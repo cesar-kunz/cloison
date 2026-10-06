@@ -1,7 +1,7 @@
-//! Every program runs on five engines: the interpreter, the JIT with
+//! Every program runs on six engines: the interpreter, the JIT with
 //! generic stencils (milestone 1), with type-specialized stencils
-//! (milestone 2), with VM registers in machine registers (milestone 3), and
-//! with fused stencils.
+//! (milestone 2), with VM registers in machine registers (milestone 3),
+//! with fused stencils, and with unboxed int32 in slots.
 //! They must agree on the result and on the final register file.
 
 use toi::bytecode::Assembler;
@@ -29,6 +29,7 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
         ("jit1", JitFunction::new(&code).unspecialized()),
         ("jit2", JitFunction::new(&code).without_register_homes()),
         ("jit3", JitFunction::new(&code).without_fusion()),
+        ("jit4", JitFunction::new(&code).without_unboxed_ints()),
         ("jit", JitFunction::new(&code)),
     ] {
         let mut jit_regs = initial.clone();
@@ -347,11 +348,11 @@ fn has_add(s: &[String], case: &str) -> bool {
     has(s, &format!("add_{case}")) || s.iter().any(|n| n.starts_with(&format!("addr_{case}_")))
 }
 
-/// Whether `suffix` is a location: `m`, `g<k>` or `f<k>`.
+/// Whether `suffix` is a location: `m`, `g<k>`, `u<k>` or `f<k>`.
 fn is_loc(suffix: &str) -> bool {
     suffix == "m"
         || suffix
-            .strip_prefix(['g', 'f'])
+            .strip_prefix(['g', 'u', 'f'])
             .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
 }
 
@@ -419,7 +420,7 @@ fn widening_join_converts_on_a_jump_edge() {
     let (v, f) = jit(&a, &mut regs);
     assert_eq!(v.as_number(), Some(5.0));
     assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
-    assert!(has(&stencils(&f), "add_ff"), "{:?}", stencils(&f));
+    assert!(has_add(&stencils(&f), "ff"), "{:?}", stencils(&f));
 }
 
 #[test]
@@ -466,8 +467,9 @@ fn homes(f: &JitFunction) -> Vec<Home> {
 fn loop_registers_live_in_machine_registers() {
     let (v, f) = jit(&sum_loop(1000), &mut [Value::UNDEFINED; 3]);
     assert_eq!(v, Value::from_i32(499500));
+    // Only ever int32: unboxed in GPR slots.
     assert!(
-        homes(&f).iter().all(|h| matches!(h, Home::Gpr(_))),
+        homes(&f).iter().all(|h| matches!(h, Home::Int(_))),
         "{:?}",
         homes(&f)
     );
@@ -530,7 +532,9 @@ fn more_registers_than_slots_use_memory() {
     assert_eq!(v, Value::from_i32(100));
     let h = homes(&f);
     assert_eq!(
-        h.iter().filter(|h| matches!(h, Home::Gpr(_))).count(),
+        h.iter()
+            .filter(|h| matches!(h, Home::Gpr(_) | Home::Int(_)))
+            .count(),
         GPR_SLOTS
     );
     assert_eq!(
@@ -607,8 +611,8 @@ fn loop_body_and_tail_fuse() {
     );
     let (_, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
     let s = stencils(&f);
-    assert!(s.iter().any(|n| n.starts_with("addi_g")), "{s:?}");
-    assert!(s.iter().any(|n| n.starts_with("incjlt_g")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("addi_u")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("incjlt_u")), "{s:?}");
 }
 
 #[test]
@@ -658,7 +662,7 @@ fn fused_loop_tail_overflow_exits() {
     unsafe { first.run(&mut [Value::UNDEFINED, Value::from_i32(-5)]) };
     assert_eq!(first.stats.exits, 0);
     let s = stencils(&first);
-    assert!(s.iter().any(|n| n.starts_with("incjlt_g")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("incjlt_u")), "{s:?}");
 }
 
 #[test]
@@ -674,7 +678,7 @@ fn live_accumulator_after_a_fused_group() {
     );
     let (_, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
     assert!(
-        stencils(&f).iter().any(|n| n.starts_with("addi_g")),
+        stencils(&f).iter().any(|n| n.starts_with("addi_u")),
         "{:?}",
         stencils(&f)
     );
@@ -723,4 +727,53 @@ fn fused_double_accumulation() {
         "{:?}",
         stencils(&f)
     );
+}
+
+// ---- Unboxed int32 slots ----
+
+#[test]
+fn fused_register_add_overflow_undoes_and_exits() {
+    // `a = a + b` in place on unboxed slots overflows: the slot holds the
+    // wrapped sum until the exit stub undoes it.
+    let (a_, b_, i) = (0, 1, 2);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(i);
+    a.bind(top);
+    a.ldar(a_).add(b_).star(a_);
+    a.ldar(i).inc().star(i).jump_if_less_smi(10, top);
+    a.ldar(a_).ret();
+    let regs = [
+        Value::from_i32(i32::MAX - 5_000_000),
+        Value::from_i32(1_000_000),
+        Value::UNDEFINED,
+    ];
+    let v = exec(a.clone(), &mut regs.clone());
+    assert_eq!(v.as_number(), Some((i32::MAX - 5_000_000) as f64 + 10e6));
+    let code = a.finish();
+    let mut f = JitFunction::new(&code);
+    let mut r = regs;
+    assert_eq!(unsafe { f.run(&mut r) }.as_number(), v.as_number());
+    assert_eq!(f.stats.exits, 1);
+}
+
+#[test]
+fn registers_written_on_some_paths_stay_boxed() {
+    // r0 isn't live at entry and is only written when r1 >= 0, so it isn't
+    // definitely assigned at `return`: it must not be pinned, or the spill
+    // at `return` would clobber its untouched value (null) when r1 < 0.
+    let mut a = Assembler::new();
+    let (no, out) = (a.label(), a.label());
+    a.ldar(1).jump_if_less_smi(0, no);
+    a.lda_smi(5).star(0).jump(out);
+    a.bind(no);
+    a.lda_smi(9);
+    a.bind(out);
+    a.ret();
+    for start in [Value::from_i32(-1), Value::from_i32(1)] {
+        let regs = [Value::NULL, start];
+        exec(a.clone(), &mut regs.clone());
+        let (_, f) = jit(&a, &mut regs.clone());
+        assert!(!matches!(homes(&f)[0], Home::Int(_)), "{:?}", homes(&f));
+    }
 }

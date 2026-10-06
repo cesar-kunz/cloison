@@ -10,7 +10,10 @@
 //! 2. [`assign_homes`] (milestone 3): each VM register lives, for the whole
 //!    region, in an FP slot as an unboxed double (if it's only ever int32 or
 //!    double, and at least once double; it's then *pinned* as double and
-//!    inference runs again), in a GPR slot (boxed), or in memory. Slots go
+//!    inference runs again), in a GPR slot as an unboxed int32 (if it's only
+//!    ever int32), in a GPR slot boxed, or in memory. Registers not live at
+//!    entry start as `Bot`, and may be pinned only if definitely assigned
+//!    before any spill ([`pinnable`]). Slots go
 //!    to the most used registers: [`GPR_SLOTS`] is 6 on x86-64 and 12 on
 //!    arm64, [`FP_SLOTS`] 7 on both.
 //! 3. [`select`] and [`stencil_for`]: a specialized stencil without type
@@ -758,6 +761,9 @@ pub enum Home {
     Mem,
     /// GPR slot `k`, boxed.
     Gpr(u8),
+    /// GPR slot `k`, an unboxed int32 (zero-extended). The register is only
+    /// ever `I32` in the region.
+    Int(u8),
     /// FP slot `k`, an unboxed double. The register is pinned as `F64`.
     Fpr(u8),
 }
@@ -767,19 +773,24 @@ impl Home {
         match self {
             Home::Mem => "m".into(),
             Home::Gpr(k) => format!("g{k}"),
+            Home::Int(k) => format!("u{k}"),
             Home::Fpr(k) => format!("f{k}"),
         }
     }
 }
 
 /// Assign homes by static use count. Registers whose type is only ever
-/// int32 or double (and at least once double) get FP slots, unless in
-/// `no_fp`; the rest get GPR slots; the rest stay in memory.
+/// int32 or double (and at least once double) get FP slots; registers only
+/// ever int32 get GPR slots unboxed (`Int`); other used registers get GPR
+/// slots boxed; the rest stay in memory. `no_fp` / `no_int` exclude
+/// registers from pinning, as does `!pin_ok` (see [`pinnable`]).
 fn assign_homes(
     insns: &[Insn],
     ins: &[Option<TypeState>],
     nregs: usize,
     no_fp: &[bool],
+    no_int: &[bool],
+    pin_ok: &[bool],
 ) -> Vec<Home> {
     let mut uses = vec![0usize; nregs];
     let mut join = vec![Ty::Bot; nregs];
@@ -797,18 +808,146 @@ fn assign_homes(
     let mut homes = vec![Home::Mem; nregs];
     let (mut fp, mut gpr) = (0, 0);
     for &r in &by_uses {
-        if join[r] == Ty::F64 && !no_fp[r] && fp < FP_SLOTS {
+        if join[r] == Ty::F64 && !no_fp[r] && pin_ok[r] && fp < FP_SLOTS {
             homes[r] = Home::Fpr(fp as u8);
             fp += 1;
         }
     }
     for &r in &by_uses {
         if homes[r] == Home::Mem && gpr < GPR_SLOTS {
-            homes[r] = Home::Gpr(gpr as u8);
+            homes[r] = if join[r] == Ty::I32 && !no_int[r] && pin_ok[r] {
+                Home::Int(gpr as u8)
+            } else {
+                Home::Gpr(gpr as u8)
+            };
             gpr += 1;
         }
     }
     homes
+}
+
+/// Instructions reachable from `entry`.
+fn reachable(insns: &[Insn], entry: usize) -> Vec<bool> {
+    let mut seen = vec![false; insns.len()];
+    let mut work = vec![entry];
+    while let Some(i) = work.pop() {
+        if i >= insns.len() || std::mem::replace(&mut seen[i], true) {
+            continue;
+        }
+        if insns[i].falls_through() {
+            work.push(i + 1);
+        }
+        if insns[i].jumps() {
+            work.push(insns[i].target);
+        }
+    }
+    seen
+}
+
+fn succs(insns: &[Insn], i: usize) -> impl Iterator<Item = usize> {
+    let insn = &insns[i];
+    [
+        insn.falls_through().then_some(i + 1),
+        insn.jumps().then_some(insn.target),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// Registers live into each reachable instruction (backward dataflow):
+/// `ldar`, `add`, `jlt` read their register, `star` writes it.
+fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize) -> Vec<Vec<bool>> {
+    let n = insns.len();
+    let mut live_in = vec![vec![false; nregs]; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..n).rev().filter(|&i| reach[i]) {
+            let insn = &insns[i];
+            let mut live = vec![false; nregs];
+            for s in succs(insns, i).filter(|&s| s < n) {
+                for (l, &x) in live.iter_mut().zip(&live_in[s]) {
+                    *l |= x;
+                }
+            }
+            match insn.op {
+                Op::Star => live[insn.reg as usize] = false,
+                Op::Ldar | Op::Add | Op::JumpIfLess => live[insn.reg as usize] = true,
+                _ => {}
+            }
+            if live != live_in[i] {
+                live_in[i] = live;
+                changed = true;
+            }
+        }
+    }
+    live_in
+}
+
+/// Registers that may be pinned (kept unboxed in a slot). A pinned register
+/// can't hold an arbitrary value, so one that isn't live at entry (and so
+/// isn't loaded) must be written on every path before any point where the
+/// slots are spilled: a possible int32 overflow exit, or `return`.
+/// Otherwise the spill would overwrite its untouched value in memory.
+fn pinnable(
+    insns: &[Insn],
+    entry: usize,
+    reach: &[bool],
+    live_at_entry: &[bool],
+    ins: &[Option<TypeState>],
+    widened: &HashSet<usize>,
+) -> Vec<bool> {
+    let n = insns.len();
+    let nregs = live_at_entry.len();
+    // Definitely assigned on entry to each instruction (forward, must).
+    let mut assigned: Vec<Option<Vec<bool>>> = vec![None; n];
+    assigned[entry] = Some(live_at_entry.to_vec());
+    let mut work = vec![entry];
+    while let Some(i) = work.pop() {
+        let mut out = assigned[i].clone().unwrap();
+        if insns[i].op == Op::Star {
+            out[insns[i].reg as usize] = true;
+        }
+        for s in succs(insns, i).filter(|&s| s < n) {
+            let changed = match &mut assigned[s] {
+                Some(a) => {
+                    let mut changed = false;
+                    for (x, &o) in a.iter_mut().zip(&out) {
+                        if *x && !o {
+                            *x = false;
+                            changed = true;
+                        }
+                    }
+                    changed
+                }
+                slot @ None => {
+                    *slot = Some(out.clone());
+                    true
+                }
+            };
+            if changed {
+                work.push(s);
+            }
+        }
+    }
+    let may_spill = |i: usize| {
+        let Some(st) = &ins[i] else { return false };
+        let reg = st.regs.get(insns[i].reg as usize).copied();
+        match insns[i].op {
+            Op::Return => true,
+            Op::AddSmi | Op::Inc => st.acc == Ty::I32 && !widened.contains(&i),
+            Op::Add => st.acc == Ty::I32 && reg == Some(Ty::I32) && !widened.contains(&i),
+            _ => false,
+        }
+    };
+    (0..nregs)
+        .map(|r| {
+            live_at_entry[r]
+                || (0..n)
+                    .filter(|&i| reach[i] && may_spill(i))
+                    .all(|i| assigned[i].as_ref().is_some_and(|a| a[r]))
+        })
+        .collect()
 }
 
 // ---- Layout and patching ----
@@ -882,7 +1021,7 @@ fn edge_conversions(from: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Pie
         _ => {}
     }
     for (r, (&a, &b)) in from.regs.iter().zip(&to.regs).enumerate() {
-        if a == Ty::I32 && b == Ty::F64 && !matches!(homes[r], Home::Fpr(_)) {
+        if a == Ty::I32 && b == Ty::F64 && matches!(homes[r], Home::Mem | Home::Gpr(_)) {
             out.push(Piece::new(&format!("conv_{}_f", homes[r].loc()), r as u8));
         }
     }
@@ -891,13 +1030,26 @@ fn edge_conversions(from: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Pie
 
 /// Entry: load cached registers from the register file (unboxing pinned
 /// ones), then convert to the entry instruction's in-state. `actual` is the
-/// exact entry state; `acc` arrives boxed.
-fn entry_pieces(actual: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Piece> {
+/// exact entry state (`acc` arrives boxed); `actual_live` has dead
+/// registers as `Bot`. Pinned registers that aren't live at entry aren't
+/// loaded (see [`pinnable`]); boxed ones always are, so spills stay exact.
+fn entry_pieces(
+    actual: &TypeState,
+    actual_live: &TypeState,
+    to: &TypeState,
+    homes: &[Home],
+    live_at_entry: &[bool],
+) -> Vec<Piece> {
     let mut out = Vec::new();
     for (r, &h) in homes.iter().enumerate() {
         match h {
             Home::Mem => {}
             Home::Gpr(k) => out.push(Piece::new(&format!("enter_g{k}"), r as u8)),
+            _ if !live_at_entry[r] => {}
+            Home::Int(k) => {
+                assert_eq!(actual.regs[r], Ty::I32, "r{r} pinned as int32");
+                out.push(Piece::new(&format!("enter_u{k}"), r as u8));
+            }
             Home::Fpr(k) => {
                 let kind = match actual.regs[r] {
                     Ty::I32 => "i",
@@ -913,7 +1065,7 @@ fn entry_pieces(actual: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Piece
         (Ty::I32, Ty::F64) => out.push(Piece::new("conv_acc_f", 0)),
         _ => {}
     }
-    let mut regs_only = actual.clone();
+    let mut regs_only = actual_live.clone();
     regs_only.acc = to.acc;
     out.extend(edge_conversions(&regs_only, to, homes));
     out
@@ -927,6 +1079,7 @@ fn spills(homes: &[Home]) -> Vec<Piece> {
         .filter_map(|(r, &h)| match h {
             Home::Mem => None,
             Home::Gpr(k) => Some(Piece::new(&format!("spill_g{k}"), r as u8)),
+            Home::Int(k) => Some(Piece::new(&format!("spill_u{k}"), r as u8)),
             Home::Fpr(k) => Some(Piece::new(&format!("spill_f{k}"), r as u8)),
         })
         .collect()
@@ -1012,6 +1165,10 @@ struct Fused {
     /// the group or in its exit stub.
     ldar: String,
     acc_live_after: bool,
+    /// For in-place ops on unboxed slots, which write the wrapped result
+    /// before checking overflow: the stencil (and immediate) that undoes it
+    /// in the exit stub.
+    undo: Option<(String, i32)>,
 }
 
 /// Matches fused-stencil patterns (see the fused section of
@@ -1048,11 +1205,11 @@ impl Fusion<'_> {
         let mid = &insns[i + 1];
         let int_ok = st.regs[r] == Ty::I32 && !widened.contains(&(i + 1));
         let dbl = st.regs[r] == Ty::F64;
-        let (home, ldar) = match self.homes[r] {
-            Home::Gpr(a) => (Home::Gpr(a), format!("ldar_g{a}")),
-            Home::Fpr(a) => (Home::Fpr(a), format!("ldar_f{a}")),
-            Home::Mem => return None,
-        };
+        let home = self.homes[r];
+        if home == Home::Mem {
+            return None;
+        }
+        let ldar = format!("ldar_{}", home.loc());
         let fused = |len: usize, name: String, imm: i32| {
             let acc_live_after = self.live_out[i + len - 1];
             Some(Fused {
@@ -1061,26 +1218,40 @@ impl Fusion<'_> {
                 imm,
                 ldar: ldar.clone(),
                 acc_live_after,
+                undo: None,
+            })
+        };
+        let undone = |f: Option<Fused>, undo: String, imm: i32| {
+            f.map(|f| Fused {
+                undo: Some((undo, imm)),
+                ..f
             })
         };
 
         // Loop tail: ldar r; inc; star r; jlt_smi k | jlt r2.
-        if mid.op == Op::Inc
-            && int_ok
-            && group(4)
-            && let Home::Gpr(a) = home
-            && !self.live_out[i + 3]
-        {
+        if mid.op == Op::Inc && int_ok && group(4) && !self.live_out[i + 3] {
             let tail = &insns[i + 3];
-            match tail.op {
-                Op::JumpIfLessSmi => return fused(4, format!("incjlt_g{a}"), tail.imm),
+            let bound = match tail.op {
                 Op::JumpIfLess => {
                     let r2 = tail.reg as usize;
-                    if let (Ty::I32, Home::Gpr(b)) =
-                        (self.ins[i + 3].as_ref()?.regs[r2], self.homes[r2])
-                    {
-                        return fused(4, format!("incjlt_g{a}_g{b}"), 0);
-                    }
+                    (self.ins[i + 3].as_ref()?.regs[r2] == Ty::I32).then_some(self.homes[r2])
+                }
+                _ => None,
+            };
+            match (home, tail.op, bound) {
+                (Home::Gpr(a), Op::JumpIfLessSmi, _) => {
+                    return fused(4, format!("incjlt_g{a}"), tail.imm);
+                }
+                (Home::Gpr(a), Op::JumpIfLess, Some(Home::Gpr(b))) => {
+                    return fused(4, format!("incjlt_g{a}_g{b}"), 0);
+                }
+                (Home::Int(a), Op::JumpIfLessSmi, _) => {
+                    let f = fused(4, format!("incjlt_u{a}"), tail.imm);
+                    return undone(f, format!("undo_addi_u{a}"), 1);
+                }
+                (Home::Int(a), Op::JumpIfLess, Some(Home::Int(b))) => {
+                    let f = fused(4, format!("incjlt_u{a}_u{b}"), 0);
+                    return undone(f, format!("undo_addi_u{a}"), 1);
                 }
                 _ => {}
             }
@@ -1091,6 +1262,11 @@ impl Fusion<'_> {
             (Op::AddSmi | Op::Inc, Home::Gpr(a)) if int_ok => {
                 fused(3, format!("addi_g{a}"), mid.imm)
             }
+            (Op::AddSmi | Op::Inc, Home::Int(a)) if int_ok => undone(
+                fused(3, format!("addi_u{a}"), mid.imm),
+                format!("undo_addi_u{a}"),
+                mid.imm,
+            ),
             (Op::AddSmi | Op::Inc, Home::Fpr(a)) if dbl => fused(3, format!("addi_f{a}"), mid.imm),
             // ldar r; add r2; star r
             (Op::Add, _) if mid.reg as usize != r => {
@@ -1100,8 +1276,15 @@ impl Fusion<'_> {
                     (Home::Gpr(a), Home::Gpr(b), Ty::I32) if int_ok => {
                         fused(3, format!("addr_ii_g{a}_g{b}"), 0)
                     }
+                    (Home::Int(a), Home::Int(b), Ty::I32) if int_ok => {
+                        let f = fused(3, format!("addr_ii_u{a}_u{b}"), 0);
+                        undone(f, format!("undo_addr_u{a}_u{b}"), 0)
+                    }
                     (Home::Fpr(a), Home::Gpr(b), Ty::I32) if dbl => {
                         fused(3, format!("addr_fi_f{a}_g{b}"), 0)
+                    }
+                    (Home::Fpr(a), Home::Int(b), Ty::I32) if dbl => {
+                        fused(3, format!("addr_fi_f{a}_u{b}"), 0)
                     }
                     (Home::Fpr(a), Home::Fpr(b), Ty::F64) if dbl => {
                         fused(3, format!("addr_ff_f{a}_f{b}"), 0)
@@ -1254,6 +1437,7 @@ struct Options {
     specialize: bool,
     register_homes: bool,
     fusion: bool,
+    unboxed_ints: bool,
 }
 
 impl JitCode {
@@ -1275,31 +1459,49 @@ impl JitCode {
         };
         let widened = opts.specialize.then_some(widened);
 
+        // Registers not live at entry are `Bot` there: their entry values
+        // (typically `undefined`) are never read, so they shouldn't widen the
+        // types the region's own stores give them.
+        let reach = reachable(insns, entry);
+        let live_in = reg_live_in(insns, &reach, nregs);
+        let live_at_entry = live_in[entry].clone();
+        let mut actual_live = actual.clone();
+        for (r, &live) in live_at_entry.iter().enumerate() {
+            if !live {
+                actual_live.regs[r] = Ty::Bot;
+            }
+        }
+
         // Pass 1: types without pinning; choose homes. Pass 2: types with
         // the FP-homed registers pinned as doubles. Pinning only widens
-        // int32 to double, so it can't make a pinned register `Any`; if it
-        // ever did, unpin it and retry.
+        // int32 to double, so it can't make an FP-pinned register `Any`, but
+        // it can turn an int-pinned one double; then unpin it and retry.
         let unpinned = vec![false; nregs];
-        let ins1 = infer(
+        let spec1 = Spec {
+            widened,
+            pinned: &unpinned,
+        };
+        let ins1 = infer(insns, entry, actual_live.clone(), &spec1);
+        let no_widening = HashSet::new();
+        let pin_ok = pinnable(
             insns,
             entry,
-            actual.clone(),
-            &Spec {
-                widened,
-                pinned: &unpinned,
-            },
+            &reach,
+            &live_at_entry,
+            &ins1,
+            widened.unwrap_or(&no_widening),
         );
-        let mut no_fp = vec![false; nregs];
+        let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
         let (homes, ins) = loop {
             let homes = if opts.register_homes {
-                assign_homes(insns, &ins1, nregs, &no_fp)
+                assign_homes(insns, &ins1, nregs, &no_fp, &no_int, &pin_ok)
             } else {
                 vec![Home::Mem; nregs]
             };
             let pinned: Vec<bool> = homes.iter().map(|h| matches!(h, Home::Fpr(_))).collect();
-            let mut entry_state = actual.clone();
+            let mut entry_state = actual_live.clone();
             for (r, &p) in pinned.iter().enumerate() {
-                if p {
+                if p && live_at_entry[r] {
                     entry_state.regs[r] = Ty::F64;
                 }
             }
@@ -1312,14 +1514,21 @@ impl JitCode {
                     pinned: &pinned,
                 },
             );
-            let bad: Vec<usize> = (0..nregs)
-                .filter(|&r| pinned[r] && ins.iter().flatten().any(|st| st.regs[r] != Ty::F64))
-                .collect();
-            if bad.is_empty() {
-                break (homes, ins);
+            let strays = |r: usize, ok: Ty| {
+                ins.iter()
+                    .flatten()
+                    .any(|st| st.regs[r] != ok && st.regs[r] != Ty::Bot)
+            };
+            let mut retry = false;
+            for (r, h) in homes.iter().enumerate() {
+                match h {
+                    Home::Fpr(_) if strays(r, Ty::F64) => (no_fp[r], retry) = (true, true),
+                    Home::Int(_) if strays(r, Ty::I32) => (no_int[r], retry) = (true, true),
+                    _ => {}
+                }
             }
-            for r in bad {
-                no_fp[r] = true;
+            if !retry {
+                break (homes, ins);
             }
         };
         let pinned: Vec<bool> = homes.iter().map(|h| matches!(h, Home::Fpr(_))).collect();
@@ -1341,7 +1550,13 @@ impl JitCode {
         let mut label_piece = vec![usize::MAX; n];
         let mut names: Vec<Option<String>> = vec![None; n];
 
-        let entry_seq = entry_pieces(&actual, ins[entry].as_ref().unwrap(), &homes);
+        let entry_seq = entry_pieces(
+            &actual,
+            &actual_live,
+            ins[entry].as_ref().unwrap(),
+            &homes,
+            &live_at_entry,
+        );
         let has_entry_seq = !entry_seq.is_empty();
         hot.extend(ending_at(entry_seq, Target::Label(entry)));
 
@@ -1406,7 +1621,14 @@ impl JitCode {
                 if main.uses("toi_exit") {
                     // Exit before the arithmetic instruction, with `acc`
                     // holding the register `ldar` loaded.
-                    let mut seq = vec![Piece::new(&f.ldar, insn.reg)];
+                    let mut seq = Vec::new();
+                    if let Some((undo, imm)) = &f.undo {
+                        seq.push(Piece {
+                            imm: *imm,
+                            ..Piece::new(undo, 0)
+                        });
+                    }
+                    seq.push(Piece::new(&f.ldar, insn.reg));
                     seq.extend(spills(&homes));
                     seq.push(Piece {
                         imm: insns[i + 1].pc as i32,
@@ -1495,7 +1717,7 @@ impl JitCode {
         let saved_gprs: Vec<u8> = homes
             .iter()
             .filter_map(|h| match h {
-                Home::Gpr(k) => arch::caller_saved_gpr_slot(*k),
+                Home::Gpr(k) | Home::Int(k) => arch::caller_saved_gpr_slot(*k),
                 _ => None,
             })
             .collect();
@@ -1710,6 +1932,7 @@ impl JitFunction {
                 specialize: true,
                 register_homes: true,
                 fusion: true,
+                unboxed_ints: true,
             },
             widened: HashSet::new(),
             cached: None,
@@ -1724,6 +1947,7 @@ impl JitFunction {
             specialize: false,
             register_homes: false,
             fusion: false,
+            unboxed_ints: false,
         };
         self
     }
@@ -1731,6 +1955,13 @@ impl JitFunction {
     /// Don't use fused stencils.
     pub fn without_fusion(mut self) -> JitFunction {
         self.opts.fusion = false;
+        self.opts.unboxed_ints = false;
+        self
+    }
+
+    /// Keep int32 values boxed in slots.
+    pub fn without_unboxed_ints(mut self) -> JitFunction {
+        self.opts.unboxed_ints = false;
         self
     }
 

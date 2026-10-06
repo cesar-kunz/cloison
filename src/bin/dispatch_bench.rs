@@ -20,7 +20,8 @@
 //!   jit1     the copy-and-patch JIT with generic stencils only (milestone 1)
 //!   jit2     with type-specialized stencils, VM registers in memory (milestone 2)
 //!   jit3     with VM registers in machine registers too (milestone 3)
-//!   jit      with fused stencils too
+//!   jit4     with fused stencils too
+//!   jit      with unboxed int32 in slots too
 //!
 //! JIT timings include compilation, which happens on entry (and again after
 //! a side exit; `double` exits once when `s` overflows int32).
@@ -48,7 +49,7 @@ const A1: u8 = 4;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dispatch_bench <int|const|chain|double|wide> <generic|smi> [n] [interp|jit1|jit2|jit3|jit]"
+        "usage: dispatch_bench <int|const|chain|double|wide> <generic|smi> [n] [interp|jit1|jit2|jit3|jit4|jit]"
     );
     exit(2)
 }
@@ -68,7 +69,7 @@ fn main() {
         .map_or(100_000_000, |s| s.parse().unwrap_or_else(|_| usage()));
     assert!(n > 0, "the loop tests at the bottom, so n must be positive");
     let engine = args.get(4).map_or("interp", String::as_str);
-    if !matches!(engine, "interp" | "jit1" | "jit2" | "jit3" | "jit") {
+    if !matches!(engine, "interp" | "jit1" | "jit2" | "jit3" | "jit4" | "jit") {
         usage()
     }
     let nf = n as f64;
@@ -129,6 +130,7 @@ fn main() {
         "jit1" => Some(JitFunction::new(&code).unspecialized()),
         "jit2" => Some(JitFunction::new(&code).without_register_homes()),
         "jit3" => Some(JitFunction::new(&code).without_fusion()),
+        "jit4" => Some(JitFunction::new(&code).without_unboxed_ints()),
         _ => None,
     };
     let start = Instant::now();

@@ -59,8 +59,52 @@ use crate::bytecode::Op;
 use crate::interp::{self, Frame, Run};
 use crate::object::{Atom, FieldType, Object, Shape};
 use crate::value::{NumberTag, Value};
-use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
+
+/// The JIT's maps and sets, keyed by small integers and pointers, use
+/// FxHash (as rustc does): `std`'s SipHash dominated entering compiled code
+/// at a function call.
+type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
+
+#[derive(Default, Clone, Copy)]
+struct FxHasher(u64);
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(b));
+        }
+    }
+    fn write_u8(&mut self, x: u8) {
+        self.add(x as u64);
+    }
+    fn write_u16(&mut self, x: u16) {
+        self.add(x as u64);
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.add(x as u64);
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.add(x);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.add(x as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// What a stencil relocation refers to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,8 +164,8 @@ fn index() -> &'static Index {
     static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
     INDEX.get_or_init(|| {
         let mut ix = Index {
-            by_name: HashMap::new(),
-            by_family: HashMap::new(),
+            by_name: HashMap::default(),
+            by_family: HashMap::default(),
         };
         for s in STENCILS {
             match s.template {
@@ -732,11 +776,10 @@ impl Insn {
 }
 
 /// Decode `code`. With `vm`, instructions the JIT doesn't compile are
-/// marked `bail`, as is `Return` (a VM frame returns in the interpreter);
-/// otherwise they're an error.
+/// marked `bail`; otherwise they're an error.
 fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
     let imm_at = |at: usize| i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
-    let mut starts = HashMap::new();
+    let mut starts = HashMap::default();
     let mut raw = Vec::new();
     let mut pc = 0;
     while pc < code.len() {
@@ -806,9 +849,6 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 }
                 _ if vm => bail = true,
                 op => panic!("the JIT does not compile {op:?} yet"),
-            }
-            if vm && op == Op::Return {
-                bail = true;
             }
             Insn {
                 pc,
@@ -1163,7 +1203,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     let Some(widened) = spec.widened else {
         let any = TypeState::any(st.regs.len());
         let no = Spec {
-            widened: Some(&HashSet::new()),
+            widened: Some(&HashSet::default()),
             ..*spec
         };
         let mut sel = select(insn, i, &any, &no);
@@ -2682,6 +2722,9 @@ pub struct JitCode {
     pub stencils: Vec<Option<String>>,
     /// Where each VM register lived.
     pub homes: Vec<Home>,
+    /// For a VM function: the lowering compiled, which exits refer to and
+    /// the code's call sites live in. Running code keeps it alive.
+    snap: Option<Rc<Snapshot>>,
 }
 
 /// How a run of [`JitCode`] ended.
@@ -2787,7 +2830,7 @@ impl JitCode {
             feedback,
         };
         let ins1 = infer(insns, entry, actual_live.clone(), &spec1);
-        let no_widening = HashSet::new();
+        let no_widening = HashSet::default();
         // Registers of inlined frames (from `inline_base`) are assigned
         // when their frame starts, before anything there can exit, and mean
         // nothing outside it: they may always be pinned.
@@ -3092,7 +3135,7 @@ impl JitCode {
             .map(|((i, _), ats)| (*i, ats[0]))
             .collect();
         // `__slow` helpers, per hot piece: piece index -> offset.
-        let mut helper_at: HashMap<usize, usize> = HashMap::new();
+        let mut helper_at: HashMap<usize, usize> = HashMap::default();
         let mut helper_list = Vec::new();
         for (k, p) in hot.iter().enumerate() {
             if let Some(h) = p.slow {
@@ -3122,7 +3165,7 @@ impl JitCode {
             }))
             .collect();
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
-        let mut tramp_at: HashMap<u8, usize> = HashMap::new();
+        let mut tramp_at: HashMap<u8, usize> = HashMap::default();
         let mut wrappers: Vec<(usize, Vec<u8>)> = Vec::new();
         let all_stencils = hot
             .iter()
@@ -3233,6 +3276,7 @@ impl JitCode {
             main_len,
             stencils: names,
             homes,
+            snap: None,
         }
     }
 
@@ -3336,7 +3380,7 @@ pub struct JitFunction {
     opts: Options,
     widened: HashSet<usize>,
     /// Compiled versions per entry instruction, with their entry types.
-    versions: HashMap<usize, Vec<(TypeState, JitCode)>>,
+    versions: HashMap<usize, Vec<(TypeState, Rc<JitCode>)>>,
     /// Which of acc and the registers are live at an entry instruction.
     live_at: HashMap<usize, (bool, Vec<bool>)>,
     /// The most recently used version: (entry instruction, index).
@@ -3373,10 +3417,13 @@ struct VmState {
     /// cache's contents, the frames, their feedback, the runtime call
     /// sites, and where inlined frames' registers start.
     props: Vec<Prop>,
-    frames: Vec<InlineFrame>,
     fbs: Vec<Feedback>,
-    sites: Vec<Box<CallSite>>,
+    snap: Rc<Snapshot>,
     inline_base: usize,
+    /// The lowering needs redoing: compiled code exited (its caches may
+    /// have changed since), or it was never done. Entries otherwise skip
+    /// it, which matters for functions entered at every call.
+    dirty: bool,
     /// The prototype epoch the versions were compiled under: a prototype's
     /// slot addresses are only valid while it holds.
     epoch: u32,
@@ -3427,6 +3474,16 @@ pub(crate) struct CallSite {
     w: usize,
     argc: usize,
     frame: usize,
+}
+
+/// A lowering as compiled (see [`JitCode::snap`]).
+#[allow(clippy::vec_box)]
+pub(crate) struct Snapshot {
+    insns: Vec<Insn>,
+    frames: Vec<InlineFrame>,
+    /// Owned here so they live as long as code pointing to them.
+    #[allow(dead_code)]
+    sites: Vec<Box<CallSite>>,
 }
 
 /// The result of [`lower`].
@@ -3571,7 +3628,12 @@ impl Lowering<'_> {
             }
             let origin = (code_key, i.pc);
             match i.op {
-                _ if i.bail && !(i.op == Op::Return && frame != 0) => {
+                _ if i.bail => {
+                    self.push(i, Prop::None);
+                }
+                // The function returns from its compiled code: the caller of
+                // the code (`vm_run`) finishes the return.
+                Op::Return if frame == 0 => {
                     self.push(i, Prop::None);
                 }
                 Op::Return => {
@@ -3763,9 +3825,9 @@ impl JitFunction {
                 fusion: true,
                 unboxed_ints: true,
             },
-            widened: HashSet::new(),
-            versions: HashMap::new(),
-            live_at: HashMap::new(),
+            widened: HashSet::default(),
+            versions: HashMap::default(),
+            live_at: HashMap::default(),
             last: None,
             tiering: Some(Tiering::default()),
             back_edges_left: Tiering::default().back_edges,
@@ -3789,43 +3851,43 @@ impl JitFunction {
             root: code,
             vm,
             root_insns,
-            decoded: HashMap::new(),
+            decoded: HashMap::default(),
             props: Vec::new(),
-            frames: Vec::new(),
             fbs: Vec::new(),
-            sites: Vec::new(),
+            snap: Rc::new(Snapshot {
+                insns: Vec::new(),
+                frames: Vec::new(),
+                sites: Vec::new(),
+            }),
             inline_base: nregs,
+            dirty: true,
             epoch: 0,
             field_epoch: 0,
-            widened: HashSet::new(),
-            property_exits: HashMap::new(),
-            callee_exits: HashMap::new(),
-            bail_exits: HashMap::new(),
-            no_entry: HashSet::new(),
+            widened: HashSet::default(),
+            property_exits: HashMap::default(),
+            callee_exits: HashMap::default(),
+            bail_exits: HashMap::default(),
+            no_entry: HashSet::default(),
         }));
         f
     }
 
-    /// Run compiled code for a VM frame whose registers start at `regs`,
-    /// entering at the loop header at bytecode offset `pc` with `acc`,
-    /// compiling a version if needed. Returns the frame (0, or an inlined
-    /// one) and bytecode offset where the interpreter resumes, with `acc`;
-    /// `None` if this entry isn't compiled. `epoch` and `field_epoch` are
-    /// the VM's prototype and field epochs: versions compiled under others
-    /// are dropped. `stack_end` bounds the registers of inlined frames.
+    /// Prepare to enter compiled code for a VM frame whose registers start
+    /// at `regs`, at bytecode offset `pc` (a loop header, or 0 at a call)
+    /// with `acc`, compiling a version if needed: the code to run, the
+    /// accumulator to give it (converted if the version expects a double),
+    /// and the register count it uses. `None` if this entry isn't compiled.
+    /// `epoch` and `field_epoch` are the VM's prototype and field epochs:
+    /// versions compiled under others are dropped. `stack_end` bounds the
+    /// registers of inlined frames.
     ///
-    /// Each entry lowers the function again ([`lower`]): if the inline
-    /// caches changed what it gives, the versions are dropped. Exits: at an
-    /// int32 operation, the instruction is widened (as in
-    /// [`JitFunction::run`]); at a property access or an inlined call's
-    /// guard, the interpreter updates its cache, and the next entry
-    /// recompiles from it (giving up after a few); at a bail, nothing
-    /// changes, but an entry that keeps bailing is given up.
+    /// The function is lowered again ([`lower`]) after exits and epoch
+    /// changes; if that gives something else, the versions are dropped.
     ///
     /// # Safety
     /// `regs` must be the frame's registers, holding values of the program
     /// whose inline caches and objects the `Feedback` points to.
-    pub(crate) unsafe fn vm_enter(
+    unsafe fn vm_prepare(
         &mut self,
         pc: usize,
         mut acc: Value,
@@ -3833,88 +3895,139 @@ impl JitFunction {
         stack_end: *mut Value,
         epoch: u32,
         field_epoch: u32,
-    ) -> Option<(usize, usize, Value)> {
-        let root_pc = pc;
+    ) -> Option<(Rc<JitCode>, Value, usize)> {
         {
             let vm = self.vm.as_mut().expect("a VM function");
-            if vm.no_entry.contains(&root_pc) || self.stats.compiles >= MAX_VM_COMPILES {
+            // The common case, entering at every call: nothing to redo, and
+            // a version that fits the live values, found without allocating.
+            if !vm.dirty
+                && vm.epoch == epoch
+                && vm.field_epoch == field_epoch
+                && let Some(found) = unsafe { self.fitting_version(pc, acc, regs) }
+            {
+                return Some(found);
+            }
+            let vm = self.vm.as_mut().unwrap();
+            if vm.no_entry.contains(&pc) || self.stats.compiles >= MAX_VM_COMPILES {
                 return None;
             }
-            let low = lower(vm, epoch);
-            if vm.epoch != epoch
-                || vm.field_epoch != field_epoch
-                || low.insns != self.insns
-                || low.props != vm.props
-                || low.frames != vm.frames
-            {
-                self.versions.clear();
-                self.live_at.clear();
-                vm.epoch = epoch;
-                vm.field_epoch = field_epoch;
-                self.widened = low
-                    .insns
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, i)| {
-                        vm.widened
-                            .contains(&(low.frames[i.frame as usize].code as usize, i.pc))
-                    })
-                    .map(|(k, _)| k)
-                    .collect();
-                self.insns = low.insns;
-                self.nregs = low.nregs;
-                vm.props = low.props;
-                vm.frames = low.frames;
-                vm.fbs = low.fbs;
-                vm.sites = low.sites;
+            if vm.dirty || vm.epoch != epoch || vm.field_epoch != field_epoch {
+                let low = lower(vm, epoch);
+                vm.dirty = false;
+                if vm.epoch != epoch
+                    || vm.field_epoch != field_epoch
+                    || low.insns != self.insns
+                    || low.props != vm.props
+                    || low.frames != vm.snap.frames
+                {
+                    self.versions.clear();
+                    self.live_at.clear();
+                    vm.epoch = epoch;
+                    vm.field_epoch = field_epoch;
+                    self.widened = low
+                        .insns
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, i)| {
+                            vm.widened
+                                .contains(&(low.frames[i.frame as usize].code as usize, i.pc))
+                        })
+                        .map(|(k, _)| k)
+                        .collect();
+                    self.insns = low.insns.clone();
+                    self.nregs = low.nregs;
+                    vm.props = low.props;
+                    vm.fbs = low.fbs;
+                    vm.snap = Rc::new(Snapshot {
+                        insns: low.insns,
+                        frames: low.frames,
+                        sites: low.sites,
+                    });
+                }
             }
             // Inlined frames' registers must fit the VM stack.
             if unsafe { regs.add(self.nregs + interp::HEADER) } > stack_end {
                 return None;
             }
         }
-        let entry = self.index_of(root_pc);
+        let entry = self.index_of(pc);
         let regs = unsafe { std::slice::from_raw_parts_mut(regs, self.nregs) };
         let actual = self.entry_types(entry, acc, regs);
         let index = self.version(entry, &actual, &mut acc, regs);
-        let code = &self.versions[&entry][index].1;
-        match unsafe { code.enter(acc, regs) } {
-            Outcome::Return(_) => unreachable!("VM functions return in the interpreter"),
-            Outcome::Exit { pc: record, acc } => {
-                self.stats.exits += 1;
-                let after_call = record & AFTER_CALL as usize != 0;
-                let (frame, pc) = (record >> 24, record & (AFTER_CALL as usize - 1));
-                let k = self
-                    .insns
+        Some((self.versions[&entry][index].1.clone(), acc, self.nregs))
+    }
+
+    /// An existing version for the entry at bytecode offset `pc` that the
+    /// live values in `acc` and `regs` fit exactly (no int32 → double
+    /// conversion), without building their `TypeState`.
+    unsafe fn fitting_version(
+        &self,
+        pc: usize,
+        acc: Value,
+        regs: *mut Value,
+    ) -> Option<(Rc<JitCode>, Value, usize)> {
+        let entry = self.insns.iter().position(|i| i.pc == pc && i.frame == 0)?;
+        let (acc_live, live) = self.live_at.get(&entry)?;
+        let fits = |t: Ty, v: Value| match t {
+            Ty::Bot => false,
+            Ty::Any => true,
+            Ty::I32 => v.is_int32(),
+            Ty::F64 => v.is_double(),
+            Ty::Obj(s) | Ty::Ext(s) => v.is_cell() && unsafe { *(v.to_bits() as *const u64) } == s,
+        };
+        let versions = self.versions.get(&entry)?;
+        versions.iter().find_map(|(st, code)| {
+            let ok = (!*acc_live || fits(st.acc, acc))
+                && live
                     .iter()
-                    .position(|i| i.frame as usize == frame && i.pc == pc)
-                    .expect("an exit's instruction");
-                let vm = self.vm.as_mut().unwrap();
-                let insn = self.insns[k];
-                let origin = (vm.frames[frame].code as usize, pc);
-                if after_call {
-                    // An error, or the callee changed the code epoch: the
-                    // next entry recompiles.
-                } else if insn.bail {
-                    let n = vm.bail_exits.entry(root_pc).or_insert(0);
-                    *n += 1;
-                    if *n >= MAX_BAIL_EXITS {
-                        vm.no_entry.insert(root_pc);
-                    }
-                } else if insn.guard != 0 {
-                    *vm.callee_exits.entry(origin).or_insert(0) += 1;
-                } else if insn.is_property() {
-                    *vm.property_exits.entry(origin).or_insert(0) += 1;
-                } else if insn.is_call() {
-                    // An error in the callee: the run ends.
-                } else {
-                    vm.widened.insert(origin);
-                    self.widened.insert(k);
-                    self.versions.clear();
-                }
-                Some((frame, pc, acc))
-            }
+                    .zip(&st.regs)
+                    .enumerate()
+                    .all(|(r, (&l, &t))| !l || fits(t, unsafe { *regs.add(r) }));
+            ok.then(|| (code.clone(), acc, self.nregs))
+        })
+    }
+
+    /// Account for an exit of `code` (prepared at entry `pc`): at an int32
+    /// operation, the instruction is widened (as in [`JitFunction::run`]);
+    /// at a property access or an inlined call's guard, the exit counts
+    /// towards giving the access or the inlining up; at a bail, towards
+    /// giving the entry up. Any exit makes the next entry lower the
+    /// function again. Returns the exit's frame and bytecode offset.
+    fn vm_finish(&mut self, code: &JitCode, pc: usize, record: usize) -> (usize, usize) {
+        self.stats.exits += 1;
+        let after_call = record & AFTER_CALL as usize != 0;
+        let (frame, exit_pc) = (record >> 24, record & (AFTER_CALL as usize - 1));
+        let snap = code.snap.as_ref().expect("a VM function's code");
+        let vm = self.vm.as_mut().unwrap();
+        vm.dirty = true;
+        // The function may have been lowered differently since (a nested
+        // entry recompiled it): then only resume.
+        if !Rc::ptr_eq(snap, &vm.snap) || after_call {
+            return (frame, exit_pc);
         }
+        let k = snap
+            .insns
+            .iter()
+            .position(|i| i.frame as usize == frame && i.pc == exit_pc)
+            .expect("an exit's instruction");
+        let insn = snap.insns[k];
+        let origin = (snap.frames[frame].code as usize, exit_pc);
+        if insn.bail {
+            let n = vm.bail_exits.entry(pc).or_insert(0);
+            *n += 1;
+            if *n >= MAX_BAIL_EXITS {
+                vm.no_entry.insert(pc);
+            }
+        } else if insn.guard != 0 {
+            *vm.callee_exits.entry(origin).or_insert(0) += 1;
+        } else if insn.is_property() {
+            *vm.property_exits.entry(origin).or_insert(0) += 1;
+        } else if !insn.is_call() {
+            vm.widened.insert(origin);
+            self.widened.insert(k);
+            self.versions.clear();
+        }
+        (frame, exit_pc)
     }
 
     /// Tier up with custom thresholds (see [`Tiering`]).
@@ -4045,8 +4158,10 @@ impl JitFunction {
                         },
                     )
                 };
+                let mut code = code;
+                code.snap = self.vm.as_ref().map(|vm| vm.snap.clone());
                 let vs = self.versions.entry(entry).or_insert(keep);
-                vs.push((state, code));
+                vs.push((state, Rc::new(code)));
                 vs.len() - 1
             }
         };
@@ -4142,7 +4257,7 @@ impl JitFunction {
     /// The most recently used code.
     pub fn last_code(&self) -> Option<&JitCode> {
         let (entry, index) = self.last?;
-        self.versions.get(&entry)?.get(index).map(|(_, c)| c)
+        self.versions.get(&entry)?.get(index).map(|(_, c)| &**c)
     }
 
     /// Versions currently compiled, over all entry points.
@@ -4160,50 +4275,75 @@ pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
     unsafe { JitFunction::new(code).run(regs) }
 }
 
-/// On-stack replacement for a VM frame (see `interp::drive`): run `code`'s
-/// compiled version for the loop header at bytecode offset `pc` over the
-/// frame `regs`, if it is compiled (or compiles now). Returns where the
-/// interpreter resumes: if the code exited inside a function it had
-/// inlined, that function's frame, whose registers are already in place,
-/// gets its header (and so do the frames between), so that its `Return`
+/// How [`vm_run`] ended.
+pub(crate) enum VmRun {
+    /// No compiled code for this entry: run the frame in the interpreter.
+    NotCompiled,
+    /// The function returned `acc` from compiled code; the caller finishes
+    /// the return (`construct_result`, the return pc).
+    Returned(Value),
+    /// The code exited: the interpreter resumes there.
+    Exit(interp::Resume),
+}
+
+/// Run `code`'s compiled code for its VM frame `regs` from bytecode offset
+/// `pc` (a loop header, for on-stack replacement, or 0, entering a call)
+/// with `acc`, compiling it if needed.
+///
+/// The `JitFunction` isn't borrowed while the code runs: the code may call,
+/// through the runtime, functions entering compiled code, this one
+/// included. The version is an `Rc`, so it outlives a recompilation by such
+/// a nested entry.
+///
+/// An exit inside a function the code had inlined resumes in that
+/// function's frame, whose registers are already in place: its header is
+/// written (and the headers of the frames between), so that its `Return`
 /// continues the caller.
 ///
 /// # Safety
 /// `regs` must be a live frame of `code` in `vm`.
-pub(crate) unsafe fn vm_osr(
+pub(crate) unsafe fn vm_run(
     vm: &mut crate::vm::Vm,
     code: &crate::vm::Code,
     regs: *mut Value,
     pc: usize,
     acc: Value,
-) -> interp::Resume {
+) -> VmRun {
     let vm_ptr: *mut crate::vm::Vm = vm;
-    let mut slot = code.jit.borrow_mut();
-    let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
-    let compiles = f.stats.compiles;
-    let r = unsafe { f.vm_enter(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch) };
-    // Debugging: `TOI_JIT_LOG` prints each compilation's stencils;
-    // `TOI_JIT_DUMP=<file>` writes the last one's hot code.
-    if f.stats.compiles != compiles
-        && let Some(c) = f.last_code()
-    {
-        if std::env::var_os("TOI_JIT_LOG").is_some() {
-            let names: Vec<&str> = c.stencils.iter().flatten().map(String::as_str).collect();
-            eprintln!("jit {} @{pc}: {}", code.name, names.join(" "));
+    let prepared = {
+        let mut slot = code.jit.borrow_mut();
+        let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
+        let compiles = f.stats.compiles;
+        let prepared =
+            unsafe { f.vm_prepare(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch) };
+        // Debugging: `TOI_JIT_LOG` prints each compilation's stencils;
+        // `TOI_JIT_DUMP=<file>` writes the last one's hot code.
+        if f.stats.compiles != compiles
+            && let Some(c) = f.last_code()
+        {
+            if std::env::var_os("TOI_JIT_LOG").is_some() {
+                let names: Vec<&str> = c.stencils.iter().flatten().map(String::as_str).collect();
+                eprintln!("jit {} @{pc}: {}", code.name, names.join(" "));
+            }
+            if let Some(path) = std::env::var_os("TOI_JIT_DUMP") {
+                std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
+            }
         }
-        if let Some(path) = std::env::var_os("TOI_JIT_DUMP") {
-            std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
-        }
-    }
-    let start = code.bytecode.as_ptr();
-    let Some((frame, pc, acc)) = r else {
-        return interp::Resume {
-            regs,
-            pc: unsafe { start.add(pc) },
-            acc,
-        };
+        prepared
     };
-    let frames = &f.vm.as_ref().unwrap().frames;
+    let Some((jit_code, acc, nregs)) = prepared else {
+        return VmRun::NotCompiled;
+    };
+    let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };
+    let (record, acc) = match unsafe { jit_code.enter(acc, regs_slice) } {
+        Outcome::Return(v) => return VmRun::Returned(v),
+        Outcome::Exit { pc: record, acc } => (record, acc),
+    };
+    let (frame, exit_pc) = {
+        let mut slot = code.jit.borrow_mut();
+        slot.as_mut().unwrap().vm_finish(&jit_code, pc, record)
+    };
+    let frames = &jit_code.snap.as_ref().unwrap().frames;
     // Headers for the inlined frames from the exit's outwards.
     let mut g = frame;
     while g != 0 {
@@ -4222,11 +4362,11 @@ pub(crate) unsafe fn vm_osr(
         g = fr.parent;
     }
     let fr = frames[frame];
-    interp::Resume {
+    VmRun::Exit(interp::Resume {
         regs: unsafe { regs.add(fr.base) },
-        pc: unsafe { (*fr.code).bytecode.as_ptr().add(pc) },
+        pc: unsafe { (*fr.code).bytecode.as_ptr().add(exit_pc) },
         acc,
-    }
+    })
 }
 
 /// `call` stencils: run the call `site` (a `CallSite`) describes, over the

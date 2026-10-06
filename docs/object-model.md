@@ -767,7 +767,8 @@ In place:
 - The external bit, always set.
 
 Step 5 has started too. Hot loops in VM frames tier up into the JIT
-(on-stack replacement from the interpreter). Property accesses compile
+(on-stack replacement from the interpreter), and calls to hot functions
+with loops enter their compiled code. Property accesses compile
 to stencils fed by the inline caches, with shape guards as exits. The JIT's
 type lattice knows objects of a known shape (`Obj(shape)`), so a guard
 that passed, or a shape seen at entry, isn't checked again. Fields have

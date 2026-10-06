@@ -1141,13 +1141,36 @@ macro_rules! int_slot {
 
 macro_rules! int_slot_pair {
     ($a:tt, $b:tt) => {
+        // In place, wrapped on overflow (the exit stub undoes it). On x86-64
+        // in asm: LLVM picks the wrong destination and needs two extra
+        // moves (`mov rax, rsi; mov esi, edi; add esi, eax`).
         stencil!("addr_ii_u", $a, "_u", $b; |s| {
-            let (v, overflow) = raw(s.g[$a]).overflowing_add(raw(s.g[$b]));
-            s.g[$a] = unboxed(v);
-            if overflow {
-                exit!(s)
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut v = s.g[$a].to_bits();
+                core::arch::asm!(
+                    "add {v:e}, {b:e}",
+                    "{{disp32}} jo {ovf}",
+                    v = inout(reg) v,
+                    b = in(reg) s.g[$b].to_bits(),
+                    ovf = label { unsafe {
+                        s.g[$a] = Value::from_bits(v);
+                        exit!(s)
+                    } },
+                    options(nomem, nostack),
+                );
+                s.g[$a] = Value::from_bits(v);
+                next!(s)
             }
-            next!(s)
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (v, overflow) = raw(s.g[$a]).overflowing_add(raw(s.g[$b]));
+                s.g[$a] = unboxed(v);
+                if overflow {
+                    exit!(s)
+                }
+                next!(s)
+            }
         });
         stencil!("undo_addr_u", $a, "_u", $b; |s| {
             s.g[$a] = unboxed(raw(s.g[$a]).wrapping_sub(raw(s.g[$b])));
@@ -1179,3 +1202,40 @@ macro_rules! fp_int_slot_pair {
 with_gprs!(each_gpr! int_slot);
 with_gprs!(gpr_pairs! int_slot_pair);
 with_gprs!(fp_gpr_pairs! fp_int_slot_pair);
+
+// ---- Slot moves, for three-address adds ----
+//
+// `ldar a; add b…; star c` with `c ≠ a` is fused as `c = a` followed by the
+// in-place `c += b` stencils above (`addr_*`), instead of one stencil per
+// slot triple. `mov_f<c>_u<a>` converts an int32 to a double on the way.
+
+macro_rules! mov_int_pair {
+    ($c:tt, $a:tt) => {
+        stencil!("mov_u", $c, "_u", $a; |s| {
+            s.g[$c] = s.g[$a];
+            next!(s)
+        });
+    };
+}
+
+macro_rules! mov_fp_pair {
+    ($c:tt, $a:tt) => {
+        stencil!("mov_f", $c, "_f", $a; |s| {
+            s.f[$c] = s.f[$a];
+            next!(s)
+        });
+    };
+}
+
+macro_rules! mov_fp_int_pair {
+    ($c:tt, $a:tt) => {
+        stencil!("mov_f", $c, "_u", $a; |s| {
+            s.f[$c] = raw(s.g[$a]) as f64;
+            next!(s)
+        });
+    };
+}
+
+with_gprs!(gpr_pairs! mov_int_pair);
+with_gprs!(fp_gpr_pairs! mov_fp_int_pair);
+cartesian!(mov_fp_pair [0 1 2 3 4 5 6] [0 1 2 3 4 5 6]);

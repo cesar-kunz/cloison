@@ -1189,20 +1189,52 @@ fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
     live_out
 }
 
-/// A matched fused group.
-struct Fused {
-    /// Number of bytecode instructions it covers.
-    len: usize,
+/// One stencil of a fused group.
+struct FusedStep {
     name: String,
     imm: i32,
-    /// `ldar` stencil for the group's register, to rematerialize `acc` after
-    /// the group or in its exit stub.
-    ldar: String,
-    acc_live_after: bool,
+    /// The bytecode instruction an exit from this step happens before.
+    insn: usize,
     /// For in-place ops on unboxed slots, which write the wrapped result
     /// before checking overflow: the stencil (and immediate) that undoes it
     /// in the exit stub.
     undo: Option<(String, i32)>,
+}
+
+/// A matched fused group: one or more stencils replacing `len` bytecode
+/// instructions.
+struct Fused {
+    len: usize,
+    steps: Vec<FusedStep>,
+    /// `ldar` stencil for the slot holding the group's result, to
+    /// rematerialize `acc` after the group or in an exit stub (where that
+    /// slot holds the interpreter's `acc` at the exiting instruction).
+    ldar: String,
+    acc_live_after: bool,
+}
+
+impl Fused {
+    fn single(
+        len: usize,
+        name: String,
+        imm: i32,
+        ldar: String,
+        acc_live_after: bool,
+        undo: Option<(String, i32)>,
+        insn: usize,
+    ) -> Fused {
+        Fused {
+            len,
+            steps: vec![FusedStep {
+                name,
+                imm,
+                insn,
+                undo,
+            }],
+            ldar,
+            acc_live_after,
+        }
+    }
 }
 
 /// Matches fused-stencil patterns (see the fused section of
@@ -1222,6 +1254,9 @@ struct Fusion<'a> {
 impl Fusion<'_> {
     fn at(&self, i: usize) -> Option<Fused> {
         let widened = self.widened?;
+        if let Some(f) = self.add_chain(i, widened) {
+            return Some(f);
+        }
         let insns = self.insns;
         let group = |len: usize| {
             i + len <= insns.len()
@@ -1246,19 +1281,20 @@ impl Fusion<'_> {
         let ldar = format!("ldar_{}", home.loc());
         let fused = |len: usize, name: String, imm: i32| {
             let acc_live_after = self.live_out[i + len - 1];
-            Some(Fused {
+            Some(Fused::single(
                 len,
                 name,
                 imm,
-                ldar: ldar.clone(),
+                ldar.clone(),
                 acc_live_after,
-                undo: None,
-            })
+                None,
+                i + 1,
+            ))
         };
         let undone = |f: Option<Fused>, undo: String, imm: i32| {
-            f.map(|f| Fused {
-                undo: Some((undo, imm)),
-                ..f
+            f.map(|mut f| {
+                f.steps[0].undo = Some((undo, imm));
+                f
             })
         };
 
@@ -1302,32 +1338,110 @@ impl Fusion<'_> {
                 mid.imm,
             ),
             (Op::AddSmi | Op::Inc, Home::Fpr(a)) if dbl => fused(3, format!("addi_f{a}"), mid.imm),
-            // ldar r; add r2; star r
-            (Op::Add, _) if mid.reg as usize != r => {
-                let r2 = mid.reg as usize;
-                let t2 = self.ins[i + 1].as_ref()?.regs[r2];
-                match (home, self.homes[r2], t2) {
-                    (Home::Gpr(a), Home::Gpr(b), Ty::I32) if int_ok => {
-                        fused(3, format!("addr_ii_g{a}_g{b}"), 0)
-                    }
-                    (Home::Int(a), Home::Int(b), Ty::I32) if int_ok => {
-                        let f = fused(3, format!("addr_ii_u{a}_u{b}"), 0);
-                        undone(f, format!("undo_addr_u{a}_u{b}"), 0)
-                    }
-                    (Home::Fpr(a), Home::Gpr(b), Ty::I32) if dbl => {
-                        fused(3, format!("addr_fi_f{a}_g{b}"), 0)
-                    }
-                    (Home::Fpr(a), Home::Int(b), Ty::I32) if dbl => {
-                        fused(3, format!("addr_fi_f{a}_u{b}"), 0)
-                    }
-                    (Home::Fpr(a), Home::Fpr(b), Ty::F64) if dbl => {
-                        fused(3, format!("addr_ff_f{a}_f{b}"), 0)
-                    }
-                    _ => None,
-                }
-            }
             _ => None,
         }
+    }
+}
+
+impl Fusion<'_> {
+    /// `ldar a; add b1; …; add bn; star c` (n ≥ 1) as `c = a` (a slot move,
+    /// skipped when `c == a`) followed by in-place `c += b_k` stencils.
+    ///
+    /// If add k overflows, its stencil exits with the wrapped sum in `c`; the
+    /// exit stub undoes it, so `c` holds `a + b1 + … + b(k-1)`, the
+    /// interpreter's `acc` before add k, and rematerializes `acc` from it.
+    /// `c` itself is dead there (the pending `star c` overwrites it), which
+    /// requires that no `b_k` is `c`: that add would read `c`'s original
+    /// value. With `c` in an FP slot the chain is computed in double from the
+    /// start, which is exact for int32 operands too; the result must then be
+    /// typed double, so a live `acc` stays consistent.
+    fn add_chain(&self, i: usize, widened: &HashSet<usize>) -> Option<Fused> {
+        let insns = self.insns;
+        if insns[i].op != Op::Ldar {
+            return None;
+        }
+        let mut j = i + 1;
+        while j < insns.len()
+            && insns[j].op == Op::Add
+            && !self.is_target[j]
+            && self.ins[j].is_some()
+        {
+            j += 1;
+        }
+        let n = j - i - 1;
+        if n == 0
+            || j >= insns.len()
+            || insns[j].op != Op::Star
+            || self.is_target[j]
+            || self.ins[j].is_none()
+        {
+            return None;
+        }
+        let (a, c) = (insns[i].reg as usize, insns[j].reg as usize);
+        let adds = i + 1..j;
+        if adds.clone().any(|k| insns[k].reg as usize == c) {
+            return None;
+        }
+        let reg_ty = |k: usize, r: usize| self.ins[k].as_ref().map(|st| st.regs[r]);
+        let mut steps = Vec::new();
+        let step = |name: String, insn: usize, undo: Option<(String, i32)>| FusedStep {
+            name,
+            imm: 0,
+            insn,
+            undo,
+        };
+        match self.homes[c] {
+            Home::Int(cs) => {
+                if a != c {
+                    let Home::Int(as_) = self.homes[a] else {
+                        return None;
+                    };
+                    steps.push(step(format!("mov_u{cs}_u{as_}"), i + 1, None));
+                }
+                for k in adds {
+                    let b = insns[k].reg as usize;
+                    let st = self.ins[k].as_ref()?;
+                    let Home::Int(bs) = self.homes[b] else {
+                        return None;
+                    };
+                    if st.acc != Ty::I32 || st.regs[b] != Ty::I32 || widened.contains(&k) {
+                        return None;
+                    }
+                    let undo = (format!("undo_addr_u{cs}_u{bs}"), 0);
+                    steps.push(step(format!("addr_ii_u{cs}_u{bs}"), k, Some(undo)));
+                }
+            }
+            Home::Fpr(cs) => {
+                if self.ins[j].as_ref()?.acc != Ty::F64 {
+                    return None;
+                }
+                if a != c {
+                    let name = match (self.homes[a], reg_ty(i, a)?) {
+                        (Home::Fpr(as_), Ty::F64) => format!("mov_f{cs}_f{as_}"),
+                        (Home::Int(as_), Ty::I32) => format!("mov_f{cs}_u{as_}"),
+                        _ => return None,
+                    };
+                    steps.push(step(name, i + 1, None));
+                }
+                for k in adds {
+                    let b = insns[k].reg as usize;
+                    let name = match (self.homes[b], reg_ty(k, b)?) {
+                        (Home::Fpr(bs), Ty::F64) => format!("addr_ff_f{cs}_f{bs}"),
+                        (Home::Int(bs), Ty::I32) => format!("addr_fi_f{cs}_u{bs}"),
+                        (Home::Gpr(bs), Ty::I32) => format!("addr_fi_f{cs}_g{bs}"),
+                        _ => return None,
+                    };
+                    steps.push(step(name, k, None));
+                }
+            }
+            _ => return None,
+        }
+        Some(Fused {
+            len: n + 2,
+            steps,
+            ldar: format!("ldar_{}", self.homes[c].loc()),
+            acc_live_after: self.live_out[j],
+        })
     }
 }
 
@@ -1646,35 +1760,44 @@ impl JitCode {
                 } else {
                     Target::Next
                 };
-                let main = Piece {
-                    jump,
-                    exit: i + 1,
-                    ..Piece::with_imm(&f.name, f.imm)
-                };
-                if main.uses("toi_exit") {
-                    // Exit before the arithmetic instruction, with `acc`
-                    // holding the register `ldar` loaded.
-                    let mut seq = Vec::new();
-                    if let Some((undo, imm)) = &f.undo {
+                let n_steps = f.steps.len();
+                for (k, step) in f.steps.iter().enumerate() {
+                    let piece = Piece {
+                        jump: if k + 1 == n_steps { jump } else { Target::Next },
+                        exit: step.insn,
+                        ..Piece::with_imm(&step.name, step.imm)
+                    };
+                    if piece.uses("toi_exit") {
+                        // Exit before the step's instruction: undo the
+                        // in-place op, then `acc` is the result slot.
+                        let mut seq = Vec::new();
+                        if let Some((undo, imm)) = &step.undo {
+                            seq.push(Piece {
+                                imm: *imm,
+                                ..Piece::new(undo, 0)
+                            });
+                        }
+                        seq.push(Piece::new(&f.ldar, 0));
+                        seq.push(Piece::new("box_iacc", 0));
+                        seq.extend(spills(&homes));
                         seq.push(Piece {
-                            imm: *imm,
-                            ..Piece::new(undo, 0)
+                            imm: insns[step.insn].pc as i32,
+                            ..Piece::new("exit", 0)
                         });
+                        exits.push((step.insn, seq));
                     }
-                    seq.push(Piece::new(&f.ldar, insn.reg));
-                    seq.push(Piece::new("box_iacc", 0));
-                    seq.extend(spills(&homes));
-                    seq.push(Piece {
-                        imm: insns[i + 1].pc as i32,
-                        ..Piece::new("exit", 0)
-                    });
-                    exits.push((i + 1, seq));
+                    hot.push(piece);
                 }
-                hot.push(main);
                 if f.acc_live_after {
-                    hot.push(Piece::new(&f.ldar, insn.reg));
+                    hot.push(Piece::new(&f.ldar, 0));
                 }
-                names[i] = Some(f.name);
+                names[i] = Some(
+                    f.steps
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("+"),
+                );
                 i += f.len;
                 continue;
             }

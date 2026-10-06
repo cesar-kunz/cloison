@@ -22,6 +22,8 @@
 //!   jit3     with VM registers in machine registers too (milestone 3)
 //!   jit4     with fused stencils too
 //!   jit      with unboxed int32 in slots too
+//!   tier     the full JIT, starting in the interpreter and tiering up
+//!            after 1000 loop back edges (on-stack replacement)
 //!
 //! JIT timings include compilation, which happens on entry (and again after
 //! a side exit; `double` exits once when `s` overflows int32).
@@ -37,7 +39,7 @@
 use std::process::exit;
 use std::time::Instant;
 use toi::bytecode::Assembler;
-use toi::jit::JitFunction;
+use toi::jit::{JitFunction, Tiering};
 use toi::value::Value;
 
 const S: u8 = 0;
@@ -49,7 +51,7 @@ const A1: u8 = 4;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dispatch_bench <int|const|chain|double|wide> <generic|smi> [n] [interp|jit1|jit2|jit3|jit4|jit]"
+        "usage: dispatch_bench <int|const|chain|double|wide> <generic|smi> [n] [interp|jit1|jit2|jit3|jit4|jit|tier]"
     );
     exit(2)
 }
@@ -69,7 +71,10 @@ fn main() {
         .map_or(100_000_000, |s| s.parse().unwrap_or_else(|_| usage()));
     assert!(n > 0, "the loop tests at the bottom, so n must be positive");
     let engine = args.get(4).map_or("interp", String::as_str);
-    if !matches!(engine, "interp" | "jit1" | "jit2" | "jit3" | "jit4" | "jit") {
+    if !matches!(
+        engine,
+        "interp" | "jit1" | "jit2" | "jit3" | "jit4" | "jit" | "tier"
+    ) {
         usage()
     }
     let nf = n as f64;
@@ -131,6 +136,10 @@ fn main() {
         "jit2" => Some(JitFunction::new(&code).without_register_homes()),
         "jit3" => Some(JitFunction::new(&code).without_fusion()),
         "jit4" => Some(JitFunction::new(&code).without_unboxed_ints()),
+        "tier" => Some(JitFunction::new(&code).tiered(Tiering {
+            back_edges: 1000,
+            calls: 10,
+        })),
         _ => None,
     };
     let start = Instant::now();

@@ -8,7 +8,8 @@
 #   jit2        + type-specialized stencils (milestone 2)
 #   jit3        + VM registers in machine registers (milestone 3)
 #   jit4        + fused stencils
-#   jit         + unboxed int32 in slots
+#   jit         + unboxed int32 in slots (and later work)
+#   tier        jit, starting in the interpreter and tiering up
 #
 # Per-iteration numbers are (run at N) − (run at 1), divided by N − 1, which
 # cancels process startup. Each cell is the minimum over REPS runs, pinned
@@ -32,6 +33,7 @@ declare -A RUN=(
   [jit3]="target/release/dispatch_bench %s %s %s jit3"
   [jit4]="target/release/dispatch_bench %s %s %s jit4"
   [jit]="target/release/dispatch_bench %s %s %s jit"
+  [tier]="target/release/dispatch_bench %s %s %s tier"
 )
 
 # Print "instructions cycles" for one run: the minimum of each over REPS.

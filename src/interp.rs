@@ -977,6 +977,7 @@ handlers! {
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+            (*ic_at(regs, pc, 4)).holder = as_object(f);
             let this = construct_this(regs, as_object(f));
             let args = reg(pc, 2, regs);
             enter!(as_object(f), this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
@@ -1119,6 +1120,7 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_construct(pc, acc, regs, tag) {
+        record_callee(pc, regs, tag);
         let r = (*frame_vm(regs)).construct_other(*reg(pc, 1, regs));
         next_or_throw!(Op::Construct.size(), r)
     }

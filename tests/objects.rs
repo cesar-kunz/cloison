@@ -1513,7 +1513,10 @@ end
     // Twice fib(0) + … + fib(14) = 2 × 986, plus 30.
     let (v, s) = jit(src);
     assert_eq!(v, "2002");
-    assert!(s.iter().any(|n| n == "call"), "{s:?}");
+    // Through the runtime, with their results predicted: `new Box`'s, and
+    // `push`'s.
+    assert!(s.iter().any(|n| n == "call+check_acc_shape"), "{s:?}");
+    assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
 }
 
 /// A callee (through the runtime: its call site is first reached after
@@ -2093,6 +2096,121 @@ end
 ";
     let (v, _) = jit_function(&recursive_program("sum", 15000, sum), "sum");
     assert_eq!(v, (2147483000u64 + 15000 * 15001 / 2).to_string());
+}
+
+/// A loop over `total += new Box(i).v + a.push(i)` (`box_body` builds the
+/// object, with `k` in r1), returning `total`.
+fn runtime_calls_program(box_body: &str) -> String {
+    format!(
+        "\
+script
+        CreateClosure Box
+        StaGlobal Box
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function Box(k)
+{box_body}        LdaUndefined
+        Return
+end
+function main()                 ; r1 i, r2 total, r3 a, r4-r8 temps
+        CreateArray
+        Star r3
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   LdaGlobal Box
+        Star r4
+        Ldar r1
+        Star r5
+        Construct r4, r5, 1
+        Star r8
+        GetNamed r8, v
+        Add r2
+        Star r2
+        GetNamed r3, push
+        Star r6
+        Mov r3, r7
+        Ldar r1
+        Star r8
+        Call r6, r7, 1
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 300, loop
+        Ldar r2
+        Return
+end
+"
+    )
+}
+
+/// Through the runtime, `new Box(i)` is predicted to give an object of the
+/// shape `Box`'s objects have had, so loading `v` needs no guard, and
+/// `push` an int32, as natives declare, so the add is on int32s.
+#[test]
+fn runtime_call_results_are_predicted() {
+    let src = runtime_calls_program("        Ldar r1\n        SetNamed r0, v\n");
+    // Σ i + Σ (i + 1), the array's length after each push.
+    let (v, s) = jit(&src);
+    assert_eq!(v, (300 * 300).to_string());
+    assert!(s.iter().any(|n| n == "call+check_acc_shape"), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("get_own_nc_")), "{s:?}");
+    assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
+    assert!(
+        s.iter().filter(|n| n.starts_with("add_ii_")).count() >= 2,
+        "{s:?}"
+    );
+}
+
+/// From k = 200, `Box` adds `w` first: its objects get another shape, the
+/// check of `new`'s result fails, and the call is compiled again without a
+/// prediction (the constructor's shapes are many now anyway).
+#[test]
+fn runtime_call_results_are_checked() {
+    let body = "        Ldar r1\n        JumpIfLessSmi 200, v\n        LdaSmi 0\n        SetNamed r0, w\n\
+                v:      Ldar r1\n        SetNamed r0, v\n";
+    let (v, s) = jit(&runtime_calls_program(body));
+    assert_eq!(v, (300 * 300).to_string());
+    assert!(!s.iter().any(|n| n == "call+check_acc_shape"), "{s:?}");
+}
+
+/// `a` calls `b`, which calls `c`: in `main`'s loop, `a` and `b` are
+/// inlined, but not `c`, nested too deep. Small as it is, `c` is called
+/// directly (calls from the interpreter wouldn't enter its compiled code).
+#[test]
+fn small_callees_past_the_inlining_depth_are_called_directly() {
+    let f = |name: &str, callee: &str| {
+        format!(
+            "function {name}(k)\n        LdaGlobal {callee}\n        Star r2\n        Ldar r1\n\
+             \x20       Star r3\n        CallUndefined r2, r3, 1\n        AddSmi 1\n        Return\nend\n"
+        )
+    };
+    let src = format!(
+        "script\n        CreateClosure a\n        StaGlobal a\n        CreateClosure b\n\
+         \x20       StaGlobal b\n        CreateClosure c\n        StaGlobal c\n\
+         \x20       CreateClosure main\n        StaGlobal main\n        LdaGlobal main\n\
+         \x20       Star r1\n        CallUndefined r1, r2, 0\n        Return\nend\n\
+         {}{}function c(k)\n        Ldar r1\n        AddSmi 1\n        Return\nend\n\
+         function main()                 ; r1 i, r2 total, r3 a, r4 arg\n\
+         \x20       LdaSmi 0\n        Star r1\n        Star r2\n\
+         top:    LdaGlobal a\n        Star r3\n        Ldar r1\n        BitAndSmi 7\n\
+         \x20       Star r4\n        CallUndefined r3, r4, 1\n        Add r2\n        Star r2\n\
+         \x20       Ldar r1\n        Inc\n        Star r1\n        JumpIfLessSmi 500, top\n\
+         \x20       Ldar r2\n        Return\nend\n",
+        f("a", "b"),
+        f("b", "c")
+    );
+    let expected: u64 = (0..500u64).map(|i| (i & 7) + 3).sum();
+    let (v, s) = jit(&src);
+    assert_eq!(v, expected.to_string());
+    assert!(s.iter().any(|n| n == "call_direct+check_acc_int"), "{s:?}");
 }
 
 /// When `k` is 7 (every 8th call), `f1` calls `h`, which it hadn't when

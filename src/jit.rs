@@ -3127,6 +3127,18 @@ impl JitCode {
                             Version::None => Ty::Any,
                         }
                     }
+                    (
+                        Some(_),
+                        Some(Prop::Call {
+                            site,
+                            direct: false,
+                            ..
+                        }),
+                        Some(w),
+                    ) if !w.contains(&i) => {
+                        let site = vm_sites[*site as usize].get();
+                        unsafe { runtime_result((*site).cached, insns[i].op) }
+                    }
                     _ => Ty::Any,
                 })
                 .collect();
@@ -3862,6 +3874,9 @@ pub(crate) struct CallSite {
     exits: u32,
     /// The callee's code and compiled version, for a direct call.
     callee: *const crate::vm::Code,
+    /// The function the call's inline cache names (bytecode or native), if
+    /// any: a call through the runtime predicts its result from it.
+    cached: *const crate::vm::Code,
     target: Option<Rc<JitCode>>,
     /// The callee is the function compiled: bound (if at all) to the code
     /// making the call, `self_code`, which `target` can't own.
@@ -3939,6 +3954,31 @@ impl CallSite {
             Version::Busy => {}
             Version::None => self.pending = false,
         }
+    }
+}
+
+/// The prediction for the result of a call through the runtime to the
+/// function `cached` (null: unknown) with `op`: for `new`, an object of the
+/// shape the constructor's objects have had (`Code::ctor_result`); for a
+/// call, the latest prediction of a bytecode function for its results, or
+/// a native's declared type (`Code::ret_hint`). Checked after the call.
+///
+/// # Safety
+/// `cached` must be null or a live function's code.
+unsafe fn runtime_result(cached: *const crate::vm::Code, op: Op) -> Ty {
+    if cached.is_null() {
+        return Ty::Any;
+    }
+    let code = unsafe { &*cached };
+    if op == Op::Construct {
+        let shape = code.ctor_result.get();
+        if shape.is_null() || shape == crate::vm::MANY_SHAPES {
+            Ty::Any
+        } else {
+            Ty::Obj(shape as u64)
+        }
+    } else {
+        code.ret_hint.get()
     }
 }
 
@@ -4213,6 +4253,7 @@ impl Lowering<'_> {
                         nparams: 0,
                         exits: 0,
                         callee: std::ptr::null(),
+                        cached: std::ptr::null(),
                         target: None,
                         self_call: false,
                         self_code: std::ptr::null(),
@@ -4220,9 +4261,8 @@ impl Lowering<'_> {
                         claim: None,
                         pending: false,
                     };
-                    let direct = i.op != Op::Construct
-                        && self.direct_target(frame, &i, &mut site)
-                        && i.imm as u32 <= site.nparams;
+                    let direct =
+                        self.direct_target(frame, &i, &mut site) && i.imm as u32 <= site.nparams;
                     let p = Prop::Call {
                         site: self.out.sites.len() as u32,
                         direct,
@@ -4270,23 +4310,30 @@ impl Lowering<'_> {
     }
 
     /// Whether call `i` of frame `frame` may go straight into its callee's
-    /// compiled code: its cache names a function worth compiling (see
-    /// `vm::worth_entering_compiled`), or this one. Fills `site` in with the
-    /// callee; [`bind_direct`] picks the version when compiling, from the
+    /// compiled code: its cache names a bytecode function. Small ones,
+    /// which calls from the interpreter don't enter compiled (see
+    /// `vm::worth_entering_compiled`), are worth it here too: a direct call
+    /// costs much less than one through the runtime. Fills `site` in with
+    /// the callee; [`bind_direct`] picks the version when compiling, from the
     /// arguments' types, or for this function `JitCode::compile` binds the
-    /// version it compiles, if they fit it.
+    /// version it compiles, if they fit it. Notes the function the cache
+    /// names in `site.cached` either way, natives included.
     fn direct_target(&mut self, frame: usize, i: &Insn, site: &mut CallSite) -> bool {
         use crate::object::Class;
         let ic = unsafe { *self.out.fbs[frame].ics.add(i.ic as usize) };
         let fo = ic.holder;
-        if fo.is_null() || unsafe { (*fo).class } != Class::Function {
+        if fo.is_null() {
+            return false;
+        }
+        let class = unsafe { (*fo).class };
+        if matches!(class, Class::Function | Class::Native) {
+            site.cached = unsafe { (*fo).code };
+        }
+        if class != Class::Function || i.op == Op::Construct {
             return false;
         }
         let callee = unsafe { (*fo).code };
         site.self_call = callee == self.state.root;
-        if !site.self_call && unsafe { (*callee).calls_left.get() } == i32::MAX {
-            return false;
-        }
         site.closure = fo as u64;
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;

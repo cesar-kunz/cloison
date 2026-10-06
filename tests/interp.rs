@@ -1,25 +1,41 @@
-//! Every program runs on both engines, the interpreter and the
-//! copy-and-patch JIT, which must agree on the result and on the final
-//! register file.
+//! Every program runs on three engines: the interpreter, the JIT with
+//! generic stencils, and the JIT with type-specialized stencils. They must
+//! agree on the result and on the final register file.
 
 use toi::bytecode::Assembler;
+use toi::jit::JitFunction;
 use toi::value::Value;
 
-/// Bitwise equality, except that any two NaNs match (engines may differ
-/// in which NaN they produce).
+/// The same JS value. Numbers compare by value, so int32 `3` matches
+/// double `3.0` (the specialized JIT may keep a number as a double where the
+/// interpreter has an int32), but `0` and `-0` differ, and any two NaNs
+/// match. Everything else compares bitwise.
 fn same(a: Value, b: Value) -> bool {
-    let nan = |v: Value| v.as_number().is_some_and(f64::is_nan);
-    a == b || (nan(a) && nan(b))
+    match (a.as_number(), b.as_number()) {
+        (Some(x), Some(y)) => {
+            (x == y && x.is_sign_negative() == y.is_sign_negative()) || (x.is_nan() && y.is_nan())
+        }
+        _ => a == b,
+    }
 }
 
 fn exec(a: Assembler, regs: &mut [Value]) -> Value {
     let code = a.finish();
-    let mut jit_regs = regs.to_vec();
+    let initial = regs.to_vec();
     let interp = unsafe { toi::interp::run(&code, regs) };
-    let jit = unsafe { toi::jit::run(&code, &mut jit_regs) };
-    assert!(same(interp, jit), "interp returned {interp:?}, jit {jit:?}");
-    for (r, (i, j)) in regs.iter().zip(&jit_regs).enumerate() {
-        assert!(same(*i, *j), "r{r}: interp {i:?}, jit {j:?}");
+    for (name, mut f) in [
+        ("jit1", JitFunction::new(&code).unspecialized()),
+        ("jit", JitFunction::new(&code)),
+    ] {
+        let mut jit_regs = initial.clone();
+        let jit = unsafe { f.run(&mut jit_regs) };
+        assert!(
+            same(interp, jit),
+            "interp returned {interp:?}, {name} {jit:?}"
+        );
+        for (r, (i, j)) in regs.iter().zip(&jit_regs).enumerate() {
+            assert!(same(*i, *j), "r{r}: interp {i:?}, {name} {j:?}");
+        }
     }
     interp
 }
@@ -300,4 +316,107 @@ fn i32_state_survives_jumps_and_nops() {
     a.bind(l1);
     a.nop().inc().jump(l2);
     assert_eq!(exec(a, &mut []), Value::from_i32(3));
+}
+
+// ---- JIT type specialization (milestone 2) ----
+
+fn jit(a: &Assembler, regs: &mut [Value]) -> (Value, JitFunction) {
+    let code = a.clone().finish();
+    let mut f = JitFunction::new(&code);
+    let v = unsafe { f.run(regs) };
+    (v, f)
+}
+
+fn stencils(f: &JitFunction) -> Vec<&'static str> {
+    f.last_code()
+        .unwrap()
+        .stencils
+        .iter()
+        .flatten()
+        .copied()
+        .collect()
+}
+
+#[test]
+fn int_loop_is_fully_specialized() {
+    let a = sum_loop(1000);
+    let (v, f) = jit(&a, &mut [Value::UNDEFINED; 3]);
+    assert_eq!(v, Value::from_i32(499500));
+    assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
+    let s = stencils(&f);
+    assert!(
+        s.contains(&"add_ii") && s.contains(&"inc_i") && s.contains(&"jump_if_less_ii"),
+        "{s:?}"
+    );
+    assert!(
+        !s.iter().any(|n| ["add", "inc", "jump_if_less"].contains(n)),
+        "generic stencil in {s:?}"
+    );
+}
+
+#[test]
+fn overflow_exits_once_then_resumes_as_double() {
+    // The sum leaves int32 after ~65k iterations: one exit at `add`, one
+    // recompile entering mid-loop with `s` converted to double.
+    let n = 100_000i64;
+    let (v, f) = jit(&sum_loop(n as i32), &mut [Value::UNDEFINED; 3]);
+    assert_eq!(v.as_number(), Some((n * (n - 1) / 2) as f64));
+    assert_eq!((f.stats.compiles, f.stats.exits), (2, 1));
+    let s = stencils(&f);
+    assert!(s.contains(&"add_fi") && s.contains(&"inc_i"), "{s:?}");
+}
+
+#[test]
+fn widening_join_converts_on_a_jump_edge() {
+    // `s` enters the loop as int32 through a jump to the condition, and comes
+    // around as a double from the body. The join at `cond` is F64, so the
+    // jump edge needs an int32 → double conversion stub.
+    let (s, i, d) = (0, 1, 2);
+    let mut a = Assembler::new();
+    let (top, cond) = (a.label(), a.label());
+    a.lda_smi(0).star(s).star(i).jump(cond);
+    a.bind(top);
+    a.ldar(s).add(d).star(s);
+    a.ldar(i).inc().star(i);
+    a.bind(cond);
+    a.ldar(i).jump_if_less_smi(10, top);
+    a.ldar(s).ret();
+    let mut regs = [Value::UNDEFINED, Value::UNDEFINED, Value::from_f64(0.5)];
+    assert_eq!(exec(a.clone(), &mut regs.clone()).as_number(), Some(5.0));
+    let (v, f) = jit(&a, &mut regs);
+    assert_eq!(v.as_number(), Some(5.0));
+    assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
+    assert!(stencils(&f).contains(&"add_ff"), "{:?}", stencils(&f));
+}
+
+#[test]
+fn entry_types_come_from_the_live_values() {
+    // The same code, entered with an int32, a double and undefined in r0.
+    let mut a = Assembler::new();
+    a.ldar(0).add_smi(1).ret();
+    for (v, stencil, expected) in [
+        (Value::from_i32(1), "add_smi_i", 2.0),
+        (Value::from_f64(1.5), "add_smi_f", 2.5),
+        (Value::NULL, "add_smi", 1.0),
+    ] {
+        let (r, f) = jit(&a, &mut [v]);
+        assert_eq!(r.as_number(), Some(expected));
+        assert!(stencils(&f).contains(&stencil), "{v:?}: {:?}", stencils(&f));
+    }
+}
+
+#[test]
+fn too_many_recompiles_finish_in_the_interpreter() {
+    // 20 independent overflowing adds: each exits once. After 16 compiles,
+    // the rest runs in the interpreter.
+    let mut a = Assembler::new();
+    for r in 0..20 {
+        a.lda_smi(i32::MAX).add_smi(1).star(r);
+    }
+    a.ldar(19).ret();
+    let mut regs = [Value::UNDEFINED; 20];
+    let (v, f) = jit(&a, &mut regs);
+    assert_eq!(v.as_number(), Some(2147483648.0));
+    assert!(regs.iter().all(|r| r.as_number() == Some(2147483648.0)));
+    assert_eq!((f.stats.compiles, f.stats.exits), (16, 16));
 }

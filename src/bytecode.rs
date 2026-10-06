@@ -66,7 +66,7 @@ impl Op {
 }
 
 /// A tiny assembler with backpatched labels.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Assembler {
     code: Vec<u8>,
     labels: Vec<Option<usize>>,

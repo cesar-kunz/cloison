@@ -263,6 +263,27 @@ impl NumberTag {
     pub fn rebox(self, acc: Value) -> Value {
         Value::from_bits(self.0 | acc.to_bits())
     }
+
+    /// Whether `v` is a double: a number but not an int32.
+    #[inline(always)]
+    pub fn is_double(self, v: Value) -> bool {
+        v.to_bits() & self.0 != 0 && v.to_bits() < self.0
+    }
+
+    /// The double in `v`, which must be one. `NUMBER_TAG` is
+    /// `-DOUBLE_ENCODE_OFFSET` (mod 2^64), so decoding is an add of the
+    /// tag register and needs no 64-bit constant, as in JSC.
+    #[inline(always)]
+    pub fn decode_f64(self, v: Value) -> f64 {
+        f64::from_bits(v.to_bits().wrapping_add(self.0))
+    }
+
+    /// Box the result of float arithmetic on boxed numbers (see
+    /// [`Value::from_f64_arith`]), subtracting the tag register.
+    #[inline(always)]
+    pub fn encode_f64(self, d: f64) -> Value {
+        Value::from_bits(d.to_bits().wrapping_sub(self.0))
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +372,22 @@ mod tests {
         }
         assert!(Value::TRUE.is_bool() && Value::FALSE.is_bool() && !Value::NULL.is_bool());
         assert!(Value::from_bits(0x1000).is_cell());
+    }
+
+    #[test]
+    fn tag_is_minus_double_offset() {
+        assert_eq!(
+            Value::NUMBER_TAG.wrapping_add(Value::DOUBLE_ENCODE_OFFSET),
+            0
+        );
+        let tag = NumberTag::new();
+        for d in [0.5, -0.0, 1e300, f64::INFINITY, f64::NEG_INFINITY] {
+            let v = Value::from_f64(d);
+            assert!(tag.is_double(v) && !tag.is_double(Value::from_i32(1)));
+            assert_eq!(tag.decode_f64(v).to_bits(), d.to_bits());
+            assert_eq!(tag.encode_f64(d), v);
+        }
+        assert!(!tag.is_double(Value::UNDEFINED));
     }
 
     #[test]

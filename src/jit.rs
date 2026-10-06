@@ -1,18 +1,31 @@
-//! Copy-and-patch baseline JIT, milestone 1 (see `docs/future-work.md`).
+//! Copy-and-patch baseline JIT (see `docs/future-work.md`, milestones 1–2).
 //!
-//! Each bytecode instruction becomes a copy of its stencil
-//! (`stencils/stencils.rs`) with the holes patched. No type specialization:
-//! the stencils do what the interpreter's `ANY`-state handlers do, minus
-//! dispatch. Layout of the generated code:
+//! Each reachable bytecode instruction becomes a copy of a stencil
+//! (`stencils/stencils.rs`) with its holes patched. Stencils are chosen per
+//! instruction from inferred types (milestone 2):
+//!
+//! 1. [`infer`]: forward dataflow from the entry instruction over the
+//!    lattice `I32 < F64 < Any`, for `acc` and each register, seeded with the
+//!    exact types of the live values at entry.
+//! 2. [`select`]: a specialized stencil without type checks when operand
+//!    types are known (`add_ii`, `add_ff`, `jump_if_less_smi_i`, …), the
+//!    generic one otherwise. int32 arithmetic side-exits on overflow (see
+//!    [`JitFunction`]).
+//! 3. Where a join widened a type from `I32` to `F64`, the edge into it gets
+//!    a conversion stencil: inline for fall-through edges, in a cold stub for
+//!    jumps.
+//!
+//! Layout of the generated code:
 //!
 //! ```text
-//! [ main code: one stencil per instruction, in bytecode order        ]
-//! [ cold code: each instruction's `__slow` helpers                   ]
-//! [ trampolines: one per runtime function (`toi_rt_*`) referenced    ]
+//! [ hot: entry conversions; per instruction: fall-through conversions,  ]
+//! [      then the instruction's stencil                                  ]
+//! [ cold: edge stubs, exit stubs, `__slow` helpers                       ]
+//! [ trampolines: one per runtime function (`toi_rt_*`) referenced       ]
 //! ```
 //!
 //! A stencil whose last instruction jumps to `toi_continue` falls through
-//! into the next stencil with that jump trimmed. Calls to runtime functions
+//! into the next piece with that jump trimmed. Calls to runtime functions
 //! go through trampolines, so `rel32` / `CALL26` relocations only ever reach
 //! inside JIT memory. On arm64, operand holes are `adrp`+`add` pairs whose
 //! "address" is the operand value. `adrp` is page-relative with a ±4 GiB
@@ -20,7 +33,7 @@
 
 use crate::bytecode::Op;
 use crate::value::{NumberTag, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A relocation in a stencil, from `build.rs`.
 pub(crate) struct Reloc {
@@ -56,22 +69,6 @@ fn helpers(name: &str) -> impl Iterator<Item = &'static Stencil> {
             .strip_prefix(name)
             .is_some_and(|rest| rest.starts_with("__"))
     })
-}
-
-fn stencil_name(op: Op) -> &'static str {
-    match op {
-        Op::Nop => "nop",
-        Op::LdaSmi => "lda_smi",
-        Op::Ldar => "ldar",
-        Op::Star => "star",
-        Op::Add => "add",
-        Op::Inc => "inc",
-        Op::JumpIfLess => "jump_if_less",
-        Op::Jump => "jump",
-        Op::AddSmi => "add_smi",
-        Op::JumpIfLessSmi => "jump_if_less_smi",
-        Op::Return => "return",
-    }
 }
 
 // ---- Runtime functions called from stencil slow paths (C ABI) ----
@@ -349,16 +346,33 @@ impl Drop for ExecMem {
     }
 }
 
-// ---- Compilation ----
+// ---- Decoding ----
 
+#[derive(Clone, Copy)]
 struct Insn {
+    /// Bytecode offset.
+    pc: usize,
     op: Op,
-    /// `toi_hole_imm`: the immediate operand, if any.
+    /// `toi_hole_imm`: the immediate operand (1 for `inc`).
     imm: i32,
     /// `toi_hole_reg`: the register operand, if any.
     reg: u8,
     /// Instruction index of the jump target, if any.
     target: usize,
+}
+
+impl Insn {
+    fn falls_through(&self) -> bool {
+        !matches!(self.op, Op::Jump | Op::Return)
+    }
+
+    fn jumps(&self) -> bool {
+        matches!(self.op, Op::Jump | Op::JumpIfLess | Op::JumpIfLessSmi)
+    }
+
+    fn reads_reg(&self) -> bool {
+        matches!(self.op, Op::Ldar | Op::Star | Op::Add | Op::JumpIfLess)
+    }
 }
 
 fn decode(code: &[u8]) -> Vec<Insn> {
@@ -386,13 +400,15 @@ fn decode(code: &[u8]) -> Vec<Insn> {
             let (mut imm, mut reg, mut target) = (0, 0, 0);
             match op {
                 Op::LdaSmi | Op::AddSmi => imm = imm_at(pc + 1),
+                Op::Inc => imm = 1,
                 Op::Ldar | Op::Star | Op::Add => reg = code[pc + 1],
                 Op::JumpIfLess => (reg, target) = (code[pc + 1], index_of(pc, imm_at(pc + 2))),
                 Op::JumpIfLessSmi => (imm, target) = (imm_at(pc + 1), index_of(pc, imm_at(pc + 5))),
                 Op::Jump => target = index_of(pc, imm_at(pc + 1)),
-                Op::Nop | Op::Inc | Op::Return => {}
+                Op::Nop | Op::Return => {}
             }
             Insn {
+                pc,
                 op,
                 imm,
                 reg,
@@ -402,60 +418,440 @@ fn decode(code: &[u8]) -> Vec<Insn> {
         .collect()
 }
 
-/// Compiled code for one bytecode function.
-pub struct JitCode {
-    mem: ExecMem,
-    /// Bytes of main code (excluding cold code and trampolines).
-    main_len: usize,
+// ---- Type inference ----
+
+/// The type lattice: `Bot < I32 < F64 < Any`. The join of `I32` and `F64`
+/// is `F64`: an int32 converts losslessly to a double, so an edge carrying
+/// `I32` into an `F64` point gets a conversion stencil.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum Ty {
+    Bot,
+    I32,
+    F64,
+    Any,
 }
 
-type Entry = extern "rust-preserve-none" fn(Value, *mut Value, NumberTag) -> Value;
+impl Ty {
+    /// The exact type of a runtime value.
+    pub fn of(v: Value) -> Ty {
+        if v.is_int32() {
+            Ty::I32
+        } else if v.is_double() {
+            Ty::F64
+        } else {
+            Ty::Any
+        }
+    }
+}
+
+/// Types of the accumulator and of every register, at an instruction
+/// boundary.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct TypeState {
+    pub acc: Ty,
+    pub regs: Vec<Ty>,
+}
+
+impl TypeState {
+    fn of(acc: Value, regs: &[Value]) -> TypeState {
+        TypeState {
+            acc: Ty::of(acc),
+            regs: regs.iter().map(|&v| Ty::of(v)).collect(),
+        }
+    }
+
+    fn any(nregs: usize) -> TypeState {
+        TypeState {
+            acc: Ty::Any,
+            regs: vec![Ty::Any; nregs],
+        }
+    }
+
+    /// Join `other` into `self`; returns whether `self` changed.
+    fn join(&mut self, other: &TypeState) -> bool {
+        let mut changed = false;
+        for (a, b) in std::iter::once((&mut self.acc, &other.acc))
+            .chain(self.regs.iter_mut().zip(&other.regs))
+        {
+            if *b > *a {
+                *a = *b;
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
+/// A representation change on a control-flow edge.
+#[derive(Clone, Copy)]
+enum Conv {
+    Acc,
+    Reg(u8),
+}
+
+/// Conversions needed to go from `from` (an edge's source) to `to` (the
+/// target's joined in-state). Types only widen along edges, and only
+/// `I32 → F64` changes the representation.
+fn conversions(from: &TypeState, to: &TypeState) -> Vec<Conv> {
+    debug_assert!(from.acc <= to.acc && from.regs.iter().zip(&to.regs).all(|(a, b)| a <= b));
+    let widens = |a: Ty, b: Ty| a == Ty::I32 && b == Ty::F64;
+    let mut out = Vec::new();
+    if widens(from.acc, to.acc) {
+        out.push(Conv::Acc);
+    }
+    for (r, (&a, &b)) in from.regs.iter().zip(&to.regs).enumerate() {
+        if widens(a, b) {
+            out.push(Conv::Reg(r as u8));
+        }
+    }
+    out
+}
+
+/// The stencil for `insn` given its in-state, and its out-state.
+/// `widened` holds the instructions whose int32 result overflowed before;
+/// they produce a double instead of exiting. `None` means no
+/// specialization: everything is `Any`, so every stencil is generic.
+fn select(
+    insn: &Insn,
+    i: usize,
+    st: &TypeState,
+    widened: Option<&HashSet<usize>>,
+) -> (&'static str, TypeState) {
+    use Ty::{Any, F64, I32};
+    let Some(widened) = widened else {
+        let any = TypeState::any(st.regs.len());
+        let (name, _) = select(insn, i, &any, Some(&HashSet::new()));
+        return (name, any);
+    };
+    let mut out = st.clone();
+    let reg = || st.regs[insn.reg as usize];
+    // An int32 op: exits on overflow unless it overflowed before.
+    let int_op = |name: &'static str, widened_name: &'static str| {
+        if widened.contains(&i) {
+            (widened_name, F64)
+        } else {
+            (name, I32)
+        }
+    };
+    let name = match insn.op {
+        Op::Nop => "nop",
+        Op::Jump => "jump",
+        Op::Return => "return",
+        Op::LdaSmi => {
+            out.acc = I32;
+            "lda_smi"
+        }
+        Op::Ldar => {
+            out.acc = reg();
+            "ldar"
+        }
+        Op::Star => {
+            out.regs[insn.reg as usize] = st.acc;
+            "star"
+        }
+        Op::Add => {
+            let (name, ty) = match (st.acc, reg()) {
+                (I32, I32) => int_op("add_ii", "add_ii_f"),
+                (I32, F64) => ("add_if", F64),
+                (F64, I32) => ("add_fi", F64),
+                (F64, F64) => ("add_ff", F64),
+                _ => ("add", Any),
+            };
+            out.acc = ty;
+            name
+        }
+        Op::AddSmi => {
+            let (name, ty) = match st.acc {
+                I32 => int_op("add_smi_i", "add_smi_i_f"),
+                F64 => ("add_smi_f", F64),
+                _ => ("add_smi", Any),
+            };
+            out.acc = ty;
+            name
+        }
+        Op::Inc => {
+            let (name, ty) = match st.acc {
+                I32 => int_op("inc_i", "inc_i_f"),
+                F64 => ("inc_f", F64),
+                _ => ("inc", Any),
+            };
+            out.acc = ty;
+            name
+        }
+        Op::JumpIfLess => match (st.acc, reg()) {
+            (I32, I32) => "jump_if_less_ii",
+            (I32, F64) => "jump_if_less_if",
+            (F64, I32) => "jump_if_less_fi",
+            (F64, F64) => "jump_if_less_ff",
+            _ => "jump_if_less",
+        },
+        Op::JumpIfLessSmi => match st.acc {
+            I32 => "jump_if_less_smi_i",
+            F64 => "jump_if_less_smi_f",
+            _ => "jump_if_less_smi",
+        },
+    };
+    (name, out)
+}
+
+/// Forward dataflow from `entry` (instruction index) with `entry_state`.
+/// Returns the joined in-state of every reachable instruction.
+fn infer(
+    insns: &[Insn],
+    entry: usize,
+    entry_state: TypeState,
+    widened: Option<&HashSet<usize>>,
+) -> Vec<Option<TypeState>> {
+    let mut ins: Vec<Option<TypeState>> = vec![None; insns.len()];
+    ins[entry] = Some(entry_state);
+    let mut work = vec![entry];
+    while let Some(i) = work.pop() {
+        let (_, out) = select(&insns[i], i, ins[i].as_ref().unwrap(), widened);
+        let succs = [
+            insns[i].falls_through().then_some(i + 1),
+            insns[i].jumps().then_some(insns[i].target),
+        ];
+        for s in succs.into_iter().flatten() {
+            assert!(s < insns.len(), "control falls off the end of the bytecode");
+            let changed = match &mut ins[s] {
+                Some(st) => st.join(&out),
+                slot @ None => {
+                    *slot = Some(out.clone());
+                    true
+                }
+            };
+            if changed {
+                work.push(s);
+            }
+        }
+    }
+    ins
+}
+
+// ---- Layout and patching ----
+
+/// Where a stencil's `toi_continue` / `toi_jump_target` goes.
+#[derive(Clone, Copy)]
+enum Target {
+    /// Whatever is laid out right after this piece (lets the jump be trimmed).
+    Next,
+    /// The main stencil of instruction `i`.
+    Label(usize),
+    /// Edge stub `n` (conversions, then a jump to its target).
+    Stub(usize),
+}
+
+/// One stencil instance to emit.
+struct Piece {
+    stencil: &'static Stencil,
+    imm: i32,
+    reg: u8,
+    cont: Target,
+    jump: Target,
+    /// Instruction whose exit stub `toi_exit` goes to.
+    exit: usize,
+}
+
+impl Piece {
+    fn conv(c: Conv, cont: Target) -> Piece {
+        let (name, reg) = match c {
+            Conv::Acc => ("conv_acc_f", 0),
+            Conv::Reg(r) => ("conv_reg_f", r),
+        };
+        Piece {
+            stencil: stencil(name),
+            imm: 0,
+            reg,
+            cont,
+            jump: Target::Next,
+            exit: usize::MAX,
+        }
+    }
+
+    fn convs(cs: &[Conv], last: Target) -> Vec<Piece> {
+        cs.iter()
+            .enumerate()
+            .map(|(k, &c)| {
+                Piece::conv(
+                    c,
+                    if k + 1 == cs.len() {
+                        last
+                    } else {
+                        Target::Next
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn trims(&self) -> bool {
+        matches!(self.cont, Target::Next)
+            && arch::ends_with_continue(self.stencil.code, self.stencil.relocs)
+    }
+
+    fn len(&self) -> usize {
+        self.stencil.code.len() - if self.trims() { arch::TRAILING_JUMP } else { 0 }
+    }
+
+    fn uses(&self, symbol: &str) -> bool {
+        self.stencil.relocs.iter().any(|r| r.symbol == symbol)
+    }
+}
+
+/// Value of `ctx` while running: no exit taken.
+const NO_EXIT: u32 = u32::MAX;
+
+type Entry = extern "rust-preserve-none" fn(Value, *mut Value, NumberTag, *mut u32) -> Value;
+
+/// Machine code for one entry into a bytecode function.
+pub struct JitCode {
+    mem: ExecMem,
+    entry: usize,
+    /// Bytes of hot code, from the start (excluding cold code).
+    main_len: usize,
+    /// The selected stencil per instruction (`None`: unreachable from the
+    /// entry), for inspection and tests.
+    pub stencils: Vec<Option<&'static str>>,
+}
+
+/// How a run of [`JitCode`] ended.
+pub enum Outcome {
+    Return(Value),
+    /// Side exit before the instruction at bytecode offset `pc`, with `acc`;
+    /// the register file is up to date.
+    Exit {
+        pc: usize,
+        acc: Value,
+    },
+}
 
 impl JitCode {
-    /// Compile `code`. Panics on malformed bytecode.
-    pub fn compile(code: &[u8]) -> JitCode {
-        let insns = decode(code);
+    /// Compile `insns` for entry at instruction `entry` with types
+    /// `entry_state`. With `specialize` off, every stencil is generic
+    /// (milestone 1).
+    fn compile(
+        insns: &[Insn],
+        entry: usize,
+        entry_state: TypeState,
+        widened: &HashSet<usize>,
+        specialize: bool,
+    ) -> JitCode {
         let n = insns.len();
-        assert!(n > 0, "empty bytecode");
+        let entry_state = if specialize {
+            entry_state
+        } else {
+            TypeState::any(entry_state.regs.len())
+        };
+        let widened = specialize.then_some(widened);
+        let ins = infer(insns, entry, entry_state.clone(), widened);
+        let sel: Vec<Option<(&'static str, TypeState)>> = (0..n)
+            .map(|i| ins[i].as_ref().map(|st| select(&insns[i], i, st, widened)))
+            .collect();
 
-        // Layout. Main code first: each stencil, minus its trailing jump to
-        // `toi_continue` (the next stencil follows directly).
-        let mains: Vec<&Stencil> = insns.iter().map(|i| stencil(stencil_name(i.op))).collect();
-        let mut main_off = Vec::with_capacity(n + 1);
-        let mut main_len = Vec::with_capacity(n);
-        let mut pos = 0;
-        for (i, s) in mains.iter().enumerate() {
-            let trim = i + 1 < n && arch::ends_with_continue(s.code, s.relocs);
-            let len = s.code.len() - if trim { arch::TRAILING_JUMP } else { 0 };
-            main_off.push(pos);
-            main_len.push(len);
-            pos += len;
+        // Hot code: entry conversions, then each reachable instruction in
+        // bytecode order, preceded by the conversions on its fall-through
+        // edge. Jump edges needing conversions get cold stubs.
+        let mut hot: Vec<Piece> = Vec::new();
+        let mut stubs: Vec<Vec<Piece>> = Vec::new();
+        let mut label_piece = vec![usize::MAX; n];
+
+        let entry_convs = conversions(&entry_state, ins[entry].as_ref().unwrap());
+        hot.extend(Piece::convs(&entry_convs, Target::Label(entry)));
+
+        for i in 0..n {
+            let Some((name, out)) = &sel[i] else { continue };
+            let insn = &insns[i];
+            if i > 0
+                && let Some((_, prev_out)) = &sel[i - 1]
+                && insns[i - 1].falls_through()
+            {
+                hot.extend(Piece::convs(
+                    &conversions(prev_out, ins[i].as_ref().unwrap()),
+                    Target::Next,
+                ));
+            }
+            let jump = if insn.jumps() {
+                let cs = conversions(out, ins[insn.target].as_ref().unwrap());
+                if cs.is_empty() {
+                    Target::Label(insn.target)
+                } else {
+                    stubs.push(Piece::convs(&cs, Target::Label(insn.target)));
+                    Target::Stub(stubs.len() - 1)
+                }
+            } else {
+                Target::Next
+            };
+            label_piece[i] = hot.len();
+            hot.push(Piece {
+                stencil: stencil(name),
+                imm: insn.imm,
+                reg: insn.reg,
+                cont: Target::Next,
+                jump,
+                exit: i,
+            });
         }
-        main_off.push(pos);
-        let main_end = pos;
 
-        // Cold code: each instruction's helpers.
+        // Positions. Hot pieces back to back; then cold code: edge stubs,
+        // exit stubs, helpers; then trampolines.
+        let mut pos = 0;
+        let hot_at: Vec<usize> = hot
+            .iter()
+            .map(|p| {
+                let at = pos;
+                pos += p.len();
+                at
+            })
+            .collect();
+        let main_len = pos;
+        let label = |i: usize| hot_at[label_piece[i]];
+        let entry_at = if entry_convs.is_empty() {
+            label(entry)
+        } else {
+            0
+        };
+
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
-        let mut helper_off: HashMap<(usize, &str), usize> = HashMap::new();
+        let mut stub_at = Vec::new();
+        let mut stub_piece_at = Vec::new();
+        for stub in &stubs {
+            stub_at.push(pos);
+            stub_piece_at.push(
+                stub.iter()
+                    .map(|p| {
+                        let at = pos;
+                        pos += p.len();
+                        at
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        let mut exit_at: HashMap<usize, usize> = HashMap::new();
+        for p in &hot {
+            if p.uses("toi_exit") && !exit_at.contains_key(&p.exit) {
+                exit_at.insert(p.exit, pos);
+                pos += stencil("exit").code.len();
+            }
+        }
+        // Helpers, per piece instance: (piece key, helper name) -> offset.
+        let mut helper_at: HashMap<(usize, &str), usize> = HashMap::new();
         let mut helper_list = Vec::new();
-        for (i, s) in mains.iter().enumerate() {
-            for h in helpers(s.name) {
-                helper_off.insert((i, h.name), pos);
-                helper_list.push((i, h, pos));
+        for (k, p) in hot.iter().enumerate() {
+            for h in helpers(p.stencil.name) {
+                helper_at.insert((k, h.name), pos);
+                helper_list.push((k, h, pos));
                 pos += h.code.len();
             }
         }
-
-        // Trampolines for the runtime functions referenced anywhere.
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
-        let mut tramp_off: HashMap<&str, usize> = HashMap::new();
-        let all = mains
+        let mut tramp_at: HashMap<&str, usize> = HashMap::new();
+        let referenced = hot
             .iter()
-            .copied()
+            .map(|p| p.stencil)
             .chain(helper_list.iter().map(|&(_, h, _)| h));
-        for s in all {
+        for s in referenced {
             for r in s.relocs.iter().filter(|r| r.symbol.starts_with("toi_rt_")) {
-                tramp_off.entry(r.symbol).or_insert_with(|| {
+                tramp_at.entry(r.symbol).or_insert_with(|| {
                     let at = pos;
                     pos += arch::TRAMPOLINE_SIZE;
                     at
@@ -466,24 +862,37 @@ impl JitCode {
         let mut mem = ExecMem::new(pos);
         let base = mem.ptr as u64;
         let buf = mem.bytes();
-
-        for (&name, &at) in &tramp_off {
+        for (&name, &at) in &tramp_at {
             arch::write_trampoline(&mut buf[at..], runtime_function(name) as u64);
         }
 
-        // Copy one stencil instance and patch it for instruction `i`.
-        let mut emit = |i: usize, s: &Stencil, at: usize, len: usize| {
+        let resolve = |t: Target, next: usize| match t {
+            Target::Next => next,
+            Target::Label(i) => label(i),
+            Target::Stub(s) => stub_at[s],
+        };
+        // Copy the first `len` bytes of `s` to `at` and patch it: operands
+        // from `p`, continuation and branch target at the given offsets, and
+        // helpers of hot piece `key`.
+        let mut emit = |s: &Stencil,
+                        len: usize,
+                        at: usize,
+                        p: &Piece,
+                        cont: usize,
+                        jump: usize,
+                        key: Option<usize>| {
             buf[at..at + len].copy_from_slice(&s.code[..len]);
-            let insn = &insns[i];
             for r in s.relocs.iter().filter(|r| (r.offset as usize) < len) {
                 let value = match r.symbol {
-                    "toi_hole_imm" => insn.imm as u32 as u64,
-                    "toi_hole_reg" => insn.reg as u64 * size_of::<Value>() as u64,
-                    "toi_continue" => base + main_off[i + 1] as u64,
-                    "toi_jump_target" => base + main_off[insn.target] as u64,
-                    sym if sym.starts_with("toi_rt_") => base + tramp_off[sym] as u64,
+                    "toi_hole_imm" => p.imm as u32 as u64,
+                    "toi_hole_reg" => p.reg as u64 * size_of::<Value>() as u64,
+                    "toi_continue" => base + cont as u64,
+                    "toi_jump_target" => base + jump as u64,
+                    "toi_exit" => base + exit_at[&p.exit] as u64,
+                    sym if sym.starts_with("toi_rt_") => base + tramp_at[sym] as u64,
                     sym if sym.starts_with('@') => {
-                        let off = helper_off.get(&(i, &sym[1..])).unwrap_or_else(|| {
+                        let k = key.expect("helper reference outside a hot piece");
+                        let off = helper_at.get(&(k, &sym[1..])).unwrap_or_else(|| {
                             panic!(
                                 "stencil {} references {sym}, not one of its helpers",
                                 s.name
@@ -503,46 +912,212 @@ impl JitCode {
                 );
             }
         };
-        for (i, s) in mains.iter().enumerate() {
-            emit(i, s, main_off[i], main_len[i]);
+        // Resolved continuation and branch target of each hot piece; its
+        // helpers share them.
+        let hot_targets: Vec<(usize, usize)> = hot
+            .iter()
+            .zip(&hot_at)
+            .map(|(p, &at)| (resolve(p.cont, at + p.len()), resolve(p.jump, at + p.len())))
+            .collect();
+        for (k, p) in hot.iter().enumerate() {
+            let (cont, jump) = hot_targets[k];
+            emit(p.stencil, p.len(), hot_at[k], p, cont, jump, Some(k));
         }
-        for &(i, h, at) in &helper_list {
-            emit(i, h, at, h.code.len());
+        for &(k, h, at) in &helper_list {
+            let (cont, jump) = hot_targets[k];
+            emit(h, h.code.len(), at, &hot[k], cont, jump, Some(k));
+        }
+        for (stub, ats) in stubs.iter().zip(&stub_piece_at) {
+            for (p, &at) in stub.iter().zip(ats) {
+                emit(
+                    p.stencil,
+                    p.len(),
+                    at,
+                    p,
+                    resolve(p.cont, at + p.len()),
+                    0,
+                    None,
+                );
+            }
+        }
+        let exit_stencil = stencil("exit");
+        for (&i, &at) in &exit_at {
+            let p = Piece {
+                stencil: exit_stencil,
+                imm: insns[i].pc as i32,
+                reg: 0,
+                cont: Target::Next,
+                jump: Target::Next,
+                exit: i,
+            };
+            emit(exit_stencil, exit_stencil.code.len(), at, &p, 0, 0, None);
         }
 
         mem.seal();
         JitCode {
             mem,
-            main_len: main_end,
+            entry: entry_at,
+            main_len,
+            stencils: sel
+                .iter()
+                .map(|s| s.as_ref().map(|(name, _)| *name))
+                .collect(),
         }
     }
 
-    /// Run over the register file `regs` and return the accumulator at
-    /// `Return`. The accumulator starts as `undefined`.
+    /// Run from the entry point over `regs`, starting with `acc`.
     ///
     /// # Safety
-    /// As [`crate::interp::run`]: register operands must be `< regs.len()`,
-    /// and every path must end in `Return`.
-    pub unsafe fn run(&self, regs: &mut [Value]) -> Value {
-        let entry: Entry = unsafe { std::mem::transmute(self.mem.ptr) };
-        entry(Value::UNDEFINED, regs.as_mut_ptr(), NumberTag::new())
+    /// `regs` must cover every register operand, and the code must have been
+    /// compiled for the current types of `acc` and `regs`.
+    unsafe fn enter(&self, acc: Value, regs: &mut [Value]) -> Outcome {
+        let entry: Entry = unsafe { std::mem::transmute(self.mem.ptr.add(self.entry)) };
+        let mut exit = NO_EXIT;
+        let acc = entry(acc, regs.as_mut_ptr(), NumberTag::new(), &mut exit);
+        match exit {
+            NO_EXIT => Outcome::Return(acc),
+            pc => Outcome::Exit {
+                pc: pc as usize,
+                acc,
+            },
+        }
     }
 
-    /// The main (hot) machine code, for inspection.
+    /// The hot machine code, for inspection.
     pub fn main_code(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.mem.ptr, self.main_len) }
     }
+}
 
-    /// Address of the generated code.
-    pub fn address(&self) -> *const u8 {
-        self.mem.ptr
+// ---- Driver ----
+
+/// Counters, for tests and benchmarks.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct JitStats {
+    pub compiles: u32,
+    pub exits: u32,
+}
+
+/// A bytecode function run through the JIT.
+///
+/// Code is compiled when execution enters, for the exact types of the live
+/// values at that point. So entry types are facts, not speculation, and no
+/// entry guards are needed: inside the region, types only widen, and edges
+/// get conversions. The only speculation is that int32 arithmetic doesn't
+/// overflow. When it does, the stencil side-exits before the instruction.
+/// The driver then records the instruction as widened (it will produce a
+/// double), recompiles for entry at that instruction with the current
+/// types, and resumes there. Code for entry at the start is cached, keyed by
+/// entry types and invalidated when feedback changes.
+pub struct JitFunction {
+    code: Vec<u8>,
+    insns: Vec<Insn>,
+    nregs: usize,
+    specialize: bool,
+    widened: HashSet<usize>,
+    /// Code for entry at instruction 0, and the entry types it was built for.
+    cached: Option<(TypeState, JitCode)>,
+    /// The most recently compiled code, for inspection.
+    last: Option<JitCode>,
+    pub stats: JitStats,
+}
+
+/// After this many compilations in one run, finish in the interpreter.
+const MAX_COMPILES: u32 = 16;
+
+impl JitFunction {
+    /// Prepare `code`; nothing is compiled yet. Panics on malformed bytecode.
+    pub fn new(code: &[u8]) -> JitFunction {
+        let insns = decode(code);
+        assert!(!insns.is_empty(), "empty bytecode");
+        let nregs = insns
+            .iter()
+            .filter(|i| i.reads_reg())
+            .map(|i| i.reg as usize + 1)
+            .max()
+            .unwrap_or(0);
+        JitFunction {
+            code: code.to_vec(),
+            insns,
+            nregs,
+            specialize: true,
+            widened: HashSet::new(),
+            cached: None,
+            last: None,
+            stats: JitStats::default(),
+        }
+    }
+
+    /// Use only generic stencils, as milestone 1 did.
+    pub fn unspecialized(mut self) -> JitFunction {
+        self.specialize = false;
+        self
+    }
+
+    fn index_of(&self, pc: usize) -> usize {
+        self.insns
+            .iter()
+            .position(|i| i.pc == pc)
+            .expect("exit at an instruction boundary")
+    }
+
+    fn compile(&mut self, entry: usize, state: TypeState) -> JitCode {
+        self.stats.compiles += 1;
+        JitCode::compile(&self.insns, entry, state, &self.widened, self.specialize)
+    }
+
+    /// Run over `regs` and return the accumulator at `Return`. The
+    /// accumulator starts as `undefined`.
+    ///
+    /// # Safety
+    /// As [`crate::interp::run`]: register operands must be `< regs.len()`.
+    pub unsafe fn run(&mut self, regs: &mut [Value]) -> Value {
+        assert!(regs.len() >= self.nregs, "register file too small");
+        let (mut pc, mut acc) = (0, Value::UNDEFINED);
+        loop {
+            let state = TypeState::of(acc, &regs[..self.nregs]);
+            let entry = self.index_of(pc);
+            if self.stats.compiles >= MAX_COMPILES {
+                return unsafe { crate::interp::run_from(&self.code, pc, acc, regs) };
+            }
+            let outcome = if entry == 0 {
+                if self.cached.as_ref().is_none_or(|(s, _)| *s != state) {
+                    let code = self.compile(0, state.clone());
+                    self.cached = Some((state, code));
+                }
+                unsafe { self.cached.as_ref().unwrap().1.enter(acc, regs) }
+            } else {
+                let code = self.compile(entry, state);
+                let outcome = unsafe { code.enter(acc, regs) };
+                self.last = Some(code);
+                outcome
+            };
+            match outcome {
+                Outcome::Return(v) => return v,
+                Outcome::Exit {
+                    pc: exit_pc,
+                    acc: exit_acc,
+                } => {
+                    self.stats.exits += 1;
+                    // Only int32 arithmetic exits: widen it and recompile.
+                    self.widened.insert(self.index_of(exit_pc));
+                    self.cached = None;
+                    (pc, acc) = (exit_pc, exit_acc);
+                }
+            }
+        }
+    }
+
+    /// The most recently compiled code.
+    pub fn last_code(&self) -> Option<&JitCode> {
+        self.last.as_ref().or(self.cached.as_ref().map(|(_, c)| c))
     }
 }
 
-/// Compile `code` and run it once. See [`JitCode::run`].
+/// Compile and run `code` once. See [`JitFunction::run`].
 ///
 /// # Safety
 /// As [`crate::interp::run`].
 pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
-    unsafe { JitCode::compile(code).run(regs) }
+    unsafe { JitFunction::new(code).run(regs) }
 }

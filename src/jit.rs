@@ -2199,7 +2199,9 @@ pub struct JitStats {
     pub generalizations: u32,
 }
 
-/// When to tier up from the interpreter.
+/// When to tier up from the interpreter. The default: 1000 loop back edges
+/// or 10 calls. At the interpreter's ~16 cycles per loop iteration, 1000
+/// iterations cost a few µs, less than compiling a small function.
 #[derive(Clone, Copy, Debug)]
 pub struct Tiering {
     /// Loop back edges run in the interpreter, over the function's lifetime,
@@ -2207,6 +2209,15 @@ pub struct Tiering {
     pub back_edges: i64,
     /// Calls run in the interpreter before compiling at entry.
     pub calls: u32,
+}
+
+impl Default for Tiering {
+    fn default() -> Tiering {
+        Tiering {
+            back_edges: 1000,
+            calls: 10,
+        }
+    }
 }
 
 /// Versions kept per entry point before generalizing.
@@ -2230,11 +2241,11 @@ const MAX_VERSIONS: usize = 4;
 /// entry guards. After [`MAX_VERSIONS`] versions at one entry point, it is
 /// megamorphic: one version for the join of all types seen replaces them.
 ///
-/// **Tiering** (opt-in, [`JitFunction::tiered`]). The function starts in the
+/// **Tiering** (the default; see [`Tiering`]). The function starts in the
 /// interpreter. Loop opcodes count back edges; when the budget runs out, the
 /// interpreter leaves at the loop header (on-stack replacement) and the run
 /// continues in code compiled there. After enough calls, later calls start
-/// in JIT code.
+/// in JIT code. [`JitFunction::eager`] compiles on entry instead.
 pub struct JitFunction {
     code: Vec<u8>,
     insns: Vec<Insn>,
@@ -2258,7 +2269,8 @@ pub struct JitFunction {
 const MAX_COMPILES: u32 = 16;
 
 impl JitFunction {
-    /// Prepare `code`; nothing is compiled yet. Panics on malformed bytecode.
+    /// Prepare `code`, to start in the interpreter and tier up with the
+    /// default [`Tiering`]. Panics on malformed bytecode.
     pub fn new(code: &[u8]) -> JitFunction {
         let insns = decode(code);
         assert!(!insns.is_empty(), "empty bytecode");
@@ -2282,17 +2294,23 @@ impl JitFunction {
             versions: HashMap::new(),
             live_at: HashMap::new(),
             last: None,
-            tiering: None,
-            back_edges_left: 0,
+            tiering: Some(Tiering::default()),
+            back_edges_left: Tiering::default().back_edges,
             calls: 0,
             stats: JitStats::default(),
         }
     }
 
-    /// Start in the interpreter and tier up (see [`Tiering`]).
+    /// Tier up with custom thresholds (see [`Tiering`]).
     pub fn tiered(mut self, tiering: Tiering) -> JitFunction {
         self.tiering = Some(tiering);
         self.back_edges_left = tiering.back_edges;
+        self
+    }
+
+    /// Compile on entry instead of starting in the interpreter.
+    pub fn eager(mut self) -> JitFunction {
+        self.tiering = None;
         self
     }
 
@@ -2498,7 +2516,8 @@ impl JitFunction {
     }
 }
 
-/// Compile and run `code` once. See [`JitFunction::run`].
+/// Run `code` once through a fresh [`JitFunction`] (so with the default
+/// tiering: it starts in the interpreter). See [`JitFunction::run`].
 ///
 /// # Safety
 /// As [`crate::interp::run`].

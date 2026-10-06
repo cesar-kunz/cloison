@@ -1989,6 +1989,92 @@ fn direct_call_results_are_checked() {
     assert!(s.iter().any(|n| n == "call_direct"), "{s:?}");
 }
 
+/// A script calling the recursive `name` (defined in `function`) with `n`.
+fn recursive_program(name: &str, n: i32, function: &str) -> String {
+    format!(
+        "script\n        CreateClosure {name}\n        StaGlobal {name}\n        LdaGlobal {name}\n\
+         \x20       Star r1\n        LdaSmi {n}\n        Star r2\n        CallUndefined r1, r2, 1\n\
+         \x20       Return\nend\n{function}"
+    )
+}
+
+/// Runs `src` with the JIT, checking the result against the interpreter's;
+/// returns it and the stencils of `function`'s last compiled code.
+fn jit_function(src: &str, function: &str) -> (String, Vec<String>) {
+    let expected = ok(src);
+    let m = toi::asm::parse(src).unwrap();
+    let mut vm = Vm::new();
+    let v = display(vm.run(&m).unwrap());
+    assert_eq!(v, expected);
+    (v, vm.jit_stencils(function).unwrap_or_default())
+}
+
+const FIB: &str = "\
+function fib(n)
+        Ldar r1
+        JumpIfLessSmi 2, base
+        LdaGlobal fib
+        Star r2
+        Ldar r1
+        AddSmi -1
+        Star r3
+        CallUndefined r2, r3, 1
+        Star r4
+        Ldar r1
+        AddSmi -2
+        Star r3
+        CallUndefined r2, r3, 1
+        Add r4
+        Return
+base:   Ldar r1
+        Return
+end
+";
+
+/// `fib` names itself, so calls to it enter compiled code, where it calls
+/// itself directly, with its results predicted to be int32s, as its other
+/// `Return` gives (and then, checked, its own add does). The second call
+/// hadn't run when `fib` first compiled: it bailed, and once it ran the
+/// function compiled again.
+#[test]
+fn direct_self_recursion() {
+    let (v, s) = jit_function(&recursive_program("fib", 20, FIB), "fib");
+    assert_eq!(v, "6765");
+    let typed = s
+        .iter()
+        .filter(|n| *n == "call_direct+check_acc_int")
+        .count();
+    assert_eq!(typed, 2, "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
+}
+
+/// `sum(n) = n + sum(n - 1)` from 2147483000: the add overflows int32 in
+/// a callee called directly by the same code (its exit finishes in the
+/// interpreter, from the code's own record), and the results are doubles
+/// from then on. 2000 deep: past the native depth limit, calls go through
+/// the runtime.
+#[test]
+fn exits_in_direct_self_calls() {
+    let sum = "\
+function sum(n)
+        Ldar r1
+        JumpIfLessSmi 1, base
+        LdaGlobal sum
+        Star r2
+        Ldar r1
+        AddSmi -1
+        Star r3
+        CallUndefined r2, r3, 1
+        Add r1
+        Return
+base:   LdaSmi 2147483000
+        Return
+end
+";
+    let (v, _) = jit_function(&recursive_program("sum", 2000, sum), "sum");
+    assert_eq!(v, (2147483000u64 + 2000 * 2001 / 2).to_string());
+}
+
 /// At i = 300 the argument is near the int32 limit: the direct callee's
 /// add overflows and exits, inside the callee; the runtime finishes that
 /// call (once: `calls` would show a second) and later calls work on.

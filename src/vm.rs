@@ -155,8 +155,13 @@ pub struct Vm {
     pub(crate) tier_calls: i32,
     /// The frame that left the interpreter to tier up.
     pub(crate) osr_regs: *mut Value,
-    /// Calls from compiled code running now (see `interp::call_from_jit`).
-    pub(crate) native_depth: u32,
+    /// The native stack address below which compiled code makes no more
+    /// calls on the native stack (see `interp::native_stack_low`).
+    pub(crate) native_limit: usize,
+    /// A call from compiled code found no room for another nested native
+    /// call: the code leaves, and the interpreter makes the call instead
+    /// (see `interp::call_from_jit`).
+    pub(crate) redo_call: bool,
     function_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
     array_shape: *const Shape,
@@ -204,7 +209,8 @@ impl Vm {
             },
             tier_calls: 0,
             osr_regs: std::ptr::null_mut(),
-            native_depth: 0,
+            native_limit: 0,
+            redo_call: false,
             function_shape: std::ptr::null(),
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
@@ -879,7 +885,7 @@ impl Vm {
                     ctor_capacity: Cell::new(INITIAL_CTOR_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
                     jit: RefCell::new(None),
-                    calls_left: Cell::new(if worth_entering_compiled(&f.code) {
+                    calls_left: Cell::new(if worth_entering_compiled(f) {
                         self.tier_calls
                     } else {
                         i32::MAX
@@ -897,6 +903,8 @@ impl Vm {
     /// Load and run `module`; returns its completion value.
     pub fn run(&mut self, module: &Module) -> Result<Value> {
         let code = self.load(module);
+        let here = 0u8;
+        self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
         unsafe { crate::interp::run_script(self, code) }
     }
 
@@ -937,11 +945,17 @@ impl Vm {
 /// Whether calls to a function should enter its compiled code once it is
 /// hot: if it has a loop (whose back-edge budget restarts with each frame,
 /// so a short loop in a function called often never tiers up by itself),
-/// or at least [`ENTRY_COMPILE_SIZE`] instructions. Entering compiled code
+/// or at least [`ENTRY_COMPILE_SIZE`] instructions, or if it looks
+/// recursive: an inline cache looks up its own name (`LdaGlobal fib`), and
+/// its compiled code can then call itself directly. Entering compiled code
 /// costs a round trip through the driver, which a small loop-free function
 /// doesn't win back; when compiled code calls it, it is inlined instead.
-fn worth_entering_compiled(code: &[u8]) -> bool {
+fn worth_entering_compiled(f: &crate::asm::FunctionDef) -> bool {
     use crate::bytecode::Op;
+    if f.ics.contains(&f.name) {
+        return true;
+    }
+    let code = &f.code;
     let (mut pc, mut n) = (0, 0);
     while pc < code.len() {
         let op = Op::from_u8(code[pc]).expect("valid bytecode");

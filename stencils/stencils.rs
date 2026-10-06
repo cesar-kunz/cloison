@@ -133,7 +133,7 @@ unsafe extern "C" {
     fn toi_rt_loose_eq();
     fn toi_rt_to_boolean();
     fn toi_rt_call();
-    fn toi_rt_direct_exit();
+    fn toi_rt_call_direct();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -2139,187 +2139,14 @@ stencil!("call"; |s| {
     next!(s)
 });
 
-/// The part of a call site (`jit::CallSite`, `repr(C)`) that `call_direct`
-/// reads: the callee's compiled entry and how to set up its frame. Offsets
-/// are in bytes from the caller's registers.
-#[repr(C)]
-struct DirectSite {
-    /// Entry address of the callee's compiled code; 0: always call through
-    /// the runtime.
-    entry: u64,
-    /// The function compiled: the callee register must hold it.
-    closure: u64,
-    f_off: u64,
-    w_off: u64,
-    frame_off: u64,
-    argc: u32,
-    nparams: u32,
-    nregs: u32,
-    /// `Call` (the window starts with `this`) rather than `CallUndefined`.
-    has_this: u32,
-    /// Bytes the callee's compiled frame spans (registers of inlined
-    /// frames included), which must end before `stack_end`.
-    span: u64,
-    stack_end: u64,
-    /// The VM's count of nested native calls.
-    depth: *mut u32,
-    /// An exit of the callee's code, and its `acc`, for
-    /// `toi_rt_direct_exit`.
-    record: u32,
-    _exits: u32,
-    exit_acc: Value,
-}
-
-/// Call compiled code at `entry` for the frame `regs`, as `JitCode::enter`
-/// does, but from a stencil, returning its `acc`. The callee uses every
-/// slot register (and scratch registers) freely, and preserves none: the
-/// asm says so, passes the entry state in the stencil-signature registers
-/// (`acc` = undefined, `regs`, `tag`, `ctx`, GPR slots undefined), and LLVM
-/// saves whatever the caller still needs around it. A Rust call through a
-/// `preserve_none` function pointer isn't enough: on arm64, LLVM assumed
-/// some of the slot registers survive it.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn call_code(entry: u64, regs: *mut Value, tag: NumberTag, ctx: *mut u32) -> Value {
-    let r: u64;
-    let u = Value::UNDEFINED.to_bits();
-    unsafe {
-        // Step over the red zone (the stencil may use it) and align for the
-        // call, keeping the old rsp on the stack; rbx and rbp are saved by
-        // hand (asm can't clobber them, but compiled code may use them).
-        core::arch::asm!(
-            "mov r10, rsp",
-            "lea rsp, [rsp - 128]",
-            "and rsp, -16",
-            "push r10",
-            "push rbx",
-            "push rbp",
-            "sub rsp, 8",
-            "call {e}",
-            "add rsp, 8",
-            "pop rbp",
-            "pop rbx",
-            "pop rsp",
-            e = in(reg) entry,
-            inout("r12") u => _,
-            inout("r13") regs => _,
-            inout("r14") tag.to_bits() => _,
-            inout("r15") ctx => _,
-            inout("rdi") u => _,
-            inout("rsi") u => _,
-            inout("rdx") u => _,
-            inout("rcx") u => _,
-            inout("r8") u => _,
-            inout("r9") u => _,
-            out("rax") r,
-            out("r10") _,
-            out("r11") _,
-            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
-            out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
-            out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
-            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
-        );
-    }
-    Value::from_bits(r)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn call_code(entry: u64, regs: *mut Value, tag: NumberTag, ctx: *mut u32) -> Value {
-    let r: u64;
-    let u = Value::UNDEFINED.to_bits();
-    unsafe {
-        // x19 and x29 (fp) are saved by hand (asm can't clobber them), with
-        // the link register.
-        core::arch::asm!(
-            "stp x29, x30, [sp, #-32]!",
-            "str x19, [sp, #16]",
-            "blr {e}",
-            "ldr x19, [sp, #16]",
-            "ldp x29, x30, [sp], #32",
-            e = in(reg) entry,
-            inout("x20") u => _,
-            inout("x21") regs => _,
-            inout("x22") tag.to_bits() => _,
-            inout("x23") ctx => _,
-            inout("x24") u => _, inout("x25") u => _, inout("x26") u => _,
-            inout("x27") u => _, inout("x28") u => _,
-            inout("x0") u => r,
-            inout("x1") u => _, inout("x2") u => _, inout("x3") u => _,
-            inout("x4") u => _, inout("x5") u => _, inout("x6") u => _,
-            out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _,
-            out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _,
-            out("x17") _, out("x18") _, out("x30") _,
-            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _,
-            out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _,
-            out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _,
-            out("v15") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-            out("v20") _, out("v21") _, out("v22") _, out("v23") _, out("v24") _,
-            out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _,
-            out("v30") _, out("v31") _,
-        );
-    }
-    Value::from_bits(r)
-}
-
-/// `*ctx` while no exit has happened (`jit::NO_EXIT`).
-const NO_EXIT: u32 = u32::MAX;
-/// Nested native calls at most (`interp::MAX_NATIVE_DEPTH`).
-const MAX_NATIVE_DEPTH: u32 = 1000;
-
-// A call straight into the callee's compiled code (`DirectSite` at `imm64`)
-// when the callee register holds the function compiled, the code epoch is
-// still `imm` (at `imm64b`), and the native stack and the VM stack have
-// room; otherwise through the runtime, as `call`. The arguments, spilled to
-// memory, are copied into the callee's frame. If the callee's code exits,
-// `toi_rt_direct_exit` finishes the call in the interpreter. Like `call`,
-// leave after the call on an error or if the code epoch changed.
+// A call straight into the callee's compiled code, if it can
+// (`toi_rt_call_direct` checks), otherwise through the runtime, as `call`;
+// leave after it as `call` does.
 stencil!("call_direct"; |s| {
-    let site = imm64() as *mut DirectSite;
-    let base = s.regs as *mut u8;
-    let callee = base.add((*site).frame_off as usize) as *mut Value;
-    let epoch = imm64b() as *const u32;
-    let r;
-    if (*site).entry != 0
-        && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
-        && *epoch == imm() as u32
-        && *(*site).depth < MAX_NATIVE_DEPTH
-        && callee as u64 + (*site).span <= (*site).stack_end
-    {
-        let w = base.add((*site).w_off as usize) as *const Value;
-        let (this, args) = if (*site).has_this != 0 {
-            (*w, w.add(1))
-        } else {
-            (Value::UNDEFINED, w)
-        };
-        *callee = this;
-        let k = (*site).argc.min((*site).nparams) as usize;
-        for i in 0..k {
-            *callee.add(1 + i) = *args.add(i);
-            core::arch::asm!("", options(nomem, nostack, preserves_flags));
-        }
-        for i in 1 + k..(*site).nregs as usize {
-            *callee.add(i) = Value::UNDEFINED;
-            core::arch::asm!("", options(nomem, nostack, preserves_flags));
-        }
-        *(*site).depth += 1;
-        let v = call_code((*site).entry, callee, s.tag, s.ctx);
-        *(*site).depth -= 1;
-        if *s.ctx != NO_EXIT {
-            (*site).record = *s.ctx;
-            (*site).exit_acc = v;
-            *s.ctx = NO_EXIT;
-            let regs = Value::from_bits(s.regs as u64);
-            r = Value::from_bits(rt_call!(s, toi_rt_direct_exit, regs, Value::from_bits(site as u64)));
-        } else {
-            r = v;
-        }
-    } else {
-        let regs = Value::from_bits(s.regs as u64);
-        r = Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)));
-    }
+    let regs = Value::from_bits(s.regs as u64);
+    let r = Value::from_bits(rt_call!(s, toi_rt_call_direct, regs, Value::from_bits(imm64())));
     s.acc = r;
-    if r.to_bits() == 0 || *epoch != imm() as u32 {
+    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
         exit!(s)
     }
     next!(s)

@@ -951,8 +951,8 @@ handlers! {
     }
 
     // ---- Calls (ignore `acc`: also I32 entries) ----
-    // A call to a bytecode function records it in the call's inline cache
-    // (`holder`), which the JIT inlines from.
+    // A call records its callee in the call's inline cache (`holder`), which
+    // the JIT inlines from (natives in the slow paths).
 
     fn op_call(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
@@ -1100,6 +1100,7 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_call(pc, acc, regs, tag) {
+        record_callee(pc, regs, tag);
         let w = reg(pc, 2, regs);
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
         let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), *w, args);
@@ -1109,6 +1110,7 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_call_undefined(pc, acc, regs, tag) {
+        record_callee(pc, regs, tag);
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
         let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), Value::UNDEFINED, args);
         next_or_throw!(Op::CallUndefined.size(), r)
@@ -1486,6 +1488,19 @@ unsafe fn frame_code(regs: *mut Value) -> *const Code {
 #[inline(always)]
 unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
     unsafe { header::<Ic>(regs, ICS).add(u16_at(pc, off) as usize) }
+}
+
+/// Record the object a call at `pc` calls in its inline cache, as the fast
+/// paths do for bytecode functions: a cache left empty then means the call
+/// never ran (the JIT leaves such calls to the interpreter).
+#[inline(always)]
+unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
+    unsafe {
+        let f = *reg(pc, 1, regs);
+        if is_cell(tag, f) {
+            (*ic_at(regs, pc, 4)).holder = as_object(f);
+        }
+    }
 }
 
 /// Push a frame for `callee` past the caller's registers: header, `this`,
@@ -1876,9 +1891,18 @@ pub(crate) unsafe fn write_frame_header(
     }
 }
 
-/// Native calls nested in compiled code at most (each runs a callee to
-/// completion on the native stack).
-const MAX_NATIVE_DEPTH: u32 = 1000;
+/// Native stack a run lets calls from compiled code use (each runs its
+/// callee to completion on the native stack). Past it, the interpreter
+/// makes them, in its own frames. Thread stacks are at least 2 MiB (Rust's
+/// default for spawned threads).
+pub(crate) const NATIVE_STACK: usize = 1 << 20;
+
+/// Whether the native stack is past the run's limit (`Vm::native_limit`).
+#[inline(always)]
+pub(crate) fn native_stack_low(vm: &Vm) -> bool {
+    let here = 0u8;
+    (&raw const here as usize) < vm.native_limit
+}
 
 /// A call from compiled code (`jit`'s `call` stencil): `op` is `Call`,
 /// `CallUndefined` or `Construct` with operands `f`, `w`, `argc` over the
@@ -1886,7 +1910,9 @@ const MAX_NATIVE_DEPTH: u32 = 1000;
 /// callee runs to completion in a new frame `frame` values past `regs`
 /// (beyond every register the compiled code uses), through [`drive`], so
 /// its loops can tier up too. Returns the result, or `EMPTY` on an error
-/// (left in `vm.error`).
+/// (left in `vm.error`), or `EMPTY` with `vm.redo_call` set if the native
+/// stack is low ([`native_stack_low`]): the compiled code then leaves, to
+/// make the call in the interpreter.
 ///
 /// # Safety
 /// `regs` must be a live VM frame whose registers cover the operands.
@@ -1923,8 +1949,15 @@ pub(crate) unsafe fn call_from_jit(
         };
         let new = regs.add(frame);
         let n = (*callee).nregs as usize;
-        if new.add(n) > vm.stack_end || vm.native_depth >= MAX_NATIVE_DEPTH {
+        if new.add(n) > vm.stack_end {
             return throw(vm, Error::range_error("Maximum call stack size exceeded"));
+        }
+        // Too deep in native calls: the compiled code leaves, before the
+        // call (`EMPTY` without an error), and the interpreter makes it,
+        // in its own frames.
+        if native_stack_low(vm) {
+            vm.redo_call = true;
+            return Value::EMPTY;
         }
         let flags = if op == Op::Construct { CONSTRUCT } else { 0 };
         write_frame_header(vm, new, callee, std::ptr::null(), regs, flags);
@@ -1936,7 +1969,6 @@ pub(crate) unsafe fn call_from_jit(
         for i in 1 + k..n {
             *new.add(i) = Value::UNDEFINED;
         }
-        vm.native_depth += 1;
         let mut start = Resume {
             regs: new,
             pc: (*callee).bytecode.as_ptr(),
@@ -1949,7 +1981,6 @@ pub(crate) unsafe fn call_from_jit(
             match crate::jit::vm_run(vm, &*callee, new, 0, Value::UNDEFINED) {
                 VmRun::NotCompiled => (*callee).calls_left.set(i32::MAX),
                 VmRun::Returned(v) => {
-                    vm.native_depth -= 1;
                     return if flags == CONSTRUCT {
                         construct_result(new, v)
                     } else {
@@ -1957,15 +1988,12 @@ pub(crate) unsafe fn call_from_jit(
                     };
                 }
                 VmRun::Exit(_) if vm.error.is_some() => {
-                    vm.native_depth -= 1;
                     return Value::EMPTY;
                 }
                 VmRun::Exit(r) => start = r,
             }
         }
-        let v = drive(vm, start.pc, start.acc, start.regs);
-        vm.native_depth -= 1;
-        v
+        drive(vm, start.pc, start.acc, start.regs)
     }
 }
 

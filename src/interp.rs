@@ -11,11 +11,13 @@
 //! | `vm`   | VM context (heap, constants, …) — placeholder for now |
 //! | `tbl`  | the handler table (kept in a register so dispatch needs no `lea`) |
 //!
-//! Argument order matters. `preserve_none` passes args 1–4 in r12–r15 and
-//! arg 5 in rdi. LLVM's x86 backend only lets the address of an indirect tail
+//! Argument order matters on x86-64. `preserve_none` passes args 1–4 in
+//! r12–r15 and arg 5 in rdi. LLVM's x86 backend only lets the address of an indirect tail
 //! call's memory operand use registers in `GR64_TC` (caller-saved under the C
 //! ABI), which excludes r12–r15. With `tbl` in r15 every handler paid an
 //! extra `mov` to copy it out. In rdi, `jmp [rdi + rcx*8]` works directly.
+//! On arm64 the order doesn't matter: args go in x20–x28, and there `tbl`
+//! (x24) only feeds an `ldr`.
 //!
 //! Dispatch to the next instruction is: load opcode byte, advance `pc`,
 //! indirect jump through `tbl`.
@@ -31,25 +33,43 @@ pub struct Vm {}
 #[repr(transparent)]
 pub struct Table([Handler; 256]);
 
-/// Tail-call the handler of the instruction at `$pc + $len`.
-///
-/// The empty `asm!` emits no code. It does two things for the register
-/// allocator:
-/// - It is a scheduling barrier: not `pure`, so it can't be reordered. Without
-///   it the scheduler hoists the next-opcode load above the operand reads.
-/// - It launders `next` through a register, so LLVM can't fold `pc + off` into
-///   the opcode load's addressing mode (`movzx ecx, [r12 + rcx]`).
-///
-/// Either one keeps the old and new `pc` live together, and LLVM then emits
-/// `lea rax,[r12+N] … mov r12,rax` where one `add r12,N` would do.
-/// `nomem` keeps it from acting as a compiler memory fence.
+/// Tail-call the handler of the instruction at `$pc + $off` (bytes, signed).
 macro_rules! dispatch {
-    ($pc:expr, $len:expr, $acc:expr, $regs:expr, $vm:expr, $tbl:expr) => {{
-        let mut next: *const u8 = $pc.add($len);
-        core::arch::asm!("/* {0} */", inout(reg) next, options(nomem, nostack, preserves_flags));
+    ($pc:expr, $off:expr, $acc:expr, $regs:expr, $vm:expr, $tbl:expr) => {{
+        let next: *const u8 = $pc.offset($off as isize);
+        pc_barrier!(next);
         let op = *next;
         become ($tbl.0[op as usize])(next, $acc, $regs, $vm, $tbl)
     }};
+}
+
+/// An empty `asm!` placed just before dispatch. It emits no code; its job is
+/// to steer the register allocator. Not being `pure`, it can't be reordered,
+/// so a handler's operand reads stay before the pc update. `nomem` keeps it
+/// from acting as a compiler memory fence. Without it, the old and new `pc`
+/// end up live together and LLVM copies pc around: `lea rax,[r12+N] … mov
+/// r12,rax` on x86, `add x8,x20,#N … mov x20,x8` on arm64.
+///
+/// x86-64: also launder `next` through a register. Otherwise LLVM folds
+/// `pc + off` into the opcode load (`movzx ecx,[r12+rcx]`), which keeps the
+/// old pc alive again. Result: `add r12,N; movzx eax,[r12]; jmp [rdi+rax*8]`.
+#[cfg(target_arch = "x86_64")]
+macro_rules! pc_barrier {
+    ($next:ident) => {
+        let mut $next = $next;
+        core::arch::asm!("/* {0} */", inout(reg) $next, options(nomem, nostack, preserves_flags));
+    };
+}
+
+/// AArch64: no laundering. LLVM must see `pc + N` feeding the load so it can
+/// fuse them into a pre-indexed `ldrb w8,[x20,#N]!`. Laundering would split
+/// it back into `add` + `ldrb`. Result: `ldrb w8,[x20,#N]!; ldr x0,[x24,x8,lsl
+/// #3]; br x0`. There is no memory-indirect branch, so 3 is the floor.
+#[cfg(target_arch = "aarch64")]
+macro_rules! pc_barrier {
+    ($next:ident) => {
+        core::arch::asm!("", options(nomem, nostack, preserves_flags));
+    };
 }
 
 /// Read an unaligned little-endian `i32` operand at `pc + off`.
@@ -115,17 +135,18 @@ handlers! {
     }
 
     fn toi_op_jump_if_less(pc, acc, regs, vm, tbl) {
-        let next = if acc < *reg(pc, 1, regs) {
-            pc.offset(imm32(pc, 2) as isize)
+        // Two separate dispatches, not one on a selected pc. A select
+        // materializes the fall-through length (`mov eax, 6`) and blocks the
+        // pre-indexed load on arm64.
+        if acc < *reg(pc, 1, regs) {
+            dispatch!(pc, imm32(pc, 2), acc, regs, vm, tbl)
         } else {
-            pc.add(Op::JumpIfLess.size())
-        };
-        dispatch!(next, 0, acc, regs, vm, tbl)
+            dispatch!(pc, Op::JumpIfLess.size(), acc, regs, vm, tbl)
+        }
     }
 
     fn toi_op_jump(pc, acc, regs, vm, tbl) {
-        let next = pc.offset(imm32(pc, 1) as isize);
-        dispatch!(next, 0, acc, regs, vm, tbl)
+        dispatch!(pc, imm32(pc, 1), acc, regs, vm, tbl)
     }
 
     fn toi_op_return(pc, acc, regs, vm, tbl) {

@@ -10,7 +10,10 @@ use std::time::Instant;
 use toi::bytecode::Assembler;
 
 fn main() {
-    let n: i32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(100_000_000);
+    let n: i32 = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000_000);
 
     let (sum, i, limit) = (0, 1, 2);
     let mut a = Assembler::new();

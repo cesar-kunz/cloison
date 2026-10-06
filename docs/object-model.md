@@ -776,8 +776,8 @@ types (`object::FieldType`), which loads in compiled code take, so objects
 reached through fields need no guards either; arrays' shapes carry their
 elements' type (`Shape::elems`), likewise. Calls are compiled too: inlined
 behind a guard on the callee, straight into the callee's compiled code
-(whose return type the result then has, checked), or through the
-runtime. Details and
+(itself included, for recursion; the result then has the callee's
+return type, checked), or through the runtime. Details and
 numbers: `docs/future-work.md`, "Property access in the JIT, and shape
 types".
 

@@ -308,7 +308,7 @@ fn runtime_function(name: &str) -> usize {
     match name {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
-        "toi_rt_direct_exit" => toi_rt_direct_exit as *const () as usize,
+        "toi_rt_call_direct" => toi_rt_call_direct as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
         "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
@@ -1591,6 +1591,18 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     }
 }
 
+/// What the function's own `Return`s give (the join of `acc`'s types
+/// there), from the in-states `ins`: `Bot` if none is reachable. With
+/// `known`, `Return`s of `Any` are left out.
+fn returned(insns: &[Insn], ins: &[Option<TypeState>], known: bool) -> Ty {
+    (0..insns.len())
+        .filter(|&i| insns[i].op == Op::Return && insns[i].frame == 0 && !insns[i].bail)
+        .filter_map(|i| ins[i].as_ref())
+        .map(|st| st.acc)
+        .filter(|&t| !known || t != Ty::Any)
+        .fold(Ty::Bot, Ty::join)
+}
+
 /// Forward dataflow from `entry` (instruction index) with `entry_state`.
 /// Returns the joined in-state of every reachable instruction.
 fn infer(
@@ -2774,6 +2786,9 @@ pub struct JitCode {
     /// What its `Return`s give (the join of `acc`'s types there), `Bot` if
     /// it never returns: a fact for every value the code returns itself.
     pub ret: Ty,
+    /// Call sites (indices into the snapshot's) bound to this code itself:
+    /// [`JitCode::into_rc`] gives them its address.
+    self_sites: Vec<usize>,
     /// For a VM function: the lowering compiled, which exits refer to and
     /// the code's call sites live in. Running code keeps it alive.
     snap: Option<Rc<Snapshot>>,
@@ -2972,6 +2987,12 @@ impl JitCode {
             let sel: Vec<Option<Sel>> = (0..n)
                 .map(|i| ins[i].as_ref().map(|st| select(&insns[i], i, st, &spec)))
                 .collect();
+            // Calls to this function are predicted to give what its own
+            // `Return`s do, which depends on the prediction. The first round
+            // assumes they give what the other `Return`s do (ignoring those
+            // that are `Any`, as those of a self call's result are then);
+            // later rounds check that.
+            let own = Ty::of_result(returned(insns, &ins, round == 0));
             let want: Vec<Ty> = (0..n)
                 .map(|i| match (&ins[i], props.get(i), widened) {
                     (
@@ -2981,8 +3002,11 @@ impl JitCode {
                         }),
                         Some(w),
                     ) if !w.contains(&i) => {
-                        let (this, args) = call_types(i, st);
                         let site = vm_sites[*site as usize].get();
+                        if unsafe { (*site).self_call } {
+                            return own;
+                        }
+                        let (this, args) = call_types(i, st);
                         unsafe { direct_version(site, this, &args) }
                             .map_or(Ty::Any, |(code, _)| Ty::of_result(code.ret))
                     }
@@ -2996,19 +3020,53 @@ impl JitCode {
             rets = want;
         };
         // Direct calls: bind each to the callee version for the arguments'
-        // types here, or call through the runtime.
+        // types here, or call through the runtime. A call to this function
+        // binds to this code, if it is entered at the start and the
+        // arguments fit its entry types (its entry pieces trust those);
+        // this code's address is only known at the end.
+        let at_start = insns[entry].frame == 0 && insns[entry].pc == 0;
+        let fits_entry = |this: Ty, args: &[Ty], nparams: usize| {
+            let fits = |a: Ty, v: Ty| a == v || v == Ty::Any || v == Ty::Bot;
+            actual_live.acc == Ty::Bot
+                && actual_live.regs.iter().enumerate().all(|(r, &v)| {
+                    let a = match r {
+                        0 => this,
+                        r if r <= nparams => args.get(r - 1).copied().unwrap_or(Ty::Any),
+                        _ => Ty::Any,
+                    };
+                    fits(a, v)
+                })
+        };
+        let mut self_sites = Vec::new();
         for (i, s) in sel.iter_mut().enumerate() {
             if let (
                 Some(s),
                 Some(st),
                 Some(Prop::Call {
-                    site, direct: true, ..
+                    site: k,
+                    direct: true,
+                    ..
                 }),
             ) = (s.as_mut(), &ins[i], props.get(i))
             {
                 let (this, args) = call_types(i, st);
-                let site = vm_sites[*site as usize].get();
-                if !unsafe { bind_direct(site, this, &args) } {
+                let site = vm_sites[*k as usize].get();
+                let bound = unsafe {
+                    if (*site).self_call {
+                        let ok = at_start
+                            && !(*site).bound
+                            && fits_entry(this, &args, (*site).nparams as usize);
+                        if ok {
+                            (*site).bound = true;
+                            (*site).span = nregs + interp::HEADER;
+                            self_sites.push(*k as usize);
+                        }
+                        ok
+                    } else {
+                        bind_direct(site, this, &args)
+                    }
+                };
+                if !bound {
                     s.base = "call";
                 }
             }
@@ -3414,19 +3472,20 @@ impl JitCode {
         }
 
         mem.seal();
-        let ret = (0..n)
-            .filter(|&i| insns[i].op == Op::Return && insns[i].frame == 0 && !insns[i].bail)
-            .filter_map(|i| ins[i].as_ref())
-            .fold(Ty::Bot, |t, st| t.join(st.acc));
-        JitCode {
+        let code = JitCode {
             mem,
             entry: entry_at,
             main_len,
             stencils: names,
             homes,
-            ret,
+            ret: returned(insns, &ins, false),
+            self_sites,
             snap: None,
+        };
+        for &k in &code.self_sites {
+            unsafe { (*vm_sites[k].get()).entry = code.entry_addr() };
         }
+        code
     }
 
     /// Run from the entry point over `regs`, starting with `acc`.
@@ -3451,6 +3510,17 @@ impl JitCode {
                 acc,
             },
         }
+    }
+
+    /// Share the code, telling the call sites bound to it where it is.
+    fn into_rc(self) -> Rc<JitCode> {
+        let code = Rc::new(self);
+        if let Some(snap) = &code.snap {
+            for &k in &code.self_sites {
+                unsafe { (*snap.sites[k].get()).self_code = Rc::as_ptr(&code) };
+            }
+        }
+        code
     }
 
     /// The address to call the code at (see `call_direct`).
@@ -3621,38 +3691,40 @@ struct InlineFrame {
 
 /// A call compiled code makes (`call` and `call_direct` stencils): `op`'s
 /// operands, renamed into the compiled frame, and where a callee's frame
-/// goes (past every register the compiled code uses). The first fields are
-/// what `call_direct` reads (`DirectSite` in `stencils/stencils.rs`): a
-/// callee's compiled entry, if the call goes straight there; offsets are in
-/// bytes from the caller's registers.
-#[repr(C)]
+/// goes (past every register the compiled code uses). For a direct call,
+/// the callee's compiled entry and how to set up its frame.
 pub(crate) struct CallSite {
-    entry: u64,
-    closure: u64,
-    f_off: u64,
-    w_off: u64,
-    frame_off: u64,
-    argc32: u32,
-    nparams: u32,
-    nregs: u32,
-    has_this: u32,
-    span: u64,
-    stack_end: u64,
-    depth: *mut u32,
-    record: u32,
-    /// Exits of the callee's code at this site: past [`MAX_DIRECT_EXITS`],
-    /// calls go through the runtime (`entry` = 0).
-    exits: u32,
-    exit_acc: Value,
     vm: *mut crate::vm::Vm,
     op: Op,
     f: usize,
     w: usize,
     argc: usize,
     frame: usize,
+    /// The code epoch the lowering saw: the callee's bound version assumes
+    /// it.
+    epoch: u32,
+    /// Entry address of the callee's compiled code; 0: always call through
+    /// the runtime.
+    entry: u64,
+    /// The function compiled: the callee register must hold it.
+    closure: u64,
+    nparams: u32,
+    nregs: u32,
+    /// Bytes the callee's compiled frame spans (registers of inlined frames
+    /// included).
+    span: usize,
+    /// Exits of the callee's code at this site: past [`MAX_DIRECT_EXITS`],
+    /// calls go through the runtime (`entry` = 0).
+    exits: u32,
     /// The callee's code and compiled version, for a direct call.
     callee: *const crate::vm::Code,
     target: Option<Rc<JitCode>>,
+    /// The callee is the function compiled: bound (if at all) to the code
+    /// making the call, `self_code`, which `target` can't own.
+    self_call: bool,
+    self_code: *const JitCode,
+    /// Bound to a version (`target` or `self_code`), for good.
+    bound: bool,
 }
 
 /// Exits of a direct callee before its call site stops calling directly.
@@ -3677,8 +3749,9 @@ unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
         Some(bound) => Rc::ptr_eq(bound, &code),
         None => {
             site.entry = code.entry_addr();
-            site.span = 8 * (nregs + interp::HEADER) as u64;
+            site.span = nregs + interp::HEADER;
             site.target = Some(code);
+            site.bound = true;
             true
         }
     }
@@ -3893,6 +3966,19 @@ impl Lowering<'_> {
                     i.bail = true;
                     self.push(i, Prop::None);
                 }
+                // A call that never ran: nothing to inline or call directly
+                // yet. The interpreter runs it, filling its cache, and the
+                // exit makes the next entry lower the function again.
+                Op::Call | Op::CallUndefined
+                    if unsafe {
+                        (*self.out.fbs[frame].ics.add(i.ic as usize))
+                            .holder
+                            .is_null()
+                    } =>
+                {
+                    i.bail = true;
+                    self.push(i, Prop::None);
+                }
                 Op::Call | Op::CallUndefined if self.inline_target(frame, &i, depth).is_some() => {
                     let callee = self.inline_target(frame, &i, depth).unwrap();
                     self.inline(frame, &i, callee, depth);
@@ -3902,29 +3988,24 @@ impl Lowering<'_> {
                     let vm = self.state.vm;
                     let callee_frame = base + code.nregs as usize + interp::HEADER;
                     let mut site = CallSite {
-                        entry: 0,
-                        closure: 0,
-                        f_off: 8 * i.reg as u64,
-                        w_off: 8 * i.reg2 as u64,
-                        frame_off: 8 * callee_frame as u64,
-                        argc32: i.imm as u32,
-                        nparams: 0,
-                        nregs: 0,
-                        has_this: (i.op == Op::Call) as u32,
-                        span: 0,
-                        stack_end: unsafe { (*vm).stack_end } as u64,
-                        depth: unsafe { &raw mut (*vm).native_depth },
-                        record: 0,
-                        exits: 0,
-                        exit_acc: Value::UNDEFINED,
                         vm,
                         op: i.op,
                         f: i.reg as usize,
                         w: i.reg2 as usize,
                         argc: i.imm as usize,
                         frame: callee_frame,
+                        epoch: unsafe { (*vm).code_epoch },
+                        entry: 0,
+                        closure: 0,
+                        nparams: 0,
+                        nregs: 0,
+                        span: 0,
+                        exits: 0,
                         callee: std::ptr::null(),
                         target: None,
+                        self_call: false,
+                        self_code: std::ptr::null(),
+                        bound: false,
                     };
                     let direct = i.op != Op::Construct && self.direct_target(frame, &i, &mut site);
                     let p = Prop::Call {
@@ -3969,10 +4050,11 @@ impl Lowering<'_> {
     }
 
     /// Whether call `i` of frame `frame` may go straight into its callee's
-    /// compiled code: its cache names another function worth compiling (see
-    /// `vm::worth_entering_compiled`), not this one (whose compiled code
-    /// isn't done yet). Fills `site` in with the callee; [`bind_direct`]
-    /// picks the version when compiling, from the arguments' types.
+    /// compiled code: its cache names a function worth compiling (see
+    /// `vm::worth_entering_compiled`), or this one. Fills `site` in with the
+    /// callee; [`bind_direct`] picks the version when compiling, from the
+    /// arguments' types, or for this function `JitCode::compile` binds the
+    /// version it compiles, if they fit it.
     fn direct_target(&mut self, frame: usize, i: &Insn, site: &mut CallSite) -> bool {
         use crate::object::Class;
         let ic = unsafe { *self.out.fbs[frame].ics.add(i.ic as usize) };
@@ -3981,7 +4063,8 @@ impl Lowering<'_> {
             return false;
         }
         let callee = unsafe { (*fo).code };
-        if callee == self.state.root || unsafe { (*callee).calls_left.get() } == i32::MAX {
+        site.self_call = callee == self.state.root;
+        if !site.self_call && unsafe { (*callee).calls_left.get() } == i32::MAX {
             return false;
         }
         site.closure = fo as u64;
@@ -4311,7 +4394,7 @@ impl JitFunction {
             },
         );
         code.snap = Some(vm.snap.clone());
-        let code = Rc::new(code);
+        let code = code.into_rc();
         self.versions
             .entry(entry)
             .or_default()
@@ -4364,22 +4447,32 @@ impl JitFunction {
         let snap = code.snap.as_ref().expect("a VM function's code");
         let vm = self.vm.as_mut().unwrap();
         vm.dirty = true;
-        // The function may have been lowered differently since (a nested
-        // entry recompiled it): then only resume.
-        if !Rc::ptr_eq(snap, &vm.snap) || (after_call && !bad_result) {
-            return (frame, exit_pc);
-        }
-        if bad_result {
-            // The call is the instruction before the one the exit resumes
-            // at: compile it without a prediction from now on.
+        // The call is the instruction before the one an after-call exit
+        // resumes at.
+        let call_before = || {
             let k = snap
                 .insns
                 .iter()
                 .position(|i| i.frame as usize == frame && i.pc == exit_pc)
                 .expect("an exit's instruction")
                 - 1;
+            debug_assert!(snap.insns[k].is_call());
+            k
+        };
+        // A call that found the native stack too deep: the interpreter
+        // makes it.
+        if after_call && std::mem::take(unsafe { &mut (*vm.vm).redo_call }) {
+            return (frame, snap.insns[call_before()].pc);
+        }
+        // The function may have been lowered differently since (a nested
+        // entry recompiled it): then only resume.
+        if !Rc::ptr_eq(snap, &vm.snap) || (after_call && !bad_result) {
+            return (frame, exit_pc);
+        }
+        if bad_result {
+            // Compile the call without a prediction from now on.
+            let k = call_before();
             let call = snap.insns[k];
-            debug_assert!(call.is_call());
             vm.widened
                 .insert((snap.frames[frame].code as usize, call.pc));
             self.widened.insert(k);
@@ -4545,7 +4638,7 @@ impl JitFunction {
                 let mut code = code;
                 code.snap = self.vm.as_ref().map(|vm| vm.snap.clone());
                 let vs = self.versions.entry(entry).or_insert(keep);
-                vs.push((state, Rc::new(code)));
+                vs.push((state, code.into_rc()));
                 vs.len() - 1
             }
         };
@@ -4771,14 +4864,76 @@ unsafe fn materialize(
     }
 }
 
-/// `call_direct` stencils: the callee's code exited (its exit record is in
-/// the `CallSite` at `site`). Account for the exit, as an entry through the
-/// driver would, write the callee frame's header (it returns to native
-/// code), and finish the call in the interpreter. `EMPTY` on an error.
-extern "C" fn toi_rt_direct_exit(regs: Value, site: Value) -> Value {
+/// `call_direct` stencils: run the call `site` (a `CallSite`) describes,
+/// over the compiled frame `regs`, straight in the callee's compiled code if
+/// it can: the callee register holds the function compiled, the code epoch
+/// is the one the callee's version was bound under, and the native stack
+/// and the VM stack have room. Otherwise as `toi_rt_call`. `EMPTY` on an
+/// error.
+///
+/// Its region's wrapper saves the slot registers the region uses, as for
+/// any runtime call, and the asm call into the callee's code ([`call_code`])
+/// declares every other register clobbered, so this function's prologue
+/// saves the C ABI's callee-saved ones. Doing the call here, rather than in
+/// the stencil, keeps LLVM from saving every slot register in the stencil.
+extern "C" fn toi_rt_call_direct(regs: Value, site: Value) -> Value {
     unsafe {
-        let site = &mut *(site.to_bits() as *mut CallSite);
-        let vm = &mut *site.vm;
+        let site = site.to_bits() as *mut CallSite;
+        let vm = (*site).vm;
+        let caller = regs.to_bits() as *mut Value;
+        let callee = caller.add((*site).frame);
+        if (*site).entry == 0
+            || (*caller.add((*site).f)).to_bits() != (*site).closure
+            || (*vm).code_epoch != (*site).epoch
+            || interp::native_stack_low(&*vm)
+            || callee.add((*site).span) > (*vm).stack_end
+        {
+            return toi_rt_call(regs, Value::from_bits(site as u64));
+        }
+        let w = caller.add((*site).w);
+        let (this, args) = if (*site).op == Op::Call {
+            (*w, w.add(1))
+        } else {
+            (Value::UNDEFINED, w)
+        };
+        *callee = this;
+        // Few values: plain loops (the empty asm keeps LLVM from making
+        // them `memcpy` calls or vector code).
+        let k = (*site).argc.min((*site).nparams as usize);
+        for i in 0..k {
+            *callee.add(1 + i) = *args.add(i);
+            std::arch::asm!("", options(nomem, nostack, preserves_flags));
+        }
+        for i in 1 + k..(*site).nregs as usize {
+            *callee.add(i) = Value::UNDEFINED;
+            std::arch::asm!("", options(nomem, nostack, preserves_flags));
+        }
+        let mut ctx = NO_EXIT;
+        let v = call_code((*site).entry, callee, &mut ctx);
+        if ctx == NO_EXIT {
+            v
+        } else {
+            direct_exit(&mut *vm, caller, &mut *site, ctx, v)
+        }
+    }
+}
+
+/// A direct call's callee code exited with `record` and `acc`. Account for
+/// the exit, as an entry through the driver would, write the callee frame's
+/// header (it returns to native code), and finish the call in the
+/// interpreter. `EMPTY` on an error.
+///
+/// # Safety
+/// `caller` must be the frame making the call at `site`, whose callee's
+/// code just exited.
+unsafe fn direct_exit(
+    vm: &mut crate::vm::Vm,
+    caller: *mut Value,
+    site: &mut CallSite,
+    record: u32,
+    acc: Value,
+) -> Value {
+    unsafe {
         if vm.error.is_some() {
             return Value::EMPTY;
         }
@@ -4786,22 +4941,110 @@ extern "C" fn toi_rt_direct_exit(regs: Value, site: Value) -> Value {
         if site.exits >= MAX_DIRECT_EXITS {
             site.entry = 0;
         }
-        let caller = regs.to_bits() as *mut Value;
         let callee_regs = caller.add(site.frame);
-        let code = site.target.clone().expect("a direct call's target");
+        // A call to the code itself: that code is running (it made the
+        // call), so it is alive.
+        let code: &JitCode = match &site.target {
+            Some(code) => code,
+            None => &*site.self_code,
+        };
         let (frame, exit_pc) = {
             let mut slot = (*site.callee).jit.borrow_mut();
-            slot.as_mut()
-                .unwrap()
-                .vm_finish(&code, 0, site.record as usize)
+            slot.as_mut().unwrap().vm_finish(code, 0, record as usize)
         };
         interp::write_frame_header(vm, callee_regs, site.callee, std::ptr::null(), caller, 0);
-        let r = materialize(vm, callee_regs, &code, frame, exit_pc, site.exit_acc);
-        vm.native_depth += 1;
-        let v = interp::drive(vm, r.pc, r.acc, r.regs);
-        vm.native_depth -= 1;
-        v
+        let r = materialize(vm, callee_regs, code, frame, exit_pc, acc);
+        interp::drive(vm, r.pc, r.acc, r.regs)
     }
+}
+
+/// Call compiled code at `entry` over the frame `regs`, as `call_entry`
+/// does but from compiled code's runtime call: the code uses every slot and
+/// scratch register freely, so they are all declared clobbered (a Rust call
+/// through a `preserve_none` function pointer isn't enough: on arm64, LLVM
+/// assumes some of the slot registers survive it). Slots start empty.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn call_code(entry: u64, regs: *mut Value, ctx: *mut u32) -> Value {
+    let r: u64;
+    let u = Value::UNDEFINED.to_bits();
+    unsafe {
+        // Step over the red zone and align for the call, keeping the old
+        // rsp on the stack; rbx and rbp are saved by hand (asm can't clobber
+        // them, but compiled code may use them).
+        core::arch::asm!(
+            "mov r10, rsp",
+            "lea rsp, [rsp - 128]",
+            "and rsp, -16",
+            "push r10",
+            "push rbx",
+            "push rbp",
+            "sub rsp, 8",
+            "call {e}",
+            "add rsp, 8",
+            "pop rbp",
+            "pop rbx",
+            "pop rsp",
+            e = in(reg) entry,
+            inout("r12") u => _,
+            inout("r13") regs => _,
+            inout("r14") NumberTag::new().to_bits() => _,
+            inout("r15") ctx => _,
+            inout("rdi") u => _,
+            inout("rsi") u => _,
+            inout("rdx") u => _,
+            inout("rcx") u => _,
+            inout("r8") u => _,
+            inout("r9") u => _,
+            out("rax") r,
+            out("r10") _,
+            out("r11") _,
+            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
+            out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
+            out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+        );
+    }
+    Value::from_bits(r)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn call_code(entry: u64, regs: *mut Value, ctx: *mut u32) -> Value {
+    let r: u64;
+    let u = Value::UNDEFINED.to_bits();
+    unsafe {
+        // x19 and x29 (fp) are saved by hand (asm can't clobber them), with
+        // the link register.
+        core::arch::asm!(
+            "stp x29, x30, [sp, #-32]!",
+            "str x19, [sp, #16]",
+            "blr {e}",
+            "ldr x19, [sp, #16]",
+            "ldp x29, x30, [sp], #32",
+            e = in(reg) entry,
+            inout("x20") u => _,
+            inout("x21") regs => _,
+            inout("x22") NumberTag::new().to_bits() => _,
+            inout("x23") ctx => _,
+            inout("x24") u => _, inout("x25") u => _, inout("x26") u => _,
+            inout("x27") u => _, inout("x28") u => _,
+            inout("x0") u => r,
+            inout("x1") u => _, inout("x2") u => _, inout("x3") u => _,
+            inout("x4") u => _, inout("x5") u => _, inout("x6") u => _,
+            out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _,
+            out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _,
+            out("x17") _, out("x18") _, out("x30") _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _,
+            out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _,
+            out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _,
+            out("v15") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _, out("v24") _,
+            out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _,
+            out("v30") _, out("v31") _,
+        );
+    }
+    Value::from_bits(r)
 }
 
 /// `call` stencils: run the call `site` (a `CallSite`) describes, over the

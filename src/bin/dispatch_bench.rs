@@ -22,8 +22,11 @@
 //!   jit3     with VM registers in machine registers too (milestone 3)
 //!   jit4     with fused stencils too
 //!   jit      with unboxed int32 in slots too
-//!   tier     the full JIT, starting in the interpreter and tiering up
-//!            after 1000 loop back edges (on-stack replacement)
+//!   tier     the default: the full JIT, starting in the interpreter and
+//!            tiering up after 1000 loop back edges (on-stack replacement)
+//!
+//! The `jit*` engines compile eagerly, on entry, so their numbers measure the
+//! JIT code alone.
 //!
 //! JIT timings include compilation, which happens on entry (and again after
 //! a side exit; `double` exits once when `s` overflows int32).
@@ -39,7 +42,7 @@
 use std::process::exit;
 use std::time::Instant;
 use toi::bytecode::Assembler;
-use toi::jit::{JitFunction, Tiering};
+use toi::jit::JitFunction;
 use toi::value::Value;
 
 const S: u8 = 0;
@@ -131,15 +134,12 @@ fn main() {
 
     let mut regs = [Value::UNDEFINED; 12];
     let mut jit = match engine {
-        "jit" => Some(JitFunction::new(&code)),
-        "jit1" => Some(JitFunction::new(&code).unspecialized()),
-        "jit2" => Some(JitFunction::new(&code).without_register_homes()),
-        "jit3" => Some(JitFunction::new(&code).without_fusion()),
-        "jit4" => Some(JitFunction::new(&code).without_unboxed_ints()),
-        "tier" => Some(JitFunction::new(&code).tiered(Tiering {
-            back_edges: 1000,
-            calls: 10,
-        })),
+        "jit" => Some(JitFunction::new(&code).eager()),
+        "jit1" => Some(JitFunction::new(&code).eager().unspecialized()),
+        "jit2" => Some(JitFunction::new(&code).eager().without_register_homes()),
+        "jit3" => Some(JitFunction::new(&code).eager().without_fusion()),
+        "jit4" => Some(JitFunction::new(&code).eager().without_unboxed_ints()),
+        "tier" => Some(JitFunction::new(&code)),
         _ => None,
     };
     let start = Instant::now();

@@ -1,4 +1,4 @@
-//! Every program runs on seven engines: the interpreter, the JIT with
+//! Every program runs on seven engines: the interpreter, the eager JIT with
 //! generic stencils (milestone 1), with type-specialized stencils
 //! (milestone 2), with VM registers in machine registers (milestone 3),
 //! with fused stencils, with unboxed int32 in slots, and tiered (starting in
@@ -27,10 +27,16 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
     let initial = regs.to_vec();
     let interp = unsafe { toi::interp::run(&code, regs) };
     for (name, mut f) in [
-        ("jit1", JitFunction::new(&code).unspecialized()),
-        ("jit2", JitFunction::new(&code).without_register_homes()),
-        ("jit3", JitFunction::new(&code).without_fusion()),
-        ("jit4", JitFunction::new(&code).without_unboxed_ints()),
+        ("jit1", JitFunction::new(&code).eager().unspecialized()),
+        (
+            "jit2",
+            JitFunction::new(&code).eager().without_register_homes(),
+        ),
+        ("jit3", JitFunction::new(&code).eager().without_fusion()),
+        (
+            "jit4",
+            JitFunction::new(&code).eager().without_unboxed_ints(),
+        ),
         // Starts in the interpreter and tiers up at the third loop back edge,
         // so loops cross into JIT code mid-way.
         (
@@ -40,7 +46,7 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
                 calls: 1,
             }),
         ),
-        ("jit", JitFunction::new(&code)),
+        ("jit", JitFunction::new(&code).eager()),
     ] {
         let mut jit_regs = initial.clone();
         let jit = unsafe { f.run(&mut jit_regs) };
@@ -337,7 +343,7 @@ fn i32_state_survives_jumps_and_nops() {
 
 fn jit(a: &Assembler, regs: &mut [Value]) -> (Value, JitFunction) {
     let code = a.clone().finish();
-    let mut f = JitFunction::new(&code);
+    let mut f = JitFunction::new(&code).eager();
     let v = unsafe { f.run(regs) };
     (v, f)
 }
@@ -663,12 +669,12 @@ fn fused_loop_tail_overflow_exits() {
         Some(2147483648.0)
     );
     let code = a.clone().finish();
-    let mut f = JitFunction::new(&code);
+    let mut f = JitFunction::new(&code).eager();
     let v = unsafe { f.run(&mut max.clone()) };
     assert_eq!(v.as_number(), Some(2147483648.0));
     assert_eq!(f.stats.exits, 1);
     // Without the overflow, the only compile shows the fused tail.
-    let mut first = JitFunction::new(&code);
+    let mut first = JitFunction::new(&code).eager();
     unsafe { first.run(&mut [Value::UNDEFINED, Value::from_i32(-5)]) };
     assert_eq!(first.stats.exits, 0);
     let s = stencils(&first);
@@ -761,7 +767,7 @@ fn fused_register_add_overflow_undoes_and_exits() {
     let v = exec(a.clone(), &mut regs.clone());
     assert_eq!(v.as_number(), Some((i32::MAX - 5_000_000) as f64 + 10e6));
     let code = a.finish();
-    let mut f = JitFunction::new(&code);
+    let mut f = JitFunction::new(&code).eager();
     let mut r = regs;
     assert_eq!(unsafe { f.run(&mut r) }.as_number(), v.as_number());
     assert_eq!(f.stats.exits, 1);
@@ -1018,7 +1024,7 @@ fn versions_are_reused_across_calls() {
     let mut a = Assembler::new();
     a.ldar(0).add_smi(1).ret();
     let code = a.finish();
-    let mut f = JitFunction::new(&code);
+    let mut f = JitFunction::new(&code).eager();
     for i in 0..10 {
         let (arg, expected) = if i % 2 == 0 {
             (Value::from_i32(1), 2.0)
@@ -1036,7 +1042,7 @@ fn an_int_enters_a_double_version() {
     let mut a = Assembler::new();
     a.ldar(0).add_smi(1).ret();
     let code = a.finish();
-    let mut f = JitFunction::new(&code);
+    let mut f = JitFunction::new(&code).eager();
     assert_eq!(
         unsafe { f.run(&mut [Value::from_f64(0.5)]) }.as_number(),
         Some(1.5)
@@ -1054,7 +1060,7 @@ fn dead_registers_dont_split_versions() {
     let mut a = Assembler::new();
     a.lda_smi(5).star(0).ldar(0).add_smi(1).ret();
     let code = a.finish();
-    let mut f = JitFunction::new(&code);
+    let mut f = JitFunction::new(&code).eager();
     for arg in [Value::from_i32(1), Value::from_f64(1.5), Value::NULL] {
         assert_eq!(unsafe { f.run(&mut [arg]) }, Value::from_i32(6));
     }
@@ -1068,7 +1074,7 @@ fn megamorphic_entries_generalize() {
     let mut a = Assembler::new();
     a.ldar(0).add(1).ret();
     let code = a.finish();
-    let mut f = JitFunction::new(&code);
+    let mut f = JitFunction::new(&code).eager();
     let (i, d, n) = (Value::from_i32(1), Value::from_f64(0.5), Value::NULL);
     let calls = [
         (i, i),
@@ -1115,4 +1121,22 @@ fn accumulator_carried_across_the_back_edge() {
         Value::from_i32(100)
     );
     assert_eq!(f.stats.osr_entries, 1);
+}
+
+#[test]
+fn tiering_is_the_default() {
+    // Short: stays in the interpreter. Long: tiers up after 1000 back edges.
+    let mut short = JitFunction::new(&sum_loop(100).finish());
+    assert_eq!(
+        unsafe { short.run(&mut [Value::UNDEFINED; 3]) },
+        Value::from_i32(4950)
+    );
+    assert_eq!((short.stats.compiles, short.stats.osr_entries), (0, 0));
+    let mut long = JitFunction::new(&sum_loop(5000).finish());
+    let n = 5000i64;
+    assert_eq!(
+        unsafe { long.run(&mut [Value::UNDEFINED; 3]) }.as_number(),
+        Some((n * (n - 1) / 2) as f64)
+    );
+    assert_eq!(long.stats.osr_entries, 1);
 }

@@ -1732,7 +1732,7 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
 /// maybe in a frame the code had inlined. The VM stack holds every frame,
 /// so leaving the handler chain loses nothing. Returns `EMPTY` on an error,
 /// left in `vm.error`.
-unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value) -> Value {
+pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value) -> Value {
     unsafe {
         let mut v = dispatch_at(pc, acc, regs);
         loop {

@@ -308,6 +308,7 @@ fn runtime_function(name: &str) -> usize {
     match name {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
+        "toi_rt_direct_exit" => toi_rt_direct_exit as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
         "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
@@ -906,10 +907,13 @@ pub(crate) enum Prop {
     /// A keyed load whose receivers had shape `shape`, with elements of
     /// type `elems`.
     Keyed { shape: u64, elems: FieldType },
-    /// A call through the runtime, described by the `CallSite` at `site`;
-    /// the VM's code epoch, at `epoch_addr`, must still be `epoch` after it.
+    /// A call, described by `CallSite` number `site` of the lowering:
+    /// straight into the callee's compiled code if `direct`, else through
+    /// the runtime. The VM's code epoch, at `epoch_addr`, must still be
+    /// `epoch` after it (and before, to call directly).
     Call {
-        site: u64,
+        site: u32,
+        direct: bool,
         epoch: u32,
         epoch_addr: u64,
     },
@@ -1250,7 +1254,10 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 }
             }
             out.acc = Any;
-            ("call", "")
+            match spec.props.get(i) {
+                Some(Prop::Call { direct: true, .. }) => ("call_direct", ""),
+                _ => ("call", ""),
+            }
         }
         // ToInt32(a + b) is the 32-bit wrapping add: no exit, no widening.
         Op::Add if wraps && st.acc == I32 && reg == I32 => {
@@ -2005,7 +2012,7 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
         ("star", _) => format!("star_{loc}"),
         ("check_callee", _) => format!("check_callee_{loc}"),
         // The callee reads its arguments from memory.
-        ("call", _) => {
+        ("call" | "call_direct", _) => {
             for r in insn.call_reads() {
                 match homes[r] {
                     Home::Mem => {}
@@ -2014,7 +2021,7 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
                     Home::Fpr(k) => pre.push(Piece::new(&format!("spill_f{k}"), r as u8)),
                 }
             }
-            "call".into()
+            sel.base.into()
         }
         ("get_own" | "get_oop" | "get_proto", _) if sel.case == "nc" => {
             format!("{}_nc_{loc}", sel.base)
@@ -2745,6 +2752,8 @@ struct VmCompile<'a> {
     props: &'a [Prop],
     feedback: Option<&'a [Feedback]>,
     inline_base: usize,
+    /// The lowering's call sites (`Prop::Call` names them by index).
+    sites: &'a [Box<std::cell::UnsafeCell<CallSite>>],
 }
 
 /// Compilation options.
@@ -2771,6 +2780,7 @@ impl JitCode {
             props,
             feedback,
             inline_base,
+            sites: vm_sites,
         } = vm;
         let n = insns.len();
         let nregs = actual.regs.len();
@@ -2891,9 +2901,35 @@ impl JitCode {
             pinned: &pinned,
             ..spec1
         };
-        let sel: Vec<Option<Sel>> = (0..n)
+        let mut sel: Vec<Option<Sel>> = (0..n)
             .map(|i| ins[i].as_ref().map(|st| select(&insns[i], i, st, &spec)))
             .collect();
+        // Direct calls: bind each to the callee version for the arguments'
+        // types here, or call through the runtime.
+        for (i, s) in sel.iter_mut().enumerate() {
+            if let (
+                Some(s),
+                Some(st),
+                Some(Prop::Call {
+                    site, direct: true, ..
+                }),
+            ) = (s.as_mut(), &ins[i], props.get(i))
+            {
+                let insn = &insns[i];
+                let ty = |r: usize| st.regs.get(r).copied().unwrap_or(Ty::Any);
+                let w = insn.reg2 as usize;
+                let (this, first) = if insn.op == Op::Call {
+                    (ty(w), w + 1)
+                } else {
+                    (Ty::Any, w)
+                };
+                let args: Vec<Ty> = (first..first + insn.imm as usize).map(ty).collect();
+                let site = vm_sites[*site as usize].get();
+                if !unsafe { bind_direct(site, this, &args) } {
+                    s.base = "call";
+                }
+            }
+        }
 
         // Hot code: entry pieces, then each reachable instruction in bytecode
         // order: its fall-through edge conversions, then (at its label) any
@@ -3052,8 +3088,13 @@ impl JitCode {
                         site,
                         epoch,
                         epoch_addr,
+                        ..
                     }),
-                ) => (epoch as i32, site, epoch_addr),
+                ) => (
+                    epoch as i32,
+                    vm_sites[site as usize].get() as u64,
+                    epoch_addr,
+                ),
                 _ => (insn.imm, 0, 0),
             };
             let main = Piece {
@@ -3082,7 +3123,7 @@ impl JitCode {
                 }
                 // A call exits after it (on an error, or when the callee
                 // changed the code epoch), with its result, boxed, in `acc`.
-                let record = if name == "call" {
+                let record = if name == "call" || name == "call_direct" {
                     insns[i + 1].exit_record() | AFTER_CALL
                 } else {
                     seq.extend(box_acc_piece(st.acc));
@@ -3304,6 +3345,11 @@ impl JitCode {
         }
     }
 
+    /// The address to call the code at (see `call_direct`).
+    fn entry_addr(&self) -> u64 {
+        self.mem.ptr as u64 + self.entry as u64
+    }
+
     /// The hot machine code, for inspection.
     pub fn main_code(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.mem.ptr, self.main_len) }
@@ -3463,17 +3509,92 @@ struct InlineFrame {
     ret_pc: usize,
 }
 
-/// A call compiled code makes through the runtime (`call` stencil,
-/// `toi_rt_call`): `op`'s operands, renamed into the compiled frame, and
-/// where a callee's frame goes (past every register the compiled code
-/// uses).
+/// A call compiled code makes (`call` and `call_direct` stencils): `op`'s
+/// operands, renamed into the compiled frame, and where a callee's frame
+/// goes (past every register the compiled code uses). The first fields are
+/// what `call_direct` reads (`DirectSite` in `stencils/stencils.rs`): a
+/// callee's compiled entry, if the call goes straight there; offsets are in
+/// bytes from the caller's registers.
+#[repr(C)]
 pub(crate) struct CallSite {
+    entry: u64,
+    closure: u64,
+    f_off: u64,
+    w_off: u64,
+    frame_off: u64,
+    argc32: u32,
+    nparams: u32,
+    nregs: u32,
+    has_this: u32,
+    span: u64,
+    stack_end: u64,
+    depth: *mut u32,
+    record: u32,
+    /// Exits of the callee's code at this site: past [`MAX_DIRECT_EXITS`],
+    /// calls go through the runtime (`entry` = 0).
+    exits: u32,
+    exit_acc: Value,
     vm: *mut crate::vm::Vm,
     op: Op,
     f: usize,
     w: usize,
     argc: usize,
     frame: usize,
+    /// The callee's code and compiled version, for a direct call.
+    callee: *const crate::vm::Code,
+    target: Option<Rc<JitCode>>,
+}
+
+/// Exits of a direct callee before its call site stops calling directly.
+const MAX_DIRECT_EXITS: u32 = 4;
+
+/// Bind direct-call candidate `site` to a version of its callee entered
+/// with `this` and the arguments of the types `this` and `args` (the
+/// caller's types when compiling: facts, like entry types); the callee's
+/// other live registers hold `undefined`. False if there is none (the
+/// callee won't compile, or is being compiled: mutual recursion, its state
+/// is borrowed), or if the site is already bound to another version (by
+/// another version of the caller): the call then goes through the runtime.
+///
+/// # Safety
+/// `site` must be a live call site of a VM function.
+unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
+    let site = unsafe { &mut *site };
+    let (callee, vm) = (site.callee, site.vm);
+    let Ok(mut slot) = (unsafe { (*callee).jit.try_borrow_mut() }) else {
+        return false;
+    };
+    let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, vm)));
+    let nparams = site.nparams as usize;
+    let make_state = |live: &[bool], acc_live: bool| {
+        let ty = |r: usize| match r {
+            0 => this,
+            r if r <= nparams => args.get(r - 1).copied().unwrap_or(Ty::Any),
+            _ => Ty::Any,
+        };
+        TypeState {
+            acc: if acc_live { Ty::Any } else { Ty::Bot },
+            regs: live
+                .iter()
+                .enumerate()
+                .map(|(r, &l)| if l { ty(r) } else { Ty::Bot })
+                .collect(),
+        }
+    };
+    let Some((code, nregs)) =
+        (unsafe { f.entry_version((*vm).proto_epoch, (*vm).field_epoch, make_state) })
+    else {
+        return false;
+    };
+    match &site.target {
+        Some(bound) => Rc::ptr_eq(bound, &code),
+        None => {
+            site.entry = code.entry_addr();
+            site.span = 8 * (nregs + interp::HEADER) as u64;
+            site.target = Some(code);
+            true
+        }
+    }
 }
 
 /// A lowering as compiled (see [`JitCode::snap`]).
@@ -3482,8 +3603,7 @@ pub(crate) struct Snapshot {
     insns: Vec<Insn>,
     frames: Vec<InlineFrame>,
     /// Owned here so they live as long as code pointing to them.
-    #[allow(dead_code)]
-    sites: Vec<Box<CallSite>>,
+    sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
 }
 
 /// The result of [`lower`].
@@ -3493,7 +3613,7 @@ struct Lowered {
     props: Vec<Prop>,
     frames: Vec<InlineFrame>,
     fbs: Vec<Feedback>,
-    sites: Vec<Box<CallSite>>,
+    sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
     nregs: usize,
 }
 
@@ -3656,21 +3776,43 @@ impl Lowering<'_> {
                 }
                 Op::Call | Op::CallUndefined | Op::Construct => {
                     let code = unsafe { &*f.code };
-                    let site = Box::new(CallSite {
-                        vm: self.state.vm,
+                    let vm = self.state.vm;
+                    let callee_frame = base + code.nregs as usize + interp::HEADER;
+                    let mut site = CallSite {
+                        entry: 0,
+                        closure: 0,
+                        f_off: 8 * i.reg as u64,
+                        w_off: 8 * i.reg2 as u64,
+                        frame_off: 8 * callee_frame as u64,
+                        argc32: i.imm as u32,
+                        nparams: 0,
+                        nregs: 0,
+                        has_this: (i.op == Op::Call) as u32,
+                        span: 0,
+                        stack_end: unsafe { (*vm).stack_end } as u64,
+                        depth: unsafe { &raw mut (*vm).native_depth },
+                        record: 0,
+                        exits: 0,
+                        exit_acc: Value::UNDEFINED,
+                        vm,
                         op: i.op,
                         f: i.reg as usize,
                         w: i.reg2 as usize,
                         argc: i.imm as usize,
-                        frame: base + code.nregs as usize + interp::HEADER,
-                    });
-                    let vm = self.state.vm;
+                        frame: callee_frame,
+                        callee: std::ptr::null(),
+                        target: None,
+                    };
+                    let direct = i.op != Op::Construct && self.direct_target(frame, &i, &mut site);
                     let p = Prop::Call {
-                        site: &*site as *const CallSite as u64,
+                        site: self.out.sites.len() as u32,
+                        direct,
                         epoch: unsafe { (*vm).code_epoch },
                         epoch_addr: unsafe { &raw const (*vm).code_epoch } as u64,
                     };
-                    self.out.sites.push(site);
+                    self.out
+                        .sites
+                        .push(Box::new(std::cell::UnsafeCell::new(site)));
                     self.push(i, p);
                 }
                 _ if i.jumps() => {
@@ -3701,6 +3843,29 @@ impl Lowering<'_> {
             self.out.insns[x].target = start[t];
         }
         rets
+    }
+
+    /// Whether call `i` of frame `frame` may go straight into its callee's
+    /// compiled code: its cache names another function worth compiling (see
+    /// `vm::worth_entering_compiled`), not this one (whose compiled code
+    /// isn't done yet). Fills `site` in with the callee; [`bind_direct`]
+    /// picks the version when compiling, from the arguments' types.
+    fn direct_target(&mut self, frame: usize, i: &Insn, site: &mut CallSite) -> bool {
+        use crate::object::Class;
+        let ic = unsafe { *self.out.fbs[frame].ics.add(i.ic as usize) };
+        let fo = ic.holder;
+        if fo.is_null() || unsafe { (*fo).class } != Class::Function {
+            return false;
+        }
+        let callee = unsafe { (*fo).code };
+        if callee == self.state.root || unsafe { (*callee).calls_left.get() } == i32::MAX {
+            return false;
+        }
+        site.closure = fo as u64;
+        site.nparams = unsafe { (*callee).nparams };
+        site.nregs = unsafe { (*callee).nregs };
+        site.callee = callee;
+        true
     }
 
     /// The function to inline for call `i` of frame `frame`, if any.
@@ -3912,38 +4077,7 @@ impl JitFunction {
                 return None;
             }
             if vm.dirty || vm.epoch != epoch || vm.field_epoch != field_epoch {
-                let low = lower(vm, epoch);
-                vm.dirty = false;
-                if vm.epoch != epoch
-                    || vm.field_epoch != field_epoch
-                    || low.insns != self.insns
-                    || low.props != vm.props
-                    || low.frames != vm.snap.frames
-                {
-                    self.versions.clear();
-                    self.live_at.clear();
-                    vm.epoch = epoch;
-                    vm.field_epoch = field_epoch;
-                    self.widened = low
-                        .insns
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, i)| {
-                            vm.widened
-                                .contains(&(low.frames[i.frame as usize].code as usize, i.pc))
-                        })
-                        .map(|(k, _)| k)
-                        .collect();
-                    self.insns = low.insns.clone();
-                    self.nregs = low.nregs;
-                    vm.props = low.props;
-                    vm.fbs = low.fbs;
-                    vm.snap = Rc::new(Snapshot {
-                        insns: low.insns,
-                        frames: low.frames,
-                        sites: low.sites,
-                    });
-                }
+                self.refresh(epoch, field_epoch);
             }
             // Inlined frames' registers must fit the VM stack.
             if unsafe { regs.add(self.nregs + interp::HEADER) } > stack_end {
@@ -3955,6 +4089,107 @@ impl JitFunction {
         let actual = self.entry_types(entry, acc, regs);
         let index = self.version(entry, &actual, &mut acc, regs);
         Some((self.versions[&entry][index].1.clone(), acc, self.nregs))
+    }
+
+    /// Lower the function again ([`lower`]); if that gives something else,
+    /// or the epochs changed, drop the versions and take the new lowering.
+    fn refresh(&mut self, epoch: u32, field_epoch: u32) {
+        let vm = self.vm.as_mut().unwrap();
+        let low = lower(vm, epoch);
+        vm.dirty = false;
+        if vm.epoch != epoch
+            || vm.field_epoch != field_epoch
+            || low.insns != self.insns
+            || low.props != vm.props
+            || low.frames != vm.snap.frames
+        {
+            self.versions.clear();
+            self.live_at.clear();
+            vm.epoch = epoch;
+            vm.field_epoch = field_epoch;
+            self.widened = low
+                .insns
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| {
+                    vm.widened
+                        .contains(&(low.frames[i.frame as usize].code as usize, i.pc))
+                })
+                .map(|(k, _)| k)
+                .collect();
+            self.insns = low.insns.clone();
+            self.nregs = low.nregs;
+            vm.props = low.props;
+            vm.fbs = low.fbs;
+            vm.snap = Rc::new(Snapshot {
+                insns: low.insns,
+                frames: low.frames,
+                sites: low.sites,
+            });
+        }
+    }
+
+    /// A version entered at instruction 0 that values of the types
+    /// `make_state` gives (from which registers, and whether `acc`, are live
+    /// there) fit, compiled if needed, with the register count its frame
+    /// uses. Direct calls from other compiled code use it: they pick the
+    /// version when compiling, from the arguments' types.
+    unsafe fn entry_version(
+        &mut self,
+        epoch: u32,
+        field_epoch: u32,
+        make_state: impl Fn(&[bool], bool) -> TypeState,
+    ) -> Option<(Rc<JitCode>, usize)> {
+        let vm = self.vm.as_mut().unwrap();
+        if vm.no_entry.contains(&0) || self.stats.compiles >= MAX_VM_COMPILES {
+            return None;
+        }
+        if vm.dirty || vm.epoch != epoch || vm.field_epoch != field_epoch {
+            self.refresh(epoch, field_epoch);
+        }
+        let entry = self.index_of(0);
+        let (insns, nregs) = (&self.insns, self.nregs);
+        let (acc_live, live) = self
+            .live_at
+            .entry(entry)
+            .or_insert_with(|| {
+                let reach = reachable(insns, entry);
+                let regs_live = reg_live_in(insns, &reach, nregs)[entry].clone();
+                (acc_liveness(insns, &reach).0[entry], regs_live)
+            })
+            .clone();
+        let state = make_state(&live, acc_live);
+        let fits = |a: Ty, v: Ty| a == v || a == Ty::Bot || v == Ty::Any;
+        if let Some((_, code)) = self.versions.get(&entry).and_then(|vs| {
+            vs.iter().find(|(st, _)| {
+                fits(state.acc, st.acc)
+                    && state.regs.iter().zip(&st.regs).all(|(&a, &b)| fits(a, b))
+            })
+        }) {
+            return Some((code.clone(), self.nregs));
+        }
+        self.stats.compiles += 1;
+        let vm = self.vm.as_ref().unwrap();
+        let mut code = JitCode::compile(
+            &self.insns,
+            entry,
+            state.clone(),
+            &self.widened,
+            self.opts,
+            VmCompile {
+                props: &vm.props,
+                feedback: Some(&vm.fbs[..]),
+                inline_base: vm.inline_base,
+                sites: &vm.snap.sites,
+            },
+        );
+        code.snap = Some(vm.snap.clone());
+        let code = Rc::new(code);
+        self.versions
+            .entry(entry)
+            .or_default()
+            .push((state, code.clone()));
+        Some((code, self.nregs))
     }
 
     /// An existing version for the entry at bytecode offset `pc` that the
@@ -4141,9 +4376,11 @@ impl JitFunction {
                 };
                 self.stats.compiles += 1;
                 let code = {
-                    let (props, feedback, inline_base): (&[Prop], _, _) = match &self.vm {
-                        Some(vm) => (&vm.props, Some(&vm.fbs[..]), vm.inline_base),
-                        None => (&[], None, self.nregs),
+                    let (props, feedback, inline_base, sites): (&[Prop], _, _, &[_]) = match &self
+                        .vm
+                    {
+                        Some(vm) => (&vm.props, Some(&vm.fbs[..]), vm.inline_base, &vm.snap.sites),
+                        None => (&[], None, self.nregs, &[]),
                     };
                     JitCode::compile(
                         &self.insns,
@@ -4155,6 +4392,7 @@ impl JitFunction {
                             props,
                             feedback,
                             inline_base,
+                            sites,
                         },
                     )
                 };
@@ -4343,7 +4581,25 @@ pub(crate) unsafe fn vm_run(
         let mut slot = code.jit.borrow_mut();
         slot.as_mut().unwrap().vm_finish(&jit_code, pc, record)
     };
-    let frames = &jit_code.snap.as_ref().unwrap().frames;
+    VmRun::Exit(unsafe { materialize(vm, regs, &jit_code, frame, exit_pc, acc) })
+}
+
+/// Where the interpreter resumes after `code` (compiled for the frame
+/// `regs`) exited in its frame `frame` at bytecode offset `pc` with `acc`:
+/// an inlined frame gets its header written (and so do the frames between),
+/// so that its `Return` continues the caller.
+///
+/// # Safety
+/// `regs` must be the frame `code` ran over.
+unsafe fn materialize(
+    vm: &crate::vm::Vm,
+    regs: *mut Value,
+    code: &JitCode,
+    frame: usize,
+    exit_pc: usize,
+    acc: Value,
+) -> interp::Resume {
+    let frames = &code.snap.as_ref().unwrap().frames;
     // Headers for the inlined frames from the exit's outwards.
     let mut g = frame;
     while g != 0 {
@@ -4362,11 +4618,44 @@ pub(crate) unsafe fn vm_run(
         g = fr.parent;
     }
     let fr = frames[frame];
-    VmRun::Exit(interp::Resume {
+    interp::Resume {
         regs: unsafe { regs.add(fr.base) },
         pc: unsafe { (*fr.code).bytecode.as_ptr().add(exit_pc) },
         acc,
-    })
+    }
+}
+
+/// `call_direct` stencils: the callee's code exited (its exit record is in
+/// the `CallSite` at `site`). Account for the exit, as an entry through the
+/// driver would, write the callee frame's header (it returns to native
+/// code), and finish the call in the interpreter. `EMPTY` on an error.
+extern "C" fn toi_rt_direct_exit(regs: Value, site: Value) -> Value {
+    unsafe {
+        let site = &mut *(site.to_bits() as *mut CallSite);
+        let vm = &mut *site.vm;
+        if vm.error.is_some() {
+            return Value::EMPTY;
+        }
+        site.exits += 1;
+        if site.exits >= MAX_DIRECT_EXITS {
+            site.entry = 0;
+        }
+        let caller = regs.to_bits() as *mut Value;
+        let callee_regs = caller.add(site.frame);
+        let code = site.target.clone().expect("a direct call's target");
+        let (frame, exit_pc) = {
+            let mut slot = (*site.callee).jit.borrow_mut();
+            slot.as_mut()
+                .unwrap()
+                .vm_finish(&code, 0, site.record as usize)
+        };
+        interp::write_frame_header(vm, callee_regs, site.callee, std::ptr::null(), caller, 0);
+        let r = materialize(vm, callee_regs, &code, frame, exit_pc, site.exit_acc);
+        vm.native_depth += 1;
+        let v = interp::drive(vm, r.pc, r.acc, r.regs);
+        vm.native_depth -= 1;
+        v
+    }
 }
 
 /// `call` stencils: run the call `site` (a `CallSite`) describes, over the

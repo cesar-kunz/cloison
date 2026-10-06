@@ -6,7 +6,7 @@
 //! 2. For every `toi_stencil_*` function, extract its machine code and
 //!    relocations.
 //! 3. On arm64, fold trailing branch stubs ([`fold_arm64_stubs`]) and
-//!    invert a conditional branch over a lone jump
+//!    invert conditional branches over lone jumps
 //!    ([`invert_arm64_branch_over_jump`]).
 //! 4. Write `$OUT_DIR/stencils.rs`, included by `src/jit.rs`.
 //!
@@ -238,69 +238,80 @@ fn local_branch(code: &[u8], at: usize) -> Option<(i64, u32, u32)> {
     }
 }
 
-/// For a conditional branch, LLVM ends a stencil with
+/// LLVM often branches over a lone jump: `x: b.cond L; y: b <symbol>;
+/// L: …`. A conditional `become` produces one, either in the middle of a
+/// stencil (`b.vc L; b toi_exit`) or at its end
+/// (`b.ge z; b toi_jump_target; z: b toi_continue`, a loop's back edge).
+/// Taking the jump then costs a not-taken `b.cond` plus a taken `b`, and at
+/// the end it also blocks trimming the final `b toi_continue`.
 ///
-/// ```text
-/// x: b.cond z          ; condition false: continue
-/// y: b      <target>   ; condition true: take the branch
-/// z: b      toi_continue
-/// ```
-///
-/// so taking the branch (a loop's back edge) costs a not-taken `b.cond` plus
-/// a taken `b`. Rewrite it to `x: b.!cond <target>; z: b toi_continue`. The
-/// JIT then trims the final jump, and the branch is a single instruction.
+/// Rewrite each one to `x: b.!cond <symbol>` (a new relocation) and delete
+/// `y`, fixing up local branches that cross it. Skips sites where another
+/// branch targets `y`.
 fn invert_arm64_branch_over_jump(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
-    let n = code.len();
-    if n < 12 {
-        return;
-    }
-    let (x, y, z) = (n - 12, n - 8, n - 4);
     let reloc_at = |relocs: &[Reloc], at: usize| relocs.iter().position(|r| r.offset == at as u64);
-    let (Some(ry), Some(rz)) = (reloc_at(relocs, y), reloc_at(relocs, z)) else {
-        return;
-    };
-    let xi = u32::from_le_bytes(code[x..x + 4].try_into().unwrap());
-    let is_bcond = xi & 0xFF00_0010 == 0x5400_0000 && (xi & 0xF) < 0xE;
-    if relocs[rz].symbol != "toi_continue"
-        || relocs[rz].r_type != R_AARCH64_JUMP26
-        || relocs[ry].r_type != R_AARCH64_JUMP26
-        || !is_bcond
-        || reloc_at(relocs, x).is_some()
-        || local_branch(code, x).map(|b| b.0) != Some(8)
-    {
+    'search: loop {
+        for x in (0..code.len().saturating_sub(8)).step_by(4) {
+            let y = x + 4;
+            let xi = u32::from_le_bytes(code[x..x + 4].try_into().unwrap());
+            let is_bcond = xi & 0xFF00_0010 == 0x5400_0000 && (xi & 0xF) < 0xE;
+            let Some(ry) = reloc_at(relocs, y) else {
+                continue;
+            };
+            if !is_bcond
+                || reloc_at(relocs, x).is_some()
+                || relocs[ry].r_type != R_AARCH64_JUMP26
+                || local_branch(code, x).map(|b| b.0) != Some(8)
+            {
+                continue;
+            }
+            let targets_y = (0..code.len()).step_by(4).any(|at| {
+                at != x
+                    && reloc_at(relocs, at).is_none()
+                    && local_branch(code, at).is_some_and(|(d, _, _)| at as i64 + d == y as i64)
+            });
+            if targets_y {
+                continue;
+            }
+            // Invert the condition (flip its low bit), clear the displacement,
+            // and aim it at `y`'s target through a relocation.
+            code[x..x + 4].copy_from_slice(&((xi ^ 1) & !(0x7FFFF << 5)).to_le_bytes());
+            let target = relocs.remove(ry);
+            relocs.push(Reloc {
+                offset: x as u64,
+                r_type: R_AARCH64_CONDBR19,
+                symbol: target.symbol,
+                addend: target.addend,
+            });
+            delete_insn(code, relocs, y);
+            continue 'search;
+        }
         return;
     }
-    // Nothing else may branch to `y`; branches to `z` move with it.
-    let mut retarget = Vec::new();
-    for at in (0..y)
-        .step_by(4)
-        .filter(|&at| at != x && reloc_at(relocs, at).is_none())
-    {
-        if let Some((disp, mask, shift)) = local_branch(code, at) {
-            match (at as i64 + disp) as usize {
-                t if t == y => return,
-                t if t == z => retarget.push((at, disp - 4, mask, shift)),
-                _ => {}
-            }
+}
+
+/// Delete the instruction at `y`, moving later code and relocations up and
+/// fixing local branches across it. Nothing may branch to `y` itself.
+fn delete_insn(code: &mut Vec<u8>, relocs: &mut [Reloc], y: usize) {
+    for at in (0..code.len()).step_by(4) {
+        if at == y || relocs.iter().any(|r| r.offset == at as u64) {
+            continue;
+        }
+        let Some((disp, mask, shift)) = local_branch(code, at) else {
+            continue;
+        };
+        let t = (at as i64 + disp) as usize;
+        assert_ne!(t, y, "branch to a deleted instruction");
+        let moved = |p: usize| if p > y { p - 4 } else { p };
+        let new_disp = moved(t) as i64 - moved(at) as i64;
+        if new_disp != disp {
+            let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+            let field = ((new_disp >> 2) as u32 & mask) << shift;
+            code[at..at + 4].copy_from_slice(&((i & !(mask << shift)) | field).to_le_bytes());
         }
     }
-    for (at, disp, mask, shift) in retarget {
-        let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
-        let field = ((disp >> 2) as u32 & mask) << shift;
-        code[at..at + 4].copy_from_slice(&((i & !(mask << shift)) | field).to_le_bytes());
+    for r in relocs.iter_mut().filter(|r| r.offset > y as u64) {
+        r.offset -= 4;
     }
-    // Invert the condition (flip its low bit), clear the displacement, and
-    // aim it at `y`'s target through a relocation.
-    let inverted = (xi ^ 1) & !(0x7FFFF << 5);
-    code[x..x + 4].copy_from_slice(&inverted.to_le_bytes());
-    let target = relocs.remove(ry);
-    let rz = reloc_at(relocs, z).unwrap();
-    relocs[rz].offset -= 4;
-    relocs.push(Reloc {
-        offset: x as u64,
-        r_type: R_AARCH64_CONDBR19,
-        symbol: target.symbol,
-        addend: target.addend,
-    });
     code.drain(y..y + 4);
 }

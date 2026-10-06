@@ -10,6 +10,10 @@
 //   --engine CMD        run `CMD file` instead of Node; its stdout must print
 //                       the completion value (e.g. --engine "target/release/toi")
 //
+// Files may also be bytecode listings (`bench/bytecode/*.asm`, needs
+// --engine); their headers come from the benchmark of the same name in
+// `bench/micro/`.
+//
 // A benchmark is a plain script with no host calls. Its result is the
 // script's completion value (the value of its last expression statement),
 // which must be a number. Header comments:
@@ -19,7 +23,7 @@
 
 import { readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 
@@ -70,7 +74,11 @@ function median(xs) {
 let failures = 0;
 for (const file of files) {
   const name = relative(process.cwd(), file);
-  let src = readFileSync(file, "utf8");
+  const listing = file.endsWith(".asm");
+  if (listing && !opt.engine) throw new Error(`${name}: bytecode listings need --engine`);
+  const headerFile = listing ? join(here, "micro", basename(file, ".asm") + ".js") : file;
+  if (listing && opt.update) throw new Error(`${name}: --update takes .js files`);
+  let src = readFileSync(headerFile, "utf8");
   const feats = (header(src, "features") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
   for (const f of feats) if (!FEATURES.has(f)) throw new Error(`${name}: unknown feature ${f}`);
   if (opt.features && !feats.every((f) => opt.features.has(f))) continue;

@@ -2,88 +2,238 @@
 //! Ignition). Instructions are variable length: a one-byte opcode followed by
 //! its operands, little-endian, unaligned.
 
-#[repr(u8)]
+/// The kinds of instruction operands, in encoding order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Op {
+pub enum Operand {
+    /// A register index (1 byte).
+    Reg,
+    /// A signed 32-bit immediate (4 bytes).
+    Imm,
+    /// A jump offset relative to the start of the instruction (4 bytes).
+    Off,
+    /// An inline-cache slot of the function (2 bytes). Each slot also
+    /// records the property name it is for.
+    Ic,
+    /// An index into the function's table of nested functions (2 bytes).
+    Fn,
+    /// An argument count (1 byte).
+    Count,
+}
+
+impl Operand {
+    pub const fn width(self) -> usize {
+        match self {
+            Operand::Reg | Operand::Count => 1,
+            Operand::Ic | Operand::Fn => 2,
+            Operand::Imm | Operand::Off => 4,
+        }
+    }
+}
+
+macro_rules! define_ops {
+    ($( $(#[$m:meta])* $name:ident ( $($k:ident),* ) ),* $(,)?) => {
+        #[repr(u8)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Op {
+            $( $(#[$m])* $name, )*
+        }
+
+        impl Op {
+            pub const ALL: [Op; [$(Op::$name),*].len()] = [$(Op::$name),*];
+            pub const COUNT: usize = Op::ALL.len();
+
+            /// The operand kinds, in encoding order.
+            pub const fn operands(self) -> &'static [Operand] {
+                match self {
+                    $( Op::$name => &[$(Operand::$k),*], )*
+                }
+            }
+
+            /// The mnemonic, as the text assembler spells it.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $( Op::$name => stringify!($name), )*
+                }
+            }
+        }
+    };
+}
+
+// Binary operators follow Ignition: `Op r` computes `r OP acc` (the left
+// operand is the register), while the `…Smi` forms compute `acc OP imm`.
+// So `x + y` is "y into acc, `Add r_x`", and `n += e` is "e into acc,
+// `Add r_n`", with no temporary. The fused compare-and-jumps are the
+// exception: `JumpIfLess r` tests `acc < r`.
+define_ops! {
     /// No operation. Its handler is pure dispatch, which makes it the probe
     /// for measuring dispatch length.
-    Nop,
+    Nop(),
     /// `acc = imm32`
-    LdaSmi,
+    LdaSmi(Imm),
     /// `acc = r[a]`
-    Ldar,
+    Ldar(Reg),
     /// `r[a] = acc`
-    Star,
-    /// `acc = acc + r[a]`
-    Add,
+    Star(Reg),
+    /// `acc = r[a] + acc`
+    Add(Reg),
     /// `acc = acc + 1`
-    Inc,
+    Inc(),
     /// `if acc < r[a] { pc += off32 }` (offset relative to this instruction)
-    JumpIfLess,
+    JumpIfLess(Reg, Off),
     /// `pc += off32` (offset relative to this instruction)
-    Jump,
+    Jump(Off),
     /// `acc = acc + imm32`. Like V8's `AddSmi`, it saves the operand fetch
     /// and its type check.
-    AddSmi,
+    AddSmi(Imm),
     /// `if acc < imm32 { pc += off32 }` (offset relative to this instruction)
-    JumpIfLessSmi,
+    JumpIfLessSmi(Imm, Off),
     /// `Jump` backwards: a loop's back edge. Like V8's `JumpLoop`, the loop
     /// forms count iterations in the interpreter, to tier up hot loops into
     /// the JIT. The assembler emits them for jumps to already-bound labels.
-    JumpLoop,
+    JumpLoop(Off),
     /// `JumpIfLess` backwards.
-    JumpIfLessLoop,
+    JumpIfLessLoop(Reg, Off),
     /// `JumpIfLessSmi` backwards.
-    JumpIfLessSmiLoop,
-    /// Return `acc` to the host.
-    Return,
+    JumpIfLessSmiLoop(Imm, Off),
+    /// Return `acc` to the caller, or to the host from the outermost frame.
+    Return(),
+
+    // ---- Constants and registers ----
+    /// `acc = undefined`
+    LdaUndefined(),
+    /// `acc = null`
+    LdaNull(),
+    /// `acc = true`
+    LdaTrue(),
+    /// `acc = false`
+    LdaFalse(),
+    /// `r[b] = r[a]`
+    Mov(Reg, Reg),
+
+    // ---- Arithmetic and comparisons ----
+    /// `acc = acc % imm32`
+    ModSmi(Imm),
+    /// `acc = acc & imm32`
+    BitAndSmi(Imm),
+    /// `acc = acc | imm32`
+    BitOrSmi(Imm),
+    /// `acc = r[a] < acc`
+    TestLessThan(Reg),
+    /// `acc = r[a] == acc`
+    TestEqual(Reg),
+    /// `acc = acc == imm32`
+    TestEqualSmi(Imm),
+
+    // ---- Conditional jumps (forward only) ----
+    /// `if acc === true { pc += off32 }`; `acc` must be a boolean.
+    JumpIfTrue(Off),
+    /// `if acc === false { pc += off32 }`; `acc` must be a boolean.
+    JumpIfFalse(Off),
+    /// `if ToBoolean(acc) { pc += off32 }`
+    JumpIfToBooleanTrue(Off),
+    /// `if !ToBoolean(acc) { pc += off32 }`
+    JumpIfToBooleanFalse(Off),
+
+    // ---- Properties ----
+    /// `acc = global.name`, where the inline-cache slot names the property.
+    /// A ReferenceError if there is no such property.
+    LdaGlobal(Ic),
+    /// `global.name = acc`
+    StaGlobal(Ic),
+    /// `acc = r[a].name`
+    GetNamed(Reg, Ic),
+    /// `r[a].name = acc`
+    SetNamed(Reg, Ic),
+    /// `acc = r[a][acc]`
+    GetKeyed(Reg),
+    /// `r[a][r[b]] = acc`
+    SetKeyed(Reg, Reg),
+
+    // ---- Allocation ----
+    /// `acc` = a new closure of nested function `f`.
+    CreateClosure(Fn),
+    /// `acc = []`
+    CreateArray(),
+
+    // ---- Calls ----
+    /// `acc = r[f](r[w+1], …, r[w+n])` with `this = r[w]`.
+    Call(Reg, Reg, Count),
+    /// `acc = r[f](r[a], …, r[a+n-1])` with `this = undefined`.
+    CallUndefined(Reg, Reg, Count),
+    /// `acc = new r[f](r[a], …, r[a+n-1])`
+    Construct(Reg, Reg, Count),
+
+    // ---- Superinstructions (see `quicken`) ----
+    // Each is a comparison immediately followed by a `JumpIfTrue` or
+    // `JumpIfFalse`, which [`quicken`] fuses by rewriting the comparison's
+    // opcode byte. The handler does both: it reads the jump's offset from
+    // the instruction after it, and either jumps or skips it. The jump
+    // instruction stays in place, so offsets and jump targets don't change,
+    // and the accumulator ends as the comparison's boolean, as it would.
+    /// `TestLessThan r` + `JumpIfTrue`.
+    TestLessThanJumpIfTrue(Reg),
+    /// `TestLessThan r` + `JumpIfFalse`.
+    TestLessThanJumpIfFalse(Reg),
+    /// `TestEqual r` + `JumpIfTrue`.
+    TestEqualJumpIfTrue(Reg),
+    /// `TestEqual r` + `JumpIfFalse`.
+    TestEqualJumpIfFalse(Reg),
+    /// `TestEqualSmi k` + `JumpIfTrue`.
+    TestEqualSmiJumpIfTrue(Imm),
+    /// `TestEqualSmi k` + `JumpIfFalse`.
+    TestEqualSmiJumpIfFalse(Imm),
 }
 
 impl Op {
-    pub const COUNT: usize = Op::Return as usize + 1;
-
-    const ALL: [Op; Op::COUNT] = [
-        Op::Nop,
-        Op::LdaSmi,
-        Op::Ldar,
-        Op::Star,
-        Op::Add,
-        Op::Inc,
-        Op::JumpIfLess,
-        Op::Jump,
-        Op::AddSmi,
-        Op::JumpIfLessSmi,
-        Op::JumpLoop,
-        Op::JumpIfLessLoop,
-        Op::JumpIfLessSmiLoop,
-        Op::Return,
-    ];
-
     /// Decode an opcode byte.
     pub fn from_u8(b: u8) -> Option<Op> {
         Self::ALL.get(b as usize).copied()
     }
 
-    /// Total encoded length in bytes, opcode included.
-    pub const fn size(self) -> usize {
-        match self {
-            Op::Nop | Op::Inc | Op::Return => 1,
-            Op::Ldar | Op::Star | Op::Add => 2,
-            Op::LdaSmi | Op::Jump | Op::JumpLoop | Op::AddSmi => 5,
-            Op::JumpIfLess | Op::JumpIfLessLoop => 6,
-            Op::JumpIfLessSmi | Op::JumpIfLessSmiLoop => 9,
-        }
+    /// The opcode named `name` (its mnemonic).
+    pub fn from_name(name: &str) -> Option<Op> {
+        Self::ALL.iter().copied().find(|op| op.name() == name)
     }
 
-    /// The plain form of a loop opcode (`JumpLoop` → `Jump`, …); any other
-    /// opcode as is. They behave the same apart from counting iterations.
+    /// Total encoded length in bytes, opcode included.
+    pub const fn size(self) -> usize {
+        let ops = self.operands();
+        let mut n = 1;
+        let mut i = 0;
+        while i < ops.len() {
+            n += ops[i].width();
+            i += 1;
+        }
+        n
+    }
+
+    /// The plain form of a loop opcode (`JumpLoop` → `Jump`, …) or of a
+    /// superinstruction (`TestLessThanJumpIfTrue` → `TestLessThan`); any
+    /// other opcode as is. They behave the same apart from counting
+    /// iterations or dispatching once less.
     pub const fn plain(self) -> Op {
         match self {
             Op::JumpLoop => Op::Jump,
             Op::JumpIfLessLoop => Op::JumpIfLess,
             Op::JumpIfLessSmiLoop => Op::JumpIfLessSmi,
+            Op::TestLessThanJumpIfTrue | Op::TestLessThanJumpIfFalse => Op::TestLessThan,
+            Op::TestEqualJumpIfTrue | Op::TestEqualJumpIfFalse => Op::TestEqual,
+            Op::TestEqualSmiJumpIfTrue | Op::TestEqualSmiJumpIfFalse => Op::TestEqualSmi,
             op => op,
         }
+    }
+
+    /// The superinstruction for `self` followed by `next`, if there is one.
+    pub const fn fused_with(self, next: Op) -> Option<Op> {
+        Some(match (self, next) {
+            (Op::TestLessThan, Op::JumpIfTrue) => Op::TestLessThanJumpIfTrue,
+            (Op::TestLessThan, Op::JumpIfFalse) => Op::TestLessThanJumpIfFalse,
+            (Op::TestEqual, Op::JumpIfTrue) => Op::TestEqualJumpIfTrue,
+            (Op::TestEqual, Op::JumpIfFalse) => Op::TestEqualJumpIfFalse,
+            (Op::TestEqualSmi, Op::JumpIfTrue) => Op::TestEqualSmiJumpIfTrue,
+            (Op::TestEqualSmi, Op::JumpIfFalse) => Op::TestEqualSmiJumpIfFalse,
+            _ => return None,
+        })
     }
 
     /// The loop form of a jump opcode.
@@ -97,6 +247,38 @@ impl Op {
     }
 }
 
+/// Fuse comparison + conditional-jump pairs into superinstructions, in
+/// place (see the superinstruction opcodes). Only opcode bytes change, so
+/// the result is equivalent instruction by instruction; a pair whose jump
+/// is also a jump target still works, as the jump stays. Idempotent.
+///
+/// # Panics
+/// On an invalid opcode or a truncated instruction.
+pub fn quicken(code: &mut [u8]) {
+    let mut pc = 0;
+    while pc < code.len() {
+        let op = Op::from_u8(code[pc]).expect("bad opcode").plain();
+        let next = pc + op.size();
+        assert!(next <= code.len(), "truncated instruction at {pc}");
+        if next < code.len()
+            && let Some(q) = op.fused_with(Op::from_u8(code[next]).expect("bad opcode"))
+        {
+            code[pc] = q as u8;
+        }
+        pc = next;
+    }
+}
+
+/// An operand value for [`Assembler::emit`].
+#[derive(Clone, Copy, Debug)]
+pub enum Arg {
+    Reg(u8),
+    Imm(i32),
+    Label(Label),
+    Index(u16),
+    Count(u8),
+}
+
 /// A tiny assembler with backpatched labels.
 #[derive(Default, Clone)]
 pub struct Assembler {
@@ -106,7 +288,7 @@ pub struct Assembler {
     fixups: Vec<(usize, usize, usize)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Label(usize);
 
 impl Assembler {
@@ -197,6 +379,49 @@ impl Assembler {
         self.op(Op::Return)
     }
 
+    /// Emit `op` with `args`, which must match its operand kinds. A jump to
+    /// an already-bound label takes the loop form; only `Jump`,
+    /// `JumpIfLess` and `JumpIfLessSmi` have one.
+    pub fn emit(&mut self, op: Op, args: &[Arg]) -> &mut Self {
+        let kinds = op.operands();
+        assert_eq!(
+            kinds.len(),
+            args.len(),
+            "{op:?} takes {} operands",
+            kinds.len()
+        );
+        let start = self.code.len();
+        let mut op = op.plain();
+        for a in args {
+            if let Arg::Label(l) = *a
+                && self.labels[l.0].is_some()
+            {
+                assert_ne!(op.looping(), op, "{op:?} cannot jump backwards");
+                op = op.looping();
+            }
+        }
+        self.op(op);
+        for (k, a) in kinds.iter().zip(args) {
+            match (k, *a) {
+                (Operand::Reg, Arg::Reg(r)) => {
+                    self.reg(r);
+                }
+                (Operand::Count, Arg::Count(n)) => {
+                    self.reg(n);
+                }
+                (Operand::Imm, Arg::Imm(v)) => {
+                    self.imm(v);
+                }
+                (Operand::Off, Arg::Label(l)) => self.jump_to(start, l),
+                (Operand::Ic | Operand::Fn, Arg::Index(i)) => {
+                    self.code.extend_from_slice(&i.to_le_bytes());
+                }
+                (k, a) => panic!("{op:?}: operand {a:?} is not a {k:?}"),
+            }
+        }
+        self
+    }
+
     pub fn finish(mut self) -> Vec<u8> {
         for &(at, label, start) in &self.fixups {
             let target = self.labels[label].expect("unbound label");
@@ -209,7 +434,7 @@ impl Assembler {
 
 #[cfg(test)]
 mod tests {
-    use super::Op;
+    use super::{Arg, Assembler, Op};
 
     #[test]
     fn from_u8_round_trips() {
@@ -218,5 +443,58 @@ mod tests {
             assert_eq!(Op::from_u8(i as u8), Some(*op));
         }
         assert_eq!(Op::from_u8(Op::COUNT as u8), None);
+        for op in Op::ALL {
+            assert_eq!(Op::from_name(op.name()), Some(op));
+        }
+    }
+
+    #[test]
+    fn sizes_match_the_original_encodings() {
+        assert_eq!(Op::Return.size(), 1);
+        assert_eq!(Op::Ldar.size(), 2);
+        assert_eq!(Op::LdaSmi.size(), 5);
+        assert_eq!(Op::JumpIfLess.size(), 6);
+        assert_eq!(Op::JumpIfLessSmi.size(), 9);
+        assert_eq!(Op::GetNamed.size(), 4);
+        assert_eq!(Op::Call.size(), 4);
+    }
+
+    #[test]
+    fn quicken_rewrites_only_opcode_bytes() {
+        let mut a = Assembler::new();
+        let out = a.label();
+        a.emit(Op::TestLessThan, &[Arg::Reg(1)]);
+        a.emit(Op::JumpIfFalse, &[Arg::Label(out)]);
+        a.emit(Op::TestEqualSmi, &[Arg::Imm(3)]);
+        a.emit(Op::Return, &[]);
+        a.bind(out);
+        a.emit(Op::Return, &[]);
+        let plain = a.finish();
+        let mut q = plain.clone();
+        super::quicken(&mut q);
+        assert_eq!(q[0], Op::TestLessThanJumpIfFalse as u8);
+        assert_eq!(q[2..], plain[2..]);
+        let again = q.clone();
+        super::quicken(&mut q);
+        assert_eq!(q, again);
+        for op in Op::ALL {
+            assert_eq!(op.size(), op.plain().size(), "{op:?}");
+        }
+    }
+
+    #[test]
+    fn emit_picks_loop_forms_for_backward_jumps() {
+        let mut a = Assembler::new();
+        let top = a.label();
+        let out = a.label();
+        a.bind(top);
+        a.emit(Op::JumpIfLessSmi, &[Arg::Imm(3), Arg::Label(out)]);
+        a.emit(Op::JumpIfLessSmi, &[Arg::Imm(3), Arg::Label(top)]);
+        a.bind(out);
+        a.emit(Op::Return, &[]);
+        let code = a.finish();
+        assert_eq!(code[0], Op::JumpIfLessSmi as u8);
+        assert_eq!(code[9], Op::JumpIfLessSmiLoop as u8);
+        assert_eq!(i32::from_le_bytes(code[14..18].try_into().unwrap()), -9);
     }
 }

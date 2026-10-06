@@ -57,8 +57,36 @@
 //! sit in their own registers, so neither staying nor switching costs
 //! anything.
 
+//!
+//! # Frames and calls
+//!
+//! A frame is a register file with a header in front, on the VM's stack:
+//!
+//! | slot              | holds                                              |
+//! |-------------------|----------------------------------------------------|
+//! | `regs[-BUDGET]`   | back edges left before tiering up (an `i64`)       |
+//! | `regs[-OSR_PC]`, `regs[-OSR_ACC]` | where and with what the interpreter left to tier up |
+//! | `regs[-CODE]`     | the running function's [`Code`] (register count, nested functions) |
+//! | `regs[-ICS]`      | its inline caches, kept apart to save a load       |
+//! | `regs[-VM]`       | the [`Vm`]                                         |
+//! | `regs[-RET_PC]`   | where the caller resumes, or null to return to the host |
+//! | `regs[-CALLER]`   | the caller's `regs`                                |
+//! | `regs[-FLAGS]`    | [`CONSTRUCT`] for a `new` frame                    |
+//!
+//! Then `r0` (`this`), the parameters, and locals and temporaries, all
+//! `undefined` on entry. VM-wide state lives here rather than in a seventh
+//! handler argument, which x86-64 couldn't keep in a register.
+//!
+//! A call copies `this` and the arguments into a new frame just past the
+//! caller's registers and tail-calls the callee's first handler with the
+//! new `regs`. `Return` tail-calls the caller's next handler with the
+//! caller's `regs`. Neither touches the native stack, so JS recursion
+//! depth is bounded by the VM stack, not Rust's.
+
 use crate::bytecode::Op;
+use crate::object::{Class, Object, as_object};
 use crate::value::{NumberTag, Value};
+use crate::vm::{Code, Error, Ic, Vm};
 
 pub type Handler = extern "rust-preserve-none" fn(
     *const u8,
@@ -168,6 +196,12 @@ unsafe fn imm32(pc: *const u8, off: usize) -> i32 {
     unsafe { i32::from_le(pc.add(off).cast::<i32>().read_unaligned()) }
 }
 
+/// Read an unaligned little-endian `u16` operand at `pc + off`.
+#[inline(always)]
+unsafe fn u16_at(pc: *const u8, off: usize) -> u16 {
+    unsafe { u16::from_le(pc.add(off).cast::<u16>().read_unaligned()) }
+}
+
 /// Read a register operand at `pc + off` and return a pointer to that register.
 #[inline(always)]
 unsafe fn reg(pc: *const u8, off: usize, regs: *mut Value) -> *mut Value {
@@ -215,6 +249,30 @@ macro_rules! handlers {
             }
             macro_rules! tail {
                 ($f:expr, $a:expr) => { become $f($pc, $a, $regs, $tag, tbl, ti32) };
+            }
+            // Dispatch to `p` in ANY with register file `r` (calls, returns).
+            macro_rules! jump_to {
+                ($p:expr, $a:expr, $r:expr) => { dispatch!(tbl, $p, 0, $a, $r, $tag, tbl, ti32) };
+            }
+            // Enter bytecode function object `fo` in a new frame.
+            macro_rules! enter {
+                ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
+                    let callee: *const Code = (*$fo).code;
+                    let new = push_frame($regs, callee, $this, $args, $argc, $flags, $pc.add($size));
+                    if new.is_null() {
+                        return stack_overflow($regs);
+                    }
+                    jump_to!((*callee).bytecode.as_ptr(), Value::UNDEFINED, new)
+                }};
+            }
+            // Continue after this instruction with `r`, or end the run on an error.
+            macro_rules! next_or_throw {
+                ($o:expr, $r:expr) => {
+                    match $r {
+                        Ok(v) => next!(any, $o, v),
+                        Err(e) => return throw(frame_vm($regs), e),
+                    }
+                };
             }
             #[allow(unused_unsafe)]
             unsafe { $body }
@@ -341,8 +399,14 @@ handlers! {
     }
 
     fn op_return(pc, acc, regs, tag) {
-        let _ = (pc, regs, tag);
-        acc
+        let ret: *const u8 = header(regs, RET_PC);
+        if ret.is_null() {
+            return acc;
+        }
+        if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
+            acc = construct_result(regs, acc);
+        }
+        jump_to!(ret, acc, header::<Value>(regs, CALLER))
     }
 
     #[cold]
@@ -459,8 +523,7 @@ handlers! {
     }
 
     fn i32_return(pc, acc, regs, tag) {
-        let _ = (pc, regs);
-        tag.rebox(acc)
+        tail!(op_return, tag.rebox(acc))
     }
 
     // ---- Slow paths (tier 2), ANY state ----
@@ -473,7 +536,7 @@ handlers! {
         let rhs = *reg(pc, 1, regs);
         acc = match both_numbers(acc, rhs) {
             Some((a, b)) => Value::from_f64_arith(a + b),
-            None => generic_add(acc, rhs),
+            None => generic_add(rhs, acc),
         };
         next!(any, Op::Add.size(), acc)
     }
@@ -563,6 +626,594 @@ handlers! {
     }
 }
 
+handlers! {
+    // ---- Constants and registers ----
+    // The loads ignore `acc`, so they also serve as I32 entries.
+
+    fn op_lda_undefined(pc, acc, regs, tag) {
+        next!(any, Op::LdaUndefined.size(), Value::UNDEFINED)
+    }
+
+    fn op_lda_null(pc, acc, regs, tag) {
+        next!(any, Op::LdaNull.size(), Value::NULL)
+    }
+
+    fn op_lda_true(pc, acc, regs, tag) {
+        next!(any, Op::LdaTrue.size(), Value::TRUE)
+    }
+
+    fn op_lda_false(pc, acc, regs, tag) {
+        next!(any, Op::LdaFalse.size(), Value::FALSE)
+    }
+
+    fn op_mov(pc, acc, regs, tag) {
+        *reg(pc, 2, regs) = *reg(pc, 1, regs);
+        next!(any, Op::Mov.size(), acc)
+    }
+
+    fn i32_mov(pc, acc, regs, tag) {
+        *reg(pc, 2, regs) = *reg(pc, 1, regs);
+        next!(i32, Op::Mov.size(), acc)
+    }
+
+    // ---- Arithmetic ----
+
+    // Non-negative dividends only: a negative one with a zero remainder
+    // gives -0, a double.
+    fn op_mod_smi(pc, acc, regs, tag) {
+        let d = imm32(pc, 1);
+        if tag.is_int32(acc) && d > 0 && acc.as_i32_unchecked() >= 0 {
+            next_int!(Op::ModSmi.size(), acc.as_i32_unchecked() % d)
+        }
+        tail!(slow_mod_smi, acc)
+    }
+
+    fn i32_mod_smi(pc, acc, regs, tag) {
+        let d = imm32(pc, 1);
+        if d > 0 && raw_i32(acc) >= 0 {
+            next!(i32, Op::ModSmi.size(), unboxed(raw_i32(acc) % d))
+        }
+        tail!(slow_mod_smi, tag.rebox(acc))
+    }
+
+    fn op_bit_and_smi(pc, acc, regs, tag) {
+        if tag.is_int32(acc) {
+            next_int!(Op::BitAndSmi.size(), acc.as_i32_unchecked() & imm32(pc, 1))
+        }
+        tail!(slow_bit_and_smi, acc)
+    }
+
+    fn i32_bit_and_smi(pc, acc, regs, tag) {
+        next!(i32, Op::BitAndSmi.size(), unboxed(raw_i32(acc) & imm32(pc, 1)))
+    }
+
+    fn op_bit_or_smi(pc, acc, regs, tag) {
+        if tag.is_int32(acc) {
+            next_int!(Op::BitOrSmi.size(), acc.as_i32_unchecked() | imm32(pc, 1))
+        }
+        tail!(slow_bit_or_smi, acc)
+    }
+
+    fn i32_bit_or_smi(pc, acc, regs, tag) {
+        next!(i32, Op::BitOrSmi.size(), unboxed(raw_i32(acc) | imm32(pc, 1)))
+    }
+
+    // ---- Comparisons: the result is a boolean, in ANY ----
+
+    fn op_test_less_than(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if tag.both_int32(lhs, acc) {
+            let r = lhs.as_i32_unchecked() < acc.as_i32_unchecked();
+            next!(any, Op::TestLessThan.size(), Value::from_bool(r))
+        }
+        tail!(slow_test_less_than, acc)
+    }
+
+    fn i32_test_less_than(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if tag.is_int32(lhs) {
+            let r = lhs.as_i32_unchecked() < raw_i32(acc);
+            next!(any, Op::TestLessThan.size(), Value::from_bool(r))
+        }
+        tail!(slow_test_less_than, tag.rebox(acc))
+    }
+
+    fn op_test_equal(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if tag.both_int32(lhs, acc) {
+            let r = lhs.as_i32_unchecked() == acc.as_i32_unchecked();
+            next!(any, Op::TestEqual.size(), Value::from_bool(r))
+        }
+        // The same value, unless it's a double (NaN != NaN): the same object,
+        // null, undefined or boolean.
+        if lhs == acc && !tag.is_double(acc) {
+            next!(any, Op::TestEqual.size(), Value::TRUE)
+        }
+        tail!(slow_test_equal, acc)
+    }
+
+    fn op_test_equal_smi(pc, acc, regs, tag) {
+        if tag.is_int32(acc) {
+            let r = acc.as_i32_unchecked() == imm32(pc, 1);
+            next!(any, Op::TestEqualSmi.size(), Value::from_bool(r))
+        }
+        tail!(slow_test_equal_smi, acc)
+    }
+
+    fn i32_test_equal_smi(pc, acc, regs, tag) {
+        let r = raw_i32(acc) == imm32(pc, 1);
+        next!(any, Op::TestEqualSmi.size(), Value::from_bool(r))
+    }
+
+    // ---- Conditional jumps ----
+
+    fn op_jump_if_true(pc, acc, regs, tag) {
+        if acc == Value::TRUE {
+            next!(any, imm32(pc, 1), acc)
+        }
+        next!(any, Op::JumpIfTrue.size(), acc)
+    }
+
+    fn op_jump_if_false(pc, acc, regs, tag) {
+        if acc == Value::FALSE {
+            next!(any, imm32(pc, 1), acc)
+        }
+        next!(any, Op::JumpIfFalse.size(), acc)
+    }
+
+    fn op_jump_if_to_boolean_true(pc, acc, regs, tag) {
+        if acc == Value::TRUE {
+            next!(any, imm32(pc, 1), acc)
+        }
+        if acc == Value::FALSE {
+            next!(any, Op::JumpIfToBooleanTrue.size(), acc)
+        }
+        tail!(slow_jump_if_to_boolean_true, acc)
+    }
+
+    fn i32_jump_if_to_boolean_true(pc, acc, regs, tag) {
+        if raw_i32(acc) != 0 {
+            next!(i32, imm32(pc, 1), acc)
+        }
+        next!(i32, Op::JumpIfToBooleanTrue.size(), acc)
+    }
+
+    fn op_jump_if_to_boolean_false(pc, acc, regs, tag) {
+        if acc == Value::FALSE {
+            next!(any, imm32(pc, 1), acc)
+        }
+        if acc == Value::TRUE {
+            next!(any, Op::JumpIfToBooleanFalse.size(), acc)
+        }
+        tail!(slow_jump_if_to_boolean_false, acc)
+    }
+
+    fn i32_jump_if_to_boolean_false(pc, acc, regs, tag) {
+        if raw_i32(acc) == 0 {
+            next!(i32, imm32(pc, 1), acc)
+        }
+        next!(i32, Op::JumpIfToBooleanFalse.size(), acc)
+    }
+
+    // ---- Properties ----
+    // The hit path: check the receiver is a cell, compare its shape with
+    // the cache's, load or store at the cached location. Loads ignore
+    // `acc`, so they also serve as I32 entries.
+
+    fn op_lda_global(pc, acc, regs, tag) {
+        let g = (*frame_vm(regs)).global;
+        let ic = ic_at(regs, pc, 1);
+        if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
+            next!(any, Op::LdaGlobal.size(), *Object::slot(g, (*ic).loc))
+        }
+        tail!(slow_lda_global, acc)
+    }
+
+    fn op_sta_global(pc, acc, regs, tag) {
+        let g = (*frame_vm(regs)).global;
+        let ic = ic_at(regs, pc, 1);
+        if (*g).shape == (*ic).shape {
+            *Object::slot(g, (*ic).loc) = acc;
+            next!(any, Op::StaGlobal.size(), acc)
+        }
+        tail!(slow_sta_global, acc)
+    }
+
+    fn op_get_named(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) {
+            let o = as_object(obj);
+            let ic = ic_at(regs, pc, 2);
+            if (*o).shape == (*ic).shape {
+                let holder = (*ic).holder;
+                if holder.is_null() {
+                    next!(any, Op::GetNamed.size(), *Object::slot(o, (*ic).loc))
+                }
+                // A prototype's property: valid while no prototype changed shape.
+                if (*ic).epoch == (*frame_vm(regs)).proto_epoch {
+                    next!(any, Op::GetNamed.size(), *Object::slot(holder, (*ic).loc))
+                }
+            }
+        }
+        tail!(slow_get_named, acc)
+    }
+
+    // The externalization barrier will go here (step 3 of the object-model
+    // plan); every object is external for now.
+    fn op_set_named(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) {
+            let o = as_object(obj);
+            let ic = ic_at(regs, pc, 2);
+            if (*o).shape == (*ic).shape {
+                let new = (*ic).new_shape;
+                if !new.is_null() {
+                    (*o).shape = new;
+                }
+                *Object::slot(o, (*ic).loc) = acc;
+                next!(any, Op::SetNamed.size(), acc)
+            }
+        }
+        tail!(slow_set_named, acc)
+    }
+
+    fn op_get_keyed(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) && tag.is_int32(acc) {
+            let o = as_object(obj);
+            let i = acc.as_i32_unchecked() as u32;
+            if i < (*o).elems_len {
+                let v = *(*o).elems.add(i as usize);
+                if v != Value::EMPTY {
+                    next!(any, Op::GetKeyed.size(), v)
+                }
+            }
+        }
+        tail!(slow_get_keyed, acc)
+    }
+
+    fn i32_get_keyed(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) {
+            let o = as_object(obj);
+            let i = raw_i32(acc) as u32;
+            if i < (*o).elems_len {
+                let v = *(*o).elems.add(i as usize);
+                if v != Value::EMPTY {
+                    next!(any, Op::GetKeyed.size(), v)
+                }
+            }
+        }
+        tail!(slow_get_keyed, tag.rebox(acc))
+    }
+
+    fn op_set_keyed(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        let key = *reg(pc, 2, regs);
+        if is_cell(tag, obj) && tag.is_int32(key) {
+            let o = as_object(obj);
+            let i = key.as_i32_unchecked() as u32;
+            if i < (*o).elems_len {
+                *(*o).elems.add(i as usize) = acc;
+                next!(any, Op::SetKeyed.size(), acc)
+            }
+        }
+        tail!(slow_set_keyed, acc)
+    }
+
+    // ---- Allocation (ignore `acc`: also I32 entries) ----
+
+    fn op_create_closure(pc, acc, regs, tag) {
+        let f = create_closure(regs, u16_at(pc, 1));
+        next!(any, Op::CreateClosure.size(), f)
+    }
+
+    fn op_create_array(pc, acc, regs, tag) {
+        let a = new_array(regs);
+        next!(any, Op::CreateArray.size(), a)
+    }
+
+    // ---- Calls (ignore `acc`: also I32 entries) ----
+
+    fn op_call(pc, acc, regs, tag) {
+        let f = *reg(pc, 1, regs);
+        if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+            let w = reg(pc, 2, regs);
+            enter!(as_object(f), *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
+        }
+        tail!(slow_call, acc)
+    }
+
+    fn op_call_undefined(pc, acc, regs, tag) {
+        let f = *reg(pc, 1, regs);
+        if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+            let args = reg(pc, 2, regs);
+            enter!(as_object(f), Value::UNDEFINED, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
+        }
+        tail!(slow_call_undefined, acc)
+    }
+
+    fn op_construct(pc, acc, regs, tag) {
+        let f = *reg(pc, 1, regs);
+        if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+            let this = construct_this(regs, as_object(f));
+            let args = reg(pc, 2, regs);
+            enter!(as_object(f), this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
+        }
+        tail!(slow_construct, acc)
+    }
+
+    // ---- Slow paths ----
+
+    #[cold]
+    #[inline(never)]
+    fn slow_mod_smi(pc, acc, regs, tag) {
+        let d = imm32(pc, 1) as f64;
+        let r = match acc.as_number() {
+            Some(a) => Value::number(a % d),
+            None => Value::number(acc.to_number() % d),
+        };
+        next!(any, Op::ModSmi.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_bit_and_smi(pc, acc, regs, tag) {
+        next_int!(Op::BitAndSmi.size(), to_int32(acc.to_number()) & imm32(pc, 1))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_bit_or_smi(pc, acc, regs, tag) {
+        next_int!(Op::BitOrSmi.size(), to_int32(acc.to_number()) | imm32(pc, 1))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_test_less_than(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        let r = match both_numbers(lhs, acc) {
+            Some((a, b)) => a < b,
+            None => generic_less_than(lhs, acc),
+        };
+        next!(any, Op::TestLessThan.size(), Value::from_bool(r))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_test_equal(pc, acc, regs, tag) {
+        let r = loose_equals(*reg(pc, 1, regs), acc).map(Value::from_bool);
+        next_or_throw!(Op::TestEqual.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_test_equal_smi(pc, acc, regs, tag) {
+        let r = loose_equals(acc, Value::from_i32(imm32(pc, 1))).map(Value::from_bool);
+        next_or_throw!(Op::TestEqualSmi.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_jump_if_to_boolean_true(pc, acc, regs, tag) {
+        if to_boolean(acc) {
+            next!(any, imm32(pc, 1), acc)
+        }
+        next!(any, Op::JumpIfToBooleanTrue.size(), acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_jump_if_to_boolean_false(pc, acc, regs, tag) {
+        if !to_boolean(acc) {
+            next!(any, imm32(pc, 1), acc)
+        }
+        next!(any, Op::JumpIfToBooleanFalse.size(), acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_lda_global(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).get_global_miss(&*frame_code(regs), u16_at(pc, 1));
+        next_or_throw!(Op::LdaGlobal.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_sta_global(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).set_global_miss(&*frame_code(regs), u16_at(pc, 1), acc);
+        next_or_throw!(Op::StaGlobal.size(), r.map(|()| acc))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_get_named(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        let r = (*frame_vm(regs)).get_named_miss(&*frame_code(regs), u16_at(pc, 2), obj);
+        next_or_throw!(Op::GetNamed.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_set_named(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        let r = (*frame_vm(regs)).set_named_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc);
+        next_or_throw!(Op::SetNamed.size(), r.map(|()| acc))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_get_keyed(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).get_keyed(*reg(pc, 1, regs), acc);
+        next_or_throw!(Op::GetKeyed.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_set_keyed(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).set_keyed(*reg(pc, 1, regs), *reg(pc, 2, regs), acc);
+        next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_call(pc, acc, regs, tag) {
+        let w = reg(pc, 2, regs);
+        let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
+        let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), *w, args);
+        next_or_throw!(Op::Call.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_call_undefined(pc, acc, regs, tag) {
+        let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
+        let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), Value::UNDEFINED, args);
+        next_or_throw!(Op::CallUndefined.size(), r)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_construct(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).construct_other(*reg(pc, 1, regs));
+        next_or_throw!(Op::Construct.size(), r)
+    }
+}
+
+handlers! {
+    // ---- Superinstructions: a comparison and the conditional jump after it ----
+    // The jump's offset is at `pc + n + 1`, where `n` is the comparison's
+    // size, and is relative to the jump (`pc + n`). Slow paths are the
+    // comparison's own: they leave the boolean in `acc` and dispatch to the
+    // jump instruction, which is still there.
+
+    fn op_test_less_than_jump_if_true(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if !tag.both_int32(lhs, acc) {
+            tail!(slow_test_less_than, acc)
+        }
+        let c = lhs.as_i32_unchecked() < acc.as_i32_unchecked();
+        if c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::TRUE)
+        }
+        next!(any, 2 + Op::JumpIfTrue.size(), Value::FALSE)
+    }
+
+    fn i32_test_less_than_jump_if_true(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if !tag.is_int32(lhs) {
+            tail!(slow_test_less_than, tag.rebox(acc))
+        }
+        let c = lhs.as_i32_unchecked() < raw_i32(acc);
+        if c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::TRUE)
+        }
+        next!(any, 2 + Op::JumpIfTrue.size(), Value::FALSE)
+    }
+
+    fn op_test_equal_jump_if_true(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        let c = if tag.both_int32(lhs, acc) {
+            lhs.as_i32_unchecked() == acc.as_i32_unchecked()
+        } else if lhs == acc && !tag.is_double(acc) {
+            true
+        } else {
+            tail!(slow_test_equal, acc)
+        };
+        if c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::TRUE)
+        }
+        next!(any, 2 + Op::JumpIfTrue.size(), Value::FALSE)
+    }
+
+    fn op_test_equal_smi_jump_if_true(pc, acc, regs, tag) {
+        if !tag.is_int32(acc) {
+            tail!(slow_test_equal_smi, acc)
+        }
+        let c = acc.as_i32_unchecked() == imm32(pc, 1);
+        if c {
+            next!(any, 5 + imm32(pc, 5 + 1) as isize, Value::TRUE)
+        }
+        next!(any, 5 + Op::JumpIfTrue.size(), Value::FALSE)
+    }
+
+    fn i32_test_equal_smi_jump_if_true(pc, acc, regs, tag) {
+        let c = raw_i32(acc) == imm32(pc, 1);
+        if c {
+            next!(any, 5 + imm32(pc, 5 + 1) as isize, Value::TRUE)
+        }
+        next!(any, 5 + Op::JumpIfTrue.size(), Value::FALSE)
+    }
+
+    fn op_test_less_than_jump_if_false(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if !tag.both_int32(lhs, acc) {
+            tail!(slow_test_less_than, acc)
+        }
+        let c = lhs.as_i32_unchecked() < acc.as_i32_unchecked();
+        if !c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::FALSE)
+        }
+        next!(any, 2 + Op::JumpIfFalse.size(), Value::TRUE)
+    }
+
+    fn i32_test_less_than_jump_if_false(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if !tag.is_int32(lhs) {
+            tail!(slow_test_less_than, tag.rebox(acc))
+        }
+        let c = lhs.as_i32_unchecked() < raw_i32(acc);
+        if !c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::FALSE)
+        }
+        next!(any, 2 + Op::JumpIfFalse.size(), Value::TRUE)
+    }
+
+    fn op_test_equal_jump_if_false(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        let c = if tag.both_int32(lhs, acc) {
+            lhs.as_i32_unchecked() == acc.as_i32_unchecked()
+        } else if lhs == acc && !tag.is_double(acc) {
+            true
+        } else {
+            tail!(slow_test_equal, acc)
+        };
+        if !c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::FALSE)
+        }
+        next!(any, 2 + Op::JumpIfFalse.size(), Value::TRUE)
+    }
+
+    fn op_test_equal_smi_jump_if_false(pc, acc, regs, tag) {
+        if !tag.is_int32(acc) {
+            tail!(slow_test_equal_smi, acc)
+        }
+        let c = acc.as_i32_unchecked() == imm32(pc, 1);
+        if !c {
+            next!(any, 5 + imm32(pc, 5 + 1) as isize, Value::FALSE)
+        }
+        next!(any, 5 + Op::JumpIfFalse.size(), Value::TRUE)
+    }
+
+    fn i32_test_equal_smi_jump_if_false(pc, acc, regs, tag) {
+        let c = raw_i32(acc) == imm32(pc, 1);
+        if !c {
+            next!(any, 5 + imm32(pc, 5 + 1) as isize, Value::FALSE)
+        }
+        next!(any, 5 + Op::JumpIfFalse.size(), Value::TRUE)
+    }
+}
+
+#[inline(never)]
+fn create_closure(regs: *mut Value, i: u16) -> Value {
+    unsafe { (*frame_vm(regs)).create_closure(&*frame_code(regs), i) }
+}
+
+#[inline(never)]
+fn new_array(regs: *mut Value) -> Value {
+    unsafe { (*frame_vm(regs)).new_array() }
+}
+
 // Generic runtime (tier 3): ordinary Rust functions, called (not tail-called)
 // from the slow paths. Here go ToPrimitive, strings, BigInt and exceptions
 // once they exist; they'll reach the VM through the frame. A call from a `preserve_none`
@@ -592,6 +1243,50 @@ pub(crate) fn generic_less_than(a: Value, b: Value) -> bool {
     a.to_number() < b.to_number()
 }
 
+/// ECMAScript ToBoolean.
+pub(crate) fn to_boolean(v: Value) -> bool {
+    if let Some(d) = v.as_number() {
+        d != 0.0 && !d.is_nan()
+    } else {
+        // Objects are truthy; there are no strings or BigInts yet.
+        v == Value::TRUE || v.is_cell()
+    }
+}
+
+/// ECMAScript ToInt32 of a number.
+pub(crate) fn to_int32(d: f64) -> i32 {
+    if !d.is_finite() {
+        return 0;
+    }
+    d.trunc().rem_euclid(4294967296.0) as u32 as i32
+}
+
+/// `a == b` (IsLooselyEqual) for the values that exist so far.
+pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
+    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
+        return Ok(x == y);
+    }
+    if a == b {
+        return Ok(true);
+    }
+    let nullish = |v: Value| v.is_null() || v.is_undefined();
+    if nullish(a) || nullish(b) {
+        return Ok(nullish(a) && nullish(b));
+    }
+    if a.is_bool() {
+        return loose_equals(Value::from_i32((a == Value::TRUE) as i32), b);
+    }
+    if b.is_bool() {
+        return loose_equals(a, Value::from_i32((b == Value::TRUE) as i32));
+    }
+    if a.is_cell() && b.is_cell() {
+        return Ok(false);
+    }
+    Err(Error::unsupported(
+        "== between an object and a primitive (ToPrimitive)",
+    ))
+}
+
 static TABLE: Table = {
     let mut t: [Handler; 256] = [op_invalid; 256];
     t[Op::Nop as usize] = op_nop;
@@ -608,6 +1303,38 @@ static TABLE: Table = {
     t[Op::JumpIfLessLoop as usize] = op_jump_if_less_loop;
     t[Op::JumpIfLessSmiLoop as usize] = op_jump_if_less_smi_loop;
     t[Op::Return as usize] = op_return;
+    t[Op::LdaUndefined as usize] = op_lda_undefined;
+    t[Op::LdaNull as usize] = op_lda_null;
+    t[Op::LdaTrue as usize] = op_lda_true;
+    t[Op::LdaFalse as usize] = op_lda_false;
+    t[Op::Mov as usize] = op_mov;
+    t[Op::ModSmi as usize] = op_mod_smi;
+    t[Op::BitAndSmi as usize] = op_bit_and_smi;
+    t[Op::BitOrSmi as usize] = op_bit_or_smi;
+    t[Op::TestLessThan as usize] = op_test_less_than;
+    t[Op::TestEqual as usize] = op_test_equal;
+    t[Op::TestEqualSmi as usize] = op_test_equal_smi;
+    t[Op::JumpIfTrue as usize] = op_jump_if_true;
+    t[Op::JumpIfFalse as usize] = op_jump_if_false;
+    t[Op::JumpIfToBooleanTrue as usize] = op_jump_if_to_boolean_true;
+    t[Op::JumpIfToBooleanFalse as usize] = op_jump_if_to_boolean_false;
+    t[Op::LdaGlobal as usize] = op_lda_global;
+    t[Op::StaGlobal as usize] = op_sta_global;
+    t[Op::GetNamed as usize] = op_get_named;
+    t[Op::SetNamed as usize] = op_set_named;
+    t[Op::GetKeyed as usize] = op_get_keyed;
+    t[Op::SetKeyed as usize] = op_set_keyed;
+    t[Op::CreateClosure as usize] = op_create_closure;
+    t[Op::CreateArray as usize] = op_create_array;
+    t[Op::Call as usize] = op_call;
+    t[Op::CallUndefined as usize] = op_call_undefined;
+    t[Op::Construct as usize] = op_construct;
+    t[Op::TestLessThanJumpIfTrue as usize] = op_test_less_than_jump_if_true;
+    t[Op::TestEqualJumpIfTrue as usize] = op_test_equal_jump_if_true;
+    t[Op::TestEqualSmiJumpIfTrue as usize] = op_test_equal_smi_jump_if_true;
+    t[Op::TestLessThanJumpIfFalse as usize] = op_test_less_than_jump_if_false;
+    t[Op::TestEqualJumpIfFalse as usize] = op_test_equal_jump_if_false;
+    t[Op::TestEqualSmiJumpIfFalse as usize] = op_test_equal_smi_jump_if_false;
     Table(t)
 };
 
@@ -627,6 +1354,31 @@ static TABLE_I32: Table = {
     t[Op::JumpIfLessLoop as usize] = i32_jump_if_less_loop;
     t[Op::JumpIfLessSmiLoop as usize] = i32_jump_if_less_smi_loop;
     t[Op::Return as usize] = i32_return;
+    // Handlers that ignore the incoming `acc` serve both states.
+    t[Op::LdaUndefined as usize] = op_lda_undefined;
+    t[Op::LdaNull as usize] = op_lda_null;
+    t[Op::LdaTrue as usize] = op_lda_true;
+    t[Op::LdaFalse as usize] = op_lda_false;
+    t[Op::LdaGlobal as usize] = op_lda_global;
+    t[Op::GetNamed as usize] = op_get_named;
+    t[Op::CreateClosure as usize] = op_create_closure;
+    t[Op::CreateArray as usize] = op_create_array;
+    t[Op::Call as usize] = op_call;
+    t[Op::CallUndefined as usize] = op_call_undefined;
+    t[Op::Construct as usize] = op_construct;
+    t[Op::Mov as usize] = i32_mov;
+    t[Op::ModSmi as usize] = i32_mod_smi;
+    t[Op::BitAndSmi as usize] = i32_bit_and_smi;
+    t[Op::BitOrSmi as usize] = i32_bit_or_smi;
+    t[Op::TestLessThan as usize] = i32_test_less_than;
+    t[Op::TestEqualSmi as usize] = i32_test_equal_smi;
+    t[Op::JumpIfToBooleanTrue as usize] = i32_jump_if_to_boolean_true;
+    t[Op::JumpIfToBooleanFalse as usize] = i32_jump_if_to_boolean_false;
+    t[Op::GetKeyed as usize] = i32_get_keyed;
+    t[Op::TestLessThanJumpIfTrue as usize] = i32_test_less_than_jump_if_true;
+    t[Op::TestEqualSmiJumpIfTrue as usize] = i32_test_equal_smi_jump_if_true;
+    t[Op::TestLessThanJumpIfFalse as usize] = i32_test_less_than_jump_if_false;
+    t[Op::TestEqualSmiJumpIfFalse as usize] = i32_test_equal_smi_jump_if_false;
     Table(t)
 };
 
@@ -639,17 +1391,148 @@ fn osr_exit(regs: *mut Value, target: *const u8, acc: Value) -> Value {
     unsafe {
         *regs.sub(OSR_PC) = Value::from_bits(target as u64);
         *regs.sub(OSR_ACC) = acc;
+        // A VM frame: tell `run_script` which one.
+        let vm = frame_vm(regs);
+        if !vm.is_null() {
+            (*vm).osr_regs = regs;
+        }
     }
     Value::EMPTY
 }
 
-/// Frame header slots, in front of the register file: `regs[-BUDGET]` is the
-/// back-edge budget (an `i64`); `regs[-OSR_PC]` and `regs[-OSR_ACC]` hold the
-/// target and accumulator when the interpreter leaves to tier up.
+/// Frame header slots, in front of the register file (see the module
+/// docs). `regs[-BUDGET]` is the back-edge budget (an `i64`);
+/// `regs[-OSR_PC]` and `regs[-OSR_ACC]` hold the target and accumulator
+/// when the interpreter leaves to tier up.
 const BUDGET: usize = 1;
 const OSR_PC: usize = 2;
 const OSR_ACC: usize = 3;
-const HEADER: usize = 3;
+const CODE: usize = 4;
+const ICS: usize = 5;
+const VM: usize = 6;
+const RET_PC: usize = 7;
+const CALLER: usize = 8;
+const FLAGS: usize = 9;
+pub const HEADER: usize = 9;
+
+/// `regs[-FLAGS]` of a frame entered by `Construct`.
+const CONSTRUCT: u64 = 1;
+
+/// A pointer kept in a frame header slot.
+#[inline(always)]
+unsafe fn header<T>(regs: *mut Value, slot: usize) -> *mut T {
+    unsafe { (*regs.sub(slot)).to_bits() as *mut T }
+}
+
+#[inline(always)]
+unsafe fn set_header<T>(regs: *mut Value, slot: usize, p: *const T) {
+    unsafe { *regs.sub(slot) = Value::from_bits(p as u64) }
+}
+
+#[inline(always)]
+unsafe fn frame_vm(regs: *mut Value) -> *mut Vm {
+    unsafe { header(regs, VM) }
+}
+
+#[inline(always)]
+unsafe fn frame_code(regs: *mut Value) -> *const Code {
+    unsafe { header(regs, CODE) }
+}
+
+/// The inline-cache slot named by the `u16` operand at `pc + off`.
+#[inline(always)]
+unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
+    unsafe { header::<Ic>(regs, ICS).add(u16_at(pc, off) as usize) }
+}
+
+/// Push a frame for `callee` past the caller's registers: header, `this`,
+/// the first `argc` values at `args` as parameters, the rest `undefined`.
+/// Null if the VM stack is full.
+#[inline(always)]
+unsafe fn push_frame(
+    regs: *mut Value,
+    callee: *const Code,
+    this: Value,
+    args: *const Value,
+    argc: usize,
+    flags: u64,
+    ret: *const u8,
+) -> *mut Value {
+    unsafe {
+        let vm = frame_vm(regs);
+        let new = regs.add((*frame_code(regs)).nregs as usize + HEADER);
+        let n = (*callee).nregs as usize;
+        if new.add(n) > (*vm).stack_end {
+            return std::ptr::null_mut();
+        }
+        *new.sub(BUDGET) = Value::from_bits((*vm).frame_budget as u64);
+        set_header(new, CODE, callee);
+        set_header(new, ICS, (*callee).ics.as_ptr());
+        set_header(new, VM, vm);
+        set_header(new, RET_PC, ret);
+        set_header(new, CALLER, regs);
+        *new.sub(FLAGS) = Value::from_bits(flags);
+        *new = this;
+        // Scalar loops: counts are small, and vectorized ones would bloat
+        // the handler with prologues and remainders.
+        let k = argc.min((*callee).nparams as usize);
+        for i in 0..k {
+            *new.add(1 + i) = *args.add(i);
+            core::arch::asm!("", options(nomem, nostack, preserves_flags));
+        }
+        for i in 1 + k..n {
+            *new.add(i) = Value::UNDEFINED;
+            core::arch::asm!("", options(nomem, nostack, preserves_flags));
+        }
+        new
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn stack_overflow(regs: *mut Value) -> Value {
+    throw(
+        unsafe { frame_vm(regs) },
+        Error::range_error("Maximum call stack size exceeded"),
+    )
+}
+
+/// End the run with `e`: record it in the VM and return the `EMPTY` marker
+/// straight to the host (every handler call is a tail call).
+#[cold]
+#[inline(never)]
+fn throw(vm: *mut Vm, e: Error) -> Value {
+    unsafe { (*vm).error = Some(e) };
+    Value::EMPTY
+}
+
+/// `Return` from a `new` frame: the result is `acc` if it is an object,
+/// else `this`, whose shape feeds the constructor's slack tracking.
+#[inline(never)]
+fn construct_result(regs: *mut Value, acc: Value) -> Value {
+    if acc.is_cell() {
+        return acc;
+    }
+    unsafe {
+        let this = *regs;
+        Vm::construct_done(&*frame_code(regs), as_object(this));
+        this
+    }
+}
+
+/// The receiver of a `new` on bytecode function `f`.
+#[inline(never)]
+fn construct_this(regs: *mut Value, f: *mut Object) -> Value {
+    unsafe { (*frame_vm(regs)).construct_this(f) }
+}
+
+/// Whether `v` is a cell (a heap pointer), testing against the tag
+/// register rather than a 64-bit constant. Like JSC's, the test passes
+/// `EMPTY`, which never reaches a register or the accumulator.
+#[inline(always)]
+fn is_cell(tag: NumberTag, v: Value) -> bool {
+    v.to_bits() & tag.to_bits() == 0 && v.to_bits() & Value::OTHER_TAG == 0
+}
 
 /// A register file with the interpreter's frame header in front.
 pub struct Frame {
@@ -659,7 +1542,8 @@ pub struct Frame {
 impl Frame {
     /// A frame holding a copy of `regs`.
     pub fn new(regs: &[Value]) -> Frame {
-        let mut slots = vec![Value::UNDEFINED; HEADER];
+        // Null code and return pc: `Return` goes back to the host.
+        let mut slots = vec![Value::EMPTY; HEADER];
         slots.extend_from_slice(regs);
         Frame { slots }
     }
@@ -750,4 +1634,69 @@ pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -
         Run::Return(v) => v,
         Run::Osr { .. } => unreachable!("an unlimited budget never runs out"),
     }
+}
+
+/// Run `code`, a module's top-level code, in a fresh frame at the base of
+/// `vm`'s stack, with the global object as `this`. Returns the completion
+/// value.
+///
+/// # Safety
+/// `code` must have been loaded into `vm` and be well formed, as for
+/// [`run_frame`]; in addition, every inline-cache and closure operand must
+/// be in range.
+pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error> {
+    unsafe {
+        let n = (*code).nregs as usize;
+        if HEADER + n > vm.stack.len() {
+            return Err(Error::range_error("Maximum call stack size exceeded"));
+        }
+        let regs = vm.stack.as_mut_ptr().add(HEADER);
+        *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
+        set_header(regs, CODE, code);
+        set_header(regs, ICS, (*code).ics.as_ptr());
+        set_header(regs, VM, vm as *mut Vm);
+        set_header(regs, RET_PC, std::ptr::null::<u8>());
+        set_header(regs, CALLER, std::ptr::null::<Value>());
+        *regs.sub(FLAGS) = Value::from_bits(0);
+        *regs = crate::object::object_value(vm.global);
+        for i in 1..n {
+            *regs.add(i) = Value::UNDEFINED;
+        }
+        let mut v = dispatch_at((*code).bytecode.as_ptr(), Value::UNDEFINED, regs);
+        // The interpreter returns `EMPTY` to tier up (`osr_exit`): run the
+        // frame's compiled code from the loop header, then resume it in the
+        // interpreter where the code exited. The VM stack holds every frame,
+        // so leaving the handler chain loses nothing.
+        loop {
+            if let Some(e) = vm.error.take() {
+                return Err(e);
+            }
+            if v != Value::EMPTY {
+                return Ok(v);
+            }
+            let regs = std::mem::replace(&mut vm.osr_regs, std::ptr::null_mut());
+            assert!(
+                !regs.is_null(),
+                "EMPTY without an error or a tier-up request"
+            );
+            let code = &*frame_code(regs);
+            let start = code.bytecode.as_ptr();
+            let target = (*regs.sub(OSR_PC)).to_bits() as usize - start as usize;
+            let acc = *regs.sub(OSR_ACC);
+            // Re-arm the budget even if this loop isn't compiled: another
+            // loop of the frame may be.
+            let (pc, acc) = crate::jit::vm_osr(vm, code, regs, target, acc);
+            *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
+            v = dispatch_at(start.add(pc), acc, regs);
+        }
+    }
+}
+
+/// Run the interpreter from `pc` with `acc` over the VM frame `regs`, until
+/// the outermost frame returns, an error, or a tier-up request (`EMPTY`).
+unsafe fn dispatch_at(pc: *const u8, acc: Value, regs: *mut Value) -> Value {
+    let tbl: &'static Table = std::hint::black_box(&TABLE);
+    let ti32: &'static Table = std::hint::black_box(&TABLE_I32);
+    let tag = NumberTag::new();
+    unsafe { (tbl.0[*pc as usize])(pc, acc, regs, tag, tbl, ti32) }
 }

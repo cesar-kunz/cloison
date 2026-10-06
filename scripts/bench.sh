@@ -50,7 +50,7 @@ counters() {
 
 echo "| program | codegen | engine | instr/iter | cycles/iter | IPC |"
 echo "|---|---|---|---:|---:|---:|"
-for program in ${PROGRAMS:-int const chain double wide}; do
+for program in ${PROGRAMS:-int const chain double wide cmp}; do
   for codegen in generic smi; do
     for engine in ${ENGINES:-interp interp+acc jit1 jit2 jit3 jit4 jit}; do
       # shellcheck disable=SC2059,SC2046

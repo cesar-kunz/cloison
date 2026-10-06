@@ -119,6 +119,8 @@ with_slots!(decl_externs!);
 
 unsafe extern "C" {
     static toi_hole_imm: u8;
+    static toi_hole_imm64: u8;
+    static toi_hole_imm64b: u8;
     static toi_hole_reg: u8;
 
     // Runtime functions. Only ever reached through `rt_call!`, so only their
@@ -126,6 +128,10 @@ unsafe extern "C" {
     fn toi_rt_add();
     fn toi_rt_inc();
     fn toi_rt_less_than();
+    fn toi_rt_mod();
+    fn toi_rt_to_int32();
+    fn toi_rt_loose_eq();
+    fn toi_rt_to_boolean();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -220,6 +226,31 @@ macro_rules! rt_inc {
 macro_rules! rt_less_than {
     ($s:ident, $a:expr, $b:expr) => {
         rt_call!($s, toi_rt_less_than, $a, $b) as u8 & 1 != 0
+    };
+}
+
+/// `toi_rt_mod(a, b)`: `a % b` for any `a` and a number `b`.
+macro_rules! rt_mod {
+    ($s:ident, $a:expr, $b:expr) => {
+        Value::from_bits(rt_call!($s, toi_rt_mod, $a, $b))
+    };
+}
+/// `toi_rt_to_int32(a)`: ToInt32(ToNumber(a)).
+macro_rules! rt_to_int32 {
+    ($s:ident, $a:expr) => {
+        rt_call!($s, toi_rt_to_int32, $a, Value::UNDEFINED) as u32 as i32
+    };
+}
+/// `toi_rt_loose_eq(a, b)`: `a == b`.
+macro_rules! rt_loose_eq {
+    ($s:ident, $a:expr, $b:expr) => {
+        rt_call!($s, toi_rt_loose_eq, $a, $b) as u8 & 1 != 0
+    };
+}
+/// `toi_rt_to_boolean(a)`.
+macro_rules! rt_to_boolean {
+    ($s:ident, $a:expr) => {
+        rt_call!($s, toi_rt_to_boolean, $a, Value::UNDEFINED) as u8 & 1 != 0
     };
 }
 
@@ -346,6 +377,59 @@ fn imm16() -> i32 {
         );
     }
     k as u32 as i32
+}
+
+/// A 64-bit immediate operand: `movabs` with an `R_X86_64_64` relocation.
+/// (A symbol address in Rust would be truncated to 32 bits in the small
+/// code model.)
+#[cfg(target_arch = "x86_64")]
+macro_rules! imm64_of {
+    ($sym:ident) => {{
+        let k: u64;
+        unsafe {
+            core::arch::asm!(
+                "movabs {k}, offset {s}",
+                k = out(reg) k,
+                s = sym $sym,
+                options(pure, nomem, nostack),
+            );
+        }
+        k
+    }};
+}
+
+/// A 64-bit immediate operand: `movz` + three `movk`.
+#[cfg(target_arch = "aarch64")]
+macro_rules! imm64_of {
+    ($sym:ident) => {{
+        let k: u64;
+        unsafe {
+            core::arch::asm!(
+                "movz {k}, #:abs_g0_nc:{s}",
+                "movk {k}, #:abs_g1_nc:{s}",
+                "movk {k}, #:abs_g2_nc:{s}",
+                "movk {k}, #:abs_g3:{s}",
+                k = out(reg) k,
+                s = sym $sym,
+                options(pure, nomem, nostack),
+            );
+        }
+        k
+    }};
+}
+
+/// The first 64-bit immediate: `mod_smi_i`'s multiplier, or the shape a
+/// property access checks.
+#[inline(always)]
+fn imm64() -> u64 {
+    imm64_of!(toi_hole_imm64)
+}
+
+/// The second 64-bit immediate: an address (a prototype's slot, the global
+/// object) or a transition's new shape.
+#[inline(always)]
+fn imm64b() -> u64 {
+    imm64_of!(toi_hole_imm64b)
 }
 
 /// The VM register in memory named by the register hole.
@@ -488,6 +572,12 @@ imm_variants!("add_smi_i"; |s, k| {
         }
         next!(s)
     }
+});
+
+// See `add_wrap_ii_*`.
+imm_variants!("add_smi_wrap_i"; |s, k| {
+    s.acc = unboxed(int(s.acc).wrapping_add(k));
+    next!(s)
 });
 
 stencil!("undo_add_smi_i"; |s| {
@@ -669,6 +759,12 @@ macro_rules! boxed_location {
                 }
                 None => exit!(s),
             }
+        });
+        // An add whose result only feeds a bitwise operation (ToInt32):
+        // `(a + b) | 0` is the wrapping add, so no overflow check.
+        stencil!("add_wrap_ii_", loc!($loc); |s| {
+            s.acc = unboxed(int(s.acc).wrapping_add(int(get!($loc, s))));
+            next!(s)
         });
         stencil!("add_iif_", loc!($loc); |s| {
             s.facc = (int(s.acc) as i64 + int(get!($loc, s)) as i64) as f64;
@@ -1035,6 +1131,10 @@ macro_rules! int_slot {
                 None => exit!(s),
             }
         });
+        stencil!("add_wrap_ii_u", $k; |s| {
+            s.acc = unboxed(int(s.acc).wrapping_add(raw(s.g[$k])));
+            next!(s)
+        });
         stencil!("add_iif_u", $k; |s| {
             s.facc = (int(s.acc) as i64 + raw(s.g[$k]) as i64) as f64;
             next!(s)
@@ -1239,3 +1339,734 @@ macro_rules! mov_fp_int_pair {
 with_gprs!(gpr_pairs! mov_int_pair);
 with_gprs!(fp_gpr_pairs! mov_fp_int_pair);
 cartesian!(mov_fp_pair [0 1 2 3 4 5 6] [0 1 2 3 4 5 6]);
+
+// ---- Constants, bitwise and modulo operations, ToBoolean jumps ----
+
+stencil!("lda_true"; |s| {
+    s.acc = Value::TRUE;
+    next!(s)
+});
+stencil!("lda_false"; |s| {
+    s.acc = Value::FALSE;
+    next!(s)
+});
+stencil!("lda_undefined"; |s| {
+    s.acc = Value::UNDEFINED;
+    next!(s)
+});
+stencil!("lda_null"; |s| {
+    s.acc = Value::NULL;
+    next!(s)
+});
+
+/// The boolean `c` as a value: `false` is 6, `true` 7.
+#[inline(always)]
+fn boolean(c: bool) -> Value {
+    Value::from_bits(Value::FALSE.to_bits() | c as u64)
+}
+
+/// ToInt32 of a double, if it is exactly computable by truncation: within
+/// ±2^63 and not NaN. The test is on the exponent field, with integer ops:
+/// `d.abs() < 2^63` would load two constants from `.rodata`.
+#[inline(always)]
+fn f64_to_int32(d: f64) -> Option<i32> {
+    if (d.to_bits() >> 52) & 0x7FF < 1023 + 63 {
+        Some(unsafe { d.to_int_unchecked::<i64>() } as i32)
+    } else {
+        None
+    }
+}
+
+macro_rules! bitwise_smi {
+    ($name:literal, $op:tt, $x86:literal) => {
+        stencil_slow!($name; |s| {
+            if s.tag.is_int32(s.acc) {
+                s.acc = s.tag.box_i32(int(s.acc) $op imm());
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let i = rt_to_int32!(s, s.acc);
+            s.acc = s.tag.box_i32(i $op imm());
+            next!(s)
+        });
+        // In place, on the low 32 bits: `and r12d, k` also clears the high
+        // ones, leaving an unboxed int32. On x86-64 the immediate is part of
+        // the instruction (inline asm); LLVM would load it into a register.
+        imm_variants!($name, "_i"; |s, k| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = k;
+                let mut v = s.acc.to_bits();
+                core::arch::asm!(
+                    concat!($x86, " {v:e}, offset {imm}"),
+                    v = inout(reg) v,
+                    imm = sym toi_hole_imm,
+                    options(pure, nomem, nostack),
+                );
+                s.acc = Value::from_bits(v);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                s.acc = unboxed(int(s.acc) $op k);
+            }
+            next!(s)
+        });
+        stencil_slow!($name, "_f"; |s| {
+            if let Some(i) = f64_to_int32(s.facc) {
+                s.acc = unboxed(i $op imm());
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let i = rt_to_int32!(s, s.tag.encode_f64(s.facc));
+            s.acc = unboxed(i $op imm());
+            next!(s)
+        });
+    };
+}
+bitwise_smi!("bit_and_smi", &, "and");
+bitwise_smi!("bit_or_smi", |, "or");
+
+// `acc % k`. The JIT picks the `_i` forms only for k > 1 not a power of two
+// (powers of two use `mod_smi_pow2_*`), and passes `⌈2^64 / k⌉` as the
+// 64-bit immediate. A negative dividend with a zero remainder gives -0, a
+// double, so `_i` exits there and `_iif` (once it has) produces a double.
+stencil_slow!("mod_smi"; |s| {
+    let k = imm();
+    if s.tag.is_int32(s.acc) && int(s.acc) >= 0 && k > 0 {
+        s.acc = s.tag.box_i32(int(s.acc) % k);
+        next!(s)
+    }
+    slow!(s)
+}; |s| {
+    s.acc = rt_mod!(s, s.acc, Value::from_i32(imm()));
+    next!(s)
+});
+
+/// The double for remainder `r` of dividend `a`: `r`, with the dividend's
+/// sign when it is zero (`-6 % 3` is -0). Built with integer ops, as a
+/// float constant would be a load from `.rodata`.
+#[inline(always)]
+fn rem_f64(r: i32, a: i32) -> f64 {
+    f64::from_bits((r as f64).to_bits() | ((a as u32 >> 31) as u64) << 63)
+}
+
+/// `a % d` for a constant d > 1 that is not a power of two, without a
+/// division (Lemire, Kaser & Kurz, "Faster remainder by direct
+/// computation", 2019): with `m = ⌈2^64 / d⌉` (the 64-bit immediate),
+/// `|a| mod d = ⌊(m·|a| mod 2^64) · d / 2^64⌋`, exact for every 32-bit
+/// `|a|` and `d`. The remainder takes the dividend's sign.
+///
+/// Branch-free (`sign` is 0 or -1), so the stencil's hot path has a single
+/// continuation, which the JIT can trim, instead of one per sign.
+#[inline(always)]
+fn rem_magic(a: i32, d: i32, m: u64) -> i32 {
+    let sign = a >> 31;
+    let n = ((a ^ sign).wrapping_sub(sign)) as u32 as u64;
+    let low = m.wrapping_mul(n);
+    let r = ((low as u128 * d as u32 as u128) >> 64) as i32;
+    (r ^ sign).wrapping_sub(sign)
+}
+
+stencil!("mod_smi_i"; |s| {
+    let a = int(s.acc);
+    let r = rem_magic(a, imm(), imm64());
+    if r == 0 && a < 0 {
+        exit!(s)
+    }
+    s.acc = unboxed(r);
+    next!(s)
+});
+stencil!("mod_smi_iif"; |s| {
+    let a = int(s.acc);
+    s.facc = rem_f64(rem_magic(a, imm(), imm64()), a);
+    next!(s)
+});
+
+// k a power of two; the immediate is the mask k - 1. No division:
+// `a & mask` for a ≥ 0, `-(-a & mask)` otherwise.
+#[inline(always)]
+fn rem_mask(a: i32, m: i32) -> i32 {
+    if a >= 0 { a & m } else { -(a.wrapping_neg() & m) }
+}
+imm_variants!("mod_smi_pow2_i"; |s, m| {
+    let a = int(s.acc);
+    let r = rem_mask(a, m);
+    if r == 0 && a < 0 {
+        exit!(s)
+    }
+    s.acc = unboxed(r);
+    next!(s)
+});
+stencil!("mod_smi_pow2_iif"; |s| {
+    let a = int(s.acc);
+    s.facc = rem_f64(rem_mask(a, imm()), a);
+    next!(s)
+});
+
+// `JumpIfTrue` / `JumpIfFalse`: acc is a boolean.
+stencil!("jtrue"; |s| {
+    if s.acc == Value::TRUE {
+        jump!(s)
+    }
+    next!(s)
+});
+stencil!("jfalse"; |s| {
+    if s.acc == Value::FALSE {
+        jump!(s)
+    }
+    next!(s)
+});
+
+// `JumpIfToBooleanTrue` / `False`.
+macro_rules! jump_to_boolean {
+    ($name:literal, $want:literal) => {
+        stencil_slow!($name; |s| {
+            if s.acc == Value::TRUE || s.acc == Value::FALSE {
+                if (s.acc == Value::TRUE) == $want {
+                    jump!(s)
+                }
+                next!(s)
+            }
+            if s.tag.is_int32(s.acc) {
+                if (int(s.acc) != 0) == $want {
+                    jump!(s)
+                }
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            if rt_to_boolean!(s, s.acc) == $want {
+                jump!(s)
+            }
+            next!(s)
+        });
+        stencil!($name, "_i"; |s| {
+            if (int(s.acc) != 0) == $want {
+                jump!(s)
+            }
+            next!(s)
+        });
+        // NaN is false: `d < 0 || d > 0`, not `d != 0`.
+        stencil!($name, "_f"; |s| {
+            if (s.facc < 0.0 || s.facc > 0.0) == $want {
+                jump!(s)
+            }
+            next!(s)
+        });
+    };
+}
+jump_to_boolean!("jtotrue", true);
+jump_to_boolean!("jtofalse", false);
+
+// ---- Comparisons: `TestLessThan r` (`r < acc`), `TestEqual r` (`r == acc`),
+// `TestEqualSmi k` (`acc == k`) ----
+//
+// Each comes as a test, producing a boolean in `acc`, and fused with the
+// `JumpIfTrue` (`_jt`) or `JumpIfFalse` (`_jf`) after it, when that leaves
+// `acc` dead: a compare and a branch, with no boolean. Names: `test_lt`,
+// `test_eq`, `test_eq_smi`; fused `tlt_jt`, `tlt_jf`, `teq_jt`, `teq_jf`,
+// `teq_smi_jt`, `teq_smi_jf`.
+
+/// The relation on int32s or doubles (`$l` is the register operand).
+macro_rules! rel {
+    (lt, $l:expr, $r:expr) => { $l < $r };
+    (eq, $l:expr, $r:expr) => { $l == $r };
+}
+/// The relation on any values, through the runtime.
+macro_rules! rel_rt {
+    (lt, $s:ident, $l:expr, $r:expr) => { rt_less_than!($s, $l, $r) };
+    (eq, $s:ident, $l:expr, $r:expr) => { rt_loose_eq!($s, $l, $r) };
+}
+/// What to do with the outcome `c`.
+macro_rules! act {
+    (test, $s:ident, $c:expr) => {{
+        $s.acc = boolean($c);
+        next!($s)
+    }};
+    (jt, $s:ident, $c:expr) => {{
+        if $c {
+            jump!($s)
+        }
+        next!($s)
+    }};
+    (jf, $s:ident, $c:expr) => {{
+        if !$c {
+            jump!($s)
+        }
+        next!($s)
+    }};
+}
+
+macro_rules! cmp_smi {
+    ($name:literal, $act:ident) => {
+        stencil_slow!($name; |s| {
+            if s.tag.is_int32(s.acc) {
+                act!($act, s, int(s.acc) == imm())
+            }
+            slow!(s)
+        }; |s| {
+            let c = rt_loose_eq!(s, s.acc, Value::from_i32(imm()));
+            act!($act, s, c)
+        });
+        imm_variants!($name, "_i"; |s, k| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = k;
+                act_imm!($act, s, "cmp", "e")
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                act!($act, s, int(s.acc) == k)
+            }
+        });
+        stencil!($name, "_f"; |s| {
+            act!($act, s, s.facc == imm() as f64)
+        });
+    };
+}
+
+/// x86-64: `$insn acc32, imm` (`cmp` or `test`), with the immediate in the
+/// instruction, then act on condition code `$cc` (`e` or `z`): `set$cc` for
+/// a test, or `j$cc` / `jn$cc` to the branch target, through `asm goto` so
+/// the continuation stays last.
+#[cfg(target_arch = "x86_64")]
+macro_rules! act_imm {
+    ($act:ident, $s:ident, $insn:literal, $cc:literal) => {
+        act_imm!($act, $s, $s.acc, $insn, $cc)
+    };
+    (test, $s:ident, $v:expr, $insn:literal, $cc:literal) => {{
+        let c: u8;
+        core::arch::asm!(
+            concat!($insn, " {v:e}, offset {imm}"),
+            concat!("set", $cc, " {c}"),
+            v = in(reg) $v.to_bits(),
+            c = out(reg_byte) c,
+            imm = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+        $s.acc = boolean(c != 0);
+        next!($s)
+    }};
+    (jt, $s:ident, $v:expr, $insn:literal, $cc:literal) => {{
+        core::arch::asm!(
+            concat!($insn, " {v:e}, offset {imm}"),
+            concat!("{{disp32}} j", $cc, " {taken}"),
+            v = in(reg) $v.to_bits(),
+            imm = sym toi_hole_imm,
+            taken = label { unsafe { jump!($s) } },
+            options(nomem, nostack),
+        );
+        next!($s)
+    }};
+    (jf, $s:ident, $v:expr, $insn:literal, $cc:literal) => {{
+        core::arch::asm!(
+            concat!($insn, " {v:e}, offset {imm}"),
+            concat!("{{disp32}} jn", $cc, " {taken}"),
+            v = in(reg) $v.to_bits(),
+            imm = sym toi_hole_imm,
+            taken = label { unsafe { jump!($s) } },
+            options(nomem, nostack),
+        );
+        next!($s)
+    }};
+}
+
+cmp_smi!("test_eq_smi", test);
+cmp_smi!("teq_smi_jt", jt);
+cmp_smi!("teq_smi_jf", jf);
+
+// `BitAndSmi k; TestEqualSmi 0; JumpIfTrue | JumpIfFalse` on an int32:
+// `test acc, k` and a branch.
+macro_rules! test_zero {
+    ($name:literal, $act:ident) => {
+        imm_variants!($name; |s, k| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = k;
+                act_imm!($act, s, "test", "z")
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                act!($act, s, int(s.acc) & k == 0)
+            }
+        });
+    };
+}
+test_zero!("tstz_jt_i", jt);
+test_zero!("tstz_jf_i", jf);
+
+/// A comparison family on a boxed location (memory or a GPR slot).
+macro_rules! cmp_boxed {
+    ($loc:tt, $rel:ident, $act:ident, $name:literal) => {
+        stencil_slow!($name, "_", loc!($loc); |s| {
+            let l = get!($loc, s);
+            if s.tag.both_int32(l, s.acc) {
+                act!($act, s, rel!($rel, int(l), int(s.acc)))
+            }
+            slow!(s)
+        }; |s| {
+            let l = get!($loc, s);
+            let c = rel_rt!($rel, s, l, s.acc);
+            act!($act, s, c)
+        });
+        stencil!($name, "_ii_", loc!($loc); |s| {
+            act!($act, s, rel!($rel, int(get!($loc, s)), int(s.acc)))
+        });
+        stencil!($name, "_if_", loc!($loc); |s| {
+            act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), int(s.acc) as f64))
+        });
+        stencil!($name, "_fi_", loc!($loc); |s| {
+            act!($act, s, rel!($rel, int(get!($loc, s)) as f64, s.facc))
+        });
+        stencil!($name, "_ff_", loc!($loc); |s| {
+            act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), s.facc))
+        });
+    };
+}
+
+/// A comparison family on an FP slot (an unboxed double).
+macro_rules! cmp_fp {
+    ($k:tt, $rel:ident, $act:ident, $name:literal) => {
+        stencil!($name, "_f", $k; |s| {
+            let l = s.tag.encode_f64(s.f[$k]);
+            let c = rel_rt!($rel, s, l, s.acc);
+            act!($act, s, c)
+        });
+        stencil!($name, "_if_f", $k; |s| {
+            act!($act, s, rel!($rel, s.f[$k], int(s.acc) as f64))
+        });
+        stencil!($name, "_ff_f", $k; |s| {
+            act!($act, s, rel!($rel, s.f[$k], s.facc))
+        });
+    };
+}
+
+/// A comparison family on an unboxed int32 slot.
+macro_rules! cmp_int {
+    ($k:tt, $rel:ident, $act:ident, $name:literal) => {
+        stencil_slow!($name, "_u", $k; |s| {
+            if s.tag.is_int32(s.acc) {
+                act!($act, s, rel!($rel, raw(s.g[$k]), int(s.acc)))
+            }
+            slow!(s)
+        }; |s| {
+            let l = s.tag.box_i32(raw(s.g[$k]));
+            let c = rel_rt!($rel, s, l, s.acc);
+            act!($act, s, c)
+        });
+        stencil!($name, "_ii_u", $k; |s| {
+            act!($act, s, rel!($rel, raw(s.g[$k]), int(s.acc)))
+        });
+        stencil!($name, "_fi_u", $k; |s| {
+            act!($act, s, rel!($rel, raw(s.g[$k]) as f64, s.facc))
+        });
+    };
+}
+
+/// All six comparison families at one location, through `$m`.
+macro_rules! cmp_families {
+    ($m:ident, $loc:tt) => {
+        $m!($loc, lt, test, "test_lt");
+        $m!($loc, eq, test, "test_eq");
+        $m!($loc, lt, jt, "tlt_jt");
+        $m!($loc, lt, jf, "tlt_jf");
+        $m!($loc, eq, jt, "teq_jt");
+        $m!($loc, eq, jf, "teq_jf");
+    };
+}
+macro_rules! cmp_gpr {
+    ($k:tt) => {
+        cmp_families!(cmp_boxed, [g $k]);
+        cmp_families!(cmp_int, $k);
+    };
+}
+cmp_families!(cmp_boxed, [m]);
+with_gprs!(each_gpr! cmp_gpr);
+cmp_families!(cmp_fp, 0);
+cmp_families!(cmp_fp, 1);
+cmp_families!(cmp_fp, 2);
+cmp_families!(cmp_fp, 3);
+cmp_families!(cmp_fp, 4);
+cmp_families!(cmp_fp, 5);
+cmp_families!(cmp_fp, 6);
+
+// ---- Comparisons and bitwise operations on unboxed int32 slots ----
+//
+// `ldar a; <compare> …; JumpIf…` with `acc` dead after the jump compares the
+// slot itself, skipping the `ldar`; `ldar a; BitAndSmi | BitOrSmi k; star b`
+// is `b = a` (a slot move, see `mov_u`) and the operation in place on `b`.
+// Names: `tlt_jt_u<a>_u<b>` (`b < a`, the register operand is `b`),
+// `teq_jf_u<a>_u<b>`, …; `teq_smi_jt_u<a>`, `tstz_jf_u<a>`, `andi_u<b>`,
+// `ori_u<b>`.
+
+macro_rules! slot_cmp_pair {
+    ($a:tt, $b:tt) => {
+        stencil!("tlt_jt_u", $a, "_u", $b; |s| { act!(jt, s, raw(s.g[$b]) < raw(s.g[$a])) });
+        stencil!("tlt_jf_u", $a, "_u", $b; |s| { act!(jf, s, raw(s.g[$b]) < raw(s.g[$a])) });
+        stencil!("teq_jt_u", $a, "_u", $b; |s| { act!(jt, s, raw(s.g[$b]) == raw(s.g[$a])) });
+        stencil!("teq_jf_u", $a, "_u", $b; |s| { act!(jf, s, raw(s.g[$b]) == raw(s.g[$a])) });
+    };
+}
+
+/// A slot test against the immediate: `$insn` (`cmp` / `test`), condition
+/// `$cc` true when `$rel` holds.
+macro_rules! slot_imm_jump {
+    ($name:literal, $k:tt, $act:ident, $insn:literal, $cc:literal, |$v:ident, $i:ident| $rel:expr) => {
+        imm_variants!($name, "_u", $k; |s, k| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = k;
+                act_imm!($act, s, s.g[$k], $insn, $cc)
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let ($v, $i) = (raw(s.g[$k]), k);
+                act!($act, s, $rel)
+            }
+        });
+    };
+}
+
+macro_rules! slot_bitwise {
+    ($name:literal, $k:tt, $op:tt, $x86:literal) => {
+        imm_variants!($name, $k; |s, k| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = k;
+                let mut v = s.g[$k].to_bits();
+                core::arch::asm!(
+                    concat!($x86, " {v:e}, offset {imm}"),
+                    v = inout(reg) v,
+                    imm = sym toi_hole_imm,
+                    options(pure, nomem, nostack),
+                );
+                s.g[$k] = Value::from_bits(v);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                s.g[$k] = unboxed(raw(s.g[$k]) $op k);
+            }
+            next!(s)
+        });
+    };
+}
+
+macro_rules! slot_int_ops {
+    ($k:tt) => {
+        slot_imm_jump!("teq_smi_jt", $k, jt, "cmp", "e", |v, i| v == i);
+        slot_imm_jump!("teq_smi_jf", $k, jf, "cmp", "e", |v, i| v == i);
+        slot_imm_jump!("tstz_jt", $k, jt, "test", "z", |v, i| v & i == 0);
+        slot_imm_jump!("tstz_jf", $k, jf, "test", "z", |v, i| v & i == 0);
+        slot_bitwise!("andi_u", $k, &, "and");
+        slot_bitwise!("ori_u", $k, |, "or");
+    };
+}
+
+with_gprs!(each_gpr! slot_int_ops);
+with_gprs!(gpr_pairs! slot_cmp_pair);
+
+// ---- Property access, fed by inline caches ----
+//
+// The JIT reads each property instruction's inline cache when it compiles,
+// and bakes what it holds into the stencil: the receiver's shape
+// (`imm64`), the slot's offset (`imm`) and, for a prototype's property or
+// a transition, an address or the new shape (`imm64b`). The guard is a cell
+// check and one shape compare; on a mismatch the stencil exits before the
+// instruction, and the interpreter's inline cache takes over.
+//
+// Names: `get_own_<loc>` (`acc = [o + imm]`), `get_oop_<loc>` (`acc =
+// [o.props + imm]`), `get_proto_<loc>` (`acc = [imm64b]`); `set_own_<loc>`,
+// `set_oop_<loc>`, `set_tr_<loc>` (store `acc`, boxed, after writing the new
+// shape); `lda_global`, `lda_global_oop`, `sta_global`, `sta_global_oop` (the
+// global object is `imm64b`); `get_keyed[_i]_<loc>` (`acc = o[acc]`, a
+// packed element in bounds). `<loc>` is the receiver's register.
+
+/// Whether `v` is a cell, testing against the tag register.
+#[inline(always)]
+fn is_cell(tag: NumberTag, v: Value) -> bool {
+    v.to_bits() & tag.to_bits() == 0 && v.to_bits() & Value::OTHER_TAG == 0
+}
+
+/// The receiver `o`, if it is a cell whose shape is `imm64`.
+#[inline(always)]
+unsafe fn guard_shape(tag: NumberTag, o: Value) -> Option<*mut u8> {
+    let p = o.to_bits() as *mut u8;
+    if is_cell(tag, o) && unsafe { *(p as *const u64) } == imm64() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// The slot `imm` bytes into `base` (folds into the access as a
+/// displacement).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn at_imm(base: *mut u8) -> *mut Value {
+    unsafe { base.byte_add(&raw const toi_hole_imm as usize).cast() }
+}
+
+/// The slot `imm` bytes into `base`: the offset (below 64 KiB, which the
+/// JIT checks) from one `movz`, as a symbol's address would be an `adrp`,
+/// relative to where the code is.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn at_imm(base: *mut u8) -> *mut Value {
+    let off: usize;
+    unsafe {
+        core::arch::asm!(
+            "movz {o:x}, #:abs_g0_nc:{s}",
+            o = out(reg) off,
+            s = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+        base.byte_add(off).cast()
+    }
+}
+
+/// The object's out-of-line slots (`Object::props`, at offset 16).
+#[inline(always)]
+unsafe fn props(o: *mut u8) -> *mut u8 {
+    unsafe { *(o.add(16) as *const *mut u8) }
+}
+
+macro_rules! property_location {
+    ($loc:tt) => {
+        stencil!("get_own_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            s.acc = *at_imm(o);
+            next!(s)
+        });
+        stencil!("get_oop_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            s.acc = *at_imm(props(o));
+            next!(s)
+        });
+        stencil!("get_proto_", loc!($loc); |s| {
+            if guard_shape(s.tag, get!($loc, s)).is_none() {
+                exit!(s)
+            }
+            s.acc = *(imm64b() as *const Value);
+            next!(s)
+        });
+        stencil!("set_own_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            *at_imm(o) = s.acc;
+            next!(s)
+        });
+        stencil!("set_oop_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            *at_imm(props(o)) = s.acc;
+            next!(s)
+        });
+        stencil!("set_tr_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            *(o as *mut u64) = imm64b();
+            *at_imm(o) = s.acc;
+            next!(s)
+        });
+        // The receiver's shape is known to be the cached one: no guard.
+        stencil!("get_own_nc_", loc!($loc); |s| {
+            s.acc = *at_imm(get!($loc, s).to_bits() as *mut u8);
+            next!(s)
+        });
+        stencil!("get_oop_nc_", loc!($loc); |s| {
+            s.acc = *at_imm(props(get!($loc, s).to_bits() as *mut u8));
+            next!(s)
+        });
+        stencil!("get_proto_nc_", loc!($loc); |s| {
+            s.acc = *(imm64b() as *const Value);
+            next!(s)
+        });
+        stencil!("set_own_nc_", loc!($loc); |s| {
+            *at_imm(get!($loc, s).to_bits() as *mut u8) = s.acc;
+            next!(s)
+        });
+        stencil!("set_oop_nc_", loc!($loc); |s| {
+            *at_imm(props(get!($loc, s).to_bits() as *mut u8)) = s.acc;
+            next!(s)
+        });
+        // Elements at offset 24, length (u32) at 32. A hole is `EMPTY` (0).
+        stencil!("get_keyed_i_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if !is_cell(s.tag, o) {
+                exit!(s)
+            }
+            let p = o.to_bits() as *const u8;
+            let i = int(s.acc) as u32;
+            if i >= *(p.add(32) as *const u32) {
+                exit!(s)
+            }
+            let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+            if v.to_bits() == 0 {
+                exit!(s)
+            }
+            s.acc = v;
+            next!(s)
+        });
+        stencil!("get_keyed_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if !is_cell(s.tag, o) || !s.tag.is_int32(s.acc) {
+                exit!(s)
+            }
+            let p = o.to_bits() as *const u8;
+            let i = int(s.acc) as u32;
+            if i >= *(p.add(32) as *const u32) {
+                exit!(s)
+            }
+            let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+            if v.to_bits() == 0 {
+                exit!(s)
+            }
+            s.acc = v;
+            next!(s)
+        });
+    };
+}
+
+macro_rules! property_gpr {
+    ($k:tt) => {
+        property_location!([g $k]);
+    };
+}
+property_location!([m]);
+with_gprs!(each_gpr! property_gpr);
+
+stencil!("lda_global"; |s| {
+    let g = imm64b() as *mut u8;
+    if *(g as *const u64) != imm64() {
+        exit!(s)
+    }
+    s.acc = *at_imm(g);
+    next!(s)
+});
+stencil!("lda_global_oop"; |s| {
+    let g = imm64b() as *mut u8;
+    if *(g as *const u64) != imm64() {
+        exit!(s)
+    }
+    s.acc = *at_imm(props(g));
+    next!(s)
+});
+stencil!("sta_global"; |s| {
+    let g = imm64b() as *mut u8;
+    if *(g as *const u64) != imm64() {
+        exit!(s)
+    }
+    *at_imm(g) = s.acc;
+    next!(s)
+});
+stencil!("sta_global_oop"; |s| {
+    let g = imm64b() as *mut u8;
+    if *(g as *const u64) != imm64() {
+        exit!(s)
+    }
+    *at_imm(props(g)) = s.acc;
+    next!(s)
+});
+
+// An instruction the JIT doesn't compile (a call, `return` in a VM frame,
+// an allocation, an uncached property access): leave for the interpreter.
+stencil!("bail"; |s| { exit!(s) });

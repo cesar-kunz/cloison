@@ -64,6 +64,10 @@ use std::collections::{HashMap, HashSet};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Sym {
     HoleImm,
+    /// A 64-bit immediate (`mod_smi_i`'s magic multiplier, a shape).
+    HoleImm64,
+    /// A second one (an address, a transition's new shape).
+    HoleImm64b,
     HoleReg,
     Continue,
     JumpTarget,
@@ -210,10 +214,14 @@ fn has_stencil(name: &str) -> bool {
 
 // ---- Runtime functions called from stencil slow paths (C ABI) ----
 
-extern "C" fn toi_rt_add(a: Value, b: Value) -> Value {
-    match (a.as_number(), b.as_number()) {
+/// Stencils call it as `(acc, rhs)`. `Add r` computes `r + acc`, so the
+/// operands go to the generic runtime in that order. `AddSmi` (`acc + imm`)
+/// shares it, which is fine while `+` is only numeric; strings will need a
+/// helper per order.
+extern "C" fn toi_rt_add(acc: Value, r: Value) -> Value {
+    match (r.as_number(), acc.as_number()) {
         (Some(x), Some(y)) => Value::from_f64_arith(x + y),
-        _ => crate::interp::generic_add(a, b),
+        _ => crate::interp::generic_add(r, acc),
     }
 }
 
@@ -231,8 +239,31 @@ extern "C" fn toi_rt_less_than(a: Value, b: Value) -> bool {
     }
 }
 
+/// `a % b` (`ModSmi`'s slow path; `b` is the immediate).
+extern "C" fn toi_rt_mod(a: Value, b: Value) -> Value {
+    Value::number(a.to_number() % b.to_number())
+}
+
+/// ToInt32(ToNumber(a)), in the low 32 bits.
+extern "C" fn toi_rt_to_int32(a: Value, _: Value) -> u64 {
+    crate::interp::to_int32(a.to_number()) as u32 as u64
+}
+
+/// `a == b`.
+extern "C" fn toi_rt_loose_eq(a: Value, b: Value) -> bool {
+    crate::interp::loose_equals(a, b).unwrap_or_else(|e| panic!("JIT code: {e}"))
+}
+
+extern "C" fn toi_rt_to_boolean(a: Value, _: Value) -> bool {
+    crate::interp::to_boolean(a)
+}
+
 fn runtime_function(name: &str) -> usize {
     match name {
+        "toi_rt_mod" => toi_rt_mod as *const () as usize,
+        "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
+        "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
+        "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
         "toi_rt_add" => toi_rt_add as *const () as usize,
         "toi_rt_inc" => toi_rt_inc as *const () as usize,
         "toi_rt_less_than" => toi_rt_less_than as *const () as usize,
@@ -354,6 +385,8 @@ mod arch {
     const R_AARCH64_ABS64: u32 = 257;
     const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264;
     const R_AARCH64_MOVW_UABS_G1_NC: u32 = 266;
+    const R_AARCH64_MOVW_UABS_G2_NC: u32 = 268;
+    const R_AARCH64_MOVW_UABS_G3: u32 = 269;
     const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
     const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
     const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
@@ -463,12 +496,17 @@ mod arch {
         let v = s.wrapping_add(a as u64);
         match r_type {
             R_AARCH64_ABS64 => buf[..8].copy_from_slice(&v.to_le_bytes()),
-            // movz / movk: imm16 at [20:5], bits 0–15 / 16–31 of the value.
-            R_AARCH64_MOVW_UABS_G0_NC | R_AARCH64_MOVW_UABS_G1_NC => {
-                let shift = if r_type == R_AARCH64_MOVW_UABS_G0_NC {
-                    0
-                } else {
-                    16
+            // movz / movk: imm16 at [20:5], bits 0–15, 16–31, 32–47 or 48–63
+            // of the value.
+            R_AARCH64_MOVW_UABS_G0_NC
+            | R_AARCH64_MOVW_UABS_G1_NC
+            | R_AARCH64_MOVW_UABS_G2_NC
+            | R_AARCH64_MOVW_UABS_G3 => {
+                let shift = match r_type {
+                    R_AARCH64_MOVW_UABS_G0_NC => 0,
+                    R_AARCH64_MOVW_UABS_G1_NC => 16,
+                    R_AARCH64_MOVW_UABS_G2_NC => 32,
+                    _ => 48,
                 };
                 let imm16 = ((v >> shift) & 0xFFFF) as u32;
                 write(buf, (read(buf) & !(0xFFFF << 5)) | imm16 << 5);
@@ -603,23 +641,65 @@ struct Insn {
     reg: u8,
     /// Instruction index of the jump target, if any.
     target: usize,
+    /// Not compiled: the code exits to the interpreter before it (see
+    /// [`JitFunction::for_vm`]).
+    bail: bool,
 }
 
 impl Insn {
     fn falls_through(&self) -> bool {
-        !matches!(self.op, Op::Jump | Op::Return)
+        !self.bail && !matches!(self.op, Op::Jump | Op::Return)
     }
 
     fn jumps(&self) -> bool {
-        matches!(self.op, Op::Jump | Op::JumpIfLess | Op::JumpIfLessSmi)
+        !self.bail
+            && matches!(
+                self.op,
+                Op::Jump
+                    | Op::JumpIfLess
+                    | Op::JumpIfLessSmi
+                    | Op::JumpIfTrue
+                    | Op::JumpIfFalse
+                    | Op::JumpIfToBooleanTrue
+                    | Op::JumpIfToBooleanFalse
+            )
     }
 
     fn reads_reg(&self) -> bool {
-        matches!(self.op, Op::Ldar | Op::Star | Op::Add | Op::JumpIfLess)
+        !self.bail
+            && matches!(
+                self.op,
+                Op::Ldar
+                    | Op::Star
+                    | Op::Add
+                    | Op::JumpIfLess
+                    | Op::TestLessThan
+                    | Op::TestEqual
+                    | Op::GetNamed
+                    | Op::SetNamed
+                    | Op::GetKeyed
+            )
+    }
+
+    /// Whether it is a property access, whose stencil exits when the
+    /// receiver's shape isn't the one its inline cache held.
+    fn is_property(&self) -> bool {
+        matches!(
+            self.op,
+            Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal | Op::GetKeyed
+        )
+    }
+
+    /// Whether it reads the register operand's value (`star` only writes it).
+    fn uses_reg_value(&self) -> bool {
+        self.reads_reg() && self.op != Op::Star
     }
 }
 
-fn decode(code: &[u8]) -> Vec<Insn> {
+/// Decode `code`. With `vm`, instructions the JIT doesn't compile are
+/// marked `bail`, as is `Return` (a VM frame returns in the interpreter);
+/// otherwise they're an error.
+fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
     let imm_at = |at: usize| i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
     let mut starts = HashMap::new();
     let mut raw = Vec::new();
@@ -642,18 +722,47 @@ fn decode(code: &[u8]) -> Vec<Insn> {
     };
     raw.into_iter()
         .map(|(pc, op)| {
-            let (mut imm, mut reg, mut target) = (0, 0, 0);
+            let (mut imm, mut reg, mut target, mut bail) = (0, 0, 0, false);
             match op {
                 Op::LdaSmi | Op::AddSmi => imm = imm_at(pc + 1),
                 Op::Inc => imm = 1,
                 Op::Ldar | Op::Star | Op::Add => reg = code[pc + 1],
                 Op::JumpIfLess => (reg, target) = (code[pc + 1], index_of(pc, imm_at(pc + 2))),
                 Op::JumpIfLessSmi => (imm, target) = (imm_at(pc + 1), index_of(pc, imm_at(pc + 5))),
-                Op::Jump => target = index_of(pc, imm_at(pc + 1)),
-                Op::Nop | Op::Return => {}
+                Op::Jump
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::JumpIfToBooleanTrue
+                | Op::JumpIfToBooleanFalse => target = index_of(pc, imm_at(pc + 1)),
+                Op::ModSmi | Op::BitAndSmi | Op::BitOrSmi | Op::TestEqualSmi => {
+                    imm = imm_at(pc + 1)
+                }
+                Op::TestLessThan | Op::TestEqual => reg = code[pc + 1],
+                Op::Nop
+                | Op::Return
+                | Op::LdaTrue
+                | Op::LdaFalse
+                | Op::LdaUndefined
+                | Op::LdaNull => {}
                 Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop => {
                     unreachable!("decoded as plain jumps")
                 }
+                // The inline-cache slot goes in `imm`.
+                Op::GetNamed | Op::SetNamed if vm => {
+                    (reg, imm) = (
+                        code[pc + 1],
+                        u16::from_le_bytes([code[pc + 2], code[pc + 3]]) as i32,
+                    )
+                }
+                Op::LdaGlobal | Op::StaGlobal if vm => {
+                    imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                }
+                Op::GetKeyed if vm => reg = code[pc + 1],
+                _ if vm => bail = true,
+                op => panic!("the JIT does not compile {op:?} yet"),
+            }
+            if vm && op == Op::Return {
+                bail = true;
             }
             Insn {
                 pc,
@@ -661,34 +770,162 @@ fn decode(code: &[u8]) -> Vec<Insn> {
                 imm,
                 reg,
                 target,
+                bail,
             }
         })
         .collect()
 }
 
+// ---- Inline-cache feedback (VM frames) ----
+
+/// What a property instruction's inline cache held when compiling, as
+/// stencil operands: the receiver's shape, then where the property is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Prop {
+    /// Not a property instruction, or nothing cached: bail.
+    None,
+    /// In the receiver, at byte offset `off`.
+    Own { shape: u64, off: i32 },
+    /// In the receiver's out-of-line slots, at byte offset `off`.
+    Oop { shape: u64, off: i32 },
+    /// In a prototype, at address `addr` (stable while no prototype
+    /// changes shape; see [`JitFunction::vm_enter`]).
+    Proto { shape: u64, addr: u64 },
+    /// A store adding the property: write `new_shape`, then the in-object
+    /// slot at `off`.
+    Transition {
+        shape: u64,
+        new_shape: u64,
+        off: i32,
+    },
+    /// A global, in the global object at `global`.
+    Global {
+        shape: u64,
+        global: u64,
+        off: i32,
+        oop: bool,
+    },
+}
+
+/// The VM state the JIT reads to compile a function's property accesses.
+#[derive(Clone, Copy)]
+pub(crate) struct Feedback {
+    pub ics: *const crate::vm::Ic,
+    pub global: *mut crate::object::Object,
+}
+
+impl Feedback {
+    /// What instruction `insn`'s inline cache says, for the stencil, under
+    /// prototype epoch `epoch`. A prototype load cached under another epoch
+    /// says nothing: its holder may be shadowed now, and the interpreter
+    /// hasn't re-run the access to find out.
+    fn prop(&self, insn: &Insn, epoch: u32) -> Prop {
+        use crate::object::Object;
+        if insn.bail
+            || !matches!(
+                insn.op,
+                Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal
+            )
+        {
+            return Prop::None;
+        }
+        let ic = unsafe { *self.ics.add(insn.imm as usize) };
+        if ic.shape.is_null() {
+            return Prop::None;
+        }
+        let shape = ic.shape as u64;
+        let at = |loc: i32| {
+            if loc >= 0 {
+                (false, loc)
+            } else {
+                (true, !loc * 8)
+            }
+        };
+        // Stencils take the offset in 16 bits on arm64.
+        if at(ic.loc).1 > 0xFFFF {
+            return Prop::None;
+        }
+        match insn.op {
+            Op::GetNamed if !ic.holder.is_null() && ic.epoch != epoch => Prop::None,
+            Op::GetNamed if !ic.holder.is_null() => Prop::Proto {
+                shape,
+                addr: unsafe { Object::slot(ic.holder, ic.loc) } as u64,
+            },
+            Op::SetNamed if !ic.new_shape.is_null() => Prop::Transition {
+                shape,
+                new_shape: ic.new_shape as u64,
+                off: ic.loc,
+            },
+            Op::GetNamed | Op::SetNamed => match at(ic.loc) {
+                (false, off) => Prop::Own { shape, off },
+                (true, off) => Prop::Oop { shape, off },
+            },
+            // Only own properties of the global object are compiled.
+            _ if !ic.holder.is_null() || !ic.new_shape.is_null() => Prop::None,
+            _ => {
+                let (oop, off) = at(ic.loc);
+                Prop::Global {
+                    shape,
+                    global: self.global as u64,
+                    off,
+                    oop,
+                }
+            }
+        }
+    }
+}
+
 // ---- Type inference ----
 
-/// The type lattice: `Bot < I32 < F64 < Any`. The join of `I32` and `F64`
-/// is `F64`: an int32 converts losslessly to a double, so an edge carrying
-/// `I32` into an `F64` point gets a conversion stencil.
+/// The type lattice: `Bot < I32 < F64 < Any`, and `Bot < Obj(s) < Any` for
+/// each shape `s` (see [`Ty::join`]). The join of `I32` and `F64` is `F64`:
+/// an int32 converts losslessly to a double, so an edge carrying `I32` into
+/// an `F64` point gets a conversion stencil.
+///
+/// `Obj(s)` is an object whose shape is `s` (the address of its `Shape`).
+/// Values get it at entry, from the live values, and from a property
+/// access's shape guard, which then needn't be repeated. A transitioning
+/// store forgets every `Obj` fact but its receiver's. Between transitions
+/// shapes stay exact; even a stale fact would still read and replace
+/// correctly, because a transition only appends slots, but a prototype load
+/// (which a new own property shadows) and a transition need the exact
+/// shape.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Ty {
     Bot,
     I32,
     F64,
+    Obj(u64),
     Any,
 }
 
 impl Ty {
-    /// The exact type of a runtime value.
+    /// The exact type of a runtime value. All cells are objects so far.
     pub fn of(v: Value) -> Ty {
         if v.is_int32() {
             Ty::I32
         } else if v.is_double() {
             Ty::F64
+        } else if v.is_cell() {
+            Ty::Obj(unsafe { *(v.to_bits() as *const u64) })
         } else {
             Ty::Any
         }
+    }
+
+    /// The least upper bound.
+    pub fn join(self, other: Ty) -> Ty {
+        use Ty::*;
+        match (self, other) {
+            (a, b) if a == b => a,
+            (Bot, t) | (t, Bot) => t,
+            (I32, F64) | (F64, I32) => F64,
+            _ => Any,
+        }
+    }
+
+    fn is_obj(self) -> bool {
+        matches!(self, Ty::Obj(_))
     }
 }
 
@@ -721,8 +958,9 @@ impl TypeState {
         let pairs = std::iter::once((&mut self.acc, &other.acc))
             .chain(self.regs.iter_mut().zip(&other.regs));
         for (a, b) in pairs {
-            if *b > *a {
-                *a = *b;
+            let j = a.join(*b);
+            if j != *a {
+                *a = j;
                 changed = true;
             }
         }
@@ -731,11 +969,24 @@ impl TypeState {
 }
 
 /// Inputs to stencil selection that are fixed for a compilation.
+#[derive(Clone, Copy)]
 struct Spec<'a> {
     /// `None`: no specialization; every type is `Any`, every stencil generic.
     widened: Option<&'a HashSet<usize>>,
     /// Registers pinned as doubles (they live in FP slots).
     pinned: &'a [bool],
+    /// Whether `acc` is live into each instruction, and which registers
+    /// are. [`infer`] gives dead values the type `Bot`, so a value that is
+    /// never read (a comparison's boolean after its jump, a temporary out
+    /// of scope) doesn't widen a join or need conversions on its way there.
+    acc_live: &'a [bool],
+    reg_live: &'a [Vec<bool>],
+    /// Per instruction, its inline cache's contents (property instructions
+    /// in VM frames); empty otherwise.
+    props: &'a [Prop],
+    /// Per instruction: an int32 add whose result only feeds the bitwise
+    /// operation right after it, so it may wrap (`(a + b) | 0`).
+    wraps: &'a [bool],
 }
 
 /// What [`select`] decided for one instruction: the stencil family, the
@@ -745,6 +996,26 @@ struct Sel {
     base: &'static str,
     case: &'static str,
     out: TypeState,
+}
+
+/// The type case of a one-operand number operation on `acc`.
+fn num_case(acc: Ty) -> &'static str {
+    match acc {
+        Ty::I32 => "i",
+        Ty::F64 => "f",
+        _ => "",
+    }
+}
+
+/// The type case of a two-operand number operation, acc first.
+fn pair_case(acc: Ty, reg: Ty) -> &'static str {
+    match (acc, reg) {
+        (Ty::I32, Ty::I32) => "ii",
+        (Ty::I32, Ty::F64) => "if",
+        (Ty::F64, Ty::I32) => "fi",
+        (Ty::F64, Ty::F64) => "ff",
+        _ => "",
+    }
 }
 
 /// Choose the operation's type case from its in-state. Instructions in
@@ -757,7 +1028,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         let any = TypeState::any(st.regs.len());
         let no = Spec {
             widened: Some(&HashSet::new()),
-            pinned: spec.pinned,
+            ..*spec
         };
         let Sel { base, case, .. } = select(insn, i, &any, &no);
         // Generic code keeps `acc` boxed, so `lda_smi`, not `lda_smi_i`.
@@ -778,7 +1049,18 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             (exits, I32)
         }
     };
+    let wraps = spec.wraps.get(i).copied().unwrap_or(false);
     let (base, case) = match insn.op {
+        _ if insn.bail => ("bail", ""),
+        // ToInt32(a + b) is the 32-bit wrapping add: no exit, no widening.
+        Op::Add if wraps && st.acc == I32 && reg == I32 => {
+            out.acc = I32;
+            ("add", "wrap_ii")
+        }
+        Op::AddSmi | Op::Inc if wraps && st.acc == I32 => {
+            out.acc = I32;
+            ("add_smi", "wrap_i")
+        }
         Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop => {
             unreachable!("decoded as plain jumps")
         }
@@ -846,6 +1128,140 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
             ("jlt_smi", case)
         }
+        Op::LdaTrue | Op::LdaFalse | Op::LdaUndefined | Op::LdaNull => {
+            out.acc = Any;
+            let base = match insn.op {
+                Op::LdaTrue => "lda_true",
+                Op::LdaFalse => "lda_false",
+                Op::LdaUndefined => "lda_undefined",
+                _ => "lda_null",
+            };
+            (base, "")
+        }
+        // A power-of-two modulus needs no division (`mod_smi_pow2`, whose
+        // immediate is the mask; see `stencil_for`).
+        Op::ModSmi => {
+            let k = insn.imm;
+            let base = if k > 0 && k & (k - 1) == 0 {
+                "mod_smi_pow2"
+            } else {
+                "mod_smi"
+            };
+            let (case, ty) = match st.acc {
+                I32 if k > 0 => int_op("i", "iif"),
+                _ => ("", Any),
+            };
+            out.acc = ty;
+            (if case.is_empty() { "mod_smi" } else { base }, case)
+        }
+        // ToInt32, then the operation: always an int32.
+        Op::BitAndSmi | Op::BitOrSmi => {
+            out.acc = I32;
+            let identity = if insn.op == Op::BitAndSmi { -1 } else { 0 };
+            let base = if insn.op == Op::BitAndSmi {
+                "bit_and_smi"
+            } else {
+                "bit_or_smi"
+            };
+            // `x | 0` and `x & -1` leave an int32 as it is.
+            if st.acc == I32 && insn.imm == identity {
+                ("nop", "")
+            } else {
+                (base, num_case(st.acc))
+            }
+        }
+        Op::TestEqualSmi => {
+            out.acc = Any;
+            ("test_eq_smi", num_case(st.acc))
+        }
+        Op::TestLessThan | Op::TestEqual => {
+            out.acc = Any;
+            let base = if insn.op == Op::TestLessThan {
+                "test_lt"
+            } else {
+                "test_eq"
+            };
+            (base, pair_case(st.acc, reg))
+        }
+        // Booleans are `Any`; a number never equals `true` or `false`, but it
+        // takes no special case: `stencil_for` boxes it for the generic test.
+        Op::JumpIfTrue => ("jtrue", ""),
+        Op::JumpIfFalse => ("jfalse", ""),
+        Op::JumpIfToBooleanTrue => ("jtotrue", num_case(st.acc)),
+        Op::JumpIfToBooleanFalse => ("jtofalse", num_case(st.acc)),
+        // Property accesses. A receiver known to be a number has no
+        // properties the cache could describe: leave it to the interpreter.
+        Op::GetNamed | Op::SetNamed | Op::GetKeyed if matches!(reg, I32 | F64) => ("bail", ""),
+        // The guard is skipped (`_nc`) when the receiver's shape is known to
+        // be the cached one; a receiver known to have another shape would
+        // always fail it. A guard that passed makes the shape known.
+        Op::GetNamed | Op::SetNamed => {
+            let prop = spec.props.get(i).copied().unwrap_or(Prop::None);
+            let shape = match prop {
+                Prop::Own { shape, .. }
+                | Prop::Oop { shape, .. }
+                | Prop::Proto { shape, .. }
+                | Prop::Transition { shape, .. } => shape,
+                _ => {
+                    return Sel {
+                        base: "bail",
+                        case: "",
+                        out,
+                    };
+                }
+            };
+            let known = reg == Ty::Obj(shape);
+            if reg.is_obj() && !known {
+                return Sel {
+                    base: "bail",
+                    case: "",
+                    out,
+                };
+            }
+            let r = insn.reg as usize;
+            out.regs[r] = Ty::Obj(shape);
+            if insn.op == Op::GetNamed {
+                out.acc = Any;
+            }
+            let case = if known { "nc" } else { "" };
+            match prop {
+                Prop::Own { .. } if insn.op == Op::GetNamed => ("get_own", case),
+                Prop::Oop { .. } if insn.op == Op::GetNamed => ("get_oop", case),
+                Prop::Proto { .. } => ("get_proto", case),
+                Prop::Own { .. } => ("set_own", case),
+                Prop::Oop { .. } => ("set_oop", case),
+                Prop::Transition { new_shape, .. } => {
+                    // The object changes shape: forget every shape fact, as
+                    // another register may hold the same object.
+                    for t in out.regs.iter_mut().chain(std::iter::once(&mut out.acc)) {
+                        if t.is_obj() {
+                            *t = Any;
+                        }
+                    }
+                    out.regs[r] = Ty::Obj(new_shape);
+                    ("set_tr", "")
+                }
+                _ => unreachable!(),
+            }
+        }
+        Op::LdaGlobal => {
+            out.acc = Any;
+            match spec.props.get(i).copied().unwrap_or(Prop::None) {
+                Prop::Global { oop: false, .. } => ("lda_global", ""),
+                Prop::Global { oop: true, .. } => ("lda_global_oop", ""),
+                _ => ("bail", ""),
+            }
+        }
+        Op::StaGlobal => match spec.props.get(i).copied().unwrap_or(Prop::None) {
+            Prop::Global { oop: false, .. } => ("sta_global", ""),
+            Prop::Global { oop: true, .. } => ("sta_global_oop", ""),
+            _ => ("bail", ""),
+        },
+        Op::GetKeyed => {
+            out.acc = Any;
+            ("get_keyed", if st.acc == I32 { "i" } else { "" })
+        }
+        op => unreachable!("rejected by decode: {op:?}"),
     };
     Sel { base, case, out }
 }
@@ -869,10 +1285,19 @@ fn infer(
         ];
         for s in succs.into_iter().flatten() {
             assert!(s < insns.len(), "control falls off the end of the bytecode");
+            let mut out = out.clone();
+            if !spec.acc_live[s] {
+                out.acc = Ty::Bot;
+            }
+            for (t, &live) in out.regs.iter_mut().zip(&spec.reg_live[s]) {
+                if !live {
+                    *t = Ty::Bot;
+                }
+            }
             let changed = match &mut ins[s] {
                 Some(st) => st.join(&out),
                 slot @ None => {
-                    *slot = Some(out.clone());
+                    *slot = Some(out);
                     true
                 }
             };
@@ -940,7 +1365,7 @@ fn assign_homes(
             uses[insn.reg as usize] += 1;
         }
         for (j, &t) in join.iter_mut().zip(&st.regs) {
-            *j = (*j).max(t);
+            *j = j.join(t);
         }
     }
     let mut by_uses: Vec<usize> = (0..nregs).filter(|&r| uses[r] > 0).collect();
@@ -995,7 +1420,8 @@ fn succs(insns: &[Insn], i: usize) -> impl Iterator<Item = usize> {
 }
 
 /// Registers live into each reachable instruction (backward dataflow):
-/// `ldar`, `add`, `jlt` read their register, `star` writes it.
+/// instructions with a register operand read it, except `star`, which
+/// writes it.
 fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize) -> Vec<Vec<bool>> {
     let n = insns.len();
     let mut live_in = vec![vec![false; nregs]; n];
@@ -1010,10 +1436,10 @@ fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize) -> Vec<Vec<bool>> {
                     *l |= x;
                 }
             }
-            match insn.op {
-                Op::Star => live[insn.reg as usize] = false,
-                Op::Ldar | Op::Add | Op::JumpIfLess => live[insn.reg as usize] = true,
-                _ => {}
+            if insn.op == Op::Star {
+                live[insn.reg as usize] = false;
+            } else if insn.uses_reg_value() {
+                live[insn.reg as usize] = true;
             }
             if live != live_in[i] {
                 live_in[i] = live;
@@ -1073,9 +1499,13 @@ fn pinnable(
     let may_spill = |i: usize| {
         let Some(st) = &ins[i] else { return false };
         let reg = st.regs.get(insns[i].reg as usize).copied();
+        if insns[i].bail || insns[i].is_property() {
+            return true;
+        }
         match insns[i].op {
             Op::Return => true,
             Op::AddSmi | Op::Inc => st.acc == Ty::I32 && !widened.contains(&i),
+            Op::ModSmi => st.acc == Ty::I32 && insns[i].imm > 0 && !widened.contains(&i),
             Op::Add => st.acc == Ty::I32 && reg == Some(Ty::I32) && !widened.contains(&i),
             _ => false,
         }
@@ -1109,6 +1539,9 @@ struct Piece {
     /// Its `__slow` helper, if any (copied into the cold area).
     slow: Option<Instance>,
     imm: i32,
+    /// The 64-bit immediates, for stencils that have them.
+    imm64: u64,
+    imm64b: u64,
     reg: u8,
     cont: Target,
     jump: Target,
@@ -1144,6 +1577,8 @@ impl Piece {
             stencil,
             slow,
             imm: 0,
+            imm64: 0,
+            imm64b: 0,
             reg,
             cont: Target::Next,
             jump: Target::Next,
@@ -1278,17 +1713,57 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
         ("star", _) if sel.case == "f" => format!("star_{loc}_f"),
         ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => format!("star_{loc}_i"),
         ("star", _) => format!("star_{loc}"),
-        ("add" | "jlt", _) if sel.case.is_empty() => {
+        ("get_own" | "get_oop" | "get_proto", _) if sel.case == "nc" => {
+            format!("{}_nc_{loc}", sel.base)
+        }
+        ("get_own" | "get_oop" | "get_proto", _) => format!("{}_{loc}", sel.base),
+        // Stores take a boxed `acc`.
+        ("set_own" | "set_oop" | "set_tr", _) => {
+            box_acc(&mut pre);
+            if sel.case == "nc" {
+                format!("{}_nc_{loc}", sel.base)
+            } else {
+                format!("{}_{loc}", sel.base)
+            }
+        }
+        ("sta_global" | "sta_global_oop", _) => {
+            box_acc(&mut pre);
+            sel.base.into()
+        }
+        ("get_keyed", _) if sel.case == "i" => format!("get_keyed_i_{loc}"),
+        ("get_keyed", _) => {
+            box_acc(&mut pre);
+            format!("get_keyed_{loc}")
+        }
+        ("add" | "jlt" | "test_lt" | "test_eq", _) if sel.case.is_empty() => {
             box_acc(&mut pre);
             format!("{}_{loc}", sel.base)
         }
-        ("add" | "jlt", _) => format!("{}_{}_{loc}", sel.base, sel.case),
+        ("add" | "jlt" | "test_lt" | "test_eq", _) => format!("{}_{}_{loc}", sel.base, sel.case),
         ("return", _) => {
             box_acc(&mut pre);
             pre.extend(spills(homes));
             "return".into()
         }
-        (base, _) if sel.case.is_empty() => base.into(),
+        // Generic stencils that read `acc` take it boxed.
+        (base, _) if sel.case.is_empty() => {
+            if !matches!(
+                base,
+                "nop"
+                    | "jump"
+                    | "lda_smi"
+                    | "lda_true"
+                    | "lda_false"
+                    | "lda_undefined"
+                    | "lda_null"
+                    | "lda_global"
+                    | "lda_global_oop"
+                    | "bail"
+            ) {
+                box_acc(&mut pre);
+            }
+            base.into()
+        }
         (base, _) => format!("{base}_{}", sel.case),
     };
     (pre, name)
@@ -1298,8 +1773,8 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
 
 /// Whether the accumulator is live after each instruction (backward
 /// dataflow over reachable instructions). An instruction reads `acc` unless
-/// it is `ldar` / `lda_smi`, which overwrite it, or `nop` / `jump`, which
-/// pass it through.
+/// it is a load (`ldar`, `lda_smi`, `lda_true`, …), which overwrites it, or
+/// `nop` / `jump`, which pass it through.
 fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
     let reach: Vec<bool> = ins.iter().map(Option::is_some).collect();
     acc_liveness(insns, &reach).1
@@ -1308,8 +1783,25 @@ fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
 /// Accumulator liveness into and out of each reachable instruction.
 fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
     let n = insns.len();
-    let reads = |op: Op| !matches!(op, Op::Ldar | Op::LdaSmi | Op::Nop | Op::Jump);
-    let kills = |op: Op| matches!(op, Op::Ldar | Op::LdaSmi);
+    let kills = |op: Op| {
+        matches!(
+            op,
+            Op::Ldar
+                | Op::LdaSmi
+                | Op::LdaTrue
+                | Op::LdaFalse
+                | Op::LdaUndefined
+                | Op::LdaNull
+                | Op::GetNamed
+                | Op::LdaGlobal
+        )
+    };
+    let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump);
+    // A bail hands `acc` to the interpreter.
+    let (reads, kills) = (
+        |insn: &Insn| insn.bail || reads(insn.op),
+        |insn: &Insn| !insn.bail && kills(insn.op),
+    );
     let mut live_in = vec![false; n];
     let mut live_out = vec![false; n];
     let mut changed = true;
@@ -1325,7 +1817,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 insn.jumps().then_some(insn.target),
             ];
             let out = succs.into_iter().flatten().any(|s| live_in[s]);
-            let inn = reads(insn.op) || (!kills(insn.op) && out);
+            let inn = reads(insn) || (!kills(insn) && out);
             if out != live_out[i] || inn != live_in[i] {
                 (live_out[i], live_in[i]) = (out, inn);
                 changed = true;
@@ -1339,6 +1831,8 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
 struct FusedStep {
     name: String,
     imm: i32,
+    /// The register operand, for a stencil on a register in memory.
+    reg: u8,
     /// The bytecode instruction an exit from this step happens before.
     insn: usize,
     /// For in-place ops on unboxed slots, which write the wrapped result
@@ -1374,6 +1868,7 @@ impl Fused {
             steps: vec![FusedStep {
                 name,
                 imm,
+                reg: 0,
                 insn,
                 undo,
             }],
@@ -1401,6 +1896,12 @@ impl Fusion<'_> {
     fn at(&self, i: usize) -> Option<Fused> {
         let widened = self.widened?;
         if let Some(f) = self.add_chain(i, widened) {
+            return Some(f);
+        }
+        if let Some(f) = self.compare_jump(i) {
+            return Some(f);
+        }
+        if let Some(f) = self.int_slot_ops(i) {
             return Some(f);
         }
         let insns = self.insns;
@@ -1490,6 +1991,197 @@ impl Fusion<'_> {
 }
 
 impl Fusion<'_> {
+    /// Whether instructions `i + 1 .. i + len` exist, are reachable and
+    /// aren't jump targets, so `i .. i + len` can be one group.
+    fn group(&self, i: usize, len: usize) -> bool {
+        i + len <= self.insns.len()
+            && (i + 1..i + len).all(|j| !self.is_target[j] && self.ins[j].is_some())
+    }
+
+    /// A comparison and the `JumpIfTrue` / `JumpIfFalse` consuming its
+    /// boolean, as one compare-and-branch stencil (`tlt_jf_ii_u0`, …),
+    /// when the boolean is dead after the jump. Also `BitAndSmi k;
+    /// TestEqualSmi 0; JumpIf…` on an int32, as `test` + branch
+    /// (`tstz_jt_i`). None of these exits.
+    fn compare_jump(&self, i: usize) -> Option<Fused> {
+        let insns = self.insns;
+        let st = self.ins[i].as_ref()?;
+        let polarity = |op: Op| match op {
+            Op::JumpIfTrue => Some("jt"),
+            Op::JumpIfFalse => Some("jf"),
+            _ => None,
+        };
+        let step = |name: String, imm: i32, reg: u8| FusedStep {
+            name,
+            imm,
+            reg,
+            insn: i,
+            undo: None,
+        };
+        let fused = |len: usize, steps: Vec<FusedStep>| Fused {
+            len,
+            steps,
+            ldar: String::new(),
+            acc_live_after: false,
+        };
+        if insns[i].op == Op::BitAndSmi
+            && st.acc == Ty::I32
+            && self.group(i, 3)
+            && insns[i + 1].op == Op::TestEqualSmi
+            && insns[i + 1].imm == 0
+            && let Some(pol) = polarity(insns[i + 2].op)
+            && !self.live_out[i + 2]
+        {
+            return Some(fused(
+                3,
+                vec![step(format!("tstz_{pol}_i"), insns[i].imm, 0)],
+            ));
+        }
+        if !self.group(i, 2) || self.live_out[i + 1] {
+            return None;
+        }
+        let pol = polarity(insns[i + 1].op)?;
+        let mut steps = Vec::new();
+        let name = match insns[i].op {
+            Op::TestLessThan | Op::TestEqual => {
+                let base = if insns[i].op == Op::TestLessThan {
+                    "tlt"
+                } else {
+                    "teq"
+                };
+                let r = insns[i].reg;
+                let loc = self.homes[r as usize].loc();
+                match pair_case(st.acc, st.regs[r as usize]) {
+                    "" => {
+                        if let Some(b) = box_acc_piece(st.acc) {
+                            steps.push(step(b.stencil.stencil.name.to_string(), 0, 0));
+                        }
+                        format!("{base}_{pol}_{loc}")
+                    }
+                    case => format!("{base}_{pol}_{case}_{loc}"),
+                }
+            }
+            Op::TestEqualSmi => match num_case(st.acc) {
+                "" => format!("teq_smi_{pol}"),
+                case => format!("teq_smi_{pol}_{case}"),
+            },
+            _ => return None,
+        };
+        steps.push(step(name, insns[i].imm, insns[i].reg));
+        Some(fused(2, steps))
+    }
+
+    /// Groups starting with `ldar a` where `a` is an unboxed int32 slot,
+    /// which work on the slots and skip `acc`:
+    ///
+    /// - `ldar a; TestLessThan b | TestEqual b; JumpIf…` with `b` an int32
+    ///   slot too: `tlt_jf_u<a>_u<b>`, … (`cmp`, branch).
+    /// - `ldar a; TestEqualSmi k; JumpIf…`: `teq_smi_jf_u<a>`, ….
+    /// - `ldar a; BitAndSmi k; TestEqualSmi 0; JumpIf…`: `tstz_jf_u<a>`, ….
+    ///
+    /// each when `acc` is dead after the jump; and
+    ///
+    /// - `ldar a; BitAndSmi k | BitOrSmi k; star b` with `b` an int32 slot:
+    ///   `mov_u<b>_u<a>` (unless `a` is `b`), then `andi_u<b>` / `ori_u<b>`
+    ///   (nothing for `& -1` and `| 0`), then `ldar_u<b>` if `acc` is live.
+    ///
+    /// None of these exits.
+    fn int_slot_ops(&self, i: usize) -> Option<Fused> {
+        let insns = self.insns;
+        if insns[i].op != Op::Ldar {
+            return None;
+        }
+        let a = insns[i].reg as usize;
+        let Home::Int(sa) = self.homes[a] else {
+            return None;
+        };
+        let polarity = |k: usize| match insns.get(k).map(|n| n.op) {
+            Some(Op::JumpIfTrue) => Some("jt"),
+            Some(Op::JumpIfFalse) => Some("jf"),
+            _ => None,
+        };
+        let step = |name: String, imm: i32| FusedStep {
+            name,
+            imm,
+            reg: 0,
+            insn: i,
+            undo: None,
+        };
+        let fused = |len: usize, steps: Vec<FusedStep>, ldar: String, live: bool| Fused {
+            len,
+            steps,
+            ldar,
+            acc_live_after: live,
+        };
+        let op1 = insns.get(i + 1).map(|n| n.op);
+        let int_slot = |k: usize, r: usize| match self.homes[r] {
+            Home::Int(sr) if self.ins[k].as_ref().is_some_and(|st| st.regs[r] == Ty::I32) => {
+                Some(sr)
+            }
+            _ => None,
+        };
+        // A compare and branch, `acc` dead after.
+        if self.group(i, 3)
+            && let Some(pol) = polarity(i + 2)
+            && !self.live_out[i + 2]
+        {
+            let name = match op1 {
+                Some(Op::TestLessThan | Op::TestEqual) => {
+                    let b = insns[i + 1].reg as usize;
+                    let sb = int_slot(i + 1, b)?;
+                    let base = if op1 == Some(Op::TestLessThan) {
+                        "tlt"
+                    } else {
+                        "teq"
+                    };
+                    Some((format!("{base}_{pol}_u{sa}_u{sb}"), 0))
+                }
+                Some(Op::TestEqualSmi) => Some((format!("teq_smi_{pol}_u{sa}"), insns[i + 1].imm)),
+                _ => None,
+            };
+            if let Some((name, imm)) = name {
+                return Some(fused(3, vec![step(name, imm)], String::new(), false));
+            }
+        }
+        if self.group(i, 4)
+            && op1 == Some(Op::BitAndSmi)
+            && insns[i + 2].op == Op::TestEqualSmi
+            && insns[i + 2].imm == 0
+            && let Some(pol) = polarity(i + 3)
+            && !self.live_out[i + 3]
+        {
+            let name = format!("tstz_{pol}_u{sa}");
+            return Some(fused(
+                4,
+                vec![step(name, insns[i + 1].imm)],
+                String::new(),
+                false,
+            ));
+        }
+        // A bitwise operation from slot to slot.
+        if self.group(i, 3)
+            && matches!(op1, Some(Op::BitAndSmi | Op::BitOrSmi))
+            && insns[i + 2].op == Op::Star
+        {
+            let b = insns[i + 2].reg as usize;
+            let Home::Int(sb) = self.homes[b] else {
+                return None;
+            };
+            let k = insns[i + 1].imm;
+            let mut steps = Vec::new();
+            if sa != sb {
+                steps.push(step(format!("mov_u{sb}_u{sa}"), 0));
+            }
+            match (op1, k) {
+                (Some(Op::BitAndSmi), -1) | (Some(Op::BitOrSmi), 0) => {}
+                (Some(Op::BitAndSmi), _) => steps.push(step(format!("andi_u{sb}"), k)),
+                _ => steps.push(step(format!("ori_u{sb}"), k)),
+            }
+            return Some(fused(3, steps, format!("ldar_u{sb}"), self.live_out[i + 2]));
+        }
+        None
+    }
+
     /// `ldar a; add b1; …; add bn; star c` (n ≥ 1) as `c = a` (a slot move,
     /// skipped when `c == a`) followed by in-place `c += b_k` stencils.
     ///
@@ -1533,6 +2225,7 @@ impl Fusion<'_> {
         let step = |name: String, insn: usize, undo: Option<(String, i32)>| FusedStep {
             name,
             imm: 0,
+            reg: 0,
             insn,
             undo,
         };
@@ -1743,6 +2436,7 @@ impl JitCode {
         actual: TypeState,
         widened: &HashSet<usize>,
         opts: Options,
+        props: &[Prop],
     ) -> JitCode {
         let n = insns.len();
         let nregs = actual.regs.len();
@@ -1771,9 +2465,34 @@ impl JitCode {
         // int32 to double, so it can't make an FP-pinned register `Any`, but
         // it can turn an int-pinned one double; then unpin it and retry.
         let unpinned = vec![false; nregs];
+        let acc_live = acc_liveness(insns, &reach).0;
+        // An add right before a bitwise operation, with no jump target in
+        // between: the add's result is `acc`, which the bitwise operation
+        // overwrites, so that is its only use.
+        let is_target = {
+            let mut t = vec![false; n];
+            for insn in insns.iter().filter(|insn| insn.jumps()) {
+                t[insn.target] = true;
+            }
+            t
+        };
+        let wraps: Vec<bool> = (0..n)
+            .map(|i| {
+                matches!(insns[i].op, Op::Add | Op::AddSmi | Op::Inc)
+                    && !insns[i].bail
+                    && i + 1 < n
+                    && !is_target[i + 1]
+                    && !insns[i + 1].bail
+                    && matches!(insns[i + 1].op, Op::BitAndSmi | Op::BitOrSmi)
+            })
+            .collect();
         let spec1 = Spec {
             widened,
             pinned: &unpinned,
+            acc_live: &acc_live,
+            reg_live: &live_in,
+            props,
+            wraps: &wraps,
         };
         let ins1 = infer(insns, entry, actual_live.clone(), &spec1);
         let no_widening = HashSet::new();
@@ -1804,8 +2523,8 @@ impl JitCode {
                 entry,
                 entry_state,
                 &Spec {
-                    widened,
                     pinned: &pinned,
+                    ..spec1
                 },
             );
             let strays = |r: usize, ok: Ty| {
@@ -1827,8 +2546,8 @@ impl JitCode {
         };
         let pinned: Vec<bool> = homes.iter().map(|h| matches!(h, Home::Fpr(_))).collect();
         let spec = Spec {
-            widened,
             pinned: &pinned,
+            ..spec1
         };
         let sel: Vec<Option<Sel>> = (0..n)
             .map(|i| ins[i].as_ref().map(|st| select(&insns[i], i, st, &spec)))
@@ -1911,6 +2630,7 @@ impl JitCode {
                     let piece = Piece {
                         jump: if k + 1 == n_steps { jump } else { Target::Next },
                         exit: step.insn,
+                        reg: step.reg,
                         ..Piece::with_imm(&step.name, step.imm)
                     };
                     if piece.uses(Sym::Exit) {
@@ -1937,13 +2657,15 @@ impl JitCode {
                 if f.acc_live_after {
                     hot.push(Piece::new(&f.ldar, 0));
                 }
-                names[i] = Some(
+                names[i] = Some(if f.steps.is_empty() {
+                    "-".into()
+                } else {
                     f.steps
                         .iter()
                         .map(|s| s.name.as_str())
                         .collect::<Vec<_>>()
-                        .join("+"),
-                );
+                        .join("+")
+                });
                 i += f.len;
                 continue;
             }
@@ -1955,14 +2677,39 @@ impl JitCode {
                 Target::Next
             };
             hot.extend(pre);
+            // `mod_smi_pow2` takes the mask, k - 1; the other specialized
+            // `mod_smi` stencils take k and ⌈2^64 / k⌉.
+            let (imm, imm64, imm64b) = match (name.as_str(), props.get(i).copied()) {
+                (n, _) if n.starts_with("mod_smi_pow2") => (insn.imm - 1, 0, 0),
+                ("mod_smi_i" | "mod_smi_iif", _) => (insn.imm, u64::MAX / insn.imm as u64 + 1, 0),
+                ("bail", _) => (0, 0, 0),
+                (_, Some(Prop::Own { shape, off } | Prop::Oop { shape, off })) => (off, shape, 0),
+                (_, Some(Prop::Proto { shape, addr })) => (0, shape, addr),
+                (
+                    _,
+                    Some(Prop::Transition {
+                        shape,
+                        new_shape,
+                        off,
+                    }),
+                ) => (off, shape, new_shape),
+                (
+                    _,
+                    Some(Prop::Global {
+                        shape, global, off, ..
+                    }),
+                ) => (off, shape, global),
+                _ => (insn.imm, 0, 0),
+            };
             let main = Piece {
                 reg: insn.reg,
                 jump,
                 exit: i,
-                ..Piece::with_imm(&name, insn.imm)
+                imm64,
+                imm64b,
+                ..Piece::with_imm(&name, imm)
             };
             if main.uses(Sym::Exit) {
-                assert_ne!(st.acc, Ty::F64, "exits happen at int32 operations");
                 // `add_smi_i` adds in place; undo it before anything else.
                 let mut seq: Vec<Piece> = Vec::new();
                 if name == "add_smi_i" {
@@ -2090,6 +2837,8 @@ impl JitCode {
             for r in s.stencil.relocs.iter().filter(|r| (r.0 as usize) < len) {
                 let value = match r.2 {
                     Sym::HoleImm => p.imm as u32 as u64,
+                    Sym::HoleImm64 => p.imm64,
+                    Sym::HoleImm64b => p.imm64b,
                     Sym::HoleReg => p.reg as u64 * size_of::<Value>() as u64,
                     Sym::Continue => base + cont as u64,
                     Sym::JumpTarget => base + jump as u64,
@@ -2263,16 +3012,44 @@ pub struct JitFunction {
     back_edges_left: i64,
     calls: u32,
     pub stats: JitStats,
+    /// For a function of a VM program (see [`JitFunction::for_vm`]).
+    vm: Option<Box<VmState>>,
 }
 
 /// After this many compilations in one run, finish in the interpreter.
 const MAX_COMPILES: u32 = 16;
 
+/// What the JIT keeps for a function in VM frames.
+struct VmState {
+    feedback: Feedback,
+    /// The instructions as compiled: `insns` plus a bail at each property
+    /// access whose cache held nothing usable, or that exited too often.
+    insns: Vec<Insn>,
+    props: Vec<Prop>,
+    /// `insns` need rebuilding (a property access was given up).
+    stale: bool,
+    /// The prototype epoch the versions were compiled under: a prototype's
+    /// slot addresses are only valid while it holds.
+    epoch: u32,
+    /// Exits per property instruction; past [`MAX_PROPERTY_EXITS`] it is
+    /// compiled as a bail.
+    property_exits: HashMap<usize, u32>,
+    /// Exits through a bail per entry; past [`MAX_BAIL_EXITS`] the entry is
+    /// left to the interpreter (a loop that calls, say).
+    bail_exits: HashMap<usize, u32>,
+    no_entry: HashSet<usize>,
+}
+
+const MAX_PROPERTY_EXITS: u32 = 4;
+const MAX_BAIL_EXITS: u32 = 3;
+/// Compilations per function in VM frames, over the program's run.
+const MAX_VM_COMPILES: u32 = 32;
+
 impl JitFunction {
     /// Prepare `code`, to start in the interpreter and tier up with the
     /// default [`Tiering`]. Panics on malformed bytecode.
     pub fn new(code: &[u8]) -> JitFunction {
-        let insns = decode(code);
+        let insns = decode(code, false);
         assert!(!insns.is_empty(), "empty bytecode");
         let nregs = insns
             .iter()
@@ -2280,6 +3057,10 @@ impl JitFunction {
             .map(|i| i.reg as usize + 1)
             .max()
             .unwrap_or(0);
+        JitFunction::new_from(code, insns, nregs)
+    }
+
+    fn new_from(code: &[u8], insns: Vec<Insn>, nregs: usize) -> JitFunction {
         JitFunction {
             code: code.to_vec(),
             insns,
@@ -2298,6 +3079,112 @@ impl JitFunction {
             back_edges_left: Tiering::default().back_edges,
             calls: 0,
             stats: JitStats::default(),
+            vm: None,
+        }
+    }
+
+    /// Prepare `code`, a function of a VM program with `nregs` registers,
+    /// for on-stack replacement from its frames ([`JitFunction::vm_enter`]).
+    /// Instructions the JIT doesn't compile (calls, allocation, `return`)
+    /// become exits to the interpreter, as do property accesses whose
+    /// inline cache holds nothing usable when compiling.
+    pub(crate) fn for_vm(code: &[u8], nregs: usize, feedback: Feedback) -> JitFunction {
+        let insns = decode(code, true);
+        let mut f = JitFunction::new_from(code, insns, nregs);
+        f.tiering = None;
+        f.vm = Some(Box::new(VmState {
+            feedback,
+            insns: Vec::new(),
+            props: Vec::new(),
+            stale: true,
+            epoch: 0,
+            property_exits: HashMap::new(),
+            bail_exits: HashMap::new(),
+            no_entry: HashSet::new(),
+        }));
+        f
+    }
+
+    /// Run compiled code for a VM frame's registers `regs`, entering at the
+    /// loop header at bytecode offset `pc` with `acc`, compiling a version
+    /// if needed. Returns where the interpreter resumes, or `None` if this
+    /// entry isn't compiled (leave the frame to the interpreter). `epoch` is
+    /// the VM's prototype epoch: versions compiled under another are dropped.
+    ///
+    /// Exits: at an int32 operation, the instruction is widened (as in
+    /// [`JitFunction::run`]); at a property access, the interpreter updates
+    /// its cache and the versions are dropped, to recompile from it; at a
+    /// bail, nothing changes, but an entry that keeps bailing is given up.
+    ///
+    /// # Safety
+    /// `regs` must be the frame's registers, holding values of the program
+    /// whose inline caches and objects the `Feedback` points to.
+    pub(crate) unsafe fn vm_enter(
+        &mut self,
+        pc: usize,
+        mut acc: Value,
+        regs: &mut [Value],
+        epoch: u32,
+    ) -> Option<(usize, Value)> {
+        let entry = self.index_of(pc);
+        {
+            let vm = self.vm.as_mut().expect("a VM function");
+            if vm.no_entry.contains(&entry) || self.stats.compiles >= MAX_VM_COMPILES {
+                return None;
+            }
+            // The inline caches as they are now; versions compiled from
+            // other contents, or under another prototype epoch, are dropped.
+            let props: Vec<Prop> = self
+                .insns
+                .iter()
+                .map(|insn| vm.feedback.prop(insn, epoch))
+                .collect();
+            if vm.stale || vm.epoch != epoch || props != vm.props {
+                self.versions.clear();
+                vm.epoch = epoch;
+                vm.insns = self.insns.clone();
+                for (k, insn) in vm.insns.iter_mut().enumerate() {
+                    let uncached = matches!(
+                        insn.op,
+                        Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal
+                    ) && props[k] == Prop::None;
+                    let given_up = vm
+                        .property_exits
+                        .get(&k)
+                        .is_some_and(|&n| n >= MAX_PROPERTY_EXITS);
+                    if uncached || given_up {
+                        insn.bail = true;
+                    }
+                }
+                vm.props = props;
+                vm.stale = false;
+            }
+        }
+        let actual = self.entry_types(entry, acc, regs);
+        let index = self.version(entry, &actual, &mut acc, regs);
+        let code = &self.versions[&entry][index].1;
+        match unsafe { code.enter(acc, regs) } {
+            Outcome::Return(_) => unreachable!("VM functions return in the interpreter"),
+            Outcome::Exit { pc: exit_pc, acc } => {
+                self.stats.exits += 1;
+                let k = self.index_of(exit_pc);
+                let vm = self.vm.as_mut().unwrap();
+                let insn = vm.insns[k];
+                if insn.bail {
+                    let n = vm.bail_exits.entry(entry).or_insert(0);
+                    *n += 1;
+                    if *n >= MAX_BAIL_EXITS {
+                        vm.no_entry.insert(entry);
+                    }
+                } else if insn.is_property() {
+                    *vm.property_exits.entry(k).or_insert(0) += 1;
+                    vm.stale = true;
+                } else {
+                    self.widened.insert(k);
+                    self.versions.clear();
+                }
+                Some((exit_pc, acc))
+            }
         }
     }
 
@@ -2408,8 +3295,13 @@ impl JitFunction {
                     (actual.clone(), seen)
                 };
                 self.stats.compiles += 1;
-                let code =
-                    JitCode::compile(&self.insns, entry, state.clone(), &self.widened, self.opts);
+                let code = {
+                    let (insns, props): (&[Insn], &[Prop]) = match &self.vm {
+                        Some(vm) => (&vm.insns, &vm.props),
+                        None => (&self.insns, &[]),
+                    };
+                    JitCode::compile(insns, entry, state.clone(), &self.widened, self.opts, props)
+                };
                 let vs = self.versions.entry(entry).or_insert(keep);
                 vs.push((state, code));
                 vs.len() - 1
@@ -2523,6 +3415,51 @@ impl JitFunction {
 /// As [`crate::interp::run`].
 pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
     unsafe { JitFunction::new(code).run(regs) }
+}
+
+/// On-stack replacement for a VM frame (see `interp::run_script`): run
+/// `code`'s compiled version for the loop header at bytecode offset `pc`
+/// over the frame's registers, if it is compiled (or compiles now). Returns
+/// where the interpreter resumes.
+///
+/// # Safety
+/// `regs` must be a live frame of `code` in `vm`.
+pub(crate) unsafe fn vm_osr(
+    vm: &mut crate::vm::Vm,
+    code: &crate::vm::Code,
+    regs: *mut Value,
+    pc: usize,
+    acc: Value,
+) -> (usize, Value) {
+    let mut slot = code.jit.borrow_mut();
+    let f = slot.get_or_insert_with(|| {
+        let feedback = Feedback {
+            ics: code.ics.as_ptr().cast(),
+            global: vm.global,
+        };
+        Box::new(JitFunction::for_vm(
+            &code.bytecode,
+            code.nregs as usize,
+            feedback,
+        ))
+    });
+    let regs = unsafe { std::slice::from_raw_parts_mut(regs, code.nregs as usize) };
+    let compiles = f.stats.compiles;
+    let r = unsafe { f.vm_enter(pc, acc, regs, vm.proto_epoch) };
+    // Debugging: `TOI_JIT_LOG` prints each compilation's stencils;
+    // `TOI_JIT_DUMP=<file>` writes the last one's hot code.
+    if f.stats.compiles != compiles
+        && let Some(c) = f.last_code()
+    {
+        if std::env::var_os("TOI_JIT_LOG").is_some() {
+            let names: Vec<&str> = c.stencils.iter().flatten().map(String::as_str).collect();
+            eprintln!("jit {} @{pc}: {}", code.name, names.join(" "));
+        }
+        if let Some(path) = std::env::var_os("TOI_JIT_DUMP") {
+            std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
+        }
+    }
+    r.unwrap_or((pc, acc))
 }
 
 #[cfg(test)]

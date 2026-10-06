@@ -8,7 +8,8 @@
 //! 3. On arm64, fold trailing branch stubs ([`fold_arm64_stubs`]) and
 //!    invert conditional branches over lone jumps
 //!    ([`invert_arm64_branch_over_jump`]). On x86-64, fold the trailing stubs
-//!    that `asm goto` labels become ([`fold_x86_stubs`]).
+//!    that `asm goto` labels become ([`fold_x86_stubs`]), and make a final
+//!    two-way branch end in the continuation ([`swap_x86_final_branch`]).
 //! 4. On arm64, compact each family of per-slot variants into one template
 //!    whose register fields the JIT patches ([`compact_arm64`]).
 //! 5. Write `$OUT_DIR/stencils.rs`, included by `src/jit.rs`.
@@ -117,7 +118,10 @@ fn main() {
                 fold_arm64_stubs(&name, &mut code, &mut relocs);
                 invert_arm64_branch_over_jump(&mut code, &mut relocs);
             }
-            "x86_64" => fold_x86_stubs(&mut code, &mut relocs),
+            "x86_64" => {
+                fold_x86_stubs(&mut code, &mut relocs);
+                swap_x86_final_branch(&mut code, &mut relocs);
+            }
             _ => {}
         }
         relocs.sort_by_key(|r| r.offset);
@@ -206,6 +210,8 @@ fn emit(entries: &[Entry]) -> String {
         for r in &e.relocs {
             let symbol = match r.symbol.as_str() {
                 "toi_hole_imm" => "Sym::HoleImm".to_string(),
+                "toi_hole_imm64" => "Sym::HoleImm64".to_string(),
+                "toi_hole_imm64b" => "Sym::HoleImm64b".to_string(),
                 "toi_hole_reg" => "Sym::HoleReg".to_string(),
                 "toi_continue" => "Sym::Continue".to_string(),
                 "toi_jump_target" => "Sym::JumpTarget".to_string(),
@@ -597,6 +603,57 @@ fn delete_insn(code: &mut Vec<u8>, relocs: &mut [Reloc], y: usize) {
 
 const R_X86_64_PC32: u32 = 2;
 const R_X86_64_PLT32: u32 = 4;
+
+/// A stencil that branches both ways at its end, `jcc toi_continue; jmp X`,
+/// can't have its final jump trimmed: it goes to `X`, not the continuation.
+/// LLVM produces it for `if !c { become X(..) } become toi_continue(..)`,
+/// where it keeps the positive comparison and swaps the successors. Rewrite
+/// it to `j!cc X; jmp toi_continue` by flipping the condition (the low bit
+/// of the `0F 8x` opcode) and swapping the two relocations: the same branch
+/// with its arms exchanged, valid for any condition. Skipped if a local jump
+/// targets the final `jmp`.
+fn swap_x86_final_branch(code: &mut [u8], relocs: &mut [Reloc]) {
+    let n = code.len();
+    if n < 11
+        || code[n - 5] != 0xE9
+        || code[n - 11] != 0x0F
+        || !(0x80..=0x8F).contains(&code[n - 10])
+    {
+        return;
+    }
+    let at = |off: usize| relocs.iter().position(|r| r.offset == off as u64);
+    let (Some(jcc), Some(jmp)) = (at(n - 9), at(n - 4)) else {
+        return;
+    };
+    if relocs[jcc].symbol != "toi_continue" || relocs[jmp].symbol == "toi_continue" {
+        return;
+    }
+    let last = (n - 5) as i64;
+    let covered = |p: usize| {
+        relocs
+            .iter()
+            .any(|r| (r.offset as usize..r.offset as usize + 4).contains(&p))
+    };
+    let jumped_to = (0..n - 5).any(|p| {
+        let short = ((0x70..=0x7F).contains(&code[p]) || code[p] == 0xEB)
+            && p + 1 < n
+            && p as i64 + 2 + code[p + 1] as i8 as i64 == last;
+        let long = p + 5 <= n
+            && !covered(p + 1)
+            && (code[p] == 0xE9
+                || (p >= 1 && code[p - 1] == 0x0F && (0x80..=0x8F).contains(&code[p])))
+            && p as i64 + 5 + i32::from_le_bytes(code[p + 1..p + 5].try_into().unwrap()) as i64
+                == last;
+        short || long
+    });
+    if jumped_to {
+        return;
+    }
+    code[n - 10] ^= 1;
+    let (a, b) = (relocs[jcc].symbol.clone(), relocs[jmp].symbol.clone());
+    relocs[jcc].symbol = b;
+    relocs[jmp].symbol = a;
+}
 
 /// x86-64 counterpart of [`fold_arm64_stubs`], for stencils using `asm goto`
 /// (immediates folded into `add` / `cmp`, see `stencils/stencils.rs`). A

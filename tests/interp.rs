@@ -5,7 +5,7 @@
 //! the interpreter, tiering up at a loop's third back edge).
 //! They must agree on the result and on the final register file.
 
-use toi::bytecode::Assembler;
+use toi::bytecode::{Arg, Assembler, Op};
 use toi::jit::{JitFunction, Tiering};
 use toi::value::Value;
 
@@ -26,6 +26,18 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
     let code = a.finish();
     let initial = regs.to_vec();
     let interp = unsafe { toi::interp::run(&code, regs) };
+    // With superinstructions (see `bytecode::quicken`): the same results.
+    let mut quick = code.clone();
+    toi::bytecode::quicken(&mut quick);
+    let mut quick_regs = initial.clone();
+    let q = unsafe { toi::interp::run(&quick, &mut quick_regs) };
+    assert!(
+        same(interp, q),
+        "interp returned {interp:?}, quickened {q:?}"
+    );
+    for (r, (i, j)) in regs.iter().zip(&quick_regs).enumerate() {
+        assert!(same(*i, *j), "r{r}: interp {i:?}, quickened {j:?}");
+    }
     for (name, mut f) in [
         ("jit1", JitFunction::new(&code).eager().unspecialized()),
         (
@@ -1139,4 +1151,282 @@ fn tiering_is_the_default() {
         Some((n * (n - 1) / 2) as f64)
     );
     assert_eq!(long.stats.osr_entries, 1);
+}
+
+// ---- Numeric operations, comparisons and boolean jumps ----
+
+fn emit(a: &mut Assembler, op: Op, args: &[Arg]) {
+    a.emit(op, args);
+}
+
+/// Values of every kind the numeric operations distinguish.
+fn sample_values() -> Vec<Value> {
+    let mut v: Vec<Value> = [0, 1, -1, 7, -6, -7, 1024, i32::MIN, i32::MAX]
+        .into_iter()
+        .map(Value::from_i32)
+        .collect();
+    v.extend(
+        [
+            2.5,
+            -0.0,
+            -6.0,
+            7.75,
+            f64::NAN,
+            f64::INFINITY,
+            -1e20,
+            1e300,
+            4294967301.0,
+        ]
+        .into_iter()
+        .map(Value::from_f64),
+    );
+    v.extend([Value::UNDEFINED, Value::NULL, Value::TRUE, Value::FALSE]);
+    v
+}
+
+#[test]
+fn immediate_operations_agree_on_every_kind_of_value() {
+    // `ldar r0; <op> k; return`, entered with each value in r0: the JIT
+    // specializes on its type (int32, double or any).
+    let ops = [Op::ModSmi, Op::BitAndSmi, Op::BitOrSmi, Op::TestEqualSmi];
+    for op in ops {
+        for k in [3, 8, 1, -3, 0, 7, i32::MIN] {
+            for v in sample_values() {
+                let mut a = Assembler::new();
+                a.ldar(0);
+                emit(&mut a, op, &[Arg::Imm(k)]);
+                a.ret();
+                exec(a, &mut [v]);
+            }
+        }
+    }
+}
+
+#[test]
+fn comparisons_agree_on_every_pair_of_values() {
+    for op in [Op::TestLessThan, Op::TestEqual] {
+        for l in sample_values() {
+            for r in sample_values() {
+                // As a value, and fused with each conditional jump.
+                let mut a = Assembler::new();
+                a.ldar(1);
+                emit(&mut a, op, &[Arg::Reg(0)]);
+                a.ret();
+                exec(a, &mut [l, r]);
+                for jump in [Op::JumpIfTrue, Op::JumpIfFalse] {
+                    let mut a = Assembler::new();
+                    let yes = a.label();
+                    a.ldar(1);
+                    emit(&mut a, op, &[Arg::Reg(0)]);
+                    emit(&mut a, jump, &[Arg::Label(yes)]);
+                    a.lda_smi(0).ret();
+                    a.bind(yes);
+                    a.lda_smi(1).ret();
+                    exec(a, &mut [l, r]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn to_boolean_jumps_agree_on_every_kind_of_value() {
+    for jump in [
+        Op::JumpIfToBooleanTrue,
+        Op::JumpIfToBooleanFalse,
+        Op::JumpIfTrue,
+        Op::JumpIfFalse,
+    ] {
+        for v in sample_values() {
+            let mut a = Assembler::new();
+            let yes = a.label();
+            a.ldar(0);
+            emit(&mut a, jump, &[Arg::Label(yes)]);
+            a.lda_smi(0).ret();
+            a.bind(yes);
+            a.lda_smi(1).ret();
+            exec(a, &mut [v]);
+        }
+    }
+}
+
+/// A loop over `i` in `0..n` using every numeric operation, with each
+/// comparison followed by the jump that consumes it:
+///
+/// ```text
+/// a = i % 7; b = i & 15
+/// if (b < a) n += 1
+/// if ((i & 3) == 0) n += 2
+/// if (a == b) n += 4
+/// if (b == 5) n = (n | 1) + 8
+/// ```
+fn numeric_loop(n: i32, modulus: i32) -> Assembler {
+    let (i, cnt, ra, rb) = (0u8, 1u8, 2u8, 3u8);
+    let mut a = Assembler::new();
+    let top = a.label();
+    let (s1, s2, s3, s4) = (a.label(), a.label(), a.label(), a.label());
+    a.lda_smi(0).star(i).star(cnt);
+    a.bind(top);
+    a.ldar(i);
+    emit(&mut a, Op::ModSmi, &[Arg::Imm(modulus)]);
+    a.star(ra);
+    a.ldar(i);
+    emit(&mut a, Op::BitAndSmi, &[Arg::Imm(15)]);
+    a.star(rb);
+    a.ldar(ra);
+    emit(&mut a, Op::TestLessThan, &[Arg::Reg(rb)]);
+    emit(&mut a, Op::JumpIfFalse, &[Arg::Label(s1)]);
+    a.ldar(cnt).inc().star(cnt);
+    a.bind(s1);
+    a.ldar(i);
+    emit(&mut a, Op::BitAndSmi, &[Arg::Imm(3)]);
+    emit(&mut a, Op::TestEqualSmi, &[Arg::Imm(0)]);
+    emit(&mut a, Op::JumpIfFalse, &[Arg::Label(s2)]);
+    a.ldar(cnt).add_smi(2).star(cnt);
+    a.bind(s2);
+    a.ldar(rb);
+    emit(&mut a, Op::TestEqual, &[Arg::Reg(ra)]);
+    emit(&mut a, Op::JumpIfFalse, &[Arg::Label(s3)]);
+    a.ldar(cnt).add_smi(4).star(cnt);
+    a.bind(s3);
+    a.ldar(rb);
+    emit(&mut a, Op::TestEqualSmi, &[Arg::Imm(5)]);
+    emit(&mut a, Op::JumpIfFalse, &[Arg::Label(s4)]);
+    a.ldar(cnt);
+    emit(&mut a, Op::BitOrSmi, &[Arg::Imm(1)]);
+    a.add_smi(8).star(cnt);
+    a.bind(s4);
+    a.ldar(i).inc().star(i).jump_if_less_smi(n, top);
+    a.ldar(cnt).ret();
+    a
+}
+
+#[test]
+fn numeric_loop_fuses_compares_with_branches() {
+    for modulus in [7, 8] {
+        let a = numeric_loop(1000, modulus);
+        let v = exec(a.clone(), &mut [Value::UNDEFINED; 4]);
+        let (w, f) = jit(&a, &mut [Value::UNDEFINED; 4]);
+        assert_eq!(v, w);
+        assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
+        let s = stencils(&f);
+        let mod_stencil = if modulus == 8 {
+            "mod_smi_pow2_i"
+        } else {
+            "mod_smi_i"
+        };
+        for want in [mod_stencil, "bit_and_smi_i", "bit_or_smi_i"] {
+            assert!(
+                s.iter()
+                    .any(|n| n == want || n.starts_with(&format!("{want}_k16"))),
+                "{want}: {s:?}"
+            );
+        }
+        for want in ["tlt_jf_", "tstz_jf_", "teq_jf_", "teq_smi_jf_"] {
+            assert!(s.iter().any(|n| n.starts_with(want)), "{want}: {s:?}");
+        }
+        assert!(
+            !s.iter().any(|n| n.starts_with("test_") || n == "jfalse"),
+            "unfused comparison in {s:?}"
+        );
+    }
+}
+
+#[test]
+fn a_live_boolean_is_not_fused_away() {
+    // The comparison's boolean is still read after the jump (returned), so
+    // the pair can't become a bare compare-and-branch.
+    let mut a = Assembler::new();
+    let out = a.label();
+    a.lda_smi(3).star(0).lda_smi(5);
+    emit(&mut a, Op::TestLessThan, &[Arg::Reg(0)]);
+    emit(&mut a, Op::JumpIfFalse, &[Arg::Label(out)]);
+    a.nop();
+    a.bind(out);
+    a.ret();
+    assert_eq!(exec(a.clone(), &mut [Value::UNDEFINED]), Value::TRUE);
+    let (_, f) = jit(&a, &mut [Value::UNDEFINED]);
+    assert!(has(&stencils(&f), "test_lt_ii"), "{:?}", stencils(&f));
+}
+
+#[test]
+fn negative_zero_remainder_exits_then_produces_doubles() {
+    // `r = i % k` for i from -9 up: the first zero remainder of a negative
+    // dividend (i = -9 for 3, -8 for 4) is -0, a double. One exit; then
+    // the recompiled loop computes remainders as doubles.
+    for k in [3, 4] {
+        let (i, r, sum) = (0u8, 1u8, 2u8);
+        let mut a = Assembler::new();
+        let top = a.label();
+        a.lda_smi(-9).star(i).lda_smi(0).star(sum);
+        a.bind(top);
+        a.ldar(i);
+        emit(&mut a, Op::ModSmi, &[Arg::Imm(k)]);
+        a.star(r).ldar(sum).add(r).star(sum);
+        a.ldar(i).inc().star(i).jump_if_less_smi(10, top);
+        a.ldar(r).ret();
+        let mut regs = [Value::UNDEFINED; 3];
+        let v = exec(a.clone(), &mut regs);
+        assert_eq!(v.as_number(), Some(9.0 % k as f64));
+        let (_, f) = jit(&a, &mut [Value::UNDEFINED; 3]);
+        assert_eq!(f.stats.exits, 1, "k = {k}");
+        let s = stencils(&f);
+        assert!(
+            s.iter()
+                .any(|n| n.starts_with("mod_smi") && n.contains("iif")),
+            "{s:?}"
+        );
+    }
+}
+
+#[test]
+fn comparisons_with_untyped_operands_use_generic_stencils() {
+    // r0 is undefined, r1 an int32 that is compared against it, fused.
+    let mut a = Assembler::new();
+    let yes = a.label();
+    a.ldar(1);
+    emit(&mut a, Op::TestLessThan, &[Arg::Reg(0)]);
+    emit(&mut a, Op::JumpIfTrue, &[Arg::Label(yes)]);
+    a.lda_smi(0).ret();
+    a.bind(yes);
+    a.lda_smi(1).ret();
+    let regs = [Value::UNDEFINED, Value::from_i32(4)];
+    assert_eq!(exec(a.clone(), &mut regs.clone()), Value::from_i32(0));
+    let (_, f) = jit(&a, &mut regs.clone());
+    let s = stencils(&f);
+    assert!(s.iter().any(|n| n.contains("box_iacc+tlt_jt_")), "{s:?}");
+}
+
+#[test]
+fn add_feeding_to_int32_wraps_without_exits() {
+    // s = (s + i) | 0 and t = (t + 1000000007) & -1: the sums leave the
+    // int32 range, and ToInt32 wraps them back. Compiled, the adds wrap in
+    // 32 bits and never exit.
+    let (s, t, i) = (0u8, 1u8, 2u8);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(s).star(t).star(i);
+    a.bind(top);
+    a.ldar(i).add(s);
+    emit(&mut a, Op::BitOrSmi, &[Arg::Imm(0)]);
+    a.star(s);
+    a.ldar(t).add_smi(1_000_000_007);
+    emit(&mut a, Op::BitAndSmi, &[Arg::Imm(-1)]);
+    a.star(t);
+    a.ldar(i).inc().star(i).jump_if_less_smi(100_000, top);
+    a.ldar(s).add(t).ret();
+    let v = exec(a.clone(), &mut [Value::UNDEFINED; 3]);
+    let (mut ws, mut wt) = (0i32, 0i32);
+    for k in 0..100_000 {
+        ws = ws.wrapping_add(k);
+        wt = wt.wrapping_add(1_000_000_007);
+    }
+    assert_eq!(v.as_number(), Some(ws as f64 + wt as f64));
+    let (_, f) = jit(&a, &mut [Value::UNDEFINED; 3]);
+    assert_eq!(f.stats.exits, 0);
+    let s = stencils(&f);
+    assert!(
+        has(&s, "add_wrap_ii") && s.iter().any(|n| n.starts_with("add_smi_wrap_i")),
+        "{s:?}"
+    );
 }

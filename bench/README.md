@@ -57,6 +57,10 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   accesses globals in such a context slowly, which shows in the
   files that use globals (10–16, 28–32, 50–53).
 
+- Hand-written bytecode for some of these files is in
+  [bytecode/](bytecode/), with the conventions a compiler should follow.
+  toi runs it already (`--engine target/release/toi bench/bytecode/*.asm`).
+
 ### Files
 
 | file | pattern |

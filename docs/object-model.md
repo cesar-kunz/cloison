@@ -745,3 +745,36 @@ objects, `{x, y}` points) are where A should be measured.
    bytecode compiler, `Materialize` with VirtualObject descriptors.
 5. **JIT**: property-access stencils fed by inline caches, shape checks as
    exits, VirtualObjects at exits.
+
+### Status
+
+Steps 1 and 2 have started, without a front end: hand-written bytecode
+for five microbenchmarks (`bench/bytecode/`) runs on
+`src/object.rs` (objects, shapes, the heap), `src/vm.rs` (inline-cache
+misses, closures, arrays, natives) and the interpreter (`src/interp.rs`).
+In place:
+
+- Shapes with shared transition trees, roots keyed by class, prototype and
+  in-object capacity, and slack tracking per constructor.
+- Monomorphic inline caches for `GetNamed`, `SetNamed` (including cached
+  transitions to in-object slots), `LdaGlobal` and `StaGlobal`, holding the
+  shape and the location. Prototype loads cache the holder too. Prototypes
+  get unique shapes, and adding a property to one bumps a global
+  epoch that every cached prototype load checks. That is simpler than
+  per-prototype validity cells.
+- Frames on a VM stack, entered and left by tail calls; `Construct` with
+  the `this`-or-object rule; natives (`Array.prototype.push`).
+- The external bit, always set.
+
+Step 5 has started too. Hot call-free loops in VM frames tier up into the
+JIT (on-stack replacement from the interpreter). Property accesses compile
+to stencils fed by the inline caches, with shape guards as exits. The JIT's
+type lattice knows objects of a known shape (`Obj(shape)`), so a guard
+that passed, or a shape seen at entry, isn't checked again. Details and
+numbers: `docs/future-work.md`, "Property access in the JIT, and shape
+types".
+
+Still missing from steps 1–2: a collector (the heap is an arena freed with
+the VM), polymorphic and megamorphic caches, a cache for array `length`,
+property attributes, strings, sloppy-mode `this`, exceptions (`try`),
+closures over variables, and the front end.

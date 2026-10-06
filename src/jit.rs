@@ -756,8 +756,9 @@ impl Insn {
     }
 
     /// What an exit before it records: its frame and bytecode offset
-    /// (below 2^23; see [`AFTER_CALL`]).
+    /// (below 2^22; see [`AFTER_CALL`] and [`BAD_RESULT`]).
     fn exit_record(&self) -> i32 {
+        debug_assert!(self.pc < 1 << 22);
         ((self.frame as u32) << 24 | self.pc as u32) as i32
     }
 
@@ -1079,6 +1080,20 @@ impl Ty {
         }
     }
 
+    /// The prediction for the result of a call into code whose `Return`s
+    /// give `ret`, or `Any` for none. A check after the call establishes
+    /// it. For an object of shape `s` or a descendant, the check is for `s`
+    /// exactly (descendants can't be told apart cheaply): mostly the shape
+    /// hasn't changed, and if it has, the check fails and the call isn't
+    /// predicted again.
+    fn of_result(ret: Ty) -> Ty {
+        match ret {
+            Ty::I32 | Ty::F64 => ret,
+            Ty::Obj(s) | Ty::Ext(s) => Ty::Obj(s),
+            _ => Ty::Any,
+        }
+    }
+
     /// The type of values loaded from a field of type `ft`, and the piece
     /// that puts it in its representation (a number goes to `facc`).
     fn of_field(ft: FieldType) -> (Ty, Option<&'static str>) {
@@ -1145,6 +1160,9 @@ struct Spec<'a> {
     /// For VM functions: each frame's feedback (property names; see
     /// [`lower`] for frames).
     feedback: Option<&'a [Feedback]>,
+    /// Per call instruction, the type its result is predicted to have
+    /// (checked after the call; see [`Ty::of_result`]); `Any` for none.
+    rets: &'a [Ty],
 }
 
 /// What [`select`] decided for one instruction: the stencil family, the
@@ -1161,6 +1179,9 @@ struct Sel {
     /// store's value against the field's type. It exits before the
     /// instruction.
     check: Option<(&'static str, u64)>,
+    /// A piece checking a call's result against its predicted type, with
+    /// its `imm64`. It exits after the call, with the result.
+    result: Option<(&'static str, u64)>,
     /// A piece after the stencil (`unbox_num_acc`).
     post: Option<&'static str>,
 }
@@ -1173,6 +1194,7 @@ impl Sel {
             out,
             ops: None,
             check: None,
+            result: None,
             post: None,
         }
     }
@@ -1253,11 +1275,22 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     *t = Ty::Ext(x);
                 }
             }
-            out.acc = Any;
-            match spec.props.get(i) {
-                Some(Prop::Call { direct: true, .. }) => ("call_direct", ""),
-                _ => ("call", ""),
-            }
+            let base = match spec.props.get(i) {
+                Some(Prop::Call { direct: true, .. }) => "call_direct",
+                _ => "call",
+            };
+            let (acc, result, post) = match spec.rets.get(i).copied().unwrap_or(Any) {
+                I32 => (I32, Some(("check_acc_int", 0)), None),
+                F64 => (F64, Some(("check_acc_num", 0)), Some("unbox_num_acc")),
+                Ty::Obj(s) => (Ty::Obj(s), Some(("check_acc_shape", s)), None),
+                _ => (Any, None, None),
+            };
+            out.acc = acc;
+            return Sel {
+                result,
+                post,
+                ..Sel::new(base, "", out)
+            };
         }
         // ToInt32(a + b) is the 32-bit wrapping add: no exit, no widening.
         Op::Add if wraps && st.acc == I32 && reg == I32 => {
@@ -2608,6 +2641,15 @@ impl Fusion<'_> {
 /// the next instruction: it says nothing about that instruction.
 const AFTER_CALL: i32 = 1 << 23;
 
+/// Set in an after-call exit record by the check of the call's result
+/// against its prediction (see [`Ty::of_result`]): the call shouldn't be
+/// predicted anymore.
+const BAD_RESULT: i32 = 1 << 22;
+
+/// Rounds of type inference that predict direct calls' results (see
+/// [`JitCode::compile`]).
+const MAX_RESULT_ROUNDS: u32 = 3;
+
 /// Value of `ctx` while running: no exit taken.
 const NO_EXIT: u32 = u32::MAX;
 
@@ -2729,6 +2771,9 @@ pub struct JitCode {
     pub stencils: Vec<Option<String>>,
     /// Where each VM register lived.
     pub homes: Vec<Home>,
+    /// What its `Return`s give (the join of `acc`'s types there), `Bot` if
+    /// it never returns: a fact for every value the code returns itself.
+    pub ret: Ty,
     /// For a VM function: the lowering compiled, which exits refer to and
     /// the code's call sites live in. Running code keeps it alive.
     snap: Option<Rc<Snapshot>>,
@@ -2830,80 +2875,126 @@ impl JitCode {
                     && matches!(insns[i + 1].op, Op::BitAndSmi | Op::BitOrSmi)
             })
             .collect();
-        let spec1 = Spec {
-            widened,
-            pinned: &unpinned,
-            acc_live: &acc_live,
-            reg_live: &live_in,
-            props,
-            wraps: &wraps,
-            feedback,
-        };
-        let ins1 = infer(insns, entry, actual_live.clone(), &spec1);
-        let no_widening = HashSet::default();
-        // Registers of inlined frames (from `inline_base`) are assigned
-        // when their frame starts, before anything there can exit, and mean
-        // nothing outside it: they may always be pinned.
-        let pin_ok: Vec<bool> = pinnable(
-            insns,
-            entry,
-            &reach,
-            &live_at_entry,
-            &ins1,
-            widened.unwrap_or(&no_widening),
-        )
-        .into_iter()
-        .enumerate()
-        .map(|(r, ok)| ok || r >= inline_base)
-        .collect();
-        let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
-        let (homes, ins) = loop {
-            let homes = if opts.register_homes {
-                assign_homes(insns, &ins1, nregs, &no_fp, &no_int, &pin_ok)
+        // `this` and the arguments' types at call `i`, in state `st`.
+        let call_types = |i: usize, st: &TypeState| {
+            let insn = &insns[i];
+            let ty = |r: usize| st.regs.get(r).copied().unwrap_or(Ty::Any);
+            let w = insn.reg2 as usize;
+            let (this, first) = if insn.op == Op::Call {
+                (ty(w), w + 1)
             } else {
-                vec![Home::Mem; nregs]
+                (Ty::Any, w)
             };
-            let pinned: Vec<bool> = homes.iter().map(|h| matches!(h, Home::Fpr(_))).collect();
-            let mut entry_state = actual_live.clone();
-            for (r, &p) in pinned.iter().enumerate() {
-                if p && live_at_entry[r] {
-                    entry_state.regs[r] = Ty::F64;
-                }
-            }
-            let ins = infer(
+            let args: Vec<Ty> = (first..first + insn.imm as usize).map(ty).collect();
+            (this, args)
+        };
+        // A direct call's result is predicted from the callee version it
+        // will bind to (see `Ty::of_result`), which depends on the
+        // arguments' types, which may depend on earlier calls' results: run
+        // the passes again until the predictions settle. They are checked
+        // after the calls, so stopping before is safe. Calls whose check
+        // failed before are in `widened`: no prediction.
+        let mut rets = vec![Ty::Any; n];
+        let mut round = 0;
+        let (homes, ins, mut sel) = loop {
+            let spec1 = Spec {
+                widened,
+                pinned: &unpinned,
+                acc_live: &acc_live,
+                reg_live: &live_in,
+                props,
+                wraps: &wraps,
+                feedback,
+                rets: &rets,
+            };
+            let ins1 = infer(insns, entry, actual_live.clone(), &spec1);
+            let no_widening = HashSet::default();
+            // Registers of inlined frames (from `inline_base`) are assigned
+            // when their frame starts, before anything there can exit, and mean
+            // nothing outside it: they may always be pinned.
+            let pin_ok: Vec<bool> = pinnable(
                 insns,
                 entry,
-                entry_state,
-                &Spec {
-                    pinned: &pinned,
-                    ..spec1
-                },
-            );
-            let strays = |r: usize, ok: Ty| {
-                ins.iter()
-                    .flatten()
-                    .any(|st| st.regs[r] != ok && st.regs[r] != Ty::Bot)
-            };
-            let mut retry = false;
-            for (r, h) in homes.iter().enumerate() {
-                match h {
-                    Home::Fpr(_) if strays(r, Ty::F64) => (no_fp[r], retry) = (true, true),
-                    Home::Int(_) if strays(r, Ty::I32) => (no_int[r], retry) = (true, true),
-                    _ => {}
-                }
-            }
-            if !retry {
-                break (homes, ins);
-            }
-        };
-        let pinned: Vec<bool> = homes.iter().map(|h| matches!(h, Home::Fpr(_))).collect();
-        let spec = Spec {
-            pinned: &pinned,
-            ..spec1
-        };
-        let mut sel: Vec<Option<Sel>> = (0..n)
-            .map(|i| ins[i].as_ref().map(|st| select(&insns[i], i, st, &spec)))
+                &reach,
+                &live_at_entry,
+                &ins1,
+                widened.unwrap_or(&no_widening),
+            )
+            .into_iter()
+            .enumerate()
+            .map(|(r, ok)| ok || r >= inline_base)
             .collect();
+            let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
+            let (homes, ins) = loop {
+                let homes = if opts.register_homes {
+                    assign_homes(insns, &ins1, nregs, &no_fp, &no_int, &pin_ok)
+                } else {
+                    vec![Home::Mem; nregs]
+                };
+                let pinned: Vec<bool> = homes.iter().map(|h| matches!(h, Home::Fpr(_))).collect();
+                let mut entry_state = actual_live.clone();
+                for (r, &p) in pinned.iter().enumerate() {
+                    if p && live_at_entry[r] {
+                        entry_state.regs[r] = Ty::F64;
+                    }
+                }
+                let ins = infer(
+                    insns,
+                    entry,
+                    entry_state,
+                    &Spec {
+                        pinned: &pinned,
+                        ..spec1
+                    },
+                );
+                let strays = |r: usize, ok: Ty| {
+                    ins.iter()
+                        .flatten()
+                        .any(|st| st.regs[r] != ok && st.regs[r] != Ty::Bot)
+                };
+                let mut retry = false;
+                for (r, h) in homes.iter().enumerate() {
+                    match h {
+                        Home::Fpr(_) if strays(r, Ty::F64) => (no_fp[r], retry) = (true, true),
+                        Home::Int(_) if strays(r, Ty::I32) => (no_int[r], retry) = (true, true),
+                        _ => {}
+                    }
+                }
+                if !retry {
+                    break (homes, ins);
+                }
+            };
+            let pinned: Vec<bool> = homes.iter().map(|h| matches!(h, Home::Fpr(_))).collect();
+            let spec = Spec {
+                pinned: &pinned,
+                ..spec1
+            };
+            let sel: Vec<Option<Sel>> = (0..n)
+                .map(|i| ins[i].as_ref().map(|st| select(&insns[i], i, st, &spec)))
+                .collect();
+            let want: Vec<Ty> = (0..n)
+                .map(|i| match (&ins[i], props.get(i), widened) {
+                    (
+                        Some(st),
+                        Some(Prop::Call {
+                            site, direct: true, ..
+                        }),
+                        Some(w),
+                    ) if !w.contains(&i) => {
+                        let (this, args) = call_types(i, st);
+                        let site = vm_sites[*site as usize].get();
+                        unsafe { direct_version(site, this, &args) }
+                            .map_or(Ty::Any, |(code, _)| Ty::of_result(code.ret))
+                    }
+                    _ => Ty::Any,
+                })
+                .collect();
+            round += 1;
+            if want == rets || round == MAX_RESULT_ROUNDS {
+                break (homes, ins, sel);
+            }
+            rets = want;
+        };
         // Direct calls: bind each to the callee version for the arguments'
         // types here, or call through the runtime.
         for (i, s) in sel.iter_mut().enumerate() {
@@ -2915,15 +3006,7 @@ impl JitCode {
                 }),
             ) = (s.as_mut(), &ins[i], props.get(i))
             {
-                let insn = &insns[i];
-                let ty = |r: usize| st.regs.get(r).copied().unwrap_or(Ty::Any);
-                let w = insn.reg2 as usize;
-                let (this, first) = if insn.op == Op::Call {
-                    (ty(w), w + 1)
-                } else {
-                    (Ty::Any, w)
-                };
-                let args: Vec<Ty> = (first..first + insn.imm as usize).map(ty).collect();
+                let (this, args) = call_types(i, st);
                 let site = vm_sites[*site as usize].get();
                 if !unsafe { bind_direct(site, this, &args) } {
                     s.base = "call";
@@ -3112,6 +3195,22 @@ impl JitCode {
                 exit: i,
                 ..Piece::new(name, 0)
             });
+            let is_call = name == "call" || name == "call_direct";
+            // The check of a call's result exits after the call too, through
+            // a stub of its own, whose record says the check failed.
+            let result = s.result.map(|(name, imm64)| {
+                let mut seq = spills(&homes);
+                seq.push(Piece {
+                    imm: insns[i + 1].exit_record() | AFTER_CALL | BAD_RESULT,
+                    ..Piece::new("exit", 0)
+                });
+                exits.push((n + i, seq));
+                Piece {
+                    imm64,
+                    exit: n + i,
+                    ..Piece::new(name, 0)
+                }
+            });
             if main.uses(Sym::Exit) || check.is_some() {
                 // `add_smi_i` adds in place; undo it before anything else.
                 let mut seq: Vec<Piece> = Vec::new();
@@ -3123,7 +3222,7 @@ impl JitCode {
                 }
                 // A call exits after it (on an error, or when the callee
                 // changed the code epoch), with its result, boxed, in `acc`.
-                let record = if name == "call" || name == "call_direct" {
+                let record = if is_call {
                     insns[i + 1].exit_record() | AFTER_CALL
                 } else {
                     seq.extend(box_acc_piece(st.acc));
@@ -3138,14 +3237,18 @@ impl JitCode {
             }
             hot.extend(check);
             hot.push(main);
+            hot.extend(result);
             if let Some(post) = s.post {
                 hot.push(Piece::new(post, 0));
             }
-            names[i] = Some(match (s.check, s.post) {
-                (Some((c, _)), _) => format!("{c}+{name}"),
-                (_, Some(p)) => format!("{name}+{p}"),
-                _ => name,
-            });
+            let mut full = match s.check {
+                Some((c, _)) => format!("{c}+{name}"),
+                None => name,
+            };
+            for p in s.result.map(|r| r.0).into_iter().chain(s.post) {
+                full = format!("{full}+{p}");
+            }
+            names[i] = Some(full);
             i += 1;
         }
 
@@ -3311,12 +3414,17 @@ impl JitCode {
         }
 
         mem.seal();
+        let ret = (0..n)
+            .filter(|&i| insns[i].op == Op::Return && insns[i].frame == 0 && !insns[i].bail)
+            .filter_map(|i| ins[i].as_ref())
+            .fold(Ty::Bot, |t, st| t.join(st.acc));
         JitCode {
             mem,
             entry: entry_at,
             main_len,
             stencils: names,
             homes,
+            ret,
             snap: None,
         }
     }
@@ -3479,7 +3587,9 @@ struct VmState {
     /// Per instruction origin (code, bytecode offset), as the interpreter
     /// sees it: int32 operations that overflowed, exits at property
     /// accesses (past [`MAX_PROPERTY_EXITS`] given up), and exits at the
-    /// guard of an inlined call (past it, the call isn't inlined).
+    /// guard of an inlined call (past it, the call isn't inlined). In
+    /// `widened` too: calls whose result failed its predicted type's check
+    /// (no prediction since).
     widened: HashSet<(usize, usize)>,
     property_exits: HashMap<(usize, usize), u32>,
     callee_exits: HashMap<(usize, usize), u32>,
@@ -3559,10 +3669,36 @@ const MAX_DIRECT_EXITS: u32 = 4;
 /// # Safety
 /// `site` must be a live call site of a VM function.
 unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
+    let Some((code, nregs)) = (unsafe { direct_version(site, this, args) }) else {
+        return false;
+    };
     let site = unsafe { &mut *site };
+    match &site.target {
+        Some(bound) => Rc::ptr_eq(bound, &code),
+        None => {
+            site.entry = code.entry_addr();
+            site.span = 8 * (nregs + interp::HEADER) as u64;
+            site.target = Some(code);
+            true
+        }
+    }
+}
+
+/// The version of direct-call candidate `site`'s callee that [`bind_direct`]
+/// would bind it to, with the register count of its frame; compiled if
+/// needed.
+///
+/// # Safety
+/// As [`bind_direct`].
+unsafe fn direct_version(
+    site: *const CallSite,
+    this: Ty,
+    args: &[Ty],
+) -> Option<(Rc<JitCode>, usize)> {
+    let site = unsafe { &*site };
     let (callee, vm) = (site.callee, site.vm);
     let Ok(mut slot) = (unsafe { (*callee).jit.try_borrow_mut() }) else {
-        return false;
+        return None;
     };
     let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, vm)));
     let nparams = site.nparams as usize;
@@ -3581,20 +3717,7 @@ unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
                 .collect(),
         }
     };
-    let Some((code, nregs)) =
-        (unsafe { f.entry_version((*vm).proto_epoch, (*vm).field_epoch, make_state) })
-    else {
-        return false;
-    };
-    match &site.target {
-        Some(bound) => Rc::ptr_eq(bound, &code),
-        None => {
-            site.entry = code.entry_addr();
-            site.span = 8 * (nregs + interp::HEADER) as u64;
-            site.target = Some(code);
-            true
-        }
-    }
+    unsafe { f.entry_version((*vm).proto_epoch, (*vm).field_epoch, make_state) }
 }
 
 /// A lowering as compiled (see [`JitCode::snap`]).
@@ -4097,8 +4220,12 @@ impl JitFunction {
         let vm = self.vm.as_mut().unwrap();
         let low = lower(vm, epoch);
         vm.dirty = false;
+        // With no versions left, nothing new uses the call sites: a new
+        // snapshot gives new versions unbound ones, so direct calls bind to
+        // the callee's current versions.
         if vm.epoch != epoch
             || vm.field_epoch != field_epoch
+            || self.versions.is_empty()
             || low.insns != self.insns
             || low.props != vm.props
             || low.frames != vm.snap.frames
@@ -4226,18 +4353,37 @@ impl JitFunction {
     /// operation, the instruction is widened (as in [`JitFunction::run`]);
     /// at a property access or an inlined call's guard, the exit counts
     /// towards giving the access or the inlining up; at a bail, towards
-    /// giving the entry up. Any exit makes the next entry lower the
-    /// function again. Returns the exit's frame and bytecode offset.
+    /// giving the entry up; at the check of a call's result, the call loses
+    /// its prediction. Any exit makes the next entry lower the function
+    /// again. Returns the exit's frame and bytecode offset.
     fn vm_finish(&mut self, code: &JitCode, pc: usize, record: usize) -> (usize, usize) {
         self.stats.exits += 1;
         let after_call = record & AFTER_CALL as usize != 0;
-        let (frame, exit_pc) = (record >> 24, record & (AFTER_CALL as usize - 1));
+        let bad_result = record & BAD_RESULT as usize != 0;
+        let (frame, exit_pc) = (record >> 24, record & (BAD_RESULT as usize - 1));
         let snap = code.snap.as_ref().expect("a VM function's code");
         let vm = self.vm.as_mut().unwrap();
         vm.dirty = true;
         // The function may have been lowered differently since (a nested
         // entry recompiled it): then only resume.
-        if !Rc::ptr_eq(snap, &vm.snap) || after_call {
+        if !Rc::ptr_eq(snap, &vm.snap) || (after_call && !bad_result) {
+            return (frame, exit_pc);
+        }
+        if bad_result {
+            // The call is the instruction before the one the exit resumes
+            // at: compile it without a prediction from now on.
+            let k = snap
+                .insns
+                .iter()
+                .position(|i| i.frame as usize == frame && i.pc == exit_pc)
+                .expect("an exit's instruction")
+                - 1;
+            let call = snap.insns[k];
+            debug_assert!(call.is_call());
+            vm.widened
+                .insert((snap.frames[frame].code as usize, call.pc));
+            self.widened.insert(k);
+            self.versions.clear();
             return (frame, exit_pc);
         }
         let k = snap

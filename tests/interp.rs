@@ -777,3 +777,26 @@ fn registers_written_on_some_paths_stay_boxed() {
         assert!(!matches!(homes(&f)[0], Home::Int(_)), "{:?}", homes(&f));
     }
 }
+
+// ---- Unboxed int32 accumulator ----
+
+#[test]
+fn int_acc_is_boxed_where_a_join_widens_it() {
+    // At `out`, acc is int32 from one path and `null` from the other, so the
+    // join is `Any`: the int path's edge must box acc. (A raw 7 would read
+    // as the value with bits 0x7, which is `true`.)
+    let mut a = Assembler::new();
+    let (b, out) = (a.label(), a.label());
+    a.ldar(0).jump_if_less_smi(0, b);
+    a.lda_smi(7).jump(out);
+    a.bind(b);
+    a.ldar(1);
+    a.bind(out);
+    a.star(2).ret();
+    for (start, expected) in [(1, Value::from_i32(7)), (-1, Value::NULL)] {
+        let regs = [Value::from_i32(start), Value::NULL, Value::UNDEFINED];
+        let mut r = regs;
+        assert_eq!(exec(a.clone(), &mut r), expected);
+        assert_eq!(r[2], expected);
+    }
+}

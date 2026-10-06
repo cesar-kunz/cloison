@@ -34,6 +34,25 @@ pub enum Op {
 impl Op {
     pub const COUNT: usize = Op::Return as usize + 1;
 
+    const ALL: [Op; Op::COUNT] = [
+        Op::Nop,
+        Op::LdaSmi,
+        Op::Ldar,
+        Op::Star,
+        Op::Add,
+        Op::Inc,
+        Op::JumpIfLess,
+        Op::Jump,
+        Op::AddSmi,
+        Op::JumpIfLessSmi,
+        Op::Return,
+    ];
+
+    /// Decode an opcode byte.
+    pub fn from_u8(b: u8) -> Option<Op> {
+        Self::ALL.get(b as usize).copied()
+    }
+
     /// Total encoded length in bytes, opcode included.
     pub const fn size(self) -> usize {
         match self {
@@ -141,5 +160,19 @@ impl Assembler {
             self.code[at..at + 4].copy_from_slice(&(off as i32).to_le_bytes());
         }
         self.code
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Op;
+
+    #[test]
+    fn from_u8_round_trips() {
+        for (i, op) in Op::ALL.iter().enumerate() {
+            assert_eq!(*op as usize, i);
+            assert_eq!(Op::from_u8(i as u8), Some(*op));
+        }
+        assert_eq!(Op::from_u8(Op::COUNT as u8), None);
     }
 }

@@ -1,9 +1,27 @@
+//! Every program runs on both engines, the interpreter and the
+//! copy-and-patch JIT, which must agree on the result and on the final
+//! register file.
+
 use toi::bytecode::Assembler;
-use toi::interp::run;
 use toi::value::Value;
 
+/// Bitwise equality, except that any two NaNs match (engines may differ
+/// in which NaN they produce).
+fn same(a: Value, b: Value) -> bool {
+    let nan = |v: Value| v.as_number().is_some_and(f64::is_nan);
+    a == b || (nan(a) && nan(b))
+}
+
 fn exec(a: Assembler, regs: &mut [Value]) -> Value {
-    unsafe { run(&a.finish(), regs) }
+    let code = a.finish();
+    let mut jit_regs = regs.to_vec();
+    let interp = unsafe { toi::interp::run(&code, regs) };
+    let jit = unsafe { toi::jit::run(&code, &mut jit_regs) };
+    assert!(same(interp, jit), "interp returned {interp:?}, jit {jit:?}");
+    for (r, (i, j)) in regs.iter().zip(&jit_regs).enumerate() {
+        assert!(same(*i, *j), "r{r}: interp {i:?}, jit {j:?}");
+    }
+    interp
 }
 
 fn sum_loop(n: i32) -> Assembler {

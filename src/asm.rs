@@ -218,7 +218,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
                 args.push(arg);
             }
             // A call's argument window counts as used registers.
-            if let [_, Arg::Reg(w), Arg::Count(c)] = args[..] {
+            if let [_, Arg::Reg(w), Arg::Count(c), ..] = args[..] {
                 let extra = usize::from(op == Op::Call);
                 nregs = nregs.max(w as usize + c as usize + extra);
             }
@@ -280,7 +280,8 @@ mod tests {
         .unwrap();
         let f = &m.functions[1];
         assert_eq!((f.name.as_str(), f.nparams, f.nregs), ("f", 2, 7));
-        assert_eq!(f.ics, ["x"]);
+        // The call has an implicit cache slot.
+        assert_eq!(f.ics, ["x", "[]"]);
         assert_eq!(m.functions[m.script].closures, [1]);
         assert_eq!(f.code[6], Op::JumpIfLessSmiLoop as u8);
     }

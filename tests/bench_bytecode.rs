@@ -83,3 +83,26 @@ fn hot_property_loops_compile_without_repeated_guards() {
     assert!(s.iter().any(|n| n.starts_with("teq_jt_ii_")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
 }
+
+#[test]
+fn loops_with_calls_compile_with_the_callee_inlined() {
+    for (name, want) in [
+        ("10-call-global-function.asm", "tlt_jf_"),
+        ("23-prototype-method.asm", "add_ii_"),
+    ] {
+        let mut vm = Vm::new();
+        vm.run(&listing(name)).unwrap();
+        let s = vm.jit_stencils("main").expect("main's loop compiled");
+        let loop_end = s
+            .iter()
+            .position(|n| n.starts_with("jlt_smi"))
+            .expect("the loop");
+        let body = &s[..loop_end];
+        assert!(
+            body.iter().any(|n| n.starts_with("check_callee_")),
+            "{name}: {s:?}"
+        );
+        assert!(!body.iter().any(|n| n == "call"), "{name}: {s:?}");
+        assert!(body.iter().any(|n| n.starts_with(want)), "{name}: {s:?}");
+    }
+}

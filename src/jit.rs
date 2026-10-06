@@ -60,6 +60,7 @@ use crate::interp::{self, Frame, Run};
 use crate::object::{Atom, FieldType, Object, Shape};
 use crate::value::{NumberTag, Value};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// What a stencil relocation refers to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -262,6 +263,7 @@ extern "C" fn toi_rt_to_boolean(a: Value, _: Value) -> bool {
 fn runtime_function(name: &str) -> usize {
     match name {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
+        "toi_rt_call" => toi_rt_call as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
         "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
@@ -631,20 +633,33 @@ impl Drop for ExecMem {
 
 // ---- Decoding ----
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Insn {
-    /// Bytecode offset.
+    /// Bytecode offset, in the code of frame `frame`.
     pc: usize,
     op: Op,
-    /// `toi_hole_imm`: the immediate operand (1 for `inc`).
+    /// `toi_hole_imm`: the immediate operand (1 for `inc`; a call's
+    /// argument count).
     imm: i32,
-    /// `toi_hole_reg`: the register operand, if any.
+    /// `toi_hole_reg`: the register operand, if any (a call's callee,
+    /// `Mov`'s source).
     reg: u8,
+    /// A second register operand: a call's argument window, `Mov`'s
+    /// destination.
+    reg2: u8,
     /// Instruction index of the jump target, if any.
     target: usize,
     /// Not compiled: the code exits to the interpreter before it (see
     /// [`JitFunction::for_vm`]).
     bail: bool,
+    /// The (inlined) frame the instruction belongs to; 0 is the function
+    /// compiled. See [`lower`].
+    frame: u8,
+    /// A call's inline-cache slot.
+    ic: u16,
+    /// For a guard [`lower`] adds before an inlined call: the function the
+    /// callee register must hold (and `op` is `Nop`).
+    guard: u64,
 }
 
 impl Insn {
@@ -667,19 +682,38 @@ impl Insn {
     }
 
     fn reads_reg(&self) -> bool {
-        !self.bail
-            && matches!(
-                self.op,
-                Op::Ldar
-                    | Op::Star
-                    | Op::Add
-                    | Op::JumpIfLess
-                    | Op::TestLessThan
-                    | Op::TestEqual
-                    | Op::GetNamed
-                    | Op::SetNamed
-                    | Op::GetKeyed
-            )
+        self.guard != 0
+            || !self.bail
+                && matches!(
+                    self.op,
+                    Op::Ldar
+                        | Op::Star
+                        | Op::Add
+                        | Op::JumpIfLess
+                        | Op::TestLessThan
+                        | Op::TestEqual
+                        | Op::GetNamed
+                        | Op::SetNamed
+                        | Op::GetKeyed
+                )
+    }
+
+    fn is_call(&self) -> bool {
+        matches!(self.op, Op::Call | Op::CallUndefined | Op::Construct)
+    }
+
+    /// The registers a call reads: the callee and the argument window
+    /// (receiver first, for `Call`).
+    fn call_reads(&self) -> impl Iterator<Item = usize> {
+        let n = self.imm as usize + usize::from(self.op == Op::Call);
+        let (f, w) = (self.reg as usize, self.reg2 as usize);
+        std::iter::once(f).chain(w..w + n)
+    }
+
+    /// What an exit before it records: its frame and bytecode offset
+    /// (below 2^23; see [`AFTER_CALL`]).
+    fn exit_record(&self) -> i32 {
+        ((self.frame as u32) << 24 | self.pc as u32) as i32
     }
 
     /// Whether it is a property access, whose stencil exits when the
@@ -724,6 +758,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
     raw.into_iter()
         .map(|(pc, op)| {
             let (mut imm, mut reg, mut target, mut bail) = (0, 0, 0, false);
+            let (mut reg2, mut ic) = (0, 0);
             match op {
                 Op::LdaSmi | Op::AddSmi => imm = imm_at(pc + 1),
                 Op::Inc => imm = 1,
@@ -758,6 +793,11 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::LdaGlobal | Op::StaGlobal if vm => {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
                 }
+                Op::Mov if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
+                Op::Call | Op::CallUndefined | Op::Construct if vm => {
+                    (reg, reg2, imm) = (code[pc + 1], code[pc + 2], code[pc + 3] as i32);
+                    ic = u16::from_le_bytes([code[pc + 4], code[pc + 5]]);
+                }
                 Op::GetKeyed if vm => {
                     (reg, imm) = (
                         code[pc + 1],
@@ -775,8 +815,12 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 op,
                 imm,
                 reg,
+                reg2,
                 target,
                 bail,
+                frame: 0,
+                ic,
+                guard: 0,
             }
         })
         .collect()
@@ -822,6 +866,13 @@ pub(crate) enum Prop {
     /// A keyed load whose receivers had shape `shape`, with elements of
     /// type `elems`.
     Keyed { shape: u64, elems: FieldType },
+    /// A call through the runtime, described by the `CallSite` at `site`;
+    /// the VM's code epoch, at `epoch_addr`, must still be `epoch` after it.
+    Call {
+        site: u64,
+        epoch: u32,
+        epoch_addr: u64,
+    },
 }
 
 /// The VM state the JIT reads to compile a function's property accesses.
@@ -1005,13 +1056,6 @@ pub struct TypeState {
 }
 
 impl TypeState {
-    fn of(acc: Value, regs: &[Value]) -> TypeState {
-        TypeState {
-            acc: Ty::of(acc),
-            regs: regs.iter().map(|&v| Ty::of(v)).collect(),
-        }
-    }
-
     fn any(nregs: usize) -> TypeState {
         TypeState {
             acc: Ty::Any,
@@ -1054,8 +1098,9 @@ struct Spec<'a> {
     /// Per instruction: an int32 add whose result only feeds the bitwise
     /// operation right after it, so it may wrap (`(a + b) | 0`).
     wraps: &'a [bool],
-    /// For VM functions: property names, and shapes' field types.
-    feedback: Option<&'a Feedback>,
+    /// For VM functions: each frame's feedback (property names; see
+    /// [`lower`] for frames).
+    feedback: Option<&'a [Feedback]>,
 }
 
 /// What [`select`] decided for one instruction: the stencil family, the
@@ -1121,13 +1166,16 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             widened: Some(&HashSet::new()),
             ..*spec
         };
-        let Sel { base, case, .. } = select(insn, i, &any, &no);
+        let mut sel = select(insn, i, &any, &no);
         // Generic code knows no shapes.
-        let (base, case) = if case == "nc" {
-            ("bail", "")
-        } else {
-            (base, case)
-        };
+        if sel.case == "nc" {
+            return Sel::new("bail", "", any);
+        }
+        let (base, case) = (sel.base, sel.case);
+        if sel.ops.is_some() {
+            sel.out = any;
+            return sel;
+        }
         // Generic code keeps `acc` boxed, so `lda_smi`, not `lda_smi_i`.
         let case = if base == "lda_smi" { "" } else { case };
         return Sel::new(base, case, any);
@@ -1145,6 +1193,25 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     let wraps = spec.wraps.get(i).copied().unwrap_or(false);
     let (base, case) = match insn.op {
         _ if insn.bail => ("bail", ""),
+        // A number is never the function an inlined call expects.
+        _ if insn.guard != 0 && matches!(reg, I32 | F64) => ("bail", ""),
+        _ if insn.guard != 0 => {
+            return Sel {
+                ops: Some((0, insn.guard, 0)),
+                ..Sel::new("check_callee", "", out)
+            };
+        }
+        // The callee may add properties to any object: exact shapes become
+        // lower bounds (see `Ty::Ext`).
+        Op::Call | Op::CallUndefined | Op::Construct => {
+            for t in out.regs.iter_mut() {
+                if let Ty::Obj(x) = *t {
+                    *t = Ty::Ext(x);
+                }
+            }
+            out.acc = Any;
+            ("call", "")
+        }
         // ToInt32(a + b) is the 32-bit wrapping add: no exit, no widening.
         Op::Add if wraps && st.acc == I32 && reg == I32 => {
             out.acc = I32;
@@ -1373,7 +1440,8 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             return bail(out);
         }
         // A known shape with the property.
-        if let (Some(s), Some(fb)) = (reg.shape(), spec.feedback) {
+        if let (Some(s), Some(fbs)) = (reg.shape(), spec.feedback) {
+            let fb = &fbs[insn.frame as usize];
             let shape = unsafe { &*(s as *const Shape) };
             if let Some(slot) = shape.lookup(fb.name(insn)) {
                 let (oop, off) = split_location(shape.location(slot));
@@ -1617,6 +1685,11 @@ fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize) -> Vec<Vec<bool>> {
                 live[insn.reg as usize] = false;
             } else if insn.uses_reg_value() {
                 live[insn.reg as usize] = true;
+            }
+            if insn.is_call() && !insn.bail {
+                for r in insn.call_reads() {
+                    live[r] = true;
+                }
             }
             if live != live_in[i] {
                 live_in[i] = live;
@@ -1890,6 +1963,19 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
         ("star", _) if sel.case == "f" => format!("star_{loc}_f"),
         ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => format!("star_{loc}_i"),
         ("star", _) => format!("star_{loc}"),
+        ("check_callee", _) => format!("check_callee_{loc}"),
+        // The callee reads its arguments from memory.
+        ("call", _) => {
+            for r in insn.call_reads() {
+                match homes[r] {
+                    Home::Mem => {}
+                    Home::Gpr(k) => pre.push(Piece::new(&format!("spill_g{k}"), r as u8)),
+                    Home::Int(k) => pre.push(Piece::new(&format!("spill_u{k}"), r as u8)),
+                    Home::Fpr(k) => pre.push(Piece::new(&format!("spill_f{k}"), r as u8)),
+                }
+            }
+            "call".into()
+        }
         ("get_own" | "get_oop" | "get_proto", _) if sel.case == "nc" => {
             format!("{}_nc_{loc}", sel.base)
         }
@@ -1975,6 +2061,9 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::LdaNull
                 | Op::GetNamed
                 | Op::LdaGlobal
+                | Op::Call
+                | Op::CallUndefined
+                | Op::Construct
         )
     };
     let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump);
@@ -2187,9 +2276,12 @@ impl Fusion<'_> {
     fn compare_jump(&self, i: usize) -> Option<Fused> {
         let insns = self.insns;
         let st = self.ins[i].as_ref()?;
+        // A comparison's result is a boolean, so a ToBoolean jump on it
+        // is the plain one (an inlined function returning `a < b` feeds
+        // `JumpIfToBooleanFalse`).
         let polarity = |op: Op| match op {
-            Op::JumpIfTrue => Some("jt"),
-            Op::JumpIfFalse => Some("jf"),
+            Op::JumpIfTrue | Op::JumpIfToBooleanTrue => Some("jt"),
+            Op::JumpIfFalse | Op::JumpIfToBooleanFalse => Some("jf"),
             _ => None,
         };
         let step = |name: String, imm: i32, reg: u8| FusedStep {
@@ -2277,8 +2369,8 @@ impl Fusion<'_> {
             return None;
         };
         let polarity = |k: usize| match insns.get(k).map(|n| n.op) {
-            Some(Op::JumpIfTrue) => Some("jt"),
-            Some(Op::JumpIfFalse) => Some("jf"),
+            Some(Op::JumpIfTrue | Op::JumpIfToBooleanTrue) => Some("jt"),
+            Some(Op::JumpIfFalse | Op::JumpIfToBooleanFalse) => Some("jf"),
             _ => None,
         };
         let step = |name: String, imm: i32| FusedStep {
@@ -2465,6 +2557,10 @@ impl Fusion<'_> {
     }
 }
 
+/// Set in an exit record by a call's exit, which happens after the call, at
+/// the next instruction: it says nothing about that instruction.
+const AFTER_CALL: i32 = 1 << 23;
+
 /// Value of `ctx` while running: no exit taken.
 const NO_EXIT: u32 = u32::MAX;
 
@@ -2599,6 +2695,15 @@ pub enum Outcome {
     },
 }
 
+/// What compiling a VM function's lowered instructions needs besides them
+/// (see [`lower`]); for other code, no properties or feedback, and no
+/// inlined frames (`inline_base` is the register count).
+struct VmCompile<'a> {
+    props: &'a [Prop],
+    feedback: Option<&'a [Feedback]>,
+    inline_base: usize,
+}
+
 /// Compilation options.
 #[derive(Clone, Copy)]
 struct Options {
@@ -2617,9 +2722,13 @@ impl JitCode {
         actual: TypeState,
         widened: &HashSet<usize>,
         opts: Options,
-        props: &[Prop],
-        feedback: Option<&Feedback>,
+        vm: VmCompile,
     ) -> JitCode {
+        let VmCompile {
+            props,
+            feedback,
+            inline_base,
+        } = vm;
         let n = insns.len();
         let nregs = actual.regs.len();
         let actual = if opts.specialize {
@@ -2679,14 +2788,21 @@ impl JitCode {
         };
         let ins1 = infer(insns, entry, actual_live.clone(), &spec1);
         let no_widening = HashSet::new();
-        let pin_ok = pinnable(
+        // Registers of inlined frames (from `inline_base`) are assigned
+        // when their frame starts, before anything there can exit, and mean
+        // nothing outside it: they may always be pinned.
+        let pin_ok: Vec<bool> = pinnable(
             insns,
             entry,
             &reach,
             &live_at_entry,
             &ins1,
             widened.unwrap_or(&no_widening),
-        );
+        )
+        .into_iter()
+        .enumerate()
+        .map(|(r, ok)| ok || r >= inline_base)
+        .collect();
         let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
         let (homes, ins) = loop {
             let homes = if opts.register_homes {
@@ -2830,7 +2946,7 @@ impl JitCode {
                         seq.push(Piece::new("box_iacc", 0));
                         seq.extend(spills(&homes));
                         seq.push(Piece {
-                            imm: insns[step.insn].pc as i32,
+                            imm: insns[step.insn].exit_record(),
                             ..Piece::new("exit", 0)
                         });
                         exits.push((step.insn, seq));
@@ -2887,6 +3003,14 @@ impl JitCode {
                     }),
                 ) => (off, shape, global),
                 (_, Some(Prop::Keyed { shape, .. })) => (0, shape, 0),
+                (
+                    _,
+                    Some(Prop::Call {
+                        site,
+                        epoch,
+                        epoch_addr,
+                    }),
+                ) => (epoch as i32, site, epoch_addr),
                 _ => (insn.imm, 0, 0),
             };
             let main = Piece {
@@ -2913,10 +3037,17 @@ impl JitCode {
                         ..Piece::new("undo_add_smi_i", 0)
                     });
                 }
-                seq.extend(box_acc_piece(st.acc));
+                // A call exits after it (on an error, or when the callee
+                // changed the code epoch), with its result, boxed, in `acc`.
+                let record = if name == "call" {
+                    insns[i + 1].exit_record() | AFTER_CALL
+                } else {
+                    seq.extend(box_acc_piece(st.acc));
+                    insn.exit_record()
+                };
                 seq.extend(spills(&homes));
                 seq.push(Piece {
-                    imm: insn.pc as i32,
+                    imm: record,
                     ..Piece::new("exit", 0)
                 });
                 exits.push((i, seq));
@@ -3222,26 +3353,45 @@ pub struct JitFunction {
 /// After this many compilations in one run, finish in the interpreter.
 const MAX_COMPILES: u32 = 16;
 
+/// A function's decoded instructions, with accumulator liveness after each.
+type Decoded = Rc<(Vec<Insn>, Vec<bool>)>;
+
 /// What the JIT keeps for a function in VM frames.
+// The call sites are boxed: compiled code holds their addresses.
+#[allow(clippy::vec_box)]
 struct VmState {
-    feedback: Feedback,
-    /// The instructions as compiled: `insns` plus a bail at each property
-    /// access whose cache held nothing usable, or that exited too often.
-    insns: Vec<Insn>,
+    /// The function's code, and the VM.
+    root: *const crate::vm::Code,
+    vm: *mut crate::vm::Vm,
+    /// The function's instructions as decoded (`JitFunction::insns` holds
+    /// the lowered ones).
+    root_insns: Vec<Insn>,
+    /// Decoded code of functions inlined, with accumulator liveness after
+    /// each instruction.
+    decoded: HashMap<*const crate::vm::Code, Decoded>,
+    /// The current lowering (see [`lower`]): per instruction its inline
+    /// cache's contents, the frames, their feedback, the runtime call
+    /// sites, and where inlined frames' registers start.
     props: Vec<Prop>,
-    /// `insns` need rebuilding (a property access was given up).
-    stale: bool,
+    frames: Vec<InlineFrame>,
+    fbs: Vec<Feedback>,
+    sites: Vec<Box<CallSite>>,
+    inline_base: usize,
     /// The prototype epoch the versions were compiled under: a prototype's
     /// slot addresses are only valid while it holds.
     epoch: u32,
     /// The field epoch they were compiled under: the field types they
     /// assume hold until it changes.
     field_epoch: u32,
-    /// Exits per property instruction; past [`MAX_PROPERTY_EXITS`] it is
-    /// compiled as a bail.
-    property_exits: HashMap<usize, u32>,
+    /// Per instruction origin (code, bytecode offset), as the interpreter
+    /// sees it: int32 operations that overflowed, exits at property
+    /// accesses (past [`MAX_PROPERTY_EXITS`] given up), and exits at the
+    /// guard of an inlined call (past it, the call isn't inlined).
+    widened: HashSet<(usize, usize)>,
+    property_exits: HashMap<(usize, usize), u32>,
+    callee_exits: HashMap<(usize, usize), u32>,
     /// Exits through a bail per entry; past [`MAX_BAIL_EXITS`] the entry is
-    /// left to the interpreter (a loop that calls, say).
+    /// left to the interpreter.
     bail_exits: HashMap<usize, u32>,
     no_entry: HashSet<usize>,
 }
@@ -3250,6 +3400,342 @@ const MAX_PROPERTY_EXITS: u32 = 4;
 const MAX_BAIL_EXITS: u32 = 3;
 /// Compilations per function in VM frames, over the program's run.
 const MAX_VM_COMPILES: u32 = 32;
+/// Inlining limits: nesting, and the callee's size in instructions.
+const MAX_INLINE_DEPTH: usize = 2;
+const MAX_INLINE_INSNS: usize = 64;
+
+/// A frame of compiled code: frame 0 is the function itself, the others
+/// functions inlined into it (see [`lower`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct InlineFrame {
+    code: *const crate::vm::Code,
+    /// Where its registers start, in registers from the compiled frame's.
+    base: usize,
+    parent: usize,
+    /// Where the parent resumes after the call, in its bytecode.
+    ret_pc: usize,
+}
+
+/// A call compiled code makes through the runtime (`call` stencil,
+/// `toi_rt_call`): `op`'s operands, renamed into the compiled frame, and
+/// where a callee's frame goes (past every register the compiled code
+/// uses).
+pub(crate) struct CallSite {
+    vm: *mut crate::vm::Vm,
+    op: Op,
+    f: usize,
+    w: usize,
+    argc: usize,
+    frame: usize,
+}
+
+/// The result of [`lower`].
+#[allow(clippy::vec_box)]
+struct Lowered {
+    insns: Vec<Insn>,
+    props: Vec<Prop>,
+    frames: Vec<InlineFrame>,
+    fbs: Vec<Feedback>,
+    sites: Vec<Box<CallSite>>,
+    nregs: usize,
+}
+
+/// An instruction made by [`lower`], at bytecode offset `pc` of `frame`.
+fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
+    Insn {
+        pc,
+        op,
+        imm: 0,
+        reg,
+        reg2: 0,
+        target: 0,
+        bail: false,
+        frame: frame as u8,
+        ic: 0,
+        guard: 0,
+    }
+}
+
+/// What [`lower`] reads and builds.
+struct Lowering<'a> {
+    state: &'a mut VmState,
+    epoch: u32,
+    out: Lowered,
+}
+
+/// The function's instructions as compiled, from its code and inline caches:
+///
+/// - `Mov a, b` becomes `Ldar a; Star b` when `acc` is dead after it
+///   (compilers emit it to set up calls), else a bail.
+/// - A `Call` or `CallUndefined` whose cache names a small bytecode function
+///   (not already being inlined, within [`MAX_INLINE_DEPTH`] and
+///   [`MAX_INLINE_INSNS`]) is inlined: a guard that the callee register
+///   holds that function (`check_callee`), moves of `this` and the
+///   arguments into the callee's registers (missing ones and locals
+///   `undefined`), then the callee's instructions, its registers renamed and
+///   each `Return` a jump past it. Its registers go exactly where its VM
+///   frame would be, just past the caller's registers and a frame header,
+///   so an exit inside it only has to write that header for the
+///   interpreter to resume there (see [`vm_osr`]).
+/// - Other calls go through the runtime (`call`), with a [`CallSite`].
+///
+/// Every instruction keeps its frame and bytecode offset, which exits
+/// record.
+fn lower(state: &mut VmState, epoch: u32) -> Lowered {
+    let root = state.root;
+    let mut cx = Lowering {
+        state,
+        epoch,
+        out: Lowered {
+            insns: Vec::new(),
+            props: Vec::new(),
+            frames: vec![InlineFrame {
+                code: root,
+                base: 0,
+                parent: 0,
+                ret_pc: 0,
+            }],
+            fbs: Vec::new(),
+            sites: Vec::new(),
+            nregs: unsafe { (*root).nregs } as usize,
+        },
+    };
+    cx.out.fbs.push(cx.feedback(root));
+    let rets = cx.emit_frame(0, 0);
+    debug_assert!(rets.is_empty());
+    cx.out
+}
+
+impl Lowering<'_> {
+    fn feedback(&self, code: *const crate::vm::Code) -> Feedback {
+        let code = unsafe { &*code };
+        Feedback {
+            ics: code.ics.as_ptr().cast(),
+            names: code.ic_names.as_ptr(),
+            global: unsafe { (*self.state.vm).global },
+        }
+    }
+
+    fn decoded(&mut self, code: *const crate::vm::Code) -> Decoded {
+        if code == self.state.root {
+            let insns = self.state.root_insns.clone();
+            let live = acc_liveness(&insns, &vec![true; insns.len()]).1;
+            return Rc::new((insns, live));
+        }
+        self.state
+            .decoded
+            .entry(code)
+            .or_insert_with(|| {
+                let insns = decode(unsafe { &(*code).bytecode }, true);
+                let live = acc_liveness(&insns, &vec![true; insns.len()]).1;
+                Rc::new((insns, live))
+            })
+            .clone()
+    }
+
+    fn push(&mut self, insn: Insn, prop: Prop) -> usize {
+        self.out.insns.push(insn);
+        self.out.props.push(prop);
+        self.out.insns.len() - 1
+    }
+
+    /// Emit frame `frame`'s instructions; returns the indices of the jumps
+    /// its `Return`s became (an inlined frame's), to point past it.
+    fn emit_frame(&mut self, frame: usize, depth: usize) -> Vec<usize> {
+        let f = self.out.frames[frame];
+        let code_key = f.code as usize;
+        let d = self.decoded(f.code);
+        let (insns, acc_out) = (&d.0, &d.1);
+        let base = f.base;
+        let mut start = vec![0usize; insns.len() + 1];
+        let (mut fix, mut rets) = (Vec::new(), Vec::new());
+        for (k, orig) in insns.iter().enumerate() {
+            start[k] = self.out.insns.len();
+            let mut i = *orig;
+            i.frame = frame as u8;
+            let renamed = |r: u8| (r as usize + base) as u8;
+            match i.op {
+                Op::Ldar
+                | Op::Star
+                | Op::Add
+                | Op::JumpIfLess
+                | Op::TestLessThan
+                | Op::TestEqual
+                | Op::GetNamed
+                | Op::SetNamed
+                | Op::GetKeyed => i.reg = renamed(i.reg),
+                Op::Mov | Op::Call | Op::CallUndefined | Op::Construct => {
+                    (i.reg, i.reg2) = (renamed(i.reg), renamed(i.reg2))
+                }
+                _ => {}
+            }
+            let origin = (code_key, i.pc);
+            match i.op {
+                _ if i.bail && !(i.op == Op::Return && frame != 0) => {
+                    self.push(i, Prop::None);
+                }
+                Op::Return => {
+                    // An inlined frame returns: `acc` is the result.
+                    let mut j = synth(Op::Jump, 0, frame, i.pc);
+                    j.target = usize::MAX;
+                    rets.push(self.push(j, Prop::None));
+                }
+                Op::Mov if !acc_out[k] => {
+                    self.push(synth(Op::Ldar, i.reg, frame, i.pc), Prop::None);
+                    self.push(synth(Op::Star, i.reg2, frame, i.pc), Prop::None);
+                }
+                Op::Mov => {
+                    i.bail = true;
+                    self.push(i, Prop::None);
+                }
+                Op::Call | Op::CallUndefined if self.inline_target(frame, &i, depth).is_some() => {
+                    let callee = self.inline_target(frame, &i, depth).unwrap();
+                    self.inline(frame, &i, callee, depth);
+                }
+                Op::Call | Op::CallUndefined | Op::Construct => {
+                    let code = unsafe { &*f.code };
+                    let site = Box::new(CallSite {
+                        vm: self.state.vm,
+                        op: i.op,
+                        f: i.reg as usize,
+                        w: i.reg2 as usize,
+                        argc: i.imm as usize,
+                        frame: base + code.nregs as usize + interp::HEADER,
+                    });
+                    let vm = self.state.vm;
+                    let p = Prop::Call {
+                        site: &*site as *const CallSite as u64,
+                        epoch: unsafe { (*vm).code_epoch },
+                        epoch_addr: unsafe { &raw const (*vm).code_epoch } as u64,
+                    };
+                    self.out.sites.push(site);
+                    self.push(i, p);
+                }
+                _ if i.jumps() => {
+                    let x = self.push(i, Prop::None);
+                    fix.push(x);
+                }
+                _ => {
+                    let given_up = self
+                        .state
+                        .property_exits
+                        .get(&origin)
+                        .is_some_and(|&n| n >= MAX_PROPERTY_EXITS);
+                    let prop = match i.op {
+                        Op::GetKeyed if given_up => Prop::None,
+                        _ if given_up && i.is_property() => {
+                            i.bail = true;
+                            Prop::None
+                        }
+                        _ => self.out.fbs[frame].prop(&i, self.epoch),
+                    };
+                    self.push(i, prop);
+                }
+            }
+        }
+        start[insns.len()] = self.out.insns.len();
+        for x in fix {
+            let t = self.out.insns[x].target;
+            self.out.insns[x].target = start[t];
+        }
+        rets
+    }
+
+    /// The function to inline for call `i` of frame `frame`, if any.
+    fn inline_target(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
+        use crate::object::Class;
+        let f = self.out.frames[frame];
+        if depth >= MAX_INLINE_DEPTH
+            || self.out.frames.len() >= 255
+            || self
+                .state
+                .callee_exits
+                .get(&(f.code as usize, i.pc))
+                .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
+        {
+            return None;
+        }
+        let ic = unsafe { *self.out.fbs[frame].ics.add(i.ic as usize) };
+        let fo = ic.holder;
+        if fo.is_null() || unsafe { (*fo).class } != Class::Function {
+            return None;
+        }
+        let callee = unsafe { (*fo).code };
+        // Not recursively.
+        let mut g = frame;
+        loop {
+            if self.out.frames[g].code == callee {
+                return None;
+            }
+            if g == 0 {
+                break;
+            }
+            g = self.out.frames[g].parent;
+        }
+        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let nregs = unsafe { (*callee).nregs } as usize;
+        if base + nregs > 256 || self.decoded(callee).0.len() > MAX_INLINE_INSNS {
+            return None;
+        }
+        Some(fo)
+    }
+
+    fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) {
+        let f = self.out.frames[frame];
+        let callee = unsafe { (*fo).code };
+        let c = unsafe { &*callee };
+        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let id = self.out.frames.len();
+        self.out.frames.push(InlineFrame {
+            code: callee,
+            base,
+            parent: frame,
+            ret_pc: i.pc + i.op.size(),
+        });
+        self.out.fbs.push(self.feedback(callee));
+        self.out.nregs = self.out.nregs.max(base + c.nregs as usize);
+        let pc = i.pc;
+        let mut guard = synth(Op::Nop, i.reg, frame, pc);
+        guard.guard = fo as u64;
+        self.push(guard, Prop::None);
+        let at = |r: usize| (base + r) as u8;
+        let mov = |cx: &mut Self, src: Option<u8>, dst: u8| {
+            match src {
+                Some(r) => cx.push(synth(Op::Ldar, r, frame, pc), Prop::None),
+                None => cx.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None),
+            };
+            cx.push(synth(Op::Star, dst, frame, pc), Prop::None);
+        };
+        let (w, argc) = (i.reg2, i.imm as usize);
+        let (this, args) = match i.op {
+            Op::Call => (Some(w), w as usize + 1),
+            _ => (None, w as usize),
+        };
+        mov(self, this, at(0));
+        for p in 0..c.nparams as usize {
+            mov(self, (p < argc).then_some((args + p) as u8), at(1 + p));
+        }
+        for r in 1 + c.nparams as usize..c.nregs as usize {
+            mov(self, None, at(r));
+        }
+        self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
+        let rets = self.emit_frame(id, depth + 1);
+        // A last `return` falling through to the continuation needs no jump.
+        let mut cont = self.out.insns.len();
+        if let Some(&last) = rets.last()
+            && last + 1 == cont
+        {
+            self.out.insns.pop();
+            self.out.props.pop();
+            cont -= 1;
+        }
+        for r in rets {
+            if r < cont {
+                self.out.insns[r].target = cont;
+            }
+        }
+    }
+}
 
 impl JitFunction {
     /// Prepare `code`, to start in the interpreter and tier up with the
@@ -3289,40 +3775,52 @@ impl JitFunction {
         }
     }
 
-    /// Prepare `code`, a function of a VM program with `nregs` registers,
-    /// for on-stack replacement from its frames ([`JitFunction::vm_enter`]).
-    /// Instructions the JIT doesn't compile (calls, allocation, `return`)
-    /// become exits to the interpreter, as do property accesses whose
-    /// inline cache holds nothing usable when compiling.
-    pub(crate) fn for_vm(code: &[u8], nregs: usize, feedback: Feedback) -> JitFunction {
-        let insns = decode(code, true);
-        let mut f = JitFunction::new_from(code, insns, nregs);
+    /// Prepare `code`, a function of a VM program, for on-stack replacement
+    /// from its frames ([`JitFunction::vm_enter`]). Its calls are compiled,
+    /// inlined or through the runtime; instructions the JIT doesn't compile
+    /// (allocation, `return`) become exits to the interpreter (see
+    /// [`lower`]).
+    pub(crate) fn for_vm(code: *const crate::vm::Code, vm: *mut crate::vm::Vm) -> JitFunction {
+        let root_insns = decode(unsafe { &(*code).bytecode }, true);
+        let nregs = unsafe { (*code).nregs } as usize;
+        let mut f = JitFunction::new_from(unsafe { &(*code).bytecode }, root_insns.clone(), nregs);
         f.tiering = None;
         f.vm = Some(Box::new(VmState {
-            feedback,
-            insns: Vec::new(),
+            root: code,
+            vm,
+            root_insns,
+            decoded: HashMap::new(),
             props: Vec::new(),
-            stale: true,
+            frames: Vec::new(),
+            fbs: Vec::new(),
+            sites: Vec::new(),
+            inline_base: nregs,
             epoch: 0,
             field_epoch: 0,
+            widened: HashSet::new(),
             property_exits: HashMap::new(),
+            callee_exits: HashMap::new(),
             bail_exits: HashMap::new(),
             no_entry: HashSet::new(),
         }));
         f
     }
 
-    /// Run compiled code for a VM frame's registers `regs`, entering at the
-    /// loop header at bytecode offset `pc` with `acc`, compiling a version
-    /// if needed. Returns where the interpreter resumes, or `None` if this
-    /// entry isn't compiled (leave the frame to the interpreter). `epoch`
-    /// and `field_epoch` are the VM's prototype and field epochs: versions
-    /// compiled under others are dropped.
+    /// Run compiled code for a VM frame whose registers start at `regs`,
+    /// entering at the loop header at bytecode offset `pc` with `acc`,
+    /// compiling a version if needed. Returns the frame (0, or an inlined
+    /// one) and bytecode offset where the interpreter resumes, with `acc`;
+    /// `None` if this entry isn't compiled. `epoch` and `field_epoch` are
+    /// the VM's prototype and field epochs: versions compiled under others
+    /// are dropped. `stack_end` bounds the registers of inlined frames.
     ///
-    /// Exits: at an int32 operation, the instruction is widened (as in
-    /// [`JitFunction::run`]); at a property access, the interpreter updates
-    /// its cache and the versions are dropped, to recompile from it; at a
-    /// bail, nothing changes, but an entry that keeps bailing is given up.
+    /// Each entry lowers the function again ([`lower`]): if the inline
+    /// caches changed what it gives, the versions are dropped. Exits: at an
+    /// int32 operation, the instruction is widened (as in
+    /// [`JitFunction::run`]); at a property access or an inlined call's
+    /// guard, the interpreter updates its cache, and the next entry
+    /// recompiles from it (giving up after a few); at a bail, nothing
+    /// changes, but an entry that keeps bailing is given up.
     ///
     /// # Safety
     /// `regs` must be the frame's registers, holding values of the program
@@ -3331,74 +3829,90 @@ impl JitFunction {
         &mut self,
         pc: usize,
         mut acc: Value,
-        regs: &mut [Value],
+        regs: *mut Value,
+        stack_end: *mut Value,
         epoch: u32,
         field_epoch: u32,
-    ) -> Option<(usize, Value)> {
-        let entry = self.index_of(pc);
+    ) -> Option<(usize, usize, Value)> {
+        let root_pc = pc;
         {
             let vm = self.vm.as_mut().expect("a VM function");
-            if vm.no_entry.contains(&entry) || self.stats.compiles >= MAX_VM_COMPILES {
+            if vm.no_entry.contains(&root_pc) || self.stats.compiles >= MAX_VM_COMPILES {
                 return None;
             }
-            // The inline caches as they are now; versions compiled from
-            // other contents, or under another prototype epoch, are dropped.
-            let given_up = |k: usize| {
-                vm.property_exits
-                    .get(&k)
-                    .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
-            };
-            // A keyed load given up on runs untyped, without its cache.
-            let props: Vec<Prop> = self
-                .insns
-                .iter()
-                .enumerate()
-                .map(|(k, insn)| match insn.op {
-                    Op::GetKeyed if given_up(k) => Prop::None,
-                    _ => vm.feedback.prop(insn, epoch),
-                })
-                .collect();
-            if vm.stale || vm.epoch != epoch || vm.field_epoch != field_epoch || props != vm.props {
+            let low = lower(vm, epoch);
+            if vm.epoch != epoch
+                || vm.field_epoch != field_epoch
+                || low.insns != self.insns
+                || low.props != vm.props
+                || low.frames != vm.frames
+            {
                 self.versions.clear();
+                self.live_at.clear();
                 vm.epoch = epoch;
                 vm.field_epoch = field_epoch;
-                vm.insns = self.insns.clone();
-                // Accesses given up after too many exits bail. An access
-                // with nothing cached is left to `select_property`: a known
-                // shape may still say where the property is.
-                for (k, insn) in vm.insns.iter_mut().enumerate() {
-                    if insn.op != Op::GetKeyed && given_up(k) {
-                        insn.bail = true;
-                    }
-                }
-                vm.props = props;
-                vm.stale = false;
+                self.widened = low
+                    .insns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, i)| {
+                        vm.widened
+                            .contains(&(low.frames[i.frame as usize].code as usize, i.pc))
+                    })
+                    .map(|(k, _)| k)
+                    .collect();
+                self.insns = low.insns;
+                self.nregs = low.nregs;
+                vm.props = low.props;
+                vm.frames = low.frames;
+                vm.fbs = low.fbs;
+                vm.sites = low.sites;
+            }
+            // Inlined frames' registers must fit the VM stack.
+            if unsafe { regs.add(self.nregs + interp::HEADER) } > stack_end {
+                return None;
             }
         }
+        let entry = self.index_of(root_pc);
+        let regs = unsafe { std::slice::from_raw_parts_mut(regs, self.nregs) };
         let actual = self.entry_types(entry, acc, regs);
         let index = self.version(entry, &actual, &mut acc, regs);
         let code = &self.versions[&entry][index].1;
         match unsafe { code.enter(acc, regs) } {
             Outcome::Return(_) => unreachable!("VM functions return in the interpreter"),
-            Outcome::Exit { pc: exit_pc, acc } => {
+            Outcome::Exit { pc: record, acc } => {
                 self.stats.exits += 1;
-                let k = self.index_of(exit_pc);
+                let after_call = record & AFTER_CALL as usize != 0;
+                let (frame, pc) = (record >> 24, record & (AFTER_CALL as usize - 1));
+                let k = self
+                    .insns
+                    .iter()
+                    .position(|i| i.frame as usize == frame && i.pc == pc)
+                    .expect("an exit's instruction");
                 let vm = self.vm.as_mut().unwrap();
-                let insn = vm.insns[k];
-                if insn.bail {
-                    let n = vm.bail_exits.entry(entry).or_insert(0);
+                let insn = self.insns[k];
+                let origin = (vm.frames[frame].code as usize, pc);
+                if after_call {
+                    // An error, or the callee changed the code epoch: the
+                    // next entry recompiles.
+                } else if insn.bail {
+                    let n = vm.bail_exits.entry(root_pc).or_insert(0);
                     *n += 1;
                     if *n >= MAX_BAIL_EXITS {
-                        vm.no_entry.insert(entry);
+                        vm.no_entry.insert(root_pc);
                     }
+                } else if insn.guard != 0 {
+                    *vm.callee_exits.entry(origin).or_insert(0) += 1;
                 } else if insn.is_property() {
-                    *vm.property_exits.entry(k).or_insert(0) += 1;
-                    vm.stale = true;
+                    *vm.property_exits.entry(origin).or_insert(0) += 1;
+                } else if insn.is_call() {
+                    // An error in the callee: the run ends.
                 } else {
+                    vm.widened.insert(origin);
                     self.widened.insert(k);
                     self.versions.clear();
                 }
-                Some((exit_pc, acc))
+                Some((frame, pc, acc))
             }
         }
     }
@@ -3446,10 +3960,12 @@ impl JitFunction {
         self
     }
 
+    /// The instruction at bytecode offset `pc` of the function itself
+    /// (frame 0).
     fn index_of(&self, pc: usize) -> usize {
         self.insns
             .iter()
-            .position(|i| i.pc == pc)
+            .position(|i| i.pc == pc && i.frame == 0)
             .expect("an instruction boundary")
     }
 
@@ -3463,16 +3979,17 @@ impl JitFunction {
             let regs_live = reg_live_in(insns, &reach, nregs)[entry].clone();
             (acc_liveness(insns, &reach).0[entry], regs_live)
         });
-        let mut st = TypeState::of(acc, regs);
-        if !*acc_live {
-            st.acc = Ty::Bot;
+        // Only live values are looked at: dead registers (an inlined frame's,
+        // say) may hold anything.
+        let ty = |v: Value, live: bool| if live { Ty::of(v) } else { Ty::Bot };
+        TypeState {
+            acc: ty(acc, *acc_live),
+            regs: regs
+                .iter()
+                .zip(live.iter())
+                .map(|(&v, &l)| ty(v, l))
+                .collect(),
         }
-        for (t, &l) in st.regs.iter_mut().zip(live.iter()) {
-            if !l {
-                *t = Ty::Bot;
-            }
-        }
-        st
     }
 
     /// A version for `entry` fitting `actual`, compiling one if needed;
@@ -3511,18 +4028,21 @@ impl JitFunction {
                 };
                 self.stats.compiles += 1;
                 let code = {
-                    let (insns, props, feedback): (&[Insn], &[Prop], _) = match &self.vm {
-                        Some(vm) => (&vm.insns, &vm.props, Some(&vm.feedback)),
-                        None => (&self.insns, &[], None),
+                    let (props, feedback, inline_base): (&[Prop], _, _) = match &self.vm {
+                        Some(vm) => (&vm.props, Some(&vm.fbs[..]), vm.inline_base),
+                        None => (&[], None, self.nregs),
                     };
                     JitCode::compile(
-                        insns,
+                        &self.insns,
                         entry,
                         state.clone(),
                         &self.widened,
                         self.opts,
-                        props,
-                        feedback,
+                        VmCompile {
+                            props,
+                            feedback,
+                            inline_base,
+                        },
                     )
                 };
                 let vs = self.versions.entry(entry).or_insert(keep);
@@ -3640,10 +4160,13 @@ pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
     unsafe { JitFunction::new(code).run(regs) }
 }
 
-/// On-stack replacement for a VM frame (see `interp::run_script`): run
-/// `code`'s compiled version for the loop header at bytecode offset `pc`
-/// over the frame's registers, if it is compiled (or compiles now). Returns
-/// where the interpreter resumes.
+/// On-stack replacement for a VM frame (see `interp::drive`): run `code`'s
+/// compiled version for the loop header at bytecode offset `pc` over the
+/// frame `regs`, if it is compiled (or compiles now). Returns where the
+/// interpreter resumes: if the code exited inside a function it had
+/// inlined, that function's frame, whose registers are already in place,
+/// gets its header (and so do the frames between), so that its `Return`
+/// continues the caller.
 ///
 /// # Safety
 /// `regs` must be a live frame of `code` in `vm`.
@@ -3653,23 +4176,12 @@ pub(crate) unsafe fn vm_osr(
     regs: *mut Value,
     pc: usize,
     acc: Value,
-) -> (usize, Value) {
+) -> interp::Resume {
+    let vm_ptr: *mut crate::vm::Vm = vm;
     let mut slot = code.jit.borrow_mut();
-    let f = slot.get_or_insert_with(|| {
-        let feedback = Feedback {
-            ics: code.ics.as_ptr().cast(),
-            names: code.ic_names.as_ptr(),
-            global: vm.global,
-        };
-        Box::new(JitFunction::for_vm(
-            &code.bytecode,
-            code.nregs as usize,
-            feedback,
-        ))
-    });
-    let regs = unsafe { std::slice::from_raw_parts_mut(regs, code.nregs as usize) };
+    let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
     let compiles = f.stats.compiles;
-    let r = unsafe { f.vm_enter(pc, acc, regs, vm.proto_epoch, vm.field_epoch) };
+    let r = unsafe { f.vm_enter(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch) };
     // Debugging: `TOI_JIT_LOG` prints each compilation's stencils;
     // `TOI_JIT_DUMP=<file>` writes the last one's hot code.
     if f.stats.compiles != compiles
@@ -3683,7 +4195,55 @@ pub(crate) unsafe fn vm_osr(
             std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
         }
     }
-    r.unwrap_or((pc, acc))
+    let start = code.bytecode.as_ptr();
+    let Some((frame, pc, acc)) = r else {
+        return interp::Resume {
+            regs,
+            pc: unsafe { start.add(pc) },
+            acc,
+        };
+    };
+    let frames = &f.vm.as_ref().unwrap().frames;
+    // Headers for the inlined frames from the exit's outwards.
+    let mut g = frame;
+    while g != 0 {
+        let fr = frames[g];
+        let parent = frames[fr.parent];
+        unsafe {
+            interp::write_frame_header(
+                vm,
+                regs.add(fr.base),
+                fr.code,
+                (*parent.code).bytecode.as_ptr().add(fr.ret_pc),
+                regs.add(parent.base),
+                0,
+            );
+        }
+        g = fr.parent;
+    }
+    let fr = frames[frame];
+    interp::Resume {
+        regs: unsafe { regs.add(fr.base) },
+        pc: unsafe { (*fr.code).bytecode.as_ptr().add(pc) },
+        acc,
+    }
+}
+
+/// `call` stencils: run the call `site` (a `CallSite`) describes, over the
+/// compiled frame `regs`. `EMPTY` on an error.
+extern "C" fn toi_rt_call(regs: Value, site: Value) -> Value {
+    unsafe {
+        let site = &*(site.to_bits() as *const CallSite);
+        interp::call_from_jit(
+            &mut *site.vm,
+            regs.to_bits() as *mut Value,
+            site.op,
+            site.f,
+            site.w,
+            site.argc,
+            site.frame,
+        )
+    }
 }
 
 #[cfg(test)]

@@ -2071,8 +2071,8 @@ fn direct_self_recursion() {
 /// `sum(n) = n + sum(n - 1)` from 2147483000: the add overflows int32 in
 /// a callee called directly by the same code (its exit finishes in the
 /// interpreter, from the code's own record), and the results are doubles
-/// from then on. 2000 deep: past the native depth limit, calls go through
-/// the runtime.
+/// from then on. 15000 deep: past the native stack limit, the interpreter
+/// makes the calls (without the limit, a 2 MiB test thread overflows).
 #[test]
 fn exits_in_direct_self_calls() {
     let sum = "\
@@ -2091,8 +2091,8 @@ base:   LdaSmi 2147483000
         Return
 end
 ";
-    let (v, _) = jit_function(&recursive_program("sum", 2000, sum), "sum");
-    assert_eq!(v, (2147483000u64 + 2000 * 2001 / 2).to_string());
+    let (v, _) = jit_function(&recursive_program("sum", 15000, sum), "sum");
+    assert_eq!(v, (2147483000u64 + 15000 * 15001 / 2).to_string());
 }
 
 /// At i = 300 the argument is near the int32 limit: the direct callee's

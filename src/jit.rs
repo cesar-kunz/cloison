@@ -308,7 +308,7 @@ fn runtime_function(name: &str) -> usize {
     match name {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
-        "toi_rt_call_direct" => toi_rt_call_direct as *const () as usize,
+        "toi_rt_enter" => toi_rt_enter as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
         "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
@@ -3161,7 +3161,7 @@ impl JitCode {
                             && fits_entry(this, &args, (*site).nparams as usize);
                         if ok {
                             (*site).bound = true;
-                            (*site).span = nregs + interp::HEADER;
+                            (*site).end_off = 8 * ((*site).frame + nregs + interp::HEADER) as u64;
                             self_sites.push(*k as usize);
                         }
                         ok
@@ -3800,27 +3800,32 @@ struct InlineFrame {
 /// A call compiled code makes (`call` and `call_direct` stencils): `op`'s
 /// operands, renamed into the compiled frame, and where a callee's frame
 /// goes (past every register the compiled code uses). For a direct call,
-/// the callee's compiled entry and how to set up its frame.
+/// the callee's compiled entry and what `call_direct` checks before calling
+/// it: the first fields, which it reads (`DirectSite` in
+/// `stencils/stencils.rs`).
+#[repr(C)]
 pub(crate) struct CallSite {
+    /// Entry address of the callee's compiled code; 0: always call through
+    /// the runtime.
+    entry: u64,
+    /// The function compiled: the callee register must hold it.
+    closure: u64,
+    /// The callee register's offset in bytes.
+    f_off: u64,
+    /// Where the callee's compiled frame (registers of its inlined frames
+    /// included) ends, in bytes from the caller's registers: it must end
+    /// before `stack_end`.
+    end_off: u64,
+    stack_end: u64,
+    /// The VM's native stack limit (see `interp::native_stack_low`).
+    native_limit: *const usize,
     vm: *mut crate::vm::Vm,
     op: Op,
     f: usize,
     w: usize,
     argc: usize,
     frame: usize,
-    /// The code epoch the lowering saw: the callee's bound version assumes
-    /// it.
-    epoch: u32,
-    /// Entry address of the callee's compiled code; 0: always call through
-    /// the runtime.
-    entry: u64,
-    /// The function compiled: the callee register must hold it.
-    closure: u64,
     nparams: u32,
-    nregs: u32,
-    /// Bytes the callee's compiled frame spans (registers of inlined frames
-    /// included).
-    span: usize,
     /// Exits of the callee's code at this site: past [`MAX_DIRECT_EXITS`],
     /// calls go through the runtime (`entry` = 0).
     exits: u32,
@@ -3857,7 +3862,7 @@ unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
         Some(bound) => Rc::ptr_eq(bound, &code),
         None => {
             site.entry = code.entry_addr();
-            site.span = nregs + interp::HEADER;
+            site.end_off = 8 * (site.frame + nregs + interp::HEADER) as u64;
             site.target = Some(code);
             site.bound = true;
             true
@@ -4113,18 +4118,19 @@ impl Lowering<'_> {
                     let vm = self.state.vm;
                     let callee_frame = base + code.nregs as usize + interp::HEADER;
                     let mut site = CallSite {
+                        entry: 0,
+                        closure: 0,
+                        f_off: 8 * i.reg as u64,
+                        end_off: 0,
+                        stack_end: unsafe { (*vm).stack_end } as u64,
+                        native_limit: unsafe { &raw const (*vm).native_limit },
                         vm,
                         op: i.op,
                         f: i.reg as usize,
                         w: i.reg2 as usize,
                         argc: i.imm as usize,
                         frame: callee_frame,
-                        epoch: unsafe { (*vm).code_epoch },
-                        entry: 0,
-                        closure: 0,
                         nparams: 0,
-                        nregs: 0,
-                        span: 0,
                         exits: 0,
                         callee: std::ptr::null(),
                         target: None,
@@ -4201,7 +4207,6 @@ impl Lowering<'_> {
         }
         site.closure = fo as u64;
         site.nparams = unsafe { (*callee).nparams };
-        site.nregs = unsafe { (*callee).nregs };
         site.callee = callee;
         true
     }
@@ -5113,41 +5118,144 @@ unsafe fn materialize(
     }
 }
 
-/// `call_direct` stencils: run the call `site` (a `CallSite`) describes,
-/// over the compiled frame `regs`, straight in the callee's compiled code if
-/// it can: the callee register holds the function compiled, the code epoch
-/// is the one the callee's version was bound under, and the native stack
-/// and the VM stack have room. Otherwise as `toi_rt_call`. `EMPTY` on an
-/// error. The compiled code has set the callee's frame up (see
-/// `Lowering::direct_setup`).
+/// `call_direct` stencils, once their checks passed: call the compiled
+/// entry of the callee of `site` (a `CallSite`), whose frame the compiled
+/// frame `regs` has set up (see `Lowering::direct_setup`). `EMPTY` on an
+/// error.
 ///
 /// Its region's wrapper saves the slot registers the region uses, as for
-/// any runtime call, and the asm call into the callee's code ([`call_code`])
-/// declares every other register clobbered, so this function's prologue
-/// saves the C ABI's callee-saved ones. Doing the call here, rather than in
-/// the stencil, keeps LLVM from saving every slot register in the stencil.
-extern "C" fn toi_rt_call_direct(regs: Value, site: Value) -> Value {
-    unsafe {
-        let site = site.to_bits() as *mut CallSite;
-        let vm = (*site).vm;
-        let caller = regs.to_bits() as *mut Value;
-        let callee = caller.add((*site).frame);
-        if (*site).entry == 0
-            || (*caller.add((*site).f)).to_bits() != (*site).closure
-            || (*vm).code_epoch != (*site).epoch
-            || interp::native_stack_low(&*vm)
-            || callee.add((*site).span) > (*vm).stack_end
-        {
-            return toi_rt_call(regs, Value::from_bits(site as u64));
-        }
-        let mut ctx = NO_EXIT;
-        let v = call_code((*site).entry, callee, &mut ctx);
-        if ctx == NO_EXIT {
-            v
-        } else {
-            direct_exit(&mut *vm, caller, &mut *site, ctx, v)
-        }
-    }
+/// any runtime call. The callee's code uses every register freely, so this
+/// trampoline saves the C ABI's callee-saved ones. It sets up what the code
+/// expects (`acc` = `undefined`, the frame, the tag, an exit cell on its
+/// stack; the slots start with garbage, as the code's entry loads those it
+/// uses from the frame) and calls the entry. If the code exited,
+/// [`toi_direct_exit`] finishes the call. In asm, it costs about a third of
+/// a Rust function doing the same through inline asm, which had to align the
+/// stack and step over the red zone around the call.
+#[cfg(target_arch = "x86_64")]
+#[unsafe(naked)]
+extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
+    core::arch::naked_asm!(
+        // Too deep in native calls: through the runtime (a tail call).
+        "mov rax, [rsi + {limit}]",
+        "cmp rsp, [rax]",
+        "jb {call}",
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // Aligned again: [rsp] the exit cell, then `regs` and `site`.
+        "sub rsp, 24",
+        "mov [rsp + 8], rdi",
+        "mov [rsp + 16], rsi",
+        "mov dword ptr [rsp], {no_exit}",
+        "mov rax, [rsi + {frame}]",
+        "lea r13, [rdi + rax * 8]",
+        "movabs r14, {tag}",
+        "mov r15, rsp",
+        "mov r12d, {undefined}",
+        "call qword ptr [rsi]",
+        "cmp dword ptr [rsp], {no_exit}",
+        "jne 3f",
+        "2:",
+        "add rsp, 24",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        "3:",
+        "mov rcx, rax",
+        "mov edx, [rsp]",
+        "mov rsi, [rsp + 16]",
+        "mov rdi, [rsp + 8]",
+        "call {exit}",
+        "jmp 2b",
+        no_exit = const NO_EXIT as i32,
+        limit = const std::mem::offset_of!(CallSite, native_limit),
+        call = sym toi_rt_call,
+        frame = const std::mem::offset_of!(CallSite, frame),
+        tag = const Value::NUMBER_TAG,
+        undefined = const Value::UNDEFINED.to_bits(),
+        exit = sym toi_direct_exit,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
+    core::arch::naked_asm!(
+        // Too deep in native calls: through the runtime (a tail call).
+        "ldr x9, [x1, #{limit}]",
+        "ldr x9, [x9]",
+        "mov x10, sp",
+        "cmp x10, x9",
+        "b.lo {call}",
+        "stp x29, x30, [sp, #-192]!",
+        "mov x29, sp",
+        "stp x19, x20, [sp, #16]",
+        "stp x21, x22, [sp, #32]",
+        "stp x23, x24, [sp, #48]",
+        "stp x25, x26, [sp, #64]",
+        "stp x27, x28, [sp, #80]",
+        "stp d8, d9, [sp, #96]",
+        "stp d10, d11, [sp, #112]",
+        "stp d12, d13, [sp, #128]",
+        "stp d14, d15, [sp, #144]",
+        // `regs` and `site`, then the exit cell.
+        "stp x0, x1, [sp, #160]",
+        "mov w9, #-1",
+        "str w9, [sp, #176]",
+        "ldr x9, [x1, #{frame}]",
+        "add x21, x0, x9, lsl #3",
+        "mov x22, #{tag_hi}",
+        "lsl x22, x22, #48",
+        "add x23, sp, #176",
+        "mov x20, #{undefined}",
+        "ldr x9, [x1]",
+        "blr x9",
+        "ldr w9, [sp, #176]",
+        "cmn w9, #1",
+        "b.ne 3f",
+        "2:",
+        "ldp d14, d15, [sp, #144]",
+        "ldp d12, d13, [sp, #128]",
+        "ldp d10, d11, [sp, #112]",
+        "ldp d8, d9, [sp, #96]",
+        "ldp x27, x28, [sp, #80]",
+        "ldp x25, x26, [sp, #64]",
+        "ldp x23, x24, [sp, #48]",
+        "ldp x21, x22, [sp, #32]",
+        "ldp x19, x20, [sp, #16]",
+        "ldp x29, x30, [sp], #192",
+        "ret",
+        "3:",
+        "mov x3, x0",
+        "mov w2, w9",
+        "ldp x0, x1, [sp, #160]",
+        "bl {exit}",
+        "b 2b",
+        limit = const std::mem::offset_of!(CallSite, native_limit),
+        call = sym toi_rt_call,
+        frame = const std::mem::offset_of!(CallSite, frame),
+        tag_hi = const Value::NUMBER_TAG >> 48,
+        undefined = const Value::UNDEFINED.to_bits(),
+        exit = sym toi_direct_exit,
+    )
+}
+
+/// [`toi_rt_enter`]: the callee's code exited with `record` and `acc`.
+extern "C" fn toi_direct_exit(
+    regs: *mut Value,
+    site: *mut CallSite,
+    record: u32,
+    acc: Value,
+) -> Value {
+    unsafe { direct_exit(&mut *(*site).vm, regs, &mut *site, record, acc) }
 }
 
 /// A direct call's callee code exited with `record` and `acc`. Account for
@@ -5188,95 +5296,6 @@ unsafe fn direct_exit(
         let r = materialize(vm, callee_regs, code, frame, exit_pc, acc);
         interp::drive(vm, r.pc, r.acc, r.regs)
     }
-}
-
-/// Call compiled code at `entry` over the frame `regs`, as `call_entry`
-/// does but from compiled code's runtime call: the code uses every slot and
-/// scratch register freely, so they are all declared clobbered (a Rust call
-/// through a `preserve_none` function pointer isn't enough: on arm64, LLVM
-/// assumes some of the slot registers survive it). `acc` starts
-/// `undefined`; the slots start with garbage, as the code's entry loads
-/// those it uses (registers live at entry) from the frame.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-unsafe fn call_code(entry: u64, regs: *mut Value, ctx: *mut u32) -> Value {
-    let r: u64;
-    let u = Value::UNDEFINED.to_bits();
-    unsafe {
-        // Step over the red zone and align for the call, keeping the old
-        // rsp on the stack; rbx and rbp are saved by hand (asm can't clobber
-        // them, but compiled code may use them).
-        core::arch::asm!(
-            "mov r10, rsp",
-            "lea rsp, [rsp - 128]",
-            "and rsp, -16",
-            "push r10",
-            "push rbx",
-            "push rbp",
-            "sub rsp, 8",
-            "call {e}",
-            "add rsp, 8",
-            "pop rbp",
-            "pop rbx",
-            "pop rsp",
-            e = in(reg) entry,
-            inout("r12") u => _,
-            inout("r13") regs => _,
-            inout("r14") NumberTag::new().to_bits() => _,
-            inout("r15") ctx => _,
-            out("rdi") _,
-            out("rsi") _,
-            out("rdx") _,
-            out("rcx") _,
-            out("r8") _,
-            out("r9") _,
-            out("rax") r,
-            out("r10") _,
-            out("r11") _,
-            out("xmm0") _, out("xmm1") _, out("xmm2") _, out("xmm3") _,
-            out("xmm4") _, out("xmm5") _, out("xmm6") _, out("xmm7") _,
-            out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
-            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
-        );
-    }
-    Value::from_bits(r)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn call_code(entry: u64, regs: *mut Value, ctx: *mut u32) -> Value {
-    let r: u64;
-    let u = Value::UNDEFINED.to_bits();
-    unsafe {
-        // x19 and x29 (fp) are saved by hand (asm can't clobber them), with
-        // the link register.
-        core::arch::asm!(
-            "stp x29, x30, [sp, #-32]!",
-            "str x19, [sp, #16]",
-            "blr {e}",
-            "ldr x19, [sp, #16]",
-            "ldp x29, x30, [sp], #32",
-            e = in(reg) entry,
-            inout("x20") u => _,
-            inout("x21") regs => _,
-            inout("x22") NumberTag::new().to_bits() => _,
-            inout("x23") ctx => _,
-            out("x24") _, out("x25") _, out("x26") _, out("x27") _, out("x28") _,
-            out("x0") r,
-            out("x1") _, out("x2") _, out("x3") _, out("x4") _, out("x5") _, out("x6") _,
-            out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _,
-            out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _,
-            out("x17") _, out("x18") _, out("x30") _,
-            out("v0") _, out("v1") _, out("v2") _, out("v3") _, out("v4") _,
-            out("v5") _, out("v6") _, out("v7") _, out("v8") _, out("v9") _,
-            out("v10") _, out("v11") _, out("v12") _, out("v13") _, out("v14") _,
-            out("v15") _, out("v16") _, out("v17") _, out("v18") _, out("v19") _,
-            out("v20") _, out("v21") _, out("v22") _, out("v23") _, out("v24") _,
-            out("v25") _, out("v26") _, out("v27") _, out("v28") _, out("v29") _,
-            out("v30") _, out("v31") _,
-        );
-    }
-    Value::from_bits(r)
 }
 
 /// `call` stencils: run the call `site` (a `CallSite`) describes, over the

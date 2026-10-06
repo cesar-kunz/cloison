@@ -2095,6 +2095,142 @@ end
     assert_eq!(v, (2147483000u64 + 15000 * 15001 / 2).to_string());
 }
 
+/// When `k` is 7 (every 8th call), `f1` calls `h`, which it hadn't when
+/// it was first compiled: that version leaves there. The exit makes `f1`
+/// compile again, and the direct call site binds the new version at the
+/// next call, instead of calling the old one until it gives up.
+#[test]
+fn direct_calls_rebind_after_callee_exits() {
+    let pad: String = (0..64).map(|_| "        AddSmi 1\n").collect();
+    let src = format!(
+        "\
+script
+        CreateClosure f1
+        StaGlobal f
+        CreateClosure h
+        StaGlobal h
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function h()
+        LdaSmi 0
+        Return
+end
+function f1(k)                  ; k + (0 + … + 9) + 64, calling h() if k is 7
+        Ldar r1
+        TestEqualSmi 7
+        JumpIfFalse go
+        LdaGlobal h
+        Star r5
+        CallUndefined r5, r6, 0
+go:     Ldar r1
+        Star r3
+        LdaSmi 0
+        Star r2
+loop:   Ldar r2
+        Add r3
+        Star r3
+        Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 10, loop
+        Ldar r3
+{pad}        Return
+end
+function main()                 ; r1 i, r2 total, r3 f, r4 arg
+        LdaGlobal f
+        Star r3
+        LdaSmi 0
+        Star r1
+        Star r2
+top:    Ldar r1
+        BitAndSmi 7
+        Star r4
+        CallUndefined r3, r4, 1
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 500, top
+        Ldar r2
+        Return
+end
+"
+    );
+    let expected: u64 = (0..500u64).map(|i| (i & 7) + 109).sum();
+    let m = toi::asm::parse(&src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(2);
+    assert_eq!(display(vm.run(&m).unwrap()), expected.to_string());
+    assert_eq!(ok(&src), expected.to_string());
+    assert_eq!(vm.jit_bound_direct_calls("main"), 1);
+}
+
+/// `fib` split over `f` and `g`, which call each other (`pad` after their
+/// base cases), and a script calling `f(n)`.
+fn mutual_program(n: i32, pad: usize) -> String {
+    let pad: String = (0..pad).map(|_| "        AddSmi 0\n").collect();
+    let function = |name: &str, other: &str| {
+        format!(
+            "function {name}(n)\n        Ldar r1\n        JumpIfLessSmi 2, base\n\
+             \x20       LdaGlobal {other}\n        Star r2\n        Ldar r1\n        AddSmi -1\n\
+             \x20       Star r3\n        CallUndefined r2, r3, 1\n        Star r4\n        Ldar r1\n\
+             \x20       AddSmi -2\n        Star r3\n        CallUndefined r2, r3, 1\n        Add r4\n\
+             \x20       Return\nbase:   Ldar r1\n{pad}        Return\nend\n"
+        )
+    };
+    format!(
+        "script\n        CreateClosure f\n        StaGlobal f\n        CreateClosure g\n\
+         \x20       StaGlobal g\n        LdaGlobal f\n        Star r1\n        LdaSmi {n}\n\
+         \x20       Star r2\n        CallUndefined r1, r2, 1\n        Return\nend\n{}{}",
+        function("f", "g"),
+        function("g", "f")
+    )
+}
+
+/// `f` and `g` call each other, so both are compiled at entry. `g` is
+/// small: inlined into `f`, whose calls (from the inlined `g`) are to
+/// itself.
+#[test]
+fn mutual_recursion_inlined() {
+    let (v, s) = jit_function(&mutual_program(20, 0), "f");
+    assert_eq!(v, "6765");
+    let typed = s
+        .iter()
+        .filter(|n| *n == "call_direct+check_acc_int")
+        .count();
+    assert!(typed >= 2, "{s:?}");
+}
+
+/// Too big to inline, `f` and `g` call each other directly. When `f`
+/// compiles, binding its calls compiles `g`, whose calls to `f` can't bind
+/// yet (`f` is being compiled): they bind at their first call. Their
+/// results are predicted from `f`'s prediction for itself (`ret_hint`),
+/// so all four calls are typed.
+#[test]
+fn mutual_recursion_direct() {
+    let src = mutual_program(20, 64);
+    let expected = ok(&src);
+    let m = toi::asm::parse(&src).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(display(vm.run(&m).unwrap()), expected);
+    assert_eq!(expected, "6765");
+    for name in ["f", "g"] {
+        let s = vm.jit_stencils(name).unwrap_or_default();
+        let typed = s
+            .iter()
+            .filter(|n| *n == "call_direct+check_acc_int")
+            .count();
+        assert_eq!(typed, 2, "{name}: {s:?}");
+        assert_eq!(vm.jit_bound_direct_calls(name), 2, "{name}");
+    }
+}
+
 /// At i = 300 the argument is near the int32 limit: the direct callee's
 /// add overflows and exits, inside the callee; the runtime finishes that
 /// call (once: `calls` would show a second) and later calls work on.

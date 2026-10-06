@@ -104,6 +104,11 @@ pub struct Code {
     /// Calls left before calls enter compiled code (below zero: they do;
     /// `i32::MAX`: never).
     pub(crate) calls_left: Cell<i32>,
+    /// What calls to the function are predicted to give, by its latest
+    /// compilation, or the one in progress: a direct call to it from a
+    /// function compiled meanwhile (mutual recursion) has no version of it
+    /// to predict from (see `jit::JitCode::compile`).
+    pub(crate) ret_hint: Cell<crate::jit::Ty>,
 }
 
 impl Code {
@@ -789,6 +794,7 @@ impl Vm {
             ctor_shape: Cell::new(std::ptr::null()),
             jit: RefCell::new(None),
             calls_left: Cell::new(i32::MAX),
+            ret_hint: Cell::new(crate::jit::Ty::Any),
         });
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
@@ -860,10 +866,12 @@ impl Vm {
 
     /// Load `module`'s functions; returns its top-level code.
     pub fn load(&mut self, module: &Module) -> *const Code {
+        let recursive = recursive_functions(module);
         let codes: Vec<*const Code> = module
             .functions
             .iter()
-            .map(|f| {
+            .zip(recursive)
+            .map(|(f, recursive)| {
                 let ics: Vec<UnsafeCell<Ic>> =
                     f.ics.iter().map(|_| UnsafeCell::new(Ic::EMPTY)).collect();
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern(n)).collect();
@@ -885,7 +893,8 @@ impl Vm {
                     ctor_capacity: Cell::new(INITIAL_CTOR_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
                     jit: RefCell::new(None),
-                    calls_left: Cell::new(if worth_entering_compiled(f) {
+                    ret_hint: Cell::new(crate::jit::Ty::Any),
+                    calls_left: Cell::new(if recursive || worth_entering_compiled(f) {
                         self.tier_calls
                     } else {
                         i32::MAX
@@ -920,6 +929,16 @@ impl Vm {
         };
     }
 
+    /// How many of `function`'s calls go straight into their callees'
+    /// compiled code (for tests).
+    pub fn jit_bound_direct_calls(&self, function: &str) -> usize {
+        let Some(code) = self.codes.iter().find(|c| c.name == function) else {
+            return 0;
+        };
+        let jit = code.jit.borrow();
+        jit.as_ref().map_or(0, |f| f.bound_direct_calls())
+    }
+
     /// The stencils of `function`'s most recent compiled code, if any (for
     /// tests).
     pub fn jit_stencils(&self, function: &str) -> Option<Vec<String>> {
@@ -946,15 +965,13 @@ impl Vm {
 /// hot: if it has a loop (whose back-edge budget restarts with each frame,
 /// so a short loop in a function called often never tiers up by itself),
 /// or at least [`ENTRY_COMPILE_SIZE`] instructions, or if it looks
-/// recursive: an inline cache looks up its own name (`LdaGlobal fib`), and
-/// its compiled code can then call itself directly. Entering compiled code
-/// costs a round trip through the driver, which a small loop-free function
-/// doesn't win back; when compiled code calls it, it is inlined instead.
+/// recursive (see [`recursive_functions`]): its compiled code can then call
+/// itself, or the functions it recurses through, directly. Entering
+/// compiled code costs a round trip through the driver, which a small
+/// loop-free function doesn't win back; when compiled code calls it, it is
+/// inlined instead.
 fn worth_entering_compiled(f: &crate::asm::FunctionDef) -> bool {
     use crate::bytecode::Op;
-    if f.ics.contains(&f.name) {
-        return true;
-    }
     let code = &f.code;
     let (mut pc, mut n) = (0, 0);
     while pc < code.len() {
@@ -973,6 +990,42 @@ fn worth_entering_compiled(f: &crate::asm::FunctionDef) -> bool {
 
 /// See [`worth_entering_compiled`].
 const ENTRY_COMPILE_SIZE: usize = 64;
+
+/// Which of `module`'s functions look recursive: they reach themselves
+/// through the names their inline caches look up (`LdaGlobal fib` in
+/// `fib`; `isOdd` naming `isEven`, which names `isOdd`).
+fn recursive_functions(module: &Module) -> Vec<bool> {
+    let fs = &module.functions;
+    let by_name: HashMap<&str, usize> = fs
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    let edges: Vec<Vec<usize>> = fs
+        .iter()
+        .map(|f| {
+            f.ics
+                .iter()
+                .filter_map(|n| by_name.get(n.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    (0..fs.len())
+        .map(|start| {
+            let mut seen = vec![false; fs.len()];
+            let mut work = edges[start].clone();
+            while let Some(i) = work.pop() {
+                if i == start {
+                    return true;
+                }
+                if !std::mem::replace(&mut seen[i], true) {
+                    work.extend(&edges[i]);
+                }
+            }
+            false
+        })
+        .collect()
+}
 
 fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {

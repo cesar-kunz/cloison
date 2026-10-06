@@ -2916,6 +2916,9 @@ struct VmCompile<'a> {
     direct_base: usize,
     /// The lowering's call sites (`Prop::Call` names them by index).
     sites: &'a [Box<std::cell::UnsafeCell<CallSite>>],
+    /// The function compiled (null for other code): its `ret_hint` follows
+    /// the predictions for its own results.
+    root: *const crate::vm::Code,
 }
 
 /// Compilation options.
@@ -2944,6 +2947,7 @@ impl JitCode {
             inline_base,
             direct_base,
             sites: vm_sites,
+            root,
         } = vm;
         let n = insns.len();
         let nregs = actual.regs.len();
@@ -3096,6 +3100,11 @@ impl JitCode {
             // that are `Any`, as those of a self call's result are then);
             // later rounds check that.
             let own = Ty::of_result(returned(insns, &ins, round == 0));
+            // Callees compiled for this round's direct calls predict calls
+            // back to this function (mutual recursion) from it.
+            if !root.is_null() {
+                unsafe { (*root).ret_hint.set(own) };
+            }
             let want: Vec<Ty> = (0..n)
                 .map(|i| match (&ins[i], props.get(i), widened) {
                     (
@@ -3110,8 +3119,13 @@ impl JitCode {
                             return own;
                         }
                         let (this, args) = call_types(i, st);
-                        unsafe { direct_version(site, this, &args) }
-                            .map_or(Ty::Any, |(code, _)| Ty::of_result(code.ret))
+                        match unsafe { direct_version(site, this, &args) } {
+                            Version::Ready(code, _) => Ty::of_result(code.ret),
+                            // Being compiled, further up: what its current
+                            // round predicts.
+                            Version::Busy => unsafe { (*(*site).callee).ret_hint.get() },
+                            Version::None => Ty::Any,
+                        }
                     }
                     _ => Ty::Any,
                 })
@@ -3576,13 +3590,17 @@ impl JitCode {
         }
 
         mem.seal();
+        let ret = returned(insns, &ins, false);
+        if !root.is_null() {
+            unsafe { (*root).ret_hint.set(Ty::of_result(ret)) };
+        }
         let code = JitCode {
             mem,
             entry: entry_at,
             main_len,
             stencils: names,
             homes,
-            ret: returned(insns, &ins, false),
+            ret,
             self_sites,
             snap: None,
         };
@@ -3613,6 +3631,19 @@ impl JitCode {
                 pc: pc as usize,
                 acc,
             },
+        }
+    }
+
+    /// Debugging: with `TOI_JIT_LOG` set, print the stencils of a VM
+    /// function's code, entered at bytecode offset `pc`.
+    fn log(&self, function: *const crate::vm::Code, pc: usize) {
+        if std::env::var_os("TOI_JIT_LOG").is_some() {
+            let names: Vec<&str> = self.stencils.iter().flatten().map(String::as_str).collect();
+            eprintln!(
+                "jit {} @{pc}: {}",
+                unsafe { &(*function).name },
+                names.join(" ")
+            );
         }
     }
 
@@ -3838,36 +3869,86 @@ pub(crate) struct CallSite {
     self_code: *const JitCode,
     /// Bound to a version (`target` or `self_code`), for good.
     bound: bool,
+    /// For a call to another function: the types of `this` and the
+    /// arguments the site was claimed with, by the first caller version
+    /// compiled to call directly. Only versions passing the same types may
+    /// call directly, as the callee's version is bound for those.
+    claim: Option<(Ty, Vec<Ty>)>,
+    /// Claimed, but the callee was being compiled (mutual recursion): bind
+    /// at a call ([`toi_rt_call`]).
+    pending: bool,
 }
 
 /// Exits of a direct callee before its call site stops calling directly.
 const MAX_DIRECT_EXITS: u32 = 4;
 
-/// Bind direct-call candidate `site` to a version of its callee entered
-/// with `this` and the arguments of the types `this` and `args` (the
-/// caller's types when compiling: facts, like entry types); the callee's
-/// other live registers hold `undefined`. False if there is none (the
-/// callee won't compile, or is being compiled: mutual recursion, its state
-/// is borrowed), or if the site is already bound to another version (by
-/// another version of the caller): the call then goes through the runtime.
+/// Claim direct-call candidate `site` for a caller version passing `this`
+/// and arguments of the types `this` and `args` (the caller's types when
+/// compiling: facts, like entry types), and bind it to a version of its
+/// callee entered with them; the callee's other live registers hold
+/// `undefined`. True if the caller version may call directly:
+///
+/// - the site is unclaimed, and there is such a version, or the callee is
+///   being compiled (mutual recursion: its state is borrowed), so that
+///   binding waits for a call (`pending`);
+/// - or the site was claimed with the same types.
+///
+/// False if it was claimed with other types (by another version of the
+/// caller), or the callee won't compile: the call then goes through the
+/// runtime.
 ///
 /// # Safety
 /// `site` must be a live call site of a VM function.
 unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
-    let Some((code, nregs)) = (unsafe { direct_version(site, this, args) }) else {
-        return false;
-    };
     let site = unsafe { &mut *site };
-    match &site.target {
-        Some(bound) => Rc::ptr_eq(bound, &code),
-        None => {
-            site.entry = code.entry_addr();
-            site.end_off = 8 * (site.frame + nregs + interp::HEADER) as u64;
-            site.target = Some(code);
-            site.bound = true;
+    if let Some((t, a)) = &site.claim {
+        return *t == this && a == args;
+    }
+    match unsafe { direct_version(site, this, args) } {
+        Version::Ready(code, nregs) => {
+            site.bind(code, nregs);
+            site.claim = Some((this, args.to_vec()));
             true
         }
+        Version::Busy => {
+            site.claim = Some((this, args.to_vec()));
+            site.pending = true;
+            true
+        }
+        Version::None => false,
     }
+}
+
+impl CallSite {
+    fn bind(&mut self, code: Rc<JitCode>, nregs: usize) {
+        self.entry = code.entry_addr();
+        self.end_off = 8 * (self.frame + nregs + interp::HEADER) as u64;
+        self.target = Some(code);
+        self.bound = true;
+    }
+
+    /// A pending site (see [`bind_direct`]): bind it if its callee isn't
+    /// being compiled anymore.
+    unsafe fn bind_pending(&mut self) {
+        let (this, args) = self.claim.clone().expect("a claimed site");
+        match unsafe { direct_version(self, this, &args) } {
+            Version::Ready(code, nregs) => {
+                self.bind(code, nregs);
+                self.pending = false;
+            }
+            Version::Busy => {}
+            Version::None => self.pending = false,
+        }
+    }
+}
+
+/// What [`direct_version`] found.
+enum Version {
+    Ready(Rc<JitCode>, usize),
+    /// The callee's state is borrowed: it is being compiled.
+    Busy,
+    /// The callee won't compile.
+    None,
 }
 
 /// The version of direct-call candidate `site`'s callee that [`bind_direct`]
@@ -3876,15 +3957,11 @@ unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
 ///
 /// # Safety
 /// As [`bind_direct`].
-unsafe fn direct_version(
-    site: *const CallSite,
-    this: Ty,
-    args: &[Ty],
-) -> Option<(Rc<JitCode>, usize)> {
+unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Version {
     let site = unsafe { &*site };
     let (callee, vm) = (site.callee, site.vm);
     let Ok(mut slot) = (unsafe { (*callee).jit.try_borrow_mut() }) else {
-        return None;
+        return Version::Busy;
     };
     let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, vm)));
     let nparams = site.nparams as usize;
@@ -3903,7 +3980,10 @@ unsafe fn direct_version(
                 .collect(),
         }
     };
-    unsafe { f.entry_version((*vm).proto_epoch, (*vm).field_epoch, make_state) }
+    match unsafe { f.entry_version((*vm).proto_epoch, (*vm).field_epoch, make_state) } {
+        Some((code, nregs)) => Version::Ready(code, nregs),
+        None => Version::None,
+    }
 }
 
 /// A lowering as compiled (see [`JitCode::snap`]).
@@ -4137,6 +4217,8 @@ impl Lowering<'_> {
                         self_call: false,
                         self_code: std::ptr::null(),
                         bound: false,
+                        claim: None,
+                        pending: false,
                     };
                     let direct = i.op != Op::Construct
                         && self.direct_target(frame, &i, &mut site)
@@ -4634,9 +4716,11 @@ impl JitFunction {
                 inline_base: vm.inline_base,
                 direct_base: vm.direct_base,
                 sites: &vm.snap.sites,
+                root: vm.root,
             },
         );
         code.snap = Some(vm.snap.clone());
+        code.log(vm.root, 0);
         let code = code.into_rc();
         self.versions
             .entry(entry)
@@ -4858,12 +4942,13 @@ impl JitFunction {
                 };
                 self.stats.compiles += 1;
                 let code = {
-                    let (props, feedback, inline_base, direct_base, sites): (
+                    let (props, feedback, inline_base, direct_base, sites, root): (
                         &[Prop],
                         _,
                         _,
                         _,
                         &[_],
+                        _,
                     ) = match &self.vm {
                         Some(vm) => (
                             &vm.props,
@@ -4871,8 +4956,9 @@ impl JitFunction {
                             vm.inline_base,
                             vm.direct_base,
                             &vm.snap.sites,
+                            vm.root,
                         ),
-                        None => (&[], None, self.nregs, usize::MAX, &[]),
+                        None => (&[], None, self.nregs, usize::MAX, &[], std::ptr::null()),
                     };
                     JitCode::compile(
                         &self.insns,
@@ -4886,11 +4972,15 @@ impl JitFunction {
                             inline_base,
                             direct_base,
                             sites,
+                            root,
                         },
                     )
                 };
                 let mut code = code;
-                code.snap = self.vm.as_ref().map(|vm| vm.snap.clone());
+                if let Some(vm) = &self.vm {
+                    code.snap = Some(vm.snap.clone());
+                    code.log(vm.root, self.insns[entry].pc);
+                }
                 let vs = self.versions.entry(entry).or_insert(keep);
                 vs.push((state, code.into_rc()));
                 vs.len() - 1
@@ -4987,8 +5077,23 @@ impl JitFunction {
 
     /// The most recently used code.
     pub fn last_code(&self) -> Option<&JitCode> {
-        let (entry, index) = self.last?;
+        let Some((entry, index)) = self.last else {
+            // Only compiled for direct calls: the latest entry version.
+            if self.versions.is_empty() {
+                return None;
+            }
+            let vs = self.versions.get(&self.index_of(0))?;
+            return vs.last().map(|(_, c)| &**c);
+        };
         self.versions.get(&entry)?.get(index).map(|(_, c)| &**c)
+    }
+
+    /// Direct calls of a VM function's current lowering that are bound to
+    /// a callee's code (for tests).
+    pub fn bound_direct_calls(&self) -> usize {
+        let Some(vm) = &self.vm else { return 0 };
+        let bound = |s: &std::cell::UnsafeCell<CallSite>| unsafe { (*s.get()).entry != 0 };
+        vm.snap.sites.iter().filter(|s| bound(s)).count()
     }
 
     /// Versions currently compiled, over all entry points.
@@ -5047,18 +5152,13 @@ pub(crate) unsafe fn vm_run(
         let compiles = f.stats.compiles;
         let prepared =
             unsafe { f.vm_prepare(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch) };
-        // Debugging: `TOI_JIT_LOG` prints each compilation's stencils;
-        // `TOI_JIT_DUMP=<file>` writes the last one's hot code.
+        // Debugging: `TOI_JIT_DUMP=<file>` writes the last compilation's
+        // hot code (`TOI_JIT_LOG`: see `JitCode::log`).
         if f.stats.compiles != compiles
             && let Some(c) = f.last_code()
+            && let Some(path) = std::env::var_os("TOI_JIT_DUMP")
         {
-            if std::env::var_os("TOI_JIT_LOG").is_some() {
-                let names: Vec<&str> = c.stencils.iter().flatten().map(String::as_str).collect();
-                eprintln!("jit {} @{pc}: {}", code.name, names.join(" "));
-            }
-            if let Some(path) = std::env::var_os("TOI_JIT_DUMP") {
-                std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
-            }
+            std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
         }
         prepared
     };
@@ -5277,10 +5377,13 @@ unsafe fn direct_exit(
         if vm.error.is_some() {
             return Value::EMPTY;
         }
+        // Through the runtime from now on, or for a site claimed by types,
+        // until the next call binds it again: the exit makes the callee
+        // lower its code again, and maybe compile another version (a call
+        // that hadn't run has run now).
         site.exits += 1;
-        if site.exits >= MAX_DIRECT_EXITS {
-            site.entry = 0;
-        }
+        site.entry = 0;
+        site.pending = site.claim.is_some() && site.exits < MAX_DIRECT_EXITS;
         let callee_regs = caller.add(site.frame);
         // A call to the code itself: that code is running (it made the
         // call), so it is alive.
@@ -5302,7 +5405,12 @@ unsafe fn direct_exit(
 /// compiled frame `regs`. `EMPTY` on an error.
 extern "C" fn toi_rt_call(regs: Value, site: Value) -> Value {
     unsafe {
-        let site = &*(site.to_bits() as *const CallSite);
+        let site = &mut *(site.to_bits() as *mut CallSite);
+        // A direct call whose callee was being compiled: bind it now, for
+        // the next calls.
+        if site.pending {
+            site.bind_pending();
+        }
         interp::call_from_jit(
             &mut *site.vm,
             regs.to_bits() as *mut Value,

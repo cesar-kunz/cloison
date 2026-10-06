@@ -802,3 +802,298 @@ end
 ";
     assert_eq!(jit(src).0, "334");
 }
+
+// ---- Field types ----
+
+/// A loop summing `o.x` over an object whose `x` is an int32, compiled with
+/// `x` typed int32; at i = 10, `o.x = -0` (a double: `-2 % 2`, kept in a
+/// global) makes the field a number. The interpreter generalizes it, and
+/// code compiled for the old type is dropped.
+#[test]
+fn a_field_generalizing_drops_compiled_code() {
+    let src = "\
+script
+        LdaSmi -2
+        ModSmi 2
+        StaGlobal nzero
+        CreateClosure P
+        StaGlobal P
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function P(x)
+        Ldar r1
+        SetNamed r0, x
+        LdaUndefined
+        Return
+end
+; r1 o, r2 i, r3 sum, r4-r5 temps
+function main()
+        LdaGlobal P
+        Star r4
+        LdaSmi 1
+        Star r5
+        Construct r4, r5, 1
+        Star r1                 ; o = new P(1)
+        LdaSmi 0
+        Star r2
+        Star r3
+loop:   GetNamed r1, x
+        Add r3
+        Star r3                 ; sum += o.x
+        Ldar r2
+        TestEqualSmi 10
+        JumpIfFalse next
+        LdaGlobal nzero
+        SetNamed r1, x          ; o.x = -0
+next:   Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 20, loop
+        Ldar r3
+        Return
+end
+";
+    // 11 × 1, then 9 × -0.
+    let (v, s) = jit(src);
+    assert_eq!(v, "11");
+    // Recompiled with `x` a number: loaded into `facc`.
+    assert!(s.iter().any(|n| n.ends_with("+unbox_num_acc")), "{s:?}");
+}
+
+/// `box.v` holds objects of shape A, so `box.v.n` is loaded without a
+/// guard; at i = 10 the compiled loop stores a B there (`n` at another
+/// offset). The store's check of the value against the field's type must
+/// exit, so the interpreter generalizes the field before the store.
+#[test]
+fn object_typed_fields_generalize_on_another_shape() {
+    let src = "\
+script
+        CreateClosure Box
+        StaGlobal Box
+        CreateClosure A
+        StaGlobal A
+        CreateClosure B
+        StaGlobal B
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function Box(v)
+        Ldar r1
+        SetNamed r0, v
+        LdaUndefined
+        Return
+end
+function A()                    ; { n: 1 }
+        LdaSmi 1
+        SetNamed r0, n
+        LdaUndefined
+        Return
+end
+function B()                    ; { pad: 0, n: 100 }: n at another offset
+        LdaSmi 0
+        SetNamed r0, pad
+        LdaSmi 100
+        SetNamed r0, n
+        LdaUndefined
+        Return
+end
+; r1 box, r2 i, r3 sum, r4-r8 temps, r9 [new A(), new B()]
+function main()
+        CreateArray
+        Star r9
+        GetNamed r9, push
+        Star r4
+        Mov r9, r5
+        LdaGlobal A
+        Star r7
+        Construct r7, r8, 0
+        Star r6
+        Call r4, r5, 1
+        LdaGlobal B
+        Star r7
+        Construct r7, r8, 0
+        Star r6
+        Call r4, r5, 1
+        LdaGlobal Box
+        Star r4
+        LdaSmi 0
+        GetKeyed r9
+        Star r5
+        Construct r4, r5, 1
+        Star r1                 ; box = new Box(a[0])
+        LdaSmi 0
+        Star r2
+        Star r3
+loop:   GetNamed r1, v
+        Star r4
+        GetNamed r4, n
+        Add r3
+        Star r3                 ; sum += box.v.n
+        Ldar r2
+        TestEqualSmi 10
+        JumpIfFalse next
+        LdaSmi 1
+        GetKeyed r9
+        SetNamed r1, v          ; box.v = a[1], a B
+next:   Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 20, loop
+        Ldar r3
+        Return
+end
+";
+    // 11 × 1, then 9 × 100.
+    let (v, s) = jit(src);
+    assert_eq!(v, "911");
+    let _ = s;
+}
+
+/// Field types are assumed by compiled code even where no inline cache
+/// says so: here `o.y` is first loaded at i = 15, in compiled code, typed
+/// from `o`'s shape, int32. At i = 5 another function (called, so in the
+/// interpreter) stores a double into `o.y`. Nothing in `main`'s caches
+/// changes; only the field epoch drops the code assuming int32.
+#[test]
+fn field_types_changed_elsewhere_drop_compiled_code() {
+    let src = "\
+script
+        LdaSmi 2147483647
+        AddSmi 3
+        StaGlobal big           ; 2147483650, a double
+        CreateClosure P
+        StaGlobal P
+        CreateClosure g
+        StaGlobal g
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function P(y)
+        Ldar r1
+        SetNamed r0, y
+        LdaUndefined
+        Return
+end
+function g()                    ; O.y = big
+        LdaGlobal O
+        Star r1
+        LdaGlobal big
+        SetNamed r1, y
+        LdaUndefined
+        Return
+end
+; r1 o, r2 i, r3 sum, r4-r5 temps, r6 g
+function main()
+        LdaGlobal P
+        Star r4
+        LdaSmi 1
+        Star r5
+        Construct r4, r5, 1
+        Star r1
+        StaGlobal O             ; O = o = new P(1)
+        LdaGlobal g
+        Star r6                 ; loaded before the loop: no cache of main's
+        LdaSmi 0                ; changes when g runs
+        Star r2
+        Star r3
+loop:   Ldar r2
+        TestEqualSmi 5
+        JumpIfFalse late
+        CallUndefined r6, r5, 0 ; g()
+late:   Ldar r2
+        JumpIfLessSmi 15, next
+        GetNamed r1, y
+        Add r3
+        Star r3                 ; sum += o.y, for i >= 15
+next:   Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 20, loop
+        Ldar r3
+        Return
+end
+";
+    assert_eq!(jit(src).0, "10737418250");
+}
+
+/// An interpreter store whose cache hits must still check the value
+/// against the field's type: `set(o, 1)` caches the store with `y` an
+/// int32, then `set(o, big)` hits that cache with a double. The field must
+/// generalize there, or the compiled loop after it would read `o.y` as an
+/// int32.
+#[test]
+fn cached_interpreter_stores_check_field_types() {
+    let src = "\
+script
+        LdaSmi 2147483647
+        AddSmi 3
+        StaGlobal big           ; 2147483650, a double
+        CreateClosure P
+        StaGlobal P
+        CreateClosure set
+        StaGlobal set
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function P(y)
+        Ldar r1
+        SetNamed r0, y
+        LdaUndefined
+        Return
+end
+function set(o, v)              ; o.y = v
+        Ldar r2
+        SetNamed r1, y
+        LdaUndefined
+        Return
+end
+; r1 o, r2 i, r3 sum, r4-r6 temps
+function main()
+        LdaGlobal P
+        Star r4
+        LdaSmi 1
+        Star r5
+        Construct r4, r5, 1
+        Star r1                 ; o = new P(1)
+        LdaGlobal set
+        Star r4
+        Mov r1, r5
+        LdaSmi 1
+        Star r6
+        CallUndefined r4, r5, 2 ; set(o, 1)
+        LdaGlobal big
+        Star r6
+        CallUndefined r4, r5, 2 ; set(o, big)
+        LdaSmi 0
+        Star r2
+        Star r3
+loop:   GetNamed r1, y
+        Add r3
+        Star r3
+        Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 10, loop
+        Ldar r3
+        Return
+end
+";
+    assert_eq!(jit(src).0, "21474836500");
+}

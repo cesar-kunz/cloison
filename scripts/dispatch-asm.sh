@@ -20,7 +20,7 @@ cargo build --release --quiet --bin dispatch_bench --target "$triple"
   awk -v target="$TARGET" -v arch="${1:-x86_64}" '
     /^<toi::interp::(op|i32|slow)_/ { name = $1; gsub(/[<>:]/, "", name); sub(/^toiinterp/, "", name); n = 0; print; next }
     name && /^$/  { printf "  ; %d instructions\n\n", n; if (name == "op_nop") nop = n; name = ""; next }
-    name && !/int3|udf|\.word/ { n++; print }
+    name && !/int3|udf|\.word|^[[:space:]]*\.\.\.$/ { n++; print }
     END {
       printf "%s dispatch length (op_nop): %d instructions (target <= %d)\n", arch, nop, target
       exit (nop > 0 && nop <= target) ? 0 : 1

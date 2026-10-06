@@ -230,6 +230,7 @@ macro_rules! handlers {
         #[allow(unused_assignments, unused_macros, unused_variables)]
         // `dispatch!` hands `next` to a `nomem` asm block, which never dereferences it.
         #[allow(clippy::pointers_in_nomem_asm_block)]
+        #[rustc_align(64)]
         extern "rust-preserve-none" fn $name(
             $pc: *const u8,
             #[allow(unused_mut)] mut $acc: Value,
@@ -812,7 +813,7 @@ handlers! {
     fn op_sta_global(pc, acc, regs, tag) {
         let g = (*frame_vm(regs)).global;
         let ic = ic_at(regs, pc, 1);
-        if (*g).shape == (*ic).shape {
+        if (*g).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
             *Object::slot(g, (*ic).loc) = acc;
             next!(any, Op::StaGlobal.size(), acc)
         }
@@ -845,7 +846,28 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let ic = ic_at(regs, pc, 2);
-            if (*o).shape == (*ic).shape {
+            if (*o).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
+                let new = (*ic).new_shape;
+                if !new.is_null() {
+                    (*o).shape = new;
+                }
+                *Object::slot(o, (*ic).loc) = acc;
+                next!(any, Op::SetNamed.size(), acc)
+            }
+        }
+        tail!(slow_set_named, acc)
+    }
+
+    // `acc` is an int32: it fits any field type up to a number (encoded 0,
+    // 1, 2), so the check is one compare. Also saves `i32_to_any`'s second
+    // dispatch.
+    fn i32_set_named(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        let acc = tag.rebox(acc);
+        if is_cell(tag, obj) {
+            let o = as_object(obj);
+            let ic = ic_at(regs, pc, 2);
+            if (*o).shape == (*ic).shape && ((*ic).holder as u64) <= 2 {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
                     (*o).shape = new;
@@ -1375,6 +1397,7 @@ static TABLE_I32: Table = {
     t[Op::JumpIfToBooleanTrue as usize] = i32_jump_if_to_boolean_true;
     t[Op::JumpIfToBooleanFalse as usize] = i32_jump_if_to_boolean_false;
     t[Op::GetKeyed as usize] = i32_get_keyed;
+    t[Op::SetNamed as usize] = i32_set_named;
     t[Op::TestLessThanJumpIfTrue as usize] = i32_test_less_than_jump_if_true;
     t[Op::TestEqualSmiJumpIfTrue as usize] = i32_test_equal_smi_jump_if_true;
     t[Op::TestLessThanJumpIfFalse as usize] = i32_test_less_than_jump_if_false;
@@ -1524,6 +1547,18 @@ fn construct_result(regs: *mut Value, acc: Value) -> Value {
 #[inline(never)]
 fn construct_this(regs: *mut Value, f: *mut Object) -> Value {
     unsafe { (*frame_vm(regs)).construct_this(f) }
+}
+
+/// Whether `v` fits the field type a store's inline cache holds (encoded by
+/// `FieldType::encode`; 0, the common case, checks nothing).
+#[inline(always)]
+fn fits_field(tag: NumberTag, want: u64, v: Value) -> bool {
+    match want {
+        0 => true,
+        1 => tag.is_int32(v),
+        2 => v.to_bits() & tag.to_bits() != 0,
+        s => is_cell(tag, v) && unsafe { *(v.to_bits() as *const u64) } == s,
+    }
 }
 
 /// Whether `v` is a cell (a heap pointer), testing against the tag

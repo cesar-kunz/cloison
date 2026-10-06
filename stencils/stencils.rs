@@ -2070,3 +2070,37 @@ stencil!("sta_global_oop"; |s| {
 // An instruction the JIT doesn't compile (a call, `return` in a VM frame,
 // an allocation, an uncached property access): leave for the interpreter.
 stencil!("bail"; |s| { exit!(s) });
+
+// ---- Field types ----
+
+// A store's value against its field's type (`object::FieldType`), when the
+// value's type doesn't prove it fits: exit before the store, so the
+// interpreter generalizes the field.
+stencil!("check_acc_int"; |s| {
+    if !s.tag.is_int32(s.acc) {
+        exit!(s)
+    }
+    next!(s)
+});
+stencil!("check_acc_num"; |s| {
+    if s.acc.to_bits() & s.tag.to_bits() == 0 {
+        exit!(s)
+    }
+    next!(s)
+});
+stencil!("check_acc_shape"; |s| {
+    if !is_cell(s.tag, s.acc) || *(s.acc.to_bits() as *const u64) != imm64() {
+        exit!(s)
+    }
+    next!(s)
+});
+
+// A number loaded from a field typed `Num`, into `facc`.
+stencil!("unbox_num_acc"; |s| {
+    s.facc = if s.tag.is_int32(s.acc) {
+        int(s.acc) as f64
+    } else {
+        s.tag.decode_f64(s.acc)
+    };
+    next!(s)
+});

@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::asm::Module;
-use crate::object::{Atom, Class, Heap, Object, PROTOTYPE, Shape, as_object, object_value};
+use crate::object::{
+    Atom, Class, FieldType, Heap, Object, PROTOTYPE, Shape, as_object, field_fits, object_value,
+};
 use crate::value::Value;
 
 /// A JS exception, or a feature not implemented yet. There is no `try`
@@ -49,7 +51,10 @@ pub type NativeFn = fn(&mut Vm, Value, &[Value]) -> Result<Value>;
 /// the value is at `loc` in the receiver, or, if `holder` is set, in that
 /// prototype, provided no prototype has changed shape since (`epoch`). A
 /// store hits on `shape` too, and moves the object to `new_shape` first if
-/// set (a cached transition, always to an in-object slot). 32 bytes, so
+/// set (a cached transition, always to an in-object slot). For a store,
+/// `holder` is instead the field's type, encoded by [`FieldType::encode`]:
+/// the stored value must fit it, or the store takes the slow path, which
+/// generalizes it. 32 bytes, so
 /// indexing is a shift; the property name is kept apart, in
 /// [`Code::ic_names`], as only misses need it.
 #[repr(C)]
@@ -63,6 +68,7 @@ pub struct Ic {
 }
 
 const _: () = assert!(size_of::<Ic>() == 32);
+const _: fn(u64, Value) -> bool = field_fits;
 
 impl Ic {
     const EMPTY: Ic = Ic {
@@ -115,6 +121,7 @@ const STACK_VALUES: usize = 1 << 18;
 pub struct Vm {
     pub heap: Heap,
     shapes: Vec<Box<Shape>>,
+    field_cells: Vec<Box<Cell<FieldType>>>,
     roots: HashMap<(Class, u64, u32), *const Shape>,
     atoms: Vec<String>,
     atom_ids: HashMap<String, Atom>,
@@ -125,6 +132,8 @@ pub struct Vm {
     pub array_prototype: *mut Object,
     /// Bumped whenever a prototype changes shape; see [`Ic`].
     pub proto_epoch: u32,
+    /// Bumped whenever a field's type generalizes (see [`FieldType`]).
+    pub field_epoch: u32,
     pub(crate) error: Option<Error>,
     pub(crate) stack: Box<[Value]>,
     pub(crate) stack_end: *mut Value,
@@ -154,6 +163,7 @@ impl Vm {
         let mut vm = Vm {
             heap: Heap::default(),
             shapes: Vec::new(),
+            field_cells: Vec::new(),
             roots: HashMap::new(),
             atoms: Vec::new(),
             atom_ids: HashMap::new(),
@@ -163,6 +173,7 @@ impl Vm {
             function_prototype: std::ptr::null_mut(),
             array_prototype: std::ptr::null_mut(),
             proto_epoch: 0,
+            field_epoch: 0,
             error: None,
             stack,
             stack_end,
@@ -242,6 +253,7 @@ impl Vm {
             proto,
             capacity,
             keys: Vec::new(),
+            fields: Vec::new(),
             unique: false,
             transitions: RefCell::default(),
         });
@@ -260,11 +272,16 @@ impl Vm {
         }
         let mut keys = s.keys.clone();
         keys.push(name);
+        let cell = Box::new(Cell::new(FieldType::None));
+        let mut fields = s.fields.clone();
+        fields.push(&*cell);
+        self.field_cells.push(cell);
         let t = self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
             capacity: s.capacity,
             keys,
+            fields,
             unique: s.unique,
             transitions: RefCell::default(),
         });
@@ -289,6 +306,7 @@ impl Vm {
                 proto: s.proto,
                 capacity: s.capacity,
                 keys: s.keys.clone(),
+                fields: s.fields.clone(),
                 unique: true,
                 transitions: RefCell::default(),
             };
@@ -333,11 +351,31 @@ impl Vm {
                 }
             }
             (*o).shape = new;
-            *Object::slot(o, ns.location(slot)) = value;
+            self.store_field(o, slot, value);
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
             slot
+        }
+    }
+
+    /// Write `value` to slot `slot` of `o`, generalizing the field's type
+    /// first if `value` doesn't fit it. Every store to a field that doesn't
+    /// go through an inline cache whose check passed must use this.
+    pub(crate) fn store_field(&mut self, o: *mut Object, slot: u32, value: Value) {
+        unsafe {
+            let shape = &*(*o).shape;
+            let cell = &*shape.fields[slot as usize];
+            let old = cell.get();
+            let new = old.join(FieldType::of(value));
+            if new != old {
+                cell.set(new);
+                // Nothing can have relied on an empty field.
+                if old != FieldType::None {
+                    self.field_epoch = self.field_epoch.wrapping_add(1);
+                }
+            }
+            *Object::slot(o, shape.location(slot)) = value;
         }
     }
 
@@ -396,7 +434,7 @@ impl Vm {
                 return Err(Error::unsupported("setting an array's length"));
             }
             match (*(*o).shape).lookup(name) {
-                Some(slot) => *Object::slot(o, (*(*o).shape).location(slot)) = value,
+                Some(slot) => self.store_field(o, slot, value),
                 // No setters or read-only properties on the chain yet.
                 None => {
                     self.add_property(o, name, value);
@@ -457,11 +495,11 @@ impl Vm {
                 return Err(Error::unsupported("setting an array's length"));
             }
             if let Some(slot) = (*old).lookup(name) {
-                let loc = (*old).location(slot);
-                *Object::slot(o, loc) = value;
+                self.store_field(o, slot, value);
                 *ic = Ic {
                     shape: old,
-                    loc,
+                    holder: (*old).field_type(slot).encode() as *mut Object,
+                    loc: (*old).location(slot),
                     ..Ic::EMPTY
                 };
                 return Ok(());
@@ -471,6 +509,7 @@ impl Vm {
             if !(*old).unique && slot < (*new).capacity {
                 *ic = Ic {
                     shape: old,
+                    holder: (*new).field_type(slot).encode() as *mut Object,
                     new_shape: new,
                     loc: (*new).location(slot),
                     ..Ic::EMPTY
@@ -502,11 +541,11 @@ impl Vm {
             let shape = (*g).shape;
             match (*shape).lookup(name) {
                 Some(slot) => {
-                    let loc = (*shape).location(slot);
-                    *Object::slot(g, loc) = value;
+                    self.store_field(g, slot, value);
                     *ic = Ic {
                         shape,
-                        loc,
+                        holder: (*shape).field_type(slot).encode() as *mut Object,
+                        loc: (*shape).location(slot),
                         ..Ic::EMPTY
                     };
                 }
@@ -615,8 +654,8 @@ impl Vm {
             let f = self.heap.alloc_object(&*self.function_shape);
             (*f).code = callee;
             let p = self.heap.alloc_object(&*self.proto_object_shape);
-            *Object::inline(p, 0) = object_value(f);
-            *Object::inline(f, 0) = object_value(p);
+            self.store_field(p, 0, object_value(f));
+            self.store_field(f, 0, object_value(p));
             object_value(f)
         }
     }

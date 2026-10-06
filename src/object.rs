@@ -32,7 +32,7 @@
 //! Property attributes are not modelled: every property is a writable,
 //! enumerable, configurable data property.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::value::Value;
 use crate::vm::Code;
@@ -102,6 +102,79 @@ impl Object {
     }
 }
 
+/// What every value ever stored in a field has been, for each field of a
+/// shape. The JIT types values loaded from the field with it.
+///
+/// A field's type lives in a cell made by the transition that added the
+/// field and shared by every shape descending from it, so it covers every
+/// object that has the field at that slot. It starts as the type of the
+/// first value stored and only generalizes: `Vm::store_field` joins the
+/// stored value's type in before writing, and bumps
+/// `Vm::field_epoch` when that changes it, which drops compiled code that
+/// assumed the old type.
+///
+/// `Obj(s)` means the values were objects of shape `s` when stored. They
+/// may have gained properties since, so a load gives an object of *at
+/// least* shape `s` (`jit::Ty::Ext`): transitions only append slots, so
+/// `s`'s own properties are where `s` has them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldType {
+    /// Nothing stored yet.
+    None,
+    Int,
+    /// A number: int32 or double.
+    Num,
+    Obj(*const Shape),
+    Any,
+}
+
+impl FieldType {
+    /// The type of a value, as a field type.
+    pub fn of(v: Value) -> FieldType {
+        if v.is_int32() {
+            FieldType::Int
+        } else if v.is_number() {
+            FieldType::Num
+        } else if v.is_cell() {
+            FieldType::Obj(unsafe { (*as_object(v)).shape })
+        } else {
+            FieldType::Any
+        }
+    }
+
+    pub fn join(self, other: FieldType) -> FieldType {
+        use FieldType::*;
+        match (self, other) {
+            (a, b) if a == b => a,
+            (None, t) | (t, None) => t,
+            (Int, Num) | (Num, Int) => Num,
+            _ => Any,
+        }
+    }
+
+    /// The type as a store's inline cache keeps it, to check stored values
+    /// against on its fast path (see [`field_fits`]): 0 for no check (`Any`,
+    /// or nothing yet), 1 for an int32, 2 for a number, else the shape.
+    pub fn encode(self) -> u64 {
+        match self {
+            FieldType::None | FieldType::Any => 0,
+            FieldType::Int => 1,
+            FieldType::Num => 2,
+            FieldType::Obj(s) => s as u64,
+        }
+    }
+}
+
+/// Whether `v` fits a field type encoded by [`FieldType::encode`] (not 0).
+#[inline(always)]
+pub fn field_fits(want: u64, v: Value) -> bool {
+    match want {
+        1 => v.is_int32(),
+        2 => v.is_number(),
+        s => v.is_cell() && unsafe { (*as_object(v)).shape } as u64 == s,
+    }
+}
+
 /// A hidden class.
 pub struct Shape {
     pub class: Class,
@@ -111,6 +184,8 @@ pub struct Shape {
     pub capacity: u32,
     /// The property in each slot.
     pub keys: Vec<Atom>,
+    /// The type of the field in each slot (see [`FieldType`]).
+    pub fields: Vec<*const Cell<FieldType>>,
     /// Owned by a single (prototype) object: transitions from it are not
     /// shared, so inline caches must not cache them.
     pub unique: bool,
@@ -120,6 +195,11 @@ pub struct Shape {
 impl Shape {
     pub fn lookup(&self, name: Atom) -> Option<u32> {
         self.keys.iter().position(|&k| k == name).map(|i| i as u32)
+    }
+
+    /// The type of the field in slot `i`.
+    pub fn field_type(&self, i: u32) -> FieldType {
+        unsafe { (*self.fields[i as usize]).get() }
     }
 
     /// Where slot `i` lives, as an inline cache records it: the byte offset
@@ -234,6 +314,7 @@ mod tests {
             proto: Value::NULL,
             capacity: 2,
             keys: vec![Atom(7), Atom(8), Atom(9)],
+            fields: Vec::new(),
             unique: false,
             transitions: RefCell::default(),
         };

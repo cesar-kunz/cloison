@@ -8,6 +8,7 @@
 
 #![feature(explicit_tail_calls)]
 #![feature(rust_preserve_none_cc)]
+#![feature(fn_align)]
 #![allow(incomplete_features)]
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -21,6 +21,10 @@
 //! 4. Where a join widens a type, the edge gets conversions: int32 → double,
 //!    or `facc` → boxed `acc`. They go inline on fall-through edges and in a
 //!    cold stub on jumps.
+//! 5. [`Fusion`]: common sequences on slot registers (`ldar r; add_smi k;
+//!    star r`, the loop tail `ldar i; inc; star i; jlt_smi n`, …) become a
+//!    single fused stencil that bypasses `acc`, guided by accumulator
+//!    liveness ([`acc_live_out`]).
 //!
 //! Layout of the generated code:
 //!
@@ -963,6 +967,153 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
     (pre, name)
 }
 
+// ---- Fused stencils ----
+
+/// Whether the accumulator is live after each instruction (backward
+/// dataflow over reachable instructions). An instruction reads `acc` unless
+/// it is `ldar` / `lda_smi`, which overwrite it, or `nop` / `jump`, which
+/// pass it through.
+fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
+    let n = insns.len();
+    let reads = |op: Op| !matches!(op, Op::Ldar | Op::LdaSmi | Op::Nop | Op::Jump);
+    let kills = |op: Op| matches!(op, Op::Ldar | Op::LdaSmi);
+    let mut live_in = vec![false; n];
+    let mut live_out = vec![false; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..n).rev() {
+            if ins[i].is_none() {
+                continue;
+            }
+            let insn = &insns[i];
+            let succs = [
+                insn.falls_through().then_some(i + 1),
+                insn.jumps().then_some(insn.target),
+            ];
+            let out = succs.into_iter().flatten().any(|s| live_in[s]);
+            let inn = reads(insn.op) || (!kills(insn.op) && out);
+            if out != live_out[i] || inn != live_in[i] {
+                (live_out[i], live_in[i]) = (out, inn);
+                changed = true;
+            }
+        }
+    }
+    live_out
+}
+
+/// A matched fused group.
+struct Fused {
+    /// Number of bytecode instructions it covers.
+    len: usize,
+    name: String,
+    imm: i32,
+    /// `ldar` stencil for the group's register, to rematerialize `acc` after
+    /// the group or in its exit stub.
+    ldar: String,
+    acc_live_after: bool,
+}
+
+/// Matches fused-stencil patterns (see the fused section of
+/// `stencils/stencils.rs`). A group needs its operands in slots with the
+/// right types, no jump target (or the entry) inside it, and, for the loop
+/// tail, a dead accumulator on both branches.
+struct Fusion<'a> {
+    insns: &'a [Insn],
+    ins: &'a [Option<TypeState>],
+    homes: &'a [Home],
+    /// `None` when not specializing: no fusion.
+    widened: Option<&'a HashSet<usize>>,
+    live_out: &'a [bool],
+    is_target: &'a [bool],
+}
+
+impl Fusion<'_> {
+    fn at(&self, i: usize) -> Option<Fused> {
+        let widened = self.widened?;
+        let insns = self.insns;
+        let group = |len: usize| {
+            i + len <= insns.len()
+                && (i + 1..i + len).all(|j| !self.is_target[j] && self.ins[j].is_some())
+        };
+        if !group(3)
+            || insns[i].op != Op::Ldar
+            || insns[i + 2].op != Op::Star
+            || insns[i + 2].reg != insns[i].reg
+        {
+            return None;
+        }
+        let r = insns[i].reg as usize;
+        let st = self.ins[i].as_ref()?;
+        let mid = &insns[i + 1];
+        let int_ok = st.regs[r] == Ty::I32 && !widened.contains(&(i + 1));
+        let dbl = st.regs[r] == Ty::F64;
+        let (home, ldar) = match self.homes[r] {
+            Home::Gpr(a) => (Home::Gpr(a), format!("ldar_g{a}")),
+            Home::Fpr(a) => (Home::Fpr(a), format!("ldar_f{a}")),
+            Home::Mem => return None,
+        };
+        let fused = |len: usize, name: String, imm: i32| {
+            let acc_live_after = self.live_out[i + len - 1];
+            Some(Fused {
+                len,
+                name,
+                imm,
+                ldar: ldar.clone(),
+                acc_live_after,
+            })
+        };
+
+        // Loop tail: ldar r; inc; star r; jlt_smi k | jlt r2.
+        if mid.op == Op::Inc
+            && int_ok
+            && group(4)
+            && let Home::Gpr(a) = home
+            && !self.live_out[i + 3]
+        {
+            let tail = &insns[i + 3];
+            match tail.op {
+                Op::JumpIfLessSmi => return fused(4, format!("incjlt_g{a}"), tail.imm),
+                Op::JumpIfLess => {
+                    let r2 = tail.reg as usize;
+                    if let (Ty::I32, Home::Gpr(b)) =
+                        (self.ins[i + 3].as_ref()?.regs[r2], self.homes[r2])
+                    {
+                        return fused(4, format!("incjlt_g{a}_g{b}"), 0);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match (mid.op, home) {
+            // ldar r; add_smi k | inc; star r
+            (Op::AddSmi | Op::Inc, Home::Gpr(a)) if int_ok => {
+                fused(3, format!("addi_g{a}"), mid.imm)
+            }
+            (Op::AddSmi | Op::Inc, Home::Fpr(a)) if dbl => fused(3, format!("addi_f{a}"), mid.imm),
+            // ldar r; add r2; star r
+            (Op::Add, _) if mid.reg as usize != r => {
+                let r2 = mid.reg as usize;
+                let t2 = self.ins[i + 1].as_ref()?.regs[r2];
+                match (home, self.homes[r2], t2) {
+                    (Home::Gpr(a), Home::Gpr(b), Ty::I32) if int_ok => {
+                        fused(3, format!("addr_ii_g{a}_g{b}"), 0)
+                    }
+                    (Home::Fpr(a), Home::Gpr(b), Ty::I32) if dbl => {
+                        fused(3, format!("addr_fi_f{a}_g{b}"), 0)
+                    }
+                    (Home::Fpr(a), Home::Fpr(b), Ty::F64) if dbl => {
+                        fused(3, format!("addr_ff_f{a}_f{b}"), 0)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Value of `ctx` while running: no exit taken.
 const NO_EXIT: u32 = u32::MAX;
 
@@ -1079,7 +1230,8 @@ pub struct JitCode {
     /// Bytes of hot code, from the start (excluding cold code).
     main_len: usize,
     /// The selected stencil per instruction (`None`: unreachable from the
-    /// entry), for inspection and tests.
+    /// entry, or covered by the fused stencil of an earlier instruction),
+    /// for inspection and tests.
     pub stencils: Vec<Option<String>>,
     /// Where each VM register lived.
     pub homes: Vec<Home>,
@@ -1101,6 +1253,7 @@ pub enum Outcome {
 struct Options {
     specialize: bool,
     register_homes: bool,
+    fusion: bool,
 }
 
 impl JitCode {
@@ -1192,8 +1345,40 @@ impl JitCode {
         let has_entry_seq = !entry_seq.is_empty();
         hot.extend(ending_at(entry_seq, Target::Label(entry)));
 
-        for i in 0..n {
+        let live_out = acc_live_out(insns, &ins);
+        let mut is_target = vec![false; n];
+        is_target[entry] = true;
+        for (insn, st) in insns.iter().zip(&ins) {
+            if st.is_some() && insn.jumps() {
+                is_target[insn.target] = true;
+            }
+        }
+        let fusion = Fusion {
+            insns,
+            ins: &ins,
+            homes: &homes,
+            widened: widened.filter(|_| opts.fusion),
+            live_out: &live_out,
+            is_target: &is_target,
+        };
+
+        // The jump target of instruction `i` (with its out-state), going
+        // through a conversion stub if the edge needs one.
+        let jump_to = |i: usize, out: &TypeState, stubs: &mut Vec<Vec<Piece>>| {
+            let target = insns[i].target;
+            let cs = edge_conversions(out, ins[target].as_ref().unwrap(), &homes);
+            if cs.is_empty() {
+                Target::Label(target)
+            } else {
+                stubs.push(ending_at(cs, Target::Label(target)));
+                Target::Stub(stubs.len() - 1)
+            }
+        };
+
+        let mut i = 0;
+        while i < n {
             let (Some(s), Some(st)) = (&sel[i], &ins[i]) else {
+                i += 1;
                 continue;
             };
             let insn = &insns[i];
@@ -1203,19 +1388,47 @@ impl JitCode {
             {
                 hot.extend(edge_conversions(&prev.out, st, &homes));
             }
+            label_piece[i] = hot.len();
+
+            if let Some(f) = fusion.at(i) {
+                let last = i + f.len - 1;
+                let jump = if insns[last].jumps() {
+                    jump_to(last, &sel[last].as_ref().unwrap().out, &mut stubs)
+                } else {
+                    Target::Next
+                };
+                let main = Piece {
+                    imm: f.imm,
+                    jump,
+                    exit: i + 1,
+                    ..Piece::new(&f.name, 0)
+                };
+                if main.uses("toi_exit") {
+                    // Exit before the arithmetic instruction, with `acc`
+                    // holding the register `ldar` loaded.
+                    let mut seq = vec![Piece::new(&f.ldar, insn.reg)];
+                    seq.extend(spills(&homes));
+                    seq.push(Piece {
+                        imm: insns[i + 1].pc as i32,
+                        ..Piece::new("exit", 0)
+                    });
+                    exits.push((i + 1, seq));
+                }
+                hot.push(main);
+                if f.acc_live_after {
+                    hot.push(Piece::new(&f.ldar, insn.reg));
+                }
+                names[i] = Some(f.name);
+                i += f.len;
+                continue;
+            }
+
             let (pre, name) = stencil_for(insn, s, st, &homes);
             let jump = if insn.jumps() {
-                let cs = edge_conversions(&s.out, ins[insn.target].as_ref().unwrap(), &homes);
-                if cs.is_empty() {
-                    Target::Label(insn.target)
-                } else {
-                    stubs.push(ending_at(cs, Target::Label(insn.target)));
-                    Target::Stub(stubs.len() - 1)
-                }
+                jump_to(i, &s.out, &mut stubs)
             } else {
                 Target::Next
             };
-            label_piece[i] = hot.len();
             hot.extend(pre);
             let main = Piece {
                 imm: insn.imm,
@@ -1235,6 +1448,7 @@ impl JitCode {
             }
             hot.push(main);
             names[i] = Some(name);
+            i += 1;
         }
 
         // Positions. Hot pieces back to back; then cold code: edge stubs,
@@ -1495,6 +1709,7 @@ impl JitFunction {
             opts: Options {
                 specialize: true,
                 register_homes: true,
+                fusion: true,
             },
             widened: HashSet::new(),
             cached: None,
@@ -1508,7 +1723,14 @@ impl JitFunction {
         self.opts = Options {
             specialize: false,
             register_homes: false,
+            fusion: false,
         };
+        self
+    }
+
+    /// Don't use fused stencils.
+    pub fn without_fusion(mut self) -> JitFunction {
+        self.opts.fusion = false;
         self
     }
 
@@ -1564,9 +1786,22 @@ impl JitFunction {
                 } => {
                     self.stats.exits += 1;
                     // Only int32 arithmetic exits: widen it and recompile.
-                    self.widened.insert(self.index_of(exit_pc));
+                    let k = self.index_of(exit_pc);
+                    self.widened.insert(k);
                     self.cached = None;
                     (pc, acc) = (exit_pc, exit_acc);
+                    // Resume at a preceding `ldar r` if `acc` is just `r`.
+                    // Re-running it changes nothing (acc is dead before an
+                    // `ldar`), and the resume point then starts a fusible
+                    // group (`ldar r; add …; star r`) instead of landing
+                    // inside one, where nothing could be fused.
+                    if k > 0
+                        && let prev = &self.insns[k - 1]
+                        && prev.op == Op::Ldar
+                        && regs[prev.reg as usize] == exit_acc
+                    {
+                        pc = prev.pc;
+                    }
                 }
             }
         }

@@ -133,7 +133,7 @@ unsafe extern "C" {
     fn toi_rt_loose_eq();
     fn toi_rt_to_boolean();
     fn toi_rt_call();
-    fn toi_rt_call_direct();
+    fn toi_rt_enter();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -2139,12 +2139,37 @@ stencil!("call"; |s| {
     next!(s)
 });
 
-// A call straight into the callee's compiled code, if it can
-// (`toi_rt_call_direct` checks), otherwise through the runtime, as `call`;
-// leave after it as `call` does.
+/// The part of a call site (`jit::CallSite`, `repr(C)`) that `call_direct`
+/// reads. Offsets are in bytes from the caller's registers.
+#[repr(C)]
+struct DirectSite {
+    /// The callee's compiled entry; 0: call through the runtime.
+    entry: u64,
+    /// The function compiled: the callee register must hold it.
+    closure: u64,
+    f_off: u64,
+    /// Where the callee's compiled frame ends: before `stack_end`.
+    end_off: u64,
+    stack_end: u64,
+}
+
+// A call straight into the callee's compiled code (`toi_rt_enter`, which
+// checks the native stack), whose frame the compiled code has set up, if
+// the call site (`DirectSite` at `imm64`) has an entry, the callee
+// register holds the function compiled, and the VM stack has room;
+// otherwise through the runtime, as `call`. Leave after it as `call` does.
 stencil!("call_direct"; |s| {
     let regs = Value::from_bits(s.regs as u64);
-    let r = Value::from_bits(rt_call!(s, toi_rt_call_direct, regs, Value::from_bits(imm64())));
+    let site = imm64() as *const DirectSite;
+    let base = s.regs as *const u8;
+    let r = if (*site).entry != 0
+        && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
+        && base as u64 + (*site).end_off <= (*site).stack_end
+    {
+        Value::from_bits(rt_call!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))
+    } else {
+        Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
+    };
     s.acc = r;
     if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
         exit!(s)

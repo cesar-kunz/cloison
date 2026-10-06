@@ -1989,6 +1989,26 @@ fn direct_call_results_are_checked() {
     assert!(s.iter().any(|n| n == "call_direct"), "{s:?}");
 }
 
+/// `f1` reads its local r2 before writing it, so a direct call must set it
+/// to `undefined`: the previous call left `k` there. The caller writes
+/// only what the callee may read first (here r1 and r2) into its frame.
+#[test]
+fn direct_calls_set_locals_read_first() {
+    let pad: String = (0..64).map(|_| "        AddSmi 0\n").collect();
+    let f1 = format!(
+        "function f1(k)                  ; 1 if r2 is undefined on entry, else 1000\n\
+         \x20       LdaUndefined\n        TestEqual r2\n        JumpIfFalse stale\n\
+         \x20       LdaSmi 1\n        Jump done\n\
+         stale:  LdaSmi 1000\n\
+         done:   Star r3\n        Ldar r1\n        Star r2\n        LdaSmi 0\n        Star r4\n\
+         loop:   Ldar r4\n        Inc\n        Star r4\n        JumpIfLessSmi 10, loop\n\
+         \x20       Ldar r3\n{pad}        Return\nend\n"
+    );
+    let (v, s) = jit(&direct_program(500, "", &f1));
+    assert_eq!(v, "500");
+    assert!(s.iter().any(|n| n.starts_with("call_direct")), "{s:?}");
+}
+
 /// A script calling the recursive `name` (defined in `function`) with `n`.
 fn recursive_program(name: &str, n: i32, function: &str) -> String {
     format!(

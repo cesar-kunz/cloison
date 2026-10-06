@@ -868,6 +868,85 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
         .collect()
 }
 
+/// The registers of the function with bytecode `code` that it may read
+/// before writing, when called: those a direct call must set (`this`, the
+/// parameters, and locals read as `undefined`). Conservative: every
+/// register operand is read, but the destinations of `Star` and `Mov`, and
+/// it covers instructions the JIT doesn't compile (which [`reg_live_in`]
+/// doesn't).
+fn entry_live(code: &[u8], nregs: usize) -> Vec<bool> {
+    use crate::bytecode::Operand;
+    let insns = decode(code, true);
+    // Per instruction: registers read, and the register written.
+    let effects: Vec<(Vec<usize>, Option<usize>)> = insns
+        .iter()
+        .map(|insn| {
+            let op = Op::from_u8(code[insn.pc]).unwrap();
+            let (mut at, mut regs, mut count) = (insn.pc + 1, Vec::new(), 0);
+            for &k in op.operands() {
+                match k {
+                    Operand::Reg => regs.push(code[at] as usize),
+                    Operand::Count => count = code[at] as usize,
+                    _ => {}
+                }
+                at += k.width();
+            }
+            match op {
+                Op::Star => (Vec::new(), Some(regs[0])),
+                Op::Mov => (vec![regs[0]], Some(regs[1])),
+                Op::Call | Op::CallUndefined | Op::Construct => {
+                    let n = count + usize::from(op == Op::Call);
+                    let reads = std::iter::once(regs[0]).chain(regs[1]..regs[1] + n);
+                    (reads.collect(), None)
+                }
+                _ => (regs, None),
+            }
+        })
+        .collect();
+    let n = insns.len();
+    let mut live_in = vec![vec![false; nregs]; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for k in (0..n).rev() {
+            let insn = &insns[k];
+            let mut live = vec![false; nregs];
+            let falls = !matches!(insn.op, Op::Jump | Op::Return);
+            let jumps = matches!(
+                insn.op,
+                Op::Jump
+                    | Op::JumpIfLess
+                    | Op::JumpIfLessSmi
+                    | Op::JumpIfTrue
+                    | Op::JumpIfFalse
+                    | Op::JumpIfToBooleanTrue
+                    | Op::JumpIfToBooleanFalse
+            );
+            let succs = [falls.then_some(k + 1), jumps.then_some(insn.target)];
+            for s in succs.into_iter().flatten().filter(|&s| s < n) {
+                for (l, &x) in live.iter_mut().zip(&live_in[s]) {
+                    *l |= x;
+                }
+            }
+            let (reads, write) = &effects[k];
+            if let Some(w) = write {
+                live[*w] = false;
+            }
+            for &r in reads {
+                live[r] = true;
+            }
+            if live != live_in[k] {
+                live_in[k] = live;
+                changed = true;
+            }
+        }
+    }
+    live_in
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| vec![false; nregs])
+}
+
 // ---- Inline-cache feedback (VM frames) ----
 
 /// What a property instruction's inline cache held when compiling, as
@@ -1684,8 +1763,9 @@ impl Home {
 /// Assign homes by static use count. Registers whose type is only ever
 /// int32 or double (and at least once double) get FP slots; registers only
 /// ever int32 get GPR slots unboxed (`Int`); other used registers get GPR
-/// slots boxed; the rest stay in memory. `no_fp` / `no_int` exclude
-/// registers from pinning, as does `!pin_ok` (see [`pinnable`]).
+/// slots boxed; the rest stay in memory, as do registers from `mem_from`
+/// (direct calls' frames). `no_fp` / `no_int` exclude registers from
+/// pinning, as does `!pin_ok` (see [`pinnable`]).
 fn assign_homes(
     insns: &[Insn],
     ins: &[Option<TypeState>],
@@ -1693,6 +1773,7 @@ fn assign_homes(
     no_fp: &[bool],
     no_int: &[bool],
     pin_ok: &[bool],
+    mem_from: usize,
 ) -> Vec<Home> {
     let mut uses = vec![0usize; nregs];
     let mut join = vec![Ty::Bot; nregs];
@@ -1705,7 +1786,7 @@ fn assign_homes(
             *j = j.join(t);
         }
     }
-    let mut by_uses: Vec<usize> = (0..nregs).filter(|&r| uses[r] > 0).collect();
+    let mut by_uses: Vec<usize> = (0..nregs.min(mem_from)).filter(|&r| uses[r] > 0).collect();
     by_uses.sort_by_key(|&r| (std::cmp::Reverse(uses[r]), r));
     let mut homes = vec![Home::Mem; nregs];
     let (mut fp, mut gpr) = (0, 0);
@@ -1975,19 +2056,28 @@ fn edge_conversions(from: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Pie
 /// ones), then convert to the entry instruction's in-state. `actual` is the
 /// exact entry state (`acc` arrives boxed); `actual_live` has dead
 /// registers as `Bot`. Pinned registers that aren't live at entry aren't
-/// loaded (see [`pinnable`]); boxed ones always are, so spills stay exact.
+/// loaded (see [`pinnable`]); boxed ones are if `exact`, so spills keep
+/// the register file exact. In a VM frame that doesn't matter: a register
+/// dead at entry is written before it is read, so it is dead wherever it
+/// still holds what it held at entry, and spilling garbage there is
+/// harmless.
 fn entry_pieces(
     actual: &TypeState,
     actual_live: &TypeState,
     to: &TypeState,
     homes: &[Home],
     live_at_entry: &[bool],
+    exact: bool,
 ) -> Vec<Piece> {
     let mut out = Vec::new();
     for (r, &h) in homes.iter().enumerate() {
         match h {
             Home::Mem => {}
-            Home::Gpr(k) => out.push(Piece::new(&format!("enter_g{k}"), r as u8)),
+            Home::Gpr(k) => {
+                if exact || live_at_entry[r] {
+                    out.push(Piece::new(&format!("enter_g{k}"), r as u8));
+                }
+            }
             _ if !live_at_entry[r] => {}
             Home::Int(k) => {
                 assert_eq!(actual.regs[r], Ty::I32, "r{r} pinned as int32");
@@ -2040,7 +2130,15 @@ fn box_acc_piece(acc: Ty) -> Option<Piece> {
 }
 
 /// The stencil name for instruction `insn`, and pieces to run before it.
-fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<Piece>, String) {
+/// With `vm`, the code runs in a VM frame, which is dead once it returns,
+/// but for `this`: a constructor's result may be it (`construct_result`).
+fn stencil_for(
+    insn: &Insn,
+    sel: &Sel,
+    st: &TypeState,
+    homes: &[Home],
+    vm: bool,
+) -> (Vec<Piece>, String) {
     let mut pre = Vec::new();
     let home = homes.get(insn.reg as usize).copied().unwrap_or(Home::Mem);
     let loc = home.loc();
@@ -2101,7 +2199,8 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
         ("add" | "jlt" | "test_lt" | "test_eq", _) => format!("{}_{}_{loc}", sel.base, sel.case),
         ("return", _) => {
             box_acc(&mut pre);
-            pre.extend(spills(homes));
+            let n = if vm { 1.min(homes.len()) } else { homes.len() };
+            pre.extend(spills(&homes[..n]));
             "return".into()
         }
         // Generic stencils that read `acc` take it boxed.
@@ -2812,6 +2911,9 @@ struct VmCompile<'a> {
     props: &'a [Prop],
     feedback: Option<&'a [Feedback]>,
     inline_base: usize,
+    /// Where direct calls' frames start (see [`Lowered::direct_base`]):
+    /// registers from there stay in memory.
+    direct_base: usize,
     /// The lowering's call sites (`Prop::Call` names them by index).
     sites: &'a [Box<std::cell::UnsafeCell<CallSite>>],
 }
@@ -2840,6 +2942,7 @@ impl JitCode {
             props,
             feedback,
             inline_base,
+            direct_base,
             sites: vm_sites,
         } = vm;
         let n = insns.len();
@@ -2942,7 +3045,7 @@ impl JitCode {
             let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
             let (homes, ins) = loop {
                 let homes = if opts.register_homes {
-                    assign_homes(insns, &ins1, nregs, &no_fp, &no_int, &pin_ok)
+                    assign_homes(insns, &ins1, nregs, &no_fp, &no_int, &pin_ok, direct_base)
                 } else {
                     vec![Home::Mem; nregs]
                 };
@@ -3088,6 +3191,7 @@ impl JitCode {
             ins[entry].as_ref().unwrap(),
             &homes,
             &live_at_entry,
+            feedback.is_none(),
         );
         let has_entry_seq = !entry_seq.is_empty();
         hot.extend(ending_at(entry_seq, Target::Label(entry)));
@@ -3189,7 +3293,7 @@ impl JitCode {
                 continue;
             }
 
-            let (pre, name) = stencil_for(insn, s, st, &homes);
+            let (pre, name) = stencil_for(insn, s, st, &homes, feedback.is_some());
             let jump = if insn.jumps() {
                 jump_to(i, &s.out, &mut stubs)
             } else {
@@ -3637,6 +3741,9 @@ struct VmState {
     /// Decoded code of functions inlined, with accumulator liveness after
     /// each instruction.
     decoded: HashMap<*const crate::vm::Code, Decoded>,
+    /// Per callee of a direct call, its registers live at entry (see
+    /// [`entry_live`]).
+    entry_live: HashMap<*const crate::vm::Code, Rc<Vec<bool>>>,
     /// The current lowering (see [`lower`]): per instruction its inline
     /// cache's contents, the frames, their feedback, the runtime call
     /// sites, and where inlined frames' registers start.
@@ -3644,6 +3751,7 @@ struct VmState {
     fbs: Vec<Feedback>,
     snap: Rc<Snapshot>,
     inline_base: usize,
+    direct_base: usize,
     /// The lowering needs redoing: compiled code exited (its caches may
     /// have changed since), or it was never done. Entries otherwise skip
     /// it, which matters for functions entered at every call.
@@ -3811,6 +3919,19 @@ struct Lowered {
     fbs: Vec<Feedback>,
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
     nregs: usize,
+    /// Where direct calls' frames start: registers from there are set up
+    /// for callees, which read them from memory (see [`lower`]).
+    direct_base: usize,
+}
+
+/// A direct call as first lowered, its frame setup's registers relative to
+/// the callee's frame: the call (`reg2` is its window), the stores into the
+/// frame (`Star`s), and the original window.
+struct DirectSetup {
+    site: usize,
+    call: usize,
+    stores: Vec<usize>,
+    window: u8,
 }
 
 /// An instruction made by [`lower`], at bytecode offset `pc` of `frame`.
@@ -3834,6 +3955,7 @@ struct Lowering<'a> {
     state: &'a mut VmState,
     epoch: u32,
     out: Lowered,
+    direct: Vec<DirectSetup>,
 }
 
 /// The function's instructions as compiled, from its code and inline caches:
@@ -3871,11 +3993,14 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
             fbs: Vec::new(),
             sites: Vec::new(),
             nregs: unsafe { (*root).nregs } as usize,
+            direct_base: usize::MAX,
         },
+        direct: Vec::new(),
     };
     cx.out.fbs.push(cx.feedback(root));
     let rets = cx.emit_frame(0, 0);
     debug_assert!(rets.is_empty());
+    cx.place_direct_frames();
     cx.out
 }
 
@@ -4007,17 +4132,24 @@ impl Lowering<'_> {
                         self_code: std::ptr::null(),
                         bound: false,
                     };
-                    let direct = i.op != Op::Construct && self.direct_target(frame, &i, &mut site);
+                    let direct = i.op != Op::Construct
+                        && self.direct_target(frame, &i, &mut site)
+                        && i.imm as u32 <= site.nparams;
                     let p = Prop::Call {
                         site: self.out.sites.len() as u32,
                         direct,
                         epoch: unsafe { (*vm).code_epoch },
                         epoch_addr: unsafe { &raw const (*vm).code_epoch } as u64,
                     };
+                    let callee = site.callee;
                     self.out
                         .sites
                         .push(Box::new(std::cell::UnsafeCell::new(site)));
-                    self.push(i, p);
+                    if direct {
+                        self.direct_setup(frame, i, callee, p);
+                    } else {
+                        self.push(i, p);
+                    }
                 }
                 _ if i.jumps() => {
                     let x = self.push(i, Prop::None);
@@ -4111,6 +4243,108 @@ impl Lowering<'_> {
             return None;
         }
         Some(fo)
+    }
+
+    /// Direct call `i` (with `p`) of frame `frame` to `callee`: store `this`
+    /// (for `Call`) and the arguments into the callee's frame, and
+    /// `undefined` into the other registers the callee may read before
+    /// writing ([`entry_live`]), then call with the frame as the window. The
+    /// stores' registers are relative to the frame until
+    /// [`Lowering::place_direct_frames`] places it. The direct call then
+    /// copies nothing, and the runtime path finds the arguments in the
+    /// window. (There are no more arguments than parameters: the fills
+    /// would overwrite those the runtime path needs.)
+    fn direct_setup(&mut self, frame: usize, mut i: Insn, callee: *const crate::vm::Code, p: Prop) {
+        let live = self
+            .state
+            .entry_live
+            .entry(callee)
+            .or_insert_with(|| {
+                let c = unsafe { &*callee };
+                Rc::new(entry_live(&c.bytecode, c.nregs as usize))
+            })
+            .clone();
+        let pc = i.pc;
+        let (w, argc) = (i.reg2 as usize, i.imm as usize);
+        let has_this = i.op == Op::Call;
+        let mut stores = Vec::new();
+        let mut store = |cx: &mut Self, src: Option<usize>, j: usize| {
+            match src {
+                Some(r) => cx.push(synth(Op::Ldar, r as u8, frame, pc), Prop::None),
+                None => cx.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None),
+            };
+            stores.push(cx.push(synth(Op::Star, j as u8, frame, pc), Prop::None));
+        };
+        if has_this {
+            store(self, Some(w), 0);
+        } else if live[0] {
+            store(self, None, 0);
+        }
+        let args = w + usize::from(has_this);
+        for a in 0..argc {
+            store(self, Some(args + a), 1 + a);
+        }
+        for (r, &l) in live.iter().enumerate().skip(1 + argc) {
+            if l {
+                store(self, None, r);
+            }
+        }
+        let window = i.reg2;
+        i.reg2 = u8::from(!has_this);
+        let call = self.push(i, p);
+        self.direct.push(DirectSetup {
+            site: match p {
+                Prop::Call { site, .. } => site as usize,
+                _ => unreachable!(),
+            },
+            call,
+            stores,
+            window,
+        });
+    }
+
+    /// Place direct calls' frames past every register the compiled code
+    /// uses (and a frame header), where they can't overlap an inlined
+    /// frame's registers, which may live in slots. If that's past the 256
+    /// registers instructions can name, the calls go through the runtime
+    /// from their original windows instead.
+    fn place_direct_frames(&mut self) {
+        if self.direct.is_empty() {
+            return;
+        }
+        let base = self.out.nregs + interp::HEADER;
+        let extent = self
+            .direct
+            .iter()
+            .flat_map(|d| d.stores.iter().map(|&k| self.out.insns[k].reg as usize + 1))
+            .max()
+            .unwrap_or(0);
+        let fits = base + extent.max(1) <= 256;
+        for d in std::mem::take(&mut self.direct) {
+            let site = unsafe { &mut *self.out.sites[d.site].get() };
+            if fits {
+                for &k in &d.stores {
+                    self.out.insns[k].reg += base as u8;
+                }
+                self.out.insns[d.call].reg2 += base as u8;
+                site.frame = base;
+                site.w = self.out.insns[d.call].reg2 as usize;
+            } else {
+                for &k in &d.stores {
+                    // The `Ldar` / `LdaUndefined` before each store too.
+                    self.out.insns[k - 1].op = Op::Nop;
+                    self.out.insns[k].op = Op::Nop;
+                }
+                self.out.insns[d.call].reg2 = d.window;
+                if let Prop::Call { direct, .. } = &mut self.out.props[d.call] {
+                    *direct = false;
+                }
+            }
+        }
+        if fits {
+            self.out.direct_base = base;
+            self.out.nregs = base + extent;
+        }
     }
 
     fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) {
@@ -4223,6 +4457,7 @@ impl JitFunction {
             vm,
             root_insns,
             decoded: HashMap::default(),
+            entry_live: HashMap::default(),
             props: Vec::new(),
             fbs: Vec::new(),
             snap: Rc::new(Snapshot {
@@ -4231,6 +4466,7 @@ impl JitFunction {
                 sites: Vec::new(),
             }),
             inline_base: nregs,
+            direct_base: usize::MAX,
             dirty: true,
             epoch: 0,
             field_epoch: 0,
@@ -4329,6 +4565,7 @@ impl JitFunction {
                 .collect();
             self.insns = low.insns.clone();
             self.nregs = low.nregs;
+            vm.direct_base = low.direct_base;
             vm.props = low.props;
             vm.fbs = low.fbs;
             vm.snap = Rc::new(Snapshot {
@@ -4390,6 +4627,7 @@ impl JitFunction {
                 props: &vm.props,
                 feedback: Some(&vm.fbs[..]),
                 inline_base: vm.inline_base,
+                direct_base: vm.direct_base,
                 sites: &vm.snap.sites,
             },
         );
@@ -4615,11 +4853,21 @@ impl JitFunction {
                 };
                 self.stats.compiles += 1;
                 let code = {
-                    let (props, feedback, inline_base, sites): (&[Prop], _, _, &[_]) = match &self
-                        .vm
-                    {
-                        Some(vm) => (&vm.props, Some(&vm.fbs[..]), vm.inline_base, &vm.snap.sites),
-                        None => (&[], None, self.nregs, &[]),
+                    let (props, feedback, inline_base, direct_base, sites): (
+                        &[Prop],
+                        _,
+                        _,
+                        _,
+                        &[_],
+                    ) = match &self.vm {
+                        Some(vm) => (
+                            &vm.props,
+                            Some(&vm.fbs[..]),
+                            vm.inline_base,
+                            vm.direct_base,
+                            &vm.snap.sites,
+                        ),
+                        None => (&[], None, self.nregs, usize::MAX, &[]),
                     };
                     JitCode::compile(
                         &self.insns,
@@ -4631,6 +4879,7 @@ impl JitFunction {
                             props,
                             feedback,
                             inline_base,
+                            direct_base,
                             sites,
                         },
                     )
@@ -4869,7 +5118,8 @@ unsafe fn materialize(
 /// it can: the callee register holds the function compiled, the code epoch
 /// is the one the callee's version was bound under, and the native stack
 /// and the VM stack have room. Otherwise as `toi_rt_call`. `EMPTY` on an
-/// error.
+/// error. The compiled code has set the callee's frame up (see
+/// `Lowering::direct_setup`).
 ///
 /// Its region's wrapper saves the slot registers the region uses, as for
 /// any runtime call, and the asm call into the callee's code ([`call_code`])
@@ -4889,24 +5139,6 @@ extern "C" fn toi_rt_call_direct(regs: Value, site: Value) -> Value {
             || callee.add((*site).span) > (*vm).stack_end
         {
             return toi_rt_call(regs, Value::from_bits(site as u64));
-        }
-        let w = caller.add((*site).w);
-        let (this, args) = if (*site).op == Op::Call {
-            (*w, w.add(1))
-        } else {
-            (Value::UNDEFINED, w)
-        };
-        *callee = this;
-        // Few values: plain loops (the empty asm keeps LLVM from making
-        // them `memcpy` calls or vector code).
-        let k = (*site).argc.min((*site).nparams as usize);
-        for i in 0..k {
-            *callee.add(1 + i) = *args.add(i);
-            std::arch::asm!("", options(nomem, nostack, preserves_flags));
-        }
-        for i in 1 + k..(*site).nregs as usize {
-            *callee.add(i) = Value::UNDEFINED;
-            std::arch::asm!("", options(nomem, nostack, preserves_flags));
         }
         let mut ctx = NO_EXIT;
         let v = call_code((*site).entry, callee, &mut ctx);
@@ -4962,7 +5194,9 @@ unsafe fn direct_exit(
 /// does but from compiled code's runtime call: the code uses every slot and
 /// scratch register freely, so they are all declared clobbered (a Rust call
 /// through a `preserve_none` function pointer isn't enough: on arm64, LLVM
-/// assumes some of the slot registers survive it). Slots start empty.
+/// assumes some of the slot registers survive it). `acc` starts
+/// `undefined`; the slots start with garbage, as the code's entry loads
+/// those it uses (registers live at entry) from the frame.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn call_code(entry: u64, regs: *mut Value, ctx: *mut u32) -> Value {
@@ -4990,12 +5224,12 @@ unsafe fn call_code(entry: u64, regs: *mut Value, ctx: *mut u32) -> Value {
             inout("r13") regs => _,
             inout("r14") NumberTag::new().to_bits() => _,
             inout("r15") ctx => _,
-            inout("rdi") u => _,
-            inout("rsi") u => _,
-            inout("rdx") u => _,
-            inout("rcx") u => _,
-            inout("r8") u => _,
-            inout("r9") u => _,
+            out("rdi") _,
+            out("rsi") _,
+            out("rdx") _,
+            out("rcx") _,
+            out("r8") _,
+            out("r9") _,
             out("rax") r,
             out("r10") _,
             out("r11") _,
@@ -5027,11 +5261,9 @@ unsafe fn call_code(entry: u64, regs: *mut Value, ctx: *mut u32) -> Value {
             inout("x21") regs => _,
             inout("x22") NumberTag::new().to_bits() => _,
             inout("x23") ctx => _,
-            inout("x24") u => _, inout("x25") u => _, inout("x26") u => _,
-            inout("x27") u => _, inout("x28") u => _,
-            inout("x0") u => r,
-            inout("x1") u => _, inout("x2") u => _, inout("x3") u => _,
-            inout("x4") u => _, inout("x5") u => _, inout("x6") u => _,
+            out("x24") _, out("x25") _, out("x26") _, out("x27") _, out("x28") _,
+            out("x0") r,
+            out("x1") _, out("x2") _, out("x3") _, out("x4") _, out("x5") _, out("x6") _,
             out("x7") _, out("x8") _, out("x9") _, out("x10") _, out("x11") _,
             out("x12") _, out("x13") _, out("x14") _, out("x15") _, out("x16") _,
             out("x17") _, out("x18") _, out("x30") _,

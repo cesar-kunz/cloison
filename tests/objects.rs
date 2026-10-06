@@ -1581,3 +1581,235 @@ end
     // i = 0..4: 1; i = 5..9: 100.
     assert_eq!(jit(src).0, "505");
 }
+
+// ---- Functions entered compiled ----
+//
+// A function with a loop, once hot (10 calls; 1 or 2 in `run`'s tiered
+// configurations), runs compiled from its first instruction at each call.
+// The callers below allocate in their loops (`CreateArray`, which compiled
+// code leaves to the interpreter), so they stay interpreted and the calls
+// come from the interpreter's call handlers.
+
+/// `add(k)` sums `k + 0..9`; it overflows int32 when `k` is near the top,
+/// exiting inside the entered function, which the interpreter finishes.
+#[test]
+fn functions_entered_compiled_from_the_interpreter() {
+    let src = "\
+script
+        CreateClosure add
+        StaGlobal add
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function add(k)                 ; r1 k, r2 i, r3 s
+        Ldar r1
+        Star r3
+        LdaSmi 0
+        Star r2
+loop:   Ldar r2
+        Add r3
+        Star r3
+        Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 10, loop
+        Ldar r3
+        Return
+end
+; r1 i, r2 total, r3 add, r4 arg, r5 temp
+function main()
+        LdaGlobal add
+        Star r3
+        LdaSmi 0
+        Star r1
+        Star r2
+top:    CreateArray
+        Star r5
+        Ldar r1
+        Star r4
+        Ldar r1
+        TestEqualSmi 40
+        JumpIfFalse call
+        LdaSmi 2147483600
+        Star r4                 ; add(2147483600): overflows
+call:   CallUndefined r3, r4, 1
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 50, top
+        Ldar r2
+        Return
+end
+";
+    let m = toi::asm::parse(src).unwrap();
+    let mut vm = Vm::new();
+    let v = display(vm.run(&m).unwrap());
+    // Σ (i + 45) for i < 50 except 40, plus 2147483600 + 45.
+    let expected: u64 = (0..50u64).filter(|&i| i != 40).map(|i| i + 45).sum::<u64>() + 2147483645;
+    assert_eq!(v, expected.to_string());
+    assert_eq!(ok(src), v);
+    let s = vm.jit_stencils("add").expect("add compiled");
+    assert!(s.iter().any(|n| n == "return"), "{s:?}");
+}
+
+/// A constructor with a loop, entered compiled through `new`: the result is
+/// `this` (the function returns undefined).
+#[test]
+fn constructors_entered_compiled() {
+    let src = "\
+script
+        CreateClosure Sum
+        StaGlobal Sum
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function Sum(n)                 ; this.v = 0 + 1 + … + (n - 1)
+        LdaSmi 0
+        Star r2
+        Star r3
+loop:   Ldar r2
+        Add r3
+        Star r3
+        Ldar r2
+        Inc
+        Star r2
+        JumpIfLess r1, loop     ; i < n
+        Ldar r3
+        SetNamed r0, v
+        LdaUndefined
+        Return
+end
+; r1 i, r2 total, r3 Sum, r4 arg, r5 temp
+function main()
+        LdaGlobal Sum
+        Star r3
+        LdaSmi 0
+        Star r1
+        Star r2
+top:    CreateArray
+        Star r5
+        Ldar r1
+        BitAndSmi 7
+        AddSmi 1
+        Star r4
+        Construct r3, r4, 1     ; new Sum((i & 7) + 1)
+        Star r5
+        GetNamed r5, v
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 40, top
+        Ldar r2
+        Return
+end
+";
+    // n = 1..8, five times each: 5 × Σ n(n-1)/2 = 5 × 84.
+    assert_eq!(ok(src), "420");
+    let mut vm = Vm::new();
+    vm.run(&toi::asm::parse(src).unwrap()).unwrap();
+    assert!(vm.jit_stencils("Sum").is_some(), "Sum compiled");
+}
+
+/// `depth(n)` loops over nothing much, then recurses: compiled, its
+/// recursive call goes through the runtime and enters itself compiled.
+#[test]
+fn recursion_through_entered_functions() {
+    let src = "\
+script
+        CreateClosure depth
+        StaGlobal depth
+        LdaGlobal depth
+        Star r1
+        LdaSmi 200
+        Star r2
+        CallUndefined r1, r2, 1
+        Return
+end
+function depth(n)               ; 3 loop iterations, then 1 + depth(n - 1)
+        LdaSmi 0
+        Star r2
+loop:   Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 3, loop
+        Ldar r1
+        JumpIfLessSmi 1, base
+        LdaGlobal depth
+        Star r3
+        Ldar r1
+        AddSmi -1
+        Star r4
+        CallUndefined r3, r4, 1
+        AddSmi 1
+        Return
+base:   LdaSmi 0
+        Return
+end
+";
+    assert_eq!(ok(src), "200");
+}
+
+#[test]
+fn errors_in_entered_functions() {
+    // `get(o)` has a loop; at the 30th call `o` is undefined.
+    let src = "\
+script
+        CreateClosure get
+        StaGlobal get
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function get(o)
+        LdaSmi 0
+        Star r2
+loop:   Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 2, loop
+        GetNamed r1, x
+        Return
+end
+; r1 i, r2 get, r3 arg, r4 temp
+function main()
+        LdaGlobal get
+        Star r2
+        LdaSmi 0
+        Star r1
+top:    CreateArray
+        Star r3
+        Ldar r1
+        TestEqualSmi 30
+        JumpIfFalse call
+        LdaUndefined
+        Star r3
+call:   CallUndefined r2, r3, 1
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 50, top
+        Ldar r1
+        Return
+end
+";
+    let e = run(src).unwrap_err();
+    assert_eq!(
+        e.0,
+        "TypeError: Cannot read properties of undefined (reading 'x')"
+    );
+}

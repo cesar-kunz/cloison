@@ -84,6 +84,7 @@
 //! depth is bounded by the VM stack, not Rust's.
 
 use crate::bytecode::Op;
+use crate::jit::VmRun;
 use crate::object::{Class, Object, as_object};
 use crate::value::{NumberTag, Value};
 use crate::vm::{Code, Error, Ic, Vm};
@@ -255,13 +256,25 @@ macro_rules! handlers {
             macro_rules! jump_to {
                 ($p:expr, $a:expr, $r:expr) => { dispatch!(tbl, $p, 0, $a, $r, $tag, tbl, ti32) };
             }
-            // Enter bytecode function object `fo` in a new frame.
+            // Enter bytecode function object `fo` in a new frame: in its
+            // compiled code, once its call countdown has run out.
             macro_rules! enter {
                 ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
                     let callee: *const Code = (*$fo).code;
                     let new = push_frame($regs, callee, $this, $args, $argc, $flags, $pc.add($size));
                     if new.is_null() {
                         return stack_overflow($regs);
+                    }
+                    let left = (*callee).calls_left.get() - 1;
+                    (*callee).calls_left.set(left);
+                    if left < 0 {
+                        let e = enter_compiled(new);
+                        match e.kind {
+                            ENTER_RETURNED => next!(any, $size, e.acc),
+                            ENTER_RESUME => jump_to!(e.pc, e.acc, e.regs),
+                            ENTER_ERROR => return Value::EMPTY,
+                            _ => {}
+                        }
                     }
                     jump_to!((*callee).bytecode.as_ptr(), Value::UNDEFINED, new)
                 }};
@@ -1737,12 +1750,97 @@ unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value) -> Val
             let acc = *regs.sub(OSR_ACC);
             // Re-arm the budget even if this loop isn't compiled: another
             // loop of the frame may be.
-            let resume = crate::jit::vm_osr(vm, code, regs, target, acc);
             *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
+            let resume = match crate::jit::vm_run(vm, code, regs, target, acc) {
+                VmRun::NotCompiled => Resume {
+                    regs,
+                    pc: start.add(target),
+                    acc,
+                },
+                VmRun::Exit(r) => r,
+                VmRun::Returned(v) => match finish_return(regs, v) {
+                    Ok(r) => r,
+                    Err(v) => return v,
+                },
+            };
             if vm.error.is_some() {
                 return Value::EMPTY;
             }
             v = dispatch_at(resume.pc, resume.acc, resume.regs);
+        }
+    }
+}
+
+/// Finish frame `regs` returning `v` from compiled code, as `Return` does:
+/// where the caller resumes, or `Err` with the result if the frame returns
+/// to native code.
+unsafe fn finish_return(regs: *mut Value, v: Value) -> Result<Resume, Value> {
+    unsafe {
+        let v = if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
+            construct_result(regs, v)
+        } else {
+            v
+        };
+        let ret: *const u8 = header(regs, RET_PC);
+        if ret.is_null() {
+            return Err(v);
+        }
+        Ok(Resume {
+            regs: header(regs, CALLER),
+            pc: ret,
+            acc: v,
+        })
+    }
+}
+
+/// How [`enter_compiled`] ended, for the call handlers.
+#[repr(C)]
+struct Entered {
+    kind: u64,
+    regs: *mut Value,
+    pc: *const u8,
+    acc: Value,
+}
+const ENTER_INTERPRET: u64 = 0;
+const ENTER_RETURNED: u64 = 1;
+const ENTER_RESUME: u64 = 2;
+const ENTER_ERROR: u64 = 3;
+
+/// A call to a hot function (its call countdown ran out): run its compiled
+/// code for the new frame `regs`. Returned: the result, for the caller
+/// (`construct_result` applied). Exited: where the interpreter resumes.
+/// Not compiled: the function won't be entered compiled again.
+#[inline(never)]
+fn enter_compiled(regs: *mut Value) -> Entered {
+    unsafe {
+        let vm = &mut *frame_vm(regs);
+        let code = &*frame_code(regs);
+        let done = |kind, acc| Entered {
+            kind,
+            regs,
+            pc: std::ptr::null(),
+            acc,
+        };
+        match crate::jit::vm_run(vm, code, regs, 0, Value::UNDEFINED) {
+            VmRun::NotCompiled => {
+                code.calls_left.set(i32::MAX);
+                done(ENTER_INTERPRET, Value::UNDEFINED)
+            }
+            VmRun::Returned(v) => {
+                let v = if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
+                    construct_result(regs, v)
+                } else {
+                    v
+                };
+                done(ENTER_RETURNED, v)
+            }
+            VmRun::Exit(_) if vm.error.is_some() => done(ENTER_ERROR, Value::EMPTY),
+            VmRun::Exit(r) => Entered {
+                kind: ENTER_RESUME,
+                regs: r.regs,
+                pc: r.pc,
+                acc: r.acc,
+            },
         }
     }
 }
@@ -1839,7 +1937,33 @@ pub(crate) unsafe fn call_from_jit(
             *new.add(i) = Value::UNDEFINED;
         }
         vm.native_depth += 1;
-        let v = drive(vm, (*callee).bytecode.as_ptr(), Value::UNDEFINED, new);
+        let mut start = Resume {
+            regs: new,
+            pc: (*callee).bytecode.as_ptr(),
+            acc: Value::UNDEFINED,
+        };
+        // A hot callee runs compiled; an exit resumes in the interpreter.
+        let left = (*callee).calls_left.get() - 1;
+        (*callee).calls_left.set(left);
+        if left < 0 {
+            match crate::jit::vm_run(vm, &*callee, new, 0, Value::UNDEFINED) {
+                VmRun::NotCompiled => (*callee).calls_left.set(i32::MAX),
+                VmRun::Returned(v) => {
+                    vm.native_depth -= 1;
+                    return if flags == CONSTRUCT {
+                        construct_result(new, v)
+                    } else {
+                        v
+                    };
+                }
+                VmRun::Exit(_) if vm.error.is_some() => {
+                    vm.native_depth -= 1;
+                    return Value::EMPTY;
+                }
+                VmRun::Exit(r) => start = r,
+            }
+        }
+        let v = drive(vm, start.pc, start.acc, start.regs);
         vm.native_depth -= 1;
         v
     }

@@ -98,8 +98,12 @@ pub struct Code {
     /// form of slack tracking), and the root shape last used.
     pub ctor_capacity: Cell<u32>,
     pub ctor_shape: Cell<*const Shape>,
-    /// Compiled code, once a loop got hot (see `jit::vm_osr`).
+    /// Compiled code, once a loop or the function got hot (see
+    /// `jit::vm_run`).
     pub(crate) jit: RefCell<Option<Box<crate::jit::JitFunction>>>,
+    /// Calls left before calls enter compiled code (below zero: they do;
+    /// `i32::MAX`: never).
+    pub(crate) calls_left: Cell<i32>,
 }
 
 impl Code {
@@ -110,8 +114,10 @@ impl Code {
 }
 
 const INITIAL_CTOR_CAPACITY: u32 = 4;
-/// Loop back edges before a frame tiers up (as `jit::Tiering::default`).
+/// Loop back edges before a frame tiers up, and calls before a function's
+/// calls enter compiled code (as `jit::Tiering::default`).
 pub(crate) const TIER_BACK_EDGES: i64 = 1000;
+pub(crate) const TIER_CALLS: i32 = 10;
 const MAX_INLINE_CAPACITY: u32 = 64;
 /// Stack size in values (frame headers included).
 const STACK_VALUES: usize = 1 << 18;
@@ -144,11 +150,16 @@ pub struct Vm {
     /// up into the JIT: `TOI_TIER` if set, `i64::MAX` (never) with
     /// `TOI_NO_JIT` set.
     pub(crate) frame_budget: i64,
+    /// Calls of a function before calls to it enter compiled code (see
+    /// `Code::calls_left`); `i32::MAX` with `TOI_NO_JIT`.
+    pub(crate) tier_calls: i32,
     /// The frame that left the interpreter to tier up.
     pub(crate) osr_regs: *mut Value,
     /// Calls from compiled code running now (see `interp::call_from_jit`).
     pub(crate) native_depth: u32,
     function_shape: *const Shape,
+    /// The root shape of arrays (cached: `root_shape` hashes).
+    array_shape: *const Shape,
     proto_object_shape: *const Shape,
     a_prototype: Atom,
     a_constructor: Atom,
@@ -191,14 +202,18 @@ impl Vm {
                     .and_then(|n| n.parse::<i64>().ok())
                     .map_or(TIER_BACK_EDGES, |n| n.max(1))
             },
+            tier_calls: 0,
             osr_regs: std::ptr::null_mut(),
             native_depth: 0,
             function_shape: std::ptr::null(),
+            array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
         };
+        let budget = vm.frame_budget;
+        vm.set_tier_back_edges(budget);
         vm.a_prototype = vm.intern("prototype");
         vm.a_constructor = vm.intern("constructor");
         vm.a_length = vm.intern("length");
@@ -215,6 +230,7 @@ impl Vm {
         let root = vm.root_shape(Class::Plain, op, INITIAL_CTOR_CAPACITY);
         vm.proto_object_shape = vm.transition(root, vm.a_constructor);
 
+        vm.array_shape = vm.root_shape(Class::Array, object_value(vm.array_prototype), 0);
         let ap = vm.array_prototype;
         vm.define_native(ap, "push", array_push, 1);
         vm
@@ -343,8 +359,7 @@ impl Vm {
     }
 
     pub fn new_array(&mut self) -> Value {
-        let ap = object_value(self.array_prototype);
-        object_value(self.new_object_with(Class::Array, ap, 0))
+        object_value(self.heap.alloc_object(unsafe { &*self.array_shape }))
     }
 
     /// Add property `name` (which `o` must not have) with `value`, and
@@ -767,6 +782,7 @@ impl Vm {
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
             jit: RefCell::new(None),
+            calls_left: Cell::new(i32::MAX),
         });
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
@@ -863,6 +879,11 @@ impl Vm {
                     ctor_capacity: Cell::new(INITIAL_CTOR_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
                     jit: RefCell::new(None),
+                    calls_left: Cell::new(if worth_entering_compiled(&f.code) {
+                        self.tier_calls
+                    } else {
+                        i32::MAX
+                    }),
                 })
             })
             .collect();
@@ -880,9 +901,15 @@ impl Vm {
     }
 
     /// Loop back edges a frame runs in the interpreter before tiering up
-    /// into the JIT; `i64::MAX` disables the JIT.
+    /// into the JIT, and (up to `TIER_CALLS`) calls before a function's
+    /// calls enter compiled code; `i64::MAX` disables the JIT.
     pub fn set_tier_back_edges(&mut self, n: i64) {
         self.frame_budget = n.max(1);
+        self.tier_calls = if n == i64::MAX {
+            i32::MAX
+        } else {
+            n.clamp(1, TIER_CALLS as i64) as i32
+        };
     }
 
     /// The stencils of `function`'s most recent compiled code, if any (for
@@ -906,6 +933,32 @@ impl Vm {
         unsafe { (*(*as_object(o)).shape).capacity }
     }
 }
+
+/// Whether calls to a function should enter its compiled code once it is
+/// hot: if it has a loop (whose back-edge budget restarts with each frame,
+/// so a short loop in a function called often never tiers up by itself),
+/// or at least [`ENTRY_COMPILE_SIZE`] instructions. Entering compiled code
+/// costs a round trip through the driver, which a small loop-free function
+/// doesn't win back; when compiled code calls it, it is inlined instead.
+fn worth_entering_compiled(code: &[u8]) -> bool {
+    use crate::bytecode::Op;
+    let (mut pc, mut n) = (0, 0);
+    while pc < code.len() {
+        let op = Op::from_u8(code[pc]).expect("valid bytecode");
+        if matches!(
+            op,
+            Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop
+        ) {
+            return true;
+        }
+        n += 1;
+        pc += op.size();
+    }
+    n >= ENTRY_COMPILE_SIZE
+}
+
+/// See [`worth_entering_compiled`].
+const ENTRY_COMPILE_SIZE: usize = 64;
 
 fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {

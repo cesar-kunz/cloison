@@ -18,11 +18,16 @@
 //!   relocation with the operand's value. Stencils must only use the low
 //!   32 bits of `toi_hole_imm`: on x86-64 the small code model may emit it
 //!   sign- or zero-extended.
-//! - Slow paths that call into the runtime (`toi_rt_*`, C ABI) live in
-//!   separate `#[cold]` helper functions named `toi_stencil_<op>__slow`.
-//!   Otherwise LLVM sets up a stack frame on the fast path too. The JIT
-//!   copies each instruction's helpers into a cold area, and `toi_rt_*`
-//!   calls go through trampolines in JIT memory.
+//! - Slow paths that call into the runtime (`toi_rt_*`) live in separate
+//!   `#[cold]` helper functions named `toi_stencil_<op>__slow`. Otherwise
+//!   LLVM sets up a stack frame on the fast path too. The JIT copies each
+//!   instruction's helpers into a cold area.
+//! - Runtime calls are inline `asm!` ([`rt_call!`]), not Rust calls: a C call
+//!   clobbers the caller-saved slot registers, so LLVM would save and restore
+//!   all of them around every call, even in regions that use none. Instead
+//!   the asm passes every caller-saved slot register through as an in/out
+//!   operand, and the call goes to a per-region wrapper that the JIT emits
+//!   in JIT memory, saving only the slots that region uses.
 //! - Side exits leave through `toi_exit`, patched to a per-instruction stub
 //!   (spills, then the `exit` stencil). It records the instruction's
 //!   bytecode offset in `*ctx` and returns `acc` to the JIT driver. An
@@ -113,9 +118,106 @@ unsafe extern "C" {
     static toi_hole_imm: u8;
     static toi_hole_reg: u8;
 
-    fn toi_rt_add(a: Value, b: Value) -> Value;
-    fn toi_rt_inc(a: Value) -> Value;
-    fn toi_rt_less_than(a: Value, b: Value) -> bool;
+    // Runtime functions. Only ever reached through `rt_call!`, so only their
+    // symbols matter: the JIT points each call at a wrapper for the region.
+    fn toi_rt_add();
+    fn toi_rt_inc();
+    fn toi_rt_less_than();
+}
+
+/// Call runtime function `$f` with two boxed arguments; returns the raw
+/// 64-bit result (a `Value`, or a `bool` in the low byte).
+///
+/// Wrapper convention (the JIT emits the wrapper, see `src/jit.rs`):
+/// - x86-64: arguments in rax and r11, result in rax. The wrapper may
+///   clobber r10 and r11, and xmm8–xmm15. Every caller-saved slot register
+///   (rdi rsi rdx rcx r8 r9, xmm0–xmm7) is an in/out operand. LLVM keeps
+///   nothing else in them across the call, and the wrapper preserves the
+///   ones the region uses (the rest hold nothing). The `call` pushes a
+///   return address, so the asm first steps over the 128-byte red zone.
+/// - arm64: arguments in x8 and x9, result in x8. The wrapper may clobber
+///   x7, x9–x17 and v16–v31; `bl` clobbers x30. Slot registers x24–x28 are
+///   callee-saved under the C ABI anyway; x0–x6 and v0–v7 are in/out
+///   operands.
+#[cfg(target_arch = "x86_64")]
+macro_rules! rt_call {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+        let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
+        let [mut g0, mut g1, mut g2, mut g3, mut g4, mut g5] = $s.g.map(Value::to_bits);
+        let [mut f0, mut f1, mut f2, mut f3, mut f4, mut f5, mut f6] = $s.f;
+        let mut facc = $s.facc;
+        core::arch::asm!(
+            "lea rsp, [rsp - 128]",
+            "call {f}",
+            "lea rsp, [rsp + 128]",
+            f = sym $f,
+            inout("rax") a,
+            inout("r11") b => _,
+            inout("rdi") g0, inout("rsi") g1, inout("rdx") g2,
+            inout("rcx") g3, inout("r8") g4, inout("r9") g5,
+            inout("xmm0") facc,
+            inout("xmm1") f0, inout("xmm2") f1, inout("xmm3") f2, inout("xmm4") f3,
+            inout("xmm5") f4, inout("xmm6") f5, inout("xmm7") f6,
+            out("r10") _,
+            out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
+            out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+        );
+        $s.g = [g0, g1, g2, g3, g4, g5].map(Value::from_bits);
+        $s.f = [f0, f1, f2, f3, f4, f5, f6];
+        $s.facc = facc;
+        a
+    }};
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! rt_call {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+        let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
+        let [g0, g1, g2, g3, g4, mut g5, mut g6, mut g7, mut g8, mut g9, mut g10, mut g11] =
+            $s.g.map(Value::to_bits);
+        let [mut f0, mut f1, mut f2, mut f3, mut f4, mut f5, mut f6] = $s.f;
+        let mut facc = $s.facc;
+        core::arch::asm!(
+            "bl {f}",
+            f = sym $f,
+            inout("x8") a,
+            inout("x9") b => _,
+            inout("x0") g5, inout("x1") g6, inout("x2") g7, inout("x3") g8,
+            inout("x4") g9, inout("x5") g10, inout("x6") g11,
+            inout("v0") facc,
+            inout("v1") f0, inout("v2") f1, inout("v3") f2, inout("v4") f3,
+            inout("v5") f4, inout("v6") f5, inout("v7") f6,
+            out("x7") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _,
+            out("x14") _, out("x15") _, out("x16") _, out("x17") _, out("x30") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+        );
+        $s.g = [g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11].map(Value::from_bits);
+        $s.f = [f0, f1, f2, f3, f4, f5, f6];
+        $s.facc = facc;
+        a
+    }};
+}
+
+/// `toi_rt_add(a, b)`.
+macro_rules! rt_add {
+    ($s:ident, $a:expr, $b:expr) => {
+        Value::from_bits(rt_call!($s, toi_rt_add, $a, $b))
+    };
+}
+/// `toi_rt_inc(a)`.
+macro_rules! rt_inc {
+    ($s:ident, $a:expr) => {
+        Value::from_bits(rt_call!($s, toi_rt_inc, $a, Value::UNDEFINED))
+    };
+}
+/// `toi_rt_less_than(a, b)`.
+macro_rules! rt_less_than {
+    ($s:ident, $a:expr, $b:expr) => {
+        rt_call!($s, toi_rt_less_than, $a, $b) as u8 & 1 != 0
+    };
 }
 
 /// Define a stencil function `$name` exported as `$sym`, whose body sees the
@@ -258,7 +360,7 @@ stencil_slow!("add_smi"; |s| {
     }
     slow!(s)
 }; |s| {
-    s.acc = toi_rt_add(s.acc, Value::from_i32(imm()));
+    s.acc = rt_add!(s, s.acc, Value::from_i32(imm()));
     next!(s)
 });
 
@@ -294,7 +396,7 @@ stencil_slow!("inc"; |s| {
     }
     slow!(s)
 }; |s| {
-    s.acc = toi_rt_inc(s.acc);
+    s.acc = rt_inc!(s, s.acc);
     next!(s)
 });
 
@@ -327,7 +429,7 @@ stencil_slow!("jlt_smi"; |s| {
     }
     next!(s)
 }; |s| {
-    if toi_rt_less_than(s.acc, Value::from_i32(imm())) {
+    if rt_less_than!(s, s.acc, Value::from_i32(imm())) {
         jump!(s)
     }
     next!(s)
@@ -402,7 +504,8 @@ macro_rules! boxed_location {
             }
             slow!(s)
         }; |s| {
-            s.acc = toi_rt_add(s.acc, get!($loc, s));
+            let rhs = get!($loc, s);
+            s.acc = rt_add!(s, s.acc, rhs);
             next!(s)
         });
         stencil!("add_ii_", loc!($loc); |s| {
@@ -441,7 +544,8 @@ macro_rules! boxed_location {
             }
             next!(s)
         }; |s| {
-            if toi_rt_less_than(s.acc, get!($loc, s)) {
+            let rhs = get!($loc, s);
+            if rt_less_than!(s, s.acc, rhs) {
                 jump!(s)
             }
             next!(s)
@@ -507,7 +611,8 @@ macro_rules! fp_slot {
         });
 
         stencil!("add_f", $k; |s| {
-            s.acc = toi_rt_add(s.acc, s.tag.encode_f64(s.f[$k]));
+            let rhs = s.tag.encode_f64(s.f[$k]);
+            s.acc = rt_add!(s, s.acc, rhs);
             next!(s)
         });
         stencil!("add_if_f", $k; |s| {
@@ -520,7 +625,8 @@ macro_rules! fp_slot {
         });
 
         stencil!("jlt_f", $k; |s| {
-            if toi_rt_less_than(s.acc, s.tag.encode_f64(s.f[$k])) {
+            let rhs = s.tag.encode_f64(s.f[$k]);
+            if rt_less_than!(s, s.acc, rhs) {
                 jump!(s)
             }
             next!(s)

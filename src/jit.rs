@@ -29,13 +29,16 @@
 //! [      fall-through conversions, then (at its label) e.g. spills       ]
 //! [      before `return`, then the instruction's stencil                 ]
 //! [ cold: edge stubs, exit stubs (spill, then exit), `__slow` helpers    ]
-//! [ trampolines: one per runtime function (`toi_rt_*`) referenced       ]
+//! [ runtime-call wrappers: one per `toi_rt_*` referenced, saving the     ]
+//! [      slot registers this region uses                                 ]
 //! ```
 //!
 //! A stencil whose last instruction jumps to `toi_continue` falls through
 //! into the next piece with that jump trimmed. Calls to runtime functions
-//! go through trampolines, so `rel32` / `CALL26` relocations only ever reach
-//! inside JIT memory. On arm64, operand holes are `adrp`+`add` pairs whose
+//! go to wrappers in JIT memory ([`arch::runtime_wrapper`]), so `rel32` /
+//! `CALL26` relocations only ever reach inside JIT memory. The wrappers save
+//! only the slot registers the region uses, instead of every stencil
+//! saving all of them around a C call. On arm64, operand holes are `adrp`+`add` pairs whose
 //! "address" is the operand value. `adrp` is page-relative with a ±4 GiB
 //! range, so JIT memory is mapped below 4 GiB there.
 
@@ -120,7 +123,6 @@ fn runtime_function(name: &str) -> usize {
 mod arch {
     /// Length of the trailing `jmp rel32` dropped on fall-through.
     pub const TRAILING_JUMP: usize = 5;
-    pub const TRAMPOLINE_SIZE: usize = 14;
     pub const CODE_ALIGN: usize = 16;
 
     /// Whether the stencil ends with `jmp toi_continue`.
@@ -133,10 +135,61 @@ mod arch {
                 .any(|r| r.symbol == "toi_continue" && r.offset as usize == n - 4)
     }
 
-    /// `jmp [rip+0]` followed by the 64-bit target.
-    pub fn write_trampoline(buf: &mut [u8], target: u64) {
-        buf[..6].copy_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
-        buf[6..14].copy_from_slice(&target.to_le_bytes());
+    /// The register number of GPR slot `k` (rdi rsi rdx rcx r8 r9), if the
+    /// C ABI doesn't preserve it, so a runtime-call wrapper must. On x86-64
+    /// all GPR slots are caller-saved.
+    pub fn caller_saved_gpr_slot(k: u8) -> Option<u8> {
+        Some([7, 6, 2, 1, 8, 9][k as usize])
+    }
+
+    /// A runtime-call wrapper (see `rt_call!` in `stencils/stencils.rs`):
+    /// called with the arguments in rax and r11, it saves GPRs `gprs` and
+    /// xmm registers `fprs`, calls the C function `target`, restores them
+    /// and returns the result in rax. Position-independent.
+    ///
+    /// Entered with rsp ≡ 8 (mod 16), as from any call at an aligned site.
+    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
+        let mut c = Vec::new();
+        for &r in gprs {
+            if r >= 8 {
+                c.push(0x41);
+            }
+            c.push(0x50 + (r & 7)); // push r
+        }
+        // Spill area for xmm registers, padded so the call site is aligned.
+        let mut frame = 8 * fprs.len();
+        if !(8 + 8 * gprs.len() + frame).is_multiple_of(16) {
+            frame += 8;
+        }
+        if frame > 0 {
+            c.extend([0x48, 0x83, 0xEC, frame as u8]); // sub rsp, frame
+        }
+        let movsd = |c: &mut Vec<u8>, op: u8, x: u8, i: usize| {
+            // movsd [rsp + 8i], xmm / movsd xmm, [rsp + 8i]
+            c.extend([0xF2, 0x0F, op, 0x44 | (x << 3), 0x24, (8 * i) as u8]);
+        };
+        for (i, &x) in fprs.iter().enumerate() {
+            movsd(&mut c, 0x11, x, i);
+        }
+        c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
+        c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+        c.extend([0x48, 0xB8]); // movabs rax, target
+        c.extend(target.to_le_bytes());
+        c.extend([0xFF, 0xD0]); // call rax
+        for (i, &x) in fprs.iter().enumerate() {
+            movsd(&mut c, 0x10, x, i);
+        }
+        if frame > 0 {
+            c.extend([0x48, 0x83, 0xC4, frame as u8]); // add rsp, frame
+        }
+        for &r in gprs.iter().rev() {
+            if r >= 8 {
+                c.push(0x41);
+            }
+            c.push(0x58 + (r & 7)); // pop r
+        }
+        c.push(0xC3); // ret
+        c
     }
 
     /// Apply relocation `r_type` at `buf[0..]` (the field), located at
@@ -183,7 +236,6 @@ mod arch {
     const R_AARCH64_LDST128_ABS_LO12_NC: u32 = 299;
 
     pub const TRAILING_JUMP: usize = 4;
-    pub const TRAMPOLINE_SIZE: usize = 16;
     pub const CODE_ALIGN: usize = 16;
 
     pub fn ends_with_continue(code: &[u8], relocs: &[super::Reloc]) -> bool {
@@ -196,11 +248,54 @@ mod arch {
             })
     }
 
-    /// `ldr x16, #8; br x16` followed by the 64-bit target.
-    pub fn write_trampoline(buf: &mut [u8], target: u64) {
-        buf[0..4].copy_from_slice(&0x5800_0050u32.to_le_bytes());
-        buf[4..8].copy_from_slice(&0xD61F_0200u32.to_le_bytes());
-        buf[8..16].copy_from_slice(&target.to_le_bytes());
+    /// The register number of GPR slot `k`, if the C ABI doesn't preserve
+    /// it, so a runtime-call wrapper must. Slots 0–4 are x24–x28,
+    /// callee-saved; slots 5–11 are x0–x6.
+    pub fn caller_saved_gpr_slot(k: u8) -> Option<u8> {
+        (k >= 5).then(|| k - 5)
+    }
+
+    /// A runtime-call wrapper (see `rt_call!` in `stencils/stencils.rs`):
+    /// called with `bl` and the arguments in x8 and x9, it saves GPRs `gprs`
+    /// and FP registers `fprs` (d0–d7), calls the C function `target`,
+    /// restores them and returns the result in x8. Position-independent; the
+    /// target address is a literal after the code.
+    pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
+        let mut c: Vec<u32> = Vec::new();
+        c.push(0xA9BF_7BFD); // stp x29, x30, [sp, #-16]!
+        c.push(0x9100_03FD); // mov x29, sp
+        let n = gprs.len() + fprs.len();
+        let frame = (8 * n).next_multiple_of(16) as u32;
+        if frame > 0 {
+            c.push(0xD100_03FF | frame << 10); // sub sp, sp, #frame
+        }
+        // str / ldr x or d register at [sp, #8i]
+        let slot = |op: u32, r: u8, i: usize| op | (i as u32) << 10 | (31 << 5) | r as u32;
+        let saves = gprs.iter().map(|&r| (0xF900_0000, 0xF940_0000, r));
+        let saves = saves.chain(fprs.iter().map(|&r| (0xFD00_0000, 0xFD40_0000, r)));
+        let saves: Vec<_> = saves.collect();
+        for (i, &(st, _, r)) in saves.iter().enumerate() {
+            c.push(slot(st, r, i));
+        }
+        c.push(0xAA08_03E0); // mov x0, x8
+        c.push(0xAA09_03E1); // mov x1, x9
+        let ldr_at = c.len();
+        c.push(0); // ldr x16, literal (patched below)
+        c.push(0xD63F_0200); // blr x16
+        c.push(0xAA00_03E8); // mov x8, x0
+        for (i, &(_, ld, r)) in saves.iter().enumerate() {
+            c.push(slot(ld, r, i));
+        }
+        if frame > 0 {
+            c.push(0x9100_03FF | frame << 10); // add sp, sp, #frame
+        }
+        c.push(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
+        c.push(0xD65F_03C0); // ret
+        let lit = c.len();
+        c[ldr_at] = 0x5800_0010 | ((lit - ldr_at) as u32) << 5;
+        let mut bytes: Vec<u8> = c.iter().flat_map(|i| i.to_le_bytes()).collect();
+        bytes.extend(target.to_le_bytes());
+        bytes
     }
 
     fn read(buf: &[u8]) -> u32 {
@@ -1143,7 +1238,7 @@ impl JitCode {
         }
 
         // Positions. Hot pieces back to back; then cold code: edge stubs,
-        // exit stubs, helpers; then trampolines.
+        // exit stubs, helpers; then runtime-call wrappers.
         let mut pos = 0;
         let place = |pieces: &[Piece], pos: &mut usize| -> Vec<usize> {
             pieces
@@ -1178,8 +1273,29 @@ impl JitCode {
                 pos += h.code.len();
             }
         }
+        // Runtime-call wrappers, saving the slot registers this region uses
+        // (see `rt_call!` in the stencils). The FP accumulator counts if the
+        // region ever holds a double in it.
+        let uses_facc = ins.iter().flatten().any(|st| st.acc == Ty::F64)
+            || sel.iter().flatten().any(|s| s.out.acc == Ty::F64);
+        let saved_gprs: Vec<u8> = homes
+            .iter()
+            .filter_map(|h| match h {
+                Home::Gpr(k) => arch::caller_saved_gpr_slot(*k),
+                _ => None,
+            })
+            .collect();
+        let saved_fprs: Vec<u8> = uses_facc
+            .then_some(0)
+            .into_iter()
+            .chain(homes.iter().filter_map(|h| match h {
+                Home::Fpr(k) => Some(k + 1),
+                _ => None,
+            }))
+            .collect();
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
         let mut tramp_at: HashMap<&str, usize> = HashMap::new();
+        let mut wrappers: Vec<(usize, Vec<u8>)> = Vec::new();
         let all_stencils = hot
             .iter()
             .chain(stubs.iter().flatten())
@@ -1189,8 +1305,11 @@ impl JitCode {
         for s in all_stencils {
             for r in s.relocs.iter().filter(|r| r.symbol.starts_with("toi_rt_")) {
                 tramp_at.entry(r.symbol).or_insert_with(|| {
+                    let target = runtime_function(r.symbol) as u64;
+                    let code = arch::runtime_wrapper(target, &saved_gprs, &saved_fprs);
                     let at = pos;
-                    pos += arch::TRAMPOLINE_SIZE;
+                    pos += code.len().next_multiple_of(8);
+                    wrappers.push((at, code));
                     at
                 });
             }
@@ -1199,8 +1318,8 @@ impl JitCode {
         let mut mem = ExecMem::new(pos);
         let base = mem.ptr as u64;
         let buf = mem.bytes();
-        for (&name, &at) in &tramp_at {
-            arch::write_trampoline(&mut buf[at..], runtime_function(name) as u64);
+        for (at, code) in &wrappers {
+            buf[*at..*at + code.len()].copy_from_slice(code);
         }
 
         let resolve = |t: Target, next: usize| match t {

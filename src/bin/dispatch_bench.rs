@@ -10,6 +10,11 @@
 //!   double  i = 0; while (i < n) { s = s + i; i = i + 1 }          return s
 //!   wide    i = 0; while (i < n) { a1 = a1 + 1; … a8 = a8 + 8; i = i + 1 }
 //!           return a8: 12 live VM registers, more than x86-64's 6 GPR slots
+//!   cmp     i = 0; while (i < n) { a = i % 7; b = i & 15;
+//!                                  if (b < a) s++; if ((i & 3) == 0) s += 2;
+//!                                  if (a == b) s += 4; s = s | 0; i = i + 1 }
+//!           return s: the numeric operations, each comparison followed by
+//!           the jump that consumes it
 //!
 //! codegen:
 //!   generic  constants in registers: `add r`, `jump_if_less r`
@@ -35,13 +40,16 @@
 //! With `TOI_JIT_DUMP=<file>`, the hot machine code the JIT compiled last
 //! is written to `<file>` after the run (see `scripts/jit-asm.sh`).
 //!
+//! The bytecode is quickened (`toi::bytecode::quicken`: comparison + jump
+//! superinstructions) unless `TOI_NO_QUICKEN` is set.
+//!
 //! `n` is baked into the bytecode, as `i < 100000000` would be. In `double`,
 //! `s` leaves the int32 range after ~65k iterations and `add` takes its slow
 //! path from then on. `scripts/bench.sh` runs the whole matrix under `perf`.
 
 use std::process::exit;
 use std::time::Instant;
-use toi::bytecode::Assembler;
+use toi::bytecode::{Arg, Assembler, Op};
 use toi::jit::JitFunction;
 use toi::value::Value;
 
@@ -121,6 +129,35 @@ fn main() {
             }
             8.0 * nf
         }
+        "cmp" => {
+            let (ra, rb) = (A1, A1 + 1);
+            let (s1, s2, s3) = (a.label(), a.label(), a.label());
+            a.ldar(I).emit(Op::ModSmi, &[Arg::Imm(7)]).star(ra);
+            a.ldar(I).emit(Op::BitAndSmi, &[Arg::Imm(15)]).star(rb);
+            a.ldar(ra).emit(Op::TestLessThan, &[Arg::Reg(rb)]);
+            a.emit(Op::JumpIfFalse, &[Arg::Label(s1)]);
+            a.ldar(S).inc().star(S);
+            a.bind(s1);
+            a.ldar(I).emit(Op::BitAndSmi, &[Arg::Imm(3)]);
+            a.emit(Op::TestEqualSmi, &[Arg::Imm(0)]);
+            a.emit(Op::JumpIfFalse, &[Arg::Label(s2)]);
+            a.ldar(S).add_smi(2).star(S);
+            a.bind(s2);
+            a.ldar(rb).emit(Op::TestEqual, &[Arg::Reg(ra)]);
+            a.emit(Op::JumpIfFalse, &[Arg::Label(s3)]);
+            a.ldar(S).add_smi(4).star(S);
+            a.bind(s3);
+            a.ldar(S).emit(Op::BitOrSmi, &[Arg::Imm(0)]).star(S);
+            // The body repeats with period lcm(7, 16) = 112: count one
+            // period, not n iterations (perf would measure this loop too).
+            let step = |i: i64| {
+                let (x, y) = (i % 7, i & 15);
+                (y < x) as i64 + 2 * (i & 3 == 0) as i64 + 4 * (x == y) as i64
+            };
+            let (period, n) = (112, n as i64);
+            let full: i64 = (0..period).map(step).sum();
+            ((n / period) * full + (0..n % period).map(step).sum::<i64>()) as f64
+        }
         _ => usage(),
     };
     a.ldar(I).inc().star(I);
@@ -130,7 +167,10 @@ fn main() {
         a.jump_if_less(LIMIT, top);
     }
     a.ldar(if program == "wide" { A1 + 7 } else { S }).ret();
-    let code = a.finish();
+    let mut code = a.finish();
+    if std::env::var_os("TOI_NO_QUICKEN").is_none() {
+        toi::bytecode::quicken(&mut code);
+    }
 
     let mut regs = [Value::UNDEFINED; 12];
     let mut jit = match engine {

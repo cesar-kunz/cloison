@@ -13,7 +13,10 @@
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("toi supports x86_64 and aarch64 only (dispatch is tuned per architecture)");
 
+pub mod asm;
 pub mod bytecode;
 pub mod interp;
 pub mod jit;
+pub mod object;
 pub mod value;
+pub mod vm;

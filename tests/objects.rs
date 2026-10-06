@@ -1245,3 +1245,339 @@ end
     assert!(s.iter().any(|n| n.starts_with("get_keyed_i_sh_")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("get_own_nc_")), "{s:?}");
 }
+
+// ---- Calls in compiled loops ----
+
+/// `get(o)` inlined into a loop over objects of two shapes: the inlined
+/// load's guard fails on the second shape, inside the inlined frame, so the
+/// exit writes the callee's frame header and the interpreter finishes the
+/// call there, returning into the caller. An int32 overflow inside the
+/// inlined callee exits the same way.
+#[test]
+fn exits_inside_inlined_callees_resume_in_the_callee() {
+    let src = "\
+script
+        LdaSmi 0
+        StaGlobal calls
+        CreateClosure P
+        StaGlobal P
+        CreateClosure Q
+        StaGlobal Q
+        CreateClosure get
+        StaGlobal get
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function P(x)
+        Ldar r1
+        SetNamed r0, x
+        LdaUndefined
+        Return
+end
+function Q(x)                   ; x at another offset
+        LdaSmi 0
+        SetNamed r0, pad
+        Ldar r1
+        SetNamed r0, x
+        LdaUndefined
+        Return
+end
+function get(o)                 ; calls++; o.x + 2147483000: overflows for large x
+        LdaGlobal calls
+        Inc
+        StaGlobal calls
+        GetNamed r1, x
+        AddSmi 2147483000
+        Return
+end
+; r1 p, r2 q, r3 i, r4 sum (a double eventually), r5 get, r6 arg, r7 temp
+function main()
+        LdaGlobal P
+        Star r7
+        LdaSmi 1
+        Star r6
+        Construct r7, r6, 1
+        Star r1
+        LdaGlobal Q
+        Star r7
+        LdaSmi 1000
+        Star r6
+        Construct r7, r6, 1
+        Star r2
+        LdaGlobal get
+        Star r5
+        LdaSmi 0
+        Star r3
+        Star r4
+loop:   Mov r1, r6
+        Ldar r3
+        TestEqualSmi 10
+        JumpIfFalse call
+        Mov r2, r6              ; at i = 10, get(q)
+call:   CallUndefined r5, r6, 1
+        Add r4
+        Star r4
+        Ldar r3
+        Inc
+        Star r3
+        JumpIfLessSmi 20, loop
+        LdaGlobal calls
+        Add r4                  ; + the number of calls, 20: an exit
+        Return                  ; inside `get` must not call it again
+end
+";
+    // 19 × (1 + 2147483000) + (1000 + 2147483000) + 20.
+    let (v, s) = jit(src);
+    assert_eq!(v, (19 * 2147483001u64 + 2147484000 + 20).to_string());
+    assert!(s.iter().any(|n| n.starts_with("check_callee_")), "{s:?}");
+}
+
+/// The function a call site calls changes mid-loop (a global reassigned):
+/// the inlined call's guard exits, and the interpreter makes the call.
+#[test]
+fn inlined_calls_guard_the_callee() {
+    let src = "\
+script
+        CreateClosure one
+        StaGlobal f
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function one()
+        LdaSmi 1
+        Return
+end
+function ten()
+        LdaSmi 10
+        Return
+end
+; r1 i, r2 sum, r3 callee
+function main()
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   Ldar r1
+        TestEqualSmi 10
+        JumpIfFalse call
+        CreateClosure ten
+        StaGlobal f             ; f = ten, at i = 10
+call:   LdaGlobal f
+        Star r3
+        CallUndefined r3, r4, 0
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 20, loop
+        Ldar r2
+        Return
+end
+";
+    // 10 × 1 + 10 × 10.
+    assert_eq!(jit(src).0, "110");
+}
+
+#[test]
+fn errors_in_callees_end_compiled_loops() {
+    // At i = 5 the callee reads a property of undefined.
+    let src = "\
+script
+        CreateClosure g
+        StaGlobal g
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function g(o)
+        GetNamed r1, x
+        Return
+end
+; r1 i, r2 g, r3 arg, r4 o
+function main()
+        LdaGlobal g
+        Star r2
+        CreateArray
+        Star r4
+        LdaSmi 0
+        Star r1
+loop:   Mov r4, r3
+        Ldar r1
+        TestEqualSmi 5
+        JumpIfFalse call
+        LdaUndefined
+        Star r3
+call:   CallUndefined r2, r3, 1
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 20, loop
+        Ldar r1
+        Return
+end
+";
+    let e = run(src).unwrap_err();
+    assert_eq!(
+        e.0,
+        "TypeError: Cannot read properties of undefined (reading 'x')"
+    );
+}
+
+#[test]
+fn compiled_loops_call_recursive_functions_constructors_and_natives() {
+    // sum of fib(i % 15) for i < 30, each pushed onto an array as a new
+    // Box(fib); the result adds the array's length.
+    let src = "\
+script
+        CreateClosure fib
+        StaGlobal fib
+        CreateClosure Box
+        StaGlobal Box
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function fib(n)
+        Ldar r1
+        JumpIfLessSmi 2, base
+        LdaGlobal fib
+        Star r2
+        Ldar r1
+        AddSmi -1
+        Star r3
+        CallUndefined r2, r3, 1
+        Star r4
+        Ldar r1
+        AddSmi -2
+        Star r3
+        CallUndefined r2, r3, 1
+        Add r4
+        Return
+base:   Ldar r1
+        Return
+end
+function Box(v)
+        Ldar r1
+        SetNamed r0, v
+        LdaUndefined
+        Return
+end
+; r1 i, r2 sum, r3 a, r4-r8 temps
+function main()
+        CreateArray
+        Star r3
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   LdaGlobal fib
+        Star r4
+        Ldar r1
+        ModSmi 15
+        Star r5
+        CallUndefined r4, r5, 1 ; fib(i % 15)
+        Star r5
+        LdaGlobal Box
+        Star r4
+        Construct r4, r5, 1     ; new Box(…)
+        Star r8
+        GetNamed r8, v
+        Add r2
+        Star r2
+        GetNamed r3, push
+        Star r6
+        Mov r3, r7
+        Call r6, r7, 1          ; a.push(box)
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 30, loop
+        GetNamed r3, length
+        Add r2
+        Return
+end
+";
+    // Twice fib(0) + … + fib(14) = 2 × 986, plus 30.
+    let (v, s) = jit(src);
+    assert_eq!(v, "2002");
+    assert!(s.iter().any(|n| n == "call"), "{s:?}");
+}
+
+/// A callee (through the runtime: its call site is first reached after
+/// compiling) gives `o` its own `m`, shadowing the prototype's. The loop
+/// knew `o`'s exact shape; after the call that is only a lower bound, so
+/// the prototype load is guarded again and sees the change.
+#[test]
+fn calls_downgrade_exact_shapes() {
+    let src = "\
+script
+        CreateClosure P
+        StaGlobal P
+        LdaGlobal P
+        Star r1
+        GetNamed r1, prototype
+        Star r1
+        LdaSmi 1
+        SetNamed r1, m          ; P.prototype.m = 1
+        CreateClosure shadow
+        StaGlobal shadow
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function P()
+        LdaUndefined
+        Return
+end
+function shadow(o)              ; o.m = 100
+        LdaSmi 100
+        SetNamed r1, m
+        LdaUndefined
+        Return
+end
+; r1 o, r2 i, r3 sum, r4 temp, r5 arg, r6 shadow
+function main()
+        LdaGlobal P
+        Star r4
+        Construct r4, r5, 0
+        Star r1
+        LdaGlobal shadow
+        Star r6
+        LdaSmi 0
+        Star r2
+        Star r3
+loop:   Ldar r2
+        TestEqualSmi 5
+        JumpIfFalse read
+        Mov r1, r5
+        CallUndefined r6, r5, 1 ; shadow(o), at i = 5
+read:   GetNamed r1, m
+        Add r3
+        Star r3
+        Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 10, loop
+        Ldar r3
+        Return
+end
+";
+    // i = 0..4: 1; i = 5..9: 100.
+    assert_eq!(jit(src).0, "505");
+}

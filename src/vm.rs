@@ -134,6 +134,9 @@ pub struct Vm {
     pub proto_epoch: u32,
     /// Bumped whenever a field's type generalizes (see [`FieldType`]).
     pub field_epoch: u32,
+    /// Bumped with either: compiled code checks it after calling out, as
+    /// the callee may have invalidated what it assumes.
+    pub code_epoch: u32,
     pub(crate) error: Option<Error>,
     pub(crate) stack: Box<[Value]>,
     pub(crate) stack_end: *mut Value,
@@ -143,6 +146,8 @@ pub struct Vm {
     pub(crate) frame_budget: i64,
     /// The frame that left the interpreter to tier up.
     pub(crate) osr_regs: *mut Value,
+    /// Calls from compiled code running now (see `interp::call_from_jit`).
+    pub(crate) native_depth: u32,
     function_shape: *const Shape,
     proto_object_shape: *const Shape,
     a_prototype: Atom,
@@ -174,6 +179,7 @@ impl Vm {
             array_prototype: std::ptr::null_mut(),
             proto_epoch: 0,
             field_epoch: 0,
+            code_epoch: 0,
             error: None,
             stack,
             stack_end,
@@ -186,6 +192,7 @@ impl Vm {
                     .map_or(TIER_BACK_EDGES, |n| n.max(1))
             },
             osr_regs: std::ptr::null_mut(),
+            native_depth: 0,
             function_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
             a_prototype: Atom(0),
@@ -363,6 +370,7 @@ impl Vm {
             self.store_field(o, slot, value);
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
+                self.code_epoch = self.code_epoch.wrapping_add(1);
             }
             slot
         }
@@ -382,6 +390,7 @@ impl Vm {
                 // Nothing can have relied on an empty field.
                 if old != FieldType::None {
                     self.field_epoch = self.field_epoch.wrapping_add(1);
+                    self.code_epoch = self.code_epoch.wrapping_add(1);
                 }
             }
             *Object::slot(o, shape.location(slot)) = value;

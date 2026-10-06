@@ -132,6 +132,7 @@ unsafe extern "C" {
     fn toi_rt_to_int32();
     fn toi_rt_loose_eq();
     fn toi_rt_to_boolean();
+    fn toi_rt_call();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -2116,3 +2117,41 @@ stencil!("unbox_num_acc"; |s| {
     };
     next!(s)
 });
+
+// ---- Calls ----
+
+// A call through the runtime (`toi_rt_call`), described by the call site
+// at `imm64`; the callee's arguments are in memory (the JIT spills them).
+// The runtime returns `EMPTY` on an error: leave, and the run ends. If the
+// VM's code epoch (at `imm64b`) isn't `imm` anymore, the callee changed
+// something the code assumes: leave too, after the call.
+stencil!("call"; |s| {
+    let regs = Value::from_bits(s.regs as u64);
+    let r = Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(imm64())));
+    s.acc = r;
+    // The exit is after the call: `acc` holds the result.
+    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+        exit!(s)
+    }
+    next!(s)
+});
+
+// Before an inlined call: the callee must be the function inlined
+// (`imm64`), or leave before the call.
+macro_rules! check_callee {
+    ($loc:tt) => {
+        stencil!("check_callee_", loc!($loc); |s| {
+            if get!($loc, s).to_bits() != imm64() {
+                exit!(s)
+            }
+            next!(s)
+        });
+    };
+}
+macro_rules! check_callee_gpr {
+    ($k:tt) => {
+        check_callee!([g $k]);
+    };
+}
+check_callee!([m]);
+with_gprs!(each_gpr! check_callee_gpr);

@@ -160,12 +160,14 @@ define_ops! {
     CreateArray(),
 
     // ---- Calls ----
-    /// `acc = r[f](r[w+1], …, r[w+n])` with `this = r[w]`.
-    Call(Reg, Reg, Count),
+    /// `acc = r[f](r[w+1], …, r[w+n])` with `this = r[w]`. The calls'
+    /// inline cache remembers the last function called, for the JIT to
+    /// inline.
+    Call(Reg, Reg, Count, AutoIc),
     /// `acc = r[f](r[a], …, r[a+n-1])` with `this = undefined`.
-    CallUndefined(Reg, Reg, Count),
+    CallUndefined(Reg, Reg, Count, AutoIc),
     /// `acc = new r[f](r[a], …, r[a+n-1])`
-    Construct(Reg, Reg, Count),
+    Construct(Reg, Reg, Count, AutoIc),
 
     // ---- Superinstructions (see `quicken`) ----
     // Each is a comparison immediately followed by a `JumpIfTrue` or
@@ -460,7 +462,7 @@ mod tests {
         assert_eq!(Op::JumpIfLess.size(), 6);
         assert_eq!(Op::JumpIfLessSmi.size(), 9);
         assert_eq!(Op::GetNamed.size(), 4);
-        assert_eq!(Op::Call.size(), 4);
+        assert_eq!(Op::Call.size(), 6);
     }
 
     #[test]

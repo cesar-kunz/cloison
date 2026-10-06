@@ -766,14 +766,15 @@ In place:
   the `this`-or-object rule; natives (`Array.prototype.push`).
 - The external bit, always set.
 
-Step 5 has started too. Hot call-free loops in VM frames tier up into the
-JIT (on-stack replacement from the interpreter). Property accesses compile
+Step 5 has started too. Hot loops in VM frames tier up into the JIT
+(on-stack replacement from the interpreter). Property accesses compile
 to stencils fed by the inline caches, with shape guards as exits. The JIT's
 type lattice knows objects of a known shape (`Obj(shape)`), so a guard
 that passed, or a shape seen at entry, isn't checked again. Fields have
 types (`object::FieldType`), which loads in compiled code take, so objects
 reached through fields need no guards either; arrays' shapes carry their
-elements' type (`Shape::elems`), likewise. Details and
+elements' type (`Shape::elems`), likewise. Calls are compiled too, inlined
+behind a guard on the callee, or through the runtime. Details and
 numbers: `docs/future-work.md`, "Property access in the JIT, and shape
 types".
 

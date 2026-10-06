@@ -400,12 +400,12 @@ handlers! {
     }
 
     fn op_return(pc, acc, regs, tag) {
+        if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
+            acc = construct_result(regs, acc);
+        }
         let ret: *const u8 = header(regs, RET_PC);
         if ret.is_null() {
             return acc;
-        }
-        if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
-            acc = construct_result(regs, acc);
         }
         jump_to!(ret, acc, header::<Value>(regs, CALLER))
     }
@@ -938,10 +938,13 @@ handlers! {
     }
 
     // ---- Calls (ignore `acc`: also I32 entries) ----
+    // A call to a bytecode function records it in the call's inline cache
+    // (`holder`), which the JIT inlines from.
 
     fn op_call(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+            (*ic_at(regs, pc, 4)).holder = as_object(f);
             let w = reg(pc, 2, regs);
             enter!(as_object(f), *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
         }
@@ -951,6 +954,7 @@ handlers! {
     fn op_call_undefined(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+            (*ic_at(regs, pc, 4)).holder = as_object(f);
             let args = reg(pc, 2, regs);
             enter!(as_object(f), Value::UNDEFINED, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
@@ -1700,17 +1704,27 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
         for i in 1..n {
             *regs.add(i) = Value::UNDEFINED;
         }
-        let mut v = dispatch_at((*code).bytecode.as_ptr(), Value::UNDEFINED, regs);
-        // The interpreter returns `EMPTY` to tier up (`osr_exit`): run the
-        // frame's compiled code from the loop header, then resume it in the
-        // interpreter where the code exited. The VM stack holds every frame,
-        // so leaving the handler chain loses nothing.
+        let v = drive(vm, (*code).bytecode.as_ptr(), Value::UNDEFINED, regs);
+        match vm.error.take() {
+            Some(e) => Err(e),
+            None => Ok(v),
+        }
+    }
+}
+
+/// Run the interpreter from `pc` with `acc` over the VM frame `regs` until
+/// that frame returns (with `RET_PC` null), handling tier-up requests: the
+/// interpreter returns `EMPTY` (`osr_exit`), the frame's compiled code runs
+/// from the loop header, and the interpreter resumes where the code exited,
+/// maybe in a frame the code had inlined. The VM stack holds every frame,
+/// so leaving the handler chain loses nothing. Returns `EMPTY` on an error,
+/// left in `vm.error`.
+unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value) -> Value {
+    unsafe {
+        let mut v = dispatch_at(pc, acc, regs);
         loop {
-            if let Some(e) = vm.error.take() {
-                return Err(e);
-            }
-            if v != Value::EMPTY {
-                return Ok(v);
+            if vm.error.is_some() || v != Value::EMPTY {
+                return v;
             }
             let regs = std::mem::replace(&mut vm.osr_regs, std::ptr::null_mut());
             assert!(
@@ -1723,10 +1737,111 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
             let acc = *regs.sub(OSR_ACC);
             // Re-arm the budget even if this loop isn't compiled: another
             // loop of the frame may be.
-            let (pc, acc) = crate::jit::vm_osr(vm, code, regs, target, acc);
+            let resume = crate::jit::vm_osr(vm, code, regs, target, acc);
             *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
-            v = dispatch_at(start.add(pc), acc, regs);
+            if vm.error.is_some() {
+                return Value::EMPTY;
+            }
+            v = dispatch_at(resume.pc, resume.acc, resume.regs);
         }
+    }
+}
+
+/// Where the interpreter resumes after compiled code exits.
+pub(crate) struct Resume {
+    pub regs: *mut Value,
+    pub pc: *const u8,
+    pub acc: Value,
+}
+
+/// Write the header of a frame of `code` at `regs`, as `push_frame` does:
+/// it returns to `ret` (null: to native code) in the frame at `caller`.
+///
+/// # Safety
+/// `regs` must have room for the header below it, in `vm`'s stack.
+pub(crate) unsafe fn write_frame_header(
+    vm: &Vm,
+    regs: *mut Value,
+    code: *const Code,
+    ret: *const u8,
+    caller: *mut Value,
+    flags: u64,
+) {
+    unsafe {
+        *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
+        set_header(regs, CODE, code);
+        set_header(regs, ICS, (*code).ics.as_ptr());
+        set_header(regs, VM, vm as *const Vm);
+        set_header(regs, RET_PC, ret);
+        set_header(regs, CALLER, caller);
+        *regs.sub(FLAGS) = Value::from_bits(flags);
+    }
+}
+
+/// Native calls nested in compiled code at most (each runs a callee to
+/// completion on the native stack).
+const MAX_NATIVE_DEPTH: u32 = 1000;
+
+/// A call from compiled code (`jit`'s `call` stencil): `op` is `Call`,
+/// `CallUndefined` or `Construct` with operands `f`, `w`, `argc` over the
+/// compiled frame `regs`, whose registers it reads from memory. A bytecode
+/// callee runs to completion in a new frame `frame` values past `regs`
+/// (beyond every register the compiled code uses), through [`drive`], so
+/// its loops can tier up too. Returns the result, or `EMPTY` on an error
+/// (left in `vm.error`).
+///
+/// # Safety
+/// `regs` must be a live VM frame whose registers cover the operands.
+pub(crate) unsafe fn call_from_jit(
+    vm: &mut Vm,
+    regs: *mut Value,
+    op: Op,
+    f: usize,
+    w: usize,
+    argc: usize,
+    frame: usize,
+) -> Value {
+    unsafe {
+        let fv = *regs.add(f);
+        let (this, args) = match op {
+            Op::Call => (*regs.add(w), regs.add(w + 1)),
+            _ => (Value::UNDEFINED, regs.add(w)),
+        };
+        let bytecode = fv.is_cell() && (*as_object(fv)).class == Class::Function;
+        if !bytecode {
+            let r = if op == Op::Construct {
+                vm.construct_other(fv)
+            } else {
+                vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
+            };
+            return r.unwrap_or_else(|e| throw(vm, e));
+        }
+        let fo = as_object(fv);
+        let callee = (*fo).code;
+        let this = if op == Op::Construct {
+            vm.construct_this(fo)
+        } else {
+            this
+        };
+        let new = regs.add(frame);
+        let n = (*callee).nregs as usize;
+        if new.add(n) > vm.stack_end || vm.native_depth >= MAX_NATIVE_DEPTH {
+            return throw(vm, Error::range_error("Maximum call stack size exceeded"));
+        }
+        let flags = if op == Op::Construct { CONSTRUCT } else { 0 };
+        write_frame_header(vm, new, callee, std::ptr::null(), regs, flags);
+        *new = this;
+        let k = argc.min((*callee).nparams as usize);
+        for i in 0..k {
+            *new.add(1 + i) = *args.add(i);
+        }
+        for i in 1 + k..n {
+            *new.add(i) = Value::UNDEFINED;
+        }
+        vm.native_depth += 1;
+        let v = drive(vm, (*callee).bytecode.as_ptr(), Value::UNDEFINED, new);
+        vm.native_depth -= 1;
+        v
     }
 }
 

@@ -98,6 +98,10 @@ pub struct Code {
     /// form of slack tracking), and the root shape last used.
     pub ctor_capacity: Cell<u32>,
     pub ctor_shape: Cell<*const Shape>,
+    /// The shape of the objects `new` has given, once constructed: null if
+    /// none yet, [`MANY_SHAPES`] if not always the same. Compiled code
+    /// predicts it for the result of a `new` through the runtime.
+    pub(crate) ctor_result: Cell<*const Shape>,
     /// Compiled code, once a loop or the function got hot (see
     /// `jit::vm_run`).
     pub(crate) jit: RefCell<Option<Box<crate::jit::JitFunction>>>,
@@ -119,6 +123,8 @@ impl Code {
 }
 
 const INITIAL_CTOR_CAPACITY: u32 = 4;
+/// `Code::ctor_result` when constructed objects have had several shapes.
+pub(crate) const MANY_SHAPES: *const Shape = std::ptr::dangling::<Shape>();
 /// Loop back edges before a frame tiers up, and calls before a function's
 /// calls enter compiled code (as `jit::Tiering::default`).
 pub(crate) const TIER_BACK_EDGES: i64 = 1000;
@@ -243,7 +249,7 @@ impl Vm {
 
         vm.array_shape = vm.root_shape(Class::Array, object_value(vm.array_prototype), 0);
         let ap = vm.array_prototype;
-        vm.define_native(ap, "push", array_push, 1);
+        vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32);
         vm
     }
 
@@ -773,13 +779,15 @@ impl Vm {
         }
     }
 
-    /// Define `obj.name` as a native function.
+    /// Define `obj.name` as a native function, whose results are always of
+    /// type `ret` (compiled code calling it predicts them).
     pub(crate) fn define_native(
         &mut self,
         obj: *mut Object,
         name: &str,
         f: NativeFn,
         nparams: u32,
+        ret: crate::jit::Ty,
     ) {
         let code = self.add_code(Code {
             name: name.to_string(),
@@ -792,9 +800,10 @@ impl Vm {
             native: Some(f),
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
+            ctor_result: Cell::new(std::ptr::null()),
             jit: RefCell::new(None),
             calls_left: Cell::new(i32::MAX),
-            ret_hint: Cell::new(crate::jit::Ty::Any),
+            ret_hint: Cell::new(ret),
         });
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
@@ -829,9 +838,16 @@ impl Vm {
     /// After `new` returned `this`: grow the in-object capacity for the next
     /// objects if this one outgrew it.
     pub(crate) fn construct_done(code: &Code, this: *mut Object) {
-        let n = unsafe { (*(*this).shape).keys.len() } as u32;
+        let shape = unsafe { (*this).shape };
+        let n = unsafe { (*shape).keys.len() } as u32;
         if n > code.ctor_capacity.get() {
             code.ctor_capacity.set(n.min(MAX_INLINE_CAPACITY));
+        }
+        let seen = code.ctor_result.get();
+        if seen.is_null() {
+            code.ctor_result.set(shape);
+        } else if seen != shape {
+            code.ctor_result.set(MANY_SHAPES);
         }
     }
 
@@ -892,6 +908,7 @@ impl Vm {
                     native: None,
                     ctor_capacity: Cell::new(INITIAL_CTOR_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
+                    ctor_result: Cell::new(std::ptr::null()),
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_left: Cell::new(if recursive || worth_entering_compiled(f) {

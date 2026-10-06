@@ -88,7 +88,8 @@ fn main() {
                 || target_name.starts_with("toi_rt_")
                 || target_name.starts_with(PREFIX)
                 || target_name == "toi_continue"
-                || target_name == "toi_jump_target";
+                || target_name == "toi_jump_target"
+                || target_name == "toi_exit";
             assert!(
                 allowed,
                 "stencil {name}: unsupported relocation to `{target_name}` \

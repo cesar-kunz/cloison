@@ -15,11 +15,15 @@
 //!
 //! engine:
 //!   interp   the tail-calling interpreter (default)
-//!   jit      the copy-and-patch JIT; compiled once, outside the timing
+//!   jit1     the copy-and-patch JIT with generic stencils only (milestone 1)
+//!   jit      the JIT with type-specialized stencils (milestone 2)
+//!
+//! JIT timings include compilation, which happens on entry (and again after
+//! a side exit; `double` exits once when `s` overflows int32).
 //! ```
 //!
-//! With `TOI_JIT_DUMP=<file>`, the JIT's main machine code is written to
-//! `<file>` (see `scripts/jit-asm.sh`).
+//! With `TOI_JIT_DUMP=<file>`, the hot machine code the JIT compiled last
+//! is written to `<file>` after the run (see `scripts/jit-asm.sh`).
 //!
 //! `n` is baked into the bytecode, as `i < 100000000` would be. In `double`,
 //! `s` leaves the int32 range after ~65k iterations and `add` takes its slow
@@ -28,6 +32,7 @@
 use std::process::exit;
 use std::time::Instant;
 use toi::bytecode::Assembler;
+use toi::jit::JitFunction;
 use toi::value::Value;
 
 const S: u8 = 0;
@@ -36,7 +41,7 @@ const LIMIT: u8 = 2;
 const K: u8 = 3;
 
 fn usage() -> ! {
-    eprintln!("usage: dispatch_bench <int|const|chain|double> <generic|smi> [n] [interp|jit]");
+    eprintln!("usage: dispatch_bench <int|const|chain|double> <generic|smi> [n] [interp|jit1|jit]");
     exit(2)
 }
 
@@ -54,11 +59,10 @@ fn main() {
         .get(3)
         .map_or(100_000_000, |s| s.parse().unwrap_or_else(|_| usage()));
     assert!(n > 0, "the loop tests at the bottom, so n must be positive");
-    let jit = match args.get(4).map_or("interp", String::as_str) {
-        "interp" => false,
-        "jit" => true,
-        _ => usage(),
-    };
+    let engine = args.get(4).map_or("interp", String::as_str);
+    if !matches!(engine, "interp" | "jit1" | "jit") {
+        usage()
+    }
     let nf = n as f64;
 
     let mut a = Assembler::new();
@@ -102,16 +106,21 @@ fn main() {
     let code = a.finish();
 
     let mut regs = [Value::UNDEFINED; 4];
-    let compiled = jit.then(|| toi::jit::JitCode::compile(&code));
-    if let (Some(c), Ok(path)) = (&compiled, std::env::var("TOI_JIT_DUMP")) {
-        std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
-    }
+    let mut jit = match engine {
+        "jit" => Some(JitFunction::new(&code)),
+        "jit1" => Some(JitFunction::new(&code).unspecialized()),
+        _ => None,
+    };
     let start = Instant::now();
-    let result = match &compiled {
-        Some(c) => unsafe { c.run(&mut regs) },
+    let result = match &mut jit {
+        Some(f) => unsafe { f.run(&mut regs) },
         None => unsafe { toi::interp::run(&code, &mut regs) },
     };
     let elapsed = start.elapsed();
+    if let (Some(f), Ok(path)) = (&jit, std::env::var("TOI_JIT_DUMP")) {
+        let code = f.last_code().expect("compiled code");
+        std::fs::write(path, code.main_code()).expect("writing TOI_JIT_DUMP");
+    }
 
     assert_eq!(
         result.as_number(),
@@ -119,9 +128,9 @@ fn main() {
         "{program}/{codegen}: got {result:?}"
     );
     println!(
-        "{program}/{codegen}/{} n={n} result={result:?} time={:.3}s {:.2} ns/iter",
-        if jit { "jit" } else { "interp" },
+        "{program}/{codegen}/{engine} n={n} result={result:?} time={:.3}s {:.2} ns/iter{}",
         elapsed.as_secs_f64(),
         elapsed.as_nanos() as f64 / nf,
+        jit.map_or(String::new(), |f| format!(" {:?}", f.stats)),
     );
 }

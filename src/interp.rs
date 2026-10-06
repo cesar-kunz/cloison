@@ -507,13 +507,21 @@ static TABLE_I32: Table = {
 /// operand `< regs.len()`, every jump landing on an instruction boundary, and
 /// every path ending in `Return`. There is no verifier yet.
 pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
-    let pc = code.as_ptr();
+    unsafe { run_from(code, 0, Value::UNDEFINED, regs) }
+}
+
+/// Run `code` from bytecode offset `pc` with accumulator `acc`. Used by the
+/// JIT to finish a run in the interpreter.
+///
+/// # Safety
+/// As [`run`], and `pc` must be an instruction boundary.
+pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -> Value {
+    let pc = unsafe { code.as_ptr().add(pc) };
     // Launder the tables (and, in `NumberTag::new`, the tag) so LLVM can't
     // fold them back into constants (`lea`/`movabs`) in every handler. They
     // must stay register arguments.
     let tbl: &'static Table = std::hint::black_box(&TABLE);
     let ti32: &'static Table = std::hint::black_box(&TABLE_I32);
     let tag = NumberTag::new();
-    let acc = Value::UNDEFINED;
     unsafe { (tbl.0[*pc as usize])(pc, acc, regs.as_mut_ptr(), tag, tbl, ti32) }
 }

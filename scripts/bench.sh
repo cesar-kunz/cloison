@@ -4,13 +4,15 @@
 # per loop iteration. Engines:
 #   interp      interpreter without accumulator type state (--no-default-features)
 #   interp+acc  interpreter with acc-i32 (default build)
-#   jit         copy-and-patch JIT (milestone 1, unspecialized)
+#   jit1        copy-and-patch JIT, generic stencils only (milestone 1)
+#   jit         copy-and-patch JIT, type-specialized stencils (milestone 2)
 #
 # Per-iteration numbers are (run at N) − (run at 1), divided by N − 1, which
 # cancels process startup. Each cell is the minimum over REPS runs, pinned
 # to one CPU.
 #
 #   scripts/bench.sh            # N=100000000 REPS=3 CPU=2
+#   ENGINES='jit1 jit' scripts/bench.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 N=${N:-100000000}
@@ -22,6 +24,7 @@ CARGO_TARGET_DIR=target/no-acc-i32 cargo build --release --quiet --bin dispatch_
 declare -A RUN=(
   [interp]="target/no-acc-i32/release/dispatch_bench %s %s %s interp"
   [interp+acc]="target/release/dispatch_bench %s %s %s interp"
+  [jit1]="target/release/dispatch_bench %s %s %s jit1"
   [jit]="target/release/dispatch_bench %s %s %s jit"
 )
 
@@ -41,7 +44,7 @@ echo "| program | codegen | engine | instr/iter | cycles/iter | IPC |"
 echo "|---|---|---|---:|---:|---:|"
 for program in int const chain double; do
   for codegen in generic smi; do
-    for engine in interp interp+acc jit; do
+    for engine in ${ENGINES:-interp interp+acc jit1 jit}; do
       # shellcheck disable=SC2059,SC2046
       read -r i1 c1 < <(counters $(printf "${RUN[$engine]}" "$program" "$codegen" 1))
       # shellcheck disable=SC2059,SC2046

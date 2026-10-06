@@ -40,6 +40,11 @@
 //! [      slot registers this region uses                                 ]
 //! ```
 //!
+//! On arm64 most stencils come from family templates: `build.rs` stores one
+//! template per family of slot variants plus the positions of its register
+//! fields, and [`Instance::copy_to`] writes the slot registers in while
+//! copying (see `compact_arm64` in `build.rs`).
+//!
 //! A stencil whose last instruction jumps to `toi_continue` falls through
 //! into the next piece with that jump trimmed. Calls to runtime functions
 //! go to wrappers in JIT memory ([`arch::runtime_wrapper`]), so `rel32` /
@@ -54,50 +59,152 @@ use crate::bytecode::Op;
 use crate::value::{NumberTag, Value};
 use std::collections::{HashMap, HashSet};
 
-/// A relocation in a stencil, from `build.rs`.
-pub(crate) struct Reloc {
-    /// Offset of the patched field within the stencil.
-    offset: u32,
-    /// ELF relocation type for the target architecture.
-    r_type: u32,
-    /// `toi_hole_*`, `toi_continue`, `toi_jump_target`, `toi_rt_*`, or
-    /// `@<stencil>` for another stencil (a helper).
-    symbol: &'static str,
-    addend: i64,
+/// What a stencil relocation refers to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sym {
+    HoleImm,
+    HoleReg,
+    Continue,
+    JumpTarget,
+    Exit,
+    /// The stencil's own `__slow` helper.
+    Slow,
+    /// A runtime function, `toi_rt_*`: an index into `RT_NAMES`.
+    Rt(u8),
 }
 
+/// A relocation in a stencil, from `build.rs`: offset of the patched field,
+/// ELF relocation type, symbol, addend.
+pub(crate) struct R(u16, u16, Sym, i32);
+
 pub(crate) struct Stencil {
+    /// The stencil's name, or for an arm64 family template its key, with
+    /// `{}` for each slot number (`addr_ii_u{}_u{}`).
     name: &'static str,
+    /// Whether `<name>__slow` exists.
+    slow: bool,
     code: &'static [u8],
-    relocs: &'static [Reloc],
+    relocs: &'static [R],
+    /// For an arm64 family template, its register fields.
+    template: Option<&'static Template>,
+}
+
+/// What makes a stencil a family template (arm64; see `compact_arm64` in
+/// `build.rs`).
+pub(crate) struct Template {
+    /// (instruction offset, bit position, parameter): the JIT writes the
+    /// parameter's register into the 5-bit field.
+    fields: &'static [(u16, u8, u8)],
+    /// The slot numbers of the family members this template covers (a
+    /// family may need several templates).
+    covers: &'static [[u8; 2]],
 }
 
 include!(concat!(env!("OUT_DIR"), "/stencils.rs"));
 
-fn stencils_by_name() -> &'static HashMap<&'static str, &'static Stencil> {
-    static BY_NAME: std::sync::OnceLock<HashMap<&'static str, &'static Stencil>> =
-        std::sync::OnceLock::new();
-    BY_NAME.get_or_init(|| STENCILS.iter().map(|s| (s.name, s)).collect())
+/// Lookup tables: concrete stencils by name, and family templates by
+/// (family key, slot numbers).
+struct Index {
+    by_name: HashMap<&'static str, &'static Stencil>,
+    by_family: HashMap<(&'static str, [u8; 2]), &'static Stencil>,
 }
 
-fn stencil(name: &str) -> &'static Stencil {
-    stencils_by_name()
-        .get(name)
-        .copied()
-        .unwrap_or_else(|| panic!("no stencil `{name}`"))
+fn index() -> &'static Index {
+    static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut ix = Index {
+            by_name: HashMap::new(),
+            by_family: HashMap::new(),
+        };
+        for s in STENCILS {
+            match s.template {
+                None => {
+                    ix.by_name.insert(s.name, s);
+                }
+                Some(t) => {
+                    for &slots in t.covers {
+                        ix.by_family.insert((s.name, slots), s);
+                    }
+                }
+            }
+        }
+        ix
+    })
+}
+
+/// Split a stencil name into its family key and slot parameters; see
+/// `slot_params` in `build.rs`, which this must match.
+fn slot_params(name: &str) -> (String, Vec<(char, u8)>) {
+    let mut key = String::with_capacity(name.len());
+    let mut params = Vec::new();
+    for (i, tok) in name.split('_').enumerate() {
+        if i > 0 {
+            key.push('_');
+        }
+        let mut cs = tok.chars();
+        match (cs.next(), cs.as_str().parse::<u8>()) {
+            (Some(c @ ('g' | 'u' | 'f')), Ok(k)) if i > 0 && !cs.as_str().is_empty() => {
+                key.push(c);
+                key.push_str("{}");
+                params.push((c, k));
+            }
+            _ => key.push_str(tok),
+        }
+    }
+    (key, params)
+}
+
+/// A stencil to copy, with the registers to patch into a family template's
+/// fields.
+#[derive(Clone, Copy)]
+struct Instance {
+    stencil: &'static Stencil,
+    regs: [u8; 2],
+}
+
+impl Instance {
+    /// The stencil named `name`: a concrete stencil, or an instance of the
+    /// family template it belongs to (arm64).
+    fn find(name: &str) -> Option<Instance> {
+        let ix = index();
+        if let Some(&stencil) = ix.by_name.get(name) {
+            return Some(Instance {
+                stencil,
+                regs: [0; 2],
+            });
+        }
+        let (key, params) = slot_params(name);
+        let (mut slots, mut regs) = ([0; 2], [0; 2]);
+        for (i, &p) in params.iter().enumerate().take(2) {
+            slots[i] = p.1;
+            regs[i] = arch::slot_reg(p);
+        }
+        let &stencil = ix.by_family.get(&(key.as_str(), slots))?;
+        Some(Instance { stencil, regs })
+    }
+
+    fn get(name: &str) -> Instance {
+        Instance::find(name).unwrap_or_else(|| panic!("no stencil `{name}`"))
+    }
+
+    /// Copy the stencil's first `len` bytes to `buf` and patch in the
+    /// registers of a family template.
+    fn copy_to(&self, buf: &mut [u8], len: usize) {
+        buf[..len].copy_from_slice(&self.stencil.code[..len]);
+        let Some(template) = self.stencil.template else {
+            return;
+        };
+        for &(at, shift, p) in template.fields {
+            let at = at as usize;
+            let w = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+            let w = (w & !(31 << shift)) | (self.regs[p as usize] as u32) << shift;
+            buf[at..at + 4].copy_from_slice(&w.to_le_bytes());
+        }
+    }
 }
 
 fn has_stencil(name: &str) -> bool {
-    stencils_by_name().contains_key(name)
-}
-
-/// The `<name>__*` helpers of stencil `name`.
-fn helpers(name: &str) -> impl Iterator<Item = &'static Stencil> {
-    STENCILS.iter().filter(move |s| {
-        s.name
-            .strip_prefix(name)
-            .is_some_and(|rest| rest.starts_with("__"))
-    })
+    Instance::find(name).is_some()
 }
 
 // ---- Runtime functions called from stencil slow paths (C ABI) ----
@@ -141,13 +248,19 @@ mod arch {
     pub const CODE_ALIGN: usize = 16;
 
     /// Whether the stencil ends with `jmp toi_continue`.
-    pub fn ends_with_continue(code: &[u8], relocs: &[super::Reloc]) -> bool {
+    pub fn ends_with_continue(code: &[u8], relocs: &[super::R]) -> bool {
         let n = code.len();
         n >= 5
             && code[n - 5] == 0xE9
             && relocs
                 .iter()
-                .any(|r| r.symbol == "toi_continue" && r.offset as usize == n - 4)
+                .any(|r| r.2 == super::Sym::Continue && r.0 as usize == n - 4)
+    }
+
+    /// x86-64 stencils have no family templates (register fields aren't
+    /// patchable in place: encodings vary in length).
+    pub fn slot_reg(_: (char, u8)) -> u8 {
+        unreachable!("no register-patched stencils on x86-64")
     }
 
     /// The register number of GPR slot `k` (rdi rsi rdx rcx r8 r9), if the
@@ -255,14 +368,25 @@ mod arch {
     pub const TRAILING_JUMP: usize = 4;
     pub const CODE_ALIGN: usize = 16;
 
-    pub fn ends_with_continue(code: &[u8], relocs: &[super::Reloc]) -> bool {
+    pub fn ends_with_continue(code: &[u8], relocs: &[super::R]) -> bool {
         let n = code.len();
         n >= 4
             && relocs.iter().any(|r| {
-                r.symbol == "toi_continue"
-                    && r.offset as usize == n - 4
-                    && r.r_type == R_AARCH64_JUMP26
+                r.2 == super::Sym::Continue
+                    && r.0 as usize == n - 4
+                    && r.1 as u32 == R_AARCH64_JUMP26
             })
+    }
+
+    /// The register of a slot parameter, as `slot_params` names them: GPR
+    /// slots 0–4 are x24–x28, 5–11 are x0–x6; FP slot k is d(k+1). Must
+    /// match `arm64_slot_reg` in `build.rs`.
+    pub fn slot_reg((class, k): (char, u8)) -> u8 {
+        match class {
+            'f' => k + 1,
+            _ if k < 5 => 24 + k,
+            _ => k - 5,
+        }
     }
 
     /// The register number of GPR slot `k`, if the C ABI doesn't preserve
@@ -973,7 +1097,9 @@ enum Target {
 
 /// One stencil instance to emit.
 struct Piece {
-    stencil: &'static Stencil,
+    stencil: Instance,
+    /// Its `__slow` helper, if any (copied into the cold area).
+    slow: Option<Instance>,
     imm: i32,
     reg: u8,
     cont: Target,
@@ -1001,8 +1127,14 @@ impl Piece {
     }
 
     fn new(name: &str, reg: u8) -> Piece {
+        let stencil = Instance::get(name);
+        let slow = stencil
+            .stencil
+            .slow
+            .then(|| Instance::get(&format!("{name}__slow")));
         Piece {
-            stencil: stencil(name),
+            stencil,
+            slow,
             imm: 0,
             reg,
             cont: Target::Next,
@@ -1012,16 +1144,16 @@ impl Piece {
     }
 
     fn trims(&self) -> bool {
-        matches!(self.cont, Target::Next)
-            && arch::ends_with_continue(self.stencil.code, self.stencil.relocs)
+        let s = self.stencil.stencil;
+        matches!(self.cont, Target::Next) && arch::ends_with_continue(s.code, s.relocs)
     }
 
     fn len(&self) -> usize {
-        self.stencil.code.len() - if self.trims() { arch::TRAILING_JUMP } else { 0 }
+        self.stencil.stencil.code.len() - if self.trims() { arch::TRAILING_JUMP } else { 0 }
     }
 
-    fn uses(&self, symbol: &str) -> bool {
-        self.stencil.relocs.iter().any(|r| r.symbol == symbol)
+    fn uses(&self, symbol: Sym) -> bool {
+        self.stencil.stencil.relocs.iter().any(|r| r.2 == symbol)
     }
 }
 
@@ -1767,7 +1899,7 @@ impl JitCode {
                         exit: step.insn,
                         ..Piece::with_imm(&step.name, step.imm)
                     };
-                    if piece.uses("toi_exit") {
+                    if piece.uses(Sym::Exit) {
                         // Exit before the step's instruction: undo the
                         // in-place op, then `acc` is the result slot.
                         let mut seq = Vec::new();
@@ -1815,7 +1947,7 @@ impl JitCode {
                 exit: i,
                 ..Piece::with_imm(&name, insn.imm)
             };
-            if main.uses("toi_exit") {
+            if main.uses(Sym::Exit) {
                 assert_ne!(st.acc, Ty::F64, "exits happen at int32 operations");
                 // `add_smi_i` adds in place; undo it before anything else.
                 let mut seq: Vec<Piece> = Vec::new();
@@ -1864,14 +1996,14 @@ impl JitCode {
             .zip(&exit_ats)
             .map(|((i, _), ats)| (*i, ats[0]))
             .collect();
-        // Helpers, per hot piece: (piece index, helper name) -> offset.
-        let mut helper_at: HashMap<(usize, &str), usize> = HashMap::new();
+        // `__slow` helpers, per hot piece: piece index -> offset.
+        let mut helper_at: HashMap<usize, usize> = HashMap::new();
         let mut helper_list = Vec::new();
         for (k, p) in hot.iter().enumerate() {
-            for h in helpers(p.stencil.name) {
-                helper_at.insert((k, h.name), pos);
+            if let Some(h) = p.slow {
+                helper_at.insert(k, pos);
                 helper_list.push((k, h, pos));
-                pos += h.code.len();
+                pos += h.stencil.code.len();
             }
         }
         // Runtime-call wrappers, saving the slot registers this region uses
@@ -1895,7 +2027,7 @@ impl JitCode {
             }))
             .collect();
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
-        let mut tramp_at: HashMap<&str, usize> = HashMap::new();
+        let mut tramp_at: HashMap<u8, usize> = HashMap::new();
         let mut wrappers: Vec<(usize, Vec<u8>)> = Vec::new();
         let all_stencils = hot
             .iter()
@@ -1904,9 +2036,10 @@ impl JitCode {
             .map(|p| p.stencil)
             .chain(helper_list.iter().map(|&(_, h, _)| h));
         for s in all_stencils {
-            for r in s.relocs.iter().filter(|r| r.symbol.starts_with("toi_rt_")) {
-                tramp_at.entry(r.symbol).or_insert_with(|| {
-                    let target = runtime_function(r.symbol) as u64;
+            for r in s.stencil.relocs {
+                let Sym::Rt(rt) = r.2 else { continue };
+                tramp_at.entry(rt).or_insert_with(|| {
+                    let target = runtime_function(RT_NAMES[rt as usize]) as u64;
                     let code = arch::runtime_wrapper(target, &saved_gprs, &saved_fprs);
                     let at = pos;
                     pos += code.len().next_multiple_of(8);
@@ -1928,43 +2061,37 @@ impl JitCode {
             Target::Label(i) => label(i),
             Target::Stub(s) => stub_ats[s][0],
         };
-        // Copy the first `len` bytes of `s` to `at` and patch it: operands
-        // from `p`, continuation and branch target at the given offsets, and
-        // helpers of hot piece `key`.
-        let mut emit = |s: &Stencil,
+        // Copy the first `len` bytes of `s` to `at` and patch it: register
+        // fields of a family template, operands from `p`, continuation and
+        // branch target at the given offsets, and the helper of hot piece
+        // `key`.
+        let mut emit = |s: Instance,
                         len: usize,
                         at: usize,
                         p: &Piece,
                         cont: usize,
                         jump: usize,
                         key: Option<usize>| {
-            buf[at..at + len].copy_from_slice(&s.code[..len]);
-            for r in s.relocs.iter().filter(|r| (r.offset as usize) < len) {
-                let value = match r.symbol {
-                    "toi_hole_imm" => p.imm as u32 as u64,
-                    "toi_hole_reg" => p.reg as u64 * size_of::<Value>() as u64,
-                    "toi_continue" => base + cont as u64,
-                    "toi_jump_target" => base + jump as u64,
-                    "toi_exit" => base + exit_at[&p.exit] as u64,
-                    sym if sym.starts_with("toi_rt_") => base + tramp_at[sym] as u64,
-                    sym if sym.starts_with('@') => {
+            s.copy_to(&mut buf[at..], len);
+            for r in s.stencil.relocs.iter().filter(|r| (r.0 as usize) < len) {
+                let value = match r.2 {
+                    Sym::HoleImm => p.imm as u32 as u64,
+                    Sym::HoleReg => p.reg as u64 * size_of::<Value>() as u64,
+                    Sym::Continue => base + cont as u64,
+                    Sym::JumpTarget => base + jump as u64,
+                    Sym::Exit => base + exit_at[&p.exit] as u64,
+                    Sym::Rt(rt) => base + tramp_at[&rt] as u64,
+                    Sym::Slow => {
                         let k = key.expect("helper reference outside a hot piece");
-                        let off = helper_at.get(&(k, &sym[1..])).unwrap_or_else(|| {
-                            panic!(
-                                "stencil {} references {sym}, not one of its helpers",
-                                s.name
-                            )
-                        });
-                        base + *off as u64
+                        base + helper_at[&k] as u64
                     }
-                    sym => panic!("unknown stencil symbol `{sym}`"),
                 };
-                let field = at + r.offset as usize;
+                let field = at + r.0 as usize;
                 arch::patch(
                     &mut buf[field..],
-                    r.r_type,
+                    r.1 as u32,
                     value,
-                    r.addend,
+                    r.3 as i64,
                     base + field as u64,
                 );
             }
@@ -1982,7 +2109,7 @@ impl JitCode {
         }
         for &(k, h, at) in &helper_list {
             let (cont, jump) = hot_targets[k];
-            emit(h, h.code.len(), at, &hot[k], cont, jump, Some(k));
+            emit(h, h.stencil.code.len(), at, &hot[k], cont, jump, Some(k));
         }
         let cold = stubs
             .iter()
@@ -2215,4 +2342,29 @@ impl JitFunction {
 /// As [`crate::interp::run`].
 pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
     unsafe { JitFunction::new(code).run(regs) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+        })
+    }
+
+    /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's
+    /// lookup and copy, including (on arm64) those rebuilt from a family
+    /// template by patching register fields.
+    #[test]
+    fn every_stencil_instance_matches_its_compiled_bytes() {
+        for &(name, hash) in STENCIL_HASHES {
+            let inst = Instance::get(name);
+            let len = inst.stencil.code.len();
+            let mut buf = vec![0; len];
+            inst.copy_to(&mut buf, len);
+            assert_eq!(fnv1a(&buf), hash, "{name} (from {})", inst.stencil.name);
+        }
+    }
 }

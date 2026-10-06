@@ -66,6 +66,7 @@
 //! bits, so a boxed int32 is a valid int32 `acc` too.
 
 #![feature(explicit_tail_calls, rust_preserve_none_cc)]
+#![cfg_attr(target_arch = "x86_64", feature(asm_goto_with_outputs))]
 #![allow(incomplete_features, non_snake_case, unused_unsafe, clippy::missing_safety_doc)]
 
 #[path = "../src/value.rs"]
@@ -288,6 +289,7 @@ macro_rules! stencil_slow {
 }
 
 /// The `i32` immediate operand.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn imm() -> i32 {
     unsafe { &raw const toi_hole_imm as usize as u32 as i32 }
@@ -301,19 +303,90 @@ fn imm_zext() -> u64 {
     imm() as u32 as u64
 }
 
-/// The immediate's low 32 bits, zero-extended.
+/// The immediate's 32 bits, zero-extended: `movz` + `movk` with absolute
+/// relocations (`MOVW_UABS_G0_NC`, `G1_NC`). Unlike `adrp` + `add`, which
+/// LLVM emits for a symbol address, this doesn't depend on where the JIT
+/// code is (`adrp` is page-relative), and the 64-bit output tells LLVM the
+/// upper bits are already zero.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn imm_zext() -> u64 {
-    // `adrp` + `add` yield the patched value exactly (it is < 2^32), so
-    // skip the truncation, which would cost a `mov w8, w8`.
-    unsafe { &raw const toi_hole_imm as usize as u64 }
+    let k: u64;
+    unsafe {
+        core::arch::asm!(
+            "movz {k:w}, #:abs_g0_nc:{s}",
+            "movk {k:w}, #:abs_g1_nc:{s}",
+            k = out(reg) k,
+            s = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+    }
+    k
+}
+
+/// The `i32` immediate operand.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn imm() -> i32 {
+    imm_zext() as u32 as i32
+}
+
+/// The immediate when the JIT knows it fits 16 bits (0..=65535): a single
+/// `movz`. Used by the `_k16` stencil variants.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn imm16() -> i32 {
+    let k: u64;
+    unsafe {
+        core::arch::asm!(
+            "movz {k:w}, #:abs_g0_nc:{s}",
+            k = out(reg) k,
+            s = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+    }
+    k as u32 as i32
 }
 
 /// The VM register in memory named by the register hole.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn mem(regs: *mut Value) -> *mut Value {
+    // Folds into the access: `mov r12, [r13 + hole]`.
     unsafe { regs.byte_add(&raw const toi_hole_reg as usize) }
+}
+
+/// The VM register in memory named by the register hole: its byte offset
+/// (< 2 KiB) fits one `movz`, so an access is `movz` + `ldr`/`str`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mem(regs: *mut Value) -> *mut Value {
+    let off: usize;
+    unsafe {
+        core::arch::asm!(
+            "movz {o:x}, #:abs_g0_nc:{s}",
+            o = out(reg) off,
+            s = sym toi_hole_reg,
+            options(pure, nomem, nostack),
+        );
+        regs.byte_add(off)
+    }
+}
+
+/// A stencil using the immediate as `$k`, plus on arm64 a `_k16` variant
+/// where it comes from a single `movz` (the JIT picks it for 0..=65535).
+macro_rules! imm_variants {
+    ($($name:expr),+ ; |$s:ident, $k:ident| $body:block) => {
+        stencil!($($name),+; |$s| {
+            let $k = imm();
+            $body
+        });
+        #[cfg(target_arch = "aarch64")]
+        stencil!($($name),+, "_k16"; |$s| {
+            let $k = imm16();
+            $body
+        });
+    };
 }
 
 /// Read or write a boxed location: `[m]` memory or `[g k]` a GPR slot.
@@ -354,8 +427,19 @@ stencil!("lda_smi"; |s| {
 });
 
 // `lda_smi` with an unboxed int32 result (specialized code).
-stencil!("lda_smi_i"; |s| {
-    s.acc = Value::from_bits(imm_zext());
+imm_variants!("lda_smi_i"; |s, k| {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Straight into acc; LLVM would go through another register.
+        let _ = k;
+        let v: u64;
+        core::arch::asm!("mov {v:e}, offset {imm}", v = out(reg) v, imm = sym toi_hole_imm, options(pure, nomem, nostack));
+        s.acc = Value::from_bits(v);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        s.acc = unboxed(k);
+    }
     next!(s)
 });
 
@@ -372,14 +456,43 @@ stencil_slow!("add_smi"; |s| {
     next!(s)
 });
 
-stencil!("add_smi_i"; |s| {
-    match int(s.acc).checked_add(imm()) {
-        Some(sum) => {
-            s.acc = unboxed(sum);
-            next!(s)
-        }
-        None => exit!(s),
+// In place: on overflow acc holds the wrapped sum, which the exit stub
+// undoes (`undo_add_smi_i`), so the add is `add r12d, k; jo exit`. On
+// x86-64 the immediate is part of the `add` (inline asm, with `asm goto`
+// for the overflow branch); LLVM would load it into a register first.
+imm_variants!("add_smi_i"; |s, k| {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = k;
+        let mut v = s.acc.to_bits();
+        core::arch::asm!(
+            "add {v:e}, offset {imm}",
+            "{{disp32}} jo {ovf}",
+            v = inout(reg) v,
+            imm = sym toi_hole_imm,
+            ovf = label { unsafe {
+                s.acc = Value::from_bits(v);
+                exit!(s)
+            } },
+            options(nomem, nostack),
+        );
+        s.acc = Value::from_bits(v);
+        next!(s)
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (v, overflow) = int(s.acc).overflowing_add(k);
+        s.acc = unboxed(v);
+        if overflow {
+            exit!(s)
+        }
+        next!(s)
+    }
+});
+
+stencil!("undo_add_smi_i"; |s| {
+    s.acc = unboxed(int(s.acc).wrapping_sub(imm()));
+    next!(s)
 });
 
 stencil!("add_smi_iif"; |s| {
@@ -443,11 +556,27 @@ stencil_slow!("jlt_smi"; |s| {
     next!(s)
 });
 
-stencil!("jlt_smi_i"; |s| {
-    if int(s.acc) < imm() {
-        jump!(s)
+imm_variants!("jlt_smi_i"; |s, k| {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = k;
+        core::arch::asm!(
+            "cmp {v:e}, offset {imm}",
+            "{{disp32}} jl {taken}",
+            v = in(reg) s.acc.to_bits(),
+            imm = sym toi_hole_imm,
+            taken = label { unsafe { jump!(s) } },
+            options(nomem, nostack),
+        );
+        next!(s)
     }
-    next!(s)
+    #[cfg(target_arch = "aarch64")]
+    {
+        if int(s.acc) < k {
+            jump!(s)
+        }
+        next!(s)
+    }
 });
 
 stencil!("jlt_smi_f"; |s| {
@@ -947,28 +1076,65 @@ macro_rules! int_slot {
         // the exit stub undoes it (`undo_addi_u`) before spilling, so the
         // exit still happens "before" the instruction. Writing the slot
         // first lets the add happen in place: `add edi, k; jo exit`.
-        stencil!("addi_u", $k; |s| {
-            let (v, overflow) = raw(s.g[$k]).overflowing_add(imm());
-            s.g[$k] = unboxed(v);
-            if overflow {
-                exit!(s)
+        imm_variants!("addi_u", $k; |s, k| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = k;
+                let mut v = s.g[$k].to_bits();
+                core::arch::asm!(
+                    "add {v:e}, offset {imm}",
+                    "{{disp32}} jo {ovf}",
+                    v = inout(reg) v,
+                    imm = sym toi_hole_imm,
+                    ovf = label { unsafe {
+                        s.g[$k] = Value::from_bits(v);
+                        exit!(s)
+                    } },
+                    options(nomem, nostack),
+                );
+                s.g[$k] = Value::from_bits(v);
+                next!(s)
             }
-            next!(s)
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (v, overflow) = raw(s.g[$k]).overflowing_add(k);
+                s.g[$k] = unboxed(v);
+                if overflow {
+                    exit!(s)
+                }
+                next!(s)
+            }
         });
         stencil!("undo_addi_u", $k; |s| {
             s.g[$k] = unboxed(raw(s.g[$k]).wrapping_sub(imm()));
             next!(s)
         });
-        stencil!("incjlt_u", $k; |s| {
+        imm_variants!("incjlt_u", $k; |s, k| {
             let (v, overflow) = raw(s.g[$k]).overflowing_add(1);
             s.g[$k] = unboxed(v);
             if overflow {
                 exit!(s)
             }
-            if v < imm() {
-                jump!(s)
+            #[cfg(target_arch = "x86_64")]
+            {
+                let _ = k;
+                core::arch::asm!(
+                    "cmp {v:e}, offset {imm}",
+                    "{{disp32}} jl {taken}",
+                    v = in(reg) s.g[$k].to_bits(),
+                    imm = sym toi_hole_imm,
+                    taken = label { unsafe { jump!(s) } },
+                    options(nomem, nostack),
+                );
+                next!(s)
             }
-            next!(s)
+            #[cfg(target_arch = "aarch64")]
+            {
+                if v < k {
+                    jump!(s)
+                }
+                next!(s)
+            }
         });
     };
 }

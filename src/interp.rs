@@ -3,29 +3,44 @@
 //! Interpreter state lives entirely in arguments, so with `preserve_none` it
 //! lives entirely in registers:
 //!
-//! | arg    | meaning                                 |
-//! |--------|-----------------------------------------|
-//! | `pc`   | pointer to the current instruction      |
-//! | `acc`  | the accumulator                         |
-//! | `regs` | pointer to the register file            |
-//! | `vm`   | VM context (heap, constants, …) — placeholder for now |
-//! | `tbl`  | the handler table (kept in a register so dispatch needs no `lea`) |
+//! | arg    | x86-64 | arm64 | meaning                                  |
+//! |--------|--------|-------|------------------------------------------|
+//! | `pc`   | r12    | x20   | pointer to the current instruction       |
+//! | `acc`  | r13    | x21   | the accumulator                          |
+//! | `regs` | r14    | x22   | pointer to the register file             |
+//! | `vm`   | r15    | x23   | VM context (heap, constants, …) — placeholder for now |
+//! | `tbl`  | rdi    | x24   | the handler table                        |
+//! | `tag`  | rsi    | x25   | [`NumberTag`], pinned like JSC's `numberTag` register |
 //!
-//! Argument order matters on x86-64. `preserve_none` passes args 1–4 in
-//! r12–r15 and arg 5 in rdi. LLVM's x86 backend only lets the address of an indirect tail
-//! call's memory operand use registers in `GR64_TC` (caller-saved under the C
-//! ABI), which excludes r12–r15. With `tbl` in r15 every handler paid an
-//! extra `mov` to copy it out. In rdi, `jmp [rdi + rcx*8]` works directly.
-//! On arm64 the order doesn't matter: args go in x20–x28, and there `tbl`
-//! (x24) only feeds an `ldr`.
+//! Argument order matters on x86-64. LLVM's x86 backend only lets the address
+//! of an indirect tail call's memory operand use registers in `GR64_TC`
+//! (caller-saved under the C ABI), which excludes r12–r15. With `tbl` in r15
+//! every handler paid an extra `mov` to copy it out. In rdi,
+//! `jmp [rdi + rcx*8]` works directly. On arm64 the order doesn't matter;
+//! `tbl` only feeds an `ldr`.
 //!
 //! Dispatch to the next instruction is: load opcode byte, advance `pc`,
 //! indirect jump through `tbl`.
+//!
+//! Value handlers are tiered like JSC's LLInt:
+//! 1. An inline int32 fast path in the handler.
+//! 2. A `become` to a cold `slow_*` handler with the same signature, for
+//!    any mix of int32 and double. It boxes the result as a double without
+//!    normalizing integral results back to int32.
+//! 3. A plain call to a `generic_*` runtime function for anything else.
+//!    That is the only tier that sets up a stack frame.
 
 use crate::bytecode::Op;
+use crate::value::Value;
 
-pub type Handler =
-    extern "rust-preserve-none" fn(*const u8, i64, *mut i64, *mut Vm, &'static Table) -> i64;
+pub type Handler = extern "rust-preserve-none" fn(
+    *const u8,
+    Value,
+    *mut Value,
+    *mut Vm,
+    &'static Table,
+    NumberTag,
+) -> Value;
 
 /// Per-VM state reachable from every handler. Empty until there is a heap.
 pub struct Vm {}
@@ -33,13 +48,42 @@ pub struct Vm {}
 #[repr(transparent)]
 pub struct Table([Handler; 256]);
 
+/// [`Value::NUMBER_TAG`], kept in a register for the whole run.
+///
+/// x86 instructions can't take a 64-bit immediate. With the tag as a
+/// constant, every int32 test becomes `shr` + `cmp`, and every int32 box a
+/// `movabs`. JSC pins it in a register for the same reason. It's passed as a
+/// handler argument, laundered once in [`run`], so LLVM can't
+/// constant-fold it back in.
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct NumberTag(u64);
+
+impl NumberTag {
+    #[inline(always)]
+    fn is_int32(self, v: Value) -> bool {
+        v.to_bits() >= self.0
+    }
+
+    /// See [`Value::both_int32`].
+    #[inline(always)]
+    fn both_int32(self, a: Value, b: Value) -> bool {
+        a.to_bits() & b.to_bits() >= self.0
+    }
+
+    #[inline(always)]
+    fn box_i32(self, i: i32) -> Value {
+        Value::from_bits(self.0 | i as u32 as u64)
+    }
+}
+
 /// Tail-call the handler of the instruction at `$pc + $off` (bytes, signed).
 macro_rules! dispatch {
-    ($pc:expr, $off:expr, $acc:expr, $regs:expr, $vm:expr, $tbl:expr) => {{
+    ($pc:expr, $off:expr, $acc:expr, $regs:expr, $vm:expr, $tbl:expr, $tag:expr) => {{
         let next: *const u8 = $pc.offset($off as isize);
         pc_barrier!(next);
         let op = *next;
-        become ($tbl.0[op as usize])(next, $acc, $regs, $vm, $tbl)
+        become ($tbl.0[op as usize])(next, $acc, $regs, $vm, $tbl, $tag)
     }};
 }
 
@@ -80,24 +124,30 @@ unsafe fn imm32(pc: *const u8, off: usize) -> i32 {
 
 /// Read a register operand at `pc + off` and return a pointer to that register.
 #[inline(always)]
-unsafe fn reg(pc: *const u8, off: usize, regs: *mut i64) -> *mut i64 {
+unsafe fn reg(pc: *const u8, off: usize, regs: *mut Value) -> *mut Value {
     unsafe { regs.add(*pc.add(off) as usize) }
 }
 
+/// Both operands as `f64` if both are numbers (int32 or double).
+#[inline(always)]
+fn both_numbers(a: Value, b: Value) -> Option<(f64, f64)> {
+    Some((a.as_number()?, b.as_number()?))
+}
+
 macro_rules! handlers {
-    ($( $(#[$m:meta])* fn $name:ident($pc:ident, $acc:ident, $regs:ident, $vm:ident, $tbl:ident) $body:block )*) => {$(
+    ($( $(#[$m:meta])* fn $name:ident($pc:ident, $acc:ident, $regs:ident, $vm:ident, $tbl:ident, $tag:ident) $body:block )*) => {$(
         $(#[$m])*
-        #[unsafe(no_mangle)]
         #[allow(unused_assignments)]
         // `dispatch!` hands `next` to a `nomem` asm block, which never dereferences it.
         #[allow(clippy::pointers_in_nomem_asm_block)]
         extern "rust-preserve-none" fn $name(
             $pc: *const u8,
-            #[allow(unused_mut)] mut $acc: i64,
-            $regs: *mut i64,
+            #[allow(unused_mut)] mut $acc: Value,
+            $regs: *mut Value,
             $vm: *mut Vm,
             $tbl: &'static Table,
-        ) -> i64 {
+            $tag: NumberTag,
+        ) -> Value {
             #[allow(unused_unsafe)]
             unsafe { $body }
         }
@@ -105,89 +155,173 @@ macro_rules! handlers {
 }
 
 handlers! {
-    fn toi_op_nop(pc, acc, regs, vm, tbl) {
-        dispatch!(pc, Op::Nop.size(), acc, regs, vm, tbl)
+    fn op_nop(pc, acc, regs, vm, tbl, tag) {
+        dispatch!(pc, Op::Nop.size(), acc, regs, vm, tbl, tag)
     }
 
-    fn toi_op_lda_smi(pc, acc, regs, vm, tbl) {
-        acc = imm32(pc, 1) as i64;
-        dispatch!(pc, Op::LdaSmi.size(), acc, regs, vm, tbl)
+    fn op_lda_smi(pc, acc, regs, vm, tbl, tag) {
+        acc = tag.box_i32(imm32(pc, 1));
+        dispatch!(pc, Op::LdaSmi.size(), acc, regs, vm, tbl, tag)
     }
 
-    fn toi_op_ldar(pc, acc, regs, vm, tbl) {
+    fn op_ldar(pc, acc, regs, vm, tbl, tag) {
         acc = *reg(pc, 1, regs);
-        dispatch!(pc, Op::Ldar.size(), acc, regs, vm, tbl)
+        dispatch!(pc, Op::Ldar.size(), acc, regs, vm, tbl, tag)
     }
 
-    fn toi_op_star(pc, acc, regs, vm, tbl) {
+    fn op_star(pc, acc, regs, vm, tbl, tag) {
         *reg(pc, 1, regs) = acc;
-        dispatch!(pc, Op::Star.size(), acc, regs, vm, tbl)
+        dispatch!(pc, Op::Star.size(), acc, regs, vm, tbl, tag)
     }
 
-    fn toi_op_add(pc, acc, regs, vm, tbl) {
-        acc = acc.wrapping_add(*reg(pc, 1, regs));
-        dispatch!(pc, Op::Add.size(), acc, regs, vm, tbl)
+    fn op_add(pc, acc, regs, vm, tbl, tag) {
+        let rhs = *reg(pc, 1, regs);
+        if tag.both_int32(acc, rhs)
+            && let Some(sum) = acc.as_i32_unchecked().checked_add(rhs.as_i32_unchecked())
+        {
+            dispatch!(pc, Op::Add.size(), tag.box_i32(sum), regs, vm, tbl, tag)
+        }
+        become slow_add(pc, acc, regs, vm, tbl, tag)
     }
 
-    fn toi_op_inc(pc, acc, regs, vm, tbl) {
-        acc = acc.wrapping_add(1);
-        dispatch!(pc, Op::Inc.size(), acc, regs, vm, tbl)
+    fn op_inc(pc, acc, regs, vm, tbl, tag) {
+        if tag.is_int32(acc)
+            && let Some(n) = acc.as_i32_unchecked().checked_add(1)
+        {
+            dispatch!(pc, Op::Inc.size(), tag.box_i32(n), regs, vm, tbl, tag)
+        }
+        become slow_inc(pc, acc, regs, vm, tbl, tag)
     }
 
-    fn toi_op_jump_if_less(pc, acc, regs, vm, tbl) {
+    fn op_jump_if_less(pc, acc, regs, vm, tbl, tag) {
+        let rhs = *reg(pc, 1, regs);
+        if !tag.both_int32(acc, rhs) {
+            become slow_jump_if_less(pc, acc, regs, vm, tbl, tag)
+        }
         // Two separate dispatches, not one on a selected pc. A select
         // materializes the fall-through length (`mov eax, 6`) and blocks the
         // pre-indexed load on arm64.
-        if acc < *reg(pc, 1, regs) {
-            dispatch!(pc, imm32(pc, 2), acc, regs, vm, tbl)
+        if acc.as_i32_unchecked() < rhs.as_i32_unchecked() {
+            dispatch!(pc, imm32(pc, 2), acc, regs, vm, tbl, tag)
         } else {
-            dispatch!(pc, Op::JumpIfLess.size(), acc, regs, vm, tbl)
+            dispatch!(pc, Op::JumpIfLess.size(), acc, regs, vm, tbl, tag)
         }
     }
 
-    fn toi_op_jump(pc, acc, regs, vm, tbl) {
-        dispatch!(pc, imm32(pc, 1), acc, regs, vm, tbl)
+    fn op_jump(pc, acc, regs, vm, tbl, tag) {
+        dispatch!(pc, imm32(pc, 1), acc, regs, vm, tbl, tag)
     }
 
-    fn toi_op_return(pc, acc, regs, vm, tbl) {
-        let _ = (pc, regs, vm, tbl);
+    fn op_return(pc, acc, regs, vm, tbl, tag) {
+        let _ = (pc, regs, vm, tbl, tag);
         acc
     }
 
     #[cold]
-    fn toi_op_invalid(pc, acc, regs, vm, tbl) {
-        let _ = (pc, acc, regs, vm, tbl);
+    fn op_invalid(pc, acc, regs, vm, tbl, tag) {
+        let _ = (pc, acc, regs, vm, tbl, tag);
         std::process::abort()
+    }
+
+    // Slow paths (tier 2). Same signature as the handlers so they can be
+    // `become`d. `inline(never)` keeps LLVM from merging them back in.
+
+    #[cold]
+    #[inline(never)]
+    fn slow_add(pc, acc, regs, vm, tbl, tag) {
+        let rhs = *reg(pc, 1, regs);
+        acc = match both_numbers(acc, rhs) {
+            Some((a, b)) => Value::from_f64_arith(a + b),
+            None => generic_add(acc, rhs),
+        };
+        dispatch!(pc, Op::Add.size(), acc, regs, vm, tbl, tag)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_inc(pc, acc, regs, vm, tbl, tag) {
+        acc = match acc.as_number() {
+            Some(a) => Value::from_f64_arith(a + 1.0),
+            None => generic_inc(acc),
+        };
+        dispatch!(pc, Op::Inc.size(), acc, regs, vm, tbl, tag)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_jump_if_less(pc, acc, regs, vm, tbl, tag) {
+        let rhs = *reg(pc, 1, regs);
+        let less = match both_numbers(acc, rhs) {
+            // False if either is NaN.
+            Some((a, b)) => a < b,
+            None => generic_less_than(acc, rhs),
+        };
+        if less {
+            dispatch!(pc, imm32(pc, 2), acc, regs, vm, tbl, tag)
+        } else {
+            dispatch!(pc, Op::JumpIfLess.size(), acc, regs, vm, tbl, tag)
+        }
     }
 }
 
+// Generic runtime (tier 3): ordinary Rust functions, called (not tail-called)
+// from the slow paths. Here go ToPrimitive, strings, BigInt and exceptions
+// once they exist; they'll take the `Vm`. A call from a `preserve_none`
+// handler is cheap: the callee preserves r12–r15 / x19–x28, where most of
+// the interpreter state already lives.
+
+/// `a + b` where at least one side is not a number.
+#[cold]
+#[inline(never)]
+fn generic_add(a: Value, b: Value) -> Value {
+    // ToPrimitive is the identity on everything representable so far, and
+    // there are no strings yet, so `+` is numeric addition.
+    Value::number(a.to_number() + b.to_number())
+}
+
+/// `a + 1` where `a` is not a number.
+#[cold]
+#[inline(never)]
+fn generic_inc(a: Value) -> Value {
+    Value::number(a.to_number() + 1.0)
+}
+
+/// `a < b` (IsLessThan) where at least one side is not a number.
+#[cold]
+#[inline(never)]
+fn generic_less_than(a: Value, b: Value) -> bool {
+    a.to_number() < b.to_number()
+}
+
 static TABLE: Table = {
-    let mut t: [Handler; 256] = [toi_op_invalid; 256];
-    t[Op::Nop as usize] = toi_op_nop;
-    t[Op::LdaSmi as usize] = toi_op_lda_smi;
-    t[Op::Ldar as usize] = toi_op_ldar;
-    t[Op::Star as usize] = toi_op_star;
-    t[Op::Add as usize] = toi_op_add;
-    t[Op::Inc as usize] = toi_op_inc;
-    t[Op::JumpIfLess as usize] = toi_op_jump_if_less;
-    t[Op::Jump as usize] = toi_op_jump;
-    t[Op::Return as usize] = toi_op_return;
+    let mut t: [Handler; 256] = [op_invalid; 256];
+    t[Op::Nop as usize] = op_nop;
+    t[Op::LdaSmi as usize] = op_lda_smi;
+    t[Op::Ldar as usize] = op_ldar;
+    t[Op::Star as usize] = op_star;
+    t[Op::Add as usize] = op_add;
+    t[Op::Inc as usize] = op_inc;
+    t[Op::JumpIfLess as usize] = op_jump_if_less;
+    t[Op::Jump as usize] = op_jump;
+    t[Op::Return as usize] = op_return;
     Table(t)
 };
 
-/// Run `code` with a register file of `nregs` zeroed registers and return the
-/// accumulator at `Return`.
+/// Run `code` over the register file `regs` and return the accumulator at
+/// `Return`. The accumulator starts as `undefined`.
 ///
 /// # Safety
 /// `code` must be well formed: every instruction complete, every register
-/// operand `< nregs`, every jump landing on an instruction boundary, and every
-/// path ending in `Return`. There is no verifier yet.
-pub unsafe fn run(code: &[u8], nregs: usize) -> i64 {
-    let mut regs = vec![0i64; nregs];
+/// operand `< regs.len()`, every jump landing on an instruction boundary, and
+/// every path ending in `Return`. There is no verifier yet.
+pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
     let mut vm = Vm {};
     let pc = code.as_ptr();
-    // Launder the table address so LLVM can't fold it back into a
-    // RIP-relative `lea` in every handler; it must stay a register argument.
+    // Launder the table address and the number tag so LLVM can't fold them
+    // back into constants (`lea`/`movabs`) in every handler. They must stay
+    // register arguments.
     let tbl: &'static Table = std::hint::black_box(&TABLE);
-    unsafe { (tbl.0[*pc as usize])(pc, 0, regs.as_mut_ptr(), &mut vm, tbl) }
+    let tag = NumberTag(std::hint::black_box(Value::NUMBER_TAG));
+    let acc = Value::UNDEFINED;
+    unsafe { (tbl.0[*pc as usize])(pc, acc, regs.as_mut_ptr(), &mut vm, tbl, tag) }
 }

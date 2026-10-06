@@ -40,7 +40,7 @@
 //!
 //! | field  | x86-64            | arm64              | contents |
 //! |--------|-------------------|--------------------|----------|
-//! | `acc`  | r12               | x20                | accumulator, boxed (when not a double) |
+//! | `acc`  | r12               | x20                | accumulator when not a double: if typed int32, its low 32 bits hold the int and its high bits are 0 or the tag; otherwise boxed |
 //! | `regs` | r13               | x21                | the VM register file in memory |
 //! | `tag`  | r14               | x22                | `NUMBER_TAG` |
 //! | `ctx`  | r15               | x23                | exit record |
@@ -61,7 +61,9 @@
 //! first: `i` int32 (boxed in a GPR or memory), `f` double. `iif` is an
 //! int32 operation that overflowed before, so it produces a double. A
 //! missing type part means the generic stencil (any types). A result typed
-//! double goes to `facc`; anything else to `acc`, boxed.
+//! double goes to `facc`; an int32 result to `acc`, unboxed; anything else
+//! to `acc`, boxed. Stencils reading an int32 `acc` use only its low 32
+//! bits, so a boxed int32 is a valid int32 `acc` too.
 
 #![feature(explicit_tail_calls, rust_preserve_none_cc)]
 #![allow(incomplete_features, non_snake_case, unused_unsafe, clippy::missing_safety_doc)]
@@ -351,6 +353,12 @@ stencil!("lda_smi"; |s| {
     next!(s)
 });
 
+// `lda_smi` with an unboxed int32 result (specialized code).
+stencil!("lda_smi_i"; |s| {
+    s.acc = Value::from_bits(imm_zext());
+    next!(s)
+});
+
 stencil_slow!("add_smi"; |s| {
     if s.tag.is_int32(s.acc)
         && let Some(sum) = int(s.acc).checked_add(imm())
@@ -367,7 +375,7 @@ stencil_slow!("add_smi"; |s| {
 stencil!("add_smi_i"; |s| {
     match int(s.acc).checked_add(imm()) {
         Some(sum) => {
-            s.acc = s.tag.box_i32(sum);
+            s.acc = unboxed(sum);
             next!(s)
         }
         None => exit!(s),
@@ -403,7 +411,7 @@ stencil_slow!("inc"; |s| {
 stencil!("inc_i"; |s| {
     match int(s.acc).checked_add(1) {
         Some(n) => {
-            s.acc = s.tag.box_i32(n);
+            s.acc = unboxed(n);
             next!(s)
         }
         None => exit!(s),
@@ -457,6 +465,14 @@ stencil!("conv_acc_f"; |s| {
 
 // Box facc into acc: before generic stencils, exits and `return`, and where
 // a join widened acc from double to any.
+// Box an int32 acc (low 32 bits valid, high bits 0 or the tag): before
+// generic stencils, exits and `return`, and where a join widens acc from
+// int32 to any. `or`-ing the tag is right for both forms.
+stencil!("box_iacc"; |s| {
+    s.acc = s.tag.rebox(s.acc);
+    next!(s)
+});
+
 stencil!("box_facc"; |s| {
     s.acc = s.tag.encode_f64(s.facc);
     next!(s)
@@ -481,6 +497,14 @@ macro_rules! boxed_location {
             next!(s)
         });
         stencil!("star_", loc!($loc); |s| {
+            set!($loc, s, s.acc);
+            next!(s)
+        });
+        // Store an int32 acc, which may be unboxed, into a boxed location.
+        // Box acc in place (a boxed int32 is still a valid int32 acc):
+        // boxing into a scratch register costs an extra `mov` on x86-64.
+        stencil!("star_", loc!($loc), "_i"; |s| {
+            s.acc = s.tag.rebox(s.acc);
             set!($loc, s, s.acc);
             next!(s)
         });
@@ -511,7 +535,7 @@ macro_rules! boxed_location {
         stencil!("add_ii_", loc!($loc); |s| {
             match int(s.acc).checked_add(int(get!($loc, s))) {
                 Some(sum) => {
-                    s.acc = s.tag.box_i32(sum);
+                    s.acc = unboxed(sum);
                     next!(s)
                 }
                 None => exit!(s),
@@ -842,10 +866,9 @@ fn unboxed(i: i32) -> Value {
 
 macro_rules! int_slot {
     ($k:tt) => {
-        // The slot's high bits are zero (the invariant), so boxing is a plain
-        // `or` of the tag; `box_i32` would re-zero-extend first.
+        // acc typed int32 may be unboxed, so this is a plain move.
         stencil!("ldar_u", $k; |s| {
-            s.acc = s.tag.rebox(s.g[$k]);
+            s.acc = s.g[$k];
             next!(s)
         });
         stencil!("star_u", $k; |s| {
@@ -877,7 +900,7 @@ macro_rules! int_slot {
         stencil!("add_ii_u", $k; |s| {
             match int(s.acc).checked_add(raw(s.g[$k])) {
                 Some(sum) => {
-                    s.acc = s.tag.box_i32(sum);
+                    s.acc = unboxed(sum);
                     next!(s)
                 }
                 None => exit!(s),

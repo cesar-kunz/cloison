@@ -625,6 +625,8 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             pinned: spec.pinned,
         };
         let Sel { base, case, .. } = select(insn, i, &any, &no);
+        // Generic code keeps `acc` boxed, so `lda_smi`, not `lda_smi_i`.
+        let case = if base == "lda_smi" { "" } else { case };
         return Sel {
             base,
             case,
@@ -647,7 +649,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         Op::Return => ("return", ""),
         Op::LdaSmi => {
             out.acc = I32;
-            ("lda_smi", "")
+            ("lda_smi", "i")
         }
         Op::Ldar => {
             out.acc = reg;
@@ -1018,6 +1020,7 @@ fn edge_conversions(from: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Pie
     match (from.acc, to.acc) {
         (Ty::I32, Ty::F64) => out.push(Piece::new("conv_acc_f", 0)),
         (Ty::F64, Ty::Any) => out.push(Piece::new("box_facc", 0)),
+        (Ty::I32, Ty::Any) => out.push(Piece::new("box_iacc", 0)),
         _ => {}
     }
     for (r, (&a, &b)) in from.regs.iter().zip(&to.regs).enumerate() {
@@ -1085,17 +1088,24 @@ fn spills(homes: &[Home]) -> Vec<Piece> {
         .collect()
 }
 
+/// The piece that boxes an accumulator of type `acc`, if it isn't boxed:
+/// `box_facc` for a double in `facc`, `box_iacc` for an int32 (whose high
+/// bits may be 0 instead of the tag).
+fn box_acc_piece(acc: Ty) -> Option<Piece> {
+    match acc {
+        Ty::F64 => Some(Piece::new("box_facc", 0)),
+        Ty::I32 => Some(Piece::new("box_iacc", 0)),
+        _ => None,
+    }
+}
+
 /// The stencil name for instruction `insn`, and pieces to run before it.
 fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<Piece>, String) {
     let mut pre = Vec::new();
     let home = homes.get(insn.reg as usize).copied().unwrap_or(Home::Mem);
     let loc = home.loc();
-    // Generic stencils take a boxed acc.
-    let box_acc = |pre: &mut Vec<Piece>| {
-        if st.acc == Ty::F64 {
-            pre.push(Piece::new("box_facc", 0));
-        }
-    };
+    // Generic stencils (and `return`) take a boxed acc.
+    let box_acc = |pre: &mut Vec<Piece>| pre.extend(box_acc_piece(st.acc));
     let name = match (sel.base, home) {
         ("ldar", Home::Fpr(k)) => format!("ldar_f{k}"),
         ("ldar", _) if sel.case == "f" => format!("ldar_{loc}_f"),
@@ -1103,6 +1113,7 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
         ("star", Home::Fpr(k)) if sel.case == "f" => format!("star_f{k}"),
         ("star", Home::Fpr(k)) => format!("star_i_f{k}"),
         ("star", _) if sel.case == "f" => format!("star_{loc}_f"),
+        ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => format!("star_{loc}_i"),
         ("star", _) => format!("star_{loc}"),
         ("add" | "jlt", _) if sel.case.is_empty() => {
             box_acc(&mut pre);
@@ -1629,6 +1640,7 @@ impl JitCode {
                         });
                     }
                     seq.push(Piece::new(&f.ldar, insn.reg));
+                    seq.push(Piece::new("box_iacc", 0));
                     seq.extend(spills(&homes));
                     seq.push(Piece {
                         imm: insns[i + 1].pc as i32,
@@ -1660,8 +1672,9 @@ impl JitCode {
                 ..Piece::new(&name, 0)
             };
             if main.uses("toi_exit") {
-                assert_ne!(st.acc, Ty::F64, "exits need a boxed acc");
-                let mut seq = spills(&homes);
+                assert_ne!(st.acc, Ty::F64, "exits happen at int32 operations");
+                let mut seq: Vec<Piece> = box_acc_piece(st.acc).into_iter().collect();
+                seq.extend(spills(&homes));
                 seq.push(Piece {
                     imm: insn.pc as i32,
                     ..Piece::new("exit", 0)

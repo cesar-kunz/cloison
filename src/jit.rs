@@ -56,6 +56,7 @@
 //! be anywhere.
 
 use crate::bytecode::Op;
+use crate::interp::{self, Frame, Run};
 use crate::value::{NumberTag, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -626,7 +627,8 @@ fn decode(code: &[u8]) -> Vec<Insn> {
     while pc < code.len() {
         let op = Op::from_u8(code[pc]).unwrap_or_else(|| panic!("bad opcode {} at {pc}", code[pc]));
         starts.insert(pc, raw.len());
-        raw.push((pc, op));
+        // Loop opcodes only count iterations in the interpreter.
+        raw.push((pc, op.plain()));
         pc += op.size();
     }
     assert_eq!(pc, code.len(), "truncated instruction");
@@ -649,6 +651,9 @@ fn decode(code: &[u8]) -> Vec<Insn> {
                 Op::JumpIfLessSmi => (imm, target) = (imm_at(pc + 1), index_of(pc, imm_at(pc + 5))),
                 Op::Jump => target = index_of(pc, imm_at(pc + 1)),
                 Op::Nop | Op::Return => {}
+                Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop => {
+                    unreachable!("decoded as plain jumps")
+                }
             }
             Insn {
                 pc,
@@ -774,6 +779,9 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
     };
     let (base, case) = match insn.op {
+        Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop => {
+            unreachable!("decoded as plain jumps")
+        }
         Op::Nop => ("nop", ""),
         Op::Jump => ("jump", ""),
         Op::Return => ("return", ""),
@@ -1293,6 +1301,12 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
 /// it is `ldar` / `lda_smi`, which overwrite it, or `nop` / `jump`, which
 /// pass it through.
 fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
+    let reach: Vec<bool> = ins.iter().map(Option::is_some).collect();
+    acc_liveness(insns, &reach).1
+}
+
+/// Accumulator liveness into and out of each reachable instruction.
+fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
     let n = insns.len();
     let reads = |op: Op| !matches!(op, Op::Ldar | Op::LdaSmi | Op::Nop | Op::Jump);
     let kills = |op: Op| matches!(op, Op::Ldar | Op::LdaSmi);
@@ -1302,7 +1316,7 @@ fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
     while changed {
         changed = false;
         for i in (0..n).rev() {
-            if ins[i].is_none() {
+            if !reach[i] {
                 continue;
             }
             let insn = &insns[i];
@@ -1318,7 +1332,7 @@ fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
             }
         }
     }
-    live_out
+    (live_in, live_out)
 }
 
 /// One stencil of a fused group.
@@ -2176,29 +2190,67 @@ impl JitCode {
 pub struct JitStats {
     pub compiles: u32,
     pub exits: u32,
+    /// Interpreter runs that tiered up into JIT code at a loop header.
+    pub osr_entries: u32,
+    /// Runs (or parts of runs) spent in the interpreter.
+    pub interp_runs: u32,
+    /// Times an entry point became megamorphic and its versions were
+    /// replaced by one generalized version.
+    pub generalizations: u32,
 }
+
+/// When to tier up from the interpreter.
+#[derive(Clone, Copy, Debug)]
+pub struct Tiering {
+    /// Loop back edges run in the interpreter, over the function's lifetime,
+    /// before compiling at the loop header.
+    pub back_edges: i64,
+    /// Calls run in the interpreter before compiling at entry.
+    pub calls: u32,
+}
+
+/// Versions kept per entry point before generalizing.
+const MAX_VERSIONS: usize = 4;
 
 /// A bytecode function run through the JIT.
 ///
-/// Code is compiled when execution enters, for the exact types of the live
-/// values at that point. So entry types are facts, not speculation, and no
-/// entry guards are needed: inside the region, types only widen, and edges
-/// get conversions. The only speculation is that int32 arithmetic doesn't
-/// overflow. When it does, the stencil side-exits before the instruction.
-/// The driver then records the instruction as widened (it will produce a
-/// double), recompiles for entry at that instruction with the current
-/// types, and resumes there. Code for entry at the start is cached, keyed by
-/// entry types and invalidated when feedback changes.
+/// Code is compiled for an entry point (an instruction) and the types of the
+/// values live there. Entry types are facts, not speculation: inside the
+/// region types only widen, and edges get conversions. The only speculation
+/// is that int32 arithmetic doesn't overflow. When it does, the stencil
+/// side-exits before the instruction; the driver records the instruction as
+/// widened (it will produce a double), invalidates all versions, recompiles
+/// for entry at that instruction with the current types, and resumes there.
+///
+/// **Versions** (milestone 4). Compiled code is cached per entry point,
+/// keyed by its entry types with dead registers ignored. A version fits a
+/// later entry if every live value's type is the same or narrower (an int32
+/// where it expects a double is converted, in the register file, before
+/// entering; JS numbers are just numbers). This check in the driver replaces
+/// entry guards. After [`MAX_VERSIONS`] versions at one entry point, it is
+/// megamorphic: one version for the join of all types seen replaces them.
+///
+/// **Tiering** (opt-in, [`JitFunction::tiered`]). The function starts in the
+/// interpreter. Loop opcodes count back edges; when the budget runs out, the
+/// interpreter leaves at the loop header (on-stack replacement) and the run
+/// continues in code compiled there. After enough calls, later calls start
+/// in JIT code.
 pub struct JitFunction {
     code: Vec<u8>,
     insns: Vec<Insn>,
     nregs: usize,
     opts: Options,
     widened: HashSet<usize>,
-    /// Code for entry at instruction 0, and the entry types it was built for.
-    cached: Option<(TypeState, JitCode)>,
-    /// The most recently compiled code, for inspection.
-    last: Option<JitCode>,
+    /// Compiled versions per entry instruction, with their entry types.
+    versions: HashMap<usize, Vec<(TypeState, JitCode)>>,
+    /// Which of acc and the registers are live at an entry instruction.
+    live_at: HashMap<usize, (bool, Vec<bool>)>,
+    /// The most recently used version: (entry instruction, index).
+    last: Option<(usize, usize)>,
+    tiering: Option<Tiering>,
+    /// Back edges left before tiering up, and calls so far.
+    back_edges_left: i64,
+    calls: u32,
     pub stats: JitStats,
 }
 
@@ -2227,10 +2279,21 @@ impl JitFunction {
                 unboxed_ints: true,
             },
             widened: HashSet::new(),
-            cached: None,
+            versions: HashMap::new(),
+            live_at: HashMap::new(),
             last: None,
+            tiering: None,
+            back_edges_left: 0,
+            calls: 0,
             stats: JitStats::default(),
         }
+    }
+
+    /// Start in the interpreter and tier up (see [`Tiering`]).
+    pub fn tiered(mut self, tiering: Tiering) -> JitFunction {
+        self.tiering = Some(tiering);
+        self.back_edges_left = tiering.back_edges;
+        self
     }
 
     /// Use only generic stencils, as milestone 1 did.
@@ -2267,12 +2330,87 @@ impl JitFunction {
         self.insns
             .iter()
             .position(|i| i.pc == pc)
-            .expect("exit at an instruction boundary")
+            .expect("an instruction boundary")
     }
 
-    fn compile(&mut self, entry: usize, state: TypeState) -> JitCode {
-        self.stats.compiles += 1;
-        JitCode::compile(&self.insns, entry, state, &self.widened, self.opts)
+    /// The types at entry instruction `entry`, with values that are dead
+    /// there (never read before being overwritten) as `Bot`, so they don't
+    /// split versions.
+    fn entry_types(&mut self, entry: usize, acc: Value, regs: &[Value]) -> TypeState {
+        let (insns, nregs) = (&self.insns, self.nregs);
+        let (acc_live, live) = self.live_at.entry(entry).or_insert_with(|| {
+            let reach = reachable(insns, entry);
+            let regs_live = reg_live_in(insns, &reach, nregs)[entry].clone();
+            (acc_liveness(insns, &reach).0[entry], regs_live)
+        });
+        let mut st = TypeState::of(acc, regs);
+        if !*acc_live {
+            st.acc = Ty::Bot;
+        }
+        for (t, &l) in st.regs.iter_mut().zip(live.iter()) {
+            if !l {
+                *t = Ty::Bot;
+            }
+        }
+        st
+    }
+
+    /// A version for `entry` fitting `actual`, compiling one if needed;
+    /// returns its index. May convert int32 values (in `acc` and `regs`) to
+    /// doubles, where the version expects doubles.
+    fn version(
+        &mut self,
+        entry: usize,
+        actual: &TypeState,
+        acc: &mut Value,
+        regs: &mut [Value],
+    ) -> usize {
+        let fits =
+            |a: Ty, v: Ty| a == v || a == Ty::Bot || v == Ty::Any || (a == Ty::I32 && v == Ty::F64);
+        let fits_all = |v: &TypeState| {
+            fits(actual.acc, v.acc) && actual.regs.iter().zip(&v.regs).all(|(&a, &b)| fits(a, b))
+        };
+        let found = self
+            .versions
+            .get(&entry)
+            .and_then(|vs| vs.iter().position(|(st, _)| fits_all(st)));
+        let index = match found {
+            Some(i) => i,
+            None => {
+                let seen = self.versions.remove(&entry).unwrap_or_default();
+                let (state, keep) = if seen.len() >= MAX_VERSIONS {
+                    // Megamorphic: one version for everything seen.
+                    self.stats.generalizations += 1;
+                    let mut joined = actual.clone();
+                    for (st, _) in &seen {
+                        joined.join(st);
+                    }
+                    (joined, Vec::new())
+                } else {
+                    (actual.clone(), seen)
+                };
+                self.stats.compiles += 1;
+                let code =
+                    JitCode::compile(&self.insns, entry, state.clone(), &self.widened, self.opts);
+                let vs = self.versions.entry(entry).or_insert(keep);
+                vs.push((state, code));
+                vs.len() - 1
+            }
+        };
+        self.last = Some((entry, index));
+        // Make the values match the version: int32 → double where it expects
+        // a double.
+        let st = &self.versions[&entry][index].0;
+        let widen = |v: &mut Value, t: Ty| {
+            if t == Ty::F64 && v.is_int32() {
+                *v = Value::from_f64(v.as_i32_unchecked() as f64);
+            }
+        };
+        widen(acc, st.acc);
+        for (v, &t) in regs.iter_mut().zip(&st.regs) {
+            widen(v, t);
+        }
+        index
     }
 
     /// Run over `regs` and return the accumulator at `Return`. The
@@ -2282,36 +2420,54 @@ impl JitFunction {
     /// As [`crate::interp::run`]: register operands must be `< regs.len()`.
     pub unsafe fn run(&mut self, regs: &mut [Value]) -> Value {
         assert!(regs.len() >= self.nregs, "register file too small");
+        let mut frame = Frame::new(regs);
+        let v = unsafe { self.run_frame(&mut frame) };
+        regs.copy_from_slice(frame.regs());
+        v
+    }
+
+    unsafe fn run_frame(&mut self, frame: &mut Frame) -> Value {
         let (mut pc, mut acc) = (0, Value::UNDEFINED);
+        self.calls += 1;
+        let compiles_at_start = self.stats.compiles;
+        let mut in_jit = match self.tiering {
+            None => true,
+            Some(t) => self.calls > t.calls || self.back_edges_left <= 0,
+        };
         loop {
-            let state = TypeState::of(acc, &regs[..self.nregs]);
-            let entry = self.index_of(pc);
-            if self.stats.compiles >= MAX_COMPILES {
-                return unsafe { crate::interp::run_from(&self.code, pc, acc, regs) };
-            }
-            let outcome = if entry == 0 {
-                if self.cached.as_ref().is_none_or(|(s, _)| *s != state) {
-                    let code = self.compile(0, state.clone());
-                    self.cached = Some((state, code));
+            if !in_jit {
+                self.stats.interp_runs += 1;
+                let (run, left) =
+                    unsafe { interp::run_frame(&self.code, pc, acc, frame, self.back_edges_left) };
+                self.back_edges_left = left;
+                match run {
+                    Run::Return(v) => return v,
+                    Run::Osr { pc: p, acc: a } => {
+                        self.stats.osr_entries += 1;
+                        (pc, acc, in_jit) = (p, a, true);
+                    }
                 }
-                unsafe { self.cached.as_ref().unwrap().1.enter(acc, regs) }
-            } else {
-                let code = self.compile(entry, state);
-                let outcome = unsafe { code.enter(acc, regs) };
-                self.last = Some(code);
-                outcome
-            };
-            match outcome {
+            }
+            if self.stats.compiles - compiles_at_start >= MAX_COMPILES {
+                return unsafe { interp::run_from(&self.code, pc, acc, frame.regs()) };
+            }
+            let entry = self.index_of(pc);
+            let regs = &mut frame.regs()[..self.nregs];
+            let actual = self.entry_types(entry, acc, regs);
+            let index = self.version(entry, &actual, &mut acc, regs);
+            let code = &self.versions[&entry][index].1;
+            match unsafe { code.enter(acc, frame.regs()) } {
                 Outcome::Return(v) => return v,
                 Outcome::Exit {
                     pc: exit_pc,
                     acc: exit_acc,
                 } => {
                     self.stats.exits += 1;
-                    // Only int32 arithmetic exits: widen it and recompile.
+                    // Only int32 arithmetic exits: widen it, invalidate all
+                    // versions (they would exit there too), recompile.
                     let k = self.index_of(exit_pc);
                     self.widened.insert(k);
-                    self.cached = None;
+                    self.versions.clear();
                     (pc, acc) = (exit_pc, exit_acc);
                     // Resume at a preceding `ldar r` if `acc` is just `r`.
                     // Re-running it changes nothing (acc is dead before an
@@ -2321,7 +2477,7 @@ impl JitFunction {
                     if k > 0
                         && let prev = &self.insns[k - 1]
                         && prev.op == Op::Ldar
-                        && regs[prev.reg as usize] == exit_acc
+                        && frame.regs()[prev.reg as usize] == exit_acc
                     {
                         pc = prev.pc;
                     }
@@ -2330,9 +2486,15 @@ impl JitFunction {
         }
     }
 
-    /// The most recently compiled code.
+    /// The most recently used code.
     pub fn last_code(&self) -> Option<&JitCode> {
-        self.last.as_ref().or(self.cached.as_ref().map(|(_, c)| c))
+        let (entry, index) = self.last?;
+        self.versions.get(&entry)?.get(index).map(|(_, c)| c)
+    }
+
+    /// Versions currently compiled, over all entry points.
+    pub fn version_count(&self) -> usize {
+        self.versions.values().map(Vec::len).sum()
     }
 }
 

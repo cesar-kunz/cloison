@@ -1,11 +1,12 @@
-//! Every program runs on six engines: the interpreter, the JIT with
+//! Every program runs on seven engines: the interpreter, the JIT with
 //! generic stencils (milestone 1), with type-specialized stencils
 //! (milestone 2), with VM registers in machine registers (milestone 3),
-//! with fused stencils, and with unboxed int32 in slots.
+//! with fused stencils, with unboxed int32 in slots, and tiered (starting in
+//! the interpreter, tiering up at a loop's third back edge).
 //! They must agree on the result and on the final register file.
 
 use toi::bytecode::Assembler;
-use toi::jit::JitFunction;
+use toi::jit::{JitFunction, Tiering};
 use toi::value::Value;
 
 /// The same JS value. Numbers compare by value, so int32 `3` matches
@@ -30,6 +31,15 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
         ("jit2", JitFunction::new(&code).without_register_homes()),
         ("jit3", JitFunction::new(&code).without_fusion()),
         ("jit4", JitFunction::new(&code).without_unboxed_ints()),
+        // Starts in the interpreter and tiers up at the third loop back edge,
+        // so loops cross into JIT code mid-way.
+        (
+            "tiered",
+            JitFunction::new(&code).tiered(Tiering {
+                back_edges: 3,
+                calls: 1,
+            }),
+        ),
         ("jit", JitFunction::new(&code)),
     ] {
         let mut jit_regs = initial.clone();
@@ -944,4 +954,165 @@ fn three_address_double_from_int() {
         "{:?}",
         stencils(&f)
     );
+}
+
+// ---- Tiering and versions (milestone 4) ----
+
+fn tiered(back_edges: i64, calls: u32) -> Tiering {
+    Tiering { back_edges, calls }
+}
+
+#[test]
+fn hot_loop_tiers_up_at_its_header() {
+    let code = sum_loop(1000).finish();
+    let mut f = JitFunction::new(&code).tiered(tiered(100, 10));
+    let v = unsafe { f.run(&mut [Value::UNDEFINED; 3]) };
+    assert_eq!(v, Value::from_i32(499500));
+    assert_eq!(
+        (f.stats.interp_runs, f.stats.osr_entries, f.stats.compiles),
+        (1, 1, 1)
+    );
+}
+
+#[test]
+fn short_loop_never_compiles() {
+    let code = sum_loop(10).finish();
+    let mut f = JitFunction::new(&code).tiered(tiered(100, 10));
+    let v = unsafe { f.run(&mut [Value::UNDEFINED; 3]) };
+    assert_eq!(v, Value::from_i32(45));
+    assert_eq!((f.stats.osr_entries, f.stats.compiles), (0, 0));
+}
+
+#[test]
+fn back_edge_budget_persists_across_calls() {
+    // 30 iterations per call, budget 100: the fourth call tiers up mid-loop.
+    let code = sum_loop(30).finish();
+    let mut f = JitFunction::new(&code).tiered(tiered(100, 1000));
+    for call in 1..=5 {
+        let v = unsafe { f.run(&mut [Value::UNDEFINED; 3]) };
+        assert_eq!(v, Value::from_i32(435));
+        let expected = if call < 4 { 0 } else { 1 };
+        assert_eq!(f.stats.osr_entries, expected, "call {call}");
+    }
+    // From the fourth call on, the function is hot and starts in JIT code.
+    assert_eq!(f.stats.interp_runs, 4);
+}
+
+#[test]
+fn frequent_calls_compile_at_entry() {
+    let mut a = Assembler::new();
+    a.ldar(0).add_smi(1).ret();
+    let code = a.finish();
+    let mut f = JitFunction::new(&code).tiered(tiered(100, 3));
+    for _ in 0..10 {
+        assert_eq!(
+            unsafe { f.run(&mut [Value::from_i32(41)]) },
+            Value::from_i32(42)
+        );
+    }
+    assert_eq!((f.stats.interp_runs, f.stats.compiles), (3, 1));
+}
+
+#[test]
+fn versions_are_reused_across_calls() {
+    let mut a = Assembler::new();
+    a.ldar(0).add_smi(1).ret();
+    let code = a.finish();
+    let mut f = JitFunction::new(&code);
+    for i in 0..10 {
+        let (arg, expected) = if i % 2 == 0 {
+            (Value::from_i32(1), 2.0)
+        } else {
+            (Value::from_f64(1.5), 2.5)
+        };
+        assert_eq!(unsafe { f.run(&mut [arg]) }.as_number(), Some(expected));
+    }
+    assert_eq!((f.stats.compiles, f.version_count()), (2, 2));
+}
+
+#[test]
+fn an_int_enters_a_double_version() {
+    // Compiled for a double first: a later int32 fits, converted to double.
+    let mut a = Assembler::new();
+    a.ldar(0).add_smi(1).ret();
+    let code = a.finish();
+    let mut f = JitFunction::new(&code);
+    assert_eq!(
+        unsafe { f.run(&mut [Value::from_f64(0.5)]) }.as_number(),
+        Some(1.5)
+    );
+    assert_eq!(
+        unsafe { f.run(&mut [Value::from_i32(2)]) }.as_number(),
+        Some(3.0)
+    );
+    assert_eq!(f.stats.compiles, 1);
+}
+
+#[test]
+fn dead_registers_dont_split_versions() {
+    // r0 is overwritten before it is read: its entry type is irrelevant.
+    let mut a = Assembler::new();
+    a.lda_smi(5).star(0).ldar(0).add_smi(1).ret();
+    let code = a.finish();
+    let mut f = JitFunction::new(&code);
+    for arg in [Value::from_i32(1), Value::from_f64(1.5), Value::NULL] {
+        assert_eq!(unsafe { f.run(&mut [arg]) }, Value::from_i32(6));
+    }
+    assert_eq!(f.stats.compiles, 1);
+}
+
+#[test]
+fn megamorphic_entries_generalize() {
+    // Five entry type states, none fitting an earlier version: after four
+    // versions, one generalized version (any, any) replaces them.
+    let mut a = Assembler::new();
+    a.ldar(0).add(1).ret();
+    let code = a.finish();
+    let mut f = JitFunction::new(&code);
+    let (i, d, n) = (Value::from_i32(1), Value::from_f64(0.5), Value::NULL);
+    let calls = [
+        (i, i),
+        (d, i),
+        (i, d),
+        (n, i),
+        (i, n),
+        (d, d),
+        (n, n),
+        (i, i),
+    ];
+    let expected = [2.0, 1.5, 1.5, 1.0, 1.0, 1.0, 0.0, 2.0];
+    for ((x, y), e) in calls.into_iter().zip(expected) {
+        assert_eq!(
+            unsafe { f.run(&mut [x, y]) }.as_number(),
+            Some(e),
+            "{x:?} + {y:?}"
+        );
+    }
+    assert_eq!(
+        (f.stats.compiles, f.stats.generalizations, f.version_count()),
+        (5, 1, 1)
+    );
+}
+
+#[test]
+fn accumulator_carried_across_the_back_edge() {
+    // acc is live at the loop header (`add_smi` reads it), so tiering up
+    // there must carry it over.
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0);
+    a.bind(top);
+    a.add_smi(1).star(0).jump_if_less_smi(100, top);
+    a.ret();
+    assert_eq!(
+        exec(a.clone(), &mut [Value::UNDEFINED]),
+        Value::from_i32(100)
+    );
+    let code = a.finish();
+    let mut f = JitFunction::new(&code).tiered(tiered(10, 10));
+    assert_eq!(
+        unsafe { f.run(&mut [Value::UNDEFINED]) },
+        Value::from_i32(100)
+    );
+    assert_eq!(f.stats.osr_entries, 1);
 }

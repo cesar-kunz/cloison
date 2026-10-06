@@ -131,6 +131,37 @@ macro_rules! pc_barrier {
     };
 }
 
+/// One back edge: count down the frame's budget and, when it runs out,
+/// leave to tier up at `$target` with `$acc` (boxed).
+///
+/// x86-64: `sub qword ptr [regs - 8], 1; jle osr`, through `asm goto`. LLVM
+/// otherwise loads, decrements, stores and tests (5 instructions).
+#[cfg(target_arch = "x86_64")]
+macro_rules! back_edge {
+    ($regs:ident, $target:expr, $acc:expr) => {
+        core::arch::asm!(
+            "sub qword ptr [{r} - {off}], 1",
+            "jle {osr}",
+            r = in(reg) $regs,
+            off = const BUDGET * size_of::<Value>(),
+            osr = label { return unsafe { osr_exit($regs, $target, $acc) }; },
+            options(nostack),
+        )
+    };
+}
+
+/// arm64 has no memory-destination arithmetic: `ldr; subs; str; b.le`.
+#[cfg(target_arch = "aarch64")]
+macro_rules! back_edge {
+    ($regs:ident, $target:expr, $acc:expr) => {
+        let budget = $regs.cast::<i64>().sub(BUDGET);
+        *budget -= 1;
+        if *budget <= 0 {
+            return osr_exit($regs, $target, $acc);
+        }
+    };
+}
+
 /// Read an unaligned little-endian `i32` operand at `pc + off`.
 #[inline(always)]
 unsafe fn imm32(pc: *const u8, off: usize) -> i32 {
@@ -275,6 +306,40 @@ handlers! {
         next!(any, imm32(pc, 1), acc)
     }
 
+    // Loop forms: the taken back edge counts down the frame's budget and,
+    // at zero, leaves the interpreter to tier up (see `run_frame`).
+
+    fn op_jump_loop(pc, acc, regs, tag) {
+        let off = imm32(pc, 1);
+        back_edge!(regs, pc.offset(off as isize), acc);
+        next!(any, off, acc)
+    }
+
+    fn op_jump_if_less_loop(pc, acc, regs, tag) {
+        let rhs = *reg(pc, 1, regs);
+        if !tag.both_int32(acc, rhs) {
+            tail!(slow_jump_if_less_loop, acc)
+        }
+        if acc.as_i32_unchecked() < rhs.as_i32_unchecked() {
+            let off = imm32(pc, 2);
+            back_edge!(regs, pc.offset(off as isize), acc);
+            if ACC_I32 { next!(i32, off, acc) } else { next!(any, off, acc) }
+        }
+        if ACC_I32 { next!(i32, Op::JumpIfLess.size(), acc) } else { next!(any, Op::JumpIfLess.size(), acc) }
+    }
+
+    fn op_jump_if_less_smi_loop(pc, acc, regs, tag) {
+        if !tag.is_int32(acc) {
+            tail!(slow_jump_if_less_smi_loop, acc)
+        }
+        if acc.as_i32_unchecked() < imm32(pc, 1) {
+            let off = imm32(pc, 5);
+            back_edge!(regs, pc.offset(off as isize), acc);
+            if ACC_I32 { next!(i32, off, acc) } else { next!(any, off, acc) }
+        }
+        if ACC_I32 { next!(i32, Op::JumpIfLessSmi.size(), acc) } else { next!(any, Op::JumpIfLessSmi.size(), acc) }
+    }
+
     fn op_return(pc, acc, regs, tag) {
         let _ = (pc, regs, tag);
         acc
@@ -365,6 +430,34 @@ handlers! {
         next!(i32, imm32(pc, 1), acc)
     }
 
+    fn i32_jump_loop(pc, acc, regs, tag) {
+        let off = imm32(pc, 1);
+        back_edge!(regs, pc.offset(off as isize), tag.rebox(acc));
+        next!(i32, off, acc)
+    }
+
+    fn i32_jump_if_less_loop(pc, acc, regs, tag) {
+        let rhs = *reg(pc, 1, regs);
+        if !tag.is_int32(rhs) {
+            tail!(slow_jump_if_less_loop, tag.rebox(acc))
+        }
+        if raw_i32(acc) < rhs.as_i32_unchecked() {
+            let off = imm32(pc, 2);
+            back_edge!(regs, pc.offset(off as isize), tag.rebox(acc));
+            next!(i32, off, acc)
+        }
+        next!(i32, Op::JumpIfLess.size(), acc)
+    }
+
+    fn i32_jump_if_less_smi_loop(pc, acc, regs, tag) {
+        if raw_i32(acc) < imm32(pc, 1) {
+            let off = imm32(pc, 5);
+            back_edge!(regs, pc.offset(off as isize), tag.rebox(acc));
+            next!(i32, off, acc)
+        }
+        next!(i32, Op::JumpIfLessSmi.size(), acc)
+    }
+
     fn i32_return(pc, acc, regs, tag) {
         let _ = (pc, regs);
         tag.rebox(acc)
@@ -436,6 +529,38 @@ handlers! {
             next!(any, Op::JumpIfLessSmi.size(), acc)
         }
     }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_jump_if_less_loop(pc, acc, regs, tag) {
+        let rhs = *reg(pc, 1, regs);
+        let less = match both_numbers(acc, rhs) {
+            Some((a, b)) => a < b,
+            None => generic_less_than(acc, rhs),
+        };
+        if less {
+            let off = imm32(pc, 2);
+            back_edge!(regs, pc.offset(off as isize), acc);
+            next!(any, off, acc)
+        }
+        next!(any, Op::JumpIfLess.size(), acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_jump_if_less_smi_loop(pc, acc, regs, tag) {
+        let rhs = Value::from_i32(imm32(pc, 1));
+        let less = match acc.as_number() {
+            Some(a) => a < imm32(pc, 1) as f64,
+            None => generic_less_than(acc, rhs),
+        };
+        if less {
+            let off = imm32(pc, 5);
+            back_edge!(regs, pc.offset(off as isize), acc);
+            next!(any, off, acc)
+        }
+        next!(any, Op::JumpIfLessSmi.size(), acc)
+    }
 }
 
 // Generic runtime (tier 3): ordinary Rust functions, called (not tail-called)
@@ -479,6 +604,9 @@ static TABLE: Table = {
     t[Op::Jump as usize] = op_jump;
     t[Op::AddSmi as usize] = op_add_smi;
     t[Op::JumpIfLessSmi as usize] = op_jump_if_less_smi;
+    t[Op::JumpLoop as usize] = op_jump_loop;
+    t[Op::JumpIfLessLoop as usize] = op_jump_if_less_loop;
+    t[Op::JumpIfLessSmiLoop as usize] = op_jump_if_less_smi_loop;
     t[Op::Return as usize] = op_return;
     Table(t)
 };
@@ -495,27 +623,87 @@ static TABLE_I32: Table = {
     t[Op::Jump as usize] = i32_jump;
     t[Op::AddSmi as usize] = i32_add_smi;
     t[Op::JumpIfLessSmi as usize] = i32_jump_if_less_smi;
+    t[Op::JumpLoop as usize] = i32_jump_loop;
+    t[Op::JumpIfLessLoop as usize] = i32_jump_if_less_loop;
+    t[Op::JumpIfLessSmiLoop as usize] = i32_jump_if_less_smi_loop;
     t[Op::Return as usize] = i32_return;
     Table(t)
 };
 
-/// Run `code` over the register file `regs` and return the accumulator at
-/// `Return`. The accumulator starts as `undefined`.
+/// Leave the interpreter to tier up at `target` (a loop header) with `acc`
+/// (boxed): record both in the frame header and return the `EMPTY` marker,
+/// which no bytecode function returns.
+#[cold]
+#[inline(never)]
+fn osr_exit(regs: *mut Value, target: *const u8, acc: Value) -> Value {
+    unsafe {
+        *regs.sub(OSR_PC) = Value::from_bits(target as u64);
+        *regs.sub(OSR_ACC) = acc;
+    }
+    Value::EMPTY
+}
+
+/// Frame header slots, in front of the register file: `regs[-BUDGET]` is the
+/// back-edge budget (an `i64`); `regs[-OSR_PC]` and `regs[-OSR_ACC]` hold the
+/// target and accumulator when the interpreter leaves to tier up.
+const BUDGET: usize = 1;
+const OSR_PC: usize = 2;
+const OSR_ACC: usize = 3;
+const HEADER: usize = 3;
+
+/// A register file with the interpreter's frame header in front.
+pub struct Frame {
+    slots: Vec<Value>,
+}
+
+impl Frame {
+    /// A frame holding a copy of `regs`.
+    pub fn new(regs: &[Value]) -> Frame {
+        let mut slots = vec![Value::UNDEFINED; HEADER];
+        slots.extend_from_slice(regs);
+        Frame { slots }
+    }
+
+    pub fn regs(&mut self) -> &mut [Value] {
+        &mut self.slots[HEADER..]
+    }
+
+    fn budget(&self) -> i64 {
+        self.slots[HEADER - BUDGET].to_bits() as i64
+    }
+
+    fn set_budget(&mut self, n: i64) {
+        self.slots[HEADER - BUDGET] = Value::from_bits(n as u64);
+    }
+}
+
+/// How an interpreter run ended.
+pub enum Run {
+    Return(Value),
+    /// The back-edge budget ran out at the loop header at bytecode offset
+    /// `pc`, with `acc`; the register file is up to date.
+    Osr {
+        pc: usize,
+        acc: Value,
+    },
+}
+
+/// Run `code` from bytecode offset `pc` with accumulator `acc` over `frame`,
+/// allowing `budget` loop back edges before leaving to tier up. Returns the
+/// remaining budget too.
 ///
 /// # Safety
 /// `code` must be well formed: every instruction complete, every register
-/// operand `< regs.len()`, every jump landing on an instruction boundary, and
-/// every path ending in `Return`. There is no verifier yet.
-pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
-    unsafe { run_from(code, 0, Value::UNDEFINED, regs) }
-}
-
-/// Run `code` from bytecode offset `pc` with accumulator `acc`. Used by the
-/// JIT to finish a run in the interpreter.
-///
-/// # Safety
-/// As [`run`], and `pc` must be an instruction boundary.
-pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -> Value {
+/// operand `< frame.regs().len()`, every jump landing on an instruction
+/// boundary, and every path ending in `Return`. There is no verifier yet.
+pub unsafe fn run_frame(
+    code: &[u8],
+    pc: usize,
+    acc: Value,
+    frame: &mut Frame,
+    budget: i64,
+) -> (Run, i64) {
+    frame.set_budget(budget.max(1));
     let pc = unsafe { code.as_ptr().add(pc) };
     // Launder the tables (and, in `NumberTag::new`, the tag) so LLVM can't
     // fold them back into constants (`lea`/`movabs`) in every handler. They
@@ -523,5 +711,43 @@ pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -
     let tbl: &'static Table = std::hint::black_box(&TABLE);
     let ti32: &'static Table = std::hint::black_box(&TABLE_I32);
     let tag = NumberTag::new();
-    unsafe { (tbl.0[*pc as usize])(pc, acc, regs.as_mut_ptr(), tag, tbl, ti32) }
+    let regs = frame.regs().as_mut_ptr();
+    let v = unsafe { (tbl.0[*pc as usize])(pc, acc, regs, tag, tbl, ti32) };
+    let left = frame.budget();
+    if v != Value::EMPTY {
+        return (Run::Return(v), left);
+    }
+    let target = frame.slots[HEADER - OSR_PC].to_bits() as usize;
+    let acc = frame.slots[HEADER - OSR_ACC];
+    (
+        Run::Osr {
+            pc: target - code.as_ptr() as usize,
+            acc,
+        },
+        left,
+    )
+}
+
+/// Run `code` over the register file `regs` and return the accumulator at
+/// `Return`. The accumulator starts as `undefined`.
+///
+/// # Safety
+/// As [`run_frame`], with register operands `< regs.len()`.
+pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
+    unsafe { run_from(code, 0, Value::UNDEFINED, regs) }
+}
+
+/// Run `code` from bytecode offset `pc` with accumulator `acc`, without
+/// tiering up.
+///
+/// # Safety
+/// As [`run`], and `pc` must be an instruction boundary.
+pub unsafe fn run_from(code: &[u8], pc: usize, acc: Value, regs: &mut [Value]) -> Value {
+    let mut frame = Frame::new(regs);
+    let (run, _) = unsafe { run_frame(code, pc, acc, &mut frame, i64::MAX) };
+    regs.copy_from_slice(frame.regs());
+    match run {
+        Run::Return(v) => v,
+        Run::Osr { .. } => unreachable!("an unlimited budget never runs out"),
+    }
 }

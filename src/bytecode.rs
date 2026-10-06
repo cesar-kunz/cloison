@@ -27,6 +27,14 @@ pub enum Op {
     AddSmi,
     /// `if acc < imm32 { pc += off32 }` (offset relative to this instruction)
     JumpIfLessSmi,
+    /// `Jump` backwards: a loop's back edge. Like V8's `JumpLoop`, the loop
+    /// forms count iterations in the interpreter, to tier up hot loops into
+    /// the JIT. The assembler emits them for jumps to already-bound labels.
+    JumpLoop,
+    /// `JumpIfLess` backwards.
+    JumpIfLessLoop,
+    /// `JumpIfLessSmi` backwards.
+    JumpIfLessSmiLoop,
     /// Return `acc` to the host.
     Return,
 }
@@ -45,6 +53,9 @@ impl Op {
         Op::Jump,
         Op::AddSmi,
         Op::JumpIfLessSmi,
+        Op::JumpLoop,
+        Op::JumpIfLessLoop,
+        Op::JumpIfLessSmiLoop,
         Op::Return,
     ];
 
@@ -58,9 +69,30 @@ impl Op {
         match self {
             Op::Nop | Op::Inc | Op::Return => 1,
             Op::Ldar | Op::Star | Op::Add => 2,
-            Op::LdaSmi | Op::Jump | Op::AddSmi => 5,
-            Op::JumpIfLess => 6,
-            Op::JumpIfLessSmi => 9,
+            Op::LdaSmi | Op::Jump | Op::JumpLoop | Op::AddSmi => 5,
+            Op::JumpIfLess | Op::JumpIfLessLoop => 6,
+            Op::JumpIfLessSmi | Op::JumpIfLessSmiLoop => 9,
+        }
+    }
+
+    /// The plain form of a loop opcode (`JumpLoop` → `Jump`, …); any other
+    /// opcode as is. They behave the same apart from counting iterations.
+    pub const fn plain(self) -> Op {
+        match self {
+            Op::JumpLoop => Op::Jump,
+            Op::JumpIfLessLoop => Op::JumpIfLess,
+            Op::JumpIfLessSmiLoop => Op::JumpIfLessSmi,
+            op => op,
+        }
+    }
+
+    /// The loop form of a jump opcode.
+    const fn looping(self) -> Op {
+        match self {
+            Op::Jump => Op::JumpLoop,
+            Op::JumpIfLess => Op::JumpIfLessLoop,
+            Op::JumpIfLessSmi => Op::JumpIfLessSmiLoop,
+            op => op,
         }
     }
 }
@@ -131,9 +163,19 @@ impl Assembler {
     pub fn inc(&mut self) -> &mut Self {
         self.op(Op::Inc)
     }
+    /// `op`, or its loop form if `l` is already bound (a backward jump).
+    fn jump_op(&self, op: Op, l: Label) -> Op {
+        if self.labels[l.0].is_some() {
+            op.looping()
+        } else {
+            op
+        }
+    }
+
     pub fn jump_if_less(&mut self, r: u8, l: Label) -> &mut Self {
         let start = self.code.len();
-        self.op(Op::JumpIfLess).reg(r).jump_to(start, l);
+        let op = self.jump_op(Op::JumpIfLess, l);
+        self.op(op).reg(r).jump_to(start, l);
         self
     }
     pub fn add_smi(&mut self, v: i32) -> &mut Self {
@@ -141,12 +183,14 @@ impl Assembler {
     }
     pub fn jump_if_less_smi(&mut self, v: i32, l: Label) -> &mut Self {
         let start = self.code.len();
-        self.op(Op::JumpIfLessSmi).imm(v).jump_to(start, l);
+        let op = self.jump_op(Op::JumpIfLessSmi, l);
+        self.op(op).imm(v).jump_to(start, l);
         self
     }
     pub fn jump(&mut self, l: Label) -> &mut Self {
         let start = self.code.len();
-        self.op(Op::Jump).jump_to(start, l);
+        let op = self.jump_op(Op::Jump, l);
+        self.op(op).jump_to(start, l);
         self
     }
     pub fn ret(&mut self) -> &mut Self {

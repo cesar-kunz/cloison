@@ -152,3 +152,134 @@ fn jump_if_less_slow_paths() {
     assert!(!lt(Value::UNDEFINED, one) && !lt(one, Value::UNDEFINED));
     assert!(lt(Value::NULL, one) && lt(Value::FALSE, Value::TRUE));
 }
+
+// ---- Immediate-operand opcodes and I32 accumulator-state transitions ----
+// With `acc-i32`, `lda_smi`/`add`/`inc` leave the accumulator unboxed in the
+// I32 state; these cover every way out of it. They also run without the
+// feature, where they exercise the plain ANY handlers.
+
+#[test]
+fn add_smi() {
+    let mut a = Assembler::new();
+    a.lda_smi(40).add_smi(2).ret();
+    assert_eq!(exec(a, &mut []), Value::from_i32(42));
+    // From ANY (after ldar), and negative immediates.
+    let mut a = Assembler::new();
+    a.ldar(0).add_smi(-50).ret();
+    assert_eq!(exec(a, &mut [Value::from_i32(8)]), Value::from_i32(-42));
+}
+
+#[test]
+fn add_smi_slow_paths() {
+    let mut a = Assembler::new();
+    a.lda_smi(i32::MAX).add_smi(1).ret();
+    assert_eq!(exec(a, &mut []).as_number(), Some(2147483648.0));
+    let mut a = Assembler::new();
+    a.lda_smi(i32::MIN).add_smi(-1).ret();
+    assert_eq!(exec(a, &mut []).as_number(), Some(-2147483649.0));
+    let mut a = Assembler::new();
+    a.ldar(0).add_smi(1).ret();
+    assert_eq!(exec(a, &mut [Value::from_f64(0.5)]).as_number(), Some(1.5));
+    assert_eq!(exec_add_smi_on(Value::NULL), Some(1.0));
+}
+
+fn exec_add_smi_on(v: Value) -> Option<f64> {
+    let mut a = Assembler::new();
+    a.ldar(0).add_smi(1).ret();
+    exec(a, &mut [v]).as_number()
+}
+
+#[test]
+fn jump_if_less_smi() {
+    // Returns 1 if r0 < 10, else 0.
+    let lt10 = |x: Value| {
+        let mut a = Assembler::new();
+        let yes = a.label();
+        a.ldar(0).jump_if_less_smi(10, yes);
+        a.lda_smi(0).ret();
+        a.bind(yes);
+        a.lda_smi(1).ret();
+        exec(a, &mut [x]) == Value::from_i32(1)
+    };
+    assert!(lt10(Value::from_i32(9)) && !lt10(Value::from_i32(10)));
+    assert!(lt10(Value::from_i32(i32::MIN)) && !lt10(Value::from_i32(i32::MAX)));
+    assert!(lt10(Value::from_f64(9.5)) && !lt10(Value::from_f64(10.5)));
+    assert!(!lt10(Value::UNDEFINED) && lt10(Value::NULL));
+}
+
+#[test]
+fn i32_state_overflow_recovers_original_acc() {
+    // acc is unboxed in I32 when the add overflows; the slow path must see
+    // the original operands, not the wrapped sum.
+    let mut a = Assembler::new();
+    a.lda_smi(i32::MAX - 1)
+        .star(0)
+        .lda_smi(i32::MAX)
+        .add(0)
+        .ret();
+    assert_eq!(
+        exec(a, &mut [Value::UNDEFINED]).as_number(),
+        Some(2.0 * i32::MAX as f64 - 1.0)
+    );
+    let mut a = Assembler::new();
+    a.lda_smi(i32::MIN).star(0).add(0).ret();
+    assert_eq!(
+        exec(a, &mut [Value::UNDEFINED]).as_number(),
+        Some(2.0 * i32::MIN as f64)
+    );
+}
+
+#[test]
+fn i32_state_add_with_non_int_rhs() {
+    let mut a = Assembler::new();
+    a.lda_smi(1).add(0).ret();
+    assert_eq!(
+        exec(a, &mut [Value::from_f64(0.25)]).as_number(),
+        Some(1.25)
+    );
+}
+
+#[test]
+fn i32_state_jump_with_non_int_rhs() {
+    let mut a = Assembler::new();
+    let yes = a.label();
+    a.lda_smi(1).jump_if_less(0, yes);
+    a.lda_smi(0).ret();
+    a.bind(yes);
+    a.lda_smi(1).ret();
+    assert_eq!(exec(a, &mut [Value::from_f64(1.5)]), Value::from_i32(1));
+}
+
+#[test]
+fn i32_state_star_stores_boxed_values() {
+    // Unboxed results must be boxed when stored, including negative ones
+    // (whose unboxed form has high bits clear).
+    let mut regs = [Value::UNDEFINED; 3];
+    let mut a = Assembler::new();
+    a.lda_smi(-5)
+        .inc()
+        .star(0)
+        .add_smi(10)
+        .star(1)
+        .add(1)
+        .star(2)
+        .ret();
+    let r = exec(a, &mut regs);
+    assert_eq!(
+        regs,
+        [Value::from_i32(-4), Value::from_i32(6), Value::from_i32(12)]
+    );
+    assert_eq!(r, Value::from_i32(12));
+}
+
+#[test]
+fn i32_state_survives_jumps_and_nops() {
+    let mut a = Assembler::new();
+    let (l1, l2) = (a.label(), a.label());
+    a.lda_smi(1).jump(l1);
+    a.bind(l2);
+    a.inc().ret();
+    a.bind(l1);
+    a.nop().inc().jump(l2);
+    assert_eq!(exec(a, &mut []), Value::from_i32(3));
+}

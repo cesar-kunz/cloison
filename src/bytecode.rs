@@ -22,6 +22,11 @@ pub enum Op {
     JumpIfLess,
     /// `pc += off32` (offset relative to this instruction)
     Jump,
+    /// `acc = acc + imm32`. Like V8's `AddSmi`, it saves the operand fetch
+    /// and its type check.
+    AddSmi,
+    /// `if acc < imm32 { pc += off32 }` (offset relative to this instruction)
+    JumpIfLessSmi,
     /// Return `acc` to the host.
     Return,
 }
@@ -34,8 +39,9 @@ impl Op {
         match self {
             Op::Nop | Op::Inc | Op::Return => 1,
             Op::Ldar | Op::Star | Op::Add => 2,
-            Op::LdaSmi | Op::Jump => 5,
+            Op::LdaSmi | Op::Jump | Op::AddSmi => 5,
             Op::JumpIfLess => 6,
+            Op::JumpIfLessSmi => 9,
         }
     }
 }
@@ -76,6 +82,11 @@ impl Assembler {
         self
     }
 
+    fn imm(&mut self, v: i32) -> &mut Self {
+        self.code.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
     /// Emit a placeholder offset for the jump instruction that starts at `start`.
     fn jump_to(&mut self, start: usize, l: Label) {
         let at = self.code.len();
@@ -87,9 +98,7 @@ impl Assembler {
         self.op(Op::Nop)
     }
     pub fn lda_smi(&mut self, v: i32) -> &mut Self {
-        self.op(Op::LdaSmi);
-        self.code.extend_from_slice(&v.to_le_bytes());
-        self
+        self.op(Op::LdaSmi).imm(v)
     }
     pub fn ldar(&mut self, r: u8) -> &mut Self {
         self.op(Op::Ldar).reg(r)
@@ -106,6 +115,14 @@ impl Assembler {
     pub fn jump_if_less(&mut self, r: u8, l: Label) -> &mut Self {
         let start = self.code.len();
         self.op(Op::JumpIfLess).reg(r).jump_to(start, l);
+        self
+    }
+    pub fn add_smi(&mut self, v: i32) -> &mut Self {
+        self.op(Op::AddSmi).imm(v)
+    }
+    pub fn jump_if_less_smi(&mut self, v: i32, l: Label) -> &mut Self {
+        let start = self.code.len();
+        self.op(Op::JumpIfLessSmi).imm(v).jump_to(start, l);
         self
     }
     pub fn jump(&mut self, l: Label) -> &mut Self {

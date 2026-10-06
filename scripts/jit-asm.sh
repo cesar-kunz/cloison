@@ -4,7 +4,7 @@
 #   scripts/jit-asm.sh int smi            # host (x86-64)
 #   scripts/jit-asm.sh int smi aarch64    # arm64, run under qemu
 #
-# N (default 10) is the iteration count, ENGINE (default jit) jit or jit1.
+# N (default 10) is the iteration count, ENGINE (default jit) jit, jit2 or jit1.
 # The code shown is the last compiled: for `double` with N > 65536, the
 # recompile after the int32 overflow exit.
 set -euo pipefail

@@ -1,6 +1,7 @@
-//! Every program runs on three engines: the interpreter, the JIT with
-//! generic stencils, and the JIT with type-specialized stencils. They must
-//! agree on the result and on the final register file.
+//! Every program runs on four engines: the interpreter, the JIT with
+//! generic stencils (milestone 1), with type-specialized stencils
+//! (milestone 2), and with VM registers in machine registers (milestone 3).
+//! They must agree on the result and on the final register file.
 
 use toi::bytecode::Assembler;
 use toi::jit::JitFunction;
@@ -25,6 +26,7 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
     let interp = unsafe { toi::interp::run(&code, regs) };
     for (name, mut f) in [
         ("jit1", JitFunction::new(&code).unspecialized()),
+        ("jit2", JitFunction::new(&code).without_register_homes()),
         ("jit", JitFunction::new(&code)),
     ] {
         let mut jit_regs = initial.clone();
@@ -327,14 +329,32 @@ fn jit(a: &Assembler, regs: &mut [Value]) -> (Value, JitFunction) {
     (v, f)
 }
 
-fn stencils(f: &JitFunction) -> Vec<&'static str> {
+fn stencils(f: &JitFunction) -> Vec<String> {
     f.last_code()
         .unwrap()
         .stencils
         .iter()
         .flatten()
-        .copied()
+        .cloned()
         .collect()
+}
+
+/// Whether `suffix` is a location: `m`, `g<k>` or `f<k>`.
+fn is_loc(suffix: &str) -> bool {
+    suffix == "m"
+        || suffix
+            .strip_prefix(['g', 'f'])
+            .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether some selected stencil is `name`, or `name` at some location.
+fn has(s: &[String], name: &str) -> bool {
+    s.iter().any(|n| {
+        n == name
+            || n.strip_prefix(name)
+                .and_then(|r| r.strip_prefix('_'))
+                .is_some_and(is_loc)
+    })
 }
 
 #[test]
@@ -345,11 +365,11 @@ fn int_loop_is_fully_specialized() {
     assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
     let s = stencils(&f);
     assert!(
-        s.contains(&"add_ii") && s.contains(&"inc_i") && s.contains(&"jump_if_less_ii"),
+        has(&s, "add_ii") && has(&s, "inc_i") && has(&s, "jlt_ii"),
         "{s:?}"
     );
     assert!(
-        !s.iter().any(|n| ["add", "inc", "jump_if_less"].contains(n)),
+        !["add", "inc", "jlt"].iter().any(|g| has(&s, g)),
         "generic stencil in {s:?}"
     );
 }
@@ -363,7 +383,8 @@ fn overflow_exits_once_then_resumes_as_double() {
     assert_eq!(v.as_number(), Some((n * (n - 1) / 2) as f64));
     assert_eq!((f.stats.compiles, f.stats.exits), (2, 1));
     let s = stencils(&f);
-    assert!(s.contains(&"add_fi") && s.contains(&"inc_i"), "{s:?}");
+    assert!(has(&s, "add_fi") || has(&s, "add_ff"), "{s:?}");
+    assert!(has(&s, "inc_i"), "{s:?}");
 }
 
 #[test]
@@ -386,7 +407,7 @@ fn widening_join_converts_on_a_jump_edge() {
     let (v, f) = jit(&a, &mut regs);
     assert_eq!(v.as_number(), Some(5.0));
     assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
-    assert!(stencils(&f).contains(&"add_ff"), "{:?}", stencils(&f));
+    assert!(has(&stencils(&f), "add_ff"), "{:?}", stencils(&f));
 }
 
 #[test]
@@ -401,7 +422,7 @@ fn entry_types_come_from_the_live_values() {
     ] {
         let (r, f) = jit(&a, &mut [v]);
         assert_eq!(r.as_number(), Some(expected));
-        assert!(stencils(&f).contains(&stencil), "{v:?}: {:?}", stencils(&f));
+        assert!(has(&stencils(&f), stencil), "{v:?}: {:?}", stencils(&f));
     }
 }
 
@@ -419,4 +440,92 @@ fn too_many_recompiles_finish_in_the_interpreter() {
     assert_eq!(v.as_number(), Some(2147483648.0));
     assert!(regs.iter().all(|r| r.as_number() == Some(2147483648.0)));
     assert_eq!((f.stats.compiles, f.stats.exits), (16, 16));
+}
+
+// ---- VM registers in machine registers (milestone 3) ----
+
+use toi::jit::{GPR_SLOTS, Home};
+
+fn homes(f: &JitFunction) -> Vec<Home> {
+    f.last_code().unwrap().homes.clone()
+}
+
+#[test]
+fn loop_registers_live_in_machine_registers() {
+    let (v, f) = jit(&sum_loop(1000), &mut [Value::UNDEFINED; 3]);
+    assert_eq!(v, Value::from_i32(499500));
+    assert!(
+        homes(&f).iter().all(|h| matches!(h, Home::Gpr(_))),
+        "{:?}",
+        homes(&f)
+    );
+    let s = stencils(&f);
+    assert!(
+        s.iter().all(|n| !n.ends_with("_m")),
+        "memory access in {s:?}"
+    );
+}
+
+#[test]
+fn doubles_are_pinned_in_fp_registers() {
+    // After the overflow exit, the sum is a double everywhere in the loop,
+    // so the recompiled region keeps it unboxed in an FP register.
+    let n = 100_000i64;
+    let mut regs = [Value::UNDEFINED; 3];
+    let (v, f) = jit(&sum_loop(n as i32), &mut regs);
+    assert_eq!(v.as_number(), Some((n * (n - 1) / 2) as f64));
+    assert!(matches!(homes(&f)[0], Home::Fpr(_)), "{:?}", homes(&f));
+    assert!(has(&stencils(&f), "add_fi"), "{:?}", stencils(&f));
+    // Spilled back, boxed, at return.
+    assert_eq!(regs[0].as_number(), v.as_number());
+    assert_eq!(regs[1], Value::from_i32(n as i32));
+}
+
+#[test]
+fn exits_spill_cached_registers() {
+    // r1 is written in a GPR slot, then `add` overflows and exits; the
+    // interpreter-visible register file must have r1's new value.
+    let mut a = Assembler::new();
+    a.lda_smi(7).star(1).lda_smi(i32::MAX).star(0).add(0).ret();
+    let mut regs = [Value::UNDEFINED; 2];
+    let (v, f) = jit(&a, &mut regs);
+    assert_eq!(v.as_number(), Some(2.0 * i32::MAX as f64));
+    assert_eq!(regs[1], Value::from_i32(7));
+    assert_eq!(f.stats.exits, 1);
+}
+
+#[test]
+fn more_registers_than_slots_use_memory() {
+    // GPR_SLOTS + 3 counters incremented in a loop: the most used get slots,
+    // the rest stay in memory, and everything still agrees.
+    let k = GPR_SLOTS + 3;
+    let i = k as u8;
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0);
+    for r in 0..=k as u8 {
+        a.star(r);
+    }
+    a.bind(top);
+    for r in 0..k as u8 {
+        a.ldar(r).add_smi(r as i32 + 1).star(r);
+    }
+    a.ldar(i).inc().star(i).jump_if_less_smi(100, top);
+    a.ldar(0).ret();
+    let mut regs = vec![Value::UNDEFINED; k + 1];
+    exec(a.clone(), &mut regs.clone());
+    let (v, f) = jit(&a, &mut regs);
+    assert_eq!(v, Value::from_i32(100));
+    let h = homes(&f);
+    assert_eq!(
+        h.iter().filter(|h| matches!(h, Home::Gpr(_))).count(),
+        GPR_SLOTS
+    );
+    assert_eq!(
+        h.iter().filter(|h| **h == Home::Mem).count(),
+        k + 1 - GPR_SLOTS
+    );
+    for (r, v) in regs.iter().enumerate().take(k) {
+        assert_eq!(*v, Value::from_i32(100 * (r as i32 + 1)), "r{r}");
+    }
 }

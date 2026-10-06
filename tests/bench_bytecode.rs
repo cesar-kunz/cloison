@@ -55,17 +55,27 @@ fn listing(name: &str) -> toi::asm::Module {
 #[test]
 fn hot_property_loops_compile_without_repeated_guards() {
     // 34: the loop only replaces fields of `c`, whose shape is known from
-    // entry, so none of its accesses is guarded.
+    // entry, and the objects it reaches come from fields typed with their
+    // shapes, holding int32 values: no access is guarded, and the
+    // comparisons are on int32s.
     let mut vm = Vm::new();
     vm.run(&listing("34-chained-loads.asm")).unwrap();
     let s = vm.jit_stencils("main").expect("main's loop compiled");
-    assert!(s.iter().any(|n| n.starts_with("get_own_nc_")), "{s:?}");
-    assert!(s.iter().any(|n| n.starts_with("set_own_nc_")), "{s:?}");
+    assert!(
+        s.iter()
+            .all(|n| !n.starts_with("get_") || n.starts_with("get_own_nc_")),
+        "{s:?}"
+    );
+    assert!(s.iter().any(|n| n.contains("set_own_nc_")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("tlt_jf_ii_")), "{s:?}");
     // 21: `v = vs[i]` is guarded once, then known.
     let mut vm = Vm::new();
     vm.run(&listing("21-monomorphic-get.asm")).unwrap();
     let s = vm.jit_stencils("main").expect("main's loop compiled");
     assert!(s.iter().any(|n| n.starts_with("get_keyed_i_")), "{s:?}");
+    // `v.mark == r % 5` and `n += v.value` on int32 fields.
+    assert!(s.iter().any(|n| n.starts_with("teq_jt_ii_")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
     let guarded = s
         .iter()
         .filter(|n| n.starts_with("get_own_") && !n.contains("_nc_"))

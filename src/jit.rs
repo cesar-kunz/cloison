@@ -57,6 +57,7 @@
 
 use crate::bytecode::Op;
 use crate::interp::{self, Frame, Run};
+use crate::object::{Atom, FieldType, Object, Shape};
 use crate::value::{NumberTag, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -779,24 +780,31 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
 // ---- Inline-cache feedback (VM frames) ----
 
 /// What a property instruction's inline cache held when compiling, as
-/// stencil operands: the receiver's shape, then where the property is.
+/// stencil operands: the receiver's shape, where the property is, and the
+/// field's type (see `object::FieldType`): what a load gives, or what a
+/// store must check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Prop {
     /// Not a property instruction, or nothing cached: bail.
     None,
     /// In the receiver, at byte offset `off`.
-    Own { shape: u64, off: i32 },
+    Own { shape: u64, off: i32, ft: FieldType },
     /// In the receiver's out-of-line slots, at byte offset `off`.
-    Oop { shape: u64, off: i32 },
+    Oop { shape: u64, off: i32, ft: FieldType },
     /// In a prototype, at address `addr` (stable while no prototype
     /// changes shape; see [`JitFunction::vm_enter`]).
-    Proto { shape: u64, addr: u64 },
+    Proto {
+        shape: u64,
+        addr: u64,
+        ft: FieldType,
+    },
     /// A store adding the property: write `new_shape`, then the in-object
     /// slot at `off`.
     Transition {
         shape: u64,
         new_shape: u64,
         off: i32,
+        ft: FieldType,
     },
     /// A global, in the global object at `global`.
     Global {
@@ -804,6 +812,7 @@ pub(crate) enum Prop {
         global: u64,
         off: i32,
         oop: bool,
+        ft: FieldType,
     },
 }
 
@@ -811,16 +820,31 @@ pub(crate) enum Prop {
 #[derive(Clone, Copy)]
 pub(crate) struct Feedback {
     pub ics: *const crate::vm::Ic,
+    /// The property name of each inline-cache slot.
+    pub names: *const Atom,
     pub global: *mut crate::object::Object,
 }
 
+/// A slot location (`Shape::location`) as `(out of line, byte offset)`.
+fn split_location(loc: i32) -> (bool, i32) {
+    if loc >= 0 {
+        (false, loc)
+    } else {
+        (true, !loc * 8)
+    }
+}
+
 impl Feedback {
+    /// The property name a property instruction accesses.
+    fn name(&self, insn: &Insn) -> Atom {
+        unsafe { *self.names.add(insn.imm as usize) }
+    }
+
     /// What instruction `insn`'s inline cache says, for the stencil, under
     /// prototype epoch `epoch`. A prototype load cached under another epoch
     /// says nothing: its holder may be shadowed now, and the interpreter
     /// hasn't re-run the access to find out.
     fn prop(&self, insn: &Insn, epoch: u32) -> Prop {
-        use crate::object::Object;
         if insn.bail
             || !matches!(
                 insn.op,
@@ -834,43 +858,51 @@ impl Feedback {
             return Prop::None;
         }
         let shape = ic.shape as u64;
-        let at = |loc: i32| {
-            if loc >= 0 {
-                (false, loc)
-            } else {
-                (true, !loc * 8)
-            }
-        };
+        let (oop, off) = split_location(ic.loc);
         // Stencils take the offset in 16 bits on arm64.
-        if at(ic.loc).1 > 0xFFFF {
+        if off > 0xFFFF {
             return Prop::None;
         }
+        let name = self.name(insn);
+        let field = |s: *const Shape| {
+            let s = unsafe { &*s };
+            s.lookup(name).map_or(FieldType::Any, |k| s.field_type(k))
+        };
+        // For loads, `holder` is a prototype; for stores, the field's type.
+        let holder = ic.holder;
         match insn.op {
-            Op::GetNamed if !ic.holder.is_null() && ic.epoch != epoch => Prop::None,
-            Op::GetNamed if !ic.holder.is_null() => Prop::Proto {
+            Op::GetNamed if !holder.is_null() && ic.epoch != epoch => Prop::None,
+            Op::GetNamed if !holder.is_null() => Prop::Proto {
                 shape,
-                addr: unsafe { Object::slot(ic.holder, ic.loc) } as u64,
+                addr: unsafe { Object::slot(holder, ic.loc) } as u64,
+                ft: field(unsafe { (*holder).shape }),
             },
             Op::SetNamed if !ic.new_shape.is_null() => Prop::Transition {
                 shape,
                 new_shape: ic.new_shape as u64,
-                off: ic.loc,
+                off,
+                ft: field(ic.new_shape),
             },
-            Op::GetNamed | Op::SetNamed => match at(ic.loc) {
-                (false, off) => Prop::Own { shape, off },
-                (true, off) => Prop::Oop { shape, off },
+            Op::GetNamed | Op::SetNamed if oop => Prop::Oop {
+                shape,
+                off,
+                ft: field(ic.shape),
+            },
+            Op::GetNamed | Op::SetNamed => Prop::Own {
+                shape,
+                off,
+                ft: field(ic.shape),
             },
             // Only own properties of the global object are compiled.
-            _ if !ic.holder.is_null() || !ic.new_shape.is_null() => Prop::None,
-            _ => {
-                let (oop, off) = at(ic.loc);
-                Prop::Global {
-                    shape,
-                    global: self.global as u64,
-                    off,
-                    oop,
-                }
-            }
+            Op::LdaGlobal if !holder.is_null() => Prop::None,
+            Op::StaGlobal if !ic.new_shape.is_null() => Prop::None,
+            _ => Prop::Global {
+                shape,
+                global: self.global as u64,
+                off,
+                oop,
+                ft: field(ic.shape),
+            },
         }
     }
 }
@@ -882,7 +914,11 @@ impl Feedback {
 /// an int32 converts losslessly to a double, so an edge carrying `I32` into
 /// an `F64` point gets a conversion stencil.
 ///
-/// `Obj(s)` is an object whose shape is `s` (the address of its `Shape`).
+/// `Obj(s)` is an object whose shape is `s` (the address of its `Shape`);
+/// `Ext(s)` one whose shape is `s` or one of its descendants, so it has
+/// `s`'s own properties where `s` has them (`Obj(s) < Ext(s) < Any`).
+/// Loads from a field typed `Obj(s)` give `Ext(s)`: the object may have
+/// gained properties since it was stored (see `object::FieldType`).
 /// Values get it at entry, from the live values, and from a property
 /// access's shape guard, which then needn't be repeated. A transitioning
 /// store forgets every `Obj` fact but its receiver's. Between transitions
@@ -896,6 +932,7 @@ pub enum Ty {
     I32,
     F64,
     Obj(u64),
+    Ext(u64),
     Any,
 }
 
@@ -920,12 +957,28 @@ impl Ty {
             (a, b) if a == b => a,
             (Bot, t) | (t, Bot) => t,
             (I32, F64) | (F64, I32) => F64,
+            (Obj(a) | Ext(a), Obj(b) | Ext(b)) if a == b => Ext(a),
             _ => Any,
         }
     }
 
-    fn is_obj(self) -> bool {
-        matches!(self, Ty::Obj(_))
+    /// The shape an object type knows.
+    fn shape(self) -> Option<u64> {
+        match self {
+            Ty::Obj(s) | Ty::Ext(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The type of values loaded from a field of type `ft`, and the piece
+    /// that puts it in its representation (a number goes to `facc`).
+    fn of_field(ft: FieldType) -> (Ty, Option<&'static str>) {
+        match ft {
+            FieldType::Int => (Ty::I32, None),
+            FieldType::Num => (Ty::F64, Some("unbox_num_acc")),
+            FieldType::Obj(s) => (Ty::Ext(s as u64), None),
+            FieldType::None | FieldType::Any => (Ty::Any, None),
+        }
     }
 }
 
@@ -987,6 +1040,8 @@ struct Spec<'a> {
     /// Per instruction: an int32 add whose result only feeds the bitwise
     /// operation right after it, so it may wrap (`(a + b) | 0`).
     wraps: &'a [bool],
+    /// For VM functions: property names, and shapes' field types.
+    feedback: Option<&'a Feedback>,
 }
 
 /// What [`select`] decided for one instruction: the stencil family, the
@@ -996,6 +1051,28 @@ struct Sel {
     base: &'static str,
     case: &'static str,
     out: TypeState,
+    /// The stencil's operands `(imm, imm64, imm64b)`, if `select` worked
+    /// them out (property accesses on a known shape).
+    ops: Option<(i32, u64, u64)>,
+    /// A piece checking `acc` before the stencil, with its `imm64`: a
+    /// store's value against the field's type. It exits before the
+    /// instruction.
+    check: Option<(&'static str, u64)>,
+    /// A piece after the stencil (`unbox_num_acc`).
+    post: Option<&'static str>,
+}
+
+impl Sel {
+    fn new(base: &'static str, case: &'static str, out: TypeState) -> Sel {
+        Sel {
+            base,
+            case,
+            out,
+            ops: None,
+            check: None,
+            post: None,
+        }
+    }
 }
 
 /// The type case of a one-operand number operation on `acc`.
@@ -1031,13 +1108,15 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             ..*spec
         };
         let Sel { base, case, .. } = select(insn, i, &any, &no);
+        // Generic code knows no shapes.
+        let (base, case) = if case == "nc" {
+            ("bail", "")
+        } else {
+            (base, case)
+        };
         // Generic code keeps `acc` boxed, so `lda_smi`, not `lda_smi_i`.
         let case = if base == "lda_smi" { "" } else { case };
-        return Sel {
-            base,
-            case,
-            out: any,
-        };
+        return Sel::new(base, case, any);
     };
     let mut out = st.clone();
     let reg = st.regs.get(insn.reg as usize).copied().unwrap_or(Any);
@@ -1192,78 +1271,142 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // Property accesses. A receiver known to be a number has no
         // properties the cache could describe: leave it to the interpreter.
         Op::GetNamed | Op::SetNamed | Op::GetKeyed if matches!(reg, I32 | F64) => ("bail", ""),
-        // The guard is skipped (`_nc`) when the receiver's shape is known to
-        // be the cached one; a receiver known to have another shape would
-        // always fail it. A guard that passed makes the shape known.
-        Op::GetNamed | Op::SetNamed => {
-            let prop = spec.props.get(i).copied().unwrap_or(Prop::None);
-            let shape = match prop {
-                Prop::Own { shape, .. }
-                | Prop::Oop { shape, .. }
-                | Prop::Proto { shape, .. }
-                | Prop::Transition { shape, .. } => shape,
-                _ => {
-                    return Sel {
-                        base: "bail",
-                        case: "",
-                        out,
-                    };
-                }
-            };
-            let known = reg == Ty::Obj(shape);
-            if reg.is_obj() && !known {
-                return Sel {
-                    base: "bail",
-                    case: "",
-                    out,
-                };
-            }
-            let r = insn.reg as usize;
-            out.regs[r] = Ty::Obj(shape);
-            if insn.op == Op::GetNamed {
-                out.acc = Any;
-            }
-            let case = if known { "nc" } else { "" };
-            match prop {
-                Prop::Own { .. } if insn.op == Op::GetNamed => ("get_own", case),
-                Prop::Oop { .. } if insn.op == Op::GetNamed => ("get_oop", case),
-                Prop::Proto { .. } => ("get_proto", case),
-                Prop::Own { .. } => ("set_own", case),
-                Prop::Oop { .. } => ("set_oop", case),
-                Prop::Transition { new_shape, .. } => {
-                    // The object changes shape: forget every shape fact, as
-                    // another register may hold the same object.
-                    for t in out.regs.iter_mut().chain(std::iter::once(&mut out.acc)) {
-                        if t.is_obj() {
-                            *t = Any;
-                        }
-                    }
-                    out.regs[r] = Ty::Obj(new_shape);
-                    ("set_tr", "")
-                }
-                _ => unreachable!(),
-            }
+        Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal => {
+            return select_property(insn, i, st, spec);
         }
-        Op::LdaGlobal => {
-            out.acc = Any;
-            match spec.props.get(i).copied().unwrap_or(Prop::None) {
-                Prop::Global { oop: false, .. } => ("lda_global", ""),
-                Prop::Global { oop: true, .. } => ("lda_global_oop", ""),
-                _ => ("bail", ""),
-            }
-        }
-        Op::StaGlobal => match spec.props.get(i).copied().unwrap_or(Prop::None) {
-            Prop::Global { oop: false, .. } => ("sta_global", ""),
-            Prop::Global { oop: true, .. } => ("sta_global_oop", ""),
-            _ => ("bail", ""),
-        },
         Op::GetKeyed => {
             out.acc = Any;
             ("get_keyed", if st.acc == I32 { "i" } else { "" })
         }
         op => unreachable!("rejected by decode: {op:?}"),
     };
-    Sel { base, case, out }
+    Sel::new(base, case, out)
+}
+
+/// `select` for `GetNamed`, `SetNamed`, `LdaGlobal` and `StaGlobal`.
+///
+/// - A receiver whose shape is known (`Obj` or `Ext`) and has the property
+///   needs no guard and no cache: the shape says where it is.
+/// - Otherwise the inline cache does, with a guard unless the receiver's
+///   exact shape is the cached one; a guard that passed makes it known.
+///   A receiver known to have another exact shape would fail it: bail.
+/// - A load is typed by the field's type. A store checks the value against
+///   it, unless the value's type proves it fits (or proves it doesn't:
+///   bail, and let the interpreter generalize the field).
+/// - A transitioning store downgrades every `Obj` fact to `Ext`, as another
+///   register may hold the same object.
+fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
+    use Ty::{Any, F64, I32};
+    let mut out = st.clone();
+    let bail = |out: TypeState| Sel::new("bail", "", out);
+    let reg = st.regs.get(insn.reg as usize).copied().unwrap_or(Any);
+    let prop = spec.props.get(i).copied().unwrap_or(Prop::None);
+    let load = matches!(insn.op, Op::GetNamed | Op::LdaGlobal);
+    // The check a store of `acc` into a field of type `ft` needs; `Err` if
+    // `acc` can't fit.
+    let check = |ft: FieldType| -> Result<Option<(&'static str, u64)>, ()> {
+        match (ft, st.acc) {
+            (FieldType::None | FieldType::Any, _) => Ok(None),
+            (FieldType::Int, I32) | (FieldType::Num, I32 | F64) => Ok(None),
+            (FieldType::Int, F64) => Err(()),
+            (FieldType::Int, _) => Ok(Some(("check_acc_int", 0))),
+            (FieldType::Num, _) => Ok(Some(("check_acc_num", 0))),
+            (FieldType::Obj(s), acc) if acc == Ty::Obj(s as u64) => Ok(None),
+            (FieldType::Obj(_), I32 | F64) => Err(()),
+            (FieldType::Obj(s), _) => Ok(Some(("check_acc_shape", s as u64))),
+        }
+    };
+    // Finish a selection: a load's result type, or a store's check.
+    let finish = |mut sel: Sel, ft: FieldType| -> Sel {
+        if load {
+            let (t, post) = Ty::of_field(ft);
+            sel.out.acc = t;
+            sel.post = post;
+            sel
+        } else {
+            match check(ft) {
+                Ok(c) => {
+                    sel.check = c;
+                    sel
+                }
+                Err(()) => bail(sel.out),
+            }
+        }
+    };
+
+    if matches!(insn.op, Op::GetNamed | Op::SetNamed) {
+        if matches!(reg, I32 | F64) {
+            return bail(out);
+        }
+        // A known shape with the property.
+        if let (Some(s), Some(fb)) = (reg.shape(), spec.feedback) {
+            let shape = unsafe { &*(s as *const Shape) };
+            if let Some(slot) = shape.lookup(fb.name(insn)) {
+                let (oop, off) = split_location(shape.location(slot));
+                if off <= 0xFFFF {
+                    let base = match (load, oop) {
+                        (true, false) => "get_own",
+                        (true, true) => "get_oop",
+                        (false, false) => "set_own",
+                        (false, true) => "set_oop",
+                    };
+                    let sel = Sel {
+                        ops: Some((off, 0, 0)),
+                        ..Sel::new(base, "nc", out)
+                    };
+                    return finish(sel, shape.field_type(slot));
+                }
+            }
+        }
+        let shape = match prop {
+            Prop::Own { shape, .. }
+            | Prop::Oop { shape, .. }
+            | Prop::Proto { shape, .. }
+            | Prop::Transition { shape, .. } => shape,
+            _ => return bail(out),
+        };
+        let exact = reg == Ty::Obj(shape);
+        if matches!(reg, Ty::Obj(_)) && !exact {
+            return bail(out);
+        }
+        let r = insn.reg as usize;
+        let case = if exact { "nc" } else { "" };
+        out.regs[r] = Ty::Obj(shape);
+        match prop {
+            Prop::Own { ft, .. } => finish(
+                Sel::new(if load { "get_own" } else { "set_own" }, case, out),
+                ft,
+            ),
+            Prop::Oop { ft, .. } => finish(
+                Sel::new(if load { "get_oop" } else { "set_oop" }, case, out),
+                ft,
+            ),
+            Prop::Proto { ft, .. } if load => finish(Sel::new("get_proto", case, out), ft),
+            Prop::Transition { new_shape, ft, .. } if !load => {
+                for t in out.regs.iter_mut().chain(std::iter::once(&mut out.acc)) {
+                    if let Ty::Obj(x) = *t {
+                        *t = Ty::Ext(x);
+                    }
+                }
+                out.regs[r] = Ty::Obj(new_shape);
+                finish(Sel::new("set_tr", "", out), ft)
+            }
+            _ => bail(out),
+        }
+    } else {
+        match prop {
+            Prop::Global { oop, ft, .. } => {
+                let base = match (load, oop) {
+                    (true, false) => "lda_global",
+                    (true, true) => "lda_global_oop",
+                    (false, false) => "sta_global",
+                    (false, true) => "sta_global_oop",
+                };
+                finish(Sel::new(base, "", out), ft)
+            }
+            _ => bail(out),
+        }
+    }
 }
 
 /// Forward dataflow from `entry` (instruction index) with `entry_state`.
@@ -2437,6 +2580,7 @@ impl JitCode {
         widened: &HashSet<usize>,
         opts: Options,
         props: &[Prop],
+        feedback: Option<&Feedback>,
     ) -> JitCode {
         let n = insns.len();
         let nregs = actual.regs.len();
@@ -2493,6 +2637,7 @@ impl JitCode {
             reg_live: &live_in,
             props,
             wraps: &wraps,
+            feedback,
         };
         let ins1 = infer(insns, entry, actual_live.clone(), &spec1);
         let no_widening = HashSet::new();
@@ -2680,17 +2825,21 @@ impl JitCode {
             // `mod_smi_pow2` takes the mask, k - 1; the other specialized
             // `mod_smi` stencils take k and ⌈2^64 / k⌉.
             let (imm, imm64, imm64b) = match (name.as_str(), props.get(i).copied()) {
+                _ if s.ops.is_some() => s.ops.unwrap(),
                 (n, _) if n.starts_with("mod_smi_pow2") => (insn.imm - 1, 0, 0),
                 ("mod_smi_i" | "mod_smi_iif", _) => (insn.imm, u64::MAX / insn.imm as u64 + 1, 0),
                 ("bail", _) => (0, 0, 0),
-                (_, Some(Prop::Own { shape, off } | Prop::Oop { shape, off })) => (off, shape, 0),
-                (_, Some(Prop::Proto { shape, addr })) => (0, shape, addr),
+                (_, Some(Prop::Own { shape, off, .. } | Prop::Oop { shape, off, .. })) => {
+                    (off, shape, 0)
+                }
+                (_, Some(Prop::Proto { shape, addr, .. })) => (0, shape, addr),
                 (
                     _,
                     Some(Prop::Transition {
                         shape,
                         new_shape,
                         off,
+                        ..
                     }),
                 ) => (off, shape, new_shape),
                 (
@@ -2709,7 +2858,14 @@ impl JitCode {
                 imm64b,
                 ..Piece::with_imm(&name, imm)
             };
-            if main.uses(Sym::Exit) {
+            // A store's check of the value against the field's type exits
+            // before the instruction, like the stencil's own guard.
+            let check = s.check.map(|(name, imm64)| Piece {
+                imm64,
+                exit: i,
+                ..Piece::new(name, 0)
+            });
+            if main.uses(Sym::Exit) || check.is_some() {
                 // `add_smi_i` adds in place; undo it before anything else.
                 let mut seq: Vec<Piece> = Vec::new();
                 if name == "add_smi_i" {
@@ -2726,8 +2882,16 @@ impl JitCode {
                 });
                 exits.push((i, seq));
             }
+            hot.extend(check);
             hot.push(main);
-            names[i] = Some(name);
+            if let Some(post) = s.post {
+                hot.push(Piece::new(post, 0));
+            }
+            names[i] = Some(match (s.check, s.post) {
+                (Some((c, _)), _) => format!("{c}+{name}"),
+                (_, Some(p)) => format!("{name}+{p}"),
+                _ => name,
+            });
             i += 1;
         }
 
@@ -3031,6 +3195,9 @@ struct VmState {
     /// The prototype epoch the versions were compiled under: a prototype's
     /// slot addresses are only valid while it holds.
     epoch: u32,
+    /// The field epoch they were compiled under: the field types they
+    /// assume hold until it changes.
+    field_epoch: u32,
     /// Exits per property instruction; past [`MAX_PROPERTY_EXITS`] it is
     /// compiled as a bail.
     property_exits: HashMap<usize, u32>,
@@ -3098,6 +3265,7 @@ impl JitFunction {
             props: Vec::new(),
             stale: true,
             epoch: 0,
+            field_epoch: 0,
             property_exits: HashMap::new(),
             bail_exits: HashMap::new(),
             no_entry: HashSet::new(),
@@ -3108,8 +3276,9 @@ impl JitFunction {
     /// Run compiled code for a VM frame's registers `regs`, entering at the
     /// loop header at bytecode offset `pc` with `acc`, compiling a version
     /// if needed. Returns where the interpreter resumes, or `None` if this
-    /// entry isn't compiled (leave the frame to the interpreter). `epoch` is
-    /// the VM's prototype epoch: versions compiled under another are dropped.
+    /// entry isn't compiled (leave the frame to the interpreter). `epoch`
+    /// and `field_epoch` are the VM's prototype and field epochs: versions
+    /// compiled under others are dropped.
     ///
     /// Exits: at an int32 operation, the instruction is widened (as in
     /// [`JitFunction::run`]); at a property access, the interpreter updates
@@ -3125,6 +3294,7 @@ impl JitFunction {
         mut acc: Value,
         regs: &mut [Value],
         epoch: u32,
+        field_epoch: u32,
     ) -> Option<(usize, Value)> {
         let entry = self.index_of(pc);
         {
@@ -3139,20 +3309,20 @@ impl JitFunction {
                 .iter()
                 .map(|insn| vm.feedback.prop(insn, epoch))
                 .collect();
-            if vm.stale || vm.epoch != epoch || props != vm.props {
+            if vm.stale || vm.epoch != epoch || vm.field_epoch != field_epoch || props != vm.props {
                 self.versions.clear();
                 vm.epoch = epoch;
+                vm.field_epoch = field_epoch;
                 vm.insns = self.insns.clone();
+                // Accesses given up after too many exits bail. An access
+                // with nothing cached is left to `select_property`: a known
+                // shape may still say where the property is.
                 for (k, insn) in vm.insns.iter_mut().enumerate() {
-                    let uncached = matches!(
-                        insn.op,
-                        Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal
-                    ) && props[k] == Prop::None;
-                    let given_up = vm
+                    if vm
                         .property_exits
                         .get(&k)
-                        .is_some_and(|&n| n >= MAX_PROPERTY_EXITS);
-                    if uncached || given_up {
+                        .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
+                    {
                         insn.bail = true;
                     }
                 }
@@ -3296,11 +3466,19 @@ impl JitFunction {
                 };
                 self.stats.compiles += 1;
                 let code = {
-                    let (insns, props): (&[Insn], &[Prop]) = match &self.vm {
-                        Some(vm) => (&vm.insns, &vm.props),
-                        None => (&self.insns, &[]),
+                    let (insns, props, feedback): (&[Insn], &[Prop], _) = match &self.vm {
+                        Some(vm) => (&vm.insns, &vm.props, Some(&vm.feedback)),
+                        None => (&self.insns, &[], None),
                     };
-                    JitCode::compile(insns, entry, state.clone(), &self.widened, self.opts, props)
+                    JitCode::compile(
+                        insns,
+                        entry,
+                        state.clone(),
+                        &self.widened,
+                        self.opts,
+                        props,
+                        feedback,
+                    )
                 };
                 let vs = self.versions.entry(entry).or_insert(keep);
                 vs.push((state, code));
@@ -3435,6 +3613,7 @@ pub(crate) unsafe fn vm_osr(
     let f = slot.get_or_insert_with(|| {
         let feedback = Feedback {
             ics: code.ics.as_ptr().cast(),
+            names: code.ic_names.as_ptr(),
             global: vm.global,
         };
         Box::new(JitFunction::for_vm(
@@ -3445,7 +3624,7 @@ pub(crate) unsafe fn vm_osr(
     });
     let regs = unsafe { std::slice::from_raw_parts_mut(regs, code.nregs as usize) };
     let compiles = f.stats.compiles;
-    let r = unsafe { f.vm_enter(pc, acc, regs, vm.proto_epoch) };
+    let r = unsafe { f.vm_enter(pc, acc, regs, vm.proto_epoch, vm.field_epoch) };
     // Debugging: `TOI_JIT_LOG` prints each compilation's stencils;
     // `TOI_JIT_DUMP=<file>` writes the last one's hot code.
     if f.stats.compiles != compiles

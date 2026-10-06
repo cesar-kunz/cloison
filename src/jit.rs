@@ -45,9 +45,10 @@
 //! go to wrappers in JIT memory ([`arch::runtime_wrapper`]), so `rel32` /
 //! `CALL26` relocations only ever reach inside JIT memory. The wrappers save
 //! only the slot registers the region uses, instead of every stencil
-//! saving all of them around a C call. On arm64, operand holes are `adrp`+`add` pairs whose
-//! "address" is the operand value. `adrp` is page-relative with a ±4 GiB
-//! range, so JIT memory is mapped below 4 GiB there.
+//! saving all of them around a C call. Operand holes are absolute
+//! relocations (x86-64: immediates and displacements, some folded into the
+//! instruction through inline asm; arm64: `movz`/`movk`), so JIT memory can
+//! be anywhere.
 
 use crate::bytecode::Op;
 use crate::value::{NumberTag, Value};
@@ -73,14 +74,21 @@ pub(crate) struct Stencil {
 
 include!(concat!(env!("OUT_DIR"), "/stencils.rs"));
 
-fn stencil(name: &str) -> &'static Stencil {
+fn stencils_by_name() -> &'static HashMap<&'static str, &'static Stencil> {
     static BY_NAME: std::sync::OnceLock<HashMap<&'static str, &'static Stencil>> =
         std::sync::OnceLock::new();
-    BY_NAME
-        .get_or_init(|| STENCILS.iter().map(|s| (s.name, s)).collect())
+    BY_NAME.get_or_init(|| STENCILS.iter().map(|s| (s.name, s)).collect())
+}
+
+fn stencil(name: &str) -> &'static Stencil {
+    stencils_by_name()
         .get(name)
         .copied()
         .unwrap_or_else(|| panic!("no stencil `{name}`"))
+}
+
+fn has_stencil(name: &str) -> bool {
+    stencils_by_name().contains_key(name)
 }
 
 /// The `<name>__*` helpers of stencil `name`.
@@ -230,6 +238,8 @@ mod arch {
 #[cfg(target_arch = "aarch64")]
 mod arch {
     const R_AARCH64_ABS64: u32 = 257;
+    const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264;
+    const R_AARCH64_MOVW_UABS_G1_NC: u32 = 266;
     const R_AARCH64_ADR_PREL_PG_HI21: u32 = 275;
     const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
     const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
@@ -328,6 +338,16 @@ mod arch {
         let v = s.wrapping_add(a as u64);
         match r_type {
             R_AARCH64_ABS64 => buf[..8].copy_from_slice(&v.to_le_bytes()),
+            // movz / movk: imm16 at [20:5], bits 0–15 / 16–31 of the value.
+            R_AARCH64_MOVW_UABS_G0_NC | R_AARCH64_MOVW_UABS_G1_NC => {
+                let shift = if r_type == R_AARCH64_MOVW_UABS_G0_NC {
+                    0
+                } else {
+                    16
+                };
+                let imm16 = ((v >> shift) & 0xFFFF) as u32;
+                write(buf, (read(buf) & !(0xFFFF << 5)) | imm16 << 5);
+            }
             R_AARCH64_JUMP26 | R_AARCH64_CALL26 => {
                 write(buf, (read(buf) & !0x03FF_FFFF) | branch_disp(v, p, 26));
             }
@@ -419,26 +439,12 @@ impl ExecMem {
         let len = len.max(1).next_multiple_of(4096);
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-        // arm64 operand holes need JIT memory within adrp range (±4 GiB) of
-        // small values, i.e. below 4 GiB. Walk hints through the low 4 GiB;
-        // the kernel honours a hint when that range is free.
-        let hints: Vec<usize> = if cfg!(target_arch = "aarch64") {
-            (0x1000_0000..1 << 32).step_by(0x100_0000).collect()
-        } else {
-            vec![0]
-        };
-        for hint in hints {
-            let ptr = unsafe { libc::mmap(hint as *mut _, len, prot, flags, -1, 0) };
-            assert!(ptr != libc::MAP_FAILED, "mmap failed");
-            if cfg!(target_arch = "x86_64") || (ptr as usize) + len <= 1 << 32 {
-                return ExecMem {
-                    ptr: ptr.cast(),
-                    len,
-                };
-            }
-            unsafe { libc::munmap(ptr, len) };
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, flags, -1, 0) };
+        assert!(ptr != libc::MAP_FAILED, "mmap failed");
+        ExecMem {
+            ptr: ptr.cast(),
+            len,
         }
-        panic!("could not map JIT memory below 4 GiB");
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -977,6 +983,23 @@ struct Piece {
 }
 
 impl Piece {
+    /// The stencil `name` with immediate `imm`. On arm64, use its `_k16`
+    /// variant (one `movz` instead of `movz` + `movk`) when it has one and
+    /// the immediate fits.
+    fn with_imm(name: &str, imm: i32) -> Piece {
+        let k16 = format!("{name}_k16");
+        let fits = cfg!(target_arch = "aarch64") && (0..=0xFFFF).contains(&imm);
+        let name = if fits && has_stencil(&k16) {
+            k16.as_str()
+        } else {
+            name
+        };
+        Piece {
+            imm,
+            ..Piece::new(name, 0)
+        }
+    }
+
     fn new(name: &str, reg: u8) -> Piece {
         Piece {
             stencil: stencil(name),
@@ -1624,10 +1647,9 @@ impl JitCode {
                     Target::Next
                 };
                 let main = Piece {
-                    imm: f.imm,
                     jump,
                     exit: i + 1,
-                    ..Piece::new(&f.name, 0)
+                    ..Piece::with_imm(&f.name, f.imm)
                 };
                 if main.uses("toi_exit") {
                     // Exit before the arithmetic instruction, with `acc`
@@ -1665,15 +1687,22 @@ impl JitCode {
             };
             hot.extend(pre);
             let main = Piece {
-                imm: insn.imm,
                 reg: insn.reg,
                 jump,
                 exit: i,
-                ..Piece::new(&name, 0)
+                ..Piece::with_imm(&name, insn.imm)
             };
             if main.uses("toi_exit") {
                 assert_ne!(st.acc, Ty::F64, "exits happen at int32 operations");
-                let mut seq: Vec<Piece> = box_acc_piece(st.acc).into_iter().collect();
+                // `add_smi_i` adds in place; undo it before anything else.
+                let mut seq: Vec<Piece> = Vec::new();
+                if name == "add_smi_i" {
+                    seq.push(Piece {
+                        imm: insn.imm,
+                        ..Piece::new("undo_add_smi_i", 0)
+                    });
+                }
+                seq.extend(box_acc_piece(st.acc));
                 seq.extend(spills(&homes));
                 seq.push(Piece {
                     imm: insn.pc as i32,

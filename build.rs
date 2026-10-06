@@ -7,7 +7,8 @@
 //!    relocations.
 //! 3. On arm64, fold trailing branch stubs ([`fold_arm64_stubs`]) and
 //!    invert conditional branches over lone jumps
-//!    ([`invert_arm64_branch_over_jump`]).
+//!    ([`invert_arm64_branch_over_jump`]). On x86-64, fold the trailing stubs
+//!    that `asm goto` labels become ([`fold_x86_stubs`]).
 //! 4. Write `$OUT_DIR/stencils.rs`, included by `src/jit.rs`.
 //!
 //! The object file is kept as `$OUT_DIR/stencils.o` for inspection:
@@ -109,9 +110,13 @@ fn main() {
         }
 
         let mut code = code.to_vec();
-        if env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "aarch64" {
-            fold_arm64_stubs(&name, &mut code, &mut relocs);
-            invert_arm64_branch_over_jump(&mut code, &mut relocs);
+        match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
+            "aarch64" => {
+                fold_arm64_stubs(&name, &mut code, &mut relocs);
+                invert_arm64_branch_over_jump(&mut code, &mut relocs);
+            }
+            "x86_64" => fold_x86_stubs(&mut code, &mut relocs),
+            _ => {}
         }
         relocs.sort_by_key(|r| r.offset);
         let mut relocs_src = String::new();
@@ -314,4 +319,68 @@ fn delete_insn(code: &mut Vec<u8>, relocs: &mut [Reloc], y: usize) {
         r.offset -= 4;
     }
     code.drain(y..y + 4);
+}
+
+const R_X86_64_PC32: u32 = 2;
+const R_X86_64_PLT32: u32 = 4;
+
+/// x86-64 counterpart of [`fold_arm64_stubs`], for stencils using `asm goto`
+/// (immediates folded into `add` / `cmp`, see `stencils/stencils.rs`). A
+/// label block that tail-calls becomes a stub at the end, `L: jmp <symbol>`,
+/// after the hot path's `jmp toi_continue`, which then can't be trimmed. The
+/// asm jumps to it with a forced long form (`{disp32} jo L`), so retarget
+/// that `rel32` straight at `<symbol>` with a new relocation and drop the
+/// stub.
+///
+/// There's no x86 decoder here, so this is conservative: it folds only a
+/// stub reached by exactly one `jcc rel32` / `jmp rel32` (`0F 8x d32` /
+/// `E9 d32` with no relocation on it), and only if nothing that could be a
+/// short jump targets it. LLVM never emits long local jumps to such stubs
+/// itself, so in practice this matches just the `asm goto` sites.
+fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
+    loop {
+        let n = code.len();
+        if n < 7 || code[n - 5] != 0xE9 {
+            return;
+        }
+        let stub = n - 5;
+        let Some(sr) = relocs.iter().position(|r| {
+            r.offset == (stub + 1) as u64
+                && matches!(r.r_type, R_X86_64_PC32 | R_X86_64_PLT32)
+                && r.symbol != "toi_continue"
+        }) else {
+            return;
+        };
+        let covered = |at: usize| {
+            relocs
+                .iter()
+                .any(|r| (r.offset as usize..r.offset as usize + 4).contains(&at))
+        };
+        let rel32 = |f: usize| i32::from_le_bytes(code[f..f + 4].try_into().unwrap()) as i64;
+        let mut users = Vec::new();
+        for f in 1..stub.saturating_sub(3) {
+            let long_jcc = f >= 2 && code[f - 2] == 0x0F && (0x80..=0x8F).contains(&code[f - 1]);
+            if (long_jcc || code[f - 1] == 0xE9)
+                && (f - 2..f + 4).all(|at| !covered(at))
+                && f as i64 + 4 + rel32(f) == stub as i64
+            {
+                users.push(f);
+            }
+        }
+        let short_to_stub = (0..stub.saturating_sub(1)).any(|p| {
+            ((0x70..=0x7F).contains(&code[p]) || code[p] == 0xEB)
+                && p as i64 + 2 + code[p + 1] as i8 as i64 == stub as i64
+        });
+        if users.len() != 1 || short_to_stub {
+            return;
+        }
+        let target = relocs.remove(sr);
+        relocs.push(Reloc {
+            offset: users[0] as u64,
+            r_type: target.r_type,
+            symbol: target.symbol,
+            addend: target.addend,
+        });
+        code.truncate(stub);
+    }
 }

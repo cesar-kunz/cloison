@@ -529,3 +529,43 @@ fn more_registers_than_slots_use_memory() {
         assert_eq!(*v, Value::from_i32(100 * (r as i32 + 1)), "r{r}");
     }
 }
+
+#[test]
+fn runtime_calls_preserve_slot_registers() {
+    // Each iteration calls the runtime (`true + 1` takes the generic slow
+    // path) while 8 int counters sit in GPR slots (on arm64 including the
+    // caller-saved x0–x6), a double sits pinned in an FP slot, and the
+    // accumulator passes through `facc`. The per-region wrapper must
+    // preserve all of them.
+    let (d, b, t, i) = (8u8, 9u8, 10u8, 11u8);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(i);
+    for r in 0..8 {
+        a.star(r);
+    }
+    a.bind(top);
+    for r in 0..8u8 {
+        a.ldar(r).add_smi(r as i32 + 1).star(r);
+    }
+    a.ldar(d).add_smi(1).star(d);
+    a.ldar(b).add_smi(1).star(t);
+    a.ldar(i).inc().star(i).jump_if_less_smi(50, top);
+    a.ldar(d).ret();
+    let mut regs = vec![Value::UNDEFINED; 12];
+    regs[d as usize] = Value::from_f64(0.5);
+    regs[b as usize] = Value::TRUE;
+    let v = exec(a.clone(), &mut regs.clone());
+    assert_eq!(v.as_number(), Some(50.5));
+    let (_, f) = jit(&a, &mut regs);
+    assert!(
+        matches!(homes(&f)[d as usize], Home::Fpr(_)),
+        "{:?}",
+        homes(&f)
+    );
+    assert!(has(&stencils(&f), "add_smi"), "{:?}", stencils(&f));
+    for (r, v) in regs.iter().enumerate().take(8) {
+        assert_eq!(*v, Value::from_i32(50 * (r as i32 + 1)), "r{r}");
+    }
+    assert_eq!(regs[t as usize], Value::from_i32(2));
+}

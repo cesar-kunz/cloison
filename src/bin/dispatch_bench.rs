@@ -8,6 +8,8 @@
 //!   const   i = 0; while (i < n) { s = s + 3; i = i + 1 }          return s
 //!   chain   i = 0; while (i < n) { t = i + i + i + i; i = i + 1 }  return t
 //!   double  i = 0; while (i < n) { s = s + i; i = i + 1 }          return s
+//!   wide    i = 0; while (i < n) { a1 = a1 + 1; … a8 = a8 + 8; i = i + 1 }
+//!           return a8: 12 live VM registers, more than x86-64's 6 GPR slots
 //!
 //! codegen:
 //!   generic  constants in registers: `add r`, `jump_if_less r`
@@ -16,7 +18,8 @@
 //! engine:
 //!   interp   the tail-calling interpreter (default)
 //!   jit1     the copy-and-patch JIT with generic stencils only (milestone 1)
-//!   jit      the JIT with type-specialized stencils (milestone 2)
+//!   jit2     with type-specialized stencils, VM registers in memory (milestone 2)
+//!   jit      with VM registers in machine registers too (milestone 3)
 //!
 //! JIT timings include compilation, which happens on entry (and again after
 //! a side exit; `double` exits once when `s` overflows int32).
@@ -39,9 +42,13 @@ const S: u8 = 0;
 const I: u8 = 1;
 const LIMIT: u8 = 2;
 const K: u8 = 3;
+/// First of the eight `wide` accumulators.
+const A1: u8 = 4;
 
 fn usage() -> ! {
-    eprintln!("usage: dispatch_bench <int|const|chain|double> <generic|smi> [n] [interp|jit1|jit]");
+    eprintln!(
+        "usage: dispatch_bench <int|const|chain|double|wide> <generic|smi> [n] [interp|jit1|jit2|jit]"
+    );
     exit(2)
 }
 
@@ -60,7 +67,7 @@ fn main() {
         .map_or(100_000_000, |s| s.parse().unwrap_or_else(|_| usage()));
     assert!(n > 0, "the loop tests at the bottom, so n must be positive");
     let engine = args.get(4).map_or("interp", String::as_str);
-    if !matches!(engine, "interp" | "jit1" | "jit") {
+    if !matches!(engine, "interp" | "jit1" | "jit2" | "jit") {
         usage()
     }
     let nf = n as f64;
@@ -69,7 +76,10 @@ fn main() {
     let top = a.label();
     a.lda_smi(0).star(S).star(I);
     a.lda_smi(n).star(LIMIT);
-    a.lda_smi(3).star(K);
+    a.lda_smi(3).star(K).lda_smi(0);
+    for r in A1..A1 + 8 {
+        a.star(r);
+    }
     a.bind(top);
     let expected = match program.as_str() {
         "int" => {
@@ -94,6 +104,13 @@ fn main() {
             a.ldar(S).add(I).star(S);
             nf * (nf - 1.0) / 2.0
         }
+        "wide" => {
+            // a_k in registers A1.., added an immediate k (both codegens).
+            for k in 1..=8u8 {
+                a.ldar(A1 + k - 1).add_smi(k as i32).star(A1 + k - 1);
+            }
+            8.0 * nf
+        }
         _ => usage(),
     };
     a.ldar(I).inc().star(I);
@@ -102,13 +119,14 @@ fn main() {
     } else {
         a.jump_if_less(LIMIT, top);
     }
-    a.ldar(S).ret();
+    a.ldar(if program == "wide" { A1 + 7 } else { S }).ret();
     let code = a.finish();
 
-    let mut regs = [Value::UNDEFINED; 4];
+    let mut regs = [Value::UNDEFINED; 12];
     let mut jit = match engine {
         "jit" => Some(JitFunction::new(&code)),
         "jit1" => Some(JitFunction::new(&code).unspecialized()),
+        "jit2" => Some(JitFunction::new(&code).without_register_homes()),
         _ => None,
     };
     let start = Instant::now();

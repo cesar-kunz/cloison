@@ -758,7 +758,12 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::LdaGlobal | Op::StaGlobal if vm => {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
                 }
-                Op::GetKeyed if vm => reg = code[pc + 1],
+                Op::GetKeyed if vm => {
+                    (reg, imm) = (
+                        code[pc + 1],
+                        u16::from_le_bytes([code[pc + 2], code[pc + 3]]) as i32,
+                    )
+                }
                 _ if vm => bail = true,
                 op => panic!("the JIT does not compile {op:?} yet"),
             }
@@ -814,6 +819,9 @@ pub(crate) enum Prop {
         oop: bool,
         ft: FieldType,
     },
+    /// A keyed load whose receivers had shape `shape`, with elements of
+    /// type `elems`.
+    Keyed { shape: u64, elems: FieldType },
 }
 
 /// The VM state the JIT reads to compile a function's property accesses.
@@ -848,7 +856,7 @@ impl Feedback {
         if insn.bail
             || !matches!(
                 insn.op,
-                Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal
+                Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal | Op::GetKeyed
             )
         {
             return Prop::None;
@@ -856,6 +864,12 @@ impl Feedback {
         let ic = unsafe { *self.ics.add(insn.imm as usize) };
         if ic.shape.is_null() {
             return Prop::None;
+        }
+        if insn.op == Op::GetKeyed {
+            return Prop::Keyed {
+                shape: ic.shape as u64,
+                elems: unsafe { (*ic.shape).elems },
+            };
         }
         let shape = ic.shape as u64;
         let (oop, off) = split_location(ic.loc);
@@ -1274,9 +1288,29 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal => {
             return select_property(insn, i, st, spec);
         }
+        // An exact receiver shape, known or guarded against the cached one,
+        // types the element; any known shape skips the cell check.
         Op::GetKeyed => {
-            out.acc = Any;
-            ("get_keyed", if st.acc == I32 { "i" } else { "" })
+            let ix = st.acc == I32;
+            let pick = |plain: &'static str, i: &'static str| if ix { i } else { plain };
+            let prop = spec.props.get(i).copied().unwrap_or(Prop::None);
+            let (case, elems) = match (reg, prop) {
+                (Ty::Obj(s), _) => (pick("nc", "i_nc"), unsafe { (*(s as *const Shape)).elems }),
+                (_, Prop::Keyed { shape, elems })
+                    if !matches!(elems, FieldType::None | FieldType::Any) =>
+                {
+                    out.regs[insn.reg as usize] = Ty::Obj(shape);
+                    (pick("sh", "i_sh"), elems)
+                }
+                (Ty::Ext(_), _) => (pick("nc", "i_nc"), FieldType::Any),
+                _ => (pick("", "i"), FieldType::Any),
+            };
+            let (t, post) = Ty::of_field(elems);
+            out.acc = t;
+            return Sel {
+                post,
+                ..Sel::new("get_keyed", case, out)
+            };
         }
         op => unreachable!("rejected by decode: {op:?}"),
     };
@@ -1873,10 +1907,14 @@ fn stencil_for(insn: &Insn, sel: &Sel, st: &TypeState, homes: &[Home]) -> (Vec<P
             box_acc(&mut pre);
             sel.base.into()
         }
-        ("get_keyed", _) if sel.case == "i" => format!("get_keyed_i_{loc}"),
+        ("get_keyed", _) if sel.case.starts_with('i') => format!("get_keyed_{}_{loc}", sel.case),
         ("get_keyed", _) => {
             box_acc(&mut pre);
-            format!("get_keyed_{loc}")
+            if sel.case.is_empty() {
+                format!("get_keyed_{loc}")
+            } else {
+                format!("get_keyed_{}_{loc}", sel.case)
+            }
         }
         ("add" | "jlt" | "test_lt" | "test_eq", _) if sel.case.is_empty() => {
             box_acc(&mut pre);
@@ -2848,6 +2886,7 @@ impl JitCode {
                         shape, global, off, ..
                     }),
                 ) => (off, shape, global),
+                (_, Some(Prop::Keyed { shape, .. })) => (0, shape, 0),
                 _ => (insn.imm, 0, 0),
             };
             let main = Piece {
@@ -3304,10 +3343,20 @@ impl JitFunction {
             }
             // The inline caches as they are now; versions compiled from
             // other contents, or under another prototype epoch, are dropped.
+            let given_up = |k: usize| {
+                vm.property_exits
+                    .get(&k)
+                    .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
+            };
+            // A keyed load given up on runs untyped, without its cache.
             let props: Vec<Prop> = self
                 .insns
                 .iter()
-                .map(|insn| vm.feedback.prop(insn, epoch))
+                .enumerate()
+                .map(|(k, insn)| match insn.op {
+                    Op::GetKeyed if given_up(k) => Prop::None,
+                    _ => vm.feedback.prop(insn, epoch),
+                })
                 .collect();
             if vm.stale || vm.epoch != epoch || vm.field_epoch != field_epoch || props != vm.props {
                 self.versions.clear();
@@ -3318,11 +3367,7 @@ impl JitFunction {
                 // with nothing cached is left to `select_property`: a known
                 // shape may still say where the property is.
                 for (k, insn) in vm.insns.iter_mut().enumerate() {
-                    if vm
-                        .property_exits
-                        .get(&k)
-                        .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
-                    {
+                    if insn.op != Op::GetKeyed && given_up(k) {
                         insn.bail = true;
                     }
                 }

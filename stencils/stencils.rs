@@ -1932,6 +1932,43 @@ unsafe fn props(o: *mut u8) -> *mut u8 {
     unsafe { *(o.add(16) as *const *mut u8) }
 }
 
+/// A keyed load stencil: `$ok` vets the receiver `$o`; `$int_key` says the
+/// key is known to be an int32.
+macro_rules! keyed_load {
+    ($loc:tt, $name:literal, $int_key:literal, |$s:ident, $o:ident| $ok:expr) => {
+        stencil!($name, loc!($loc); |$s| {
+            let $o = get!($loc, $s);
+            if !($ok) || (!$int_key && !$s.tag.is_int32($s.acc)) {
+                exit!($s)
+            }
+            let p = $o.to_bits() as *const u8;
+            let i = int($s.acc) as u32;
+            if i >= *(p.add(32) as *const u32) {
+                exit!($s)
+            }
+            let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+            // x86-64: the hole check through `asm goto`, so the exit is the
+            // conditional jump (folded straight to the exit stub) and the
+            // continuation the final, trimmed one. LLVM otherwise ends with
+            // the exit and jumps over it to the continuation.
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!(
+                "test {v}, {v}",
+                "{{disp32}} jz {hole}",
+                v = in(reg) v.to_bits(),
+                hole = label { unsafe { exit!($s) } },
+                options(nomem, nostack),
+            );
+            #[cfg(target_arch = "aarch64")]
+            if v.to_bits() == 0 {
+                exit!($s)
+            }
+            $s.acc = v;
+            next!($s)
+        });
+    };
+}
+
 macro_rules! property_location {
     ($loc:tt) => {
         stencil!("get_own_", loc!($loc); |s| {
@@ -1989,40 +2026,15 @@ macro_rules! property_location {
             next!(s)
         });
         // Elements at offset 24, length (u32) at 32. A hole is `EMPTY` (0).
-        stencil!("get_keyed_i_", loc!($loc); |s| {
-            let o = get!($loc, s);
-            if !is_cell(s.tag, o) {
-                exit!(s)
-            }
-            let p = o.to_bits() as *const u8;
-            let i = int(s.acc) as u32;
-            if i >= *(p.add(32) as *const u32) {
-                exit!(s)
-            }
-            let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
-            if v.to_bits() == 0 {
-                exit!(s)
-            }
-            s.acc = v;
-            next!(s)
-        });
-        stencil!("get_keyed_", loc!($loc); |s| {
-            let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !s.tag.is_int32(s.acc) {
-                exit!(s)
-            }
-            let p = o.to_bits() as *const u8;
-            let i = int(s.acc) as u32;
-            if i >= *(p.add(32) as *const u32) {
-                exit!(s)
-            }
-            let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
-            if v.to_bits() == 0 {
-                exit!(s)
-            }
-            s.acc = v;
-            next!(s)
-        });
+        // `_i`: the key is known to be an int32. `_nc`: the receiver is
+        // known to be an object; `_sh`: its shape must be `imm64` (the
+        // elements' type comes with it).
+        keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell(s.tag, o));
+        keyed_load!($loc, "get_keyed_", false, |s, o| is_cell(s.tag, o));
+        keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);
+        keyed_load!($loc, "get_keyed_nc_", false, |s, o| true);
+        keyed_load!($loc, "get_keyed_i_sh_", true, |s, o| guard_shape(s.tag, o).is_some());
+        keyed_load!($loc, "get_keyed_sh_", false, |s, o| guard_shape(s.tag, o).is_some());
     };
 }
 

@@ -772,7 +772,8 @@ to stencils fed by the inline caches, with shape guards as exits. The JIT's
 type lattice knows objects of a known shape (`Obj(shape)`), so a guard
 that passed, or a shape seen at entry, isn't checked again. Fields have
 types (`object::FieldType`), which loads in compiled code take, so objects
-reached through fields need no guards either. Details and
+reached through fields need no guards either; arrays' shapes carry their
+elements' type (`Shape::elems`), likewise. Details and
 numbers: `docs/future-work.md`, "Property access in the JIT, and shape
 types".
 

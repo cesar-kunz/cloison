@@ -16,6 +16,9 @@ pub enum Operand {
     Ic,
     /// An index into the function's table of nested functions (2 bytes).
     Fn,
+    /// An inline-cache slot of the function, not written in the text
+    /// format, which gives each such instruction its own (2 bytes).
+    AutoIc,
     /// An argument count (1 byte).
     Count,
 }
@@ -24,7 +27,7 @@ impl Operand {
     pub const fn width(self) -> usize {
         match self {
             Operand::Reg | Operand::Count => 1,
-            Operand::Ic | Operand::Fn => 2,
+            Operand::Ic | Operand::Fn | Operand::AutoIc => 2,
             Operand::Imm | Operand::Off => 4,
         }
     }
@@ -144,8 +147,9 @@ define_ops! {
     GetNamed(Reg, Ic),
     /// `r[a].name = acc`
     SetNamed(Reg, Ic),
-    /// `acc = r[a][acc]`
-    GetKeyed(Reg),
+    /// `acc = r[a][acc]`. The inline cache remembers the receiver's shape
+    /// (its elements' type) for the JIT.
+    GetKeyed(Reg, AutoIc),
     /// `r[a][r[b]] = acc`
     SetKeyed(Reg, Reg),
 
@@ -413,7 +417,7 @@ impl Assembler {
                     self.imm(v);
                 }
                 (Operand::Off, Arg::Label(l)) => self.jump_to(start, l),
-                (Operand::Ic | Operand::Fn, Arg::Index(i)) => {
+                (Operand::Ic | Operand::Fn | Operand::AutoIc, Arg::Index(i)) => {
                     self.code.extend_from_slice(&i.to_le_bytes());
                 }
                 (k, a) => panic!("{op:?}: operand {a:?} is not a {k:?}"),

@@ -1870,6 +1870,122 @@ fn direct_calls_into_compiled_callees() {
     let expected: u64 = (0..500u64).map(|i| (i & 7) + 109).sum::<u64>() + 500;
     let (v, s) = jit(&src);
     assert_eq!(v, expected.to_string());
+    // The callee version returns int32s: the result is checked to be one,
+    // and `total += f(…)` adds int32s.
+    assert!(s.iter().any(|n| n == "call_direct+check_acc_int"), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
+}
+
+/// The argument is a double, so the callee version returns doubles, and
+/// so does the call (checked to be a number, unboxed).
+#[test]
+fn direct_calls_returning_doubles() {
+    let hook = "        Ldar r5\n        Add r5\n        Star r4\n";
+    let src = direct_program(500, hook, &padded("f1", 1));
+    let expected: u64 = 500 * (2 * 2147483600 + 109) + 500;
+    let (v, s) = jit(&src);
+    assert_eq!(v, expected.to_string());
+    assert!(
+        s.iter()
+            .any(|n| n == "call_direct+check_acc_num+unbox_num_acc"),
+        "{s:?}"
+    );
+}
+
+/// A script whose `main` loops 500 times over `total += m.call(o, i).x`
+/// with `o = [] + {x: 5}`, returning `total + calls`. `m` returns `this`
+/// after `special` (code run first, with `k` in r1). The global `other`
+/// is an object with `a = 1000` and then `x = 7`. The padding keeps `m`
+/// from being inlined.
+fn object_program(special: &str) -> String {
+    let pad: String = (0..64).map(|_| "        AddSmi 1\n").collect();
+    format!(
+        "\
+script
+        LdaSmi 0
+        StaGlobal calls
+        CreateArray
+        Star r3
+        LdaSmi 1000
+        SetNamed r3, a
+        LdaSmi 7
+        SetNamed r3, x
+        Ldar r3
+        StaGlobal other
+        CreateClosure m
+        StaGlobal m
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function m(k)
+        LdaGlobal calls
+        Inc
+        StaGlobal calls
+{special}        LdaSmi 0
+        Star r2
+loop:   Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 10, loop
+{pad}        Ldar r0
+        Return
+end
+function main()                 ; r1 i, r2 total, r3 m, r7 o, r8 arg, r9 o again
+        CreateArray
+        Star r7
+        LdaSmi 5
+        SetNamed r7, x
+        LdaGlobal m
+        Star r3
+        LdaSmi 0
+        Star r1
+        Star r2
+top:    Ldar r1
+        Star r8
+        Call r3, r7, 1
+        Star r9
+        GetNamed r9, x
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 500, top
+        LdaGlobal calls
+        Add r2
+        Return
+end
+"
+    )
+}
+
+/// `m` returns `this`, an object of a known shape: the call's result is
+/// checked to have it, and loading `x` from it needs no guard.
+#[test]
+fn direct_calls_returning_objects() {
+    let (v, s) = jit(&object_program(""));
+    assert_eq!(v, (500 * 5 + 500).to_string());
+    assert!(
+        s.iter().any(|n| n == "call_direct+check_acc_shape"),
+        "{s:?}"
+    );
+    // `x` is out of line: arrays have no in-object slots.
+    assert!(s.iter().any(|n| n.starts_with("get_oop_nc_")), "{s:?}");
+}
+
+/// At k = 300, `m` returns `other` instead, whose shape has `x` in another
+/// slot: the check of the result's shape fails, and the interpreter loads
+/// `x` (7, not `a`'s 1000).
+#[test]
+fn direct_call_results_are_checked() {
+    let special = "        Ldar r1\n        TestEqualSmi 300\n        JumpIfFalse go\n\
+                   \x20       LdaGlobal other\n        Return\ngo:\n";
+    let (v, s) = jit(&object_program(special));
+    assert_eq!(v, (499 * 5 + 7 + 500).to_string());
     assert!(s.iter().any(|n| n == "call_direct"), "{s:?}");
 }
 
@@ -1891,7 +2007,11 @@ fn exits_in_direct_callees_finish_in_the_interpreter() {
         })
         .sum::<u64>()
         + 500;
-    assert_eq!(jit(&src).0, expected.to_string());
+    let (v, s) = jit(&src);
+    assert_eq!(v, expected.to_string());
+    // The call's result was a double then, failing the check that it was
+    // an int32: the call is compiled again, without a prediction.
+    assert!(s.iter().any(|n| n == "call_direct"), "{s:?}");
 }
 
 /// From i = 300 the callee is another function: the direct call's check of

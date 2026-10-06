@@ -6,7 +6,8 @@
 #   interp+acc  interpreter with acc-i32 (default build)
 #   jit1        copy-and-patch JIT, generic stencils only (milestone 1)
 #   jit2        + type-specialized stencils (milestone 2)
-#   jit         + VM registers in machine registers (milestone 3)
+#   jit3        + VM registers in machine registers (milestone 3)
+#   jit         + fused stencils
 #
 # Per-iteration numbers are (run at N) − (run at 1), divided by N − 1, which
 # cancels process startup. Each cell is the minimum over REPS runs, pinned
@@ -27,6 +28,7 @@ declare -A RUN=(
   [interp+acc]="target/release/dispatch_bench %s %s %s interp"
   [jit1]="target/release/dispatch_bench %s %s %s jit1"
   [jit2]="target/release/dispatch_bench %s %s %s jit2"
+  [jit3]="target/release/dispatch_bench %s %s %s jit3"
   [jit]="target/release/dispatch_bench %s %s %s jit"
 )
 
@@ -46,7 +48,7 @@ echo "| program | codegen | engine | instr/iter | cycles/iter | IPC |"
 echo "|---|---|---|---:|---:|---:|"
 for program in ${PROGRAMS:-int const chain double wide}; do
   for codegen in generic smi; do
-    for engine in ${ENGINES:-interp interp+acc jit1 jit2 jit}; do
+    for engine in ${ENGINES:-interp interp+acc jit1 jit2 jit3 jit}; do
       # shellcheck disable=SC2059,SC2046
       read -r i1 c1 < <(counters $(printf "${RUN[$engine]}" "$program" "$codegen" 1))
       # shellcheck disable=SC2059,SC2046

@@ -684,3 +684,139 @@ fp_slot!(3);
 fp_slot!(4);
 fp_slot!(5);
 fp_slot!(6);
+
+// ---- Fused stencils: common instruction sequences on slot registers ----
+//
+// A fused stencil replaces a short bytecode sequence whose operands all live
+// in slots, so the values never pass through `acc`. None of them writes
+// `acc`: when the accumulator is live after the sequence, the JIT appends an
+// `ldar_<loc>` piece. On int32 overflow they exit before the arithmetic
+// instruction with the slot unchanged. The JIT starts that exit stub with an
+// `ldar_<loc>` piece, so `acc` holds the loaded value, which is the
+// interpreter's state at that instruction. Setting `acc` here instead would
+// make LLVM lay the exit path out after the hot path's `jmp toi_continue`,
+// which the JIT then couldn't trim.
+//
+// Names: `addi_<r>` for `ldar r; add_smi k | inc; star r`; `addr_<types>_<r>_<r2>`
+// for `ldar r; add r2; star r`; `incjlt_<r>[_<r2>]` for the loop tail
+// `ldar r; inc; star r; jlt_smi k | jlt r2`.
+
+/// `$m!(a, b)` for every `a` in the first list and `b` in the second.
+macro_rules! cartesian {
+    ($m:ident [$($a:tt)*] $bs:tt) => {
+        $( cartesian!(@row $m $a $bs); )*
+    };
+    (@row $m:ident $a:tt [$($b:tt)*]) => {
+        $( $m!($a, $b); )*
+    };
+}
+
+/// Calls `$cb! { [GPR slot numbers] rest… }` for this target.
+#[cfg(target_arch = "x86_64")]
+macro_rules! with_gprs {
+    ($cb:ident ! $($t:tt)*) => { $cb! { [0 1 2 3 4 5] $($t)* } };
+}
+#[cfg(target_arch = "aarch64")]
+macro_rules! with_gprs {
+    ($cb:ident ! $($t:tt)*) => { $cb! { [0 1 2 3 4 5 6 7 8 9 10 11] $($t)* } };
+}
+macro_rules! each_gpr {
+    ([$($a:tt)*] $m:ident) => { $( $m!($a); )* };
+}
+macro_rules! gpr_pairs {
+    ($gs:tt $m:ident) => { cartesian!($m $gs $gs); };
+}
+macro_rules! fp_gpr_pairs {
+    ($gs:tt $m:ident) => { cartesian!($m [0 1 2 3 4 5 6] $gs); };
+}
+
+macro_rules! fused_gpr {
+    ($a:tt) => {
+        stencil!("addi_g", $a; |s| {
+            match int(s.g[$a]).checked_add(imm()) {
+                Some(v) => {
+                    s.g[$a] = s.tag.box_i32(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+        stencil!("incjlt_g", $a; |s| {
+            match int(s.g[$a]).checked_add(1) {
+                Some(v) => {
+                    s.g[$a] = s.tag.box_i32(v);
+                    if v < imm() {
+                        jump!(s)
+                    }
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+    };
+}
+
+macro_rules! fused_gpr_gpr {
+    ($a:tt, $b:tt) => {
+        stencil!("addr_ii_g", $a, "_g", $b; |s| {
+            match int(s.g[$a]).checked_add(int(s.g[$b])) {
+                Some(v) => {
+                    s.g[$a] = s.tag.box_i32(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+        stencil!("incjlt_g", $a, "_g", $b; |s| {
+            match int(s.g[$a]).checked_add(1) {
+                Some(v) => {
+                    s.g[$a] = s.tag.box_i32(v);
+                    if v < int(s.g[$b]) {
+                        jump!(s)
+                    }
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+    };
+}
+
+macro_rules! fused_fp {
+    ($a:tt) => {
+        stencil!("addi_f", $a; |s| {
+            s.f[$a] += imm() as f64;
+            next!(s)
+        });
+    };
+}
+
+macro_rules! fused_fp_gpr {
+    ($a:tt, $b:tt) => {
+        stencil!("addr_fi_f", $a, "_g", $b; |s| {
+            s.f[$a] += int(s.g[$b]) as f64;
+            next!(s)
+        });
+    };
+}
+
+macro_rules! fused_fp_fp {
+    ($a:tt, $b:tt) => {
+        stencil!("addr_ff_f", $a, "_f", $b; |s| {
+            s.f[$a] += s.f[$b];
+            next!(s)
+        });
+    };
+}
+
+with_gprs!(each_gpr! fused_gpr);
+with_gprs!(gpr_pairs! fused_gpr_gpr);
+with_gprs!(fp_gpr_pairs! fused_fp_gpr);
+fused_fp!(0);
+fused_fp!(1);
+fused_fp!(2);
+fused_fp!(3);
+fused_fp!(4);
+fused_fp!(5);
+fused_fp!(6);
+cartesian!(fused_fp_fp [0 1 2 3 4 5 6] [0 1 2 3 4 5 6]);

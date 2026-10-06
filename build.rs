@@ -5,7 +5,9 @@
 //!    continuations are plain relocations, not GOT/PLT indirections.
 //! 2. For every `toi_stencil_*` function, extract its machine code and
 //!    relocations.
-//! 3. On arm64, fold trailing branch stubs (see [`fold_arm64_stubs`]).
+//! 3. On arm64, fold trailing branch stubs ([`fold_arm64_stubs`]) and
+//!    invert a conditional branch over a lone jump
+//!    ([`invert_arm64_branch_over_jump`]).
 //! 4. Write `$OUT_DIR/stencils.rs`, included by `src/jit.rs`.
 //!
 //! The object file is kept as `$OUT_DIR/stencils.o` for inspection:
@@ -109,6 +111,7 @@ fn main() {
         let mut code = code.to_vec();
         if env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "aarch64" {
             fold_arm64_stubs(&name, &mut code, &mut relocs);
+            invert_arm64_branch_over_jump(&mut code, &mut relocs);
         }
         relocs.sort_by_key(|r| r.offset);
         let mut relocs_src = String::new();
@@ -218,4 +221,86 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         code.truncate(n - 4);
         let _ = name;
     }
+}
+
+/// AArch64 branch displacement of the (relocation-free) local branch at `at`,
+/// in bytes, with the field's mask and shift, if it is one.
+fn local_branch(code: &[u8], at: usize) -> Option<(i64, u32, u32)> {
+    let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+    if i & 0xFF00_0010 == 0x5400_0000 || i & 0x7E00_0000 == 0x3400_0000 {
+        Some(((((i >> 5) & 0x7FFFF) as i64) << 45 >> 43, 0x7FFFF, 5)) // b.cond, cbz/cbnz
+    } else if i & 0x7E00_0000 == 0x3600_0000 {
+        Some(((((i >> 5) & 0x3FFF) as i64) << 50 >> 48, 0x3FFF, 5)) // tbz/tbnz
+    } else if i & 0xFC00_0000 == 0x1400_0000 {
+        Some((((i & 0x03FF_FFFF) as i64) << 38 >> 36, 0x03FF_FFFF, 0)) // b
+    } else {
+        None
+    }
+}
+
+/// For a conditional branch, LLVM ends a stencil with
+///
+/// ```text
+/// x: b.cond z          ; condition false: continue
+/// y: b      <target>   ; condition true: take the branch
+/// z: b      toi_continue
+/// ```
+///
+/// so taking the branch (a loop's back edge) costs a not-taken `b.cond` plus
+/// a taken `b`. Rewrite it to `x: b.!cond <target>; z: b toi_continue`. The
+/// JIT then trims the final jump, and the branch is a single instruction.
+fn invert_arm64_branch_over_jump(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
+    let n = code.len();
+    if n < 12 {
+        return;
+    }
+    let (x, y, z) = (n - 12, n - 8, n - 4);
+    let reloc_at = |relocs: &[Reloc], at: usize| relocs.iter().position(|r| r.offset == at as u64);
+    let (Some(ry), Some(rz)) = (reloc_at(relocs, y), reloc_at(relocs, z)) else {
+        return;
+    };
+    let xi = u32::from_le_bytes(code[x..x + 4].try_into().unwrap());
+    let is_bcond = xi & 0xFF00_0010 == 0x5400_0000 && (xi & 0xF) < 0xE;
+    if relocs[rz].symbol != "toi_continue"
+        || relocs[rz].r_type != R_AARCH64_JUMP26
+        || relocs[ry].r_type != R_AARCH64_JUMP26
+        || !is_bcond
+        || reloc_at(relocs, x).is_some()
+        || local_branch(code, x).map(|b| b.0) != Some(8)
+    {
+        return;
+    }
+    // Nothing else may branch to `y`; branches to `z` move with it.
+    let mut retarget = Vec::new();
+    for at in (0..y)
+        .step_by(4)
+        .filter(|&at| at != x && reloc_at(relocs, at).is_none())
+    {
+        if let Some((disp, mask, shift)) = local_branch(code, at) {
+            match (at as i64 + disp) as usize {
+                t if t == y => return,
+                t if t == z => retarget.push((at, disp - 4, mask, shift)),
+                _ => {}
+            }
+        }
+    }
+    for (at, disp, mask, shift) in retarget {
+        let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+        let field = ((disp >> 2) as u32 & mask) << shift;
+        code[at..at + 4].copy_from_slice(&((i & !(mask << shift)) | field).to_le_bytes());
+    }
+    // Invert the condition (flip its low bit), clear the displacement, and
+    // aim it at `y`'s target through a relocation.
+    let inverted = (xi ^ 1) & !(0x7FFFF << 5);
+    code[x..x + 4].copy_from_slice(&inverted.to_le_bytes());
+    let target = relocs.remove(ry);
+    let rz = reloc_at(relocs, z).unwrap();
+    relocs[rz].offset -= 4;
+    relocs.push(Reloc {
+        offset: x as u64,
+        r_type: R_AARCH64_CONDBR19,
+        symbol: target.symbol,
+        addend: target.addend,
+    });
+    code.drain(y..y + 4);
 }

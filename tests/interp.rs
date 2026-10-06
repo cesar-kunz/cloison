@@ -1,6 +1,7 @@
-//! Every program runs on four engines: the interpreter, the JIT with
+//! Every program runs on five engines: the interpreter, the JIT with
 //! generic stencils (milestone 1), with type-specialized stencils
-//! (milestone 2), and with VM registers in machine registers (milestone 3).
+//! (milestone 2), with VM registers in machine registers (milestone 3), and
+//! with fused stencils.
 //! They must agree on the result and on the final register file.
 
 use toi::bytecode::Assembler;
@@ -27,6 +28,7 @@ fn exec(a: Assembler, regs: &mut [Value]) -> Value {
     for (name, mut f) in [
         ("jit1", JitFunction::new(&code).unspecialized()),
         ("jit2", JitFunction::new(&code).without_register_homes()),
+        ("jit3", JitFunction::new(&code).without_fusion()),
         ("jit", JitFunction::new(&code)),
     ] {
         let mut jit_regs = initial.clone();
@@ -339,6 +341,12 @@ fn stencils(f: &JitFunction) -> Vec<String> {
         .collect()
 }
 
+/// Whether some selected stencil adds with type case `case` (`"fi"`, …),
+/// alone (`add_fi_<loc>`) or fused (`addr_fi_<r>_<r2>`).
+fn has_add(s: &[String], case: &str) -> bool {
+    has(s, &format!("add_{case}")) || s.iter().any(|n| n.starts_with(&format!("addr_{case}_")))
+}
+
 /// Whether `suffix` is a location: `m`, `g<k>` or `f<k>`.
 fn is_loc(suffix: &str) -> bool {
     suffix == "m"
@@ -364,8 +372,12 @@ fn int_loop_is_fully_specialized() {
     assert_eq!(v, Value::from_i32(499500));
     assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
     let s = stencils(&f);
+    // The add may be fused (`addr_ii_<r>_<r2>`); `inc` isn't, since
+    // `sum_loop` puts a `nop` between it and its `star`.
     assert!(
-        has(&s, "add_ii") && has(&s, "inc_i") && has(&s, "jlt_ii"),
+        (has(&s, "add_ii") || s.iter().any(|n| n.starts_with("addr_ii_")))
+            && has(&s, "inc_i")
+            && has(&s, "jlt_ii"),
         "{s:?}"
     );
     assert!(
@@ -383,7 +395,7 @@ fn overflow_exits_once_then_resumes_as_double() {
     assert_eq!(v.as_number(), Some((n * (n - 1) / 2) as f64));
     assert_eq!((f.stats.compiles, f.stats.exits), (2, 1));
     let s = stencils(&f);
-    assert!(has(&s, "add_fi") || has(&s, "add_ff"), "{s:?}");
+    assert!(has_add(&s, "fi") || has_add(&s, "ff"), "{s:?}");
     assert!(has(&s, "inc_i"), "{s:?}");
 }
 
@@ -475,7 +487,7 @@ fn doubles_are_pinned_in_fp_registers() {
     let (v, f) = jit(&sum_loop(n as i32), &mut regs);
     assert_eq!(v.as_number(), Some((n * (n - 1) / 2) as f64));
     assert!(matches!(homes(&f)[0], Home::Fpr(_)), "{:?}", homes(&f));
-    assert!(has(&stencils(&f), "add_fi"), "{:?}", stencils(&f));
+    assert!(has_add(&stencils(&f), "fi"), "{:?}", stencils(&f));
     // Spilled back, boxed, at return.
     assert_eq!(regs[0].as_number(), v.as_number());
     assert_eq!(regs[1], Value::from_i32(n as i32));
@@ -568,4 +580,147 @@ fn runtime_calls_preserve_slot_registers() {
         assert_eq!(*v, Value::from_i32(50 * (r as i32 + 1)), "r{r}");
     }
     assert_eq!(regs[t as usize], Value::from_i32(2));
+}
+
+// ---- Fused stencils ----
+
+/// `s = s + k; i = i + 1` while `i < n`, with no `nop`s, so the body and the
+/// loop tail fuse.
+fn fusible_loop(k: i32, n: i32, start: i32) -> Assembler {
+    let (s, i) = (0, 1);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(start).star(s).lda_smi(0).star(i);
+    a.bind(top);
+    a.ldar(s).add_smi(k).star(s);
+    a.ldar(i).inc().star(i).jump_if_less_smi(n, top);
+    a.ldar(s).ret();
+    a
+}
+
+#[test]
+fn loop_body_and_tail_fuse() {
+    let a = fusible_loop(3, 1000, 0);
+    assert_eq!(
+        exec(a.clone(), &mut [Value::UNDEFINED; 2]),
+        Value::from_i32(3000)
+    );
+    let (_, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
+    let s = stencils(&f);
+    assert!(s.iter().any(|n| n.starts_with("addi_g")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("incjlt_g")), "{s:?}");
+}
+
+#[test]
+fn fused_add_overflow_exits_and_resumes() {
+    // `s` overflows int32 inside the fused `addi`: one exit, with `acc`
+    // rematerialized from the slot, then a recompile where `s` is a double.
+    let a = fusible_loop(1000, 100, i32::MAX - 50_000);
+    let expected = (i32::MAX - 50_000) as f64 + 100_000.0;
+    assert_eq!(
+        exec(a.clone(), &mut [Value::UNDEFINED; 2]).as_number(),
+        Some(expected)
+    );
+    let (v, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
+    assert_eq!(v.as_number(), Some(expected));
+    assert_eq!((f.stats.compiles, f.stats.exits), (2, 1));
+    assert!(
+        stencils(&f).iter().any(|n| n.starts_with("addi_f")),
+        "{:?}",
+        stencils(&f)
+    );
+}
+
+#[test]
+fn fused_loop_tail_overflow_exits() {
+    // A do-while entered with the counter at i32::MAX: the fused `incjlt`
+    // overflows on its first run and exits; the double result then fails
+    // `< 0`, ending the loop.
+    // The start value comes from r1.
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.ldar(1).star(0);
+    a.bind(top);
+    a.ldar(0).inc().star(0).jump_if_less_smi(0, top);
+    a.ldar(0).ret();
+    let max = [Value::UNDEFINED, Value::from_i32(i32::MAX)];
+    assert_eq!(
+        exec(a.clone(), &mut max.clone()).as_number(),
+        Some(2147483648.0)
+    );
+    let code = a.clone().finish();
+    let mut f = JitFunction::new(&code);
+    let v = unsafe { f.run(&mut max.clone()) };
+    assert_eq!(v.as_number(), Some(2147483648.0));
+    assert_eq!(f.stats.exits, 1);
+    // Without the overflow, the only compile shows the fused tail.
+    let mut first = JitFunction::new(&code);
+    unsafe { first.run(&mut [Value::UNDEFINED, Value::from_i32(-5)]) };
+    assert_eq!(first.stats.exits, 0);
+    let s = stencils(&first);
+    assert!(s.iter().any(|n| n.starts_with("incjlt_g")), "{s:?}");
+}
+
+#[test]
+fn live_accumulator_after_a_fused_group() {
+    // After `ldar r0; add_smi 5; star r0`, acc is still read by `star r1`
+    // and `add r0`, so it must be rematerialized.
+    let mut a = Assembler::new();
+    a.lda_smi(1).star(0).star(1);
+    a.ldar(0).add_smi(5).star(0).star(1).add(0).ret();
+    assert_eq!(
+        exec(a.clone(), &mut [Value::UNDEFINED; 2]),
+        Value::from_i32(12)
+    );
+    let (_, f) = jit(&a, &mut [Value::UNDEFINED; 2]);
+    assert!(
+        stencils(&f).iter().any(|n| n.starts_with("addi_g")),
+        "{:?}",
+        stencils(&f)
+    );
+}
+
+#[test]
+fn no_fusion_across_a_jump_target() {
+    // A jump lands on the `add_smi` in the middle of `ldar; add_smi; star`.
+    let mut a = Assembler::new();
+    let (mid, out) = (a.label(), a.label());
+    a.lda_smi(10).star(0).lda_smi(20).jump(mid);
+    a.ldar(0);
+    a.bind(mid);
+    a.add_smi(1).star(0).jump(out);
+    a.bind(out);
+    a.ldar(0).ret();
+    assert_eq!(
+        exec(a.clone(), &mut [Value::UNDEFINED]),
+        Value::from_i32(21)
+    );
+    let (_, f) = jit(&a, &mut [Value::UNDEFINED]);
+    assert!(
+        !stencils(&f).iter().any(|n| n.starts_with("addi_")),
+        "{:?}",
+        stencils(&f)
+    );
+}
+
+#[test]
+fn fused_double_accumulation() {
+    // `d = d + i` with `d` pinned in an FP slot and `i` an int32 in a GPR
+    // slot: fuses to `addr_fi`.
+    let (d, i) = (0, 1);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(i);
+    a.bind(top);
+    a.ldar(d).add(i).star(d);
+    a.ldar(i).inc().star(i).jump_if_less_smi(100, top);
+    a.ldar(d).ret();
+    let regs = [Value::from_f64(0.5), Value::UNDEFINED];
+    assert_eq!(exec(a.clone(), &mut regs.clone()).as_number(), Some(4950.5));
+    let (_, f) = jit(&a, &mut regs.clone());
+    assert!(
+        stencils(&f).iter().any(|n| n.starts_with("addr_fi_f")),
+        "{:?}",
+        stencils(&f)
+    );
 }

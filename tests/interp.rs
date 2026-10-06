@@ -800,3 +800,148 @@ fn int_acc_is_boxed_where_a_join_widens_it() {
         assert_eq!(r[2], expected);
     }
 }
+
+// ---- Three-address and chained adds ----
+
+/// Names of the fused groups (and in-place adds) in `f`'s last code.
+fn group_names(f: &JitFunction) -> Vec<String> {
+    stencils(f)
+        .into_iter()
+        .filter(|n| n.contains('+') || n.starts_with("addr_"))
+        .collect()
+}
+
+/// `r2 = r0 + r1 (+ r1 …)` in a loop, `extra` more adds of r1.
+fn three_address_loop(extra: usize) -> Assembler {
+    let (x, y, t, i) = (0, 1, 2, 3);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(i).star(t);
+    a.bind(top);
+    a.ldar(x).add(y);
+    for _ in 0..extra {
+        a.add(y);
+    }
+    a.star(t);
+    a.ldar(i).inc().star(i).jump_if_less_smi(10, top);
+    a.ldar(t).ret();
+    a
+}
+
+#[test]
+fn three_address_add_fuses_as_move_and_add() {
+    let a = three_address_loop(0);
+    let regs = [
+        Value::from_i32(5),
+        Value::from_i32(7),
+        Value::UNDEFINED,
+        Value::UNDEFINED,
+    ];
+    assert_eq!(exec(a.clone(), &mut regs.clone()), Value::from_i32(12));
+    let (_, f) = jit(&a, &mut regs.clone());
+    let g = group_names(&f);
+    assert!(
+        g.iter()
+            .any(|n| n.starts_with("mov_u") && n.contains("+addr_ii_u")),
+        "{g:?}"
+    );
+}
+
+#[test]
+fn add_chain_fuses() {
+    // t = x + y + y + y
+    let a = three_address_loop(2);
+    let regs = [
+        Value::from_i32(5),
+        Value::from_i32(7),
+        Value::UNDEFINED,
+        Value::UNDEFINED,
+    ];
+    assert_eq!(exec(a.clone(), &mut regs.clone()), Value::from_i32(26));
+    let (_, f) = jit(&a, &mut regs.clone());
+    let g = group_names(&f);
+    assert!(
+        g.iter().any(|n| n.matches("+addr_ii_u").count() == 3),
+        "{g:?}"
+    );
+}
+
+#[test]
+fn add_chain_overflow_mid_chain() {
+    // t = x + y + y in straight-line code: x + y fits, the second add
+    // overflows. The exit must undo it and resume with acc = x + y. (In a
+    // loop recomputing t every iteration, a wrong value would be
+    // overwritten and go unnoticed.) t is written first so it can be pinned
+    // in a slot (see `pinnable`); otherwise it stays boxed and the chain
+    // doesn't fuse.
+    let (x, y, t) = (0, 1, 2);
+    let mut a = Assembler::new();
+    a.lda_smi(0).star(t);
+    a.ldar(x).add(y).add(y).star(t).ldar(t).ret();
+    let yv = 1_500_000_000;
+    let regs = [Value::from_i32(7), Value::from_i32(yv), Value::UNDEFINED];
+    let expected = 7.0 + 2.0 * yv as f64;
+    assert_eq!(
+        exec(a.clone(), &mut regs.clone()).as_number(),
+        Some(expected)
+    );
+    let mut r = regs;
+    let (v, f) = jit(&a, &mut r);
+    assert_eq!(v.as_number(), Some(expected));
+    assert_eq!(f.stats.exits, 1);
+    assert_eq!(r[t as usize].as_number(), Some(expected));
+    // Without the overflow, the code shows the fused chain.
+    let (_, f) = jit(
+        &a,
+        &mut [Value::from_i32(1), Value::from_i32(2), Value::UNDEFINED],
+    );
+    let g = group_names(&f);
+    assert!(
+        g.iter().any(|n| n.matches("+addr_ii_u").count() == 2),
+        "{g:?}"
+    );
+}
+
+#[test]
+fn add_chain_reading_its_destination_is_not_fused() {
+    // t = x + t reads t's old value: must not become `t = x; t += t`.
+    let (x, t, i) = (0, 1, 2);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(i).star(t);
+    a.bind(top);
+    a.ldar(x).add(t).star(t);
+    a.ldar(i).inc().star(i).jump_if_less_smi(10, top);
+    a.ldar(t).ret();
+    let regs = [Value::from_i32(3), Value::UNDEFINED, Value::UNDEFINED];
+    assert_eq!(exec(a.clone(), &mut regs.clone()), Value::from_i32(30));
+    let (_, f) = jit(&a, &mut regs.clone());
+    assert!(
+        !stencils(&f).iter().any(|n| n.starts_with("mov_u")),
+        "{:?}",
+        stencils(&f)
+    );
+}
+
+#[test]
+fn three_address_double_from_int() {
+    // s = i + d with i int32 and d, s doubles: mov_f<s>_u<i> + addr_ff.
+    let (d, s, i) = (0, 1, 2);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(i);
+    a.bind(top);
+    a.ldar(i).add(d).star(s);
+    a.ldar(i).inc().star(i).jump_if_less_smi(10, top);
+    a.ldar(s).ret();
+    let regs = [Value::from_f64(0.5), Value::from_f64(0.0), Value::UNDEFINED];
+    assert_eq!(exec(a.clone(), &mut regs.clone()).as_number(), Some(9.5));
+    let (_, f) = jit(&a, &mut regs.clone());
+    assert!(
+        stencils(&f)
+            .iter()
+            .any(|n| n.starts_with("mov_f") && n.contains("+addr_ff_f")),
+        "{:?}",
+        stencils(&f)
+    );
+}

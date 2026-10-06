@@ -153,11 +153,23 @@ pub fn parse(src: &str) -> Result<Module, String> {
                 .filter(|t| !t.is_empty())
                 .collect();
             let kinds = op.operands();
-            if toks.len() != kinds.len() {
-                return Err(err(format!("{mnemonic} takes {} operands", kinds.len())));
+            let written = kinds.iter().filter(|&&k| k != Operand::AutoIc).count();
+            if toks.len() != written {
+                return Err(err(format!("{mnemonic} takes {written} operands")));
             }
+            let mut toks = toks.iter();
             let mut args = Vec::new();
-            for (&k, &t) in kinds.iter().zip(&toks) {
+            for &k in kinds {
+                if k == Operand::AutoIc {
+                    // Keyed accesses' caches are named after no property.
+                    ics.push("[]".into());
+                    args.push(Arg::Index(
+                        u16::try_from(ics.len() - 1)
+                            .map_err(|_| err("too many inline caches".into()))?,
+                    ));
+                    continue;
+                }
+                let t = *toks.next().unwrap();
                 let arg = match k {
                     Operand::Reg => {
                         let r = t
@@ -191,6 +203,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
                                 .map_err(|_| err("too many inline caches".into()))?,
                         )
                     }
+                    Operand::AutoIc => unreachable!(),
                     Operand::Fn => {
                         let f = *index
                             .get(t)

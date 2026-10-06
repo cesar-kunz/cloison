@@ -1097,3 +1097,151 @@ end
 ";
     assert_eq!(jit(src).0, "21474836500");
 }
+
+// ---- Element types ----
+
+/// `a = [1, 2, 3, 4]`, summed in a loop as `a[i & 3]`, compiled with the
+/// elements typed int32 (from `a`'s shape, known at entry). At i = 10,
+/// `a[2] = big` (a double) moves `a` to a shape with number elements; the
+/// code compiled for the old shape is no longer entered.
+#[test]
+fn element_types_generalize_by_shape() {
+    let src = "\
+script
+        LdaSmi 2147483647
+        AddSmi 3
+        StaGlobal big           ; 2147483650, a double
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+; r1 a, r2 i, r3 sum, r4 key
+function main()
+        CreateArray
+        Star r1
+        LdaSmi 0
+        Star r4
+        LdaSmi 1
+        SetKeyed r1, r4
+        LdaSmi 1
+        Star r4
+        LdaSmi 2
+        SetKeyed r1, r4
+        LdaSmi 2
+        Star r4
+        LdaSmi 3
+        SetKeyed r1, r4
+        LdaSmi 3
+        Star r4
+        LdaSmi 4
+        SetKeyed r1, r4         ; a = [1, 2, 3, 4]
+        LdaSmi 0
+        Star r2
+        Star r3
+loop:   Ldar r2
+        BitAndSmi 3
+        GetKeyed r1
+        Add r3
+        Star r3                 ; sum += a[i & 3]
+        Ldar r2
+        TestEqualSmi 10
+        JumpIfFalse next
+        LdaSmi 2
+        Star r4
+        LdaGlobal big
+        SetKeyed r1, r4         ; a[2] = big
+next:   Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 20, loop
+        Ldar r3
+        Return
+end
+";
+    // i = 0..10: 1+2+3+4 twice, then 1+2+3 (26); i = 11..19, with a =
+    // [1, 2, big, 4]: 4, 1, 2, big, 4, 1, 2, big, 4 (18 + 2 big).
+    let (v, s) = jit(src);
+    assert_eq!(v, (26 + 18 + 2 * 2147483650u64).to_string());
+    // Recompiled for number elements: loaded into `facc`.
+    assert!(s.iter().any(|n| n.ends_with("+unbox_num_acc")), "{s:?}");
+}
+
+/// An array reached through a field (`box.list`) is only `Ext` in compiled
+/// code, which says nothing about its elements; the keyed load's cache
+/// supplies its shape, which a guard checks, and the elements' type with
+/// it: `box.list[i].n` needs no guard on the element.
+#[test]
+fn keyed_loads_guard_the_cached_shape_for_element_types() {
+    let src = "\
+script
+        CreateClosure Box
+        StaGlobal Box
+        CreateClosure N
+        StaGlobal N
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function Box()
+        CreateArray
+        SetNamed r0, list
+        LdaUndefined
+        Return
+end
+function N(n)
+        Ldar r1
+        SetNamed r0, n
+        LdaUndefined
+        Return
+end
+; r1 box, r2 i, r3 sum, r4-r7 temps
+function main()
+        LdaGlobal Box
+        Star r4
+        Construct r4, r5, 0
+        Star r1
+        LdaSmi 0
+        Star r2
+fill:   GetNamed r1, list
+        Star r5
+        GetNamed r5, push
+        Star r4
+        LdaGlobal N
+        Star r7
+        Construct r7, r2, 1
+        Star r6
+        Call r4, r5, 1          ; box.list.push(new N(i))
+        Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 10, fill
+        LdaSmi 0
+        Star r2
+        Star r3
+loop:   GetNamed r1, list
+        Star r4
+        Ldar r2
+        GetKeyed r4
+        Star r4
+        GetNamed r4, n
+        Add r3
+        Star r3                 ; sum += box.list[i].n
+        Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 10, loop
+        Ldar r3
+        Return
+end
+";
+    let (v, s) = jit(src);
+    assert_eq!(v, "45");
+    assert!(s.iter().any(|n| n.starts_with("get_keyed_i_sh_")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("get_own_nc_")), "{s:?}");
+}

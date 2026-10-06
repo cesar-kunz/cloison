@@ -254,8 +254,11 @@ impl Vm {
             capacity,
             keys: Vec::new(),
             fields: Vec::new(),
+            elems: FieldType::None,
+            elems_code: 0,
             unique: false,
             transitions: RefCell::default(),
+            elem_transitions: RefCell::default(),
         });
         self.roots.insert(key, s);
         s
@@ -282,8 +285,11 @@ impl Vm {
             capacity: s.capacity,
             keys,
             fields,
+            elems: s.elems,
+            elems_code: s.elems_code,
             unique: s.unique,
             transitions: RefCell::default(),
+            elem_transitions: RefCell::default(),
         });
         if !s.unique {
             s.transitions.borrow_mut().push((name, t));
@@ -307,8 +313,11 @@ impl Vm {
                 capacity: s.capacity,
                 keys: s.keys.clone(),
                 fields: s.fields.clone(),
+                elems: s.elems,
+                elems_code: s.elems_code,
                 unique: true,
                 transitions: RefCell::default(),
+                elem_transitions: RefCell::default(),
             };
             (*o).shape = self.add_shape(u);
         }
@@ -376,6 +385,54 @@ impl Vm {
                 }
             }
             *Object::slot(o, shape.location(slot)) = value;
+        }
+    }
+
+    /// `shape` with elements of type `elems`. Shared shapes share these
+    /// transitions; unique ones get a fresh unique successor.
+    pub(crate) fn elements_transition(
+        &mut self,
+        shape: *const Shape,
+        elems: FieldType,
+    ) -> *const Shape {
+        let s = unsafe { &*shape };
+        if !s.unique
+            && let Some(&(_, t)) = s
+                .elem_transitions
+                .borrow()
+                .iter()
+                .find(|(e, _)| *e == elems)
+        {
+            return t;
+        }
+        let t = self.add_shape(Shape {
+            class: s.class,
+            proto: s.proto,
+            capacity: s.capacity,
+            keys: s.keys.clone(),
+            fields: s.fields.clone(),
+            elems,
+            elems_code: elems.encode(),
+            unique: s.unique,
+            transitions: RefCell::default(),
+            elem_transitions: RefCell::default(),
+        });
+        if !s.unique {
+            s.elem_transitions.borrow_mut().push((elems, t));
+        }
+        t
+    }
+
+    /// Write element `i` (within capacity) of `o`, first moving `o` to a
+    /// shape whose elements' type `value` fits (see `Shape::elems`).
+    pub(crate) fn store_element(&mut self, o: *mut Object, i: usize, value: Value) {
+        unsafe {
+            let s = &*(*o).shape;
+            let elems = s.elems.join(FieldType::of(value));
+            if elems != s.elems {
+                (*o).shape = self.elements_transition((*o).shape, elems);
+            }
+            *(*o).elems.add(i) = value;
         }
     }
 
@@ -573,6 +630,27 @@ impl Vm {
         Err(Error::unsupported(format!("property key {key:?}")))
     }
 
+    /// `GetKeyed` miss: remember the receiver's shape (for the JIT: its
+    /// elements' type), then `obj[key]`.
+    pub fn get_keyed_miss(
+        &mut self,
+        code: &Code,
+        ic: u16,
+        obj: Value,
+        key: Value,
+    ) -> Result<Value> {
+        if obj.is_cell() {
+            let (ic, _) = code.ic(ic);
+            unsafe {
+                *ic = Ic {
+                    shape: (*as_object(obj)).shape,
+                    ..Ic::EMPTY
+                };
+            }
+        }
+        self.get_keyed(obj, key)
+    }
+
     /// `obj[key]`.
     pub fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
         if !obj.is_cell() {
@@ -622,7 +700,7 @@ impl Vm {
                 }
                 (*o).elems_len = i + 1;
             }
-            *(*o).elems.add(i as usize) = value;
+            self.store_element(o, i as usize, value);
         }
         Ok(())
     }
@@ -829,7 +907,7 @@ fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
         let len = (*o).elems_len as usize;
         vm.reserve_elems(o, len + args.len());
         for (i, &v) in args.iter().enumerate() {
-            *(*o).elems.add(len + i) = v;
+            vm.store_element(o, len + i, v);
         }
         (*o).elems_len = (len + args.len()) as u32;
         Ok(Value::from_i32((*o).elems_len as i32))

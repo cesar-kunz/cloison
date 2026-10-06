@@ -879,12 +879,14 @@ handlers! {
         tail!(slow_set_named, acc)
     }
 
+    // The receiver's shape must be the cached one: the JIT reads the cache
+    // for the elements' type. A miss records the new shape.
     fn op_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         if is_cell(tag, obj) && tag.is_int32(acc) {
             let o = as_object(obj);
             let i = acc.as_i32_unchecked() as u32;
-            if i < (*o).elems_len {
+            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
                 let v = *(*o).elems.add(i as usize);
                 if v != Value::EMPTY {
                     next!(any, Op::GetKeyed.size(), v)
@@ -899,7 +901,7 @@ handlers! {
         if is_cell(tag, obj) {
             let o = as_object(obj);
             let i = raw_i32(acc) as u32;
-            if i < (*o).elems_len {
+            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
                 let v = *(*o).elems.add(i as usize);
                 if v != Value::EMPTY {
                     next!(any, Op::GetKeyed.size(), v)
@@ -915,7 +917,7 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(key) {
             let o = as_object(obj);
             let i = key.as_i32_unchecked() as u32;
-            if i < (*o).elems_len {
+            if i < (*o).elems_len && fits_field(tag, (*(*o).shape).elems_code, acc) {
                 *(*o).elems.add(i as usize) = acc;
                 next!(any, Op::SetKeyed.size(), acc)
             }
@@ -1066,7 +1068,8 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_get_keyed(pc, acc, regs, tag) {
-        let r = (*frame_vm(regs)).get_keyed(*reg(pc, 1, regs), acc);
+        let obj = *reg(pc, 1, regs);
+        let r = (*frame_vm(regs)).get_keyed_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc);
         next_or_throw!(Op::GetKeyed.size(), r)
     }
 

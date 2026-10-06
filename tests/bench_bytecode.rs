@@ -68,17 +68,18 @@ fn hot_property_loops_compile_without_repeated_guards() {
     );
     assert!(s.iter().any(|n| n.contains("set_own_nc_")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("tlt_jf_ii_")), "{s:?}");
-    // 21: `v = vs[i]` is guarded once, then known.
+    // 21: `vs` is known at entry, with elements of `v`'s shape, so `vs[i]`
+    // needs no cell check and gives `v` a known shape: no guards at all.
     let mut vm = Vm::new();
     vm.run(&listing("21-monomorphic-get.asm")).unwrap();
     let s = vm.jit_stencils("main").expect("main's loop compiled");
-    assert!(s.iter().any(|n| n.starts_with("get_keyed_i_")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("get_keyed_i_nc_")), "{s:?}");
+    assert!(
+        s.iter()
+            .all(|n| !n.starts_with("get_own_") || n.starts_with("get_own_nc_")),
+        "{s:?}"
+    );
     // `v.mark == r % 5` and `n += v.value` on int32 fields.
     assert!(s.iter().any(|n| n.starts_with("teq_jt_ii_")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
-    let guarded = s
-        .iter()
-        .filter(|n| n.starts_with("get_own_") && !n.contains("_nc_"))
-        .count();
-    assert_eq!(guarded, 1, "{s:?}");
 }

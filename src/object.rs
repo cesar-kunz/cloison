@@ -186,10 +186,20 @@ pub struct Shape {
     pub keys: Vec<Atom>,
     /// The type of the field in each slot (see [`FieldType`]).
     pub fields: Vec<*const Cell<FieldType>>,
+    /// The type of every element stored in objects of this shape, and its
+    /// encoding for store checks ([`FieldType::encode`]). Unlike a field's
+    /// type it is part of the shape, as V8's elements kinds are part of the
+    /// map: an element store that doesn't fit moves the object to a shape
+    /// with a more general type (`Vm::store_element`), so a shape guard
+    /// also guarantees the elements' type. Holes are not elements.
+    pub elems: FieldType,
+    pub elems_code: u64,
     /// Owned by a single (prototype) object: transitions from it are not
     /// shared, so inline caches must not cache them.
     pub unique: bool,
     pub(crate) transitions: RefCell<Vec<(Atom, *const Shape)>>,
+    /// The shapes this one moves to when its elements' type generalizes.
+    pub(crate) elem_transitions: RefCell<Vec<(FieldType, *const Shape)>>,
 }
 
 impl Shape {
@@ -315,8 +325,11 @@ mod tests {
             capacity: 2,
             keys: vec![Atom(7), Atom(8), Atom(9)],
             fields: Vec::new(),
+            elems: FieldType::None,
+            elems_code: 0,
             unique: false,
             transitions: RefCell::default(),
+            elem_transitions: RefCell::default(),
         };
         assert_eq!(s.location(0), 48);
         assert_eq!(s.location(1), 56);

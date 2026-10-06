@@ -210,6 +210,61 @@ impl fmt::Debug for Value {
     }
 }
 
+/// [`Value::NUMBER_TAG`], kept in a register for the whole run.
+///
+/// x86 instructions can't take a 64-bit immediate. With the tag as a
+/// constant, every int32 test becomes `shr` + `cmp`, and every int32 box a
+/// `movabs`. JSC pins it in a register for the same reason. It's passed as a
+/// handler argument, created once per run by [`NumberTag::new`], so LLVM
+/// can't constant-fold it back in. Shared by the interpreter
+/// (`src/interp.rs`) and the JIT stencils (`stencils/stencils.rs`).
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct NumberTag(u64);
+
+impl Default for NumberTag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NumberTag {
+    /// The tag, laundered through `black_box` so that code taking it as an
+    /// argument can't see it is constant.
+    #[inline(always)]
+    pub fn new() -> Self {
+        NumberTag(std::hint::black_box(Value::NUMBER_TAG))
+    }
+
+    #[inline(always)]
+    pub const fn to_bits(self) -> u64 {
+        self.0
+    }
+
+    #[inline(always)]
+    pub fn is_int32(self, v: Value) -> bool {
+        v.to_bits() >= self.0
+    }
+
+    /// See [`Value::both_int32`].
+    #[inline(always)]
+    pub fn both_int32(self, a: Value, b: Value) -> bool {
+        a.to_bits() & b.to_bits() >= self.0
+    }
+
+    #[inline(always)]
+    pub fn box_i32(self, i: i32) -> Value {
+        Value::from_bits(self.0 | i as u32 as u64)
+    }
+
+    /// Box an `I32`-state accumulator. Its high bits are 0 or the tag, so
+    /// this is one `or` with no truncation.
+    #[inline(always)]
+    pub fn rebox(self, acc: Value) -> Value {
+        Value::from_bits(self.0 | acc.to_bits())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

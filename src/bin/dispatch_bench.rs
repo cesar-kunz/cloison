@@ -1,7 +1,7 @@
 //! Experiment: run counting loops through the tail-call dispatcher.
 //!
 //! ```text
-//! dispatch_bench <program> <codegen> [n]
+//! dispatch_bench <program> <codegen> [n] [engine]
 //!
 //! program:
 //!   int     i = 0; while (i < n) { t = i + i; i = i + 1 }          return t
@@ -12,7 +12,14 @@
 //! codegen:
 //!   generic  constants in registers: `add r`, `jump_if_less r`
 //!   smi      constants as immediates: `add_smi 3`, `jump_if_less_smi n`
+//!
+//! engine:
+//!   interp   the tail-calling interpreter (default)
+//!   jit      the copy-and-patch JIT; compiled once, outside the timing
 //! ```
+//!
+//! With `TOI_JIT_DUMP=<file>`, the JIT's main machine code is written to
+//! `<file>` (see `scripts/jit-asm.sh`).
 //!
 //! `n` is baked into the bytecode, as `i < 100000000` would be. In `double`,
 //! `s` leaves the int32 range after ~65k iterations and `add` takes its slow
@@ -29,7 +36,7 @@ const LIMIT: u8 = 2;
 const K: u8 = 3;
 
 fn usage() -> ! {
-    eprintln!("usage: dispatch_bench <int|const|chain|double> <generic|smi> [n]");
+    eprintln!("usage: dispatch_bench <int|const|chain|double> <generic|smi> [n] [interp|jit]");
     exit(2)
 }
 
@@ -47,6 +54,11 @@ fn main() {
         .get(3)
         .map_or(100_000_000, |s| s.parse().unwrap_or_else(|_| usage()));
     assert!(n > 0, "the loop tests at the bottom, so n must be positive");
+    let jit = match args.get(4).map_or("interp", String::as_str) {
+        "interp" => false,
+        "jit" => true,
+        _ => usage(),
+    };
     let nf = n as f64;
 
     let mut a = Assembler::new();
@@ -90,8 +102,15 @@ fn main() {
     let code = a.finish();
 
     let mut regs = [Value::UNDEFINED; 4];
+    let compiled = jit.then(|| toi::jit::JitCode::compile(&code));
+    if let (Some(c), Ok(path)) = (&compiled, std::env::var("TOI_JIT_DUMP")) {
+        std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
+    }
     let start = Instant::now();
-    let result = unsafe { toi::interp::run(&code, &mut regs) };
+    let result = match &compiled {
+        Some(c) => unsafe { c.run(&mut regs) },
+        None => unsafe { toi::interp::run(&code, &mut regs) },
+    };
     let elapsed = start.elapsed();
 
     assert_eq!(
@@ -100,7 +119,8 @@ fn main() {
         "{program}/{codegen}: got {result:?}"
     );
     println!(
-        "{program}/{codegen} n={n} result={result:?} time={:.3}s {:.2} ns/iter",
+        "{program}/{codegen}/{} n={n} result={result:?} time={:.3}s {:.2} ns/iter",
+        if jit { "jit" } else { "interp" },
         elapsed.as_secs_f64(),
         elapsed.as_nanos() as f64 / nf,
     );

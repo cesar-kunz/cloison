@@ -58,7 +58,7 @@
 //! anything.
 
 use crate::bytecode::Op;
-use crate::value::Value;
+use crate::value::{NumberTag, Value};
 
 pub type Handler = extern "rust-preserve-none" fn(
     *const u8,
@@ -76,42 +76,6 @@ const ACC_I32: bool = cfg!(feature = "acc-i32");
 
 #[repr(transparent)]
 pub struct Table([Handler; 256]);
-
-/// [`Value::NUMBER_TAG`], kept in a register for the whole run.
-///
-/// x86 instructions can't take a 64-bit immediate. With the tag as a
-/// constant, every int32 test becomes `shr` + `cmp`, and every int32 box a
-/// `movabs`. JSC pins it in a register for the same reason. It's passed as a
-/// handler argument, laundered once in [`run`], so LLVM can't
-/// constant-fold it back in.
-#[repr(transparent)]
-#[derive(Clone, Copy)]
-pub struct NumberTag(u64);
-
-impl NumberTag {
-    #[inline(always)]
-    fn is_int32(self, v: Value) -> bool {
-        v.to_bits() >= self.0
-    }
-
-    /// See [`Value::both_int32`].
-    #[inline(always)]
-    fn both_int32(self, a: Value, b: Value) -> bool {
-        a.to_bits() & b.to_bits() >= self.0
-    }
-
-    #[inline(always)]
-    fn box_i32(self, i: i32) -> Value {
-        Value::from_bits(self.0 | i as u32 as u64)
-    }
-
-    /// Box an `I32`-state accumulator. Its high bits are 0 or the tag, so
-    /// this is one `or` with no truncation.
-    #[inline(always)]
-    fn rebox(self, acc: Value) -> Value {
-        Value::from_bits(self.0 | acc.to_bits())
-    }
-}
 
 /// The int32 in an `I32`-state accumulator.
 #[inline(always)]
@@ -483,7 +447,7 @@ handlers! {
 /// `a + b` where at least one side is not a number.
 #[cold]
 #[inline(never)]
-fn generic_add(a: Value, b: Value) -> Value {
+pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     // ToPrimitive is the identity on everything representable so far, and
     // there are no strings yet, so `+` is numeric addition.
     Value::number(a.to_number() + b.to_number())
@@ -492,14 +456,14 @@ fn generic_add(a: Value, b: Value) -> Value {
 /// `a + 1` where `a` is not a number.
 #[cold]
 #[inline(never)]
-fn generic_inc(a: Value) -> Value {
+pub(crate) fn generic_inc(a: Value) -> Value {
     Value::number(a.to_number() + 1.0)
 }
 
 /// `a < b` (IsLessThan) where at least one side is not a number.
 #[cold]
 #[inline(never)]
-fn generic_less_than(a: Value, b: Value) -> bool {
+pub(crate) fn generic_less_than(a: Value, b: Value) -> bool {
     a.to_number() < b.to_number()
 }
 
@@ -544,12 +508,12 @@ static TABLE_I32: Table = {
 /// every path ending in `Return`. There is no verifier yet.
 pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
     let pc = code.as_ptr();
-    // Launder the tables and the number tag so LLVM can't fold them back
-    // into constants (`lea`/`movabs`) in every handler. They must stay
-    // register arguments.
+    // Launder the tables (and, in `NumberTag::new`, the tag) so LLVM can't
+    // fold them back into constants (`lea`/`movabs`) in every handler. They
+    // must stay register arguments.
     let tbl: &'static Table = std::hint::black_box(&TABLE);
     let ti32: &'static Table = std::hint::black_box(&TABLE_I32);
-    let tag = NumberTag(std::hint::black_box(Value::NUMBER_TAG));
+    let tag = NumberTag::new();
     let acc = Value::UNDEFINED;
     unsafe { (tbl.0[*pc as usize])(pc, acc, regs.as_mut_ptr(), tag, tbl, ti32) }
 }

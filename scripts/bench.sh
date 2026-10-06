@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Measure the dispatch_bench matrix (program × codegen × acc-i32 on/off)
-# with hardware counters, and print a markdown table of instructions and
-# cycles per loop iteration.
+# Measure the dispatch_bench matrix (program × codegen × engine) with
+# hardware counters, and print a markdown table of instructions and cycles
+# per loop iteration. Engines:
+#   interp      interpreter without accumulator type state (--no-default-features)
+#   interp+acc  interpreter with acc-i32 (default build)
+#   jit         copy-and-patch JIT (milestone 1, unspecialized)
 #
 # Per-iteration numbers are (run at N) − (run at 1), divided by N − 1, which
 # cancels process startup. Each cell is the minimum over REPS runs, pinned
@@ -16,9 +19,10 @@ CPU=${CPU:-2}
 
 cargo build --release --quiet --bin dispatch_bench
 CARGO_TARGET_DIR=target/no-acc-i32 cargo build --release --quiet --bin dispatch_bench --no-default-features
-declare -A BIN=(
-  [on]=target/release/dispatch_bench
-  [off]=target/no-acc-i32/release/dispatch_bench
+declare -A RUN=(
+  [interp]="target/no-acc-i32/release/dispatch_bench %s %s %s interp"
+  [interp+acc]="target/release/dispatch_bench %s %s %s interp"
+  [jit]="target/release/dispatch_bench %s %s %s jit"
 )
 
 # Print "instructions cycles" for one run: the minimum of each over REPS.
@@ -33,14 +37,16 @@ counters() {
   echo "$best_i $best_c"
 }
 
-echo "| program | codegen | acc-i32 | instr/iter | cycles/iter | IPC |"
+echo "| program | codegen | engine | instr/iter | cycles/iter | IPC |"
 echo "|---|---|---|---:|---:|---:|"
 for program in int const chain double; do
   for codegen in generic smi; do
-    for acc in off on; do
-      read -r i1 c1 < <(counters "${BIN[$acc]}" "$program" "$codegen" 1)
-      read -r iN cN < <(counters "${BIN[$acc]}" "$program" "$codegen" "$N")
-      awk -v p="$program" -v g="$codegen" -v a="$acc" -v n="$N" \
+    for engine in interp interp+acc jit; do
+      # shellcheck disable=SC2059,SC2046
+      read -r i1 c1 < <(counters $(printf "${RUN[$engine]}" "$program" "$codegen" 1))
+      # shellcheck disable=SC2059,SC2046
+      read -r iN cN < <(counters $(printf "${RUN[$engine]}" "$program" "$codegen" "$N"))
+      awk -v p="$program" -v g="$codegen" -v a="$engine" -v n="$N" \
           -v i1="$i1" -v c1="$c1" -v iN="$iN" -v cN="$cN" 'BEGIN {
         ipi = (iN - i1) / (n - 1); cpi = (cN - c1) / (n - 1)
         printf "| %s | %s | %s | %.2f | %.2f | %.2f |\n", p, g, a, ipi, cpi, ipi / cpi

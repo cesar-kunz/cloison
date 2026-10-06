@@ -1813,3 +1813,118 @@ end
         "TypeError: Cannot read properties of undefined (reading 'x')"
     );
 }
+
+// ---- Direct calls between compiled functions ----
+//
+// Callees with a loop, padded past the inlining limit (64 instructions),
+// called from compiled loops: the call goes straight into the callee's
+// compiled code, a version for the arguments' types.
+
+/// `function name(k) { calls++; s = k; for (i = 0; i < 10; i++) s += i;
+/// return s + 64 × step }`, padded with 64 `AddSmi step`.
+fn padded(name: &str, step: i32) -> String {
+    let pad: String = (0..64)
+        .map(|_| format!("        AddSmi {step}\n"))
+        .collect();
+    format!(
+        "function {name}(k)\n        LdaGlobal calls\n        Inc\n        StaGlobal calls\n\
+         \x20       Ldar r1\n        Star r3\n        LdaSmi 0\n        Star r2\n\
+         loop:   Ldar r2\n        Add r3\n        Star r3\n        Ldar r2\n        Inc\n\
+         \x20       Star r2\n        JumpIfLessSmi 10, loop\n        Ldar r3\n{pad}        Return\nend\n"
+    )
+}
+
+/// A script calling `main`, whose loop runs `n` times: `total += f(arg)`
+/// with `f` from r3 and `arg = i & 7`, after `hook` (code run each
+/// iteration, with `i` in r1); returns `total + calls`. Before the loop,
+/// r5 holds 2147483600 and r6 the function `f2` (or `f1`, without one), so
+/// that hooks change no inline cache the compiled loop depends on.
+fn direct_program(n: i32, hook: &str, functions: &str) -> String {
+    let second = if functions.contains("function f2(") {
+        "f2"
+    } else {
+        "f1"
+    };
+    format!(
+        "script\n        LdaSmi 0\n        StaGlobal calls\n\
+         \x20       CreateClosure f1\n        StaGlobal f\n        CreateClosure {second}\n        StaGlobal g\n\
+         \x20       CreateClosure main\n        StaGlobal main\n\
+         \x20       LdaGlobal main\n        Star r1\n        CallUndefined r1, r2, 0\n        Return\nend\n\
+         {functions}\
+         function main()                 ; r1 i, r2 total, r3 f, r4 arg, r5 big, r6 g\n\
+         \x20       LdaSmi 2147483600\n        Star r5\n        LdaGlobal g\n        Star r6\n\
+         \x20       LdaGlobal f\n        Star r3\n\
+         \x20       LdaSmi 0\n        Star r1\n        Star r2\n\
+         top:    Ldar r1\n        BitAndSmi 7\n        Star r4\n\
+         {hook}\
+         call:   CallUndefined r3, r4, 1\n        Add r2\n        Star r2\n\
+         \x20       Ldar r1\n        Inc\n        Star r1\n        JumpIfLessSmi {n}, top\n\
+         \x20       LdaGlobal calls\n        Add r2\n        Return\nend\n"
+    )
+}
+
+#[test]
+fn direct_calls_into_compiled_callees() {
+    let src = direct_program(500, "", &padded("f1", 1));
+    // Σ (i & 7) + 45 + 64 over 500 iterations, plus 500 calls.
+    let expected: u64 = (0..500u64).map(|i| (i & 7) + 109).sum::<u64>() + 500;
+    let (v, s) = jit(&src);
+    assert_eq!(v, expected.to_string());
+    assert!(s.iter().any(|n| n == "call_direct"), "{s:?}");
+}
+
+/// At i = 300 the argument is near the int32 limit: the direct callee's
+/// add overflows and exits, inside the callee; the runtime finishes that
+/// call (once: `calls` would show a second) and later calls work on.
+#[test]
+fn exits_in_direct_callees_finish_in_the_interpreter() {
+    let hook = "        Ldar r1\n        TestEqualSmi 300\n        JumpIfFalse call\n\
+                \x20       Ldar r5\n        Star r4\n";
+    let src = direct_program(500, hook, &padded("f1", 1));
+    let expected: u64 = (0..500u64)
+        .map(|i| {
+            if i == 300 {
+                2147483600 + 109
+            } else {
+                (i & 7) + 109
+            }
+        })
+        .sum::<u64>()
+        + 500;
+    assert_eq!(jit(&src).0, expected.to_string());
+}
+
+/// From i = 300 the callee is another function: the direct call's check of
+/// the callee fails, and the call goes through the runtime.
+#[test]
+fn direct_calls_check_the_callee() {
+    let hook = "        Ldar r1\n        TestEqualSmi 300\n        JumpIfFalse call\n\
+                \x20       Ldar r6\n        Star r3\n";
+    let functions = padded("f1", 1) + &padded("f2", 2);
+    let src = direct_program(500, hook, &functions);
+    let expected: u64 = (0..500u64)
+        .map(|i| (i & 7) + 45 + if i < 300 { 64 } else { 128 })
+        .sum::<u64>()
+        + 500;
+    assert_eq!(jit(&src).0, expected.to_string());
+}
+
+#[test]
+fn errors_in_direct_callees() {
+    // At i = 300, f is called with undefined, and reads a property of it.
+    let pad: String = (0..64).map(|_| "        AddSmi 1\n").collect();
+    let f1 = format!(
+        "function f1(k)\n        LdaSmi 0\n        Star r2\n\
+         loop:   Ldar r2\n        Inc\n        Star r2\n        JumpIfLessSmi 3, loop\n\
+         \x20       Ldar r1\n        JumpIfToBooleanTrue num\n        GetNamed r1, x\n\
+         num:    Ldar r2\n{pad}        Return\nend\n"
+    );
+    let hook = "        Ldar r1\n        TestEqualSmi 300\n        JumpIfFalse call\n\
+                \x20       LdaUndefined\n        Star r4\n";
+    let src = direct_program(500, hook, &f1);
+    let e = run(&src).unwrap_err();
+    assert_eq!(
+        e.0,
+        "TypeError: Cannot read properties of undefined (reading 'x')"
+    );
+}

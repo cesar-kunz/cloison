@@ -815,6 +815,13 @@ impl Vm {
     /// The receiver for `new f`: a new object whose prototype is
     /// `f.prototype` (or `Object.prototype` if that is not an object).
     pub(crate) fn construct_this(&mut self, f: *mut Object) -> Value {
+        let s = self.ctor_root(f);
+        object_value(self.heap.alloc_object(unsafe { &*s }))
+    }
+
+    /// The shape `new f` gives `this` now: the root for `f.prototype` and
+    /// `f`'s in-object capacity.
+    pub(crate) fn ctor_root(&mut self, f: *mut Object) -> *const Shape {
         unsafe {
             debug_assert_eq!((*f).class, Class::Function);
             let code = &*(*f).code;
@@ -831,7 +838,7 @@ impl Vm {
                 s = self.root_shape(Class::Plain, proto, cap);
                 code.ctor_shape.set(s);
             }
-            object_value(self.heap.alloc_object(&*s))
+            s
         }
     }
 

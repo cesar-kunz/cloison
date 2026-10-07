@@ -134,6 +134,7 @@ unsafe extern "C" {
     fn toi_rt_to_boolean();
     fn toi_rt_call();
     fn toi_rt_enter();
+    fn toi_rt_construct();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -2025,6 +2026,12 @@ macro_rules! property_location {
             *at_imm(get!($loc, s).to_bits() as *mut u8) = s.acc;
             next!(s)
         });
+        stencil!("set_tr_nc_", loc!($loc); |s| {
+            let o = get!($loc, s).to_bits() as *mut u8;
+            *(o as *mut u64) = imm64b();
+            *at_imm(o) = s.acc;
+            next!(s)
+        });
         stencil!("set_oop_nc_", loc!($loc); |s| {
             *at_imm(props(get!($loc, s).to_bits() as *mut u8)) = s.acc;
             next!(s)
@@ -2158,24 +2165,33 @@ struct DirectSite {
 // the call site (`DirectSite` at `imm64`) has an entry, the callee
 // register holds the function compiled, and the VM stack has room;
 // otherwise through the runtime, as `call`. Leave after it as `call` does.
-stencil!("call_direct"; |s| {
-    let regs = Value::from_bits(s.regs as u64);
-    let site = imm64() as *const DirectSite;
-    let base = s.regs as *const u8;
-    let r = if (*site).entry != 0
-        && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
-        && base as u64 + (*site).end_off <= (*site).stack_end
-    {
-        Value::from_bits(rt_call!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))
-    } else {
-        Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
+//
+// `construct_direct` is the same for `new`, entering through
+// `toi_rt_construct`, which allocates `this` first.
+macro_rules! direct_call {
+    ($name:literal, $enter:ident) => {
+        stencil!($name; |s| {
+            let regs = Value::from_bits(s.regs as u64);
+            let site = imm64() as *const DirectSite;
+            let base = s.regs as *const u8;
+            let r = if (*site).entry != 0
+                && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
+                && base as u64 + (*site).end_off <= (*site).stack_end
+            {
+                Value::from_bits(rt_call!(s, $enter, regs, Value::from_bits(site as u64)))
+            } else {
+                Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
+            };
+            s.acc = r;
+            if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+                exit!(s)
+            }
+            next!(s)
+        });
     };
-    s.acc = r;
-    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-        exit!(s)
-    }
-    next!(s)
-});
+}
+direct_call!("call_direct", toi_rt_enter);
+direct_call!("construct_direct", toi_rt_construct);
 
 // Before an inlined call: the callee must be the function inlined
 // (`imm64`), or leave before the call.

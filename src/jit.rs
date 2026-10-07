@@ -309,6 +309,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
         "toi_rt_enter" => toi_rt_enter as *const () as usize,
+        "toi_rt_construct" => toi_rt_construct as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
         "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
@@ -1365,6 +1366,9 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 }
             }
             let base = match spec.props.get(i) {
+                Some(Prop::Call { direct: true, .. }) if insn.op == Op::Construct => {
+                    "construct_direct"
+                }
                 Some(Prop::Call { direct: true, .. }) => "call_direct",
                 _ => "call",
             };
@@ -1660,7 +1664,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     }
                 }
                 out.regs[r] = Ty::Obj(new_shape);
-                finish(Sel::new("set_tr", "", out), ft)
+                finish(Sel::new("set_tr", case, out), ft)
             }
             _ => bail(out),
         }
@@ -2166,7 +2170,7 @@ fn stencil_for(
         ("check_callee", _) => format!("check_callee_{loc}"),
         ("check_tail_callee", _) => format!("check_tail_callee_{loc}"),
         // The callee reads its arguments from memory.
-        ("call" | "call_direct", _) => {
+        ("call" | "call_direct" | "construct_direct", _) => {
             for r in insn.call_reads() {
                 match homes[r] {
                     Home::Mem => {}
@@ -3013,10 +3017,14 @@ impl JitCode {
             let insn = &insns[i];
             let ty = |r: usize| st.regs.get(r).copied().unwrap_or(Ty::Any);
             let w = insn.reg2 as usize;
-            let (this, first) = if insn.op == Op::Call {
-                (ty(w), w + 1)
-            } else {
-                (Ty::Any, w)
+            let (this, first) = match (insn.op, props.get(i)) {
+                (Op::Call, _) => (ty(w), w + 1),
+                // `new`: an object of the shape the site allocates.
+                (Op::Construct, Some(Prop::Call { site, .. })) => {
+                    let s = unsafe { (*vm_sites[*site as usize].get()).this_shape };
+                    (if s == 0 { Ty::Any } else { Ty::Obj(s) }, w)
+                }
+                _ => (Ty::Any, w),
             };
             let args: Vec<Ty> = (first..first + insn.imm as usize).map(ty).collect();
             (this, args)
@@ -3128,6 +3136,11 @@ impl JitCode {
                         let site = vm_sites[*site as usize].get();
                         if unsafe { (*site).self_call } {
                             return own;
+                        }
+                        // `new` gives `this`, mostly: what the
+                        // constructor's objects have been.
+                        if insns[i].op == Op::Construct {
+                            return unsafe { runtime_result((*site).cached, Op::Construct) };
                         }
                         let (this, args) = call_types(i, st);
                         match unsafe { direct_version(site, this, &args) } {
@@ -3394,7 +3407,7 @@ impl JitCode {
                 exit: i,
                 ..Piece::new(name, 0)
             });
-            let is_call = name == "call" || name == "call_direct";
+            let is_call = matches!(name.as_str(), "call" | "call_direct" | "construct_direct");
             // The check of a call's result exits after the call too, through
             // a stub of its own, whose record says the check failed.
             let result = s.result.map(|(name, imm64)| {
@@ -3873,6 +3886,9 @@ pub(crate) struct CallSite {
     stack_end: u64,
     /// The VM's native stack limit (see `interp::native_stack_low`).
     native_limit: *const usize,
+    /// For `new`: the shape `this` is allocated with, which the callee's
+    /// version is bound for (0 if none is known).
+    this_shape: u64,
     vm: *mut crate::vm::Vm,
     op: Op,
     f: usize,
@@ -4263,6 +4279,7 @@ impl Lowering<'_> {
                         end_off: 0,
                         stack_end: unsafe { (*vm).stack_end } as u64,
                         native_limit: unsafe { &raw const (*vm).native_limit },
+                        this_shape: 0,
                         vm,
                         op: i.op,
                         f: i.reg as usize,
@@ -4348,11 +4365,16 @@ impl Lowering<'_> {
         if matches!(class, Class::Function | Class::Native) {
             site.cached = unsafe { (*fo).code };
         }
-        if class != Class::Function || i.op == Op::Construct {
+        if class != Class::Function {
             return false;
         }
         let callee = unsafe { (*fo).code };
-        site.self_call = callee == self.state.root;
+        // A constructor's `this` is allocated by the call
+        // (`toi_rt_construct`), with the shape its root has now.
+        if i.op == Op::Construct {
+            site.this_shape = unsafe { (*self.state.vm).ctor_root(fo) } as u64;
+        }
+        site.self_call = callee == self.state.root && i.op != Op::Construct;
         site.closure = fo as u64;
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
@@ -4516,7 +4538,7 @@ impl Lowering<'_> {
         };
         if has_this {
             store(self, Some(w), 0);
-        } else if live[0] {
+        } else if live[0] && i.op != Op::Construct {
             store(self, None, 0);
         }
         let args = w + usize::from(has_this);
@@ -5414,7 +5436,8 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "mov rax, [rsi + {frame}]",
         "lea r13, [rdi + rax * 8]",
         // The frame's flags: not a `new` frame (its header isn't written
-        // otherwise; see `check_tail_callee`).
+        // otherwise; see `check_tail_callee`). For `new`, either:
+        // `toi_rt_construct` makes the result from its own `this`.
         "mov qword ptr [r13 - {flags}], 0",
         "movabs r14, {tag}",
         "mov r15, rsp",
@@ -5477,7 +5500,8 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "ldr x9, [x1, #{frame}]",
         "add x21, x0, x9, lsl #3",
         // The frame's flags: not a `new` frame (its header isn't written
-        // otherwise; see `check_tail_callee`).
+        // otherwise; see `check_tail_callee`). For `new`, either:
+        // `toi_rt_construct` makes the result from its own `this`.
         "stur xzr, [x21, #-{flags}]",
         "mov x22, #{tag_hi}",
         "lsl x22, x22, #48",
@@ -5514,6 +5538,41 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         undefined = const Value::UNDEFINED.to_bits(),
         exit = sym toi_direct_exit,
     )
+}
+
+/// `construct_direct` stencils, once their checks passed: `new` of the
+/// callee of `site` (a `CallSite`), whose frame the compiled frame `regs`
+/// has set up but for `this`. Allocate `this`, and if it has the shape the
+/// callee's version was bound for, enter that (`toi_rt_enter`); otherwise
+/// (the constructor's root changed: its prototype, or its objects' size)
+/// go through the runtime, from now on. The result is the constructor's,
+/// if an object, else `this`. `EMPTY` on an error.
+///
+/// The frame isn't marked as a `new` one: this function keeps `this` and
+/// makes the result, also after an exit (the interpreter finishes the
+/// frame as a plain call) and after a self tail call reused the frame
+/// (whose `this` is then the tail call's).
+extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
+    unsafe {
+        let s = site.to_bits() as *mut CallSite;
+        let vm = &mut *(*s).vm;
+        let this = vm.construct_this((*s).closure as *mut Object);
+        let o = crate::object::as_object(this);
+        if (*s).this_shape != 0 && (*o).shape as u64 != (*s).this_shape {
+            (*s).entry = 0;
+            return toi_rt_call(regs, site);
+        }
+        *(regs.to_bits() as *mut Value).add((*s).frame) = this;
+        let v = toi_rt_enter(regs, site);
+        if v.to_bits() == 0 || v.is_cell() {
+            // An error, or an object: the constructor's, or (through the
+            // runtime, the native stack being low) `new`'s already.
+            v
+        } else {
+            crate::vm::Vm::construct_done(&*(*s).callee, o);
+            this
+        }
+    }
 }
 
 /// [`toi_rt_enter`]: the callee's code exited with `record` and `acc`.
@@ -5566,6 +5625,8 @@ unsafe fn direct_exit(
             let mut slot = (*site.callee).jit.borrow_mut();
             slot.as_mut().unwrap().vm_finish(code, 0, record as usize)
         };
+        // Not a `new` frame, even for `new`: `toi_rt_construct` makes the
+        // result.
         interp::write_frame_header(vm, callee_regs, site.callee, std::ptr::null(), caller, 0);
         let r = materialize(vm, callee_regs, code, frame, exit_pc, acc);
         interp::drive(vm, r.pc, r.acc, r.regs)

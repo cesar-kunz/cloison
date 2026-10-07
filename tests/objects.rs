@@ -1515,9 +1515,12 @@ end
     // Twice fib(0) + … + fib(14) = 2 × 986, plus 30.
     let (v, s) = jit(src);
     assert_eq!(v, "2002");
-    // Through the runtime, with their results predicted: `new Box`'s, and
-    // `push`'s.
-    assert!(s.iter().any(|n| n == "call+check_acc_shape"), "{s:?}");
+    // With their results predicted: `new Box` (called directly) and `push`
+    // (through the runtime).
+    assert!(
+        s.iter().any(|n| n == "construct_direct+check_acc_shape"),
+        "{s:?}"
+    );
     assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
 }
 
@@ -2153,22 +2156,278 @@ end
     )
 }
 
-/// Through the runtime, `new Box(i)` is predicted to give an object of the
-/// shape `Box`'s objects have had, so loading `v` needs no guard, and
-/// `push` an int32, as natives declare, so the add is on int32s.
+/// `new Box(i)` (a direct call) is predicted to give an object of the shape
+/// `Box`'s objects have had, so loading `v` needs no guard, and `push`
+/// (through the runtime) an int32, as natives declare, so the add is on
+/// int32s. `Box` itself is compiled knowing `this`'s shape: storing `v`
+/// is a transition without a guard.
 #[test]
 fn runtime_call_results_are_predicted() {
     let src = runtime_calls_program("        Ldar r1\n        SetNamed r0, v\n");
     // Σ i + Σ (i + 1), the array's length after each push.
     let (v, s) = jit(&src);
     assert_eq!(v, (300 * 300).to_string());
-    assert!(s.iter().any(|n| n == "call+check_acc_shape"), "{s:?}");
+    assert!(
+        s.iter().any(|n| n == "construct_direct+check_acc_shape"),
+        "{s:?}"
+    );
     assert!(s.iter().any(|n| n.starts_with("get_own_nc_")), "{s:?}");
     assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
     assert!(
         s.iter().filter(|n| n.starts_with("add_ii_")).count() >= 2,
         "{s:?}"
     );
+    let m = toi::asm::parse(&src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(2);
+    vm.run(&m).unwrap();
+    let s = vm
+        .jit_stencils("Box")
+        .expect("Box compiled for the direct call");
+    assert!(s.iter().any(|n| n.starts_with("set_tr_nc_")), "{s:?}");
+    assert_eq!(vm.jit_bound_direct_calls("main"), 1);
+}
+
+/// From k = 148, `Box`'s `k + 2147483500` overflows int32 and its code
+/// (entered directly) exits: the interpreter finishes the `new` frame
+/// (the exit writes its header with the `new` flag), so the result is
+/// still `this`, not `Box`'s `undefined`.
+#[test]
+fn exits_in_direct_constructors() {
+    let body = "        Ldar r1\n        AddSmi 2147483500\n        SetNamed r0, v\n";
+    let (v, _) = jit(&runtime_calls_program(body));
+    let expected: u64 = 300 * 2147483500 + (0..300).sum::<u64>() + (1..=300).sum::<u64>();
+    assert_eq!(v, expected.to_string());
+}
+
+/// From k = 200, `Box` gives its objects 5 more properties, past the
+/// in-object capacity: `new` then allocates `this` from another root, not
+/// the shape `Box`'s version was bound for, and goes through the runtime.
+#[test]
+fn direct_constructors_whose_root_changes() {
+    let mut body = String::from(
+        "        Ldar r1\n        SetNamed r0, v\n        Ldar r1\n        JumpIfLessSmi 200, done\n",
+    );
+    for p in ["a", "b", "c", "d", "e"] {
+        body += &format!("        LdaSmi 0\n        SetNamed r0, {p}\n");
+    }
+    body += "done:\n";
+    let (v, _) = jit(&runtime_calls_program(&body));
+    assert_eq!(v, (300 * 300).to_string());
+}
+
+/// The loop sets `Box.prototype` to `other` (whose `w` is 10; the first
+/// prototype's is 1) at i = 100, to `last` (1000) at 200, and to `other`
+/// again at 250. The first two exit the loop's code (their stores hadn't
+/// run), which compiles again, binding `new Box` for the new root. The
+/// third runs compiled, and the field's type is general by then: nothing
+/// is compiled again. `new Box` then allocates `this` from another root,
+/// with the other prototype, not the shape `Box`'s version was bound for,
+/// and goes through the runtime. Entering the version would give the
+/// object the old prototype back.
+#[test]
+fn direct_constructors_see_prototype_changes() {
+    let src = "\
+script
+        CreateClosure Box
+        StaGlobal Box
+        LdaGlobal Box
+        Star r1
+        GetNamed r1, prototype
+        Star r2
+        LdaSmi 1
+        SetNamed r2, w
+        CreateArray
+        Star r1
+        LdaSmi 10
+        SetNamed r1, w
+        Ldar r1
+        StaGlobal other
+        CreateArray
+        Star r1
+        LdaSmi 1000
+        SetNamed r1, w
+        Ldar r1
+        StaGlobal last
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function Box(k)
+        Ldar r1
+        SetNamed r0, v
+        LdaUndefined
+        Return
+end
+function main()                 ; r1 i, r2 total
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   Ldar r1
+        TestEqualSmi 100
+        JumpIfTrue first
+        Ldar r1
+        TestEqualSmi 250
+        JumpIfFalse second
+first:  LdaGlobal Box
+        Star r3
+        LdaGlobal other
+        SetNamed r3, prototype
+second: Ldar r1
+        TestEqualSmi 200
+        JumpIfFalse new
+        LdaGlobal Box
+        Star r3
+        LdaGlobal last
+        SetNamed r3, prototype
+new:    LdaGlobal Box
+        Star r4
+        Ldar r1
+        Star r5
+        Construct r4, r5, 1
+        Star r6
+        GetNamed r6, w
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 300, loop
+        Ldar r2
+        Return
+end
+";
+    let (v, _) = jit(src);
+    assert_eq!(v, (100 + 100 * 10 + 50 * 1000 + 50 * 10).to_string());
+}
+
+/// A compiled loop calls `new F(3)` directly, `F` tail-calling itself and
+/// returning `this` (see `self_tail_calls_keep_new_frames`). The tail call
+/// may reuse the frame, overwriting `this` there: `toi_rt_construct` keeps
+/// its own, so the result is never `undefined`.
+#[test]
+fn direct_constructors_keep_their_frames() {
+    let src = "\
+script
+        CreateClosure F
+        StaGlobal F
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function F(n)
+        Ldar r1
+        JumpIfLessSmi 1, done
+        LdaGlobal F
+        Star r2
+        Ldar r1
+        AddSmi -1
+        Star r3
+        CallUndefined r2, r3, 1
+        Return
+done:   Ldar r0
+        Return
+end
+function main()                 ; r1 i, r2 how many results were undefined
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   LdaGlobal F
+        Star r4
+        LdaSmi 3
+        Star r5
+        CallUndefined r4, r5, 1
+        LdaGlobal F
+        Star r4
+        LdaSmi 3
+        Star r5
+        Construct r4, r5, 1
+        Star r6
+        LdaUndefined
+        TestEqual r6
+        JumpIfFalse next
+        Ldar r2
+        Inc
+        Star r2
+next:   Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 100, loop
+        Ldar r2
+        Return
+end
+";
+    let (v, s) = jit(src);
+    assert_eq!(v, "0");
+    assert!(s.iter().any(|n| n.starts_with("construct_direct")), "{s:?}");
+}
+
+/// For odd `k`, `R` returns another object (`other`, whose `v` is 1000)
+/// instead of `this`: that is the result of `new`, called directly. Its
+/// shape isn't `this`'s, so the result's check fails, and the call is
+/// untyped from then on.
+#[test]
+fn direct_constructors_returning_objects() {
+    let src = "\
+script
+        CreateArray
+        Star r1
+        LdaSmi 1000
+        SetNamed r1, v
+        Ldar r1
+        StaGlobal other
+        CreateClosure R
+        StaGlobal R
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function R(k)
+        Ldar r1
+        BitAndSmi 1
+        TestEqualSmi 1
+        JumpIfFalse even
+        LdaGlobal other
+        Return
+even:   Ldar r1
+        SetNamed r0, v
+        LdaUndefined
+        Return
+end
+function main()                 ; r1 i, r2 total
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   LdaGlobal R
+        Star r4
+        Ldar r1
+        Star r5
+        Construct r4, r5, 1
+        Star r6
+        GetNamed r6, v
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 300, loop
+        Ldar r2
+        Return
+end
+";
+    let (v, s) = jit(src);
+    let even: i32 = (0..300).step_by(2).sum();
+    assert_eq!(v, (even + 150 * 1000).to_string());
+    assert!(s.iter().any(|n| n == "construct_direct"), "{s:?}");
 }
 
 /// From k = 200, `Box` adds `w` first: its objects get another shape, the

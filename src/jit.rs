@@ -1341,6 +1341,13 @@ pub(crate) enum Prop {
     Keyed { shape: u64, elems: FieldType },
     /// A `GetNamed` that read an array's or a string's `length`.
     Length,
+    /// A named access whose cache holds several receiver shapes: one
+    /// guard dispatching to `n` accesses, one per shape (see
+    /// [`Case`]).
+    Poly {
+        n: u8,
+        cases: [Case; crate::vm::IC_WAYS],
+    },
     /// A call, described by `CallSite` number `site` of the lowering:
     /// straight into the callee's compiled code if `direct`, else through
     /// the runtime. The VM's code epoch, at `epoch_addr`, must still be
@@ -1351,6 +1358,98 @@ pub(crate) enum Prop {
         epoch: u32,
         epoch_addr: u64,
     },
+}
+
+impl Prop {
+    /// A monomorphic property access's stencil operands `(imm, imm64,
+    /// imm64b)`: the offset, the receiver's shape, and a prototype's slot
+    /// address or the new shape.
+    fn operands(self) -> Option<(i32, u64, u64)> {
+        match self {
+            Prop::Own { shape, off, .. } | Prop::Oop { shape, off, .. } => Some((off, shape, 0)),
+            Prop::Proto { shape, addr, .. } => Some((0, shape, addr)),
+            Prop::Transition {
+                shape,
+                new_shape,
+                off,
+                ..
+            } => Some((off, shape, new_shape)),
+            _ => None,
+        }
+    }
+}
+
+/// One shape of a polymorphic access ([`Prop::Poly`]): a receiver of shape
+/// `shape` has the property at `loc`, of type `ft`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Case {
+    pub shape: u64,
+    pub loc: CaseLoc,
+    pub ft: FieldType,
+}
+
+/// Where a [`Case`]'s property is, as in the monomorphic [`Prop`]s.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaseLoc {
+    Own(i32),
+    Oop(i32),
+    Proto(u64),
+    Transition { new_shape: u64, off: i32 },
+}
+
+impl Case {
+    const NONE: Case = Case {
+        shape: 0,
+        loc: CaseLoc::Own(0),
+        ft: FieldType::None,
+    };
+
+    /// The case of a monomorphic property access, if it is one.
+    fn of(prop: Prop) -> Option<Case> {
+        let (shape, loc, ft) = match prop {
+            Prop::Own { shape, off, ft } => (shape, CaseLoc::Own(off), ft),
+            Prop::Oop { shape, off, ft } => (shape, CaseLoc::Oop(off), ft),
+            Prop::Proto { shape, addr, ft } => (shape, CaseLoc::Proto(addr), ft),
+            Prop::Transition {
+                shape,
+                new_shape,
+                off,
+                ft,
+            } => (shape, CaseLoc::Transition { new_shape, off }, ft),
+            _ => return None,
+        };
+        Some(Case { shape, loc, ft })
+    }
+
+    /// The monomorphic access for this case alone.
+    fn prop(&self) -> Prop {
+        let (shape, ft) = (self.shape, self.ft);
+        match self.loc {
+            CaseLoc::Own(off) => Prop::Own { shape, off, ft },
+            CaseLoc::Oop(off) => Prop::Oop { shape, off, ft },
+            CaseLoc::Proto(addr) => Prop::Proto { shape, addr, ft },
+            CaseLoc::Transition { new_shape, off } => Prop::Transition {
+                shape,
+                new_shape,
+                off,
+                ft,
+            },
+        }
+    }
+
+    /// The access for a receiver known to have the case's shape: its
+    /// `_nc` stencil family (load or store) and operands `(imm, imm64b)`.
+    fn access(&self, load: bool) -> (&'static str, i32, u64) {
+        match (self.loc, load) {
+            (CaseLoc::Own(off), true) => ("get_own", off, 0),
+            (CaseLoc::Oop(off), true) => ("get_oop", off, 0),
+            (CaseLoc::Proto(addr), true) => ("get_proto", 0, addr),
+            (CaseLoc::Own(off), false) => ("set_own", off, 0),
+            (CaseLoc::Oop(off), false) => ("set_oop", off, 0),
+            (CaseLoc::Transition { new_shape, off }, false) => ("set_tr", off, new_shape),
+            _ => unreachable!("a load's case is no transition, a store's no prototype's"),
+        }
+    }
 }
 
 /// The VM state the JIT reads to compile a function's property accesses.
@@ -1376,6 +1475,11 @@ fn split_location(loc: i32) -> (bool, i32) {
 }
 
 impl Feedback {
+    /// Way 0 of inline-cache slot `k`, the other ways following.
+    fn ic(&self, k: usize) -> *const crate::vm::Ic {
+        unsafe { self.ics.add(k * crate::vm::IC_WAYS) }
+    }
+
     /// The property name a property instruction accesses.
     fn name(&self, insn: &Insn) -> Atom {
         unsafe { *self.names.add(insn.imm as usize) }
@@ -1394,7 +1498,7 @@ impl Feedback {
         {
             return Prop::None;
         }
-        let ic = unsafe { *self.ics.add(insn.imm as usize) };
+        let ic = unsafe { *self.ic(insn.imm as usize) };
         if insn.op == Op::GetNamed && ic.loc == crate::vm::LENGTH_LOC {
             return Prop::Length;
         }
@@ -1407,6 +1511,37 @@ impl Feedback {
                 elems: unsafe { (*ic.shape).elems },
             };
         }
+        if !matches!(insn.op, Op::GetNamed | Op::SetNamed) {
+            return self.way(insn, ic, epoch);
+        }
+        // Named accesses: every way that caches something usable.
+        let mut cases = [Case::NONE; crate::vm::IC_WAYS];
+        let mut n = 0;
+        let mut first = Prop::None;
+        for k in 0..crate::vm::IC_WAYS {
+            let w = unsafe { *self.ic(insn.imm as usize).add(k) };
+            if w.shape.is_null() {
+                break;
+            }
+            let p = self.way(insn, w, epoch);
+            if let Some(c) = Case::of(p) {
+                if n == 0 {
+                    first = p;
+                }
+                cases[n] = c;
+                n += 1;
+            }
+        }
+        match n {
+            0 => Prop::None,
+            1 => first,
+            _ => Prop::Poly { n: n as u8, cases },
+        }
+    }
+
+    /// What one way `ic` of instruction `insn`'s inline cache says (see
+    /// [`Feedback::prop`]).
+    fn way(&self, insn: &Insn, ic: crate::vm::Ic, epoch: u32) -> Prop {
         let shape = ic.shape as u64;
         let (oop, off) = split_location(ic.loc);
         // Stencils take the offset in 16 bits on arm64.
@@ -1507,8 +1642,23 @@ impl Ty {
             (a, b) if a == b => a,
             (Bot, t) | (t, Bot) => t,
             (I32, F64) | (F64, I32) => F64,
-            (Obj(a) | Ext(a), Obj(b) | Ext(b)) if a == b => Ext(a),
+            (Obj(a) | Ext(a), Obj(b) | Ext(b)) => Ty::join_shapes(a, b),
             _ => Any,
+        }
+    }
+
+    /// The join of two object types, of shapes `a` and `b`: `Ext` of the
+    /// one the other extends, if one does (an object of either has its
+    /// properties where it has them). Out of line, to keep `join` small.
+    #[inline(never)]
+    fn join_shapes(a: u64, b: u64) -> Ty {
+        let (sa, sb) = (a as *const Shape, b as *const Shape);
+        if a == b || unsafe { extends(sa, sb) } {
+            Ty::Ext(b)
+        } else if unsafe { extends(sb, sa) } {
+            Ty::Ext(a)
+        } else {
+            Ty::Any
         }
     }
 
@@ -1974,7 +2124,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let Some(fb) = spec.feedback.map(|f| &f[insn.frame as usize]) else {
                 return Sel::new("bail", "", out);
             };
-            let shape = unsafe { (*fb.ics.add(insn.ic as usize)).shape };
+            let shape = unsafe { (*fb.ic(insn.ic as usize)).shape };
             if shape.is_null() {
                 return Sel::new("bail", "", out);
             }
@@ -2197,6 +2347,20 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     Sel::new(base, case, out)
 }
 
+/// Whether shape `s` extends shape `b`: same class, prototype and
+/// capacity, and `b`'s properties first, where `b` has them, as a shape
+/// reached from `b` by adding properties or generalizing its elements has.
+/// An object of shape `s` passes for one of `b` (`Ty::Ext(b)`).
+unsafe fn extends(s: *const Shape, b: *const Shape) -> bool {
+    let (s, b) = unsafe { (&*s, &*b) };
+    s.class == b.class
+        && s.proto == b.proto
+        && s.capacity.get() == b.capacity.get()
+        && s.keys.starts_with(&b.keys)
+        && s.attrs.starts_with(&b.attrs)
+        && s.fields.starts_with(&b.fields)
+}
+
 /// `select` for `GetNamed`, `SetNamed`, `LdaGlobal` and `StaGlobal`.
 ///
 /// - A receiver whose shape is known (`Obj` or `Ext`) and has the property
@@ -2290,6 +2454,49 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 }
             }
         }
+        // Several shapes: one of them if the receiver's is known, else a
+        // dispatch on the shape. A load's type is their fields' join; a
+        // store's check, the same for all, goes before it.
+        let collapsed = matches!((prop, reg), (Prop::Poly { .. }, Ty::Obj(_)));
+        let prop = match (prop, reg) {
+            (Prop::Poly { n, cases }, Ty::Obj(s)) => cases[..n as usize]
+                .iter()
+                .find(|c| c.shape == s)
+                .map_or(Prop::None, |c| c.prop()),
+            (Prop::Poly { n, cases }, _) => {
+                let cases = &cases[..n as usize];
+                let ft = cases.iter().fold(FieldType::None, |a, c| a.join(c.ft));
+                // Past the dispatch, the receiver has one of the shapes: if
+                // they all extend one of them, it is known to extend that.
+                if !matches!(reg, Ty::Ext(_))
+                    && let Some(base) = cases.iter().map(|c| c.shape).find(|&b| {
+                        cases
+                            .iter()
+                            .all(|c| unsafe { extends(c.shape as *const Shape, b as *const Shape) })
+                    })
+                {
+                    out.regs[insn.reg as usize] = Ty::Ext(base);
+                }
+                if !load {
+                    if cases.iter().any(|c| check(c.ft) != check(cases[0].ft)) {
+                        return bail(out);
+                    }
+                    if cases
+                        .iter()
+                        .any(|c| matches!(c.loc, CaseLoc::Transition { .. }))
+                    {
+                        for t in out.regs.iter_mut().chain(std::iter::once(&mut out.acc)) {
+                            if let Ty::Obj(x) = *t {
+                                *t = Ty::Ext(x);
+                            }
+                        }
+                    }
+                    return finish(Sel::new("poly", "", out), cases[0].ft);
+                }
+                return finish(Sel::new("poly", "", out), ft);
+            }
+            (p, _) => p,
+        };
         let shape = match prop {
             Prop::Own { shape, .. }
             | Prop::Oop { shape, .. }
@@ -2304,7 +2511,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         let r = insn.reg as usize;
         let case = if exact { "nc" } else { "" };
         out.regs[r] = Ty::Obj(shape);
-        match prop {
+        let mut sel = match prop {
             Prop::Own { ft, .. } => finish(
                 Sel::new(if load { "get_own" } else { "set_own" }, case, out),
                 ft,
@@ -2324,7 +2531,13 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 finish(Sel::new("set_tr", case, out), ft)
             }
             _ => bail(out),
+        };
+        // The instruction's cache holds the other cases too: the operands
+        // are this one's.
+        if collapsed && sel.base != "bail" {
+            sel.ops = prop.operands();
         }
+        sel
     } else {
         match prop {
             Prop::Global { oop, ft, .. } => {
@@ -2751,6 +2964,10 @@ enum Target {
     Label(usize),
     /// Edge stub `n` (conversions, then a jump to its target).
     Stub(usize),
+    /// Hot piece `k`.
+    Piece(usize),
+    /// Whatever is laid out right after hot piece `k`.
+    AfterPiece(usize),
 }
 
 /// One stencil instance to emit.
@@ -4288,11 +4505,27 @@ impl JitCode {
         // `acc`. Such a transition stores just the slot (`set_own_nc`), the
         // next one the final shape. (A jump into the run is fine: the next
         // transition's shape is exact there too.)
+        // Instruction `i`'s transition, if a `set_tr_nc`: shape and new
+        // shape (a polymorphic cache's case, if `select` picked one).
+        let transition = |i: usize| -> Option<(u64, u64)> {
+            let s = sel[i].as_ref()?;
+            if (s.base, s.case) != ("set_tr", "nc") {
+                return None;
+            }
+            match (s.ops, props.get(i).copied()) {
+                (Some((_, shape, new_shape)), _)
+                | (
+                    None,
+                    Some(Prop::Transition {
+                        shape, new_shape, ..
+                    }),
+                ) => Some((shape, new_shape)),
+                _ => None,
+            }
+        };
         let defer_shape: Vec<bool> = (0..n)
             .map(|i| {
-                let (Some(Sel { base: "set_tr", case: "nc", .. }), Some(Prop::Transition { new_shape, .. })) =
-                    (&sel[i], props.get(i))
-                else {
+                let Some((_, new_shape)) = transition(i) else {
                     return false;
                 };
                 let (frame, obj) = (insns[i].frame, insns[i].reg);
@@ -4302,14 +4535,16 @@ impl JitCode {
                         return false;
                     }
                     match insn.op {
-                        Op::Ldar | Op::LdaSmi | Op::LdaUndefined | Op::LdaNull | Op::LdaTrue
+                        Op::Ldar
+                        | Op::LdaSmi
+                        | Op::LdaUndefined
+                        | Op::LdaNull
+                        | Op::LdaTrue
                         | Op::LdaFalse => {}
                         Op::SetNamed => {
                             return insn.reg == obj
-                                && s.base == "set_tr"
-                                && s.case == "nc"
                                 && s.check.is_none()
-                                && matches!(props.get(j), Some(Prop::Transition { shape, .. }) if shape == new_shape);
+                                && transition(j).is_some_and(|(shape, _)| shape == new_shape);
                         }
                         _ => return false,
                     }
@@ -4345,6 +4580,25 @@ impl JitCode {
                 hot.extend(edge_conversions(&prev.out, st, &homes));
             }
             label_piece[i] = hot.len();
+
+            if s.base == "poly" {
+                emit_poly(i, insn, s, st, props, &homes, &mut hot, &mut exits);
+                names[i] = Some(format!(
+                    "poly{}_{}",
+                    if insn.op == Op::GetNamed {
+                        "get"
+                    } else {
+                        "set"
+                    },
+                    hot[label_piece[i]..]
+                        .iter()
+                        .map(|p| p.stencil.stencil.name)
+                        .collect::<Vec<_>>()
+                        .join("+")
+                ));
+                i += 1;
+                continue;
+            }
 
             if let Some(f) = fusion.at(i) {
                 let last = i + f.len - 1;
@@ -4421,19 +4675,7 @@ impl JitCode {
                 }
                 ("mod_smi_iif", _) => (insn.imm, u64::MAX / insn.imm as u64 + 1, 0),
                 ("bail", _) => (0, 0, 0),
-                (_, Some(Prop::Own { shape, off, .. } | Prop::Oop { shape, off, .. })) => {
-                    (off, shape, 0)
-                }
-                (_, Some(Prop::Proto { shape, addr, .. })) => (0, shape, addr),
-                (
-                    _,
-                    Some(Prop::Transition {
-                        shape,
-                        new_shape,
-                        off,
-                        ..
-                    }),
-                ) => (off, shape, new_shape),
+                (_, Some(p)) if p.operands().is_some() => p.operands().unwrap(),
                 (
                     _,
                     Some(Prop::Global {
@@ -4668,6 +4910,8 @@ impl JitCode {
             Target::Next => next,
             Target::Label(i) => label(i),
             Target::Stub(s) => stub_ats[s][0],
+            Target::Piece(k) => hot_at[k],
+            Target::AfterPiece(k) => hot_at[k] + hot[k].len(),
         };
         // Copy the first `len` bytes of `s` to `at` and patch it: register
         // fields of a family template, operands from `p`, continuation and
@@ -5215,6 +5459,102 @@ pub(crate) struct Snapshot {
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
 }
 
+/// Emit polymorphic access `i` ([`Prop::Poly`]): a store's boxing and
+/// check, the receiver's cell check, one compare per shape, branching to
+/// that shape's access (the last one's exits on a mismatch and falls
+/// through to its own), the accesses, and the load's `post`. The accesses
+/// but the last laid out jump past it.
+#[allow(clippy::too_many_arguments)]
+fn emit_poly(
+    i: usize,
+    insn: &Insn,
+    s: &Sel,
+    st: &TypeState,
+    props: &[Prop],
+    homes: &[Home],
+    hot: &mut Vec<Piece>,
+    exits: &mut Vec<(usize, Vec<Piece>)>,
+) {
+    let Some(Prop::Poly { n, cases }) = props.get(i).copied() else {
+        unreachable!("a polymorphic selection without its cases")
+    };
+    let cases = &cases[..n as usize];
+    let m = cases.len();
+    let load = insn.op == Op::GetNamed;
+    let loc = homes
+        .get(insn.reg as usize)
+        .copied()
+        .unwrap_or(Home::Mem)
+        .loc();
+    let at = |name: &str| Piece {
+        reg: insn.reg,
+        exit: i,
+        ..Piece::new(&format!("{name}_{loc}"), 0)
+    };
+    if !load {
+        hot.extend(box_acc_piece(st.acc));
+    }
+    if let Some((c, imm64)) = s.check {
+        hot.push(Piece {
+            imm64,
+            exit: i,
+            ..Piece::new(c, 0)
+        });
+    }
+    hot.push(at("guard_cell"));
+    // The distinct accesses, the last case's first (it falls through to
+    // it), and each case's.
+    let mut bodies = vec![cases[m - 1].access(load)];
+    let group: Vec<usize> = cases
+        .iter()
+        .map(|c| {
+            let a = c.access(load);
+            bodies.iter().position(|&b| b == a).unwrap_or_else(|| {
+                bodies.push(a);
+                bodies.len() - 1
+            })
+        })
+        .collect();
+    let first = hot.len() + m;
+    let end = first + bodies.len() - 1;
+    for (c, case) in cases.iter().enumerate() {
+        let last = c + 1 == m;
+        hot.push(Piece {
+            imm64: case.shape,
+            jump: if last {
+                Target::Next
+            } else {
+                Target::Piece(first + group[c])
+            },
+            ..at(if last { "shape_guard" } else { "shape_jeq" })
+        });
+    }
+    for (base, imm, imm64b) in bodies {
+        let k = hot.len();
+        hot.push(Piece {
+            imm64b,
+            reg: insn.reg,
+            exit: i,
+            cont: if k == end {
+                Target::Next
+            } else {
+                Target::AfterPiece(end)
+            },
+            ..Piece::with_imm(&format!("{base}_nc_{loc}"), imm)
+        });
+    }
+    if let Some(post) = s.post {
+        hot.push(Piece::new(post, 0));
+    }
+    let mut seq: Vec<Piece> = box_acc_piece(st.acc).into_iter().collect();
+    seq.extend(spills(homes));
+    seq.push(Piece {
+        imm: insn.exit_record(),
+        ..Piece::new("exit", 0)
+    });
+    exits.push((i, seq));
+}
+
 /// The result of [`lower`].
 #[allow(clippy::vec_box)]
 struct Lowered {
@@ -5421,11 +5761,7 @@ impl Lowering<'_> {
                 // yet. The interpreter runs it, filling its cache, and the
                 // exit makes the next entry lower the function again.
                 Op::Call | Op::CallUndefined
-                    if unsafe {
-                        (*self.out.fbs[frame].ics.add(i.ic as usize))
-                            .holder
-                            .is_null()
-                    } =>
+                    if unsafe { (*self.out.fbs[frame].ic(i.ic as usize)).holder.is_null() } =>
                 {
                     i.bail = true;
                     self.push(i, Prop::None);
@@ -5523,7 +5859,7 @@ impl Lowering<'_> {
     /// names in `site.cached` either way, natives included.
     fn direct_target(&mut self, frame: usize, i: &Insn, site: &mut CallSite) -> bool {
         use crate::object::Class;
-        let ic = unsafe { *self.out.fbs[frame].ics.add(i.ic as usize) };
+        let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
         let fo = ic.holder;
         if fo.is_null() {
             return false;
@@ -5551,7 +5887,7 @@ impl Lowering<'_> {
                     proto: *proto_at,
                     cap_at,
                     cap: *cap_at as u64,
-                    slots: (*shape).capacity as u64,
+                    slots: (*shape).capacity.get() as u64,
                     // Set when the frame is placed.
                     this_off: 0,
                     done_shape: 0,
@@ -5586,7 +5922,7 @@ impl Lowering<'_> {
         {
             return None;
         }
-        let fo = unsafe { (*self.out.fbs[0].ics.add(i.ic as usize)).holder };
+        let fo = unsafe { (*self.out.fbs[0].ic(i.ic as usize)).holder };
         let ok = !fo.is_null() && unsafe { (*fo).class == Class::Function && (*fo).code == root };
         ok.then_some(fo)
     }
@@ -5666,7 +6002,7 @@ impl Lowering<'_> {
         {
             return None;
         }
-        let ic = unsafe { *self.out.fbs[frame].ics.add(i.ic as usize) };
+        let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
         let fo = ic.holder;
         if fo.is_null() || unsafe { (*fo).class } != Class::Function {
             return None;
@@ -6829,7 +7165,8 @@ extern "C" fn toi_rt_construct_done(site: Value, this: Value) -> u64 {
         crate::vm::Vm::construct_done(code, o);
         let shape = (*o).shape;
         let seen = code.ctor_result.get();
-        if (*shape).keys.len() as u32 <= code.ctor_capacity.get()
+        if code.ctor_settled.get()
+            && (*shape).keys.len() as u32 <= code.ctor_capacity.get()
             && (seen == shape || seen == crate::vm::MANY_SHAPES)
         {
             s.ctor.as_mut().unwrap().done_shape = shape as u64;

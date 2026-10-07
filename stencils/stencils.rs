@@ -2952,7 +2952,9 @@ with_gprs!(each_gpr! identity_gpr);
 // `set_oop_<loc>`, `set_tr_<loc>` (store `acc`, boxed, after writing the new
 // shape); `lda_global`, `lda_global_oop`, `sta_global`, `sta_global_oop` (the
 // global object is `imm64b`); `get_keyed[_i]_<loc>` (`acc = o[acc]`, a
-// packed element in bounds). `<loc>` is the receiver's register.
+// packed element in bounds); `guard_cell_<loc>`, `shape_jeq_<loc>` and
+// `shape_guard_<loc>` for polymorphic accesses. `<loc>` is the receiver's
+// register.
 
 /// Whether `v` is a cell, testing against the tag register.
 #[inline(always)]
@@ -3102,6 +3104,28 @@ macro_rules! property_location {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             *(o as *mut u64) = imm64b();
             *at_imm(o) = s.acc;
+            next!(s)
+        });
+        // A polymorphic access (`jit::Prop::Poly`): a cell check, then a
+        // compare per cached shape (`imm64`), each branching to its own
+        // `_nc` access but the last, which exits on a mismatch and falls
+        // through to its access.
+        stencil!("guard_cell_", loc!($loc); |s| {
+            if !is_cell(s.tag, get!($loc, s)) {
+                exit!(s)
+            }
+            next!(s)
+        });
+        stencil!("shape_jeq_", loc!($loc); |s| {
+            if *(get!($loc, s).to_bits() as *const u64) == imm64() {
+                jump!(s)
+            }
+            next!(s)
+        });
+        stencil!("shape_guard_", loc!($loc); |s| {
+            if *(get!($loc, s).to_bits() as *const u64) != imm64() {
+                exit!(s)
+            }
             next!(s)
         });
         // The receiver's shape is known to be the cached one: no guard.

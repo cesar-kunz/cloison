@@ -48,7 +48,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A function implemented in Rust: `(vm, this, args)`.
 pub type NativeFn = fn(&mut Vm, Value, &[Value]) -> Result<Value>;
 
-/// One inline-cache slot. A load hits when the receiver's shape is `shape`:
+/// One way of an inline-cache slot. A load hits when the receiver's shape is `shape`:
 /// the value is at `loc` in the receiver, or, if `holder` is set, in that
 /// prototype, provided no prototype has changed shape since (`epoch`). A
 /// store hits on `shape` too, and moves the object to `new_shape` first if
@@ -70,6 +70,13 @@ pub struct Ic {
 
 const _: () = assert!(size_of::<Ic>() == 32);
 
+/// Ways per inline-cache slot: a property access caches up to this many
+/// receiver shapes (it is polymorphic), the first in way 0, which the
+/// interpreter's hit path checks; a miss there checks the others before
+/// the lookup. Other instructions use way 0 only. 128 bytes, so indexing
+/// is a shift.
+pub const IC_WAYS: usize = 4;
+
 /// An elements' type code (`Shape::elems_code`) that no value fits: not a
 /// type code (0–2) nor a shape's address.
 pub const NO_ELEMENTS: u64 = 3;
@@ -83,6 +90,51 @@ enum Key {
 /// `Ic::loc` of a `GetNamed` that read an array's `length`.
 pub const LENGTH_LOC: i32 = i32::MIN;
 const _: fn(u64, Value) -> bool = field_fits;
+
+/// The first `new` of `code` returned: shrink the capacity of its objects'
+/// shapes, all reached from its private root, to the most properties one
+/// has (or [`INITIAL_CTOR_CAPACITY`]), and give later objects that. Every
+/// slot of those objects is in the object (they had room for more), below
+/// that count, so it stays where it is.
+fn settle(code: &Code) {
+    fn walk(s: *const Shape, f: &mut dyn FnMut(&Shape)) {
+        let s = unsafe { &*s };
+        f(s);
+        for &(_, _, t) in s.transitions.borrow().iter() {
+            walk(t, f);
+        }
+        for &(_, t) in s.elem_transitions.borrow().iter() {
+            walk(t, f);
+        }
+    }
+    let root = code.ctor_shape.get();
+    if root.is_null() {
+        return;
+    }
+    let mut most = INITIAL_CTOR_CAPACITY;
+    walk(root, &mut |s| most = most.max(s.keys.len() as u32));
+    if most < unsafe { (*root).capacity.get() } {
+        walk(root, &mut |s| s.capacity.set(most));
+    }
+    code.ctor_capacity.set(unsafe { (*root).capacity.get() });
+}
+
+/// Cache `e` in the slot whose way 0 is at `ic`: in the way caching its
+/// shape if one does (it may be stale: a field generalized since, or a
+/// prototype changed), else in the first free way. With every way taken
+/// (the site is megamorphic), `e` replaces way 0.
+unsafe fn install(ic: *mut Ic, e: Ic) {
+    unsafe {
+        for k in 0..IC_WAYS {
+            let w = &mut *ic.add(k);
+            if w.shape.is_null() || w.shape == e.shape {
+                *w = e;
+                return;
+            }
+        }
+        *ic = e;
+    }
+}
 
 impl Ic {
     const EMPTY: Ic = Ic {
@@ -101,7 +153,7 @@ pub struct Code {
     pub nparams: u32,
     /// Register count, `r0` (`this`) and the parameters included.
     pub nregs: u32,
-    pub ics: Box<[UnsafeCell<Ic>]>,
+    pub ics: Box<[UnsafeCell<[Ic; IC_WAYS]>]>,
     /// The property name of each inline-cache slot.
     pub ic_names: Box<[Atom]>,
     /// The nested functions, by `CreateClosure` operand.
@@ -112,11 +164,17 @@ pub struct Code {
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
     pub constructs: bool,
-    /// For `new`: the in-object capacity to give new objects (raised to the
-    /// most properties a constructed object has had on return, a simple
-    /// form of slack tracking), and the root shape last used.
+    /// For `new`: the in-object capacity to give new objects, and the root
+    /// shape last used. Slack tracking: until the first `new` returns (the
+    /// capacity is not `ctor_settled`), objects get a root of their own
+    /// with ample room ([`MAX_INLINE_CAPACITY`]), whose shapes then shrink
+    /// in place to the most properties any has (at least
+    /// [`INITIAL_CTOR_CAPACITY`]), so later objects share them (see
+    /// [`Vm::construct_done`]). The capacity grows afterwards if a
+    /// constructed object outgrows it, with a new root.
     pub ctor_capacity: Cell<u32>,
     pub ctor_shape: Cell<*const Shape>,
+    pub ctor_settled: Cell<bool>,
     /// The shape of the objects `new` has given, once constructed: null if
     /// none yet, [`MANY_SHAPES`] if not always the same. Compiled code
     /// predicts it for the result of a `new` through the runtime.
@@ -135,9 +193,10 @@ pub struct Code {
 }
 
 impl Code {
-    /// The inline-cache slot `i`, and the name it looks up.
+    /// The inline-cache slot `i` (its way 0, the others following), and
+    /// the name it looks up.
     pub fn ic(&self, i: u16) -> (*mut Ic, Atom) {
-        (self.ics[i as usize].get(), self.ic_names[i as usize])
+        (self.ics[i as usize].get().cast(), self.ic_names[i as usize])
     }
 }
 
@@ -364,7 +423,7 @@ impl Vm {
         let s = self.add_shape(Shape {
             class,
             proto,
-            capacity,
+            capacity: Cell::new(capacity),
             keys: Vec::new(),
             attrs: Vec::new(),
             fields: Vec::new(),
@@ -376,6 +435,27 @@ impl Vm {
         });
         self.roots.insert(key, s);
         s
+    }
+
+    /// A root shape for `proto` and `capacity` that no other gets (see
+    /// `Code::ctor_settled`). Marks `proto` as a prototype.
+    fn private_root(&mut self, proto: Value, capacity: u32) -> *const Shape {
+        if proto.is_cell() {
+            self.make_prototype(as_object(proto));
+        }
+        self.add_shape(Shape {
+            class: Class::Plain,
+            proto,
+            capacity: Cell::new(capacity),
+            keys: Vec::new(),
+            attrs: Vec::new(),
+            fields: Vec::new(),
+            elems: FieldType::None,
+            elems_code: 0,
+            unique: false,
+            transitions: RefCell::default(),
+            elem_transitions: RefCell::default(),
+        })
     }
 
     /// `shape` plus property `name` with attributes `attrs`. Shared shapes
@@ -407,7 +487,7 @@ impl Vm {
         let t = self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
-            capacity: s.capacity,
+            capacity: Cell::new(s.capacity.get()),
             keys,
             attrs: slot_attrs,
             fields,
@@ -436,7 +516,7 @@ impl Vm {
             let u = Shape {
                 class: s.class,
                 proto: s.proto,
-                capacity: s.capacity,
+                capacity: Cell::new(s.capacity.get()),
                 keys: s.keys.clone(),
                 attrs: s.attrs.clone(),
                 fields: s.fields.clone(),
@@ -484,8 +564,8 @@ impl Vm {
             let new = self.transition_with((*o).shape, name, attrs);
             let ns = &*new;
             let slot = ns.keys.len() as u32 - 1;
-            if slot >= ns.capacity {
-                let i = slot - ns.capacity;
+            if slot >= ns.capacity.get() {
+                let i = slot - ns.capacity.get();
                 if i >= (*o).props_cap {
                     let cap = ((*o).props_cap * 2).max(4);
                     let p = self.heap.alloc_values(cap as usize);
@@ -547,7 +627,7 @@ impl Vm {
         let t = self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
-            capacity: s.capacity,
+            capacity: Cell::new(s.capacity.get()),
             keys: s.keys.clone(),
             attrs: s.attrs.clone(),
             fields: s.fields.clone(),
@@ -678,23 +758,29 @@ impl Vm {
             // slot, valid (like a prototype's property) while no prototype
             // changes shape.
             let Some((h, slot)) = self.lookup(o, name) else {
-                *ic = Ic {
-                    shape: (*o).shape,
-                    holder: self.missing_holder,
-                    new_shape: std::ptr::null(),
-                    loc: crate::object::INLINE_BASE as i32,
-                    epoch: self.proto_epoch,
-                };
+                install(
+                    ic,
+                    Ic {
+                        shape: (*o).shape,
+                        holder: self.missing_holder,
+                        new_shape: std::ptr::null(),
+                        loc: crate::object::INLINE_BASE as i32,
+                        epoch: self.proto_epoch,
+                    },
+                );
                 return Ok(Value::UNDEFINED);
             };
             let loc = (*(*h).shape).location(slot);
-            *ic = Ic {
-                shape: (*o).shape,
-                holder: if h == o { std::ptr::null_mut() } else { h },
-                new_shape: std::ptr::null(),
-                loc,
-                epoch: self.proto_epoch,
-            };
+            install(
+                ic,
+                Ic {
+                    shape: (*o).shape,
+                    holder: if h == o { std::ptr::null_mut() } else { h },
+                    new_shape: std::ptr::null(),
+                    loc,
+                    epoch: self.proto_epoch,
+                },
+            );
             Ok(*Object::slot(h, loc))
         }
     }
@@ -718,24 +804,30 @@ impl Vm {
             }
             if let Some(slot) = (*old).lookup(name) {
                 self.store_field(o, slot, value);
-                *ic = Ic {
-                    shape: old,
-                    holder: (*old).field_type(slot).encode() as *mut Object,
-                    loc: (*old).location(slot),
-                    ..Ic::EMPTY
-                };
+                install(
+                    ic,
+                    Ic {
+                        shape: old,
+                        holder: (*old).field_type(slot).encode() as *mut Object,
+                        loc: (*old).location(slot),
+                        ..Ic::EMPTY
+                    },
+                );
                 return Ok(());
             }
             let slot = self.add_property(o, name, value);
             let new = (*o).shape;
-            if !(*old).unique && slot < (*new).capacity {
-                *ic = Ic {
-                    shape: old,
-                    holder: (*new).field_type(slot).encode() as *mut Object,
-                    new_shape: new,
-                    loc: (*new).location(slot),
-                    ..Ic::EMPTY
-                };
+            if !(*old).unique && slot < (*new).capacity.get() {
+                install(
+                    ic,
+                    Ic {
+                        shape: old,
+                        holder: (*new).field_type(slot).encode() as *mut Object,
+                        new_shape: new,
+                        loc: (*new).location(slot),
+                        ..Ic::EMPTY
+                    },
+                );
             }
         }
         Ok(())
@@ -773,7 +865,7 @@ impl Vm {
                 let u = Shape {
                     class: s.class,
                     proto: s.proto,
-                    capacity: s.capacity,
+                    capacity: Cell::new(s.capacity.get()),
                     keys: s.keys.clone(),
                     attrs: slot_attrs,
                     fields: s.fields.clone(),
@@ -877,10 +969,13 @@ impl Vm {
         if obj.is_cell() && unsafe { (*as_object(obj)).class } != Class::String {
             let (ic, _) = code.ic(ic);
             unsafe {
-                *ic = Ic {
-                    shape: (*as_object(obj)).shape,
-                    ..Ic::EMPTY
-                };
+                install(
+                    ic,
+                    Ic {
+                        shape: (*as_object(obj)).shape,
+                        ..Ic::EMPTY
+                    },
+                );
             }
         }
         self.get_keyed(obj, key)
@@ -1112,6 +1207,7 @@ impl Vm {
             constructs,
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
+            ctor_settled: Cell::new(true),
             ctor_result: Cell::new(std::ptr::null()),
             jit: RefCell::new(None),
             calls_left: Cell::new(i32::MAX),
@@ -1148,8 +1244,12 @@ impl Vm {
             };
             let cap = code.ctor_capacity.get();
             let mut s = code.ctor_shape.get();
-            if s.is_null() || (*s).proto != proto || (*s).capacity != cap {
-                s = self.root_shape(Class::Plain, proto, cap);
+            if s.is_null() || (*s).proto != proto || (*s).capacity.get() != cap {
+                s = if code.ctor_settled.get() {
+                    self.root_shape(Class::Plain, proto, cap)
+                } else {
+                    self.private_root(proto, cap)
+                };
                 code.ctor_shape.set(s);
             }
             s
@@ -1159,6 +1259,9 @@ impl Vm {
     /// After `new` returned `this`: grow the in-object capacity for the next
     /// objects if this one outgrew it.
     pub(crate) fn construct_done(code: &Code, this: *mut Object) {
+        if !code.ctor_settled.replace(true) {
+            settle(code);
+        }
         let shape = unsafe { (*this).shape };
         let n = unsafe { (*shape).keys.len() } as u32;
         if n > code.ctor_capacity.get() {
@@ -1220,8 +1323,11 @@ impl Vm {
             .iter()
             .zip(recursive)
             .map(|(f, recursive)| {
-                let ics: Vec<UnsafeCell<Ic>> =
-                    f.ics.iter().map(|_| UnsafeCell::new(Ic::EMPTY)).collect();
+                let ics: Vec<UnsafeCell<[Ic; IC_WAYS]>> = f
+                    .ics
+                    .iter()
+                    .map(|_| UnsafeCell::new([Ic::EMPTY; IC_WAYS]))
+                    .collect();
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern(n)).collect();
                 let constants: Box<[Value]> = f
                     .constants
@@ -1250,8 +1356,9 @@ impl Vm {
                     constants,
                     native: None,
                     constructs: false,
-                    ctor_capacity: Cell::new(INITIAL_CTOR_CAPACITY),
+                    ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
+                    ctor_settled: Cell::new(false),
                     ctor_result: Cell::new(std::ptr::null()),
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
@@ -1319,7 +1426,7 @@ impl Vm {
 
     /// Words of in-object storage in `o` (for tests).
     pub fn inline_capacity(&self, o: Value) -> u32 {
-        unsafe { (*(*as_object(o)).shape).capacity }
+        unsafe { (*(*as_object(o)).shape).capacity.get() }
     }
 }
 

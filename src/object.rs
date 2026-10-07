@@ -205,8 +205,9 @@ pub struct Shape {
     pub class: Class,
     /// An object, or null.
     pub proto: Value,
-    /// Number of in-object slots.
-    pub capacity: u32,
+    /// Number of in-object slots. Shrinks once, in place, for the shapes
+    /// of a constructor's first objects (see `Vm::construct_done`).
+    pub capacity: Cell<u32>,
     /// The property in each slot.
     pub keys: Vec<Atom>,
     /// Each slot's attributes ([`READ_ONLY`], [`DONT_ENUM`], [`DONT_DELETE`];
@@ -250,10 +251,10 @@ impl Shape {
     /// Where slot `i` lives, as an inline cache records it: the byte offset
     /// of an in-object slot, or `!index` into the out-of-line slots.
     pub fn location(&self, i: u32) -> i32 {
-        if i < self.capacity {
+        if i < self.capacity.get() {
             (INLINE_BASE + 8 * i as usize) as i32
         } else {
-            !((i - self.capacity) as i32)
+            !((i - self.capacity.get()) as i32)
         }
     }
 }
@@ -394,12 +395,12 @@ impl Heap {
 
     /// A new object of `shape`, with its in-object slots `undefined`.
     pub fn alloc_object(&mut self, shape: &Shape) -> *mut Object {
-        let words = INLINE_BASE / 8 + shape.capacity as usize;
+        let words = INLINE_BASE / 8 + shape.capacity.get() as usize;
         let o = self.alloc_words(words).cast::<Object>();
         unsafe {
             o.cast::<[u64; INLINE_BASE / 8]>()
                 .write(object_header(shape));
-            for i in 0..shape.capacity as usize {
+            for i in 0..shape.capacity.get() as usize {
                 Object::inline(o, i).write(Value::UNDEFINED);
             }
         }
@@ -421,7 +422,7 @@ mod tests {
         let s = Shape {
             class: Class::Plain,
             proto: Value::NULL,
-            capacity: 2,
+            capacity: Cell::new(2),
             keys: vec![Atom(7), Atom(8), Atom(9)],
             attrs: vec![0; 3],
             fields: Vec::new(),

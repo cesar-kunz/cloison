@@ -87,7 +87,7 @@ use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
-use crate::vm::{Code, Error, Ic, Vm, string_units};
+use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, Vm, string_units};
 
 pub type Handler = extern "rust-preserve-none" fn(
     *const u8,
@@ -848,6 +848,36 @@ handlers! {
                     next!(any, Op::GetNamed.size(), *Object::slot(holder, (*ic).loc))
                 }
             }
+            tail!(poly_get_named, acc)
+        }
+        tail!(slow_get_named, acc)
+    }
+
+    // Way 0 missed: `length`, or the other ways (the receiver is a cell). A hit moves
+    // to way 0, so a site whose receivers change shape for a while (an
+    // array once it has elements) takes the hit path again.
+    #[inline(never)]
+    fn poly_get_named(pc, acc, regs, tag) {
+        let o = as_object(*reg(pc, 1, regs));
+        let ic = ic_at(regs, pc, 2);
+        // An array's or a string's `length` (cached without a shape).
+        if (*ic).loc == LENGTH_LOC && matches!((*o).class, Class::Array | Class::String) {
+            next!(any, Op::GetNamed.size(), Value::from_i32((*o).elems_len as i32))
+        }
+        for k in 1..IC_WAYS {
+            let w = ic.add(k);
+            if (*o).shape == (*w).shape {
+                std::ptr::swap(ic, w);
+                let w = ic;
+                let holder = (*w).holder;
+                if holder.is_null() {
+                    next!(any, Op::GetNamed.size(), *Object::slot(o, (*w).loc))
+                }
+                if (*w).epoch == (*frame_vm(regs)).proto_epoch {
+                    next!(any, Op::GetNamed.size(), *Object::slot(holder, (*w).loc))
+                }
+                break;
+            }
         }
         tail!(slow_get_named, acc)
     }
@@ -866,6 +896,32 @@ handlers! {
                 }
                 *Object::slot(o, (*ic).loc) = acc;
                 next!(any, Op::SetNamed.size(), acc)
+            }
+            tail!(poly_set_named, acc)
+        }
+        tail!(slow_set_named, acc)
+    }
+
+    // Way 0 missed: the other ways (the receiver is a cell, `acc` boxed).
+    // A hit moves to way 0, as for loads.
+    #[inline(never)]
+    fn poly_set_named(pc, acc, regs, tag) {
+        let o = as_object(*reg(pc, 1, regs));
+        let ic = ic_at(regs, pc, 2);
+        for k in 1..IC_WAYS {
+            let w = ic.add(k);
+            if (*o).shape == (*w).shape {
+                std::ptr::swap(ic, w);
+                let w = ic;
+                if fits_field(tag, (*w).holder as u64, acc) {
+                    let new = (*w).new_shape;
+                    if !new.is_null() {
+                        (*o).shape = new;
+                    }
+                    *Object::slot(o, (*w).loc) = acc;
+                    next!(any, Op::SetNamed.size(), acc)
+                }
+                break;
             }
         }
         tail!(slow_set_named, acc)
@@ -888,6 +944,7 @@ handlers! {
                 *Object::slot(o, (*ic).loc) = acc;
                 next!(any, Op::SetNamed.size(), acc)
             }
+            tail!(poly_set_named, acc)
         }
         tail!(slow_set_named, acc)
     }
@@ -2501,10 +2558,11 @@ unsafe fn frame_code(regs: *mut Value) -> *const Code {
     unsafe { header(regs, CODE) }
 }
 
-/// The inline-cache slot named by the `u16` operand at `pc + off`.
+/// The inline-cache slot named by the `u16` operand at `pc + off`: its
+/// way 0, the others following.
 #[inline(always)]
 unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
-    unsafe { header::<Ic>(regs, ICS).add(u16_at(pc, off) as usize) }
+    unsafe { header::<Ic>(regs, ICS).add(u16_at(pc, off) as usize * IC_WAYS) }
 }
 
 /// Record the object a call at `pc` calls in its inline cache, as the fast

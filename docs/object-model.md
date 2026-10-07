@@ -757,10 +757,11 @@ misses, closures, arrays, natives) and the interpreter (`src/interp.rs`).
 In place:
 
 - Shapes with shared transition trees, roots keyed by class, prototype and
-  in-object capacity, and slack tracking per constructor.
-- Monomorphic inline caches for `GetNamed`, `SetNamed` (including cached
-  transitions to in-object slots), `LdaGlobal` and `StaGlobal`, holding the
-  shape and the location. Prototype loads cache the holder too. Prototypes
+  in-object capacity, and slack tracking per constructor (settled in place
+  after the first `new`).
+- Inline caches for `GetNamed`, `SetNamed` (including cached transitions
+  to in-object slots), `LdaGlobal` and `StaGlobal`, holding the shape and
+  the location; named accesses are polymorphic (up to four shapes). Prototype loads cache the holder too. Prototypes
   get unique shapes, and adding a property to one bumps a global
   epoch that every cached prototype load checks. That is simpler than
   per-prototype validity cells.
@@ -784,7 +785,7 @@ numbers: `docs/future-work.md`, "Property access in the JIT, and shape
 types".
 
 Still missing from steps 1–2: a collector (the heap is an arena freed with
-the VM), polymorphic and megamorphic caches, a cache for array `length`,
+the VM), megamorphic caches, polymorphic calls,
 property attributes, strings, sloppy-mode `this`, exceptions (`try`),
 closures over variables, and the opcodes the front end still rejects
 (`%`, shifts and bitwise operators by a variable, unary `-` of a variable,

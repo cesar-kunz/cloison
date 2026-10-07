@@ -169,6 +169,68 @@ define_ops! {
     /// `acc = new r[f](r[a], …, r[a+n-1])`
     Construct(Reg, Reg, Count, AutoIc),
 
+    // ---- Arithmetic, group 2 ----
+    /// `acc = r[a] - acc`
+    Sub(Reg),
+    /// `acc = acc - imm32`
+    SubSmi(Imm),
+    /// `acc = r[a] * acc`
+    Mul(Reg),
+    /// `acc = acc * imm32`
+    MulSmi(Imm),
+    /// `acc = r[a] / acc`
+    Div(Reg),
+    /// `acc = acc / imm32`
+    DivSmi(Imm),
+    /// `acc = acc << imm32`
+    ShiftLeftSmi(Imm),
+    /// `acc = acc >> imm32`
+    ShiftRightSmi(Imm),
+    /// `acc = acc >>> imm32`
+    ShiftRightLogicalSmi(Imm),
+
+    // ---- Comparisons, group 2 ----
+    /// `acc = r[a] > acc`
+    TestGreaterThan(Reg),
+    /// `acc = r[a] <= acc`
+    TestLessThanOrEqual(Reg),
+    /// `acc = r[a] >= acc`
+    TestGreaterThanOrEqual(Reg),
+    /// `acc = r[a] === acc`
+    TestStrictEqual(Reg),
+    /// `acc = acc === undefined`
+    TestUndefined(),
+    /// `acc = acc === null`
+    TestNull(),
+    /// `acc = acc == null` (null or undefined)
+    TestNullish(),
+
+    // ---- Compare-and-jumps, group 2: `acc OP r[a]` / `acc OP imm32` ----
+    /// `if acc <= r[a] { pc += off32 }`
+    JumpIfLessEqual(Reg, Off),
+    /// `if acc > r[a] { pc += off32 }`
+    JumpIfGreater(Reg, Off),
+    /// `if acc >= r[a] { pc += off32 }`
+    JumpIfGreaterEqual(Reg, Off),
+    /// `if acc <= imm32 { pc += off32 }`
+    JumpIfLessEqualSmi(Imm, Off),
+    /// `if acc > imm32 { pc += off32 }`
+    JumpIfGreaterSmi(Imm, Off),
+    /// `if acc >= imm32 { pc += off32 }`
+    JumpIfGreaterEqualSmi(Imm, Off),
+    /// `JumpIfLessEqual` backwards.
+    JumpIfLessEqualLoop(Reg, Off),
+    /// `JumpIfGreater` backwards.
+    JumpIfGreaterLoop(Reg, Off),
+    /// `JumpIfGreaterEqual` backwards.
+    JumpIfGreaterEqualLoop(Reg, Off),
+    /// `JumpIfLessEqualSmi` backwards.
+    JumpIfLessEqualSmiLoop(Imm, Off),
+    /// `JumpIfGreaterSmi` backwards.
+    JumpIfGreaterSmiLoop(Imm, Off),
+    /// `JumpIfGreaterEqualSmi` backwards.
+    JumpIfGreaterEqualSmiLoop(Imm, Off),
+
     // ---- Superinstructions (see `quicken`) ----
     // Each is a comparison immediately followed by a `JumpIfTrue` or
     // `JumpIfFalse`, which [`quicken`] fuses by rewriting the comparison's
@@ -188,6 +250,20 @@ define_ops! {
     TestEqualSmiJumpIfTrue(Imm),
     /// `TestEqualSmi k` + `JumpIfFalse`.
     TestEqualSmiJumpIfFalse(Imm),
+    TestGreaterThanJumpIfTrue(Reg),
+    TestGreaterThanJumpIfFalse(Reg),
+    TestLessThanOrEqualJumpIfTrue(Reg),
+    TestLessThanOrEqualJumpIfFalse(Reg),
+    TestGreaterThanOrEqualJumpIfTrue(Reg),
+    TestGreaterThanOrEqualJumpIfFalse(Reg),
+    TestStrictEqualJumpIfTrue(Reg),
+    TestStrictEqualJumpIfFalse(Reg),
+    TestUndefinedJumpIfTrue(),
+    TestUndefinedJumpIfFalse(),
+    TestNullJumpIfTrue(),
+    TestNullJumpIfFalse(),
+    TestNullishJumpIfTrue(),
+    TestNullishJumpIfFalse(),
 }
 
 impl Op {
@@ -222,6 +298,23 @@ impl Op {
             Op::JumpLoop => Op::Jump,
             Op::JumpIfLessLoop => Op::JumpIfLess,
             Op::JumpIfLessSmiLoop => Op::JumpIfLessSmi,
+            Op::JumpIfLessEqualLoop => Op::JumpIfLessEqual,
+            Op::JumpIfGreaterLoop => Op::JumpIfGreater,
+            Op::JumpIfGreaterEqualLoop => Op::JumpIfGreaterEqual,
+            Op::JumpIfLessEqualSmiLoop => Op::JumpIfLessEqualSmi,
+            Op::JumpIfGreaterSmiLoop => Op::JumpIfGreaterSmi,
+            Op::JumpIfGreaterEqualSmiLoop => Op::JumpIfGreaterEqualSmi,
+            Op::TestGreaterThanJumpIfTrue | Op::TestGreaterThanJumpIfFalse => Op::TestGreaterThan,
+            Op::TestLessThanOrEqualJumpIfTrue | Op::TestLessThanOrEqualJumpIfFalse => {
+                Op::TestLessThanOrEqual
+            }
+            Op::TestGreaterThanOrEqualJumpIfTrue | Op::TestGreaterThanOrEqualJumpIfFalse => {
+                Op::TestGreaterThanOrEqual
+            }
+            Op::TestStrictEqualJumpIfTrue | Op::TestStrictEqualJumpIfFalse => Op::TestStrictEqual,
+            Op::TestUndefinedJumpIfTrue | Op::TestUndefinedJumpIfFalse => Op::TestUndefined,
+            Op::TestNullJumpIfTrue | Op::TestNullJumpIfFalse => Op::TestNull,
+            Op::TestNullishJumpIfTrue | Op::TestNullishJumpIfFalse => Op::TestNullish,
             Op::TestLessThanJumpIfTrue | Op::TestLessThanJumpIfFalse => Op::TestLessThan,
             Op::TestEqualJumpIfTrue | Op::TestEqualJumpIfFalse => Op::TestEqual,
             Op::TestEqualSmiJumpIfTrue | Op::TestEqualSmiJumpIfFalse => Op::TestEqualSmi,
@@ -238,6 +331,20 @@ impl Op {
             (Op::TestEqual, Op::JumpIfFalse) => Op::TestEqualJumpIfFalse,
             (Op::TestEqualSmi, Op::JumpIfTrue) => Op::TestEqualSmiJumpIfTrue,
             (Op::TestEqualSmi, Op::JumpIfFalse) => Op::TestEqualSmiJumpIfFalse,
+            (Op::TestGreaterThan, Op::JumpIfTrue) => Op::TestGreaterThanJumpIfTrue,
+            (Op::TestGreaterThan, Op::JumpIfFalse) => Op::TestGreaterThanJumpIfFalse,
+            (Op::TestLessThanOrEqual, Op::JumpIfTrue) => Op::TestLessThanOrEqualJumpIfTrue,
+            (Op::TestLessThanOrEqual, Op::JumpIfFalse) => Op::TestLessThanOrEqualJumpIfFalse,
+            (Op::TestGreaterThanOrEqual, Op::JumpIfTrue) => Op::TestGreaterThanOrEqualJumpIfTrue,
+            (Op::TestGreaterThanOrEqual, Op::JumpIfFalse) => Op::TestGreaterThanOrEqualJumpIfFalse,
+            (Op::TestStrictEqual, Op::JumpIfTrue) => Op::TestStrictEqualJumpIfTrue,
+            (Op::TestStrictEqual, Op::JumpIfFalse) => Op::TestStrictEqualJumpIfFalse,
+            (Op::TestUndefined, Op::JumpIfTrue) => Op::TestUndefinedJumpIfTrue,
+            (Op::TestUndefined, Op::JumpIfFalse) => Op::TestUndefinedJumpIfFalse,
+            (Op::TestNull, Op::JumpIfTrue) => Op::TestNullJumpIfTrue,
+            (Op::TestNull, Op::JumpIfFalse) => Op::TestNullJumpIfFalse,
+            (Op::TestNullish, Op::JumpIfTrue) => Op::TestNullishJumpIfTrue,
+            (Op::TestNullish, Op::JumpIfFalse) => Op::TestNullishJumpIfFalse,
             _ => return None,
         })
     }
@@ -248,6 +355,12 @@ impl Op {
             Op::Jump => Op::JumpLoop,
             Op::JumpIfLess => Op::JumpIfLessLoop,
             Op::JumpIfLessSmi => Op::JumpIfLessSmiLoop,
+            Op::JumpIfLessEqual => Op::JumpIfLessEqualLoop,
+            Op::JumpIfGreater => Op::JumpIfGreaterLoop,
+            Op::JumpIfGreaterEqual => Op::JumpIfGreaterEqualLoop,
+            Op::JumpIfLessEqualSmi => Op::JumpIfLessEqualSmiLoop,
+            Op::JumpIfGreaterSmi => Op::JumpIfGreaterSmiLoop,
+            Op::JumpIfGreaterEqualSmi => Op::JumpIfGreaterEqualSmiLoop,
             op => op,
         }
     }
@@ -386,8 +499,8 @@ impl Assembler {
     }
 
     /// Emit `op` with `args`, which must match its operand kinds. A jump to
-    /// an already-bound label takes the loop form; only `Jump`,
-    /// `JumpIfLess` and `JumpIfLessSmi` have one.
+    /// an already-bound label takes the loop form; only `Jump` and the
+    /// compare-and-jumps (`JumpIfLess`, `JumpIfGreaterEqualSmi`, …) have one.
     pub fn emit(&mut self, op: Op, args: &[Arg]) -> &mut Self {
         let kinds = op.operands();
         assert_eq!(

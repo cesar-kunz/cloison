@@ -25,7 +25,7 @@ function sum(n, acc)            ; r1 n, r2 acc, r3 callee, r4-r5 arguments
         LdaGlobal sum
         Star r3
         Ldar r1
-        AddSmi -1
+        SubSmi 1
         Star r4                 ; n - 1
         Ldar r1
         Add r2

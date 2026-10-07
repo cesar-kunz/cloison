@@ -68,6 +68,9 @@ pub struct Ic {
 }
 
 const _: () = assert!(size_of::<Ic>() == 32);
+
+/// `Ic::loc` of a `GetNamed` that read an array's `length`.
+pub const LENGTH_LOC: i32 = i32::MIN;
 const _: fn(u64, Value) -> bool = field_fits;
 
 impl Ic {
@@ -93,6 +96,9 @@ pub struct Code {
     /// The nested functions, by `CreateClosure` operand.
     pub closures: Vec<*const Code>,
     pub native: Option<NativeFn>,
+    /// A native that `new` may call (`Array`, `Object`): it makes its own
+    /// object.
+    pub constructs: bool,
     /// For `new`: the in-object capacity to give new objects (raised to the
     /// most properties a constructed object has had on return, a simple
     /// form of slack tracking), and the root shape last used.
@@ -175,8 +181,11 @@ pub struct Vm {
     pub(crate) redo_call: bool,
     function_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
-    array_shape: *const Shape,
+    pub(crate) array_shape: *const Shape,
     proto_object_shape: *const Shape,
+    /// `Function.prototype.call`'s code: a call through it is a call of its
+    /// receiver (see `interp::unwrap_call`).
+    pub(crate) function_call: *const Code,
     a_prototype: Atom,
     a_constructor: Atom,
     a_length: Atom,
@@ -225,6 +234,7 @@ impl Vm {
             function_shape: std::ptr::null(),
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
+            function_call: std::ptr::null(),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
@@ -239,7 +249,9 @@ impl Vm {
         let op = object_value(vm.object_prototype);
         vm.function_prototype = vm.new_object(op);
         vm.array_prototype = vm.new_object(op);
-        vm.global = vm.new_object(op);
+        // Room for the builtins and the script's globals in the object
+        // itself: out-of-line globals cost compiled code a load each.
+        vm.global = vm.new_object_with(Class::Plain, op, MAX_INLINE_CAPACITY);
 
         let fp = object_value(vm.function_prototype);
         let root = vm.root_shape(Class::Function, fp, 2);
@@ -249,7 +261,26 @@ impl Vm {
 
         vm.array_shape = vm.root_shape(Class::Array, object_value(vm.array_prototype), 0);
         let ap = vm.array_prototype;
-        vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32);
+        vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
+        vm.define_native(ap, "pop", array_pop, 0, crate::jit::Ty::Any, false);
+        let fp = vm.function_prototype;
+        let call = vm.define_native(fp, "call", function_call, 1, crate::jit::Ty::Any, false);
+        vm.function_call = unsafe { (*call).code };
+        // The constructors, with `prototype` and `constructor` links.
+        let g = vm.global;
+        for (name, f, proto) in [
+            ("Array", array_constructor as NativeFn, vm.array_prototype),
+            (
+                "Object",
+                object_constructor as NativeFn,
+                vm.object_prototype,
+            ),
+        ] {
+            let c = vm.define_native(g, name, f, 0, crate::jit::Ty::Any, true);
+            let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
+            vm.add_property(c, a_p, object_value(proto));
+            vm.add_property(proto, a_c, object_value(c));
+        }
         vm
     }
 
@@ -563,6 +594,12 @@ impl Vm {
         let o = as_object(obj);
         unsafe {
             if (*o).class == Class::Array && name == self.a_length {
+                // Recorded for the JIT (`jit::Prop::Length`); no shape, so
+                // the interpreter's hit path never takes it.
+                *ic = Ic {
+                    loc: LENGTH_LOC,
+                    ..Ic::EMPTY
+                };
                 return Ok(Value::from_i32((*o).elems_len as i32));
             }
             let Some((h, slot)) = self.lookup(o, name) else {
@@ -788,7 +825,8 @@ impl Vm {
         f: NativeFn,
         nparams: u32,
         ret: crate::jit::Ty,
-    ) {
+        constructs: bool,
+    ) -> *mut Object {
         let code = self.add_code(Code {
             name: name.to_string(),
             bytecode: Vec::new(),
@@ -798,6 +836,7 @@ impl Vm {
             ic_names: Box::new([]),
             closures: Vec::new(),
             native: Some(f),
+            constructs,
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
             ctor_result: Cell::new(std::ptr::null()),
@@ -810,6 +849,7 @@ impl Vm {
         unsafe { (*fo).code = code };
         let a = self.intern(name);
         self.add_property(obj, a, object_value(fo));
+        fo
     }
 
     /// The receiver for `new f`: a new object whose prototype is
@@ -860,6 +900,7 @@ impl Vm {
 
     /// Call `f` when it isn't a bytecode function (those the interpreter
     /// enters itself).
+    #[inline]
     pub fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
         if f.is_cell() {
             let o = as_object(f);
@@ -873,8 +914,18 @@ impl Vm {
         Err(Error::type_error(format!("{f:?} is not a function")))
     }
 
-    /// `new f(…)` when `f` isn't a bytecode function.
-    pub fn construct_other(&mut self, f: Value) -> Result<Value> {
+    /// `new f(…args)` when `f` isn't a bytecode function: a native that
+    /// constructs (`Array`, `Object`) makes its object.
+    pub fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
+        if f.is_cell() {
+            let o = as_object(f);
+            unsafe {
+                if (*o).class == Class::Native && (*(*o).code).constructs {
+                    let native = (*(*o).code).native.unwrap();
+                    return native(self, Value::UNDEFINED, args);
+                }
+            }
+        }
         Err(Error::type_error(format!("{f:?} is not a constructor")))
     }
 
@@ -913,6 +964,7 @@ impl Vm {
                     ic_names: ic_names.into_boxed_slice(),
                     closures: Vec::new(),
                     native: None,
+                    constructs: false,
                     ctor_capacity: Cell::new(INITIAL_CTOR_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
                     ctor_result: Cell::new(std::ptr::null()),
@@ -1049,6 +1101,85 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
             false
         })
         .collect()
+}
+
+/// `Array.prototype.pop`.
+fn array_pop(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
+        return Err(Error::unsupported("Array.prototype.pop on a non-array"));
+    }
+    let o = as_object(this);
+    unsafe {
+        let len = (*o).elems_len as usize;
+        if len == 0 {
+            return Ok(Value::UNDEFINED);
+        }
+        let v = *(*o).elems.add(len - 1);
+        *(*o).elems.add(len - 1) = Value::EMPTY;
+        (*o).elems_len = (len - 1) as u32;
+        Ok(if v == Value::EMPTY {
+            Value::UNDEFINED
+        } else {
+            v
+        })
+    }
+}
+
+/// `Array(…)` and `new Array(…)`: `Array(n)` has length `n` (holes), any
+/// other arguments are the elements.
+fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    let a = vm.new_array();
+    let o = as_object(a);
+    let elems: Vec<Value> = match args {
+        [n] if n.is_number() => {
+            let len = n.as_number().unwrap();
+            if len < 0.0 || len.fract() != 0.0 || len > u32::MAX as f64 {
+                return Err(Error::range_error("Invalid array length"));
+            }
+            vec![Value::EMPTY; len as usize]
+        }
+        _ => args.to_vec(),
+    };
+    unsafe {
+        vm.reserve_elems(o, elems.len());
+        for (i, &v) in elems.iter().enumerate() {
+            // Holes don't type the elements.
+            if v == Value::EMPTY {
+                *(*o).elems.add(i) = v;
+            } else {
+                vm.store_element(o, i, v);
+            }
+        }
+        (*o).elems_len = elems.len() as u32;
+    }
+    Ok(a)
+}
+
+/// `Object(…)` and `new Object(…)`: an object argument itself, else a new
+/// plain object (there are no wrapper objects yet).
+fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    match args.first() {
+        Some(&v) if v.is_cell() => Ok(v),
+        _ => {
+            let op = object_value(vm.object_prototype);
+            Ok(object_value(vm.new_object(op)))
+        }
+    }
+}
+
+/// `Function.prototype.call` on a native: a call through it to a bytecode
+/// function is unwrapped where it is made (`interp::unwrap_call`).
+fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
+    let (that, rest) = match args {
+        [] => (Value::UNDEFINED, args),
+        [t, rest @ ..] => (*t, rest),
+    };
+    if this.is_cell() && unsafe { (*as_object(this)).class } == Class::Native {
+        return vm.call_other(this, that, rest);
+    }
+    Err(Error::type_error(format!(
+        "{this:?} is not a native function (call it directly)"
+    )))
 }
 
 fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {

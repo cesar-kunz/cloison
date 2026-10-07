@@ -787,5 +787,5 @@ Still missing from steps 1–2: a collector (the heap is an arena freed with
 the VM), polymorphic and megamorphic caches, a cache for array `length`,
 property attributes, strings, sloppy-mode `this`, exceptions (`try`),
 closures over variables, and the opcodes the front end still rejects
-(`a - b` other than by a literal, `*`, `/`, `>`, `===`, shifts, object
-literals, `switch`, `for … in`, doubles and strings as constants).
+(`%`, shifts and bitwise operators by a variable, unary `-` of a variable,
+object literals, `switch`, `for … in`, doubles and strings as constants).

@@ -128,6 +128,12 @@ unsafe extern "C" {
     fn toi_rt_add();
     fn toi_rt_inc();
     fn toi_rt_less_than();
+    fn toi_rt_compare();
+    fn toi_rt_create_array();
+    fn toi_rt_sub();
+    fn toi_rt_mul();
+    fn toi_rt_div();
+    fn toi_rt_strict_eq();
     fn toi_rt_mod();
     fn toi_rt_to_int32();
     fn toi_rt_loose_eq();
@@ -2008,6 +2014,744 @@ macro_rules! slot_int_ops {
 with_gprs!(each_gpr! slot_int_ops);
 with_gprs!(gpr_pairs! slot_cmp_pair);
 
+// ---- Group 2: `Sub`, `Mul`, `Div`, relational and strict comparisons ----
+//
+// Register forms compute `r OP acc` (`r` at the location). Cases as for
+// `add`: `ii` exits on an int32 overflow (and `mul_ii` on a -0 product),
+// `iif` is its widened form, producing a double; `Div` always produces a
+// double. Comparisons: for int32 operands every relation is `<` with the
+// operands either way round, or its negation, so the int32 stencils are
+// `test_lt`/`tlt_*` (`r < acc`), `jlt` (`acc < r`), and here `jge`
+// (`acc >= r`, jump) and the booleans `test_gt` (`r > acc`), `test_le`
+// (`r <= acc`), `test_ge` (`r >= acc`). Other types go through the generic
+// `test_rel`, `jrel`, `jnrel` (boolean, jump if true, jump if false), whose
+// immediate selects the relation (see `rel_int`).
+
+/// `r - acc` etc. through the runtime, for any values.
+macro_rules! rt_sub {
+    ($s:ident, $acc:expr, $r:expr) => {
+        Value::from_bits(rt_call!($s, toi_rt_sub, $acc, $r))
+    };
+}
+macro_rules! rt_mul {
+    ($s:ident, $acc:expr, $r:expr) => {
+        Value::from_bits(rt_call!($s, toi_rt_mul, $acc, $r))
+    };
+}
+macro_rules! rt_div {
+    ($s:ident, $acc:expr, $r:expr) => {
+        Value::from_bits(rt_call!($s, toi_rt_div, $acc, $r))
+    };
+}
+/// `toi_rt_compare(a, b)`: how `a` compares with `b` (see `order`).
+macro_rules! rt_compare {
+    ($s:ident, $a:expr, $b:expr) => {
+        rt_call!($s, toi_rt_compare, $a, $b) as u32 & 3
+    };
+}
+/// `toi_rt_strict_eq(a, b)`: `a === b`.
+macro_rules! rt_strict_eq {
+    ($s:ident, $a:expr, $b:expr) => {
+        rt_call!($s, toi_rt_strict_eq, $a, $b) as u8 & 1 != 0
+    };
+}
+
+/// An int32 product, or `None` on overflow or a -0 result (a zero product
+/// with a negative factor).
+#[inline(always)]
+fn mul_i32(a: i32, b: i32) -> Option<i32> {
+    match a.checked_mul(b) {
+        Some(0) if (a | b) < 0 => None,
+        p => p,
+    }
+}
+
+/// How `x` compares with `a`: 0 less, 1 equal, 2 greater (3, unordered,
+/// is NaN's, from the runtime). A relation is the mask of the outcomes it
+/// holds for (the immediate of the generic stencils; see `REL_*` in
+/// `src/jit.rs`), so one stencil and one runtime call serve all four.
+#[inline(always)]
+fn order(x: i32, a: i32) -> u32 {
+    (x >= a) as u32 + (x > a) as u32
+}
+#[inline(always)]
+fn holds(mask: i32, order: u32) -> bool {
+    (mask as u32 >> order) & 1 != 0
+}
+
+/// The generic relational families at a location whose value is
+/// `$get` (boxed).
+macro_rules! rel_generic {
+    ($name:literal, $loc:expr, $act:ident, |$s:ident| $get:expr) => {
+        stencil_slow!($name, $loc; |$s| {
+            let x = $get;
+            if $s.tag.both_int32(x, $s.acc) {
+                act!($act, $s, holds(imm(), order(int(x), int($s.acc))))
+            }
+            slow!($s)
+        }; |$s| {
+            let x = $get;
+            let c = holds(imm(), rt_compare!($s, x, $s.acc));
+            act!($act, $s, c)
+        });
+    };
+}
+
+#[inline(always)]
+fn is_number(tag: NumberTag, v: Value) -> bool {
+    v.to_bits() & tag.to_bits() != 0
+}
+
+/// `===` at a location whose value is `$get` (boxed): without a double on
+/// either side, equal bits.
+macro_rules! strict_generic {
+    ($name:literal, $loc:expr, $act:ident, |$s:ident| $get:expr) => {
+        stencil_slow!($name, $loc; |$s| {
+            let x = $get;
+            // A non-number is strictly equal only to the same bits, and so
+            // are two int32s; two numbers otherwise need a numeric compare.
+            if !is_number($s.tag, x) || !is_number($s.tag, $s.acc) || $s.tag.both_int32(x, $s.acc) {
+                act!($act, $s, x == $s.acc)
+            }
+            slow!($s)
+        }; |$s| {
+            let x = $get;
+            let c = rt_strict_eq!($s, x, $s.acc);
+            act!($act, $s, c)
+        });
+    };
+}
+
+/// The int32 comparisons with `x` the location's int32 (`$x`).
+macro_rules! rel_int32 {
+    ($loc:expr, |$s:ident| $x:expr) => {
+        stencil!("jge_ii_", $loc; |$s| { act!(jt, $s, int($s.acc) >= $x) });
+        stencil!("test_gt_ii_", $loc; |$s| { act!(test, $s, $x > int($s.acc)) });
+        stencil!("test_le_ii_", $loc; |$s| { act!(test, $s, $x <= int($s.acc)) });
+        stencil!("test_ge_ii_", $loc; |$s| { act!(test, $s, $x >= int($s.acc)) });
+    };
+}
+
+/// Group 2's generic stencils, on memory only: the JIT writes a slot
+/// back first (`spill_*`), as these are the untyped, slow paths.
+macro_rules! group2_generic {
+    ($loc:tt) => {
+        stencil_slow!("sub_", loc!($loc); |s| {
+            let l = get!($loc, s);
+            if s.tag.both_int32(l, s.acc)
+                && let Some(v) = int(l).checked_sub(int(s.acc))
+            {
+                s.acc = s.tag.box_i32(v);
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let l = get!($loc, s);
+            s.acc = rt_sub!(s, s.acc, l);
+            next!(s)
+        });
+        stencil!("sub_ii_", loc!($loc); |s| {
+            match int(get!($loc, s)).checked_sub(int(s.acc)) {
+                Some(v) => {
+                    s.acc = unboxed(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+        stencil!("sub_wrap_ii_", loc!($loc); |s| {
+            s.acc = unboxed(int(get!($loc, s)).wrapping_sub(int(s.acc)));
+            next!(s)
+        });
+        stencil!("sub_iif_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 - int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("sub_if_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) - int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("sub_fi_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 - s.facc;
+            next!(s)
+        });
+        stencil!("sub_ff_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) - s.facc;
+            next!(s)
+        });
+
+        stencil_slow!("mul_", loc!($loc); |s| {
+            let l = get!($loc, s);
+            if s.tag.both_int32(l, s.acc)
+                && let Some(v) = mul_i32(int(l), int(s.acc))
+            {
+                s.acc = s.tag.box_i32(v);
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let l = get!($loc, s);
+            s.acc = rt_mul!(s, s.acc, l);
+            next!(s)
+        });
+        // A zero product is -0 if a factor is negative: checked out of
+        // line (`imul; jo exit; test; jz slow`).
+        stencil_slow!("mul_ii_", loc!($loc); |s| {
+            match int(get!($loc, s)).checked_mul(int(s.acc)) {
+                Some(0) => slow!(s),
+                Some(v) => {
+                    s.acc = unboxed(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        }; |s| {
+            if (int(get!($loc, s)) | int(s.acc)) < 0 {
+                exit!(s)
+            }
+            s.acc = unboxed(0);
+            next!(s)
+        });
+        stencil!("mul_iif_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 * int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("mul_if_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) * int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("mul_fi_", loc!($loc); |s| {
+            s.facc *= int(get!($loc, s)) as f64;
+            next!(s)
+        });
+        stencil!("mul_ff_", loc!($loc); |s| {
+            s.facc *= s.tag.decode_f64(get!($loc, s));
+            next!(s)
+        });
+
+        stencil_slow!("div_", loc!($loc); |s| {
+            let l = get!($loc, s);
+            if s.tag.both_int32(l, s.acc) {
+                s.acc = s.tag.encode_f64(int(l) as f64 / int(s.acc) as f64);
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let l = get!($loc, s);
+            s.acc = rt_div!(s, s.acc, l);
+            next!(s)
+        });
+        stencil!("div_ii_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 / int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("div_if_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) / int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("div_fi_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 / s.facc;
+            next!(s)
+        });
+        stencil!("div_ff_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) / s.facc;
+            next!(s)
+        });
+
+        rel_int32!(loc!($loc), |s| int(get!($loc, s)));
+        rel_generic!("test_rel_", loc!($loc), test, |s| get!($loc, s));
+        rel_generic!("jrel_", loc!($loc), jt, |s| get!($loc, s));
+        rel_generic!("jnrel_", loc!($loc), jf, |s| get!($loc, s));
+        strict_generic!("test_seq_", loc!($loc), test, |s| get!($loc, s));
+        strict_generic!("tseq_jt_", loc!($loc), jt, |s| get!($loc, s));
+        strict_generic!("tseq_jf_", loc!($loc), jf, |s| get!($loc, s));
+    };
+
+}
+
+macro_rules! group2_int_slot {
+    ($k:tt) => {
+        stencil!("sub_ii_u", $k; |s| {
+            match raw(s.g[$k]).checked_sub(int(s.acc)) {
+                Some(v) => {
+                    s.acc = unboxed(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+        stencil!("sub_wrap_ii_u", $k; |s| {
+            s.acc = unboxed(raw(s.g[$k]).wrapping_sub(int(s.acc)));
+            next!(s)
+        });
+        stencil!("sub_iif_u", $k; |s| {
+            s.facc = raw(s.g[$k]) as f64 - int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("sub_fi_u", $k; |s| {
+            s.facc = raw(s.g[$k]) as f64 - s.facc;
+            next!(s)
+        });
+        stencil_slow!("mul_ii_u", $k; |s| {
+            match raw(s.g[$k]).checked_mul(int(s.acc)) {
+                Some(0) => slow!(s),
+                Some(v) => {
+                    s.acc = unboxed(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        }; |s| {
+            // Not merged with `mul_ii_g<k>`'s identical helper: each
+            // stencil must keep its own.
+            core::arch::asm!(concat!("/* mul_ii_u", $k, " */"), options(nomem, nostack, preserves_flags));
+            if (raw(s.g[$k]) | int(s.acc)) < 0 {
+                exit!(s)
+            }
+            s.acc = unboxed(0);
+            next!(s)
+        });
+        stencil!("mul_iif_u", $k; |s| {
+            s.facc = raw(s.g[$k]) as f64 * int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("mul_fi_u", $k; |s| {
+            s.facc *= raw(s.g[$k]) as f64;
+            next!(s)
+        });
+        stencil!("div_ii_u", $k; |s| {
+            s.facc = raw(s.g[$k]) as f64 / int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("div_fi_u", $k; |s| {
+            s.facc = raw(s.g[$k]) as f64 / s.facc;
+            next!(s)
+        });
+        rel_int32!(concat!("u", $k), |s| raw(s.g[$k]));
+    };
+}
+
+/// Group 2's typed stencils on a boxed GPR slot.
+macro_rules! group2_boxed_typed {
+    ($loc:tt) => {
+        stencil!("sub_ii_", loc!($loc); |s| {
+            match int(get!($loc, s)).checked_sub(int(s.acc)) {
+                Some(v) => {
+                    s.acc = unboxed(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+        stencil!("sub_wrap_ii_", loc!($loc); |s| {
+            s.acc = unboxed(int(get!($loc, s)).wrapping_sub(int(s.acc)));
+            next!(s)
+        });
+        stencil!("sub_iif_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 - int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("sub_if_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) - int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("sub_fi_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 - s.facc;
+            next!(s)
+        });
+        stencil!("sub_ff_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) - s.facc;
+            next!(s)
+        });
+        // A zero product is -0 if a factor is negative: checked out of
+        // line (`imul; jo exit; test; jz slow`).
+        stencil_slow!("mul_ii_", loc!($loc); |s| {
+            match int(get!($loc, s)).checked_mul(int(s.acc)) {
+                Some(0) => slow!(s),
+                Some(v) => {
+                    s.acc = unboxed(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        }; |s| {
+            if (int(get!($loc, s)) | int(s.acc)) < 0 {
+                exit!(s)
+            }
+            s.acc = unboxed(0);
+            next!(s)
+        });
+        stencil!("mul_iif_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 * int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("mul_if_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) * int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("mul_fi_", loc!($loc); |s| {
+            s.facc *= int(get!($loc, s)) as f64;
+            next!(s)
+        });
+        stencil!("mul_ff_", loc!($loc); |s| {
+            s.facc *= s.tag.decode_f64(get!($loc, s));
+            next!(s)
+        });
+        stencil!("div_ii_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 / int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("div_if_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) / int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("div_fi_", loc!($loc); |s| {
+            s.facc = int(get!($loc, s)) as f64 / s.facc;
+            next!(s)
+        });
+        stencil!("div_ff_", loc!($loc); |s| {
+            s.facc = s.tag.decode_f64(get!($loc, s)) / s.facc;
+            next!(s)
+        });
+        rel_int32!(loc!($loc), |s| int(get!($loc, s)));
+    };
+}
+
+/// `x = x - y` on int32 slots, in place: on overflow the exit stub undoes
+/// it (`undo_subr_u<x>_u<y>`).
+macro_rules! group2_int_slot_pair {
+    ($a:tt, $b:tt) => {
+        stencil!("subr_ii_u", $a, "_u", $b; |s| {
+            let (v, overflow) = raw(s.g[$a]).overflowing_sub(raw(s.g[$b]));
+            s.g[$a] = unboxed(v);
+            if overflow {
+                exit!(s)
+            }
+            next!(s)
+        });
+        stencil!("undo_subr_u", $a, "_u", $b; |s| {
+            s.g[$a] = unboxed(raw(s.g[$a]).wrapping_add(raw(s.g[$b])));
+            next!(s)
+        });
+    };
+}
+
+macro_rules! group2_fp_slot {
+    ($k:tt) => {
+        stencil!("sub_if_f", $k; |s| {
+            s.facc = s.f[$k] - int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("sub_ff_f", $k; |s| {
+            s.facc = s.f[$k] - s.facc;
+            next!(s)
+        });
+        stencil!("mul_if_f", $k; |s| {
+            s.facc = s.f[$k] * int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("mul_ff_f", $k; |s| {
+            s.facc *= s.f[$k];
+            next!(s)
+        });
+        stencil!("div_if_f", $k; |s| {
+            s.facc = s.f[$k] / int(s.acc) as f64;
+            next!(s)
+        });
+        stencil!("div_ff_f", $k; |s| {
+            s.facc = s.f[$k] / s.facc;
+            next!(s)
+        });
+    };
+}
+
+group2_generic!([m]);
+macro_rules! group2_gpr {
+    ($k:tt) => {
+        group2_boxed_typed!([g $k]);
+        group2_int_slot!($k);
+    };
+}
+with_gprs!(each_gpr! group2_gpr);
+with_gprs!(gpr_pairs! group2_int_slot_pair);
+group2_fp_slot!(0);
+group2_fp_slot!(1);
+group2_fp_slot!(2);
+group2_fp_slot!(3);
+group2_fp_slot!(4);
+group2_fp_slot!(5);
+group2_fp_slot!(6);
+
+// `MulSmi k`, `DivSmi k` (`acc OP k`).
+stencil_slow!("mul_smi"; |s| {
+    if s.tag.is_int32(s.acc)
+        && let Some(v) = mul_i32(int(s.acc), imm())
+    {
+        s.acc = s.tag.box_i32(v);
+        next!(s)
+    }
+    slow!(s)
+}; |s| {
+    s.acc = rt_mul!(s, s.acc, Value::from_i32(imm()));
+    next!(s)
+});
+// An int32 times k ≠ 0: `imul eax, r12d, k; jo exit` (x86-64 in asm, as
+// LLVM would load k into a register first; the result goes to a scratch
+// register, as an overflowed product can't be undone), then for k < 0 a
+// zero product is -0, which exits too.
+macro_rules! mul_smi_i {
+    ($name:literal, $neg:literal) => {
+        imm_variants!($name; |s, k| {
+            #[cfg(target_arch = "x86_64")]
+            let r: Option<i32> = {
+                let _ = k;
+                let v: u32;
+                core::arch::asm!(
+                    "imul {v:e}, {a:e}, offset {imm}",
+                    "{{disp32}} jo {ovf}",
+                    v = out(reg) v,
+                    a = in(reg) s.acc.to_bits(),
+                    imm = sym toi_hole_imm,
+                    ovf = label { unsafe { exit!(s) } },
+                    options(nomem, nostack),
+                );
+                Some(v as i32)
+            };
+            #[cfg(target_arch = "aarch64")]
+            let r = int(s.acc).checked_mul(k);
+            match r {
+                Some(0) if $neg => exit!(s),
+                Some(v) => {
+                    s.acc = unboxed(v);
+                    next!(s)
+                }
+                None => exit!(s),
+            }
+        });
+    };
+}
+mul_smi_i!("mul_smi_pos_i", false);
+mul_smi_i!("mul_smi_neg_i", true);
+// `x * 0`: 0, or -0 for a negative `x`.
+stencil!("mul_smi_zero_i"; |s| {
+    if int(s.acc) < 0 {
+        exit!(s)
+    }
+    s.acc = unboxed(0);
+    next!(s)
+});
+stencil!("mul_smi_iif"; |s| {
+    s.facc = int(s.acc) as f64 * imm() as f64;
+    next!(s)
+});
+stencil!("mul_smi_f"; |s| {
+    s.facc *= imm() as f64;
+    next!(s)
+});
+stencil_slow!("div_smi"; |s| {
+    if s.tag.is_int32(s.acc) {
+        s.acc = s.tag.encode_f64(int(s.acc) as f64 / imm() as f64);
+        next!(s)
+    }
+    slow!(s)
+}; |s| {
+    // `toi_rt_div(x, y)` is `y / x`.
+    s.acc = rt_div!(s, Value::from_i32(imm()), s.acc);
+    next!(s)
+});
+stencil!("div_smi_i"; |s| {
+    s.facc = int(s.acc) as f64 / imm() as f64;
+    next!(s)
+});
+stencil!("div_smi_f"; |s| {
+    s.facc /= imm() as f64;
+    next!(s)
+});
+
+// Shifts by a constant, on an int32 `acc`: one stencil per shift count,
+// which is then part of the instruction (`sar r12d, 3`). Generic forms
+// (`shl_smi`, …) and double forms (`shl_smi_f`) take the count from the
+// immediate.
+macro_rules! shift_by {
+    ($($k:literal)*) => {$(
+        stencil!("shl_smi_i_", $k; |s| {
+            s.acc = unboxed(int(s.acc) << $k);
+            next!(s)
+        });
+        stencil!("sar_smi_i_", $k; |s| {
+            s.acc = unboxed(int(s.acc) >> $k);
+            next!(s)
+        });
+        stencil!("shr_smi_i_", $k; |s| {
+            s.acc = unboxed((int(s.acc) as u32 >> $k) as i32);
+            next!(s)
+        });
+    )*};
+}
+shift_by!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31);
+// `x >>> 0` of an int32: itself if it isn't negative.
+stencil!("shr_smi_i_0"; |s| {
+    if int(s.acc) < 0 {
+        exit!(s)
+    }
+    next!(s)
+});
+/// The result of a shift, boxed: an int32, or for `>>>` a uint32 above
+/// 2^31 - 1, which is a double.
+#[inline(always)]
+fn box_shifted(tag: NumberTag, v: i64) -> Value {
+    match i32::try_from(v) {
+        Ok(i) => tag.box_i32(i),
+        Err(_) => tag.encode_f64(v as f64),
+    }
+}
+macro_rules! shift_generic {
+    ($name:literal, |$a:ident, $k:ident| $op:expr, |$wa:ident, $wk:ident| $wide:expr) => {
+        stencil_slow!($name; |s| {
+            if s.tag.is_int32(s.acc) {
+                let ($wa, $wk) = (int(s.acc), imm() as u32 & 31);
+                s.acc = box_shifted(s.tag, $wide);
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let ($wa, $wk) = (rt_to_int32!(s, s.acc), imm() as u32 & 31);
+            s.acc = box_shifted(s.tag, $wide);
+            next!(s)
+        });
+        stencil_slow!($name, "_f"; |s| {
+            if let Some($a) = f64_to_int32(s.facc) {
+                let $k = imm() as u32 & 31;
+                s.acc = unboxed($op);
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let ($a, $k) = (rt_to_int32!(s, s.tag.encode_f64(s.facc)), imm() as u32 & 31);
+            s.acc = unboxed($op);
+            next!(s)
+        });
+    };
+}
+shift_generic!("shl_smi", |a, k| a << k, |a, k| (a << k) as i64);
+shift_generic!("sar_smi", |a, k| a >> k, |a, k| (a >> k) as i64);
+// The JIT uses `shr_smi_f` for counts 1–31 only, which leave an int32.
+shift_generic!("shr_smi", |a, k| (a as u32 >> k) as i32, |a, k| (a as u32 >> k) as i64);
+
+// `JumpIfLessEqualSmi`, `JumpIfGreaterSmi`, `JumpIfGreaterEqualSmi` (`acc OP
+// k`). On an int32, `acc <= k` is `acc < k + 1` (`jlt_smi_i`) and `acc > k`
+// is `acc >= k + 1`, so the only new int32 stencil is `jge_smi_i`.
+imm_variants!("jge_smi_i"; |s, k| {
+    // As `jlt_smi_i`: the immediate in the `cmp` (LLVM would load it).
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = k;
+        core::arch::asm!(
+            "cmp {v:e}, offset {imm}",
+            "{{disp32}} jge {taken}",
+            v = in(reg) s.acc.to_bits(),
+            imm = sym toi_hole_imm,
+            taken = label { unsafe { jump!(s) } },
+            options(nomem, nostack),
+        );
+        next!(s)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if int(s.acc) >= k {
+            jump!(s)
+        }
+        next!(s)
+    }
+});
+stencil!("jle_smi_f"; |s| {
+    if s.facc <= imm() as f64 {
+        jump!(s)
+    }
+    next!(s)
+});
+stencil!("jgt_smi_f"; |s| {
+    if s.facc > imm() as f64 {
+        jump!(s)
+    }
+    next!(s)
+});
+stencil!("jge_smi_f"; |s| {
+    if s.facc >= imm() as f64 {
+        jump!(s)
+    }
+    next!(s)
+});
+// Generic: `imm` is k, the 64-bit immediate the relation's mask (see
+// `holds`), with `x` = k.
+stencil_slow!("jrel_smi"; |s| {
+    if s.tag.is_int32(s.acc) {
+        act!(jt, s, holds(imm64_u32() as i32, order(imm(), int(s.acc))))
+    }
+    slow!(s)
+}; |s| {
+    let c = holds(imm64_u32() as i32, rt_compare!(s, Value::from_i32(imm()), s.acc));
+    act!(jt, s, c)
+});
+
+// `TestUndefined`, `TestNull`, `TestNullish` on a boxed `acc` (an int32 or
+// double `acc` is none of them: the JIT folds the test), and with the jump
+// after them; also on a boxed slot (`ldar g<k>` skipped).
+/// `v`, which LLVM can no longer relate to anything: a value it has just
+/// compared with a constant stays in its register, instead of being
+/// rematerialized as that constant on the equal path. No instructions.
+#[inline(always)]
+fn opaque(v: Value) -> Value {
+    let mut b = v.to_bits();
+    unsafe { core::arch::asm!("/* {0} */", inout(reg) b, options(pure, nomem, nostack, preserves_flags)) };
+    Value::from_bits(b)
+}
+
+#[inline(always)]
+fn nullish(v: Value) -> bool {
+    // null is 0x2, undefined 0xA: `(v - 2) & !8 == 0`.
+    v.to_bits().wrapping_sub(Value::NULL.to_bits()) & !Value::UNDEFINED_TAG == 0
+}
+macro_rules! value_test {
+    ($test:literal, $jt:literal, $jf:literal, |$v:ident| $c:expr) => {
+        stencil!($test; |s| {
+            let $v = s.acc;
+            act!(test, s, $c)
+        });
+        stencil!($jt; |s| {
+            let $v = s.acc;
+            s.acc = opaque(s.acc);
+            act!(jt, s, $c)
+        });
+        stencil!($jf; |s| {
+            let $v = s.acc;
+            s.acc = opaque(s.acc);
+            act!(jf, s, $c)
+        });
+    };
+}
+value_test!("test_undefined", "tund_jt", "tund_jf", |v| v == Value::UNDEFINED);
+value_test!("test_null", "tnull_jt", "tnull_jf", |v| v == Value::NULL);
+value_test!("test_nullish", "tnsh_jt", "tnsh_jf", |v| nullish(v));
+macro_rules! value_test_slot {
+    ($k:tt) => {
+        stencil!("tund_jt_g", $k; |s| { let v = s.g[$k]; s.g[$k] = opaque(v); act!(jt, s, v == Value::UNDEFINED) });
+        stencil!("tund_jf_g", $k; |s| { let v = s.g[$k]; s.g[$k] = opaque(v); act!(jf, s, v == Value::UNDEFINED) });
+        stencil!("tnull_jt_g", $k; |s| { let v = s.g[$k]; s.g[$k] = opaque(v); act!(jt, s, v == Value::NULL) });
+        stencil!("tnull_jf_g", $k; |s| { let v = s.g[$k]; s.g[$k] = opaque(v); act!(jf, s, v == Value::NULL) });
+        stencil!("tnsh_jt_g", $k; |s| { act!(jt, s, nullish(s.g[$k])) });
+        stencil!("tnsh_jf_g", $k; |s| { act!(jf, s, nullish(s.g[$k])) });
+    };
+}
+with_gprs!(each_gpr! value_test_slot);
+
+// `CreateArray`: a new, empty array from the runtime (the VM's address is
+// the 64-bit immediate).
+stencil!("create_array"; |s| {
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_create_array, Value::from_bits(imm64()), Value::UNDEFINED));
+    next!(s)
+});
+
 // ---- Property access, fed by inline caches ----
 //
 // The JIT reads each property instruction's inline cache when it compiles,
@@ -2109,6 +2853,35 @@ macro_rules! keyed_load {
         });
     };
 }
+
+/// `o.length` for an array `o` at a boxed location: its elements' count
+/// (`Object::elems_len`, at byte 32), after a check that it is an array
+/// (`Object::class` at byte 8 is `Class::Array`, 1) unless its shape is
+/// known (`_nc`).
+macro_rules! array_length {
+    ($loc:tt) => {
+        stencil!("get_length_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if !is_cell(s.tag, o) || *(o.to_bits() as *const u8).add(8) != 1 {
+                exit!(s)
+            }
+            s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());
+            next!(s)
+        });
+        stencil!("get_length_nc_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());
+            next!(s)
+        });
+    };
+}
+array_length!([m]);
+macro_rules! array_length_gpr {
+    ($k:tt) => {
+        array_length!([g $k]);
+    };
+}
+with_gprs!(each_gpr! array_length_gpr);
 
 macro_rules! property_location {
     ($loc:tt) => {

@@ -31,6 +31,15 @@ fn ok(src: &str) -> String {
     display(run(src).unwrap_or_else(|e| panic!("{e}")))
 }
 
+/// `script` defining global function `f` (defined in `rest`) and calling
+/// `main()`, returning its result, plus `rest`.
+fn with_main_and(f: &str, rest: &str) -> String {
+    format!(
+        "script\n CreateClosure {f}\n StaGlobal {f}\n CreateClosure main\n StaGlobal main\n \
+         LdaGlobal main\n Star r1\n CallUndefined r1, r2, 0\n Return\nend\n{rest}"
+    )
+}
+
 /// `script` calling `main()` and returning its result, plus `rest`.
 fn with_main(rest: &str) -> String {
     format!(
@@ -2433,6 +2442,182 @@ end
     // Σ i + (i + 1) + 2 (i + 2) = 2n(n - 1) + 5n.
     assert_eq!(v, (2 * 20000 * 19999 + 5 * 20000).to_string());
     assert!(s.iter().any(|n| n.starts_with("construct_direct")), "{s:?}");
+}
+
+/// `P(a, b)` sets `this.x = a`, then `this.y = b + 1`, whose add
+/// overflows (exits) at i = 250. The add between the two transitions keeps
+/// the first one storing its shape: after the exit, the interpreter sees
+/// `x`.
+#[test]
+fn exits_between_transitions() {
+    let src = with_main_and(
+        "P",
+        "\
+function P(a, b)
+        Ldar r1
+        SetNamed r0, x
+        Ldar r2
+        AddSmi 1
+        SetNamed r0, y
+        LdaUndefined
+        Return
+end
+function main()                 ; r1 i, r2 total, r3 P, r4-r5 arguments
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   LdaGlobal P
+        Star r3
+        Ldar r1
+        Star r4
+        Star r5
+        TestEqualSmi 250
+        JumpIfFalse go
+        LdaSmi 2147483647
+        Star r5
+go:     Construct r3, r4, 2
+        Star r6
+        GetNamed r6, x
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 300, loop
+        Ldar r2
+        Return
+end
+",
+    );
+    assert_eq!(ok(&src), (299 * 300 / 2).to_string());
+}
+
+/// The same with the second store's value check failing: `b` comes from
+/// a field of any type, so `this.y = b` checks it fits `y`'s int32 type,
+/// until compiled `main` passes a double at i = 250. The check is an exit
+/// between the two transitions: the first one stores its shape.
+#[test]
+fn checks_between_transitions() {
+    let src = with_main_and(
+        "P",
+        "\
+function P(a, b)
+        Ldar r1
+        SetNamed r0, x
+        Ldar r2
+        SetNamed r0, y
+        LdaUndefined
+        Return
+end
+function main()                 ; r1 i, r2 total, r3 P, r4-r5 arguments, r7 o, r8 d
+        CreateArray
+        Star r7
+        LdaUndefined
+        SetNamed r7, w          ; o.w: any type
+        LdaSmi 2147483647
+        AddSmi 1
+        Star r8                 ; a double, made before the loop compiles
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   Ldar r1
+        SetNamed r7, w
+        TestEqualSmi 250
+        JumpIfFalse go
+        Ldar r8
+        SetNamed r7, w
+go:     LdaGlobal P
+        Star r3
+        Ldar r1
+        Star r4
+        GetNamed r7, w
+        Star r5
+        Construct r3, r4, 2
+        Star r6
+        GetNamed r6, x
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 300, loop
+        Ldar r2
+        Return
+end
+",
+    );
+    assert_eq!(ok(&src), (299 * 300 / 2).to_string());
+    let m = toi::asm::parse(&src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(2);
+    vm.run(&m).unwrap();
+    let s = vm.jit_stencils("P").unwrap_or_default();
+    assert!(s.iter().any(|n| n.contains("+set_tr")), "{s:?}");
+}
+
+/// `F` loops (so calls from the interpreter enter it compiled), then puts
+/// another object (`other`) in `this`'s register (`Star r0`, which
+/// compilers don't emit, but bytecode allows). The interpreter's `new` takes the result
+/// from that register, so compiled `F` writes it back on return. (`main`
+/// exits before each `new` at an instruction the JIT doesn't compile, so
+/// the interpreter makes it.)
+#[test]
+fn compiled_new_frames_write_this_back() {
+    let src = with_main_and(
+        "F",
+        "\
+function F()                    ; r1 k
+        LdaSmi 0
+        Star r1
+l:      Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 3, l
+        LdaGlobal other
+        Star r0
+        LdaSmi 7
+        SetNamed r0, v
+        LdaUndefined
+        Return
+end
+function main()                 ; r1 i, r2 total, r3 F, r6 a, r7 0
+        CreateArray
+        StaGlobal other
+        CreateArray
+        Star r6
+        LdaSmi 0
+        Star r7
+        Star r1
+        Star r2
+loop:   LdaGlobal F
+        Star r3
+        SetKeyed r6, r7         ; not compiled: compiled `main` exits here
+        Construct r3, r4, 0
+        Star r5
+        GetNamed r5, v
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 100, loop
+        Ldar r2
+        Return
+end
+",
+    );
+    assert_eq!(ok(&src), "700");
+    let m = toi::asm::parse(&src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(2);
+    assert_eq!(display(vm.run(&m).unwrap()), "700");
+    let s = vm.jit_stencils("F").unwrap_or_default();
+    assert!(
+        s.iter()
+            .any(|n| n.starts_with("star_") || n.starts_with("spill_")),
+        "{s:?}"
+    );
+    assert!(!s.iter().any(|n| n == "bail"), "{s:?}");
 }
 
 /// For odd `k`, `R` returns another object (`other`, whose `v` is 1000)

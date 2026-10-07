@@ -57,6 +57,13 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   accesses globals in such a context slowly, which shows in the
   files that use globals (10–16, 28–32, 50–53).
 
+- `scripts/sizes.sh` reports the size of the runtime, of the stencils,
+  and of the code the JIT generates for each listing in
+  [bytecode/](bytecode/); `--record` appends them to
+  [sizes.tsv](sizes.tsv), by commit, and every run shows the change since
+  the last record. Speed comes first, but size is tracked: a small
+  speedup for a large size increase is worth reconsidering.
+
 - Hand-written bytecode for some of these files is in
   [bytecode/](bytecode/), with the conventions a compiler should follow.
   toi runs it already (`--engine target/release/toi bench/bytecode/*.asm`).
@@ -127,6 +134,11 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
 | [82-propagate-walk.js](micro/82-propagate-walk.js) | Kernel: worklist propagation of "max-of" ranks downstream through a graph, with marks. |
 | [83-collect-and-readd.js](micro/83-collect-and-readd.js) | Kernel: collect unsatisfied items into a returned collection; re-add them lowest rank first. |
 | [84-build-and-tear-down.js](micro/84-build-and-tear-down.js) | Kernel: build a graph by constructor side effects, then remove edges by in-place compaction. |
+| [90-recursive-fib.js](micro/90-recursive-fib.js) | Doubly recursive fib. |
+| [91-mutual-recursion.js](micro/91-mutual-recursion.js) | fib over two mutually recursive functions. |
+| [92-tail-recursion.js](micro/92-tail-recursion.js) | A tail-recursive sum, 5000 deep, run from a loop. |
+| [93-constructor-loop.js](micro/93-constructor-loop.js) | A small constructor called in a loop, one field read back. |
+| [94-constructor-and-native.js](micro/94-constructor-and-native.js) | A constructor and `push` in the same loop. |
 
 Groups:
 
@@ -152,3 +164,5 @@ Groups:
 - **8x, kernels**: multi-class workloads: plan execution (copy,
   scale), rank propagation over a worklist, collecting and re-adding by
   rank, building and tearing down a graph.
+- **9x, calls into compiled code**: recursion (self, mutual, tail),
+  constructors called in a loop, a native method next to one.

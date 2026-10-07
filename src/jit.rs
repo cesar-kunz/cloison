@@ -2330,12 +2330,13 @@ fn box_acc_piece(acc: Ty) -> Option<Piece> {
 /// The stencil name for instruction `insn`, and pieces to run before it.
 /// With `vm`, the code runs in a VM frame, which is dead once it returns,
 /// but for `this`: a constructor's result may be it (`construct_result`).
+/// `return_spills`: how many registers, from `r0`, `return` writes back.
 fn stencil_for(
     insn: &Insn,
     sel: &Sel,
     st: &TypeState,
     homes: &[Home],
-    vm: bool,
+    return_spills: usize,
 ) -> (Vec<Piece>, String) {
     let mut pre = Vec::new();
     let home = homes.get(insn.reg as usize).copied().unwrap_or(Home::Mem);
@@ -2398,8 +2399,7 @@ fn stencil_for(
         ("add" | "jlt" | "test_lt" | "test_eq", _) => format!("{}_{}_{loc}", sel.base, sel.case),
         ("return", _) => {
             box_acc(&mut pre);
-            let n = if vm { 1.min(homes.len()) } else { homes.len() };
-            pre.extend(spills(&homes[..n]));
+            pre.extend(spills(&homes[..return_spills.min(homes.len())]));
             "return".into()
         }
         // Generic stencils that read `acc` take it boxed.
@@ -3075,6 +3075,8 @@ pub struct JitCode {
     entry: usize,
     /// Bytes of hot code, from the start (excluding cold code).
     main_len: usize,
+    /// Bytes of code: hot, cold (stubs, helpers) and runtime-call wrappers.
+    len: usize,
     /// The selected stencil per instruction (`None`: unreachable from the
     /// entry, or covered by the fused stencil of an earlier instruction),
     /// for inspection and tests.
@@ -3429,6 +3431,24 @@ impl JitCode {
         );
         let has_entry_seq = !entry_seq.is_empty();
         hot.extend(ending_at(entry_seq, Target::Label(entry)));
+        let entry_len = hot.len();
+        // What `return` writes back: in a VM frame only `this`, which the
+        // caller of a `new` frame reads, and only if the code changes it
+        // (`Star r0`, a self tail call's moves); otherwise everything.
+        let return_spills = if feedback.is_none() {
+            homes.len()
+        } else {
+            let writes_this = |i: &Insn| {
+                i.frame == 0
+                    && ((i.op == Op::Star && i.reg == 0) || (i.op == Op::Mov && i.reg2 == 0))
+            };
+            usize::from(
+                insns
+                    .iter()
+                    .zip(&ins)
+                    .any(|(i, st)| st.is_some() && writes_this(i)),
+            )
+        };
 
         let live_out = acc_live_out(insns, &ins);
         let mut is_target = vec![false; n];
@@ -3446,6 +3466,42 @@ impl JitCode {
             live_out: &live_out,
             is_target: &is_target,
         };
+
+        // Transitions whose new shape only the next transition on the same
+        // object sees: it adds a property to that shape (exactly, and
+        // unchecked), and nothing between them can exit: only loads into
+        // `acc`. Such a transition stores just the slot (`set_own_nc`), the
+        // next one the final shape. (A jump into the run is fine: the next
+        // transition's shape is exact there too.)
+        let defer_shape: Vec<bool> = (0..n)
+            .map(|i| {
+                let (Some(Sel { base: "set_tr", case: "nc", .. }), Some(Prop::Transition { new_shape, .. })) =
+                    (&sel[i], props.get(i))
+                else {
+                    return false;
+                };
+                let (frame, obj) = (insns[i].frame, insns[i].reg);
+                for (j, insn) in insns.iter().enumerate().skip(i + 1) {
+                    let Some(s) = &sel[j] else { return false };
+                    if insn.frame != frame {
+                        return false;
+                    }
+                    match insn.op {
+                        Op::Ldar | Op::LdaSmi | Op::LdaUndefined | Op::LdaNull | Op::LdaTrue
+                        | Op::LdaFalse => {}
+                        Op::SetNamed => {
+                            return insn.reg == obj
+                                && s.base == "set_tr"
+                                && s.case == "nc"
+                                && s.check.is_none()
+                                && matches!(props.get(j), Some(Prop::Transition { shape, .. }) if shape == new_shape);
+                        }
+                        _ => return false,
+                    }
+                }
+                false
+            })
+            .collect();
 
         // The jump target of instruction `i` (with its out-state), going
         // through a conversion stub if the edge needs one.
@@ -3527,7 +3583,12 @@ impl JitCode {
                 continue;
             }
 
-            let (pre, name) = stencil_for(insn, s, st, &homes, feedback.is_some());
+            let (pre, name) = stencil_for(insn, s, st, &homes, return_spills);
+            let name = if defer_shape[i] {
+                name.replacen("set_tr_nc_", "set_own_nc_", 1)
+            } else {
+                name
+            };
             let jump = if insn.jumps() {
                 jump_to(i, &s.out, &mut stubs)
             } else {
@@ -3648,6 +3709,12 @@ impl JitCode {
             i += 1;
         }
 
+        // The entry sequence falls through into the entry instruction when
+        // that comes right after it.
+        if has_entry_seq && label_piece[entry] == entry_len {
+            hot[entry_len - 1].cont = Target::Next;
+        }
+
         // Positions. Hot pieces back to back; then cold code: edge stubs,
         // exit stubs, helpers; then runtime-call wrappers.
         let mut pos = 0;
@@ -3732,6 +3799,7 @@ impl JitCode {
             }
         }
 
+        let len = pos;
         let mut mem = ExecMem::new(pos);
         let base = mem.ptr as u64;
         let buf = mem.bytes();
@@ -3823,6 +3891,7 @@ impl JitCode {
             mem,
             entry: entry_at,
             main_len,
+            len,
             stencils: names,
             homes,
             ret,
@@ -3860,13 +3929,16 @@ impl JitCode {
     }
 
     /// Debugging: with `TOI_JIT_LOG` set, print the stencils of a VM
-    /// function's code, entered at bytecode offset `pc`.
+    /// function's code, entered at bytecode offset `pc`, and its size in
+    /// bytes: hot code, and all of it (`scripts/sizes.sh` adds these up).
     fn log(&self, function: *const crate::vm::Code, pc: usize) {
         if std::env::var_os("TOI_JIT_LOG").is_some() {
             let names: Vec<&str> = self.stencils.iter().flatten().map(String::as_str).collect();
             eprintln!(
-                "jit {} @{pc}: {}",
+                "jit {} @{pc} ({} hot, {} bytes): {}",
                 unsafe { &(*function).name },
+                self.main_len,
+                self.len,
                 names.join(" ")
             );
         }

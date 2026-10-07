@@ -45,6 +45,77 @@ pub struct FunctionDef {
     /// Module function index of each nested function (`CreateClosure`'s
     /// operand indexes this).
     pub closures: Vec<usize>,
+    /// The constants `LdaConstant` loads.
+    pub constants: Vec<Constant>,
+}
+
+/// A constant: a string or a number (one that isn't an int32).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Constant {
+    Number(f64),
+    String(String),
+}
+
+impl Constant {
+    /// As the text format writes it: a quoted string, or a number Rust
+    /// reads back exactly.
+    fn text(&self) -> String {
+        match self {
+            Constant::Number(d) => format!("{d:?}"),
+            Constant::String(s) => format!("{s:?}"),
+        }
+    }
+
+    /// The constant written as `t`, if it is one.
+    fn parse(t: &str) -> Option<Constant> {
+        if let Some(inner) = t.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+            let mut out = String::new();
+            let mut cs = inner.chars();
+            while let Some(c) = cs.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match cs.next()? {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    '0' => out.push('\0'),
+                    'u' => {
+                        // `\u{…}`, as Rust's `{:?}` writes.
+                        let rest: String = cs.by_ref().take_while(|&c| c != '}').collect();
+                        let hex = rest.strip_prefix('{')?;
+                        out.push(char::from_u32(u32::from_str_radix(hex, 16).ok()?)?);
+                    }
+                    c => out.push(c),
+                }
+            }
+            return Some(Constant::String(out));
+        }
+        let d = match t {
+            "inf" => f64::INFINITY,
+            "-inf" => f64::NEG_INFINITY,
+            "NaN" => f64::NAN,
+            _ => t.parse().ok()?,
+        };
+        Some(Constant::Number(d))
+    }
+}
+
+/// `line` up to a `;` comment, but not one in a string.
+fn strip_comment(line: &str) -> &str {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => return &line[..i],
+            _ => {}
+        }
+    }
+    line
 }
 
 #[derive(Clone, Debug)]
@@ -67,7 +138,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
     let mut open: Option<Block> = None;
     for (n, raw) in src.lines().enumerate() {
         let n = n + 1;
-        let line = raw.split(';').next().unwrap().trim();
+        let line = strip_comment(raw).trim();
         if line.is_empty() {
             continue;
         }
@@ -113,6 +184,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
         let mut labels: HashMap<String, (Label, bool)> = HashMap::new();
         let mut ics: Vec<String> = Vec::new();
         let mut closures: Vec<usize> = Vec::new();
+        let mut constants: Vec<Constant> = Vec::new();
         let mut nregs = 1 + b.params as usize;
         fn label(
             labels: &mut HashMap<String, (Label, bool)>,
@@ -147,11 +219,16 @@ pub fn parse(src: &str) -> Result<Module, String> {
             let (mnemonic, operands) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
             let op = Op::from_name(mnemonic)
                 .ok_or_else(|| err(format!("unknown opcode `{mnemonic}`")))?;
-            let toks: Vec<&str> = operands
-                .split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .collect();
+            // A constant is the only operand, and may contain commas.
+            let toks: Vec<&str> = if op.operands() == [Operand::Const] {
+                vec![operands.trim()]
+            } else {
+                operands
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            };
             let kinds = op.operands();
             let written = kinds.iter().filter(|&&k| k != Operand::AutoIc).count();
             if toks.len() != written {
@@ -204,6 +281,18 @@ pub fn parse(src: &str) -> Result<Module, String> {
                         )
                     }
                     Operand::AutoIc => unreachable!(),
+                    Operand::Const => {
+                        let c = Constant::parse(t)
+                            .ok_or_else(|| err(format!("expected a constant, got `{t}`")))?;
+                        let i = match constants.iter().position(|x| x.text() == c.text()) {
+                            Some(i) => i,
+                            None => {
+                                constants.push(c);
+                                constants.len() - 1
+                            }
+                        };
+                        Arg::Index(u16::try_from(i).map_err(|_| err("too many constants".into()))?)
+                    }
                     Operand::Fn => {
                         let f = *index
                             .get(t)
@@ -237,6 +326,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             code: a.finish(),
             ics,
             closures,
+            constants,
         });
     }
     Ok(Module { functions, script })
@@ -319,6 +409,7 @@ pub fn disassemble(m: &Module) -> String {
                     }
                     Operand::Ic => args.push(f.ics[u16_at()].clone()),
                     Operand::Fn => args.push(names[f.closures[u16_at()]].clone()),
+                    Operand::Const => args.push(f.constants[u16_at()].text()),
                     Operand::AutoIc => {}
                 }
                 at += k.width();
@@ -403,6 +494,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn constants_read_back() {
+        let m = parse(
+            "script\n  LdaConstant \"a, b; \\\"c\\\" \\u{e9}\"\n  LdaConstant 2.5\n  LdaConstant -0.0 ; neg\n  LdaConstant 2.5\n  Return\nend\n",
+        )
+        .unwrap();
+        let f = &m.functions[0];
+        assert_eq!(
+            f.constants,
+            [
+                Constant::String("a, b; \"c\" é".into()),
+                Constant::Number(2.5),
+                Constant::Number(-0.0),
+            ]
+        );
+        let back = parse(&disassemble(&m)).unwrap();
+        assert_eq!(back.functions[0].constants, f.constants);
+        assert_eq!(back.functions[0].code, f.code);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use super::Error;
 use super::ast::*;
-use crate::asm::{FunctionDef, Module};
+use crate::asm::{Constant, FunctionDef, Module};
 use crate::bytecode::{Arg, Assembler, Label, Op};
 
 pub fn generate(p: &Program) -> Result<Module, Error> {
@@ -280,6 +280,7 @@ struct Gen<'a> {
     labels: Vec<LabelInfo>,
     ics: Vec<String>,
     closures: Vec<usize>,
+    constants: Vec<Constant>,
     nregs: usize,
     locals: HashMap<&'a str, u8>,
     /// The next free temporary.
@@ -317,6 +318,7 @@ impl<'a> Gen<'a> {
             labels: Vec::new(),
             ics: Vec::new(),
             closures: Vec::new(),
+            constants: Vec::new(),
             nregs: 1 + f.params.len(),
             locals,
             temp,
@@ -395,6 +397,7 @@ impl<'a> Gen<'a> {
             code: self.asm.finish(),
             ics: self.ics,
             closures: self.closures,
+            constants: self.constants,
         })
     }
 
@@ -571,6 +574,19 @@ impl<'a> Gen<'a> {
     fn named(&mut self, op: Op, obj: u8, name: &str) {
         let ic = self.ic(name);
         self.emit(op, &[Arg::Reg(obj), ic]);
+    }
+
+    /// `LdaConstant` of `c`, one slot per distinct constant.
+    fn constant(&mut self, c: Constant) {
+        let same = |x: &Constant| match (x, &c) {
+            (Constant::Number(a), Constant::Number(b)) => a.to_bits() == b.to_bits(),
+            (a, b) => a == b,
+        };
+        let i = self.constants.iter().position(same).unwrap_or_else(|| {
+            self.constants.push(c);
+            self.constants.len() - 1
+        });
+        self.emit(Op::LdaConstant, &[Arg::Index(i as u16)]);
     }
 
     fn closure(&mut self, f: usize) {
@@ -762,8 +778,12 @@ impl<'a> Gen<'a> {
         use ExprKind::*;
         match &e.kind {
             Num(_) | Unary(UnOp::Neg, _) if smi(e).is_some() => self.lda_smi(smi(e).unwrap()),
-            Num(v) => return unsupported(e.pos, format!("the number {v} (only int32 literals)")),
-            Str(_) => return unsupported(e.pos, "strings"),
+            Num(v) => self.constant(Constant::Number(*v)),
+            Unary(UnOp::Neg, x) if matches!(x.kind, Num(_)) => {
+                let Num(v) = x.kind else { unreachable!() };
+                self.constant(Constant::Number(-v))
+            }
+            Str(s) => self.constant(Constant::String(s.clone())),
             Bool(true) => self.emit(Op::LdaTrue, &[]),
             Bool(false) => self.emit(Op::LdaFalse, &[]),
             Null => self.emit(Op::LdaNull, &[]),
@@ -788,7 +808,30 @@ impl<'a> Gen<'a> {
                     self.ldar(a);
                 }
             }
-            Object(_) => return unsupported(e.pos, "object literals"),
+            // A plain object with room for the properties, then each one
+            // stored in order (a later duplicate wins).
+            Object(props) => {
+                // An index key is an element (`o[1]` reads it), and
+                // `__proto__:` sets the prototype: neither is a named
+                // property.
+                if let Some((k, _)) = props.iter().find(|(k, _)| {
+                    k == "__proto__" || k.parse::<u32>().is_ok_and(|i| i.to_string() == *k)
+                }) {
+                    return unsupported(e.pos, format!("the key `{k}` in an object literal"));
+                }
+                let cap = props.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
+                let ic = self.auto_ic();
+                self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
+                if !props.is_empty() {
+                    let o = self.alloc(e.pos)?;
+                    self.star(o);
+                    for (name, v) in props {
+                        self.value(v)?;
+                        self.named(Op::SetNamed, o, name);
+                    }
+                    self.ldar(o);
+                }
+            }
             Function(i) => self.closure(*i),
             Member(o, name) => {
                 let r = self.reg(o, &[])?;

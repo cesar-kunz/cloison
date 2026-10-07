@@ -154,35 +154,46 @@ pub(crate) struct Template {
 
 include!(concat!(env!("OUT_DIR"), "/stencils.rs"));
 
-/// Lookup tables: concrete stencils by name, and family templates by
-/// (family key, slot numbers).
-struct Index {
-    by_name: HashMap<&'static str, &'static Stencil>,
-    by_family: HashMap<(&'static str, [u8; 2]), &'static Stencil>,
+/// The concrete stencil named `name`, in `BY_NAME` (a hash table
+/// `build.rs` emits, so there is none to build at startup).
+fn concrete(name: &str) -> Option<&'static Stencil> {
+    let mask = BY_NAME.len() - 1;
+    let mut h = name_hash(name.as_bytes()) as usize & mask;
+    loop {
+        let i = BY_NAME[h] as usize;
+        if i == 0 {
+            return None;
+        }
+        let s = &STENCILS[i - 1];
+        if s.name == name {
+            return Some(s);
+        }
+        h = (h + 1) & mask;
+    }
 }
 
-fn index() -> &'static Index {
-    static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
-    INDEX.get_or_init(|| {
-        // Sized up front: growing rehashes every stencil at each doubling.
-        let concrete = STENCILS.iter().filter(|s| s.template.is_none()).count();
-        let mut ix = Index {
-            by_name: HashMap::with_capacity_and_hasher(concrete, Default::default()),
-            by_family: HashMap::default(),
-        };
+/// FNV-1a, 64-bit: `fnv1a` in `build.rs`, which hashes `BY_NAME`'s keys.
+fn name_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
+/// Family templates (arm64) by (family key, slot numbers), built at the
+/// first lookup of a stencil that isn't concrete.
+fn families() -> &'static HashMap<(&'static str, [u8; 2]), &'static Stencil> {
+    static FAMILIES: std::sync::OnceLock<HashMap<(&'static str, [u8; 2]), &'static Stencil>> =
+        std::sync::OnceLock::new();
+    FAMILIES.get_or_init(|| {
+        let mut m = HashMap::default();
         for s in STENCILS {
-            match s.template {
-                None => {
-                    ix.by_name.insert(s.name, s);
-                }
-                Some(t) => {
-                    for &slots in t.covers {
-                        ix.by_family.insert((s.name, slots), s);
-                    }
+            if let Some(t) = s.template {
+                for &slots in t.covers {
+                    m.insert((s.name, slots), s);
                 }
             }
         }
-        ix
+        m
     })
 }
 
@@ -220,8 +231,7 @@ impl Instance {
     /// The stencil named `name`: a concrete stencil, or an instance of the
     /// family template it belongs to (arm64).
     fn find(name: &str) -> Option<Instance> {
-        let ix = index();
-        if let Some(&stencil) = ix.by_name.get(name) {
+        if let Some(stencil) = concrete(name) {
             return Some(Instance {
                 stencil,
                 regs: [0; 2],
@@ -233,7 +243,7 @@ impl Instance {
             slots[i] = p.1;
             regs[i] = arch::slot_reg(p);
         }
-        let &stencil = ix.by_family.get(&(key.as_str(), slots))?;
+        let &stencil = families().get(&(key.as_str(), slots))?;
         Some(Instance { stencil, regs })
     }
 
@@ -288,6 +298,44 @@ extern "C" fn toi_rt_less_than(a: Value, b: Value) -> bool {
     }
 }
 
+/// A new, empty array (`create_array`; `vm` is the VM's address).
+extern "C" fn toi_rt_create_array(vm: Value, _: Value) -> u64 {
+    unsafe {
+        (*(vm.to_bits() as *mut crate::vm::Vm))
+            .new_array()
+            .to_bits()
+    }
+}
+
+/// How `a` compares with `b`: 0 less, 1 equal, 2 greater, 3 unordered.
+extern "C" fn toi_rt_compare(a: Value, b: Value) -> u64 {
+    let (x, y) = (a.to_number(), b.to_number());
+    match x.partial_cmp(&y) {
+        Some(std::cmp::Ordering::Less) => 0,
+        Some(std::cmp::Ordering::Equal) => 1,
+        Some(std::cmp::Ordering::Greater) => 2,
+        None => 3,
+    }
+}
+
+/// Stencils call these as `(acc, r)` for `r - acc` (and `DivSmi`'s as
+/// `(k, acc)` for `acc / k`).
+extern "C" fn toi_rt_sub(acc: Value, r: Value) -> Value {
+    crate::interp::generic_arith(Op::Sub, r, acc)
+}
+
+extern "C" fn toi_rt_mul(acc: Value, r: Value) -> Value {
+    crate::interp::generic_arith(Op::Mul, r, acc)
+}
+
+extern "C" fn toi_rt_div(acc: Value, r: Value) -> Value {
+    crate::interp::generic_arith(Op::Div, r, acc)
+}
+
+extern "C" fn toi_rt_strict_eq(a: Value, b: Value) -> bool {
+    crate::interp::strict_equals(a, b)
+}
+
 /// `a % b` (`ModSmi`'s slow path; `b` is the immediate).
 extern "C" fn toi_rt_mod(a: Value, b: Value) -> Value {
     Value::number(a.to_number() % b.to_number())
@@ -320,6 +368,12 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_add" => toi_rt_add as *const () as usize,
         "toi_rt_inc" => toi_rt_inc as *const () as usize,
         "toi_rt_less_than" => toi_rt_less_than as *const () as usize,
+        "toi_rt_compare" => toi_rt_compare as *const () as usize,
+        "toi_rt_create_array" => toi_rt_create_array as *const () as usize,
+        "toi_rt_sub" => toi_rt_sub as *const () as usize,
+        "toi_rt_mul" => toi_rt_mul as *const () as usize,
+        "toi_rt_div" => toi_rt_div as *const () as usize,
+        "toi_rt_strict_eq" => toi_rt_strict_eq as *const () as usize,
         _ => panic!("unknown runtime function `{name}`"),
     }
 }
@@ -907,13 +961,12 @@ impl Insn {
             && matches!(
                 self.op,
                 Op::Jump
-                    | Op::JumpIfLess
-                    | Op::JumpIfLessSmi
                     | Op::JumpIfTrue
                     | Op::JumpIfFalse
                     | Op::JumpIfToBooleanTrue
                     | Op::JumpIfToBooleanFalse
             )
+            || !self.bail && is_compare_jump(self.op)
     }
 
     fn reads_reg(&self) -> bool {
@@ -924,9 +977,19 @@ impl Insn {
                     Op::Ldar
                         | Op::Star
                         | Op::Add
+                        | Op::Sub
+                        | Op::Mul
+                        | Op::Div
                         | Op::JumpIfLess
+                        | Op::JumpIfLessEqual
+                        | Op::JumpIfGreater
+                        | Op::JumpIfGreaterEqual
                         | Op::TestLessThan
+                        | Op::TestGreaterThan
+                        | Op::TestLessThanOrEqual
+                        | Op::TestGreaterThanOrEqual
                         | Op::TestEqual
+                        | Op::TestStrictEqual
                         | Op::GetNamed
                         | Op::SetNamed
                         | Op::GetKeyed
@@ -967,6 +1030,21 @@ impl Insn {
     }
 }
 
+/// The compare-and-jumps (plain forms): `acc OP r` or `acc OP imm`.
+fn is_compare_jump(op: Op) -> bool {
+    matches!(
+        op,
+        Op::JumpIfLess
+            | Op::JumpIfLessSmi
+            | Op::JumpIfLessEqual
+            | Op::JumpIfGreater
+            | Op::JumpIfGreaterEqual
+            | Op::JumpIfLessEqualSmi
+            | Op::JumpIfGreaterSmi
+            | Op::JumpIfGreaterEqualSmi
+    )
+}
+
 /// Decode `code`. With `vm`, instructions the JIT doesn't compile are
 /// marked `bail`; otherwise they're an error.
 fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
@@ -994,30 +1072,65 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
         .map(|(pc, op)| {
             let (mut imm, mut reg, mut target, mut bail) = (0, 0, 0, false);
             let (mut reg2, mut ic) = (0, 0);
+            // `x - k` is `x + -k`, so `SubSmi` shares every `AddSmi` stencil
+            // and fusion (but for k = INT32_MIN).
+            let op = match op {
+                Op::SubSmi if imm_at(pc + 1) != i32::MIN => {
+                    imm = -imm_at(pc + 1);
+                    Op::AddSmi
+                }
+                op => op,
+            };
             match op {
-                Op::LdaSmi | Op::AddSmi => imm = imm_at(pc + 1),
+                Op::LdaSmi => imm = imm_at(pc + 1),
+                // (A `SubSmi`'s negated immediate is already in `imm`.)
+                Op::AddSmi if code[pc] == Op::AddSmi as u8 => imm = imm_at(pc + 1),
+                Op::AddSmi => {}
                 Op::Inc => imm = 1,
                 Op::Ldar | Op::Star | Op::Add => reg = code[pc + 1],
-                Op::JumpIfLess => (reg, target) = (code[pc + 1], index_of(pc, imm_at(pc + 2))),
-                Op::JumpIfLessSmi => (imm, target) = (imm_at(pc + 1), index_of(pc, imm_at(pc + 5))),
+                Op::JumpIfLess
+                | Op::JumpIfLessEqual
+                | Op::JumpIfGreater
+                | Op::JumpIfGreaterEqual => {
+                    (reg, target) = (code[pc + 1], index_of(pc, imm_at(pc + 2)))
+                }
+                Op::JumpIfLessSmi
+                | Op::JumpIfLessEqualSmi
+                | Op::JumpIfGreaterSmi
+                | Op::JumpIfGreaterEqualSmi => {
+                    (imm, target) = (imm_at(pc + 1), index_of(pc, imm_at(pc + 5)))
+                }
                 Op::Jump
                 | Op::JumpIfTrue
                 | Op::JumpIfFalse
                 | Op::JumpIfToBooleanTrue
                 | Op::JumpIfToBooleanFalse => target = index_of(pc, imm_at(pc + 1)),
-                Op::ModSmi | Op::BitAndSmi | Op::BitOrSmi | Op::TestEqualSmi => {
-                    imm = imm_at(pc + 1)
-                }
-                Op::TestLessThan | Op::TestEqual => reg = code[pc + 1],
+                Op::ModSmi
+                | Op::BitAndSmi
+                | Op::BitOrSmi
+                | Op::TestEqualSmi
+                | Op::MulSmi
+                | Op::DivSmi
+                | Op::ShiftLeftSmi
+                | Op::ShiftRightSmi
+                | Op::ShiftRightLogicalSmi => imm = imm_at(pc + 1),
+                Op::TestLessThan
+                | Op::TestEqual
+                | Op::TestGreaterThan
+                | Op::TestLessThanOrEqual
+                | Op::TestGreaterThanOrEqual
+                | Op::TestStrictEqual
+                | Op::Sub
+                | Op::Mul
+                | Op::Div => reg = code[pc + 1],
+                Op::TestUndefined | Op::TestNull | Op::TestNullish => {}
                 Op::Nop
                 | Op::Return
                 | Op::LdaTrue
                 | Op::LdaFalse
                 | Op::LdaUndefined
                 | Op::LdaNull => {}
-                Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop => {
-                    unreachable!("decoded as plain jumps")
-                }
+                op if op.plain() != op => unreachable!("decoded as plain jumps"),
                 // The inline-cache slot goes in `imm`.
                 Op::GetNamed | Op::SetNamed if vm => {
                     (reg, imm) = (
@@ -1029,6 +1142,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
                 }
                 Op::Mov if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
+                Op::CreateArray if vm => {}
                 Op::Call | Op::CallUndefined | Op::Construct if vm => {
                     (reg, reg2, imm) = (code[pc + 1], code[pc + 2], code[pc + 3] as i32);
                     ic = u16::from_le_bytes([code[pc + 4], code[pc + 5]]);
@@ -1103,16 +1217,15 @@ fn entry_live(code: &[u8], nregs: usize) -> Vec<bool> {
             let insn = &insns[k];
             let mut live = vec![false; nregs];
             let falls = !matches!(insn.op, Op::Jump | Op::Return);
-            let jumps = matches!(
-                insn.op,
-                Op::Jump
-                    | Op::JumpIfLess
-                    | Op::JumpIfLessSmi
-                    | Op::JumpIfTrue
-                    | Op::JumpIfFalse
-                    | Op::JumpIfToBooleanTrue
-                    | Op::JumpIfToBooleanFalse
-            );
+            let jumps = is_compare_jump(insn.op)
+                || matches!(
+                    insn.op,
+                    Op::Jump
+                        | Op::JumpIfTrue
+                        | Op::JumpIfFalse
+                        | Op::JumpIfToBooleanTrue
+                        | Op::JumpIfToBooleanFalse
+                );
             let succs = [falls.then_some(k + 1), jumps.then_some(insn.target)];
             for s in succs.into_iter().flatten().filter(|&s| s < n) {
                 for (l, &x) in live.iter_mut().zip(&live_in[s]) {
@@ -1178,6 +1291,8 @@ pub(crate) enum Prop {
     /// A keyed load whose receivers had shape `shape`, with elements of
     /// type `elems`.
     Keyed { shape: u64, elems: FieldType },
+    /// A `GetNamed` that read an array's `length`.
+    Length,
     /// A call, described by `CallSite` number `site` of the lowering:
     /// straight into the callee's compiled code if `direct`, else through
     /// the runtime. The VM's code epoch, at `epoch_addr`, must still be
@@ -1197,6 +1312,8 @@ pub(crate) struct Feedback {
     /// The property name of each inline-cache slot.
     pub names: *const Atom,
     pub global: *mut crate::object::Object,
+    /// For stencils calling into it (`create_array`).
+    pub vm: *mut crate::vm::Vm,
 }
 
 /// A slot location (`Shape::location`) as `(out of line, byte offset)`.
@@ -1228,6 +1345,9 @@ impl Feedback {
             return Prop::None;
         }
         let ic = unsafe { *self.ics.add(insn.imm as usize) };
+        if insn.op == Op::GetNamed && ic.loc == crate::vm::LENGTH_LOC {
+            return Prop::Length;
+        }
         if ic.shape.is_null() {
             return Prop::None;
         }
@@ -1493,6 +1613,32 @@ fn pair_case(acc: Ty, reg: Ty) -> &'static str {
     }
 }
 
+/// Relations for the generic comparison stencils, between a register or
+/// literal operand `x` and `acc` (`a`): masks of the orders (`x` less,
+/// equal, greater than `a`, unordered: bits 0–3) they hold for (`holds` in
+/// `stencils/stencils.rs`).
+const REL_X_LT_A: i32 = 0b0001;
+const REL_A_LT_X: i32 = 0b0100;
+const REL_X_LE_A: i32 = 0b0011;
+const REL_A_LE_X: i32 = 0b0110;
+
+/// The relation code of a test `r OP acc`.
+fn rel_code(op: Op) -> i32 {
+    match op {
+        Op::TestLessThan => REL_X_LT_A,
+        // `r > acc` is `acc < r`, `r >= acc` is `acc <= r`.
+        Op::TestGreaterThan => REL_A_LT_X,
+        Op::TestLessThanOrEqual => REL_X_LE_A,
+        Op::TestGreaterThanOrEqual => REL_A_LE_X,
+        op => unreachable!("{op:?} is not relational"),
+    }
+}
+
+/// Whether a value of type `t` is never null or undefined.
+fn never_nullish(t: Ty) -> bool {
+    matches!(t, Ty::I32 | Ty::F64 | Ty::Obj(_) | Ty::Ext(_))
+}
+
 /// Choose the operation's type case from its in-state. Instructions in
 /// `widened` overflowed int32 before, so they produce a double instead of
 /// exiting. A store to a pinned register makes it `F64` (an int32 is
@@ -1583,8 +1729,180 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = I32;
             ("add_smi", "wrap_i")
         }
-        Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop => {
-            unreachable!("decoded as plain jumps")
+        Op::Sub if wraps && st.acc == I32 && reg == I32 => {
+            out.acc = I32;
+            ("sub", "wrap_ii")
+        }
+        op if op.plain() != op => unreachable!("decoded as plain jumps"),
+        Op::Sub | Op::Mul => {
+            let (case, ty) = match (st.acc, reg) {
+                (I32, I32) => int_op("ii", "iif"),
+                (I32, F64) => ("if", F64),
+                (F64, I32) => ("fi", F64),
+                (F64, F64) => ("ff", F64),
+                _ => ("", Any),
+            };
+            out.acc = ty;
+            (if insn.op == Op::Sub { "sub" } else { "mul" }, case)
+        }
+        // A quotient is a double, even an exact one.
+        Op::Div => {
+            let case = pair_case(st.acc, reg);
+            out.acc = if case.is_empty() { Any } else { F64 };
+            ("div", case)
+        }
+        // By the sign of k: a positive one never makes -0, a negative one
+        // does from 0, and 0 does from a negative (`mul_smi_*_i`).
+        Op::MulSmi => {
+            let (case, ty) = match st.acc {
+                I32 if widened.contains(&i) => ("iif", F64),
+                I32 if insn.imm > 0 => ("pos_i", I32),
+                I32 if insn.imm < 0 => ("neg_i", I32),
+                I32 => ("zero_i", I32),
+                F64 => ("f", F64),
+                _ => ("", Any),
+            };
+            out.acc = ty;
+            ("mul_smi", case)
+        }
+        Op::DivSmi => {
+            let case = num_case(st.acc);
+            out.acc = if case.is_empty() { Any } else { F64 };
+            ("div_smi", case)
+        }
+        // On an int32 the count is part of the stencil (`stencil_for`);
+        // `<< 0` and `>> 0` leave it as it is, `>>> 0` exits when it is
+        // negative (the result is above 2^31 - 1).
+        Op::ShiftLeftSmi | Op::ShiftRightSmi | Op::ShiftRightLogicalSmi => {
+            let base = match insn.op {
+                Op::ShiftLeftSmi => "shl_smi",
+                Op::ShiftRightSmi => "sar_smi",
+                _ => "shr_smi",
+            };
+            let shr0 = insn.op == Op::ShiftRightLogicalSmi && insn.imm & 31 == 0;
+            match st.acc {
+                I32 if insn.imm & 31 == 0 && !shr0 => {
+                    out.acc = I32;
+                    ("nop", "")
+                }
+                I32 if shr0 && widened.contains(&i) => {
+                    out.acc = Any;
+                    (base, "")
+                }
+                I32 => {
+                    out.acc = I32;
+                    (base, "i")
+                }
+                F64 if !shr0 => {
+                    out.acc = I32;
+                    (base, "f")
+                }
+                _ => {
+                    out.acc = if shr0 { Any } else { I32 };
+                    (base, "")
+                }
+            }
+        }
+        // `acc OP k`: on an int32, `acc <= k` is `acc < k + 1` and `acc > k`
+        // is `acc >= k + 1`. Generic: `rel_int`'s code with `x` = k.
+        Op::JumpIfLessEqualSmi | Op::JumpIfGreaterSmi | Op::JumpIfGreaterEqualSmi => {
+            let k = insn.imm;
+            let code = match insn.op {
+                Op::JumpIfLessEqualSmi => REL_A_LE_X,
+                Op::JumpIfGreaterSmi => REL_X_LT_A,
+                _ => REL_X_LE_A,
+            };
+            let generic = Sel {
+                ops: Some((k, code as u64, 0)),
+                ..Sel::new("jrel_smi", "", out.clone())
+            };
+            return match (st.acc, insn.op) {
+                (I32, Op::JumpIfLessEqualSmi) if k < i32::MAX => Sel {
+                    ops: Some((k + 1, 0, 0)),
+                    ..Sel::new("jlt_smi", "i", out)
+                },
+                (I32, Op::JumpIfGreaterSmi) if k < i32::MAX => Sel {
+                    ops: Some((k + 1, 0, 0)),
+                    ..Sel::new("jge_smi", "i", out)
+                },
+                (I32, Op::JumpIfGreaterEqualSmi) => Sel::new("jge_smi", "i", out),
+                (F64, Op::JumpIfLessEqualSmi) => Sel::new("jle_smi", "f", out),
+                (F64, Op::JumpIfGreaterSmi) => Sel::new("jgt_smi", "f", out),
+                (F64, Op::JumpIfGreaterEqualSmi) => Sel::new("jge_smi", "f", out),
+                _ => generic,
+            };
+        }
+        // `acc OP r` on int32s as an existing `<` stencil (`tlt_*` test
+        // `r < acc`); generic `jrel`.
+        Op::JumpIfLessEqual | Op::JumpIfGreater | Op::JumpIfGreaterEqual => {
+            if (st.acc, reg) == (I32, I32) {
+                let base = match insn.op {
+                    Op::JumpIfLessEqual => "tlt_jf",
+                    Op::JumpIfGreater => "tlt_jt",
+                    _ => "jge",
+                };
+                (base, "ii")
+            } else {
+                let code = match insn.op {
+                    Op::JumpIfLessEqual => REL_A_LE_X,
+                    Op::JumpIfGreater => REL_X_LT_A,
+                    _ => REL_X_LE_A,
+                };
+                return Sel {
+                    ops: Some((code, 0, 0)),
+                    ..Sel::new("jrel", "", out)
+                };
+            }
+        }
+        Op::TestGreaterThan | Op::TestLessThanOrEqual | Op::TestGreaterThanOrEqual => {
+            out.acc = Any;
+            if (st.acc, reg) == (I32, I32) {
+                let base = match insn.op {
+                    Op::TestGreaterThan => "test_gt",
+                    Op::TestLessThanOrEqual => "test_le",
+                    _ => "test_ge",
+                };
+                (base, "ii")
+            } else {
+                return Sel {
+                    ops: Some((rel_code(insn.op), 0, 0)),
+                    ..Sel::new("test_rel", "", out)
+                };
+            }
+        }
+        Op::TestStrictEqual => {
+            out.acc = Any;
+            if (st.acc, reg) == (I32, I32) {
+                ("test_eq", "ii")
+            } else {
+                ("test_seq", "")
+            }
+        }
+        // A new, empty array, through the runtime (the VM is the 64-bit
+        // immediate); typed `Ext` of the empty array's shape, which says
+        // only that it is a cell.
+        Op::CreateArray => {
+            let Some(vm) = spec.feedback.map(|f| f[insn.frame as usize].vm) else {
+                return Sel::new("bail", "", out);
+            };
+            out.acc = Ty::Ext(unsafe { (*vm).array_shape } as u64);
+            return Sel {
+                ops: Some((0, vm as u64, 0)),
+                ..Sel::new("create_array", "", out)
+            };
+        }
+        Op::TestUndefined | Op::TestNull | Op::TestNullish => {
+            out.acc = Any;
+            if never_nullish(st.acc) {
+                ("lda_false", "")
+            } else {
+                let base = match insn.op {
+                    Op::TestUndefined => "test_undefined",
+                    Op::TestNull => "test_null",
+                    _ => "test_nullish",
+                };
+                (base, "")
+            }
         }
         Op::Nop => ("nop", ""),
         Op::Jump => ("jump", ""),
@@ -1802,6 +2120,15 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     if matches!(insn.op, Op::GetNamed | Op::SetNamed) {
         if matches!(reg, I32 | F64) {
             return bail(out);
+        }
+        // An array's length: no check if the receiver's shape is an
+        // array's.
+        if prop == Prop::Length {
+            let array = reg.shape().is_some_and(
+                |s| unsafe { (*(s as *const Shape)).class } == crate::object::Class::Array,
+            );
+            out.acc = I32;
+            return Sel::new("get_length", if array { "nc" } else { "" }, out);
         }
         // A known shape with the property.
         if let (Some(s), Some(fbs)) = (reg.shape(), spec.feedback) {
@@ -2037,12 +2364,12 @@ fn mod_magic(d: i32) -> (u32, u64) {
 /// constant, booleans and the other non-numbers. Within straight-line
 /// code: unknown at jump targets. For `ModSmi`, whose `_u` forms need no
 /// sign handling; empty work if there is none.
-fn nonneg_acc(insns: &[Insn], is_target: &[bool], nregs: usize) -> Vec<bool> {
+fn nonneg_acc(insns: &[Insn], is_target: &[bool], nregs: usize, frames: &[FrameRegs]) -> Vec<bool> {
     let n = insns.len();
     if !insns.iter().any(|i| i.op == Op::ModSmi && !i.bail) {
         return vec![false; n];
     }
-    let start = reg_live_in(insns, &reachable(insns, 0), nregs).swap_remove(0);
+    let start = reg_live_in(insns, &reachable(insns, 0), nregs, frames).swap_remove(0);
     let mut ok: Vec<bool> = start.iter().map(|&live| !live).collect();
     loop {
         let mut acc = vec![false; n];
@@ -2059,7 +2386,14 @@ fn nonneg_acc(insns: &[Insn], is_target: &[bool], nregs: usize) -> Vec<bool> {
                 | Op::LdaFalse
                 | Op::TestLessThan
                 | Op::TestEqual
-                | Op::TestEqualSmi => true,
+                | Op::TestEqualSmi
+                | Op::TestGreaterThan
+                | Op::TestLessThanOrEqual
+                | Op::TestGreaterThanOrEqual
+                | Op::TestStrictEqual
+                | Op::TestUndefined
+                | Op::TestNull
+                | Op::TestNullish => true,
                 Op::Ldar => ok[p.reg as usize],
                 Op::Inc => acc[j - 1],
                 Op::AddSmi => p.imm >= 0 && acc[j - 1],
@@ -2069,12 +2403,11 @@ fn nonneg_acc(insns: &[Insn], is_target: &[bool], nregs: usize) -> Vec<bool> {
                 Op::Star
                 | Op::Nop
                 | Op::Mov
-                | Op::JumpIfLess
-                | Op::JumpIfLessSmi
                 | Op::JumpIfTrue
                 | Op::JumpIfFalse
                 | Op::JumpIfToBooleanTrue
                 | Op::JumpIfToBooleanFalse => acc[j - 1],
+                op if is_compare_jump(op) => acc[j - 1],
                 _ => false,
             };
         }
@@ -2127,7 +2460,38 @@ fn succs(insns: &[Insn], i: usize) -> impl Iterator<Item = usize> {
 /// Registers live into each reachable instruction (backward dataflow):
 /// instructions with a register operand read it, except `star`, which
 /// writes it.
-fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize) -> Vec<Vec<bool>> {
+/// A frame's (first register, register count, parent frame).
+type FrameRegs = (usize, usize, usize);
+
+/// The registers the interpreter may read after an exit from `frame`: its
+/// own and its callers' (`frames` empty: one frame with all of them).
+/// Other frames' registers, and the headers between frames, aren't
+/// registers at the exit (they may hold anything).
+fn exit_live(frames: &[FrameRegs], frame: u8, nregs: usize) -> Vec<bool> {
+    let mut live = vec![false; nregs];
+    if frames.is_empty() {
+        live.iter_mut().for_each(|l| *l = true);
+        return live;
+    }
+    let mut f = frame as usize;
+    loop {
+        let (base, n, parent) = frames[f];
+        for l in live.iter_mut().skip(base).take(n) {
+            *l = true;
+        }
+        if f == 0 {
+            return live;
+        }
+        f = parent;
+    }
+}
+
+fn reg_live_in(
+    insns: &[Insn],
+    reach: &[bool],
+    nregs: usize,
+    frames: &[FrameRegs],
+) -> Vec<Vec<bool>> {
     let n = insns.len();
     let mut live_in = vec![vec![false; nregs]; n];
     let mut changed = true;
@@ -2140,6 +2504,13 @@ fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize) -> Vec<Vec<bool>> {
                 for (l, &x) in live.iter_mut().zip(&live_in[s]) {
                     *l |= x;
                 }
+            }
+            // The interpreter runs a bailed instruction and the rest of the
+            // function, which may read any register: each must hold its
+            // value there, so a register with a store of a non-int32 isn't
+            // pinned as an int32 (which would truncate it).
+            if insn.bail {
+                live = exit_live(frames, insn.frame, nregs);
             }
             if insn.op == Op::Star {
                 live[insn.reg as usize] = false;
@@ -2405,6 +2776,22 @@ fn spills(homes: &[Home]) -> Vec<Piece> {
         .collect()
 }
 
+/// The stencil that writes a slot back to memory (`spill_g3`), if `home`
+/// is one.
+fn spill_name(home: Home) -> Option<String> {
+    match home {
+        Home::Mem => None,
+        Home::Gpr(k) => Some(format!("spill_g{k}")),
+        Home::Int(k) => Some(format!("spill_u{k}")),
+        Home::Fpr(k) => Some(format!("spill_f{k}")),
+    }
+}
+
+/// The piece that writes register `r`'s slot back to memory, if it has one.
+fn spill_piece(home: Home, r: u8) -> Option<Piece> {
+    spill_name(home).map(|name| Piece::new(&name, r))
+}
+
 /// The piece that boxes an accumulator of type `acc`, if it isn't boxed:
 /// `box_facc` for a double in `facc`, `box_iacc` for an int32 (whose high
 /// bits may be 0 instead of the tag).
@@ -2455,10 +2842,10 @@ fn stencil_for(
             }
             sel.base.into()
         }
-        ("get_own" | "get_oop" | "get_proto", _) if sel.case == "nc" => {
+        ("get_own" | "get_oop" | "get_proto" | "get_length", _) if sel.case == "nc" => {
             format!("{}_nc_{loc}", sel.base)
         }
-        ("get_own" | "get_oop" | "get_proto", _) => format!("{}_{loc}", sel.base),
+        ("get_own" | "get_oop" | "get_proto" | "get_length", _) => format!("{}_{loc}", sel.base),
         // Stores take a boxed `acc`.
         ("set_own" | "set_oop" | "set_tr", _) => {
             box_acc(&mut pre);
@@ -2481,11 +2868,26 @@ fn stencil_for(
                 format!("get_keyed_{}_{loc}", sel.case)
             }
         }
+        // Group 2's generic stencils only exist on memory: a slot is
+        // written back first (they are the slow, untyped paths).
+        ("sub" | "mul" | "div" | "jrel" | "test_rel" | "test_seq", _) if sel.case.is_empty() => {
+            box_acc(&mut pre);
+            pre.extend(spill_piece(home, insn.reg));
+            format!("{}_m", sel.base)
+        }
         ("add" | "jlt" | "test_lt" | "test_eq", _) if sel.case.is_empty() => {
             box_acc(&mut pre);
             format!("{}_{loc}", sel.base)
         }
-        ("add" | "jlt" | "test_lt" | "test_eq", _) => format!("{}_{}_{loc}", sel.base, sel.case),
+        (
+            "add" | "sub" | "mul" | "div" | "jlt" | "test_lt" | "test_eq" | "tlt_jt" | "tlt_jf"
+            | "jge" | "test_gt" | "test_le" | "test_ge",
+            _,
+        ) => format!("{}_{}_{loc}", sel.base, sel.case),
+        // The count is part of the stencil: `sar_smi_i_3`.
+        ("shl_smi" | "sar_smi" | "shr_smi", _) if sel.case == "i" => {
+            format!("{}_i_{}", sel.base, insn.imm & 31)
+        }
         ("return", _) => {
             box_acc(&mut pre);
             pre.extend(spills(&homes[..return_spills.min(homes.len())]));
@@ -2504,6 +2906,7 @@ fn stencil_for(
                     | "lda_null"
                     | "lda_global"
                     | "lda_global_oop"
+                    | "create_array"
                     | "bail"
             ) {
                 box_acc(&mut pre);
@@ -2547,6 +2950,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::Call
                 | Op::CallUndefined
                 | Op::Construct
+                | Op::CreateArray
         )
     };
     let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump | Op::Mov);
@@ -2582,6 +2986,9 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
 
 /// One stencil of a fused group.
 struct FusedStep {
+    /// The slot holding `acc` at an exit from this step, if it isn't the
+    /// group's `ldar` slot.
+    exit_ldar: Option<String>,
     name: String,
     imm: i32,
     /// The register operand, for a stencil on a register in memory.
@@ -2624,6 +3031,7 @@ impl Fused {
                 reg: 0,
                 insn,
                 undo,
+                exit_ldar: None,
             }],
             ldar,
             acc_live_after,
@@ -2655,6 +3063,9 @@ impl Fusion<'_> {
             return Some(f);
         }
         if let Some(f) = self.int_slot_ops(i) {
+            return Some(f);
+        }
+        if let Some(f) = self.slot_tests_and_subs(i, widened) {
             return Some(f);
         }
         let insns = self.insns;
@@ -2773,6 +3184,7 @@ impl Fusion<'_> {
             reg,
             insn: i,
             undo: None,
+            exit_ldar: None,
         };
         let fused = |len: usize, steps: Vec<FusedStep>| Fused {
             len,
@@ -2821,6 +3233,60 @@ impl Fusion<'_> {
                 "" => format!("teq_smi_{pol}"),
                 case => format!("teq_smi_{pol}_{case}"),
             },
+            // On int32s, as a `<` stencil with the operands either way
+            // round (`jlt`: `acc < r`, `tlt`: `r < acc`) or its negation
+            // (`jge`); otherwise the generic `jrel` / `jnrel`.
+            Op::TestGreaterThan | Op::TestLessThanOrEqual | Op::TestGreaterThanOrEqual => {
+                let r = insns[i].reg;
+                let loc = self.homes[r as usize].loc();
+                if pair_case(st.acc, st.regs[r as usize]) == "ii" {
+                    let base = match (insns[i].op, pol) {
+                        (Op::TestGreaterThan, "jt") | (Op::TestLessThanOrEqual, "jf") => "jlt",
+                        (Op::TestGreaterThan, _) | (Op::TestLessThanOrEqual, _) => "jge",
+                        (_, "jt") => "tlt_jf",
+                        _ => "tlt_jt",
+                    };
+                    format!("{base}_ii_{loc}")
+                } else {
+                    if let Some(b) = box_acc_piece(st.acc) {
+                        steps.push(step(b.stencil.stencil.name.to_string(), 0, 0));
+                    }
+                    if let Some(name) = spill_name(self.homes[r as usize]) {
+                        steps.push(step(name, 0, r));
+                    }
+                    let base = if pol == "jt" { "jrel" } else { "jnrel" };
+                    steps.push(step(format!("{base}_m"), rel_code(insns[i].op), r));
+                    return Some(fused(2, steps));
+                }
+            }
+            Op::TestStrictEqual => {
+                let r = insns[i].reg;
+                let loc = self.homes[r as usize].loc();
+                if pair_case(st.acc, st.regs[r as usize]) == "ii" {
+                    format!("teq_{pol}_ii_{loc}")
+                } else {
+                    if let Some(b) = box_acc_piece(st.acc) {
+                        steps.push(step(b.stencil.stencil.name.to_string(), 0, 0));
+                    }
+                    if let Some(name) = spill_name(self.homes[r as usize]) {
+                        steps.push(step(name, 0, r));
+                    }
+                    "tseq_".to_string() + pol + "_m"
+                }
+            }
+            // Never true of a number or an object: no test.
+            Op::TestUndefined | Op::TestNull | Op::TestNullish => {
+                let base = match insns[i].op {
+                    Op::TestUndefined => "tund",
+                    Op::TestNull => "tnull",
+                    _ => "tnsh",
+                };
+                match (never_nullish(st.acc), pol) {
+                    (true, "jt") => return Some(fused(2, steps)),
+                    (true, _) => "jump".to_string(),
+                    (false, _) => format!("{base}_{pol}"),
+                }
+            }
             _ => return None,
         };
         steps.push(step(name, insns[i].imm, insns[i].reg));
@@ -2862,6 +3328,7 @@ impl Fusion<'_> {
             reg: 0,
             insn: i,
             undo: None,
+            exit_ldar: None,
         };
         let fused = |len: usize, steps: Vec<FusedStep>, ldar: String, live: bool| Fused {
             len,
@@ -2882,7 +3349,7 @@ impl Fusion<'_> {
             && !self.live_out[i + 2]
         {
             let name = match op1 {
-                Some(Op::TestLessThan | Op::TestEqual) => {
+                Some(Op::TestLessThan | Op::TestEqual | Op::TestStrictEqual) => {
                     let b = insns[i + 1].reg as usize;
                     let sb = int_slot(i + 1, b)?;
                     let base = if op1 == Some(Op::TestLessThan) {
@@ -2891,6 +3358,26 @@ impl Fusion<'_> {
                         "teq"
                     };
                     Some((format!("{base}_{pol}_u{sa}_u{sb}"), 0))
+                }
+                // `tlt_*_u<a>_u<b>` tests `b < a`; with `acc` = a and the
+                // register operand b: `b > a` is `a < b` (operands
+                // swapped), `b <= a` is `!(a < b)`, `b >= a` is `!(b < a)`.
+                Some(
+                    Op::TestGreaterThan | Op::TestLessThanOrEqual | Op::TestGreaterThanOrEqual,
+                ) => {
+                    let b = insns[i + 1].reg as usize;
+                    let sb = int_slot(i + 1, b)?;
+                    let negate = op1 != Some(Op::TestGreaterThan);
+                    let pol = match (pol, negate) {
+                        ("jt", false) | ("jf", true) => "jt",
+                        _ => "jf",
+                    };
+                    let (x, y) = if op1 == Some(Op::TestGreaterThanOrEqual) {
+                        (sa, sb)
+                    } else {
+                        (sb, sa)
+                    };
+                    Some((format!("tlt_{pol}_u{x}_u{y}"), 0))
                 }
                 Some(Op::TestEqualSmi) => Some((format!("teq_smi_{pol}_u{sa}"), insns[i + 1].imm)),
                 _ => None,
@@ -2934,6 +3421,76 @@ impl Fusion<'_> {
                 _ => steps.push(step(format!("ori_u{sb}"), k)),
             }
             return Some(fused(3, steps, format!("ldar_u{sb}"), self.live_out[i + 2]));
+        }
+        None
+    }
+
+    /// Two groups starting with `ldar a`:
+    ///
+    /// - `ldar a; TestUndefined | TestNull | TestNullish; JumpIf…` with `a` a
+    ///   boxed slot and `acc` dead after the jump: the slot is compared
+    ///   (`tund_jf_g<a>`, …).
+    /// - `ldar y; Sub x; star x` (`x = x - y`) with `x`, `y` int32 slots:
+    ///   `subr_ii_u<x>_u<y>`, in place. On overflow the exit stub undoes it
+    ///   and loads `acc` from `y`, the interpreter's `acc` before the `Sub`.
+    fn slot_tests_and_subs(&self, i: usize, widened: &HashSet<usize>) -> Option<Fused> {
+        let insns = self.insns;
+        if insns[i].op != Op::Ldar || !self.group(i, 3) {
+            return None;
+        }
+        let a = insns[i].reg as usize;
+        let (mid, last) = (&insns[i + 1], &insns[i + 2]);
+        let pol = match last.op {
+            Op::JumpIfTrue | Op::JumpIfToBooleanTrue => Some("jt"),
+            Op::JumpIfFalse | Op::JumpIfToBooleanFalse => Some("jf"),
+            _ => None,
+        };
+        if let (Home::Gpr(sa), Some(pol)) = (self.homes[a], pol)
+            && !self.live_out[i + 2]
+        {
+            let base = match mid.op {
+                Op::TestUndefined => "tund",
+                Op::TestNull => "tnull",
+                Op::TestNullish => "tnsh",
+                _ => return None,
+            };
+            return Some(Fused {
+                len: 3,
+                steps: vec![FusedStep {
+                    name: format!("{base}_{pol}_g{sa}"),
+                    imm: 0,
+                    reg: 0,
+                    insn: i,
+                    undo: None,
+                    exit_ldar: None,
+                }],
+                ldar: String::new(),
+                acc_live_after: false,
+            });
+        }
+        if mid.op == Op::Sub && last.op == Op::Star && last.reg == mid.reg && mid.reg as usize != a
+        {
+            let x = mid.reg as usize;
+            let st = self.ins[i + 1].as_ref()?;
+            let (Home::Int(sx), Home::Int(sy)) = (self.homes[x], self.homes[a]) else {
+                return None;
+            };
+            if st.acc != Ty::I32 || st.regs[x] != Ty::I32 || widened.contains(&(i + 1)) {
+                return None;
+            }
+            return Some(Fused {
+                len: 3,
+                steps: vec![FusedStep {
+                    name: format!("subr_ii_u{sx}_u{sy}"),
+                    imm: 0,
+                    reg: 0,
+                    insn: i + 1,
+                    undo: Some((format!("undo_subr_u{sx}_u{sy}"), 0)),
+                    exit_ldar: Some(format!("ldar_u{sy}")),
+                }],
+                ldar: format!("ldar_u{sx}"),
+                acc_live_after: self.live_out[i + 2],
+            });
         }
         None
     }
@@ -2984,6 +3541,7 @@ impl Fusion<'_> {
             reg: 0,
             insn,
             undo,
+            exit_ldar: None,
         };
         match self.homes[c] {
             Home::Int(cs) => {
@@ -3210,6 +3768,8 @@ struct VmCompile<'a> {
     direct_base: usize,
     /// The lowering's call sites (`Prop::Call` names them by index).
     sites: &'a [Box<std::cell::UnsafeCell<CallSite>>],
+    /// The frames' registers (empty: one frame, all registers).
+    frames: &'a [FrameRegs],
     /// The function compiled (null for other code): its `ret_hint` follows
     /// the predictions for its own results.
     root: *const crate::vm::Code,
@@ -3241,6 +3801,7 @@ impl JitCode {
             inline_base,
             direct_base,
             sites: vm_sites,
+            frames,
             root,
         } = vm;
         let n = insns.len();
@@ -3256,7 +3817,7 @@ impl JitCode {
         // (typically `undefined`) are never read, so they shouldn't widen the
         // types the region's own stores give them.
         let reach = reachable(insns, entry);
-        let live_in = reg_live_in(insns, &reach, nregs);
+        let live_in = reg_live_in(insns, &reach, nregs, frames);
         let live_at_entry = live_in[entry].clone();
         let mut actual_live = actual.clone();
         for (r, &live) in live_at_entry.iter().enumerate() {
@@ -3283,15 +3844,22 @@ impl JitCode {
         };
         let wraps: Vec<bool> = (0..n)
             .map(|i| {
-                matches!(insns[i].op, Op::Add | Op::AddSmi | Op::Inc)
+                matches!(insns[i].op, Op::Add | Op::AddSmi | Op::Inc | Op::Sub)
                     && !insns[i].bail
                     && i + 1 < n
                     && !is_target[i + 1]
                     && !insns[i + 1].bail
-                    && matches!(insns[i + 1].op, Op::BitAndSmi | Op::BitOrSmi)
+                    && matches!(
+                        insns[i + 1].op,
+                        Op::BitAndSmi
+                            | Op::BitOrSmi
+                            | Op::ShiftLeftSmi
+                            | Op::ShiftRightSmi
+                            | Op::ShiftRightLogicalSmi
+                    )
             })
             .collect();
-        let nonneg = nonneg_acc(insns, &is_target, nregs);
+        let nonneg = nonneg_acc(insns, &is_target, nregs, frames);
         // `this` and the arguments' types at call `i`, in state `st`.
         let call_types = |i: usize, st: &TypeState| {
             let insn = &insns[i];
@@ -3651,7 +4219,7 @@ impl JitCode {
                                 ..Piece::new(undo, 0)
                             });
                         }
-                        seq.push(Piece::new(&f.ldar, 0));
+                        seq.push(Piece::new(step.exit_ldar.as_ref().unwrap_or(&f.ldar), 0));
                         seq.push(Piece::new("box_iacc", 0));
                         seq.extend(spills(&homes));
                         seq.push(Piece {
@@ -4487,6 +5055,10 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
 pub(crate) struct Snapshot {
     insns: Vec<Insn>,
     frames: Vec<InlineFrame>,
+    /// Per frame, (first register, register count, parent frame): the
+    /// registers an exit from it leaves to the interpreter (see
+    /// [`reg_live_in`]).
+    frame_regs: Vec<FrameRegs>,
     /// Owned here so they live as long as code pointing to them.
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
 }
@@ -4593,6 +5165,7 @@ impl Lowering<'_> {
             ics: code.ics.as_ptr().cast(),
             names: code.ic_names.as_ptr(),
             global: unsafe { (*self.state.vm).global },
+            vm: self.state.vm,
         }
     }
 
@@ -4638,9 +5211,19 @@ impl Lowering<'_> {
                 Op::Ldar
                 | Op::Star
                 | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
                 | Op::JumpIfLess
+                | Op::JumpIfLessEqual
+                | Op::JumpIfGreater
+                | Op::JumpIfGreaterEqual
                 | Op::TestLessThan
+                | Op::TestGreaterThan
+                | Op::TestLessThanOrEqual
+                | Op::TestGreaterThanOrEqual
                 | Op::TestEqual
+                | Op::TestStrictEqual
                 | Op::GetNamed
                 | Op::SetNamed
                 | Op::GetKeyed => i.reg = renamed(i.reg),
@@ -5180,6 +5763,7 @@ impl JitFunction {
             snap: Rc::new(Snapshot {
                 insns: Vec::new(),
                 frames: Vec::new(),
+                frame_regs: Vec::new(),
                 sites: Vec::new(),
             }),
             inline_base: nregs,
@@ -5285,9 +5869,15 @@ impl JitFunction {
             vm.direct_base = low.direct_base;
             vm.props = low.props;
             vm.fbs = low.fbs;
+            let frame_regs = low
+                .frames
+                .iter()
+                .map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent))
+                .collect();
             vm.snap = Rc::new(Snapshot {
                 insns: low.insns,
                 frames: low.frames,
+                frame_regs,
                 sites: low.sites,
             });
         }
@@ -5313,12 +5903,14 @@ impl JitFunction {
         }
         let entry = self.index_of(0);
         let (insns, nregs) = (&self.insns, self.nregs);
+        let snap = self.vm.as_ref().map(|v| v.snap.clone());
+        let frames: &[FrameRegs] = snap.as_ref().map_or(&[], |s| &s.frame_regs);
         let (acc_live, live) = self
             .live_at
             .entry(entry)
             .or_insert_with(|| {
                 let reach = reachable(insns, entry);
-                let regs_live = reg_live_in(insns, &reach, nregs)[entry].clone();
+                let regs_live = reg_live_in(insns, &reach, nregs, frames)[entry].clone();
                 (acc_liveness(insns, &reach).0[entry], regs_live)
             })
             .clone();
@@ -5346,6 +5938,7 @@ impl JitFunction {
                 inline_base: vm.inline_base,
                 direct_base: vm.direct_base,
                 sites: &vm.snap.sites,
+                frames: &vm.snap.frame_regs,
                 root: vm.root,
             },
         );
@@ -5520,9 +6113,11 @@ impl JitFunction {
     /// split versions.
     fn entry_types(&mut self, entry: usize, acc: Value, regs: &[Value]) -> TypeState {
         let (insns, nregs) = (&self.insns, self.nregs);
+        let snap = self.vm.as_ref().map(|v| v.snap.clone());
+        let frames: &[FrameRegs] = snap.as_ref().map_or(&[], |s| &s.frame_regs);
         let (acc_live, live) = self.live_at.entry(entry).or_insert_with(|| {
             let reach = reachable(insns, entry);
-            let regs_live = reg_live_in(insns, &reach, nregs)[entry].clone();
+            let regs_live = reg_live_in(insns, &reach, nregs, frames)[entry].clone();
             (acc_liveness(insns, &reach).0[entry], regs_live)
         });
         // Only live values are looked at: dead registers (an inlined frame's,
@@ -5592,6 +6187,10 @@ impl JitFunction {
                         ),
                         None => (&[], None, self.nregs, usize::MAX, &[], std::ptr::null()),
                     };
+                    let frames: &[FrameRegs] = match &self.vm {
+                        Some(vm) => &vm.snap.frame_regs,
+                        None => &[],
+                    };
                     JitCode::compile(
                         &self.insns,
                         entry,
@@ -5604,6 +6203,7 @@ impl JitFunction {
                             inline_base,
                             direct_base,
                             sites,
+                            frames,
                             root,
                         },
                     )

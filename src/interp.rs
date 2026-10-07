@@ -85,7 +85,7 @@
 
 use crate::bytecode::Op;
 use crate::jit::VmRun;
-use crate::object::{Class, Object, as_object};
+use crate::object::{Class, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
 use crate::vm::{Code, Error, Ic, Vm};
 
@@ -1103,6 +1103,13 @@ handlers! {
     fn slow_call(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         let w = reg(pc, 2, regs);
+        // `f.call(that, …args)` with `f` a bytecode function: call `f`,
+        // with the window one register on.
+        let argc = *pc.add(3) as usize;
+        if let Some(fo) = unwrap_call(frame_vm(regs), *reg(pc, 1, regs), *w) {
+            let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
+            enter!(fo, that, w.add(2), argc.saturating_sub(1), 0, Op::Call.size())
+        }
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
         let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), *w, args);
         next_or_throw!(Op::Call.size(), r)
@@ -1121,7 +1128,8 @@ handlers! {
     #[inline(never)]
     fn slow_construct(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
-        let r = (*frame_vm(regs)).construct_other(*reg(pc, 1, regs));
+        let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
+        let r = (*frame_vm(regs)).construct_other(*reg(pc, 1, regs), args);
         next_or_throw!(Op::Construct.size(), r)
     }
 }
@@ -1249,6 +1257,614 @@ handlers! {
         next!(any, 5 + Op::JumpIfFalse.size(), Value::TRUE)
     }
 }
+
+// ---- Group 2: arithmetic, comparisons, compare-and-jumps ----
+
+/// `r OP acc` (or `acc OP imm`) for any two values: as numbers, there being
+/// no strings yet. The result is normalized like the other slow paths'.
+#[cold]
+#[inline(never)]
+pub(crate) fn generic_arith(op: Op, a: Value, b: Value) -> Value {
+    let (x, y) = match both_numbers(a, b) {
+        Some(p) => p,
+        None => (a.to_number(), b.to_number()),
+    };
+    Value::from_f64_arith(match op {
+        Op::Sub | Op::SubSmi => x - y,
+        Op::Mul | Op::MulSmi => x * y,
+        _ => x / y,
+    })
+}
+
+/// `a < b` or `a <= b` (`le`) for any two values; false with NaN.
+#[cold]
+#[inline(never)]
+pub(crate) fn generic_compare(le: bool, a: Value, b: Value) -> bool {
+    let (x, y) = match both_numbers(a, b) {
+        Some(p) => p,
+        None => (a.to_number(), b.to_number()),
+    };
+    if le { x <= y } else { x < y }
+}
+
+/// `a === b` (IsStrictlyEqual) for the values that exist so far.
+pub(crate) fn strict_equals(a: Value, b: Value) -> bool {
+    match both_numbers(a, b) {
+        Some((x, y)) => x == y,
+        None => a == b,
+    }
+}
+
+/// An int32 quotient `a / b`, if it is one: exact, not -0, not 2^31.
+#[inline(always)]
+fn int_div(a: i32, b: i32) -> Option<i32> {
+    if b == 0 || (a == 0 && b < 0) {
+        return None;
+    }
+    let q = a.checked_div(b)?;
+    (q * b == a).then_some(q)
+}
+
+/// An int32 product `a * b`, if it is one: no overflow, not -0.
+#[inline(always)]
+fn int_mul(a: i32, b: i32) -> Option<i32> {
+    let p = a.checked_mul(b)?;
+    (p != 0 || (a | b) >= 0).then_some(p)
+}
+
+/// Arithmetic `r OP acc` with a register operand, int32 fast path `$int`.
+macro_rules! arith_reg {
+    ($op:ident, $any:ident, $i32:ident, $slow:ident, $int:path) => {
+        handlers! {
+            fn $any(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if tag.both_int32(lhs, acc)
+                    && let Some(v) = $int(lhs.as_i32_unchecked(), acc.as_i32_unchecked())
+                {
+                    next_int!(Op::$op.size(), v)
+                }
+                tail!($slow, acc)
+            }
+
+            fn $i32(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if tag.is_int32(lhs)
+                    && let Some(v) = $int(lhs.as_i32_unchecked(), raw_i32(acc))
+                {
+                    next!(i32, Op::$op.size(), unboxed(v))
+                }
+                tail!($slow, tag.rebox(acc))
+            }
+
+            #[cold]
+            #[inline(never)]
+            fn $slow(pc, acc, regs, tag) {
+                let v = generic_arith(Op::$op, *reg(pc, 1, regs), acc);
+                next!(any, Op::$op.size(), v)
+            }
+        }
+    };
+}
+
+/// Arithmetic `acc OP imm` (`$int(acc, imm)`).
+macro_rules! arith_smi {
+    ($op:ident, $any:ident, $i32:ident, $slow:ident, $int:path) => {
+        handlers! {
+            fn $any(pc, acc, regs, tag) {
+                if tag.is_int32(acc)
+                    && let Some(v) = $int(acc.as_i32_unchecked(), imm32(pc, 1))
+                {
+                    next_int!(Op::$op.size(), v)
+                }
+                tail!($slow, acc)
+            }
+
+            fn $i32(pc, acc, regs, tag) {
+                if let Some(v) = $int(raw_i32(acc), imm32(pc, 1)) {
+                    next!(i32, Op::$op.size(), unboxed(v))
+                }
+                tail!($slow, tag.rebox(acc))
+            }
+
+            #[cold]
+            #[inline(never)]
+            fn $slow(pc, acc, regs, tag) {
+                let v = generic_arith(Op::$op, acc, Value::from_i32(imm32(pc, 1)));
+                next!(any, Op::$op.size(), v)
+            }
+        }
+    };
+}
+
+arith_reg!(Sub, op_sub, i32_sub, slow_sub, i32::checked_sub);
+arith_reg!(Mul, op_mul, i32_mul, slow_mul, int_mul);
+arith_reg!(Div, op_div, i32_div, slow_div, int_div);
+handlers! {
+    // In place too (`sub r13d, eax; jo`); the slow path gets `acc` back
+    // as `wrapped + k`, reboxed.
+    fn op_sub_smi(pc, acc, regs, tag) {
+        if tag.is_int32(acc) {
+            let imm = imm32(pc, 1);
+            let (v, overflow) = acc.as_i32_unchecked().overflowing_sub(imm);
+            if !overflow {
+                next_int!(Op::SubSmi.size(), v)
+            }
+            tail!(slow_sub_smi, tag.box_i32(v.wrapping_add(imm)))
+        }
+        tail!(slow_sub_smi, acc)
+    }
+
+    // In place, as `i32_add_smi`: on overflow, recover `acc` as `wrapped + k`.
+    fn i32_sub_smi(pc, acc, regs, tag) {
+        let imm = imm32(pc, 1);
+        let (v, overflow) = raw_i32(acc).overflowing_sub(imm);
+        if overflow {
+            tail!(slow_sub_smi, tag.rebox(unboxed(v.wrapping_add(imm))))
+        }
+        next!(i32, Op::SubSmi.size(), unboxed(v))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_sub_smi(pc, acc, regs, tag) {
+        let v = generic_arith(Op::SubSmi, acc, Value::from_i32(imm32(pc, 1)));
+        next!(any, Op::SubSmi.size(), v)
+    }
+}
+arith_smi!(MulSmi, op_mul_smi, i32_mul_smi, slow_mul_smi, int_mul);
+arith_smi!(DivSmi, op_div_smi, i32_div_smi, slow_div_smi, int_div);
+
+/// A shift by a constant: on the int32 (after ToInt32), by `imm & 31`.
+macro_rules! shift_smi {
+    ($op:ident, $any:ident, $i32:ident, $slow:ident, |$a:ident, $k:ident| $int:expr) => {
+        handlers! {
+            fn $any(pc, acc, regs, tag) {
+                if tag.is_int32(acc) {
+                    let ($a, $k) = (acc.as_i32_unchecked(), imm32(pc, 1) as u32 & 31);
+                    if let Some(v) = $int {
+                        next_int!(Op::$op.size(), v)
+                    }
+                }
+                tail!($slow, acc)
+            }
+
+            fn $i32(pc, acc, regs, tag) {
+                let ($a, $k) = (raw_i32(acc), imm32(pc, 1) as u32 & 31);
+                if let Some(v) = $int {
+                    next!(i32, Op::$op.size(), unboxed(v))
+                }
+                tail!($slow, tag.rebox(acc))
+            }
+
+            #[cold]
+            #[inline(never)]
+            fn $slow(pc, acc, regs, tag) {
+                let ($a, $k) = (to_int32(acc.to_number()), imm32(pc, 1) as u32 & 31);
+                let v = match $int {
+                    Some(v) => Value::from_i32(v),
+                    // Only `>>>` leaves int32: a uint32 above 2^31 - 1.
+                    None => Value::from_f64_arith(($a as u32 >> $k) as f64),
+                };
+                next!(any, Op::$op.size(), v)
+            }
+        }
+    };
+}
+
+shift_smi!(
+    ShiftLeftSmi,
+    op_shl_smi,
+    i32_shl_smi,
+    slow_shl_smi,
+    |a, k| Some(a << k)
+);
+shift_smi!(
+    ShiftRightSmi,
+    op_sar_smi,
+    i32_sar_smi,
+    slow_sar_smi,
+    |a, k| Some(a >> k)
+);
+shift_smi!(
+    ShiftRightLogicalSmi,
+    op_shr_smi,
+    i32_shr_smi,
+    slow_shr_smi,
+    |a, k| { i32::try_from(a as u32 >> k).ok() }
+);
+
+/// A relational test `r OP acc` (`$le` picks `<=`; `$swap` compares `acc OP
+/// r`, so `>` is `acc < r` and `>=` is `acc <= r`), its fused forms with
+/// the following `JumpIfTrue` / `JumpIfFalse`, all in both states.
+macro_rules! relational {
+    ($op:ident, $jt:ident, $jf:ident, $le:literal, $swap:literal,
+     $any:ident, $i32:ident, $slow:ident, $any_jt:ident, $any_jf:ident, $i32_jt:ident, $i32_jf:ident) => {
+        handlers! {
+            fn $any(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if tag.both_int32(lhs, acc) {
+                    let c = rel_i32($le, $swap, lhs.as_i32_unchecked(), acc.as_i32_unchecked());
+                    next!(any, Op::$op.size(), Value::from_bool(c))
+                }
+                tail!($slow, acc)
+            }
+
+            fn $i32(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if tag.is_int32(lhs) {
+                    let c = rel_i32($le, $swap, lhs.as_i32_unchecked(), raw_i32(acc));
+                    next!(any, Op::$op.size(), Value::from_bool(c))
+                }
+                tail!($slow, tag.rebox(acc))
+            }
+
+            #[cold]
+            #[inline(never)]
+            fn $slow(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                let c = if $swap { generic_compare($le, acc, lhs) } else { generic_compare($le, lhs, acc) };
+                next!(any, Op::$op.size(), Value::from_bool(c))
+            }
+
+            fn $any_jt(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if !tag.both_int32(lhs, acc) {
+                    tail!($slow, acc)
+                }
+                if rel_i32($le, $swap, lhs.as_i32_unchecked(), acc.as_i32_unchecked()) {
+                    next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::TRUE)
+                }
+                next!(any, 2 + Op::JumpIfTrue.size(), Value::FALSE)
+            }
+
+            fn $any_jf(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if !tag.both_int32(lhs, acc) {
+                    tail!($slow, acc)
+                }
+                if !rel_i32($le, $swap, lhs.as_i32_unchecked(), acc.as_i32_unchecked()) {
+                    next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::FALSE)
+                }
+                next!(any, 2 + Op::JumpIfFalse.size(), Value::TRUE)
+            }
+
+            fn $i32_jt(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if !tag.is_int32(lhs) {
+                    tail!($slow, tag.rebox(acc))
+                }
+                if rel_i32($le, $swap, lhs.as_i32_unchecked(), raw_i32(acc)) {
+                    next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::TRUE)
+                }
+                next!(any, 2 + Op::JumpIfTrue.size(), Value::FALSE)
+            }
+
+            fn $i32_jf(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if !tag.is_int32(lhs) {
+                    tail!($slow, tag.rebox(acc))
+                }
+                if !rel_i32($le, $swap, lhs.as_i32_unchecked(), raw_i32(acc)) {
+                    next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::FALSE)
+                }
+                next!(any, 2 + Op::JumpIfFalse.size(), Value::TRUE)
+            }
+        }
+    };
+}
+
+/// `l < r` or `l <= r`, or with `swap` `r < l` / `r <= l`.
+#[inline(always)]
+fn rel_i32(le: bool, swap: bool, l: i32, r: i32) -> bool {
+    let (a, b) = if swap { (r, l) } else { (l, r) };
+    if le { a <= b } else { a < b }
+}
+
+relational!(
+    TestGreaterThan,
+    TestGreaterThanJumpIfTrue,
+    TestGreaterThanJumpIfFalse,
+    false,
+    true,
+    op_test_gt,
+    i32_test_gt,
+    slow_test_gt,
+    op_test_gt_jt,
+    op_test_gt_jf,
+    i32_test_gt_jt,
+    i32_test_gt_jf
+);
+relational!(
+    TestLessThanOrEqual,
+    TestLessThanOrEqualJumpIfTrue,
+    TestLessThanOrEqualJumpIfFalse,
+    true,
+    false,
+    op_test_le,
+    i32_test_le,
+    slow_test_le,
+    op_test_le_jt,
+    op_test_le_jf,
+    i32_test_le_jt,
+    i32_test_le_jf
+);
+relational!(
+    TestGreaterThanOrEqual,
+    TestGreaterThanOrEqualJumpIfTrue,
+    TestGreaterThanOrEqualJumpIfFalse,
+    true,
+    true,
+    op_test_ge,
+    i32_test_ge,
+    slow_test_ge,
+    op_test_ge_jt,
+    op_test_ge_jf,
+    i32_test_ge_jt,
+    i32_test_ge_jf
+);
+
+/// A test of `acc` alone (`TestUndefined`, …), plain and fused with the
+/// jump after it. It ignores the state: both tables use these.
+macro_rules! acc_test {
+    ($op:ident, $test:ident, $jt:ident, $jf:ident, |$v:ident| $c:expr) => {
+        handlers! {
+            fn $test(pc, acc, regs, tag) {
+                let $v = acc;
+                next!(any, Op::$op.size(), Value::from_bool($c))
+            }
+
+            fn $jt(pc, acc, regs, tag) {
+                let $v = acc;
+                if $c {
+                    next!(any, 1 + imm32(pc, 1 + 1) as isize, Value::TRUE)
+                }
+                next!(any, 1 + Op::JumpIfTrue.size(), Value::FALSE)
+            }
+
+            fn $jf(pc, acc, regs, tag) {
+                let $v = acc;
+                if !$c {
+                    next!(any, 1 + imm32(pc, 1 + 1) as isize, Value::FALSE)
+                }
+                next!(any, 1 + Op::JumpIfFalse.size(), Value::TRUE)
+            }
+        }
+    };
+}
+
+// In the I32 state `acc` is an int32, which is none of these: they read
+// it unboxed or boxed alike, as an int32's bits are neither 0x2 nor 0xA.
+acc_test!(
+    TestUndefined,
+    op_test_undefined,
+    op_test_undefined_jt,
+    op_test_undefined_jf,
+    |v| v == Value::UNDEFINED
+);
+acc_test!(
+    TestNull,
+    op_test_null,
+    op_test_null_jt,
+    op_test_null_jf,
+    |v| v == Value::NULL
+);
+acc_test!(
+    TestNullish,
+    op_test_nullish,
+    op_test_nullish_jt,
+    op_test_nullish_jf,
+    |v| v.to_bits() & !Value::UNDEFINED_TAG == Value::NULL.to_bits()
+);
+
+handlers! {
+    // Without a double on either side, strict equality is equality of the
+    // bits; a double needs a numeric compare (NaN, ±0, an int32 equal to
+    // it).
+    fn op_test_strict_equal(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if !tag.is_double(lhs) && !tag.is_double(acc) {
+            next!(any, Op::TestStrictEqual.size(), Value::from_bool(lhs == acc))
+        }
+        tail!(slow_test_strict_equal, acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_test_strict_equal(pc, acc, regs, tag) {
+        let c = strict_equals(*reg(pc, 1, regs), acc);
+        next!(any, Op::TestStrictEqual.size(), Value::from_bool(c))
+    }
+
+    fn op_test_strict_equal_jt(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if tag.is_double(lhs) || tag.is_double(acc) {
+            tail!(slow_test_strict_equal, acc)
+        }
+        let c = lhs == acc;
+        if c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::TRUE)
+        }
+        next!(any, 2 + Op::JumpIfTrue.size(), Value::FALSE)
+    }
+
+    fn op_test_strict_equal_jf(pc, acc, regs, tag) {
+        let lhs = *reg(pc, 1, regs);
+        if tag.is_double(lhs) || tag.is_double(acc) {
+            tail!(slow_test_strict_equal, acc)
+        }
+        let c = lhs == acc;
+        if !c {
+            next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::FALSE)
+        }
+        next!(any, 2 + Op::JumpIfFalse.size(), Value::TRUE)
+    }
+}
+
+/// A compare-and-jump `acc OP x` (`x` a register or the immediate; `$le`
+/// picks `<=`, `$swap` compares `x OP acc`: `>` is `x < acc`), plain and
+/// loop forms, in both states.
+macro_rules! compare_jump {
+    ($op:ident, $loop_op:ident, $le:literal, $swap:literal, $smi:tt,
+     $any:ident, $i32:ident, $slow:ident, $any_loop:ident, $i32_loop:ident, $slow_loop:ident) => {
+        handlers! {
+            fn $any(pc, acc, regs, tag) {
+                let x = compare_jump!(@operand $smi, pc, regs);
+                if !tag.both_int32(acc, x) {
+                    tail!($slow, acc)
+                }
+                let c = rel_i32($le, $swap, acc.as_i32_unchecked(), x.as_i32_unchecked());
+                if c {
+                    if ACC_I32 { next!(i32, compare_jump!(@off $smi, pc), acc) } else { next!(any, compare_jump!(@off $smi, pc), acc) }
+                }
+                if ACC_I32 { next!(i32, Op::$op.size(), acc) } else { next!(any, Op::$op.size(), acc) }
+            }
+
+            fn $i32(pc, acc, regs, tag) {
+                let x = compare_jump!(@operand $smi, pc, regs);
+                if !tag.is_int32(x) {
+                    tail!($slow, tag.rebox(acc))
+                }
+                if rel_i32($le, $swap, raw_i32(acc), x.as_i32_unchecked()) {
+                    next!(i32, compare_jump!(@off $smi, pc), acc)
+                }
+                next!(i32, Op::$op.size(), acc)
+            }
+
+            #[cold]
+            #[inline(never)]
+            fn $slow(pc, acc, regs, tag) {
+                let x = compare_jump!(@operand $smi, pc, regs);
+                let c = if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) };
+                if c {
+                    next!(any, compare_jump!(@off $smi, pc), acc)
+                }
+                next!(any, Op::$op.size(), acc)
+            }
+
+            fn $any_loop(pc, acc, regs, tag) {
+                let x = compare_jump!(@operand $smi, pc, regs);
+                if !tag.both_int32(acc, x) {
+                    tail!($slow_loop, acc)
+                }
+                if rel_i32($le, $swap, acc.as_i32_unchecked(), x.as_i32_unchecked()) {
+                    let off = compare_jump!(@off $smi, pc);
+                    back_edge!(regs, pc.offset(off as isize), acc);
+                    if ACC_I32 { next!(i32, off, acc) } else { next!(any, off, acc) }
+                }
+                if ACC_I32 { next!(i32, Op::$op.size(), acc) } else { next!(any, Op::$op.size(), acc) }
+            }
+
+            fn $i32_loop(pc, acc, regs, tag) {
+                let x = compare_jump!(@operand $smi, pc, regs);
+                if !tag.is_int32(x) {
+                    tail!($slow_loop, tag.rebox(acc))
+                }
+                if rel_i32($le, $swap, raw_i32(acc), x.as_i32_unchecked()) {
+                    let off = compare_jump!(@off $smi, pc);
+                    back_edge!(regs, pc.offset(off as isize), tag.rebox(acc));
+                    next!(i32, off, acc)
+                }
+                next!(i32, Op::$op.size(), acc)
+            }
+
+            #[cold]
+            #[inline(never)]
+            fn $slow_loop(pc, acc, regs, tag) {
+                let x = compare_jump!(@operand $smi, pc, regs);
+                let c = if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) };
+                if c {
+                    let off = compare_jump!(@off $smi, pc);
+                    back_edge!(regs, pc.offset(off as isize), acc);
+                    next!(any, off, acc)
+                }
+                next!(any, Op::$op.size(), acc)
+            }
+        }
+    };
+    (@operand reg, $pc:ident, $regs:ident) => { *reg($pc, 1, $regs) };
+    (@operand smi, $pc:ident, $regs:ident) => { Value::from_i32(imm32($pc, 1)) };
+    (@off reg, $pc:ident) => { imm32($pc, 2) };
+    (@off smi, $pc:ident) => { imm32($pc, 5) };
+}
+
+compare_jump!(
+    JumpIfLessEqual,
+    JumpIfLessEqualLoop,
+    true,
+    false,
+    reg,
+    op_jle,
+    i32_jle,
+    slow_jle,
+    op_jle_loop,
+    i32_jle_loop,
+    slow_jle_loop
+);
+compare_jump!(
+    JumpIfGreater,
+    JumpIfGreaterLoop,
+    false,
+    true,
+    reg,
+    op_jgt,
+    i32_jgt,
+    slow_jgt,
+    op_jgt_loop,
+    i32_jgt_loop,
+    slow_jgt_loop
+);
+compare_jump!(
+    JumpIfGreaterEqual,
+    JumpIfGreaterEqualLoop,
+    true,
+    true,
+    reg,
+    op_jge,
+    i32_jge,
+    slow_jge,
+    op_jge_loop,
+    i32_jge_loop,
+    slow_jge_loop
+);
+compare_jump!(
+    JumpIfLessEqualSmi,
+    JumpIfLessEqualSmiLoop,
+    true,
+    false,
+    smi,
+    op_jle_smi,
+    i32_jle_smi,
+    slow_jle_smi,
+    op_jle_smi_loop,
+    i32_jle_smi_loop,
+    slow_jle_smi_loop
+);
+compare_jump!(
+    JumpIfGreaterSmi,
+    JumpIfGreaterSmiLoop,
+    false,
+    true,
+    smi,
+    op_jgt_smi,
+    i32_jgt_smi,
+    slow_jgt_smi,
+    op_jgt_smi_loop,
+    i32_jgt_smi_loop,
+    slow_jgt_smi_loop
+);
+compare_jump!(
+    JumpIfGreaterEqualSmi,
+    JumpIfGreaterEqualSmiLoop,
+    true,
+    true,
+    smi,
+    op_jge_smi,
+    i32_jge_smi,
+    slow_jge_smi,
+    op_jge_smi_loop,
+    i32_jge_smi_loop,
+    slow_jge_smi_loop
+);
 
 #[inline(never)]
 fn create_closure(regs: *mut Value, i: u16) -> Value {
@@ -1381,6 +1997,48 @@ static TABLE: Table = {
     t[Op::TestLessThanJumpIfFalse as usize] = op_test_less_than_jump_if_false;
     t[Op::TestEqualJumpIfFalse as usize] = op_test_equal_jump_if_false;
     t[Op::TestEqualSmiJumpIfFalse as usize] = op_test_equal_smi_jump_if_false;
+    t[Op::Sub as usize] = op_sub;
+    t[Op::SubSmi as usize] = op_sub_smi;
+    t[Op::Mul as usize] = op_mul;
+    t[Op::MulSmi as usize] = op_mul_smi;
+    t[Op::Div as usize] = op_div;
+    t[Op::DivSmi as usize] = op_div_smi;
+    t[Op::ShiftLeftSmi as usize] = op_shl_smi;
+    t[Op::ShiftRightSmi as usize] = op_sar_smi;
+    t[Op::ShiftRightLogicalSmi as usize] = op_shr_smi;
+    t[Op::TestGreaterThan as usize] = op_test_gt;
+    t[Op::TestLessThanOrEqual as usize] = op_test_le;
+    t[Op::TestGreaterThanOrEqual as usize] = op_test_ge;
+    t[Op::TestStrictEqual as usize] = op_test_strict_equal;
+    t[Op::TestUndefined as usize] = op_test_undefined;
+    t[Op::TestNull as usize] = op_test_null;
+    t[Op::TestNullish as usize] = op_test_nullish;
+    t[Op::JumpIfLessEqual as usize] = op_jle;
+    t[Op::JumpIfGreater as usize] = op_jgt;
+    t[Op::JumpIfGreaterEqual as usize] = op_jge;
+    t[Op::JumpIfLessEqualSmi as usize] = op_jle_smi;
+    t[Op::JumpIfGreaterSmi as usize] = op_jgt_smi;
+    t[Op::JumpIfGreaterEqualSmi as usize] = op_jge_smi;
+    t[Op::JumpIfLessEqualLoop as usize] = op_jle_loop;
+    t[Op::JumpIfGreaterLoop as usize] = op_jgt_loop;
+    t[Op::JumpIfGreaterEqualLoop as usize] = op_jge_loop;
+    t[Op::JumpIfLessEqualSmiLoop as usize] = op_jle_smi_loop;
+    t[Op::JumpIfGreaterSmiLoop as usize] = op_jgt_smi_loop;
+    t[Op::JumpIfGreaterEqualSmiLoop as usize] = op_jge_smi_loop;
+    t[Op::TestGreaterThanJumpIfTrue as usize] = op_test_gt_jt;
+    t[Op::TestGreaterThanJumpIfFalse as usize] = op_test_gt_jf;
+    t[Op::TestLessThanOrEqualJumpIfTrue as usize] = op_test_le_jt;
+    t[Op::TestLessThanOrEqualJumpIfFalse as usize] = op_test_le_jf;
+    t[Op::TestGreaterThanOrEqualJumpIfTrue as usize] = op_test_ge_jt;
+    t[Op::TestGreaterThanOrEqualJumpIfFalse as usize] = op_test_ge_jf;
+    t[Op::TestStrictEqualJumpIfTrue as usize] = op_test_strict_equal_jt;
+    t[Op::TestStrictEqualJumpIfFalse as usize] = op_test_strict_equal_jf;
+    t[Op::TestUndefinedJumpIfTrue as usize] = op_test_undefined_jt;
+    t[Op::TestUndefinedJumpIfFalse as usize] = op_test_undefined_jf;
+    t[Op::TestNullJumpIfTrue as usize] = op_test_null_jt;
+    t[Op::TestNullJumpIfFalse as usize] = op_test_null_jf;
+    t[Op::TestNullishJumpIfTrue as usize] = op_test_nullish_jt;
+    t[Op::TestNullishJumpIfFalse as usize] = op_test_nullish_jf;
     Table(t)
 };
 
@@ -1426,6 +2084,45 @@ static TABLE_I32: Table = {
     t[Op::TestEqualSmiJumpIfTrue as usize] = i32_test_equal_smi_jump_if_true;
     t[Op::TestLessThanJumpIfFalse as usize] = i32_test_less_than_jump_if_false;
     t[Op::TestEqualSmiJumpIfFalse as usize] = i32_test_equal_smi_jump_if_false;
+    t[Op::Sub as usize] = i32_sub;
+    t[Op::SubSmi as usize] = i32_sub_smi;
+    t[Op::Mul as usize] = i32_mul;
+    t[Op::MulSmi as usize] = i32_mul_smi;
+    t[Op::Div as usize] = i32_div;
+    t[Op::DivSmi as usize] = i32_div_smi;
+    t[Op::ShiftLeftSmi as usize] = i32_shl_smi;
+    t[Op::ShiftRightSmi as usize] = i32_sar_smi;
+    t[Op::ShiftRightLogicalSmi as usize] = i32_shr_smi;
+    t[Op::TestGreaterThan as usize] = i32_test_gt;
+    t[Op::TestLessThanOrEqual as usize] = i32_test_le;
+    t[Op::TestGreaterThanOrEqual as usize] = i32_test_ge;
+    t[Op::TestUndefined as usize] = op_test_undefined;
+    t[Op::TestNull as usize] = op_test_null;
+    t[Op::TestNullish as usize] = op_test_nullish;
+    t[Op::JumpIfLessEqual as usize] = i32_jle;
+    t[Op::JumpIfGreater as usize] = i32_jgt;
+    t[Op::JumpIfGreaterEqual as usize] = i32_jge;
+    t[Op::JumpIfLessEqualSmi as usize] = i32_jle_smi;
+    t[Op::JumpIfGreaterSmi as usize] = i32_jgt_smi;
+    t[Op::JumpIfGreaterEqualSmi as usize] = i32_jge_smi;
+    t[Op::JumpIfLessEqualLoop as usize] = i32_jle_loop;
+    t[Op::JumpIfGreaterLoop as usize] = i32_jgt_loop;
+    t[Op::JumpIfGreaterEqualLoop as usize] = i32_jge_loop;
+    t[Op::JumpIfLessEqualSmiLoop as usize] = i32_jle_smi_loop;
+    t[Op::JumpIfGreaterSmiLoop as usize] = i32_jgt_smi_loop;
+    t[Op::JumpIfGreaterEqualSmiLoop as usize] = i32_jge_smi_loop;
+    t[Op::TestGreaterThanJumpIfTrue as usize] = i32_test_gt_jt;
+    t[Op::TestGreaterThanJumpIfFalse as usize] = i32_test_gt_jf;
+    t[Op::TestLessThanOrEqualJumpIfTrue as usize] = i32_test_le_jt;
+    t[Op::TestLessThanOrEqualJumpIfFalse as usize] = i32_test_le_jf;
+    t[Op::TestGreaterThanOrEqualJumpIfTrue as usize] = i32_test_ge_jt;
+    t[Op::TestGreaterThanOrEqualJumpIfFalse as usize] = i32_test_ge_jf;
+    t[Op::TestUndefinedJumpIfTrue as usize] = op_test_undefined_jt;
+    t[Op::TestUndefinedJumpIfFalse as usize] = op_test_undefined_jf;
+    t[Op::TestNullJumpIfTrue as usize] = op_test_null_jt;
+    t[Op::TestNullJumpIfFalse as usize] = op_test_null_jf;
+    t[Op::TestNullishJumpIfTrue as usize] = op_test_nullish_jt;
+    t[Op::TestNullishJumpIfFalse as usize] = op_test_nullish_jf;
     Table(t)
 };
 
@@ -1496,6 +2193,19 @@ unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
 /// paths do for bytecode functions: a cache left empty then means the call
 /// never ran (the JIT leaves such calls to the interpreter).
 #[inline(always)]
+/// For a call of `f` with receiver `this`: if `f` is
+/// `Function.prototype.call` and `this` a bytecode function, `this`, which
+/// is what the call calls.
+pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
+    unsafe {
+        let is = |v: Value, c: Class| v.is_cell() && (*as_object(v)).class == c;
+        (is(f, Class::Native)
+            && (*as_object(f)).code == (*vm).function_call
+            && is(this, Class::Function))
+        .then(|| as_object(this))
+    }
+}
+
 unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
     unsafe {
         let f = *reg(pc, 1, regs);
@@ -1929,19 +2639,30 @@ pub(crate) unsafe fn call_from_jit(
     frame: usize,
 ) -> Value {
     unsafe {
-        let fv = *regs.add(f);
-        let (this, args) = match op {
-            Op::Call => (*regs.add(w), regs.add(w + 1)),
-            _ => (Value::UNDEFINED, regs.add(w)),
+        let mut fv = *regs.add(f);
+        let (mut this, mut args, mut argc) = match op {
+            Op::Call => (*regs.add(w), regs.add(w + 1), argc),
+            _ => (Value::UNDEFINED, regs.add(w), argc),
         };
         let bytecode = fv.is_cell() && (*as_object(fv)).class == Class::Function;
         if !bytecode {
-            let r = if op == Op::Construct {
-                vm.construct_other(fv)
-            } else {
-                vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
-            };
-            return r.unwrap_or_else(|e| throw(vm, e));
+            // `f.call(that, …args)` with `f` a bytecode function: call `f`.
+            match unwrap_call(vm, fv, this) {
+                Some(fo) if op == Op::Call => {
+                    fv = object_value(fo);
+                    this = if argc == 0 { Value::UNDEFINED } else { *args };
+                    args = args.add(1);
+                    argc = argc.saturating_sub(1);
+                }
+                _ => {
+                    let r = if op == Op::Construct {
+                        vm.construct_other(fv, std::slice::from_raw_parts(args, argc))
+                    } else {
+                        vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
+                    };
+                    return r.unwrap_or_else(|e| throw(vm, e));
+                }
+            }
         }
         let fo = as_object(fv);
         let callee = (*fo).code;

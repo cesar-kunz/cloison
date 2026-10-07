@@ -78,8 +78,10 @@ fn listings_are_what_the_front_end_emits() {
 
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
-    "01", "08", "10", "16", "17", "21", "22", "23", "25", "32", "33", "34", "35", "36", "37", "44",
-    "50", "51", "53", "70", "90", "91", "92", "93", "94",
+    "01", "02", "03", "04", "08", "10", "11", "12", "14", "15", "16", "17", "21", "22", "23", "24",
+    "25", "26", "27", "30", "31", "32", "33", "34", "35", "36", "37", "40", "41", "42", "43", "44",
+    "45", "50", "51", "52", "53", "60", "61", "62", "63", "64", "66", "67", "68", "69", "70", "71",
+    "80", "81", "82", "83", "84", "90", "91", "92", "93", "94",
 ];
 
 #[test]
@@ -263,7 +265,7 @@ fn rejects_what_it_cannot_compile() {
         ("var s = 'a';", "strings"),
         ("var x = 1.5;", "1.5"),
         ("var o = {};", "object literals"),
-        ("function f(a, b) { return a * b; }", "`*`"),
+        ("function f(a, b) { return a % b; }", "`%`"),
         ("switch (1) {}", "switch"),
     ];
     for (src, what) in unsupported {
@@ -272,4 +274,140 @@ fn rejects_what_it_cannot_compile() {
     }
     assert!(compile_error("var a = 1;\nvar b = ;").starts_with("2:9:"));
     assert!(compile_error("while (1) { continue x; }").contains("no target"));
+}
+
+/// The group 2 operators (`-`, `*`, `/`, shifts, `>`, `<=`, `>=`, `===`,
+/// tests against null and undefined) at their edges: int32 overflow, -0
+/// products, `>>> 0` of negatives, NaN, an int32 equal to a double. The
+/// expected values are Node's.
+const GROUP2: &str = r#"
+function arith(n) {
+  var s = 0, d = 0, i, a, b;
+  for (i = 0; i < n; i++) {
+    a = (i * 7919) % 2001 - 1000;
+    b = (i * 104729) % 41 - 20;
+    s = (s + a * b) | 0;
+    s = (s + (a - b) * 3) | 0;
+    s = (s - (b - a)) | 0;
+    s = (s + (a << 3) + (a >> 2) + (a >>> 28)) | 0;
+    if (b != 0) d = d + a / b;
+    d = d + a / 8 - b * 2;
+  }
+  return s + d;
+}
+function overflow() {
+  var big = 2147483647, x = 0, i, r = 0;
+  for (i = 0; i < 50; i++) {
+    x = big - i;
+    r = r + (x + 10) - (0 - x - 5) + x * 3 + (x - (0 - big));
+  }
+  return r;
+}
+function negzero() {
+  var i, z, n = 0;
+  for (i = 0; i < 40; i++) {
+    z = (i % 3 - 1) * 0;
+    if (1 / z < 0) n = n + 1;
+    z = 0 * (i % 4 - 2);
+    if (1 / z < 0) n = n + 10;
+    z = (i % 2) * -5;
+    if (1 / z < 0) n = n + 100;
+  }
+  return n;
+}
+function shifts() {
+  var i, t = 0, v;
+  for (i = -30; i < 30; i++) {
+    v = i * 123457;
+    t = t + (v >>> 0) + (v >>> 1) + (v >> 31) + (v << 31) + (v << 0) + (v >> 0);
+  }
+  return t;
+}
+function rel(xs, ys) {
+  var c = 0, i, j, x, y;
+  for (i = 0; i < xs.length; i++)
+    for (j = 0; j < ys.length; j++) {
+      x = xs[i]; y = ys[j];
+      if (x > y) c = c + 1;
+      if (x >= y) c = c + 3;
+      if (x <= y) c = c + 7;
+      if (x < y) c = c + 11;
+      if (x === y) c = c + 13;
+      if (x !== y) c = c + 17;
+      if (!(x > y)) c = c + 19;
+      if (!(x <= y)) c = c + 23;
+      c = c + (x > 2 ? 29 : 0) + (x >= 2 ? 31 : 0) + (x <= 2 ? 37 : 0);
+      c = c + ((x > y) == true ? 41 : 0) + ((x <= y) == true ? 43 : 0);
+    }
+  return c;
+}
+function loops(n) {
+  var c = 0, i, k;
+  for (i = n; i >= 0; i -= 3) c = c + i;
+  for (i = 1; i <= n; i++) c = c + 1;
+  k = n;
+  while (k > 5) { k = k - 2; c = c + k; }
+  for (i = 0; i <= 2147483646; i += 1000000000) c = c + 1;
+  return c;
+}
+function nulls() {
+  var vs = [null, undefined, 0, false, vs, 3], c = 0, i, v, o = new O();
+  for (i = 0; i < 60; i++) {
+    v = vs[i % 6];
+    if (v === undefined) c = c + 1;
+    if (v === null) c = c + 10;
+    if (v == null) c = c + 100;
+    if (v != null) c = c + 1000;
+    if (v !== undefined) c = c + 10000;
+    if (o == null) c = c + 100000;
+    if (i == null) c = c + 1000000;
+    c = c + (v === null ? 2 : 0) + (v == undefined ? 4 : 0);
+  }
+  return c;
+}
+function O() { this.k = 1; }
+var nan = 0 / 0;
+"#;
+
+#[test]
+fn group2_operators_agree_with_node() {
+    for (call, want) in [
+        ("arith(3000)", "178913.9690706911"),
+        ("overflow()", "751619269850"),
+        ("negzero()", "4214"),
+        ("shifts()", "128836055850"),
+        (
+            "rel([1, 2, 3, 5 / 2, nan, 0 * -1, 0], [2, 0, 5 / 2, nan])",
+            "3400",
+        ),
+        ("loops(1000)", "417668"),
+        ("nulls()", "433260"),
+    ] {
+        assert_eq!(value(&format!("{GROUP2}\n{call};")), want, "{call}");
+    }
+}
+
+/// Two calls inlined into one loop share their frames' registers: `at`'s
+/// int32 parameter and the array `size` loads into the same register. The
+/// `length` load after it was compiled as an exit to the interpreter
+/// (a bail), which reads that register: it must not have been kept as an
+/// unboxed int32 (which truncated the array).
+#[test]
+fn inlined_frames_sharing_registers_survive_an_exit() {
+    let src = "
+        function Coll() { this.elms = []; }
+        Coll.prototype.add = function (e) { this.elms.push(e); };
+        Coll.prototype.at = function (i) { return this.elms[i]; };
+        Coll.prototype.size = function () { return this.elms.length; };
+        function collect(n) { var out = new Coll(); for (var i = 0; i < n; i++) out.add(i); return out; }
+        function main() {
+          var sum = 0;
+          for (var r = 0; r < 3000; r++) {
+            var c = collect(50);
+            for (var i = 0; i < c.size(); i++) sum += c.at(i);
+          }
+          return sum;
+        }
+        main();";
+    assert_eq!(value(src), "3675000");
 }

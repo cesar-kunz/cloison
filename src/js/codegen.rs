@@ -511,7 +511,13 @@ impl<'a> Gen<'a> {
                 | Op::JumpIfToBooleanTrue
                 | Op::JumpIfToBooleanFalse
                 | Op::JumpIfLess
-                | Op::JumpIfLessSmi,
+                | Op::JumpIfLessSmi
+                | Op::JumpIfLessEqual
+                | Op::JumpIfGreater
+                | Op::JumpIfGreaterEqual
+                | Op::JumpIfLessEqualSmi
+                | Op::JumpIfGreaterSmi
+                | Op::JumpIfGreaterEqualSmi,
                 _,
             ) => {}
             _ => self.acc = Acc::default(),
@@ -643,15 +649,11 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// The jump for `acc < k` (it has a loop form, but no negation).
-    fn jump_if_less_smi(&mut self, k: i32, l: L) {
+    /// A compare-and-jump (`JumpIfLessSmi k`, `JumpIfGreater r`, …): it
+    /// has a loop form, but no negation.
+    fn compare_jump(&mut self, op: Op, x: Arg, l: L) {
         let t = self.target(l);
-        self.emit(Op::JumpIfLessSmi, &[Arg::Imm(k), t]);
-    }
-
-    fn jump_if_less(&mut self, r: u8, l: L) {
-        let t = self.target(l);
-        self.emit(Op::JumpIfLess, &[Arg::Reg(r), t]);
+        self.emit(op, &[x, t]);
     }
 
     // ---- Names ----
@@ -862,9 +864,12 @@ impl<'a> Gen<'a> {
     fn smi_form(op: BinOp, k: i32) -> Option<(Op, i32)> {
         Some(match op {
             BinOp::Add => (Op::AddSmi, k),
-            // `x - k` as `x + -k`: the same for every value toi has (no
-            // strings yet).
-            BinOp::Sub if k != 0 && k != i32::MIN => (Op::AddSmi, -k),
+            BinOp::Sub => (Op::SubSmi, k),
+            BinOp::Mul => (Op::MulSmi, k),
+            BinOp::Div => (Op::DivSmi, k),
+            BinOp::Shl => (Op::ShiftLeftSmi, k),
+            BinOp::Sar => (Op::ShiftRightSmi, k),
+            BinOp::Shr => (Op::ShiftRightLogicalSmi, k),
             BinOp::Mod => (Op::ModSmi, k),
             BinOp::BitAnd => (Op::BitAndSmi, k),
             BinOp::BitOr => (Op::BitOrSmi, k),
@@ -873,12 +878,41 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// For `x === undefined`, `null === x`, `x == null`, … (`op` `==` or
+    /// `===`): `x` and the test of it.
+    fn nullish_test<'e>(op: BinOp, l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, Op)> {
+        let constant = |e: &Expr| match &e.kind {
+            ExprKind::Null => Some(Op::TestNull),
+            // `undefined` names the global (it can't be reassigned, but a
+            // local may shadow it).
+            ExprKind::Ident(n) if n == "undefined" => Some(Op::TestUndefined),
+            _ => None,
+        };
+        let (x, c) = match (constant(l), constant(r)) {
+            (_, Some(c)) => (l, c),
+            (Some(c), None) => (r, c),
+            _ => return None,
+        };
+        match op {
+            BinOp::StrictEq => Some((x, c)),
+            BinOp::Eq => Some((x, Op::TestNullish)),
+            _ => None,
+        }
+    }
+
     /// The register form of `op`: `r OP acc`.
     fn reg_form(op: BinOp) -> Option<Op> {
         Some(match op {
             BinOp::Add => Op::Add,
+            BinOp::Sub => Op::Sub,
+            BinOp::Mul => Op::Mul,
+            BinOp::Div => Op::Div,
             BinOp::Lt => Op::TestLessThan,
+            BinOp::Gt => Op::TestGreaterThan,
+            BinOp::Le => Op::TestLessThanOrEqual,
+            BinOp::Ge => Op::TestGreaterThanOrEqual,
             BinOp::Eq => Op::TestEqual,
+            BinOp::StrictEq => Op::TestStrictEqual,
             _ => return None,
         })
     }
@@ -889,7 +923,22 @@ impl<'a> Gen<'a> {
             self.emit(sop, &[Arg::Imm(k)]);
             return Ok(());
         }
-        if matches!(op, BinOp::Ne) {
+        // `k * x` is `x * k`: multiplication of numbers commutes, and a
+        // literal has no side effects to order.
+        if op == BinOp::Mul
+            && let Some(k) = smi(l)
+        {
+            self.value(r)?;
+            self.emit(Op::MulSmi, &[Arg::Imm(k)]);
+            return Ok(());
+        }
+        // `x === undefined`, `x == null`, …: a test of one value.
+        if let Some((x, test)) = Self::nullish_test(op, l, r) {
+            self.value(x)?;
+            self.emit(test, &[]);
+            return Ok(());
+        }
+        if matches!(op, BinOp::Ne | BinOp::StrictNe) {
             // `l != r` has no opcode: branch on `l == r`.
             let (lt, lf, end) = (self.label(), self.label(), self.label());
             self.test_binary(op, l, r, lt, lf, Fall::True, pos)?;
@@ -986,7 +1035,7 @@ impl<'a> Gen<'a> {
             if d > 0 {
                 g.emit(Op::Inc, &[]);
             } else {
-                g.emit(Op::AddSmi, &[Arg::Imm(-1)]);
+                g.emit(Op::SubSmi, &[Arg::Imm(1)]);
             }
         };
         match &t.kind {
@@ -1143,30 +1192,62 @@ impl<'a> Gen<'a> {
     ) -> R<()> {
         match op {
             BinOp::Ne => return self.test_binary(BinOp::Eq, l, r, f, t, fall.flip(), pos),
-            // Only jump-if-true forms exist for `<`.
-            BinOp::Lt if fall == Fall::False => {
+            BinOp::StrictNe => {
+                return self.test_binary(BinOp::StrictEq, l, r, f, t, fall.flip(), pos);
+            }
+            // The relational compare-and-jumps only jump when true (a
+            // negation isn't one: NaN makes both false).
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if fall == Fall::False => {
+                // A local `r` is read at the jump, after `l`: what `l OP r`
+                // reads anyway, even if `l` assigns it.
                 if let Some(k) = smi(r) {
                     self.value(l)?;
-                    self.jump_if_less_smi(k, t);
+                    self.compare_jump(Self::jump_smi_op(op), Arg::Imm(k), t);
                     return Ok(());
                 }
                 if let Some(rr) = self.local(r) {
                     self.value(l)?;
-                    self.jump_if_less(rr, t);
+                    self.compare_jump(Self::jump_reg_op(op), Arg::Reg(rr), t);
                     return Ok(());
                 }
             }
             _ => {}
         }
+        let tests_one_value = Self::nullish_test(op, l, r).is_some();
         self.binary(op, l, r, pos)?;
-        let boolean = matches!(op, BinOp::Lt | BinOp::Eq | BinOp::Ne);
+        let boolean = tests_one_value
+            || matches!(
+                op,
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::StrictEq
+            );
         self.branch(boolean, t, f, fall);
         Ok(())
     }
 
     /// Whether a test of `e` jumps more cheaply when true than when false.
     fn jumps_when_true(&self, e: &Expr) -> bool {
-        matches!(&e.kind, ExprKind::Binary(BinOp::Lt, _, r) if smi(r).is_some() || self.local(r).is_some())
+        matches!(&e.kind, ExprKind::Binary(BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, _, r)
+            if smi(r).is_some() || self.local(r).is_some())
+    }
+
+    /// The compare-and-jump `acc OP imm` for relational `op`.
+    fn jump_smi_op(op: BinOp) -> Op {
+        match op {
+            BinOp::Lt => Op::JumpIfLessSmi,
+            BinOp::Le => Op::JumpIfLessEqualSmi,
+            BinOp::Gt => Op::JumpIfGreaterSmi,
+            _ => Op::JumpIfGreaterEqualSmi,
+        }
+    }
+
+    /// The compare-and-jump `acc OP r` for relational `op`.
+    fn jump_reg_op(op: BinOp) -> Op {
+        match op {
+            BinOp::Lt => Op::JumpIfLess,
+            BinOp::Le => Op::JumpIfLessEqual,
+            BinOp::Gt => Op::JumpIfGreater,
+            _ => Op::JumpIfGreaterEqual,
+        }
     }
 
     // ---- Statements ----
@@ -1336,9 +1417,11 @@ impl<'a> Gen<'a> {
 }
 
 /// Whether `for (init; test; …)`'s first test is known to pass: `init`
-/// sets `x` to `a` and `test` is `x < b`, with `a < b`.
+/// sets `x` to `a` and `test` is `x < b` (or `<=`, `>`, `>=`), and `a` is
+/// in that relation to `b`.
 fn first_test_passes(init: Option<&ForInit>, test: &Expr) -> bool {
-    let ExprKind::Binary(BinOp::Lt, x, b) = &test.kind else {
+    let ExprKind::Binary(op @ (BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge), x, b) = &test.kind
+    else {
         return false;
     };
     let (ExprKind::Ident(x), Some(b)) = (&x.kind, smi(b)) else {
@@ -1356,5 +1439,10 @@ fn first_test_passes(init: Option<&ForInit>, test: &Expr) -> bool {
         })) if matches!(&t.kind, ExprKind::Ident(n) if n == x) => smi(e),
         _ => None,
     };
-    start.is_some_and(|a| a < b)
+    start.is_some_and(|a| match op {
+        BinOp::Lt => a < b,
+        BinOp::Le => a <= b,
+        BinOp::Gt => a > b,
+        _ => a >= b,
+    })
 }

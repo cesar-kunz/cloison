@@ -20,14 +20,14 @@ function fib(n)                 ; r1 n, r2 callee, then fib(n - 1), r3 callee, r
         LdaGlobal fib
         Star r2
         Ldar r1
-        AddSmi -1
+        SubSmi 1
         Star r3
         CallUndefined r2, r3, 1
         Star r2                 ; fib(n - 1)
         LdaGlobal fib           ; again: the call may have changed it
         Star r3
         Ldar r1
-        AddSmi -2
+        SubSmi 2
         Star r4
         CallUndefined r3, r4, 1
         Add r2                  ; fib(n - 1) + fib(n - 2)

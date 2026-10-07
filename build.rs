@@ -133,11 +133,13 @@ fn main() {
         obj_path.display()
     );
 
-    let entries = if arch == "aarch64" {
+    let mut entries = if arch == "aarch64" {
         compact_arm64(extracted)
     } else {
         extracted.into_iter().map(Entry::concrete).collect()
     };
+    // In name order, so the tables don't depend on the object file's.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     fs::write(out_dir.join("stencils.rs"), emit(&entries)).unwrap();
 }
 
@@ -198,6 +200,22 @@ fn emit(entries: &[Entry]) -> String {
     rt_names.sort();
     rt_names.dedup();
     writeln!(out, "/// Runtime functions, indexed by `Sym::Rt`.\npub(crate) static RT_NAMES: &[&str] = &{rt_names:?};\n").unwrap();
+    // Concrete stencils by name: an open-addressing table (linear probing,
+    // at most 2/3 full) of `STENCILS` indexes + 1, at the FNV-1a hash of
+    // the name. Built here, so the JIT has nothing to build at startup.
+    let concrete: Vec<usize> = (0..entries.len())
+        .filter(|&i| entries[i].covers.is_empty())
+        .collect();
+    let size = (3 * concrete.len()).div_ceil(2).next_power_of_two();
+    let mut table = vec![0u16; size];
+    for &i in &concrete {
+        let mut h = fnv1a(entries[i].name.as_bytes()) as usize & (size - 1);
+        while table[h] != 0 {
+            h = (h + 1) & (size - 1);
+        }
+        table[h] = u16::try_from(i + 1).expect("too many stencils");
+    }
+    writeln!(out, "/// Concrete stencils by name: `STENCILS` index + 1 at `fnv1a(name)`, linear probing (0: empty).\npub(crate) static BY_NAME: [u16; {size}] = {table:?};\n").unwrap();
     out.push_str("pub(crate) static STENCILS: &[Stencil] = &[\n");
     for e in entries {
         // A template's members each have a `__slow` helper if the family does

@@ -270,8 +270,10 @@ fn recursion_uses_the_vm_stack() {
 
 #[test]
 fn unbounded_recursion_is_a_range_error() {
+    // `main() + 1`: not a tail call, which compiled code would make a
+    // loop (unbounded, that runs forever).
     let src = with_main(
-        "function main()\n LdaGlobal main\n Star r1\n CallUndefined r1, r2, 0\n Return\nend\n",
+        "function main()\n LdaGlobal main\n Star r1\n CallUndefined r1, r2, 0\n AddSmi 1\n Return\nend\n",
     );
     let e = run(&src).unwrap_err();
     assert_eq!(e.0, "RangeError: Maximum call stack size exceeded");
@@ -2287,6 +2289,160 @@ end
     assert_eq!(display(vm.run(&m).unwrap()), expected.to_string());
     assert_eq!(ok(&src), expected.to_string());
     assert_eq!(vm.jit_bound_direct_calls("main"), 1);
+}
+
+const TAIL_SUM: &str = "\
+function sum(n, acc)
+        Ldar r1
+        JumpIfLessSmi 1, done
+        LdaGlobal sum
+        Star r3
+        Ldar r1
+        AddSmi -1
+        Star r4
+        Ldar r2
+        Add r1
+        Star r5
+        CallUndefined r3, r4, 2
+        Return
+done:   Ldar r2
+        Return
+end
+";
+
+/// A script calling `sum(n, 0)`.
+fn tail_sum_program(n: i32) -> String {
+    format!(
+        "script\n        CreateClosure sum\n        StaGlobal sum\n        LdaGlobal sum\n\
+         \x20       Star r1\n        LdaSmi {n}\n        Star r2\n        LdaSmi 0\n        Star r3\n\
+         \x20       CallUndefined r1, r2, 2\n        Return\nend\n{TAIL_SUM}"
+    )
+}
+
+/// `return sum(n - 1, acc + n)` calls the function itself and returns the
+/// result: compiled code moves the arguments into the parameters and jumps
+/// back to the start, behind a guard that `sum` is still the callee.
+#[test]
+fn self_tail_calls_are_loops() {
+    let (v, s) = jit_function(&tail_sum_program(10000), "sum");
+    assert_eq!(v, (10000 * 10001 / 2).to_string());
+    assert!(
+        s.iter().any(|n| n.starts_with("check_tail_callee_")),
+        "{s:?}"
+    );
+    assert!(!s.iter().any(|n| n.starts_with("call")), "{s:?}");
+}
+
+/// A million deep: the interpreter runs out of VM stack, but the compiled
+/// loop runs in constant space (and `acc` goes past int32, so it widens
+/// to a double).
+#[test]
+fn deep_self_tail_recursion() {
+    let m = toi::asm::parse(&tail_sum_program(1_000_000)).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(display(vm.run(&m).unwrap()), "500000500000");
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(i64::MAX);
+    let e = vm.run(&m).unwrap_err();
+    assert_eq!(e.0, "RangeError: Maximum call stack size exceeded");
+}
+
+/// The arguments' registers overlap the parameters (`f(n - 1, k + 1)` with
+/// the arguments in r2 and r3): moved first to last, each is read before
+/// it's overwritten.
+#[test]
+fn self_tail_calls_move_overlapping_arguments() {
+    let src = "\
+script
+        CreateClosure f
+        StaGlobal f
+        LdaGlobal f
+        Star r1
+        LdaSmi 300
+        Star r2
+        LdaSmi 0
+        Star r3
+        CallUndefined r1, r2, 2
+        Return
+end
+function f(n, k)                ; k + n
+        Ldar r1
+        JumpIfLessSmi 1, done
+        LdaGlobal f
+        Star r4
+        Ldar r2
+        AddSmi 1
+        Star r3
+        Ldar r1
+        AddSmi -1
+        Star r2
+        CallUndefined r4, r2, 2
+        Return
+done:   Ldar r2
+        Return
+end
+";
+    let (v, s) = jit_function(src, "f");
+    assert_eq!(v, "300");
+    assert!(
+        s.iter().any(|n| n.starts_with("check_tail_callee_")),
+        "{s:?}"
+    );
+}
+
+/// `F` tail-calls itself, and is compiled by plain calls; at the end it
+/// returns `this` (`undefined` in plain calls). `new F(3)` must not reuse
+/// its frame: the result of a `new` is its `this` when the constructor
+/// returns a non-object, and the tail call (whose `this` is `undefined`)
+/// would overwrite it. The guard sees the frame's `new` flag and leaves,
+/// and the interpreter makes the call.
+#[test]
+fn self_tail_calls_keep_new_frames() {
+    let src = "\
+script                          ; 20 × F(5), then new F(3) == undefined
+        CreateClosure F
+        StaGlobal F
+        LdaSmi 0
+        Star r4
+warm:   LdaGlobal F
+        Star r1
+        LdaSmi 5
+        Star r2
+        CallUndefined r1, r2, 1
+        Ldar r4
+        Inc
+        Star r4
+        JumpIfLessSmi 20, warm
+        LdaGlobal F
+        Star r1
+        LdaSmi 3
+        Star r2
+        Construct r1, r2, 1
+        Star r3
+        LdaUndefined
+        TestEqual r3
+        Return
+end
+function F(n)
+        Ldar r1
+        JumpIfLessSmi 1, done
+        LdaGlobal F
+        Star r2
+        Ldar r1
+        AddSmi -1
+        Star r3
+        CallUndefined r2, r3, 1
+        Return
+done:   Ldar r0
+        Return
+end
+";
+    let (v, s) = jit_function(src, "F");
+    assert_eq!(v, "false");
+    assert!(
+        s.iter().any(|n| n.starts_with("check_tail_callee_")),
+        "{s:?}"
+    );
 }
 
 /// `fib` split over `f` and `g`, which call each other (`pad` after their

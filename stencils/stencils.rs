@@ -2196,3 +2196,27 @@ macro_rules! check_callee_gpr {
 }
 check_callee!([m]);
 with_gprs!(each_gpr! check_callee_gpr);
+
+// Before a self tail call, which reuses the frame: the callee must be the
+// function compiled (`imm64`), and the frame not a `new` one (bit 0 of
+// its flags, `regs[-imm]`, clear), whose result `this` may be; or leave
+// before the call.
+macro_rules! check_tail_callee {
+    ($loc:tt) => {
+        stencil!("check_tail_callee_", loc!($loc); |s| {
+            if get!($loc, s).to_bits() != imm64()
+                || *(s.regs as *const u64).sub(imm() as usize) & 1 != 0
+            {
+                exit!(s)
+            }
+            next!(s)
+        });
+    };
+}
+macro_rules! check_tail_callee_gpr {
+    ($k:tt) => {
+        check_tail_callee!([g $k]);
+    };
+}
+check_tail_callee!([m]);
+with_gprs!(each_gpr! check_tail_callee_gpr);

@@ -705,6 +705,9 @@ struct Insn {
     /// For a guard [`lower`] adds before an inlined call: the function the
     /// callee register must hold (and `op` is `Nop`).
     guard: u64,
+    /// The guard is before a self tail call (see `Lowering::tail_call`):
+    /// the frame must not be a `new` one, either.
+    tail: bool,
 }
 
 impl Insn {
@@ -863,6 +866,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 frame: 0,
                 ic,
                 guard: 0,
+                tail: false,
             }
         })
         .collect()
@@ -1340,6 +1344,12 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         _ if insn.bail => ("bail", ""),
         // A number is never the function an inlined call expects.
         _ if insn.guard != 0 && matches!(reg, I32 | F64) => ("bail", ""),
+        _ if insn.guard != 0 && insn.tail => {
+            return Sel {
+                ops: Some((interp::FLAGS as i32, insn.guard, 0)),
+                ..Sel::new("check_tail_callee", "", out)
+            };
+        }
         _ if insn.guard != 0 => {
             return Sel {
                 ops: Some((0, insn.guard, 0)),
@@ -2154,6 +2164,7 @@ fn stencil_for(
         ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => format!("star_{loc}_i"),
         ("star", _) => format!("star_{loc}"),
         ("check_callee", _) => format!("check_callee_{loc}"),
+        ("check_tail_callee", _) => format!("check_tail_callee_{loc}"),
         // The callee reads its arguments from memory.
         ("call" | "call_direct", _) => {
             for r in insn.call_reads() {
@@ -4072,6 +4083,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         frame: frame as u8,
         ic: 0,
         guard: 0,
+        tail: false,
     }
 }
 
@@ -4216,6 +4228,13 @@ impl Lowering<'_> {
                     i.bail = true;
                     self.push(i, Prop::None);
                 }
+                Op::Call | Op::CallUndefined
+                    if frame == 0 && self.tail_call(&i, insns.get(k + 1)).is_some() =>
+                {
+                    let fo = self.tail_call(&i, insns.get(k + 1)).unwrap();
+                    let jump = self.emit_tail_call(&i, fo);
+                    fix.push(jump);
+                }
                 // A call that never ran: nothing to inline or call directly
                 // yet. The interpreter runs it, filling its cache, and the
                 // exit makes the next entry lower the function again.
@@ -4338,6 +4357,92 @@ impl Lowering<'_> {
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
         true
+    }
+
+    /// Whether call `i` of the function compiled (frame 0), followed by
+    /// `next`, is a self tail call to compile as a jump to its start: its
+    /// result is returned at once, its cache names this function, it passes
+    /// no more arguments than there are parameters, and (for `Call`) the
+    /// receiver isn't one of the registers the arguments go to. Not after
+    /// [`MAX_PROPERTY_EXITS`] exits at its guard. Returns the function.
+    fn tail_call(&self, i: &Insn, next: Option<&Insn>) -> Option<*mut Object> {
+        use crate::object::Class;
+        let root = self.state.root;
+        if next.is_none_or(|n| n.op != Op::Return || n.bail)
+            || i.imm as u32 > unsafe { (*root).nparams }
+            || (i.op == Op::Call && i.reg2 as i32 <= i.imm)
+            || self
+                .state
+                .callee_exits
+                .get(&(root as usize, i.pc))
+                .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
+        {
+            return None;
+        }
+        let fo = unsafe { (*self.out.fbs[0].ics.add(i.ic as usize)).holder };
+        let ok = !fo.is_null() && unsafe { (*fo).class == Class::Function && (*fo).code == root };
+        ok.then_some(fo)
+    }
+
+    /// A self tail call `i` (see [`Lowering::tail_call`]) to `fo`: a guard
+    /// that the callee register holds `fo` and the frame isn't a `new`
+    /// one, the arguments moved into the parameters, `this` set, the
+    /// registers the function may read before writing (`entry_live`) set
+    /// to `undefined`, and a jump to the start, whose index it returns for
+    /// fixing up. The frame is reused: deep tail recursion runs in constant
+    /// space. The moves need no temporaries: the arguments are consecutive
+    /// registers, moved in the order that reads each before it is
+    /// overwritten.
+    fn emit_tail_call(&mut self, i: &Insn, fo: *mut Object) -> usize {
+        let root = self.state.root;
+        let live = self
+            .state
+            .entry_live
+            .entry(root)
+            .or_insert_with(|| {
+                let c = unsafe { &*root };
+                Rc::new(entry_live(&c.bytecode, c.nregs as usize))
+            })
+            .clone();
+        let (pc, argc) = (i.pc, i.imm as usize);
+        let mut guard = synth(Op::Nop, i.reg, 0, pc);
+        guard.guard = fo as u64;
+        guard.tail = true;
+        self.push(guard, Prop::None);
+        let mov = |cx: &mut Self, src: Option<usize>, dst: usize| {
+            match src {
+                Some(r) => cx.push(synth(Op::Ldar, r as u8, 0, pc), Prop::None),
+                None => cx.push(synth(Op::LdaUndefined, 0, 0, pc), Prop::None),
+            };
+            cx.push(synth(Op::Star, dst as u8, 0, pc), Prop::None);
+        };
+        let w = i.reg2 as usize;
+        let first = w + usize::from(i.op == Op::Call);
+        // Arguments from below the parameters move last-first, from above
+        // first-first (they don't overlap `this`: see `tail_call`).
+        let order: Vec<usize> = if first == 0 {
+            (0..argc).rev().collect()
+        } else if first > 1 {
+            (0..argc).collect()
+        } else {
+            Vec::new()
+        };
+        for a in order {
+            mov(self, Some(first + a), 1 + a);
+        }
+        if i.op == Op::Call {
+            mov(self, Some(w), 0);
+        } else if live[0] {
+            mov(self, None, 0);
+        }
+        for (r, &l) in live.iter().enumerate().skip(1 + argc) {
+            if l {
+                mov(self, None, r);
+            }
+        }
+        let mut jump = synth(Op::Jump, 0, 0, pc);
+        jump.target = 0;
+        self.push(jump, Prop::None)
     }
 
     /// The function to inline for call `i` of frame `frame`, if any.
@@ -4820,7 +4925,6 @@ impl JitFunction {
         let (frame, exit_pc) = (record >> 24, record & (BAD_RESULT as usize - 1));
         let snap = code.snap.as_ref().expect("a VM function's code");
         let vm = self.vm.as_mut().unwrap();
-        vm.dirty = true;
         // The call is the instruction before the one an after-call exit
         // resumes at.
         let call_before = || {
@@ -4834,10 +4938,13 @@ impl JitFunction {
             k
         };
         // A call that found the native stack too deep: the interpreter
-        // makes it.
+        // makes it. Nothing the code assumed changed, so the next entry
+        // needn't lower the function again (past the limit, every frame
+        // leaves at its first call).
         if after_call && std::mem::take(unsafe { &mut (*vm.vm).redo_call }) {
             return (frame, snap.insns[call_before()].pc);
         }
+        vm.dirty = true;
         // The function may have been lowered differently since (a nested
         // entry recompiled it): then only resume.
         if !Rc::ptr_eq(snap, &vm.snap) || (after_call && !bad_result) {
@@ -5162,6 +5269,9 @@ pub unsafe fn run(code: &[u8], regs: &mut [Value]) -> Value {
 pub(crate) enum VmRun {
     /// No compiled code for this entry: run the frame in the interpreter.
     NotCompiled,
+    /// Run this call in the interpreter: the native stack is low, so its
+    /// compiled code would leave at its first call anyway.
+    Interpret,
     /// The function returned `acc` from compiled code; the caller finishes
     /// the return (`construct_result`, the return pc).
     Returned(Value),
@@ -5192,6 +5302,9 @@ pub(crate) unsafe fn vm_run(
     pc: usize,
     acc: Value,
 ) -> VmRun {
+    if pc == 0 && interp::native_stack_low(vm) {
+        return VmRun::Interpret;
+    }
     let vm_ptr: *mut crate::vm::Vm = vm;
     let prepared = {
         let mut slot = code.jit.borrow_mut();
@@ -5300,6 +5413,9 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "mov dword ptr [rsp], {no_exit}",
         "mov rax, [rsi + {frame}]",
         "lea r13, [rdi + rax * 8]",
+        // The frame's flags: not a `new` frame (its header isn't written
+        // otherwise; see `check_tail_callee`).
+        "mov qword ptr [r13 - {flags}], 0",
         "movabs r14, {tag}",
         "mov r15, rsp",
         "mov r12d, {undefined}",
@@ -5323,6 +5439,7 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "call {exit}",
         "jmp 2b",
         no_exit = const NO_EXIT as i32,
+        flags = const 8 * interp::FLAGS,
         limit = const std::mem::offset_of!(CallSite, native_limit),
         call = sym toi_rt_call,
         frame = const std::mem::offset_of!(CallSite, frame),
@@ -5359,6 +5476,9 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "str w9, [sp, #176]",
         "ldr x9, [x1, #{frame}]",
         "add x21, x0, x9, lsl #3",
+        // The frame's flags: not a `new` frame (its header isn't written
+        // otherwise; see `check_tail_callee`).
+        "stur xzr, [x21, #-{flags}]",
         "mov x22, #{tag_hi}",
         "lsl x22, x22, #48",
         "add x23, sp, #176",
@@ -5388,6 +5508,7 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "b 2b",
         limit = const std::mem::offset_of!(CallSite, native_limit),
         call = sym toi_rt_call,
+        flags = const 8 * interp::FLAGS,
         frame = const std::mem::offset_of!(CallSite, frame),
         tag_hi = const Value::NUMBER_TAG >> 48,
         undefined = const Value::UNDEFINED.to_bits(),
@@ -5427,10 +5548,13 @@ unsafe fn direct_exit(
         // Through the runtime from now on, or for a site claimed by types,
         // until the next call binds it again: the exit makes the callee
         // lower its code again, and maybe compile another version (a call
-        // that hadn't run has run now).
-        site.exits += 1;
-        site.entry = 0;
-        site.pending = site.claim.is_some() && site.exits < MAX_DIRECT_EXITS;
+        // that hadn't run has run now). An exit to make a call the native
+        // stack had no room for says nothing about the callee's code.
+        if !vm.redo_call {
+            site.exits += 1;
+            site.entry = 0;
+            site.pending = site.claim.is_some() && site.exits < MAX_DIRECT_EXITS;
+        }
         let callee_regs = caller.add(site.frame);
         // A call to the code itself: that code is running (it made the
         // call), so it is alive.

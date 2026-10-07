@@ -1459,11 +1459,11 @@ const ICS: usize = 5;
 const VM: usize = 6;
 const RET_PC: usize = 7;
 const CALLER: usize = 8;
-const FLAGS: usize = 9;
+pub(crate) const FLAGS: usize = 9;
 pub const HEADER: usize = 9;
 
 /// `regs[-FLAGS]` of a frame entered by `Construct`.
-const CONSTRUCT: u64 = 1;
+pub(crate) const CONSTRUCT: u64 = 1;
 
 /// A pointer kept in a frame header slot.
 #[inline(always)]
@@ -1769,7 +1769,7 @@ pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Va
             // loop of the frame may be.
             *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
             let resume = match crate::jit::vm_run(vm, code, regs, target, acc) {
-                VmRun::NotCompiled => Resume {
+                VmRun::NotCompiled | VmRun::Interpret => Resume {
                     regs,
                     pc: start.add(target),
                     acc,
@@ -1843,6 +1843,7 @@ fn enter_compiled(regs: *mut Value) -> Entered {
                 code.calls_left.set(i32::MAX);
                 done(ENTER_INTERPRET, Value::UNDEFINED)
             }
+            VmRun::Interpret => done(ENTER_INTERPRET, Value::UNDEFINED),
             VmRun::Returned(v) => {
                 let v = if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
                     construct_result(regs, v)
@@ -1982,6 +1983,7 @@ pub(crate) unsafe fn call_from_jit(
         if left < 0 {
             match crate::jit::vm_run(vm, &*callee, new, 0, Value::UNDEFINED) {
                 VmRun::NotCompiled => (*callee).calls_left.set(i32::MAX),
+                VmRun::Interpret => {}
                 VmRun::Returned(v) => {
                     return if flags == CONSTRUCT {
                         construct_result(new, v)

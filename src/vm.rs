@@ -10,7 +10,8 @@ use std::fmt;
 
 use crate::asm::Module;
 use crate::object::{
-    Atom, Class, FieldType, Heap, Object, PROTOTYPE, Shape, as_object, field_fits, object_value,
+    Atom, Class, DONT_DELETE, DONT_ENUM, FieldType, Heap, Object, PROTOTYPE, READ_ONLY, Shape,
+    as_object, field_fits, object_value,
 };
 use crate::value::Value;
 
@@ -156,6 +157,9 @@ pub struct Vm {
     pub function_prototype: *mut Object,
     pub array_prototype: *mut Object,
     pub string_prototype: *mut Object,
+    /// An object whose one slot always holds `undefined`: a cached miss
+    /// (a property found nowhere on the chain) is a prototype load from it.
+    missing_holder: *mut Object,
     pub(crate) string_shape: *const Shape,
     /// String constants by contents, so equal literals are one string.
     strings: HashMap<Vec<u16>, Value>,
@@ -220,6 +224,7 @@ impl Vm {
             function_prototype: std::ptr::null_mut(),
             array_prototype: std::ptr::null_mut(),
             string_prototype: std::ptr::null_mut(),
+            missing_holder: std::ptr::null_mut(),
             string_shape: std::ptr::null(),
             strings: HashMap::new(),
             proto_epoch: 0,
@@ -259,6 +264,7 @@ impl Vm {
         vm.function_prototype = vm.new_object(op);
         vm.array_prototype = vm.new_object(op);
         vm.string_prototype = vm.new_object(op);
+        vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
         // Room for the builtins and the script's globals in the object
         // itself: out-of-line globals cost compiled code a load each.
         vm.global = vm.new_object_with(Class::Plain, op, MAX_INLINE_CAPACITY);
@@ -290,7 +296,12 @@ impl Vm {
             let c = vm.define_native(g, name, f, 0, crate::jit::Ty::Any, true);
             let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
             vm.add_property(c, a_p, object_value(proto));
-            vm.add_property(proto, a_c, object_value(c));
+            // Not enumerable, as the builtins' properties.
+            vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
+            if name == "Object" {
+                let f = object_define_property as NativeFn;
+                vm.define_native(c, "defineProperty", f, 3, crate::jit::Ty::Any, false);
+            }
         }
         vm
     }
@@ -335,6 +346,7 @@ impl Vm {
             proto,
             capacity,
             keys: Vec::new(),
+            attrs: Vec::new(),
             fields: Vec::new(),
             elems: FieldType::None,
             elems_code: 0,
@@ -349,14 +361,30 @@ impl Vm {
     /// `shape` plus property `name`. Shared shapes share transitions;
     /// unique shapes get a fresh unique successor.
     pub(crate) fn transition(&mut self, shape: *const Shape, name: Atom) -> *const Shape {
+        self.transition_with(shape, name, 0)
+    }
+
+    /// `shape` plus property `name` with attributes `attrs`.
+    pub(crate) fn transition_with(
+        &mut self,
+        shape: *const Shape,
+        name: Atom,
+        attrs: u8,
+    ) -> *const Shape {
         let s = unsafe { &*shape };
         if !s.unique
-            && let Some(&(_, t)) = s.transitions.borrow().iter().find(|(n, _)| *n == name)
+            && let Some(&(_, _, t)) = s
+                .transitions
+                .borrow()
+                .iter()
+                .find(|&&(n, a, _)| n == name && a == attrs)
         {
             return t;
         }
         let mut keys = s.keys.clone();
         keys.push(name);
+        let mut slot_attrs = s.attrs.clone();
+        slot_attrs.push(attrs);
         let cell = Box::new(Cell::new(FieldType::None));
         let mut fields = s.fields.clone();
         fields.push(&*cell);
@@ -366,6 +394,7 @@ impl Vm {
             proto: s.proto,
             capacity: s.capacity,
             keys,
+            attrs: slot_attrs,
             fields,
             elems: s.elems,
             elems_code: s.elems_code,
@@ -374,7 +403,7 @@ impl Vm {
             elem_transitions: RefCell::default(),
         });
         if !s.unique {
-            s.transitions.borrow_mut().push((name, t));
+            s.transitions.borrow_mut().push((name, attrs, t));
         }
         t
     }
@@ -394,6 +423,7 @@ impl Vm {
                 proto: s.proto,
                 capacity: s.capacity,
                 keys: s.keys.clone(),
+                attrs: s.attrs.clone(),
                 fields: s.fields.clone(),
                 elems: s.elems,
                 elems_code: s.elems_code,
@@ -424,8 +454,19 @@ impl Vm {
     /// Add property `name` (which `o` must not have) with `value`, and
     /// return its slot.
     pub(crate) fn add_property(&mut self, o: *mut Object, name: Atom, value: Value) -> u32 {
+        self.add_property_with(o, name, value, 0)
+    }
+
+    /// `add_property` with attributes `attrs`.
+    pub(crate) fn add_property_with(
+        &mut self,
+        o: *mut Object,
+        name: Atom,
+        value: Value,
+        attrs: u8,
+    ) -> u32 {
         unsafe {
-            let new = self.transition((*o).shape, name);
+            let new = self.transition_with((*o).shape, name, attrs);
             let ns = &*new;
             let slot = ns.keys.len() as u32 - 1;
             if slot >= ns.capacity {
@@ -493,6 +534,7 @@ impl Vm {
             proto: s.proto,
             capacity: s.capacity,
             keys: s.keys.clone(),
+            attrs: s.attrs.clone(),
             fields: s.fields.clone(),
             elems,
             elems_code: elems.encode(),
@@ -574,12 +616,12 @@ impl Vm {
                 return Err(Error::unsupported("setting an array's length"));
             }
             // A string is a primitive: stores to it do nothing.
-            if (*o).class == Class::String {
+            if (*o).class == Class::String || self.read_only(o, name) {
                 return Ok(());
             }
             match (*(*o).shape).lookup(name) {
                 Some(slot) => self.store_field(o, slot, value),
-                // No setters or read-only properties on the chain yet.
+                // No setters on the chain yet.
                 None => {
                     self.add_property(o, name, value);
                 }
@@ -617,7 +659,17 @@ impl Vm {
                 };
                 return Ok(Value::from_i32((*o).elems_len as i32));
             }
+            // Absent: cached as a load from `missing_holder`'s `undefined`
+            // slot, valid (like a prototype's property) while no prototype
+            // changes shape.
             let Some((h, slot)) = self.lookup(o, name) else {
+                *ic = Ic {
+                    shape: (*o).shape,
+                    holder: self.missing_holder,
+                    new_shape: std::ptr::null(),
+                    loc: crate::object::INLINE_BASE as i32,
+                    epoch: self.proto_epoch,
+                };
                 return Ok(Value::UNDEFINED);
             };
             let loc = (*(*h).shape).location(slot);
@@ -644,7 +696,9 @@ impl Vm {
             if (*o).class == Class::Array && name == self.a_length {
                 return Err(Error::unsupported("setting an array's length"));
             }
-            if (*o).class == Class::String {
+            // Sloppy mode: a store to a read-only property, own or
+            // inherited, does nothing (and isn't cached, so it stays slow).
+            if (*o).class == Class::String || self.read_only(o, name) {
                 return Ok(());
             }
             if let Some(slot) = (*old).lookup(name) {
@@ -672,6 +726,60 @@ impl Vm {
         Ok(())
     }
 
+    /// Whether a store of `name` to `o` is blocked by a read-only property
+    /// of that name: `o`'s own, or else the nearest on its prototype chain.
+    pub(crate) fn read_only(&self, o: *mut Object, name: Atom) -> bool {
+        match self.lookup(o, name) {
+            Some((h, slot)) => unsafe { (&(*(*h).shape).attrs)[slot as usize] & READ_ONLY != 0 },
+            None => false,
+        }
+    }
+
+    /// `Object.defineProperty(o, name, …)` of a data property: `value` (if
+    /// given) with attributes `attrs`. An existing property keeps its value
+    /// if none is given, and changes its attributes: `o` gets a shape of
+    /// its own (no shared transition leads to it).
+    pub(crate) fn define_property(
+        &mut self,
+        o: *mut Object,
+        name: Atom,
+        value: Option<Value>,
+        attrs: u8,
+    ) {
+        unsafe {
+            let s = &*(*o).shape;
+            let Some(slot) = s.lookup(name) else {
+                self.add_property_with(o, name, value.unwrap_or(Value::UNDEFINED), attrs);
+                return;
+            };
+            if s.attrs[slot as usize] != attrs {
+                let mut slot_attrs = s.attrs.clone();
+                slot_attrs[slot as usize] = attrs;
+                let u = Shape {
+                    class: s.class,
+                    proto: s.proto,
+                    capacity: s.capacity,
+                    keys: s.keys.clone(),
+                    attrs: slot_attrs,
+                    fields: s.fields.clone(),
+                    elems: s.elems,
+                    elems_code: s.elems_code,
+                    unique: true,
+                    transitions: RefCell::default(),
+                    elem_transitions: RefCell::default(),
+                };
+                (*o).shape = self.add_shape(u);
+                self.code_epoch = self.code_epoch.wrapping_add(1);
+                if (*o).flags & PROTOTYPE != 0 {
+                    self.proto_epoch = self.proto_epoch.wrapping_add(1);
+                }
+            }
+            if let Some(v) = value {
+                self.store_field(o, slot, v);
+            }
+        }
+    }
+
     /// `LdaGlobal` miss: a ReferenceError if the global doesn't exist.
     pub fn get_global_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
         let (_, name) = code.ic(ic);
@@ -690,6 +798,9 @@ impl Vm {
     pub fn set_global_miss(&mut self, code: &Code, ic: u16, value: Value) -> Result<()> {
         let (ic, name) = code.ic(ic);
         let g = self.global;
+        if self.read_only(g, name) {
+            return Ok(());
+        }
         unsafe {
             let shape = (*g).shape;
             match (*shape).lookup(name) {
@@ -1242,6 +1353,61 @@ fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
             Ok(object_value(vm.new_object(op)))
         }
     }
+}
+
+/// `Object.defineProperty(o, key, descriptor)` for data properties: the
+/// descriptor's `value`, and its `writable`, `enumerable` and
+/// `configurable`, false unless given (for an existing property, as they
+/// were). Accessors (`get`, `set`) and index keys aren't supported.
+fn object_define_property(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    let arg = |i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
+    let (target, key, desc) = (arg(0), arg(1), arg(2));
+    if !target.is_cell() {
+        return Err(Error::type_error(
+            "Object.defineProperty called on non-object",
+        ));
+    }
+    if !desc.is_cell() {
+        return Err(Error::type_error("Property description must be an object"));
+    }
+    let units = crate::interp::to_string_units(key);
+    let name = String::from_utf16_lossy(&units);
+    if name.parse::<u32>().is_ok_and(|i| i.to_string() == name) {
+        return Err(Error::unsupported(
+            "Object.defineProperty with an index key",
+        ));
+    }
+    let name = vm.intern(&name);
+    let o = as_object(target);
+    let field = |vm: &mut Vm, f: &str| -> Option<Value> {
+        let a = vm.intern(f);
+        vm.lookup(as_object(desc), a)
+            .map(|(h, slot)| unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })
+    };
+    if field(vm, "get").is_some() || field(vm, "set").is_some() {
+        return Err(Error::unsupported("accessor properties (get/set)"));
+    }
+    let old = unsafe {
+        let s = &*(*o).shape;
+        s.lookup(name).map(|k| s.attrs[k as usize])
+    };
+    let mut attrs = old.unwrap_or(READ_ONLY | DONT_ENUM | DONT_DELETE);
+    for (f, bit) in [
+        ("writable", READ_ONLY),
+        ("enumerable", DONT_ENUM),
+        ("configurable", DONT_DELETE),
+    ] {
+        if let Some(v) = field(vm, f) {
+            if crate::interp::to_boolean(v) {
+                attrs &= !bit;
+            } else {
+                attrs |= bit;
+            }
+        }
+    }
+    let value = field(vm, "value");
+    vm.define_property(o, name, value, attrs);
+    Ok(target)
 }
 
 /// `Function.prototype.call` on a native: a call through it to a bytecode

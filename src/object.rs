@@ -209,6 +209,9 @@ pub struct Shape {
     pub capacity: u32,
     /// The property in each slot.
     pub keys: Vec<Atom>,
+    /// Each slot's attributes ([`READ_ONLY`], [`DONT_ENUM`], [`DONT_DELETE`];
+    /// 0 for an ordinary property).
+    pub attrs: Vec<u8>,
     /// The type of the field in each slot (see [`FieldType`]).
     pub fields: Vec<*const Cell<FieldType>>,
     /// The type of every element stored in objects of this shape, and its
@@ -222,10 +225,17 @@ pub struct Shape {
     /// Owned by a single (prototype) object: transitions from it are not
     /// shared, so inline caches must not cache them.
     pub unique: bool,
-    pub(crate) transitions: RefCell<Vec<(Atom, *const Shape)>>,
+    /// By the property added and its attributes.
+    pub(crate) transitions: RefCell<Vec<(Atom, u8, *const Shape)>>,
     /// The shapes this one moves to when its elements' type generalizes.
     pub(crate) elem_transitions: RefCell<Vec<(FieldType, *const Shape)>>,
 }
+
+/// Property attributes: not writable, not enumerable, not configurable
+/// (`Object.defineProperty`'s defaults; ordinary properties have none).
+pub const READ_ONLY: u8 = 1;
+pub const DONT_ENUM: u8 = 2;
+pub const DONT_DELETE: u8 = 4;
 
 impl Shape {
     pub fn lookup(&self, name: Atom) -> Option<u32> {
@@ -413,6 +423,7 @@ mod tests {
             proto: Value::NULL,
             capacity: 2,
             keys: vec![Atom(7), Atom(8), Atom(9)],
+            attrs: vec![0; 3],
             fields: Vec::new(),
             elems: FieldType::None,
             elems_code: 0,

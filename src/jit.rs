@@ -2235,6 +2235,11 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let fb = &fbs[insn.frame as usize];
             let shape = unsafe { &*(s as *const Shape) };
             if let Some(slot) = shape.lookup(fb.name(insn)) {
+                // A store to a read-only property does nothing: left to
+                // the interpreter.
+                if !load && shape.attrs[slot as usize] & crate::object::READ_ONLY != 0 {
+                    return bail(out);
+                }
                 let (oop, off) = split_location(shape.location(slot));
                 if off <= 0xFFFF {
                     let base = match (load, oop) {

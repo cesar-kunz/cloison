@@ -79,9 +79,10 @@ fn listings_are_what_the_front_end_emits() {
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
     "01", "02", "03", "04", "05", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17",
-    "20", "21", "22", "23", "24", "25", "26", "27", "30", "31", "32", "33", "34", "35", "36", "37",
-    "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62", "63", "64", "65",
-    "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91", "92", "93", "94",
+    "20", "21", "22", "23", "24", "25", "26", "27", "29", "30", "31", "32", "33", "34", "35", "36",
+    "37", "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62", "63", "64",
+    "65", "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91", "92", "93",
+    "94",
 ];
 
 #[test]
@@ -537,5 +538,68 @@ fn object_literals_agree_with_node() {
         ("keywords()", "12"),
     ] {
         assert_eq!(value(&format!("{OBJECTS}\n{call};")), want, "{call}");
+    }
+}
+
+/// `Object.defineProperty`: read-only properties, own and inherited, ignore
+/// assignments (also where the JIT knows the shape); `writable: true`;
+/// redefining a property's attributes and value; a cached miss invalidated
+/// when the property appears on the prototype; the target is returned.
+/// The expected values are Node's.
+const DEFINE: &str = r#"
+function readOnly() {
+  var o = {}, i, n = 0;
+  Object.defineProperty(o, "k", { value: 5 });
+  for (i = 0; i < 100; i++) { o.k = i; n += o.k; }
+  return n;
+}
+function inheritedReadOnly() {
+  function P() {}
+  Object.defineProperty(P.prototype, "ro", { value: 7 });
+  var n = 0, i, p;
+  for (i = 0; i < 100; i++) { p = new P(); p.ro = i; n += p.ro; }
+  return n;
+}
+function writable() {
+  var o = {}, i, n = 0;
+  Object.defineProperty(o, "w", { value: 1, writable: true });
+  for (i = 0; i < 100; i++) { o.w = o.w + 1; n += o.w; }
+  return n;
+}
+function redefine() {
+  var o = { a: 1 }, n = 0, i;
+  Object.defineProperty(o, "a", { writable: false });
+  for (i = 0; i < 50; i++) { o.a = 9; n += o.a; }
+  Object.defineProperty(o, "a", { value: 3, writable: true });
+  for (i = 0; i < 50; i++) { o.a = o.a + 1; n += o.a; }
+  return n;
+}
+function missesThenDefined() {
+  function Q() { this.x = 1; }
+  var q = new Q(), n = 0, i;
+  for (i = 0; i < 200; i++) { if (q.later === undefined) n++; }
+  Object.defineProperty(Q.prototype, "later", { value: 10 });
+  for (i = 0; i < 200; i++) { if (q.later === undefined) n++; else n += q.later; }
+  Q.prototype.other = 2;
+  for (i = 0; i < 200; i++) n += q.other;
+  return n;
+}
+function returnsTarget() {
+  var o = {};
+  return Object.defineProperty(o, "z", { value: 4 }) === o ? o.z : -1;
+}
+"#;
+
+#[test]
+fn define_property_agrees_with_node() {
+    for (call, want) in [
+        ("readOnly()", "500"),
+        ("inheritedReadOnly()", "700"),
+        ("writable()", "5150"),
+        ("redefine()", "1475"),
+        ("missesThenDefined()", "2600"),
+        ("returnsTarget()", "4"),
+    ] {
+        assert_eq!(value(&format!("{DEFINE}\n{call};")), want, "{call}");
     }
 }

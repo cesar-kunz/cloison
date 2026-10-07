@@ -236,13 +236,62 @@ pub fn object_value(o: *mut Object) -> Value {
 
 /// A bump allocator over 8-byte words. Memory is zeroed and lives as long
 /// as the heap.
+///
+/// There is no collector, so every object is in memory never touched
+/// before, and each new 4 KiB page costs a fault (about 8k cycles, several
+/// times the cost of filling it). The first [`SMALL_HEAP`] bytes come in
+/// [`CHUNK_WORDS`] chunks, as small programs need little. Past that, chunks
+/// are mapped 2 MiB-aligned and marked for transparent huge pages, one
+/// fault per 2 MiB where the kernel has them, and each doubles the heap, up
+/// to [`MAX_CHUNK`].
 pub struct Heap {
-    chunks: Vec<Box<[u64]>>,
+    chunks: Vec<Chunk>,
     ptr: *mut u64,
     end: *mut u64,
 }
 
 const CHUNK_WORDS: usize = 1 << 16;
+const SMALL_HEAP: usize = 8 * CHUNK_WORDS;
+const HUGE_PAGE: usize = 2 << 20;
+const MAX_CHUNK: usize = 64 << 20;
+
+/// A zeroed, private anonymous mapping.
+struct Chunk {
+    ptr: *mut u64,
+    len: usize,
+}
+
+impl Chunk {
+    /// `len` bytes (a multiple of the page size), aligned to `align`.
+    fn map(len: usize, align: usize) -> Chunk {
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+        let all = len + align - 4096;
+        let p = unsafe { libc::mmap(std::ptr::null_mut(), all, prot, flags, -1, 0) };
+        assert!(p != libc::MAP_FAILED, "heap mmap failed");
+        let start = (p as usize).next_multiple_of(align);
+        unsafe {
+            // Unmap the slack before and after the aligned range.
+            if start > p as usize {
+                libc::munmap(p, start - p as usize);
+            }
+            let tail = p as usize + all - (start + len);
+            if tail > 0 {
+                libc::munmap((start + len) as *mut libc::c_void, tail);
+            }
+        }
+        Chunk {
+            ptr: start as *mut u64,
+            len,
+        }
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
 
 impl Default for Heap {
     fn default() -> Self {
@@ -267,10 +316,26 @@ impl Heap {
 
     #[cold]
     fn refill(&mut self, n: usize) {
-        let mut chunk = vec![0u64; n.max(CHUNK_WORDS)].into_boxed_slice();
-        self.ptr = chunk.as_mut_ptr();
-        self.end = unsafe { self.ptr.add(chunk.len()) };
+        let mapped = self.mapped();
+        let chunk = if mapped < SMALL_HEAP {
+            Chunk::map((8 * n).max(8 * CHUNK_WORDS).next_multiple_of(4096), 4096)
+        } else {
+            let len = mapped.clamp(HUGE_PAGE, MAX_CHUNK).max(8 * n);
+            let c = Chunk::map(len.next_multiple_of(HUGE_PAGE), HUGE_PAGE);
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::madvise(c.ptr.cast(), c.len, libc::MADV_HUGEPAGE);
+            }
+            c
+        };
+        self.ptr = chunk.ptr;
+        self.end = unsafe { chunk.ptr.add(chunk.len / 8) };
         self.chunks.push(chunk);
+    }
+
+    /// Bytes mapped for chunks.
+    fn mapped(&self) -> usize {
+        self.chunks.iter().map(|c| c.len).sum()
     }
 
     /// Room for `n` values, all `undefined`.
@@ -308,8 +373,7 @@ impl Heap {
 
     /// Bytes allocated so far, abandoned space included.
     pub fn allocated(&self) -> usize {
-        let full: usize = self.chunks.iter().map(|c| c.len() * 8).sum();
-        full - (self.end as usize - self.ptr as usize)
+        self.mapped() - (self.end as usize - self.ptr as usize)
     }
 }
 
@@ -343,5 +407,44 @@ mod tests {
             assert_eq!(*Object::inline(o, 1), Value::from_i32(5));
             assert_eq!((*o).flags & EXTERNAL, EXTERNAL);
         }
+    }
+
+    /// The first chunk is small; then chunks are huge-page aligned, each
+    /// doubling the heap, and an allocation bigger than that gets a chunk
+    /// of its size. All of it is zeroed, and `allocated` counts what was
+    /// handed out, with space abandoned at chunk ends.
+    #[test]
+    fn heap_chunks() {
+        let mut heap = Heap::default();
+        let mut total = 0;
+        let mut words = |heap: &mut Heap, n: usize| {
+            let p = heap.alloc_words(n);
+            let s = unsafe { std::slice::from_raw_parts_mut(p, n) };
+            assert!(s.iter().all(|&w| w == 0));
+            s.fill(!0);
+            total += n;
+            p
+        };
+        for _ in 0..SMALL_HEAP / 8 / 1000 {
+            words(&mut heap, 1000);
+        }
+        assert_eq!(heap.mapped(), SMALL_HEAP);
+        let p = words(&mut heap, 1000);
+        assert_eq!(p as usize % HUGE_PAGE, 0);
+        assert_eq!(heap.chunks[1].len, HUGE_PAGE);
+        let big = words(&mut heap, 3 * HUGE_PAGE / 8);
+        assert_eq!(big as usize % HUGE_PAGE, 0);
+        assert_eq!(heap.chunks[2].len, 3 * HUGE_PAGE);
+        for _ in 0..1000 {
+            words(&mut heap, 10_000);
+        }
+        for k in 3..heap.chunks.len() {
+            let before: usize = heap.chunks[..k].iter().map(|c| c.len).sum();
+            let len = before
+                .clamp(HUGE_PAGE, MAX_CHUNK)
+                .next_multiple_of(HUGE_PAGE);
+            assert_eq!(heap.chunks[k].len, len);
+        }
+        assert!(heap.allocated() >= 8 * total && heap.allocated() <= heap.mapped());
     }
 }

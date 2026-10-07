@@ -298,6 +298,15 @@ extern "C" fn toi_rt_less_than(a: Value, b: Value) -> bool {
     }
 }
 
+/// `for … in`'s keys of `v` (`for_in_keys`; `vm` is the VM's address).
+extern "C" fn toi_rt_for_in_keys(vm: Value, v: Value) -> u64 {
+    unsafe {
+        (*(vm.to_bits() as *mut crate::vm::Vm))
+            .for_in_keys(v)
+            .to_bits()
+    }
+}
+
 /// A new object of shape `shape` (`create_object`, when the heap's chunk
 /// is full).
 extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
@@ -392,6 +401,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_compare" => toi_rt_compare as *const () as usize,
         "toi_rt_create_array" => toi_rt_create_array as *const () as usize,
         "toi_rt_create_object" => toi_rt_create_object as *const () as usize,
+        "toi_rt_for_in_keys" => toi_rt_for_in_keys as *const () as usize,
         "toi_rt_sub" => toi_rt_sub as *const () as usize,
         "toi_rt_mul" => toi_rt_mul as *const () as usize,
         "toi_rt_div" => toi_rt_div as *const () as usize,
@@ -1171,7 +1181,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
                 }
                 Op::Mov if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
-                Op::CreateArray if vm => {}
+                Op::CreateArray | Op::ForInKeys if vm => {}
                 // The capacity in `imm`, the shape's cache slot in `ic`.
                 Op::CreateObject if vm => {
                     imm = code[pc + 1] as i32;
@@ -1944,6 +1954,18 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ..Sel::new("create_array", "", out)
             };
         }
+        // `for … in`'s keys, through the runtime (the VM is the 64-bit
+        // immediate): an array.
+        Op::ForInKeys => {
+            let Some(vm) = spec.feedback.map(|f| f[insn.frame as usize].vm) else {
+                return Sel::new("bail", "", out);
+            };
+            out.acc = Ty::Ext(unsafe { (*vm).array_shape } as u64);
+            return Sel {
+                ops: Some((0, vm as u64, 0)),
+                ..Sel::new("for_in_keys", "", out)
+            };
+        }
         // A new plain object of the shape the inline cache holds (none
         // yet: the interpreter hasn't run it), allocated in the stencil:
         // the slot count, the shape and the heap's bump pointer are its
@@ -2140,6 +2162,14 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         // An exact receiver shape, known or guarded against the cached one,
         // types the element; any known shape skips the cell check.
+        // A string's elements are code units: the interpreter reads them.
+        Op::GetKeyed
+            if reg.shape().is_some_and(|s| unsafe {
+                (*(s as *const Shape)).class == crate::object::Class::String
+            }) =>
+        {
+            ("bail", "")
+        }
         Op::GetKeyed => {
             let ix = st.acc == I32;
             let pick = |plain: &'static str, i: &'static str| if ix { i } else { plain };

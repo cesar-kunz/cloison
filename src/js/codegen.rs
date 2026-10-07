@@ -1351,7 +1351,9 @@ impl<'a> Gen<'a> {
                 self.looping(labels, Some(c), None, body, !first_passes)?;
             }
             StmtKind::DoWhile(body, c) => self.looping(labels, Some(c), None, body, false)?,
-            StmtKind::ForIn { .. } => return unsupported(s.pos, "`for … in`"),
+            StmtKind::ForIn {
+                name, object, body, ..
+            } => self.for_in(labels, name, object, body, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
             StmtKind::Throw(_) => return unsupported(s.pos, "`throw`"),
             StmtKind::Return(e) => {
@@ -1476,6 +1478,51 @@ impl<'a> Gen<'a> {
         }
         self.targets.pop();
         self.bind(end);
+        Ok(())
+    }
+
+    /// `for (x in o) body`: the keys as an array (`ForInKeys`), then a
+    /// loop over them with an index in a temporary:
+    /// `keys; i = 0; Jump test; body: x = keys[i]; …; continue: i++;
+    /// test: keys.length > i, back to body; break:`.
+    fn for_in(
+        &mut self,
+        labels: Vec<String>,
+        name: &str,
+        object: &Expr,
+        body: &'a Stmt,
+        pos: Pos,
+    ) -> R<()> {
+        self.value(object)?;
+        self.emit(Op::ForInKeys, &[]);
+        let keys = self.alloc(pos)?;
+        self.star(keys);
+        let i = self.alloc(pos)?;
+        self.lda_smi(0);
+        self.star(i);
+        let (top, cont, test, brk) = (self.loop_label(), self.label(), self.label(), self.label());
+        self.jump(test);
+        self.bind(top);
+        self.ldar(i);
+        let ic = self.auto_ic();
+        self.emit(Op::GetKeyed, &[Arg::Reg(keys), ic]);
+        self.store_var(name, pos)?;
+        self.targets.push(Target {
+            labels,
+            brk,
+            cont: Some(cont),
+            breakable: true,
+        });
+        self.stmt(body)?;
+        self.targets.pop();
+        self.bind(cont);
+        self.ldar(i);
+        self.emit(Op::Inc, &[]);
+        self.star(i);
+        self.bind(test);
+        self.named(Op::GetNamed, keys, "length");
+        self.compare_jump(Op::JumpIfGreater, Arg::Reg(i), top);
+        self.bind(brk);
         Ok(())
     }
 

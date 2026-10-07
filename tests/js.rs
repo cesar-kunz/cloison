@@ -79,10 +79,10 @@ fn listings_are_what_the_front_end_emits() {
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
     "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
-    "17", "20", "21", "22", "23", "24", "25", "26", "27", "29", "30", "31", "32", "33", "34", "35",
-    "36", "37", "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62", "63",
-    "64", "65", "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91", "92",
-    "93", "94",
+    "17", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34",
+    "35", "36", "37", "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62",
+    "63", "64", "65", "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91",
+    "92", "93", "94",
 ];
 
 #[test]
@@ -266,7 +266,6 @@ fn rejects_what_it_cannot_compile() {
         ("var x = typeof 1;", "Typeof"),
         ("var o = {1: 2};", "the key `1`"),
         ("function f(a, b) { return a % b; }", "`%`"),
-        ("var o = {}; for (var p in o) {}", "for … in"),
     ];
     for (src, what) in unsupported {
         let e = compile_error(src);
@@ -683,5 +682,70 @@ fn switch_agrees_with_node() {
         ("onceAndControl()", "8/51114"),
     ] {
         assert_eq!(value(&format!("{SWITCH}\n{call};")), want, "{call}");
+    }
+}
+
+/// `for … in`: own properties in insertion order, then inherited
+/// enumerable ones, a non-enumerable property hiding an inherited one of
+/// its name, built-ins never enumerated; array indices (as strings) before
+/// named properties, a string's indices, nothing for null, undefined or a
+/// number; `break`, `continue`, labeled `continue`; keys as strings, used
+/// as `o[k]`. The expected values are Node's.
+const FOR_IN: &str = r#"
+function P() { this.own1 = 1; this.own2 = 2; }
+P.prototype.inh = 3;
+Object.defineProperty(P.prototype, "hidden", { value: 4 });
+var log = "";
+function order() {
+  var p = new P(), s = "", k, n = 0, i;
+  p.later = 5;
+  for (i = 0; i < 50; i++) { s = ""; for (k in p) s += k + ";"; n += s.length; }
+  return s + "/" + n;
+}
+function shadowing() {
+  var o = Object.create ? 0 : 0, s = "", k;
+  function Q() {}
+  Q.prototype.a = 1; Q.prototype.b = 2;
+  var q = new Q();
+  Object.defineProperty(q, "a", { value: 9 });
+  for (k in q) s += k;
+  return s;
+}
+function arraysAndStrings() {
+  var a = [10, 20, 30], s = "", k, t = 0, i;
+  a.extra = 1;
+  for (k in a) s += k + ",";
+  for (k in "xyz") s += k;
+  for (k in null) s += "N";
+  for (k in undefined) s += "U";
+  for (k in 5) s += "5";
+  for (i = 0; i < 100; i++) for (k in a) t += a[k] === undefined ? 0 : 1;
+  return s + "/" + t;
+}
+function control() {
+  var o = { a: 1, b: 2, c: 3, d: 4 }, s = "", k, j;
+  for (k in o) { if (k == "b") continue; if (k == "d") break; s += k; }
+  outer: for (j = 0; j < 3; j++) for (k in o) { if (k == "c") continue outer; s += j; }
+  return s;
+}
+function keysAreStrings() {
+  var a = [7, 8], t = "", k;
+  for (k in a) t += (k + 1) + "|";
+  for (g in { x: 1 }) t += g;
+  return t;
+}
+var g;
+"#;
+
+#[test]
+fn for_in_agrees_with_node() {
+    for (call, want) in [
+        ("order()", "own1;own2;later;inh;/1000"),
+        ("shadowing()", "b"),
+        ("arraysAndStrings()", "0,1,2,extra,012/400"),
+        ("control()", "ac001122"),
+        ("keysAreStrings()", "01|11|x"),
+    ] {
+        assert_eq!(value(&format!("{FOR_IN}\n{call};")), want, "{call}");
     }
 }

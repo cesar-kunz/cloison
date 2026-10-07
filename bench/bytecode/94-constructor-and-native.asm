@@ -26,7 +26,7 @@ function Box(k)                 ; r0 this, r1 k
         Return
 end
 
-function main()                 ; r1 a, r2 s, r3 i, r4 callee, r5-r6 window, r7 object
+function main()                 ; r1 a, r2 s, r3 i, r4 callee then object, r5-r6 window
         CreateArray
         Star r1                 ; a = []
         LdaSmi 0
@@ -34,18 +34,15 @@ function main()                 ; r1 a, r2 s, r3 i, r4 callee, r5-r6 window, r7 
         Star r3                 ; i = 0
 loop:   LdaGlobal Box
         Star r4
-        Ldar r3
-        Star r5
-        Construct r4, r5, 1
-        Star r7
-        GetNamed r7, v
+        Construct r4, r3, 1     ; the argument in place
+        Star r4
+        GetNamed r4, v
         Add r2
         Star r2                 ; s = s + new Box(i).v
         GetNamed r1, push
         Star r4
         Mov r1, r5              ; this = a
-        Ldar r3
-        Star r6
+        Mov r3, r6
         Call r4, r5, 1
         Add r2
         Star r2                 ; s = s + a.push(i)

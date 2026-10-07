@@ -1,0 +1,287 @@
+//! The lexer: the whole source into tokens, up front.
+//!
+//! The subset has no regular expression or template literals, so `/` is
+//! always division and the lexer needs no feedback from the parser.
+
+use super::Error;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tok {
+    Ident(String),
+    /// A reserved word (`function`, `var`, `this`, `true`, …).
+    Keyword(&'static str),
+    Num(f64),
+    Str(String),
+    /// An operator or punctuator.
+    Punct(&'static str),
+    Eof,
+}
+
+#[derive(Clone, Debug)]
+pub struct Token {
+    pub tok: Tok,
+    /// Byte offset of its first character.
+    pub pos: u32,
+    /// Whether a line break precedes it (for automatic semicolons).
+    pub newline_before: bool,
+}
+
+const KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+];
+
+/// Longest first, so that the first match is the longest.
+const PUNCTS: &[&str] = &[
+    ">>>=", "===", "!==", ">>>", "<<=", ">>=", "**=", "...", "&&=", "||=", "??=", "=>", "==", "!=",
+    "<=", ">=", "&&", "||", "??", "?.", "++", "--", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=",
+    "<<", ">>", "**", "{", "}", "(", ")", "[", "]", ";", ",", "<", ">", "+", "-", "*", "/", "%",
+    "&", "|", "^", "!", "~", "?", ":", "=", ".",
+];
+
+pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
+    let b = src.as_bytes();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    let mut newline = false;
+    while i < b.len() {
+        let c = b[i];
+        let start = i;
+        let err = |m: &str| Error::new(start, m.to_string());
+        match c {
+            b'\n' | b'\r' => {
+                newline = true;
+                i += 1;
+                continue;
+            }
+            b' ' | b'\t' | 0x0b | 0x0c => {
+                i += 1;
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'/') => {
+                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = src[i + 2..]
+                    .find("*/")
+                    .ok_or_else(|| err("unterminated comment"))?;
+                newline |= src[i + 2..i + 2 + end].contains(['\n', '\r']);
+                i += end + 4;
+                continue;
+            }
+            _ => {}
+        }
+        let tok =
+            if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+                let (v, n) = number(&src[i..]).ok_or_else(|| err("bad number"))?;
+                i += n;
+                Tok::Num(v)
+            } else if c == b'"' || c == b'\'' {
+                let (s, n) = string(&src[i..]).ok_or_else(|| err("unterminated string"))?;
+                i += n;
+                Tok::Str(s)
+            } else if c == b'`' {
+                return Err(err("template literals are not supported"));
+            } else if let Some(ch) = src[i..].chars().next()
+                && is_ident_start(ch)
+            {
+                let n = src[i..]
+                    .char_indices()
+                    .find(|&(_, ch)| !is_ident_part(ch))
+                    .map_or(src.len() - i, |(n, _)| n);
+                let word = &src[i..i + n];
+                i += n;
+                match KEYWORDS.iter().find(|&&k| k == word) {
+                    Some(k) => Tok::Keyword(k),
+                    None => Tok::Ident(word.to_string()),
+                }
+            } else if let Some(p) = PUNCTS.iter().find(|p| src[i..].starts_with(**p)) {
+                i += p.len();
+                Tok::Punct(p)
+            } else {
+                let ch = src[i..].chars().next().unwrap();
+                return Err(err(&format!("unexpected character `{ch}`")));
+            };
+        toks.push(Token {
+            tok,
+            pos: start as u32,
+            newline_before: std::mem::take(&mut newline),
+        });
+    }
+    toks.push(Token {
+        tok: Tok::Eof,
+        pos: src.len() as u32,
+        newline_before: true,
+    });
+    Ok(toks)
+}
+
+fn is_ident_start(c: char) -> bool {
+    c.is_alphabetic() || c == '_' || c == '$'
+}
+
+fn is_ident_part(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// A numeric literal at the start of `s`: its value and length.
+fn number(s: &str) -> Option<(f64, usize)> {
+    let b = s.as_bytes();
+    if b.len() > 1 && b[0] == b'0' && matches!(b[1], b'x' | b'X' | b'o' | b'O' | b'b' | b'B') {
+        let radix = match b[1] | 0x20 {
+            b'x' => 16,
+            b'o' => 8,
+            _ => 2,
+        };
+        let n = 2 + s[2..]
+            .find(|c: char| !c.is_digit(radix))
+            .unwrap_or(s.len() - 2);
+        let v = u64::from_str_radix(&s[2..n], radix).ok()? as f64;
+        return (!s[n..].starts_with(is_ident_part)).then_some((v, n));
+    }
+    let mut n = 0;
+    let digits = |n: &mut usize| {
+        while *n < b.len() && b[*n].is_ascii_digit() {
+            *n += 1;
+        }
+    };
+    digits(&mut n);
+    if n < b.len() && b[n] == b'.' {
+        n += 1;
+        digits(&mut n);
+    }
+    if n < b.len() && (b[n] | 0x20) == b'e' {
+        let mut m = n + 1;
+        if m < b.len() && matches!(b[m], b'+' | b'-') {
+            m += 1;
+        }
+        if m < b.len() && b[m].is_ascii_digit() {
+            n = m;
+            digits(&mut n);
+        }
+    }
+    if s[n..].starts_with(is_ident_part) {
+        return None;
+    }
+    Some((s[..n].parse().ok()?, n))
+}
+
+/// A string literal at the start of `s`: its value and length.
+fn string(s: &str) -> Option<(String, usize)> {
+    let quote = s.chars().next()?;
+    let mut out = String::new();
+    let mut it = s.char_indices().skip(1);
+    while let Some((i, c)) = it.next() {
+        match c {
+            _ if c == quote => return Some((out, i + 1)),
+            '\n' | '\r' => return None,
+            '\\' => {
+                let (_, e) = it.next()?;
+                match e {
+                    'n' => out.push('\n'),
+                    't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    'b' => out.push('\u{8}'),
+                    'f' => out.push('\u{c}'),
+                    'v' => out.push('\u{b}'),
+                    '0' => out.push('\0'),
+                    'x' | 'u' => {
+                        let n = if e == 'x' { 2 } else { 4 };
+                        let mut v = 0;
+                        for _ in 0..n {
+                            v = v * 16 + it.next()?.1.to_digit(16)?;
+                        }
+                        out.push(char::from_u32(v)?);
+                    }
+                    // A line continuation.
+                    '\n' => {}
+                    e => out.push(e),
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn toks(s: &str) -> Vec<Tok> {
+        lex(s).unwrap().into_iter().map(|t| t.tok).collect()
+    }
+
+    #[test]
+    fn lexes_words_numbers_strings_and_operators() {
+        assert_eq!(
+            toks("var x1 = 0x1F + .5e1 >>>= 'a\\n'; // c\n/* d */ y"),
+            [
+                Tok::Keyword("var"),
+                Tok::Ident("x1".into()),
+                Tok::Punct("="),
+                Tok::Num(31.0),
+                Tok::Punct("+"),
+                Tok::Num(5.0),
+                Tok::Punct(">>>="),
+                Tok::Str("a\n".into()),
+                Tok::Punct(";"),
+                Tok::Ident("y".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn records_line_breaks_and_positions() {
+        let t = lex("a /* \n */ b\nc d").unwrap();
+        let nl: Vec<bool> = t.iter().map(|t| t.newline_before).collect();
+        assert_eq!(nl, [false, true, true, false, true]);
+        assert_eq!(t[3].pos, 14);
+    }
+
+    #[test]
+    fn rejects_bad_input() {
+        assert!(lex("'abc").is_err());
+        assert!(lex("3in").is_err());
+        assert!(lex("a # b").is_err());
+        assert!(lex("/* x").is_err());
+    }
+}

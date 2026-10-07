@@ -30,25 +30,24 @@ function Point(x, y, z)         ; r0 this, r1 x, r2 y, r3 z
         Return
 end
 
-function main()                 ; r1 i, r2 s, r3 constructor, r4-r6 arguments, r7 object
+function main()                 ; r1 s, r2 i, r3 constructor then object, r4-r6 arguments
         LdaSmi 0
-        Star r1                 ; i = 0
-        Star r2                 ; s = 0
+        Star r1                 ; s = 0
+        Star r2                 ; i = 0
 loop:   LdaGlobal Point
         Star r3
-        Ldar r1
-        Star r4
-        Star r5
-        Star r6
+        Mov r2, r4
+        Mov r2, r5
+        Mov r2, r6
         Construct r3, r4, 3
-        Star r7
-        GetNamed r7, z
-        Add r2
-        Star r2                 ; s = s + new Point(i, i, i).z
-        Ldar r1
-        Inc
-        Star r1
-        JumpIfLessSmi 200000, loop
+        Star r3
+        GetNamed r3, z
+        Add r1
+        Star r1                 ; s = s + new Point(i, i, i).z
         Ldar r2
+        Inc
+        Star r2
+        JumpIfLessSmi 200000, loop
+        Ldar r1
         Return
 end

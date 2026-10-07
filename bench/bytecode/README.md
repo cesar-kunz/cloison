@@ -4,16 +4,14 @@ Hand-written bytecode for some of the [microbenchmarks](../micro/), in
 toi's text assembly format (see [src/asm.rs](../../src/asm.rs)). Each
 listing is what a straightforward JS-to-bytecode compiler should emit for
 the benchmark of the same name: no escape analysis, no inlining, no type
-specialization. The listings serve two purposes:
-
-- They run the object model and the interpreter before there is a front
-  end: `target/release/toi bench/bytecode/21-monomorphic-get.asm`.
-- They are the reference for the bytecode compiler. Its output for
-  `micro/N.js` should match `N.asm` up to register numbering, or differ
-  for a reason worth writing down.
+specialization. They are the reference for toi's front end
+([src/js/](../../src/js/)): `tests/js.rs` checks that it compiles
+`micro/N.js` to exactly `N.asm`, so a change to the code generator shows up
+as a change to a listing, with comments saying why.
 
 `tests/bench_bytecode.rs` runs every listing and checks the result against
-its benchmark's `// expect:` line. `run.mjs` takes listings too:
+its benchmark's `// expect:` line. `toi --dump FILE.js` prints what a script
+compiles to, in this format. `run.mjs` takes listings too:
 
 ```sh
 cargo build --release
@@ -57,8 +55,11 @@ own slot, and every `CreateClosure` its function.
 
 ## Conventions the listings assume of the compiler
 
-- **Registers**: `r0` is `this`, then the parameters, then `var`s in order of
-  declaration, then temporaries, allocated as a stack per expression.
+- **Registers**: `r0` is `this`, then the parameters, then `var`s and
+  function declarations in order of declaration, then temporaries,
+  allocated as a stack per expression. An operand that goes in a register
+  takes the lowest free one after it's evaluated, so a chain `c.a.b` reuses
+  one temporary.
 - **Operands**: binary operators put the left operand in a register and the
   right one in the accumulator (`Add r` computes `r + acc`), as Ignition
   does, so `n += e` needs no temporary: `e` into acc, `Add r_n`, `Star r_n`.
@@ -67,17 +68,24 @@ own slot, and every `CreateClosure` its function.
   storing it as a global.
 - **Loops are rotated**: `init; Jump test; body: …; update; test: …;
   JumpIf… body`. A `x < literal` condition becomes a fused
-  `JumpIfLessSmi`; the backward jump is the loop's back edge.
+  `JumpIfLessSmi`; the backward jump is the loop's back edge. When the
+  first test is known to pass (`for (var i = 0; i < 100; …)`), there is no
+  `Jump test`.
 - **Conditions**: a comparison yields a boolean, so it's tested with
   `JumpIfTrue`/`JumpIfFalse`; any other value is tested with
   `JumpIfToBooleanTrue`/`False`. `a || b` in a condition jumps on `a`.
+  `<` only has jump-if-true forms (`JumpIfLessSmi`, `JumpIfLess`), so
+  `if (n < 2) return n;` jumps to its `return`, which goes at the end of
+  the function.
 - **Calls**: the callee goes in a temporary and the arguments in
   consecutive temporaries (for `Call`, the receiver first). One argument
   that's already in a register is passed in place: `new V(i)` is
-  `Construct r_V, r_i, 1`.
+  `Construct r_V, r_i, 1`. A global callee is loaded for every call, even
+  twice in one expression (`fib(n - 1) + fib(n - 2)`): the first call may
+  change it.
 - **Peepholes within a basic block only**: a value already in the
-  accumulator is not reloaded (`LdaSmi 0; Star r1; Star r2`), but nothing
-  is assumed across a label.
+  accumulator is not reloaded (`LdaSmi 0; Star r1; Star r2`; stores keep
+  it), but nothing is assumed across a label that is jumped to.
 - **Statements**: `x++` as a statement is `Ldar; Inc; Star`; a function
   without `return` ends in `LdaUndefined; Return`; the script returns the
   value of its last expression statement.

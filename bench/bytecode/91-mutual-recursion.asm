@@ -17,7 +17,7 @@ script                          ; r1 callee, r2 argument
         Return
 end
 
-function f(n)                   ; r1 n, r2 callee, r3 argument, r4 g(n - 1)
+function f(n)                   ; r1 n, r2 callee, then g(n - 1), r3 callee, r4 argument
         Ldar r1
         JumpIfLessSmi 2, base
         LdaGlobal g
@@ -26,18 +26,20 @@ function f(n)                   ; r1 n, r2 callee, r3 argument, r4 g(n - 1)
         AddSmi -1
         Star r3
         CallUndefined r2, r3, 1
-        Star r4
+        Star r2                 ; g(n - 1)
+        LdaGlobal g             ; again: the call may have changed it
+        Star r3
         Ldar r1
         AddSmi -2
-        Star r3
-        CallUndefined r2, r3, 1
-        Add r4
+        Star r4
+        CallUndefined r3, r4, 1
+        Add r2                  ; g(n - 1) + g(n - 2)
         Return
 base:   Ldar r1
         Return
 end
 
-function g(n)                   ; r1 n, r2 callee, r3 argument, r4 f(n - 1)
+function g(n)                   ; r1 n, r2 callee, then f(n - 1), r3 callee, r4 argument
         Ldar r1
         JumpIfLessSmi 2, base
         LdaGlobal f
@@ -46,12 +48,14 @@ function g(n)                   ; r1 n, r2 callee, r3 argument, r4 f(n - 1)
         AddSmi -1
         Star r3
         CallUndefined r2, r3, 1
-        Star r4
+        Star r2                 ; f(n - 1)
+        LdaGlobal f             ; again: the call may have changed it
+        Star r3
         Ldar r1
         AddSmi -2
-        Star r3
-        CallUndefined r2, r3, 1
-        Add r4
+        Star r4
+        CallUndefined r3, r4, 1
+        Add r2                  ; f(n - 1) + f(n - 2)
         Return
 base:   Ldar r1
         Return

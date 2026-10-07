@@ -748,8 +748,10 @@ objects, `{x, y}` points) are where A should be measured.
 
 ### Status
 
-Steps 1 and 2 have started, without a front end: hand-written bytecode
-for five microbenchmarks (`bench/bytecode/`) runs on
+Steps 1 and 2 have started. The JS front end (`src/js/`) parses the ES5
+subset the microbenchmarks are written in and compiles what the
+instruction set covers; its output for the reference listings in
+`bench/bytecode/` is checked instruction by instruction. The bytecode runs on
 `src/object.rs` (objects, shapes, the heap), `src/vm.rs` (inline-cache
 misses, closures, arrays, natives) and the interpreter (`src/interp.rs`).
 In place:
@@ -784,4 +786,6 @@ types".
 Still missing from steps 1–2: a collector (the heap is an arena freed with
 the VM), polymorphic and megamorphic caches, a cache for array `length`,
 property attributes, strings, sloppy-mode `this`, exceptions (`try`),
-closures over variables, and the front end.
+closures over variables, and the opcodes the front end still rejects
+(`a - b` other than by a literal, `*`, `/`, `>`, `===`, shifts, object
+literals, `switch`, `for … in`, doubles and strings as constants).

@@ -29,7 +29,6 @@ end
 function V(i)                   ; r0 this, r1 i
         Ldar r1
         SetNamed r0, value      ; this.value = i
-        Ldar r1
         ModSmi 5
         SetNamed r0, mark       ; this.mark = i % 5
         Ldar r1
@@ -45,7 +44,6 @@ function main()                 ; r1 vs, r2 i, r3 n, r4 r, r5 v, r6-r9 temporari
         Star r1                 ; vs = []
         LdaSmi 0
         Star r2                 ; i = 0
-        Jump test1
 fill:   GetNamed r1, push
         Star r6
         Mov r1, r7              ; this = vs
@@ -57,15 +55,12 @@ fill:   GetNamed r1, push
         Ldar r2
         Inc
         Star r2                 ; i++
-test1:  Ldar r2
         JumpIfLessSmi 100, fill
         LdaSmi 0
         Star r3                 ; n = 0
         Star r4                 ; r = 0
-        Jump test2
 outer:  LdaSmi 0
         Star r2                 ; i = 0
-        Jump test3
 inner:  Ldar r2
         GetKeyed r1
         Star r5                 ; v = vs[i]
@@ -83,12 +78,10 @@ add:    GetNamed r5, value
 skip:   Ldar r2
         Inc
         Star r2                 ; i++
-test3:  Ldar r2
         JumpIfLessSmi 100, inner
         Ldar r4
         Inc
         Star r4                 ; r++
-test2:  Ldar r4
         JumpIfLessSmi 10000, outer
         Ldar r3
         Return

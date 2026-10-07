@@ -242,6 +242,101 @@ pub fn parse(src: &str) -> Result<Module, String> {
     Ok(Module { functions, script })
 }
 
+/// The text form of a module, which [`parse`] reads back into the same
+/// module. Jump targets get labels `L1`, `L2`, … in address order,
+/// parameters are named `p1`, `p2`, …, and functions keep their names,
+/// numbered (`f_2`) where two share one.
+pub fn disassemble(m: &Module) -> String {
+    use std::fmt::Write;
+    let mut names: Vec<String> = Vec::new();
+    for (i, f) in m.functions.iter().enumerate() {
+        let base = if i == m.script {
+            "script".to_string()
+        } else if is_ident(&f.name) && f.name != "script" {
+            f.name.clone()
+        } else {
+            "anonymous".to_string()
+        };
+        let mut name = base.clone();
+        let mut n = 1;
+        while names.contains(&name) {
+            n += 1;
+            name = format!("{base}_{n}");
+        }
+        names.push(name);
+    }
+    let mut out = String::new();
+    for (i, f) in m.functions.iter().enumerate() {
+        if i == m.script {
+            out.push_str("script\n");
+        } else {
+            let params: Vec<String> = (1..=f.nparams).map(|p| format!("p{p}")).collect();
+            let _ = writeln!(out, "function {}({})", names[i], params.join(", "));
+        }
+        let code = &f.code;
+        let decode = |pc: usize| {
+            let op = Op::from_u8(code[pc]).expect("valid bytecode");
+            (op, pc + op.size())
+        };
+        // Label the jump targets.
+        let mut targets = Vec::new();
+        let mut pc = 0;
+        while pc < code.len() {
+            let (op, next) = decode(pc);
+            let mut at = pc + 1;
+            for &k in op.operands() {
+                if k == Operand::Off {
+                    let off = i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                    targets.push((pc as i64 + off as i64) as usize);
+                }
+                at += k.width();
+            }
+            pc = next;
+        }
+        targets.sort_unstable();
+        targets.dedup();
+        let label = |t: usize| format!("L{}", targets.binary_search(&t).unwrap() + 1);
+        let mut pc = 0;
+        while pc < code.len() {
+            let (op, next) = decode(pc);
+            let head = if targets.binary_search(&pc).is_ok() {
+                format!("{}:", label(pc))
+            } else {
+                String::new()
+            };
+            let mut args = Vec::new();
+            let mut at = pc + 1;
+            for &k in op.operands() {
+                let u16_at = || u16::from_le_bytes([code[at], code[at + 1]]) as usize;
+                match k {
+                    Operand::Reg => args.push(format!("r{}", code[at])),
+                    Operand::Count => args.push(code[at].to_string()),
+                    Operand::Imm => args
+                        .push(i32::from_le_bytes(code[at..at + 4].try_into().unwrap()).to_string()),
+                    Operand::Off => {
+                        let off = i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                        args.push(label((pc as i64 + off as i64) as usize));
+                    }
+                    Operand::Ic => args.push(f.ics[u16_at()].clone()),
+                    Operand::Fn => args.push(names[f.closures[u16_at()]].clone()),
+                    Operand::AutoIc => {}
+                }
+                at += k.width();
+            }
+            let _ = writeln!(
+                out,
+                "{head:<8}{}{}{}",
+                op.plain().name(),
+                if args.is_empty() { "" } else { " " },
+                args.join(", ")
+            );
+            pc = next;
+        }
+        out.push_str("end\n\n");
+    }
+    out
+}
+
 /// `name(a, b)` → `(name, 2)`.
 fn parse_signature(s: &str) -> Option<(String, u32)> {
     let (name, rest) = s.split_once('(')?;
@@ -284,6 +379,30 @@ mod tests {
         assert_eq!(f.ics, ["x", "[]"]);
         assert_eq!(m.functions[m.script].closures, [1]);
         assert_eq!(f.code[6], Op::JumpIfLessSmiLoop as u8);
+    }
+
+    #[test]
+    fn disassembly_reads_back_as_the_same_module() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/bytecode");
+        for e in std::fs::read_dir(dir).unwrap() {
+            let path = e.unwrap().path();
+            if path.extension().is_none_or(|x| x != "asm") {
+                continue;
+            }
+            let m = parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let text = disassemble(&m);
+            let back = parse(&text).unwrap_or_else(|e| panic!("{}: {e}\n{text}", path.display()));
+            assert_eq!(text, disassemble(&back), "{}", path.display());
+            for (a, b) in m.functions.iter().zip(&back.functions) {
+                assert_eq!(
+                    (&a.code, &a.ics, &a.closures, a.nparams, a.nregs),
+                    (&b.code, &b.ics, &b.closures, b.nparams, b.nregs),
+                    "{}: {}",
+                    path.display(),
+                    a.name
+                );
+            }
+        }
     }
 
     #[test]

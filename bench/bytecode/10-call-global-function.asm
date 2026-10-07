@@ -29,7 +29,6 @@ function main()                 ; r1 n, r2 i, r3 callee, r4-r5 arguments
         LdaSmi 0
         Star r1                 ; n = 0
         Star r2                 ; i = 0
-        Jump test
 body:   LdaGlobal less
         Star r3
         Ldar r2
@@ -46,7 +45,6 @@ body:   LdaGlobal less
 next:   Ldar r2
         Inc
         Star r2                 ; i++
-test:   Ldar r2
         JumpIfLessSmi 1000000, body
         Ldar r1
         Return

@@ -62,7 +62,6 @@ function main()                 ; r1 c, r2 i, r3 callee, r4 this, r5 argument
         Star r1                 ; c = new Counter()
         LdaSmi 0
         Star r2                 ; i = 0
-        Jump test
 body:   GetNamed r1, bump
         Star r3
         Mov r1, r4
@@ -73,7 +72,6 @@ body:   GetNamed r1, bump
         Ldar r2
         Inc
         Star r2                 ; i++
-test:   Ldar r2
         JumpIfLessSmi 1000000, body
         GetNamed r1, get
         Star r3

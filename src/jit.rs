@@ -2524,7 +2524,7 @@ fn stencil_for(
 /// Whether the accumulator is live after each instruction (backward
 /// dataflow over reachable instructions). An instruction reads `acc` unless
 /// it is a load (`ldar`, `lda_smi`, `lda_true`, …), which overwrites it, or
-/// `nop` / `jump`, which pass it through.
+/// `nop` / `jump` / `mov`, which pass it through.
 fn acc_live_out(insns: &[Insn], ins: &[Option<TypeState>]) -> Vec<bool> {
     let reach: Vec<bool> = ins.iter().map(Option::is_some).collect();
     acc_liveness(insns, &reach).1
@@ -2549,7 +2549,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::Construct
         )
     };
-    let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump);
+    let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump | Op::Mov);
     // A bail hands `acc` to the interpreter.
     let (reads, kills) = (
         |insn: &Insn| insn.bail || reads(insn.op),

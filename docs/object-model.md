@@ -778,14 +778,15 @@ that passed, or a shape seen at entry, isn't checked again. Fields have
 types (`object::FieldType`), which loads in compiled code take, so objects
 reached through fields need no guards either; arrays' shapes carry their
 elements' type (`Shape::elems`), likewise. Calls are compiled too: inlined
-behind a guard on the callee, straight into the callee's compiled code
-(itself included, for recursion; the result then has the callee's
-return type, checked), or through the runtime. Details and
+behind a guard on the callee (or a dispatch on up to four callees),
+straight into the callee's compiled code (itself included, for
+recursion; the result then has the callee's return type, checked), or
+through the runtime. Details and
 numbers: `docs/future-work.md`, "Property access in the JIT, and shape
 types".
 
 Still missing from steps 1–2: a collector (the heap is an arena freed with
-the VM), megamorphic caches, polymorphic calls,
+the VM), megamorphic caches,
 property attributes, strings, sloppy-mode `this`, exceptions (`try`),
 closures over variables, and the opcodes the front end still rejects
 (`%`, shifts and bitwise operators by a variable, unary `-` of a variable,

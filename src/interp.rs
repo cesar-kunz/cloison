@@ -1032,7 +1032,7 @@ handlers! {
     fn op_call(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
-            (*ic_at(regs, pc, 4)).holder = as_object(f);
+            note_callee(ic_at(regs, pc, 4), as_object(f));
             let w = reg(pc, 2, regs);
             enter!(as_object(f), *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
         }
@@ -1042,7 +1042,7 @@ handlers! {
     fn op_call_undefined(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
-            (*ic_at(regs, pc, 4)).holder = as_object(f);
+            note_callee(ic_at(regs, pc, 4), as_object(f));
             let args = reg(pc, 2, regs);
             enter!(as_object(f), Value::UNDEFINED, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
@@ -1052,7 +1052,7 @@ handlers! {
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
-            (*ic_at(regs, pc, 4)).holder = as_object(f);
+            note_callee(ic_at(regs, pc, 4), as_object(f));
             let this = construct_this(regs, as_object(f));
             let args = reg(pc, 2, regs);
             enter!(as_object(f), this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
@@ -2582,11 +2582,54 @@ pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option
     }
 }
 
+/// Record that a call calls `f`: way 0's `holder` is the latest callee,
+/// the other ways' the ones before it (distinct; the JIT inlines up to all
+/// four). Only a change of callee costs more than a compare; another
+/// closure of the same code (a function made anew at each call) just
+/// replaces the one in way 0.
+#[inline(always)]
+unsafe fn note_callee(ic: *mut Ic, f: *mut Object) {
+    unsafe {
+        let old = (*ic).holder;
+        if old != f {
+            if !old.is_null() && (*old).code != (*f).code {
+                keep_callee(ic, old, f);
+            }
+            (*ic).holder = f;
+        }
+    }
+}
+
+/// `note_callee`'s slow path: keep `old` in ways 1-3, unless there, and
+/// take `new` out of them (it goes to way 0).
+#[inline(never)]
+unsafe fn keep_callee(ic: *mut Ic, old: *mut Object, new: *mut Object) {
+    unsafe {
+        for k in 1..IC_WAYS {
+            let w = &mut *ic.add(k);
+            if w.holder == new {
+                w.holder = old;
+                return;
+            }
+        }
+        for k in 1..IC_WAYS {
+            let w = &mut *ic.add(k);
+            if w.holder.is_null() || w.holder == old {
+                w.holder = old;
+                return;
+            }
+        }
+        // Megamorphic: the oldest goes.
+        std::ptr::copy(ic.add(2), ic.add(1), IC_WAYS - 2);
+        (*ic.add(IC_WAYS - 1)).holder = old;
+    }
+}
+
 unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
     unsafe {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) {
-            (*ic_at(regs, pc, 4)).holder = as_object(f);
+            note_callee(ic_at(regs, pc, 4), as_object(f));
         }
     }
 }

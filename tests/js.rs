@@ -825,3 +825,78 @@ fn polymorphic_accesses_agree_with_node() {
         "9152700"
     );
 }
+
+/// Polymorphic calls, inlined: two to five callees with different
+/// parameter counts (missing arguments, locals that start undefined), one
+/// calling further, callees appearing after compilation, a function made
+/// anew at each call, and methods replaced after compilation. The expected values are Node's.
+const POLY_CALLS: &str = r#"
+function K1(v) { this.v = v; }
+K1.prototype.f = function (a) { return this.v + a; };
+function K2(v) { this.w = 0; this.v = v; }
+K2.prototype.f = function (a, b, c) { var t; if (t == undefined) t = 1; return this.v * 2 + (b == undefined ? 5 : b) + t; };
+function K3(v) { this.v = v; }
+K3.prototype.f = function () { var x, y; x = this.v; return x - (y == undefined ? 1 : y); };
+function K4(v) { this.v = v; }
+K4.prototype.helper = function (a) { return a * 3; };
+K4.prototype.f = function (a) { return this.helper(a) + this.v; };
+function K5(v) { this.v = v; }
+K5.prototype.f = function (a) { return 0 - a; };
+function make(i, kinds) {
+  var k = i - ((i / kinds) | 0) * kinds;
+  return k == 0 ? new K1(i) : k == 1 ? new K2(i) : k == 2 ? new K3(i) : k == 3 ? new K4(i) : new K5(i);
+}
+function run(kinds, n) {
+  var os = [], i, r, s = 0;
+  for (i = 0; i < 30; i++) os.push(make(i, kinds));
+  for (r = 0; r < n; r++)
+    for (i = 0; i < os.length; i++) s = (s + os[i].f(r)) | 0;
+  return s;
+}
+function later() {
+  var os = [], i, r, s = 0;
+  for (i = 0; i < 20; i++) os.push((i & 1) ? new K1(i) : new K3(i));
+  for (r = 0; r < 3000; r++) {
+    if (r == 2000) os[4] = new K2(4);
+    if (r == 2500) os[6] = new K5(6);
+    for (i = 0; i < os.length; i++) s = (s + os[i].f(r, i)) | 0;
+  }
+  return s;
+}
+function fresh() {
+  var s = 0, i;
+  for (i = 0; i < 3000; i++) {
+    var g = function (x) { return x + 1; };
+    s = (s + g(i)) | 0;
+  }
+  return s;
+}
+function swap() {
+  var os = [], i, r, s = 0;
+  for (i = 0; i < 20; i++) os.push((i & 1) ? new K1(i) : (i & 2) ? new K3(i) : new K2(i));
+  for (r = 0; r < 4000; r++) {
+    if (r == 2000) K1.prototype.f = function (a) { return a * 7; };
+    if (r == 3000) { K3.prototype.f = K1.prototype.f; os[1].f = function () { return 1000; }; }
+    for (i = 0; i < os.length; i++) s = (s + os[i].f(r, i)) | 0;
+  }
+  return s;
+}
+"#;
+
+#[test]
+fn polymorphic_calls_agree_with_node() {
+    for (call, want) in [
+        ("run(2, 2000)", "31485000"),
+        ("run(3, 2000)", "21250000"),
+        ("run(4, 2000)", "59163000"),
+        ("run(5, 2000)", "36876000"),
+        ("later()", "44157750"),
+        ("fresh()", "4501500"),
+        (
+            "run(2, 300) + run(4, 300) + run(5, 300) + later()",
+            "47476350",
+        ),
+    ] {
+        assert_eq!(value(&format!("{POLY_CALLS}\n{call};")), want, "{call}");
+    }
+}

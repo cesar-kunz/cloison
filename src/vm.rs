@@ -603,7 +603,16 @@ impl Vm {
                     self.code_epoch = self.code_epoch.wrapping_add(1);
                 }
             }
-            *Object::slot(o, shape.location(slot)) = value;
+            let at = Object::slot(o, shape.location(slot));
+            // A prototype's slots hold what compiled code assumes they do
+            // while the prototype epoch holds (see `jit`'s `Case::value`);
+            // every store to one comes here (inline caches don't cache
+            // them).
+            if (*o).flags & PROTOTYPE != 0 && *at != value {
+                self.proto_epoch = self.proto_epoch.wrapping_add(1);
+                self.code_epoch = self.code_epoch.wrapping_add(1);
+            }
+            *at = value;
         }
     }
 
@@ -804,6 +813,11 @@ impl Vm {
             }
             if let Some(slot) = (*old).lookup(name) {
                 self.store_field(o, slot, value);
+                // Stores to a prototype stay on this path, which bumps the
+                // epoch (see `store_field`).
+                if (*o).flags & PROTOTYPE != 0 {
+                    return Ok(());
+                }
                 install(
                     ic,
                     Ic {

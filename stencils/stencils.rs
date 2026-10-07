@@ -2952,8 +2952,9 @@ with_gprs!(each_gpr! identity_gpr);
 // `set_oop_<loc>`, `set_tr_<loc>` (store `acc`, boxed, after writing the new
 // shape); `lda_global`, `lda_global_oop`, `sta_global`, `sta_global_oop` (the
 // global object is `imm64b`); `get_keyed[_i]_<loc>` (`acc = o[acc]`, a
-// packed element in bounds); `guard_cell_<loc>`, `shape_jeq_<loc>` and
-// `shape_guard_<loc>` for polymorphic accesses. `<loc>` is the receiver's
+// packed element in bounds); `guard_cell_<loc>`, `shape_jeq_<loc>`,
+// `shape_jne_<loc>` and `shape_guard_<loc>` for polymorphic accesses and
+// calls. `<loc>` is the receiver's
 // register.
 
 /// Whether `v` is a cell, testing against the tag register.
@@ -3118,6 +3119,12 @@ macro_rules! property_location {
         });
         stencil!("shape_jeq_", loc!($loc); |s| {
             if *(get!($loc, s).to_bits() as *const u64) == imm64() {
+                jump!(s)
+            }
+            next!(s)
+        });
+        stencil!("shape_jne_", loc!($loc); |s| {
+            if *(get!($loc, s).to_bits() as *const u64) != imm64() {
                 jump!(s)
             }
             next!(s)
@@ -3409,6 +3416,14 @@ macro_rules! check_callee {
         stencil!("check_callee_", loc!($loc); |s| {
             if get!($loc, s).to_bits() != imm64() {
                 exit!(s)
+            }
+            next!(s)
+        });
+        // A case of a polymorphic inlined call: another callee takes the
+        // branch, to the next case.
+        stencil!("callee_jne_", loc!($loc); |s| {
+            if get!($loc, s).to_bits() != imm64() {
+                jump!(s)
             }
             next!(s)
         });

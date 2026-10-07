@@ -981,6 +981,19 @@ struct Insn {
     /// The guard is before a self tail call (see `Lowering::tail_call`):
     /// the frame must not be a `new` one, either.
     tail: bool,
+    /// The guard is a case of a polymorphic inlined call, not the last:
+    /// on a mismatch it jumps to `target`, the next case, instead of
+    /// exiting (see `Lowering::inline_poly`).
+    next_case: bool,
+    /// For a `Nop` [`lower`] adds in a case of a polymorphic inlined call:
+    /// the register operand is known to hold an object of this shape there
+    /// (see `Lowering::receiver_shapes`); no code.
+    assume: u64,
+    /// The guard (`guard`) is on the receiver's shape, not the callee: a
+    /// case of a polymorphic inlined call whose callee load was dropped
+    /// (see `Lowering::inline_poly`); `guard` 1 is the receiver's cell
+    /// check before the cases.
+    on_shape: bool,
     /// An `AddSmi` decoded from `SubSmi`: on numbers `x - k` is `x + -k`,
     /// but not on other values (`"12" - 1`), so its generic case subtracts.
     sub: bool,
@@ -1002,6 +1015,7 @@ impl Insn {
                     | Op::JumpIfToBooleanFalse
             )
             || !self.bail && is_compare_jump(self.op)
+            || !self.bail && self.next_case
     }
 
     fn reads_reg(&self) -> bool {
@@ -1215,6 +1229,9 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 ic,
                 guard: 0,
                 tail: false,
+                next_case: false,
+                assume: 0,
+                on_shape: false,
                 sub,
             }
         })
@@ -1893,6 +1910,31 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ..Sel::new("check_tail_callee", "", out)
             };
         }
+        _ if insn.assume != 0 => {
+            out.regs[insn.reg as usize] = Ty::Obj(insn.assume);
+            return Sel::new("nop", "", out);
+        }
+        _ if insn.on_shape && insn.guard == 1 => return Sel::new("guard_cell", "", out),
+        _ if insn.on_shape => {
+            return Sel {
+                ops: Some((0, insn.guard, 0)),
+                ..Sel::new(
+                    if insn.next_case {
+                        "shape_jne"
+                    } else {
+                        "shape_guard"
+                    },
+                    "",
+                    out,
+                )
+            };
+        }
+        _ if insn.guard != 0 && insn.next_case => {
+            return Sel {
+                ops: Some((0, insn.guard, 0)),
+                ..Sel::new("callee_jne", "", out)
+            };
+        }
         _ if insn.guard != 0 => {
             return Sel {
                 ops: Some((0, insn.guard, 0)),
@@ -2433,9 +2475,12 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let fb = &fbs[insn.frame as usize];
             let shape = unsafe { &*(s as *const Shape) };
             if let Some(slot) = shape.lookup(fb.name(insn)) {
-                // A store to a read-only property does nothing: left to
-                // the interpreter.
-                if !load && shape.attrs[slot as usize] & crate::object::READ_ONLY != 0 {
+                // A store to a read-only property does nothing, and one to
+                // a prototype's (a unique shape's) must bump the epoch (see
+                // `Vm::store_field`): left to the interpreter.
+                if !load
+                    && (shape.attrs[slot as usize] & crate::object::READ_ONLY != 0 || shape.unique)
+                {
                     return bail(out);
                 }
                 let (oop, off) = split_location(shape.location(slot));
@@ -3185,6 +3230,8 @@ fn stencil_for(
         ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => format!("star_{loc}_i"),
         ("star", _) => format!("star_{loc}"),
         ("check_callee", _) => format!("check_callee_{loc}"),
+        ("callee_jne", _) => format!("callee_jne_{loc}"),
+        ("guard_cell" | "shape_jne" | "shape_guard", _) => format!("{}_{loc}", sel.base),
         ("check_tail_callee", _) => format!("check_tail_callee_{loc}"),
         // The callee reads its arguments from memory.
         ("call" | "call_direct" | "construct_direct", _) => {
@@ -5593,6 +5640,9 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         ic: 0,
         guard: 0,
         tail: false,
+        next_case: false,
+        assume: 0,
+        on_shape: false,
         sub: false,
     }
 }
@@ -5603,6 +5653,9 @@ struct Lowering<'a> {
     epoch: u32,
     out: Lowered,
     direct: Vec<DirectSetup>,
+    /// Per function, the registers live into each of its instructions, in
+    /// its own frame (see [`Lowering::dead_after`]).
+    live: HashMap<*const crate::vm::Code, Rc<Vec<Vec<bool>>>>,
 }
 
 /// The function's instructions as compiled, from its code and inline caches:
@@ -5643,6 +5696,7 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
             direct_base: usize::MAX,
         },
         direct: Vec::new(),
+        live: HashMap::default(),
     };
     cx.out.fbs.push(cx.feedback(root));
     let rets = cx.emit_frame(0, 0);
@@ -5765,6 +5819,11 @@ impl Lowering<'_> {
                 {
                     i.bail = true;
                     self.push(i, Prop::None);
+                }
+                Op::Call | Op::CallUndefined if self.inline_targets(frame, &i, depth).len() > 1 => {
+                    let fos = self.inline_targets(frame, &i, depth);
+                    let dead = self.dead_after(f.code, k, orig.reg);
+                    self.inline_poly(frame, &i, &fos, depth, dead);
                 }
                 Op::Call | Op::CallUndefined if self.inline_target(frame, &i, depth).is_some() => {
                     let callee = self.inline_target(frame, &i, depth).unwrap();
@@ -5990,7 +6049,6 @@ impl Lowering<'_> {
 
     /// The function to inline for call `i` of frame `frame`, if any.
     fn inline_target(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
-        use crate::object::Class;
         let f = self.out.frames[frame];
         if depth >= MAX_INLINE_DEPTH
             || self.out.frames.len() >= 255
@@ -6003,9 +6061,51 @@ impl Lowering<'_> {
             return None;
         }
         let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
-        let fo = ic.holder;
+        self.inlinable(frame, ic.holder).then_some(ic.holder)
+    }
+
+    /// The functions to inline for call `i` of frame `frame` when its
+    /// cache recorded several callees: all of them (up to four), if each
+    /// can be inlined (see [`Lowering::inline_target`]).
+    fn inline_targets(&mut self, frame: usize, i: &Insn, depth: usize) -> Vec<*mut Object> {
+        let Some(first) = self.inline_target(frame, i, depth) else {
+            return Vec::new();
+        };
+        // At the last level, a callee's own calls couldn't be inlined: a
+        // direct call into its compiled code, which inlines them, is
+        // better than inlining it.
+        let calls = |cx: &mut Self, fo: *mut Object| {
+            cx.decoded(unsafe { (*fo).code })
+                .0
+                .iter()
+                .any(|j| j.is_call())
+        };
+        let last_level = depth + 1 >= MAX_INLINE_DEPTH;
+        let ic = self.out.fbs[frame].ic(i.ic as usize);
+        let mut fos = vec![first];
+        for k in 1..crate::vm::IC_WAYS {
+            let fo = unsafe { (*ic.add(k)).holder };
+            if fo.is_null() {
+                break;
+            }
+            if !self.inlinable(frame, fo) || self.out.frames.len() + fos.len() >= 255 {
+                return Vec::new();
+            }
+            fos.push(fo);
+        }
+        if last_level && fos.len() > 1 && fos.iter().any(|&fo| calls(self, fo)) {
+            return Vec::new();
+        }
+        fos
+    }
+
+    /// Whether `fo` is a bytecode function call sites in frame `frame` may
+    /// inline: not recursively more than one level deep, and small enough.
+    fn inlinable(&mut self, frame: usize, fo: *mut Object) -> bool {
+        use crate::object::Class;
+        let f = self.out.frames[frame];
         if fo.is_null() || unsafe { (*fo).class } != Class::Function {
-            return None;
+            return false;
         }
         let callee = unsafe { (*fo).code };
         // Recursively only one level deep: below that, calls to it are
@@ -6015,7 +6115,7 @@ impl Lowering<'_> {
         loop {
             if self.out.frames[g].code == callee {
                 if seen {
-                    return None;
+                    return false;
                 }
                 seen = true;
             }
@@ -6026,10 +6126,7 @@ impl Lowering<'_> {
         }
         let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
         let nregs = unsafe { (*callee).nregs } as usize;
-        if base + nregs > 256 || self.decoded(callee).0.len() > MAX_INLINE_INSNS {
-            return None;
-        }
-        Some(fo)
+        base + nregs <= 256 && self.decoded(callee).0.len() <= MAX_INLINE_INSNS
     }
 
     /// Direct call `i` (with `p`) of frame `frame` to `callee`: store `this`
@@ -6138,6 +6235,233 @@ impl Lowering<'_> {
     }
 
     fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) {
+        let (_, rets) = self.inline_case(frame, i, fo, depth, false, None);
+        self.return_past(rets);
+    }
+
+    /// Call `i` inlined for each of the functions `fos`: a case per
+    /// function, as [`Lowering::inline`] does it, but for the last one's a
+    /// guard that jumps to the next case on another callee (`next_case`),
+    /// so only the last exits. The cases' frames share registers (one runs),
+    /// so `this` and the arguments move into them once, before the cases
+    /// (as many as any callee has parameters; each case sets its other
+    /// registers).
+    ///
+    /// When each callee implies its own receiver shape and nothing reads
+    /// the callee's register after the call (`dead`), the load of the
+    /// callee goes, and the cases dispatch on the receiver's shape (a cell
+    /// check, `shape_jne`, the last `shape_guard`): one dispatch, not two.
+    /// The guards then exit to the load, which the interpreter redoes;
+    /// exits there count against this.
+    fn inline_poly(
+        &mut self,
+        frame: usize,
+        i: &Insn,
+        fos: &[*mut Object],
+        depth: usize,
+        dead: bool,
+    ) {
+        let (shapes, load) = self.receiver_shapes(frame, i, fos);
+        let mut fused = None;
+        if dead
+            && let Some((get, star)) = load
+            && shapes.iter().all(|&s| s != 0)
+            && shapes
+                .iter()
+                .enumerate()
+                .all(|(a, s)| !shapes[..a].contains(s))
+        {
+            let g = self.out.insns[get];
+            let code = self.out.frames[frame].code as usize;
+            let exits = self.state.callee_exits.get(&(code, g.pc)).copied();
+            if exits.is_none_or(|n| n < MAX_PROPERTY_EXITS) {
+                for x in [get, star] {
+                    self.out.insns[x] = synth(Op::Nop, 0, frame, g.pc);
+                    self.out.props[x] = Prop::None;
+                }
+                fused = Some(g.pc);
+            }
+        }
+        let nparams = fos
+            .iter()
+            .map(|&fo| unsafe { (*(*fo).code).nparams } as usize)
+            .max();
+        self.arg_moves(frame, i, nparams.unwrap_or(0));
+        if let Some(pc) = fused {
+            let mut cell = synth(Op::Nop, i.reg2, frame, pc);
+            (cell.guard, cell.on_shape) = (1, true);
+            self.push(cell, Prop::None);
+        }
+        let mut rets = Vec::new();
+        for (k, &fo) in fos.iter().enumerate() {
+            let last = k + 1 == fos.len();
+            let (guard, r) = self.inline_case(frame, i, fo, depth, !last, Some(shapes[k]));
+            if let Some(pc) = fused {
+                let g = &mut self.out.insns[guard];
+                (g.reg, g.guard, g.on_shape, g.pc) = (i.reg2, shapes[k], true, pc);
+            }
+            rets.extend(r);
+            if !last {
+                if self.out.insns.last().is_some_and(|j| j.falls_through()) {
+                    let mut j = synth(Op::Jump, 0, frame, i.pc);
+                    j.target = usize::MAX;
+                    rets.push(self.push(j, Prop::None));
+                }
+                self.out.insns[guard].target = self.out.insns.len();
+            }
+        }
+        self.return_past(rets);
+    }
+
+    /// For a polymorphic call `i` (`Call`) of frame `frame` to `fos`: per
+    /// callee, the shape its receiver must have, or 0. The callee was
+    /// loaded from the receiver, unchanged since, by a polymorphic access
+    /// whose shapes all find it in a prototype: a prototype's slots hold
+    /// the same values while the prototype epoch the code is compiled
+    /// under holds (see `Vm::store_field`), so a callee found under just
+    /// one of the shapes proves that shape. Only with nothing between
+    /// that may add properties to the receiver (a call), which would leave
+    /// it a descendant of that shape, not that shape.
+    /// Also the indices of the load and of the `Star` of its result.
+    fn receiver_shapes(
+        &self,
+        frame: usize,
+        i: &Insn,
+        fos: &[*mut Object],
+    ) -> (Vec<u64>, Option<(usize, usize)>) {
+        let none = (vec![0; fos.len()], None);
+        if i.op != Op::Call {
+            return none;
+        }
+        let insns = &self.out.insns;
+        let Some(k) = insns
+            .iter()
+            .rposition(|j| j.frame as usize == frame && j.op == Op::Star && j.reg == i.reg)
+        else {
+            return none;
+        };
+        let Some(get) = k.checked_sub(1) else {
+            return none;
+        };
+        let (g, Prop::Poly { n, cases }) = (insns[get], self.out.props[get]) else {
+            return none;
+        };
+        if g.op != Op::GetNamed || g.frame as usize != frame || g.reg != i.reg2 || g.bail {
+            return none;
+        }
+        // Nothing between rewrites the receiver or calls.
+        if insns[k + 1..].iter().any(|j| {
+            j.is_call()
+                || j.guard != 0
+                || j.bail
+                || (j.frame as usize == frame && j.op == Op::Star && j.reg == g.reg)
+        }) {
+            return none;
+        }
+        let cases = &cases[..n as usize];
+        let mut values = Vec::with_capacity(cases.len());
+        for c in cases {
+            let CaseLoc::Proto(addr) = c.loc else {
+                return none;
+            };
+            values.push(unsafe { *(addr as *const Value) });
+        }
+        let shapes = fos
+            .iter()
+            .map(|&fo| {
+                let f = crate::object::object_value(fo);
+                let mut found = values.iter().zip(cases).filter(|(v, _)| **v == f);
+                match (found.next(), found.next()) {
+                    (Some((_, c)), None) => c.shape,
+                    _ => 0,
+                }
+            })
+            .collect();
+        (shapes, Some((get, k)))
+    }
+
+    /// Whether register `r` of `code`'s frame is dead after its instruction
+    /// `k` (no path reads it before writing it; an exit to the interpreter
+    /// later reads only what it would).
+    fn dead_after(&mut self, code: *const crate::vm::Code, k: usize, r: u8) -> bool {
+        let d = self.decoded(code);
+        let live = self
+            .live
+            .entry(code)
+            .or_insert_with(|| {
+                let insns = &d.0;
+                let nregs = unsafe { (*code).nregs } as usize;
+                Rc::new(reg_live_in(insns, &reachable(insns, 0), nregs, &[]))
+            })
+            .clone();
+        live.get(k + 1).is_some_and(|l| !l[r as usize])
+    }
+
+    /// Point the jumps `rets` (inlined `Return`s) past the inlined code,
+    /// which ends here; a last one falling through to it needs no jump.
+    fn return_past(&mut self, rets: Vec<usize>) {
+        let mut cont = self.out.insns.len();
+        if let Some(&last) = rets.last()
+            && last + 1 == cont
+        {
+            self.out.insns.pop();
+            self.out.props.pop();
+            cont -= 1;
+        }
+        for r in rets {
+            if r < cont {
+                self.out.insns[r].target = cont;
+            }
+        }
+    }
+
+    /// `acc = src` (a register, or `undefined`), then `dst = acc`, for call
+    /// setup at `pc` in frame `frame`.
+    fn mov(&mut self, frame: usize, pc: usize, src: Option<u8>, dst: u8) {
+        match src {
+            Some(r) => self.push(synth(Op::Ldar, r, frame, pc), Prop::None),
+            None => self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None),
+        };
+        self.push(synth(Op::Star, dst, frame, pc), Prop::None);
+    }
+
+    /// For call `i` of frame `frame` inlined: move `this` and the first
+    /// `nparams` arguments (`undefined` for missing ones) into the
+    /// callee's registers, which start past the caller's and a header.
+    fn arg_moves(&mut self, frame: usize, i: &Insn, nparams: usize) {
+        let f = self.out.frames[frame];
+        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let (w, argc) = (i.reg2, i.imm as usize);
+        let (this, args) = match i.op {
+            Op::Call => (Some(w), w as usize + 1),
+            _ => (None, w as usize),
+        };
+        self.mov(frame, i.pc, this, base as u8);
+        for p in 0..nparams {
+            self.mov(
+                frame,
+                i.pc,
+                (p < argc).then_some((args + p) as u8),
+                (base + 1 + p) as u8,
+            );
+        }
+    }
+
+    /// Inline call `i` of frame `frame` to `fo`, in a new frame: the guard
+    /// (jumping on a mismatch if `next_case`; its index is returned), the
+    /// moves into the callee's registers (`this` and the arguments only if
+    /// not `hoisted` before, which gives the receiver's shape the callee
+    /// implies, or 0), its instructions. Returns the
+    /// jumps its `Return`s became, still to point past it.
+    fn inline_case(
+        &mut self,
+        frame: usize,
+        i: &Insn,
+        fo: *mut Object,
+        depth: usize,
+        next_case: bool,
+        hoisted: Option<u64>,
+    ) -> (usize, Vec<usize>) {
         let f = self.out.frames[frame];
         let callee = unsafe { (*fo).code };
         let c = unsafe { &*callee };
@@ -6154,43 +6478,26 @@ impl Lowering<'_> {
         let pc = i.pc;
         let mut guard = synth(Op::Nop, i.reg, frame, pc);
         guard.guard = fo as u64;
-        self.push(guard, Prop::None);
-        let at = |r: usize| (base + r) as u8;
-        let mov = |cx: &mut Self, src: Option<u8>, dst: u8| {
-            match src {
-                Some(r) => cx.push(synth(Op::Ldar, r, frame, pc), Prop::None),
-                None => cx.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None),
-            };
-            cx.push(synth(Op::Star, dst, frame, pc), Prop::None);
-        };
-        let (w, argc) = (i.reg2, i.imm as usize);
-        let (this, args) = match i.op {
-            Op::Call => (Some(w), w as usize + 1),
-            _ => (None, w as usize),
-        };
-        mov(self, this, at(0));
-        for p in 0..c.nparams as usize {
-            mov(self, (p < argc).then_some((args + p) as u8), at(1 + p));
-        }
-        for r in 1 + c.nparams as usize..c.nregs as usize {
-            mov(self, None, at(r));
-        }
-        self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
-        let rets = self.emit_frame(id, depth + 1);
-        // A last `return` falling through to the continuation needs no jump.
-        let mut cont = self.out.insns.len();
-        if let Some(&last) = rets.last()
-            && last + 1 == cont
-        {
-            self.out.insns.pop();
-            self.out.props.pop();
-            cont -= 1;
-        }
-        for r in rets {
-            if r < cont {
-                self.out.insns[r].target = cont;
+        guard.next_case = next_case;
+        let guard = self.push(guard, Prop::None);
+        match hoisted {
+            None => self.arg_moves(frame, i, c.nparams as usize),
+            // The receiver's shape, if this callee implies it: in the
+            // window and in the callee's `this`.
+            Some(0) => {}
+            Some(shape) => {
+                for r in [i.reg2, base as u8] {
+                    let mut a = synth(Op::Nop, r, frame, pc);
+                    a.assume = shape;
+                    self.push(a, Prop::None);
+                }
             }
         }
+        for r in 1 + c.nparams as usize..c.nregs as usize {
+            self.mov(frame, pc, None, (base + r) as u8);
+        }
+        self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
+        (guard, self.emit_frame(id, depth + 1))
     }
 }
 

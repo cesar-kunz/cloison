@@ -2367,6 +2367,74 @@ end
     assert!(s.iter().any(|n| n.starts_with("construct_direct")), "{s:?}");
 }
 
+/// `new Point(i, i + 1, i + 2)` 20,000 times, allocated by the
+/// `construct_direct` stencil: each argument arrives as passed (the call
+/// must hand the callee the tag and exit cell registers, whatever the
+/// stencil used them for while allocating), and the objects cross heap
+/// chunks.
+#[test]
+fn direct_constructors_allocate_in_the_stencil() {
+    let src = "\
+script
+        CreateClosure Point
+        StaGlobal Point
+        CreateClosure main
+        StaGlobal main
+        LdaGlobal main
+        Star r1
+        CallUndefined r1, r2, 0
+        Return
+end
+function Point(x, y, z)
+        Ldar r1
+        SetNamed r0, x
+        Ldar r2
+        SetNamed r0, y
+        Ldar r3
+        SetNamed r0, z
+        LdaUndefined
+        Return
+end
+function main()                 ; r1 i, r2 total, r4-r8 temps
+        LdaSmi 0
+        Star r1
+        Star r2
+loop:   LdaGlobal Point
+        Star r4
+        Ldar r1
+        Star r5
+        AddSmi 1
+        Star r6
+        AddSmi 1
+        Star r7
+        Construct r4, r5, 3
+        Star r8
+        GetNamed r8, x
+        Add r2
+        Star r2
+        GetNamed r8, y
+        Add r2
+        Star r2
+        GetNamed r8, z
+        Add r2
+        Star r2
+        GetNamed r8, z
+        Add r2
+        Star r2
+        Ldar r1
+        Inc
+        Star r1
+        JumpIfLessSmi 20000, loop
+        Ldar r2
+        Return
+end
+";
+    let (v, s) = jit(src);
+    // Σ i + (i + 1) + 2 (i + 2) = 2n(n - 1) + 5n.
+    assert_eq!(v, (2 * 20000 * 19999 + 5 * 20000).to_string());
+    assert!(s.iter().any(|n| n.starts_with("construct_direct")), "{s:?}");
+}
+
 /// For odd `k`, `R` returns another object (`other`, whose `v` is 1000)
 /// instead of `this`: that is the result of `new`, called directly. Its
 /// shape isn't `this`'s, so the result's check fails, and the call is

@@ -135,6 +135,7 @@ unsafe extern "C" {
     fn toi_rt_call();
     fn toi_rt_enter();
     fn toi_rt_construct();
+    fn toi_rt_construct_done();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -154,7 +155,7 @@ unsafe extern "C" {
 ///   operands.
 #[cfg(target_arch = "x86_64")]
 macro_rules! rt_call {
-    ($s:ident, $f:ident, $a:expr, $b:expr $(, $clobber:tt)*) => {{
+    ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {{
         let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
         let [mut g0, mut g1, mut g2, mut g3, mut g4, mut g5] = $s.g.map(Value::to_bits);
         let [mut f0, mut f1, mut f2, mut f3, mut f4, mut f5, mut f6] = $s.f;
@@ -174,7 +175,7 @@ macro_rules! rt_call {
             out("r10") _,
             out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
             out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
-            $(out($clobber) _,)*
+            $($($extra)*)?
         );
         $s.g = [g0, g1, g2, g3, g4, g5].map(Value::from_bits);
         $s.f = [f0, f1, f2, f3, f4, f5, f6];
@@ -185,7 +186,7 @@ macro_rules! rt_call {
 
 #[cfg(target_arch = "aarch64")]
 macro_rules! rt_call {
-    ($s:ident, $f:ident, $a:expr, $b:expr $(, $clobber:tt)*) => {{
+    ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {{
         let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
         let [g0, g1, g2, g3, g4, mut g5, mut g6, mut g7, mut g8, mut g9, mut g10, mut g11] =
             $s.g.map(Value::to_bits);
@@ -208,7 +209,7 @@ macro_rules! rt_call {
             out("v20") _, out("v21") _, out("v22") _, out("v23") _,
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-            $(out($clobber) _,)*
+            $($($extra)*)?
         );
         $s.g = [g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11].map(Value::from_bits);
         $s.f = [f0, f1, f2, f3, f4, f5, f6];
@@ -2149,7 +2150,8 @@ stencil!("call"; |s| {
 });
 
 /// The part of a call site (`jit::CallSite`, `repr(C)`) that `call_direct`
-/// reads. Offsets are in bytes from the caller's registers.
+/// and `construct_direct` read. Offsets are in bytes from the caller's
+/// registers.
 #[repr(C)]
 struct DirectSite {
     /// The callee's compiled entry; 0: call through the runtime.
@@ -2160,55 +2162,126 @@ struct DirectSite {
     /// Where the callee's compiled frame ends: before `stack_end`.
     end_off: u64,
     stack_end: u64,
+    native_limit: u64,
+    this_shape: u64,
+    /// For `new`: how to allocate `this` (null if not a direct `new`).
+    ctor: *mut CtorAlloc,
+}
+
+/// `jit::CtorSite`: how `construct_direct` allocates `this`.
+#[repr(C)]
+struct CtorAlloc {
+    /// The VM heap's free space: next word, end.
+    heap: *mut [*mut u64; 2],
+    proto_at: *const u64,
+    proto: u64,
+    cap_at: *const u32,
+    cap: u64,
+    slots: u64,
+    this_off: u64,
+    done_shape: u64,
+    header: [u64; 6],
+}
+
+/// `rt_call!` to `toi_rt_enter`, whose wrapper (`arch::enter_wrapper` in
+/// `src/jit.rs`) passes the tag and `ctx` registers on to the callee and
+/// doesn't preserve `acc`'s. So they must hold the tag and `ctx` at the
+/// call: LLVM otherwise only keeps them across it, free to use them in
+/// between (and `construct_direct` does).
+#[cfg(target_arch = "x86_64")]
+macro_rules! rt_call_enter {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+        let tag: u64 = core::mem::transmute($s.tag);
+        rt_call!($s, $f, $a, $b; out("r12") _, in("r14") tag, in("r15") $s.ctx,)
+    }};
+}
+#[cfg(target_arch = "aarch64")]
+macro_rules! rt_call_enter {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+        let tag: u64 = core::mem::transmute($s.tag);
+        rt_call!($s, $f, $a, $b; out("x20") _, in("x22") tag, in("x23") $s.ctx,)
+    }};
 }
 
 // A call straight into the callee's compiled code (`toi_rt_enter`, which
 // checks the native stack), whose frame the compiled code has set up, if
 // the call site (`DirectSite` at `imm64`) has an entry, the callee
 // register holds the function compiled, and the VM stack has room;
-// otherwise through the runtime, as `call`. Leave after it as `call` does.
-//
-// `construct_direct` is the same for `new`, entering through
-// `toi_rt_construct`, which allocates `this` first.
-/// `rt_call!` to `toi_rt_enter`, whose wrapper doesn't preserve `acc`'s
-/// register (see `arch::enter_wrapper` in `src/jit.rs`).
-#[cfg(target_arch = "x86_64")]
-macro_rules! rt_call_enter {
-    ($s:ident, $f:ident, $a:expr, $b:expr) => {
-        rt_call!($s, $f, $a, $b, "r12")
+// otherwise through the runtime, as `call`. Leave after it as `call` does
+// (`imm64b` is the code's epoch, which must still be `imm`).
+stencil!("call_direct"; |s| {
+    let regs = Value::from_bits(s.regs as u64);
+    let site = imm64() as *const DirectSite;
+    let base = s.regs as *const u8;
+    let r = if (*site).entry != 0
+        && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
+        && base as u64 + (*site).end_off <= (*site).stack_end
+    {
+        Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))
+    } else {
+        Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
     };
-}
-#[cfg(target_arch = "aarch64")]
-macro_rules! rt_call_enter {
-    ($s:ident, $f:ident, $a:expr, $b:expr) => {
-        rt_call!($s, $f, $a, $b, "x20")
-    };
-}
+    s.acc = r;
+    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+        exit!(s)
+    }
+    next!(s)
+});
 
-macro_rules! direct_call {
-    ($name:literal, $enter:ident) => {
-        stencil!($name; |s| {
-            let regs = Value::from_bits(s.regs as u64);
-            let site = imm64() as *const DirectSite;
-            let base = s.regs as *const u8;
-            let r = if (*site).entry != 0
-                && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
-                && base as u64 + (*site).end_off <= (*site).stack_end
-            {
-                Value::from_bits(rt_call_enter!(s, $enter, regs, Value::from_bits(site as u64)))
-            } else {
-                Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
-            };
-            s.acc = r;
-            if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-                exit!(s)
+// `new`, as `call_direct`, allocating `this` itself: if what the
+// constructor's root shape depends on is unchanged and the heap's chunk
+// has room, bump the heap, write the header and `undefined` slots, put
+// `this` in the callee's frame and enter. The result is the
+// constructor's, if an object, else `this`, after `construct_done`
+// (`toi_rt_construct_done`) unless that has nothing to do for its shape.
+// Otherwise `toi_rt_construct` allocates and enters.
+stencil!("construct_direct"; |s| {
+    let regs = Value::from_bits(s.regs as u64);
+    let site = imm64() as *const DirectSite;
+    let base = s.regs as *const u8;
+    let r = if (*site).entry != 0
+        && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
+        && base as u64 + (*site).end_off <= (*site).stack_end
+    {
+        let c = (*site).ctor;
+        let heap = (*c).heap;
+        let p = (*heap)[0];
+        let words = 6 + (*c).slots as usize;
+        if *(*c).proto_at == (*c).proto
+            && *(*c).cap_at as u64 == (*c).cap
+            && (*heap)[1] as usize - p as usize >= 8 * words
+        {
+            (*heap)[0] = p.add(words);
+            for k in 0..6 {
+                *p.add(k) = (*c).header[k];
             }
-            next!(s)
-        });
+            // Volatile: vectorized, the loop would load its constant from
+            // a pool, outside the stencil.
+            for k in 6..words {
+                p.add(k).write_volatile(Value::UNDEFINED.to_bits());
+            }
+            *(base.add((*c).this_off as usize) as *mut u64) = p as u64;
+            let v = Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)));
+            if v.to_bits() == 0 || v.is_cell() {
+                v
+            } else {
+                if *p != (*c).done_shape {
+                    rt_call!(s, toi_rt_construct_done, Value::from_bits(site as u64), Value::from_bits(p as u64));
+                }
+                Value::from_bits(p as u64)
+            }
+        } else {
+            Value::from_bits(rt_call!(s, toi_rt_construct, regs, Value::from_bits(site as u64)))
+        }
+    } else {
+        Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
     };
-}
-direct_call!("call_direct", toi_rt_enter);
-direct_call!("construct_direct", toi_rt_construct);
+    s.acc = r;
+    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+        exit!(s)
+    }
+    next!(s)
+});
 
 // Before an inlined call: the callee must be the function inlined
 // (`imm64`), or leave before the call.

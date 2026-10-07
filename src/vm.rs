@@ -70,6 +70,16 @@ pub struct Ic {
 
 const _: () = assert!(size_of::<Ic>() == 32);
 
+/// An elements' type code (`Shape::elems_code`) that no value fits: not a
+/// type code (0–2) nor a shape's address.
+pub const NO_ELEMENTS: u64 = 3;
+
+/// A property key: an element index or a name.
+enum Key {
+    Index(u32),
+    Name(Atom),
+}
+
 /// `Ic::loc` of a `GetNamed` that read an array's `length`.
 pub const LENGTH_LOC: i32 = i32::MIN;
 const _: fn(u64, Value) -> bool = field_fits;
@@ -271,12 +281,17 @@ impl Vm {
 
         let fp = object_value(vm.function_prototype);
         let root = vm.root_shape(Class::Function, fp, 2);
-        vm.function_shape = vm.transition(root, vm.a_prototype);
+        // Functions' `prototype` and prototypes' `constructor` aren't
+        // enumerable.
+        vm.function_shape = vm.transition_with(root, vm.a_prototype, DONT_ENUM);
         let root = vm.root_shape(Class::Plain, op, INITIAL_CTOR_CAPACITY);
-        vm.proto_object_shape = vm.transition(root, vm.a_constructor);
+        vm.proto_object_shape = vm.transition_with(root, vm.a_constructor, DONT_ENUM);
 
         vm.array_shape = vm.root_shape(Class::Array, object_value(vm.array_prototype), 0);
         vm.string_shape = vm.root_shape(Class::String, object_value(vm.string_prototype), 0);
+        // No value fits a string's "elements" (its code units): element
+        // stores' fast paths never take one.
+        unsafe { (*vm.string_shape.cast_mut()).elems_code = NO_ELEMENTS };
         let ap = vm.array_prototype;
         vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
         vm.define_native(ap, "pop", array_pop, 0, crate::jit::Ty::Any, false);
@@ -295,7 +310,12 @@ impl Vm {
         ] {
             let c = vm.define_native(g, name, f, 0, crate::jit::Ty::Any, true);
             let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-            vm.add_property(c, a_p, object_value(proto));
+            vm.add_property_with(
+                c,
+                a_p,
+                object_value(proto),
+                READ_ONLY | DONT_ENUM | DONT_DELETE,
+            );
             // Not enumerable, as the builtins' properties.
             vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
             if name == "Object" {
@@ -358,13 +378,8 @@ impl Vm {
         s
     }
 
-    /// `shape` plus property `name`. Shared shapes share transitions;
-    /// unique shapes get a fresh unique successor.
-    pub(crate) fn transition(&mut self, shape: *const Shape, name: Atom) -> *const Shape {
-        self.transition_with(shape, name, 0)
-    }
-
-    /// `shape` plus property `name` with attributes `attrs`.
+    /// `shape` plus property `name` with attributes `attrs`. Shared shapes
+    /// share transitions; unique shapes get a fresh unique successor.
     pub(crate) fn transition_with(
         &mut self,
         shape: *const Shape,
@@ -823,18 +838,30 @@ impl Vm {
 
     // ---- Elements ----
 
-    fn index(key: Value) -> Result<u32> {
+    /// What `o[key]` accesses: an element, for an array index (a number,
+    /// or its canonical string, below 2^32 - 1), else the property named
+    /// by the key's string.
+    fn property_key(&mut self, key: Value) -> Key {
         if key.is_int32() && key.as_i32_unchecked() >= 0 {
-            return Ok(key.as_i32_unchecked() as u32);
+            return Key::Index(key.as_i32_unchecked() as u32);
         }
         if let Some(d) = key.as_number()
             && d >= 0.0
             && d < u32::MAX as f64
             && d.fract() == 0.0
+            && !(d == 0.0 && d.is_sign_negative())
         {
-            return Ok(d as u32);
+            return Key::Index(d as u32);
         }
-        Err(Error::unsupported(format!("property key {key:?}")))
+        let units = crate::interp::to_string_units(key);
+        let name = String::from_utf16_lossy(&units);
+        if let Ok(i) = name.parse::<u32>()
+            && i != u32::MAX
+            && i.to_string() == name
+        {
+            return Key::Index(i);
+        }
+        Key::Name(self.intern(&name))
     }
 
     /// `GetKeyed` miss: remember the receiver's shape (for the JIT: its
@@ -846,7 +873,8 @@ impl Vm {
         obj: Value,
         key: Value,
     ) -> Result<Value> {
-        if obj.is_cell() {
+        // A string's elements are code units, not values: never cached.
+        if obj.is_cell() && unsafe { (*as_object(obj)).class } != Class::String {
             let (ic, _) = code.ic(ic);
             unsafe {
                 *ic = Ic {
@@ -868,11 +896,22 @@ impl Vm {
             }
             return Ok(Value::UNDEFINED);
         }
-        let i = Self::index(key)?;
+        let i = match self.property_key(key) {
+            Key::Index(i) => i,
+            Key::Name(a) => return self.get(obj, a),
+        };
         let mut o = as_object(obj);
+        // A string's index is its code unit there, as a string.
+        if let Some(u) = string_units(obj) {
+            if (i as usize) < u.len() {
+                let c = [u[i as usize]];
+                return Ok(self.string_constant(&c));
+            }
+            o = self.string_prototype;
+        }
         loop {
             unsafe {
-                if i < (*o).elems_len {
+                if i < (*o).elems_len && (*o).class != Class::String {
                     let v = *(*o).elems.add(i as usize);
                     if v != Value::EMPTY {
                         return Ok(v);
@@ -897,9 +936,16 @@ impl Vm {
             }
             return Ok(());
         }
-        let i = Self::index(key)?;
+        let i = match self.property_key(key) {
+            Key::Index(i) => i,
+            Key::Name(a) => return self.set(obj, a, value),
+        };
         let o = as_object(obj);
         unsafe {
+            // A string's characters can't be changed.
+            if (*o).class == Class::String {
+                return Ok(());
+            }
             if i >= (*o).elems_len {
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
@@ -940,6 +986,57 @@ impl Vm {
             }
             object_value(self.heap.alloc_object(&*(*ic).shape))
         }
+    }
+
+    /// `for … in`'s keys of `v`, as an array of strings: indices (of an
+    /// array's elements or a string's code units) in order, then each
+    /// object's enumerable properties in insertion order, from `v` up its
+    /// prototype chain. A name seen once (even not enumerable) hides it
+    /// further up. Null and undefined have none.
+    pub fn for_in_keys(&mut self, v: Value) -> Value {
+        let mut names: Vec<Vec<u16>> = Vec::new();
+        if v.is_cell() {
+            let mut seen: Vec<Atom> = Vec::new();
+            let mut o = as_object(v);
+            unsafe {
+                if matches!((*o).class, Class::Array | Class::String) {
+                    let n = (*o).elems_len as usize;
+                    for i in 0..n {
+                        let hole = (*o).class == Class::Array && *(*o).elems.add(i) == Value::EMPTY;
+                        if !hole {
+                            names.push(i.to_string().encode_utf16().collect());
+                        }
+                    }
+                }
+                loop {
+                    let s = &*(*o).shape;
+                    for (k, &name) in s.keys.iter().enumerate() {
+                        if seen.contains(&name) {
+                            continue;
+                        }
+                        seen.push(name);
+                        if s.attrs[k] & DONT_ENUM == 0 {
+                            names.push(self.atom_name(name).encode_utf16().collect());
+                        }
+                    }
+                    if !s.proto.is_cell() {
+                        break;
+                    }
+                    o = as_object(s.proto);
+                }
+            }
+        }
+        let a = self.new_array();
+        let o = as_object(a);
+        unsafe {
+            self.reserve_elems(o, names.len());
+            for (i, n) in names.iter().enumerate() {
+                let s = self.string_constant(n);
+                self.store_element(o, i, s);
+            }
+            (*o).elems_len = names.len() as u32;
+        }
+        a
     }
 
     // ---- Strings ----
@@ -1024,7 +1121,8 @@ impl Vm {
         let fo = self.new_object_with(Class::Native, fp, 0);
         unsafe { (*fo).code = code };
         let a = self.intern(name);
-        self.add_property(obj, a, object_value(fo));
+        // Builtins' methods aren't enumerable.
+        self.add_property_with(obj, a, object_value(fo), DONT_ENUM);
         fo
     }
 

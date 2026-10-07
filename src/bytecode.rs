@@ -163,6 +163,9 @@ define_ops! {
     CreateArray(),
     /// `acc = constants[k]`: a string, or a number that isn't an int32.
     LdaConstant(Const),
+    /// `acc` = the enumerable property names of `acc` (an array of
+    /// strings): `for … in`'s keys.
+    ForInKeys(),
     /// `acc = {}`: a plain object with room for `n` properties in itself
     /// (a literal's count), whose shape the inline cache keeps.
     CreateObject(Count, AutoIc),

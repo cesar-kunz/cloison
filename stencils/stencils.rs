@@ -131,6 +131,7 @@ unsafe extern "C" {
     fn toi_rt_compare();
     fn toi_rt_create_array();
     fn toi_rt_create_object();
+    fn toi_rt_for_in_keys();
     fn toi_rt_sub();
     fn toi_rt_mul();
     fn toi_rt_div();
@@ -2842,6 +2843,13 @@ macro_rules! value_test_slot {
 }
 with_gprs!(each_gpr! value_test_slot);
 
+// `ForInKeys`: `for … in`'s keys of a boxed `acc`, from the runtime (the
+// VM's address is the 64-bit immediate).
+stencil!("for_in_keys"; |s| {
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_for_in_keys, Value::from_bits(imm64()), s.acc));
+    next!(s)
+});
+
 // `LdaConstant`: the constant's bits are the 64-bit immediate (`_f`: a
 // double's, into `facc`).
 stencil!("lda_constant"; |s| {
@@ -3127,8 +3135,11 @@ macro_rules! property_location {
         // `_i`: the key is known to be an int32. `_nc`: the receiver is
         // known to be an object; `_sh`: its shape must be `imm64` (the
         // elements' type comes with it).
-        keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell(s.tag, o));
-        keyed_load!($loc, "get_keyed_", false, |s, o| is_cell(s.tag, o));
+        // Not a string (class 4, at byte 8): its elements are code units.
+        keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell(s.tag, o)
+            && *(o.to_bits() as *const u8).add(8) != 4);
+        keyed_load!($loc, "get_keyed_", false, |s, o| is_cell(s.tag, o)
+            && *(o.to_bits() as *const u8).add(8) != 4);
         keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);
         keyed_load!($loc, "get_keyed_nc_", false, |s, o| true);
         keyed_load!($loc, "get_keyed_i_sh_", true, |s, o| guard_shape(s.tag, o).is_some());

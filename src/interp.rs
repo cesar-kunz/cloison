@@ -956,6 +956,11 @@ handlers! {
         next!(any, Op::CreateObject.size(), o)
     }
 
+    fn op_for_in_keys(pc, acc, regs, tag) {
+        let keys = (*frame_vm(regs)).for_in_keys(acc);
+        next!(any, Op::ForInKeys.size(), keys)
+    }
+
     // Ignores `acc`: also the I32 entry.
     fn op_lda_constant(pc, acc, regs, tag) {
         let code = &*frame_code(regs);
@@ -2296,6 +2301,7 @@ static TABLE: Table = {
     t[Op::CreateArray as usize] = op_create_array;
     t[Op::LdaConstant as usize] = op_lda_constant;
     t[Op::CreateObject as usize] = op_create_object;
+    t[Op::ForInKeys as usize] = op_for_in_keys;
     t[Op::Call as usize] = op_call;
     t[Op::CallUndefined as usize] = op_call_undefined;
     t[Op::Construct as usize] = op_construct;

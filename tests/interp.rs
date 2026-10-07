@@ -1310,10 +1310,12 @@ fn numeric_loop_fuses_compares_with_branches() {
         assert_eq!(v, w);
         assert_eq!((f.stats.compiles, f.stats.exits), (1, 0));
         let s = stencils(&f);
+        // `i` never holds a negative int32: the `_u` forms, without sign
+        // handling (7's magic number shift is 31 + ⌈log2 7⌉).
         let mod_stencil = if modulus == 8 {
-            "mod_smi_pow2_i"
+            "mod_smi_pow2_u"
         } else {
-            "mod_smi_i"
+            "mod_smi_u_s34"
         };
         for want in [mod_stencil, "bit_and_smi_i", "bit_or_smi_i"] {
             assert!(
@@ -1377,6 +1379,100 @@ fn negative_zero_remainder_exits_then_produces_doubles() {
             "{s:?}"
         );
     }
+}
+
+/// `r % 7` for `r` from -40 up, where -40 comes from outside (the
+/// register's value at entry): `r` may be negative, so the remainder
+/// handles the sign (`mod_smi_i_*`, then doubles after -0).
+#[test]
+fn remainders_of_registers_from_outside() {
+    let (r, x, sum) = (0u8, 1u8, 2u8);
+    let mut a = Assembler::new();
+    let top = a.label();
+    a.lda_smi(0).star(sum);
+    a.bind(top);
+    a.ldar(r);
+    emit(&mut a, Op::ModSmi, &[Arg::Imm(7)]);
+    a.star(x).ldar(sum).add(x).star(sum);
+    a.ldar(r).inc().star(r).jump_if_less_smi(40, top);
+    a.ldar(sum).ret();
+    let regs = || [Value::from_i32(-40), Value::UNDEFINED, Value::UNDEFINED];
+    let v = exec(a.clone(), &mut regs());
+    let expect: i32 = (-40..40).map(|r| r % 7).sum();
+    assert_eq!(v.as_number(), Some(expect as f64));
+    let (_, f) = jit(&a, &mut regs());
+    let s = stencils(&f);
+    assert!(!s.iter().any(|n| n.starts_with("mod_smi_u")), "{s:?}");
+}
+
+/// `i` counts up from 0, so `i & 255` and `(i & 255) + 3` aren't negative:
+/// their remainders skip the sign handling (`_u`). `j` is `i`, but -3 when
+/// `i == 5`: its remainder handles the sign (`_i`).
+#[test]
+fn remainders_of_non_negative_values_skip_sign_handling() {
+    let (i, j, x, sum) = (0u8, 1u8, 2u8, 3u8);
+    let mut a = Assembler::new();
+    let (top, other, join) = (a.label(), a.label(), a.label());
+    a.lda_smi(0).star(i).star(sum);
+    a.bind(top);
+    a.ldar(i);
+    emit(&mut a, Op::BitAndSmi, &[Arg::Imm(255)]);
+    a.add_smi(3);
+    emit(&mut a, Op::ModSmi, &[Arg::Imm(10)]);
+    a.star(x).ldar(sum).add(x).star(sum);
+    a.ldar(i);
+    emit(&mut a, Op::TestEqualSmi, &[Arg::Imm(5)]);
+    emit(&mut a, Op::JumpIfFalse, &[Arg::Label(other)]);
+    a.lda_smi(-3).star(j);
+    a.jump(join);
+    a.bind(other);
+    a.ldar(i).star(j);
+    a.bind(join);
+    a.ldar(j);
+    emit(&mut a, Op::ModSmi, &[Arg::Imm(7)]);
+    a.star(x).ldar(sum).add(x).star(sum);
+    a.ldar(i).inc().star(i).jump_if_less_smi(1000, top);
+    a.ldar(sum).ret();
+    let v = exec(a.clone(), &mut [Value::UNDEFINED; 4]);
+    let expect: i32 = (0..1000)
+        .map(|i| ((i & 255) + 3) % 10 + if i == 5 { -3 } else { i % 7 })
+        .sum();
+    assert_eq!(v, Value::from_i32(expect));
+    let (_, f) = jit(&a, &mut [Value::UNDEFINED; 4]);
+    let s = stencils(&f);
+    assert!(s.iter().any(|n| n.starts_with("mod_smi_u_s35")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("mod_smi_i_s34")), "{s:?}");
+}
+
+/// Two values that may be negative though they come from a counter that
+/// isn't: `i + -5`, and `acc` at a join reached both from `Ldar i` and
+/// from a jump with -3 in it. Their remainders handle the sign.
+#[test]
+fn remainders_of_negative_adds_and_joins() {
+    let (i, x, sum) = (0u8, 1u8, 2u8);
+    let mut a = Assembler::new();
+    let (top, minus, rem) = (a.label(), a.label(), a.label());
+    a.lda_smi(0).star(i).star(sum);
+    a.bind(top);
+    a.ldar(i).add_smi(-5);
+    emit(&mut a, Op::ModSmi, &[Arg::Imm(7)]);
+    a.star(x).ldar(sum).add(x).star(sum);
+    a.ldar(i);
+    emit(&mut a, Op::TestEqualSmi, &[Arg::Imm(3)]);
+    emit(&mut a, Op::JumpIfTrue, &[Arg::Label(minus)]);
+    a.ldar(i);
+    a.bind(rem);
+    emit(&mut a, Op::ModSmi, &[Arg::Imm(10)]);
+    a.star(x).ldar(sum).add(x).star(sum);
+    a.ldar(i).inc().star(i).jump_if_less_smi(1000, top);
+    a.ldar(sum).ret();
+    a.bind(minus);
+    a.lda_smi(-3).jump(rem);
+    let v = exec(a.clone(), &mut [Value::UNDEFINED; 3]);
+    let expect: i32 = (0..1000)
+        .map(|i| (i - 5) % 7 + if i == 3 { -3 } else { i % 10 })
+        .sum();
+    assert_eq!(v, Value::from_i32(expect));
 }
 
 #[test]

@@ -164,8 +164,10 @@ struct Index {
 fn index() -> &'static Index {
     static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
     INDEX.get_or_init(|| {
+        // Sized up front: growing rehashes every stencil at each doubling.
+        let concrete = STENCILS.iter().filter(|s| s.template.is_none()).count();
         let mut ix = Index {
-            by_name: HashMap::default(),
+            by_name: HashMap::with_capacity_and_hasher(concrete, Default::default()),
             by_family: HashMap::default(),
         };
         for s in STENCILS {
@@ -1425,6 +1427,9 @@ struct Spec<'a> {
     /// Per instruction: an int32 add whose result only feeds the bitwise
     /// operation right after it, so it may wrap (`(a + b) | 0`).
     wraps: &'a [bool],
+    /// Per instruction: `acc` is never a negative int32 there (see
+    /// [`nonneg_acc`]).
+    nonneg: &'a [bool],
     /// For VM functions: each frame's feedback (property names; see
     /// [`lower`] for frames).
     feedback: Option<&'a [Feedback]>,
@@ -1665,6 +1670,8 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 "mod_smi"
             };
             let (case, ty) = match st.acc {
+                // Never -0: the `_u` forms (see `stencil_for`).
+                I32 if k > 0 && spec.nonneg.get(i).copied().unwrap_or(false) => ("u", I32),
                 I32 if k > 0 => int_op("i", "iif"),
                 _ => ("", Any),
             };
@@ -2005,6 +2012,88 @@ fn assign_homes(
         }
     }
     homes
+}
+
+/// The shift `s` and multiplier `m` with which `mod_smi_{u,i}_s<s>`
+/// compute `a mod d` for 0 <= a < 2^31 and d >= 3 not a power of two: s =
+/// 31 + ⌈log2 d⌉, m = ⌈2^s / d⌉ < 2^32, and q = ⌊a·m / 2^s⌋ = ⌊a / d⌋
+/// (Granlund & Montgomery). With e = m·d - 2^s < d <= 2^(s-31), a·e <
+/// 2^s, so a·m / 2^s exceeds a / d by less than 1/d, short of the next
+/// integer.
+fn mod_magic(d: i32) -> (u32, u64) {
+    debug_assert!(d >= 3 && d & (d - 1) != 0);
+    let s = 31 + (32 - (d as u32 - 1).leading_zeros());
+    (s, (1u64 << s).div_ceil(d as u64))
+}
+
+/// Per instruction, whether `acc` is never a negative int32 there: it
+/// holds a non-negative int32, or no int32 at all. From registers that
+/// never do (all their stores store such values), for registers whose
+/// values don't come from outside (not live at the start: parameters,
+/// `this`, or the caller's registers outside a VM): constants, `Inc` and
+/// adds of a non-negative constant (an int32 overflow leaves int32, it
+/// doesn't wrap, but for the wrapping adds `wraps` marks, which only feed
+/// a bitwise operation), remainders of such, masks with a non-negative
+/// constant, booleans and the other non-numbers. Within straight-line
+/// code: unknown at jump targets. For `ModSmi`, whose `_u` forms need no
+/// sign handling; empty work if there is none.
+fn nonneg_acc(insns: &[Insn], is_target: &[bool], nregs: usize) -> Vec<bool> {
+    let n = insns.len();
+    if !insns.iter().any(|i| i.op == Op::ModSmi && !i.bail) {
+        return vec![false; n];
+    }
+    let start = reg_live_in(insns, &reachable(insns, 0), nregs).swap_remove(0);
+    let mut ok: Vec<bool> = start.iter().map(|&live| !live).collect();
+    loop {
+        let mut acc = vec![false; n];
+        for j in 1..n {
+            let p = &insns[j - 1];
+            if is_target[j] || !p.falls_through() {
+                continue;
+            }
+            acc[j] = match p.op {
+                Op::LdaSmi => p.imm >= 0,
+                Op::LdaUndefined
+                | Op::LdaNull
+                | Op::LdaTrue
+                | Op::LdaFalse
+                | Op::TestLessThan
+                | Op::TestEqual
+                | Op::TestEqualSmi => true,
+                Op::Ldar => ok[p.reg as usize],
+                Op::Inc => acc[j - 1],
+                Op::AddSmi => p.imm >= 0 && acc[j - 1],
+                Op::ModSmi => p.imm > 0 && acc[j - 1],
+                Op::BitAndSmi => p.imm >= 0,
+                // `acc` unchanged.
+                Op::Star
+                | Op::Nop
+                | Op::Mov
+                | Op::JumpIfLess
+                | Op::JumpIfLessSmi
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::JumpIfToBooleanTrue
+                | Op::JumpIfToBooleanFalse => acc[j - 1],
+                _ => false,
+            };
+        }
+        let mut changed = false;
+        for (j, insn) in insns.iter().enumerate() {
+            let (dst, fine) = match insn.op {
+                Op::Star => (insn.reg as usize, acc[j]),
+                Op::Mov => (insn.reg2 as usize, ok[insn.reg as usize]),
+                _ => continue,
+            };
+            if ok[dst] && !fine {
+                ok[dst] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            return acc;
+        }
+    }
 }
 
 /// Instructions reachable from `entry`.
@@ -2420,6 +2509,10 @@ fn stencil_for(
                 box_acc(&mut pre);
             }
             base.into()
+        }
+        // The shift of the divisor's magic number is part of the stencil.
+        ("mod_smi", _) if matches!(sel.case, "u" | "i") => {
+            format!("mod_smi_{}_s{}", sel.case, mod_magic(insn.imm).0)
         }
         (base, _) => format!("{base}_{}", sel.case),
     };
@@ -3198,6 +3291,7 @@ impl JitCode {
                     && matches!(insns[i + 1].op, Op::BitAndSmi | Op::BitOrSmi)
             })
             .collect();
+        let nonneg = nonneg_acc(insns, &is_target, nregs);
         // `this` and the arguments' types at call `i`, in state `st`.
         let call_types = |i: usize, st: &TypeState| {
             let insn = &insns[i];
@@ -3231,6 +3325,7 @@ impl JitCode {
                 reg_live: &live_in,
                 props,
                 wraps: &wraps,
+                nonneg: &nonneg,
                 feedback,
                 rets: &rets,
             };
@@ -3595,12 +3690,16 @@ impl JitCode {
                 Target::Next
             };
             hot.extend(pre);
-            // `mod_smi_pow2` takes the mask, k - 1; the other specialized
-            // `mod_smi` stencils take k and ⌈2^64 / k⌉.
+            // `mod_smi_pow2` takes the mask, k - 1; `mod_smi_{u,i}_s<s>` k
+            // and its magic number (`mod_magic`); `mod_smi_iif` k and
+            // ⌈2^64 / k⌉.
             let (imm, imm64, imm64b) = match (name.as_str(), props.get(i).copied()) {
                 _ if s.ops.is_some() => s.ops.unwrap(),
                 (n, _) if n.starts_with("mod_smi_pow2") => (insn.imm - 1, 0, 0),
-                ("mod_smi_i" | "mod_smi_iif", _) => (insn.imm, u64::MAX / insn.imm as u64 + 1, 0),
+                (n, _) if n.starts_with("mod_smi_u_s") || n.starts_with("mod_smi_i_s") => {
+                    (insn.imm, mod_magic(insn.imm).1, 0)
+                }
+                ("mod_smi_iif", _) => (insn.imm, u64::MAX / insn.imm as u64 + 1, 0),
                 ("bail", _) => (0, 0, 0),
                 (_, Some(Prop::Own { shape, off, .. } | Prop::Oop { shape, off, .. })) => {
                     (off, shape, 0)
@@ -3668,7 +3767,11 @@ impl JitCode {
                     ..Piece::new(name, 0)
                 }
             });
-            if main.uses(Sym::Exit) || check.is_some() {
+            // (An exit in the stencil's `__slow` helper uses the stub too.)
+            let helper_exits = main
+                .slow
+                .is_some_and(|h| h.stencil.relocs.iter().any(|r| r.2 == Sym::Exit));
+            if main.uses(Sym::Exit) || helper_exits || check.is_some() {
                 // `add_smi_i` adds in place; undo it before anything else.
                 let mut seq: Vec<Piece> = Vec::new();
                 if name == "add_smi_i" {
@@ -6071,7 +6174,36 @@ mod tests {
         })
     }
 
-    /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's
+    /// `mod_magic`'s quotients are exact for every dividend below 2^31:
+    /// checked for every divisor up to 5000 and some larger ones, at the
+    /// dividends around each multiple near the ends, and a spread between.
+    #[test]
+    fn mod_magic_is_exact() {
+        let big = [
+            65535,
+            65537,
+            1 << 20 | 1,
+            1_000_000_007,
+            (1 << 30) + 1,
+            i32::MAX,
+        ];
+        for d in (3..5000).chain(big).filter(|d| d & (d - 1) != 0) {
+            let (s, m) = mod_magic(d);
+            assert!(m < 1 << 32, "{d}");
+            let d64 = d as u64;
+            let top = (1u64 << 31) - 1;
+            let near = |q: u64| [q * d64, q * d64 + d64 - 1, q * d64 + 1];
+            let ends = (0..4)
+                .flat_map(near)
+                .chain(((top / d64).saturating_sub(2)..=top / d64).flat_map(near));
+            let spread = (0..2000u64).map(|k| k * 1_073_741 % (top + 1));
+            for a in ends.chain(spread).filter(|&a| a <= top) {
+                assert_eq!((a * m) >> s, a / d64, "{a} / {d}");
+            }
+        }
+    }
+
+    /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's    /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's
     /// lookup and copy, including (on arm64) those rebuilt from a family
     /// template by patching register fields.
     #[test]

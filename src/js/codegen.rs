@@ -261,6 +261,8 @@ struct Target {
     brk: L,
     /// For loops.
     cont: Option<L>,
+    /// A loop or a `switch`: an unlabeled `break` leaves it.
+    breakable: bool,
 }
 
 /// What the accumulator is known to hold, within a basic block.
@@ -520,7 +522,8 @@ impl<'a> Gen<'a> {
                 | Op::JumpIfGreaterEqual
                 | Op::JumpIfLessEqualSmi
                 | Op::JumpIfGreaterSmi
-                | Op::JumpIfGreaterEqualSmi,
+                | Op::JumpIfGreaterEqualSmi
+                | Op::JumpIfStrictEqualSmi,
                 _,
             ) => {}
             _ => self.acc = Acc::default(),
@@ -1349,7 +1352,7 @@ impl<'a> Gen<'a> {
             }
             StmtKind::DoWhile(body, c) => self.looping(labels, Some(c), None, body, false)?,
             StmtKind::ForIn { .. } => return unsupported(s.pos, "`for … in`"),
-            StmtKind::Switch(..) => return unsupported(s.pos, "`switch`"),
+            StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
             StmtKind::Throw(_) => return unsupported(s.pos, "`throw`"),
             StmtKind::Return(e) => {
                 match e {
@@ -1360,9 +1363,10 @@ impl<'a> Gen<'a> {
             }
             StmtKind::Break(label) | StmtKind::Continue(label) => {
                 let brk = matches!(s.kind, StmtKind::Break(_));
-                let target = self.targets.iter().rev().find(|t| match label {
-                    Some(l) => t.labels.contains(l),
-                    None => t.cont.is_some(),
+                let target = self.targets.iter().rev().find(|t| match (label, brk) {
+                    (Some(l), _) => t.labels.contains(l),
+                    (None, true) => t.breakable,
+                    (None, false) => t.cont.is_some(),
                 });
                 let l = match target {
                     Some(t) if brk => t.brk,
@@ -1401,6 +1405,7 @@ impl<'a> Gen<'a> {
                         labels,
                         brk,
                         cont: None,
+                        breakable: false,
                     });
                     self.stmt(body)?;
                     self.targets.pop();
@@ -1409,6 +1414,68 @@ impl<'a> Gen<'a> {
             }
         }
         self.temp = mark;
+        Ok(())
+    }
+
+    /// `switch`: the discriminant in a temporary, then a test of each case
+    /// in order, jumping to its statements (`JumpIfStrictEqualSmi` for an
+    /// int32 literal, which keeps the discriminant in `acc`), then a jump
+    /// to `default` or past the end; the statements follow in order, each
+    /// falling into the next.
+    fn switch(
+        &mut self,
+        labels: Vec<String>,
+        d: &Expr,
+        cases: &'a [(Option<Expr>, Vec<Stmt>)],
+    ) -> R<()> {
+        // A local discriminant tested only against literals can't change
+        // before the jump: its register serves.
+        let literal_tests = cases
+            .iter()
+            .all(|(t, _)| t.as_ref().is_none_or(|t| smi(t).is_some()));
+        let dr = match self.local(d) {
+            Some(r) if literal_tests => r,
+            _ => {
+                self.value(d)?;
+                let t = self.alloc(d.pos)?;
+                self.star(t);
+                t
+            }
+        };
+        let bodies: Vec<L> = cases.iter().map(|_| self.label()).collect();
+        let end = self.label();
+        for ((test, _), &l) in cases.iter().zip(&bodies) {
+            let Some(test) = test else { continue };
+            match smi(test) {
+                Some(k) => {
+                    self.ldar(dr);
+                    self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(k), l);
+                }
+                None => {
+                    self.value(test)?;
+                    self.emit(Op::TestStrictEqual, &[Arg::Reg(dr)]);
+                    self.jump_if(Jmp::True, l);
+                }
+            }
+        }
+        match cases.iter().position(|(t, _)| t.is_none()) {
+            Some(i) => self.jump(bodies[i]),
+            None => self.jump(end),
+        }
+        self.targets.push(Target {
+            labels,
+            brk: end,
+            cont: None,
+            breakable: true,
+        });
+        for ((_, body), &l) in cases.iter().zip(&bodies) {
+            self.bind(l);
+            for s in body {
+                self.stmt(s)?;
+            }
+        }
+        self.targets.pop();
+        self.bind(end);
         Ok(())
     }
 
@@ -1442,6 +1509,7 @@ impl<'a> Gen<'a> {
             labels,
             brk,
             cont: Some(cont),
+            breakable: true,
         });
         self.stmt(body)?;
         self.targets.pop();

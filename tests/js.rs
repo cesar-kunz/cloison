@@ -78,11 +78,11 @@ fn listings_are_what_the_front_end_emits() {
 
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
-    "01", "02", "03", "04", "05", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17",
-    "20", "21", "22", "23", "24", "25", "26", "27", "29", "30", "31", "32", "33", "34", "35", "36",
-    "37", "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62", "63", "64",
-    "65", "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91", "92", "93",
-    "94",
+    "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
+    "17", "20", "21", "22", "23", "24", "25", "26", "27", "29", "30", "31", "32", "33", "34", "35",
+    "36", "37", "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62", "63",
+    "64", "65", "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91", "92",
+    "93", "94",
 ];
 
 #[test]
@@ -266,7 +266,7 @@ fn rejects_what_it_cannot_compile() {
         ("var x = typeof 1;", "Typeof"),
         ("var o = {1: 2};", "the key `1`"),
         ("function f(a, b) { return a % b; }", "`%`"),
-        ("switch (1) {}", "switch"),
+        ("var o = {}; for (var p in o) {}", "for … in"),
     ];
     for (src, what) in unsupported {
         let e = compile_error(src);
@@ -601,5 +601,87 @@ fn define_property_agrees_with_node() {
         ("returnsTarget()", "4"),
     ] {
         assert_eq!(value(&format!("{DEFINE}\n{call};")), want, "{call}");
+    }
+}
+
+/// `switch`: fall-through, `default` first or in the middle, string cases,
+/// a double equal to an int32 case (and `"1"` and -0 against them), case
+/// expressions evaluated in order only until one matches, the discriminant
+/// evaluated once, `break` and `continue` in loops, labeled `break`, nested
+/// and empty switches. The expected values are Node's.
+const SWITCH: &str = r#"
+function fallthrough() {
+  var t = 0, i;
+  for (i = 0; i < 60; i++) {
+    switch (i % 6) {
+      case 0: t += 1;
+      case 1: t += 10; break;
+      default: t += 100;
+      case 4: t += 1000; break;
+      case 5:
+    }
+  }
+  return t;
+}
+function defaultFirst() {
+  var t = 0, i;
+  for (i = 0; i < 30; i++) {
+    switch (i % 5) { default: t += 7; break; case 2: t += 2; case 3: t += 3; }
+  }
+  return t;
+}
+function strings() {
+  var ws = ["a", "b", "c", "ab"], t = "", i;
+  for (i = 0; i < 8; i++) {
+    switch (ws[i % 4]) { case "a": t += "A"; break; case "a" + "b": t += "X"; break; case "c": t += "C"; break; default: t += "?"; }
+  }
+  return t;
+}
+function numbers() {
+  var vs = [1, 2.5, 5 / 5, "1", 0 * -1, 0, null, undefined], t = 0, i;
+  for (i = 0; i < 80; i++) {
+    switch (vs[i % 8]) { case 0: t += 1; break; case 1: t += 10; break; case 2.5: t += 100; break; case null: t += 1000; break; default: t += 10000; }
+  }
+  return t;
+}
+var log = 0, evals = 0;
+function c(k) { log = log * 10 + k; return k; }
+function d(v) { evals++; return v; }
+function lazyCases() {
+  var hits = 0, i;
+  log = 0;
+  for (i = 0; i < 4; i++) {
+    switch (i) { case c(1): hits += 1; break; case c(2): hits += 2; break; case c(3): hits += 3; }
+  }
+  return log + "/" + hits;
+}
+function onceAndControl() {
+  var t = 0, i, j;
+  evals = 0;
+  outer: for (i = 0; i < 10; i++) {
+    switch (d(i % 4)) {
+      case 0: continue;
+      case 1: for (j = 0; j < 5; j++) { if (j == 2) break; t += 1; } break;
+      case 2: switch (i) { case 2: t += 100; break; default: t += 1000; } break;
+      case 3: if (i > 6) break outer; t += 10;
+    }
+    t += 10000;
+  }
+  switch (t) {}
+  return evals + "/" + t;
+}
+"#;
+
+#[test]
+fn switch_agrees_with_node() {
+    for (call, want) in [
+        ("fallthrough()", "32210"),
+        ("defaultFirst()", "174"),
+        ("strings()", "A?CXA?CX"),
+        ("numbers()", "211220"),
+        ("lazyCases()", "123112123/6"),
+        ("onceAndControl()", "8/51114"),
+    ] {
+        assert_eq!(value(&format!("{SWITCH}\n{call};")), want, "{call}");
     }
 }

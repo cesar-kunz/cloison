@@ -76,6 +76,27 @@ pub struct Object {
 pub const INLINE_BASE: usize = size_of::<Object>();
 const _: () = assert!(INLINE_BASE == 48);
 
+/// A new object's header, as words: `shape`, external, nothing out of
+/// line. (`Object` has no padding, so every byte is defined.)
+pub fn object_header(shape: &Shape) -> [u64; INLINE_BASE / 8] {
+    let mut h = [0u64; INLINE_BASE / 8];
+    unsafe {
+        h.as_mut_ptr().cast::<Object>().write(Object {
+            shape,
+            class: shape.class,
+            flags: EXTERNAL,
+            _pad: 0,
+            props_cap: 0,
+            props: std::ptr::null_mut(),
+            elems: std::ptr::null_mut(),
+            elems_len: 0,
+            elems_cap: 0,
+            code: std::ptr::null(),
+        });
+    }
+    h
+}
+
 impl Object {
     /// The slot at `loc` (see [`Shape::location`]).
     ///
@@ -244,10 +265,15 @@ pub fn object_value(o: *mut Object) -> Value {
 /// are mapped 2 MiB-aligned and marked for transparent huge pages, one
 /// fault per 2 MiB where the kernel has them, and each doubles the heap, up
 /// to [`MAX_CHUNK`].
+///
+/// Compiled code allocates too (`construct_direct`), bumping `ptr` while
+/// it stays within `end`: they come first, in that order (see
+/// [`Heap::bump`]).
+#[repr(C)]
 pub struct Heap {
-    chunks: Vec<Chunk>,
     ptr: *mut u64,
     end: *mut u64,
+    chunks: Vec<Chunk>,
 }
 
 const CHUNK_WORDS: usize = 1 << 16;
@@ -304,6 +330,11 @@ impl Default for Heap {
 }
 
 impl Heap {
+    /// Where compiled code finds the free space: `ptr`, then `end`.
+    pub(crate) fn bump(&mut self) -> *mut [*mut u64; 2] {
+        (&raw mut self.ptr).cast()
+    }
+
     #[inline]
     pub fn alloc_words(&mut self, n: usize) -> *mut u64 {
         if (self.end as usize - self.ptr as usize) / 8 < n {
@@ -352,18 +383,8 @@ impl Heap {
         let words = INLINE_BASE / 8 + shape.capacity as usize;
         let o = self.alloc_words(words).cast::<Object>();
         unsafe {
-            o.write(Object {
-                shape,
-                class: shape.class,
-                flags: EXTERNAL,
-                _pad: 0,
-                props_cap: 0,
-                props: std::ptr::null_mut(),
-                elems: std::ptr::null_mut(),
-                elems_len: 0,
-                elems_cap: 0,
-                code: std::ptr::null(),
-            });
+            o.cast::<[u64; INLINE_BASE / 8]>()
+                .write(object_header(shape));
             for i in 0..shape.capacity as usize {
                 Object::inline(o, i).write(Value::UNDEFINED);
             }

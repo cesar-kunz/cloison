@@ -311,6 +311,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_call" => toi_rt_call as *const () as usize,
         "toi_rt_enter" => toi_rt_enter as *const () as usize,
         "toi_rt_construct" => toi_rt_construct as *const () as usize,
+        "toi_rt_construct_done" => toi_rt_construct_done as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
         "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
@@ -4077,6 +4078,8 @@ pub(crate) struct CallSite {
     /// For `new`: the shape `this` is allocated with, which the callee's
     /// version is bound for (0 if none is known).
     this_shape: u64,
+    /// For a direct `new`: what `construct_direct` allocates `this` with.
+    ctor: Option<Box<CtorSite>>,
     vm: *mut crate::vm::Vm,
     op: Op,
     f: usize,
@@ -4107,6 +4110,35 @@ pub(crate) struct CallSite {
     /// Claimed, but the callee was being compiled (mutual recursion): bind
     /// at a call ([`toi_rt_call`]).
     pending: bool,
+}
+
+/// How `construct_direct` allocates `this` for a direct `new` (read by the
+/// stencil as `CtorAlloc`): from the VM heap's free space, with the root
+/// shape the callee's version is bound for (`CallSite::this_shape`), as
+/// long as what that root depends on (`Vm::ctor_root`) is unchanged: the
+/// constructor's `prototype` slot and its objects' in-object capacity.
+/// Otherwise, or when the heap's chunk is full, `toi_rt_construct`
+/// allocates.
+#[repr(C)]
+struct CtorSite {
+    /// The heap's `ptr` and `end` (`Heap::bump`).
+    heap: *mut [*mut u64; 2],
+    /// The constructor's `prototype` slot, and its value then.
+    proto_at: *const u64,
+    proto: u64,
+    /// The constructor's `Code::ctor_capacity`, and its value then.
+    cap_at: *const u32,
+    cap: u64,
+    /// In-object slots of the shape, set to `undefined`.
+    slots: u64,
+    /// Where `this` goes: the callee frame's `r0`, in bytes from the
+    /// caller's registers.
+    this_off: u64,
+    /// A shape for which `Vm::construct_done` has nothing to do: the
+    /// constructor's objects end with it (see `toi_rt_construct_done`).
+    done_shape: u64,
+    /// The header of `this`.
+    header: [u64; crate::object::INLINE_BASE / 8],
 }
 
 /// Exits of a direct callee before its call site stops calling directly.
@@ -4468,6 +4500,7 @@ impl Lowering<'_> {
                         stack_end: unsafe { (*vm).stack_end } as u64,
                         native_limit: unsafe { &raw const (*vm).native_limit },
                         this_shape: 0,
+                        ctor: None,
                         vm,
                         op: i.op,
                         f: i.reg as usize,
@@ -4560,7 +4593,25 @@ impl Lowering<'_> {
         // A constructor's `this` is allocated by the call
         // (`toi_rt_construct`), with the shape its root has now.
         if i.op == Op::Construct {
-            site.this_shape = unsafe { (*self.state.vm).ctor_root(fo) } as u64;
+            unsafe {
+                let vm = &mut *self.state.vm;
+                let shape = vm.ctor_root(fo);
+                site.this_shape = shape as u64;
+                let proto_at = Object::inline(fo, 0).cast::<u64>();
+                let cap_at = (*callee).ctor_capacity.as_ptr();
+                site.ctor = Some(Box::new(CtorSite {
+                    heap: vm.heap.bump(),
+                    proto_at,
+                    proto: *proto_at,
+                    cap_at,
+                    cap: *cap_at as u64,
+                    slots: (*shape).capacity as u64,
+                    // Set when the frame is placed.
+                    this_off: 0,
+                    done_shape: 0,
+                    header: crate::object::object_header(&*shape),
+                }));
+            }
         }
         site.self_call = callee == self.state.root && i.op != Op::Construct;
         site.closure = fo as u64;
@@ -4783,6 +4834,9 @@ impl Lowering<'_> {
                 self.out.insns[d.call].reg2 += base as u8;
                 site.frame = base;
                 site.w = self.out.insns[d.call].reg2 as usize;
+                if let Some(c) = &mut site.ctor {
+                    c.this_off = 8 * base as u64;
+                }
             } else {
                 for &k in &d.stores {
                     // The `Ldar` / `LdaUndefined` before each store too.
@@ -5763,7 +5817,8 @@ impl EnterConsts {
     }
 }
 
-/// `construct_direct` stencils, once their checks passed: `new` of the
+/// `construct_direct` stencils, once their checks passed, when they can't
+/// allocate `this` themselves (see [`CtorSite`]): `new` of the
 /// callee of `site` (a `CallSite`), whose frame the compiled frame `regs`
 /// has set up but for `this`. Allocate `this`, and if it has the shape the
 /// callee's version was bound for, enter that (`toi_rt_enter`); otherwise
@@ -5771,10 +5826,10 @@ impl EnterConsts {
 /// go through the runtime, from now on. The result is the constructor's,
 /// if an object, else `this`. `EMPTY` on an error.
 ///
-/// The frame isn't marked as a `new` one: this function keeps `this` and
-/// makes the result, also after an exit (the interpreter finishes the
-/// frame as a plain call) and after a self tail call reused the frame
-/// (whose `this` is then the tail call's).
+/// The frame isn't marked as a `new` one: this function (or the stencil)
+/// keeps `this` and makes the result, also after an exit (the interpreter
+/// finishes the frame as a plain call) and after a self tail call reused
+/// the frame (whose `this` is then the tail call's).
 extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
     unsafe {
         let s = site.to_bits() as *mut CallSite;
@@ -5795,6 +5850,28 @@ extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
             crate::vm::Vm::construct_done(&*(*s).callee, o);
             this
         }
+    }
+}
+
+/// `construct_direct` stencils, after a constructor they allocated `this`
+/// for returned it: `Vm::construct_done`. If that will have nothing to
+/// do for objects of `this`'s shape from now on (their keys fit the
+/// capacity, which only grows, and the constructor's result is that
+/// shape or already several), the stencil skips the call for that shape.
+extern "C" fn toi_rt_construct_done(site: Value, this: Value) -> u64 {
+    unsafe {
+        let s = &mut *(site.to_bits() as *mut CallSite);
+        let o = crate::object::as_object(this);
+        let code = &*s.callee;
+        crate::vm::Vm::construct_done(code, o);
+        let shape = (*o).shape;
+        let seen = code.ctor_result.get();
+        if (*shape).keys.len() as u32 <= code.ctor_capacity.get()
+            && (seen == shape || seen == crate::vm::MANY_SHAPES)
+        {
+            s.ctor.as_mut().unwrap().done_shape = shape as u64;
+        }
+        0
     }
 }
 

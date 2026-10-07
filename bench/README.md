@@ -64,6 +64,10 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   the last record. Speed comes first, but size is tracked: a small
   speedup for a large size increase is worth reconsidering.
 
+- `scripts/jit-profile.sh <listing>` profiles where compiled code spends
+  its cycles, per stencil piece (`TOI_PERF_MAP=1` makes the JIT name
+  every piece in `/tmp/perf-<pid>.map`, which `perf report` reads too).
+
 - Hand-written bytecode for some of these files is in
   [bytecode/](bytecode/), with the conventions a compiler should follow.
   toi runs it already (`--engine target/release/toi bench/bytecode/*.asm`).

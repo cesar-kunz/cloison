@@ -3773,7 +3773,7 @@ impl JitCode {
             .collect();
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
         let mut tramp_at: HashMap<u8, usize> = HashMap::default();
-        let mut wrappers: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut wrappers: Vec<(usize, Vec<u8>, &str)> = Vec::new();
         let all_stencils = hot
             .iter()
             .chain(stubs.iter().flatten())
@@ -3793,7 +3793,7 @@ impl JitCode {
                     };
                     let at = pos;
                     pos += code.len().next_multiple_of(8);
-                    wrappers.push((at, code));
+                    wrappers.push((at, code, name));
                     at
                 });
             }
@@ -3803,8 +3803,42 @@ impl JitCode {
         let mut mem = ExecMem::new(pos);
         let base = mem.ptr as u64;
         let buf = mem.bytes();
-        for (at, code) in &wrappers {
+        for (at, code, _) in &wrappers {
             buf[*at..*at + code.len()].copy_from_slice(code);
+        }
+        // Profiling: with `TOI_PERF_MAP` set, name every piece in
+        // `/tmp/perf-<pid>.map`, so `perf report` shows time per stencil.
+        if std::env::var_os("TOI_PERF_MAP").is_some() {
+            let mut map = String::new();
+            let mut sym = |at: usize, len: usize, name: &str| {
+                map.push_str(&format!("{:x} {len:x} jit:{name}\n", base as usize + at));
+            };
+            for (p, &at) in hot.iter().zip(&hot_at) {
+                sym(at, p.len(), p.stencil.stencil.name);
+            }
+            for (pieces, ats) in stubs
+                .iter()
+                .zip(&stub_ats)
+                .chain(exits.iter().map(|(_, s)| s).zip(&exit_ats))
+            {
+                for (p, &at) in pieces.iter().zip(ats) {
+                    sym(at, p.len(), &format!("cold:{}", p.stencil.stencil.name));
+                }
+            }
+            for &(_, h, at) in &helper_list {
+                sym(at, h.stencil.code.len(), h.stencil.name);
+            }
+            for (at, code, name) in &wrappers {
+                sym(*at, code.len(), &format!("wrapper:{name}"));
+            }
+            use std::io::Write;
+            let path = format!("/tmp/perf-{}.map", std::process::id());
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            f.write_all(map.as_bytes()).unwrap();
         }
 
         let resolve = |t: Target, next: usize| match t {

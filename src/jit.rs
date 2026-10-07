@@ -4116,7 +4116,7 @@ struct Lowering<'a> {
 /// - `Mov a, b` becomes `Ldar a; Star b` when `acc` is dead after it
 ///   (compilers emit it to set up calls), else a bail.
 /// - A `Call` or `CallUndefined` whose cache names a small bytecode function
-///   (not already being inlined, within [`MAX_INLINE_DEPTH`] and
+///   (not inlined twice in one chain, within [`MAX_INLINE_DEPTH`] and
 ///   [`MAX_INLINE_INSNS`]) is inlined: a guard that the callee register
 ///   holds that function (`check_callee`), moves of `this` and the
 ///   arguments into the callee's registers (missing ones and locals
@@ -4487,11 +4487,16 @@ impl Lowering<'_> {
             return None;
         }
         let callee = unsafe { (*fo).code };
-        // Not recursively.
+        // Recursively only one level deep: below that, calls to it are
+        // direct (to the code being compiled, for this function).
+        let mut seen = false;
         let mut g = frame;
         loop {
             if self.out.frames[g].code == callee {
-                return None;
+                if seen {
+                    return None;
+                }
+                seen = true;
             }
             if g == 0 {
                 break;

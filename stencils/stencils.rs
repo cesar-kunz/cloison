@@ -387,6 +387,41 @@ fn imm16() -> i32 {
     k as u32 as i32
 }
 
+/// The first 64-bit immediate when the JIT knows it fits 32 bits:
+/// `mov r32, imm32` (zero-extending; an `R_X86_64_32` relocation).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn imm64_u32() -> u64 {
+    let k: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {k:e}, offset {s}",
+            k = out(reg) k,
+            s = sym toi_hole_imm64,
+            options(pure, nomem, nostack),
+        );
+    }
+    k
+}
+
+/// The first 64-bit immediate when the JIT knows it fits 32 bits: `movz` +
+/// `movk` of the low halves.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn imm64_u32() -> u64 {
+    let k: u64;
+    unsafe {
+        core::arch::asm!(
+            "movz {k:w}, #:abs_g0_nc:{s}",
+            "movk {k:w}, #:abs_g1_nc:{s}",
+            k = out(reg) k,
+            s = sym toi_hole_imm64,
+            options(pure, nomem, nostack),
+        );
+    }
+    k
+}
+
 /// A 64-bit immediate operand: `movabs` with an `R_X86_64_64` relocation.
 /// (A symbol address in Rust would be truncated to 32 bits in the small
 /// code model.)
@@ -1436,10 +1471,11 @@ macro_rules! bitwise_smi {
 bitwise_smi!("bit_and_smi", &, "and");
 bitwise_smi!("bit_or_smi", |, "or");
 
-// `acc % k`. The JIT picks the `_i` forms only for k > 1 not a power of two
-// (powers of two use `mod_smi_pow2_*`), and passes `⌈2^64 / k⌉` as the
-// 64-bit immediate. A negative dividend with a zero remainder gives -0, a
-// double, so `_i` exits there and `_iif` (once it has) produces a double.
+// `acc % k`, generic. For an int32 `acc` and k > 1 not a power of two
+// (powers of two use `mod_smi_pow2_*`), the JIT picks `mod_smi_{u,i}_s<s>`
+// (below), and once a negative dividend's zero remainder (-0, a double) has
+// made them exit, `mod_smi_iif`, which produces a double, with `⌈2^64 / k⌉`
+// as the 64-bit immediate.
 stencil_slow!("mod_smi"; |s| {
     let k = imm();
     if s.tag.is_int32(s.acc) && int(s.acc) >= 0 && k > 0 {
@@ -1460,8 +1496,8 @@ fn rem_f64(r: i32, a: i32) -> f64 {
     f64::from_bits((r as f64).to_bits() | ((a as u32 >> 31) as u64) << 63)
 }
 
-/// `a % d` for a constant d > 1 that is not a power of two, without a
-/// division (Lemire, Kaser & Kurz, "Faster remainder by direct
+/// `a % d` for a constant d > 1 that is not a power of two, any sign, for
+/// `mod_smi_iif`, without a division (Lemire, Kaser & Kurz, "Faster remainder by direct
 /// computation", 2019): with `m = ⌈2^64 / d⌉` (the 64-bit immediate),
 /// `|a| mod d = ⌊(m·|a| mod 2^64) · d / 2^64⌋`, exact for every 32-bit
 /// `|a|` and `d`. The remainder takes the dividend's sign.
@@ -1477,18 +1513,115 @@ fn rem_magic(a: i32, d: i32, m: u64) -> i32 {
     (r ^ sign).wrapping_sub(sign)
 }
 
-stencil!("mod_smi_i"; |s| {
-    let a = int(s.acc);
-    let r = rem_magic(a, imm(), imm64());
-    if r == 0 && a < 0 {
-        exit!(s)
-    }
-    s.acc = unboxed(r);
-    next!(s)
-});
 stencil!("mod_smi_iif"; |s| {
     let a = int(s.acc);
     s.facc = rem_f64(rem_magic(a, imm(), imm64()), a);
+    next!(s)
+});
+
+/// `a mod d` for 0 <= a < 2^31 and a constant d >= 3 that is not a power
+/// of two, with `S` = 31 + ⌈log2 d⌉ and m = ⌈2^S / d⌉ < 2^32 (see
+/// `jit::mod_magic`; m is the 64-bit immediate, d the immediate): q =
+/// ⌊a·m / 2^S⌋ is ⌊a / d⌋ exactly (a·m < 2^63), and the remainder is
+/// a - q·d. In asm, as LLVM would add a zero-extension (or a mask, after a
+/// sign test) and load d separately; the target sequences are in
+/// docs/future-work.md ("ModSmi"). No fixed registers, unlike a 128-bit
+/// product's high half on x86-64 (rdx, a slot).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn rem_u31<const S: u32>(a: u64) -> u64 {
+    let m = imm64_u32();
+    let r: u64;
+    unsafe {
+        // The 32-bit `sub` clears the upper half: `r` is the remainder,
+        // zero-extended (an unboxed int32 `acc`).
+        core::arch::asm!(
+            "mov {t:e}, {a:e}",
+            "imul {t}, {m}",
+            "shr {t}, {s}",
+            "imul {t:e}, {t:e}, offset {d}",
+            "sub {a:e}, {t:e}",
+            a = inout(reg) a => r,
+            t = out(reg) _,
+            m = in(reg) m,
+            s = const S,
+            d = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+    }
+    r
+}
+
+/// See the x86-64 version; `d` is the divisor, from `imm()` or `imm16()`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn rem_u31<const S: u32>(a: u64, d: u32) -> u64 {
+    let m = imm64_u32();
+    let r: u64;
+    unsafe {
+        // `msub` on w registers clears the upper half (see x86-64).
+        core::arch::asm!(
+            "umull {t}, {a:w}, {m:w}",
+            "lsr {t}, {t}, #{s}",
+            "msub {a:w}, {t:w}, {d:w}, {a:w}",
+            a = inout(reg) a => r,
+            m = in(reg) m,
+            d = in(reg) d,
+            t = out(reg) _,
+            s = const S,
+            options(pure, nomem, nostack),
+        );
+    }
+    r
+}
+
+// `acc % d` (the immediate) with the shift `S` of d's magic number in the
+// name, `mod_smi_{u,i}_s<S>`, and the magic number m as the 64-bit
+// immediate. `_u`: `acc` is known not to be negative. `_i`: a negative
+// dividend goes to the cold helper, which divides, and exits if the
+// remainder is zero (-0). On arm64, `_k16` variants for d < 2^16.
+macro_rules! mod_smi_shift {
+    ($s:literal, $($suffix:literal)?, $rem:expr) => {
+        stencil!("mod_smi_u_s", $s $(, $suffix)?; |s| {
+            s.acc = Value::from_bits($rem(s.acc.to_bits()));
+            next!(s)
+        });
+        stencil_slow!("mod_smi_i_s", $s $(, $suffix)?; |s| {
+            if int(s.acc) >= 0 {
+                s.acc = Value::from_bits($rem(s.acc.to_bits()));
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            // Distinct per stencil, or LLVM merges the helpers into one.
+            core::arch::asm!(concat!("/* ", $s, $($suffix,)? " */"), options(nomem, nostack, preserves_flags));
+            let d = imm();
+            if d > 0 {
+                let r = int(s.acc) % d;
+                if r != 0 {
+                    s.acc = unboxed(r);
+                    next!(s)
+                }
+            }
+            exit!(s)
+        });
+    };
+}
+macro_rules! mod_smi_shifts {
+    ($($s:literal)*) => {$(
+        #[cfg(target_arch = "x86_64")]
+        mod_smi_shift!($s, , rem_u31::<$s>);
+        #[cfg(target_arch = "aarch64")]
+        mod_smi_shift!($s, , |a| rem_u31::<$s>(a, imm() as u32));
+        #[cfg(target_arch = "aarch64")]
+        mod_smi_shift!($s, "_k16", |a| rem_u31::<$s>(a, imm16() as u32));
+    )*};
+}
+mod_smi_shifts!(33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62);
+
+// A power of two, `acc` known not to be negative: `acc & (k - 1)`.
+imm_variants!("mod_smi_pow2_u"; |s, m| {
+    s.acc = unboxed(int(s.acc) & m);
     next!(s)
 });
 

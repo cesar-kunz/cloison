@@ -154,7 +154,7 @@ unsafe extern "C" {
 ///   operands.
 #[cfg(target_arch = "x86_64")]
 macro_rules! rt_call {
-    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+    ($s:ident, $f:ident, $a:expr, $b:expr $(, $clobber:tt)*) => {{
         let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
         let [mut g0, mut g1, mut g2, mut g3, mut g4, mut g5] = $s.g.map(Value::to_bits);
         let [mut f0, mut f1, mut f2, mut f3, mut f4, mut f5, mut f6] = $s.f;
@@ -174,6 +174,7 @@ macro_rules! rt_call {
             out("r10") _,
             out("xmm8") _, out("xmm9") _, out("xmm10") _, out("xmm11") _,
             out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+            $(out($clobber) _,)*
         );
         $s.g = [g0, g1, g2, g3, g4, g5].map(Value::from_bits);
         $s.f = [f0, f1, f2, f3, f4, f5, f6];
@@ -184,7 +185,7 @@ macro_rules! rt_call {
 
 #[cfg(target_arch = "aarch64")]
 macro_rules! rt_call {
-    ($s:ident, $f:ident, $a:expr, $b:expr) => {{
+    ($s:ident, $f:ident, $a:expr, $b:expr $(, $clobber:tt)*) => {{
         let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
         let [g0, g1, g2, g3, g4, mut g5, mut g6, mut g7, mut g8, mut g9, mut g10, mut g11] =
             $s.g.map(Value::to_bits);
@@ -207,6 +208,7 @@ macro_rules! rt_call {
             out("v20") _, out("v21") _, out("v22") _, out("v23") _,
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            $(out($clobber) _,)*
         );
         $s.g = [g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11].map(Value::from_bits);
         $s.f = [f0, f1, f2, f3, f4, f5, f6];
@@ -2168,6 +2170,21 @@ struct DirectSite {
 //
 // `construct_direct` is the same for `new`, entering through
 // `toi_rt_construct`, which allocates `this` first.
+/// `rt_call!` to `toi_rt_enter`, whose wrapper doesn't preserve `acc`'s
+/// register (see `arch::enter_wrapper` in `src/jit.rs`).
+#[cfg(target_arch = "x86_64")]
+macro_rules! rt_call_enter {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {
+        rt_call!($s, $f, $a, $b, "r12")
+    };
+}
+#[cfg(target_arch = "aarch64")]
+macro_rules! rt_call_enter {
+    ($s:ident, $f:ident, $a:expr, $b:expr) => {
+        rt_call!($s, $f, $a, $b, "x20")
+    };
+}
+
 macro_rules! direct_call {
     ($name:literal, $enter:ident) => {
         stencil!($name; |s| {
@@ -2178,7 +2195,7 @@ macro_rules! direct_call {
                 && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
                 && base as u64 + (*site).end_off <= (*site).stack_end
             {
-                Value::from_bits(rt_call!(s, $enter, regs, Value::from_bits(site as u64)))
+                Value::from_bits(rt_call_enter!(s, $enter, regs, Value::from_bits(site as u64)))
             } else {
                 Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
             };

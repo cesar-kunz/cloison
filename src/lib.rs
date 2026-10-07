@@ -18,6 +18,7 @@ pub mod asm;
 pub mod bytecode;
 pub mod interp;
 pub mod jit;
+pub mod js;
 pub mod object;
 pub mod value;
 pub mod vm;

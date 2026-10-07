@@ -95,7 +95,7 @@ fn loops_with_calls_compile_with_the_callee_inlined() {
         let s = vm.jit_stencils("main").expect("main's loop compiled");
         let loop_end = s
             .iter()
-            .position(|n| n.starts_with("jlt_smi"))
+            .position(|n| n.starts_with("jlt_smi") || n.starts_with("incjlt"))
             .expect("the loop");
         let body = &s[..loop_end];
         assert!(

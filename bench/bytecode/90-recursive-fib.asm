@@ -14,7 +14,7 @@ script                          ; r1 callee, r2 argument
         Return
 end
 
-function fib(n)                 ; r1 n, r2 callee, r3 argument, r4 fib(n - 1)
+function fib(n)                 ; r1 n, r2 callee, then fib(n - 1), r3 callee, r4 argument
         Ldar r1
         JumpIfLessSmi 2, base
         LdaGlobal fib
@@ -23,12 +23,14 @@ function fib(n)                 ; r1 n, r2 callee, r3 argument, r4 fib(n - 1)
         AddSmi -1
         Star r3
         CallUndefined r2, r3, 1
-        Star r4
+        Star r2                 ; fib(n - 1)
+        LdaGlobal fib           ; again: the call may have changed it
+        Star r3
         Ldar r1
         AddSmi -2
-        Star r3
-        CallUndefined r2, r3, 1
-        Add r4                  ; fib(n - 1) + fib(n - 2)
+        Star r4
+        CallUndefined r3, r4, 1
+        Add r2                  ; fib(n - 1) + fib(n - 2)
         Return
 base:   Ldar r1
         Return

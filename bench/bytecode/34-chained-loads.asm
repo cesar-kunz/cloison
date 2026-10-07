@@ -91,7 +91,6 @@ function main()
         LdaSmi 0
         Star r5                 ; n = 0
         Star r6                 ; i = 0
-        Jump test
 body:   GetNamed r4, rank
         Star r8
         GetNamed r8, value
@@ -133,7 +132,6 @@ third:  Ldar r6
 next:   Ldar r6
         Inc
         Star r6                 ; i++
-test:   Ldar r6
         JumpIfLessSmi 1000000, body
         Ldar r5
         Return

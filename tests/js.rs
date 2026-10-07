@@ -749,3 +749,79 @@ fn for_in_agrees_with_node() {
         assert_eq!(value(&format!("{FOR_IN}\n{call};")), want, "{call}");
     }
 }
+
+/// Polymorphic accesses, compiled: loads, stores and transitions on
+/// receivers of two to five shapes (fields at different offsets, in and
+/// out of the object, a prototype's method, a missing one), arrays whose
+/// elements change type, and shapes appearing after compilation (an exit).
+/// The expected values are Node's.
+const POLY: &str = r#"
+function A(x) { this.x = x; this.y = 1; }
+function B(x) { this.k = 0; this.y = 2; this.x = x; }
+function C(x) { this.y = 3; this.z = 0; this.w = 0; this.x = x; }
+function D(x) { this.x = x; }
+function E(x) { this.q = 1; this.r = 2; this.x = x; }
+A.prototype.m = function () { return 1; };
+B.prototype.m = function () { return 2; };
+function F() {}
+F.prototype = A.prototype;
+function make(i, kinds) {
+  var k = i - ((i / kinds) | 0) * kinds;
+  return k == 0 ? new A(i) : k == 1 ? new B(i) : k == 2 ? new C(i) : k == 3 ? new D(i) : new E(i);
+}
+function run(kinds, n) {
+  var os = [], i, r, s = 0;
+  for (i = 0; i < 40; i++) os.push(make(i, kinds));
+  for (r = 0; r < n; r++) {
+    for (i = 0; i < os.length; i++) {
+      var o = os[i];
+      s = (s + o.x + (o.y | 0)) | 0;
+      o.x = o.x + 1;
+      if (r == 5) o.tag = i;
+      if (o.tag != undefined) s = (s + o.tag) | 0;
+      if (o.m != undefined) s = (s + o.m()) | 0;
+    }
+  }
+  return s;
+}
+function grow() {
+  var out = 0, r, i;
+  for (r = 0; r < 300; r++) {
+    var a = [], b = [1.5];
+    for (i = 0; i < 20; i++) { a.push(i); b.push(i); }
+    out = (out + a.length + b.length + a[3] + b[1]) | 0;
+  }
+  return out;
+}
+function late() {
+  var os = [], s = 0, i, r;
+  for (i = 0; i < 30; i++) os.push((i & 1) ? new A(i) : new B(i));
+  for (r = 0; r < 2000; r++) {
+    if (r == 1500) os[7] = new C(7);
+    if (r == 1700) os[8] = new F();
+    for (i = 0; i < os.length; i++) s = (s + (os[i].x | 0)) | 0;
+  }
+  return s;
+}
+"#;
+
+#[test]
+fn polymorphic_accesses_agree_with_node() {
+    for (call, want) in [
+        ("run(2, 1500)", "47486100"),
+        ("run(3, 1500)", "47484600"),
+        ("run(4, 1500)", "47441100"),
+        ("run(5, 1500)", "47414100"),
+        ("grow()", "13200"),
+        ("late()", "867600"),
+    ] {
+        assert_eq!(value(&format!("{POLY}\n{call};")), want, "{call}");
+    }
+    // All in one run: the caches carry over.
+    assert_eq!(
+        value(&format!(
+            "{POLY}\nrun(2, 300) + run(3, 300) + run(4, 300) + run(5, 300);"
+        )),
+        "9152700"
+    );
+}

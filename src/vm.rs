@@ -95,6 +95,8 @@ pub struct Code {
     pub ic_names: Box<[Atom]>,
     /// The nested functions, by `CreateClosure` operand.
     pub closures: Vec<*const Code>,
+    /// `LdaConstant`'s values.
+    pub constants: Box<[Value]>,
     pub native: Option<NativeFn>,
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
@@ -135,7 +137,7 @@ pub(crate) const MANY_SHAPES: *const Shape = std::ptr::dangling::<Shape>();
 /// calls enter compiled code (as `jit::Tiering::default`).
 pub(crate) const TIER_BACK_EDGES: i64 = 1000;
 pub(crate) const TIER_CALLS: i32 = 10;
-const MAX_INLINE_CAPACITY: u32 = 64;
+pub const MAX_INLINE_CAPACITY: u32 = 64;
 /// Stack size in values (frame headers included).
 const STACK_VALUES: usize = 1 << 18;
 
@@ -153,6 +155,10 @@ pub struct Vm {
     pub object_prototype: *mut Object,
     pub function_prototype: *mut Object,
     pub array_prototype: *mut Object,
+    pub string_prototype: *mut Object,
+    pub(crate) string_shape: *const Shape,
+    /// String constants by contents, so equal literals are one string.
+    strings: HashMap<Vec<u16>, Value>,
     /// Bumped whenever a prototype changes shape; see [`Ic`].
     pub proto_epoch: u32,
     /// Bumped whenever a field's type generalizes (see [`FieldType`]).
@@ -213,6 +219,9 @@ impl Vm {
             object_prototype: std::ptr::null_mut(),
             function_prototype: std::ptr::null_mut(),
             array_prototype: std::ptr::null_mut(),
+            string_prototype: std::ptr::null_mut(),
+            string_shape: std::ptr::null(),
+            strings: HashMap::new(),
             proto_epoch: 0,
             field_epoch: 0,
             code_epoch: 0,
@@ -249,6 +258,7 @@ impl Vm {
         let op = object_value(vm.object_prototype);
         vm.function_prototype = vm.new_object(op);
         vm.array_prototype = vm.new_object(op);
+        vm.string_prototype = vm.new_object(op);
         // Room for the builtins and the script's globals in the object
         // itself: out-of-line globals cost compiled code a load each.
         vm.global = vm.new_object_with(Class::Plain, op, MAX_INLINE_CAPACITY);
@@ -260,6 +270,7 @@ impl Vm {
         vm.proto_object_shape = vm.transition(root, vm.a_constructor);
 
         vm.array_shape = vm.root_shape(Class::Array, object_value(vm.array_prototype), 0);
+        vm.string_shape = vm.root_shape(Class::String, object_value(vm.string_prototype), 0);
         let ap = vm.array_prototype;
         vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
         vm.define_native(ap, "pop", array_pop, 0, crate::jit::Ty::Any, false);
@@ -531,7 +542,7 @@ impl Vm {
         }
         let o = as_object(obj);
         unsafe {
-            if (*o).class == Class::Array && name == self.a_length {
+            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
                 return Ok(Value::from_i32((*o).elems_len as i32));
             }
             Ok(match self.lookup(o, name) {
@@ -561,6 +572,10 @@ impl Vm {
         unsafe {
             if (*o).class == Class::Array && name == self.a_length {
                 return Err(Error::unsupported("setting an array's length"));
+            }
+            // A string is a primitive: stores to it do nothing.
+            if (*o).class == Class::String {
+                return Ok(());
             }
             match (*(*o).shape).lookup(name) {
                 Some(slot) => self.store_field(o, slot, value),
@@ -593,7 +608,7 @@ impl Vm {
         }
         let o = as_object(obj);
         unsafe {
-            if (*o).class == Class::Array && name == self.a_length {
+            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
                 // Recorded for the JIT (`jit::Prop::Length`); no shape, so
                 // the interpreter's hit path never takes it.
                 *ic = Ic {
@@ -628,6 +643,9 @@ impl Vm {
             let old = (*o).shape;
             if (*o).class == Class::Array && name == self.a_length {
                 return Err(Error::unsupported("setting an array's length"));
+            }
+            if (*o).class == Class::String {
+                return Ok(());
             }
             if let Some(slot) = (*old).lookup(name) {
                 self.store_field(o, slot, value);
@@ -800,6 +818,52 @@ impl Vm {
         }
     }
 
+    /// `CreateObject n`: a plain object with room for `n` properties in
+    /// itself, its root shape cached in inline-cache slot `ic`.
+    pub fn create_object(&mut self, code: &Code, ic: u16, n: u32) -> Value {
+        let (ic, _) = code.ic(ic);
+        unsafe {
+            if (*ic).shape.is_null() {
+                let op = object_value(self.object_prototype);
+                (*ic).shape = self.root_shape(Class::Plain, op, n);
+            }
+            object_value(self.heap.alloc_object(&*(*ic).shape))
+        }
+    }
+
+    // ---- Strings ----
+
+    /// A new string of `units` (UTF-16 code units), stored after its header.
+    pub fn new_string(&mut self, units: &[u16]) -> Value {
+        self.new_string_with(units.len(), |out| out.copy_from_slice(units))
+    }
+
+    /// A new string of `len` code units, which `fill` writes.
+    pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
+        let header = crate::object::INLINE_BASE / 8;
+        let words = header + len.div_ceil(4);
+        unsafe {
+            let o = self.heap.alloc_words(words).cast::<Object>();
+            o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
+                .write(crate::object::object_header(&*self.string_shape));
+            let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
+            fill(std::slice::from_raw_parts_mut(data, len));
+            (*o).elems = data.cast();
+            (*o).elems_len = u32::try_from(len).expect("string too long");
+            object_value(o)
+        }
+    }
+
+    /// The string constant with `units`, shared by equal ones.
+    pub fn string_constant(&mut self, units: &[u16]) -> Value {
+        if let Some(&v) = self.strings.get(units) {
+            return v;
+        }
+        let v = self.new_string(units);
+        self.strings.insert(units.to_vec(), v);
+        v
+    }
+
     // ---- Functions ----
 
     /// A new closure of `code`'s nested function `i`, with a fresh
@@ -835,6 +899,7 @@ impl Vm {
             ics: Box::new([]),
             ic_names: Box::new([]),
             closures: Vec::new(),
+            constants: Box::new([]),
             native: Some(f),
             constructs,
             ctor_capacity: Cell::new(0),
@@ -949,6 +1014,16 @@ impl Vm {
                 let ics: Vec<UnsafeCell<Ic>> =
                     f.ics.iter().map(|_| UnsafeCell::new(Ic::EMPTY)).collect();
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern(n)).collect();
+                let constants: Box<[Value]> = f
+                    .constants
+                    .iter()
+                    .map(|c| match c {
+                        crate::asm::Constant::Number(d) => Value::number(*d),
+                        crate::asm::Constant::String(t) => {
+                            self.string_constant(&t.encode_utf16().collect::<Vec<_>>())
+                        }
+                    })
+                    .collect();
                 self.add_code(Code {
                     name: f.name.clone(),
                     bytecode: {
@@ -963,6 +1038,7 @@ impl Vm {
                     ics: ics.into_boxed_slice(),
                     ic_names: ic_names.into_boxed_slice(),
                     closures: Vec::new(),
+                    constants,
                     native: None,
                     constructs: false,
                     ctor_capacity: Cell::new(INITIAL_CTOR_CAPACITY),
@@ -987,6 +1063,7 @@ impl Vm {
 
     /// Load and run `module`; returns its completion value.
     pub fn run(&mut self, module: &Module) -> Result<Value> {
+        crate::interp::CURRENT_VM.with(|v| v.set(self));
         let code = self.load(module);
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
@@ -1204,15 +1281,7 @@ pub fn display(v: Value) -> String {
         return v.as_i32_unchecked().to_string();
     }
     if let Some(d) = v.as_number() {
-        return if d.is_nan() {
-            "NaN".into()
-        } else if d.is_infinite() {
-            if d > 0.0 { "Infinity" } else { "-Infinity" }.into()
-        } else if d == 0.0 {
-            "0".into()
-        } else {
-            format!("{d}")
-        };
+        return number_to_string(d);
     }
     if v.is_undefined() {
         "undefined".into()
@@ -1220,9 +1289,62 @@ pub fn display(v: Value) -> String {
         "null".into()
     } else if v.is_bool() {
         (v == Value::TRUE).to_string()
+    } else if let Some(s) = string_units(v) {
+        String::from_utf16_lossy(s)
     } else if v.is_cell() {
         "[object Object]".into()
     } else {
         format!("{v:?}")
+    }
+}
+
+/// `v`'s code units if it is a string.
+pub fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
+    if !v.is_cell() {
+        return None;
+    }
+    let o = as_object(v);
+    unsafe {
+        ((*o).class == Class::String)
+            .then(|| std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize))
+    }
+}
+
+/// Number::toString(10): the shortest digits that round-trip, laid out as
+/// ECMA-262 says (no exponent from 1e-6 up to 1e21).
+pub fn number_to_string(d: f64) -> String {
+    if d.is_nan() {
+        return "NaN".into();
+    }
+    if d == 0.0 {
+        return "0".into();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if d < 0.0 {
+        return format!("-{}", number_to_string(-d));
+    }
+    // `{:e}` gives the shortest round-trip digits: `d1.d2…dke<x>`.
+    let e = format!("{d:e}");
+    let (mantissa, exp) = e.split_once('e').unwrap();
+    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let k = digits.len() as i32;
+    // d = 0.d1…dk × 10^n
+    let n = exp.parse::<i32>().unwrap() + 1;
+    if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let sign = if n - 1 < 0 { '-' } else { '+' };
+        let rest = if k > 1 {
+            format!(".{}", &digits[1..])
+        } else {
+            String::new()
+        };
+        format!("{}{rest}e{sign}{}", &digits[..1], (n - 1).abs())
     }
 }

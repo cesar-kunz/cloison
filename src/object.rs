@@ -50,6 +50,10 @@ pub enum Class {
     Function,
     /// A function implemented in Rust: `code` is set, with `native`.
     Native,
+    /// A string: its UTF-16 code units follow the header; `elems` points
+    /// to them and `elems_len` is the length (as arrays', so `length` reads
+    /// the same field).
+    String,
 }
 
 /// The object is reachable from outside the internal heap. Always set for

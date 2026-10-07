@@ -130,6 +130,7 @@ unsafe extern "C" {
     fn toi_rt_less_than();
     fn toi_rt_compare();
     fn toi_rt_create_array();
+    fn toi_rt_create_object();
     fn toi_rt_sub();
     fn toi_rt_mul();
     fn toi_rt_div();
@@ -585,7 +586,8 @@ stencil_slow!("add_smi"; |s| {
     }
     slow!(s)
 }; |s| {
-    s.acc = rt_add!(s, s.acc, Value::from_i32(imm()));
+    // `toi_rt_add(x, r)` is `r + x`: here `acc + k`.
+    s.acc = rt_add!(s, Value::from_i32(imm()), s.acc);
     next!(s)
 });
 
@@ -1845,12 +1847,44 @@ test_zero!("tstz_jt_i", jt);
 test_zero!("tstz_jf_i", jf);
 
 /// A comparison family on a boxed location (memory or a GPR slot).
+/// What `==` gives without the runtime, if the operands decide it alone
+/// (`fast_rel!(lt, …)` never does).
+macro_rules! fast_rel {
+    (lt, $tag:expr, $l:expr, $r:expr) => {
+        None::<bool>
+    };
+    (eq, $tag:expr, $l:expr, $r:expr) => {
+        loose_eq_fast($tag, $l, $r)
+    };
+}
+
+/// `l == r` when no conversion is needed: equal bits (not NaN), null or
+/// undefined on either side, or two cells that aren't both strings (the
+/// class byte, at 8, is 4 for a string).
+#[inline(always)]
+unsafe fn loose_eq_fast(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
+    if l == r && !tag.is_double(l) {
+        return Some(true);
+    }
+    if nullish(l) || nullish(r) {
+        return Some(nullish(l) && nullish(r));
+    }
+    let string = |v: Value| unsafe { *(v.to_bits() as *const u8).add(8) } == 4;
+    if is_cell(tag, l) && is_cell(tag, r) && !(string(l) && string(r)) {
+        return Some(false);
+    }
+    None
+}
+
 macro_rules! cmp_boxed {
     ($loc:tt, $rel:ident, $act:ident, $name:literal) => {
         stencil_slow!($name, "_", loc!($loc); |s| {
             let l = get!($loc, s);
             if s.tag.both_int32(l, s.acc) {
                 act!($act, s, rel!($rel, int(l), int(s.acc)))
+            }
+            if let Some(c) = fast_rel!($rel, s.tag, l, s.acc) {
+                act!($act, s, c)
             }
             slow!(s)
         }; |s| {
@@ -2108,10 +2142,15 @@ macro_rules! strict_generic {
     ($name:literal, $loc:expr, $act:ident, |$s:ident| $get:expr) => {
         stencil_slow!($name, $loc; |$s| {
             let x = $get;
-            // A non-number is strictly equal only to the same bits, and so
-            // are two int32s; two numbers otherwise need a numeric compare.
-            if !is_number($s.tag, x) || !is_number($s.tag, $s.acc) || $s.tag.both_int32(x, $s.acc) {
-                act!($act, $s, x == $s.acc)
+            // Equal bits are equal but for a NaN; two int32s, or a cell and
+            // a non-cell non-number, are unequal otherwise. Two numbers may
+            // be equal as numbers, two cells as strings.
+            let num = |v: Value| is_number($s.tag, v);
+            if x == $s.acc && !$s.tag.is_double(x) {
+                act!($act, $s, true)
+            }
+            if $s.tag.both_int32(x, $s.acc) || (!num(x) && !num($s.acc) && !(x.is_cell() && $s.acc.is_cell())) {
+                act!($act, $s, false)
             }
             slow!($s)
         }; |$s| {
@@ -2482,6 +2521,21 @@ group2_fp_slot!(4);
 group2_fp_slot!(5);
 group2_fp_slot!(6);
 
+// `SubSmi k` on any value (the typed cases are `add_smi_*` of -k).
+stencil_slow!("sub_smi"; |s| {
+    if s.tag.is_int32(s.acc)
+        && let Some(v) = int(s.acc).checked_sub(imm())
+    {
+        s.acc = s.tag.box_i32(v);
+        next!(s)
+    }
+    slow!(s)
+}; |s| {
+    // `toi_rt_sub(x, r)` is `r - x`: here `acc - k`.
+    s.acc = rt_sub!(s, Value::from_i32(imm()), s.acc);
+    next!(s)
+});
+
 // `MulSmi k`, `DivSmi k` (`acc OP k`).
 stencil_slow!("mul_smi"; |s| {
     if s.tag.is_int32(s.acc)
@@ -2745,12 +2799,93 @@ macro_rules! value_test_slot {
 }
 with_gprs!(each_gpr! value_test_slot);
 
+// `LdaConstant`: the constant's bits are the 64-bit immediate (`_f`: a
+// double's, into `facc`).
+stencil!("lda_constant"; |s| {
+    s.acc = Value::from_bits(imm64());
+    next!(s)
+});
+stencil!("lda_constant_f"; |s| {
+    s.facc = f64::from_bits(imm64());
+    next!(s)
+});
+
+// `CreateObject n`: bump the heap (its pointers' address is `imm64b`) for
+// the header and `n` slots, write the header of a plain, external object of
+// shape `imm64` and `undefined` slots. If the heap's chunk is full, the
+// runtime allocates (`toi_rt_create_object`). One stencil per count up to 8
+// (`create_object_<n>`, straight-line stores), then `create_object` with
+// the count in `imm`.
+#[inline(always)]
+unsafe fn create_object(words: usize) -> Option<*mut u64> {
+    unsafe {
+        let heap = imm64b() as *mut [*mut u64; 2];
+        let p = (*heap)[0];
+        if ((*heap)[1] as usize - p as usize) < 8 * words {
+            return None;
+        }
+        (*heap)[0] = p.add(words);
+        *p = imm64();
+        // `Class::Plain`, flags `EXTERNAL`.
+        *p.add(1) = 1 << 8;
+        for k in 2..6 {
+            *p.add(k) = 0;
+        }
+        // Volatile: vectorized, the loop would load its constant from a
+        // pool, outside the stencil.
+        for k in 6..words {
+            p.add(k).write_volatile(Value::UNDEFINED.to_bits());
+        }
+        Some(p)
+    }
+}
+macro_rules! create_object_n {
+    ($($n:literal)*) => {$(
+        stencil_slow!("create_object_", $n; |s| {
+            let Some(p) = create_object(6 + $n) else { slow!(s) };
+            s.acc = Value::from_bits(p as u64);
+            next!(s)
+        }; |s| {
+            // Each stencil keeps its own helper (LLVM would merge these).
+            core::arch::asm!(concat!("/* create_object_", $n, " */"), options(nomem, nostack, preserves_flags));
+            s.acc = Value::from_bits(rt_call!(s, toi_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
+            next!(s)
+        });
+    )*};
+}
+create_object_n!(0 1 2 3 4 5 6 7 8);
+stencil_slow!("create_object"; |s| {
+    let Some(p) = create_object(6 + imm() as usize) else { slow!(s) };
+    s.acc = Value::from_bits(p as u64);
+    next!(s)
+}; |s| {
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
+    next!(s)
+});
+
 // `CreateArray`: a new, empty array from the runtime (the VM's address is
 // the 64-bit immediate).
 stencil!("create_array"; |s| {
     s.acc = Value::from_bits(rt_call!(s, toi_rt_create_array, Value::from_bits(imm64()), Value::UNDEFINED));
     next!(s)
 });
+
+// Identity: `==` / `===` between two objects that aren't strings (the JIT
+// knows from their shapes), a 64-bit compare.
+macro_rules! identity {
+    ($loc:tt) => {
+        stencil!("test_id_", loc!($loc); |s| { act!(test, s, get!($loc, s) == s.acc) });
+        stencil!("tid_jt_", loc!($loc); |s| { act!(jt, s, get!($loc, s) == s.acc) });
+        stencil!("tid_jf_", loc!($loc); |s| { act!(jf, s, get!($loc, s) == s.acc) });
+    };
+}
+identity!([m]);
+macro_rules! identity_gpr {
+    ($k:tt) => {
+        identity!([g $k]);
+    };
+}
+with_gprs!(each_gpr! identity_gpr);
 
 // ---- Property access, fed by inline caches ----
 //
@@ -2854,15 +2989,15 @@ macro_rules! keyed_load {
     };
 }
 
-/// `o.length` for an array `o` at a boxed location: its elements' count
-/// (`Object::elems_len`, at byte 32), after a check that it is an array
-/// (`Object::class` at byte 8 is `Class::Array`, 1) unless its shape is
-/// known (`_nc`).
+/// `o.length` for an array or string `o` at a boxed location: its
+/// elements' or code units' count (`Object::elems_len`, at byte 32), after
+/// a check that it is one (`Object::class` at byte 8 is `Class::Array`, 1,
+/// or `Class::String`, 4) unless its shape is known (`_nc`).
 macro_rules! array_length {
     ($loc:tt) => {
         stencil!("get_length_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || *(o.to_bits() as *const u8).add(8) != 1 {
+            if !is_cell(s.tag, o) || !matches!(*(o.to_bits() as *const u8).add(8), 1 | 4) {
                 exit!(s)
             }
             s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());

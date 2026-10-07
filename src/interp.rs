@@ -87,7 +87,7 @@ use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
-use crate::vm::{Code, Error, Ic, Vm};
+use crate::vm::{Code, Error, Ic, Vm, string_units};
 
 pub type Handler = extern "rust-preserve-none" fn(
     *const u8,
@@ -950,6 +950,19 @@ handlers! {
         next!(any, Op::CreateArray.size(), a)
     }
 
+    // Ignores `acc`: also the I32 entry.
+    fn op_create_object(pc, acc, regs, tag) {
+        let o = create_object(regs, u16_at(pc, 2), *pc.add(1) as u32);
+        next!(any, Op::CreateObject.size(), o)
+    }
+
+    // Ignores `acc`: also the I32 entry.
+    fn op_lda_constant(pc, acc, regs, tag) {
+        let code = &*frame_code(regs);
+        let c = *code.constants.get_unchecked(u16_at(pc, 1) as usize);
+        next!(any, Op::LdaConstant.size(), c)
+    }
+
     // ---- Calls (ignore `acc`: also I32 entries) ----
     // A call records its callee in the call's inline cache (`holder`), which
     // the JIT inlines from (natives in the slow paths).
@@ -993,7 +1006,7 @@ handlers! {
         let d = imm32(pc, 1) as f64;
         let r = match acc.as_number() {
             Some(a) => Value::number(a % d),
-            None => Value::number(acc.to_number() % d),
+            None => Value::number(to_number(acc) % d),
         };
         next!(any, Op::ModSmi.size(), r)
     }
@@ -1001,13 +1014,13 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_bit_and_smi(pc, acc, regs, tag) {
-        next_int!(Op::BitAndSmi.size(), to_int32(acc.to_number()) & imm32(pc, 1))
+        next_int!(Op::BitAndSmi.size(), to_int32(to_number(acc)) & imm32(pc, 1))
     }
 
     #[cold]
     #[inline(never)]
     fn slow_bit_or_smi(pc, acc, regs, tag) {
-        next_int!(Op::BitOrSmi.size(), to_int32(acc.to_number()) | imm32(pc, 1))
+        next_int!(Op::BitOrSmi.size(), to_int32(to_number(acc)) | imm32(pc, 1))
     }
 
     #[cold]
@@ -1267,13 +1280,19 @@ handlers! {
 pub(crate) fn generic_arith(op: Op, a: Value, b: Value) -> Value {
     let (x, y) = match both_numbers(a, b) {
         Some(p) => p,
-        None => (a.to_number(), b.to_number()),
+        None => (to_number(a), to_number(b)),
     };
-    Value::from_f64_arith(match op {
+    Value::from_f64_arith(arith_f64(op, x, y))
+}
+
+/// `x OP y` for `Sub`, `Mul`, `Div` (or their `…Smi` forms).
+#[inline(always)]
+fn arith_f64(op: Op, x: f64, y: f64) -> f64 {
+    match op {
         Op::Sub | Op::SubSmi => x - y,
         Op::Mul | Op::MulSmi => x * y,
         _ => x / y,
-    })
+    }
 }
 
 /// `a < b` or `a <= b` (`le`) for any two values; false with NaN.
@@ -1282,16 +1301,26 @@ pub(crate) fn generic_arith(op: Op, a: Value, b: Value) -> Value {
 pub(crate) fn generic_compare(le: bool, a: Value, b: Value) -> bool {
     let (x, y) = match both_numbers(a, b) {
         Some(p) => p,
-        None => (a.to_number(), b.to_number()),
+        None => {
+            // Two strings compare by code units.
+            let (a, b) = (to_primitive(a), to_primitive(b));
+            if let (Some(p), Some(q)) = (string_units(a), string_units(b)) {
+                return if le { p <= q } else { p < q };
+            }
+            (to_number(a), to_number(b))
+        }
     };
     if le { x <= y } else { x < y }
 }
 
 /// `a === b` (IsStrictlyEqual) for the values that exist so far.
 pub(crate) fn strict_equals(a: Value, b: Value) -> bool {
-    match both_numbers(a, b) {
-        Some((x, y)) => x == y,
-        None => a == b,
+    if let Some((x, y)) = both_numbers(a, b) {
+        return x == y;
+    }
+    match (string_units(a), string_units(b)) {
+        (Some(p), Some(q)) => p == q,
+        _ => a == b,
     }
 }
 
@@ -1339,7 +1368,11 @@ macro_rules! arith_reg {
             #[cold]
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
-                let v = generic_arith(Op::$op, *reg(pc, 1, regs), acc);
+                let lhs = *reg(pc, 1, regs);
+                let v = match both_numbers(lhs, acc) {
+                    Some((x, y)) => Value::from_f64_arith(arith_f64(Op::$op, x, y)),
+                    None => generic_arith(Op::$op, lhs, acc),
+                };
                 next!(any, Op::$op.size(), v)
             }
         }
@@ -1369,7 +1402,11 @@ macro_rules! arith_smi {
             #[cold]
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
-                let v = generic_arith(Op::$op, acc, Value::from_i32(imm32(pc, 1)));
+                let k = imm32(pc, 1);
+                let v = match acc.as_number() {
+                    Some(x) => Value::from_f64_arith(arith_f64(Op::$op, x, k as f64)),
+                    None => generic_arith(Op::$op, acc, Value::from_i32(k)),
+                };
                 next!(any, Op::$op.size(), v)
             }
         }
@@ -1439,7 +1476,7 @@ macro_rules! shift_smi {
             #[cold]
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
-                let ($a, $k) = (to_int32(acc.to_number()), imm32(pc, 1) as u32 & 31);
+                let ($a, $k) = (to_int32(to_number(acc)), imm32(pc, 1) as u32 & 31);
                 let v = match $int {
                     Some(v) => Value::from_i32(v),
                     // Only `>>>` leaves int32: a uint32 above 2^31 - 1.
@@ -1553,6 +1590,24 @@ macro_rules! relational {
     };
 }
 
+/// `a === b` without a runtime call, if the bits decide: equal bits (but
+/// a NaN's), or different ones where neither is a double and not both are
+/// cells (two cells may be equal strings).
+#[inline(always)]
+fn strict_fast(tag: NumberTag, a: Value, b: Value) -> Option<bool> {
+    if tag.is_double(a) || tag.is_double(b) {
+        return None;
+    }
+    if a == b {
+        return Some(true);
+    }
+    // Two cells are equal only as strings.
+    if a.is_cell() && b.is_cell() && is_string(a) && is_string(b) {
+        return None;
+    }
+    Some(false)
+}
+
 /// `l < r` or `l <= r`, or with `swap` `r < l` / `r <= l`.
 #[inline(always)]
 fn rel_i32(le: bool, swap: bool, l: i32, r: i32) -> bool {
@@ -1662,8 +1717,8 @@ handlers! {
     // it).
     fn op_test_strict_equal(pc, acc, regs, tag) {
         let lhs = *reg(pc, 1, regs);
-        if !tag.is_double(lhs) && !tag.is_double(acc) {
-            next!(any, Op::TestStrictEqual.size(), Value::from_bool(lhs == acc))
+        if let Some(c) = strict_fast(tag, lhs, acc) {
+            next!(any, Op::TestStrictEqual.size(), Value::from_bool(c))
         }
         tail!(slow_test_strict_equal, acc)
     }
@@ -1677,10 +1732,9 @@ handlers! {
 
     fn op_test_strict_equal_jt(pc, acc, regs, tag) {
         let lhs = *reg(pc, 1, regs);
-        if tag.is_double(lhs) || tag.is_double(acc) {
+        let Some(c) = strict_fast(tag, lhs, acc) else {
             tail!(slow_test_strict_equal, acc)
-        }
-        let c = lhs == acc;
+        };
         if c {
             next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::TRUE)
         }
@@ -1689,10 +1743,9 @@ handlers! {
 
     fn op_test_strict_equal_jf(pc, acc, regs, tag) {
         let lhs = *reg(pc, 1, regs);
-        if tag.is_double(lhs) || tag.is_double(acc) {
+        let Some(c) = strict_fast(tag, lhs, acc) else {
             tail!(slow_test_strict_equal, acc)
-        }
-        let c = lhs == acc;
+        };
         if !c {
             next!(any, 2 + imm32(pc, 2 + 1) as isize, Value::FALSE)
         }
@@ -1872,6 +1925,11 @@ fn create_closure(regs: *mut Value, i: u16) -> Value {
 }
 
 #[inline(never)]
+fn create_object(regs: *mut Value, ic: u16, n: u32) -> Value {
+    unsafe { (*frame_vm(regs)).create_object(&*frame_code(regs), ic, n) }
+}
+
+#[inline(never)]
 fn new_array(regs: *mut Value) -> Value {
     unsafe { (*frame_vm(regs)).new_array() }
 }
@@ -1886,31 +1944,113 @@ fn new_array(regs: *mut Value) -> Value {
 #[cold]
 #[inline(never)]
 pub(crate) fn generic_add(a: Value, b: Value) -> Value {
-    // ToPrimitive is the identity on everything representable so far, and
-    // there are no strings yet, so `+` is numeric addition.
-    Value::number(a.to_number() + b.to_number())
+    // Strings and int32s, the common case, straight into the result.
+    if let (Some(p), Some(q)) = (Piece::of(a), Piece::of(b))
+        && (p.is_string() || q.is_string())
+    {
+        return concat(p, q);
+    }
+    // ToPrimitive: an object is its string (no `valueOf` yet).
+    let (a, b) = (to_primitive(a), to_primitive(b));
+    if is_string(a) || is_string(b) {
+        let mut units = to_string_units(a);
+        units.extend(to_string_units(b));
+        return unsafe { (*current_vm()).new_string(&units) };
+    }
+    Value::number(to_number(a) + to_number(b))
+}
+
+/// An operand of a concatenation that needs no conversion through a
+/// `String`: a string's code units, or an int32's decimal digits.
+enum Piece<'a> {
+    Units(&'a [u16]),
+    /// The digits are `digits[start..]`.
+    Int {
+        digits: [u8; 11],
+        start: usize,
+    },
+}
+
+impl Piece<'_> {
+    fn of(v: Value) -> Option<Self> {
+        if v.is_int32() {
+            let mut digits = [0u8; 11];
+            let i = v.as_i32_unchecked();
+            let mut n = i.unsigned_abs();
+            let mut at = digits.len();
+            loop {
+                at -= 1;
+                digits[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            if i < 0 {
+                at -= 1;
+                digits[at] = b'-';
+            }
+            return Some(Piece::Int { digits, start: at });
+        }
+        string_units(v).map(Piece::Units)
+    }
+
+    fn is_string(&self) -> bool {
+        matches!(self, Piece::Units(_))
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Piece::Units(u) => u.len(),
+            Piece::Int { digits, start } => digits.len() - start,
+        }
+    }
+
+    fn write(&self, out: &mut [u16]) {
+        match self {
+            Piece::Units(u) => out.copy_from_slice(u),
+            Piece::Int { digits, start } => {
+                for (o, &d) in out.iter_mut().zip(&digits[*start..]) {
+                    *o = d as u16;
+                }
+            }
+        }
+    }
+}
+
+/// `p + q` as a new string.
+fn concat(p: Piece, q: Piece) -> Value {
+    let (m, n) = (p.len(), q.len());
+    unsafe {
+        (*current_vm()).new_string_with(m + n, |out| {
+            p.write(&mut out[..m]);
+            q.write(&mut out[m..]);
+        })
+    }
 }
 
 /// `a + 1` where `a` is not a number.
 #[cold]
 #[inline(never)]
 pub(crate) fn generic_inc(a: Value) -> Value {
-    Value::number(a.to_number() + 1.0)
+    Value::number(to_number(a) + 1.0)
 }
 
 /// `a < b` (IsLessThan) where at least one side is not a number.
 #[cold]
 #[inline(never)]
 pub(crate) fn generic_less_than(a: Value, b: Value) -> bool {
-    a.to_number() < b.to_number()
+    generic_compare(false, a, b)
 }
 
 /// ECMAScript ToBoolean.
 pub(crate) fn to_boolean(v: Value) -> bool {
     if let Some(d) = v.as_number() {
         d != 0.0 && !d.is_nan()
+    } else if let Some(u) = string_units(v) {
+        !u.is_empty()
     } else {
-        // Objects are truthy; there are no strings or BigInts yet.
+        // Objects are truthy; there are no BigInts yet.
         v == Value::TRUE || v.is_cell()
     }
 }
@@ -1941,12 +2081,156 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
     if b.is_bool() {
         return loose_equals(a, Value::from_i32((b == Value::TRUE) as i32));
     }
+    // Two objects that aren't both strings: the same one only.
+    if a.is_cell() && b.is_cell() && !(is_string(a) && is_string(b)) {
+        return Ok(false);
+    }
+    match (string_units(a), string_units(b)) {
+        (Some(p), Some(q)) => return Ok(p == q),
+        // A string and a number: as numbers.
+        (Some(_), None) if b.is_number() => return Ok(to_number(a) == to_number(b)),
+        (None, Some(_)) if a.is_number() => return Ok(to_number(a) == to_number(b)),
+        _ => {}
+    }
     if a.is_cell() && b.is_cell() {
         return Ok(false);
     }
-    Err(Error::unsupported(
-        "== between an object and a primitive (ToPrimitive)",
-    ))
+    // An object and a primitive: the object's primitive (its string).
+    if a.is_cell() {
+        return loose_equals(to_primitive(a), b);
+    }
+    loose_equals(a, to_primitive(b))
+}
+
+/// The VM running (stencils' runtime calls and slow paths reach it this
+/// way to allocate strings).
+pub(crate) fn current_vm() -> *mut Vm {
+    CURRENT_VM.with(|v| v.get())
+}
+
+thread_local! {
+    pub(crate) static CURRENT_VM: std::cell::Cell<*mut Vm> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+fn is_string(v: Value) -> bool {
+    string_units(v).is_some()
+}
+
+/// ToPrimitive, for the values that exist so far: an object other than a
+/// string is its ToString (no `valueOf`/`toString` methods yet).
+pub(crate) fn to_primitive(v: Value) -> Value {
+    if v.is_cell() && !is_string(v) {
+        let units = to_string_units(v);
+        unsafe { (*current_vm()).new_string(&units) }
+    } else {
+        v
+    }
+}
+
+/// ToString, as UTF-16 code units.
+pub(crate) fn to_string_units(v: Value) -> Vec<u16> {
+    if let Some(u) = string_units(v) {
+        return u.to_vec();
+    }
+    let s = if v.is_cell() {
+        let o = as_object(v);
+        // An array: its elements' strings, joined by commas (holes,
+        // undefined and null as empty strings).
+        if unsafe { (*o).class } == Class::Array {
+            let n = unsafe { (*o).elems_len } as usize;
+            let mut out = Vec::new();
+            for i in 0..n {
+                if i > 0 {
+                    out.push(b',' as u16);
+                }
+                let e = unsafe { *(*o).elems.add(i) };
+                if e != Value::EMPTY && !e.is_undefined() && !e.is_null() {
+                    out.extend(to_string_units(e));
+                }
+            }
+            return out;
+        }
+        "[object Object]".to_string()
+    } else {
+        crate::vm::display(v)
+    };
+    s.encode_utf16().collect()
+}
+
+/// ToNumber: a string is parsed (StringToNumber), an object goes through
+/// its primitive.
+pub(crate) fn to_number(v: Value) -> f64 {
+    if !v.is_cell() {
+        return v.to_number();
+    }
+    match string_units(v) {
+        Some(u) => string_to_number(&String::from_utf16_lossy(u)),
+        None => to_number(to_primitive(v)),
+    }
+}
+
+/// StringToNumber: whitespace-trimmed decimal (with sign, fraction and
+/// exponent), `0x`/`0o`/`0b` integers, or `Infinity`; empty is 0, anything
+/// else NaN.
+pub(crate) fn string_to_number(s: &str) -> f64 {
+    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    if t.is_empty() {
+        return 0.0;
+    }
+    let radix = match t.get(..2) {
+        Some("0x" | "0X") => 16,
+        Some("0o" | "0O") => 8,
+        Some("0b" | "0B") => 2,
+        _ => 10,
+    };
+    if radix != 10 {
+        let digits = &t[2..];
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+            return f64::NAN;
+        }
+        return digits.chars().fold(0.0, |acc, c| {
+            acc * radix as f64 + c.to_digit(radix).unwrap() as f64
+        });
+    }
+    let unsigned = t.strip_prefix(['+', '-']).unwrap_or(t);
+    if unsigned == "Infinity" {
+        return if t.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
+    }
+    // A StrDecimalLiteral: digits, an optional fraction, an exponent.
+    let b = unsigned.as_bytes();
+    let mut i = 0;
+    let digits = |i: &mut usize| {
+        let start = *i;
+        while *i < b.len() && b[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        *i - start
+    };
+    let mut n = digits(&mut i);
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        n += digits(&mut i);
+    }
+    if n == 0 {
+        return f64::NAN;
+    }
+    if i < b.len() && (b[i] | 0x20) == b'e' {
+        i += 1;
+        if i < b.len() && matches!(b[i], b'+' | b'-') {
+            i += 1;
+        }
+        if digits(&mut i) == 0 {
+            return f64::NAN;
+        }
+    }
+    if i != b.len() {
+        return f64::NAN;
+    }
+    t.parse().unwrap_or(f64::NAN)
 }
 
 static TABLE: Table = {
@@ -1988,6 +2272,8 @@ static TABLE: Table = {
     t[Op::SetKeyed as usize] = op_set_keyed;
     t[Op::CreateClosure as usize] = op_create_closure;
     t[Op::CreateArray as usize] = op_create_array;
+    t[Op::LdaConstant as usize] = op_lda_constant;
+    t[Op::CreateObject as usize] = op_create_object;
     t[Op::Call as usize] = op_call;
     t[Op::CallUndefined as usize] = op_call_undefined;
     t[Op::Construct as usize] = op_construct;
@@ -2067,6 +2353,8 @@ static TABLE_I32: Table = {
     t[Op::GetNamed as usize] = op_get_named;
     t[Op::CreateClosure as usize] = op_create_closure;
     t[Op::CreateArray as usize] = op_create_array;
+    t[Op::LdaConstant as usize] = op_lda_constant;
+    t[Op::CreateObject as usize] = op_create_object;
     t[Op::Call as usize] = op_call;
     t[Op::CallUndefined as usize] = op_call_undefined;
     t[Op::Construct as usize] = op_construct;

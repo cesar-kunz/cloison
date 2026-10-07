@@ -21,13 +21,16 @@ pub enum Operand {
     AutoIc,
     /// An argument count (1 byte).
     Count,
+    /// An index into the function's constants (2 bytes): a string, or a
+    /// number that isn't an int32.
+    Const,
 }
 
 impl Operand {
     pub const fn width(self) -> usize {
         match self {
             Operand::Reg | Operand::Count => 1,
-            Operand::Ic | Operand::Fn | Operand::AutoIc => 2,
+            Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const => 2,
             Operand::Imm | Operand::Off => 4,
         }
     }
@@ -158,6 +161,11 @@ define_ops! {
     CreateClosure(Fn),
     /// `acc = []`
     CreateArray(),
+    /// `acc = constants[k]`: a string, or a number that isn't an int32.
+    LdaConstant(Const),
+    /// `acc = {}`: a plain object with room for `n` properties in itself
+    /// (a literal's count), whose shape the inline cache keeps.
+    CreateObject(Count, AutoIc),
 
     // ---- Calls ----
     /// `acc = r[f](r[w+1], …, r[w+n])` with `this = r[w]`. The calls'
@@ -532,7 +540,7 @@ impl Assembler {
                     self.imm(v);
                 }
                 (Operand::Off, Arg::Label(l)) => self.jump_to(start, l),
-                (Operand::Ic | Operand::Fn | Operand::AutoIc, Arg::Index(i)) => {
+                (Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const, Arg::Index(i)) => {
                     self.code.extend_from_slice(&i.to_le_bytes());
                 }
                 (k, a) => panic!("{op:?}: operand {a:?} is not a {k:?}"),

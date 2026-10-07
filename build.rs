@@ -512,6 +512,15 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
             // Nothing branches to it: a fall-through, so it can't go.
             return;
         }
+        // Branched to, and also fallen into (the instruction before it
+        // isn't an unconditional branch, `ret` or `br`): it must stay.
+        let prev = insn(code, n - 8);
+        let ends = prev & 0xFC00_0000 == 0x1400_0000 // b
+            || prev & 0xFFFF_FC1F == 0xD65F_0000 // ret
+            || prev & 0xFFFF_FC1F == 0xD61F_0000; // br
+        if !ends {
+            return;
+        }
         let target = relocs.remove(stub_reloc);
         for (at, kind) in users {
             relocs.push(Reloc {

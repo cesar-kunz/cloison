@@ -78,10 +78,10 @@ fn listings_are_what_the_front_end_emits() {
 
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
-    "01", "02", "03", "04", "08", "10", "11", "12", "14", "15", "16", "17", "21", "22", "23", "24",
-    "25", "26", "27", "30", "31", "32", "33", "34", "35", "36", "37", "40", "41", "42", "43", "44",
-    "45", "50", "51", "52", "53", "60", "61", "62", "63", "64", "66", "67", "68", "69", "70", "71",
-    "80", "81", "82", "83", "84", "90", "91", "92", "93", "94",
+    "01", "02", "03", "04", "05", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17",
+    "20", "21", "22", "23", "24", "25", "26", "27", "30", "31", "32", "33", "34", "35", "36", "37",
+    "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62", "63", "64", "65",
+    "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91", "92", "93", "94",
 ];
 
 #[test]
@@ -262,9 +262,8 @@ fn rejects_what_it_cannot_compile() {
         ),
         ("var g = function h() { return h; };", "own name"),
         ("function f(i) { return i++; }", "postfix"),
-        ("var s = 'a';", "strings"),
-        ("var x = 1.5;", "1.5"),
-        ("var o = {};", "object literals"),
+        ("var x = typeof 1;", "Typeof"),
+        ("var o = {1: 2};", "the key `1`"),
         ("function f(a, b) { return a % b; }", "`%`"),
         ("switch (1) {}", "switch"),
     ];
@@ -410,4 +409,133 @@ fn inlined_frames_sharing_registers_survive_an_exit() {
         }
         main();";
     assert_eq!(value(src), "3675000");
+}
+
+/// Strings: concatenation with numbers of every format, `length`, `==` and
+/// `===` between distinct strings and with numbers, `<` on strings,
+/// ToBoolean, numeric strings in arithmetic, arrays as strings, strings in
+/// fields. The expected values are Node's.
+const STRINGS: &str = r#"
+function concat() {
+  var s = "", i, xs = [0, -1, 7, 2147483647, 0.5, -2.25, 1e21, 1.5e-7, 123.456, 1 / 3, 0 / 0, 1 / 0, -1 / 0, 0 * -1, 100, 1e300 * 10, 4294967296, 0.000001, 123456789012345680000];
+  for (i = 0; i < xs.length; i++) s = s + "|" + xs[i];
+  return s;
+}
+function lengths() {
+  var n = 0, i, s;
+  for (i = 0; i < 1000; i++) { s = "ab" + i; n += s.length; }
+  return n + "/" + "".length + "/" + "héllo".length + "/" + "é中".length;
+}
+function equality() {
+  var c = 0, i, a, b, n;
+  for (i = 0; i < 300; i++) {
+    a = "x" + (i % 3); b = "x" + (i % 2); n = "" + (i % 4);
+    if (a === b) c += 1;
+    if (a == b) c += 10;
+    if (a !== b) c += 100;
+    if (n == i % 4) c += 1000;
+    if (n === i % 4) c += 10000;
+    if ("1" == 1) c += 100000;
+    if ("" == 0) c += 1000000;
+  }
+  return c;
+}
+function relations() {
+  var c = 0, i, ws = ["b", "a", "ab", "", "B", "10", "9"];
+  for (i = 0; i < 49; i++) {
+    var x = ws[i % 7], y = ws[(i / 7) | 0];
+    if (x < y) c += 1;
+    if (x <= y) c += 10;
+    if (x > y) c += 100;
+    if (x >= y) c += 1000;
+  }
+  return c;
+}
+function truthy() {
+  var c = 0, i, vs = ["", "0", "a", " "];
+  for (i = 0; i < 400; i++) { if (vs[i % 4]) c++; c += (vs[i % 4] || "z").length; }
+  return c;
+}
+function numbers() {
+  var t = 0, i, ss = ["12", " 7 ", "", "0x10", "1e3", "-2.5", "abc", "Infinity", ".5", "5.", "0b11", "1_0"];
+  for (i = 0; i < ss.length; i++) t = t + "," + (ss[i] * 1) + (ss[i] - 0);
+  return t + "|" + ("3" * "4") + "|" + ("8" / "2") + "|" + ([1, 2] + "") + "|" + ("a" + [3, [4, 5]]) + "|" + (1 + 2 + "3" + 4 + 5);
+}
+function fields() {
+  function P(n) { this.name = n; this.k = n.length; }
+  var t = 0, i, p;
+  for (i = 0; i < 500; i++) { p = new P("p" + (i % 10)); t += p.k; if (p.name === "p3") t += 100; }
+  return t;
+}
+"#;
+
+#[test]
+fn strings_agree_with_node() {
+    for (call, want) in [
+        (
+            "concat()",
+            "|0|-1|7|2147483647|0.5|-2.25|1e+21|1.5e-7|123.456|0.3333333333333333|NaN|Infinity|-Infinity|0|100|1e+301|4294967296|0.000001|123456789012345680000",
+        ),
+        ("lengths()", "4890/0/5/2"),
+        ("equality()", "330321100"),
+        ("relations()", "30401"),
+        ("truthy()", "700"),
+        (
+            "numbers()",
+            "0,1212,77,00,1616,10001000,-2.5-2.5,NaNNaN,InfinityInfinity,0.50.5,55,33,NaNNaN|12|4|1,2|a3,4,5|3345",
+        ),
+        ("fields()", "6000"),
+    ] {
+        assert_eq!(value(&format!("{STRINGS}\n{call};")), want, "{call}");
+    }
+}
+
+/// Object literals: empty, nested, with function, string and null values,
+/// keywords and quoted keys as names, a later duplicate key winning, two
+/// key orders (two shapes) at one site, identity under `==` and `===`. The
+/// expected values are Node's.
+const OBJECTS: &str = r#"
+function literals() {
+  var t = 0, i, o, e;
+  for (i = 0; i < 300; i++) {
+    e = {};
+    o = { a: i, b: i * 2, c: { d: i & 7 }, s: "x" + i, f: function (k) { return this.a + k; }, a2: null };
+    o.extra = 1;
+    t += o.a + o.b + o.c.d + o.s.length + o.f(3) + (o.a2 == null ? 1 : 0) + o.extra + (e.a === undefined ? 1 : 0);
+  }
+  return t;
+}
+function duplicates() {
+  var o = { k: 1, j: 2, k: 3 }, n = 0, i;
+  for (i = 0; i < 100; i++) n += o.k * 10 + o.j;
+  return n;
+}
+function shapes() {
+  var xs = [], i, s = 0;
+  for (i = 0; i < 200; i++) xs.push(i % 2 ? { x: i, y: 1 } : { y: 2, x: i });
+  for (i = 0; i < 200; i++) s += xs[i].x * xs[i].y;
+  return s;
+}
+function identity() {
+  var a = {}, b = {}, c = a, n = 0, i;
+  for (i = 0; i < 100; i++) { if (a == c) n++; if (a != b) n += 10; if (a === b) n += 100; }
+  return n;
+}
+function keywords() {
+  var o = { if: 1, default: 2, "quoted key": 3, $d: 4, _u: 5 };
+  return o.if + o.default + o.$d + o._u;
+}
+"#;
+
+#[test]
+fn object_literals_agree_with_node() {
+    for (call, want) in [
+        ("literals()", "183332"),
+        ("duplicates()", "3200"),
+        ("shapes()", "29800"),
+        ("identity()", "1100"),
+        ("keywords()", "12"),
+    ] {
+        assert_eq!(value(&format!("{OBJECTS}\n{call};")), want, "{call}");
+    }
 }

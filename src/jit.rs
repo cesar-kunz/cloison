@@ -298,6 +298,16 @@ extern "C" fn toi_rt_less_than(a: Value, b: Value) -> bool {
     }
 }
 
+/// A new object of shape `shape` (`create_object`, when the heap's chunk
+/// is full).
+extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
+    unsafe {
+        let vm = crate::interp::current_vm();
+        let o = (*vm).heap.alloc_object(&*(shape.to_bits() as *const Shape));
+        crate::object::object_value(o).to_bits()
+    }
+}
+
 /// A new, empty array (`create_array`; `vm` is the VM's address).
 extern "C" fn toi_rt_create_array(vm: Value, _: Value) -> u64 {
     unsafe {
@@ -309,7 +319,18 @@ extern "C" fn toi_rt_create_array(vm: Value, _: Value) -> u64 {
 
 /// How `a` compares with `b`: 0 less, 1 equal, 2 greater, 3 unordered.
 extern "C" fn toi_rt_compare(a: Value, b: Value) -> u64 {
-    let (x, y) = (a.to_number(), b.to_number());
+    let (a, b) = (
+        crate::interp::to_primitive(a),
+        crate::interp::to_primitive(b),
+    );
+    if let (Some(p), Some(q)) = (crate::vm::string_units(a), crate::vm::string_units(b)) {
+        return match p.cmp(q) {
+            std::cmp::Ordering::Less => 0,
+            std::cmp::Ordering::Equal => 1,
+            std::cmp::Ordering::Greater => 2,
+        };
+    }
+    let (x, y) = (crate::interp::to_number(a), crate::interp::to_number(b));
     match x.partial_cmp(&y) {
         Some(std::cmp::Ordering::Less) => 0,
         Some(std::cmp::Ordering::Equal) => 1,
@@ -338,12 +359,12 @@ extern "C" fn toi_rt_strict_eq(a: Value, b: Value) -> bool {
 
 /// `a % b` (`ModSmi`'s slow path; `b` is the immediate).
 extern "C" fn toi_rt_mod(a: Value, b: Value) -> Value {
-    Value::number(a.to_number() % b.to_number())
+    Value::number(crate::interp::to_number(a) % crate::interp::to_number(b))
 }
 
 /// ToInt32(ToNumber(a)), in the low 32 bits.
 extern "C" fn toi_rt_to_int32(a: Value, _: Value) -> u64 {
-    crate::interp::to_int32(a.to_number()) as u32 as u64
+    crate::interp::to_int32(crate::interp::to_number(a)) as u32 as u64
 }
 
 /// `a == b`.
@@ -370,6 +391,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_less_than" => toi_rt_less_than as *const () as usize,
         "toi_rt_compare" => toi_rt_compare as *const () as usize,
         "toi_rt_create_array" => toi_rt_create_array as *const () as usize,
+        "toi_rt_create_object" => toi_rt_create_object as *const () as usize,
         "toi_rt_sub" => toi_rt_sub as *const () as usize,
         "toi_rt_mul" => toi_rt_mul as *const () as usize,
         "toi_rt_div" => toi_rt_div as *const () as usize,
@@ -949,6 +971,9 @@ struct Insn {
     /// The guard is before a self tail call (see `Lowering::tail_call`):
     /// the frame must not be a `new` one, either.
     tail: bool,
+    /// An `AddSmi` decoded from `SubSmi`: on numbers `x - k` is `x + -k`,
+    /// but not on other values (`"12" - 1`), so its generic case subtracts.
+    sub: bool,
 }
 
 impl Insn {
@@ -1072,11 +1097,13 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
         .map(|(pc, op)| {
             let (mut imm, mut reg, mut target, mut bail) = (0, 0, 0, false);
             let (mut reg2, mut ic) = (0, 0);
-            // `x - k` is `x + -k`, so `SubSmi` shares every `AddSmi` stencil
-            // and fusion (but for k = INT32_MIN).
+            // On numbers `x - k` is `x + -k`, so `SubSmi` shares every
+            // typed `AddSmi` stencil and fusion (but for k = INT32_MIN).
+            let mut sub = false;
             let op = match op {
                 Op::SubSmi if imm_at(pc + 1) != i32::MIN => {
                     imm = -imm_at(pc + 1);
+                    sub = true;
                     Op::AddSmi
                 }
                 op => op,
@@ -1143,6 +1170,14 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 }
                 Op::Mov if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
                 Op::CreateArray if vm => {}
+                // The capacity in `imm`, the shape's cache slot in `ic`.
+                Op::CreateObject if vm => {
+                    imm = code[pc + 1] as i32;
+                    ic = u16::from_le_bytes([code[pc + 2], code[pc + 3]]);
+                }
+                Op::LdaConstant if vm => {
+                    imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                }
                 Op::Call | Op::CallUndefined | Op::Construct if vm => {
                     (reg, reg2, imm) = (code[pc + 1], code[pc + 2], code[pc + 3] as i32);
                     ic = u16::from_le_bytes([code[pc + 4], code[pc + 5]]);
@@ -1168,6 +1203,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 ic,
                 guard: 0,
                 tail: false,
+                sub,
             }
         })
         .collect()
@@ -1291,7 +1327,7 @@ pub(crate) enum Prop {
     /// A keyed load whose receivers had shape `shape`, with elements of
     /// type `elems`.
     Keyed { shape: u64, elems: FieldType },
-    /// A `GetNamed` that read an array's `length`.
+    /// A `GetNamed` that read an array's or a string's `length`.
     Length,
     /// A call, described by `CallSite` number `site` of the lowering:
     /// straight into the callee's compiled code if `direct`, else through
@@ -1314,6 +1350,8 @@ pub(crate) struct Feedback {
     pub global: *mut crate::object::Object,
     /// For stencils calling into it (`create_array`).
     pub vm: *mut crate::vm::Vm,
+    /// The function's constants (`LdaConstant`).
+    pub constants: *const Value,
 }
 
 /// A slot location (`Shape::location`) as `(out of line, byte offset)`.
@@ -1634,6 +1672,13 @@ fn rel_code(op: Op) -> i32 {
     }
 }
 
+/// Whether a value of type `t` is an object other than a string: two such
+/// are equal (`==` or `===`) only if they are the same object.
+fn identity_ty(t: Ty) -> bool {
+    t.shape()
+        .is_some_and(|s| unsafe { (*(s as *const Shape)).class } != crate::object::Class::String)
+}
+
 /// Whether a value of type `t` is never null or undefined.
 fn never_nullish(t: Ty) -> bool {
     matches!(t, Ty::I32 | Ty::F64 | Ty::Obj(_) | Ty::Ext(_))
@@ -1870,6 +1915,10 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 };
             }
         }
+        Op::TestStrictEqual | Op::TestEqual if identity_ty(st.acc) && identity_ty(reg) => {
+            out.acc = Any;
+            ("test_id", "")
+        }
         Op::TestStrictEqual => {
             out.acc = Any;
             if (st.acc, reg) == (I32, I32) {
@@ -1889,6 +1938,46 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             return Sel {
                 ops: Some((0, vm as u64, 0)),
                 ..Sel::new("create_array", "", out)
+            };
+        }
+        // A new plain object of the shape the inline cache holds (none
+        // yet: the interpreter hasn't run it), allocated in the stencil:
+        // the slot count, the shape and the heap's bump pointer are its
+        // operands.
+        Op::CreateObject => {
+            let Some(fb) = spec.feedback.map(|f| &f[insn.frame as usize]) else {
+                return Sel::new("bail", "", out);
+            };
+            let shape = unsafe { (*fb.ics.add(insn.ic as usize)).shape };
+            if shape.is_null() {
+                return Sel::new("bail", "", out);
+            }
+            debug_assert_eq!(
+                &crate::object::object_header(unsafe { &*shape })[1..],
+                &[1 << 8, 0, 0, 0, 0],
+                "the header `create_object` writes"
+            );
+            out.acc = Ty::Obj(shape as u64);
+            let heap = unsafe { (*fb.vm).heap.bump() };
+            return Sel {
+                ops: Some((insn.imm, shape as u64, heap as u64)),
+                ..Sel::new("create_object", "", out)
+            };
+        }
+        // The constant is the 64-bit immediate: a double goes to `facc`.
+        Op::LdaConstant => {
+            let Some(fb) = spec.feedback.map(|f| &f[insn.frame as usize]) else {
+                return Sel::new("bail", "", out);
+            };
+            let v = unsafe { *fb.constants.add(insn.imm as usize) };
+            out.acc = Ty::of(v);
+            let (case, bits) = match v.as_number() {
+                Some(d) if out.acc == F64 => ("f", d.to_bits()),
+                _ => ("", v.to_bits()),
+            };
+            return Sel {
+                ops: Some((0, bits, 0)),
+                ..Sel::new("lda_constant", case, out)
             };
         }
         Op::TestUndefined | Op::TestNull | Op::TestNullish => {
@@ -1939,6 +2028,14 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
             out.acc = ty;
             ("add", case)
+        }
+        // Untyped, a `SubSmi` subtracts (`sub_smi`, with k).
+        Op::AddSmi if insn.sub && !matches!(st.acc, I32 | F64) => {
+            out.acc = Any;
+            return Sel {
+                ops: Some((-insn.imm, 0, 0)),
+                ..Sel::new("sub_smi", "", out)
+            };
         }
         Op::AddSmi | Op::Inc => {
             let base = if insn.op == Op::Inc { "inc" } else { "add_smi" };
@@ -2121,12 +2218,15 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         if matches!(reg, I32 | F64) {
             return bail(out);
         }
-        // An array's length: no check if the receiver's shape is an
-        // array's.
+        // An array's or string's length: no check if the receiver's shape
+        // is one's.
         if prop == Prop::Length {
-            let array = reg.shape().is_some_and(
-                |s| unsafe { (*(s as *const Shape)).class } == crate::object::Class::Array,
-            );
+            let array = reg.shape().is_some_and(|s| {
+                matches!(
+                    unsafe { (*(s as *const Shape)).class },
+                    crate::object::Class::Array | crate::object::Class::String
+                )
+            });
             out.acc = I32;
             return Sel::new("get_length", if array { "nc" } else { "" }, out);
         }
@@ -2884,6 +2984,9 @@ fn stencil_for(
             | "jge" | "test_gt" | "test_le" | "test_ge",
             _,
         ) => format!("{}_{}_{loc}", sel.base, sel.case),
+        ("test_id", _) => format!("test_id_{loc}"),
+        // Up to 8 slots, the count is part of the stencil.
+        ("create_object", _) if insn.imm <= 8 => format!("create_object_{}", insn.imm),
         // The count is part of the stencil: `sar_smi_i_3`.
         ("shl_smi" | "sar_smi" | "shr_smi", _) if sel.case == "i" => {
             format!("{}_i_{}", sel.base, insn.imm & 31)
@@ -2907,6 +3010,8 @@ fn stencil_for(
                     | "lda_global"
                     | "lda_global_oop"
                     | "create_array"
+                    | "create_object"
+                    | "lda_constant"
                     | "bail"
             ) {
                 box_acc(&mut pre);
@@ -2951,6 +3056,8 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::CallUndefined
                 | Op::Construct
                 | Op::CreateArray
+                | Op::CreateObject
+                | Op::LdaConstant
         )
     };
     let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump | Op::Mov);
@@ -3211,6 +3318,12 @@ impl Fusion<'_> {
         let pol = polarity(insns[i + 1].op)?;
         let mut steps = Vec::new();
         let name = match insns[i].op {
+            Op::TestEqual | Op::TestStrictEqual
+                if identity_ty(st.acc) && identity_ty(st.regs[insns[i].reg as usize]) =>
+            {
+                let loc = self.homes[insns[i].reg as usize].loc();
+                format!("tid_{pol}_{loc}")
+            }
             Op::TestLessThan | Op::TestEqual => {
                 let base = if insns[i].op == Op::TestLessThan {
                     "tlt"
@@ -5101,6 +5214,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         ic: 0,
         guard: 0,
         tail: false,
+        sub: false,
     }
 }
 
@@ -5166,6 +5280,7 @@ impl Lowering<'_> {
             names: code.ic_names.as_ptr(),
             global: unsafe { (*self.state.vm).global },
             vm: self.state.vm,
+            constants: code.constants.as_ptr(),
         }
     }
 

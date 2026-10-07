@@ -2736,6 +2736,49 @@ stencil!("jge_smi_f"; |s| {
     }
     next!(s)
 });
+// `JumpIfStrictEqualSmi k` (a `switch` case): `acc === k`, which only an
+// int32 or a double can be, so the generic form needs no runtime.
+imm_variants!("jseq_smi_i"; |s, k| {
+    // As `jlt_smi_i`: the immediate in the `cmp`.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = k;
+        core::arch::asm!(
+            "cmp {v:e}, offset {imm}",
+            "{{disp32}} je {taken}",
+            v = in(reg) s.acc.to_bits(),
+            imm = sym toi_hole_imm,
+            taken = label { unsafe { jump!(s) } },
+            options(nomem, nostack),
+        );
+        next!(s)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if int(s.acc) == k {
+            jump!(s)
+        }
+        next!(s)
+    }
+});
+stencil!("jseq_smi_f"; |s| {
+    if s.facc == imm() as f64 {
+        jump!(s)
+    }
+    next!(s)
+});
+stencil!("jseq_smi"; |s| {
+    let c = if s.tag.is_int32(s.acc) {
+        int(s.acc) == imm()
+    } else {
+        s.tag.is_double(s.acc) && s.tag.decode_f64(s.acc) == imm() as f64
+    };
+    if c {
+        jump!(s)
+    }
+    next!(s)
+});
+
 // Generic: `imm` is k, the 64-bit immediate the relation's mask (see
 // `holds`), with `x` = k.
 stencil_slow!("jrel_smi"; |s| {

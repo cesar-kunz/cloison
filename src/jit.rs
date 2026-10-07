@@ -1067,6 +1067,7 @@ fn is_compare_jump(op: Op) -> bool {
             | Op::JumpIfLessEqualSmi
             | Op::JumpIfGreaterSmi
             | Op::JumpIfGreaterEqualSmi
+            | Op::JumpIfStrictEqualSmi
     )
 }
 
@@ -1124,7 +1125,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::JumpIfLessSmi
                 | Op::JumpIfLessEqualSmi
                 | Op::JumpIfGreaterSmi
-                | Op::JumpIfGreaterEqualSmi => {
+                | Op::JumpIfGreaterEqualSmi
+                | Op::JumpIfStrictEqualSmi => {
                     (imm, target) = (imm_at(pc + 1), index_of(pc, imm_at(pc + 5)))
                 }
                 Op::Jump
@@ -1877,6 +1879,8 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 _ => generic,
             };
         }
+        // A `switch` case: `acc === k`, `acc` unchanged.
+        Op::JumpIfStrictEqualSmi => ("jseq_smi", num_case(st.acc)),
         // `acc OP r` on int32s as an existing `<` stencil (`tlt_*` test
         // `r < acc`); generic `jrel`.
         Op::JumpIfLessEqual | Op::JumpIfGreater | Op::JumpIfGreaterEqual => {

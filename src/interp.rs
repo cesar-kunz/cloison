@@ -1840,6 +1840,28 @@ macro_rules! compare_jump {
     (@off smi, $pc:ident) => { imm32($pc, 5) };
 }
 
+handlers! {
+    fn op_jump_if_strict_equal_smi(pc, acc, regs, tag) {
+        let k = imm32(pc, 1);
+        let c = if tag.is_int32(acc) {
+            acc.as_i32_unchecked() == k
+        } else {
+            tag.is_double(acc) && tag.decode_f64(acc) == k as f64
+        };
+        if c {
+            next!(any, imm32(pc, 5), acc)
+        }
+        next!(any, Op::JumpIfStrictEqualSmi.size(), acc)
+    }
+
+    fn i32_jump_if_strict_equal_smi(pc, acc, regs, tag) {
+        if raw_i32(acc) == imm32(pc, 1) {
+            next!(i32, imm32(pc, 5), acc)
+        }
+        next!(i32, Op::JumpIfStrictEqualSmi.size(), acc)
+    }
+}
+
 compare_jump!(
     JumpIfLessEqual,
     JumpIfLessEqualLoop,
@@ -2311,6 +2333,7 @@ static TABLE: Table = {
     t[Op::JumpIfLessEqualSmiLoop as usize] = op_jle_smi_loop;
     t[Op::JumpIfGreaterSmiLoop as usize] = op_jgt_smi_loop;
     t[Op::JumpIfGreaterEqualSmiLoop as usize] = op_jge_smi_loop;
+    t[Op::JumpIfStrictEqualSmi as usize] = op_jump_if_strict_equal_smi;
     t[Op::TestGreaterThanJumpIfTrue as usize] = op_test_gt_jt;
     t[Op::TestGreaterThanJumpIfFalse as usize] = op_test_gt_jf;
     t[Op::TestLessThanOrEqualJumpIfTrue as usize] = op_test_le_jt;
@@ -2399,6 +2422,7 @@ static TABLE_I32: Table = {
     t[Op::JumpIfLessEqualSmiLoop as usize] = i32_jle_smi_loop;
     t[Op::JumpIfGreaterSmiLoop as usize] = i32_jgt_smi_loop;
     t[Op::JumpIfGreaterEqualSmiLoop as usize] = i32_jge_smi_loop;
+    t[Op::JumpIfStrictEqualSmi as usize] = i32_jump_if_strict_equal_smi;
     t[Op::TestGreaterThanJumpIfTrue as usize] = i32_test_gt_jt;
     t[Op::TestGreaterThanJumpIfFalse as usize] = i32_test_gt_jf;
     t[Op::TestLessThanOrEqualJumpIfTrue as usize] = i32_test_le_jt;

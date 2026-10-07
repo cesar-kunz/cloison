@@ -238,6 +238,9 @@ define_ops! {
     JumpIfGreaterSmiLoop(Imm, Off),
     /// `JumpIfGreaterEqualSmi` backwards.
     JumpIfGreaterEqualSmiLoop(Imm, Off),
+    /// `if acc === imm32 { pc += off32 }` (an int32 equal to it, or a
+    /// double); `acc` is unchanged. A `switch`'s cases.
+    JumpIfStrictEqualSmi(Imm, Off),
 
     // ---- Superinstructions (see `quicken`) ----
     // Each is a comparison immediately followed by a `JumpIfTrue` or

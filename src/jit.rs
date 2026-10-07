@@ -37,7 +37,8 @@
 //! [      before `return`, then the instruction's stencil                 ]
 //! [ cold: edge stubs, exit stubs (spill, then exit), `__slow` helpers    ]
 //! [ runtime-call wrappers: one per `toi_rt_*` referenced, saving the     ]
-//! [      slot registers this region uses                                 ]
+//! [      slot registers this region uses (for `toi_rt_enter`, the call   ]
+//! [      into compiled code itself, inline)                              ]
 //! ```
 //!
 //! On arm64 most stencils come from family templates: `build.rs` stores one
@@ -358,12 +359,102 @@ mod arch {
     ///
     /// Entered with rsp ≡ 8 (mod 16), as from any call at an aligned site.
     pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
+        let (mut c, restore) = saves(gprs, fprs);
+        c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
+        c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+        call_abs(&mut c, target);
+        c.extend(restore);
+        c
+    }
+
+    /// The wrapper for `toi_rt_enter` (see [`super::toi_rt_enter`]), which
+    /// does its work inline, for compiled code calling compiled code: with
+    /// `regs` in rax and the site in r11, and the slot registers `gprs` and
+    /// `fprs` saved as for any runtime call, it checks the native stack
+    /// (else calls `toi_rt_call`), sets up the callee's frame register,
+    /// flags and `acc`, and calls its entry. The callee shares the caller's
+    /// `ctx` (the exit cell, `NO_EXIT` while code runs) and tag. The
+    /// callee's code uses every register; the caller relies on r13, rbx
+    /// and rbp (which LLVM may keep values in across the call), so those
+    /// are saved; `acc` (r12) is declared clobbered by `call_direct`. If the
+    /// callee exited, its record is in the cell: `toi_direct_exit` finishes
+    /// the call, and the cell is reset.
+    pub fn enter_wrapper(gprs: &[u8], fprs: &[u8], k: &super::EnterConsts) -> Vec<u8> {
+        let disp8 = |d: usize| u8::try_from(d).ok().filter(|&d| d < 0x80).unwrap();
+        let (mut c, restore) = saves(gprs, fprs);
+        c.extend([0x4D, 0x8B, 0x53, disp8(k.limit)]); // mov r10, [r11 + limit]
+        c.extend([0x49, 0x3B, 0x22]); // cmp rsp, [r10]
+        c.extend([0x0F, 0x82, 0, 0, 0, 0]); // jb slow
+        let to_slow = c.len();
+        c.extend([0x53, 0x55, 0x41, 0x53, 0x41, 0x55]); // push rbx, rbp, r11, r13
+        c.extend([0x4D, 0x8B, 0x53, disp8(k.frame)]); // mov r10, [r11 + frame]
+        c.extend([0x4E, 0x8D, 0x2C, 0xD0]); // lea r13, [rax + r10 * 8]
+        // mov qword ptr [r13 - flags], 0
+        c.extend([
+            0x49,
+            0xC7,
+            0x45,
+            (disp8(k.flags) as i8).wrapping_neg() as u8,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        c.extend([0x41, 0xBC]); // mov r12d, undefined
+        c.extend(u32::try_from(k.undefined).unwrap().to_le_bytes());
+        c.extend([0x41, 0xFF, 0x13]); // call [r11]
+        c.extend([0x41, 0x5D, 0x41, 0x5B, 0x5D, 0x5B]); // pop r13, r11, rbp, rbx
+        c.extend([0x41, 0x83, 0x3F, 0xFF]); // cmp dword ptr [r15], NO_EXIT
+        c.extend([0x0F, 0x85, 0, 0, 0, 0]); // jne exit
+        let to_exit = c.len();
+        let done = c.len();
+        c.extend(restore);
+        let rel = |c: &mut Vec<u8>, from: usize, to: usize| {
+            let d = (to as i32 - from as i32).to_le_bytes();
+            c[from - 4..from].copy_from_slice(&d);
+        };
+        let jmp_done = |c: &mut Vec<u8>| {
+            c.extend([0xE9, 0, 0, 0, 0]);
+            let at = c.len();
+            rel(c, at, done);
+        };
+        // exit: toi_direct_exit(regs, site, record, acc).
+        let at = c.len();
+        rel(&mut c, to_exit, at);
+        c.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
+        c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+        c.extend([0x41, 0x8B, 0x17]); // mov edx, [r15]
+        c.extend([0x41, 0xC7, 0x07, 0xFF, 0xFF, 0xFF, 0xFF]); // mov dword ptr [r15], NO_EXIT
+        c.extend([0x48, 0x89, 0xC1]); // mov rcx, rax
+        call_abs(&mut c, k.exit);
+        jmp_done(&mut c);
+        // slow: toi_rt_call(regs, site).
+        let at = c.len();
+        rel(&mut c, to_slow, at);
+        c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
+        c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+        call_abs(&mut c, k.call);
+        jmp_done(&mut c);
+        c
+    }
+
+    /// `movabs rax, target; call rax`.
+    fn call_abs(c: &mut Vec<u8>, target: u64) {
+        c.extend([0x48, 0xB8]);
+        c.extend(target.to_le_bytes());
+        c.extend([0xFF, 0xD0]);
+    }
+
+    /// A wrapper's saves of GPRs `gprs` and xmm registers `fprs`, leaving
+    /// rsp aligned for a call, and the restores and `ret` after it.
+    fn saves(gprs: &[u8], fprs: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut c = Vec::new();
-        for &r in gprs {
-            if r >= 8 {
+        let mut r = Vec::new();
+        for &g in gprs {
+            if g >= 8 {
                 c.push(0x41);
             }
-            c.push(0x50 + (r & 7)); // push r
+            c.push(0x50 + (g & 7)); // push g
         }
         // Spill area for xmm registers, padded so the call site is aligned.
         let mut frame = 8 * fprs.len();
@@ -379,26 +470,19 @@ mod arch {
         };
         for (i, &x) in fprs.iter().enumerate() {
             movsd(&mut c, 0x11, x, i);
-        }
-        c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
-        c.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
-        c.extend([0x48, 0xB8]); // movabs rax, target
-        c.extend(target.to_le_bytes());
-        c.extend([0xFF, 0xD0]); // call rax
-        for (i, &x) in fprs.iter().enumerate() {
-            movsd(&mut c, 0x10, x, i);
+            movsd(&mut r, 0x10, x, i);
         }
         if frame > 0 {
-            c.extend([0x48, 0x83, 0xC4, frame as u8]); // add rsp, frame
+            r.extend([0x48, 0x83, 0xC4, frame as u8]); // add rsp, frame
         }
-        for &r in gprs.iter().rev() {
-            if r >= 8 {
-                c.push(0x41);
+        for &g in gprs.iter().rev() {
+            if g >= 8 {
+                r.push(0x41);
             }
-            c.push(0x58 + (r & 7)); // pop r
+            r.push(0x58 + (g & 7)); // pop g
         }
-        c.push(0xC3); // ret
-        c
+        r.push(0xC3); // ret
+        (c, r)
     }
 
     /// Apply relocation `r_type` at `buf[0..]` (the field), located at
@@ -485,7 +569,105 @@ mod arch {
     /// restores them and returns the result in x8. Position-independent; the
     /// target address is a literal after the code.
     pub fn runtime_wrapper(target: u64, gprs: &[u8], fprs: &[u8]) -> Vec<u8> {
+        let (mut c, restore) = saves(gprs, fprs);
+        c.push(0xAA08_03E0); // mov x0, x8
+        c.push(0xAA09_03E1); // mov x1, x9
+        let call = c.len();
+        c.push(0); // ldr x16, literal (patched below)
+        c.push(0xD63F_0200); // blr x16
+        c.push(0xAA00_03E8); // mov x8, x0
+        c.extend(restore);
+        with_literals(c, &[(call, target)])
+    }
+
+    /// The wrapper for `toi_rt_enter`, doing its work inline: see the
+    /// x86-64 version. Besides the slot registers saved as for any runtime
+    /// call, it saves the C ABI's callee-saved registers the caller may
+    /// rely on and the callee's code may use (`preserve_none` preserves
+    /// only x29 and x30): x19, x21 (`regs`), x24–x28 and d8–d15; `acc`
+    /// (x20) is declared clobbered by `call_direct`.
+    pub fn enter_wrapper(gprs: &[u8], fprs: &[u8], k: &super::EnterConsts) -> Vec<u8> {
+        let ldr_x16_x9 = |off: usize| {
+            assert!(off.is_multiple_of(8) && off < 8 * 4096);
+            0xF940_0130 | ((off / 8) as u32) << 10
+        };
+        let (mut c, restore) = saves(gprs, fprs);
+        c.push(ldr_x16_x9(k.limit)); // ldr x16, [x9, #limit]
+        c.push(0xF940_0210); // ldr x16, [x16]
+        c.push(0x9100_03F1); // mov x17, sp
+        c.push(0xEB10_023F); // cmp x17, x16
+        let to_slow = c.len();
+        c.push(0x5400_0003); // b.lo slow
+        c.push(0xD102_03FF); // sub sp, sp, #128
+        let pairs = [
+            0xA900_57F3u32, // stp x19, x21, [sp]
+            0xA901_67F8,    // stp x24, x25, [sp, #16]
+            0xA902_6FFA,    // stp x26, x27, [sp, #32]
+            0xA903_27FC,    // stp x28, x9, [sp, #48]
+            0x6D04_27E8,    // stp d8, d9, [sp, #64]
+            0x6D05_2FEA,    // stp d10, d11, [sp, #80]
+            0x6D06_37EC,    // stp d12, d13, [sp, #96]
+            0x6D07_3FEE,    // stp d14, d15, [sp, #112]
+        ];
+        c.extend(pairs);
+        c.push(ldr_x16_x9(k.frame)); // ldr x16, [x9, #frame]
+        c.push(0x8B10_0D15); // add x21, x8, x16, lsl #3
+        assert!(k.flags < 256);
+        let imm9 = (k.flags as u32).wrapping_neg() & 0x1FF;
+        c.push(0xF800_02BF | imm9 << 12); // stur xzr, [x21, #-flags]
+        assert!(k.undefined < 1 << 16);
+        c.push(0xD280_0014 | (k.undefined as u32) << 5); // mov x20, #undefined
+        c.push(0xF940_0130); // ldr x16, [x9]
+        c.push(0xD63F_0200); // blr x16
+        c.extend(pairs.map(|p| p | 1 << 22)); // ldp, the same
+        c.push(0x9102_03FF); // add sp, sp, #128
+        c.push(0xAA00_03E8); // mov x8, x0
+        c.push(0xB940_02F0); // ldr w16, [x23]
+        c.push(0x3100_061F); // cmn w16, #1
+        let to_exit = c.len();
+        c.push(0x5400_0001); // b.ne exit
+        let done = c.len();
+        c.extend(restore);
+        let branch = |c: &mut Vec<u32>, from: usize, to: usize, bits: u32, shift: u32| {
+            let d = (to as i64 - from as i64) as u32 & ((1 << bits) - 1);
+            c[from] |= d << shift;
+        };
+        // exit: toi_direct_exit(regs, site, record, acc).
+        let at = c.len();
+        branch(&mut c, to_exit, at, 19, 5);
+        c.push(0xAA15_03E0); // mov x0, x21
+        c.push(0xAA09_03E1); // mov x1, x9
+        c.push(0x2A10_03E2); // mov w2, w16
+        c.push(0xAA08_03E3); // mov x3, x8
+        c.push(0x1280_0010); // mov w16, #-1
+        c.push(0xB900_02F0); // str w16, [x23]
+        let exit = c.len();
+        c.push(0); // ldr x16, literal
+        c.push(0xD63F_0200); // blr x16
+        c.push(0xAA00_03E8); // mov x8, x0
+        let at = c.len();
+        c.push(0x1400_0000); // b done
+        branch(&mut c, at, done, 26, 0);
+        // slow: toi_rt_call(regs, site).
+        let at = c.len();
+        branch(&mut c, to_slow, at, 19, 5);
+        c.push(0xAA08_03E0); // mov x0, x8
+        c.push(0xAA09_03E1); // mov x1, x9
+        let call = c.len();
+        c.push(0); // ldr x16, literal
+        c.push(0xD63F_0200); // blr x16
+        c.push(0xAA00_03E8); // mov x8, x0
+        let at = c.len();
+        c.push(0x1400_0000); // b done
+        branch(&mut c, at, done, 26, 0);
+        with_literals(c, &[(exit, k.exit), (call, k.call)])
+    }
+
+    /// A wrapper's frame and saves of GPRs `gprs` and FP registers `fprs`,
+    /// and the restores and `ret` after its call.
+    fn saves(gprs: &[u8], fprs: &[u8]) -> (Vec<u32>, Vec<u32>) {
         let mut c: Vec<u32> = Vec::new();
+        let mut r: Vec<u32> = Vec::new();
         c.push(0xA9BF_7BFD); // stp x29, x30, [sp, #-16]!
         c.push(0x9100_03FD); // mov x29, sp
         let n = gprs.len() + fprs.len();
@@ -497,28 +679,29 @@ mod arch {
         let slot = |op: u32, r: u8, i: usize| op | (i as u32) << 10 | (31 << 5) | r as u32;
         let saves = gprs.iter().map(|&r| (0xF900_0000, 0xF940_0000, r));
         let saves = saves.chain(fprs.iter().map(|&r| (0xFD00_0000, 0xFD40_0000, r)));
-        let saves: Vec<_> = saves.collect();
-        for (i, &(st, _, r)) in saves.iter().enumerate() {
-            c.push(slot(st, r, i));
-        }
-        c.push(0xAA08_03E0); // mov x0, x8
-        c.push(0xAA09_03E1); // mov x1, x9
-        let ldr_at = c.len();
-        c.push(0); // ldr x16, literal (patched below)
-        c.push(0xD63F_0200); // blr x16
-        c.push(0xAA00_03E8); // mov x8, x0
-        for (i, &(_, ld, r)) in saves.iter().enumerate() {
-            c.push(slot(ld, r, i));
+        for (i, (st, ld, g)) in saves.enumerate() {
+            c.push(slot(st, g, i));
+            r.push(slot(ld, g, i));
         }
         if frame > 0 {
-            c.push(0x9100_03FF | frame << 10); // add sp, sp, #frame
+            r.push(0x9100_03FF | frame << 10); // add sp, sp, #frame
         }
-        c.push(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
-        c.push(0xD65F_03C0); // ret
-        let lit = c.len();
-        c[ldr_at] = 0x5800_0010 | ((lit - ldr_at) as u32) << 5;
+        r.push(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
+        r.push(0xD65F_03C0); // ret
+        (c, r)
+    }
+
+    /// Code `c` as bytes, followed by 64-bit literals, each loaded into x16
+    /// by the `ldr` (literal) placeholder at its index.
+    fn with_literals(mut c: Vec<u32>, lits: &[(usize, u64)]) -> Vec<u8> {
+        for (k, &(at, _)) in lits.iter().enumerate() {
+            let lit = c.len() + 2 * k;
+            c[at] = 0x5800_0010 | ((lit - at) as u32) << 5;
+        }
         let mut bytes: Vec<u8> = c.iter().flat_map(|i| i.to_le_bytes()).collect();
-        bytes.extend(target.to_le_bytes());
+        for &(_, v) in lits {
+            bytes.extend(v.to_le_bytes());
+        }
         bytes
     }
 
@@ -3533,8 +3716,13 @@ impl JitCode {
             for r in s.stencil.relocs {
                 let Sym::Rt(rt) = r.2 else { continue };
                 tramp_at.entry(rt).or_insert_with(|| {
-                    let target = runtime_function(RT_NAMES[rt as usize]) as u64;
-                    let code = arch::runtime_wrapper(target, &saved_gprs, &saved_fprs);
+                    let name = RT_NAMES[rt as usize];
+                    let code = if name == "toi_rt_enter" {
+                        arch::enter_wrapper(&saved_gprs, &saved_fprs, &EnterConsts::new())
+                    } else {
+                        let target = runtime_function(name) as u64;
+                        arch::runtime_wrapper(target, &saved_gprs, &saved_fprs)
+                    };
                     let at = pos;
                     pos += code.len().next_multiple_of(8);
                     wrappers.push((at, code));
@@ -5410,6 +5598,10 @@ unsafe fn materialize(
 /// frame `regs` has set up (see `Lowering::direct_setup`). `EMPTY` on an
 /// error.
 ///
+/// Compiled code doesn't call this function: a region's wrapper for it
+/// does the same inline, more cheaply (`arch::enter_wrapper`). This one
+/// serves `toi_rt_construct`, a Rust caller.
+///
 /// Its region's wrapper saves the slot registers the region uses, as for
 /// any runtime call. The callee's code uses every register freely, so this
 /// trampoline saves the C ABI's callee-saved ones. It sets up what the code
@@ -5543,6 +5735,32 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         undefined = const Value::UNDEFINED.to_bits(),
         exit = sym toi_direct_exit,
     )
+}
+
+/// What the inline version of [`toi_rt_enter`] in a region's wrapper for
+/// it (`arch::enter_wrapper`) needs: `CallSite` offsets, constants and
+/// the functions it calls.
+struct EnterConsts {
+    limit: usize,
+    frame: usize,
+    flags: usize,
+    undefined: u64,
+    call: u64,
+    exit: u64,
+}
+
+impl EnterConsts {
+    fn new() -> Self {
+        const { assert!(NO_EXIT == u32::MAX) };
+        EnterConsts {
+            limit: std::mem::offset_of!(CallSite, native_limit),
+            frame: std::mem::offset_of!(CallSite, frame),
+            flags: 8 * interp::FLAGS,
+            undefined: Value::UNDEFINED.to_bits(),
+            call: toi_rt_call as *const () as u64,
+            exit: toi_direct_exit as *const () as u64,
+        }
+    }
 }
 
 /// `construct_direct` stencils, once their checks passed: `new` of the

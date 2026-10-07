@@ -27,6 +27,11 @@ node bench/run.mjs --engine target/release/toi --time bench/bytecode/*.asm
 | [21-monomorphic-get.asm](21-monomorphic-get.asm) | [21](../micro/21-monomorphic-get.js) | `Construct`, store transitions in a constructor, a native call (`push`), `GetKeyed`, own-property `GetNamed` hits |
 | [23-prototype-method.asm](23-prototype-method.asm) | [23](../micro/23-prototype-method.js) | prototype-chain `GetNamed` hits (the method), `Call` with a receiver, a field updated in place |
 | [34-chained-loads.asm](34-chained-loads.asm) | [34](../micro/34-chained-loads.js) | chains of `GetNamed`, `TestLessThan` + `JumpIfFalse`, `SetNamed` replacing object-valued fields |
+| [90-recursive-fib.asm](90-recursive-fib.asm) | [90](../micro/90-recursive-fib.js) | a function calling itself twice (direct self-calls, inlined once) |
+| [91-mutual-recursion.asm](91-mutual-recursion.asm) | [91](../micro/91-mutual-recursion.js) | two functions calling each other (compiled together) |
+| [92-tail-recursion.asm](92-tail-recursion.asm) | [92](../micro/92-tail-recursion.js) | a self tail call (a loop), called from a loop |
+| [93-constructor-loop.asm](93-constructor-loop.asm) | [93](../micro/93-constructor-loop.js) | `Construct` in a loop (direct, `this` allocated in the stencil), store transitions |
+| [94-constructor-and-native.asm](94-constructor-and-native.asm) | [94](../micro/94-constructor-and-native.js) | `Construct` and a native `Call` (`push`) in one loop |
 
 ## The format
 

@@ -836,6 +836,21 @@ handlers! {
         tail!(slow_lda_global, acc)
     }
 
+    fn op_lda_global_inside_typeof(pc, acc, regs, tag) {
+        let g = (*frame_vm(regs)).global;
+        let ic = ic_at(regs, pc, 1);
+        if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
+            next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(g, (*ic).loc))
+        }
+        let r = (*frame_vm(regs)).get_global_typeof_miss(&*frame_code(regs), u16_at(pc, 1));
+        next_or_throw!(Op::LdaGlobalInsideTypeof.size(), r)
+    }
+
+    fn op_type_of(pc, acc, regs, tag) {
+        let v = (*frame_vm(regs)).type_of(acc);
+        next!(any, Op::TypeOf.size(), v)
+    }
+
     fn op_sta_global(pc, acc, regs, tag) {
         let g = (*frame_vm(regs)).global;
         let ic = ic_at(regs, pc, 1);
@@ -2349,6 +2364,8 @@ static TABLE: Table = {
     t[Op::JumpIfLessSmiLoop as usize] = op_jump_if_less_smi_loop;
     t[Op::Return as usize] = op_return;
     t[Op::Throw as usize] = op_throw;
+    t[Op::TypeOf as usize] = op_type_of;
+    t[Op::LdaGlobalInsideTypeof as usize] = op_lda_global_inside_typeof;
     t[Op::LdaUndefined as usize] = op_lda_undefined;
     t[Op::LdaNull as usize] = op_lda_null;
     t[Op::LdaTrue as usize] = op_lda_true;

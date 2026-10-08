@@ -971,6 +971,37 @@ impl Vm {
         self.get_named_miss(code, ic, object_value(g))
     }
 
+    /// `LdaGlobalInsideTypeof` miss: as `LdaGlobal`'s, but `undefined` for a
+    /// missing global.
+    pub fn get_global_typeof_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
+        let (_, name) = code.ic(ic);
+        if self.lookup(self.global, name).is_none() {
+            return Ok(Value::UNDEFINED);
+        }
+        self.get_named_miss(code, ic, object_value(self.global))
+    }
+
+    /// `typeof v`, a string constant.
+    pub fn type_of(&mut self, v: Value) -> Value {
+        let name = if v.is_number() {
+            "number"
+        } else if v.is_undefined() {
+            "undefined"
+        } else if v.is_bool() {
+            "boolean"
+        } else if v.is_cell() {
+            match unsafe { (*as_object(v)).class } {
+                Class::String => "string",
+                Class::Function | Class::Native => "function",
+                _ => "object",
+            }
+        } else {
+            "object"
+        };
+        let units: Vec<u16> = name.encode_utf16().collect();
+        self.string_constant(&units)
+    }
+
     /// `StaGlobal` miss (sloppy mode: creates the global if missing). Only
     /// stores to existing globals are cached.
     pub fn set_global_miss(&mut self, code: &Code, ic: u16, value: Value) -> Result<()> {

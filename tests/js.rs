@@ -341,7 +341,7 @@ fn rejects_what_it_cannot_compile() {
         ),
         ("var g = function h() { return h; };", "own name"),
         ("function f(i) { return i++; }", "postfix"),
-        ("var x = typeof 1;", "Typeof"),
+        ("var x = -y;", "Neg"),
         ("var o = {1: 2};", "the key `1`"),
         ("function f(a, b) { return a % b; }", "`%`"),
     ];
@@ -1541,6 +1541,25 @@ function main() {
 #[test]
 fn direct_calls_dispatched_on_the_callee_agree_with_node() {
     assert_eq!(value(&format!("{DIRECT_DISPATCH}\nmain();")), "73149");
+}
+
+/// `typeof` of every kind of value, of an undeclared global (no
+/// ReferenceError), and in a compiled loop. The expected value is Node's.
+const TYPEOF: &str = r#"
+function F() {}
+var o = { a: 1 }, arr = [1], s = "x", n = 1.5, i = 3, u, nl = null, t = true;
+function kinds() {
+  return typeof o + "," + typeof arr + "," + typeof s + "," + typeof n + "," + typeof i + "," + typeof u + "," + typeof nl + "," +
+          typeof t + "," + typeof F + "," + typeof Object + "," + typeof notDeclared + "," + typeof (1 + 1) + "," + typeof typeof 1;
+}
+function hot(v) { var c = 0; for (var k = 0; k < 5000; k++) if (typeof v == "number") c++; return c; }
+var r = kinds();
+r == "object,object,string,number,number,undefined,object,boolean,function,function,undefined,number,string" ? hot(4) + hot("a") + (typeof window != "undefined" ? 1 : 0) : r;
+"#;
+
+#[test]
+fn typeof_agrees_with_node() {
+    assert_eq!(value(TYPEOF), "5000");
 }
 
 /// A method a compiled loop calls inlined, without checking the callee

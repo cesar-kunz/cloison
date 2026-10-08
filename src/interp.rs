@@ -261,7 +261,7 @@ macro_rules! handlers {
             macro_rules! enter {
                 ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
                     let callee: *const Code = (*$fo).code;
-                    let new = push_frame($regs, callee, $this, $args, $argc, $flags, $pc.add($size));
+                    let new = push_frame($regs, $fo, callee, $this, $args, $argc, $flags, $pc.add($size));
                     if new.is_null() {
                         return stack_overflow($regs);
                     }
@@ -425,8 +425,14 @@ handlers! {
                 (*code).loop_budget.set(left);
             }
         }
-        if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
-            acc = construct_result(regs, acc);
+        let flags = (*regs.sub(FLAGS)).to_bits();
+        if flags != 0 {
+            if flags & CAPTURED != 0 {
+                (*frame_vm(regs)).close_upvalues(regs);
+            }
+            if flags & CONSTRUCT != 0 {
+                acc = construct_result(regs, acc);
+            }
         }
         let ret: *const u8 = header(regs, RET_PC);
         if ret.is_null() {
@@ -692,6 +698,9 @@ handlers! {
                 };
                 jump_to!(base.add(h as usize), v, regs)
             }
+            if (*regs.sub(FLAGS)).to_bits() & CAPTURED != 0 {
+                (*vm).close_upvalues(regs);
+            }
             let ret: *const u8 = header(regs, RET_PC);
             if ret.is_null() {
                 return Value::EMPTY;
@@ -888,6 +897,19 @@ handlers! {
         }
         let r = (*frame_vm(regs)).get_global_typeof_miss(&*frame_code(regs), u16_at(pc, 1));
         next_or_throw!(Op::LdaGlobalInsideTypeof.size(), r)
+    }
+
+    fn op_lda_upvalue(pc, acc, regs, tag) {
+        let f: *const crate::object::Object = header(regs, FUNC);
+        let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
+        next!(any, Op::LdaUpvalue.size(), *(*u).at)
+    }
+
+    fn op_sta_upvalue(pc, acc, regs, tag) {
+        let f: *const crate::object::Object = header(regs, FUNC);
+        let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
+        *(*u).at = acc;
+        next!(any, Op::StaUpvalue.size(), acc)
     }
 
     fn op_type_of(pc, acc, regs, tag) {
@@ -2079,7 +2101,19 @@ compare_jump!(
 
 #[inline(never)]
 fn create_closure(regs: *mut Value, i: u16) -> Value {
-    unsafe { (*frame_vm(regs)).create_closure(&*frame_code(regs), i) }
+    unsafe {
+        let code = &*frame_code(regs);
+        let callee = code.closures[i as usize];
+        if (&(*callee).upvalues).is_empty() {
+            return (*frame_vm(regs)).new_closure(callee);
+        }
+        // Upvalues of this frame's registers: closed when it ends.
+        if (*callee).upvalues.iter().any(|&(local, _)| local) {
+            *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
+        }
+        let current: *const crate::object::Object = header(regs, FUNC);
+        (*frame_vm(regs)).create_closure_in(code, i, regs, current)
+    }
 }
 
 #[inline(never)]
@@ -2409,6 +2443,8 @@ static TABLE: Table = {
     t[Op::Return as usize] = op_return;
     t[Op::Throw as usize] = op_throw;
     t[Op::TypeOf as usize] = op_type_of;
+    t[Op::LdaUpvalue as usize] = op_lda_upvalue;
+    t[Op::StaUpvalue as usize] = op_sta_upvalue;
     t[Op::LdaGlobalInsideTypeof as usize] = op_lda_global_inside_typeof;
     t[Op::LdaUndefined as usize] = op_lda_undefined;
     t[Op::LdaNull as usize] = op_lda_null;
@@ -2609,10 +2645,16 @@ const VM: usize = 6;
 const RET_PC: usize = 7;
 const CALLER: usize = 8;
 pub(crate) const FLAGS: usize = 9;
-pub const HEADER: usize = 9;
+/// The function object called (for its upvalues; set by the interpreter's
+/// calls, not by compiled code, which runs no function that has any).
+const FUNC: usize = 10;
+pub const HEADER: usize = 10;
 
 /// `regs[-FLAGS]` of a frame entered by `Construct`.
 pub(crate) const CONSTRUCT: u64 = 1;
+/// `regs[-FLAGS]` of a frame whose registers open upvalues point to: its
+/// return (or an unwind past it) closes them.
+const CAPTURED: u64 = 2;
 
 /// A pointer kept in a frame header slot.
 #[inline(always)]
@@ -2715,8 +2757,10 @@ unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
 /// the first `argc` values at `args` as parameters, the rest `undefined`.
 /// Null if the VM stack is full.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn push_frame(
     regs: *mut Value,
+    fo: *mut crate::object::Object,
     callee: *const Code,
     this: Value,
     args: *const Value,
@@ -2738,6 +2782,7 @@ unsafe fn push_frame(
         set_header(new, RET_PC, ret);
         set_header(new, CALLER, regs);
         *new.sub(FLAGS) = Value::from_bits(flags);
+        set_header(new, FUNC, fo);
         *new = this;
         // Scalar loops: counts are small, and vectorized ones would bloat
         // the handler with prologues and remainders.
@@ -3184,6 +3229,7 @@ pub(crate) unsafe fn call_from_jit(
         }
         let flags = if op == Op::Construct { CONSTRUCT } else { 0 };
         write_frame_header(vm, new, callee, std::ptr::null(), regs, flags);
+        set_header(new, FUNC, fo);
         *new = this;
         let k = argc.min((*callee).nparams as usize);
         for i in 0..k {

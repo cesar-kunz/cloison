@@ -107,6 +107,11 @@ define_ops! {
     Throw(),
     /// `acc = typeof acc`.
     TypeOf(),
+    /// `acc` = the function's upvalue `k` (an enclosing function's
+    /// variable).
+    LdaUpvalue(Count),
+    /// Upvalue `k` = `acc`.
+    StaUpvalue(Count),
 
     // ---- Constants and registers ----
     /// `acc = undefined`

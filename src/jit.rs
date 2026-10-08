@@ -8813,7 +8813,7 @@ impl Lowering<'_> {
         }
         let callee = unsafe { (*fo).code };
         // Not compiled: its exception handlers need interpreted frames.
-        if unsafe { !(&(*callee).handlers).is_empty() } {
+        if unsafe { (*callee).interpreted } {
             return false;
         }
         // A constructor's `this` is allocated by the call
@@ -9007,7 +9007,7 @@ impl Lowering<'_> {
         }
         let callee = unsafe { (*fo).code };
         // Exceptions unwind only through interpreted frames.
-        if unsafe { !(&(*callee).handlers).is_empty() } {
+        if unsafe { (*callee).interpreted } {
             return false;
         }
         if !self.call_in_loop

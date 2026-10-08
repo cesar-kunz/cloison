@@ -157,9 +157,7 @@ impl Parser<'_> {
                 self.semicolon()?;
                 StmtKind::Var(decls)
             }
-            Tok::Keyword(
-                k @ ("let" | "const" | "class" | "with" | "import" | "export"),
-            ) => {
+            Tok::Keyword(k @ ("let" | "const" | "class" | "with" | "import" | "export")) => {
                 return self.err(format!("`{k}` is not supported"));
             }
             Tok::Keyword("function") => {

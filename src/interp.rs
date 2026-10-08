@@ -653,6 +653,10 @@ handlers! {
     // ---- Constants and registers ----
     // The loads ignore `acc`, so they also serve as I32 entries.
 
+    fn op_throw(pc, acc, regs, tag) {
+        return throw(frame_vm(regs), Error::thrown(acc))
+    }
+
     fn op_lda_undefined(pc, acc, regs, tag) {
         next!(any, Op::LdaUndefined.size(), Value::UNDEFINED)
     }
@@ -2344,6 +2348,7 @@ static TABLE: Table = {
     t[Op::JumpIfLessLoop as usize] = op_jump_if_less_loop;
     t[Op::JumpIfLessSmiLoop as usize] = op_jump_if_less_smi_loop;
     t[Op::Return as usize] = op_return;
+    t[Op::Throw as usize] = op_throw;
     t[Op::LdaUndefined as usize] = op_lda_undefined;
     t[Op::LdaNull as usize] = op_lda_null;
     t[Op::LdaTrue as usize] = op_lda_true;

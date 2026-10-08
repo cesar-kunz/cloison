@@ -79,10 +79,10 @@ fn listings_are_what_the_front_end_emits() {
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
     "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
-    "17", "18", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33",
-    "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "50", "51", "52",
-    "53", "54", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "80", "81",
-    "82", "83", "84", "85", "86", "87", "90", "91", "92", "93", "94",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
+    "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "50", "51",
+    "52", "53", "54", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "80",
+    "81", "82", "83", "84", "85", "86", "87", "90", "91", "92", "93", "94",
 ];
 
 #[test]
@@ -306,6 +306,30 @@ fn the_script_returns_its_last_expression_statement() {
         "10"
     );
     assert_eq!(value("var s = 1;"), "undefined");
+}
+
+/// An uncaught `throw` ends the run with the value thrown, from the script,
+/// from a function, and from a function compiled by then (where `Throw`
+/// leaves for the interpreter).
+#[test]
+fn uncaught_throws_end_the_run() {
+    for (src, want) in [
+        ("1; throw \"a\"; 2;", "a"),
+        ("throw 1.5;", "1.5"),
+        ("function f() { throw null; } f();", "null"),
+        (
+            "function f(n) { if (n > 5) throw \"big \" + n; return n; } \
+             var s = 0; for (var i = 0; i < 5000; i++) s += f(i & 3); f(9);",
+            "big 9",
+        ),
+        (
+            "function f(o) { for (var i = 0; i < 3000; i++) if (i == o.at) throw o; return 0; } \
+             f({ at: -1 }); f({ at: 2500 });",
+            "[object Object]",
+        ),
+    ] {
+        assert_eq!(run(src), Err(want.to_string()), "{src}");
+    }
 }
 
 #[test]

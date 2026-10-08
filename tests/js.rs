@@ -1447,6 +1447,102 @@ fn direct_calls_from_several_versions_agree_with_node() {
     assert_eq!(value(&format!("{DIRECT_SITES}\nmain();")), "5117370");
 }
 
+/// A call site seeing three methods too long to inline: a direct call to
+/// each, dispatched on the callee, and `D`'s, which comes after `run` is
+/// compiled, through the runtime. The expected value is Node's.
+const DIRECT_DISPATCH: &str = r#"
+function A(v) { this.v = v; }
+A.prototype.f = function (s) {
+  s = s + this.v * 1 + 0; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 1; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 2; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 3; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 4; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 5; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 6; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 7; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 8; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 9; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 10; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 11; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 12; if (s > 100000) s = s - 99991;
+  s = s + this.v * 1 + 13; if (s > 100000) s = s - 99991;
+  return s;
+};
+function B(v) { this.v = v; }
+B.prototype.f = function (s) {
+  s = s + this.v * 2 + 0; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 1; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 2; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 3; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 4; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 5; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 6; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 7; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 8; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 9; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 10; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 11; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 12; if (s > 100000) s = s - 99991;
+  s = s + this.v * 2 + 13; if (s > 100000) s = s - 99991;
+  return s;
+};
+function C(v) { this.v = v; }
+C.prototype.f = function (s) {
+  s = s + this.v * 3 + 0; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 1; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 2; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 3; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 4; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 5; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 6; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 7; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 8; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 9; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 10; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 11; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 12; if (s > 100000) s = s - 99991;
+  s = s + this.v * 3 + 13; if (s > 100000) s = s - 99991;
+  return s;
+};
+function D(v) { this.v = v; }
+D.prototype.f = function (s) {
+  s = s + this.v * 4 + 0; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 1; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 2; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 3; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 4; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 5; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 6; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 7; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 8; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 9; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 10; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 11; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 12; if (s > 100000) s = s - 99991;
+  s = s + this.v * 4 + 13; if (s > 100000) s = s - 99991;
+  return s;
+};
+function run(objs, n) {
+  var s = 0;
+  for (var r = 0; r < n; r++)
+    for (var i = 0; i < objs.length; i++) s = objs[i].f(s);
+  return s;
+}
+function main() {
+  var objs = [];
+  for (var i = 0; i < 30; i++) objs.push(i % 3 == 0 ? new A(i) : i % 3 == 1 ? new B(i) : new C(i));
+  var s = run(objs, 200);
+  objs.push(new D(7));
+  return s + run(objs, 200);
+}
+"#;
+
+#[test]
+fn direct_calls_dispatched_on_the_callee_agree_with_node() {
+    assert_eq!(value(&format!("{DIRECT_DISPATCH}\nmain();")), "73149");
+}
+
 /// A method a compiled loop calls inlined, without checking the callee
 /// (its prototype holds it), replaced from a called function and from the
 /// loop itself. The expected value is Node's.

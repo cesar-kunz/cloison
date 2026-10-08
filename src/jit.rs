@@ -8412,26 +8412,39 @@ impl Lowering<'_> {
                     let callee = self.inline_ctor(frame, &i, depth).unwrap();
                     self.inline_construct(frame, &i, callee, depth);
                 }
-                Op::Call | Op::CallUndefined | Op::Construct => {
-                    let vm = self.state.vm;
-                    let mut site = self.call_site(frame, &i);
-                    let direct =
-                        self.direct_target(frame, &i, &mut site) && i.imm as u32 <= site.nparams;
-                    let p = Prop::Call {
-                        site: self.out.sites.len() as u32,
-                        direct,
-                        epoch: unsafe { (*vm).code_epoch },
-                        epoch_addr: unsafe { &raw const (*vm).code_epoch } as u64,
-                    };
-                    let callee = site.callee;
-                    self.out
-                        .sites
-                        .push(Box::new(std::cell::UnsafeCell::new(site)));
-                    if direct {
-                        self.direct_setup(frame, i, callee, p);
-                    } else {
-                        self.push(i, p);
+                Op::Call | Op::CallUndefined
+                    if self.cached_callees(frame, &i).len() > 1
+                        && self
+                            .state
+                            .callee_exits
+                            .get(&origin)
+                            .is_none_or(|&n| n < MAX_PROPERTY_EXITS) =>
+                {
+                    // Several callees, not inlined: a direct call to each,
+                    // dispatched on the callee; the last one's site calls
+                    // any other through the runtime.
+                    let fos = self.cached_callees(frame, &i);
+                    let mut ends = Vec::new();
+                    for (n, &fo) in fos.iter().enumerate() {
+                        let last = n + 1 == fos.len();
+                        let guard = (!last).then(|| {
+                            let mut g = synth(Op::Nop, i.reg, frame, i.pc);
+                            (g.guard, g.next_case) = (fo as u64, true);
+                            self.push(g, Prop::None)
+                        });
+                        self.emit_call(frame, i, fo);
+                        if let Some(g) = guard {
+                            let mut j = synth(Op::Jump, 0, frame, i.pc);
+                            j.target = usize::MAX;
+                            ends.push(self.push(j, Prop::None));
+                            self.out.insns[g].target = self.out.insns.len();
+                        }
                     }
+                    self.return_past(ends);
+                }
+                Op::Call | Op::CallUndefined | Op::Construct => {
+                    let fo = unsafe { (*self.out.fbs[frame].ic(i.ic as usize)).holder };
+                    self.emit_call(frame, i, fo);
                 }
                 _ if i.jumps() => {
                     let x = self.push(i, Prop::None);
@@ -8529,10 +8542,53 @@ impl Lowering<'_> {
         }
     }
 
-    fn direct_target(&mut self, frame: usize, i: &Insn, site: &mut CallSite) -> bool {
+    /// Call `i` of frame `frame` through a site of its own: straight into
+    /// `fo`'s compiled code if it may (see [`Lowering::direct_target`]),
+    /// else through the runtime.
+    fn emit_call(&mut self, frame: usize, i: Insn, fo: *mut Object) {
+        let vm = self.state.vm;
+        let mut site = self.call_site(frame, &i);
+        let direct = self.direct_target(&i, fo, &mut site) && i.imm as u32 <= site.nparams;
+        let p = Prop::Call {
+            site: self.out.sites.len() as u32,
+            direct,
+            epoch: unsafe { (*vm).code_epoch },
+            epoch_addr: unsafe { &raw const (*vm).code_epoch } as u64,
+        };
+        let callee = site.callee;
+        self.out
+            .sites
+            .push(Box::new(std::cell::UnsafeCell::new(site)));
+        if direct {
+            self.direct_setup(frame, i, callee, p);
+        } else {
+            self.push(i, p);
+        }
+    }
+
+    /// The bytecode functions call `i`'s cache has seen, if more than one
+    /// and all of them are (natives, `f.call`, … go through the runtime).
+    fn cached_callees(&self, frame: usize, i: &Insn) -> Vec<*mut Object> {
         use crate::object::Class;
-        let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
-        let fo = ic.holder;
+        let ic = self.out.fbs[frame].ic(i.ic as usize);
+        let mut fos = Vec::new();
+        for k in 0..crate::vm::IC_WAYS {
+            let w = unsafe { *ic.add(k) };
+            if w.holder.is_null() {
+                break;
+            }
+            if unsafe { (*w.holder).class } != Class::Function || w.loc == crate::vm::VIA_CALL {
+                return Vec::new();
+            }
+            if !fos.contains(&w.holder) {
+                fos.push(w.holder);
+            }
+        }
+        if fos.len() > 1 { fos } else { Vec::new() }
+    }
+
+    fn direct_target(&mut self, i: &Insn, fo: *mut Object, site: &mut CallSite) -> bool {
+        use crate::object::Class;
         if fo.is_null() {
             return false;
         }

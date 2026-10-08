@@ -6500,6 +6500,9 @@ type Decoded = Rc<(Vec<Insn>, Vec<bool>)>;
 /// `Vm::jit_caches`).
 #[derive(Default)]
 pub(crate) struct Caches {
+    /// Code call sites were bound to before, kept alive (see
+    /// `CallSite::bind`).
+    retired: Vec<Rc<JitCode>>,
     /// Decoded code of functions inlined, with accumulator liveness after
     /// each instruction.
     decoded: HashMap<*const crate::vm::Code, Decoded>,
@@ -6838,7 +6841,13 @@ impl CallSite {
     fn bind(&mut self, code: Rc<JitCode>, nregs: usize) {
         self.entry = code.entry_addr();
         self.end_off = 8 * (self.frame + nregs + interp::HEADER) as u64;
-        self.target = Some(code);
+        // The code bound before may be running: a direct call into it is
+        // on the native stack below this rebinding (a pending site bound
+        // by `toi_rt_call` from inside its callee, say). It stays alive
+        // with the VM, as dropping it would free code returned into.
+        if let Some(old) = self.target.replace(code) {
+            unsafe { (*self.vm).jit_caches.retired.push(old) };
+        }
         self.bound = true;
     }
 

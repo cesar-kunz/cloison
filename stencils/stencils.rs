@@ -541,6 +541,52 @@ macro_rules! loc {
 }
 
 /// int32 view of a boxed int.
+/// `x` as a double. On x86-64 `cvtsi2sd` writes only the low half of its
+/// register, so it waits for the register's last writer (LLVM doesn't break
+/// the dependency here): in a loop that's often the previous iteration's
+/// `divsd`. Zeroing the register first (`xorps`, free at rename) breaks
+/// it. (Measured on 03-double-scale: 8.4M to 3.5M cycles.)
+#[inline(always)]
+fn i2f(x: i32) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let r: f64;
+        core::arch::asm!(
+            "xorps {r}, {r}",
+            "cvtsi2sd {r}, {x:e}",
+            r = out(xmm_reg) r,
+            x = in(reg) x,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        r
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        x as f64
+    }
+}
+
+/// [`i2f`] for an `i64`.
+#[inline(always)]
+fn l2f(x: i64) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let r: f64;
+        core::arch::asm!(
+            "xorps {r}, {r}",
+            "cvtsi2sd {r}, {x}",
+            r = out(xmm_reg) r,
+            x = in(reg) x,
+            options(pure, nomem, nostack, preserves_flags),
+        );
+        r
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        x as f64
+    }
+}
+
 #[inline(always)]
 fn int(v: Value) -> i32 {
     v.as_i32_unchecked()
@@ -555,7 +601,7 @@ fn is_num(tag: NumberTag, v: Value) -> bool {
 /// A boxed number's value.
 #[inline(always)]
 fn num(tag: NumberTag, v: Value) -> f64 {
-    if tag.is_int32(v) { int(v) as f64 } else { tag.decode_f64(v) }
+    if tag.is_int32(v) { i2f(int(v)) } else { tag.decode_f64(v) }
 }
 
 // ---- Accumulator-only and control stencils ----
@@ -652,7 +698,7 @@ stencil!("undo_add_smi_i"; |s| {
 });
 
 stencil!("add_smi_iif"; |s| {
-    s.facc = (int(s.acc) as i64 + imm() as i64) as f64;
+    s.facc = l2f(int(s.acc) as i64 + imm() as i64);
     next!(s)
 });
 
@@ -660,7 +706,7 @@ stencil!("add_smi_iif"; |s| {
 // a constant would be a load from .rodata, which stencils can't reference.
 // `inc` variants get `imm` = 1 from the JIT for the same reason.
 stencil!("add_smi_f"; |s| {
-    s.facc += imm() as f64;
+    s.facc += i2f(imm());
     next!(s)
 });
 
@@ -688,12 +734,12 @@ stencil!("inc_i"; |s| {
 });
 
 stencil!("inc_iif"; |s| {
-    s.facc = (int(s.acc) as i64 + 1) as f64;
+    s.facc = l2f(int(s.acc) as i64 + 1);
     next!(s)
 });
 
 stencil!("inc_f"; |s| {
-    s.facc += imm() as f64;
+    s.facc += i2f(imm());
     next!(s)
 });
 
@@ -736,7 +782,7 @@ imm_variants!("jlt_smi_i"; |s, k| {
 });
 
 stencil!("jlt_smi_f"; |s| {
-    if s.facc < imm() as f64 {
+    if s.facc < i2f(imm()) {
         jump!(s)
     }
     next!(s)
@@ -744,7 +790,7 @@ stencil!("jlt_smi_f"; |s| {
 
 // int32 acc → double facc, where a join widened acc's type.
 stencil!("conv_acc_f"; |s| {
-    s.facc = int(s.acc) as f64;
+    s.facc = i2f(int(s.acc));
     next!(s)
 });
 
@@ -799,7 +845,7 @@ macro_rules! boxed_location {
         });
         // int32 → double in place, where a join widened the type.
         stencil!("conv_", loc!($loc), "_f"; |s| {
-            set!($loc, s, s.tag.encode_f64(int(get!($loc, s)) as f64));
+            set!($loc, s, s.tag.encode_f64(i2f(int(get!($loc, s)))));
             next!(s)
         });
 
@@ -839,15 +885,15 @@ macro_rules! boxed_location {
             next!(s)
         });
         stencil!("add_iif_", loc!($loc); |s| {
-            s.facc = (int(s.acc) as i64 + int(get!($loc, s)) as i64) as f64;
+            s.facc = l2f(int(s.acc) as i64 + int(get!($loc, s)) as i64);
             next!(s)
         });
         stencil!("add_if_", loc!($loc); |s| {
-            s.facc = int(s.acc) as f64 + s.tag.decode_f64(get!($loc, s));
+            s.facc = i2f(int(s.acc)) + s.tag.decode_f64(get!($loc, s));
             next!(s)
         });
         stencil!("add_fi_", loc!($loc); |s| {
-            s.facc += int(get!($loc, s)) as f64;
+            s.facc += i2f(int(get!($loc, s)));
             next!(s)
         });
         stencil!("add_ff_", loc!($loc); |s| {
@@ -878,13 +924,13 @@ macro_rules! boxed_location {
             next!(s)
         });
         stencil!("jlt_if_", loc!($loc); |s| {
-            if (int(s.acc) as f64) < s.tag.decode_f64(get!($loc, s)) {
+            if i2f(int(s.acc)) < s.tag.decode_f64(get!($loc, s)) {
                 jump!(s)
             }
             next!(s)
         });
         stencil!("jlt_fi_", loc!($loc); |s| {
-            if s.facc < int(get!($loc, s)) as f64 {
+            if s.facc < i2f(int(get!($loc, s))) {
                 jump!(s)
             }
             next!(s)
@@ -927,7 +973,7 @@ macro_rules! fp_slot {
         });
         // Store an int32 acc into a register pinned as double.
         stencil!("star_i_f", $k; |s| {
-            s.f[$k] = int(s.acc) as f64;
+            s.f[$k] = i2f(int(s.acc));
             next!(s)
         });
 
@@ -937,7 +983,7 @@ macro_rules! fp_slot {
             next!(s)
         });
         stencil!("add_if_f", $k; |s| {
-            s.facc = int(s.acc) as f64 + s.f[$k];
+            s.facc = i2f(int(s.acc)) + s.f[$k];
             next!(s)
         });
         stencil!("add_ff_f", $k; |s| {
@@ -953,7 +999,7 @@ macro_rules! fp_slot {
             next!(s)
         });
         stencil!("jlt_if_f", $k; |s| {
-            if (int(s.acc) as f64) < s.f[$k] {
+            if i2f(int(s.acc)) < s.f[$k] {
                 jump!(s)
             }
             next!(s)
@@ -966,7 +1012,7 @@ macro_rules! fp_slot {
         });
 
         stencil!("enter_f", $k, "_i"; |s| {
-            s.f[$k] = int(*mem(s.regs)) as f64;
+            s.f[$k] = i2f(int(*mem(s.regs)));
             next!(s)
         });
         stencil!("enter_f", $k, "_f"; |s| {
@@ -1106,7 +1152,7 @@ macro_rules! fused_gpr_gpr {
 macro_rules! fused_fp {
     ($a:tt) => {
         stencil!("addi_f", $a; |s| {
-            s.f[$a] += imm() as f64;
+            s.f[$a] += i2f(imm());
             next!(s)
         });
     };
@@ -1115,7 +1161,7 @@ macro_rules! fused_fp {
 macro_rules! fused_fp_gpr {
     ($a:tt, $b:tt) => {
         stencil!("addr_fi_f", $a, "_g", $b; |s| {
-            s.f[$a] += int(s.g[$b]) as f64;
+            s.f[$a] += i2f(int(s.g[$b]));
             next!(s)
         });
     };
@@ -1208,11 +1254,11 @@ macro_rules! int_slot {
             next!(s)
         });
         stencil!("add_iif_u", $k; |s| {
-            s.facc = (int(s.acc) as i64 + raw(s.g[$k]) as i64) as f64;
+            s.facc = l2f(int(s.acc) as i64 + raw(s.g[$k]) as i64);
             next!(s)
         });
         stencil!("add_fi_u", $k; |s| {
-            s.facc += raw(s.g[$k]) as f64;
+            s.facc += i2f(raw(s.g[$k]));
             next!(s)
         });
 
@@ -1238,7 +1284,7 @@ macro_rules! int_slot {
             next!(s)
         });
         stencil!("jlt_fi_u", $k; |s| {
-            if s.facc < raw(s.g[$k]) as f64 {
+            if s.facc < i2f(raw(s.g[$k])) {
                 jump!(s)
             }
             next!(s)
@@ -1365,7 +1411,7 @@ macro_rules! int_slot_pair {
 macro_rules! fp_int_slot_pair {
     ($a:tt, $b:tt) => {
         stencil!("addr_fi_f", $a, "_u", $b; |s| {
-            s.f[$a] += raw(s.g[$b]) as f64;
+            s.f[$a] += i2f(raw(s.g[$b]));
             next!(s)
         });
     };
@@ -1402,7 +1448,7 @@ macro_rules! mov_fp_pair {
 macro_rules! mov_fp_int_pair {
     ($c:tt, $a:tt) => {
         stencil!("mov_f", $c, "_u", $a; |s| {
-            s.f[$c] = raw(s.g[$a]) as f64;
+            s.f[$c] = i2f(raw(s.g[$a]));
             next!(s)
         });
     };
@@ -1522,7 +1568,7 @@ stencil_slow!("mod_smi"; |s| {
 /// float constant would be a load from `.rodata`.
 #[inline(always)]
 fn rem_f64(r: i32, a: i32) -> f64 {
-    f64::from_bits((r as f64).to_bits() | ((a as u32 >> 31) as u64) << 63)
+    f64::from_bits(i2f(r).to_bits() | ((a as u32 >> 31) as u64) << 63)
 }
 
 /// `a % d` for a constant d > 1 that is not a power of two, any sign, for
@@ -1801,7 +1847,7 @@ macro_rules! cmp_smi {
             }
         });
         stencil!($name, "_f"; |s| {
-            act!($act, s, s.facc == imm() as f64)
+            act!($act, s, s.facc == i2f(imm()))
         });
     };
 }
@@ -1926,10 +1972,10 @@ macro_rules! cmp_boxed {
             act!($act, s, rel!($rel, int(get!($loc, s)), int(s.acc)))
         });
         stencil!($name, "_if_", loc!($loc); |s| {
-            act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), int(s.acc) as f64))
+            act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), i2f(int(s.acc))))
         });
         stencil!($name, "_fi_", loc!($loc); |s| {
-            act!($act, s, rel!($rel, int(get!($loc, s)) as f64, s.facc))
+            act!($act, s, rel!($rel, i2f(int(get!($loc, s))), s.facc))
         });
         stencil!($name, "_ff_", loc!($loc); |s| {
             act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), s.facc))
@@ -1946,7 +1992,7 @@ macro_rules! cmp_fp {
             act!($act, s, c)
         });
         stencil!($name, "_if_f", $k; |s| {
-            act!($act, s, rel!($rel, s.f[$k], int(s.acc) as f64))
+            act!($act, s, rel!($rel, s.f[$k], i2f(int(s.acc))))
         });
         stencil!($name, "_ff_f", $k; |s| {
             act!($act, s, rel!($rel, s.f[$k], s.facc))
@@ -1971,7 +2017,7 @@ macro_rules! cmp_int {
             act!($act, s, rel!($rel, raw(s.g[$k]), int(s.acc)))
         });
         stencil!($name, "_fi_u", $k; |s| {
-            act!($act, s, rel!($rel, raw(s.g[$k]) as f64, s.facc))
+            act!($act, s, rel!($rel, i2f(raw(s.g[$k])), s.facc))
         });
     };
 }
@@ -2233,15 +2279,15 @@ macro_rules! group2_generic {
             next!(s)
         });
         stencil!("sub_iif_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 - int(s.acc) as f64;
+            s.facc = i2f(int(get!($loc, s))) - i2f(int(s.acc));
             next!(s)
         });
         stencil!("sub_if_", loc!($loc); |s| {
-            s.facc = s.tag.decode_f64(get!($loc, s)) - int(s.acc) as f64;
+            s.facc = s.tag.decode_f64(get!($loc, s)) - i2f(int(s.acc));
             next!(s)
         });
         stencil!("sub_fi_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 - s.facc;
+            s.facc = i2f(int(get!($loc, s))) - s.facc;
             next!(s)
         });
         stencil!("sub_ff_", loc!($loc); |s| {
@@ -2282,15 +2328,15 @@ macro_rules! group2_generic {
             next!(s)
         });
         stencil!("mul_iif_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 * int(s.acc) as f64;
+            s.facc = i2f(int(get!($loc, s))) * i2f(int(s.acc));
             next!(s)
         });
         stencil!("mul_if_", loc!($loc); |s| {
-            s.facc = s.tag.decode_f64(get!($loc, s)) * int(s.acc) as f64;
+            s.facc = s.tag.decode_f64(get!($loc, s)) * i2f(int(s.acc));
             next!(s)
         });
         stencil!("mul_fi_", loc!($loc); |s| {
-            s.facc *= int(get!($loc, s)) as f64;
+            s.facc *= i2f(int(get!($loc, s)));
             next!(s)
         });
         stencil!("mul_ff_", loc!($loc); |s| {
@@ -2301,7 +2347,7 @@ macro_rules! group2_generic {
         stencil_slow!("div_", loc!($loc); |s| {
             let l = get!($loc, s);
             if s.tag.both_int32(l, s.acc) {
-                s.acc = s.tag.encode_f64(int(l) as f64 / int(s.acc) as f64);
+                s.acc = s.tag.encode_f64(i2f(int(l)) / i2f(int(s.acc)));
                 next!(s)
             }
             slow!(s)
@@ -2311,15 +2357,15 @@ macro_rules! group2_generic {
             next!(s)
         });
         stencil!("div_ii_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 / int(s.acc) as f64;
+            s.facc = i2f(int(get!($loc, s))) / i2f(int(s.acc));
             next!(s)
         });
         stencil!("div_if_", loc!($loc); |s| {
-            s.facc = s.tag.decode_f64(get!($loc, s)) / int(s.acc) as f64;
+            s.facc = s.tag.decode_f64(get!($loc, s)) / i2f(int(s.acc));
             next!(s)
         });
         stencil!("div_fi_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 / s.facc;
+            s.facc = i2f(int(get!($loc, s))) / s.facc;
             next!(s)
         });
         stencil!("div_ff_", loc!($loc); |s| {
@@ -2354,11 +2400,11 @@ macro_rules! group2_int_slot {
             next!(s)
         });
         stencil!("sub_iif_u", $k; |s| {
-            s.facc = raw(s.g[$k]) as f64 - int(s.acc) as f64;
+            s.facc = i2f(raw(s.g[$k])) - i2f(int(s.acc));
             next!(s)
         });
         stencil!("sub_fi_u", $k; |s| {
-            s.facc = raw(s.g[$k]) as f64 - s.facc;
+            s.facc = i2f(raw(s.g[$k])) - s.facc;
             next!(s)
         });
         stencil_slow!("mul_ii_u", $k; |s| {
@@ -2381,19 +2427,19 @@ macro_rules! group2_int_slot {
             next!(s)
         });
         stencil!("mul_iif_u", $k; |s| {
-            s.facc = raw(s.g[$k]) as f64 * int(s.acc) as f64;
+            s.facc = i2f(raw(s.g[$k])) * i2f(int(s.acc));
             next!(s)
         });
         stencil!("mul_fi_u", $k; |s| {
-            s.facc *= raw(s.g[$k]) as f64;
+            s.facc *= i2f(raw(s.g[$k]));
             next!(s)
         });
         stencil!("div_ii_u", $k; |s| {
-            s.facc = raw(s.g[$k]) as f64 / int(s.acc) as f64;
+            s.facc = i2f(raw(s.g[$k])) / i2f(int(s.acc));
             next!(s)
         });
         stencil!("div_fi_u", $k; |s| {
-            s.facc = raw(s.g[$k]) as f64 / s.facc;
+            s.facc = i2f(raw(s.g[$k])) / s.facc;
             next!(s)
         });
         rel_int32!(concat!("u", $k), |s| raw(s.g[$k]));
@@ -2417,15 +2463,15 @@ macro_rules! group2_boxed_typed {
             next!(s)
         });
         stencil!("sub_iif_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 - int(s.acc) as f64;
+            s.facc = i2f(int(get!($loc, s))) - i2f(int(s.acc));
             next!(s)
         });
         stencil!("sub_if_", loc!($loc); |s| {
-            s.facc = s.tag.decode_f64(get!($loc, s)) - int(s.acc) as f64;
+            s.facc = s.tag.decode_f64(get!($loc, s)) - i2f(int(s.acc));
             next!(s)
         });
         stencil!("sub_fi_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 - s.facc;
+            s.facc = i2f(int(get!($loc, s))) - s.facc;
             next!(s)
         });
         stencil!("sub_ff_", loc!($loc); |s| {
@@ -2451,15 +2497,15 @@ macro_rules! group2_boxed_typed {
             next!(s)
         });
         stencil!("mul_iif_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 * int(s.acc) as f64;
+            s.facc = i2f(int(get!($loc, s))) * i2f(int(s.acc));
             next!(s)
         });
         stencil!("mul_if_", loc!($loc); |s| {
-            s.facc = s.tag.decode_f64(get!($loc, s)) * int(s.acc) as f64;
+            s.facc = s.tag.decode_f64(get!($loc, s)) * i2f(int(s.acc));
             next!(s)
         });
         stencil!("mul_fi_", loc!($loc); |s| {
-            s.facc *= int(get!($loc, s)) as f64;
+            s.facc *= i2f(int(get!($loc, s)));
             next!(s)
         });
         stencil!("mul_ff_", loc!($loc); |s| {
@@ -2467,15 +2513,15 @@ macro_rules! group2_boxed_typed {
             next!(s)
         });
         stencil!("div_ii_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 / int(s.acc) as f64;
+            s.facc = i2f(int(get!($loc, s))) / i2f(int(s.acc));
             next!(s)
         });
         stencil!("div_if_", loc!($loc); |s| {
-            s.facc = s.tag.decode_f64(get!($loc, s)) / int(s.acc) as f64;
+            s.facc = s.tag.decode_f64(get!($loc, s)) / i2f(int(s.acc));
             next!(s)
         });
         stencil!("div_fi_", loc!($loc); |s| {
-            s.facc = int(get!($loc, s)) as f64 / s.facc;
+            s.facc = i2f(int(get!($loc, s))) / s.facc;
             next!(s)
         });
         stencil!("div_ff_", loc!($loc); |s| {
@@ -2508,7 +2554,7 @@ macro_rules! group2_int_slot_pair {
 macro_rules! group2_fp_slot {
     ($k:tt) => {
         stencil!("sub_if_f", $k; |s| {
-            s.facc = s.f[$k] - int(s.acc) as f64;
+            s.facc = s.f[$k] - i2f(int(s.acc));
             next!(s)
         });
         stencil!("sub_ff_f", $k; |s| {
@@ -2516,7 +2562,7 @@ macro_rules! group2_fp_slot {
             next!(s)
         });
         stencil!("mul_if_f", $k; |s| {
-            s.facc = s.f[$k] * int(s.acc) as f64;
+            s.facc = s.f[$k] * i2f(int(s.acc));
             next!(s)
         });
         stencil!("mul_ff_f", $k; |s| {
@@ -2524,7 +2570,7 @@ macro_rules! group2_fp_slot {
             next!(s)
         });
         stencil!("div_if_f", $k; |s| {
-            s.facc = s.f[$k] / int(s.acc) as f64;
+            s.facc = s.f[$k] / i2f(int(s.acc));
             next!(s)
         });
         stencil!("div_ff_f", $k; |s| {
@@ -2625,16 +2671,16 @@ stencil!("mul_smi_zero_i"; |s| {
     next!(s)
 });
 stencil!("mul_smi_iif"; |s| {
-    s.facc = int(s.acc) as f64 * imm() as f64;
+    s.facc = i2f(int(s.acc)) * i2f(imm());
     next!(s)
 });
 stencil!("mul_smi_f"; |s| {
-    s.facc *= imm() as f64;
+    s.facc *= i2f(imm());
     next!(s)
 });
 stencil_slow!("div_smi"; |s| {
     if s.tag.is_int32(s.acc) {
-        s.acc = s.tag.encode_f64(int(s.acc) as f64 / imm() as f64);
+        s.acc = s.tag.encode_f64(i2f(int(s.acc)) / i2f(imm()));
         next!(s)
     }
     slow!(s)
@@ -2644,11 +2690,11 @@ stencil_slow!("div_smi"; |s| {
     next!(s)
 });
 stencil!("div_smi_i"; |s| {
-    s.facc = int(s.acc) as f64 / imm() as f64;
+    s.facc = i2f(int(s.acc)) / i2f(imm());
     next!(s)
 });
 stencil!("div_smi_f"; |s| {
-    s.facc /= imm() as f64;
+    s.facc /= i2f(imm());
     next!(s)
 });
 
@@ -2686,7 +2732,7 @@ stencil!("shr_smi_i_0"; |s| {
 fn box_shifted(tag: NumberTag, v: i64) -> Value {
     match i32::try_from(v) {
         Ok(i) => tag.box_i32(i),
-        Err(_) => tag.encode_f64(v as f64),
+        Err(_) => tag.encode_f64(l2f(v)),
     }
 }
 macro_rules! shift_generic {
@@ -2749,19 +2795,19 @@ imm_variants!("jge_smi_i"; |s, k| {
     }
 });
 stencil!("jle_smi_f"; |s| {
-    if s.facc <= imm() as f64 {
+    if s.facc <= i2f(imm()) {
         jump!(s)
     }
     next!(s)
 });
 stencil!("jgt_smi_f"; |s| {
-    if s.facc > imm() as f64 {
+    if s.facc > i2f(imm()) {
         jump!(s)
     }
     next!(s)
 });
 stencil!("jge_smi_f"; |s| {
-    if s.facc >= imm() as f64 {
+    if s.facc >= i2f(imm()) {
         jump!(s)
     }
     next!(s)
@@ -2792,7 +2838,7 @@ imm_variants!("jseq_smi_i"; |s, k| {
     }
 });
 stencil!("jseq_smi_f"; |s| {
-    if s.facc == imm() as f64 {
+    if s.facc == i2f(imm()) {
         jump!(s)
     }
     next!(s)
@@ -2801,7 +2847,7 @@ stencil!("jseq_smi"; |s| {
     let c = if s.tag.is_int32(s.acc) {
         int(s.acc) == imm()
     } else {
-        s.tag.is_double(s.acc) && s.tag.decode_f64(s.acc) == imm() as f64
+        s.tag.is_double(s.acc) && s.tag.decode_f64(s.acc) == i2f(imm())
     };
     if c {
         jump!(s)
@@ -3352,7 +3398,7 @@ stencil!("check_acc_shape"; |s| {
 // A number loaded from a field typed `Num`, into `facc`.
 stencil!("unbox_num_acc"; |s| {
     s.facc = if s.tag.is_int32(s.acc) {
-        int(s.acc) as f64
+        i2f(int(s.acc))
     } else {
         s.tag.decode_f64(s.acc)
     };

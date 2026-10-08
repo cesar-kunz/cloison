@@ -66,7 +66,8 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
 
 - `scripts/tiers.sh` times every file in toi's interpreter, toi with
   the JIT, and V8 capped at each of its tiers (Ignition, Sparkplug,
-  Maglev, Turbofan), as a table in `perf-history/tiers-<commit>.md`.
+  Maglev, Turbofan), as a table in `perf-history/tiers-<commit>.md`,
+  timing both inside the process, startup excluded.
   V8's times are cached by host, V8 version and file contents, so only new
   or changed files are measured again.
 

@@ -14,11 +14,16 @@
 # measured, the rest reused. Delete the cache (or pass --v8) after changing
 # how V8 is timed.
 #
-# Timing as in scripts/vs-v8.sh: V8 from compile to completion inside the
-# process (perf-history/v8time.js, Node's startup excluded); toi the CPU time
-# of the whole process (about 0.4 ms of it startup). Medians of REPS (toi,
-# default 7) and V8REPS (default 11) runs, pinned to an idle core
+# Both timed inside the process, from compile to completion, process
+# startup excluded (wall clock): V8 by perf-history/v8time.js (Node's
+# startup excluded), toi by its TOI_TIME (about 0.35 ms of startup
+# excluded; scripts/vs-v8.sh times toi's whole process). Medians of REPS
+# (toi, default 7) and V8REPS (default 11) runs, pinned to an idle core
 # (scripts/quiet.sh). Results are checked against `// expect:`.
+#
+# The machine's load average goes in the table's header, at the start and
+# the end of the run: V8's cached times may come from a quieter (or
+# busier) time than toi's.
 #
 # Node: $NODE, else a Node 26 (V8 14.6) the script downloads to
 # ~/.local/share/toi-v8 (the system's Node may predate Maglev).
@@ -76,10 +81,12 @@ toi_ms() {
   local f=$1 core=$2 i
   shift 2
   for i in $(seq "$reps"); do
-    env "$@" QUIET_CPU=${core%%,*} scripts/quiet.sh perf stat -x, -e task-clock target/release/toi "$f" 2>&1 >/dev/null | cut -d, -f1
+    env "$@" TOI_TIME=1 QUIET_CPU=${core%%,*} scripts/quiet.sh target/release/toi "$f" 2>&1 >/dev/null |
+      sed -n 's/^time //p'
   done | median
 }
 
+load_start=$(cut -d' ' -f1 /proc/loadavg)
 tiers=(ignition sparkplug maglev turbofan)
 declare -A flags=([ignition]=--max-opt=0 [sparkplug]=--max-opt=1 [maglev]=--max-opt=2 [turbofan]=)
 out=$hist/tiers-$commit.tsv
@@ -113,15 +120,15 @@ for f in bench/micro/*.js; do
 done
 mv "$tmp" "$out"
 
-python3 - "$out" "$commit" "$v8" <<'EOF' | tee "${out%.tsv}.md"
+python3 - "$out" "$commit" "$v8" "$load_start $(cut -d' ' -f1 /proc/loadavg)" <<'EOF' | tee "${out%.tsv}.md"
 import math, sys
-path, commit, v8 = sys.argv[1:]
+path, commit, v8, load = sys.argv[1:]
 rows = [l.rstrip("\n").split("\t") for l in open(path)]
 head, rows = rows[0], rows[1:]
 names = ["toi interp", "toi JIT", "Ignition", "Sparkplug", "Maglev", "Turbofan"]
 fmt = lambda x: "-" if x is None else f"{x:.3g}" if x < 100 else f"{x:.0f}"
 val = lambda s: None if s == "-" else float(s)
-print(f"Time (ms, medians) per benchmark: toi {commit}, V8 {v8} capped at each tier.\n")
+print(f"Time (ms, medians, compile to completion, process startup excluded) per benchmark: toi {commit}, V8 {v8} capped at each tier. Load average at the start and end: {load}.\n")
 print("| benchmark | " + " | ".join(names) + " |")
 print("|---|" + "---:|" * len(names))
 cols = [[] for _ in names]

@@ -1417,6 +1417,36 @@ fn calls_dispatched_on_the_receivers_shape_agree_with_node() {
     assert_eq!(value(&format!("{RECEIVER_DISPATCH}\nmain();")), "717000");
 }
 
+/// Direct calls from versions of one caller compiled for different types
+/// (`many` on `P`, `Q` and a literal): each version's call site is its own,
+/// bound to a version of `weight` for its types. And `new Array()` made
+/// in compiled code, until `Array` is replaced. The expected value is
+/// Node's.
+const DIRECT_SITES: &str = r#"
+function P(x) { this.x = x; }
+function Q(x) { this.y = 0; this.x = x; }
+function weight(o, k) { return o.x * k; }
+function many(o, n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) s += weight(o, i & 3) + weight(o, 1);
+  return s;
+}
+function bag() { var a = new Array(); a.push(1); return a.length; }
+function bags(n) { var s = 0; for (var i = 0; i < n; i++) s += bag(); return s; }
+function main() {
+  var s = 0;
+  for (var r = 0; r < 200; r++) s += many(new P(r), 50) + many(new Q(r), 50) + many({ x: r }, 5);
+  s += bags(3000);
+  Array = function () { this.push = function (v) {}; this.length = 7; };
+  return s + bags(10);
+}
+"#;
+
+#[test]
+fn direct_calls_from_several_versions_agree_with_node() {
+    assert_eq!(value(&format!("{DIRECT_SITES}\nmain();")), "5117370");
+}
+
 /// A method a compiled loop calls inlined, without checking the callee
 /// (its prototype holds it), replaced from a called function and from the
 /// loop itself. The expected value is Node's.

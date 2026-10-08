@@ -54,6 +54,9 @@ pub enum Class {
     /// to them and `elems_len` is the length (as arrays', so `length` reads
     /// the same field).
     String,
+    /// A `Date`: its time value (milliseconds since the epoch, an `f64`) is
+    /// kept in `code`'s bits (see `vm::date_value`).
+    Date,
 }
 
 /// The object is reachable from outside the internal heap. Always set for

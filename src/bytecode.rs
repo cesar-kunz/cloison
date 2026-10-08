@@ -107,6 +107,26 @@ define_ops! {
     Throw(),
     /// `acc = typeof acc`.
     TypeOf(),
+    /// `acc = r[a] % acc`
+    Mod(Reg),
+    /// `acc = r[a] & acc`
+    BitAnd(Reg),
+    /// `acc = r[a] | acc`
+    BitOr(Reg),
+    /// `acc = r[a] ^ acc`
+    BitXor(Reg),
+    /// `acc = r[a] << acc`
+    ShiftLeft(Reg),
+    /// `acc = r[a] >> acc`
+    ShiftRight(Reg),
+    /// `acc = r[a] >>> acc`
+    ShiftRightLogical(Reg),
+    /// `acc = +acc` (ToNumber)
+    ToNumber(),
+    /// `acc = -acc`
+    Negate(),
+    /// `acc = ~acc`
+    BitNot(),
     /// `acc` = the function's upvalue `k` (an enclosing function's
     /// variable).
     LdaUpvalue(Count),

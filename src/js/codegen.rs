@@ -88,39 +88,41 @@ fn upvalues<'a>(p: &'a Program, decls: &[Vec<&'a str>]) -> Scopes<'a> {
     Scopes { upvalues, captured }
 }
 
+/// The names expression `e` refers to (not its nested functions').
+fn expr_refs<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
+    use ExprKind::*;
+    match &e.kind {
+        Ident(n) => out.push(n),
+        Num(_) | Str(_) | Bool(_) | Null | This | Function(_) => {}
+        Array(es) => es.iter().for_each(|e| expr_refs(e, out)),
+        Object(ps) => ps.iter().for_each(|(_, e)| expr_refs(e, out)),
+        Member(o, _) | Unary(_, o) | Update(o, ..) => expr_refs(o, out),
+        Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) | Assign(_, a, b) => {
+            expr_refs(a, out);
+            expr_refs(b, out);
+        }
+        Call(f, args) | New(f, args) => {
+            expr_refs(f, out);
+            args.iter().for_each(|e| expr_refs(e, out));
+        }
+        Cond(a, b, c) => [a, b, c].into_iter().for_each(|e| expr_refs(e, out)),
+    }
+}
+
 /// The names function `f`'s own code refers to (not its nested
 /// functions').
 fn references(f: &Function) -> Vec<&str> {
-    fn expr<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
-        use ExprKind::*;
-        match &e.kind {
-            Ident(n) => out.push(n),
-            Num(_) | Str(_) | Bool(_) | Null | This | Function(_) => {}
-            Array(es) => es.iter().for_each(|e| expr(e, out)),
-            Object(ps) => ps.iter().for_each(|(_, e)| expr(e, out)),
-            Member(o, _) | Unary(_, o) | Update(o, ..) => expr(o, out),
-            Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) | Assign(_, a, b) => {
-                expr(a, out);
-                expr(b, out);
-            }
-            Call(f, args) | New(f, args) => {
-                expr(f, out);
-                args.iter().for_each(|e| expr(e, out));
-            }
-            Cond(a, b, c) => [a, b, c].into_iter().for_each(|e| expr(e, out)),
-        }
-    }
     fn stmt<'a>(s: &'a Stmt, out: &mut Vec<&'a str>) {
         match &s.kind {
-            StmtKind::Var(ds) => ds.iter().flat_map(|(_, e)| e).for_each(|e| expr(e, out)),
+            StmtKind::Var(ds) => ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out)),
             StmtKind::Function(_)
             | StmtKind::Empty
             | StmtKind::Break(_)
             | StmtKind::Continue(_) => {}
-            StmtKind::Expr(e) | StmtKind::Throw(e) => expr(e, out),
-            StmtKind::Return(e) => e.iter().for_each(|e| expr(e, out)),
+            StmtKind::Expr(e) | StmtKind::Throw(e) => expr_refs(e, out),
+            StmtKind::Return(e) => e.iter().for_each(|e| expr_refs(e, out)),
             StmtKind::If(c, a, b) => {
-                expr(c, out);
+                expr_refs(c, out);
                 stmt(a, out);
                 b.iter().for_each(|b| stmt(b, out));
             }
@@ -132,30 +134,30 @@ fn references(f: &Function) -> Vec<&str> {
             } => {
                 match init {
                     Some(ForInit::Var(ds)) => {
-                        ds.iter().flat_map(|(_, e)| e).for_each(|e| expr(e, out))
+                        ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out))
                     }
-                    Some(ForInit::Expr(e)) => expr(e, out),
+                    Some(ForInit::Expr(e)) => expr_refs(e, out),
                     None => {}
                 }
-                test.iter().chain(update).for_each(|e| expr(e, out));
+                test.iter().chain(update).for_each(|e| expr_refs(e, out));
                 stmt(body, out);
             }
             StmtKind::ForIn {
                 name, object, body, ..
             } => {
                 out.push(name);
-                expr(object, out);
+                expr_refs(object, out);
                 stmt(body, out);
             }
             StmtKind::While(c, body) | StmtKind::DoWhile(body, c) => {
-                expr(c, out);
+                expr_refs(c, out);
                 stmt(body, out);
             }
             StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, out)),
             StmtKind::Switch(d, cases) => {
-                expr(d, out);
+                expr_refs(d, out);
                 for (t, b) in cases {
-                    t.iter().for_each(|t| expr(t, out));
+                    t.iter().for_each(|t| expr_refs(t, out));
                     b.iter().for_each(|s| stmt(s, out));
                 }
             }
@@ -504,8 +506,10 @@ impl<'a> Gen<'a> {
         let body = &self.f.body;
         if self.index == 0 {
             // `var x;` makes a global that reads as undefined.
-            for name in self.uninitialized_script_vars() {
-                self.emit(Op::LdaUndefined, &[]);
+            // Declared before the script runs, `undefined` unless a global
+            // of that name exists (`var performance = performance || {}`).
+            for name in self.script_vars() {
+                self.global(Op::LdaGlobalInsideTypeof, name);
                 self.global(Op::StaGlobal, name);
             }
             // The script's completion value is its last expression
@@ -584,13 +588,22 @@ impl<'a> Gen<'a> {
             .collect()
     }
 
-    /// Script `var`s declared only without an initializer, and not also
-    /// functions.
-    fn uninitialized_script_vars(&self) -> Vec<&'a str> {
+    /// The script's `var`s to declare before it runs: those without an
+    /// initializer, or whose initializer reads them; not those assigned
+    /// first, whose first store then sets the global's field type (an int,
+    /// not `undefined`: 53, 80), nor function declarations.
+    fn script_vars(&self) -> Vec<&'a str> {
         fn walk<'a>(s: &'a Stmt, init: &mut Vec<&'a str>, bare: &mut Vec<&'a str>) {
+            // An initializer reading its own variable (`var p = p || {}`)
+            // reads it declared, before it's assigned.
             let mut decl = |ds: &'a [(String, Option<Expr>)]| {
                 for (n, e) in ds {
-                    if e.is_some() { &mut *init } else { &mut *bare }.push(n);
+                    let reads_itself = e.as_ref().is_some_and(|e| {
+                        let mut refs = Vec::new();
+                        expr_refs(e, &mut refs);
+                        refs.contains(&n.as_str())
+                    });
+                    if e.is_some() && !reads_itself { &mut *init } else { &mut *bare }.push(n);
                 }
             };
             match &s.kind {
@@ -957,7 +970,7 @@ impl<'a> Gen<'a> {
     /// `e` for its side effects only.
     fn effect(&mut self, e: &Expr) -> R<()> {
         match &e.kind {
-            ExprKind::Update(t, d, _) => self.update(t, *d, e.pos),
+            ExprKind::Update(t, d, _) => self.update(t, *d, false, e.pos),
             _ => self.value(e),
         }
     }
@@ -1059,11 +1072,17 @@ impl<'a> Gen<'a> {
                 }
                 self.emit(Op::TypeOf, &[]);
             }
-            Unary(op, _) => return unsupported(e.pos, format!("unary {op:?}")),
-            Update(t, d, true) => self.update(t, *d, e.pos)?,
-            Update(..) => {
-                return unsupported(e.pos, "the value of a postfix increment (needs ToNumeric)");
+            Unary(op @ (UnOp::Plus | UnOp::Neg | UnOp::BitNot), x) => {
+                self.value(x)?;
+                let op = match op {
+                    UnOp::Plus => Op::ToNumber,
+                    UnOp::Neg => Op::Negate,
+                    _ => Op::BitNot,
+                };
+                self.emit(op, &[]);
             }
+            Unary(op, _) => return unsupported(e.pos, format!("unary {op:?}")),
+            Update(t, d, prefix) => self.update(t, *d, !*prefix, e.pos)?,
             Binary(op, l, r) => self.binary(*op, l, r, e.pos)?,
             Logical(and, l, r) => {
                 let end = self.label();
@@ -1165,6 +1184,13 @@ impl<'a> Gen<'a> {
             BinOp::Ge => Op::TestGreaterThanOrEqual,
             BinOp::Eq => Op::TestEqual,
             BinOp::StrictEq => Op::TestStrictEqual,
+            BinOp::Mod => Op::Mod,
+            BinOp::BitAnd => Op::BitAnd,
+            BinOp::BitOr => Op::BitOr,
+            BinOp::BitXor => Op::BitXor,
+            BinOp::Shl => Op::ShiftLeft,
+            BinOp::Sar => Op::ShiftRight,
+            BinOp::Shr => Op::ShiftRightLogical,
             _ => return None,
         })
     }
@@ -1281,9 +1307,20 @@ impl<'a> Gen<'a> {
     }
 
     /// `++t` or `--t` (`d` = ±1), leaving the new value in the accumulator.
-    fn update(&mut self, t: &Expr, d: i8, pos: Pos) -> R<()> {
+    /// `++t` / `--t`; with `postfix`, `t++` / `t--` whose value is used: the
+    /// old value, as a number, ends in `acc`.
+    fn update(&mut self, t: &Expr, d: i8, postfix: bool, pos: Pos) -> R<()> {
         let mark = self.temp;
+        let old = if postfix {
+            Some(self.alloc(pos)?)
+        } else {
+            None
+        };
         let step = |g: &mut Self| {
+            if let Some(o) = old {
+                g.emit(Op::ToNumber, &[]);
+                g.star(o);
+            }
             if d > 0 {
                 g.emit(Op::Inc, &[]);
             } else {
@@ -1312,6 +1349,9 @@ impl<'a> Gen<'a> {
                 self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk)]);
             }
             _ => unreachable!("the parser checks increment targets"),
+        }
+        if let Some(o) = old {
+            self.ldar(o);
         }
         self.temp = mark;
         Ok(())

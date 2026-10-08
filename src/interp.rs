@@ -912,6 +912,65 @@ handlers! {
         next!(any, Op::StaUpvalue.size(), acc)
     }
 
+    // `r OP acc` for `%` and the bitwise operators, on any operands (the
+    // generic forms: the `…Smi` ones take a constant).
+    fn op_mod(pc, acc, regs, tag) {
+        let (a, b) = (*reg(pc, 1, regs), acc);
+        let r = if tag.both_int32(a, b) && b.as_i32_unchecked() > 0 && a.as_i32_unchecked() >= 0 {
+            Value::from_i32(a.as_i32_unchecked() % b.as_i32_unchecked())
+        } else {
+            Value::from_f64_arith(to_number(a) % to_number(b))
+        };
+        next!(any, Op::Mod.size(), r)
+    }
+
+    fn op_bit_and(pc, acc, regs, tag) {
+        next_int!(Op::BitAnd.size(), int32_of(*reg(pc, 1, regs)) & int32_of(acc))
+    }
+
+    fn op_bit_or(pc, acc, regs, tag) {
+        next_int!(Op::BitOr.size(), int32_of(*reg(pc, 1, regs)) | int32_of(acc))
+    }
+
+    fn op_bit_xor(pc, acc, regs, tag) {
+        next_int!(Op::BitXor.size(), int32_of(*reg(pc, 1, regs)) ^ int32_of(acc))
+    }
+
+    fn op_shift_left(pc, acc, regs, tag) {
+        let n = int32_of(acc) as u32 & 31;
+        next_int!(Op::ShiftLeft.size(), int32_of(*reg(pc, 1, regs)).wrapping_shl(n))
+    }
+
+    fn op_shift_right(pc, acc, regs, tag) {
+        let n = int32_of(acc) as u32 & 31;
+        next_int!(Op::ShiftRight.size(), int32_of(*reg(pc, 1, regs)) >> n)
+    }
+
+    fn op_shift_right_logical(pc, acc, regs, tag) {
+        let n = int32_of(acc) as u32 & 31;
+        let r = (int32_of(*reg(pc, 1, regs)) as u32) >> n;
+        next!(any, Op::ShiftRightLogical.size(), Value::number(r as f64))
+    }
+
+    fn op_to_number(pc, acc, regs, tag) {
+        if acc.is_number() {
+            next!(any, Op::ToNumber.size(), acc)
+        }
+        next!(any, Op::ToNumber.size(), Value::number(to_number(acc)))
+    }
+
+    fn op_negate(pc, acc, regs, tag) {
+        // (-0 is a double: `-x` of int32 0 isn't 0.)
+        if tag.is_int32(acc) && acc.as_i32_unchecked() != 0 && acc.as_i32_unchecked() != i32::MIN {
+            next_int!(Op::Negate.size(), -acc.as_i32_unchecked())
+        }
+        next!(any, Op::Negate.size(), Value::from_f64(-to_number(acc)))
+    }
+
+    fn op_bit_not(pc, acc, regs, tag) {
+        next_int!(Op::BitNot.size(), !int32_of(acc))
+    }
+
     fn op_type_of(pc, acc, regs, tag) {
         let v = (*frame_vm(regs)).type_of(acc);
         next!(any, Op::TypeOf.size(), v)
@@ -2248,6 +2307,16 @@ pub(crate) fn to_boolean(v: Value) -> bool {
 }
 
 /// ECMAScript ToInt32 of a number.
+/// ToInt32 of any value (ToNumber first).
+#[inline]
+fn int32_of(v: Value) -> i32 {
+    if v.is_int32() {
+        v.as_i32_unchecked()
+    } else {
+        to_int32(to_number(v))
+    }
+}
+
 pub(crate) fn to_int32(d: f64) -> i32 {
     if !d.is_finite() {
         return 0;
@@ -2355,6 +2424,9 @@ pub(crate) fn to_number(v: Value) -> f64 {
     if !v.is_cell() {
         return v.to_number();
     }
+    if let Some(t) = crate::vm::date_value(v) {
+        return t;
+    }
     match string_units(v) {
         Some(u) => string_to_number(&String::from_utf16_lossy(u)),
         None => to_number(to_primitive(v)),
@@ -2443,6 +2515,16 @@ static TABLE: Table = {
     t[Op::Return as usize] = op_return;
     t[Op::Throw as usize] = op_throw;
     t[Op::TypeOf as usize] = op_type_of;
+    t[Op::ToNumber as usize] = op_to_number;
+    t[Op::Negate as usize] = op_negate;
+    t[Op::BitNot as usize] = op_bit_not;
+    t[Op::Mod as usize] = op_mod;
+    t[Op::BitAnd as usize] = op_bit_and;
+    t[Op::BitOr as usize] = op_bit_or;
+    t[Op::BitXor as usize] = op_bit_xor;
+    t[Op::ShiftLeft as usize] = op_shift_left;
+    t[Op::ShiftRight as usize] = op_shift_right;
+    t[Op::ShiftRightLogical as usize] = op_shift_right_logical;
     t[Op::LdaUpvalue as usize] = op_lda_upvalue;
     t[Op::StaUpvalue as usize] = op_sta_upvalue;
     t[Op::LdaGlobalInsideTypeof as usize] = op_lda_global_inside_typeof;

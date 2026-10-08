@@ -5,10 +5,18 @@
 # build runs correctly. Recorded rows go to perf-history/perf.tsv, which is
 # untracked: timings belong to a machine, so each row names its host.
 #
-#   scripts/perf.sh                 # measure the working tree; compare with
+#   scripts/perf.sh [--ab [REV]]    # the working tree against REV (default
+#                                   # HEAD) built in a worktree, their runs
+#                                   # interleaved (A B A B …) so load on the
+#                                   # machine affects both alike; the change
+#                                   # is the median of the paired ratios, the
+#                                   # spread the middle half of them (a change
+#                                   # within it is noise)
+#   scripts/perf.sh --record        # measure the working tree, compare with
 #                                   # the newest recorded ancestor of HEAD
-#   scripts/perf.sh --record        # also record it (HEAD's commit, `+` if
-#                                   # src/, stencils/, bench/ or build.rs differ)
+#                                   # (noisier: another session's load), and
+#                                   # record it (HEAD's commit, `+` if src/,
+#                                   # stencils/, bench/ or build.rs differ)
 #   scripts/perf.sh --backfill [N]  # build and record the last N (default all)
 #                                   # first-parent commits of master not yet
 #                                   # recorded on this host, each in a worktree
@@ -17,7 +25,9 @@
 #                                   # RE over the last K (default 8) recorded
 #                                   # master commits, oldest first
 #
-# REPS (default 11) sets the runs per benchmark. A listing is named
+# Runs aren't pinned to a CPU: on this shared host a pinned run can't leave
+# a CPU another process lands on (see scripts/quiet.sh). REPS (default 11)
+# sets the runs per benchmark. A listing is named
 # `asm/NAME` and a script `js/NAME`; a benchmark's code may change between
 # commits (listings follow the code generator).
 set -euo pipefail
@@ -100,7 +110,43 @@ for b in sorted(data):
 EOF
   exit 0
   ;;
---record | "") ;;
+--ab | "")
+  rev=$(git rev-parse --short "${2:-HEAD}")
+  work=$hist/ab
+  rm -rf "$work/tree"
+  git worktree prune
+  git worktree add -q --detach "$work/tree" "$rev"
+  (cd "$work/tree" && CARGO_TARGET_DIR="$root/$work/target" cargo build --release --quiet --bin toi)
+  git worktree remove --force "$work/tree"
+  cargo build --release --quiet --bin toi
+  a=$work/target/release/toi b=target/release/toi
+  printf '%-36s %10s %10s %8s %8s %8s\n' bench "$rev" "working" change spread insns
+  for f in bench/bytecode/*.asm bench/micro/*.js; do
+    name=$(basename "$f") kind=asm
+    [[ $f == *.js ]] && kind=js
+    expect=$(sed -n 's|^// expect: ||p' "bench/micro/${name%.*}.js" 2>/dev/null | head -1)
+    [[ $(timeout 60 "$a" "$f" 2>/dev/null) == "$expect" ]] || continue
+    [[ $(timeout 60 "$b" "$f" 2>/dev/null) == "$expect" ]] || continue
+    for _ in $(seq "$reps"); do
+      for bin in "$a" "$b"; do
+        perf stat -x, -e cycles:u,instructions:u "$bin" "$f" 2>&1 >/dev/null |
+          awk -F, '$3 == "cycles:u" { c = $1 } $3 == "instructions:u" { i = $1 } END { printf "%s %s ", c, i }'
+      done
+      echo
+    done | python3 -c '
+import statistics as st, sys
+r = [list(map(float, l.split())) for l in sys.stdin if l.strip()]
+ca, ia, cb, ib = zip(*r)
+ratio = sorted(b / a for a, b in zip(ca, cb))
+# The spread: the middle half of the paired ratios.
+q = lambda p: ratio[min(len(ratio) - 1, int(p * len(ratio)))]
+di = st.median(ib) / st.median(ia) - 1
+print(f"{sys.argv[1]:36} {st.median(ca) / 1e6:9.2f}M {st.median(cb) / 1e6:9.2f}M {100 * (st.median(ratio) - 1):+7.1f}% {100 * (q(.75) - q(.25)):7.1f}% {100 * di:+7.1f}%")
+' "$kind/${name%.*}"
+  done
+  exit 0
+  ;;
+--record) ;;
 *) sed -n '2,25p' "$0"; exit 2 ;;
 esac
 

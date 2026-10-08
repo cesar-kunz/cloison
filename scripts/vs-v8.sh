@@ -9,7 +9,10 @@
 # (`vm.runInThisContext`) and times it from compile to completion, Node's
 # own startup excluded. toi: CPU time of the whole process (`perf stat`
 # task-clock), startup included. Each the median of REPS runs (the
-# machine's timings can be bimodal; a mean would land between the modes).
+# machine's timings can be bimodal; a mean would land between the modes),
+# pinned to an idle core (scripts/quiet.sh): toi to one of its CPUs, Node
+# (whose compiler and collector run on threads of their own) to the core's
+# CPUs (both SMT siblings).
 # Results are checked against each script's `// expect:` line. The
 # summary is toi's speed relative to V8 (above 1: toi is faster).
 set -euo pipefail
@@ -24,7 +27,7 @@ const src = fs.readFileSync(process.argv[2], "utf8");
 const t0 = process.hrtime.bigint();
 const v = vm.runInThisContext(src);
 const t1 = process.hrtime.bigint();
-console.log(Number(t1 - t0) / 1e6, String(v));
+process.stdout.write(`${Number(t1 - t0) / 1e6} ${String(v)}\n`);
 EOF
 toi_only=false
 [[ ${1:-} == --toi ]] && toi_only=true
@@ -38,11 +41,12 @@ tmp=$(mktemp)
 printf "commit\tnode\tbench\tv8_ms\ttoi_ms\n" >"$tmp"
 for f in bench/micro/*.js; do
   b=$(basename "$f" .js)
+  core=$(scripts/quiet.sh --core)
   want=$(sed -n 's|^// expect: ||p' "$f")
   if $toi_only && [[ -n $prev ]]; then
     v8=$(awk -F'\t' -v b="$b" '$3 == b { print $4 }' "$prev")
   else
-    v8=$(for _ in $(seq "$reps"); do node "$hist/v8time.js" "$f"; done |
+    v8=$(for _ in $(seq "$reps"); do taskset -c "$core" node "$hist/v8time.js" "$f"; done |
       awk -v w="$want" '$2 != w { print "V8 gave " $2 > "/dev/stderr" } { print $1 }' |
       sort -g | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
   fi
@@ -51,7 +55,7 @@ for f in bench/micro/*.js; do
     echo "toi gave '$got' for $b, expected '$want'" >&2
     continue
   fi
-  toi=$(for _ in $(seq "$reps"); do perf stat -x, -e task-clock target/release/toi "$f" 2>&1 >/dev/null | cut -d, -f1; done |
+  toi=$(for _ in $(seq "$reps"); do QUIET_CPU=${core%%,*} scripts/quiet.sh perf stat -x, -e task-clock target/release/toi "$f" 2>&1 >/dev/null | cut -d, -f1; done |
     sort -g | awk '{ a[NR] = $1 } END { print a[int((NR + 1) / 2)] }')
   printf "%s\t%s\t%s\t%s\t%s\n" "$commit" "$node" "$b" "$v8" "$toi" >>"$tmp"
 done

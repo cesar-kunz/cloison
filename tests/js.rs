@@ -1314,6 +1314,40 @@ fn nested_scalar_replaced_objects_agree_with_node() {
     assert_eq!(value(NESTED), "210701");
 }
 
+/// Arrays whose first elements come from several classes, so of shapes
+/// differing in their elements' type alone: `push` is one case for them all
+/// (see `Shape::family`), and takes the classes that come after it was
+/// compiled (`main(5)`) too. The expected value is Node's.
+const MIXED_ARRAYS: &str = r#"
+function A(v) { this.v = v; }
+function B(v) { this.w = 0; this.v = v; }
+function C(v) { this.v = v * 2; }
+function D(v) { this.x = 1; this.v = v; }
+function E(v) { this.v = 0 - v; }
+function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i].v; return s; }
+function make(k, r) {
+  var out = [];
+  out.push(k == 0 ? new A(r) : k == 1 ? new B(r) : k == 2 ? new C(r) : k == 3 ? new D(r) : new E(r));
+  out.push(new A(1));
+  if (r % 7 == 0) out.push(3);
+  return out;
+}
+function main(kinds) {
+  var t = 0, k = 0;
+  for (var r = 0; r < 20000; r++) {
+    var a = make(k, r);
+    if (++k == kinds) k = 0;
+    t += sum(a.length > 2 ? [a[0], a[1]] : a) + a.length;
+  }
+  return t;
+}
+"#;
+
+#[test]
+fn arrays_first_filled_with_several_classes_agree_with_node() {
+    assert_eq!(value(&format!("{MIXED_ARRAYS}\nmain(3) + main(5);")), "426748383");
+}
+
 /// A method a compiled loop calls inlined, without checking the callee
 /// (its prototype holds it), replaced from a called function and from the
 /// loop itself. The expected value is Node's.

@@ -103,6 +103,8 @@ define_ops! {
     JumpIfLessSmiLoop(Imm, Off),
     /// Return `acc` to the caller, or to the host from the outermost frame.
     Return(),
+    /// Throw `acc`.
+    Throw(),
 
     // ---- Constants and registers ----
     /// `acc = undefined`

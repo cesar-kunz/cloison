@@ -1357,7 +1357,7 @@ fn bytecode_live(code: &[u8], insns: &[Insn]) -> Vec<RegSet> {
         for k in (0..n).rev() {
             let insn = &insns[k];
             let mut live = [0; 4];
-            let falls = !matches!(insn.op, Op::Jump | Op::Return);
+            let falls = !matches!(insn.op, Op::Jump | Op::Return | Op::Throw);
             let jumps = is_compare_jump(insn.op)
                 || matches!(
                     insn.op,

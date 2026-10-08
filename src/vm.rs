@@ -15,23 +15,28 @@ use crate::object::{
 };
 use crate::value::Value;
 
-/// A JS exception, or a feature not implemented yet. There is no `try`
-/// yet, so every error ends the run.
+/// A JS exception, or a feature not implemented yet: its message, and for
+/// a `throw`, the value thrown. There is no `try` yet, so every error ends
+/// the run.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(pub String);
+pub struct Error(pub String, pub Option<Value>);
 
 impl Error {
     pub fn type_error(m: impl fmt::Display) -> Error {
-        Error(format!("TypeError: {m}"))
+        Error(format!("TypeError: {m}"), None)
     }
     pub fn reference_error(m: impl fmt::Display) -> Error {
-        Error(format!("ReferenceError: {m}"))
+        Error(format!("ReferenceError: {m}"), None)
     }
     pub fn range_error(m: impl fmt::Display) -> Error {
-        Error(format!("RangeError: {m}"))
+        Error(format!("RangeError: {m}"), None)
     }
     pub fn unsupported(m: impl fmt::Display) -> Error {
-        Error(format!("unsupported: {m}"))
+        Error(format!("unsupported: {m}"), None)
+    }
+    /// `throw v`. (No heap object moves or is freed while it's held.)
+    pub fn thrown(v: Value) -> Error {
+        Error(display(v), Some(v))
     }
 }
 

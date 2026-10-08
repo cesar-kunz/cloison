@@ -506,7 +506,7 @@ impl<'a> Gen<'a> {
                     self.acc.regs.push(b);
                 }
             }
-            (Op::Jump | Op::Return, _) => self.reachable = false,
+            (Op::Jump | Op::Return | Op::Throw, _) => self.reachable = false,
             (
                 Op::StaGlobal
                 | Op::SetNamed
@@ -1355,7 +1355,10 @@ impl<'a> Gen<'a> {
                 name, object, body, ..
             } => self.for_in(labels, name, object, body, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
-            StmtKind::Throw(_) => return unsupported(s.pos, "`throw`"),
+            StmtKind::Throw(e) => {
+                self.value(e)?;
+                self.emit(Op::Throw, &[]);
+            }
             StmtKind::Return(e) => {
                 match e {
                     Some(e) => self.value(e)?,

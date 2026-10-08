@@ -1525,8 +1525,8 @@ end
     let (v, s) = jit(src);
     assert_eq!(v, "2002");
     // `new Box` inlined (its `this` allocated in the stencil), and `push`.
-    assert!(s.iter().any(|n| n == "alloc_this"), "{s:?}");
-    assert!(s.iter().any(|n| n == "array_push"), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("guard_word+create_object")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("array_push")), "{s:?}");
 }
 
 /// A callee (through the runtime: its call site is first reached after
@@ -2172,8 +2172,8 @@ fn runtime_call_results_are_predicted() {
     assert_eq!(v, (300 * 300).to_string());
     // `new Box` inlined, its object (only read from) never allocated.
     assert!(s.iter().any(|n| n == "ctor_check"), "{s:?}");
-    assert!(!s.iter().any(|n| n == "alloc_this"), "{s:?}");
-    assert!(s.iter().any(|n| n == "array_push"), "{s:?}");
+    assert!(!s.iter().any(|n| n.contains("create_object")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("array_push")), "{s:?}");
     assert!(
         s.iter().filter(|n| n.starts_with("add_ii_")).count() >= 2,
         "{s:?}"
@@ -2376,7 +2376,7 @@ end
 }
 
 /// `new Point(i, i + 1, i + 2)` 20,000 times, allocated in a stencil:
-/// `alloc_this` with `Point` inlined, `construct_direct` with it called
+/// `guard_word` + `create_object` with `Point` inlined, `construct_direct` with it called
 /// (when it returns `this`). Each argument arrives as passed (the call
 /// must hand the callee the tag and exit cell registers, whatever the
 /// stencil used them for while allocating), and the objects cross heap
@@ -2447,7 +2447,7 @@ end
     };
     // Inlined (returning nothing), and called directly (returning `this`).
     for (ret, stencil) in [
-        ("LdaUndefined", "alloc_this"),
+        ("LdaUndefined", "guard_word+create_object"),
         ("Ldar r0", "construct_direct"),
     ] {
         let (v, s) = jit(&src(ret));

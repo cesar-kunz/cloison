@@ -392,7 +392,6 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_enter" => toi_rt_enter as *const () as usize,
         "toi_rt_construct" => toi_rt_construct as *const () as usize,
         "toi_rt_construct_done" => toi_rt_construct_done as *const () as usize,
-        "toi_rt_alloc_this" => toi_rt_alloc_this as *const () as usize,
         "toi_rt_array_push" => toi_rt_array_push as *const () as usize,
         "toi_rt_materialize" => toi_rt_materialize as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
@@ -1958,12 +1957,16 @@ struct Sel {
     /// A piece checking `acc` before the stencil, with its `imm64`: a
     /// store's value against the field's type. It exits before the
     /// instruction.
-    check: Option<(&'static str, u64)>,
+    check: Option<(&'static str, u64, u64)>,
     /// A piece checking a call's result against its predicted type, with
     /// its `imm64`. It exits after the call, with the result.
     result: Option<(&'static str, u64)>,
     /// A piece after the stencil (`unbox_num_acc`).
     post: Option<&'static str>,
+    /// The register whose slot the stencil reads, if not the
+    /// instruction's: a copy's, if in memory or a general register (see
+    /// [`slot_reg`]).
+    reg: Option<u8>,
 }
 
 impl Sel {
@@ -1976,7 +1979,23 @@ impl Sel {
             check: None,
             result: None,
             post: None,
+            reg: None,
         }
+    }
+}
+
+/// The register whose slot the stencil for `insn` reads: `sel.reg` if its
+/// home is memory or a general register, else the instruction's (`reg2`
+/// for `push` and `pop`).
+fn slot_reg(insn: &Insn, sel: &Sel, homes: &[Home]) -> u8 {
+    let own = if insn.native == 1 || insn.native == 2 {
+        insn.reg2
+    } else {
+        insn.reg
+    };
+    match sel.reg.map(|r| (r, homes.get(r as usize).copied().unwrap_or(Home::Mem))) {
+        Some((r, Home::Mem | Home::Gpr(_))) => r,
+        _ => own,
     }
 }
 
@@ -2091,35 +2110,57 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.regs[insn.reg as usize] = Ty::Obj(insn.assume);
             return Sel::new("nop", "", out);
         }
-        // An allocation scalar replacement removed: its checks only.
+        // An allocation scalar replacement removed: its check only.
         _ if insn.native == 3 => {
+            let c = unsafe { (*(insn.alloc as *const CallSite)).ctor.as_deref().unwrap() };
             out.acc = Any;
             return Sel {
-                ops: Some((0, insn.alloc, 0)),
+                ops: Some((0, c.proto_at as u64, c.proto)),
                 ..Sel::new("ctor_check", "", out)
             };
         }
-        _ if insn.native != 0 => {
-            out.acc = if insn.native == 1 { I32 } else { Any };
+        // The receiver in `reg2` (read where its copies' lowest is), known
+        // to be an array if its type has an array's shape; `push`'s
+        // argument in `acc`.
+        _ if insn.native == 1 || insn.native == 2 => {
+            let a = insn.reg2 as usize;
+            let array = st.regs.get(a).and_then(|t| t.shape()).is_some_and(|s| unsafe {
+                (*(s as *const Shape)).class == crate::object::Class::Array
+            });
+            let case = match (insn.native, st.acc == I32, array) {
+                (1, true, true) => "i_nc",
+                (1, true, false) => "i",
+                (_, _, true) => "nc",
+                _ => "",
+            };
+            let (base, acc) = if insn.native == 1 {
+                ("array_push", I32)
+            } else {
+                ("array_pop", Any)
+            };
+            out.acc = acc;
             return Sel {
-                ops: Some((8 * insn.reg2 as i32, 0, 0)),
-                ..Sel::new(
-                    if insn.native == 1 {
-                        "array_push"
-                    } else {
-                        "array_pop"
-                    },
-                    "",
-                    out,
-                )
+                reg: (a < st.regs.len()).then(|| st.class(a)),
+                ..Sel::new(base, case, out)
             };
         }
+        // An inlined `new`: `this` allocated as an object literal is, with
+        // the shape the constructor's root has (whose capacity doesn't
+        // change once settled), after a check that the constructor's
+        // `prototype` didn't change.
         _ if insn.alloc != 0 => {
             let site = unsafe { &*(insn.alloc as *const CallSite) };
+            let c = site.ctor.as_deref().unwrap();
+            debug_assert_eq!(
+                &c.header[1..],
+                &[1 << 8, 0, 0, 0, 0],
+                "the header `create_object` writes"
+            );
             out.acc = Ty::Obj(site.this_shape);
             return Sel {
-                ops: Some((0, insn.alloc, 0)),
-                ..Sel::new("alloc_this", "", out)
+                ops: Some((c.slots as i32, site.this_shape, c.heap as u64)),
+                check: Some(("guard_word", c.proto_at as u64, c.proto)),
+                ..Sel::new("create_object", "", out)
             };
         }
         _ if insn.on_shape && insn.guard == 1 => return Sel::new("guard_cell", "", out),
@@ -2560,11 +2601,25 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             ("bail", "")
         }
         // `o[k] = acc` (see `set_keyed` in the stencils): the key from
-        // memory, at `regs + imm`.
+        // memory, at `regs + imm`; no checks of a receiver known to be an
+        // array (`nc`); an int32 (`i`) or an object of a known shape
+        // (`sh`, the shape in `imm64`) checked against the elements' type
+        // as such.
         Op::SetKeyed => {
+            let array = reg.shape().is_some_and(|s| unsafe {
+                (*(s as *const Shape)).class == crate::object::Class::Array
+            });
+            let (case, shape) = match (array, st.acc) {
+                (true, I32) => ("nc_i", 0),
+                (true, Ty::Obj(s)) => ("nc_sh", s),
+                (true, _) => ("nc", 0),
+                (false, I32) => ("i", 0),
+                (false, Ty::Obj(s)) => ("sh", s),
+                _ => ("", 0),
+            };
             return Sel {
-                ops: Some((8 * insn.reg2 as i32, 0, 0)),
-                ..Sel::new("set_keyed", "", out)
+                ops: Some((8 * insn.reg2 as i32, shape, 0)),
+                ..Sel::new("set_keyed", case, out)
             };
         }
         Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal => {
@@ -2642,16 +2697,16 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     let load = matches!(insn.op, Op::GetNamed | Op::LdaGlobal);
     // The check a store of `acc` into a field of type `ft` needs; `Err` if
     // `acc` can't fit.
-    let check = |ft: FieldType| -> Result<Option<(&'static str, u64)>, ()> {
+    let check = |ft: FieldType| -> Result<Option<(&'static str, u64, u64)>, ()> {
         match (ft, st.acc) {
             (FieldType::None | FieldType::Any, _) => Ok(None),
             (FieldType::Int, I32) | (FieldType::Num, I32 | F64) => Ok(None),
             (FieldType::Int, F64) => Err(()),
-            (FieldType::Int, _) => Ok(Some(("check_acc_int", 0))),
-            (FieldType::Num, _) => Ok(Some(("check_acc_num", 0))),
+            (FieldType::Int, _) => Ok(Some(("check_acc_int", 0, 0))),
+            (FieldType::Num, _) => Ok(Some(("check_acc_num", 0, 0))),
             (FieldType::Obj(s), acc) if acc == Ty::Obj(s as u64) => Ok(None),
             (FieldType::Obj(_), I32 | F64) => Err(()),
-            (FieldType::Obj(s), _) => Ok(Some(("check_acc_shape", s as u64))),
+            (FieldType::Obj(s), _) => Ok(Some(("check_acc_shape", s as u64, 0))),
         }
     };
     // Finish a selection: a load's result type, or a store's check.
@@ -3474,7 +3529,19 @@ fn stencil_for(
         ("guard_cell" | "shape_jne" | "shape_guard", _) => format!("{}_{loc}", sel.base),
         ("check_tail_callee", _) => format!("check_tail_callee_{loc}"),
         // The callee reads its arguments from memory.
-        ("call" | "call_direct" | "construct_direct" | "array_push" | "array_pop", _) => {
+        // The receiver in its slot; a boxed argument unless `_i`.
+        ("array_push" | "array_pop", _) => {
+            let at = homes.get(slot_reg(insn, sel, homes) as usize).copied().unwrap_or(Home::Mem).loc();
+            if sel.base == "array_push" && !sel.case.starts_with('i') {
+                box_acc(&mut pre);
+            }
+            if sel.case.is_empty() {
+                format!("{}_{at}", sel.base)
+            } else {
+                format!("{}_{}_{at}", sel.base, sel.case)
+            }
+        }
+        ("call" | "call_direct" | "construct_direct", _) => {
             for r in insn.call_reads() {
                 match homes[r] {
                     Home::Mem => {}
@@ -3503,7 +3570,9 @@ fn stencil_for(
             sel.base.into()
         }
         ("set_keyed", _) => {
-            box_acc(&mut pre);
+            if !sel.case.ends_with('i') {
+                box_acc(&mut pre);
+            }
             let k = insn.reg2;
             match homes[k as usize] {
                 Home::Mem => {}
@@ -3511,7 +3580,11 @@ fn stencil_for(
                 Home::Int(h) => pre.push(Piece::new(&format!("spill_u{h}"), k)),
                 Home::Fpr(h) => pre.push(Piece::new(&format!("spill_f{h}"), k)),
             }
-            format!("set_keyed_{loc}")
+            if sel.case.is_empty() {
+                format!("set_keyed_{loc}")
+            } else {
+                format!("set_keyed_{}_{loc}", sel.case)
+            }
         }
         ("get_keyed", _) if sel.case.starts_with('i') => format!("get_keyed_{}_{loc}", sel.case),
         ("get_keyed", _) => {
@@ -3540,7 +3613,9 @@ fn stencil_for(
         ) => format!("{}_{}_{loc}", sel.base, sel.case),
         ("test_id", _) => format!("test_id_{loc}"),
         // Up to 8 slots, the count is part of the stencil.
-        ("create_object", _) if insn.imm <= 8 => format!("create_object_{}", insn.imm),
+        ("create_object", _) if sel.ops.unwrap().0 <= 8 => {
+            format!("create_object_{}", sel.ops.unwrap().0)
+        }
         // The count is part of the stencil: `sar_smi_i_3`.
         ("shl_smi" | "sar_smi" | "shr_smi", _) if sel.case == "i" => {
             format!("{}_i_{}", sel.base, insn.imm & 31)
@@ -3615,9 +3690,10 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
         )
     };
     let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump | Op::Mov);
-    // A bail hands `acc` to the interpreter.
+    // A bail hands `acc` to the interpreter; an inlined `push` takes its
+    // argument in it.
     let (reads, kills) = (
-        |insn: &Insn| insn.bail || reads(insn.op),
+        |insn: &Insn| insn.bail || reads(insn.op) || insn.native == 1,
         |insn: &Insn| !insn.bail && kills(insn.op),
     );
     let mut live_in = vec![false; n];
@@ -5000,7 +5076,8 @@ impl JitCode {
                 _ => (insn.imm, 0, 0),
             };
             let main = Piece {
-                reg: insn.reg,
+                // `push` and `pop` read the receiver's slot.
+                reg: slot_reg(insn, &s, &homes),
                 jump,
                 exit: i,
                 imm64,
@@ -5009,8 +5086,9 @@ impl JitCode {
             };
             // A store's check of the value against the field's type exits
             // before the instruction, like the stencil's own guard.
-            let check = s.check.map(|(name, imm64)| Piece {
+            let check = s.check.map(|(name, imm64, imm64b)| Piece {
                 imm64,
+                imm64b,
                 exit: i,
                 ..Piece::new(name, 0)
             });
@@ -5065,7 +5143,7 @@ impl JitCode {
                 hot.push(Piece::new(post, 0));
             }
             let mut full = match s.check {
-                Some((c, _)) => format!("{c}+{name}"),
+                Some((c, ..)) => format!("{c}+{name}"),
                 None => name,
             };
             for p in s.result.map(|r| r.0).into_iter().chain(s.post) {
@@ -5820,9 +5898,10 @@ fn emit_poly(
     if !load {
         hot.extend(box_acc_piece(st.acc));
     }
-    if let Some((c, imm64)) = s.check {
+    if let Some((c, imm64, imm64b)) = s.check {
         hot.push(Piece {
             imm64,
+            imm64b,
             exit: i,
             ..Piece::new(c, 0)
         });
@@ -6219,7 +6298,8 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
 
 /// Whether `insn` reads `acc` (conservatively: unless it is known not to).
 fn reads_acc(insn: &Insn) -> bool {
-    !matches!(
+    insn.native == 1
+        || !matches!(
         insn.op,
         Op::Ldar
             | Op::LdaSmi
@@ -6469,9 +6549,9 @@ impl Lowering<'_> {
                 }
             }
             // `a.push(v)` and `a.pop()`, when that is all the call has
-            // called: a guard on the callee, then inline (see `array_push`
-            // in the stencils). Not after exits there (a receiver not an
-            // array).
+            // called: a guard on the callee (unless `proven_callee`), then
+            // inline (see `array_push` in the stencils). Not after exits
+            // there (a receiver not an array).
             if i.op == Op::Call && !i.bail {
                 let ic = self.out.fbs[frame].ic(i.ic as usize);
                 let (fo, other) = unsafe { ((*ic).holder, (*ic.add(1)).holder) };
@@ -6483,9 +6563,19 @@ impl Lowering<'_> {
                 };
                 let exits = self.state.callee_exits.get(&origin).copied().unwrap_or(0);
                 if native != 0 && other.is_null() && exits < MAX_PROPERTY_EXITS {
-                    let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
-                    guard.guard = fo as u64;
-                    self.push(guard, Prop::None);
+                    // `push` takes its argument in `acc` (there already if
+                    // the call's setup stored it last).
+                    let stored = self.out.insns.last().is_some_and(|l| {
+                        l.op == Op::Star && l.reg == i.reg2 + 1 && l.frame == i.frame && !l.bail
+                    });
+                    if !self.proven_callee(frame, i.reg, fo) {
+                        let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
+                        guard.guard = fo as u64;
+                        self.push(guard, Prop::None);
+                    }
+                    if native == 1 && !stored {
+                        self.push(synth(Op::Ldar, i.reg2 + 1, frame, i.pc), Prop::None);
+                    }
                     i.native = native;
                     self.push(i, Prop::None);
                     continue;
@@ -6996,10 +7086,10 @@ impl Lowering<'_> {
     }
 
     /// `new` `i` of frame `frame` inlined: the guard on the constructor,
-    /// `this` allocated (`alloc_this`, through the runtime if the heap's
-    /// chunk is full; leaving before the `new` if the constructor's
-    /// prototype or capacity changed, which would change its shape) into
-    /// the callee's `r0`, the arguments, the body, then `this`.
+    /// `this` allocated (`guard_word` + `create_object`, leaving before
+    /// the `new` if the constructor's prototype changed, which would change
+    /// its shape) into the callee's `r0`, the arguments, the body, then
+    /// `this`.
     /// `construct_done` is left out: the objects have the shape it has
     /// nothing to do for (see [`Lowering::inline_ctor`]); one that ends
     /// with another only misses growing the capacity for later objects.
@@ -7200,13 +7290,16 @@ impl Lowering<'_> {
             return false;
         };
         let g = insns[get];
-        let Prop::Proto { addr, .. } = self.out.props[get] else {
-            return false;
+        let holds = |addr: u64| unsafe { *(addr as *const Value) } == crate::object::object_value(fo);
+        // A load from a prototype slot holding it, for every receiver shape.
+        let proven = match self.out.props[get] {
+            Prop::Proto { addr, .. } => holds(addr),
+            Prop::Poly { n, cases } => cases[..n as usize]
+                .iter()
+                .all(|c| matches!(c.loc, CaseLoc::Proto(addr) if holds(addr))),
+            _ => false,
         };
-        g.op == Op::GetNamed
-            && g.frame as usize == frame
-            && !g.bail
-            && unsafe { *(addr as *const Value) } == crate::object::object_value(fo)
+        proven && g.op == Op::GetNamed && g.frame as usize == frame && !g.bail
     }
 
     /// Point the jumps `rets` (inlined `Return`s) past the inlined code,
@@ -8331,16 +8424,6 @@ extern "C" fn toi_rt_materialize(regs: Value, mat: Value) -> u64 {
 extern "C" fn toi_rt_array_push(a: Value, v: Value) -> Value {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     crate::vm::array_push(vm, a, &[v]).expect("a push onto an array")
-}
-
-/// `alloc_this` stencils (inlined `new`), when the heap's chunk is full:
-/// `this` for the constructor of `site` (a `CallSite`), allocated by the
-/// VM, its shape the site's (`alloc_this` checked what it depends on).
-extern "C" fn toi_rt_alloc_this(site: Value, _: Value) -> Value {
-    unsafe {
-        let s = &*(site.to_bits() as *const CallSite);
-        (*s.vm).construct_this(s.closure as *mut Object)
-    }
 }
 
 /// `construct_direct` stencils, after a constructor they allocated `this`

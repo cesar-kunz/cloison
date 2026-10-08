@@ -144,7 +144,6 @@ unsafe extern "C" {
     fn toi_rt_enter();
     fn toi_rt_construct();
     fn toi_rt_construct_done();
-    fn toi_rt_alloc_this();
     fn toi_rt_array_push();
     fn toi_rt_materialize();
 }
@@ -3099,6 +3098,30 @@ macro_rules! array_length_gpr {
 }
 with_gprs!(each_gpr! array_length_gpr);
 
+macro_rules! set_keyed {
+    ($loc:tt, $case:literal, $array:expr, |$s:ident, $v:ident, $code:ident| $fits:expr, |$t:ident| $value:expr) => {
+        stencil!("set_keyed_", $case, loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            let key = *(($s.regs as *const u8).add(imm() as usize) as *const Value);
+            if !$array($s.tag, o) || !$s.tag.is_int32(key) {
+                exit!($s)
+            }
+            let p = o.to_bits() as *mut u8;
+            let i = int(key) as u32;
+            let $v = {
+                let $t = &$s;
+                $value
+            };
+            let $code = **(p as *const *const u64);
+            if i >= *(p.add(32) as *const u32) || !($fits) {
+                exit!($s)
+            }
+            *(*(p.add(24) as *const *mut Value)).add(i as usize) = $v;
+            next!($s)
+        });
+    };
+}
+
 macro_rules! property_location {
     ($loc:tt) => {
         stencil!("get_own_", loc!($loc); |s| {
@@ -3134,30 +3157,30 @@ macro_rules! property_location {
             *at_imm(o) = s.acc;
             next!(s)
         });
-        // `o[k] = acc` (`acc` boxed, the key at `regs + imm`): an array,
-        // an int32 key within its length, a value its shape's elements'
-        // type (`Shape::elems_code`, at offset 0) fits; else leave before.
-        stencil!("set_keyed_", loc!($loc); |s| {
-            let o = get!($loc, s);
-            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
-            if !is_cell(s.tag, o) || *(o.to_bits() as *const u8).add(8) != 1 || !s.tag.is_int32(key) {
-                exit!(s)
-            }
-            let p = o.to_bits() as *mut u8;
-            let i = int(key) as u32;
-            let v = s.acc;
-            let fits = match **(p as *const *const u64) {
-                0 => true,
-                1 => s.tag.is_int32(v),
-                2 => v.to_bits() & s.tag.to_bits() != 0,
-                sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
-            };
-            if i >= *(p.add(32) as *const u32) || !fits {
-                exit!(s)
-            }
-            *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
-            next!(s)
-        });
+        // `o[k] = acc` (the key at `regs + imm`): an array (`_nc`: known to
+        // be one), an int32 key within its length, a value its shape's
+        // elements' type (`Shape::elems_code`, at offset 0) fits; else
+        // leave before. `acc` boxed, or (`_i`) an int32, which fits codes
+        // 0 to 2, or (`_sh`) an object of shape `imm64`, which fits code 0
+        // or that shape.
+        set_keyed!($loc, "", is_array, |s, v, code| match code {
+            0 => true,
+            1 => s.tag.is_int32(v),
+            2 => v.to_bits() & s.tag.to_bits() != 0,
+            sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+        }, |s| s.acc);
+        set_keyed!($loc, "i_", is_array, |s, v, code| code <= 2,
+            |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
+        set_keyed!($loc, "sh_", is_array, |s, v, code| code == 0 || code == imm64(), |s| s.acc);
+        set_keyed!($loc, "nc_", |_, _| true, |s, v, code| match code {
+            0 => true,
+            1 => s.tag.is_int32(v),
+            2 => v.to_bits() & s.tag.to_bits() != 0,
+            sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+        }, |s| s.acc);
+        set_keyed!($loc, "nc_i_", |_, _| true, |s, v, code| code <= 2,
+            |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
+        set_keyed!($loc, "nc_sh_", |_, _| true, |s, v, code| code == 0 || code == imm64(), |s| s.acc);
         // A polymorphic access (`jit::Prop::Poly`): a cell check, then a
         // compare per cached shape (`imm64`), each branching to its own
         // `_nc` access but the last, which exits on a mismatch and falls
@@ -3458,12 +3481,20 @@ stencil!("construct_direct"; |s| {
     next!(s)
 });
 
-// An inlined `new` whose object scalar replacement doesn't allocate: what
-// its shape depends on (as `alloc_this` checks, the call site at `imm64`)
-// unchanged, else leave before the `new`; `acc` = `undefined`.
+// Before an inlined `new`: the constructor's `prototype` slot (at
+// `imm64`) still holds `imm64b`, the prototype of the shape the inlined
+// body assumes; else leave before the `new`.
+stencil!("guard_word"; |s| {
+    if *(imm64() as *const u64) != imm64b() {
+        exit!(s)
+    }
+    next!(s)
+});
+
+// An inlined `new` whose object scalar replacement doesn't allocate: the
+// check `guard_word` makes, then `acc` = `undefined`.
 stencil!("ctor_check"; |s| {
-    let c = (*(imm64() as *const DirectSite)).ctor;
-    if *(*c).proto_at != (*c).proto || *(*c).cap_at as u64 != (*c).cap {
+    if *(imm64() as *const u64) != imm64b() {
         exit!(s)
     }
     s.acc = Value::UNDEFINED;
@@ -3477,85 +3508,104 @@ stencil!("materialize"; |s| {
     next!(s)
 });
 
-// `a.push(v)` (`a` and `v` at `regs + imm`, the call's window, spilled):
-// a store at the end and the length bumped, if `a` is an array (else leave
-// before the call) whose elements have room and whose shape's elements'
-// type (`Shape::elems_code`, at offset 0) `v` fits; otherwise the runtime
-// pushes (growing the elements, moving `a` to a more general shape).
-// `acc` = the new length, an int32.
-stencil!("array_push"; |s| {
-    let w = (s.regs as *const u8).add(imm() as usize) as *const Value;
-    let (a, v) = (*w, *w.add(1));
-    if !is_cell(s.tag, a) || *(a.to_bits() as *const u8).add(8) != 1 {
-        exit!(s)
-    }
-    let o = a.to_bits() as *mut u8;
-    let code = **(o as *const *const u64);
-    let len = *(o.add(32) as *const u32);
-    let fits = match code {
-        0 => true,
-        1 => s.tag.is_int32(v),
-        2 => v.to_bits() & s.tag.to_bits() != 0,
-        sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+// `a.push(v)` (`a` in its slot, `v` in `acc`, boxed; `_i`: an int32): a
+// store at the end and the length bumped, if `a` is an array (else leave
+// before the call; `_nc`: known to be one) whose elements have room and
+// whose shape's elements' type (`Shape::elems_code`, at offset 0) `v`
+// fits; otherwise the runtime pushes (growing the elements, moving `a` to a
+// more general shape). `acc` = the new length, an int32.
+// `a.pop()` (`a` in its slot): the last element, its slot made a hole and
+// the length one less, or `undefined` if empty (or a hole), if `a` is an
+// array; else leave before the call.
+#[inline(always)]
+fn is_array(tag: NumberTag, a: Value) -> bool {
+    is_cell(tag, a) && unsafe { *(a.to_bits() as *const u8).add(8) } == 1
+}
+macro_rules! array_methods {
+    ($loc:tt, $nc:literal, $array:expr) => {
+        stencil_slow!("array_push_", $nc, loc!($loc); |s| {
+            let a = get!($loc, s);
+            let v = s.acc;
+            if !$array(s.tag, a) {
+                exit!(s)
+            }
+            let o = a.to_bits() as *mut u8;
+            let fits = match **(o as *const *const u64) {
+                0 => true,
+                1 => s.tag.is_int32(v),
+                2 => v.to_bits() & s.tag.to_bits() != 0,
+                sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+            };
+            let len = *(o.add(32) as *const u32);
+            if !fits || len >= *(o.add(36) as *const u32) {
+                slow!(s)
+            }
+            *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
+            *(o.add(32) as *mut u32) = len + 1;
+            s.acc = unboxed(len as i32 + 1);
+            next!(s)
+        }; |s| {
+            // Each stencil keeps its own helper (LLVM would merge these).
+            core::arch::asm!(concat!("/* array_push_", $nc, loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let a = get!($loc, s);
+            s.acc = unboxed(int(Value::from_bits(rt_call!(s, toi_rt_array_push, a, s.acc))));
+            next!(s)
+        });
+        // An int32 fits elements of any type but objects of a shape
+        // (codes 0 to 2; `NO_ELEMENTS` is 3, a shape's address more).
+        stencil_slow!("array_push_i_", $nc, loc!($loc); |s| {
+            let a = get!($loc, s);
+            if !$array(s.tag, a) {
+                exit!(s)
+            }
+            let o = a.to_bits() as *mut u8;
+            let len = *(o.add(32) as *const u32);
+            if **(o as *const *const u64) > 2 || len >= *(o.add(36) as *const u32) {
+                slow!(s)
+            }
+            *(*(o.add(24) as *const *mut u64)).add(len as usize) = s.acc.to_bits() as u32 as u64 | s.tag.to_bits();
+            *(o.add(32) as *mut u32) = len + 1;
+            s.acc = unboxed(len as i32 + 1);
+            next!(s)
+        }; |s| {
+            core::arch::asm!(concat!("/* array_push_i_", $nc, loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let a = get!($loc, s);
+            let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            s.acc = unboxed(int(Value::from_bits(rt_call!(s, toi_rt_array_push, a, v))));
+            next!(s)
+        });
+        stencil!("array_pop_", $nc, loc!($loc); |s| {
+            let a = get!($loc, s);
+            if !$array(s.tag, a) {
+                exit!(s)
+            }
+            let o = a.to_bits() as *mut u8;
+            let len = *(o.add(32) as *const u32);
+            s.acc = Value::UNDEFINED;
+            if len != 0 {
+                let at = (*(o.add(24) as *const *mut Value)).add(len as usize - 1);
+                let v = *at;
+                *at = Value::EMPTY;
+                *(o.add(32) as *mut u32) = len - 1;
+                if v != Value::EMPTY {
+                    s.acc = v;
+                }
+            }
+            next!(s)
+        });
     };
-    if fits && len < *(o.add(36) as *const u32) {
-        *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
-        *(o.add(32) as *mut u32) = len + 1;
-        s.acc = unboxed(len as i32 + 1);
-    } else {
-        s.acc = unboxed(int(Value::from_bits(rt_call!(s, toi_rt_array_push, a, v))));
-    }
-    next!(s)
-});
-
-// `a.pop()` (`a` at `regs + imm`): the last element, its slot made a hole
-// and the length one less, or `undefined` if empty (or a hole), if `a` is
-// an array; else leave before the call.
-stencil!("array_pop"; |s| {
-    let a = *((s.regs as *const u8).add(imm() as usize) as *const Value);
-    if !is_cell(s.tag, a) || *(a.to_bits() as *const u8).add(8) != 1 {
-        exit!(s)
-    }
-    let o = a.to_bits() as *mut u8;
-    let len = *(o.add(32) as *const u32);
-    s.acc = Value::UNDEFINED;
-    if len != 0 {
-        let at = (*(o.add(24) as *const *mut Value)).add(len as usize - 1);
-        let v = *at;
-        *at = Value::EMPTY;
-        *(o.add(32) as *mut u32) = len - 1;
-        if v != Value::EMPTY {
-            s.acc = v;
-        }
-    }
-    next!(s)
-});
-
-// An inlined `new`: `acc` = `this`, allocated as `construct_direct` does
-// (`imm64` is the call site, whose `ctor` says how), through the runtime if
-// the heap's chunk is full; leave before the `new` if the constructor's
-// prototype or capacity changed (the inlined body assumes the shape).
-stencil!("alloc_this"; |s| {
-    let site = imm64() as *const DirectSite;
-    let c = (*site).ctor;
-    if *(*c).proto_at != (*c).proto || *(*c).cap_at as u64 != (*c).cap {
-        exit!(s)
-    }
-    let heap = (*c).heap;
-    let p = (*heap)[0];
-    let words = 6 + (*c).slots as usize;
-    if (*heap)[1] as usize - p as usize >= 8 * words {
-        (*heap)[0] = p.add(words);
-        // The header only, as in `construct_direct`.
-        for k in 0..6 {
-            *p.add(k) = (*c).header[k];
-        }
-        s.acc = Value::from_bits(p as u64);
-    } else {
-        s.acc = Value::from_bits(rt_call!(s, toi_rt_alloc_this, Value::from_bits(site as u64), s.acc));
-    }
-    next!(s)
-});
+    ($loc:tt) => {
+        array_methods!($loc, "", is_array);
+        array_methods!($loc, "nc_", |_, _| true);
+    };
+}
+macro_rules! array_methods_gpr {
+    ($k:tt) => {
+        array_methods!([g $k]);
+    };
+}
+array_methods!([m]);
+with_gprs!(each_gpr! array_methods_gpr);
 
 // Before an inlined call: the callee must be the function inlined
 // (`imm64`), or leave before the call.

@@ -1294,10 +1294,18 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
 /// it covers instructions the JIT doesn't compile (which [`reg_live_in`]
 /// doesn't).
 fn entry_live(code: &[u8], nregs: usize) -> Vec<bool> {
+    let (_, live_in) = bytecode_live(code);
+    let first = live_in.first().copied().unwrap_or([0; 4]);
+    (0..nregs).map(|r| rs_has(&first, r)).collect()
+}
+
+/// The function with bytecode `code` decoded, and the registers live into
+/// each instruction, as the interpreter runs it (see [`entry_live`]).
+fn bytecode_live(code: &[u8]) -> (Vec<Insn>, Vec<RegSet>) {
     use crate::bytecode::Operand;
     let insns = decode(code, true);
     // Per instruction: registers read, and the register written.
-    let effects: Vec<(Vec<usize>, Option<usize>)> = insns
+    let effects: Vec<(RegSet, Option<usize>)> = insns
         .iter()
         .map(|insn| {
             let op = Op::from_u8(code[insn.pc]).unwrap();
@@ -1310,26 +1318,36 @@ fn entry_live(code: &[u8], nregs: usize) -> Vec<bool> {
                 }
                 at += k.width();
             }
-            match op {
-                Op::Star => (Vec::new(), Some(regs[0])),
-                Op::Mov => (vec![regs[0]], Some(regs[1])),
+            let mut reads = [0; 4];
+            let write = match op {
+                Op::Star => Some(regs[0]),
+                Op::Mov => {
+                    rs_add(&mut reads, regs[0]);
+                    Some(regs[1])
+                }
                 Op::Call | Op::CallUndefined | Op::Construct => {
                     let n = count + usize::from(op == Op::Call);
-                    let reads = std::iter::once(regs[0]).chain(regs[1]..regs[1] + n);
-                    (reads.collect(), None)
+                    for r in std::iter::once(regs[0]).chain(regs[1]..regs[1] + n) {
+                        rs_add(&mut reads, r);
+                    }
+                    None
                 }
-                _ => (regs, None),
-            }
+                _ => {
+                    regs.iter().for_each(|&r| rs_add(&mut reads, r));
+                    None
+                }
+            };
+            (reads, write)
         })
         .collect();
     let n = insns.len();
-    let mut live_in = vec![vec![false; nregs]; n];
+    let mut live_in: Vec<RegSet> = vec![[0; 4]; n];
     let mut changed = true;
     while changed {
         changed = false;
         for k in (0..n).rev() {
             let insn = &insns[k];
-            let mut live = vec![false; nregs];
+            let mut live = [0; 4];
             let falls = !matches!(insn.op, Op::Jump | Op::Return);
             let jumps = is_compare_jump(insn.op)
                 || matches!(
@@ -1342,27 +1360,20 @@ fn entry_live(code: &[u8], nregs: usize) -> Vec<bool> {
                 );
             let succs = [falls.then_some(k + 1), jumps.then_some(insn.target)];
             for s in succs.into_iter().flatten().filter(|&s| s < n) {
-                for (l, &x) in live.iter_mut().zip(&live_in[s]) {
-                    *l |= x;
-                }
+                rs_or(&mut live, &live_in[s]);
             }
             let (reads, write) = &effects[k];
             if let Some(w) = write {
-                live[*w] = false;
+                live[w / 64] &= !(1 << (w % 64));
             }
-            for &r in reads {
-                live[r] = true;
-            }
+            rs_or(&mut live, reads);
             if live != live_in[k] {
                 live_in[k] = live;
                 changed = true;
             }
         }
     }
-    live_in
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| vec![false; nregs])
+    (insns, live_in)
 }
 
 // ---- Inline-cache feedback (VM frames) ----
@@ -2099,7 +2110,21 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     let mut sel = select_types(insn, i, st, spec);
     // A load only checking its receiver (`emit_poly` handles `poly`), and
     // the store of its value, which nothing reads.
-    if insn.check_only && insn.op == Op::Star {
+    // A load into `acc` that nothing reads (an inlined callee's `acc =
+    // undefined` at its start, say) emits nothing.
+    let dead = !insn.bail
+        && matches!(
+            insn.op,
+            Op::Ldar
+                | Op::LdaSmi
+                | Op::LdaUndefined
+                | Op::LdaNull
+                | Op::LdaTrue
+                | Op::LdaFalse
+                | Op::LdaConstant
+        )
+        && spec.acc_live.get(i + 1) == Some(&false);
+    if dead || insn.check_only && matches!(insn.op, Op::Star | Op::Ldar) {
         sel.base = "nop";
         sel.case = "";
     } else if insn.check_only && sel.base.starts_with("get_") {
@@ -3035,12 +3060,77 @@ impl Home {
     }
 }
 
+/// A set of registers (they are `u8`s).
+type RegSet = [u64; 4];
+
+fn rs_has(s: &RegSet, r: usize) -> bool {
+    s[r / 64] >> (r % 64) & 1 != 0
+}
+
+fn rs_add(s: &mut RegSet, r: usize) {
+    s[r / 64] |= 1 << (r % 64);
+}
+
+fn rs_or(a: &mut RegSet, b: &RegSet) {
+    a.iter_mut().zip(b).for_each(|(x, y)| *x |= y);
+}
+
+fn rs_of(l: &[bool]) -> RegSet {
+    let mut s = [0; 4];
+    l.iter()
+        .enumerate()
+        .filter(|e| *e.1)
+        .for_each(|(r, _)| rs_add(&mut s, r));
+    s
+}
+
+fn rs_iter(s: &RegSet) -> impl Iterator<Item = usize> + '_ {
+    s.iter().enumerate().flat_map(|(k, &w)| {
+        let mut w = w;
+        std::iter::from_fn(move || {
+            (w != 0).then(|| {
+                let b = w.trailing_zeros() as usize;
+                w &= w - 1;
+                k * 64 + b
+            })
+        })
+    })
+}
+
+/// Registers that can't share a slot (see [`assign_homes`]), from the
+/// registers live into each instruction (exits included): both live into
+/// one, or one written where the other is live after.
+fn interference(insns: &[Insn], live: &[RegSet], nregs: usize) -> Vec<RegSet> {
+    let mut m = vec![[0; 4]; nregs];
+    for (i, here) in live.iter().enumerate() {
+        for r in rs_iter(here).take_while(|&r| r < nregs) {
+            rs_or(&mut m[r], here);
+        }
+        if insns[i].op == Op::Star {
+            let mut after = [0; 4];
+            for s in succs(insns, i).filter(|&s| s < live.len()) {
+                rs_or(&mut after, &live[s]);
+            }
+            let w = insns[i].reg as usize;
+            rs_or(&mut m[w], &after);
+            for r in rs_iter(&after).take_while(|&r| r < nregs) {
+                rs_add(&mut m[r], w);
+            }
+        }
+    }
+    m
+}
+
 /// Assign homes by static use count. Registers whose type is only ever
 /// int32 or double (and at least once double) get FP slots; registers only
 /// ever int32 get GPR slots unboxed (`Int`); other used registers get GPR
 /// slots boxed; the rest stay in memory, as do registers from `mem_from`
 /// (direct calls' frames). `no_fp` / `no_int` exclude registers from
 /// pinning, as does `!pin_ok` (see [`pinnable`]).
+///
+/// With `interferes` ([`interference`]), registers share a slot unless they
+/// interfere. Exits then write back only the registers live there.
+#[allow(clippy::too_many_arguments)]
 fn assign_homes(
     insns: &[Insn],
     ins: &[Option<TypeState>],
@@ -3049,13 +3139,31 @@ fn assign_homes(
     no_int: &[bool],
     pin_ok: &[bool],
     mem_from: usize,
+    interferes: Option<&[RegSet]>,
 ) -> Vec<Home> {
+    // Uses inside loops count 8 times per level (a loop is the code from a
+    // backward jump's target to it).
+    let mut depth = vec![0u32; insns.len() + 1];
+    for (j, insn) in insns.iter().enumerate() {
+        if insn.jumps() && insn.target <= j {
+            depth[insn.target] += 1;
+            depth[j + 1] -= 1;
+        }
+    }
+    let mut d = 0u32;
+    let weight: Vec<usize> = depth[..insns.len()]
+        .iter()
+        .map(|&x| {
+            d = d.wrapping_add(x);
+            8usize.pow(d.min(4))
+        })
+        .collect();
     let mut uses = vec![0usize; nregs];
     let mut join = vec![Ty::Bot; nregs];
-    for (insn, st) in insns.iter().zip(ins) {
+    for ((insn, st), w) in insns.iter().zip(ins).zip(&weight) {
         let Some(st) = st else { continue };
         if insn.reads_reg() {
-            uses[insn.reg as usize] += 1;
+            uses[insn.reg as usize] += w;
         }
         for (j, &t) in join.iter_mut().zip(&st.regs) {
             *j = j.join(t);
@@ -3063,22 +3171,37 @@ fn assign_homes(
     }
     let mut by_uses: Vec<usize> = (0..nregs.min(mem_from)).filter(|&r| uses[r] > 0).collect();
     by_uses.sort_by_key(|&r| (std::cmp::Reverse(uses[r]), r));
+    let meets = |a: &RegSet, b: &RegSet| a.iter().zip(b).any(|(x, y)| x & y != 0);
+    // Per slot, the registers in it.
+    let mut fprs: Vec<RegSet> = vec![[0; 4]; FP_SLOTS];
+    let mut gprs: Vec<RegSet> = vec![[0; 4]; GPR_SLOTS];
+    let free = |slots: &[RegSet], r: usize| {
+        slots.iter().position(|s| match interferes {
+            Some(m) => !meets(s, &m[r]),
+            None => *s == [0; 4],
+        })
+    };
     let mut homes = vec![Home::Mem; nregs];
-    let (mut fp, mut gpr) = (0, 0);
     for &r in &by_uses {
-        if join[r] == Ty::F64 && !no_fp[r] && pin_ok[r] && fp < FP_SLOTS {
-            homes[r] = Home::Fpr(fp as u8);
-            fp += 1;
+        if join[r] == Ty::F64
+            && !no_fp[r]
+            && pin_ok[r]
+            && let Some(k) = free(&fprs, r)
+        {
+            homes[r] = Home::Fpr(k as u8);
+            rs_add(&mut fprs[k], r);
         }
     }
     for &r in &by_uses {
-        if homes[r] == Home::Mem && gpr < GPR_SLOTS {
+        if homes[r] == Home::Mem
+            && let Some(k) = free(&gprs, r)
+        {
             homes[r] = if join[r] == Ty::I32 && !no_int[r] && pin_ok[r] {
-                Home::Int(gpr as u8)
+                Home::Int(k as u8)
             } else {
-                Home::Gpr(gpr as u8)
+                Home::Gpr(k as u8)
             };
-            gpr += 1;
+            rs_add(&mut gprs[k], r);
         }
     }
     homes
@@ -3270,6 +3393,9 @@ fn reg_live_in(
             }
             if insn.op == Op::Star {
                 clear(&mut live, insn.reg as usize);
+            } else if insn.op == Op::Mov {
+                clear(&mut live, insn.reg2 as usize);
+                set(&mut live, insn.reg as usize);
             } else if insn.uses_reg_value() {
                 set(&mut live, insn.reg as usize);
             }
@@ -3764,9 +3890,11 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
     let reads = |op: Op| !kills(op) && !matches!(op, Op::Nop | Op::Jump | Op::Mov);
     // A bail hands `acc` to the interpreter; an inlined `push` takes its
     // argument in it.
+    // A code-less `Star` (`Insn::check_only`) reads nothing, a code-less
+    // `Ldar` writes nothing.
     let (reads, kills) = (
-        |insn: &Insn| insn.bail || reads(insn.op) || insn.native == 1,
-        |insn: &Insn| !insn.bail && kills(insn.op),
+        |insn: &Insn| insn.bail || (reads(insn.op) && !insn.check_only) || insn.native == 1,
+        |insn: &Insn| !insn.bail && kills(insn.op) && !(insn.check_only && insn.op == Op::Ldar),
     );
     let mut live_in = vec![false; n];
     let mut live_out = vec![false; n];
@@ -3863,8 +3991,37 @@ struct Fusion<'a> {
 }
 
 impl Fusion<'_> {
+    /// A fused group at instruction `i`, if any: not one whose
+    /// instructions name two registers sharing a slot (see
+    /// `assign_homes`), which its patterns tell apart by register.
     fn at(&self, i: usize) -> Option<Fused> {
+        let f = self.at_any(i)?;
+        let mut seen: Vec<((bool, u8), u8)> = Vec::new();
+        for insn in &self.insns[i..i + f.len] {
+            if !insn.reads_reg() {
+                continue;
+            }
+            let r = insn.reg;
+            let slot = match self.homes[r as usize] {
+                Home::Mem => continue,
+                Home::Gpr(k) | Home::Int(k) => (false, k),
+                Home::Fpr(k) => (true, k),
+            };
+            if seen.iter().any(|&(s, q)| s == slot && q != r) {
+                return None;
+            }
+            seen.push((slot, r));
+        }
+        Some(f)
+    }
+
+    fn at_any(&self, i: usize) -> Option<Fused> {
         let widened = self.widened?;
+        // Not over a code-less `Ldar` (see `Lowering::drop_setup`).
+        let n = self.insns.len();
+        if (i..(i + 4).min(n)).any(|j| self.insns[j].check_only && self.insns[j].op == Op::Ldar) {
+            return None;
+        }
         if let Some(f) = self.add_chain(i, widened) {
             return Some(f);
         }
@@ -4590,6 +4747,8 @@ struct VmCompile<'a> {
     root: *const crate::vm::Code,
     /// Objects to allocate at exits (see [`Lowered::mats`]).
     mats: Option<&'a HashMap<usize, Vec<Rc<Mat>>>>,
+    /// See [`Lowered::exit_live`].
+    exit_live: Option<&'a [RegSet]>,
 }
 
 /// Compilation options.
@@ -4621,6 +4780,7 @@ impl JitCode {
             frames,
             root,
             mats,
+            exit_live,
         } = vm;
         let n = insns.len();
         let nregs = actual.regs.len();
@@ -4637,6 +4797,63 @@ impl JitCode {
         let reach = reachable(insns, entry);
         let live_in = reg_live_in(insns, &reach, nregs, frames);
         let live_at_entry = live_in[entry].clone();
+        // In a VM frame, registers whose live ranges don't overlap share
+        // slots (see `assign_homes`): live here also where an exit leaves
+        // them to the interpreter (`exit_live`, which compiled code may not
+        // read: a callee whose check it dropped, say), into an exit that
+        // allocates an object scalar replacement left unallocated (its
+        // fields), and `this` into the frame's `Return`s (it writes `this`
+        // back).
+        let share_live: Option<Vec<RegSet>> = exit_live
+            .filter(|e| feedback.is_some() && opts.register_homes && e.len() == n && nregs <= 256)
+            .map(|e| {
+                let mut l: Vec<RegSet> = live_in.iter().map(|l| rs_of(l)).collect();
+                for (l, e) in l.iter_mut().zip(e) {
+                    rs_or(l, e);
+                }
+                for (&at, ms) in mats.into_iter().flatten() {
+                    for m in ms {
+                        for &f in &m.fields {
+                            rs_add(&mut l[at], f as usize);
+                        }
+                    }
+                }
+                for (i, insn) in insns.iter().enumerate() {
+                    if insn.op == Op::Return && insn.frame == 0 && nregs > 0 {
+                        rs_add(&mut l[i], 0);
+                    }
+                }
+                l
+            });
+        let interferes = share_live.as_ref().map(|l| interference(insns, l, nregs));
+        // The homes an exit before instruction `i` writes back; for an exit
+        // after a call, `i` is the instruction after it, and those live
+        // into the call too: the interpreter may make the call again (see
+        // `Vm::redo_call`).
+        let exit_homes = |homes: &[Home], i: usize| -> Vec<Home> {
+            match &share_live {
+                Some(l) => homes
+                    .iter()
+                    .enumerate()
+                    .map(|(r, &h)| {
+                        let call = i > 0 && insns[i - 1].is_call() && rs_has(&l[i - 1], r);
+                        if rs_has(&l[i.min(n - 1)], r) || call {
+                            h
+                        } else {
+                            Home::Mem
+                        }
+                    })
+                    .collect(),
+                None => homes.to_vec(),
+            }
+        };
+        // What entry loads into slots: the live registers, and in a VM frame
+        // those an exit may leave to the interpreter (shared slots write
+        // back only those, so they must hold their values).
+        let load_at_entry: Vec<bool> = match &share_live {
+            Some(l) => (0..nregs).map(|r| rs_has(&l[entry], r)).collect(),
+            None => live_at_entry.clone(),
+        };
         let mut actual_live = actual.clone();
         for (r, &live) in live_at_entry.iter().enumerate() {
             if !live {
@@ -4731,11 +4948,24 @@ impl JitCode {
             .into_iter()
             .enumerate()
             .map(|(r, ok)| ok || r >= inline_base)
+            // Not one entry loads only for the interpreter (see `entry_pieces`).
+            .zip(&load_at_entry)
+            .enumerate()
+            .map(|(r, (ok, &load))| ok && (!load || live_at_entry[r]))
             .collect();
             let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
             let (homes, ins) = loop {
                 let homes = if opts.register_homes {
-                    assign_homes(insns, &ins1, nregs, &no_fp, &no_int, &pin_ok, direct_base)
+                    assign_homes(
+                        insns,
+                        &ins1,
+                        nregs,
+                        &no_fp,
+                        &no_int,
+                        &pin_ok,
+                        direct_base,
+                        interferes.as_deref(),
+                    )
                 } else {
                     vec![Home::Mem; nregs]
                 };
@@ -4907,7 +5137,7 @@ impl JitCode {
             &actual_live,
             ins[entry].as_ref().unwrap(),
             &homes,
-            &live_at_entry,
+            &load_at_entry,
             feedback.is_none(),
         );
         let has_entry_seq = !entry_seq.is_empty();
@@ -5031,7 +5261,8 @@ impl JitCode {
             label_piece[i] = hot.len();
 
             if s.base == "poly" {
-                emit_poly(i, insn, s, st, props, &homes, &mut hot, &mut exits);
+                let at = exit_homes(&homes, i);
+                emit_poly(i, insn, s, st, props, &at, &mut hot, &mut exits);
                 names[i] = Some(format!(
                     "poly{}_{}",
                     if insn.op == Op::GetNamed {
@@ -5076,7 +5307,7 @@ impl JitCode {
                         }
                         seq.push(Piece::new(step.exit_ldar.as_ref().unwrap_or(&f.ldar), 0));
                         seq.push(Piece::new("box_iacc", 0));
-                        seq.extend(spills(&homes));
+                        seq.extend(spills(&exit_homes(&homes, step.insn)));
                         seq.push(Piece {
                             imm: insns[step.insn].exit_record(),
                             ..Piece::new("exit", 0)
@@ -5168,7 +5399,7 @@ impl JitCode {
             // The check of a call's result exits after the call too, through
             // a stub of its own, whose record says the check failed.
             let result = s.result.map(|(name, imm64)| {
-                let mut seq = spills(&homes);
+                let mut seq = spills(&exit_homes(&homes, i + 1));
                 seq.push(Piece {
                     imm: insns[i + 1].exit_record() | AFTER_CALL | BAD_RESULT,
                     ..Piece::new("exit", 0)
@@ -5201,7 +5432,7 @@ impl JitCode {
                     seq.extend(box_acc_piece(st.acc));
                     insn.exit_record()
                 };
-                seq.extend(spills(&homes));
+                seq.extend(spills(&exit_homes(&homes, if is_call { i + 1 } else { i })));
                 if insn.exit_const != 0 {
                     seq.push(Piece {
                         imm64: insn.exit_const,
@@ -5294,14 +5525,17 @@ impl JitCode {
         // region ever holds a double in it.
         let uses_facc = ins.iter().flatten().any(|st| st.acc == Ty::F64)
             || sel.iter().flatten().any(|s| s.out.acc == Ty::F64);
-        let saved_gprs: Vec<u8> = homes
+        // Once per slot (registers may share one).
+        let mut saved_gprs: Vec<u8> = homes
             .iter()
             .filter_map(|h| match h {
                 Home::Gpr(k) | Home::Int(k) => arch::caller_saved_gpr_slot(*k),
                 _ => None,
             })
             .collect();
-        let saved_fprs: Vec<u8> = uses_facc
+        saved_gprs.sort_unstable();
+        saved_gprs.dedup();
+        let mut saved_fprs: Vec<u8> = uses_facc
             .then_some(0)
             .into_iter()
             .chain(homes.iter().filter_map(|h| match h {
@@ -5309,6 +5543,8 @@ impl JitCode {
                 _ => None,
             }))
             .collect();
+        saved_fprs.sort_unstable();
+        saved_fprs.dedup();
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
         let mut tramp_at: HashMap<u8, usize> = HashMap::default();
         let mut wrappers: Vec<(usize, Vec<u8>, &str)> = Vec::new();
@@ -5646,6 +5882,9 @@ struct VmState {
     /// Per callee of a direct call, its registers live at entry (see
     /// [`entry_live`]).
     entry_live: HashMap<*const crate::vm::Code, Rc<Vec<bool>>>,
+    /// Per function inlined, its registers live into each instruction as
+    /// the interpreter runs it, by bytecode offset (see [`interp_live`]).
+    pc_live: HashMap<*const crate::vm::Code, Rc<PcLive>>,
     /// The current lowering (see [`lower`]): per instruction its inline
     /// cache's contents, the frames, their feedback, the runtime call
     /// sites, and where inlined frames' registers start.
@@ -5940,6 +6179,8 @@ pub(crate) struct Snapshot {
     /// See [`Lowered::aliases`]: an exit copies each argument into its
     /// parameter, for the interpreter.
     aliases: Vec<(u8, u8, u8)>,
+    restores: Vec<Restore>,
+    exit_live: Vec<RegSet>,
     /// Owned here so they live as long as code pointing to them.
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
 }
@@ -6079,6 +6320,31 @@ struct Lowered {
     /// argument registers: `(frame, parameter, argument)`, registers
     /// renamed (see [`Lowering::arg_moves`]).
     aliases: Vec<(u8, u8, u8)>,
+    /// Registers a call's setup no longer writes, which an exit resuming
+    /// in its frame within its setup sets for the interpreter (see
+    /// [`Lowering::drop_setup`]).
+    restores: Vec<Restore>,
+    /// Per instruction, the registers an exit before it leaves the
+    /// interpreter to read (see [`interp_live`]).
+    exit_live: Vec<RegSet>,
+}
+
+/// Register `reg` (renamed) of frame `frame` holds `value` for the
+/// interpreter at bytecode offsets `after < pc <= upto` of that frame.
+#[derive(Clone, Copy, Debug)]
+struct Restore {
+    frame: u8,
+    after: usize,
+    upto: usize,
+    reg: u8,
+    value: Restored,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Restored {
+    /// What register (renamed) holds.
+    Reg(u8),
+    Const(u64),
 }
 
 /// A direct call as first lowered, its frame setup's registers relative to
@@ -6209,6 +6475,8 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
             nregs: unsafe { (*root).nregs } as usize,
             direct_base: usize::MAX,
             aliases: Vec::new(),
+            restores: Vec::new(),
+            exit_live: Vec::new(),
         },
         direct: Vec::new(),
         live: HashMap::default(),
@@ -6222,7 +6490,87 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
     reuse_global_loads(&mut cx.out);
     fold_constant_loads(&mut cx.out, &cx.state.property_exits);
     scalar_replace(&mut cx.out);
+    // Registers share slots only if there are more than slots (see
+    // `assign_homes`), which needs where exits leave them to the
+    // interpreter.
+    let mut used = [0; 4];
+    for i in cx.out.insns.iter().filter(|i| i.reads_reg()) {
+        rs_add(&mut used, i.reg as usize);
+    }
+    if rs_iter(&used).count() <= GPR_SLOTS {
+        return cx.out;
+    }
+    for f in &cx.out.frames {
+        cx.state.pc_live.entry(f.code).or_insert_with(|| {
+            let (insns, live) = bytecode_live(unsafe { &(*f.code).bytecode });
+            Rc::new(insns.iter().map(|i| i.pc).zip(live).collect())
+        });
+    }
+    cx.out.exit_live = interp_live(&cx.out, &cx.state.pc_live);
     cx.out
+}
+
+/// A function's registers live into each instruction, by bytecode offset.
+type PcLive = HashMap<usize, RegSet>;
+
+/// Per instruction of `out`, the registers the interpreter may read after
+/// an exit before it: each frame's live registers where it resumes (the
+/// exit's frame at the instruction, its callers past their calls), as its
+/// bytecode reads them, renamed; for a parameter read from an argument's
+/// register, that register, and for a register a call's setup no longer
+/// writes, the register it is restored from (see `materialize`).
+fn interp_live(
+    out: &Lowered,
+    pc_live: &HashMap<*const crate::vm::Code, Rc<PcLive>>,
+) -> Vec<RegSet> {
+    if out.nregs > 256 {
+        return Vec::new();
+    }
+    // Per frame, its registers read from others.
+    let mut aliases: Vec<Vec<(usize, usize)>> = vec![Vec::new(); out.frames.len()];
+    for &(g, p, a) in &out.aliases {
+        aliases[g as usize].push((p as usize, a as usize));
+    }
+    let mut memo: HashMap<(u8, usize), RegSet> = HashMap::default();
+    out.insns
+        .iter()
+        .map(|insn| {
+            *memo.entry((insn.frame, insn.pc)).or_insert_with(|| {
+                let mut set = [0; 4];
+                let (mut g, mut pc) = (insn.frame as usize, insn.pc);
+                loop {
+                    let f = out.frames[g];
+                    // (Past the end of the bytecode: nothing.)
+                    if let Some(live) = pc_live[&f.code].get(&pc) {
+                        let mut flat = [0; 4];
+                        for r in rs_iter(live) {
+                            rs_add(&mut flat, f.base + r);
+                        }
+                        for &(p, a) in &aliases[g] {
+                            if rs_has(&flat, p) {
+                                rs_add(&mut flat, a);
+                            }
+                        }
+                        rs_or(&mut set, &flat);
+                    }
+                    for r in out.restores.iter().filter(|r| r.frame as usize == g) {
+                        if let Restored::Reg(x) = r.value
+                            && r.after < pc
+                            && pc <= r.upto
+                        {
+                            rs_add(&mut set, x as usize);
+                        }
+                    }
+                    if g == 0 {
+                        break;
+                    }
+                    pc = f.ret_pc;
+                    g = f.parent;
+                }
+                set
+            })
+        })
+        .collect()
 }
 
 /// An object [`scalar_replace`] didn't allocate, as an exit allocates it:
@@ -6912,7 +7260,9 @@ impl Lowering<'_> {
                 }
                 Op::Call | Op::CallUndefined if self.inline_target(frame, &i, depth).is_some() => {
                     let callee = self.inline_target(frame, &i, depth).unwrap();
-                    self.inline(frame, &i, callee, depth);
+                    let fwd = self.fwd.clone();
+                    let guard = self.inline(frame, &i, callee, depth);
+                    self.drop_setup(frame, k, orig.reg, &i, guard, callee, &fwd);
                 }
                 Op::Construct if self.inline_ctor(frame, &i, depth).is_some() => {
                     let callee = self.inline_ctor(frame, &i, depth).unwrap();
@@ -7395,9 +7745,122 @@ impl Lowering<'_> {
         self.push(synth(Op::Ldar, base as u8, frame, i.pc), Prop::None);
     }
 
-    fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) {
-        let (_, rets) = self.inline_case(frame, i, fo, depth, false, None, 0);
+    /// Returns the index of the callee's guard.
+    fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) -> usize {
+        let (guard, rets) = self.inline_case(frame, i, fo, depth, false, None, 0);
         self.return_past(rets);
+        guard
+    }
+
+    /// After call `i` (instruction `k` of frame `frame`'s code, its callee
+    /// register `orig_reg` there) was inlined behind the guard at `guard`
+    /// to `fo`: drop the setup only an exit would read. Its callee's load,
+    /// if the guard needed no check (`proven_callee`) and the register is
+    /// dead after the call: the load only checks the receiver's shape and
+    /// its `Star` emits nothing (`Insn::check_only`). A window register
+    /// that is a copy of another, `x` (`fwd`, see [`window_sources`]),
+    /// which the callee reads instead, if it is dead after the call and the
+    /// callee doesn't read it: its `Star` emits nothing. An exit resuming
+    /// in the frame between the dropped `Star` and the call gives the
+    /// interpreter the function, or `x`'s value ([`Restore`],
+    /// `materialize`); one in the callee or after it resumes past the call.
+    #[allow(clippy::too_many_arguments)]
+    fn drop_setup(
+        &mut self,
+        frame: usize,
+        k: usize,
+        orig_reg: u8,
+        i: &Insn,
+        guard: usize,
+        fo: *mut Object,
+        fwd: &[(u8, u8)],
+    ) {
+        let code = self.out.frames[frame].code;
+        let insns = &self.out.insns;
+        let reads = |j: &Insn, r: u8| {
+            (j.uses_reg_value() && j.reg == r)
+                || (j.is_call() && !j.bail && j.call_reads().any(|x| x == r as usize))
+                || (j.op == Op::SetKeyed && j.reg2 == r)
+                || (j.op == Op::Mov && j.reg == r)
+        };
+        let star = |r: u8| {
+            insns[..guard]
+                .iter()
+                .rposition(|j| j.frame as usize == frame && j.op == Op::Star && j.reg == r)
+                .filter(|&s| !insns[s].bail && !insns[s].check_only)
+        };
+        let body = guard..insns.len();
+        // The first instruction after `s` (past code-less `Nop`s) sets
+        // `acc` without reading it: a value the dropped code left in `acc`
+        // (or didn't) is never seen.
+        let then_sets_acc = |s: usize| {
+            insns[s + 1..]
+                .iter()
+                .find(|j| !(j.op == Op::Nop && j.guard == 0 && j.alloc == 0 && j.assume == 0))
+                .is_some_and(|j| {
+                    !j.bail
+                        && j.native == 0
+                        && matches!(
+                            j.op,
+                            Op::Ldar
+                                | Op::LdaSmi
+                                | Op::LdaUndefined
+                                | Op::LdaNull
+                                | Op::LdaTrue
+                                | Op::LdaFalse
+                                | Op::LdaConstant
+                                | Op::LdaGlobal
+                                | Op::GetNamed
+                        )
+                })
+        };
+        let mut drops = Vec::new();
+        // The callee's load.
+        if insns[guard].guard == 0
+            && let Some(s) = star(i.reg)
+            && s > 0
+            && insns[s - 1].op == Op::GetNamed
+            && !insns[s - 1].bail
+            && insns[s + 1..].iter().all(|j| !reads(j, i.reg))
+            && then_sets_acc(s)
+        {
+            let value = Restored::Const(crate::object::object_value(fo).to_bits());
+            drops.push((s, Some(s - 1), insns[s - 1].pc, orig_reg, i.reg, value));
+        }
+        for &(w, x) in fwd {
+            let Some(s) = star(w) else { continue };
+            if insns[s + 1..].iter().any(|j| reads(j, w))
+                || !insns[body.clone()].iter().any(|j| reads(j, x))
+            {
+                continue;
+            }
+            let orig_w = w - (self.out.frames[frame].base as u8);
+            // Its `Ldar x` too, if `acc` isn't read after.
+            let ldar = (s > 0
+                && insns[s - 1].op == Op::Ldar
+                && insns[s - 1].reg == x
+                && insns[s - 1].frame as usize == frame
+                && !insns[s - 1].bail
+                && then_sets_acc(s))
+            .then_some(s - 1);
+            drops.push((s, ldar, insns[s].pc, orig_w, w, Restored::Reg(x)));
+        }
+        for (s, get, after, orig, reg, value) in drops {
+            if !self.dead_after(code, k, orig) {
+                continue;
+            }
+            self.out.insns[s].check_only = true;
+            if let Some(g) = get {
+                self.out.insns[g].check_only = true;
+            }
+            self.out.restores.push(Restore {
+                frame: frame as u8,
+                after,
+                upto: i.pc,
+                reg,
+                value,
+            });
+        }
     }
 
     /// Call `i` inlined for each of the functions `fos`: a case per
@@ -7844,6 +8307,7 @@ impl JitFunction {
             root_insns,
             decoded: HashMap::default(),
             entry_live: HashMap::default(),
+            pc_live: HashMap::default(),
             props: Vec::new(),
             fbs: Vec::new(),
             snap: Rc::new(Snapshot {
@@ -7852,6 +8316,8 @@ impl JitFunction {
                 frames: Vec::new(),
                 frame_regs: Vec::new(),
                 aliases: Vec::new(),
+                restores: Vec::new(),
+                exit_live: Vec::new(),
                 sites: Vec::new(),
             }),
             inline_base: nregs,
@@ -7968,6 +8434,8 @@ impl JitFunction {
                 frames: low.frames,
                 frame_regs,
                 aliases: low.aliases,
+                restores: low.restores,
+                exit_live: low.exit_live,
                 sites: low.sites,
             });
         }
@@ -8031,6 +8499,7 @@ impl JitFunction {
                 frames: &vm.snap.frame_regs,
                 root: vm.root,
                 mats: Some(&vm.snap.mats),
+                exit_live: Some(&vm.snap.exit_live),
             },
         );
         code.snap = Some(vm.snap.clone());
@@ -8285,6 +8754,7 @@ impl JitFunction {
                         None => &[],
                     };
                     let mats = self.vm.as_ref().map(|vm| &vm.snap.mats);
+                    let exit_live = self.vm.as_ref().map(|vm| &vm.snap.exit_live[..]);
                     JitCode::compile(
                         &self.insns,
                         entry,
@@ -8300,6 +8770,7 @@ impl JitFunction {
                             frames,
                             root,
                             mats,
+                            exit_live,
                         },
                     )
                 };
@@ -8543,8 +9014,26 @@ unsafe fn materialize(
         }
         g = fr.parent;
     }
-    // Parameters read from their arguments' registers.
+    // Registers a call's setup didn't write, for a frame resuming in it.
     let snap = code.snap.as_ref().unwrap();
+    let (mut g, mut pc) = (frame, exit_pc);
+    loop {
+        for r in snap.restores.iter().filter(|r| r.frame as usize == g) {
+            if r.after < pc && pc <= r.upto {
+                let v = match r.value {
+                    Restored::Reg(x) => unsafe { *regs.add(x as usize) },
+                    Restored::Const(bits) => Value::from_bits(bits),
+                };
+                unsafe { *regs.add(r.reg as usize) = v };
+            }
+        }
+        if g == 0 {
+            break;
+        }
+        pc = frames[g].ret_pc;
+        g = frames[g].parent;
+    }
+    // Parameters read from their arguments' registers.
     let mut g = frame;
     while g != 0 {
         for &(_, p, a) in snap.aliases.iter().filter(|a| a.0 as usize == g) {

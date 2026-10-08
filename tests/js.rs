@@ -131,6 +131,33 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
     }
 }
 
+/// The microbenchmarks compiled after 1 and 3 back edges: code entered in
+/// the middle of loops, and exits there before types and caches settle,
+/// each leaving the interpreter what it reads (registers sharing slots
+/// write back only those; see `jit::assign_homes`).
+#[test]
+fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
+    for f in files("bench/micro", "js") {
+        let name = f.file_name().unwrap().to_str().unwrap();
+        if !RUNNING.contains(&&name[..2]) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&f).unwrap();
+        let expect = src
+            .lines()
+            .find_map(|l| l.strip_prefix("// expect: "))
+            .unwrap()
+            .trim();
+        let module = toi::js::compile(&src).unwrap();
+        for budget in [1, 3] {
+            let mut vm = Vm::new();
+            vm.set_tier_back_edges(budget);
+            let v = vm.run(&module).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(display(v), expect, "{name} (tier at {budget})");
+        }
+    }
+}
+
 #[test]
 fn statements() {
     // `while`, `do … while`, `break` and `continue`, labeled ones too.

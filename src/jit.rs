@@ -6126,6 +6126,13 @@ impl JitCode {
                 }
                 ("mod_smi_iif", _) => (insn.imm, u64::MAX / insn.imm as u64 + 1, 0),
                 ("bail", _) => (0, 0, 0),
+                // `push` allocates an empty array's first elements from
+                // the heap's free space.
+                (n, _) if n.starts_with("array_push") => (
+                    0,
+                    feedback.map_or(0, |f| unsafe { (*f[0].vm).heap.bump() } as u64),
+                    0,
+                ),
                 (_, Some(p)) if p.operands().is_some() => p.operands().unwrap(),
                 (
                     _,

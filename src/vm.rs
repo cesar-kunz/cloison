@@ -591,6 +591,7 @@ impl Vm {
                 0
             },
             family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -615,6 +616,7 @@ impl Vm {
             elems: FieldType::None,
             elems_code: 0,
             family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -657,6 +659,7 @@ impl Vm {
             elems: s.elems,
             elems_code: s.elems_code,
             family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
             unique: s.unique,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -687,6 +690,7 @@ impl Vm {
                 elems: s.elems,
                 elems_code: s.elems_code,
                 family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
@@ -808,6 +812,7 @@ impl Vm {
             elems,
             elems_code: elems.encode(),
             family: s.family,
+            push: Cell::new(std::ptr::null_mut()),
             unique: s.unique,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -825,7 +830,18 @@ impl Vm {
             let s = &*(*o).shape;
             let elems = s.elems.join(FieldType::of(value));
             if elems != s.elems {
-                (*o).shape = self.elements_transition((*o).shape, elems);
+                let t = self.elements_transition((*o).shape, elems);
+                // For the `array_push` stencils (see `Shape::push_key`).
+                if !s.unique && s.class == crate::object::Class::Array {
+                    if s.elems == FieldType::None {
+                        let c = s.push_cache();
+                        c.to.rotate_right(1);
+                        c.to[0] = (crate::object::push_key(value), t as u64);
+                    } else if elems == FieldType::Any {
+                        s.push_cache().any = t as u64;
+                    }
+                }
+                (*o).shape = t;
             }
             *(*o).elems.add(i) = value;
         }
@@ -1060,6 +1076,7 @@ impl Vm {
                     elems: s.elems,
                     elems_code: s.elems_code,
                     family: std::ptr::null(),
+                    push: Cell::new(std::ptr::null_mut()),
                     unique: true,
                     transitions: RefCell::default(),
                     elem_transitions: RefCell::default(),

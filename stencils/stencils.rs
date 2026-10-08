@@ -3628,6 +3628,86 @@ stencil!("materialize"; |s| {
 // `a.pop()` (`a` in its slot): the last element, its slot made a hole and
 // the length one less, or `undefined` if empty (or a hole), if `a` is an
 // array; else leave before the call.
+/// `vm::NO_ELEMENTS`: the elements' code of a shape with no elements yet.
+const NO_ELEMENTS: u64 = 3;
+/// `object::PUSH_WAYS`, and the word of `object::PushCache::any`.
+const PUSH_WAYS: usize = 4;
+const PUSH_ANY: usize = 2 * PUSH_WAYS;
+
+/// The elements a push's helper gives an array without any (as a new one).
+/// In Octane's DeltaBlue, 7.3M of 8.9M pushes through the runtime were the
+/// first onto an array; allocating them with every array instead cost
+/// 20-constructor-fields 46%.
+const FIRST_ELEMENTS: usize = 4;
+
+/// If the array at `o` has no room for elements at all, give it
+/// [`FIRST_ELEMENTS`] (`undefined`) from the heap's free space (`imm64`:
+/// `Heap::bump`), if there is that much.
+#[inline(always)]
+unsafe fn first_elements(o: *mut u8) {
+    if *(o.add(36) as *const u32) != 0 {
+        return;
+    }
+    let heap = imm64() as *mut [*mut u64; 2];
+    let p = (*heap)[0];
+    if heap.is_null() || ((*heap)[1] as usize - p as usize) < 8 * FIRST_ELEMENTS {
+        return;
+    }
+    (*heap)[0] = p.add(FIRST_ELEMENTS);
+    // Volatile: LLVM would vectorize the stores from a constant pool,
+    // which a stencil can't refer to.
+    for k in 0..FIRST_ELEMENTS {
+        p.add(k).write_volatile(Value::UNDEFINED.to_bits());
+    }
+    *(o.add(24) as *mut *mut u64) = p;
+    *(o.add(36) as *mut u32) = FIRST_ELEMENTS as u32;
+}
+
+/// For a push of `v` that doesn't fit the elements of an array of `shape`
+/// (with room for it): the shape the array moves to, if a push of the same
+/// kind of value made that transition before (`Shape::push`, an
+/// `object::PushCache`), else 0. An int32 onto int32 elements fits; another
+/// number generalizes them to numbers, which is left to the runtime.
+#[inline(always)]
+unsafe fn push_transition(tag: NumberTag, shape: *const u64, v: Value) -> u64 {
+    let code = *shape;
+    // `Shape::push`, an `object::PushCache`.
+    let cache = *shape.add(2) as *const u64;
+    if cache.is_null() {
+        return 0;
+    }
+    let number = v.to_bits() & tag.to_bits() != 0;
+    if code == NO_ELEMENTS {
+        let key = if tag.is_int32(v) {
+            1
+        } else if number {
+            2
+        } else if is_cell(tag, v) {
+            *(v.to_bits() as *const u64)
+        } else {
+            0
+        };
+        push_target(cache, key)
+    } else if code == 1 && number || code == 0 {
+        0
+    } else {
+        *cache.add(PUSH_ANY)
+    }
+}
+
+/// The shape `PushCache::to` (at `cache`) moves an array to for a value of
+/// key `key`, or 0.
+#[inline(always)]
+unsafe fn push_target(cache: *const u64, key: u64) -> u64 {
+    let mut to = 0;
+    for k in 0..PUSH_WAYS {
+        if to == 0 && *cache.add(2 * k) == key {
+            to = *cache.add(2 * k + 1);
+        }
+    }
+    to
+}
+
 #[inline(always)]
 fn is_array(tag: NumberTag, a: Value) -> bool {
     is_cell(tag, a) && unsafe { *(a.to_bits() as *const u8).add(8) } == 1
@@ -3659,7 +3739,21 @@ macro_rules! array_methods {
             // Each stencil keeps its own helper (LLVM would merge these).
             core::arch::asm!(concat!("/* array_push_", $nc, loc!($loc), " */"), options(nomem, nostack, preserves_flags));
             let a = get!($loc, s);
-            s.acc = unboxed(int(Value::from_bits(rt_call!(s, toi_rt_array_push, a, s.acc))));
+            let v = s.acc;
+            let o = a.to_bits() as *mut u8;
+            let len = *(o.add(32) as *const u32);
+            first_elements(o);
+            if len < *(o.add(36) as *const u32) {
+                let to = push_transition(s.tag, *(o as *const *const u64), v);
+                if to != 0 {
+                    *(o as *mut u64) = to;
+                    *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
+                    *(o.add(32) as *mut u32) = len + 1;
+                    s.acc = unboxed(len as i32 + 1);
+                    next!(s)
+                }
+            }
+            s.acc = unboxed(int(Value::from_bits(rt_call!(s, toi_rt_array_push, a, v))));
             next!(s)
         });
         // An int32 fits elements of any type but objects of a shape
@@ -3682,6 +3776,19 @@ macro_rules! array_methods {
             core::arch::asm!(concat!("/* array_push_i_", $nc, loc!($loc), " */"), options(nomem, nostack, preserves_flags));
             let a = get!($loc, s);
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            let o = a.to_bits() as *mut u8;
+            let len = *(o.add(32) as *const u32);
+            first_elements(o);
+            if len < *(o.add(36) as *const u32) {
+                let to = push_transition(s.tag, *(o as *const *const u64), v);
+                if to != 0 {
+                    *(o as *mut u64) = to;
+                    *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
+                    *(o.add(32) as *mut u32) = len + 1;
+                    s.acc = unboxed(len as i32 + 1);
+                    next!(s)
+                }
+            }
             s.acc = unboxed(int(Value::from_bits(rt_call!(s, toi_rt_array_push, a, v))));
             next!(s)
         });

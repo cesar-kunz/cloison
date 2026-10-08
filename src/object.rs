@@ -216,6 +216,10 @@ pub struct Shape {
     /// differ in nothing else, so they find the same property in the same
     /// prototype. Compiled code reads it (`family_jeq`).
     pub family: *const Shape,
+    /// Element transitions the `array_push` stencils make themselves
+    /// (`Vm::store_element` records them), out of line as few shapes have
+    /// any: null until one is recorded.
+    pub push: Cell<*mut PushCache>,
     pub class: Class,
     /// An object, or null.
     pub proto: Value,
@@ -252,6 +256,56 @@ pub const DONT_DELETE: u8 = 4;
 
 const _: () = assert!(std::mem::offset_of!(Shape, elems_code) == 0);
 const _: () = assert!(std::mem::offset_of!(Shape, family) == 8);
+const _: () = assert!(std::mem::offset_of!(Shape, push) == 16);
+
+/// Entries of [`PushCache::to`]. DeltaBlue's collections start with
+/// objects of several constructors.
+pub const PUSH_WAYS: usize = 4;
+
+/// [`Shape::push`]: an array of the shape, with no elements yet, moves to
+/// `to[k].1` when a value whose key ([`push_key`]) is `to[k].0` is pushed
+/// onto it (null: no entry; the latest first); `any`, if not null, is the
+/// shape with elements of any type it moves to. The stencils read it.
+#[repr(C)]
+#[derive(Default)]
+pub struct PushCache {
+    pub to: [(u64, u64); PUSH_WAYS],
+    pub any: u64,
+}
+
+impl Drop for Shape {
+    fn drop(&mut self) {
+        let p = self.push.get();
+        if !p.is_null() {
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
+}
+
+impl Shape {
+    /// The shape's [`PushCache`], made if it has none.
+    pub(crate) fn push_cache(&self) -> &mut PushCache {
+        if self.push.get().is_null() {
+            self.push.set(Box::into_raw(Box::default()));
+        }
+        unsafe { &mut *self.push.get() }
+    }
+}
+
+/// A value's key for [`PushCache`]: 1 for an int32, 2 for another
+/// number, an object's shape, else 0 (its type is `Any`). Values of one key
+/// have one [`FieldType`].
+pub fn push_key(v: Value) -> u64 {
+    if v.is_int32() {
+        1
+    } else if v.is_number() {
+        2
+    } else if v.is_cell() {
+        unsafe { (*as_object(v)).shape as u64 }
+    } else {
+        0
+    }
+}
 
 impl Shape {
     pub fn lookup(&self, name: Atom) -> Option<u32> {
@@ -444,6 +498,7 @@ mod tests {
             elems: FieldType::None,
             elems_code: 0,
             family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),

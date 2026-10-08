@@ -3613,6 +3613,29 @@ fn exit_live(frames: &[FrameRegs], frame: u8, nregs: usize) -> Vec<bool> {
 /// the reachable instructions): read before being written on some path,
 /// by an instruction or by the interpreter after a bail.
 fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize, frames: &[FrameRegs]) -> Vec<RegSet> {
+    reg_live_in_mats(insns, reach, nregs, frames, None, true)
+}
+
+/// [`reg_live_in`] without the registers only a bail keeps live (every
+/// register of its frames, which the interpreter may or may not read): the
+/// registers compiled code reads, which hold values. One a bail alone keeps
+/// live may hold anything (a call-window temporary not yet written in this
+/// frame holds whatever the stack held: a stale frame header, say).
+fn reg_read_in(insns: &[Insn], reach: &[bool], nregs: usize) -> Vec<RegSet> {
+    reg_live_in_mats(insns, reach, nregs, &[], None, false)
+}
+
+/// [`reg_live_in`], with the fields of the objects exits allocate (`mats`,
+/// see [`scalar_replace`]) read where they are allocated; with
+/// `bail_reads` false, a bail reads no register.
+fn reg_live_in_mats(
+    insns: &[Insn],
+    reach: &[bool],
+    nregs: usize,
+    frames: &[FrameRegs],
+    mats: Option<&HashMap<usize, Vec<Rc<Mat>>>>,
+    bail_reads: bool,
+) -> Vec<RegSet> {
     let n = insns.len();
     // Per instruction, the registers it reads and those it writes, and
     // whether it bails (leaving every register of its frames live: see
@@ -3642,7 +3665,9 @@ fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize, frames: &[FrameRegs
             // function, which may read any register: each must hold its
             // value there, so a register with a store of a non-int32 isn't
             // pinned as an int32 (which would truncate it).
-            if insn.bail {
+            if insn.bail && !bail_reads {
+                writes = [!0; 4];
+            } else if insn.bail {
                 let e = *exit_sets
                     .entry(insn.frame)
                     .or_insert_with(|| rs_of(&exit_live(frames, insn.frame, nregs)));
@@ -3653,6 +3678,12 @@ fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize, frames: &[FrameRegs
             (reads, writes)
         })
         .collect();
+    let mut effects = effects;
+    for (&at, ms) in mats.into_iter().flatten() {
+        for &f in ms.iter().flat_map(|m| &m.fields) {
+            rs_add(&mut effects[at].0, f as usize);
+        }
+    }
     let mut live_in: Vec<RegSet> = vec![[0; 4]; n];
     let mut changed = true;
     while changed {
@@ -6317,6 +6348,8 @@ struct EntryLive {
     acc: Vec<bool>,
     acc_at_entry: bool,
     at_entry: Vec<bool>,
+    /// Of `at_entry`, those compiled code reads (see [`reg_read_in`]).
+    read_at_entry: Vec<bool>,
 }
 
 impl EntryLive {
@@ -6325,7 +6358,10 @@ impl EntryLive {
         let regs = reg_live_in(insns, &reach, nregs, frames);
         let acc = acc_liveness(insns, &reach).0;
         let at_entry = (0..nregs).map(|r| rs_has(&regs[entry], r)).collect();
+        let read = reg_read_in(insns, &reach, nregs);
+        let read_at_entry = (0..nregs).map(|r| rs_has(&read[entry], r)).collect();
         EntryLive {
+            read_at_entry,
             acc_at_entry: acc[entry],
             at_entry,
             reach,
@@ -7247,7 +7283,17 @@ fn scalar_replace(out: &mut Lowered) {
                 .iter()
                 .map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent))
                 .collect();
-            reg_live_in(&out.insns, &reachable(&out.insns, 0), out.nregs, &frames)
+            // An object replaced already is a use of the registers of
+            // its fields where an exit allocates it: one of them may hold
+            // the object this allocation makes.
+            reg_live_in_mats(
+                &out.insns,
+                &reachable(&out.insns, 0),
+                out.nregs,
+                &frames,
+                Some(&out.mats),
+                true,
+            )
         });
         if let Some(plan) = replacement(out, a, l) {
             apply_replacement(out, a, plan);
@@ -7505,11 +7551,17 @@ fn apply_replacement(out: &mut Lowered, a: usize, plan: Replacement) {
     out.insns[a].native = 3;
     for (i, shape, regs) in plan.live {
         let fields = (0..unsafe { (*shape).keys.len() }).map(h).collect();
-        out.mats.entry(i).or_default().push(Rc::new(Mat {
-            shape,
-            fields,
-            regs,
-        }));
+        // Before the objects replaced earlier: one may hold this one in a
+        // field (a slot register this allocation writes). (Not the other
+        // way: an object stored into one replaced later escapes there.)
+        out.mats.entry(i).or_default().insert(
+            0,
+            Rc::new(Mat {
+                shape,
+                fields,
+                regs,
+            }),
+        );
     }
 }
 
@@ -9624,8 +9676,10 @@ impl JitFunction {
             .live_at
             .entry(entry)
             .or_insert_with(|| Rc::new(EntryLive::new(insns, entry, nregs, frames)));
-        let (acc_live, live) = (&l.acc_at_entry, &l.at_entry);
+        let (acc_live, live, read) = (&l.acc_at_entry, &l.at_entry, &l.read_at_entry);
         // Only live values are looked at: dead registers may hold anything.
+        // So may those live only into a bail (see `reg_read_in`): `Any`,
+        // not looked at either.
         // So may inlined frames' registers, live or not: code is entered in
         // the function's own frame, before any inlined frame starts (they
         // seem live there to a bail inside one, which leaves them all to
@@ -9643,9 +9697,13 @@ impl JitFunction {
         TypeState {
             acc: ty(acc, *acc_live),
             regs: Regs::from_dense(regs.iter().zip(live.iter()).enumerate().map(
-                |(r, (&v, &l))| match ty(v, l && r < inline_base) {
-                    Ty::Obj(s) if r < params => Ty::Ext(s),
-                    t => t,
+                |(r, (&v, &l))| {
+                    let l = l && r < inline_base;
+                    match ty(v, l && read[r]) {
+                        _ if l && !read[r] => Ty::Any,
+                        Ty::Obj(s) if r < params => Ty::Ext(s),
+                        t => t,
+                    }
                 },
             )),
             same: Vec::new(),

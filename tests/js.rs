@@ -79,10 +79,10 @@ fn listings_are_what_the_front_end_emits() {
 /// Benchmarks that compile, and run on what the VM implements so far.
 const RUNNING: &[&str] = &[
     "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16",
-    "17", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34",
-    "35", "36", "37", "40", "41", "42", "43", "44", "45", "50", "51", "52", "53", "60", "61", "62",
-    "63", "64", "65", "66", "67", "68", "69", "70", "71", "80", "81", "82", "83", "84", "90", "91",
-    "92", "93", "94",
+    "17", "18", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33",
+    "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "50", "51", "52",
+    "53", "54", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "80", "81",
+    "82", "83", "84", "85", "86", "87", "90", "91", "92", "93", "94",
 ];
 
 #[test]
@@ -1263,6 +1263,31 @@ fn scalar_replaced_objects_agree_with_node() {
     ] {
         assert_eq!(value(&format!("{SCALARS}\n{call};")), want, "{call}");
     }
+}
+
+/// An object scalar replaced together with the object in its field: an
+/// exit (the cold branch) allocates both, the inner one first. The
+/// expected value is Node's.
+const NESTED: &str = r#"
+function Inner() { this.x = 7; }
+function Outer(v) { this.v = v; this.inner = new Inner(); }
+function f(n, cold, q) {
+  var s = 0;
+  for (var i = 0; i < n; i++) {
+    var o = new Outer(i);
+    if (i == cold) s += q.zz;
+    s += o.inner.x;
+  }
+  return s;
+}
+var t = 0;
+for (var r = 0; r < 300; r++) t += f(100, -1, null);
+t + f(100, 50, { zz: 1 });
+"#;
+
+#[test]
+fn nested_scalar_replaced_objects_agree_with_node() {
+    assert_eq!(value(NESTED), "210701");
 }
 
 /// A method a compiled loop calls inlined, without checking the callee

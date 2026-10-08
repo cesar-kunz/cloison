@@ -21,6 +21,10 @@
 # (toi, default 7) and V8REPS (default 11) runs, pinned to an idle core
 # (scripts/quiet.sh). Results are checked against `// expect:`.
 #
+# With Octane's base.js and deltablue.js in $OCTANE (default notes/deltablue,
+# not tracked: GPL), the table ends with Octane DeltaBlue's own score
+# (higher is better) in each column, measured afresh (about 5 s each).
+#
 # The machine's load average goes in the table's header, at the start and
 # the end of the run: V8's cached times may come from a quieter (or
 # busier) time than toi's.
@@ -120,9 +124,36 @@ for f in bench/micro/*.js; do
 done
 mv "$tmp" "$out"
 
-python3 - "$out" "$commit" "$v8" "$load_start $(cut -d' ' -f1 /proc/loadavg)" <<'EOF' | tee "${out%.tsv}.md"
-import math, sys
-path, commit, v8, load = sys.argv[1:]
+# Octane DeltaBlue's score, its harness and file unmodified.
+octane=${OCTANE:-notes/deltablue}
+scores=$hist/tiers-$commit-octane.tsv
+rm -f "$scores"
+if [[ -f $octane/base.js && -f $octane/deltablue.js ]]; then
+  src=$(mktemp --suffix=.js)
+  cat "$octane/base.js" "$octane/deltablue.js" - >"$src" <<'JS'
+var score = "", failed = "";
+BenchmarkSuite.RunSuites({
+  NotifyResult: function (name, result) {},
+  NotifyError: function (name, error) { failed = name + ": " + error; },
+  NotifyScore: function (s) { score = s; }
+});
+failed == "" ? score : failed;
+JS
+  core=$(scripts/quiet.sh --core)
+  {
+    QUIET_CPU=${core%%,*} TOI_NO_JIT=1 scripts/quiet.sh target/release/toi "$src"
+    QUIET_CPU=${core%%,*} scripts/quiet.sh target/release/toi "$src"
+    for t in "${tiers[@]}"; do
+      taskset -c "$core" "$NODE" ${flags[$t]} -e \
+        'console.log(require("vm").runInThisContext(require("fs").readFileSync(process.argv[1], "utf8")))' "$src"
+    done
+  } | paste -sd '\t' >"$scores"
+  rm -f "$src"
+fi
+
+python3 - "$out" "$commit" "$v8" "$load_start $(cut -d' ' -f1 /proc/loadavg)" "$scores" <<'EOF' | tee "${out%.tsv}.md"
+import math, os, sys
+path, commit, v8, load, scores = sys.argv[1:]
 rows = [l.rstrip("\n").split("\t") for l in open(path)]
 head, rows = rows[0], rows[1:]
 names = ["toi interp", "toi JIT", "Ignition", "Sparkplug", "Maglev", "Turbofan"]
@@ -146,4 +177,11 @@ for k, who in ((0, "toi interp"), (1, "toi JIT")):
     print(f"{who} vs " + ", ".join(
         f"{names[j]} {gm[j] / gm[k]:.2f}x (faster on {sum(cols[k][i] < cols[j][i] for i in ok)})"
         for j in range(2, 6)) + f" (of {len(ok)}; above 1x: toi faster)")
+if os.path.exists(scores):
+    s = open(scores).read().split("\t")
+    print()
+    print("Octane DeltaBlue score (its harness and file unmodified; higher is better):\n")
+    print("| | " + " | ".join(names) + " |")
+    print("|---|" + "---:|" * len(names))
+    print("| **score** | " + " | ".join(x.strip() for x in s) + " |")
 EOF

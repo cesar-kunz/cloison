@@ -2696,7 +2696,11 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
             out.acc = acc;
             let proven = matches!(spec.props.get(i), Some(Prop::Call { proven: true, .. }));
-            let case = if base == "call_direct" && proven { "nc" } else { "" };
+            let case = if base == "call_direct" && proven {
+                "nc"
+            } else {
+                ""
+            };
             return Sel {
                 result,
                 post,
@@ -6799,6 +6803,14 @@ const MAX_VM_COMPILES: u32 = 32;
 /// Inlining limits: nesting, and the callee's size in instructions.
 const MAX_INLINE_DEPTH: usize = 2;
 const MAX_INLINE_INSNS: usize = 64;
+/// Bytecode instructions a lowering inlines at call sites outside loops
+/// (small leaves aside): past it, those calls stay calls (direct ones,
+/// cheap now). Inlined chains of polymorphic methods outside loops were
+/// most of DeltaBlue's compiled code (833 KB, 5.4 KB per compile; 66 of
+/// its 74 ms for 10 runs went to compiling). Measured (perf.sh --ab):
+/// 87 -48%, 85 -27%, 71 -8%; 91 +4%, 80 and 82 +2%. Without exempting
+/// calls in loops, 80 lost 80%; 60 cost 91 17%.
+const INLINE_BUDGET: usize = 80;
 /// Functions inlined at any depth: calling nothing and at most this long.
 const MAX_LEAF_INSNS: usize = 16;
 
@@ -7361,6 +7373,12 @@ struct Lowering<'a> {
     /// copies of another register, with that register, both renamed (see
     /// [`window_sources`]).
     fwd: Vec<(u8, u8)>,
+    /// Bytecode instructions inlined so far, small leaves aside (see
+    /// [`INLINE_BUDGET`]).
+    inlined: usize,
+    /// The call being considered for inlining is in a loop of its frame:
+    /// not limited by [`INLINE_BUDGET`].
+    call_in_loop: bool,
 }
 
 /// The function's instructions as compiled, from its code and inline caches:
@@ -7450,6 +7468,8 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
         direct: Vec::new(),
         live: HashMap::default(),
         fwd: Vec::new(),
+        inlined: 0,
+        call_in_loop: false,
     };
     cx.out.fbs.push(cx.feedback(root));
     let rets = cx.emit_frame(0, 0);
@@ -8889,6 +8909,7 @@ impl Lowering<'_> {
         }
         let f = self.out.frames[frame];
         let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
+        self.call_in_loop = self.in_loop(f.code, i.pc);
         if (depth >= MAX_INLINE_DEPTH && !self.small_leaf(ic.holder))
             || self.out.frames.len() >= 255
             || self
@@ -8900,6 +8921,17 @@ impl Lowering<'_> {
             return None;
         }
         self.inlinable(frame, ic.holder).then_some(ic.holder)
+    }
+
+    /// Whether the instruction at bytecode offset `pc` of `code` is in a
+    /// loop of `code` (between a backward jump and its target).
+    fn in_loop(&mut self, code: *const crate::vm::Code, pc: usize) -> bool {
+        let d = self.decoded(code);
+        let insns = &d.0;
+        let Some(k) = insns.iter().position(|j| j.pc == pc) else {
+            return false;
+        };
+        (insns.iter().enumerate()).any(|(b, j)| j.jumps() && j.target <= k && k <= b)
     }
 
     /// Whether `fo` is a bytecode function of at most [`MAX_LEAF_INSNS`]
@@ -8957,6 +8989,12 @@ impl Lowering<'_> {
             return false;
         }
         let callee = unsafe { (*fo).code };
+        if !self.call_in_loop
+            && self.inlined + self.decoded(callee).0.len() > INLINE_BUDGET
+            && !self.small_leaf(fo)
+        {
+            return false;
+        }
         // Recursively only one level deep: below that, calls to it are
         // direct (to the code being compiled, for this function).
         let mut seen = false;
@@ -9594,6 +9632,9 @@ impl Lowering<'_> {
         let c = unsafe { &*callee };
         let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
         let id = self.out.frames.len();
+        if !self.small_leaf(fo) {
+            self.inlined += self.decoded(callee).0.len();
+        }
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,

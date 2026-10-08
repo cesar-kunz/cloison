@@ -6864,8 +6864,13 @@ pub(crate) struct CallSite {
     frame: usize,
     nparams: u32,
     /// Exits of the callee's code at this site: past [`MAX_DIRECT_EXITS`],
-    /// calls go through the runtime (`entry` = 0).
+    /// calls go through the runtime (`entry` = 0) until the callee is
+    /// compiled again (`retry`).
     exits: u32,
+    /// When calls went through the runtime for exits: the callee's compile
+    /// count then. Once it has compiled since (with the feedback the exits
+    /// gave it), the site is bound again (see [`toi_rt_call`]).
+    retry: u32,
     /// The callee's code and compiled version, for a direct call.
     callee: *const crate::vm::Code,
     /// The function the call's inline cache names (bytecode or native), if
@@ -6946,6 +6951,15 @@ fn same_insns(a: &[Insn], b: &[Insn]) -> bool {
 /// lowering changed little.
 const COOL_ENTRIES: u32 = 100;
 
+/// How many times `callee` has been compiled (0 if it is being compiled
+/// now: its state is borrowed).
+fn callee_compiles(callee: *const crate::vm::Code) -> u32 {
+    unsafe { (*callee).jit.try_borrow() }
+        .ok()
+        .and_then(|f| f.as_ref().map(|f| f.stats.compiles))
+        .unwrap_or(0)
+}
+
 /// Exits of a direct callee before its call site stops calling directly.
 const MAX_DIRECT_EXITS: u32 = 4;
 
@@ -6999,6 +7013,7 @@ impl CallSite {
             bound: false,
             claim: None,
             pending: false,
+            retry: 0,
             ..*self
         }
     }
@@ -8607,17 +8622,14 @@ impl Lowering<'_> {
                     let callee = self.inline_ctor(frame, &i, depth).unwrap();
                     self.inline_construct(frame, &i, callee, depth);
                 }
-                Op::Call | Op::CallUndefined
-                    if self.cached_callees(frame, &i).len() > 1
-                        && self
-                            .state
-                            .callee_exits
-                            .get(&origin)
-                            .is_none_or(|&n| n < MAX_PROPERTY_EXITS) =>
-                {
+                Op::Call | Op::CallUndefined if self.cached_callees(frame, &i).len() > 1 => {
                     // Several callees, not inlined: a direct call to each,
                     // dispatched on the callee; the last one's site calls
-                    // any other through the runtime.
+                    // any other through the runtime. (Its guards jump to
+                    // the next case, never exit: exits that gave up
+                    // inlining here don't count. With them, DeltaBlue's
+                    // `plan.execute()` called its second test's `execute`
+                    // through the runtime: 135 calls a run.)
                     let fos = self.cached_callees(frame, &i);
                     let mut ends = Vec::new();
                     for (n, &fo) in fos.iter().enumerate() {
@@ -8709,6 +8721,7 @@ impl Lowering<'_> {
             bound: false,
             claim: None,
             pending: false,
+            retry: 0,
         }
     }
 
@@ -10893,6 +10906,9 @@ unsafe fn direct_exit(
             }
             site.entry = 0;
             site.pending = site.claim.is_some() && site.exits < MAX_DIRECT_EXITS;
+            if site.exits == MAX_DIRECT_EXITS {
+                site.retry = callee_compiles(site.callee);
+            }
         }
         let callee_regs = caller.add(site.frame);
         // A call to the code itself: that code is running (it made the
@@ -10918,6 +10934,18 @@ unsafe fn direct_exit(
 extern "C" fn toi_rt_call(regs: Value, site: Value) -> Value {
     unsafe {
         let site = &mut *(site.to_bits() as *mut CallSite);
+        // A site that stopped calling directly after its callee's exits:
+        // bind it again once the callee compiled since. (Warm-up exits, at
+        // stores to a constructor's `this` whose shapes differ by subclass,
+        // say, made constructors run in the interpreter for good.)
+        if site.claim.is_some()
+            && !site.pending
+            && site.exits >= MAX_DIRECT_EXITS
+            && callee_compiles(site.callee) != site.retry
+        {
+            site.exits = 0;
+            site.pending = true;
+        }
         // A direct call whose callee was being compiled: bind it now, for
         // the next calls.
         if site.pending {

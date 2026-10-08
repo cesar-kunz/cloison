@@ -158,6 +158,33 @@ fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
     }
 }
 
+/// The microbenchmarks with the warm tier on (`jit::Tier`): functions
+/// compiled warm, tiering up to hot code at loop headers and starts, the
+/// run continuing there; after 1 and 1000 back edges in the interpreter.
+#[test]
+fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
+    for f in files("bench/micro", "js") {
+        let name = f.file_name().unwrap().to_str().unwrap();
+        if !RUNNING.contains(&&name[..2]) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&f).unwrap();
+        let expect = src
+            .lines()
+            .find_map(|l| l.strip_prefix("// expect: "))
+            .unwrap()
+            .trim();
+        let module = toi::js::compile(&src).unwrap();
+        for budget in [1, 1000] {
+            let mut vm = Vm::new();
+            vm.set_warm_tier(true);
+            vm.set_tier_back_edges(budget);
+            let v = vm.run(&module).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(display(v), expect, "{name} (warm, tier at {budget})");
+        }
+    }
+}
+
 #[test]
 fn statements() {
     // `while`, `do … while`, `break` and `continue`, labeled ones too.

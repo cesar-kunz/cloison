@@ -402,6 +402,7 @@ fn slack_tracking_grows_in_object_capacity() {
     );
     let m = toi::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     let second = vm.run(&m).unwrap();
     assert_eq!(vm.inline_capacity(second), 6);
 }
@@ -499,6 +500,7 @@ fn jit(src: &str) -> (String, Vec<String>) {
     let expected = ok(src);
     let m = toi::asm::parse(src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
     let v = display(vm.run(&m).unwrap());
     assert_eq!(v, expected);
@@ -1662,6 +1664,7 @@ end
 ";
     let m = toi::asm::parse(src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     let v = display(vm.run(&m).unwrap());
     // Σ (i + 45) for i < 50 except 40, plus 2147483600 + 45.
     let expected: u64 = (0..50u64).filter(|&i| i != 40).map(|i| i + 45).sum::<u64>() + 2147483645;
@@ -1731,6 +1734,7 @@ end
     // n = 1..8, five times each: 5 × Σ n(n-1)/2 = 5 × 84.
     assert_eq!(ok(src), "420");
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.run(&toi::asm::parse(src).unwrap()).unwrap();
     assert!(vm.jit_stencils("Sum").is_some(), "Sum compiled");
 }
@@ -2037,6 +2041,7 @@ fn jit_function(src: &str, function: &str) -> (String, Vec<String>) {
     let expected = ok(src);
     let m = toi::asm::parse(src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     let v = display(vm.run(&m).unwrap());
     assert_eq!(v, expected);
     (v, vm.jit_stencils(function).unwrap_or_default())
@@ -2190,6 +2195,7 @@ fn runtime_call_results_are_predicted() {
     assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
     let m = toi::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
     vm.run(&m).unwrap();
     let s = vm.jit_stencils("main").expect("main compiled");
@@ -2565,6 +2571,7 @@ end
     assert_eq!(ok(&src), (299 * 300 / 2).to_string());
     let m = toi::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
     vm.run(&m).unwrap();
     // `P` is inlined into `main`.
@@ -2624,6 +2631,7 @@ end
     assert_eq!(ok(&src), "700");
     let m = toi::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
     assert_eq!(display(vm.run(&m).unwrap()), "700");
     let s = vm.jit_stencils("F").unwrap_or_default();
@@ -2823,6 +2831,7 @@ end
     let expected: u64 = (0..500u64).map(|i| (i & 7) + 109).sum();
     let m = toi::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
     assert_eq!(display(vm.run(&m).unwrap()), expected.to_string());
     assert_eq!(ok(&src), expected.to_string());
@@ -2878,8 +2887,10 @@ fn self_tail_calls_are_loops() {
 fn deep_self_tail_recursion() {
     let m = toi::asm::parse(&tail_sum_program(1_000_000)).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     assert_eq!(display(vm.run(&m).unwrap()), "500000500000");
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.set_tier_back_edges(i64::MAX);
     let e = vm.run(&m).unwrap_err();
     assert_eq!(e.0, "RangeError: Maximum call stack size exceeded");
@@ -3030,6 +3041,7 @@ fn mutual_recursion_direct() {
     let expected = ok(&src);
     let m = toi::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     assert_eq!(display(vm.run(&m).unwrap()), expected);
     assert_eq!(expected, "6765");
     for name in ["f", "g"] {

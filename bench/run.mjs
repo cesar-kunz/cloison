@@ -30,7 +30,7 @@ import vm from "node:vm";
 const FEATURES = new Set([
   "loop", "double", "string", "switch", "call", "recursion", "closure",
   "object", "new", "proto", "call-method", "array", "global", "null",
-  "define-property", "for-in",
+  "define-property", "for-in", "throw",
 ]);
 
 const here = dirname(fileURLToPath(import.meta.url));

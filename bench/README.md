@@ -99,6 +99,8 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
 | [15-super-method-call.js](micro/15-super-method-call.js) | Overriding method calling the parent's version: X.parent.prototype.m.call(this, ...). |
 | [16-inner-function.js](micro/16-inner-function.js) | Creating an inner function per call, used as a constructor with a borrowed prototype. |
 | [17-constructor-side-effects.js](micro/17-constructor-side-effects.js) | `new X(...)` whose result is discarded: the constructor registers the object elsewhere. |
+| [18-constructor-calls-override.js](micro/18-constructor-calls-override.js) | A parent constructor calling a method that subclasses override, on an object still being built. |
+| [19-cold-path-throw.js](micro/19-cold-path-throw.js) | Checks in hot code whose failure throws; they never fail. |
 | [20-constructor-fields.js](micro/20-constructor-fields.js) | Constructor initializing seven fields of mixed kinds, then reading them back. |
 | [21-monomorphic-get.js](micro/21-monomorphic-get.js) | Monomorphic field loads in a loop over same-shaped objects. |
 | [22-monomorphic-set.js](micro/22-monomorphic-set.js) | Monomorphic field stores of ints, booleans and objects. |
@@ -117,16 +119,20 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
 | [35-chained-assignment.js](micro/35-chained-assignment.js) | Chained assignment storing one value into two objects' fields. |
 | [36-boolean-and-chain.js](micro/36-boolean-and-chain.js) | && chains over boolean fields of three objects, result stored in a field. |
 | [37-prefix-increment-field.js](micro/37-prefix-increment-field.js) | Pre-increment of a field, returning the new value. |
+| [38-mixed-depth-polymorphic-call.js](micro/38-mixed-depth-polymorphic-call.js) | Call sites over four classes whose implementations live at different depths of the prototype chain. |
+| [39-empty-polymorphic-methods.js](micro/39-empty-polymorphic-methods.js) | Calls to methods that do nothing or return a constant, at sites seeing three classes. |
 | [40-array-push-length.js](micro/40-array-push-length.js) | Growing an empty `new Array()` with push and reading length. |
 | [41-array-pop-worklist.js](micro/41-array-pop-worklist.js) | LIFO worklist: push seeds, pop one, push its successors, until empty. |
 | [42-array-index-load.js](micro/42-array-index-load.js) | Indexed loads from a packed int array in a counted loop. |
 | [43-array-compact-remove.js](micro/43-array-compact-remove.js) | Removing every occurrence of an element by in-place compaction, then popping the tail. |
 | [44-array-scan-filter.js](micro/44-array-scan-filter.js) | Scanning an array of objects, calling a predicate method, collecting matches. |
 | [45-collection-wrapper.js](micro/45-collection-wrapper.js) | A one-field wrapper class around an array, used only through one-line methods. |
+| [46-polymorphic-elements-scan.js](micro/46-polymorphic-elements-scan.js) | Scanning a collection of objects of four shapes, calling a predicate on each, collecting the ones that pass. |
 | [50-global-object-in-hot-method.js](micro/50-global-object-in-hot-method.js) | Methods reading a global variable that holds an object, and calling through it. |
 | [51-global-reassigned.js](micro/51-global-reassigned.js) | A global reassigned between phases; methods keep reading it. |
 | [52-global-store-number.js](micro/52-global-store-number.js) | Storing numbers into an object reachable from a global (an external object). |
 | [53-top-level-loop.js](micro/53-top-level-loop.js) | Loop at script top level: every variable is a global property. |
+| [54-global-reentrant-calls.js](micro/54-global-reentrant-calls.js) | Methods passing `this` to a method of a global object, which calls back into them, and they call the global again. |
 | [60-local-worklist-wrapper.js](micro/60-local-worklist-wrapper.js) | A worklist wrapper allocated, filled and drained inside one function; it never leaves. |
 | [61-worklist-passed-to-helper.js](micro/61-worklist-passed-to-helper.js) | A local worklist passed to a helper that only pushes into it. |
 | [62-returned-collection.js](micro/62-returned-collection.js) | A function building a collection and returning it to its caller, which consumes it. |
@@ -144,6 +150,9 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
 | [82-propagate-walk.js](micro/82-propagate-walk.js) | Kernel: worklist propagation of "max-of" ranks downstream through a graph, with marks. |
 | [83-collect-and-readd.js](micro/83-collect-and-readd.js) | Kernel: collect unsatisfied items into a returned collection; re-add them lowest rank first. |
 | [84-build-and-tear-down.js](micro/84-build-and-tear-down.js) | Kernel: build a graph by constructor side effects, then remove edges by in-place compaction. |
+| [85-plan-extraction.js](micro/85-plan-extraction.js) | Kernel: extracting a plan from the input steps (inputs known, outputs marked, consumers queued), then running it. |
+| [86-alternating-phases.js](micro/86-alternating-phases.js) | Kernel: two phases taking turns, each building fresh objects for shared functions (ints and two classes, then doubles and three). |
+| [87-constraint-solver.js](micro/87-constraint-solver.js) | Kernel: a whole incremental constraint solver in DeltaBlue's style, on a chain and on a projection, repeatedly. |
 | [90-recursive-fib.js](micro/90-recursive-fib.js) | Doubly recursive fib. |
 | [91-mutual-recursion.js](micro/91-mutual-recursion.js) | fib over two mutually recursive functions. |
 | [92-tail-recursion.js](micro/92-tail-recursion.js) | A tail-recursive sum, 5000 deep, run from a loop. |
@@ -156,16 +165,18 @@ Groups:
   `switch`, string concatenation, loose equality.
 - **1x, calls**: global functions, "static" methods on constructors,
   missing arguments, parent constructors and methods through `.call`, inner
-  functions, constructors run for their side effects.
+  functions, constructors run for their side effects, parent constructors
+  calling overridden methods, checks that throw.
 - **2x–3x, objects**: constructor-built shapes, monomorphic and polymorphic
   loads, stores and calls, prototype chains, field orders that differ across
   subclasses, `Object.prototype` extension, constant properties of global
-  objects, identity singletons, null fields, load chains.
+  objects, identity singletons, null fields, load chains, implementations
+  at mixed prototype depths, empty polymorphic methods.
 - **4x, arrays**: `push`, `pop`, `length`, indexed loads, in-place
-  compaction, the collection wrapper.
+  compaction, the collection wrapper, scans over elements of several shapes.
 - **5x, globals**: a global object used from hot methods, a reassigned
   global, numbers stored into an external object (the barrier fast path),
-  top-level loops.
+  top-level loops, reentrant calls through a reassigned global.
 - **6x–7x, escape and flattening**: local worklist wrappers (A), wrappers
   passed to helpers, returned and aliased collections, owned children (B),
   dead fields, graphs built by constructors, arguments to external methods,
@@ -173,6 +184,7 @@ Groups:
   while the previous instance is live, per-call temporaries.
 - **8x, kernels**: multi-class workloads: plan execution (copy,
   scale), rank propagation over a worklist, collecting and re-adding by
-  rank, building and tearing down a graph.
+  rank, building and tearing down a graph, plan extraction, phases with
+  different feedback, and a whole DeltaBlue-style solver.
 - **9x, calls into compiled code**: recursion (self, mutual, tail),
   constructors called in a loop, a native method next to one.

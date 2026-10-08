@@ -272,7 +272,7 @@ macro_rules! handlers {
                         match e.kind {
                             ENTER_RETURNED => next!(any, $size, e.acc),
                             ENTER_RESUME => jump_to!(e.pc, e.acc, e.regs),
-                            ENTER_ERROR => return Value::EMPTY,
+                            ENTER_ERROR => tail!(op_unwind, Value::EMPTY),
                             _ => {}
                         }
                     }
@@ -284,7 +284,10 @@ macro_rules! handlers {
                 ($o:expr, $r:expr) => {
                     match $r {
                         Ok(v) => next!(any, $o, v),
-                        Err(e) => return throw(frame_vm($regs), e),
+                        Err(e) => {
+                            (*frame_vm($regs)).error = Some(e);
+                            tail!(op_unwind, Value::EMPTY)
+                        }
                     }
                 };
             }
@@ -654,7 +657,48 @@ handlers! {
     // The loads ignore `acc`, so they also serve as I32 entries.
 
     fn op_throw(pc, acc, regs, tag) {
-        return throw(frame_vm(regs), Error::thrown(acc))
+        (*frame_vm(regs)).error = Some(Error::thrown(acc));
+        tail!(op_unwind, acc)
+    }
+
+    /// The error in `vm.error` was raised at `pc` of frame `regs`: continue
+    /// at the innermost handler covering it, in this frame or a caller's
+    /// (at its call), with the exception's value in `acc`. A frame entered
+    /// from native code (no return pc: the script's, or one compiled code
+    /// or a native called) ends the walk: the error goes back to that
+    /// caller as `EMPTY`, which unwinds from its own frame.
+    #[cold]
+    fn op_unwind(pc, acc, regs, tag) {
+        let vm = frame_vm(regs);
+        let (mut pc, mut regs) = (pc, regs);
+        loop {
+            let code: *const Code = header(regs, CODE);
+            if code.is_null() {
+                return Value::EMPTY;
+            }
+            let base = (*code).bytecode.as_ptr();
+            let at = pc.offset_from(base) as u32;
+            if let Some(&(_, _, h)) = (&(*code).handlers)
+                .iter()
+                .find(|&&(start, end, _)| start <= at && at < end)
+            {
+                let e = (*vm).error.take().expect("an error to unwind");
+                let v = match e.1 {
+                    Some(v) => v,
+                    None => {
+                        let units: Vec<u16> = e.0.encode_utf16().collect();
+                        (*vm).new_string(&units)
+                    }
+                };
+                jump_to!(base.add(h as usize), v, regs)
+            }
+            let ret: *const u8 = header(regs, RET_PC);
+            if ret.is_null() {
+                return Value::EMPTY;
+            }
+            // Inside the caller's call instruction.
+            (pc, regs) = (ret.sub(1), header::<Value>(regs, CALLER));
+        }
     }
 
     fn op_lda_undefined(pc, acc, regs, tag) {
@@ -2942,10 +2986,13 @@ pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Va
                     Err(v) => return v,
                 },
             };
-            if vm.error.is_some() {
-                return Value::EMPTY;
-            }
-            v = dispatch_at(resume.pc, resume.acc, resume.regs);
+            // An error in the compiled code: unwind from where it left (its
+            // frames have no handlers; a caller's may).
+            v = if vm.error.is_some() {
+                unwind_at(resume.pc, resume.regs)
+            } else {
+                dispatch_at(resume.pc, resume.acc, resume.regs)
+            };
         }
     }
 }
@@ -3172,6 +3219,13 @@ pub(crate) unsafe fn call_from_jit(
         }
         drive(vm, start.pc, start.acc, start.regs)
     }
+}
+
+/// `op_unwind` from `pc` of frame `regs`, called from outside a handler.
+unsafe fn unwind_at(pc: *const u8, regs: *mut Value) -> Value {
+    let tbl: &'static Table = std::hint::black_box(&TABLE);
+    let ti32: &'static Table = std::hint::black_box(&TABLE_I32);
+    op_unwind(pc, Value::EMPTY, regs, NumberTag::new(), tbl, ti32)
 }
 
 /// Run the interpreter from `pc` with `acc` over the VM frame `regs`, until

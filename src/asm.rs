@@ -47,6 +47,10 @@ pub struct FunctionDef {
     pub closures: Vec<usize>,
     /// The constants `LdaConstant` loads.
     pub constants: Vec<Constant>,
+    /// Exception handlers: an exception at a bytecode offset in
+    /// `start..end` continues at `handler` with its value in `acc` (the
+    /// first that covers it: inner `try`s come first).
+    pub handlers: Vec<(u32, u32, u32)>,
 }
 
 /// A constant: a string or a number (one that isn't an int32).
@@ -327,6 +331,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             ics,
             closures,
             constants,
+            handlers: Vec::new(),
         });
     }
     Ok(Module { functions, script })
@@ -362,6 +367,10 @@ pub fn disassemble(m: &Module) -> String {
         } else {
             let params: Vec<String> = (1..=f.nparams).map(|p| format!("p{p}")).collect();
             let _ = writeln!(out, "function {}({})", names[i], params.join(", "));
+        }
+        // (Not read back: the text form has no handlers yet.)
+        for &(start, end, handler) in &f.handlers {
+            let _ = writeln!(out, "        ; handler: {start}..{end} -> {handler}");
         }
         let code = &f.code;
         let decode = |pc: usize| {

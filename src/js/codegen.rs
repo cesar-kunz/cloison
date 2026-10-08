@@ -79,6 +79,7 @@ fn declarations(p: &Program, f: usize) -> Vec<&str> {
                 .iter()
                 .flat_map(|(_, b)| b)
                 .for_each(|s| stmt(s, p, out)),
+            StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, p, out)),
             _ => {}
         }
     }
@@ -111,8 +112,20 @@ fn hoisted(s: &Stmt, out: &mut Vec<usize>) {
             .iter()
             .flat_map(|(_, b)| b)
             .for_each(|s| hoisted(s, out)),
+        StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| hoisted(s, out)),
         _ => {}
     }
+}
+
+/// The statements of a `try`'s blocks.
+fn try_blocks<'a>(
+    b: &'a [Stmt],
+    c: &'a Option<(String, Vec<Stmt>)>,
+    f: &'a Option<Vec<Stmt>>,
+) -> impl Iterator<Item = &'a Stmt> {
+    b.iter()
+        .chain(c.iter().flat_map(|(_, c)| c))
+        .chain(f.iter().flatten())
 }
 
 /// An int32 literal (`-0` is not one).
@@ -177,6 +190,7 @@ fn returns(s: &Stmt) -> bool {
             | StmtKind::Labeled(_, body) => jumps(body),
             StmtKind::Block(b) => b.iter().any(jumps),
             StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).any(jumps),
+            StmtKind::Try(b, c, f) => try_blocks(b, c, f).any(jumps),
             _ => false,
         }
     }
@@ -295,6 +309,12 @@ struct Gen<'a> {
     /// Statements compiled at the end of the function: the `then` branches
     /// of `if`s whose condition can only jump when true.
     deferred: Vec<(L, &'a Stmt)>,
+    /// Exception handlers: (start, end, handler) bytecode offsets, inner
+    /// ones first (see `FunctionDef::handlers`).
+    handlers: Vec<(u32, u32, u32)>,
+    /// `try` blocks being compiled: none of their statements goes out of
+    /// line, outside the handler's range.
+    in_try: u32,
 }
 
 impl<'a> Gen<'a> {
@@ -329,6 +349,8 @@ impl<'a> Gen<'a> {
             targets: Vec::new(),
             pending_labels: Vec::new(),
             deferred: Vec::new(),
+            handlers: Vec::new(),
+            in_try: 0,
         }
     }
 
@@ -400,6 +422,7 @@ impl<'a> Gen<'a> {
             ics: self.ics,
             closures: self.closures,
             constants: self.constants,
+            handlers: self.handlers,
         })
     }
 
@@ -446,6 +469,7 @@ impl<'a> Gen<'a> {
                     .iter()
                     .flat_map(|(_, b)| b)
                     .for_each(|s| walk(s, init, bare)),
+                StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| walk(s, init, bare)),
                 _ => {}
             }
         }
@@ -1315,7 +1339,9 @@ impl<'a> Gen<'a> {
             StmtKind::Var(ds) => self.var_decls(ds)?,
             StmtKind::Function(_) | StmtKind::Empty => {}
             StmtKind::Expr(e) => self.effect(e)?,
-            StmtKind::If(c, then, None) if returns(then) && self.jumps_when_true(c) => {
+            StmtKind::If(c, then, None)
+                if self.in_try == 0 && returns(then) && self.jumps_when_true(c) =>
+            {
                 // The `then` branch goes out of line, so the test can jump
                 // to it.
                 let (lt, cont) = (self.label(), self.label());
@@ -1365,6 +1391,40 @@ impl<'a> Gen<'a> {
                 name, object, body, ..
             } => self.for_in(labels, name, object, body, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
+            StmtKind::Try(_, _, Some(_)) => return unsupported(s.pos, "`finally`"),
+            StmtKind::Try(block, Some((name, body)), None) => {
+                // The block, then past the handler. An exception thrown in
+                // the block's range lands in the handler with its value in
+                // `acc`, which goes to the catch parameter's own register.
+                let start = self.asm.offset() as u32;
+                self.in_try += 1;
+                for s in block {
+                    self.stmt(s)?;
+                }
+                self.in_try -= 1;
+                let end = self.asm.offset() as u32;
+                let after = self.label();
+                if self.reachable {
+                    self.jump(after);
+                }
+                let handler = self.label();
+                self.labels[handler.0].used = true;
+                self.reachable = false;
+                self.bind(handler);
+                self.handlers.push((start, end, self.asm.offset() as u32));
+                let r = self.alloc(s.pos)?;
+                self.star(r);
+                let outer = self.locals.insert(name.as_str(), r);
+                for s in body {
+                    self.stmt(s)?;
+                }
+                match outer {
+                    Some(o) => self.locals.insert(name.as_str(), o),
+                    None => self.locals.remove(name.as_str()),
+                };
+                self.bind(after);
+            }
+            StmtKind::Try(..) => unreachable!("the parser requires `catch` or `finally`"),
             StmtKind::Throw(e) => {
                 self.value(e)?;
                 self.emit(Op::Throw, &[]);

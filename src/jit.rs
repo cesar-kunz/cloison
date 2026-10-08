@@ -8812,6 +8812,10 @@ impl Lowering<'_> {
             return false;
         }
         let callee = unsafe { (*fo).code };
+        // Not compiled: its exception handlers need interpreted frames.
+        if unsafe { !(&(*callee).handlers).is_empty() } {
+            return false;
+        }
         // A constructor's `this` is allocated by the call
         // (`toi_rt_construct`), with the shape its root has now.
         if i.op == Op::Construct {
@@ -9002,6 +9006,10 @@ impl Lowering<'_> {
             return false;
         }
         let callee = unsafe { (*fo).code };
+        // Exceptions unwind only through interpreted frames.
+        if unsafe { !(&(*callee).handlers).is_empty() } {
+            return false;
+        }
         if !self.call_in_loop
             && self.inlined + self.decoded(callee).0.len() > INLINE_BUDGET
             && !self.small_leaf(fo)

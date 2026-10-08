@@ -59,6 +59,9 @@ pub enum StmtKind {
     Break(Option<String>),
     Continue(Option<String>),
     Throw(Expr),
+    /// `try { … } catch (name) { … } finally { … }`, either of the last two
+    /// optional.
+    Try(Vec<Stmt>, Option<(String, Vec<Stmt>)>, Option<Vec<Stmt>>),
     Block(Vec<Stmt>),
     /// The discriminant, then `case` tests (`None` for `default`) with
     /// their statements.

@@ -173,6 +173,10 @@ pub struct Code {
     pub closures: Vec<*const Code>,
     /// `LdaConstant`'s values.
     pub constants: Box<[Value]>,
+    /// Exception handlers (see `FunctionDef::handlers`). A function with
+    /// any runs only in the interpreter, which unwinds into them
+    /// (`interp::unwind`): it isn't compiled, inlined or called directly.
+    pub handlers: Box<[(u32, u32, u32)]>,
     pub native: Option<NativeFn>,
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
@@ -1305,6 +1309,7 @@ impl Vm {
             ic_names: Box::new([]),
             closures: Vec::new(),
             constants: Box::new([]),
+            handlers: Box::new([]),
             native: Some(f),
             constructs,
             ctor_capacity: Cell::new(0),
@@ -1457,6 +1462,7 @@ impl Vm {
                     ic_names: ic_names.into_boxed_slice(),
                     closures: Vec::new(),
                     constants,
+                    handlers: f.handlers.clone().into_boxed_slice(),
                     native: None,
                     constructs: false,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
@@ -1466,11 +1472,16 @@ impl Vm {
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_left: Cell::new(match (has_loop(f), recursive || large(f)) {
+                        _ if !f.handlers.is_empty() => i32::MAX,
                         (true, _) => self.tier_calls,
                         (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
                         (false, false) => i32::MAX,
                     }),
-                    loop_budget: Cell::new(self.frame_budget),
+                    loop_budget: Cell::new(if f.handlers.is_empty() {
+                        self.frame_budget
+                    } else {
+                        i64::MAX
+                    }),
                 })
             })
             .collect();

@@ -3,6 +3,10 @@
 //!
 //! `toi --dump FILE.js` prints the bytecode the script compiles to instead,
 //! in the text form.
+//!
+//! `TOI_TIME` set: also prints, to stderr, the milliseconds from compiling
+//! to completion (wall clock; process startup excluded, as V8's in-process
+//! timings exclude Node's: see `scripts/tiers.sh`).
 
 use std::process::ExitCode;
 
@@ -23,6 +27,8 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let mut vm = toi::vm::Vm::new();
+    let start = std::time::Instant::now();
     let module = if path.ends_with(".js") {
         toi::js::compile(&src)
     } else {
@@ -39,9 +45,11 @@ fn main() -> ExitCode {
         print!("{}", toi::asm::disassemble(&module));
         return ExitCode::SUCCESS;
     }
-    let mut vm = toi::vm::Vm::new();
     match vm.run(&module) {
         Ok(v) => {
+            if std::env::var_os("TOI_TIME").is_some() {
+                eprintln!("time {:.3}", start.elapsed().as_secs_f64() * 1e3);
+            }
             println!("{}", toi::vm::display(v));
             // `TOI_JIT_TIME`: the JIT's lowering and compiling time.
             if std::env::var_os("TOI_JIT_TIME").is_some() {

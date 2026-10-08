@@ -3326,9 +3326,12 @@ pub(crate) unsafe fn call_from_jit(
             acc: Value::UNDEFINED,
         };
         // A hot callee runs compiled; an exit resumes in the interpreter.
+        // So does one compiled before (for direct calls, say: a function
+        // without loops has no countdown, and a site that stopped calling
+        // it directly waits for it to compile again).
         let left = (*callee).calls_left.get() - 1;
         (*callee).calls_left.set(left);
-        if left < 0 {
+        if left < 0 || (*callee).jit.borrow().is_some() {
             match crate::jit::vm_run(vm, &*callee, new, 0, Value::UNDEFINED) {
                 VmRun::NotCompiled => (*callee).calls_left.set(i32::MAX),
                 VmRun::Interpret => {}

@@ -862,9 +862,10 @@ handlers! {
         tail!(slow_get_named, acc)
     }
 
-    // Way 0 missed: `length`, or the other ways (the receiver is a cell). A hit moves
-    // to way 0, so a site whose receivers change shape for a while (an
-    // array once it has elements) takes the hit path again.
+    // Way 0 missed: `length`, or the other ways (the receiver is a cell).
+    // The ways stay in place: moving a hit to way 0 (64 bytes swapped) cost
+    // a site alternating between shapes more than it saved one whose
+    // receivers changed shape for good.
     #[inline(never)]
     fn poly_get_named(pc, acc, regs, tag) {
         let o = as_object(*reg(pc, 1, regs));
@@ -876,8 +877,6 @@ handlers! {
         for k in 1..IC_WAYS {
             let w = ic.add(k);
             if (*o).shape == (*w).shape {
-                std::ptr::swap(ic, w);
-                let w = ic;
                 let holder = (*w).holder;
                 if holder.is_null() {
                     next!(any, Op::GetNamed.size(), *Object::slot(o, (*w).loc))
@@ -911,8 +910,8 @@ handlers! {
         tail!(slow_set_named, acc)
     }
 
-    // Way 0 missed: the other ways (the receiver is a cell, `acc` boxed).
-    // A hit moves to way 0, as for loads.
+    // Way 0 missed: the other ways (the receiver is a cell, `acc` boxed),
+    // as for loads.
     #[inline(never)]
     fn poly_set_named(pc, acc, regs, tag) {
         let o = as_object(*reg(pc, 1, regs));
@@ -920,8 +919,6 @@ handlers! {
         for k in 1..IC_WAYS {
             let w = ic.add(k);
             if (*o).shape == (*w).shape {
-                std::ptr::swap(ic, w);
-                let w = ic;
                 if fits_field(tag, (*w).holder as u64, acc) {
                     let new = (*w).new_shape;
                     if !new.is_null() {

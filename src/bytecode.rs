@@ -578,6 +578,11 @@ impl Assembler {
         self
     }
 
+    /// Where the next instruction goes.
+    pub fn offset(&self) -> usize {
+        self.code.len()
+    }
+
     pub fn finish(mut self) -> Vec<u8> {
         for &(at, label, start) in &self.fixups {
             let target = self.labels[label].expect("unbound label");

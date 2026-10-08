@@ -1,7 +1,7 @@
 //! The parser: tokens into a [`Program`], by recursive descent, with
 //! precedence climbing for binary operators.
 //!
-//! It covers ES5's statements and expressions minus `with`, `try`,
+//! It covers ES5's statements and expressions minus `with`,
 //! getters and setters and regular expressions.
 
 use super::Error;
@@ -158,7 +158,7 @@ impl Parser<'_> {
                 StmtKind::Var(decls)
             }
             Tok::Keyword(
-                k @ ("let" | "const" | "class" | "try" | "with" | "import" | "export"),
+                k @ ("let" | "const" | "class" | "with" | "import" | "export"),
             ) => {
                 return self.err(format!("`{k}` is not supported"));
             }
@@ -234,6 +234,30 @@ impl Parser<'_> {
                 } else {
                     StmtKind::Continue(label)
                 }
+            }
+            Tok::Keyword("try") => {
+                self.bump();
+                self.expect("{")?;
+                let block = self.block_rest()?;
+                let handler = if self.eat("catch") {
+                    self.expect("(")?;
+                    let name = self.ident()?;
+                    self.expect(")")?;
+                    self.expect("{")?;
+                    Some((name, self.block_rest()?))
+                } else {
+                    None
+                };
+                let finalizer = if self.eat("finally") {
+                    self.expect("{")?;
+                    Some(self.block_rest()?)
+                } else {
+                    None
+                };
+                if handler.is_none() && finalizer.is_none() {
+                    return self.err("`try` without `catch` or `finally`");
+                }
+                StmtKind::Try(block, handler, finalizer)
             }
             Tok::Keyword("throw") => {
                 self.bump();

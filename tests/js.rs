@@ -342,6 +342,7 @@ fn rejects_what_it_cannot_compile() {
         ("var g = function h() { return h; };", "own name"),
         ("function f(i) { return i++; }", "postfix"),
         ("var x = -y;", "Neg"),
+        ("try { 1; } finally { 2; }", "finally"),
         ("var o = {1: 2};", "the key `1`"),
         ("function f(a, b) { return a % b; }", "`%`"),
     ];
@@ -1560,6 +1561,35 @@ r == "object,object,string,number,number,undefined,object,boolean,function,funct
 #[test]
 fn typeof_agrees_with_node() {
     assert_eq!(value(TYPEOF), "5000");
+}
+
+/// `try`/`catch`: exceptions thrown two frames down, by the runtime (a
+/// TypeError, caught as its message for now), rethrown from a `catch`,
+/// a catch parameter shadowing a local, and a throw after a loop compiled
+/// code ran. The expected value is Node's.
+const TRY_CATCH: &str = r#"
+function thrower(n) { if (n % 7 == 3) throw "t" + n; return n; }
+function deep(n) { return thrower(n) + 1; }
+function bad(o) { return o.x.y; }
+function hotCallee(n) { var s = 0; for (var i = 0; i < 2000; i++) s += i; if (n == 42) throw 99; return s; }
+function main() {
+  var caught = 0, sum = 0, last = "";
+  for (var i = 0; i < 3000; i++) {
+    try { sum += deep(i); } catch (e) { caught++; last = e; }
+  }
+  try { bad({}); } catch (e) { last = last + "|" + (typeof e); }
+  try { try { throw 1; } catch (a) { throw a + 1; } } catch (b) { sum += b; }
+  var e = 5;
+  try { throw 10; } catch (e) { sum += e; }
+  sum += e;
+  for (var k = 40; k < 45; k++) { try { sum += hotCallee(k); } catch (x) { sum += x; } }
+  return sum + caught * 1000000 + last.length;
+}
+"#;
+
+#[test]
+fn try_catch_agrees_with_node() {
+    assert_eq!(value(&format!("{TRY_CATCH}\nmain();")), "440853270");
 }
 
 /// A method a compiled loop calls inlined, without checking the callee

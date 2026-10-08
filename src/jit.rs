@@ -2006,6 +2006,157 @@ impl std::ops::Index<usize> for Regs {
     }
 }
 
+/// A short list, inline up to `N` elements (then on the heap): inference
+/// clones type states, and their copy lists (`TypeState::same`) are short,
+/// so as `Vec`s they were most of compiling's allocations.
+#[derive(Clone)]
+pub struct Small<T: Copy + Default, const N: usize> {
+    len: usize,
+    inline: [T; N],
+    heap: Vec<T>,
+}
+
+impl<T: Copy + Default, const N: usize> Small<T, N> {
+    fn new() -> Self {
+        Small {
+            len: 0,
+            inline: [T::default(); N],
+            heap: Vec::new(),
+        }
+    }
+
+    fn spilled(&self) -> bool {
+        self.len > N
+    }
+
+    fn as_slice(&self) -> &[T] {
+        if self.spilled() {
+            &self.heap
+        } else {
+            &self.inline[..self.len]
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        if self.spilled() {
+            &mut self.heap
+        } else {
+            &mut self.inline[..self.len]
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.as_slice().iter()
+    }
+
+    fn push(&mut self, x: T) {
+        if self.len < N {
+            self.inline[self.len] = x;
+        } else {
+            if self.len == N {
+                self.heap = self.inline.to_vec();
+            }
+            self.heap.push(x);
+        }
+        self.len += 1;
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        if self.spilled() {
+            self.heap.retain(|x| keep(x));
+            self.len = self.heap.len();
+            if self.len <= N {
+                self.inline[..self.len].copy_from_slice(&self.heap);
+                self.heap = Vec::new();
+            }
+        } else {
+            let mut k = 0;
+            for j in 0..self.len {
+                let x = self.inline[j];
+                if keep(&x) {
+                    self.inline[k] = x;
+                    k += 1;
+                }
+            }
+            self.len = k;
+        }
+    }
+}
+
+impl<T: Copy + Default + Ord, const N: usize> Small<T, N> {
+    fn sort_unstable(&mut self) {
+        self.as_mut_slice().sort_unstable();
+    }
+
+    /// Drop consecutive repeats (as `Vec::dedup`).
+    fn dedup(&mut self) {
+        let mut last = None;
+        self.retain(|&x| last.replace(x) != Some(x));
+    }
+}
+
+impl<T: Copy + Default, const N: usize> std::ops::Deref for Small<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T: Copy + Default, const N: usize> Default for Small<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy + Default, const N: usize> Extend<T> for Small<T, N> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, it: I) {
+        for x in it {
+            self.push(x);
+        }
+    }
+}
+
+impl<T: Copy + Default, const N: usize> FromIterator<T> for Small<T, N> {
+    fn from_iter<I: IntoIterator<Item = T>>(it: I) -> Self {
+        let mut s = Self::new();
+        s.extend(it);
+        s
+    }
+}
+
+impl<T: Copy + Default + PartialEq, const N: usize> PartialEq for Small<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: Copy + Default + Eq, const N: usize> Eq for Small<T, N> {}
+
+impl<T: Copy + Default + std::hash::Hash, const N: usize> std::hash::Hash for Small<T, N> {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.as_slice().hash(h)
+    }
+}
+
+impl<T: Copy + Default + std::fmt::Debug, const N: usize> std::fmt::Debug for Small<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+/// Copy pairs (see [`TypeState::same`]).
+pub type Copies = Small<(u8, u8), 12>;
+/// Registers of a class.
+type Members = Small<u8, 24>;
+
 /// Types of the accumulator and of every register, at an instruction
 /// boundary.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -2018,7 +2169,7 @@ pub struct TypeState {
     /// (sorted by register); registers alone aren't. What an instruction
     /// proves about a register (a shape guard passed, a transition) holds
     /// for its copies (see [`copies`]).
-    pub same: Vec<(u8, u8)>,
+    pub same: Copies,
     /// The class `acc` holds the value of, if any.
     pub acc_same: Option<u8>,
 }
@@ -2028,7 +2179,7 @@ impl TypeState {
         TypeState {
             acc: Ty::Any,
             regs: Regs::filled(nregs, Ty::Any),
-            same: Vec::new(),
+            same: Copies::new(),
             acc_same: None,
         }
     }
@@ -2054,7 +2205,7 @@ impl TypeState {
 
     /// The class of register `r` (its lowest copy).
     fn class(&self, r: usize) -> u8 {
-        class_in(&self.same, r)
+        class_in(self.same.as_slice(), r)
     }
 }
 
@@ -2062,8 +2213,8 @@ impl TypeState {
 fn leave_dead(st: &mut TypeState, live: &RegSet, acc_live: bool) {
     let old = std::mem::take(&mut st.same);
     // Per class (its lowest register), its lowest live register.
-    let mut low: Vec<(u8, u8)> = Vec::new();
-    for &(r, c) in &old {
+    let mut low = Copies::new();
+    for &(r, c) in old.iter() {
         if !low.iter().any(|e| e.0 == c) {
             let first = std::iter::once(c)
                 .chain(old.iter().filter(|e| e.1 == c).map(|e| e.0))
@@ -2098,7 +2249,7 @@ fn class_in(same: &[(u8, u8)], r: usize) -> u8 {
 }
 
 /// The registers of class `c` in copies `same`, lowest first.
-fn members(same: &[(u8, u8)], c: u8) -> Vec<u8> {
+fn members(same: &[(u8, u8)], c: u8) -> Members {
     std::iter::once(c)
         .chain(same.iter().filter(|e| e.1 == c).map(|e| e.0))
         .collect()
@@ -2106,7 +2257,7 @@ fn members(same: &[(u8, u8)], c: u8) -> Vec<u8> {
 
 /// Make the registers `regs` (sorted) one class in `same`, the others
 /// keeping theirs.
-fn set_class(same: &mut Vec<(u8, u8)>, regs: &[u8]) {
+fn set_class(same: &mut Copies, regs: &[u8]) {
     same.retain(|e| !regs.contains(&e.0));
     if let Some((&low, rest)) = regs.split_first() {
         same.extend(rest.iter().map(|&q| (q, low)));
@@ -2134,8 +2285,9 @@ fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
         Op::Star if r < n => {
             // `r` leaves its class: the others' lowest may change.
             let old = class_in(&same, r);
-            let rest: Vec<u8> = members(&same, old)
-                .into_iter()
+            let rest: Members = members(&same, old)
+                .iter()
+                .copied()
                 .filter(|&q| q as usize != r)
                 .collect();
             same.retain(|e| e.0 as usize != r && e.1 != old);
@@ -2148,8 +2300,9 @@ fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
                     } else {
                         c
                     };
-                    let mut joined: Vec<u8> = members(&same, c)
-                        .into_iter()
+                    let mut joined: Members = members(&same, c)
+                        .iter()
+                        .copied()
                         .filter(|&q| q as usize != r)
                         .chain(std::iter::once(r as u8))
                         .collect();
@@ -2167,7 +2320,7 @@ fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
             if insn.uses_reg_value() && r < n && out.regs[r] != st.regs[r] {
                 let t = out.regs[r];
                 let c = class_in(&same, r);
-                for q in members(&same, c) {
+                for &q in members(&same, c).iter() {
                     out.regs.set(q as usize, t);
                 }
                 if out.acc_same == Some(c) && writes_acc(insn).is_none() {
@@ -6925,7 +7078,7 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
             regs: Regs::from_dense(
                 (live.iter().enumerate()).map(|(r, &l)| if l { ty(r) } else { Ty::Bot }),
             ),
-            same: Vec::new(),
+            same: Copies::new(),
             acc_same: None,
         }
     };
@@ -10002,7 +10155,7 @@ impl JitFunction {
                     }
                 },
             )),
-            same: Vec::new(),
+            same: Copies::new(),
             acc_same: None,
         }
     }

@@ -25,9 +25,10 @@ use crate::bytecode::{Arg, Assembler, Label, Op};
 
 pub fn generate(p: &Program) -> Result<Module, Error> {
     let decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
+    let scopes = upvalues(p, &decls);
     let mut functions = Vec::with_capacity(p.functions.len());
     for i in 0..p.functions.len() {
-        functions.push(Gen::new(p, &decls, i).function()?);
+        functions.push(Gen::new(p, &decls, &scopes, i).function()?);
     }
     Ok(Module {
         functions,
@@ -39,6 +40,132 @@ type R<T> = Result<T, Error>;
 
 fn unsupported<T>(pos: Pos, what: impl std::fmt::Display) -> R<T> {
     Err(Error::new(pos as usize, format!("unsupported: {what}")))
+}
+
+/// Per function, the variables of enclosing functions it uses (its
+/// upvalues, in order; for a function between the one declaring a
+/// variable and one using it, too, to pass it down), and its own variables
+/// that nested functions use (captured). The script's are globals: never
+/// upvalues.
+struct Scopes<'a> {
+    upvalues: Vec<Vec<&'a str>>,
+    captured: Vec<Vec<&'a str>>,
+}
+
+fn upvalues<'a>(p: &'a Program, decls: &[Vec<&'a str>]) -> Scopes<'a> {
+    let n = p.functions.len();
+    let (mut upvalues, mut captured) = (vec![Vec::new(); n], vec![Vec::new(); n]);
+    for i in 1..n {
+        for name in references(&p.functions[i]) {
+            if decls[i].contains(&name) {
+                continue;
+            }
+            let (mut chain, mut j) = (vec![i], p.functions[i].parent);
+            let owner = loop {
+                match j {
+                    Some(k) if k != 0 => {
+                        if decls[k].contains(&name) {
+                            break Some(k);
+                        }
+                        chain.push(k);
+                        j = p.functions[k].parent;
+                    }
+                    _ => break None,
+                }
+            };
+            if let Some(k) = owner {
+                for c in chain {
+                    if !upvalues[c].contains(&name) {
+                        upvalues[c].push(name);
+                    }
+                }
+                if !captured[k].contains(&name) {
+                    captured[k].push(name);
+                }
+            }
+        }
+    }
+    Scopes { upvalues, captured }
+}
+
+/// The names function `f`'s own code refers to (not its nested
+/// functions').
+fn references(f: &Function) -> Vec<&str> {
+    fn expr<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
+        use ExprKind::*;
+        match &e.kind {
+            Ident(n) => out.push(n),
+            Num(_) | Str(_) | Bool(_) | Null | This | Function(_) => {}
+            Array(es) => es.iter().for_each(|e| expr(e, out)),
+            Object(ps) => ps.iter().for_each(|(_, e)| expr(e, out)),
+            Member(o, _) | Unary(_, o) | Update(o, ..) => expr(o, out),
+            Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) | Assign(_, a, b) => {
+                expr(a, out);
+                expr(b, out);
+            }
+            Call(f, args) | New(f, args) => {
+                expr(f, out);
+                args.iter().for_each(|e| expr(e, out));
+            }
+            Cond(a, b, c) => [a, b, c].into_iter().for_each(|e| expr(e, out)),
+        }
+    }
+    fn stmt<'a>(s: &'a Stmt, out: &mut Vec<&'a str>) {
+        match &s.kind {
+            StmtKind::Var(ds) => ds.iter().flat_map(|(_, e)| e).for_each(|e| expr(e, out)),
+            StmtKind::Function(_)
+            | StmtKind::Empty
+            | StmtKind::Break(_)
+            | StmtKind::Continue(_) => {}
+            StmtKind::Expr(e) | StmtKind::Throw(e) => expr(e, out),
+            StmtKind::Return(e) => e.iter().for_each(|e| expr(e, out)),
+            StmtKind::If(c, a, b) => {
+                expr(c, out);
+                stmt(a, out);
+                b.iter().for_each(|b| stmt(b, out));
+            }
+            StmtKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                match init {
+                    Some(ForInit::Var(ds)) => {
+                        ds.iter().flat_map(|(_, e)| e).for_each(|e| expr(e, out))
+                    }
+                    Some(ForInit::Expr(e)) => expr(e, out),
+                    None => {}
+                }
+                test.iter().chain(update).for_each(|e| expr(e, out));
+                stmt(body, out);
+            }
+            StmtKind::ForIn {
+                name, object, body, ..
+            } => {
+                out.push(name);
+                expr(object, out);
+                stmt(body, out);
+            }
+            StmtKind::While(c, body) | StmtKind::DoWhile(body, c) => {
+                expr(c, out);
+                stmt(body, out);
+            }
+            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, out)),
+            StmtKind::Switch(d, cases) => {
+                expr(d, out);
+                for (t, b) in cases {
+                    t.iter().for_each(|t| expr(t, out));
+                    b.iter().for_each(|s| stmt(s, out));
+                }
+            }
+            StmtKind::Labeled(_, body) => stmt(body, out),
+            StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, out)),
+        }
+    }
+    let mut out = Vec::new();
+    f.body.iter().for_each(|s| stmt(s, &mut out));
+    out
 }
 
 /// Every name a function declares: parameters, `var`s and function
@@ -207,6 +334,8 @@ fn returns(s: &Stmt) -> bool {
 /// Where a name refers to.
 enum Var {
     Reg(u8),
+    /// An enclosing function's variable: upvalue `k` of this one's.
+    Upvalue(u8),
     Global,
     Undefined,
 }
@@ -290,6 +419,7 @@ struct Acc {
 struct Gen<'a> {
     p: &'a Program,
     decls: &'a [Vec<&'a str>],
+    scopes: &'a Scopes<'a>,
     index: usize,
     f: &'a Function,
     asm: Assembler,
@@ -318,7 +448,12 @@ struct Gen<'a> {
 }
 
 impl<'a> Gen<'a> {
-    fn new(p: &'a Program, decls: &'a [Vec<&'a str>], index: usize) -> Self {
+    fn new(
+        p: &'a Program,
+        decls: &'a [Vec<&'a str>],
+        scopes: &'a Scopes<'a>,
+        index: usize,
+    ) -> Self {
         let f = &p.functions[index];
         // The script's names are globals.
         let locals: HashMap<&str, u8> = if index == 0 {
@@ -334,6 +469,7 @@ impl<'a> Gen<'a> {
         Gen {
             p,
             decls,
+            scopes,
             index,
             f,
             asm: Assembler::new(),
@@ -414,6 +550,8 @@ impl<'a> Gen<'a> {
             (_, Some(n)) => n.clone(),
             (_, None) => "<anonymous>".to_string(),
         };
+        let upvalues = self.upvalue_sources();
+        let captures = !self.scopes.captured[self.index].is_empty();
         Ok(FunctionDef {
             name,
             nparams: self.f.params.len() as u32,
@@ -423,7 +561,27 @@ impl<'a> Gen<'a> {
             closures: self.closures,
             constants: self.constants,
             handlers: self.handlers,
+            upvalues,
+            captures,
         })
+    }
+
+    /// Where each of the function's upvalues comes from, in its parent: a
+    /// register of the parent's (`true`), or an upvalue of its own.
+    fn upvalue_sources(&self) -> Vec<(bool, u8)> {
+        let ups = &self.scopes.upvalues[self.index];
+        let Some(parent) = self.f.parent else {
+            return Vec::new();
+        };
+        ups.iter()
+            .map(|n| match self.decls[parent].iter().position(|d| d == n) {
+                Some(k) if parent != 0 => (true, k as u8 + 1),
+                _ => {
+                    let k = self.scopes.upvalues[parent].iter().position(|d| d == n);
+                    (false, k.expect("passed down by the parent") as u8)
+                }
+            })
+            .collect()
     }
 
     /// Script `var`s declared only without an initializer, and not also
@@ -705,6 +863,12 @@ impl<'a> Gen<'a> {
         if let Some(&r) = self.locals.get(name) {
             return Ok(Var::Reg(r));
         }
+        if let Some(k) = self.scopes.upvalues[self.index]
+            .iter()
+            .position(|&n| n == name)
+        {
+            return Ok(Var::Upvalue(k as u8));
+        }
         let mut f = Some(self.index);
         while let Some(i) = f {
             if i == 0 {
@@ -745,6 +909,9 @@ impl<'a> Gen<'a> {
     fn store_var(&mut self, name: &str, pos: Pos) -> R<()> {
         match self.resolve(name, pos)? {
             Var::Reg(r) => self.star(r),
+            Var::Upvalue(k) => {
+                self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
+            }
             Var::Global | Var::Undefined => self.global(Op::StaGlobal, name),
         }
         Ok(())
@@ -759,8 +926,10 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::This => return Ok(0),
             ExprKind::Ident(n) => {
+                // (A captured one may change in any call, through a closure.)
                 if let Some(&r) = self.locals.get(n.as_str())
                     && !later.iter().any(|l| assigns(l, n))
+                    && !self.scopes.captured[self.index].contains(&n.as_str())
                 {
                     return Ok(r);
                 }
@@ -817,6 +986,9 @@ impl<'a> Gen<'a> {
             This => self.ldar(0),
             Ident(n) => match self.resolve(n, e.pos)? {
                 Var::Reg(r) => self.ldar(r),
+                Var::Upvalue(k) => {
+                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                }
                 Var::Undefined => self.emit(Op::LdaUndefined, &[]),
                 Var::Global => self.global(Op::LdaGlobal, n),
             },

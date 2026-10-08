@@ -50,6 +50,17 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// An enclosing function's variable as a closure sees it (Lua's design):
+/// while that function's frame is live, `at` points to its register
+/// (open: the function itself reads and writes the register as any
+/// other); when the frame ends, the value moves to `closed` and `at`
+/// points there. Closures of one frame share it.
+#[repr(C)]
+pub struct Upvalue {
+    pub at: *mut Value,
+    pub closed: Value,
+}
+
 /// A function implemented in Rust: `(vm, this, args)`.
 pub type NativeFn = fn(&mut Vm, Value, &[Value]) -> Result<Value>;
 
@@ -177,6 +188,12 @@ pub struct Code {
     /// any runs only in the interpreter, which unwinds into them
     /// (`interp::unwind`): it isn't compiled, inlined or called directly.
     pub handlers: Box<[(u32, u32, u32)]>,
+    /// Where its upvalues come from (see `FunctionDef::upvalues`).
+    pub upvalues: Box<[(bool, u8)]>,
+    /// Runs only in the interpreter: it has exception handlers, upvalues, or
+    /// variables its nested functions use (frames the interpreter manages:
+    /// unwinding, closing upvalues).
+    pub interpreted: bool,
     pub native: Option<NativeFn>,
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
@@ -283,6 +300,9 @@ pub struct Vm {
     /// call: the code leaves, and the interpreter makes the call instead
     /// (see `interp::call_from_jit`).
     pub(crate) redo_call: bool,
+    /// The open upvalues (see [`Upvalue`]), by the address of the register
+    /// they point to, lowest first.
+    open_upvalues: Vec<*mut Upvalue>,
     function_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
     pub(crate) array_shape: *const Shape,
@@ -354,6 +374,7 @@ impl Vm {
             osr_regs: std::ptr::null_mut(),
             native_limit: 0,
             redo_call: false,
+            open_upvalues: Vec::new(),
             function_shape: std::ptr::null(),
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
@@ -1278,14 +1299,112 @@ impl Vm {
     /// A new closure of `code`'s nested function `i`, with a fresh
     /// `prototype` object.
     pub fn create_closure(&mut self, code: &Code, i: u16) -> Value {
-        let callee = code.closures[i as usize];
+        self.new_closure(code.closures[i as usize])
+    }
+
+    /// A closure of `callee`, which has no upvalues.
+    pub(crate) fn new_closure(&mut self, callee: *const Code) -> Value {
         unsafe {
             let f = self.heap.alloc_object(&*self.function_shape);
             (*f).code = callee;
-            let p = self.heap.alloc_object(&*self.proto_object_shape);
-            self.store_field(p, 0, object_value(f));
-            self.store_field(f, 0, object_value(p));
-            object_value(f)
+            self.closure_prototype(f)
+        }
+    }
+
+    /// `CreateClosure` in frame `regs` of function `current`: the closure's
+    /// upvalues (after its in-object slots: see [`Vm::upvalues`]) are open
+    /// ones for `regs`' registers, or `current`'s own.
+    pub(crate) fn create_closure_in(
+        &mut self,
+        code: &Code,
+        i: u16,
+        regs: *mut Value,
+        current: *const Object,
+    ) -> Value {
+        let callee = code.closures[i as usize];
+        unsafe {
+            let shape = &*self.function_shape;
+            let ups = &(*callee).upvalues;
+            let f = if ups.is_empty() {
+                self.heap.alloc_object(shape)
+            } else {
+                let cap = shape.capacity.get() as usize;
+                let o = self
+                    .heap
+                    .alloc_words(crate::object::INLINE_BASE / 8 + cap + ups.len())
+                    .cast::<Object>();
+                o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
+                    .write(crate::object::object_header(shape));
+                for k in 0..cap {
+                    Object::inline(o, k).write(Value::UNDEFINED);
+                }
+                let out = Self::upvalues(o);
+                for (k, &(local, idx)) in ups.iter().enumerate() {
+                    *out.add(k) = if local {
+                        self.open_upvalue(regs.add(idx as usize))
+                    } else {
+                        *Self::upvalues(current).add(idx as usize)
+                    };
+                }
+                o
+            };
+            (*f).code = callee;
+            self.closure_prototype(f)
+        }
+    }
+
+    /// Give new closure `f` its `prototype` object; `f` as a value.
+    fn closure_prototype(&mut self, f: *mut Object) -> Value {
+        let p = self.heap.alloc_object(unsafe { &*self.proto_object_shape });
+        self.store_field(p, 0, object_value(f));
+        self.store_field(f, 0, object_value(p));
+        object_value(f)
+    }
+
+    /// A closure's upvalues: after its in-object slots (a function's shapes
+    /// keep the capacity they were created with).
+    pub(crate) fn upvalues(f: *const Object) -> *mut *mut Upvalue {
+        unsafe {
+            let cap = (*(*f).shape).capacity.get() as usize;
+            f.cast::<u8>()
+                .add(crate::object::INLINE_BASE + 8 * cap)
+                .cast_mut()
+                .cast()
+        }
+    }
+
+    /// The open upvalue of register `at`, made if there is none.
+    fn open_upvalue(&mut self, at: *mut Value) -> *mut Upvalue {
+        let k = self
+            .open_upvalues
+            .partition_point(|&u| unsafe { (*u).at } < at);
+        if let Some(&u) = self.open_upvalues.get(k)
+            && unsafe { (*u).at } == at
+        {
+            return u;
+        }
+        let u = self.heap.alloc_words(2).cast::<Upvalue>();
+        unsafe {
+            u.write(Upvalue {
+                at,
+                closed: Value::UNDEFINED,
+            })
+        };
+        self.open_upvalues.insert(k, u);
+        u
+    }
+
+    /// Close the open upvalues of registers at or past `level` (a frame
+    /// ending): their values move into them.
+    pub(crate) fn close_upvalues(&mut self, level: *mut Value) {
+        while let Some(&u) = self.open_upvalues.last()
+            && unsafe { (*u).at } >= level
+        {
+            unsafe {
+                (*u).closed = *(*u).at;
+                (*u).at = &raw mut (*u).closed;
+            }
+            self.open_upvalues.pop();
         }
     }
 
@@ -1310,6 +1429,8 @@ impl Vm {
             closures: Vec::new(),
             constants: Box::new([]),
             handlers: Box::new([]),
+            upvalues: Box::new([]),
+            interpreted: false,
             native: Some(f),
             constructs,
             ctor_capacity: Cell::new(0),
@@ -1463,6 +1584,8 @@ impl Vm {
                     closures: Vec::new(),
                     constants,
                     handlers: f.handlers.clone().into_boxed_slice(),
+                    upvalues: f.upvalues.clone().into_boxed_slice(),
+                    interpreted: interpreted(f),
                     native: None,
                     constructs: false,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
@@ -1472,12 +1595,12 @@ impl Vm {
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_left: Cell::new(match (has_loop(f), recursive || large(f)) {
-                        _ if !f.handlers.is_empty() => i32::MAX,
+                        _ if interpreted(f) => i32::MAX,
                         (true, _) => self.tier_calls,
                         (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
                         (false, false) => i32::MAX,
                     }),
-                    loop_budget: Cell::new(if f.handlers.is_empty() {
+                    loop_budget: Cell::new(if !interpreted(f) {
                         self.frame_budget
                     } else {
                         i64::MAX
@@ -1566,6 +1689,11 @@ impl Vm {
 /// three and two times; DeltaBlue's methods).
 fn has_loop(f: &crate::asm::FunctionDef) -> bool {
     ops(f).any(|op| op.is_loop())
+}
+
+/// See `Code::interpreted`.
+fn interpreted(f: &crate::asm::FunctionDef) -> bool {
+    !f.handlers.is_empty() || !f.upvalues.is_empty() || f.captures
 }
 
 /// See [`has_loop`].

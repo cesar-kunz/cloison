@@ -335,10 +335,6 @@ fn uncaught_throws_end_the_run() {
 #[test]
 fn rejects_what_it_cannot_compile() {
     let unsupported = [
-        (
-            "function f(a) { return function () { return a; }; } f(1);",
-            "captured",
-        ),
         ("var g = function h() { return h; };", "own name"),
         ("function f(i) { return i++; }", "postfix"),
         ("var x = -y;", "Neg"),
@@ -1590,6 +1586,75 @@ function main() {
 #[test]
 fn try_catch_agrees_with_node() {
     assert_eq!(value(&format!("{TRY_CATCH}\nmain();")), "440853270");
+}
+
+/// Closures over enclosing functions' variables (upvalues, open while
+/// the function runs, closed when it returns): shared by closures of one
+/// call, read after the call returned, through an intermediate function,
+/// changed by a call within an expression, per recursive call, an IIFE's
+/// state, `++` and `+=` on them, and one left open by a throw. The
+/// expected value is Node's.
+const CLOSURES: &str = r#"
+function counter(start) {
+  var n = start;
+  return { inc: function () { return ++n; }, add: function (k) { n += k; return n; }, get: function () { return n; } };
+}
+function adders() {
+  var fs = [], base = 10;
+  for (var i = 0; i < 3; i++) fs.push(function (x) { return x + base; });
+  base = 100;
+  return fs[0](1) + fs[2](2);
+}
+function outer() {
+  var a = 1;
+  function middle() {
+    var b = 2;
+    function inner() { a = a * 10; return a + b; }
+    return inner;
+  }
+  var f = middle();
+  var r = f() + f();
+  return r + a;
+}
+function sideEffect() {
+  var x = 1;
+  function bump() { x = x + 5; return 0; }
+  return x + bump() + x;
+}
+function rec(n) {
+  var me = n;
+  var get = function () { return me; };
+  if (n == 0) return get();
+  return get() + rec(n - 1) + get();
+}
+var rnd = (function () {
+  var seed = 49734321;
+  return function () {
+    seed = (seed * 31 + 7) % 1000003;
+    return seed;
+  };
+})();
+function thrower() {
+  var hidden = 7;
+  var peek = function () { return hidden; };
+  thrower.peek = peek;
+  hidden = 8;
+  throw "x";
+}
+function main() {
+  var c = counter(5);
+  c.inc(); c.add(10); c.inc();
+  var t = typeof c.get;
+  var r = 0;
+  for (var k = 0; k < 2000; k++) r = (r + rnd()) | 0;
+  try { thrower(); } catch (e) {}
+  return c.get() + adders() + outer() + sideEffect() + rec(4) + r + thrower.peek() + t.length;
+}
+"#;
+
+#[test]
+fn closures_agree_with_node() {
+    assert_eq!(value(&format!("{CLOSURES}\nmain();")), "1032368592");
 }
 
 /// A method a compiled loop calls inlined, without checking the callee

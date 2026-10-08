@@ -51,6 +51,13 @@ pub struct FunctionDef {
     /// `start..end` continues at `handler` with its value in `acc` (the
     /// first that covers it: inner `try`s come first).
     pub handlers: Vec<(u32, u32, u32)>,
+    /// Where each upvalue `CreateClosure` gives the function comes from in
+    /// the function creating it: a register (`true`) or an upvalue of its
+    /// own (see `vm::Upvalue`).
+    pub upvalues: Vec<(bool, u8)>,
+    /// Nested functions use some of its variables (they stay in its
+    /// registers, which its closures' upvalues point to until it returns).
+    pub captures: bool,
 }
 
 /// A constant: a string or a number (one that isn't an int32).
@@ -332,6 +339,8 @@ pub fn parse(src: &str) -> Result<Module, String> {
             closures,
             constants,
             handlers: Vec::new(),
+            upvalues: Vec::new(),
+            captures: false,
         });
     }
     Ok(Module { functions, script })

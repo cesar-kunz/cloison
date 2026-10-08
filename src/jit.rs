@@ -1003,6 +1003,15 @@ struct Insn {
     /// A call [`lower`] compiles as `Array.prototype.push` (1) or `pop`
     /// (2) of its receiver, after a guard on the callee.
     native: u8,
+    /// For a `GetNamed`: only its receiver's shape check, the value unused
+    /// (a proven callee's load; see `Lowering::drop_callee_load`). For the
+    /// `Star` of that value: no code (analyses still see the register
+    /// overwritten, by something not an object they track).
+    check_only: bool,
+    /// For a `push` or `pop` whose callee's load was dropped: the callee,
+    /// which an exit before it stores to the callee's register (the
+    /// interpreter makes the call again).
+    exit_const: u64,
     /// An `AddSmi` decoded from `SubSmi`: on numbers `x - k` is `x + -k`,
     /// but not on other values (`"12" - 1`), so its generic case subtracts.
     sub: bool,
@@ -1251,6 +1260,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 on_shape: false,
                 alloc: 0,
                 native: 0,
+                check_only: false,
+                exit_const: 0,
                 sub,
             }
         })
@@ -2058,6 +2069,23 @@ fn never_nullish(t: Ty) -> bool {
 /// converted).
 fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     let mut sel = select_types(insn, i, st, spec);
+    // A load only checking its receiver (`emit_poly` handles `poly`), and
+    // the store of its value, which nothing reads.
+    if insn.check_only && insn.op == Op::Star {
+        sel.base = "nop";
+        sel.case = "";
+    } else if insn.check_only && sel.base.starts_with("get_") {
+        if sel.case == "nc" {
+            sel.base = "nop";
+        } else if let Some(c) = spec.props.get(i).and_then(|&p| Case::of(p)) {
+            sel.base = "check_shape";
+            sel.ops = Some((0, c.shape, 0));
+        } else {
+            unreachable!("a load proven to hold the callee has a case");
+        }
+        sel.case = "";
+        sel.post = None;
+    }
     copies(insn, st, &mut sel.out);
     sel
 }
@@ -2602,23 +2630,23 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         // `o[k] = acc` (see `set_keyed` in the stencils): the key from
         // memory, at `regs + imm`; no checks of a receiver known to be an
-        // array (`nc`); an int32 (`i`) or an object of a known shape
-        // (`sh`, the shape in `imm64`) checked against the elements' type
-        // as such.
+        // array (`nc`); an int32 (`i`) or an object (`o`) checked against
+        // the elements' type as such.
         Op::SetKeyed => {
             let array = reg.shape().is_some_and(|s| unsafe {
                 (*(s as *const Shape)).class == crate::object::Class::Array
             });
-            let (case, shape) = match (array, st.acc) {
-                (true, I32) => ("nc_i", 0),
-                (true, Ty::Obj(s)) => ("nc_sh", s),
-                (true, _) => ("nc", 0),
-                (false, I32) => ("i", 0),
-                (false, Ty::Obj(s)) => ("sh", s),
-                _ => ("", 0),
+            let object = matches!(st.acc, Ty::Obj(_) | Ty::Ext(_));
+            let case = match (array, st.acc) {
+                (true, I32) => "nc_i",
+                (true, _) if object => "nc_o",
+                (true, _) => "nc",
+                (false, I32) => "i",
+                (false, _) if object => "o",
+                _ => "",
             };
             return Sel {
-                ops: Some((8 * insn.reg2 as i32, shape, 0)),
+                ops: Some((8 * insn.reg2 as i32, 0, 0)),
                 ..Sel::new("set_keyed", case, out)
             };
         }
@@ -3526,7 +3554,9 @@ fn stencil_for(
         ("star", _) => format!("star_{loc}"),
         ("check_callee", _) => format!("check_callee_{loc}"),
         ("callee_jne", _) => format!("callee_jne_{loc}"),
-        ("guard_cell" | "shape_jne" | "shape_guard", _) => format!("{}_{loc}", sel.base),
+        ("guard_cell" | "shape_jne" | "shape_guard" | "check_shape", _) => {
+            format!("{}_{loc}", sel.base)
+        }
         ("check_tail_callee", _) => format!("check_tail_callee_{loc}"),
         // The callee reads its arguments from memory.
         // The receiver in its slot; a boxed argument unless `_i`.
@@ -5130,6 +5160,12 @@ impl JitCode {
                     insn.exit_record()
                 };
                 seq.extend(spills(&homes));
+                if insn.exit_const != 0 {
+                    seq.push(Piece {
+                        imm64: insn.exit_const,
+                        ..Piece::new("store_const_m", insn.reg)
+                    });
+                }
                 seq.push(Piece {
                     imm: record,
                     ..Piece::new("exit", 0)
@@ -5907,49 +5943,67 @@ fn emit_poly(
         });
     }
     hot.push(at("guard_cell"));
-    // The distinct accesses, the last case's first (it falls through to
-    // it), and each case's.
-    let mut bodies = vec![cases[m - 1].access(load)];
-    let group: Vec<usize> = cases
-        .iter()
-        .map(|c| {
-            let a = c.access(load);
-            bodies.iter().position(|&b| b == a).unwrap_or_else(|| {
-                bodies.push(a);
-                bodies.len() - 1
+    // Only the dispatch for a load whose value is unused: a match jumps
+    // past the last compare.
+    if insn.check_only {
+        let last = hot.len() + m - 1;
+        for (c, case) in cases.iter().enumerate() {
+            let is_last = c + 1 == m;
+            hot.push(Piece {
+                imm64: case.shape,
+                jump: if is_last {
+                    Target::Next
+                } else {
+                    Target::AfterPiece(last)
+                },
+                ..at(if is_last { "shape_guard" } else { "shape_jeq" })
+            });
+        }
+    } else {
+        // The distinct accesses, the last case's first (it falls through to
+        // it), and each case's.
+        let mut bodies = vec![cases[m - 1].access(load)];
+        let group: Vec<usize> = cases
+            .iter()
+            .map(|c| {
+                let a = c.access(load);
+                bodies.iter().position(|&b| b == a).unwrap_or_else(|| {
+                    bodies.push(a);
+                    bodies.len() - 1
+                })
             })
-        })
-        .collect();
-    let first = hot.len() + m;
-    let end = first + bodies.len() - 1;
-    for (c, case) in cases.iter().enumerate() {
-        let last = c + 1 == m;
-        hot.push(Piece {
-            imm64: case.shape,
-            jump: if last {
-                Target::Next
-            } else {
-                Target::Piece(first + group[c])
-            },
-            ..at(if last { "shape_guard" } else { "shape_jeq" })
-        });
-    }
-    for (base, imm, imm64b) in bodies {
-        let k = hot.len();
-        hot.push(Piece {
-            imm64b,
-            reg: insn.reg,
-            exit: i,
-            cont: if k == end {
-                Target::Next
-            } else {
-                Target::AfterPiece(end)
-            },
-            ..Piece::with_imm(&format!("{base}_nc_{loc}"), imm)
-        });
-    }
-    if let Some(post) = s.post {
-        hot.push(Piece::new(post, 0));
+            .collect();
+        let first = hot.len() + m;
+        let end = first + bodies.len() - 1;
+        for (c, case) in cases.iter().enumerate() {
+            let last = c + 1 == m;
+            hot.push(Piece {
+                imm64: case.shape,
+                jump: if last {
+                    Target::Next
+                } else {
+                    Target::Piece(first + group[c])
+                },
+                ..at(if last { "shape_guard" } else { "shape_jeq" })
+            });
+        }
+        for (base, imm, imm64b) in bodies {
+            let k = hot.len();
+            hot.push(Piece {
+                imm64b,
+                reg: insn.reg,
+                exit: i,
+                cont: if k == end {
+                    Target::Next
+                } else {
+                    Target::AfterPiece(end)
+                },
+                ..Piece::with_imm(&format!("{base}_nc_{loc}"), imm)
+            });
+        }
+        if let Some(post) = s.post {
+            hot.push(Piece::new(post, 0));
+        }
     }
     let mut seq: Vec<Piece> = box_acc_piece(st.acc).into_iter().collect();
     seq.extend(spills(homes));
@@ -6007,6 +6061,8 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         on_shape: false,
         alloc: 0,
         native: 0,
+        check_only: false,
+        exit_const: 0,
         sub: false,
     }
 }
@@ -6572,6 +6628,8 @@ impl Lowering<'_> {
                         let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
                         guard.guard = fo as u64;
                         self.push(guard, Prop::None);
+                    } else if self.dead_after(f.code, k, orig.reg) && self.drop_callee_load(frame, i.reg) {
+                        i.exit_const = crate::object::object_value(fo).to_bits();
                     }
                     if native == 1 && !stored {
                         self.push(synth(Op::Ldar, i.reg2 + 1, frame, i.pc), Prop::None);
@@ -7300,6 +7358,34 @@ impl Lowering<'_> {
             _ => false,
         };
         proven && g.op == Op::GetNamed && g.frame as usize == frame && !g.bail
+    }
+
+    /// For a call whose callee register `r` (of frame `frame`) is
+    /// `proven_callee` and dead after it: make its load check only the
+    /// receiver's shape, and drop the `Star` to `r`, if nothing since reads
+    /// `r` (the call's setup moves only other registers), and emit nothing
+    /// for the `Star`. The call must then store the callee to `r` in its
+    /// exits (`Insn::exit_const`).
+    fn drop_callee_load(&mut self, frame: usize, r: u8) -> bool {
+        let insns = &self.out.insns;
+        let Some(k) = insns
+            .iter()
+            .rposition(|j| j.frame as usize == frame && j.op == Op::Star && j.reg == r)
+        else {
+            return false;
+        };
+        let moves_only = insns[k + 1..].iter().all(|j| {
+            j.frame as usize == frame
+                && !j.bail
+                && matches!(j.op, Op::Ldar | Op::Star | Op::LdaUndefined)
+                && j.reg != r
+        });
+        if !moves_only || k == 0 {
+            return false;
+        }
+        self.out.insns[k - 1].check_only = true;
+        self.out.insns[k].check_only = true;
+        true
     }
 
     /// Point the jumps `rets` (inlined `Return`s) past the inlined code,

@@ -939,6 +939,20 @@ function ctors() {
   }
   return s;
 }
+function add(c, v) { return c.push(v); }
+function take(c) { return c.pop(); }
+function mixed() {
+  var s = 0, i, a, b, other = { n: 0, push: function (v) { this.n += v; return -1; } };
+  for (i = 0; i < 3000; i++) {
+    a = [];
+    b = [i, 0.5];
+    s += add(a, i) + add(b, i & 7) + (add(b, "x") > 3 ? 1 : 0);
+    if (i > 2000) s += add(other, 2);
+    if (i % 500 == 0) { a.pop(); s += take(a) === undefined ? 1 : 0; }
+    s += take(b) === "x" ? 1 : 0;
+  }
+  return s + other.n;
+}
 "#;
 
 #[test]
@@ -947,6 +961,7 @@ fn arrays_and_constructors_agree_with_node() {
         ("stores()", "2262261.5"),
         ("stack()", "2847651"),
         ("ctors()", "913365704"),
+        ("mixed()", "19005"),
     ] {
         assert_eq!(value(&format!("{ARRAYS}\n{call};")), want, "{call}");
     }

@@ -1351,6 +1351,35 @@ fn arrays_first_filled_with_several_classes_agree_with_node() {
     );
 }
 
+/// Tests of values known where they are (see `fold_constant_tests`):
+/// parameters inlined calls leave `undefined`, constants returned from
+/// inlined calls, and values set on one path only, which a merge makes
+/// unknown. The expected value is Node's.
+const KNOWN_TESTS: &str = r#"
+function or0(a, b) { return b || 0; }
+function and1(a, b) { return (b && 1) || 0; }
+function not(a, b) { return !b ? 3 : 4; }
+function pick(a, b, c) { return c ? b : a; }
+function zero() { return 0; }
+function main() {
+  var s = 0, flag = null, k = 0;
+  for (var i = 0; i < 3000; i++) {
+    s += or0(1) + or0(1, i) + and1(2) + and1(2, i & 1) + not(0) + not(0, i);
+    s += pick(5, 7) + pick(5, 7, 1) + pick(5, 7, i & 2);
+    if (zero()) s += 1000;
+    if (flag) s += 100; else flag = i & 4;
+    k = i & 1 ? 0 : 1;
+    if (k) s += 9;
+  }
+  return s;
+}
+"#;
+
+#[test]
+fn tests_of_known_values_agree_with_node() {
+    assert_eq!(value(&format!("{KNOWN_TESTS}\nmain();")), "4887999");
+}
+
 /// A method a compiled loop calls inlined, without checking the callee
 /// (its prototype holds it), replaced from a called function and from the
 /// loop itself. The expected value is Node's.

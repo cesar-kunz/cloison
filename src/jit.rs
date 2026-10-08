@@ -8965,7 +8965,13 @@ impl Lowering<'_> {
         depth: usize,
         dead: bool,
     ) {
-        let (shapes, load) = self.receiver_shapes(frame, i, fos);
+        let (by_callee, load) = self.receiver_shapes(frame, i, fos);
+        // The receiver's shape, where just one finds the callee. (Inlining a
+        // callee found under several shapes once per shape, to dispatch on
+        // the shape alone, cost 87 more compiling than it saved: +15%.)
+        let shapes: Vec<u64> = (by_callee.iter())
+            .map(|ss| if ss.len() == 1 { ss[0] } else { 0 })
+            .collect();
         let mut fused = None;
         if dead
             && let Some((get, star)) = load
@@ -9020,12 +9026,13 @@ impl Lowering<'_> {
     }
 
     /// For a polymorphic call `i` (`Call`) of frame `frame` to `fos`: per
-    /// callee, the shape its receiver must have, or 0. The callee was
+    /// callee, the shapes its receiver must have one of (none if not known).
+    /// The callee was
     /// loaded from the receiver, unchanged since, by a polymorphic access
     /// whose shapes all find it in a prototype: a prototype's slots hold
     /// the same values while the prototype epoch the code is compiled
-    /// under holds (see `Vm::store_field`), so a callee found under just
-    /// one of the shapes proves that shape. Only with nothing between
+    /// under holds (see `Vm::store_field`), so the shapes a callee is found
+    /// under are the ones the receiver may have. Only with nothing between
     /// that may add properties to the receiver (a call), which would leave
     /// it a descendant of that shape, not that shape.
     /// Also the indices of the load and of the `Star` of its result.
@@ -9034,8 +9041,8 @@ impl Lowering<'_> {
         frame: usize,
         i: &Insn,
         fos: &[*mut Object],
-    ) -> (Vec<u64>, Option<(usize, usize)>) {
-        let none = (vec![0; fos.len()], None);
+    ) -> (Vec<Vec<u64>>, Option<(usize, usize)>) {
+        let none = (vec![Vec::new(); fos.len()], None);
         if i.op != Op::Call {
             return none;
         }
@@ -9052,16 +9059,37 @@ impl Lowering<'_> {
         let (g, Prop::Poly { n, at }) = (insns[get], self.out.props[get]) else {
             return none;
         };
-        if g.op != Op::GetNamed || g.frame as usize != frame || g.reg != i.reg2 || g.bail {
+        if g.op != Op::GetNamed || g.frame as usize != frame || g.bail {
+            return none;
+        }
+        // The call's `this` is the receiver: the same register, or one it
+        // was copied to since (`Mov r8, r10` of `s.m()`, `s` a local, which
+        // lowers to `Ldar r8; Star r10`), and not written again.
+        let writes = |j: &Insn, r: u8| {
+            j.frame as usize == frame
+                && (j.op == Op::Star && j.reg == r || j.op == Op::Mov && j.reg2 == r)
+        };
+        let copied = i.reg2 != g.reg
+            && insns[k + 1..]
+                .iter()
+                .rposition(|j| writes(j, i.reg2))
+                .is_some_and(|m| {
+                    let (j, prev) = (insns[k + 1 + m], insns[k + m]);
+                    j.op == Op::Mov && j.reg == g.reg
+                        || j.op == Op::Star
+                            && m > 0
+                            && prev.op == Op::Ldar
+                            && prev.reg == g.reg
+                            && prev.frame == j.frame
+                });
+        if i.reg2 != g.reg && !copied {
             return none;
         }
         // Nothing between rewrites the receiver or calls.
-        if insns[k + 1..].iter().any(|j| {
-            j.is_call()
-                || j.guard != 0
-                || j.bail
-                || (j.frame as usize == frame && j.op == Op::Star && j.reg == g.reg)
-        }) {
+        if insns[k + 1..]
+            .iter()
+            .any(|j| j.is_call() || j.guard != 0 || j.bail || writes(j, g.reg))
+        {
             return none;
         }
         let cases = poly_cases(&self.out.polys, n, at);
@@ -9076,11 +9104,10 @@ impl Lowering<'_> {
             .iter()
             .map(|&fo| {
                 let f = crate::object::object_value(fo);
-                let mut found = values.iter().zip(cases).filter(|(v, _)| **v == f);
-                match (found.next(), found.next()) {
-                    (Some((_, c)), None) => c.shape,
-                    _ => 0,
-                }
+                (values.iter().zip(cases))
+                    .filter(|(v, _)| **v == f)
+                    .map(|(_, c)| c.shape)
+                    .collect()
             })
             .collect();
         (shapes, Some((get, k)))

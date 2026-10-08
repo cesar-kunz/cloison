@@ -336,11 +336,9 @@ fn uncaught_throws_end_the_run() {
 fn rejects_what_it_cannot_compile() {
     let unsupported = [
         ("var g = function h() { return h; };", "own name"),
-        ("function f(i) { return i++; }", "postfix"),
-        ("var x = -y;", "Neg"),
+        ("var x = delete y.z;", "Delete"),
         ("try { 1; } finally { 2; }", "finally"),
         ("var o = {1: 2};", "the key `1`"),
-        ("function f(a, b) { return a % b; }", "`%`"),
     ];
     for (src, what) in unsupported {
         let e = compile_error(src);
@@ -1655,6 +1653,53 @@ function main() {
 #[test]
 fn closures_agree_with_node() {
     assert_eq!(value(&format!("{CLOSURES}\nmain();")), "1032368592");
+}
+
+/// `%`, `&`, `|`, `^`, `<<`, `>>`, `>>>` on any operands (int32s, doubles
+/// past int32, strings, NaN) and a seeded generator like Octane's. The
+/// expected value is Node's.
+const BITWISE: &str = r#"
+function f(a, b) { return (a & b) + (a | b) * 3 + (a ^ b) * 7 + (a << (b & 7)) + (a >> 3) + (a >>> 1) + a % (b | 1); }
+var vals = [0, 1, -1, 7, 0x7fffffff, -2147483648, 4294967295, 0xc761c23c, 1.5, -7.25, "12", NaN];
+var s = 0;
+for (var i = 0; i < vals.length; i++) for (var j = 0; j < vals.length; j++) { var r = f(vals[i], vals[j]); if (r == r) s = (s + r) % 1000000007; }
+var seed = 49734321;
+for (var k = 0; k < 100; k++) { seed = ((seed + 0x7ed55d16) + (seed << 12)) & 0xffffffff; seed = ((seed ^ 0xc761c23c) ^ (seed >>> 19)) & 0xffffffff; }
+s + seed;
+"#;
+
+#[test]
+fn bitwise_operators_agree_with_node() {
+    assert_eq!(value(BITWISE), "346943374");
+}
+
+/// Builtins Octane's harness uses: `toFixed`, `toPrecision`, `Math`,
+/// `indexOf`, `Date` (but its time), unary `-`, `~`, `+` and postfix
+/// increments' values. The expected value is Node's.
+const BUILTINS: &str = r#"
+var out = "";
+var xs = [0, 1, -1, 2.5, -2.5, 0.5, 1.005, 123.456, 1e21, -0.0001234, 98765.4321, NaN, Infinity];
+for (var i = 0; i < xs.length; i++) {
+  var x = xs[i];
+  out = out + x.toFixed(0) + "," + x.toFixed(2) + "," + x.toPrecision(3) + "," + x.toString() + ";";
+}
+out = out + Math.round(2.5) + Math.round(-2.5) + Math.round(-0.4) + Math.floor(-1.5) + Math.ceil(1.2);
+out = out + Math.pow(2, 10) + Math.pow(1, NaN) + Math.log(Math.E) + Math.max(1, 7, 3) + Math.min(4, -2) + Math.abs(-3) + Math.sqrt(16);
+var a = [3, "x", 5, 3, null];
+out = out + a.indexOf(3) + a.indexOf(3, 1) + a.indexOf("x") + a.indexOf(9) + a.indexOf(null) + a.indexOf(3, -2);
+var d = new Date(1000), e = new Date(4000);
+out = out + (e - d) + d.getTime() + (typeof Date.now()) + (Date.now() > 1e12) + (Math.random() < 1);
+out = out + (-(3)) + (~5) + (+"12") + (+"") + (-"x");
+var k = 5; out = out + (k++) + k + (k--) + k;
+out;
+"#;
+
+#[test]
+fn builtins_agree_with_node() {
+    assert_eq!(
+        value(BUILTINS),
+        "0,0.00,0.00,0;1,1.00,1.00,1;-1,-1.00,-1.00,-1;3,2.50,2.50,2.5;-3,-2.50,-2.50,-2.5;1,0.50,0.500,0.5;1,1.00,1.00,1.005;123,123.46,123,123.456;1e+21,1e+21,1.00e+21,1e+21;-0,-0.00,-0.000123,-0.0001234;98765,98765.43,9.88e+4,98765.4321;NaN,NaN,NaN,NaN;Infinity,Infinity,Infinity,Infinity;3-20-221024NaN17-234031-14330001000numbertruetrue-3-6120NaN5665"
+    );
 }
 
 /// A method a compiled loop calls inlined, without checking the callee

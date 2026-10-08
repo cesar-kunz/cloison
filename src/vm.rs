@@ -314,6 +314,8 @@ pub struct Vm {
     pub(crate) function_call_fn: *mut Object,
     /// The `Array` constructor: compiled code makes `new Array()` itself.
     pub(crate) array_fn: *mut Object,
+    date_prototype: *mut Object,
+    number_prototype: *mut Object,
     /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
     pub(crate) array_push_fn: *mut Object,
     pub(crate) array_pop_fn: *mut Object,
@@ -381,6 +383,8 @@ impl Vm {
             function_call: std::ptr::null(),
             function_call_fn: std::ptr::null_mut(),
             array_fn: std::ptr::null_mut(),
+            date_prototype: std::ptr::null_mut(),
+            number_prototype: std::ptr::null_mut(),
             array_push_fn: std::ptr::null_mut(),
             array_pop_fn: std::ptr::null_mut(),
             a_prototype: Atom(0),
@@ -425,7 +429,85 @@ impl Vm {
         vm.function_call_fn = call;
         // The constructors, with `prototype` and `constructor` links.
         let g = vm.global;
+        for (name, v) in [("NaN", f64::NAN), ("Infinity", f64::INFINITY)] {
+            let a = vm.intern(name);
+            vm.add_property_with(
+                g,
+                a,
+                Value::from_f64(v),
+                READ_ONLY | DONT_ENUM | DONT_DELETE,
+            );
+        }
+        vm.number_prototype = vm.new_object(op);
+        let np = vm.number_prototype;
+        vm.define_native(
+            np,
+            "toFixed",
+            number_to_fixed,
+            1,
+            crate::jit::Ty::Any,
+            false,
+        );
+        vm.define_native(
+            np,
+            "toPrecision",
+            number_to_precision,
+            1,
+            crate::jit::Ty::Any,
+            false,
+        );
+        vm.define_native(
+            np,
+            "toString",
+            number_to_string_method,
+            0,
+            crate::jit::Ty::Any,
+            false,
+        );
+        vm.define_native(ap, "indexOf", array_index_of, 1, crate::jit::Ty::I32, false);
+        let math = vm.new_object_with(Class::Plain, op, 16);
+        let a = vm.intern("Math");
+        vm.add_property_with(g, a, object_value(math), DONT_ENUM);
+        for (name, v) in [
+            ("E", std::f64::consts::E),
+            ("PI", std::f64::consts::PI),
+            ("LN2", std::f64::consts::LN_2),
+            ("LN10", std::f64::consts::LN_10),
+            ("LOG2E", std::f64::consts::LOG2_E),
+            ("LOG10E", std::f64::consts::LOG10_E),
+            ("SQRT2", std::f64::consts::SQRT_2),
+        ] {
+            let a = vm.intern(name);
+            vm.add_property_with(
+                math,
+                a,
+                Value::from_f64(v),
+                READ_ONLY | DONT_ENUM | DONT_DELETE,
+            );
+        }
+        for (name, f, n) in [
+            ("log", math_log as NativeFn, 1),
+            ("exp", math_exp, 1),
+            ("sqrt", math_sqrt, 1),
+            ("abs", math_abs, 1),
+            ("floor", math_floor, 1),
+            ("ceil", math_ceil, 1),
+            ("round", math_round, 1),
+            ("sin", math_sin, 1),
+            ("cos", math_cos, 1),
+            ("pow", math_pow, 2),
+            ("min", math_min, 2),
+            ("max", math_max, 2),
+            ("random", math_random, 0),
+        ] {
+            vm.define_native(math, name, f, n, crate::jit::Ty::Any, false);
+        }
+        vm.date_prototype = vm.new_object(op);
+        let dp = vm.date_prototype;
+        vm.define_native(dp, "getTime", date_get_time, 0, crate::jit::Ty::Any, false);
+        vm.define_native(dp, "valueOf", date_get_time, 0, crate::jit::Ty::Any, false);
         for (name, f, proto) in [
+            ("Date", date_constructor as NativeFn, vm.date_prototype),
             ("Array", array_constructor as NativeFn, vm.array_prototype),
             (
                 "Object",
@@ -446,6 +528,9 @@ impl Vm {
             );
             // Not enumerable, as the builtins' properties.
             vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
+            if name == "Date" {
+                vm.define_native(c, "now", date_now, 0, crate::jit::Ty::Any, false);
+            }
             if name == "Object" {
                 let f = object_define_property as NativeFn;
                 vm.define_native(c, "defineProperty", f, 3, crate::jit::Ty::Any, false);
@@ -786,7 +871,15 @@ impl Vm {
                 self.atom_name(name)
             )));
         }
-        // No Number or Boolean prototypes yet.
+        // A number's properties are `Number.prototype`'s (no Boolean
+        // prototype yet).
+        if obj.is_number() {
+            let o = self.number_prototype;
+            return Ok(match self.lookup(o, name) {
+                Some((h, slot)) => unsafe { *Object::slot(h, (*(*h).shape).location(slot)) },
+                None => Value::UNDEFINED,
+            });
+        }
         Ok(Value::UNDEFINED)
     }
 
@@ -1832,6 +1925,267 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
 
 /// `Object(…)` and `new Object(…)`: an object argument itself, else a new
 /// plain object (there are no wrapper objects yet).
+/// Argument `i` as a number (ToNumber), `NaN` if missing.
+fn num_arg(args: &[Value], i: usize) -> f64 {
+    args.get(i)
+        .map_or(f64::NAN, |&v| crate::interp::to_number(v))
+}
+
+fn math_log(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).ln()))
+}
+fn math_exp(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).exp()))
+}
+fn math_sqrt(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).sqrt()))
+}
+fn math_abs(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).abs()))
+}
+fn math_floor(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).floor()))
+}
+fn math_ceil(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).ceil()))
+}
+/// `Math.round`: halves round up (`-2.5` is `-2`), unlike Rust's `round`.
+fn math_round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = num_arg(a, 0);
+    let r = (x + 0.5).floor();
+    // (-0.5 rounds to -0; x + 0.5 is inexact past 2^52, where x is
+    // integral already.)
+    Ok(Value::number(if x.abs() >= 4503599627370496.0 {
+        x
+    } else if r == 0.0 && x < 0.0 {
+        -0.0
+    } else {
+        r
+    }))
+}
+fn math_sin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).sin()))
+}
+fn math_cos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::number(num_arg(a, 0).cos()))
+}
+/// `Math.pow`: as `**`, where `pow(1, NaN)` and `pow(±1, ±∞)` are NaN.
+fn math_pow(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let (x, y) = (num_arg(a, 0), num_arg(a, 1));
+    Ok(Value::number(
+        if y.is_nan() || (x.abs() == 1.0 && y.is_infinite()) {
+            f64::NAN
+        } else {
+            x.powf(y)
+        },
+    ))
+}
+/// `Math.min`/`max` of all the arguments (NaN if any is; no arguments:
+/// `Infinity`/`-Infinity`).
+fn math_min(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let mut r = f64::INFINITY;
+    for i in 0..a.len() {
+        let x = num_arg(a, i);
+        if x.is_nan() {
+            return Ok(Value::from_f64(f64::NAN));
+        }
+        if x < r || (x == 0.0 && r == 0.0 && x.is_sign_negative()) {
+            r = x;
+        }
+    }
+    Ok(Value::number(r))
+}
+fn math_max(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let mut r = f64::NEG_INFINITY;
+    for i in 0..a.len() {
+        let x = num_arg(a, i);
+        if x.is_nan() {
+            return Ok(Value::from_f64(f64::NAN));
+        }
+        if x > r || (x == 0.0 && r == 0.0 && r.is_sign_negative()) {
+            r = x;
+        }
+    }
+    Ok(Value::number(r))
+}
+/// `Math.random`: xorshift64*, seeded from the clock.
+fn math_random(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(
+            (now_ms() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+        );
+    }
+    let x = STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        s.set(x);
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    });
+    Ok(Value::from_f64((x >> 11) as f64 / (1u64 << 53) as f64))
+}
+
+/// `this` as a number for `Number.prototype` methods.
+fn this_number(this: Value) -> Result<f64> {
+    this.as_number()
+        .ok_or_else(|| Error::type_error("Number.prototype method called on a non-number"))
+}
+
+/// `Number.prototype.toFixed(digits)`: rounded to `digits` (0 to 100)
+/// decimals, halves away from zero; `ToString` past 1e21.
+fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let x = this_number(this)?;
+    let f = a.first().map_or(0.0, |&v| crate::interp::to_number(v));
+    if !(0.0..=100.0).contains(&f) {
+        return Err(Error::range_error(
+            "toFixed() digits argument must be between 0 and 100",
+        ));
+    }
+    let f = f as usize;
+    let s = if !x.is_finite() || x.abs() >= 1e21 {
+        number_to_string(x)
+    } else {
+        // Ties (exact in binary) go away from zero, as the spec's "larger
+        // n"; Rust's formatting would make them even.
+        let scaled = x.abs() * 10f64.powi(f as i32);
+        let n = if scaled.fract() == 0.5 {
+            scaled.ceil()
+        } else {
+            scaled.round()
+        };
+        let digits = format!("{:0>width$}", format!("{n:.0}"), width = f + 1);
+        let (int, frac) = digits.split_at(digits.len() - f);
+        // (The spec's sign: of x, even when it rounds to 0; -0 has none.)
+        let sign = if x < 0.0 { "-" } else { "" };
+        if f == 0 {
+            format!("{sign}{int}")
+        } else {
+            format!("{sign}{int}.{frac}")
+        }
+    };
+    let units: Vec<u16> = s.encode_utf16().collect();
+    Ok(vm.new_string(&units))
+}
+
+/// `Number.prototype.toPrecision(p)`: `p` (1 to 100) significant digits,
+/// in exponent form when the exponent is below -6 or at least `p`.
+fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let x = this_number(this)?;
+    let s = match a.first() {
+        None => number_to_string(x),
+        Some(&v) if v.is_undefined() => number_to_string(x),
+        Some(&v) => {
+            let p = crate::interp::to_number(v);
+            if !(1.0..=100.0).contains(&p) {
+                return Err(Error::range_error(
+                    "toPrecision() argument must be between 1 and 100",
+                ));
+            }
+            let p = p as usize;
+            if !x.is_finite() {
+                number_to_string(x)
+            } else if x == 0.0 {
+                if p == 1 {
+                    "0".into()
+                } else {
+                    format!("0.{}", "0".repeat(p - 1))
+                }
+            } else {
+                let e = format!("{:.*e}", p - 1, x.abs());
+                let (m, exp) = e.split_once('e').unwrap();
+                let exp: i32 = exp.parse().unwrap();
+                let sign = if x < 0.0 { "-" } else { "" };
+                if exp < -6 || exp >= p as i32 {
+                    let es = if exp >= 0 {
+                        format!("+{exp}")
+                    } else {
+                        exp.to_string()
+                    };
+                    format!("{sign}{m}e{es}")
+                } else {
+                    let decimals = (p as i32 - 1 - exp).max(0) as usize;
+                    format!("{sign}{:.*}", decimals, x.abs())
+                }
+            }
+        }
+    };
+    let units: Vec<u16> = s.encode_utf16().collect();
+    Ok(vm.new_string(&units))
+}
+
+/// `Number.prototype.toString()` (radix 10).
+fn number_to_string_method(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let units: Vec<u16> = number_to_string(this_number(this)?)
+        .encode_utf16()
+        .collect();
+    Ok(vm.new_string(&units))
+}
+
+/// `Array.prototype.indexOf(x, from)`: the first index of an element
+/// strictly equal to `x`, or -1.
+fn array_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
+        return Err(Error::unsupported("Array.prototype.indexOf on a non-array"));
+    }
+    let o = as_object(this);
+    let x = a.first().copied().unwrap_or(Value::UNDEFINED);
+    let len = unsafe { (*o).elems_len } as i64;
+    let from = a.get(1).map_or(0.0, |&v| crate::interp::to_number(v));
+    let from = if from.is_nan() {
+        0
+    } else if from < 0.0 {
+        (len + from as i64).max(0)
+    } else {
+        from as i64
+    };
+    for i in from..len {
+        let e = unsafe { *(*o).elems.add(i as usize) };
+        if e != Value::EMPTY && crate::interp::strict_equals(e, x) {
+            return Ok(Value::from_i32(i as i32));
+        }
+    }
+    Ok(Value::from_i32(-1))
+}
+
+/// Milliseconds since the epoch, now.
+fn now_ms() -> f64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    t.map_or(0.0, |d| d.as_millis() as f64)
+}
+
+/// `new Date()` (now) or `new Date(ms)`. (Called without `new`, it should
+/// give a string; it gives the object.)
+fn date_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    let t = match args.first() {
+        Some(v) if v.is_number() => v.as_number().unwrap().trunc(),
+        _ => now_ms(),
+    };
+    let dp = object_value(vm.date_prototype);
+    let o = vm.new_object_with(Class::Date, dp, 0);
+    unsafe { (*o).code = t.to_bits() as *const Code };
+    Ok(object_value(o))
+}
+
+/// `Date.now()`.
+fn date_now(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    Ok(Value::number(now_ms()))
+}
+
+/// The time value of `v` if it is a `Date`.
+pub(crate) fn date_value(v: Value) -> Option<f64> {
+    let o = v.is_cell().then(|| as_object(v))?;
+    unsafe { ((*o).class == Class::Date).then(|| f64::from_bits((*o).code as u64)) }
+}
+
+/// `Date.prototype.getTime()` and `valueOf()`.
+fn date_get_time(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    match date_value(this) {
+        Some(t) => Ok(Value::number(t)),
+        None => Err(Error::type_error("this is not a Date object")),
+    }
+}
+
 fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     match args.first() {
         Some(&v) if v.is_cell() => Ok(v),

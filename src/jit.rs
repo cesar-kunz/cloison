@@ -5102,6 +5102,12 @@ pub struct JitCode {
     /// Call sites (indices into the snapshot's) bound to this code itself:
     /// [`JitCode::into_rc`] gives them its address.
     self_sites: Vec<usize>,
+    /// Copies of the snapshot's direct-call sites another version claimed
+    /// with other types: this version's calls there go straight into a
+    /// callee version for its own types, not through the runtime. Owned
+    /// here: the code points to them.
+    #[allow(clippy::vec_box, dead_code)]
+    forks: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
     /// For a VM function: the lowering compiled, which exits refer to and
     /// the code's call sites live in. Running code keeps it alive.
     snap: Option<Rc<Snapshot>>,
@@ -5612,6 +5618,10 @@ impl JitCode {
                 })
         };
         let mut self_sites = Vec::new();
+        #[allow(clippy::vec_box)]
+        let mut forks: Vec<Box<std::cell::UnsafeCell<CallSite>>> = Vec::new();
+        // Per instruction, the site its stencil uses if not the snapshot's.
+        let mut forked: HashMap<usize, u64> = HashMap::default();
         for (i, s) in sel.iter_mut().enumerate() {
             if let (
                 Some(s),
@@ -5636,8 +5646,24 @@ impl JitCode {
                             self_sites.push(*k as usize);
                         }
                         ok
+                    } else if bind_direct(site, this, &args) {
+                        true
+                    } else if (*site)
+                        .claim
+                        .as_ref()
+                        .is_some_and(|c| *c != (this, args.clone()))
+                    {
+                        // Claimed by another version with other types: a
+                        // copy of its own.
+                        let f = Box::new(std::cell::UnsafeCell::new((*site).fork()));
+                        let ok = bind_direct(f.get(), this, &args);
+                        if ok {
+                            forked.insert(i, f.get() as u64);
+                            forks.push(f);
+                        }
+                        ok
                     } else {
-                        bind_direct(site, this, &args)
+                        false
                     }
                 };
                 if !bound {
@@ -5925,7 +5951,7 @@ impl JitCode {
                     }),
                 ) => (
                     epoch as i32,
-                    vm_sites[site as usize].get() as u64,
+                    (forked.get(&i).copied()).unwrap_or(vm_sites[site as usize].get() as u64),
                     epoch_addr,
                 ),
                 _ => (insn.imm, 0, 0),
@@ -6258,6 +6284,7 @@ impl JitCode {
             homes,
             ret,
             self_sites,
+            forks,
             snap: None,
         };
         for &k in &code.self_sites {
@@ -6688,7 +6715,7 @@ pub(crate) struct CallSite {
 /// Otherwise, or when the heap's chunk is full, `toi_rt_construct`
 /// allocates.
 #[repr(C)]
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct CtorSite {
     /// The heap's `ptr` and `end` (`Heap::bump`).
     heap: *mut [*mut u64; 2],
@@ -6779,6 +6806,22 @@ unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
 }
 
 impl CallSite {
+    /// The site unbound and unclaimed, for a caller version passing other
+    /// types than the one that claimed it (see `JitCode::forks`).
+    fn fork(&self) -> CallSite {
+        CallSite {
+            entry: 0,
+            ctor: self.ctor.clone(),
+            exits: 0,
+            target: None,
+            self_code: std::ptr::null(),
+            bound: false,
+            claim: None,
+            pending: false,
+            ..*self
+        }
+    }
+
     fn bind(&mut self, code: Rc<JitCode>, nregs: usize) {
         self.entry = code.entry_addr();
         self.end_off = 8 * (self.frame + nregs + interp::HEADER) as u64;
@@ -8293,6 +8336,25 @@ impl Lowering<'_> {
                     }
                     i.native = native;
                     self.push(i, Prop::None);
+                    continue;
+                }
+            }
+            // `new Array()`: a guard on the callee (unless proven), then a
+            // new empty array, as `[]` makes (DeltaBlue's collections make
+            // one each, which went through the runtime's `construct`).
+            if i.op == Op::Construct && i.imm == 0 && !i.bail {
+                let ic = self.out.fbs[frame].ic(i.ic as usize);
+                let (fo, other) = unsafe { ((*ic).holder, (*ic.add(1)).holder) };
+                let array = unsafe { (*self.state.vm).array_fn };
+                let exits = self.state.callee_exits.get(&origin).copied().unwrap_or(0);
+                if !array.is_null() && fo == array && other.is_null() && exits < MAX_PROPERTY_EXITS
+                {
+                    if !self.proven_callee(frame, i.reg, fo) {
+                        let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
+                        guard.guard = fo as u64;
+                        self.push(guard, Prop::None);
+                    }
+                    self.push(synth(Op::CreateArray, 0, frame, i.pc), Prop::None);
                     continue;
                 }
             }

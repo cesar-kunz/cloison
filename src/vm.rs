@@ -288,6 +288,8 @@ pub struct Vm {
     pub(crate) function_call: *const Code,
     /// `Function.prototype.call` itself.
     pub(crate) function_call_fn: *mut Object,
+    /// The `Array` constructor: compiled code makes `new Array()` itself.
+    pub(crate) array_fn: *mut Object,
     /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
     pub(crate) array_push_fn: *mut Object,
     pub(crate) array_pop_fn: *mut Object,
@@ -353,6 +355,7 @@ impl Vm {
             proto_object_shape: std::ptr::null(),
             function_call: std::ptr::null(),
             function_call_fn: std::ptr::null_mut(),
+            array_fn: std::ptr::null_mut(),
             array_push_fn: std::ptr::null_mut(),
             array_pop_fn: std::ptr::null_mut(),
             a_prototype: Atom(0),
@@ -406,6 +409,9 @@ impl Vm {
             ),
         ] {
             let c = vm.define_native(g, name, f, 0, crate::jit::Ty::Any, true);
+            if name == "Array" {
+                vm.array_fn = c;
+            }
             let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
             vm.add_property_with(
                 c,

@@ -8997,12 +8997,25 @@ impl Lowering<'_> {
         };
         // At the last level, a callee's own calls couldn't be inlined: a
         // direct call into its compiled code, which inlines them, is
-        // better than inlining it.
+        // better than inlining it. Calls to small leaves are inlined at
+        // any depth, so they don't count (`EqualityConstraint.execute`'s
+        // `this.output()` in DeltaBlue: counting them left a call in
+        // `chainTest`'s hottest loop, 87M direct calls a run).
         let calls = |cx: &mut Self, fo: *mut Object| {
-            cx.decoded(unsafe { (*fo).code })
-                .0
-                .iter()
-                .any(|j| j.is_call())
+            let code = unsafe { (*fo).code };
+            let fb = cx.feedback(code);
+            let d = cx.decoded(code);
+            d.0.iter().filter(|j| j.is_call()).any(|j| {
+                let ic = fb.ic(j.ic as usize);
+                if unsafe { (*ic).loc } == crate::vm::VIA_CALL {
+                    return true;
+                }
+                let holders: Vec<*mut Object> = (0..crate::vm::IC_WAYS)
+                    .map(|k| unsafe { (*ic.add(k)).holder })
+                    .take_while(|h| !h.is_null())
+                    .collect();
+                holders.is_empty() || !holders.iter().all(|&h| cx.small_leaf(h))
+            })
         };
         let last_level = depth + 1 >= MAX_INLINE_DEPTH;
         let ic = self.out.fbs[frame].ic(i.ic as usize);

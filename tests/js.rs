@@ -1380,6 +1380,43 @@ fn tests_of_known_values_agree_with_node() {
     assert_eq!(value(&format!("{KNOWN_TESTS}\nmain();")), "4887999");
 }
 
+/// Polymorphic calls on a local receiver (copied into the call's `this`):
+/// `get` is one function for `A` and `B`, another for `C`, and `D` comes
+/// after `run` is compiled. The expected value is Node's.
+const RECEIVER_DISPATCH: &str = r#"
+function Base(v) { this.v = v; }
+Base.prototype.get = function () { return this.v; };
+function A(v) { this.v = v; }
+A.prototype = new Base(0);
+function B(v) { this.w = 1; this.v = v; }
+B.prototype = A.prototype;
+function C(v) { this.v = v * 2; }
+C.prototype.get = function () { return this.v + 1; };
+function D(v) { this.d = 0; this.v = v; }
+D.prototype.get = function () { return 0 - this.v; };
+function run(objs, n) {
+  var s = 0;
+  for (var r = 0; r < n; r++)
+    for (var i = 0; i < objs.length; i++) {
+      var o = objs[i];
+      s += o.get() + o.get();
+    }
+  return s;
+}
+function main() {
+  var objs = [];
+  for (var i = 0; i < 30; i++) objs.push(i % 3 == 0 ? new A(i) : i % 3 == 1 ? new B(i) : new C(i));
+  var s = run(objs, 300);
+  objs.push(new D(5));
+  return s + run(objs, 300);
+}
+"#;
+
+#[test]
+fn calls_dispatched_on_the_receivers_shape_agree_with_node() {
+    assert_eq!(value(&format!("{RECEIVER_DISPATCH}\nmain();")), "717000");
+}
+
 /// A method a compiled loop calls inlined, without checking the callee
 /// (its prototype holds it), replaced from a called function and from the
 /// loop itself. The expected value is Node's.

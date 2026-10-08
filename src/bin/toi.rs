@@ -43,6 +43,22 @@ fn main() -> ExitCode {
     match vm.run(&module) {
         Ok(v) => {
             println!("{}", toi::vm::display(v));
+            // `TOI_JIT_TIME`: the JIT's lowering and compiling time.
+            if std::env::var_os("TOI_JIT_TIME").is_some() {
+                let ms = |a: &std::sync::atomic::AtomicU64| {
+                    a.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+                };
+                eprintln!(
+                    "lower {:.3} ms, compile {:.3} ms",
+                    ms(&toi::jit::LOWER_NS),
+                    ms(&toi::jit::COMPILE_NS)
+                );
+                eprintln!(
+                    "lowers {} compiles {}",
+                    toi::jit::LOWERS.load(std::sync::atomic::Ordering::Relaxed),
+                    toi::jit::COMPILES.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

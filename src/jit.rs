@@ -8060,33 +8060,66 @@ fn hoist_guards(out: &mut Lowered) {
     out.props = props2;
 }
 
-/// `LdaTrue` or `LdaFalse` followed by a jump on `acc`'s truth (an inlined
-/// `return true`, say, tested by the caller): the jump is taken or not
-/// whatever happens, so it becomes `Jump` or nothing. Not where control
-/// also arrives from elsewhere (a jump target, which loop entries are).
+/// Jumps on a value known where they are: taken or not whatever happens,
+/// so they become `Jump` or nothing. Known: what `LdaTrue`, `LdaFalse`,
+/// `LdaUndefined`, `LdaNull` and `LdaSmi` load, through `Star`, `Ldar` and
+/// `Mov`, along straight-line code: an inlined `return true` tested by the
+/// caller, or a parameter an inlined call leaves `undefined`
+/// (05-logical-or-default's `initial || 0`). Not past where control also
+/// arrives from elsewhere (a jump target, which loop entries are), a bail,
+/// or a call. `JumpIfTrue` and `JumpIfFalse` fold on booleans only.
 fn fold_constant_tests(insns: &mut [Insn]) {
+    // A value's truth, and whether it's a boolean.
+    #[derive(Clone, Copy)]
+    struct Known {
+        truth: bool,
+        boolean: bool,
+    }
     let mut target = vec![false; insns.len()];
     for i in insns.iter().filter(|i| i.jumps()) {
         if let Some(t) = target.get_mut(i.target) {
             *t = true;
         }
     }
-    for k in 1..insns.len() {
-        let (c, j) = (insns[k - 1], insns[k]);
-        let value = match c.op {
-            Op::LdaTrue => true,
-            Op::LdaFalse => false,
-            _ => continue,
-        };
-        let on = match j.op {
-            Op::JumpIfToBooleanTrue | Op::JumpIfTrue => true,
-            Op::JumpIfToBooleanFalse | Op::JumpIfFalse => false,
-            _ => continue,
-        };
-        if c.bail || j.bail || target[k] {
+    let mut regs: Vec<Option<Known>> = vec![None; 256];
+    let mut acc: Option<Known> = None;
+    let constant = |truth, boolean| Some(Known { truth, boolean });
+    for k in 0..insns.len() {
+        let i = insns[k];
+        if target[k] || i.bail || i.is_call() {
+            regs.fill(None);
+            acc = None;
+        }
+        if i.bail {
             continue;
         }
-        insns[k].op = if value == on { Op::Jump } else { Op::Nop };
+        match i.op {
+            Op::LdaTrue => acc = constant(true, true),
+            Op::LdaFalse => acc = constant(false, true),
+            Op::LdaUndefined | Op::LdaNull => acc = constant(false, false),
+            Op::LdaSmi => acc = constant(i.imm != 0, false),
+            Op::Ldar => acc = regs[i.reg as usize],
+            Op::Star => regs[i.reg as usize] = acc,
+            Op::Mov => regs[i.reg2 as usize] = regs[i.reg as usize],
+            Op::Nop if i.alloc == 0 => {}
+            Op::JumpIfToBooleanTrue
+            | Op::JumpIfToBooleanFalse
+            | Op::JumpIfTrue
+            | Op::JumpIfFalse => {
+                let on = matches!(i.op, Op::JumpIfToBooleanTrue | Op::JumpIfTrue);
+                let to_boolean = matches!(i.op, Op::JumpIfToBooleanTrue | Op::JumpIfToBooleanFalse);
+                if let Some(v) = acc
+                    && (to_boolean || v.boolean)
+                {
+                    insns[k].op = if v.truth == on { Op::Jump } else { Op::Nop };
+                }
+            }
+            _ => acc = None,
+        }
+        if !insns[k].falls_through() {
+            regs.fill(None);
+            acc = None;
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 # Direct calls: what they cost, and a cheaper convention
 
-Status: design, 2026-10-08. Nothing here is implemented yet.
+Status: design, 2026-10-08. Step 1 implemented (see Measured).
 
 ## Why
 
@@ -89,6 +89,18 @@ recursion, 18, 87) and DeltaBlue ×1000.
    them in the slot registers the callee assigns them to (known when
    binding: the callee's version is compiled first) saves a store and a load
    each. Exits must spill them to the frame first, as for any slot.
+
+## Measured
+
+Step 1 (`call_direct_nc`, 348 of DeltaBlue's 484 direct-call sites): about
+-1% on DeltaBlue x1000 (329-331 ms against 332-336), nothing else beyond
+noise in `perf.sh --ab`. Removing instructions and loads that don't sit on
+the call's critical path barely shows: a call's cost isn't mostly its
+instruction count. Steps 2 and 3 remove less than step 1 and are not
+worth doing for speed alone. What remains is the structure: the indirect
+`call [r11]`, the stores and reloads of the arguments and of the live
+slots around the call, the extra call and return through the wrapper.
+Steps 4-6 address those.
 
 ## Recommendation
 

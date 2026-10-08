@@ -1034,6 +1034,9 @@ struct Insn {
     /// An `AddSmi` decoded from `SubSmi`: on numbers `x - k` is `x + -k`,
     /// but not on other values (`"12" - 1`), so its generic case subtracts.
     sub: bool,
+    /// A check [`hoist_guards`] moved before a loop: the frame and bytecode
+    /// offset of the load it checked for.
+    hoisted: Option<(u8, u32)>,
 }
 
 impl Insn {
@@ -1282,6 +1285,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 check_only: false,
                 exit_const: 0,
                 sub,
+                hoisted: None,
             }
         })
         .collect()
@@ -1413,6 +1417,8 @@ pub(crate) enum Prop {
         at: u64,
         expect: u64,
         ft: FieldType,
+        /// The object the word is in (or 0).
+        obj: u64,
     },
     /// A global, in the global object at `global`.
     Global {
@@ -2146,6 +2152,15 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
 /// [`select`], but for the copies.
 fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     use Ty::{Any, F64, I32};
+    // A check moved before a loop (see `hoist_guards`).
+    if insn.op == Op::Nop
+        && let Some(&Prop::Const { at, expect, .. }) = spec.props.get(i)
+    {
+        return Sel {
+            ops: Some((0, at, expect)),
+            ..Sel::new("guard_word", "", st.clone())
+        };
+    }
     let Some(widened) = spec.widened else {
         let any = TypeState::any(st.regs.len());
         let no = Spec {
@@ -2781,6 +2796,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         at,
         expect,
         ft,
+        ..
     } = prop
     {
         out.acc = Ty::of_field(ft).0;
@@ -4579,6 +4595,10 @@ const AFTER_CALL: i32 = 1 << 23;
 /// predicted anymore.
 const BAD_RESULT: i32 = 1 << 22;
 
+/// The same bit without [`AFTER_CALL`]: the exit is a check moved before a
+/// loop (see [`hoist_guards`]).
+const HOISTED: i32 = BAD_RESULT;
+
 /// Rounds of type inference that predict direct calls' results (see
 /// [`JitCode::compile`]).
 const MAX_RESULT_ROUNDS: u32 = 3;
@@ -4808,8 +4828,34 @@ impl JitCode {
             .filter(|e| feedback.is_some() && opts.register_homes && e.len() == n && nregs <= 256)
             .map(|e| {
                 let mut l: Vec<RegSet> = live_in.iter().map(|l| rs_of(l)).collect();
-                for (l, e) in l.iter_mut().zip(e) {
-                    rs_or(l, e);
+                // Where an exit may leave: an instruction that can exit, and
+                // the one after a call (it exits there).
+                let quiet = |i: &Insn| {
+                    !i.bail
+                        && match i.op {
+                            Op::Ldar
+                            | Op::Star
+                            | Op::LdaSmi
+                            | Op::LdaUndefined
+                            | Op::LdaNull
+                            | Op::LdaTrue
+                            | Op::LdaFalse
+                            | Op::LdaConstant
+                            | Op::Jump => true,
+                            Op::Nop => {
+                                i.guard == 0
+                                    && i.alloc == 0
+                                    && i.native == 0
+                                    && i.hoisted.is_none()
+                                    && !i.on_shape
+                            }
+                            _ => false,
+                        }
+                };
+                for (k, (l, e)) in l.iter_mut().zip(e).enumerate() {
+                    if !quiet(&insns[k]) || k > 0 && insns[k - 1].is_call() {
+                        rs_or(l, e);
+                    }
                 }
                 for (&at, ms) in mats.into_iter().flatten() {
                     for m in ms {
@@ -4821,6 +4867,27 @@ impl JitCode {
                 for (i, insn) in insns.iter().enumerate() {
                     if insn.op == Op::Return && insn.frame == 0 && nregs > 0 {
                         rs_add(&mut l[i], 0);
+                    }
+                }
+                // Those are uses: live back to where they were written.
+                let uses = l.clone();
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for k in (0..n).rev().filter(|&k| reach[k]) {
+                        let mut out = [0; 4];
+                        for s in succs(insns, k).filter(|&s| s < n) {
+                            rs_or(&mut out, &l[s]);
+                        }
+                        if insns[k].op == Op::Star {
+                            let w = insns[k].reg as usize;
+                            out[w / 64] &= !(1 << (w % 64));
+                        }
+                        rs_or(&mut out, &uses[k]);
+                        if out != l[k] {
+                            l[k] = out;
+                            changed = true;
+                        }
                     }
                 }
                 l
@@ -5069,6 +5136,39 @@ impl JitCode {
             }
             rets = want;
         };
+        // A `Star` into a register nothing reads after, compiled code or
+        // the interpreter after an exit, writes nothing (but into a direct
+        // call's frame, which the callee reads).
+        let mut dead_star = vec![false; n];
+        if let Some(l) = &share_live {
+            for (i, s) in sel.iter_mut().enumerate() {
+                if let Some(s) = s
+                    && insns[i].op == Op::Star
+                    && s.base == "star"
+                    && (insns[i].reg as usize) < direct_base
+                    && i + 1 < n
+                    && !rs_has(&l[i + 1], insns[i].reg as usize)
+                {
+                    s.base = "nop";
+                    s.case = "";
+                    dead_star[i] = true;
+                }
+            }
+            // The load into `acc` such a `Star` stored, if nothing else
+            // reads it.
+            for i in 1..n {
+                let pure = matches!(
+                    sel[i - 1].as_ref().map(|s| s.base),
+                    Some("ldar" | "lda_smi" | "lda_undefined" | "lda_null" | "lda_true")
+                        | Some("lda_false" | "lda_constant")
+                ) && sel[i - 1].as_ref().is_some_and(|s| s.check.is_none());
+                if dead_star[i] && pure && !acc_live.get(i + 1).copied().unwrap_or(true) {
+                    let s = sel[i - 1].as_mut().unwrap();
+                    s.base = "nop";
+                    s.case = "";
+                }
+            }
+        }
         // Direct calls: bind each to the callee version for the arguments'
         // types here, or call through the runtime. A call to this function
         // binds to this code, if it is entered at the start and the
@@ -5430,7 +5530,7 @@ impl JitCode {
                     insns[i + 1].exit_record() | AFTER_CALL
                 } else {
                     seq.extend(box_acc_piece(st.acc));
-                    insn.exit_record()
+                    insn.exit_record() | if insn.hoisted.is_some() { HOISTED } else { 0 }
                 };
                 seq.extend(spills(&exit_homes(&homes, if is_call { i + 1 } else { i })));
                 if insn.exit_const != 0 {
@@ -6379,6 +6479,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         check_only: false,
         exit_const: 0,
         sub: false,
+        hoisted: None,
     }
 }
 
@@ -6489,17 +6590,19 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
     fold_constant_tests(&mut cx.out.insns);
     reuse_global_loads(&mut cx.out);
     fold_constant_loads(&mut cx.out, &cx.state.property_exits);
+    hoist_guards(&mut cx.out);
+    // An int32 constant needing no check is an `LdaSmi`, which typed code
+    // and fused groups handle as an immediate.
+    for (i, p) in cx.out.insns.iter_mut().zip(cx.out.props.iter_mut()) {
+        if let Prop::Const { value, at: 0, .. } = *p
+            && i.op != Op::Nop
+            && Value::from_bits(value).is_int32()
+        {
+            let k = Value::from_bits(value).as_i32_unchecked();
+            (i.op, i.imm, *p) = (Op::LdaSmi, k, Prop::None);
+        }
+    }
     scalar_replace(&mut cx.out);
-    // Registers share slots only if there are more than slots (see
-    // `assign_homes`), which needs where exits leave them to the
-    // interpreter.
-    let mut used = [0; 4];
-    for i in cx.out.insns.iter().filter(|i| i.reads_reg()) {
-        rs_add(&mut used, i.reg as usize);
-    }
-    if rs_iter(&used).count() <= GPR_SLOTS {
-        return cx.out;
-    }
     for f in &cx.out.frames {
         cx.state.pc_live.entry(f.code).or_insert_with(|| {
             let (insns, live) = bytecode_live(unsafe { &(*f.code).bytecode });
@@ -6922,7 +7025,8 @@ fn reuse_global_loads(out: &mut Lowered) {
 
 /// Loads of objects that mostly stay what they are: a global's (a
 /// function, say) and properties of an object so loaded, or loaded so
-/// (`C.parent.prototype.m`). Each becomes the value it has now
+/// (`C.parent.prototype.m`), and int32s of int32 fields so found
+/// (`Dir.FORWARD`). Each becomes the value it has now
 /// ([`Prop::Const`]), after a check that its slot still holds it (or, for
 /// a prototype's property, that the receiver's shape is the one the cache
 /// found it under); none for a slot of a prototype, which holds its value
@@ -6963,7 +7067,8 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
         }
         let exited = || exits.contains_key(&(out.frames[i.frame as usize].code as usize, i.pc));
         let of = |r: u8| known.iter().find(|&&(x, _)| x == r).map(|&(_, v)| v);
-        // (value, the word checked and what it must be, field type).
+        // (value, the word checked and what it must be, field type, the
+        // object).
         let folded = match (i.op, out.props[k]) {
             _ if i.check_only => None,
             (
@@ -6978,28 +7083,47 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
             ) => {
                 let at = global + off as u64;
                 let stored = || stored.contains(&out.fbs[i.frame as usize].name(&i));
-                (!oop && !stored()).then(|| (word(at), at, word(at), ft))
+                (!oop && !stored()).then(|| (word(at), at, word(at), ft, global))
             }
             (Op::GetNamed, Prop::Own { shape, off, ft }) => of(i.reg)
                 .and_then(object)
                 .filter(|&o| word(o as u64) == shape)
                 .map(|o| {
                     let at = o as u64 + off as u64;
-                    (word(at), if proto(o) { 0 } else { at }, word(at), ft)
+                    (
+                        word(at),
+                        if proto(o) { 0 } else { at },
+                        word(at),
+                        ft,
+                        o as u64,
+                    )
                 }),
             (Op::GetNamed, Prop::Proto { shape, addr, ft }) => of(i.reg)
                 .and_then(object)
                 .filter(|&o| word(o as u64) == shape)
-                .map(|o| (word(addr), if proto(o) { 0 } else { o as u64 }, shape, ft)),
+                .map(|o| {
+                    (
+                        word(addr),
+                        if proto(o) { 0 } else { o as u64 },
+                        shape,
+                        ft,
+                        o as u64,
+                    )
+                }),
             _ => None,
         };
         let folded = folded
-            .filter(|&(value, ..)| object(value).is_some() && !exited())
-            .map(|(value, at, expect, ft)| Prop::Const {
+            .filter(|&(value, _, _, ft, _)| {
+                // An object, or an int32 of an int32 field.
+                let int = Value::from_bits(value).is_int32() && ft == FieldType::Int;
+                (object(value).is_some() || int) && !exited()
+            })
+            .map(|(value, at, expect, ft, obj)| Prop::Const {
                 value,
                 at,
                 expect: if at == 0 { 0 } else { expect },
                 ft,
+                obj,
             });
         match i.op {
             Op::LdaGlobal | Op::GetNamed => {
@@ -7030,6 +7154,206 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
             }
         }
     }
+}
+
+/// The checks of constant loads ([`Prop::Const`]) in a loop that nothing
+/// in the loop can make fail, moved before it: the load in the loop is the
+/// constant alone. Not in a loop that calls (anything may change then),
+/// stores through the runtime or by key, or stores into objects with the
+/// checked object's shape or one extending it (`StaGlobal`: into the
+/// global object). The checks go where the loop is entered: before its
+/// header if that is entered by falling into it (and jumps from outside
+/// to it go to them), else before the jump into the loop (a `for` jumping
+/// to its condition), with a copy before the header for code entered
+/// there (compiled code is entered at a loop's header, by its bytecode
+/// offset, which the checks carry: see `JitFunction::index_of`). Not into
+/// a loop holding another loop of the function itself (entered at its
+/// header, it would skip the checks), nor one jumped into elsewhere.
+/// A check failing exits before the loop (`HOISTED`), and its load isn't
+/// compiled as a constant again.
+fn hoist_guards(out: &mut Lowered) {
+    let n = out.insns.len();
+    let insns = &out.insns;
+    // Loops: header, last backward jump to it.
+    let mut loops: Vec<(usize, usize)> = Vec::new();
+    for (j, i) in insns.iter().enumerate() {
+        if i.jumps() && i.target <= j {
+            match loops.iter_mut().find(|l| l.0 == i.target) {
+                Some(l) => l.1 = l.1.max(j),
+                None => loops.push((i.target, j)),
+            }
+        }
+    }
+    loops.sort_by_key(|&(t, e)| e - t);
+    let global = out.fbs.first().map_or(0, |f| f.global as u64);
+    let word = |at: u64| unsafe { *(at as *const u64) };
+    // Insertions before an instruction: the checks, and which jumps to
+    // the instruction go to them (`Some(loop)`: from outside the loop;
+    // `None`: all, or with `false` none).
+    struct Group {
+        at: usize,
+        checks: Vec<usize>,
+        frame: u8,
+        pc: usize,
+        enter: Option<(usize, usize)>,
+        all: bool,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut taken = vec![false; n];
+    for &(t, e) in &loops {
+        let inside = |k: usize| t <= k && k <= e;
+        // Another loop of the function's own frame inside: entered there.
+        if loops
+            .iter()
+            .any(|&(u, _)| u != t && inside(u) && insns[u].frame == 0)
+        {
+            continue;
+        }
+        // What the loop may store into.
+        let (mut all, mut shapes, mut globals) = (false, Vec::new(), false);
+        for i in &insns[t..=e] {
+            if i.bail {
+                continue;
+            }
+            if i.is_call() && i.native == 0 {
+                all = true;
+            }
+        }
+        for k in t..=e {
+            let i = &insns[k];
+            if i.bail {
+                continue;
+            }
+            match (i.op, out.props[k]) {
+                (
+                    Op::SetNamed,
+                    Prop::Own { shape, .. }
+                    | Prop::Oop { shape, .. }
+                    | Prop::Transition { shape, .. },
+                ) => shapes.push(shape),
+                (Op::SetNamed, Prop::Poly { n, cases }) => {
+                    shapes.extend(cases[..n as usize].iter().map(|c| c.shape))
+                }
+                (Op::SetNamed | Op::SetKeyed, _) => all = true,
+                (Op::StaGlobal, _) => globals = true,
+                _ => {}
+            }
+        }
+        if all {
+            continue;
+        }
+        // Entered by falling into the header (`A`), or by a jump just
+        // before it (`B`); from outside, nothing else jumps in.
+        let fall = t == 0 || insns[t - 1].falls_through() && !insns[t - 1].jumps();
+        let jump = t > 0
+            && insns[t - 1].op == Op::Jump
+            && !insns[t - 1].bail
+            && inside(insns[t - 1].target);
+        if !fall && !jump {
+            continue;
+        }
+        let jumps_in = insns.iter().enumerate().any(|(j, i)| {
+            i.jumps()
+                && !inside(j)
+                && inside(i.target)
+                && !(fall && i.target == t)
+                && !(jump && j == t - 1)
+        });
+        if jumps_in {
+            continue;
+        }
+        let checks: Vec<usize> = (t..=e)
+            .filter(|&k| {
+                !taken[k]
+                    && !insns[k].bail
+                    && matches!(out.props[k], Prop::Const { at, obj, .. } if at != 0 && obj != 0
+                    && !(globals && obj == global)
+                    && !shapes.iter().any(|&s| {
+                        let o = word(obj) as *const Shape;
+                        s == o as u64 || unsafe { extends(s as *const Shape, o) }
+                    }))
+            })
+            .collect();
+        if checks.is_empty() {
+            continue;
+        }
+        // (where, from outside which loop jumps enter, whether all do).
+        type Place = (usize, Option<(usize, usize)>, bool);
+        let places: Vec<Place> = if fall {
+            vec![(t, Some((t, e)), false)]
+        } else if insns[t].frame == 0 {
+            vec![(t - 1, None, true), (t, None, false)]
+        } else {
+            vec![(t - 1, None, true)]
+        };
+        if places.iter().any(|p| groups.iter().any(|g| g.at == p.0)) {
+            continue;
+        }
+        for &k in &checks {
+            taken[k] = true;
+        }
+        for (at, enter, all) in places {
+            groups.push(Group {
+                at,
+                checks: checks.clone(),
+                frame: insns[at].frame,
+                pc: insns[at].pc,
+                enter,
+                all,
+            });
+        }
+    }
+    if groups.is_empty() {
+        return;
+    }
+    groups.sort_by_key(|g| g.at);
+    // Rebuild, with the checks inserted.
+    let mut new_of = vec![0; n + 1];
+    let mut start_of: HashMap<usize, usize> = HashMap::default();
+    let (mut insns2, mut props2) = (Vec::new(), Vec::new());
+    let mut g = 0;
+    for k in 0..=n {
+        while g < groups.len() && groups[g].at == k {
+            start_of.insert(k, insns2.len());
+            for &c in &groups[g].checks {
+                let mut check = synth(Op::Nop, 0, groups[g].frame as usize, groups[g].pc);
+                check.hoisted = Some((out.insns[c].frame, out.insns[c].pc as u32));
+                insns2.push(check);
+                props2.push(out.props[c]);
+            }
+            g += 1;
+        }
+        new_of[k] = insns2.len();
+        if k < n {
+            insns2.push(out.insns[k]);
+            props2.push(out.props[k]);
+        }
+    }
+    // The loads keep only their constants.
+    for g in &groups {
+        for &c in &g.checks {
+            if let Prop::Const { at, expect, .. } = &mut props2[new_of[c]] {
+                (*at, *expect) = (0, 0);
+            }
+        }
+    }
+    for (k, i) in out.insns.iter().enumerate() {
+        if !(i.jumps() || i.bail && i.target > 0) {
+            continue;
+        }
+        let t = i.target;
+        let to = match groups.iter().find(|g| g.at == t) {
+            Some(g) if g.all => start_of[&t],
+            Some(g) => match g.enter {
+                Some((a, b)) if !(a <= k && k <= b) => start_of[&t],
+                _ => new_of[t],
+            },
+            None => new_of[t],
+        };
+        insns2[new_of[k]].target = to;
+    }
+    out.insns = insns2;
+    out.props = props2;
 }
 
 /// `LdaTrue` or `LdaFalse` followed by a jump on `acc`'s truth (an inlined
@@ -8552,7 +8876,8 @@ impl JitFunction {
     fn vm_finish(&mut self, code: &JitCode, pc: usize, record: usize) -> (usize, usize) {
         self.stats.exits += 1;
         let after_call = record & AFTER_CALL as usize != 0;
-        let bad_result = record & BAD_RESULT as usize != 0;
+        let bad_result = after_call && record & BAD_RESULT as usize != 0;
+        let hoisted = !after_call && record & HOISTED as usize != 0;
         let (frame, exit_pc) = (record >> 24, record & (BAD_RESULT as usize - 1));
         let snap = code.snap.as_ref().expect("a VM function's code");
         let vm = self.vm.as_mut().unwrap();
@@ -8591,10 +8916,22 @@ impl JitFunction {
             self.versions.clear();
             return (frame, exit_pc);
         }
+        // A check moved before a loop: its loads aren't compiled as
+        // constants anymore (which of the checks there failed isn't told).
+        if hoisted {
+            let at = |i: &&Insn| i.frame as usize == frame && i.pc == exit_pc;
+            for i in snap.insns.iter().filter(at) {
+                if let Some((f, opc)) = i.hoisted {
+                    let origin = (snap.frames[f as usize].code as usize, opc as usize);
+                    *vm.property_exits.entry(origin).or_insert(0) += 1;
+                }
+            }
+            return (frame, exit_pc);
+        }
         let k = snap
             .insns
             .iter()
-            .position(|i| i.frame as usize == frame && i.pc == exit_pc)
+            .position(|i| i.frame as usize == frame && i.pc == exit_pc && i.hoisted.is_none())
             .expect("an exit's instruction");
         let insn = snap.insns[k];
         let origin = (snap.frames[frame].code as usize, exit_pc);

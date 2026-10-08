@@ -289,6 +289,9 @@ pub struct Vm {
     a_prototype: Atom,
     a_constructor: Atom,
     a_length: Atom,
+    /// What the JIT worked out about functions' bytecode, for every
+    /// function's compilations.
+    pub(crate) jit_caches: crate::jit::Caches,
 }
 
 impl Default for Vm {
@@ -312,6 +315,7 @@ impl Vm {
             atoms: Vec::new(),
             atom_ids: HashMap::new(),
             codes: Vec::new(),
+            jit_caches: Default::default(),
             global: std::ptr::null_mut(),
             object_prototype: std::ptr::null_mut(),
             function_prototype: std::ptr::null_mut(),

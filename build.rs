@@ -224,6 +224,16 @@ fn emit(entries: &[Entry]) -> String {
         let slow = entries
             .iter()
             .any(|h| h.name == slow_name || slot_params(&h.name).0 == slow_name);
+        // The helper's index + 1 when it is the one stencil (or template)
+        // named so, which an instance's registers fit too; else 0 (looked
+        // up by name: a family's templates share a name).
+        let named: Vec<usize> = (0..entries.len())
+            .filter(|&k| entries[k].name == slow_name)
+            .collect();
+        let slow_at = match named[..] {
+            [k] if entries[k].covers.is_empty() == e.covers.is_empty() => k + 1,
+            _ => 0,
+        };
         let mut relocs = String::new();
         for r in &e.relocs {
             let symbol = match r.symbol.as_str() {
@@ -268,7 +278,7 @@ fn emit(entries: &[Entry]) -> String {
         };
         writeln!(
             out,
-            "    Stencil {{ name: {:?}, slow: {slow}, code: &{:?}, relocs: &[{relocs}], template: {template} }},",
+            "    Stencil {{ name: {:?}, slow: {slow}, slow_at: {slow_at}, code: &{:?}, relocs: &[{relocs}], template: {template} }},",
             e.name, e.code
         )
         .unwrap();

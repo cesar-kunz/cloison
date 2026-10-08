@@ -64,6 +64,12 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   the last record. Speed comes first, but size is tracked: a small
   speedup for a large size increase is worth reconsidering.
 
+- `scripts/tiers.sh` times every file in toi's interpreter, toi with
+  the JIT, and V8 capped at each of its tiers (Ignition, Sparkplug,
+  Maglev, Turbofan), as a table in `perf-history/tiers-<commit>.md`.
+  V8's times are cached by host, V8 version and file contents, so only new
+  or changed files are measured again.
+
 - `scripts/jit-profile.sh <listing>` profiles where compiled code spends
   its cycles, per stencil piece (`TOI_PERF_MAP=1` makes the JIT name
   every piece in `/tmp/perf-<pid>.map`, which `perf report` reads too).

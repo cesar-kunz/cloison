@@ -900,3 +900,173 @@ fn polymorphic_calls_agree_with_node() {
         assert_eq!(value(&format!("{POLY_CALLS}\n{call};")), want, "{call}");
     }
 }
+
+/// Compiled element stores, `push` and `pop`, and inlined constructors:
+/// stores of ints, doubles and objects (a double into ints, past the
+/// length), pushes that grow the elements and pops down to empty, and a
+/// constructor chain through `.call` whose add overflows (an exit inside
+/// the inlined `new`). The expected values are Node's.
+const ARRAYS: &str = r#"
+function stores() {
+  var a = [], d = [0.5], o = [], s = 0, i, r;
+  for (i = 0; i < 50; i++) { a.push(i); d.push(i); o.push(null); }
+  for (r = 0; r < 300; r++) {
+    for (i = 0; i < 50; i++) { a[i] = a[i] + r; d[i] = d[i] * 0.5 + r; }
+    if (r == 150) { a[3] = 2.5; o[7] = a; }
+    a[60] = r;
+  }
+  for (i = 0; i < 50; i++) s += a[i] + d[i];
+  return s + a.length + (o[7] === a ? 1 : 0);
+}
+function stack() {
+  var st = [], n = 0, i, r, v;
+  for (r = 0; r < 400; r++) {
+    for (i = 0; i < (r & 15); i++) st.push(i * r);
+    while (st.length > 3) { v = st.pop(); n = (n + v) | 0; }
+    if (st.pop() == undefined) n++;
+  }
+  var e = [];
+  return n + (e.pop() === undefined ? 1 : 0) + st.length;
+}
+function P(x, y) { this.x = x; this.y = y + 1; }
+function Q(a, b) { P.call(this, a, b); this.z = a * b; }
+function ctors() {
+  var s = 0, i, o;
+  for (i = 0; i < 3000; i++) {
+    o = new Q(i, i < 2500 ? i : 2147483647);
+    s = (s + o.x + o.z) | 0;
+    if (o.y > 3000) s = (s + 1) | 0;
+  }
+  return s;
+}
+"#;
+
+#[test]
+fn arrays_and_constructors_agree_with_node() {
+    for (call, want) in [
+        ("stores()", "2262261.5"),
+        ("stack()", "2847651"),
+        ("ctors()", "913365704"),
+    ] {
+        assert_eq!(value(&format!("{ARRAYS}\n{call};")), want, "{call}");
+    }
+}
+
+/// A global loaded several times in compiled straight-line code, changed
+/// in between by stores (`g = …`), by calls that store it, inlined or not
+/// (`swap`, `setG`), while its object is stored to through it. The
+/// expected values are Node's.
+const GLOBALS: &str = r#"
+var g = { v: 1 }, h = { v: 100 }, other = { v: 7 };
+function swap() { var t = g; g = h; h = t; }
+function setG(o) { g = o; }
+function loads() {
+  var s = 0, i;
+  for (i = 0; i < 3000; i++) {
+    s += g.v;
+    if ((i & 7) == 0) swap();
+    s += g.v;
+    if ((i & 15) == 1) g = other;
+    s += g.v;
+    if ((i & 31) == 2) setG(h);
+    s += g.v;
+    if ((i & 63) == 3) { g = h; h = other; }
+    s += g.v;
+    g.v = g.v + 1;
+    s = s | 0;
+  }
+  return s + g.v;
+}
+"#;
+
+#[test]
+fn repeated_global_loads_agree_with_node() {
+    assert_eq!(value(&format!("{GLOBALS}\nloads();")), "22481141");
+}
+
+/// Scalar replacement: objects of inlined constructors that are only read
+/// from aren't allocated, and exits while one is live (an int32 add
+/// overflowing, a field getting a double) allocate it; objects from two
+/// constructors joining, and one escaping now and then. The expected
+/// values are Node's.
+const SCALARS: &str = r#"
+function V(x, y) { this.x = x; this.y = y; }
+function W(a) { this.a = a; this.b = a + 1; }
+var kept = [];
+function plain() {
+  var s = 0, i;
+  for (i = 0; i < 5000; i++) { var v = new V(i, 2 * i); s = (s + v.x + v.y) | 0; }
+  return s;
+}
+function overflow() {
+  var s = 0, i;
+  for (i = 0; i < 3000; i++) {
+    var v = new V(i, i < 2000 ? i : 2147483000 + i);
+    var t = v.y + 1000;
+    s = (s + v.x + (t > 2147483647 ? 1 : 0)) | 0;
+  }
+  return s;
+}
+function doubles() {
+  var s = 0, i;
+  for (i = 0; i < 3000; i++) {
+    var v = new V(i, i < 2500 ? i : i + 0.5);
+    s += v.y - v.x;
+  }
+  var w = new V(1, 2);
+  return s + w.y;
+}
+function branches() {
+  var s = 0, i, o;
+  for (i = 0; i < 3000; i++) {
+    if (i & 1) o = new V(i, 1); else o = new W(i);
+    s = (s + (o.x === undefined ? o.a + o.b : o.x + o.y)) | 0;
+  }
+  return s;
+}
+function sometimes() {
+  var s = 0, i;
+  for (i = 0; i < 3000; i++) {
+    var v = new V(i, 0 - i);
+    if (i % 1000 == 999) kept.push(v);
+    s = (s + v.x + v.y + 1) | 0;
+  }
+  return s + kept.length + kept[1].x;
+}
+"#;
+
+#[test]
+fn scalar_replaced_objects_agree_with_node() {
+    for (call, want) in [
+        ("plain()", "37492500"),
+        ("overflow()", "4499500"),
+        ("doubles()", "252"),
+        ("branches()", "6750000"),
+        ("sometimes()", "5002"),
+    ] {
+        assert_eq!(value(&format!("{SCALARS}\n{call};")), want, "{call}");
+    }
+}
+
+/// A method a compiled loop calls inlined, without checking the callee
+/// (its prototype holds it), replaced from a called function and from the
+/// loop itself. The expected value is Node's.
+const METHODS: &str = r#"
+function A(v) { this.v = v; }
+A.prototype.f = function (k) { return this.v + k; };
+function replace() { A.prototype.f = function (k) { return this.v * k; }; }
+function methods() {
+  var a = new A(3), s = 0, i;
+  for (i = 0; i < 5000; i++) {
+    s = (s + a.f(i)) | 0;
+    if (i == 2000) replace();
+    if (i == 4000) A.prototype.f = function (k) { return k - this.v; };
+  }
+  return s;
+}
+"#;
+
+#[test]
+fn replaced_prototype_methods_agree_with_node() {
+    assert_eq!(value(&format!("{METHODS}\nmethods();")), "24502506");
+}

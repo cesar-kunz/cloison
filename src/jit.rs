@@ -392,6 +392,9 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_enter" => toi_rt_enter as *const () as usize,
         "toi_rt_construct" => toi_rt_construct as *const () as usize,
         "toi_rt_construct_done" => toi_rt_construct_done as *const () as usize,
+        "toi_rt_alloc_this" => toi_rt_alloc_this as *const () as usize,
+        "toi_rt_array_push" => toi_rt_array_push as *const () as usize,
+        "toi_rt_materialize" => toi_rt_materialize as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
         "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
@@ -994,6 +997,13 @@ struct Insn {
     /// (see `Lowering::inline_poly`); `guard` 1 is the receiver's cell
     /// check before the cases.
     on_shape: bool,
+    /// For a `Nop` [`lower`] adds before an inlined constructor (with
+    /// `guard` its function): the `CallSite` whose `ctor` allocates `this`
+    /// (into `acc`); see `Lowering::inline_construct`.
+    alloc: u64,
+    /// A call [`lower`] compiles as `Array.prototype.push` (1) or `pop`
+    /// (2) of its receiver, after a guard on the callee.
+    native: u8,
     /// An `AddSmi` decoded from `SubSmi`: on numbers `x - k` is `x + -k`,
     /// but not on other values (`"12" - 1`), so its generic case subtracts.
     sub: bool,
@@ -1042,6 +1052,7 @@ impl Insn {
                         | Op::GetNamed
                         | Op::SetNamed
                         | Op::GetKeyed
+                        | Op::SetKeyed
                 )
     }
 
@@ -1069,7 +1080,12 @@ impl Insn {
     fn is_property(&self) -> bool {
         matches!(
             self.op,
-            Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal | Op::GetKeyed
+            Op::GetNamed
+                | Op::SetNamed
+                | Op::LdaGlobal
+                | Op::StaGlobal
+                | Op::GetKeyed
+                | Op::SetKeyed
         )
     }
 
@@ -1214,6 +1230,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                         u16::from_le_bytes([code[pc + 2], code[pc + 3]]) as i32,
                     )
                 }
+                // The object in `reg`, the key in `reg2`.
+                Op::SetKeyed if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
                 _ if vm => bail = true,
                 op => panic!("the JIT does not compile {op:?} yet"),
             }
@@ -1232,6 +1250,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 next_case: false,
                 assume: 0,
                 on_shape: false,
+                alloc: 0,
+                native: 0,
                 sub,
             }
         })
@@ -1719,6 +1739,14 @@ impl Ty {
 pub struct TypeState {
     pub acc: Ty,
     pub regs: Vec<Ty>,
+    /// Copies: registers holding the same value (copied by `Ldar` and
+    /// `Star`, neither rewritten since) form a class, each register here
+    /// naming the lowest of its class; empty when every register is alone.
+    /// What an instruction proves about a register (a shape guard passed,
+    /// a transition) holds for its copies (see [`copies`]).
+    pub same: Vec<u8>,
+    /// The class `acc` holds the value of, if any.
+    pub acc_same: Option<u8>,
 }
 
 impl TypeState {
@@ -1726,10 +1754,13 @@ impl TypeState {
         TypeState {
             acc: Ty::Any,
             regs: vec![Ty::Any; nregs],
+            same: Vec::new(),
+            acc_same: None,
         }
     }
 
-    /// Join `other` into `self`; returns whether `self` changed.
+    /// Join `other` into `self`; returns whether `self` changed. Copies
+    /// stay copies only where both say so.
     fn join(&mut self, other: &TypeState) -> bool {
         let mut changed = false;
         let pairs = std::iter::once((&mut self.acc, &other.acc))
@@ -1741,8 +1772,147 @@ impl TypeState {
                 changed = true;
             }
         }
+        if !self.same.is_empty() {
+            let n = self.regs.len();
+            let mut same: Vec<u8> = (0..n).map(|r| self.class(r)).collect();
+            for (r, s) in same.iter_mut().enumerate() {
+                if *s != other.class(r) {
+                    *s = r as u8;
+                }
+            }
+            let before = std::mem::take(&mut self.same);
+            set_classes(self, same);
+            changed |= self.same != before;
+        }
+        if self.acc_same.is_some() && self.acc_same != other.acc_same {
+            self.acc_same = None;
+            changed = true;
+        }
         changed
     }
+
+    /// The class of register `r` (its lowest copy).
+    fn class(&self, r: usize) -> u8 {
+        self.same.get(r).copied().unwrap_or(r as u8)
+    }
+}
+
+/// Dead registers (and a dead `acc`) leave their classes.
+fn leave_dead(st: &mut TypeState, live: &[bool], acc_live: bool) {
+    let n = st.regs.len();
+    let old: Vec<u8> = (0..n).map(|r| st.class(r)).collect();
+    let mut same: Vec<u8> = (0..n).map(|r| r as u8).collect();
+    for r in 0..n {
+        if !live.get(r).copied().unwrap_or(true) {
+            continue;
+        }
+        // The lowest live register of `r`'s class.
+        let low = (0..n)
+            .find(|&q| old[q] == old[r] && live.get(q).copied().unwrap_or(true))
+            .unwrap();
+        same[r] = low as u8;
+    }
+    let acc = st
+        .acc_same
+        .and_then(|c| (0..n).find(|&q| old[q] == c && live.get(q).copied().unwrap_or(true)));
+    st.acc_same = if acc_live { acc.map(|q| same[q]) } else { None };
+    set_classes(st, same);
+}
+
+/// Store `same` as `st`'s classes, made canonical: empty if every register
+/// is alone.
+fn set_classes(st: &mut TypeState, same: Vec<u8>) {
+    st.same = if same.iter().enumerate().all(|(r, &c)| c as usize == r) {
+        Vec::new()
+    } else {
+        same
+    };
+}
+
+/// After `insn` (the out-state `out`, from the in-state `st`): track copies
+/// (`Ldar` makes `acc` a copy, `Star` a register; anything else writing
+/// `acc` ends its copy), and give the copies of the register an instruction
+/// learned something about (its operand, whose type changed and which it
+/// doesn't write) that type too.
+fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
+    let n = st.regs.len();
+    let mut same: Vec<u8> = (0..n).map(|r| st.class(r)).collect();
+    out.acc_same = st.acc_same;
+    if insn.bail {
+        out.acc_same = None;
+        set_classes(out, same);
+        return;
+    }
+    let r = insn.reg as usize;
+    match insn.op {
+        Op::Ldar if r < n => out.acc_same = Some(same[r]),
+        Op::Star if r < n => {
+            // `r` leaves its class: the others' lowest may change.
+            let old = same[r];
+            let rest: Vec<usize> = (0..n).filter(|&q| q != r && same[q] == old).collect();
+            if let Some(&low) = rest.first() {
+                for &q in &rest {
+                    same[q] = low as u8;
+                }
+            }
+            match out.acc_same {
+                // `acc` copies class `c`: `r` joins it.
+                Some(c) => {
+                    let c = if c as usize == r {
+                        rest.first().map_or(r, |&l| l) as u8
+                    } else {
+                        c
+                    };
+                    let members: Vec<usize> = (0..n).filter(|&q| q != r && same[q] == c).collect();
+                    let low = members
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(r))
+                        .min()
+                        .unwrap() as u8;
+                    for q in members.into_iter().chain(std::iter::once(r)) {
+                        same[q] = low;
+                    }
+                    out.acc_same = Some(low);
+                }
+                None => {
+                    same[r] = r as u8;
+                    out.acc_same = Some(r as u8);
+                }
+            }
+        }
+        _ => {
+            // What the instruction learned about its operand holds for the
+            // operand's copies.
+            if insn.uses_reg_value() && r < n && out.regs[r] != st.regs[r] {
+                let t = out.regs[r];
+                for q in 0..n {
+                    if same[q] == same[r] {
+                        out.regs[q] = t;
+                    }
+                }
+                if out.acc_same == Some(same[r]) && writes_acc(insn).is_none() {
+                    out.acc = t;
+                }
+            }
+            if writes_acc(insn).is_some() {
+                out.acc_same = None;
+            }
+        }
+    }
+    set_classes(out, same);
+}
+
+/// `Some(())` if `insn` may write `acc` (other than `Ldar`).
+fn writes_acc(insn: &Insn) -> Option<()> {
+    let keeps = insn.alloc == 0
+        && insn.native == 0
+        && (insn.jumps()
+            || matches!(
+                insn.op,
+                Op::Nop | Op::Jump | Op::Star | Op::SetNamed | Op::SetKeyed | Op::StaGlobal
+            ));
+    (!keeps).then_some(())
 }
 
 /// Inputs to stencil selection that are fixed for a compilation.
@@ -1868,6 +2038,13 @@ fn never_nullish(t: Ty) -> bool {
 /// exiting. A store to a pinned register makes it `F64` (an int32 is
 /// converted).
 fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
+    let mut sel = select_types(insn, i, st, spec);
+    copies(insn, st, &mut sel.out);
+    sel
+}
+
+/// [`select`], but for the copies.
+fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     use Ty::{Any, F64, I32};
     let Some(widened) = spec.widened else {
         let any = TypeState::any(st.regs.len());
@@ -1875,7 +2052,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             widened: Some(&HashSet::default()),
             ..*spec
         };
-        let mut sel = select(insn, i, &any, &no);
+        let mut sel = select_types(insn, i, &any, &no);
         // Generic code knows no shapes.
         if sel.case == "nc" {
             return Sel::new("bail", "", any);
@@ -1913,6 +2090,37 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         _ if insn.assume != 0 => {
             out.regs[insn.reg as usize] = Ty::Obj(insn.assume);
             return Sel::new("nop", "", out);
+        }
+        // An allocation scalar replacement removed: its checks only.
+        _ if insn.native == 3 => {
+            out.acc = Any;
+            return Sel {
+                ops: Some((0, insn.alloc, 0)),
+                ..Sel::new("ctor_check", "", out)
+            };
+        }
+        _ if insn.native != 0 => {
+            out.acc = if insn.native == 1 { I32 } else { Any };
+            return Sel {
+                ops: Some((8 * insn.reg2 as i32, 0, 0)),
+                ..Sel::new(
+                    if insn.native == 1 {
+                        "array_push"
+                    } else {
+                        "array_pop"
+                    },
+                    "",
+                    out,
+                )
+            };
+        }
+        _ if insn.alloc != 0 => {
+            let site = unsafe { &*(insn.alloc as *const CallSite) };
+            out.acc = Ty::Obj(site.this_shape);
+            return Sel {
+                ops: Some((0, insn.alloc, 0)),
+                ..Sel::new("alloc_this", "", out)
+            };
         }
         _ if insn.on_shape && insn.guard == 1 => return Sel::new("guard_cell", "", out),
         _ if insn.on_shape => {
@@ -2348,7 +2556,17 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         Op::JumpIfToBooleanFalse => ("jtofalse", num_case(st.acc)),
         // Property accesses. A receiver known to be a number has no
         // properties the cache could describe: leave it to the interpreter.
-        Op::GetNamed | Op::SetNamed | Op::GetKeyed if matches!(reg, I32 | F64) => ("bail", ""),
+        Op::GetNamed | Op::SetNamed | Op::GetKeyed | Op::SetKeyed if matches!(reg, I32 | F64) => {
+            ("bail", "")
+        }
+        // `o[k] = acc` (see `set_keyed` in the stencils): the key from
+        // memory, at `regs + imm`.
+        Op::SetKeyed => {
+            return Sel {
+                ops: Some((8 * insn.reg2 as i32, 0, 0)),
+                ..Sel::new("set_keyed", "", out)
+            };
+        }
         Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal => {
             return select_property(insn, i, st, spec);
         }
@@ -2639,6 +2857,9 @@ fn infer(
                     *t = Ty::Bot;
                 }
             }
+            if !out.same.is_empty() || out.acc_same.is_some() {
+                leave_dead(&mut out, &spec.reg_live[s], spec.acc_live[s]);
+            }
             let changed = match &mut ins[s] {
                 Some(st) => st.join(&out),
                 slot @ None => {
@@ -2889,16 +3110,21 @@ fn reg_live_in(
     nregs: usize,
     frames: &[FrameRegs],
 ) -> Vec<Vec<bool>> {
+    // Bitsets of 256 registers (they are `u8`s), one per instruction.
+    type Set = [u64; 4];
+    let set = |s: &mut Set, r: usize| s[r / 64] |= 1 << (r % 64);
+    let clear = |s: &mut Set, r: usize| s[r / 64] &= !(1 << (r % 64));
+    let mut exit_sets: HashMap<u8, Set> = HashMap::default();
     let n = insns.len();
-    let mut live_in = vec![vec![false; nregs]; n];
+    let mut live_in: Vec<Set> = vec![[0; 4]; n];
     let mut changed = true;
     while changed {
         changed = false;
         for i in (0..n).rev().filter(|&i| reach[i]) {
             let insn = &insns[i];
-            let mut live = vec![false; nregs];
+            let mut live: Set = [0; 4];
             for s in succs(insns, i).filter(|&s| s < n) {
-                for (l, &x) in live.iter_mut().zip(&live_in[s]) {
+                for (l, x) in live.iter_mut().zip(&live_in[s]) {
                     *l |= x;
                 }
             }
@@ -2907,17 +3133,28 @@ fn reg_live_in(
             // value there, so a register with a store of a non-int32 isn't
             // pinned as an int32 (which would truncate it).
             if insn.bail {
-                live = exit_live(frames, insn.frame, nregs);
+                live = *exit_sets.entry(insn.frame).or_insert_with(|| {
+                    let mut e = [0; 4];
+                    for (r, &l) in exit_live(frames, insn.frame, nregs).iter().enumerate() {
+                        if l {
+                            set(&mut e, r);
+                        }
+                    }
+                    e
+                });
             }
             if insn.op == Op::Star {
-                live[insn.reg as usize] = false;
+                clear(&mut live, insn.reg as usize);
             } else if insn.uses_reg_value() {
-                live[insn.reg as usize] = true;
+                set(&mut live, insn.reg as usize);
             }
             if insn.is_call() && !insn.bail {
                 for r in insn.call_reads() {
-                    live[r] = true;
+                    set(&mut live, r);
                 }
+            }
+            if insn.op == Op::SetKeyed && !insn.bail {
+                set(&mut live, insn.reg2 as usize);
             }
             if live != live_in[i] {
                 live_in[i] = live;
@@ -2926,6 +3163,9 @@ fn reg_live_in(
         }
     }
     live_in
+        .iter()
+        .map(|s| (0..nregs).map(|r| s[r / 64] >> (r % 64) & 1 != 0).collect())
+        .collect()
 }
 
 /// Registers that may be pinned (kept unboxed in a slot). A pinned register
@@ -3234,7 +3474,7 @@ fn stencil_for(
         ("guard_cell" | "shape_jne" | "shape_guard", _) => format!("{}_{loc}", sel.base),
         ("check_tail_callee", _) => format!("check_tail_callee_{loc}"),
         // The callee reads its arguments from memory.
-        ("call" | "call_direct" | "construct_direct", _) => {
+        ("call" | "call_direct" | "construct_direct" | "array_push" | "array_pop", _) => {
             for r in insn.call_reads() {
                 match homes[r] {
                     Home::Mem => {}
@@ -3261,6 +3501,17 @@ fn stencil_for(
         ("sta_global" | "sta_global_oop", _) => {
             box_acc(&mut pre);
             sel.base.into()
+        }
+        ("set_keyed", _) => {
+            box_acc(&mut pre);
+            let k = insn.reg2;
+            match homes[k as usize] {
+                Home::Mem => {}
+                Home::Gpr(h) => pre.push(Piece::new(&format!("spill_g{h}"), k)),
+                Home::Int(h) => pre.push(Piece::new(&format!("spill_u{h}"), k)),
+                Home::Fpr(h) => pre.push(Piece::new(&format!("spill_f{h}"), k)),
+            }
+            format!("set_keyed_{loc}")
         }
         ("get_keyed", _) if sel.case.starts_with('i') => format!("get_keyed_{}_{loc}", sel.case),
         ("get_keyed", _) => {
@@ -4189,6 +4440,8 @@ struct VmCompile<'a> {
     /// The function compiled (null for other code): its `ret_hint` follows
     /// the predictions for its own results.
     root: *const crate::vm::Code,
+    /// Objects to allocate at exits (see [`Lowered::mats`]).
+    mats: Option<&'a HashMap<usize, Vec<Rc<Mat>>>>,
 }
 
 /// Compilation options.
@@ -4219,6 +4472,7 @@ impl JitCode {
             sites: vm_sites,
             frames,
             root,
+            mats,
         } = vm;
         let n = insns.len();
         let nregs = actual.regs.len();
@@ -4827,6 +5081,22 @@ impl JitCode {
             hot[entry_len - 1].cont = Target::Next;
         }
 
+        // Exits where objects scalar replacement didn't allocate are live
+        // allocate them first, after the spills (an exit after a call: as
+        // they are after it).
+        if let Some(mats) = mats {
+            for (k, seq) in exits.iter_mut() {
+                let at = if *k >= n { *k - n + 1 } else { *k };
+                let Some(ms) = mats.get(&at) else { continue };
+                let pieces = ms.iter().map(|m| Piece {
+                    imm64: Rc::as_ptr(m) as u64,
+                    ..Piece::new("materialize", 0)
+                });
+                let last = seq.len() - 1;
+                seq.splice(last..last, pieces);
+            }
+        }
+
         // Positions. Hot pieces back to back; then cold code: edge stubs,
         // exit stubs, helpers; then runtime-call wrappers.
         let mut pos = 0;
@@ -5260,11 +5530,16 @@ const MAX_VM_COMPILES: u32 = 32;
 /// Inlining limits: nesting, and the callee's size in instructions.
 const MAX_INLINE_DEPTH: usize = 2;
 const MAX_INLINE_INSNS: usize = 64;
+/// Functions inlined at any depth: calling nothing and at most this long.
+const MAX_LEAF_INSNS: usize = 16;
 
 /// A frame of compiled code: frame 0 is the function itself, the others
 /// functions inlined into it (see [`lower`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct InlineFrame {
+    /// Inlined for `new`: the interpreter's frame for it, if it exits
+    /// there, is a `new` one (its `Return` gives `this`).
+    construct: bool,
     code: *const crate::vm::Code,
     /// Where its registers start, in registers from the compiled frame's.
     base: usize,
@@ -5485,6 +5760,8 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
                 .enumerate()
                 .map(|(r, &l)| if l { ty(r) } else { Ty::Bot })
                 .collect(),
+            same: Vec::new(),
+            acc_same: None,
         }
     };
     match unsafe { f.entry_version((*vm).proto_epoch, (*vm).field_epoch, make_state) } {
@@ -5497,6 +5774,8 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
 #[allow(clippy::vec_box)]
 pub(crate) struct Snapshot {
     insns: Vec<Insn>,
+    /// See [`Lowered::mats`].
+    mats: HashMap<usize, Vec<Rc<Mat>>>,
     frames: Vec<InlineFrame>,
     /// Per frame, (first register, register count, parent frame): the
     /// registers an exit from it leaves to the interpreter (see
@@ -5607,6 +5886,10 @@ fn emit_poly(
 struct Lowered {
     insns: Vec<Insn>,
     props: Vec<Prop>,
+    /// Per instruction, the objects scalar replacement left unallocated
+    /// that are live there: an exit before it allocates them (see
+    /// [`scalar_replace`]).
+    mats: HashMap<usize, Vec<Rc<Mat>>>,
     frames: Vec<InlineFrame>,
     fbs: Vec<Feedback>,
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
@@ -5643,6 +5926,8 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         next_case: false,
         assume: 0,
         on_shape: false,
+        alloc: 0,
+        native: 0,
         sub: false,
     }
 }
@@ -5684,7 +5969,9 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
         out: Lowered {
             insns: Vec::new(),
             props: Vec::new(),
+            mats: HashMap::default(),
             frames: vec![InlineFrame {
+                construct: false,
                 code: root,
                 base: 0,
                 parent: 0,
@@ -5702,7 +5989,386 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
     let rets = cx.emit_frame(0, 0);
     debug_assert!(rets.is_empty());
     cx.place_direct_frames();
+    fold_constant_tests(&mut cx.out.insns);
+    reuse_global_loads(&mut cx.out);
+    scalar_replace(&mut cx.out);
     cx.out
+}
+
+/// An object [`scalar_replace`] didn't allocate, as an exit allocates it:
+/// of shape `shape`, slot `k` holding register `fields[k]`, and put in the
+/// registers `regs` (those holding it there).
+pub(crate) struct Mat {
+    shape: *const Shape,
+    fields: Vec<u8>,
+    regs: Vec<u8>,
+}
+
+/// Scalar replacement of inlined `new`s whose object never escapes: no
+/// call, store, comparison or return sees it, only loads and stores of
+/// its own properties, on every path from the allocation while a register
+/// holding it is live (not into a loop's header, where code may be entered
+/// with a real object). The allocation becomes `ctor_check` (what the
+/// object's shape depends on unchanged, else leave before), each property a
+/// register: a store `Star`s it, a load `Ldar`s it. Where it is live, an
+/// exit allocates it first (`Lowered::mats`, `materialize`), with the shape
+/// it has there, storing its fields through `Vm::store_field`, so their
+/// types stay right.
+fn scalar_replace(out: &mut Lowered) {
+    let allocs: Vec<usize> = (0..out.insns.len())
+        .filter(|&a| out.insns[a].alloc != 0 && !out.insns[a].bail)
+        .collect();
+    let mut live = None;
+    for a in allocs {
+        let l = live.get_or_insert_with(|| {
+            let frames: Vec<FrameRegs> = out
+                .frames
+                .iter()
+                .map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent))
+                .collect();
+            reg_live_in(&out.insns, &reachable(&out.insns, 0), out.nregs, &frames)
+        });
+        if let Some(plan) = replacement(out, a, l) {
+            apply_replacement(out, a, plan);
+            live = None;
+        }
+    }
+}
+
+/// What [`replacement`] found: the rewrites (instruction, slot, load or
+/// store), the slot count, and per instruction where the object is live,
+/// its shape and the live registers holding it.
+struct Replacement {
+    rewrites: Vec<(usize, usize, bool)>,
+    slots: usize,
+    live: Vec<(usize, *const Shape, Vec<u8>)>,
+}
+
+fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacement> {
+    const NO: u8 = 0;
+    const YES: u8 = 1;
+    const MAYBE: u8 = 2;
+    #[derive(Clone, PartialEq)]
+    struct St {
+        regs: Vec<u8>,
+        acc: u8,
+        shape: *const Shape,
+    }
+    let insns = &out.insns;
+    let n = insns.len();
+    let nregs = out.nregs;
+    let mut header = vec![false; n];
+    for (j, i) in insns.iter().enumerate() {
+        if i.jumps() && i.target <= j {
+            header[i.target] = true;
+        }
+    }
+    let site = unsafe { &*(insns[a].alloc as *const CallSite) };
+    let root = site.this_shape as *const Shape;
+    // Forward over the whole function, from its start, so that a path
+    // that doesn't come from the allocation counts where paths join.
+    let start = St {
+        regs: vec![NO; nregs],
+        acc: NO,
+        shape: root,
+    };
+    let mut ins: Vec<Option<St>> = vec![None; n];
+    let mut rewrites: HashMap<usize, (usize, bool)> = HashMap::default();
+    let mut slots = 0usize;
+    let mut work = vec![(0, start)];
+    let held = |st: &St, live: &[bool]| {
+        st.acc != NO || st.regs.iter().zip(live).any(|(&h, &l)| h != NO && l)
+    };
+    while let Some((i, st)) = work.pop() {
+        if i >= n {
+            return None;
+        }
+        let st = match &ins[i] {
+            Some(old) => {
+                let mut j = old.clone();
+                for (x, y) in j.regs.iter_mut().zip(&st.regs) {
+                    if x != y {
+                        *x = MAYBE;
+                    }
+                }
+                if j.acc != st.acc {
+                    j.acc = MAYBE;
+                }
+                if j.shape != st.shape {
+                    // Paths disagree on its shape: fine if nothing holds it.
+                    if held(&j, &live[i]) || held(&st, &live[i]) {
+                        return None;
+                    }
+                    j.shape = root;
+                }
+                if &j == old {
+                    continue;
+                }
+                j
+            }
+            None => st,
+        };
+        ins[i] = Some(st.clone());
+        let insn = insns[i];
+        let is_held = held(&st, &live[i]);
+        if is_held && (i == a || header[i] || insn.bail && st.acc != NO) {
+            return None;
+        }
+        // Registers holding it that the interpreter would read after an
+        // exit here must hold it for sure.
+        if st.regs.iter().zip(&live[i]).any(|(&h, &l)| h == MAYBE && l) {
+            return None;
+        }
+        let r = insn.reg as usize;
+        let reg_held = r < nregs && st.regs[r] != NO;
+        let mut next = st.clone();
+        let fb = &out.fbs[insn.frame as usize];
+        match insn.op {
+            // The allocation: `acc` holds a new object (nothing holds the
+            // previous one any more, checked above).
+            _ if i == a => {
+                next.regs = vec![NO; nregs];
+                next.acc = YES;
+                next.shape = root;
+            }
+            Op::Ldar => next.acc = if r < nregs { st.regs[r] } else { NO },
+            Op::Star => next.regs[r] = st.acc,
+            Op::GetNamed if reg_held => {
+                if st.regs[r] != YES {
+                    return None;
+                }
+                let shape = unsafe { &*st.shape };
+                let slot = shape.lookup(fb.name(&insn))? as usize;
+                if shape.location(slot as u32) < 0 {
+                    return None;
+                }
+                rewrites.insert(i, (slot, true));
+                next.acc = NO;
+            }
+            Op::SetNamed if reg_held => {
+                if st.regs[r] != YES || st.acc != NO {
+                    return None;
+                }
+                let shape = unsafe { &*st.shape };
+                let name = fb.name(&insn);
+                let slot = match shape.lookup(name) {
+                    Some(k) => k as usize,
+                    None => {
+                        let Prop::Transition {
+                            shape: from,
+                            new_shape,
+                            ..
+                        } = out.props[i]
+                        else {
+                            return None;
+                        };
+                        if from != st.shape as u64 {
+                            return None;
+                        }
+                        next.shape = new_shape as *const Shape;
+                        unsafe { (*next.shape).lookup(name)? as usize }
+                    }
+                };
+                if unsafe { (*next.shape).location(slot as u32) } < 0 {
+                    return None;
+                }
+                slots = slots.max(slot + 1);
+                rewrites.insert(i, (slot, false));
+            }
+            _ => {
+                // Any other use of it is an escape.
+                let reads_held = (insn.reads_reg() && reg_held)
+                    || (insn.is_call() && insn.call_reads().any(|q| q < nregs && st.regs[q] != NO))
+                    || (insn.op == Op::SetKeyed && st.regs[insn.reg2 as usize] != NO)
+                    || (st.acc != NO && reads_acc(&insn));
+                if reads_held || insn.assume != 0 && reg_held {
+                    return None;
+                }
+                if writes_acc(&insn).is_some() {
+                    next.acc = NO;
+                }
+            }
+        }
+        if insn.falls_through() {
+            work.push((i + 1, next.clone()));
+        }
+        if insn.jumps() {
+            work.push((insn.target, next));
+        }
+    }
+    let live = (0..n)
+        .filter_map(|i| {
+            let st = ins[i].as_ref()?;
+            let regs: Vec<u8> = (0..nregs)
+                .filter(|&q| st.regs[q] == YES && live[i][q])
+                .map(|q| q as u8)
+                .collect();
+            (!regs.is_empty()).then_some((i, st.shape, regs))
+        })
+        .collect();
+    let rewrites = rewrites
+        .into_iter()
+        .map(|(i, (k, load))| (i, k, load))
+        .collect::<Vec<_>>();
+    (!rewrites.is_empty() && ins[a].is_some() && out.nregs + slots <= 256).then_some(Replacement {
+        rewrites,
+        slots,
+        live,
+    })
+}
+
+/// Whether `insn` reads `acc` (conservatively: unless it is known not to).
+fn reads_acc(insn: &Insn) -> bool {
+    !matches!(
+        insn.op,
+        Op::Ldar
+            | Op::LdaSmi
+            | Op::LdaUndefined
+            | Op::LdaNull
+            | Op::LdaTrue
+            | Op::LdaFalse
+            | Op::LdaGlobal
+            | Op::LdaConstant
+            | Op::Jump
+            | Op::Nop
+            | Op::GetNamed
+            | Op::CreateArray
+            | Op::CreateObject
+            | Op::CreateClosure
+            | Op::Call
+            | Op::CallUndefined
+            | Op::Construct
+    )
+}
+
+fn apply_replacement(out: &mut Lowered, a: usize, plan: Replacement) {
+    let base = out.nregs;
+    out.nregs += plan.slots;
+    let h = |slot: usize| (base + slot) as u8;
+    for (i, slot, load) in plan.rewrites {
+        let j = out.insns[i];
+        out.insns[i] = synth(
+            if load { Op::Ldar } else { Op::Star },
+            h(slot),
+            j.frame as usize,
+            j.pc,
+        );
+        out.props[i] = Prop::None;
+    }
+    // The allocation: only its checks (`acc` = `undefined`).
+    out.insns[a].native = 3;
+    for (i, shape, regs) in plan.live {
+        let fields = (0..unsafe { (*shape).keys.len() }).map(h).collect();
+        out.mats.entry(i).or_default().push(Rc::new(Mat {
+            shape,
+            fields,
+            regs,
+        }));
+    }
+}
+
+/// A global loaded again in straight-line code, its earlier load still in
+/// a register: `Ldar` that register, a copy (see [`TypeState::same`]), so
+/// a shape guard on one holds for both. Not past a jump target, a store
+/// to a global, a call not inlined (which may store one), a bail, or a
+/// property store that might be to the global object (its receiver's
+/// shape unknown, or the global's).
+fn reuse_global_loads(out: &mut Lowered) {
+    let n = out.insns.len();
+    let mut target = vec![false; n + 1];
+    for i in out.insns.iter().filter(|i| i.jumps()) {
+        if i.target <= n {
+            target[i.target] = true;
+        }
+    }
+    let global_shape = out
+        .fbs
+        .first()
+        .map_or(0, |f| unsafe { (*f.global).shape } as u64);
+    let may_store_global = |p: &Prop| match *p {
+        Prop::Own { shape, .. } | Prop::Oop { shape, .. } | Prop::Transition { shape, .. } => {
+            shape == global_shape
+        }
+        Prop::Poly { n, cases } => cases[..n as usize].iter().any(|c| c.shape == global_shape),
+        _ => true,
+    };
+    // (name, register holding its value), and the name `acc` holds.
+    let mut known: Vec<(Atom, u8)> = Vec::new();
+    let mut acc: Option<Atom> = None;
+    for k in 0..n {
+        if target[k] {
+            known.clear();
+            acc = None;
+        }
+        let i = out.insns[k];
+        if i.bail {
+            known.clear();
+            acc = None;
+            continue;
+        }
+        match i.op {
+            Op::LdaGlobal => {
+                let name = out.fbs[i.frame as usize].name(&i);
+                if let Some(&(_, r)) = known.iter().find(|(m, _)| *m == name) {
+                    out.insns[k] = synth(Op::Ldar, r, i.frame as usize, i.pc);
+                    out.props[k] = Prop::None;
+                }
+                acc = Some(name);
+            }
+            Op::Star => {
+                known.retain(|&(_, r)| r != i.reg);
+                if let Some(name) = acc {
+                    known.push((name, i.reg));
+                }
+            }
+            Op::Ldar => acc = known.iter().find(|&&(_, r)| r == i.reg).map(|&(m, _)| m),
+            Op::StaGlobal | Op::Call | Op::CallUndefined | Op::Construct => {
+                known.clear();
+                acc = None;
+            }
+            Op::SetNamed | Op::SetKeyed
+                if may_store_global(&out.props[k]) && i.op == Op::SetNamed =>
+            {
+                known.clear();
+                acc = None;
+            }
+            _ => {
+                if writes_acc(&i).is_some() {
+                    acc = None;
+                }
+            }
+        }
+    }
+}
+
+/// `LdaTrue` or `LdaFalse` followed by a jump on `acc`'s truth (an inlined
+/// `return true`, say, tested by the caller): the jump is taken or not
+/// whatever happens, so it becomes `Jump` or nothing. Not where control
+/// also arrives from elsewhere (a jump target, which loop entries are).
+fn fold_constant_tests(insns: &mut [Insn]) {
+    let mut target = vec![false; insns.len()];
+    for i in insns.iter().filter(|i| i.jumps()) {
+        if let Some(t) = target.get_mut(i.target) {
+            *t = true;
+        }
+    }
+    for k in 1..insns.len() {
+        let (c, j) = (insns[k - 1], insns[k]);
+        let value = match c.op {
+            Op::LdaTrue => true,
+            Op::LdaFalse => false,
+            _ => continue,
+        };
+        let on = match j.op {
+            Op::JumpIfToBooleanTrue | Op::JumpIfTrue => true,
+            Op::JumpIfToBooleanFalse | Op::JumpIfFalse => false,
+            _ => continue,
+        };
+        if c.bail || j.bail || target[k] {
+            continue;
+        }
+        insns[k].op = if value == on { Op::Jump } else { Op::Nop };
+    }
 }
 
 impl Lowering<'_> {
@@ -5775,12 +6441,56 @@ impl Lowering<'_> {
                 | Op::GetNamed
                 | Op::SetNamed
                 | Op::GetKeyed => i.reg = renamed(i.reg),
-                Op::Mov | Op::Call | Op::CallUndefined | Op::Construct => {
+                Op::Mov | Op::Call | Op::CallUndefined | Op::Construct | Op::SetKeyed => {
                     (i.reg, i.reg2) = (renamed(i.reg), renamed(i.reg2))
                 }
                 _ => {}
             }
             let origin = (code_key, i.pc);
+            // `f.call(that, …args)` (see `vm::VIA_CALL`): a guard that the
+            // callee is `Function.prototype.call`, then a call of `f`, the
+            // window one register on.
+            if i.op == Op::Call && !i.bail {
+                let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
+                if ic.loc == crate::vm::VIA_CALL && !ic.holder.is_null() {
+                    let call = unsafe { (*self.state.vm).function_call_fn };
+                    if !self.proven_callee(frame, i.reg, call) {
+                        let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
+                        guard.guard = call as u64;
+                        self.push(guard, Prop::None);
+                    }
+                    i.reg = i.reg2;
+                    i.reg2 += 1;
+                    if i.imm == 0 {
+                        i.op = Op::CallUndefined;
+                    } else {
+                        i.imm -= 1;
+                    }
+                }
+            }
+            // `a.push(v)` and `a.pop()`, when that is all the call has
+            // called: a guard on the callee, then inline (see `array_push`
+            // in the stencils). Not after exits there (a receiver not an
+            // array).
+            if i.op == Op::Call && !i.bail {
+                let ic = self.out.fbs[frame].ic(i.ic as usize);
+                let (fo, other) = unsafe { ((*ic).holder, (*ic.add(1)).holder) };
+                let vm = unsafe { &*self.state.vm };
+                let native = match (fo, i.imm) {
+                    (f, 1) if f == vm.array_push_fn => 1,
+                    (f, 0) if f == vm.array_pop_fn => 2,
+                    _ => 0,
+                };
+                let exits = self.state.callee_exits.get(&origin).copied().unwrap_or(0);
+                if native != 0 && other.is_null() && exits < MAX_PROPERTY_EXITS {
+                    let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
+                    guard.guard = fo as u64;
+                    self.push(guard, Prop::None);
+                    i.native = native;
+                    self.push(i, Prop::None);
+                    continue;
+                }
+            }
             match i.op {
                 _ if i.bail => {
                     self.push(i, Prop::None);
@@ -5829,36 +6539,13 @@ impl Lowering<'_> {
                     let callee = self.inline_target(frame, &i, depth).unwrap();
                     self.inline(frame, &i, callee, depth);
                 }
+                Op::Construct if self.inline_ctor(frame, &i, depth).is_some() => {
+                    let callee = self.inline_ctor(frame, &i, depth).unwrap();
+                    self.inline_construct(frame, &i, callee, depth);
+                }
                 Op::Call | Op::CallUndefined | Op::Construct => {
-                    let code = unsafe { &*f.code };
                     let vm = self.state.vm;
-                    let callee_frame = base + code.nregs as usize + interp::HEADER;
-                    let mut site = CallSite {
-                        entry: 0,
-                        closure: 0,
-                        f_off: 8 * i.reg as u64,
-                        end_off: 0,
-                        stack_end: unsafe { (*vm).stack_end } as u64,
-                        native_limit: unsafe { &raw const (*vm).native_limit },
-                        this_shape: 0,
-                        ctor: None,
-                        vm,
-                        op: i.op,
-                        f: i.reg as usize,
-                        w: i.reg2 as usize,
-                        argc: i.imm as usize,
-                        frame: callee_frame,
-                        nparams: 0,
-                        exits: 0,
-                        callee: std::ptr::null(),
-                        cached: std::ptr::null(),
-                        target: None,
-                        self_call: false,
-                        self_code: std::ptr::null(),
-                        bound: false,
-                        claim: None,
-                        pending: false,
-                    };
+                    let mut site = self.call_site(frame, &i);
                     let direct =
                         self.direct_target(frame, &i, &mut site) && i.imm as u32 <= site.nparams;
                     let p = Prop::Call {
@@ -5916,6 +6603,63 @@ impl Lowering<'_> {
     /// arguments' types, or for this function `JitCode::compile` binds the
     /// version it compiles, if they fit it. Notes the function the cache
     /// names in `site.cached` either way, natives included.
+    /// A call site for call `i` of frame `frame`, its callee unknown yet.
+    fn call_site(&self, frame: usize, i: &Insn) -> CallSite {
+        let f = self.out.frames[frame];
+        let vm = self.state.vm;
+        CallSite {
+            entry: 0,
+            closure: 0,
+            f_off: 8 * i.reg as u64,
+            end_off: 0,
+            stack_end: unsafe { (*vm).stack_end } as u64,
+            native_limit: unsafe { &raw const (*vm).native_limit },
+            this_shape: 0,
+            ctor: None,
+            vm,
+            op: i.op,
+            f: i.reg as usize,
+            w: i.reg2 as usize,
+            argc: i.imm as usize,
+            frame: f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER,
+            nparams: 0,
+            exits: 0,
+            callee: std::ptr::null(),
+            cached: std::ptr::null(),
+            target: None,
+            self_call: false,
+            self_code: std::ptr::null(),
+            bound: false,
+            claim: None,
+            pending: false,
+        }
+    }
+
+    /// How `new fo` allocates `this` now (see [`CtorSite`]), and the shape
+    /// it gives it.
+    fn ctor_site(&mut self, fo: *mut Object) -> (Box<CtorSite>, *const Shape) {
+        unsafe {
+            let vm = &mut *self.state.vm;
+            let callee = (*fo).code;
+            let shape = vm.ctor_root(fo);
+            let proto_at = Object::inline(fo, 0).cast::<u64>();
+            let cap_at = (*callee).ctor_capacity.as_ptr();
+            let site = Box::new(CtorSite {
+                heap: vm.heap.bump(),
+                proto_at,
+                proto: *proto_at,
+                cap_at,
+                cap: *cap_at as u64,
+                slots: (*shape).capacity.get() as u64,
+                // Set when the frame is placed.
+                this_off: 0,
+                done_shape: 0,
+                header: crate::object::object_header(&*shape),
+            });
+            (site, shape)
+        }
+    }
+
     fn direct_target(&mut self, frame: usize, i: &Insn, site: &mut CallSite) -> bool {
         use crate::object::Class;
         let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
@@ -5934,25 +6678,9 @@ impl Lowering<'_> {
         // A constructor's `this` is allocated by the call
         // (`toi_rt_construct`), with the shape its root has now.
         if i.op == Op::Construct {
-            unsafe {
-                let vm = &mut *self.state.vm;
-                let shape = vm.ctor_root(fo);
-                site.this_shape = shape as u64;
-                let proto_at = Object::inline(fo, 0).cast::<u64>();
-                let cap_at = (*callee).ctor_capacity.as_ptr();
-                site.ctor = Some(Box::new(CtorSite {
-                    heap: vm.heap.bump(),
-                    proto_at,
-                    proto: *proto_at,
-                    cap_at,
-                    cap: *cap_at as u64,
-                    slots: (*shape).capacity.get() as u64,
-                    // Set when the frame is placed.
-                    this_off: 0,
-                    done_shape: 0,
-                    header: crate::object::object_header(&*shape),
-                }));
-            }
+            let (ctor, shape) = self.ctor_site(fo);
+            site.this_shape = shape as u64;
+            site.ctor = Some(ctor);
         }
         site.self_call = callee == self.state.root && i.op != Op::Construct;
         site.closure = fo as u64;
@@ -6050,7 +6778,8 @@ impl Lowering<'_> {
     /// The function to inline for call `i` of frame `frame`, if any.
     fn inline_target(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
         let f = self.out.frames[frame];
-        if depth >= MAX_INLINE_DEPTH
+        let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
+        if (depth >= MAX_INLINE_DEPTH && !self.small_leaf(ic.holder))
             || self.out.frames.len() >= 255
             || self
                 .state
@@ -6060,8 +6789,18 @@ impl Lowering<'_> {
         {
             return None;
         }
-        let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
         self.inlinable(frame, ic.holder).then_some(ic.holder)
+    }
+
+    /// Whether `fo` is a bytecode function of at most [`MAX_LEAF_INSNS`]
+    /// instructions that calls nothing: inlined past [`MAX_INLINE_DEPTH`],
+    /// as it costs little code and inlines nothing further.
+    fn small_leaf(&mut self, fo: *mut Object) -> bool {
+        if fo.is_null() || unsafe { (*fo).class } != crate::object::Class::Function {
+            return false;
+        }
+        let d = self.decoded(unsafe { (*fo).code });
+        d.0.len() <= MAX_LEAF_INSNS && !d.0.iter().any(|j| j.is_call())
     }
 
     /// The functions to inline for call `i` of frame `frame` when its
@@ -6234,8 +6973,55 @@ impl Lowering<'_> {
         }
     }
 
+    /// The constructor to inline for `new` `i` of frame `frame`, if any: as
+    /// for a call ([`Lowering::inline_target`]), and one whose objects
+    /// have settled (see `Code::ctor_settled`) on one shape that
+    /// `construct_done` has nothing to do for (see `toi_rt_construct_done`),
+    /// and that returns nothing (`this` is the result).
+    fn inline_ctor(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
+        let fo = self.inline_target(frame, i, depth)?;
+        let code = unsafe { &*(*fo).code };
+        let seen = code.ctor_result.get();
+        let fits = !seen.is_null()
+            && seen != crate::vm::MANY_SHAPES
+            && unsafe { (*seen).keys.len() } as u32 <= code.ctor_capacity.get();
+        if !code.ctor_settled.get() || !fits {
+            return None;
+        }
+        let d = self.decoded(code);
+        let only_undefined = d.0.iter().enumerate().all(|(k, j)| {
+            j.op != Op::Return || (k > 0 && d.0[k - 1].op == Op::LdaUndefined && !d.0[k - 1].bail)
+        });
+        only_undefined.then_some(fo)
+    }
+
+    /// `new` `i` of frame `frame` inlined: the guard on the constructor,
+    /// `this` allocated (`alloc_this`, through the runtime if the heap's
+    /// chunk is full; leaving before the `new` if the constructor's
+    /// prototype or capacity changed, which would change its shape) into
+    /// the callee's `r0`, the arguments, the body, then `this`.
+    /// `construct_done` is left out: the objects have the shape it has
+    /// nothing to do for (see [`Lowering::inline_ctor`]); one that ends
+    /// with another only misses growing the capacity for later objects.
+    fn inline_construct(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) {
+        let f = self.out.frames[frame];
+        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let mut site = self.call_site(frame, i);
+        let (ctor, shape) = self.ctor_site(fo);
+        site.ctor = Some(ctor);
+        site.this_shape = shape as u64;
+        site.closure = fo as u64;
+        site.callee = unsafe { (*fo).code };
+        let site = Box::new(std::cell::UnsafeCell::new(site));
+        let alloc = site.get() as u64;
+        self.out.sites.push(site);
+        let (_, rets) = self.inline_case(frame, i, fo, depth, false, None, alloc);
+        self.return_past(rets);
+        self.push(synth(Op::Ldar, base as u8, frame, i.pc), Prop::None);
+    }
+
     fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) {
-        let (_, rets) = self.inline_case(frame, i, fo, depth, false, None);
+        let (_, rets) = self.inline_case(frame, i, fo, depth, false, None, 0);
         self.return_past(rets);
     }
 
@@ -6295,7 +7081,7 @@ impl Lowering<'_> {
         let mut rets = Vec::new();
         for (k, &fo) in fos.iter().enumerate() {
             let last = k + 1 == fos.len();
-            let (guard, r) = self.inline_case(frame, i, fo, depth, !last, Some(shapes[k]));
+            let (guard, r) = self.inline_case(frame, i, fo, depth, !last, Some(shapes[k]), 0);
             if let Some(pc) = fused {
                 let g = &mut self.out.insns[guard];
                 (g.reg, g.guard, g.on_shape, g.pc) = (i.reg2, shapes[k], true, pc);
@@ -6397,6 +7183,32 @@ impl Lowering<'_> {
         live.get(k + 1).is_some_and(|l| !l[r as usize])
     }
 
+    /// Whether register `r` of frame `frame` holds `fo` for sure: its last
+    /// write was the result of a load from a prototype's slot (whose shape
+    /// guard passed) that holds `fo`. A prototype's slots keep their values
+    /// while the prototype epoch the code is compiled under holds (see
+    /// `Vm::store_field`), which code checks at entry and after calls.
+    fn proven_callee(&self, frame: usize, r: u8, fo: *mut Object) -> bool {
+        let insns = &self.out.insns;
+        let Some(k) = insns
+            .iter()
+            .rposition(|j| j.frame as usize == frame && j.op == Op::Star && j.reg == r)
+        else {
+            return false;
+        };
+        let Some(get) = k.checked_sub(1) else {
+            return false;
+        };
+        let g = insns[get];
+        let Prop::Proto { addr, .. } = self.out.props[get] else {
+            return false;
+        };
+        g.op == Op::GetNamed
+            && g.frame as usize == frame
+            && !g.bail
+            && unsafe { *(addr as *const Value) } == crate::object::object_value(fo)
+    }
+
     /// Point the jumps `rets` (inlined `Return`s) past the inlined code,
     /// which ends here; a last one falling through to it needs no jump.
     fn return_past(&mut self, rets: Vec<usize>) {
@@ -6436,7 +7248,10 @@ impl Lowering<'_> {
             Op::Call => (Some(w), w as usize + 1),
             _ => (None, w as usize),
         };
-        self.mov(frame, i.pc, this, base as u8);
+        // `new` allocated `this` already.
+        if i.op != Op::Construct {
+            self.mov(frame, i.pc, this, base as u8);
+        }
         for p in 0..nparams {
             self.mov(
                 frame,
@@ -6453,6 +7268,7 @@ impl Lowering<'_> {
     /// not `hoisted` before, which gives the receiver's shape the callee
     /// implies, or 0), its instructions. Returns the
     /// jumps its `Return`s became, still to point past it.
+    #[allow(clippy::too_many_arguments)]
     fn inline_case(
         &mut self,
         frame: usize,
@@ -6461,6 +7277,7 @@ impl Lowering<'_> {
         depth: usize,
         next_case: bool,
         hoisted: Option<u64>,
+        alloc: u64,
     ) -> (usize, Vec<usize>) {
         let f = self.out.frames[frame];
         let callee = unsafe { (*fo).code };
@@ -6468,6 +7285,7 @@ impl Lowering<'_> {
         let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
         let id = self.out.frames.len();
         self.out.frames.push(InlineFrame {
+            construct: i.op == Op::Construct,
             code: callee,
             base,
             parent: frame,
@@ -6479,7 +7297,18 @@ impl Lowering<'_> {
         let mut guard = synth(Op::Nop, i.reg, frame, pc);
         guard.guard = fo as u64;
         guard.next_case = next_case;
+        // A callee loaded from a prototype holding it needs no check.
+        if !next_case && self.proven_callee(frame, i.reg, fo) {
+            guard.guard = 0;
+        }
         let guard = self.push(guard, Prop::None);
+        // `new`: `this`, allocated (see `Lowering::inline_construct`).
+        if alloc != 0 {
+            let mut a = synth(Op::Nop, i.reg, frame, pc);
+            (a.guard, a.alloc) = (fo as u64, alloc);
+            self.push(a, Prop::None);
+            self.push(synth(Op::Star, base as u8, frame, pc), Prop::None);
+        }
         match hoisted {
             None => self.arg_moves(frame, i, c.nparams as usize),
             // The receiver's shape, if this callee implies it: in the
@@ -6493,8 +7322,19 @@ impl Lowering<'_> {
                 }
             }
         }
+        // Locals start `undefined` only if the callee may read them before
+        // writing them (`entry_live`), which also covers the interpreter
+        // after an exit in it: it runs the same bytecode from there.
+        let live = self
+            .state
+            .entry_live
+            .entry(callee)
+            .or_insert_with(|| Rc::new(entry_live(&c.bytecode, c.nregs as usize)))
+            .clone();
         for r in 1 + c.nparams as usize..c.nregs as usize {
-            self.mov(frame, pc, None, (base + r) as u8);
+            if live[r] {
+                self.mov(frame, pc, None, (base + r) as u8);
+            }
         }
         self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
         (guard, self.emit_frame(id, depth + 1))
@@ -6559,6 +7399,7 @@ impl JitFunction {
             fbs: Vec::new(),
             snap: Rc::new(Snapshot {
                 insns: Vec::new(),
+                mats: HashMap::default(),
                 frames: Vec::new(),
                 frame_regs: Vec::new(),
                 sites: Vec::new(),
@@ -6673,6 +7514,7 @@ impl JitFunction {
                 .collect();
             vm.snap = Rc::new(Snapshot {
                 insns: low.insns,
+                mats: low.mats,
                 frames: low.frames,
                 frame_regs,
                 sites: low.sites,
@@ -6737,6 +7579,7 @@ impl JitFunction {
                 sites: &vm.snap.sites,
                 frames: &vm.snap.frame_regs,
                 root: vm.root,
+                mats: Some(&vm.snap.mats),
             },
         );
         code.snap = Some(vm.snap.clone());
@@ -6841,7 +7684,7 @@ impl JitFunction {
             if *n >= MAX_BAIL_EXITS {
                 vm.no_entry.insert(pc);
             }
-        } else if insn.guard != 0 {
+        } else if insn.guard != 0 || insn.native != 0 {
             *vm.callee_exits.entry(origin).or_insert(0) += 1;
         } else if insn.is_property() {
             *vm.property_exits.entry(origin).or_insert(0) += 1;
@@ -6927,6 +7770,8 @@ impl JitFunction {
                 .zip(live.iter())
                 .map(|(&v, &l)| ty(v, l))
                 .collect(),
+            same: Vec::new(),
+            acc_same: None,
         }
     }
 
@@ -6988,6 +7833,7 @@ impl JitFunction {
                         Some(vm) => &vm.snap.frame_regs,
                         None => &[],
                     };
+                    let mats = self.vm.as_ref().map(|vm| &vm.snap.mats);
                     JitCode::compile(
                         &self.insns,
                         entry,
@@ -7002,6 +7848,7 @@ impl JitFunction {
                             sites,
                             frames,
                             root,
+                            mats,
                         },
                     )
                 };
@@ -7240,7 +8087,7 @@ unsafe fn materialize(
                 fr.code,
                 (*parent.code).bytecode.as_ptr().add(fr.ret_pc),
                 regs.add(parent.base),
-                0,
+                if fr.construct { interp::CONSTRUCT } else { 0 },
             );
         }
         g = fr.parent;
@@ -7456,6 +8303,43 @@ extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
             crate::vm::Vm::construct_done(&*(*s).callee, o);
             this
         }
+    }
+}
+
+/// `materialize` stencils, in an exit: allocate the object `mat` (a
+/// [`Mat`]) describes, its fields from the frame `regs` (spilled), and
+/// put it in its registers.
+extern "C" fn toi_rt_materialize(regs: Value, mat: Value) -> u64 {
+    unsafe {
+        let m = &*(mat.to_bits() as *const Mat);
+        let regs = regs.to_bits() as *mut Value;
+        let vm = &mut *crate::interp::current_vm();
+        let o = vm.heap.alloc_object(&*m.shape);
+        for (k, &r) in m.fields.iter().enumerate() {
+            vm.store_field(o, k as u32, *regs.add(r as usize));
+        }
+        for &r in &m.regs {
+            *regs.add(r as usize) = crate::object::object_value(o);
+        }
+        0
+    }
+}
+
+/// `array_push` stencils, when the value doesn't fit the elements' type or
+/// the elements are full: `Array.prototype.push` of `v` onto `a` (an
+/// array), its new length.
+extern "C" fn toi_rt_array_push(a: Value, v: Value) -> Value {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    crate::vm::array_push(vm, a, &[v]).expect("a push onto an array")
+}
+
+/// `alloc_this` stencils (inlined `new`), when the heap's chunk is full:
+/// `this` for the constructor of `site` (a `CallSite`), allocated by the
+/// VM, its shape the site's (`alloc_this` checked what it depends on).
+extern "C" fn toi_rt_alloc_this(site: Value, _: Value) -> Value {
+    unsafe {
+        let s = &*(site.to_bits() as *const CallSite);
+        (*s.vm).construct_this(s.closure as *mut Object)
     }
 }
 

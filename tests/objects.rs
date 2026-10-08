@@ -1524,13 +1524,9 @@ end
     // Twice fib(0) + … + fib(14) = 2 × 986, plus 30.
     let (v, s) = jit(src);
     assert_eq!(v, "2002");
-    // With their results predicted: `new Box` (called directly) and `push`
-    // (through the runtime).
-    assert!(
-        s.iter().any(|n| n == "construct_direct+check_acc_shape"),
-        "{s:?}"
-    );
-    assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
+    // `new Box` inlined (its `this` allocated in the stencil), and `push`.
+    assert!(s.iter().any(|n| n == "alloc_this"), "{s:?}");
+    assert!(s.iter().any(|n| n == "array_push"), "{s:?}");
 }
 
 /// A callee (through the runtime: its call site is first reached after
@@ -2164,36 +2160,39 @@ end
     )
 }
 
-/// `new Box(i)` (a direct call) is predicted to give an object of the shape
-/// `Box`'s objects have had, so loading `v` needs no guard, and `push`
-/// (through the runtime) an int32, as natives declare, so the add is on
-/// int32s. `Box` itself is compiled knowing `this`'s shape: storing `v`
-/// is a transition without a guard.
+/// `new Box(i)` (inlined) gives an object only read from: not allocated,
+/// its `v` a register. `push` (inline) gives an int32,
+/// so the add is on int32s. Pushing two values goes through the runtime,
+/// whose result is predicted from what the native declares, an int32.
 #[test]
 fn runtime_call_results_are_predicted() {
     let src = runtime_calls_program("        Ldar r1\n        SetNamed r0, v\n");
     // Σ i + Σ (i + 1), the array's length after each push.
     let (v, s) = jit(&src);
     assert_eq!(v, (300 * 300).to_string());
-    assert!(
-        s.iter().any(|n| n == "construct_direct+check_acc_shape"),
-        "{s:?}"
-    );
-    assert!(s.iter().any(|n| n.starts_with("get_own_nc_")), "{s:?}");
-    assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
+    // `new Box` inlined, its object (only read from) never allocated.
+    assert!(s.iter().any(|n| n == "ctor_check"), "{s:?}");
+    assert!(!s.iter().any(|n| n == "alloc_this"), "{s:?}");
+    assert!(s.iter().any(|n| n == "array_push"), "{s:?}");
     assert!(
         s.iter().filter(|n| n.starts_with("add_ii_")).count() >= 2,
         "{s:?}"
     );
+    let two = src.replace(
+        "        Call r6, r7, 1\n",
+        "        Ldar r1\n        Star r9\n        Call r6, r7, 2\n",
+    );
+    // Σ i + Σ 2 (i + 1).
+    let (v, s) = jit(&two);
+    assert_eq!(v, (299 * 300 / 2 + 300 * 301).to_string());
+    assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
     let m = toi::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(2);
     vm.run(&m).unwrap();
-    let s = vm
-        .jit_stencils("Box")
-        .expect("Box compiled for the direct call");
-    assert!(s.iter().any(|n| n.starts_with("set_tr_nc_")), "{s:?}");
-    assert_eq!(vm.jit_bound_direct_calls("main"), 1);
+    let s = vm.jit_stencils("main").expect("main compiled");
+    assert!(s.iter().any(|n| n == "ctor_check"), "{s:?}");
+    assert_eq!(vm.jit_bound_direct_calls("main"), 0);
 }
 
 /// From k = 148, `Box`'s `k + 2147483500` overflows int32 and its code
@@ -2376,14 +2375,17 @@ end
     assert!(s.iter().any(|n| n.starts_with("construct_direct")), "{s:?}");
 }
 
-/// `new Point(i, i + 1, i + 2)` 20,000 times, allocated by the
-/// `construct_direct` stencil: each argument arrives as passed (the call
+/// `new Point(i, i + 1, i + 2)` 20,000 times, allocated in a stencil:
+/// `alloc_this` with `Point` inlined, `construct_direct` with it called
+/// (when it returns `this`). Each argument arrives as passed (the call
 /// must hand the callee the tag and exit cell registers, whatever the
 /// stencil used them for while allocating), and the objects cross heap
 /// chunks.
 #[test]
 fn direct_constructors_allocate_in_the_stencil() {
-    let src = "\
+    let src = |ret: &str| {
+        format!(
+            "\
 script
         CreateClosure Point
         StaGlobal Point
@@ -2401,10 +2403,12 @@ function Point(x, y, z)
         SetNamed r0, y
         Ldar r3
         SetNamed r0, z
-        LdaUndefined
+        {ret}
         Return
 end
-function main()                 ; r1 i, r2 total, r4-r8 temps
+function main()                 ; r1 i, r2 total, r4-r8 temps, r9 a holder
+        CreateArray
+        Star r9
         LdaSmi 0
         Star r1
         Star r2
@@ -2418,6 +2422,7 @@ loop:   LdaGlobal Point
         Star r7
         Construct r4, r5, 3
         Star r8
+        SetNamed r9, last       ; stored: allocated
         GetNamed r8, x
         Add r2
         Star r2
@@ -2437,11 +2442,19 @@ loop:   LdaGlobal Point
         Ldar r2
         Return
 end
-";
-    let (v, s) = jit(src);
-    // Σ i + (i + 1) + 2 (i + 2) = 2n(n - 1) + 5n.
-    assert_eq!(v, (2 * 20000 * 19999 + 5 * 20000).to_string());
-    assert!(s.iter().any(|n| n.starts_with("construct_direct")), "{s:?}");
+"
+        )
+    };
+    // Inlined (returning nothing), and called directly (returning `this`).
+    for (ret, stencil) in [
+        ("LdaUndefined", "alloc_this"),
+        ("Ldar r0", "construct_direct"),
+    ] {
+        let (v, s) = jit(&src(ret));
+        // Σ i + (i + 1) + 2 (i + 2) = 2n(n - 1) + 5n.
+        assert_eq!(v, (2 * 20000 * 19999 + 5 * 20000).to_string());
+        assert!(s.iter().any(|n| n.starts_with(stencil)), "{s:?}");
+    }
 }
 
 /// `P(a, b)` sets `this.x = a`, then `this.y = b + 1`, whose add
@@ -2534,6 +2547,7 @@ go:     LdaGlobal P
         Star r5
         Construct r3, r4, 2
         Star r6
+        SetNamed r7, last       ; stored: allocated
         GetNamed r6, x
         Add r2
         Star r2
@@ -2551,7 +2565,8 @@ end
     let mut vm = Vm::new();
     vm.set_tier_back_edges(2);
     vm.run(&m).unwrap();
-    let s = vm.jit_stencils("P").unwrap_or_default();
+    // `P` is inlined into `main`.
+    let s = vm.jit_stencils("main").unwrap_or_default();
     assert!(s.iter().any(|n| n.contains("+set_tr")), "{s:?}");
 }
 
@@ -2580,18 +2595,16 @@ l:      Ldar r1
         LdaUndefined
         Return
 end
-function main()                 ; r1 i, r2 total, r3 F, r6 a, r7 0
+function main()                 ; r1 i, r2 total, r3 F, r7 0
         CreateArray
         StaGlobal other
-        CreateArray
-        Star r6
         LdaSmi 0
         Star r7
         Star r1
         Star r2
 loop:   LdaGlobal F
+        Mov r7, r8              ; `acc` live: not compiled, compiled `main` exits here
         Star r3
-        SetKeyed r6, r7         ; not compiled: compiled `main` exits here
         Construct r3, r4, 0
         Star r5
         GetNamed r5, v
@@ -2695,34 +2708,46 @@ fn runtime_call_results_are_checked() {
 }
 
 /// `a` calls `b`, which calls `c`: in `main`'s loop, `a` and `b` are
-/// inlined, but not `c`, nested too deep. Small as it is, `c` is called
-/// directly (calls from the interpreter wouldn't enter its compiled code).
+/// inlined. `c`, nested too deep, is inlined too if it is a small leaf
+/// (`c(k) = k + 1`); one that calls further (`c` calls `d`) is called
+/// directly instead (calls from the interpreter wouldn't enter its
+/// compiled code).
 #[test]
-fn small_callees_past_the_inlining_depth_are_called_directly() {
+fn small_callees_past_the_inlining_depth() {
     let f = |name: &str, callee: &str| {
         format!(
             "function {name}(k)\n        LdaGlobal {callee}\n        Star r2\n        Ldar r1\n\
              \x20       Star r3\n        CallUndefined r2, r3, 1\n        AddSmi 1\n        Return\nend\n"
         )
     };
-    let src = format!(
-        "script\n        CreateClosure a\n        StaGlobal a\n        CreateClosure b\n\
-         \x20       StaGlobal b\n        CreateClosure c\n        StaGlobal c\n\
-         \x20       CreateClosure main\n        StaGlobal main\n        LdaGlobal main\n\
-         \x20       Star r1\n        CallUndefined r1, r2, 0\n        Return\nend\n\
-         {}{}function c(k)\n        Ldar r1\n        AddSmi 1\n        Return\nend\n\
-         function main()                 ; r1 i, r2 total, r3 a, r4 arg\n\
-         \x20       LdaSmi 0\n        Star r1\n        Star r2\n\
-         top:    LdaGlobal a\n        Star r3\n        Ldar r1\n        BitAndSmi 7\n\
-         \x20       Star r4\n        CallUndefined r3, r4, 1\n        Add r2\n        Star r2\n\
-         \x20       Ldar r1\n        Inc\n        Star r1\n        JumpIfLessSmi 500, top\n\
-         \x20       Ldar r2\n        Return\nend\n",
-        f("a", "b"),
-        f("b", "c")
-    );
-    let expected: u64 = (0..500u64).map(|i| (i & 7) + 3).sum();
-    let (v, s) = jit(&src);
-    assert_eq!(v, expected.to_string());
+    let leaf = |name: &str| {
+        format!("function {name}(k)\n        Ldar r1\n        AddSmi 1\n        Return\nend\n")
+    };
+    let program = |c: String, extra: u64| {
+        let src = format!(
+            "script\n        CreateClosure a\n        StaGlobal a\n        CreateClosure b\n\
+             \x20       StaGlobal b\n        CreateClosure c\n        StaGlobal c\n\
+             \x20       CreateClosure d\n        StaGlobal d\n\
+             \x20       CreateClosure main\n        StaGlobal main\n        LdaGlobal main\n\
+             \x20       Star r1\n        CallUndefined r1, r2, 0\n        Return\nend\n\
+             {}{}{c}{}function main()                 ; r1 i, r2 total, r3 a, r4 arg\n\
+             \x20       LdaSmi 0\n        Star r1\n        Star r2\n\
+             top:    LdaGlobal a\n        Star r3\n        Ldar r1\n        BitAndSmi 7\n\
+             \x20       Star r4\n        CallUndefined r3, r4, 1\n        Add r2\n        Star r2\n\
+             \x20       Ldar r1\n        Inc\n        Star r1\n        JumpIfLessSmi 500, top\n\
+             \x20       Ldar r2\n        Return\nend\n",
+            f("a", "b"),
+            f("b", "c"),
+            leaf("d")
+        );
+        let expected: u64 = (0..500u64).map(|i| (i & 7) + 3 + extra).sum();
+        let (v, s) = jit(&src);
+        assert_eq!(v, expected.to_string());
+        s
+    };
+    let s = program(leaf("c"), 0);
+    assert!(!s.iter().any(|n| n.starts_with("call")), "{s:?}");
+    let s = program(f("c", "d"), 1);
     assert!(s.iter().any(|n| n == "call_direct+check_acc_int"), "{s:?}");
 }
 

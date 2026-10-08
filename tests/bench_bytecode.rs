@@ -86,9 +86,12 @@ fn hot_property_loops_compile_without_repeated_guards() {
 
 #[test]
 fn loops_with_calls_compile_with_the_callee_inlined() {
-    for (name, want) in [
-        ("10-call-global-function.asm", "tlt_jf_"),
-        ("23-prototype-method.asm", "add_ii_"),
+    // A global function is checked (the global may change); a method from
+    // a prototype holding it needs no check (its slots are stable while
+    // the code's prototype epoch holds).
+    for (name, want, checked) in [
+        ("10-call-global-function.asm", "tlt_jf_", true),
+        ("23-prototype-method.asm", "add_ii_", false),
     ] {
         let mut vm = Vm::new();
         vm.run(&listing(name)).unwrap();
@@ -98,8 +101,9 @@ fn loops_with_calls_compile_with_the_callee_inlined() {
             .position(|n| n.starts_with("jlt_smi") || n.starts_with("incjlt"))
             .expect("the loop");
         let body = &s[..loop_end];
-        assert!(
+        assert_eq!(
             body.iter().any(|n| n.starts_with("check_callee_")),
+            checked,
             "{name}: {s:?}"
         );
         assert!(!body.iter().any(|n| n == "call"), "{name}: {s:?}");

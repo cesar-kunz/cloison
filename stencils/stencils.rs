@@ -144,6 +144,9 @@ unsafe extern "C" {
     fn toi_rt_enter();
     fn toi_rt_construct();
     fn toi_rt_construct_done();
+    fn toi_rt_alloc_this();
+    fn toi_rt_array_push();
+    fn toi_rt_materialize();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -544,6 +547,18 @@ fn int(v: Value) -> i32 {
     v.as_i32_unchecked()
 }
 
+/// Whether boxed `v` is a number (an int32 or a double).
+#[inline(always)]
+fn is_num(tag: NumberTag, v: Value) -> bool {
+    v.to_bits() & tag.to_bits() != 0
+}
+
+/// A boxed number's value.
+#[inline(always)]
+fn num(tag: NumberTag, v: Value) -> f64 {
+    if tag.is_int32(v) { int(v) as f64 } else { tag.decode_f64(v) }
+}
+
 // ---- Accumulator-only and control stencils ----
 
 stencil!("nop"; |s| { next!(s) });
@@ -800,6 +815,12 @@ macro_rules! boxed_location {
             slow!(s)
         }; |s| {
             let rhs = get!($loc, s);
+            // Two numbers (an int32 overflow, a double): their sum, as the
+            // runtime gives it, without calling it.
+            if is_num(s.tag, s.acc) && is_num(s.tag, rhs) {
+                s.acc = s.tag.encode_f64(num(s.tag, rhs) + num(s.tag, s.acc));
+                next!(s)
+            }
             s.acc = rt_add!(s, s.acc, rhs);
             next!(s)
         });
@@ -1687,7 +1708,16 @@ macro_rules! jump_to_boolean {
             }
             slow!(s)
         }; |s| {
-            if rt_to_boolean!(s, s.acc) == $want {
+            // Without the runtime: `undefined`, `null` and doubles.
+            let b = if s.acc == Value::UNDEFINED || s.acc == Value::NULL {
+                false
+            } else if s.acc.to_bits() & s.tag.to_bits() != 0 {
+                let d = s.tag.decode_f64(s.acc);
+                d < 0.0 || d > 0.0
+            } else {
+                rt_to_boolean!(s, s.acc)
+            };
+            if b == $want {
                 jump!(s)
             }
             next!(s)
@@ -2863,7 +2893,7 @@ stencil!("lda_constant_f"; |s| {
 
 // `CreateObject n`: bump the heap (its pointers' address is `imm64b`) for
 // the header and `n` slots, write the header of a plain, external object of
-// shape `imm64` and `undefined` slots. If the heap's chunk is full, the
+// shape `imm64` (not the slots). If the heap's chunk is full, the
 // runtime allocates (`toi_rt_create_object`). One stencil per count up to 8
 // (`create_object_<n>`, straight-line stores), then `create_object` with
 // the count in `imm`.
@@ -2882,11 +2912,8 @@ unsafe fn create_object(words: usize) -> Option<*mut u64> {
         for k in 2..6 {
             *p.add(k) = 0;
         }
-        // Volatile: vectorized, the loop would load its constant from a
-        // pool, outside the stencil.
-        for k in 6..words {
-            p.add(k).write_volatile(Value::UNDEFINED.to_bits());
-        }
+        // No slots: a slot is read only through a shape that has its
+        // property, and a store writes the slot no later than the shape.
         Some(p)
     }
 }
@@ -3105,6 +3132,30 @@ macro_rules! property_location {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             *(o as *mut u64) = imm64b();
             *at_imm(o) = s.acc;
+            next!(s)
+        });
+        // `o[k] = acc` (`acc` boxed, the key at `regs + imm`): an array,
+        // an int32 key within its length, a value its shape's elements'
+        // type (`Shape::elems_code`, at offset 0) fits; else leave before.
+        stencil!("set_keyed_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+            if !is_cell(s.tag, o) || *(o.to_bits() as *const u8).add(8) != 1 || !s.tag.is_int32(key) {
+                exit!(s)
+            }
+            let p = o.to_bits() as *mut u8;
+            let i = int(key) as u32;
+            let v = s.acc;
+            let fits = match **(p as *const *const u64) {
+                0 => true,
+                1 => s.tag.is_int32(v),
+                2 => v.to_bits() & s.tag.to_bits() != 0,
+                sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+            };
+            if i >= *(p.add(32) as *const u32) || !fits {
+                exit!(s)
+            }
+            *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
             next!(s)
         });
         // A polymorphic access (`jit::Prop::Poly`): a cell check, then a
@@ -3356,7 +3407,7 @@ stencil!("call_direct"; |s| {
 
 // `new`, as `call_direct`, allocating `this` itself: if what the
 // constructor's root shape depends on is unchanged and the heap's chunk
-// has room, bump the heap, write the header and `undefined` slots, put
+// has room, bump the heap, write the header, put
 // `this` in the callee's frame and enter. The result is the
 // constructor's, if an object, else `this`, after `construct_done`
 // (`toi_rt_construct_done`) unless that has nothing to do for its shape.
@@ -3378,13 +3429,11 @@ stencil!("construct_direct"; |s| {
             && (*heap)[1] as usize - p as usize >= 8 * words
         {
             (*heap)[0] = p.add(words);
+            // The header only: a slot is read only through a shape that
+            // has its property, and a store writes the slot no later than
+            // the shape (the heap's fresh memory is zero meanwhile).
             for k in 0..6 {
                 *p.add(k) = (*c).header[k];
-            }
-            // Volatile: vectorized, the loop would load its constant from
-            // a pool, outside the stencil.
-            for k in 6..words {
-                p.add(k).write_volatile(Value::UNDEFINED.to_bits());
             }
             *(base.add((*c).this_off as usize) as *mut u64) = p as u64;
             let v = Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)));
@@ -3405,6 +3454,105 @@ stencil!("construct_direct"; |s| {
     s.acc = r;
     if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
         exit!(s)
+    }
+    next!(s)
+});
+
+// An inlined `new` whose object scalar replacement doesn't allocate: what
+// its shape depends on (as `alloc_this` checks, the call site at `imm64`)
+// unchanged, else leave before the `new`; `acc` = `undefined`.
+stencil!("ctor_check"; |s| {
+    let c = (*(imm64() as *const DirectSite)).ctor;
+    if *(*c).proto_at != (*c).proto || *(*c).cap_at as u64 != (*c).cap {
+        exit!(s)
+    }
+    s.acc = Value::UNDEFINED;
+    next!(s)
+});
+
+// In an exit: allocate an object scalar replacement left unallocated
+// (`imm64` describes it, `jit::Mat`), from the spilled registers.
+stencil!("materialize"; |s| {
+    rt_call!(s, toi_rt_materialize, Value::from_bits(s.regs as u64), Value::from_bits(imm64()));
+    next!(s)
+});
+
+// `a.push(v)` (`a` and `v` at `regs + imm`, the call's window, spilled):
+// a store at the end and the length bumped, if `a` is an array (else leave
+// before the call) whose elements have room and whose shape's elements'
+// type (`Shape::elems_code`, at offset 0) `v` fits; otherwise the runtime
+// pushes (growing the elements, moving `a` to a more general shape).
+// `acc` = the new length, an int32.
+stencil!("array_push"; |s| {
+    let w = (s.regs as *const u8).add(imm() as usize) as *const Value;
+    let (a, v) = (*w, *w.add(1));
+    if !is_cell(s.tag, a) || *(a.to_bits() as *const u8).add(8) != 1 {
+        exit!(s)
+    }
+    let o = a.to_bits() as *mut u8;
+    let code = **(o as *const *const u64);
+    let len = *(o.add(32) as *const u32);
+    let fits = match code {
+        0 => true,
+        1 => s.tag.is_int32(v),
+        2 => v.to_bits() & s.tag.to_bits() != 0,
+        sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+    };
+    if fits && len < *(o.add(36) as *const u32) {
+        *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
+        *(o.add(32) as *mut u32) = len + 1;
+        s.acc = unboxed(len as i32 + 1);
+    } else {
+        s.acc = unboxed(int(Value::from_bits(rt_call!(s, toi_rt_array_push, a, v))));
+    }
+    next!(s)
+});
+
+// `a.pop()` (`a` at `regs + imm`): the last element, its slot made a hole
+// and the length one less, or `undefined` if empty (or a hole), if `a` is
+// an array; else leave before the call.
+stencil!("array_pop"; |s| {
+    let a = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+    if !is_cell(s.tag, a) || *(a.to_bits() as *const u8).add(8) != 1 {
+        exit!(s)
+    }
+    let o = a.to_bits() as *mut u8;
+    let len = *(o.add(32) as *const u32);
+    s.acc = Value::UNDEFINED;
+    if len != 0 {
+        let at = (*(o.add(24) as *const *mut Value)).add(len as usize - 1);
+        let v = *at;
+        *at = Value::EMPTY;
+        *(o.add(32) as *mut u32) = len - 1;
+        if v != Value::EMPTY {
+            s.acc = v;
+        }
+    }
+    next!(s)
+});
+
+// An inlined `new`: `acc` = `this`, allocated as `construct_direct` does
+// (`imm64` is the call site, whose `ctor` says how), through the runtime if
+// the heap's chunk is full; leave before the `new` if the constructor's
+// prototype or capacity changed (the inlined body assumes the shape).
+stencil!("alloc_this"; |s| {
+    let site = imm64() as *const DirectSite;
+    let c = (*site).ctor;
+    if *(*c).proto_at != (*c).proto || *(*c).cap_at as u64 != (*c).cap {
+        exit!(s)
+    }
+    let heap = (*c).heap;
+    let p = (*heap)[0];
+    let words = 6 + (*c).slots as usize;
+    if (*heap)[1] as usize - p as usize >= 8 * words {
+        (*heap)[0] = p.add(words);
+        // The header only, as in `construct_direct`.
+        for k in 0..6 {
+            *p.add(k) = (*c).header[k];
+        }
+        s.acc = Value::from_bits(p as u64);
+    } else {
+        s.acc = Value::from_bits(rt_call!(s, toi_rt_alloc_this, Value::from_bits(site as u64), s.acc));
     }
     next!(s)
 });

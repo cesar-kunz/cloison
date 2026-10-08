@@ -87,7 +87,7 @@ use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
-use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, Vm, string_units};
+use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, string_units};
 
 pub type Handler = extern "rust-preserve-none" fn(
     *const u8,
@@ -413,6 +413,15 @@ handlers! {
     }
 
     fn op_return(pc, acc, regs, tag) {
+        // The back edges this frame didn't use go back to the function
+        // (written only if it used some: most frames run no loop).
+        let code: *const Code = header(regs, CODE);
+        if !code.is_null() {
+            let left = (*regs.sub(BUDGET)).to_bits() as i64;
+            if left != (*code).loop_budget.get() {
+                (*code).loop_budget.set(left);
+            }
+        }
         if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
             acc = construct_result(regs, acc);
         }
@@ -1176,15 +1185,20 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_call(pc, acc, regs, tag) {
-        record_callee(pc, regs, tag);
         let w = reg(pc, 2, regs);
         // `f.call(that, …args)` with `f` a bytecode function: call `f`,
-        // with the window one register on.
+        // with the window one register on. The cache records `f`, for the
+        // JIT to call (`VIA_CALL`).
         let argc = *pc.add(3) as usize;
+        let ic = ic_at(regs, pc, 4);
         if let Some(fo) = unwrap_call(frame_vm(regs), *reg(pc, 1, regs), *w) {
+            note_callee(ic, fo);
+            (*ic).loc = VIA_CALL;
             let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
             enter!(fo, that, w.add(2), argc.saturating_sub(1), 0, Op::Call.size())
         }
+        record_callee(pc, regs, tag);
+        (*ic).loc = 0;
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
         let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), *w, args);
         next_or_throw!(Op::Call.size(), r)
@@ -2654,7 +2668,7 @@ unsafe fn push_frame(
         if new.add(n) > (*vm).stack_end {
             return std::ptr::null_mut();
         }
-        *new.sub(BUDGET) = Value::from_bits((*vm).frame_budget as u64);
+        *new.sub(BUDGET) = Value::from_bits((*callee).loop_budget.get() as u64);
         set_header(new, CODE, callee);
         set_header(new, ICS, (*callee).ics.as_ptr());
         set_header(new, VM, vm);
@@ -3013,7 +3027,7 @@ pub(crate) unsafe fn write_frame_header(
     flags: u64,
 ) {
     unsafe {
-        *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
+        *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
         set_header(regs, CODE, code);
         set_header(regs, ICS, (*code).ics.as_ptr());
         set_header(regs, VM, vm as *const Vm);

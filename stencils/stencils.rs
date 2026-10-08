@@ -3498,6 +3498,18 @@ stencil!("store_const_m"; |s| {
     next!(s)
 });
 
+// At a loop header of warm code (see `jit::Tier`): count down the
+// function's heat (an `i64` at `imm64`); when it runs out, leave at the
+// header to tier up.
+stencil!("tier_count"; |s| {
+    let heat = imm64() as *mut i64;
+    *heat -= 1;
+    if *heat < 0 {
+        exit!(s)
+    }
+    next!(s)
+});
+
 stencil!("guard_word"; |s| {
     if *(imm64() as *const u64) != imm64b() {
         exit!(s)

@@ -31,6 +31,7 @@ fn listings_match_their_benchmarks() {
         // default.
         for budget in [i64::MAX, 1, 2, 1000] {
             let mut vm = Vm::new();
+            vm.set_warm_tier(false);
             vm.set_tier_back_edges(budget);
             let v = vm
                 .run(&module)
@@ -59,6 +60,7 @@ fn hot_property_loops_compile_without_repeated_guards() {
     // shapes, holding int32 values: no access is guarded, and the
     // comparisons are on int32s.
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.run(&listing("34-chained-loads.asm")).unwrap();
     let s = vm.jit_stencils("main").expect("main's loop compiled");
     assert!(
@@ -71,6 +73,7 @@ fn hot_property_loops_compile_without_repeated_guards() {
     // 21: `vs` is known at entry, with elements of `v`'s shape, so `vs[i]`
     // needs no cell check and gives `v` a known shape: no guards at all.
     let mut vm = Vm::new();
+    vm.set_warm_tier(false);
     vm.run(&listing("21-monomorphic-get.asm")).unwrap();
     let s = vm.jit_stencils("main").expect("main's loop compiled");
     assert!(s.iter().any(|n| n.starts_with("get_keyed_i_nc_")), "{s:?}");
@@ -95,6 +98,7 @@ fn loops_with_calls_compile_with_the_callee_inlined() {
         ("23-prototype-method.asm", "add_ii_", false),
     ] {
         let mut vm = Vm::new();
+        vm.set_warm_tier(false);
         vm.run(&listing(name)).unwrap();
         let s = vm.jit_stencils("main").expect("main's loop compiled");
         let loop_end = s

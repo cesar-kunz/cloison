@@ -259,6 +259,9 @@ pub struct Vm {
     /// up into the JIT: `TOI_TIER` if set, `i64::MAX` (never) with
     /// `TOI_NO_JIT` set.
     pub(crate) frame_budget: i64,
+    /// Functions are compiled warm first (see `jit::Tier`): off by
+    /// default.
+    pub(crate) warm_tier: bool,
     /// Calls of a function before calls to it enter compiled code (see
     /// `Code::calls_left`); `i32::MAX` with `TOI_NO_JIT`.
     pub(crate) tier_calls: i32,
@@ -323,6 +326,7 @@ impl Vm {
             error: None,
             stack,
             stack_end,
+            warm_tier: std::env::var_os("TOI_WARM").is_some(),
             frame_budget: if std::env::var_os("TOI_NO_JIT").is_some() {
                 i64::MAX
             } else {
@@ -1429,6 +1433,13 @@ impl Vm {
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
         unsafe { crate::interp::run_script(self, code) }
+    }
+
+    /// Whether functions are compiled warm first, then hot, or hot from
+    /// the start (the default; `TOI_WARM` set: warm first). See
+    /// `jit::Tier`.
+    pub fn set_warm_tier(&mut self, on: bool) {
+        self.warm_tier = on;
     }
 
     /// Loop back edges a frame runs in the interpreter before tiering up

@@ -1101,7 +1101,7 @@ impl Insn {
     /// What an exit before it records: its frame and bytecode offset
     /// (below 2^22; see [`AFTER_CALL`] and [`BAD_RESULT`]).
     fn exit_record(&self) -> i32 {
-        debug_assert!(self.pc < 1 << 22);
+        debug_assert!(self.pc < 1 << 21);
         ((self.frame as u32) << 24 | self.pc as u32) as i32
     }
 
@@ -4601,6 +4601,10 @@ const BAD_RESULT: i32 = 1 << 22;
 /// loop (see [`hoist_guards`]).
 const HOISTED: i32 = BAD_RESULT;
 
+/// Set in an exit record by warm code's loop header when the function's
+/// heat ran out: compile it hot and continue there (see [`Tier`]).
+const TIER_UP: i32 = 1 << 21;
+
 /// Rounds of type inference that predict direct calls' results (see
 /// [`JitCode::compile`]).
 const MAX_RESULT_ROUNDS: u32 = 3;
@@ -4771,6 +4775,9 @@ struct VmCompile<'a> {
     mats: Option<&'a HashMap<usize, Vec<Rc<Mat>>>>,
     /// See [`Lowered::exit_live`].
     exit_live: Option<&'a [RegSet]>,
+    /// Warm code: the function's heat, which its loop headers count down
+    /// (see [`Tier`]); 0 for hot code.
+    heat: u64,
 }
 
 /// Compilation options.
@@ -4803,6 +4810,7 @@ impl JitCode {
             root,
             mats,
             exit_live,
+            heat,
         } = vm;
         let n = insns.len();
         let nregs = actual.regs.len();
@@ -5364,6 +5372,19 @@ impl JitCode {
             }
         };
 
+        // Warm code: the function's start and loop headers count down its
+        // heat.
+        let mut loop_head = vec![false; n];
+        if heat != 0 {
+            for (j, insn) in insns.iter().enumerate() {
+                if insn.jumps() && insn.target <= j && insns[insn.target].frame == 0 {
+                    loop_head[insn.target] = true;
+                }
+            }
+            if n > 0 && insns[0].pc == 0 {
+                loop_head[0] = true;
+            }
+        }
         let mut i = 0;
         while i < n {
             let (Some(s), Some(st)) = (&sel[i], &ins[i]) else {
@@ -5378,6 +5399,21 @@ impl JitCode {
                 hot.extend(edge_conversions(&prev.out, st, &homes));
             }
             label_piece[i] = hot.len();
+            if loop_head[i] {
+                // Run out: leave at the header, to continue in hot code.
+                let mut seq: Vec<Piece> = box_acc_piece(st.acc).into_iter().collect();
+                seq.extend(spills(&exit_homes(&homes, i)));
+                seq.push(Piece {
+                    imm: insn.exit_record() | TIER_UP,
+                    ..Piece::new("exit", 0)
+                });
+                exits.push((2 * n + i, seq));
+                hot.push(Piece {
+                    imm64: heat,
+                    exit: 2 * n + i,
+                    ..Piece::new("tier_count", 0)
+                });
+            }
 
             if s.base == "poly" {
                 let at = exit_homes(&homes, i);
@@ -6035,7 +6071,72 @@ struct VmState {
     /// left to the interpreter.
     bail_exits: HashMap<usize, u32>,
     no_entry: HashSet<usize>,
+    /// Warm or hot, and for warm, what is left before hot (its heat):
+    /// calls and loop back edges, counted down by warm code at its start
+    /// and its loop headers (`tier_count`), at a stable address.
+    tier: Tier,
+    heat: Box<i64>,
+    /// Whether the first compile chose the tier (see `inlining_pays`).
+    classified: bool,
 }
+
+impl VmState {
+    /// For compiling warm code, its heat's address; 0 when hot.
+    fn heat_addr(&self) -> u64 {
+        match self.tier {
+            Tier::Warm => &raw const *self.heat as u64,
+            Tier::Hot => 0,
+        }
+    }
+}
+
+/// Whether the function `code` calls or constructs, as its inline caches
+/// recorded, a function small enough to inline and without loops: what
+/// hot code does better than warm code (a method or constructor call costs
+/// tens of times what its inlined body does). Calls to functions that loop
+/// gain little from being inlined: warm code calls their code directly.
+unsafe fn inlining_pays(code: *const crate::vm::Code) -> bool {
+    let c = unsafe { &*code };
+    let ics: *const crate::vm::Ic = c.ics.as_ptr().cast();
+    decode(&c.bytecode, true).iter().any(|i| {
+        if i.bail || !matches!(i.op, Op::Call | Op::CallUndefined | Op::Construct) {
+            return false;
+        }
+        let fo = unsafe { (*ics.add(i.ic as usize * crate::vm::IC_WAYS)).holder };
+        if fo.is_null() || unsafe { (*fo).class } != crate::object::Class::Function {
+            return false;
+        }
+        let callee = decode(unsafe { &(*(*fo).code).bytecode }, true);
+        let loops = callee
+            .iter()
+            .enumerate()
+            .any(|(k, j)| j.jumps() && j.target <= k);
+        callee.len() <= MAX_INLINE_INSNS && !loops
+    })
+}
+
+/// How a function in VM frames is compiled, with the warm tier on
+/// (`Vm::set_warm_tier`, `TOI_WARM`; off by default). **Warm**: the
+/// function alone (no inlining; direct calls only into code compiled
+/// already), its start and loop headers counting down its heat
+/// ([`HOT_HEAT`], `tier_count`). **Hot**: everything (inlining, direct
+/// calls, constant folding and checks moved out of loops, scalar
+/// replacement, registers sharing slots). A function starts hot if
+/// inlining is what hot code would bring ([`inlining_pays`]), else warm;
+/// warm code running out of heat leaves at its start or a loop header, and
+/// the run continues there in hot code (`vm_run`).
+///
+/// Off by default: on the microbenchmarks every function ends hot, so a
+/// warm stage adds a compile and slower code before it (83 +6%, 30 +6%,
+/// 68 +4%; 91 -5%). It is for code that is called often enough to compile
+/// but never gets hot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tier {
+    Warm,
+    Hot,
+}
+
+const HOT_HEAT: i64 = 1_000;
 
 const MAX_PROPERTY_EXITS: u32 = 4;
 const MAX_BAIL_EXITS: u32 = 3;
@@ -6622,6 +6723,9 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
         }
     }
     scalar_replace(&mut cx.out);
+    if cx.state.tier == Tier::Warm {
+        return cx.out;
+    }
     for f in &cx.out.frames {
         cx.state.pc_live.entry(f.code).or_insert_with(|| {
             let (insns, live) = bytecode_live(unsafe { &(*f.code).bytecode });
@@ -7751,6 +7855,17 @@ impl Lowering<'_> {
             site.ctor = Some(ctor);
         }
         site.self_call = callee == self.state.root && i.op != Op::Construct;
+        // Warm code calls directly only code compiled already (itself
+        // included): binding compiles the callee, which a warm caller
+        // shouldn't pay for (its callees tier up on their own).
+        if self.state.tier == Tier::Warm && !site.self_call {
+            let compiled = unsafe { (*callee).jit.try_borrow() }
+                .ok()
+                .is_some_and(|f| f.as_ref().is_some_and(|f| !f.versions.is_empty()));
+            if !compiled {
+                return false;
+            }
+        }
         site.closure = fo as u64;
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
@@ -7845,6 +7960,9 @@ impl Lowering<'_> {
 
     /// The function to inline for call `i` of frame `frame`, if any.
     fn inline_target(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
+        if self.state.tier == Tier::Warm {
+            return None;
+        }
         let f = self.out.frames[frame];
         let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
         if (depth >= MAX_INLINE_DEPTH && !self.small_leaf(ic.holder))
@@ -8673,6 +8791,13 @@ impl JitFunction {
             callee_exits: HashMap::default(),
             bail_exits: HashMap::default(),
             no_entry: HashSet::default(),
+            tier: if unsafe { (*vm).warm_tier } {
+                Tier::Warm
+            } else {
+                Tier::Hot
+            },
+            heat: Box::new(HOT_HEAT),
+            classified: false,
         }));
         f
     }
@@ -8715,6 +8840,15 @@ impl JitFunction {
             let vm = self.vm.as_mut().unwrap();
             if vm.no_entry.contains(&pc) || self.stats.compiles >= MAX_VM_COMPILES {
                 return None;
+            }
+            // First compile: hot right away if inlining is what hot code
+            // would bring (see `inlining_pays`).
+            if vm.tier == Tier::Warm && !vm.classified {
+                vm.classified = true;
+                if unsafe { inlining_pays(vm.root) } {
+                    vm.tier = Tier::Hot;
+                    vm.dirty = true;
+                }
             }
             if vm.dirty || vm.epoch != epoch || vm.field_epoch != field_epoch {
                 self.refresh(epoch, field_epoch);
@@ -8843,6 +8977,7 @@ impl JitFunction {
                 root: vm.root,
                 mats: Some(&vm.snap.mats),
                 exit_live: Some(&vm.snap.exit_live),
+                heat: vm.heat_addr(),
             },
         );
         code.snap = Some(vm.snap.clone());
@@ -8897,8 +9032,20 @@ impl JitFunction {
         let after_call = record & AFTER_CALL as usize != 0;
         let bad_result = after_call && record & BAD_RESULT as usize != 0;
         let hoisted = !after_call && record & HOISTED as usize != 0;
-        let (frame, exit_pc) = (record >> 24, record & (BAD_RESULT as usize - 1));
+        let (frame, exit_pc) = (record >> 24, record & (TIER_UP as usize - 1));
         let snap = code.snap.as_ref().expect("a VM function's code");
+        // Warm code ran hot: compile hot (the caller enters it there).
+        if record & TIER_UP as usize != 0 {
+            // (Once: warm code still running, deeper in recursion say,
+            // leaves the same way.)
+            let vm = self.vm.as_mut().unwrap();
+            if vm.tier == Tier::Warm {
+                vm.tier = Tier::Hot;
+                vm.dirty = true;
+                self.versions.clear();
+            }
+            return (frame, exit_pc);
+        }
         let vm = self.vm.as_mut().unwrap();
         // The call is the instruction before the one an after-call exit
         // resumes at.
@@ -9133,6 +9280,7 @@ impl JitFunction {
                     };
                     let mats = self.vm.as_ref().map(|vm| &vm.snap.mats);
                     let exit_live = self.vm.as_ref().map(|vm| &vm.snap.exit_live[..]);
+                    let heat = self.vm.as_ref().map_or(0, |vm| vm.heat_addr());
                     JitCode::compile(
                         &self.insns,
                         entry,
@@ -9149,6 +9297,7 @@ impl JitFunction {
                             root,
                             mats,
                             exit_live,
+                            heat,
                         },
                     )
                 };
@@ -9328,35 +9477,54 @@ pub(crate) unsafe fn vm_run(
         return VmRun::Interpret;
     }
     let vm_ptr: *mut crate::vm::Vm = vm;
-    let prepared = {
-        let mut slot = code.jit.borrow_mut();
-        let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
-        let compiles = f.stats.compiles;
-        let prepared =
-            unsafe { f.vm_prepare(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch) };
-        // Debugging: `TOI_JIT_DUMP=<file>` writes the last compilation's
-        // hot code (`TOI_JIT_LOG`: see `JitCode::log`).
-        if f.stats.compiles != compiles
-            && let Some(c) = f.last_code()
-            && let Some(path) = std::env::var_os("TOI_JIT_DUMP")
-        {
-            std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
+    let (mut pc, mut acc) = (pc, acc);
+    // After a tier-up exit: where the interpreter resumes if hot code can't
+    // be entered there.
+    let mut left: Option<(Rc<JitCode>, usize)> = None;
+    loop {
+        let prepared = {
+            let mut slot = code.jit.borrow_mut();
+            let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
+            let compiles = f.stats.compiles;
+            let prepared = unsafe {
+                f.vm_prepare(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch)
+            };
+            // Debugging: `TOI_JIT_DUMP=<file>` writes the last compilation's
+            // hot code (`TOI_JIT_LOG`: see `JitCode::log`).
+            if f.stats.compiles != compiles
+                && let Some(c) = f.last_code()
+                && let Some(path) = std::env::var_os("TOI_JIT_DUMP")
+            {
+                std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
+            }
+            prepared
+        };
+        let Some((jit_code, entry_acc, nregs)) = prepared else {
+            return match left {
+                Some((code, frame)) => {
+                    VmRun::Exit(unsafe { materialize(vm, regs, &code, frame, pc, acc) })
+                }
+                None => VmRun::NotCompiled,
+            };
+        };
+        let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };
+        let (record, exit_acc) = match unsafe { jit_code.enter(entry_acc, regs_slice) } {
+            Outcome::Return(v) => return VmRun::Returned(v),
+            Outcome::Exit { pc: record, acc } => (record, acc),
+        };
+        let (frame, exit_pc) = {
+            let mut slot = code.jit.borrow_mut();
+            slot.as_mut().unwrap().vm_finish(&jit_code, pc, record)
+        };
+        // Warm code ran out of heat at a loop header: continue there in hot
+        // code (its registers are in the frame, as for the interpreter).
+        if record & TIER_UP as usize != 0 && frame == 0 {
+            (pc, acc) = (exit_pc, exit_acc);
+            left = Some((jit_code, frame));
+            continue;
         }
-        prepared
-    };
-    let Some((jit_code, acc, nregs)) = prepared else {
-        return VmRun::NotCompiled;
-    };
-    let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };
-    let (record, acc) = match unsafe { jit_code.enter(acc, regs_slice) } {
-        Outcome::Return(v) => return VmRun::Returned(v),
-        Outcome::Exit { pc: record, acc } => (record, acc),
-    };
-    let (frame, exit_pc) = {
-        let mut slot = code.jit.borrow_mut();
-        slot.as_mut().unwrap().vm_finish(&jit_code, pc, record)
-    };
-    VmRun::Exit(unsafe { materialize(vm, regs, &jit_code, frame, exit_pc, acc) })
+        return VmRun::Exit(unsafe { materialize(vm, regs, &jit_code, frame, exit_pc, exit_acc) });
+    }
 }
 
 /// Where the interpreter resumes after `code` (compiled for the frame
@@ -9717,8 +9885,12 @@ unsafe fn direct_exit(
         // lower its code again, and maybe compile another version (a call
         // that hadn't run has run now). An exit to make a call the native
         // stack had no room for says nothing about the callee's code.
+        // A warm callee tiering up says nothing either: the next call binds
+        // its hot code.
         if !vm.redo_call {
-            site.exits += 1;
+            if record & TIER_UP as u32 == 0 {
+                site.exits += 1;
+            }
             site.entry = 0;
             site.pending = site.claim.is_some() && site.exits < MAX_DIRECT_EXITS;
         }

@@ -208,6 +208,11 @@ pub struct Shape {
     /// an array that has no elements' type yet has `NO_ELEMENTS`, which no
     /// value fits, so its first store moves it to a typed shape.
     pub elems_code: u64,
+    /// The shape this one is a variant of by its elements' type alone (see
+    /// `Vm::elements_transition`), itself if none: shapes of one family
+    /// differ in nothing else, so they find the same property in the same
+    /// prototype. Compiled code reads it (`family_jeq`).
+    pub family: *const Shape,
     pub class: Class,
     /// An object, or null.
     pub proto: Value,
@@ -243,6 +248,7 @@ pub const DONT_ENUM: u8 = 2;
 pub const DONT_DELETE: u8 = 4;
 
 const _: () = assert!(std::mem::offset_of!(Shape, elems_code) == 0);
+const _: () = assert!(std::mem::offset_of!(Shape, family) == 8);
 
 impl Shape {
     pub fn lookup(&self, name: Atom) -> Option<u32> {
@@ -434,6 +440,7 @@ mod tests {
             fields: Vec::new(),
             elems: FieldType::None,
             elems_code: 0,
+            family: std::ptr::null(),
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),

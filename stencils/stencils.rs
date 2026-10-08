@@ -3216,6 +3216,27 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // The same against the shape's family (`Shape::family`, at offset
+        // 8): any shape differing from the cached ones in its elements'
+        // type alone.
+        stencil!("family_jeq_", loc!($loc); |s| {
+            if *(*(get!($loc, s).to_bits() as *const *const u64)).add(1) == imm64() {
+                jump!(s)
+            }
+            next!(s)
+        });
+        stencil!("family_jne_", loc!($loc); |s| {
+            if *(*(get!($loc, s).to_bits() as *const *const u64)).add(1) != imm64() {
+                jump!(s)
+            }
+            next!(s)
+        });
+        stencil!("family_guard_", loc!($loc); |s| {
+            if *(*(get!($loc, s).to_bits() as *const *const u64)).add(1) != imm64() {
+                exit!(s)
+            }
+            next!(s)
+        });
         // The receiver's shape is known to be the cached one: no guard.
         stencil!("get_own_nc_", loc!($loc); |s| {
             s.acc = *at_imm(get!($loc, s).to_bits() as *mut u8);

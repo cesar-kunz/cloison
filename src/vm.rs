@@ -442,8 +442,11 @@ impl Vm {
     // ---- Shapes ----
 
     fn add_shape(&mut self, s: Shape) -> *const Shape {
-        let b = Box::new(s);
+        let mut b = Box::new(s);
         let p: *const Shape = &*b;
+        if b.family.is_null() {
+            b.family = p;
+        }
         self.shapes.push(b);
         p
     }
@@ -471,6 +474,7 @@ impl Vm {
             } else {
                 0
             },
+            family: std::ptr::null(),
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -494,6 +498,7 @@ impl Vm {
             fields: Vec::new(),
             elems: FieldType::None,
             elems_code: 0,
+            family: std::ptr::null(),
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -535,6 +540,7 @@ impl Vm {
             fields,
             elems: s.elems,
             elems_code: s.elems_code,
+            family: std::ptr::null(),
             unique: s.unique,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -564,6 +570,7 @@ impl Vm {
                 fields: s.fields.clone(),
                 elems: s.elems,
                 elems_code: s.elems_code,
+                family: std::ptr::null(),
                 unique: true,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
@@ -684,6 +691,7 @@ impl Vm {
             fields: s.fields.clone(),
             elems,
             elems_code: elems.encode(),
+            family: s.family,
             unique: s.unique,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -927,6 +935,7 @@ impl Vm {
                     fields: s.fields.clone(),
                     elems: s.elems,
                     elems_code: s.elems_code,
+                    family: std::ptr::null(),
                     unique: true,
                     transitions: RefCell::default(),
                     elem_transitions: RefCell::default(),

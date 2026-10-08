@@ -1500,7 +1500,37 @@ pub(crate) enum CaseLoc {
     Transition { new_shape: u64, off: i32 },
 }
 
+/// Bit 0 of a [`Case`]'s `shape`: the case stands for every shape of a
+/// family (see `Shape::family`), the rest of the word being the family.
+const FAMILY: u64 = 1;
+
 impl Case {
+    /// Whether the case stands for a family of shapes ([`FAMILY`]).
+    fn is_family(&self) -> bool {
+        self.shape & FAMILY != 0
+    }
+
+    /// Whether a receiver of shape `s` takes this case.
+    fn admits(&self, s: u64) -> bool {
+        self.shape == s
+            || self.is_family()
+                && (unsafe { (*(s as *const Shape)).family } as u64 | FAMILY) == self.shape
+    }
+
+    /// A shape every receiver taking this case extends (see [`extends`]):
+    /// its own, or its family's.
+    fn base(&self) -> u64 {
+        self.shape & !FAMILY
+    }
+
+    /// The guard dispatching to the case: `shape_*`, or `family_*`.
+    fn guard(&self, kind: &str) -> String {
+        format!(
+            "{}_{kind}",
+            if self.is_family() { "family" } else { "shape" }
+        )
+    }
+
     const NONE: Case = Case {
         shape: 0,
         loc: CaseLoc::Own(0),
@@ -1627,17 +1657,33 @@ impl Feedback {
                 break;
             }
             let p = self.way(insn, w, epoch);
-            if let Some(c) = Case::of(p) {
-                if n == 0 {
-                    first = p;
+            let Some(c) = Case::of(p) else { continue };
+            // Loads from one prototype slot by shapes of one family (arrays
+            // whose elements' types differ, say): one case for the family,
+            // which takes the family's shapes not cached yet too.
+            let family = |c: &Case| match c.loc {
+                CaseLoc::Proto(_) if insn.op == Op::GetNamed => {
+                    (unsafe { (*(c.base() as *const Shape)).family }) as u64
                 }
-                cases[n] = c;
-                n += 1;
+                _ => 0,
+            };
+            if let f @ 1.. = family(&c)
+                && let Some(d) = cases[..n]
+                    .iter_mut()
+                    .find(|d| d.loc == c.loc && d.ft == c.ft && family(d) == f)
+            {
+                d.shape = f | FAMILY;
+                continue;
             }
+            if n == 0 {
+                first = p;
+            }
+            cases[n] = c;
+            n += 1;
         }
         match n {
             0 => Prop::None,
-            1 => first,
+            1 if !cases[0].is_family() => first,
             _ => {
                 polys.push(cases);
                 Prop::Poly {
@@ -2444,13 +2490,15 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         _ if insn.on_shape && insn.guard == 1 => return Sel::new("guard_cell", "", out),
         _ if insn.on_shape => {
+            let family = insn.guard & FAMILY != 0;
             return Sel {
-                ops: Some((0, insn.guard, 0)),
+                ops: Some((0, insn.guard & !FAMILY, 0)),
                 ..Sel::new(
-                    if insn.next_case {
-                        "shape_jne"
-                    } else {
-                        "shape_guard"
+                    match (family, insn.next_case) {
+                        (false, true) => "shape_jne",
+                        (false, false) => "shape_guard",
+                        (true, true) => "family_jne",
+                        (true, false) => "family_guard",
                     },
                     "",
                     out,
@@ -3075,18 +3123,18 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         let prop = match (prop, reg) {
             (Prop::Poly { n, at }, Ty::Obj(s)) => poly_cases(spec.polys, n, at)
                 .iter()
-                .find(|c| c.shape == s)
-                .map_or(Prop::None, |c| c.prop()),
+                .find(|c| c.admits(s))
+                .map_or(Prop::None, |c| Case { shape: s, ..*c }.prop()),
             (Prop::Poly { n, at }, _) => {
                 let cases = poly_cases(spec.polys, n, at);
                 let ft = cases.iter().fold(FieldType::None, |a, c| a.join(c.ft));
                 // Past the dispatch, the receiver has one of the shapes: if
                 // they all extend one of them, it is known to extend that.
                 if !matches!(reg, Ty::Ext(_))
-                    && let Some(base) = cases.iter().map(|c| c.shape).find(|&b| {
-                        cases
-                            .iter()
-                            .all(|c| unsafe { extends(c.shape as *const Shape, b as *const Shape) })
+                    && let Some(base) = cases.iter().map(|c| c.base()).find(|&b| {
+                        cases.iter().all(|c| unsafe {
+                            extends(c.base() as *const Shape, b as *const Shape)
+                        })
                     })
                 {
                     out.regs.set(insn.reg as usize, Ty::Ext(base));
@@ -4058,7 +4106,11 @@ fn stencil_for(
         ("star", _) => cat!("star_", loc),
         ("check_callee", _) => cat!("check_callee_", loc),
         ("callee_jne", _) => cat!("callee_jne_", loc),
-        ("guard_cell" | "shape_jne" | "shape_guard" | "check_shape", _) => {
+        (
+            "guard_cell" | "shape_jne" | "shape_guard" | "family_jne" | "family_guard"
+            | "check_shape",
+            _,
+        ) => {
             cat!(sel.base, "_", loc)
         }
         ("check_tail_callee", _) => cat!("check_tail_callee_", loc),
@@ -6857,13 +6909,13 @@ fn emit_poly(
         for (c, case) in cases.iter().enumerate() {
             let is_last = c + 1 == m;
             hot.push(Piece {
-                imm64: case.shape,
+                imm64: case.base(),
                 jump: if is_last {
                     Target::Next
                 } else {
                     Target::AfterPiece(last as u32)
                 },
-                ..at(if is_last { "shape_guard" } else { "shape_jeq" })
+                ..at(&case.guard(if is_last { "guard" } else { "jeq" }))
             });
         }
     } else {
@@ -6885,13 +6937,13 @@ fn emit_poly(
         for (c, case) in cases.iter().enumerate() {
             let last = c + 1 == m;
             hot.push(Piece {
-                imm64: case.shape,
+                imm64: case.base(),
                 jump: if last {
                     Target::Next
                 } else {
                     Target::Piece((first + group[c]) as u32)
                 },
-                ..at(if last { "shape_guard" } else { "shape_jeq" })
+                ..at(&case.guard(if last { "guard" } else { "jeq" }))
             });
         }
         for (base, imm, imm64b) in bodies {
@@ -7589,7 +7641,7 @@ fn reuse_global_loads(out: &mut Lowered) {
         }
         Prop::Poly { n, at } => poly_cases(&out.polys, n, at)
             .iter()
-            .any(|c| c.shape == global_shape),
+            .any(|c| c.is_family() || c.shape == global_shape),
         _ => true,
     };
     // (name, register holding its value), and the name `acc` holds.
@@ -9185,6 +9237,7 @@ impl Lowering<'_> {
         // and in the callee's `this` (unless that is the window's).
         if let Some((shape, _)) = hoisted
             && shape != 0
+            && shape & FAMILY == 0
         {
             let mut regs = vec![i.reg2];
             if !aliases.iter().any(|a| a.0 == base as u8) {

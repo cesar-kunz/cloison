@@ -853,6 +853,16 @@ impl<'a> Gen<'a> {
                 self.effect(x)?;
                 self.emit(Op::LdaUndefined, &[]);
             }
+            Unary(UnOp::Typeof, x) => {
+                // An undeclared global is "undefined", not a ReferenceError.
+                match &x.kind {
+                    Ident(n) if matches!(self.resolve(n, x.pos)?, Var::Global) => {
+                        self.global(Op::LdaGlobalInsideTypeof, n)
+                    }
+                    _ => self.value(x)?,
+                }
+                self.emit(Op::TypeOf, &[]);
+            }
             Unary(op, _) => return unsupported(e.pos, format!("unary {op:?}")),
             Update(t, d, true) => self.update(t, *d, e.pos)?,
             Update(..) => {

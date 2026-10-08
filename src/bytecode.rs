@@ -105,6 +105,8 @@ define_ops! {
     Return(),
     /// Throw `acc`.
     Throw(),
+    /// `acc = typeof acc`.
+    TypeOf(),
 
     // ---- Constants and registers ----
     /// `acc = undefined`
@@ -148,6 +150,9 @@ define_ops! {
     LdaGlobal(Ic),
     /// `global.name = acc`
     StaGlobal(Ic),
+    /// `LdaGlobal`, but `undefined` if there is no such property (`typeof
+    /// name`).
+    LdaGlobalInsideTypeof(Ic),
     /// `acc = r[a].name`
     GetNamed(Reg, Ic),
     /// `r[a].name = acc`

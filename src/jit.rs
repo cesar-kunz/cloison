@@ -1857,19 +1857,21 @@ fn leave_dead(st: &mut TypeState, live: &[bool], acc_live: bool) {
     let n = st.regs.len();
     let old: Vec<u8> = (0..n).map(|r| st.class(r)).collect();
     let mut same: Vec<u8> = (0..n).map(|r| r as u8).collect();
+    // Per class, its lowest live register.
+    let mut low = [u16::MAX; 256];
     for r in 0..n {
         if !live.get(r).copied().unwrap_or(true) {
             continue;
         }
-        // The lowest live register of `r`'s class.
-        let low = (0..n)
-            .find(|&q| old[q] == old[r] && live.get(q).copied().unwrap_or(true))
-            .unwrap();
-        same[r] = low as u8;
+        let c = old[r] as usize;
+        if low[c] == u16::MAX {
+            low[c] = r as u16;
+        }
+        same[r] = low[c] as u8;
     }
     let acc = st
         .acc_same
-        .and_then(|c| (0..n).find(|&q| old[q] == c && live.get(q).copied().unwrap_or(true)));
+        .and_then(|c| (low[c as usize] != u16::MAX).then_some(low[c as usize] as usize));
     st.acc_same = if acc_live { acc.map(|q| same[q]) } else { None };
     set_classes(st, same);
 }
@@ -4816,7 +4818,11 @@ impl JitCode {
         // types the region's own stores give them.
         let reach = reachable(insns, entry);
         let live_in = reg_live_in(insns, &reach, nregs, frames);
-        let live_at_entry = live_in[entry].clone();
+        // Not inlined frames' registers: none has started at an entry (see
+        // `JitFunction::entry_types`).
+        let live_at_entry: Vec<bool> = (live_in[entry].iter().enumerate())
+            .map(|(r, &l)| l && (feedback.is_none() || r < inline_base))
+            .collect();
         // In a VM frame, registers whose live ranges don't overlap share
         // slots (see `assign_homes`): live here also where an exit leaves
         // them to the interpreter (`exit_live`, which compiled code may not
@@ -4918,7 +4924,9 @@ impl JitCode {
         // those an exit may leave to the interpreter (shared slots write
         // back only those, so they must hold their values).
         let load_at_entry: Vec<bool> = match &share_live {
-            Some(l) => (0..nregs).map(|r| rs_has(&l[entry], r)).collect(),
+            Some(l) => (0..nregs)
+                .map(|r| rs_has(&l[entry], r) && r < inline_base)
+                .collect(),
             None => live_at_entry.clone(),
         };
         let mut actual_live = actual.clone();
@@ -5043,15 +5051,20 @@ impl JitCode {
                         entry_state.regs[r] = Ty::F64;
                     }
                 }
-                let ins = infer(
-                    insns,
-                    entry,
-                    entry_state,
-                    &Spec {
-                        pinned: &pinned,
-                        ..spec1
-                    },
-                );
+                // Nothing pinned: the types are those already inferred.
+                let ins = if pinned.contains(&true) {
+                    infer(
+                        insns,
+                        entry,
+                        entry_state,
+                        &Spec {
+                            pinned: &pinned,
+                            ..spec1
+                        },
+                    )
+                } else {
+                    ins1.clone()
+                };
                 let strays = |r: usize, ok: Ty| {
                     ins.iter()
                         .flatten()
@@ -5176,7 +5189,13 @@ impl JitCode {
         // this code's address is only known at the end.
         let at_start = insns[entry].frame == 0 && insns[entry].pc == 0;
         let fits_entry = |this: Ty, args: &[Ty], nparams: usize| {
-            let fits = |a: Ty, v: Ty| a == v || v == Ty::Any || v == Ty::Bot;
+            let fits = |a: Ty, v: Ty| {
+                a == v
+                    || v == Ty::Any
+                    || v == Ty::Bot
+                    || matches!((a, v), (Ty::Obj(x) | Ty::Ext(x), Ty::Ext(y))
+                        if unsafe { extends(x as *const Shape, y as *const Shape) })
+            };
             actual_live.acc == Ty::Bot
                 && actual_live.regs.iter().enumerate().all(|(r, &v)| {
                     let a = match r {
@@ -9017,15 +9036,31 @@ impl JitFunction {
             let regs_live = reg_live_in(insns, &reach, nregs, frames)[entry].clone();
             (acc_liveness(insns, &reach).0[entry], regs_live)
         });
-        // Only live values are looked at: dead registers (an inlined frame's,
-        // say) may hold anything.
+        // Only live values are looked at: dead registers may hold anything.
+        // So may inlined frames' registers, live or not: code is entered in
+        // the function's own frame, before any inlined frame starts (they
+        // seem live there to a bail inside one, which leaves them all to
+        // the interpreter).
+        let inline_base = self.vm.as_ref().map_or(usize::MAX, |vm| vm.inline_base);
         let ty = |v: Value, live: bool| if live { Ty::of(v) } else { Ty::Bot };
+        // At a function's start, `this` and the parameters are objects of
+        // their shapes or shapes extending them (`Ext`): what callers'
+        // loads from fields give, so its own calls to itself fit (see
+        // `fits_entry` in `JitCode::compile`).
+        let params = match &self.vm {
+            Some(vm) if entry == 0 => (unsafe { (*vm.root).nparams }) as usize + 1,
+            _ => 0,
+        };
         TypeState {
             acc: ty(acc, *acc_live),
             regs: regs
                 .iter()
                 .zip(live.iter())
-                .map(|(&v, &l)| ty(v, l))
+                .enumerate()
+                .map(|(r, (&v, &l))| match ty(v, l && r < inline_base) {
+                    Ty::Obj(s) if r < params => Ty::Ext(s),
+                    t => t,
+                })
                 .collect(),
             same: Vec::new(),
             acc_same: None,
@@ -9042,8 +9077,14 @@ impl JitFunction {
         acc: &mut Value,
         regs: &mut [Value],
     ) -> usize {
-        let fits =
-            |a: Ty, v: Ty| a == v || a == Ty::Bot || v == Ty::Any || (a == Ty::I32 && v == Ty::F64);
+        let fits = |a: Ty, v: Ty| {
+            a == v
+                || a == Ty::Bot
+                || v == Ty::Any
+                || (a == Ty::I32 && v == Ty::F64)
+                || matches!((a, v), (Ty::Obj(x) | Ty::Ext(x), Ty::Ext(y))
+                    if unsafe { extends(x as *const Shape, y as *const Shape) })
+        };
         let fits_all = |v: &TypeState| {
             fits(actual.acc, v.acc) && actual.regs.iter().zip(&v.regs).all(|(&a, &b)| fits(a, b))
         };

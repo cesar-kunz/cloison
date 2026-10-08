@@ -934,42 +934,67 @@ mod arch {
 /// slower in some runs (frontend stalls, 13-missing-arguments' recompile
 /// landing on its first version's page: 46M or 61M cycles from one run to
 /// the next), as if the CPU kept state for the old code.
+///
+/// Each piece of code has pages of its own, but starts where the one before
+/// it ended within a page (`EXEC_RANGE`'s offset), so consecutive pieces
+/// use the instruction cache's sets as if they were packed. Starting each
+/// at a page boundary put every piece's first lines (the entry, its
+/// `toi_rt_enter` wrapper) in the same few sets: on DeltaBlue, any change
+/// to code size moved which of them conflicted, up to twice the L1i misses
+/// and 3% of the cycles.
 struct ExecMem {
+    /// Where the code starts, `offset` bytes into the pages.
     ptr: *mut u8,
     len: usize,
+    offset: usize,
 }
 
-/// The reserved range code is carved from: (next free address, end).
-static EXEC_RANGE: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+/// The reserved range code is carved from: (next free address, end, the
+/// next piece's offset into its first page).
+static EXEC_RANGE: std::sync::Mutex<(usize, usize, usize)> =
+    std::sync::Mutex::new((0, 0, 0));
 const EXEC_RESERVE: usize = 1 << 30;
 
 impl ExecMem {
     fn new(len: usize) -> Self {
-        let len = len.max(1).next_multiple_of(4096);
+        let len = len.max(1);
         let mut range = EXEC_RANGE.lock().unwrap();
-        if range.1 - range.0 < len {
-            let size = EXEC_RESERVE.max(len);
+        let offset = range.2;
+        let pages = (offset + len).next_multiple_of(4096);
+        if range.1 - range.0 < pages {
+            let size = EXEC_RESERVE.max(pages);
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
             let base =
                 unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_NONE, flags, -1, 0) };
             assert!(base != libc::MAP_FAILED, "mmap failed");
-            *range = (base as usize, base as usize + size);
+            (range.0, range.1) = (base as usize, base as usize + size);
         }
-        let ptr = range.0 as *mut u8;
-        range.0 += len;
-        let r = unsafe { libc::mprotect(ptr.cast(), len, libc::PROT_READ | libc::PROT_WRITE) };
+        let start = range.0 as *mut u8;
+        range.0 += pages;
+        range.2 = (offset + len).next_multiple_of(64) % 4096;
+        let r = unsafe { libc::mprotect(start.cast(), pages, libc::PROT_READ | libc::PROT_WRITE) };
         assert_eq!(r, 0, "mprotect failed");
-        ExecMem { ptr, len }
+        ExecMem {
+            ptr: unsafe { start.add(offset) },
+            len,
+            offset,
+        }
     }
 
     fn bytes(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 
+    /// The pages: their start and length.
+    fn pages(&self) -> (*mut u8, usize) {
+        let start = unsafe { self.ptr.sub(self.offset) };
+        (start, (self.offset + self.len).next_multiple_of(4096))
+    }
+
     fn seal(&mut self) {
         arch::flush_icache(self.ptr, self.len);
-        let r =
-            unsafe { libc::mprotect(self.ptr.cast(), self.len, libc::PROT_READ | libc::PROT_EXEC) };
+        let (start, len) = self.pages();
+        let r = unsafe { libc::mprotect(start.cast(), len, libc::PROT_READ | libc::PROT_EXEC) };
         assert_eq!(r, 0, "mprotect failed");
     }
 }
@@ -977,9 +1002,10 @@ impl ExecMem {
 impl Drop for ExecMem {
     /// The pages go back to the system; their addresses stay reserved.
     fn drop(&mut self) {
+        let (start, len) = self.pages();
         unsafe {
-            libc::madvise(self.ptr.cast(), self.len, libc::MADV_DONTNEED);
-            libc::mprotect(self.ptr.cast(), self.len, libc::PROT_NONE);
+            libc::madvise(start.cast(), len, libc::MADV_DONTNEED);
+            libc::mprotect(start.cast(), len, libc::PROT_NONE);
         }
     }
 }

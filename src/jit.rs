@@ -1146,7 +1146,7 @@ fn is_compare_jump(op: Op) -> bool {
 fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
     let imm_at = |at: usize| i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
     let mut starts = HashMap::default();
-    let mut raw = Vec::new();
+    let mut raw = Vec::with_capacity(code.len() / 2);
     let mut pc = 0;
     while pc < code.len() {
         let op = Op::from_u8(code[pc]).unwrap_or_else(|| panic!("bad opcode {} at {pc}", code[pc]));
@@ -1371,7 +1371,7 @@ fn bytecode_live(code: &[u8]) -> (Vec<Insn>, Vec<RegSet>) {
                 live[w / 64] &= !(1 << (w % 64));
             }
             rs_or(&mut live, reads);
-            if live != live_in[k] {
+            if !rs_eq(&live, &live_in[k]) {
                 live_in[k] = live;
                 changed = true;
             }
@@ -1788,18 +1788,133 @@ impl Ty {
     }
 }
 
+/// The types of `len` registers, kept for those not `Bot` only (in
+/// register order): a few are live at any point, of the dozens a frame
+/// with inlined calls has, and states are copied and joined per
+/// instruction.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub struct Regs {
+    len: usize,
+    tys: Vec<(u8, Ty)>,
+}
+
+static BOT: Ty = Ty::Bot;
+
+impl Regs {
+    fn filled(len: usize, t: Ty) -> Regs {
+        let tys = if t == Ty::Bot {
+            Vec::new()
+        } else {
+            (0..len).map(|r| (r as u8, t)).collect()
+        };
+        Regs { len, tys }
+    }
+
+    /// From every register's type.
+    fn from_dense(tys: impl IntoIterator<Item = Ty>) -> Regs {
+        let mut regs = Regs::default();
+        for t in tys {
+            if t != Ty::Bot {
+                regs.tys.push((regs.len as u8, t));
+            }
+            regs.len += 1;
+        }
+        regs
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Register `r`'s type, if it is one of them (as a slice's `get`).
+    fn get(&self, r: usize) -> Option<&Ty> {
+        (r < self.len).then(|| &self[r])
+    }
+
+    fn set(&mut self, r: usize, t: Ty) {
+        match self.tys.binary_search_by_key(&(r as u8), |e| e.0) {
+            Ok(k) if t == Ty::Bot => {
+                self.tys.remove(k);
+            }
+            Ok(k) => self.tys[k].1 = t,
+            Err(_) if t == Ty::Bot => {}
+            Err(k) => self.tys.insert(k, (r as u8, t)),
+        }
+    }
+
+    /// The registers not `Bot`, with their types.
+    fn iter(&self) -> impl Iterator<Item = (usize, Ty)> + '_ {
+        self.tys.iter().map(|&(r, t)| (r as usize, t))
+    }
+
+    /// Replace each type not `Bot` by `f` of it (`Bot` drops it).
+    fn map(&mut self, mut f: impl FnMut(usize, Ty) -> Ty) {
+        self.tys.retain_mut(|e| {
+            e.1 = f(e.0 as usize, e.1);
+            e.1 != Ty::Bot
+        });
+    }
+
+    /// Join `other` in; whether anything changed.
+    fn join(&mut self, other: &Regs) -> bool {
+        let mut changed = false;
+        let mut out: Vec<(u8, Ty)> = Vec::with_capacity(self.tys.len().max(other.tys.len()));
+        let (mut a, mut b) = (self.tys.iter().peekable(), other.tys.iter().peekable());
+        loop {
+            match (a.peek(), b.peek()) {
+                (Some(&&(ra, ta)), Some(&&(rb, tb))) if ra == rb => {
+                    let j = ta.join(tb);
+                    changed |= j != ta;
+                    out.push((ra, j));
+                    a.next();
+                    b.next();
+                }
+                (Some(&&e), Some(&&(rb, _))) if e.0 < rb => {
+                    out.push(e);
+                    a.next();
+                }
+                (_, Some(&&e)) => {
+                    out.push(e);
+                    changed = true;
+                    b.next();
+                }
+                (Some(&&e), None) => {
+                    out.push(e);
+                    a.next();
+                }
+                (None, None) => break,
+            }
+        }
+        if changed {
+            self.tys = out;
+        }
+        changed
+    }
+}
+
+impl std::ops::Index<usize> for Regs {
+    type Output = Ty;
+    fn index(&self, r: usize) -> &Ty {
+        match self.tys.binary_search_by_key(&(r as u8), |e| e.0) {
+            Ok(k) => &self.tys[k].1,
+            Err(_) => &BOT,
+        }
+    }
+}
+
 /// Types of the accumulator and of every register, at an instruction
 /// boundary.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TypeState {
     pub acc: Ty,
-    pub regs: Vec<Ty>,
+    pub regs: Regs,
     /// Copies: registers holding the same value (copied by `Ldar` and
-    /// `Star`, neither rewritten since) form a class, each register here
-    /// naming the lowest of its class; empty when every register is alone.
-    /// What an instruction proves about a register (a shape guard passed,
-    /// a transition) holds for its copies (see [`copies`]).
-    pub same: Vec<u8>,
+    /// `Star`, neither rewritten since) form a class, named by its lowest
+    /// register. Here each other register of a class, with that lowest
+    /// (sorted by register); registers alone aren't. What an instruction
+    /// proves about a register (a shape guard passed, a transition) holds
+    /// for its copies (see [`copies`]).
+    pub same: Vec<(u8, u8)>,
     /// The class `acc` holds the value of, if any.
     pub acc_same: Option<u8>,
 }
@@ -1808,7 +1923,7 @@ impl TypeState {
     fn any(nregs: usize) -> TypeState {
         TypeState {
             acc: Ty::Any,
-            regs: vec![Ty::Any; nregs],
+            regs: Regs::filled(nregs, Ty::Any),
             same: Vec::new(),
             acc_same: None,
         }
@@ -1817,27 +1932,14 @@ impl TypeState {
     /// Join `other` into `self`; returns whether `self` changed. Copies
     /// stay copies only where both say so.
     fn join(&mut self, other: &TypeState) -> bool {
-        let mut changed = false;
-        let pairs = std::iter::once((&mut self.acc, &other.acc))
-            .chain(self.regs.iter_mut().zip(&other.regs));
-        for (a, b) in pairs {
-            let j = a.join(*b);
-            if j != *a {
-                *a = j;
-                changed = true;
-            }
-        }
+        let acc = self.acc.join(other.acc);
+        let mut changed = acc != self.acc;
+        self.acc = acc;
+        changed |= self.regs.join(&other.regs);
         if !self.same.is_empty() {
-            let n = self.regs.len();
-            let mut same: Vec<u8> = (0..n).map(|r| self.class(r)).collect();
-            for (r, s) in same.iter_mut().enumerate() {
-                if *s != other.class(r) {
-                    *s = r as u8;
-                }
-            }
-            let before = std::mem::take(&mut self.same);
-            set_classes(self, same);
-            changed |= self.same != before;
+            let before = self.same.len();
+            self.same.retain(|&(r, c)| other.class(r as usize) == c);
+            changed |= self.same.len() != before;
         }
         if self.acc_same.is_some() && self.acc_same != other.acc_same {
             self.acc_same = None;
@@ -1848,42 +1950,64 @@ impl TypeState {
 
     /// The class of register `r` (its lowest copy).
     fn class(&self, r: usize) -> u8 {
-        self.same.get(r).copied().unwrap_or(r as u8)
+        class_in(&self.same, r)
     }
 }
 
 /// Dead registers (and a dead `acc`) leave their classes.
-fn leave_dead(st: &mut TypeState, live: &[bool], acc_live: bool) {
-    let n = st.regs.len();
-    let old: Vec<u8> = (0..n).map(|r| st.class(r)).collect();
-    let mut same: Vec<u8> = (0..n).map(|r| r as u8).collect();
-    // Per class, its lowest live register.
-    let mut low = [u16::MAX; 256];
-    for r in 0..n {
-        if !live.get(r).copied().unwrap_or(true) {
-            continue;
+fn leave_dead(st: &mut TypeState, live: &RegSet, acc_live: bool) {
+    let old = std::mem::take(&mut st.same);
+    // Per class (its lowest register), its lowest live register.
+    let mut low: Vec<(u8, u8)> = Vec::new();
+    for &(r, c) in &old {
+        if !low.iter().any(|e| e.0 == c) {
+            let first = std::iter::once(c)
+                .chain(old.iter().filter(|e| e.1 == c).map(|e| e.0))
+                .find(|&q| rs_has(live, q as usize));
+            if let Some(l) = first {
+                low.push((c, l));
+            }
         }
-        let c = old[r] as usize;
-        if low[c] == u16::MAX {
-            low[c] = r as u16;
+        if rs_has(live, r as usize)
+            && let Some(&(_, l)) = low.iter().find(|e| e.0 == c)
+            && l != r
+        {
+            st.same.push((r, l));
         }
-        same[r] = low[c] as u8;
     }
+    st.same.sort_unstable();
     let acc = st
         .acc_same
-        .and_then(|c| (low[c as usize] != u16::MAX).then_some(low[c as usize] as usize));
-    st.acc_same = if acc_live { acc.map(|q| same[q]) } else { None };
-    set_classes(st, same);
+        .and_then(|c| match low.iter().find(|e| e.0 == c) {
+            Some(&(_, l)) => Some(l),
+            None => rs_has(live, c as usize).then_some(c),
+        });
+    st.acc_same = if acc_live { acc } else { None };
 }
 
-/// Store `same` as `st`'s classes, made canonical: empty if every register
-/// is alone.
-fn set_classes(st: &mut TypeState, same: Vec<u8>) {
-    st.same = if same.iter().enumerate().all(|(r, &c)| c as usize == r) {
-        Vec::new()
-    } else {
-        same
-    };
+/// The class of register `r` in copies `same` (see [`TypeState::same`]).
+fn class_in(same: &[(u8, u8)], r: usize) -> u8 {
+    match same.binary_search_by_key(&(r as u8), |e| e.0) {
+        Ok(k) => same[k].1,
+        Err(_) => r as u8,
+    }
+}
+
+/// The registers of class `c` in copies `same`, lowest first.
+fn members(same: &[(u8, u8)], c: u8) -> Vec<u8> {
+    std::iter::once(c)
+        .chain(same.iter().filter(|e| e.1 == c).map(|e| e.0))
+        .collect()
+}
+
+/// Make the registers `regs` (sorted) one class in `same`, the others
+/// keeping theirs.
+fn set_class(same: &mut Vec<(u8, u8)>, regs: &[u8]) {
+    same.retain(|e| !regs.contains(&e.0));
+    if let Some((&low, rest)) = regs.split_first() {
+        same.extend(rest.iter().map(|&q| (q, low)));
+    }
+    same.sort_unstable();
 }
 
 /// After `insn` (the out-state `out`, from the in-state `st`): track copies
@@ -1893,49 +2017,44 @@ fn set_classes(st: &mut TypeState, same: Vec<u8>) {
 /// doesn't write) that type too.
 fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
     let n = st.regs.len();
-    let mut same: Vec<u8> = (0..n).map(|r| st.class(r)).collect();
+    let mut same = st.same.clone();
     out.acc_same = st.acc_same;
     if insn.bail {
         out.acc_same = None;
-        set_classes(out, same);
+        out.same = same;
         return;
     }
     let r = insn.reg as usize;
     match insn.op {
-        Op::Ldar if r < n => out.acc_same = Some(same[r]),
+        Op::Ldar if r < n => out.acc_same = Some(class_in(&same, r)),
         Op::Star if r < n => {
             // `r` leaves its class: the others' lowest may change.
-            let old = same[r];
-            let rest: Vec<usize> = (0..n).filter(|&q| q != r && same[q] == old).collect();
-            if let Some(&low) = rest.first() {
-                for &q in &rest {
-                    same[q] = low as u8;
-                }
-            }
+            let old = class_in(&same, r);
+            let rest: Vec<u8> = members(&same, old)
+                .into_iter()
+                .filter(|&q| q as usize != r)
+                .collect();
+            same.retain(|e| e.0 as usize != r && e.1 != old);
+            set_class(&mut same, &rest);
             match out.acc_same {
                 // `acc` copies class `c`: `r` joins it.
                 Some(c) => {
                     let c = if c as usize == r {
-                        rest.first().map_or(r, |&l| l) as u8
+                        rest.first().copied().unwrap_or(r as u8)
                     } else {
                         c
                     };
-                    let members: Vec<usize> = (0..n).filter(|&q| q != r && same[q] == c).collect();
-                    let low = members
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(r))
-                        .min()
-                        .unwrap() as u8;
-                    for q in members.into_iter().chain(std::iter::once(r)) {
-                        same[q] = low;
-                    }
-                    out.acc_same = Some(low);
+                    let mut joined: Vec<u8> = members(&same, c)
+                        .into_iter()
+                        .filter(|&q| q as usize != r)
+                        .chain(std::iter::once(r as u8))
+                        .collect();
+                    joined.sort_unstable();
+                    joined.dedup();
+                    set_class(&mut same, &joined);
+                    out.acc_same = Some(joined[0]);
                 }
-                None => {
-                    same[r] = r as u8;
-                    out.acc_same = Some(r as u8);
-                }
+                None => out.acc_same = Some(r as u8),
             }
         }
         _ => {
@@ -1943,12 +2062,11 @@ fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
             // operand's copies.
             if insn.uses_reg_value() && r < n && out.regs[r] != st.regs[r] {
                 let t = out.regs[r];
-                for q in 0..n {
-                    if same[q] == same[r] {
-                        out.regs[q] = t;
-                    }
+                let c = class_in(&same, r);
+                for q in members(&same, c) {
+                    out.regs.set(q as usize, t);
                 }
-                if out.acc_same == Some(same[r]) && writes_acc(insn).is_none() {
+                if out.acc_same == Some(c) && writes_acc(insn).is_none() {
                     out.acc = t;
                 }
             }
@@ -1957,7 +2075,7 @@ fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
             }
         }
     }
-    set_classes(out, same);
+    out.same = same;
 }
 
 /// `Some(())` if `insn` may write `acc` (other than `Ldar`).
@@ -1984,7 +2102,7 @@ struct Spec<'a> {
     /// never read (a comparison's boolean after its jump, a temporary out
     /// of scope) doesn't widen a join or need conversions on its way there.
     acc_live: &'a [bool],
-    reg_live: &'a [Vec<bool>],
+    reg_live: &'a [RegSet],
     /// Per instruction, its inline cache's contents (property instructions
     /// in VM frames); empty otherwise.
     props: &'a [Prop],
@@ -2051,7 +2169,10 @@ fn slot_reg(insn: &Insn, sel: &Sel, homes: &[Home]) -> u8 {
     } else {
         insn.reg
     };
-    match sel.reg.map(|r| (r, homes.get(r as usize).copied().unwrap_or(Home::Mem))) {
+    match sel
+        .reg
+        .map(|r| (r, homes.get(r as usize).copied().unwrap_or(Home::Mem)))
+    {
         Some((r, Home::Mem | Home::Gpr(_))) => r,
         _ => own,
     }
@@ -2205,7 +2326,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
         }
         _ if insn.assume != 0 => {
-            out.regs[insn.reg as usize] = Ty::Obj(insn.assume);
+            out.regs.set(insn.reg as usize, Ty::Obj(insn.assume));
             return Sel::new("nop", "", out);
         }
         // An allocation scalar replacement removed: its check only.
@@ -2222,9 +2343,13 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // argument in `acc`.
         _ if insn.native == 1 || insn.native == 2 => {
             let a = insn.reg2 as usize;
-            let array = st.regs.get(a).and_then(|t| t.shape()).is_some_and(|s| unsafe {
-                (*(s as *const Shape)).class == crate::object::Class::Array
-            });
+            let array = st
+                .regs
+                .get(a)
+                .and_then(|t| t.shape())
+                .is_some_and(|s| unsafe {
+                    (*(s as *const Shape)).class == crate::object::Class::Array
+                });
             let case = match (insn.native, st.acc == I32, array) {
                 (1, true, true) => "i_nc",
                 (1, true, false) => "i",
@@ -2291,11 +2416,10 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // The callee may add properties to any object: exact shapes become
         // lower bounds (see `Ty::Ext`).
         Op::Call | Op::CallUndefined | Op::Construct => {
-            for t in out.regs.iter_mut() {
-                if let Ty::Obj(x) = *t {
-                    *t = Ty::Ext(x);
-                }
-            }
+            out.regs.map(|_, t| match t {
+                Ty::Obj(x) => Ty::Ext(x),
+                t => t,
+            });
             let base = match spec.props.get(i) {
                 Some(Prop::Call { direct: true, .. }) if insn.op == Op::Construct => {
                     "construct_direct"
@@ -2571,11 +2695,14 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         Op::Star => {
             let r = insn.reg as usize;
-            out.regs[r] = if spec.pinned[r] && st.acc <= F64 {
-                F64
-            } else {
-                st.acc
-            };
+            out.regs.set(
+                r,
+                if spec.pinned[r] && st.acc <= F64 {
+                    F64
+                } else {
+                    st.acc
+                },
+            );
             let case = match st.acc {
                 F64 => "f",
                 I32 => "i",
@@ -2742,7 +2869,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 (_, Prop::Keyed { shape, elems })
                     if !matches!(elems, FieldType::None | FieldType::Any) =>
                 {
-                    out.regs[insn.reg as usize] = Ty::Obj(shape);
+                    out.regs.set(insn.reg as usize, Ty::Obj(shape));
                     (pick("sh", "i_sh"), elems)
                 }
                 (Ty::Ext(_), _) => (pick("nc", "i_nc"), FieldType::Any),
@@ -2906,7 +3033,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                             .all(|c| unsafe { extends(c.shape as *const Shape, b as *const Shape) })
                     })
                 {
-                    out.regs[insn.reg as usize] = Ty::Ext(base);
+                    out.regs.set(insn.reg as usize, Ty::Ext(base));
                 }
                 if !load {
                     if cases.iter().any(|c| check(c.ft) != check(cases[0].ft)) {
@@ -2916,11 +3043,12 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                         .iter()
                         .any(|c| matches!(c.loc, CaseLoc::Transition { .. }))
                     {
-                        for t in out.regs.iter_mut().chain(std::iter::once(&mut out.acc)) {
-                            if let Ty::Obj(x) = *t {
-                                *t = Ty::Ext(x);
-                            }
-                        }
+                        let ext = |t: Ty| match t {
+                            Ty::Obj(x) => Ty::Ext(x),
+                            t => t,
+                        };
+                        out.regs.map(|_, t| ext(t));
+                        out.acc = ext(out.acc);
                     }
                     return finish(Sel::new("poly", "", out), cases[0].ft);
                 }
@@ -2941,7 +3069,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         let r = insn.reg as usize;
         let case = if exact { "nc" } else { "" };
-        out.regs[r] = Ty::Obj(shape);
+        out.regs.set(r, Ty::Obj(shape));
         let mut sel = match prop {
             Prop::Own { ft, .. } => finish(
                 Sel::new(if load { "get_own" } else { "set_own" }, case, out),
@@ -2953,12 +3081,13 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             ),
             Prop::Proto { ft, .. } if load => finish(Sel::new("get_proto", case, out), ft),
             Prop::Transition { new_shape, ft, .. } if !load => {
-                for t in out.regs.iter_mut().chain(std::iter::once(&mut out.acc)) {
-                    if let Ty::Obj(x) = *t {
-                        *t = Ty::Ext(x);
-                    }
-                }
-                out.regs[r] = Ty::Obj(new_shape);
+                let ext = |t: Ty| match t {
+                    Ty::Obj(x) => Ty::Ext(x),
+                    t => t,
+                };
+                out.regs.map(|_, t| ext(t));
+                out.acc = ext(out.acc);
+                out.regs.set(r, Ty::Obj(new_shape));
                 finish(Sel::new("set_tr", case, out), ft)
             }
             _ => bail(out),
@@ -3020,11 +3149,9 @@ fn infer(
             if !spec.acc_live[s] {
                 out.acc = Ty::Bot;
             }
-            for (t, &live) in out.regs.iter_mut().zip(&spec.reg_live[s]) {
-                if !live {
-                    *t = Ty::Bot;
-                }
-            }
+            let live = &spec.reg_live[s];
+            out.regs
+                .map(|r, t| if rs_has(live, r) { t } else { Ty::Bot });
             if !out.same.is_empty() || out.acc_same.is_some() {
                 leave_dead(&mut out, &spec.reg_live[s], spec.acc_live[s]);
             }
@@ -3083,6 +3210,11 @@ type RegSet = [u64; 4];
 
 fn rs_has(s: &RegSet, r: usize) -> bool {
     s[r / 64] >> (r % 64) & 1 != 0
+}
+
+/// Equality, without a call to `memcmp` (what `==` on arrays becomes).
+fn rs_eq(a: &RegSet, b: &RegSet) -> bool {
+    (a[0] ^ b[0]) | (a[1] ^ b[1]) | (a[2] ^ b[2]) | (a[3] ^ b[3]) == 0
 }
 
 fn rs_add(s: &mut RegSet, r: usize) {
@@ -3150,8 +3282,7 @@ fn interference(insns: &[Insn], live: &[RegSet], nregs: usize) -> Vec<RegSet> {
 /// interfere. Exits then write back only the registers live there.
 #[allow(clippy::too_many_arguments)]
 fn assign_homes(
-    insns: &[Insn],
-    ins: &[Option<TypeState>],
+    stats: &HomeStats,
     nregs: usize,
     no_fp: &[bool],
     no_int: &[bool],
@@ -3159,8 +3290,56 @@ fn assign_homes(
     mem_from: usize,
     interferes: Option<&[RegSet]>,
 ) -> Vec<Home> {
-    // Uses inside loops count 8 times per level (a loop is the code from a
-    // backward jump's target to it).
+    let HomeStats { uses, join } = stats;
+    let mut by_uses: Vec<usize> = (0..nregs.min(mem_from)).filter(|&r| uses[r] > 0).collect();
+    by_uses.sort_by_key(|&r| (std::cmp::Reverse(uses[r]), r));
+    let meets = |a: &RegSet, b: &RegSet| a.iter().zip(b).any(|(x, y)| x & y != 0);
+    // Per slot, the registers in it.
+    let mut fprs: Vec<RegSet> = vec![[0; 4]; FP_SLOTS];
+    let mut gprs: Vec<RegSet> = vec![[0; 4]; GPR_SLOTS];
+    let free = |slots: &[RegSet], r: usize| {
+        slots.iter().position(|s| match interferes {
+            Some(m) => !meets(s, &m[r]),
+            None => rs_eq(s, &[0; 4]),
+        })
+    };
+    let mut homes = vec![Home::Mem; nregs];
+    for &r in &by_uses {
+        if join[r] == 2
+            && !no_fp[r]
+            && pin_ok[r]
+            && let Some(k) = free(&fprs, r)
+        {
+            homes[r] = Home::Fpr(k as u8);
+            rs_add(&mut fprs[k], r);
+        }
+    }
+    for &r in &by_uses {
+        if homes[r] == Home::Mem
+            && let Some(k) = free(&gprs, r)
+        {
+            homes[r] = if join[r] == 1 && !no_int[r] && pin_ok[r] {
+                Home::Int(k as u8)
+            } else {
+                Home::Gpr(k as u8)
+            };
+            rs_add(&mut gprs[k], r);
+        }
+    }
+    homes
+}
+
+/// What [`assign_homes`] chooses from: per register, its uses (weighted)
+/// and the join of its types (`Bot` < `I32` < `F64` < anything else).
+struct HomeStats {
+    uses: Vec<usize>,
+    join: Vec<u8>,
+}
+
+/// [`HomeStats`] for `insns` with the types `ins`. Uses inside loops count
+/// 8 times per level (a loop is the code from a backward jump's target to
+/// it).
+fn home_stats(insns: &[Insn], ins: &[Option<TypeState>], nregs: usize) -> HomeStats {
     let mut depth = vec![0u32; insns.len() + 1];
     for (j, insn) in insns.iter().enumerate() {
         if insn.jumps() && insn.target <= j {
@@ -3177,52 +3356,25 @@ fn assign_homes(
         })
         .collect();
     let mut uses = vec![0usize; nregs];
-    let mut join = vec![Ty::Bot; nregs];
+    // As far as homes care: no shapes joined.
+    let mut join = vec![0u8; nregs];
     for ((insn, st), w) in insns.iter().zip(ins).zip(&weight) {
         let Some(st) = st else { continue };
         if insn.reads_reg() {
             uses[insn.reg as usize] += w;
         }
-        for (j, &t) in join.iter_mut().zip(&st.regs) {
-            *j = j.join(t);
-        }
-    }
-    let mut by_uses: Vec<usize> = (0..nregs.min(mem_from)).filter(|&r| uses[r] > 0).collect();
-    by_uses.sort_by_key(|&r| (std::cmp::Reverse(uses[r]), r));
-    let meets = |a: &RegSet, b: &RegSet| a.iter().zip(b).any(|(x, y)| x & y != 0);
-    // Per slot, the registers in it.
-    let mut fprs: Vec<RegSet> = vec![[0; 4]; FP_SLOTS];
-    let mut gprs: Vec<RegSet> = vec![[0; 4]; GPR_SLOTS];
-    let free = |slots: &[RegSet], r: usize| {
-        slots.iter().position(|s| match interferes {
-            Some(m) => !meets(s, &m[r]),
-            None => *s == [0; 4],
-        })
-    };
-    let mut homes = vec![Home::Mem; nregs];
-    for &r in &by_uses {
-        if join[r] == Ty::F64
-            && !no_fp[r]
-            && pin_ok[r]
-            && let Some(k) = free(&fprs, r)
-        {
-            homes[r] = Home::Fpr(k as u8);
-            rs_add(&mut fprs[k], r);
-        }
-    }
-    for &r in &by_uses {
-        if homes[r] == Home::Mem
-            && let Some(k) = free(&gprs, r)
-        {
-            homes[r] = if join[r] == Ty::I32 && !no_int[r] && pin_ok[r] {
-                Home::Int(k as u8)
-            } else {
-                Home::Gpr(k as u8)
+        for (r, t) in st.regs.iter() {
+            let j = &mut join[r];
+            let k = match t {
+                Ty::Bot => 0,
+                Ty::I32 => 1,
+                Ty::F64 => 2,
+                _ => 3,
             };
-            rs_add(&mut gprs[k], r);
+            *j = (*j).max(k);
         }
     }
-    homes
+    HomeStats { uses, join }
 }
 
 /// The shift `s` and multiplier `m` with which `mod_smi_{u,i}_s<s>`
@@ -3248,13 +3400,22 @@ fn mod_magic(d: i32) -> (u32, u64) {
 /// constant, booleans and the other non-numbers. Within straight-line
 /// code: unknown at jump targets. For `ModSmi`, whose `_u` forms need no
 /// sign handling; empty work if there is none.
-fn nonneg_acc(insns: &[Insn], is_target: &[bool], nregs: usize, frames: &[FrameRegs]) -> Vec<bool> {
+fn nonneg_acc(
+    insns: &[Insn],
+    is_target: &[bool],
+    nregs: usize,
+    frames: &[FrameRegs],
+    live_at_start: Option<&RegSet>,
+) -> Vec<bool> {
     let n = insns.len();
     if !insns.iter().any(|i| i.op == Op::ModSmi && !i.bail) {
         return vec![false; n];
     }
-    let start = reg_live_in(insns, &reachable(insns, 0), nregs, frames).swap_remove(0);
-    let mut ok: Vec<bool> = start.iter().map(|&live| !live).collect();
+    let start = match live_at_start {
+        Some(l) => *l,
+        None => reg_live_in(insns, &reachable(insns, 0), nregs, frames).swap_remove(0),
+    };
+    let mut ok: Vec<bool> = (0..nregs).map(|r| !rs_has(&start, r)).collect();
     loop {
         let mut acc = vec![false; n];
         for j in 1..n {
@@ -3370,71 +3531,70 @@ fn exit_live(frames: &[FrameRegs], frame: u8, nregs: usize) -> Vec<bool> {
     }
 }
 
-fn reg_live_in(
-    insns: &[Insn],
-    reach: &[bool],
-    nregs: usize,
-    frames: &[FrameRegs],
-) -> Vec<Vec<bool>> {
-    // Bitsets of 256 registers (they are `u8`s), one per instruction.
-    type Set = [u64; 4];
-    let set = |s: &mut Set, r: usize| s[r / 64] |= 1 << (r % 64);
-    let clear = |s: &mut Set, r: usize| s[r / 64] &= !(1 << (r % 64));
-    let mut exit_sets: HashMap<u8, Set> = HashMap::default();
+/// Per instruction, the registers live into it (backward dataflow, over
+/// the reachable instructions): read before being written on some path,
+/// by an instruction or by the interpreter after a bail.
+fn reg_live_in(insns: &[Insn], reach: &[bool], nregs: usize, frames: &[FrameRegs]) -> Vec<RegSet> {
     let n = insns.len();
-    let mut live_in: Vec<Set> = vec![[0; 4]; n];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in (0..n).rev().filter(|&i| reach[i]) {
-            let insn = &insns[i];
-            let mut live: Set = [0; 4];
-            for s in succs(insns, i).filter(|&s| s < n) {
-                for (l, x) in live.iter_mut().zip(&live_in[s]) {
-                    *l |= x;
+    // Per instruction, the registers it reads and those it writes, and
+    // whether it bails (leaving every register of its frames live: see
+    // below).
+    let mut exit_sets: HashMap<u8, RegSet> = HashMap::default();
+    let effects: Vec<(RegSet, RegSet)> = insns
+        .iter()
+        .map(|insn| {
+            let (mut reads, mut writes) = ([0; 4], [0; 4]);
+            if insn.op == Op::Star {
+                rs_add(&mut writes, insn.reg as usize);
+            } else if insn.op == Op::Mov {
+                rs_add(&mut writes, insn.reg2 as usize);
+                rs_add(&mut reads, insn.reg as usize);
+            } else if insn.uses_reg_value() {
+                rs_add(&mut reads, insn.reg as usize);
+            }
+            if insn.is_call() && !insn.bail {
+                for r in insn.call_reads() {
+                    rs_add(&mut reads, r);
                 }
+            }
+            if insn.op == Op::SetKeyed && !insn.bail {
+                rs_add(&mut reads, insn.reg2 as usize);
             }
             // The interpreter runs a bailed instruction and the rest of the
             // function, which may read any register: each must hold its
             // value there, so a register with a store of a non-int32 isn't
             // pinned as an int32 (which would truncate it).
             if insn.bail {
-                live = *exit_sets.entry(insn.frame).or_insert_with(|| {
-                    let mut e = [0; 4];
-                    for (r, &l) in exit_live(frames, insn.frame, nregs).iter().enumerate() {
-                        if l {
-                            set(&mut e, r);
-                        }
-                    }
-                    e
-                });
+                let e = *exit_sets
+                    .entry(insn.frame)
+                    .or_insert_with(|| rs_of(&exit_live(frames, insn.frame, nregs)));
+                // Live: all of them (the successors' don't matter).
+                writes = [!0; 4];
+                rs_or(&mut reads, &e);
             }
-            if insn.op == Op::Star {
-                clear(&mut live, insn.reg as usize);
-            } else if insn.op == Op::Mov {
-                clear(&mut live, insn.reg2 as usize);
-                set(&mut live, insn.reg as usize);
-            } else if insn.uses_reg_value() {
-                set(&mut live, insn.reg as usize);
+            (reads, writes)
+        })
+        .collect();
+    let mut live_in: Vec<RegSet> = vec![[0; 4]; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..n).rev().filter(|&i| reach[i]) {
+            let mut live: RegSet = [0; 4];
+            for s in succs(insns, i).filter(|&s| s < n) {
+                rs_or(&mut live, &live_in[s]);
             }
-            if insn.is_call() && !insn.bail {
-                for r in insn.call_reads() {
-                    set(&mut live, r);
-                }
+            let (reads, writes) = &effects[i];
+            for (l, (r, w)) in live.iter_mut().zip(reads.iter().zip(writes)) {
+                *l = (*l & !w) | r;
             }
-            if insn.op == Op::SetKeyed && !insn.bail {
-                set(&mut live, insn.reg2 as usize);
-            }
-            if live != live_in[i] {
+            if !rs_eq(&live, &live_in[i]) {
                 live_in[i] = live;
                 changed = true;
             }
         }
     }
     live_in
-        .iter()
-        .map(|s| (0..nregs).map(|r| s[r / 64] >> (r % 64) & 1 != 0).collect())
-        .collect()
 }
 
 /// Registers that may be pinned (kept unboxed in a slot). A pinned register
@@ -3497,12 +3657,13 @@ fn pinnable(
             _ => false,
         }
     };
+    let spill_points: Vec<usize> = (0..n).filter(|&i| reach[i] && may_spill(i)).collect();
     (0..nregs)
         .map(|r| {
             live_at_entry[r]
-                || (0..n)
-                    .filter(|&i| reach[i] && may_spill(i))
-                    .all(|i| assigned[i].as_ref().is_some_and(|a| a[r]))
+                || spill_points
+                    .iter()
+                    .all(|&i| assigned[i].as_ref().is_some_and(|a| a[r]))
         })
         .collect()
 }
@@ -3545,13 +3706,15 @@ impl Piece {
     /// variant (one `movz` instead of `movz` + `movk`) when it has one and
     /// the immediate fits.
     fn with_imm(name: &str, imm: i32) -> Piece {
-        let k16 = format!("{name}_k16");
-        let fits = cfg!(target_arch = "aarch64") && (0..=0xFFFF).contains(&imm);
-        let name = if fits && has_stencil(&k16) {
-            k16.as_str()
-        } else {
-            name
-        };
+        if cfg!(target_arch = "aarch64") && (0..=0xFFFF).contains(&imm) {
+            let k16 = format!("{name}_k16");
+            if has_stencil(&k16) {
+                return Piece {
+                    imm,
+                    ..Piece::new(&k16, 0)
+                };
+            }
+        }
         Piece {
             imm,
             ..Piece::new(name, 0)
@@ -3560,13 +3723,19 @@ impl Piece {
 
     fn new(name: &str, reg: u8) -> Piece {
         let stencil = Instance::get(name);
-        let slow = stencil
-            .stencil
-            .slow
-            .then(|| Instance::get(&format!("{name}__slow")));
+        let slow = (stencil.stencil.slow).then(|| Instance::get(&format!("{name}__slow")));
+        Piece {
+            slow,
+            ..Piece::of(stencil, reg)
+        }
+    }
+
+    /// The instance `stencil`, without its `__slow` helper (spills have
+    /// none). On arm64, a family template's name isn't the instance's.
+    fn of(stencil: Instance, reg: u8) -> Piece {
         Piece {
             stencil,
-            slow,
+            slow: None,
             imm: 0,
             imm64: 0,
             imm64b: 0,
@@ -3612,7 +3781,8 @@ fn edge_conversions(from: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Pie
         (Ty::I32, Ty::Any) => out.push(Piece::new("box_iacc", 0)),
         _ => {}
     }
-    for (r, (&a, &b)) in from.regs.iter().zip(&to.regs).enumerate() {
+    for (r, b) in to.regs.iter() {
+        let a = from.regs[r];
         if a == Ty::I32 && b == Ty::F64 && matches!(homes[r], Home::Mem | Home::Gpr(_)) {
             out.push(Piece::new(&format!("conv_{}_f", homes[r].loc()), r as u8));
         }
@@ -3677,12 +3847,7 @@ fn spills(homes: &[Home]) -> Vec<Piece> {
     homes
         .iter()
         .enumerate()
-        .filter_map(|(r, &h)| match h {
-            Home::Mem => None,
-            Home::Gpr(k) => Some(Piece::new(&format!("spill_g{k}"), r as u8)),
-            Home::Int(k) => Some(Piece::new(&format!("spill_u{k}"), r as u8)),
-            Home::Fpr(k) => Some(Piece::new(&format!("spill_f{k}"), r as u8)),
-        })
+        .filter_map(|(r, &h)| spill_piece(h, r as u8))
         .collect()
 }
 
@@ -3697,9 +3862,29 @@ fn spill_name(home: Home) -> Option<String> {
     }
 }
 
-/// The piece that writes register `r`'s slot back to memory, if it has one.
+/// The piece that writes register `r`'s slot back to memory (`spill_g3`),
+/// if it has one. (The stencils are looked up once: exits write back
+/// every slot, many times a compilation.)
 fn spill_piece(home: Home, r: u8) -> Option<Piece> {
-    spill_name(home).map(|name| Piece::new(&name, r))
+    static SPILLS: std::sync::OnceLock<Vec<Option<Instance>>> = std::sync::OnceLock::new();
+    let table = SPILLS.get_or_init(|| {
+        let at = |kind: &str, k: usize| Instance::find(&format!("spill_{kind}{k}"));
+        let some = |n: usize, kind: &'static str| {
+            (0..16).map(move |k| if k < n { at(kind, k) } else { None })
+        };
+        some(GPR_SLOTS, "g")
+            .chain(some(GPR_SLOTS, "u"))
+            .chain(some(FP_SLOTS, "f"))
+            .collect()
+    });
+    let at = match home {
+        Home::Mem => return None,
+        Home::Gpr(k) => k as usize,
+        Home::Int(k) => 16 + k as usize,
+        Home::Fpr(k) => 32 + k as usize,
+    };
+    let stencil = table[at].unwrap_or_else(|| panic!("no spill stencil for {home:?}"));
+    Some(Piece::of(stencil, r))
 }
 
 /// The piece that boxes an accumulator of type `acc`, if it isn't boxed:
@@ -3747,7 +3932,11 @@ fn stencil_for(
         // The callee reads its arguments from memory.
         // The receiver in its slot; a boxed argument unless `_i`.
         ("array_push" | "array_pop", _) => {
-            let at = homes.get(slot_reg(insn, sel, homes) as usize).copied().unwrap_or(Home::Mem).loc();
+            let at = homes
+                .get(slot_reg(insn, sel, homes) as usize)
+                .copied()
+                .unwrap_or(Home::Mem)
+                .loc();
             if sel.base == "array_push" && !sel.case.starts_with('i') {
                 box_acc(&mut pre);
             }
@@ -3759,12 +3948,7 @@ fn stencil_for(
         }
         ("call" | "call_direct" | "construct_direct", _) => {
             for r in insn.call_reads() {
-                match homes[r] {
-                    Home::Mem => {}
-                    Home::Gpr(k) => pre.push(Piece::new(&format!("spill_g{k}"), r as u8)),
-                    Home::Int(k) => pre.push(Piece::new(&format!("spill_u{k}"), r as u8)),
-                    Home::Fpr(k) => pre.push(Piece::new(&format!("spill_f{k}"), r as u8)),
-                }
+                pre.extend(spill_piece(homes[r], r as u8));
             }
             sel.base.into()
         }
@@ -3790,12 +3974,7 @@ fn stencil_for(
                 box_acc(&mut pre);
             }
             let k = insn.reg2;
-            match homes[k as usize] {
-                Home::Mem => {}
-                Home::Gpr(h) => pre.push(Piece::new(&format!("spill_g{h}"), k)),
-                Home::Int(h) => pre.push(Piece::new(&format!("spill_u{h}"), k)),
-                Home::Fpr(h) => pre.push(Piece::new(&format!("spill_f{h}"), k)),
-            }
+            pre.extend(spill_piece(homes[k as usize], k));
             if sel.case.is_empty() {
                 format!("set_keyed_{loc}")
             } else {
@@ -4800,6 +4979,19 @@ impl JitCode {
         opts: Options,
         vm: VmCompile,
     ) -> JitCode {
+        timed(&COMPILE_NS, || {
+            Self::compile_region(insns, entry, actual, widened, opts, vm)
+        })
+    }
+
+    fn compile_region(
+        insns: &[Insn],
+        entry: usize,
+        actual: TypeState,
+        widened: &HashSet<usize>,
+        opts: Options,
+        vm: VmCompile,
+    ) -> JitCode {
         let VmCompile {
             props,
             feedback,
@@ -4825,11 +5017,11 @@ impl JitCode {
         // (typically `undefined`) are never read, so they shouldn't widen the
         // types the region's own stores give them.
         let reach = reachable(insns, entry);
-        let live_in = reg_live_in(insns, &reach, nregs, frames);
+        let live_sets = reg_live_in(insns, &reach, nregs, frames);
         // Not inlined frames' registers: none has started at an entry (see
         // `JitFunction::entry_types`).
-        let live_at_entry: Vec<bool> = (live_in[entry].iter().enumerate())
-            .map(|(r, &l)| l && (feedback.is_none() || r < inline_base))
+        let live_at_entry: Vec<bool> = (0..nregs)
+            .map(|r| rs_has(&live_sets[entry], r) && (feedback.is_none() || r < inline_base))
             .collect();
         // In a VM frame, registers whose live ranges don't overlap share
         // slots (see `assign_homes`): live here also where an exit leaves
@@ -4841,7 +5033,7 @@ impl JitCode {
         let share_live: Option<Vec<RegSet>> = exit_live
             .filter(|e| feedback.is_some() && opts.register_homes && e.len() == n && nregs <= 256)
             .map(|e| {
-                let mut l: Vec<RegSet> = live_in.iter().map(|l| rs_of(l)).collect();
+                let mut l = live_sets.clone();
                 // Where an exit may leave: an instruction that can exit, and
                 // the one after a call (it exits there).
                 let quiet = |i: &Insn| {
@@ -4898,7 +5090,7 @@ impl JitCode {
                             out[w / 64] &= !(1 << (w % 64));
                         }
                         rs_or(&mut out, &uses[k]);
-                        if out != l[k] {
+                        if !rs_eq(&out, &l[k]) {
                             l[k] = out;
                             changed = true;
                         }
@@ -4940,7 +5132,7 @@ impl JitCode {
         let mut actual_live = actual.clone();
         for (r, &live) in live_at_entry.iter().enumerate() {
             if !live {
-                actual_live.regs[r] = Ty::Bot;
+                actual_live.regs.set(r, Ty::Bot);
             }
         }
 
@@ -4977,7 +5169,13 @@ impl JitCode {
                     )
             })
             .collect();
-        let nonneg = nonneg_acc(insns, &is_target, nregs, frames);
+        let nonneg = nonneg_acc(
+            insns,
+            &is_target,
+            nregs,
+            frames,
+            (entry == 0).then(|| &live_sets[0]),
+        );
         // `this` and the arguments' types at call `i`, in state `st`.
         let call_types = |i: usize, st: &TypeState| {
             let insn = &insns[i];
@@ -5008,7 +5206,7 @@ impl JitCode {
                 widened,
                 pinned: &unpinned,
                 acc_live: &acc_live,
-                reg_live: &live_in,
+                reg_live: &live_sets,
                 props,
                 wraps: &wraps,
                 nonneg: &nonneg,
@@ -5037,11 +5235,11 @@ impl JitCode {
             .map(|(r, (ok, &load))| ok && (!load || live_at_entry[r]))
             .collect();
             let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
+            let stats = home_stats(insns, &ins1, nregs);
             let (homes, ins) = loop {
                 let homes = if opts.register_homes {
                     assign_homes(
-                        insns,
-                        &ins1,
+                        &stats,
                         nregs,
                         &no_fp,
                         &no_int,
@@ -5056,7 +5254,7 @@ impl JitCode {
                 let mut entry_state = actual_live.clone();
                 for (r, &p) in pinned.iter().enumerate() {
                     if p && live_at_entry[r] {
-                        entry_state.regs[r] = Ty::F64;
+                        entry_state.regs.set(r, Ty::F64);
                     }
                 }
                 // Nothing pinned: the types are those already inferred.
@@ -5205,7 +5403,7 @@ impl JitCode {
                         if unsafe { extends(x as *const Shape, y as *const Shape) })
             };
             actual_live.acc == Ty::Bot
-                && actual_live.regs.iter().enumerate().all(|(r, &v)| {
+                && actual_live.regs.iter().all(|(r, v)| {
                     let a = match r {
                         0 => this,
                         r if r <= nparams => args.get(r - 1).copied().unwrap_or(Ty::Any),
@@ -5253,7 +5451,7 @@ impl JitCode {
         // order: its fall-through edge conversions, then (at its label) any
         // pieces it needs first, then its stencil. Jump edges needing
         // conversions get cold stubs; exits get cold spill-and-exit stubs.
-        let mut hot: Vec<Piece> = Vec::new();
+        let mut hot: Vec<Piece> = Vec::with_capacity(2 * n);
         let mut stubs: Vec<Vec<Piece>> = Vec::new();
         let mut exits: Vec<(usize, Vec<Piece>)> = Vec::new();
         let mut label_piece = vec![usize::MAX; n];
@@ -5535,7 +5733,7 @@ impl JitCode {
             };
             let main = Piece {
                 // `push` and `pop` read the receiver's slot.
-                reg: slot_reg(insn, &s, &homes),
+                reg: slot_reg(insn, s, &homes),
                 jump,
                 exit: i,
                 imm64,
@@ -6370,11 +6568,9 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
         };
         TypeState {
             acc: if acc_live { Ty::Any } else { Ty::Bot },
-            regs: live
-                .iter()
-                .enumerate()
-                .map(|(r, &l)| if l { ty(r) } else { Ty::Bot })
-                .collect(),
+            regs: Regs::from_dense(
+                (live.iter().enumerate()).map(|(r, &l)| if l { ty(r) } else { Ty::Bot }),
+            ),
             same: Vec::new(),
             acc_same: None,
         }
@@ -6650,7 +6846,7 @@ struct Lowering<'a> {
     direct: Vec<DirectSetup>,
     /// Per function, the registers live into each of its instructions, in
     /// its own frame (see [`Lowering::dead_after`]).
-    live: HashMap<*const crate::vm::Code, Rc<Vec<Vec<bool>>>>,
+    live: HashMap<*const crate::vm::Code, Rc<Vec<RegSet>>>,
     /// For the call being lowered, registers of its window that are
     /// copies of another register, with that register, both renamed (see
     /// [`window_sources`]).
@@ -6675,14 +6871,55 @@ struct Lowering<'a> {
 ///
 /// Every instruction keeps its frame and bytecode offset, which exits
 /// record.
+/// Time spent lowering and compiling, in nanoseconds, over the process
+/// (`toi` prints it with `TOI_JIT_TIME` set).
+pub static LOWER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMPILE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Lowerings and compilations running (a call binding compiles its
+    /// callee within its caller's): only the outermost is timed.
+    static TIMING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `f`, adding its time to `total` unless it runs within another timed
+/// call.
+pub static LOWERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn timed<T>(total: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> T) -> T {
+    if std::ptr::eq(total, &LOWER_NS) {
+        LOWERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let depth = TIMING.with(|d| d.replace(d.get() + 1));
+    let t = std::time::Instant::now();
+    let r = f();
+    if depth == 0 {
+        total.fetch_add(
+            t.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    TIMING.with(|d| d.set(depth));
+    r
+}
+
 fn lower(state: &mut VmState, epoch: u32) -> Lowered {
+    timed(&LOWER_NS, || lower_frames(state, epoch))
+}
+
+fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     let root = state.root;
+    let root_len = state.root_insns.len();
     let mut cx = Lowering {
         state,
         epoch,
         out: Lowered {
-            insns: Vec::new(),
-            props: Vec::new(),
+            // (Inlined calls make it longer.)
+            insns: Vec::with_capacity(4 * root_len),
+            props: Vec::with_capacity(4 * root_len),
             mats: HashMap::default(),
             frames: vec![InlineFrame {
                 construct: false,
@@ -6722,8 +6959,10 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
             (i.op, i.imm, *p) = (Op::LdaSmi, k, Prop::None);
         }
     }
-    scalar_replace(&mut cx.out);
-    if cx.state.tier == Tier::Warm {
+    if std::env::var_os("X_NOSR").is_none() {
+        scalar_replace(&mut cx.out);
+    }
+    if cx.state.tier == Tier::Warm || std::env::var_os("X_NOSHARE").is_some() {
         return cx.out;
     }
     for f in &cx.out.frames {
@@ -6848,16 +7087,39 @@ struct Replacement {
     live: Vec<(usize, *const Shape, Vec<u8>)>,
 }
 
-fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacement> {
+fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> {
     const NO: u8 = 0;
     const YES: u8 = 1;
     const MAYBE: u8 = 2;
+    /// Which registers hold the object for sure (`yes`), or on some
+    /// paths only (`maybe`).
     #[derive(Clone, PartialEq)]
     struct St {
-        regs: Vec<u8>,
+        yes: RegSet,
+        maybe: RegSet,
         acc: u8,
         shape: *const Shape,
     }
+    let get = |st: &St, r: usize| {
+        if rs_has(&st.maybe, r) {
+            MAYBE
+        } else if rs_has(&st.yes, r) {
+            YES
+        } else {
+            NO
+        }
+    };
+    let set = |st: &mut St, r: usize, v: u8| {
+        let bit = 1u64 << (r % 64);
+        st.yes[r / 64] &= !bit;
+        st.maybe[r / 64] &= !bit;
+        match v {
+            YES => st.yes[r / 64] |= bit,
+            MAYBE => st.maybe[r / 64] |= bit,
+            _ => {}
+        }
+    };
+    let meets = |a: &RegSet, b: &RegSet| a.iter().zip(b).any(|(x, y)| x & y != 0);
     let insns = &out.insns;
     let n = insns.len();
     let nregs = out.nregs;
@@ -6872,7 +7134,8 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
     // Forward over the whole function, from its start, so that a path
     // that doesn't come from the allocation counts where paths join.
     let start = St {
-        regs: vec![NO; nregs],
+        yes: [0; 4],
+        maybe: [0; 4],
         acc: NO,
         shape: root,
     };
@@ -6880,9 +7143,8 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
     let mut rewrites: HashMap<usize, (usize, bool)> = HashMap::default();
     let mut slots = 0usize;
     let mut work = vec![(0, start)];
-    let held = |st: &St, live: &[bool]| {
-        st.acc != NO || st.regs.iter().zip(live).any(|(&h, &l)| h != NO && l)
-    };
+    let held =
+        |st: &St, live: &RegSet| st.acc != NO || meets(&st.yes, live) || meets(&st.maybe, live);
     while let Some((i, st)) = work.pop() {
         if i >= n {
             return None;
@@ -6890,10 +7152,10 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
         let st = match &ins[i] {
             Some(old) => {
                 let mut j = old.clone();
-                for (x, y) in j.regs.iter_mut().zip(&st.regs) {
-                    if x != y {
-                        *x = MAYBE;
-                    }
+                for k in 0..4 {
+                    let maybe = j.maybe[k] | st.maybe[k] | (j.yes[k] ^ st.yes[k]);
+                    j.yes[k] &= st.yes[k] & !maybe;
+                    j.maybe[k] = maybe;
                 }
                 if j.acc != st.acc {
                     j.acc = MAYBE;
@@ -6920,25 +7182,25 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
         }
         // Registers holding it that the interpreter would read after an
         // exit here must hold it for sure.
-        if st.regs.iter().zip(&live[i]).any(|(&h, &l)| h == MAYBE && l) {
+        if meets(&st.maybe, &live[i]) {
             return None;
         }
         let r = insn.reg as usize;
-        let reg_held = r < nregs && st.regs[r] != NO;
+        let reg_held = r < nregs && get(&st, r) != NO;
         let mut next = st.clone();
         let fb = &out.fbs[insn.frame as usize];
         match insn.op {
             // The allocation: `acc` holds a new object (nothing holds the
             // previous one any more, checked above).
             _ if i == a => {
-                next.regs = vec![NO; nregs];
+                (next.yes, next.maybe) = ([0; 4], [0; 4]);
                 next.acc = YES;
                 next.shape = root;
             }
-            Op::Ldar => next.acc = if r < nregs { st.regs[r] } else { NO },
-            Op::Star => next.regs[r] = st.acc,
+            Op::Ldar => next.acc = if r < nregs { get(&st, r) } else { NO },
+            Op::Star => set(&mut next, r, st.acc),
             Op::GetNamed if reg_held => {
-                if st.regs[r] != YES {
+                if get(&st, r) != YES {
                     return None;
                 }
                 let shape = unsafe { &*st.shape };
@@ -6950,7 +7212,7 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
                 next.acc = NO;
             }
             Op::SetNamed if reg_held => {
-                if st.regs[r] != YES || st.acc != NO {
+                if get(&st, r) != YES || st.acc != NO {
                     return None;
                 }
                 let shape = unsafe { &*st.shape };
@@ -6982,8 +7244,9 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
             _ => {
                 // Any other use of it is an escape.
                 let reads_held = (insn.reads_reg() && reg_held)
-                    || (insn.is_call() && insn.call_reads().any(|q| q < nregs && st.regs[q] != NO))
-                    || (insn.op == Op::SetKeyed && st.regs[insn.reg2 as usize] != NO)
+                    || (insn.is_call()
+                        && insn.call_reads().any(|q| q < nregs && get(&st, q) != NO))
+                    || (insn.op == Op::SetKeyed && get(&st, insn.reg2 as usize) != NO)
                     || (st.acc != NO && reads_acc(&insn));
                 if reads_held || insn.assume != 0 && reg_held {
                     return None;
@@ -7003,8 +7266,8 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
     let live = (0..n)
         .filter_map(|i| {
             let st = ins[i].as_ref()?;
-            let regs: Vec<u8> = (0..nregs)
-                .filter(|&q| st.regs[q] == YES && live[i][q])
+            let regs: Vec<u8> = rs_iter(&st.yes)
+                .filter(|&q| q < nregs && rs_has(&live[i], q))
                 .map(|q| q as u8)
                 .collect();
             (!regs.is_empty()).then_some((i, st.shape, regs))
@@ -7025,25 +7288,25 @@ fn replacement(out: &Lowered, a: usize, live: &[Vec<bool>]) -> Option<Replacemen
 fn reads_acc(insn: &Insn) -> bool {
     insn.native == 1
         || !matches!(
-        insn.op,
-        Op::Ldar
-            | Op::LdaSmi
-            | Op::LdaUndefined
-            | Op::LdaNull
-            | Op::LdaTrue
-            | Op::LdaFalse
-            | Op::LdaGlobal
-            | Op::LdaConstant
-            | Op::Jump
-            | Op::Nop
-            | Op::GetNamed
-            | Op::CreateArray
-            | Op::CreateObject
-            | Op::CreateClosure
-            | Op::Call
-            | Op::CallUndefined
-            | Op::Construct
-    )
+            insn.op,
+            Op::Ldar
+                | Op::LdaSmi
+                | Op::LdaUndefined
+                | Op::LdaNull
+                | Op::LdaTrue
+                | Op::LdaFalse
+                | Op::LdaGlobal
+                | Op::LdaConstant
+                | Op::Jump
+                | Op::Nop
+                | Op::GetNamed
+                | Op::CreateArray
+                | Op::CreateObject
+                | Op::CreateClosure
+                | Op::Call
+                | Op::CallUndefined
+                | Op::Construct
+        )
 }
 
 fn apply_replacement(out: &mut Lowered, a: usize, plan: Replacement) {
@@ -7433,7 +7696,8 @@ fn hoist_guards(out: &mut Lowered) {
     // Rebuild, with the checks inserted.
     let mut new_of = vec![0; n + 1];
     let mut start_of: HashMap<usize, usize> = HashMap::default();
-    let (mut insns2, mut props2) = (Vec::new(), Vec::new());
+    let extra: usize = groups.iter().map(|g| g.checks.len()).sum();
+    let (mut insns2, mut props2) = (Vec::with_capacity(n + extra), Vec::with_capacity(n + extra));
     let mut g = 0;
     for k in 0..=n {
         while g < groups.len() && groups[g].at == k {
@@ -7650,7 +7914,9 @@ impl Lowering<'_> {
                         let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
                         guard.guard = fo as u64;
                         self.push(guard, Prop::None);
-                    } else if self.dead_after(f.code, k, orig.reg) && self.drop_callee_load(frame, i.reg) {
+                    } else if self.dead_after(f.code, k, orig.reg)
+                        && self.drop_callee_load(frame, i.reg)
+                    {
                         i.exit_const = crate::object::object_value(fo).to_bits();
                     }
                     if native == 1 && !stored {
@@ -7965,7 +8231,11 @@ impl Lowering<'_> {
         }
         let f = self.out.frames[frame];
         let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
-        if (depth >= MAX_INLINE_DEPTH && !self.small_leaf(ic.holder))
+        let max_depth = std::env::var("X_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(MAX_INLINE_DEPTH);
+        if (depth >= max_depth && !self.small_leaf(ic.holder))
             || self.out.frames.len() >= 255
             || self
                 .state
@@ -8481,7 +8751,7 @@ impl Lowering<'_> {
                 Rc::new(reg_live_in(insns, &reachable(insns, 0), nregs, &[]))
             })
             .clone();
-        live.get(k + 1).is_some_and(|l| !l[r as usize])
+        live.get(k + 1).is_some_and(|l| !rs_has(l, r as usize))
     }
 
     /// Whether register `r` of frame `frame` holds `fo` for sure: its last
@@ -8501,7 +8771,8 @@ impl Lowering<'_> {
             return false;
         };
         let g = insns[get];
-        let holds = |addr: u64| unsafe { *(addr as *const Value) } == crate::object::object_value(fo);
+        let holds =
+            |addr: u64| unsafe { *(addr as *const Value) } == crate::object::object_value(fo);
         // A load from a prototype slot holding it, for every receiver shape.
         let proven = match self.out.props[get] {
             Prop::Proto { addr, .. } => holds(addr),
@@ -8945,7 +9216,8 @@ impl JitFunction {
             .entry(entry)
             .or_insert_with(|| {
                 let reach = reachable(insns, entry);
-                let regs_live = reg_live_in(insns, &reach, nregs, frames)[entry].clone();
+                let set = reg_live_in(insns, &reach, nregs, frames)[entry];
+                let regs_live: Vec<bool> = (0..nregs).map(|r| rs_has(&set, r)).collect();
                 (acc_liveness(insns, &reach).0[entry], regs_live)
             })
             .clone();
@@ -8953,8 +9225,7 @@ impl JitFunction {
         let fits = |a: Ty, v: Ty| a == v || a == Ty::Bot || v == Ty::Any;
         if let Some((_, code)) = self.versions.get(&entry).and_then(|vs| {
             vs.iter().find(|(st, _)| {
-                fits(state.acc, st.acc)
-                    && state.regs.iter().zip(&st.regs).all(|(&a, &b)| fits(a, b))
+                fits(state.acc, st.acc) && state.regs.iter().all(|(r, a)| fits(a, st.regs[r]))
             })
         }) {
             return Some((code.clone(), self.nregs));
@@ -9011,11 +9282,8 @@ impl JitFunction {
         let versions = self.versions.get(&entry)?;
         versions.iter().find_map(|(st, code)| {
             let ok = (!*acc_live || fits(st.acc, acc))
-                && live
-                    .iter()
-                    .zip(&st.regs)
-                    .enumerate()
-                    .all(|(r, (&l, &t))| !l || fits(t, unsafe { *regs.add(r) }));
+                && (live.iter().enumerate())
+                    .all(|(r, &l)| !l || fits(st.regs[r], unsafe { *regs.add(r) }));
             ok.then(|| (code.clone(), acc, self.nregs))
         })
     }
@@ -9180,7 +9448,8 @@ impl JitFunction {
         let frames: &[FrameRegs] = snap.as_ref().map_or(&[], |s| &s.frame_regs);
         let (acc_live, live) = self.live_at.entry(entry).or_insert_with(|| {
             let reach = reachable(insns, entry);
-            let regs_live = reg_live_in(insns, &reach, nregs, frames)[entry].clone();
+            let set = reg_live_in(insns, &reach, nregs, frames)[entry];
+            let regs_live: Vec<bool> = (0..nregs).map(|r| rs_has(&set, r)).collect();
             (acc_liveness(insns, &reach).0[entry], regs_live)
         });
         // Only live values are looked at: dead registers may hold anything.
@@ -9200,15 +9469,12 @@ impl JitFunction {
         };
         TypeState {
             acc: ty(acc, *acc_live),
-            regs: regs
-                .iter()
-                .zip(live.iter())
-                .enumerate()
-                .map(|(r, (&v, &l))| match ty(v, l && r < inline_base) {
+            regs: Regs::from_dense(regs.iter().zip(live.iter()).enumerate().map(
+                |(r, (&v, &l))| match ty(v, l && r < inline_base) {
                     Ty::Obj(s) if r < params => Ty::Ext(s),
                     t => t,
-                })
-                .collect(),
+                },
+            )),
             same: Vec::new(),
             acc_same: None,
         }
@@ -9233,7 +9499,7 @@ impl JitFunction {
                     if unsafe { extends(x as *const Shape, y as *const Shape) })
         };
         let fits_all = |v: &TypeState| {
-            fits(actual.acc, v.acc) && actual.regs.iter().zip(&v.regs).all(|(&a, &b)| fits(a, b))
+            fits(actual.acc, v.acc) && actual.regs.iter().all(|(r, a)| fits(a, v.regs[r]))
         };
         let found = self
             .versions
@@ -9321,8 +9587,8 @@ impl JitFunction {
             }
         };
         widen(acc, st.acc);
-        for (v, &t) in regs.iter_mut().zip(&st.regs) {
-            widen(v, t);
+        for (r, t) in st.regs.iter() {
+            widen(&mut regs[r], t);
         }
         index
     }

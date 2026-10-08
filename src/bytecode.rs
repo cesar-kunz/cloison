@@ -303,6 +303,22 @@ impl Op {
         n
     }
 
+    /// Whether it is a loop's back edge (`JumpLoop`, `JumpIfLessLoop`, …).
+    pub const fn is_loop(self) -> bool {
+        matches!(
+            self,
+            Op::JumpLoop
+                | Op::JumpIfLessLoop
+                | Op::JumpIfLessSmiLoop
+                | Op::JumpIfLessEqualLoop
+                | Op::JumpIfGreaterLoop
+                | Op::JumpIfGreaterEqualLoop
+                | Op::JumpIfLessEqualSmiLoop
+                | Op::JumpIfGreaterSmiLoop
+                | Op::JumpIfGreaterEqualSmiLoop
+        )
+    }
+
     /// The plain form of a loop opcode (`JumpLoop` → `Jump`, …) or of a
     /// superinstruction (`TestLessThanJumpIfTrue` → `TestLessThan`); any
     /// other opcode as is. They behave the same apart from counting

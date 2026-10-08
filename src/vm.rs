@@ -87,13 +87,18 @@ enum Key {
     Name(Atom),
 }
 
+/// `Ic::loc` of a call's cache whose callees are what `f.call(…)` called,
+/// `f` being `Function.prototype.call` (see `interp::unwrap_call`): the JIT
+/// compiles such a call as a call of them.
+pub const VIA_CALL: i32 = 1;
+
 /// `Ic::loc` of a `GetNamed` that read an array's `length`.
 pub const LENGTH_LOC: i32 = i32::MIN;
 const _: fn(u64, Value) -> bool = field_fits;
 
 /// The first `new` of `code` returned: shrink the capacity of its objects'
 /// shapes, all reached from its private root, to the most properties one
-/// has (or [`INITIAL_CTOR_CAPACITY`]), and give later objects that. Every
+/// has (at least 1), and give later objects that. Every
 /// slot of those objects is in the object (they had room for more), below
 /// that count, so it stays where it is.
 fn settle(code: &Code) {
@@ -111,7 +116,10 @@ fn settle(code: &Code) {
     if root.is_null() {
         return;
     }
-    let mut most = INITIAL_CTOR_CAPACITY;
+    // Exactly the most properties any has: objects that get more later
+    // keep those out of line, but every object is smaller (with no
+    // collector, memory is fresh pages the kernel zeroes).
+    let mut most = 1;
     walk(root, &mut |s| most = most.max(s.keys.len() as u32));
     if most < unsafe { (*root).capacity.get() } {
         walk(root, &mut |s| s.capacity.set(most));
@@ -168,8 +176,8 @@ pub struct Code {
     /// shape last used. Slack tracking: until the first `new` returns (the
     /// capacity is not `ctor_settled`), objects get a root of their own
     /// with ample room ([`MAX_INLINE_CAPACITY`]), whose shapes then shrink
-    /// in place to the most properties any has (at least
-    /// [`INITIAL_CTOR_CAPACITY`]), so later objects share them (see
+    /// in place to the most properties any has (at least 1), so later
+    /// objects share them (see
     /// [`Vm::construct_done`]). The capacity grows afterwards if a
     /// constructed object outgrows it, with a new root.
     pub ctor_capacity: Cell<u32>,
@@ -185,6 +193,11 @@ pub struct Code {
     /// Calls left before calls enter compiled code (below zero: they do;
     /// `i32::MAX`: never).
     pub(crate) calls_left: Cell<i32>,
+    /// Loop back edges left before the interpreter tiers up: a frame of
+    /// the function starts with it and gives back what it didn't use when
+    /// it returns, so loops tier up after that many back edges over all
+    /// calls, however few each call runs.
+    pub(crate) loop_budget: Cell<i64>,
     /// What calls to the function are predicted to give, by its latest
     /// compilation, or the one in progress: a direct call to it from a
     /// function compiled meanwhile (mutual recursion) has no version of it
@@ -265,6 +278,11 @@ pub struct Vm {
     /// `Function.prototype.call`'s code: a call through it is a call of its
     /// receiver (see `interp::unwrap_call`).
     pub(crate) function_call: *const Code,
+    /// `Function.prototype.call` itself.
+    pub(crate) function_call_fn: *mut Object,
+    /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
+    pub(crate) array_push_fn: *mut Object,
+    pub(crate) array_pop_fn: *mut Object,
     a_prototype: Atom,
     a_constructor: Atom,
     a_length: Atom,
@@ -278,7 +296,10 @@ impl Default for Vm {
 
 impl Vm {
     pub fn new() -> Vm {
-        let mut stack = vec![Value::UNDEFINED; STACK_VALUES].into_boxed_slice();
+        // Zeroed, so fresh pages from the kernel, touched only as frames
+        // reach them (a frame sets its registers when pushed); filling it
+        // faulted in all 2 MiB at startup.
+        let mut stack = vec![Value::from_bits(0); STACK_VALUES].into_boxed_slice();
         let stack_end = unsafe { stack.as_mut_ptr().add(stack.len()) };
         let mut vm = Vm {
             heap: Heap::default(),
@@ -318,6 +339,9 @@ impl Vm {
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
             function_call: std::ptr::null(),
+            function_call_fn: std::ptr::null_mut(),
+            array_push_fn: std::ptr::null_mut(),
+            array_pop_fn: std::ptr::null_mut(),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
@@ -352,11 +376,12 @@ impl Vm {
         // stores' fast paths never take one.
         unsafe { (*vm.string_shape.cast_mut()).elems_code = NO_ELEMENTS };
         let ap = vm.array_prototype;
-        vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
-        vm.define_native(ap, "pop", array_pop, 0, crate::jit::Ty::Any, false);
+        vm.array_push_fn = vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
+        vm.array_pop_fn = vm.define_native(ap, "pop", array_pop, 0, crate::jit::Ty::Any, false);
         let fp = vm.function_prototype;
         let call = vm.define_native(fp, "call", function_call, 1, crate::jit::Ty::Any, false);
         vm.function_call = unsafe { (*call).code };
+        vm.function_call_fn = call;
         // The constructors, with `prototype` and `constructor` links.
         let g = vm.global;
         for (name, f, proto) in [
@@ -428,7 +453,11 @@ impl Vm {
             attrs: Vec::new(),
             fields: Vec::new(),
             elems: FieldType::None,
-            elems_code: 0,
+            elems_code: if class == Class::Array {
+                NO_ELEMENTS
+            } else {
+                0
+            },
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
@@ -1225,6 +1254,7 @@ impl Vm {
             ctor_result: Cell::new(std::ptr::null()),
             jit: RefCell::new(None),
             calls_left: Cell::new(i32::MAX),
+            loop_budget: Cell::new(i64::MAX),
             ret_hint: Cell::new(ret),
         });
         let fp = object_value(self.function_prototype);
@@ -1381,6 +1411,7 @@ impl Vm {
                     } else {
                         i32::MAX
                     }),
+                    loop_budget: Cell::new(self.frame_budget),
                 })
             })
             .collect();
@@ -1459,10 +1490,7 @@ fn worth_entering_compiled(f: &crate::asm::FunctionDef) -> bool {
     let (mut pc, mut n) = (0, 0);
     while pc < code.len() {
         let op = Op::from_u8(code[pc]).expect("valid bytecode");
-        if matches!(
-            op,
-            Op::JumpLoop | Op::JumpIfLessLoop | Op::JumpIfLessSmiLoop
-        ) {
+        if op.is_loop() {
             return true;
         }
         n += 1;
@@ -1644,7 +1672,7 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     )))
 }
 
-fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
+pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
         return Err(Error::unsupported("Array.prototype.push on a non-array"));
     }

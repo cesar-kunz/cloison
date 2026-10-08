@@ -200,8 +200,14 @@ pub fn field_fits(want: u64, v: Value) -> bool {
     }
 }
 
-/// A hidden class.
+/// A hidden class. `repr(C)` with `elems_code` first: stencils read it
+/// (`array_push`).
+#[repr(C)]
 pub struct Shape {
+    /// [`Shape::elems`] encoded for store checks ([`FieldType::encode`]);
+    /// an array that has no elements' type yet has `NO_ELEMENTS`, which no
+    /// value fits, so its first store moves it to a typed shape.
+    pub elems_code: u64,
     pub class: Class,
     /// An object, or null.
     pub proto: Value,
@@ -215,14 +221,12 @@ pub struct Shape {
     pub attrs: Vec<u8>,
     /// The type of the field in each slot (see [`FieldType`]).
     pub fields: Vec<*const Cell<FieldType>>,
-    /// The type of every element stored in objects of this shape, and its
-    /// encoding for store checks ([`FieldType::encode`]). Unlike a field's
+    /// The type of every element stored in objects of this shape. Unlike a field's
     /// type it is part of the shape, as V8's elements kinds are part of the
     /// map: an element store that doesn't fit moves the object to a shape
     /// with a more general type (`Vm::store_element`), so a shape guard
     /// also guarantees the elements' type. Holes are not elements.
     pub elems: FieldType,
-    pub elems_code: u64,
     /// Owned by a single (prototype) object: transitions from it are not
     /// shared, so inline caches must not cache them.
     pub unique: bool,
@@ -237,6 +241,8 @@ pub struct Shape {
 pub const READ_ONLY: u8 = 1;
 pub const DONT_ENUM: u8 = 2;
 pub const DONT_DELETE: u8 = 4;
+
+const _: () = assert!(std::mem::offset_of!(Shape, elems_code) == 0);
 
 impl Shape {
     pub fn lookup(&self, name: Atom) -> Option<u32> {

@@ -4,3 +4,9 @@
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
 runner = "qemu-aarch64"
+
+# Host builds: statically linked and not position-independent, so starting
+# the process needs no dynamic loader or relocations (an empty script: 0.68
+# ms of CPU and 136 page faults dynamically linked, 0.31 ms and 47 static).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "relocation-model=static"]

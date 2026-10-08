@@ -758,7 +758,9 @@ In place:
 
 - Shapes with shared transition trees, roots keyed by class, prototype and
   in-object capacity, and slack tracking per constructor (settled in place
-  after the first `new`).
+  after the first `new`, to exactly the properties its objects have).
+- Scalar replacement of objects that never escape compiled code, which
+  allocates them only at exits (see `docs/future-work.md`).
 - Inline caches for `GetNamed`, `SetNamed` (including cached transitions
   to in-object slots), `LdaGlobal` and `StaGlobal`, holding the shape and
   the location; named accesses are polymorphic (up to four shapes). Prototype loads cache the holder too. Prototypes

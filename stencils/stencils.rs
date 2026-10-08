@@ -3161,8 +3161,7 @@ macro_rules! property_location {
         // be one), an int32 key within its length, a value its shape's
         // elements' type (`Shape::elems_code`, at offset 0) fits; else
         // leave before. `acc` boxed, or (`_i`) an int32, which fits codes
-        // 0 to 2, or (`_sh`) an object of shape `imm64`, which fits code 0
-        // or that shape.
+        // 0 to 2, or (`_o`) an object, which fits code 0 or its shape.
         set_keyed!($loc, "", is_array, |s, v, code| match code {
             0 => true,
             1 => s.tag.is_int32(v),
@@ -3171,7 +3170,7 @@ macro_rules! property_location {
         }, |s| s.acc);
         set_keyed!($loc, "i_", is_array, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
-        set_keyed!($loc, "sh_", is_array, |s, v, code| code == 0 || code == imm64(), |s| s.acc);
+        set_keyed!($loc, "o_", is_array, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
         set_keyed!($loc, "nc_", |_, _| true, |s, v, code| match code {
             0 => true,
             1 => s.tag.is_int32(v),
@@ -3180,11 +3179,19 @@ macro_rules! property_location {
         }, |s| s.acc);
         set_keyed!($loc, "nc_i_", |_, _| true, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
-        set_keyed!($loc, "nc_sh_", |_, _| true, |s, v, code| code == 0 || code == imm64(), |s| s.acc);
+        set_keyed!($loc, "nc_o_", |_, _| true, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
         // A polymorphic access (`jit::Prop::Poly`): a cell check, then a
         // compare per cached shape (`imm64`), each branching to its own
         // `_nc` access but the last, which exits on a mismatch and falls
         // through to its access.
+        // A load whose value is unused (`jit::Insn::check_only`): its
+        // receiver's shape guard alone.
+        stencil!("check_shape_", loc!($loc); |s| {
+            if guard_shape(s.tag, get!($loc, s)).is_none() {
+                exit!(s)
+            }
+            next!(s)
+        });
         stencil!("guard_cell_", loc!($loc); |s| {
             if !is_cell(s.tag, get!($loc, s)) {
                 exit!(s)
@@ -3484,6 +3491,13 @@ stencil!("construct_direct"; |s| {
 // Before an inlined `new`: the constructor's `prototype` slot (at
 // `imm64`) still holds `imm64b`, the prototype of the shape the inlined
 // body assumes; else leave before the `new`.
+// In an exit stub: the register at `regs + reg hole` is `imm64` (a value
+// compiled code knew and didn't write; see `jit::Insn::exit_const`).
+stencil!("store_const_m"; |s| {
+    *mem(s.regs) = Value::from_bits(imm64());
+    next!(s)
+});
+
 stencil!("guard_word"; |s| {
     if *(imm64() as *const u64) != imm64b() {
         exit!(s)

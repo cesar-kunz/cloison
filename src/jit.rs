@@ -915,22 +915,37 @@ mod arch {
 // ---- Executable memory ----
 
 /// An anonymous RW mapping, made RX by [`ExecMem::seal`].
+/// Executable memory: pages of a reserved range, never reused for other
+/// code once freed. Code mapped where freed code was ran up to a third
+/// slower in some runs (frontend stalls, 13-missing-arguments' recompile
+/// landing on its first version's page: 46M or 61M cycles from one run to
+/// the next), as if the CPU kept state for the old code.
 struct ExecMem {
     ptr: *mut u8,
     len: usize,
 }
 
+/// The reserved range code is carved from: (next free address, end).
+static EXEC_RANGE: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+const EXEC_RESERVE: usize = 1 << 30;
+
 impl ExecMem {
     fn new(len: usize) -> Self {
         let len = len.max(1).next_multiple_of(4096);
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
-        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, flags, -1, 0) };
-        assert!(ptr != libc::MAP_FAILED, "mmap failed");
-        ExecMem {
-            ptr: ptr.cast(),
-            len,
+        let mut range = EXEC_RANGE.lock().unwrap();
+        if range.1 - range.0 < len {
+            let size = EXEC_RESERVE.max(len);
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+            let base =
+                unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_NONE, flags, -1, 0) };
+            assert!(base != libc::MAP_FAILED, "mmap failed");
+            *range = (base as usize, base as usize + size);
         }
+        let ptr = range.0 as *mut u8;
+        range.0 += len;
+        let r = unsafe { libc::mprotect(ptr.cast(), len, libc::PROT_READ | libc::PROT_WRITE) };
+        assert_eq!(r, 0, "mprotect failed");
+        ExecMem { ptr, len }
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -946,8 +961,12 @@ impl ExecMem {
 }
 
 impl Drop for ExecMem {
+    /// The pages go back to the system; their addresses stay reserved.
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+        unsafe {
+            libc::madvise(self.ptr.cast(), self.len, libc::MADV_DONTNEED);
+            libc::mprotect(self.ptr.cast(), self.len, libc::PROT_NONE);
+        }
     }
 }
 
@@ -1373,6 +1392,15 @@ pub(crate) enum Prop {
         shape: u64,
         new_shape: u64,
         off: i32,
+        ft: FieldType,
+    },
+    /// A load folded to the value it had when compiled, `value`, of a
+    /// field of type `ft`, after a check that the word at `at` still is
+    /// `expect` (no check if `at` is 0). See [`fold_constant_loads`].
+    Const {
+        value: u64,
+        at: u64,
+        expect: u64,
         ft: FieldType,
     },
     /// A global, in the global object at `global`.
@@ -2723,6 +2751,20 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     let reg = st.regs.get(insn.reg as usize).copied().unwrap_or(Any);
     let prop = spec.props.get(i).copied().unwrap_or(Prop::None);
     let load = matches!(insn.op, Op::GetNamed | Op::LdaGlobal);
+    if let Prop::Const {
+        value,
+        at,
+        expect,
+        ft,
+    } = prop
+    {
+        out.acc = Ty::of_field(ft).0;
+        return Sel {
+            ops: Some((0, value, 0)),
+            check: (at != 0).then_some(("guard_word", at, expect)),
+            ..Sel::new("lda_constant", "", out)
+        };
+    }
     // The check a store of `acc` into a field of type `ft` needs; `Err` if
     // `acc` can't fit.
     let check = |ft: FieldType| -> Result<Option<(&'static str, u64, u64)>, ()> {
@@ -5895,6 +5937,9 @@ pub(crate) struct Snapshot {
     /// registers an exit from it leaves to the interpreter (see
     /// [`reg_live_in`]).
     frame_regs: Vec<FrameRegs>,
+    /// See [`Lowered::aliases`]: an exit copies each argument into its
+    /// parameter, for the interpreter.
+    aliases: Vec<(u8, u8, u8)>,
     /// Owned here so they live as long as code pointing to them.
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
 }
@@ -6030,6 +6075,10 @@ struct Lowered {
     /// Where direct calls' frames start: registers from there are set up
     /// for callees, which read them from memory (see [`lower`]).
     direct_base: usize,
+    /// Parameters of inlined frames read straight from the caller's
+    /// argument registers: `(frame, parameter, argument)`, registers
+    /// renamed (see [`Lowering::arg_moves`]).
+    aliases: Vec<(u8, u8, u8)>,
 }
 
 /// A direct call as first lowered, its frame setup's registers relative to
@@ -6067,6 +6116,45 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
     }
 }
 
+/// For the call at `insns[k]`, the registers of its window (`this` and the
+/// arguments) that hold a copy of another register `x` until the call: set
+/// by `Mov x, w` or `Ldar x; Star w`, with no jump into the code from there
+/// to the call and nothing there writing `x` or calling. An inlined callee
+/// may read `x` for such a `w` (see [`Lowering::arg_moves`]); `w` is still
+/// set, for the interpreter. As `(w, x)`.
+fn window_sources(insns: &[Insn], is_target: &[bool], k: usize) -> Vec<(u8, u8)> {
+    let call = &insns[k];
+    let n = call.imm as usize + usize::from(call.op == Op::Call);
+    let writes = |j: &Insn| match j.op {
+        Op::Star => Some(j.reg),
+        Op::Mov => Some(j.reg2),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for w in (call.reg2 as usize..call.reg2 as usize + n).map(|w| w as u8) {
+        let Some(s) = (0..k).rev().find(|&s| writes(&insns[s]) == Some(w)) else {
+            continue;
+        };
+        let x = match insns[s].op {
+            Op::Mov if !insns[s].bail => insns[s].reg,
+            Op::Star
+                if s > 0 && !is_target[s] && insns[s - 1].op == Op::Ldar && !insns[s - 1].bail =>
+            {
+                insns[s - 1].reg
+            }
+            _ => continue,
+        };
+        let clear = (s + 1..k).all(|j| {
+            let j = &insns[j];
+            !j.bail && !j.is_call() && writes(j) != Some(x)
+        });
+        if clear && (s + 1..=k).all(|j| !is_target[j]) {
+            out.push((w, x));
+        }
+    }
+    out
+}
+
 /// What [`lower`] reads and builds.
 struct Lowering<'a> {
     state: &'a mut VmState,
@@ -6076,6 +6164,10 @@ struct Lowering<'a> {
     /// Per function, the registers live into each of its instructions, in
     /// its own frame (see [`Lowering::dead_after`]).
     live: HashMap<*const crate::vm::Code, Rc<Vec<Vec<bool>>>>,
+    /// For the call being lowered, registers of its window that are
+    /// copies of another register, with that register, both renamed (see
+    /// [`window_sources`]).
+    fwd: Vec<(u8, u8)>,
 }
 
 /// The function's instructions as compiled, from its code and inline caches:
@@ -6116,9 +6208,11 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
             sites: Vec::new(),
             nregs: unsafe { (*root).nregs } as usize,
             direct_base: usize::MAX,
+            aliases: Vec::new(),
         },
         direct: Vec::new(),
         live: HashMap::default(),
+        fwd: Vec::new(),
     };
     cx.out.fbs.push(cx.feedback(root));
     let rets = cx.emit_frame(0, 0);
@@ -6126,6 +6220,7 @@ fn lower(state: &mut VmState, epoch: u32) -> Lowered {
     cx.place_direct_frames();
     fold_constant_tests(&mut cx.out.insns);
     reuse_global_loads(&mut cx.out);
+    fold_constant_loads(&mut cx.out, &cx.state.property_exits);
     scalar_replace(&mut cx.out);
     cx.out
 }
@@ -6477,6 +6572,118 @@ fn reuse_global_loads(out: &mut Lowered) {
     }
 }
 
+/// Loads of objects that mostly stay what they are: a global's (a
+/// function, say) and properties of an object so loaded, or loaded so
+/// (`C.parent.prototype.m`). Each becomes the value it has now
+/// ([`Prop::Const`]), after a check that its slot still holds it (or, for
+/// a prototype's property, that the receiver's shape is the one the cache
+/// found it under); none for a slot of a prototype, which holds its value
+/// while the prototype epoch the code is compiled under holds (see
+/// `Vm::store_field`). A guard on the callee then needs no code if its
+/// register holds the function. Only in-object slots (out-of-line ones
+/// move when they grow), in straight-line code (registers' values known
+/// from the last jump target on), not where such a check exited, and not
+/// a global the code stores to.
+fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) {
+    use crate::object::{Object, PROTOTYPE};
+    let n = out.insns.len();
+    let mut target = vec![false; n + 1];
+    for i in out.insns.iter().filter(|i| i.jumps()) {
+        if i.target <= n {
+            target[i.target] = true;
+        }
+    }
+    let word = |at: u64| unsafe { *(at as *const u64) };
+    let object = |v: u64| Value::from_bits(v).is_cell().then_some(v as *mut Object);
+    let proto = |o: *mut Object| unsafe { (*o).flags & PROTOTYPE != 0 };
+    // Globals the code stores to: likely to change.
+    let stored: Vec<Atom> = (out.insns.iter())
+        .filter(|i| i.op == Op::StaGlobal)
+        .map(|i| out.fbs[i.frame as usize].name(i))
+        .collect();
+    // Registers known to hold a value, and what `acc` holds.
+    let mut known: Vec<(u8, u64)> = Vec::new();
+    let mut acc: Option<u64> = None;
+    for k in 0..n {
+        let i = out.insns[k];
+        if target[k] || i.bail {
+            known.clear();
+            acc = None;
+        }
+        if i.bail {
+            continue;
+        }
+        let exited = || exits.contains_key(&(out.frames[i.frame as usize].code as usize, i.pc));
+        let of = |r: u8| known.iter().find(|&&(x, _)| x == r).map(|&(_, v)| v);
+        // (value, the word checked and what it must be, field type).
+        let folded = match (i.op, out.props[k]) {
+            _ if i.check_only => None,
+            (
+                Op::LdaGlobal,
+                Prop::Global {
+                    global,
+                    off,
+                    oop,
+                    ft,
+                    ..
+                },
+            ) => {
+                let at = global + off as u64;
+                let stored = || stored.contains(&out.fbs[i.frame as usize].name(&i));
+                (!oop && !stored()).then(|| (word(at), at, word(at), ft))
+            }
+            (Op::GetNamed, Prop::Own { shape, off, ft }) => of(i.reg)
+                .and_then(object)
+                .filter(|&o| word(o as u64) == shape)
+                .map(|o| {
+                    let at = o as u64 + off as u64;
+                    (word(at), if proto(o) { 0 } else { at }, word(at), ft)
+                }),
+            (Op::GetNamed, Prop::Proto { shape, addr, ft }) => of(i.reg)
+                .and_then(object)
+                .filter(|&o| word(o as u64) == shape)
+                .map(|o| (word(addr), if proto(o) { 0 } else { o as u64 }, shape, ft)),
+            _ => None,
+        };
+        let folded = folded
+            .filter(|&(value, ..)| object(value).is_some() && !exited())
+            .map(|(value, at, expect, ft)| Prop::Const {
+                value,
+                at,
+                expect: if at == 0 { 0 } else { expect },
+                ft,
+            });
+        match i.op {
+            Op::LdaGlobal | Op::GetNamed => {
+                acc = None;
+                if let Some(p @ Prop::Const { value, .. }) = folded {
+                    out.props[k] = p;
+                    acc = Some(value);
+                }
+            }
+            Op::Star => {
+                known.retain(|&(r, _)| r != i.reg);
+                if let Some(v) = acc
+                    && !i.check_only
+                {
+                    known.push((i.reg, v));
+                }
+            }
+            Op::Ldar => acc = of(i.reg),
+            Op::Nop if i.guard != 0 && !i.next_case && !i.on_shape && !i.tail && i.alloc == 0 => {
+                if of(i.reg) == Some(i.guard) {
+                    out.insns[k].guard = 0;
+                }
+            }
+            _ => {
+                if writes_acc(&i).is_some() || i.is_call() {
+                    acc = None;
+                }
+            }
+        }
+    }
+}
+
 /// `LdaTrue` or `LdaFalse` followed by a jump on `acc`'s truth (an inlined
 /// `return true`, say, tested by the caller): the jump is taken or not
 /// whatever happens, so it becomes `Jump` or nothing. Not where control
@@ -6552,11 +6759,22 @@ impl Lowering<'_> {
         let base = f.base;
         let mut start = vec![0usize; insns.len() + 1];
         let (mut fix, mut rets) = (Vec::new(), Vec::new());
+        let aliases: Vec<(u8, u8)> = (self.out.aliases.iter())
+            .filter(|a| a.0 as usize == frame)
+            .map(|a| (a.1, a.2))
+            .collect();
+        let mut is_target = vec![false; insns.len() + 1];
+        for j in insns.iter().filter(|j| j.jumps()) {
+            is_target[j.target] = true;
+        }
         for (k, orig) in insns.iter().enumerate() {
             start[k] = self.out.insns.len();
             let mut i = *orig;
             i.frame = frame as u8;
-            let renamed = |r: u8| (r as usize + base) as u8;
+            let renamed = |r: u8| {
+                let r = (r as usize + base) as u8;
+                aliases.iter().find(|a| a.0 == r).map_or(r, |a| a.1)
+            };
             match i.op {
                 Op::Ldar
                 | Op::Star
@@ -6582,6 +6800,15 @@ impl Lowering<'_> {
                 }
                 _ => {}
             }
+            self.fwd = match i.op {
+                Op::Call | Op::CallUndefined | Op::Construct if !i.bail => {
+                    window_sources(insns, &is_target, k)
+                        .into_iter()
+                        .map(|(w, x)| (renamed(w), renamed(x)))
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
             let origin = (code_key, i.pc);
             // `f.call(that, …args)` (see `vm::VIA_CALL`): a guard that the
             // callee is `Function.prototype.call`, then a call of `f`, the
@@ -7220,7 +7447,8 @@ impl Lowering<'_> {
             .iter()
             .map(|&fo| unsafe { (*(*fo).code).nparams } as usize)
             .max();
-        self.arg_moves(frame, i, nparams.unwrap_or(0));
+        let codes: Vec<_> = fos.iter().map(|&fo| unsafe { (*fo).code }).collect();
+        let aliases = self.arg_moves(frame, i, nparams.unwrap_or(0), &codes);
         if let Some(pc) = fused {
             let mut cell = synth(Op::Nop, i.reg2, frame, pc);
             (cell.guard, cell.on_shape) = (1, true);
@@ -7229,7 +7457,8 @@ impl Lowering<'_> {
         let mut rets = Vec::new();
         for (k, &fo) in fos.iter().enumerate() {
             let last = k + 1 == fos.len();
-            let (guard, r) = self.inline_case(frame, i, fo, depth, !last, Some(shapes[k]), 0);
+            let (guard, r) =
+                self.inline_case(frame, i, fo, depth, !last, Some((shapes[k], &aliases)), 0);
             if let Some(pc) = fused {
                 let g = &mut self.out.insns[guard];
                 (g.reg, g.guard, g.on_shape, g.pc) = (i.reg2, shapes[k], true, pc);
@@ -7419,7 +7648,18 @@ impl Lowering<'_> {
     /// For call `i` of frame `frame` inlined: move `this` and the first
     /// `nparams` arguments (`undefined` for missing ones) into the
     /// callee's registers, which start past the caller's and a header.
-    fn arg_moves(&mut self, frame: usize, i: &Insn, nparams: usize) {
+    /// Not a parameter that none of `callees` writes or passes in a call
+    /// window ([`Lowering::read_only`]): the callee reads the argument's
+    /// register instead, which nothing writes while the callee runs (it
+    /// is the caller's), and an exit copies it over for the interpreter
+    /// (see [`materialize`]). Returns those, as (parameter, argument).
+    fn arg_moves(
+        &mut self,
+        frame: usize,
+        i: &Insn,
+        nparams: usize,
+        callees: &[*const crate::vm::Code],
+    ) -> Vec<(u8, u8)> {
         let f = self.out.frames[frame];
         let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
         let (w, argc) = (i.reg2, i.imm as usize);
@@ -7427,18 +7667,41 @@ impl Lowering<'_> {
             Op::Call => (Some(w), w as usize + 1),
             _ => (None, w as usize),
         };
+        let mut aliases = Vec::new();
+        let mut arg = |cx: &mut Self, p: usize, src: Option<u8>| match src {
+            Some(a) if callees.iter().all(|&c| cx.read_only(c, p)) => {
+                let a = cx.fwd.iter().find(|f| f.0 == a).map_or(a, |f| f.1);
+                aliases.push(((base + p) as u8, a));
+            }
+            _ => cx.mov(frame, i.pc, src, (base + p) as u8),
+        };
         // `new` allocated `this` already.
         if i.op != Op::Construct {
-            self.mov(frame, i.pc, this, base as u8);
+            arg(self, 0, this);
         }
         for p in 0..nparams {
-            self.mov(
-                frame,
-                i.pc,
-                (p < argc).then_some((args + p) as u8),
-                (base + 1 + p) as u8,
-            );
+            arg(self, 1 + p, (p < argc).then_some((args + p) as u8));
         }
+        aliases
+    }
+
+    /// Whether register `r` of the function `code` is `this` or a
+    /// parameter that it never writes nor passes in a call window (which
+    /// must stay contiguous).
+    fn read_only(&mut self, code: *const crate::vm::Code, r: usize) -> bool {
+        if r > unsafe { (*code).nparams } as usize {
+            return false;
+        }
+        let d = self.decoded(code);
+        d.0.iter().all(|j| match j.op {
+            Op::Star => j.reg as usize != r,
+            Op::Mov => j.reg2 as usize != r,
+            Op::Call | Op::CallUndefined | Op::Construct => {
+                let n = j.imm as usize + usize::from(j.op == Op::Call);
+                !(j.reg2 as usize..j.reg2 as usize + n).contains(&r)
+            }
+            _ => true,
+        })
     }
 
     /// Inline call `i` of frame `frame` to `fo`, in a new frame: the guard
@@ -7455,7 +7718,7 @@ impl Lowering<'_> {
         fo: *mut Object,
         depth: usize,
         next_case: bool,
-        hoisted: Option<u64>,
+        hoisted: Option<(u64, &[(u8, u8)])>,
         alloc: u64,
     ) -> (usize, Vec<usize>) {
         let f = self.out.frames[frame];
@@ -7488,19 +7751,26 @@ impl Lowering<'_> {
             self.push(a, Prop::None);
             self.push(synth(Op::Star, base as u8, frame, pc), Prop::None);
         }
-        match hoisted {
-            None => self.arg_moves(frame, i, c.nparams as usize),
-            // The receiver's shape, if this callee implies it: in the
-            // window and in the callee's `this`.
-            Some(0) => {}
-            Some(shape) => {
-                for r in [i.reg2, base as u8] {
-                    let mut a = synth(Op::Nop, r, frame, pc);
-                    a.assume = shape;
-                    self.push(a, Prop::None);
-                }
+        let aliases = match hoisted {
+            None => self.arg_moves(frame, i, c.nparams as usize, &[callee]),
+            Some((_, aliases)) => aliases.to_vec(),
+        };
+        // The receiver's shape, if this callee implies it: in the window
+        // and in the callee's `this` (unless that is the window's).
+        if let Some((shape, _)) = hoisted
+            && shape != 0
+        {
+            let mut regs = vec![i.reg2];
+            if !aliases.iter().any(|a| a.0 == base as u8) {
+                regs.push(base as u8);
+            }
+            for r in regs {
+                let mut a = synth(Op::Nop, r, frame, pc);
+                a.assume = shape;
+                self.push(a, Prop::None);
             }
         }
+        (self.out.aliases).extend(aliases.iter().map(|&(p, a)| (id as u8, p, a)));
         // Locals start `undefined` only if the callee may read them before
         // writing them (`entry_live`), which also covers the interpreter
         // after an exit in it: it runs the same bytecode from there.
@@ -7581,6 +7851,7 @@ impl JitFunction {
                 mats: HashMap::default(),
                 frames: Vec::new(),
                 frame_regs: Vec::new(),
+                aliases: Vec::new(),
                 sites: Vec::new(),
             }),
             inline_base: nregs,
@@ -7696,6 +7967,7 @@ impl JitFunction {
                 mats: low.mats,
                 frames: low.frames,
                 frame_regs,
+                aliases: low.aliases,
                 sites: low.sites,
             });
         }
@@ -8270,6 +8542,15 @@ unsafe fn materialize(
             );
         }
         g = fr.parent;
+    }
+    // Parameters read from their arguments' registers.
+    let snap = code.snap.as_ref().unwrap();
+    let mut g = frame;
+    while g != 0 {
+        for &(_, p, a) in snap.aliases.iter().filter(|a| a.0 as usize == g) {
+            unsafe { *regs.add(p as usize) = *regs.add(a as usize) };
+        }
+        g = frames[g].parent;
     }
     let fr = frames[frame];
     interp::Resume {

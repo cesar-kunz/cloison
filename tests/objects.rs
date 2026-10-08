@@ -2069,13 +2069,15 @@ end
 /// `Return` gives (and then, checked, its own add does). The second call
 /// hadn't run when `fib` first compiled: it bailed, and once it ran the
 /// function compiled again. Both calls inline `fib` once, behind a callee
-/// guard; the four calls in those copies are direct.
+/// guard, which the first needn't make: the load of `fib` just before it
+/// checked the global's slot. The four calls in those copies are direct.
 #[test]
 fn direct_self_recursion() {
     let (v, s) = jit_function(&recursive_program("fib", 20, FIB), "fib");
     assert_eq!(v, "6765");
     let count = |stencil: &str| s.iter().filter(|n| n.starts_with(stencil)).count();
-    assert_eq!(count("check_callee_"), 2, "{s:?}");
+    assert_eq!(count("check_callee_"), 1, "{s:?}");
+    assert_eq!(count("guard_word+lda_constant"), 2, "{s:?}");
     assert_eq!(count("call_direct+check_acc_int"), 4, "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
 }

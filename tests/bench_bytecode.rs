@@ -86,8 +86,9 @@ fn hot_property_loops_compile_without_repeated_guards() {
 
 #[test]
 fn loops_with_calls_compile_with_the_callee_inlined() {
-    // A global function is checked (the global may change); a method from
-    // a prototype holding it needs no check (its slots are stable while
+    // A global function is checked where it is loaded, its global's slot
+    // (the global may change), then needs no check as the callee; a method
+    // from a prototype holding it needs neither (its slots are stable while
     // the code's prototype epoch holds).
     for (name, want, checked) in [
         ("10-call-global-function.asm", "tlt_jf_", true),
@@ -101,8 +102,12 @@ fn loops_with_calls_compile_with_the_callee_inlined() {
             .position(|n| n.starts_with("jlt_smi") || n.starts_with("incjlt"))
             .expect("the loop");
         let body = &s[..loop_end];
+        assert!(
+            !body.iter().any(|n| n.starts_with("check_callee_")),
+            "{name}: {s:?}"
+        );
         assert_eq!(
-            body.iter().any(|n| n.starts_with("check_callee_")),
+            body.iter().any(|n| n.starts_with("guard_word")),
             checked,
             "{name}: {s:?}"
         );

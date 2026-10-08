@@ -102,6 +102,14 @@ worth doing for speed alone. What remains is the structure: the indirect
 slots around the call, the extra call and return through the wrapper.
 Steps 4-6 address those.
 
+Step 4 (2026-10-08), not done: sampled inside the enter wrapper, a long
+DeltaBlue run spends its cycles across the wrapper's thirty-odd
+instructions, none dominant; step 4 removes loads and turns the indirect
+call direct, which step 1 suggests is worth 1-2%, at the cost of
+invalidating callers when a site unbinds. The call protocol was 21% of
+DeltaBlue x1000 (wrapper 15%, `call_direct` 5%, entry and return 1.5%):
+most of it goes only with the wrapper itself (steps 5-6).
+
 ## Recommendation
 
 Steps 1–3 are local to `call_direct`, the wrapper and the callee's return,

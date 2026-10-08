@@ -1450,6 +1450,10 @@ pub(crate) enum Prop {
     Call {
         site: u32,
         direct: bool,
+        /// The callee register holds the site's closure for sure (a guard
+        /// passed, or `Lowering::proven_callee`): `call_direct_nc`, without
+        /// that check.
+        proven: bool,
         epoch: u32,
         epoch_addr: u64,
     },
@@ -2538,10 +2542,12 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 _ => (Any, None, None),
             };
             out.acc = acc;
+            let proven = matches!(spec.props.get(i), Some(Prop::Call { proven: true, .. }));
+            let case = if base == "call_direct" && proven { "nc" } else { "" };
             return Sel {
                 result,
                 post,
-                ..Sel::new(base, "", out)
+                ..Sel::new(base, case, out)
             };
         }
         // ToInt32(a + b) is the 32-bit wrapping add: no exit, no widening.
@@ -4135,7 +4141,11 @@ fn stencil_for(
             for r in insn.call_reads() {
                 pre.extend(spill_piece(homes[r], r as u8));
             }
-            sel.base.into()
+            if sel.case == "nc" {
+                cat!(sel.base, "_nc")
+            } else {
+                sel.base.into()
+            }
         }
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) if sel.case == "nc" => {
             cat!(sel.base, "_nc_", loc)
@@ -5667,7 +5677,7 @@ impl JitCode {
                     }
                 };
                 if !bound {
-                    s.base = "call";
+                    (s.base, s.case) = ("call", "");
                 }
             }
         }
@@ -5973,7 +5983,10 @@ impl JitCode {
                 exit: i as u32,
                 ..Piece::new(name, 0)
             });
-            let is_call = matches!(name.as_str(), "call" | "call_direct" | "construct_direct");
+            let is_call = matches!(
+                name.as_str(),
+                "call" | "call_direct" | "call_direct_nc" | "construct_direct"
+            );
             // The check of a call's result exits after the call too, through
             // a stub of its own, whose record says the check failed.
             let result = s.result.map(|(name, imm64)| {
@@ -8432,7 +8445,7 @@ impl Lowering<'_> {
                             (g.guard, g.next_case) = (fo as u64, true);
                             self.push(g, Prop::None)
                         });
-                        self.emit_call(frame, i, fo);
+                        self.emit_call(frame, i, fo, guard.is_some());
                         if let Some(g) = guard {
                             let mut j = synth(Op::Jump, 0, frame, i.pc);
                             j.target = usize::MAX;
@@ -8444,7 +8457,7 @@ impl Lowering<'_> {
                 }
                 Op::Call | Op::CallUndefined | Op::Construct => {
                     let fo = unsafe { (*self.out.fbs[frame].ic(i.ic as usize)).holder };
-                    self.emit_call(frame, i, fo);
+                    self.emit_call(frame, i, fo, false);
                 }
                 _ if i.jumps() => {
                     let x = self.push(i, Prop::None);
@@ -8545,13 +8558,17 @@ impl Lowering<'_> {
     /// Call `i` of frame `frame` through a site of its own: straight into
     /// `fo`'s compiled code if it may (see [`Lowering::direct_target`]),
     /// else through the runtime.
-    fn emit_call(&mut self, frame: usize, i: Insn, fo: *mut Object) {
+    /// `guarded`: a guard that the callee register holds `fo` comes just
+    /// before.
+    fn emit_call(&mut self, frame: usize, i: Insn, fo: *mut Object, guarded: bool) {
         let vm = self.state.vm;
         let mut site = self.call_site(frame, &i);
         let direct = self.direct_target(&i, fo, &mut site) && i.imm as u32 <= site.nparams;
+        let proven = direct && (guarded || self.proven_callee(frame, i.reg, fo));
         let p = Prop::Call {
             site: self.out.sites.len() as u32,
             direct,
+            proven,
             epoch: unsafe { (*vm).code_epoch },
             epoch_addr: unsafe { &raw const (*vm).code_epoch } as u64,
         };

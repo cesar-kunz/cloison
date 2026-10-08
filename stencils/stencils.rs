@@ -3502,6 +3502,24 @@ stencil!("call_direct"; |s| {
     next!(s)
 });
 
+// `call_direct` where the callee register is known to hold the site's
+// closure (a guard on it passed): without that check.
+stencil!("call_direct_nc"; |s| {
+    let regs = Value::from_bits(s.regs as u64);
+    let site = imm64() as *const DirectSite;
+    let base = s.regs as *const u8;
+    let r = if (*site).entry != 0 && base as u64 + (*site).end_off <= (*site).stack_end {
+        Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))
+    } else {
+        Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
+    };
+    s.acc = r;
+    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+        exit!(s)
+    }
+    next!(s)
+});
+
 // `new`, as `call_direct`, allocating `this` itself: if what the
 // constructor's root shape depends on is unchanged and the heap's chunk
 // has room, bump the heap, write the header, put

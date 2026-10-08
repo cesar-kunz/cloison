@@ -1527,7 +1527,10 @@ end
     let (v, s) = jit(src);
     assert_eq!(v, "2002");
     // `new Box` inlined (its `this` allocated in the stencil), and `push`.
-    assert!(s.iter().any(|n| n.starts_with("guard_word+create_object")), "{s:?}");
+    assert!(
+        s.iter().any(|n| n.starts_with("guard_word+create_object")),
+        "{s:?}"
+    );
     assert!(s.iter().any(|n| n.starts_with("array_push")), "{s:?}");
 }
 

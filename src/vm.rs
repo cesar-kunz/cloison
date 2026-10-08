@@ -1428,10 +1428,10 @@ impl Vm {
                     ctor_result: Cell::new(std::ptr::null()),
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
-                    calls_left: Cell::new(if recursive || worth_entering_compiled(f) {
-                        self.tier_calls
-                    } else {
-                        i32::MAX
+                    calls_left: Cell::new(match (has_loop(f), recursive || large(f)) {
+                        (true, _) => self.tier_calls,
+                        (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
+                        (false, false) => i32::MAX,
                     }),
                     loop_budget: Cell::new(self.frame_budget),
                 })
@@ -1507,46 +1507,81 @@ impl Vm {
 /// Whether calls to a function should enter its compiled code once it is
 /// hot: if it has a loop (whose back-edge budget restarts with each frame,
 /// so a short loop in a function called often never tiers up by itself),
-/// or at least [`ENTRY_COMPILE_SIZE`] instructions, or if it looks
-/// recursive (see [`recursive_functions`]): its compiled code can then call
-/// itself, or the functions it recurses through, directly. Entering
-/// compiled code costs a round trip through the driver, which a small
-/// loop-free function doesn't win back; when compiled code calls it, it is
-/// inlined instead.
-fn worth_entering_compiled(f: &crate::asm::FunctionDef) -> bool {
-    use crate::bytecode::Op;
-    let code = &f.code;
-    let (mut pc, mut n) = (0, 0);
-    while pc < code.len() {
-        let op = Op::from_u8(code[pc]).expect("valid bytecode");
-        if op.is_loop() {
-            return true;
-        }
-        n += 1;
-        pc += op.size();
-    }
-    n >= ENTRY_COMPILE_SIZE
+/// or at least [`ENTRY_COMPILE_SIZE`] instructions ([`large`]), or if it
+/// looks recursive (see [`recursive_functions`]): its compiled code can
+/// then call itself, or the functions it recurses through, directly.
+/// Entering compiled code costs a round trip through the driver, which a
+/// small loop-free function doesn't win back; when compiled code calls it,
+/// it is inlined instead. A loop-free one is entered after
+/// [`LOOP_FREE_CALLS`] times as many calls: compiled sooner, its callers'
+/// feedback is still growing and it gets compiled again (91: f and g
+/// three and two times; DeltaBlue's methods).
+fn has_loop(f: &crate::asm::FunctionDef) -> bool {
+    ops(f).any(|op| op.is_loop())
 }
 
-/// See [`worth_entering_compiled`].
+/// See [`has_loop`].
+fn large(f: &crate::asm::FunctionDef) -> bool {
+    ops(f).count() >= ENTRY_COMPILE_SIZE
+}
+
+/// The opcodes of `f`'s code.
+fn ops(f: &crate::asm::FunctionDef) -> impl Iterator<Item = crate::bytecode::Op> + '_ {
+    let mut pc = 0;
+    std::iter::from_fn(move || {
+        let op = crate::bytecode::Op::from_u8(*f.code.get(pc)?).expect("valid bytecode");
+        pc += op.size();
+        Some(op)
+    })
+}
+
+/// See [`has_loop`]. Measured (perf.sh --ab, against entering loop-free
+/// functions after `TIER_CALLS` too): 91 -10%, 90 -5%, 87 -5%; 10 does the
+/// same. A higher threshold for functions with loops too cost up to +70%
+/// (61, 66, 80, 82: loops in functions called a few hundred times).
+const LOOP_FREE_CALLS: i32 = 5;
+
+/// See [`large`].
 const ENTRY_COMPILE_SIZE: usize = 64;
 
 /// Which of `module`'s functions look recursive: they reach themselves
 /// through the names their inline caches look up (`LdaGlobal fib` in
-/// `fib`; `isOdd` naming `isEven`, which names `isOdd`).
+/// `fib`; `isOdd` naming `isEven`, which names `isOdd`). A global loaded
+/// only to read a property of it (`LdaGlobal C; Star r; GetNamed r, …`:
+/// `C.parent.call(this)` in constructor `C`) isn't a call of it.
 fn recursive_functions(module: &Module) -> Vec<bool> {
+    use crate::bytecode::Op;
     let fs = &module.functions;
     let by_name: HashMap<&str, usize> = fs
         .iter()
         .enumerate()
         .map(|(i, f)| (f.name.as_str(), i))
         .collect();
+    // The inline-cache slots of `f`'s global loads that only feed a
+    // property read.
+    let property_bases = |f: &crate::asm::FunctionDef| {
+        let (code, mut pc, mut bases) = (&f.code, 0, Vec::new());
+        let op_at = |pc: usize| code.get(pc).and_then(|&b| Op::from_u8(b));
+        while let Some(op) = op_at(pc) {
+            let star = pc + op.size();
+            if op == Op::LdaGlobal
+                && op_at(star) == Some(Op::Star)
+                && op_at(star + Op::Star.size()) == Some(Op::GetNamed)
+                && code[star + 1] == code[star + Op::Star.size() + 1]
+            {
+                bases.push(u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize);
+            }
+            pc = star;
+        }
+        bases
+    };
     let edges: Vec<Vec<usize>> = fs
         .iter()
         .map(|f| {
-            f.ics
-                .iter()
-                .filter_map(|n| by_name.get(n.as_str()).copied())
+            let bases = property_bases(f);
+            (f.ics.iter().enumerate())
+                .filter(|(k, _)| !bases.contains(k))
+                .filter_map(|(_, n)| by_name.get(n.as_str()).copied())
                 .collect()
         })
         .collect();

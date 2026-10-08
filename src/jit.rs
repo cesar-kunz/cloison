@@ -8371,7 +8371,7 @@ impl Lowering<'_> {
     /// Whether call `i` of frame `frame` may go straight into its callee's
     /// compiled code: its cache names a bytecode function. Small ones,
     /// which calls from the interpreter don't enter compiled (see
-    /// `vm::worth_entering_compiled`), are worth it here too: a direct call
+    /// `vm::has_loop`), are worth it here too: a direct call
     /// costs much less than one through the runtime. Fills `site` in with
     /// the callee; [`bind_direct`] picks the version when compiling, from the
     /// arguments' types, or for this function `JitCode::compile` binds the

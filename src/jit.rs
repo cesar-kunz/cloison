@@ -6525,6 +6525,10 @@ struct VmState {
     /// left to the interpreter.
     bail_exits: HashMap<usize, u32>,
     no_entry: HashSet<usize>,
+    /// Call entries left to the interpreter after a property or callee
+    /// exit ([`COOL_ENTRIES`]), letting inline caches settle before the
+    /// function is lowered again.
+    cool: u32,
     /// Warm or hot, and for warm, what is left before hot (its heat):
     /// calls and loop back edges, counted down by warm code at its start
     /// and its loop headers (`tier_count`), at a stable address.
@@ -6684,6 +6688,7 @@ pub(crate) struct CallSite {
 /// Otherwise, or when the heap's chunk is full, `toi_rt_construct`
 /// allocates.
 #[repr(C)]
+#[derive(PartialEq)]
 struct CtorSite {
     /// The heap's `ptr` and `end` (`Heap::bump`).
     heap: *mut [*mut u64; 2],
@@ -6704,6 +6709,34 @@ struct CtorSite {
     /// The header of `this`.
     header: [u64; crate::object::INLINE_BASE / 8],
 }
+
+/// Whether two lowerings' instructions are the same. An inlined `new`'s
+/// allocation site (`Insn::alloc`) is boxed afresh by each lowering: it is
+/// compared by what it allocates.
+fn same_insns(a: &[Insn], b: &[Insn]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            if x.alloc == y.alloc || x.alloc == 0 || y.alloc == 0 {
+                return x == y;
+            }
+            let (s, t) = unsafe {
+                (
+                    &*(*(x.alloc as *const std::cell::UnsafeCell<CallSite>)).get(),
+                    &*(*(y.alloc as *const std::cell::UnsafeCell<CallSite>)).get(),
+                )
+            };
+            Insn { alloc: 0, ..*x } == Insn { alloc: 0, ..*y }
+                && (s.closure, s.this_shape, s.callee) == (t.closure, t.this_shape, t.callee)
+                && s.ctor.is_some()
+                && s.ctor == t.ctor
+        })
+}
+
+/// Call entries a function leaves to the interpreter after a property or
+/// callee exit (see `VmState::cool`). Measured on DeltaBlue (10 runs): no
+/// cooling 101 ms, 50 entries 77, 100 entries 72; doubling it at each new
+/// lowering changed little.
+const COOL_ENTRIES: u32 = 100;
 
 /// Exits of a direct callee before its call site stops calling directly.
 const MAX_DIRECT_EXITS: u32 = 4;
@@ -9340,6 +9373,7 @@ impl JitFunction {
             callee_exits: HashMap::default(),
             bail_exits: HashMap::default(),
             no_entry: HashSet::default(),
+            cool: 0,
             tier: if unsafe { (*vm).warm_tier } {
                 Tier::Warm
             } else {
@@ -9426,7 +9460,7 @@ impl JitFunction {
         if vm.epoch != epoch
             || vm.field_epoch != field_epoch
             || self.versions.is_empty()
-            || low.insns[..] != self.insns[..]
+            || !same_insns(&low.insns, &self.insns)
             || low.props != vm.props
             || low.polys != vm.polys
             || low.frames != vm.snap.frames
@@ -9613,10 +9647,13 @@ impl JitFunction {
         if after_call && std::mem::take(unsafe { &mut (*vm.vm).redo_call }) {
             return (frame, snap.insns[call_before()].pc);
         }
-        vm.dirty = true;
+        let was_dirty = std::mem::replace(&mut vm.dirty, true);
         // The function may have been lowered differently since (a nested
-        // entry recompiled it): then only resume.
-        if !Rc::ptr_eq(snap, &vm.snap) || (after_call && !bad_result) {
+        // entry recompiled it): then only resume. So, while it cools, for
+        // code still running from before the exit that started it: what
+        // it saw counts once.
+        if !Rc::ptr_eq(snap, &vm.snap) || (after_call && !bad_result) || (was_dirty && vm.cool > 0)
+        {
             return (frame, exit_pc);
         }
         if bad_result {
@@ -9655,8 +9692,10 @@ impl JitFunction {
                 vm.no_entry.insert(pc);
             }
         } else if insn.guard != 0 || insn.native != 0 {
+            vm.cool = COOL_ENTRIES;
             *vm.callee_exits.entry(origin).or_insert(0) += 1;
         } else if insn.is_property() {
+            vm.cool = COOL_ENTRIES;
             *vm.property_exits.entry(origin).or_insert(0) += 1;
         } else if !insn.is_call() {
             vm.widened.insert(origin);
@@ -10037,6 +10076,17 @@ pub(crate) unsafe fn vm_run(
         let prepared = {
             let mut slot = code.jit.borrow_mut();
             let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
+            // Cooling after an exit: calls run in the interpreter (not
+            // `NotCompiled`, which would stop entering for good).
+            if left.is_none()
+                && pc == 0
+                && let Some(v) = f.vm.as_mut()
+                && v.dirty
+                && v.cool > 0
+            {
+                v.cool -= 1;
+                return VmRun::Interpret;
+            }
             let compiles = f.stats.compiles;
             let prepared = unsafe {
                 f.vm_prepare(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch)

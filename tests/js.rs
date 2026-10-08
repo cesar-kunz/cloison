@@ -1345,7 +1345,10 @@ function main(kinds) {
 
 #[test]
 fn arrays_first_filled_with_several_classes_agree_with_node() {
-    assert_eq!(value(&format!("{MIXED_ARRAYS}\nmain(3) + main(5);")), "426748383");
+    assert_eq!(
+        value(&format!("{MIXED_ARRAYS}\nmain(3) + main(5);")),
+        "426748383"
+    );
 }
 
 /// A method a compiled loop calls inlined, without checking the callee

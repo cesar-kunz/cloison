@@ -3481,6 +3481,13 @@ macro_rules! property_location {
         set_keyed!($loc, "nc_i_", |_, _| true, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "nc_o_", |_, _| true, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
+        // The array's exact shape known, so its elements' type: any
+        // (`nc_a`), numbers (`nc_n`), or an int32 into int32s, numbers or
+        // any (`nc_ia`): no dispatch on the code.
+        set_keyed!($loc, "nc_a_", |_, _| true, |s, v, code| true, |s| s.acc);
+        set_keyed!($loc, "nc_n_", |_, _| true, |s, v, code| v.to_bits() & s.tag.to_bits() != 0, |s| s.acc);
+        set_keyed!($loc, "nc_ia_", |_, _| true, |s, v, code| true,
+            |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         // A polymorphic access (`jit::Prop::Poly`): a cell check, then a
         // compare per cached shape (`imm64`), each branching to its own
         // `_nc` access but the last, which exits on a mismatch and falls
@@ -3674,7 +3681,22 @@ unsafe fn typed_elem(o: Value, i: u32, size: usize) -> Option<*mut u8> {
     if i >= unsafe { *(p.add(32) as *const u32) } {
         return None;
     }
-    Some(unsafe { (*(p.add(24) as *const *mut u8)).add(i as usize * size) })
+    Some(unsafe { elem_at(*(p.add(24) as *const *mut u8), i, size) })
+}
+
+/// Element `i` of `size` bytes at `elems`, indexed through a pointer of
+/// that size: on arm64 the load or store then scales the index itself
+/// (`ldrh w20, [x8, w20, uxtw #1]`, not `ubfiz` first).
+#[inline(always)]
+unsafe fn elem_at(elems: *mut u8, i: u32, size: usize) -> *mut u8 {
+    unsafe {
+        match size {
+            1 => elems.add(i as usize),
+            2 => elems.cast::<u16>().add(i as usize).cast(),
+            4 => elems.cast::<u32>().add(i as usize).cast(),
+            _ => elems.cast::<u64>().add(i as usize).cast(),
+        }
+    }
 }
 
 /// Whether `o` is a typed array of kind `k`: class and kind, its bytes 8
@@ -3733,7 +3755,7 @@ unsafe fn typed_elem_x(o: Value, i: u64, size: usize) -> Option<*mut u8> {
     if i as u32 >= unsafe { *(p.add(32) as *const u32) } {
         return None;
     }
-    Some(unsafe { (*(p.add(24) as *const *mut u8)).add(i as usize * size) })
+    Some(unsafe { elem_at(*(p.add(24) as *const *mut u8), i as u32, size) })
 }
 
 // ---- A keyed store's key in a scratch register ----

@@ -3320,6 +3320,15 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     out.acc = I32;
                     (base, "f")
                 }
+                // Not known to be a number: checked to be an int32 (and
+                // compiled generic once that check has exited).
+                Any if !shr0 && !widened.contains(&i) => {
+                    out.acc = I32;
+                    return Sel {
+                        check: Some(("check_acc_int", 0, 0)),
+                        ..Sel::new(base, "i", out)
+                    };
+                }
                 _ => {
                     out.acc = if shr0 { Any } else { I32 };
                     (base, "")
@@ -3720,21 +3729,29 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ..Sel::new("tset", if known { case } else { typed_checked(case) }, out)
             };
         }
-        // `o[k] = acc` (see `set_keyed` in the stencils): the key from
-        // memory, at `regs + imm`; no checks of a receiver known to be an
-        // array (`nc`); an int32 (`i`) or an object (`o`) checked against
-        // the elements' type as such.
+        // `o[k] = acc` (see `set_keyed` in the stencils): no checks of a
+        // receiver known to be an array (`nc`); an int32 (`i`) or an object
+        // (`o`) checked against the elements' type as such; none of the
+        // value where the array's exact shape says its elements take it
+        // (`nc_ia`, `nc_a`), or just that it's a number (`nc_n`).
         Op::SetKeyed => {
             let array = reg.shape().is_some_and(|s| unsafe {
                 (*(s as *const Shape)).class == crate::object::Class::Array
             });
+            let elems = match reg {
+                Ty::Obj(s) => Some(unsafe { (*(s as *const Shape)).elems }),
+                _ => None,
+            };
             let object = matches!(st.acc, Ty::Obj(_) | Ty::Ext(_));
-            let case = match (array, st.acc) {
-                (true, I32) => "nc_i",
-                (true, _) if object => "nc_o",
-                (true, _) => "nc",
-                (false, I32) => "i",
-                (false, _) if object => "o",
+            let case = match (array, st.acc, elems) {
+                (true, I32, Some(FieldType::Int | FieldType::Num | FieldType::Any)) => "nc_ia",
+                (true, I32, _) => "nc_i",
+                (true, _, _) if object => "nc_o",
+                (true, _, Some(FieldType::Any)) => "nc_a",
+                (true, _, Some(FieldType::Num)) => "nc_n",
+                (true, _, _) => "nc",
+                (false, I32, _) => "i",
+                (false, _, _) if object => "o",
                 _ => "",
             };
             return Sel {

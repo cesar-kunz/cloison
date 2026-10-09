@@ -305,6 +305,10 @@ pub struct Shape {
     pub(crate) transitions: RefCell<Vec<(Atom, u8, *const Shape)>>,
     /// The shapes this one moves to when its elements' type generalizes.
     pub(crate) elem_transitions: RefCell<Vec<(FieldType, *const Shape)>>,
+    /// Compiled code takes an object that has at least this shape for one
+    /// that has exactly it, as the shape is stable ([`Shape::is_stable`]):
+    /// a transition from it drops the code (`Vm::shape_left_stable`).
+    pub(crate) relied: Cell<bool>,
 }
 
 /// Property attributes: not writable, not enumerable, not configurable
@@ -369,6 +373,18 @@ pub fn push_key(v: Value) -> u64 {
 impl Shape {
     pub fn lookup(&self, name: Atom) -> Option<u32> {
         self.keys.iter().position(|&k| k == name).map(|i| i as u32)
+    }
+
+    /// Whether no object of this shape has gained a property or moved to
+    /// more general elements yet (V8's stable maps): an object known to have
+    /// at least this shape has exactly it. Not for a prototype's (unique)
+    /// shape, nor for arrays and strings, whose elements' type changes in
+    /// compiled code (`array_push`).
+    pub fn is_stable(&self) -> bool {
+        !self.unique
+            && !matches!(self.class, Class::Array | Class::String)
+            && self.transitions.borrow().is_empty()
+            && self.elem_transitions.borrow().is_empty()
     }
 
     /// The type of the field in slot `i`.
@@ -566,6 +582,7 @@ mod tests {
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
         };
         assert_eq!(s.location(0), 48);
         assert_eq!(s.location(1), 56);

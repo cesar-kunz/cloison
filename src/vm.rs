@@ -596,6 +596,7 @@ impl Vm {
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
         });
         self.roots.insert(key, s);
         s
@@ -621,6 +622,7 @@ impl Vm {
             unique: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
         })
     }
 
@@ -664,8 +666,10 @@ impl Vm {
             unique: s.unique,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
         });
         if !s.unique {
+            self.shape_left_stable(s);
             s.transitions.borrow_mut().push((name, attrs, t));
         }
         t
@@ -681,6 +685,8 @@ impl Vm {
             }
             (*o).flags |= PROTOTYPE;
             let s = &*(*o).shape;
+            // The object leaves `s` (for a copy of its own).
+            self.shape_left_stable(s);
             let u = Shape {
                 class: s.class,
                 proto: s.proto,
@@ -695,6 +701,7 @@ impl Vm {
                 unique: true,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
             };
             (*o).shape = self.add_shape(u);
         }
@@ -772,6 +779,15 @@ impl Vm {
         true
     }
 
+    /// Shape `s` gets a transition: drop compiled code that relied on it
+    /// being stable (see `Shape::relied`).
+    fn shape_left_stable(&mut self, s: &Shape) {
+        if s.relied.replace(false) {
+            self.field_epoch = self.field_epoch.wrapping_add(1);
+            self.code_epoch = self.code_epoch.wrapping_add(1);
+        }
+    }
+
     /// Make constant field `cell` mutable, dropping compiled code that
     /// folded it (see `FieldCell`).
     pub(crate) fn field_made_mutable(&mut self, cell: &FieldCell) {
@@ -847,8 +863,10 @@ impl Vm {
             unique: s.unique,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
         });
         if !s.unique {
+            self.shape_left_stable(s);
             s.elem_transitions.borrow_mut().push((elems, t));
         }
         t
@@ -1096,6 +1114,7 @@ impl Vm {
                 return;
             };
             if s.attrs[slot as usize] != attrs {
+                self.shape_left_stable(s);
                 let mut slot_attrs = s.attrs.clone();
                 slot_attrs[slot as usize] = attrs;
                 let u = Shape {
@@ -1112,6 +1131,7 @@ impl Vm {
                     unique: true,
                     transitions: RefCell::default(),
                     elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
                 };
                 (*o).shape = self.add_shape(u);
                 self.code_epoch = self.code_epoch.wrapping_add(1);

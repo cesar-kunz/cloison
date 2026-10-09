@@ -2015,3 +2015,22 @@ function sloppyThis() {
 fn sloppy_this_agrees_with_node() {
     assert_eq!(value(&format!("{SLOPPY_THIS}\nsloppyThis();")), "139107");
 }
+
+/// Error objects: constructors of each kind, `name`, `message` and
+/// `toString` (through `String()` and `+`), and the runtime's own errors
+/// caught as objects of their kind. The expected value is Node's.
+const ERRORS: &str = r#"
+var e = new Error("boom");
+var r = [e.message, e.name, String(e), "" + e, new RangeError().toString(), Error("x").message];
+try { null.x; } catch (t) { r.push(t.name, t.message, String(t)); }
+try { throw new TypeError("bad"); } catch (t) { r.push(t.message, t.name); }
+try { undefinedVar; } catch (t) { r.push(t.name); }
+"#;
+
+#[test]
+fn error_objects_agree_with_node() {
+    assert_eq!(
+        value(&format!("{ERRORS}\nr.join(\"|\");")),
+        "boom|Error|Error: boom|Error: boom|RangeError|x|TypeError|Cannot read properties of null (reading 'x')|TypeError: Cannot read properties of null (reading 'x')|bad|TypeError|ReferenceError"
+    );
+}

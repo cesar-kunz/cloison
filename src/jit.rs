@@ -66,11 +66,11 @@ use std::rc::Rc;
 /// The JIT's maps and sets, keyed by small integers and pointers, use
 /// FxHash (as rustc does): `std`'s SipHash dominated entering compiled code
 /// at a function call.
-type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
 
 #[derive(Default, Clone, Copy)]
-struct FxHasher(u64);
+pub(crate) struct FxHasher(u64);
 
 impl FxHasher {
     #[inline]

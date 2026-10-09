@@ -465,7 +465,19 @@ mod arch {
     /// C ABI doesn't preserve it, so a runtime-call wrapper must. On x86-64
     /// all GPR slots are caller-saved.
     pub fn caller_saved_gpr_slot(k: u8) -> Option<u8> {
-        Some([7, 6, 2, 1, 8, 9][k as usize])
+        Some(slot_gpr(k))
+    }
+
+    /// The register number of GPR slot `k`: rdi rsi rdx rcx r8 r9.
+    pub fn slot_gpr(k: u8) -> u8 {
+        [7, 6, 2, 1, 8, 9][k as usize]
+    }
+
+    /// Link a jump of [`direct_call`]'s code, once placed: the rel32 field
+    /// ending at `at` jumps to `to`.
+    pub fn link_raw(buf: &mut [u8], at: usize, to: usize) {
+        let d = (to as i64 - at as i64) as i32;
+        buf[at - 4..at].copy_from_slice(&d.to_le_bytes());
     }
 
     /// A runtime-call wrapper (see `rt_call!` in `stencils/stencils.rs`):
@@ -799,6 +811,155 @@ mod arch {
     /// callee-saved; slots 5–11 are x0–x6.
     pub fn caller_saved_gpr_slot(k: u8) -> Option<u8> {
         (k >= 5).then(|| k - 5)
+    }
+
+    /// The register number of GPR slot `k`: x24–x28, then x0–x6.
+    pub fn slot_gpr(k: u8) -> u8 {
+        slot_reg(('g', k))
+    }
+
+    /// Link a branch of [`direct_call`]'s code, once placed: the `b`,
+    /// `b.cond` or `cbz` at `at` branches to `to`.
+    pub fn link_raw(buf: &mut [u8], at: usize, to: usize) {
+        let insn = read(&buf[at..]);
+        let d = (to as i64 - at as i64) / 4;
+        let patched = if insn & 0xFC00_0000 == 0x1400_0000 {
+            assert!((-(1 << 25)..1 << 25).contains(&d), "branch out of range");
+            insn | (d as u32 & 0x03FF_FFFF)
+        } else {
+            assert!((-(1 << 18)..1 << 18).contains(&d), "branch out of range");
+            insn | (d as u32 & 0x7_FFFF) << 5
+        };
+        write(&mut buf[at..], patched);
+    }
+
+    /// `movz`/`movk` loading the 64-bit `v` into `x{rd}`.
+    fn mov64(c: &mut Vec<u32>, rd: u32, v: u64) {
+        c.push(0xD280_0000 | ((v & 0xFFFF) as u32) << 5 | rd); // movz
+        for hw in 1..4 {
+            let part = ((v >> (16 * hw)) & 0xFFFF) as u32;
+            c.push(0xF280_0000 | hw << 21 | part << 5 | rd); // movk
+        }
+    }
+
+    /// `ldr x{rt}, [x{rn}, #off]` (unsigned, scaled offset).
+    fn ldr(rt: u32, rn: u32, off: usize) -> u32 {
+        assert!(off.is_multiple_of(8) && off < 8 * 4096);
+        0xF940_0000 | ((off / 8) as u32) << 10 | rn << 5 | rt
+    }
+
+    /// A direct call without a wrapper: see the x86-64 version. Between
+    /// stencils only the stencil state registers carry values (x20 `acc`,
+    /// x21 `regs`, x22 the tag, x23 `ctx`, the slot registers); the
+    /// callee's code may use every other register and preserves only x29
+    /// and x30 (`preserve_none`), so the piece saves the link register
+    /// (which `blr` overwrites) and the slot registers live after the call,
+    /// GPRs `gprs` and FP registers `fprs` (d1–d7), on the native stack.
+    /// The callee shares the tag and `ctx`, returns its result in x0 and
+    /// leaves x21 as it found it. The site is in x9; the rare paths are in
+    /// the cold part, which branches back. Branches to link are recorded at
+    /// their instruction (see [`link_raw`]).
+    pub fn direct_call(
+        gprs: &[u8],
+        fprs: &[u8],
+        site: u64,
+        f_off: Option<u32>,
+        frame: u32,
+        k: &super::DirectConsts,
+    ) -> super::RawCall {
+        let mut c: Vec<u32> = Vec::new();
+        c.push(0xA9BF_7BFD); // stp x29, x30, [sp, #-16]!
+        let n = gprs.len() + fprs.len();
+        let area = (8 * n).next_multiple_of(16) as u32;
+        if area > 0 {
+            c.push(0xD100_03FF | area << 10); // sub sp, sp, #area
+        }
+        // str / ldr x or d register at [sp, #8i]
+        let slot = |op: u32, r: u8, i: usize| op | (i as u32) << 10 | (31 << 5) | r as u32;
+        let saves: Vec<(u32, u32, u8)> = (gprs.iter().map(|&r| (0xF900_0000, 0xF940_0000, r)))
+            .chain(fprs.iter().map(|&r| (0xFD00_0000, 0xFD40_0000, r)))
+            .collect();
+        for (i, &(st, _, r)) in saves.iter().enumerate() {
+            c.push(slot(st, r, i));
+        }
+        mov64(&mut c, 9, site);
+        // Branches to the cold part: (instruction, slow?).
+        let mut to_cold: Vec<(usize, bool)> = Vec::new();
+        c.push(ldr(10, 9, 0)); // ldr x10, [x9]: the entry
+        to_cold.push((c.len(), true));
+        c.push(0xB400_000A); // cbz x10, slow
+        if let Some(off) = f_off {
+            c.push(ldr(16, 21, off as usize)); // ldr x16, [x21, #off]
+            c.push(ldr(17, 9, k.closure)); // ldr x17, [x9, #closure]
+            c.push(0xEB11_021F); // cmp x16, x17
+            to_cold.push((c.len(), true));
+            c.push(0x5400_0001); // b.ne slow
+        }
+        c.push(ldr(16, 9, k.end_off)); // ldr x16, [x9, #end_off]
+        c.push(0x8B15_0210); // add x16, x16, x21
+        c.push(ldr(17, 9, k.stack_end)); // ldr x17, [x9, #stack_end]
+        c.push(0xEB11_021F); // cmp x16, x17
+        to_cold.push((c.len(), true));
+        c.push(0x5400_0008); // b.hi slow
+        c.push(ldr(16, 9, k.limit)); // ldr x16, [x9, #limit]
+        c.push(0xF940_0210); // ldr x16, [x16]
+        c.push(0x9100_03F1); // mov x17, sp
+        c.push(0xEB10_023F); // cmp x17, x16
+        to_cold.push((c.len(), true));
+        c.push(0x5400_0003); // b.lo slow
+        assert!(frame < 4096);
+        c.push(0x9100_02B5 | frame << 10); // add x21, x21, #frame
+        assert!(k.flags < 256);
+        let imm9 = (k.flags as u32).wrapping_neg() & 0x1FF;
+        c.push(0xF800_02BF | imm9 << 12); // stur xzr, [x21, #-flags]
+        assert!(k.undefined < 1 << 16);
+        c.push(0xD280_0014 | (k.undefined as u32) << 5); // mov x20, #undefined
+        c.push(0xD63F_0140); // blr x10
+        c.push(0xD100_02B5 | frame << 10); // sub x21, x21, #frame
+        c.push(0xB940_02F0); // ldr w16, [x23]
+        c.push(0x3100_061F); // cmn w16, #1
+        to_cold.push((c.len(), false));
+        c.push(0x5400_0001); // b.ne exit
+        let done = c.len();
+        c.push(0xAA00_03F4); // mov x20, x0
+        for (i, &(_, ld, r)) in saves.iter().enumerate() {
+            c.push(slot(ld, r, i));
+        }
+        if area > 0 {
+            c.push(0x9100_03FF | area << 10); // add sp, sp, #area
+        }
+        c.push(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
+        // The cold part. exit: toi_direct_exit(regs, site, record, acc).
+        let mut d: Vec<u32> = Vec::new();
+        let mut to_done = Vec::new();
+        let exit = d.len();
+        d.push(0xAA00_03E3); // mov x3, x0
+        d.push(0xAA15_03E0); // mov x0, x21
+        mov64(&mut d, 1, site);
+        d.push(0xB940_02E2); // ldr w2, [x23]
+        d.push(0x1280_0010); // mov w16, #-1
+        d.push(0xB900_02F0); // str w16, [x23]
+        mov64(&mut d, 16, k.exit);
+        d.push(0xD63F_0200); // blr x16
+        to_done.push(d.len());
+        d.push(0x1400_0000); // b done
+        // slow: toi_rt_call(regs, site).
+        let slow = d.len();
+        d.push(0xAA15_03E0); // mov x0, x21
+        d.push(0xAA09_03E1); // mov x1, x9
+        mov64(&mut d, 16, k.call);
+        d.push(0xD63F_0200); // blr x16
+        to_done.push(d.len());
+        d.push(0x1400_0000); // b done
+        let bytes = |c: &[u32]| c.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>();
+        super::RawCall {
+            hot: bytes(&c),
+            cold: bytes(&d),
+            hot_to_cold: (to_cold.into_iter())
+                .map(|(at, s)| (4 * at, 4 * if s { slow } else { exit }))
+                .collect(),
+            cold_to_hot: to_done.into_iter().map(|at| (4 * at, 4 * done)).collect(),
+        }
     }
 
     /// A runtime-call wrapper (see `rt_call!` in `stencils/stencils.rs`):
@@ -6447,7 +6608,6 @@ impl JitCode {
             // A direct call (in a VM frame, where exits' liveness is known)
             // without the `toi_rt_enter` wrapper: `arch::direct_call`, then
             // `call_done`'s checks.
-            #[cfg(target_arch = "x86_64")]
             let main = match exit_live.filter(|e| e.len() == n) {
                 Some(e) if matches!(name.as_str(), "call_direct" | "call_direct_nc") => {
                     let site = unsafe { &*(main.imm64 as *const CallSite) };
@@ -6691,15 +6851,11 @@ impl JitCode {
         }
         for (k, s, to_cold, to_hot) in &raw_links {
             let (h, c) = (code_at[*k], stub_ats[*s][0]);
-            let mut rel32 = |field_end: usize, to: usize| {
-                let d = (to as i64 - field_end as i64) as i32;
-                buf[field_end - 4..field_end].copy_from_slice(&d.to_le_bytes());
-            };
             for &(f, t) in to_cold {
-                rel32(h + f, c + t);
+                arch::link_raw(buf, h + f, c + t);
             }
             for &(f, t) in to_hot {
-                rel32(c + f, h + t);
+                arch::link_raw(buf, c + f, h + t);
             }
         }
         let mut emit = |s: Instance,
@@ -11212,8 +11368,8 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
 /// The slot registers to keep across call `i`, as (GPRs, xmm registers):
 /// those of registers live after it, to compiled code (`live`) or to the
 /// interpreter after an exit there (`exit_live`, and the fields of objects
-/// an exit there allocates).
-#[cfg(target_arch = "x86_64")]
+/// an exit there allocates). All of them: the callee's code preserves no
+/// slot register, unlike a C function.
 fn live_slots(
     exit_live: &[RegSet],
     mats: Option<&HashMap<usize, Vec<Rc<Mat>>>>,
@@ -11237,7 +11393,7 @@ fn live_slots(
     let (mut g, mut f): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
     for r in rs_iter(&set).filter(|&r| r < homes.len()) {
         match homes[r] {
-            Home::Gpr(k) | Home::Int(k) => g.extend(arch::caller_saved_gpr_slot(k)),
+            Home::Gpr(k) | Home::Int(k) => g.push(arch::slot_gpr(k)),
             Home::Fpr(k) => f.push(k + 1),
             Home::Mem => {}
         }
@@ -11250,9 +11406,9 @@ fn live_slots(
 }
 
 /// [`arch::direct_call`]'s code: the hot part, a piece of its own, and
-/// the cold part, a stub; and the rel32 fields to patch once they're
-/// placed, each as (field end, offset in the other part).
-#[cfg(target_arch = "x86_64")]
+/// the cold part, a stub; and the jumps to link once they're placed, each
+/// as (where in its part, as [`arch::link_raw`] takes it, offset in the
+/// other part).
 struct RawCall {
     hot: Vec<u8>,
     cold: Vec<u8>,
@@ -11262,7 +11418,6 @@ struct RawCall {
 
 /// What [`arch::direct_call`] needs: offsets in a `CallSite`, the frame
 /// header's flags slot, `undefined`, and the runtime functions it calls.
-#[cfg(target_arch = "x86_64")]
 struct DirectConsts {
     closure: usize,
     end_off: usize,
@@ -11274,7 +11429,6 @@ struct DirectConsts {
     exit: u64,
 }
 
-#[cfg(target_arch = "x86_64")]
 impl DirectConsts {
     fn new() -> Self {
         const { assert!(NO_EXIT == u32::MAX) };

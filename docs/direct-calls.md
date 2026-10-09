@@ -1,6 +1,6 @@
 # Direct calls: what they cost, and a cheaper convention
 
-Status: design, 2026-10-08. Step 1 and a wrapper-free call on x86-64 implemented (see Measured).
+Status: design, 2026-10-08. Step 1 and a wrapper-free call on x86-64 and arm64 implemented (see Measured).
 
 ## Why
 
@@ -122,8 +122,17 @@ paths (the callee exited, the checks failed) are a cold stub calling
 `toi_direct_exit` and `toi_rt_call`, as the wrapper did. Measured: fib
 (90) and mutual recursion (91) -18%, 54 -8%, 63 -8%, DeltaBlue's
 `octane-db.js` -4.8% (Octane score ~46700 -> ~48300); hot code +6%
-(`jit.all.hot`). `new` (`construct_direct`) and arm64 still use the
-wrapper. Saving only the live slots within the wrapper alone gained
+(`jit.all.hot`). `new` (`construct_direct`) still uses the wrapper.
+
+On arm64 (2026-10-09), the same piece: it saves the link register,
+which `blr` overwrites, besides the live slot registers, all of them
+(slots 0-4, x24-x28, are callee-saved in the C ABI but not in compiled
+code, which preserves only x29 and x30); the site goes in x9, its
+64-bit constants by `movz`/`movk`; the cold part's branches are linked
+once placed (`arch::link_raw`). Checked under qemu (the test suite, every
+microbenchmark's result, DeltaBlue's): DeltaBlue's `octane-db.js` ran in
+12.2 s emulated against 13.4 with the wrapper. No arm64 hardware here to
+time it. Saving only the live slots within the wrapper alone gained
 nothing measurable (-0.5% instructions): the wrapper's fixed cost was the
 rest.
 

@@ -11,7 +11,7 @@ use std::fmt;
 
 use crate::asm::Module;
 use crate::object::{
-    Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Heap, Object, PROTOTYPE, READ_ONLY,
+    ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Heap, Object, PROTOTYPE, READ_ONLY,
     Shape,
     as_object, field_fits, object_value,
 };
@@ -320,6 +320,9 @@ pub struct Vm {
     /// the callee's `CreateArguments` (its frame has no call instruction to
     /// find them by).
     pub(crate) pending_args: (*const Value, usize),
+    /// The VM stack's free top while runtime code that may call a
+    /// function runs (null elsewhere): see `interp::call_function`.
+    pub(crate) native_top: *mut Value,
     /// The `Array` constructor: compiled code makes `new Array()` itself.
     pub(crate) array_fn: *mut Object,
     date_prototype: *mut Object,
@@ -398,6 +401,7 @@ impl Vm {
             function_call_fn: std::ptr::null_mut(),
             function_apply: std::ptr::null(),
             pending_args: (std::ptr::null(), 0),
+            native_top: std::ptr::null_mut(),
             array_fn: std::ptr::null_mut(),
             date_prototype: std::ptr::null_mut(),
             number_prototype: std::ptr::null_mut(),
@@ -951,9 +955,72 @@ impl Vm {
                 return Ok(Value::from_i32((*o).elems_len as i32));
             }
             Ok(match self.lookup(o, name) {
+                Some((h, slot)) if self.is_accessor(h, slot) => {
+                    let pair = *Object::slot(h, (*(*h).shape).location(slot));
+                    return self.call_getter(pair, obj);
+                }
                 Some((h, slot)) => *Object::slot(h, (*(*h).shape).location(slot)),
                 None => Value::UNDEFINED,
             })
+        }
+    }
+
+    fn is_accessor(&self, h: *mut Object, slot: u32) -> bool {
+        unsafe { (&(*(*h).shape).attrs)[slot as usize] & ACCESSOR != 0 }
+    }
+
+    /// The accessor property `name` of `o` or its prototypes, if that is
+    /// what `o.name` finds: its getter-setter pair.
+    fn accessor(&self, o: *mut Object, name: Atom) -> Option<Value> {
+        let (h, slot) = self.lookup(o, name)?;
+        self.is_accessor(h, slot)
+            .then(|| unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })
+    }
+
+    /// `this.name` through an accessor `pair`'s getter (`undefined`
+    /// without one).
+    fn call_getter(&mut self, pair: Value, this: Value) -> Result<Value> {
+        let g = unsafe { *(*as_object(pair)).elems };
+        if g.is_undefined() {
+            return Ok(Value::UNDEFINED);
+        }
+        crate::interp::call_function(self, g, this, &[])
+    }
+
+    /// `this.name = value` through an accessor `pair`'s setter (nothing
+    /// without one: sloppy mode).
+    fn call_setter(&mut self, pair: Value, this: Value, value: Value) -> Result<()> {
+        let s = unsafe { *(*as_object(pair)).elems.add(1) };
+        if s.is_undefined() {
+            return Ok(());
+        }
+        crate::interp::call_function(self, s, this, &[value]).map(|_| ())
+    }
+
+    /// `Object.defineProperty(o, name, {get, set, …})`: an accessor
+    /// property with attributes `attrs` (`ACCESSOR` added). An existing
+    /// accessor keeps the function a descriptor leaves out; an existing
+    /// data property becomes an accessor.
+    pub(crate) fn define_accessor(
+        &mut self,
+        o: *mut Object,
+        name: Atom,
+        get: Option<Value>,
+        set: Option<Value>,
+        attrs: u8,
+    ) {
+        unsafe {
+            let s = &*(*o).shape;
+            let old = s.lookup(name).filter(|&k| s.attrs[k as usize] & ACCESSOR != 0);
+            let (mut g, mut st) = (Value::UNDEFINED, Value::UNDEFINED);
+            if let Some(k) = old {
+                let pair = as_object(*Object::slot(o, s.location(k)));
+                (g, st) = (*(*pair).elems, *(*pair).elems.add(1));
+            }
+            let pair = self.new_array();
+            crate::vm::array_push(self, pair, &[get.unwrap_or(g), set.unwrap_or(st)])
+                .expect("an array");
+            self.define_property(o, name, Some(pair), attrs | ACCESSOR);
         }
     }
 
@@ -984,11 +1051,14 @@ impl Vm {
         let o = as_object(obj);
         unsafe {
             if (*o).class == Class::Array && name == self.a_length {
-                return Err(Error::unsupported("setting an array's length"));
+                return self.set_array_length(o, value);
             }
             // A string is a primitive: stores to it do nothing.
             if (*o).class == Class::String || self.read_only(o, name) {
                 return Ok(());
+            }
+            if let Some(pair) = self.accessor(o, name) {
+                return self.call_setter(pair, obj, value);
             }
             match (*(*o).shape).lookup(name) {
                 Some(slot) => self.store_field(o, slot, value),
@@ -1047,6 +1117,10 @@ impl Vm {
                 return Ok(Value::UNDEFINED);
             };
             let loc = (*(*h).shape).location(slot);
+            // A getter's: called, never cached.
+            if self.is_accessor(h, slot) {
+                return self.call_getter(*Object::slot(h, loc), obj);
+            }
             install(
                 ic,
                 Ic {
@@ -1071,12 +1145,16 @@ impl Vm {
         unsafe {
             let old = (*o).shape;
             if (*o).class == Class::Array && name == self.a_length {
-                return Err(Error::unsupported("setting an array's length"));
+                return self.set_array_length(o, value);
             }
             // Sloppy mode: a store to a read-only property, own or
             // inherited, does nothing (and isn't cached, so it stays slow).
             if (*o).class == Class::String || self.read_only(o, name) {
                 return Ok(());
+            }
+            // A setter's: called, never cached.
+            if let Some(pair) = self.accessor(o, name) {
+                return self.call_setter(pair, obj, value);
             }
             if let Some(slot) = (*old).lookup(name) {
                 self.store_field(o, slot, value);
@@ -1248,6 +1326,160 @@ impl Vm {
         Ok(())
     }
 
+    /// `v instanceof f`: whether `f.prototype` is on `v`'s prototype chain
+    /// (OrdinaryHasInstance; there are no bound functions or
+    /// `Symbol.hasInstance`).
+    pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
+        let callable = f.is_cell()
+            && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
+        if !callable {
+            return Err(Error::type_error("Right-hand side of 'instanceof' is not callable"));
+        }
+        // Strings are primitives.
+        if !v.is_cell() || string_units(v).is_some() {
+            return Ok(false);
+        }
+        let p = self.get(f, self.a_prototype)?;
+        if !p.is_cell() {
+            return Err(Error::type_error(
+                "Function has non-object prototype in instanceof check",
+            ));
+        }
+        let mut o = as_object(v);
+        loop {
+            let proto = unsafe { (*(*o).shape).proto };
+            if !proto.is_cell() {
+                return Ok(false);
+            }
+            if proto == p {
+                return Ok(true);
+            }
+            o = as_object(proto);
+        }
+    }
+
+    /// `key in obj`: whether `obj` or its prototypes have the property or
+    /// element `key`.
+    pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+        if !obj.is_cell() || string_units(obj).is_some() {
+            return Err(Error::type_error(format!(
+                "Cannot use 'in' operator to search for '{}' in {}",
+                display(key),
+                display(obj)
+            )));
+        }
+        let mut o = as_object(obj);
+        match self.property_key(key) {
+            Key::Name(a) => Ok(self.lookup(o, a).is_some()
+                || (a == self.a_length && unsafe { (*o).class } == Class::Array)),
+            Key::Index(i) => loop {
+                unsafe {
+                    if i < (*o).elems_len
+                        && (*o).class != Class::String
+                        && *(*o).elems.add(i as usize) != Value::EMPTY
+                    {
+                        return Ok(true);
+                    }
+                    let proto = (*(*o).shape).proto;
+                    if !proto.is_cell() {
+                        return Ok(false);
+                    }
+                    o = as_object(proto);
+                }
+            },
+        }
+    }
+
+    /// `delete obj[key]`: an element becomes a hole; a property is
+    /// removed, the object getting a shape of its own without it (see
+    /// [`Vm::delete_named`]). False for what can't be deleted.
+    pub fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+        if !obj.is_cell() {
+            if obj.is_undefined() || obj.is_null() {
+                return Err(Error::type_error(format!(
+                    "Cannot convert {} to object",
+                    display(obj)
+                )));
+            }
+            return Ok(true);
+        }
+        let o = as_object(obj);
+        match self.property_key(key) {
+            Key::Index(i) => unsafe {
+                if (*o).class == Class::String {
+                    return Ok(i >= (*o).elems_len);
+                }
+                if i < (*o).elems_len {
+                    *(*o).elems.add(i as usize) = Value::EMPTY;
+                }
+                Ok(true)
+            },
+            Key::Name(a) => Ok(self.delete_named(o, a)),
+        }
+    }
+
+    /// Remove property `name` of `o`, unless it can't be deleted. The
+    /// object gets a shape of its own (as a prototype's), with the other
+    /// properties' slots moved down. Compiled code that folded `o`'s fields
+    /// or relied on its shape is dropped: every field of its old shape is
+    /// made mutable (they no longer describe `o`'s), and its shape left
+    /// stable.
+    pub(crate) fn delete_named(&mut self, o: *mut Object, name: Atom) -> bool {
+        unsafe {
+            let s = &*(*o).shape;
+            let Some(slot) = s.lookup(name) else {
+                return !(name == self.a_length
+                    && matches!((*o).class, Class::Array | Class::String));
+            };
+            if s.attrs[slot as usize] & DONT_DELETE != 0 {
+                return false;
+            }
+            let n = s.keys.len() as u32;
+            let kept: Vec<u32> = (0..n).filter(|&k| k != slot).collect();
+            let values: Vec<Value> = kept
+                .iter()
+                .map(|&k| *Object::slot(o, s.location(k)))
+                .collect();
+            self.shape_left_stable(s);
+            for &cell in &s.fields {
+                self.field_made_mutable(&*cell);
+            }
+            let mut fields = Vec::with_capacity(kept.len());
+            for &k in &kept {
+                let cell = Box::new(FieldCell::new());
+                cell.set((*s.fields[k as usize]).get());
+                fields.push(&*cell as *const FieldCell);
+                self.field_cells.push(cell);
+            }
+            let u = Shape {
+                class: s.class,
+                proto: s.proto,
+                capacity: Cell::new(s.capacity.get()),
+                keys: kept.iter().map(|&k| s.keys[k as usize]).collect(),
+                attrs: kept.iter().map(|&k| s.attrs[k as usize]).collect(),
+                fields,
+                elems: s.elems,
+                elems_code: s.elems_code,
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: true,
+                transitions: RefCell::default(),
+                elem_transitions: RefCell::default(),
+                relied: Cell::new(false),
+            };
+            let new = self.add_shape(u);
+            (*o).shape = new;
+            for (k, v) in values.into_iter().enumerate() {
+                *Object::slot(o, (*new).location(k as u32)) = v;
+            }
+            if (*o).flags & PROTOTYPE != 0 {
+                self.proto_epoch = self.proto_epoch.wrapping_add(1);
+                self.code_epoch = self.code_epoch.wrapping_add(1);
+            }
+            true
+        }
+    }
+
     // ---- Elements ----
 
     /// What `o[key]` accesses: an element, for an array index (a number,
@@ -1374,6 +1606,27 @@ impl Vm {
     }
 
     /// Make room for `n` elements.
+    /// `a.length = value`: truncated (the elements past it removed) or
+    /// grown with holes.
+    fn set_array_length(&mut self, o: *mut Object, value: Value) -> Result<()> {
+        let d = crate::interp::to_number(value);
+        if !(d >= 0.0 && d <= u32::MAX as f64 && d.fract() == 0.0) {
+            return Err(Error::range_error("Invalid array length"));
+        }
+        let n = d as usize;
+        unsafe {
+            let len = (*o).elems_len as usize;
+            if n > len {
+                self.reserve_elems(o, n);
+            }
+            for i in n.min(len)..n.max(len) {
+                *(*o).elems.add(i) = Value::EMPTY;
+            }
+            (*o).elems_len = n as u32;
+        }
+        Ok(())
+    }
+
     fn reserve_elems(&mut self, o: *mut Object, n: usize) {
         unsafe {
             if n <= (*o).elems_cap as usize {
@@ -1414,10 +1667,11 @@ impl Vm {
             let mut seen: Vec<Atom> = Vec::new();
             let mut o = as_object(v);
             unsafe {
-                if matches!((*o).class, Class::Array | Class::String) {
+                // Elements first, in order (any object's: `{1: x}` has one).
+                {
                     let n = (*o).elems_len as usize;
                     for i in 0..n {
-                        let hole = (*o).class == Class::Array && *(*o).elems.add(i) == Value::EMPTY;
+                        let hole = (*o).class != Class::String && *(*o).elems.add(i) == Value::EMPTY;
                         if !hole {
                             names.push(i.to_string().encode_utf16().collect());
                         }
@@ -1924,7 +2178,9 @@ fn interpreted(f: &crate::asm::FunctionDef) -> bool {
     !f.handlers.is_empty()
         || !f.upvalues.is_empty()
         || f.captures
-        || f.code.first() == Some(&(crate::bytecode::Op::CreateArguments as u8))
+        || ops(f).any(|op| {
+            matches!(op, crate::bytecode::Op::CreateArguments | crate::bytecode::Op::LdaCallee)
+        })
 }
 
 /// See [`has_loop`].
@@ -2370,9 +2626,7 @@ fn object_define_property(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value
         vm.lookup(as_object(desc), a)
             .map(|(h, slot)| unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })
     };
-    if field(vm, "get").is_some() || field(vm, "set").is_some() {
-        return Err(Error::unsupported("accessor properties (get/set)"));
-    }
+    let (get, set) = (field(vm, "get"), field(vm, "set"));
     let old = unsafe {
         let s = &*(*o).shape;
         s.lookup(name).map(|k| s.attrs[k as usize])
@@ -2391,8 +2645,13 @@ fn object_define_property(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value
             }
         }
     }
+    if get.is_some() || set.is_some() {
+        // (`writable` doesn't apply to an accessor.)
+        vm.define_accessor(o, name, get, set, attrs & !READ_ONLY & !ACCESSOR);
+        return Ok(target);
+    }
     let value = field(vm, "value");
-    vm.define_property(o, name, value, attrs);
+    vm.define_property(o, name, value, attrs & !ACCESSOR);
     Ok(target)
 }
 

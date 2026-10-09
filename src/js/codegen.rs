@@ -93,7 +93,7 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
     use ExprKind::*;
     match &e.kind {
         Ident(n) => out.push(n),
-        Num(_) | Str(_) | Bool(_) | Null | This | Function(_) => {}
+        Num(_) | Str(_) | Bool(_) | Null | This | Function(_) | Accessor(..) => {}
         Array(es) => es.iter().for_each(|e| expr_refs(e, out)),
         Object(ps) => ps.iter().for_each(|(_, e)| expr_refs(e, out)),
         Member(o, _) | Unary(_, o) | Update(o, ..) => expr_refs(o, out),
@@ -222,7 +222,34 @@ fn declarations(p: &Program, f: usize) -> Vec<&str> {
     if arguments_object(p, i) && !out.contains(&"arguments") {
         out.push("arguments");
     }
+    // A named function expression's own name, if used: a variable set to
+    // the function (`LdaCallee`).
+    if let Some(n) = own_name(p, i)
+        && !out.contains(&n)
+    {
+        out.push(n);
+    }
     out
+}
+
+/// The name a named function expression `f` binds in its body, if it or a
+/// function nested in it refers to it (shadowed or not: then the variable
+/// is just unused).
+fn own_name(p: &Program, f: usize) -> Option<&str> {
+    let func = &p.functions[f];
+    let name = func.name.as_deref().filter(|_| func.binds_name)?;
+    let within = |mut g: usize| loop {
+        if g == f {
+            return true;
+        }
+        match p.functions[g].parent {
+            Some(q) => g = q,
+            None => return false,
+        }
+    };
+    (0..p.functions.len())
+        .any(|g| within(g) && references(&p.functions[g]).contains(&name))
+        .then_some(name)
 }
 
 /// Whether function `f` gets an `arguments` object: it reads `arguments`,
@@ -291,7 +318,7 @@ fn assigns(e: &Expr, name: &str) -> bool {
             matches!(&t.kind, Ident(n) if n == name) || assigns(t, name) || assigns(v, name)
         }
         Update(t, ..) => matches!(&t.kind, Ident(n) if n == name) || assigns(t, name),
-        Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) => false,
+        Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) => false,
         Array(es) => es.iter().any(|e| assigns(e, name)),
         Object(ps) => ps.iter().any(|(_, e)| assigns(e, name)),
         Member(o, _) => assigns(o, name),
@@ -459,6 +486,18 @@ struct Gen<'a> {
     /// `try` blocks being compiled: none of their statements goes out of
     /// line, outside the handler's range.
     in_try: u32,
+    /// The `try` statements being compiled, outermost first.
+    trys: Vec<TryCtx<'a>>,
+}
+
+/// A `try` being compiled: the bytecode ranges it covers (closed around
+/// the copies of `finally` blocks that jumps out of it run), its
+/// `finally` block, and how many jump targets enclose it.
+struct TryCtx<'a> {
+    start: u32,
+    ranges: Vec<(u32, u32)>,
+    finally: Option<&'a [Stmt]>,
+    targets: usize,
 }
 
 impl<'a> Gen<'a> {
@@ -501,6 +540,7 @@ impl<'a> Gen<'a> {
             deferred: Vec::new(),
             handlers: Vec::new(),
             in_try: 0,
+            trys: Vec::new(),
         }
     }
 
@@ -511,6 +551,14 @@ impl<'a> Gen<'a> {
         if arguments_object(self.p, self.index) {
             let r = self.locals["arguments"];
             self.emit(Op::CreateArguments, &[Arg::Reg(r)]);
+        }
+        // (Not if a parameter or variable of the function has the name.)
+        if let Some(n) = own_name(self.p, self.index)
+            && !self.f.params.iter().any(|p| p == n)
+            && self.locals.get(n).is_some_and(|&r| r as usize == self.decls[self.index].len())
+        {
+            self.emit(Op::LdaCallee, &[]);
+            self.star(self.locals[n]);
         }
         let mut fns = Vec::new();
         self.f.body.iter().for_each(|s| hoisted(s, &mut fns));
@@ -792,6 +840,12 @@ impl<'a> Gen<'a> {
 
     /// `LdaConstant` of `c`, one slot per distinct constant.
     fn constant(&mut self, c: Constant) {
+        let i = self.const_index(c);
+        self.emit(Op::LdaConstant, &[Arg::Index(i)]);
+    }
+
+    /// The index of constant `c` (equal ones shared).
+    fn const_index(&mut self, c: Constant) -> u16 {
         let same = |x: &Constant| match (x, &c) {
             (Constant::Number(a), Constant::Number(b)) => a.to_bits() == b.to_bits(),
             (a, b) => a == b,
@@ -800,7 +854,7 @@ impl<'a> Gen<'a> {
             self.constants.push(c);
             self.constants.len() - 1
         });
-        self.emit(Op::LdaConstant, &[Arg::Index(i as u16)]);
+        i as u16
     }
 
     fn closure(&mut self, f: usize) {
@@ -876,6 +930,155 @@ impl<'a> Gen<'a> {
         } else {
             let t = self.target(l);
             self.emit(c.op(), &[t]);
+        }
+    }
+
+    // ---- try / catch / finally ----
+
+    /// `try block catch (name) body finally f`. The block (and the catch
+    /// clause, if there is a `finally`) is covered by handler ranges; an
+    /// exception there lands in the handler with its value in `acc`. A
+    /// `finally` block runs on every way out: after the statement
+    /// completes, in the exception handler (which then throws again), and
+    /// copied before each `return`, `break` or `continue` leaving it (see
+    /// [`Gen::leave_trys`]).
+    fn try_stmt(
+        &mut self,
+        block: &'a [Stmt],
+        catch: &'a Option<(String, Vec<Stmt>)>,
+        finally: &'a Option<Vec<Stmt>>,
+        pos: Pos,
+    ) -> R<()> {
+        let Some(f) = finally else {
+            let (name, body) = catch.as_ref().expect("the parser requires `catch` or `finally`");
+            return self.try_catch(block, name, body, pos);
+        };
+        let after = self.label();
+        self.open_try(Some(f));
+        self.in_try += 1;
+        match catch {
+            Some((name, body)) => self.try_catch(block, name, body, pos)?,
+            None => {
+                for s in block {
+                    self.stmt(s)?;
+                }
+            }
+        }
+        self.in_try -= 1;
+        let ranges = self.close_try();
+        if self.reachable {
+            for s in f {
+                self.stmt(s)?;
+            }
+            if self.reachable {
+                self.jump(after);
+            }
+        }
+        // The exception path: the `finally` block, then throw it again.
+        let handler = self.label();
+        self.labels[handler.0].used = true;
+        self.reachable = false;
+        self.bind(handler);
+        let at = self.asm.offset() as u32;
+        self.handlers.extend(ranges.iter().map(|&(s, e)| (s, e, at)));
+        let mark = self.temp;
+        let r = self.alloc(pos)?;
+        self.star(r);
+        for s in f {
+            self.stmt(s)?;
+        }
+        if self.reachable {
+            self.ldar(r);
+            self.emit(Op::Throw, &[]);
+        }
+        self.temp = mark;
+        self.bind(after);
+        Ok(())
+    }
+
+    /// `try block catch (name) body`: the block, then past the handler,
+    /// which puts the exception in the catch parameter's own register.
+    fn try_catch(&mut self, block: &'a [Stmt], name: &'a str, body: &'a [Stmt], pos: Pos) -> R<()> {
+        self.open_try(None);
+        self.in_try += 1;
+        for s in block {
+            self.stmt(s)?;
+        }
+        self.in_try -= 1;
+        let ranges = self.close_try();
+        let after = self.label();
+        if self.reachable {
+            self.jump(after);
+        }
+        let handler = self.label();
+        self.labels[handler.0].used = true;
+        self.reachable = false;
+        self.bind(handler);
+        let at = self.asm.offset() as u32;
+        self.handlers.extend(ranges.iter().map(|&(s, e)| (s, e, at)));
+        let r = self.alloc(pos)?;
+        self.star(r);
+        let outer = self.locals.insert(name, r);
+        for s in body {
+            self.stmt(s)?;
+        }
+        match outer {
+            Some(o) => self.locals.insert(name, o),
+            None => self.locals.remove(name),
+        };
+        self.bind(after);
+        Ok(())
+    }
+
+    fn open_try(&mut self, finally: Option<&'a [Stmt]>) {
+        self.trys.push(TryCtx {
+            start: self.asm.offset() as u32,
+            ranges: Vec::new(),
+            finally,
+            targets: self.targets.len(),
+        });
+    }
+
+    /// The innermost `try`'s ranges, closed (empty ones dropped).
+    fn close_try(&mut self) -> Vec<(u32, u32)> {
+        let mut t = self.trys.pop().expect("a try");
+        let end = self.asm.offset() as u32;
+        if end > t.start {
+            t.ranges.push((t.start, end));
+        }
+        t.ranges
+    }
+
+    /// Before a jump out of the `try` statements from `depth` on: from the
+    /// innermost out, close each one's range and copy its `finally` block,
+    /// compiled as outside it (still inside the ones further out, whose
+    /// handlers cover it).
+    fn leave_trys(&mut self, depth: usize) -> R<()> {
+        for i in (depth..self.trys.len()).rev() {
+            let end = self.asm.offset() as u32;
+            let t = &mut self.trys[i];
+            if end > t.start {
+                t.ranges.push((t.start, end));
+            }
+            t.start = end;
+            if let Some(f) = t.finally {
+                let inner = self.trys.split_off(i);
+                let r = f.iter().try_for_each(|s| self.stmt(s));
+                self.trys.extend(inner);
+                r?;
+                if !self.reachable {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// After that jump: the ranges reopen.
+    fn reenter_trys(&mut self, depth: usize) {
+        let at = self.asm.offset() as u32;
+        for t in &mut self.trys[depth..] {
+            t.start = at;
         }
     }
 
@@ -1039,28 +1242,60 @@ impl<'a> Gen<'a> {
             // A plain object with room for the properties, then each one
             // stored in order (a later duplicate wins).
             Object(props) => {
-                // An index key is an element (`o[1]` reads it), and
-                // `__proto__:` sets the prototype: neither is a named
-                // property.
-                if let Some((k, _)) = props.iter().find(|(k, _)| {
-                    k == "__proto__" || k.parse::<u32>().is_ok_and(|i| i.to_string() == *k)
-                }) {
-                    return unsupported(e.pos, format!("the key `{k}` in an object literal"));
+                // `__proto__:` sets the prototype, not a property.
+                if props.iter().any(|(k, _)| k == "__proto__") {
+                    return unsupported(e.pos, "the key `__proto__` in an object literal");
                 }
-                let cap = props.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
+                // An index key is an element (`o[1]` reads it), stored as
+                // `o[k] = v`.
+                let index = |k: &str| {
+                    k.parse::<u32>()
+                        .ok()
+                        .filter(|&i| i != u32::MAX && i.to_string() == k)
+                };
+                let named = props.iter().filter(|(k, _)| index(k).is_none()).count();
+                let cap = named.min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
                 let ic = self.auto_ic();
                 self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
                 if !props.is_empty() {
+                    let mark = self.temp;
                     let o = self.alloc(e.pos)?;
                     self.star(o);
                     for (name, v) in props {
-                        self.value(v)?;
-                        self.named(Op::SetNamed, o, name);
+                        match index(name) {
+                            Some(i) => {
+                                let k = self.alloc(e.pos)?;
+                                match i32::try_from(i) {
+                                    Ok(i) => self.emit(Op::LdaSmi, &[Arg::Imm(i)]),
+                                    Err(_) => self.constant(Constant::Number(i as f64)),
+                                }
+                                self.star(k);
+                                self.value(v)?;
+                                self.emit(Op::SetKeyed, &[Arg::Reg(o), Arg::Reg(k)]);
+                                self.temp -= 1;
+                            }
+                            None => {
+                                if let Accessor(set, f) = v.kind {
+                                    self.closure(f);
+                                    let k = self.const_index(Constant::String(name.clone()));
+                                    let kind = u8::from(set);
+                                    self.emit(
+                                        Op::DefineAccessor,
+                                        &[Arg::Reg(o), Arg::Index(k), Arg::Count(kind)],
+                                    );
+                                    continue;
+                                }
+                                self.value(v)?;
+                                self.named(Op::SetNamed, o, name);
+                            }
+                        }
                     }
                     self.ldar(o);
+                    self.temp = mark;
                 }
             }
             Function(i) => self.closure(*i),
+            Accessor(..) => unreachable!("the parser makes them object literal values only"),
             Member(o, name) => {
                 let r = self.reg(o, &[])?;
                 self.named(Op::GetNamed, r, name);
@@ -1078,6 +1313,36 @@ impl<'a> Gen<'a> {
                 self.effect(x)?;
                 self.emit(Op::LdaUndefined, &[]);
             }
+            // `delete`: a property or element (the key in `acc`), a global
+            // (its name in `acc`); a variable isn't deleted (false), and
+            // anything else is just evaluated (true).
+            Unary(UnOp::Delete, x) => match &x.kind {
+                Member(o, name) => {
+                    let mark = self.temp;
+                    let r = self.reg(o, &[])?;
+                    self.constant(Constant::String(name.clone()));
+                    self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                    self.temp = mark;
+                }
+                Index(o, k) => {
+                    let mark = self.temp;
+                    let r = self.reg(o, &[k])?;
+                    self.value(k)?;
+                    self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                    self.temp = mark;
+                }
+                Ident(n) => match self.resolve(n, x.pos)? {
+                    Var::Global => {
+                        self.constant(Constant::String(n.clone()));
+                        self.emit(Op::DeleteGlobal, &[]);
+                    }
+                    _ => self.emit(Op::LdaFalse, &[]),
+                },
+                _ => {
+                    self.effect(x)?;
+                    self.emit(Op::LdaTrue, &[]);
+                }
+            },
             Unary(UnOp::Typeof, x) => {
                 // An undeclared global is "undefined", not a ReferenceError.
                 match &x.kind {
@@ -1097,7 +1362,6 @@ impl<'a> Gen<'a> {
                 };
                 self.emit(op, &[]);
             }
-            Unary(op, _) => return unsupported(e.pos, format!("unary {op:?}")),
             Update(t, d, prefix) => self.update(t, *d, !*prefix, e.pos)?,
             Binary(op, l, r) => self.binary(*op, l, r, e.pos)?,
             Logical(and, l, r) => {
@@ -1207,6 +1471,8 @@ impl<'a> Gen<'a> {
             BinOp::Shl => Op::ShiftLeft,
             BinOp::Sar => Op::ShiftRight,
             BinOp::Shr => Op::ShiftRightLogical,
+            BinOp::Instanceof => Op::TestInstanceOf,
+            BinOp::In => Op::TestIn,
             _ => return None,
         })
     }
@@ -1619,40 +1885,7 @@ impl<'a> Gen<'a> {
                 name, object, body, ..
             } => self.for_in(labels, name, object, body, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
-            StmtKind::Try(_, _, Some(_)) => return unsupported(s.pos, "`finally`"),
-            StmtKind::Try(block, Some((name, body)), None) => {
-                // The block, then past the handler. An exception thrown in
-                // the block's range lands in the handler with its value in
-                // `acc`, which goes to the catch parameter's own register.
-                let start = self.asm.offset() as u32;
-                self.in_try += 1;
-                for s in block {
-                    self.stmt(s)?;
-                }
-                self.in_try -= 1;
-                let end = self.asm.offset() as u32;
-                let after = self.label();
-                if self.reachable {
-                    self.jump(after);
-                }
-                let handler = self.label();
-                self.labels[handler.0].used = true;
-                self.reachable = false;
-                self.bind(handler);
-                self.handlers.push((start, end, self.asm.offset() as u32));
-                let r = self.alloc(s.pos)?;
-                self.star(r);
-                let outer = self.locals.insert(name.as_str(), r);
-                for s in body {
-                    self.stmt(s)?;
-                }
-                match outer {
-                    Some(o) => self.locals.insert(name.as_str(), o),
-                    None => self.locals.remove(name.as_str()),
-                };
-                self.bind(after);
-            }
-            StmtKind::Try(..) => unreachable!("the parser requires `catch` or `finally`"),
+            StmtKind::Try(block, catch, finally) => self.try_stmt(block, catch, finally, s.pos)?,
             StmtKind::Throw(e) => {
                 self.value(e)?;
                 self.emit(Op::Throw, &[]);
@@ -1662,7 +1895,20 @@ impl<'a> Gen<'a> {
                     Some(e) => self.value(e)?,
                     None => self.emit(Op::LdaUndefined, &[]),
                 }
-                self.emit(Op::Return, &[]);
+                if self.trys.iter().any(|t| t.finally.is_some()) {
+                    // The value waits in a register while the `finally`
+                    // blocks run.
+                    let mark = self.temp;
+                    let r = self.alloc(s.pos)?;
+                    self.star(r);
+                    self.leave_trys(0)?;
+                    self.ldar(r);
+                    self.emit(Op::Return, &[]);
+                    self.reenter_trys(0);
+                    self.temp = mark;
+                } else {
+                    self.emit(Op::Return, &[]);
+                }
             }
             StmtKind::Break(label) | StmtKind::Continue(label) => {
                 let brk = matches!(s.kind, StmtKind::Break(_));
@@ -1682,7 +1928,17 @@ impl<'a> Gen<'a> {
                         ));
                     }
                 };
-                self.jump(l);
+                // The `try` statements inside the target, left on the way.
+                let t = target.map(|t| t as *const Target).unwrap();
+                let at = self.targets.iter().position(|x| std::ptr::eq(x, t)).unwrap();
+                let depth = self.trys.iter().position(|c| c.targets > at).unwrap_or(self.trys.len());
+                if self.trys[depth..].iter().any(|c| c.finally.is_some()) {
+                    self.leave_trys(depth)?;
+                    self.jump(l);
+                    self.reenter_trys(depth);
+                } else {
+                    self.jump(l);
+                }
             }
             StmtKind::Block(b) => {
                 for s in b {

@@ -728,8 +728,25 @@ impl Parser<'_> {
                             return self.err("expected a property name");
                         }
                     };
+                    // `get k() {…}` / `set k(v) {…}`.
                     if matches!(key.as_str(), "get" | "set") && !self.is(":") {
-                        return self.err("getters and setters are not supported");
+                        let name_at = self.i;
+                        let name = match self.bump() {
+                            Tok::Ident(s) | Tok::Str(s) => s,
+                            Tok::Keyword(k) => k.to_string(),
+                            Tok::Num(v) => super::number_to_string(v),
+                            _ => {
+                                self.i = name_at;
+                                return self.err("expected a property name");
+                            }
+                        };
+                        let f = self.function(false, pos)?;
+                        let kind = ExprKind::Accessor(key == "set", f);
+                        props.push((name, Expr { kind, pos }));
+                        if !self.is("}") {
+                            self.expect(",")?;
+                        }
+                        continue;
                     }
                     self.expect(":")?;
                     let v = self.assignment(false)?;

@@ -335,10 +335,6 @@ fn uncaught_throws_end_the_run() {
 #[test]
 fn rejects_what_it_cannot_compile() {
     let unsupported = [
-        ("var g = function h() { return h; };", "own name"),
-        ("var x = delete y.z;", "Delete"),
-        ("try { 1; } finally { 2; }", "finally"),
-        ("var o = {1: 2};", "the key `1`"),
     ];
     for (src, what) in unsupported {
         let e = compile_error(src);
@@ -2062,4 +2058,126 @@ function argsAndApply() {
 #[test]
 fn arguments_and_apply_agree_with_node() {
     assert_eq!(value(&format!("{ARGUMENTS}\nargsAndApply();")), "33128045");
+}
+
+/// `instanceof` and `in` in compiled code (through the runtime), over
+/// prototype chains, arrays and elements, and the errors they throw (the
+/// compiled code leaves for the interpreter to throw them). The expected
+/// value is Node's.
+const INSTANCE_AND_IN: &str = r#"
+function A() { this.a = 1; }
+function B() { this.b = 2; }
+B.prototype = new A();
+B.prototype.p = 3;
+function check(x, C, key) { return (x instanceof C ? 1 : 0) + (key in x ? 2 : 0); }
+function bad(x, C) { return x instanceof C; }
+function badIn(k, o) { return k in o; }
+function errors(o, i) {
+  var t = 0;
+  try { bad(o, i & 1 ? 3 : {}); } catch (e) { t += e instanceof TypeError ? 1000 : 0; }
+  try { badIn("a", i & 1 ? "str" : 4); } catch (e) { t += e instanceof TypeError ? 3000 : 0; }
+  return t;
+}
+function instanceAndIn() {
+  var t = 0, objs = [new A(), new B(), [1, 2], { a: 5 }], keys = ["a", "b", "p", "0", 1, "length"];
+  for (var i = 0; i < 4000; i++) {
+    var o = objs[i & 3];
+    t += check(o, A, keys[i % 6]) + check(o, B, keys[(i + 1) % 6]) * 4 + check(o, Array, keys[(i + 2) % 6]) * 16;
+    if (o instanceof B && "p" in o) t += 7;
+    if (i % 500 == 0) t += errors(o, i);
+  }
+  return t;
+}
+"#;
+
+#[test]
+fn instanceof_and_in_agree_with_node() {
+    assert_eq!(value(&format!("{INSTANCE_AND_IN}\ninstanceAndIn();")), "108338");
+}
+
+/// `finally`: on normal completion, exceptions (thrown again after it),
+/// `return` (also one it overrides), `break` and `continue` (labeled, out
+/// of nested `try`s), with `catch` clauses inside and around it. The
+/// expected value is Node's.
+const FINALLY: &str = r#"
+var log = "";
+function a(x) {
+  try {
+    try { if (x == 1) return "r1"; if (x == 2) throw "t2"; log += "b"; }
+    catch (e) { log += "c" + e; if (x == 2) return "rc"; }
+    finally { log += "F"; }
+    log += "m";
+    for (var i = 0; i < 3; i++) {
+      try { if (i == 1) continue; if (i == 2) break; log += i; } finally { log += "f" + i; }
+    }
+    return "end";
+  } finally { log += "O"; }
+}
+function b() { try { return "x"; } finally { return "override"; } }
+function c() { try { throw new Error("in"); } finally { log += "cf"; } }
+function d() {
+  var n = 0;
+  outer: for (var i = 0; i < 3; i++) {
+    try { for (var j = 0; j < 3; j++) { try { if (j == 1) continue outer; n++; } finally { n += 10; } } }
+    finally { n += 100; }
+  }
+  return n;
+}
+function e2() { try { try { throw 1; } finally { log += "e"; } } catch (x) { return "caught" + x; } }
+function f2() { try { return 1; } finally { try { throw 2; } catch (q) { log += "q" + q; } } }
+var r = [a(0), a(1), a(2), b(), d(), e2(), f2()];
+try { c(); } catch (err) { r.push(err.message); }
+var s = 0;
+for (var k = 0; k < 3000; k++) { try { s += k; if (k % 1000 == 0) throw k; } catch (x) { s -= 1; } finally { s += 2; } }
+r.push(s, log);
+"#;
+
+#[test]
+fn finally_agrees_with_node() {
+    assert_eq!(
+        value(&format!("{FINALLY}\nr.join(\",\");")),
+        "end,r1,rc,override,363,caught1,1,in,4504497,bFm0f0f1f2OFOct2FOeq2cf"
+    );
+}
+
+/// Accessor properties: from `Object.defineProperty` (on a prototype,
+/// getter and setter defined apart: box2d's `b2ContactID.key`) and object
+/// literals, from compiled loops (the runtime calls them), nested, one
+/// throwing; and an array's `length` set. The expected value is Node's.
+const ACCESSORS: &str = r#"
+function L() { this._key = 0; this.f = { r: 0 }; }
+Object.defineProperty(L.prototype, "key", { enumerable: false, configurable: true,
+  get: function () { return this._key; } });
+Object.defineProperty(L.prototype, "key", { enumerable: false, configurable: true,
+  set: function (b) { this._key = b; this.f.r = b & 255; } });
+var box = { _v: 2, get v() { return this._v * 3; }, set v(x) { this._v = x - 1; },
+  get nested() { return this.v + 1; } };
+function Bad() {}
+Object.defineProperty(Bad.prototype, "boom", { get: function () { throw new RangeError("no"); } });
+function accessors() {
+  var t = 0, l = new L(), arr = [1, 2, 3, 4, 5];
+  for (var i = 0; i < 3000; i++) {
+    l.key = i;
+    t += l.key + l.f.r;
+    box.v = i & 7;
+    t += box.v + box.nested;
+    if (i % 1000 == 0) {
+      try { t += new Bad().boom; } catch (e) { t += e instanceof RangeError ? 100 : 0; }
+      arr.length = 2; t += arr.length; arr.length = 4; t += arr.length + (arr[3] === undefined ? 1 : 0);
+      arr.push(9); t += arr[4];
+    }
+  }
+  var keys = [];
+  for (var k in l) keys.push(k);
+  for (var k2 in box) keys.push(k2);
+  return t + ":" + keys.join(",") + ":" + Object.keys(box).length + ":" + ("key" in l) + l.hasOwnProperty("key");
+}
+"#;
+
+#[test]
+fn accessors_agree_with_node() {
+    assert_eq!(
+        value(&format!("{ACCESSORS}\naccessors();")),
+        "4922724:_key,f,_v,v,nested:3:truefalse"
+    );
 }

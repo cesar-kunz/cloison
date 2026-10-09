@@ -395,6 +395,18 @@ extern "C" fn toi_rt_loose_eq(a: Value, b: Value) -> bool {
     crate::interp::loose_equals(a, b).unwrap_or_else(|e| panic!("JIT code: {e}"))
 }
 
+/// `a instanceof b`, or 0 where it would throw (the interpreter does).
+extern "C" fn toi_rt_instance_of(a: Value, b: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    vm.instance_of(a, b).map_or(0, |r| Value::from_bool(r).to_bits())
+}
+
+/// `a in b`, or 0 where it would throw (the interpreter does).
+extern "C" fn toi_rt_in(a: Value, b: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    vm.has_property(b, a).map_or(0, |r| Value::from_bool(r).to_bits())
+}
+
 extern "C" fn toi_rt_to_boolean(a: Value, _: Value) -> bool {
     crate::interp::to_boolean(a)
 }
@@ -402,6 +414,8 @@ extern "C" fn toi_rt_to_boolean(a: Value, _: Value) -> bool {
 fn runtime_function(name: &str) -> usize {
     match name {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
+        "toi_rt_instance_of" => toi_rt_instance_of as *const () as usize,
+        "toi_rt_in" => toi_rt_in as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
         "toi_rt_enter" => toi_rt_enter as *const () as usize,
         "toi_rt_construct" => toi_rt_construct as *const () as usize,
@@ -1420,6 +1434,8 @@ impl Insn {
                         | Op::TestGreaterThanOrEqual
                         | Op::TestEqual
                         | Op::TestStrictEqual
+                        | Op::TestInstanceOf
+                        | Op::TestIn
                         | Op::GetNamed
                         | Op::SetNamed
                         | Op::GetKeyed
@@ -1571,6 +1587,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 | Op::TestLessThanOrEqual
                 | Op::TestGreaterThanOrEqual
                 | Op::TestStrictEqual
+                | Op::TestInstanceOf
+                | Op::TestIn
                 | Op::Sub
                 | Op::Mul
                 | Op::Div => reg = code[pc + 1],
@@ -3475,6 +3493,14 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = Any;
             ("test_eq_smi", num_case(st.acc))
         }
+        Op::TestInstanceOf => {
+            out.acc = Any;
+            ("test_instanceof", "")
+        }
+        Op::TestIn => {
+            out.acc = Any;
+            ("test_in", "")
+        }
         Op::TestLessThan | Op::TestEqual => {
             out.acc = Any;
             let base = if insn.op == Op::TestLessThan {
@@ -3679,7 +3705,11 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         {
             let fb = &fbs[insn.ic_frame()];
             let shape = unsafe { &*(s as *const Shape) };
-            if let Some(slot) = shape.lookup(fb.name(insn)) {
+            // (Not an accessor's slot: the runtime calls its functions.)
+            if let Some(slot) = shape
+                .lookup(fb.name(insn))
+                .filter(|&k| shape.attrs[k as usize] & crate::object::ACCESSOR == 0)
+            {
                 // A store to a read-only property does nothing, one to a
                 // prototype's (a unique shape's) must bump the epoch, and one
                 // to a function's constant field may have to make it mutable
@@ -4798,7 +4828,10 @@ fn stencil_for(
         }
         // Group 2's generic stencils only exist on memory: a slot is
         // written back first (they are the slow, untyped paths).
-        ("sub" | "mul" | "div" | "jrel" | "test_rel" | "test_seq", _) if sel.case.is_empty() => {
+        (
+            "sub" | "mul" | "div" | "jrel" | "test_rel" | "test_seq" | "test_instanceof" | "test_in",
+            _,
+        ) if sel.case.is_empty() => {
             box_acc(&mut pre);
             pre.extend(spill_piece(home, insn.reg));
             cat!(sel.base, "_m")
@@ -8442,6 +8475,9 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
                 }
                 let shape = unsafe { &*st.shape };
                 let slot = shape.lookup(fb.name(&insn))? as usize;
+                if shape.attrs[slot] & crate::object::ACCESSOR != 0 {
+                    return None;
+                }
                 if shape.location(slot as u32) < 0 {
                     return None;
                 }
@@ -8455,6 +8491,9 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
                 let shape = unsafe { &*st.shape };
                 let name = fb.name(&insn);
                 let slot = match shape.lookup(name) {
+                    Some(k) if shape.attrs[k as usize] & crate::object::ACCESSOR != 0 => {
+                        return None;
+                    }
                     Some(k) => k as usize,
                     None => {
                         let Prop::Transition {
@@ -9630,6 +9669,8 @@ impl Lowering<'_> {
                 | Op::TestGreaterThanOrEqual
                 | Op::TestEqual
                 | Op::TestStrictEqual
+                | Op::TestInstanceOf
+                | Op::TestIn
                 | Op::GetNamed
                 | Op::SetNamed
                 | Op::GetKeyed => i.reg = renamed(i.reg),

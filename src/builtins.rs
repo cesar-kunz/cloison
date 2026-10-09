@@ -54,8 +54,37 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 
     let fp = vm.function_prototype;
+    let function = vm.define_native(g, "Function", function_ctor, 1, any, true);
+    link_constructor(vm, function, fp);
     let apply = vm.define_native(fp, "apply", function_apply, 2, any, false);
     vm.function_apply = unsafe { (*apply).code };
+
+    // `Number`, a conversion, and its constants.
+    let number = vm.define_native(g, "Number", number_fn, 1, any, false);
+    link_constructor(vm, number, np_of(vm));
+    for (name, v) in [
+        ("MAX_VALUE", f64::MAX),
+        ("MIN_VALUE", 5e-324),
+        ("POSITIVE_INFINITY", f64::INFINITY),
+        ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+        ("NaN", f64::NAN),
+        ("EPSILON", f64::EPSILON),
+    ] {
+        let a = vm.intern(name);
+        vm.add_property_with(number, a, Value::from_f64(v), READ_ONLY | DONT_ENUM | DONT_DELETE);
+    }
+
+    // `Object`'s functions and `hasOwnProperty`.
+    let a_object = vm.intern("Object");
+    let object = as_object(vm.get(object_value(g), a_object).unwrap());
+    for (name, f, n) in [
+        ("create", object_create as NativeFn, 2),
+        ("keys", object_keys, 1),
+        ("getPrototypeOf", object_get_prototype_of, 1),
+    ] {
+        vm.define_native(object, name, f, n, any, false);
+    }
+    vm.define_native(op, "hasOwnProperty", object_has_own_property, 1, any, false);
 
     // The methods ToPrimitive calls.
     vm.define_native(op, "toString", object_to_string, 0, any, false);
@@ -416,11 +445,111 @@ fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Err(Error::type_error(format!("{this:?} is not a native function (apply it directly)")))
 }
 
+/// `Function(…)` / `new Function(…)`: compiling source at run time isn't
+/// supported yet (as `eval`).
+fn function_ctor(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    Err(Error::unsupported("the Function constructor"))
+}
+
 /// A new array of `values`: an `arguments` object.
 pub(crate) fn arguments_object(vm: &mut Vm, values: &[Value]) -> Value {
     let arr = vm.new_array();
     crate::vm::array_push(vm, arr, values).expect("an array");
     arr
+}
+
+// ---- Number and Object ----
+
+fn np_of(vm: &Vm) -> *mut Object {
+    vm.number_prototype
+}
+
+/// `Number(v)`: ToNumber (0 without an argument).
+fn number_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(match a.first() {
+        None => Value::from_i32(0),
+        Some(&v) if v.is_number() => v,
+        Some(&v) => num(to_number(v)),
+    })
+}
+
+/// `Object.create(proto)`: a plain object with prototype `proto` (an
+/// object or `null`). (No property descriptors yet.)
+fn object_create(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let proto = arg(a, 0);
+    if !(proto.is_null() || (proto.is_cell() && string_units(proto).is_none())) {
+        return Err(Error::type_error("Object prototype may only be an Object or null"));
+    }
+    if !arg(a, 1).is_undefined() {
+        return Err(Error::unsupported("Object.create with property descriptors"));
+    }
+    Ok(object_value(vm.new_object(proto)))
+}
+
+/// The object `Object` functions take: a TypeError for `undefined` and
+/// `null`; `None` for other primitives (which have no own properties here).
+fn object_arg(v: Value, what: &str) -> Result<Option<*mut Object>> {
+    if v.is_undefined() || v.is_null() {
+        return Err(Error::type_error(format!("{what} called on null or undefined")));
+    }
+    Ok(v.is_cell().then(|| as_object(v)))
+}
+
+/// `Object.keys(o)`: its own enumerable keys, elements first.
+fn object_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let mut keys = Vec::new();
+    if let Some(o) = object_arg(arg(a, 0), "Object.keys")? {
+        unsafe {
+            for i in 0..(*o).elems_len as usize {
+                if (*o).class == Class::String || *(*o).elems.add(i) != Value::EMPTY {
+                    keys.push(str_value(vm, &i.to_string()));
+                }
+            }
+            let s = &*(*o).shape;
+            for (k, &name) in s.keys.iter().enumerate() {
+                if s.attrs[k] & DONT_ENUM == 0 {
+                    let n = vm.atom_name(name).to_string();
+                    keys.push(str_value(vm, &n));
+                }
+            }
+        }
+    }
+    let arr = vm.new_array();
+    crate::vm::array_push(vm, arr, &keys)?;
+    Ok(arr)
+}
+
+fn object_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let v = arg(a, 0);
+    Ok(match object_arg(v, "Object.getPrototypeOf")? {
+        Some(o) if string_units(v).is_none() => unsafe { (*(*o).shape).proto },
+        Some(_) => object_value(vm.string_prototype),
+        None if v.is_number() => object_value(vm.number_prototype),
+        None => Value::NULL,
+    })
+}
+
+/// `o.hasOwnProperty(key)`: an own property or element.
+fn object_has_own_property(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let Some(o) = object_arg(this, "Object.prototype.hasOwnProperty")? else {
+        return Ok(Value::FALSE);
+    };
+    let key = arg(a, 0);
+    let u = units(key).into_owned();
+    let name = String::from_utf16_lossy(&u);
+    unsafe {
+        if let Ok(i) = name.parse::<u32>()
+            && i.to_string() == name
+        {
+            let own = i < (*o).elems_len
+                && ((*o).class == Class::String || *(*o).elems.add(i as usize) != Value::EMPTY);
+            return Ok(Value::from_bool(own));
+        }
+        let a = vm.intern(&name);
+        let own = (*(*o).shape).lookup(a).is_some()
+            || (a == vm.intern("length") && matches!((*o).class, Class::Array | Class::String));
+        Ok(Value::from_bool(own))
+    }
 }
 
 // ---- What ToPrimitive calls ----

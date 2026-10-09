@@ -1295,6 +1295,17 @@ struct ExecMem {
     offset: usize,
 }
 
+/// Measuring: `TOI_CODE_SHIFT=<bytes>` (0 to 63) starts every piece that
+/// much past where it would, to sample how alignment alone moves a
+/// benchmark: on DeltaBlue, builds running the same instructions differ by
+/// up to 3% in cycles as the hot code's alignment changes.
+fn code_shift() -> usize {
+    static SHIFT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SHIFT.get_or_init(|| {
+        std::env::var("TOI_CODE_SHIFT").ok().and_then(|s| s.parse().ok()).unwrap_or(0) % 64
+    })
+}
+
 /// The reserved range code is carved from: (next free address, end, the
 /// next piece's offset into its first page).
 static EXEC_RANGE: std::sync::Mutex<(usize, usize, usize)> =
@@ -1305,7 +1316,7 @@ impl ExecMem {
     fn new(len: usize) -> Self {
         let len = len.max(1);
         let mut range = EXEC_RANGE.lock().unwrap();
-        let offset = range.2;
+        let offset = range.2 + code_shift();
         let pages = (offset + len).next_multiple_of(4096);
         if range.1 - range.0 < pages {
             let size = EXEC_RESERVE.max(pages);

@@ -314,7 +314,7 @@ macro_rules! jump {
 }
 /// Side-exit before this instruction has changed anything.
 macro_rules! exit {
-    ($s:expr) => { tail!(toi_exit, $s) };
+    ($s:expr) => {{ core::hint::cold_path(); tail!(toi_exit, $s) }};
 }
 /// Go to this stencil's `__slow` helper (defined by `stencil_slow!`).
 macro_rules! slow {
@@ -3346,13 +3346,13 @@ with_gprs!(each_gpr! array_length_gpr);
 macro_rules! set_keyed {
     ($loc:tt, $case:literal, $array:expr, |$s:ident, $v:ident, $code:ident| $fits:expr, |$t:ident| $value:expr) => {
         stencil!("set_keyed_", $case, loc!($loc); |$s| {
+            let key = key_x();
             let o = get!($loc, $s);
-            let key = *at_imm($s.regs as *mut u8);
-            if !$array($s.tag, o) || !$s.tag.is_int32(key) {
+            if !$array($s.tag, o) {
                 exit!($s)
             }
             let p = o.to_bits() as *mut u8;
-            let i = int(key) as u32;
+            let i = key as u32;
             let $v = {
                 let $t = &$s;
                 $value
@@ -3361,7 +3361,7 @@ macro_rules! set_keyed {
             if i >= *(p.add(32) as *const u32) || !($fits) {
                 exit!($s)
             }
-            *(*(p.add(24) as *const *mut Value)).add(i as usize) = $v;
+            *(*(p.add(24) as *const *mut Value)).add(key as usize) = $v;
             next!($s)
         });
     };
@@ -3402,12 +3402,13 @@ macro_rules! property_location {
             *at_imm(o) = s.acc;
             next!(s)
         });
-        // `o[k] = acc` (the key at `regs + imm`): an array (`_nc`: known to
-        // be one), an int32 key within its length, a value its shape's
-        // elements' type (`Shape::elems_code`, at offset 0) fits; else
-        // leave before. `acc` boxed, or (`_i`) an int32, which fits codes
-        // 0 to 2, or (`_o`) an object, which fits code 0 or its shape.
-        // (A typed array goes through the runtime.)
+        // `o[k] = acc`: an array (`_nc`: known to be one), an int32 key
+        // within its length, a value its shape's elements' type
+        // (`Shape::elems_code`, at offset 0) fits; else leave before. `acc`
+        // boxed, or (`_i`) an int32, which fits codes 0 to 2, or (`_o`) an
+        // object, which fits code 0 or its shape. The key in r11 / x15
+        // (`key_x`); the generic stencil's at `regs + imm`, its `__slow`
+        // helper (a typed array, through the runtime) reading it there too.
         stencil_slow!("set_keyed_", loc!($loc); |s| {
             let o = get!($loc, s);
             let key = *at_imm(s.regs as *mut u8);
@@ -3637,8 +3638,9 @@ with_gprs!(each_gpr! property_gpr);
 // (`jit::typed_kind`): `elems` (byte 24) points to its first element,
 // `elems_len` (byte 32) is its length. An index out of bounds exits (the
 // interpreter reads `undefined`, stores nothing). `_chk` first checks that
-// `o` is a typed array (`class`, byte 8, 7) of the kind in `imm64`
-// (`kind`, byte 10), when only the inline cache says so.
+// `o` is a typed array (`class`, byte 8, 7) of the kind the inline cache
+// saw (`kind`, byte 10): the word at byte 8, its flags (byte 9) masked
+// off, is `imm`, `7 | kind << 16`.
 
 /// The typed array at `o` and its element `i`'s address, `size` bytes
 /// each, if `i` is in bounds.
@@ -3651,11 +3653,12 @@ unsafe fn typed_elem(o: Value, i: u32, size: usize) -> Option<*mut u8> {
     Some(unsafe { (*(p.add(24) as *const *mut u8)).add(i as usize * size) })
 }
 
-/// Whether `o` is a typed array of kind `k`.
+/// Whether `o` is a typed array of kind `k`: class and kind, its bytes 8
+/// and 10, are `want` (`7 | k << 16`).
 #[inline(always)]
-unsafe fn is_typed(tag: NumberTag, o: Value, k: u64) -> bool {
+unsafe fn is_typed(tag: NumberTag, o: Value, want: u32) -> bool {
     let p = o.to_bits() as *const u8;
-    is_cell(tag, o) && unsafe { *p.add(8) == 7 && *p.add(10) as u64 == k }
+    is_cell(tag, o) && unsafe { *(p.add(8) as *const u32) & 0xff00ff == want }
 }
 
 macro_rules! typed_load {
@@ -3667,7 +3670,7 @@ macro_rules! typed_load {
         });
         stencil!("tget_", $w, "_chk_", loc!($loc); |$s| {
             let o = get!($loc, $s);
-            if !is_typed($s.tag, o, imm64()) {
+            if !is_typed($s.tag, o, imm() as u32) {
                 exit!($s)
             }
             let Some($e) = typed_elem(o, int($s.acc) as u32, $size) else { exit!($s) };
@@ -3680,26 +3683,92 @@ macro_rules! typed_load {
 macro_rules! typed_store {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $store:expr) => {
         stencil!("tset_", $w, "_", loc!($loc); |$s| {
-            let key = *at_imm($s.regs as *mut u8);
-            if !$s.tag.is_int32(key) {
-                exit!($s)
-            }
-            let Some($e) = typed_elem(get!($loc, $s), int(key) as u32, $size) else { exit!($s) };
+            let key = key_x();
+            let Some($e) = typed_elem_x(get!($loc, $s), key, $size) else { exit!($s) };
             $store;
             next!($s)
         });
         stencil!("tset_", $w, "_chk_", loc!($loc); |$s| {
+            let key = key_x();
             let o = get!($loc, $s);
-            let key = *at_imm($s.regs as *mut u8);
-            if !is_typed($s.tag, o, imm64()) || !$s.tag.is_int32(key) {
+            if !is_typed($s.tag, o, imm() as u32) {
                 exit!($s)
             }
-            let Some($e) = typed_elem(o, int(key) as u32, $size) else { exit!($s) };
+            let Some($e) = typed_elem_x(o, key, $size) else { exit!($s) };
             $store;
             next!($s)
         });
     };
 }
+
+/// As [`typed_elem`], for a key from [`key_x`].
+#[inline(always)]
+unsafe fn typed_elem_x(o: Value, i: u64, size: usize) -> Option<*mut u8> {
+    let p = o.to_bits() as *const u8;
+    // (A 32-bit compare: the key's high half is zero.)
+    if i as u32 >= unsafe { *(p.add(32) as *const u32) } {
+        return None;
+    }
+    Some(unsafe { (*(p.add(24) as *const *mut u8)).add(i as usize * size) })
+}
+
+// ---- A keyed store's key in a scratch register ----
+//
+// `tset_*` takes the key in r11 / x15, zero-extended, which the JIT's
+// `key_*` piece right before it sets from wherever the key lives (an
+// int32 slot, a boxed one, memory), so the store stencils needn't come in
+// a variant per key slot. Nothing between them touches the register.
+
+/// The key a `key_*` piece left: the stencil's first instruction must
+/// read it (checked in the disassembly; the asm has side effects, so the
+/// stencil's loads and exits come after it).
+#[inline(always)]
+fn key_x() -> u64 {
+    let k: u64;
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("/* key in r11 */", out("r11") k, options(nostack, preserves_flags));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("/* key in x15 */", out("x15") k, options(nostack, preserves_flags));
+    }
+    k
+}
+
+/// Leave int32 `i` in the key register, zero-extended.
+#[inline(always)]
+fn set_key_x(i: i32) {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!("mov r11d, {i:e}", i = in(reg) i, out("r11") _, options(nostack, preserves_flags));
+        #[cfg(target_arch = "aarch64")]
+        core::arch::asm!("mov w15, {i:w}", i = in(reg) i, out("x15") _, options(nostack, preserves_flags));
+    }
+}
+
+stencil!("key_m"; |s| {
+    let k = *mem(s.regs);
+    if !s.tag.is_int32(k) {
+        exit!(s)
+    }
+    set_key_x(int(k));
+    next!(s)
+});
+macro_rules! key_gpr {
+    ($k:tt) => {
+        stencil!("key_g", $k; |s| {
+            if !s.tag.is_int32(s.g[$k]) {
+                exit!(s)
+            }
+            set_key_x(int(s.g[$k]));
+            next!(s)
+        });
+        stencil!("key_u", $k; |s| {
+            set_key_x(raw(s.g[$k]));
+            next!(s)
+        });
+    };
+}
+with_gprs!(each_gpr! key_gpr);
 
 macro_rules! typed_location {
     ($loc:tt) => {

@@ -489,12 +489,12 @@ mod arch {
     /// Bytes of a counting prefix (see `count_prefix` in the parent).
     pub const COUNT_PREFIX: usize = 13;
 
-    /// `movabs r11, counter; inc qword ptr [r11]`: r11 and the flags carry
-    /// nothing between stencils.
+    /// `movabs rax, counter; inc qword ptr [rax]`: rax and the flags carry
+    /// nothing between stencils (r11 may: a keyed store's key, `key_*`).
     pub fn count_prefix(buf: &mut [u8], counter: *mut u64) {
-        buf[..2].copy_from_slice(&[0x49, 0xBB]);
+        buf[..2].copy_from_slice(&[0x48, 0xB8]);
         buf[2..10].copy_from_slice(&(counter as u64).to_le_bytes());
-        buf[10..13].copy_from_slice(&[0x49, 0xFF, 0x03]);
+        buf[10..13].copy_from_slice(&[0x48, 0xFF, 0x00]);
     }
 
     /// Whether the stencil ends with `jmp toi_continue`.
@@ -3694,9 +3694,9 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
         }
         // A number into a typed array of the kind the cache saw: stored as
-        // the kind stores it (`tset_*`), the key from memory, at
-        // `regs + imm`; checked to be one unless the receiver's shape says
-        // so (`_chk`, the kind in `imm64`).
+        // the kind stores it (`tset_*`), the key in a scratch register (see
+        // `stencil_for`); checked to be one unless the receiver's shape
+        // says so (`_chk`, against `typed_class_kind`).
         Op::SetKeyed
             if let Some(Prop::Typed { kind }) = spec.props.get(i).copied()
                 && matches!(st.acc, I32 | F64)
@@ -3705,7 +3705,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let case = typed_store(Some(kind), st.acc == I32).unwrap();
             let known = reg.shape().and_then(typed_kind) == Some(kind);
             return Sel {
-                ops: Some((8 * insn.reg2 as i32, kind as u64, 0)),
+                ops: Some((typed_class_kind(kind), 0, 0)),
                 ..Sel::new("tset", if known { case } else { typed_checked(case) }, out)
             };
         }
@@ -3777,7 +3777,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     ["i8_chk", "u8_chk", "u8_chk", "i16_chk", "u16_chk", "i32_chk", "u32f_chk", "f32_chk", "f64_chk"];
                 out.acc = ty;
                 return Sel {
-                    ops: Some((0, kind as u64, 0)),
+                    ops: Some((typed_class_kind(kind), 0, 0)),
                     ..Sel::new("tget", if known { w } else { CHECKED[kind as usize] }, out)
                 };
             }
@@ -3835,6 +3835,13 @@ fn rely_on_slot(addr: u64) {
 
 /// The element kind (`object::TypedKind`) of typed arrays of shape `s`,
 /// if they are: each kind has its own prototype.
+/// What `tget_*_chk` / `tset_*_chk` compare an object's bytes 8 to 11
+/// with, its flags (byte 9) masked off: class `TypedArray` and `kind`.
+fn typed_class_kind(kind: u8) -> i32 {
+    const _: () = assert!(crate::object::Class::TypedArray as u8 == 7);
+    7 | (kind as i32) << 16
+}
+
 fn typed_kind(s: u64) -> Option<u8> {
     unsafe {
         let s = &*(s as *const Shape);
@@ -5016,6 +5023,30 @@ fn spill_name(home: Home) -> Option<String> {
 /// The piece that writes register `r`'s slot back to memory (`spill_g3`),
 /// if it has one. (The stencils are looked up once: exits write back
 /// every slot, many times a compilation.)
+/// A [`stencil_for`] piece's exit before it's known: the instruction's.
+const KEY_EXIT: u32 = u32::MAX - 1;
+
+/// The pieces putting a keyed store's key, register `k`, into r11 / x15
+/// (`key_*`, which exits if it isn't an int32), where the store reads it.
+/// A double in an FP slot goes through memory (and exits there).
+fn key_pieces(homes: &[Home], k: u8) -> Vec<Piece> {
+    let mut v = Vec::new();
+    let key = match homes[k as usize] {
+        Home::Mem => Piece::new("key_m", k),
+        Home::Gpr(j) => Piece::new(&format!("key_g{j}"), k),
+        Home::Int(j) => Piece::new(&format!("key_u{j}"), k),
+        h @ Home::Fpr(_) => {
+            v.extend(spill_piece(h, k));
+            Piece::new("key_m", k)
+        }
+    };
+    v.push(Piece {
+        exit: KEY_EXIT,
+        ..key
+    });
+    v
+}
+
 fn spill_piece(home: Home, r: u8) -> Option<Piece> {
     static SPILLS: std::sync::OnceLock<Vec<Option<Instance>>> = std::sync::OnceLock::new();
     let table = SPILLS.get_or_init(|| {
@@ -5150,7 +5181,11 @@ fn stencil_for(
                 box_acc(&mut pre);
             }
             let k = insn.reg2;
-            pre.extend(spill_piece(homes[k as usize], k));
+            if sel.case.is_empty() {
+                pre.extend(spill_piece(homes[k as usize], k));
+            } else {
+                pre.extend(key_pieces(homes, k));
+            }
             if sel.case.is_empty() {
                 cat!("set_keyed_", loc)
             } else {
@@ -5162,9 +5197,9 @@ fn stencil_for(
             cat!("get_keyed_rt_", loc)
         }
         ("tget", _) => cat!("tget_", sel.case, "_", loc),
+        // The key into r11 / x15 (`key_*`), where `tset` reads it.
         ("tset", _) => {
-            let k = insn.reg2;
-            pre.extend(spill_piece(homes[k as usize], k));
+            pre.extend(key_pieces(homes, insn.reg2));
             cat!("tset_", sel.case, "_", loc)
         }
         ("set_keyed_rt", _) => {
@@ -6994,7 +7029,11 @@ impl JitCode {
             } else {
                 Target::Next
             };
-            hot.extend(pre);
+            // (A `key_*` piece leaves through the instruction's exit.)
+            hot.extend(pre.into_iter().map(|p| match p.exit {
+                KEY_EXIT => Piece { exit: i as u32, ..p },
+                _ => p,
+            }));
             // A direct call to a function with upvalues: its frame's header
             // gets the function (`set_frame_func`), which the runtime's
             // calls write themselves.

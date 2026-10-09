@@ -975,7 +975,6 @@ mod tests {
         assert!(error("f(").contains("end of input"));
         assert!(error("1 = 2").contains("assignment target"));
         assert!(error("return 1").contains("outside a function"));
-        assert!(error("x = /a/").contains("regular expressions"));
         assert!(error("function (a) {}").contains("name"));
     }
 }

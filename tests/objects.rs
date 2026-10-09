@@ -2616,8 +2616,10 @@ function main()                 ; r1 i, r2 total, r3 F, r7 0
         Star r7
         Star r1
         Star r2
-loop:   LdaGlobal F
-        Mov r7, r8              ; `acc` live: not compiled, compiled `main` exits here
+loop:   Ldar r7
+        Negate                  ; not compiled: compiled `main` exits here
+        Star r8
+        LdaGlobal F
         Star r3
         Construct r3, r4, 0
         Star r5

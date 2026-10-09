@@ -49,6 +49,10 @@ fn main() -> ExitCode {
     // The process exits next: freeing the VM's shapes and code one by one
     // would only cost time (about 100k instructions).
     std::mem::forget(vm);
+    // `TOI_EXITS`: exits from compiled code to the interpreter, and entries.
+    if std::env::var_os("TOI_EXITS").is_some() {
+        eprint!("{}", toi::jit::exits_report());
+    }
     match result {
         Ok(v) => {
             if std::env::var_os("TOI_TIME").is_some() {

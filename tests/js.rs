@@ -1937,3 +1937,45 @@ fn hoisted_loads_agree_with_node() {
     assert_eq!(value(&format!("{HOISTED_LOADS}
 r;")), "1447227");
 }
+
+/// Loads moved out of nested loops of one function (`hoist_loads`), which
+/// code tiering up may enter at either loop's header: the field changed
+/// in the inner loop by a callee, an inner loop not run, a `while` and a
+/// `for` inside the same loop. The results are node's.
+const HOISTED_FROM_NESTED_LOOPS: &str = r#"
+function B(v) { this.v = v; }
+function H(b) { this.b = b; }
+function W(h) { this.h = h; }
+function swap(h) { h.b = new B(9); }
+function f(w, n, m, k) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    for (var j = 0; j < m; j++) {
+      t = t + w.h.b.v;
+      if (i == k && j == 1) swap(w.h);
+    }
+    t = t + w.h.b.v * 2;
+  }
+  return t;
+}
+function g(w, n, m) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    var j = 0;
+    while (j < m) { t = t + w.h.b.v; j++; }
+    for (var q = 0; q < 3; q++) { t = t + w.h.b.v; }
+  }
+  return t;
+}
+var r = 0;
+for (var z = 0; z < 40; z++) {
+  r = r + f(new W(new H(new B(z))), 30, 20, z % 5 == 0 ? 7 : 1000);
+  r = r + g(new W(new H(new B(z))), 20, z % 3);
+}
+"#;
+
+#[test]
+fn loads_hoisted_from_nested_loops_agree_with_node() {
+    assert_eq!(value(&format!("{HOISTED_FROM_NESTED_LOOPS}
+r;")), "542668");
+}

@@ -1427,7 +1427,11 @@ handlers! {
             if (*o).class == Class::TypedArray && i < (*o).elems_len {
                 crate::vm::note_bytes(ic_at(regs, pc, 3), o);
                 let kind = crate::object::TypedKind::from_u8((*o).kind);
-                kind.store((*o).elems.cast(), i as usize, acc.to_number());
+                if tag.is_int32(acc) {
+                    kind.store_i32((*o).elems.cast(), i as usize, acc.as_i32_unchecked());
+                } else {
+                    kind.store((*o).elems.cast(), i as usize, acc.to_number());
+                }
                 next!(any, Op::SetKeyed.size(), acc)
             }
         }
@@ -2581,6 +2585,10 @@ fn int32_of(v: Value) -> i32 {
 }
 
 pub(crate) fn to_int32(d: f64) -> i32 {
+    // Below 2^63 in magnitude, the truncation's low 32 bits (`cvttsd2si`).
+    if d.abs() < 9223372036854775808.0 {
+        return d as i64 as i32;
+    }
     if !d.is_finite() {
         return 0;
     }
@@ -3664,6 +3672,8 @@ pub(crate) unsafe fn set_frame_func(regs: *mut Value, f: *const Object) {
 /// `regs[-FUNC]`'s offset in bytes below the registers (compiled code
 /// reads a function's upvalues through it).
 pub(crate) const FUNC_OFF: usize = 8 * FUNC;
+// The stencils' copy (`lda_upvalue`).
+const _: () = assert!(FUNC_OFF == 80);
 
 /// Native stack a run lets calls from compiled code use (each runs its
 /// callee to completion on the native stack). Past it, the interpreter

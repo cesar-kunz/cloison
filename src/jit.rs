@@ -3496,10 +3496,10 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = if st.acc == I32 { I32 } else { Any };
             ("bit_not", if st.acc == I32 { "i" } else { "" })
         }
-        // `lda_upvalue` finds the cell from the frame's function (its
-        // in-object slots, then the cells: `Vm::upvalues`), the capacity's
-        // offset in the shape in `imm64`, the function's below the
-        // registers in `imm64b`; `_c` has the cell (`Prop::Upvalue`).
+        // `lda_upvalue` finds the cell in the frame's function, at byte
+        // `imm`: after the in-object slots of the function shape, which
+        // every function object with upvalues has (`Vm::upvalues`); `_c`
+        // has the cell (`Prop::Upvalue`).
         Op::LdaUpvalue | Op::StaUpvalue => {
             if insn.op == Op::LdaUpvalue {
                 out.acc = Any;
@@ -3512,9 +3512,11 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 },
                 _ => Sel {
                     ops: Some((
-                        insn.imm,
-                        std::mem::offset_of!(Shape, capacity) as u64,
-                        interp::FUNC_OFF as u64,
+                        (crate::object::INLINE_BASE as u32
+                            + 8 * unsafe { (*(*interp::current_vm()).function_shape).capacity.get() }
+                            + 8 * insn.imm as u32) as i32,
+                        0,
+                        0,
                     )),
                     ..Sel::new(if load { "lda_upvalue" } else { "sta_upvalue" }, "", out)
                 },
@@ -3924,7 +3926,12 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         ..
     } = prop
     {
-        out.acc = Ty::of_field(ft).0;
+        // A typed array keeps its kind: its shape, or one extending it,
+        // says which (no `_chk` on its elements).
+        out.acc = match Ty::of(Value::from_bits(value)) {
+            Ty::Obj(s) if typed_kind(s).is_some() => Ty::Ext(s),
+            _ => Ty::of_field(ft).0,
+        };
         return Sel {
             ops: Some((0, value, 0)),
             check: (at != 0).then_some(("guard_word", at, expect)),
@@ -9166,8 +9173,13 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     let word = |at: u64| unsafe { *(at as *const u64) };
     let object = |v: u64| Value::from_bits(v).is_cell().then_some(v as *mut Object);
     let proto = |o: *mut Object| unsafe { (*o).flags & PROTOTYPE != 0 };
-    // Fields the code may store to.
-    let keyed = out.insns.iter().any(|i| i.op == Op::SetKeyed);
+    // Fields the code may store to. A keyed store's stencils write an
+    // array's elements, or go through the runtime for a typed array (which
+    // may add it a named property); only `set_keyed_rt` writes any object's.
+    let keyed_store = |rt: bool| {
+        (0..n).any(|k| out.insns[k].op == Op::SetKeyed && (out.props[k] == Prop::Runtime) == rt)
+    };
+    let (keyed, keyed_typed) = (keyed_store(true), keyed_store(false));
     let set: Vec<Atom> = (out.insns.iter())
         .filter(|i| i.op == Op::SetNamed)
         .map(|i| out.fbs[i.ic_frame()].name(i))
@@ -9175,8 +9187,9 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     // The cell of `o`'s field `name`, if constant and not stored to.
     let constant = |o: *mut Object, name: Atom| unsafe {
         let s = &*(*o).shape;
+        let typed = (*o).class == crate::object::Class::TypedArray;
         (s.lookup(name).map(|slot| s.field_cell(slot)))
-            .filter(|c| c.is_constant() && !keyed && !set.contains(&name))
+            .filter(|c| c.is_constant() && !keyed && !(typed && keyed_typed) && !set.contains(&name))
     };
     // Globals the code stores to: likely to change.
     let stored: Vec<Atom> = (out.insns.iter())
@@ -9213,8 +9226,16 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
             ) => {
                 let at = global + off as u64;
                 let name = out.fbs[i.ic_frame()].name(&i);
+                // An out-of-line slot moves when the slots grow: only
+                // without a check (a constant field).
+                let at = if oop {
+                    unsafe { *((global + 16) as *const u64) + off as u64 }
+                } else {
+                    at
+                };
                 let check = if constant(global as *mut Object, name).is_some() { 0 } else { at };
-                (!oop && !stored.contains(&name)).then(|| (word(at), check, word(at), ft, global))
+                (!(oop && check != 0) && !stored.contains(&name))
+                    .then(|| (word(at), check, word(at), ft, global))
             }
             (Op::GetNamed, Prop::Own { shape, off, ft }) => of(i.reg)
                 .and_then(object)

@@ -1378,6 +1378,27 @@ impl Vm {
         self.new_string_with(units.len(), |out| out.copy_from_slice(units))
     }
 
+    /// A new string of `len` code units, with `words` words after its
+    /// header (at least the units'), which `fill` writes from their start.
+    pub(crate) fn new_string_raw(
+        &mut self,
+        len: usize,
+        words: usize,
+        fill: impl FnOnce(*mut u16),
+    ) -> Value {
+        let header = crate::object::INLINE_BASE / 8;
+        unsafe {
+            let o = self.heap.alloc_words(header + words).cast::<Object>();
+            o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
+                .write(crate::object::object_header(&*self.string_shape));
+            let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
+            fill(data);
+            (*o).elems = data.cast();
+            (*o).elems_len = u32::try_from(len).expect("string too long");
+            object_value(o)
+        }
+    }
+
     /// A new string of `len` code units, which `fill` writes.
     pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
         let header = crate::object::INLINE_BASE / 8;

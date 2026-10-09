@@ -2397,6 +2397,10 @@ struct Spec<'a> {
     /// Per instruction: `acc` is never a negative int32 there (see
     /// [`nonneg_acc`]).
     nonneg: &'a [bool],
+    /// Per instruction: a `GetNamed` whose value only goes into the
+    /// `SetNamed` right after it (`a.x = b.y`): a number stays boxed (see
+    /// [`select_property`]).
+    moved: &'a [bool],
     /// For VM functions: each frame's feedback (property names; see
     /// [`lower`] for frames).
     feedback: Option<&'a [Feedback]>,
@@ -3243,8 +3247,16 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
     };
     // Finish a selection: a load's result type, or a store's check.
+    // A number moved from a field into another stays boxed: no unboxing
+    // into `facc` and boxing back (DeltaBlue's `EqualityConstraint`
+    // `execute`, `this.output().value = this.input().value`); the store
+    // checks it is a number instead.
+    let moved = spec.moved.get(i).copied().unwrap_or(false);
     let finish = |mut sel: Sel, ft: FieldType| -> Sel {
-        if load {
+        if load && moved && ft == FieldType::Num {
+            sel.out.acc = Ty::Any;
+            sel
+        } else if load {
             let (t, post) = Ty::of_field(ft);
             sel.out.acc = t;
             sel.post = post;
@@ -5556,6 +5568,17 @@ impl JitCode {
             }
             t
         };
+        let moved: Vec<bool> = (0..n)
+            .map(|i| {
+                insns[i].op == Op::GetNamed
+                    && !insns[i].bail
+                    && !insns[i].check_only
+                    && i + 1 < n
+                    && !is_target[i + 1]
+                    && !insns[i + 1].bail
+                    && insns[i + 1].op == Op::SetNamed
+            })
+            .collect();
         let wraps: Vec<bool> = (0..n)
             .map(|i| {
                 matches!(insns[i].op, Op::Add | Op::AddSmi | Op::Inc | Op::Sub)
@@ -5615,6 +5638,7 @@ impl JitCode {
                 polys,
                 wraps: &wraps,
                 nonneg: &nonneg,
+                moved: &moved,
                 feedback,
                 rets: &rets,
             };
@@ -6365,8 +6389,12 @@ impl JitCode {
         // `/tmp/perf-<pid>.map`, so `perf report` shows time per stencil.
         if std::env::var_os("TOI_PERF_MAP").is_some() {
             let mut map = String::new();
+            // Empty pieces (`nop`) get no symbol: perf would give them the
+            // samples of the piece at the same address.
             let mut sym = |at: usize, len: usize, name: &str| {
-                map.push_str(&format!("{:x} {len:x} jit:{name}\n", base as usize + at));
+                if len > 0 {
+                    map.push_str(&format!("{:x} {len:x} jit:{name}\n", base as usize + at));
+                }
             };
             for (p, &at) in hot.iter().zip(&hot_at) {
                 sym(at, p.len(), p.stencil.stencil().name);

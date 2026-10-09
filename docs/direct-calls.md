@@ -1,6 +1,6 @@
 # Direct calls: what they cost, and a cheaper convention
 
-Status: design, 2026-10-08. Step 1 implemented (see Measured).
+Status: design, 2026-10-08. Step 1 and a wrapper-free call on x86-64 implemented (see Measured).
 
 ## Why
 
@@ -109,6 +109,23 @@ call direct, which step 1 suggests is worth 1-2%, at the cost of
 invalidating callers when a site unbinds. The call protocol was 21% of
 DeltaBlue x1000 (wrapper 15%, `call_direct` 5%, entry and return 1.5%):
 most of it goes only with the wrapper itself (steps 5-6).
+
+Without the wrapper (2026-10-09, x86-64): a direct call in a VM frame
+is now a piece of machine code of its own (`arch::direct_call`), not a
+stencil, followed by the `call_done` stencil's checks. Between stencils
+only the stencil state registers carry values, so the piece saves just
+the slot registers live after the call (what compiled code or, after an
+exit there, the interpreter reads), checks the site's entry, closure and
+the two stacks, enters the callee's frame and calls the entry: no second
+call and return, no saves of every slot, rbx, rbp, r11 and r13. The rare
+paths (the callee exited, the checks failed) are a cold stub calling
+`toi_direct_exit` and `toi_rt_call`, as the wrapper did. Measured: fib
+(90) and mutual recursion (91) -18%, 54 -8%, 63 -8%, DeltaBlue's
+`octane-db.js` -4.8% (Octane score ~46700 -> ~48300); hot code +6%
+(`jit.all.hot`). `new` (`construct_direct`) and arm64 still use the
+wrapper. Saving only the live slots within the wrapper alone gained
+nothing measurable (-0.5% instructions): the wrapper's fixed cost was the
+rest.
 
 ## Recommendation
 

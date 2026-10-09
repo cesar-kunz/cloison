@@ -115,6 +115,9 @@ pub const VIA_CALL: i32 = 1;
 
 /// `Ic::loc` of a `GetNamed` that read an array's `length`.
 pub const LENGTH_LOC: i32 = i32::MIN;
+/// How far past twice its elements' length an integer key of an object
+/// that isn't an array makes it sparse (see `object::SPARSE`).
+const SPARSE_GAP: usize = 1024;
 /// `Ic::loc` of a `GetKeyed` that read a typed array's, a buffer's or a
 /// string's elements (no shape: the interpreter's hit path never takes it;
 /// compiled code reads them through the runtime).
@@ -1406,6 +1409,7 @@ impl Vm {
 
     /// Whether `o` has element `i` of its own: within the length, and not
     /// a hole (strings and typed arrays have none; buffers no elements).
+    /// (A sparse object's far keys are named properties: [`Vm::sparse_get`].)
     pub(crate) fn has_element(o: *mut Object, i: u32) -> bool {
         unsafe {
             match (*o).class {
@@ -1414,6 +1418,27 @@ impl Vm {
                 _ => i < (*o).elems_len && *(*o).elems.add(i as usize) != Value::EMPTY,
             }
         }
+    }
+
+    /// A sparse object's own key `i`, stored as a named property (see
+    /// `object::SPARSE`), if it has it.
+    fn sparse_get(&mut self, o: *mut Object, i: u32) -> Result<Option<Value>> {
+        let a = self.intern(&i.to_string());
+        unsafe {
+            if (*(*o).shape).lookup(a).is_none() {
+                return Ok(None);
+            }
+        }
+        self.get(object_value(o), a).map(Some)
+    }
+
+    /// Whether `o` has key `i` of its own: an element, or a sparse one.
+    pub(crate) fn has_own_index(&mut self, o: *mut Object, i: u32) -> bool {
+        Self::has_element(o, i)
+            || unsafe { (*o).flags & crate::object::SPARSE != 0 && {
+                let a = self.intern(&i.to_string());
+                (*(*o).shape).lookup(a).is_some()
+            } }
     }
 
     /// `key in obj`: whether `obj` or its prototypes have the property or
@@ -1432,7 +1457,7 @@ impl Vm {
                 || (a == self.a_length && unsafe { (*o).class } == Class::Array)),
             Key::Index(i) => loop {
                 unsafe {
-                    if (*o).class != Class::String && Self::has_element(o, i) {
+                    if (*o).class != Class::String && self.has_own_index(o, i) {
                         return Ok(true);
                     }
                     let proto = (*(*o).shape).proto;
@@ -1468,6 +1493,9 @@ impl Vm {
                 }
                 if i < (*o).elems_len {
                     *(*o).elems.add(i as usize) = Value::EMPTY;
+                } else if (*o).flags & crate::object::SPARSE != 0 {
+                    let a = self.intern(&i.to_string());
+                    return Ok(self.delete_named(o, a));
                 }
                 Ok(true)
             },
@@ -1653,6 +1681,11 @@ impl Vm {
                         return Ok(v);
                     }
                 }
+                if (*o).flags & crate::object::SPARSE != 0
+                    && let Some(v) = self.sparse_get(o, i)?
+                {
+                    return Ok(v);
+                }
                 let proto = (*(*o).shape).proto;
                 if !proto.is_cell() {
                     return Ok(Value::UNDEFINED);
@@ -1691,6 +1724,13 @@ impl Vm {
                     return Ok(());
                 }
                 _ => {}
+            }
+            // Far past the elements of an object that isn't an array (a
+            // map keyed by numbers): a named property, not as many holes.
+            if (*o).class != Class::Array && i as usize > (*o).elems_len as usize * 2 + SPARSE_GAP {
+                (*o).flags |= crate::object::SPARSE;
+                let a = self.intern(&i.to_string());
+                return self.set(obj, a, value);
             }
             if i >= (*o).elems_len {
                 self.reserve_elems(o, i as usize + 1);
@@ -1863,6 +1903,26 @@ impl Vm {
             self.single_chars[c as usize] = self.new_string(&[c]);
         }
         self.single_chars[c as usize]
+    }
+
+    /// A cons string of strings `a` and `b` (V8's): no units of its own
+    /// (`elems` null) until something reads them (`string_units` flattens
+    /// it), `a` and `b` in `props` and `code`, its length the sum. So
+    /// building a long string piece by piece costs memory linear in its
+    /// length, not quadratic (pdfjs: 138 GB).
+    pub(crate) fn new_cons(&mut self, a: Value, b: Value) -> Value {
+        let header = crate::object::INLINE_BASE / 8;
+        let len = string_len(a).unwrap() + string_len(b).unwrap();
+        unsafe {
+            let o = self.heap.alloc_words(header).cast::<Object>();
+            o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
+                .write(crate::object::object_header(&*self.string_shape));
+            (*o).elems = std::ptr::null_mut();
+            (*o).elems_len = u32::try_from(len).expect("string too long");
+            (*o).props = as_object(a).cast();
+            (*o).code = as_object(b).cast();
+            object_value(o)
+        }
     }
 
     /// The string constant with `units`, shared by equal ones.
@@ -2863,7 +2923,19 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
 
 pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
-        return Err(Error::unsupported("Array.prototype.push on a non-array"));
+        // An array-like object: `this[length++] = v` for each.
+        if !this.is_cell() {
+            return Err(Error::type_error("Array.prototype.push called on a non-object"));
+        }
+        let a_length = vm.a_length;
+        let n = crate::interp::to_number(vm.get(this, a_length)?);
+        let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc() };
+        for &v in args {
+            vm.set_keyed(this, Value::number(n), v)?;
+            n += 1.0;
+        }
+        vm.set(this, a_length, Value::number(n))?;
+        return Ok(Value::number(n));
     }
     let o = as_object(this);
     unsafe {
@@ -2907,8 +2979,52 @@ pub fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
     }
     let o = as_object(v);
     unsafe {
-        ((*o).class == Class::String)
-            .then(|| std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize))
+        if (*o).class != Class::String {
+            return None;
+        }
+        if (*o).elems.is_null() {
+            flatten(o);
+        }
+        Some(std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize))
+    }
+}
+
+/// A string's length without flattening it (see [`Vm::new_cons`]).
+pub(crate) fn string_len(v: Value) -> Option<usize> {
+    if !v.is_cell() {
+        return None;
+    }
+    let o = as_object(v);
+    unsafe { ((*o).class == Class::String).then(|| (*o).elems_len as usize) }
+}
+
+/// Make the cons string `o` (see [`Vm::new_cons`]) flat: its units copied
+/// out of its pieces (iteratively: `s += c` makes a chain as long as the
+/// string), the pieces dropped.
+#[cold]
+#[inline(never)]
+unsafe fn flatten(o: *mut Object) {
+    unsafe {
+        let vm = &mut *crate::interp::current_vm();
+        let len = (*o).elems_len as usize;
+        // Padded to whole words, and one more (copies read past the end).
+        let buf = vm.heap.alloc_words(len.div_ceil(4) + 1).cast::<u16>();
+        let mut at = 0;
+        let mut stack: Vec<*mut Object> = vec![(*o).code as *mut Object, (*o).props.cast::<Object>()];
+        while let Some(s) = stack.pop() {
+            if (*s).elems.is_null() {
+                stack.push((*s).code as *mut Object);
+                stack.push((*s).props.cast::<Object>());
+            } else {
+                let n = (*s).elems_len as usize;
+                std::ptr::copy_nonoverlapping((*s).elems.cast::<u16>(), buf.add(at), n);
+                at += n;
+            }
+        }
+        debug_assert_eq!(at, len);
+        (*o).elems = buf.cast();
+        (*o).props = std::ptr::null_mut();
+        (*o).code = std::ptr::null();
     }
 }
 

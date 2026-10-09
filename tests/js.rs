@@ -2222,3 +2222,41 @@ fn many_variables_agree_with_node() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/octane/many-variables.js.txt")).unwrap();
     assert_eq!(value(&src), "2001571,4543976");
 }
+
+/// Cons strings (long strings built by `+`, flattened when read) and
+/// sparse integer keys (an object used as a map by numbers), `push` on an
+/// array-like. The expected value is Node's.
+const CONS_AND_SPARSE: &str = r#"
+function build(n) { var s = ""; for (var i = 0; i < n; i++) s += String.fromCharCode(97 + i % 26); return s; }
+function sparseMap() {
+  var m = {}, t = 0;
+  for (var i = 0; i < 3000; i++) m[i * 100003 % 9999991] = i;
+  for (var j = 0; j < 3000; j++) t += m[j * 100003 % 9999991];
+  m[5] = 7;
+  var keys = 0;
+  for (var k in m) keys++;
+  return t + ":" + keys + ":" + (2000000 in m) + (100003 in m) + m.hasOwnProperty(100003) + (delete m[100003]) + (100003 in m) + m[5];
+}
+function consAndSparse() {
+  var s = build(5000), parts = [];
+  parts.push(s.length, s.charAt(4999), s.indexOf("xyz"), (s + s).length, s.slice(26, 30));
+  var a = build(300), b = build(300);
+  parts.push(a == b, a === b, (a + "!").length, (a + 1).charAt(300), ("" + 12 + a).substr(0, 5));
+  var arr = [s, a].join("|").length;
+  parts.push(arr, sparseMap(), JSON.stringify({ a: build(260) }).length);
+  var big = [];
+  big.push.apply(big, [1, 2]);
+  var like = { length: 0 };
+  Array.prototype.push.call(like, 5, 6);
+  parts.push(like.length, like[1], big.length, "abc".toLocaleUpperCase());
+  return parts.join(",");
+}
+"#;
+
+#[test]
+fn cons_strings_and_sparse_keys_agree_with_node() {
+    assert_eq!(
+        value(&format!("{CONS_AND_SPARSE}\nconsAndSparse();")),
+        "5000,h,23,10000,abcd,true,true,301,1,12abc,5301,4498500:3001:falsetruetruetruefalse7,268,2,6,2,ABC"
+    );
+}

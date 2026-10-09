@@ -130,6 +130,64 @@ impl Object {
     }
 }
 
+/// A field's type ([`FieldType`]), and whether it is constant: on the
+/// global object and on functions (constructors' statics, such as
+/// DeltaBlue's `Direction.FORWARD`), compiled code takes a constant field's
+/// value as a constant without checking it (`jit`'s `fold_constant_loads`).
+///
+/// A field stays constant while every store to it, on any object with the
+/// field, either filled it (it held `undefined`: a new property, or a
+/// declared global) or stored what it held; `Vm::store_field` makes it
+/// mutable at any other store, and bumps `Vm::field_epoch` if compiled code
+/// took its value (`folded`). So every store to a constant field must go
+/// through `Vm::store_field`: inline caches cache stores to the global
+/// object's and functions' constant fields only once they are mutable, and
+/// caching any other store makes the field mutable first.
+pub struct FieldCell {
+    ty: Cell<FieldType>,
+    mutable: Cell<bool>,
+    folded: Cell<bool>,
+}
+
+impl FieldCell {
+    pub fn new() -> FieldCell {
+        FieldCell {
+            ty: Cell::new(FieldType::None),
+            mutable: Cell::new(false),
+            folded: Cell::new(false),
+        }
+    }
+
+    pub fn get(&self) -> FieldType {
+        self.ty.get()
+    }
+
+    pub fn set(&self, ty: FieldType) {
+        self.ty.set(ty)
+    }
+
+    pub fn is_constant(&self) -> bool {
+        !self.mutable.get()
+    }
+
+    /// Compiled code takes the field's value as a constant.
+    pub fn fold(&self) {
+        self.folded.set(true)
+    }
+
+    /// Make the field mutable; whether compiled code had folded it.
+    pub fn make_mutable(&self) -> bool {
+        self.mutable.set(true);
+        self.folded.replace(false)
+    }
+}
+
+impl Default for FieldCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// What every value ever stored in a field has been, for each field of a
 /// shape. The JIT types values loaded from the field with it.
 ///
@@ -231,8 +289,9 @@ pub struct Shape {
     /// Each slot's attributes ([`READ_ONLY`], [`DONT_ENUM`], [`DONT_DELETE`];
     /// 0 for an ordinary property).
     pub attrs: Vec<u8>,
-    /// The type of the field in each slot (see [`FieldType`]).
-    pub fields: Vec<*const Cell<FieldType>>,
+    /// The type of the field in each slot, and whether it is constant (see
+    /// [`FieldCell`]).
+    pub fields: Vec<*const FieldCell>,
     /// The type of every element stored in objects of this shape. Unlike a field's
     /// type it is part of the shape, as V8's elements kinds are part of the
     /// map: an element store that doesn't fit moves the object to a shape
@@ -314,7 +373,12 @@ impl Shape {
 
     /// The type of the field in slot `i`.
     pub fn field_type(&self, i: u32) -> FieldType {
-        unsafe { (*self.fields[i as usize]).get() }
+        self.field_cell(i).get()
+    }
+
+    /// The cell of the field in slot `i`.
+    pub fn field_cell(&self, i: u32) -> &FieldCell {
+        unsafe { &*self.fields[i as usize] }
     }
 
     /// Where slot `i` lives, as an inline cache records it: the byte offset

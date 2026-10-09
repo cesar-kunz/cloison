@@ -1396,6 +1396,21 @@ handlers! {
     #[inline(never)]
     fn slow_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
+        // A typed array's element, once the cache has its kind (see
+        // `Vm::get_keyed_miss`): read directly.
+        if is_cell(tag, obj) && tag.is_int32(acc) {
+            let o = as_object(obj);
+            let i = acc.as_i32_unchecked() as u32;
+            let ic = ic_at(regs, pc, 2);
+            if (*o).class == Class::TypedArray
+                && i < (*o).elems_len
+                && (*ic).loc == crate::vm::BYTES_LOC
+                && (*ic).epoch == (*o).kind as u32 + 1
+            {
+                let kind = crate::object::TypedKind::from_u8((*o).kind);
+                next!(any, Op::GetKeyed.size(), kind.load((*o).elems.cast(), i as usize))
+            }
+        }
         let r = with_top(regs, None, |vm| vm.get_keyed_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc));
         next_or_throw!(Op::GetKeyed.size(), r)
     }
@@ -1403,6 +1418,19 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_set_keyed(pc, acc, regs, tag) {
+        // A number into a typed array's element: stored directly, its kind
+        // noted for the JIT.
+        let (obj, key) = (*reg(pc, 1, regs), *reg(pc, 2, regs));
+        if is_cell(tag, obj) && tag.is_int32(key) && acc.is_number() {
+            let o = as_object(obj);
+            let i = key.as_i32_unchecked() as u32;
+            if (*o).class == Class::TypedArray && i < (*o).elems_len {
+                crate::vm::note_bytes(ic_at(regs, pc, 3), o);
+                let kind = crate::object::TypedKind::from_u8((*o).kind);
+                kind.store((*o).elems.cast(), i as usize, acc.to_number());
+                next!(any, Op::SetKeyed.size(), acc)
+            }
+        }
         let r = with_top(regs, None, |vm| vm.set_keyed(*reg(pc, 1, regs), *reg(pc, 2, regs), acc));
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
     }

@@ -102,6 +102,31 @@ pub const IC_WAYS: usize = 4;
 /// type code (0–2) nor a shape's address.
 pub const NO_ELEMENTS: u64 = 3;
 
+/// Record in keyed-access cache `ic` that it met `o`'s bytes (a string's,
+/// a typed array's or a buffer's: `BYTES_LOC`), and for the JIT a typed
+/// array's element kind plus one in `epoch` (`u32::MAX` once two kinds or
+/// anything else came). A cache holding a shape keeps it.
+///
+/// # Safety
+/// `ic` must be a live cache slot and `o` a live object.
+pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
+    unsafe {
+        let kind = if (*o).class == Class::TypedArray {
+            (*o).kind as u32 + 1
+        } else {
+            u32::MAX
+        };
+        if (*ic).shape.is_null() && ((*ic).loc != BYTES_LOC || (*ic).epoch != kind) {
+            let epoch = if (*ic).loc != BYTES_LOC { kind } else { u32::MAX };
+            *ic = Ic {
+                loc: BYTES_LOC,
+                epoch,
+                ..Ic::EMPTY
+            };
+        }
+    }
+}
+
 /// A property key: an element index or a name.
 enum Key {
     Index(u32),
@@ -1603,7 +1628,7 @@ impl Vm {
         key: Value,
     ) -> Result<Value> {
         // A string's elements are code units, not values, and a typed
-        // array's or buffer's bytes: recorded as such (`BYTES_LOC`).
+        // array's or buffer's bytes: recorded as such (`note_bytes`).
         if obj.is_cell()
             && matches!(
                 unsafe { (*as_object(obj)).class },
@@ -1611,14 +1636,7 @@ impl Vm {
             )
         {
             let (ic, _) = code.ic(ic);
-            unsafe {
-                if (*ic).shape.is_null() {
-                    *ic = Ic {
-                        loc: BYTES_LOC,
-                        ..Ic::EMPTY
-                    };
-                }
-            }
+            unsafe { note_bytes(ic, as_object(obj)) };
         } else if obj.is_cell() {
             let (ic, _) = code.ic(ic);
             unsafe {

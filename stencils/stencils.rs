@@ -3521,6 +3521,128 @@ macro_rules! property_gpr {
 property_location!([m]);
 with_gprs!(each_gpr! property_gpr);
 
+// ---- Typed arrays' elements ----
+//
+// `o[acc]` and `o[k] = acc` for a typed array `o` of a known element kind
+// (`jit::typed_kind`): `elems` (byte 24) points to its first element,
+// `elems_len` (byte 32) is its length. An index out of bounds exits (the
+// interpreter reads `undefined`, stores nothing). `_chk` first checks that
+// `o` is a typed array (`class`, byte 8, 7) of the kind in `imm64`
+// (`kind`, byte 10), when only the inline cache says so.
+
+/// The typed array at `o` and its element `i`'s address, `size` bytes
+/// each, if `i` is in bounds.
+#[inline(always)]
+unsafe fn typed_elem(o: Value, i: u32, size: usize) -> Option<*mut u8> {
+    let p = o.to_bits() as *const u8;
+    if i >= unsafe { *(p.add(32) as *const u32) } {
+        return None;
+    }
+    Some(unsafe { (*(p.add(24) as *const *mut u8)).add(i as usize * size) })
+}
+
+/// Whether `o` is a typed array of kind `k`.
+#[inline(always)]
+unsafe fn is_typed(tag: NumberTag, o: Value, k: u64) -> bool {
+    let p = o.to_bits() as *const u8;
+    is_cell(tag, o) && unsafe { *p.add(8) == 7 && *p.add(10) as u64 == k }
+}
+
+macro_rules! typed_load {
+    ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $set:expr) => {
+        stencil!("tget_", $w, "_", loc!($loc); |$s| {
+            let Some($e) = typed_elem(get!($loc, $s), int($s.acc) as u32, $size) else { exit!($s) };
+            $set;
+            next!($s)
+        });
+        stencil!("tget_", $w, "_chk_", loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            if !is_typed($s.tag, o, imm64()) {
+                exit!($s)
+            }
+            let Some($e) = typed_elem(o, int($s.acc) as u32, $size) else { exit!($s) };
+            $set;
+            next!($s)
+        });
+    };
+}
+
+macro_rules! typed_store {
+    ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $store:expr) => {
+        stencil!("tset_", $w, "_", loc!($loc); |$s| {
+            let key = *(($s.regs as *const u8).add(imm() as usize) as *const Value);
+            if !$s.tag.is_int32(key) {
+                exit!($s)
+            }
+            let Some($e) = typed_elem(get!($loc, $s), int(key) as u32, $size) else { exit!($s) };
+            $store;
+            next!($s)
+        });
+        stencil!("tset_", $w, "_chk_", loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            let key = *(($s.regs as *const u8).add(imm() as usize) as *const Value);
+            if !is_typed($s.tag, o, imm64()) || !$s.tag.is_int32(key) {
+                exit!($s)
+            }
+            let Some($e) = typed_elem(o, int(key) as u32, $size) else { exit!($s) };
+            $store;
+            next!($s)
+        });
+    };
+}
+
+macro_rules! typed_location {
+    ($loc:tt) => {
+        typed_load!($loc, "i8", 1, |s, e| s.acc = unboxed(*(e as *const i8) as i32));
+        typed_load!($loc, "u8", 1, |s, e| s.acc = unboxed(*e as i32));
+        typed_load!($loc, "i16", 2, |s, e| s.acc = unboxed(*(e as *const i16) as i32));
+        typed_load!($loc, "u16", 2, |s, e| s.acc = unboxed(*(e as *const u16) as i32));
+        typed_load!($loc, "i32", 4, |s, e| s.acc = unboxed(*(e as *const i32)));
+        // A uint32 past int32 exits; once it has, `u32f` gives a double.
+        typed_load!($loc, "u32", 4, |s, e| {
+            let v = *(e as *const u32);
+            if v as i32 >= 0 {
+                s.acc = unboxed(v as i32)
+            } else {
+                exit!(s)
+            }
+        });
+        typed_load!($loc, "u32f", 4, |s, e| s.facc = *(e as *const u32) as f64);
+        typed_load!($loc, "f32", 4, |s, e| s.facc = *(e as *const f32) as f64);
+        typed_load!($loc, "f64", 8, |s, e| s.facc = *(e as *const f64));
+
+        // An int32 `acc` (`_i`) or a double in `facc` (`_f`); into an
+        // integer kind, a double ToInt32 can't truncate exits.
+        typed_store!($loc, "b8_i", 1, |s, e| *e = int(s.acc) as u8);
+        typed_store!($loc, "b16_i", 2, |s, e| *(e as *mut u16) = int(s.acc) as u16);
+        typed_store!($loc, "b32_i", 4, |s, e| *(e as *mut i32) = int(s.acc));
+        typed_store!($loc, "c8_i", 1, |s, e| *e = int(s.acc).clamp(0, 255) as u8);
+        typed_store!($loc, "f32_i", 4, |s, e| *(e as *mut f32) = int(s.acc) as f32);
+        typed_store!($loc, "f64_i", 8, |s, e| *(e as *mut f64) = i2f(int(s.acc)));
+        typed_store!($loc, "b8_f", 1, |s, e| {
+            let Some(v) = f64_to_int32(s.facc) else { exit!(s) };
+            *e = v as u8
+        });
+        typed_store!($loc, "b16_f", 2, |s, e| {
+            let Some(v) = f64_to_int32(s.facc) else { exit!(s) };
+            *(e as *mut u16) = v as u16
+        });
+        typed_store!($loc, "b32_f", 4, |s, e| {
+            let Some(v) = f64_to_int32(s.facc) else { exit!(s) };
+            *(e as *mut i32) = v
+        });
+        typed_store!($loc, "f32_f", 4, |s, e| *(e as *mut f32) = s.facc as f32);
+        typed_store!($loc, "f64_f", 8, |s, e| *(e as *mut f64) = s.facc);
+    };
+}
+macro_rules! typed_gpr {
+    ($k:tt) => {
+        typed_location!([g $k]);
+    };
+}
+typed_location!([m]);
+with_gprs!(each_gpr! typed_gpr);
+
 stencil!("lda_global"; |s| {
     let g = imm64b() as *mut u8;
     if *(g as *const u64) != imm64() {

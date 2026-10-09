@@ -2181,3 +2181,44 @@ fn accessors_agree_with_node() {
         "4922724:_key,f,_v,v,nested:3:truefalse"
     );
 }
+
+/// Typed arrays and buffers read and written by compiled loops (elements
+/// through the runtime), mixed with arrays and strings; callbacks from
+/// natives (`sort`, `map`, `replace`), JSON, `eval` and `Function`. The
+/// expected value is Node's.
+const TYPED_AND_CALLBACKS: &str = r#"
+function fill(t, n) { for (var i = 0; i < n; i++) t[i] = i * 37; return t; }
+function sum(t) { var s = 0; for (var i = 0; i < t.length; i++) s += t[i]; return s; }
+function mixed(xs) { var s = 0; for (var k = 0; k < xs.length; k++) { var x = xs[k]; for (var i = 0; i < 4; i++) s += x[i] | 0; } return s; }
+function typedAndCallbacks() {
+  var u8 = fill(new Uint8Array(300), 300), i16 = fill(new Int16Array(300), 300);
+  var f64 = fill(new Float64Array(300), 300), arr = fill([], 300);
+  var heap = new ArrayBuffer(64), h32 = new Int32Array(heap), h8 = new Uint8Array(heap);
+  for (var i = 0; i < 16; i++) h32[i] = i * 16843009;
+  var r = [sum(u8), sum(i16), sum(f64), sum(arr), sum(h8), mixed([u8, arr, "abcd", h32, f64])];
+  var words = [];
+  for (var j = 0; j < 200; j++) words.push("w" + ((j * 7919) % 200));
+  words.sort(function (a, b) { return a < b ? -1 : a > b ? 1 : 0; });
+  r.push(words.slice(0, 3).join("-"), [3, 1, 2].map(function (x) { return x * x; }).join("-"));
+  r.push("a1b22c333".replace(/\d+/g, function (d) { return "<" + d.length + ">"; }));
+  r.push(JSON.stringify({ k: [1, "x"], n: null }), JSON.parse("[1,{\"a\":[2]}]")[1].a[0]);
+  r.push(eval("1 + 2 * 3"), Function("a", "b", "return a * b")(6, 7));
+  return r.join(",");
+}
+"#;
+
+#[test]
+fn typed_arrays_and_callbacks_agree_with_node() {
+    assert_eq!(
+        value(&format!("{TYPED_AND_CALLBACKS}\ntypedAndCallbacks();")),
+        "37690,1659450,1659450,1659450,480,101058720,w0-w1-w10,9-1-4,a<1>b<2>c<3>,{\"k\":[1,\"x\"],\"n\":null},2,7,42"
+    );
+}
+
+/// Functions with more variables than registers: the rest in a scope
+/// object, also read by a nested function. The expected value is Node's.
+#[test]
+fn many_variables_agree_with_node() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/octane/many-variables.js.txt")).unwrap();
+    assert_eq!(value(&src), "2001571,4543976");
+}

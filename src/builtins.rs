@@ -7,7 +7,7 @@ use std::borrow::Cow;
 
 use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
-use crate::object::{Class, DONT_ENUM, Object, READ_ONLY, DONT_DELETE, as_object, object_value};
+use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, TypedKind, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, number_to_string, string_units};
 
@@ -34,29 +34,38 @@ pub(crate) fn install(vm: &mut Vm) {
     let string = vm.define_native(g, "String", string_fn, 1, any, false);
     link_constructor(vm, string, sp);
     vm.define_native(string, "fromCharCode", string_from_char_code, 1, any, false);
-    for (name, f, n) in [
-        ("charCodeAt", string_char_code_at as NativeFn, 1),
-        ("charAt", string_char_at, 1),
-        ("indexOf", string_index_of, 1),
-        ("lastIndexOf", string_last_index_of, 1),
-        ("substring", string_substring, 2),
-        ("substr", string_substr, 2),
-        ("slice", string_slice, 2),
-        ("toLowerCase", string_to_lower_case, 0),
-        ("toUpperCase", string_to_upper_case, 0),
-        ("trim", string_trim, 0),
-        ("split", string_split, 2),
-        ("concat", string_concat, 1),
-        ("toString", string_to_string, 0),
-        ("valueOf", string_to_string, 0),
-    ] {
-        vm.define_native(sp, name, f, n, any, false);
-    }
+    vm.define_natives(
+        sp,
+        &[
+            ("charCodeAt", string_char_code_at as NativeFn, 1),
+            ("charAt", string_char_at, 1),
+            ("indexOf", string_index_of, 1),
+            ("lastIndexOf", string_last_index_of, 1),
+            ("substring", string_substring, 2),
+            ("substr", string_substr, 2),
+            ("slice", string_slice, 2),
+            ("toLowerCase", string_to_lower_case, 0),
+            ("toUpperCase", string_to_upper_case, 0),
+            ("trim", string_trim, 0),
+            ("split", string_split, 2),
+            ("match", string_match, 1),
+            ("replace", string_replace, 2),
+            ("search", string_search, 1),
+            ("concat", string_concat, 1),
+            ("toString", string_to_string, 0),
+            ("valueOf", string_to_string, 0),
+        ],
+    );
 
     let fp = vm.function_prototype;
     let function = vm.define_native(g, "Function", function_ctor, 1, any, true);
+    vm.define_native(g, "eval", eval_fn, 1, any, false);
+    // A shell's (as V8's `d8`, which Octane's emscripten code expects).
+    vm.define_native(g, "print", print_fn, 1, any, false);
+    vm.define_native(g, "read", read_fn, 1, any, false);
     link_constructor(vm, function, fp);
     let apply = vm.define_native(fp, "apply", function_apply, 2, any, false);
+    vm.define_native(fp, "bind", function_bind, 1, any, false);
     vm.function_apply = unsafe { (*apply).code };
 
     // `Number`, a conversion, and its constants.
@@ -74,16 +83,25 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.add_property_with(number, a, Value::from_f64(v), READ_ONLY | DONT_ENUM | DONT_DELETE);
     }
 
+    // `Boolean`, a conversion; booleans' methods.
+    let bp = vm.new_object(object_value(op));
+    vm.boolean_prototype = bp;
+    let boolean = vm.define_native(g, "Boolean", boolean_fn, 1, any, false);
+    link_constructor(vm, boolean, bp);
+    vm.define_native(bp, "toString", boolean_to_string, 0, any, false);
+    vm.define_native(bp, "valueOf", boolean_value_of, 0, any, false);
+
     // `Object`'s functions and `hasOwnProperty`.
     let a_object = vm.intern("Object");
     let object = as_object(vm.get(object_value(g), a_object).unwrap());
-    for (name, f, n) in [
-        ("create", object_create as NativeFn, 2),
-        ("keys", object_keys, 1),
-        ("getPrototypeOf", object_get_prototype_of, 1),
-    ] {
-        vm.define_native(object, name, f, n, any, false);
-    }
+    vm.define_natives(
+        object,
+        &[
+            ("create", object_create as NativeFn, 2),
+            ("keys", object_keys, 1),
+            ("getPrototypeOf", object_get_prototype_of, 1),
+        ],
+    );
     vm.define_native(op, "hasOwnProperty", object_has_own_property, 1, any, false);
 
     // The methods ToPrimitive calls.
@@ -92,6 +110,30 @@ pub(crate) fn install(vm: &mut Vm) {
     let ap = vm.array_prototype;
     vm.define_native(ap, "toString", array_to_string, 0, any, false);
     vm.define_native(ap, "join", array_join, 1, any, false);
+    vm.define_natives(
+        ap,
+        &[
+            ("slice", array_slice as NativeFn, 2),
+            ("concat", array_concat, 1),
+            ("shift", array_shift, 0),
+            ("unshift", array_unshift, 1),
+            ("splice", array_splice, 2),
+            ("reverse", array_reverse, 0),
+            ("lastIndexOf", array_last_index_of, 1),
+            ("sort", array_sort, 1),
+            ("map", array_map, 1),
+            ("forEach", array_for_each, 1),
+            ("filter", array_filter, 1),
+            ("some", array_some, 1),
+            ("every", array_every, 1),
+            ("reduce", array_reduce, 1),
+        ],
+    );
+    let a_array = vm.intern("Array");
+    let array_ctor = as_object(vm.get(object_value(g), a_array).unwrap());
+    vm.define_native(array_ctor, "isArray", array_is_array, 1, any, false);
+    let np = vm.number_prototype;
+    vm.define_native(np, "toExponential", number_to_exponential, 1, any, false);
     let np = vm.number_prototype;
     vm.define_native(np, "valueOf", number_value_of, 0, any, false);
 
@@ -99,25 +141,42 @@ pub(crate) fn install(vm: &mut Vm) {
     let a_math = vm.intern("Math");
     let math = vm.get(object_value(g), a_math).unwrap();
     let math = as_object(math);
-    for (name, f, n) in [
-        ("tan", math_tan as NativeFn, 1),
-        ("atan", math_atan, 1),
-        ("atan2", math_atan2, 2),
-        ("asin", math_asin, 1),
-        ("acos", math_acos, 1),
-        ("imul", math_imul, 2),
-    ] {
-        vm.define_native(math, name, f, n, any, false);
-    }
+    vm.define_natives(
+        math,
+        &[
+            ("tan", math_tan as NativeFn, 1),
+            ("atan", math_atan, 1),
+            ("atan2", math_atan2, 2),
+            ("asin", math_asin, 1),
+            ("acos", math_acos, 1),
+            ("imul", math_imul, 2),
+        ],
+    );
 
-    for (name, f, n) in [
-        ("parseInt", parse_int as NativeFn, 2),
-        ("parseFloat", parse_float, 1),
-        ("isNaN", is_nan, 1),
-        ("isFinite", is_finite, 1),
-    ] {
-        vm.define_native(g, name, f, n, any, false);
-    }
+    vm.define_natives(
+        g,
+        &[
+            ("parseInt", parse_int as NativeFn, 2),
+            ("parseFloat", parse_float, 1),
+            ("isNaN", is_nan, 1),
+            ("isFinite", is_finite, 1),
+            ("escape", escape_fn, 1),
+            ("unescape", unescape_fn, 1),
+            ("encodeURIComponent", encode_uri_component, 1),
+            ("encodeURI", encode_uri, 1),
+            ("decodeURIComponent", decode_uri_component, 1),
+            ("decodeURI", decode_uri, 1),
+        ],
+    );
+
+    install_typed_arrays(vm);
+    install_regexps(vm);
+
+    let json = vm.new_object(object_value(op));
+    let a_json = vm.intern("JSON");
+    vm.add_property_with(g, a_json, object_value(json), DONT_ENUM);
+    vm.define_native(json, "stringify", json_stringify, 3, any, false);
+    vm.define_native(json, "parse", json_parse, 2, any, false);
 
     // `Error` and its kinds, each prototype inheriting `Error.prototype`.
     const CTORS: [NativeFn; 7] = [
@@ -354,9 +413,13 @@ fn string_trim(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// `split(sep, limit)` with a string separator (or none: the whole
-/// string; `""`: each code unit).
+/// string; `""`: each code unit), or a regular expression (its captures
+/// spliced in).
 fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?.into_owned();
+    if let Some(re) = regexp_of(arg(a, 0)) {
+        return regexp_split(vm, re, &u, a.get(1).copied());
+    }
     let limit = match a.get(1) {
         Some(v) if !v.is_undefined() => crate::interp::to_int32(to_number(*v)) as u32 as usize,
         _ => usize::MAX,
@@ -445,10 +508,77 @@ fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Err(Error::type_error(format!("{this:?} is not a native function (apply it directly)")))
 }
 
-/// `Function(…)` / `new Function(…)`: compiling source at run time isn't
-/// supported yet (as `eval`).
-fn function_ctor(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Err(Error::unsupported("the Function constructor"))
+/// `Function(p1, …, body)` / `new Function(…)`: the function
+/// `(function anonymous(p1, …) { body })` evaluates to, in the global scope.
+fn function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let mut params = Vec::new();
+    for &p in a.iter().take(a.len().saturating_sub(1)) {
+        params.push(String::from_utf16_lossy(&units(p)));
+    }
+    let body = a.last().map_or(String::new(), |&b| String::from_utf16_lossy(&units(b)));
+    let src = format!("(function anonymous({}\n) {{\n{}\n}})", params.join(","), body);
+    run_source(vm, &src)
+}
+
+/// `eval(x)`: `x` itself unless a string, else the value of the script it
+/// is, run in the global scope (also when called directly: its `var`s and
+/// functions become globals, and it can't see the caller's variables).
+fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = arg(a, 0);
+    let Some(u) = string_units(x) else {
+        return Ok(x);
+    };
+    let src = String::from_utf16_lossy(u);
+    run_source(vm, &src)
+}
+
+/// `print(…)`: the arguments' strings, separated by spaces, on a line of
+/// standard output.
+fn print_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let parts: Vec<String> = a.iter().map(|&v| String::from_utf16_lossy(&units(v))).collect();
+    println!("{}", parts.join(" "));
+    Ok(Value::UNDEFINED)
+}
+
+/// `read(file)`: reading files isn't supported.
+fn read_fn(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    Err(Error::unsupported("read()"))
+}
+
+/// Compile `src` as a script and run it (see `interp::run_script_at`): its
+/// completion value. A syntax error is a `SyntaxError`.
+fn run_source(vm: &mut Vm, src: &str) -> Result<Value> {
+    let module = crate::js::compile(src).map_err(|e| {
+        if e.contains("unsupported") {
+            Error(format!("unsupported: in eval'd code: {e}"), None)
+        } else {
+            Error(format!("SyntaxError: {e}"), None)
+        }
+    })?;
+    let code = vm.load(&module);
+    crate::interp::run_script_at(vm, code)
+}
+
+/// `f.bind(that, …args)`: a function calling `f` with `this` `that` and
+/// `args` before its own. Made by a JS helper (natives carry no data of
+/// their own), evaluated on first use.
+fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if !this.is_cell() || !matches!(unsafe { (*as_object(this)).class }, Class::Function | Class::Native) {
+        return Err(Error::type_error("Bind must be called on a function"));
+    }
+    if vm.bind_helper.is_undefined() {
+        vm.bind_helper = run_source(
+            vm,
+            "(function (f, that, args) { return function () { \
+               var all = args.slice(); \
+               for (var i = 0; i < arguments.length; i++) all.push(arguments[i]); \
+               return f.apply(that, all); }; })",
+        )?;
+    }
+    let rest = vm.new_array();
+    crate::vm::array_push(vm, rest, a.get(1..).unwrap_or(&[]))?;
+    let helper = vm.bind_helper;
+    crate::interp::call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), rest])
 }
 
 /// A new array of `values`: an `arguments` object.
@@ -471,6 +601,27 @@ fn number_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         Some(&v) if v.is_number() => v,
         Some(&v) => num(to_number(v)),
     })
+}
+
+fn boolean_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(crate::interp::to_boolean(arg(a, 0))))
+}
+
+fn this_boolean(this: Value) -> Result<bool> {
+    if this.is_bool() {
+        Ok(this == Value::TRUE)
+    } else {
+        Err(Error::type_error("Boolean.prototype method called on a non-boolean"))
+    }
+}
+
+fn boolean_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let b = this_boolean(this)?;
+    Ok(str_value(vm, if b { "true" } else { "false" }))
+}
+
+fn boolean_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(this_boolean(this)?))
 }
 
 /// `Object.create(proto)`: a plain object with prototype `proto` (an
@@ -501,7 +652,7 @@ fn object_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if let Some(o) = object_arg(arg(a, 0), "Object.keys")? {
         unsafe {
             for i in 0..(*o).elems_len as usize {
-                if (*o).class == Class::String || *(*o).elems.add(i) != Value::EMPTY {
+                if Vm::has_element(o, i as u32) {
                     keys.push(str_value(vm, &i.to_string()));
                 }
             }
@@ -541,15 +692,294 @@ fn object_has_own_property(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Valu
         if let Ok(i) = name.parse::<u32>()
             && i.to_string() == name
         {
-            let own = i < (*o).elems_len
-                && ((*o).class == Class::String || *(*o).elems.add(i as usize) != Value::EMPTY);
-            return Ok(Value::from_bool(own));
+            return Ok(Value::from_bool(Vm::has_element(o, i)));
         }
         let a = vm.intern(&name);
         let own = (*(*o).shape).lookup(a).is_some()
             || (a == vm.intern("length") && matches!((*o).class, Class::Array | Class::String));
         Ok(Value::from_bool(own))
     }
+}
+
+// ---- Array.prototype ----
+
+/// `this` as an array: its elements (holes as `undefined`).
+fn this_array(this: Value, what: &str) -> Result<(*mut Object, Vec<Value>)> {
+    if !is_class(this, Class::Array) {
+        return Err(Error::unsupported(format!("Array.prototype.{what} on a non-array")));
+    }
+    let o = as_object(this);
+    let n = unsafe { (*o).elems_len } as usize;
+    let v = (0..n)
+        .map(|i| {
+            let e = unsafe { *(*o).elems.add(i) };
+            if e == Value::EMPTY { Value::UNDEFINED } else { e }
+        })
+        .collect();
+    Ok((o, v))
+}
+
+fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
+    let arr = vm.new_array();
+    crate::vm::array_push(vm, arr, values)?;
+    Ok(arr)
+}
+
+/// Replace `o`'s elements with `values`.
+fn set_elements(vm: &mut Vm, o: *mut Object, values: &[Value]) -> Result<()> {
+    unsafe { (*o).elems_len = 0 };
+    crate::vm::array_push(vm, object_value(o), values).map(|_| ())
+}
+
+fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (_, v) = this_array(this, "slice")?;
+    let s = relative(int_arg(a, 0), v.len());
+    let e = match a.get(1) {
+        Some(x) if !x.is_undefined() => relative(int_arg(a, 1), v.len()),
+        _ => v.len(),
+    };
+    new_array_of(vm, if s < e { &v[s..e] } else { &[] })
+}
+
+fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (_, mut v) = this_array(this, "concat")?;
+    for &x in a {
+        if is_class(x, Class::Array) {
+            v.extend(this_array(x, "concat")?.1);
+        } else {
+            v.push(x);
+        }
+    }
+    new_array_of(vm, &v)
+}
+
+fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let (o, v) = this_array(this, "shift")?;
+    let Some((&first, rest)) = v.split_first() else {
+        return Ok(Value::UNDEFINED);
+    };
+    set_elements(vm, o, rest)?;
+    Ok(first)
+}
+
+fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, v) = this_array(this, "unshift")?;
+    let mut all = a.to_vec();
+    all.extend(v);
+    set_elements(vm, o, &all)?;
+    Ok(Value::from_i32(all.len() as i32))
+}
+
+/// `a.splice(start, count, …items)`: the removed elements.
+fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, mut v) = this_array(this, "splice")?;
+    let s = relative(int_arg(a, 0), v.len());
+    let n = match a.len() {
+        0 => 0,
+        1 => v.len() - s,
+        _ => int_arg(a, 1).clamp(0.0, (v.len() - s) as f64) as usize,
+    };
+    let items = a.get(2..).unwrap_or(&[]);
+    let removed: Vec<Value> = v.splice(s..s + n, items.iter().copied()).collect();
+    set_elements(vm, o, &v)?;
+    new_array_of(vm, &removed)
+}
+
+fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let (o, mut v) = this_array(this, "reverse")?;
+    v.reverse();
+    set_elements(vm, o, &v)?;
+    Ok(this)
+}
+
+fn array_last_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (_, v) = this_array(this, "lastIndexOf")?;
+    let x = arg(a, 0);
+    let from = match a.get(1) {
+        Some(_) => {
+            let d = int_arg(a, 1);
+            if d < 0.0 { v.len() as f64 + d } else { d.min(v.len() as f64 - 1.0) }
+        }
+        None => v.len() as f64 - 1.0,
+    };
+    if from < 0.0 {
+        return Ok(Value::from_i32(-1));
+    }
+    let r = (0..=from as usize).rev().find(|&i| crate::interp::strict_equals(v[i], x));
+    Ok(Value::from_i32(r.map_or(-1, |i| i as i32)))
+}
+
+/// `a.sort(compare)`: stable (a merge sort); `undefined`s last; without a
+/// comparison function, by the elements' strings.
+fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, v) = this_array(this, "sort")?;
+    let cmp = arg(a, 0);
+    let (mut defined, undef): (Vec<Value>, Vec<Value>) = v.into_iter().partition(|x| !x.is_undefined());
+    let mut err = None;
+    let mut less = |vm: &mut Vm, x: Value, y: Value| -> bool {
+        if err.is_some() {
+            return false;
+        }
+        if cmp.is_undefined() {
+            return units(x) > units(y);
+        }
+        match crate::interp::call_function(vm, cmp, Value::UNDEFINED, &[x, y]) {
+            Ok(r) => to_number(r) > 0.0,
+            Err(e) => {
+                err = Some(e);
+                false
+            }
+        }
+    };
+    // Insertion sort for short runs, merging otherwise: stable, and calls
+    // `compare` only as a sort may.
+    merge_sort(vm, &mut defined, &mut less);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    defined.extend(undef);
+    set_elements(vm, o, &defined)?;
+    Ok(this)
+}
+
+/// Sort `v` stably, `after(x, y)` meaning `x` goes after `y`.
+fn merge_sort(vm: &mut Vm, v: &mut [Value], after: &mut dyn FnMut(&mut Vm, Value, Value) -> bool) {
+    let n = v.len();
+    if n <= 10 {
+        for i in 1..n {
+            let mut j = i;
+            while j > 0 && after(vm, v[j - 1], v[j]) {
+                v.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        return;
+    }
+    let mid = n / 2;
+    merge_sort(vm, &mut v[..mid], after);
+    merge_sort(vm, &mut v[mid..], after);
+    let (left, right) = (v[..mid].to_vec(), v[mid..].to_vec());
+    let (mut i, mut j) = (0, 0);
+    for slot in v.iter_mut() {
+        if j >= right.len() || (i < left.len() && !after(vm, left[i], right[j])) {
+            *slot = left[i];
+            i += 1;
+        } else {
+            *slot = right[j];
+            j += 1;
+        }
+    }
+}
+
+/// Call `f` with each element, its index and the array, as the iteration
+/// methods do.
+fn each(vm: &mut Vm, this: Value, a: &[Value], what: &str, mut on: impl FnMut(&mut Vm, usize, Value, Value) -> Result<bool>) -> Result<()> {
+    let (o, _) = this_array(this, what)?;
+    let f = arg(a, 0);
+    let that = arg(a, 1);
+    let n = unsafe { (*o).elems_len } as usize;
+    for i in 0..n.min(unsafe { (*o).elems_len } as usize) {
+        let e = unsafe { *(*o).elems.add(i) };
+        if e == Value::EMPTY {
+            continue;
+        }
+        let r = crate::interp::call_function(vm, f, that, &[e, Value::from_i32(i as i32), this])?;
+        if !on(vm, i, e, r)? {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn array_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let mut out = Vec::new();
+    each(vm, this, a, "map", |_, _, _, r| {
+        out.push(r);
+        Ok(true)
+    })?;
+    new_array_of(vm, &out)
+}
+
+fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    each(vm, this, a, "forEach", |_, _, _, _| Ok(true))?;
+    Ok(Value::UNDEFINED)
+}
+
+fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let mut out = Vec::new();
+    each(vm, this, a, "filter", |_, _, e, r| {
+        if crate::interp::to_boolean(r) {
+            out.push(e);
+        }
+        Ok(true)
+    })?;
+    new_array_of(vm, &out)
+}
+
+fn array_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let mut found = false;
+    each(vm, this, a, "some", |_, _, _, r| {
+        found = crate::interp::to_boolean(r);
+        Ok(!found)
+    })?;
+    Ok(Value::from_bool(found))
+}
+
+fn array_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let mut all = true;
+    each(vm, this, a, "every", |_, _, _, r| {
+        all = crate::interp::to_boolean(r);
+        Ok(all)
+    })?;
+    Ok(Value::from_bool(all))
+}
+
+fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (_, v) = this_array(this, "reduce")?;
+    let f = arg(a, 0);
+    let mut it = v.into_iter().enumerate();
+    let mut acc = match a.get(1) {
+        Some(&x) => x,
+        None => match it.next() {
+            Some((_, x)) => x,
+            None => return Err(Error::type_error("Reduce of empty array with no initial value")),
+        },
+    };
+    for (i, e) in it {
+        acc = crate::interp::call_function(vm, f, Value::UNDEFINED, &[acc, e, Value::from_i32(i as i32), this])?;
+    }
+    Ok(acc)
+}
+
+fn array_is_array(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(is_class(arg(a, 0), Class::Array)))
+}
+
+/// `n.toExponential(digits)`: one digit, `digits` decimals (as many as
+/// needed if missing), `e±exponent`.
+fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let Some(x) = this.as_number() else {
+        return Err(Error::type_error("Number.prototype.toExponential called on a non-number"));
+    };
+    if !x.is_finite() {
+        return Ok(str_value(vm, &number_to_string(x)));
+    }
+    let s = match a.first() {
+        Some(d) if !d.is_undefined() => {
+            let d = to_number(*d);
+            if !(0.0..=100.0).contains(&d) {
+                return Err(Error::range_error("toExponential() argument must be between 0 and 100"));
+            }
+            format!("{:.*e}", d as usize, x)
+        }
+        _ => format!("{x:e}"),
+    };
+    // Rust's `1.5e3` / `1.5e-3`: JavaScript's `1.5e+3` / `1.5e-3`.
+    let s = match s.split_once('e') {
+        Some((m, e)) if !e.starts_with('-') => format!("{m}e+{e}"),
+        _ => s,
+    };
+    Ok(str_value(vm, &s))
 }
 
 // ---- What ToPrimitive calls ----
@@ -749,12 +1179,1109 @@ fn parse_float(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(t[..i].parse::<f64>().unwrap_or(f64::NAN)))
 }
 
+// ---- escape, unescape, URIs ----
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+fn escape_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let u = units(arg(a, 0)).into_owned();
+    let mut out = Vec::new();
+    for c in u {
+        let keep = c < 128 && (c as u8).is_ascii_alphanumeric() || b"@*_+-./".contains(&(c as u8)) && c < 128;
+        if keep {
+            out.push(c);
+        } else if c < 256 {
+            out.extend([b'%' as u16, HEX[(c >> 4) as usize] as u16, HEX[(c & 15) as usize] as u16]);
+        } else {
+            out.extend(['%', 'u'].iter().map(|&c| c as u16));
+            for k in (0..4).rev() {
+                out.push(HEX[((c >> (4 * k)) & 15) as usize] as u16);
+            }
+        }
+    }
+    Ok(vm.new_string(&out))
+}
+
+fn hex_digits(u: &[u16]) -> Option<u16> {
+    let s = String::from_utf16(u).ok()?;
+    u16::from_str_radix(&s, 16).ok().filter(|_| s.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+fn unescape_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let u = units(arg(a, 0)).into_owned();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < u.len() {
+        if u[i] == b'%' as u16 {
+            if u.get(i + 1) == Some(&(b'u' as u16))
+                && let Some(c) = u.get(i + 2..i + 6).and_then(hex_digits)
+            {
+                out.push(c);
+                i += 6;
+                continue;
+            }
+            if let Some(c) = u.get(i + 1..i + 3).and_then(hex_digits) {
+                out.push(c);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(u[i]);
+        i += 1;
+    }
+    Ok(vm.new_string(&out))
+}
+
+/// `encodeURI…`: UTF-8 bytes as `%XX`, but for `keep`'s characters.
+fn encode(vm: &mut Vm, a: &[Value], keep: &[u8]) -> Result<Value> {
+    let u = units(arg(a, 0)).into_owned();
+    let mut out = Vec::new();
+    let mut it = char::decode_utf16(u.iter().copied());
+    while let Some(c) = it.next() {
+        let c = c.map_err(|_| Error(String::from("URIError: URI malformed"), None))?;
+        if c.is_ascii_alphanumeric() || (c.is_ascii() && keep.contains(&(c as u8))) {
+            out.push(c as u16);
+            continue;
+        }
+        let mut b = [0u8; 4];
+        for &byte in c.encode_utf8(&mut b).as_bytes() {
+            out.extend([b'%' as u16, HEX[(byte >> 4) as usize] as u16, HEX[(byte & 15) as usize] as u16]);
+        }
+    }
+    Ok(vm.new_string(&out))
+}
+
+fn encode_uri_component(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    encode(vm, a, b"-_.!~*'()")
+}
+
+fn encode_uri(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    encode(vm, a, b"-_.!~*'();/?:@&=+$,#")
+}
+
+/// `decodeURI…`: `%XX` UTF-8 sequences decoded, but those of `reserved`'s
+/// characters.
+fn decode(vm: &mut Vm, a: &[Value], reserved: &[u8]) -> Result<Value> {
+    let malformed = || Error(String::from("URIError: URI malformed"), None);
+    let u = units(arg(a, 0)).into_owned();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < u.len() {
+        if u[i] != b'%' as u16 {
+            out.push(u[i]);
+            i += 1;
+            continue;
+        }
+        let byte = |i: usize| u.get(i + 1..i + 3).and_then(hex_digits).map(|b| b as u8);
+        let b0 = byte(i).ok_or_else(malformed)?;
+        if b0 < 0x80 {
+            if reserved.contains(&b0) {
+                out.extend_from_slice(&u[i..i + 3]);
+            } else {
+                out.push(b0 as u16);
+            }
+            i += 3;
+            continue;
+        }
+        let n = match b0 {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => return Err(malformed()),
+        };
+        let mut bytes = vec![b0];
+        for k in 1..n {
+            if u.get(i + 3 * k) != Some(&(b'%' as u16)) {
+                return Err(malformed());
+            }
+            bytes.push(byte(i + 3 * k).ok_or_else(malformed)?);
+        }
+        let s = std::str::from_utf8(&bytes).map_err(|_| malformed())?;
+        out.extend(s.encode_utf16());
+        i += 3 * n;
+    }
+    Ok(vm.new_string(&out))
+}
+
+fn decode_uri_component(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    decode(vm, a, b"")
+}
+
+fn decode_uri(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    decode(vm, a, b";/?:@&=+$,#")
+}
+
 fn is_nan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(math_arg(a, 0).is_nan()))
 }
 
 fn is_finite(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(math_arg(a, 0).is_finite()))
+}
+
+// ---- Typed arrays ----
+
+/// `ArrayBuffer`, and the typed array constructors, whose prototypes
+/// share one holding their methods (as `%TypedArray%.prototype`).
+fn install_typed_arrays(vm: &mut Vm) {
+    let g = vm.global;
+    let op = object_value(vm.object_prototype);
+    let any = Ty::Any;
+    let abp = vm.new_object(op);
+    vm.array_buffer_prototype = abp;
+    let ab = vm.define_native(g, "ArrayBuffer", array_buffer_ctor, 1, any, true);
+    link_constructor(vm, ab, abp);
+    getter(vm, abp, "byteLength", buffer_byte_length);
+    vm.define_native(abp, "slice", buffer_slice, 2, any, false);
+
+    let shared = vm.new_object(op);
+    vm.define_natives(
+        shared,
+        &[
+            ("subarray", typed_subarray as NativeFn, 2),
+            ("set", typed_set, 2),
+            ("join", typed_join, 1),
+            ("toString", typed_to_string, 0),
+            ("fill", typed_fill, 3),
+        ],
+    );
+    getter(vm, shared, "buffer", typed_buffer);
+    getter(vm, shared, "byteLength", typed_byte_length);
+    getter(vm, shared, "byteOffset", typed_byte_offset);
+    const CTORS: [NativeFn; 9] = [
+        typed_ctor::<0>,
+        typed_ctor::<1>,
+        typed_ctor::<2>,
+        typed_ctor::<3>,
+        typed_ctor::<4>,
+        typed_ctor::<5>,
+        typed_ctor::<6>,
+        typed_ctor::<7>,
+        typed_ctor::<8>,
+    ];
+    let a_bpe = vm.intern("BYTES_PER_ELEMENT");
+    for (k, kind) in TypedKind::ALL.iter().enumerate() {
+        let proto = vm.new_object(object_value(shared));
+        let c = vm.define_native(g, kind.name(), CTORS[k], 3, any, true);
+        link_constructor(vm, c, proto);
+        let size = Value::from_i32(kind.size() as i32);
+        vm.add_property_with(c, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
+        vm.add_property_with(proto, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
+        vm.typed_prototypes.push(proto);
+    }
+}
+
+/// An accessor `name` on `o` whose getter is the native `f`.
+fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) {
+    let holder = vm.new_object(Value::NULL);
+    let fo = vm.define_native(holder, name, f, 0, Ty::Any, false);
+    let a = vm.intern(name);
+    vm.define_accessor(o, a, Some(object_value(fo)), None, DONT_ENUM);
+}
+
+/// A new buffer of `n` zero bytes (the heap's fresh memory is zeroed and
+/// never reused).
+fn new_buffer(vm: &mut Vm, n: usize) -> *mut Object {
+    let abp = object_value(vm.array_buffer_prototype);
+    let o = vm.new_object_with(Class::ArrayBuffer, abp, 0);
+    unsafe {
+        (*o).elems = vm.heap.alloc_words(n.div_ceil(8).max(1)).cast();
+        (*o).elems_len = u32::try_from(n).expect("buffer too large");
+    }
+    o
+}
+
+/// A view of kind `k` on `buffer`'s bytes from `offset`, `len` elements.
+fn new_view(vm: &mut Vm, k: TypedKind, buffer: *mut Object, offset: usize, len: usize) -> Value {
+    let proto = vm.typed_prototypes[k as usize];
+    let o = vm.new_object_with(Class::TypedArray, object_value(proto), 0);
+    unsafe {
+        (*o).kind = k as u8;
+        (*o).elems = (*buffer).elems.cast::<u8>().add(offset).cast();
+        (*o).elems_len = len as u32;
+        (*o).code = buffer.cast();
+    }
+    object_value(o)
+}
+
+fn is_class(v: Value, c: Class) -> bool {
+    v.is_cell() && unsafe { (*as_object(v)).class } == c
+}
+
+/// ToIndex of argument `i` (`default` if missing or undefined).
+fn index_arg(a: &[Value], i: usize, default: usize) -> Result<usize> {
+    match a.get(i) {
+        Some(v) if !v.is_undefined() => {
+            let d = to_number(*v);
+            let d = if d.is_nan() { 0.0 } else { d.trunc() };
+            if !(0.0..=9007199254740991.0).contains(&d) {
+                return Err(Error::range_error("Invalid typed array length"));
+            }
+            Ok(d as usize)
+        }
+        _ => Ok(default),
+    }
+}
+
+fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let n = index_arg(a, 0, 0)?;
+    Ok(object_value(new_buffer(vm, n)))
+}
+
+fn this_buffer(this: Value) -> Result<*mut Object> {
+    if is_class(this, Class::ArrayBuffer) {
+        Ok(as_object(this))
+    } else {
+        Err(Error::type_error("not an ArrayBuffer"))
+    }
+}
+
+fn buffer_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    Ok(Value::from_i32(unsafe { (*this_buffer(this)?).elems_len } as i32))
+}
+
+/// `buffer.slice(begin, end)`: a copy of those bytes.
+fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let b = this_buffer(this)?;
+    let len = unsafe { (*b).elems_len } as usize;
+    let s = relative(int_arg(a, 0), len);
+    let e = match a.get(1) {
+        Some(v) if !v.is_undefined() => relative(int_arg(a, 1), len),
+        _ => len,
+    };
+    let n = e.saturating_sub(s);
+    let c = new_buffer(vm, n);
+    unsafe { std::ptr::copy_nonoverlapping((*b).elems.cast::<u8>().add(s), (*c).elems.cast::<u8>(), n) };
+    Ok(object_value(c))
+}
+
+/// `new X(length)`, `new X(buffer, byteOffset, length)`, or `new X(list)`
+/// (an array, typed array or array-like: its elements converted).
+fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let k = TypedKind::ALL[K];
+    let first = arg(a, 0);
+    if is_class(first, Class::ArrayBuffer) {
+        let b = as_object(first);
+        let bytes = unsafe { (*b).elems_len } as usize;
+        let offset = index_arg(a, 1, 0)?;
+        if offset % k.size() != 0 {
+            return Err(Error::range_error(format!(
+                "start offset of {} should be a multiple of {}",
+                k.name(),
+                k.size()
+            )));
+        }
+        let len = match a.get(2) {
+            Some(v) if !v.is_undefined() => index_arg(a, 2, 0)?,
+            _ => {
+                if bytes % k.size() != 0 || offset > bytes {
+                    return Err(Error::range_error("Invalid typed array length"));
+                }
+                (bytes - offset) / k.size()
+            }
+        };
+        if offset + len * k.size() > bytes {
+            return Err(Error::range_error("Invalid typed array length"));
+        }
+        return Ok(new_view(vm, k, b, offset, len));
+    }
+    if first.is_cell() && string_units(first).is_none() {
+        // A list: its length, then each element.
+        let a_length = vm.intern("length");
+        let n = to_number(vm.get(first, a_length)?);
+        let n = if n.is_nan() || n < 0.0 { 0 } else { n as usize };
+        let b = new_buffer(vm, n * k.size());
+        let v = new_view(vm, k, b, 0, n);
+        for i in 0..n {
+            let e = vm.get_keyed(first, Value::from_i32(i as i32))?;
+            unsafe { k.store((*b).elems.cast(), i, to_number(e)) };
+        }
+        return Ok(v);
+    }
+    let n = index_arg(a, 0, 0)?;
+    let b = new_buffer(vm, n * k.size());
+    Ok(new_view(vm, k, b, 0, n))
+}
+
+fn this_typed(this: Value) -> Result<*mut Object> {
+    if is_class(this, Class::TypedArray) {
+        Ok(as_object(this))
+    } else {
+        Err(Error::type_error("this is not a typed array."))
+    }
+}
+
+fn kind_of(o: *mut Object) -> TypedKind {
+    TypedKind::from_u8(unsafe { (*o).kind })
+}
+
+/// `t.subarray(begin, end)`: a view of the same bytes.
+fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let k = kind_of(o);
+    let len = unsafe { (*o).elems_len } as usize;
+    let s = relative(int_arg(a, 0), len);
+    let e = match a.get(1) {
+        Some(v) if !v.is_undefined() => relative(int_arg(a, 1), len),
+        _ => len,
+    };
+    unsafe {
+        let b = (*o).code as *mut Object;
+        let offset = (*o).elems.cast::<u8>().offset_from((*b).elems.cast::<u8>()) as usize;
+        Ok(new_view(vm, k, b, offset + s * k.size(), e.saturating_sub(s)))
+    }
+}
+
+/// `t.set(list, offset)`: `list`'s elements (an array or a typed array)
+/// stored from `offset` on.
+fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let k = kind_of(o);
+    let offset = index_arg(a, 1, 0)?;
+    let src = arg(a, 0);
+    let a_length = vm.intern("length");
+    let n = to_number(vm.get(src, a_length)?);
+    let n = if n.is_nan() || n < 0.0 { 0 } else { n as usize };
+    let len = unsafe { (*o).elems_len } as usize;
+    if offset + n > len {
+        return Err(Error::range_error("offset is out of bounds"));
+    }
+    // Read them all first: `list` may share the bytes.
+    let mut vals = Vec::with_capacity(n);
+    for i in 0..n {
+        vals.push(to_number(vm.get_keyed(src, Value::from_i32(i as i32))?));
+    }
+    for (i, d) in vals.into_iter().enumerate() {
+        unsafe { k.store((*o).elems.cast(), offset + i, d) };
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// `t.fill(v, begin, end)`.
+fn typed_fill(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let k = kind_of(o);
+    let len = unsafe { (*o).elems_len } as usize;
+    let d = to_number(arg(a, 0));
+    let s = relative(int_arg(a, 1), len);
+    let e = match a.get(2) {
+        Some(v) if !v.is_undefined() => relative(int_arg(a, 2), len),
+        _ => len,
+    };
+    for i in s..e.max(s) {
+        unsafe { k.store((*o).elems.cast(), i, d) };
+    }
+    Ok(this)
+}
+
+fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let k = kind_of(o);
+    let sep = match a.first() {
+        Some(v) if !v.is_undefined() => units(*v).into_owned(),
+        _ => vec![b',' as u16],
+    };
+    let mut out = Vec::new();
+    for i in 0..unsafe { (*o).elems_len } as usize {
+        if i > 0 {
+            out.extend_from_slice(&sep);
+        }
+        let v = unsafe { k.load((*o).elems.cast(), i) };
+        out.extend(crate::vm::display(v).encode_utf16());
+    }
+    Ok(vm.new_string(&out))
+}
+
+fn typed_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    typed_join(vm, this, &[])
+}
+
+fn typed_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    Ok(object_value(unsafe { (*this_typed(this)?).code } as *mut Object))
+}
+
+fn typed_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    Ok(Value::from_i32((unsafe { (*o).elems_len } as usize * kind_of(o).size()) as i32))
+}
+
+fn typed_byte_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    unsafe {
+        let b = (*o).code as *mut Object;
+        Ok(Value::from_i32((*o).elems.cast::<u8>().offset_from((*b).elems.cast::<u8>()) as i32))
+    }
+}
+
+// ---- JSON ----
+
+/// `JSON.stringify(v)`: no replacer, `toJSON` or indentation; `undefined`
+/// (also for a function).
+fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    if a.len() > 1 && !(arg(a, 1).is_undefined() && arg(a, 2).is_undefined()) {
+        return Err(Error::unsupported("JSON.stringify with a replacer or indentation"));
+    }
+    let mut out = Vec::new();
+    let mut stack = Vec::new();
+    if !json_value(vm, arg(a, 0), &mut out, &mut stack)? {
+        return Ok(Value::UNDEFINED);
+    }
+    Ok(vm.new_string(&out))
+}
+
+/// `v` as JSON appended to `out`; false if it has none (`undefined`, a
+/// function).
+fn json_value(vm: &mut Vm, v: Value, out: &mut Vec<u16>, stack: &mut Vec<u64>) -> Result<bool> {
+    let push = |out: &mut Vec<u16>, s: &str| out.extend(s.encode_utf16());
+    if v.is_undefined() {
+        return Ok(false);
+    }
+    if v.is_null() {
+        push(out, "null");
+        return Ok(true);
+    }
+    if v.is_bool() {
+        push(out, if v == Value::TRUE { "true" } else { "false" });
+        return Ok(true);
+    }
+    if let Some(d) = v.as_number() {
+        push(out, &if d.is_finite() { crate::vm::display(v) } else { "null".into() });
+        return Ok(true);
+    }
+    if let Some(u) = string_units(v) {
+        json_quote(u, out);
+        return Ok(true);
+    }
+    let o = as_object(v);
+    let class = unsafe { (*o).class };
+    if matches!(class, Class::Function | Class::Native) {
+        return Ok(false);
+    }
+    if stack.contains(&v.to_bits()) {
+        return Err(Error::type_error("Converting circular structure to JSON"));
+    }
+    stack.push(v.to_bits());
+    if class == Class::Array {
+        out.push(b'[' as u16);
+        let n = unsafe { (*o).elems_len } as usize;
+        for i in 0..n {
+            if i > 0 {
+                out.push(b',' as u16);
+            }
+            let e = vm.get_keyed(v, Value::from_i32(i as i32))?;
+            if !json_value(vm, e, out, stack)? {
+                push(out, "null");
+            }
+        }
+        out.push(b']' as u16);
+    } else {
+        out.push(b'{' as u16);
+        let mut first = true;
+        let mut keys: Vec<(Vec<u16>, Value)> = Vec::new();
+        unsafe {
+            for i in 0..(*o).elems_len as usize {
+                if Vm::has_element(o, i as u32) {
+                    let e = vm.get_keyed(v, Value::from_i32(i as i32))?;
+                    keys.push((i.to_string().encode_utf16().collect(), e));
+                }
+            }
+            let s = &*(*o).shape;
+            let names: Vec<_> = s
+                .keys
+                .iter()
+                .enumerate()
+                .filter(|&(k, _)| s.attrs[k] & DONT_ENUM == 0)
+                .map(|(_, &n)| n)
+                .collect();
+            for n in names {
+                let e = vm.get(v, n)?;
+                keys.push((vm.atom_name(n).encode_utf16().collect(), e));
+            }
+        }
+        for (k, e) in keys {
+            let mark = out.len();
+            if !first {
+                out.push(b',' as u16);
+            }
+            json_quote(&k, out);
+            out.push(b':' as u16);
+            if json_value(vm, e, out, stack)? {
+                first = false;
+            } else {
+                out.truncate(mark);
+            }
+        }
+        out.push(b'}' as u16);
+    }
+    stack.pop();
+    Ok(true)
+}
+
+fn json_quote(u: &[u16], out: &mut Vec<u16>) {
+    out.push(b'"' as u16);
+    for &c in u {
+        let esc = match c {
+            0x22 => Some("\\\""),
+            0x5C => Some("\\\\"),
+            0x08 => Some("\\b"),
+            0x0C => Some("\\f"),
+            0x0A => Some("\\n"),
+            0x0D => Some("\\r"),
+            0x09 => Some("\\t"),
+            _ => None,
+        };
+        match esc {
+            Some(e) => out.extend(e.encode_utf16()),
+            None if c < 0x20 || (0xD800..0xE000).contains(&c) => {
+                out.extend(format!("\\u{c:04x}").encode_utf16())
+            }
+            None => out.push(c),
+        }
+    }
+    out.push(b'"' as u16);
+}
+
+/// `JSON.parse(text)` (no reviver).
+fn json_parse(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let u = units(arg(a, 0)).into_owned();
+    let mut p = JsonParser { u: &u, i: 0 };
+    let v = p.value(vm)?;
+    p.space();
+    if p.i != u.len() {
+        return Err(p.error());
+    }
+    Ok(v)
+}
+
+struct JsonParser<'a> {
+    u: &'a [u16],
+    i: usize,
+}
+
+impl JsonParser<'_> {
+    fn error(&self) -> Error {
+        Error::new_syntax(format!("Unexpected token in JSON at position {}", self.i))
+    }
+    fn space(&mut self) {
+        while self.i < self.u.len() && matches!(self.u[self.i], 0x20 | 0x09 | 0x0A | 0x0D) {
+            self.i += 1;
+        }
+    }
+    fn peek(&self) -> Option<u16> {
+        self.u.get(self.i).copied()
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.space();
+        if self.peek() == Some(c as u16) {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn word(&mut self, w: &str, v: Value) -> Result<Value> {
+        let w: Vec<u16> = w.encode_utf16().collect();
+        if self.u[self.i..].starts_with(&w) {
+            self.i += w.len();
+            Ok(v)
+        } else {
+            Err(self.error())
+        }
+    }
+    fn value(&mut self, vm: &mut Vm) -> Result<Value> {
+        self.space();
+        match self.peek().map(|c| c as u8 as char) {
+            Some('{') => {
+                self.i += 1;
+                let o = object_value(vm.new_object(object_value(vm.object_prototype)));
+                if self.eat(b'}') {
+                    return Ok(o);
+                }
+                loop {
+                    self.space();
+                    let k = self.string()?;
+                    if !self.eat(b':') {
+                        return Err(self.error());
+                    }
+                    let v = self.value(vm)?;
+                    let key = vm.new_string(&k);
+                    vm.set_keyed(o, key, v)?;
+                    if self.eat(b'}') {
+                        return Ok(o);
+                    }
+                    if !self.eat(b',') {
+                        return Err(self.error());
+                    }
+                }
+            }
+            Some('[') => {
+                self.i += 1;
+                let mut elems = Vec::new();
+                if !self.eat(b']') {
+                    loop {
+                        elems.push(self.value(vm)?);
+                        if self.eat(b']') {
+                            break;
+                        }
+                        if !self.eat(b',') {
+                            return Err(self.error());
+                        }
+                    }
+                }
+                let arr = vm.new_array();
+                crate::vm::array_push(vm, arr, &elems)?;
+                Ok(arr)
+            }
+            Some('"') => {
+                let s = self.string()?;
+                Ok(vm.new_string(&s))
+            }
+            Some('t') => self.word("true", Value::TRUE),
+            Some('f') => self.word("false", Value::FALSE),
+            Some('n') => self.word("null", Value::NULL),
+            Some('-' | '0'..='9') => {
+                let start = self.i;
+                while self.i < self.u.len()
+                    && matches!(self.u[self.i] as u8 as char, '-' | '+' | '.' | 'e' | 'E' | '0'..='9')
+                    && self.u[self.i] < 128
+                {
+                    self.i += 1;
+                }
+                let s = String::from_utf16_lossy(&self.u[start..self.i]);
+                s.parse::<f64>().map(num).map_err(|_| self.error())
+            }
+            _ => Err(self.error()),
+        }
+    }
+    fn string(&mut self) -> Result<Vec<u16>> {
+        if self.peek() != Some(b'"' as u16) {
+            return Err(self.error());
+        }
+        self.i += 1;
+        let mut out = Vec::new();
+        loop {
+            let Some(c) = self.peek() else { return Err(self.error()) };
+            self.i += 1;
+            match c {
+                0x22 => return Ok(out),
+                0x5C => {
+                    let Some(e) = self.peek() else { return Err(self.error()) };
+                    self.i += 1;
+                    out.push(match e as u8 {
+                        b'"' => 0x22,
+                        b'\\' => 0x5C,
+                        b'/' => 0x2F,
+                        b'b' => 0x08,
+                        b'f' => 0x0C,
+                        b'n' => 0x0A,
+                        b'r' => 0x0D,
+                        b't' => 0x09,
+                        b'u' => {
+                            let h = self.u.get(self.i..self.i + 4).ok_or_else(|| self.error())?;
+                            let s = String::from_utf16_lossy(h);
+                            self.i += 4;
+                            u16::from_str_radix(&s, 16).map_err(|_| self.error())?
+                        }
+                        _ => return Err(self.error()),
+                    });
+                }
+                _ => out.push(c),
+            }
+        }
+    }
+}
+
+// ---- Regular expressions ----
+
+fn install_regexps(vm: &mut Vm) {
+    let g = vm.global;
+    let op = object_value(vm.object_prototype);
+    let any = Ty::Any;
+    let rp = vm.new_object(op);
+    vm.regexp_prototype = rp;
+    let c = vm.define_native(g, "RegExp", regexp_ctor, 2, any, true);
+    link_constructor(vm, c, rp);
+    vm.define_natives(
+        rp,
+        &[
+            ("exec", regexp_exec as NativeFn, 1),
+            ("test", regexp_test, 1),
+            ("toString", regexp_to_string, 0),
+        ],
+    );
+}
+
+/// A new `RegExp` of `pattern` and `flags` (compiled once per pair): its
+/// own `lastIndex`, `source`, `global`, `ignoreCase`, `multiline`.
+pub(crate) fn new_regexp(vm: &mut Vm, pattern: &str, flags: &str) -> Result<Value> {
+    let key = (pattern.to_string(), flags.to_string());
+    let re: *const crate::regexp::Regex = match vm.regexps.get(&key) {
+        Some(r) => &**r,
+        None => {
+            let r = crate::regexp::Regex::new(pattern, flags).map_err(Error::new_syntax)?;
+            let b = Box::new(r);
+            let p: *const crate::regexp::Regex = &*b;
+            vm.regexps.insert(key, b);
+            p
+        }
+    };
+    let proto = object_value(vm.regexp_prototype);
+    let o = vm.new_object_with(Class::RegExp, proto, 6);
+    unsafe { (*o).code = re.cast() };
+    let source = if pattern.is_empty() { "(?:)" } else { pattern };
+    let source = str_value(vm, source);
+    let r = unsafe { &*re };
+    for (name, v) in [
+        ("lastIndex", Value::from_i32(0)),
+        ("source", source),
+        ("global", Value::from_bool(r.global)),
+        ("ignoreCase", Value::from_bool(r.ignore_case)),
+        ("multiline", Value::from_bool(r.multiline)),
+    ] {
+        let a = vm.intern(name);
+        let attrs = if name == "lastIndex" { DONT_ENUM } else { DONT_ENUM | READ_ONLY };
+        vm.add_property_with(o, a, v, attrs);
+    }
+    Ok(object_value(o))
+}
+
+/// `v`'s compiled regular expression, if it is a `RegExp`.
+fn regexp_of<'a>(v: Value) -> Option<&'a crate::regexp::Regex> {
+    is_class(v, Class::RegExp).then(|| unsafe { &*((*as_object(v)).code as *const crate::regexp::Regex) })
+}
+
+/// `RegExp(pattern, flags)`: from a string, or from another `RegExp`
+/// (its source; its flags unless given).
+fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let p = arg(a, 0);
+    let (mut pattern, mut flags) = (String::new(), String::new());
+    if let Some(re) = regexp_of(p) {
+        let a_source = vm.intern("source");
+        pattern = String::from_utf16_lossy(&units(vm.get(p, a_source)?));
+        flags = regexp_flags(re);
+    } else if !p.is_undefined() {
+        pattern = String::from_utf16_lossy(&units(p));
+    }
+    if pattern == "(?:)" {
+        pattern.clear();
+    }
+    if !arg(a, 1).is_undefined() {
+        flags = String::from_utf16_lossy(&units(arg(a, 1)));
+    }
+    new_regexp(vm, &pattern, &flags)
+}
+
+fn regexp_flags(re: &crate::regexp::Regex) -> String {
+    let mut f = String::new();
+    for (on, c) in [(re.global, 'g'), (re.ignore_case, 'i'), (re.multiline, 'm')] {
+        if on {
+            f.push(c);
+        }
+    }
+    f
+}
+
+fn this_regexp<'a>(this: Value) -> Result<&'a crate::regexp::Regex> {
+    regexp_of(this).ok_or_else(|| Error::type_error("RegExp method called on an incompatible receiver"))
+}
+
+/// The match of `re` (the object `this`) in `s` where `exec` looks: from
+/// `lastIndex` if global (then set past the match, or to 0 on none).
+fn regexp_match(vm: &mut Vm, this: Value, re: &crate::regexp::Regex, s: &[u16]) -> Result<Option<crate::regexp::Captures>> {
+    let a_last = vm.intern("lastIndex");
+    let start = if re.global {
+        let li = to_number(vm.get(this, a_last)?);
+        if li.is_nan() || li < 0.0 { 0 } else { li as usize }
+    } else {
+        0
+    };
+    if start > s.len() {
+        vm.set(this, a_last, Value::from_i32(0))?;
+        return Ok(None);
+    }
+    let caps = re.exec(s, start);
+    if re.global {
+        let next = caps.as_ref().map_or(0, |c| c[0].unwrap().1);
+        vm.set(this, a_last, Value::from_i32(next as i32))?;
+    }
+    Ok(caps)
+}
+
+/// The array `exec` returns for `caps` over `s`: the match and each group
+/// (`undefined` if it didn't match), with `index` and `input`.
+fn match_array(vm: &mut Vm, caps: &crate::regexp::Captures, s: &[u16], input: Value) -> Result<Value> {
+    let parts: Vec<Value> = caps
+        .iter()
+        .map(|c| match c {
+            Some((a, b)) => string(vm, &s[*a..*b]),
+            None => Value::UNDEFINED,
+        })
+        .collect();
+    let arr = vm.new_array();
+    crate::vm::array_push(vm, arr, &parts)?;
+    let (a_index, a_input) = (vm.intern("index"), vm.intern("input"));
+    vm.set(arr, a_index, Value::from_i32(caps[0].unwrap().0 as i32))?;
+    vm.set(arr, a_input, input)?;
+    Ok(arr)
+}
+
+fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let re = this_regexp(this)?;
+    let input = string_fn(vm, Value::UNDEFINED, &a[..a.len().min(1)])?;
+    let s = units(input).into_owned();
+    match regexp_match(vm, this, re, &s)? {
+        Some(caps) => match_array(vm, &caps, &s, input),
+        None => Ok(Value::NULL),
+    }
+}
+
+fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let re = this_regexp(this)?;
+    let s = units(arg(a, 0)).into_owned();
+    Ok(Value::from_bool(regexp_match(vm, this, re, &s)?.is_some()))
+}
+
+fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let re = this_regexp(this)?;
+    let a_source = vm.intern("source");
+    let src = String::from_utf16_lossy(&units(vm.get(this, a_source)?));
+    Ok(str_value(vm, &format!("/{src}/{}", regexp_flags(re))))
+}
+
+/// The `RegExp` a String method's argument stands for (a string is a
+/// pattern).
+fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
+    if regexp_of(v).is_some() {
+        return Ok(v);
+    }
+    let p = if v.is_undefined() { String::new() } else { String::from_utf16_lossy(&units(v)) };
+    new_regexp(vm, &p, "")
+}
+
+/// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
+/// none).
+fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let s = this_units(this)?.into_owned();
+    let rv = as_regexp(vm, arg(a, 0))?;
+    let re = regexp_of(rv).unwrap();
+    let input = this_string(vm, this, &s);
+    if !re.global {
+        return match regexp_match(vm, rv, re, &s)? {
+            Some(caps) => match_array(vm, &caps, &s, input),
+            None => Ok(Value::NULL),
+        };
+    }
+    let mut found = Vec::new();
+    let mut at = 0;
+    while let Some(caps) = re.exec(&s, at) {
+        let (x, y) = caps[0].unwrap();
+        found.push(string(vm, &s[x..y]));
+        at = if y == x { y + 1 } else { y };
+        if at > s.len() {
+            break;
+        }
+    }
+    let a_last = vm.intern("lastIndex");
+    vm.set(rv, a_last, Value::from_i32(0))?;
+    if found.is_empty() {
+        return Ok(Value::NULL);
+    }
+    let arr = vm.new_array();
+    crate::vm::array_push(vm, arr, &found)?;
+    Ok(arr)
+}
+
+fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let s = this_units(this)?.into_owned();
+    let rv = as_regexp(vm, arg(a, 0))?;
+    let re = regexp_of(rv).unwrap();
+    Ok(Value::from_i32(re.exec(&s, 0).map_or(-1, |c| c[0].unwrap().0 as i32)))
+}
+
+/// `s.replace(pattern, replacement)`: the first match of a string
+/// pattern, or of a regular expression (every one with `g`), replaced by
+/// a string (with `$&`, `$1`…, `$$`, `` $` ``, `$'`) or a function's
+/// result (called with the match, the groups, the index and `s`).
+fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let s = this_units(this)?.into_owned();
+    let pattern = arg(a, 0);
+    let replacement = arg(a, 1);
+    let func = replacement.is_cell()
+        && matches!(unsafe { (*as_object(replacement)).class }, Class::Function | Class::Native);
+    let template = if func { Vec::new() } else { units(replacement).into_owned() };
+    // The matches: each one's groups.
+    let mut matches: Vec<crate::regexp::Captures> = Vec::new();
+    match regexp_of(pattern) {
+        Some(re) => {
+            if re.global {
+                let mut at = 0;
+                while at <= s.len()
+                    && let Some(caps) = re.exec(&s, at)
+                {
+                    let (x, y) = caps[0].unwrap();
+                    at = if y == x { y + 1 } else { y };
+                    matches.push(caps);
+                }
+                let a_last = vm.intern("lastIndex");
+                vm.set(pattern, a_last, Value::from_i32(0))?;
+            } else if let Some(caps) = regexp_match(vm, pattern, re, &s)? {
+                matches.push(caps);
+            }
+        }
+        None => {
+            let p = units(pattern).into_owned();
+            if let Some(i) = find(&s, &p, 0) {
+                matches.push(vec![Some((i, i + p.len()))]);
+            }
+        }
+    }
+    if matches.is_empty() {
+        return Ok(this_string(vm, this, &s));
+    }
+    let input = this_string(vm, this, &s);
+    let mut out = Vec::with_capacity(s.len());
+    let mut last = 0;
+    for caps in &matches {
+        let (x, y) = caps[0].unwrap();
+        out.extend_from_slice(&s[last..x]);
+        if func {
+            let mut args: Vec<Value> = caps
+                .iter()
+                .map(|c| match c {
+                    Some((p, q)) => string(vm, &s[*p..*q]),
+                    None => Value::UNDEFINED,
+                })
+                .collect();
+            args.push(Value::from_i32(x as i32));
+            args.push(input);
+            let r = crate::interp::call_function(vm, replacement, Value::UNDEFINED, &args)?;
+            out.extend_from_slice(&units(r));
+        } else {
+            expand(&template, &s, caps, &mut out);
+        }
+        last = y;
+    }
+    out.extend_from_slice(&s[last..]);
+    Ok(vm.new_string(&out))
+}
+
+/// A replacement template's `$` patterns expanded for one match.
+fn expand(t: &[u16], s: &[u16], caps: &crate::regexp::Captures, out: &mut Vec<u16>) {
+    let (x, y) = caps[0].unwrap();
+    let mut i = 0;
+    while i < t.len() {
+        let c = t[i];
+        if c != b'$' as u16 || i + 1 == t.len() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let n = t[i + 1];
+        match n as u8 {
+            b'$' => {
+                out.push(b'$' as u16);
+                i += 2;
+            }
+            b'&' => {
+                out.extend_from_slice(&s[x..y]);
+                i += 2;
+            }
+            b'`' => {
+                out.extend_from_slice(&s[..x]);
+                i += 2;
+            }
+            b'\'' => {
+                out.extend_from_slice(&s[y..]);
+                i += 2;
+            }
+            b'0'..=b'9' if n < 128 => {
+                // `$nn` if that group exists, else `$n`.
+                let d1 = (n - b'0' as u16) as usize;
+                let two = t.get(i + 2).filter(|&&c| (b'0' as u16..=b'9' as u16).contains(&c));
+                let (g, len) = match two {
+                    Some(&d2) if d1 * 10 + ((d2 - b'0' as u16) as usize) < caps.len() && d1 * 10 + ((d2 - b'0' as u16) as usize) > 0 => {
+                        (d1 * 10 + (d2 - b'0' as u16) as usize, 3)
+                    }
+                    _ => (d1, 2),
+                };
+                if g == 0 || g >= caps.len() {
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                if let Some((p, q)) = caps[g] {
+                    out.extend_from_slice(&s[p..q]);
+                }
+                i += len;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// `split` by a regular expression: the pieces between matches (not
+/// empty ones at the very start or end), each match's groups after its
+/// piece.
+fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option<Value>) -> Result<Value> {
+    let limit = match limit {
+        Some(v) if !v.is_undefined() => crate::interp::to_int32(to_number(v)) as u32 as usize,
+        _ => usize::MAX,
+    };
+    let mut parts: Vec<Value> = Vec::new();
+    if limit == 0 {
+        let arr = vm.new_array();
+        return Ok(arr);
+    }
+    if s.is_empty() {
+        if re.exec(s, 0).is_none() {
+            parts.push(vm.new_string(&[]));
+        }
+    } else {
+        let (mut p, mut q) = (0, 0);
+        while q < s.len() {
+            match re.exec(s, q) {
+                None => break,
+                Some(caps) => {
+                    let (x, e) = caps[0].unwrap();
+                    if x >= s.len() {
+                        break;
+                    }
+                    if e == p || (e == x && x == q && e == p) {
+                        q = x + 1;
+                        continue;
+                    }
+                    if e == x && x == p {
+                        q = x + 1;
+                        continue;
+                    }
+                    parts.push(string(vm, &s[p..x]));
+                    if parts.len() == limit {
+                        break;
+                    }
+                    for c in &caps[1..] {
+                        parts.push(match c {
+                            Some((a, b)) => string(vm, &s[*a..*b]),
+                            None => Value::UNDEFINED,
+                        });
+                        if parts.len() == limit {
+                            break;
+                        }
+                    }
+                    p = e;
+                    q = if e == x { e + 1 } else { e };
+                }
+            }
+        }
+        if parts.len() < limit {
+            parts.push(string(vm, &s[p..]));
+        }
+    }
+    let arr = vm.new_array();
+    crate::vm::array_push(vm, arr, &parts)?;
+    Ok(arr)
 }
 
 // ---- Errors ----

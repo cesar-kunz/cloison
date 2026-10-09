@@ -96,6 +96,8 @@ pub enum ExprKind {
     Object(Vec<(String, Expr)>),
     /// A function expression: an index into [`Program::functions`].
     Function(usize),
+    /// A regular expression literal: pattern, flags.
+    RegExp(String, String),
     /// In an object literal only: `get k() {…}` (false) or `set k(v) {…}`
     /// (true), the function's index.
     Accessor(bool, usize),

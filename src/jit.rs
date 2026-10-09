@@ -395,6 +395,23 @@ extern "C" fn toi_rt_loose_eq(a: Value, b: Value) -> bool {
     crate::interp::loose_equals(a, b).unwrap_or_else(|e| panic!("JIT code: {e}"))
 }
 
+/// `a[b]` for any `a` (a string, a typed array, …: what `get_keyed`
+/// stencils don't read themselves), or 0 where it would throw or call a
+/// function (the interpreter does).
+extern "C" fn toi_rt_get_keyed(a: Value, b: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    vm.get_keyed(a, b).map_or(0, |v| v.to_bits())
+}
+
+/// `args[0][args[1]] = args[2]` (a typed array's element: what `set_keyed`
+/// stencils don't store themselves); 0 where it would throw (the
+/// interpreter does).
+extern "C" fn toi_rt_set_keyed(args: Value, _: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
+    u64::from(vm.set_keyed(a[0], a[1], a[2]).is_ok())
+}
+
 /// `a instanceof b`, or 0 where it would throw (the interpreter does).
 extern "C" fn toi_rt_instance_of(a: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
@@ -415,6 +432,8 @@ fn runtime_function(name: &str) -> usize {
     match name {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
         "toi_rt_instance_of" => toi_rt_instance_of as *const () as usize,
+        "toi_rt_get_keyed" => toi_rt_get_keyed as *const () as usize,
+        "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
         "toi_rt_in" => toi_rt_in as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
         "toi_rt_enter" => toi_rt_enter as *const () as usize,
@@ -1782,6 +1801,10 @@ fn bytecode_live(code: &[u8], insns: &[Insn]) -> Vec<RegSet> {
 pub(crate) enum Prop {
     /// Not a property instruction, or nothing cached: bail.
     None,
+    /// A keyed load left to the runtime: a site that read a typed array's,
+    /// a buffer's or a string's elements (`vm::BYTES_LOC`; see
+    /// `get_keyed_rt` in the stencils).
+    Runtime,
     /// In the receiver, at byte offset `off`.
     Own { shape: u64, off: i32, ft: FieldType },
     /// In the receiver's out-of-line slots, at byte offset `off`.
@@ -2025,6 +2048,9 @@ impl Feedback {
         let ic = unsafe { *self.ic(insn.imm as usize) };
         if insn.op == Op::GetNamed && ic.loc == crate::vm::LENGTH_LOC {
             return Prop::Length;
+        }
+        if insn.op == Op::GetKeyed && ic.loc == crate::vm::BYTES_LOC {
+            return Prop::Runtime;
         }
         if ic.shape.is_null() {
             return Prop::None;
@@ -3560,6 +3586,18 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let ix = st.acc == I32;
             let pick = |plain: &'static str, i: &'static str| if ix { i } else { plain };
             let prop = spec.props.get(i).copied().unwrap_or(Prop::None);
+            // A typed array's or buffer's elements are bytes: the generic
+            // stencil, through the runtime.
+            let bytes = reg.shape().is_some_and(|s| unsafe {
+                matches!(
+                    (*(s as *const Shape)).class,
+                    crate::object::Class::TypedArray | crate::object::Class::ArrayBuffer
+                )
+            });
+            if bytes || prop == Prop::Runtime {
+                out.acc = Any;
+                return Sel::new("get_keyed_rt", "", out);
+            }
             let (case, elems) = match (reg, prop) {
                 (Ty::Obj(s), _) => (pick("nc", "i_nc"), unsafe { (*(s as *const Shape)).elems }),
                 (_, Prop::Keyed { shape, elems })
@@ -3681,7 +3719,9 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let array = reg.shape().is_some_and(|s| {
                 matches!(
                     unsafe { (*(s as *const Shape)).class },
-                    crate::object::Class::Array | crate::object::Class::String
+                    crate::object::Class::Array
+                        | crate::object::Class::String
+                        | crate::object::Class::TypedArray
                 )
             });
             out.acc = I32;
@@ -4816,6 +4856,10 @@ fn stencil_for(
             } else {
                 cat!("set_keyed_", sel.case, "_", loc)
             }
+        }
+        ("get_keyed_rt", _) => {
+            box_acc(&mut pre);
+            cat!("get_keyed_rt_", loc)
         }
         ("get_keyed", _) if sel.case.starts_with('i') => cat!("get_keyed_", sel.case, "_", loc),
         ("get_keyed", _) => {

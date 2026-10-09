@@ -57,6 +57,116 @@ pub enum Class {
     /// A `Date`: its time value (milliseconds since the epoch, an `f64`) is
     /// kept in `code`'s bits (see `vm::date_value`).
     Date,
+    /// An `ArrayBuffer`: `elems` points to its bytes, `elems_len` is their
+    /// count.
+    ArrayBuffer,
+    /// A typed array (`Uint8Array`, …): `elems` points to its first
+    /// element in its buffer's bytes, `elems_len` is its length, `kind` its
+    /// element type ([`TypedKind`]), and `code` holds its buffer.
+    TypedArray,
+    /// A `RegExp`: `code` holds its compiled `regexp::Regex`.
+    RegExp,
+}
+
+/// A typed array's element type, as `Object::kind` holds it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum TypedKind {
+    I8,
+    U8,
+    U8Clamped,
+    I16,
+    U16,
+    I32,
+    U32,
+    F32,
+    F64,
+}
+
+impl TypedKind {
+    pub const ALL: [TypedKind; 9] = [
+        TypedKind::I8,
+        TypedKind::U8,
+        TypedKind::U8Clamped,
+        TypedKind::I16,
+        TypedKind::U16,
+        TypedKind::I32,
+        TypedKind::U32,
+        TypedKind::F32,
+        TypedKind::F64,
+    ];
+
+    pub fn from_u8(k: u8) -> TypedKind {
+        TypedKind::ALL[k as usize]
+    }
+
+    /// Bytes per element.
+    pub fn size(self) -> usize {
+        match self {
+            TypedKind::I8 | TypedKind::U8 | TypedKind::U8Clamped => 1,
+            TypedKind::I16 | TypedKind::U16 => 2,
+            TypedKind::I32 | TypedKind::U32 | TypedKind::F32 => 4,
+            TypedKind::F64 => 8,
+        }
+    }
+
+    /// The constructor's name.
+    pub fn name(self) -> &'static str {
+        match self {
+            TypedKind::I8 => "Int8Array",
+            TypedKind::U8 => "Uint8Array",
+            TypedKind::U8Clamped => "Uint8ClampedArray",
+            TypedKind::I16 => "Int16Array",
+            TypedKind::U16 => "Uint16Array",
+            TypedKind::I32 => "Int32Array",
+            TypedKind::U32 => "Uint32Array",
+            TypedKind::F32 => "Float32Array",
+            TypedKind::F64 => "Float64Array",
+        }
+    }
+
+    /// Element `i` at `p` (the first element), as a number.
+    ///
+    /// # Safety
+    /// `p` must point to at least `i + 1` elements of this kind.
+    pub unsafe fn load(self, p: *const u8, i: usize) -> Value {
+        unsafe {
+            match self {
+                TypedKind::I8 => Value::from_i32(*p.cast::<i8>().add(i) as i32),
+                TypedKind::U8 | TypedKind::U8Clamped => Value::from_i32(*p.add(i) as i32),
+                TypedKind::I16 => Value::from_i32(p.cast::<i16>().add(i).read_unaligned() as i32),
+                TypedKind::U16 => Value::from_i32(p.cast::<u16>().add(i).read_unaligned() as i32),
+                TypedKind::I32 => Value::from_i32(p.cast::<i32>().add(i).read_unaligned()),
+                TypedKind::U32 => Value::number(p.cast::<u32>().add(i).read_unaligned() as f64),
+                TypedKind::F32 => Value::number(p.cast::<f32>().add(i).read_unaligned() as f64),
+                TypedKind::F64 => Value::number(p.cast::<f64>().add(i).read_unaligned()),
+            }
+        }
+    }
+
+    /// Store number `d` (ToNumber of the value) as element `i` at `p`.
+    ///
+    /// # Safety
+    /// As [`TypedKind::load`].
+    pub unsafe fn store(self, p: *mut u8, i: usize, d: f64) {
+        let int = || crate::interp::to_int32(d);
+        unsafe {
+            match self {
+                TypedKind::I8 | TypedKind::U8 => *p.add(i) = int() as u8,
+                TypedKind::U8Clamped => {
+                    // Round half to even, clamped to 0..=255 (NaN is 0).
+                    let c = if d.is_nan() { 0.0 } else { d.clamp(0.0, 255.0) };
+                    let r = c.round();
+                    let r = if (c - c.floor()) == 0.5 && r % 2.0 != 0.0 { r - 1.0 } else { r };
+                    *p.add(i) = r as u8;
+                }
+                TypedKind::I16 | TypedKind::U16 => p.cast::<u16>().add(i).write_unaligned(int() as u16),
+                TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(int() as u32),
+                TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(d as f32),
+                TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(d),
+            }
+        }
+    }
 }
 
 /// The object is reachable from outside the internal heap. Always set for
@@ -70,7 +180,9 @@ pub struct Object {
     pub shape: *const Shape,
     pub class: Class,
     pub flags: u8,
-    _pad: u16,
+    /// A typed array's element type (see [`TypedKind`]).
+    pub kind: u8,
+    _pad: u8,
     pub props_cap: u32,
     pub props: *mut Value,
     pub elems: *mut Value,
@@ -92,6 +204,7 @@ pub fn object_header(shape: &Shape) -> [u64; INLINE_BASE / 8] {
             shape,
             class: shape.class,
             flags: EXTERNAL,
+            kind: 0,
             _pad: 0,
             props_cap: 0,
             props: std::ptr::null_mut(),

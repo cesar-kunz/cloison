@@ -330,6 +330,9 @@ define_ops! {
     /// `acc` = the function object running (a named function expression's
     /// own name). Such a function runs only in the interpreter.
     LdaCallee(),
+    /// `acc` = a new `RegExp` of pattern and flags constants `p`, `f` (a
+    /// regular expression literal).
+    CreateRegExp(Const, Const),
 }
 
 impl Op {

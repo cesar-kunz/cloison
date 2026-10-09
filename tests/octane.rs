@@ -10,7 +10,7 @@ use toi::vm::{Vm, display};
 
 /// The scripts toi runs to Node's value (by number); the rest don't yet.
 /// Add a script's number here when its feature lands.
-const PASSING: &[&str] = &["01", "02", "03", "04", "05", "06", "07", "08", "16", "18"];
+const PASSING: &[&str] = &["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "18", "19", "20"];
 
 fn scripts() -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/octane");

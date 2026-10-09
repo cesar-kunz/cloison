@@ -96,6 +96,9 @@ pub enum ExprKind {
     Object(Vec<(String, Expr)>),
     /// A function expression: an index into [`Program::functions`].
     Function(usize),
+    /// In an object literal only: `get k() {…}` (false) or `set k(v) {…}`
+    /// (true), the function's index.
+    Accessor(bool, usize),
     /// `o.name`
     Member(Box<Expr>, String),
     /// `o[key]`

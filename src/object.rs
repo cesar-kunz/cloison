@@ -316,6 +316,10 @@ pub struct Shape {
 pub const READ_ONLY: u8 = 1;
 pub const DONT_ENUM: u8 = 2;
 pub const DONT_DELETE: u8 = 4;
+/// An accessor property: its slot holds an array of the getter and the
+/// setter (`undefined` where missing). Inline caches never cache one; the
+/// runtime calls them (see `Vm::get`, `Vm::set`).
+pub const ACCESSOR: u8 = 8;
 
 const _: () = assert!(std::mem::offset_of!(Shape, elems_code) == 0);
 const _: () = assert!(std::mem::offset_of!(Shape, family) == 8);

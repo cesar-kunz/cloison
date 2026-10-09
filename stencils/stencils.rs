@@ -146,6 +146,8 @@ unsafe extern "C" {
     fn toi_rt_construct_done();
     fn toi_rt_array_push();
     fn toi_rt_materialize();
+    fn toi_rt_instance_of();
+    fn toi_rt_in();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -1468,6 +1470,25 @@ stencil!("lda_false"; |s| {
     s.acc = Value::FALSE;
     next!(s)
 });
+// `acc = r instanceof acc` and `acc = r in acc`, `r` in memory, through the
+// runtime; out to the interpreter (before) where they would throw (0).
+stencil!("test_instanceof_m"; |s| {
+    let r = rt_call!(s, toi_rt_instance_of, *mem(s.regs), s.acc);
+    if r == 0 {
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
+    next!(s)
+});
+stencil!("test_in_m"; |s| {
+    let r = rt_call!(s, toi_rt_in, *mem(s.regs), s.acc);
+    if r == 0 {
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
+    next!(s)
+});
+
 stencil!("lda_undefined"; |s| {
     s.acc = Value::UNDEFINED;
     next!(s)

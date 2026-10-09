@@ -132,10 +132,6 @@ define_ops! {
     LdaUpvalue(Count),
     /// Upvalue `k` = `acc`.
     StaUpvalue(Count),
-    /// `r[a]` = the call's `arguments` object (an array of the arguments
-    /// passed, extra ones included). First in a function that reads
-    /// `arguments`; such a function runs only in the interpreter.
-    CreateArguments(Reg),
 
     // ---- Constants and registers ----
     /// `acc = undefined`
@@ -314,6 +310,26 @@ define_ops! {
     TestNullJumpIfFalse(),
     TestNullishJumpIfTrue(),
     TestNullishJumpIfFalse(),
+
+    // ---- Added later, last so the groups above stay contiguous ----
+    /// `r[a]` = the call's `arguments` object (an array of the arguments
+    /// passed, extra ones included). First in a function that reads
+    /// `arguments`; such a function runs only in the interpreter.
+    CreateArguments(Reg),
+    /// `acc = r[a] instanceof acc`
+    TestInstanceOf(Reg),
+    /// `acc = r[a] in acc`
+    TestIn(Reg),
+    /// `acc = delete r[a][acc]`
+    DeleteProperty(Reg),
+    /// `acc = delete <global named acc>`
+    DeleteGlobal(),
+    /// Define the getter (`k` 0) or setter (1) `acc` of `r[a]`'s property
+    /// named by constant `c` (an object literal's `get`/`set`).
+    DefineAccessor(Reg, Const, Count),
+    /// `acc` = the function object running (a named function expression's
+    /// own name). Such a function runs only in the interpreter.
+    LdaCallee(),
 }
 
 impl Op {

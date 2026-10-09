@@ -746,6 +746,46 @@ handlers! {
         next!(any, Op::CreateArguments.size(), acc)
     }
 
+    fn op_test_instance_of(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).instance_of(*reg(pc, 1, regs), acc);
+        next_or_throw!(Op::TestInstanceOf.size(), r.map(Value::from_bool))
+    }
+
+    fn op_test_in(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).has_property(acc, *reg(pc, 1, regs));
+        next_or_throw!(Op::TestIn.size(), r.map(Value::from_bool))
+    }
+
+    fn op_delete_property(pc, acc, regs, tag) {
+        let r = (*frame_vm(regs)).delete_property(*reg(pc, 1, regs), acc);
+        next_or_throw!(Op::DeleteProperty.size(), r.map(Value::from_bool))
+    }
+
+    fn op_delete_global(pc, acc, regs, tag) {
+        let vm = &mut *frame_vm(regs);
+        let name = String::from_utf16_lossy(string_units(acc).unwrap_or(&[]));
+        let a = vm.intern(&name);
+        let r = vm.delete_named(vm.global, a);
+        next!(any, Op::DeleteGlobal.size(), Value::from_bool(r))
+    }
+
+    fn op_lda_callee(pc, acc, regs, tag) {
+        let f: *mut Object = header(regs, FUNC);
+        next!(any, Op::LdaCallee.size(), object_value(f))
+    }
+
+    fn op_define_accessor(pc, acc, regs, tag) {
+        let vm = &mut *frame_vm(regs);
+        let o = as_object(*reg(pc, 1, regs));
+        let k = u16::from_le_bytes([*pc.add(2), *pc.add(3)]) as usize;
+        let name = (&(*frame_code(regs)).constants)[k];
+        let name = String::from_utf16_lossy(string_units(name).unwrap_or(&[]));
+        let a = vm.intern(&name);
+        let (g, s) = if *pc.add(4) == 0 { (Some(acc), None) } else { (None, Some(acc)) };
+        vm.define_accessor(o, a, g, s, 0);
+        next!(any, Op::DefineAccessor.size(), acc)
+    }
+
     fn op_lda_null(pc, acc, regs, tag) {
         next!(any, Op::LdaNull.size(), Value::NULL)
     }
@@ -1331,7 +1371,7 @@ handlers! {
     #[inline(never)]
     fn slow_get_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let r = (*frame_vm(regs)).get_named_miss(&*frame_code(regs), u16_at(pc, 2), obj);
+        let r = with_top(regs, None, |vm| vm.get_named_miss(&*frame_code(regs), u16_at(pc, 2), obj));
         next_or_throw!(Op::GetNamed.size(), r)
     }
 
@@ -1339,7 +1379,7 @@ handlers! {
     #[inline(never)]
     fn slow_set_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let r = (*frame_vm(regs)).set_named_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc);
+        let r = with_top(regs, None, |vm| vm.set_named_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc));
         next_or_throw!(Op::SetNamed.size(), r.map(|()| acc))
     }
 
@@ -1347,14 +1387,14 @@ handlers! {
     #[inline(never)]
     fn slow_get_keyed(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let r = (*frame_vm(regs)).get_keyed_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc);
+        let r = with_top(regs, None, |vm| vm.get_keyed_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc));
         next_or_throw!(Op::GetKeyed.size(), r)
     }
 
     #[cold]
     #[inline(never)]
     fn slow_set_keyed(pc, acc, regs, tag) {
-        let r = (*frame_vm(regs)).set_keyed(*reg(pc, 1, regs), *reg(pc, 2, regs), acc);
+        let r = with_top(regs, None, |vm| vm.set_keyed(*reg(pc, 1, regs), *reg(pc, 2, regs), acc));
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
     }
 
@@ -1391,7 +1431,7 @@ handlers! {
         record_callee(pc, regs, tag);
         (*ic).loc = 0;
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
-        let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), *w, args);
+        let r = with_top(regs, None, |vm| vm.call_other(*reg(pc, 1, regs), *w, args));
         next_or_throw!(Op::Call.size(), r)
     }
 
@@ -1400,7 +1440,7 @@ handlers! {
     fn slow_call_undefined(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = (*frame_vm(regs)).call_other(*reg(pc, 1, regs), Value::UNDEFINED, args);
+        let r = with_top(regs, None, |vm| vm.call_other(*reg(pc, 1, regs), Value::UNDEFINED, args));
         next_or_throw!(Op::CallUndefined.size(), r)
     }
 
@@ -1409,7 +1449,7 @@ handlers! {
     fn slow_construct(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = (*frame_vm(regs)).construct_other(*reg(pc, 1, regs), args);
+        let r = with_top(regs, None, |vm| vm.construct_other(*reg(pc, 1, regs), args));
         next_or_throw!(Op::Construct.size(), r)
     }
 }
@@ -2733,6 +2773,12 @@ static TABLE: Table = {
     t[Op::JumpIfToBooleanFalse as usize] = op_jump_if_to_boolean_false;
     t[Op::LdaGlobal as usize] = op_lda_global;
     t[Op::CreateArguments as usize] = op_create_arguments;
+    t[Op::TestInstanceOf as usize] = op_test_instance_of;
+    t[Op::TestIn as usize] = op_test_in;
+    t[Op::DeleteProperty as usize] = op_delete_property;
+    t[Op::DeleteGlobal as usize] = op_delete_global;
+    t[Op::LdaCallee as usize] = op_lda_callee;
+    t[Op::DefineAccessor as usize] = op_define_accessor;
     t[Op::StaGlobal as usize] = op_sta_global;
     t[Op::GetNamed as usize] = op_get_named;
     t[Op::SetNamed as usize] = op_set_named;
@@ -2959,6 +3005,66 @@ unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
 /// paths do for bytecode functions: a cache left empty then means the call
 /// never ran (the JIT leaves such calls to the interpreter).
 #[inline(always)]
+/// Call `f` with `this` and `args` from the runtime (a native, a getter or
+/// a setter): a native directly; a bytecode function in a new frame at the
+/// VM stack's free top, which the runtime code that may get here records
+/// (`Vm::native_top`, see [`with_top`]), run to completion.
+pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate::vm::Result<Value> {
+    unsafe {
+        if !f.is_cell() || !matches!((*as_object(f)).class, Class::Function | Class::Native) {
+            return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
+        }
+        if (*as_object(f)).class == Class::Native {
+            return vm.call_other(f, this, args);
+        }
+        let top = vm.native_top;
+        if top.is_null() {
+            return Err(Error::unsupported("calling a function from here (compiled code)"));
+        }
+        let fo = as_object(f);
+        let callee = (*fo).code;
+        let new = top.add(HEADER);
+        let n = (*callee).nregs as usize;
+        if new.add(n) > vm.stack_end || native_stack_low(vm) {
+            return Err(Error::range_error("Maximum call stack size exceeded"));
+        }
+        write_frame_header(vm, new, callee, std::ptr::null(), std::ptr::null_mut(), 0);
+        set_header(new, FUNC, fo);
+        *new = sloppy_this(vm, this);
+        let k = args.len().min((*callee).nparams as usize);
+        for i in 0..k {
+            *new.add(1 + i) = args[i];
+        }
+        for i in 1 + k..n {
+            *new.add(i) = Value::UNDEFINED;
+        }
+        vm.pending_args = (args.as_ptr(), args.len());
+        let saved = vm.native_top;
+        vm.native_top = std::ptr::null_mut();
+        let v = run_new_frame(vm, callee, new, 0);
+        vm.native_top = saved;
+        if v == Value::EMPTY {
+            return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("a call from the runtime")));
+        }
+        Ok(v)
+    }
+}
+
+/// Run `f` with `Vm::native_top` at the free VM stack above the frame
+/// `regs` (at its `top`, its registers' end, if given): what it calls
+/// through [`call_function`] goes there.
+#[inline(always)]
+unsafe fn with_top<T>(regs: *mut Value, top: Option<*mut Value>, f: impl FnOnce(&mut Vm) -> T) -> T {
+    unsafe {
+        let vm = &mut *frame_vm(regs);
+        let saved = vm.native_top;
+        vm.native_top = top.unwrap_or_else(|| regs.add((*frame_code(regs)).nregs as usize));
+        let r = f(vm);
+        (*frame_vm(regs)).native_top = saved;
+        r
+    }
+}
+
 /// For a call of `f` with receiver `this`: if `f` is
 /// `Function.prototype.apply` and `this` a bytecode function, `this`, which
 /// is what the call calls.
@@ -3511,11 +3617,15 @@ pub(crate) unsafe fn call_from_jit(
                     argc = argc.saturating_sub(1);
                 }
                 _ => {
+                    // (Past every register the compiled code uses.)
+                    let saved = vm.native_top;
+                    vm.native_top = regs.add(frame - HEADER);
                     let r = if op == Op::Construct {
                         vm.construct_other(fv, std::slice::from_raw_parts(args, argc))
                     } else {
                         vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
                     };
+                    vm.native_top = saved;
                     return r.unwrap_or_else(|e| throw(vm, e));
                 }
             }
@@ -3554,6 +3664,19 @@ pub(crate) unsafe fn call_from_jit(
         }
         // For a `CreateArguments` (the frame has no call instruction).
         vm.pending_args = (args, argc);
+        run_new_frame(vm, callee, new, flags)
+    }
+}
+
+/// Run the frame `new` of `callee`, set up by the runtime (no return
+/// address: it returns to here), to completion: in its compiled code if
+/// it has some, else in the interpreter. The result, or `EMPTY` on an
+/// error (left in `vm.error`).
+///
+/// # Safety
+/// `new` must be a frame of `callee` with its header and registers set.
+unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags: u64) -> Value {
+    unsafe {
         let mut start = Resume {
             regs: new,
             pc: (*callee).bytecode.as_ptr(),

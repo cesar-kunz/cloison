@@ -4421,11 +4421,18 @@ fn home_stats(insns: &[Insn], ins: &[Option<TypeState>], nregs: usize) -> HomeSt
     let mut uses = vec![0usize; nregs];
     // As far as homes care: no shapes joined.
     let mut join = vec![0u8; nregs];
+    // (States mostly share their registers' types with the one before:
+    // each list once.)
+    let mut last: *const Vec<(u8, Ty)> = std::ptr::null();
     for ((insn, st), w) in insns.iter().zip(ins).zip(&weight) {
         let Some(st) = st else { continue };
         if insn.reads_reg() {
             uses[insn.reg as usize] += w;
         }
+        if Rc::as_ptr(&st.regs.tys) == last {
+            continue;
+        }
+        last = Rc::as_ptr(&st.regs.tys);
         for (r, t) in st.regs.iter() {
             let j = &mut join[r];
             let k = match t {
@@ -7595,6 +7602,8 @@ struct EntryLive {
     acc: Vec<bool>,
     acc_at_entry: bool,
     at_entry: Vec<bool>,
+    /// The registers of `at_entry`, in order (an entry checks only these).
+    live_list: Vec<u8>,
     /// Of `at_entry`, those compiled code reads (see [`reg_read_in`]).
     read_at_entry: Vec<bool>,
 }
@@ -7604,13 +7613,15 @@ impl EntryLive {
         let reach = reachable(insns, entry);
         let regs = reg_live_in(insns, &reach, nregs, frames);
         let acc = acc_liveness(insns, &reach).0;
-        let at_entry = (0..nregs).map(|r| rs_has(&regs[entry], r)).collect();
+        let at_entry: Vec<bool> = (0..nregs).map(|r| rs_has(&regs[entry], r)).collect();
+        let live_list = (0..nregs).filter(|&r| at_entry[r]).map(|r| r as u8).collect();
         let read = reg_read_in(insns, &reach, nregs);
         let read_at_entry = (0..nregs).map(|r| rs_has(&read[entry], r)).collect();
         EntryLive {
             read_at_entry,
             acc_at_entry: acc[entry],
             at_entry,
+            live_list,
             reach,
             regs,
             acc,
@@ -7729,6 +7740,13 @@ struct VmState {
     /// exit ([`COOL_ENTRIES`]), letting inline caches settle before the
     /// function is lowered again.
     cool: u32,
+    /// The function's inline-cache misses (`Code::ic_misses`) when the
+    /// cooling window began, and how many times it was extended: a window
+    /// in which the caches missed again is followed by another, longer
+    /// one (up to [`MAX_SETTLE`] times), so code is compiled again once
+    /// its feedback settles.
+    settle_mark: u32,
+    settles: u32,
     /// Coolings so far: each one is longer ([`cooling`]).
     coolings: u32,
     /// Warm or hot, and for warm, what is left before hot (its heat):
@@ -7812,8 +7830,7 @@ const MAX_VM_COMPILES: u32 = 32;
 /// +21%, Mandreel +15%, DeltaBlue and GameBoy unchanged; with 200, zlib
 /// and GameBoy lost half.
 fn max_compiles(n: usize) -> u32 {
-    static U: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("CUNIT").ok().and_then(|x| x.parse().ok()).unwrap_or(COMPILE_SIZE));
-    (MAX_VM_COMPILES as usize * *U / n.max(1)).clamp(4, MAX_VM_COMPILES as usize) as u32
+    (MAX_VM_COMPILES as usize * COMPILE_SIZE / n.max(1)).clamp(4, MAX_VM_COMPILES as usize) as u32
 }
 
 /// See [`max_compiles`].
@@ -7972,6 +7989,12 @@ fn same_insns(a: &[Insn], b: &[Insn]) -> bool {
 /// cooling 101 ms, 50 entries 77, 100 entries 72; doubling it at each new
 /// lowering changed little.
 const COOL_ENTRIES: u32 = 100;
+/// Cooling windows added while a function's caches keep missing (see
+/// `VmState::settle_mark`), for functions of at least [`SETTLE_SIZE`]
+/// instructions. Measured (scores, against none): pdfjs +8%, TypeScript
+/// +1%; for every function, DeltaBlue -2.5% (its methods are small).
+const MAX_SETTLE: u32 = 4;
+const SETTLE_SIZE: usize = 200;
 /// Measured on 87-constraint-solver, whose phases change its types (compile
 /// ms; 0: 26.6, 2: 24.5, 4 and 6: 25.5).
 const MAX_COOL_SHIFT: u32 = 2;
@@ -11522,6 +11545,8 @@ impl JitFunction {
             no_entry: HashSet::default(),
             bad_results: 0,
             cool: 0,
+            settle_mark: 0,
+            settles: 0,
             coolings: 0,
             tier: if unsafe { (*vm).warm_tier } {
                 Tier::Warm
@@ -11736,7 +11761,7 @@ impl JitFunction {
     ) -> Option<(Rc<JitCode>, Value, usize)> {
         let entry = self.insns.iter().position(|i| i.pc == pc && i.frame == 0)?;
         let l = self.live_at.get(&entry)?;
-        let (acc_live, live) = (&l.acc_at_entry, &l.at_entry);
+        let (acc_live, live) = (&l.acc_at_entry, &l.live_list);
         let fits = |t: Ty, v: Value| match t {
             Ty::Bot => false,
             Ty::Any => true,
@@ -11745,10 +11770,20 @@ impl JitFunction {
             Ty::Obj(s) | Ty::Ext(s) => v.is_cell() && unsafe { *(v.to_bits() as *const u64) } == s,
         };
         let versions = self.versions.get(&entry)?;
+        // The live registers against the version's types, both in order
+        // (a live register without one is `Bot`: no fit).
         versions.iter().find_map(|(st, code)| {
+            let tys = &st.regs.tys;
+            let mut k = 0;
             let ok = (!*acc_live || fits(st.acc, acc))
-                && (live.iter().enumerate())
-                    .all(|(r, &l)| !l || fits(st.regs[r], unsafe { *regs.add(r) }));
+                && live.iter().all(|&r| {
+                    while k < tys.len() && tys[k].0 < r {
+                        k += 1;
+                    }
+                    k < tys.len()
+                        && tys[k].0 == r
+                        && fits(tys[k].1, unsafe { *regs.add(r as usize) })
+                });
             ok.then(|| (code.clone(), acc, self.nregs))
         })
     }
@@ -11856,9 +11891,11 @@ impl JitFunction {
             }
         } else if insn.guard != 0 || insn.native != 0 {
             vm.cool = cooling(&mut vm.coolings);
+            (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
             *vm.callee_exits.entry(origin).or_insert(0) += 1;
         } else if insn.is_property() {
             vm.cool = cooling(&mut vm.coolings);
+            (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
             *vm.property_exits.entry(origin).or_insert(0) += 1;
         } else if !insn.is_call() {
             vm.widened.insert(origin);
@@ -12269,6 +12306,18 @@ unsafe fn vm_run_(
                 && v.cool > 0
             {
                 v.cool -= 1;
+                // The window ends: another, longer one if the caches
+                // missed meanwhile.
+                let misses = code.ic_misses.get();
+                if v.cool == 0
+                    && misses != v.settle_mark
+                    && v.settles < MAX_SETTLE
+                    && v.root_len >= SETTLE_SIZE
+                {
+                    v.settles += 1;
+                    v.cool = COOL_ENTRIES << v.settles;
+                    v.settle_mark = misses;
+                }
                 return VmRun::Interpret;
             }
             let compiles = f.stats.compiles;

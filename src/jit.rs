@@ -1337,7 +1337,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
             .get(&to)
             .unwrap_or_else(|| panic!("jump into the middle of an instruction at {to}"))
     };
-    raw.into_iter()
+    let mut insns: Vec<Insn> = raw
+        .into_iter()
         .map(|(pc, op)| {
             let (mut imm, mut reg, mut target, mut bail) = (0, 0, 0, false);
             let (mut reg2, mut ic) = (0, 0);
@@ -1461,7 +1462,37 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 hoisted: None,
             }
         })
-        .collect()
+        .collect();
+    unswap_backward_jumps(&mut insns);
+    insns
+}
+
+/// The bytecode has no backward conditional jumps (the interpreter counts
+/// iterations only at `Jump` and the compare-and-jumps' loop forms), so
+/// the front end writes one as its negation over a `Jump`: a loop whose
+/// test isn't a compare-and-jump (`i < this.size()`) ends `JumpIfFalse
+/// exit; Jump body; exit:`. Compiled code counts nothing: one conditional
+/// jump, taken each iteration, and a `Nop`. Measured on DeltaBlue: 135M
+/// unconditional jumps a run (`Plan.execute`'s loop, 89M).
+fn unswap_backward_jumps(insns: &mut [Insn]) {
+    let mut targeted = vec![false; insns.len() + 1];
+    for i in insns.iter().filter(|i| i.jumps()) {
+        targeted[i.target] = true;
+    }
+    for k in 0..insns.len().saturating_sub(1) {
+        let negated = match insns[k].op {
+            Op::JumpIfTrue => Op::JumpIfFalse,
+            Op::JumpIfFalse => Op::JumpIfTrue,
+            Op::JumpIfToBooleanTrue => Op::JumpIfToBooleanFalse,
+            Op::JumpIfToBooleanFalse => Op::JumpIfToBooleanTrue,
+            _ => continue,
+        };
+        let next = insns[k + 1];
+        if insns[k].target == k + 2 && next.op == Op::Jump && next.target <= k && !targeted[k + 1] {
+            (insns[k].op, insns[k].target) = (negated, next.target);
+            insns[k + 1] = Insn { op: Op::Nop, target: 0, ..next };
+        }
+    }
 }
 
 /// The registers live into each instruction `insns` of the function with

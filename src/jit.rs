@@ -543,6 +543,123 @@ mod arch {
         c
     }
 
+    /// A direct call without a wrapper (see `call_done` in the stencils):
+    /// a piece of its own between stencils, where only the stencil state
+    /// registers carry values, so it saves just the slot registers live
+    /// after the call (GPRs `gprs`, xmm registers `fprs`) on the native
+    /// stack. Then, if call site `site` (a `CallSite`) has an entry, the
+    /// callee register (at byte `f_off` of the frame, if `Some`) holds its
+    /// closure, and the VM and native stacks have room: enter the callee's
+    /// frame (`frame` bytes on) and call the entry. If the callee exited,
+    /// `toi_direct_exit` finishes the call; if the checks failed,
+    /// `toi_rt_call` makes it: both in the cold part, which jumps back. The
+    /// result goes to `acc` (r12).
+    ///
+    /// Entered as stencils are, with rsp ≡ 8 (mod 16).
+    pub fn direct_call(
+        gprs: &[u8],
+        fprs: &[u8],
+        site: u64,
+        f_off: Option<u32>,
+        frame: u32,
+        k: &super::DirectConsts,
+    ) -> super::RawCall {
+        let disp8 = |d: usize| u8::try_from(d).ok().filter(|&d| d < 0x80).unwrap();
+        let mut c = Vec::new();
+        for &g in gprs {
+            if g >= 8 {
+                c.push(0x41);
+            }
+            c.push(0x50 + (g & 7)); // push g
+        }
+        // At the call rsp ≡ 0 (mod 16): the saves take 8 (mod 16).
+        let mut area = 8 * fprs.len();
+        if (8 * gprs.len() + area) % 16 != 8 {
+            area += 8;
+        }
+        if area > 0 {
+            c.extend([0x48, 0x83, 0xEC, area as u8]); // sub rsp, area
+        }
+        for (i, &x) in fprs.iter().enumerate() {
+            c.extend([0xF2, 0x0F, 0x11, 0x44 | (x << 3), 0x24, (8 * i) as u8]); // movsd [rsp+8i], x
+        }
+        c.extend([0x49, 0xBB]); // movabs r11, site
+        c.extend(site.to_le_bytes());
+        // Jumps to the cold part: (field end, slow?).
+        let mut to_cold: Vec<(usize, bool)> = Vec::new();
+        let jcc = |c: &mut Vec<u8>, cc: u8, slow: bool, to: &mut Vec<(usize, bool)>| {
+            c.extend([0x0F, cc, 0, 0, 0, 0]);
+            to.push((c.len(), slow));
+        };
+        c.extend([0x49, 0x8B, 0x03]); // mov rax, [r11]: the entry
+        c.extend([0x48, 0x85, 0xC0]); // test rax, rax
+        jcc(&mut c, 0x84, true, &mut to_cold); // jz slow
+        if let Some(off) = f_off {
+            c.extend([0x4D, 0x8B, 0x95]); // mov r10, [r13 + off]
+            c.extend(off.to_le_bytes());
+            c.extend([0x4D, 0x3B, 0x53, disp8(k.closure)]); // cmp r10, [r11 + closure]
+            jcc(&mut c, 0x85, true, &mut to_cold); // jne slow
+        }
+        c.extend([0x4D, 0x8B, 0x53, disp8(k.end_off)]); // mov r10, [r11 + end_off]
+        c.extend([0x4D, 0x01, 0xEA]); // add r10, r13
+        c.extend([0x4D, 0x3B, 0x53, disp8(k.stack_end)]); // cmp r10, [r11 + stack_end]
+        jcc(&mut c, 0x87, true, &mut to_cold); // ja slow
+        c.extend([0x4D, 0x8B, 0x53, disp8(k.limit)]); // mov r10, [r11 + limit]
+        c.extend([0x49, 0x3B, 0x22]); // cmp rsp, [r10]
+        jcc(&mut c, 0x82, true, &mut to_cold); // jb slow
+        c.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 + frame]
+        c.extend(frame.to_le_bytes());
+        // mov qword ptr [r13 - flags], 0
+        c.extend([0x49, 0xC7, 0x45, (disp8(k.flags) as i8).wrapping_neg() as u8, 0, 0, 0, 0]);
+        c.extend([0x41, 0xBC]); // mov r12d, undefined
+        c.extend(u32::try_from(k.undefined).unwrap().to_le_bytes());
+        c.extend([0xFF, 0xD0]); // call rax
+        c.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 - frame]
+        c.extend(frame.wrapping_neg().to_le_bytes());
+        c.extend([0x41, 0x83, 0x3F, 0xFF]); // cmp dword ptr [r15], NO_EXIT
+        jcc(&mut c, 0x85, false, &mut to_cold); // jne exit
+        let done = c.len();
+        c.extend([0x49, 0x89, 0xC4]); // mov r12, rax
+        for (i, &x) in fprs.iter().enumerate() {
+            c.extend([0xF2, 0x0F, 0x10, 0x44 | (x << 3), 0x24, (8 * i) as u8]); // movsd x, [rsp+8i]
+        }
+        if area > 0 {
+            c.extend([0x48, 0x83, 0xC4, area as u8]); // add rsp, area
+        }
+        for &g in gprs.iter().rev() {
+            if g >= 8 {
+                c.push(0x41);
+            }
+            c.push(0x58 + (g & 7)); // pop g
+        }
+        // The cold part. exit: toi_direct_exit(regs, site, record, acc).
+        let mut d = Vec::new();
+        let mut to_done = Vec::new();
+        let exit = d.len();
+        d.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
+        d.extend([0x48, 0xBE]); // movabs rsi, site
+        d.extend(site.to_le_bytes());
+        d.extend([0x41, 0x8B, 0x17]); // mov edx, [r15]
+        d.extend([0x41, 0xC7, 0x07, 0xFF, 0xFF, 0xFF, 0xFF]); // mov dword ptr [r15], NO_EXIT
+        d.extend([0x48, 0x89, 0xC1]); // mov rcx, rax
+        call_abs(&mut d, k.exit);
+        d.extend([0xE9, 0, 0, 0, 0]); // jmp done
+        to_done.push(d.len());
+        // slow: toi_rt_call(regs, site).
+        let slow = d.len();
+        d.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
+        d.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+        call_abs(&mut d, k.call);
+        d.extend([0xE9, 0, 0, 0, 0]); // jmp done
+        to_done.push(d.len());
+        super::RawCall {
+            hot: c,
+            cold: d,
+            hot_to_cold: to_cold.into_iter().map(|(f, s)| (f, if s { slow } else { exit })).collect(),
+            cold_to_hot: to_done.into_iter().map(|f| (f, done)).collect(),
+        }
+    }
+
     /// `movabs rax, target; call rax`.
     fn call_abs(c: &mut Vec<u8>, target: u64) {
         c.extend([0x48, 0xB8]);
@@ -4066,6 +4183,10 @@ struct Piece {
     jump: Target,
     /// Instruction whose exit stub `toi_exit` goes to.
     exit: u32,
+    /// Machine code of its own instead of the stencil's (`arch::direct_call`):
+    /// 1 + its index in the region's list, or 0.
+    raw: u32,
+    raw_len: u32,
 }
 
 impl Piece {
@@ -4116,15 +4237,23 @@ impl Piece {
             cont: Target::Next,
             jump: Target::Next,
             exit: u32::MAX,
+            raw: 0,
+            raw_len: 0,
         }
     }
 
     fn trims(&self) -> bool {
+        if self.raw != 0 {
+            return false;
+        }
         let s = self.stencil.stencil();
         matches!(self.cont, Target::Next) && arch::ends_with_continue(s.code, s.relocs)
     }
 
     fn len(&self) -> usize {
+        if self.raw != 0 {
+            return self.raw_len as usize;
+        }
         self.stencil.stencil().code.len() - if self.trims() { arch::TRAILING_JUMP } else { 0 }
     }
 
@@ -5894,6 +6023,13 @@ impl JitCode {
         // pieces it needs first, then its stencil. Jump edges needing
         // conversions get cold stubs; exits get cold spill-and-exit stubs.
         let mut hot: Vec<Piece> = Vec::with_capacity(2 * n);
+        // Machine code of pieces of their own (`Piece::raw`), and per
+        // direct call made so, (hot piece, stub, rel32 fields to patch; see
+        // `RawCall`).
+        let mut raws: Vec<Vec<u8>> = Vec::new();
+        #[allow(clippy::type_complexity)]
+        let mut raw_links: Vec<(usize, usize, Vec<(usize, usize)>, Vec<(usize, usize)>)> =
+            Vec::new();
         let mut stubs: Vec<Vec<Piece>> = Vec::new();
         let mut exits: Vec<(usize, Vec<Piece>)> = Vec::new();
         let mut label_piece = vec![usize::MAX; n];
@@ -6251,6 +6387,44 @@ impl JitCode {
                 exits.push((i, seq));
             }
             hot.extend(check);
+            // A direct call (in a VM frame, where exits' liveness is known)
+            // without the `toi_rt_enter` wrapper: `arch::direct_call`, then
+            // `call_done`'s checks.
+            #[cfg(target_arch = "x86_64")]
+            let main = match exit_live.filter(|e| e.len() == n) {
+                Some(e) if matches!(name.as_str(), "call_direct" | "call_direct_nc") => {
+                    let site = unsafe { &*(main.imm64 as *const CallSite) };
+                    let (g, f) = live_slots(e, mats, live_sets, &homes, i, n);
+                    let call = arch::direct_call(
+                        &g,
+                        &f,
+                        main.imm64,
+                        (name == "call_direct").then_some(site.f_off as u32),
+                        (8 * site.frame) as u32,
+                        &DirectConsts::new(),
+                    );
+                    let raw = |code: Vec<u8>, raws: &mut Vec<Vec<u8>>| {
+                        raws.push(code);
+                        Piece {
+                            raw: raws.len() as u32,
+                            raw_len: raws.last().unwrap().len() as u32,
+                            exit: i as u32,
+                            ..Piece::new("nop", 0)
+                        }
+                    };
+                    raw_links.push((hot.len(), stubs.len(), call.hot_to_cold, call.cold_to_hot));
+                    let cold = raw(call.cold, &mut raws);
+                    stubs.push(vec![cold]);
+                    let hot_part = raw(call.hot, &mut raws);
+                    hot.push(hot_part);
+                    Piece {
+                        stencil: Instance::get("call_done"),
+                        slow: None,
+                        ..main
+                    }
+                }
+                _ => main,
+            };
             hot.push(main);
             hot.extend(result);
             if let Some(post) = s.post {
@@ -6397,7 +6571,8 @@ impl JitCode {
                 }
             };
             for (p, &at) in hot.iter().zip(&hot_at) {
-                sym(at, p.len(), p.stencil.stencil().name);
+                let name = if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
+                sym(at, p.len(), name);
             }
             for (pieces, ats) in stubs
                 .iter()
@@ -6405,7 +6580,8 @@ impl JitCode {
                 .chain(exits.iter().map(|(_, s)| s).zip(&exit_ats))
             {
                 for (p, &at) in pieces.iter().zip(ats) {
-                    sym(at, p.len(), &format!("cold:{}", p.stencil.stencil().name));
+                    let name = if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
+                    sym(at, p.len(), &format!("cold:{name}"));
                 }
             }
             for &(_, h, at) in &helper_list {
@@ -6435,6 +6611,29 @@ impl JitCode {
         // fields of a family template, operands from `p`, continuation and
         // branch target at the given offsets, and the helper of hot piece
         // `key`.
+        let raw_pieces = hot.iter().zip(&hot_at).chain(
+            stubs
+                .iter()
+                .zip(&stub_ats)
+                .flat_map(|(s, ats)| s.iter().zip(ats)),
+        );
+        for (p, &at) in raw_pieces.filter(|(p, _)| p.raw != 0) {
+            let code = &raws[p.raw as usize - 1];
+            buf[at..at + code.len()].copy_from_slice(code);
+        }
+        for (k, s, to_cold, to_hot) in &raw_links {
+            let (h, c) = (hot_at[*k], stub_ats[*s][0]);
+            let mut rel32 = |field_end: usize, to: usize| {
+                let d = (to as i64 - field_end as i64) as i32;
+                buf[field_end - 4..field_end].copy_from_slice(&d.to_le_bytes());
+            };
+            for &(f, t) in to_cold {
+                rel32(h + f, c + t);
+            }
+            for &(f, t) in to_hot {
+                rel32(c + f, h + t);
+            }
+        }
         let mut emit = |s: Instance,
                         len: usize,
                         at: usize,
@@ -6476,6 +6675,9 @@ impl JitCode {
             .map(|(p, &at)| (resolve(p.cont, at + p.len()), resolve(p.jump, at + p.len())))
             .collect();
         for (k, p) in hot.iter().enumerate() {
+            if p.raw != 0 {
+                continue;
+            }
             let (cont, jump) = hot_targets[k];
             emit(p.stencil, p.len(), hot_at[k], p, cont, jump, Some(k));
         }
@@ -6488,7 +6690,7 @@ impl JitCode {
             .zip(&stub_ats)
             .chain(exits.iter().map(|(_, s)| s).zip(&exit_ats));
         for (seq, ats) in cold {
-            for (p, &at) in seq.iter().zip(ats) {
+            for (p, &at) in seq.iter().zip(ats).filter(|(p, _)| p.raw == 0) {
                 emit(
                     p.stencil,
                     p.len(),
@@ -10837,6 +11039,88 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
 /// What the inline version of [`toi_rt_enter`] in a region's wrapper for
 /// it (`arch::enter_wrapper`) needs: `CallSite` offsets, constants and
 /// the functions it calls.
+/// The slot registers to keep across call `i`, as (GPRs, xmm registers):
+/// those of registers live after it, to compiled code (`live`) or to the
+/// interpreter after an exit there (`exit_live`, and the fields of objects
+/// an exit there allocates).
+#[cfg(target_arch = "x86_64")]
+fn live_slots(
+    exit_live: &[RegSet],
+    mats: Option<&HashMap<usize, Vec<Rc<Mat>>>>,
+    live: &[RegSet],
+    homes: &[Home],
+    i: usize,
+    n: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut set = [0; 4];
+    for k in [i, i + 1].into_iter().filter(|&k| k < n) {
+        rs_or(&mut set, &exit_live[k]);
+        for m in mats.and_then(|m| m.get(&k)).into_iter().flatten() {
+            for &f in &m.fields {
+                rs_add(&mut set, f as usize);
+            }
+        }
+    }
+    if i + 1 < n {
+        rs_or(&mut set, &live[i + 1]);
+    }
+    let (mut g, mut f): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+    for r in rs_iter(&set).filter(|&r| r < homes.len()) {
+        match homes[r] {
+            Home::Gpr(k) | Home::Int(k) => g.extend(arch::caller_saved_gpr_slot(k)),
+            Home::Fpr(k) => f.push(k + 1),
+            Home::Mem => {}
+        }
+    }
+    g.sort_unstable();
+    g.dedup();
+    f.sort_unstable();
+    f.dedup();
+    (g, f)
+}
+
+/// [`arch::direct_call`]'s code: the hot part, a piece of its own, and
+/// the cold part, a stub; and the rel32 fields to patch once they're
+/// placed, each as (field end, offset in the other part).
+#[cfg(target_arch = "x86_64")]
+struct RawCall {
+    hot: Vec<u8>,
+    cold: Vec<u8>,
+    hot_to_cold: Vec<(usize, usize)>,
+    cold_to_hot: Vec<(usize, usize)>,
+}
+
+/// What [`arch::direct_call`] needs: offsets in a `CallSite`, the frame
+/// header's flags slot, `undefined`, and the runtime functions it calls.
+#[cfg(target_arch = "x86_64")]
+struct DirectConsts {
+    closure: usize,
+    end_off: usize,
+    stack_end: usize,
+    limit: usize,
+    flags: usize,
+    undefined: u64,
+    call: u64,
+    exit: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl DirectConsts {
+    fn new() -> Self {
+        const { assert!(NO_EXIT == u32::MAX) };
+        DirectConsts {
+            closure: std::mem::offset_of!(CallSite, closure),
+            end_off: std::mem::offset_of!(CallSite, end_off),
+            stack_end: std::mem::offset_of!(CallSite, stack_end),
+            limit: std::mem::offset_of!(CallSite, native_limit),
+            flags: 8 * interp::FLAGS,
+            undefined: Value::UNDEFINED.to_bits(),
+            call: toi_rt_call as *const () as u64,
+            exit: toi_direct_exit as *const () as u64,
+        }
+    }
+}
+
 struct EnterConsts {
     limit: usize,
     frame: usize,

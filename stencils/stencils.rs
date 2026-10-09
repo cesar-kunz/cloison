@@ -3520,6 +3520,16 @@ stencil!("call_direct_nc"; |s| {
     next!(s)
 });
 
+// After a direct call the JIT made without the `toi_rt_enter` wrapper
+// (`arch::direct_call` in `src/jit.rs`), its result in `acc`: leave as
+// `call_direct` does.
+stencil!("call_done"; |s| {
+    if s.acc.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+        exit!(s)
+    }
+    next!(s)
+});
+
 // `new`, as `call_direct`, allocating `this` itself: if what the
 // constructor's root shape depends on is unchanged and the heap's chunk
 // has room, bump the heap, write the header, put

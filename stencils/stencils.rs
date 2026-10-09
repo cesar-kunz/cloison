@@ -2202,6 +2202,41 @@ macro_rules! rt_strict_eq {
     };
 }
 
+/// `mul_ii`'s fast path, `$a * acc`: overflow exits, a zero product goes to
+/// the `__slow` helper (-0 if a factor is negative). On x86-64 both
+/// branches are long, through `asm goto`, so `build.rs` aims them at the
+/// exit and the helper (see `exit_unless_int32`).
+macro_rules! mul_ii_fast {
+    ($s:ident, $a:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut v = int($s.acc);
+            core::arch::asm!(
+                "imul {v:e}, {a:e}",
+                "{{disp32}} jo {ovf}",
+                "test {v:e}, {v:e}",
+                "{{disp32}} jz {zero}",
+                v = inout(reg) v,
+                a = in(reg) $a,
+                ovf = label { unsafe { exit!($s) } },
+                zero = label { unsafe { slow!($s) } },
+                options(nomem, nostack),
+            );
+            $s.acc = unboxed(v);
+            next!($s)
+        }
+        #[cfg(target_arch = "aarch64")]
+        match $a.checked_mul(int($s.acc)) {
+            Some(0) => slow!($s),
+            Some(v) => {
+                $s.acc = unboxed(v);
+                next!($s)
+            }
+            None => exit!($s),
+        }
+    }};
+}
+
 /// An int32 product, or `None` on overflow or a -0 result (a zero product
 /// with a negative factor).
 #[inline(always)]
@@ -2348,14 +2383,7 @@ macro_rules! group2_generic {
         // A zero product is -0 if a factor is negative: checked out of
         // line (`imul; jo exit; test; jz slow`).
         stencil_slow!("mul_ii_", loc!($loc); |s| {
-            match int(get!($loc, s)).checked_mul(int(s.acc)) {
-                Some(0) => slow!(s),
-                Some(v) => {
-                    s.acc = unboxed(v);
-                    next!(s)
-                }
-                None => exit!(s),
-            }
+            mul_ii_fast!(s, int(get!($loc, s)))
         }; |s| {
             if (int(get!($loc, s)) | int(s.acc)) < 0 {
                 exit!(s)
@@ -2444,14 +2472,7 @@ macro_rules! group2_int_slot {
             next!(s)
         });
         stencil_slow!("mul_ii_u", $k; |s| {
-            match raw(s.g[$k]).checked_mul(int(s.acc)) {
-                Some(0) => slow!(s),
-                Some(v) => {
-                    s.acc = unboxed(v);
-                    next!(s)
-                }
-                None => exit!(s),
-            }
+            mul_ii_fast!(s, raw(s.g[$k]))
         }; |s| {
             // Not merged with `mul_ii_g<k>`'s identical helper: each
             // stencil must keep its own.
@@ -2517,14 +2538,7 @@ macro_rules! group2_boxed_typed {
         // A zero product is -0 if a factor is negative: checked out of
         // line (`imul; jo exit; test; jz slow`).
         stencil_slow!("mul_ii_", loc!($loc); |s| {
-            match int(get!($loc, s)).checked_mul(int(s.acc)) {
-                Some(0) => slow!(s),
-                Some(v) => {
-                    s.acc = unboxed(v);
-                    next!(s)
-                }
-                None => exit!(s),
-            }
+            mul_ii_fast!(s, int(get!($loc, s)))
         }; |s| {
             if (int(get!($loc, s)) | int(s.acc)) < 0 {
                 exit!(s)
@@ -2656,6 +2670,16 @@ fn fneg(d: f64) -> f64 {
 // once it has, `neg_iif` gives a double.
 stencil!("neg_i"; |s| {
     let v = int(s.acc);
+    // (On x86-64 a long `jz` to the exit, as `exit_unless_int32`.)
+    #[cfg(target_arch = "x86_64")]
+    core::arch::asm!(
+        "test {v:e}, 0x7fffffff",
+        "{{disp32}} jz {bad}",
+        v = in(reg) v,
+        bad = label { unsafe { exit!(s) } },
+        options(nomem, nostack),
+    );
+    #[cfg(target_arch = "aarch64")]
     if v == 0 || v == i32::MIN {
         exit!(s)
     }
@@ -3566,10 +3590,10 @@ macro_rules! property_location {
         }; |s| {
             let key = *at_imm(s.regs as *mut u8);
             let args = [get!($loc, s), key, s.acc];
-            // (The second argument is unused: `NULL` keeps LLVM from
-            // merging this helper with `set_keyed_`'s, identical otherwise,
-            // which a stencil can't jump to.)
-            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::NULL);
+            // Not merged with `set_keyed_`'s identical helper: each stencil
+            // must keep its own.
+            core::arch::asm!(concat!("/* set_keyed_rt_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
                 exit!(s)
             }
@@ -3745,20 +3769,39 @@ fn set_key_x(i: i32) {
     }
 }
 
+/// Exit unless `$v` is an int32. On x86-64 `cmp v, r14; jb exit` through
+/// `asm goto` with a long `jb`, which `build.rs` aims at the exit itself
+/// (`fold_x86_stubs`); LLVM's short jump would reach it through a stub at
+/// the end, after the hot path's final `jmp`, which then couldn't be
+/// trimmed.
+macro_rules! exit_unless_int32 {
+    ($s:ident, $v:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!(
+            "cmp {v}, {t}",
+            "{{disp32}} jb {bad}",
+            v = in(reg) $v.to_bits(),
+            t = in(reg) $s.tag.to_bits(),
+            bad = label { unsafe { exit!($s) } },
+            options(nomem, nostack),
+        );
+        #[cfg(target_arch = "aarch64")]
+        if !$s.tag.is_int32($v) {
+            exit!($s)
+        }
+    }};
+}
+
 stencil!("key_m"; |s| {
     let k = *mem(s.regs);
-    if !s.tag.is_int32(k) {
-        exit!(s)
-    }
+    exit_unless_int32!(s, k);
     set_key_x(int(k));
     next!(s)
 });
 macro_rules! key_gpr {
     ($k:tt) => {
         stencil!("key_g", $k; |s| {
-            if !s.tag.is_int32(s.g[$k]) {
-                exit!(s)
-            }
+            exit_unless_int32!(s, s.g[$k]);
             set_key_x(int(s.g[$k]));
             next!(s)
         });

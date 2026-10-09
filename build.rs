@@ -9,7 +9,9 @@
 //!    invert conditional branches over lone jumps
 //!    ([`invert_arm64_branch_over_jump`]). On x86-64, fold the trailing stubs
 //!    that `asm goto` labels become ([`fold_x86_stubs`]), and make a final
-//!    two-way branch end in the continuation ([`swap_x86_final_branch`]).
+//!    two-way branch end in the continuation ([`swap_x86_final_branch`]);
+//!    a stencil whose exits still go through stubs takes the code of a
+//!    second compile with every branch long, where they fold (`main`).
 //! 4. On arm64, compact each family of per-slot variants into one template
 //!    whose register fields the JIT patches ([`compact_arm64`]).
 //! 5. Write `$OUT_DIR/stencils.rs`, included by `src/jit.rs`.
@@ -36,7 +38,54 @@ fn main() {
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let obj_path = out_dir.join("stencils.o");
 
-    let status = Command::new(&rustc)
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    let mut extracted = extract(&compile(&rustc, &target, &obj_path, &[]), &arch);
+    // x86-64: LLVM jumps to an exit or a helper with a short `jcc` to a
+    // stub after the hot path's final `jmp toi_continue`, which then can't
+    // be trimmed. Assembled with every branch long (`-mc-relax-all`), the
+    // stubs fold away (`fold_x86_stubs`). That lengthens every other local
+    // jump: a stencil takes its relaxed form only where that lets it end in
+    // `jmp toi_continue` and makes it no longer (DeltaBlue's `teq_jt`, 147
+    // to 158 bytes of mostly 6-byte `jcc`s, cost it 2.5%).
+    if arch == "x86_64" {
+        let relaxed_path = out_dir.join("stencils-relaxed.o");
+        let relaxed = extract(
+            &compile(&rustc, &target, &relaxed_path, &["-Cllvm-args=-mc-relax-all"]),
+            &arch,
+        );
+        let mut relaxed: std::collections::HashMap<String, Extracted> =
+            relaxed.into_iter().map(|e| (e.name.clone(), e)).collect();
+        for e in &mut extracted {
+            if !ends_with_continue(e)
+                && let Some(r) = relaxed.remove(&e.name)
+                && ends_with_continue(&r)
+                && r.code.len() <= e.code.len()
+            {
+                *e = r;
+            }
+        }
+    }
+    assert!(
+        !extracted.is_empty(),
+        "no {PREFIX}* symbols in {}",
+        obj_path.display()
+    );
+
+    let mut entries = if arch == "aarch64" {
+        compact_arm64(extracted)
+    } else {
+        extracted.into_iter().map(Entry::concrete).collect()
+    };
+    // In name order, so the tables don't depend on the object file's.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    fs::write(out_dir.join("stencils.rs"), emit(&entries)).unwrap();
+}
+
+
+/// Compile the stencils into the object file `obj_path`, with `extra`
+/// codegen options; returns its bytes.
+fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]) -> Vec<u8> {
+    let status = Command::new(rustc)
         .args([
             "--edition=2024",
             "--crate-type=lib",
@@ -44,17 +93,35 @@ fn main() {
         ])
         .args(["-Copt-level=3", "-Cpanic=abort", "-Ccodegen-units=1"])
         .args(["-Crelocation-model=static", "-Ccode-model=small"])
-        .args(["--target", &target])
+        .args(extra)
+        .args(["--target", target])
         .arg(format!("--emit=obj={}", obj_path.display()))
         .arg(SOURCE)
         .status()
         .expect("failed to run rustc for the stencils");
     assert!(status.success(), "compiling {SOURCE} failed");
+    fs::read(obj_path).unwrap()
+}
 
-    let data = fs::read(&obj_path).unwrap();
-    let file = object::File::parse(&*data).expect("stencil object");
+/// Whether a stencil ends with its hot path's `jmp toi_continue` (which
+/// the JIT trims when the next stencil follows).
+fn ends_with_continue(e: &Extracted) -> bool {
+    let n = e.code.len();
+    match e.code.len() {
+        0..5 => false,
+        _ if e.code[n - 5] == 0xE9 => e
+            .relocs
+            .iter()
+            .any(|r| r.offset == (n - 4) as u64 && r.symbol == "toi_continue"),
+        _ => false,
+    }
+}
 
-    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+/// Every `toi_stencil_*` function of the object file `data`: its code and
+/// relocations, after this target's rewrites.
+fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
+    let file = object::File::parse(data).expect("stencil object");
+
     let mut symbols: Vec<_> = file
         .symbols()
         .filter(|s| s.kind() == SymbolKind::Text && s.is_definition())
@@ -113,7 +180,7 @@ fn main() {
         }
 
         let mut code = code.to_vec();
-        match arch.as_str() {
+        match arch {
             "aarch64" => {
                 fold_arm64_stubs(&name, &mut code, &mut relocs);
                 invert_arm64_branch_over_jump(&mut code, &mut relocs);
@@ -127,20 +194,7 @@ fn main() {
         relocs.sort_by_key(|r| r.offset);
         extracted.push(Extracted { name, code, relocs });
     }
-    assert!(
-        !extracted.is_empty(),
-        "no {PREFIX}* symbols in {}",
-        obj_path.display()
-    );
-
-    let mut entries = if arch == "aarch64" {
-        compact_arm64(extracted)
-    } else {
-        extracted.into_iter().map(Entry::concrete).collect()
-    };
-    // In name order, so the tables don't depend on the object file's.
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-    fs::write(out_dir.join("stencils.rs"), emit(&entries)).unwrap();
+    extracted
 }
 
 /// A stencil as extracted from the object file.
@@ -701,10 +755,11 @@ fn swap_x86_final_branch(code: &mut [u8], relocs: &mut [Reloc]) {
 /// stub.
 ///
 /// There's no x86 decoder here, so this is conservative: it folds only a
-/// stub reached by exactly one `jcc rel32` / `jmp rel32` (`0F 8x d32` /
-/// `E9 d32` with no relocation on it), and only if nothing that could be a
-/// short jump targets it. LLVM never emits long local jumps to such stubs
-/// itself, so in practice this matches just the `asm goto` sites.
+/// stub reached by `jcc rel32` / `jmp rel32` alone (`0F 8x d32` / `E9 d32`
+/// with no relocation on it), not fallen into, and only if nothing that
+/// could be a short jump targets it. LLVM emits long local jumps to such
+/// stubs only where told to: the `asm goto` sites, and the stencils
+/// assembled with `-mc-relax-all` (see `main`).
 fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
     loop {
         let n = code.len();
@@ -724,6 +779,17 @@ fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
                 .iter()
                 .any(|r| (r.offset as usize..r.offset as usize + 4).contains(&at))
         };
+        // Nothing may fall into the stub: the instruction before it must be
+        // an unconditional `jmp rel32` to a symbol (the hot path's `jmp
+        // toi_continue`, or another stub's).
+        let jumps_away = stub >= 5
+            && code[stub - 5] == 0xE9
+            && relocs.iter().any(|r| {
+                r.offset == (stub - 4) as u64 && matches!(r.r_type, R_X86_64_PC32 | R_X86_64_PLT32)
+            });
+        if !jumps_away {
+            return;
+        }
         let rel32 = |f: usize| i32::from_le_bytes(code[f..f + 4].try_into().unwrap()) as i64;
         let mut users = Vec::new();
         for f in 1..stub.saturating_sub(3) {
@@ -739,16 +805,18 @@ fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
             ((0x70..=0x7F).contains(&code[p]) || code[p] == 0xEB)
                 && p as i64 + 2 + code[p + 1] as i8 as i64 == stub as i64
         });
-        if users.len() != 1 || short_to_stub {
+        if users.is_empty() || short_to_stub {
             return;
         }
         let target = relocs.remove(sr);
-        relocs.push(Reloc {
-            offset: users[0] as u64,
-            r_type: target.r_type,
-            symbol: target.symbol,
-            addend: target.addend,
-        });
+        for &f in &users {
+            relocs.push(Reloc {
+                offset: f as u64,
+                r_type: target.r_type,
+                symbol: target.symbol.clone(),
+                addend: target.addend,
+            });
+        }
         code.truncate(stub);
     }
 }

@@ -1371,6 +1371,10 @@ struct Insn {
     /// A check [`hoist_guards`] moved before a loop: the frame and bytecode
     /// offset of the load it checked for.
     hoisted: Option<(u8, u32)>,
+    /// A call through `f.call(that, …)` whose `that` may be `undefined` or
+    /// `null`, which the callee would see as the global object: not the
+    /// caller's own `this` (see [`Lowering::nullable_this`]).
+    nullable_this: bool,
 }
 
 impl Insn {
@@ -1634,6 +1638,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 exit_const: 0,
                 sub,
                 hoisted: None,
+                nullable_this: false,
             }
         })
         .collect();
@@ -3308,6 +3313,14 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             return Sel {
                 ops: Some((insn.imm, shape as u64, heap as u64)),
                 ..Sel::new("create_object", "", out)
+            };
+        }
+        // A constant the lowering gives (see `Lowering::global_this`).
+        Op::LdaConstant if let Some(&Prop::Const { value, .. }) = spec.props.get(i) => {
+            out.acc = Any;
+            return Sel {
+                ops: Some((0, value, 0)),
+                ..Sel::new("lda_constant", "", out)
             };
         }
         // The constant is the 64-bit immediate: a double goes to `facc`.
@@ -7930,6 +7943,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         exit_const: 0,
         sub: false,
         hoisted: None,
+        nullable_this: false,
     }
 }
 
@@ -9648,6 +9662,10 @@ impl Lowering<'_> {
                     }
                     i.reg = i.reg2;
                     i.reg2 += 1;
+                    // `X.call(this, …)` passes the caller's `this`, never
+                    // `undefined` or `null` (sloppy mode).
+                    let this = renamed(0);
+                    i.nullable_this = !self.fwd.iter().any(|&(w, x)| w == i.reg2 && x == this);
                     if i.imm == 0 {
                         i.op = Op::CallUndefined;
                     } else {
@@ -9956,7 +9974,8 @@ impl Lowering<'_> {
         }
         let callee = unsafe { (*fo).code };
         // Not compiled: its exception handlers need interpreted frames.
-        if unsafe { (*callee).interpreted } {
+        // Nor a `that` of `f.call(that, …)` to convert: the runtime does.
+        if unsafe { (*callee).interpreted } || self.nullable_this(i, fo) {
             return false;
         }
         // A constructor's `this` is allocated by the call
@@ -9996,6 +10015,7 @@ impl Lowering<'_> {
         if next.is_none_or(|n| n.op != Op::Return || n.bail)
             || i.imm as u32 > unsafe { (*root).nparams }
             || (i.op == Op::Call && i.reg2 as i32 <= i.imm)
+            || (i.op == Op::Call && i.nullable_this)
             || self
                 .state
                 .callee_exits
@@ -10050,7 +10070,8 @@ impl Lowering<'_> {
         if i.op == Op::Call {
             mov(self, Some(w), 0);
         } else if live[0] {
-            mov(self, None, 0);
+            self.global_this(0, pc);
+            self.push(synth(Op::Star, 0, 0, pc), Prop::None);
         }
         for (r, &l) in live.iter().enumerate().skip(1 + argc) {
             if l {
@@ -10080,7 +10101,35 @@ impl Lowering<'_> {
         {
             return None;
         }
+        if self.nullable_this(i, ic.holder) {
+            return None;
+        }
         self.inlinable(frame, ic.holder).then_some(ic.holder)
+    }
+
+    /// Whether call `i` may pass `fo` an `undefined` or `null` `this`
+    /// (`f.call(null, …)`) that `fo` reads, and would see as the global
+    /// object: then made through the runtime, which converts it.
+    fn nullable_this(&mut self, i: &Insn, fo: *mut Object) -> bool {
+        i.op == Op::Call
+            && i.nullable_this
+            && !fo.is_null()
+            && unsafe { (*fo).class } == crate::object::Class::Function
+            && self.entry_live(unsafe { (*fo).code })[0]
+    }
+
+    /// Load the global object into `acc`: `this` of a call without a
+    /// receiver (sloppy mode).
+    fn global_this(&mut self, frame: usize, pc: usize) {
+        let g = unsafe { (*self.state.vm).global };
+        let prop = Prop::Const {
+            value: crate::object::object_value(g).to_bits(),
+            at: 0,
+            expect: 0,
+            ft: FieldType::Any,
+            obj: 0,
+        };
+        self.push(synth(Op::LdaConstant, 0, frame, pc), prop);
     }
 
     /// Whether the instruction at bytecode offset `pc` of `code` is in a
@@ -10142,7 +10191,10 @@ impl Lowering<'_> {
             if fo.is_null() {
                 break;
             }
-            if !self.inlinable(frame, fo) || self.out.frames.len() + fos.len() >= 255 {
+            if !self.inlinable(frame, fo)
+                || self.nullable_this(i, fo)
+                || self.out.frames.len() + fos.len() >= 255
+            {
                 return Vec::new();
             }
             fos.push(fo);
@@ -10208,17 +10260,24 @@ impl Lowering<'_> {
         let (w, argc) = (i.reg2 as usize, i.imm as usize);
         let has_this = i.op == Op::Call;
         let mut stores = Vec::new();
+        // `src`: a register, `undefined` (`None`), or the global object
+        // (`usize::MAX`: `this` of a call without a receiver).
         let mut store = |cx: &mut Self, src: Option<usize>, j: usize| {
             match src {
-                Some(r) => cx.push(synth(Op::Ldar, r as u8, frame, pc), Prop::None),
-                None => cx.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None),
+                Some(usize::MAX) => cx.global_this(frame, pc),
+                Some(r) => {
+                    cx.push(synth(Op::Ldar, r as u8, frame, pc), Prop::None);
+                }
+                None => {
+                    cx.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
+                }
             };
             stores.push(cx.push(synth(Op::Star, j as u8, frame, pc), Prop::None));
         };
         if has_this {
             store(self, Some(w), 0);
         } else if live[0] && i.op != Op::Construct {
-            store(self, None, 0);
+            store(self, Some(usize::MAX), 0);
         }
         let args = w + usize::from(has_this);
         for a in 0..argc {
@@ -10758,8 +10817,12 @@ impl Lowering<'_> {
             }
             _ => cx.mov(frame, i.pc, src, (base + p) as u8),
         };
-        // `new` allocated `this` already.
-        if i.op != Op::Construct {
+        // `new` allocated `this` already; a call without a receiver passes
+        // the global object.
+        if i.op == Op::CallUndefined && callees.iter().any(|&c| self.entry_live(c)[0]) {
+            self.global_this(frame, i.pc);
+            self.push(synth(Op::Star, base as u8, frame, i.pc), Prop::None);
+        } else if i.op != Op::Construct {
             arg(self, 0, this);
         }
         for p in 0..nparams {

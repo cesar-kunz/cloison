@@ -1194,7 +1194,10 @@ handlers! {
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
             note_callee(ic_at(regs, pc, 4), as_object(f));
             let args = reg(pc, 2, regs);
-            enter!(as_object(f), Value::UNDEFINED, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
+            // Sloppy mode (toi has no strict mode): `this` is the global
+            // object.
+            let this = object_value((*frame_vm(regs)).global);
+            enter!(as_object(f), this, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
         tail!(slow_call_undefined, acc)
     }
@@ -1336,6 +1339,7 @@ handlers! {
             note_callee(ic, fo);
             (*ic).loc = VIA_CALL;
             let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
+            let that = sloppy_this(frame_vm(regs), that);
             enter!(fo, that, w.add(2), argc.saturating_sub(1), 0, Op::Call.size())
         }
         record_callee(pc, regs, tag);
@@ -2872,6 +2876,18 @@ unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
 /// paths do for bytecode functions: a cache left empty then means the call
 /// never ran (the JIT leaves such calls to the interpreter).
 #[inline(always)]
+/// The `this` a bytecode function gets for receiver `this`: the global
+/// object for `undefined` or `null` (sloppy mode; toi has no strict mode).
+/// Calls without a receiver pass the global object themselves; this is for
+/// `f.call(that, …)`.
+pub(crate) unsafe fn sloppy_this(vm: *const Vm, this: Value) -> Value {
+    if this == Value::UNDEFINED || this == Value::NULL {
+        object_value(unsafe { (*vm).global })
+    } else {
+        this
+    }
+}
+
 /// For a call of `f` with receiver `this`: if `f` is
 /// `Function.prototype.call` and `this` a bytecode function, `this`, which
 /// is what the call calls.
@@ -3370,7 +3386,7 @@ pub(crate) unsafe fn call_from_jit(
         let mut fv = *regs.add(f);
         let (mut this, mut args, mut argc) = match op {
             Op::Call => (*regs.add(w), regs.add(w + 1), argc),
-            _ => (Value::UNDEFINED, regs.add(w), argc),
+            _ => (object_value(vm.global), regs.add(w), argc),
         };
         let bytecode = fv.is_cell() && (*as_object(fv)).class == Class::Function;
         if !bytecode {
@@ -3378,7 +3394,7 @@ pub(crate) unsafe fn call_from_jit(
             match unwrap_call(vm, fv, this) {
                 Some(fo) if op == Op::Call => {
                     fv = object_value(fo);
-                    this = if argc == 0 { Value::UNDEFINED } else { *args };
+                    this = sloppy_this(vm, if argc == 0 { Value::UNDEFINED } else { *args });
                     args = args.add(1);
                     argc = argc.saturating_sub(1);
                 }
@@ -3394,10 +3410,11 @@ pub(crate) unsafe fn call_from_jit(
         }
         let fo = as_object(fv);
         let callee = (*fo).code;
+        // (A `Call` the JIT made of `f.call(that, …)` passes `that`.)
         let this = if op == Op::Construct {
             vm.construct_this(fo)
         } else {
-            this
+            sloppy_this(vm, this)
         };
         let new = regs.add(frame);
         let n = (*callee).nregs as usize;

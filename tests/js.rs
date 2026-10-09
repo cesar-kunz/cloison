@@ -1979,3 +1979,39 @@ fn loads_hoisted_from_nested_loops_agree_with_node() {
     assert_eq!(value(&format!("{HOISTED_FROM_NESTED_LOOPS}
 r;")), "542668");
 }
+
+/// `this` in sloppy mode (toi has no strict mode): the global object in a
+/// call without a receiver, and for `f.call(null)` / `f.call()`; through
+/// inlined, direct, polymorphic and self tail calls. The expected value is
+/// Node's.
+const SLOPPY_THIS: &str = r#"
+var tag = 1;
+function small() { return this.tag; }
+function big(k) {
+  var s = 0;
+  for (var j = 0; j < 3; j++) s += this.tag + k + j;
+  if (k < 0) { s += 1; s += 2; s += 3; s += 4; s += 5; s += 6; s += 7; s += 8; }
+  return s;
+}
+function other() { return this === undefined ? -1 : 2; }
+function count(n, acc) { if (n == 0) return acc + this.tag; return count(n - 1, acc + 1); }
+var o = { tag: 5, m: small };
+function sloppyThis() {
+  var s = 0, fs = [small, other];
+  for (var i = 0; i < 3000; i++) {
+    s += small();
+    s += big(i & 3);
+    var f = fs[i & 1];
+    s += f();
+    s += small.call(null) + small.call() + small.call(o) + small.call(undefined);
+    s += o.m();
+    if (i % 100 == 0) { s += count(10, 0); tag = (tag + 1) & 7; }
+  }
+  return s;
+}
+"#;
+
+#[test]
+fn sloppy_this_agrees_with_node() {
+    assert_eq!(value(&format!("{SLOPPY_THIS}\nsloppyThis();")), "139107");
+}

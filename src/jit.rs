@@ -1681,7 +1681,14 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     )
                 }
                 // The object in `reg`, the key in `reg2`.
-                Op::SetKeyed if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
+                // The inline-cache slot in `imm`, as `GetKeyed`'s.
+                Op::SetKeyed if vm => {
+                    (reg, reg2, imm) = (
+                        code[pc + 1],
+                        code[pc + 2],
+                        u16::from_le_bytes([code[pc + 3], code[pc + 4]]) as i32,
+                    )
+                }
                 _ if vm => bail = true,
                 op => panic!("the JIT does not compile {op:?} yet"),
             }
@@ -1836,6 +1843,9 @@ pub(crate) enum Prop {
     /// a buffer's or a string's elements (`vm::BYTES_LOC`; see
     /// `get_keyed_rt` in the stencils).
     Runtime,
+    /// A keyed load whose receivers were typed arrays of element kind
+    /// `kind` (`object::TypedKind`; see `tget_*` in the stencils).
+    Typed { kind: u8 },
     /// In the receiver, at byte offset `off`.
     Own { shape: u64, off: i32, ft: FieldType },
     /// In the receiver's out-of-line slots, at byte offset `off`.
@@ -2071,7 +2081,12 @@ impl Feedback {
         if insn.bail
             || !matches!(
                 insn.op,
-                Op::GetNamed | Op::SetNamed | Op::LdaGlobal | Op::StaGlobal | Op::GetKeyed
+                Op::GetNamed
+                    | Op::SetNamed
+                    | Op::LdaGlobal
+                    | Op::StaGlobal
+                    | Op::GetKeyed
+                    | Op::SetKeyed
             )
         {
             return Prop::None;
@@ -2080,8 +2095,16 @@ impl Feedback {
         if insn.op == Op::GetNamed && ic.loc == crate::vm::LENGTH_LOC {
             return Prop::Length;
         }
-        if insn.op == Op::GetKeyed && ic.loc == crate::vm::BYTES_LOC {
-            return Prop::Runtime;
+        if matches!(insn.op, Op::GetKeyed | Op::SetKeyed) && ic.loc == crate::vm::BYTES_LOC {
+            return match ic.epoch {
+                k @ 1..=9 => Prop::Typed { kind: k as u8 - 1 },
+                _ if insn.op == Op::SetKeyed => Prop::None,
+                _ => Prop::Runtime,
+            };
+        }
+        // (A store's cache records typed arrays only.)
+        if insn.op == Op::SetKeyed {
+            return Prop::None;
         }
         if ic.shape.is_null() {
             return Prop::None;
@@ -3622,6 +3645,22 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ..Sel::new("set_keyed_rt", if st.acc == I32 { "i" } else { "" }, out)
             };
         }
+        // A number into a typed array of the kind the cache saw: stored as
+        // the kind stores it (`tset_*`), the key from memory, at
+        // `regs + imm`; checked to be one unless the receiver's shape says
+        // so (`_chk`, the kind in `imm64`).
+        Op::SetKeyed
+            if let Some(Prop::Typed { kind }) = spec.props.get(i).copied()
+                && matches!(st.acc, I32 | F64)
+                && typed_store(Some(kind), st.acc == I32).is_some() =>
+        {
+            let case = typed_store(Some(kind), st.acc == I32).unwrap();
+            let known = reg.shape().and_then(typed_kind) == Some(kind);
+            return Sel {
+                ops: Some((8 * insn.reg2 as i32, kind as u64, 0)),
+                ..Sel::new("tset", if known { case } else { typed_checked(case) }, out)
+            };
+        }
         // `o[k] = acc` (see `set_keyed` in the stencils): the key from
         // memory, at `regs + imm`; no checks of a receiver known to be an
         // array (`nc`); an int32 (`i`) or an object (`o`) checked against
@@ -3669,7 +3708,32 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     crate::object::Class::TypedArray | crate::object::Class::ArrayBuffer
                 )
             });
-            if bytes || prop == Prop::Runtime {
+            // A typed array's element, of the kind the cache saw: checked to
+            // be one unless the receiver's shape says so.
+            if let Prop::Typed { kind } = prop
+                && ix
+            {
+                use crate::object::TypedKind as K;
+                let known = reg.shape().and_then(typed_kind) == Some(kind);
+                let (w, ty) = match K::from_u8(kind) {
+                    K::I8 => ("i8", I32),
+                    K::U8 | K::U8Clamped => ("u8", I32),
+                    K::I16 => ("i16", I32),
+                    K::U16 => ("u16", I32),
+                    K::I32 => ("i32", I32),
+                    K::U32 => ("u32f", F64),
+                    K::F32 => ("f32", F64),
+                    K::F64 => ("f64", F64),
+                };
+                const CHECKED: [&str; 9] =
+                    ["i8_chk", "u8_chk", "u8_chk", "i16_chk", "u16_chk", "i32_chk", "u32f_chk", "f32_chk", "f64_chk"];
+                out.acc = ty;
+                return Sel {
+                    ops: Some((0, kind as u64, 0)),
+                    ..Sel::new("tget", if known { w } else { CHECKED[kind as usize] }, out)
+                };
+            }
+            if bytes || matches!(prop, Prop::Runtime | Prop::Typed { .. }) {
                 out.acc = Any;
                 return Sel::new("get_keyed_rt", "", out);
             }
@@ -3694,6 +3758,58 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         op => unreachable!("rejected by decode: {op:?}"),
     };
     Sel::new(base, case, out)
+}
+
+/// The element kind (`object::TypedKind`) of typed arrays of shape `s`,
+/// if they are: each kind has its own prototype.
+fn typed_kind(s: u64) -> Option<u8> {
+    unsafe {
+        let s = &*(s as *const Shape);
+        if s.class != crate::object::Class::TypedArray {
+            return None;
+        }
+        let vm = &*crate::interp::current_vm();
+        (vm.typed_prototypes.iter())
+            .position(|&p| crate::object::object_value(p) == s.proto)
+            .map(|k| k as u8)
+    }
+}
+
+/// The `tset_*` stencil's case storing an int32 (`int`) or a double into a
+/// typed array of kind `kind`, if there is one.
+fn typed_store(kind: Option<u8>, int: bool) -> Option<&'static str> {
+    use crate::object::TypedKind as K;
+    Some(match (K::from_u8(kind?), int) {
+        (K::I8 | K::U8, true) => "b8_i",
+        (K::I8 | K::U8, false) => "b8_f",
+        (K::U8Clamped, true) => "c8_i",
+        (K::U8Clamped, false) => return None,
+        (K::I16 | K::U16, true) => "b16_i",
+        (K::I16 | K::U16, false) => "b16_f",
+        (K::I32 | K::U32, true) => "b32_i",
+        (K::I32 | K::U32, false) => "b32_f",
+        (K::F32, true) => "f32_i",
+        (K::F32, false) => "f32_f",
+        (K::F64, true) => "f64_i",
+        (K::F64, false) => "f64_f",
+    })
+}
+
+/// The checking variant (`_chk`) of a `tset_*` case.
+fn typed_checked(case: &str) -> &'static str {
+    match case {
+        "b8_i" => "b8_i_chk",
+        "b8_f" => "b8_f_chk",
+        "c8_i" => "c8_i_chk",
+        "b16_i" => "b16_i_chk",
+        "b16_f" => "b16_f_chk",
+        "b32_i" => "b32_i_chk",
+        "b32_f" => "b32_f_chk",
+        "f32_i" => "f32_i_chk",
+        "f32_f" => "f32_f_chk",
+        "f64_i" => "f64_i_chk",
+        _ => "f64_f_chk",
+    }
 }
 
 /// Whether shape `s` extends shape `b`: same class, prototype and
@@ -4959,6 +5075,12 @@ fn stencil_for(
         ("get_keyed_rt", _) => {
             box_acc(&mut pre);
             cat!("get_keyed_rt_", loc)
+        }
+        ("tget", _) => cat!("tget_", sel.case, "_", loc),
+        ("tset", _) => {
+            let k = insn.reg2;
+            pre.extend(spill_piece(homes[k as usize], k));
+            cat!("tset_", sel.case, "_", loc)
         }
         ("set_keyed_rt", _) => {
             if sel.case.is_empty() {

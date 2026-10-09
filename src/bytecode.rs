@@ -185,8 +185,9 @@ define_ops! {
     /// `acc = r[a][acc]`. The inline cache remembers the receiver's shape
     /// (its elements' type) for the JIT.
     GetKeyed(Reg, AutoIc),
-    /// `r[a][r[b]] = acc`
-    SetKeyed(Reg, Reg),
+    /// `r[a][r[b]] = acc`. The inline cache remembers a typed array's
+    /// element kind for the JIT (see `Vm::set_keyed_miss`).
+    SetKeyed(Reg, Reg, AutoIc),
 
     // ---- Allocation ----
     /// `acc` = a new closure of nested function `f`.

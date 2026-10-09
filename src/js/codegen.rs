@@ -1362,11 +1362,13 @@ impl<'a> Gen<'a> {
                     let a = self.alloc(e.pos)?;
                     self.star(a);
                     let k = self.alloc(e.pos)?;
+                    // (One cache for the literal's stores.)
+                    let ic = self.auto_ic("[]keyed");
                     for (i, el) in elems.iter().enumerate() {
                         self.lda_smi(i as i32);
                         self.star(k);
                         self.value(el)?;
-                        self.emit(Op::SetKeyed, &[Arg::Reg(a), Arg::Reg(k)]);
+                        self.emit(Op::SetKeyed, &[Arg::Reg(a), Arg::Reg(k), ic]);
                     }
                     self.ldar(a);
                 }
@@ -1403,7 +1405,8 @@ impl<'a> Gen<'a> {
                                 }
                                 self.star(k);
                                 self.value(v)?;
-                                self.emit(Op::SetKeyed, &[Arg::Reg(o), Arg::Reg(k)]);
+                                let ic = self.auto_ic("[]keyed");
+                                self.emit(Op::SetKeyed, &[Arg::Reg(o), Arg::Reg(k), ic]);
                                 self.temp -= 1;
                             }
                             None => {
@@ -1718,7 +1721,8 @@ impl<'a> Gen<'a> {
                         self.apply(op, v, pos)?;
                     }
                 }
-                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk)]);
+                let ic = self.auto_ic("[]keyed");
+                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
                 Ok(())
             }
             _ => unreachable!("the parser checks assignment targets"),
@@ -1765,7 +1769,8 @@ impl<'a> Gen<'a> {
                 let ic = self.auto_ic("[]keyed");
                 self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
                 step(self);
-                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk)]);
+                let ic = self.auto_ic("[]keyed");
+                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
             }
             _ => unreachable!("the parser checks increment targets"),
         }

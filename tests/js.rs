@@ -2351,3 +2351,67 @@ fn crypto_paths_agree_with_node() {
 905147;370|371.25|372.5|373.75|365|366.25|367.5|368.75;112|114|115|116|117|109|110|111;367.5|368.75|370|371.25|372.5|373.75|365|366.25;370;305"#
     );
 }
+
+/// Typed arrays' elements in compiled code (`tget_*`, `tset_*`) and the
+/// interpreter's direct paths: every kind, ints and doubles stored, reads
+/// and writes out of bounds, NaN, clamping, kinds mixed at one site. The
+/// expected values are Node's.
+const TYPED: &str = r#"
+function typedArrays() {
+function Heap(n) {
+  this.buf = new ArrayBuffer(n * 8);
+  this.i8 = new Int8Array(n); this.u8 = new Uint8Array(n); this.c8 = new Uint8ClampedArray(n);
+  this.i16 = new Int16Array(n); this.u16 = new Uint16Array(n); this.i32 = new Int32Array(n);
+  this.u32 = new Uint32Array(n); this.f32 = new Float32Array(n); this.f64 = new Float64Array(n);
+}
+Heap.prototype.fill = function (n, k) {
+  for (var i = 0; i < n; i++) {
+    var v = (i * 2654435761 + k) | 0, d = v / 7;
+    this.i8[i] = v; this.u8[i] = v; this.c8[i] = v; this.i16[i] = v; this.u16[i] = v;
+    this.i32[i] = v; this.u32[i] = v; this.f32[i] = d; this.f64[i] = d;
+    if (i & 1) { this.i8[i] = d; this.i16[i] = d * 1000; this.i32[i] = d * 1e6; this.u32[i] = -d; this.f32[i] = v; this.f64[i] = v; }
+  }
+};
+Heap.prototype.sum = function (n) {
+  var s = 0, f = 0;
+  for (var i = 0; i < n; i++) {
+    s = (s + this.i8[i] + this.u8[i] + this.c8[i] + this.i16[i] + this.u16[i] + this.i32[i]) | 0;
+    f += this.u32[i] + this.f32[i] + this.f64[i];
+  }
+  return s + ":" + f;
+};
+function oob(a, n) { var s = 0, u = 0; for (var i = 0; i < n; i++) { var v = a[i]; if (v === undefined) u++; else s += v; a[i + 3] = i; } return s + "/" + u; }
+function mixed(arrs, n) { var s = 0; for (var i = 0; i < n; i++) { var a = arrs[i % arrs.length]; s += a[i & 7]; a[(i + 1) & 7] = i * 1.5; } return s; }
+var h = new Heap(64), out = [];
+for (var k = 0; k < 300; k++) { h.fill(64, k); var sm = h.sum(64); if (k % 50 == 0) out.push(sm); }
+var small = new Int32Array(10), r = "";
+for (var k2 = 0; k2 < 2000; k2++) r = oob(small, 12);
+out.push(r, small.join(","));
+var nanf = new Float64Array(4), nan8 = new Uint8Array(4), nanc = new Uint8ClampedArray(4);
+for (var k3 = 0; k3 < 3000; k3++) { var x = k3 % 3 ? 0 / 0 : 1e10 + k3; nanf[k3 & 3] = x; nan8[k3 & 3] = x; nanc[k3 & 3] = k3 % 2 ? 300 : -5; }
+out.push(nanf.join(","), nan8.join(","), nanc.join(","));
+var ms = 0;
+for (var k4 = 0; k4 < 300; k4++) ms = mixed([new Uint8Array(8), new Float32Array(8), new Int16Array(8), [1,2,3,4,5,6,7,8]], 64);
+out.push(ms);
+return out.join("\n");
+}
+"#;
+
+#[test]
+fn typed_array_elements_agree_with_node() {
+    assert_eq!(
+        value(&format!("{TYPED}\ntypedArrays();")),
+        r#"-1174860914:117237799293.35715
+-946382236:117237804373.07144
+-717706432:117237808880.78572
+-489031403:117237814869.5
+-260552215:117237819201.71428
+-32139072:117237824306.42857
+21/2
+0,0,0,0,1,2,3,4,5,6
+NaN,10000002997,NaN,NaN
+0,181,0,0
+0,255,0,255
+96"#
+    );
+}

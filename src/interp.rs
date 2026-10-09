@@ -2214,55 +2214,86 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     Value::number(to_number(a) + to_number(b))
 }
 
-/// `a + b` for two strings, or a string and an int32 (`"v" + i`): both
-/// copied straight into the new string, a word at a time. In Octane's
-/// DeltaBlue (2.65M a run) going through [`Piece`] cost about 290
-/// instructions each, a third of them calls to `memmove`.
+/// `a + b` for two strings, or a string and an int32 (`"v" + i`): the
+/// string copied straight into the new string, a word at a time, and the
+/// int32's digits written there. In Octane's DeltaBlue (2.65M a run) going
+/// through [`Piece`] cost about 290 instructions each, a third of them
+/// calls to `memmove`; reading the digits back a word at a time from where
+/// they were written a unit at a time stalled each copy (no store
+/// forwarding from narrower stores): 2% of DeltaBlue's cycles.
 #[inline(always)]
 fn concat_fast(a: Value, b: Value) -> Option<Value> {
-    // Digits end at unit 11; a word read from their start stays inside.
-    let mut digits = [0u64; 4];
-    let (x, y): ((*const u16, usize), (*const u16, usize)) =
-        match (string_units(a), string_units(b)) {
-            (Some(x), Some(y)) => ((x.as_ptr(), x.len()), (y.as_ptr(), y.len())),
-            (Some(x), None) if b.is_int32() => {
-                ((x.as_ptr(), x.len()), int_units(b.as_i32_unchecked(), &mut digits))
-            }
-            (None, Some(y)) if a.is_int32() => {
-                (int_units(a.as_i32_unchecked(), &mut digits), (y.as_ptr(), y.len()))
-            }
-            _ => return None,
-        };
-    let len = x.1 + y.1;
     let vm = unsafe { &mut *current_vm() };
     // A word more than the units need: the last word copied may run past
     // the end.
-    Some(vm.new_string_raw(len, len.div_ceil(4) + 1, |out| unsafe {
-        copy_words(out, x.0, x.1);
-        copy_words(out.add(x.1), y.0, y.1);
-    }))
+    let words = |len: usize| len.div_ceil(4) + 1;
+    match (string_units(a), string_units(b)) {
+        (Some(x), Some(y)) => {
+            let len = x.len() + y.len();
+            Some(vm.new_string_raw(len, words(len), |out| unsafe {
+                copy_words(out, x.as_ptr(), x.len());
+                copy_words(out.add(x.len()), y.as_ptr(), y.len());
+            }))
+        }
+        (Some(x), None) if b.is_int32() => {
+            let i = b.as_i32_unchecked();
+            let (n, len) = (int_len(i), x.len() + int_len(i));
+            // The copy may run into the digits' units: they come after.
+            Some(vm.new_string_raw(len, words(len), |out| unsafe {
+                copy_words(out, x.as_ptr(), x.len());
+                write_int(out.add(x.len()), i, n);
+            }))
+        }
+        (None, Some(y)) if a.is_int32() => {
+            let i = a.as_i32_unchecked();
+            let (n, len) = (int_len(i), int_len(i) + y.len());
+            Some(vm.new_string_raw(len, words(len), |out| unsafe {
+                write_int(out, i, n);
+                copy_words(out.add(n), y.as_ptr(), y.len());
+            }))
+        }
+        _ => None,
+    }
 }
 
-/// `i`'s decimal digits, written to end at unit 11 of `buf`: their start
-/// and count.
+/// The units of `i`'s decimal form: its digits, and a sign.
 #[inline(always)]
-fn int_units(i: i32, buf: &mut [u64; 4]) -> (*const u16, usize) {
-    let units = buf.as_mut_ptr().cast::<u16>();
+fn int_len(i: i32) -> usize {
+    let n = i.unsigned_abs();
+    let digits = match n {
+        0..10 => 1,
+        10..100 => 2,
+        100..1_000 => 3,
+        1_000..10_000 => 4,
+        10_000..100_000 => 5,
+        100_000..1_000_000 => 6,
+        1_000_000..10_000_000 => 7,
+        10_000_000..100_000_000 => 8,
+        100_000_000..1_000_000_000 => 9,
+        _ => 10,
+    };
+    digits + (i < 0) as usize
+}
+
+/// Write `i`'s decimal form, `len` units ([`int_len`]), to `to`.
+///
+/// # Safety
+/// `to` must have room for `len` units.
+#[inline(always)]
+unsafe fn write_int(to: *mut u16, i: i32, len: usize) {
     let mut n = i.unsigned_abs();
-    let mut at = 11;
+    let mut at = len;
     loop {
         at -= 1;
-        unsafe { *units.add(at) = b'0' as u16 + (n % 10) as u16 };
+        unsafe { *to.add(at) = b'0' as u16 + (n % 10) as u16 };
         n /= 10;
         if n == 0 {
             break;
         }
     }
     if i < 0 {
-        at -= 1;
-        unsafe { *units.add(at) = b'-' as u16 };
+        unsafe { *to = b'-' as u16 };
     }
-    (unsafe { units.add(at) }, 11 - at)
 }
 
 /// Copy `n` units from `from` to `to` four at a time, reading and writing

@@ -6992,6 +6992,8 @@ struct VmState {
     /// exit ([`COOL_ENTRIES`]), letting inline caches settle before the
     /// function is lowered again.
     cool: u32,
+    /// Coolings so far: each one is longer ([`cooling`]).
+    coolings: u32,
     /// Warm or hot, and for warm, what is left before hot (its heat):
     /// calls and loop back edges, counted down by warm code at its start
     /// and its loop headers (`tier_count`), at a stable address.
@@ -7213,6 +7215,21 @@ fn same_insns(a: &[Insn], b: &[Insn]) -> bool {
 /// cooling 101 ms, 50 entries 77, 100 entries 72; doubling it at each new
 /// lowering changed little.
 const COOL_ENTRIES: u32 = 100;
+/// Measured on 87-constraint-solver, whose phases change its types (compile
+/// ms; 0: 26.6, 2: 24.5, 4 and 6: 25.5).
+const MAX_COOL_SHIFT: u32 = 2;
+
+/// The call entries of a function's next cooling, given how many it has
+/// had (`coolings`, counted here): [`COOL_ENTRIES`], doubled at each
+/// cooling up to [`MAX_COOL_SHIFT`] times, so a function whose code keeps
+/// exiting is compiled again less often. Loop entries don't cool: a loop
+/// left to the interpreter costs more than compiling it (87 +27% with
+/// them cooling too).
+fn cooling(coolings: &mut u32) -> u32 {
+    let n = *coolings;
+    *coolings += 1;
+    COOL_ENTRIES << n.min(MAX_COOL_SHIFT)
+}
 
 /// How many times `callee` has been compiled (0 if it is being compiled
 /// now: its state is borrowed).
@@ -7356,6 +7373,14 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
         return Version::Busy;
     };
     let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, vm)));
+    // Cooling after an exit: binding waits (calls meanwhile go through the
+    // interpreter, which counts the cooling down).
+    if let Some(v) = &f.vm
+        && v.dirty
+        && v.cool > 0
+    {
+        return Version::Busy;
+    }
     let nparams = site.nparams as usize;
     let make_state = |live: &[bool], acc_live: bool| {
         let ty = |r: usize| match r {
@@ -10069,6 +10094,7 @@ impl JitFunction {
             bail_exits: HashMap::default(),
             no_entry: HashSet::default(),
             cool: 0,
+            coolings: 0,
             tier: if unsafe { (*vm).warm_tier } {
                 Tier::Warm
             } else {
@@ -10387,10 +10413,10 @@ impl JitFunction {
                 vm.no_entry.insert(pc);
             }
         } else if insn.guard != 0 || insn.native != 0 {
-            vm.cool = COOL_ENTRIES;
+            vm.cool = cooling(&mut vm.coolings);
             *vm.callee_exits.entry(origin).or_insert(0) += 1;
         } else if insn.is_property() {
-            vm.cool = COOL_ENTRIES;
+            vm.cool = cooling(&mut vm.coolings);
             *vm.property_exits.entry(origin).or_insert(0) += 1;
         } else if !insn.is_call() {
             vm.widened.insert(origin);

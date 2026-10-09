@@ -148,6 +148,8 @@ unsafe extern "C" {
     fn toi_rt_materialize();
     fn toi_rt_instance_of();
     fn toi_rt_in();
+    fn toi_rt_get_keyed();
+    fn toi_rt_set_keyed();
 }
 
 /// Call runtime function `$f` with two boxed arguments; returns the raw
@@ -3144,7 +3146,7 @@ macro_rules! array_length {
     ($loc:tt) => {
         stencil!("get_length_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !matches!(*(o.to_bits() as *const u8).add(8), 1 | 4) {
+            if !is_cell(s.tag, o) || !matches!(*(o.to_bits() as *const u8).add(8), 1 | 4 | 7) {
                 exit!(s)
             }
             s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());
@@ -3229,12 +3231,43 @@ macro_rules! property_location {
         // elements' type (`Shape::elems_code`, at offset 0) fits; else
         // leave before. `acc` boxed, or (`_i`) an int32, which fits codes
         // 0 to 2, or (`_o`) an object, which fits code 0 or its shape.
-        set_keyed!($loc, "", is_array, |s, v, code| match code {
-            0 => true,
-            1 => s.tag.is_int32(v),
-            2 => v.to_bits() & s.tag.to_bits() != 0,
-            sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
-        }, |s| s.acc);
+        // (A typed array goes through the runtime.)
+        stencil_slow!("set_keyed_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+            if !is_array(s.tag, o) {
+                if is_cell(s.tag, o) && *(o.to_bits() as *const u8).add(8) == 7 {
+                    slow!(s)
+                }
+                exit!(s)
+            }
+            if !s.tag.is_int32(key) {
+                exit!(s)
+            }
+            let p = o.to_bits() as *mut u8;
+            let i = int(key) as u32;
+            let v = s.acc;
+            let code = **(p as *const *const u64);
+            let fits = match code {
+                0 => true,
+                1 => s.tag.is_int32(v),
+                2 => v.to_bits() & s.tag.to_bits() != 0,
+                sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+            };
+            if i >= *(p.add(32) as *const u32) || !fits {
+                exit!(s)
+            }
+            *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
+            next!(s)
+        }; |s| {
+            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+            let args = [get!($loc, s), key, s.acc];
+            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
+            next!(s)
+        });
         set_keyed!($loc, "i_", is_array, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "o_", is_array, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
@@ -3335,11 +3368,23 @@ macro_rules! property_location {
         // `_i`: the key is known to be an int32. `_nc`: the receiver is
         // known to be an object; `_sh`: its shape must be `imm64` (the
         // elements' type comes with it).
-        // Not a string (class 4, at byte 8): its elements are code units.
+        // An object whose elements are values: not a string (class 4, at
+        // byte 8: code units), a buffer or a typed array (6 and 7: bytes).
         keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell(s.tag, o)
-            && *(o.to_bits() as *const u8).add(8) != 4);
+            && matches!(*(o.to_bits() as *const u8).add(8), 0..=3 | 5));
         keyed_load!($loc, "get_keyed_", false, |s, o| is_cell(s.tag, o)
-            && *(o.to_bits() as *const u8).add(8) != 4);
+            && matches!(*(o.to_bits() as *const u8).add(8), 0..=3 | 5));
+        // `acc = o[acc]` through the runtime (`acc` boxed): a typed array's
+        // element, or a site whose receivers the fast ones keep leaving
+        // for. Leaves only where it would throw or call a function.
+        stencil!("get_keyed_rt_", loc!($loc); |s| {
+            let r = rt_call!(s, toi_rt_get_keyed, get!($loc, s), s.acc);
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
         keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);
         keyed_load!($loc, "get_keyed_nc_", false, |s, o| true);
         keyed_load!($loc, "get_keyed_i_sh_", true, |s, o| guard_shape(s.tag, o).is_some());

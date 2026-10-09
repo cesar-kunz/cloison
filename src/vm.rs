@@ -30,6 +30,9 @@ impl Error {
     pub fn reference_error(m: impl fmt::Display) -> Error {
         Error(format!("ReferenceError: {m}"), None)
     }
+    pub fn new_syntax(m: impl fmt::Display) -> Error {
+        Error(format!("SyntaxError: {m}"), None)
+    }
     pub fn range_error(m: impl fmt::Display) -> Error {
         Error(format!("RangeError: {m}"), None)
     }
@@ -112,6 +115,10 @@ pub const VIA_CALL: i32 = 1;
 
 /// `Ic::loc` of a `GetNamed` that read an array's `length`.
 pub const LENGTH_LOC: i32 = i32::MIN;
+/// `Ic::loc` of a `GetKeyed` that read a typed array's, a buffer's or a
+/// string's elements (no shape: the interpreter's hit path never takes it;
+/// compiled code reads them through the runtime).
+pub const BYTES_LOC: i32 = i32::MIN + 1;
 const _: fn(u64, Value) -> bool = field_fits;
 
 /// The first `new` of `code` returned: shrink the capacity of its objects'
@@ -249,6 +256,10 @@ pub(crate) const MANY_SHAPES: *const Shape = std::ptr::dangling::<Shape>();
 pub(crate) const TIER_BACK_EDGES: i64 = 1000;
 pub(crate) const TIER_CALLS: i32 = 10;
 pub const MAX_INLINE_CAPACITY: u32 = 64;
+
+/// The global object's room for properties in itself (the builtins take
+/// about 70; Octane's emscripten benchmarks define thousands).
+const GLOBAL_CAPACITY: u32 = 1024;
 /// Stack size in values (frame headers included).
 const STACK_VALUES: usize = 1 << 18;
 
@@ -259,8 +270,9 @@ pub struct Vm {
     shapes: Vec<Box<Shape>>,
     field_cells: Vec<Box<FieldCell>>,
     roots: HashMap<(Class, u64, u32), *const Shape>,
-    atoms: Vec<String>,
-    atom_ids: HashMap<String, Atom>,
+    /// Each atom's name, once (the map's key shares it).
+    atoms: Vec<std::rc::Rc<str>>,
+    atom_ids: HashMap<std::rc::Rc<str>, Atom>,
     codes: Vec<Box<Code>>,
     pub global: *mut Object,
     pub object_prototype: *mut Object,
@@ -327,6 +339,19 @@ pub struct Vm {
     pub(crate) array_fn: *mut Object,
     date_prototype: *mut Object,
     pub(crate) number_prototype: *mut Object,
+    /// Each typed array kind's prototype (`TypedKind` order), and
+    /// `ArrayBuffer.prototype`.
+    pub(crate) typed_prototypes: Vec<*mut Object>,
+    pub(crate) regexp_prototype: *mut Object,
+    pub(crate) boolean_prototype: *mut Object,
+    /// Loaded scripts' `var` and function names (see `Module::declared`).
+    declared: std::collections::HashSet<Atom>,
+    /// `Function.prototype.bind`'s JS helper, once made.
+    pub(crate) bind_helper: Value,
+    /// Compiled regular expressions, by pattern and flags (a literal makes
+    /// a new object each time it runs, sharing one).
+    pub(crate) regexps: HashMap<(String, String), Box<crate::regexp::Regex>>,
+    pub(crate) array_buffer_prototype: *mut Object,
     /// `Error.prototype` and its kinds' (see `builtins::ERROR_KINDS`).
     pub(crate) error_prototypes: Vec<*mut Object>,
     /// Strings of one code unit below 256, made on first use.
@@ -406,6 +431,13 @@ impl Vm {
             date_prototype: std::ptr::null_mut(),
             number_prototype: std::ptr::null_mut(),
             error_prototypes: Vec::new(),
+            typed_prototypes: Vec::new(),
+            regexp_prototype: std::ptr::null_mut(),
+            boolean_prototype: std::ptr::null_mut(),
+            bind_helper: Value::UNDEFINED,
+            declared: Default::default(),
+            regexps: HashMap::default(),
+            array_buffer_prototype: std::ptr::null_mut(),
             single_chars: Vec::new(),
             a_to_string: Atom(0),
             a_value_of: Atom(0),
@@ -430,8 +462,10 @@ impl Vm {
         vm.string_prototype = vm.new_object(op);
         vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
         // Room for the builtins and the script's globals in the object
-        // itself: out-of-line globals cost compiled code a load each.
-        vm.global = vm.new_object_with(Class::Plain, op, MAX_INLINE_CAPACITY);
+        // itself: out-of-line globals cost compiled code a load each, and
+        // aren't folded as constants. (64 slots, the builtins took them
+        // all: DeltaBlue +20% instructions.)
+        vm.global = vm.new_object_with(Class::Plain, op, GLOBAL_CAPACITY);
 
         let fp = object_value(vm.function_prototype);
         let root = vm.root_shape(Class::Function, fp, 2);
@@ -573,8 +607,9 @@ impl Vm {
             return a;
         }
         let a = Atom(self.atoms.len() as u32);
-        self.atoms.push(s.to_string());
-        self.atom_ids.insert(s.to_string(), a);
+        let name: std::rc::Rc<str> = s.into();
+        self.atoms.push(name.clone());
+        self.atom_ids.insert(name, a);
         a
     }
 
@@ -612,7 +647,9 @@ impl Vm {
             attrs: Vec::new(),
             fields: Vec::new(),
             elems: FieldType::None,
-            elems_code: if class == Class::Array {
+            // (No value fits a typed array's or buffer's bytes, so stores'
+            // fast paths never take them.)
+            elems_code: if matches!(class, Class::Array | Class::TypedArray | Class::ArrayBuffer) {
                 NO_ELEMENTS
             } else {
                 0
@@ -741,7 +778,7 @@ impl Vm {
 
     // ---- Objects ----
 
-    fn new_object_with(&mut self, class: Class, proto: Value, capacity: u32) -> *mut Object {
+    pub(crate) fn new_object_with(&mut self, class: Class, proto: Value, capacity: u32) -> *mut Object {
         let s = self.root_shape(class, proto, capacity);
         self.heap.alloc_object(unsafe { &*s })
     }
@@ -951,7 +988,9 @@ impl Vm {
         }
         let o = as_object(obj);
         unsafe {
-            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
+            if name == self.a_length
+                && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
+            {
                 return Ok(Value::from_i32((*o).elems_len as i32));
             }
             Ok(match self.lookup(o, name) {
@@ -1031,10 +1070,10 @@ impl Vm {
                 self.atom_name(name)
             )));
         }
-        // A number's properties are `Number.prototype`'s (no Boolean
-        // prototype yet).
-        if obj.is_number() {
-            let o = self.number_prototype;
+        // A number's properties are `Number.prototype`'s, a boolean's
+        // `Boolean.prototype`'s.
+        if obj.is_number() || obj.is_bool() {
+            let o = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
             return Ok(match self.lookup(o, name) {
                 Some((h, slot)) => unsafe { *Object::slot(h, (*(*h).shape).location(slot)) },
                 None => Value::UNDEFINED,
@@ -1091,7 +1130,9 @@ impl Vm {
         }
         let o = as_object(obj);
         unsafe {
-            if name == self.a_length && matches!((*o).class, Class::Array | Class::String) {
+            if name == self.a_length
+                && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
+            {
                 // Recorded for the JIT (`jit::Prop::Length`); no shape, so
                 // the interpreter's hit path never takes it.
                 *ic = Ic {
@@ -1256,6 +1297,11 @@ impl Vm {
         let (_, name) = code.ic(ic);
         let g = self.global;
         if self.lookup(g, name).is_none() {
+            // A script's `var` not assigned yet (`toi` makes the global on
+            // its first store, keeping its field's type): `undefined`.
+            if self.declared.contains(&name) {
+                return Ok(Value::UNDEFINED);
+            }
             return Err(Error::reference_error(format!(
                 "{} is not defined",
                 self.atom_name(name)
@@ -1358,6 +1404,18 @@ impl Vm {
         }
     }
 
+    /// Whether `o` has element `i` of its own: within the length, and not
+    /// a hole (strings and typed arrays have none; buffers no elements).
+    pub(crate) fn has_element(o: *mut Object, i: u32) -> bool {
+        unsafe {
+            match (*o).class {
+                Class::ArrayBuffer => false,
+                Class::String | Class::TypedArray => i < (*o).elems_len,
+                _ => i < (*o).elems_len && *(*o).elems.add(i as usize) != Value::EMPTY,
+            }
+        }
+    }
+
     /// `key in obj`: whether `obj` or its prototypes have the property or
     /// element `key`.
     pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
@@ -1374,10 +1432,7 @@ impl Vm {
                 || (a == self.a_length && unsafe { (*o).class } == Class::Array)),
             Key::Index(i) => loop {
                 unsafe {
-                    if i < (*o).elems_len
-                        && (*o).class != Class::String
-                        && *(*o).elems.add(i as usize) != Value::EMPTY
-                    {
+                    if (*o).class != Class::String && Self::has_element(o, i) {
                         return Ok(true);
                     }
                     let proto = (*(*o).shape).proto;
@@ -1406,8 +1461,10 @@ impl Vm {
         let o = as_object(obj);
         match self.property_key(key) {
             Key::Index(i) => unsafe {
-                if (*o).class == Class::String {
-                    return Ok(i >= (*o).elems_len);
+                match (*o).class {
+                    Class::String | Class::TypedArray => return Ok(i >= (*o).elems_len),
+                    Class::ArrayBuffer => return Ok(true),
+                    _ => {}
                 }
                 if i < (*o).elems_len {
                     *(*o).elems.add(i as usize) = Value::EMPTY;
@@ -1517,8 +1574,24 @@ impl Vm {
         obj: Value,
         key: Value,
     ) -> Result<Value> {
-        // A string's elements are code units, not values: never cached.
-        if obj.is_cell() && unsafe { (*as_object(obj)).class } != Class::String {
+        // A string's elements are code units, not values, and a typed
+        // array's or buffer's bytes: recorded as such (`BYTES_LOC`).
+        if obj.is_cell()
+            && matches!(
+                unsafe { (*as_object(obj)).class },
+                Class::String | Class::TypedArray | Class::ArrayBuffer
+            )
+        {
+            let (ic, _) = code.ic(ic);
+            unsafe {
+                if (*ic).shape.is_null() {
+                    *ic = Ic {
+                        loc: BYTES_LOC,
+                        ..Ic::EMPTY
+                    };
+                }
+            }
+        } else if obj.is_cell() {
             let (ic, _) = code.ic(ic);
             unsafe {
                 install(
@@ -1548,6 +1621,22 @@ impl Vm {
             Key::Name(a) => return self.get(obj, a),
         };
         let mut o = as_object(obj);
+        // A typed array's elements are all there is at an index (no holes,
+        // nothing inherited); a buffer has none.
+        unsafe {
+            match (*o).class {
+                Class::TypedArray => {
+                    return Ok(if i < (*o).elems_len {
+                        let kind = crate::object::TypedKind::from_u8((*o).kind);
+                        kind.load((*o).elems.cast(), i as usize)
+                    } else {
+                        Value::UNDEFINED
+                    });
+                }
+                Class::ArrayBuffer => return Ok(Value::UNDEFINED),
+                _ => {}
+            }
+        }
         // A string's index is its code unit there, as a string.
         if let Some(u) = string_units(obj) {
             if (i as usize) < u.len() {
@@ -1589,9 +1678,19 @@ impl Vm {
         };
         let o = as_object(obj);
         unsafe {
-            // A string's characters can't be changed.
-            if (*o).class == Class::String {
-                return Ok(());
+            // A string's characters can't be changed; a typed array stores
+            // within its length only (a buffer has no elements).
+            match (*o).class {
+                Class::String | Class::ArrayBuffer => return Ok(()),
+                Class::TypedArray => {
+                    if i < (*o).elems_len {
+                        let kind = crate::object::TypedKind::from_u8((*o).kind);
+                        let d = crate::interp::to_number(value);
+                        kind.store((*o).elems.cast(), i as usize, d);
+                    }
+                    return Ok(());
+                }
+                _ => {}
             }
             if i >= (*o).elems_len {
                 self.reserve_elems(o, i as usize + 1);
@@ -1605,7 +1704,6 @@ impl Vm {
         Ok(())
     }
 
-    /// Make room for `n` elements.
     /// `a.length = value`: truncated (the elements past it removed) or
     /// grown with holes.
     fn set_array_length(&mut self, o: *mut Object, value: Value) -> Result<()> {
@@ -1627,6 +1725,7 @@ impl Vm {
         Ok(())
     }
 
+    /// Make room for `n` elements.
     fn reserve_elems(&mut self, o: *mut Object, n: usize) {
         unsafe {
             if n <= (*o).elems_cap as usize {
@@ -1671,7 +1770,7 @@ impl Vm {
                 {
                     let n = (*o).elems_len as usize;
                     for i in 0..n {
-                        let hole = (*o).class != Class::String && *(*o).elems.add(i) == Value::EMPTY;
+                        let hole = !Self::has_element(o, i as u32);
                         if !hole {
                             names.push(i.to_string().encode_utf16().collect());
                         }
@@ -1901,6 +2000,36 @@ impl Vm {
         ret: crate::jit::Ty,
         constructs: bool,
     ) -> *mut Object {
+        let fo = self.native_function(name, f, nparams, ret, constructs);
+        let a = self.intern(name);
+        // Builtins' methods aren't enumerable.
+        self.add_property_with(obj, a, object_value(fo), DONT_ENUM);
+        fo
+    }
+
+    /// Define natives `fs` (name, function, parameters) on `obj`, not
+    /// enumerable, their results of any type: one shape for them all (see
+    /// [`Vm::add_properties`]).
+    pub(crate) fn define_natives(&mut self, obj: *mut Object, fs: &[(&str, NativeFn, u32)]) {
+        let mut names = Vec::with_capacity(fs.len());
+        let mut values = Vec::with_capacity(fs.len());
+        for &(name, f, n) in fs {
+            let fo = self.native_function(name, f, n, crate::jit::Ty::Any, false);
+            names.push(self.intern(name));
+            values.push(object_value(fo));
+        }
+        self.add_properties(obj, &names, &values, DONT_ENUM);
+    }
+
+    /// A native function object.
+    fn native_function(
+        &mut self,
+        name: &str,
+        f: NativeFn,
+        nparams: u32,
+        ret: crate::jit::Ty,
+        constructs: bool,
+    ) -> *mut Object {
         let code = self.add_code(Code {
             name: name.to_string(),
             bytecode: Vec::new(),
@@ -1927,10 +2056,68 @@ impl Vm {
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
         unsafe { (*fo).code = code };
-        let a = self.intern(name);
-        // Builtins' methods aren't enumerable.
-        self.add_property_with(obj, a, object_value(fo), DONT_ENUM);
         fo
+    }
+
+    /// Add properties `names` (none of which `o` has) with `values` and
+    /// attributes `attrs`, as `add_property_with` would one by one, but
+    /// through one new shape (no transition leads to it; startup made one
+    /// shape per builtin, and copied its keys each time).
+    pub(crate) fn add_properties(&mut self, o: *mut Object, names: &[Atom], values: &[Value], attrs: u8) {
+        unsafe {
+            let s = &*(*o).shape;
+            let n = s.keys.len() + names.len();
+            let mut keys = Vec::with_capacity(n);
+            keys.extend_from_slice(&s.keys);
+            keys.extend_from_slice(names);
+            let mut slot_attrs = Vec::with_capacity(n);
+            slot_attrs.extend_from_slice(&s.attrs);
+            slot_attrs.resize(n, attrs);
+            let mut fields = Vec::with_capacity(n);
+            fields.extend_from_slice(&s.fields);
+            for _ in names {
+                let cell = Box::new(FieldCell::new());
+                fields.push(&*cell as *const FieldCell);
+                self.field_cells.push(cell);
+            }
+            self.shape_left_stable(s);
+            let new = self.add_shape(Shape {
+                class: s.class,
+                proto: s.proto,
+                capacity: Cell::new(s.capacity.get()),
+                keys,
+                attrs: slot_attrs,
+                fields,
+                elems: s.elems,
+                elems_code: s.elems_code,
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: s.unique,
+                transitions: RefCell::default(),
+                elem_transitions: RefCell::default(),
+                relied: Cell::new(false),
+            });
+            // Out-of-line room for the slots past the object's capacity.
+            let cap = (*new).capacity.get() as usize;
+            if n > cap && n - cap > (*o).props_cap as usize {
+                let want = (n - cap).max((*o).props_cap as usize * 2).max(4);
+                let p = self.heap.alloc_values(want);
+                if !(*o).props.is_null() {
+                    std::ptr::copy_nonoverlapping((*o).props, p, (*o).props_cap as usize);
+                }
+                (*o).props = p;
+                (*o).props_cap = want as u32;
+            }
+            (*o).shape = new;
+            let first = n - names.len();
+            for (k, &v) in values.iter().enumerate() {
+                self.store_field(o, (first + k) as u32, v);
+            }
+            if (*o).flags & PROTOTYPE != 0 {
+                self.proto_epoch = self.proto_epoch.wrapping_add(1);
+                self.code_epoch = self.code_epoch.wrapping_add(1);
+            }
+        }
     }
 
     /// The receiver for `new f`: a new object whose prototype is
@@ -2028,6 +2215,10 @@ impl Vm {
 
     /// Load `module`'s functions; returns its top-level code.
     pub fn load(&mut self, module: &Module) -> *const Code {
+        for n in &module.declared {
+            let a = self.intern(n);
+            self.declared.insert(a);
+        }
         let recursive = recursive_functions(module);
         let codes: Vec<*const Code> = module
             .functions

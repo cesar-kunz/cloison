@@ -134,6 +134,9 @@ pub struct Module {
     pub functions: Vec<FunctionDef>,
     /// Index of the top-level code in `functions`.
     pub script: usize,
+    /// The script's `var` and function names: globals that exist (as
+    /// `undefined`) before it assigns them (see `Vm::get_global_miss`).
+    pub declared: Vec<String>,
 }
 
 /// Assemble a module from its text form.
@@ -343,7 +346,11 @@ pub fn parse(src: &str) -> Result<Module, String> {
             captures: false,
         });
     }
-    Ok(Module { functions, script })
+    Ok(Module {
+        functions,
+        script,
+        declared: Vec::new(),
+    })
 }
 
 /// The text form of a module, which [`parse`] reads back into the same

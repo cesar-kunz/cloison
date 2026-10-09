@@ -24,19 +24,52 @@ use crate::asm::{Constant, FunctionDef, Module};
 use crate::bytecode::{Arg, Assembler, Label, Op};
 
 pub fn generate(p: &Program) -> Result<Module, Error> {
-    let decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
-    let scopes = upvalues(p, &decls);
+    let mut decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
+    // A function with more variables than registers keeps the last ones
+    // in a scope object (`%env`, a register; see `Gen::function`).
+    let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
+    for i in 1..p.functions.len() {
+        if decls[i].len() > LOCAL_REGS {
+            let f = &p.functions[i];
+            let params = f.params.len();
+            let implicit: Vec<&str> = decls[i][params..]
+                .iter()
+                .copied()
+                .filter(|&n| n == "arguments" || (f.binds_name && f.name.as_deref() == Some(n)))
+                .collect();
+            let mut d: Vec<&str> = decls[i][..params].to_vec();
+            d.push(ENV);
+            d.extend(implicit.iter().copied());
+            d.extend(decls[i][params..].iter().copied().filter(|n| !implicit.contains(n)));
+            overflow[i] = d.split_off(LOCAL_REGS);
+            d.extend(overflow[i].iter().copied());
+            decls[i] = d;
+        }
+    }
+    let scopes = upvalues(p, &decls, &overflow);
     let mut functions = Vec::with_capacity(p.functions.len());
     for i in 0..p.functions.len() {
-        functions.push(Gen::new(p, &decls, &scopes, i).function()?);
+        functions.push(Gen::new(p, &decls, &overflow[i], &scopes, i).function()?);
     }
     Ok(Module {
         functions,
         script: 0,
+        declared: explicit_declarations(p, 0).iter().map(|s| s.to_string()).collect(),
     })
 }
 
 type R<T> = Result<T, Error>;
+
+/// A function's parameters and variables in registers, at most; the rest
+/// go in a scope object (see [`generate`]), leaving room for temporaries.
+const LOCAL_REGS: usize = 160;
+
+/// Inline-cache slots past which instructions share them (see `Gen::ic`):
+/// below 2^16, with room for the shared ones.
+const SHARED_ICS: usize = 60000;
+
+/// The name of the register holding a function's scope object.
+const ENV: &str = "%env";
 
 fn unsupported<T>(pos: Pos, what: impl std::fmt::Display) -> R<T> {
     Err(Error::new(pos as usize, format!("unsupported: {what}")))
@@ -52,11 +85,27 @@ struct Scopes<'a> {
     captured: Vec<Vec<&'a str>>,
 }
 
-fn upvalues<'a>(p: &'a Program, decls: &[Vec<&'a str>]) -> Scopes<'a> {
+fn upvalues<'a>(p: &'a Program, decls: &[Vec<&'a str>], overflow: &[Vec<&'a str>]) -> Scopes<'a> {
     let n = p.functions.len();
     let (mut upvalues, mut captured) = (vec![Vec::new(); n], vec![Vec::new(); n]);
     for i in 1..n {
         for name in references(&p.functions[i]) {
+            // An enclosing function's variable in its scope object: the
+            // object's register is what is captured.
+            let mut name = name;
+            let mut j = p.functions[i].parent;
+            while let Some(k) = j.filter(|&k| k != 0) {
+                if decls[i].contains(&name) {
+                    break;
+                }
+                if decls[k].contains(&name) {
+                    if overflow[k].contains(&name) {
+                        name = ENV;
+                    }
+                    break;
+                }
+                j = p.functions[k].parent;
+            }
             if decls[i].contains(&name) {
                 continue;
             }
@@ -93,7 +142,7 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
     use ExprKind::*;
     match &e.kind {
         Ident(n) => out.push(n),
-        Num(_) | Str(_) | Bool(_) | Null | This | Function(_) | Accessor(..) => {}
+        Num(_) | Str(_) | Bool(_) | Null | This | Function(_) | Accessor(..) | RegExp(..) => {}
         Array(es) => es.iter().for_each(|e| expr_refs(e, out)),
         Object(ps) => ps.iter().for_each(|(_, e)| expr_refs(e, out)),
         Member(o, _) | Unary(_, o) | Update(o, ..) => expr_refs(o, out),
@@ -173,6 +222,23 @@ fn references(f: &Function) -> Vec<&str> {
 /// Every name a function declares: parameters, `var`s and function
 /// declarations, in order of declaration.
 fn declarations(p: &Program, f: usize) -> Vec<&str> {
+    let mut out = explicit_declarations(p, f);
+    // `arguments`: a variable `CreateArguments` sets.
+    if arguments_object(p, f) && !out.contains(&"arguments") {
+        out.push("arguments");
+    }
+    // A named function expression's own name, if used: a variable set to
+    // the function (`LdaCallee`).
+    if let Some(n) = own_name(p, f)
+        && !out.contains(&n)
+    {
+        out.push(n);
+    }
+    out
+}
+
+/// The parameters and the variables and functions a function declares.
+fn explicit_declarations(p: &Program, f: usize) -> Vec<&str> {
     fn stmt<'a>(s: &'a Stmt, p: &'a Program, out: &mut Vec<&'a str>) {
         let add = |n: &'a str, out: &mut Vec<&'a str>| {
             if !out.contains(&n) {
@@ -212,22 +278,10 @@ fn declarations(p: &Program, f: usize) -> Vec<&str> {
             _ => {}
         }
     }
-    let i = f;
     let f = &p.functions[f];
     let mut out: Vec<&str> = f.params.iter().map(String::as_str).collect();
     for s in &f.body {
         stmt(s, p, &mut out);
-    }
-    // `arguments`: a variable `CreateArguments` sets.
-    if arguments_object(p, i) && !out.contains(&"arguments") {
-        out.push("arguments");
-    }
-    // A named function expression's own name, if used: a variable set to
-    // the function (`LdaCallee`).
-    if let Some(n) = own_name(p, i)
-        && !out.contains(&n)
-    {
-        out.push(n);
     }
     out
 }
@@ -318,7 +372,9 @@ fn assigns(e: &Expr, name: &str) -> bool {
             matches!(&t.kind, Ident(n) if n == name) || assigns(t, name) || assigns(v, name)
         }
         Update(t, ..) => matches!(&t.kind, Ident(n) if n == name) || assigns(t, name),
-        Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) => false,
+        Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) | RegExp(..) => {
+            false
+        }
         Array(es) => es.iter().any(|e| assigns(e, name)),
         Object(ps) => ps.iter().any(|(_, e)| assigns(e, name)),
         Member(o, _) => assigns(o, name),
@@ -375,6 +431,11 @@ fn returns(s: &Stmt) -> bool {
 /// Where a name refers to.
 enum Var {
     Reg(u8),
+    /// A property of the scope object in this register.
+    Scope(u8),
+    /// A property of an enclosing function's scope object, that object
+    /// this function's upvalue.
+    ScopeUpvalue(u8),
     /// An enclosing function's variable: upvalue `k` of this one's.
     Upvalue(u8),
     Global,
@@ -470,6 +531,10 @@ struct Gen<'a> {
     constants: Vec<Constant>,
     nregs: usize,
     locals: HashMap<&'a str, u8>,
+    /// Shared inline-cache slots (see [`Gen::ic`]), by kind and name.
+    shared_ics: HashMap<String, u16>,
+    /// Variables in the scope object (see [`generate`]).
+    overflow: &'a [&'a str],
     /// The next free temporary.
     temp: usize,
     acc: Acc,
@@ -504,6 +569,7 @@ impl<'a> Gen<'a> {
     fn new(
         p: &'a Program,
         decls: &'a [Vec<&'a str>],
+        overflow: &'a [&'a str],
         scopes: &'a Scopes<'a>,
         index: usize,
     ) -> Self {
@@ -512,7 +578,7 @@ impl<'a> Gen<'a> {
         let locals: HashMap<&str, u8> = if index == 0 {
             HashMap::new()
         } else {
-            decls[index]
+            decls[index][..decls[index].len() - overflow.len()]
                 .iter()
                 .enumerate()
                 .map(|(i, &n)| (n, i as u8 + 1))
@@ -532,6 +598,8 @@ impl<'a> Gen<'a> {
             constants: Vec::new(),
             nregs: 1 + f.params.len(),
             locals,
+            overflow,
+            shared_ics: HashMap::new(),
             temp,
             acc: Acc::default(),
             reachable: true,
@@ -545,8 +613,21 @@ impl<'a> Gen<'a> {
     }
 
     fn function(mut self) -> R<FunctionDef> {
-        if self.locals.len() + 1 > 255 {
-            return unsupported(self.f.pos, "more than 254 parameters and variables");
+        if self.f.params.len() + 1 > LOCAL_REGS {
+            return unsupported(self.f.pos, "more parameters than registers");
+        }
+        // The scope object, with each of its variables (`undefined`, in
+        // order: one shape).
+        if !self.overflow.is_empty() {
+            let env = self.locals[ENV];
+            let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
+            let ic = self.auto_ic(&format!("[]{}", cap));
+            self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
+            self.star(env);
+            self.emit(Op::LdaUndefined, &[]);
+            for &n in self.overflow {
+                self.named(Op::SetNamed, env, n);
+            }
         }
         if arguments_object(self.p, self.index) {
             let r = self.locals["arguments"];
@@ -555,7 +636,8 @@ impl<'a> Gen<'a> {
         // (Not if a parameter or variable of the function has the name.)
         if let Some(n) = own_name(self.p, self.index)
             && !self.f.params.iter().any(|p| p == n)
-            && self.locals.get(n).is_some_and(|&r| r as usize == self.decls[self.index].len())
+            && !explicit_declarations(self.p, self.index).contains(&n)
+            && self.locals.contains_key(n)
         {
             self.emit(Op::LdaCallee, &[]);
             self.star(self.locals[n]);
@@ -818,23 +900,33 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn ic(&mut self, name: &str) -> Arg {
+    /// An inline-cache slot for property `name`: one per instruction, but
+    /// past [`SHARED_ICS`] slots (2-byte operands) instructions of the same
+    /// `kind` (opcode, and what else their caches depend on) share one.
+    fn ic(&mut self, kind: &str, name: &str) -> Arg {
+        if self.ics.len() >= SHARED_ICS {
+            let key = format!("{kind}\0{name}");
+            if let Some(&k) = self.shared_ics.get(&key) {
+                return Arg::Index(k);
+            }
+            self.shared_ics.insert(key, self.ics.len() as u16);
+        }
         self.ics.push(name.to_string());
         Arg::Index(self.ics.len() as u16 - 1)
     }
 
-    /// A slot for an instruction with an implicit inline cache.
-    fn auto_ic(&mut self) -> Arg {
-        self.ic("[]")
+    /// A slot for an instruction with an implicit inline cache, of `kind`.
+    fn auto_ic(&mut self, kind: &str) -> Arg {
+        self.ic(kind, "[]")
     }
 
     fn global(&mut self, op: Op, name: &str) {
-        let ic = self.ic(name);
+        let ic = self.ic(op.name(), name);
         self.emit(op, &[ic]);
     }
 
     fn named(&mut self, op: Op, obj: u8, name: &str) {
-        let ic = self.ic(name);
+        let ic = self.ic(op.name(), name);
         self.emit(op, &[Arg::Reg(obj), ic]);
     }
 
@@ -1095,6 +1187,24 @@ impl<'a> Gen<'a> {
         if let Some(&r) = self.locals.get(name) {
             return Ok(Var::Reg(r));
         }
+        if self.overflow.contains(&name) {
+            return Ok(Var::Scope(self.locals[ENV]));
+        }
+        // An enclosing function's variable in its scope object, through
+        // that object's register (an upvalue).
+        let mut f = self.f.parent;
+        while let Some(k) = f.filter(|&k| k != 0) {
+            if let Some(at) = self.decls[k].iter().position(|&n| n == name) {
+                // (Past the registers: see `generate`.)
+                if at >= LOCAL_REGS
+                    && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == ENV)
+                {
+                    return Ok(Var::ScopeUpvalue(u as u8));
+                }
+                break;
+            }
+            f = self.p.functions[k].parent;
+        }
         if let Some(k) = self.scopes.upvalues[self.index]
             .iter()
             .position(|&n| n == name)
@@ -1143,6 +1253,19 @@ impl<'a> Gen<'a> {
             Var::Reg(r) => self.star(r),
             Var::Upvalue(k) => {
                 self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
+            }
+            Var::Scope(env) => self.named(Op::SetNamed, env, name),
+            Var::ScopeUpvalue(k) => {
+                // (`acc` stays the value.)
+                let mark = self.temp;
+                let v = self.alloc(pos)?;
+                self.star(v);
+                let env = self.alloc(pos)?;
+                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.star(env);
+                self.ldar(v);
+                self.named(Op::SetNamed, env, name);
+                self.temp = mark;
             }
             Var::Global | Var::Undefined => self.global(Op::StaGlobal, name),
         }
@@ -1221,6 +1344,15 @@ impl<'a> Gen<'a> {
                 Var::Upvalue(k) => {
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                 }
+                Var::Scope(env) => self.named(Op::GetNamed, env, n),
+                Var::ScopeUpvalue(k) => {
+                    let mark = self.temp;
+                    let env = self.alloc(e.pos)?;
+                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                    self.star(env);
+                    self.named(Op::GetNamed, env, n);
+                    self.temp = mark;
+                }
                 Var::Undefined => self.emit(Op::LdaUndefined, &[]),
                 Var::Global => self.global(Op::LdaGlobal, n),
             },
@@ -1255,7 +1387,7 @@ impl<'a> Gen<'a> {
                 };
                 let named = props.iter().filter(|(k, _)| index(k).is_none()).count();
                 let cap = named.min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
-                let ic = self.auto_ic();
+                let ic = self.auto_ic(&format!("[]{}", cap));
                 self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
                 if !props.is_empty() {
                     let mark = self.temp;
@@ -1296,6 +1428,11 @@ impl<'a> Gen<'a> {
             }
             Function(i) => self.closure(*i),
             Accessor(..) => unreachable!("the parser makes them object literal values only"),
+            RegExp(p, f) => {
+                let p = self.const_index(Constant::String(p.clone()));
+                let f = self.const_index(Constant::String(f.clone()));
+                self.emit(Op::CreateRegExp, &[Arg::Index(p), Arg::Index(f)]);
+            }
             Member(o, name) => {
                 let r = self.reg(o, &[])?;
                 self.named(Op::GetNamed, r, name);
@@ -1303,7 +1440,7 @@ impl<'a> Gen<'a> {
             Index(o, k) => {
                 let r = self.reg(o, &[k])?;
                 self.value(k)?;
-                let ic = self.auto_ic();
+                let ic = self.auto_ic("[]keyed");
                 self.emit(Op::GetKeyed, &[Arg::Reg(r), ic]);
             }
             Call(f, args) => self.call(f, args, false, e.pos)?,
@@ -1576,7 +1713,7 @@ impl<'a> Gen<'a> {
                     None => self.value(v)?,
                     Some(op) => {
                         self.ldar(rk);
-                        let ic = self.auto_ic();
+                        let ic = self.auto_ic("[]keyed");
                         self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
                         self.apply(op, v, pos)?;
                     }
@@ -1625,7 +1762,7 @@ impl<'a> Gen<'a> {
                 let ro = self.reg(o, &[k])?;
                 let rk = self.reg(k, &[])?;
                 self.ldar(rk);
-                let ic = self.auto_ic();
+                let ic = self.auto_ic("[]keyed");
                 self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
                 step(self);
                 self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk)]);
@@ -1668,7 +1805,7 @@ impl<'a> Gen<'a> {
                 Ok(name) => self.named(Op::GetNamed, ro, name),
                 Err(k) => {
                     self.value(k)?;
-                    let ic = self.auto_ic();
+                    let ic = self.auto_ic("[]keyed");
                     self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
                 }
             }
@@ -1701,7 +1838,7 @@ impl<'a> Gen<'a> {
             (false, true) => Op::Call,
             (false, false) => Op::CallUndefined,
         };
-        let ic = self.auto_ic();
+        let ic = self.auto_ic(op.name());
         self.emit(op, &[Arg::Reg(c), Arg::Reg(w), Arg::Count(n), ic]);
         Ok(())
     }
@@ -2061,7 +2198,7 @@ impl<'a> Gen<'a> {
         self.jump(test);
         self.bind(top);
         self.ldar(i);
-        let ic = self.auto_ic();
+        let ic = self.auto_ic("[]keyed");
         self.emit(Op::GetKeyed, &[Arg::Reg(keys), ic]);
         self.store_var(name, pos)?;
         self.targets.push(Target {

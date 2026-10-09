@@ -1,7 +1,9 @@
 //! The lexer: the whole source into tokens, up front.
 //!
-//! The subset has no regular expression or template literals, so `/` is
-//! always division and the lexer needs no feedback from the parser.
+//! A `/` starts a regular expression literal where an expression can
+//! start: not after a token that ends one (a name, a literal, `)`, `]`,
+//! `}`, `this`, …). That's the usual rule without the parser's feedback;
+//! it misreads only a regular expression right after a block's `}`.
 
 use super::Error;
 
@@ -14,6 +16,8 @@ pub enum Tok {
     Str(String),
     /// An operator or punctuator.
     Punct(&'static str),
+    /// A regular expression literal: its pattern and flags.
+    RegExp(String, String),
     Eof,
 }
 
@@ -119,6 +123,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 Tok::Str(s)
             } else if c == b'`' {
                 return Err(err("template literals are not supported"));
+            } else if c == b'/' && !toks.last().is_some_and(|t: &Token| ends_expression(&t.tok)) {
+                let (pattern, flags, n) = regexp(&src[i..]).ok_or_else(|| err("unterminated regular expression"))?;
+                i += n;
+                Tok::RegExp(pattern, flags)
             } else if let Some(ch) = src[i..].chars().next()
                 && is_ident_start(ch)
             {
@@ -151,6 +159,46 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
         newline_before: true,
     });
     Ok(toks)
+}
+
+/// Whether a `/` after `t` divides (`t` ends an expression).
+fn ends_expression(t: &Tok) -> bool {
+    match t {
+        Tok::Ident(_) | Tok::Num(_) | Tok::Str(_) | Tok::RegExp(..) => true,
+        Tok::Keyword(k) => matches!(*k, "this" | "true" | "false" | "null" | "super"),
+        Tok::Punct(p) => matches!(*p, ")" | "]" | "}" | "++" | "--"),
+        Tok::Eof => false,
+    }
+}
+
+/// A regular expression literal at the start of `s` (at its `/`): its
+/// pattern (escapes kept for the regular expression compiler), flags and
+/// length. A `/` in a class (`[/]`) doesn't end it.
+fn regexp(s: &str) -> Option<(String, String, usize)> {
+    let mut class = false;
+    let mut it = s.char_indices().skip(1);
+    let end = loop {
+        let (i, c) = it.next()?;
+        match c {
+            '\\' => {
+                let (_, e) = it.next()?;
+                if e == '\n' || e == '\r' {
+                    return None;
+                }
+            }
+            '\n' | '\r' => return None,
+            '[' => class = true,
+            ']' => class = false,
+            '/' if !class => break i,
+            _ => {}
+        }
+    };
+    let flags_len = s[end + 1..]
+        .char_indices()
+        .find(|&(_, c)| !is_ident_part(c))
+        .map_or(s.len() - end - 1, |(n, _)| n);
+    let flags = s[end + 1..end + 1 + flags_len].to_string();
+    Some((s[1..end].to_string(), flags, end + 1 + flags_len))
 }
 
 fn is_ident_start(c: char) -> bool {

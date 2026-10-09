@@ -88,6 +88,7 @@ impl Parser<'_> {
             Tok::Keyword(k) | Tok::Punct(k) => format!("`{k}`"),
             Tok::Num(_) => "a number".into(),
             Tok::Str(_) => "a string".into(),
+            Tok::RegExp(..) => "a regular expression".into(),
             Tok::Eof => "end of input".into(),
         };
         self.err(format!("unexpected {what}"))
@@ -758,10 +759,7 @@ impl Parser<'_> {
                 }
                 ExprKind::Object(props)
             }
-            Tok::Punct("/" | "/=") => {
-                self.i = start;
-                return self.err("regular expressions are not supported");
-            }
+            Tok::RegExp(p, f) => ExprKind::RegExp(p, f),
             _ => {
                 self.i = start;
                 return self.unexpected();

@@ -16,6 +16,7 @@ compile_error!("toi supports x86_64 and aarch64 only (dispatch is tuned per arch
 
 pub mod asm;
 mod builtins;
+pub mod regexp;
 pub mod bytecode;
 pub mod interp;
 pub mod jit;

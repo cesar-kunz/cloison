@@ -786,6 +786,15 @@ handlers! {
         next!(any, Op::DefineAccessor.size(), acc)
     }
 
+    fn op_create_regexp(pc, acc, regs, tag) {
+        let vm = &mut *frame_vm(regs);
+        let k = |at: usize| (&(*frame_code(regs)).constants)[u16::from_le_bytes([*pc.add(at), *pc.add(at + 1)]) as usize];
+        let units = |v: Value| String::from_utf16_lossy(string_units(v).unwrap_or(&[]));
+        let (p, f) = (units(k(1)), units(k(3)));
+        let r = crate::builtins::new_regexp(vm, &p, &f);
+        next_or_throw!(Op::CreateRegExp.size(), r)
+    }
+
     fn op_lda_null(pc, acc, regs, tag) {
         next!(any, Op::LdaNull.size(), Value::NULL)
     }
@@ -2779,6 +2788,7 @@ static TABLE: Table = {
     t[Op::DeleteGlobal as usize] = op_delete_global;
     t[Op::LdaCallee as usize] = op_lda_callee;
     t[Op::DefineAccessor as usize] = op_define_accessor;
+    t[Op::CreateRegExp as usize] = op_create_regexp;
     t[Op::StaGlobal as usize] = op_sta_global;
     t[Op::GetNamed as usize] = op_get_named;
     t[Op::SetNamed as usize] = op_set_named;
@@ -3045,6 +3055,36 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
         vm.native_top = saved;
         if v == Value::EMPTY {
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("a call from the runtime")));
+        }
+        Ok(v)
+    }
+}
+
+/// Run the script `code` (`eval`'s, `Function`'s) in a new frame at the VM
+/// stack's free top (as [`call_function`]), `this` the global object.
+pub(crate) fn run_script_at(vm: &mut Vm, code: *const Code) -> crate::vm::Result<Value> {
+    unsafe {
+        let top = vm.native_top;
+        if top.is_null() {
+            return Err(Error::unsupported("eval from here (compiled code)"));
+        }
+        let new = top.add(HEADER);
+        let n = (*code).nregs as usize;
+        if new.add(n) > vm.stack_end || native_stack_low(vm) {
+            return Err(Error::range_error("Maximum call stack size exceeded"));
+        }
+        write_frame_header(vm, new, code, std::ptr::null(), std::ptr::null_mut(), 0);
+        set_header(new, FUNC, std::ptr::null_mut::<Object>());
+        *new = object_value(vm.global);
+        for i in 1..n {
+            *new.add(i) = Value::UNDEFINED;
+        }
+        let saved = vm.native_top;
+        vm.native_top = std::ptr::null_mut();
+        let v = drive(vm, (*code).bytecode.as_ptr(), Value::UNDEFINED, new);
+        vm.native_top = saved;
+        if v == Value::EMPTY {
+            return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("eval")));
         }
         Ok(v)
     }

@@ -1724,3 +1724,33 @@ function methods() {
 fn replaced_prototype_methods_agree_with_node() {
     assert_eq!(value(&format!("{METHODS}\nmethods();")), "24502506");
 }
+
+/// Concatenations of strings and int32s around the word boundaries their
+/// units are copied in (`interp::concat_fast`), on either side, compiled.
+/// The expected value is Node's.
+const CONCATS: &str = r#"function concats() {
+  var pieces = ["", "a", "bc", "def", "ghij", "klmno", "pqrstuvw", "xyz0123456789ABCDEFG"];
+  var ints = [0, 7, -7, 42, 1234, -98765, 2147483647, -2147483648];
+  var out = "", n = 0;
+  for (var r = 0; r < 300; r++) {
+    for (var i = 0; i < pieces.length; i++) {
+      for (var j = 0; j < ints.length; j++) {
+        var s = pieces[i] + ints[j];
+        var t = ints[j] + pieces[i];
+        var u = pieces[i] + pieces[(i + j) % pieces.length];
+        n += s.length + t.length + u.length;
+        if (r == 299 && (i + j) % 5 == 0) out = out + s + "|" + t + "|" + u + ";";
+      }
+    }
+  }
+  return n + ":" + out;
+}
+"#;
+
+#[test]
+fn concatenations_agree_with_node() {
+    assert_eq!(
+        value(&format!("{CONCATS}\nconcats();")),
+        "590400:0|0|;-98765|-98765|klmno;a1234|1234a|aklmno;bc42|42bc|bcklmno;def-7|-7def|defklmno;def-2147483648|-2147483648def|defbc;ghij7|7ghij|ghijklmno;ghij2147483647|2147483647ghij|ghijbc;klmno0|0klmno|klmnoklmno;klmno-98765|-98765klmno|klmnobc;pqrstuvw1234|1234pqrstuvw|pqrstuvwbc;xyz0123456789ABCDEFG42|42xyz0123456789ABCDEFG|xyz0123456789ABCDEFGbc;"
+    );
+}

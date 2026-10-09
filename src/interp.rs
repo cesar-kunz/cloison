@@ -2195,6 +2195,9 @@ fn new_array(regs: *mut Value) -> Value {
 #[cold]
 #[inline(never)]
 pub(crate) fn generic_add(a: Value, b: Value) -> Value {
+    if let Some(v) = concat_fast(a, b) {
+        return v;
+    }
     // Strings and int32s, the common case, straight into the result.
     if let (Some(p), Some(q)) = (Piece::of(a), Piece::of(b))
         && (p.is_string() || q.is_string())
@@ -2209,6 +2212,74 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
         return unsafe { (*current_vm()).new_string(&units) };
     }
     Value::number(to_number(a) + to_number(b))
+}
+
+/// `a + b` for two strings, or a string and an int32 (`"v" + i`): both
+/// copied straight into the new string, a word at a time. In Octane's
+/// DeltaBlue (2.65M a run) going through [`Piece`] cost about 290
+/// instructions each, a third of them calls to `memmove`.
+#[inline(always)]
+fn concat_fast(a: Value, b: Value) -> Option<Value> {
+    // Digits end at unit 11; a word read from their start stays inside.
+    let mut digits = [0u64; 4];
+    let (x, y): ((*const u16, usize), (*const u16, usize)) =
+        match (string_units(a), string_units(b)) {
+            (Some(x), Some(y)) => ((x.as_ptr(), x.len()), (y.as_ptr(), y.len())),
+            (Some(x), None) if b.is_int32() => {
+                ((x.as_ptr(), x.len()), int_units(b.as_i32_unchecked(), &mut digits))
+            }
+            (None, Some(y)) if a.is_int32() => {
+                (int_units(a.as_i32_unchecked(), &mut digits), (y.as_ptr(), y.len()))
+            }
+            _ => return None,
+        };
+    let len = x.1 + y.1;
+    let vm = unsafe { &mut *current_vm() };
+    // A word more than the units need: the last word copied may run past
+    // the end.
+    Some(vm.new_string_raw(len, len.div_ceil(4) + 1, |out| unsafe {
+        copy_words(out, x.0, x.1);
+        copy_words(out.add(x.1), y.0, y.1);
+    }))
+}
+
+/// `i`'s decimal digits, written to end at unit 11 of `buf`: their start
+/// and count.
+#[inline(always)]
+fn int_units(i: i32, buf: &mut [u64; 4]) -> (*const u16, usize) {
+    let units = buf.as_mut_ptr().cast::<u16>();
+    let mut n = i.unsigned_abs();
+    let mut at = 11;
+    loop {
+        at -= 1;
+        unsafe { *units.add(at) = b'0' as u16 + (n % 10) as u16 };
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if i < 0 {
+        at -= 1;
+        unsafe { *units.add(at) = b'-' as u16 };
+    }
+    (unsafe { units.add(at) }, 11 - at)
+}
+
+/// Copy `n` units from `from` to `to` four at a time, reading and writing
+/// up to three past them: a string's units are padded to whole words.
+///
+/// # Safety
+/// Both must have room for `n` rounded up to a multiple of four.
+#[inline(always)]
+unsafe fn copy_words(to: *mut u16, from: *const u16, n: usize) {
+    let mut k = 0;
+    while k < n {
+        unsafe {
+            let w = from.add(k).cast::<u64>().read_unaligned();
+            to.add(k).cast::<u64>().write_unaligned(w);
+        }
+        k += 4;
+    }
 }
 
 /// An operand of a concatenation that needs no conversion through a

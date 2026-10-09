@@ -1394,6 +1394,9 @@ impl Insn {
 
     fn reads_reg(&self) -> bool {
         self.guard != 0
+            // (An `assume` refines its register's copies: they must still
+            // be its copies there.)
+            || self.assume != 0
             || !self.bail
                 && matches!(
                     self.op,
@@ -2732,6 +2735,11 @@ struct Spec<'a> {
     /// Per call instruction, the type its result is predicted to have
     /// (checked after the call; see [`Ty::of_result`]); `Any` for none.
     rets: &'a [Ty],
+    /// An object of at least a stable shape has exactly it (see
+    /// `Shape::is_stable`): the code has no store through the runtime,
+    /// which could add a transition while the code runs (only calls check
+    /// the code epoch after them).
+    stable_ok: bool,
 }
 
 /// What [`select`] decided for one instruction: the stencil family, the
@@ -2939,8 +2947,16 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ..Sel::new("check_tail_callee", "", out)
             };
         }
+        // Its copies too (the dispatch guards a copy made for the call:
+        // the inlined code reads the original).
         _ if insn.assume != 0 => {
-            out.regs.set(insn.reg as usize, Ty::Obj(insn.assume));
+            let r = insn.reg as usize;
+            if r < st.regs.len() {
+                for q in members(&st.same, class_in(&st.same, r)).iter() {
+                    out.regs.set(*q as usize, Ty::Obj(insn.assume));
+                }
+            }
+            out.regs.set(r, Ty::Obj(insn.assume));
             return Sel::new("nop", "", out);
         }
         // An allocation scalar replacement removed: its check only.
@@ -3613,8 +3629,22 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = I32;
             return Sel::new("get_length", if array { "nc" } else { "" }, out);
         }
-        // A known shape with the property.
-        if let (Some(s), Some(fbs)) = (reg.shape(), spec.feedback) {
+        // A known shape with the property. Not for a load from a
+        // prototype's slot as cached (all its cases, if several): lowering
+        // may take its value to be the one there (`proven_callee`, the
+        // function an inlined call needs no guard for), which an own
+        // property found here would shadow. The cache's path checks the
+        // shape, or bails.
+        let from_proto = match prop {
+            Prop::Proto { .. } => true,
+            Prop::Poly { n, at } => poly_cases(spec.polys, n, at)
+                .iter()
+                .all(|c| matches!(c.loc, CaseLoc::Proto(_))),
+            _ => false,
+        };
+        if let (Some(s), Some(fbs)) = (reg.shape(), spec.feedback)
+            && !(load && from_proto)
+        {
             let fb = &fbs[insn.frame as usize];
             let shape = unsafe { &*(s as *const Shape) };
             if let Some(slot) = shape.lookup(fb.name(insn)) {
@@ -3703,7 +3733,14 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             | Prop::Transition { shape, .. } => shape,
             _ => return bail(out),
         };
-        let exact = reg == Ty::Obj(shape);
+        let stable = || {
+            let s = unsafe { &*(shape as *const Shape) };
+            spec.stable_ok && s.is_stable() && {
+                s.relied.set(true);
+                true
+            }
+        };
+        let exact = reg == Ty::Obj(shape) || (reg == Ty::Ext(shape) && stable());
         if matches!(reg, Ty::Obj(_)) && !exact {
             return bail(out);
         }
@@ -5975,6 +6012,25 @@ impl JitCode {
         // failed before are in `widened`: no prediction.
         let mut rets = vec![Ty::Any; n];
         let mut round = 0;
+        // No store through the runtime (see `Spec::stable_ok`): every named
+        // store a cached one, no keyed store.
+        let stable_ok = !props.is_empty()
+            && insns.iter().enumerate().all(|(k, i)| {
+                i.bail
+                    || match i.op {
+                        Op::SetKeyed => false,
+                        Op::SetNamed => matches!(
+                            props.get(k),
+                            Some(
+                                Prop::Own { .. }
+                                    | Prop::Oop { .. }
+                                    | Prop::Transition { .. }
+                                    | Prop::Poly { .. }
+                            )
+                        ),
+                        _ => true,
+                    }
+            });
         let (homes, ins, mut sel) = loop {
             let spec1 = Spec {
                 widened,
@@ -5988,6 +6044,7 @@ impl JitCode {
                 moved: &moved,
                 feedback,
                 rets: &rets,
+                stable_ok,
             };
             let (ins1, sels1) = infer(insns, entry, actual_live.clone(), &spec1);
             let no_widening = HashSet::default();

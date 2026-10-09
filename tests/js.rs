@@ -1835,3 +1835,66 @@ fn more_changed_constants_agree_with_node() {
     assert_eq!(value(&format!("{CHANGED_CONSTANTS_2}
 r;")), "13721319");
 }
+
+/// Methods shadowed by own properties while compiled code calls them in a
+/// loop: added by a callee, after the object became another's prototype,
+/// after `Object.defineProperty`, and by a keyed store. The shapes involved
+/// were stable (see `Shape::is_stable`) until then. Tiering up after one
+/// back edge compiled the loop once the object had the shadowing method,
+/// and the method's load took it while the inlined call was the old
+/// method's. The results are node's.
+const SHADOWED_METHODS: &str = r#"
+function P(x) { this.x = x; }
+P.prototype.get = function () { return this.x; };
+function shadow(o) { o.get = function () { return 100; }; }
+var r = 0;
+function hot(o, n, k) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + o.get();
+    if (i == k) shadow(o);
+  }
+  return t;
+}
+for (var j = 0; j < 20; j++) { var o = new P(j); r = r + hot(o, 1000, 500 + j); }
+function Q(x) { this.x = x; }
+Q.prototype.get = function () { return this.x * 2; };
+function protoize(o) { function F() {} F.prototype = o; return new F(); }
+function hot2(o, n) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + o.get();
+    if (i == 300) { var c = protoize(o); o.get = function () { return 7; }; t = t + c.get(); }
+  }
+  return t;
+}
+for (var j = 0; j < 20; j++) r = r + hot2(new Q(j), 1000);
+function R(x) { this.x = x; }
+R.prototype.get = function () { return this.x + 1; };
+function hot3(o, n) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + o.get();
+    if (i == 400) { Object.defineProperty(o, "x", {value: 50, writable: false}); o.get = function () { return this.x; }; }
+  }
+  return t;
+}
+for (var j = 0; j < 20; j++) r = r + hot3(new R(j), 1000);
+function S(x) { this.x = x; }
+S.prototype.get = function () { return this.x; };
+function hot4(o, n, key) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + o.get();
+    if (i == 600) o[key] = function () { return 3; };
+  }
+  return t;
+}
+for (var j = 0; j < 20; j++) r = r + hot4(new S(j), 1000, "get");
+"#;
+
+#[test]
+fn shadowed_methods_agree_with_node() {
+    assert_eq!(value(&format!("{SHADOWED_METHODS}
+r;")), "2110380");
+}

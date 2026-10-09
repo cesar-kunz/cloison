@@ -1457,6 +1457,16 @@ impl Insn {
     }
 
     /// Whether it reads the register operand's value (`star` only writes it).
+    /// The frame whose feedback (inline caches, names) the instruction's
+    /// `ic` indexes: its own, or for a load moved out of a loop (in the
+    /// frame the loop is in, see `hoist_loads`) the one it was moved from.
+    fn ic_frame(&self) -> usize {
+        match (self.op, self.hoisted) {
+            (Op::GetNamed, Some((f, _))) => f as usize,
+            _ => self.frame as usize,
+        }
+    }
+
     fn uses_reg_value(&self) -> bool {
         self.reads_reg() && self.op != Op::Star
     }
@@ -2624,7 +2634,7 @@ fn set_class(same: &mut Copies, regs: &[u8]) {
 /// `acc` ends its copy), and give the copies of the register an instruction
 /// learned something about (its operand, whose type changed and which it
 /// doesn't write) that type too.
-fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
+fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState, fixed_from: usize) {
     let n = st.regs.len();
     let mut same = st.same.clone();
     out.acc_same = st.acc_same;
@@ -2674,7 +2684,7 @@ fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState) {
             if insn.uses_reg_value() && r < n && out.regs[r] != st.regs[r] {
                 let t = out.regs[r];
                 let c = class_in(&same, r);
-                for &q in members(&same, c).iter() {
+                for &q in members(&same, c).iter().filter(|&&q| (q as usize) < fixed_from) {
                     out.regs.set(q as usize, t);
                 }
                 if out.acc_same == Some(c) && writes_acc(insn).is_none() {
@@ -2740,6 +2750,13 @@ struct Spec<'a> {
     /// which could add a transition while the code runs (only calls check
     /// the code epoch after them).
     stable_ok: bool,
+    /// Registers from here keep their types: what an instruction learns
+    /// about a copy of one isn't given to it (see [`copies`]). The values
+    /// of loads moved out of loops (`hoist_loads`): a loop learning their
+    /// shape (from a check on a copy) gave the loop's back edge another
+    /// type than its entry, and inference went over the loop again (71's
+    /// compiles 20-37% slower).
+    fixed_from: usize,
 }
 
 /// What [`select`] decided for one instruction: the stencil family, the
@@ -2890,7 +2907,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         sel.case = "";
         sel.post = None;
     }
-    copies(insn, st, &mut sel.out);
+    copies(insn, st, &mut sel.out, spec.fixed_from);
     sel
 }
 
@@ -2953,7 +2970,9 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let r = insn.reg as usize;
             if r < st.regs.len() {
                 for q in members(&st.same, class_in(&st.same, r)).iter() {
-                    out.regs.set(*q as usize, Ty::Obj(insn.assume));
+                    if (*q as usize) < spec.fixed_from {
+                        out.regs.set(*q as usize, Ty::Obj(insn.assume));
+                    }
                 }
             }
             out.regs.set(r, Ty::Obj(insn.assume));
@@ -3645,7 +3664,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         if let (Some(s), Some(fbs)) = (reg.shape(), spec.feedback)
             && !(load && from_proto)
         {
-            let fb = &fbs[insn.frame as usize];
+            let fb = &fbs[insn.ic_frame()];
             let shape = unsafe { &*(s as *const Shape) };
             if let Some(slot) = shape.lookup(fb.name(insn)) {
                 // A store to a read-only property does nothing, one to a
@@ -6045,6 +6064,7 @@ impl JitCode {
                 feedback,
                 rets: &rets,
                 stable_ok,
+                fixed_from: direct_base,
             };
             let (ins1, sels1) = infer(insns, entry, actual_live.clone(), &spec1);
             let no_widening = HashSet::default();
@@ -7842,7 +7862,9 @@ struct Lowered {
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
     nregs: usize,
     /// Where direct calls' frames start: registers from there are set up
-    /// for callees, which read them from memory (see [`lower`]).
+    /// for callees, which read them from memory (see [`lower`]). Or where
+    /// the registers of loads moved out of loops start, just below them,
+    /// which stay in memory too (see [`hoist_loads`]).
     direct_base: usize,
     /// Parameters of inlined frames read straight from the caller's
     /// argument registers: `(frame, parameter, argument)`, registers
@@ -8109,7 +8131,19 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     cx.out.fbs.push(cx.feedback(root));
     let rets = cx.emit_frame(0, 0);
     debug_assert!(rets.is_empty());
+    // Registers for the loads `hoist_loads` moves out of loops, below the
+    // direct calls' frames.
+    let spare_base = cx.out.nregs;
+    let spare = hoist_loads(&mut cx.out, &cx.state.property_exits, None)
+        .min(255usize.saturating_sub(spare_base + interp::HEADER));
+    cx.out.nregs += spare;
     cx.place_direct_frames();
+    // They stay in memory (`Lowered::direct_base` on): a slot each for the
+    // whole loop took slots from what the loop computes (71, 82, 87 3-8%
+    // slower), while a load from the frame is one load, not a chain.
+    if spare > 0 {
+        cx.out.direct_base = cx.out.direct_base.min(spare_base);
+    }
     fold_constant_tests(&mut cx.out.insns);
     reuse_global_loads(&mut cx.out);
     fold_constant_loads(&mut cx.out, &cx.state.property_exits);
@@ -8126,6 +8160,14 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
         }
     }
     scalar_replace(&mut cx.out);
+    // After scalar replacement: loads from objects it removed are no loads.
+    // Innermost loops first, then out of the loops around them (`0`: no
+    // round to go).
+    for _ in 0..4 {
+        if hoist_loads(&mut cx.out, &cx.state.property_exits, Some((spare_base, spare))) == 0 {
+            break;
+        }
+    }
     if cx.state.tier == Tier::Warm {
         return cx.out;
     }
@@ -8370,7 +8412,7 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
         let r = insn.reg as usize;
         let reg_held = r < nregs && get(&st, r) != NO;
         let mut next = st.clone();
-        let fb = &out.fbs[insn.frame as usize];
+        let fb = &out.fbs[insn.ic_frame()];
         match insn.op {
             // The allocation: `acc` holds a new object (nothing holds the
             // previous one any more, checked above).
@@ -8566,7 +8608,7 @@ fn reuse_global_loads(out: &mut Lowered) {
         }
         match i.op {
             Op::LdaGlobal => {
-                let name = out.fbs[i.frame as usize].name(&i);
+                let name = out.fbs[i.ic_frame()].name(&i);
                 if let Some(&(_, r)) = known.iter().find(|(m, _)| *m == name) {
                     out.insns[k] = synth(Op::Ldar, r, i.frame as usize, i.pc);
                     out.props[k] = Prop::None;
@@ -8631,7 +8673,7 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     let keyed = out.insns.iter().any(|i| i.op == Op::SetKeyed);
     let set: Vec<Atom> = (out.insns.iter())
         .filter(|i| i.op == Op::SetNamed)
-        .map(|i| out.fbs[i.frame as usize].name(i))
+        .map(|i| out.fbs[i.ic_frame()].name(i))
         .collect();
     // The cell of `o`'s field `name`, if constant and not stored to.
     let constant = |o: *mut Object, name: Atom| unsafe {
@@ -8642,7 +8684,7 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     // Globals the code stores to: likely to change.
     let stored: Vec<Atom> = (out.insns.iter())
         .filter(|i| i.op == Op::StaGlobal)
-        .map(|i| out.fbs[i.frame as usize].name(i))
+        .map(|i| out.fbs[i.ic_frame()].name(i))
         .collect();
     // Registers known to hold a value, and what `acc` holds.
     let mut known: Vec<(u8, u64)> = Vec::new();
@@ -8673,7 +8715,7 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
                 },
             ) => {
                 let at = global + off as u64;
-                let name = out.fbs[i.frame as usize].name(&i);
+                let name = out.fbs[i.ic_frame()].name(&i);
                 let check = if constant(global as *mut Object, name).is_some() { 0 } else { at };
                 (!oop && !stored.contains(&name)).then(|| (word(at), check, word(at), ft, global))
             }
@@ -8682,7 +8724,7 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
                 .filter(|&o| word(o as u64) == shape)
                 .map(|o| {
                     let at = o as u64 + off as u64;
-                    let name = out.fbs[i.frame as usize].name(&i);
+                    let name = out.fbs[i.ic_frame()].name(&i);
                     let fixed = proto(o) || constant(o, name).is_some();
                     (
                         word(at),
@@ -8726,7 +8768,7 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
                     // Without a check: a store that changes it must drop
                     // the code.
                     if at == 0
-                        && let Some(c) = constant(obj as *mut Object, out.fbs[i.frame as usize].name(&i))
+                        && let Some(c) = constant(obj as *mut Object, out.fbs[i.ic_frame()].name(&i))
                     {
                         c.fold();
                     }
@@ -8956,6 +8998,376 @@ fn hoist_guards(out: &mut Lowered) {
     }
     out.insns = insns2;
     out.props = props2;
+}
+
+/// Loads of constant fields (see `object::FieldCell`) from objects a loop
+/// doesn't change, moved before the loop into registers of their own
+/// (`spare`: the first and how many; `None` counts them, to reserve them):
+/// the loop reads the register. In DeltaBlue's `Plan.execute`, `this.v`
+/// and `v.elms` were loaded every iteration (by hand, moving them out of
+/// the loop: -5.2% cycles). The value can't change while the code runs: a
+/// store changing a constant field drops code that took its value
+/// (`FieldCell::fold`), which a running loop notices after its calls; and
+/// the loop must not store to such a field itself (a store through the
+/// runtime checks nothing after). Only fields of numbers or objects, which
+/// never held `undefined` (filling one keeps it constant).
+///
+/// The receiver: a register the loop doesn't write, or one written just
+/// before the load (no jump target between) with a copy of such a register
+/// or of a hoisted load's value (the copies an inlined call makes of its
+/// receiver). Placed as `hoist_guards` places checks, after them and after
+/// scalar replacement: an exit from a moved load allocates what one at the
+/// loop's header would. A load failing its check there exits before the
+/// loop (`HOISTED`), and isn't moved again.
+fn hoist_loads(
+    out: &mut Lowered,
+    exits: &HashMap<(usize, usize), u32>,
+    spare: Option<(usize, usize)>,
+) -> usize {
+    let n = out.insns.len();
+    let insns = &out.insns;
+    let mut loops: Vec<(usize, usize)> = Vec::new();
+    for (j, i) in insns.iter().enumerate() {
+        if i.jumps() && i.target <= j {
+            match loops.iter_mut().find(|l| l.0 == i.target) {
+                Some(l) => l.1 = l.1.max(j),
+                None => loops.push((i.target, j)),
+            }
+        }
+    }
+    if loops.is_empty() {
+        return 0;
+    }
+    // Innermost first: a load moves once, out of its innermost loop.
+    loops.sort_by_key(|&(t, e)| e - t);
+    let jumps: Vec<(usize, usize)> = (insns.iter().enumerate())
+        .filter(|(_, i)| i.jumps())
+        .map(|(j, i)| (j, i.target))
+        .collect();
+    let mut target = vec![false; n + 1];
+    for i in insns.iter().filter(|i| i.jumps() || i.bail && i.target > 0) {
+        target[i.target.min(n)] = true;
+    }
+    // Fields the code may change by name: not a transition's, which adds
+    // the field to an object that hadn't it (filling it, see `FieldCell`).
+    let set: Vec<Atom> = (insns.iter().zip(&out.props))
+        .filter(|(i, p)| i.op == Op::SetNamed && !i.bail && !matches!(p, Prop::Transition { .. }))
+        .map(|(i, _)| out.fbs[i.ic_frame()].name(i))
+        .collect();
+    // A hoisted load's value: from a register, or another hoisted load's.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Src {
+        Reg(u8),
+        Load(usize),
+    }
+    struct Group {
+        at: usize,
+        loads: Vec<(usize, Src)>,
+        frame: u8,
+        pc: usize,
+        enter: Option<(usize, usize)>,
+        all: bool,
+    }
+    // A load an earlier round moved before an inner loop (`GetNamed;
+    // Star` into a register of its own): moving it again keeps its
+    // register, and the pair before the inner loop goes.
+    let spare_regs = spare.map_or(0..0, |(base, max)| base..base + max);
+    let moved = |k: usize| -> Option<u8> {
+        let (i, next) = (insns[k], insns.get(k + 1)?);
+        (i.hoisted.is_some() && next.op == Op::Star && spare_regs.contains(&(next.reg as usize)))
+            .then_some(next.reg)
+    };
+    // Registers earlier rounds took.
+    let used = (insns.iter())
+        .filter(|i| i.op == Op::Star && spare_regs.contains(&(i.reg as usize)))
+        .map(|i| i.reg as usize + 1 - spare_regs.start)
+        .max()
+        .unwrap_or(0);
+    let mut groups: Vec<Group> = Vec::new();
+    let mut taken = vec![false; n];
+    let mut count = 0;
+    for &(t, e) in &loops {
+        let inside = |k: usize| t <= k && k <= e;
+        if loops
+            .iter()
+            .any(|&(u, _)| u != t && inside(u) && insns[u].frame == 0)
+        {
+            continue;
+        }
+        // Entered as `hoist_guards` requires.
+        let fall = t == 0 || insns[t - 1].falls_through() && !insns[t - 1].jumps();
+        let jump = t > 0
+            && insns[t - 1].op == Op::Jump
+            && !insns[t - 1].bail
+            && inside(insns[t - 1].target);
+        if !fall && !jump {
+            continue;
+        }
+        let jumps_in = jumps.iter().any(|&(j, to)| {
+            !inside(j) && inside(to) && !(fall && to == t) && !(jump && j == t - 1)
+        });
+        if jumps_in {
+            continue;
+        }
+        let writes = |i: &Insn, r: u8| {
+            !i.bail && (i.op == Op::Star && i.reg == r || i.op == Op::Mov && i.reg2 == r)
+        };
+        // The registers the loop writes.
+        let mut wset: RegSet = [0; 4];
+        for i in insns[t..=e].iter().filter(|i| !i.bail) {
+            match i.op {
+                Op::Star => rs_add(&mut wset, i.reg as usize),
+                Op::Mov => rs_add(&mut wset, i.reg2 as usize),
+                _ => {}
+            }
+        }
+        // Not a loop of the function's own frame: one entered by a jump
+        // gets the loads twice (one copy for code entered at its header),
+        // and compiling them cost short programs more than they gained
+        // (87 +6.7% instructions, against +3% this way).
+        if !insns[t..=e].iter().any(|i| i.op == Op::GetNamed) {
+            continue;
+        }
+        // No call through the runtime: it puts its callee's frame at the
+        // call's window, below the moved loads' registers, and the callee's
+        // registers run over them. Direct calls' frames are past them
+        // (`place_direct_frames`), as are their callees' after an exit.
+        let runtime_call = (t..=e).any(|k| {
+            insns[k].is_call()
+                && !insns[k].bail
+                && !matches!(out.props[k], Prop::Call { direct: true, .. })
+        });
+        if runtime_call {
+            continue;
+        }
+        let written = |r: u8| rs_has(&wset, r as usize);
+        let mut loads: Vec<(usize, Src)> = Vec::new();
+        for k in t..=e {
+            let i = insns[k];
+            if taken[k] || i.op != Op::GetNamed || i.bail || i.check_only || i.guard != 0 {
+                continue;
+            }
+            let (shape, ft) = match out.props[k] {
+                Prop::Own { shape, ft, .. } | Prop::Oop { shape, ft, .. } => (shape, ft),
+                _ => continue,
+            };
+            if !matches!(ft, FieldType::Int | FieldType::Num | FieldType::Obj(_)) {
+                continue;
+            }
+            let name = out.fbs[i.ic_frame()].name(&i);
+            let sh = unsafe { &*(shape as *const Shape) };
+            let constant = sh
+                .lookup(name)
+                .is_some_and(|slot| sh.field_cell(slot).is_constant());
+            let origin = match i.hoisted {
+                Some((f, pc)) => (out.frames[f as usize].code as usize, pc as usize),
+                None => (out.frames[i.frame as usize].code as usize, i.pc),
+            };
+            if !constant || set.contains(&name) || exits.contains_key(&origin) {
+                continue;
+            }
+            let src = if !written(i.reg) {
+                Src::Reg(i.reg)
+            } else {
+                // The write just before it, in the same block.
+                let Some(j) = (t..k).rev().find(|&j| writes(&insns[j], i.reg)) else {
+                    continue;
+                };
+                if (j + 1..=k).any(|m| target[m]) || j == t || target[j] {
+                    continue;
+                }
+                let (w, prev) = (insns[j], insns[j - 1]);
+                match (w.op, prev.op) {
+                    (Op::Star, Op::Ldar) if !prev.bail && !written(prev.reg) => Src::Reg(prev.reg),
+                    (Op::Star, Op::GetNamed) if loads.iter().any(|l| l.0 == j - 1) => {
+                        Src::Load(j - 1)
+                    }
+                    (Op::Mov, _) if !written(w.reg) => Src::Reg(w.reg),
+                    _ => continue,
+                }
+            };
+            loads.push((k, src));
+        }
+        // Only chains: a load from a hoisted load's value (`this.v.elms`),
+        // and those it reads. One load from a register the loop keeps
+        // would be one load from the frame instead: nothing gained (31
+        // 20% slower, the stores to the frame in the loop).
+        let mut keep: Vec<bool> = loads.iter().map(|l| matches!(l.1, Src::Load(_))).collect();
+        for k in (0..loads.len()).rev() {
+            if let (true, Src::Load(j)) = (keep[k], loads[k].1)
+                && let Some(p) = loads.iter().position(|l| l.0 == j)
+            {
+                keep[p] = true;
+            }
+        }
+        let mut kept = keep.iter();
+        loads.retain(|_| *kept.next().unwrap());
+        if loads.is_empty() {
+            continue;
+        }
+        type Place = (usize, Option<(usize, usize)>, bool);
+        let places: Vec<Place> = if fall {
+            vec![(t, Some((t, e)), false)]
+        } else if insns[t].frame == 0 {
+            vec![(t - 1, None, true), (t, None, false)]
+        } else {
+            vec![(t - 1, None, true)]
+        };
+        if places.iter().any(|p| groups.iter().any(|g| g.at == p.0)) {
+            continue;
+        }
+        let new = loads.iter().filter(|l| moved(l.0).is_none()).count();
+        if let Some((_, max)) = spare
+            && used + count + new > max
+        {
+            continue;
+        }
+        count += new;
+        for &(k, _) in &loads {
+            taken[k] = true;
+        }
+        for (at, enter, all) in places {
+            groups.push(Group {
+                at,
+                loads: loads.clone(),
+                frame: insns[at].frame,
+                pc: insns[at].pc,
+                enter,
+                all,
+            });
+        }
+    }
+    let Some((base, _)) = spare else {
+        return count;
+    };
+    if groups.is_empty() {
+        return 0;
+    }
+    // Each hoisted load's register: its own, if moved before.
+    let mut reg_of: HashMap<usize, u8> = HashMap::default();
+    let mut next = base + used;
+    for g in &groups {
+        for &(k, _) in &g.loads {
+            reg_of.entry(k).or_insert_with(|| {
+                moved(k).unwrap_or_else(|| {
+                    next += 1;
+                    (next - 1) as u8
+                })
+            });
+        }
+    }
+    // The `Star`s of loads moved again go with them.
+    let gone: HashSet<usize> = (reg_of.keys())
+        .filter(|&&k| moved(k).is_some())
+        .map(|&k| k + 1)
+        .collect();
+    for g in &groups {
+        for &(k, _) in &g.loads {
+            let i = &out.insns[k];
+            let name = out.fbs[i.ic_frame()].name(i);
+            if let Prop::Own { shape, .. } | Prop::Oop { shape, .. } = out.props[k] {
+                let sh = unsafe { &*(shape as *const Shape) };
+                if let Some(slot) = sh.lookup(name) {
+                    sh.field_cell(slot).fold();
+                }
+            }
+        }
+    }
+    groups.sort_by_key(|g| g.at);
+    let mut new_of = vec![0; n + 1];
+    let mut start_of: HashMap<usize, usize> = HashMap::default();
+    let extra: usize = groups.iter().map(|g| 2 * g.loads.len()).sum();
+    let (mut insns2, mut props2) = (Vec::with_capacity(n + extra), Vec::with_capacity(n + extra));
+    let mut g = 0;
+    for k in 0..=n {
+        while g < groups.len() && groups[g].at == k {
+            start_of.insert(k, insns2.len());
+            let (frame, pc) = (groups[g].frame as usize, groups[g].pc);
+            // (Copies of one load, before two entries of an inner loop,
+            // load once.)
+            let mut done: Vec<u8> = Vec::new();
+            for &(l, src) in &groups[g].loads {
+                if done.contains(&reg_of[&l]) {
+                    continue;
+                }
+                done.push(reg_of[&l]);
+                let orig = out.insns[l];
+                let mut load = Insn {
+                    frame: frame as u8,
+                    pc,
+                    hoisted: orig.hoisted.or(Some((orig.frame, orig.pc as u32))),
+                    ..orig
+                };
+                load.reg = match src {
+                    Src::Reg(r) => r,
+                    Src::Load(j) => reg_of[&j],
+                };
+                insns2.push(load);
+                props2.push(out.props[l]);
+                insns2.push(synth(Op::Star, reg_of[&l], frame, pc));
+                props2.push(Prop::None);
+            }
+            g += 1;
+        }
+        new_of[k] = insns2.len();
+        if k < n {
+            let i = out.insns[k];
+            match reg_of.get(&k) {
+                // Moved again, with its `Star`: nothing left here.
+                Some(_) if moved(k).is_some() => {
+                    insns2.push(synth(Op::Nop, 0, i.frame as usize, i.pc));
+                    props2.push(Prop::None);
+                }
+                _ if gone.contains(&k) => {
+                    insns2.push(synth(Op::Nop, 0, i.frame as usize, i.pc));
+                    props2.push(Prop::None);
+                }
+                // The loop reads the register.
+                Some(&r) => {
+                    insns2.push(synth(Op::Ldar, r, i.frame as usize, i.pc));
+                    props2.push(Prop::None);
+                }
+                None => {
+                    insns2.push(i);
+                    props2.push(out.props[k]);
+                }
+            }
+        }
+    }
+    for (k, i) in out.insns.iter().enumerate() {
+        if !(i.jumps() || i.bail && i.target > 0) {
+            continue;
+        }
+        let t = i.target;
+        let to = match groups.iter().find(|g| g.at == t) {
+            Some(g) if g.all => start_of[&t],
+            Some(g) => match g.enter {
+                Some((a, b)) if !(a <= k && k <= b) => start_of[&t],
+                _ => new_of[t],
+            },
+            None => new_of[t],
+        };
+        insns2[new_of[k]].target = to;
+    }
+    // Objects to allocate at exits: by the new indices, and for the moved
+    // loads those of the instruction they go before.
+    let mut mats: HashMap<usize, Vec<Rc<Mat>>> = HashMap::default();
+    for (k, m) in std::mem::take(&mut out.mats) {
+        if let Some(&start) = start_of.get(&k) {
+            for j in start..new_of[k] {
+                mats.insert(j, m.clone());
+            }
+        }
+        mats.insert(new_of[k], m);
+    }
+    // Another round only if loads went before a loop inside another.
+    let nested = groups
+        .iter()
+        .any(|g| loops.iter().any(|&(u, v)| u < g.at && g.at <= v));
+    out.mats = mats;
+    out.insns = insns2;
+    out.props = props2;
+    if nested { reg_of.len() } else { 0 }
 }
 
 /// Jumps on a value known where they are: taken or not whatever happens,

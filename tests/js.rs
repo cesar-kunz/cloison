@@ -1898,3 +1898,42 @@ fn shadowed_methods_agree_with_node() {
     assert_eq!(value(&format!("{SHADOWED_METHODS}
 r;")), "2110380");
 }
+
+/// Loads of constant fields moved out of a loop inlined into its caller
+/// (`hoist_loads`), the fields then changed: by a callee, on another
+/// object, with the receiver gaining properties first; and a loop not run
+/// with `undefined` for its receiver. The results are node's.
+const HOISTED_LOADS: &str = r#"
+function Box(v) { this.v = v; }
+function Holder(b) { this.b = b; }
+var G = new Holder(new Box(3));
+function setB(h) { h.b = new Box(7); }
+function setG(h) { G.b = new Box(11); }
+function grow(h) { h.extra = 1; h.more = 2; h.b = new Box(5); }
+function noop(h) {}
+Holder.prototype.sum = function (n, k, f) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + this.b.v + G.b.v;
+    if (i == k) f(this);
+  }
+  return t;
+};
+function scan(o, n) { var t = 0; for (var i = 0; i < n; i++) t = t + o.b.v; return t; }
+function drive(h, n, k, f) { return h.sum(n, k, f); }
+function drive2(o, n) { return scan(o, n); }
+var r = 0;
+var fs = [noop, setB, setG, grow];
+for (var j = 0; j < 4000; j++) {
+  var h = new Holder(new Box(j % 13));
+  var f = j % 97 == 5 ? fs[1 + (j % 3)] : noop;
+  r = r + drive(h, 20, j % 7, f);
+  r = r + drive2(j % 501 == 9 ? undefined : h, j % 501 == 9 ? 0 : 5);
+}
+"#;
+
+#[test]
+fn hoisted_loads_agree_with_node() {
+    assert_eq!(value(&format!("{HOISTED_LOADS}
+r;")), "1447227");
+}

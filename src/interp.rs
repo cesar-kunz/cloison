@@ -711,6 +711,41 @@ handlers! {
         next!(any, Op::LdaUndefined.size(), Value::UNDEFINED)
     }
 
+    // The arguments the frame's maker passed: those of the caller's call
+    // instruction (one on for `f.call(that, …)`, `list`'s elements for
+    // `f.apply(that, list)`), or the runtime's (`Vm::pending_args`).
+    fn op_create_arguments(pc, acc, regs, tag) {
+        let vm = &mut *frame_vm(regs);
+        let ret: *const u8 = header(regs, RET_PC);
+        let caller: *mut Value = header(regs, CALLER);
+        let spread;
+        let (args, argc): (*const Value, usize) = if ret.is_null() || caller.is_null() {
+            vm.pending_args
+        } else {
+            let call = ret.sub(Op::Call.size());
+            let (f, w, n) = (*call.add(1) as usize, *call.add(2) as usize, *call.add(3) as usize);
+            match Op::from_u8(*call) {
+                Some(Op::Call) => {
+                    let fv = *caller.add(f);
+                    let this = *caller.add(w);
+                    if unwrap_call(vm, fv, this).is_some() {
+                        (caller.add(w + 2).cast_const(), n.saturating_sub(1))
+                    } else if unwrap_apply(vm, fv, this).is_some() {
+                        let list = if n < 2 { Value::UNDEFINED } else { *caller.add(w + 2) };
+                        spread = crate::builtins::apply_list(list).unwrap_or_default();
+                        (spread.as_ptr(), spread.len())
+                    } else {
+                        (caller.add(w + 1).cast_const(), n)
+                    }
+                }
+                _ => (caller.add(w).cast_const(), n),
+            }
+        };
+        let values = std::slice::from_raw_parts(args, argc);
+        *reg(pc, 1, regs) = crate::builtins::arguments_object(vm, values);
+        next!(any, Op::CreateArguments.size(), acc)
+    }
+
     fn op_lda_null(pc, acc, regs, tag) {
         next!(any, Op::LdaNull.size(), Value::NULL)
     }
@@ -1338,6 +1373,20 @@ handlers! {
             let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
             let that = sloppy_this(frame_vm(regs), that);
             enter!(fo, that, w.add(2), argc.saturating_sub(1), 0, Op::Call.size())
+        }
+        // `f.apply(that, list)` with `f` a bytecode function: call `f` with
+        // `list`'s elements. The cache records `apply` (compiled code calls
+        // it through the runtime, which unwraps it too).
+        if let Some(fo) = unwrap_apply(frame_vm(regs), *reg(pc, 1, regs), *w) {
+            record_callee(pc, regs, tag);
+            (*ic).loc = 0;
+            let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
+            let that = sloppy_this(frame_vm(regs), that);
+            let list = if argc < 2 { Value::UNDEFINED } else { *w.add(2) };
+            match crate::builtins::apply_list(list) {
+                Ok(spread) => enter!(fo, that, spread.as_ptr(), spread.len(), 0, Op::Call.size()),
+                Err(e) => next_or_throw!(Op::Call.size(), Err::<Value, Error>(e)),
+            }
         }
         record_callee(pc, regs, tag);
         (*ic).loc = 0;
@@ -2683,6 +2732,7 @@ static TABLE: Table = {
     t[Op::JumpIfToBooleanTrue as usize] = op_jump_if_to_boolean_true;
     t[Op::JumpIfToBooleanFalse as usize] = op_jump_if_to_boolean_false;
     t[Op::LdaGlobal as usize] = op_lda_global;
+    t[Op::CreateArguments as usize] = op_create_arguments;
     t[Op::StaGlobal as usize] = op_sta_global;
     t[Op::GetNamed as usize] = op_get_named;
     t[Op::SetNamed as usize] = op_set_named;
@@ -2909,6 +2959,19 @@ unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
 /// paths do for bytecode functions: a cache left empty then means the call
 /// never ran (the JIT leaves such calls to the interpreter).
 #[inline(always)]
+/// For a call of `f` with receiver `this`: if `f` is
+/// `Function.prototype.apply` and `this` a bytecode function, `this`, which
+/// is what the call calls.
+pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Option<*mut Object> {
+    unsafe {
+        let is = |v: Value, c: Class| v.is_cell() && (*as_object(v)).class == c;
+        (is(f, Class::Native)
+            && (*as_object(f)).code == (*vm).function_apply
+            && is(this, Class::Function))
+        .then(|| as_object(this))
+    }
+}
+
 /// The `this` a bytecode function gets for receiver `this`: the global
 /// object for `undefined` or `null` (sloppy mode; toi has no strict mode).
 /// Calls without a receiver pass the global object themselves; this is for
@@ -3422,8 +3485,24 @@ pub(crate) unsafe fn call_from_jit(
             _ => (object_value(vm.global), regs.add(w), argc),
         };
         let bytecode = fv.is_cell() && (*as_object(fv)).class == Class::Function;
+        // `f.apply(that, list)`'s arguments (alive until the call returns).
+        let spread: Vec<Value>;
         if !bytecode {
-            // `f.call(that, …args)` with `f` a bytecode function: call `f`.
+            // `f.call(that, …args)` with `f` a bytecode function: call `f`;
+            // `f.apply(that, list)`: call `f` with `list`'s elements.
+            if op == Op::Call
+                && let Some(fo) = unwrap_apply(vm, fv, this)
+            {
+                let list = if argc < 2 { Value::UNDEFINED } else { *args.add(1) };
+                spread = match crate::builtins::apply_list(list) {
+                    Ok(s) => s,
+                    Err(e) => return throw(vm, e),
+                };
+                fv = object_value(fo);
+                this = if argc == 0 { Value::UNDEFINED } else { *args };
+                args = spread.as_ptr().cast_mut();
+                argc = spread.len();
+            } else {
             match unwrap_call(vm, fv, this) {
                 Some(fo) if op == Op::Call => {
                     fv = object_value(fo);
@@ -3439,6 +3518,7 @@ pub(crate) unsafe fn call_from_jit(
                     };
                     return r.unwrap_or_else(|e| throw(vm, e));
                 }
+            }
             }
         }
         let fo = as_object(fv);
@@ -3472,6 +3552,8 @@ pub(crate) unsafe fn call_from_jit(
         for i in 1 + k..n {
             *new.add(i) = Value::UNDEFINED;
         }
+        // For a `CreateArguments` (the frame has no call instruction).
+        vm.pending_args = (args, argc);
         let mut start = Resume {
             regs: new,
             pc: (*callee).bytecode.as_ptr(),

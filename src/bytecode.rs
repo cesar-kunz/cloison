@@ -132,6 +132,10 @@ define_ops! {
     LdaUpvalue(Count),
     /// Upvalue `k` = `acc`.
     StaUpvalue(Count),
+    /// `r[a]` = the call's `arguments` object (an array of the arguments
+    /// passed, extra ones included). First in a function that reads
+    /// `arguments`; such a function runs only in the interpreter.
+    CreateArguments(Reg),
 
     // ---- Constants and registers ----
     /// `acc = undefined`

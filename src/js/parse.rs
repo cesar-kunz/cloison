@@ -22,6 +22,7 @@ pub fn parse(toks: &[Token]) -> Result<Program, Error> {
         parent: None,
         declaration: false,
         binds_name: false,
+        uses_arguments: false,
         pos: 0,
     });
     let mut body = Vec::new();
@@ -414,6 +415,7 @@ impl Parser<'_> {
         self.functions.push(Function {
             name,
             binds_name,
+            uses_arguments: false,
             params: Vec::new(),
             body: Vec::new(),
             parent: Some(self.current),
@@ -684,7 +686,12 @@ impl Parser<'_> {
         let kind = match self.bump() {
             Tok::Num(v) => ExprKind::Num(v),
             Tok::Str(s) => ExprKind::Str(s),
-            Tok::Ident(s) => ExprKind::Ident(s),
+            Tok::Ident(s) => {
+                if s == "arguments" {
+                    self.functions[self.current].uses_arguments = true;
+                }
+                ExprKind::Ident(s)
+            }
             Tok::Keyword("this") => ExprKind::This,
             Tok::Keyword("true") => ExprKind::Bool(true),
             Tok::Keyword("false") => ExprKind::Bool(false),

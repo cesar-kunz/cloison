@@ -314,6 +314,12 @@ pub struct Vm {
     pub(crate) function_call: *const Code,
     /// `Function.prototype.call` itself.
     pub(crate) function_call_fn: *mut Object,
+    /// `Function.prototype.apply`'s code (see `interp::unwrap_apply`).
+    pub(crate) function_apply: *const Code,
+    /// The arguments of a call the runtime makes from compiled code, for
+    /// the callee's `CreateArguments` (its frame has no call instruction to
+    /// find them by).
+    pub(crate) pending_args: (*const Value, usize),
     /// The `Array` constructor: compiled code makes `new Array()` itself.
     pub(crate) array_fn: *mut Object,
     date_prototype: *mut Object,
@@ -390,6 +396,8 @@ impl Vm {
             proto_object_shape: std::ptr::null(),
             function_call: std::ptr::null(),
             function_call_fn: std::ptr::null_mut(),
+            function_apply: std::ptr::null(),
+            pending_args: (std::ptr::null(), 0),
             array_fn: std::ptr::null_mut(),
             date_prototype: std::ptr::null_mut(),
             number_prototype: std::ptr::null_mut(),
@@ -1913,7 +1921,10 @@ fn has_loop(f: &crate::asm::FunctionDef) -> bool {
 
 /// See `Code::interpreted`.
 fn interpreted(f: &crate::asm::FunctionDef) -> bool {
-    !f.handlers.is_empty() || !f.upvalues.is_empty() || f.captures
+    !f.handlers.is_empty()
+        || !f.upvalues.is_empty()
+        || f.captures
+        || f.code.first() == Some(&(crate::bytecode::Op::CreateArguments as u8))
 }
 
 /// See [`has_loop`].

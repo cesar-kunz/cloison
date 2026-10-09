@@ -53,6 +53,10 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.define_native(sp, name, f, n, any, false);
     }
 
+    let fp = vm.function_prototype;
+    let apply = vm.define_native(fp, "apply", function_apply, 2, any, false);
+    vm.function_apply = unsafe { (*apply).code };
+
     // The methods ToPrimitive calls.
     vm.define_native(op, "toString", object_to_string, 0, any, false);
     vm.define_native(op, "valueOf", object_value_of, 0, any, false);
@@ -378,6 +382,45 @@ fn string_to_string(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         Some(_) => Ok(this),
         None => Err(Error::type_error("String.prototype.toString called on a non-string")),
     }
+}
+
+// ---- Function.prototype.apply ----
+
+/// The arguments `f.apply(that, list)` passes: `list`'s elements (holes as
+/// `undefined`; none for `undefined` or `null`). `arguments` objects are
+/// arrays.
+pub(crate) fn apply_list(list: Value) -> Result<Vec<Value>> {
+    if list.is_undefined() || list.is_null() {
+        return Ok(Vec::new());
+    }
+    if !list.is_cell() || unsafe { (*as_object(list)).class } != Class::Array {
+        return Err(Error::type_error("CreateListFromArrayLike called on a non-array"));
+    }
+    let o = as_object(list);
+    let n = unsafe { (*o).elems_len } as usize;
+    Ok((0..n)
+        .map(|i| {
+            let e = unsafe { *(*o).elems.add(i) };
+            if e == Value::EMPTY { Value::UNDEFINED } else { e }
+        })
+        .collect())
+}
+
+/// `Function.prototype.apply` on a native (a call through it to a bytecode
+/// function is unwrapped where it is made: `interp::unwrap_apply`).
+fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let list = apply_list(arg(a, 1))?;
+    if this.is_cell() && unsafe { (*as_object(this)).class } == Class::Native {
+        return vm.call_other(this, arg(a, 0), &list);
+    }
+    Err(Error::type_error(format!("{this:?} is not a native function (apply it directly)")))
+}
+
+/// A new array of `values`: an `arguments` object.
+pub(crate) fn arguments_object(vm: &mut Vm, values: &[Value]) -> Value {
+    let arr = vm.new_array();
+    crate::vm::array_push(vm, arr, values).expect("an array");
+    arr
 }
 
 // ---- What ToPrimitive calls ----

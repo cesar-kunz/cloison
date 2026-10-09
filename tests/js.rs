@@ -2034,3 +2034,32 @@ fn error_objects_agree_with_node() {
         "boom|Error|Error: boom|Error: boom|RangeError|x|TypeError|Cannot read properties of null (reading 'x')|TypeError: Cannot read properties of null (reading 'x')|bad|TypeError|ReferenceError"
     );
 }
+
+/// `arguments` (extra arguments included) and `Function.prototype.apply`,
+/// from interpreted and compiled callers: forwarded with `apply(this,
+/// arguments)` (raytrace's `Class.create`), through `call`, on natives.
+/// The expected value is Node's.
+const ARGUMENTS: &str = r#"
+function sum() { var s = 0; for (var i = 0; i < arguments.length; i++) s += arguments[i]; return s; }
+function pair(a, b) { return a * 10 + b + (this.k || 0); }
+function fwd() { return pair.apply(this, arguments); }
+function viaCall(x) { return sum.call(null, x, arguments.length, 3); }
+var Class = { create: function () { return function () { this.initialize.apply(this, arguments); }; } };
+var P = Class.create();
+P.prototype = { initialize: function (x, y) { this.x = x; this.y = y; } };
+function argsAndApply() {
+  var t = 0, o = { k: 100, f: fwd };
+  for (var i = 0; i < 4000; i++) {
+    t += sum(i, 1, 2, 3) + sum() + fwd(i & 7, 2) + o.f(1, 2) + viaCall(i);
+    t += pair.apply(o, [i & 3, 1]) + pair.apply(null, [1, 2]) + Math.max.apply(Math, [i, 5, 9]);
+    var p = new P(i, 3);
+    t += p.x - p.y;
+  }
+  return t;
+}
+"#;
+
+#[test]
+fn arguments_and_apply_agree_with_node() {
+    assert_eq!(value(&format!("{ARGUMENTS}\nargsAndApply();")), "33128045");
+}

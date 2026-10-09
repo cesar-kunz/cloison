@@ -212,12 +212,24 @@ fn declarations(p: &Program, f: usize) -> Vec<&str> {
             _ => {}
         }
     }
+    let i = f;
     let f = &p.functions[f];
     let mut out: Vec<&str> = f.params.iter().map(String::as_str).collect();
     for s in &f.body {
         stmt(s, p, &mut out);
     }
+    // `arguments`: a variable `CreateArguments` sets.
+    if arguments_object(p, i) && !out.contains(&"arguments") {
+        out.push("arguments");
+    }
     out
+}
+
+/// Whether function `f` gets an `arguments` object: it reads `arguments`,
+/// and no parameter has that name.
+fn arguments_object(p: &Program, f: usize) -> bool {
+    let f = &p.functions[f];
+    f.uses_arguments && f.parent.is_some() && !f.params.iter().any(|n| n == "arguments")
 }
 
 /// The function declarations directly in a function's body (hoisted to
@@ -495,6 +507,10 @@ impl<'a> Gen<'a> {
     fn function(mut self) -> R<FunctionDef> {
         if self.locals.len() + 1 > 255 {
             return unsupported(self.f.pos, "more than 254 parameters and variables");
+        }
+        if arguments_object(self.p, self.index) {
+            let r = self.locals["arguments"];
+            self.emit(Op::CreateArguments, &[Arg::Reg(r)]);
         }
         let mut fns = Vec::new();
         self.f.body.iter().for_each(|s| hoisted(s, &mut fns));

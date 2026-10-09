@@ -24,6 +24,8 @@ pub struct Function {
     pub declaration: bool,
     /// A named function expression, whose name is bound in its body.
     pub binds_name: bool,
+    /// Its body reads `arguments` (not counting nested functions').
+    pub uses_arguments: bool,
     pub pos: Pos,
 }
 

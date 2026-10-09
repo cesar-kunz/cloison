@@ -1754,3 +1754,84 @@ fn concatenations_agree_with_node() {
         "590400:0|0|;-98765|-98765|klmno;a1234|1234a|aklmno;bc42|42bc|bcklmno;def-7|-7def|defklmno;def-2147483648|-2147483648def|defbc;ghij7|7ghij|ghijklmno;ghij2147483647|2147483647ghij|ghijbc;klmno0|0klmno|klmnoklmno;klmno-98765|-98765klmno|klmnobc;pqrstuvw1234|1234pqrstuvw|pqrstuvwbc;xyz0123456789ABCDEFG42|42xyz0123456789ABCDEFG|xyz0123456789ABCDEFGbc;"
     );
 }
+
+/// Values compiled code takes as constants (constant fields, see
+/// `FieldCell`: a global, a plain object's and a function's fields) changed
+/// by a callee, by compiled code itself and through a field holding an
+/// object; the results are node's.
+const CHANGED_CONSTANTS: &str = r#"
+var K = {a: 1, b: 2};
+var G = 10;
+function F() {}
+F.s = 5;
+function setG(v) { G = v; }
+function setKa(v) { K.a = v; }
+function setFs(v) { F.s = v; }
+function hot(n) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + G + K.a + F.s;
+    if (i == 5000) setG(20);
+    if (i == 7000) setKa(3);
+    if (i == 9000) setFs(7);
+  }
+  return t;
+}
+var r = 0;
+for (var j = 0; j < 30; j++) r = r + hot(10000);
+// direct stores from compiled code
+function hot2(n) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + K.b;
+    if (i == 500) K.b = 9;
+  }
+  return t;
+}
+for (var j = 0; j < 30; j++) r = r + hot2(1000);
+// global reassigned inside the hot loop itself
+var H = 1;
+function hot3(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + H; if (i == 100) H = 2; } return t; }
+for (var j = 0; j < 30; j++) { H = 1; r = r + hot3(1000); }
+// object constants as receivers
+var O = {p: {q: 4}};
+function hot4(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + O.p.q; if (i == 300) O.p = {q: 6}; } return t; }
+for (var j = 0; j < 30; j++) r = r + hot4(1000);
+"#;
+
+#[test]
+fn changed_constants_agree_with_node() {
+    assert_eq!(value(&format!("{CHANGED_CONSTANTS}
+r;")), "9420847");
+}
+
+/// More of them: a keyed store, stores in a callee (inlined or not, which
+/// the code notices after the call) and `Object.defineProperty`.
+const CHANGED_CONSTANTS_2: &str = r#"
+var K = {a: 1, b: 2, c: 3, d: 4};
+var r = 0;
+function hot5(n, key) {
+  var t = 0;
+  for (var i = 0; i < n; i++) {
+    t = t + K.a;
+    if (i == 400) K[key] = 5;
+  }
+  return t;
+}
+for (var j = 0; j < 20; j++) { K.a = 1; r = r + hot5(1000, "a"); }
+function setc(v) { K.c = v; }
+function hot6(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + K.c; if (i == 600) setc(t % 7); } return t; }
+for (var j = 0; j < 20; j++) r = r + hot6(1000);
+function big(v) { var x = 0; for (var q = 0; q < 3; q++) { x = x + q; } K.d = v + x; }
+function hot7(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + K.d; if (i == 700) big(i); } return t; }
+for (var j = 0; j < 20; j++) r = r + hot7(1000);
+var Z = {z: 1};
+function hot8(n) { var t = 0; for (var i = 0; i < n; i++) { t = t + Z.z; if (i == 800) Object.defineProperty(Z, "z", {value: 3, writable: true}); } return t; }
+for (var j = 0; j < 5; j++) r = r + hot8(1000);
+"#;
+
+#[test]
+fn more_changed_constants_agree_with_node() {
+    assert_eq!(value(&format!("{CHANGED_CONSTANTS_2}
+r;")), "13721319");
+}

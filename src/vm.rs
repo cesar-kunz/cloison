@@ -10,7 +10,8 @@ use std::fmt;
 
 use crate::asm::Module;
 use crate::object::{
-    Atom, Class, DONT_DELETE, DONT_ENUM, FieldType, Heap, Object, PROTOTYPE, READ_ONLY, Shape,
+    Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Heap, Object, PROTOTYPE, READ_ONLY,
+    Shape,
     as_object, field_fits, object_value,
 };
 use crate::value::Value;
@@ -255,7 +256,7 @@ const STACK_VALUES: usize = 1 << 18;
 pub struct Vm {
     pub heap: Heap,
     shapes: Vec<Box<Shape>>,
-    field_cells: Vec<Box<Cell<FieldType>>>,
+    field_cells: Vec<Box<FieldCell>>,
     roots: HashMap<(Class, u64, u32), *const Shape>,
     atoms: Vec<String>,
     atom_ids: HashMap<String, Atom>,
@@ -645,7 +646,7 @@ impl Vm {
         keys.push(name);
         let mut slot_attrs = s.attrs.clone();
         slot_attrs.push(attrs);
-        let cell = Box::new(Cell::new(FieldType::None));
+        let cell = Box::new(FieldCell::new());
         let mut fields = s.fields.clone();
         fields.push(&*cell);
         self.field_cells.push(cell);
@@ -755,6 +756,31 @@ impl Vm {
         }
     }
 
+    /// Whether an inline cache may cache stores to slot `slot` of `o`'s
+    /// shape: not while the field is constant on the global object or a
+    /// function, whose constant fields compiled code folds; on other
+    /// objects, once the field is made mutable (see `FieldCell`).
+    fn may_cache_store(&mut self, o: *mut Object, slot: u32) -> bool {
+        let cell = unsafe { (*(*o).shape).field_cell(slot) };
+        if !cell.is_constant() {
+            return true;
+        }
+        if o == self.global || unsafe { (*o).class } == Class::Function {
+            return false;
+        }
+        self.field_made_mutable(cell);
+        true
+    }
+
+    /// Make constant field `cell` mutable, dropping compiled code that
+    /// folded it (see `FieldCell`).
+    pub(crate) fn field_made_mutable(&mut self, cell: &FieldCell) {
+        if cell.make_mutable() {
+            self.field_epoch = self.field_epoch.wrapping_add(1);
+            self.code_epoch = self.code_epoch.wrapping_add(1);
+        }
+    }
+
     /// Write `value` to slot `slot` of `o`, generalizing the field's type
     /// first if `value` doesn't fit it. Every store to a field that doesn't
     /// go through an inline cache whose check passed must use this.
@@ -773,6 +799,11 @@ impl Vm {
                 }
             }
             let at = Object::slot(o, shape.location(slot));
+            // Constant while stores fill the field or store what it holds
+            // (see `FieldCell`).
+            if cell.is_constant() && *at != value && *at != Value::UNDEFINED {
+                self.field_made_mutable(cell);
+            }
             // A prototype's slots hold what compiled code assumes they do
             // while the prototype epoch holds (see `jit`'s `Case::value`);
             // every store to one comes here (inline caches don't cache
@@ -1004,8 +1035,9 @@ impl Vm {
             if let Some(slot) = (*old).lookup(name) {
                 self.store_field(o, slot, value);
                 // Stores to a prototype stay on this path, which bumps the
-                // epoch (see `store_field`).
-                if (*o).flags & PROTOTYPE != 0 {
+                // epoch (see `store_field`), as do those to a constant field
+                // of a function's.
+                if (*o).flags & PROTOTYPE != 0 || !self.may_cache_store(o, slot) {
                     return Ok(());
                 }
                 install(
@@ -1150,6 +1182,9 @@ impl Vm {
             match (*shape).lookup(name) {
                 Some(slot) => {
                     self.store_field(g, slot, value);
+                    if !self.may_cache_store(g, slot) {
+                        return Ok(());
+                    }
                     *ic = Ic {
                         shape,
                         holder: (*shape).field_type(slot).encode() as *mut Object,

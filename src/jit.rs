@@ -434,6 +434,17 @@ mod arch {
     pub const TRAILING_JUMP: usize = 5;
     pub const CODE_ALIGN: usize = 16;
 
+    /// Bytes of a counting prefix (see `count_prefix` in the parent).
+    pub const COUNT_PREFIX: usize = 13;
+
+    /// `movabs r11, counter; inc qword ptr [r11]`: r11 and the flags carry
+    /// nothing between stencils.
+    pub fn count_prefix(buf: &mut [u8], counter: *mut u64) {
+        buf[..2].copy_from_slice(&[0x49, 0xBB]);
+        buf[2..10].copy_from_slice(&(counter as u64).to_le_bytes());
+        buf[10..13].copy_from_slice(&[0x49, 0xFF, 0x03]);
+    }
+
     /// Whether the stencil ends with `jmp toi_continue`.
     pub fn ends_with_continue(code: &[u8], relocs: &[super::R]) -> bool {
         let n = code.len();
@@ -756,6 +767,11 @@ mod arch {
 
     pub const TRAILING_JUMP: usize = 4;
     pub const CODE_ALIGN: usize = 16;
+
+    /// No counting prefix on arm64 (see `count_prefix` in the parent).
+    pub const COUNT_PREFIX: usize = 0;
+
+    pub fn count_prefix(_: &mut [u8], _: *mut u64) {}
 
     pub fn ends_with_continue(code: &[u8], relocs: &[super::R]) -> bool {
         let n = code.len();
@@ -3410,13 +3426,23 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let fb = &fbs[insn.frame as usize];
             let shape = unsafe { &*(s as *const Shape) };
             if let Some(slot) = shape.lookup(fb.name(insn)) {
-                // A store to a read-only property does nothing, and one to
-                // a prototype's (a unique shape's) must bump the epoch (see
-                // `Vm::store_field`): left to the interpreter.
+                // A store to a read-only property does nothing, one to a
+                // prototype's (a unique shape's) must bump the epoch, and one
+                // to a function's constant field may have to make it mutable
+                // (see `Vm::store_field`): left to the interpreter. (The
+                // global object isn't a register's.) Other objects' fields
+                // stores make mutable, as caching them does.
+                let cell = shape.field_cell(slot);
+                let function = shape.class == crate::object::Class::Function;
                 if !load
-                    && (shape.attrs[slot as usize] & crate::object::READ_ONLY != 0 || shape.unique)
+                    && (shape.attrs[slot as usize] & crate::object::READ_ONLY != 0
+                        || shape.unique
+                        || (function && cell.is_constant()))
                 {
                     return bail(out);
+                }
+                if !load && cell.is_constant() {
+                    unsafe { (*crate::interp::current_vm()).field_made_mutable(cell) };
                 }
                 let (oop, off) = split_location(shape.location(slot));
                 if off <= 0xFFFF {
@@ -6476,7 +6502,18 @@ impl JitCode {
                 })
                 .collect()
         };
-        let hot_at = place(&hot, &mut pos);
+        // Counting (`TOI_COUNT`): each hot piece behind a counter of its
+        // stencil's executions, where jumps to it and falls into it land.
+        let prefix = count_prefix();
+        let hot_at: Vec<usize> = hot
+            .iter()
+            .map(|p| {
+                let at = pos;
+                pos += prefix + p.len();
+                at
+            })
+            .collect();
+        let code_at: Vec<usize> = hot_at.iter().map(|&at| at + prefix).collect();
         let main_len = pos;
         let label = |i: usize| hot_at[label_piece[i]];
         let entry_at = if has_entry_seq { 0 } else { label(entry) };
@@ -6570,7 +6607,7 @@ impl JitCode {
                     map.push_str(&format!("{:x} {len:x} jit:{name}\n", base as usize + at));
                 }
             };
-            for (p, &at) in hot.iter().zip(&hot_at) {
+            for (p, &at) in hot.iter().zip(&code_at) {
                 let name = if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
                 sym(at, p.len(), name);
             }
@@ -6605,13 +6642,13 @@ impl JitCode {
             Target::Label(i) => label(i as usize),
             Target::Stub(s) => stub_ats[s as usize][0],
             Target::Piece(k) => hot_at[k as usize],
-            Target::AfterPiece(k) => hot_at[k as usize] + hot[k as usize].len(),
+            Target::AfterPiece(k) => code_at[k as usize] + hot[k as usize].len(),
         };
         // Copy the first `len` bytes of `s` to `at` and patch it: register
         // fields of a family template, operands from `p`, continuation and
         // branch target at the given offsets, and the helper of hot piece
         // `key`.
-        let raw_pieces = hot.iter().zip(&hot_at).chain(
+        let raw_pieces = hot.iter().zip(&code_at).chain(
             stubs
                 .iter()
                 .zip(&stub_ats)
@@ -6622,7 +6659,7 @@ impl JitCode {
             buf[at..at + code.len()].copy_from_slice(code);
         }
         for (k, s, to_cold, to_hot) in &raw_links {
-            let (h, c) = (hot_at[*k], stub_ats[*s][0]);
+            let (h, c) = (code_at[*k], stub_ats[*s][0]);
             let mut rel32 = |field_end: usize, to: usize| {
                 let d = (to as i64 - field_end as i64) as i32;
                 buf[field_end - 4..field_end].copy_from_slice(&d.to_le_bytes());
@@ -6671,7 +6708,7 @@ impl JitCode {
         // helpers share them.
         let hot_targets: Vec<(usize, usize)> = hot
             .iter()
-            .zip(&hot_at)
+            .zip(&code_at)
             .map(|(p, &at)| (resolve(p.cont, at + p.len()), resolve(p.jump, at + p.len())))
             .collect();
         for (k, p) in hot.iter().enumerate() {
@@ -6679,7 +6716,7 @@ impl JitCode {
                 continue;
             }
             let (cont, jump) = hot_targets[k];
-            emit(p.stencil, p.len(), hot_at[k], p, cont, jump, Some(k));
+            emit(p.stencil, p.len(), code_at[k], p, cont, jump, Some(k));
         }
         for &(k, h, at) in &helper_list {
             let (cont, jump) = hot_targets[k];
@@ -6700,6 +6737,12 @@ impl JitCode {
                     0,
                     None,
                 );
+            }
+        }
+        if prefix > 0 {
+            for (p, &at) in hot.iter().zip(&hot_at) {
+                let name = if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
+                arch::count_prefix(&mut buf[at..at + prefix], piece_counter(name, p.len()));
             }
         }
 
@@ -7716,6 +7759,51 @@ thread_local! {
 /// Run `f`, adding its time to `total` unless it runs within another timed
 /// call.
 pub static LOWERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Profiling: with `TOI_COUNT` set, hot code counts each stencil's
+/// executions (exactly, unlike sampling, whose skid moves samples to the
+/// next piece), reported by [`count_report`]. x86-64 only.
+fn count_prefix() -> usize {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("TOI_COUNT").is_some()) {
+        arch::COUNT_PREFIX
+    } else {
+        0
+    }
+}
+
+/// Per stencil name: executions (boxed: compiled code increments it in
+/// place) and code bytes.
+type Counts = HashMap<&'static str, (Box<u64>, usize)>;
+static COUNTS: std::sync::Mutex<Option<Counts>> = std::sync::Mutex::new(None);
+
+fn piece_counter(name: &'static str, len: usize) -> *mut u64 {
+    let mut counts = COUNTS.lock().unwrap();
+    let (n, bytes) = counts
+        .get_or_insert_with(HashMap::default)
+        .entry(name)
+        .or_insert_with(|| (Box::new(0), len));
+    *bytes = (*bytes).max(len);
+    &mut **n
+}
+
+/// The counts `TOI_COUNT` collected, most executed bytes first: stencil,
+/// executions, bytes, executions times bytes.
+pub fn count_report() -> String {
+    let counts = COUNTS.lock().unwrap();
+    let mut rows: Vec<_> = counts
+        .iter()
+        .flatten()
+        .map(|(name, (n, bytes))| (**n * *bytes as u64, **n, *bytes, *name))
+        .collect();
+    rows.sort_unstable_by(|a, b| b.cmp(a));
+    let total: u64 = rows.iter().map(|r| r.0).sum::<u64>().max(1);
+    rows.iter()
+        .map(|(w, n, bytes, name)| {
+            format!("{:6.2}% {n:>12} x {bytes:>4} B  {name}\n", 100.0 * *w as f64 / total as f64)
+        })
+        .collect()
+}
+
 pub static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn timed<T>(total: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> T) -> T {
@@ -8279,7 +8367,10 @@ fn reuse_global_loads(out: &mut Lowered) {
 /// register holds the function. Only in-object slots (out-of-line ones
 /// move when they grow), in straight-line code (registers' values known
 /// from the last jump target on), not where such a check exited, and not
-/// a global the code stores to.
+/// a global the code stores to. None for a constant field (see
+/// `FieldCell`): a store that changes it drops the code, which notices
+/// after calls; so not one the code itself may store to (by name, or any
+/// with a keyed store), through the runtime.
 fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) {
     use crate::object::{Object, PROTOTYPE};
     let n = out.insns.len();
@@ -8292,6 +8383,18 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     let word = |at: u64| unsafe { *(at as *const u64) };
     let object = |v: u64| Value::from_bits(v).is_cell().then_some(v as *mut Object);
     let proto = |o: *mut Object| unsafe { (*o).flags & PROTOTYPE != 0 };
+    // Fields the code may store to.
+    let keyed = out.insns.iter().any(|i| i.op == Op::SetKeyed);
+    let set: Vec<Atom> = (out.insns.iter())
+        .filter(|i| i.op == Op::SetNamed)
+        .map(|i| out.fbs[i.frame as usize].name(i))
+        .collect();
+    // The cell of `o`'s field `name`, if constant and not stored to.
+    let constant = |o: *mut Object, name: Atom| unsafe {
+        let s = &*(*o).shape;
+        (s.lookup(name).map(|slot| s.field_cell(slot)))
+            .filter(|c| c.is_constant() && !keyed && !set.contains(&name))
+    };
     // Globals the code stores to: likely to change.
     let stored: Vec<Atom> = (out.insns.iter())
         .filter(|i| i.op == Op::StaGlobal)
@@ -8326,17 +8429,20 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
                 },
             ) => {
                 let at = global + off as u64;
-                let stored = || stored.contains(&out.fbs[i.frame as usize].name(&i));
-                (!oop && !stored()).then(|| (word(at), at, word(at), ft, global))
+                let name = out.fbs[i.frame as usize].name(&i);
+                let check = if constant(global as *mut Object, name).is_some() { 0 } else { at };
+                (!oop && !stored.contains(&name)).then(|| (word(at), check, word(at), ft, global))
             }
             (Op::GetNamed, Prop::Own { shape, off, ft }) => of(i.reg)
                 .and_then(object)
                 .filter(|&o| word(o as u64) == shape)
                 .map(|o| {
                     let at = o as u64 + off as u64;
+                    let name = out.fbs[i.frame as usize].name(&i);
+                    let fixed = proto(o) || constant(o, name).is_some();
                     (
                         word(at),
-                        if proto(o) { 0 } else { at },
+                        if fixed { 0 } else { at },
                         word(at),
                         ft,
                         o as u64,
@@ -8372,7 +8478,14 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
         match i.op {
             Op::LdaGlobal | Op::GetNamed => {
                 acc = None;
-                if let Some(p @ Prop::Const { value, .. }) = folded {
+                if let Some(p @ Prop::Const { value, at, obj, .. }) = folded {
+                    // Without a check: a store that changes it must drop
+                    // the code.
+                    if at == 0
+                        && let Some(c) = constant(obj as *mut Object, out.fbs[i.frame as usize].name(&i))
+                    {
+                        c.fold();
+                    }
                     out.props[k] = p;
                     acc = Some(value);
                 }

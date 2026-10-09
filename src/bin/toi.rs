@@ -67,6 +67,10 @@ fn main() -> ExitCode {
                     toi::jit::COMPILES.load(std::sync::atomic::Ordering::Relaxed)
                 );
             }
+            // `TOI_COUNT`: hot code's stencil executions.
+            if std::env::var_os("TOI_COUNT").is_some() {
+                eprint!("{}", toi::jit::count_report());
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

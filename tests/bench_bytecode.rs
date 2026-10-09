@@ -89,12 +89,12 @@ fn hot_property_loops_compile_without_repeated_guards() {
 
 #[test]
 fn loops_with_calls_compile_with_the_callee_inlined() {
-    // A global function is checked where it is loaded, its global's slot
-    // (the global may change), then needs no check as the callee; a method
-    // from a prototype holding it needs neither (its slots are stable while
-    // the code's prototype epoch holds).
+    // A global function needs no check where it is loaded (its global is
+    // constant: a store changing it drops the code, see `FieldCell`), nor
+    // as the callee; a method from a prototype holding it needs neither (its
+    // slots are stable while the code's prototype epoch holds).
     for (name, want, checked) in [
-        ("10-call-global-function.asm", "tlt_jf_", true),
+        ("10-call-global-function.asm", "tlt_jf_", false),
         ("23-prototype-method.asm", "add_ii_", false),
     ] {
         let mut vm = Vm::new();

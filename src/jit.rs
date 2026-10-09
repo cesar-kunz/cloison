@@ -9086,12 +9086,38 @@ fn hoist_loads(
     let mut groups: Vec<Group> = Vec::new();
     let mut taken = vec![false; n];
     let mut count = 0;
+    // Where compiled code entered at loop header `u` (by its bytecode
+    // offset, `JitFunction::index_of`) starts: the first of the copies
+    // earlier rounds put before it, which carry its offset.
+    let entry_at = |u: usize| {
+        let mut k = u;
+        while k > 0 && insns[k - 1].frame == 0 && insns[k - 1].pc == insns[u].pc && !target[k] {
+            k -= 1;
+        }
+        k
+    };
     for &(t, e) in &loops {
         let inside = |k: usize| t <= k && k <= e;
-        if loops
-            .iter()
-            .any(|&(u, _)| u != t && inside(u) && insns[u].frame == 0)
-        {
+        // Loops of the function's own frame inside, where compiled code
+        // may be entered (tiering up there): each gets a copy of the loads
+        // where that entry lands. Only loops entered by a jump to their
+        // condition, so nothing else gets there: a loop entered by falling
+        // into it would run the copy at every iteration around it.
+        let mut nested: Vec<usize> = Vec::new();
+        let mut ok = true;
+        for &(u, _) in loops.iter().filter(|&&(u, _)| u != t && inside(u) && insns[u].frame == 0) {
+            let at = entry_at(u);
+            let jumped = at > 0
+                && insns[at - 1].op == Op::Jump
+                && !insns[at - 1].bail
+                && (at..=u).all(|k| k == u || !target[k]);
+            if !jumped {
+                ok = false;
+                break;
+            }
+            nested.push(at);
+        }
+        if !ok {
             continue;
         }
         // Entered as `hoist_guards` requires.
@@ -9206,13 +9232,14 @@ fn hoist_loads(
             continue;
         }
         type Place = (usize, Option<(usize, usize)>, bool);
-        let places: Vec<Place> = if fall {
+        let mut places: Vec<Place> = if fall {
             vec![(t, Some((t, e)), false)]
         } else if insns[t].frame == 0 {
-            vec![(t - 1, None, true), (t, None, false)]
+            vec![(t - 1, None, true), (entry_at(t), None, false)]
         } else {
             vec![(t - 1, None, true)]
         };
+        places.extend(nested.iter().map(|&at| (at, None, false)));
         if places.iter().any(|p| groups.iter().any(|g| g.at == p.0)) {
             continue;
         }

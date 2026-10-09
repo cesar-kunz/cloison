@@ -3347,7 +3347,7 @@ macro_rules! set_keyed {
     ($loc:tt, $case:literal, $array:expr, |$s:ident, $v:ident, $code:ident| $fits:expr, |$t:ident| $value:expr) => {
         stencil!("set_keyed_", $case, loc!($loc); |$s| {
             let o = get!($loc, $s);
-            let key = *(($s.regs as *const u8).add(imm() as usize) as *const Value);
+            let key = *at_imm($s.regs as *mut u8);
             if !$array($s.tag, o) || !$s.tag.is_int32(key) {
                 exit!($s)
             }
@@ -3410,7 +3410,7 @@ macro_rules! property_location {
         // (A typed array goes through the runtime.)
         stencil_slow!("set_keyed_", loc!($loc); |s| {
             let o = get!($loc, s);
-            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+            let key = *at_imm(s.regs as *mut u8);
             if !is_array(s.tag, o) {
                 if is_cell(s.tag, o) && *(o.to_bits() as *const u8).add(8) == 7 {
                     slow!(s)
@@ -3436,7 +3436,7 @@ macro_rules! property_location {
             *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
             next!(s)
         }; |s| {
-            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+            let key = *at_imm(s.regs as *mut u8);
             let args = [get!($loc, s), key, s.acc];
             let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
@@ -3555,17 +3555,33 @@ macro_rules! property_location {
         // for. Leaves only where it would throw or call a function.
         // `o[k] = acc` through the runtime (`jit::Prop::Runtime`), the key
         // from memory, at `regs + imm`; `acc` boxed, or (`_i`) an int32.
-        stencil!("set_keyed_rt_", loc!($loc); |s| {
-            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+        // (An object's own element first, as the interpreter's
+        // `op_set_keyed` stores it: see `own_element_store`.)
+        stencil_slow!("set_keyed_rt_", loc!($loc); |s| {
+            if own_element_store(s.tag, get!($loc, s), *at_imm(s.regs as *mut u8), s.acc, false) {
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let key = *at_imm(s.regs as *mut u8);
             let args = [get!($loc, s), key, s.acc];
-            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            // (The second argument is unused: `NULL` keeps LLVM from
+            // merging this helper with `set_keyed_`'s, identical otherwise,
+            // which a stencil can't jump to.)
+            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::NULL);
             if r == 0 {
                 exit!(s)
             }
             next!(s)
         });
-        stencil!("set_keyed_rt_i_", loc!($loc); |s| {
-            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+        stencil_slow!("set_keyed_rt_i_", loc!($loc); |s| {
+            let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            if own_element_store(s.tag, get!($loc, s), *at_imm(s.regs as *mut u8), v, true) {
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let key = *at_imm(s.regs as *mut u8);
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             let args = [get!($loc, s), key, v];
             let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
@@ -3664,7 +3680,7 @@ macro_rules! typed_load {
 macro_rules! typed_store {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $store:expr) => {
         stencil!("tset_", $w, "_", loc!($loc); |$s| {
-            let key = *(($s.regs as *const u8).add(imm() as usize) as *const Value);
+            let key = *at_imm($s.regs as *mut u8);
             if !$s.tag.is_int32(key) {
                 exit!($s)
             }
@@ -3674,7 +3690,7 @@ macro_rules! typed_store {
         });
         stencil!("tset_", $w, "_chk_", loc!($loc); |$s| {
             let o = get!($loc, $s);
-            let key = *(($s.regs as *const u8).add(imm() as usize) as *const Value);
+            let key = *at_imm($s.regs as *mut u8);
             if !is_typed($s.tag, o, imm64()) || !$s.tag.is_int32(key) {
                 exit!($s)
             }
@@ -3741,19 +3757,20 @@ with_gprs!(each_gpr! typed_gpr);
 //
 // A cell (`vm::Upvalue`) points (`at`, its first field) to the variable: a
 // register of the frame defining it while that runs, the cell's own slot
-// after. `lda_upvalue` finds cell `imm` of the frame's function (the
-// header slot `imm64b` bytes below the registers): after the function
-// object's in-object slots (48 bytes of header, then the shape's
-// capacity, at `imm64` in the shape, times 8). `_c`: the cell at `imm64`.
+// after. `lda_upvalue` finds cell `imm` of the frame's function (in the
+// frame header, `FUNC_OFF` bytes below the registers): `imm` is the cell's
+// byte offset in the function object, after its in-object slots, which
+// every function object with upvalues has as many of (`Vm::upvalues`).
+// `_c`: the cell at `imm64`.
+
+/// `interp::FUNC_OFF` (the JIT checks they agree).
+const FUNC_OFF: usize = 80;
 
 #[inline(always)]
 unsafe fn upvalue_at(regs: *mut Value) -> *mut Value {
     unsafe {
-        let f = *((regs as *const u8).sub(imm64b() as usize) as *const *const u8);
-        let shape = *(f as *const *const u8);
-        let cap = *(shape.add(imm64() as usize) as *const u32) as usize;
-        let cell = *(f.add(48 + 8 * cap) as *const *const *mut Value).add(imm() as usize);
-        *cell
+        let f = *(regs.byte_sub(FUNC_OFF) as *const *mut u8);
+        *(*(at_imm(f) as *const *const *mut Value))
     }
 }
 
@@ -4162,6 +4179,33 @@ unsafe fn push_target(cache: *const u64, key: u64) -> u64 {
         }
     }
     to
+}
+
+/// `o[key] = v` for an object `o` whose elements' type
+/// (`Shape::elems_code`) fits `v`, `key` an int32 within its elements, as
+/// the interpreter's `op_set_keyed` stores it (`int32`: `v` is one,
+/// which codes 0 to 2 fit). False, storing nothing, otherwise.
+#[inline(always)]
+unsafe fn own_element_store(tag: NumberTag, o: Value, key: Value, v: Value, int32: bool) -> bool {
+    if !is_cell(tag, o) || !tag.is_int32(key) {
+        return false;
+    }
+    let p = o.to_bits() as *mut u8;
+    unsafe {
+        let fits = match **(p as *const *const u64) {
+            code if int32 => code <= 2,
+            0 => true,
+            1 => tag.is_int32(v),
+            2 => v.to_bits() & tag.to_bits() != 0,
+            sh => is_cell(tag, v) && *(v.to_bits() as *const u64) == sh,
+        };
+        let i = int(key) as u32;
+        if !fits || i >= *(p.add(32) as *const u32) {
+            return false;
+        }
+        *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
+        true
+    }
 }
 
 #[inline(always)]

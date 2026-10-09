@@ -144,6 +144,24 @@ impl TypedKind {
         }
     }
 
+    /// Store int32 `v` as element `i` at `p`: as [`TypedKind::store`] of
+    /// it, without the conversions through `f64`.
+    ///
+    /// # Safety
+    /// As [`TypedKind::load`].
+    pub unsafe fn store_i32(self, p: *mut u8, i: usize, v: i32) {
+        unsafe {
+            match self {
+                TypedKind::I8 | TypedKind::U8 => *p.add(i) = v as u8,
+                TypedKind::U8Clamped => *p.add(i) = v.clamp(0, 255) as u8,
+                TypedKind::I16 | TypedKind::U16 => p.cast::<u16>().add(i).write_unaligned(v as u16),
+                TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(v as u32),
+                TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(v as f32),
+                TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(v as f64),
+            }
+        }
+    }
+
     /// Store number `d` (ToNumber of the value) as element `i` at `p`.
     ///
     /// # Safety

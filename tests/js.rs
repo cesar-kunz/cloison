@@ -2462,3 +2462,83 @@ fn upvalues_and_negation_agree_with_node() {
     assert_eq!(value(&format!("{UPVALUES}\nupvalues();")), "1051500,441000,442000,119400000,400000,125085000");
     assert_eq!(value(&format!("{UPVALUES}\nnegation();")), "-397800000;1000;-Infinity,2147483648,-3,-5,-10|-2000500;166.66666666667243;-Infinity,2147483648,-3,-5,-10|1996000;-333.33333333334485;Infinity,2147483648,-3,-5,-10");
 }
+
+/// Typed arrays in globals past the global object's in-object slots (as
+/// Mandreel's `HEAPU16`): constants in compiled code, with a keyed store
+/// in the same function; then replaced by arrays of other kinds. The
+/// expected value is Node's.
+const GLOBAL_HEAPS: &str = r#"
+function globalHeaps() {
+for (var g = 0; g < 40; g++) this["pad" + g] = g;
+this.HEAPU16 = new Uint16Array(256); this.HEAP32 = new Int32Array(128);
+function copy(n) { var s = 0; for (var i = 0; i < n; i++) { HEAPU16[i] = i * 7 + 65530; HEAP32[i & 127] = HEAPU16[i] - i; s = (s + HEAP32[i & 127]) | 0; } return s; }
+var t = 0, r = [];
+for (var k = 0; k < 3000; k++) t = (t + copy(200)) | 0;
+r.push(t);
+this.HEAPU16 = new Int8Array(256);
+for (var k2 = 0; k2 < 300; k2++) t = (t + copy(200)) | 0;
+r.push(t);
+this.HEAP32 = new Float64Array(128);
+HEAPU16.extra = 1;
+for (var k3 = 0; k3 < 300; k3++) t = (t + copy(200)) | 0;
+r.push(t, HEAPU16[3], HEAP32[3], HEAPU16.extra);
+return r.join(",");
+}
+"#;
+
+#[test]
+fn global_typed_arrays_agree_with_node() {
+    assert_eq!(value(&format!("{GLOBAL_HEAPS}\nglobalHeaps();")), "551208000,545503200,539798400,15,-244,1");
+}
+
+/// Keyed stores through the runtime (`set_keyed_rt`) into an object's
+/// own elements, stored in place while their type fits, then values that
+/// don't (a double, a string, an object; past the end). The expected
+/// value is Node's.
+const OWN_ELEMENTS: &str = r#"
+function ownElements() {
+function Big(n) { for (var i = 0; i < n; i++) this[i] = 0; this.t = n; }
+function fill(o, n, v) { for (var i = 0; i < n; i++) o[i] = v + i; }
+function sum(o, n) { var s = 0; for (var i = 0; i < n; i++) s += typeof o[i] == "number" ? o[i] : o[i].length; return s; }
+var a = new Big(40), b = new Big(40), r = [];
+for (var k = 0; k < 2000; k++) { fill(a, 40, k); fill(b, 30, k & 7); }
+r.push(sum(a, 40), sum(b, 40));
+fill(a, 40, 0.5); r.push(sum(a, 40));
+fill(b, 45, "x"); r.push(sum(b, 45), b[44], b.t);
+var arr = [1, 2, 3]; for (var k2 = 0; k2 < 500; k2++) fill(arr, 3, k2); fill(arr, 3, {length: 9}); r.push(sum(arr, 3));
+return r.join(",");
+}
+"#;
+
+#[test]
+fn own_element_stores_agree_with_node() {
+    assert_eq!(value(&format!("{OWN_ELEMENTS}\nownElements();")), "80740,645,800,125,x44,40,48");
+}
+
+/// ToInt32 of doubles around 2^31, 2^32, 2^63 and the non-finite ones;
+/// int32s and doubles stored into every typed array kind. The expected
+/// value is Node's.
+const TO_INT32: &str = r#"
+function toInt32s() {
+var ds = [0.5, -0.5, -1.5, 2147483647.9, 2147483648.5, -2147483649.5, 4294967296.5, 4294967301.7, -4294967301.7, 1e15 + 0.5, -1e18, 9.2e18, 9223372036854775808, -9223372036854775808, 1e19, 1.8e308, -0, NaN, Infinity, -Infinity];
+var r = [];
+for (var i = 0; i < ds.length; i++) r.push(ds[i] | 0, ds[i] >>> 0, ~ds[i]);
+var kinds = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];
+var vs = [-129, -1, 0, 200, 255, 256, 40000, 70000, -70000, 2147483647, -2147483648, 16777217];
+for (var k = 0; k < kinds.length; k++) {
+  var a = new kinds[k](vs.length);
+  for (var j = 0; j < vs.length; j++) a[j] = vs[j];
+  for (var j2 = 0; j2 < vs.length; j2++) r.push(a[j2]);
+  a[0] = 1e10 + 3.7; a[1] = -3.5; r.push(a[0], a[1]);
+}
+return r.join(",");
+}
+"#;
+
+#[test]
+fn to_int32_agrees_with_node() {
+    assert_eq!(
+        value(&format!("{TO_INT32}\ntoInt32s();")),
+        "0,0,-1,0,0,-1,-1,4294967295,0,2147483647,2147483647,-2147483648,-2147483648,2147483648,2147483647,2147483647,2147483647,-2147483648,0,0,-1,5,5,-6,-5,4294967291,4,-1530494976,2764472320,1530494975,1486618624,1486618624,-1486618625,-1650982912,2643984384,1650982911,0,0,-1,0,0,-1,-1981284352,2313682944,1981284351,0,0,-1,0,0,-1,0,0,-1,0,0,-1,0,0,-1,127,-1,0,-56,-1,0,64,112,-112,-1,0,1,3,-3,127,255,0,200,255,0,64,112,144,255,0,1,3,253,0,0,0,200,255,255,255,255,0,255,0,255,255,0,-129,-1,0,200,255,256,-25536,4464,-4464,-1,0,1,-7165,-3,65407,65535,0,200,255,256,40000,4464,61072,65535,0,1,58371,65533,-129,-1,0,200,255,256,40000,70000,-70000,2147483647,-2147483648,16777217,1410065411,-3,4294967167,4294967295,0,200,255,256,40000,70000,4294897296,2147483647,2147483648,16777217,1410065411,4294967293,-129,-1,0,200,255,256,40000,70000,-70000,2147483648,-2147483648,16777216,10000000000,-3.5,-129,-1,0,200,255,256,40000,70000,-70000,2147483647,-2147483648,16777217,10000000003.7,-3.5"
+    );
+}

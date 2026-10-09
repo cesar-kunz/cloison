@@ -365,7 +365,7 @@ pub struct Vm {
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
     open_upvalues: Vec<*mut Upvalue>,
-    function_shape: *const Shape,
+    pub(crate) function_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
     pub(crate) array_shape: *const Shape,
     proto_object_shape: *const Shape,

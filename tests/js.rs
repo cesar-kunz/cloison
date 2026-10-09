@@ -2415,3 +2415,50 @@ NaN,10000002997,NaN,NaN
 96"#
     );
 }
+
+/// Functions with upvalues in compiled code: read and written, in the
+/// compiled function (through its frame's function) and inlined (the
+/// cells known), closures of one code with other cells, an Emscripten-like
+/// module whose functions share a heap, and `-x` and `~x`. The expected
+/// values are Node's.
+const UPVALUES: &str = r#"
+function upvalues() {
+function makeCounter(start) {
+  var n = start, log = [];
+  function inc(k) { n += k; return n; }
+  function get() { return n; }
+  function sum(arr) { var s = 0; for (var i = 0; i < arr.length; i++) s += inc(arr[i]) & 7; return s; }
+  function mk(j) { return function () { return n + j; }; }
+  return { inc: inc, get: get, sum: sum, mk: mk };
+}
+var a = makeCounter(0), b = makeCounter(1000);
+var arr = []; for (var i = 0; i < 50; i++) arr.push(i % 7);
+var t = 0;
+for (var r = 0; r < 3000; r++) {
+  t = (t + a.sum(arr) + b.sum(arr)) | 0;
+  if (r % 500 == 0) t += a.mk(r)() - b.get();
+}
+var Mod = (function () {
+  var HEAP = new Int32Array(1024), base = 16, calls = 0;
+  function store(p, v) { HEAP[(p + base) >> 2] = v; calls++; }
+  function load(p) { return HEAP[(p + base) >> 2]; }
+  function run(n) { var s = 0; for (var i = 0; i < n; i++) { store(i * 4, i * 3); s = (s + load(i * 4)) | 0; if (i == n - 1) base = (base + 4) & 1023; } return s; }
+  return { run: run, calls: function () { return calls; } };
+})();
+var m = 0; for (var q = 0; q < 2000; q++) m = (m + Mod.run(200)) | 0;
+function outer() { var x = 1; function mid() { var y = 2; function inner() { x++; return x * 10 + y; } return inner; } return mid(); }
+var f = outer(), z = 0; for (var q2 = 0; q2 < 5000; q2++) z = (z + f()) | 0;
+return [t, a.get(), b.get(), m, Mod.calls(), z].join(",");
+}
+function negation() {
+function f(a, b) { var s = 0, t = 0, u = []; for (var i = 0; i < 2000; i++) { var x = (i - 1000) * a; s += -x + ~(i * b); t += -(x / 3); if (i == 1000) u.push(1 / -x, -(-2147483648), ~2.7, -"5", ~"9"); } return [s, t, u.join(",")].join(";"); }
+var r; for (var k = 0; k < 200; k++) r = f(k & 3, k);
+return r + "|" + f(0.5, 1) + "|" + f(-1, -1);
+}
+"#;
+
+#[test]
+fn upvalues_and_negation_agree_with_node() {
+    assert_eq!(value(&format!("{UPVALUES}\nupvalues();")), "1051500,441000,442000,119400000,400000,125085000");
+    assert_eq!(value(&format!("{UPVALUES}\nnegation();")), "-397800000;1000;-Infinity,2147483648,-3,-5,-10|-2000500;166.66666666667243;-Infinity,2147483648,-3,-5,-10|1996000;-333.33333333334485;Infinity,2147483648,-3,-5,-10");
+}

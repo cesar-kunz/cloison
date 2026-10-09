@@ -67,7 +67,7 @@ use std::rc::Rc;
 /// FxHash (as rustc does): `std`'s SipHash dominated entering compiled code
 /// at a function call.
 pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
-type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
+pub(crate) type HashSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
 
 #[derive(Default, Clone, Copy)]
 pub(crate) struct FxHasher(u64);
@@ -1642,7 +1642,13 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 | Op::ShiftLeft
                 | Op::ShiftRight
                 | Op::ShiftRightLogical => reg = code[pc + 1],
-                Op::TestUndefined | Op::TestNull | Op::TestNullish | Op::ToNumber => {}
+                Op::TestUndefined
+                | Op::TestNull
+                | Op::TestNullish
+                | Op::ToNumber
+                | Op::Negate
+                | Op::BitNot => {}
+                Op::LdaUpvalue | Op::StaUpvalue if vm => imm = code[pc + 1] as i32,
                 Op::Nop
                 | Op::Return
                 | Op::LdaTrue
@@ -1843,6 +1849,9 @@ pub(crate) enum Prop {
     /// a buffer's or a string's elements (`vm::BYTES_LOC`; see
     /// `get_keyed_rt` in the stencils).
     Runtime,
+    /// An upvalue of an inlined frame's function, known: its cell
+    /// (`vm::Upvalue`), at address `cell`.
+    Upvalue { cell: u64 },
     /// A keyed load whose receivers were typed arrays of element kind
     /// `kind` (`object::TypedKind`; see `tget_*` in the stencils).
     Typed { kind: u8 },
@@ -2177,7 +2186,7 @@ impl Feedback {
         let name = self.name(insn);
         let field = |s: *const Shape| {
             let s = unsafe { &*s };
-            s.lookup(name).map_or(FieldType::Any, |k| s.field_type(k))
+            s.lookup(name).map_or(FieldType::Any, |k| s.field_type_relied(k))
         };
         // For loads, `holder` is a prototype; for stores, the field's type.
         let holder = ic.holder;
@@ -3474,6 +3483,43 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             }
         }
         Op::Nop => ("nop", ""),
+        Op::Negate => {
+            let (case, ty) = match st.acc {
+                I32 => int_op("i", "iif"),
+                F64 => ("f", F64),
+                _ => ("", Any),
+            };
+            out.acc = ty;
+            ("neg", case)
+        }
+        Op::BitNot => {
+            out.acc = if st.acc == I32 { I32 } else { Any };
+            ("bit_not", if st.acc == I32 { "i" } else { "" })
+        }
+        // `lda_upvalue` finds the cell from the frame's function (its
+        // in-object slots, then the cells: `Vm::upvalues`), the capacity's
+        // offset in the shape in `imm64`, the function's below the
+        // registers in `imm64b`; `_c` has the cell (`Prop::Upvalue`).
+        Op::LdaUpvalue | Op::StaUpvalue => {
+            if insn.op == Op::LdaUpvalue {
+                out.acc = Any;
+            }
+            let load = insn.op == Op::LdaUpvalue;
+            return match spec.props.get(i).copied() {
+                Some(Prop::Upvalue { cell }) => Sel {
+                    ops: Some((0, cell, 0)),
+                    ..Sel::new(if load { "lda_upvalue_c" } else { "sta_upvalue_c" }, "", out)
+                },
+                _ => Sel {
+                    ops: Some((
+                        insn.imm,
+                        std::mem::offset_of!(Shape, capacity) as u64,
+                        interp::FUNC_OFF as u64,
+                    )),
+                    ..Sel::new(if load { "lda_upvalue" } else { "sta_upvalue" }, "", out)
+                },
+            };
+        }
         // `x++`'s old value: a number is itself; anything else exits, for
         // the interpreter to convert.
         Op::ToNumber if matches!(st.acc, I32 | F64) => ("nop", ""),
@@ -3733,7 +3779,10 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     ..Sel::new("tget", if known { w } else { CHECKED[kind as usize] }, out)
                 };
             }
-            if bytes || matches!(prop, Prop::Runtime | Prop::Typed { .. }) {
+            // (A site that gave up on the stencils, but with an int32 key
+            // into a receiver of known shape: `get_keyed_i_nc`, as before.)
+            let known = ix && matches!(reg, Ty::Obj(_) | Ty::Ext(_));
+            if bytes || matches!(prop, Prop::Typed { .. }) || (prop == Prop::Runtime && !known) {
                 out.acc = Any;
                 return Sel::new("get_keyed_rt", "", out);
             }
@@ -3758,6 +3807,28 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         op => unreachable!("rejected by decode: {op:?}"),
     };
     Sel::new(base, case, out)
+}
+
+/// While alive: the function whose code is being made, which the field
+/// types read are recorded for (`object::COMPILING`); the one before after.
+struct Compiling(usize);
+
+impl Compiling {
+    fn of(code: *const crate::vm::Code) -> Compiling {
+        Compiling(crate::object::COMPILING.with(|c| c.replace(code as usize)))
+    }
+}
+
+impl Drop for Compiling {
+    fn drop(&mut self) {
+        crate::object::COMPILING.with(|c| c.set(self.0));
+    }
+}
+
+/// Compiled code takes the value in prototype slot `addr` as fixed: a
+/// store of another drops it (`Vm::relied_slots`).
+fn rely_on_slot(addr: u64) {
+    unsafe { (*crate::interp::current_vm()).relied_slots.insert(addr as usize) };
 }
 
 /// The element kind (`object::TypedKind`) of typed arrays of shape `s`,
@@ -3971,7 +4042,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                         ops: Some((off, 0, 0)),
                         ..Sel::new(base, "nc", out)
                     };
-                    return finish(sel, shape.field_type(slot));
+                    return finish(sel, shape.field_type_relied(slot));
                 }
             }
         }
@@ -5154,6 +5225,8 @@ fn stencil_for(
                     | "create_array"
                     | "create_object"
                     | "lda_constant"
+                    | "lda_upvalue"
+                    | "lda_upvalue_c"
                     | "bail"
             ) {
                 box_acc(&mut pre);
@@ -6908,6 +6981,23 @@ impl JitCode {
                 Target::Next
             };
             hot.extend(pre);
+            // A direct call to a function with upvalues: its frame's header
+            // gets the function (`set_frame_func`), which the runtime's
+            // calls write themselves.
+            if matches!(name.as_str(), "call_direct" | "call_direct_nc" | "construct_direct")
+                && let Some(Prop::Call { site, .. }) = props.get(i)
+            {
+                let site = unsafe { &*vm_sites[*site as usize].get() };
+                if !site.callee.is_null() && !unsafe { (&(*site.callee).upvalues).is_empty() } {
+                    hot.push(Piece {
+                        imm64: site.closure,
+                        ..Piece::with_imm(
+                            "set_frame_func",
+                            (8 * site.frame) as i32 - interp::FUNC_OFF as i32,
+                        )
+                    });
+                }
+            }
             // `mod_smi_pow2` takes the mask, k - 1; `mod_smi_{u,i}_s<s>` k
             // and its magic number (`mod_magic`); `mod_smi_iif` k and
             // ⌈2^64 / k⌉.
@@ -7633,6 +7723,8 @@ struct VmState {
     /// left to the interpreter.
     bail_exits: HashMap<usize, u32>,
     no_entry: HashSet<usize>,
+    /// Calls whose result their prediction missed (see `vm_finish`).
+    bad_results: u32,
     /// Call entries left to the interpreter after a property or callee
     /// exit ([`COOL_ENTRIES`]), letting inline caches settle before the
     /// function is lowered again.
@@ -7710,6 +7802,22 @@ const MAX_PROPERTY_EXITS: u32 = 4;
 const MAX_BAIL_EXITS: u32 = 3;
 /// Compilations per function in VM frames, over the program's run.
 const MAX_VM_COMPILES: u32 = 32;
+
+/// The compilations a function lowered to `n` instructions gets: up to
+/// [`MAX_VM_COMPILES`], fewer past [`COMPILE_SIZE`] instructions, as each
+/// costs about its size (at least 4). A large function whose feedback
+/// keeps changing (TypeScript's scanner and emitter, which compiling
+/// functions with upvalues made eligible) otherwise compiles 32 times.
+/// Measured (scores against no limit): TypeScript +7%, zlib +9%, Box2D
+/// +21%, Mandreel +15%, DeltaBlue and GameBoy unchanged; with 200, zlib
+/// and GameBoy lost half.
+fn max_compiles(n: usize) -> u32 {
+    static U: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("CUNIT").ok().and_then(|x| x.parse().ok()).unwrap_or(COMPILE_SIZE));
+    (MAX_VM_COMPILES as usize * *U / n.max(1)).clamp(4, MAX_VM_COMPILES as usize) as u32
+}
+
+/// See [`max_compiles`].
+const COMPILE_SIZE: usize = 400;
 /// Inlining limits: nesting, and the callee's size in instructions.
 const MAX_INLINE_DEPTH: usize = 2;
 const MAX_INLINE_INSNS: usize = 64;
@@ -7732,6 +7840,10 @@ struct InlineFrame {
     /// there, is a `new` one (its `Return` gives `this`).
     construct: bool,
     code: *const crate::vm::Code,
+    /// The function object it runs, if known (an inlined frame's callee,
+    /// checked): an exit writes it into the frame's header, for its
+    /// upvalues.
+    func: *mut Object,
     /// Where its registers start, in registers from the compiled frame's.
     base: usize,
     parent: usize,
@@ -8042,7 +8154,8 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
             acc_same: None,
         }
     };
-    match unsafe { f.entry_version((*vm).proto_epoch, (*vm).field_epoch, make_state) } {
+    let field_epoch = unsafe { (*vm).field_epoch.wrapping_add((*site.callee).field_deps.get()) };
+    match unsafe { f.entry_version((*vm).proto_epoch, field_epoch, make_state) } {
         Some((code, nregs)) => Version::Ready(code, nregs),
         None => Version::None,
     }
@@ -8454,6 +8567,8 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             frames: vec![InlineFrame {
                 construct: false,
                 code: root,
+                // (The root's is in its frame's header already.)
+                func: std::ptr::null_mut(),
                 base: 0,
                 parent: 0,
                 ret_pc: 0,
@@ -9085,6 +9200,9 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
                     let at = o as u64 + off as u64;
                     let name = out.fbs[i.ic_frame()].name(&i);
                     let fixed = proto(o) || constant(o, name).is_some();
+                    if proto(o) {
+                        rely_on_slot(at);
+                    }
                     (
                         word(at),
                         if fixed { 0 } else { at },
@@ -9097,6 +9215,7 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
                 .and_then(object)
                 .filter(|&o| word(o as u64) == shape)
                 .map(|o| {
+                    rely_on_slot(addr);
                     (
                         word(addr),
                         if proto(o) { 0 } else { o as u64 },
@@ -10180,6 +10299,19 @@ impl Lowering<'_> {
                     let x = self.push(i, Prop::None);
                     fix.push(x);
                 }
+                // An upvalue: in an inlined frame, of its (checked) callee,
+                // whose cells are known; in the root frame, through the
+                // frame's function (`lda_upvalue`).
+                Op::LdaUpvalue | Op::StaUpvalue => {
+                    let func = self.out.frames[frame].func;
+                    let prop = if func.is_null() {
+                        Prop::None
+                    } else {
+                        let cell = unsafe { *crate::vm::Vm::upvalues(func).add(i.imm as usize) };
+                        Prop::Upvalue { cell: cell as u64 }
+                    };
+                    self.push(i, prop);
+                }
                 _ => {
                     let given_up = self
                         .state
@@ -10187,7 +10319,8 @@ impl Lowering<'_> {
                         .get(&origin)
                         .is_some_and(|&n| n >= MAX_PROPERTY_EXITS);
                     let prop = match i.op {
-                        Op::GetKeyed if given_up => Prop::None,
+                        // (Any key: a name, a typed array's index, ….)
+                        Op::GetKeyed if given_up => Prop::Runtime,
                         Op::SetKeyed if given_up => Prop::Runtime,
                         _ if given_up && i.is_property() => {
                             i.bail = true;
@@ -10280,7 +10413,6 @@ impl Lowering<'_> {
     /// `guarded`: a guard that the callee register holds `fo` comes just
     /// before.
     fn emit_call(&mut self, frame: usize, i: Insn, fo: *mut Object, guarded: bool) {
-        let vm = self.state.vm;
         let mut site = self.call_site(frame, &i);
         let direct = self.direct_target(&i, fo, &mut site) && i.imm as u32 <= site.nparams;
         let proven = direct && (guarded || self.proven_callee(frame, i.reg, fo));
@@ -10288,8 +10420,9 @@ impl Lowering<'_> {
             site: self.out.sites.len() as u32,
             direct,
             proven,
-            epoch: unsafe { (*vm).code_epoch },
-            epoch_addr: unsafe { &raw const (*vm).code_epoch } as u64,
+            // (The compiled function's own epoch: see `Code::field_deps`.)
+            epoch: unsafe { (*self.state.root).field_deps.get() },
+            epoch_addr: unsafe { (*self.state.root).field_deps.as_ptr() } as u64,
         };
         let callee = site.callee;
         self.out
@@ -10388,7 +10521,13 @@ impl Lowering<'_> {
             return None;
         }
         let fo = unsafe { (*self.out.fbs[0].ic(i.ic as usize)).holder };
-        let ok = !fo.is_null() && unsafe { (*fo).class == Class::Function && (*fo).code == root };
+        // (Not for a function with upvalues: another closure of the same
+        // code has other cells, and the frame's header would keep this
+        // one's.)
+        let ok = !fo.is_null()
+            && unsafe {
+                (*fo).class == Class::Function && (*fo).code == root && (&(*root).upvalues).is_empty()
+            };
         ok.then_some(fo)
     }
 
@@ -11032,6 +11171,7 @@ impl Lowering<'_> {
             let CaseLoc::Proto(addr) = c.loc else {
                 return none;
             };
+            rely_on_slot(addr);
             values.push(unsafe { *(addr as *const Value) });
         }
         let shapes = fos
@@ -11081,8 +11221,10 @@ impl Lowering<'_> {
             return false;
         };
         let g = insns[get];
-        let holds =
-            |addr: u64| unsafe { *(addr as *const Value) } == crate::object::object_value(fo);
+        let holds = |addr: u64| {
+            rely_on_slot(addr);
+            (unsafe { *(addr as *const Value) }) == crate::object::object_value(fo)
+        };
         // A load from a prototype slot holding it, for every receiver shape.
         let proven = match self.out.props[get] {
             Prop::Proto { addr, .. } => holds(addr),
@@ -11241,6 +11383,7 @@ impl Lowering<'_> {
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,
+            func: fo,
             base,
             parent: frame,
             ret_pc: i.pc + i.op.size(),
@@ -11342,6 +11485,9 @@ impl JitFunction {
     /// (allocation, `return`) become exits to the interpreter (see
     /// [`lower`]).
     pub(crate) fn for_vm(code: *const crate::vm::Code, vm: *mut crate::vm::Vm) -> JitFunction {
+        // (Its own epoch moves with the VM's from now on: see
+        // `Vm::bump_code_epoch`.)
+        unsafe { (*vm).jitted.push(code) };
         let root_insns = unsafe { (*vm).jit_caches.decoded(code) }.0.clone();
         let nregs = unsafe { (*code).nregs } as usize;
         let root_len = root_insns.len();
@@ -11374,6 +11520,7 @@ impl JitFunction {
             callee_exits: HashMap::default(),
             bail_exits: HashMap::default(),
             no_entry: HashSet::default(),
+            bad_results: 0,
             cool: 0,
             coolings: 0,
             tier: if unsafe { (*vm).warm_tier } {
@@ -11411,6 +11558,8 @@ impl JitFunction {
         epoch: u32,
         field_epoch: u32,
     ) -> Option<(Rc<JitCode>, Value, usize)> {
+        // Field types read while lowering and compiling are this function's.
+        let _compiling = Compiling::of(self.vm.as_ref().expect("a VM function").root);
         {
             let vm = self.vm.as_mut().expect("a VM function");
             // The common case, entering at every call: nothing to redo, and
@@ -11423,7 +11572,7 @@ impl JitFunction {
                 return Some(found);
             }
             let vm = self.vm.as_mut().unwrap();
-            if vm.no_entry.contains(&pc) || self.stats.compiles >= MAX_VM_COMPILES {
+            if vm.no_entry.contains(&pc) || self.stats.compiles >= max_compiles(vm.root_len) {
                 return None;
             }
             // First compile: hot right away if inlining is what hot code
@@ -11518,9 +11667,10 @@ impl JitFunction {
         make_state: impl Fn(&[bool], bool) -> TypeState,
     ) -> Option<(Rc<JitCode>, usize)> {
         let vm = self.vm.as_mut().unwrap();
-        if vm.no_entry.contains(&0) || self.stats.compiles >= MAX_VM_COMPILES {
+        if vm.no_entry.contains(&0) || self.stats.compiles >= max_compiles(vm.root_len) {
             return None;
         }
+        let _compiling = Compiling::of(vm.root);
         if vm.dirty || vm.epoch != epoch || vm.field_epoch != field_epoch {
             self.refresh(epoch, field_epoch);
         }
@@ -11659,12 +11809,23 @@ impl JitFunction {
             return (frame, exit_pc);
         }
         if bad_result {
-            // Compile the call without a prediction from now on.
+            // Compile the call without a prediction from now on; after a
+            // second miss, every call (each miss costs a compilation:
+            // Raytrace's `rayTrace` missed at 20 calls, one at a time, and
+            // ran out of compilations).
             let k = call_before();
-            let call = snap.insns[k];
-            vm.widened
-                .insert((snap.frames[frame].code as usize, call.pc));
-            self.widened.insert(k);
+            vm.bad_results += 1;
+            let calls: Vec<usize> = if vm.bad_results >= 2 {
+                (0..snap.insns.len()).filter(|&j| snap.insns[j].is_call()).collect()
+            } else {
+                vec![k]
+            };
+            for j in calls {
+                let call = snap.insns[j];
+                vm.widened
+                    .insert((snap.frames[call.frame as usize].code as usize, call.pc));
+                self.widened.insert(j);
+            }
             self.versions.clear();
             return (frame, exit_pc);
         }
@@ -12112,7 +12273,14 @@ unsafe fn vm_run_(
             }
             let compiles = f.stats.compiles;
             let prepared = unsafe {
-                f.vm_prepare(pc, acc, regs, vm.stack_end, vm.proto_epoch, vm.field_epoch)
+                f.vm_prepare(
+                    pc,
+                    acc,
+                    regs,
+                    vm.stack_end,
+                    vm.proto_epoch,
+                    vm.field_epoch.wrapping_add(code.field_deps.get()),
+                )
             };
             // Debugging: `TOI_JIT_DUMP=<file>` writes the last compilation's
             // hot code (`TOI_JIT_LOG`: see `JitCode::log`).
@@ -12203,6 +12371,7 @@ unsafe fn materialize(
                 regs.add(parent.base),
                 if fr.construct { interp::CONSTRUCT } else { 0 },
             );
+            interp::set_frame_func(regs.add(fr.base), fr.func);
         }
         g = fr.parent;
     }

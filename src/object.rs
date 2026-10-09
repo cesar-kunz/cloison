@@ -264,6 +264,16 @@ pub struct FieldCell {
     ty: Cell<FieldType>,
     mutable: Cell<bool>,
     folded: Cell<bool>,
+    /// Compiled code took the field's type (`Shape::field_type_relied`):
+    /// the functions whose code did are in `Vm::field_deps`, keyed by the
+    /// cell's address; generalizing it makes them recompile, and no other.
+    relied: Cell<bool>,
+}
+
+thread_local! {
+    /// The function being compiled (a `vm::Code`'s address; 0: none), which
+    /// the field types its code reads are recorded for (see `FieldCell`).
+    pub static COMPILING: Cell<usize> = const { Cell::new(0) };
 }
 
 impl FieldCell {
@@ -272,6 +282,7 @@ impl FieldCell {
             ty: Cell::new(FieldType::None),
             mutable: Cell::new(false),
             folded: Cell::new(false),
+            relied: Cell::new(false),
         }
     }
 
@@ -290,6 +301,11 @@ impl FieldCell {
     /// Compiled code takes the field's value as a constant.
     pub fn fold(&self) {
         self.folded.set(true)
+    }
+
+    /// Whether compiled code took the field's type, forgotten.
+    pub fn take_relied(&self) -> bool {
+        self.relied.replace(false)
     }
 
     /// Make the field mutable; whether compiled code had folded it.
@@ -511,6 +527,22 @@ impl Shape {
     /// The type of the field in slot `i`.
     pub fn field_type(&self, i: u32) -> FieldType {
         self.field_cell(i).get()
+    }
+
+    /// The type of the field in slot `i`, for the code of the function
+    /// being compiled, which relies on it (see `FieldCell::deps`).
+    pub fn field_type_relied(&self, i: u32) -> FieldType {
+        let cell = self.field_cell(i);
+        let code = COMPILING.with(Cell::get);
+        if code != 0 {
+            cell.relied.set(true);
+            let vm = unsafe { &mut *crate::interp::current_vm() };
+            let deps = vm.field_deps.entry(cell as *const FieldCell as usize).or_default();
+            if deps.last() != Some(&code) && !deps.contains(&code) {
+                deps.push(code);
+            }
+        }
+        cell.get()
     }
 
     /// The cell of the field in slot `i`.

@@ -334,8 +334,7 @@ fn uncaught_throws_end_the_run() {
 
 #[test]
 fn rejects_what_it_cannot_compile() {
-    let unsupported = [
-    ];
+    let unsupported: [(&str, &str); 0] = [];
     for (src, what) in unsupported {
         let e = compile_error(src);
         assert!(e.contains("unsupported") && e.contains(what), "{src}: {e}");
@@ -2258,5 +2257,97 @@ fn cons_strings_and_sparse_keys_agree_with_node() {
     assert_eq!(
         value(&format!("{CONS_AND_SPARSE}\nconsAndSparse();")),
         "5000,h,23,10000,abcd,true,true,301,1,12abc,5301,4498500:3001:falsetruetruetruefalse7,268,2,6,2,ABC"
+    );
+}
+
+/// What Crypto needed compiled: bitwise operators on registers (int32,
+/// doubles, strings, `>>>` past int32), `x++`'s `ToNumber`, a `Mov` with
+/// `acc` live (`this.am(0, …, 0, n)`), and keyed stores the stencils gave
+/// up on, through the runtime (holes, appends, typed arrays, element
+/// transitions). The expected values are Node's.
+const SPEED1: &str = r#"
+function bitsLoop(n, x) {
+  var s = 0, t = 0, u = 0;
+  for (var i = 0; i < n; i++) {
+    var y = i * 7919;
+    s = (s + (y & x) + (y | i) - (y ^ x)) | 0;
+    t = (t + (i << (y & 15)) + (y >> (i & 7))) | 0;
+    u += (y >>> (i & 3)) + ((-i) >>> 1);
+  }
+  return s + ":" + t + ":" + u;
+}
+function bitsMixed() {
+  var vals = [5, -1, 3.7, -2.5e10, "12", "x", null, undefined, true, 4294967295, 2147483648, 0x7fffffff];
+  var out = "";
+  for (var r = 0; r < 100; r++)
+    for (var a = 0; a < vals.length; a++)
+      for (var b = 0; b < vals.length; b++) {
+        var p = vals[a], q = vals[b];
+        var v = (p & q) + (p | q) * 3 + (p ^ q) * 5 + (p << q) * 7 + (p >> q) * 11 + (p >>> q) * 13;
+        if (r == 99) out += v + ",";
+      }
+  return out;
+}
+function am(i, x, w, j, c, n) {
+  var xl = x & 0x3fff, xh = x >> 14;
+  while (--n >= 0) {
+    var l = w[i] & 0x3fff;
+    var h = w[i++] >> 14;
+    var m = xh * l + h * xl;
+    l = xl * l + ((m & 0x3fff) << 14) + w[j] + c;
+    c = (l >> 28) + (m >> 14) + xh * h;
+    w[j++] = l & 0xfffffff;
+  }
+  return c;
+}
+function Big() { this.w = []; for (var q = 0; q < 64; q++) this.w.push((q * 2654435761) & 0xfffffff); }
+Big.prototype.am = am;
+Big.prototype.reduce = function (x) {
+  var c = 0;
+  for (var q = 0; q < 40; q++) c = this.am(0, (q * 40503) & 0xfffffff, this.w, 32, 0, 30) + (c & 0xff);
+  return c;
+};
+function postInc() {
+  var o = { n: "5" }, s = "7", out = [];
+  for (var q = 0; q < 3000; q++) {
+    var p = q; p++;
+    var z = o.n; z++;
+    var e = s, f = e++;
+    if (q == 2999) out.push(p, z, typeof f, f, e);
+  }
+  return out.join(",");
+}
+function runtimeStores() {
+  var holes = [], appended = [], u8 = new Uint8Array(8), f64 = new Float64Array(8), o = {}, sum = 0;
+  for (var r = 0; r < 300; r++) {
+    var down = [];
+    for (var k = 20; k >= 0; k--) down[k] = k * r;
+    var up = [];
+    for (var k2 = 0; k2 < 20; k2++) up[k2] = r & 1 ? k2 + 0.5 : k2;
+    var targets = [holes, u8, f64, o, appended];
+    for (var t = 0; t < 5; t++) targets[t][(r + t) & 7] = r * 1.25;
+    appended[appended.length] = r;
+    sum += down[0] + down[20] + up[19] + holes.length;
+  }
+  return [sum, holes.join("|"), u8.join("|"), f64.join("|"), o[3], appended.length].join(";");
+}
+function speed1() {
+  var b = new Big(), red = 0;
+  for (var k = 0; k < 300; k++) red = (red + b.reduce()) | 0;
+  var bl = "";
+  for (var k3 = 0; k3 < 300; k3++) bl = bitsLoop(50, k3);
+  return [bl, bitsMixed(), red, postInc(), runtimeStores()].join("\n");
+}
+"#;
+
+#[test]
+fn crypto_paths_agree_with_node() {
+    assert_eq!(
+        value(&format!("{SPEED1}\nspeed1();")),
+        r#"6571:7703403:105231322806
+1140,-15032385564,332,6158430403,143448,195,195,195,154,-15032385564,-17179868989,2147483620,1744830188,-15032385538,6979321756,52755359705,13602736,55834574809,55834574809,55834574809,27917287374,-15032385538,64424509401,-23622320130,724,-15032385556,180,6158430325,86136,117,117,117,86,-15032385556,-17179869067,2147483628,-1216797528,-3079215112,21512081944,26943132160,10434839488,30022347264,30022347264,30022347264,26173328392,-3079215112,12842478080,14100654072,2776,-56,816,6158430676,344112,468,468,468,416,-56,-17179868716,17179869128,40,-8,24,6158430208,96,0,0,0,8,-8,-17179869184,17179869176,40,-8,24,6158430208,96,0,0,0,8,-8,-17179869184,17179869176,40,-8,24,6158430208,96,0,0,0,8,-8,-17179869184,17179869176,260,-15032385548,76,6158430247,28776,39,39,39,18,-15032385548,-17179869145,2147483636,1744830188,-15032385538,6979321756,52755359705,13602736,55834574809,55834574809,55834574809,27917287374,-15032385538,64424509401,-23622320130,-17045651416,8589934586,-16642998248,-21758857216,-17178820512,-27917287424,-27917287424,-27917287424,-15032385528,8589934586,-19327352832,-6,18790481644,-23622320132,23622320028,80672647129,17192423344,83751862233,83751862233,83751862233,42949672910,-23622320132,66571993049,-6442450948,
+363849187
+3000,6,number,7,8
+905147;370|371.25|372.5|373.75|365|366.25|367.5|368.75;112|114|115|116|117|109|110|111;367.5|368.75|370|371.25|372.5|373.75|365|366.25;370;305"#
     );
 }

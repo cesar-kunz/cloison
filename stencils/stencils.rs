@@ -1226,8 +1226,21 @@ macro_rules! int_slot {
             s.g[$k] = unboxed(int(*mem(s.regs)));
             next!(s)
         });
+        // A boxed value no int32 (see `star_u<k>_v`): its high half isn't
+        // zero.
+        stencil!("star_u", $k, "_v"; |s| {
+            s.g[$k] = s.acc;
+            next!(s)
+        });
         stencil!("spill_u", $k; |s| {
             *mem(s.regs) = s.tag.rebox(s.g[$k]);
+            next!(s)
+        });
+        // Where the slot may hold such a boxed value (exits, writing back
+        // every slot): boxed only if its high half is zero.
+        stencil!("spill_u", $k, "_v"; |s| {
+            let v = s.g[$k];
+            *mem(s.regs) = if v.to_bits() >> 32 == 0 { s.tag.rebox(v) } else { v };
             next!(s)
         });
 
@@ -2612,6 +2625,93 @@ macro_rules! group2_gpr {
 }
 with_gprs!(each_gpr! group2_gpr);
 with_gprs!(gpr_pairs! group2_int_slot_pair);
+
+// ---- Bitwise operations on a register: `r & acc`, `r << acc`, … ----
+
+/// The int32 stencils, `x` the location's int32 (`$x`). A shift count is
+/// taken mod 32. `r >>> acc` is a uint32: past int32 it exits, and once it
+/// has, `shr_iif` gives a double.
+macro_rules! bitwise_int32 {
+    ($loc:expr, |$s:ident| $x:expr) => {
+        stencil!("bit_and_ii_", $loc; |$s| {
+            $s.acc = unboxed($x & int($s.acc));
+            next!($s)
+        });
+        stencil!("bit_or_ii_", $loc; |$s| {
+            $s.acc = unboxed($x | int($s.acc));
+            next!($s)
+        });
+        stencil!("bit_xor_ii_", $loc; |$s| {
+            $s.acc = unboxed($x ^ int($s.acc));
+            next!($s)
+        });
+        stencil!("shl_ii_", $loc; |$s| {
+            $s.acc = unboxed($x.wrapping_shl(int($s.acc) as u32));
+            next!($s)
+        });
+        stencil!("sar_ii_", $loc; |$s| {
+            $s.acc = unboxed($x.wrapping_shr(int($s.acc) as u32));
+            next!($s)
+        });
+        stencil!("shr_ii_", $loc; |$s| {
+            let v = ($x as u32).wrapping_shr(int($s.acc) as u32);
+            if (v as i32) < 0 {
+                exit!($s)
+            }
+            $s.acc = unboxed(v as i32);
+            next!($s)
+        });
+        stencil!("shr_iif_", $loc; |$s| {
+            $s.facc = ($x as u32).wrapping_shr(int($s.acc) as u32) as f64;
+            next!($s)
+        });
+    };
+}
+bitwise_int32!("m", |s| int(*mem(s.regs)));
+macro_rules! bitwise_gpr {
+    ($k:tt) => {
+        bitwise_int32!(concat!("g", $k), |s| int(s.g[$k]));
+        bitwise_int32!(concat!("u", $k), |s| raw(s.g[$k]));
+    };
+}
+with_gprs!(each_gpr! bitwise_gpr);
+
+/// The generic stencil, on memory: both int32, or ToInt32 of each through
+/// the runtime (the register's first, as JavaScript converts them).
+macro_rules! bitwise_generic {
+    ($name:literal, |$l:ident, $a:ident| $e:expr) => {
+        stencil_slow!($name, "_m"; |s| {
+            let l = *mem(s.regs);
+            if s.tag.both_int32(l, s.acc) {
+                let ($l, $a) = (int(l), int(s.acc));
+                s.acc = bitwise_result(s.tag, $e);
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let $l = rt_to_int32!(s, *mem(s.regs));
+            let $a = rt_to_int32!(s, s.acc);
+            s.acc = bitwise_result(s.tag, $e);
+            next!(s)
+        });
+    };
+}
+
+/// A bitwise result (an int32, or `>>>`'s uint32), boxed.
+#[inline(always)]
+fn bitwise_result(tag: NumberTag, v: i64) -> Value {
+    if v == v as i32 as i64 {
+        tag.box_i32(v as i32)
+    } else {
+        tag.encode_f64(v as f64)
+    }
+}
+bitwise_generic!("bit_and", |l, a| (l & a) as i64);
+bitwise_generic!("bit_or", |l, a| (l | a) as i64);
+bitwise_generic!("bit_xor", |l, a| (l ^ a) as i64);
+bitwise_generic!("shl", |l, a| l.wrapping_shl(a as u32) as i64);
+bitwise_generic!("sar", |l, a| l.wrapping_shr(a as u32) as i64);
+bitwise_generic!("shr", |l, a| (l as u32).wrapping_shr(a as u32) as i64);
 group2_fp_slot!(0);
 group2_fp_slot!(1);
 group2_fp_slot!(2);
@@ -3377,6 +3477,27 @@ macro_rules! property_location {
         // `acc = o[acc]` through the runtime (`acc` boxed): a typed array's
         // element, or a site whose receivers the fast ones keep leaving
         // for. Leaves only where it would throw or call a function.
+        // `o[k] = acc` through the runtime (`jit::Prop::Runtime`), the key
+        // from memory, at `regs + imm`; `acc` boxed, or (`_i`) an int32.
+        stencil!("set_keyed_rt_", loc!($loc); |s| {
+            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+            let args = [get!($loc, s), key, s.acc];
+            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
+            next!(s)
+        });
+        stencil!("set_keyed_rt_i_", loc!($loc); |s| {
+            let key = *((s.regs as *const u8).add(imm() as usize) as *const Value);
+            let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            let args = [get!($loc, s), key, v];
+            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
+            next!(s)
+        });
         stencil!("get_keyed_rt_", loc!($loc); |s| {
             let r = rt_call!(s, toi_rt_get_keyed, get!($loc, s), s.acc);
             if r == 0 {

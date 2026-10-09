@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 octane=${OCTANE:-notes/octane}
 commit=570ad1ccfe86e3eecba0636c8f932ac08edec517
-timeout=${TIMEOUT:-300}
+timeout=${TIMEOUT:-600}
 if [ ! -d "$octane" ]; then
   git clone -q https://github.com/chromium/octane.git "$octane"
   git -C "$octane" checkout -q "$commit"

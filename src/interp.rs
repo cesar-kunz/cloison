@@ -2313,6 +2313,9 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     Value::number(to_number(a) + to_number(b))
 }
 
+/// Concatenations at least this long make cons strings.
+const CONS_MIN: usize = 256;
+
 /// `a + b` for two strings, or a string and an int32 (`"v" + i`): the
 /// string copied straight into the new string, a word at a time, and the
 /// int32's digits written there. In Octane's DeltaBlue (2.65M a run) going
@@ -2326,33 +2329,64 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
     // A word more than the units need: the last word copied may run past
     // the end.
     let words = |len: usize| len.div_ceil(4) + 1;
-    match (string_units(a), string_units(b)) {
-        (Some(x), Some(y)) => {
-            let len = x.len() + y.len();
+    // A long result is a cons string (see `Vm::new_cons`): the pieces not
+    // copied, nor flattened. (A cons piece is that long itself, so a short
+    // result's pieces are flat.)
+    match (raw_units(a), raw_units(b)) {
+        (Some((x, m)), Some((y, n))) => {
+            let len = m + n;
+            if len >= CONS_MIN {
+                return Some(vm.new_cons(a, b));
+            }
             Some(vm.new_string_raw(len, words(len), |out| unsafe {
-                copy_words(out, x.as_ptr(), x.len());
-                copy_words(out.add(x.len()), y.as_ptr(), y.len());
+                copy_words(out, x, m);
+                copy_words(out.add(m), y, n);
             }))
         }
-        (Some(x), None) if b.is_int32() => {
+        (Some((x, m)), None) if b.is_int32() => {
             let i = b.as_i32_unchecked();
-            let (n, len) = (int_len(i), x.len() + int_len(i));
+            let (n, len) = (int_len(i), m + int_len(i));
+            if len >= CONS_MIN {
+                let d = int_string(vm, i);
+                return Some(vm.new_cons(a, d));
+            }
             // The copy may run into the digits' units: they come after.
             Some(vm.new_string_raw(len, words(len), |out| unsafe {
-                copy_words(out, x.as_ptr(), x.len());
-                write_int(out.add(x.len()), i, n);
+                copy_words(out, x, m);
+                write_int(out.add(m), i, n);
             }))
         }
-        (None, Some(y)) if a.is_int32() => {
+        (None, Some((y, m))) if a.is_int32() => {
             let i = a.as_i32_unchecked();
-            let (n, len) = (int_len(i), int_len(i) + y.len());
+            let (n, len) = (int_len(i), int_len(i) + m);
+            if len >= CONS_MIN {
+                let d = int_string(vm, i);
+                return Some(vm.new_cons(d, b));
+            }
             Some(vm.new_string_raw(len, words(len), |out| unsafe {
                 write_int(out, i, n);
-                copy_words(out.add(n), y.as_ptr(), y.len());
+                copy_words(out.add(n), y, m);
             }))
         }
         _ => None,
     }
+}
+
+/// A string's units and length, without flattening it (null units for a
+/// cons string).
+#[inline(always)]
+fn raw_units(v: Value) -> Option<(*const u16, usize)> {
+    if !v.is_cell() {
+        return None;
+    }
+    let o = as_object(v);
+    unsafe { ((*o).class == Class::String).then(|| ((*o).elems.cast::<u16>().cast_const(), (*o).elems_len as usize)) }
+}
+
+/// `i`'s decimal string.
+fn int_string(vm: &mut Vm, i: i32) -> Value {
+    let n = int_len(i);
+    vm.new_string_raw(n, n.div_ceil(4) + 1, |out| unsafe { write_int(out, i, n) })
 }
 
 /// The units of `i`'s decimal form: its digits, and a sign.

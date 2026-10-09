@@ -46,6 +46,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("slice", string_slice, 2),
             ("toLowerCase", string_to_lower_case, 0),
             ("toUpperCase", string_to_upper_case, 0),
+        ("toLocaleLowerCase", string_to_lower_case, 0),
+        ("toLocaleUpperCase", string_to_upper_case, 0),
             ("trim", string_trim, 0),
             ("split", string_split, 2),
             ("match", string_match, 1),
@@ -692,7 +694,7 @@ fn object_has_own_property(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Valu
         if let Ok(i) = name.parse::<u32>()
             && i.to_string() == name
         {
-            return Ok(Value::from_bool(Vm::has_element(o, i)));
+            return Ok(Value::from_bool(vm.has_own_index(o, i)));
         }
         let a = vm.intern(&name);
         let own = (*(*o).shape).lookup(a).is_some()

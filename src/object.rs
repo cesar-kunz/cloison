@@ -174,6 +174,10 @@ impl TypedKind {
 pub const EXTERNAL: u8 = 1;
 /// The object is some shape's prototype.
 pub const PROTOTYPE: u8 = 2;
+/// The object has integer keys too far past its elements to store there:
+/// named properties (their decimal strings), which keyed accesses check
+/// after the elements (see `Vm::set_keyed`).
+pub const SPARSE: u8 = 4;
 
 #[repr(C)]
 pub struct Object {

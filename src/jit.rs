@@ -8134,8 +8134,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     // Registers for the loads `hoist_loads` moves out of loops, below the
     // direct calls' frames.
     let spare_base = cx.out.nregs;
-    let spare = hoist_loads(&mut cx.out, &cx.state.property_exits, None)
-        .min(255usize.saturating_sub(spare_base + interp::HEADER));
+    let spare = hoist_candidates(&cx.out).min(255usize.saturating_sub(spare_base + interp::HEADER));
     cx.out.nregs += spare;
     cx.place_direct_frames();
     // They stay in memory (`Lowered::direct_base` on): a slot each for the
@@ -8163,8 +8162,8 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     // After scalar replacement: loads from objects it removed are no loads.
     // Innermost loops first, then out of the loops around them (`0`: no
     // round to go).
-    for _ in 0..4 {
-        if hoist_loads(&mut cx.out, &cx.state.property_exits, Some((spare_base, spare))) == 0 {
+    for _ in 0..if spare > 0 { 4 } else { 0 } {
+        if hoist_loads(&mut cx.out, &cx.state.property_exits, (spare_base, spare)) == 0 {
             break;
         }
     }
@@ -9002,8 +9001,8 @@ fn hoist_guards(out: &mut Lowered) {
 
 /// Loads of constant fields (see `object::FieldCell`) from objects a loop
 /// doesn't change, moved before the loop into registers of their own
-/// (`spare`: the first and how many; `None` counts them, to reserve them):
-/// the loop reads the register. In DeltaBlue's `Plan.execute`, `this.v`
+/// (the first and how many, reserved by [`hoist_candidates`]): the loop
+/// reads the register. In DeltaBlue's `Plan.execute`, `this.v`
 /// and `v.elms` were loaded every iteration (by hand, moving them out of
 /// the loop: -5.2% cycles). The value can't change while the code runs: a
 /// store changing a constant field drops code that took its value
@@ -9019,20 +9018,96 @@ fn hoist_guards(out: &mut Lowered) {
 /// scalar replacement: an exit from a moved load allocates what one at the
 /// loop's header would. A load failing its check there exits before the
 /// loop (`HOISTED`), and isn't moved again.
+/// An upper bound on what [`hoist_loads`] moves, in one pass, to reserve
+/// registers and to skip it where it would find nothing (it went over the
+/// code several times: lowering 0.8 ms more on 87): twice the loads in
+/// loops of a field it could move from a register written just before
+/// with such a load's value (the chains it moves, with their heads).
+fn hoist_candidates(out: &Lowered) -> usize {
+    let insns = &out.insns;
+    let n = insns.len();
+    // How many loops each instruction is in (back jumps' ranges).
+    let mut depth = vec![0i32; n + 1];
+    let mut any = false;
+    for (j, i) in insns.iter().enumerate() {
+        if i.jumps() && i.target <= j {
+            depth[i.target] += 1;
+            depth[j + 1] -= 1;
+            any = true;
+        }
+    }
+    if !any {
+        return 0;
+    }
+    let movable = |k: usize| {
+        let i = &insns[k];
+        i.op == Op::GetNamed
+            && !i.bail
+            && !i.check_only
+            && i.guard == 0
+            && matches!(
+                out.props[k],
+                Prop::Own { ft: FieldType::Int | FieldType::Num | FieldType::Obj(_), .. }
+                    | Prop::Oop { ft: FieldType::Int | FieldType::Num | FieldType::Obj(_), .. }
+            )
+    };
+    let mut from_load = [false; 256];
+    let (mut count, mut inside) = (0, 0);
+    for k in 0..n {
+        inside += depth[k];
+        let i = &insns[k];
+        if inside > 0 && movable(k) && from_load[i.reg as usize] {
+            count += 2;
+        }
+        match i.op {
+            _ if i.bail => {}
+            Op::Star => from_load[i.reg as usize] = k > 0 && movable(k - 1),
+            Op::Mov => from_load[i.reg2 as usize] = false,
+            _ => {}
+        }
+    }
+    count
+}
+
 fn hoist_loads(
     out: &mut Lowered,
     exits: &HashMap<(usize, usize), u32>,
-    spare: Option<(usize, usize)>,
+    (base, max): (usize, usize),
 ) -> usize {
     let n = out.insns.len();
     let insns = &out.insns;
+    // One pass: the loops (header, last backward jump to it), the jumps,
+    // jump targets, the fields the code may change by name (not by a
+    // transition, which adds the field to an object that hadn't it:
+    // filling it, see `FieldCell`), and the registers earlier rounds took.
+    let spare_regs = base..base + max;
     let mut loops: Vec<(usize, usize)> = Vec::new();
+    let mut jumps: Vec<(usize, usize)> = Vec::new();
+    let mut target = vec![false; n + 1];
+    let mut set: Vec<Atom> = Vec::new();
+    let mut used = 0;
     for (j, i) in insns.iter().enumerate() {
-        if i.jumps() && i.target <= j {
-            match loops.iter_mut().find(|l| l.0 == i.target) {
-                Some(l) => l.1 = l.1.max(j),
-                None => loops.push((i.target, j)),
+        if i.jumps() {
+            jumps.push((j, i.target));
+            target[i.target.min(n)] = true;
+            if i.target <= j {
+                match loops.iter_mut().find(|l| l.0 == i.target) {
+                    Some(l) => l.1 = l.1.max(j),
+                    None => loops.push((i.target, j)),
+                }
             }
+        } else if i.bail && i.target > 0 {
+            target[i.target.min(n)] = true;
+        }
+        match i.op {
+            _ if i.bail => {}
+            Op::SetNamed if !matches!(out.props[j], Prop::Transition { .. }) => {
+                set.push(out.fbs[i.ic_frame()].name(i))
+            }
+            Op::Star if spare_regs.contains(&(i.reg as usize)) => {
+                used = used.max(i.reg as usize + 1 - base)
+            }
+            _ => {}
         }
     }
     if loops.is_empty() {
@@ -9040,20 +9115,6 @@ fn hoist_loads(
     }
     // Innermost first: a load moves once, out of its innermost loop.
     loops.sort_by_key(|&(t, e)| e - t);
-    let jumps: Vec<(usize, usize)> = (insns.iter().enumerate())
-        .filter(|(_, i)| i.jumps())
-        .map(|(j, i)| (j, i.target))
-        .collect();
-    let mut target = vec![false; n + 1];
-    for i in insns.iter().filter(|i| i.jumps() || i.bail && i.target > 0) {
-        target[i.target.min(n)] = true;
-    }
-    // Fields the code may change by name: not a transition's, which adds
-    // the field to an object that hadn't it (filling it, see `FieldCell`).
-    let set: Vec<Atom> = (insns.iter().zip(&out.props))
-        .filter(|(i, p)| i.op == Op::SetNamed && !i.bail && !matches!(p, Prop::Transition { .. }))
-        .map(|(i, _)| out.fbs[i.ic_frame()].name(i))
-        .collect();
     // A hoisted load's value: from a register, or another hoisted load's.
     #[derive(Clone, Copy, PartialEq)]
     enum Src {
@@ -9071,18 +9132,11 @@ fn hoist_loads(
     // A load an earlier round moved before an inner loop (`GetNamed;
     // Star` into a register of its own): moving it again keeps its
     // register, and the pair before the inner loop goes.
-    let spare_regs = spare.map_or(0..0, |(base, max)| base..base + max);
     let moved = |k: usize| -> Option<u8> {
         let (i, next) = (insns[k], insns.get(k + 1)?);
         (i.hoisted.is_some() && next.op == Op::Star && spare_regs.contains(&(next.reg as usize)))
             .then_some(next.reg)
     };
-    // Registers earlier rounds took.
-    let used = (insns.iter())
-        .filter(|i| i.op == Op::Star && spare_regs.contains(&(i.reg as usize)))
-        .map(|i| i.reg as usize + 1 - spare_regs.start)
-        .max()
-        .unwrap_or(0);
     let mut groups: Vec<Group> = Vec::new();
     let mut taken = vec![false; n];
     let mut count = 0;
@@ -9135,42 +9189,54 @@ fn hoist_loads(
         if jumps_in {
             continue;
         }
-        let writes = |i: &Insn, r: u8| {
-            !i.bail && (i.op == Op::Star && i.reg == r || i.op == Op::Mov && i.reg2 == r)
-        };
-        // The registers the loop writes.
+        // One pass over the loop: the registers it writes, whether it has
+        // loads, and no call through the runtime, which puts its callee's
+        // frame at the call's window, below the moved loads' registers: the
+        // callee's registers run over them. Direct calls' frames are past
+        // them (`place_direct_frames`), as are their callees' after an exit.
         let mut wset: RegSet = [0; 4];
-        for i in insns[t..=e].iter().filter(|i| !i.bail) {
+        let (mut loads_in, mut runtime_call) = (false, false);
+        for k in t..=e {
+            let i = &insns[k];
+            if i.bail {
+                continue;
+            }
             match i.op {
                 Op::Star => rs_add(&mut wset, i.reg as usize),
                 Op::Mov => rs_add(&mut wset, i.reg2 as usize),
+                Op::GetNamed => loads_in = true,
+                _ if i.is_call() => {
+                    runtime_call |= !matches!(out.props[k], Prop::Call { direct: true, .. })
+                }
                 _ => {}
             }
         }
-        // Not a loop of the function's own frame: one entered by a jump
-        // gets the loads twice (one copy for code entered at its header),
-        // and compiling them cost short programs more than they gained
-        // (87 +6.7% instructions, against +3% this way).
-        if !insns[t..=e].iter().any(|i| i.op == Op::GetNamed) {
-            continue;
-        }
-        // No call through the runtime: it puts its callee's frame at the
-        // call's window, below the moved loads' registers, and the callee's
-        // registers run over them. Direct calls' frames are past them
-        // (`place_direct_frames`), as are their callees' after an exit.
-        let runtime_call = (t..=e).any(|k| {
-            insns[k].is_call()
-                && !insns[k].bail
-                && !matches!(out.props[k], Prop::Call { direct: true, .. })
-        });
-        if runtime_call {
+        if !loads_in || runtime_call {
             continue;
         }
         let written = |r: u8| rs_has(&wset, r as usize);
         let mut loads: Vec<(usize, Src)> = Vec::new();
+        // Going through the loop: each register's last write, and the
+        // last jump target, so far.
+        let mut last_write = [usize::MAX; 256];
+        let mut last_target = t;
         for k in t..=e {
             let i = insns[k];
+            if target[k] {
+                last_target = k;
+            }
+            let wrote = (!i.bail).then(|| match i.op {
+                Op::Star => Some(i.reg),
+                Op::Mov => Some(i.reg2),
+                _ => None,
+            });
+            let record = |last_write: &mut [usize; 256]| {
+                if let Some(Some(r)) = wrote {
+                    last_write[r as usize] = k;
+                }
+            };
             if taken[k] || i.op != Op::GetNamed || i.bail || i.check_only || i.guard != 0 {
+                record(&mut last_write);
                 continue;
             }
             let (shape, ft) = match out.props[k] {
@@ -9196,10 +9262,8 @@ fn hoist_loads(
                 Src::Reg(i.reg)
             } else {
                 // The write just before it, in the same block.
-                let Some(j) = (t..k).rev().find(|&j| writes(&insns[j], i.reg)) else {
-                    continue;
-                };
-                if (j + 1..=k).any(|m| target[m]) || j == t || target[j] {
+                let j = last_write[i.reg as usize];
+                if j == usize::MAX || last_target > j || j == t || target[j] {
                     continue;
                 }
                 let (w, prev) = (insns[j], insns[j - 1]);
@@ -9244,9 +9308,7 @@ fn hoist_loads(
             continue;
         }
         let new = loads.iter().filter(|l| moved(l.0).is_none()).count();
-        if let Some((_, max)) = spare
-            && used + count + new > max
-        {
+        if used + count + new > max {
             continue;
         }
         count += new;
@@ -9264,9 +9326,6 @@ fn hoist_loads(
             });
         }
     }
-    let Some((base, _)) = spare else {
-        return count;
-    };
     if groups.is_empty() {
         return 0;
     }

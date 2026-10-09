@@ -2626,6 +2626,82 @@ macro_rules! group2_gpr {
 with_gprs!(each_gpr! group2_gpr);
 with_gprs!(gpr_pairs! group2_int_slot_pair);
 
+// ---- `-acc` and `~acc` ----
+
+/// `-d`, its sign flipped: on x86-64 with the mask built in a register
+/// (LLVM loads it from `.rodata`, which a stencil can't have).
+#[inline(always)]
+fn fneg(d: f64) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let mut d = d;
+        core::arch::asm!(
+            "mov {t}, 0x8000000000000000",
+            "movq {x}, {t}",
+            "xorpd {d}, {x}",
+            d = inout(xmm_reg) d,
+            t = out(reg) _,
+            x = out(xmm_reg) _,
+            options(pure, nomem, nostack),
+        );
+        d
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        -d
+    }
+}
+
+// An int32's negation: 0 gives -0 and INT32_MIN 2^31, doubles: exit, and
+// once it has, `neg_iif` gives a double.
+stencil!("neg_i"; |s| {
+    let v = int(s.acc);
+    if v == 0 || v == i32::MIN {
+        exit!(s)
+    }
+    s.acc = unboxed(-v);
+    next!(s)
+});
+stencil!("neg_iif"; |s| {
+    s.facc = fneg(i2f(int(s.acc)));
+    next!(s)
+});
+stencil!("neg_f"; |s| {
+    s.facc = fneg(s.facc);
+    next!(s)
+});
+// Generic: a number here; anything else is `acc * -1` through the runtime
+// (ToNumber first).
+stencil_slow!("neg"; |s| {
+    if s.tag.is_int32(s.acc) && int(s.acc) != 0 && int(s.acc) != i32::MIN {
+        s.acc = s.tag.box_i32(-int(s.acc));
+        next!(s)
+    }
+    if s.tag.is_double(s.acc) {
+        s.acc = s.tag.encode_f64(fneg(s.tag.decode_f64(s.acc)));
+        next!(s)
+    }
+    slow!(s)
+}; |s| {
+    s.acc = rt_mul!(s, s.acc, s.tag.box_i32(-1));
+    next!(s)
+});
+stencil!("bit_not_i"; |s| {
+    s.acc = unboxed(!int(s.acc));
+    next!(s)
+});
+stencil_slow!("bit_not"; |s| {
+    if s.tag.is_int32(s.acc) {
+        s.acc = s.tag.box_i32(!int(s.acc));
+        next!(s)
+    }
+    slow!(s)
+}; |s| {
+    let i = rt_to_int32!(s, s.acc);
+    s.acc = s.tag.box_i32(!i);
+    next!(s)
+});
+
 // ---- Bitwise operations on a register: `r & acc`, `r << acc`, … ----
 
 /// The int32 stencils, `x` the location's int32 (`$x`). A shift count is
@@ -3498,7 +3574,25 @@ macro_rules! property_location {
             }
             next!(s)
         });
-        stencil!("get_keyed_rt_", loc!($loc); |s| {
+        // (An object's own element first, as `get_keyed_`.)
+        stencil_slow!("get_keyed_rt_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if is_cell(s.tag, o)
+                && s.tag.is_int32(s.acc)
+                && matches!(*(o.to_bits() as *const u8).add(8), 0..=3 | 5)
+            {
+                let p = o.to_bits() as *const u8;
+                let i = int(s.acc) as u32;
+                if i < *(p.add(32) as *const u32) {
+                    let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+                    if v.to_bits() != 0 {
+                        s.acc = v;
+                        next!(s)
+                    }
+                }
+            }
+            slow!(s)
+        }; |s| {
             let r = rt_call!(s, toi_rt_get_keyed, get!($loc, s), s.acc);
             if r == 0 {
                 exit!(s)
@@ -3642,6 +3736,49 @@ macro_rules! typed_gpr {
 }
 typed_location!([m]);
 with_gprs!(each_gpr! typed_gpr);
+
+// ---- Upvalues ----
+//
+// A cell (`vm::Upvalue`) points (`at`, its first field) to the variable: a
+// register of the frame defining it while that runs, the cell's own slot
+// after. `lda_upvalue` finds cell `imm` of the frame's function (the
+// header slot `imm64b` bytes below the registers): after the function
+// object's in-object slots (48 bytes of header, then the shape's
+// capacity, at `imm64` in the shape, times 8). `_c`: the cell at `imm64`.
+
+#[inline(always)]
+unsafe fn upvalue_at(regs: *mut Value) -> *mut Value {
+    unsafe {
+        let f = *((regs as *const u8).sub(imm64b() as usize) as *const *const u8);
+        let shape = *(f as *const *const u8);
+        let cap = *(shape.add(imm64() as usize) as *const u32) as usize;
+        let cell = *(f.add(48 + 8 * cap) as *const *const *mut Value).add(imm() as usize);
+        *cell
+    }
+}
+
+// Before a direct call to a function with upvalues: the function object
+// (`imm64`) into the callee frame's header, `imm` bytes from the registers.
+stencil!("set_frame_func"; |s| {
+    *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = imm64();
+    next!(s)
+});
+stencil!("lda_upvalue"; |s| {
+    s.acc = *upvalue_at(s.regs);
+    next!(s)
+});
+stencil!("sta_upvalue"; |s| {
+    *upvalue_at(s.regs) = s.acc;
+    next!(s)
+});
+stencil!("lda_upvalue_c"; |s| {
+    s.acc = **(imm64() as *const *const Value);
+    next!(s)
+});
+stencil!("sta_upvalue_c"; |s| {
+    **(imm64() as *const *mut Value) = s.acc;
+    next!(s)
+});
 
 stencil!("lda_global"; |s| {
     let g = imm64b() as *mut u8;

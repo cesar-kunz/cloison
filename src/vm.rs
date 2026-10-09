@@ -227,10 +227,16 @@ pub struct Code {
     pub handlers: Box<[(u32, u32, u32)]>,
     /// Where its upvalues come from (see `FunctionDef::upvalues`).
     pub upvalues: Box<[(bool, u8)]>,
-    /// Runs only in the interpreter: it has exception handlers, upvalues, or
-    /// variables its nested functions use (frames the interpreter manages:
-    /// unwinding, closing upvalues).
+    /// Runs only in the interpreter: it has exception handlers or variables
+    /// its nested functions use (frames the interpreter manages: unwinding,
+    /// closing upvalues). (One with upvalues is compiled: see
+    /// `jit::Prop::Upvalue`.)
     pub interpreted: bool,
+    /// The function's own epoch: bumped when a field type its compiled
+    /// code took generalizes (see `object::FieldCell`), or anything all
+    /// compiled code may rely on changes (`Vm::bump_code_epoch`). Added to
+    /// `Vm::field_epoch` for its entries; its code checks it after calls.
+    pub field_deps: Cell<u32>,
     pub native: Option<NativeFn>,
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
@@ -315,6 +321,16 @@ pub struct Vm {
     strings: HashMap<Vec<u16>, Value>,
     /// Bumped whenever a prototype changes shape; see [`Ic`].
     pub proto_epoch: u32,
+    /// Prototype slots whose values compiled code folded (`jit::rely_on_slot`):
+    /// a store of another value to one bumps `proto_epoch`; to another
+    /// prototype slot, nothing (compiled code reads those when it runs).
+    /// Cleared with each bump, which drops all compiled code anyway.
+    pub(crate) relied_slots: crate::jit::HashSet<usize>,
+    /// The functions the JIT has state for (see `bump_code_epoch`).
+    pub(crate) jitted: Vec<*const Code>,
+    /// By field cell (its address), the functions whose compiled code took
+    /// its type (see `object::FieldCell::relied`).
+    pub(crate) field_deps: HashMap<usize, Vec<usize>>,
     /// Bumped whenever a field's type generalizes (see [`FieldType`]).
     pub field_epoch: u32,
     /// Bumped with either: compiled code checks it after calling out, as
@@ -428,6 +444,9 @@ impl Vm {
             string_shape: std::ptr::null(),
             strings: HashMap::default(),
             proto_epoch: 0,
+            relied_slots: Default::default(),
+            jitted: Vec::new(),
+            field_deps: HashMap::default(),
             field_epoch: 0,
             code_epoch: 0,
             error: None,
@@ -854,7 +873,7 @@ impl Vm {
             self.store_field(o, slot, value);
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
-                self.code_epoch = self.code_epoch.wrapping_add(1);
+                self.bump_code_epoch();
             }
             slot
         }
@@ -876,12 +895,24 @@ impl Vm {
         true
     }
 
+    /// Something all compiled code may rely on changed: the own epoch
+    /// (`Code::field_deps`) of each function the JIT has state for
+    /// (`jitted`) moves, which its code, once a call returns, and its next
+    /// entry notice. (Others compare the VM's epochs when they compile.)
+    pub(crate) fn bump_code_epoch(&mut self) {
+        self.code_epoch = self.code_epoch.wrapping_add(1);
+        for &c in &self.jitted {
+            let c = unsafe { &*c };
+            c.field_deps.set(c.field_deps.get().wrapping_add(1));
+        }
+    }
+
     /// Shape `s` gets a transition: drop compiled code that relied on it
     /// being stable (see `Shape::relied`).
     fn shape_left_stable(&mut self, s: &Shape) {
         if s.relied.replace(false) {
             self.field_epoch = self.field_epoch.wrapping_add(1);
-            self.code_epoch = self.code_epoch.wrapping_add(1);
+            self.bump_code_epoch();
         }
     }
 
@@ -890,7 +921,7 @@ impl Vm {
     pub(crate) fn field_made_mutable(&mut self, cell: &FieldCell) {
         if cell.make_mutable() {
             self.field_epoch = self.field_epoch.wrapping_add(1);
-            self.code_epoch = self.code_epoch.wrapping_add(1);
+            self.bump_code_epoch();
         }
     }
 
@@ -901,14 +932,33 @@ impl Vm {
         unsafe {
             let shape = &*(*o).shape;
             let cell = &*shape.fields[slot as usize];
+            let at = Object::slot(o, shape.location(slot));
+            // The common case, calling nothing: the type holds, and the
+            // field isn't constant or a prototype's, or keeps its value.
+            let unchanged = *at == value;
+            if cell.get().join(FieldType::of(value)) == cell.get()
+                && (unchanged || !cell.is_constant() || *at == Value::UNDEFINED)
+                && (unchanged || (*o).flags & PROTOTYPE == 0)
+            {
+                *at = value;
+                return;
+            }
+            self.store_field_slow(o, slot, value);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn store_field_slow(&mut self, o: *mut Object, slot: u32, value: Value) {
+        unsafe {
+            let shape = &*(*o).shape;
+            let cell = &*shape.fields[slot as usize];
             let old = cell.get();
             let new = old.join(FieldType::of(value));
             if new != old {
                 cell.set(new);
-                // Nothing can have relied on an empty field.
-                if old != FieldType::None {
-                    self.field_epoch = self.field_epoch.wrapping_add(1);
-                    self.code_epoch = self.code_epoch.wrapping_add(1);
+                if cell.take_relied() {
+                    self.field_generalized(cell, old);
                 }
             }
             let at = Object::slot(o, shape.location(slot));
@@ -917,15 +967,40 @@ impl Vm {
             if cell.is_constant() && *at != value && *at != Value::UNDEFINED {
                 self.field_made_mutable(cell);
             }
-            // A prototype's slots hold what compiled code assumes they do
-            // while the prototype epoch holds (see `jit`'s `Case::value`);
-            // every store to one comes here (inline caches don't cache
-            // them).
+            // A prototype's slots whose values compiled code folded hold
+            // them while the prototype epoch holds (`relied_slots`); every
+            // store to one comes here (inline caches don't cache them).
             if (*o).flags & PROTOTYPE != 0 && *at != value {
-                self.proto_epoch = self.proto_epoch.wrapping_add(1);
-                self.code_epoch = self.code_epoch.wrapping_add(1);
+                self.prototype_slot_changed(at);
             }
             *at = value;
+        }
+    }
+
+    /// Field `cell`, whose type compiled code took, generalized from
+    /// `old`: the functions whose code did recompile (code running notices
+    /// after its calls); no code relies on an empty field's.
+    #[cold]
+    #[inline(never)]
+    fn field_generalized(&mut self, cell: &FieldCell, old: FieldType) {
+        let deps = self.field_deps.remove(&(cell as *const FieldCell as usize));
+        if old != FieldType::None {
+            for code in deps.into_iter().flatten() {
+                let c = unsafe { &*(code as *const Code) };
+                c.field_deps.set(c.field_deps.get().wrapping_add(1));
+            }
+        }
+    }
+
+    /// A prototype's slot `at` gets another value: compiled code that
+    /// folded it is dropped (see `relied_slots`).
+    #[cold]
+    #[inline(never)]
+    fn prototype_slot_changed(&mut self, at: *mut Value) {
+        if self.relied_slots.contains(&(at as usize)) {
+            self.relied_slots.clear();
+            self.proto_epoch = self.proto_epoch.wrapping_add(1);
+            self.bump_code_epoch();
         }
     }
 
@@ -1309,7 +1384,7 @@ impl Vm {
             relied: Cell::new(false),
                 };
                 (*o).shape = self.add_shape(u);
-                self.code_epoch = self.code_epoch.wrapping_add(1);
+                self.bump_code_epoch();
                 if (*o).flags & PROTOTYPE != 0 {
                     self.proto_epoch = self.proto_epoch.wrapping_add(1);
                 }
@@ -1584,7 +1659,7 @@ impl Vm {
             }
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
-                self.code_epoch = self.code_epoch.wrapping_add(1);
+                self.bump_code_epoch();
             }
             true
         }
@@ -2120,6 +2195,7 @@ impl Vm {
             handlers: Box::new([]),
             upvalues: Box::new([]),
             interpreted: false,
+            field_deps: Cell::new(0),
             native: Some(f),
             constructs,
             ctor_capacity: Cell::new(0),
@@ -2193,7 +2269,7 @@ impl Vm {
             }
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
-                self.code_epoch = self.code_epoch.wrapping_add(1);
+                self.bump_code_epoch();
             }
         }
     }
@@ -2337,6 +2413,7 @@ impl Vm {
                     handlers: f.handlers.clone().into_boxed_slice(),
                     upvalues: f.upvalues.clone().into_boxed_slice(),
                     interpreted: interpreted(f),
+                    field_deps: Cell::new(0),
                     native: None,
                     constructs: false,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
@@ -2445,7 +2522,6 @@ fn has_loop(f: &crate::asm::FunctionDef) -> bool {
 /// See `Code::interpreted`.
 fn interpreted(f: &crate::asm::FunctionDef) -> bool {
     !f.handlers.is_empty()
-        || !f.upvalues.is_empty()
         || f.captures
         || ops(f).any(|op| {
             matches!(op, crate::bytecode::Op::CreateArguments | crate::bytecode::Op::LdaCallee)

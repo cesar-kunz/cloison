@@ -3652,6 +3652,19 @@ pub(crate) unsafe fn write_frame_header(
     }
 }
 
+/// Set the function object frame `regs` runs (`regs[-FUNC]`), whose
+/// upvalues `LdaUpvalue` reads.
+///
+/// # Safety
+/// `regs` must be a frame's registers.
+pub(crate) unsafe fn set_frame_func(regs: *mut Value, f: *const Object) {
+    unsafe { set_header(regs, FUNC, f) }
+}
+
+/// `regs[-FUNC]`'s offset in bytes below the registers (compiled code
+/// reads a function's upvalues through it).
+pub(crate) const FUNC_OFF: usize = 8 * FUNC;
+
 /// Native stack a run lets calls from compiled code use (each runs its
 /// callee to completion on the native stack). Past it, the interpreter
 /// makes them, in its own frames. Thread stacks are at least 2 MiB (Rust's

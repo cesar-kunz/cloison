@@ -5,7 +5,8 @@
 //! `src/interp.rs`), which holds the frame's [`Code`] and the `Vm`.
 
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::collections::HashMap;
+// FxHash: interning the builtins' names at startup was mostly SipHash.
+use crate::jit::HashMap;
 use std::fmt;
 
 use crate::asm::Module;
@@ -316,7 +317,13 @@ pub struct Vm {
     /// The `Array` constructor: compiled code makes `new Array()` itself.
     pub(crate) array_fn: *mut Object,
     date_prototype: *mut Object,
-    number_prototype: *mut Object,
+    pub(crate) number_prototype: *mut Object,
+    /// `Error.prototype` and its kinds' (see `builtins::ERROR_KINDS`).
+    pub(crate) error_prototypes: Vec<*mut Object>,
+    /// Strings of one code unit below 256, made on first use.
+    single_chars: Vec<Value>,
+    pub(crate) a_to_string: Atom,
+    pub(crate) a_value_of: Atom,
     /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
     pub(crate) array_push_fn: *mut Object,
     pub(crate) array_pop_fn: *mut Object,
@@ -345,9 +352,9 @@ impl Vm {
             heap: Heap::default(),
             shapes: Vec::new(),
             field_cells: Vec::new(),
-            roots: HashMap::new(),
+            roots: HashMap::default(),
             atoms: Vec::new(),
-            atom_ids: HashMap::new(),
+            atom_ids: HashMap::default(),
             codes: Vec::new(),
             jit_caches: Default::default(),
             global: std::ptr::null_mut(),
@@ -357,7 +364,7 @@ impl Vm {
             string_prototype: std::ptr::null_mut(),
             missing_holder: std::ptr::null_mut(),
             string_shape: std::ptr::null(),
-            strings: HashMap::new(),
+            strings: HashMap::default(),
             proto_epoch: 0,
             field_epoch: 0,
             code_epoch: 0,
@@ -386,6 +393,10 @@ impl Vm {
             array_fn: std::ptr::null_mut(),
             date_prototype: std::ptr::null_mut(),
             number_prototype: std::ptr::null_mut(),
+            error_prototypes: Vec::new(),
+            single_chars: Vec::new(),
+            a_to_string: Atom(0),
+            a_value_of: Atom(0),
             array_push_fn: std::ptr::null_mut(),
             array_pop_fn: std::ptr::null_mut(),
             a_prototype: Atom(0),
@@ -397,6 +408,8 @@ impl Vm {
         vm.a_prototype = vm.intern("prototype");
         vm.a_constructor = vm.intern("constructor");
         vm.a_length = vm.intern("length");
+        vm.a_to_string = vm.intern("toString");
+        vm.a_value_of = vm.intern("valueOf");
 
         vm.object_prototype = vm.new_object_with(Class::Plain, Value::NULL, 4);
         let op = object_value(vm.object_prototype);
@@ -537,6 +550,7 @@ impl Vm {
                 vm.define_native(c, "defineProperty", f, 3, crate::jit::Ty::Any, false);
             }
         }
+        crate::builtins::install(&mut vm);
         vm
     }
 
@@ -628,6 +642,15 @@ impl Vm {
 
     /// `shape` plus property `name` with attributes `attrs`. Shared shapes
     /// share transitions; unique shapes get a fresh unique successor.
+    /// `v` and `x`, allocated at its final size (a clone and a push
+    /// reallocates).
+    fn grown<T: Copy>(v: &[T], x: T) -> Vec<T> {
+        let mut w = Vec::with_capacity(v.len() + 1);
+        w.extend_from_slice(v);
+        w.push(x);
+        w
+    }
+
     pub(crate) fn transition_with(
         &mut self,
         shape: *const Shape,
@@ -644,13 +667,10 @@ impl Vm {
         {
             return t;
         }
-        let mut keys = s.keys.clone();
-        keys.push(name);
-        let mut slot_attrs = s.attrs.clone();
-        slot_attrs.push(attrs);
+        let keys = Self::grown(&s.keys, name);
+        let slot_attrs = Self::grown(&s.attrs, attrs);
         let cell = Box::new(FieldCell::new());
-        let mut fields = s.fields.clone();
-        fields.push(&*cell);
+        let fields = Self::grown(&s.fields, &*cell as *const FieldCell);
         self.field_cells.push(cell);
         let t = self.add_shape(Shape {
             class: s.class,
@@ -1470,6 +1490,20 @@ impl Vm {
         }
     }
 
+    /// The string of the one code unit `c` (shared below 256).
+    pub(crate) fn single_char(&mut self, c: u16) -> Value {
+        if c >= 256 {
+            return self.new_string(&[c]);
+        }
+        if self.single_chars.is_empty() {
+            self.single_chars = vec![Value::EMPTY; 256];
+        }
+        if self.single_chars[c as usize] == Value::EMPTY {
+            self.single_chars[c as usize] = self.new_string(&[c]);
+        }
+        self.single_chars[c as usize]
+    }
+
     /// The string constant with `units`, shared by equal ones.
     pub fn string_constant(&mut self, units: &[u16]) -> Value {
         if let Some(&v) = self.strings.get(units) {
@@ -2207,9 +2241,16 @@ fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(vm.new_string(&units))
 }
 
-/// `Number.prototype.toString()` (radix 10).
-fn number_to_string_method(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let units: Vec<u16> = number_to_string(this_number(this)?)
+/// `Number.prototype.toString(radix)` (2 to 36, 10 by default).
+fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let radix = match a.first() {
+        Some(r) if !r.is_undefined() => crate::interp::to_number(*r).trunc(),
+        _ => 10.0,
+    };
+    if !(2.0..=36.0).contains(&radix) {
+        return Err(Error::range_error("toString() radix must be between 2 and 36"));
+    }
+    let units: Vec<u16> = crate::builtins::radix_string(this_number(this)?, radix as u32)
         .encode_utf16()
         .collect();
     Ok(vm.new_string(&units))

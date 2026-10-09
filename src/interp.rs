@@ -691,10 +691,7 @@ handlers! {
                 let e = (*vm).error.take().expect("an error to unwind");
                 let v = match e.1 {
                     Some(v) => v,
-                    None => {
-                        let units: Vec<u16> = e.0.encode_utf16().collect();
-                        (*vm).new_string(&units)
-                    }
+                    None => crate::builtins::caught(&mut *vm, &e),
                 };
                 jump_to!(base.add(h as usize), v, regs)
             }
@@ -2483,14 +2480,41 @@ fn is_string(v: Value) -> bool {
     string_units(v).is_some()
 }
 
-/// ToPrimitive, for the values that exist so far: an object other than a
-/// string is its ToString (no `valueOf`/`toString` methods yet).
+/// ToPrimitive (hint "default", as "number"): an object's `valueOf`, else
+/// its `toString`, whichever gives a primitive first.
 pub(crate) fn to_primitive(v: Value) -> Value {
-    if v.is_cell() && !is_string(v) {
-        let units = to_string_units(v);
-        unsafe { (*current_vm()).new_string(&units) }
-    } else {
-        v
+    to_primitive_hint(v, false)
+}
+
+/// ToPrimitive with hint "string" (`string`: `toString` first) or
+/// "number". Calls native methods only: a bytecode one (natives can't call
+/// those yet) gets the default's result (`Object.prototype.toString`, or
+/// an array's `join`).
+fn to_primitive_hint(v: Value, string: bool) -> Value {
+    if !v.is_cell() || is_string(v) {
+        return v;
+    }
+    unsafe {
+        let vm = &mut *current_vm();
+        let order = if string {
+            [vm.a_to_string, vm.a_value_of]
+        } else {
+            [vm.a_value_of, vm.a_to_string]
+        };
+        for name in order {
+            let Ok(m) = vm.get(v, name) else { continue };
+            if !m.is_cell() || (*as_object(m)).class != Class::Native {
+                continue;
+            }
+            let native = (*(*as_object(m)).code).native.unwrap();
+            if let Ok(r) = native(vm, v, &[])
+                && (!r.is_cell() || is_string(r))
+            {
+                return r;
+            }
+        }
+        let units = default_string(v);
+        vm.new_string(&units)
     }
 }
 
@@ -2499,6 +2523,15 @@ pub(crate) fn to_string_units(v: Value) -> Vec<u16> {
     if let Some(u) = string_units(v) {
         return u.to_vec();
     }
+    if v.is_cell() {
+        return to_string_units(to_primitive_hint(v, true));
+    }
+    crate::vm::display(v).encode_utf16().collect()
+}
+
+/// An object's string without its methods: an array's elements joined by
+/// commas, else `[object Object]`.
+fn default_string(v: Value) -> Vec<u16> {
     let s = if v.is_cell() {
         let o = as_object(v);
         // An array: its elements' strings, joined by commas (holes,

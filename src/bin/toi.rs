@@ -45,7 +45,11 @@ fn main() -> ExitCode {
         print!("{}", toi::asm::disassemble(&module));
         return ExitCode::SUCCESS;
     }
-    match vm.run(&module) {
+    let result = vm.run(&module);
+    // The process exits next: freeing the VM's shapes and code one by one
+    // would only cost time (about 100k instructions).
+    std::mem::forget(vm);
+    match result {
         Ok(v) => {
             if std::env::var_os("TOI_TIME").is_some() {
                 eprintln!("time {:.3}", start.elapsed().as_secs_f64() * 1e3);

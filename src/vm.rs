@@ -237,6 +237,10 @@ pub struct Code {
     /// compiled code may rely on changes (`Vm::bump_code_epoch`). Added to
     /// `Vm::field_epoch` for its entries; its code checks it after calls.
     pub field_deps: Cell<u32>,
+    /// Inline-cache misses in this function's interpreted frames: the
+    /// JIT waits for its feedback to settle before compiling it again
+    /// (see `jit::VmState::cool`).
+    pub ic_misses: Cell<u32>,
     pub native: Option<NativeFn>,
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
@@ -1227,6 +1231,7 @@ impl Vm {
 
     /// `GetNamed` miss: look `obj.name` up and cache how, if possible.
     pub fn get_named_miss(&mut self, code: &Code, ic: u16, obj: Value) -> Result<Value> {
+        code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         let (ic, name) = code.ic(ic);
         if !obj.is_cell() {
             return self.get_primitive(obj, name);
@@ -1281,6 +1286,7 @@ impl Vm {
 
     /// `SetNamed` miss: store `obj.name = value` and cache how, if possible.
     pub fn set_named_miss(&mut self, code: &Code, ic: u16, obj: Value, value: Value) -> Result<()> {
+        code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         let (ic, name) = code.ic(ic);
         if !obj.is_cell() {
             return self.set_primitive(obj, name);
@@ -1702,6 +1708,7 @@ impl Vm {
         obj: Value,
         key: Value,
     ) -> Result<Value> {
+        code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         // A string's elements are code units, not values, and a typed
         // array's or buffer's bytes: recorded as such (`note_bytes`).
         if obj.is_cell()
@@ -2196,6 +2203,7 @@ impl Vm {
             upvalues: Box::new([]),
             interpreted: false,
             field_deps: Cell::new(0),
+            ic_misses: Cell::new(0),
             native: Some(f),
             constructs,
             ctor_capacity: Cell::new(0),
@@ -2414,6 +2422,7 @@ impl Vm {
                     upvalues: f.upvalues.clone().into_boxed_slice(),
                     interpreted: interpreted(f),
                     field_deps: Cell::new(0),
+                    ic_misses: Cell::new(0),
                     native: None,
                     constructs: false,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!  0  shape       *const Shape     names → slots, prototype, inline capacity
-//!  8  class u8, flags u8, _ u16, props_cap u32
+//!  8  class u8, flags u8, inline_cap u16, props_cap u32
 //! 16  props       *mut Value       out-of-line slots beyond the inline ones
 //! 24  elems       *mut Value       indexed elements (arrays, mostly)
 //! 32  elems_len u32, elems_cap u32
@@ -26,11 +26,14 @@
 //! prototype-chain load at once. (V8 and JSC invalidate per prototype with
 //! validity cells; a global epoch is the simple version.)
 //!
-//! Every object has the external bit set: the internal heap (step 3) is
-//! not there yet. There is no collector either. The heap is a bump arena
-//! freed with the VM, and outgrown out-of-line arrays are abandoned in it.
-//! Property attributes are not modelled: every property is a writable,
-//! enumerable, configurable data property.
+//! `inline_cap` is the number of in-object slots the object was allocated
+//! with (a shape's capacity may shrink later: see `Vm::construct_done`),
+//! so the collector knows the object's size without its shape (see
+//! `heap::cell_size`). A typed array has none, and its element type in the
+//! low byte instead (`kind`).
+//!
+//! Every object has the external bit set: the internal heap of
+//! `docs/object-model.md` is not there. The heap is `crate::heap`.
 
 use std::cell::{Cell, RefCell};
 
@@ -202,9 +205,10 @@ pub struct Object {
     pub shape: *const Shape,
     pub class: Class,
     pub flags: u8,
-    /// A typed array's element type (see [`TypedKind`]).
+    /// A typed array's element type (see [`TypedKind`]); for any other
+    /// object the low byte of its in-object capacity (see the module docs).
     pub kind: u8,
-    _pad: u8,
+    cap_hi: u8,
     pub props_cap: u32,
     pub props: *mut Value,
     pub elems: *mut Value,
@@ -217,17 +221,21 @@ pub struct Object {
 pub const INLINE_BASE: usize = size_of::<Object>();
 const _: () = assert!(INLINE_BASE == 48);
 
-/// A new object's header, as words: `shape`, external, nothing out of
-/// line. (`Object` has no padding, so every byte is defined.)
+/// A new object's header, as words: `shape`, external, its in-object
+/// capacity the shape's, nothing out of line. (`Object` has no padding, so
+/// every byte is defined.)
 pub fn object_header(shape: &Shape) -> [u64; INLINE_BASE / 8] {
     let mut h = [0u64; INLINE_BASE / 8];
+    let cap = shape.capacity.get();
+    let cap = u16::try_from(cap).expect("in-object capacity above 65535");
+    assert!(cap == 0 || shape.class != Class::TypedArray, "a typed array with in-object slots");
     unsafe {
         h.as_mut_ptr().cast::<Object>().write(Object {
             shape,
             class: shape.class,
             flags: EXTERNAL,
-            kind: 0,
-            _pad: 0,
+            kind: cap as u8,
+            cap_hi: (cap >> 8) as u8,
             props_cap: 0,
             props: std::ptr::null_mut(),
             elems: std::ptr::null_mut(),
@@ -240,6 +248,21 @@ pub fn object_header(shape: &Shape) -> [u64; INLINE_BASE / 8] {
 }
 
 impl Object {
+    /// The number of in-object slots `this` was allocated with.
+    ///
+    /// # Safety
+    /// `this` must be an object.
+    #[inline(always)]
+    pub unsafe fn inline_cap(this: *const Object) -> usize {
+        unsafe {
+            if (*this).class == Class::TypedArray {
+                0
+            } else {
+                (*this).kind as usize | ((*this).cap_hi as usize) << 8
+            }
+        }
+    }
+
     /// The slot at `loc` (see [`Shape::location`]).
     ///
     /// # Safety
@@ -590,156 +613,7 @@ pub fn object_value(o: *mut Object) -> Value {
     Value::from_bits(o as u64)
 }
 
-/// A bump allocator over 8-byte words. Memory is zeroed and lives as long
-/// as the heap.
-///
-/// There is no collector, so every object is in memory never touched
-/// before, and each new 4 KiB page costs a fault (about 8k cycles, several
-/// times the cost of filling it). The first [`SMALL_HEAP`] bytes come in
-/// [`CHUNK_WORDS`] chunks, as small programs need little. Past that, chunks
-/// are mapped 2 MiB-aligned and marked for transparent huge pages, one
-/// fault per 2 MiB where the kernel has them, and each doubles the heap, up
-/// to [`MAX_CHUNK`].
-///
-/// Compiled code allocates too (`construct_direct`), bumping `ptr` while
-/// it stays within `end`: they come first, in that order (see
-/// [`Heap::bump`]).
-#[repr(C)]
-pub struct Heap {
-    ptr: *mut u64,
-    end: *mut u64,
-    chunks: Vec<Chunk>,
-}
-
-const CHUNK_WORDS: usize = 1 << 16;
-const SMALL_HEAP: usize = 8 * CHUNK_WORDS;
-const HUGE_PAGE: usize = 2 << 20;
-
-/// The system's page size: what `mmap`, `mprotect` and `munmap` round to
-/// (16 KiB on Apple silicon, 4 KiB elsewhere).
-pub(crate) const PAGE: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-    16 << 10
-} else {
-    4 << 10
-};
-const MAX_CHUNK: usize = 64 << 20;
-
-/// A zeroed, private anonymous mapping.
-struct Chunk {
-    ptr: *mut u64,
-    len: usize,
-}
-
-impl Chunk {
-    /// `len` bytes (a multiple of the page size), aligned to `align`.
-    fn map(len: usize, align: usize) -> Chunk {
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
-        let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-        let all = len + align - PAGE;
-        let p = unsafe { libc::mmap(std::ptr::null_mut(), all, prot, flags, -1, 0) };
-        assert!(p != libc::MAP_FAILED, "heap mmap failed");
-        let start = (p as usize).next_multiple_of(align);
-        unsafe {
-            // Unmap the slack before and after the aligned range.
-            if start > p as usize {
-                libc::munmap(p, start - p as usize);
-            }
-            let tail = p as usize + all - (start + len);
-            if tail > 0 {
-                libc::munmap((start + len) as *mut libc::c_void, tail);
-            }
-        }
-        Chunk {
-            ptr: start as *mut u64,
-            len,
-        }
-    }
-}
-
-impl Drop for Chunk {
-    fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr.cast(), self.len) };
-    }
-}
-
-impl Default for Heap {
-    fn default() -> Self {
-        Heap {
-            chunks: Vec::new(),
-            ptr: std::ptr::null_mut(),
-            end: std::ptr::null_mut(),
-        }
-    }
-}
-
-impl Heap {
-    /// Where compiled code finds the free space: `ptr`, then `end`.
-    pub(crate) fn bump(&mut self) -> *mut [*mut u64; 2] {
-        (&raw mut self.ptr).cast()
-    }
-
-    #[inline]
-    pub fn alloc_words(&mut self, n: usize) -> *mut u64 {
-        if (self.end as usize - self.ptr as usize) / 8 < n {
-            self.refill(n);
-        }
-        let p = self.ptr;
-        self.ptr = unsafe { p.add(n) };
-        p
-    }
-
-    #[cold]
-    fn refill(&mut self, n: usize) {
-        let mapped = self.mapped();
-        let chunk = if mapped < SMALL_HEAP {
-            Chunk::map((8 * n).max(8 * CHUNK_WORDS).next_multiple_of(PAGE), PAGE)
-        } else {
-            let len = mapped.clamp(HUGE_PAGE, MAX_CHUNK).max(8 * n);
-            let c = Chunk::map(len.next_multiple_of(HUGE_PAGE), HUGE_PAGE);
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::madvise(c.ptr.cast(), c.len, libc::MADV_HUGEPAGE);
-            }
-            c
-        };
-        self.ptr = chunk.ptr;
-        self.end = unsafe { chunk.ptr.add(chunk.len / 8) };
-        self.chunks.push(chunk);
-    }
-
-    /// Bytes mapped for chunks.
-    fn mapped(&self) -> usize {
-        self.chunks.iter().map(|c| c.len).sum()
-    }
-
-    /// Room for `n` values, all `undefined`.
-    pub fn alloc_values(&mut self, n: usize) -> *mut Value {
-        let p = self.alloc_words(n).cast::<Value>();
-        for i in 0..n {
-            unsafe { p.add(i).write(Value::UNDEFINED) };
-        }
-        p
-    }
-
-    /// A new object of `shape`, with its in-object slots `undefined`.
-    pub fn alloc_object(&mut self, shape: &Shape) -> *mut Object {
-        let words = INLINE_BASE / 8 + shape.capacity.get() as usize;
-        let o = self.alloc_words(words).cast::<Object>();
-        unsafe {
-            o.cast::<[u64; INLINE_BASE / 8]>()
-                .write(object_header(shape));
-            for i in 0..shape.capacity.get() as usize {
-                Object::inline(o, i).write(Value::UNDEFINED);
-            }
-        }
-        o
-    }
-
-    /// Bytes allocated so far, abandoned space included.
-    pub fn allocated(&self) -> usize {
-        self.mapped() - (self.end as usize - self.ptr as usize)
-    }
-}
+pub(crate) use crate::heap::PAGE;
 
 #[cfg(test)]
 mod tests {
@@ -767,7 +641,7 @@ mod tests {
         assert_eq!(s.location(1), 56);
         assert_eq!(s.location(2), !0);
         assert_eq!(s.lookup(Atom(9)), Some(2));
-        let mut heap = Heap::default();
+        let mut heap = crate::heap::Heap::new();
         let o = heap.alloc_object(&s);
         assert!(object_value(o).is_cell());
         unsafe {
@@ -775,44 +649,5 @@ mod tests {
             assert_eq!(*Object::inline(o, 1), Value::from_i32(5));
             assert_eq!((*o).flags & EXTERNAL, EXTERNAL);
         }
-    }
-
-    /// The first chunk is small; then chunks are huge-page aligned, each
-    /// doubling the heap, and an allocation bigger than that gets a chunk
-    /// of its size. All of it is zeroed, and `allocated` counts what was
-    /// handed out, with space abandoned at chunk ends.
-    #[test]
-    fn heap_chunks() {
-        let mut heap = Heap::default();
-        let mut total = 0;
-        let mut words = |heap: &mut Heap, n: usize| {
-            let p = heap.alloc_words(n);
-            let s = unsafe { std::slice::from_raw_parts_mut(p, n) };
-            assert!(s.iter().all(|&w| w == 0));
-            s.fill(!0);
-            total += n;
-            p
-        };
-        for _ in 0..SMALL_HEAP / 8 / 1000 {
-            words(&mut heap, 1000);
-        }
-        assert_eq!(heap.mapped(), SMALL_HEAP);
-        let p = words(&mut heap, 1000);
-        assert_eq!(p as usize % HUGE_PAGE, 0);
-        assert_eq!(heap.chunks[1].len, HUGE_PAGE);
-        let big = words(&mut heap, 3 * HUGE_PAGE / 8);
-        assert_eq!(big as usize % HUGE_PAGE, 0);
-        assert_eq!(heap.chunks[2].len, 3 * HUGE_PAGE);
-        for _ in 0..1000 {
-            words(&mut heap, 10_000);
-        }
-        for k in 3..heap.chunks.len() {
-            let before: usize = heap.chunks[..k].iter().map(|c| c.len).sum();
-            let len = before
-                .clamp(HUGE_PAGE, MAX_CHUNK)
-                .next_multiple_of(HUGE_PAGE);
-            assert_eq!(heap.chunks[k].len, len);
-        }
-        assert!(heap.allocated() >= 8 * total && heap.allocated() <= heap.mapped());
     }
 }

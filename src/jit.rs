@@ -3164,7 +3164,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let c = site.ctor.as_deref().unwrap();
             debug_assert_eq!(
                 &c.header[1..],
-                &[1 << 8, 0, 0, 0, 0],
+                &[1 << 8 | c.slots << 16, 0, 0, 0, 0],
                 "the header `create_object` writes"
             );
             out.acc = Ty::Obj(site.this_shape);
@@ -3471,7 +3471,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             }
             debug_assert_eq!(
                 &crate::object::object_header(unsafe { &*shape })[1..],
-                &[1 << 8, 0, 0, 0, 0],
+                &[1 << 8 | (insn.imm as u64) << 16, 0, 0, 0, 0],
                 "the header `create_object` writes"
             );
             out.acc = Ty::Obj(shape as u64);

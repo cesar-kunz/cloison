@@ -11,10 +11,11 @@ use std::fmt;
 
 use crate::asm::Module;
 use crate::object::{
-    ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Heap, Object, PROTOTYPE, READ_ONLY,
+    ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Object, PROTOTYPE, READ_ONLY,
     Shape,
     as_object, field_fits, object_value,
 };
+use crate::heap::Heap;
 use crate::value::Value;
 
 /// A JS exception, or a feature not implemented yet: its message, and for
@@ -59,7 +60,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// while that function's frame is live, `at` points to its register
 /// (open: the function itself reads and writes the register as any
 /// other); when the frame ends, the value moves to `closed` and `at`
-/// points there. Closures of one frame share it.
+/// points there. Closures of one frame share it. It is the payload of an
+/// upvalue cell (`heap::UPVALUE`): a pointer to it points past the cell's
+/// header word.
 #[repr(C)]
 pub struct Upvalue {
     pub at: *mut Value,
@@ -431,7 +434,7 @@ impl Vm {
         let mut stack = vec![Value::from_bits(0); STACK_VALUES].into_boxed_slice();
         let stack_end = unsafe { stack.as_mut_ptr().add(stack.len()) };
         let mut vm = Vm {
-            heap: Heap::default(),
+            heap: Heap::new(),
             shapes: Vec::new(),
             field_cells: Vec::new(),
             roots: HashMap::default(),
@@ -1962,11 +1965,8 @@ impl Vm {
         words: usize,
         fill: impl FnOnce(*mut u16),
     ) -> Value {
-        let header = crate::object::INLINE_BASE / 8;
         unsafe {
-            let o = self.heap.alloc_words(header + words).cast::<Object>();
-            o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
-                .write(crate::object::object_header(&*self.string_shape));
+            let o = self.alloc_string(words);
             let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
             fill(data);
             (*o).elems = data.cast();
@@ -1975,14 +1975,25 @@ impl Vm {
         }
     }
 
-    /// A new string of `len` code units, which `fill` writes.
-    pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
-        let header = crate::object::INLINE_BASE / 8;
-        let words = header + len.div_ceil(4);
+    /// A string cell with `words` words of units after its header, which
+    /// `elems_cap` records (see `heap::cell_size`).
+    fn alloc_string(&mut self, words: usize) -> *mut Object {
+        let o = self
+            .heap
+            .alloc(crate::heap::object_bytes(words))
+            .cast::<Object>();
         unsafe {
-            let o = self.heap.alloc_words(words).cast::<Object>();
             o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
                 .write(crate::object::object_header(&*self.string_shape));
+            (*o).elems_cap = u32::try_from(words).expect("string too long");
+        }
+        o
+    }
+
+    /// A new string of `len` code units, which `fill` writes.
+    pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
+        unsafe {
+            let o = self.alloc_string(len.div_ceil(4));
             let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
             fill(std::slice::from_raw_parts_mut(data, len));
             (*o).elems = data.cast();
@@ -2011,12 +2022,9 @@ impl Vm {
     /// building a long string piece by piece costs memory linear in its
     /// length, not quadratic (pdfjs: 138 GB).
     pub(crate) fn new_cons(&mut self, a: Value, b: Value) -> Value {
-        let header = crate::object::INLINE_BASE / 8;
         let len = string_len(a).unwrap() + string_len(b).unwrap();
         unsafe {
-            let o = self.heap.alloc_words(header).cast::<Object>();
-            o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
-                .write(crate::object::object_header(&*self.string_shape));
+            let o = self.alloc_string(0);
             (*o).elems = std::ptr::null_mut();
             (*o).elems_len = u32::try_from(len).expect("string too long");
             (*o).props = as_object(a).cast();
@@ -2069,16 +2077,7 @@ impl Vm {
             let f = if ups.is_empty() {
                 self.heap.alloc_object(shape)
             } else {
-                let cap = shape.capacity.get() as usize;
-                let o = self
-                    .heap
-                    .alloc_words(crate::object::INLINE_BASE / 8 + cap + ups.len())
-                    .cast::<Object>();
-                o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
-                    .write(crate::object::object_header(shape));
-                for k in 0..cap {
-                    Object::inline(o, k).write(Value::UNDEFINED);
-                }
+                let o = self.heap.alloc_object_extra(shape, ups.len());
                 let out = Self::upvalues(o);
                 for (k, &(local, idx)) in ups.iter().enumerate() {
                     *out.add(k) = if local {
@@ -2124,7 +2123,7 @@ impl Vm {
         {
             return u;
         }
-        let u = self.heap.alloc_words(2).cast::<Upvalue>();
+        let u = self.heap.alloc_upvalue().cast::<Upvalue>();
         unsafe {
             u.write(Upvalue {
                 at,
@@ -3104,7 +3103,7 @@ unsafe fn flatten(o: *mut Object) {
         let vm = &mut *crate::interp::current_vm();
         let len = (*o).elems_len as usize;
         // Padded to whole words, and one more (copies read past the end).
-        let buf = vm.heap.alloc_words(len.div_ceil(4) + 1).cast::<u16>();
+        let buf = vm.heap.alloc_bytes(8 * (len.div_ceil(4) + 1)).cast::<u16>();
         let mut at = 0;
         let mut stack: Vec<*mut Object> = vec![(*o).code as *mut Object, (*o).props.cast::<Object>()];
         while let Some(s) = stack.pop() {

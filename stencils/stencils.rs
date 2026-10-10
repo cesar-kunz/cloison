@@ -3478,22 +3478,46 @@ stencil!("lda_constant_f"; |s| {
 
 // `CreateObject n`: bump the heap (its pointers' address is `imm64b`) for
 // the header and `n` slots, write the header of a plain, external object of
-// shape `imm64` (not the slots). If the heap's chunk is full, the
+// shape `imm64` (not the slots). If the heap's hole is full, the
 // runtime allocates (`toi_rt_create_object`). One stencil per count up to 8
 // (`create_object_<n>`, straight-line stores), then `create_object` with
 // the count in `imm`.
+
+/// `heap::Heap`'s first words: the free space's next byte and end, and
+/// the metadata's bias.
+#[repr(C)]
+struct HeapPtrs {
+    ptr: *mut u64,
+    end: *mut u64,
+    meta_bias: usize,
+}
+
+/// `heap::YOUNG`: a new cell's metadata byte.
+const YOUNG: u8 = 0x80;
+
+/// Bump `heap` for a cell of `words` words (rounded up to 16 bytes,
+/// `heap::GRANULE`), if its hole has room, and write its metadata byte.
 #[inline(always)]
-unsafe fn create_object(words: usize) -> Option<*mut u64> {
+unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
     unsafe {
-        let heap = imm64b() as *mut [*mut u64; 2];
-        let p = (*heap)[0];
-        if ((*heap)[1] as usize - p as usize) < 8 * words {
+        let words = (words + 1) & !1;
+        let p = (*heap).ptr;
+        if ((*heap).end as usize - p as usize) < 8 * words {
             return None;
         }
-        (*heap)[0] = p.add(words);
+        (*heap).ptr = p.add(words);
+        *(((*heap).meta_bias).wrapping_add(p as usize >> 4) as *mut u8) = YOUNG;
+        Some(p)
+    }
+}
+
+#[inline(always)]
+unsafe fn create_object(slots: usize) -> Option<*mut u64> {
+    unsafe {
+        let p = bump(imm64b() as *mut HeapPtrs, 6 + slots)?;
         *p = imm64();
-        // `Class::Plain`, flags `EXTERNAL`.
-        *p.add(1) = 1 << 8;
+        // `Class::Plain`, flags `EXTERNAL`, `slots` in-object slots.
+        *p.add(1) = 1 << 8 | (slots as u64) << 16;
         for k in 2..6 {
             *p.add(k) = 0;
         }
@@ -3505,7 +3529,7 @@ unsafe fn create_object(words: usize) -> Option<*mut u64> {
 macro_rules! create_object_n {
     ($($n:literal)*) => {$(
         stencil_slow!("create_object_", $n; |s| {
-            let Some(p) = create_object(6 + $n) else { slow!(s) };
+            let Some(p) = create_object($n) else { slow!(s) };
             s.acc = Value::from_bits(p as u64);
             next!(s)
         }; |s| {
@@ -3518,7 +3542,7 @@ macro_rules! create_object_n {
 }
 create_object_n!(0 1 2 3 4 5 6 7 8);
 stencil_slow!("create_object"; |s| {
-    let Some(p) = create_object(6 + imm() as usize) else { slow!(s) };
+    let Some(p) = create_object(imm() as usize) else { slow!(s) };
     s.acc = Value::from_bits(p as u64);
     next!(s)
 }; |s| {
@@ -4354,8 +4378,8 @@ struct DirectSite {
 /// `jit::CtorSite`: how `construct_direct` allocates `this`.
 #[repr(C)]
 struct CtorAlloc {
-    /// The VM heap's free space: next word, end.
-    heap: *mut [*mut u64; 2],
+    /// The VM heap's free space (`heap::Heap::bump`).
+    heap: *mut HeapPtrs,
     proto_at: *const u64,
     proto: u64,
     cap_at: *const u32,
@@ -4455,17 +4479,13 @@ stencil!("construct_direct"; |s| {
         && base as u64 + (*site).end_off <= (*site).stack_end
     {
         let c = (*site).ctor;
-        let heap = (*c).heap;
-        let p = (*heap)[0];
-        let words = 6 + (*c).slots as usize;
         if *(*c).proto_at == (*c).proto
             && *(*c).cap_at as u64 == (*c).cap
-            && (*heap)[1] as usize - p as usize >= 8 * words
+            && let Some(p) = bump((*c).heap, 6 + (*c).slots as usize)
         {
-            (*heap)[0] = p.add(words);
             // The header only: a slot is read only through a shape that
             // has its property, and a store writes the slot no later than
-            // the shape (the heap's fresh memory is zero meanwhile).
+            // the shape (a hole's memory is zero meanwhile).
             for k in 0..6 {
                 *p.add(k) = (*c).header[k];
             }
@@ -4561,18 +4581,20 @@ const FIRST_ELEMENTS: usize = 4;
 
 /// If the array at `o` has no room for elements at all, give it
 /// [`FIRST_ELEMENTS`] (`undefined`) from the heap's free space (`imm64`:
-/// `Heap::bump`), if there is that much.
+/// `Heap::bump`), if there is that much: an array cell, its header word
+/// (`heap::VALUES`, the capacity) and the values.
 #[inline(always)]
 unsafe fn first_elements(o: *mut u8) {
     if *(o.add(36) as *const u32) != 0 {
         return;
     }
-    let heap = imm64() as *mut [*mut u64; 2];
-    let p = (*heap)[0];
-    if heap.is_null() || ((*heap)[1] as usize - p as usize) < 8 * FIRST_ELEMENTS {
+    let heap = imm64() as *mut HeapPtrs;
+    if heap.is_null() {
         return;
     }
-    (*heap)[0] = p.add(FIRST_ELEMENTS);
+    let Some(p) = bump(heap, 1 + FIRST_ELEMENTS) else { return };
+    *p = 1 | (FIRST_ELEMENTS as u64) << 32;
+    let p = p.add(1);
     // Volatile: LLVM would vectorize the stores from a constant pool,
     // which a stencil can't refer to.
     for k in 0..FIRST_ELEMENTS {

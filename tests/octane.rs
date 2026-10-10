@@ -35,6 +35,7 @@ fn run(name: &str, src: &str) -> Result<String, String> {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        vm.heap.verify();
         match &result {
             None => result = Some(r),
             Some(first) => assert_eq!(first, &r, "{name}: tier at {budget}"),

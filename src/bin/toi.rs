@@ -46,6 +46,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let result = vm.run(&module);
+    // `TOI_GC_VERIFY`: walk the heap, checking every cell (see `heap`).
+    if std::env::var_os("TOI_GC_VERIFY").is_some() {
+        let cells = vm.heap.verify();
+        eprintln!("heap: {cells} cells, {} MiB of blocks", vm.heap.allocated() >> 20);
+    }
     // The process exits next: freeing the VM's shapes and code one by one
     // would only cost time (about 100k instructions).
     std::mem::forget(vm);

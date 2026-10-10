@@ -1381,13 +1381,12 @@ fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) {
     vm.define_accessor(o, a, Some(object_value(fo)), None, DONT_ENUM);
 }
 
-/// A new buffer of `n` zero bytes (the heap's fresh memory is zeroed and
-/// never reused).
+/// A new buffer of `n` zero bytes.
 fn new_buffer(vm: &mut Vm, n: usize) -> *mut Object {
     let abp = object_value(vm.array_buffer_prototype);
     let o = vm.new_object_with(Class::ArrayBuffer, abp, 0);
     unsafe {
-        (*o).elems = vm.heap.alloc_words(n.div_ceil(8).max(1)).cast();
+        (*o).elems = vm.heap.alloc_bytes(8 * n.div_ceil(8).max(1)).cast();
         (*o).elems_len = u32::try_from(n).expect("buffer too large");
     }
     o

@@ -1,135 +1,115 @@
 # The garbage collector
 
-Status: design, 2026-10-10. Nothing implemented. Supersedes the collector
-parts of `docs/object-model.md` (its escape analysis and compact layouts
-stand); fits the reservation and offset plan of `docs/sandbox.md`.
+Status: in progress, 2026-10-10. Step 1 of the plan below is implemented
+(`src/heap.rs`). This revision replaces the first one (a parallel copying
+nursery with precise roots), whose two premises implementation showed
+false: see "Why not a copying nursery". Supersedes the collector parts of
+`docs/object-model.md` (its escape analysis and compact layouts stand).
 
 ## Decision
 
-A **generational collector with precise roots, concurrent on the old
-space, parallel on the nursery**:
+A **non-moving generational mark-region collector with conservative
+native roots, concurrent on the old generation**:
 
-- a copying nursery, collected in short stop-the-world pauses that helper
-  threads share (V8's parallel Scavenger), with promotion by age;
-- a mark-region old space (Immix's design: blocks of lines, allocation
-  by bumping into free runs of lines), marked and swept by collector
-  threads while the mutator runs, with two brief pauses per cycle (take
-  the roots, finish the roots), and evacuation of the sparsest blocks in
-  the second pause when fragmentation is measured, within a budget;
-- a non-moving space for large cells and buffers;
-- one reservation for all of it, as the sandbox wants;
-- one write barrier, three instructions on the hot path, serving both the
-  remembered set and concurrent marking;
-- pacing from measurement: the nursery size, the old-space headroom and
-  the moment marking starts come from the costs the collector observes,
-  not from presets.
+- one reservation of address space in 32 KiB blocks; cells up to 8 KiB
+  are bump-allocated through *holes* (runs of free 16-byte granules) and
+  never cross a block, larger cells get blocks of their own;
+- one metadata byte per granule beside the heap: allocation writes
+  "young" at a cell's first granule, marking replaces it with the mark
+  color and writes "end" at its last granule; so liveness, age, cell
+  starts and free space are all read from the side table (Whippet's
+  `nofl` space, [Wingo 2024][nofl]);
+- generations by sticky marks: a minor collection marks the young cells
+  reachable from the roots and from dirty cards, survivors become old
+  where they are, and the rest of the nursery's memory is holes again;
+- roots: the VM stack and the native stack scanned conservatively, every
+  word checked against the metadata, plus the VM's own references;
+- one write barrier, an unconditional card mark of the stored-to address
+  (two or three instructions), which serves the minor collection's
+  remembered set and concurrent marking's record of mutated cells (the
+  HotSpot CMS arrangement);
+- major collections marked by a collector thread while the mutator runs,
+  with two short pauses, and swept concurrently from the metadata;
+- pacing from measurement.
 
-Collections run only at safepoints, where every live value is in a VM
-frame, a handle or a named VM root, so Rust runtime code needs no handles
-unless it calls back into JS.
+Collections run only at safepoints: allocation never collects, so Rust
+runtime code may hold values in locals across allocations; the native
+stack scan covers them, and the few natives that keep values in Rust
+heap containers across a call into JS hold them in a handle scope.
 
-Why these, against the alternatives studied below:
+## Why not a copying nursery
 
-- **Concurrent marking and sweeping, parallel copying, no concurrent
-  copying.** On the heaps that matter (pdfjs 1.6 GB, EarleyBoyer 4.6 GB
-  allocated, TypeScript's growing structures) marking the old space is the
-  dominant cost, and it can run entirely on other cores: JSC's Riptide and
-  V8's Orinoco both took main-thread marking down by two thirds or more
-  ([Riptide][riptide], [concurrent marking][v8-cm]). Sweeping is
-  embarrassingly concurrent with side mark bits. The nursery is different:
-  copying objects while the mutator runs needs a read barrier on every
-  heap load (ZGC's coloured pointers, Shenandoah's load-reference barrier),
-  which is incompatible with raw NaN-boxed pointers and with compiled code
-  that folds loads, and which no JavaScript engine does. So minor
-  collections stop the world, but their cost is survivors not garbage,
-  and helper threads copy alongside the mutator; V8 measured 20 to 50% off
-  the main-thread share ([Orinoco][orinoco]). The ckronos engine
-  (`~/git/js-interpreter`) is a data point for the split: the same Splay
-  run took 0.36 s with its concurrent marker and did not finish in 120 s
-  with it disabled, measured here.
-- **Copying nursery, not a non-moving or mark-in-place one.** Allocation
-  stays a bump (what `construct_direct` and the `CreateObject` stencils do
-  today), and dead young objects, the bulk of what Octane allocates, cost
-  nothing. V8 built a non-moving young generation (MinorMS) and found it "a
-  lose relative to the copying nursery"; its sticky-mark-bit generational
-  mode "didn't work out" either ([Wingo 2025][v8-2025]). ckronos's
-  non-moving region nursery reclaimed 18% of EarleyBoyer's memory and none
-  of Splay's.
-- **Precise roots, not a conservative stack scan.** JSC scans the machine
-  stack conservatively because three JITs and C++ hold raw pointers, and
-  that is why it can never move anything. toi's compiled code already
-  writes every live VM register back, boxed, at exits and before runtime
-  calls, and knows at each site which machine registers hold boxed values;
-  the interpreter's frames are arrays of `Value`. The roots are precise
-  already; the collector only has to read them.
-- **A mark-region old space that rarely needs to move anything, and
-  moves a bounded amount when it does.** A heap of size-classed blocks
-  (JSC's) has one pathology: a block serves one size, so after a phase
-  change a block that is dead but for one 64-byte object can serve no
-  128-byte allocation, and in the worst case every live object pins a
-  block. That is what makes compaction necessary in such heaps, and JSC
-  lives without it by accepting the memory. In a mark-region heap
-  ([Immix][immix]) a block has no size class: allocation bumps into any
-  free run of 128-byte lines, so the memory a live object can waste is
-  bounded by the line it sits in, not by a block, and a phase change
-  leaves holes any size can fill. That bound is usually enough; when the
-  sweep measures that it is not, the next cycle evacuates the sparsest
-  blocks into holes elsewhere, a budgeted amount per cycle, in the same
-  pause that finishes marking, on the slots the concurrent marker recorded
-  as pointing into them (V8's evacuation candidates, LXR's pattern of
-  concurrent marking with stop-the-world copying). Objects that compiled
-  code, inline caches or shapes refer to are *pinned* per cell and stay,
-  so nothing outside the heap is ever patched, and nothing moves while the
-  markers run, which is what keeps concurrent marking simple: V8's marker
-  must snapshot objects whose layout changes under it because it compacts
-  concurrently with layout changes; here moving happens only in a pause.
-- **Generations, not the internal/external split.** `object-model.md`
-  proposed two heaps separated by observability, with transitive
-  externalization on a store into an external object. A generational heap
-  gives the same three things it was after: minor collections trace only
-  from frames (plus the remembered set, which is small), dead young graphs
-  are freed in bulk, and stores into young objects carry no barrier. It
-  does not pay the transitive walk, whose cost is unbounded, and it does
-  not need the invariant that no external object points to an internal
-  one, which every builtin would have had to respect. What the split had
-  over generations, keeping a graph that lives for one long call out of
-  the old space, a generational heap recovers partly with pretenuring and
-  a nursery sized to the survival rate, and the concurrent marker makes
-  the rest cheap: a graph promoted and then dropped costs marking time on
-  another core, not mutator time. The escape analysis of `object-model.md`
-  (virtual objects, compact layouts) is orthogonal and stays.
+The first revision of this document chose V8's design: a semi-space
+nursery copied by a parallel Scavenger, precise roots read from VM frames
+and safepoint maps, and an old space that moved only in pauses. Two of
+its premises do not hold in toi, which implementation showed:
+
+1. **Roots in compiled frames are not precise.** Stencils are machine
+   code that LLVM compiled; across a runtime call, LLVM keeps live values
+   in callee-saved registers (`rbx`, `rbp` on x86-64), and on arm64 the
+   GPR slot registers x24–x28 are callee-saved under the C ABI, so the
+   runtime-call wrapper does not push them: they pass through Rust frames
+   that save them wherever their prologues put them. A collection reached
+   from a runtime call can find those words only by scanning the native
+   stack, and cannot tell a boxed value from an integer that looks like
+   one, so it cannot rewrite them: what they point to must not move.
+2. **Compiled code embeds heap addresses everywhere.** Inlining guards
+   compare the callee register with a function object, prototype loads
+   read an absolute slot address, the global object and folded constants
+   are immediates, inlined frames read upvalue cells by address, call and
+   constructor sites cache closures and prototypes. Under a moving
+   nursery none of these may be young, so a function allocated since the
+   last collection could not be inlined; in a short run that is every
+   function, and the microbenchmarks are short runs.
+
+A third cost tipped it: Rust runtime code holds values, raw object
+pointers and slices of string units across allocations everywhere
+(`string_units` returns a slice into the heap), and a moving collector
+needs each one in a handle.
+
+With cells that never move, compiled code keeps embedding what it likes
+(the collector keeps those cells alive), conservative roots cost a
+metadata check per word, and Rust code needs no handles except across a
+call into JS. What is given up is compaction of the nursery: survivors
+stay where they were allocated, interleaved with the holes that dead
+cells leave, and allocation bumps through holes rather than one free
+range. V8 measured its non-moving young generation as a loss against
+the Scavenger; Whippet measured `nofl` with sticky marks as competitive
+for Guile, whose roots are conservative like toi's. The plan measures it
+at each step.
 
 ## Numbers the design is for
 
-Octane's deterministic runs on toi today (2026-10-10, Apple M-series,
-`target/release/toi`, peak RSS; with no collector that is the allocation
-volume):
+Octane's deterministic runs on toi before the collector (2026-10-10,
+Apple silicon, `target/release/toi`; with no collector the heap's size is the
+allocation volume; peak RSS undercounts it on macOS, which compresses
+memory that is never touched again):
 
 | benchmark | allocated | time | rate |
 |---|---:|---:|---:|
-| Splay | 4.9 GB | 2.6 s | 1.9 GB/s |
-| EarleyBoyer | 4.65 GB | 27.8 s | 170 MB/s |
-| RegExp | 2.5 GB | 18.8 s | 130 MB/s |
-| pdfjs | 1.6 GB | 2.4 s | 670 MB/s |
-| RayTrace | 1.37 GB | 11.6 s | 120 MB/s |
-| DeltaBlue | 832 MB | 1.2 s | 700 MB/s |
-| Crypto | 772 MB | 5.7 s | 135 MB/s |
-| code-load | 569 MB | 2.7 s | 210 MB/s |
-| TypeScript | 534 MB | 4.1 s | 130 MB/s |
-| Box2D | 228 MB | 1.7 s | |
-| GBEmu | 189 MB | 1.2 s | |
-| Richards | 47 MB | 1.6 s | |
+| Splay | 4.9 GB | 2.4 s | 2.0 GB/s |
+| EarleyBoyer | 4.4 GB | 28.7 s | 150 MB/s |
+| RegExp | 2.5 GB | 18.6 s | 135 MB/s |
+| DeltaBlue | 1.8 GB | 1.2 s | 1.5 GB/s |
+| RayTrace | 1.6 GB | 10.8 s | 150 MB/s |
+| pdfjs | 1.4 GB | 2.4 s | 590 MB/s |
+| Crypto | 784 MB | 5.6 s | 140 MB/s |
+| TypeScript | 393 MB | 4.1 s | 95 MB/s |
+| Box2D | 183 MB | 1.7 s | |
+| GBEmu | 166 MB | 1.3 s | |
+| code-load | 123 MB | 2.7 s | |
+| Richards | 40 MB | 1.6 s | |
 | NavierStokes | 10 MB | 7.1 s | |
 
-The three largest ran several times slower than the README's Linux figures
-here: the machine was paging. That is the first thing the collector buys.
+The heap of step 1 rounds cells to 16 bytes and gives arrays a header
+word: DeltaBlue allocates 12% more, Splay 9%, code-load 28%.
 
 Two shapes of workload: DeltaBlue, Richards, RayTrace and Splay allocate
 small objects at hundreds of MB/s with most dying young (Splay's tree
 nodes are the exception that generational collectors are tested on), while
 pdfjs, TypeScript and code-load build large structures that live until the
-end. The nursery pays for the first group; the old space's headroom
-policy and the concurrent marker decide the second.
+end. The minor collection pays for the first group; the old generation's
+headroom policy and the concurrent marker decide the second.
 
 Header cost: a DeltaBlue `Variable` has 7 fields, 56 bytes of slots after
 a 48-byte header. JSC's header is 8 bytes, Java's 12 (8 with
@@ -188,14 +168,15 @@ during a collection and none outside one. ([Riptide][riptide],
 [Understanding GC in JSC][jsc-2022], `heap/MarkedBlock.h`,
 `heap/Collector.cpp`)
 
-Taken: side mark bits with version clearing, bump allocation over free
-intervals (JSC's intervals are Immix's holes), concurrent lazy sweeping,
-the two-pause concurrent cycle, the threshold trick that lets one barrier
-switch modes, code holding heap constants with an invalidation rule, the
-collector pacing against mutator progress. Not taken: size-classed
-blocks (the fragmentation argument above), conservative scanning, the
-object-granular barrier (below), IsoSubspaces, the fenced slow path
-(single mutator: no fence).
+Taken: non-moving cells with side mark state, generations by sticky
+marks, conservative scanning of the machine stack (for the same reason
+JSC has it: compiled code and C++, here Rust, hold raw pointers), bump
+allocation over free intervals (JSC's intervals are Immix's holes),
+concurrent lazy sweeping, the two-pause concurrent cycle, code holding
+heap constants, the collector pacing against mutator progress. Not
+taken: size-classed blocks (a block of one size class can be held by
+one live cell), the object-granular barrier (a card mark is cheaper on
+the store, and the minor collection pays instead), IsoSubspaces.
 
 ### V8
 
@@ -220,12 +201,15 @@ scanning for JS (unshipped after a decade). ([Trash talk][orinoco],
 [concurrent marking][v8-cm], [pre-tenuring][v8-pretenure],
 [Wingo 2025][v8-2025])
 
-Taken: the parallel Scavenger with age mark, slot-set remembered sets,
-the insertion barrier with black allocation, the barrier's elision rules
-(numbers, initializing stores with no safepoint in between), memento
-pretenuring, the shape of the pacer (measured speeds, not constants).
-Not taken: relocation of code and compaction (the old space does not
-move), the specific constants, and anything weak until ES6.
+Taken: the barrier's elision rules (numbers, initializing stores with no
+safepoint in between), black allocation during marking, the shape of the
+pacer (measured speeds, not constants). Not taken, after trying to fit
+it (see "Why not a copying nursery"): the Scavenger, which needs every
+pointer to a young object to be found and rewritten, and `RelocInfo`'s
+patching of code. V8 found its non-moving young generation slower than
+the Scavenger; V8 can move because it controls every frame layout its
+compilers produce, which a copy-and-patch JIT built from LLVM's output
+does not.
 
 ### Recent work (2023–2026)
 
@@ -246,13 +230,14 @@ move), the specific constants, and anything weak until ES6.
   heap stays movable ([Ruby][ruby-mmtk], [Julia][julia-mmtk]). Whippet's
   `nofl` space does the same for Guile with one metadata byte per 16-byte
   granule and a field-logging barrier measured at 1.05–1.5× over card
-  marking ([Wingo 2024][nofl]). toi does not need the conservative half,
-  but the pin bit is the fallback if a Rust frame ever has to hold an
-  unrooted value.
+  marking ([Wingo 2024][nofl]). toi's heap is `nofl`'s: the granule
+  metadata byte, conservative roots checked against it, holes found from
+  it, generations by sticky marks, with a card-marking barrier.
 - **Copying nurseries' failure mode.** A long live list built in one go
   survives its first minor collection whole and is copied again at the
   second ([Wingo 2025][nursery-fail]); the remedy is to promote in place
-  when evacuation would copy most of a page. The nursery below has that.
+  when evacuation would copy most of a page. A non-moving young
+  generation promotes everything in place.
 - **Headers.** JEP 450/519 shrink Java's header to 8 bytes: 22% less heap,
   8% less CPU on SPECjbb ([lilliput]). JSC has been at 8 bytes since 2013.
 - **Dynamic heapification** (PLDI 2024, [paper][heapify]): objects
@@ -276,607 +261,262 @@ move), the specific constants, and anything weak until ES6.
 
 ### Threads
 
-- **The mutator**: the one JS thread, as today. It allocates, runs the
-  barrier, and executes every stop-the-world phase itself when it reaches
-  a safepoint (JSC's "conn": the collector never touches frames, the
-  handle stack or Rust-owned structures).
-- **Collector threads**: a pool of `min(cores - 1, 4)` threads (the count
-  is a tunable measured in step 6), idle when no cycle runs. They mark
-  and sweep the old space, help copy during minor collections, and
-  prepare memory (below). They read and write the cage, the mark bitmaps,
-  the work queues and the block descriptors, and nothing else.
-
-What is shared, and how:
-
-| structure | written by | read by | synchronisation |
-|---|---|---|---|
-| cell fields | mutator | markers | relaxed atomic loads in the marker; every field is a `Value` or a cell pointer at every instant |
-| mark bitmaps and line marks | markers, mutator (barrier, allocation during marking) | sweepers, mutator | atomic or-and-test per mark bit; a line mark is a byte store of 1, which any number of threads may repeat |
-| recorded-slot bitmaps (remembered set and candidate slots) | mutator (barrier stub), markers (candidate slots) | mutator at the pauses | atomic or per bit; read only when the world is stopped |
-| mark work queues | barrier (push), markers | markers | segmented queues: a thread owns a segment, publishes full ones to a shared list under a lock |
-| remembered-set slot buffer | mutator | mutator (minor GC) | none: the minor collection is stop-the-world |
-| block descriptors (state, holes, pins) | sweepers, mutator allocator, the start pause (candidates) | both | a state word per block: `free`, `recyclable`, `full`, `allocating`, `candidate`; sweepers hand recyclable blocks over through one queue; pins are set only by the mutator |
-| `gc_requested`, phase | collector | mutator at safepoints | one atomic word |
-
-The marker never reads a shape, a `Code`, a `Vm` field or an inline cache:
-everything it needs is in the cell (below). That rule is what keeps the
-concurrent part small; ckronos's collector reads 121 fields of its
-runtime state and carries 53 numbered invariants to stay consistent.
+- **The mutator**: the one JS thread. It allocates, runs the barrier, and
+  runs every stop-the-world phase itself at a safepoint (JSC's "conn":
+  only the mutator reads frames, the native stack and Rust structures).
+- **A collector thread** (later a small pool) marks and sweeps the old
+  generation while the mutator runs. It reads cells and writes the
+  metadata, the mark queues and the block lists, nothing else: it never
+  reads a shape, a `Code`, a `Vm` field or an inline cache.
 
 ### The heap
 
-One reservation (the sandbox's cage, `docs/sandbox.md`; 64 GB of address
-space costs nothing until touched), divided into:
+One reservation (32 GiB of address space by default, `TOI_HEAP_LIMIT` in
+MiB lowers it; memory is used only as touched) of 32 KiB blocks:
 
-- **Nursery**: two semi-spaces of `N` bytes each, contiguous, so *young*
-  is one unsigned compare: `(cell - nursery_base) < 2N`. Allocation is a
-  bump of `Heap::ptr` against `Heap::end`, as today; compiled code keeps
-  bumping the same two words. A collector thread pre-faults and zeroes
-  the to-space while the mutator fills the from-space, so allocation never
-  takes a page fault on the mutator thread (the kernel's zeroing was most
-  of allocation's cost in `future-work.md`, "Fewer page faults").
-- **Old space**: 32 KB blocks (two Apple-silicon pages) of 256 lines of
-  128 bytes, Immix's geometry. A cell is allocated at a 16-byte granule
-  inside a *hole*, a run of free lines; cells up to a line are the common
-  case (a 48-byte header and up to ten slots), cells up to 8 KB take a
-  hole of enough lines, and the allocator keeps one block with large
-  holes aside for them (Immix's overflow block) so they do not break up
-  small holes. Per block, outside the block (trusted metadata, V8's
-  lesson for the sandbox): a state word (`free`, `recyclable`, `full`,
-  `allocating`, `candidate`), the line marks (one byte per line), the
-  cell mark bitmap (one bit per granule, set at a cell's first granule),
-  the pin bitmap (same geometry), a *version* that makes the marks
-  logically clear without touching them (JSC), and the slot bitmap of
-  recorded slots. Allocation is a bump: the mutator and each helper
-  thread own a current hole (`ptr`, `end`), take the next hole of the
-  block from its line marks, and the next recyclable block from the
-  sweeper's queue. The nursery's bump and the old space's bump are the
-  same two-word operation, so pretenured allocation in compiled code is
-  the stencil it has today with another pair of words.
-- **Large space**: cells over 8 KB (long strings, big element arrays,
-  `ArrayBuffer` bytes), each its own range, never moved, one mark bit
-  each. `ArrayBuffer` bytes always live here, even small, so a typed
-  array's `elems`, an interior pointer into them, never needs fixing.
-- **Metadata**: block descriptors, bitmaps, queues, the handle stack:
-  Rust allocations outside the cage.
+- **Small blocks** hold cells of up to 8 KiB. A cell is a run of 16-byte
+  granules and never crosses a block's end. The mutator allocates by
+  bumping `ptr` against `end`, a hole of the current block; when the
+  hole is full it takes the next hole of the block, then the next block
+  with free granules, then a block never used.
+- **Large cells** get a run of whole blocks.
+- **Metadata**, beside the heap, one byte per granule
+  (`meta_bias + addr / 16`): at a cell's first granule `YOUNG` (allocated
+  since the last collection) or the color it was last marked with (an
+  old cell), and `END` at an old cell's last granule; 0 elsewhere. A
+  conservative word is a cell exactly when its granule's byte is `YOUNG`
+  or the current color; a hole is a run of granules no live cell covers,
+  found from the bytes alone.
+- **Cards**, beside the heap, one byte per 512 bytes, set by the barrier.
 
-Offsets or addresses: cells are raw 48-bit addresses today and 32-bit
-offsets in the sandbox. Every test in this design is of the form
-`addr - base < size`, which reads the same either way, so the collector is
-written over a `Cage` with `base` and the tests stay when the encoding
-changes.
+Memory is zeroed when a hole is taken (fresh blocks are zero already):
+the `create_object` stencils write a header and leave the slots, whose
+zero (`Value::EMPTY`, not a cell) a collection then reads.
 
 ### Cells
 
-Every allocation is a cell of one of these kinds, and the collector finds
-a cell's size and pointer fields from the cell alone:
+Every cell says how big it is from its first words (`heap::cell_size`):
 
-| kind | header | size from | pointer fields |
+| kind | first word | size from | references |
 |---|---|---|---|
-| object (`Class::Plain`, `Function`, `Native`, `Date`, `RegExp`, …) | `Object`, 48 bytes | `inline_cap` byte, plus `kind` as upvalue count for functions | inline slots, `props`, `elems`, upvalues; `code` only for `TypedArray` (its buffer) and cons strings (the second half) |
-| array | same | same | same, `elems` |
-| string | same, units follow | `elems_len` | none, or `props`/`code` for a cons |
-| typed array / buffer view | same | fixed | `code` (the buffer); `elems` recomputed from it |
-| property array (`props`) | 8 bytes: capacity | its header | all |
-| element array (`elems`) | 8 bytes: capacity | its header | all |
-| upvalue | none: its block's kind says "upvalues" | fixed, 16 bytes | `closed`, or `at` into a frame (or at its own `closed`) |
-| buffer bytes | 8 bytes: length | its header | none |
+| object | its shape's address (8-aligned) | `inline_cap` (header bytes 10–11), plus a string's `elems_cap` units words or a function's upvalue count | inline slots; `props` and `elems` (arrays' payloads); a function's upvalues; a typed array's `code` (its buffer) and a cons string's `props` and `code` (its halves) |
+| array of values | `VALUES \| capacity << 32` | its header | its values |
+| byte buffer | `BYTES \| length << 32` | its header | none |
+| upvalue | `UPVALUE` | fixed, 32 bytes | `closed` |
 
-Two changes to today's layout, both for the concurrent marker:
+A pointer to an array or an upvalue points past its header word, at the
+payload, so compiled code indexes `props` and `elems` as before. Two
+pointers are interior: a flat string's `elems` points at its own units,
+and a closed upvalue's `at` at its own `closed`; a typed array's `elems`
+points into its buffer's bytes. None of them is ever followed as a
+reference: the collector reaches the buffer through `code`.
 
-- **The header says how big the object is.** `inline_cap` goes in the
-  header's spare byte at allocation and `kind` doubles as the upvalue
-  count for functions, so the marker never reads a shape (a Rust `Box`
-  the mutator mutates) nor a `Code`. A function with more than 255
-  upvalues gets them in a separate array cell.
-- **Property and element arrays get a capacity word.** Today their
-  capacity lives in the owner (`props_cap`, `elems_cap`), and growth
-  writes a new pointer and a new capacity in two stores; a marker reading
-  the old pointer with the new capacity would run off the end of the old
-  array into unrelated cells. With the capacity in the array, the marker
-  reads the pointer, then the length from what it points to, and both
-  belong to the same array whether old or new. The old array is garbage
-  it may still scan, which is harmless: its slots hold the values they
-  held, all valid. This is V8's `FixedArray` and the reason JSC's
-  butterfly carries its own lengths. The owner's `props_cap` and
-  `elems_cap` stay for the interpreter's and the stencils' fast paths.
+### Generations
 
-A property or element array is referenced only by its owner (the
-`arguments` object copies, `string_units` flattens into a fresh units
-cell), which the verifier checks; the owner traces it and copies it along
-when it is copied.
+Young cells are those whose first granule says `YOUNG`. A **minor
+collection** marks every young cell reachable from the roots, from the
+young cells already marked, and from old cells on dirty cards, giving
+each the current color and its `END` byte: it is old from then on, where
+it is. The young cells left unmarked are garbage; their `YOUNG` bytes are
+cleared, and their granules are holes. Nothing is copied and no pointer
+is rewritten.
 
-The object header keeps its 48 bytes in this design. The collector needs
-from it `shape`, which a copy, in the nursery or an evacuation,
-overwrites with the forwarding pointer plus a tag bit (shapes are
-8-aligned Rust boxes, so bit 0 is free; the parallel copy installs it
-with a compare-and-swap), `class`, `inline_cap` and `kind`. No mark bit:
-marks live in the block bitmaps. No age bit: age is position relative to
-the nursery's age mark, as in V8. Two cells point into themselves, a
-string's `elems` at its inline units and a closed upvalue's `at` at its
-own `closed`; a copy re-aims them, and nothing else is an interior
-pointer, since buffers never move.
+Promotion is immediate: a cell that survives one minor collection is
+old. Premature promotion costs old-generation marking, which the
+concurrent marker does on another core; an age bit (a second young byte
+value, surviving one more minor collection) is the fallback if
+measurement says the old generation fills with cells that die soon after.
 
 ### Roots
 
-The precise root set, taken by the mutator at a pause:
+1. **The VM stack**, from its base to the highest word frames have
+   reached: each word that is a cell by the metadata. A frame's registers
+   are `Value`s; header slots hold Rust addresses (not in the heap) or
+   the running closure (a root).
+2. **The native stack and registers** (spilled at the collection's
+   entry), from the collection's frame to the base recorded when the VM
+   started running: each word that points into a cell, its first granule
+   found by walking the metadata back. This covers values compiled code
+   keeps in callee-saved registers, the slot registers a runtime-call
+   wrapper pushes, and Rust locals.
+3. **The VM's own references**: the global object and the builtins'
+   prototypes and functions, the string constant table and
+   `single_chars`, `Code::constants`, open upvalues, a pending error's
+   value, the handle stack.
+4. **References from Rust structures**: inline caches' holders
+   (prototypes, cached callees), shapes' prototypes, call and
+   constructor sites, and cells compiled code embeds (each compiled
+   function records them). A major collection enumerates them. A minor
+   collection cannot afford to (there are hundreds of thousands of
+   inline-cache ways in TypeScript), so the store of a young cell into
+   one is logged (`Heap::note_external`) and the log is a root of the
+   next minor collection, after which the cell is old.
 
-1. **VM frames**, walked from the current frame through `regs[-CALLER]`:
-   every register `r0..nregs` of every frame, and the header's `FUNC`
-   slot (the running closure). Every register holds a valid `Value` at a
-   safepoint: the interpreter writes nothing else, and compiled code
-   writes back only registers live at the exit, boxed. Dead registers are
-   scanned too; what they hold is a valid value that keeps something
-   alive until the frame returns, as in V8's and JSC's interpreters. The
-   alternative, liveness maps per `Code` and pc, is a later refinement
-   the JIT's `exit_live` already computes.
-2. **Compiled frames at a runtime call.** A region's call wrapper pushes
-   the live slot registers on the native stack. Each runtime call site
-   gets a *safepoint map*: the frame, how many GPR slots were pushed and
-   a bit per pushed slot for "boxed" (unboxed `Int` and `Fpr` homes hold
-   no pointers), and whether `acc` is boxed there. The map is a side table
-   keyed by the wrapper's return address, built when the region is
-   emitted from the same `Home` assignment the exits use. Direct calls
-   (`arch::direct_call`) push the same way and get the same map.
-3. **The handle stack**: `Vm::handles`, a `Vec<Value>` with scoped depth,
-   for Rust code that holds a value across a call into JS (below).
-4. **Open upvalues**: `Vm::open_upvalues`, each an upvalue cell.
-5. **Named VM roots**: the global object, every builtin prototype,
-   `missing_holder`, `single_chars`, `bind_helper`, `array_fn` and the
-   other cached functions, `error`'s value, `pending_args` (made to point
-   into the callee frame rather than a Rust slice).
-6. **Old-only references**, visited by a major cycle but never by a
-   minor one, because they may only refer to old cells: `Code::constants`
-   and the string constant table (allocated old), inline caches' `holder`
-   and `new_shape`'s prototypes, `Shape::proto`, `CallSite::closure`,
-   `CtorSite::proto`, folded constants and prototype slot addresses in
-   compiled code (`relied_slots`), `Vm::regexps`' objects. The rule that
-   keeps them old is below; the barrier that keeps them marked during a
-   cycle is the same as for any store.
+### Safepoints
 
-The interning table `Vm::strings` holds constants, which are old and live
-as long as their `Code`; runtime strings are never interned
-(`string_constant` is called from the compiler and from property-name
-conversion only), so the table is a plain root, not Lua's weak set.
-
-### Safepoints, and why Rust code needs no handles
-
-**A collection runs only at a safepoint, never inside an allocation.**
-When the nursery is full, the allocator takes the next chunk of to-space
-headroom (or, if none is left, a fresh chunk) and sets `Vm::gc_requested`;
-the collection happens at the next safepoint. The collector threads
-request their two pauses through the same word. Safepoints are:
-
-- the interpreter's loop back edge (next to the budget countdown that
-  tiers up), and a call before the callee's frame is pushed;
-- a runtime call from compiled code, in the wrapper, with the safepoint
-  map; the allocation slow path is one;
-- `call_function` and `run_script_at`, before entering the new frame.
-
-Compiled loops get no poll of their own: a loop that allocates reaches the
-allocation slow path within one nursery of allocation, and a loop that
-does not allocate cannot need a collection. A pause the collector asks for
-waits until the mutator next allocates; while it waits, nothing grows.
-
-So a runtime function or builtin that allocates ten times in a row holds
-its `Value`s in Rust locals safely: nothing moves under it. The only Rust
-code that must root is code that **calls back into JS** and keeps a value
-across the call: `each` and the other callback builtins (`sort`, `map`,
-`filter`, `reduce`, `replace` with a function), accessor calls in
-`Vm::get`/`Vm::set`, `to_primitive` and `to_string` on objects. There are
-37 `call_function` sites and the accessor path to audit. The API is a
-scope: `vm.rooted(v)` pushes on the handle stack and returns an index;
-the scope's drop truncates; natives read `vm.handles[i]` after the call.
-This is Lua's rule for its C API (values live on the Lua stack) and what
-`native_top` already does for frames.
-
-`TOI_GC_STRESS=1` collects at every safepoint, flips the nursery every
-time, and fills the vacated semi-space with `0xdd`, so a missed root
-crashes on first use rather than corrupting silently. The differential
-test suite runs under it, and under `TOI_GC_STW=1` (every phase on the
-mutator thread, the debugging configuration), as two more of its
-configurations; ckronos tested only its stop-the-world mode and shipped
-the concurrent one.
-
-### The nursery collection
-
-Cheney copying, with V8's age mark, stop-the-world, parallel:
-
-1. Flip. From-space is the nursery that was being allocated into; the
-   age mark is where allocation stood after the previous collection.
-2. The mutator scans the roots (1–5 above) and the remembered set's
-   slots, posting each slot that holds a young value as a work item; the
-   collector threads and the mutator consume items: for an object above
-   the age mark, allocate in to-space from a per-thread allocation buffer
-   and compare-and-swap the forwarding word; the thread that wins copies,
-   the others read the forwarding pointer. For an object **below the age
-   mark**, which survived once already, *promote*: allocate in the old
-   space from a per-thread block, copy, and scan the fields for young
-   pointers, which go in the remembered set. Copied objects are scanned
-   from a per-thread worklist with stealing.
-3. Set the age mark at the new allocation top; the from-space becomes
-   the next to-space, and a collector thread starts zeroing it.
-
-If copying would move more than most of a from-space page (the fraction
-is measured, not preset: the point where copying costs more than the
-fragmentation it saves), the page is promoted whole by re-threading it
-into the old space as a block of mixed sizes that is swept but never
-allocated into again (V8's page promotion; the answer to the long-live-list
-failure mode). This needs object-start bits for that page only, computed
-while copying.
-
-A minor collection during a major cycle stops the markers too. Promoted
-objects are allocated marked and pushed grey, so the marker scans them
-once initialized; the mark queues and the remembered set hold only old
-addresses, so copying changes nothing they contain.
-
-**Pretenuring.** Allocation sites that survive are made to allocate
-directly in the old space: a `CreateObject`, `CreateArray` or
-`construct_direct` site records a memento after a sample of its objects
-(one word, the site), the collection counts mementos behind survivors,
-and a site whose sampled survival stays high over enough samples switches
-to old allocation; the JIT's inline allocation for that site is dropped
-and recompiles against the old-space allocator. The sample rate, the
-number of samples and the survival cut-off are tunables of step 6; the
-decisions reset when a major cycle frees most of the old space. This is
-what replaces "allocate external directly" from `object-model.md`.
+A collection runs only at a safepoint: allocation sets `gc_requested`
+when the nursery's budget is used, and never collects. Safepoints are
+the entries of the runtime functions that interpreter handlers and
+compiled code call to allocate or to call (creating objects, arrays and
+closures, `new`, calls into natives and through the runtime, the
+allocation slow paths of the stencils), and the tier-up exit of a loop.
+At those points every value is in a VM frame, a register or a native
+stack word, all of which the collection scans. A native that keeps
+values in a `Vec` across `call_function` (`sort`, `map`, `filter`,
+`replace` with a function) holds them in a handle scope.
 
 ### The write barrier
 
-Needed on every store of a value into a heap cell: `SetNamed`,
-`SetKeyed`, element stores, `props`/`elems` installation, upvalue close,
-`store_field`, every builtin's store, and every creation of an old-only
-reference (an inline cache filled, a constant folded, a shape's prototype
-set). Two conditions share it: the *generational* one, the host is old and
-the value is a young cell, and the *marking* one, a cycle is marking and
-the value is an old cell not yet marked.
-
-Compiled code, x86-64, after the store of `v` into `[host + off]`:
+Every store of a value into a cell, and of an array or upvalue pointer
+into an object, marks the card of the address stored to:
 
 ```text
-mov rax, v ; sub rax, [young_base]     ; is v a cell we care about?
-cmp rax, [young_span] ; jae done       ;   numbers (≥ 2^49) and immediates (< 16) never are
-cmp host, [young_end] ; jb done        ; host young: never a barrier
-lea rax, [host + off] ; call slow      ; out-of-line stub, not a runtime call
-done:
+shr  rax, 9 ; mov byte [card_bias + rax], 1      (x86-64, rax = address)
 ```
 
-`young_span` is `2N` outside a marking cycle and `2^48` during one, so
-during marking every *cell* store into an old host takes the stub and
-every number store still takes three instructions (JSC's threshold trick,
-applied to a range). Storing an old value into a young host needs no
-marking barrier either: the nursery is one grey object, scanned in full at
-the final pause. The stub does both jobs: if the value is young, append
-the slot to the remembered-set buffer (flushed into the block's slot
-bitmap when full); if marking and the value is old and its mark bit is
-clear, set it and push the cell on the mutator's mark segment. No fence:
-one mutator, and the markers tolerate seeing a grey cell late because the
-final pause drains everything.
+The barrier needs neither the host's start nor the value, so it fits
+every store site the same way, including the stencils' (a `toi_hole_cards`
+operand holds the bias). It is elided where the stored value is known to
+be a number, and on initializing stores into a cell allocated with no
+safepoint since.
 
-The remembered set is V8's: precise slots, so the minor collection visits
-exactly what was recorded and drops what died. A card table would be
-branchless but makes the minor collection rescan whole cards and find
-object starts; JSC's object-granular barrier rescans whole objects, wrong
-for a 10,000-element old array taking one store. The stub is where to
-swap either in if measurement says so.
+A minor collection scans the dirty cards that hold old cells: it finds
+the first cell overlapping each card from the metadata, and visits the
+references of every old cell within the card's bytes. Every young cell
+reached is old afterwards, so no old-to-young reference survives a minor
+collection and every card is clean after one.
 
-The barrier is elided where the JIT knows the store can create neither
-edge:
+### The major collection
 
-- the value's type is `Int` or `Num` (field types: DeltaBlue's hot stores,
-  `planner.currentMark = …`, are numbers, and the type is static);
-- the host is an object allocated in this region with no safepoint since
-  (a `CreateObject` or scalar replacement being materialized): the
-  Maglev CVEs of 2024 came from a collection between two folded
-  allocations, so the rule is tied to the safepoint list above;
-- the host is a folded constant, old by the old-only rule, and the value
-  is a folded constant too.
+Concurrent, with two pauses (CMS's and JSC's pattern):
 
-The interpreter and the runtime call one `write_barrier` function with the
-same condition.
+1. **Start pause**: advance the current color, so every old cell is
+   unmarked; mark the roots (all four kinds above) and push them; record
+   that marking is on; start the collector thread.
+2. **Concurrent mark**: the collector pops cells, marks their unmarked
+   old referents (a byte store of the color and the `END` byte) and pushes
+   them. Young referents are left for the final pause. Old cells
+   allocated meanwhile are none: allocation makes young cells, and a
+   minor collection during marking marks its survivors with the current
+   color, which the marker treats as marked, and pushes their old
+   referents. Stores during marking dirty cards as always; a minor
+   collection clears the cards it scans, so it first copies the dirty
+   card set into the *mod-union* set that marking keeps. A preclean pass
+   of the collector rescans dirty cards while the mutator runs, so few
+   are left for the pause.
+3. **Final pause**: a minor collection (which marks the young survivors
+   and their old referents), a rescan of the roots, a rescan of the cards
+   dirtied since marking started (the mod-union set and the card table),
+   drain the queue. Then marking is off.
+4. **Concurrent sweep**: for each block, clear the bytes of cells marked
+   with an older color (dead), count the free granules; a block with no
+   live cell goes back to the free blocks and its memory to the system.
+   Large cells unmarked are freed. Sweeping must finish before the next
+   start pause (two colors live at most, three exist so a sweep can lag).
+   The allocator sweeps a block itself if it reaches one first.
 
-### The old-only rule, and pins
+Correctness of concurrent marking rests on four facts: nothing moves;
+every word of a cell is a valid value or a header at every instant (the
+mutator writes whole words, and growth writes the new array before the
+pointer to it); an array's capacity is in the array, so a marker never
+pairs an old pointer with a new capacity; and every store into a cell
+dirties its card, which the final pause rescans.
 
-**A pointer stored in compiled code, an inline cache, a shape, a call site
-or any Rust-side cache refers to an old cell, and that cell is pinned.**
-Then nothing outside the heap is ever patched: a minor collection does
-not look at those places at all, and an evacuation leaves pinned cells
-where they are. Pinning is a bit in the block's pin bitmap, set by the
-same call that stores the pointer, never cleared (a `Code` is never freed
-today; when it is, its pins go with it). A few thousand cells at most are
-pinned in a run: prototypes, constant objects on globals, closures at
-direct call sites. Enforcement at each site:
+### Pacing
 
-- *Folded constants and prototype slot addresses* (`fold_constant_loads`,
-  `rely_on_slot`): if the object is young, do not fold; emit the load and
-  check instead. Compiled code is compiled after warm-up, so the case is
-  rare, and the object is old two minor collections later.
-- *Call and constructor sites* (`CallSite::closure`, `CtorSite::proto`):
-  a young closure or prototype leaves the site unbound (calls go through
-  the runtime) until it is old; `toi_rt_call` rebinds it, as it does
-  today after exits.
-- *Inline caches*: a prototype `holder` that is young is not cached; the
-  miss path handles the load until it is old.
-- *Shapes*: `Shape::proto` is the one Rust-side pointer that cannot wait,
-  since a shape is made the moment `new F` runs. Shapes whose prototype
-  is young go on a list the minor collection walks to update `proto`; a
-  shape leaves the list when its prototype is promoted. The root-shape map
-  `Vm::roots`, keyed today by the prototype's address, is keyed by the
-  prototype's *unique shape* instead, which is a stable Rust pointer.
-- *Constants*: `Code::constants`, interned strings, `single_chars`, the
-  builtins and their prototypes are allocated in the old space directly
-  (`Heap::alloc_old`), as V8 does for internalized strings, into blocks
-  marked `pinned` whole, which the evacuation never selects.
+- **Nursery size**: the bytes allocated between minor collections. Its
+  cost is the roots and the survivors marked; a larger nursery gives
+  cells more time to die but leaves the cache. Measured: start from the
+  last-level cache's size and climb on marked bytes per allocated byte.
+- **Old-generation headroom**: the next major cycle starts when the old
+  generation has grown by a factor of its size after the last cycle,
+  adjusted so the collector's CPU share stays under a target and the
+  heap under `TOI_HEAP_LIMIT`.
+- **When marking starts**: early enough to finish before the headroom
+  is used, from the measured marking rate and allocation rate.
 
-Each of these is a store of a cell pointer into something the marker does
-not read, so each runs the barrier's marking half when it happens during a
-cycle, sets the pin bit, and a major cycle's pauses treat them all as
-strong roots while their owner (`Code`, `JitFunction`, `Shape`) lives.
-The named VM roots (the global object, the builtin prototypes) need no
-pin: the pause updates them like any root. JSC holds structures
-weakly from code and jettisons code when they die; toi's `Code`s are never
-freed today, so weak references buy nothing yet. When they are, the
-dependency lists the JIT keeps (`field_deps`, `jitted`) are where the
-jettison goes.
-
-### The major cycle
-
-Concurrent, with two pauses, on JSC's and V8's pattern:
-
-1. **Start pause** (mutator, at a safepoint): bump the mark version, so
-   every block's marks are logically clear; if the last sweep found the
-   old space fragmented (below), choose the *evacuation candidates*: the
-   blocks with the fewest live lines, without pinned blocks, up to the
-   cycle's copy budget, and flag them; scan the roots 1–6 above and the
-   remembered set's hosts into the shared mark queues; set `young_span`
-   to `2^48`; wake the markers. Microseconds to a millisecond: the roots
-   are frames and a few tables.
-2. **Concurrent mark** (collector threads): drain the queues with
-   stealing; a popped cell is traced by its kind, each old referent's
-   mark bit set with an atomic test-and-set and its lines marked, newly
-   set ones pushed. A slot whose referent is in a candidate block (and
-   not pinned) is *recorded* in the host block's slot bitmap, the same
-   structure the remembered set uses; the barrier stub records such
-   stores made meanwhile. Work is queued per block where it can be
-   (Green Tea's observation: cells of one block are scanned together,
-   which keeps the scan in cache), with the queue of blocks replacing the
-   queue of cells once the first wave of discovery is done. Young
-   referents are ignored: the nursery is scanned at the end. Old cells
-   allocated meanwhile (promotions, pretenured sites) are allocated
-   marked, lines included, and pushed grey. The markers stop when the
-   queues stay empty for a short while, then request the final pause.
-3. **Final pause** (mutator, with the collector threads helping): a minor
-   collection first, which empties the nursery of garbage and makes its
-   survivors the "grey nursery"; rescan roots 1–6; trace the nursery's
-   survivors to mark their old referents; drain the queues to empty
-   (bounded by what the barrier pushed since the markers stopped, which
-   the markers kept small by not stopping until the queues were quiet).
-   Then, if there are candidates, **evacuate**: each thread walks the
-   marked, unpinned cells of its candidate blocks, copies each into its
-   current hole (a recyclable block from the previous sweep, or a fresh
-   one), marks the copy and its lines, leaves the forwarding pointer in
-   the old cell, and clears the old cell's mark and lines; then every
-   recorded slot, every root 1–5 and every field of a nursery survivor
-   that points at a forwarded cell is rewritten, and a promoted or moved
-   cell's young pointers are re-recorded in the remembered set. Reset
-   `young_span`; wake the sweepers. Expected in the low milliseconds
-   without evacuation, plus the copy budget at the measured parallel
-   copy rate with it; the budget is set from that rate and the pause
-   target.
-4. **Concurrent sweep** (collector threads): for each block, read the
-   line marks: no live line, the block is free and its memory given back
-   with `madvise`; all lines live, `full`; otherwise `recyclable`, its
-   holes listed and the block queued for the allocator. No cell is
-   touched. The sweep also totals the live lines against the live bytes
-   per block, which is the fragmentation measure the next start pause
-   reads. Large cells without a mark are unmapped. If the allocator's
-   queue is empty it sweeps one block itself (JSC's sweep-to-allocate,
-   which keeps the mutator from waiting).
-5. **Prepare**: pre-zero and pre-fault the blocks the allocator will
-   take next, and the nursery's to-space.
-
-Correctness of concurrent marking rests on four facts: nothing moves
-while the markers run; every field holds a valid value at every instant
-(the mutator writes words, and a word is a `Value` or a cell pointer); the
-capacity of an array lives in the array; and every store of an old cell
-pointer into an old host, or into anything the marker does not read, runs
-the barrier. Correctness of evacuation rests on two more: every slot that
-points into a candidate at the final pause is either a root, a field of a
-nursery survivor, or recorded (the marker saw it, or the barrier did,
-because it was written into an old host during the cycle); and pinned
-cells never move. The verifier (`TOI_GC_VERIFY`) checks at the final
-pause that no live old cell is unmarked, by a full stop-the-world mark it
-compares against, and after an evacuation that no live word points at a
-forwarded cell.
-
-### Pacing, for performance
-
-The collector's job is to maximise mutator throughput under a memory
-cap, with the other cores as the resource it spends. No preset numbers;
-the policy measures and adjusts.
-
-- **Nursery size.** The cost of a minor collection is the roots plus the
-  survivors it copies; its benefit is the garbage it frees for nothing.
-  A larger nursery gives objects more time to die, so it copies fewer
-  bytes per byte allocated, until the survival curve flattens; a smaller
-  one keeps allocation in cache (write-allocate misses are the cost of
-  bumping through fresh memory). The policy climbs: it records copied
-  bytes per allocated byte and mutator time per allocated byte at the
-  current size, tries double and half every few collections, and keeps
-  what measured best, between 256 KB and the memory cap's share. The
-  starting point is the last-level cache size. DeltaBlue's 4,400
-  deterministic iterations allocated 832 MB, about 190 KB each; Splay's
-  1,400 allocated 4.9 GB, 3.5 MB each; those are the two profiles the
-  climb must handle.
-- **Old-space headroom.** With concurrent marking the cost of a cycle to
-  the mutator is the two pauses, the barrier's slow path and the memory
-  bandwidth the markers take; the cost of headroom is memory. The policy
-  sets the next cycle's trigger so that the collector's share of CPU
-  (marking and sweeping time across threads, divided by elapsed mutator
-  time) stays under a target, growing the headroom when the share is
-  above it and shrinking when below, clamped by the cap. The cap is the
-  only fixed number: `TOI_HEAP_LIMIT`, else a fraction of physical
-  memory. Under the cap the mutator stops and waits for the sweep, which
-  is what every collector does there.
-- **When marking starts.** Marking must finish before the headroom runs
-  out: start when `headroom < allocation_rate × predicted_mark_time ×
-  slack`, with the mark time predicted from live bytes at the last cycle
-  over the measured marking rate, and the allocation rate measured over
-  the last few minor collections (V8's and Go's pacers both work this
-  way). If the mutator outruns the markers, more collector threads join;
-  if the headroom is gone before marking ends, the mutator marks too
-  (JSC's scheduler stops the mutator; this does the same with the mutator
-  doing useful work).
-- **When to evacuate.** Fragmentation is the sweep's count of live
-  lines against live bytes: the memory held by lines that are partly
-  dead. Without evacuation it is bounded by a line per live cell; the
-  policy evacuates when that memory exceeds what the headroom controller
-  would otherwise have to grant, that is, when compacting is cheaper than
-  the memory it would save at the current target. The copy budget per
-  cycle comes from the pause target and the measured parallel copy rate,
-  and candidates are taken sparsest first, so each copied byte frees the
-  most. Fragmentation that never crosses the line costs nothing: most
-  runs will never evacuate.
-- **Thread counts.** The number of markers and copy helpers is chosen
-  per cycle from the work left and the cores idle; measured in step 6
-  rather than fixed.
-
-`TOI_GC_STATS` prints, per collection: kind, pause, bytes allocated since
-the last, bytes copied and promoted, marking and sweeping time per thread,
-and the mutator's share of wall time; `scripts/gc-tune.sh` sweeps the
-knobs on Octane and `bench/micro` to set the defaults the policy starts
-from.
+`TOI_GC_STATS` prints each collection: kind, pause, bytes allocated
+since the last, marked, freed, and the heap's size.
 
 ### Weak references, finalization
 
 None in ES5. `WeakMap` and `WeakRef` arrive with ES6 and need ephemeron
-processing in the final pause (V8's fixpoint, then a linear pass; Lua's
-`convergeephemerons`). Rust-side resources reachable from cells, `Regex`
-boxes and buffer memory, are freed by the sweeper when the cell dies;
-nothing else needs a finalizer.
+processing in the final pause. Rust-side resources reachable from cells
+(`Regex` boxes) are freed by the sweeper when the cell dies; nothing else
+needs a finalizer.
 
 ### Interaction with the JIT
 
-- **Inline allocation** keeps its two-word bump against `Heap::ptr`/`end`
-  (`CtorSite::heap`). The slow path is a runtime call, so a safepoint; the
-  stencil re-reads `ptr` after it.
-- **Stores** get the barrier above as a stencil tail, elided by type.
-  `array_push` and element stores barrier the element array cell.
-- **Safepoint maps** at runtime and direct call sites, from the `Home`
-  assignment; the exit stubs are unchanged.
-- **Old-only** checks at lowering, the pin bit on every pointer lowering
-  embeds, and the barrier's marking half when that happens during a
-  cycle.
-- **Code epoch**: nothing new; the collector never invalidates code,
-  because nothing it references moves.
-- **Pretenured allocation** in compiled code bumps the old-space hole's
-  two words exactly as the nursery's; the slow path takes the next hole.
-- **Scalar replacement** materializes into the nursery like any
-  allocation; between the allocation and the last initializing store there
-  is no safepoint, so no barrier.
+- **Inline allocation** keeps its bump of `Heap::ptr` against `end`, and
+  writes the new cell's metadata byte (`Heap`'s third word is the
+  metadata's bias). The slow path is a runtime call, so a safepoint.
+- **Stores** get the card mark as part of the stencil, elided by type.
+- **Embedded cells** are recorded per compiled function and are roots;
+  nothing the collector does invalidates code.
 
 ### What `object-model.md` keeps
 
 Virtual objects at the bytecode level (A), compact layouts (B), the
-measurement plan for DeltaBlue's allocation sites, and the barrier-free
-argument for hot stores (now: numeric stores need no barrier, and stores
-into young objects need none). The externalization barrier, the external
-bit, the transitive walk and the two-heap invariant go.
+measurement plan for DeltaBlue's allocation sites. The externalization
+barrier, the external bit, the transitive walk and the two-heap invariant
+go.
 
 ## Plan
 
 Each step lands with its tests and a measurement against the previous
-one on `scripts/octane.sh` (time and peak RSS) and `bench/micro`. The
-concurrent structures (atomic mark bits, segmented queues, the block
-state word, compare-and-swap forwarding) are built in from step 1; the
-stop-the-world configuration is the debugging mode, not the first design.
+one: `scripts/gc-bench.sh` (time and peak RSS of Octane's deterministic
+runs) and the microbenchmarks.
 
-1. **Heap layout, no collection.** The cage, nursery semi-spaces, old
-   blocks with descriptors and line marks, hole allocation, large space,
-   `alloc_old`; constants and builtins allocated old into pinned blocks;
-   `inline_cap` in the header; property and element arrays with their
-   capacity word; upvalues in their blocks. Everything still leaks. Checks: byte-identical results, page faults
-   and time on the allocation microbenchmarks not worse.
-2. **Roots and verification.** The frame walk, safepoint maps for
-   runtime and direct calls, the handle stack and the audit of the 37
-   callback sites and the accessor path, `gc_requested` at safepoints.
-   `TOI_GC_VERIFY=1` traces the whole heap from the roots at every
-   safepoint and asserts every root word and every traced field is a
-   valid value pointing at a live cell, before anything is freed. This
-   step finds the missing roots; it frees nothing.
-3. **The nursery collection, single-threaded.** Cheney copy, age mark,
-   promotion, the barrier in the interpreter and runtime, then in the
-   stencils, the old-only rule at lowering, `TOI_GC_STRESS`. Target:
-   Splay and DeltaBlue at a fraction of today's RSS with less than 10%
-   more time; a mutation test that removes one barrier call fails under
-   stress.
-4. **The major cycle, concurrent.** The collector threads, the two
-   pauses, concurrent marking with line marks and the barrier's marking
-   half, concurrent line sweeping, the verifier's stop-the-world
-   comparison, `TOI_GC_STW`. Target: pdfjs and TypeScript peak RSS near
-   their live size times the headroom, EarleyBoyer and RegExp with no
-   paging, and the mutator's share of wall time above 90% on all of
-   Octane.
-5. **Parallel copying and memory preparation.** Helper threads in the
-   minor pause, pre-zeroed to-space and blocks. Target: minor pauses on
-   Splay down by the measured parallel share.
-6. **Evacuation.** Pins, candidate selection from the sweep's
-   fragmentation measure, slot recording in the marker and the barrier
-   stub, the copy and rewrite in the final pause, the verifier's
-   forwarded-pointer check. Test: a program that allocates a large
-   population, keeps one object in a thousand and then allocates objects
-   of another size, with `TOI_GC_STATS` showing the old space's blocks
-   returning to the live size; the same program must also stay bounded
-   with evacuation disabled, which is the line-granularity claim.
-7. **Pacing and tuning.** The nursery climb, the headroom controller,
-   the marking start predictor, the evacuation trigger and budget, thread
-   counts, pretenuring's sample and cut-off, measured with
-   `scripts/gc-tune.sh`.
-8. **Later.** The header diet (shape as a 32-bit ID and class, flags and
-   lengths in one word: 16 bytes, with `props` and `elems` behind one
-   pointer as JSC's butterfly), which also puts most objects within one
-   line; shapes as collectable cells with weak references from code,
-   which lets pins expire; ephemerons with ES6.
+1. **Heap layout, no collection** (done). The reservation, blocks,
+   metadata and cards, hole and large allocation, self-describing cells
+   (`inline_cap` in the header, arrays' and buffers' header words,
+   upvalue cells), the stencils writing the metadata byte;
+   `TOI_GC_VERIFY` walks the heap and the test suite does after every
+   run. Measured: +1.8% geomean on the microbenchmarks, +5 to 19% on the
+   allocation-heavy ones (more memory per object, all of it fresh pages).
+2. **Roots and marking, no freeing.** The conservative scans, the VM's
+   references, the external log, the handle scopes, safepoints and
+   `gc_requested`; a stop-the-world mark of everything reachable whose
+   result `TOI_GC_VERIFY` checks (every reference of a marked cell is a
+   cell).
+3. **The minor collection.** The card barrier in the runtime, the
+   interpreter and the stencils; card scanning; clearing dead young
+   cells; holes and their reuse; `TOI_GC_STRESS` (collect at every
+   safepoint, fill freed memory with a pattern). Target: Splay and
+   DeltaBlue at a fraction of today's memory, within 10% of today's time.
+4. **The major collection, stop-the-world.** Colors, sweeping, freeing
+   blocks, the headroom policy.
+5. **Concurrent marking and sweeping.** The collector thread, the two
+   pauses, the mod-union cards and precleaning. Target: the mutator's
+   share of wall time above 90% on all of Octane.
+6. **Tuning**: the nursery size, the headroom, more marker threads, an
+   age bit, and evacuation of fragmented blocks if measurement shows
+   fragmentation costs memory (moving only cells no conservative word
+   and no Rust structure refers to).
+7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
+   most objects in one or two granules fewer), shapes as collectable
+   cells, ephemerons with ES6.
 
 ## Risks
 
-- **A missed root or barrier is silent.** Step 2's verifier and step 3's
-  stress mode are the defence, and they run in CI across the test suite's
-  configurations, concurrent and stop-the-world both. The audit of Rust
-  code that calls back into JS is the manual part; the list is short
-  because reentry goes through `call_function` and the accessor path only.
-- **Concurrency bugs are the expensive kind.** The design keeps the
-  shared state to five structures (the table above) and the marker's
-  reads to the cage alone, and the verifier compares every concurrent
-  mark against a stop-the-world one under `TOI_GC_VERIFY`. Termination
-  uses the plain counting protocol (a shared count of busy markers,
-  queues checked twice); ckronos's livelock came from a cleverer one.
-- **Promotion churn.** A graph live for one long call (DeltaBlue's solver
-  state, Splay's tree) is promoted and dies in the old space. Pretenuring
-  and the nursery climb reduce it; the concurrent marker makes what is
-  left cost another core rather than the mutator. Measured in step 6
-  against the internal/external alternative's claim.
-- **Memory bandwidth.** Markers share the memory system with the
-  mutator; on a laptop with a 1.5 GB live heap they can slow it. The
-  headroom controller's CPU-share target is also the knob for this, and
-  thread counts are measured, not assumed.
-- **Pins that never expire.** A pinned cell holds its line for the life
-  of the `Code` that pinned it, and `Code`s are not freed today. The
-  count is small and the memory is a line per pin, but a block full of
-  pins is never a candidate, so a long-running embedding that compiles
-  without bound accumulates unevacuable blocks. Shapes and code as
-  collectable cells (step 8) is the fix; until then `TOI_GC_STATS`
-  reports pinned lines so the growth is visible.
-- **A missed recorded slot leaves a dangling pointer after an
-  evacuation.** The recording happens in exactly two places, the
-  marker's trace and the barrier stub, and the verifier's
-  forwarded-pointer check runs under `TOI_GC_VERIFY` after every
-  evacuation; `TOI_GC_STRESS` makes every cycle evacuate every eligible
-  block, so a missed slot shows up in the test suite rather than in a
-  long run.
-- **The sandbox's offsets.** The design is written over `base`-relative
-  tests so the switch is mechanical; `Heap::alloc_old` and the block
-  descriptors are the two places that compute addresses from offsets.
+- **A missed root is a use after free.** `TOI_GC_STRESS` collects at
+  every safepoint and overwrites freed cells, so a missed root crashes on
+  first use; the test suite runs under it. The VM's references and the
+  Rust structures are the manual part; the conservative scans cover the
+  rest by construction.
+- **A missed barrier is a use after free too**, found the same way. The
+  barrier is one function in Rust and one macro in the stencils.
+- **Conservative retention.** A stale native stack word can keep a dead
+  cell (and what it reaches) alive for a cycle. Bounded by the stack's
+  size; Whippet, JSC and Guile live with it.
+- **Fragmentation.** Survivors pin their granules. Holes are granule-
+  precise, so the waste is the survivors themselves and holes too small
+  for the next allocation; `TOI_GC_STATS` reports free granules in
+  partly used blocks so the cost is visible, and evacuation is step 6's
+  remedy.
+- **Concurrency bugs** are kept to the marker's reads of cells and
+  writes of metadata; the verifier compares a concurrent mark with a
+  stop-the-world one.
 
 ## Sources
 

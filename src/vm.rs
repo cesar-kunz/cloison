@@ -3139,10 +3139,21 @@ pub fn number_to_string(d: f64) -> String {
     if d < 0.0 {
         return format!("-{}", number_to_string(-d));
     }
-    // `{:e}` gives the shortest round-trip digits: `d1.d2…dke<x>`.
-    let e = format!("{d:e}");
+    // `{:e}` gives the shortest round-trip digits, `d1.d2…dke<x>`, but
+    // where two k-digit strings are equally close to `d` (2^-25 is
+    // 2.98023223876953125e-8 exactly) it rounds up, and ECMA-262 wants the
+    // even one. `{:.*e}` rounds `d` to k digits exactly, ties to even: the
+    // closest k-digit string. It is the one to print if it round-trips;
+    // it may not (2^-24 is 5.9604644775390625e-8, and only ...063e-8 reads
+    // back as it: the interval of a power of two is narrower below), and
+    // then the shortest string is the closest that does.
+    let shortest = format!("{d:e}");
+    let k = shortest.split_once('e').unwrap().0.chars().filter(|c| c.is_ascii_digit()).count();
+    let closest = format!("{d:.*e}", k - 1);
+    let e = if closest != shortest && closest.parse::<f64>() == Ok(d) { closest } else { shortest };
     let (mantissa, exp) = e.split_once('e').unwrap();
     let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
+    let digits = digits.trim_end_matches('0').to_owned();
     let k = digits.len() as i32;
     // d = 0.d1…dk × 10^n
     let n = exp.parse::<i32>().unwrap() + 1;

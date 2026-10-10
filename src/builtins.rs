@@ -1055,19 +1055,19 @@ fn math_arg(a: &[Value], i: usize) -> f64 {
     a.get(i).map_or(f64::NAN, |&v| to_number(v))
 }
 fn math_tan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).tan()))
+    Ok(num(crate::math::tan(math_arg(a, 0))))
 }
 fn math_atan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).atan()))
+    Ok(num(crate::math::atan(math_arg(a, 0))))
 }
 fn math_atan2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).atan2(math_arg(a, 1))))
+    Ok(num(crate::math::atan2(math_arg(a, 0), math_arg(a, 1))))
 }
 fn math_asin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).asin()))
+    Ok(num(crate::math::asin(math_arg(a, 0))))
 }
 fn math_acos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(num(math_arg(a, 0).acos()))
+    Ok(num(crate::math::acos(math_arg(a, 0))))
 }
 fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = crate::interp::to_int32(math_arg(a, 0));

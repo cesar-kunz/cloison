@@ -2680,10 +2680,10 @@ fn num_arg(args: &[Value], i: usize) -> f64 {
 }
 
 fn math_log(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).ln()))
+    Ok(Value::number(crate::math::log(num_arg(a, 0))))
 }
 fn math_exp(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).exp()))
+    Ok(Value::number(crate::math::exp(num_arg(a, 0))))
 }
 fn math_sqrt(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::number(num_arg(a, 0).sqrt()))
@@ -2712,21 +2712,14 @@ fn math_round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }))
 }
 fn math_sin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).sin()))
+    Ok(Value::number(crate::math::sin(num_arg(a, 0))))
 }
 fn math_cos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::number(num_arg(a, 0).cos()))
+    Ok(Value::number(crate::math::cos(num_arg(a, 0))))
 }
-/// `Math.pow`: as `**`, where `pow(1, NaN)` and `pow(±1, ±∞)` are NaN.
+/// `Math.pow` (fdlibm's, as V8's: `pow(1, NaN)` and `pow(±1, ±∞)` are NaN).
 fn math_pow(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let (x, y) = (num_arg(a, 0), num_arg(a, 1));
-    Ok(Value::number(
-        if y.is_nan() || (x.abs() == 1.0 && y.is_infinite()) {
-            f64::NAN
-        } else {
-            x.powf(y)
-        },
-    ))
+    Ok(Value::number(crate::math::pow(num_arg(a, 0), num_arg(a, 1))))
 }
 /// `Math.min`/`max` of all the arguments (NaN if any is; no arguments:
 /// `Infinity`/`-Infinity`).

@@ -124,10 +124,14 @@ features: `explicit_tail_calls`, `rust_preserve_none_cc` and
   from one register fewer. Pages are 16 KiB there. Intel Macs are not
   supported (x86-64 Mach-O has no 32-bit absolute relocation for the
   immediate holes).
-- The platform's `libm` shows: `Math.tan(1)`, `asin` and `acos` differ
-  from Node's values in the last bit on macOS, so `cargo test --test
-  octane` fails its math script there. V8 ships its own fdlibm port for
-  this reason.
+- `Math`'s transcendental functions don't use the platform's `libm`,
+  whose results differ in the last bit between systems (Apple's
+  `tan(1)` against glibc's). `src/math.rs` ports fdlibm, as V8 does, so
+  `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log` and
+  `pow` are bit for bit Node's on x86-64 everywhere. (Node's arm64 builds
+  let the C++ compiler fuse multiply-adds in those same functions, so
+  about 0.5% of results differ from them by one ulp. The `// expect:`
+  values in the tests come from x86-64.)
 
 Because `build.rs` extracts stencils from LLVM's machine code and then
 rewrites branches in it, the stencil pipeline depends on LLVM's codegen

@@ -6895,10 +6895,19 @@ impl JitCode {
         if !clear.is_empty() {
             let count = unsafe { &raw const (*cur).heap.gc.count } as u64;
             let last = Box::leak(Box::new(u64::MAX)) as *mut u64 as u64;
+            // The stub continues where `words_jne` does: the next entry
+            // piece, or the entry instruction when there is none (what is
+            // laid out after it then is the region's first instruction,
+            // which the entry may be past: a loop nested in the region's).
+            let cont = if entry_seq.is_empty() {
+                Target::Label(entry as u32)
+            } else {
+                Target::AfterPiece(hot.len() as u32)
+            };
             clear.push(Piece {
                 imm64: count,
                 imm64b: last,
-                cont: Target::AfterPiece(hot.len() as u32),
+                cont,
                 ..Piece::new("copy_word", 0)
             });
             stubs.push(clear);

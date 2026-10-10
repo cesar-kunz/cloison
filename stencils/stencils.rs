@@ -164,7 +164,8 @@ unsafe extern "C" {
 ///   return address, so the asm first steps over the 128-byte red zone.
 /// - arm64: arguments in x8 and x9, result in x8. The wrapper may clobber
 ///   x7, x9–x17 and v16–v31; `bl` clobbers x30. x18, a temporary on Linux,
-///   is clobbered too: C code may use it. Slot registers x24–x28 are
+///   is clobbered too: C code may use it (not on macOS, where it is
+///   reserved). Slot registers x24–x28 are
 ///   callee-saved under the C ABI anyway; x0–x6 and v0–v7 are in/out
 ///   operands.
 #[cfg(target_arch = "x86_64")]
@@ -198,9 +199,10 @@ macro_rules! rt_call {
     }};
 }
 
+/// `rt_call!` on arm64, with the clobbers the OS decides (below).
 #[cfg(target_arch = "aarch64")]
-macro_rules! rt_call {
-    ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {{
+macro_rules! rt_call_arm64 {
+    ($s:ident, $f:ident, $a:expr, $b:expr; $($extra:tt)*) => {{
         let (mut a, b): (u64, u64) = ($a.to_bits(), $b.to_bits());
         let [g0, g1, g2, g3, g4, mut g5, mut g6, mut g7, mut g8, mut g9, mut g10, mut g11] =
             $s.g.map(Value::to_bits);
@@ -217,19 +219,34 @@ macro_rules! rt_call {
             inout("v1") f0, inout("v2") f1, inout("v3") f2, inout("v4") f3,
             inout("v5") f4, inout("v6") f5, inout("v7") f6,
             out("x7") _, out("x10") _, out("x11") _, out("x12") _, out("x13") _,
-            out("x14") _, out("x15") _, out("x16") _, out("x17") _, out("x18") _,
+            out("x14") _, out("x15") _, out("x16") _, out("x17") _,
             out("x30") _,
             out("v16") _, out("v17") _, out("v18") _, out("v19") _,
             out("v20") _, out("v21") _, out("v22") _, out("v23") _,
             out("v24") _, out("v25") _, out("v26") _, out("v27") _,
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
-            $($($extra)*)?
+            $($extra)*
         );
         $s.g = [g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11].map(Value::from_bits);
         $s.f = [f0, f1, f2, f3, f4, f5, f6];
         $s.facc = facc;
         a
     }};
+}
+
+// x18 is a temporary on Linux, so C code may clobber it; on macOS it is
+// reserved (the platform register), never touched and not nameable.
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+macro_rules! rt_call {
+    ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {
+        rt_call_arm64!($s, $f, $a, $b; out("x18") _, $($($extra)*)?)
+    };
+}
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+macro_rules! rt_call {
+    ($s:ident, $f:ident, $a:expr, $b:expr $(; $($extra:tt)*)?) => {
+        rt_call_arm64!($s, $f, $a, $b; $($($extra)*)?)
+    };
 }
 
 /// `toi_rt_add(a, b)`.
@@ -361,7 +378,7 @@ fn imm_zext() -> u64 {
 /// LLVM emits for a symbol address, this doesn't depend on where the JIT
 /// code is (`adrp` is page-relative), and the 64-bit output tells LLVM the
 /// upper bits are already zero.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[inline(always)]
 fn imm_zext() -> u64 {
     let k: u64;
@@ -386,7 +403,7 @@ fn imm() -> i32 {
 
 /// The immediate when the JIT knows it fits 16 bits (0..=65535): a single
 /// `movz`. Used by the `_k16` stencil variants.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[inline(always)]
 fn imm16() -> i32 {
     let k: u64;
@@ -420,7 +437,7 @@ fn imm64_u32() -> u64 {
 
 /// The first 64-bit immediate when the JIT knows it fits 32 bits: `movz` +
 /// `movk` of the low halves.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[inline(always)]
 fn imm64_u32() -> u64 {
     let k: u64;
@@ -456,7 +473,7 @@ macro_rules! imm64_of {
 }
 
 /// A 64-bit immediate operand: `movz` + three `movk`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 macro_rules! imm64_of {
     ($sym:ident) => {{
         let k: u64;
@@ -473,6 +490,108 @@ macro_rules! imm64_of {
         }
         k
     }};
+}
+
+// macOS: Mach-O has no relocation for a `movz`/`movk` immediate field, so
+// each hole is written as a magic immediate, `0xB0<hole><part>`, that
+// `build.rs` (`macho_holes`) turns into the `MOVW_UABS_G<part>` relocation
+// of the hole and zeroes: the same instructions, operands and bytes as the
+// ELF stencils above, which are the reference. The hole's symbol stays an
+// operand, named only in an assembler comment: without a `sym` operand
+// LLVM schedules the asm earlier (above a load it doesn't depend on), and
+// the stencils differ from Linux's. With it they are byte for byte the
+// same (`scripts/stencils-asm.sh` on both, or the generated `stencils.rs`).
+
+/// The 16-bit immediate standing for part `$part` (0–3) of hole `$hole`.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+macro_rules! hole16 {
+    ($part:literal, imm) => { concat!("#0xB01", $part) };
+    ($part:literal, reg) => { concat!("#0xB02", $part) };
+    ($part:literal, imm64) => { concat!("#0xB03", $part) };
+    ($part:literal, imm64b) => { concat!("#0xB04", $part) };
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+fn imm_zext() -> u64 {
+    let k: u64;
+    unsafe {
+        core::arch::asm!(
+            concat!("movz {k:w}, ", hole16!(0, imm), " // {s}"),
+            concat!("movk {k:w}, ", hole16!(1, imm), ", lsl #16"),
+            k = out(reg) k,
+            s = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+    }
+    k
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+fn imm16() -> i32 {
+    let k: u64;
+    unsafe {
+        core::arch::asm!(
+            concat!("movz {k:w}, ", hole16!(0, imm), " // {s}"),
+            k = out(reg) k,
+            s = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+    }
+    k as u32 as i32
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+fn imm64_u32() -> u64 {
+    let k: u64;
+    unsafe {
+        core::arch::asm!(
+            concat!("movz {k:w}, ", hole16!(0, imm64), " // {s}"),
+            concat!("movk {k:w}, ", hole16!(1, imm64), ", lsl #16"),
+            k = out(reg) k,
+            s = sym toi_hole_imm64,
+            options(pure, nomem, nostack),
+        );
+    }
+    k
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+macro_rules! imm64_of {
+    (toi_hole_imm64) => { imm64_of!(@parts imm64, toi_hole_imm64) };
+    (toi_hole_imm64b) => { imm64_of!(@parts imm64b, toi_hole_imm64b) };
+    (@parts $hole:ident, $sym:ident) => {{
+        let k: u64;
+        unsafe {
+            core::arch::asm!(
+                concat!("movz {k}, ", hole16!(0, $hole), " // {s}"),
+                concat!("movk {k}, ", hole16!(1, $hole), ", lsl #16"),
+                concat!("movk {k}, ", hole16!(2, $hole), ", lsl #32"),
+                concat!("movk {k}, ", hole16!(3, $hole), ", lsl #48"),
+                k = out(reg) k,
+                s = sym $sym,
+                options(pure, nomem, nostack),
+            );
+        }
+        k
+    }};
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn mem(regs: *mut Value) -> *mut Value {
+    let off: usize;
+    unsafe {
+        core::arch::asm!(
+            concat!("movz {o:x}, ", hole16!(0, reg), " // {s}"),
+            o = out(reg) off,
+            s = sym toi_hole_reg,
+            options(pure, nomem, nostack),
+        );
+        regs.byte_add(off)
+    }
 }
 
 /// The first 64-bit immediate: `mod_smi_i`'s multiplier, or the shape a
@@ -499,7 +618,7 @@ unsafe fn mem(regs: *mut Value) -> *mut Value {
 
 /// The VM register in memory named by the register hole: its byte offset
 /// (< 2 KiB) fits one `movz`, so an access is `movz` + `ldr`/`str`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[inline(always)]
 unsafe fn mem(regs: *mut Value) -> *mut Value {
     let off: usize;
@@ -3280,13 +3399,28 @@ unsafe fn at_imm(base: *mut u8) -> *mut Value {
 /// The slot `imm` bytes into `base`: the offset (below 64 KiB, which the
 /// JIT checks) from one `movz`, as a symbol's address would be an `adrp`,
 /// relative to where the code is.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[inline(always)]
 unsafe fn at_imm(base: *mut u8) -> *mut Value {
     let off: usize;
     unsafe {
         core::arch::asm!(
             "movz {o:x}, #:abs_g0_nc:{s}",
+            o = out(reg) off,
+            s = sym toi_hole_imm,
+            options(pure, nomem, nostack),
+        );
+        base.byte_add(off).cast()
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn at_imm(base: *mut u8) -> *mut Value {
+    let off: usize;
+    unsafe {
+        core::arch::asm!(
+            concat!("movz {o:x}, ", hole16!(0, imm), " // {s}"),
             o = out(reg) off,
             s = sym toi_hole_imm,
             options(pure, nomem, nostack),

@@ -20,4 +20,4 @@ panic = "abort"
 debug = "line-tables-only"
 
 [build-dependencies]
-object = { version = "0.40", default-features = false, features = ["read_core", "elf"] }
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "macho"] }

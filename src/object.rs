@@ -614,6 +614,14 @@ pub struct Heap {
 const CHUNK_WORDS: usize = 1 << 16;
 const SMALL_HEAP: usize = 8 * CHUNK_WORDS;
 const HUGE_PAGE: usize = 2 << 20;
+
+/// The system's page size: what `mmap`, `mprotect` and `munmap` round to
+/// (16 KiB on Apple silicon, 4 KiB elsewhere).
+pub(crate) const PAGE: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    16 << 10
+} else {
+    4 << 10
+};
 const MAX_CHUNK: usize = 64 << 20;
 
 /// A zeroed, private anonymous mapping.
@@ -627,7 +635,7 @@ impl Chunk {
     fn map(len: usize, align: usize) -> Chunk {
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-        let all = len + align - 4096;
+        let all = len + align - PAGE;
         let p = unsafe { libc::mmap(std::ptr::null_mut(), all, prot, flags, -1, 0) };
         assert!(p != libc::MAP_FAILED, "heap mmap failed");
         let start = (p as usize).next_multiple_of(align);
@@ -684,7 +692,7 @@ impl Heap {
     fn refill(&mut self, n: usize) {
         let mapped = self.mapped();
         let chunk = if mapped < SMALL_HEAP {
-            Chunk::map((8 * n).max(8 * CHUNK_WORDS).next_multiple_of(4096), 4096)
+            Chunk::map((8 * n).max(8 * CHUNK_WORDS).next_multiple_of(PAGE), PAGE)
         } else {
             let len = mapped.clamp(HUGE_PAGE, MAX_CHUNK).max(8 * n);
             let c = Chunk::map(len.next_multiple_of(HUGE_PAGE), HUGE_PAGE);

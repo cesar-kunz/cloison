@@ -2,7 +2,7 @@
 // young object at a random position, about 100,000 stores per nursery.
 // gc: every store from an old record to a young object dirties a card,
 // and each minor collection scans every dirty card in full, 512 bytes of
-// old records for the one young pointer in them: 23-26 ms of a 25 ms
+// old records for the one young pointer in them: about 13 of a 16 ms
 // pause is card scanning while tracing takes 2 ms (TypeScript's long
 // minor pauses). The replaced children die old, so the heap peaks at
 // three times what is live.

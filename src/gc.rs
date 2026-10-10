@@ -310,6 +310,41 @@ impl Visit for Marking<'_> {
     }
 }
 
+/// Card scanning: the references on dirty cards pass through a ring,
+/// their metadata prefetched on entering it. Old cells' references go
+/// all over the heap, so each metadata read is a cache miss otherwise,
+/// and old cells hold most of the references dirty cards do.
+struct CardRefs<'a, 'b> {
+    m: &'a mut Marking<'b>,
+    ring: [usize; CardRefs::RING],
+    n: usize,
+}
+
+impl CardRefs<'_, '_> {
+    const RING: usize = 32;
+
+    /// Mark what is still in the ring.
+    unsafe fn flush(&mut self) {
+        for i in self.n.saturating_sub(Self::RING)..self.n {
+            unsafe { self.m.cell(self.ring[i % Self::RING]) }
+        }
+        self.n = 0;
+    }
+}
+
+impl Visit for CardRefs<'_, '_> {
+    #[inline(always)]
+    unsafe fn cell(&mut self, p: usize) {
+        prefetch(crate::heap::meta(p) as usize);
+        let slot = self.n % Self::RING;
+        if self.n >= Self::RING {
+            unsafe { self.m.cell(self.ring[slot]) }
+        }
+        self.ring[slot] = p;
+        self.n += 1;
+    }
+}
+
 impl Marking<'_> {
     /// Trace every marked cell until none is left; returns how many there
     /// were. `stop` is asked every few hundred cells whether to stop early
@@ -1152,6 +1187,7 @@ impl Heap {
     /// clean the cards (every young cell marked is old afterwards).
     unsafe fn scan_cards(&mut self, m: &mut Marking) {
         unsafe {
+            let mut refs = CardRefs { m, ring: [0; CardRefs::RING], n: 0 };
             let (base, end) = self.space_range();
             let (first, last) = (crate::heap::card(base) as usize, crate::heap::card(end) as usize);
             let mut c = first;
@@ -1163,10 +1199,11 @@ impl Heap {
                 if *(c as *const u8) != 0 {
                     *(c as *mut u8) = 0;
                     let lo = base + (c - first) * crate::heap::CARD;
-                    self.scan_card(lo, lo + crate::heap::CARD, m);
+                    self.scan_card(lo, lo + crate::heap::CARD, &mut refs);
                 }
                 c += 1;
             }
+            refs.flush();
         }
     }
 
@@ -1177,7 +1214,7 @@ impl Heap {
     /// the metadata alone (their first granules have a color), so the
     /// young cells most dirty cards hold, written as they were made, cost
     /// nothing.
-    unsafe fn scan_card(&mut self, lo: usize, hi: usize, m: &mut Marking) {
+    unsafe fn scan_card(&mut self, lo: usize, hi: usize, m: &mut CardRefs) {
         unsafe {
             // An old cell from before the card reaching into it.
             // (While blocks are swept, a dead old cell keeps an old color:

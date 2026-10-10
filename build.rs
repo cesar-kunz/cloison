@@ -188,6 +188,24 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
                     let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
                     if i >> 31 == 1 { R_AARCH64_CALL26 } else { R_AARCH64_JUMP26 }
                 }
+                // A `@PAGEOFF` operand: ELF's `:lo12:`, typed by the
+                // instruction (a load or store's size, or `add`).
+                RelocationFlags::MachO { r_type, r_pcrel: false, r_length: 2 }
+                    if arch == "aarch64" && r_type.0 == object::macho::ARM64_RELOC_PAGEOFF12.0 =>
+                {
+                    let at = (offset - start) as usize;
+                    let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                    if i & 0x3B00_0000 == 0x3900_0000 {
+                        // Load/store, unsigned offset: size in bits 31:30.
+                        [R_AARCH64_LDST8_ABS_LO12_NC, R_AARCH64_LDST16_ABS_LO12_NC,
+                            R_AARCH64_LDST32_ABS_LO12_NC, R_AARCH64_LDST64_ABS_LO12_NC]
+                            [(i >> 30) as usize]
+                    } else if i & 0x7F80_0000 == 0x1100_0000 {
+                        R_AARCH64_ADD_ABS_LO12_NC
+                    } else {
+                        panic!("{name}: PAGEOFF12 on {i:#010x} at {offset:#x}")
+                    }
+                }
                 _ => panic!("{name}: unsupported relocation kind at {offset:#x}"),
             };
             let RelocationTarget::Symbol(idx) = reloc.target() else {
@@ -565,10 +583,15 @@ const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264;
 const R_AARCH64_MOVW_UABS_G1_NC: u32 = 266;
 const R_AARCH64_MOVW_UABS_G2_NC: u32 = 268;
 const R_AARCH64_MOVW_UABS_G3: u32 = 269;
+const R_AARCH64_ADD_ABS_LO12_NC: u32 = 277;
+const R_AARCH64_LDST8_ABS_LO12_NC: u32 = 278;
 const R_AARCH64_TSTBR14: u32 = 279;
 const R_AARCH64_CONDBR19: u32 = 280;
 const R_AARCH64_JUMP26: u32 = 282;
 const R_AARCH64_CALL26: u32 = 283;
+const R_AARCH64_LDST16_ABS_LO12_NC: u32 = 284;
+const R_AARCH64_LDST32_ABS_LO12_NC: u32 = 285;
+const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 
 /// Mach-O has no relocation for a `movz`/`movk` immediate field (ELF's
 /// `MOVW_UABS_G*`), so on macOS the stencils write each hole as a magic

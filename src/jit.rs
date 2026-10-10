@@ -107,6 +107,10 @@ impl Hasher for FxHasher {
     }
 }
 
+/// The largest slot offset the property stencils take: on arm64 the
+/// access's `imm12`, scaled by 8 (`ldst_imm!` in `stencils/stencils.rs`).
+const MAX_SLOT_OFF: i32 = if cfg!(target_arch = "aarch64") { 0x7FF8 } else { 0xFFFF };
+
 /// What a stencil relocation refers to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Sym {
@@ -1239,9 +1243,12 @@ mod arch {
                     R_AARCH64_LDST64_ABS_LO12_NC => 3,
                     _ => 4,
                 };
-                let lo12 = v as u32 & 0xFFF;
-                assert!(lo12.is_multiple_of(1 << scale), "misaligned lo12 offset");
-                write(buf, (read(buf) & !(0xFFF << 10)) | ((lo12 >> scale) << 10));
+                // The hole's whole value (an offset, not an address's low 12
+                // bits): `imm12`, scaled by the access size.
+                assert!(v.is_multiple_of(1 << scale), "misaligned imm12 offset");
+                let imm12 = v >> scale;
+                assert!(imm12 < 1 << 12, "imm12 offset {v:#x} out of range");
+                write(buf, (read(buf) & !(0xFFF << 10)) | (imm12 as u32) << 10);
             }
             _ => panic!("unsupported AArch64 relocation type {r_type}"),
         }
@@ -2200,8 +2207,7 @@ impl Feedback {
     fn way(&self, insn: &Insn, ic: crate::vm::Ic, epoch: u32) -> Prop {
         let shape = ic.shape as u64;
         let (oop, off) = split_location(ic.loc);
-        // Stencils take the offset in 16 bits on arm64.
-        if off > 0xFFFF {
+        if off > MAX_SLOT_OFF {
             return Prop::None;
         }
         let name = self.name(insn);
@@ -4083,7 +4089,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     unsafe { (*crate::interp::current_vm()).field_made_mutable(cell) };
                 }
                 let (oop, off) = split_location(shape.location(slot));
-                if off <= 0xFFFF {
+                if off <= MAX_SLOT_OFF {
                     let base = match (load, oop) {
                         (true, false) => "get_own",
                         (true, true) => "get_oop",
@@ -7478,6 +7484,13 @@ impl JitCode {
                     }
                 };
                 let field = at + r.0 as usize;
+                // arm64: a 64-bit hole without a fourth part (`imm64_of!`)
+                // holds an address, 48 bits; `imm64_full_of!` has the part.
+                if cfg!(target_arch = "aarch64") && r.1 == 268 {
+                    let relocs = s.stencil().relocs;
+                    let has_g3 = relocs.iter().any(|q| q.0 == r.0 + 4 && q.1 == 269 && q.2 == r.2);
+                    assert!(has_g3 || value >> 48 == 0, "64-bit hole {value:#x} past 48 bits");
+                }
                 arch::patch(
                     &mut buf[field..],
                     r.1 as u32,

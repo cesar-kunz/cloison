@@ -105,7 +105,9 @@ node bench/run.mjs --engine target/release/toi        # every micro against `exp
 cargo test --target aarch64-unknown-linux-musl         # arm64 under qemu-aarch64
 ```
 
-Scripts in `scripts/`: `tiers.sh` times every micro in toi and in V8
+Scripts in `scripts/`: `stencil-listing.py` lists every stencil as the
+JIT emits it, with instruction counts (`docs/arm64-targets.md` holds
+them against handwritten arm64 code); `tiers.sh` times every micro in toi and in V8
 capped at each tier; `octane.sh` runs Octane (`SCORE=1` for scores);
 `perf.sh --ab` compares two builds; `jit-asm.sh` and `stencils-asm.sh`
 disassemble generated code and stencils; `sizes.sh --record` appends

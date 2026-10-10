@@ -1,0 +1,153 @@
+# toi
+
+A JavaScript engine in Rust: an ES5 front end, a register bytecode
+interpreter, and a copy-and-patch JIT for x86-64 and arm64 Linux that
+grows into a mid-tier optimizing compiler without an IR beyond bytecode.
+
+```sh
+cargo build --release
+target/release/toi bench/micro/87-constraint-solver.js   # prints the completion value
+target/release/toi --dump file.js                         # the bytecode instead
+```
+
+Status (2026-10-10): every Octane benchmark runs. There is no garbage
+collector yet, and the language is ES5 in sloppy mode. See
+[Where it falls short](#where-it-falls-short).
+
+## How it works
+
+- **Values** are NaN-boxed into 64 bits with JavaScriptCore's encoding
+  (`src/value.rs`): pointers as is, int32s under a tag, doubles offset by
+  2^49.
+- **The interpreter** (`src/interp.rs`) is a tail-calling dispatcher: all
+  state lives in `preserve_none` arguments, so in registers, and each
+  handler ends in `become` to the next. A second handler table encodes
+  "the accumulator is an int32" so hot arithmetic skips type checks.
+  Comparison-and-jump pairs are quickened into superinstructions.
+- **Objects** (`src/object.rs`, `src/vm.rs`) have shapes in transition
+  trees, in-object slots, inline caches that record field types and
+  element kinds, and a global prototype epoch that invalidates cached
+  prototype-chain loads. Closures use Lua-style upvalues.
+- **The JIT** (`src/jit.rs`, `stencils/stencils.rs`, `build.rs`) is
+  copy-and-patch: `build.rs` compiles the stencils into an ELF object,
+  extracts each one's machine code and relocations, and the JIT copies
+  one stencil per bytecode instruction and patches the holes. On top of
+  that:
+  - forward type inference over `I32 < F64 < Any`, with int32 arithmetic
+    that side-exits on overflow and widens;
+  - VM registers kept in machine registers for a whole region, as
+    unboxed int32s or doubles (6 GPR slots on x86-64, 12 on arm64, 7 FP
+    slots on both);
+  - fused stencils for common sequences (`i += k; if (i < n)` is four
+    instructions), and immediates folded into instructions through
+    `asm goto`;
+  - tiering from the interpreter by on-stack replacement at loop back
+    edges, with a version cache keyed by the live values' types;
+  - inline caches, polymorphic calls, inlining with a budget, scalar
+    replacement of inlined constructors, direct calls between compiled
+    functions, and guards and constant loads hoisted out of loops;
+  - on arm64, register fields are patched while copying, so 1,844
+    stencil variants collapse into 146 table entries, each verified
+    byte-for-byte against LLVM's own compile of every variant.
+
+`docs/future-work.md` is the design log: each step with what it took,
+what it measured, and what did not work. `docs/object-model.md` designs
+the internal/external heap the collector will use, `docs/direct-calls.md`
+the call convention, and `docs/sandbox.md` surveys heap sandboxing and
+defers it.
+
+## Results
+
+All numbers are from an Ubuntu Linux host, recorded in the docs; they
+are the author's, not reproduced on other hardware.
+
+Octane scores, toi against V8 14.6 with all tiers (higher is better):
+
+| benchmark | toi | V8 |
+|---|---:|---:|
+| DeltaBlue | 58,713 | 118,616 |
+| Richards | 35,775 | 62,785 |
+| GameBoy | 40,757 | 124,442 |
+| Crypto | 16,043 | 50,085 |
+| Box2D | 15,522 | 132,428 |
+| TypeScript | 26,377 | |
+
+Inside a long DeltaBlue run the JIT is about 7x the interpreter and about 2.3x
+behind V8's Maglev tier.
+
+Code size is tracked per commit in `bench/sizes.tsv`: the release
+binary is about 3 MB, stencil code about 98 KB.
+
+## Testing
+
+Every test program runs through seven engine configurations (the
+interpreter, the JIT at each milestone, and tiered with tiny thresholds)
+and the results must agree; `bench/micro/` and `tests/octane/` carry
+Node's value as the reference. Several tests are mutation checks that
+fail when a specific conversion or undo piece is removed.
+
+```sh
+cargo test --release
+node bench/run.mjs --engine target/release/toi        # every micro against `expect`
+cargo test --target aarch64-unknown-linux-musl         # arm64 under qemu-aarch64
+```
+
+Scripts in `scripts/`: `tiers.sh` times every micro in toi and in V8
+capped at each tier; `octane.sh` runs Octane (`SCORE=1` for scores);
+`perf.sh --ab` compares two builds; `jit-asm.sh` and `stencils-asm.sh`
+disassemble generated code and stencils; `sizes.sh --record` appends
+sizes.
+
+Environment flags: `TOI_NO_JIT`, `TOI_TIER=<back edges>`, `TOI_TIME`,
+`TOI_JIT_TIME`, `TOI_EXITS` (exits, entries and runtime calls by count),
+`TOI_JIT_DUMP`, `TOI_JIT_LOG`, `TOI_PERF_MAP` (names JIT code for `perf`),
+`TOI_NO_QUICKEN`, `TOI_COUNT`, `TOI_CODE_SHIFT`.
+
+## Building
+
+Linux only, nightly Rust (`rust-toolchain.toml`). The JIT needs three
+unstable features: `explicit_tail_calls`, `rust_preserve_none_cc` and
+`asm_goto_with_outputs`. Host builds are static and not
+position-independent (`.cargo/config.toml`), which is where the startup
+time comes from. arm64 builds cross-compile to musl and run under
+`qemu-aarch64`.
+
+The build does not work on macOS: the stencils' runtime-call asm uses
+x18, which Apple reserves, and `build.rs` reads ELF only.
+
+Because `build.rs` extracts stencils from LLVM's machine code and then
+rewrites branches in it, the stencil pipeline depends on LLVM's codegen
+choices. A nightly bump can change stencil shapes; the
+`every_stencil_instance_matches_its_compiled_bytes` test and
+`scripts/stencils-asm.sh` are the checks.
+
+## Where it falls short
+
+- **No garbage collector.** The heap is a bump arena freed at exit;
+  pdfjs peaks at 1.5 GB. Compiled code folds shape and field addresses as
+  64-bit immediates, so a moving collector is a retrofit, not an add-on.
+  The design is in `docs/object-model.md`.
+- **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
+  template literals, strict mode or array holes. Correctness is checked
+  against Node on about 100 programs and Octane, not against test262.
+- **Linux and nightly only**, as above.
+- **Safety.** Around 560 `unsafe` sites, a raw-pointer object model, no
+  fuzzing; a heap sandbox is deferred by design.
+- **Compile-time churn** on large programs: TypeScript, pdfjs and
+  code-load slowed when more of their functions compiled, from
+  recompiling as feedback changes. A cheaper baseline tier is the
+  planned fix.
+
+## Layout
+
+```text
+src/js/          lexer, parser, AST, bytecode generation
+src/bytecode.rs  the instruction set;  src/asm.rs  its text form
+src/interp.rs    the interpreter;  src/vm.rs  runtime, builtins' host
+src/object.rs    objects, shapes, the heap;  src/builtins.rs  the builtins
+src/jit.rs       the JIT;  stencils/stencils.rs  its stencils;  build.rs  extraction
+src/regexp.rs    regular expressions
+tests/           differential tests;  tests/octane/  feature scripts per benchmark
+bench/micro/     one pattern per file;  bench/bytecode/  handwritten bytecode
+docs/            design log and designs
+```

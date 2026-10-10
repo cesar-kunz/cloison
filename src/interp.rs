@@ -990,6 +990,10 @@ handlers! {
         let f: *const crate::object::Object = header(regs, FUNC);
         let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
         *(*u).at = acc;
+        // (A closed upvalue's variable is its own `closed`, in the heap.)
+        if (*u).at == &raw mut (*u).closed {
+            crate::heap::barrier(u.cast::<u8>().sub(8), (*u).at, acc);
+        }
         next!(any, Op::StaUpvalue.size(), acc)
     }
 
@@ -1061,7 +1065,9 @@ handlers! {
         let g = (*frame_vm(regs)).global;
         let ic = ic_at(regs, pc, 1);
         if (*g).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
-            *Object::slot(g, (*ic).loc) = acc;
+            let at = Object::slot(g, (*ic).loc);
+            *at = acc;
+            crate::heap::barrier(g.cast(), at, acc);
             next!(any, Op::StaGlobal.size(), acc)
         }
         tail!(slow_sta_global, acc)
@@ -1127,7 +1133,9 @@ handlers! {
                 if !new.is_null() {
                     (*o).shape = new;
                 }
-                *Object::slot(o, (*ic).loc) = acc;
+                let at = Object::slot(o, (*ic).loc);
+                *at = acc;
+                crate::heap::barrier(o.cast(), at, acc);
                 next!(any, Op::SetNamed.size(), acc)
             }
             tail!(poly_set_named, acc)
@@ -1149,7 +1157,9 @@ handlers! {
                     if !new.is_null() {
                         (*o).shape = new;
                     }
-                    *Object::slot(o, (*w).loc) = acc;
+                    let at = Object::slot(o, (*w).loc);
+                    *at = acc;
+                    crate::heap::barrier(o.cast(), at, acc);
                     next!(any, Op::SetNamed.size(), acc)
                 }
                 break;
@@ -1219,7 +1229,9 @@ handlers! {
             let o = as_object(obj);
             let i = key.as_i32_unchecked() as u32;
             if i < (*o).elems_len && fits_field(tag, (*(*o).shape).elems_code, acc) {
-                *(*o).elems.add(i as usize) = acc;
+                let at = (*o).elems.add(i as usize);
+                *at = acc;
+                crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, acc);
                 next!(any, Op::SetKeyed.size(), acc)
             }
         }
@@ -1263,7 +1275,7 @@ handlers! {
     fn op_call(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
-            note_callee(ic_at(regs, pc, 4), as_object(f));
+            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
             let w = reg(pc, 2, regs);
             enter!(as_object(f), *w, w.add(1), *pc.add(3) as usize, 0, Op::Call.size())
         }
@@ -1273,7 +1285,7 @@ handlers! {
     fn op_call_undefined(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
-            note_callee(ic_at(regs, pc, 4), as_object(f));
+            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
             let args = reg(pc, 2, regs);
             // Sloppy mode (toi has no strict mode): `this` is the global
             // object.
@@ -1286,7 +1298,7 @@ handlers! {
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
-            note_callee(ic_at(regs, pc, 4), as_object(f));
+            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
             let this = construct_this(regs, as_object(f));
             let args = reg(pc, 2, regs);
             enter!(as_object(f), this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
@@ -1449,7 +1461,7 @@ handlers! {
         let argc = *pc.add(3) as usize;
         let ic = ic_at(regs, pc, 4);
         if let Some(fo) = unwrap_call(frame_vm(regs), *reg(pc, 1, regs), *w) {
-            note_callee(ic, fo);
+            note_callee(regs, ic, fo);
             (*ic).loc = VIA_CALL;
             let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
             let that = sloppy_this(frame_vm(regs), that);
@@ -2292,6 +2304,7 @@ compare_jump!(
 #[inline(never)]
 fn create_closure(regs: *mut Value, i: u16) -> Value {
     unsafe {
+        (*frame_vm(regs)).safepoint(regs);
         let code = &*frame_code(regs);
         let callee = code.closures[i as usize];
         if (&(*callee).upvalues).is_empty() {
@@ -2308,12 +2321,18 @@ fn create_closure(regs: *mut Value, i: u16) -> Value {
 
 #[inline(never)]
 fn create_object(regs: *mut Value, ic: u16, n: u32) -> Value {
-    unsafe { (*frame_vm(regs)).create_object(&*frame_code(regs), ic, n) }
+    unsafe {
+        (*frame_vm(regs)).safepoint(regs);
+        (*frame_vm(regs)).create_object(&*frame_code(regs), ic, n)
+    }
 }
 
 #[inline(never)]
 fn new_array(regs: *mut Value) -> Value {
-    unsafe { (*frame_vm(regs)).new_array() }
+    unsafe {
+        (*frame_vm(regs)).safepoint(regs);
+        (*frame_vm(regs)).new_array()
+    }
 }
 
 // Generic runtime (tier 3): ordinary Rust functions, called (not tail-called)
@@ -3101,6 +3120,7 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
         if top.is_null() {
             return Err(Error::unsupported("calling a function from here (compiled code)"));
         }
+        vm.safepoint(top);
         let fo = as_object(f);
         let callee = (*fo).code;
         let new = top.add(HEADER);
@@ -3118,11 +3138,13 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
         for i in 1 + k..n {
             *new.add(i) = Value::UNDEFINED;
         }
-        vm.pending_args = (args.as_ptr(), args.len());
+        // (Roots while the callee runs; an outer call's again after.)
+        let outer = std::mem::replace(&mut vm.pending_args, (args.as_ptr(), args.len()));
         let saved = vm.native_top;
         vm.native_top = std::ptr::null_mut();
         let v = run_new_frame(vm, callee, new, 0);
         vm.native_top = saved;
+        vm.pending_args = outer;
         if v == Value::EMPTY {
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("a call from the runtime")));
         }
@@ -3169,6 +3191,7 @@ unsafe fn with_top<T>(regs: *mut Value, top: Option<*mut Value>, f: impl FnOnce(
         let vm = &mut *frame_vm(regs);
         let saved = vm.native_top;
         vm.native_top = top.unwrap_or_else(|| regs.add((*frame_code(regs)).nregs as usize));
+        vm.safepoint(vm.native_top);
         let r = f(vm);
         (*frame_vm(regs)).native_top = saved;
         r
@@ -3218,8 +3241,10 @@ pub(crate) unsafe fn unwrap_call(vm: *const Vm, f: Value, this: Value) -> Option
 /// four). Only a change of callee costs more than a compare; another
 /// closure of the same code (a function made anew at each call) just
 /// replaces the one in way 0.
+/// The cache is a Rust structure: a young `f` is logged for the next
+/// minor collection (`Heap::note`).
 #[inline(always)]
-unsafe fn note_callee(ic: *mut Ic, f: *mut Object) {
+unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: *mut Object) {
     unsafe {
         let old = (*ic).holder;
         if old != f {
@@ -3227,6 +3252,7 @@ unsafe fn note_callee(ic: *mut Ic, f: *mut Object) {
                 keep_callee(ic, old, f);
             }
             (*ic).holder = f;
+            (*frame_vm(regs)).heap.note(object_value(f));
         }
     }
 }
@@ -3260,7 +3286,7 @@ unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
     unsafe {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) {
-            note_callee(ic_at(regs, pc, 4), as_object(f));
+            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
         }
     }
 }
@@ -3346,7 +3372,10 @@ fn construct_result(regs: *mut Value, acc: Value) -> Value {
 /// The receiver of a `new` on bytecode function `f`.
 #[inline(never)]
 fn construct_this(regs: *mut Value, f: *mut Object) -> Value {
-    unsafe { (*frame_vm(regs)).construct_this(f) }
+    unsafe {
+        (*frame_vm(regs)).safepoint(regs);
+        (*frame_vm(regs)).construct_this(f)
+    }
 }
 
 /// Whether `v` fits the field type a store's inline cache holds (encoded by
@@ -3531,6 +3560,7 @@ pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Va
             // Re-arm the budget even if this loop isn't compiled: another
             // loop of the frame may be.
             *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
+            vm.safepoint(regs);
             let resume = match crate::jit::vm_run(vm, code, regs, target, acc) {
                 VmRun::NotCompiled | VmRun::Interpret => Resume {
                     regs,
@@ -3788,8 +3818,10 @@ pub(crate) unsafe fn call_from_jit(
             *new.add(i) = Value::UNDEFINED;
         }
         // For a `CreateArguments` (the frame has no call instruction).
-        vm.pending_args = (args, argc);
-        run_new_frame(vm, callee, new, flags)
+        let outer = std::mem::replace(&mut vm.pending_args, (args, argc));
+        let v = run_new_frame(vm, callee, new, flags);
+        vm.pending_args = outer;
+        v
     }
 }
 

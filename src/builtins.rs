@@ -817,6 +817,10 @@ fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, v) = this_array(this, "sort")?;
     let cmp = arg(a, 0);
     let (mut defined, undef): (Vec<Value>, Vec<Value>) = v.into_iter().partition(|x| !x.is_undefined());
+    // The comparison may collect, and while merging, an element may be
+    // only in a `Vec`: all of them are roots meanwhile.
+    let depth = vm.handles.len();
+    vm.handles.extend_from_slice(&defined);
     let mut err = None;
     let mut less = |vm: &mut Vm, x: Value, y: Value| -> bool {
         if err.is_some() {
@@ -836,6 +840,7 @@ fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // Insertion sort for short runs, merging otherwise: stable, and calls
     // `compare` only as a sort may.
     merge_sort(vm, &mut defined, &mut less);
+    vm.handles.truncate(depth);
     if let Some(e) = err {
         return Err(e);
     }
@@ -894,12 +899,16 @@ fn each(vm: &mut Vm, this: Value, a: &[Value], what: &str, mut on: impl FnMut(&m
 }
 
 fn array_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let mut out = Vec::new();
-    each(vm, this, a, "map", |_, _, _, r| {
-        out.push(r);
-        Ok(true)
-    })?;
-    new_array_of(vm, &out)
+    vm.handle_scope(|vm| {
+        let mut out = Vec::new();
+        // (The results are only here until the array is made: roots.)
+        each(vm, this, a, "map", |vm, _, _, r| {
+            out.push(r);
+            vm.handles.push(r);
+            Ok(true)
+        })?;
+        new_array_of(vm, &out)
+    })
 }
 
 fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -908,14 +917,17 @@ fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let mut out = Vec::new();
-    each(vm, this, a, "filter", |_, _, e, r| {
-        if crate::interp::to_boolean(r) {
-            out.push(e);
-        }
-        Ok(true)
-    })?;
-    new_array_of(vm, &out)
+    vm.handle_scope(|vm| {
+        let mut out = Vec::new();
+        each(vm, this, a, "filter", |vm, _, e, r| {
+            if crate::interp::to_boolean(r) {
+                out.push(e);
+                vm.handles.push(e);
+            }
+            Ok(true)
+        })?;
+        new_array_of(vm, &out)
+    })
 }
 
 fn array_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -939,6 +951,9 @@ fn array_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (_, v) = this_array(this, "reduce")?;
     let f = arg(a, 0);
+    // (The callback may change the array: its elements are roots.)
+    let depth = vm.handles.len();
+    vm.handles.extend_from_slice(&v);
     let mut it = v.into_iter().enumerate();
     let mut acc = match a.get(1) {
         Some(&x) => x,
@@ -948,8 +963,10 @@ fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         },
     };
     for (i, e) in it {
-        acc = crate::interp::call_function(vm, f, Value::UNDEFINED, &[acc, e, Value::from_i32(i as i32), this])?;
+        let r = crate::interp::call_function(vm, f, Value::UNDEFINED, &[acc, e, Value::from_i32(i as i32), this]);
+        acc = r.inspect_err(|_| vm.handles.truncate(depth))?;
     }
+    vm.handles.truncate(depth);
     Ok(acc)
 }
 
@@ -2155,7 +2172,11 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 .collect();
             args.push(Value::from_i32(x as i32));
             args.push(input);
-            let r = crate::interp::call_function(vm, replacement, Value::UNDEFINED, &args)?;
+            // (The captures are only in `args`: roots for the call.)
+            let r = vm.handle_scope(|vm| {
+                vm.handles.extend_from_slice(&args);
+                crate::interp::call_function(vm, replacement, Value::UNDEFINED, &args)
+            })?;
             out.extend_from_slice(&units(r));
         } else {
             expand(&template, &s, caps, &mut out);

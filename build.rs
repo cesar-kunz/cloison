@@ -248,6 +248,7 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
             "aarch64" => {
                 fold_arm64_stubs(&name, &mut code, &mut relocs);
                 invert_arm64_branch_over_jump(&mut code, &mut relocs);
+                widen_arm64_tbz(&mut code, &mut relocs);
             }
             "x86_64" => {
                 fold_x86_stubs(&mut code, &mut relocs);
@@ -359,6 +360,8 @@ fn emit(entries: &[Entry]) -> String {
                 "toi_hole_imm64" => "Sym::HoleImm64".to_string(),
                 "toi_hole_imm64b" => "Sym::HoleImm64b".to_string(),
                 "toi_hole_reg" => "Sym::HoleReg".to_string(),
+                "toi_hole_cards" => "Sym::HoleCards".to_string(),
+                "toi_hole_meta" => "Sym::HoleMeta".to_string(),
                 "toi_continue" => "Sym::Continue".to_string(),
                 "toi_jump_target" => "Sym::JumpTarget".to_string(),
                 "toi_exit" => "Sym::Exit".to_string(),
@@ -597,11 +600,19 @@ const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 /// `MOVW_UABS_G*`), so on macOS the stencils write each hole as a magic
 /// immediate `0xB0<hole><part>` (`hole16!` in `stencils/stencils.rs`):
 /// hole 1 `toi_hole_imm`, 2 `toi_hole_reg`, 3 `toi_hole_imm64`, 4
-/// `toi_hole_imm64b`; part 0–3 the 16 bits at `16 * part`. Record each as
+/// `toi_hole_imm64b`, 5 `toi_hole_cards`, 6 `toi_hole_meta`; part 0–3 the
+/// 16 bits at `16 * part`. Record each as
 /// the relocation it stands for and zero the field, so the code is what
 /// the ELF build extracts.
 fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
-    const HOLES: [&str; 4] = ["toi_hole_imm", "toi_hole_reg", "toi_hole_imm64", "toi_hole_imm64b"];
+    const HOLES: [&str; 6] = [
+        "toi_hole_imm",
+        "toi_hole_reg",
+        "toi_hole_imm64",
+        "toi_hole_imm64b",
+        "toi_hole_cards",
+        "toi_hole_meta",
+    ];
     const MOVW: [u32; 4] = [
         R_AARCH64_MOVW_UABS_G0_NC,
         R_AARCH64_MOVW_UABS_G1_NC,
@@ -612,7 +623,7 @@ fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
         let i = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
         let imm = (i >> 5) & 0xFFFF;
         let (hole, part) = ((imm >> 4) & 0xF, imm & 0xF);
-        if imm & 0xFF00 != 0xB000 || !(1..=4).contains(&hole) || part > 3 {
+        if imm & 0xFF00 != 0xB000 || !(1..=6).contains(&hole) || part > 3 {
             continue;
         }
         // `movz` or `movk`, 32- or 64-bit, shifted by the part.
@@ -777,6 +788,59 @@ fn invert_arm64_branch_over_jump(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         }
         return;
     }
+}
+
+/// `tbz`/`tbnz` reach 32 KiB; a stencil's exits, helpers and jump
+/// targets lie in the JIT's cold area, after all the hot code, which grows
+/// past that in large functions. Rewrite each one with a relocation, `tbz
+/// Rt, #b, sym`, to `tst Rt, #(1 << b); b.eq sym` (`b.ne` for `tbnz`), which
+/// reaches 1 MiB.
+fn widen_arm64_tbz(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
+    while let Some(k) = relocs.iter().position(|r| r.r_type == R_AARCH64_TSTBR14) {
+        let at = relocs[k].offset as usize;
+        let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+        let bit = (i >> 31) << 5 | (i >> 19) & 31;
+        let rt = i & 31;
+        let tbnz = (i >> 24) & 1 == 1;
+        // `ands xzr, xn, #(1 << bit)` (`wzr`, `wn` below 32): a logical
+        // immediate of one set bit, rotated right by `size - bit`.
+        let tst = if bit >= 32 {
+            0xF240_0000 | ((64 - bit) % 64) << 16 | rt << 5 | 31
+        } else {
+            0x7200_0000 | ((32 - bit) % 32) << 16 | rt << 5 | 31
+        };
+        code[at..at + 4].copy_from_slice(&tst.to_le_bytes());
+        // b.eq / b.ne, the displacement left to the relocation.
+        let bcond: u32 = 0x5400_0000 | if tbnz { 1 } else { 0 };
+        insert_insn(code, relocs, at + 4, bcond);
+        relocs[k].r_type = R_AARCH64_CONDBR19;
+        relocs[k].offset = (at + 4) as u64;
+    }
+}
+
+/// Insert instruction `insn` at `y`, moving later code and relocations
+/// down and fixing local branches across it.
+fn insert_insn(code: &mut Vec<u8>, relocs: &mut [Reloc], y: usize, insn: u32) {
+    for at in (0..code.len()).step_by(4) {
+        if relocs.iter().any(|r| r.offset == at as u64) {
+            continue;
+        }
+        let Some((disp, mask, shift)) = local_branch(code, at) else {
+            continue;
+        };
+        let t = (at as i64 + disp) as usize;
+        let moved = |p: usize| if p >= y { p + 4 } else { p };
+        let new_disp = moved(t) as i64 - moved(at) as i64;
+        if new_disp != disp {
+            let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+            let field = ((new_disp >> 2) as u32 & mask) << shift;
+            code[at..at + 4].copy_from_slice(&((i & !(mask << shift)) | field).to_le_bytes());
+        }
+    }
+    for r in relocs.iter_mut().filter(|r| r.offset >= y as u64) {
+        r.offset += 4;
+    }
+    code.splice(y..y, insn.to_le_bytes());
 }
 
 /// Delete the instruction at `y`, moving later code and relocations up and

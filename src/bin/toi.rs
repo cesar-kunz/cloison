@@ -10,7 +10,32 @@
 
 use std::process::ExitCode;
 
+extern "C" fn on_segv(_: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    unsafe {
+        let addr = (*info).si_addr as usize;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let pc = (*(*(ctx as *mut libc::ucontext_t)).uc_mcontext).__ss.__pc as usize;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let pc = { let _ = ctx; 0usize };
+        eprintln!("SIGSEGV at {addr:#x}, pc {pc:#x}");
+        eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        libc::_exit(139);
+    }
+}
+
 fn main() -> ExitCode {
+    if std::env::var_os("TOI_SEGV").is_some() {
+        unsafe {
+            let stack = vec![0u8; 1 << 20].leak();
+            let ss = libc::stack_t { ss_sp: stack.as_mut_ptr().cast(), ss_size: stack.len(), ss_flags: 0 };
+            libc::sigaltstack(&ss, std::ptr::null_mut());
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_segv as *const () as usize;
+            sa.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut());
+            libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
+        }
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (dump, path) = match &args[..] {
         [p] => (false, p),

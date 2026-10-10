@@ -121,6 +121,8 @@ unsafe extern "C" {
     static toi_hole_imm: u8;
     static toi_hole_imm64: u8;
     static toi_hole_imm64b: u8;
+    static toi_hole_cards: u8;
+    static toi_hole_meta: u8;
     static toi_hole_reg: u8;
 
     // Runtime functions. Only ever reached through `rt_call!`, so only their
@@ -512,6 +514,8 @@ macro_rules! hole16 {
     ($part:literal, reg) => { concat!("#0xB02", $part) };
     ($part:literal, imm64) => { concat!("#0xB03", $part) };
     ($part:literal, imm64b) => { concat!("#0xB04", $part) };
+    ($part:literal, cards) => { concat!("#0xB05", $part) };
+    ($part:literal, meta) => { concat!("#0xB06", $part) };
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -565,6 +569,8 @@ fn imm64_u32() -> u64 {
 macro_rules! imm64_of {
     (toi_hole_imm64) => { imm64_of!(@parts imm64, toi_hole_imm64) };
     (toi_hole_imm64b) => { imm64_of!(@parts imm64b, toi_hole_imm64b) };
+    (toi_hole_cards) => { imm64_of!(@parts cards, toi_hole_cards) };
+    (toi_hole_meta) => { imm64_of!(@parts meta, toi_hole_meta) };
     (@parts $hole:ident, $sym:ident) => {{
         let k: u64;
         unsafe {
@@ -655,6 +661,45 @@ fn imm64b_full() -> u64 {
 #[inline(always)]
 fn imm64b() -> u64 {
     imm64_of!(toi_hole_imm64b)
+}
+
+/// Mark the card of `a` (`heap::card_mark`). The card table's bias is a
+/// hole of its own.
+#[inline(always)]
+unsafe fn card_mark<T>(a: *const T) {
+    unsafe { *((imm64_of!(toi_hole_cards) as usize).wrapping_add(a as usize >> 9) as *mut u8) = 1 };
+}
+
+/// The metadata byte of the granule at `a` (`heap::meta`), whose bias is
+/// a hole of its own.
+#[inline(always)]
+unsafe fn meta_of(a: usize) -> u8 {
+    unsafe { *((imm64_of!(toi_hole_meta) as usize).wrapping_add(a >> 4) as *const u8) }
+}
+
+/// The write barrier (`heap::barrier`): `v` was stored at `a`, in the cell
+/// at `host`; a reference from an old cell to a young one (`heap::YOUNG`)
+/// marks the card of `a`.
+#[inline(always)]
+unsafe fn barrier<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
+    unsafe {
+        if is_cell(tag, v) && v.to_bits() != 0 && meta_of(v.to_bits() as usize) == YOUNG && meta_of(host as usize) != YOUNG {
+            card_mark(a);
+        }
+    }
+}
+
+/// The barrier for a store of `v` to upvalue `u`'s variable (at `*u`):
+/// only if it is closed, its variable then its own `closed` word (after
+/// `at`), in the cell before `u`.
+#[inline(always)]
+unsafe fn upvalue_barrier(tag: NumberTag, u: *const *mut Value, v: Value) {
+    unsafe {
+        let at = *u;
+        if at as usize == u as usize + 8 {
+            barrier(tag, (u as *const u8).sub(8), at, v);
+        }
+    }
 }
 
 // arm64: a slot at an immediate offset is one `ldr`/`str` with the offset
@@ -3703,8 +3748,10 @@ macro_rules! array_length_gpr {
 }
 with_gprs!(each_gpr! array_length_gpr);
 
+// `$card`: the value may be a cell, so the store needs the barrier (not
+// for an int32 or a number).
 macro_rules! set_keyed {
-    ($loc:tt, $case:literal, $array:expr, |$s:ident, $v:ident, $code:ident| $fits:expr, |$t:ident| $value:expr) => {
+    ($loc:tt, $case:literal, $card:literal, $array:expr, |$s:ident, $v:ident, $code:ident| $fits:expr, |$t:ident| $value:expr) => {
         stencil!("set_keyed_", $case, loc!($loc); |$s| {
             let key = key_x();
             let o = get!($loc, $s);
@@ -3721,7 +3768,11 @@ macro_rules! set_keyed {
             if i >= *(p.add(32) as *const u32) || !($fits) {
                 exit!($s)
             }
-            *(*(p.add(24) as *const *mut Value)).add(key as usize) = $v;
+            let at = (*(p.add(24) as *const *mut Value)).add(key as usize);
+            *at = $v;
+            if $card {
+                barrier($s.tag, (*(p.add(24) as *const *const u8)).sub(8), at, $v);
+            }
             next!($s)
         });
     };
@@ -3749,17 +3800,21 @@ macro_rules! property_location {
         stencil!("set_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             store_imm(o, s.acc);
+            barrier(s.tag, o, o, s.acc);
             next!(s)
         });
         stencil!("set_oop_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            store_imm(props(o), s.acc);
+            let p = props(o);
+            store_imm(p, s.acc);
+            barrier(s.tag, p.sub(8), p.offset(imm() as isize), s.acc);
             next!(s)
         });
         stencil!("set_tr_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             *(o as *mut u64) = imm64b();
             store_imm(o, s.acc);
+            barrier(s.tag, o, o, s.acc);
             next!(s)
         });
         // `o[k] = acc`: an array (`_nc`: known to be one), an int32 key
@@ -3794,7 +3849,9 @@ macro_rules! property_location {
             if i >= *(p.add(32) as *const u32) || !fits {
                 exit!(s)
             }
-            *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
+            let at = (*(p.add(24) as *const *mut Value)).add(i as usize);
+            *at = v;
+            barrier(s.tag, (*(p.add(24) as *const *const u8)).sub(8), at, v);
             next!(s)
         }; |s| {
             let key = load_imm(s.regs as *mut u8);
@@ -3805,24 +3862,24 @@ macro_rules! property_location {
             }
             next!(s)
         });
-        set_keyed!($loc, "i_", is_array, |s, v, code| code <= 2,
+        set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
-        set_keyed!($loc, "o_", is_array, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
-        set_keyed!($loc, "nc_", |_, _| true, |s, v, code| match code {
+        set_keyed!($loc, "o_", true, is_array, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
+        set_keyed!($loc, "nc_", true, |_, _| true, |s, v, code| match code {
             0 => true,
             1 => s.tag.is_int32(v),
             2 => v.to_bits() & s.tag.to_bits() != 0,
             sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
         }, |s| s.acc);
-        set_keyed!($loc, "nc_i_", |_, _| true, |s, v, code| code <= 2,
+        set_keyed!($loc, "nc_i_", false, |_, _| true, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
-        set_keyed!($loc, "nc_o_", |_, _| true, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
+        set_keyed!($loc, "nc_o_", true, |_, _| true, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
         // The array's exact shape known, so its elements' type: any
         // (`nc_a`), numbers (`nc_n`), or an int32 into int32s, numbers or
         // any (`nc_ia`): no dispatch on the code.
-        set_keyed!($loc, "nc_a_", |_, _| true, |s, v, code| true, |s| s.acc);
-        set_keyed!($loc, "nc_n_", |_, _| true, |s, v, code| v.to_bits() & s.tag.to_bits() != 0, |s| s.acc);
-        set_keyed!($loc, "nc_ia_", |_, _| true, |s, v, code| true,
+        set_keyed!($loc, "nc_a_", true, |_, _| true, |s, v, code| true, |s| s.acc);
+        set_keyed!($loc, "nc_n_", false, |_, _| true, |s, v, code| v.to_bits() & s.tag.to_bits() != 0, |s| s.acc);
+        set_keyed!($loc, "nc_ia_", false, |_, _| true, |s, v, code| true,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         // A polymorphic access (`jit::Prop::Poly`): a cell check, then a
         // compare per cached shape (`imm64`), each branching to its own
@@ -3895,17 +3952,22 @@ macro_rules! property_location {
             next!(s)
         });
         stencil!("set_own_nc_", loc!($loc); |s| {
-            store_imm(get!($loc, s).to_bits() as *mut u8, s.acc);
+            let o = get!($loc, s).to_bits() as *mut u8;
+            store_imm(o, s.acc);
+            barrier(s.tag, o, o, s.acc);
             next!(s)
         });
         stencil!("set_tr_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             *(o as *mut u64) = imm64b();
             store_imm(o, s.acc);
+            barrier(s.tag, o, o, s.acc);
             next!(s)
         });
         stencil!("set_oop_nc_", loc!($loc); |s| {
-            store_imm(props(get!($loc, s).to_bits() as *mut u8), s.acc);
+            let p = props(get!($loc, s).to_bits() as *mut u8);
+            store_imm(p, s.acc);
+            barrier(s.tag, p.sub(8), p.offset(imm() as isize), s.acc);
             next!(s)
         });
         // Elements at offset 24, length (u32) at 32. A hole is `EMPTY` (0).
@@ -4236,11 +4298,12 @@ with_gprs!(each_gpr! typed_gpr);
 /// `interp::FUNC_OFF` (the JIT checks they agree).
 const FUNC_OFF: usize = 80;
 
+/// The upvalue (its payload: `at`, then `closed`) of the frame's function.
 #[inline(always)]
-unsafe fn upvalue_at(regs: *mut Value) -> *mut Value {
+unsafe fn upvalue_cell(regs: *mut Value) -> *const *mut Value {
     unsafe {
         let f = *(regs.byte_sub(FUNC_OFF) as *const *mut u8);
-        *(load_imm(f).to_bits() as *const *mut Value)
+        load_imm(f).to_bits() as *const *mut Value
     }
 }
 
@@ -4251,11 +4314,13 @@ stencil!("set_frame_func"; |s| {
     next!(s)
 });
 stencil!("lda_upvalue"; |s| {
-    s.acc = *upvalue_at(s.regs);
+    s.acc = **upvalue_cell(s.regs);
     next!(s)
 });
 stencil!("sta_upvalue"; |s| {
-    *upvalue_at(s.regs) = s.acc;
+    let u = upvalue_cell(s.regs);
+    **u = s.acc;
+    upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
 stencil!("lda_upvalue_c"; |s| {
@@ -4263,7 +4328,9 @@ stencil!("lda_upvalue_c"; |s| {
     next!(s)
 });
 stencil!("sta_upvalue_c"; |s| {
-    **(imm64() as *const *mut Value) = s.acc;
+    let u = imm64() as *const *mut Value;
+    **u = s.acc;
+    upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
 
@@ -4289,6 +4356,7 @@ stencil!("sta_global"; |s| {
         exit!(s)
     }
     store_imm(g, s.acc);
+    barrier(s.tag, g, g, s.acc);
     next!(s)
 });
 stencil!("sta_global_oop"; |s| {
@@ -4296,7 +4364,9 @@ stencil!("sta_global_oop"; |s| {
     if *(g as *const u64) != imm64() {
         exit!(s)
     }
-    store_imm(props(g), s.acc);
+    let p = props(g);
+    store_imm(p, s.acc);
+    barrier(s.tag, p.sub(8), p.offset(imm() as isize), s.acc);
     next!(s)
 });
 
@@ -4601,6 +4671,10 @@ unsafe fn first_elements(o: *mut u8) {
         p.add(k).write_volatile(Value::UNDEFINED.to_bits());
     }
     *(o.add(24) as *mut *mut u64) = p;
+    // (A young array: only an old array needs the card.)
+    if meta_of(o as usize) != YOUNG {
+        card_mark(o);
+    }
     *(o.add(36) as *mut u32) = FIRST_ELEMENTS as u32;
 }
 
@@ -4671,7 +4745,11 @@ unsafe fn own_element_store(tag: NumberTag, o: Value, key: Value, v: Value, int3
         if !fits || i >= *(p.add(32) as *const u32) {
             return false;
         }
-        *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
+        let at = (*(p.add(24) as *const *mut Value)).add(i as usize);
+        *at = v;
+        if !int32 {
+            barrier(tag, (*(p.add(24) as *const *const u8)).sub(8), at, v);
+        }
         true
     }
 }
@@ -4699,7 +4777,9 @@ macro_rules! array_methods {
             if !fits || len >= *(o.add(36) as *const u32) {
                 slow!(s)
             }
-            *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
+            let at = (*(o.add(24) as *const *mut Value)).add(len as usize);
+            *at = v;
+            barrier(s.tag, (*(o.add(24) as *const *const u8)).sub(8), at, v);
             *(o.add(32) as *mut u32) = len + 1;
             s.acc = unboxed(len as i32 + 1);
             next!(s)
@@ -4715,7 +4795,9 @@ macro_rules! array_methods {
                 let to = push_transition(s.tag, *(o as *const *const u64), v);
                 if to != 0 {
                     *(o as *mut u64) = to;
-                    *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
+                    let at = (*(o.add(24) as *const *mut Value)).add(len as usize);
+                    *at = v;
+                    barrier(s.tag, (*(o.add(24) as *const *const u8)).sub(8), at, v);
                     *(o.add(32) as *mut u32) = len + 1;
                     s.acc = unboxed(len as i32 + 1);
                     next!(s)

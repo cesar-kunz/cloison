@@ -93,6 +93,8 @@ pub struct Gc {
     /// would have let it.
     cycle_from: usize,
     lead: usize,
+    /// Bytes minor collections promoted since the last major one.
+    promoted: usize,
     /// Old cells a minor collection during marking shaded for the marker.
     shade: Vec<usize>,
     /// The marker thread, once a cycle needed it.
@@ -722,7 +724,7 @@ impl Vm {
                 self.heap.requested.store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
-        } else if gc.always_full || gc.cycles || self.heap.allocated() > gc.full_at {
+        } else if gc.always_full || gc.cycles || self.heap.allocated() > gc.full_at || gc.promoted > gc.room.max(FULL_MIN) {
             if gc.stw || gc.always_full { Collection::Full } else { Collection::Start }
         } else {
             Collection::Minor
@@ -821,6 +823,11 @@ impl Vm {
             times[3] = lap();
         }
         let traced = m.marked;
+        if full {
+            self.heap.gc.promoted = 0;
+        } else {
+            self.heap.gc.promoted += traced;
+        }
         self.heap.gc.stack = stack;
         self.heap.gc.log.clear();
         self.heap.gc.log_slots.clear();

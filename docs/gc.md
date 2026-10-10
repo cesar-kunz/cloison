@@ -631,6 +631,17 @@ runs) and the microbenchmarks.
      12%, hence the floor. Splay's live size is 117-130 MiB, yet 372 MiB
      of blocks stay in use after a stop-the-world full collection (495
      MiB concurrent): fragmentation, not pacing, is most of its memory.
+     After a stop-the-world full collection Splay's blocks are 31% full
+     on average (2,900 of 12,000 under a tenth): the nursery allocates in
+     every recycled block's holes and its survivors pin them all.
+   - *Prefetching* (done): marked cells pass through an eight-entry ring
+     between the stack and tracing, prefetched on entering it. Splay's
+     minor tracing 626 ms -> 450 ms, its collection share 23% -> 19.5%
+     (sixteen entries: no better). Splay stays under the 90% target: its
+     minor collections mark 220,000 survivors each, the tree's new nodes.
+     TypeScript's largest minor pauses are cards (50,000 dirty, 18 MB of
+     old objects traced through them): the compiler writes young values
+     into that many old objects.
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

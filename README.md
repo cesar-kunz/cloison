@@ -64,10 +64,12 @@ collector yet, and the language is ES5 in sloppy mode. See
   Node.
 
 `docs/future-work.md` is the design log: each step with what it took,
-what it measured, and what did not work. `docs/object-model.md` designs
-the internal/external heap the collector will use, `docs/direct-calls.md`
-the call convention, and `docs/sandbox.md` surveys heap sandboxing and
-defers it.
+what it measured, and what did not work. `docs/gc.md` designs the
+collector (a parallel copying nursery with precise roots over a
+concurrently marked mark-region old space with budgeted evacuation),
+`docs/object-model.md` the object model and its escape analysis,
+`docs/direct-calls.md` the call convention, and `docs/sandbox.md` surveys
+heap sandboxing and defers it.
 
 ## Results
 
@@ -153,7 +155,7 @@ targets.
 - **No garbage collector.** The heap is a bump arena freed at exit;
   pdfjs peaks at 1.5 GB. Compiled code folds shape and field addresses as
   64-bit immediates, so a moving collector is a retrofit, not an add-on.
-  The design is in `docs/object-model.md`.
+  The design is in `docs/gc.md`.
 - **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
   template literals, strict mode or array holes. Correctness is checked
   against Node on about 100 programs and Octane, not against test262.

@@ -50,6 +50,19 @@ collector yet, and the language is ES5 in sloppy mode. See
     stencil variants collapse into 146 table entries, each verified
     byte-for-byte against LLVM's own compile of every variant.
 
+- **Numbers print and compute as in V8.** `Math`'s transcendental
+  functions (`src/math.rs`) are a port of fdlibm, which V8 ships, rather
+  than the platform's `libm`, whose last bits differ between systems
+  (Apple's `tan(1)` against glibc's): `sin`, `cos`, `tan`, `asin`,
+  `acos`, `atan`, `atan2`, `exp`, `log` and `pow` are bit for bit Node's
+  on x86-64, checked on 57,000 inputs over every reduction path. Node's
+  arm64 builds let the C++ compiler fuse multiply-adds in the same code,
+  so about 0.5% of their results differ by one ulp; the tests' expected
+  values come from x86-64. Number to string picks the closest of the
+  shortest round-tripping digit strings, ties to even, as ECMA-262 says
+  and Rust's own formatting doesn't; checked on 22,000 doubles against
+  Node.
+
 `docs/future-work.md` is the design log: each step with what it took,
 what it measured, and what did not work. `docs/object-model.md` designs
 the internal/external heap the collector will use, `docs/direct-calls.md`
@@ -124,14 +137,6 @@ features: `explicit_tail_calls`, `rust_preserve_none_cc` and
   from one register fewer. Pages are 16 KiB there. Intel Macs are not
   supported (x86-64 Mach-O has no 32-bit absolute relocation for the
   immediate holes).
-- `Math`'s transcendental functions don't use the platform's `libm`,
-  whose results differ in the last bit between systems (Apple's
-  `tan(1)` against glibc's). `src/math.rs` ports fdlibm, as V8 does, so
-  `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log` and
-  `pow` are bit for bit Node's on x86-64 everywhere. (Node's arm64 builds
-  let the C++ compiler fuse multiply-adds in those same functions, so
-  about 0.5% of results differ from them by one ulp. The `// expect:`
-  values in the tests come from x86-64.)
 
 Because `build.rs` extracts stencils from LLVM's machine code and then
 rewrites branches in it, the stencil pipeline depends on LLVM's codegen
@@ -166,7 +171,7 @@ src/bytecode.rs  the instruction set;  src/asm.rs  its text form
 src/interp.rs    the interpreter;  src/vm.rs  runtime, builtins' host
 src/object.rs    objects, shapes, the heap;  src/builtins.rs  the builtins
 src/jit.rs       the JIT;  stencils/stencils.rs  its stencils;  build.rs  extraction
-src/regexp.rs    regular expressions
+src/regexp.rs    regular expressions;  src/math.rs  Math's transcendental functions (fdlibm)
 tests/           differential tests;  tests/octane/  feature scripts per benchmark
 bench/micro/     one pattern per file;  bench/bytecode/  handwritten bytecode
 docs/            design log and designs

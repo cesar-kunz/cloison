@@ -675,6 +675,22 @@ runs) and the microbenchmarks.
      TypeScript's largest minor pauses are cards (50,000 dirty, 18 MB of
      old objects traced through them): the compiler writes young values
      into that many old objects.
+   - *Microbenchmarks* for what remains (`bench/gc/`, timed by
+     `scripts/gc-micro.sh`; seconds, peak RSS, live at full collections,
+     collecting's share of the time, longest pause):
+
+     | file | s | MB | live MiB | gc | max pause | shows |
+     |---|---:|---:|---:|---:|---:|---|
+     | survivors.js | 1.0 | 171 | 19 | 13% | 5.4 ms | minor collections trace their whole nursery |
+     | cards.js | 3.9 | 779 | 261 | 28% | 26 ms | dirty cards scanned in full, 23-26 ms of each pause |
+     | fragmentation.js | 4.3 | 777 | 168 | 24% | 23 ms | random deaths in a non-moving heap: 4.6x live |
+     | splay.js | 3.7 | 471 | 172 | 19% | 17 ms | Splay: survivors, 2.7x live, a 12 ms final pause |
+
+     Card scanning dominates the longest pauses in all but splay.js,
+     whose final pause retraces about 670,000 cells. Each is a target
+     for later work: scanning a card's young-pointing slots only (a
+     remembered set of slots for large cells), evacuating fragmented
+     blocks, and retracing less at the final pause.
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

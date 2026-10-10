@@ -189,3 +189,20 @@ Groups:
   different feedback, and a whole DeltaBlue-style solver.
 - **9x, calls into compiled code**: recursion (self, mutual, tail),
   constructors called in a loop, a native method next to one.
+
+## `gc/`: the collector's open problems
+
+Each file reproduces something the collector still does badly (see the
+end of step 6 in [docs/gc.md](../docs/gc.md)), with the same
+conventions as `micro/` plus a `// gc:` line on what it shows. A
+seeded Park-Miller generator (exact in doubles) picks the random
+positions. `scripts/gc-micro.sh` runs them under `TOI_GC_STATS` and
+prints wall time, peak RSS, the live size full collections found,
+collecting's share of the time, and the longest minor and major pauses.
+
+| file | what it shows |
+|---|---|
+| [survivors.js](gc/survivors.js) | Nearly the whole nursery survives each minor collection, then dies old. |
+| [cards.js](gc/cards.js) | Young objects stored into random old records: minor pauses are card scanning. |
+| [fragmentation.js](gc/fragmentation.js) | Records replaced at random: a non-moving heap peaks at several times live. |
+| [splay.js](gc/splay.js) | Octane's Splay in small: all of the above, and a long final pause. |

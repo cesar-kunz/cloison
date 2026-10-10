@@ -129,7 +129,9 @@ checking references and poisoning what is freed), `TOI_GC_STRESS`
 `TOI_GC_CYCLES` (major cycles back to back),
 `TOI_GC_CHECK_BARRIER` (find missed barriers), `TOI_HEAP_HIST` (cells by
 kind and size), `TOI_SEGV` (a backtrace on a crash). `gc-bench.sh` times
-Octane's deterministic runs with their peak RSS.
+Octane's deterministic runs with their peak RSS. `gc-micro.sh` runs
+the collector's microbenchmarks in `bench/gc/`, which reproduce what it
+still does badly.
 
 ## Building
 

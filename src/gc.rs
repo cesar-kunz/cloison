@@ -93,6 +93,8 @@ pub struct Gc {
     /// would have let it.
     cycle_from: usize,
     lead: usize,
+    /// Bytes the last full collection found live (for `TOI_GC_STATS`).
+    live: usize,
     /// Bytes minor collections promoted since the last major one.
     promoted: usize,
     /// Old cells a minor collection during marking shaded for the marker.
@@ -136,7 +138,7 @@ impl Gc {
     #[cold]
     #[inline(never)]
     fn report_room(&self) {
-        eprintln!("  live {} MiB, room {} MiB, lead {} MiB", (self.room / (GROWTH - 1)) >> 20, self.room >> 20, self.lead >> 20);
+        eprintln!("  live {} MiB, room {} MiB, lead {} MiB", self.live >> 20, self.room >> 20, self.lead >> 20);
     }
 
     /// What the heap may grow by after a sweep before the next cycle
@@ -841,6 +843,7 @@ impl Vm {
             // and room to grow by what was live, times `GROWTH - 1`.
             let live = traced + concurrent;
             let room = ((GROWTH - 1) * live).max(FULL_MIN);
+            self.heap.gc.live = live;
             self.heap.gc.room = room;
             if kind == Collection::Final {
                 self.heap.gc.lead = self.heap.allocated().saturating_sub(self.heap.gc.cycle_from);

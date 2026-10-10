@@ -302,7 +302,7 @@ blocks:
   conservative word is a cell exactly when its granule's byte is `YOUNG`
   or a color; a hole is a run of granules no live cell covers, found
   from the bytes alone.
-- **Cards**, beside the heap, one byte per 512 bytes, set by the barrier.
+- **Cards**, beside the heap, one byte per 128 bytes, set by the barrier.
 
 Memory is zeroed when a hole is taken (fresh blocks are zero already):
 the `create_object` stencils write a header and leave the slots, whose
@@ -403,7 +403,7 @@ if v is a cell && meta(v) == YOUNG && meta(host) != YOUNG:
     card(address stored to) = 1
 ```
 
-with `meta(a) = SIDE + (a >> 4)` and `card(a) = SIDE + (a >> 9)`: the
+with `meta(a) = SIDE + (a >> 4)` and `card(a) = SIDE + (a >> 7)`: the
 shared reservation is placed (at 16 TiB) so both side tables hang off
 one constant, `SIDE` = 8 TiB, which arm64 builds in one `movz` and
 indexes with a shifted register; no operand is patched in. (macOS grants
@@ -710,6 +710,31 @@ runs) and the microbenchmarks.
      and 128-byte holes (cards.js 758 -> 576 MB, fragmentation.js 696 ->
      594 MB, but RayTrace and Splay 6-7% slower with no gain on Octane's
      memory).
+   - *Card scanning on several threads* (done), with three changes,
+     each measured on cards.js's longest pause (33 ms with its loop
+     compiled, of which 25 ms scanning cards):
+     cards of 128 bytes instead of 512 (a random store dirties a fourth
+     as much old memory: 25 ms; 256 bytes: 29 ms); runs of dirty cards
+     scanned as one range (the cell reaching into a run looked for once,
+     and cells started on one card not traced again from the next); and
+     the dirty runs (split to 64 cards) scanned by up to eight threads
+     once there are 4,096 dirty cards, each claiming a cell by a
+     compare-and-swap of its metadata byte, in minor, start and final
+     pauses alike (`TOI_GC_THREADS`; the marker is paused then). Taking
+     one run at a time from the shared counter did not scale (11.2 ->
+     9.4 ms on four threads); 256 runs a take does: the card phase
+     18.8 ms on one thread, 12 on two, 9 on four (eight no better on four
+     performance cores). cards.js 33 ms -> 16-19 ms, collecting 20% ->
+     12.5%; fragmentation.js 20% -> 16%; TypeScript's longest minor
+     pause 16.6 -> 14.9 ms, major 16.3 -> 13.7; Splay's minor 10.9 ->
+     6.2 ms. Peak RSS +3% on cards.js (the smaller cards' table and the
+     threads' stacks). What is left of the card phase is marking: cards.js
+     finds 440,000 young survivors through 480,000 references on 320,000
+     cards per minor collection.
+   - *Found meanwhile*: the marker takes up to 16 ms to stop for a pause
+     when it is tracing a large array (fragmentation.js's table of 1.5
+     million slots is one cell, traced without a check), which a pause
+     waits for before it starts.
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

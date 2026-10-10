@@ -31,9 +31,9 @@
 //! leave the slots.
 //!
 //! The shared reservation sits where its side tables can be at a 16th and
-//! a 512th of its addresses past one constant ([`SIDE`]): a granule's
+//! a 128th of its addresses past one constant ([`SIDE`]): a granule's
 //! metadata byte is at `SIDE + (addr >> 4)`, a card at `SIDE + (addr >>
-//! 9)`, and the barrier needs no operands.
+//! 7)`, and the barrier needs no operands.
 //!
 //! Compiled code allocates too, bumping `ptr` while it stays within `end`
 //! and writing the metadata byte of the new cell: they come first, in that
@@ -48,7 +48,10 @@ pub const GRANULE: usize = 16;
 pub const BLOCK: usize = 32 << 10;
 const GRANULES_PER_BLOCK: usize = BLOCK / GRANULE;
 /// Bytes per card.
-pub const CARD: usize = 512;
+/// (128 rather than 512: a minor collection scans what dirty cards hold,
+/// and a random store dirties a fourth as much. cards.js's longest pause
+/// 33 ms -> 25 ms; `card_mark` in `stencils/stencils.rs` shifts by 7.)
+pub const CARD: usize = 1 << 7;
 /// Cells larger than this get blocks of their own.
 pub const LARGE: usize = 8 << 10;
 /// Address space all heaps share: room for 512 heaps of a [`SLICE`] each.
@@ -139,7 +142,7 @@ fn reserve_at(at: usize, len: usize) -> bool {
 
 /// Where the side tables are, past their share of the reservation's
 /// addresses: a granule's metadata byte at `SIDE + addr / 16`, a card at
-/// `SIDE + addr / 512` (see [`meta`], [`card`]). One constant, which arm64
+/// `SIDE + addr / 128` (see [`meta`], [`card`]). One constant, which arm64
 /// builds in one instruction, so the barrier needs no operand. (macOS
 /// grants addresses asked for only from 8 TiB up.)
 pub const SIDE: usize = 1 << 43;

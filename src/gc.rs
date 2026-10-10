@@ -95,6 +95,12 @@ pub struct Gc {
     lead: usize,
     /// Bytes the last full collection found live (for `TOI_GC_STATS`).
     live: usize,
+    /// Dirty card runs, kept for the next collection's (see
+    /// `Heap::scan_cards`).
+    card_runs: Vec<(usize, usize)>,
+    /// Threads that scan dirty cards (`TOI_GC_THREADS`; 1: on the
+    /// collecting thread only).
+    threads: usize,
     /// Bytes minor collections promoted since the last major one.
     promoted: usize,
     /// Old cells a minor collection during marking shaded for the marker.
@@ -131,6 +137,11 @@ impl Gc {
                 .and_then(|s| s.parse::<usize>().ok())
                 .map_or(NURSERY, |mb| mb << 20),
             full_at: FULL_MIN,
+            threads: std::env::var("TOI_GC_THREADS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)))
+                .max(1),
             ..Default::default()
         }
     }
@@ -314,36 +325,98 @@ impl Visit for Marking<'_> {
 /// their metadata prefetched on entering it. Old cells' references go
 /// all over the heap, so each metadata read is a cache miss otherwise,
 /// and old cells hold most of the references dirty cards do.
-struct CardRefs<'a, 'b> {
-    m: &'a mut Marking<'b>,
-    ring: [usize; CardRefs::RING],
+struct CardRefs<'a, V: Visit> {
+    m: &'a mut V,
+    ring: [usize; CARD_REFS],
     n: usize,
 }
 
-impl CardRefs<'_, '_> {
-    const RING: usize = 32;
+/// How many references [`CardRefs`] holds (16: cards.js's longest pause
+/// 19 ms against 16 ms; 64: no better).
+const CARD_REFS: usize = 32;
+
+impl<'a, V: Visit> CardRefs<'a, V> {
+    fn new(m: &'a mut V) -> Self {
+        CardRefs { m, ring: [0; CARD_REFS], n: 0 }
+    }
 
     /// Mark what is still in the ring.
     unsafe fn flush(&mut self) {
-        for i in self.n.saturating_sub(Self::RING)..self.n {
-            unsafe { self.m.cell(self.ring[i % Self::RING]) }
+        for i in self.n.saturating_sub(CARD_REFS)..self.n {
+            unsafe { self.m.cell(self.ring[i % CARD_REFS]) }
         }
         self.n = 0;
     }
 }
 
-impl Visit for CardRefs<'_, '_> {
+impl<V: Visit> Visit for CardRefs<'_, V> {
     #[inline(always)]
     unsafe fn cell(&mut self, p: usize) {
         prefetch(crate::heap::meta(p) as usize);
-        let slot = self.n % Self::RING;
-        if self.n >= Self::RING {
+        let slot = self.n % CARD_REFS;
+        if self.n >= CARD_REFS {
             unsafe { self.m.cell(self.ring[slot]) }
         }
         self.ring[slot] = p;
         self.n += 1;
     }
 }
+
+/// One thread's marking when a collection's dirty cards are scanned by
+/// several (see [`Heap::scan_cards`]), as [`Marking`]'s, but a cell is
+/// claimed by the thread whose compare-and-swap of its metadata byte
+/// succeeds, so each lands on one stack. (One that fails lost to another
+/// thread marking the cell with the same color: nothing left to do.)
+struct CardMarking {
+    mode: Mode,
+    heap: (usize, usize),
+    stack: Vec<usize>,
+    shade: Vec<usize>,
+}
+
+impl Visit for CardMarking {
+    #[inline(always)]
+    unsafe fn cell(&mut self, p: usize) {
+        use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        let mode = self.mode;
+        unsafe {
+            if mode.check && !is_cell_in(self.heap, p) {
+                bad_reference(p);
+            }
+            let m = &*(crate::heap::meta(p) as *const AtomicU8);
+            let b = m.load(Relaxed);
+            let (new, shade) = match mode.kind {
+                Kind::Minor if b == YOUNG => (mode.color, false),
+                Kind::MinorShade if b == YOUNG => (mode.color, false),
+                Kind::MinorShade if b & COLOR != 0 && b & COLOR != mode.color => ((b & END) | mode.color, true),
+                Kind::Full if b & COLOR != mode.color => ((b & END) | mode.color, false),
+                _ => return,
+            };
+            if m.compare_exchange(b, new, Relaxed, Relaxed).is_ok() {
+                if shade {
+                    self.shade.push(p);
+                } else {
+                    self.stack.push(p);
+                }
+            }
+        }
+    }
+}
+
+/// A heap shared by the card-scanning threads, which only read it (but
+/// for the young cells' metadata, claimed atomically).
+#[derive(Clone, Copy)]
+struct SharedHeap(*const Heap);
+unsafe impl Send for SharedHeap {}
+unsafe impl Sync for SharedHeap {}
+
+/// Dirty cards (at [`heap::CARD`](crate::heap::CARD) bytes) from which a
+/// minor collection scans them on several threads, and the most cards a
+/// thread takes at a time. (Spawning the threads costs some tens of
+/// microseconds.)
+const PARALLEL_CARDS: usize = 4096;
+const CARDS_PER_TAKE: usize = 64;
+const RUNS_PER_TAKE: usize = 256;
 
 impl Marking<'_> {
     /// Trace every marked cell until none is left; returns how many there
@@ -1187,9 +1260,16 @@ impl Heap {
     /// clean the cards (every young cell marked is old afterwards).
     unsafe fn scan_cards(&mut self, m: &mut Marking) {
         unsafe {
-            let mut refs = CardRefs { m, ring: [0; CardRefs::RING], n: 0 };
+            // The dirty cards, cleaned, as runs: each scanned as one range
+            // (the cell reaching into it looked for once, and the cells
+            // started on one card not traced again from the next), split
+            // to at most `CARDS_PER_TAKE` cards for the threads.
             let (base, end) = self.space_range();
             let (first, last) = (crate::heap::card(base) as usize, crate::heap::card(end) as usize);
+            let at = |c: usize| base + (c - first) * crate::heap::CARD;
+            let mut runs = std::mem::take(&mut self.gc.card_runs);
+            runs.clear();
+            let mut cards = 0;
             let mut c = first;
             while c < last {
                 if c.is_multiple_of(8) && c + 8 <= last && *(c as *const u64) == 0 {
@@ -1197,13 +1277,59 @@ impl Heap {
                     continue;
                 }
                 if *(c as *const u8) != 0 {
-                    *(c as *mut u8) = 0;
-                    let lo = base + (c - first) * crate::heap::CARD;
-                    self.scan_card(lo, lo + crate::heap::CARD, &mut refs);
+                    let start = c;
+                    while c < last && *(c as *const u8) != 0 && c - start < CARDS_PER_TAKE {
+                        *(c as *mut u8) = 0;
+                        c += 1;
+                    }
+                    runs.push((at(start), at(c)));
+                    cards += c - start;
+                    continue;
                 }
                 c += 1;
             }
-            refs.flush();
+            let threads = self.gc.threads;
+            if threads < 2 || cards < PARALLEL_CARDS {
+                let mut refs = CardRefs::new(m);
+                for &(lo, hi) in &runs {
+                    self.scan_card(lo, hi, &mut refs);
+                }
+                refs.flush();
+            } else {
+                // On several threads, each taking runs in turn.
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let heap = SharedHeap(self);
+                let (runs, next) = (&runs[..], &next);
+                let (mode, range) = (m.mode, m.heap);
+                let work = move || {
+                    let heap = heap;
+                    let mut cm = CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new() };
+                    let mut refs = CardRefs::new(&mut cm);
+                    loop {
+                        let i = next.fetch_add(RUNS_PER_TAKE, std::sync::atomic::Ordering::Relaxed);
+                        if i >= runs.len() {
+                            break;
+                        }
+                        for &(lo, hi) in &runs[i..(i + RUNS_PER_TAKE).min(runs.len())] {
+                            (*heap.0).scan_card(lo, hi, &mut refs);
+                        }
+                    }
+                    refs.flush();
+                    (cm.stack, cm.shade)
+                };
+                std::thread::scope(|sc| {
+                    let helpers: Vec<_> = (1..threads).map(|_| sc.spawn(work)).collect();
+                    let mut take = |(stack, shade): (Vec<usize>, Vec<usize>)| {
+                        m.stack.extend(stack);
+                        m.shade.extend(shade);
+                    };
+                    take(work());
+                    for h in helpers {
+                        take(h.join().unwrap());
+                    }
+                });
+            }
+            self.gc.card_runs = runs;
         }
     }
 
@@ -1214,7 +1340,7 @@ impl Heap {
     /// the metadata alone (their first granules have a color), so the
     /// young cells most dirty cards hold, written as they were made, cost
     /// nothing.
-    unsafe fn scan_card(&mut self, lo: usize, hi: usize, m: &mut CardRefs) {
+    unsafe fn scan_card(&self, lo: usize, hi: usize, m: &mut impl Visit) {
         unsafe {
             // An old cell from before the card reaching into it.
             // (While blocks are swept, a dead old cell keeps an old color:

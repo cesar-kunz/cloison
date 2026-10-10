@@ -431,6 +431,15 @@ impl Marking<'_> {
     /// for as long as it took (16 ms for fragmentation.js's table of 1.5
     /// million slots), and the pause waited for it.
     unsafe fn drain(&mut self, stop: &dyn Fn() -> bool) -> usize {
+        unsafe { self.drain_to(stop, usize::MAX) }
+    }
+
+    /// [`drain`](Self::drain), stopping early also once it has traced
+    /// `after` cells and the stack holds enough to share (for
+    /// [`drain_parallel`](Self::drain_parallel)). By work done, not the
+    /// stack's size: tracing a tree depth first keeps the stack about as
+    /// deep as the tree.
+    unsafe fn drain_to(&mut self, stop: &dyn Fn() -> bool, after: usize) -> usize {
         let mut n = 0;
         // Work since `stop` was last asked, in cells (a slice counts as
         // one per 32 slots).
@@ -490,6 +499,9 @@ impl Marking<'_> {
                         break;
                     }
                 }
+                if n >= after && self.stack.len() >= SHARE_AT {
+                    break;
+                }
             }
             // Stopped early: what the ring holds goes back on the stack.
             for i in 0..len {
@@ -505,6 +517,53 @@ impl Marking<'_> {
         n
     }
 
+    /// [`drain`](Self::drain) in a pause, on `threads` threads: each traces
+    /// from its own stack, claiming the cells it marks by a
+    /// compare-and-swap of their metadata ([`CardMarking`]), and hands
+    /// half its stack to the others when they have run out; done once
+    /// every thread is out of work. Returns how many cells were traced.
+    unsafe fn drain_parallel(&mut self, threads: usize) -> usize {
+        // The stack's cells and array slices (see `drain`), the cells
+        // dealt out, the slices to the first thread.
+        let mut cells = Vec::with_capacity(self.stack.len());
+        let mut slices = Vec::new();
+        while let Some(p) = self.stack.pop() {
+            if p & 1 != 0 {
+                slices.push((p & !1, self.stack.pop().expect("a slice's index")));
+            } else {
+                cells.push(p);
+            }
+        }
+        let pool = TracePool {
+            state: std::sync::Mutex::new((Vec::new(), 0)),
+            wake: std::sync::Condvar::new(),
+            queued: std::sync::atomic::AtomicUsize::new(0),
+            threads,
+        };
+        let per = cells.len().div_ceil(threads).max(1);
+        let mut deal: Vec<Vec<usize>> = cells.chunks(per).map(<[usize]>::to_vec).collect();
+        deal.resize_with(threads, Vec::new);
+        let (mode, heap) = (self.mode, self.heap);
+        let pool = &pool;
+        let results: Vec<(usize, usize, Vec<usize>)> = std::thread::scope(|sc| {
+            let mut deal = deal.into_iter();
+            let first = (deal.next().unwrap(), slices);
+            let helpers: Vec<_> = deal
+                .map(|stack| sc.spawn(move || unsafe { trace_shared(pool, mode, heap, stack, Vec::new()) }))
+                .collect();
+            let mut r = vec![unsafe { trace_shared(pool, mode, heap, first.0, first.1) }];
+            r.extend(helpers.into_iter().map(|h| h.join().unwrap()));
+            r
+        });
+        let mut n = 0;
+        for (cells, bytes, shade) in results {
+            n += cells;
+            self.marked += bytes;
+            self.shade.extend(shade);
+        }
+        n
+    }
+
     /// Mark the cell that word `w` points to the start of, if any (a word
     /// of the VM stack, a pending argument: values, or stale ones).
     #[inline(always)]
@@ -516,6 +575,118 @@ impl Marking<'_> {
         }
     }
 }
+
+/// The work [`Marking::drain_parallel`]'s threads share: stacks handed
+/// over, and how many threads are out of work (with the stacks, under the
+/// lock); `queued` counts the stacks for a look without it.
+struct TracePool {
+    state: std::sync::Mutex<(Vec<Vec<usize>>, usize)>,
+    wake: std::sync::Condvar,
+    queued: std::sync::atomic::AtomicUsize,
+    threads: usize,
+}
+
+impl TracePool {
+    fn give(&self, stack: Vec<usize>) {
+        let mut st = self.state.lock().unwrap();
+        st.0.push(stack);
+        self.queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.wake.notify_one();
+    }
+
+    /// A stack to trace from, waiting for one; `None` once every thread
+    /// is out of work.
+    fn take(&self) -> Option<Vec<usize>> {
+        let mut st = self.state.lock().unwrap();
+        st.1 += 1;
+        loop {
+            if let Some(stack) = st.0.pop() {
+                st.1 -= 1;
+                self.queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(stack);
+            }
+            if st.1 == self.threads {
+                self.wake.notify_all();
+                return None;
+            }
+            st = self.wake.wait(st).unwrap();
+        }
+    }
+}
+
+/// One of [`Marking::drain_parallel`]'s threads: trace from `stack` and
+/// `slices`, then from what the others hand over, until all are out of
+/// work. Returns the cells and bytes traced, and the old cells shaded.
+unsafe fn trace_shared(
+    pool: &TracePool,
+    mode: Mode,
+    heap: (usize, usize),
+    stack: Vec<usize>,
+    mut slices: Vec<(usize, usize)>,
+) -> (usize, usize, Vec<usize>) {
+    use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    let mut cm = CardMarking { mode, heap, stack, shade: Vec::new() };
+    let (mut n, mut bytes) = (0, 0);
+    // As `drain`'s ring: cells prefetched `RING - 1` cells ahead.
+    const RING: usize = 8;
+    let mut ring = [0usize; RING];
+    let (mut head, mut len) = (0, 0);
+    unsafe {
+        loop {
+            loop {
+                while len < RING {
+                    let Some(p) = cm.stack.pop() else { break };
+                    prefetch(p);
+                    ring[(head + len) % RING] = p;
+                    len += 1;
+                }
+                if len > 0 {
+                    let p = ring[head];
+                    head = (head + 1) % RING;
+                    len -= 1;
+                    let size = cell_size(p as *const u8);
+                    (*(crate::heap::meta(p + size - GRANULE) as *const AtomicU8)).fetch_or(END, Relaxed);
+                    bytes += size;
+                    n += 1;
+                    let w = *(p as *const u64);
+                    let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
+                    if slots > SLICE_SLOTS {
+                        trace(&mut cm, p, p + 8, p + 8 + 8 * SLICE_SLOTS);
+                        slices.push((p, SLICE_SLOTS));
+                    } else {
+                        trace(&mut cm, p, 0, usize::MAX);
+                    }
+                } else if let Some((p, from)) = slices.pop() {
+                    let slots = (*(p as *const u64) >> 32) as usize;
+                    let to = (from + SLICE_SLOTS).min(slots);
+                    trace(&mut cm, p, p + 8 + 8 * from, p + 8 + 8 * to);
+                    if to < slots {
+                        slices.push((p, to));
+                    }
+                } else {
+                    break;
+                }
+                // Others out of work: half of this stack (its oldest
+                // cells, the widest part of the graph) for them.
+                if cm.stack.len() >= SHARE_AT && pool.queued.load(Relaxed) == 0 {
+                    let rest = cm.stack.split_off(cm.stack.len() / 2);
+                    pool.give(std::mem::replace(&mut cm.stack, rest));
+                }
+            }
+            match pool.take() {
+                Some(stack) => cm.stack = stack,
+                None => break,
+            }
+        }
+    }
+    (n, bytes, cm.shade)
+}
+
+/// A pause traces on several threads once it has traced this many cells
+/// on one, and a thread hands half its stack over from this many cells
+/// (subtrees, for a tree traced depth first).
+const PARALLEL_TRACE: usize = 16384;
+const SHARE_AT: usize = 16;
 
 /// The values of an array cell [`Marking::drain`] traces at a time.
 const SLICE_SLOTS: usize = 1024;
@@ -964,7 +1135,15 @@ impl Vm {
                 }
             }
             times[1] = lap();
-            marked = m.drain(&|| false);
+            // On one thread until there is enough to share (a minor
+            // collection's roots may lead to most of the nursery).
+            let threads = self.heap.gc.threads;
+            marked = if threads > 1 {
+                let n = m.drain_to(&|| false, PARALLEL_TRACE);
+                n + if m.stack.is_empty() { 0 } else { m.drain_parallel(threads) }
+            } else {
+                m.drain(&|| false)
+            };
             if kind == Collection::Minor && self.heap.gc.check_barriers {
                 self.heap.check_barriers();
             }

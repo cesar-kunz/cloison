@@ -420,42 +420,86 @@ const RUNS_PER_TAKE: usize = 256;
 
 impl Marking<'_> {
     /// Trace every marked cell until none is left; returns how many there
-    /// were. `stop` is asked every few hundred cells whether to stop early
-    /// (the marker, asked to pause), leaving the rest on the stack.
+    /// were. `stop` is asked every few hundred cells' worth of work
+    /// whether to stop early (the marker, asked to pause), leaving the rest
+    /// on the stack.
+    ///
+    /// An array cell of more than [`SLICE_SLOTS`] values is traced that
+    /// many at a time, the rest left on the stack as a pair: the next
+    /// slot's index, then the cell's address with bit 0 set (cells are
+    /// granule-aligned). One traced at once kept the marker from pausing
+    /// for as long as it took (16 ms for fragmentation.js's table of 1.5
+    /// million slots), and the pause waited for it.
     unsafe fn drain(&mut self, stop: &dyn Fn() -> bool) -> usize {
         let mut n = 0;
+        // Work since `stop` was last asked, in cells (a slice counts as
+        // one per 32 slots).
+        let mut work = 0;
         // Cells pass through a small ring between the stack and tracing,
         // prefetched as they enter it: by the time one is traced its
-        // header has had `RING - 1` other cells' time to arrive.
+        // header has had `RING - 1` other cells' time to arrive. With the
+        // slot a slice starts at (0: the whole cell, or its first slice).
         const RING: usize = 8;
-        let mut ring = [0usize; RING];
+        let mut ring = [(0usize, 0usize); RING];
         let (mut head, mut len) = (0, 0);
         unsafe {
             loop {
                 while len < RING {
                     let Some(p) = self.stack.pop() else { break };
-                    prefetch(p);
-                    ring[(head + len) % RING] = p;
+                    let entry = if p & 1 != 0 {
+                        let from = self.stack.pop().expect("a slice's index");
+                        let p = p & !1;
+                        prefetch(p + 8 + 8 * from);
+                        (p, from)
+                    } else {
+                        prefetch(p);
+                        (p, 0)
+                    };
+                    ring[(head + len) % RING] = entry;
                     len += 1;
                 }
                 if len == 0 {
                     break;
                 }
-                let p = ring[head];
+                let (p, from) = ring[head];
                 head = (head + 1) % RING;
                 len -= 1;
-                let size = cell_size(p as *const u8);
-                *crate::heap::meta(p + size - GRANULE) |= END;
-                self.marked += size;
-                trace(self, p, 0, usize::MAX);
-                n += 1;
-                if n % 256 == 0 && stop() {
-                    break;
+                let w = *(p as *const u64);
+                let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
+                if from == 0 {
+                    let size = cell_size(p as *const u8);
+                    *crate::heap::meta(p + size - GRANULE) |= END;
+                    self.marked += size;
+                    n += 1;
+                }
+                if slots > SLICE_SLOTS {
+                    let to = (from + SLICE_SLOTS).min(slots);
+                    trace(self, p, p + 8 + 8 * from, p + 8 + 8 * to);
+                    if to < slots {
+                        self.stack.push(to);
+                        self.stack.push(p | 1);
+                    }
+                    work += SLICE_SLOTS / 32;
+                } else {
+                    trace(self, p, 0, usize::MAX);
+                    work += 1;
+                }
+                if work >= 256 {
+                    work = 0;
+                    if stop() {
+                        break;
+                    }
                 }
             }
             // Stopped early: what the ring holds goes back on the stack.
             for i in 0..len {
-                self.stack.push(ring[(head + i) % RING]);
+                match ring[(head + i) % RING] {
+                    (p, 0) => self.stack.push(p),
+                    (p, from) => {
+                        self.stack.push(from);
+                        self.stack.push(p | 1);
+                    }
+                }
             }
         }
         n
@@ -472,6 +516,9 @@ impl Marking<'_> {
         }
     }
 }
+
+/// The values of an array cell [`Marking::drain`] traces at a time.
+const SLICE_SLOTS: usize = 1024;
 
 /// Ask for the cache line at `p`.
 #[inline(always)]

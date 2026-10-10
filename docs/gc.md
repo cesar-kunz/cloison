@@ -731,10 +731,15 @@ runs) and the microbenchmarks.
      threads' stacks). What is left of the card phase is marking: cards.js
      finds 440,000 young survivors through 480,000 references on 320,000
      cards per minor collection.
-   - *Found meanwhile*: the marker takes up to 16 ms to stop for a pause
-     when it is tracing a large array (fragmentation.js's table of 1.5
-     million slots is one cell, traced without a check), which a pause
-     waits for before it starts.
+   - *Large arrays marked in slices* (done): the marker took up to 16 ms
+     to stop for a pause when tracing a large array (fragmentation.js's
+     table of 1.5 million slots is one cell, traced without a check), and
+     the pause waited for it. An array of more than 1,024 values is now
+     traced that many at a time, the rest left on the mark stack as a pair
+     (the next slot, the cell's address with bit 0 set), and the stop
+     check counts work by slots. fragmentation.js's longest pause
+     19.8-26.1 ms -> 8.3-10.0 ms over five runs each; nothing else
+     changes.
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

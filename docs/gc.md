@@ -1,7 +1,8 @@
 # The garbage collector
 
-Status: in progress, 2026-10-10. Step 1 of the plan below is implemented
-(`src/heap.rs`). This revision replaces the first one (a parallel copying
+Status: in progress, 2026-10-10. Steps 1 to 4 of the plan below are
+implemented (`src/heap.rs`, `src/gc.rs`): minor and stop-the-world full
+collections; the old generation is not marked concurrently yet. This revision replaces the first one (a parallel copying
 nursery with precise roots), whose two premises implementation showed
 false: see "Why not a copying nursery". Supersedes the collector parts of
 `docs/object-model.md` (its escape analysis and compact layouts stand).
@@ -24,10 +25,11 @@ native roots, concurrent on the old generation**:
   where they are, and the rest of the nursery's memory is holes again;
 - roots: the VM stack and the native stack scanned conservatively, every
   word checked against the metadata, plus the VM's own references;
-- one write barrier, an unconditional card mark of the stored-to address
-  (two or three instructions), which serves the minor collection's
-  remembered set and concurrent marking's record of mutated cells (the
-  HotSpot CMS arrangement);
+- one write barrier, a card mark of the stored-to address when the store
+  makes an old cell refer to a young one (two metadata loads decide it),
+  which is the minor collection's remembered set and, widened to every
+  store of an unmarked cell while marking runs, concurrent marking's
+  record of mutated cells (the HotSpot CMS arrangement);
 - major collections marked by a collector thread while the mutator runs,
   with two short pauses, and swept concurrently from the metadata;
 - pacing from measurement.
@@ -87,19 +89,23 @@ memory that is never touched again):
 
 | benchmark | allocated | time | rate |
 |---|---:|---:|---:|
+| EarleyBoyer | 17.3 GB | 28.7 s | 600 MB/s |
+| RayTrace | 13.6 GB | 10.8 s | 1.3 GB/s |
 | Splay | 4.9 GB | 2.4 s | 2.0 GB/s |
-| EarleyBoyer | 4.4 GB | 28.7 s | 150 MB/s |
 | RegExp | 2.5 GB | 18.6 s | 135 MB/s |
 | DeltaBlue | 1.8 GB | 1.2 s | 1.5 GB/s |
-| RayTrace | 1.6 GB | 10.8 s | 150 MB/s |
 | pdfjs | 1.4 GB | 2.4 s | 590 MB/s |
-| Crypto | 784 MB | 5.6 s | 140 MB/s |
+| Crypto | 769 MB | 5.6 s | 140 MB/s |
 | TypeScript | 393 MB | 4.1 s | 95 MB/s |
 | Box2D | 183 MB | 1.7 s | |
 | GBEmu | 166 MB | 1.3 s | |
 | code-load | 123 MB | 2.7 s | |
 | Richards | 40 MB | 1.6 s | |
 | NavierStokes | 10 MB | 7.1 s | |
+
+(The volumes are the heap's own count; the first revision of this table
+took peak RSS for them, which macOS's memory compression held to a
+quarter of EarleyBoyer's and a tenth of RayTrace's.)
 
 The heap of step 1 rounds cells to 16 bytes and gives arrays a header
 word: DeltaBlue allocates 12% more, Splay 9%, code-load 28%.
@@ -271,27 +277,35 @@ does not.
 
 ### The heap
 
-One reservation (32 GiB of address space by default, `TOI_HEAP_LIMIT` in
-MiB lowers it; memory is used only as touched) of 32 KiB blocks:
+All heaps of a process share one reservation of address space (16 TiB,
+inaccessible until committed, so up to 512 heaps alive at once); each
+takes a 32 GiB slice of it
+(`TOI_HEAP_LIMIT`, in MiB, lowers what it may use), committed 8 MiB at a
+time. Sharing makes the metadata's and the cards' biases process
+constants, so the barrier needs no heap at hand. A slice is 32 KiB
+blocks:
 
 - **Small blocks** hold cells of up to 8 KiB. A cell is a run of 16-byte
   granules and never crosses a block's end. The mutator allocates by
   bumping `ptr` against `end`, a hole of the current block; when the
-  hole is full it takes the next hole of the block, then the next block
-  with free granules, then a block never used.
-- **Large cells** get a run of whole blocks.
+  hole is full it takes the next hole of the block, then a block a
+  collection left free granules in, then a free block, then a block
+  never used. Holes under 256 bytes are left for later: each would send
+  compiled code's inline allocation to the runtime after a few cells.
+- **Large cells** get a run of whole blocks, reused once free.
 - **Metadata**, beside the heap, one byte per granule
   (`meta_bias + addr / 16`): at a cell's first granule `YOUNG` (allocated
   since the last collection) or the color it was last marked with (an
   old cell), and `END` at an old cell's last granule; 0 elsewhere. A
   conservative word is a cell exactly when its granule's byte is `YOUNG`
-  or the current color; a hole is a run of granules no live cell covers,
-  found from the bytes alone.
+  or a color; a hole is a run of granules no live cell covers, found
+  from the bytes alone.
 - **Cards**, beside the heap, one byte per 512 bytes, set by the barrier.
 
 Memory is zeroed when a hole is taken (fresh blocks are zero already):
 the `create_object` stencils write a header and leave the slots, whose
-zero (`Value::EMPTY`, not a cell) a collection then reads.
+zero (`Value::EMPTY`, not a cell) a collection then reads. Blocks a full
+collection leaves empty are given back to the system (`madvise`).
 
 ### Cells
 
@@ -368,23 +382,38 @@ values in a `Vec` across `call_function` (`sort`, `map`, `filter`,
 ### The write barrier
 
 Every store of a value into a cell, and of an array or upvalue pointer
-into an object, marks the card of the address stored to:
+into an object, runs the barrier (`heap::barrier`, and `barrier` in the
+stencils, whose `toi_hole_meta` and `toi_hole_cards` operands hold the
+side tables' biases):
 
 ```text
-shr  rax, 9 ; mov byte [card_bias + rax], 1      (x86-64, rax = address)
+if v is a cell && meta[v] == YOUNG && meta[host] != YOUNG:
+    cards[address stored to >> 9] = 1
 ```
 
-The barrier needs neither the host's start nor the value, so it fits
-every store site the same way, including the stencils' (a `toi_hole_cards`
-operand holds the bias). It is elided where the stored value is known to
-be a number, and on initializing stores into a cell allocated with no
-safepoint since.
+A number store leaves at the first test; the stencils whose value is
+known to be a number (`set_keyed` with an int32 or a number) have no
+barrier at all. The first version marked the card unconditionally (two
+instructions, no host or value needed) and it cost more than it saved:
+every initializing store dirtied a card, and as young cells are
+interleaved with old ones in reused blocks, nearly every card was dirty
+at every minor collection, whose card scan then traced most old cells:
+7.2 of RayTrace's 22 seconds. With the condition, RayTrace's 4,000
+minor collections spend 0.9 seconds in all, and NavierStokes, which only
+stores numbers, is back to its time without a collector.
 
-A minor collection scans the dirty cards that hold old cells: it finds
-the first cell overlapping each card from the metadata, and visits the
-references of every old cell within the card's bytes. Every young cell
-reached is old afterwards, so no old-to-young reference survives a minor
-collection and every card is clean after one.
+Compiled code marks an object's own card for a store to any of its
+in-object slots (no offset to add), Rust code the slot's; so a minor
+collection scans the old cells' words on dirty cards and the whole of
+an object that starts on one. It finds old cells from the metadata
+alone (only their first granule has a color), eight granules at a time.
+Every young cell reached is old afterwards, so every card is clean after
+a minor collection.
+
+The barrier is also what found the one store site the audit missed: with
+`TOI_GC_CHECK_BARRIER`, each minor collection walks every old cell for a
+reference to a young cell it left unmarked, and the `set_keyed!` family
+of stencils, which writes `$v`, was one.
 
 ### The major collection
 
@@ -474,18 +503,47 @@ runs) and the microbenchmarks.
    `TOI_GC_VERIFY` walks the heap and the test suite does after every
    run. Measured: +1.8% geomean on the microbenchmarks, +5 to 19% on the
    allocation-heavy ones (more memory per object, all of it fresh pages).
-2. **Roots and marking, no freeing.** The conservative scans, the VM's
-   references, the external log, the handle scopes, safepoints and
-   `gc_requested`; a stop-the-world mark of everything reachable whose
-   result `TOI_GC_VERIFY` checks (every reference of a marked cell is a
-   cell).
-3. **The minor collection.** The card barrier in the runtime, the
-   interpreter and the stencils; card scanning; clearing dead young
-   cells; holes and their reuse; `TOI_GC_STRESS` (collect at every
-   safepoint, fill freed memory with a pattern). Target: Splay and
-   DeltaBlue at a fraction of today's memory, within 10% of today's time.
-4. **The major collection, stop-the-world.** Colors, sweeping, freeing
-   blocks, the headroom policy.
+2. **Roots and marking** (done). The conservative scans, the VM's
+   references, the log of cells Rust structures take, the handle scopes,
+   safepoints. Validated with full stop-the-world collections that poison
+   what they free without reusing it: all of Octane ran correctly through
+   3,019 of them.
+3. **The minor collection** (done). The barrier in the runtime, the
+   interpreter and the stencils; card scanning; freeing dead young cells
+   by clearing their metadata eight bytes at a time; holes and their
+   reuse in recycled blocks; `TOI_GC_STRESS` (collect at every safepoint)
+   and `TOI_GC_CHECK_BARRIER` (find an old cell referring to a freed young
+   one). The nursery is 32 MiB (`TOI_GC_NURSERY`): at 4 MiB, RayTrace took
+   18.3 s instead of 10.8 s, nearly all of it in compiled code's inline
+   allocation falling to the runtime for the next small hole between
+   survivors; at 32 MiB it runs at its speed without a collector.
+4. **The full collection, stop-the-world** (done). Colors, sweeping,
+   freeing empty blocks to the system, a trigger at the blocks in use
+   after the last full collection plus the live size (64 MiB at least).
+   Octane after steps 2 to 4 against no collector (Apple silicon, seconds and peak
+   RSS):
+
+   | benchmark | before | after |
+   |---|---:|---:|
+   | Richards | 1.58 s, 47 MB | 2.01 s, 41 MB |
+   | DeltaBlue | 1.15 s, 1.2 GB | 1.12 s, 68 MB |
+   | Crypto | 5.64 s, 784 MB | 5.64 s, 49 MB |
+   | RayTrace | 10.77 s, 1.6 GB | 10.56 s, 58 MB |
+   | EarleyBoyer | 28.7 s, 4.4 GB | 33.6 s, 191 MB |
+   | RegExp | 18.6 s, 2.5 GB | 18.7 s, 77 MB |
+   | Splay | 2.41 s, 4.9 GB | 5.43 s, 1.4 GB |
+   | NavierStokes | 7.11 s, 10 MB | 7.17 s, 11 MB |
+   | pdfjs | 2.39 s, 1.6 GB | 2.64 s, 324 MB |
+   | GBEmu | 1.32 s, 189 MB | 1.39 s, 114 MB |
+   | code-load | 2.71 s, 569 MB | 2.78 s, 513 MB |
+   | Box2D | 1.69 s, 228 MB | 1.78 s, 121 MB |
+   | TypeScript | 4.07 s, 534 MB | 4.51 s, 439 MB |
+
+   (The "before" RSS undercounts: see "Numbers".) Splay spends 1.7 s
+   collecting: its minor collections each mark about 220,000 survivors
+   (4 ms), and its full collections mark 1.3 million cells (33 ms). Richards,
+   which allocates 40 MB in all, is the barrier's cost: on arm64 each one
+   builds two 48-bit table biases (six instructions) before its two loads.
 5. **Concurrent marking and sweeping.** The collector thread, the two
    pauses, the mod-union cards and precleaning. Target: the mutator's
    share of wall time above 90% on all of Octane.

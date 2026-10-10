@@ -18,6 +18,7 @@ pub mod asm;
 mod builtins;
 pub mod regexp;
 pub mod bytecode;
+pub mod gc;
 pub mod heap;
 pub mod interp;
 pub mod jit;

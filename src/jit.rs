@@ -119,6 +119,10 @@ pub(crate) enum Sym {
     HoleImm64,
     /// A second one (an address, a transition's new shape).
     HoleImm64b,
+    /// The card table's bias (`heap::card_bias`), for the write barrier.
+    HoleCards,
+    /// The metadata's bias (`heap::meta_bias`), for the write barrier.
+    HoleMeta,
     HoleReg,
     Continue,
     JumpTarget,
@@ -298,7 +302,14 @@ fn has_stencil(name: &str) -> bool {
 extern "C" fn toi_rt_add(acc: Value, r: Value) -> Value {
     match (r.as_number(), acc.as_number()) {
         (Some(x), Some(y)) => Value::from_f64_arith(x + y),
-        _ => crate::interp::generic_add(r, acc),
+        _ => {
+            // (A string's concatenation allocates.)
+            let vm = crate::interp::current_vm();
+            if !vm.is_null() {
+                unsafe { (*vm).safepoint(std::ptr::null_mut()) };
+            }
+            crate::interp::generic_add(r, acc)
+        }
     }
 }
 
@@ -319,9 +330,9 @@ extern "C" fn toi_rt_less_than(a: Value, b: Value) -> bool {
 /// `for … in`'s keys of `v` (`for_in_keys`; `vm` is the VM's address).
 extern "C" fn toi_rt_for_in_keys(vm: Value, v: Value) -> u64 {
     unsafe {
-        (*(vm.to_bits() as *mut crate::vm::Vm))
-            .for_in_keys(v)
-            .to_bits()
+        let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
+        vm.safepoint(std::ptr::null_mut());
+        vm.for_in_keys(v).to_bits()
     }
 }
 
@@ -330,6 +341,7 @@ extern "C" fn toi_rt_for_in_keys(vm: Value, v: Value) -> u64 {
 extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
     unsafe {
         let vm = crate::interp::current_vm();
+        (*vm).safepoint(std::ptr::null_mut());
         let o = (*vm).heap.alloc_object(&*(shape.to_bits() as *const Shape));
         crate::object::object_value(o).to_bits()
     }
@@ -338,9 +350,9 @@ extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
 /// A new, empty array (`create_array`; `vm` is the VM's address).
 extern "C" fn toi_rt_create_array(vm: Value, _: Value) -> u64 {
     unsafe {
-        (*(vm.to_bits() as *mut crate::vm::Vm))
-            .new_array()
-            .to_bits()
+        let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
+        vm.safepoint(std::ptr::null_mut());
+        vm.new_array().to_bits()
     }
 }
 
@@ -1175,7 +1187,7 @@ mod arch {
         assert!(d & 3 == 0, "misaligned branch target");
         let d = d >> 2;
         let limit = 1i64 << (bits - 1);
-        assert!((-limit..limit).contains(&d), "branch out of range");
+        assert!((-limit..limit).contains(&d), "branch out of range: {bits}-bit displacement {d} instructions");
         (d as u32) & ((1 << bits) - 1)
     }
 
@@ -6300,6 +6312,11 @@ impl JitCode {
         } = vm;
         let n = insns.len();
         let nregs = actual.regs.len();
+        // The collector scans the VM stack that far past a frame.
+        let cur = crate::interp::current_vm();
+        if !cur.is_null() {
+            unsafe { (*cur).max_frame = (*cur).max_frame.max(nregs + interp::HEADER) };
+        }
         let actual = if opts.specialize {
             actual
         } else {
@@ -7471,9 +7488,20 @@ impl JitCode {
             for r in s.stencil().relocs.iter().filter(|r| (r.0 as usize) < len) {
                 let value = match r.2 {
                     Sym::HoleImm => p.imm as u32 as u64,
-                    Sym::HoleImm64 => p.imm64,
-                    Sym::HoleImm64b => p.imm64b,
+                    // A cell, or an address in one, that the code embeds
+                    // (a folded constant, a callee it checks for, a
+                    // prototype's slot): kept alive (see `gc`).
+                    Sym::HoleImm64 | Sym::HoleImm64b => {
+                        let v = if r.2 == Sym::HoleImm64 { p.imm64 } else { p.imm64b };
+                        let vm = crate::interp::current_vm();
+                        if !vm.is_null() {
+                            unsafe { (*vm).heap.keep(v as usize) };
+                        }
+                        v
+                    }
                     Sym::HoleReg => p.reg as u64 * size_of::<Value>() as u64,
+                    Sym::HoleCards => crate::heap::card_bias() as u64,
+                    Sym::HoleMeta => crate::heap::meta_bias() as u64,
                     Sym::Continue => base + cont as u64,
                     Sym::JumpTarget => base + jump as u64,
                     Sym::Exit => base + exit_at[&(p.exit as usize)] as u64,
@@ -10524,6 +10552,8 @@ impl Lowering<'_> {
             let callee = (*fo).code;
             let shape = vm.ctor_root(fo);
             let proto_at = Object::inline(fo, 0).cast::<u64>();
+            vm.heap.keep(fo as usize);
+            vm.heap.keep(*proto_at as usize);
             let cap_at = (*callee).ctor_capacity.as_ptr();
             let site = Box::new(CtorSite {
                 heap: vm.heap.bump(),
@@ -10628,6 +10658,7 @@ impl Lowering<'_> {
             }
         }
         site.closure = fo as u64;
+        unsafe { (*self.state.vm).heap.keep(fo as usize) };
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
         true
@@ -11023,6 +11054,7 @@ impl Lowering<'_> {
         site.ctor = Some(ctor);
         site.this_shape = shape as u64;
         site.closure = fo as u64;
+        unsafe { (*self.state.vm).heap.keep(fo as usize) };
         site.callee = unsafe { (*fo).code };
         let site = Box::new(std::cell::UnsafeCell::new(site));
         let alloc = site.get() as u64;
@@ -11514,6 +11546,7 @@ impl Lowering<'_> {
         if !self.small_leaf(fo) {
             self.inlined += self.decoded(callee).0.len();
         }
+        unsafe { (*self.state.vm).heap.keep(fo as usize) };
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,
@@ -12848,6 +12881,7 @@ extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
     unsafe {
         let s = site.to_bits() as *mut CallSite;
         let vm = &mut *(*s).vm;
+        vm.safepoint(regs.to_bits() as *mut Value);
         let this = vm.construct_this((*s).closure as *mut Object);
         let o = crate::object::as_object(this);
         if (*s).this_shape != 0 && (*o).shape as u64 != (*s).this_shape {
@@ -12891,6 +12925,7 @@ extern "C" fn toi_rt_materialize(regs: Value, mat: Value) -> u64 {
 /// array), its new length.
 extern "C" fn toi_rt_array_push(a: Value, v: Value) -> Value {
     let vm = unsafe { &mut *crate::interp::current_vm() };
+    vm.safepoint(std::ptr::null_mut());
     crate::vm::array_push(vm, a, &[v]).expect("a push onto an array")
 }
 
@@ -12987,6 +13022,7 @@ unsafe fn direct_exit(
 extern "C" fn toi_rt_call(regs: Value, site: Value) -> Value {
     unsafe {
         let site = &mut *(site.to_bits() as *mut CallSite);
+        (*site.vm).safepoint(regs.to_bits() as *mut Value);
         // `TOI_EXITS`: also the calls through the runtime, by callee and why.
         if *EXITS_ON.get_or_init(|| std::env::var_os("TOI_EXITS").is_some()) && !site.callee.is_null() {
             let key = format!(

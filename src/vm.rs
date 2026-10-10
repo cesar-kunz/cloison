@@ -367,7 +367,14 @@ pub struct Vm {
     pub(crate) redo_call: bool,
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
-    open_upvalues: Vec<*mut Upvalue>,
+    pub(crate) open_upvalues: Vec<*mut Upvalue>,
+    /// Values Rust code holds in heap containers across a call into JS
+    /// (see [`Vm::handle_scope`]): roots.
+    pub(crate) handles: Vec<Value>,
+    /// The most values a frame spans from its registers: its own and, for
+    /// compiled code, its inlined frames' (the collector scans the VM stack
+    /// that far past the deepest frame's registers).
+    pub(crate) max_frame: usize,
     pub(crate) function_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
     pub(crate) array_shape: *const Shape,
@@ -473,6 +480,8 @@ impl Vm {
             native_limit: 0,
             redo_call: false,
             open_upvalues: Vec::new(),
+            handles: Vec::new(),
+            max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
@@ -674,6 +683,8 @@ impl Vm {
     // ---- Shapes ----
 
     fn add_shape(&mut self, s: Shape) -> *const Shape {
+        // (A Rust structure: its prototype is logged if young.)
+        self.heap.note(s.proto);
         let mut b = Box::new(s);
         let p: *const Shape = &*b;
         if b.family.is_null() {
@@ -873,6 +884,7 @@ impl Vm {
                         std::ptr::copy_nonoverlapping((*o).props, p, (*o).props_cap as usize);
                     }
                     (*o).props = p;
+                    crate::heap::barrier_young(o.cast(), &raw const (*o).props);
                     (*o).props_cap = cap;
                 }
             }
@@ -948,6 +960,7 @@ impl Vm {
                 && (unchanged || (*o).flags & PROTOTYPE == 0)
             {
                 *at = value;
+                crate::heap::barrier(o.cast(), at, value);
                 return;
             }
             self.store_field_slow(o, slot, value);
@@ -981,6 +994,7 @@ impl Vm {
                 self.prototype_slot_changed(at);
             }
             *at = value;
+            crate::heap::barrier(o.cast(), at, value);
         }
     }
 
@@ -1072,6 +1086,7 @@ impl Vm {
                 (*o).shape = t;
             }
             *(*o).elems.add(i) = value;
+            crate::heap::barrier((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), value);
         }
     }
 
@@ -1273,6 +1288,7 @@ impl Vm {
             if self.is_accessor(h, slot) {
                 return self.call_getter(*Object::slot(h, loc), obj);
             }
+            self.heap.note(object_value(h));
             install(
                 ic,
                 Ic {
@@ -1664,7 +1680,9 @@ impl Vm {
             let new = self.add_shape(u);
             (*o).shape = new;
             for (k, v) in values.into_iter().enumerate() {
-                *Object::slot(o, (*new).location(k as u32)) = v;
+                let at = Object::slot(o, (*new).location(k as u32));
+                *at = v;
+                crate::heap::barrier(o.cast(), at, v);
             }
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
@@ -1881,6 +1899,7 @@ impl Vm {
                 std::ptr::copy_nonoverlapping((*o).elems, e, (*o).elems_len as usize);
             }
             (*o).elems = e;
+            crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
             (*o).elems_cap = cap;
         }
     }
@@ -2039,6 +2058,7 @@ impl Vm {
             return v;
         }
         let v = self.new_string(units);
+        self.heap.note(v);
         self.strings.insert(units.to_vec(), v);
         v
     }
@@ -2143,6 +2163,7 @@ impl Vm {
             unsafe {
                 (*u).closed = *(*u).at;
                 (*u).at = &raw mut (*u).closed;
+                crate::heap::barrier(u.cast::<u8>().sub(8), &raw const (*u).closed, (*u).closed);
             }
             self.open_upvalues.pop();
         }
@@ -2267,6 +2288,7 @@ impl Vm {
                     std::ptr::copy_nonoverlapping((*o).props, p, (*o).props_cap as usize);
                 }
                 (*o).props = p;
+                crate::heap::barrier_young(o.cast(), &raw const (*o).props);
                 (*o).props_cap = want as u32;
             }
             (*o).shape = new;
@@ -2447,6 +2469,7 @@ impl Vm {
         for (f, &c) in module.functions.iter().zip(&codes) {
             let closures = f.closures.iter().map(|&i| codes[i]).collect();
             unsafe { (*c.cast_mut()).closures = closures };
+            self.max_frame = self.max_frame.max(f.nregs as usize + crate::interp::HEADER);
         }
         codes[module.script]
     }
@@ -2457,7 +2480,75 @@ impl Vm {
         let code = self.load(module);
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
-        unsafe { crate::interp::run_script(self, code) }
+        // Roots on the native stack are below here (see `gc`).
+        let outer = self.heap.gc.stack_base == 0;
+        if outer {
+            self.heap.gc.stack_base = &raw const here as usize & !7;
+        }
+        let r = unsafe { crate::interp::run_script(self, code) };
+        if outer {
+            self.heap.gc.stack_base = 0;
+        }
+        r
+    }
+
+    /// Run `f` with the values `vm.handles` gets meanwhile rooted: Rust
+    /// code that keeps values in a heap container (a `Vec`) across a call
+    /// into JS pushes them there.
+    pub(crate) fn handle_scope<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> T {
+        let depth = self.handles.len();
+        let r = f(self);
+        self.handles.truncate(depth);
+        r
+    }
+
+    /// The cells the VM refers to itself: the global object, the builtins'
+    /// prototypes and functions, `single_chars`, a pending error's value.
+    pub(crate) fn named_roots(&self) -> Vec<Value> {
+        let mut v: Vec<Value> = [
+            self.global,
+            self.object_prototype,
+            self.function_prototype,
+            self.array_prototype,
+            self.string_prototype,
+            self.missing_holder,
+            self.function_call_fn,
+            self.array_fn,
+            self.date_prototype,
+            self.number_prototype,
+            self.regexp_prototype,
+            self.boolean_prototype,
+            self.array_buffer_prototype,
+            self.array_push_fn,
+            self.array_pop_fn,
+        ]
+        .into_iter()
+        .chain(self.typed_prototypes.iter().copied())
+        .chain(self.error_prototypes.iter().copied())
+        .filter(|o| !o.is_null())
+        .map(object_value)
+        .collect();
+        v.push(self.bind_helper);
+        v.extend_from_slice(&self.single_chars);
+        if let Some(Error(_, Some(e))) = &self.error {
+            v.push(*e);
+        }
+        v
+    }
+
+    /// Every shape.
+    pub(crate) fn shapes(&self) -> impl Iterator<Item = &Shape> {
+        self.shapes.iter().map(|s| &**s)
+    }
+
+    /// Every function's code.
+    pub(crate) fn codes(&self) -> impl Iterator<Item = &Code> {
+        self.codes.iter().map(|c| &**c)
+    }
+
+    /// The string constants (see [`Vm::string_constant`]).
+    pub(crate) fn string_constants(&self) -> Vec<Value> {
+        self.strings.values().copied().collect()
     }
 
     /// Whether functions are compiled warm first, then hot, or hot from
@@ -3118,6 +3209,7 @@ unsafe fn flatten(o: *mut Object) {
         }
         debug_assert_eq!(at, len);
         (*o).elems = buf.cast();
+        crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
         (*o).props = std::ptr::null_mut();
         (*o).code = std::ptr::null();
     }

@@ -10,8 +10,9 @@ target/release/toi bench/micro/87-constraint-solver.js   # prints the completion
 target/release/toi --dump file.js                         # the bytecode instead
 ```
 
-Status (2026-10-10): every Octane benchmark runs. There is no garbage
-collector yet, and the language is ES5 in sloppy mode. See
+Status (2026-10-10): every Octane benchmark runs, with a generational
+garbage collector (its old generation not yet marked concurrently). The
+language is ES5 in sloppy mode. See
 [Where it falls short](#where-it-falls-short).
 
 ## How it works
@@ -119,10 +120,14 @@ sizes.
 Environment flags: `TOI_NO_JIT`, `TOI_TIER=<back edges>`, `TOI_TIME`,
 `TOI_JIT_TIME`, `TOI_EXITS` (exits, entries and runtime calls by count),
 `TOI_JIT_DUMP`, `TOI_JIT_LOG`, `TOI_PERF_MAP` (names JIT code for `perf`),
-`TOI_NO_QUICKEN`, `TOI_COUNT`, `TOI_CODE_SHIFT`; for the heap,
-`TOI_HEAP_LIMIT` (MiB of address space), `TOI_GC_VERIFY` (walk the heap
-at exit), `TOI_HEAP_HIST` (its cells by kind and size). `gc-bench.sh`
-times Octane's deterministic runs with their peak RSS.
+`TOI_NO_QUICKEN`, `TOI_COUNT`, `TOI_CODE_SHIFT`; for the collector,
+`TOI_GC_STATS` (each collection), `TOI_GC_NURSERY` (MiB),
+`TOI_HEAP_LIMIT` (MiB), `TOI_GC_VERIFY=<KiB>` (collect that often,
+checking references and poisoning what is freed), `TOI_GC_STRESS`
+(collect at every safepoint), `TOI_GC_FULL` (every collection full),
+`TOI_GC_CHECK_BARRIER` (find missed barriers), `TOI_HEAP_HIST` (cells by
+kind and size), `TOI_SEGV` (a backtrace on a crash). `gc-bench.sh` times
+Octane's deterministic runs with their peak RSS.
 
 ## Building
 
@@ -156,9 +161,10 @@ targets.
 
 ## Where it falls short
 
-- **No garbage collector yet.** The heap (`src/heap.rs`) is laid out for
-  one, but nothing is freed before exit: Splay allocates 5 GB. The design
-  and its progress are in `docs/gc.md`.
+- **The collector stops the world for full collections** (Splay spends
+  1.7 s of 5.4 collecting), and its write barrier costs up to 27% on
+  store-heavy code (Richards). Concurrent marking and a cheaper barrier
+  are next in `docs/gc.md`.
 - **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
   template literals, strict mode or array holes. Correctness is checked
   against Node on about 100 programs and Octane, not against test262.
@@ -176,7 +182,8 @@ targets.
 src/js/          lexer, parser, AST, bytecode generation
 src/bytecode.rs  the instruction set;  src/asm.rs  its text form
 src/interp.rs    the interpreter;  src/vm.rs  runtime, builtins' host
-src/object.rs    objects, shapes;  src/heap.rs  the heap;  src/builtins.rs  the builtins
+src/object.rs    objects, shapes;  src/builtins.rs  the builtins
+src/heap.rs      the heap;  src/gc.rs  the collector
 src/jit.rs       the JIT;  stencils/stencils.rs  its stencils;  build.rs  extraction
 src/regexp.rs    regular expressions;  src/math.rs  Math's transcendental functions (fdlibm)
 tests/           differential tests;  tests/octane/  feature scripts per benchmark

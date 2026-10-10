@@ -687,7 +687,11 @@ runs) and the microbenchmarks.
      | splay.js | 3.7 | 471 | 172 | 19% | 17 ms | Splay: survivors, 2.7x live, a 12 ms final pause |
 
      Card scanning dominates the longest pauses in all but splay.js,
-     whose final pause retraces about 670,000 cells.
+     whose final pause retraces about 670,000 cells. (Measured with their
+     loops in the interpreter: `%` with a register divisor kept them out
+     of the JIT. Compiled, survivors.js takes 0.39 s, 37% collecting;
+     cards.js 1.47 s, 21%, its pauses 32 ms with five times the stores per
+     nursery; splay.js 2.7 s, 22%; fragmentation.js 3.1 s, 22%.)
    - *Card references prefetched* (done): the references on dirty cards
      pass through a 32-entry ring, their metadata prefetched on entering
      it (old cells' references go all over the heap, each read a cache

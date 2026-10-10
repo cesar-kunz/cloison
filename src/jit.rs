@@ -1498,6 +1498,7 @@ impl Insn {
                         | Op::Sub
                         | Op::Mul
                         | Op::Div
+                        | Op::Mod
                         | Op::BitAnd
                         | Op::BitOr
                         | Op::BitXor
@@ -1672,6 +1673,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 | Op::Sub
                 | Op::Mul
                 | Op::Div
+                | Op::Mod
                 | Op::BitAnd
                 | Op::BitOr
                 | Op::BitXor
@@ -3291,6 +3293,16 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 out.acc = Any;
                 (base, "")
             }
+        }
+        // `r % acc` on int32s: an int32, but for a zero or negative
+        // divisor or a -0 (`mod_ii` exits; once it has, `mod_iif`).
+        Op::Mod => {
+            let (case, ty) = match (st.acc, reg) {
+                (I32, I32) => int_op("ii", "iif"),
+                _ => ("", Any),
+            };
+            out.acc = ty;
+            ("mod", case)
         }
         // A quotient is a double, even an exact one.
         Op::Div => {
@@ -5275,6 +5287,15 @@ fn stencil_for(
             } else {
                 cat!("get_keyed_", sel.case, "_", loc)
             }
+        }
+        // `mod`'s stencils only exist on memory, typed ones too (a
+        // division costs more than the slot's write-back).
+        ("mod", _) => {
+            if sel.case.is_empty() {
+                box_acc(&mut pre);
+            }
+            pre.extend(spill_piece(home, insn.reg));
+            if sel.case.is_empty() { "mod_m".into() } else { cat!("mod_", sel.case, "_m") }
         }
         // Group 2's generic stencils only exist on memory: a slot is
         // written back first (they are the slow, untyped paths).
@@ -10307,6 +10328,7 @@ impl Lowering<'_> {
                 | Op::Sub
                 | Op::Mul
                 | Op::Div
+                | Op::Mod
                 | Op::BitAnd
                 | Op::BitOr
                 | Op::BitXor

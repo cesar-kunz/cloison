@@ -1,11 +1,11 @@
 // GC: an old table of 2,000,000 records, each of which is handed a new
-// young object at a random position, about 100,000 stores per nursery.
+// young object at a random position, about 500,000 stores per nursery.
 // gc: every store from an old record to a young object dirties a card,
 // and each minor collection scans every dirty card in full, 512 bytes of
-// old records for the one young pointer in them: about 13 of a 16 ms
-// pause is card scanning while tracing takes 2 ms (TypeScript's long
+// old records for the one young pointer in them: about 25 of a 32 ms
+// pause is card scanning while tracing takes 6 ms (TypeScript's long
 // minor pauses). The replaced children die old, so the heap peaks at
-// three times what is live.
+// twice what is live.
 // features: loop, call, object, new, array
 // expect: 573428
 

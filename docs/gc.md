@@ -357,6 +357,17 @@ measurement says the old generation fills with cells that die soon after.
    prototypes and functions, the string constant table and
    `single_chars`, `Code::constants`, open upvalues, a pending error's
    value, the handle stack.
+   Conservative scanning retains what stale words point to, and the VM
+   stack had stale words where compiled code never writes: an inlined
+   frame's registers, and registers the code keeps in machine registers,
+   hold what an earlier frame at that depth left. On Splay one such word,
+   in compiled `SplayRun`'s inlined area, held a node removed long before,
+   which pointed at nodes removed after it: the live set grew from 1.3 to
+   5.3 million cells and the heap to 1.4 GB. Compiled code now zeroes the
+   registers dead at its entry, once per collection (a two-load check at
+   entry jumps to a cold stub when the collection count changed: zeroing
+   at every entry cost Richards 55%). Splay's live set stays at 1.3
+   million cells and its heap at 640 MB.
 4. **References from Rust structures**: inline caches' holders
    (prototypes, cached callees), shapes' prototypes, call and
    constructor sites, and cells compiled code embeds (each compiled

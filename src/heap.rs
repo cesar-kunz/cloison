@@ -87,6 +87,11 @@ pub const BYTES: u64 = 3;
 pub const UPVALUE: u64 = 5;
 const KIND: u64 = 7;
 
+/// A block is allocated in again after a minor collection only if it took
+/// at least this many bytes of holes in the cycle before, and after a full
+/// one only if that much of it is free.
+const RECYCLE: usize = 4 << 10;
+
 /// Holes smaller than this are left unused until the next collection.
 fn min_hole() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -273,6 +278,9 @@ pub struct Heap {
     pub(crate) requested: bool,
     /// The color the latest collection marked with (`COLOR`).
     pub(crate) color: u8,
+    /// Since the last collection: holes taken, holes too small for the
+    /// cell asked for, granules looked at to find them (`TOI_GC_STATS`).
+    pub(crate) holes: [usize; 3],
     pub(crate) gc: crate::gc::Gc,
 }
 
@@ -303,6 +311,7 @@ impl Heap {
         let gc = crate::gc::Gc::new();
         Heap {
             budget: gc.budget(),
+            holes: [0; 3],
             requested: false,
             color: 1,
             gc,
@@ -364,14 +373,12 @@ impl Heap {
         }
         self.end_region();
         let (s, e) = loop {
-            if let Some((s, e)) = self.next_hole() {
-                // Smaller holes would send compiled code's inline
-                // allocation to the runtime every few cells.
-                if e - s >= bytes.max(min_hole()) {
-                    unsafe { std::ptr::write_bytes(s as *mut u8, 0, e - s) };
-                    break (s, e);
-                }
-                continue;
+            // Smaller holes would send compiled code's inline allocation
+            // to the runtime every few cells.
+            if let Some((s, e)) = self.next_hole(bytes.max(min_hole())) {
+                unsafe { std::ptr::write_bytes(s as *mut u8, 0, e - s) };
+                self.holes[0] += 1;
+                break (s, e);
             }
             if let Some(b) = self.recycle.pop() {
                 self.cursor = self.block_addr(b as usize) as usize;
@@ -400,23 +407,68 @@ impl Heap {
         self.alloc(bytes)
     }
 
-    /// The next hole of the block being allocated in: a run of granules no
-    /// cell covers.
-    fn next_hole(&mut self) -> Option<(usize, usize)> {
+    /// The next hole of at least `min` bytes in the block being allocated
+    /// in: a run of granules no cell covers.
+    ///
+    /// From the metadata alone: a block allocation comes back to holds old
+    /// cells only (a collection made every survivor old), each with its
+    /// color at its first granule and `END` at its last, and 0 elsewhere.
+    /// Eight granules' bytes are looked at at a time.
+    fn next_hole(&mut self, min: usize) -> Option<(usize, usize)> {
+        const ENDS: u64 = 0x0404_0404_0404_0404;
+        let end = self.cursor_end;
         let mut p = self.cursor;
-        while p < self.cursor_end {
-            if unsafe { *meta(p) } & (YOUNG | COLOR) != 0 {
-                p += unsafe { cell_size(p as *const u8) };
-                continue;
+        let from = p;
+        unsafe {
+            while p < end {
+                let m = *meta(p);
+                if m != 0 {
+                    // A cell: on to the granule after its `END`.
+                    debug_assert!(m & COLOR != 0, "a young cell where allocation comes back");
+                    // (Eight bytes at a time within the block: the
+                    // metadata past the heap's end may not be mapped.)
+                    while p + 8 * GRANULE <= end {
+                        let w = (meta(p) as *const u64).read_unaligned() & ENDS;
+                        if w != 0 {
+                            p += w.trailing_zeros() as usize / 8 * GRANULE;
+                            break;
+                        }
+                        p += 8 * GRANULE;
+                    }
+                    while *meta(p) & END == 0 {
+                        p += GRANULE;
+                    }
+                    p += GRANULE;
+                    continue;
+                }
+                let s = p;
+                // Free granules: the bytes up to the next nonzero one.
+                loop {
+                    if p + 8 * GRANULE <= end {
+                        let w = (meta(p) as *const u64).read_unaligned();
+                        if w == 0 {
+                            p += 8 * GRANULE;
+                            continue;
+                        }
+                        p += w.trailing_zeros() as usize / 8 * GRANULE;
+                        break;
+                    }
+                    if p == end || *meta(p) != 0 {
+                        break;
+                    }
+                    p += GRANULE;
+                }
+                if p - s < min {
+                    self.holes[1] += 1;
+                    continue;
+                }
+                self.cursor = p;
+                self.holes[2] += (p - from) / GRANULE;
+                return Some((s, p));
             }
-            let s = p;
-            while p < self.cursor_end && unsafe { *meta(p) } & (YOUNG | COLOR) == 0 {
-                p += GRANULE;
-            }
-            self.cursor = p;
-            return Some((s, p));
         }
-        self.cursor = self.cursor_end;
+        self.holes[2] += (end - from) / GRANULE;
+        self.cursor = end;
         None
     }
 
@@ -428,14 +480,29 @@ impl Heap {
         if !full {
             // Once each: a block a second time would be allocated in again
             // over cells it holds since (holes of one block need not be
-            // consecutive regions: a large cell's comes between).
-            let mut bs: Vec<u32> = (self.regions.iter())
-                .map(|&(s, _)| ((s - self.base) / BLOCK) as u32)
-                .filter(|&b| self.blocks[b as usize] == Block::Small)
+            // consecutive regions: a large cell's comes between). And only
+            // a block whose holes held at least `RECYCLE` bytes: one with
+            // small holes between old cells costs a scan of its metadata
+            // for little room (Splay's blocks of promoted nodes, scanned at
+            // every cycle, were a tenth of its time).
+            let mut bs: Vec<(u32, usize)> = (self.regions.iter())
+                .map(|&(s, e)| (((s - self.base) / BLOCK) as u32, e - s))
+                .filter(|&(b, _)| self.blocks[b as usize] == Block::Small)
                 .collect();
             bs.sort_unstable();
-            bs.dedup();
-            self.recycle.extend(bs.into_iter().rev());
+            let mut k = 0;
+            while k < bs.len() {
+                let b = bs[k].0;
+                let mut room = 0;
+                while k < bs.len() && bs[k].0 == b {
+                    room += bs[k].1;
+                    k += 1;
+                }
+                if room >= RECYCLE {
+                    self.recycle.push(b);
+                }
+            }
+            self.recycle.reverse();
         }
         self.regions.clear();
         // The block being allocated in is among them: start afresh.
@@ -460,16 +527,32 @@ impl Heap {
         p.is_multiple_of(BLOCK) && matches!(self.blocks[(p - self.base) / BLOCK], Block::LargeHead(_))
     }
 
-    /// After a full collection: allocate in the blocks at `partly` again,
-    /// and free those at `empty`, giving their memory back to the system.
-    pub(crate) fn reset_blocks(&mut self, partly: &[usize], empty: &[usize]) {
-        self.recycle = partly.iter().rev().map(|&a| ((a - self.base) / BLOCK) as u32).collect();
+    /// After a full collection: allocate in the blocks at `partly` again
+    /// (with their free bytes), those with room (see [`RECYCLE`]), and free
+    /// those at `empty`, giving their memory back to the system.
+    pub(crate) fn reset_blocks(&mut self, partly: &[(usize, usize)], empty: &[usize]) {
+        self.recycle = (partly.iter().rev())
+            .filter(|&&(_, free)| free >= RECYCLE)
+            .map(|&(a, _)| ((a - self.base) / BLOCK) as u32)
+            .collect();
+        let mut run: Option<(usize, usize)> = None;
         for &a in empty {
             let b = (a - self.base) / BLOCK;
             self.blocks[b] = Block::Free;
             self.free.push(b as u32);
             self.used -= BLOCK;
-            release(a, BLOCK);
+            // Contiguous blocks go back in one call.
+            run = match run {
+                Some((s, e)) if e == a => Some((s, a + BLOCK)),
+                Some((s, e)) => {
+                    release(s, e - s);
+                    Some((a, a + BLOCK))
+                }
+                None => Some((a, a + BLOCK)),
+            };
+        }
+        if let Some((s, e)) = run {
+            release(s, e - s);
         }
     }
 

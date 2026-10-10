@@ -172,10 +172,8 @@ unsafe fn mark(heap: &mut Heap, p: usize, mode: Mode) {
         if if mode.minor { *m != YOUNG } else { *m & COLOR == mode.color } {
             return;
         }
-        let n = cell_size(p as *const u8);
+        // (Its `END` byte when traced, from the header then in cache.)
         *m = mode.color;
-        *heap.meta(p + n - GRANULE) |= END;
-        heap.gc.marked += n;
         heap.gc.stack.push(p);
     }
 }
@@ -219,6 +217,21 @@ unsafe fn mark_payload(heap: &mut Heap, q: usize, mode: Mode) {
         bad_reference(heap, p);
     }
     unsafe { mark(heap, p, mode) }
+}
+
+/// Trace every marked cell until none is left; returns how many there were.
+unsafe fn drain(heap: &mut Heap, mode: Mode) -> usize {
+    let mut n = 0;
+    unsafe {
+        while let Some(p) = heap.gc.stack.pop() {
+            let size = cell_size(p as *const u8);
+            *heap.meta(p + size - GRANULE) |= END;
+            heap.gc.marked += size;
+            trace(heap, p, mode, 0, usize::MAX);
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Mark what the cell at `p` refers to from its words in `lo..hi` (see
@@ -417,12 +430,7 @@ impl Vm {
                 self.heap.scan_cards(mode);
             }
             times[1] = lap();
-            let mut n = 0;
-            while let Some(p) = self.heap.gc.stack.pop() {
-                trace(&mut self.heap, p, mode, 0, usize::MAX);
-                n += 1;
-            }
-            marked = n;
+            marked = drain(&mut self.heap, mode);
             if !full && self.heap.gc.check_barriers {
                 self.heap.check_barriers();
             }
@@ -441,7 +449,8 @@ impl Vm {
             let (top, recycle, free, large) = self.heap.block_counts();
             eprintln!(
                 "gc {} {}: {:.3} ms (roots {:.3}, {} {:.3}, trace {:.3}, free {:.3}), {marked} cells marked, \
-                 {} KiB freed, {} MiB of blocks ({top} blocks, {recycle} to reuse, {free} free, {large} large)",
+                 {} KiB freed, {} MiB of blocks ({top} blocks, {recycle} to reuse, {free} free, {large} large), \
+                 holes {:?}",
                 self.heap.gc.count,
                 if full { "full" } else { "minor" },
                 start.elapsed().as_secs_f64() * 1e3,
@@ -451,9 +460,11 @@ impl Vm {
                 times[2],
                 times[3],
                 freed >> 10,
-                self.heap.allocated() >> 20
+                self.heap.allocated() >> 20,
+                self.heap.holes
             );
         }
+        self.heap.holes = [0; 3];
         if full {
             // The blocks the sweep left in use (partly free ones too),
             // and room to grow by what was live, times `GROWTH - 1`.
@@ -473,13 +484,7 @@ impl Vm {
         if !self.heap.gc.roots_report {
             return;
         }
-        let mut n = 0;
-        unsafe {
-            while let Some(p) = self.heap.gc.stack.pop() {
-                trace(&mut self.heap, p, mode, 0, usize::MAX);
-                n += 1;
-            }
-        }
+        let n = unsafe { drain(&mut self.heap, mode) };
         eprintln!("  roots {what}: {n} cells");
     }
 
@@ -719,7 +724,7 @@ impl Heap {
         let mut partly = Vec::new();
         unsafe {
             for (start, end) in self.block_ranges() {
-                let mut live = false;
+                let mut live = 0;
                 let mut p = start;
                 while p < end {
                     let m = *self.meta(p);
@@ -740,12 +745,16 @@ impl Heap {
                             std::ptr::write_bytes(p as *mut u8, POISON, n);
                         }
                     } else {
-                        live = true;
+                        live += n;
                     }
                     p += n;
                 }
                 if end - start == crate::heap::BLOCK {
-                    if live { partly.push(start) } else { empty.push(start) }
+                    if live > 0 {
+                        partly.push((start, crate::heap::BLOCK - live));
+                    } else {
+                        empty.push(start);
+                    }
                 }
             }
             let (base, end) = self.space_range();

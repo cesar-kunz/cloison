@@ -65,8 +65,9 @@ collector yet, and the language is ES5 in sloppy mode. See
 
 `docs/future-work.md` is the design log: each step with what it took,
 what it measured, and what did not work. `docs/gc.md` designs the
-collector (a parallel copying nursery with precise roots over a
-concurrently marked mark-region old space with budgeted evacuation),
+collector (non-moving and generational, cells in 16-byte granules with a
+metadata byte each, conservative native roots, a card-marking barrier,
+concurrent marking of the old generation) and tracks its implementation,
 `docs/object-model.md` the object model and its escape analysis,
 `docs/direct-calls.md` the call convention, and `docs/sandbox.md` surveys
 heap sandboxing and defers it.
@@ -118,7 +119,10 @@ sizes.
 Environment flags: `TOI_NO_JIT`, `TOI_TIER=<back edges>`, `TOI_TIME`,
 `TOI_JIT_TIME`, `TOI_EXITS` (exits, entries and runtime calls by count),
 `TOI_JIT_DUMP`, `TOI_JIT_LOG`, `TOI_PERF_MAP` (names JIT code for `perf`),
-`TOI_NO_QUICKEN`, `TOI_COUNT`, `TOI_CODE_SHIFT`.
+`TOI_NO_QUICKEN`, `TOI_COUNT`, `TOI_CODE_SHIFT`; for the heap,
+`TOI_HEAP_LIMIT` (MiB of address space), `TOI_GC_VERIFY` (walk the heap
+at exit), `TOI_HEAP_HIST` (its cells by kind and size). `gc-bench.sh`
+times Octane's deterministic runs with their peak RSS.
 
 ## Building
 
@@ -152,10 +156,9 @@ targets.
 
 ## Where it falls short
 
-- **No garbage collector.** The heap is a bump arena freed at exit;
-  pdfjs peaks at 1.5 GB. Compiled code folds shape and field addresses as
-  64-bit immediates, so a moving collector is a retrofit, not an add-on.
-  The design is in `docs/gc.md`.
+- **No garbage collector yet.** The heap (`src/heap.rs`) is laid out for
+  one, but nothing is freed before exit: Splay allocates 5 GB. The design
+  and its progress are in `docs/gc.md`.
 - **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
   template literals, strict mode or array holes. Correctness is checked
   against Node on about 100 programs and Octane, not against test262.
@@ -173,7 +176,7 @@ targets.
 src/js/          lexer, parser, AST, bytecode generation
 src/bytecode.rs  the instruction set;  src/asm.rs  its text form
 src/interp.rs    the interpreter;  src/vm.rs  runtime, builtins' host
-src/object.rs    objects, shapes, the heap;  src/builtins.rs  the builtins
+src/object.rs    objects, shapes;  src/heap.rs  the heap;  src/builtins.rs  the builtins
 src/jit.rs       the JIT;  stencils/stencils.rs  its stencils;  build.rs  extraction
 src/regexp.rs    regular expressions;  src/math.rs  Math's transcendental functions (fdlibm)
 tests/           differential tests;  tests/octane/  feature scripts per benchmark

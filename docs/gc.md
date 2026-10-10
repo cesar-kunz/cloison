@@ -506,11 +506,14 @@ pauses.
   cells more time to die but leaves the cache. Measured: start from the
   last-level cache's size and climb on marked bytes per allocated byte.
 - **Old-generation headroom**: the next major cycle starts when the old
-  generation has grown by a factor of its size after the last cycle,
-  adjusted so the collector's CPU share stays under a target and the
-  heap under `TOI_HEAP_LIMIT`.
-- **When marking starts**: early enough to finish before the headroom
-  is used, from the measured marking rate and allocation rate.
+  generation has grown by its live size after the last cycle (64 MiB at
+  least), counted two ways, whichever comes first: blocks in use since
+  the sweep, and bytes minor collections promoted (allocation into
+  recycled holes adds no blocks). Not yet: a CPU-share target, and
+  `TOI_HEAP_LIMIT` steering it.
+- **When marking starts**: earlier by what the last cycle grew the heap
+  by while marking, so the heap peaks about where a stop-the-world
+  collection would have let it.
 
 `TOI_GC_STATS` prints each collection: kind, pause, bytes allocated
 since the last, marked, freed, and the heap's size.
@@ -634,6 +637,12 @@ runs) and the microbenchmarks.
      After a stop-the-world full collection Splay's blocks are 31% full
      on average (2,900 of 12,000 under a tenth): the nursery allocates in
      every recycled block's holes and its survivors pin them all.
+   - *Promotion trigger* (done): allocation into recycled blocks' holes
+     adds no blocks, so a trigger on blocks in use let old garbage grow
+     well past the room. A cycle also starts once minor collections have
+     promoted the room's bytes since the last one. Splay 14 cycles -> 20,
+     peak RSS 760-820 MB -> 646-659 MB at the same speed (4.0-4.2 s);
+     nothing else changes.
    - *Prefetching* (done): marked cells pass through an eight-entry ring
      between the stack and tracing, prefetched on entering it. Splay's
      minor tracing 626 ms -> 450 ms, its collection share 23% -> 19.5%

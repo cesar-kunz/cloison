@@ -455,6 +455,22 @@ fn group2_operators_agree_with_node() {
     }
 }
 
+/// Code compiled for an outer loop, entered at the inner loop's header
+/// (tiering up there): the stub that zeroes dead registers once per
+/// collection must go on to that header, not to the region's first
+/// instruction (`j = 0`), which ran the inner loop's iterations again.
+#[test]
+fn entering_a_nested_loop_after_zeroing_dead_registers() {
+    assert_eq!(
+        value(
+            "var s = 0;
+             for (var i = 0; i < 3; i++) for (var j = 0; j < 3; j++) { s = s * 3 + j + i; }
+             s;"
+        ),
+        "4162"
+    );
+}
+
 /// Two calls inlined into one loop share their frames' registers: `at`'s
 /// int32 parameter and the array `size` loads into the same register. The
 /// `length` load after it was compiled as an exit to the interpreter

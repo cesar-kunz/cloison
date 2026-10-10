@@ -87,6 +87,12 @@ pub struct Gc {
     /// What the heap may grow by before the next full collection (see
     /// [`GROWTH`]).
     room: usize,
+    /// The heap's blocks in use when the current cycle started, and what
+    /// the last cycle grew them by while marking: the next one starts that
+    /// much earlier, so the heap peaks where a stop-the-world collection
+    /// would have let it.
+    cycle_from: usize,
+    lead: usize,
     /// Old cells a minor collection during marking shaded for the marker.
     shade: Vec<usize>,
     /// The marker thread, once a cycle needed it.
@@ -123,6 +129,20 @@ impl Gc {
             full_at: FULL_MIN,
             ..Default::default()
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn report_room(&self) {
+        eprintln!("  live {} MiB, room {} MiB, lead {} MiB", (self.room / (GROWTH - 1)) >> 20, self.room >> 20, self.lead >> 20);
+    }
+
+    /// What the heap may grow by after a sweep before the next cycle
+    /// starts: the room less the last cycle's lead, half the room and
+    /// [`FULL_MIN`] at least (more cycles of a small heap cost more time
+    /// than they save memory: EarleyBoyer 12% at half of 64 MiB).
+    fn headroom(&self) -> usize {
+        self.room.saturating_sub(self.lead).max(self.room / 2).max(FULL_MIN)
     }
 
     /// Bytes allocated before the next collection.
@@ -688,6 +708,7 @@ impl Vm {
             self.heap.absorb_sweep();
         }
         if kind == Collection::Start {
+            self.heap.gc.cycle_from = self.heap.allocated();
             self.heap.next_color();
             self.heap.gc.marking = true;
         }
@@ -779,8 +800,11 @@ impl Vm {
             let live = traced + concurrent;
             let room = ((GROWTH - 1) * live).max(FULL_MIN);
             self.heap.gc.room = room;
+            if kind == Collection::Final {
+                self.heap.gc.lead = self.heap.allocated().saturating_sub(self.heap.gc.cycle_from);
+            }
             // (After a final pause, again once the sweep has freed blocks.)
-            self.heap.gc.full_at = self.heap.allocated() + room;
+            self.heap.gc.full_at = self.heap.allocated() + self.heap.gc.headroom();
         }
         if self.heap.gc.stats {
             let (top, recycle, free, large) = self.heap.block_counts();
@@ -802,6 +826,9 @@ impl Vm {
                 self.heap.holes,
                 self.heap.gc.marker.as_ref().map_or(0, |mk| mk.shared.state.lock().unwrap().sweep.len())
             );
+            if full {
+                self.heap.gc.report_room();
+            }
         }
         self.heap.holes = [0; 3];
         let next = self.heap.gc.budget();
@@ -1291,7 +1318,7 @@ impl Heap {
         self.add_swept(&partly, &empty);
         if over && self.gc.sweeping {
             self.gc.sweeping = false;
-            self.gc.full_at = self.allocated() + self.gc.room;
+            self.gc.full_at = self.allocated() + self.gc.headroom();
         }
         over
     }

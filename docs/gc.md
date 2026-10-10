@@ -624,6 +624,13 @@ runs) and the microbenchmarks.
    age bit, and evacuation of fragmented blocks if measurement shows
    fragmentation costs memory (moving only cells no conservative word
    and no Rust structure refers to).
+   - *Pacing* (done): a cycle starts earlier by what the previous one grew
+     the heap by while marking (its lead), no less than half the room and
+     64 MiB after a sweep. Splay's peak RSS 911-968 MB -> 760-820 MB at
+     the same speed; at half of 64 MiB EarleyBoyer's doubled cycles cost
+     12%, hence the floor. Splay's live size is 117-130 MiB, yet 372 MiB
+     of blocks stay in use after a stop-the-world full collection (495
+     MiB concurrent): fragmentation, not pacing, is most of its memory.
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

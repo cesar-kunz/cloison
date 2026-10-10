@@ -661,10 +661,10 @@ fn imm64b() -> u64 {
 /// (`heap`'s reservation is placed for that).
 const SIDE: usize = 1 << 43;
 
-/// Mark the card of `a` (`heap::card_mark`).
+/// Mark the card of `a` (`heap::card_mark`; `heap::CARD` is 128 bytes).
 #[inline(always)]
 unsafe fn card_mark<T>(a: *const T) {
-    unsafe { *((SIDE + (a as usize >> 9)) as *mut u8) = 1 };
+    unsafe { *((SIDE + (a as usize >> 7)) as *mut u8) = 1 };
 }
 
 /// The metadata byte of the granule at `a` (`heap::meta`).

@@ -472,7 +472,11 @@ macro_rules! imm64_of {
     }};
 }
 
-/// A 64-bit immediate operand: `movz` + three `movk`.
+/// A 64-bit immediate operand: `movz` + two `movk`, 48 bits. Every value
+/// a 64-bit hole holds is an address (a shape, a slot, a site, the global
+/// object: 47-bit user space on Linux and macOS) or a small constant
+/// (`mod_smi`'s multiplier, a typed array's kind), so the top 16 bits are
+/// zero; the JIT checks that when patching.
 #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 macro_rules! imm64_of {
     ($sym:ident) => {{
@@ -482,7 +486,6 @@ macro_rules! imm64_of {
                 "movz {k}, #:abs_g0_nc:{s}",
                 "movk {k}, #:abs_g1_nc:{s}",
                 "movk {k}, #:abs_g2_nc:{s}",
-                "movk {k}, #:abs_g3:{s}",
                 k = out(reg) k,
                 s = sym $sym,
                 options(pure, nomem, nostack),
@@ -569,7 +572,6 @@ macro_rules! imm64_of {
                 concat!("movz {k}, ", hole16!(0, $hole), " // {s}"),
                 concat!("movk {k}, ", hole16!(1, $hole), ", lsl #16"),
                 concat!("movk {k}, ", hole16!(2, $hole), ", lsl #32"),
-                concat!("movk {k}, ", hole16!(3, $hole), ", lsl #48"),
                 k = out(reg) k,
                 s = sym $sym,
                 options(pure, nomem, nostack),
@@ -579,26 +581,73 @@ macro_rules! imm64_of {
     }};
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-#[inline(always)]
-unsafe fn mem(regs: *mut Value) -> *mut Value {
-    let off: usize;
-    unsafe {
-        core::arch::asm!(
-            concat!("movz {o:x}, ", hole16!(0, reg), " // {s}"),
-            o = out(reg) off,
-            s = sym toi_hole_reg,
-            options(pure, nomem, nostack),
-        );
-        regs.byte_add(off)
-    }
-}
-
-/// The first 64-bit immediate: `mod_smi_i`'s multiplier, or the shape a
-/// property access checks.
+/// The first 64-bit immediate: the shape a property access checks, a
+/// slot's address, a call site.
 #[inline(always)]
 fn imm64() -> u64 {
     imm64_of!(toi_hole_imm64)
+}
+
+/// The 64-bit immediates when they hold any 64 bits: a `Value` (a folded
+/// constant, the word `guard_word` expects, a constant stored at an exit)
+/// or `mod_smi_i`'s multiplier. On arm64 a fourth `movk`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn imm64_full() -> u64 {
+    imm64()
+}
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn imm64b_full() -> u64 {
+    imm64b()
+}
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+macro_rules! imm64_full_of {
+    ($sym:ident) => {{
+        let k: u64;
+        unsafe {
+            core::arch::asm!(
+                "movz {k}, #:abs_g0_nc:{s}",
+                "movk {k}, #:abs_g1_nc:{s}",
+                "movk {k}, #:abs_g2_nc:{s}",
+                "movk {k}, #:abs_g3:{s}",
+                k = out(reg) k,
+                s = sym $sym,
+                options(pure, nomem, nostack),
+            );
+        }
+        k
+    }};
+}
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+macro_rules! imm64_full_of {
+    (toi_hole_imm64) => { imm64_full_of!(@parts imm64, toi_hole_imm64) };
+    (toi_hole_imm64b) => { imm64_full_of!(@parts imm64b, toi_hole_imm64b) };
+    (@parts $hole:ident, $sym:ident) => {{
+        let k: u64;
+        unsafe {
+            core::arch::asm!(
+                concat!("movz {k}, ", hole16!(0, $hole), " // {s}"),
+                concat!("movk {k}, ", hole16!(1, $hole), ", lsl #16"),
+                concat!("movk {k}, ", hole16!(2, $hole), ", lsl #32"),
+                concat!("movk {k}, ", hole16!(3, $hole), ", lsl #48"),
+                k = out(reg) k,
+                s = sym $sym,
+                options(pure, nomem, nostack),
+            );
+        }
+        k
+    }};
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn imm64_full() -> u64 {
+    imm64_full_of!(toi_hole_imm64)
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn imm64b_full() -> u64 {
+    imm64_full_of!(toi_hole_imm64b)
 }
 
 /// The second 64-bit immediate: an address (a prototype's slot, the global
@@ -606,6 +655,73 @@ fn imm64() -> u64 {
 #[inline(always)]
 fn imm64b() -> u64 {
     imm64_of!(toi_hole_imm64b)
+}
+
+// arm64: a slot at an immediate offset is one `ldr`/`str` with the offset
+// in the instruction (`imm12`, scaled by 8: below 32 KiB, which the JIT
+// checks), as the relocation of a `:lo12:` operand (`LDST64_ABS_LO12_NC`,
+// whose field the JIT patches with the whole offset) or, on Mach-O, of a
+// `@PAGEOFF` one. The asm is the access itself: through a pointer, LLVM
+// would materialize the offset with a `movz` and index with it.
+macro_rules! ldst_imm {
+    ($load:ident, $store:ident, $sym:ident, $elf:literal, $macho:literal) => {
+        #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+        #[inline(always)]
+        unsafe fn $load(base: *mut u8) -> Value {
+            let v: u64;
+            unsafe {
+                core::arch::asm!(
+                    concat!("ldr {v}, [{b}, ", $elf, "]"),
+                    v = out(reg) v,
+                    b = in(reg) base,
+                    s = sym $sym,
+                    options(pure, readonly, nostack),
+                );
+            }
+            Value::from_bits(v)
+        }
+        #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+        #[inline(always)]
+        unsafe fn $store(base: *mut u8, v: Value) {
+            unsafe {
+                core::arch::asm!(
+                    concat!("str {v}, [{b}, ", $elf, "]"),
+                    v = in(reg) v.to_bits(),
+                    b = in(reg) base,
+                    s = sym $sym,
+                    options(nostack),
+                );
+            }
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[inline(always)]
+        unsafe fn $load(base: *mut u8) -> Value {
+            let v: u64;
+            unsafe {
+                core::arch::asm!(
+                    concat!("ldr {v}, [{b}, ", $macho, "]"),
+                    v = out(reg) v,
+                    b = in(reg) base,
+                    s = sym $sym,
+                    options(pure, readonly, nostack),
+                );
+            }
+            Value::from_bits(v)
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        #[inline(always)]
+        unsafe fn $store(base: *mut u8, v: Value) {
+            unsafe {
+                core::arch::asm!(
+                    concat!("str {v}, [{b}, ", $macho, "]"),
+                    v = in(reg) v.to_bits(),
+                    b = in(reg) base,
+                    s = sym $sym,
+                    options(nostack),
+                );
+            }
+        }
+    };
 }
 
 /// The VM register in memory named by the register hole.
@@ -616,21 +732,103 @@ unsafe fn mem(regs: *mut Value) -> *mut Value {
     unsafe { regs.byte_add(&raw const toi_hole_reg as usize) }
 }
 
-/// The VM register in memory named by the register hole: its byte offset
-/// (< 2 KiB) fits one `movz`, so an access is `movz` + `ldr`/`str`.
+/// The VM register in memory named by the register hole: on arm64, its
+/// byte offset (< 2 KiB) in the instruction, as a slot's (`ldst_imm!`).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load_m(regs: *mut Value) -> Value {
+    unsafe { *mem(regs) }
+}
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn store_m(regs: *mut Value, v: Value) {
+    unsafe { *mem(regs) = v }
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn load_m(regs: *mut Value) -> Value {
+    unsafe { load_m_at(regs.cast()) }
+}
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn store_m(regs: *mut Value, v: Value) {
+    unsafe { store_m_at(regs.cast(), v) }
+}
+ldst_imm!(load_m_at, store_m_at, toi_hole_reg, "#:lo12:{s}", "{s}@PAGEOFF");
+
+/// The int32 in the VM register in memory named by the register hole:
+/// on arm64 a 32-bit load.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load_m_i32(regs: *mut Value) -> i32 {
+    unsafe { int(*mem(regs)) }
+}
+/// The int32 in the VM register in memory named by the register hole, as
+/// an unboxed slot value (zero-extended): on arm64 one `ldr w`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn load_m_unboxed(regs: *mut Value) -> Value {
+    unsafe { unboxed(int(*mem(regs))) }
+}
 #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
 #[inline(always)]
-unsafe fn mem(regs: *mut Value) -> *mut Value {
-    let off: usize;
+unsafe fn load_m_unboxed(regs: *mut Value) -> Value {
+    let v: u64;
     unsafe {
         core::arch::asm!(
-            "movz {o:x}, #:abs_g0_nc:{s}",
-            o = out(reg) off,
+            "ldr {v:w}, [{b}, #:lo12:{s}]",
+            v = out(reg) v,
+            b = in(reg) regs,
             s = sym toi_hole_reg,
-            options(pure, nomem, nostack),
+            options(pure, readonly, nostack),
         );
-        regs.byte_add(off)
     }
+    Value::from_bits(v)
+}
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn load_m_unboxed(regs: *mut Value) -> Value {
+    let v: u64;
+    unsafe {
+        core::arch::asm!(
+            "ldr {v:w}, [{b}, {s}@PAGEOFF]",
+            v = out(reg) v,
+            b = in(reg) regs,
+            s = sym toi_hole_reg,
+            options(pure, readonly, nostack),
+        );
+    }
+    Value::from_bits(v)
+}
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+#[inline(always)]
+unsafe fn load_m_i32(regs: *mut Value) -> i32 {
+    let v: u32;
+    unsafe {
+        core::arch::asm!(
+            "ldr {v:w}, [{b}, #:lo12:{s}]",
+            v = out(reg) v,
+            b = in(reg) regs,
+            s = sym toi_hole_reg,
+            options(pure, readonly, nostack),
+        );
+    }
+    v as i32
+}
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn load_m_i32(regs: *mut Value) -> i32 {
+    let v: u32;
+    unsafe {
+        core::arch::asm!(
+            "ldr {v:w}, [{b}, {s}@PAGEOFF]",
+            v = out(reg) v,
+            b = in(reg) regs,
+            s = sym toi_hole_reg,
+            options(pure, readonly, nostack),
+        );
+    }
+    v as i32
 }
 
 /// A stencil using the immediate as `$k`, plus on arm64 a `_k16` variant
@@ -651,11 +849,11 @@ macro_rules! imm_variants {
 
 /// Read or write a boxed location: `[m]` memory or `[g k]` a GPR slot.
 macro_rules! get {
-    ([m], $s:ident) => { *mem($s.regs) };
+    ([m], $s:ident) => { load_m($s.regs) };
     ([g $k:literal], $s:ident) => { $s.g[$k] };
 }
 macro_rules! set {
-    ([m], $s:ident, $v:expr) => { *mem($s.regs) = $v };
+    ([m], $s:ident, $v:expr) => { store_m($s.regs, $v) };
     ([g $k:literal], $s:ident, $v:expr) => { $s.g[$k] = $v };
 }
 macro_rules! loc {
@@ -1072,11 +1270,11 @@ macro_rules! gpr_slot {
     ($k:literal) => {
         boxed_location!([g $k]);
         stencil!("enter_g", $k; |s| {
-            s.g[$k] = *mem(s.regs);
+            s.g[$k] = load_m(s.regs);
             next!(s)
         });
         stencil!("spill_g", $k; |s| {
-            *mem(s.regs) = s.g[$k];
+            store_m(s.regs, s.g[$k]);
             next!(s)
         });
     };
@@ -1135,15 +1333,15 @@ macro_rules! fp_slot {
         });
 
         stencil!("enter_f", $k, "_i"; |s| {
-            s.f[$k] = i2f(int(*mem(s.regs)));
+            s.f[$k] = i2f(load_m_i32(s.regs));
             next!(s)
         });
         stencil!("enter_f", $k, "_f"; |s| {
-            s.f[$k] = s.tag.decode_f64(*mem(s.regs));
+            s.f[$k] = s.tag.decode_f64(load_m(s.regs));
             next!(s)
         });
         stencil!("spill_f", $k; |s| {
-            *mem(s.regs) = s.tag.encode_f64(s.f[$k]);
+            store_m(s.regs, s.tag.encode_f64(s.f[$k]));
             next!(s)
         });
     };
@@ -1342,7 +1540,7 @@ macro_rules! int_slot {
             next!(s)
         });
         stencil!("enter_u", $k; |s| {
-            s.g[$k] = unboxed(int(*mem(s.regs)));
+            s.g[$k] = load_m_unboxed(s.regs);
             next!(s)
         });
         // A boxed value no int32 (see `star_u<k>_v`): its high half isn't
@@ -1352,14 +1550,14 @@ macro_rules! int_slot {
             next!(s)
         });
         stencil!("spill_u", $k; |s| {
-            *mem(s.regs) = s.tag.rebox(s.g[$k]);
+            store_m(s.regs, s.tag.rebox(s.g[$k]));
             next!(s)
         });
         // Where the slot may hold such a boxed value (exits, writing back
         // every slot): boxed only if its high half is zero.
         stencil!("spill_u", $k, "_v"; |s| {
             let v = s.g[$k];
-            *mem(s.regs) = if v.to_bits() >> 32 == 0 { s.tag.rebox(v) } else { v };
+            store_m(s.regs, if v.to_bits() >> 32 == 0 { s.tag.rebox(v) } else { v });
             next!(s)
         });
 
@@ -1607,7 +1805,7 @@ stencil!("lda_false"; |s| {
 // `acc = r instanceof acc` and `acc = r in acc`, `r` in memory, through the
 // runtime; out to the interpreter (before) where they would throw (0).
 stencil!("test_instanceof_m"; |s| {
-    let r = rt_call!(s, toi_rt_instance_of, *mem(s.regs), s.acc);
+    let r = rt_call!(s, toi_rt_instance_of, load_m(s.regs), s.acc);
     if r == 0 {
         exit!(s)
     }
@@ -1615,7 +1813,7 @@ stencil!("test_instanceof_m"; |s| {
     next!(s)
 });
 stencil!("test_in_m"; |s| {
-    let r = rt_call!(s, toi_rt_in, *mem(s.regs), s.acc);
+    let r = rt_call!(s, toi_rt_in, load_m(s.regs), s.acc);
     if r == 0 {
         exit!(s)
     }
@@ -1745,7 +1943,7 @@ fn rem_magic(a: i32, d: i32, m: u64) -> i32 {
 
 stencil!("mod_smi_iif"; |s| {
     let a = int(s.acc);
-    s.facc = rem_f64(rem_magic(a, imm(), imm64()), a);
+    s.facc = rem_f64(rem_magic(a, imm(), imm64_full()), a);
     next!(s)
 });
 
@@ -2886,7 +3084,7 @@ macro_rules! bitwise_int32 {
         });
     };
 }
-bitwise_int32!("m", |s| int(*mem(s.regs)));
+bitwise_int32!("m", |s| load_m_i32(s.regs));
 macro_rules! bitwise_gpr {
     ($k:tt) => {
         bitwise_int32!(concat!("g", $k), |s| int(s.g[$k]));
@@ -2900,7 +3098,7 @@ with_gprs!(each_gpr! bitwise_gpr);
 macro_rules! bitwise_generic {
     ($name:literal, |$l:ident, $a:ident| $e:expr) => {
         stencil_slow!($name, "_m"; |s| {
-            let l = *mem(s.regs);
+            let l = load_m(s.regs);
             if s.tag.both_int32(l, s.acc) {
                 let ($l, $a) = (int(l), int(s.acc));
                 s.acc = bitwise_result(s.tag, $e);
@@ -2908,7 +3106,7 @@ macro_rules! bitwise_generic {
             }
             slow!(s)
         }; |s| {
-            let $l = rt_to_int32!(s, *mem(s.regs));
+            let $l = rt_to_int32!(s, load_m(s.regs));
             let $a = rt_to_int32!(s, s.acc);
             s.acc = bitwise_result(s.tag, $e);
             next!(s)
@@ -3270,11 +3468,11 @@ stencil!("for_in_keys"; |s| {
 // `LdaConstant`: the constant's bits are the 64-bit immediate (`_f`: a
 // double's, into `facc`).
 stencil!("lda_constant"; |s| {
-    s.acc = Value::from_bits(imm64());
+    s.acc = Value::from_bits(imm64_full());
     next!(s)
 });
 stencil!("lda_constant_f"; |s| {
-    s.facc = f64::from_bits(imm64());
+    s.facc = f64::from_bits(imm64_full());
     next!(s)
 });
 
@@ -3396,38 +3594,18 @@ unsafe fn at_imm(base: *mut u8) -> *mut Value {
     unsafe { base.byte_add(&raw const toi_hole_imm as usize).cast() }
 }
 
-/// The slot `imm` bytes into `base`: the offset (below 64 KiB, which the
-/// JIT checks) from one `movz`, as a symbol's address would be an `adrp`,
-/// relative to where the code is.
-#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+/// The value `imm` bytes into `base`.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn at_imm(base: *mut u8) -> *mut Value {
-    let off: usize;
-    unsafe {
-        core::arch::asm!(
-            "movz {o:x}, #:abs_g0_nc:{s}",
-            o = out(reg) off,
-            s = sym toi_hole_imm,
-            options(pure, nomem, nostack),
-        );
-        base.byte_add(off).cast()
-    }
+unsafe fn load_imm(base: *mut u8) -> Value {
+    unsafe { *at_imm(base) }
 }
-
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn at_imm(base: *mut u8) -> *mut Value {
-    let off: usize;
-    unsafe {
-        core::arch::asm!(
-            concat!("movz {o:x}, ", hole16!(0, imm), " // {s}"),
-            o = out(reg) off,
-            s = sym toi_hole_imm,
-            options(pure, nomem, nostack),
-        );
-        base.byte_add(off).cast()
-    }
+unsafe fn store_imm(base: *mut u8, v: Value) {
+    unsafe { *at_imm(base) = v }
 }
+ldst_imm!(load_imm, store_imm, toi_hole_imm, "#:lo12:{s}", "{s}@PAGEOFF");
 
 /// The object's out-of-line slots (`Object::props`, at offset 16).
 #[inline(always)]
@@ -3529,12 +3707,12 @@ macro_rules! property_location {
     ($loc:tt) => {
         stencil!("get_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            s.acc = *at_imm(o);
+            s.acc = load_imm(o);
             next!(s)
         });
         stencil!("get_oop_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            s.acc = *at_imm(props(o));
+            s.acc = load_imm(props(o));
             next!(s)
         });
         stencil!("get_proto_", loc!($loc); |s| {
@@ -3546,18 +3724,18 @@ macro_rules! property_location {
         });
         stencil!("set_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            *at_imm(o) = s.acc;
+            store_imm(o, s.acc);
             next!(s)
         });
         stencil!("set_oop_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            *at_imm(props(o)) = s.acc;
+            store_imm(props(o), s.acc);
             next!(s)
         });
         stencil!("set_tr_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             *(o as *mut u64) = imm64b();
-            *at_imm(o) = s.acc;
+            store_imm(o, s.acc);
             next!(s)
         });
         // `o[k] = acc`: an array (`_nc`: known to be one), an int32 key
@@ -3569,7 +3747,7 @@ macro_rules! property_location {
         // helper (a typed array, through the runtime) reading it there too.
         stencil_slow!("set_keyed_", loc!($loc); |s| {
             let o = get!($loc, s);
-            let key = *at_imm(s.regs as *mut u8);
+            let key = load_imm(s.regs as *mut u8);
             if !is_array(s.tag, o) {
                 if is_cell(s.tag, o) && *(o.to_bits() as *const u8).add(8) == 7 {
                     slow!(s)
@@ -3595,7 +3773,7 @@ macro_rules! property_location {
             *(*(p.add(24) as *const *mut Value)).add(i as usize) = v;
             next!(s)
         }; |s| {
-            let key = *at_imm(s.regs as *mut u8);
+            let key = load_imm(s.regs as *mut u8);
             let args = [get!($loc, s), key, s.acc];
             let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
@@ -3681,11 +3859,11 @@ macro_rules! property_location {
         });
         // The receiver's shape is known to be the cached one: no guard.
         stencil!("get_own_nc_", loc!($loc); |s| {
-            s.acc = *at_imm(get!($loc, s).to_bits() as *mut u8);
+            s.acc = load_imm(get!($loc, s).to_bits() as *mut u8);
             next!(s)
         });
         stencil!("get_oop_nc_", loc!($loc); |s| {
-            s.acc = *at_imm(props(get!($loc, s).to_bits() as *mut u8));
+            s.acc = load_imm(props(get!($loc, s).to_bits() as *mut u8));
             next!(s)
         });
         stencil!("get_proto_nc_", loc!($loc); |s| {
@@ -3693,17 +3871,17 @@ macro_rules! property_location {
             next!(s)
         });
         stencil!("set_own_nc_", loc!($loc); |s| {
-            *at_imm(get!($loc, s).to_bits() as *mut u8) = s.acc;
+            store_imm(get!($loc, s).to_bits() as *mut u8, s.acc);
             next!(s)
         });
         stencil!("set_tr_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             *(o as *mut u64) = imm64b();
-            *at_imm(o) = s.acc;
+            store_imm(o, s.acc);
             next!(s)
         });
         stencil!("set_oop_nc_", loc!($loc); |s| {
-            *at_imm(props(get!($loc, s).to_bits() as *mut u8)) = s.acc;
+            store_imm(props(get!($loc, s).to_bits() as *mut u8), s.acc);
             next!(s)
         });
         // Elements at offset 24, length (u32) at 32. A hole is `EMPTY` (0).
@@ -3724,12 +3902,12 @@ macro_rules! property_location {
         // (An object's own element first, as the interpreter's
         // `op_set_keyed` stores it: see `own_element_store`.)
         stencil_slow!("set_keyed_rt_", loc!($loc); |s| {
-            if own_element_store(s.tag, get!($loc, s), *at_imm(s.regs as *mut u8), s.acc, false) {
+            if own_element_store(s.tag, get!($loc, s), load_imm(s.regs as *mut u8), s.acc, false) {
                 next!(s)
             }
             slow!(s)
         }; |s| {
-            let key = *at_imm(s.regs as *mut u8);
+            let key = load_imm(s.regs as *mut u8);
             let args = [get!($loc, s), key, s.acc];
             // Not merged with `set_keyed_`'s identical helper: each stencil
             // must keep its own.
@@ -3742,12 +3920,12 @@ macro_rules! property_location {
         });
         stencil_slow!("set_keyed_rt_i_", loc!($loc); |s| {
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
-            if own_element_store(s.tag, get!($loc, s), *at_imm(s.regs as *mut u8), v, true) {
+            if own_element_store(s.tag, get!($loc, s), load_imm(s.regs as *mut u8), v, true) {
                 next!(s)
             }
             slow!(s)
         }; |s| {
-            let key = *at_imm(s.regs as *mut u8);
+            let key = load_imm(s.regs as *mut u8);
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             let args = [get!($loc, s), key, v];
             let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
@@ -3949,7 +4127,7 @@ macro_rules! exit_unless_int32 {
 }
 
 stencil!("key_m"; |s| {
-    let k = *mem(s.regs);
+    let k = load_m(s.regs);
     exit_unless_int32!(s, k);
     set_key_x(int(k));
     next!(s)
@@ -4038,7 +4216,7 @@ const FUNC_OFF: usize = 80;
 unsafe fn upvalue_at(regs: *mut Value) -> *mut Value {
     unsafe {
         let f = *(regs.byte_sub(FUNC_OFF) as *const *mut u8);
-        *(*(at_imm(f) as *const *const *mut Value))
+        *(load_imm(f).to_bits() as *const *mut Value)
     }
 }
 
@@ -4070,7 +4248,7 @@ stencil!("lda_global"; |s| {
     if *(g as *const u64) != imm64() {
         exit!(s)
     }
-    s.acc = *at_imm(g);
+    s.acc = load_imm(g);
     next!(s)
 });
 stencil!("lda_global_oop"; |s| {
@@ -4078,7 +4256,7 @@ stencil!("lda_global_oop"; |s| {
     if *(g as *const u64) != imm64() {
         exit!(s)
     }
-    s.acc = *at_imm(props(g));
+    s.acc = load_imm(props(g));
     next!(s)
 });
 stencil!("sta_global"; |s| {
@@ -4086,7 +4264,7 @@ stencil!("sta_global"; |s| {
     if *(g as *const u64) != imm64() {
         exit!(s)
     }
-    *at_imm(g) = s.acc;
+    store_imm(g, s.acc);
     next!(s)
 });
 stencil!("sta_global_oop"; |s| {
@@ -4094,7 +4272,7 @@ stencil!("sta_global_oop"; |s| {
     if *(g as *const u64) != imm64() {
         exit!(s)
     }
-    *at_imm(props(g)) = s.acc;
+    store_imm(props(g), s.acc);
     next!(s)
 });
 
@@ -4320,7 +4498,7 @@ stencil!("construct_direct"; |s| {
 // In an exit stub: the register at `regs + reg hole` is `imm64` (a value
 // compiled code knew and didn't write; see `jit::Insn::exit_const`).
 stencil!("store_const_m"; |s| {
-    *mem(s.regs) = Value::from_bits(imm64());
+    store_m(s.regs, Value::from_bits(imm64_full()));
     next!(s)
 });
 
@@ -4337,7 +4515,7 @@ stencil!("tier_count"; |s| {
 });
 
 stencil!("guard_word"; |s| {
-    if *(imm64() as *const u64) != imm64b() {
+    if *(imm64() as *const u64) != imm64b_full() {
         exit!(s)
     }
     next!(s)
@@ -4346,7 +4524,7 @@ stencil!("guard_word"; |s| {
 // An inlined `new` whose object scalar replacement doesn't allocate: the
 // check `guard_word` makes, then `acc` = `undefined`.
 stencil!("ctor_check"; |s| {
-    if *(imm64() as *const u64) != imm64b() {
+    if *(imm64() as *const u64) != imm64b_full() {
         exit!(s)
     }
     s.acc = Value::UNDEFINED;

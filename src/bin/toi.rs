@@ -12,7 +12,10 @@ use std::process::ExitCode;
 
 extern "C" fn on_segv(_: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     unsafe {
+        #[cfg(target_os = "macos")]
         let addr = (*info).si_addr as usize;
+        #[cfg(not(target_os = "macos"))]
+        let addr = (*info).si_addr() as usize;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         let pc = (*(*(ctx as *mut libc::ucontext_t)).uc_mcontext).__ss.__pc as usize;
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

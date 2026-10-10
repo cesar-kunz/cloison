@@ -119,10 +119,6 @@ pub(crate) enum Sym {
     HoleImm64,
     /// A second one (an address, a transition's new shape).
     HoleImm64b,
-    /// The card table's bias (`heap::card_bias`), for the write barrier.
-    HoleCards,
-    /// The metadata's bias (`heap::meta_bias`), for the write barrier.
-    HoleMeta,
     HoleReg,
     Continue,
     JumpTarget,
@@ -5219,13 +5215,14 @@ fn stencil_for(
             cat!(sel.base, "_nc_", loc)
         }
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) => cat!(sel.base, "_", loc),
-        // Stores take a boxed `acc`.
+        // Stores take a boxed `acc`; a number's (`_n`) needs no barrier.
         ("set_own" | "set_oop" | "set_tr", _) => {
             box_acc(&mut pre);
+            let n = if matches!(st.acc, Ty::I32 | Ty::F64) { "_n" } else { "" };
             if sel.case == "nc" {
-                cat!(sel.base, "_nc_", loc)
+                cat!(sel.base, n, "_nc_", loc)
             } else {
-                cat!(sel.base, "_", loc)
+                cat!(sel.base, n, "_", loc)
             }
         }
         ("sta_global" | "sta_global_oop", _) => {
@@ -7081,7 +7078,7 @@ impl JitCode {
 
             let (pre, name) = stencil_for(insn, s, st, &homes, &boxed, return_spills);
             let name = if defer_shape[i] {
-                name.replacen("set_tr_nc_", "set_own_nc_", 1)
+                name.replacen("set_tr_nc_", "set_own_nc_", 1).replacen("set_tr_n_nc_", "set_own_n_nc_", 1)
             } else {
                 name
             };
@@ -7500,8 +7497,6 @@ impl JitCode {
                         v
                     }
                     Sym::HoleReg => p.reg as u64 * size_of::<Value>() as u64,
-                    Sym::HoleCards => crate::heap::card_bias() as u64,
-                    Sym::HoleMeta => crate::heap::meta_bias() as u64,
                     Sym::Continue => base + cont as u64,
                     Sym::JumpTarget => base + jump as u64,
                     Sym::Exit => base + exit_at[&(p.exit as usize)] as u64,

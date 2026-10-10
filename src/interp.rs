@@ -3252,7 +3252,13 @@ unsafe fn note_callee(regs: *mut Value, ic: *mut Ic, f: *mut Object) {
                 keep_callee(ic, old, f);
             }
             (*ic).holder = f;
-            (*frame_vm(regs)).heap.note(object_value(f));
+            // A Rust structure: its slot is a root of the next minor
+            // collection, logged once (an old callee replaced by a young
+            // one; a closure made per call replaces a young one each time).
+            let heap = &mut (*frame_vm(regs)).heap;
+            if heap.is_young(object_value(f)) && (old.is_null() || !heap.is_young(object_value(old))) {
+                heap.note_slot(&raw const (*ic).holder);
+            }
         }
     }
 }
@@ -3266,6 +3272,7 @@ unsafe fn keep_callee(ic: *mut Ic, old: *mut Object, new: *mut Object) {
             let w = &mut *ic.add(k);
             if w.holder == new {
                 w.holder = old;
+                log_ways(ic);
                 return;
             }
         }
@@ -3273,12 +3280,29 @@ unsafe fn keep_callee(ic: *mut Ic, old: *mut Object, new: *mut Object) {
             let w = &mut *ic.add(k);
             if w.holder.is_null() || w.holder == old {
                 w.holder = old;
+                log_ways(ic);
                 return;
             }
         }
         // Megamorphic: the oldest goes.
         std::ptr::copy(ic.add(2), ic.add(1), IC_WAYS - 2);
         (*ic.add(IC_WAYS - 1)).holder = old;
+        log_ways(ic);
+    }
+}
+
+/// Ways 1-3 of call cache `ic` changed: log their slots for the next minor
+/// collection (see `note_callee`).
+#[cold]
+unsafe fn log_ways(ic: *mut Ic) {
+    unsafe {
+        let heap = &mut (*current_vm()).heap;
+        for k in 1..IC_WAYS {
+            let h = (*ic.add(k)).holder;
+            if !h.is_null() && heap.is_young(object_value(h)) {
+                heap.note_slot(&raw const (*ic.add(k)).holder);
+            }
+        }
     }
 }
 

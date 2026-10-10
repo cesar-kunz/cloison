@@ -383,17 +383,33 @@ values in a `Vec` across `call_function` (`sort`, `map`, `filter`,
 
 Every store of a value into a cell, and of an array or upvalue pointer
 into an object, runs the barrier (`heap::barrier`, and `barrier` in the
-stencils, whose `toi_hole_meta` and `toi_hole_cards` operands hold the
-side tables' biases):
+stencils):
 
 ```text
-if v is a cell && meta[v] == YOUNG && meta[host] != YOUNG:
-    cards[address stored to >> 9] = 1
+if v is a cell && meta(v) == YOUNG && meta(host) != YOUNG:
+    card(address stored to) = 1
 ```
 
-A number store leaves at the first test; the stencils whose value is
-known to be a number (`set_keyed` with an int32 or a number) have no
-barrier at all. The first version marked the card unconditionally (two
+with `meta(a) = SIDE + (a >> 4)` and `card(a) = SIDE + (a >> 9)`: the
+shared reservation is placed (at 16 TiB) so both side tables hang off
+one constant, `SIDE` = 8 TiB, which arm64 builds in one `movz` and
+indexes with a shifted register; no operand is patched in. (macOS grants
+addresses asked for only from 8 TiB up, which rules out a zero `SIDE`.)
+A number store leaves at the first test, and the stencils whose value is
+known to be an int32 or a double have variants without the barrier
+(`set_own_n`, `set_keyed_nc_n`, …); booleans, `null` and `undefined`,
+which the JIT's types don't distinguish from cells, take the two tests.
+
+The barrier's first layout cost as much as its instructions: LLVM merges
+a stencil's tail calls into one `b toi_continue` that every early exit
+branched to, so a store of an old value took two branches. `build.rs`
+now aims every branch to an inner `b <symbol>` at the symbol itself,
+after which the stencil's exits are single branches to the next piece
+(it also shortened a few stencils that had nothing to do with the
+collector). On Richards, which allocates 40 MB and stores pointers
+constantly, the barrier cost 27% at first and 13% now; the
+microbenchmarks are 6% slower than without a collector, geomean, the
+store-heavy ones up to 30% (most of it storing booleans and `null`). The first version marked the card unconditionally (two
 instructions, no host or value needed) and it cost more than it saved:
 every initializing store dirtied a card, and as young cells are
 interleaved with old ones in reused blocks, nearly every card was dirty

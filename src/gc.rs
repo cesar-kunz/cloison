@@ -59,6 +59,9 @@ pub struct Gc {
     kept_set: crate::jit::HashSet<usize>,
     /// Cells stored into Rust structures since the last collection.
     log: Vec<usize>,
+    /// Slots of Rust structures (call caches) a young cell was stored in
+    /// since the last collection: what they hold then is a root.
+    log_slots: Vec<usize>,
     /// Bytes the current collection marked.
     marked: usize,
     /// The heap's blocks in use above which the next collection is full.
@@ -124,6 +127,14 @@ impl Heap {
         if self.is_young(v) {
             self.gc.log.push(v.to_bits() as usize);
         }
+    }
+
+    /// A young cell was stored in slot `slot` of a Rust structure that
+    /// full collections enumerate (a call cache): what it holds at the
+    /// next collection is a root of it.
+    #[inline]
+    pub fn note_slot(&mut self, slot: *const *mut Object) {
+        self.gc.log_slots.push(slot as usize);
     }
 
     /// A Rust structure refers to the cell at or around address `a` for
@@ -421,6 +432,7 @@ impl Vm {
             times[3] = lap();
         }
         self.heap.gc.log.clear();
+        self.heap.gc.log_slots.clear();
         self.heap.gc.count += 1;
         if self.heap.gc.stats {
             let (top, recycle, free, large) = self.heap.block_counts();
@@ -496,6 +508,10 @@ impl Vm {
             for i in 0..self.heap.gc.log.len() {
                 let a = self.heap.gc.log[i];
                 mark_interior(&mut self.heap, a, mode);
+            }
+            for i in 0..self.heap.gc.log_slots.len() {
+                let h = *(self.heap.gc.log_slots[i] as *const usize);
+                mark_value(&mut self.heap, Value::from_bits(h as u64), mode);
             }
         }
     }

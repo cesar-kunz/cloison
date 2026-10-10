@@ -247,6 +247,7 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
         match arch {
             "aarch64" => {
                 fold_arm64_stubs(&name, &mut code, &mut relocs);
+                retarget_arm64_jumps(&mut code, &mut relocs);
                 invert_arm64_branch_over_jump(&mut code, &mut relocs);
                 widen_arm64_tbz(&mut code, &mut relocs);
             }
@@ -360,8 +361,6 @@ fn emit(entries: &[Entry]) -> String {
                 "toi_hole_imm64" => "Sym::HoleImm64".to_string(),
                 "toi_hole_imm64b" => "Sym::HoleImm64b".to_string(),
                 "toi_hole_reg" => "Sym::HoleReg".to_string(),
-                "toi_hole_cards" => "Sym::HoleCards".to_string(),
-                "toi_hole_meta" => "Sym::HoleMeta".to_string(),
                 "toi_continue" => "Sym::Continue".to_string(),
                 "toi_jump_target" => "Sym::JumpTarget".to_string(),
                 "toi_exit" => "Sym::Exit".to_string(),
@@ -600,19 +599,11 @@ const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 /// `MOVW_UABS_G*`), so on macOS the stencils write each hole as a magic
 /// immediate `0xB0<hole><part>` (`hole16!` in `stencils/stencils.rs`):
 /// hole 1 `toi_hole_imm`, 2 `toi_hole_reg`, 3 `toi_hole_imm64`, 4
-/// `toi_hole_imm64b`, 5 `toi_hole_cards`, 6 `toi_hole_meta`; part 0–3 the
-/// 16 bits at `16 * part`. Record each as
+/// `toi_hole_imm64b`; part 0–3 the 16 bits at `16 * part`. Record each as
 /// the relocation it stands for and zero the field, so the code is what
 /// the ELF build extracts.
 fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
-    const HOLES: [&str; 6] = [
-        "toi_hole_imm",
-        "toi_hole_reg",
-        "toi_hole_imm64",
-        "toi_hole_imm64b",
-        "toi_hole_cards",
-        "toi_hole_meta",
-    ];
+    const HOLES: [&str; 4] = ["toi_hole_imm", "toi_hole_reg", "toi_hole_imm64", "toi_hole_imm64b"];
     const MOVW: [u32; 4] = [
         R_AARCH64_MOVW_UABS_G0_NC,
         R_AARCH64_MOVW_UABS_G1_NC,
@@ -623,7 +614,7 @@ fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
         let i = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
         let imm = (i >> 5) & 0xFFFF;
         let (hole, part) = ((imm >> 4) & 0xF, imm & 0xF);
-        if imm & 0xFF00 != 0xB000 || !(1..=6).contains(&hole) || part > 3 {
+        if imm & 0xFF00 != 0xB000 || !(1..=4).contains(&hole) || part > 3 {
             continue;
         }
         // `movz` or `movk`, 32- or 64-bit, shifted by the part.
@@ -720,6 +711,50 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         }
         code.truncate(n - 4);
         let _ = name;
+    }
+}
+
+/// LLVM merges a stencil's tail calls to one symbol into one `b <symbol>`
+/// that the other exits branch to, so an early exit (a barrier finding
+/// nothing to record, say) takes two branches. Aim every local branch to
+/// a `b <symbol>` at the symbol itself, with a relocation of its own
+/// (`invert_arm64_branch_over_jump` can then fold the `b` the fall-through
+/// path still takes).
+fn retarget_arm64_jumps(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
+    // Not the final `b`: the JIT drops it when the next piece follows, so
+    // branching to it is branching to that piece, and falling into it is
+    // free.
+    let last = code.len() - 4;
+    let stubs: Vec<(usize, String, i64)> = relocs
+        .iter()
+        .filter(|r| r.r_type == R_AARCH64_JUMP26 && !r.symbol.starts_with('@') && r.offset as usize != last)
+        .map(|r| (r.offset as usize, r.symbol.clone(), r.addend))
+        .collect();
+    for (y, symbol, addend) in stubs {
+        for at in (0..code.len()).step_by(4) {
+            if relocs.iter().any(|r| r.offset == at as u64) {
+                continue;
+            }
+            let Some((disp, mask, shift)) = local_branch(code, at) else {
+                continue;
+            };
+            if at as i64 + disp != y as i64 {
+                continue;
+            }
+            let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+            let r_type = match (mask, shift) {
+                (0x7FFFF, 5) => R_AARCH64_CONDBR19,
+                (0x3FFF, 5) => R_AARCH64_TSTBR14,
+                _ => R_AARCH64_JUMP26,
+            };
+            code[at..at + 4].copy_from_slice(&(i & !(mask << shift)).to_le_bytes());
+            relocs.push(Reloc {
+                offset: at as u64,
+                r_type,
+                symbol: symbol.clone(),
+                addend,
+            });
+        }
     }
 }
 

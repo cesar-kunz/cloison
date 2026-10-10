@@ -30,9 +30,14 @@
 //! are zero already): the `create_object` stencils write a header and
 //! leave the slots.
 //!
+//! The shared reservation sits where its side tables can be at a 16th and
+//! a 512th of its addresses past one constant ([`SIDE`]): a granule's
+//! metadata byte is at `SIDE + (addr >> 4)`, a card at `SIDE + (addr >>
+//! 9)`, and the barrier needs no operands.
+//!
 //! Compiled code allocates too, bumping `ptr` while it stays within `end`
-//! and writing the metadata byte at `meta_bias + (cell >> 4)`: they come
-//! first, in that order (see [`Heap::bump`]).
+//! and writing the metadata byte of the new cell: they come first, in that
+//! order (see [`Heap::bump`]).
 
 use crate::object::{Class, INLINE_BASE, Object, Shape, object_header};
 use crate::value::Value;
@@ -47,7 +52,9 @@ pub const CARD: usize = 512;
 /// Cells larger than this get blocks of their own.
 pub const LARGE: usize = 8 << 10;
 /// Address space all heaps share: room for 512 heaps of a [`SLICE`] each.
-/// Only reserved: no page is touched until committed.
+/// Only reserved (no page is touched until committed); from any of
+/// [`BASES`] it ends below 128 TiB, and its side tables stay between
+/// [`SIDE`] and the first base.
 const SPACE: usize = 16 << 40;
 /// Address space one heap may use (`TOI_HEAP_LIMIT`, in MiB, lowers it).
 const SLICE: usize = 32 << 30;
@@ -106,45 +113,56 @@ struct Space {
 }
 
 static SPACE_: std::sync::OnceLock<Space> = std::sync::OnceLock::new();
-static META_BIAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static CARD_BIAS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// `len` bytes of address space, aligned to `align`, inaccessible until
-/// committed.
-fn reserve(len: usize, align: usize) -> usize {
+/// `len` bytes of address space at `at`, inaccessible until committed,
+/// if they are free.
+fn reserve_at(at: usize, len: usize) -> bool {
     let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
-    let all = len + align;
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), all, libc::PROT_NONE, flags, -1, 0) };
-    assert!(p != libc::MAP_FAILED, "heap reservation failed");
-    let start = (p as usize).next_multiple_of(align);
-    unsafe {
-        if start > p as usize {
-            libc::munmap(p, start - p as usize);
-        }
-        let tail = p as usize + all - (start + len);
-        if tail > 0 {
-            libc::munmap((start + len) as *mut libc::c_void, tail);
-        }
+    let p = unsafe { libc::mmap(at as *mut libc::c_void, len, libc::PROT_NONE, flags, -1, 0) };
+    if p == libc::MAP_FAILED {
+        return false;
     }
-    start
+    if p as usize != at {
+        unsafe { libc::munmap(p, len) };
+        return false;
+    }
+    true
 }
+
+/// Where the side tables are, past their share of the reservation's
+/// addresses: a granule's metadata byte at `SIDE + addr / 16`, a card at
+/// `SIDE + addr / 512` (see [`meta`], [`card`]). One constant, which arm64
+/// builds in one instruction, so the barrier needs no operand. (macOS
+/// grants addresses asked for only from 8 TiB up.)
+pub const SIDE: usize = 1 << 43;
+
+/// Candidate addresses for the reservation (16, 32, 48, 64 TiB): above
+/// [`SIDE`] plus their side tables, all where Linux and macOS leave room.
+const BASES: [usize; 4] = [0x1000 << 32, 0x2000 << 32, 0x3000 << 32, 0x4000 << 32];
 
 fn space() -> &'static Space {
     SPACE_.get_or_init(|| {
-        let base = reserve(SPACE, CHUNK);
-        let meta = reserve(SPACE / GRANULE, PAGE);
-        let cards = reserve(SPACE / CARD, PAGE);
-        let meta_bias = meta.wrapping_sub(base / GRANULE);
-        assert!(meta_bias >> 48 == 0, "metadata below the heap's reservation / 16");
-        META_BIAS.store(meta_bias, std::sync::atomic::Ordering::Relaxed);
-        let card_bias = cards.wrapping_sub(base / CARD);
-        // Compiled code holds it in a 48-bit immediate.
-        assert!(card_bias >> 48 == 0, "card table below the heap's reservation / 512");
-        CARD_BIAS.store(card_bias, std::sync::atomic::Ordering::Relaxed);
-        Space {
-            base,
-            free: std::sync::Mutex::new((0..SPACE / SLICE).rev().collect()),
+        for base in BASES {
+            if !reserve_at(base, SPACE) {
+                continue;
+            }
+            if !reserve_at(SIDE + base / GRANULE, SPACE / GRANULE) {
+                unsafe { libc::munmap(base as *mut libc::c_void, SPACE) };
+                continue;
+            }
+            if !reserve_at(SIDE + base / CARD, SPACE / CARD) {
+                unsafe {
+                    libc::munmap(base as *mut libc::c_void, SPACE);
+                    libc::munmap((SIDE + base / GRANULE) as *mut libc::c_void, SPACE / GRANULE);
+                }
+                continue;
+            }
+            return Space {
+                base,
+                free: std::sync::Mutex::new((0..SPACE / SLICE).rev().collect()),
+            };
         }
+        panic!("no room for the heap's reservation at any of {BASES:x?}");
     })
 }
 
@@ -181,20 +199,13 @@ fn release(a: usize, len: usize) {
 /// The metadata byte of the granule at `a` (in a heap).
 #[inline(always)]
 pub fn meta(a: usize) -> *mut u8 {
-    META_BIAS.load(std::sync::atomic::Ordering::Relaxed).wrapping_add(a / GRANULE) as *mut u8
+    (SIDE + a / GRANULE) as *mut u8
 }
 
 /// The card byte of address `a` (in a heap).
 #[inline(always)]
 pub fn card(a: usize) -> *mut u8 {
-    CARD_BIAS.load(std::sync::atomic::Ordering::Relaxed).wrapping_add(a / CARD) as *mut u8
-}
-
-/// What compiled code adds to an address shifted right by 9 to get its
-/// card (see `toi_hole_cards` in the stencils).
-pub fn card_bias() -> usize {
-    space();
-    CARD_BIAS.load(std::sync::atomic::Ordering::Relaxed)
+    (SIDE + a / CARD) as *mut u8
 }
 
 /// Mark the card of `a`. A minor collection scans the old cells' words on
@@ -227,19 +238,11 @@ pub fn barrier_young<T>(host: *const u8, a: *const T) {
     }
 }
 
-/// What compiled code adds to an address shifted right by 4 to get its
-/// metadata byte (see `toi_hole_meta` in the stencils).
-pub fn meta_bias() -> usize {
-    space();
-    META_BIAS.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 #[repr(C)]
 pub struct Heap {
     // Read by compiled code (`Heap::bump`): keep first, in this order.
     ptr: *mut u8,
     end: *mut u8,
-    meta_bias: usize,
     /// Where the current hole started (allocations since are a region).
     hole: *mut u8,
     /// The slice's start, its index, and how much of it may be used.
@@ -305,7 +308,6 @@ impl Heap {
             gc,
             ptr: std::ptr::null_mut(),
             end: std::ptr::null_mut(),
-            meta_bias: META_BIAS.load(std::sync::atomic::Ordering::Relaxed),
             hole: std::ptr::null_mut(),
             base: s.base + slice * SLICE,
             slice,
@@ -323,8 +325,7 @@ impl Heap {
         }
     }
 
-    /// Where compiled code finds the free space: `ptr`, `end`, then the
-    /// metadata's bias (see the module docs).
+    /// Where compiled code finds the free space: `ptr`, then `end`.
     pub(crate) fn bump(&mut self) -> *mut [*mut u64; 2] {
         (&raw mut self.ptr).cast()
     }

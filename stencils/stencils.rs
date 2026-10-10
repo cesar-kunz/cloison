@@ -65,7 +65,7 @@
 //! to `acc`, boxed. Stencils reading an int32 `acc` use only its low 32
 //! bits, so a boxed int32 is a valid int32 `acc` too.
 
-#![feature(explicit_tail_calls, rust_preserve_none_cc)]
+#![feature(explicit_tail_calls, rust_preserve_none_cc, cold_path)]
 #![cfg_attr(target_arch = "x86_64", feature(asm_goto_with_outputs))]
 #![allow(incomplete_features, non_snake_case, unused_unsafe, clippy::missing_safety_doc)]
 
@@ -121,8 +121,6 @@ unsafe extern "C" {
     static toi_hole_imm: u8;
     static toi_hole_imm64: u8;
     static toi_hole_imm64b: u8;
-    static toi_hole_cards: u8;
-    static toi_hole_meta: u8;
     static toi_hole_reg: u8;
 
     // Runtime functions. Only ever reached through `rt_call!`, so only their
@@ -514,8 +512,6 @@ macro_rules! hole16 {
     ($part:literal, reg) => { concat!("#0xB02", $part) };
     ($part:literal, imm64) => { concat!("#0xB03", $part) };
     ($part:literal, imm64b) => { concat!("#0xB04", $part) };
-    ($part:literal, cards) => { concat!("#0xB05", $part) };
-    ($part:literal, meta) => { concat!("#0xB06", $part) };
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -569,8 +565,6 @@ fn imm64_u32() -> u64 {
 macro_rules! imm64_of {
     (toi_hole_imm64) => { imm64_of!(@parts imm64, toi_hole_imm64) };
     (toi_hole_imm64b) => { imm64_of!(@parts imm64b, toi_hole_imm64b) };
-    (toi_hole_cards) => { imm64_of!(@parts cards, toi_hole_cards) };
-    (toi_hole_meta) => { imm64_of!(@parts meta, toi_hole_meta) };
     (@parts $hole:ident, $sym:ident) => {{
         let k: u64;
         unsafe {
@@ -663,18 +657,20 @@ fn imm64b() -> u64 {
     imm64_of!(toi_hole_imm64b)
 }
 
-/// Mark the card of `a` (`heap::card_mark`). The card table's bias is a
-/// hole of its own.
+/// `heap::SIDE`: the side tables are at it plus an address shifted right
+/// (`heap`'s reservation is placed for that).
+const SIDE: usize = 1 << 43;
+
+/// Mark the card of `a` (`heap::card_mark`).
 #[inline(always)]
 unsafe fn card_mark<T>(a: *const T) {
-    unsafe { *((imm64_of!(toi_hole_cards) as usize).wrapping_add(a as usize >> 9) as *mut u8) = 1 };
+    unsafe { *((SIDE + (a as usize >> 9)) as *mut u8) = 1 };
 }
 
-/// The metadata byte of the granule at `a` (`heap::meta`), whose bias is
-/// a hole of its own.
+/// The metadata byte of the granule at `a` (`heap::meta`).
 #[inline(always)]
 unsafe fn meta_of(a: usize) -> u8 {
-    unsafe { *((imm64_of!(toi_hole_meta) as usize).wrapping_add(a >> 4) as *const u8) }
+    unsafe { *((SIDE + (a >> 4)) as *const u8) }
 }
 
 /// The write barrier (`heap::barrier`): `v` was stored at `a`, in the cell
@@ -684,6 +680,7 @@ unsafe fn meta_of(a: usize) -> u8 {
 unsafe fn barrier<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
     unsafe {
         if is_cell(tag, v) && v.to_bits() != 0 && meta_of(v.to_bits() as usize) == YOUNG && meta_of(host as usize) != YOUNG {
+            core::hint::cold_path();
             card_mark(a);
         }
     }
@@ -3528,13 +3525,11 @@ stencil!("lda_constant_f"; |s| {
 // (`create_object_<n>`, straight-line stores), then `create_object` with
 // the count in `imm`.
 
-/// `heap::Heap`'s first words: the free space's next byte and end, and
-/// the metadata's bias.
+/// `heap::Heap`'s first words: the free space's next byte and end.
 #[repr(C)]
 struct HeapPtrs {
     ptr: *mut u64,
     end: *mut u64,
-    meta_bias: usize,
 }
 
 /// `heap::YOUNG`: a new cell's metadata byte.
@@ -3551,7 +3546,7 @@ unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
             return None;
         }
         (*heap).ptr = p.add(words);
-        *(((*heap).meta_bias).wrapping_add(p as usize >> 4) as *mut u8) = YOUNG;
+        *((SIDE + (p as usize >> 4)) as *mut u8) = YOUNG;
         Some(p)
     }
 }
@@ -3817,6 +3812,23 @@ macro_rules! property_location {
             barrier(s.tag, o, o, s.acc);
             next!(s)
         });
+        // `_n`: `acc` is known to be a number, never a cell: no barrier.
+        stencil!("set_own_n_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            store_imm(o, s.acc);
+            next!(s)
+        });
+        stencil!("set_oop_n_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            store_imm(props(o), s.acc);
+            next!(s)
+        });
+        stencil!("set_tr_n_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            *(o as *mut u64) = imm64b();
+            store_imm(o, s.acc);
+            next!(s)
+        });
         // `o[k] = acc`: an array (`_nc`: known to be one), an int32 key
         // within its length, a value its shape's elements' type
         // (`Shape::elems_code`, at offset 0) fits; else leave before. `acc`
@@ -3968,6 +3980,20 @@ macro_rules! property_location {
             let p = props(get!($loc, s).to_bits() as *mut u8);
             store_imm(p, s.acc);
             barrier(s.tag, p.sub(8), p.offset(imm() as isize), s.acc);
+            next!(s)
+        });
+        stencil!("set_own_n_nc_", loc!($loc); |s| {
+            store_imm(get!($loc, s).to_bits() as *mut u8, s.acc);
+            next!(s)
+        });
+        stencil!("set_tr_n_nc_", loc!($loc); |s| {
+            let o = get!($loc, s).to_bits() as *mut u8;
+            *(o as *mut u64) = imm64b();
+            store_imm(o, s.acc);
+            next!(s)
+        });
+        stencil!("set_oop_n_nc_", loc!($loc); |s| {
+            store_imm(props(get!($loc, s).to_bits() as *mut u8), s.acc);
             next!(s)
         });
         // Elements at offset 24, length (u32) at 32. A hole is `EMPTY` (0).

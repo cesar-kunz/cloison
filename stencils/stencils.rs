@@ -4613,6 +4613,44 @@ stencil!("construct_direct"; |s| {
 // body assumes; else leave before the `new`.
 // In an exit stub: the register at `regs + reg hole` is `imm64` (a value
 // compiled code knew and didn't write; see `jit::Insn::exit_const`).
+// At an entry of compiled code: zero `imm` registers from byte `imm64`
+// of the frame, dead there (a register compiled code keeps elsewhere, an
+// inlined frame's), whose words would otherwise hold whatever an earlier
+// frame left: the collector scans them, and a stale pointer keeps what it
+// reaches alive (Splay's removed nodes, each pointing at the next).
+stencil!("clear_m"; |s| {
+    let p = (s.regs as *mut u8).add(imm64() as usize) as *mut u64;
+    let n = imm() as usize;
+    // Two words a store (`stp xzr, xzr`). Volatile: not a call to
+    // `memset`, which a stencil can't make.
+    let mut k = 0;
+    while k + 2 <= n {
+        p.add(k).cast::<u128>().write_volatile(0);
+        k += 2;
+    }
+    if k < n {
+        p.add(k).write_volatile(0);
+    }
+    next!(s)
+});
+// Jump if the words at `imm64` and `imm64b` differ (at an entry: whether
+// a collection ran since the code last zeroed its dead registers).
+stencil!("words_jne"; |s| {
+    if *(imm64() as *const u64) != *(imm64b() as *const u64) {
+        jump!(s)
+    }
+    next!(s)
+});
+// Copy the word at `imm64` to `imm64b`.
+stencil!("copy_word"; |s| {
+    *(imm64b() as *mut u64) = *(imm64() as *const u64);
+    next!(s)
+});
+// `clear_m` for one register (at `regs + reg hole`): one `str xzr`.
+stencil!("zero_m"; |s| {
+    store_m(s.regs, Value::EMPTY);
+    next!(s)
+});
 stencil!("store_const_m"; |s| {
     store_m(s.regs, Value::from_bits(imm64_full()));
     next!(s)

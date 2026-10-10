@@ -70,6 +70,8 @@ pub struct Gc {
     always_full: bool,
     /// Bytes allocated between minor collections (`TOI_GC_NURSERY`, MiB).
     nursery: usize,
+    /// Print what each kind of root reaches (`TOI_GC_ROOTS`).
+    roots_report: bool,
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
     /// (`TOI_GC_CHECK_BARRIER`, slow).
@@ -88,6 +90,7 @@ impl Gc {
             stats: env("TOI_GC_STATS"),
             always_full: env("TOI_GC_FULL"),
             check_barriers: env("TOI_GC_CHECK_BARRIER"),
+            roots_report: env("TOI_GC_ROOTS"),
             nursery: std::env::var("TOI_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -464,6 +467,22 @@ impl Vm {
         }
     }
 
+    /// Debugging (`TOI_GC_ROOTS`): trace what the roots marked so far
+    /// reach, and print how many cells that was, for root kind `what`.
+    unsafe fn roots_report(&mut self, what: &str, mode: Mode) {
+        if !self.heap.gc.roots_report {
+            return;
+        }
+        let mut n = 0;
+        unsafe {
+            while let Some(p) = self.heap.gc.stack.pop() {
+                trace(&mut self.heap, p, mode, 0, usize::MAX);
+                n += 1;
+            }
+        }
+        eprintln!("  roots {what}: {n} cells");
+    }
+
     /// Mark the roots every collection has.
     unsafe fn mark_roots(&mut self, sp: usize, regs: *mut Value, mode: Mode) {
         unsafe {
@@ -481,11 +500,13 @@ impl Vm {
                     mark_interior(&mut self.heap, w, mode);
                 }
             }
+            self.roots_report("native stack", mode);
             // The VM stack, to the end of the deepest frame there may be.
             let top = (top + 8 * self.max_frame).clamp(stack, stack_end);
             for a in (stack..top).step_by(8) {
                 mark_exact(&mut self.heap, *(a as *const usize), mode);
             }
+            self.roots_report(&format!("vm stack ({} words)", (top - stack) / 8), mode);
             let (args, n) = self.pending_args;
             if !args.is_null() {
                 for i in 0..n {
@@ -496,6 +517,7 @@ impl Vm {
             for v in self.named_roots() {
                 mark_value(&mut self.heap, v, mode);
             }
+            self.roots_report("named", mode);
             for i in 0..self.handles.len() {
                 let v = self.handles[i];
                 mark_value(&mut self.heap, v, mode);
@@ -513,6 +535,7 @@ impl Vm {
                 let h = *(self.heap.gc.log_slots[i] as *const usize);
                 mark_value(&mut self.heap, Value::from_bits(h as u64), mode);
             }
+            self.roots_report("handles, upvalues, log", mode);
         }
     }
 
@@ -525,6 +548,7 @@ impl Vm {
                 let a = self.heap.gc.kept[i];
                 mark_interior(&mut self.heap, a, mode);
             }
+            self.roots_report("kept", mode);
             for s in self.shapes() {
                 mark_value(&mut *heap, s.proto, mode);
             }
@@ -550,6 +574,7 @@ impl Vm {
             for v in self.string_constants() {
                 mark_value(&mut *heap, v, mode);
             }
+            self.roots_report("shapes, code, strings", mode);
         }
     }
 }

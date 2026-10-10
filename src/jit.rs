@@ -6856,6 +6856,62 @@ impl JitCode {
             &load_at_entry,
             feedback.is_none(),
         );
+        // In a VM frame, the registers dead at entry are zeroed: their words
+        // hold what an earlier frame there left (an inlined frame's, one
+        // the code keeps in a machine register), which the collector would
+        // take for references; one left for long can keep growing garbage
+        // alive (Splay's removed nodes, each pointing at the next). Only
+        // once per collection (a cold stub, run when the collection count
+        // differs from the one the code last zeroed at): a word stale for
+        // one collection keeps garbage alive for one cycle, and code that
+        // is entered constantly (Richards' tasks) would otherwise pay at
+        // every entry.
+        let mut entry_seq = entry_seq;
+        let mut clear = Vec::new();
+        let cur = crate::interp::current_vm();
+        if feedback.is_some() && !cur.is_null() {
+            // (Not `this`, which the caller of a `new` frame reads after.)
+            let mut r = 1;
+            while r < nregs {
+                if live_at_entry[r] || load_at_entry[r] {
+                    r += 1;
+                    continue;
+                }
+                let start = r;
+                while r < nregs && !live_at_entry[r] && !load_at_entry[r] {
+                    r += 1;
+                }
+                if r - start <= 4 {
+                    clear.extend((start..r).map(|k| Piece::new("zero_m", k as u8)));
+                } else {
+                    clear.push(Piece {
+                        imm: (r - start) as i32,
+                        imm64: 8 * start as u64,
+                        ..Piece::new("clear_m", 0)
+                    });
+                }
+            }
+        }
+        if !clear.is_empty() {
+            let count = unsafe { &raw const (*cur).heap.gc.count } as u64;
+            let last = Box::leak(Box::new(u64::MAX)) as *mut u64 as u64;
+            clear.push(Piece {
+                imm64: count,
+                imm64b: last,
+                cont: Target::AfterPiece(hot.len() as u32),
+                ..Piece::new("copy_word", 0)
+            });
+            stubs.push(clear);
+            entry_seq.insert(
+                0,
+                Piece {
+                    imm64: count,
+                    imm64b: last,
+                    jump: Target::Stub(stubs.len() as u32 - 1),
+                    ..Piece::new("words_jne", 0)
+                },
+            );
+        }
         let has_entry_seq = !entry_seq.is_empty();
         hot.extend(ending_at(entry_seq, Target::Label(entry as u32)));
         let entry_len = hot.len();

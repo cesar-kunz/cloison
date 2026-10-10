@@ -1,8 +1,9 @@
 # The garbage collector
 
-Status: in progress, 2026-10-10. Steps 1 to 4 of the plan below are
-implemented (`src/heap.rs`, `src/gc.rs`): minor and stop-the-world full
-collections; the old generation is not marked concurrently yet. This revision replaces the first one (a parallel copying
+Status: in progress, 2026-10-10. Steps 1 to 5 of the plan below are
+implemented (`src/heap.rs`, `src/gc.rs`): minor collections, and major
+ones marked and swept by a second thread between two short pauses
+(`TOI_GC_STW` keeps the stop-the-world full collection). This revision replaces the first one (a parallel copying
 nursery with precise roots), whose two premises implementation showed
 false: see "Why not a copying nursery". Supersedes the collector parts of
 `docs/object-model.md` (its escape analysis and compact layouts stand).
@@ -444,39 +445,59 @@ of stencils, which writes `$v`, was one.
 
 ### The major collection
 
-Concurrent, with two pauses (CMS's and JSC's pattern):
+Concurrent, with two short pauses, the marker thread doing the rest
+(`gc::Marker`):
 
 1. **Start pause**: advance the current color, so every old cell is
-   unmarked; mark the roots (all four kinds above) and push them; record
-   that marking is on; start the collector thread.
-2. **Concurrent mark**: the collector pops cells, marks their unmarked
-   old referents (a byte store of the color and the `END` byte) and pushes
-   them. Young referents are left for the final pause. Old cells
-   allocated meanwhile are none: allocation makes young cells, and a
-   minor collection during marking marks its survivors with the current
-   color, which the marker treats as marked, and pushes their old
-   referents. Stores during marking dirty cards as always; a minor
-   collection clears the cards it scans, so it first copies the dirty
-   card set into the *mod-union* set that marking keeps. A preclean pass
-   of the collector rescans dirty cards while the mutator runs, so few
-   are left for the pause.
-3. **Final pause**: a minor collection (which marks the young survivors
-   and their old referents), a rescan of the roots, a rescan of the cards
-   dirtied since marking started (the mod-union set and the card table),
-   drain the queue. Then marking is off.
-4. **Concurrent sweep**: for each block, clear the bytes of cells marked
-   with an older color (dead), count the free granules; a block with no
-   live cell goes back to the free blocks and its memory to the system.
-   Large cells unmarked are freed. Sweeping must finish before the next
-   start pause (two colors live at most, three exist so a sweep can lag).
-   The allocator sweeps a block itself if it reaches one first.
+   unmarked, and run a minor collection that *shades* as it goes: every
+   old cell its roots, its survivors and its dirty cards refer to is
+   marked and handed to the marker instead of traced. The Rust
+   structures' references are shaded too. Survivors are marked with the
+   new color, so they count as marked for the cycle.
+2. **Concurrent mark**: the marker pops cells, marks their unmarked old
+   referents (a byte store of the color; the `END` byte when it traces
+   one) and pushes them; young referents are left for the final pause.
+   The mutator's barrier compares a stored value's metadata with the
+   heap's current color, kept in the metadata byte of the first granule
+   of the heap's slice (a block of no cells): outside a cycle that is
+   "the value is young"; during one it also catches an old cell not
+   marked yet, so the store's card is dirty whichever kind it was. Minor
+   collections meanwhile pause the marker, shade the old cells their
+   survivors and dirty cards refer to (the cards are cleaned after, so
+   what they recorded goes to the marker), and resume it. When it runs
+   out of work it sets the heap's request flag.
+3. **Final pause**: mark everything not marked yet, from the roots, the
+   Rust structures, the dirty cards (old cells stored into since they
+   were traced) and the marker's leftover work, young cells included.
+   On Splay it takes 2.5 ms; marking in one pause took 30 ms there. If
+   the heap outgrows twice its trigger before the marker is done, the
+   final pause runs anyway and the mutator finishes the marking.
+4. **Concurrent sweep**: the marker thread sweeps the small blocks from
+   their metadata (the dead cells' bytes cleared, live bytes counted)
+   and hands them back: blocks with room to allocation, empty ones to the
+   free blocks, their memory to the system. Allocation meanwhile takes
+   free and new blocks and the swept ones as they come, and sweeps a few
+   blocks itself rather than take a new one while the sweeper is behind
+   (JSC's sweep-to-allocate). While sweeping, a dead old cell still has
+   the old color, so minor collections trace only old cells of the
+   current one. The next cycle finishes the sweep first. Large cells are
+   swept in the final pause.
+
+`TOI_GC_STW` marks and sweeps full collections in one pause instead;
+`TOI_GC_CYCLES` runs cycles back to back, and with `TOI_GC_VERIFY` each
+final pause also walks every root again in one pass and panics on a
+reachable cell the concurrent marking left unmarked.
 
 Correctness of concurrent marking rests on four facts: nothing moves;
 every word of a cell is a valid value or a header at every instant (the
 mutator writes whole words, and growth writes the new array before the
-pointer to it); an array's capacity is in the array, so a marker never
-pairs an old pointer with a new capacity; and every store into a cell
-dirties its card, which the final pause rescans.
+pointer to it, the pointer's store dirtying the card); an array's
+capacity is in the array, so a marker never pairs an old pointer with a
+new capacity; and every store of a cell not marked with the current
+color into an old cell dirties its card, which the final pause rescans.
+The marker reads cells and `Code::upvalues` (immutable once loaded) and
+writes only old cells' metadata, which the mutator writes only in
+pauses.
 
 ### Pacing
 
@@ -571,9 +592,34 @@ runs) and the microbenchmarks.
    (4 ms), and its full collections mark 1.3 million cells (33 ms). Richards,
    which allocates 40 MB in all, is the barrier's cost: on arm64 each one
    builds two 48-bit table biases (six instructions) before its two loads.
-5. **Concurrent marking and sweeping.** The collector thread, the two
-   pauses, the mod-union cards and precleaning. Target: the mutator's
-   share of wall time above 90% on all of Octane.
+5. **Concurrent marking and sweeping** (done). One marker thread, the
+   two pauses of "The major collection", minor collections during marking
+   shading their survivors, cards dirtied during marking rescanned in the
+   final pause (no mod-union table or precleaning: the final pause stayed
+   short without them), sweeping by the marker thread with the mutator
+   sweeping the blocks it needs first. The barrier compares against one
+   color byte per slice instead of building table biases. Pauses in ms
+   (largest; `TOI_GC_STW` for the stop-the-world column):
+
+   | benchmark | full (STW) | start | final | minor |
+   |---|---:|---:|---:|---:|
+   | Splay | 63.8 | 7.0 | 6.7 | 9.0 |
+   | TypeScript | 49.9 | 15.9 | 1.1 | 16.2 |
+   | EarleyBoyer | | 1.8 | 0.2 | 2.7 |
+   | pdfjs | | 1.1 | 0.7 | 1.1 |
+
+   Octane (seconds, peak RSS): Richards 1.85 s, 41 MB; DeltaBlue 1.06 s,
+   65 MB; Crypto 5.59 s, 49 MB; RayTrace 10.20 s, 57 MB; EarleyBoyer
+   29.9 s, 127 MB; RegExp 18.4 s, 76 MB; Splay 4.45 s, 911 MB;
+   NavierStokes 7.13 s, 11 MB; pdfjs 2.60 s, 330 MB; GBEmu 1.36 s,
+   114 MB; code-load 2.76 s, 513 MB; Box2D 1.73 s, 91 MB; TypeScript
+   4.36 s, 469 MB. Splay's peak grows from 636 MB stop-the-world to
+   911 MB: what dies while the marker runs floats until the next cycle,
+   and allocation continues meanwhile; the headroom policy is step 6's.
+   The start pause is a minor collection that also shades old cells the
+   young ones refer to, so it costs what a minor collection costs; the
+   nursery's survivors (Splay's 220,000 a collection, TypeScript's
+   200,000) are the remaining pause, and the age bit of step 6 the remedy.
 6. **Tuning**: the nursery size, the headroom, more marker threads, an
    age bit, and evacuation of fragmented blocks if measurement shows
    fragmentation costs memory (moving only cells no conservative word

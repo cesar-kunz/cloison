@@ -693,8 +693,11 @@ runs) and the microbenchmarks.
      it (old cells' references go all over the heap, each read a cache
      miss). cards.js's longest pause 26 ms -> 16 ms, its collection share
      28% -> 19%; fragmentation.js 24% -> 17%, 23 ms -> 15 ms (16 entries:
-     19 ms; 64: no better than 32). Octane unchanged. Not kept: prefetching
-     the dirty cards' own words a few cards ahead (no change), skipping
+     19 ms; 64: no better than 32). Octane unchanged. Not kept: the same
+     ring for what traced cells refer to (splay.js 18% -> 21%: a cell's
+     references are mostly near it, their metadata in cache already),
+     prefetching the dirty cards' own words a few cards ahead (no change),
+     skipping
      references into blocks the nursery did not allocate in (the nursery
      fills holes in thousands of recycled blocks, so few are skipped),
      subtracting the sweep's holes from the headroom (fragmentation.js

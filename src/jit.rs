@@ -8286,6 +8286,8 @@ impl CallSite {
 
     fn bind(&mut self, code: Rc<JitCode>, nregs: usize) {
         self.entry = code.entry_addr();
+        // (The version's own frame: it zeroes its dead registers at entry.)
+        let nregs = nregs.max(code.homes.len());
         self.end_off = 8 * (self.frame + nregs + interp::HEADER) as u64;
         // The code bound before may be running: a direct call into it is
         // on the native stack below this rebinding (a pending site bound
@@ -11690,6 +11692,22 @@ impl Lowering<'_> {
     }
 }
 
+/// `found` (a version, the accumulator for it, the register count), if
+/// the version's frame, its inlined frames' registers included, fits the
+/// VM stack from `regs`: its entry zeroes the registers dead there and
+/// its inlined calls write theirs, unchecked. Checked at every entry,
+/// with the version's own count: entered near the end of the stack
+/// (unbounded recursion), the zeroing wrote past it, into the next
+/// allocation (another VM's stack, in the tests run in parallel).
+fn fits_stack(
+    found: (Rc<JitCode>, Value, usize),
+    regs: *mut Value,
+    stack_end: *mut Value,
+) -> Option<(Rc<JitCode>, Value, usize)> {
+    let words = found.0.homes.len().max(found.2) + interp::HEADER;
+    (regs.wrapping_add(words) <= stack_end).then_some(found)
+}
+
 impl JitFunction {
     /// Prepare `code`, to start in the interpreter and tier up with the
     /// default [`Tiering`]. Panics on malformed bytecode.
@@ -11820,7 +11838,7 @@ impl JitFunction {
                 && vm.field_epoch == field_epoch
                 && let Some(found) = unsafe { self.fitting_version(pc, acc, regs) }
             {
-                return Some(found);
+                return fits_stack(found, regs, stack_end);
             }
             let vm = self.vm.as_mut().unwrap();
             if vm.no_entry.contains(&pc) || self.stats.compiles >= max_compiles(vm.root_len) {
@@ -11847,7 +11865,11 @@ impl JitFunction {
         let regs = unsafe { std::slice::from_raw_parts_mut(regs, self.nregs) };
         let actual = self.entry_types(entry, acc, regs);
         let index = self.version(entry, &actual, &mut acc, regs);
-        Some((self.versions[&entry][index].1.clone(), acc, self.nregs))
+        fits_stack(
+            (self.versions[&entry][index].1.clone(), acc, self.nregs),
+            regs.as_mut_ptr(),
+            stack_end,
+        )
     }
 
     /// Lower the function again ([`lower`]); if that gives something else,

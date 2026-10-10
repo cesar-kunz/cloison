@@ -1,9 +1,10 @@
 # The garbage collector
 
-Status: in progress, 2026-10-10. Steps 1 to 5 of the plan below are
-implemented (`src/heap.rs`, `src/gc.rs`): minor collections, and major
-ones marked and swept by a second thread between two short pauses
-(`TOI_GC_STW` keeps the stop-the-world full collection). This revision replaces the first one (a parallel copying
+Status: 2026-10-10. Steps 1 to 6 of the plan below are implemented in
+`src/heap.rs` and `src/gc.rs` (step 7 is later work): minor collections,
+and major ones marked and swept by a second thread between two short
+pauses (`TOI_GC_STW` keeps the stop-the-world full collection).
+This revision replaces the first one (a parallel copying
 nursery with precise roots), whose two premises implementation showed
 false: see "Why not a copying nursery". Supersedes the collector parts of
 `docs/object-model.md` (its escape analysis and compact layouts stand).
@@ -623,7 +624,7 @@ runs) and the microbenchmarks.
    young ones refer to, so it costs what a minor collection costs; the
    nursery's survivors (Splay's 220,000 a collection, TypeScript's
    200,000) are the remaining pause, and the age bit of step 6 the remedy.
-6. **Tuning**: the nursery size, the headroom, more marker threads, an
+6. **Tuning** (done): the nursery size, the headroom, more marker threads, an
    age bit, and evacuation of fragmented blocks if measurement shows
    fragmentation costs memory (moving only cells no conservative word
    and no Rust structure refers to).
@@ -643,6 +644,29 @@ runs) and the microbenchmarks.
      promoted the room's bytes since the last one. Splay 14 cycles -> 20,
      peak RSS 760-820 MB -> 646-659 MB at the same speed (4.0-4.2 s);
      nothing else changes.
+   - *Nursery size* (kept at 32 MiB): at 16 MiB RayTrace 11.5 s and
+     EarleyBoyer 31.1 s (pauses halve); at 64 MiB they gain 2-3% while
+     TypeScript's largest pause doubles to 31 ms and Splay's peak grows
+     to 810 MB.
+   - *Not done, not warranted by measurement*: more marker threads (the
+     marker finishes well inside a cycle: the lead is under a third of the
+     room), an age bit (EarleyBoyer, the most promoting benchmark, spends
+     2% collecting; Splay's survivors are long-lived and an age bit would
+     mark them twice), and evacuation. Splay's fragmentation comes from
+     deleting random nodes, so any placement pins blocks; evacuating
+     would need the concurrent marker to record slots into candidate
+     blocks and pin what conservative words and compiled code refer to,
+     for one benchmark's memory (still a seventh of no collector's).
+
+   Octane after step 6 (seconds, peak RSS): Richards 1.86 s, 41 MB;
+   DeltaBlue 1.09 s, 64 MB; Crypto 5.60 s, 49 MB; RayTrace 10.85 s,
+   57 MB; EarleyBoyer 29.9 s, 140 MB; RegExp 18.5 s, 77 MB; Splay 4.14 s,
+   657 MB; NavierStokes 7.92 s, 11 MB; pdfjs 2.61 s, 330 MB; GBEmu
+   1.37 s, 115 MB; code-load 2.75 s, 512 MB; Box2D 1.73 s, 90 MB;
+   TypeScript 4.34 s, 486 MB. The collector's share of wall time is under
+   3% everywhere but Splay (19%). `bench/micro` runs 6.5% slower
+   (geomean) than with no collector: barriers, safepoints and
+   once-per-collection register clearing.
    - *Prefetching* (done): marked cells pass through an eight-entry ring
      between the stack and tracing, prefetched on entering it. Splay's
      minor tracing 626 ms -> 450 ms, its collection share 23% -> 19.5%

@@ -164,10 +164,10 @@ targets.
 ## Where it falls short
 
 - **The collector's minor pauses grow with the nursery's survivors**
-  (up to 16 ms on TypeScript, 9 ms on Splay; major pauses stay under
-  16 ms as a second thread marks and sweeps), and concurrent marking lets
-  garbage float (Splay peaks at 911 MB). An age bit and headroom tuning
-  are next in `docs/gc.md`.
+  (up to 16 ms on TypeScript, 8 ms on Splay; major pauses stay under
+  16 ms as a second thread marks and sweeps), Splay spends 19% of its
+  time collecting, and it never moves a cell, so randomly dying cells
+  fragment its blocks (Splay peaks at 657 MB for 120 MB live).
 - **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
   template literals, strict mode or array holes. Correctness is checked
   against Node on about 100 programs and Octane, not against test262.

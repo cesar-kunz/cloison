@@ -58,7 +58,7 @@
 
 use crate::bytecode::Op;
 use crate::interp::{self, Frame, Run};
-use crate::object::{Atom, FieldType, Object, Shape};
+use crate::object::{Atom, FieldType, Object, PAGE, Shape};
 use crate::value::{NumberTag, Value};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
@@ -1247,6 +1247,16 @@ mod arch {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn flush_icache(mem: *const u8, len: usize) {
+        // The system's own cache maintenance (libkern/OSCacheControl.h).
+        unsafe extern "C" {
+            fn sys_icache_invalidate(start: *const core::ffi::c_void, len: usize);
+        }
+        unsafe { sys_icache_invalidate(mem.cast(), len) }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn flush_icache(mem: *const u8, len: usize) {
         // Clean the data cache to the point of unification, then invalidate
         // the instruction cache, line by line (CTR_EL0 gives line sizes).
@@ -1317,7 +1327,7 @@ impl ExecMem {
         let len = len.max(1);
         let mut range = EXEC_RANGE.lock().unwrap();
         let offset = range.2 + code_shift();
-        let pages = (offset + len).next_multiple_of(4096);
+        let pages = (offset + len).next_multiple_of(PAGE);
         if range.1 - range.0 < pages {
             let size = EXEC_RESERVE.max(pages);
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
@@ -1345,7 +1355,7 @@ impl ExecMem {
     /// The pages: their start and length.
     fn pages(&self) -> (*mut u8, usize) {
         let start = unsafe { self.ptr.sub(self.offset) };
-        (start, (self.offset + self.len).next_multiple_of(4096))
+        (start, (self.offset + self.len).next_multiple_of(PAGE))
     }
 
     fn seal(&mut self) {
@@ -12620,7 +12630,14 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
     )
 }
 
+/// The arm64 `toi_rt_enter`, with the too-deep branch and a stub for it
+/// as the OS needs: Linux branches to `toi_rt_call` directly (ELF
+/// `CONDBR19`); Mach-O can't relocate a conditional branch to another
+/// function, so there it goes through a local `b` placed after the cold
+/// tail. The hot path is the same on both.
 #[cfg(target_arch = "aarch64")]
+macro_rules! toi_rt_enter_arm64 {
+    ($too_deep:literal $(, $stub:literal)*) => {
 #[unsafe(naked)]
 extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
     core::arch::naked_asm!(
@@ -12629,7 +12646,7 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "ldr x9, [x9]",
         "mov x10, sp",
         "cmp x10, x9",
-        "b.lo {call}",
+        $too_deep,
         "stp x29, x30, [sp, #-192]!",
         "mov x29, sp",
         "stp x19, x20, [sp, #16]",
@@ -12678,6 +12695,7 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "ldp x0, x1, [sp, #160]",
         "bl {exit}",
         "b 2b",
+        $($stub,)*
         limit = const std::mem::offset_of!(CallSite, native_limit),
         call = sym toi_rt_call,
         flags = const 8 * interp::FLAGS,
@@ -12687,6 +12705,12 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         exit = sym toi_direct_exit,
     )
 }
+    };
+}
+#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+toi_rt_enter_arm64!("b.lo {call}");
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+toi_rt_enter_arm64!("b.lo 4f", "4:", "b {call}");
 
 /// What the inline version of [`toi_rt_enter`] in a region's wrapper for
 /// it (`arch::enter_wrapper`) needs: `CallSite` offsets, constants and

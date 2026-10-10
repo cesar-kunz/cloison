@@ -85,14 +85,21 @@ fn main() {
 /// Compile the stencils into the object file `obj_path`, with `extra`
 /// codegen options; returns its bytes.
 fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]) -> Vec<u8> {
-    let status = Command::new(rustc)
-        .args([
-            "--edition=2024",
-            "--crate-type=lib",
-            "--crate-name=toi_stencils",
-        ])
-        .args(["-Copt-level=3", "-Cpanic=abort", "-Ccodegen-units=1"])
-        .args(["-Crelocation-model=static", "-Ccode-model=small"])
+    let mut cmd = Command::new(rustc);
+    cmd.args([
+        "--edition=2024",
+        "--crate-type=lib",
+        "--crate-name=toi_stencils",
+    ])
+    .args(["-Copt-level=3", "-Cpanic=abort", "-Ccodegen-units=1"])
+    .args(["-Crelocation-model=static", "-Ccode-model=small"]);
+    // Darwin's default CPU is the host's (`apple-m1`), whose scheduling
+    // model orders instructions differently; `generic` is Linux's default,
+    // so the stencils come out the same bytes on both.
+    if target.contains("apple") {
+        cmd.arg("-Ctarget-cpu=generic");
+    }
+    let status = cmd
         .args(extra)
         .args(["--target", target])
         .arg(format!("--emit=obj={}", obj_path.display()))
@@ -121,11 +128,38 @@ fn ends_with_continue(e: &Extracted) -> bool {
 /// relocations, after this target's rewrites.
 fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
     let file = object::File::parse(data).expect("stencil object");
+    // Mach-O (macOS) symbol names carry a leading underscore.
+    let macho = file.format() == object::BinaryFormat::MachO;
+    fn plain(macho: bool, n: &str) -> &str {
+        if macho { n.strip_prefix('_').unwrap_or(n) } else { n }
+    }
 
-    let mut symbols: Vec<_> = file
+    let text: Vec<_> = file
         .symbols()
         .filter(|s| s.kind() == SymbolKind::Text && s.is_definition())
-        .filter_map(|s| Some((s.name().ok()?.strip_prefix(PREFIX)?.to_owned(), s)))
+        .collect();
+    // Mach-O symbols have no size: a function ends where the next one in
+    // its section starts.
+    let mut starts: Vec<(usize, u64)> = text
+        .iter()
+        .map(|s| (s.section_index().unwrap().0, s.address()))
+        .collect();
+    starts.sort_unstable();
+    let end_of = |sym: &object::Symbol| -> u64 {
+        if sym.size() != 0 {
+            return sym.address() + sym.size();
+        }
+        let sec = sym.section_index().unwrap();
+        starts
+            .iter()
+            .find(|&&(s, a)| s == sec.0 && a > sym.address())
+            .map(|&(_, a)| a)
+            .unwrap_or_else(|| file.section_by_index(sec).unwrap().size())
+    };
+
+    let mut symbols: Vec<_> = text
+        .iter()
+        .filter_map(|s| Some((plain(macho, s.name().ok()?).strip_prefix(PREFIX)?.to_owned(), s)))
         .collect();
     symbols.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -134,7 +168,7 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
         let section = file.section_by_index(sym.section_index().unwrap()).unwrap();
         // In a relocatable object, a symbol's address is its section offset.
         let start = sym.address();
-        let end = start + sym.size();
+        let end = end_of(sym);
         let section_data = section.data().unwrap();
         let code = &section_data[start as usize..end as usize];
 
@@ -143,14 +177,24 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
             if offset < start || offset >= end {
                 continue;
             }
-            let RelocationFlags::Elf { r_type } = reloc.flags() else {
-                panic!("{name}: non-ELF relocation");
+            let r_type = match reloc.flags() {
+                RelocationFlags::Elf { r_type } => r_type.0,
+                // Mach-O has one type for `b` and `bl`, which ELF tells
+                // apart (and the JIT patches alike).
+                RelocationFlags::MachO { r_type, r_pcrel: true, r_length: 2 }
+                    if arch == "aarch64" && r_type.0 == object::macho::ARM64_RELOC_BRANCH26.0 =>
+                {
+                    let at = (offset - start) as usize;
+                    let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+                    if i >> 31 == 1 { R_AARCH64_CALL26 } else { R_AARCH64_JUMP26 }
+                }
+                _ => panic!("{name}: unsupported relocation kind at {offset:#x}"),
             };
             let RelocationTarget::Symbol(idx) = reloc.target() else {
                 panic!("{name}: relocation at {offset:#x} has no symbol target");
             };
             let target = file.symbol_by_index(idx).unwrap();
-            let target_name = target.name().unwrap();
+            let target_name = plain(macho, target.name().unwrap());
             // Only holes, continuations, runtime functions and the stencil's
             // own `__slow` helper may be referenced. Anything else (rodata,
             // panics, section-relative references) would need copying data
@@ -164,12 +208,11 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
             assert!(
                 allowed,
                 "stencil {name}: unsupported relocation to `{target_name}` \
-                 (type {}) at {offset:#x}; stencils must stay self-contained",
-                r_type.0
+                 (type {r_type}) at {offset:#x}; stencils must stay self-contained"
             );
             relocs.push(Reloc {
                 offset: offset - start,
-                r_type: r_type.0,
+                r_type,
                 symbol: if target_name.starts_with(PREFIX) {
                     "@slow".into()
                 } else {
@@ -180,6 +223,9 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
         }
 
         let mut code = code.to_vec();
+        if macho && arch == "aarch64" {
+            macho_holes(&name, &mut code, &mut relocs);
+        }
         match arch {
             "aarch64" => {
                 fold_arm64_stubs(&name, &mut code, &mut relocs);
@@ -515,9 +561,53 @@ struct Reloc {
     addend: i64,
 }
 
+const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264;
+const R_AARCH64_MOVW_UABS_G1_NC: u32 = 266;
+const R_AARCH64_MOVW_UABS_G2_NC: u32 = 268;
+const R_AARCH64_MOVW_UABS_G3: u32 = 269;
 const R_AARCH64_TSTBR14: u32 = 279;
 const R_AARCH64_CONDBR19: u32 = 280;
 const R_AARCH64_JUMP26: u32 = 282;
+const R_AARCH64_CALL26: u32 = 283;
+
+/// Mach-O has no relocation for a `movz`/`movk` immediate field (ELF's
+/// `MOVW_UABS_G*`), so on macOS the stencils write each hole as a magic
+/// immediate `0xB0<hole><part>` (`hole16!` in `stencils/stencils.rs`):
+/// hole 1 `toi_hole_imm`, 2 `toi_hole_reg`, 3 `toi_hole_imm64`, 4
+/// `toi_hole_imm64b`; part 0–3 the 16 bits at `16 * part`. Record each as
+/// the relocation it stands for and zero the field, so the code is what
+/// the ELF build extracts.
+fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
+    const HOLES: [&str; 4] = ["toi_hole_imm", "toi_hole_reg", "toi_hole_imm64", "toi_hole_imm64b"];
+    const MOVW: [u32; 4] = [
+        R_AARCH64_MOVW_UABS_G0_NC,
+        R_AARCH64_MOVW_UABS_G1_NC,
+        R_AARCH64_MOVW_UABS_G2_NC,
+        R_AARCH64_MOVW_UABS_G3,
+    ];
+    for off in (0..code.len()).step_by(4) {
+        let i = u32::from_le_bytes(code[off..off + 4].try_into().unwrap());
+        let imm = (i >> 5) & 0xFFFF;
+        let (hole, part) = ((imm >> 4) & 0xF, imm & 0xF);
+        if imm & 0xFF00 != 0xB000 || !(1..=4).contains(&hole) || part > 3 {
+            continue;
+        }
+        // `movz` or `movk`, 32- or 64-bit, shifted by the part.
+        let movw = matches!(i & 0x7F80_0000, 0x5280_0000 | 0x7280_0000);
+        assert!(
+            movw && (i >> 21) & 3 == part,
+            "stencil {name}: {i:#010x} at {off:#x} has a hole's magic immediate \
+             but isn't a movz/movk of part {part}"
+        );
+        relocs.push(Reloc {
+            offset: off as u64,
+            r_type: MOVW[part as usize],
+            symbol: HOLES[hole as usize - 1].into(),
+            addend: 0,
+        });
+        code[off..off + 4].copy_from_slice(&(i & !(0xFFFF << 5)).to_le_bytes());
+    }
+}
 
 /// AArch64 has no conditional tail call. For `if slow { become helper(..) }`
 /// LLVM emits a conditional branch to a local stub, `b.cc stub`, and puts

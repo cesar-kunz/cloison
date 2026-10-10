@@ -1,7 +1,7 @@
 # toi
 
 A JavaScript engine in Rust: an ES5 front end, a register bytecode
-interpreter, and a copy-and-patch JIT for x86-64 and arm64 Linux that
+interpreter, and a copy-and-patch JIT for x86-64 and arm64 (Linux, and macOS on Apple silicon) that
 grows into a mid-tier optimizing compiler without an IR beyond bytecode.
 
 ```sh
@@ -105,21 +105,37 @@ Environment flags: `TOI_NO_JIT`, `TOI_TIER=<back edges>`, `TOI_TIME`,
 
 ## Building
 
-Linux only, nightly Rust (`rust-toolchain.toml`). The JIT needs three
-unstable features: `explicit_tail_calls`, `rust_preserve_none_cc` and
-`asm_goto_with_outputs`. Host builds are static and not
-position-independent (`.cargo/config.toml`), which is where the startup
-time comes from. arm64 builds cross-compile to musl and run under
-`qemu-aarch64`.
+Nightly Rust (`rust-toolchain.toml`). The JIT needs three unstable
+features: `explicit_tail_calls`, `rust_preserve_none_cc` and
+`asm_goto_with_outputs`.
 
-The build does not work on macOS: the stencils' runtime-call asm uses
-x18, which Apple reserves, and `build.rs` reads ELF only.
+- **Linux**, x86-64 and arm64, is the reference. Host builds are static
+  and not position-independent (`.cargo/config.toml`), which is where the
+  startup time comes from. arm64 builds cross-compile to musl and run
+  under `qemu-aarch64`.
+- **macOS on Apple silicon** builds and runs natively. The stencils come
+  out byte for byte the same as Linux's: `build.rs` reads Mach-O, the
+  holes that ELF expresses as `movz`/`movk` relocations (which Mach-O
+  lacks) are written as magic immediates that `build.rs` turns back into
+  those relocations, and the stencils compile for the `generic` CPU as on
+  Linux (the Darwin default schedules for the host's). The one stencil
+  that differs, `construct_direct`, swaps two independent instructions
+  before a runtime call, because Darwin reserves x18 and LLVM allocates
+  from one register fewer. Pages are 16 KiB there. Intel Macs are not
+  supported (x86-64 Mach-O has no 32-bit absolute relocation for the
+  immediate holes).
+- The platform's `libm` shows: `Math.tan(1)`, `asin` and `acos` differ
+  from Node's values in the last bit on macOS, so `cargo test --test
+  octane` fails its math script there. V8 ships its own fdlibm port for
+  this reason.
 
 Because `build.rs` extracts stencils from LLVM's machine code and then
 rewrites branches in it, the stencil pipeline depends on LLVM's codegen
 choices. A nightly bump can change stencil shapes; the
 `every_stencil_instance_matches_its_compiled_bytes` test and
-`scripts/stencils-asm.sh` are the checks.
+`scripts/stencils-asm.sh` are the checks, and the generated
+`stencils.rs` (in `target/*/build/toi-*/out/`) can be diffed between
+targets.
 
 ## Where it falls short
 
@@ -130,7 +146,7 @@ choices. A nightly bump can change stencil shapes; the
 - **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
   template literals, strict mode or array holes. Correctness is checked
   against Node on about 100 programs and Octane, not against test262.
-- **Linux and nightly only**, as above.
+- **Nightly only**, and Linux is the reference; macOS runs on Apple silicon only.
 - **Safety.** Around 560 `unsafe` sites, a raw-pointer object model, no
   fuzzing; a heap sandbox is deferred by design.
 - **Compile-time churn** on large programs: TypeScript, pdfjs and

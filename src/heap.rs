@@ -833,8 +833,17 @@ impl Heap {
         let mut cells = 0;
         let mut hist: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
         let hist_on = std::env::var_os("TOI_HEAP_HIST").is_some();
+        // Small blocks by the share of them old cells fill, in tenths.
+        let mut fill = [0usize; 11];
+        let mut block = (0, 0);
         for (start, end) in self.block_ranges() {
             let large = end - start == GRANULE;
+            if hist_on && !large && start & !(BLOCK - 1) != block.0 {
+                if block.0 != 0 {
+                    fill[block.1 * 10 / BLOCK] += 1;
+                }
+                block = (start & !(BLOCK - 1), 0);
+            }
             let mut p = start;
             while p < end {
                 let m = unsafe { *self.meta(p) };
@@ -854,6 +863,9 @@ impl Heap {
                 } else if n > GRANULE {
                     assert_eq!(last, 0, "young cell at {p:#x} overlaps one");
                 }
+                if hist_on && !large && m & COLOR != 0 {
+                    block.1 += n;
+                }
                 if hist_on {
                     let w = unsafe { *(p as *const u64) };
                     let k = if w & 1 == 0 {
@@ -868,6 +880,12 @@ impl Heap {
                 p += n;
                 cells += 1;
             }
+        }
+        if block.0 != 0 {
+            fill[block.1 * 10 / BLOCK] += 1;
+        }
+        if hist_on {
+            eprintln!("small blocks by old cells' fill, tenths: {fill:?}");
         }
         if !hist.is_empty() {
             let mut v: Vec<_> = hist.into_iter().collect();

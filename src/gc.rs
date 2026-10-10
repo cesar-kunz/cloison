@@ -312,8 +312,26 @@ impl Marking<'_> {
     /// (the marker, asked to pause), leaving the rest on the stack.
     unsafe fn drain(&mut self, stop: &dyn Fn() -> bool) -> usize {
         let mut n = 0;
+        // Cells pass through a small ring between the stack and tracing,
+        // prefetched as they enter it: by the time one is traced its
+        // header has had `RING - 1` other cells' time to arrive.
+        const RING: usize = 8;
+        let mut ring = [0usize; RING];
+        let (mut head, mut len) = (0, 0);
         unsafe {
-            while let Some(p) = self.stack.pop() {
+            loop {
+                while len < RING {
+                    let Some(p) = self.stack.pop() else { break };
+                    prefetch(p);
+                    ring[(head + len) % RING] = p;
+                    len += 1;
+                }
+                if len == 0 {
+                    break;
+                }
+                let p = ring[head];
+                head = (head + 1) % RING;
+                len -= 1;
                 let size = cell_size(p as *const u8);
                 *crate::heap::meta(p + size - GRANULE) |= END;
                 self.marked += size;
@@ -322,6 +340,10 @@ impl Marking<'_> {
                 if n % 256 == 0 && stop() {
                     break;
                 }
+            }
+            // Stopped early: what the ring holds goes back on the stack.
+            for i in 0..len {
+                self.stack.push(ring[(head + i) % RING]);
             }
         }
         n
@@ -336,6 +358,19 @@ impl Marking<'_> {
             unsafe { self.cell(w) };
             self.mode.check = check;
         }
+    }
+}
+
+/// Ask for the cache line at `p`.
+#[inline(always)]
+fn prefetch(p: usize) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
     }
 }
 

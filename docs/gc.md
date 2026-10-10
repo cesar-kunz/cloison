@@ -740,6 +740,21 @@ runs) and the microbenchmarks.
      check counts work by slots. fragmentation.js's longest pause
      19.8-26.1 ms -> 8.3-10.0 ms over five runs each; nothing else
      changes.
+   - *Survivors traced on several threads* (done): a pause (minor, start
+     or final) traces on one thread until it has traced 16,384 cells,
+     then on up to `TOI_GC_THREADS` (`Marking::drain_parallel`): each
+     from its own stack, claiming cells as card scanning does, handing
+     half its stack to a shared queue when another thread has run out
+     (from 16 cells: a tree traced depth first keeps a stack about as
+     deep as the tree, so a threshold on the stack's size never fired on
+     Splay's), done when all are out of work; an array's slices stay with
+     the thread that has them. The switch is by work done: at 2,048 cells
+     DeltaBlue's minor collections (2,900 cells) paid for threads,
+     1.8% -> 2.7% of its time collecting. splay.js's minor trace phase
+     5.99 ms -> 1.99 ms on four threads (8: 1.90); collecting 21% ->
+     10.7%; survivors.js 38% -> 27%; Splay 19.6% -> 12.8% (4.23 s ->
+     3.80 s), longest pause 10 -> 4.5 ms; TypeScript's longest pauses 15
+     -> 8.4 ms; the rest of Octane unchanged.
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

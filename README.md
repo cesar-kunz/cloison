@@ -127,7 +127,7 @@ checking references and poisoning what is freed), `TOI_GC_STRESS`
 (collect at every safepoint), `TOI_GC_FULL` (every collection full),
 `TOI_GC_STW` (full collections stop the world, no marker thread),
 `TOI_GC_CYCLES` (major cycles back to back),
-`TOI_GC_THREADS` (threads scanning dirty cards; 1 for none),
+`TOI_GC_THREADS` (threads a pause scans cards and traces with; 1 for none),
 `TOI_GC_CHECK_BARRIER` (find missed barriers), `TOI_HEAP_HIST` (cells by
 kind and size), `TOI_SEGV` (a backtrace on a crash). `gc-bench.sh` times
 Octane's deterministic runs with their peak RSS. `gc-micro.sh` runs
@@ -166,11 +166,12 @@ targets.
 
 ## Where it falls short
 
-- **The collector's minor pauses grow with the nursery's survivors**
-  (up to 15 ms on TypeScript, 6 ms on Splay; major pauses stay under
-  16 ms as a second thread marks and sweeps), Splay spends 19% of its
-  time collecting, and it never moves a cell, so randomly dying cells
-  fragment its blocks (Splay peaks at 657 MB for 120 MB live).
+- **The collector's pauses grow with the nursery's survivors**, though
+  pauses trace and scan cards on several threads (up to 8 ms on
+  TypeScript, 4.5 ms on Splay; a second thread marks and sweeps the old
+  generation), Splay spends 12% of its time collecting, and it never
+  moves a cell, so randomly dying cells fragment its blocks (Splay peaks
+  at 657 MB for 120 MB live).
 - **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
   template literals, strict mode or array holes. Correctness is checked
   against Node on about 100 programs and Octane, not against test262.

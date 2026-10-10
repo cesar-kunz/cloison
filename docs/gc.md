@@ -687,10 +687,22 @@ runs) and the microbenchmarks.
      | splay.js | 3.7 | 471 | 172 | 19% | 17 ms | Splay: survivors, 2.7x live, a 12 ms final pause |
 
      Card scanning dominates the longest pauses in all but splay.js,
-     whose final pause retraces about 670,000 cells. Each is a target
-     for later work: scanning a card's young-pointing slots only (a
-     remembered set of slots for large cells), evacuating fragmented
-     blocks, and retracing less at the final pause.
+     whose final pause retraces about 670,000 cells.
+   - *Card references prefetched* (done): the references on dirty cards
+     pass through a 32-entry ring, their metadata prefetched on entering
+     it (old cells' references go all over the heap, each read a cache
+     miss). cards.js's longest pause 26 ms -> 16 ms, its collection share
+     28% -> 19%; fragmentation.js 24% -> 17%, 23 ms -> 15 ms (16 entries:
+     19 ms; 64: no better than 32). Octane unchanged. Not kept: prefetching
+     the dirty cards' own words a few cards ahead (no change), skipping
+     references into blocks the nursery did not allocate in (the nursery
+     fills holes in thousands of recycled blocks, so few are skipped),
+     subtracting the sweep's holes from the headroom (fragmentation.js
+     777 -> 695 MB, but half of Splay's runs 80 MB higher: cycles start
+     only once the holes are used up, so the lead lands in new blocks),
+     and 128-byte holes (cards.js 758 -> 576 MB, fragmentation.js 696 ->
+     594 MB, but RayTrace and Splay 6-7% slower with no gain on Octane's
+     memory).
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

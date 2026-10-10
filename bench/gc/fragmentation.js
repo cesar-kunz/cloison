@@ -4,7 +4,7 @@
 // gc: the replaced records die one by one all over the old generation,
 // and a collector that never moves a cell leaves its blocks partly full,
 // so the heap peaks at 4.6 times what is live (Splay's peak). The stores
-// into the table dirty all of its cards, so minor pauses reach 20 ms.
+// into the table dirty all of its cards, so minor pauses reach 13 ms.
 // features: loop, call, object, new, array
 // expect: 54233
 

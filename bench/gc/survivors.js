@@ -3,8 +3,8 @@
 // collection before it dies, already promoted.
 // gc: every minor collection traces and promotes nearly all of its 32 MiB
 // nursery (about 420,000 cells, 4-5 ms), and the records then die old, so
-// the major cycles run back to back: 13% of the time collecting for a
-// live set that fits in the nursery.
+// the major cycles run back to back: over a third of the time collecting
+// for a live set that fits in the nursery.
 // features: loop, call, object, new, array
 // expect: 978931
 

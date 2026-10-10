@@ -2805,6 +2805,45 @@ macro_rules! group2_generic {
             next!(s)
         });
 
+        // `r % acc`: on int32s with a positive divisor the remainder
+        // takes the dividend's sign, and is -0 (a double) when it is zero
+        // and the dividend negative. `mod_ii` exits there and for a zero
+        // or negative divisor; once it has, `mod_iif` gives a double.
+        stencil_slow!("mod_", loc!($loc); |s| {
+            let l = get!($loc, s);
+            if s.tag.both_int32(l, s.acc) && int(l) >= 0 && int(s.acc) > 0 {
+                s.acc = s.tag.box_i32(int(l) % int(s.acc));
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let l = get!($loc, s);
+            s.acc = rt_mod!(s, l, s.acc);
+            next!(s)
+        });
+        stencil!("mod_ii_", loc!($loc); |s| {
+            let (l, d) = (int(get!($loc, s)), int(s.acc));
+            if d <= 0 {
+                exit!(s)
+            }
+            let r = l % d;
+            if r == 0 && l < 0 {
+                exit!(s)
+            }
+            s.acc = unboxed(r);
+            next!(s)
+        });
+        // (A zero divisor exits too: its NaN would be a float constant, a
+        // load from `.rodata`.)
+        stencil!("mod_iif_", loc!($loc); |s| {
+            let (l, d) = (int(get!($loc, s)), int(s.acc));
+            if d == 0 {
+                exit!(s)
+            }
+            s.facc = rem_f64(l.wrapping_rem(d), l);
+            next!(s)
+        });
+
         rel_int32!(loc!($loc), |s| int(get!($loc, s)));
         rel_generic!("test_rel_", loc!($loc), test, |s| get!($loc, s));
         rel_generic!("jrel_", loc!($loc), jt, |s| get!($loc, s));

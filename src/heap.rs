@@ -108,6 +108,9 @@ enum Block {
     /// The first of a large cell's `n` blocks.
     LargeHead(u32),
     LargeTail,
+    /// The slice's first block: no cells; the metadata byte of its first
+    /// granule is the heap's current color (see [`barrier`]).
+    Header,
 }
 
 /// The reservation all heaps share, and its side tables.
@@ -222,16 +225,30 @@ pub fn card_mark<T>(a: *const T) {
     unsafe { *card(a as usize) = 1 };
 }
 
-/// The write barrier: `v` was stored at `a`, in the cell at `host`. Only a
-/// reference from an old cell to a young one needs recording, for the
-/// next minor collection: its card is marked.
+/// The write barrier: `v` was stored at `a`, in the cell at `host`. A
+/// reference from an old cell to one that isn't marked with the heap's
+/// current color is recorded, by marking the card of `a`: outside a
+/// marking cycle, a young cell (the next minor collection must find it);
+/// during one, also an old cell not marked yet (the marker may have traced
+/// `host` already). The current color is the metadata byte of the heap's
+/// slice's first granule ([`color_byte`]).
 #[inline(always)]
 pub fn barrier<T>(host: *const u8, a: *const T, v: Value) {
     unsafe {
-        if v.is_cell() && *meta(v.to_bits() as usize) == YOUNG && *meta(host as usize) != YOUNG {
+        if v.is_cell()
+            && *meta(v.to_bits() as usize) & (YOUNG | COLOR) != *color_byte(host as usize)
+            && *meta(host as usize) != YOUNG
+        {
             card_mark(a);
         }
     }
+}
+
+/// The byte holding the current color of the heap address `a` is in: the
+/// metadata of its slice's first granule (a block of no cells).
+#[inline(always)]
+pub fn color_byte(a: usize) -> *mut u8 {
+    meta(a & !(SLICE - 1))
 }
 
 /// The write barrier for a store at `a`, in the cell at `host`, of a
@@ -274,8 +291,9 @@ pub struct Heap {
     used: usize,
     /// Bytes handed out after which the next collection is requested.
     budget: usize,
-    /// A collection is due at the next safepoint (`Vm::safepoint`).
-    pub(crate) requested: bool,
+    /// A collection is due at the next safepoint (`Vm::safepoint`); the
+    /// marker thread sets it too, for the final pause.
+    pub(crate) requested: std::sync::atomic::AtomicBool,
     /// The color the latest collection marked with (`COLOR`).
     pub(crate) color: u8,
     /// Since the last collection: holes taken, holes too small for the
@@ -292,6 +310,8 @@ impl Default for Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
+        // The marker thread first: it reads the heap.
+        self.gc.marker = None;
         decommit(self.base, self.committed);
         space().free.lock().unwrap().push(self.slice);
     }
@@ -309,10 +329,10 @@ impl Heap {
         let slice = s.free.lock().unwrap().pop();
         let slice = slice.unwrap_or_else(|| panic!("more than {} heaps alive at once", SPACE / SLICE));
         let gc = crate::gc::Gc::new();
-        Heap {
+        let mut heap = Heap {
             budget: gc.budget(),
             holes: [0; 3],
-            requested: false,
+            requested: std::sync::atomic::AtomicBool::new(false),
             color: 1,
             gc,
             ptr: std::ptr::null_mut(),
@@ -331,7 +351,18 @@ impl Heap {
             regions: Vec::new(),
             since: 0,
             used: 0,
-        }
+        };
+        // The header block, and the current color in it.
+        let b = heap.fresh_blocks(1);
+        heap.blocks[b] = Block::Header;
+        heap.set_color(1);
+        heap
+    }
+
+    /// Make `c` the heap's current color (see [`barrier`]).
+    pub(crate) fn set_color(&mut self, c: u8) {
+        self.color = c;
+        unsafe { *color_byte(self.base) = c };
     }
 
     /// Where compiled code finds the free space: `ptr`, then `end`.
@@ -342,7 +373,8 @@ impl Heap {
     /// Whether `a` is an address in the heap.
     #[inline(always)]
     pub fn contains(&self, a: usize) -> bool {
-        a.wrapping_sub(self.base) < self.top * BLOCK
+        // (Not the header block: its color byte would read as a cell's.)
+        a.wrapping_sub(self.base + BLOCK) < self.top.saturating_sub(1) * BLOCK
     }
 
     /// The metadata byte of the granule at `a` (in the heap).
@@ -385,6 +417,14 @@ impl Heap {
                 self.cursor_end = self.cursor + BLOCK;
                 continue;
             }
+            // Blocks the marker thread swept since: allocate in those, or
+            // sweep some here before taking a new one.
+            if self.gc.sweeping {
+                self.absorb_sweep();
+                if !self.recycle.is_empty() || (self.free.is_empty() && self.help_sweep()) {
+                    continue;
+                }
+            }
             let b = match self.free.pop() {
                 Some(b) => {
                     self.clean(b as usize, 1);
@@ -402,7 +442,7 @@ impl Heap {
         self.end = e as *mut u8;
         self.since += e - s;
         if self.since >= self.budget {
-            self.requested = true;
+            self.requested.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.alloc(bytes)
     }
@@ -477,6 +517,11 @@ impl Heap {
     /// after `budget` bytes.
     pub(crate) fn collected(&mut self, budget: usize, full: bool) {
         self.end_region();
+        // The current hole's unused end is room too.
+        let tail = (self.end as usize).saturating_sub(self.ptr as usize);
+        if tail > 0 {
+            self.regions.push((self.ptr as usize, self.end as usize));
+        }
         if !full {
             // Once each: a block a second time would be allocated in again
             // over cells it holds since (holes of one block need not be
@@ -513,7 +558,18 @@ impl Heap {
         self.cursor_end = 0;
         self.since = 0;
         self.budget = budget;
-        self.requested = false;
+        self.requested.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Bytes handed out since the last collection.
+    pub(crate) fn since(&self) -> usize {
+        self.since
+    }
+
+    /// Where cells may be: from the block after the header to the end of
+    /// the last handed out.
+    pub(crate) fn cells_range(&self) -> (usize, usize) {
+        (self.base + BLOCK, self.base + self.top * BLOCK)
     }
 
     /// The heap's address range: from its first block to the end of the
@@ -531,12 +587,23 @@ impl Heap {
     /// (with their free bytes), those with room (see [`RECYCLE`]), and free
     /// those at `empty`, giving their memory back to the system.
     pub(crate) fn reset_blocks(&mut self, partly: &[(usize, usize)], empty: &[usize]) {
-        self.recycle = (partly.iter().rev())
-            .filter(|&&(_, free)| free >= RECYCLE)
-            .map(|&(a, _)| ((a - self.base) / BLOCK) as u32)
-            .collect();
+        self.recycle.clear();
+        self.add_swept(partly, empty);
+    }
+
+    /// Blocks a sweep found: allocate in those at `partly` again (with
+    /// their free bytes) if they have room (see [`RECYCLE`]), and free
+    /// those at `empty`, giving their memory back to the system.
+    pub(crate) fn add_swept(&mut self, partly: &[(usize, usize)], empty: &[usize]) {
+        self.recycle.extend(
+            (partly.iter().rev())
+                .filter(|&&(_, free)| free >= RECYCLE)
+                .map(|&(a, _)| ((a - self.base) / BLOCK) as u32),
+        );
+        let mut empty = empty.to_vec();
+        empty.sort_unstable();
         let mut run: Option<(usize, usize)> = None;
-        for &a in empty {
+        for &a in &empty {
             let b = (a - self.base) / BLOCK;
             self.blocks[b] = Block::Free;
             self.free.push(b as u32);
@@ -578,7 +645,7 @@ impl Heap {
             match k {
                 Block::Small => v.push((a, a + BLOCK)),
                 Block::LargeHead(_) => v.push((a, a + GRANULE)),
-                Block::LargeTail | Block::Free => {}
+                Block::LargeTail | Block::Free | Block::Header => {}
             }
         }
         v
@@ -590,7 +657,7 @@ impl Heap {
     pub(crate) fn cell_start_before(&self, a: usize) -> Option<usize> {
         let mut b = (a - self.base) / BLOCK;
         match *self.blocks.get(b)? {
-            Block::Free => None,
+            Block::Free | Block::Header => None,
             Block::Small => {
                 let block = self.base + b * BLOCK;
                 let g = a & !(GRANULE - 1);
@@ -637,7 +704,7 @@ impl Heap {
         self.since += n * BLOCK;
         self.used += n * BLOCK;
         if self.since >= self.budget {
-            self.requested = true;
+            self.requested.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         unsafe { *meta(p as usize) = YOUNG };
         p

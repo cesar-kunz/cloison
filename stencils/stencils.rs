@@ -673,13 +673,22 @@ unsafe fn meta_of(a: usize) -> u8 {
     unsafe { *((SIDE + (a >> 4)) as *const u8) }
 }
 
+/// `heap::SLICE`: a heap's address space, aligned to it; the metadata of
+/// its first granule is the heap's current color (`heap::color_byte`).
+const SLICE: usize = 32 << 30;
+
 /// The write barrier (`heap::barrier`): `v` was stored at `a`, in the cell
-/// at `host`; a reference from an old cell to a young one (`heap::YOUNG`)
-/// marks the card of `a`.
+/// at `host`; a reference from an old cell to one not marked with the
+/// heap's current color (young, `heap::YOUNG`, or not marked yet during a
+/// marking cycle) marks the card of `a`.
 #[inline(always)]
 unsafe fn barrier<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
     unsafe {
-        if is_cell(tag, v) && v.to_bits() != 0 && meta_of(v.to_bits() as usize) == YOUNG && meta_of(host as usize) != YOUNG {
+        if is_cell(tag, v)
+            && v.to_bits() != 0
+            && meta_of(v.to_bits() as usize) & (YOUNG | 3) != meta_of(host as usize & !(SLICE - 1))
+            && meta_of(host as usize) != YOUNG
+        {
             core::hint::cold_path();
             card_mark(a);
         }

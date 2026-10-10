@@ -125,6 +125,8 @@ Environment flags: `TOI_NO_JIT`, `TOI_TIER=<back edges>`, `TOI_TIME`,
 `TOI_HEAP_LIMIT` (MiB), `TOI_GC_VERIFY=<KiB>` (collect that often,
 checking references and poisoning what is freed), `TOI_GC_STRESS`
 (collect at every safepoint), `TOI_GC_FULL` (every collection full),
+`TOI_GC_STW` (full collections stop the world, no marker thread),
+`TOI_GC_CYCLES` (major cycles back to back),
 `TOI_GC_CHECK_BARRIER` (find missed barriers), `TOI_HEAP_HIST` (cells by
 kind and size), `TOI_SEGV` (a backtrace on a crash). `gc-bench.sh` times
 Octane's deterministic runs with their peak RSS.
@@ -161,9 +163,10 @@ targets.
 
 ## Where it falls short
 
-- **The collector stops the world for full collections** (Splay spends
-  1.7 s of 5.4 collecting), and its write barrier costs up to 27% on
-  store-heavy code (Richards). Concurrent marking and a cheaper barrier
+- **The collector's minor pauses grow with the nursery's survivors**
+  (up to 16 ms on TypeScript, 9 ms on Splay; major pauses stay under
+  16 ms as a second thread marks and sweeps), and concurrent marking lets
+  garbage float (Splay peaks at 911 MB). An age bit and headroom tuning
   are next in `docs/gc.md`.
 - **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
   template literals, strict mode or array holes. Correctness is checked

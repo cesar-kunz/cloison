@@ -2488,6 +2488,7 @@ impl Vm {
         let r = unsafe { crate::interp::run_script(self, code) };
         if outer {
             self.heap.gc.stack_base = 0;
+            self.pause_marker();
         }
         r
     }

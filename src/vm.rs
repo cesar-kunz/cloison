@@ -2144,7 +2144,17 @@ impl Vm {
         regs: *mut Value,
         current: *const Object,
     ) -> Value {
-        let callee = code.closures[i as usize];
+        self.closure_of(code.closures[i as usize], regs, current)
+    }
+
+    /// A new closure of `callee` in frame `regs` of function `current`
+    /// (see [`Vm::create_closure_in`]).
+    pub(crate) fn closure_of(
+        &mut self,
+        callee: *const Code,
+        regs: *mut Value,
+        current: *const Object,
+    ) -> Value {
         unsafe {
             let shape = &*self.function_shape;
             let ups = &(*callee).upvalues;

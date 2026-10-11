@@ -589,16 +589,9 @@ impl<'a> Matcher<'a> {
                     && (0..n).all(|d| self.eq(s[i + d], s[a + d]))
                     && k(self, i + n)
             }
-            Node::Alt(alts) => {
-                for alt in alts {
-                    let saved = self.caps.clone();
-                    if self.node(alt, i, k) {
-                        return true;
-                    }
-                    self.caps = saved;
-                }
-                false
-            }
+            // A failed match leaves the captures as they were (a group
+            // restores its own when `k` fails), so nothing is saved here.
+            Node::Alt(alts) => alts.iter().any(|alt| self.node(alt, i, k)),
             Node::Seq(nodes) => self.seq(nodes, i, k),
             Node::Repeat(inner, min, max, greedy) => self.repeat(inner, *min, *max, *greedy, 0, i, k),
         }

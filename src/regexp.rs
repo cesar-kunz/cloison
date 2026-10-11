@@ -744,6 +744,8 @@ fn canonical(c: u16) -> u16 {
 enum Insn {
     /// One code unit.
     Char(u16),
+    /// The code units `Program::strs[k]`, in a row.
+    Str(u32),
     /// One code unit, case folded: as given, or with its canonical form.
     CharFold { c: u16, canon: u16 },
     /// `.`: anything but a line terminator.
@@ -778,6 +780,9 @@ enum Insn {
     /// as many as match (at most `max`), then fewer on backtracking (at
     /// least `min`); on after that instruction.
     Run { min: u32, max: u32 },
+    /// A lazy repetition of the single-unit instruction that follows: as
+    /// few as `min`, then one more on each backtracking (at most `max`).
+    LazyRun { min: u32, max: u32 },
     /// A lookahead, whose body follows and ends in `LookEnd`; on at
     /// `after`.
     Look { negative: bool, after: u32 },
@@ -791,6 +796,8 @@ struct Program {
     code: Vec<Insn>,
     /// Classes' ranges and negation, for units past ASCII.
     classes: Vec<(Vec<(u16, u16)>, bool)>,
+    /// `Str`'s code units.
+    strs: Vec<Vec<u16>>,
     /// Registers: positions and repetition counts.
     nregs: usize,
     /// Whether case is folded (`i`).
@@ -807,12 +814,15 @@ enum Bt {
     Cap { g: u32, old: Option<(usize, usize)> },
     /// A greedy run from `base` that matched `n` units: fewer next (at
     /// least `min`), continuing at `pc`.
-    Run { pc: u32, base: usize, n: usize, min: usize },
+    Run { pc: u32, min: u32, base: usize, n: usize },
+    /// A lazy run that matched `n` units, up to `pos`: one more next (at
+    /// most `max`), if the unit (before `pc`) matches there.
+    LazyRun { pc: u32, max: u32, pos: usize, n: usize },
     /// A lookahead's body runs: if it fails, continue at `after` from
     /// `pos` when `negative`; `caps` are the captures before it.
-    Look { pos: usize, after: u32, negative: bool, caps: Captures },
+    Look(Box<(usize, u32, bool, Captures)>),
     /// The captures before a positive lookahead that matched.
-    Caps(Captures),
+    Caps(Box<Captures>),
 }
 
 /// The interpreter's state, kept over an `exec`'s attempts.
@@ -903,13 +913,31 @@ impl Program {
                 }
             }
             Node::Seq(nodes) => {
-                for n in nodes {
-                    self.emit(re, n);
+                let mut k = 0;
+                while k < nodes.len() {
+                    // Two or more characters (case not folded): one `Str`.
+                    let run = nodes[k..].iter().take_while(|n| matches!(n, Node::Char(_))).count();
+                    if run >= 2 && !re.ignore_case {
+                        let units = nodes[k..k + run]
+                            .iter()
+                            .map(|n| match n {
+                                Node::Char(c) => *c,
+                                _ => unreachable!(),
+                            })
+                            .collect();
+                        self.strs.push(units);
+                        self.code.push(Insn::Str((self.strs.len() - 1) as u32));
+                        k += run;
+                    } else {
+                        self.emit(re, &nodes[k]);
+                        k += 1;
+                    }
                 }
             }
             Node::Repeat(inner, min, max, greedy, groups) => {
-                if *greedy && let Some(i) = self.unit(re, inner) {
-                    self.code.push(Insn::Run { min: *min, max: *max });
+                if let Some(i) = self.unit(re, inner) {
+                    let (min, max) = (*min, *max);
+                    self.code.push(if *greedy { Insn::Run { min, max } } else { Insn::LazyRun { min, max } });
                     self.code.push(i);
                     return;
                 }
@@ -959,6 +987,13 @@ impl Program {
                 i @ (Insn::Char(_) | Insn::CharFold { .. } | Insn::Any | Insn::Class { .. }) => {
                     let ok = pos < s.len() && self.unit_matches(i, s[pos]);
                     pos += 1;
+                    pc += 1;
+                    ok
+                }
+                Insn::Str(k) => {
+                    let u = &self.strs[k as usize];
+                    let ok = s.get(pos..pos + u.len()) == Some(&u[..]);
+                    pos += u.len();
                     pc += 1;
                     ok
                 }
@@ -1065,14 +1100,25 @@ impl Program {
                         false
                     } else {
                         if n > min {
-                            stack.push(Bt::Run { pc: pc as u32, base: pos, n, min });
+                            stack.push(Bt::Run { pc: pc as u32, min: min as u32, base: pos, n });
                         }
                         pos += n;
                         true
                     }
                 }
+                Insn::LazyRun { min, max } => {
+                    let unit = self.code[pc + 1];
+                    let (min, max) = (min as usize, max as usize);
+                    pc += 2;
+                    let ok = pos + min <= s.len() && s[pos..pos + min].iter().all(|&c| self.unit_matches(unit, c));
+                    pos += min;
+                    if ok && min < max {
+                        stack.push(Bt::LazyRun { pc: pc as u32, max: max as u32, pos, n: min });
+                    }
+                    ok
+                }
                 Insn::Look { negative, after } => {
-                    stack.push(Bt::Look { pos, after, negative, caps: caps.clone() });
+                    stack.push(Bt::Look(Box::new((pos, after, negative, caps.clone()))));
                     pc += 1;
                     true
                 }
@@ -1081,7 +1127,7 @@ impl Program {
                     // matches once), its captures stay.
                     let (at, after, negative, saved) = loop {
                         match stack.pop() {
-                            Some(Bt::Look { pos, after, negative, caps }) => break (pos, after, negative, caps),
+                            Some(Bt::Look(l)) => break *l,
                             Some(_) => {}
                             None => unreachable!("a lookahead's end without its start"),
                         }
@@ -1090,7 +1136,7 @@ impl Program {
                         *caps = saved;
                         false
                     } else {
-                        stack.push(Bt::Caps(saved));
+                        stack.push(Bt::Caps(Box::new(saved)));
                         (pc, pos) = (after as usize, at);
                         true
                     }
@@ -1113,22 +1159,33 @@ impl Program {
                     }
                     Some(Bt::Reg { r, old }) => regs[r as usize] = old,
                     Some(Bt::Cap { g, old }) => caps[g as usize] = old,
-                    Some(Bt::Run { pc: to, base, n, min }) => {
+                    Some(Bt::Run { pc: to, min, base, n }) => {
                         let n = n - 1;
-                        if n > min {
-                            stack.push(Bt::Run { pc: to, base, n, min });
+                        if n > min as usize {
+                            stack.push(Bt::Run { pc: to, min, base, n });
                         }
                         (pc, pos) = (to as usize, base + n);
                         break;
                     }
+                    Some(Bt::LazyRun { pc: to, max, pos: at, n }) => {
+                        let unit = self.code[to as usize - 1];
+                        if at < s.len() && self.unit_matches(unit, s[at]) {
+                            if n + 1 < max as usize {
+                                stack.push(Bt::LazyRun { pc: to, max, pos: at + 1, n: n + 1 });
+                            }
+                            (pc, pos) = (to as usize, at + 1);
+                            break;
+                        }
+                    }
                     // The body failed.
-                    Some(Bt::Look { pos: at, after, negative, .. }) => {
+                    Some(Bt::Look(l)) => {
+                        let (at, after, negative, _) = *l;
                         if negative {
                             (pc, pos) = (after as usize, at);
                             break;
                         }
                     }
-                    Some(Bt::Caps(saved)) => *caps = saved,
+                    Some(Bt::Caps(saved)) => *caps = *saved,
                 }
             }
         }
@@ -1370,6 +1427,7 @@ mod tests {
     /// matcher overflows the stack on these).
     #[test]
     fn long_matches_dont_recurse() {
+        assert_eq!(std::mem::size_of::<Bt>(), 32);
         let s: Vec<u16> = "ab".repeat(1 << 20).encode_utf16().collect();
         let all = Some((0, s.len()));
         assert_eq!(Regex::new("^(?:a|b)*$", "").unwrap().exec(&s, 0).unwrap()[0], all);

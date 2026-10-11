@@ -59,8 +59,9 @@ enum Node {
     BackRef(usize),
     Alt(Vec<Node>),
     Seq(Vec<Node>),
-    /// A repetition: minimum, maximum (`u32::MAX`: none), greedy.
-    Repeat(Box<Node>, u32, u32, bool),
+    /// A repetition: minimum, maximum (`u32::MAX`: none), greedy, and the
+    /// capture groups inside it (cleared at each iteration).
+    Repeat(Box<Node>, u32, u32, bool, std::ops::Range<usize>),
 }
 
 impl Regex {
@@ -227,8 +228,9 @@ impl Parser<'_> {
             if c == '|' || c == ')' {
                 break;
             }
+            let first = self.groups;
             let atom = self.atom()?;
-            let atom = self.quantifier(atom)?;
+            let atom = self.quantifier(atom, first..self.groups)?;
             seq.push(atom);
         }
         Ok(match seq.len() {
@@ -238,7 +240,7 @@ impl Parser<'_> {
         })
     }
 
-    fn quantifier(&mut self, atom: Node) -> Result<Node, String> {
+    fn quantifier(&mut self, atom: Node, groups: std::ops::Range<usize>) -> Result<Node, String> {
         let (min, max) = match self.peek() {
             Some('*') => (0, u32::MAX),
             Some('+') => (1, u32::MAX),
@@ -263,7 +265,7 @@ impl Parser<'_> {
         } else {
             true
         };
-        Ok(Node::Repeat(Box::new(atom), min, max, greedy))
+        Ok(Node::Repeat(Box::new(atom), min, max, greedy, groups))
     }
 
     /// `{n}`, `{n,}`, `{n,m}` at `{` (consumed if it is one; else `{` is
@@ -650,7 +652,9 @@ impl<'a> Matcher<'a> {
             // restores its own when `k` fails), so nothing is saved here.
             Node::Alt(alts) => alts.iter().any(|alt| self.node(alt, i, k)),
             Node::Seq(nodes) => self.seq(nodes, i, k),
-            Node::Repeat(inner, min, max, greedy) => self.repeat(inner, *min, *max, *greedy, 0, i, k),
+            Node::Repeat(inner, min, max, greedy, groups) => {
+                self.repeat(inner, *min, *max, *greedy, groups, 0, i, k)
+            }
         }
     }
 
@@ -682,7 +686,7 @@ impl<'a> Matcher<'a> {
             ),
             Node::Group(inner, _) => self.first(inner),
             Node::BackRef(_) => None,
-            Node::Repeat(inner, min, _, _) => {
+            Node::Repeat(inner, min, ..) => {
                 let (a, o, empty) = self.first(inner)?;
                 Some((a, o, empty || *min == 0))
             }
@@ -712,6 +716,7 @@ impl<'a> Matcher<'a> {
         min: u32,
         max: u32,
         greedy: bool,
+        groups: &std::ops::Range<usize>,
         count: u32,
         i: usize,
         k: K<'_, 'a>,
@@ -730,15 +735,25 @@ impl<'a> Matcher<'a> {
                 n -= 1;
             }
         }
+        // Each iteration starts with the groups inside cleared, and puts
+        // them back if it fails (a failed match changes no captures).
         let more = |m: &mut Self, k: K<'_, 'a>| {
-            count < max
-                && m.node(inner, i, &mut |m, j| {
-                    // An empty iteration past the minimum ends the loop.
-                    if j == i && count >= min {
-                        return false;
-                    }
-                    m.repeat(inner, min, max, greedy, count + 1, j, k)
-                })
+            if count >= max {
+                return false;
+            }
+            let saved = (!groups.is_empty()).then(|| m.caps[groups.clone()].to_vec());
+            m.caps[groups.clone()].fill(None);
+            let found = m.node(inner, i, &mut |m, j| {
+                // An empty iteration past the minimum ends the loop.
+                if j == i && count >= min {
+                    return false;
+                }
+                m.repeat(inner, min, max, greedy, groups, count + 1, j, k)
+            });
+            if !found && let Some(saved) = saved {
+                m.caps[groups.clone()].copy_from_slice(&saved);
+            }
+            found
         };
         if greedy {
             more(self, k) || (count >= min && k(self, i))
@@ -802,6 +817,12 @@ mod tests {
         assert_eq!(c[1].as_deref(), Some("bob"));
         assert_eq!(c[2].as_deref(), Some("site"));
         assert_eq!(find("(a)|(b)", "", "b").unwrap()[1], None);
+        // A repetition's iteration clears the groups inside it.
+        assert_eq!(find("((a)|b)+", "", "ab").unwrap()[2], None);
+        assert_eq!(find("(z)((a+)?(b+)?(c))*", "", "zaacbbbcac").unwrap()[3..], [Some("a".into()), None, Some("c".into())]);
+        assert_eq!(find("(?:(a)|b)*", "", "ab").unwrap()[1], None);
+        assert_eq!(find("(a)*", "", "b").unwrap()[1], None);
+        assert_eq!(find("(?:(a)|(b))+?c", "", "abc").unwrap()[1..], [None, Some("b".into())]);
     }
 
     /// Where `exec` starts trying (`Regex::starts`) doesn't change what it

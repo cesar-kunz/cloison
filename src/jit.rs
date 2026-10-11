@@ -4258,12 +4258,16 @@ fn infer(
     let n = insns.len();
     let mut ins: Vec<Option<TypeState>> = vec![None; n];
     let mut sels: Vec<Option<Sel>> = (0..n).map(|_| None).collect();
-    // Instructions on `work`, which holds each once.
+    // Instructions on `work`, which holds each once, taken lowest first:
+    // bytecode is laid out in about reverse postorder, so an instruction
+    // mostly waits until its predecessors in the loop are done. Taken last
+    // pushed first, zlib's 9,600-instruction `a1` took 180,000 visits (430
+    // ms a compile), now 25,000 (70 ms).
     let mut queued = vec![false; n];
     ins[entry] = Some(entry_state);
-    let mut work = vec![entry];
+    let mut work = std::collections::BinaryHeap::from([std::cmp::Reverse(entry)]);
     queued[entry] = true;
-    while let Some(i) = work.pop() {
+    while let Some(std::cmp::Reverse(i)) = work.pop() {
         queued[i] = false;
         let sel = select(&insns[i], i, ins[i].as_ref().unwrap(), spec);
         let succs = [
@@ -4291,7 +4295,7 @@ fn infer(
             };
             if changed && !queued[s] {
                 queued[s] = true;
-                work.push(s);
+                work.push(std::cmp::Reverse(s));
             }
         }
         sels[i] = Some(sel);
@@ -11841,8 +11845,19 @@ impl JitFunction {
                 return fits_stack(found, regs, stack_end);
             }
             let vm = self.vm.as_mut().unwrap();
-            if vm.no_entry.contains(&pc) || self.stats.compiles >= max_compiles(vm.root_len) {
+            if vm.no_entry.contains(&pc) {
                 return None;
+            }
+            // Out of compilations: the versions there are still run, unless
+            // the epochs they assumed changed (an exit only made the function
+            // `dirty`, for a lowering that won't come). Dropping them left
+            // zlib's `a1` interpreted after its fourth exit.
+            if self.stats.compiles >= max_compiles(vm.root_len) {
+                if vm.epoch != epoch || vm.field_epoch != field_epoch {
+                    return None;
+                }
+                return unsafe { self.fitting_version(pc, acc, regs) }
+                    .and_then(|found| fits_stack(found, regs, stack_end));
             }
             // First compile: hot right away if inlining is what hot code
             // would bring (see `inlining_pays`).
@@ -12007,7 +12022,14 @@ impl JitFunction {
         acc: Value,
         regs: *mut Value,
     ) -> Option<(Rc<JitCode>, Value, usize)> {
-        let entry = self.insns.iter().position(|i| i.pc == pc && i.frame == 0)?;
+        // The entry among those with versions (keyed by `index_of`, so
+        // the first instruction at `pc`): a few, against every instruction
+        // of the function. Calls that find no version (a function out of
+        // compilations, entered by every call) cost a scan of it each.
+        let entry = *self.versions.keys().find(|&&e| {
+            let i = &self.insns[e];
+            i.pc == pc && i.frame == 0
+        })?;
         let l = self.live_at.get(&entry)?;
         let (acc_live, live) = (&l.acc_at_entry, &l.live_list);
         let fits = |t: Ty, v: Value| match t {
@@ -12148,7 +12170,11 @@ impl JitFunction {
         } else if !insn.is_call() {
             vm.widened.insert(origin);
             self.widened.insert(k);
-            self.versions.clear();
+            // Out of compilations, the versions stay (see `vm_prepare`):
+            // they exit here again, but run the rest.
+            if self.stats.compiles < max_compiles(vm.root_len) {
+                self.versions.clear();
+            }
         }
         (frame, exit_pc)
     }

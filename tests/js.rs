@@ -2760,13 +2760,13 @@ out.join(",");"#;
 
 #[test]
 fn exits_at_an_instruction_never_compiled_dont_lower_again() {
-    // `block`'s regular expression literal is never compiled: exits there
-    // lower it again only at the 1st, 2nd, 4th… (Octane RegExp's
-    // `runBlock1` was lowered at every call).
+    // `block`'s `delete` is never compiled: exits there lower it again
+    // only at the 1st, 2nd, 4th… (Octane RegExp's `runBlock1` was lowered
+    // at every call, at a regular expression literal, compiled since).
     let src = "function block(n) {
-  var re = /x/, s = 0;
+  var o = { x: 1 }, d = delete o.y, s = 0;
   for (var i = 0; i < n; i++) s += i;
-  return s + (re.test('x') ? 1 : 0);
+  return s + (d ? 1 : 0);
 }
 var t = 0;
 for (var k = 0; k < 300; k++) t += block(50);

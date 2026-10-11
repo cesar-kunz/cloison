@@ -17,6 +17,19 @@ pub struct Regex {
     pub multiline: bool,
     /// Where a match can start (see [`Starts`]).
     starts: Starts,
+    /// A literal every match contains, if any (see [`Needle`]).
+    needle: Option<Needle>,
+}
+
+/// A run of characters in the pattern's top-level sequence, so in every
+/// match: `exec` tries only where one follows within what the part before
+/// it can match.
+struct Needle {
+    units: Vec<u16>,
+    /// The shortest and longest the part before it matches (`None`: no
+    /// bound).
+    min: usize,
+    max: Option<usize>,
 }
 
 /// Where a match can start, so `exec` tries only there.
@@ -99,9 +112,41 @@ impl Regex {
             ignore_case,
             multiline,
             starts: Starts::Anywhere,
+            needle: None,
         };
         re.starts = re.starts();
+        re.needle = re.needle();
         Ok(re)
+    }
+
+    /// The longest run of two or more characters in the top-level
+    /// sequence (case-sensitive patterns only).
+    fn needle(&self) -> Option<Needle> {
+        let Node::Seq(ns) = &self.node else {
+            return None;
+        };
+        if self.ignore_case {
+            return None;
+        }
+        let mut best: Option<(usize, usize)> = None;
+        let mut k = 0;
+        while k < ns.len() {
+            let run = ns[k..].iter().take_while(|n| matches!(n, Node::Char(_))).count();
+            if run >= 2 && best.is_none_or(|(_, len)| run > len) {
+                best = Some((k, run));
+            }
+            k += run.max(1);
+        }
+        let (k, len) = best?;
+        let units = ns[k..k + len]
+            .iter()
+            .map(|n| match n {
+                Node::Char(c) => *c,
+                _ => unreachable!(),
+            })
+            .collect();
+        let (min, max) = seq_width(&ns[..k]);
+        Some(Needle { units, min, max })
     }
 
     fn starts(&self) -> Starts {
@@ -131,7 +176,20 @@ impl Regex {
             caps: vec![None; self.groups],
         };
         let mut at = start;
+        // Where the needle next occurs, at or after `at` + its `min`.
+        let mut next: Option<usize> = None;
         while at <= s.len() {
+            if let Some(nd) = &self.needle {
+                let from = at.saturating_add(nd.min);
+                if next.is_none_or(|q| q < from) {
+                    next = Some(find(s, &nd.units, from)?);
+                }
+                // A match from before `q` - `max` would need the needle
+                // before `q`.
+                if let (Some(q), Some(max)) = (next, nd.max) {
+                    at = at.max(q.saturating_sub(max));
+                }
+            }
             // Skip to where a match can start.
             match self.starts {
                 Starts::Anywhere => {}
@@ -166,6 +224,48 @@ impl Regex {
         }
         None
     }
+}
+
+/// The first `needle` in `s` at or after `from`.
+fn find(s: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    let mut at = from;
+    while at + needle.len() <= s.len() {
+        at += s[at..=s.len() - needle.len()].iter().position(|&c| c == needle[0])?;
+        if s[at..at + needle.len()] == *needle {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The shortest and longest `n` matches (`None`: no bound).
+fn width(n: &Node) -> (usize, Option<usize>) {
+    match n {
+        Node::Empty | Node::Start | Node::End | Node::Boundary(_) | Node::Look(..) => (0, Some(0)),
+        Node::Char(_) | Node::Any | Node::Class(..) => (1, Some(1)),
+        Node::Group(inner, _) => width(inner),
+        Node::BackRef(_) => (0, None),
+        Node::Alt(alts) => alts.iter().map(width).fold((usize::MAX, Some(0)), |(a, b), (c, d)| {
+            (a.min(c), b.zip(d).map(|(b, d)| b.max(d)))
+        }),
+        Node::Seq(nodes) => seq_width(nodes),
+        Node::Repeat(inner, min, max, ..) => {
+            let (c, d) = width(inner);
+            let hi = match (d, *max) {
+                (Some(0), _) => Some(0),
+                (_, u32::MAX) => None,
+                (d, max) => d.map(|d| d.saturating_mul(max as usize)),
+            };
+            (c.saturating_mul(*min as usize), hi)
+        }
+    }
+}
+
+fn seq_width(nodes: &[Node]) -> (usize, Option<usize>) {
+    nodes.iter().map(width).fold((0, Some(0)), |(a, b), (c, d)| {
+        (a.saturating_add(c), b.zip(d).map(|(b, d)| b.saturating_add(d)))
+    })
 }
 
 /// Whether every match of `n` begins where `^` matches.
@@ -835,6 +935,23 @@ mod tests {
             re.exec(&u, start).map(|c| c[0].unwrap())
         };
         assert!(matches!(Regex::new("^a|^b", "").unwrap().starts, Starts::Anchored));
+        // A literal every match contains: tried only up to where the part
+        // before it can reach.
+        let nd = Regex::new("(^|[^x])ab+cde", "").unwrap().needle.unwrap();
+        assert_eq!((nd.units.len(), nd.min, nd.max), (3, 2, None));
+        let nd = Regex::new("[ab]?\\d{2,3}xyz", "").unwrap().needle.unwrap();
+        assert_eq!((nd.units.len(), nd.min, nd.max), (3, 2, Some(4)));
+        assert!(Regex::new("abc", "i").unwrap().needle.is_none());
+        assert!(Regex::new("a|bc", "").unwrap().needle.is_none());
+        assert_eq!(at("(^|[^x])ab", "", "xab_ab", 0), Some((3, 6)));
+        assert_eq!(at("(^|[^x])ab", "", "abxab", 0), Some((0, 2)));
+        assert_eq!(at("(^|[^x])ab", "", "xabxab", 0), None);
+        assert_eq!(at("\\d+px", "", "1p 22px 3px", 0), Some((3, 7)));
+        assert_eq!(at("\\d+px", "", "1p 22px 3px", 6), Some((8, 11)));
+        assert_eq!(at("\\d{2}px", "", "123456px", 0), Some((4, 8)));
+        assert_eq!(at("(a)\\1bc", "", "aabc", 0), Some((0, 4)));
+        assert_eq!(at("x.*yz", "", "x1yzyz", 1), None);
+        assert_eq!(at("ab", "", "a", 0), None);
         assert!(matches!(Regex::new("a*", "").unwrap().starts, Starts::Anywhere));
         assert!(matches!(Regex::new("(a)\\1", "").unwrap().starts, Starts::Units { .. }));
         assert!(matches!(Regex::new("(a)|\\1b", "").unwrap().starts, Starts::Anywhere));

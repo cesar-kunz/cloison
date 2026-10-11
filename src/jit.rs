@@ -7754,6 +7754,8 @@ pub struct JitStats {
     /// Times an entry point became megamorphic and its versions were
     /// replaced by one generalized version.
     pub generalizations: u32,
+    /// Times the function was lowered again (`refresh`).
+    pub lowers: u32,
 }
 
 /// When to tier up from the interpreter. The default: 1000 loop back edges
@@ -7943,6 +7945,9 @@ struct VmState {
     /// Exits through a bail per entry; past [`MAX_BAIL_EXITS`] the entry is
     /// left to the interpreter.
     bail_exits: HashMap<usize, u32>,
+    /// Exits at instructions compiled code doesn't run, other than calls
+    /// (see `vm_finish`).
+    bails: u32,
     no_entry: HashSet<usize>,
     /// Calls whose result their prediction missed (see `vm_finish`).
     bad_results: u32,
@@ -11790,6 +11795,7 @@ impl JitFunction {
             property_exits: HashMap::default(),
             callee_exits: HashMap::default(),
             bail_exits: HashMap::default(),
+            bails: 0,
             no_entry: HashSet::default(),
             bad_results: 0,
             cool: 0,
@@ -11890,6 +11896,7 @@ impl JitFunction {
     /// Lower the function again ([`lower`]); if that gives something else,
     /// or the epochs changed, drop the versions and take the new lowering.
     fn refresh(&mut self, epoch: u32, field_epoch: u32) {
+        self.stats.lowers += 1;
         let vm = self.vm.as_mut().unwrap();
         let low = lower(vm, epoch);
         vm.dirty = false;
@@ -12172,6 +12179,23 @@ impl JitFunction {
         let insn = snap.insns[k];
         let origin = (snap.frames[frame].code as usize, exit_pc);
         if insn.bail {
+            // An instruction compiled code doesn't run (one it can't
+            // compile, a property access given up on): lowering again
+            // gives the same but for what the interpreter learned
+            // meanwhile, so only at the 1st, 2nd, 4th, 8th… such exit.
+            // Octane RegExp's `runBlock1` left at a regular expression
+            // literal at each call, and was lowered again 474 times;
+            // pdfjs's `DecodeStream_ensureBuffer`, 1,762 times, all to the
+            // same. A call that hadn't run yet, though, has its cache
+            // filled now: lowered again, it is compiled. (The versions are
+            // still entered: a loop that leaves now and then, at a
+            // recursive call inlined too deep, say, is better compiled.)
+            if !insn.is_call() {
+                vm.bails += 1;
+                if !vm.bails.is_power_of_two() {
+                    vm.dirty = was_dirty;
+                }
+            }
             let n = vm.bail_exits.entry(pc).or_insert(0);
             *n += 1;
             if *n >= MAX_BAIL_EXITS {

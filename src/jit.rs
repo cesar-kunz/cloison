@@ -428,6 +428,20 @@ extern "C" fn toi_rt_create_closure(callee: Value, current: Value) -> u64 {
     vm.closure_of(callee, std::ptr::null_mut(), current).to_bits()
 }
 
+/// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws.
+extern "C" fn toi_rt_delete(a: Value, b: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    vm.delete_property(a, b).map_or(0, |r| Value::from_bool(r).to_bits())
+}
+
+/// `delete g`, `b` the global's name (`delete_global_m` stencils).
+extern "C" fn toi_rt_delete_global(_: Value, b: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    let name = String::from_utf16_lossy(crate::vm::string_units(b).unwrap_or(&[]));
+    let a = vm.intern(&name);
+    Value::from_bool(vm.delete_named(vm.global, a)).to_bits()
+}
+
 /// `typeof a`: a string constant (`type_of` stencils).
 extern "C" fn toi_rt_type_of(a: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
@@ -494,6 +508,8 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_create_regexp" => toi_rt_create_regexp as *const () as usize,
         "toi_rt_type_of" => toi_rt_type_of as *const () as usize,
         "toi_rt_create_closure" => toi_rt_create_closure as *const () as usize,
+        "toi_rt_delete" => toi_rt_delete as *const () as usize,
+        "toi_rt_delete_global" => toi_rt_delete_global as *const () as usize,
         "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
         "toi_rt_in" => toi_rt_in as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
@@ -1499,6 +1515,12 @@ struct Insn {
     /// header. A function with one isn't inlined or called directly
     /// (frames without a header).
     forward: bool,
+    /// A `TestIn` decoded from `DeleteProperty` (1; `reg` the object, the
+    /// key in `acc`, as `TestIn`'s operands) or `DeleteGlobal` (2; `reg`
+    /// 0, unused): through the runtime, after which no object's shape is
+    /// known, and which code moved or reused across it must not cross, as
+    /// a call (see `delete_m` in the stencils).
+    delete: u8,
 }
 
 impl Insn {
@@ -1657,7 +1679,16 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
             // typed `AddSmi` stencil and fusion (but for k = INT32_MIN).
             let mut sub = false;
             let mut forward = false;
+            let mut delete = 0;
             let op = match op {
+                Op::DeleteProperty if vm => {
+                    delete = 1;
+                    Op::TestIn
+                }
+                Op::DeleteGlobal if vm => {
+                    delete = 2;
+                    Op::TestIn
+                }
                 Op::SubSmi if imm_at(pc + 1) != i32::MIN => {
                     imm = -imm_at(pc + 1);
                     sub = true;
@@ -1686,6 +1717,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 | Op::JumpIfGreaterEqual => {
                     (reg, target) = (code[pc + 1], index_of(pc, imm_at(pc + 2)))
                 }
+                // (`delete g`: no register; `reg` 0, unused.)
+                Op::TestIn if delete == 2 => {}
                 Op::JumpIfLessSmi
                 | Op::JumpIfLessEqualSmi
                 | Op::JumpIfGreaterSmi
@@ -1816,6 +1849,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 hoisted: None,
                 nullable_this: false,
                 forward,
+                delete,
             }
         })
         .collect();
@@ -1948,6 +1982,9 @@ pub(crate) enum Prop {
     /// An upvalue of an inlined frame's function, known: its cell
     /// (`vm::Upvalue`), at address `cell`.
     Upvalue { cell: u64 },
+    /// A `delete` (`Insn::delete`): the compiled function's epoch, and
+    /// its address (`Code::field_deps`), checked after it.
+    Delete { epoch: u32, addr: u64 },
     /// A `CreateClosure`: the callee's code, and the function whose
     /// upvalues it takes (an inlined frame's; 0: the frame's own).
     Closure { callee: u64, func: u64 },
@@ -3816,6 +3853,20 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = Any;
             ("test_instanceof", "")
         }
+        // A delete changes an object's shape to one not extending the old:
+        // no shape is known after it.
+        Op::TestIn if insn.delete != 0 => {
+            let Some(Prop::Delete { epoch, addr }) = spec.props.get(i).copied() else {
+                return Sel::new("bail", "", out);
+            };
+            out.regs.map(|_, t| if matches!(t, Ty::Obj(_) | Ty::Ext(_)) { Any } else { t });
+            out.acc = Any;
+            let base = if insn.delete == 2 { "delete_global" } else { "delete" };
+            return Sel {
+                ops: Some((0, epoch as u64, addr)),
+                ..Sel::new(base, "", out)
+            };
+        }
         Op::TestIn => {
             out.acc = Any;
             ("test_in", "")
@@ -5423,7 +5474,7 @@ fn stencil_for(
         // written back first (they are the slow, untyped paths).
         (
             "sub" | "mul" | "div" | "jrel" | "test_rel" | "test_seq" | "test_instanceof" | "test_in"
-            | "bit_and" | "bit_or" | "bit_xor" | "shl" | "sar" | "shr",
+            | "delete" | "delete_global" | "bit_and" | "bit_or" | "bit_xor" | "shl" | "sar" | "shr",
             _,
         ) if sel.case.is_empty() => {
             box_acc(&mut pre);
@@ -8746,6 +8797,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         hoisted: None,
         nullable_this: false,
         forward: false,
+        delete: 0,
     }
 }
 
@@ -9464,6 +9516,10 @@ fn reuse_global_loads(out: &mut Lowered) {
                 known.clear();
                 acc = None;
             }
+            Op::TestIn if i.delete != 0 => {
+                known.clear();
+                acc = None;
+            }
             Op::SetNamed | Op::SetKeyed
                 if may_store_global(&out.props[k]) && i.op == Op::SetNamed =>
             {
@@ -9714,7 +9770,7 @@ fn hoist_guards(out: &mut Lowered) {
             if i.bail {
                 continue;
             }
-            if i.is_call() && i.native == 0 {
+            if i.is_call() && i.native == 0 || i.delete != 0 {
                 all = true;
             }
         }
@@ -10065,6 +10121,7 @@ fn hoist_loads(
                 _ if i.is_call() => {
                     runtime_call |= !matches!(out.props[k], Prop::Call { direct: true, .. })
                 }
+                _ if i.delete != 0 => runtime_call = true,
                 _ => {}
             }
         }
@@ -10679,6 +10736,16 @@ impl Lowering<'_> {
                 _ if i.jumps() => {
                     let x = self.push(i, Prop::None);
                     fix.push(x);
+                }
+                // A delete, then the compiled function's epoch checked, as
+                // after a call.
+                Op::TestIn if i.delete != 0 => {
+                    let root = self.state.root;
+                    let prop = Prop::Delete {
+                        epoch: unsafe { (*root).field_deps.get() },
+                        addr: unsafe { (*root).field_deps.as_ptr() } as u64,
+                    };
+                    self.push(i, prop);
                 }
                 // A closure: its code, and the function whose upvalues it
                 // takes, known in an inlined frame (its checked callee).

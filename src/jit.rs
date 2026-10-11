@@ -415,6 +415,12 @@ extern "C" fn toi_rt_get_keyed(a: Value, b: Value) -> u64 {
     vm.get_keyed(a, b).map_or(0, |v| v.to_bits())
 }
 
+/// `typeof a`: a string constant (`type_of` stencils).
+extern "C" fn toi_rt_type_of(a: Value, _: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    vm.type_of(a).to_bits()
+}
+
 /// A regular expression literal's new `RegExp`, of pattern `p` and flags
 /// `f` (`create_regexp` stencils); 0 where it would throw (the
 /// interpreter does it).
@@ -473,6 +479,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_instance_of" => toi_rt_instance_of as *const () as usize,
         "toi_rt_get_keyed" => toi_rt_get_keyed as *const () as usize,
         "toi_rt_create_regexp" => toi_rt_create_regexp as *const () as usize,
+        "toi_rt_type_of" => toi_rt_type_of as *const () as usize,
         "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
         "toi_rt_in" => toi_rt_in as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
@@ -1646,6 +1653,10 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     forward = true;
                     Op::Call
                 }
+                // (`typeof g`'s load: its cache is `LdaGlobal`'s, and
+                // compiled code leaves where that misses, where the
+                // interpreter gives `undefined` for a missing global.)
+                Op::LdaGlobalInsideTypeof if vm => Op::LdaGlobal,
                 op => op,
             };
             match op {
@@ -1703,6 +1714,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::TestUndefined
                 | Op::TestNull
                 | Op::TestNullish
+                | Op::TypeOf
                 | Op::ToNumber
                 | Op::Negate
                 | Op::BitNot => {}
@@ -3482,6 +3494,28 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ("test_seq", "")
             }
         }
+        // `typeof acc`: a constant if `acc`'s type says which, else
+        // through the runtime.
+        Op::TypeOf => {
+            let Some(vm) = spec.feedback.map(|f| f[insn.frame as usize].vm) else {
+                return Sel::new("bail", "", out);
+            };
+            let class = |s: u64| unsafe { (*(s as *const Shape)).class };
+            let name = match st.acc {
+                I32 | F64 => Some("number"),
+                Ty::Obj(s) | Ty::Ext(s) => Some(match class(s) {
+                    crate::object::Class::String => "string",
+                    crate::object::Class::Function | crate::object::Class::Native => "function",
+                    _ => "object",
+                }),
+                _ => None,
+            };
+            if let Some(name) = name {
+                return const_sel(vm, name, out);
+            }
+            out.acc = Any;
+            return Sel::new("type_of", "", out);
+        }
         // A regular expression literal's new object, through the runtime:
         // the pattern and the flags are the 64-bit immediates.
         Op::CreateRegExp => {
@@ -3916,6 +3950,17 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         op => unreachable!("rejected by decode: {op:?}"),
     };
     Sel::new(base, case, out)
+}
+
+/// `lda_constant` of the string constant `name` (`typeof`'s result).
+fn const_sel(vm: *mut crate::vm::Vm, name: &str, mut out: TypeState) -> Sel {
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let v = unsafe { (*vm).string_constant(&units) };
+    out.acc = Ty::of(v);
+    Sel {
+        ops: Some((0, v.to_bits(), 0)),
+        ..Sel::new("lda_constant", "", out)
+    }
 }
 
 /// While alive: the function whose code is being made, which the field
@@ -12130,7 +12175,8 @@ impl JitFunction {
             Ty::F64 => v.is_double(),
             Ty::Obj(s) => v.is_cell() && unsafe { *(v.to_bits() as *const u64) } == s,
             // A shape extending it fits too, as in `version` (an object of
-            // a subclass, say).
+            // a subclass, say); missing it sent each call of EarleyBoyer's
+            // `one_way_unify1_nboyer` through `version`.
             Ty::Ext(s) => {
                 v.is_cell() && {
                     let shape = unsafe { *(v.to_bits() as *const u64) };

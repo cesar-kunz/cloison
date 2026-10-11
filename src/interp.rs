@@ -789,9 +789,7 @@ handlers! {
     fn op_create_regexp(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
         let k = |at: usize| (&(*frame_code(regs)).constants)[u16::from_le_bytes([*pc.add(at), *pc.add(at + 1)]) as usize];
-        let units = |v: Value| String::from_utf16_lossy(string_units(v).unwrap_or(&[]));
-        let (p, f) = (units(k(1)), units(k(3)));
-        let r = crate::builtins::new_regexp(vm, &p, &f);
+        let r = crate::builtins::regexp_literal(vm, k(1), k(3));
         next_or_throw!(Op::CreateRegExp.size(), r)
     }
 

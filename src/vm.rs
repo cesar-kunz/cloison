@@ -421,6 +421,17 @@ pub struct Vm {
     /// Compiled regular expressions, by pattern and flags (a literal makes
     /// a new object each time it runs, sharing one).
     pub(crate) regexps: HashMap<(String, String), Box<crate::regexp::Regex>>,
+    /// The same, by a literal's pattern and flags constants (a `Value`'s
+    /// bits each, kept by its `Code::constants`).
+    pub(crate) regexp_literals: HashMap<(u64, u64), *const crate::regexp::Regex>,
+    /// Names of `RegExp` objects' and `exec` results' properties.
+    pub(crate) a_last_index: Atom,
+    pub(crate) a_source: Atom,
+    pub(crate) a_global: Atom,
+    pub(crate) a_ignore_case: Atom,
+    pub(crate) a_multiline: Atom,
+    pub(crate) a_index: Atom,
+    pub(crate) a_input: Atom,
     pub(crate) array_buffer_prototype: *mut Object,
     /// `Error.prototype` and its kinds' (see `builtins::ERROR_KINDS`).
     pub(crate) error_prototypes: Vec<*mut Object>,
@@ -512,6 +523,14 @@ impl Vm {
             bind_helper: Value::UNDEFINED,
             declared: Default::default(),
             regexps: HashMap::default(),
+            regexp_literals: HashMap::default(),
+            a_last_index: Atom(0),
+            a_source: Atom(0),
+            a_global: Atom(0),
+            a_ignore_case: Atom(0),
+            a_multiline: Atom(0),
+            a_index: Atom(0),
+            a_input: Atom(0),
             array_buffer_prototype: std::ptr::null_mut(),
             single_chars: Vec::new(),
             a_to_string: Atom(0),
@@ -529,6 +548,13 @@ impl Vm {
         vm.a_length = vm.intern("length");
         vm.a_to_string = vm.intern("toString");
         vm.a_value_of = vm.intern("valueOf");
+        vm.a_last_index = vm.intern("lastIndex");
+        vm.a_source = vm.intern("source");
+        vm.a_global = vm.intern("global");
+        vm.a_ignore_case = vm.intern("ignoreCase");
+        vm.a_multiline = vm.intern("multiline");
+        vm.a_index = vm.intern("index");
+        vm.a_input = vm.intern("input");
 
         vm.object_prototype = vm.new_object_with(Class::Plain, Value::NULL, 4);
         let op = object_value(vm.object_prototype);

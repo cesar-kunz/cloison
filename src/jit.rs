@@ -12116,13 +12116,27 @@ impl JitFunction {
             i.pc == pc && i.frame == 0
         })?;
         let l = self.live_at.get(&entry)?;
-        let (acc_live, live) = (&l.acc_at_entry, &l.live_list);
+        let (acc_live, live, read) = (&l.acc_at_entry, &l.live_list, &l.read_at_entry);
+        // As `entry_types`: not inlined frames' registers, and a live one
+        // compiled code doesn't read is `Any` (a version took them so;
+        // checking them sent every call of a function with inlined frames
+        // live at entry through `version`, EarleyBoyer's included).
+        let inline_base = self.vm.as_ref().map_or(usize::MAX, |vm| vm.inline_base);
+        let checked = |r: u8| (r as usize) < inline_base && read[r as usize];
         let fits = |t: Ty, v: Value| match t {
             Ty::Bot => false,
             Ty::Any => true,
             Ty::I32 => v.is_int32(),
             Ty::F64 => v.is_double(),
-            Ty::Obj(s) | Ty::Ext(s) => v.is_cell() && unsafe { *(v.to_bits() as *const u64) } == s,
+            Ty::Obj(s) => v.is_cell() && unsafe { *(v.to_bits() as *const u64) } == s,
+            // A shape extending it fits too, as in `version` (an object of
+            // a subclass, say).
+            Ty::Ext(s) => {
+                v.is_cell() && {
+                    let shape = unsafe { *(v.to_bits() as *const u64) };
+                    shape == s || unsafe { extends(shape as *const Shape, s as *const Shape) }
+                }
+            }
         };
         let versions = self.versions.get(&entry)?;
         // The live registers against the version's types, both in order
@@ -12131,7 +12145,7 @@ impl JitFunction {
             let tys = &st.regs.tys;
             let mut k = 0;
             let ok = (!*acc_live || fits(st.acc, acc))
-                && live.iter().all(|&r| {
+                && live.iter().filter(|&&r| checked(r)).all(|&r| {
                     while k < tys.len() && tys[k].0 < r {
                         k += 1;
                     }

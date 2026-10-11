@@ -200,6 +200,15 @@ unsafe fn install(ic: *mut Ic, e: Ic) {
     }
 }
 
+/// Before a global load's miss: its cache's first way made free, where
+/// `install` then puts the global object's current shape. The interpreter's
+/// hit path and the JIT read only that way (there is one global object);
+/// left holding a shape the global had before, it sent the shape it has now
+/// to the second way, and every load after that missed.
+unsafe fn global_way(code: &Code, ic: u16) {
+    unsafe { (*code.ic(ic).0).shape = std::ptr::null() }
+}
+
 impl Ic {
     const EMPTY: Ic = Ic {
         shape: std::ptr::null(),
@@ -269,6 +278,9 @@ pub struct Code {
     /// Calls left before calls enter compiled code (below zero: they do;
     /// `i32::MAX`: never).
     pub(crate) calls_left: Cell<i32>,
+    /// Calls never enter compiled code, although loops may: its start is
+    /// refused for good (see `jit::vm_run`).
+    pub(crate) calls_interpret: Cell<bool>,
     /// Loop back edges left before the interpreter tiers up: a frame of
     /// the function starts with it and gives back what it didn't use when
     /// it returns, so loops tier up after that many back edges over all
@@ -1435,6 +1447,7 @@ impl Vm {
                 self.atom_name(name)
             )));
         }
+        unsafe { global_way(code, ic) };
         self.get_named_miss(code, ic, object_value(g))
     }
 
@@ -1445,6 +1458,7 @@ impl Vm {
         if self.lookup(self.global, name).is_none() {
             return Ok(Value::UNDEFINED);
         }
+        unsafe { global_way(code, ic) };
         self.get_named_miss(code, ic, object_value(self.global))
     }
 
@@ -2232,6 +2246,7 @@ impl Vm {
             ctor_result: Cell::new(std::ptr::null()),
             jit: RefCell::new(None),
             calls_left: Cell::new(i32::MAX),
+            calls_interpret: Cell::new(false),
             loop_budget: Cell::new(i64::MAX),
             ret_hint: Cell::new(ret),
         });
@@ -2452,6 +2467,7 @@ impl Vm {
                     ctor_result: Cell::new(std::ptr::null()),
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
+                    calls_interpret: Cell::new(false),
                     calls_left: Cell::new(match (has_loop(f), recursive || large(f)) {
                         _ if interpreted(f) => i32::MAX,
                         (true, _) => self.tier_calls,
@@ -2569,6 +2585,12 @@ impl Vm {
         } else {
             n.clamp(1, TIER_CALLS as i64) as i32
         };
+    }
+
+    /// How often `function`'s inline caches missed in the interpreter (for
+    /// tests).
+    pub fn ic_misses(&self, function: &str) -> u32 {
+        self.codes.iter().filter(|c| c.name == function).map(|c| c.ic_misses.get()).sum()
     }
 
     /// How many of `function`'s calls go straight into their callees'

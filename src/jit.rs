@@ -11943,6 +11943,24 @@ impl JitFunction {
         }
     }
 
+    /// Whether `vm_prepare` refuses the entry at instruction 0 from now on:
+    /// it is refused for good, or the function is out of compilations with
+    /// no version there, or with versions compiled under other `epochs`
+    /// (from then on, versions are only dropped).
+    fn never_entered(&self, (epoch, field_epoch): (u32, u32)) -> bool {
+        let Some(vm) = self.vm.as_ref() else {
+            return false;
+        };
+        vm.no_entry.contains(&0)
+            || self.stats.compiles >= max_compiles(vm.root_len)
+                && (vm.epoch != epoch
+                    || vm.field_epoch != field_epoch
+                    || !self.versions.keys().any(|&e| {
+                        let i = &self.insns[e];
+                        i.pc == 0 && i.frame == 0
+                    }))
+    }
+
     /// A version entered at instruction 0 that values of the types
     /// `make_state` gives (from which registers, and whether `acc`, are live
     /// there) fit, compiled if needed, with the register count its frame
@@ -12620,7 +12638,15 @@ unsafe fn vm_run_(
                 Some((code, frame)) => {
                     VmRun::Exit(unsafe { materialize(vm, regs, &code, frame, pc, acc) })
                 }
-                None => VmRun::NotCompiled,
+                None => {
+                    // Refused for good: calls stop trying (`run_new_frame`).
+                    let field_epoch = vm.field_epoch.wrapping_add(code.field_deps.get());
+                    let epochs = (vm.proto_epoch, field_epoch);
+                    if pc == 0 && code.jit.borrow().as_ref().unwrap().never_entered(epochs) {
+                        code.calls_interpret.set(true);
+                    }
+                    VmRun::NotCompiled
+                }
             };
         };
         let regs_slice = unsafe { std::slice::from_raw_parts_mut(regs, nregs) };

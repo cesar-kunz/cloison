@@ -424,6 +424,12 @@ pub struct Vm {
     /// The same, by a literal's pattern and flags constants (a `Value`'s
     /// bits each, kept by its `Code::constants`).
     pub(crate) regexp_literals: HashMap<(u64, u64), *const crate::regexp::Regex>,
+    /// Captures for `exec`, `test`, `match` and `replace` to match into
+    /// (taken while in use).
+    pub(crate) caps_buf: crate::regexp::Captures,
+    /// `exec` arrays' shapes: from an array's, with `index` and with
+    /// `input` added (a few, by the elements' kind).
+    pub(crate) match_shapes: Vec<(*const Shape, *const Shape, *const Shape)>,
     /// Names of `RegExp` objects' and `exec` results' properties.
     pub(crate) a_last_index: Atom,
     pub(crate) a_source: Atom,
@@ -524,6 +530,8 @@ impl Vm {
             declared: Default::default(),
             regexps: HashMap::default(),
             regexp_literals: HashMap::default(),
+            caps_buf: Vec::new(),
+            match_shapes: Vec::new(),
             a_last_index: Atom(0),
             a_source: Atom(0),
             a_global: Atom(0),
@@ -909,8 +917,14 @@ impl Vm {
         value: Value,
         attrs: u8,
     ) -> u32 {
+        let new = self.transition_with(unsafe { (*o).shape }, name, attrs);
+        self.add_property_shaped(o, new, value)
+    }
+
+    /// Add the property that shape `new`, a transition from `o`'s, adds,
+    /// with `value`: its slot.
+    pub(crate) fn add_property_shaped(&mut self, o: *mut Object, new: *const Shape, value: Value) -> u32 {
         unsafe {
-            let new = self.transition_with((*o).shape, name, attrs);
             let ns = &*new;
             let slot = ns.keys.len() as u32 - 1;
             if slot >= ns.capacity.get() {

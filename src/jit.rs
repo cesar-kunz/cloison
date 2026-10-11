@@ -428,6 +428,29 @@ extern "C" fn toi_rt_create_closure(callee: Value, current: Value) -> u64 {
     vm.closure_of(callee, std::ptr::null_mut(), current).to_bits()
 }
 
+/// `CreateClosure` of `callee` (a `Code`) in the compiled frame `regs` of
+/// a function whose registers it captures (`create_closure_local`
+/// stencils).
+extern "C" fn toi_rt_create_closure_local(regs: Value, callee: Value) -> u64 {
+    unsafe {
+        crate::interp::create_closure_of(
+            regs.to_bits() as *mut Value,
+            callee.to_bits() as *const crate::vm::Code,
+        )
+        .to_bits()
+    }
+}
+
+/// Before compiled frame `regs` returns `acc`: its open upvalues closed
+/// (`close_upvalues` stencils); `acc`.
+extern "C" fn toi_rt_close_upvalues(regs: Value, acc: Value) -> u64 {
+    unsafe {
+        let vm = &mut *crate::interp::current_vm();
+        interp::close_frame_upvalues(vm, regs.to_bits() as *mut Value);
+    }
+    acc.to_bits()
+}
+
 /// The `arguments` of the compiled frame `regs` (`create_arguments`
 /// stencils): found through its header, as `CreateArguments` does.
 extern "C" fn toi_rt_create_arguments(regs: Value, _: Value) -> u64 {
@@ -521,6 +544,8 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_create_closure" => toi_rt_create_closure as *const () as usize,
         "toi_rt_delete" => toi_rt_delete as *const () as usize,
         "toi_rt_create_arguments" => toi_rt_create_arguments as *const () as usize,
+        "toi_rt_create_closure_local" => toi_rt_create_closure_local as *const () as usize,
+        "toi_rt_close_upvalues" => toi_rt_close_upvalues as *const () as usize,
         "toi_rt_delete_global" => toi_rt_delete_global as *const () as usize,
         "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
         "toi_rt_in" => toi_rt_in as *const () as usize,
@@ -1533,6 +1558,9 @@ struct Insn {
     /// known, and which code moved or reused across it must not cross, as
     /// a call (see `delete_m` in the stencils).
     delete: u8,
+    /// A `Nop` [`lower`] adds before the `Return` of a function whose
+    /// registers closures capture: its open upvalues closed.
+    close: bool,
 }
 
 impl Insn {
@@ -1864,6 +1892,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 nullable_this: false,
                 forward,
                 delete,
+                close: false,
             }
         })
         .collect();
@@ -1999,6 +2028,9 @@ pub(crate) enum Prop {
     /// A `delete` (`Insn::delete`): the compiled function's epoch, and
     /// its address (`Code::field_deps`), checked after it.
     Delete { epoch: u32, addr: u64 },
+    /// A `CreateClosure` capturing registers of the compiled function's
+    /// own frame: the callee's code (see `create_closure_local`).
+    ClosureLocal { callee: u64 },
     /// A `CreateClosure`: the callee's code, and the function whose
     /// upvalues it takes (an inlined frame's; 0: the frame's own).
     Closure { callee: u64, func: u64 },
@@ -3018,6 +3050,10 @@ struct Spec<'a> {
     /// type than its entry, and inference went over the loop again (71's
     /// compiles 20-37% slower).
     fixed_from: usize,
+    /// The compiled function's registers its closures capture (see
+    /// [`captured_regs`]): never typed nor copies, as a closure may write
+    /// them whenever code may run.
+    captured: &'a [bool],
 }
 
 /// What [`select`] decided for one instruction: the stencil family, the
@@ -3217,6 +3253,10 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     let wraps = spec.wraps.get(i).copied().unwrap_or(false);
     let (base, case) = match insn.op {
         _ if insn.bail => ("bail", ""),
+        _ if insn.close => {
+            out.acc = Any;
+            ("close_upvalues", "")
+        }
         // A number is never the function an inlined call expects.
         _ if insn.guard != 0 && matches!(reg, I32 | F64) => ("bail", ""),
         _ if insn.guard != 0 && insn.tail => {
@@ -3572,6 +3612,13 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         // A closure, through the runtime (see `Prop::Closure`).
         Op::CreateClosure => {
+            if let Some(Prop::ClosureLocal { callee }) = spec.props.get(i).copied() {
+                out.acc = Any;
+                return Sel {
+                    ops: Some((0, callee, 0)),
+                    ..Sel::new("create_closure_local", "", out)
+                };
+            }
             let Some(Prop::Closure { callee, func }) = spec.props.get(i).copied() else {
                 return Sel::new("bail", "", out);
             };
@@ -4474,6 +4521,16 @@ fn infer(
                 .map(|r, t| if rs_has(live, r) { t } else { Ty::Bot });
             if !out.same.is_empty() || out.acc_same.is_some() {
                 leave_dead(&mut out, &spec.reg_live[s], spec.acc_live[s]);
+            }
+            // Captured registers: whatever a closure may have stored.
+            if spec.captured.contains(&true) {
+                let mut kept = spec.reg_live[s];
+                for (r, _) in spec.captured.iter().enumerate().filter(|c| *c.1) {
+                    kept[r / 64] &= !(1u64 << (r % 64));
+                }
+                leave_dead(&mut out, &kept, spec.acc_live[s]);
+                let captured = spec.captured;
+                out.regs.map(|r, t| if captured.get(r) == Some(&true) { Ty::Any } else { t });
             }
             let changed = match &mut ins[s] {
                 Some(st) => st.join(&out),
@@ -5542,6 +5599,7 @@ fn stencil_for(
                     | "create_object"
                     | "create_regexp"
                     | "create_closure"
+                    | "create_closure_local"
                     | "create_arguments"
                     | "lda_constant"
                     | "lda_upvalue"
@@ -6775,6 +6833,7 @@ impl JitCode {
                         _ => true,
                     }
             });
+        let captured = if feedback.is_some() { captured_regs(root) } else { Vec::new() };
         let (homes, ins, mut sel) = loop {
             let spec1 = Spec {
                 widened,
@@ -6790,6 +6849,7 @@ impl JitCode {
                 rets: &rets,
                 stable_ok,
                 fixed_from: direct_base,
+                captured: &captured,
             };
             let (ins1, sels1) = infer(insns, entry, actual_live.clone(), &spec1);
             let no_widening = HashSet::default();
@@ -6813,7 +6873,14 @@ impl JitCode {
             .map(|(r, (ok, &load))| ok && (!load || live_at_entry[r]))
             .collect();
             let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
-            let stats = home_stats(insns, &ins1, nregs);
+            let mut stats = home_stats(insns, &ins1, nregs);
+            // Captured registers stay in memory, where closures' upvalues
+            // point.
+            for (r, _) in captured.iter().enumerate().filter(|c| *c.1) {
+                if r < stats.uses.len() {
+                    stats.uses[r] = 0;
+                }
+            }
             // The types and stencils with registers pinned, if any is.
             let (homes, pinned_run) = loop {
                 let homes = if opts.register_homes {
@@ -6938,6 +7005,8 @@ impl JitCode {
                     && (insns[i].reg as usize) < direct_base
                     && i + 1 < n
                     && !rs_has(&l[i + 1], insns[i].reg as usize)
+                    // (A closure may read a captured one any time.)
+                    && captured.get(insns[i].reg as usize) != Some(&true)
                 {
                     s.base = "nop";
                     s.case = "";
@@ -7090,15 +7159,17 @@ impl JitCode {
         let mut clear = Vec::new();
         let cur = crate::interp::current_vm();
         if feedback.is_some() && !cur.is_null() {
-            // (Not `this`, which the caller of a `new` frame reads after.)
+            // (Not `this`, which the caller of a `new` frame reads after;
+            // nor a captured register, which a closure may read.)
+            let kept = |r: usize| live_at_entry[r] || load_at_entry[r] || captured.get(r) == Some(&true);
             let mut r = 1;
             while r < nregs {
-                if live_at_entry[r] || load_at_entry[r] {
+                if kept(r) {
                     r += 1;
                     continue;
                 }
                 let start = r;
-                while r < nregs && !live_at_entry[r] && !load_at_entry[r] {
+                while r < nregs && !kept(r) {
                     r += 1;
                 }
                 if r - start <= 4 {
@@ -7362,6 +7433,16 @@ impl JitCode {
             }
 
             let (pre, name) = stencil_for(insn, s, st, &homes, &boxed, return_spills);
+            // A site bound to the callee's code (`CallSite::by_code`).
+            let by_code = |p: Option<&Prop>| match p {
+                Some(Prop::Call { site, .. }) => unsafe { (*vm_sites[*site as usize].get()).by_code },
+                _ => false,
+            };
+            let name = if name == "call_direct" && by_code(props.get(i)) {
+                "call_direct_code".to_string()
+            } else {
+                name
+            };
             let name = if defer_shape[i] {
                 name.replacen("set_tr_nc_", "set_own_nc_", 1).replacen("set_tr_n_nc_", "set_own_n_nc_", 1)
             } else {
@@ -7380,11 +7461,21 @@ impl JitCode {
             // A direct call to a function with upvalues: its frame's header
             // gets the function (`set_frame_func`), which the runtime's
             // calls write themselves.
-            if matches!(name.as_str(), "call_direct" | "call_direct_nc" | "construct_direct")
-                && let Some(Prop::Call { site, .. }) = props.get(i)
+            if matches!(
+                name.as_str(),
+                "call_direct" | "call_direct_nc" | "call_direct_code" | "construct_direct"
+            ) && let Some(Prop::Call { site, .. }) = props.get(i)
             {
                 let site = unsafe { &*vm_sites[*site as usize].get() };
-                if !site.callee.is_null() && !unsafe { (&(*site.callee).upvalues).is_empty() } {
+                if site.by_code {
+                    hot.push(Piece {
+                        imm64: site.f_off,
+                        ..Piece::with_imm(
+                            "set_frame_func_r",
+                            (8 * site.frame) as i32 - interp::FUNC_OFF as i32,
+                        )
+                    });
+                } else if !site.callee.is_null() && !unsafe { (&(*site.callee).upvalues).is_empty() } {
                     hot.push(Piece {
                         imm64: site.closure,
                         ..Piece::with_imm(
@@ -7454,7 +7545,7 @@ impl JitCode {
             });
             let is_call = matches!(
                 name.as_str(),
-                "call" | "call_direct" | "call_direct_nc" | "construct_direct"
+                "call" | "call_direct" | "call_direct_nc" | "call_direct_code" | "construct_direct"
             );
             // The check of a call's result exits after the call too, through
             // a stub of its own, whose record says the check failed.
@@ -8343,6 +8434,10 @@ pub(crate) struct CallSite {
     /// Claimed, but the callee was being compiled (mutual recursion): bind
     /// at a call ([`toi_rt_call`]).
     pending: bool,
+    /// Bound to the callee's code, not one closure of it (`closure` is
+    /// the `Code`): a function with upvalues, made anew at each call of
+    /// the one making it (`call_direct_code`).
+    by_code: bool,
 }
 
 /// How `construct_direct` allocates `this` for a direct `new` (read by the
@@ -8823,6 +8918,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         nullable_this: false,
         forward: false,
         delete: 0,
+        close: false,
     }
 }
 
@@ -9042,7 +9138,15 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     // Registers for the loads `hoist_loads` moves out of loops, below the
     // direct calls' frames.
     let spare_base = cx.out.nregs;
-    let spare = hoist_candidates(&cx.out).min(255usize.saturating_sub(spare_base + interp::HEADER));
+    // A function whose registers closures capture: nothing moved or reused
+    // across code that may run one (a load hoisted out of a loop, a global
+    // load reused, an allocation replaced), which may write them.
+    let captures = cx.captures(root);
+    let spare = if captures {
+        0
+    } else {
+        hoist_candidates(&cx.out).min(255usize.saturating_sub(spare_base + interp::HEADER))
+    };
     cx.out.nregs += spare;
     cx.place_direct_frames();
     // They stay in memory (`Lowered::direct_base` on): a slot each for the
@@ -9052,9 +9156,13 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
         cx.out.direct_base = cx.out.direct_base.min(spare_base);
     }
     fold_constant_tests(&mut cx.out.insns);
-    reuse_global_loads(&mut cx.out);
+    if !captures {
+        reuse_global_loads(&mut cx.out);
+    }
     fold_constant_loads(&mut cx.out, &cx.state.property_exits);
-    hoist_guards(&mut cx.out);
+    if !captures {
+        hoist_guards(&mut cx.out);
+    }
     // An int32 constant needing no check is an `LdaSmi`, which typed code
     // and fused groups handle as an immediate.
     for (i, p) in cx.out.insns.iter_mut().zip(cx.out.props.iter_mut()) {
@@ -9066,7 +9174,9 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             (i.op, i.imm, *p) = (Op::LdaSmi, k, Prop::None);
         }
     }
-    scalar_replace(&mut cx.out);
+    if !captures {
+        scalar_replace(&mut cx.out);
+    }
     // After scalar replacement: loads from objects it removed are no loads.
     // Innermost loops first, then out of the loops around them (`0`: no
     // round to go).
@@ -10576,9 +10686,13 @@ impl Lowering<'_> {
                 _ => {}
             }
             self.fwd = match i.op {
+                // (Not from a captured register, which a closure may write
+                // between the copy and the call.)
                 Op::Call | Op::CallUndefined | Op::Construct if !i.bail => {
+                    let captured = if frame == 0 { captured_regs(self.state.root) } else { Vec::new() };
                     window_sources(insns, &is_target, k)
                         .into_iter()
+                        .filter(|&(_, x)| captured.get(x as usize) != Some(&true))
                         .map(|(w, x)| (renamed(w), renamed(x)))
                         .collect()
                 }
@@ -10675,6 +10789,11 @@ impl Lowering<'_> {
                 // The function returns from its compiled code: the caller of
                 // the code (`vm_run`) finishes the return.
                 Op::Return if frame == 0 => {
+                    if self.captures(self.state.root) {
+                        let mut close = synth(Op::Nop, 0, frame, i.pc);
+                        close.close = true;
+                        self.push(close, Prop::None);
+                    }
                     self.push(i, Prop::None);
                 }
                 Op::Return => {
@@ -10704,7 +10823,8 @@ impl Lowering<'_> {
                 Op::Call | Op::CallUndefined
                     if frame == 0
                         && self.tail_call(&i, insns.get(k + 1)).is_some()
-                        && !self.frame_args(self.state.root) =>
+                        && !self.frame_args(self.state.root)
+                        && !self.captures(self.state.root) =>
                 {
                     let fo = self.tail_call(&i, insns.get(k + 1)).unwrap();
                     let jump = self.emit_tail_call(&i, fo);
@@ -10811,9 +10931,17 @@ impl Lowering<'_> {
                 Op::CreateClosure => {
                     let f = self.out.frames[frame];
                     let callee = unsafe { (&(*f.code).closures)[i.imm as usize] };
-                    let prop = Prop::Closure {
-                        callee: callee as u64,
-                        func: f.func as u64,
+                    let local = unsafe { (&(*callee).upvalues).iter().any(|&(l, _)| l) };
+                    let prop = if local {
+                        // (Only in the function's own frame: one capturing
+                        // its registers isn't inlined.)
+                        debug_assert_eq!(frame, 0);
+                        Prop::ClosureLocal { callee: callee as u64 }
+                    } else {
+                        Prop::Closure {
+                            callee: callee as u64,
+                            func: f.func as u64,
+                        }
                     };
                     self.push(i, prop);
                 }
@@ -10897,6 +11025,7 @@ impl Lowering<'_> {
             claim: None,
             pending: false,
             retry: 0,
+            by_code: false,
         }
     }
 
@@ -11020,6 +11149,14 @@ impl Lowering<'_> {
         }
         site.closure = fo as u64;
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
+        // A closure with upvalues, likely made anew at each call of the
+        // function making it (EarleyBoyer's `loop2`, made at each call of
+        // `sc_loop1_98`): any closure of its code is called directly.
+        // (Not for `new`, whose `this` comes from the closure's prototype.)
+        if i.op != Op::Construct && unsafe { !(&(*callee).upvalues).is_empty() } {
+            site.by_code = true;
+            site.closure = callee as u64;
+        }
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
         true
@@ -11184,6 +11321,14 @@ impl Lowering<'_> {
         self.decoded(code).0.iter().any(|j| j.forward || j.op == Op::CreateArguments)
     }
 
+    /// Whether closures capture registers of `code`'s frames (see
+    /// [`captured_regs`]): it isn't inlined nor compiled as a self tail
+    /// call (whose frame they would keep), and its frames' header says to
+    /// close them (`CAPTURED`, which an exit from a direct call keeps).
+    fn captures(&self, code: *const crate::vm::Code) -> bool {
+        captured_regs(code).iter().any(|&c| c)
+    }
+
     /// Whether `fo` is a bytecode function of at most [`MAX_LEAF_INSNS`]
     /// instructions that calls nothing: inlined past [`MAX_INLINE_DEPTH`],
     /// as it costs little code and inlines nothing further.
@@ -11256,8 +11401,22 @@ impl Lowering<'_> {
         }
         let callee = unsafe { (*fo).code };
         // Exceptions unwind only through interpreted frames. A function
-        // passing its arguments on reads them from its frame's header.
-        if unsafe { (*callee).interpreted } || self.forwards(callee) {
+        // passing its arguments on reads them from its frame's header; one
+        // whose registers closures capture keeps them in its own frame.
+        if unsafe { (*callee).interpreted } || self.forwards(callee) || self.captures(callee) {
+            return false;
+        }
+        // A closure this code makes (one of its frames' nested functions,
+        // with upvalues): another object at each call of the function, so
+        // a guard on this one would fail at the next (pdfjs's
+        // `Type1Parser_extractFontProgram` was compiled 29 times so, once
+        // capturing functions compiled). Called directly, by its code.
+        let made_here = self
+            .out
+            .frames
+            .iter()
+            .any(|g| unsafe { (&(*g.code).closures).contains(&callee) });
+        if made_here && unsafe { !(&(*callee).upvalues).is_empty() } {
             return false;
         }
         if !self.call_in_loop
@@ -11742,7 +11901,9 @@ impl Lowering<'_> {
                 Rc::new(reg_live_in(insns, &reachable(insns, 0), nregs, &[]))
             })
             .clone();
+        // (A closure may read a captured register any time.)
         live.get(k + 1).is_some_and(|l| !rs_has(l, r as usize))
+            && captured_regs(code).get(r as usize) != Some(&true)
     }
 
     /// Whether register `r` of frame `frame` holds `fo` for sure: its last
@@ -11982,6 +12143,22 @@ impl Lowering<'_> {
         self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
         (guard, self.emit_frame(id, depth + 1))
     }
+}
+
+/// The registers of `code`'s frames that its closures capture (an upvalue
+/// of a nested function that is a register of `code`'s: see
+/// `Code::upvalues`), by register.
+fn captured_regs(code: *const crate::vm::Code) -> Vec<bool> {
+    let code = unsafe { &*code };
+    let mut out = vec![false; code.nregs as usize];
+    for &c in &code.closures {
+        for &(local, r) in unsafe { (*c).upvalues.iter() } {
+            if local && (r as usize) < out.len() {
+                out[r as usize] = true;
+            }
+        }
+    }
+    out
 }
 
 /// `found` (a version, the accumulator for it, the register count), if
@@ -13488,8 +13665,10 @@ unsafe fn direct_exit(
             slot.as_mut().unwrap().vm_finish(code, 0, record as usize)
         };
         // Not a `new` frame, even for `new`: `toi_rt_construct` makes the
-        // result.
-        interp::write_frame_header(vm, callee_regs, site.callee, std::ptr::null(), caller, 0);
+        // result. (Marked to close upvalues if its code made closures of
+        // its registers.)
+        let captured = interp::captured_flag(callee_regs);
+        interp::write_frame_header(vm, callee_regs, site.callee, std::ptr::null(), caller, captured);
         let r = materialize(vm, callee_regs, code, frame, exit_pc, acc);
         interp::drive(vm, r.pc, r.acc, r.regs)
     }

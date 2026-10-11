@@ -428,6 +428,17 @@ extern "C" fn toi_rt_create_closure(callee: Value, current: Value) -> u64 {
     vm.closure_of(callee, std::ptr::null_mut(), current).to_bits()
 }
 
+/// The `arguments` of the compiled frame `regs` (`create_arguments`
+/// stencils): found through its header, as `CreateArguments` does.
+extern "C" fn toi_rt_create_arguments(regs: Value, _: Value) -> u64 {
+    unsafe {
+        let vm = &mut *crate::interp::current_vm();
+        let mut spread = Vec::new();
+        let (args, n) = interp::frame_args(vm, regs.to_bits() as *mut Value, &mut spread);
+        crate::builtins::arguments_object(vm, std::slice::from_raw_parts(args, n)).to_bits()
+    }
+}
+
 /// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws.
 extern "C" fn toi_rt_delete(a: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
@@ -509,6 +520,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_type_of" => toi_rt_type_of as *const () as usize,
         "toi_rt_create_closure" => toi_rt_create_closure as *const () as usize,
         "toi_rt_delete" => toi_rt_delete as *const () as usize,
+        "toi_rt_create_arguments" => toi_rt_create_arguments as *const () as usize,
         "toi_rt_delete_global" => toi_rt_delete_global as *const () as usize,
         "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
         "toi_rt_in" => toi_rt_in as *const () as usize,
@@ -1793,6 +1805,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::LdaConstant if vm => {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
                 }
+                // Its register: where the `arguments` go.
+                Op::CreateArguments if vm => reg = code[pc + 1],
                 // The nested function's index in `imm`.
                 Op::CreateClosure if vm => imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32,
                 // The pattern's constant in `imm`, the flags' in `ic`.
@@ -3549,6 +3563,12 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             } else {
                 ("test_seq", "")
             }
+        }
+        // The compiled function's own `arguments` (see `Lowering`'s
+        // `CreateArguments`): an array.
+        Op::CreateArguments => {
+            out.acc = Any;
+            return Sel::new("create_arguments", "", out);
         }
         // A closure, through the runtime (see `Prop::Closure`).
         Op::CreateClosure => {
@@ -5522,6 +5542,7 @@ fn stencil_for(
                     | "create_object"
                     | "create_regexp"
                     | "create_closure"
+                    | "create_arguments"
                     | "lda_constant"
                     | "lda_upvalue"
                     | "lda_upvalue_c"
@@ -5572,6 +5593,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::CreateObject
                 | Op::CreateRegExp
                 | Op::CreateClosure
+                | Op::CreateArguments
                 | Op::LdaConstant
         )
     };
@@ -8254,6 +8276,9 @@ struct InlineFrame {
     parent: usize,
     /// Where the parent resumes after the call, in its bytecode.
     ret_pc: usize,
+    /// The call's arguments: the first one's register (renamed into the
+    /// compiled frame) and their count, for the callee's `arguments`.
+    args: (u8, u8),
 }
 
 /// A call compiled code makes (`call` and `call_direct` stencils): `op`'s
@@ -8987,6 +9012,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
                 base: 0,
                 parent: 0,
                 ret_pc: 0,
+                args: (0, 0),
             }],
             fbs: Vec::new(),
             sites: Vec::new(),
@@ -9417,6 +9443,7 @@ fn reads_acc(insn: &Insn) -> bool {
                 | Op::CreateObject
                 | Op::CreateClosure
                 | Op::CreateRegExp
+                | Op::CreateArguments
                 | Op::Call
                 | Op::CallUndefined
                 | Op::Construct
@@ -10541,7 +10568,8 @@ impl Lowering<'_> {
                 | Op::TestIn
                 | Op::GetNamed
                 | Op::SetNamed
-                | Op::GetKeyed => i.reg = renamed(i.reg),
+                | Op::GetKeyed
+                | Op::CreateArguments => i.reg = renamed(i.reg),
                 Op::Mov | Op::Call | Op::CallUndefined | Op::Construct | Op::SetKeyed => {
                     (i.reg, i.reg2) = (renamed(i.reg), renamed(i.reg2))
                 }
@@ -10671,8 +10699,12 @@ impl Lowering<'_> {
                     i.bail = true;
                     self.push(i, Prop::None);
                 }
+                // (Not in a function that finds its arguments through its
+                // frame's header, which a self tail call keeps.)
                 Op::Call | Op::CallUndefined
-                    if frame == 0 && self.tail_call(&i, insns.get(k + 1)).is_some() =>
+                    if frame == 0
+                        && self.tail_call(&i, insns.get(k + 1)).is_some()
+                        && !self.frame_args(self.state.root) =>
                 {
                     let fo = self.tail_call(&i, insns.get(k + 1)).unwrap();
                     let jump = self.emit_tail_call(&i, fo);
@@ -10736,6 +10768,33 @@ impl Lowering<'_> {
                 _ if i.jumps() => {
                     let x = self.push(i, Prop::None);
                     fix.push(x);
+                }
+                // `arguments`, into `acc` and then its register. In an
+                // inlined frame, an array of the call's arguments, pushed
+                // (an exit in it does it again in the interpreter, from the
+                // frame's call); in the compiled function's own, from the
+                // runtime (`create_arguments`). (Not where `acc` lives on.)
+                Op::CreateArguments if acc_out[k] => {
+                    i.bail = true;
+                    self.push(i, Prop::None);
+                }
+                Op::CreateArguments => {
+                    let r = i.reg;
+                    if frame == 0 {
+                        self.push(i, Prop::None);
+                    } else {
+                        let (first, n) = self.out.frames[frame].args;
+                        self.push(synth(Op::CreateArray, 0, frame, i.pc), Prop::None);
+                        self.push(synth(Op::Star, r, frame, i.pc), Prop::None);
+                        for a in 0..n {
+                            self.push(synth(Op::Ldar, first + a, frame, i.pc), Prop::None);
+                            let mut push = synth(Op::Call, r, frame, i.pc);
+                            (push.reg2, push.imm, push.native) = (r, 0, 1);
+                            self.push(push, Prop::None);
+                        }
+                        continue;
+                    }
+                    self.push(synth(Op::Star, r, frame, i.pc), Prop::None);
                 }
                 // A delete, then the compiled function's epoch checked, as
                 // after a call.
@@ -10937,7 +10996,7 @@ impl Lowering<'_> {
         // Nor a `that` of `f.call(that, …)` to convert: the runtime does.
         // Nor a function passing its arguments on, which reads them from
         // its frame's header (see `Insn::forward`).
-        if unsafe { (*callee).interpreted } || self.nullable_this(i, fo) || self.forwards(callee) {
+        if unsafe { (*callee).interpreted } || self.nullable_this(i, fo) || self.frame_args(callee) {
             return false;
         }
         // A constructor's `this` is allocated by the call
@@ -11115,6 +11174,14 @@ impl Lowering<'_> {
     /// Whether `code` passes its own arguments on (see `Insn::forward`).
     fn forwards(&mut self, code: *const crate::vm::Code) -> bool {
         self.decoded(code).0.iter().any(|j| j.forward)
+    }
+
+    /// Whether `code` finds its arguments through its frame's header:
+    /// it passes them on, or makes `arguments` (in its own frame; an
+    /// inlined one's come from its call). A direct call or a self tail
+    /// call's frame has no header for them.
+    fn frame_args(&mut self, code: *const crate::vm::Code) -> bool {
+        self.decoded(code).0.iter().any(|j| j.forward || j.op == Op::CreateArguments)
     }
 
     /// Whether `fo` is a bytecode function of at most [`MAX_LEAF_INSNS`]
@@ -11862,6 +11929,7 @@ impl Lowering<'_> {
             base,
             parent: frame,
             ret_pc: i.pc + i.op.size(),
+            args: (i.reg2 + u8::from(i.op == Op::Call), i.imm as u8),
         });
         self.out.fbs.push(self.feedback(callee));
         self.out.nregs = self.out.nregs.max(base + c.nregs as usize);

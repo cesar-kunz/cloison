@@ -2701,9 +2701,7 @@ fn has_loop(f: &crate::asm::FunctionDef) -> bool {
 fn interpreted(f: &crate::asm::FunctionDef) -> bool {
     !f.handlers.is_empty()
         || f.captures
-        || ops(f).any(|op| {
-            matches!(op, crate::bytecode::Op::CreateArguments | crate::bytecode::Op::LdaCallee)
-        })
+        || ops(f).any(|op| op == crate::bytecode::Op::LdaCallee)
 }
 
 /// See [`has_loop`].

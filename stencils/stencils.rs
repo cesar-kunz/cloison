@@ -153,6 +153,7 @@ unsafe extern "C" {
     fn toi_rt_type_of();
     fn toi_rt_create_closure();
     fn toi_rt_delete();
+    fn toi_rt_create_arguments();
     fn toi_rt_delete_global();
     fn toi_rt_set_keyed();
 }
@@ -1868,6 +1869,15 @@ stencil!("test_instanceof_m"; |s| {
     s.acc = Value::from_bits(r);
     next!(s)
 });
+// `CreateArguments` in the compiled function's own frame: its `arguments`
+// (an array of the arguments it was called with) from the runtime, which
+// finds them through the frame's header. (An inlined frame's are built
+// from its call's arguments: see `jit::Lowering::emit_frame`.)
+stencil!("create_arguments"; |s| {
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_create_arguments, Value::from_bits(s.regs as u64), Value::UNDEFINED));
+    next!(s)
+});
+
 // `delete r[a][acc]` (`delete_m`) and `delete <global named acc>`
 // (`delete_global_m`), from the runtime; then, as after a call, the
 // function's epoch (`imm64b` points to it) must be what its code was

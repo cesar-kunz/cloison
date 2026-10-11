@@ -1943,24 +1943,44 @@ pub(crate) fn new_regexp(vm: &mut Vm, pattern: &str, flags: &str) -> Result<Valu
             p
         }
     };
+    let source = if pattern.is_empty() { "(?:)" } else { pattern };
+    let source = str_value(vm, source);
+    Ok(regexp_object(vm, re, source))
+}
+
+/// A regular expression literal's object, its pattern and flags string
+/// constants compiled once.
+pub(crate) fn regexp_literal(vm: &mut Vm, pattern: Value, flags: Value) -> Result<Value> {
+    let key = (pattern.to_bits(), flags.to_bits());
+    let re = match vm.regexp_literals.get(&key) {
+        Some(&re) => re,
+        None => {
+            let (p, f) = (String::from_utf16_lossy(&units(pattern)), String::from_utf16_lossy(&units(flags)));
+            let made = new_regexp(vm, &p, &f)?;
+            vm.regexp_literals.insert(key, regexp_of(made).unwrap());
+            return Ok(made);
+        }
+    };
+    Ok(regexp_object(vm, re, pattern))
+}
+
+/// A `RegExp` object for `re`, with `source`.
+fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) -> Value {
     let proto = object_value(vm.regexp_prototype);
     let o = vm.new_object_with(Class::RegExp, proto, 6);
     unsafe { (*o).code = re.cast() };
-    let source = if pattern.is_empty() { "(?:)" } else { pattern };
-    let source = str_value(vm, source);
     let r = unsafe { &*re };
-    for (name, v) in [
-        ("lastIndex", Value::from_i32(0)),
-        ("source", source),
-        ("global", Value::from_bool(r.global)),
-        ("ignoreCase", Value::from_bool(r.ignore_case)),
-        ("multiline", Value::from_bool(r.multiline)),
+    for (a, v) in [
+        (vm.a_last_index, Value::from_i32(0)),
+        (vm.a_source, source),
+        (vm.a_global, Value::from_bool(r.global)),
+        (vm.a_ignore_case, Value::from_bool(r.ignore_case)),
+        (vm.a_multiline, Value::from_bool(r.multiline)),
     ] {
-        let a = vm.intern(name);
-        let attrs = if name == "lastIndex" { DONT_ENUM } else { DONT_ENUM | READ_ONLY };
+        let attrs = if a == vm.a_last_index { DONT_ENUM } else { DONT_ENUM | READ_ONLY };
         vm.add_property_with(o, a, v, attrs);
     }
-    Ok(object_value(o))
+    object_value(o)
 }
 
 /// `v`'s compiled regular expression, if it is a `RegExp`.
@@ -2006,7 +2026,7 @@ fn this_regexp<'a>(this: Value) -> Result<&'a crate::regexp::Regex> {
 /// The match of `re` (the object `this`) in `s` where `exec` looks: from
 /// `lastIndex` if global (then set past the match, or to 0 on none).
 fn regexp_match(vm: &mut Vm, this: Value, re: &crate::regexp::Regex, s: &[u16]) -> Result<Option<crate::regexp::Captures>> {
-    let a_last = vm.intern("lastIndex");
+    let a_last = vm.a_last_index;
     let start = if re.global {
         let li = to_number(vm.get(this, a_last)?);
         if li.is_nan() || li < 0.0 { 0 } else { li as usize }
@@ -2037,16 +2057,19 @@ fn match_array(vm: &mut Vm, caps: &crate::regexp::Captures, s: &[u16], input: Va
         .collect();
     let arr = vm.new_array();
     crate::vm::array_push(vm, arr, &parts)?;
-    let (a_index, a_input) = (vm.intern("index"), vm.intern("input"));
-    vm.set(arr, a_index, Value::from_i32(caps[0].unwrap().0 as i32))?;
-    vm.set(arr, a_input, input)?;
+    // Defined, as ECMAScript's CreateDataProperty does (no setters).
+    let o = as_object(arr);
+    let (a_index, a_input) = (vm.a_index, vm.a_input);
+    vm.add_property_with(o, a_index, Value::from_i32(caps[0].unwrap().0 as i32), 0);
+    vm.add_property_with(o, a_input, input, 0);
     Ok(arr)
 }
 
 fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = this_regexp(this)?;
     let input = string_fn(vm, Value::UNDEFINED, &a[..a.len().min(1)])?;
-    let s = units(input).into_owned();
+    // Borrowed: strings don't change, and the stack scan keeps `input`.
+    let s = units(input);
     match regexp_match(vm, this, re, &s)? {
         Some(caps) => match_array(vm, &caps, &s, input),
         None => Ok(Value::NULL),
@@ -2055,7 +2078,7 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = this_regexp(this)?;
-    let s = units(arg(a, 0)).into_owned();
+    let s = units(arg(a, 0));
     Ok(Value::from_bool(regexp_match(vm, this, re, &s)?.is_some()))
 }
 
@@ -2079,7 +2102,7 @@ fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
 /// none).
 fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let s = this_units(this)?.into_owned();
+    let s = this_units(this)?;
     let rv = as_regexp(vm, arg(a, 0))?;
     let re = regexp_of(rv).unwrap();
     let input = this_string(vm, this, &s);
@@ -2110,7 +2133,7 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let s = this_units(this)?.into_owned();
+    let s = this_units(this)?;
     let rv = as_regexp(vm, arg(a, 0))?;
     let re = regexp_of(rv).unwrap();
     Ok(Value::from_i32(re.exec(&s, 0).map_or(-1, |c| c[0].unwrap().0 as i32)))
@@ -2121,7 +2144,7 @@ fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// a string (with `$&`, `$1`…, `$$`, `` $` ``, `$'`) or a function's
 /// result (called with the match, the groups, the index and `s`).
 fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let s = this_units(this)?.into_owned();
+    let s = this_units(this)?;
     let pattern = arg(a, 0);
     let replacement = arg(a, 1);
     let func = replacement.is_cell()

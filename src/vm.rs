@@ -2520,6 +2520,7 @@ impl Vm {
                     calls_interpret: Cell::new(false),
                     calls_left: Cell::new(match (has_loop(f), recursive || large(f)) {
                         _ if interpreted(f) => i32::MAX,
+                        _ if f.captures && ops(f).count() > CAPTURING_ENTRY_SIZE => i32::MAX,
                         (true, _) => self.tier_calls,
                         (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
                         (false, false) => i32::MAX,
@@ -2725,6 +2726,16 @@ const LOOP_FREE_CALLS: i32 = 5;
 
 /// See [`large`].
 const ENTRY_COMPILE_SIZE: usize = 64;
+
+/// A function whose registers its closures capture and of more
+/// instructions than this: calls never enter compiled code (its loops
+/// may). Its compiled code costs more (captured registers in memory,
+/// nothing hoisted), and such a function is mostly a driver making
+/// closures: TypeScript's checkers (100 to 4,000 instructions), each
+/// called a few thousand times, compiled ~10 times each and ran compiled
+/// hardly at all; EarleyBoyer's hot ones (`loop2`, `deriv_trees`) have
+/// fewer than 100.
+const CAPTURING_ENTRY_SIZE: usize = 100;
 
 /// Which of `module`'s functions look recursive: they reach themselves
 /// through the names their inline caches look up (`LdaGlobal fib` in

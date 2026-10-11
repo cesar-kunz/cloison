@@ -11138,8 +11138,13 @@ impl Lowering<'_> {
         site.self_call = callee == self.state.root && i.op != Op::Construct;
         // Warm code calls directly only code compiled already (itself
         // included): binding compiles the callee, which a warm caller
-        // shouldn't pay for (its callees tier up on their own).
-        if self.state.tier == Tier::Warm && !site.self_call {
+        // shouldn't pay for (its callees tier up on their own). Nor does
+        // a call compile a function whose registers closures capture
+        // before its calls made it hot (its countdown ran out): CodeLoad's,
+        // made anew by each run's code and called a few times, were
+        // compiled so, for nothing.
+        let cold_capturing = self.captures(callee) && unsafe { (*callee).calls_left.get() } > 0;
+        if (self.state.tier == Tier::Warm || cold_capturing) && !site.self_call {
             let compiled = unsafe { (*callee).jit.try_borrow() }
                 .ok()
                 .is_some_and(|f| f.as_ref().is_some_and(|f| !f.versions.is_empty()));

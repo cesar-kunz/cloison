@@ -151,6 +151,7 @@ unsafe extern "C" {
     fn toi_rt_get_keyed();
     fn toi_rt_create_regexp();
     fn toi_rt_type_of();
+    fn toi_rt_create_closure();
     fn toi_rt_set_keyed();
 }
 
@@ -3644,6 +3645,23 @@ stencil_slow!("create_object"; |s| {
 // the 64-bit immediate).
 stencil!("create_array"; |s| {
     s.acc = Value::from_bits(rt_call!(s, toi_rt_create_array, Value::from_bits(imm64()), Value::UNDEFINED));
+    next!(s)
+});
+
+// `CreateClosure`: a new function of the code that is the 64-bit
+// immediate, from the runtime, its upvalues the enclosing function's: the
+// second immediate (an inlined frame's, known), or (0) the frame's own,
+// in its header at `regs - imm` words.
+stencil!("create_closure"; |s| {
+    let current = match imm64b() {
+        0 => *(s.regs as *const u64).sub(imm() as usize),
+        f => f,
+    };
+    let r = rt_call!(s, toi_rt_create_closure, Value::from_bits(imm64()), Value::from_bits(current));
+    if r == 0 {
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 

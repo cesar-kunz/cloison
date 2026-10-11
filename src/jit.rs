@@ -415,6 +415,19 @@ extern "C" fn toi_rt_get_keyed(a: Value, b: Value) -> u64 {
     vm.get_keyed(a, b).map_or(0, |v| v.to_bits())
 }
 
+/// A new closure of `callee` (a `Code`) taking its upvalues from function
+/// `current` (`create_closure` stencils); 0 if it would capture the
+/// frame's registers (a function doing that isn't compiled).
+extern "C" fn toi_rt_create_closure(callee: Value, current: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    let callee = callee.to_bits() as *const crate::vm::Code;
+    if unsafe { (*callee).upvalues.iter().any(|&(local, _)| local) } {
+        return 0;
+    }
+    let current = current.to_bits() as *const Object;
+    vm.closure_of(callee, std::ptr::null_mut(), current).to_bits()
+}
+
 /// `typeof a`: a string constant (`type_of` stencils).
 extern "C" fn toi_rt_type_of(a: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
@@ -480,6 +493,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_get_keyed" => toi_rt_get_keyed as *const () as usize,
         "toi_rt_create_regexp" => toi_rt_create_regexp as *const () as usize,
         "toi_rt_type_of" => toi_rt_type_of as *const () as usize,
+        "toi_rt_create_closure" => toi_rt_create_closure as *const () as usize,
         "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
         "toi_rt_in" => toi_rt_in as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
@@ -1746,6 +1760,8 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::LdaConstant if vm => {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
                 }
+                // The nested function's index in `imm`.
+                Op::CreateClosure if vm => imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32,
                 // The pattern's constant in `imm`, the flags' in `ic`.
                 Op::CreateRegExp if vm => {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
@@ -1932,6 +1948,9 @@ pub(crate) enum Prop {
     /// An upvalue of an inlined frame's function, known: its cell
     /// (`vm::Upvalue`), at address `cell`.
     Upvalue { cell: u64 },
+    /// A `CreateClosure`: the callee's code, and the function whose
+    /// upvalues it takes (an inlined frame's; 0: the frame's own).
+    Closure { callee: u64, func: u64 },
     /// A keyed load whose receivers were typed arrays of element kind
     /// `kind` (`object::TypedKind`; see `tget_*` in the stencils).
     Typed { kind: u8 },
@@ -3493,6 +3512,17 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             } else {
                 ("test_seq", "")
             }
+        }
+        // A closure, through the runtime (see `Prop::Closure`).
+        Op::CreateClosure => {
+            let Some(Prop::Closure { callee, func }) = spec.props.get(i).copied() else {
+                return Sel::new("bail", "", out);
+            };
+            out.acc = Any;
+            return Sel {
+                ops: Some(((interp::FUNC_OFF / 8) as i32, callee, func)),
+                ..Sel::new("create_closure", "", out)
+            };
         }
         // `typeof acc`: a constant if `acc`'s type says which, else
         // through the runtime.
@@ -5440,6 +5470,7 @@ fn stencil_for(
                     | "create_array"
                     | "create_object"
                     | "create_regexp"
+                    | "create_closure"
                     | "lda_constant"
                     | "lda_upvalue"
                     | "lda_upvalue_c"
@@ -5489,6 +5520,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::CreateArray
                 | Op::CreateObject
                 | Op::CreateRegExp
+                | Op::CreateClosure
                 | Op::LdaConstant
         )
     };
@@ -10647,6 +10679,17 @@ impl Lowering<'_> {
                 _ if i.jumps() => {
                     let x = self.push(i, Prop::None);
                     fix.push(x);
+                }
+                // A closure: its code, and the function whose upvalues it
+                // takes, known in an inlined frame (its checked callee).
+                Op::CreateClosure => {
+                    let f = self.out.frames[frame];
+                    let callee = unsafe { (&(*f.code).closures)[i.imm as usize] };
+                    let prop = Prop::Closure {
+                        callee: callee as u64,
+                        func: f.func as u64,
+                    };
+                    self.push(i, prop);
                 }
                 // An upvalue: in an inlined frame, of its (checked) callee,
                 // whose cells are known; in the root frame, through the

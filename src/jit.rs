@@ -491,15 +491,30 @@ extern "C" fn toi_rt_create_regexp(p: Value, f: Value) -> u64 {
 }
 
 /// `args[0][args[1]] = args[2]` (what `set_keyed` stencils don't store
-/// themselves: a typed array's element, one past an array's length, …);
-/// 0 where it would throw or make a named property (the interpreter
-/// does it). It may change the elements' type, so the receiver's shape:
-/// `set_keyed_rt` forgets exact shapes.
+/// themselves: a typed array's element, one past an array's length, a
+/// named property, …); 0 where it would throw or run code (the
+/// interpreter does it). It may change the elements' type, so the
+/// receiver's shape: `set_keyed_rt` forgets exact shapes (a named
+/// property's transition gives a shape extending the old one).
 extern "C" fn toi_rt_set_keyed(args: Value, _: Value) -> u64 {
     use crate::object::Class;
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
     let (o, key, v) = (a[0], a[1], a[2]);
+    // A named property (a table keyed by strings: TypeScript's hash
+    // tables left at each `this.table[key] = data` once given up on, 391
+    // times a run in `find`). If that changed what compiled code relies
+    // on (an epoch moved), leave: the interpreter stores again, the same.
+    if o.is_cell()
+        && key.is_cell()
+        && unsafe { (*crate::object::as_object(key)).class } == Class::String
+    {
+        let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
+        return u64::from(
+            vm.set_named_plain(o, key, v).is_some()
+                && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before,
+        );
+    }
     if !o.is_cell() || !key.is_int32() || key.as_i32_unchecked() < 0 {
         return 0;
     }

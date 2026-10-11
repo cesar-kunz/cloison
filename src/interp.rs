@@ -716,34 +716,28 @@ handlers! {
     // `f.apply(that, list)`), or the runtime's (`Vm::pending_args`).
     fn op_create_arguments(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
-        let ret: *const u8 = header(regs, RET_PC);
-        let caller: *mut Value = header(regs, CALLER);
-        let spread;
-        let (args, argc): (*const Value, usize) = if ret.is_null() || caller.is_null() {
-            vm.pending_args
-        } else {
-            let call = ret.sub(Op::Call.size());
-            let (f, w, n) = (*call.add(1) as usize, *call.add(2) as usize, *call.add(3) as usize);
-            match Op::from_u8(*call) {
-                Some(Op::Call) => {
-                    let fv = *caller.add(f);
-                    let this = *caller.add(w);
-                    if unwrap_call(vm, fv, this).is_some() {
-                        (caller.add(w + 2).cast_const(), n.saturating_sub(1))
-                    } else if unwrap_apply(vm, fv, this).is_some() {
-                        let list = if n < 2 { Value::UNDEFINED } else { *caller.add(w + 2) };
-                        spread = crate::builtins::apply_list(list).unwrap_or_default();
-                        (spread.as_ptr(), spread.len())
-                    } else {
-                        (caller.add(w + 1).cast_const(), n)
-                    }
-                }
-                _ => (caller.add(w).cast_const(), n),
-            }
-        };
+        let mut spread = Vec::new();
+        let (args, argc) = frame_args(vm, regs, &mut spread);
         let values = std::slice::from_raw_parts(args, argc);
         *reg(pc, 1, regs) = crate::builtins::arguments_object(vm, values);
         next!(any, Op::CreateArguments.size(), acc)
+    }
+
+    // `g.apply(x, arguments)` with the frame's arguments: `g` called with
+    // them as they are, or (`apply` not the builtin's, or `g` not a
+    // bytecode function) the object made, and the call `Call`'s.
+    fn op_call_apply_arguments(pc, acc, regs, tag) {
+        let vm = frame_vm(regs);
+        let w = reg(pc, 2, regs);
+        let mut spread = Vec::new();
+        let (args, argc) = frame_args(&mut *vm, regs, &mut spread);
+        if let Some(fo) = unwrap_apply(vm, *reg(pc, 1, regs), *w) {
+            let that = sloppy_this(vm, *w.add(1));
+            enter!(fo, that, args, argc, 0, Op::CallApplyArguments.size())
+        }
+        let values = std::slice::from_raw_parts(args, argc);
+        *w.add(2) = crate::builtins::arguments_object(&mut *vm, values);
+        tail!(op_call, acc)
     }
 
     fn op_test_instance_of(pc, acc, regs, tag) {
@@ -2869,6 +2863,7 @@ static TABLE: Table = {
     t[Op::JumpIfToBooleanFalse as usize] = op_jump_if_to_boolean_false;
     t[Op::LdaGlobal as usize] = op_lda_global;
     t[Op::CreateArguments as usize] = op_create_arguments;
+    t[Op::CallApplyArguments as usize] = op_call_apply_arguments;
     t[Op::TestInstanceOf as usize] = op_test_instance_of;
     t[Op::TestIn as usize] = op_test_in;
     t[Op::DeleteProperty as usize] = op_delete_property;
@@ -2971,6 +2966,7 @@ static TABLE_I32: Table = {
     t[Op::Call as usize] = op_call;
     t[Op::CallUndefined as usize] = op_call_undefined;
     t[Op::Construct as usize] = op_construct;
+    t[Op::CallApplyArguments as usize] = op_call_apply_arguments;
     t[Op::Mov as usize] = i32_mov;
     t[Op::ModSmi as usize] = i32_mod_smi;
     t[Op::BitAndSmi as usize] = i32_bit_and_smi;
@@ -3193,6 +3189,48 @@ unsafe fn with_top<T>(regs: *mut Value, top: Option<*mut Value>, f: impl FnOnce(
         let r = f(vm);
         (*frame_vm(regs)).native_top = saved;
         r
+    }
+}
+
+/// The arguments frame `regs` was called with, extra ones included (its
+/// `arguments`): from the call instruction that made it, or for a frame
+/// the runtime made (no call instruction), `Vm::pending_args`. `spread`
+/// holds them when they are a list's (`f.apply(that, list)`).
+///
+/// # Safety
+/// `regs` must be a frame on the VM stack whose caller (if a call
+/// instruction made it) is still there, its registers as at the call.
+pub(crate) unsafe fn frame_args(
+    vm: &mut Vm,
+    regs: *mut Value,
+    spread: &mut Vec<Value>,
+) -> (*const Value, usize) {
+    unsafe {
+        let ret: *const u8 = header(regs, RET_PC);
+        let caller: *mut Value = header(regs, CALLER);
+        if ret.is_null() || caller.is_null() {
+            return vm.pending_args;
+        }
+        // (Every call instruction has `Call`'s size.)
+        let call = ret.sub(Op::Call.size());
+        let (f, w, n) = (*call.add(1) as usize, *call.add(2) as usize, *call.add(3) as usize);
+        let (fv, this) = (*caller.add(f), *caller.add(w));
+        match Op::from_u8(*call) {
+            Some(Op::Call) if unwrap_call(vm, fv, this).is_some() => {
+                (caller.add(w + 2).cast_const(), n.saturating_sub(1))
+            }
+            Some(Op::Call) if unwrap_apply(vm, fv, this).is_some() => {
+                let list = if n < 2 { Value::UNDEFINED } else { *caller.add(w + 2) };
+                *spread = crate::builtins::apply_list(list).unwrap_or_default();
+                (spread.as_ptr(), spread.len())
+            }
+            // The caller's own arguments, passed on.
+            Some(Op::CallApplyArguments) if unwrap_apply(vm, fv, this).is_some() => {
+                frame_args(vm, caller, spread)
+            }
+            Some(Op::Call | Op::CallApplyArguments) => (caller.add(w + 1).cast_const(), n),
+            _ => (caller.add(w).cast_const(), n),
+        }
     }
 }
 
@@ -3764,8 +3802,26 @@ pub(crate) unsafe fn call_from_jit(
     unsafe {
         let mut fv = *regs.add(f);
         let (mut this, mut args, mut argc) = match op {
-            Op::Call => (*regs.add(w), regs.add(w + 1), argc),
+            Op::Call | Op::CallApplyArguments => (*regs.add(w), regs.add(w + 1), argc),
             _ => (object_value(vm.global), regs.add(w), argc),
+        };
+        // `g.apply(x, arguments)` passing the frame's arguments: `g` called
+        // with them, or `apply` (not the builtin's, or `g` native) called
+        // with `x` and the `arguments` object, as `Call` would.
+        let mut forwarded = Vec::new();
+        let mut pair: [Value; 2];
+        let op = if op == Op::CallApplyArguments {
+            let (a, n) = frame_args(vm, regs, &mut forwarded);
+            if let Some(fo) = unwrap_apply(vm, fv, this) {
+                (fv, this) = (object_value(fo), *args);
+                (args, argc) = (a.cast_mut(), n);
+            } else {
+                pair = [*args, crate::builtins::arguments_object(vm, std::slice::from_raw_parts(a, n))];
+                (args, argc) = (pair.as_mut_ptr(), 2);
+            }
+            Op::Call
+        } else {
+            op
         };
         let bytecode = fv.is_cell() && (*as_object(fv)).class == Class::Function;
         // `f.apply(that, list)`'s arguments (alive until the call returns).

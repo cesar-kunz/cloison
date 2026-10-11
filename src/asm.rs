@@ -322,7 +322,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             }
             // A call's argument window counts as used registers.
             if let [_, Arg::Reg(w), Arg::Count(c), ..] = args[..] {
-                let extra = usize::from(op == Op::Call);
+                let extra = usize::from(matches!(op, Op::Call | Op::CallApplyArguments));
                 nregs = nregs.max(w as usize + c as usize + extra);
             }
             a.emit(op, &args);

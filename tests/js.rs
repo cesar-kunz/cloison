@@ -595,6 +595,36 @@ run();
     );
 }
 
+/// A function big enough for only four compilations (`max_compiles`)
+/// whose loop overflows int32 at five instructions, one after another,
+/// each exit widening one: past the fourth, the last version is kept and
+/// entered (the values it was compiled for still fit at the loop header),
+/// exiting again wherever it overflows, which it was compiled before
+/// widening. Before, the function ran in the interpreter from there on
+/// (zlib's `a1`, for most of its run).
+#[test]
+fn a_function_out_of_compilations_keeps_its_last_version() {
+    let pad: String = (0..900)
+        .map(|k| format!("    s = (s + (i ^ {k}) * {}) | 0;\n", k % 7 + 1))
+        .collect();
+    let src = format!(
+        "function big(n, neg) {{
+  var s = 0;
+  for (var i = 0; i < n; i++) {{
+{pad}    var u = (i % 1000 === 100 ? neg : i) >>> 0;
+    var z = -(i % 1000 === 200 ? 0 : 1);
+    var m = (i % 1000 === 300 ? 65536 : 1) * 65536;
+    var a = (i % 1000 === 400 ? 2147483647 : 1) + i;
+    var w = (i % 1000 === 500 ? neg - i : i) >>> 0;
+    s = (s + u % 1000 + (1 / z > 0 ? 1 : 2) + m % 999 + a % 997 + w % 991) % 1000003;
+  }}
+  return s;
+}}
+big(8000, -5);"
+    );
+    assert_eq!(value(&src), "662330");
+}
+
 /// Two calls inlined into one loop share their frames' registers: `at`'s
 /// int32 parameter and the array `size` loads into the same register. The
 /// `length` load after it was compiled as an exit to the interpreter

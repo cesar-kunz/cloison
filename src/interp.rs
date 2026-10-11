@@ -2294,7 +2294,7 @@ compare_jump!(
 );
 
 #[inline(never)]
-fn create_closure(regs: *mut Value, i: u16) -> Value {
+pub(crate) fn create_closure(regs: *mut Value, i: u16) -> Value {
     unsafe {
         (*frame_vm(regs)).safepoint(regs);
         let code = &*frame_code(regs);
@@ -3189,6 +3189,47 @@ unsafe fn with_top<T>(regs: *mut Value, top: Option<*mut Value>, f: impl FnOnce(
         let r = f(vm);
         (*frame_vm(regs)).native_top = saved;
         r
+    }
+}
+
+/// A new closure of `callee`, which captures registers of frame `regs`
+/// (compiled code's `CreateClosure`, which knows `callee`; the frame's
+/// header may not have its code, but has its function if that has
+/// upvalues). The frame is marked to close them when it ends.
+///
+/// # Safety
+/// `regs` must be a frame with `FLAGS` and (if `callee` takes upvalues of
+/// the frame's function) `FUNC` in its header.
+pub(crate) unsafe fn create_closure_of(regs: *mut Value, callee: *const Code) -> Value {
+    unsafe {
+        let vm = &mut *current_vm();
+        vm.safepoint(regs);
+        *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
+        let current: *const crate::object::Object = header(regs, FUNC);
+        vm.closure_of(callee, regs, current)
+    }
+}
+
+/// Frame `regs`' `CAPTURED` flag (to keep when its header is written
+/// again: see `jit::direct_exit`).
+///
+/// # Safety
+/// `regs` must be a frame whose `FLAGS` is written.
+pub(crate) unsafe fn captured_flag(regs: *mut Value) -> u64 {
+    unsafe { (*regs.sub(FLAGS)).to_bits() & CAPTURED }
+}
+
+/// Close the open upvalues of frame `regs`' registers if it made any
+/// (its `Return` does it in the interpreter; compiled code's, through the
+/// runtime).
+///
+/// # Safety
+/// `regs` must be a frame with its header.
+pub(crate) unsafe fn close_frame_upvalues(vm: &mut Vm, regs: *mut Value) {
+    unsafe {
+        if (*regs.sub(FLAGS)).to_bits() & CAPTURED != 0 {
+            vm.close_upvalues(regs);
+        }
     }
 }
 

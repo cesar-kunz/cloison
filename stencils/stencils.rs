@@ -154,6 +154,8 @@ unsafe extern "C" {
     fn toi_rt_create_closure();
     fn toi_rt_delete();
     fn toi_rt_create_arguments();
+    fn toi_rt_create_closure_local();
+    fn toi_rt_close_upvalues();
     fn toi_rt_delete_global();
     fn toi_rt_set_keyed();
 }
@@ -1869,6 +1871,21 @@ stencil!("test_instanceof_m"; |s| {
     s.acc = Value::from_bits(r);
     next!(s)
 });
+// `CreateClosure` of a function capturing registers of this frame, the
+// compiled function's own (one doing so isn't inlined): the runtime's, as
+// the interpreter's, the closure's index the 64-bit immediate.
+stencil!("create_closure_local"; |s| {
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_create_closure_local, Value::from_bits(s.regs as u64), Value::from_bits(imm64())));
+    next!(s)
+});
+
+// Before the `Return` of a function whose registers closures capture: its
+// open upvalues closed, if it made any (`acc`, boxed, kept).
+stencil!("close_upvalues"; |s| {
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_close_upvalues, Value::from_bits(s.regs as u64), s.acc));
+    next!(s)
+});
+
 // `CreateArguments` in the compiled function's own frame: its `arguments`
 // (an array of the arguments it was called with) from the runtime, which
 // finds them through the frame's header. (An inlined frame's are built
@@ -4462,6 +4479,11 @@ stencil!("set_frame_func"; |s| {
     *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = imm64();
     next!(s)
 });
+// The same, of the function the callee register (at byte `imm64`) holds.
+stencil!("set_frame_func_r"; |s| {
+    *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = *((s.regs as *const u8).add(imm64() as usize) as *const u64);
+    next!(s)
+});
 stencil!("lda_upvalue"; |s| {
     s.acc = **upvalue_cell(s.regs);
     next!(s)
@@ -4641,6 +4663,34 @@ stencil!("call_direct"; |s| {
     let base = s.regs as *const u8;
     let r = if (*site).entry != 0
         && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
+        && base as u64 + (*site).end_off <= (*site).stack_end
+    {
+        Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))
+    } else {
+        Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
+    };
+    s.acc = r;
+    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+        exit!(s)
+    }
+    next!(s)
+});
+
+// `call_direct` for a site bound to a function's code, not one closure of
+// it (`DirectSite::closure` is the `Code`): one made anew at each call of
+// the function making it. The callee register must hold a bytecode
+// function (class 2, at byte 8) of that code (at byte 40); its frame's
+// header gets it (`set_frame_func_r`).
+stencil!("call_direct_code"; |s| {
+    let regs = Value::from_bits(s.regs as u64);
+    let site = imm64() as *const DirectSite;
+    let base = s.regs as *const u8;
+    let f = *(base.add((*site).f_off as usize) as *const u64);
+    let r = if (*site).entry != 0
+        && f != 0
+        && is_cell(s.tag, Value::from_bits(f))
+        && *(f as *const u8).add(8) == 2
+        && *((f as *const u8).add(40) as *const u64) == (*site).closure
         && base as u64 + (*site).end_off <= (*site).stack_end
     {
         Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))

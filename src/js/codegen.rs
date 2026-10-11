@@ -139,9 +139,23 @@ fn upvalues<'a>(p: &'a Program, decls: &[Vec<&'a str>], overflow: &[Vec<&'a str>
 
 /// The names expression `e` refers to (not its nested functions').
 fn expr_refs<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
+    expr_names(e, out, false)
+}
+
+/// The names expression `e` refers to, or with `forwarded`, only its
+/// `arguments` that `g.apply(x, arguments)` passes on (see
+/// [`forwards_arguments`]).
+fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
     use ExprKind::*;
+    let expr_refs = |e: &'a Expr, out: &mut Vec<&'a str>| expr_names(e, out, forwarded);
     match &e.kind {
-        Ident(n) => out.push(n),
+        Ident(n) if !forwarded => out.push(n),
+        Ident(_) => {}
+        Call(f, args) if forwarded && apply_arguments(f, args) => {
+            out.push("arguments");
+            expr_refs(f, out);
+            expr_refs(&args[0], out);
+        }
         Num(_) | Str(_) | Bool(_) | Null | This | Function(_) | Accessor(..) | RegExp(..) => {}
         Array(es) => es.iter().for_each(|e| expr_refs(e, out)),
         Object(ps) => ps.iter().for_each(|(_, e)| expr_refs(e, out)),
@@ -161,7 +175,21 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Vec<&'a str>) {
 /// The names function `f`'s own code refers to (not its nested
 /// functions').
 fn references(f: &Function) -> Vec<&str> {
-    fn stmt<'a>(s: &'a Stmt, out: &mut Vec<&'a str>) {
+    names(f, false)
+}
+
+/// Whether call `f(args)` is `g.apply(x, arguments)`.
+fn apply_arguments(f: &Expr, args: &[Expr]) -> bool {
+    matches!(&f.kind, ExprKind::Member(_, m) if m == "apply")
+        && matches!(args, [_, a] if matches!(&a.kind, ExprKind::Ident(n) if n == "arguments"))
+}
+
+/// The names function `f`'s own code refers to, or with `forwarded`, the
+/// `arguments` it passes on (see [`expr_names`]).
+fn names(f: &Function, forwarded: bool) -> Vec<&str> {
+    fn stmt<'a>(s: &'a Stmt, out: &mut Vec<&'a str>, fw: bool) {
+        let expr_refs = |e: &'a Expr, out: &mut Vec<&'a str>| expr_names(e, out, fw);
+        let stmt = |s: &'a Stmt, out: &mut Vec<&'a str>| stmt(s, out, fw);
         match &s.kind {
             StmtKind::Var(ds) => ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out)),
             StmtKind::Function(_)
@@ -194,7 +222,9 @@ fn references(f: &Function) -> Vec<&str> {
             StmtKind::ForIn {
                 name, object, body, ..
             } => {
-                out.push(name);
+                if !fw {
+                    out.push(name);
+                }
                 expr_refs(object, out);
                 stmt(body, out);
             }
@@ -215,7 +245,7 @@ fn references(f: &Function) -> Vec<&str> {
         }
     }
     let mut out = Vec::new();
-    f.body.iter().for_each(|s| stmt(s, &mut out));
+    f.body.iter().for_each(|s| stmt(s, &mut out, forwarded));
     out
 }
 
@@ -307,10 +337,29 @@ fn own_name(p: &Program, f: usize) -> Option<&str> {
 }
 
 /// Whether function `f` gets an `arguments` object: it reads `arguments`,
-/// and no parameter has that name.
+/// no parameter has that name, and it doesn't just pass them on (see
+/// [`forwards_arguments`]).
 fn arguments_object(p: &Program, f: usize) -> bool {
-    let f = &p.functions[f];
-    f.uses_arguments && f.parent.is_some() && !f.params.iter().any(|n| n == "arguments")
+    let func = &p.functions[f];
+    func.uses_arguments
+        && func.parent.is_some()
+        && !func.params.iter().any(|n| n == "arguments")
+        && !forwards_arguments(p, f)
+}
+
+/// Whether function `f` reads `arguments` only to pass them on, as
+/// `g.apply(x, arguments)` (a class's constructor calling its
+/// `initialize`, in Prototype's style), and declares no variable of the
+/// name: then it makes no `arguments` object, and those calls are
+/// `CallApplyArguments`, which pass the frame's arguments themselves
+/// (the JIT compiles them; it doesn't compile `CreateArguments`).
+fn forwards_arguments(p: &Program, f: usize) -> bool {
+    let func = &p.functions[f];
+    let count = |forwarded| names(func, forwarded).iter().filter(|&&n| n == "arguments").count();
+    func.uses_arguments
+        && func.parent.is_some()
+        && !explicit_declarations(p, f).contains(&"arguments")
+        && count(true) == count(false)
 }
 
 /// The function declarations directly in a function's body (hoisted to
@@ -823,7 +872,7 @@ impl<'a> Gen<'a> {
         }
         // A call's argument window counts as used registers.
         if let [_, Arg::Reg(w), Arg::Count(c), ..] = args[..] {
-            let extra = usize::from(op == Op::Call);
+            let extra = usize::from(matches!(op, Op::Call | Op::CallApplyArguments));
             self.nregs = self.nregs.max(w as usize + c as usize + extra);
         }
         self.asm.emit(op, args);
@@ -1789,6 +1838,8 @@ impl<'a> Gen<'a> {
         let n =
             u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
         let method = !new && matches!(f.kind, ExprKind::Member(..) | ExprKind::Index(..));
+        // `g.apply(x, arguments)` passing the frame's arguments on.
+        let forward = method && apply_arguments(f, args) && forwards_arguments(self.p, self.index);
         let c = self.alloc(pos)?;
         let w;
         if method {
@@ -1819,7 +1870,8 @@ impl<'a> Gen<'a> {
             for _ in 0..n {
                 self.alloc(pos)?;
             }
-            for (i, a) in args.iter().enumerate() {
+            // (Not `arguments`, which `CallApplyArguments` passes.)
+            for (i, a) in args.iter().enumerate().take(if forward { 1 } else { args.len() }) {
                 self.into(a, w + 1 + i as u8)?;
             }
         } else {
@@ -1839,6 +1891,7 @@ impl<'a> Gen<'a> {
             }
         }
         let op = match (new, method) {
+            _ if forward => Op::CallApplyArguments,
             (true, _) => Op::Construct,
             (false, true) => Op::Call,
             (false, false) => Op::CallUndefined,

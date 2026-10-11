@@ -1463,6 +1463,12 @@ struct Insn {
     /// `null`, which the callee would see as the global object: not the
     /// caller's own `this` (see [`Lowering::nullable_this`]).
     nullable_this: bool,
+    /// A `Call` decoded from `CallApplyArguments` (`g.apply(x, arguments)`
+    /// with the frame's arguments), its window `g` and `x` (`imm` 1): made
+    /// through the runtime, which reads the arguments from the frame's
+    /// header. A function with one isn't inlined or called directly
+    /// (frames without a header).
+    forward: bool,
 }
 
 impl Insn {
@@ -1620,11 +1626,16 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
             // On numbers `x - k` is `x + -k`, so `SubSmi` shares every
             // typed `AddSmi` stencil and fusion (but for k = INT32_MIN).
             let mut sub = false;
+            let mut forward = false;
             let op = match op {
                 Op::SubSmi if imm_at(pc + 1) != i32::MIN => {
                     imm = -imm_at(pc + 1);
                     sub = true;
                     Op::AddSmi
+                }
+                Op::CallApplyArguments if vm => {
+                    forward = true;
+                    Op::Call
                 }
                 op => op,
             };
@@ -1717,6 +1728,10 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::Call | Op::CallUndefined | Op::Construct if vm => {
                     (reg, reg2, imm) = (code[pc + 1], code[pc + 2], code[pc + 3] as i32);
                     ic = u16::from_le_bytes([code[pc + 4], code[pc + 5]]);
+                    // `g` and `x`: the runtime passes the arguments.
+                    if forward {
+                        imm = 1;
+                    }
                 }
                 Op::GetKeyed if vm => {
                     (reg, imm) = (
@@ -1758,6 +1773,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 sub,
                 hoisted: None,
                 nullable_this: false,
+                forward,
             }
         })
         .collect();
@@ -8623,6 +8639,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         sub: false,
         hoisted: None,
         nullable_this: false,
+        forward: false,
     }
 }
 
@@ -10379,7 +10396,7 @@ impl Lowering<'_> {
             // `f.call(that, …args)` (see `vm::VIA_CALL`): a guard that the
             // callee is `Function.prototype.call`, then a call of `f`, the
             // window one register on.
-            if i.op == Op::Call && !i.bail {
+            if i.op == Op::Call && !i.bail && !i.forward {
                 let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
                 if ic.loc == crate::vm::VIA_CALL && !ic.holder.is_null() {
                     let call = unsafe { (*self.state.vm).function_call_fn };
@@ -10405,7 +10422,7 @@ impl Lowering<'_> {
             // called: a guard on the callee (unless `proven_callee`), then
             // inline (see `array_push` in the stencils). Not after exits
             // there (a receiver not an array).
-            if i.op == Op::Call && !i.bail {
+            if i.op == Op::Call && !i.bail && !i.forward {
                 let ic = self.out.fbs[frame].ic(i.ic as usize);
                 let (fo, other) = unsafe { ((*ic).holder, (*ic.add(1)).holder) };
                 let vm = unsafe { &*self.state.vm };
@@ -10461,6 +10478,8 @@ impl Lowering<'_> {
                 _ if i.bail => {
                     self.push(i, Prop::None);
                 }
+                // `g.apply(x, arguments)`: through the runtime.
+                Op::Call if i.forward => self.emit_call(frame, i, std::ptr::null_mut(), false),
                 // The function returns from its compiled code: the caller of
                 // the code (`vm_run`) finishes the return.
                 Op::Return if frame == 0 => {
@@ -10671,6 +10690,9 @@ impl Lowering<'_> {
     /// before.
     fn emit_call(&mut self, frame: usize, i: Insn, fo: *mut Object, guarded: bool) {
         let mut site = self.call_site(frame, &i);
+        if i.forward {
+            site.op = Op::CallApplyArguments;
+        }
         let direct = self.direct_target(&i, fo, &mut site) && i.imm as u32 <= site.nparams;
         let proven = direct && (guarded || self.proven_callee(frame, i.reg, fo));
         let p = Prop::Call {
@@ -10728,7 +10750,9 @@ impl Lowering<'_> {
         let callee = unsafe { (*fo).code };
         // Not compiled: its exception handlers need interpreted frames.
         // Nor a `that` of `f.call(that, …)` to convert: the runtime does.
-        if unsafe { (*callee).interpreted } || self.nullable_this(i, fo) {
+        // Nor a function passing its arguments on, which reads them from
+        // its frame's header (see `Insn::forward`).
+        if unsafe { (*callee).interpreted } || self.nullable_this(i, fo) || self.forwards(callee) {
             return false;
         }
         // A constructor's `this` is allocated by the call
@@ -10903,6 +10927,11 @@ impl Lowering<'_> {
         (insns.iter().enumerate()).any(|(b, j)| j.jumps() && j.target <= k && k <= b)
     }
 
+    /// Whether `code` passes its own arguments on (see `Insn::forward`).
+    fn forwards(&mut self, code: *const crate::vm::Code) -> bool {
+        self.decoded(code).0.iter().any(|j| j.forward)
+    }
+
     /// Whether `fo` is a bytecode function of at most [`MAX_LEAF_INSNS`]
     /// instructions that calls nothing: inlined past [`MAX_INLINE_DEPTH`],
     /// as it costs little code and inlines nothing further.
@@ -10974,8 +11003,9 @@ impl Lowering<'_> {
             return false;
         }
         let callee = unsafe { (*fo).code };
-        // Exceptions unwind only through interpreted frames.
-        if unsafe { (*callee).interpreted } {
+        // Exceptions unwind only through interpreted frames. A function
+        // passing its arguments on reads them from its frame's header.
+        if unsafe { (*callee).interpreted } || self.forwards(callee) {
             return false;
         }
         if !self.call_in_loop

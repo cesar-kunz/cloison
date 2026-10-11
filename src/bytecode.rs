@@ -334,6 +334,15 @@ define_ops! {
     /// `acc` = a new `RegExp` of pattern and flags constants `p`, `f` (a
     /// regular expression literal).
     CreateRegExp(Const, Const),
+    /// `acc = r[f](r[w+1], arguments)` with `this = r[w]`, where
+    /// `arguments` is the frame's own arguments, extra ones included:
+    /// `g.apply(x, arguments)` in a function that reads `arguments` only
+    /// that way (and so makes no `arguments` object). When `r[f]` is
+    /// `Function.prototype.apply` and `r[w]` a bytecode function, that is
+    /// called with the arguments as they are; otherwise the object is made
+    /// into `r[w+2]` and the call is `Call`'s, with `n` 2. Laid out as
+    /// `Call`, whose size it has (`CreateArguments` reads either).
+    CallApplyArguments(Reg, Reg, Count, AutoIc),
 }
 
 impl Op {

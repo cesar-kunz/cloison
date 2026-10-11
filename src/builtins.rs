@@ -2026,23 +2026,59 @@ fn this_regexp<'a>(this: Value) -> Result<&'a crate::regexp::Regex> {
 /// The match of `re` (the object `this`) in `s` where `exec` looks: from
 /// `lastIndex` if global (then set past the match, or to 0 on none).
 fn regexp_match(vm: &mut Vm, this: Value, re: &crate::regexp::Regex, s: &[u16]) -> Result<Option<crate::regexp::Captures>> {
+    let mut caps = Vec::new();
+    Ok(regexp_match_into(vm, this, re, s, &mut caps)?.then_some(caps))
+}
+
+/// [`regexp_match`] into `caps`: whether it matched.
+fn regexp_match_into(
+    vm: &mut Vm,
+    this: Value,
+    re: &crate::regexp::Regex,
+    s: &[u16],
+    caps: &mut crate::regexp::Captures,
+) -> Result<bool> {
     let a_last = vm.a_last_index;
+    let plain = plain_last_index(vm, this);
     let start = if re.global {
-        let li = to_number(vm.get(this, a_last)?);
+        let li = match plain {
+            Some(o) => unsafe { *Object::slot(o, (*(*o).shape).location(0)) },
+            None => vm.get(this, a_last)?,
+        };
+        let li = to_number(li);
         if li.is_nan() || li < 0.0 { 0 } else { li as usize }
     } else {
         0
     };
     if start > s.len() {
         vm.set(this, a_last, Value::from_i32(0))?;
-        return Ok(None);
+        return Ok(false);
     }
-    let caps = re.exec(s, start);
+    let found = re.exec_into(s, start, caps);
     if re.global {
-        let next = caps.as_ref().map_or(0, |c| c[0].unwrap().1);
-        vm.set(this, a_last, Value::from_i32(next as i32))?;
+        let next = Value::from_i32(if found { caps[0].unwrap().1 } else { 0 } as i32);
+        match plain {
+            Some(o) => vm.store_field(o, 0, next),
+            None => vm.set(this, a_last, next)?,
+        }
     }
-    Ok(caps)
+    Ok(found)
+}
+
+/// `this`, a `RegExp`, if its `lastIndex` is still the writable data
+/// property in slot 0 it was made with: read and stored there directly.
+fn plain_last_index(vm: &Vm, this: Value) -> Option<*mut Object> {
+    let o = as_object(this);
+    let sh = unsafe { &*(*o).shape };
+    (sh.keys.first() == Some(&vm.a_last_index) && sh.attrs[0] == DONT_ENUM).then_some(o)
+}
+
+/// `f` with the VM's captures buffer (see `Vm::caps_buf`).
+fn with_caps<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm, &mut crate::regexp::Captures) -> R) -> R {
+    let mut caps = std::mem::take(&mut vm.caps_buf);
+    let r = f(vm, &mut caps);
+    vm.caps_buf = caps;
+    r
 }
 
 /// The array `exec` returns for `caps` over `s`: the match and each group
@@ -2057,11 +2093,29 @@ fn match_array(vm: &mut Vm, caps: &crate::regexp::Captures, s: &[u16], input: Va
         .collect();
     let arr = vm.new_array();
     crate::vm::array_push(vm, arr, &parts)?;
-    // Defined, as ECMAScript's CreateDataProperty does (no setters).
+    // Defined, as ECMAScript's CreateDataProperty does (no setters), along
+    // transitions found once per shape the array has.
     let o = as_object(arr);
-    let (a_index, a_input) = (vm.a_index, vm.a_input);
-    vm.add_property_with(o, a_index, Value::from_i32(caps[0].unwrap().0 as i32), 0);
-    vm.add_property_with(o, a_input, input, 0);
+    let base = unsafe { (*o).shape };
+    if unsafe { (*base).unique } {
+        vm.add_property_with(o, vm.a_index, Value::from_i32(caps[0].unwrap().0 as i32), 0);
+        vm.add_property_with(o, vm.a_input, input, 0);
+        return Ok(arr);
+    }
+    let (with_index, with_input) = match vm.match_shapes.iter().find(|m| m.0 == base) {
+        Some(&(_, a, b)) => (a, b),
+        None => {
+            let a = vm.transition_with(base, vm.a_index, 0);
+            let b = vm.transition_with(a, vm.a_input, 0);
+            if vm.match_shapes.len() == 4 {
+                vm.match_shapes.remove(0);
+            }
+            vm.match_shapes.push((base, a, b));
+            (a, b)
+        }
+    };
+    vm.add_property_shaped(o, with_index, Value::from_i32(caps[0].unwrap().0 as i32));
+    vm.add_property_shaped(o, with_input, input);
     Ok(arr)
 }
 
@@ -2070,16 +2124,19 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let input = string_fn(vm, Value::UNDEFINED, &a[..a.len().min(1)])?;
     // Borrowed: strings don't change, and the stack scan keeps `input`.
     let s = units(input);
-    match regexp_match(vm, this, re, &s)? {
-        Some(caps) => match_array(vm, &caps, &s, input),
-        None => Ok(Value::NULL),
-    }
+    with_caps(vm, |vm, caps| {
+        if regexp_match_into(vm, this, re, &s, caps)? {
+            match_array(vm, caps, &s, input)
+        } else {
+            Ok(Value::NULL)
+        }
+    })
 }
 
 fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = this_regexp(this)?;
     let s = units(arg(a, 0));
-    Ok(Value::from_bool(regexp_match(vm, this, re, &s)?.is_some()))
+    with_caps(vm, |vm, caps| Ok(Value::from_bool(regexp_match_into(vm, this, re, &s, caps)?)))
 }
 
 fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -2107,10 +2164,13 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = regexp_of(rv).unwrap();
     let input = this_string(vm, this, &s);
     if !re.global {
-        return match regexp_match(vm, rv, re, &s)? {
-            Some(caps) => match_array(vm, &caps, &s, input),
-            None => Ok(Value::NULL),
-        };
+        return with_caps(vm, |vm, caps| {
+            if regexp_match_into(vm, rv, re, &s, caps)? {
+                match_array(vm, caps, &s, input)
+            } else {
+                Ok(Value::NULL)
+            }
+        });
     }
     let mut found = Vec::new();
     let mut at = 0;

@@ -25,6 +25,9 @@ pub struct Regex {
     starts: Starts,
     /// A literal every match contains, if any (see [`Needle`]).
     needle: Option<Needle>,
+    /// The pattern, if it is just characters (case-sensitive): found by
+    /// searching for them, without the interpreter.
+    literal: Option<Vec<u16>>,
 }
 
 /// A run of characters in the pattern's top-level sequence, so in every
@@ -121,8 +124,21 @@ impl Regex {
             needle: None,
             prog: Program::default(),
             run: Default::default(),
+            literal: None,
         };
         re.prog = Program::compile(&re);
+        re.literal = match &re.node {
+            _ if re.ignore_case => None,
+            Node::Char(c) => Some(vec![*c]),
+            Node::Seq(ns) => ns
+                .iter()
+                .map(|n| match n {
+                    Node::Char(c) => Some(*c),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
+        };
         re.starts = re.starts();
         re.needle = re.needle();
         Ok(re)
@@ -174,13 +190,31 @@ impl Regex {
 
     /// The first match in `s` at or after `start`: each group's span.
     pub fn exec(&self, s: &[u16], start: usize) -> Option<Captures> {
+        let mut caps = Vec::new();
+        self.exec_into(s, start, &mut caps).then_some(caps)
+    }
+
+    /// [`Regex::exec`] into `caps` (no allocation once it has room):
+    /// whether it matched.
+    pub fn exec_into(&self, s: &[u16], start: usize, caps: &mut Captures) -> bool {
+        caps.clear();
+        if let Some(l) = &self.literal {
+            let Some(q) = (start <= s.len()).then(|| find(s, l, start)).flatten() else {
+                return false;
+            };
+            caps.push(Some((q, q + l.len())));
+            return true;
+        }
         let mut kept = self.run.try_borrow_mut().ok();
         let mut fresh = Run::default();
         let run = kept.as_deref_mut().unwrap_or(&mut fresh);
         run.caps.resize(self.groups, None);
         run.regs.resize(self.prog.nregs, 0);
-        self.search(s, start, |at| self.prog.run(self, s, at, run))?;
-        Some(run.caps.clone())
+        if self.search(s, start, |at| self.prog.run(self, s, at, run)).is_none() {
+            return false;
+        }
+        caps.extend_from_slice(&run.caps);
+        true
     }
 
     /// Call `attempt` at each position from `start` where a match can

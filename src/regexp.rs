@@ -15,7 +15,26 @@ pub struct Regex {
     pub global: bool,
     pub ignore_case: bool,
     pub multiline: bool,
+    /// Where a match can start (see [`Starts`]).
+    starts: Starts,
 }
+
+/// Where a match can start, so `exec` tries only there.
+#[derive(Clone, Copy)]
+enum Starts {
+    /// Anywhere: the pattern may match empty, or begin with a backreference.
+    Anywhere,
+    /// Where `^` matches (every alternative begins with it).
+    Anchored,
+    /// At a code unit in `ascii` (bit `c` for `c` < 128), or at any one
+    /// past ASCII if `other`; `one` if that is a single unit.
+    Units { ascii: u128, other: bool, one: Option<u16> },
+}
+
+/// The code units a node's non-empty matches can begin with (as in
+/// `Starts::Units`), and whether it can match empty (then what follows it
+/// can begin a match too); `None` if unknown.
+type First = Option<(u128, bool, bool)>;
 
 /// Where each group matched (start, end), if it did.
 pub type Captures = Vec<Option<(usize, usize)>>;
@@ -72,13 +91,35 @@ impl Regex {
         if p.i != chars.len() {
             return Err(format!("Invalid regular expression: /{pattern}/: Unmatched ')'"));
         }
-        Ok(Regex {
+        let mut re = Regex {
             node,
             groups: p.groups,
             global,
             ignore_case,
             multiline,
-        })
+            starts: Starts::Anywhere,
+        };
+        re.starts = re.starts();
+        Ok(re)
+    }
+
+    fn starts(&self) -> Starts {
+        if anchored(&self.node) {
+            return Starts::Anchored;
+        }
+        let m = Matcher {
+            re: self,
+            s: &[],
+            caps: Vec::new(),
+        };
+        match m.first(&self.node) {
+            Some((ascii, other, false)) => Starts::Units {
+                ascii,
+                other,
+                one: (ascii.count_ones() == 1 && !other).then(|| ascii.trailing_zeros() as u16),
+            },
+            _ => Starts::Anywhere,
+        }
     }
 
     /// The first match in `s` at or after `start`: each group's span.
@@ -88,21 +129,26 @@ impl Regex {
             s,
             caps: vec![None; self.groups],
         };
-        // A literal first character: only where it is.
-        let first = match &self.node {
-            Node::Char(c) if !self.ignore_case => Some(*c),
-            Node::Seq(ns) if !self.ignore_case => match ns.first() {
-                Some(Node::Char(c)) => Some(*c),
-                _ => None,
-            },
-            _ => None,
-        };
         let mut at = start;
         while at <= s.len() {
-            if let Some(c) = first {
-                match s[at..].iter().position(|&x| x == c) {
-                    Some(k) => at += k,
-                    None => return None,
+            // Skip to where a match can start.
+            match self.starts {
+                Starts::Anywhere => {}
+                Starts::Anchored => {
+                    let line = |i: usize| i == 0 || self.multiline && is_line_terminator(s[i - 1]);
+                    if !line(at) {
+                        if !self.multiline {
+                            return None;
+                        }
+                        at += s[at..].iter().position(|&c| is_line_terminator(c))? + 1;
+                    }
+                }
+                Starts::Units { one: Some(c), .. } => {
+                    at += s[at..].iter().position(|&x| x == c)?;
+                }
+                Starts::Units { ascii, other, .. } => {
+                    let can = |c: u16| if c < 128 { ascii >> c & 1 != 0 } else { other };
+                    at += s[at..].iter().position(|&c| can(c))?;
                 }
             }
             for c in m.caps.iter_mut() {
@@ -118,6 +164,17 @@ impl Regex {
             at += 1;
         }
         None
+    }
+}
+
+/// Whether every match of `n` begins where `^` matches.
+fn anchored(n: &Node) -> bool {
+    match n {
+        Node::Start => true,
+        Node::Group(inner, _) => anchored(inner),
+        Node::Seq(nodes) => nodes.first().is_some_and(anchored),
+        Node::Alt(alts) => alts.iter().all(anchored),
+        _ => false,
     }
 }
 
@@ -605,6 +662,48 @@ impl<'a> Matcher<'a> {
         }
     }
 
+    /// What `n`'s matches can begin with (see [`First`]): ASCII units are
+    /// tested as matching does, so with its case folding (which maps no
+    /// unit past ASCII to one in it, or back).
+    fn first(&self, n: &Node) -> First {
+        let units = |one: &dyn Fn(u16) -> bool, other: bool| {
+            let ascii = (0..128u16).filter(|&c| one(c)).fold(0u128, |m, c| m | 1 << c);
+            Some((ascii, other, false))
+        };
+        match n {
+            Node::Empty | Node::Start | Node::End | Node::Boundary(_) | Node::Look(..) => {
+                Some((0, false, true))
+            }
+            Node::Char(c) => units(&|x| self.eq(x, *c), *c >= 128 || self.re.ignore_case),
+            Node::Any => units(&|x| !is_line_terminator(x), true),
+            Node::Class(r, neg) => units(
+                &|x| self.in_class(r, *neg, x),
+                *neg || self.re.ignore_case || r.iter().any(|&(_, hi)| hi >= 128),
+            ),
+            Node::Group(inner, _) => self.first(inner),
+            Node::BackRef(_) => None,
+            Node::Repeat(inner, min, _, _) => {
+                let (a, o, empty) = self.first(inner)?;
+                Some((a, o, empty || *min == 0))
+            }
+            Node::Alt(alts) => alts.iter().try_fold((0, false, false), |(a, o, e), n| {
+                let (a2, o2, e2) = self.first(n)?;
+                Some((a | a2, o || o2, e || e2))
+            }),
+            Node::Seq(nodes) => {
+                let (mut a, mut o) = (0, false);
+                for n in nodes {
+                    let (a2, o2, empty) = self.first(n)?;
+                    (a, o) = (a | a2, o || o2);
+                    if !empty {
+                        return Some((a, o, false));
+                    }
+                }
+                Some((a, o, true))
+            }
+        }
+    }
+
     /// `inner` repeated `count` times so far, from `i`.
     #[allow(clippy::too_many_arguments)]
     fn repeat(
@@ -703,5 +802,45 @@ mod tests {
         assert_eq!(c[1].as_deref(), Some("bob"));
         assert_eq!(c[2].as_deref(), Some("site"));
         assert_eq!(find("(a)|(b)", "", "b").unwrap()[1], None);
+    }
+
+    /// Where `exec` starts trying (`Regex::starts`) doesn't change what it
+    /// finds.
+    #[test]
+    fn skipping_to_where_a_match_can_start() {
+        let at = |p: &str, f: &str, s: &str, start: usize| {
+            let re = Regex::new(p, f).unwrap();
+            let u: Vec<u16> = s.encode_utf16().collect();
+            re.exec(&u, start).map(|c| c[0].unwrap())
+        };
+        assert!(matches!(Regex::new("^a|^b", "").unwrap().starts, Starts::Anchored));
+        assert!(matches!(Regex::new("a*", "").unwrap().starts, Starts::Anywhere));
+        assert!(matches!(Regex::new("(a)\\1", "").unwrap().starts, Starts::Units { .. }));
+        assert!(matches!(Regex::new("(a)|\\1b", "").unwrap().starts, Starts::Anywhere));
+        assert!(matches!(
+            Regex::new("[xy]z", "").unwrap().starts,
+            Starts::Units { other: false, one: None, .. }
+        ));
+        // `^`: at 0 only, or after a line terminator with `m`.
+        assert_eq!(at("^b", "", "ab", 0), None);
+        assert_eq!(at("^a", "", "aa", 1), None);
+        assert_eq!(at("^b", "m", "a\nb\rb", 1), Some((2, 3)));
+        assert_eq!(at("^b", "m", "a\nb\rb", 3), Some((4, 5)));
+        assert_eq!(at("^b", "m", "a\nc", 0), None);
+        assert_eq!(at("^$", "m", "a\n", 0), Some((2, 2)));
+        // The units a match begins with.
+        assert_eq!(at("[xy]z", "", "axzyz", 2), Some((3, 5)));
+        assert_eq!(at("b", "i", "aB", 0), Some((1, 2)));
+        assert_eq!(at("[^a]", "", "aa\u{e9}", 0), Some((2, 3)));
+        assert_eq!(at("\u{e9}", "i", "a\u{c9}", 0), Some((1, 2)));
+        assert_eq!(at("[a-z]+", "i", "12XY", 0), Some((2, 4)));
+        assert_eq!(at("(?=b)\\w", "", "ab", 0), Some((1, 2)));
+        assert_eq!(at("x?y", "", "aay", 0), Some((2, 3)));
+        assert_eq!(at("(a|)b", "", "cb", 0), Some((1, 2)));
+        assert_eq!(at("\\bc", "", "a c", 0), Some((2, 3)));
+        assert_eq!(at("q", "", "abc", 0), None);
+        // Matches that can be empty: anywhere, the end included.
+        assert_eq!(at("x*", "", "ab", 1), Some((1, 1)));
+        assert_eq!(at("$", "", "ab", 0), Some((2, 2)));
     }
 }

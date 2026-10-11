@@ -3121,3 +3121,21 @@ fn errors_in_direct_callees() {
         "TypeError: Cannot read properties of undefined (reading 'x')"
     );
 }
+
+#[test]
+fn global_loads_hit_again_after_the_global_object_changes_shape() {
+    // `get` caches `x` under the global object's shape, which `y` then
+    // changes: its loads miss once more, not on every call.
+    let src = "var x = 1;
+function get() { return x; }
+get();
+y = 2;
+var s = 0;
+for (var i = 0; i < 1000; i++) s += get();
+s;";
+    let m = toi::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(i64::MAX);
+    assert_eq!(display(vm.run(&m).unwrap()), "1000");
+    assert_eq!(vm.ic_misses("get"), 2);
+}

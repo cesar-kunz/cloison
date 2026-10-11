@@ -1871,6 +1871,33 @@ impl Vm {
     }
 
     /// `obj[key] = value`.
+    /// `obj[key] = value` for compiled code's keyed stores through the
+    /// runtime, where `key` names a property: a data property of a plain
+    /// object or an array that is neither a prototype nor the global
+    /// object, with no accessor of that name on its chain (a store that
+    /// runs no code). `None` where the interpreter must do it.
+    pub(crate) fn set_named_plain(&mut self, obj: Value, key: Value, value: Value) -> Option<()> {
+        if !obj.is_cell() {
+            return None;
+        }
+        let o = as_object(obj);
+        unsafe {
+            if !matches!((*o).class, Class::Plain | Class::Array)
+                || (*o).flags & crate::object::PROTOTYPE != 0
+                || o == self.global
+            {
+                return None;
+            }
+        }
+        let Key::Name(a) = self.property_key(key) else {
+            return None;
+        };
+        if self.accessor(o, a).is_some() {
+            return None;
+        }
+        self.set(obj, a, value).ok()
+    }
+
     pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {

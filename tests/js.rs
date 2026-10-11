@@ -2757,3 +2757,50 @@ var lit = /ab/; out.push(lit.exec("zzab").index, lit.test("a b"), "xxabab".repla
 out.join(",");"#;
     assert_eq!(value(src), "4,ab,b,6,4,b,6,1,3,,0,7,undefined,8,false,0,true,3,0|1|index|input,true,2,0|1|index|input|extra,0|1|2|index|input,1,a1b,3,2,false,xx-ab,4");
 }
+
+#[test]
+fn exits_at_an_instruction_never_compiled_dont_lower_again() {
+    // `block`'s regular expression literal is never compiled: exits there
+    // lower it again only at the 1st, 2nd, 4th… (Octane RegExp's
+    // `runBlock1` was lowered at every call).
+    let src = "function block(n) {
+  var re = /x/, s = 0;
+  for (var i = 0; i < n; i++) s += i;
+  return s + (re.test('x') ? 1 : 0);
+}
+var t = 0;
+for (var k = 0; k < 300; k++) t += block(50);
+t;";
+    let m = toi::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(20);
+    assert_eq!(display(vm.run(&m).unwrap()), "367800");
+    let st = vm.jit_stats("block").expect("block compiled");
+    // (11 for 288 exits here; one per exit before.)
+    assert!(st.lowers <= 16 && st.exits > 100, "{st:?}");
+}
+
+#[test]
+fn a_call_that_had_not_run_is_compiled_once_it_has() {
+    // `f`'s loop compiles before its call has run: the call is left to the
+    // interpreter, and then compiled, not left at every call of `f`.
+    let src = "function g(x) { return x * 2; }
+function f(n, h) {
+  var s = 0;
+  for (var i = 0; i < n; i++) {
+    if (i == 50) s += h(i);
+    s += i;
+  }
+  return s;
+}
+var t = 0;
+for (var k = 0; k < 300; k++) t += f(100, g);
+t;";
+    let m = toi::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(20);
+    assert_eq!(display(vm.run(&m).unwrap()), "1515000");
+    let st = vm.jit_stats("f").expect("f compiled");
+    // (1 here; 20 when the exit at the call left it uncompiled.)
+    assert!(st.exits <= 5, "{st:?}");
+}

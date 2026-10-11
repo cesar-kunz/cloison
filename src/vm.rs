@@ -2643,6 +2643,12 @@ impl Vm {
         jit.as_ref().map_or(0, |f| f.bound_direct_calls())
     }
 
+    /// `function`'s JIT counters, if it was compiled (for tests).
+    pub fn jit_stats(&self, function: &str) -> Option<crate::jit::JitStats> {
+        let code = self.codes.iter().find(|c| c.name == function)?;
+        Some(code.jit.borrow().as_ref()?.stats)
+    }
+
     /// The stencils of `function`'s most recent compiled code, if any (for
     /// tests).
     pub fn jit_stencils(&self, function: &str) -> Option<Vec<String>> {

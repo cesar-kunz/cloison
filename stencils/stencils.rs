@@ -152,6 +152,8 @@ unsafe extern "C" {
     fn toi_rt_create_regexp();
     fn toi_rt_type_of();
     fn toi_rt_create_closure();
+    fn toi_rt_delete();
+    fn toi_rt_delete_global();
     fn toi_rt_set_keyed();
 }
 
@@ -1866,6 +1868,30 @@ stencil!("test_instanceof_m"; |s| {
     s.acc = Value::from_bits(r);
     next!(s)
 });
+// `delete r[a][acc]` (`delete_m`) and `delete <global named acc>`
+// (`delete_global_m`), from the runtime; then, as after a call, the
+// function's epoch (`imm64b` points to it) must be what its code was
+// compiled under (the 32-bit `imm64`): a delete makes code relying on the
+// object's shape or fields drop. Leaves where it would throw, and where
+// the epoch moved, before the instruction: the interpreter does the
+// delete again, which deletes nothing more and gives the same result.
+stencil!("delete_m"; |s| {
+    let r = rt_call!(s, toi_rt_delete, load_m(s.regs), s.acc);
+    if r == 0 || *(imm64b() as *const u32) != imm64() as u32 {
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
+    next!(s)
+});
+stencil!("delete_global_m"; |s| {
+    let r = rt_call!(s, toi_rt_delete_global, Value::UNDEFINED, s.acc);
+    if r == 0 || *(imm64b() as *const u32) != imm64() as u32 {
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
+    next!(s)
+});
+
 stencil!("test_in_m"; |s| {
     let r = rt_call!(s, toi_rt_in, load_m(s.regs), s.acc);
     if r == 0 {

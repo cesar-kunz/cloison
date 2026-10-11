@@ -149,6 +149,7 @@ unsafe extern "C" {
     fn toi_rt_instance_of();
     fn toi_rt_in();
     fn toi_rt_get_keyed();
+    fn toi_rt_create_regexp();
     fn toi_rt_set_keyed();
 }
 
@@ -3642,6 +3643,18 @@ stencil_slow!("create_object"; |s| {
 // the 64-bit immediate).
 stencil!("create_array"; |s| {
     s.acc = Value::from_bits(rt_call!(s, toi_rt_create_array, Value::from_bits(imm64()), Value::UNDEFINED));
+    next!(s)
+});
+
+// `CreateRegExp`: a new `RegExp` from the runtime, of the pattern and the
+// flags (strings) that are the 64-bit immediates; leaves where it would
+// throw (a pattern the engine doesn't support).
+stencil!("create_regexp"; |s| {
+    let r = rt_call!(s, toi_rt_create_regexp, Value::from_bits(imm64()), Value::from_bits(imm64b()));
+    if r == 0 {
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 

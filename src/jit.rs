@@ -415,6 +415,14 @@ extern "C" fn toi_rt_get_keyed(a: Value, b: Value) -> u64 {
     vm.get_keyed(a, b).map_or(0, |v| v.to_bits())
 }
 
+/// A regular expression literal's new `RegExp`, of pattern `p` and flags
+/// `f` (`create_regexp` stencils); 0 where it would throw (the
+/// interpreter does it).
+extern "C" fn toi_rt_create_regexp(p: Value, f: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    crate::builtins::regexp_literal(vm, p, f).map_or(0, |v| v.to_bits())
+}
+
 /// `args[0][args[1]] = args[2]` (what `set_keyed` stencils don't store
 /// themselves: a typed array's element, one past an array's length, …);
 /// 0 where it would throw or make a named property (the interpreter
@@ -464,6 +472,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
         "toi_rt_instance_of" => toi_rt_instance_of as *const () as usize,
         "toi_rt_get_keyed" => toi_rt_get_keyed as *const () as usize,
+        "toi_rt_create_regexp" => toi_rt_create_regexp as *const () as usize,
         "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
         "toi_rt_in" => toi_rt_in as *const () as usize,
         "toi_rt_call" => toi_rt_call as *const () as usize,
@@ -1724,6 +1733,11 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 }
                 Op::LdaConstant if vm => {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                }
+                // The pattern's constant in `imm`, the flags' in `ic`.
+                Op::CreateRegExp if vm => {
+                    imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                    ic = u16::from_le_bytes([code[pc + 3], code[pc + 4]]);
                 }
                 Op::Call | Op::CallUndefined | Op::Construct if vm => {
                     (reg, reg2, imm) = (code[pc + 1], code[pc + 2], code[pc + 3] as i32);
@@ -3467,6 +3481,19 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             } else {
                 ("test_seq", "")
             }
+        }
+        // A regular expression literal's new object, through the runtime:
+        // the pattern and the flags are the 64-bit immediates.
+        Op::CreateRegExp => {
+            let Some(fb) = spec.feedback.map(|f| &f[insn.frame as usize]) else {
+                return Sel::new("bail", "", out);
+            };
+            let k = |at: usize| unsafe { *fb.constants.add(at) }.to_bits();
+            out.acc = Any;
+            return Sel {
+                ops: Some((0, k(insn.imm as usize), k(insn.ic as usize))),
+                ..Sel::new("create_regexp", "", out)
+            };
         }
         // A new, empty array, through the runtime (the VM is the 64-bit
         // immediate); typed `Ext` of the empty array's shape, which says
@@ -5367,6 +5394,7 @@ fn stencil_for(
                     | "lda_global_oop"
                     | "create_array"
                     | "create_object"
+                    | "create_regexp"
                     | "lda_constant"
                     | "lda_upvalue"
                     | "lda_upvalue_c"
@@ -5415,6 +5443,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::Construct
                 | Op::CreateArray
                 | Op::CreateObject
+                | Op::CreateRegExp
                 | Op::LdaConstant
         )
     };
@@ -9258,6 +9287,7 @@ fn reads_acc(insn: &Insn) -> bool {
                 | Op::CreateArray
                 | Op::CreateObject
                 | Op::CreateClosure
+                | Op::CreateRegExp
                 | Op::Call
                 | Op::CallUndefined
                 | Op::Construct

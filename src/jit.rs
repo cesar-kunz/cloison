@@ -332,23 +332,14 @@ extern "C" fn toi_rt_for_in_keys(vm: Value, v: Value) -> u64 {
     }
 }
 
-/// A new object of shape `shape` (`create_object`, when the heap's chunk
-/// is full).
+/// A new object of shape `shape` (`create_object` and `create_array`,
+/// when the heap's chunk is full).
 extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
     unsafe {
         let vm = crate::interp::current_vm();
         (*vm).safepoint(std::ptr::null_mut());
         let o = (*vm).heap.alloc_object(&*(shape.to_bits() as *const Shape));
         crate::object::object_value(o).to_bits()
-    }
-}
-
-/// A new, empty array (`create_array`; `vm` is the VM's address).
-extern "C" fn toi_rt_create_array(vm: Value, _: Value) -> u64 {
-    unsafe {
-        let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
-        vm.safepoint(std::ptr::null_mut());
-        vm.new_array().to_bits()
     }
 }
 
@@ -577,7 +568,6 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_inc" => toi_rt_inc as *const () as usize,
         "toi_rt_less_than" => toi_rt_less_than as *const () as usize,
         "toi_rt_compare" => toi_rt_compare as *const () as usize,
-        "toi_rt_create_array" => toi_rt_create_array as *const () as usize,
         "toi_rt_create_object" => toi_rt_create_object as *const () as usize,
         "toi_rt_for_in_keys" => toi_rt_for_in_keys as *const () as usize,
         "toi_rt_sub" => toi_rt_sub as *const () as usize,
@@ -3678,16 +3668,24 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ..Sel::new("create_regexp", "", out)
             };
         }
-        // A new, empty array, through the runtime (the VM is the 64-bit
-        // immediate); typed `Ext` of the empty array's shape, which says
-        // only that it is a cell.
+        // A new, empty array, allocated in the stencil as `create_object`
+        // (the shape and the heap's bump pointer are its operands); typed
+        // `Ext` of the empty array's shape, which says only that it is a
+        // cell.
         Op::CreateArray => {
             let Some(vm) = spec.feedback.map(|f| f[insn.frame as usize].vm) else {
                 return Sel::new("bail", "", out);
             };
-            out.acc = Ty::Ext(unsafe { (*vm).array_shape } as u64);
+            let shape = unsafe { (*vm).array_shape };
+            debug_assert_eq!(
+                &crate::object::object_header(unsafe { &*shape })[1..],
+                &[1 << 8 | crate::object::Class::Array as u64, 0, 0, 0, 0],
+                "the header `create_array` writes"
+            );
+            out.acc = Ty::Ext(shape as u64);
+            let heap = unsafe { (*vm).heap.bump() };
             return Sel {
-                ops: Some((0, vm as u64, 0)),
+                ops: Some((0, shape as u64, heap as u64)),
                 ..Sel::new("create_array", "", out)
             };
         }

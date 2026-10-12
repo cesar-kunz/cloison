@@ -129,7 +129,6 @@ unsafe extern "C" {
     fn toi_rt_inc();
     fn toi_rt_less_than();
     fn toi_rt_compare();
-    fn toi_rt_create_array();
     fn toi_rt_create_object();
     fn toi_rt_for_in_keys();
     fn toi_rt_sub();
@@ -3694,10 +3693,22 @@ stencil_slow!("create_object"; |s| {
     next!(s)
 });
 
-// `CreateArray`: a new, empty array from the runtime (the VM's address is
-// the 64-bit immediate).
-stencil!("create_array"; |s| {
-    s.acc = Value::from_bits(rt_call!(s, toi_rt_create_array, Value::from_bits(imm64()), Value::UNDEFINED));
+// `CreateArray`: a new, empty array of shape `imm64`, as `create_object_0`
+// (no slots nor elements).
+stencil_slow!("create_array"; |s| {
+    let Some(p) = bump(imm64b() as *mut HeapPtrs, 6) else { slow!(s) };
+    *p = imm64();
+    // `Class::Array`, flags `EXTERNAL`.
+    *p.add(1) = 1 | 1 << 8;
+    for k in 2..6 {
+        *p.add(k) = 0;
+    }
+    s.acc = Value::from_bits(p as u64);
+    next!(s)
+}; |s| {
+    // (Its own helper: LLVM would merge it with `create_object`'s.)
+    core::arch::asm!("/* create_array */", options(nomem, nostack, preserves_flags));
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
     next!(s)
 });
 

@@ -89,7 +89,7 @@ pub struct Gc {
     pub(crate) sweeping: bool,
     /// What the heap may grow by before the next full collection (see
     /// [`GROWTH`]).
-    room: usize,
+    pub(crate) room: usize,
     /// The heap's blocks in use when the current cycle started, and what
     /// the last cycle grew them by while marking: the next one starts that
     /// much earlier, so the heap peaks where a stop-the-world collection
@@ -159,7 +159,7 @@ impl Gc {
     /// starts: the room less the last cycle's lead, half the room and
     /// [`FULL_MIN`] at least (more cycles of a small heap cost more time
     /// than they save memory: EarleyBoyer 12% at half of 64 MiB).
-    fn headroom(&self) -> usize {
+    pub(crate) fn headroom(&self) -> usize {
         self.room.saturating_sub(self.lead).max(self.room / 2).max(FULL_MIN)
     }
 
@@ -1628,9 +1628,14 @@ impl Heap {
     /// metadata cleared (their memory is holes), and with `poison` filled
     /// with [`POISON`]. Returns the bytes freed (counted only with
     /// `poison`, and large cells).
+    ///
+    /// Each region's room is counted in `room` (for `collected`): its runs
+    /// of free granules allocation would take (at least `min_hole`).
     unsafe fn free_young(&mut self, poison: bool) -> usize {
         let mut freed = 0;
         let regions = std::mem::take(&mut self.regions);
+        let min = crate::heap::min_hole() / GRANULE;
+        self.room.clear();
         unsafe {
             for &(s, e) in &regions {
                 if self.is_large_start(s) {
@@ -1638,6 +1643,7 @@ impl Heap {
                         freed += e - s;
                         self.free_large(s);
                     }
+                    self.room.push(0);
                     continue;
                 }
                 if poison {
@@ -1651,23 +1657,42 @@ impl Heap {
                         }
                         p += n;
                     }
+                    self.room.push(e - s);
                     continue;
                 }
                 // Clear every `YOUNG` byte (bit 7; colors and `END` are
-                // below it), eight at a time.
+                // below it), eight at a time, counting the granules in runs
+                // of words left zero, two words (`min_hole`) or more: what
+                // allocation takes, give or take a hole's ends. (A cell's
+                // own zero bytes, between its first and its `END`, count
+                // too: only in a cell of more than 256 bytes.)
                 let (mut m, me) = (self.meta(s) as usize, self.meta(e) as usize);
                 while m < me && !m.is_multiple_of(8) {
                     *(m as *mut u8) &= !YOUNG;
                     m += 1;
                 }
+                let (mut room, mut run) = (0, 0);
                 while m + 8 <= me {
-                    *(m as *mut u64) &= !0x8080_8080_8080_8080;
+                    let w = *(m as *mut u64) & !0x8080_8080_8080_8080;
+                    *(m as *mut u64) = w;
+                    if w == 0 {
+                        run += 8;
+                    } else {
+                        if run >= min {
+                            room += run;
+                        }
+                        run = 0;
+                    }
                     m += 8;
+                }
+                if run >= min {
+                    room += run;
                 }
                 while m < me {
                     *(m as *mut u8) &= !YOUNG;
                     m += 1;
                 }
+                self.room.push(room * GRANULE);
             }
         }
         self.regions = regions;

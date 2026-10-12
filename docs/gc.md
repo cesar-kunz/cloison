@@ -307,7 +307,8 @@ blocks:
 Memory is zeroed when a hole is taken (fresh blocks are zero already):
 the `create_object` stencils write a header and leave the slots, whose
 zero (`Value::EMPTY`, not a cell) a collection then reads. Blocks a full
-collection leaves empty are given back to the system (`madvise`).
+collection leaves empty are given back to the system (`madvise`), but
+for as many as the heap will grow by before the next cycle.
 
 ### Cells
 
@@ -774,6 +775,22 @@ runs) and the microbenchmarks.
      kept to the collecting thread's L3 (Linux, `sched_setaffinity`),
      spread over all the host's cores or were left where the
      scheduler put them: pauses in all within 10% either way, by file.
+   - *Empty blocks kept; blocks recycled for their room* (done). Every
+     block a sweep emptied went back to the system (`madvise`) and was
+     faulted in again within the cycle: Splay took 444,000 page faults a
+     run, 17% of its cycles in the kernel. Up to the room's bytes of
+     empty blocks now stay committed, taken before fresh ones (their
+     memory zeroed then; a released block's is zero, only its metadata
+     is cleared). And a minor collection recycles a block for the room
+     `free_young` left in it, counted while clearing the `YOUNG` bits
+     (runs of at least two zero metadata words), not for the bytes
+     allocated there: most of Splay's young cells survive, and
+     allocation scanned 1.0G granules a run (33M holes too small) to
+     find its 32 MiB a cycle, 0.5G (13M) now. Splay 5.05 s -> 4.09 s
+     (keeping blocks alone 4.38 s; counting room alone was slower, more
+     blocks faulted in), peak RSS 587 -> 685 MB (614 MB keeping only the
+     headroom's bytes: 4.40 s); its pauses' free phase 74 -> 92 ms.
+     Others within noise, their peak RSS unchanged.
 
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable

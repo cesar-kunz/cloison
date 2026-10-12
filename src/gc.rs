@@ -67,8 +67,11 @@ pub struct Gc {
     /// call sites' closures), each an address in or at a cell.
     kept: Vec<usize>,
     kept_set: crate::jit::HashSet<usize>,
-    /// Cells stored into Rust structures since the last collection.
+    /// Cells stored into Rust structures since the last collection (their
+    /// first granules), and addresses in or at cells taken for good since
+    /// (see [`Heap::keep`]).
     log: Vec<usize>,
+    log_kept: Vec<usize>,
     /// Slots of Rust structures (call caches) a young cell was stored in
     /// since the last collection: what they hold then is a root.
     log_slots: Vec<usize>,
@@ -187,8 +190,11 @@ impl Heap {
     /// structures).
     #[inline(always)]
     pub fn note(&mut self, v: Value) {
-        if self.is_young(v) {
-            self.gc.log.push(v.to_bits() as usize);
+        // (Prototype caches note the same holder over and over: TypeScript
+        // logged 386,000 cells for 31,000 between two collections.)
+        let a = v.to_bits() as usize;
+        if self.is_young(v) && self.gc.log.last() != Some(&a) {
+            self.gc.log.push(a);
         }
     }
 
@@ -205,7 +211,7 @@ impl Heap {
     pub fn keep(&mut self, a: usize) {
         if self.contains(a) && self.gc.kept_set.insert(a) {
             self.gc.kept.push(a);
-            self.gc.log.push(a);
+            self.gc.log_kept.push(a);
         }
     }
 }
@@ -520,7 +526,7 @@ impl Marking<'_> {
     /// [`drain`](Self::drain) in a pause, on `threads` threads: each traces
     /// from its own stack, claiming the cells it marks by a
     /// compare-and-swap of their metadata ([`CardMarking`]), and hands
-    /// half its stack to the others when they have run out; done once
+    /// half its stack to the shared queue whenever that is empty; done once
     /// every thread is out of work. Returns how many cells were traced.
     unsafe fn drain_parallel(&mut self, threads: usize) -> usize {
         // The stack's cells and array slices (see `drain`), the cells
@@ -788,11 +794,14 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 return;
             }
             Class::Function => {
+                // After the in-object slots it was allocated with, as
+                // `cell_size` has it: the marker thread reads no shape.
                 let ups = (&(*(*o).code).upvalues).len();
-                let up = crate::vm::Vm::upvalues(o);
+                let up = (p + INLINE_BASE + 8 * cap) as *const usize;
+                debug_assert_eq!(up as usize, crate::vm::Vm::upvalues(o) as usize);
                 for k in 0..ups {
                     if within(up.add(k) as usize) {
-                        v.payload(*up.add(k) as usize);
+                        v.payload(*up.add(k));
                     }
                 }
             }
@@ -809,7 +818,9 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
 
 /// Run `f` with the callee-saved registers spilled into this frame, and
 /// the stack pointer below them: every word a caller holds is then in
-/// memory at or above it.
+/// memory at or above it. (General registers only: arm64's callee-saved
+/// `d8`-`d15` would hold a cell only if LLVM moved a pointer into a
+/// floating-point register across a call, which it does not.)
 #[inline(never)]
 fn with_registers_spilled(f: &mut dyn FnMut(usize)) {
     let mut buf = [0usize; 12];
@@ -1040,6 +1051,9 @@ impl Vm {
         let vm: *mut Vm = self;
         let gc = &self.heap.gc;
         let kind = if gc.marking {
+            // Cleared before `done` is read: a request the marker makes
+            // after this is kept for the next safepoint.
+            self.heap.requested.store(false, std::sync::atomic::Ordering::Relaxed);
             let done = gc.marker.as_ref().is_some_and(|m| m.shared.state.lock().unwrap().done);
             // The final pause: the marker is done, or the heap has outgrown
             // the cycle (the mutator then finishes the marking).
@@ -1049,7 +1063,6 @@ impl Vm {
                 Collection::MinorShade
             } else {
                 // (The marker's request of the final pause came early.)
-                self.heap.requested.store(false, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         } else if gc.always_full || gc.cycles || self.heap.allocated() > gc.full_at || gc.promoted > gc.room.max(FULL_MIN) {
@@ -1152,7 +1165,11 @@ impl Vm {
             }
             times[2] = lap();
             freed = match kind {
-                Collection::Final => self.heap.start_sweep(color, check),
+                // The young cells left unmarked are freed now, not by the
+                // sweep: until their block is swept, a minor collection
+                // would take a stale word to one for a live young cell and
+                // keep it, with what it refers to swept from under it.
+                Collection::Final => self.heap.free_young(check) + self.heap.start_sweep(color, check),
                 Collection::Full => self.heap.free_unmarked(color, check),
                 _ => self.heap.free_young(check),
             };
@@ -1166,6 +1183,7 @@ impl Vm {
         }
         self.heap.gc.stack = stack;
         self.heap.gc.log.clear();
+        self.heap.gc.log_kept.clear();
         self.heap.gc.log_slots.clear();
         self.heap.gc.count += 1;
         if full {
@@ -1306,9 +1324,13 @@ impl Vm {
             for i in 0..self.open_upvalues.len() {
                 m.payload(self.open_upvalues[i] as usize);
             }
-            // What Rust structures took since the last collection.
+            // What Rust structures took since the last collection: cells
+            // (young ones, so still cells), and addresses in or at cells.
             for i in 0..self.heap.gc.log.len() {
-                let a = self.heap.gc.log[i];
+                m.cell(self.heap.gc.log[i]);
+            }
+            for i in 0..self.heap.gc.log_kept.len() {
+                let a = self.heap.gc.log_kept[i];
                 self.mark_interior(m, a);
             }
             for i in 0..self.heap.gc.log_slots.len() {

@@ -482,7 +482,11 @@ Concurrent, with two short pauses, the marker thread doing the rest
    (JSC's sweep-to-allocate). While sweeping, a dead old cell still has
    the old color, so minor collections trace only old cells of the
    current one. The next cycle finishes the sweep first. Large cells are
-   swept in the final pause.
+   swept in the final pause, and so are the young cells it left
+   unmarked, as a minor collection frees them: left `YOUNG` for the
+   sweeper, a stale word a minor collection found meanwhile kept one as
+   a live young cell, with what it referred to swept from under it
+   (EarleyBoyer did so six times with a 1 MiB nursery).
 
 `TOI_GC_STW` marks and sweeps full collections in one pause instead;
 `TOI_GC_CYCLES` runs cycles back to back, and with `TOI_GC_VERIFY` each
@@ -744,7 +748,7 @@ runs) and the microbenchmarks.
      or final) traces on one thread until it has traced 16,384 cells,
      then on up to `TOI_GC_THREADS` (`Marking::drain_parallel`): each
      from its own stack, claiming cells as card scanning does, handing
-     half its stack to a shared queue when another thread has run out
+     half its stack to a shared queue whenever that is empty
      (from 16 cells: a tree traced depth first keeps a stack about as
      deep as the tree, so a threshold on the stack's size never fired on
      Splay's), done when all are out of work; an array's slices stay with
@@ -755,6 +759,22 @@ runs) and the microbenchmarks.
      10.7%; survivors.js 38% -> 27%; Splay 19.6% -> 12.8% (4.23 s ->
      3.80 s), longest pause 10 -> 4.5 ms; TypeScript's longest pauses 15
      -> 8.4 ms; the rest of Octane unchanged.
+   - *The log of Rust structures' cells* (done): a cell `Heap::note`
+     logs is a cell's first granule, marked as one, not resolved as an
+     interior pointer (`keep`'s addresses, which may be, have their own
+     log), and the same cell noted twice in a row is logged once
+     (prototype caches note their holder at every fill: TypeScript logged
+     386,000 cells for 31,000 between two collections). TypeScript's
+     roots 27 ms -> 3 ms over its collections, its pauses 91 -> 67 ms in
+     all, its longest 11.6 -> 7.8 ms.
+   - *Not kept: parked threads for pauses.* Spawning seven threads costs
+     170 microseconds a phase; a pool of parked ones made card scanning
+     17-28% faster but tracing 10-25% slower, even traced on spawned
+     threads after cards scanned on parked ones, whether the parked ones
+     kept to the collecting thread's L3 (Linux, `sched_setaffinity`),
+     spread over all the host's cores or were left where the
+     scheduler put them: pauses in all within 10% either way, by file.
+
 7. **Later.** The header diet (shape as a 32-bit ID: 16-byte headers,
    most objects in one or two granules fewer), shapes as collectable
    cells, ephemerons with ES6.

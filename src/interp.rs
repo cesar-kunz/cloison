@@ -2368,7 +2368,8 @@ const CONS_MIN: usize = 256;
 /// forwarding from narrower stores): 2% of DeltaBlue's cycles.
 #[inline(always)]
 fn concat_fast(a: Value, b: Value) -> Option<Value> {
-    let vm = unsafe { &mut *current_vm() };
+    // (Taken only for strings: a test may add other values with no VM.)
+    let vm = || unsafe { &mut *current_vm() };
     // A word more than the units need: the last word copied may run past
     // the end.
     let words = |len: usize| len.div_ceil(4) + 1;
@@ -2379,9 +2380,9 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
         (Some((x, m)), Some((y, n))) => {
             let len = m + n;
             if len >= CONS_MIN {
-                return Some(vm.new_cons(a, b));
+                return Some(vm().new_cons(a, b));
             }
-            Some(vm.new_string_raw(len, words(len), |out| unsafe {
+            Some(vm().new_string_raw(len, words(len), |out| unsafe {
                 copy_words(out, x, m);
                 copy_words(out.add(m), y, n);
             }))
@@ -2390,11 +2391,11 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
             let i = b.as_i32_unchecked();
             let (n, len) = (int_len(i), m + int_len(i));
             if len >= CONS_MIN {
-                let d = int_string(vm, i);
-                return Some(vm.new_cons(a, d));
+                let d = int_string(vm(), i);
+                return Some(vm().new_cons(a, d));
             }
             // The copy may run into the digits' units: they come after.
-            Some(vm.new_string_raw(len, words(len), |out| unsafe {
+            Some(vm().new_string_raw(len, words(len), |out| unsafe {
                 copy_words(out, x, m);
                 write_int(out.add(m), i, n);
             }))
@@ -2403,10 +2404,10 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
             let i = a.as_i32_unchecked();
             let (n, len) = (int_len(i), int_len(i) + m);
             if len >= CONS_MIN {
-                let d = int_string(vm, i);
-                return Some(vm.new_cons(d, b));
+                let d = int_string(vm(), i);
+                return Some(vm().new_cons(d, b));
             }
-            Some(vm.new_string_raw(len, words(len), |out| unsafe {
+            Some(vm().new_string_raw(len, words(len), |out| unsafe {
                 write_int(out, i, n);
                 copy_words(out.add(n), y, m);
             }))

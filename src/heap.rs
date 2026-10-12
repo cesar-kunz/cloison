@@ -16,9 +16,9 @@
 //!   at the cell's last granule. So a granule's byte says whether a cell
 //!   starts there and how old it is, without reading the cell: what a
 //!   conservative root is checked against, and what holes are found from.
-//! - **Cards**, one byte per [`CARD`] bytes, set by every store of a value
-//!   into a cell: what a minor collection scans old cells for young
-//!   referents in.
+//! - **Cards**, one byte per [`CARD`] bytes, set by a store into an old
+//!   cell of a cell not marked with the current color ([`barrier`]): what
+//!   a minor collection scans old cells for young referents in.
 //!
 //! Every cell says how big it is from its first words ([`cell_size`]): an
 //! object starts with its shape's address (8-aligned), anything else with

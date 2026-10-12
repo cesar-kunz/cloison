@@ -4749,8 +4749,8 @@ fn home_stats(insns: &[Insn], ins: &[Option<TypeState>], nregs: usize) -> HomeSt
     let mut depth = vec![0u32; insns.len() + 1];
     for (j, insn) in insns.iter().enumerate() {
         if insn.jumps() && insn.target <= j {
-            depth[insn.target] += 1;
-            depth[j + 1] -= 1;
+            depth[insn.target] = depth[insn.target].wrapping_add(1);
+            depth[j + 1] = depth[j + 1].wrapping_sub(1);
         }
     }
     let mut d = 0u32;

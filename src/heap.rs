@@ -96,7 +96,7 @@ const KIND: u64 = 7;
 const RECYCLE: usize = 4 << 10;
 
 /// Holes smaller than this are left unused until the next collection.
-fn min_hole() -> usize {
+pub(crate) fn min_hole() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("TOI_GC_MIN_HOLE").ok().and_then(|s| s.parse().ok()).unwrap_or(256))
 }
@@ -284,11 +284,16 @@ pub struct Heap {
     recycle: Vec<u32>,
     cursor: usize,
     cursor_end: usize,
-    /// Blocks that hold nothing.
+    /// Blocks that hold nothing: given back to the system (their memory
+    /// zero, their metadata not), and kept (see `add_swept`).
     free: Vec<u32>,
+    empty: Vec<u32>,
     /// The ranges cells were allocated in since the last collection, in
     /// order, the current hole's not yet (its end is `ptr`).
     pub(crate) regions: Vec<(usize, usize)>,
+    /// The room a minor collection left in each of `regions` (see
+    /// `free_young`).
+    pub(crate) room: Vec<usize>,
     /// Bytes handed out since the last collection, and blocks in use.
     since: usize,
     used: usize,
@@ -351,7 +356,9 @@ impl Heap {
             cursor: 0,
             cursor_end: 0,
             free: Vec::new(),
+            empty: Vec::new(),
             regions: Vec::new(),
+            room: Vec::new(),
             since: 0,
             used: 0,
         };
@@ -424,16 +431,18 @@ impl Heap {
             // sweep some here before taking a new one.
             if self.gc.sweeping {
                 self.absorb_sweep();
-                if !self.recycle.is_empty() || (self.free.is_empty() && self.help_sweep()) {
+                if !self.recycle.is_empty() || (self.free.is_empty() && self.empty.is_empty() && self.help_sweep()) {
                     continue;
                 }
             }
-            let b = match self.free.pop() {
-                Some(b) => {
-                    self.clean(b as usize, 1);
-                    b as usize
-                }
-                None => self.fresh_blocks(1),
+            let b = if let Some(b) = self.empty.pop() {
+                self.clean(b as usize, 1);
+                b as usize
+            } else if let Some(b) = self.free.pop() {
+                unsafe { std::ptr::write_bytes(meta(self.block_addr(b as usize) as usize), 0, BLOCK / GRANULE) };
+                b as usize
+            } else {
+                self.fresh_blocks(1)
             };
             self.blocks[b] = Block::Small;
             self.used += BLOCK;
@@ -529,12 +538,16 @@ impl Heap {
             // Once each: a block a second time would be allocated in again
             // over cells it holds since (holes of one block need not be
             // consecutive regions: a large cell's comes between). And only
-            // a block whose holes held at least `RECYCLE` bytes: one with
-            // small holes between old cells costs a scan of its metadata
-            // for little room (Splay's blocks of promoted nodes, scanned at
-            // every cycle, were a tenth of its time).
-            let mut bs: Vec<(u32, usize)> = (self.regions.iter())
-                .map(|&(s, e)| (((s - self.base) / BLOCK) as u32, e - s))
+            // a block with at least `RECYCLE` bytes of room in them, in
+            // holes allocation takes: one with small holes between old
+            // cells costs a scan of its metadata for little room (Splay's
+            // blocks of promoted nodes, scanned at every cycle, were a
+            // tenth of its time). The room `free_young` left, not what the
+            // regions held: most of Splay's young cells survive, and its
+            // allocation scanned twice the granules counting those. (The
+            // hole's unused end, after them, is all room.)
+            let mut bs: Vec<(u32, usize)> = (self.regions.iter().enumerate())
+                .map(|(k, &(s, e))| (((s - self.base) / BLOCK) as u32, self.room.get(k).map_or(e - s, |&r| r)))
                 .filter(|&(b, _)| self.blocks[b as usize] == Block::Small)
                 .collect();
             bs.sort_unstable();
@@ -553,6 +566,7 @@ impl Heap {
             self.recycle.reverse();
         }
         self.regions.clear();
+        self.room.clear();
         // The block being allocated in is among them: start afresh.
         self.ptr = std::ptr::null_mut();
         self.end = std::ptr::null_mut();
@@ -596,21 +610,30 @@ impl Heap {
 
     /// Blocks a sweep found: allocate in those at `partly` again (with
     /// their free bytes) if they have room (see [`RECYCLE`]), and free
-    /// those at `empty`, giving their memory back to the system.
+    /// those at `empty`. Up to the room's bytes of free blocks keep their
+    /// memory, the heap growing by about that much before the next cycle
+    /// (`Gc::room`): the others' goes back to the system. (Splay, whose
+    /// sweeps empty a hundred MiB a cycle that it allocates in again, took
+    /// 444,000 page faults a run giving all back.)
     pub(crate) fn add_swept(&mut self, partly: &[(usize, usize)], empty: &[usize]) {
         self.recycle.extend(
             (partly.iter().rev())
                 .filter(|&&(_, free)| free >= RECYCLE)
                 .map(|&(a, _)| ((a - self.base) / BLOCK) as u32),
         );
+        let keep = self.gc.room.max(self.gc.headroom()) / BLOCK;
         let mut empty = empty.to_vec();
         empty.sort_unstable();
         let mut run: Option<(usize, usize)> = None;
         for &a in &empty {
             let b = (a - self.base) / BLOCK;
             self.blocks[b] = Block::Free;
-            self.free.push(b as u32);
             self.used -= BLOCK;
+            if self.empty.len() < keep {
+                self.empty.push(b as u32);
+                continue;
+            }
+            self.free.push(b as u32);
             // Contiguous blocks go back in one call.
             run = match run {
                 Some((s, e)) if e == a => Some((s, a + BLOCK)),
@@ -716,7 +739,7 @@ impl Heap {
     /// `n` contiguous free blocks, zeroed and taken off the free list: the
     /// first's index.
     fn free_run(&mut self, n: usize) -> Option<usize> {
-        if self.free.len() < n {
+        if self.free.len() + self.empty.len() < n {
             return None;
         }
         let mut run = 0;
@@ -726,6 +749,7 @@ impl Heap {
         })? + 1
             - n;
         self.free.retain(|&k| !(b..b + n).contains(&(k as usize)));
+        self.empty.retain(|&k| !(b..b + n).contains(&(k as usize)));
         self.clean(b, n);
         Some(b)
     }
@@ -824,7 +848,7 @@ impl Heap {
     /// Blocks: handed out, to allocate in again, free, large.
     pub fn block_counts(&self) -> (usize, usize, usize, usize) {
         let large = self.blocks.iter().filter(|b| !matches!(b, Block::Small | Block::Free)).count();
-        (self.top, self.recycle.len(), self.free.len(), large)
+        (self.top, self.recycle.len(), self.free.len() + self.empty.len(), large)
     }
 
     /// Walk every cell, checking that each says how big it is and that

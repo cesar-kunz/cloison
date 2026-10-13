@@ -1004,6 +1004,38 @@ impl Program {
                     self.code.push(i);
                     return;
                 }
+                // A body that can't match empty, repeated at most once or
+                // without bound: no count, no empty-iteration check.
+                if width(inner).0 > 0 && *min <= 1 && (*max == 1 || *max == u32::MAX) && *max >= *min {
+                    if *min == 1 {
+                        self.emit(re, inner);
+                        if *max == 1 {
+                            return;
+                        }
+                    }
+                    let top = self.here();
+                    let split = self.code.len();
+                    if *greedy {
+                        self.code.push(Insn::Split(0));
+                    } else {
+                        self.code.push(Insn::Split(split as u32 + 2));
+                        self.code.push(Insn::Jmp(0));
+                    }
+                    if !groups.is_empty() && *max != 1 {
+                        self.code.push(Insn::Clear { lo: groups.start as u32, hi: groups.end as u32 });
+                    }
+                    self.emit(re, inner);
+                    if *max != 1 {
+                        self.code.push(Insn::Jmp(top));
+                    }
+                    let exit = self.here();
+                    if *greedy {
+                        self.code[split] = Insn::Split(exit);
+                    } else {
+                        self.code[split + 1] = Insn::Jmp(exit);
+                    }
+                    return;
+                }
                 let (c, p) = (self.reg(), self.reg());
                 self.code.push(Insn::Zero(c));
                 let head = self.here();

@@ -268,3 +268,21 @@ the plain function shape. On a miss, the runtime answers and fills the
 cache. Measured with `perf stat` against 1ef392c: earley-boyer −9.2%
 cycles (−12.7% instructions; a one-entry cache gave −6.8%), every other
 benchmark unchanged.
+
+Self calls (step 9's earley-boyer part). A self call binds directly to
+the version being compiled only if its arguments fit that version's
+entry types. `one_way_unify1_nboyer`'s entry is typed by its callers
+(pairs), and it recurses on `lst1.car`, which is `Any`. So its 43M self
+calls went through `toi_rt_call` → `vm_run` → `fitting_version`.
+
+They aren't tail calls: the call is in a loop and its result is tested.
+Now such a call gets a site of its own, claimed pending as for mutual
+recursion. Its first call binds a version for its types, whose own
+self calls fit it. Measured with `perf stat` against 66389ea:
+earley-boyer −18% cycles (−18.8% instructions), the others unchanged.
+
+Left in earley-boyer:
+
+- closure creation (`closure_of`, 8%);
+- allocation (memset, `alloc_slow`, `free_young`, about 12%);
+- `sc_list`, which reads `arguments`: entered through `vm_run` 13M times.

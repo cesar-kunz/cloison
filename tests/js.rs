@@ -3108,3 +3108,28 @@ var err2 = 0; try { var g = function () {}; g.prototype = 7; count([{}], g); } c
 t + " " + err + " " + err2;"#;
     assert_eq!(value(src), "326439998 1 1");
 }
+
+/// A recursive call whose arguments the version making it doesn't take
+/// (its entry typed by its callers, the call's argument a field of any
+/// type) still calls directly: a version for those types, bound at the
+/// first call, not the runtime at each.
+#[test]
+fn self_calls_bind_versions_for_their_types() {
+    let src = r#"
+function P(car, cdr) { this.car = car; this.cdr = cdr; }
+function T(kids) { this.kids = kids; }
+function walk(t, d) {
+  if (!(t instanceof T)) return d;
+  var n = 0, l = t.kids;
+  while (l !== null) { n += walk(l.car, d + 1); l = l.cdr; }
+  return n;
+}
+function tree(k) { if (k == 0) return k; var l = null; for (var i = 0; i < 3; i++) l = new P(tree(k - 1), l); return new T(l); }
+var t = tree(6), s = 0;
+for (var r = 0; r < 200; r++) s += walk(t, r & 3);
+s;"#;
+    assert_eq!(value(src), "1093500");
+    let (_, s) = compiled(src, "walk");
+    assert!(s.iter().any(|n| n.starts_with("call_direct")), "{s:?}");
+    assert!(!s.iter().any(|n| n == "call"), "{s:?}");
+}

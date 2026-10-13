@@ -327,12 +327,41 @@ fn in_class(ic: bool, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
     r != neg
 }
 
-/// The first `needle` in `s` at or after `from`.
-fn find(s: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+/// The first `needle` in `s` at or after `from`: candidates where its
+/// first and last units both occur, eight positions at a time.
+pub(crate) fn find(s: &[u16], needle: &[u16], from: usize) -> Option<usize> {
+    let n = needle.len();
+    if n == 0 {
+        return (from <= s.len()).then_some(from);
+    }
+    if from + n > s.len() {
+        return None;
+    }
+    let last = s.len() - n;
     let mut at = from;
-    while at + needle.len() <= s.len() {
-        at += s[at..=s.len() - needle.len()].iter().position(|&c| c == needle[0])?;
-        if s[at..at + needle.len()] == *needle {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let f = _mm_set1_epi16(needle[0] as i16);
+        let l = _mm_set1_epi16(needle[n - 1] as i16);
+        let p = s.as_ptr();
+        while at + 8 <= last + 1 {
+            let a = _mm_loadu_si128(p.add(at).cast());
+            let b = _mm_loadu_si128(p.add(at + n - 1).cast());
+            let eq = _mm_and_si128(_mm_cmpeq_epi16(a, f), _mm_cmpeq_epi16(b, l));
+            let mut m = _mm_movemask_epi8(eq) as u32 & 0x5555;
+            while m != 0 {
+                let i = at + (m.trailing_zeros() / 2) as usize;
+                if n <= 2 || s[i + 1..i + n - 1] == needle[1..n - 1] {
+                    return Some(i);
+                }
+                m &= m - 1;
+            }
+            at += 8;
+        }
+    }
+    while at <= last {
+        if s[at] == needle[0] && s[at..at + n] == *needle {
             return Some(at);
         }
         at += 1;
@@ -1530,6 +1559,28 @@ mod tests {
         }
         // Both ways, often.
         assert!(matched > tried / 4 && matched < tried * 3 / 4, "{matched} of {tried}");
+    }
+
+    /// `find` (eight positions at a time) finds what a scan of every
+    /// position does: needles of 1 to 5 units, from every start, matches
+    /// near the ends included.
+    #[test]
+    fn find_agrees_with_a_scan() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..3000 {
+            let s: Vec<u16> = (0..rand(40)).map(|_| b"aab\xe9"[rand(4)] as u16).collect();
+            let needle: Vec<u16> = (0..1 + rand(5)).map(|_| b"aab\xe9"[rand(4)] as u16).collect();
+            for from in 0..=s.len() + 1 {
+                let want = (from..s.len().saturating_sub(needle.len() - 1)).find(|&i| s[i..i + needle.len()] == *needle);
+                assert_eq!(super::find(&s, &needle, from), want, "{s:?} {needle:?} from {from}");
+            }
+        }
     }
 
     /// Where `exec` starts trying (`Regex::starts`) doesn't change what it

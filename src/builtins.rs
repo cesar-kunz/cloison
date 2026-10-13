@@ -335,8 +335,7 @@ fn find(hay: &[u16], needle: &[u16], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from.min(hay.len()));
     }
-    (from..=hay.len().saturating_sub(needle.len()))
-        .find(|&i| i + needle.len() <= hay.len() && hay[i..i + needle.len()] == *needle)
+    crate::regexp::find(hay, needle, from)
 }
 
 fn string_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

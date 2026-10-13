@@ -766,8 +766,14 @@ fn splice_elements(vm: &mut Vm, o: *mut Object, at: usize, n: usize, items: &[Va
         let new_len = len - n + k;
         vm.reserve_elems(o, new_len);
         let e = (*o).elems;
+        // The elements after moved within the array: their type fits. (The
+        // same values, in other cards.)
         if k != n {
-            vm.store_elements(o, at + k, e.add(at + n), len - at - n);
+            let m = len - at - n;
+            std::ptr::copy(e.add(at + n), e.add(at + k), m);
+            for i in at + k..at + k + m {
+                crate::heap::barrier(e.cast::<u8>().sub(8), e.add(i), *e.add(i));
+            }
         }
         for i in new_len..len {
             *e.add(i) = Value::EMPTY;

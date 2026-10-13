@@ -1862,10 +1862,33 @@ stencil!("lda_false"; |s| {
     s.acc = Value::FALSE;
     next!(s)
 });
-// `acc = r instanceof acc` and `acc = r in acc`, `r` in memory, through the
-// runtime; out to the interpreter (before) where they would throw (0).
-stencil!("test_instanceof_m"; |s| {
-    let r = rt_call!(s, toi_rt_instance_of, load_m(s.regs), s.acc);
+// `acc = r instanceof acc`, `r` in memory. With a cache at `imm64` (two
+// entries: the receiver's shape, the prototype, the result; Earley-Boyer's
+// sites see two shapes) and a function of the plain
+// function shape (`imm64b`, its `prototype` at byte `imm`): a shape fixes
+// its prototype chain, so a receiver of the cached shape against the
+// cached prototype gets the cached result. Else, and on a miss, through
+// the runtime, which fills the cache; out to the interpreter (before)
+// where it would throw (0).
+stencil_slow!("test_instanceof_m"; |s| {
+    let v = load_m(s.regs);
+    let c = imm64() as *const u64;
+    if !c.is_null() && is_cell(s.tag, v) && is_cell(s.tag, s.acc) {
+        let f = s.acc.to_bits() as *const u8;
+        if *(f as *const u64) == imm64b() {
+            let (shape, p) = (*(v.to_bits() as *const u64), *(f.add(imm() as usize) as *const u64));
+            for e in [c, c.add(3)] {
+                if shape == *e && p == *e.add(1) {
+                    s.acc = Value::from_bits(*e.add(2));
+                    next!(s)
+                }
+            }
+        }
+    }
+    slow!(s)
+}; |s| {
+    let args = [load_m(s.regs), s.acc, Value::from_bits(imm64())];
+    let r = rt_call!(s, toi_rt_instance_of, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
     if r == 0 {
         exit!(s)
     }

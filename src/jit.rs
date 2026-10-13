@@ -548,9 +548,30 @@ extern "C" fn toi_rt_set_named(args: Value, _: Value) -> u64 {
 }
 
 /// `a instanceof b`, or 0 where it would throw (the interpreter does).
-extern "C" fn toi_rt_instance_of(a: Value, b: Value) -> u64 {
+extern "C" fn toi_rt_instance_of(args: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.instance_of(a, b).map_or(0, |r| Value::from_bool(r).to_bits())
+    let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
+    let (v, f, cache) = (a[0], a[1], a[2].to_bits() as *const std::cell::Cell<u64>);
+    let Ok(r) = vm.instance_of(v, f) else { return 0 };
+    let r = Value::from_bool(r);
+    // The site's cache: the receiver's shape and the prototype, read as the
+    // stencil reads them (see `test_instanceof_m`).
+    if !cache.is_null() && v.is_cell() {
+        let fo = crate::object::as_object(f);
+        unsafe {
+            if (*fo).shape as *const Shape == vm.function_shape {
+                let p = *Object::slot(fo, (*vm.function_shape).location(0));
+                // The new entry first, the first one moved to second.
+                for k in 0..3 {
+                    (*cache.add(3 + k)).set((*cache.add(k)).get());
+                }
+                (*cache).set((*crate::object::as_object(v)).shape as u64);
+                (*cache.add(1)).set(p.to_bits());
+                (*cache.add(2)).set(r.to_bits());
+            }
+        }
+    }
+    r.to_bits()
 }
 
 /// `a in b`, or 0 where it would throw (the interpreter does).
@@ -2122,6 +2143,9 @@ pub(crate) enum Prop {
     Keyed { shape: u64, elems: FieldType },
     /// A `GetNamed` that read an array's or a string's `length`.
     Length,
+    /// An `instanceof`: its cache, two entries of three words at `cache`
+    /// (see `test_instanceof_m` in the stencils), which the snapshot owns.
+    InstanceOf { cache: u64 },
     /// A named access whose cache holds several receiver shapes: one
     /// guard dispatching to `n` accesses, one per shape: the lowering's
     /// [`Case`]s at `at` (see [`Lowered::polys`]; kept apart, they would
@@ -3988,8 +4012,22 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = Any;
             ("test_eq_smi", num_case(st.acc))
         }
+        // Through the site's cache when the function has the plain
+        // function shape, its `prototype` in the slot at `imm`.
         Op::TestInstanceOf => {
             out.acc = Any;
+            if let Some(Prop::InstanceOf { cache }) = spec.props.get(i).copied()
+                && let Some(vm) = spec.feedback.map(|f| f[insn.frame as usize].vm)
+            {
+                let shape = unsafe { &*(*vm).function_shape };
+                let at = shape.location(0);
+                if at >= 0 && at <= MAX_SLOT_OFF {
+                    return Sel {
+                        ops: Some((at, cache, shape as *const Shape as u64)),
+                        ..Sel::new("test_instanceof", "", out)
+                    };
+                }
+            }
             ("test_instanceof", "")
         }
         // A delete changes an object's shape to one not extending the old:
@@ -9027,6 +9065,8 @@ pub(crate) struct Snapshot {
     exit_live: Vec<RegSet>,
     /// Owned here so they live as long as code pointing to them.
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
+    #[allow(dead_code)]
+    caches: Vec<Box<[std::cell::Cell<u64>; 6]>>,
 }
 
 /// Emit polymorphic access `i` ([`Prop::Poly`]): a store's boxing and
@@ -9160,6 +9200,8 @@ struct Lowered {
     frames: Vec<InlineFrame>,
     fbs: Vec<Feedback>,
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
+    /// The `instanceof` caches ([`Prop::InstanceOf`]).
+    caches: Vec<Box<[std::cell::Cell<u64>; 6]>>,
     nregs: usize,
     /// Where direct calls' frames start: registers from there are set up
     /// for callees, which read them from memory (see [`lower`]). Or where
@@ -9427,6 +9469,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             }],
             fbs: Vec::new(),
             sites: Vec::new(),
+            caches: Vec::new(),
             nregs: unsafe { (*root).nregs } as usize,
             direct_base: usize::MAX,
             aliases: Vec::new(),
@@ -11246,6 +11289,15 @@ impl Lowering<'_> {
                     };
                     self.push(i, prop);
                 }
+                // `instanceof`: a cache of its own (see `Prop::InstanceOf`).
+                Op::TestInstanceOf => {
+                    let cache = Box::new([const { std::cell::Cell::new(0) }; 6]);
+                    let prop = Prop::InstanceOf {
+                        cache: cache.as_ptr() as u64,
+                    };
+                    self.out.caches.push(cache);
+                    self.push(i, prop);
+                }
                 // A closure: its code, and the function whose upvalues it
                 // takes, known in an inlined frame (its checked callee).
                 Op::CreateClosure => {
@@ -12626,6 +12678,7 @@ impl JitFunction {
                 restores: Vec::new(),
                 exit_live: Vec::new(),
                 sites: Vec::new(),
+                caches: Vec::new(),
             }),
             inline_base: nregs,
             direct_base: usize::MAX,
@@ -12800,6 +12853,7 @@ impl JitFunction {
                 restores: low.restores,
                 exit_live: low.exit_live,
                 sites: low.sites,
+                caches: low.caches,
             });
         }
     }

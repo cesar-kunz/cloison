@@ -255,3 +255,16 @@ That's more than twice the estimate: the dead element arrays a literal
 left behind had also cost the collector. A boilerplate to clone for
 constant literals isn't needed for now: in compiled code, appending a
 constant costs two stencils.
+
+Step 8: `instanceof` goes through a two-entry cache per site. Each entry
+holds a receiver's shape, a prototype and the result. A shape fixes its
+prototype chain, so an entry stays valid for good. It needs no GC root
+either: a `true` entry's prototype is on a chain that shapes keep alive,
+and a `false` entry stays false even if its prototype dies and the
+address is reused.
+
+The stencil reads the function's `prototype` inline when the function has
+the plain function shape. On a miss, the runtime answers and fills the
+cache. Measured with `perf stat` against 1ef392c: earley-boyer −9.2%
+cycles (−12.7% instructions; a one-entry cache gave −6.8%), every other
+benchmark unchanged.

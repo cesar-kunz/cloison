@@ -361,14 +361,7 @@ impl Op {
 
     /// Total encoded length in bytes, opcode included.
     pub const fn size(self) -> usize {
-        let ops = self.operands();
-        let mut n = 1;
-        let mut i = 0;
-        while i < ops.len() {
-            n += ops[i].width();
-            i += 1;
-        }
-        n
+        SIZES[self as usize] as usize
     }
 
     /// Whether it is a loop's back edge (`JumpLoop`, `JumpIfLessLoop`, …).
@@ -653,6 +646,24 @@ impl Assembler {
         self.code
     }
 }
+
+/// Each opcode's [`Op::size`], from its operands' widths.
+const SIZES: [u8; Op::COUNT] = {
+    let mut t = [0; Op::COUNT];
+    let mut k = 0;
+    while k < Op::COUNT {
+        let ops = Op::ALL[k].operands();
+        let mut n = 1;
+        let mut i = 0;
+        while i < ops.len() {
+            n += ops[i].width();
+            i += 1;
+        }
+        t[k] = n as u8;
+        k += 1;
+    }
+    t
+};
 
 #[cfg(test)]
 mod tests {

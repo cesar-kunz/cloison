@@ -213,3 +213,29 @@ The barrier checker (`TOI_GC_CHECK_BARRIER`) also had a false positive
 on splay: while a sweep is pending, a dead old cell it hadn't reached
 held a stale pointer into memory already reused by young cells. The
 checker now skips cells of the old color while sweeping.
+
+Step 6, measured with `perf stat` instructions against 5bf2b40: box2d
+−2.6%, pdfjs −4.2%, typescript unchanged. That is far below the estimate.
+Functions that had been refused now run compiled, and that exposed three
+other problems:
+
+- **A bug.** A polymorphic call whose callee load had been dropped (its
+  cases dispatch on the receiver's shape) left the callee's register
+  unwritten when something between the load and the call exited.
+  TypeScript's `table.add(symbol.name, symbol)` then called a stale value.
+  Fixed separately; it costs nothing measurable.
+- **Exits are expensive.** Each exit looked its instruction up by scanning
+  the whole snapshot, thousands of instructions in TypeScript's inlining
+  functions. An index makes typescript −1.8% on its own.
+- **Spent functions keep failing.** A function out of compilations either
+  keeps exiting at accesses no lowering will give up on, or finds no
+  version its arguments fit (TypeScript's walker callbacks, called with
+  every kind of node). Once one call in four fails, its calls are left to
+  the interpreter.
+
+The rest of box2d's and typescript's interpreter time is in calls from
+compiled code into functions that run in the interpreter
+(`preCollectTypes`: 1M calls through `toi_rt_call`), and in functions
+refused or out of compilations for reasons other than named accesses.
+Those need the call-path work in step 9 and a look at the compilation
+budget (`max_compiles`).

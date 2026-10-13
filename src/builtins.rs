@@ -2271,40 +2271,43 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let replacement = arg(a, 1);
     let func = replacement.is_cell()
         && matches!(unsafe { (*as_object(replacement)).class }, Class::Function | Class::Native);
-    let template = if func { Vec::new() } else { units(replacement).into_owned() };
+    let template = if func { std::borrow::Cow::Borrowed(&[][..]) } else { units(replacement) };
     // The matches: each one's groups.
-    let mut matches: Vec<crate::regexp::Captures> = Vec::new();
+    let mut flat: crate::regexp::Captures = Vec::new();
+    let mut stride = 1;
+    let mut caps = std::mem::take(&mut vm.caps_buf);
     match regexp_of(pattern) {
         Some(re) => {
             if re.global {
                 let mut at = 0;
-                while at <= s.len()
-                    && let Some(caps) = re.exec(&s, at)
-                {
+                stride = re.groups;
+                while at <= s.len() && re.exec_into(&s, at, &mut caps) {
                     let (x, y) = caps[0].unwrap();
                     at = if y == x { y + 1 } else { y };
-                    matches.push(caps);
+                    flat.extend_from_slice(&caps);
                 }
                 let a_last = vm.intern("lastIndex");
                 vm.set(pattern, a_last, Value::from_i32(0))?;
-            } else if let Some(caps) = regexp_match(vm, pattern, re, &s)? {
-                matches.push(caps);
+            } else if let Some(c) = regexp_match(vm, pattern, re, &s)? {
+                stride = c.len();
+                flat.extend_from_slice(&c);
             }
         }
         None => {
             let p = units(pattern).into_owned();
             if let Some(i) = find(&s, &p, 0) {
-                matches.push(vec![Some((i, i + p.len()))]);
+                flat.push(Some((i, i + p.len())));
             }
         }
     }
-    if matches.is_empty() {
+    vm.caps_buf = caps;
+    if flat.is_empty() {
         return Ok(this_string(vm, this, &s));
     }
     let input = this_string(vm, this, &s);
     let mut out = Vec::with_capacity(s.len());
     let mut last = 0;
-    for caps in &matches {
+    for caps in flat.chunks(stride) {
         let (x, y) = caps[0].unwrap();
         out.extend_from_slice(&s[last..x]);
         if func {
@@ -2333,7 +2336,7 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// A replacement template's `$` patterns expanded for one match.
-fn expand(t: &[u16], s: &[u16], caps: &crate::regexp::Captures, out: &mut Vec<u16>) {
+fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], out: &mut Vec<u16>) {
     let (x, y) = caps[0].unwrap();
     let mut i = 0;
     while i < t.len() {

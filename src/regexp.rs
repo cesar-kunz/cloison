@@ -1021,6 +1021,7 @@ impl Program {
     }
 
     /// Whether the single-unit instruction `i` matches `c`.
+    #[inline(always)]
     fn unit_matches(&self, i: Insn, c: u16) -> bool {
         match i {
             Insn::Char(x) => c == x,

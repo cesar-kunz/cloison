@@ -8417,6 +8417,15 @@ impl Default for Tiering {
     }
 }
 
+/// A version and what live values entering it must fit (see
+/// `JitFunction::fitting_version`): the accumulator's type if checked, and
+/// the checked registers' types but `Any`.
+struct Fit {
+    code: Rc<JitCode>,
+    acc: Option<Ty>,
+    regs: Box<[(u8, Ty)]>,
+}
+
 /// Versions kept per entry point before generalizing.
 const MAX_VERSIONS: usize = 4;
 
@@ -8497,6 +8506,9 @@ pub struct JitFunction {
     live_at: HashMap<usize, Rc<EntryLive>>,
     /// The most recently used version: (entry instruction, index).
     last: Option<(usize, usize)>,
+    /// Per entry's bytecode offset, its versions' checks for
+    /// `fitting_version` (built there; emptied when versions change).
+    fits: std::cell::RefCell<HashMap<usize, Rc<[Fit]>>>,
     tiering: Option<Tiering>,
     /// Back edges left before tiering up, and calls so far.
     back_edges_left: i64,
@@ -12838,6 +12850,7 @@ impl JitFunction {
             wide: HashMap::default(),
             live_at: HashMap::default(),
             last: None,
+            fits: Default::default(),
             tiering: Some(Tiering::default()),
             back_edges_left: Tiering::default().back_edges,
             calls: 0,
@@ -13011,6 +13024,7 @@ impl JitFunction {
             || low.frames != vm.snap.frames
         {
             self.versions.clear();
+            self.fits.get_mut().clear();
             self.live_at.clear();
             vm.epoch = epoch;
             vm.field_epoch = field_epoch;
@@ -13139,6 +13153,7 @@ impl JitFunction {
         code.snap = Some(vm.snap.clone());
         code.log(vm.root, 0);
         let code = code.into_rc();
+        self.fits.get_mut().clear();
         self.versions
             .entry(entry)
             .or_default()
@@ -13155,22 +13170,6 @@ impl JitFunction {
         acc: Value,
         regs: *mut Value,
     ) -> Option<(Rc<JitCode>, Value, usize)> {
-        // The entry among those with versions (keyed by `index_of`, so
-        // the first instruction at `pc`): a few, against every instruction
-        // of the function. Calls that find no version (a function out of
-        // compilations, entered by every call) cost a scan of it each.
-        let entry = *self.versions.keys().find(|&&e| {
-            let i = &self.insns[e];
-            i.pc == pc && i.frame == 0
-        })?;
-        let l = self.live_at.get(&entry)?;
-        let (acc_live, live, read) = (&l.acc_at_entry, &l.live_list, &l.read_at_entry);
-        // As `entry_types`: not inlined frames' registers, and a live one
-        // compiled code doesn't read is `Any` (a version took them so;
-        // checking them sent every call of a function with inlined frames
-        // live at entry through `version`, EarleyBoyer's included).
-        let inline_base = self.vm.as_ref().map_or(usize::MAX, |vm| vm.inline_base);
-        let checked = |r: u8| (r as usize) < inline_base && read[r as usize];
         let fits = |t: Ty, v: Value| match t {
             Ty::Bot => false,
             Ty::Any => true,
@@ -13187,23 +13186,62 @@ impl JitFunction {
                 }
             }
         };
+        let cached = self.fits.borrow().get(&pc).cloned();
+        // (None there: an empty list, as the entry scan finds nothing again
+        // till versions change.)
+        let vs = match cached {
+            Some(vs) => vs,
+            None => {
+                let vs = self.fits_at(pc).unwrap_or_else(|| Rc::from([]));
+                self.fits.borrow_mut().insert(pc, vs.clone());
+                vs
+            }
+        };
+        vs.iter().find_map(|f| {
+            let ok = f.acc.is_none_or(|t| fits(t, acc))
+                && f.regs.iter().all(|&(r, t)| fits(t, unsafe { *regs.add(r as usize) }));
+            ok.then(|| (f.code.clone(), acc, self.nregs))
+        })
+    }
+
+    /// The checks of the versions at the entry at bytecode offset `pc`
+    /// (see [`Fit`]).
+    fn fits_at(&self, pc: usize) -> Option<Rc<[Fit]>> {
+        // The entry among those with versions (keyed by `index_of`, so
+        // the first instruction at `pc`): a few, against every instruction
+        // of the function.
+        let entry = *self.versions.keys().find(|&&e| {
+            let i = &self.insns[e];
+            i.pc == pc && i.frame == 0
+        })?;
+        let l = self.live_at.get(&entry)?;
+        let (acc_live, live, read) = (&l.acc_at_entry, &l.live_list, &l.read_at_entry);
+        // As `entry_types`: not inlined frames' registers, and a live one
+        // compiled code doesn't read is `Any` (a version took them so;
+        // checking them sent every call of a function with inlined frames
+        // live at entry through `version`, EarleyBoyer's included).
+        let inline_base = self.vm.as_ref().map_or(usize::MAX, |vm| vm.inline_base);
+        let checked = |r: u8| (r as usize) < inline_base && read[r as usize];
         let versions = self.versions.get(&entry)?;
         // The live registers against the version's types, both in order
         // (a live register without one is `Bot`: no fit).
-        versions.iter().find_map(|(st, code)| {
+        let fits = versions.iter().map(|(st, code)| {
             let tys = &st.regs.tys;
             let mut k = 0;
-            let ok = (!*acc_live || fits(st.acc, acc))
-                && live.iter().filter(|&&r| checked(r)).all(|&r| {
-                    while k < tys.len() && tys[k].0 < r {
-                        k += 1;
-                    }
-                    k < tys.len()
-                        && tys[k].0 == r
-                        && fits(tys[k].1, unsafe { *regs.add(r as usize) })
-                });
-            ok.then(|| (code.clone(), acc, self.nregs))
-        })
+            let regs = live.iter().filter(|&&r| checked(r)).filter_map(|&r| {
+                while k < tys.len() && tys[k].0 < r {
+                    k += 1;
+                }
+                let t = if k < tys.len() && tys[k].0 == r { tys[k].1 } else { Ty::Bot };
+                (t != Ty::Any).then_some((r, t))
+            });
+            Fit {
+                code: code.clone(),
+                acc: (*acc_live && st.acc != Ty::Any).then_some(st.acc),
+                regs: regs.collect(),
+            }
+        });
+        Some(fits.collect())
     }
 
     /// Account for an exit of `code` (prepared at entry `pc`): at an int32
@@ -13256,6 +13294,7 @@ impl JitFunction {
                 vm.tier = Tier::Hot;
                 vm.dirty = true;
                 self.versions.clear();
+                self.fits.get_mut().clear();
             }
             return (frame, exit_pc);
         }
@@ -13313,6 +13352,7 @@ impl JitFunction {
                 self.widened.insert(j);
             }
             self.versions.clear();
+            self.fits.get_mut().clear();
             return (frame, exit_pc);
         }
         // A check moved before a loop: its loads aren't compiled as
@@ -13378,6 +13418,7 @@ impl JitFunction {
             // they exit here again, but run the rest.
             if self.stats.compiles < max_compiles(vm.root_len) {
                 self.versions.clear();
+                self.fits.get_mut().clear();
             }
         }
         (frame, exit_pc)
@@ -13516,6 +13557,7 @@ impl JitFunction {
         let index = match found {
             Some(i) => i,
             None => {
+                self.fits.get_mut().clear();
                 let seen = self.versions.remove(&entry).unwrap_or_default();
                 let (state, keep) = if seen.len() >= MAX_VERSIONS {
                     // Megamorphic: one version for everything seen, and so
@@ -13666,6 +13708,7 @@ impl JitFunction {
                     let k = self.index_of(exit_pc);
                     self.widened.insert(k);
                     self.versions.clear();
+                    self.fits.get_mut().clear();
                     (pc, acc) = (exit_pc, exit_acc);
                     // Resume at a preceding `ldar r` if `acc` is just `r`.
                     // Re-running it changes nothing (acc is dead before an

@@ -1935,8 +1935,19 @@ impl Heap {
                         continue;
                     }
                     let n = cell_size(p as *const u8);
+                    // A string's units in the cell: `elems` points to them (just
+                    // past an empty string's header, at the next cell), and
+                    // the trace doesn't follow it.
+                    let o = p as *const Object;
+                    let units = (*(p as *const u64) & 1 == 0
+                        && (*o).class == Class::String
+                        && (*o).elems as usize == p + INLINE_BASE)
+                        .then(|| &raw const (*o).elems as usize);
                     if m & COLOR != 0 {
                         for a in (p..p + n).step_by(8) {
+                            if Some(a) == units {
+                                continue;
+                            }
                             let w = *(a as *const usize);
                             for q in [w, w.wrapping_sub(8)] {
                                 if self.contains(q) && q.is_multiple_of(GRANULE) && *self.meta(q) == YOUNG {

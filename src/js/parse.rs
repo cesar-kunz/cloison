@@ -66,6 +66,13 @@ impl Parser<'_> {
         t
     }
 
+    /// The next token, without the current one's copy that `bump` returns.
+    fn advance(&mut self) {
+        if self.i + 1 < self.toks.len() {
+            self.i += 1;
+        }
+    }
+
     fn is(&self, p: &str) -> bool {
         matches!(self.peek(), Tok::Punct(q) | Tok::Keyword(q) if *q == p)
     }
@@ -73,7 +80,7 @@ impl Parser<'_> {
     fn eat(&mut self, p: &str) -> bool {
         let yes = self.is(p);
         if yes {
-            self.bump();
+            self.advance();
         }
         yes
     }
@@ -146,15 +153,15 @@ impl Parser<'_> {
         let pos = self.pos();
         let kind = match self.peek().clone() {
             Tok::Punct("{") => {
-                self.bump();
+                self.advance();
                 StmtKind::Block(self.block_rest()?)
             }
             Tok::Punct(";") => {
-                self.bump();
+                self.advance();
                 StmtKind::Empty
             }
             Tok::Keyword("var") => {
-                self.bump();
+                self.advance();
                 let decls = self.var_decls(false)?;
                 self.semicolon()?;
                 StmtKind::Var(decls)
@@ -163,11 +170,11 @@ impl Parser<'_> {
                 return self.err(format!("`{k}` is not supported"));
             }
             Tok::Keyword("function") => {
-                self.bump();
+                self.advance();
                 StmtKind::Function(self.function(true, pos)?)
             }
             Tok::Keyword("if") => {
-                self.bump();
+                self.advance();
                 self.expect("(")?;
                 let c = self.expression(false)?;
                 self.expect(")")?;
@@ -180,18 +187,18 @@ impl Parser<'_> {
                 StmtKind::If(c, then, other)
             }
             Tok::Keyword("for") => {
-                self.bump();
+                self.advance();
                 self.for_rest()?
             }
             Tok::Keyword("while") => {
-                self.bump();
+                self.advance();
                 self.expect("(")?;
                 let c = self.expression(false)?;
                 self.expect(")")?;
                 StmtKind::While(c, Box::new(self.statement()?))
             }
             Tok::Keyword("do") => {
-                self.bump();
+                self.advance();
                 let body = Box::new(self.statement()?);
                 self.expect("while")?;
                 self.expect("(")?;
@@ -203,7 +210,7 @@ impl Parser<'_> {
                 StmtKind::DoWhile(body, c)
             }
             Tok::Keyword("return") => {
-                self.bump();
+                self.advance();
                 if self.current == 0 {
                     return Err(Error::new(
                         pos as usize,
@@ -223,7 +230,7 @@ impl Parser<'_> {
                 StmtKind::Return(e)
             }
             Tok::Keyword(k @ ("break" | "continue")) => {
-                self.bump();
+                self.advance();
                 let label = match self.peek() {
                     Tok::Ident(_) if !self.toks[self.i].newline_before => Some(self.ident()?),
                     _ => None,
@@ -236,7 +243,7 @@ impl Parser<'_> {
                 }
             }
             Tok::Keyword("try") => {
-                self.bump();
+                self.advance();
                 self.expect("{")?;
                 let block = self.block_rest()?;
                 let handler = if self.eat("catch") {
@@ -260,7 +267,7 @@ impl Parser<'_> {
                 StmtKind::Try(block, handler, finalizer)
             }
             Tok::Keyword("throw") => {
-                self.bump();
+                self.advance();
                 if self.toks[self.i].newline_before {
                     return self.err("line break after `throw`");
                 }
@@ -269,12 +276,12 @@ impl Parser<'_> {
                 StmtKind::Throw(e)
             }
             Tok::Keyword("switch") => {
-                self.bump();
+                self.advance();
                 self.switch_rest()?
             }
             Tok::Ident(name) if self.peek_at(1) == &Tok::Punct(":") => {
-                self.bump();
-                self.bump();
+                self.advance();
+                self.advance();
                 StmtKind::Labeled(name, Box::new(self.statement()?))
             }
             _ => {
@@ -385,7 +392,7 @@ impl Parser<'_> {
                 if std::mem::replace(&mut default, true) {
                     return self.err("two `default` clauses");
                 }
-                self.bump();
+                self.advance();
                 None
             } else {
                 return self.unexpected();
@@ -461,7 +468,7 @@ impl Parser<'_> {
         let mut e = self.assignment(no_in)?;
         while self.is(",") {
             let pos = self.pos();
-            self.bump();
+            self.advance();
             let r = self.assignment(no_in)?;
             e = Expr {
                 kind: ExprKind::Comma(Box::new(e), Box::new(r)),
@@ -488,7 +495,7 @@ impl Parser<'_> {
         ) {
             return self.err("invalid assignment target");
         }
-        self.bump();
+        self.advance();
         let value = self.assignment(no_in)?;
         if op.is_none() {
             match &target.kind {
@@ -511,7 +518,7 @@ impl Parser<'_> {
             return Ok(c);
         }
         let pos = self.pos();
-        self.bump();
+        self.advance();
         let a = self.assignment(false)?;
         self.expect(":")?;
         let b = self.assignment(no_in)?;
@@ -532,7 +539,7 @@ impl Parser<'_> {
                 return Ok(l);
             }
             let pos = self.pos();
-            self.bump();
+            self.advance();
             // `**` is right-associative.
             let rmin = if matches!(op, Bin::Op(BinOp::Exp)) {
                 prec - 1
@@ -561,7 +568,7 @@ impl Parser<'_> {
             Tok::Keyword("delete") => UnOp::Delete,
             Tok::Punct(p @ ("++" | "--")) => {
                 let d = if *p == "++" { 1 } else { -1 };
-                self.bump();
+                self.advance();
                 let target = self.unary()?;
                 self.check_update_target(&target)?;
                 return Ok(Expr {
@@ -571,7 +578,7 @@ impl Parser<'_> {
             }
             _ => return self.postfix(),
         };
-        self.bump();
+        self.advance();
         let e = self.unary()?;
         if self.is("**") {
             return self.err("parenthesize a unary operand of `**`");
@@ -600,7 +607,7 @@ impl Parser<'_> {
             let d = if *p == "++" { 1 } else { -1 };
             let pos = self.pos();
             self.check_update_target(&e)?;
-            self.bump();
+            self.advance();
             return Ok(Expr {
                 kind: ExprKind::Update(Box::new(e), d, false),
                 pos,

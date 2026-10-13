@@ -810,39 +810,50 @@ mod arch {
         }
         c.extend([0x49, 0xBB]); // movabs r11, site
         c.extend(site.to_le_bytes());
-        // Jumps to the cold part: (field end, slow?).
-        let mut to_cold: Vec<(usize, bool)> = Vec::new();
-        let jcc = |c: &mut Vec<u8>, cc: u8, slow: bool, to: &mut Vec<(usize, bool)>| {
+        // Jumps to the cold part: (field end, where).
+        #[derive(Clone, Copy)]
+        enum To {
+            Slow,
+            Exit,
+            Dispatch,
+        }
+        let mut to_cold: Vec<(usize, To)> = Vec::new();
+        let jcc = |c: &mut Vec<u8>, cc: u8, to: To, list: &mut Vec<(usize, To)>| {
             c.extend([0x0F, cc, 0, 0, 0, 0]);
-            to.push((c.len(), slow));
+            list.push((c.len(), to));
         };
         c.extend([0x49, 0x8B, 0x03]); // mov rax, [r11]: the entry
         c.extend([0x48, 0x85, 0xC0]); // test rax, rax
-        jcc(&mut c, 0x84, true, &mut to_cold); // jz slow
+        jcc(&mut c, 0x84, To::Slow, &mut to_cold); // jz slow
         if let Some(off) = f_off {
             c.extend([0x4D, 0x8B, 0x95]); // mov r10, [r13 + off]
             c.extend(off.to_le_bytes());
             c.extend([0x4D, 0x3B, 0x53, disp8(k.closure)]); // cmp r10, [r11 + closure]
-            jcc(&mut c, 0x85, true, &mut to_cold); // jne slow
+            jcc(&mut c, 0x85, To::Dispatch, &mut to_cold); // jne dispatch
         }
-        c.extend([0x4D, 0x8B, 0x53, disp8(k.end_off)]); // mov r10, [r11 + end_off]
-        c.extend([0x4D, 0x01, 0xEA]); // add r10, r13
-        c.extend([0x4D, 0x3B, 0x53, disp8(k.stack_end)]); // cmp r10, [r11 + stack_end]
-        jcc(&mut c, 0x87, true, &mut to_cold); // ja slow
-        c.extend([0x4D, 0x8B, 0x53, disp8(k.limit)]); // mov r10, [r11 + limit]
-        c.extend([0x49, 0x3B, 0x22]); // cmp rsp, [r10]
-        jcc(&mut c, 0x82, true, &mut to_cold); // jb slow
-        c.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 + frame]
-        c.extend(frame.to_le_bytes());
-        // mov qword ptr [r13 - flags], 0
-        c.extend([0x49, 0xC7, 0x45, (disp8(k.flags) as i8).wrapping_neg() as u8, 0, 0, 0, 0]);
-        c.extend([0x41, 0xBC]); // mov r12d, undefined
-        c.extend(u32::try_from(k.undefined).unwrap().to_le_bytes());
+        // The checks and the call, with the site in r11 and the entry in
+        // rax (`check` jumps to its cold target on failure).
+        let call = |c: &mut Vec<u8>, check: &mut dyn FnMut(&mut Vec<u8>, u8)| {
+            c.extend([0x4D, 0x8B, 0x53, disp8(k.end_off)]); // mov r10, [r11 + end_off]
+            c.extend([0x4D, 0x01, 0xEA]); // add r10, r13
+            c.extend([0x4D, 0x3B, 0x53, disp8(k.stack_end)]); // cmp r10, [r11 + stack_end]
+            check(c, 0x87); // ja
+            c.extend([0x4D, 0x8B, 0x53, disp8(k.limit)]); // mov r10, [r11 + limit]
+            c.extend([0x49, 0x3B, 0x22]); // cmp rsp, [r10]
+            check(c, 0x82); // jb
+            c.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 + frame]
+            c.extend(frame.to_le_bytes());
+            // mov qword ptr [r13 - flags], 0
+            c.extend([0x49, 0xC7, 0x45, (disp8(k.flags) as i8).wrapping_neg() as u8, 0, 0, 0, 0]);
+            c.extend([0x41, 0xBC]); // mov r12d, undefined
+            c.extend(u32::try_from(k.undefined).unwrap().to_le_bytes());
+        };
+        call(&mut c, &mut |c, cc| jcc(c, cc, To::Slow, &mut to_cold));
         c.extend([0xFF, 0xD0]); // call rax
         c.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 - frame]
         c.extend(frame.wrapping_neg().to_le_bytes());
         c.extend([0x41, 0x83, 0x3F, 0xFF]); // cmp dword ptr [r15], NO_EXIT
-        jcc(&mut c, 0x85, false, &mut to_cold); // jne exit
+        jcc(&mut c, 0x85, To::Exit, &mut to_cold); // jne exit
         let done = c.len();
         c.extend([0x49, 0x89, 0xC4]); // mov r12, rax
         for (i, &x) in fprs.iter().enumerate() {
@@ -857,30 +868,79 @@ mod arch {
             }
             c.push(0x58 + (g & 7)); // pop g
         }
-        // The cold part. exit: toi_direct_exit(regs, site, record, acc).
+        // The cold part. exit: toi_direct_exit(regs, site, record, acc),
+        // the site in rsi.
         let mut d = Vec::new();
         let mut to_done = Vec::new();
         let exit = d.len();
-        d.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
         d.extend([0x48, 0xBE]); // movabs rsi, site
         d.extend(site.to_le_bytes());
+        let exit_rsi = d.len();
+        d.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
         d.extend([0x41, 0x8B, 0x17]); // mov edx, [r15]
         d.extend([0x41, 0xC7, 0x07, 0xFF, 0xFF, 0xFF, 0xFF]); // mov dword ptr [r15], NO_EXIT
         d.extend([0x48, 0x89, 0xC1]); // mov rcx, rax
         call_abs(&mut d, k.exit);
         d.extend([0xE9, 0, 0, 0, 0]); // jmp done
         to_done.push(d.len());
-        // slow: toi_rt_call(regs, site).
+        // reslow: the site back in r11; slow: toi_rt_call(regs, site).
+        let reslow = d.len();
+        d.extend([0x49, 0xBB]); // movabs r11, site
+        d.extend(site.to_le_bytes());
         let slow = d.len();
         d.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
         d.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
         call_abs(&mut d, k.call);
         d.extend([0xE9, 0, 0, 0, 0]); // jmp done
         to_done.push(d.len());
+        // dispatch: the callee (in r10) another closure; its site from the
+        // table, if any (else reslow), called as the bound one is; an exit
+        // of its callee goes through `exit` with that site.
+        let dispatch = d.len();
+        let jcc_back = |d: &mut Vec<u8>, cc: u8, to: usize| {
+            d.extend([0x0F, cc, 0, 0, 0, 0]);
+            let at = d.len();
+            d[at - 4..at].copy_from_slice(&(to as i32 - at as i32).to_le_bytes());
+        };
+        if f_off.is_some() {
+            d.extend([0x49, 0x8B, 0x83]); // mov rax, [r11 + table]
+            d.extend(u32::try_from(k.table).unwrap().to_le_bytes());
+            d.extend([0x48, 0x85, 0xC0]); // test rax, rax
+            jcc_back(&mut d, 0x84, slow); // jz slow
+            d.extend([0x44, 0x89, 0xD1]); // mov ecx, r10d
+            d.extend([0xC1, 0xE9, 0x04]); // shr ecx, 4
+            d.extend([0x81, 0xE1]); // and ecx, DISPATCH - 1
+            d.extend((super::DISPATCH as u32 - 1).to_le_bytes());
+            d.extend([0x4C, 0x8B, 0x1C, 0xC8]); // mov r11, [rax + rcx * 8]
+            d.extend([0x4D, 0x85, 0xDB]); // test r11, r11
+            jcc_back(&mut d, 0x84, reslow); // jz reslow
+            d.extend([0x4D, 0x3B, 0x53, disp8(k.closure)]); // cmp r10, [r11 + closure]
+            jcc_back(&mut d, 0x85, reslow); // jne reslow
+            d.extend([0x49, 0x8B, 0x03]); // mov rax, [r11]: the entry
+            d.extend([0x48, 0x85, 0xC0]); // test rax, rax
+            jcc_back(&mut d, 0x84, reslow); // jz reslow
+            call(&mut d, &mut |d, cc| jcc_back(d, cc, reslow));
+            d.extend([0x41, 0x53, 0x41, 0x53]); // push r11; push r11
+            d.extend([0xFF, 0xD0]); // call rax
+            d.extend([0x41, 0x5B, 0x41, 0x5B]); // pop r11; pop r11
+            d.extend([0x4D, 0x8D, 0xAD]); // lea r13, [r13 - frame]
+            d.extend(frame.wrapping_neg().to_le_bytes());
+            d.extend([0x4C, 0x89, 0xDE]); // mov rsi, r11
+            d.extend([0x41, 0x83, 0x3F, 0xFF]); // cmp dword ptr [r15], NO_EXIT
+            jcc_back(&mut d, 0x85, exit_rsi); // jne exit (site in rsi)
+            d.extend([0xE9, 0, 0, 0, 0]); // jmp done
+            to_done.push(d.len());
+        }
         super::RawCall {
             hot: c,
             cold: d,
-            hot_to_cold: to_cold.into_iter().map(|(f, s)| (f, if s { slow } else { exit })).collect(),
+            hot_to_cold: (to_cold.into_iter())
+                .map(|(f, to)| match to {
+                    To::Slow => (f, slow),
+                    To::Exit => (f, exit),
+                    To::Dispatch => (f, dispatch),
+                })
+                .collect(),
             cold_to_hot: to_done.into_iter().map(|f| (f, done)).collect(),
         }
     }
@@ -1085,42 +1145,54 @@ mod arch {
             c.push(slot(st, r, i));
         }
         mov64(&mut c, 9, site);
-        // Branches to the cold part: (instruction, slow?).
-        let mut to_cold: Vec<(usize, bool)> = Vec::new();
+        // Branches to the cold part: (instruction, where).
+        #[derive(Clone, Copy)]
+        enum To {
+            Slow,
+            Exit,
+            Dispatch,
+        }
+        let mut to_cold: Vec<(usize, To)> = Vec::new();
         c.push(ldr(10, 9, 0)); // ldr x10, [x9]: the entry
-        to_cold.push((c.len(), true));
+        to_cold.push((c.len(), To::Slow));
         c.push(0xB400_000A); // cbz x10, slow
         if let Some(off) = f_off {
             c.push(ldr(16, 21, off as usize)); // ldr x16, [x21, #off]
             c.push(ldr(17, 9, k.closure)); // ldr x17, [x9, #closure]
             c.push(0xEB11_021F); // cmp x16, x17
-            to_cold.push((c.len(), true));
-            c.push(0x5400_0001); // b.ne slow
+            to_cold.push((c.len(), To::Dispatch));
+            c.push(0x5400_0001); // b.ne dispatch
         }
-        c.push(ldr(16, 9, k.end_off)); // ldr x16, [x9, #end_off]
-        c.push(0x8B15_0210); // add x16, x16, x21
-        c.push(ldr(17, 9, k.stack_end)); // ldr x17, [x9, #stack_end]
-        c.push(0xEB11_021F); // cmp x16, x17
-        to_cold.push((c.len(), true));
-        c.push(0x5400_0008); // b.hi slow
-        c.push(ldr(16, 9, k.limit)); // ldr x16, [x9, #limit]
-        c.push(0xF940_0210); // ldr x16, [x16]
-        c.push(0x9100_03F1); // mov x17, sp
-        c.push(0xEB10_023F); // cmp x17, x16
-        to_cold.push((c.len(), true));
-        c.push(0x5400_0003); // b.lo slow
-        assert!(frame < 4096);
-        c.push(0x9100_02B5 | frame << 10); // add x21, x21, #frame
-        assert!(k.flags < 256);
-        let imm9 = (k.flags as u32).wrapping_neg() & 0x1FF;
-        c.push(0xF800_02BF | imm9 << 12); // stur xzr, [x21, #-flags]
-        assert!(k.undefined < 1 << 16);
-        c.push(0xD280_0014 | (k.undefined as u32) << 5); // mov x20, #undefined
+        // The checks and the call's setup, with the site in x9 and the entry
+        // in x10; `check` gets each conditional branch's condition.
+        let setup = |c: &mut Vec<u32>, check: &mut dyn FnMut(&mut Vec<u32>, u32)| {
+            c.push(ldr(16, 9, k.end_off)); // ldr x16, [x9, #end_off]
+            c.push(0x8B15_0210); // add x16, x16, x21
+            c.push(ldr(17, 9, k.stack_end)); // ldr x17, [x9, #stack_end]
+            c.push(0xEB11_021F); // cmp x16, x17
+            check(c, 8); // b.hi
+            c.push(ldr(16, 9, k.limit)); // ldr x16, [x9, #limit]
+            c.push(0xF940_0210); // ldr x16, [x16]
+            c.push(0x9100_03F1); // mov x17, sp
+            c.push(0xEB10_023F); // cmp x17, x16
+            check(c, 3); // b.lo
+            assert!(frame < 4096);
+            c.push(0x9100_02B5 | frame << 10); // add x21, x21, #frame
+            assert!(k.flags < 256);
+            let imm9 = (k.flags as u32).wrapping_neg() & 0x1FF;
+            c.push(0xF800_02BF | imm9 << 12); // stur xzr, [x21, #-flags]
+            assert!(k.undefined < 1 << 16);
+            c.push(0xD280_0014 | (k.undefined as u32) << 5); // mov x20, #undefined
+        };
+        setup(&mut c, &mut |c, cond| {
+            to_cold.push((c.len(), To::Slow));
+            c.push(0x5400_0000 | cond); // b.<cond> slow
+        });
         c.push(0xD63F_0140); // blr x10
         c.push(0xD100_02B5 | frame << 10); // sub x21, x21, #frame
         c.push(0xB940_02F0); // ldr w16, [x23]
         c.push(0x3100_061F); // cmn w16, #1
-        to_cold.push((c.len(), false));
+        to_cold.push((c.len(), To::Exit));
         c.push(0x5400_0001); // b.ne exit
         let done = c.len();
         c.push(0xAA00_03F4); // mov x20, x0
@@ -1131,13 +1203,15 @@ mod arch {
             c.push(0x9100_03FF | area << 10); // add sp, sp, #area
         }
         c.push(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
-        // The cold part. exit: toi_direct_exit(regs, site, record, acc).
+        // The cold part. exit: toi_direct_exit(regs, site, record, acc),
+        // the site in x1.
         let mut d: Vec<u32> = Vec::new();
         let mut to_done = Vec::new();
         let exit = d.len();
+        mov64(&mut d, 1, site);
+        let exit_x1 = d.len();
         d.push(0xAA00_03E3); // mov x3, x0
         d.push(0xAA15_03E0); // mov x0, x21
-        mov64(&mut d, 1, site);
         d.push(0xB940_02E2); // ldr w2, [x23]
         d.push(0x1280_0010); // mov w16, #-1
         d.push(0xB900_02F0); // str w16, [x23]
@@ -1145,7 +1219,9 @@ mod arch {
         d.push(0xD63F_0200); // blr x16
         to_done.push(d.len());
         d.push(0x1400_0000); // b done
-        // slow: toi_rt_call(regs, site).
+        // reslow: the site back in x9; slow: toi_rt_call(regs, site).
+        let reslow = d.len();
+        mov64(&mut d, 9, site);
         let slow = d.len();
         d.push(0xAA15_03E0); // mov x0, x21
         d.push(0xAA09_03E1); // mov x1, x9
@@ -1153,12 +1229,52 @@ mod arch {
         d.push(0xD63F_0200); // blr x16
         to_done.push(d.len());
         d.push(0x1400_0000); // b done
+        // dispatch: the callee (in x16) another closure; its site from the
+        // table, if any (else reslow), called as the bound one is; an exit
+        // of its callee goes through `exit` with that site.
+        let dispatch = d.len();
+        if f_off.is_some() {
+            let back = |d: &mut Vec<u32>, op: u32, to: usize| {
+                let at = d.len();
+                let rel = (to as i32 - at as i32) as u32 & 0x7FFFF;
+                d.push(op | rel << 5);
+            };
+            d.push(ldr(10, 9, k.table)); // ldr x10, [x9, #table]
+            back(&mut d, 0xB400_000A, slow); // cbz x10, slow
+            assert!(super::DISPATCH == 1024);
+            d.push(0xD340_0000 | 4 << 16 | 13 << 10 | 16 << 5 | 17); // ubfx x17, x16, #4, #10
+            d.push(0xF860_7800 | 17 << 16 | 10 << 5 | 9); // ldr x9, [x10, x17, lsl #3]
+            back(&mut d, 0xB400_0009, reslow); // cbz x9, reslow
+            d.push(ldr(17, 9, k.closure)); // ldr x17, [x9, #closure]
+            d.push(0xEB11_021F); // cmp x16, x17
+            back(&mut d, 0x5400_0001, reslow); // b.ne reslow
+            d.push(ldr(10, 9, 0)); // ldr x10, [x9]: the entry
+            back(&mut d, 0xB400_000A, reslow); // cbz x10, reslow
+            setup(&mut d, &mut |d, cond| back(d, 0x5400_0000 | cond, reslow));
+            d.push(0xF81F_0FE9); // str x9, [sp, #-16]!
+            d.push(0xD63F_0140); // blr x10
+            d.push(0xF841_07E9); // ldr x9, [sp], #16
+            d.push(0xD100_02B5 | frame << 10); // sub x21, x21, #frame
+            d.push(0xAA09_03E1); // mov x1, x9
+            d.push(0xB940_02F0); // ldr w16, [x23]
+            d.push(0x3100_061F); // cmn w16, #1
+            back(&mut d, 0x5400_0001, exit_x1); // b.ne exit (site in x1)
+            to_done.push(d.len());
+            d.push(0x1400_0000); // b done
+        }
         let bytes = |c: &[u32]| c.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>();
         super::RawCall {
             hot: bytes(&c),
             cold: bytes(&d),
             hot_to_cold: (to_cold.into_iter())
-                .map(|(at, s)| (4 * at, 4 * if s { slow } else { exit }))
+                .map(|(at, to)| {
+                    let to = match to {
+                        To::Slow => slow,
+                        To::Exit => exit,
+                        To::Dispatch => dispatch,
+                    };
+                    (4 * at, 4 * to)
+                })
                 .collect(),
             cold_to_hot: to_done.into_iter().map(|at| (4 * at, 4 * done)).collect(),
         }
@@ -8923,6 +9039,9 @@ pub(crate) struct CallSite {
     this_shape: u64,
     /// For a direct `new`: what `construct_direct` allocates `this` with.
     ctor: Option<Box<CtorSite>>,
+    /// The table of [`Dispatch`] (`dispatch`), which a direct call reads
+    /// where its callee isn't the one bound; null without one.
+    table: *mut u64,
     vm: *mut crate::vm::Vm,
     op: Op,
     f: usize,
@@ -8962,7 +9081,32 @@ pub(crate) struct CallSite {
     /// the `Code`): a function with upvalues, made anew at each call of
     /// the one making it (`call_direct_code`).
     by_code: bool,
+    /// Calls through the runtime of a closure other than the one bound
+    /// (see [`Dispatch`]).
+    misses: u32,
+    dispatch: Option<Box<Dispatch>>,
 }
+
+/// A direct call site whose callee varies (gbemu's `OPCODE[op](this)`,
+/// 8.3M calls a run through the runtime): sites for the other callees,
+/// each bound as the site is (to a version of its callee entered with the
+/// types the site was claimed with), found by the callee's address in a
+/// table of [`DISPATCH`] (bits 4 and up: see `direct_call`), one per slot.
+/// A direct call missing its closure looks there before calling through
+/// the runtime, which makes the site for a callee after
+/// [`DISPATCH_AFTER`] misses.
+struct Dispatch {
+    table: [u64; DISPATCH],
+    /// The sites, by callee (one each: a slot two callees share points to
+    /// the latest's).
+    sites: HashMap<u64, Box<std::cell::UnsafeCell<CallSite>>>,
+}
+
+/// Slots of a [`Dispatch`] table (`dispatched` in the stencils too).
+const DISPATCH: usize = 1024;
+// (`DirectSite` in the stencils reads it after the fields before it.)
+const _: () = assert!(std::mem::offset_of!(CallSite, table) == 8 * 8);
+const DISPATCH_AFTER: u32 = 8;
 
 /// How `construct_direct` allocates `this` for a direct `new` (read by the
 /// stencil as `CtorAlloc`): from the VM heap's free space, with the root
@@ -9111,8 +9255,58 @@ impl CallSite {
             claim: None,
             pending: false,
             retry: 0,
+            misses: 0,
+            table: std::ptr::null_mut(),
+            dispatch: None,
             ..*self
         }
+    }
+
+    /// The site for callee `fv` (a bytecode function other than the one
+    /// bound) in its [`Dispatch`], made (pending: bound at once, or once
+    /// its callee isn't being compiled) if its slot holds another's.
+    ///
+    /// # Safety
+    /// `fv` must be a live bytecode function; the site bound and claimed.
+    unsafe fn dispatched(&mut self, fv: Value) -> &mut CallSite {
+        if self.dispatch.is_none() {
+            let mut d = Box::new(Dispatch {
+                table: [0; DISPATCH],
+                sites: HashMap::default(),
+            });
+            self.table = d.table.as_mut_ptr();
+            self.dispatch = Some(d);
+        }
+        let fo = crate::object::as_object(fv);
+        let callee = unsafe { (*fo).code };
+        // (By code, as the site is, or by closure.)
+        let key = if self.by_code { callee as u64 } else { fv.to_bits() };
+        let k = (key >> 4) as usize % DISPATCH;
+        let at = unsafe { *self.table.add(k) } as *mut CallSite;
+        if !at.is_null() && unsafe { (*at).closure } == key {
+            return unsafe { &mut *at };
+        }
+        let fork = self.fork();
+        let claim = self.claim.clone();
+        let (vm, by_code) = (self.vm, self.by_code);
+        let d = self.dispatch.as_mut().unwrap();
+        let site = d.sites.entry(key).or_insert_with(|| {
+            if !by_code {
+                unsafe { (*vm).heap.keep(fo as usize) };
+            }
+            Box::new(std::cell::UnsafeCell::new(CallSite {
+                closure: key,
+                callee,
+                cached: callee,
+                nparams: unsafe { (*callee).nparams },
+                claim,
+                pending: true,
+                ..fork
+            }))
+        });
+        let at = site.get();
+        d.table[k] = at as u64;
+        unsafe { &mut *at }
     }
 
     fn bind(&mut self, code: Rc<JitCode>, nregs: usize) {
@@ -11692,6 +11886,9 @@ impl Lowering<'_> {
             pending: false,
             retry: 0,
             by_code: false,
+            misses: 0,
+            table: std::ptr::null_mut(),
+            dispatch: None,
         }
     }
 
@@ -14402,6 +14599,7 @@ struct RawCall {
 /// header's flags slot, `undefined`, and the runtime functions it calls.
 struct DirectConsts {
     closure: usize,
+    table: usize,
     end_off: usize,
     stack_end: usize,
     limit: usize,
@@ -14416,6 +14614,7 @@ impl DirectConsts {
         const { assert!(NO_EXIT == u32::MAX) };
         DirectConsts {
             closure: std::mem::offset_of!(CallSite, closure),
+            table: std::mem::offset_of!(CallSite, table),
             end_off: std::mem::offset_of!(CallSite, end_off),
             stack_end: std::mem::offset_of!(CallSite, stack_end),
             limit: std::mem::offset_of!(CallSite, native_limit),
@@ -14646,6 +14845,27 @@ extern "C" fn toi_rt_call(regs: Value, site: Value) -> Value {
             );
             *EXITS.lock().unwrap().entry(key).or_default() += 1;
         }
+        // A direct call of another bytecode function than the one bound,
+        // often: its own site, which the call looks for in the table from
+        // now on (see `Dispatch`).
+        let fv = *(regs.to_bits() as *const Value).add(site.f);
+        let site = if site.bound
+            && site.claim.is_some()
+            && matches!(site.op, Op::Call | Op::CallUndefined)
+            && !site.self_call
+            && fv.is_cell()
+            && (*crate::object::as_object(fv)).class == crate::object::Class::Function
+            && site.closure
+                != if site.by_code { (*crate::object::as_object(fv)).code as u64 } else { fv.to_bits() }
+            // (A site bound to a closure writes that one to the callee's
+            // frame header, if any: a callee with upvalues reads it.)
+            && (site.by_code || (&(*(*crate::object::as_object(fv)).code).upvalues).is_empty())
+        {
+            site.misses += 1;
+            if site.misses >= DISPATCH_AFTER { site.dispatched(fv) } else { site }
+        } else {
+            site
+        };
         // A site that stopped calling directly after its callee's exits:
         // bind it again once the callee compiled since. (Warm-up exits, at
         // stores to a constructor's `this` whose shapes differ by subclass,

@@ -4775,6 +4775,28 @@ struct DirectSite {
     this_shape: u64,
     /// For `new`: how to allocate `this` (null if not a direct `new`).
     ctor: *mut CtorAlloc,
+    /// Sites for other callees, by the callee's address (bits 4 and up),
+    /// or null (`jit::Dispatch`).
+    table: *const *const DirectSite,
+}
+
+/// The site in `site`'s table (`jit::Dispatch`) for callee `key` (the
+/// function, or its code for a site bound by code), if it has an entry and
+/// the VM stack room for the callee's frame from `base`.
+#[inline(always)]
+unsafe fn dispatched(site: *const DirectSite, key: u64, base: *const u8) -> Option<*const DirectSite> {
+    unsafe {
+        let table = (*site).table;
+        if table.is_null() {
+            return None;
+        }
+        let d = *table.add((key >> 4) as usize % 1024);
+        (!d.is_null()
+            && (*d).closure == key
+            && (*d).entry != 0
+            && base as u64 + (*d).end_off <= (*d).stack_end)
+            .then_some(d)
+    }
 }
 
 /// `jit::CtorSite`: how `construct_direct` allocates `this`.
@@ -4822,11 +4844,14 @@ stencil!("call_direct"; |s| {
     let regs = Value::from_bits(s.regs as u64);
     let site = imm64() as *const DirectSite;
     let base = s.regs as *const u8;
+    let f = *(base.add((*site).f_off as usize) as *const u64);
     let r = if (*site).entry != 0
-        && *(base.add((*site).f_off as usize) as *const u64) == (*site).closure
+        && f == (*site).closure
         && base as u64 + (*site).end_off <= (*site).stack_end
     {
         Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))
+    } else if let Some(d) = dispatched(site, f, base) {
+        Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(d as u64)))
     } else {
         Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
     };
@@ -4847,14 +4872,16 @@ stencil!("call_direct_code"; |s| {
     let site = imm64() as *const DirectSite;
     let base = s.regs as *const u8;
     let f = *(base.add((*site).f_off as usize) as *const u64);
+    let function = f != 0 && is_cell(s.tag, Value::from_bits(f)) && *(f as *const u8).add(8) == 2;
+    let code = if function { *((f as *const u8).add(40) as *const u64) } else { 0 };
     let r = if (*site).entry != 0
-        && f != 0
-        && is_cell(s.tag, Value::from_bits(f))
-        && *(f as *const u8).add(8) == 2
-        && *((f as *const u8).add(40) as *const u64) == (*site).closure
+        && function
+        && code == (*site).closure
         && base as u64 + (*site).end_off <= (*site).stack_end
     {
         Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)))
+    } else if function && let Some(d) = dispatched(site, code, base) {
+        Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(d as u64)))
     } else {
         Value::from_bits(rt_call!(s, toi_rt_call, regs, Value::from_bits(site as u64)))
     };

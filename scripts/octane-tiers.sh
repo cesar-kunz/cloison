@@ -17,6 +17,10 @@
 # Parallel runs share the L3 cache and memory bandwidth. A run past
 # TIMEOUT seconds (default 900) or giving no score counts as `-`.
 #
+# V8's columns don't change with toi: they come from an earlier table
+# (V8_FROM, default the newest perf-history/octane-tiers-*.tsv), and only
+# toi runs. V8=1 measures them again.
+#
 # Node: $NODE, else the Node 26 scripts/tiers.sh downloads.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -34,11 +38,16 @@ commit=$(git rev-parse --short HEAD)
 git diff --quiet HEAD -- src stencils build.rs .cargo || commit="$commit+"
 mkdir -p perf-history
 out=perf-history/octane-tiers-$commit
+v8_from=""
+if [[ ${V8:-} != 1 ]]; then
+  v8_from=${V8_FROM:-$(ls -t perf-history/octane-tiers-*.tsv 2>/dev/null | grep -v "^$out.tsv$" | head -1 || true)}
+  [[ -n $v8_from ]] || { echo "no earlier table for V8's columns: run with V8=1" >&2; exit 1; }
+fi
 
-python3 - "$NODE" "$reps" "$jobs" "$timeout" "$out" "$commit" $order <<'EOF'
+python3 - "$NODE" "$reps" "$jobs" "$timeout" "$out" "$commit" "$v8_from" $order <<'EOF'
 import concurrent.futures as cf, math, os, queue, statistics, subprocess, sys, time
 
-node, reps, jobs, timeout, out, commit, *benches = sys.argv[1:]
+node, reps, jobs, timeout, out, commit, v8_from, *benches = sys.argv[1:]
 reps, jobs, timeout = int(reps), int(jobs), int(timeout)
 v8 = subprocess.run([node, "-p", "process.versions.v8"], capture_output=True, text=True).stdout.strip()
 runner = 'console.log(String(require("vm").runInThisContext(require("fs").readFileSync(process.argv[1], "utf8"))))'
@@ -97,9 +106,20 @@ def run(job):
         print(f"{b} ({name}): {last[:120]}", file=sys.stderr)
         return job, None
 
+# V8's columns from an earlier table, if one is given: only toi runs.
+reused = {}
+if v8_from:
+    rows = [l.rstrip("\n").split("\t") for l in open(v8_from)]
+    cols = rows[0]
+    for r in rows[1:]:
+        for k, (name, _) in enumerate(configs):
+            if not name.startswith("toi") and name in cols:
+                v = r[cols.index(name)]
+                reused[(r[0], k)] = [None if v == "-" else float(v)]
+measured = [k for k in range(len(configs)) if not any((b, k) in reused for b in benches)]
 # Longest first (the interpreter's), so the end isn't one long run alone.
-work = [(b, k, i) for k in range(len(configs)) for b in benches for i in range(reps)]
-scores = {}
+work = [(b, k, i) for k in measured for b in benches for i in range(reps)]
+scores = dict(reused)
 load = [open("/proc/loadavg").read().split()[0]]
 with cf.ThreadPoolExecutor(jobs) as ex:
     for n, (job, s) in enumerate(ex.map(run, work), 1):
@@ -109,6 +129,8 @@ print(file=sys.stderr)
 load.append(open("/proc/loadavg").read().split()[0])
 
 def score(b, k):
+    if (b, k) not in scores:
+        return None
     v = [s for s in scores[(b, k)] if s is not None]
     return statistics.median(v) if len(v) == len(scores[(b, k)]) else None
 
@@ -121,7 +143,9 @@ with open(out + ".tsv", "w") as f:
 
 fmt = lambda s: "-" if s is None else f"{s:.0f}" if s >= 100 else f"{s:.3g}"
 lines = [f"Octane scores (higher is better; medians of {reps} runs, {jobs} at a time on cores of their own): "
-         f"toi {commit}, V8 {v8} capped at each tier. Load average at the start and end: {' '.join(load)}.\n",
+         f"toi {commit}, V8 {v8} capped at each tier"
+         + (f" (V8's columns from {v8_from})" if v8_from else "")
+         + f". Load average at the start and end: {' '.join(load)}.\n",
          "| benchmark | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]
 for b in benches:
     lines.append(f"| {b} | " + " | ".join(fmt(s) for s in table[b]) + " |")

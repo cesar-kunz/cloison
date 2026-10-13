@@ -91,6 +91,37 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 toi interp vs Ignition 0.83x (ahead on 12), Sparkplug 0.61x (ahead on 4), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
 toi JIT vs Ignition 2.32x (ahead on 11), Sparkplug 1.72x (ahead on 10), Maglev 0.30x (ahead on 1), Turbofan 0.25x (ahead on 0) (of 15; above 1x: toi scores higher)
 
+## 4535791: after steps 0–12
+
+V8's columns are reused from the 6ecaeba+ run (V8 doesn't change with
+toi). The toi JIT's geomean went from 15621 (6ecaeba) to 18119: +16%.
+By benchmark: raytrace +101%, earley-boyer +68%, pdfjs +49%, splay
++41%, typescript +10%, zlib +7%; DeltaBlue level.
+
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 4535791, V8 14.6.202.34-node.28 capped at each tier (V8's columns from perf-history/octane-tiers-6ecaeba+.tsv). Load average at the start and end: 2.36 5.05.
+
+| benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
+|---|---:|---:|---:|---:|---:|---:|
+| richards | 2852 | 33742 | 2058 | 2743 | 40668 | 51308 |
+| deltablue | 2820 | 58693 | 2059 | 2804 | 57291 | 120738 |
+| crypto | 2030 | 19253 | 1521 | 2442 | 36493 | 50339 |
+| raytrace | 7002 | 22355 | 5175 | 7348 | 84285 | 132902 |
+| earley-boyer | 9187 | 19837 | 8428 | 13690 | 62194 | 96935 |
+| regexp | 2799 | 3176 | 5226 | 6668 | 11614 | 11851 |
+| splay | 8390 | 10868 | 6720 | 7283 | 32737 | 35231 |
+| navier-stokes | 3363 | 7865 | 2188 | 3104 | 38397 | 47441 |
+| pdfjs | 10782 | 12791 | 10688 | 16331 | 66163 | 60628 |
+| mandreel | 4385 | 25664 | 3354 | 4860 | 55716 | 72396 |
+| gbemu | 13728 | 41811 | 9559 | 14365 | 119729 | 107033 |
+| code-load | 11845 | 11482 | 45444 | 45023 | 44883 | 45102 |
+| box2d | 8623 | 16994 | 5627 | 8286 | 115487 | 112889 |
+| zlib | 2984 | 23707 | 109545 | 109623 | 109623 | 109702 |
+| typescript | 27309 | 25552 | 25199 | 34545 | 83941 | 74261 |
+| **geomean** (15) | **5981** | **18119** | **7045** | **9494** | **55264** | **64968** |
+
+toi interp vs Ignition 0.85x (ahead on 12), Sparkplug 0.63x (ahead on 5), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
+toi JIT vs Ignition 2.57x (ahead on 12), Sparkplug 1.91x (ahead on 10), Maglev 0.33x (ahead on 1), Turbofan 0.28x (ahead on 0) (of 15; above 1x: toi scores higher)
+
 ## Where the JIT gains little: findings and plan (at 93e5b2d)
 
 The JIT gains little over toi's interpreter on raytrace (1.8x), earley-boyer

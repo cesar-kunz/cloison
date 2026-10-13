@@ -452,6 +452,10 @@ pub struct Vm {
     /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
     pub(crate) array_push_fn: *mut Object,
     pub(crate) array_pop_fn: *mut Object,
+    /// `String.prototype.charCodeAt` and `String.fromCharCode`, which
+    /// compiled code inlines (see `jit::Insn::native`).
+    pub(crate) char_code_at_fn: *mut Object,
+    pub(crate) from_char_code_fn: *mut Object,
     a_prototype: Atom,
     a_constructor: Atom,
     a_length: Atom,
@@ -544,11 +548,13 @@ impl Vm {
             a_index: Atom(0),
             a_input: Atom(0),
             array_buffer_prototype: std::ptr::null_mut(),
-            single_chars: Vec::new(),
+            single_chars: vec![Value::EMPTY; 256],
             a_to_string: Atom(0),
             a_value_of: Atom(0),
             array_push_fn: std::ptr::null_mut(),
             array_pop_fn: std::ptr::null_mut(),
+            char_code_at_fn: std::ptr::null_mut(),
+            from_char_code_fn: std::ptr::null_mut(),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
@@ -2156,13 +2162,16 @@ impl Vm {
         if c >= 256 {
             return self.new_string(&[c]);
         }
-        if self.single_chars.is_empty() {
-            self.single_chars = vec![Value::EMPTY; 256];
-        }
         if self.single_chars[c as usize] == Value::EMPTY {
             self.single_chars[c as usize] = self.new_string(&[c]);
         }
         self.single_chars[c as usize]
+    }
+
+    /// The table of [`Vm::single_char`]'s strings (`EMPTY` where not made
+    /// yet), 256 values that stay where they are: compiled code reads it.
+    pub(crate) fn single_chars_at(&self) -> u64 {
+        self.single_chars.as_ptr() as u64
     }
 
     /// A cons string of strings `a` and `b` (V8's): no units of its own

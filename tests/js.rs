@@ -3147,6 +3147,42 @@ main();"#;
     assert_eq!(value(src), "2450000");
 }
 
+/// `charCodeAt` and `String.fromCharCode` inlined: flat and cons strings,
+/// indices past the end and not int32s, units past 255 and arguments not
+/// int32s, a receiver no string, and `charCodeAt` replaced.
+#[test]
+fn char_codes_agree_with_node() {
+    let src = r#"
+function sum(s) { var t = 0; for (var i = 0; i < s.length; i++) t += s.charCodeAt(i); return t; }
+function sumd(s) { var t = 0; for (var i = 0; i < s.length; i += 0.5) t += s.charCodeAt(i) | 0; return t; }
+function past(s) { var t = 0; for (var i = 0; i <= s.length; i++) { var c = s.charCodeAt(i); t += (c === c) ? c : 1000; } return t; }
+function mk(n) { var o = ""; for (var i = 0; i < n; i++) o += String.fromCharCode(32 + (i * 7) % 300); return o; }
+function mkd(n) { var o = ""; for (var i = 0; i < n; i++) o += String.fromCharCode(65.7 + i % 26); return o; }
+function weird(xs) { var t = ""; for (var i = 0; i < xs.length; i++) t += String.fromCharCode(xs[i]); return t; }
+function other(o) { var t = 0; for (var i = 0; i < 3; i++) t += o.charCodeAt(i); return t; }
+function main() {
+  var r = 0, s = "";
+  for (var k = 0; k < 300; k++) {
+    s = mk(50 + k % 7);
+    r += sum(s) + sumd(s) + past(s) + sum(mkd(30));
+    var c = "ab" + k; c = c + "cd"; r += sum(c);
+    r += weird([65, "66", 67.9, -1, 65536 + 66, null]).length * 1000 + sum(weird([65, "66", 67.9, -1, 65536 + 66, null]));
+  }
+  var fake = { charCodeAt: function (i) { return i * 2; } };
+  for (var k = 0; k < 2000; k++) r += other(k % 50 == 49 ? fake : "xyz");
+  var saved = String.prototype.charCodeAt;
+  String.prototype.charCodeAt = function (i) { return 1; };
+  r += sum("hello");
+  String.prototype.charCodeAt = saved;
+  r += sum("hello");
+  return r;
+}
+main();"#;
+    assert_eq!(value(src), "33421313");
+    let (_, s) = compiled(src, "sum");
+    assert!(s.iter().any(|n| n.starts_with("char_code_at")), "{s:?}");
+}
+
 /// An array literal is made with room for its elements, each appended
 /// (`create_array_n`, then `push`), whatever their types; past 255
 /// elements, it grows.

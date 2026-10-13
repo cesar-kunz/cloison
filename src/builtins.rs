@@ -33,12 +33,12 @@ pub(crate) fn install(vm: &mut Vm) {
     // `String`, a conversion (no wrapper objects: `new String` isn't one).
     let string = vm.define_native(g, "String", string_fn, 1, any, false);
     link_constructor(vm, string, sp);
-    vm.define_native(string, "fromCharCode", string_from_char_code, 1, any, false);
+    vm.from_char_code_fn = vm.define_native(string, "fromCharCode", string_from_char_code, 1, any, false);
+    vm.char_code_at_fn = vm.define_native(sp, "charCodeAt", string_char_code_at, 1, any, false);
     vm.define_natives(
         sp,
         &[
-            ("charCodeAt", string_char_code_at as NativeFn, 1),
-            ("charAt", string_char_at, 1),
+            ("charAt", string_char_at as NativeFn, 1),
             ("indexOf", string_index_of, 1),
             ("lastIndexOf", string_last_index_of, 1),
             ("substring", string_substring, 2),

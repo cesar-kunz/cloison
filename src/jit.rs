@@ -1750,7 +1750,14 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
             let mut sub = false;
             let mut forward = false;
             let mut delete = 0;
+            // `PushLiteral`: a `push` onto the literal's array (see
+            // `Insn::native`).
+            let mut native = 0;
             let op = match op {
+                Op::PushLiteral if vm => {
+                    native = 1;
+                    Op::Call
+                }
                 Op::DeleteProperty if vm => {
                     delete = 1;
                     Op::TestIn
@@ -1854,7 +1861,9 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
                 }
                 Op::Mov if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
-                Op::CreateArray | Op::ForInKeys if vm => {}
+                // The capacity in `imm`.
+                Op::CreateArray if vm => imm = code[pc + 1] as i32,
+                Op::ForInKeys if vm => {}
                 // The capacity in `imm`, the shape's cache slot in `ic`.
                 Op::CreateObject if vm => {
                     imm = code[pc + 1] as i32;
@@ -1872,6 +1881,9 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     ic = u16::from_le_bytes([code[pc + 3], code[pc + 4]]);
                 }
+                // The array the callee too (the callee's register a guard
+                // would check: there is none), the value in `acc`.
+                Op::Call if native == 1 => (reg, reg2, imm) = (code[pc + 1], code[pc + 1], 1),
                 Op::Call | Op::CallUndefined | Op::Construct if vm => {
                     (reg, reg2, imm) = (code[pc + 1], code[pc + 2], code[pc + 3] as i32);
                     ic = u16::from_le_bytes([code[pc + 4], code[pc + 5]]);
@@ -1914,7 +1926,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 assume: 0,
                 on_shape: false,
                 alloc: 0,
-                native: 0,
+                native,
                 check_only: false,
                 exit_const: 0,
                 sub,
@@ -3729,9 +3741,11 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             );
             out.acc = Ty::Ext(shape as u64);
             let heap = unsafe { (*vm).heap.bump() };
+            // A literal's: with room for its elements (`create_array_n`).
+            let n = insn.imm;
             return Sel {
-                ops: Some((0, shape as u64, heap as u64)),
-                ..Sel::new("create_array", "", out)
+                ops: Some((n, shape as u64, heap as u64)),
+                ..Sel::new(if n > 0 { "create_array_n" } else { "create_array" }, "", out)
             };
         }
         // `for … in`'s keys, through the runtime (the VM is the 64-bit
@@ -5690,6 +5704,7 @@ fn stencil_for(
                     | "lda_global"
                     | "lda_global_oop"
                     | "create_array"
+                    | "create_array_n"
                     | "create_object"
                     | "create_regexp"
                     | "create_closure"
@@ -11023,6 +11038,11 @@ impl Lowering<'_> {
                         i.imm -= 1;
                     }
                 }
+            }
+            // An array literal's element: its `push`, nothing to guard.
+            if i.native == 1 && !i.bail {
+                self.push(i, Prop::None);
+                continue;
             }
             // `a.push(v)` and `a.pop()`, when that is all the call has
             // called: a guard on the callee (unless `proven_callee`), then

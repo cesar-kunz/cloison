@@ -239,3 +239,19 @@ compiled code into functions that run in the interpreter
 refused or out of compilations for reasons other than named accesses.
 Those need the call-path work in step 9 and a look at the compilation
 budget (`max_compiles`).
+
+Step 7: an array literal is `CreateArray n`, which allocates room for
+its `n` elements (in compiled code `create_array_n`, the elements' cell
+from the same bump allocation), followed by a `PushLiteral` per element.
+The JIT lowers each `PushLiteral` to the `array_push` stencils, which
+join the elements' type through their push cache. Measured with
+`perf stat` against ada17a1:
+
+- splay −35.5% cycles, −37.5% instructions, peak RSS 778 → 650 MB;
+- pdfjs −2.5% instructions;
+- every other benchmark unchanged.
+
+That's more than twice the estimate: the dead element arrays a literal
+left behind had also cost the collector. A boilerplate to clone for
+constant literals isn't needed for now: in compiled code, appending a
+constant costs two stencils.

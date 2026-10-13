@@ -3071,3 +3071,19 @@ t;"#;
     let (_, s) = compiled(src, "run");
     assert!(s.iter().any(|n| n.starts_with("get_named_rt")), "{s:?}");
 }
+
+/// An array literal is made with room for its elements, each appended
+/// (`create_array_n`, then `push`), whatever their types; past 255
+/// elements, it grows.
+#[test]
+fn array_literals_have_room_for_their_elements() {
+    let src = r#"
+function f(i) { var a = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]; var b = [i, i * 0.5, "s" + i, {x: i}, [i, [i]]]; var c = []; var d = [i]; return a[9] + b[0] + b[1] + b[2].length + b[3].x + b[4][1][0] + c.length + d[0] + a.length + b.length; }
+var t = 0; for (var i = 0; i < 100000; i++) t += f(i);
+var big = []; for (var i = 0; i < 300; i++) big.push(i);
+var lit300 = eval("[" + big.join(",") + "]");
+t + " " + lit300.length + " " + lit300[299] + " " + JSON.stringify([1, [2, 3], "x", null, true]);"#;
+    assert_eq!(value(src), "22502763890 300 299 [1,[2,3],\"x\",null,true]");
+    let (_, s) = compiled(src, "f");
+    assert!(s.iter().any(|n| n == "create_array_n"), "{s:?}");
+}

@@ -1239,7 +1239,17 @@ handlers! {
 
     fn op_create_array(pc, acc, regs, tag) {
         let a = new_array(regs);
+        let n = *pc.add(1) as usize;
+        if n > 0 {
+            (*frame_vm(regs)).reserve_elems(as_object(a), n);
+        }
         next!(any, Op::CreateArray.size(), a)
+    }
+
+    fn op_push_literal(pc, acc, regs, tag) {
+        let a = *reg(pc, 1, regs);
+        let n = crate::vm::array_push(&mut *frame_vm(regs), a, &[acc]).expect("an array literal");
+        next!(any, Op::PushLiteral.size(), n)
     }
 
     // Ignores `acc`: also the I32 entry.
@@ -2887,6 +2897,7 @@ static TABLE: Table = {
     t[Op::SetKeyed as usize] = op_set_keyed;
     t[Op::CreateClosure as usize] = op_create_closure;
     t[Op::CreateArray as usize] = op_create_array;
+    t[Op::PushLiteral as usize] = op_push_literal;
     t[Op::LdaConstant as usize] = op_lda_constant;
     t[Op::CreateObject as usize] = op_create_object;
     t[Op::ForInKeys as usize] = op_for_in_keys;

@@ -2805,3 +2805,114 @@ t;";
     // (1 here; 20 when the exit at the call left it uncompiled.)
     assert!(st.exits <= 5, "{st:?}");
 }
+
+/// Runs `src` tiering up after 1000 back edges (the default, whatever
+/// `TOI_TIER` says); returns its value and `function`'s stencils.
+fn compiled(src: &str, function: &str) -> (String, Vec<String>) {
+    let m = toi::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(1000);
+    let v = display(vm.run(&m).unwrap());
+    (v, vm.jit_stencils(function).unwrap_or_default())
+}
+
+const CONSTANT_FIELD_COMPARES: &str = "var K = { ONE: 1, TWO: 2 };
+function V(d, n) { this.d = d; this.n = n; }
+function f(a, n) {
+  var s = 0;
+  for (var i = 0; i < n; i++) {
+    var o = a[i % a.length];
+    if (o.n.d == K.ONE) s += 2;
+    if (o.d == K.ONE) s += 5; else s -= 1;
+    if (o.d != K.TWO) s += 3;
+    var t = o.d;
+    if (t == K.TWO) s += t;
+  }
+  return s;
+}
+var a = [new V(1, null), new V(2, null), new V(0, null)];
+a[0].n = a[1]; a[1].n = a[2]; a[2].n = a[0];
+var r = 0;
+for (var k = 0; k < 300; k++) r += f(a, 31);
+";
+
+/// An int32 field compared with a constant one (DeltaBlue's `this.direction
+/// == Direction.FORWARD`, the constant folded): `Star t; LdaSmi k;
+/// TestEqual t` compares `acc` with `k` (`teq_smi_jf_i`), and the `Star`
+/// goes if `t` is dead after. Not where the load before the `Star` loads
+/// into `t`'s slot instead of `acc` (`get_own_nc_g2_to_g1`): `acc` doesn't
+/// hold `t` there (the second and third compares in `f`, whose temporary
+/// also holds `o.n`). Then a double, and code without them.
+#[test]
+fn compares_of_fields_with_constant_fields() {
+    let (v, s) = compiled(&format!("{CONSTANT_FIELD_COMPARES}r;"), "f");
+    assert_eq!(v, "41400");
+    assert!(s.iter().any(|n| n.contains("teq_smi_jf_i")), "{s:?}");
+    assert!(s.iter().any(|n| n.contains("_to_g")), "{s:?}");
+    let src = format!("{CONSTANT_FIELD_COMPARES}a[2].d = 1.5;\nfor (var k = 0; k < 50; k++) r += f(a, 31);\nr;");
+    assert_eq!(value(&src), "48300");
+}
+
+/// `Ldar a; Star b` with `acc` dead after as one move between slots and
+/// the frame (`enter_*`, `spill_*`, `mov_u*`), and loads into a slot
+/// (`get_own_nc_g0_to_g2`): more locals than slots, rotated each
+/// iteration; exits on entering mid-loop leave the interpreter the moved
+/// values.
+#[test]
+fn moves_between_slots_and_frame() {
+    let src = "function P(x, y) { this.x = x; this.y = y; this.n = null; }
+function g(ps, n) {
+  var a = 0, b = 1, c = 2, d = 3, e = 4, f = 5, h = 6, j = 7, s = 0;
+  for (var i = 0; i < n; i++) {
+    var p = ps[i % ps.length];
+    var q = p.n, x = p.x, y = p.y;
+    var t = a; a = b; b = c; c = d; d = e; e = f; f = h; h = j; j = t;
+    var u = x; x = y; y = u;
+    s += x - y + a * 2 - j + (q === null ? 1 : q.x);
+  }
+  return s + a + b + c + d + e + f + h + j;
+}
+var ps = [new P(1, 2), new P(3, 5), new P(8, 13)];
+ps[1].n = ps[2]; ps[2].n = ps[0];
+var r = 0;
+for (var k = 0; k < 300; k++) r += g(ps, 29);
+r;";
+    assert_eq!(value(src), "91800");
+    let (_, s) = compiled(src, "g");
+    for kind in ["enter_", "spill_", "mov_u", "_to_g"] {
+        assert!(s.iter().any(|n| n.contains(kind)), "{kind}: {s:?}");
+    }
+}
+
+/// A small function whose calls are all compiled inline is inlined past
+/// the inlining depth: `add` pushing (DeltaBlue's `OrderedCollection.add`)
+/// three calls down, and `weakestOf` calling the leaf `weaker`.
+#[test]
+fn small_functions_calling_push_or_leaves_are_inlined_deep() {
+    let src = "function C() { this.e = []; }
+C.prototype.add = function (x) { this.e.push(x); };
+C.prototype.size = function () { return this.e.length; };
+function Plan() { this.v = new C(); }
+Plan.prototype.addC = function (c) { this.v.add(c); };
+function S(w) { this.w = w; }
+S.weaker = function (a, b) { return a.w > b.w; };
+S.weakestOf = function (a, b) { return this.weaker(a, b) ? a : b; };
+function fill(p, xs) {
+  for (var i = 0; i < xs.length; i++) p.addC(S.weakestOf(xs[i], xs[(i + 1) % xs.length]));
+}
+function outer(xs) {
+  var p = new Plan();
+  for (var k = 0; k < 3; k++) fill(p, xs);
+  var s = 0;
+  for (var i = 0; i < p.v.size(); i++) s += p.v.e[i].w;
+  return s;
+}
+var xs = [new S(4), new S(1), new S(7), new S(3)];
+var r = 0;
+for (var k = 0; k < 400; k++) r += outer(xs);
+r;";
+    assert_eq!(value(src), "26400");
+    let (_, s) = compiled(src, "outer");
+    assert!(s.iter().any(|n| n.contains("array_push")), "{s:?}");
+    assert!(!s.iter().any(|n| n.contains("call_direct")), "{s:?}");
+}

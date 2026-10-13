@@ -7773,8 +7773,12 @@ impl JitCode {
                     .and_then(|k| k.parse::<u8>().ok())
                 && let Some(last) = hot.last()
                 && last.slow.is_none()
-                && last.stencil.stencil().name.starts_with("get_own_nc_")
-                && let Some(to) = Instance::find(&format!("{}_to_g{d}", last.stencil.stencil().name))
+                // The load's own name: on arm64 the piece's stencil may be
+                // its family's template (`get_own_nc_g{}`).
+                && let (Some(ps), Some(pst)) = (&sel[i - 1], &ins[i - 1])
+                && let (_, load) = stencil_for(&insns[i - 1], ps, pst, &homes, &boxed, return_spills)
+                && load.starts_with("get_own_nc_")
+                && let Some(to) = Instance::find(&format!("{load}_to_g{d}"))
             {
                 let last = hot.last_mut().unwrap();
                 last.stencil = to;

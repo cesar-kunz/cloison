@@ -3128,6 +3128,25 @@ main();"#;
     assert_eq!(value(src), "16640798");
 }
 
+/// A load into the slot of the register it loads from (`o = o.o`, as
+/// `get_own_nc_g1_to_g1`): on arm64 a family template, whose registers the
+/// fused name must give.
+#[test]
+fn loads_into_their_receivers_slot() {
+    let src = r#"
+function P(x) { this.x = x; this.o = { k: x }; }
+function f(o) { return o.x + o.o.k; }
+function main() {
+  var objs = [0];
+  for (var i = 0; i < 50; i++) objs.push(new P(i));
+  var t = 0;
+  for (var r = 0; r < 1000; r++) for (var i = 1; i < objs.length; i++) t += f(objs[i]);
+  return t;
+}
+main();"#;
+    assert_eq!(value(src), "2450000");
+}
+
 /// An array literal is made with room for its elements, each appended
 /// (`create_array_n`, then `push`), whatever their types; past 255
 /// elements, it grows.

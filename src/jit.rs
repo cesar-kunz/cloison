@@ -606,6 +606,8 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_construct" => toi_rt_construct as *const () as usize,
         "toi_rt_construct_done" => toi_rt_construct_done as *const () as usize,
         "toi_rt_array_push" => toi_rt_array_push as *const () as usize,
+        "toi_rt_char_code_at" => toi_rt_char_code_at as *const () as usize,
+        "toi_rt_from_char_code" => toi_rt_from_char_code as *const () as usize,
         "toi_rt_materialize" => toi_rt_materialize as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
@@ -1578,7 +1580,9 @@ struct Insn {
     /// (into `acc`); see `Lowering::inline_construct`.
     alloc: u64,
     /// A call [`lower`] compiles as `Array.prototype.push` (1) or `pop`
-    /// (2) of its receiver, after a guard on the callee.
+    /// (2) of its receiver, `String.prototype.charCodeAt` (4) or
+    /// `String.fromCharCode` (5), after a guard on the callee. (3: see
+    /// `scalar_replace`.)
     native: u8,
     /// For a `GetNamed`: only its receiver's shape check, the value unused
     /// (a proven callee's load; see `Lowering::drop_callee_load`). For the
@@ -1637,6 +1641,12 @@ impl Insn {
             )
             || !self.bail && is_compare_jump(self.op)
             || !self.bail && self.next_case
+    }
+
+    /// An inlined native taking its argument in `acc` (`push`,
+    /// `charCodeAt`, `fromCharCode`; see [`Insn::native`]).
+    fn takes_acc(&self) -> bool {
+        matches!(self.native, 1 | 4 | 5)
     }
 
     fn reads_reg(&self) -> bool {
@@ -3205,7 +3215,7 @@ struct Soft {
 /// home is memory or a general register, else the instruction's (`reg2`
 /// for `push` and `pop`).
 fn slot_reg(insn: &Insn, sel: &Sel, homes: &[Home]) -> u8 {
-    let own = if insn.native == 1 || insn.native == 2 {
+    let own = if matches!(insn.native, 1 | 2 | 4) {
         insn.reg2
     } else {
         insn.reg
@@ -3420,6 +3430,27 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             return Sel {
                 reg: (a < st.regs.len()).then(|| st.class(a)),
                 ..Sel::new(base, case, out)
+            };
+        }
+        // `charCodeAt`: the receiver in `reg2` (as `push`'s), the index in
+        // `acc`; a unit. `fromCharCode`: the unit in `acc`, the table of
+        // single-unit strings an operand.
+        _ if insn.native == 4 => {
+            let a = insn.reg2 as usize;
+            let case = if st.acc == I32 { "i" } else { "" };
+            out.acc = I32;
+            return Sel {
+                reg: (a < st.regs.len()).then(|| st.class(a)),
+                ..Sel::new("char_code_at", case, out)
+            };
+        }
+        _ if insn.native == 5 => {
+            let case = if st.acc == I32 { "i" } else { "" };
+            out.acc = Any;
+            let table = unsafe { (*crate::interp::current_vm()).single_chars_at() };
+            return Sel {
+                ops: Some((0, table, 0)),
+                ..Sel::new("from_char_code", case, out)
             };
         }
         // An inlined `new`: `this` allocated as an object literal is, with
@@ -5643,7 +5674,18 @@ fn stencil_for(
         ("check_tail_callee", _) => cat!("check_tail_callee_", loc),
         // The callee reads its arguments from memory.
         // The receiver in its slot; a boxed argument unless `_i`.
-        ("array_push" | "array_pop", _) => {
+        ("from_char_code", _) => {
+            if sel.case.is_empty() {
+                box_acc(&mut pre);
+                "from_char_code".to_string()
+            } else {
+                "from_char_code_i".to_string()
+            }
+        }
+        ("array_push" | "array_pop" | "char_code_at", _) => {
+            if sel.base == "char_code_at" && sel.case.is_empty() {
+                box_acc(&mut pre);
+            }
             let at = homes
                 .get(slot_reg(insn, sel, homes) as usize)
                 .copied()
@@ -5868,7 +5910,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
     // A code-less `Star` (`Insn::check_only`) reads nothing, a code-less
     // `Ldar` writes nothing.
     let (reads, kills) = (
-        |insn: &Insn| insn.bail || (reads(insn.op) && !insn.check_only) || insn.native == 1,
+        |insn: &Insn| insn.bail || (reads(insn.op) && !insn.check_only) || insn.takes_acc(),
         |insn: &Insn| !insn.bail && kills(insn.op) && !(insn.check_only && insn.op == Op::Ldar),
     );
     let mut live_in = vec![false; n];
@@ -10045,7 +10087,7 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
 
 /// Whether `insn` reads `acc` (conservatively: unless it is known not to).
 fn reads_acc(insn: &Insn) -> bool {
-    insn.native == 1
+    insn.takes_acc()
         || !matches!(
             insn.op,
             Op::Ldar
@@ -11250,12 +11292,15 @@ impl Lowering<'_> {
                 let native = match (fo, i.imm) {
                     (f, 1) if f == vm.array_push_fn => 1,
                     (f, 0) if f == vm.array_pop_fn => 2,
+                    (f, 1) if f == vm.char_code_at_fn => 4,
+                    (f, 1) if f == vm.from_char_code_fn => 5,
                     _ => 0,
                 };
                 let exits = self.state.callee_exits.get(&origin).copied().unwrap_or(0);
                 if native != 0 && other.is_null() && exits < MAX_PROPERTY_EXITS {
-                    // `push` takes its argument in `acc` (there already if
-                    // the call's setup stored it last).
+                    // `push`, `charCodeAt` and `fromCharCode` take their
+                    // argument in `acc` (there already if the call's setup
+                    // stored it last).
                     let stored = self.out.insns.last().is_some_and(|l| {
                         l.op == Op::Star && l.reg == i.reg2 + 1 && l.frame == i.frame && !l.bail
                     });
@@ -11268,7 +11313,7 @@ impl Lowering<'_> {
                     {
                         i.exit_const = crate::object::object_value(fo).to_bits();
                     }
-                    if native == 1 && !stored {
+                    if native != 2 && !stored {
                         self.push(synth(Op::Ldar, i.reg2 + 1, frame, i.pc), Prop::None);
                     }
                     i.native = native;
@@ -14440,6 +14485,28 @@ extern "C" fn toi_rt_materialize(regs: Value, mat: Value) -> u64 {
 /// `array_push` stencils, when the value doesn't fit the elements' type or
 /// the elements are full: `Array.prototype.push` of `v` onto `a` (an
 /// array), its new length.
+/// `s.charCodeAt(k)` for `char_code_at` stencils: the unit, boxed (a cons
+/// string flattened), or 0 to leave where there is none or `s` is no
+/// string (the interpreter calls it).
+extern "C" fn toi_rt_char_code_at(s: Value, k: Value) -> u64 {
+    match (crate::vm::string_units(s), k.is_int32()) {
+        (Some(u), true) => u
+            .get(k.as_i32_unchecked() as u32 as usize)
+            .map_or(0, |&c| Value::from_i32(c as i32).to_bits()),
+        _ => 0,
+    }
+}
+
+/// `String.fromCharCode(c)` for `from_char_code` stencils, `c` an int32 or
+/// (`from_char_code`) any value: the string, or 0 to leave where `c` isn't
+/// a number (converting it may run code).
+extern "C" fn toi_rt_from_char_code(c: Value, _: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    let Some(d) = c.as_number() else { return 0 };
+    vm.safepoint(std::ptr::null_mut());
+    vm.single_char(crate::interp::to_int32(d) as u16).to_bits()
+}
+
 extern "C" fn toi_rt_array_push(a: Value, v: Value) -> Value {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.safepoint(std::ptr::null_mut());

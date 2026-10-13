@@ -144,6 +144,8 @@ unsafe extern "C" {
     fn toi_rt_construct();
     fn toi_rt_construct_done();
     fn toi_rt_array_push();
+    fn toi_rt_char_code_at();
+    fn toi_rt_from_char_code();
     fn toi_rt_materialize();
     fn toi_rt_instance_of();
     fn toi_rt_in();
@@ -5231,6 +5233,83 @@ macro_rules! array_methods_gpr {
 }
 array_methods!([m]);
 with_gprs!(each_gpr! array_methods_gpr);
+
+// `s.charCodeAt(i)` (`jit`'s `Insn::native` 4), after a guard on the
+// callee: the receiver `s` at a location, `i` in `acc`, boxed or (`_i`) an
+// int32. A flat string's unit (`Object::elems`, at byte 24, its count at
+// 32); else (a cons string, an index not an int32) the runtime's, or leave
+// where that is no unit (`NaN`) or the receiver no string.
+macro_rules! char_code_at {
+    ($loc:tt, $i:literal, |$s:ident| $index:expr) => {
+        stencil_slow!("char_code_at_", $i, loc!($loc); |s| {
+            let a = get!($loc, s);
+            let $s = &s;
+            if is_cell(s.tag, a) && *(a.to_bits() as *const u8).add(8) == 4 && ($index).is_some() {
+                let o = a.to_bits() as *const u8;
+                let units = *(o.add(24) as *const *const u16);
+                let k = int(s.acc) as u32;
+                if !units.is_null() && k < *(o.add(32) as *const u32) {
+                    s.acc = unboxed(*units.add(k as usize) as i32);
+                    next!(s)
+                }
+            }
+            slow!(s)
+        }; |s| {
+            core::arch::asm!(concat!("/* char_code_at_", $i, loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let k = if $i.is_empty() { s.acc } else { Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()) };
+            let r = rt_call!(s, toi_rt_char_code_at, get!($loc, s), k);
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = unboxed(int(Value::from_bits(r)));
+            next!(s)
+        });
+    };
+    ($loc:tt) => {
+        char_code_at!($loc, "", |s| s.tag.is_int32(s.acc).then_some(()));
+        char_code_at!($loc, "i_", |s| Some(()));
+    };
+}
+macro_rules! char_code_at_gpr {
+    ($k:tt) => {
+        char_code_at!([g $k]);
+    };
+}
+char_code_at!([m]);
+with_gprs!(each_gpr! char_code_at_gpr);
+
+// `String.fromCharCode(c)` (`Insn::native` 5), after a guard on the
+// callee: `c` in `acc`, boxed or (`_i`) an int32. Below 256, the VM's
+// string of that unit, from its table at `imm64` (`Vm::single_char`);
+// else the runtime's, or leave where `c` isn't a number.
+macro_rules! from_char_code {
+    ($name:literal, |$s:ident| $code:expr) => {
+        stencil_slow!($name; |s| {
+            let $s = &s;
+            if let Some(c) = $code
+                && (c as u32) < 256
+            {
+                let v = *(imm64() as *const Value).add(c as u32 as usize);
+                if v.to_bits() != 0 {
+                    s.acc = v;
+                    next!(s)
+                }
+            }
+            slow!(s)
+        }; |s| {
+            core::arch::asm!(concat!("/* ", $name, " */"), options(nomem, nostack, preserves_flags));
+            let c = if $name == "from_char_code" { s.acc } else { Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()) };
+            let r = rt_call!(s, toi_rt_from_char_code, c, Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
+    };
+}
+from_char_code!("from_char_code", |s| s.tag.is_int32(s.acc).then(|| int(s.acc)));
+from_char_code!("from_char_code_i", |s| Some(int(s.acc)));
 
 // Before an inlined call: the callee must be the function inlined
 // (`imm64`), or leave before the call.

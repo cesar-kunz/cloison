@@ -286,3 +286,42 @@ Left in earley-boyer:
 - closure creation (`closure_of`, 8%);
 - allocation (memset, `alloc_slow`, `free_young`, about 12%);
 - `sc_list`, which reads `arguments`: entered through `vm_run` 13M times.
+
+Calls from compiled code into functions running in the interpreter (at
+220b28e). Measured, not guessed:
+
+- **A call through the runtime into compiled code is cheap,** about 250
+  cycles. Earley-Boyer's 2.3M runtime calls to closures of an already
+  bound function went direct: −0.7% instructions, −0.3% cycles.
+  - These functions have no upvalues but are made anew by each call of
+    the function making them (`conf_set_adjoin`). A site was bound to
+    one closure.
+  - Now a code made into more than one closure (`Code::closures_made`)
+    is bound by code, as functions with upvalues were.
+- **Polymorphic call sites wouldn't pay.** TypeScript's walker calls a
+  callback that differs by walk (`pre`/`post`): about 700K calls to
+  other functions than the bound one, under 1% of its time.
+- **What costs is that the callees run interpreted.** `preCollectTypes`
+  (1M calls), `preAssignScopes`, `emitParensAndCommentsInPlace` and
+  others are refused for good, because they spend their compilations
+  (32) on versions:
+  - their entry is typed by the node they're called with, and the walker
+    passes every kind;
+  - each lowering again (8 for `preCollectTypes`) drops the versions;
+  - so 19 compilations went to versions for new types and 6 to
+    megamorphic generalizations, and almost none to exits (22 in all).
+
+Tried, and dropped:
+
+- *A last version taking any values once out of compilations, and
+  widening to `Any` at a second generalization.* typescript +1.5%
+  instructions, +3.5% cycles.
+- *Twice the budget (64).* typescript +8.7% instructions, box2d +4.3%:
+  more compiling, and the functions still don't settle.
+
+The fix is in the versions' policy:
+
+- keep versions across a lowering whose code is the same;
+- type a call entry by its arguments only while they're monomorphic, so
+  a callback called with many kinds of node gets one `Any` version early
+  instead of a version per kind.

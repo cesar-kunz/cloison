@@ -281,6 +281,10 @@ pub struct Code {
     /// Calls never enter compiled code, although loops may: its start is
     /// refused for good (see `jit::vm_run`).
     pub(crate) calls_interpret: Cell<bool>,
+    /// Closures made of it, up to 2: past one, it is made anew (by each
+    /// call of the function making it), and calls bind to the code, not a
+    /// closure (see `jit::CallSite::by_code`).
+    pub(crate) closures_made: Cell<u8>,
     /// Loop back edges left before the interpreter tiers up: a frame of
     /// the function starts with it and gives back what it didn't use when
     /// it returns, so loops tier up after that many back edges over all
@@ -2251,6 +2255,8 @@ impl Vm {
 
     /// Give new closure `f` its `prototype` object; `f` as a value.
     fn closure_prototype(&mut self, f: *mut Object) -> Value {
+        let made = unsafe { &(*(*f).code).closures_made };
+        made.set(made.get().saturating_add(1).min(2));
         let p = self.heap.alloc_object(unsafe { &*self.proto_object_shape });
         self.store_field(p, 0, object_value(f));
         self.store_field(f, 0, object_value(p));
@@ -2378,6 +2384,7 @@ impl Vm {
             jit: RefCell::new(None),
             calls_left: Cell::new(i32::MAX),
             calls_interpret: Cell::new(false),
+            closures_made: Cell::new(0),
             loop_budget: Cell::new(i64::MAX),
             ret_hint: Cell::new(ret),
         });
@@ -2599,6 +2606,7 @@ impl Vm {
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_interpret: Cell::new(false),
+                    closures_made: Cell::new(0),
                     calls_left: Cell::new(match (has_loop(f), recursive || large(f)) {
                         _ if interpreted(f) => i32::MAX,
                         _ if f.captures && ops(f).count() > CAPTURING_ENTRY_SIZE => i32::MAX,

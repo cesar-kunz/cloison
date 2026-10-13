@@ -3133,3 +3133,39 @@ s;"#;
     assert!(s.iter().any(|n| n.starts_with("call_direct")), "{s:?}");
     assert!(!s.iter().any(|n| n == "call"), "{s:?}");
 }
+
+/// Prototype's `Class.create` constructors, one code for every class
+/// (`this.initialize.apply(this, arguments)`): inlined at `new`, `this`
+/// of the class's root shape, its `initialize` found on the prototype and
+/// called with the `new`'s arguments (`arguments` too), and replaced later.
+#[test]
+fn class_create_constructors_inlined() {
+    let src = r#"
+var Class = { create: function () { return function () { this.initialize.apply(this, arguments); }; } };
+var Vec = Class.create();
+Vec.prototype = {
+  initialize: function (x, y, z) { this.x = x ? x : 0; this.y = y ? y : 0; this.z = z ? z : 0; },
+  add: function (w) { return new Vec(this.x + w.x, this.y + w.y, this.z + w.z); },
+  scale: function (k) { return new Vec(this.x * k, this.y * k, this.z * k); }
+};
+var Ray = Class.create();
+Ray.prototype = { initialize: function (o, d) { this.o = o; this.d = d; this.t = new Vec(1, 2); } };
+var Named = Class.create();
+Named.prototype = { initialize: function () { this.n = arguments.length; this.first = arguments[0]; } };
+function main(n) {
+  var acc = new Vec(), s = 0;
+  for (var i = 0; i < n; i++) {
+    var r = new Ray(new Vec(i, 1, 2), new Vec(0, i & 3));
+    acc = acc.add(r.o.scale(0.5)).add(r.d).add(r.t);
+    s += new Named(i, 2, 3).n + new Named().n + (new Named(7).first);
+  }
+  return [acc.x, acc.y, acc.z, s].join(",");
+}
+var out = main(20000);
+Vec.prototype.initialize = function (x, y, z) { this.x = -1; this.y = -1; this.z = -1; };
+out + " " + main(3);"#;
+    assert_eq!(value(src), "100015000,80000,20000,200000 -1,-1,-1,30");
+    let (_, s) = compiled(src, "main");
+    // No `new` through the runtime, nor a call (direct ones are).
+    assert!(!s.iter().any(|n| n == "call" || n.starts_with("construct")), "{s:?}");
+}

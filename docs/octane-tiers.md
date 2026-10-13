@@ -340,3 +340,32 @@ Measured with `perf stat` against a0626ba:
 - gbemu +1.3% instructions, +0.5% cycles, from remembering the joins.
   Applying them only past half the budget lost typescript's gain;
 - the others unchanged, DeltaBlue's instructions included.
+
+Step 12: Prototype's `Class.create` constructors.
+
+Every class's constructor is one code,
+`function () { this.initialize.apply(this, arguments); }`. Each `new`
+went through the runtime and ran the constructor and its `initialize` in
+the interpreter. Now `new C(…)` inlines it:
+
+- *A forwarding function is inlined* when each of its forward calls
+  calls a method of `this`.
+  - Its frame takes a window past its registers.
+  - Its forward call becomes an ordinary call of `g`, with `this` `x`
+    and the `new`'s arguments, inlined or direct. That holds when `apply`
+    and `g` come from prototype slots; else the call bails, and the
+    interpreter finds the arguments in the caller's window.
+  - Box2D's `b2Vec2.b2Vec2.apply(this, arguments)` takes `g` from a
+    variable, so it isn't inlined: inlining it bailed, +6%.
+- *`this.initialize` is loaded from the closure's prototype.* `this` has
+  the root shape for that prototype, and the code's cache is every
+  class's.
+- *Not the code's slack tracking:* its objects' shapes are every class's.
+- *Not the inlining budget:* past it, a `new` went through the runtime,
+  in `renderScene` for one, with both functions interpreted.
+
+Measured with `perf stat` against 0c84419:
+
+- raytrace −48.3% cycles (−56.9% instructions), 1.9×;
+- the others unchanged;
+- its JIT code 910 → 993 KB, peak RSS 48 → 51 MB, the binary +23 KB.

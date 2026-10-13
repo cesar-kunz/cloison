@@ -8731,6 +8731,15 @@ struct InlineFrame {
     /// The call's arguments: the first one's register (renamed into the
     /// compiled frame) and their count, for the callee's `arguments`.
     args: (u8, u8),
+    /// Registers past its own: for a function passing its arguments on,
+    /// the window of that call, made an ordinary one (see `emit_frame`).
+    extra: u8,
+}
+
+/// Where the registers of frames inlined into `f` start: past its own
+/// (and their `extra`) and a header.
+fn frame_end(f: &InlineFrame) -> usize {
+    f.base + unsafe { (*f.code).nregs } as usize + f.extra as usize + interp::HEADER
 }
 
 /// A call compiled code makes (`call` and `call_direct` stencils): `op`'s
@@ -9484,6 +9493,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
                 parent: 0,
                 ret_pc: 0,
                 args: (0, 0),
+                extra: 0,
             }],
             fbs: Vec::new(),
             sites: Vec::new(),
@@ -11165,6 +11175,59 @@ impl Lowering<'_> {
                 _ if i.bail => {
                     self.push(i, Prop::None);
                 }
+                // `g.apply(x, arguments)` in an inlined frame, `apply` and `g`
+                // loaded from prototypes (Prototype's `Class.create`
+                // constructors, `this.initialize.apply(this, arguments)`):
+                // a call of `g` with `this` `x` and the frame's arguments,
+                // moved into its window past the frame's registers. (Else
+                // the interpreter does it, which finds them in the caller's
+                // window.) In the compiled function's own frame: through
+                // the runtime.
+                Op::Call if i.forward && frame != 0 => {
+                    let vm = self.state.vm;
+                    let apply = self.loaded_value(frame, i.reg);
+                    let g = self.loaded_value(frame, i.reg2);
+                    let is_apply = apply.is_some_and(|v| {
+                        v.is_cell()
+                            && unsafe { (*crate::object::as_object(v)).code == (*vm).function_apply }
+                    });
+                    let (a, n) = f.args;
+                    let w = base + unsafe { (*f.code).nregs } as usize;
+                    match g {
+                        Some(g)
+                            if is_apply
+                                && w + 1 + (n as usize) <= 256
+                                && g.is_cell()
+                                && unsafe { (*crate::object::as_object(g)).class }
+                                    == crate::object::Class::Function =>
+                        {
+                            let w = w as u8;
+                            self.mov(frame, i.pc, Some(i.reg2 + 1), w);
+                            for p in 0..n {
+                                self.mov(frame, i.pc, Some(a + p), w + 1 + p);
+                            }
+                            let mut c = i;
+                            (c.forward, c.reg, c.reg2, c.imm) = (false, i.reg2, w, n as i32);
+                            let fo = crate::object::as_object(g);
+                            // (As `inline_target` would for a cached callee.)
+                            self.call_in_loop = self.in_loop(f.code, i.pc);
+                            if self.state.tier != Tier::Warm
+                                && self.out.frames.len() < 255
+                                && (depth < MAX_INLINE_DEPTH || self.small_leaf(fo))
+                                && !self.nullable_this(&c, fo)
+                                && self.inlinable(frame, fo)
+                            {
+                                self.inline(frame, &c, fo, depth);
+                            } else {
+                                self.emit_call(frame, c, fo, true);
+                            }
+                        }
+                        _ => {
+                            i.bail = true;
+                            self.push(i, Prop::None);
+                        }
+                    }
+                }
                 // `g.apply(x, arguments)`: through the runtime.
                 Op::Call if i.forward => self.emit_call(frame, i, std::ptr::null_mut(), false),
                 // The function returns from its compiled code: the caller of
@@ -11348,6 +11411,19 @@ impl Lowering<'_> {
                     };
                     self.push(i, prop);
                 }
+                // In a constructor passing its arguments on, inlined for
+                // `new`: a load from `this`, whose shape is the root one
+                // for the closure's prototype, from the prototype chain.
+                // (Its code is every class's: its cache isn't this one's.)
+                Op::GetNamed
+                    if f.construct
+                        && !f.func.is_null()
+                        && i.reg as usize == base
+                        && self.forwards(f.code)
+                        && let Some(prop) = self.this_proto_load(f.func, &i, frame) =>
+                {
+                    self.push(i, prop);
+                }
                 _ => {
                     let given_up = self
                         .state
@@ -11404,7 +11480,7 @@ impl Lowering<'_> {
             f: i.reg as usize,
             w: i.reg2 as usize,
             argc: i.imm as usize,
-            frame: f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER,
+            frame: frame_end(&f),
             nparams: 0,
             exits: 0,
             callee: std::ptr::null(),
@@ -11714,6 +11790,20 @@ impl Lowering<'_> {
         self.decoded(code).0.iter().any(|j| j.forward)
     }
 
+    /// Whether each of `code`'s forward calls calls a method of `this`
+    /// (`this.initialize.apply(this, arguments)`): its function the result
+    /// of a load from register 0 stored to its window.
+    fn forwards_this_method(&mut self, code: *const crate::vm::Code) -> bool {
+        let d = self.decoded(code);
+        let insns = &d.0;
+        insns.iter().enumerate().filter(|(_, j)| j.forward).all(|(k, j)| {
+            insns[..k]
+                .iter()
+                .rposition(|s| s.op == Op::Star && s.reg == j.reg2)
+                .is_some_and(|s| s > 0 && insns[s - 1].op == Op::GetNamed && insns[s - 1].reg == 0)
+        })
+    }
+
     /// Whether `code` finds its arguments through its frame's header:
     /// it passes them on, or makes `arguments` (in its own frame; an
     /// inlined one's come from its call). A direct call or a self tail
@@ -11853,7 +11943,14 @@ impl Lowering<'_> {
         // Exceptions unwind only through interpreted frames. A function
         // passing its arguments on reads them from its frame's header; one
         // whose registers closures capture keeps them in its own frame.
-        if unsafe { (*callee).interpreted } || self.forwards(callee) || self.captures(callee) {
+        // (A function passing its arguments on is, its forward call made
+        // an ordinary one with the call's arguments, if it calls a method
+        // of `this`, which its frame resolves: see `emit_frame`. Box2D's
+        // `b2Vec2.b2Vec2.apply(this, arguments)`, not, left there: +6%.)
+        if unsafe { (*callee).interpreted }
+            || self.captures(callee)
+            || self.forwards(callee) && !self.forwards_this_method(callee)
+        {
             return false;
         }
         // A closure this code makes (one of its frames' nested functions,
@@ -11869,9 +11966,13 @@ impl Lowering<'_> {
         if made_here && unsafe { !(&(*callee).upvalues).is_empty() } {
             return false;
         }
+        // (Not a constructor passing its arguments on, whose `new` would
+        // go through the runtime and both functions run interpreted:
+        // Raytrace's `Class.create` ones, past the budget in `renderScene`.)
         if !self.call_in_loop
             && self.inlined + self.decoded(callee).0.len() > INLINE_BUDGET
             && !self.small_leaf(fo)
+            && !self.forwards(callee)
         {
             return false;
         }
@@ -11891,7 +11992,7 @@ impl Lowering<'_> {
             }
             g = self.out.frames[g].parent;
         }
-        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let base = frame_end(&f);
         let nregs = unsafe { (*callee).nregs } as usize;
         base + nregs <= 256 && self.decoded(callee).0.len() <= MAX_INLINE_INSNS
     }
@@ -12012,7 +12113,12 @@ impl Lowering<'_> {
         let fits = !seen.is_null()
             && seen != crate::vm::MANY_SHAPES
             && unsafe { (*seen).keys.len() } as u32 <= code.ctor_capacity.get();
-        if !code.ctor_settled.get() || !fits {
+        // A constructor passing its arguments on (Prototype's
+        // `Class.create`, `this.initialize.apply(this, arguments)`) is one
+        // code for every class: the shapes its objects end with say
+        // nothing of this one's, whose `this` gets its own root shape.
+        let forwards = unsafe { self.forwards((*fo).code) };
+        if !forwards && (!code.ctor_settled.get() || !fits) {
             return None;
         }
         let d = self.decoded(code);
@@ -12032,7 +12138,7 @@ impl Lowering<'_> {
     /// with another only misses growing the capacity for later objects.
     fn inline_construct(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) {
         let f = self.out.frames[frame];
-        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let base = frame_end(&f);
         let mut site = self.call_site(frame, i);
         let (ctor, shape) = self.ctor_site(fo);
         site.ctor = Some(ctor);
@@ -12361,6 +12467,71 @@ impl Lowering<'_> {
             && captured_regs(code).get(r as usize) != Some(&true)
     }
 
+    /// For load `i` (in frame `frame`) from `this` of `new fo`, allocated
+    /// with the root shape for `fo`'s prototype: a load from the
+    /// prototype holding the property, if one does with a data property.
+    fn this_proto_load(&mut self, fo: *mut Object, i: &Insn, frame: usize) -> Option<Prop> {
+        unsafe {
+            let shape = (*self.state.vm).ctor_root(fo);
+            let name = self.out.fbs[frame].name(i);
+            if (*shape).lookup(name).is_some() {
+                return None;
+            }
+            let mut p = (*shape).proto;
+            while p.is_cell() {
+                let o = crate::object::as_object(p);
+                let s = &*(*o).shape;
+                if let Some(slot) = s.lookup(name) {
+                    if s.attrs[slot as usize] & crate::object::ACCESSOR != 0 {
+                        return None;
+                    }
+                    let addr = Object::slot(o, s.location(slot)) as u64;
+                    rely_on_slot(addr);
+                    return Some(Prop::Proto {
+                        shape: shape as u64,
+                        addr,
+                        ft: s.field_type_relied(slot),
+                    });
+                }
+                p = s.proto;
+            }
+            None
+        }
+    }
+
+    /// The value register `r` of frame `frame` holds for sure, if its last
+    /// write was the result of a load from a prototype's slot (whose shape
+    /// guard passed), for every receiver shape the same (see
+    /// [`Lowering::proven_callee`]).
+    fn loaded_value(&self, frame: usize, r: u8) -> Option<Value> {
+        let insns = &self.out.insns;
+        let k = insns
+            .iter()
+            .rposition(|j| j.frame as usize == frame && j.op == Op::Star && j.reg == r)?;
+        let get = k.checked_sub(1)?;
+        let g = insns[get];
+        if g.op != Op::GetNamed || g.frame as usize != frame || g.bail {
+            return None;
+        }
+        let value = |addr: u64| {
+            rely_on_slot(addr);
+            unsafe { *(addr as *const Value) }
+        };
+        match self.out.props[get] {
+            Prop::Proto { addr, .. } => Some(value(addr)),
+            Prop::Poly { n, at } => {
+                let cases = poly_cases(&self.out.polys, n, at);
+                let mut vs = cases.iter().map(|c| match c.loc {
+                    CaseLoc::Proto(addr) => Some(value(addr)),
+                    _ => None,
+                });
+                let v = vs.next()??;
+                vs.all(|w| w == Some(v)).then_some(v)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether register `r` of frame `frame` holds `fo` for sure: its last
     /// write was the result of a load from a prototype's slot (whose shape
     /// guard passed) that holds `fo`. A prototype's slots keep their values
@@ -12465,7 +12636,7 @@ impl Lowering<'_> {
         callees: &[*const crate::vm::Code],
     ) -> Vec<(u8, u8)> {
         let f = self.out.frames[frame];
-        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let base = frame_end(&f);
         let (w, argc) = (i.reg2, i.imm as usize);
         let (this, args) = match i.op {
             Op::Call => (Some(w), w as usize + 1),
@@ -12532,12 +12703,13 @@ impl Lowering<'_> {
         let f = self.out.frames[frame];
         let callee = unsafe { (*fo).code };
         let c = unsafe { &*callee };
-        let base = f.base + unsafe { (*f.code).nregs } as usize + interp::HEADER;
+        let base = frame_end(&f);
         let id = self.out.frames.len();
         if !self.small_leaf(fo) {
             self.inlined += self.decoded(callee).0.len();
         }
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
+        let extra = if self.forwards(callee) { (i.imm as u8).saturating_add(1) } else { 0 };
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,
@@ -12546,9 +12718,10 @@ impl Lowering<'_> {
             parent: frame,
             ret_pc: i.pc + i.op.size(),
             args: (i.reg2 + u8::from(i.op == Op::Call), i.imm as u8),
+            extra,
         });
         self.out.fbs.push(self.feedback(callee));
-        self.out.nregs = self.out.nregs.max(base + c.nregs as usize);
+        self.out.nregs = self.out.nregs.max(base + c.nregs as usize + extra as usize);
         let pc = i.pc;
         let mut guard = synth(Op::Nop, i.reg, frame, pc);
         guard.guard = fo as u64;

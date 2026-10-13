@@ -40,7 +40,7 @@ function V(i)                   ; r0 this, r1 i
 end
 
 function main()                 ; r1 vs, r2 i, r3 n, r4 r, r5 v, r6-r9 temporaries
-        CreateArray
+        CreateArray 0
         Star r1                 ; vs = []
         LdaSmi 0
         Star r2                 ; i = 0

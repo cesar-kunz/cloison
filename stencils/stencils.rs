@@ -3714,6 +3714,37 @@ stencil_slow!("create_array"; |s| {
     next!(s)
 });
 
+// `CreateArray n` (a literal's, `imm` its count): as `create_array`, with
+// room for `n` elements (`undefined`) in a cell of their own, if the
+// heap's free space has it too (else none: `push` makes room).
+stencil_slow!("create_array_n"; |s| {
+    let heap = imm64b() as *mut HeapPtrs;
+    let Some(p) = bump(heap, 6) else { slow!(s) };
+    *p = imm64();
+    *p.add(1) = 1 | 1 << 8;
+    for k in 2..6 {
+        *p.add(k) = 0;
+    }
+    let n = imm() as usize;
+    if let Some(e) = bump(heap, 1 + n) {
+        // `heap::VALUES`, the capacity.
+        *e = 1 | (n as u64) << 32;
+        // Volatile: LLVM would call `memset`-like code from a constant pool.
+        for k in 1..=n {
+            e.add(k).write_volatile(Value::UNDEFINED.to_bits());
+        }
+        *p.add(3) = e.add(1) as u64;
+        // Length 0, capacity `n` (at 32 and 36).
+        *p.add(4) = (n as u64) << 32;
+    }
+    s.acc = Value::from_bits(p as u64);
+    next!(s)
+}; |s| {
+    core::arch::asm!("/* create_array_n */", options(nomem, nostack, preserves_flags));
+    s.acc = Value::from_bits(rt_call!(s, toi_rt_create_object, Value::from_bits(imm64()), Value::UNDEFINED));
+    next!(s)
+});
+
 // `CreateClosure`: a new function of the code that is the 64-bit
 // immediate, from the runtime, its upvalues the enclosing function's: the
 // second immediate (an inlined frame's, known), or (0) the frame's own,

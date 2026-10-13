@@ -192,8 +192,11 @@ define_ops! {
     // ---- Allocation ----
     /// `acc` = a new closure of nested function `f`.
     CreateClosure(Fn),
-    /// `acc = []`
-    CreateArray(),
+    /// `acc = []`, with room for `n` elements (a literal's count).
+    CreateArray(Count),
+    /// `r[a].push(acc)`, `r[a]` an array literal being made: `acc` = its
+    /// length after.
+    PushLiteral(Reg),
     /// `acc = constants[k]`: a string, or a number that isn't an int32.
     LdaConstant(Const),
     /// `acc` = the enumerable property names of `acc` (an array of

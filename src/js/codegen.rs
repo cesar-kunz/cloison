@@ -1405,19 +1405,18 @@ impl<'a> Gen<'a> {
                 Var::Undefined => self.emit(Op::LdaUndefined, &[]),
                 Var::Global => self.global(Op::LdaGlobal, n),
             },
+            // An array with room for its elements, each appended. (Stored
+            // by index, Splay's `[0, 1, …, 9]` went through the runtime at
+            // the first and grew twice: 17% of its time.)
             Array(elems) => {
-                self.emit(Op::CreateArray, &[]);
+                let n = elems.len().min(u8::MAX as usize) as u8;
+                self.emit(Op::CreateArray, &[Arg::Count(n)]);
                 if !elems.is_empty() {
                     let a = self.alloc(e.pos)?;
                     self.star(a);
-                    let k = self.alloc(e.pos)?;
-                    // (One cache for the literal's stores.)
-                    let ic = self.auto_ic("[]keyed");
-                    for (i, el) in elems.iter().enumerate() {
-                        self.lda_smi(i as i32);
-                        self.star(k);
+                    for el in elems {
                         self.value(el)?;
-                        self.emit(Op::SetKeyed, &[Arg::Reg(a), Arg::Reg(k), ic]);
+                        self.emit(Op::PushLiteral, &[Arg::Reg(a)]);
                     }
                     self.ldar(a);
                 }

@@ -304,7 +304,7 @@ fn calling_a_non_function_is_a_type_error() {
 fn arrays_push_index_holes_and_length() {
     let src = "\
 script                          ; r1 a, r2 push, r3 this, r4 arg, r5 key
-        CreateArray
+        CreateArray 0
         Star r1
         GetNamed r1, push
         Star r2
@@ -356,7 +356,7 @@ fn loose_equality_and_truthiness() {
         ("LdaSmi 0", false),
         ("LdaSmi -3", true),
         ("LdaNull", false),
-        ("CreateArray", true),
+        ("CreateArray 0", true),
     ] {
         let src = format!(
             "script\n {v}\n JumpIfToBooleanTrue t\n LdaFalse\n Return\nt: LdaTrue\n Return\nend\n"
@@ -619,7 +619,7 @@ function Q(x)                   ; another field first, so x is at another offset
 end
 ; r1 array, r2 i, r3 sum, r4-r7 temps
 function main()
-        CreateArray
+        CreateArray 0
         Star r1
         LdaSmi 0
         Star r2
@@ -686,7 +686,7 @@ function E()
 end
 ; r1 array, r2 i, r3 sum, r4-r7 temps
 function main()
-        CreateArray
+        CreateArray 0
         Star r1
         LdaSmi 0
         Star r2
@@ -777,7 +777,7 @@ script
 end
 ; r1 a, r2 i, r3 sum, r4 key, r5 temp
 function main()
-        CreateArray
+        CreateArray 0
         Star r1
         LdaSmi 0
         Star r4
@@ -921,7 +921,7 @@ function B()                    ; { pad: 0, n: 100 }: n at another offset
 end
 ; r1 box, r2 i, r3 sum, r4-r8 temps, r9 [new A(), new B()]
 function main()
-        CreateArray
+        CreateArray 0
         Star r9
         GetNamed r9, push
         Star r4
@@ -1133,7 +1133,7 @@ script
 end
 ; r1 a, r2 i, r3 sum, r4 key
 function main()
-        CreateArray
+        CreateArray 0
         Star r1
         LdaSmi 0
         Star r4
@@ -1202,7 +1202,7 @@ script
         Return
 end
 function Box()
-        CreateArray
+        CreateArray 0
         SetNamed r0, list
         LdaUndefined
         Return
@@ -1421,7 +1421,7 @@ end
 function main()
         LdaGlobal g
         Star r2
-        CreateArray
+        CreateArray 0
         Star r4
         LdaSmi 0
         Star r1
@@ -1491,7 +1491,7 @@ function Box(v)
 end
 ; r1 i, r2 sum, r3 a, r4-r8 temps
 function main()
-        CreateArray
+        CreateArray 0
         Star r3
         LdaSmi 0
         Star r1
@@ -1645,7 +1645,7 @@ function main()
         LdaSmi 0
         Star r1
         Star r2
-top:    CreateArray
+top:    CreateArray 0
         Star r5
         Ldar r1
         Star r4
@@ -1715,7 +1715,7 @@ function main()
         LdaSmi 0
         Star r1
         Star r2
-top:    CreateArray
+top:    CreateArray 0
         Star r5
         Ldar r1
         BitAndSmi 7
@@ -1811,7 +1811,7 @@ function main()
         Star r2
         LdaSmi 0
         Star r1
-top:    CreateArray
+top:    CreateArray 0
         Star r3
         Ldar r1
         TestEqualSmi 30
@@ -1924,7 +1924,7 @@ fn object_program(special: &str) -> String {
 script
         LdaSmi 0
         StaGlobal calls
-        CreateArray
+        CreateArray 0
         Star r3
         LdaSmi 1000
         SetNamed r3, a
@@ -1955,7 +1955,7 @@ loop:   Ldar r2
         Return
 end
 function main()                 ; r1 i, r2 total, r3 m, r7 o, r8 arg, r9 o again
-        CreateArray
+        CreateArray 0
         Star r7
         LdaSmi 5
         SetNamed r7, x
@@ -2139,7 +2139,7 @@ function Box(k)
         Return
 end
 function main()                 ; r1 i, r2 total, r3 a, r4-r8 temps
-        CreateArray
+        CreateArray 0
         Star r3
         LdaSmi 0
         Star r1
@@ -2257,13 +2257,13 @@ script
         Star r2
         LdaSmi 1
         SetNamed r2, w
-        CreateArray
+        CreateArray 0
         Star r1
         LdaSmi 10
         SetNamed r1, w
         Ldar r1
         StaGlobal other
-        CreateArray
+        CreateArray 0
         Star r1
         LdaSmi 1000
         SetNamed r1, w
@@ -2420,7 +2420,7 @@ function Point(x, y, z)
         Return
 end
 function main()                 ; r1 i, r2 total, r4-r8 temps, r9 a holder
-        CreateArray
+        CreateArray 0
         Star r9
         LdaSmi 0
         Star r1
@@ -2536,7 +2536,7 @@ function P(a, b)
         Return
 end
 function main()                 ; r1 i, r2 total, r3 P, r4-r5 arguments, r7 o, r8 d
-        CreateArray
+        CreateArray 0
         Star r7
         LdaUndefined
         SetNamed r7, w          ; o.w: any type
@@ -2610,7 +2610,7 @@ l:      Ldar r1
         Return
 end
 function main()                 ; r1 i, r2 total, r3 F, r7 0
-        CreateArray
+        CreateArray 0
         StaGlobal other
         LdaSmi 0
         Star r7
@@ -2658,7 +2658,7 @@ end
 fn direct_constructors_returning_objects() {
     let src = "\
 script
-        CreateArray
+        CreateArray 0
         Star r1
         LdaSmi 1000
         SetNamed r1, v

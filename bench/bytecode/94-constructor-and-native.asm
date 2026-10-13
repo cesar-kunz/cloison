@@ -27,7 +27,7 @@ function Box(k)                 ; r0 this, r1 k
 end
 
 function main()                 ; r1 a, r2 s, r3 i, r4 callee then object, r5-r6 window
-        CreateArray
+        CreateArray 0
         Star r1                 ; a = []
         LdaSmi 0
         Star r2                 ; s = 0

@@ -6,10 +6,11 @@
 //! it misreads only a regular expression right after a block's `}`.
 
 use super::Error;
+use super::ast::Name;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
-    Ident(String),
+    Ident(Name),
     /// A reserved word (`function`, `var`, `this`, `true`, …).
     Keyword(&'static str),
     Num(f64),
@@ -30,6 +31,8 @@ pub struct Token {
     pub newline_before: bool,
 }
 
+/// The reserved words, as [`keyword`] matches them.
+#[cfg(test)]
 const KEYWORDS: &[&str] = &[
     "break",
     "case",
@@ -80,6 +83,8 @@ const PUNCTS: &[&str] = &[
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     let b = src.as_bytes();
     let mut toks = Vec::new();
+    // Each distinct name once.
+    let mut names: crate::jit::HashMap<&str, Name> = Default::default();
     let mut i = 0;
     let mut newline = false;
     while i < b.len() {
@@ -140,13 +145,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 i += n;
                 // Keywords: lowercase, of 2 to 10 letters.
                 let keyword = if c.is_ascii_lowercase() && (2..=10).contains(&n) {
-                    KEYWORDS.iter().find(|&&k| k == word)
+                    keyword(word)
                 } else {
                     None
                 };
                 match keyword {
                     Some(k) => Tok::Keyword(k),
-                    None => Tok::Ident(word.to_string()),
+                    None => Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone()),
                 }
             } else if let Some(p) = PUNCTS.iter().find(|p| p.as_bytes()[0] == c && src[i..].starts_with(**p)) {
                 i += p.len();
@@ -207,6 +212,50 @@ fn regexp(s: &str) -> Option<(String, String, usize)> {
         .map_or(s.len() - end - 1, |(n, _)| n);
     let flags = s[end + 1..end + 1 + flags_len].to_string();
     Some((s[1..end].to_string(), flags, end + 1 + flags_len))
+}
+
+/// `word` as the [`KEYWORDS`] entry it is, if any (a `match`: by length,
+/// then the bytes, not a scan).
+fn keyword(word: &str) -> Option<&'static str> {
+    Some(match word {
+        "break" => "break",
+        "case" => "case",
+        "catch" => "catch",
+        "class" => "class",
+        "const" => "const",
+        "continue" => "continue",
+        "debugger" => "debugger",
+        "default" => "default",
+        "delete" => "delete",
+        "do" => "do",
+        "else" => "else",
+        "export" => "export",
+        "extends" => "extends",
+        "false" => "false",
+        "finally" => "finally",
+        "for" => "for",
+        "function" => "function",
+        "if" => "if",
+        "import" => "import",
+        "in" => "in",
+        "instanceof" => "instanceof",
+        "let" => "let",
+        "new" => "new",
+        "null" => "null",
+        "return" => "return",
+        "super" => "super",
+        "switch" => "switch",
+        "this" => "this",
+        "throw" => "throw",
+        "true" => "true",
+        "try" => "try",
+        "typeof" => "typeof",
+        "var" => "var",
+        "void" => "void",
+        "while" => "while",
+        "with" => "with",
+        _ => return None,
+    })
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -351,6 +400,14 @@ mod tests {
                 Tok::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn keywords_are_found_by_match() {
+        for &k in KEYWORDS {
+            assert_eq!(keyword(k), Some(k));
+        }
+        assert_eq!(keyword("iff"), None);
     }
 
     #[test]

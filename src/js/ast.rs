@@ -5,6 +5,10 @@
 /// Byte offset into the source, for errors.
 pub type Pos = u32;
 
+/// A name (an identifier, a property name, a label): shared by every token
+/// and node spelling it (the lexer makes one per distinct name).
+pub type Name = std::rc::Rc<str>;
+
 #[derive(Debug)]
 pub struct Program {
     /// `functions[0]` is the script.
@@ -15,8 +19,8 @@ pub struct Program {
 pub struct Function {
     /// The declared name, or the one inferred from what an anonymous
     /// function expression is assigned to (`C.prototype.m = function …`).
-    pub name: Option<String>,
-    pub params: Vec<String>,
+    pub name: Option<Name>,
+    pub params: Vec<Name>,
     pub body: Vec<Stmt>,
     /// The enclosing function (`None` for the script).
     pub parent: Option<usize>,
@@ -37,7 +41,7 @@ pub struct Stmt {
 
 #[derive(Debug)]
 pub enum StmtKind {
-    Var(Vec<(String, Option<Expr>)>),
+    Var(Vec<(Name, Option<Expr>)>),
     /// A function declaration: an index into [`Program::functions`].
     Function(usize),
     Expr(Expr),
@@ -51,30 +55,30 @@ pub enum StmtKind {
     /// `for (var? x in e)`
     ForIn {
         var: bool,
-        name: String,
+        name: Name,
         object: Expr,
         body: Box<Stmt>,
     },
     While(Expr, Box<Stmt>),
     DoWhile(Box<Stmt>, Expr),
     Return(Option<Expr>),
-    Break(Option<String>),
-    Continue(Option<String>),
+    Break(Option<Name>),
+    Continue(Option<Name>),
     Throw(Expr),
     /// `try { … } catch (name) { … } finally { … }`, either of the last two
     /// optional.
-    Try(Vec<Stmt>, Option<(String, Vec<Stmt>)>, Option<Vec<Stmt>>),
+    Try(Vec<Stmt>, Option<(Name, Vec<Stmt>)>, Option<Vec<Stmt>>),
     Block(Vec<Stmt>),
     /// The discriminant, then `case` tests (`None` for `default`) with
     /// their statements.
     Switch(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
-    Labeled(String, Box<Stmt>),
+    Labeled(Name, Box<Stmt>),
     Empty,
 }
 
 #[derive(Debug)]
 pub enum ForInit {
-    Var(Vec<(String, Option<Expr>)>),
+    Var(Vec<(Name, Option<Expr>)>),
     Expr(Expr),
 }
 
@@ -90,10 +94,10 @@ pub enum ExprKind {
     Str(String),
     Bool(bool),
     Null,
-    Ident(String),
+    Ident(Name),
     This,
     Array(Vec<Expr>),
-    Object(Vec<(String, Expr)>),
+    Object(Vec<(Name, Expr)>),
     /// A function expression: an index into [`Program::functions`].
     Function(usize),
     /// A regular expression literal: pattern, flags.
@@ -102,7 +106,7 @@ pub enum ExprKind {
     /// (true), the function's index.
     Accessor(bool, usize),
     /// `o.name`
-    Member(Box<Expr>, String),
+    Member(Box<Expr>, Name),
     /// `o[key]`
     Index(Box<Expr>, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),

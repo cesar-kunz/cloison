@@ -534,7 +534,12 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let Some(u) = string_units(x) else {
         return Ok(x);
     };
-    let src = String::from_utf16_lossy(u);
+    // (ASCII, as code mostly is: a byte per unit.)
+    let src = if u.iter().all(|&c| c < 0x80) {
+        String::from_utf8(u.iter().map(|&c| c as u8).collect()).unwrap()
+    } else {
+        String::from_utf16_lossy(u)
+    };
     run_source(vm, &src)
 }
 

@@ -1142,6 +1142,27 @@ impl Vm {
         }
     }
 
+    /// Write the `n` values at `from` (holes as they are) to `o`'s
+    /// elements `at` on (within capacity; `from` may be in them): each
+    /// value that fits `o`'s elements' type is only written.
+    pub(crate) fn store_elements(&mut self, o: *mut Object, at: usize, from: *const Value, n: usize) {
+        unsafe {
+            let e = (*o).elems;
+            let fwd = from >= e.add(at).cast_const();
+            for k in 0..n {
+                let i = if fwd { k } else { n - 1 - k };
+                let v = *from.add(i);
+                let s = &*(*o).shape;
+                if v == Value::EMPTY || s.elems.join(FieldType::of(v)) == s.elems {
+                    *e.add(at + i) = v;
+                    crate::heap::barrier(e.cast::<u8>().sub(8), e.add(at + i), v);
+                } else {
+                    self.store_element(o, at + i, v);
+                }
+            }
+        }
+    }
+
     /// The object holding `name` on `o`'s prototype chain (`o` included),
     /// and its slot there.
     pub(crate) fn lookup(&self, o: *mut Object, name: Atom) -> Option<(*mut Object, u32)> {
@@ -1968,7 +1989,7 @@ impl Vm {
     }
 
     /// Make room for `n` elements.
-    fn reserve_elems(&mut self, o: *mut Object, n: usize) {
+    pub(crate) fn reserve_elems(&mut self, o: *mut Object, n: usize) {
         unsafe {
             if n <= (*o).elems_cap as usize {
                 return;
@@ -2226,9 +2247,18 @@ impl Vm {
 
     /// The open upvalue of register `at`, made if there is none.
     fn open_upvalue(&mut self, at: *mut Value) -> *mut Upvalue {
-        let k = self
-            .open_upvalues
-            .partition_point(|&u| unsafe { (*u).at } < at);
+        // The registers captured are usually the newest frame's, at or
+        // near the end of the list: probe from there first (in deep
+        // recursion the list is long, and every probe is a cell's load).
+        let ups = &self.open_upvalues;
+        let mut k = ups.len();
+        let near = k.saturating_sub(8);
+        while k > near && unsafe { (*ups[k - 1]).at } >= at {
+            k -= 1;
+        }
+        if k == near && k > 0 {
+            k = ups[..k].partition_point(|&u| unsafe { (*u).at } < at);
+        }
         if let Some(&u) = self.open_upvalues.get(k)
             && unsafe { (*u).at } == at
         {

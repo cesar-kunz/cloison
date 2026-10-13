@@ -733,64 +733,122 @@ fn set_elements(vm: &mut Vm, o: *mut Object, values: &[Value]) -> Result<()> {
     crate::vm::array_push(vm, object_value(o), values).map(|_| ())
 }
 
+/// `this` as an array.
+fn array_object(this: Value, what: &str) -> Result<*mut Object> {
+    if !is_class(this, Class::Array) {
+        return Err(Error::unsupported(format!("Array.prototype.{what} on a non-array")));
+    }
+    Ok(as_object(this))
+}
+
+/// A new array of `o`'s `n` elements from `at` (holes as they are).
+fn array_range(vm: &mut Vm, o: *mut Object, at: usize, n: usize) -> Value {
+    let r = vm.new_array();
+    let ro = as_object(r);
+    vm.reserve_elems(ro, n);
+    unsafe {
+        vm.store_elements(ro, 0, (*o).elems.add(at), n);
+        (*ro).elems_len = n as u32;
+    }
+    r
+}
+
+/// Replace `o`'s `n` elements from `at` with `items`, moving the ones
+/// after them in place.
+fn splice_elements(vm: &mut Vm, o: *mut Object, at: usize, n: usize, items: &[Value]) {
+    unsafe {
+        let len = (*o).elems_len as usize;
+        let k = items.len();
+        let new_len = len - n + k;
+        vm.reserve_elems(o, new_len);
+        let e = (*o).elems;
+        if k != n {
+            vm.store_elements(o, at + k, e.add(at + n), len - at - n);
+        }
+        for i in new_len..len {
+            *e.add(i) = Value::EMPTY;
+        }
+        vm.store_elements(o, at, items.as_ptr(), k);
+        (*o).elems_len = new_len as u32;
+    }
+}
+
 fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (_, v) = this_array(this, "slice")?;
-    let s = relative(int_arg(a, 0), v.len());
+    let o = array_object(this, "slice")?;
+    let len = unsafe { (*o).elems_len } as usize;
+    let s = relative(int_arg(a, 0), len);
     let e = match a.get(1) {
-        Some(x) if !x.is_undefined() => relative(int_arg(a, 1), v.len()),
-        _ => v.len(),
+        Some(x) if !x.is_undefined() => relative(int_arg(a, 1), len),
+        _ => len,
     };
-    new_array_of(vm, if s < e { &v[s..e] } else { &[] })
+    Ok(array_range(vm, o, s, e.saturating_sub(s)))
 }
 
 fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (_, mut v) = this_array(this, "concat")?;
+    let o = array_object(this, "concat")?;
+    let r = array_range(vm, o, 0, unsafe { (*o).elems_len } as usize);
+    let ro = as_object(r);
     for &x in a {
-        if is_class(x, Class::Array) {
-            v.extend(this_array(x, "concat")?.1);
+        let (from, n) = if is_class(x, Class::Array) {
+            let xo = as_object(x);
+            unsafe { ((*xo).elems.cast_const(), (*xo).elems_len as usize) }
         } else {
-            v.push(x);
+            (&raw const x, 1)
+        };
+        unsafe {
+            let len = (*ro).elems_len as usize;
+            vm.reserve_elems(ro, len + n);
+            vm.store_elements(ro, len, from, n);
+            (*ro).elems_len = (len + n) as u32;
         }
     }
-    new_array_of(vm, &v)
+    Ok(r)
 }
 
 fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let (o, v) = this_array(this, "shift")?;
-    let Some((&first, rest)) = v.split_first() else {
+    let o = array_object(this, "shift")?;
+    if unsafe { (*o).elems_len } == 0 {
         return Ok(Value::UNDEFINED);
-    };
-    set_elements(vm, o, rest)?;
-    Ok(first)
+    }
+    let first = unsafe { *(*o).elems };
+    splice_elements(vm, o, 0, 1, &[]);
+    Ok(if first == Value::EMPTY { Value::UNDEFINED } else { first })
 }
 
 fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, v) = this_array(this, "unshift")?;
-    let mut all = a.to_vec();
-    all.extend(v);
-    set_elements(vm, o, &all)?;
-    Ok(Value::from_i32(all.len() as i32))
+    let o = array_object(this, "unshift")?;
+    splice_elements(vm, o, 0, 0, a);
+    Ok(Value::from_i32(unsafe { (*o).elems_len } as i32))
 }
 
 /// `a.splice(start, count, …items)`: the removed elements.
 fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, mut v) = this_array(this, "splice")?;
-    let s = relative(int_arg(a, 0), v.len());
+    let o = array_object(this, "splice")?;
+    let len = unsafe { (*o).elems_len } as usize;
+    let s = relative(int_arg(a, 0), len);
     let n = match a.len() {
         0 => 0,
-        1 => v.len() - s,
-        _ => int_arg(a, 1).clamp(0.0, (v.len() - s) as f64) as usize,
+        1 => len - s,
+        _ => int_arg(a, 1).clamp(0.0, (len - s) as f64) as usize,
     };
-    let items = a.get(2..).unwrap_or(&[]);
-    let removed: Vec<Value> = v.splice(s..s + n, items.iter().copied()).collect();
-    set_elements(vm, o, &v)?;
-    new_array_of(vm, &removed)
+    let removed = array_range(vm, o, s, n);
+    splice_elements(vm, o, s, n, a.get(2..).unwrap_or(&[]));
+    Ok(removed)
 }
 
-fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let (o, mut v) = this_array(this, "reverse")?;
-    v.reverse();
-    set_elements(vm, o, &v)?;
+fn array_reverse(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let o = array_object(this, "reverse")?;
+    unsafe {
+        let e = (*o).elems;
+        let n = (*o).elems_len as usize;
+        if n > 1 {
+            std::slice::from_raw_parts_mut(e, n).reverse();
+            // The same values, in other cards.
+            for i in 0..n {
+                crate::heap::barrier(e.cast::<u8>().sub(8), e.add(i), *e.add(i));
+            }
+        }
+    }
     Ok(this)
 }
 

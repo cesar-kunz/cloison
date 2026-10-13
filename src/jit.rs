@@ -11543,9 +11543,14 @@ impl Lowering<'_> {
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
         // A closure with upvalues, likely made anew at each call of the
         // function making it (EarleyBoyer's `loop2`, made at each call of
-        // `sc_loop1_98`): any closure of its code is called directly.
-        // (Not for `new`, whose `this` comes from the closure's prototype.)
-        if i.op != Op::Construct && unsafe { !(&(*callee).upvalues).is_empty() } {
+        // `sc_loop1_98`), or one made more than once already (its
+        // `conf_set_adjoin`, without upvalues: 664,000 calls through the
+        // runtime, each a closure other than the one bound): any closure of
+        // its code is called directly. (Not for `new`, whose `this` comes
+        // from the closure's prototype.)
+        if i.op != Op::Construct
+            && unsafe { !(&(*callee).upvalues).is_empty() || (*callee).closures_made.get() > 1 }
+        {
             site.by_code = true;
             site.closure = callee as u64;
         }

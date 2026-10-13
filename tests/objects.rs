@@ -1891,8 +1891,9 @@ fn direct_calls_into_compiled_callees() {
     let (v, s) = jit(&src);
     assert_eq!(v, expected.to_string());
     // The callee version returns int32s: the result is checked to be one,
-    // and `total += f(…)` adds int32s.
-    assert!(s.iter().any(|n| n == "call_direct+check_acc_int"), "{s:?}");
+    // and `total += f(…)` adds int32s. (`f` and `g` are closures of one
+    // function: the call is bound to its code, `call_direct_code`.)
+    assert!(s.iter().any(|n| n.replace("_code", "") == "call_direct+check_acc_int"), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
 }
 
@@ -1907,7 +1908,7 @@ fn direct_calls_returning_doubles() {
     assert_eq!(v, expected.to_string());
     assert!(
         s.iter()
-            .any(|n| n == "call_direct+check_acc_num+unbox_num_acc"),
+            .any(|n| n.replace("_code", "") == "call_direct+check_acc_num+unbox_num_acc"),
         "{s:?}"
     );
 }
@@ -3083,8 +3084,9 @@ fn exits_in_direct_callees_finish_in_the_interpreter() {
     let (v, s) = jit(&src);
     assert_eq!(v, expected.to_string());
     // The call's result was a double then, failing the check that it was
-    // an int32: the call is compiled again, without a prediction.
-    assert!(s.iter().any(|n| n == "call_direct"), "{s:?}");
+    // an int32: the call is compiled again, without a prediction. (`f` and
+    // `g` are closures of one function: bound to its code.)
+    assert!(s.iter().any(|n| n.replace("_code", "") == "call_direct"), "{s:?}");
 }
 
 /// From i = 300 the callee is another function: the direct call's check of

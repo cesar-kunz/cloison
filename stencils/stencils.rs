@@ -148,6 +148,8 @@ unsafe extern "C" {
     fn toi_rt_instance_of();
     fn toi_rt_in();
     fn toi_rt_get_keyed();
+    fn toi_rt_get_named();
+    fn toi_rt_set_named();
     fn toi_rt_create_regexp();
     fn toi_rt_type_of();
     fn toi_rt_create_closure();
@@ -4221,6 +4223,35 @@ macro_rules! property_location {
                 exit!(s)
             }
             s.acc = Value::from_bits(r);
+            next!(s)
+        });
+        // `acc = o.name` and `o.name = acc` through the runtime
+        // (`jit::Prop::Runtime`: a site whose receivers the fast ones kept
+        // leaving for), the name (an `Atom`) in `imm64`; `acc` boxed, or
+        // (`_i`) an int32. Leave where they would throw or run code.
+        stencil!("get_named_rt_", loc!($loc); |s| {
+            let r = rt_call!(s, toi_rt_get_named, get!($loc, s), Value::from_bits(imm64()));
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
+        stencil!("set_named_rt_", loc!($loc); |s| {
+            let args = [get!($loc, s), Value::from_bits(imm64()), s.acc];
+            let r = rt_call!(s, toi_rt_set_named, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
+            next!(s)
+        });
+        stencil!("set_named_rt_i_", loc!($loc); |s| {
+            let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            let args = [get!($loc, s), Value::from_bits(imm64()), v];
+            let r = rt_call!(s, toi_rt_set_named, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
             next!(s)
         });
         keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);

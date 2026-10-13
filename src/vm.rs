@@ -1898,6 +1898,17 @@ impl Vm {
     /// object, with no accessor of that name on its chain (a store that
     /// runs no code). `None` where the interpreter must do it.
     pub(crate) fn set_named_plain(&mut self, obj: Value, key: Value, value: Value) -> Option<()> {
+        let Key::Name(a) = self.property_key(key) else {
+            return None;
+        };
+        self.set_named_rt(obj, a, value)
+    }
+
+    /// `obj.name = value` for compiled code's runtime path: on a plain
+    /// object or an array, not a prototype or the global object (stores
+    /// there move epochs compiled code relies on), and not through a
+    /// setter; else nothing (`None`: the interpreter stores).
+    pub(crate) fn set_named_rt(&mut self, obj: Value, name: Atom, value: Value) -> Option<()> {
         if !obj.is_cell() {
             return None;
         }
@@ -1910,13 +1921,26 @@ impl Vm {
                 return None;
             }
         }
-        let Key::Name(a) = self.property_key(key) else {
-            return None;
-        };
-        if self.accessor(o, a).is_some() {
+        if self.accessor(o, name).is_some() {
             return None;
         }
-        self.set(obj, a, value).ok()
+        self.set(obj, name, value).ok()
+    }
+
+    /// `obj.name` for compiled code's runtime path: `None` where it would
+    /// throw or call a bytecode getter (the interpreter does). A native
+    /// getter (a typed array's `byteLength`) is called.
+    pub(crate) fn get_named_rt(&mut self, obj: Value, name: Atom) -> Option<Value> {
+        if !obj.is_cell() {
+            return None;
+        }
+        if let Some(pair) = self.accessor(as_object(obj), name) {
+            let g = unsafe { *(*as_object(pair)).elems };
+            if g.is_cell() && unsafe { (*as_object(g)).class } != Class::Native {
+                return None;
+            }
+        }
+        self.get(obj, name).ok()
     }
 
     pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {

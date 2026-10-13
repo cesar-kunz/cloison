@@ -524,6 +524,29 @@ extern "C" fn toi_rt_set_keyed(args: Value, _: Value) -> u64 {
     u64::from(vm.set_keyed(o, key, v).is_ok())
 }
 
+/// `o.name` (`name` an `Atom`), or 0 where it would throw or call a
+/// bytecode getter (`get_named_rt` stencils).
+extern "C" fn toi_rt_get_named(o: Value, name: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    let name = crate::object::Atom(name.to_bits() as u32);
+    vm.get_named_rt(o, name).map_or(0, |v| v.to_bits())
+}
+
+/// `o.name = v` (`args`: `o`, `name` an `Atom`, `v`): 1, or 0 to leave
+/// (`set_named_rt` stencils). As `toi_rt_set_keyed`'s named stores: if
+/// the store changed what compiled code relies on (an epoch moved), leave;
+/// the interpreter stores again, the same.
+extern "C" fn toi_rt_set_named(args: Value, _: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
+    let name = crate::object::Atom(a[1].to_bits() as u32);
+    let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
+    u64::from(
+        vm.set_named_rt(a[0], name, a[2]).is_some()
+            && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before,
+    )
+}
+
 /// `a instanceof b`, or 0 where it would throw (the interpreter does).
 extern "C" fn toi_rt_instance_of(a: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
@@ -545,6 +568,8 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_mod" => toi_rt_mod as *const () as usize,
         "toi_rt_instance_of" => toi_rt_instance_of as *const () as usize,
         "toi_rt_get_keyed" => toi_rt_get_keyed as *const () as usize,
+        "toi_rt_get_named" => toi_rt_get_named as *const () as usize,
+        "toi_rt_set_named" => toi_rt_set_named as *const () as usize,
         "toi_rt_create_regexp" => toi_rt_create_regexp as *const () as usize,
         "toi_rt_type_of" => toi_rt_type_of as *const () as usize,
         "toi_rt_create_closure" => toi_rt_create_closure as *const () as usize,
@@ -4393,6 +4418,31 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 }
             }
         }
+        // A site that gave up on the stencils: through the runtime (a
+        // store may change shapes: exact ones become lower bounds, as after
+        // a call), the name an operand.
+        if prop == Prop::Runtime
+            && matches!(insn.op, Op::GetNamed | Op::SetNamed)
+            && let Some(fbs) = spec.feedback
+        {
+            let name = fbs[insn.ic_frame()].name(insn).0 as u64;
+            let sel = if load {
+                out.acc = Any;
+                Sel::new("get_named_rt", "", out)
+            } else {
+                let ext = |t: Ty| match t {
+                    Ty::Obj(x) => Ty::Ext(x),
+                    t => t,
+                };
+                out.regs.map(|_, t| ext(t));
+                out.acc = ext(out.acc);
+                Sel::new("set_named_rt", if st.acc == I32 { "i" } else { "" }, out)
+            };
+            return Sel {
+                ops: Some((0, name, 0)),
+                ..sel
+            };
+        }
         // Several shapes: one of them if the receiver's is known, else a
         // dispatch on the shape. A load's type is their fields' join; a
         // store's check, the same for all, goes before it.
@@ -5545,6 +5595,15 @@ fn stencil_for(
         ("get_keyed_rt", _) => {
             box_acc(&mut pre);
             cat!("get_keyed_rt_", loc)
+        }
+        ("get_named_rt", _) => cat!("get_named_rt_", loc),
+        ("set_named_rt", _) => {
+            if sel.case.is_empty() {
+                box_acc(&mut pre);
+                cat!("set_named_rt_", loc)
+            } else {
+                cat!("set_named_rt_", sel.case, "_", loc)
+            }
         }
         ("tget", _) => cat!("tget_", sel.case, "_", loc),
         // The key into r11 / x15 (`key_*`), where `tset` reads it.
@@ -8455,6 +8514,10 @@ struct VmState {
     /// Exits through a bail per entry; past [`MAX_BAIL_EXITS`] the entry is
     /// left to the interpreter.
     bail_exits: HashMap<usize, u32>,
+    /// Out of compilations (`spent`): call entries since, and those that
+    /// failed, exiting or fitting no version (see `JitFunction::late_miss`).
+    spent: bool,
+    late: (u32, u32),
     /// Exits at instructions compiled code doesn't run, other than calls
     /// (see `vm_finish`).
     bails: u32,
@@ -8543,6 +8606,8 @@ const HOT_HEAT: i64 = 1_000;
 
 const MAX_PROPERTY_EXITS: u32 = 4;
 const MAX_BAIL_EXITS: u32 = 3;
+/// See `vm_finish`.
+const MAX_LATE_EXITS: u32 = 16;
 /// Compilations per function in VM frames, over the program's run.
 const MAX_VM_COMPILES: u32 = 32;
 
@@ -11203,6 +11268,7 @@ impl Lowering<'_> {
                         // (Any key: a name, a typed array's index, ….)
                         Op::GetKeyed if given_up => Prop::Runtime,
                         Op::SetKeyed if given_up => Prop::Runtime,
+                        Op::GetNamed | Op::SetNamed if given_up => Prop::Runtime,
                         _ if given_up && i.is_property() => {
                             i.bail = true;
                             Prop::None
@@ -12550,6 +12616,8 @@ impl JitFunction {
             property_exits: HashMap::default(),
             callee_exits: HashMap::default(),
             bail_exits: HashMap::default(),
+            spent: false,
+            late: (0, 0),
             bails: 0,
             no_entry: HashSet::default(),
             bad_results: 0,
@@ -12596,6 +12664,7 @@ impl JitFunction {
         let _compiling = Compiling::of(self.vm.as_ref().expect("a VM function").root);
         {
             let vm = self.vm.as_mut().expect("a VM function");
+            vm.late.0 += u32::from(vm.spent && pc == 0);
             // The common case, entering at every call: nothing to redo, and
             // a version that fits the live values, found without allocating.
             if !vm.dirty
@@ -12617,8 +12686,11 @@ impl JitFunction {
                 if vm.epoch != epoch || vm.field_epoch != field_epoch {
                     return None;
                 }
-                return unsafe { self.fitting_version(pc, acc, regs) }
-                    .and_then(|found| fits_stack(found, regs, stack_end));
+                let found = unsafe { self.fitting_version(pc, acc, regs) };
+                if found.is_none() && pc == 0 {
+                    self.late_miss(false);
+                }
+                return found.and_then(|found| fits_stack(found, regs, stack_end));
             }
             // First compile: hot right away if inlining is what hot code
             // would bring (see `inlining_pays`).
@@ -12768,6 +12840,7 @@ impl JitFunction {
             return Some((code.clone(), self.nregs));
         }
         self.stats.compiles += 1;
+        self.note_spent();
         let vm = self.vm.as_ref().unwrap();
         let mut code = JitCode::compile(
             &self.insns,
@@ -12867,6 +12940,33 @@ impl JitFunction {
     /// giving the entry up; at the check of a call's result, the call loses
     /// its prediction. Any exit makes the next entry lower the function
     /// again. Returns the exit's frame and bytecode offset.
+    /// Whether the function is out of compilations now (`VmState::spent`).
+    fn note_spent(&mut self) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.spent = self.stats.compiles >= max_compiles(vm.root_len);
+        }
+    }
+
+    /// Out of compilations, a call that failed: it found no version its
+    /// arguments fit, or it exited (`exit`). When one
+    /// call in four fails, and often, calls are left to the interpreter,
+    /// as after bails: each failure costs about what the call does.
+    /// TypeScript's `emitParensAndCommentsInPlace` exited 700,000 times at
+    /// accesses no lowering will give up on, and `preAssignScopes`, its
+    /// versions fitting few of the nodes it is called with, looked for one
+    /// 617,000 times. (Not for exits of a large function: zlib's `bb`
+    /// exits at half its calls, after its loops' work, +3% interpreted.)
+    fn late_miss(&mut self, exit: bool) {
+        let vm = self.vm.as_mut().unwrap();
+        if exit && vm.root_len >= COMPILE_SIZE {
+            return;
+        }
+        vm.late.1 += 1;
+        if vm.late.1 >= MAX_LATE_EXITS && vm.late.1 * 4 >= vm.late.0 {
+            vm.no_entry.insert(0);
+        }
+    }
+
     fn vm_finish(&mut self, code: &JitCode, pc: usize, record: usize) -> (usize, usize) {
         self.stats.exits += 1;
         let after_call = record & AFTER_CALL as usize != 0;
@@ -12916,6 +13016,11 @@ impl JitFunction {
         {
             return (frame, exit_pc);
         }
+        // Out of compilations: see `late_miss`.
+        if out_of_compiles && pc == 0 {
+            self.late_miss(true);
+        }
+        let vm = self.vm.as_mut().unwrap();
         if bad_result {
             // Compile the call without a prediction from now on; after a
             // second miss, every call (each miss costs a compilation:
@@ -13134,6 +13239,7 @@ impl JitFunction {
                     (actual.clone(), seen)
                 };
                 self.stats.compiles += 1;
+                self.note_spent();
                 let code = {
                     let (props, feedback, inline_base, direct_base, sites, root): (
                         &[Prop],

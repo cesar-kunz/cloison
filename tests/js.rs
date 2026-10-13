@@ -3045,3 +3045,29 @@ for (var i = 0; i < 2000; i++) s += enter(box, i % 2 == 0, new S3("abcd"));
 s + " " + box.a.n + " " + box.b.n;"#;
     assert_eq!(value(src), "22000 27334 54666");
 }
+
+/// Named loads and stores whose sites gave up on the stencils go through
+/// the runtime: a native getter (`byteLength`) is called there, an
+/// accessor of bytecode functions leaves to the interpreter.
+#[test]
+fn megamorphic_named_accesses_through_the_runtime() {
+    let src = r#"
+function mk(i) {
+  var o = {}; o["k" + (i % 13)] = i; o.v = i;
+  if (i % 17 == 0) Object.defineProperty(o, "w", { get: function () { return 1000; }, set: function (x) { this.v = -x; } });
+  return o;
+}
+var objs = []; for (var i = 0; i < 100; i++) objs.push(mk(i));
+var bufs = []; for (var i = 0; i < 9; i++) { var b = new Uint8Array(i + 1); b["p" + i] = i; bufs.push(b); }
+function run(a, b) {
+  var s = 0;
+  for (var j = 0; j < a.length; j++) { var o = a[j]; s += o.v; o.w = j; s += o.w; }
+  for (var j = 0; j < b.length; j++) s += b[j].byteLength;
+  return s;
+}
+var t = 0; for (var r = 0; r < 500; r++) t += run(objs, bufs);
+t;"#;
+    assert_eq!(value(src), "7590510");
+    let (_, s) = compiled(src, "run");
+    assert!(s.iter().any(|n| n.starts_with("get_named_rt")), "{s:?}");
+}

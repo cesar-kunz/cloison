@@ -2997,6 +2997,26 @@ fn copies(insn: &Insn, st: &TypeState, out: &mut TypeState, fixed_from: usize) {
     out.same = same;
 }
 
+/// Whether `insn` may leave compiled code: anything but moves and
+/// constants (see `Lowering::inline_poly`).
+fn may_exit_between(insn: &Insn) -> bool {
+    insn.bail
+        || insn.guard != 0
+        || !matches!(
+            insn.op,
+            Op::Nop
+                | Op::Ldar
+                | Op::Star
+                | Op::Mov
+                | Op::LdaSmi
+                | Op::LdaConstant
+                | Op::LdaUndefined
+                | Op::LdaNull
+                | Op::LdaTrue
+                | Op::LdaFalse
+        )
+}
+
 /// `Some(())` if `insn` may write `acc` (other than `Ldar`).
 fn writes_acc(insn: &Insn) -> Option<()> {
     let keeps = insn.alloc == 0
@@ -11993,7 +12013,11 @@ impl Lowering<'_> {
     /// callee goes, and the cases dispatch on the receiver's shape (a cell
     /// check, `shape_jne`, the last `shape_guard`): one dispatch, not two.
     /// The guards then exit to the load, which the interpreter redoes;
-    /// exits there count against this.
+    /// exits there count against this. Only if nothing between the load
+    /// and the call may exit: the interpreter would resume past the load,
+    /// with the callee's register never written (TypeScript's
+    /// `table.add(symbol.name, symbol)` left at `symbol.name` and called
+    /// what the register held before).
     fn inline_poly(
         &mut self,
         frame: usize,
@@ -12012,6 +12036,7 @@ impl Lowering<'_> {
         let mut fused = None;
         if dead
             && let Some((get, star)) = load
+            && self.out.insns[star + 1..].iter().all(|j| !may_exit_between(j))
             && shapes.iter().all(|&s| s != 0)
             && shapes
                 .iter()

@@ -11540,9 +11540,10 @@ impl Lowering<'_> {
     }
 
     /// Whether `fo` is a bytecode function whose calls are all compiled
-    /// inline: `push` and `pop` (see `Lowering::emit_frame`), or calls to
-    /// small leaves themselves, one level down (`Strength.weakestOf`
-    /// calling `weaker`, and `OrderedCollection.add` pushing, in
+    /// inline: `push`, `pop` and `new Array()` (see `Lowering::emit_frame`),
+    /// or calls and `new`s of small leaves themselves, one level down
+    /// (`Strength.weakestOf` calling `weaker`, `OrderedCollection.add`
+    /// pushing, and `Plan`'s constructor making an `OrderedCollection`, in
     /// DeltaBlue), at most [`MAX_LEAF_INSNS`] instructions with those
     /// leaves. Inlined past [`MAX_INLINE_DEPTH`], as it costs little code
     /// and inlines nothing further. Counting only its own instructions let
@@ -11569,13 +11570,11 @@ impl Lowering<'_> {
         if !d.0.iter().any(|j| j.is_call()) {
             return Some(n);
         }
-        if levels <= 1 {
-            return None;
-        }
         let fb = self.feedback(code);
-        let (push, pop) = unsafe { ((*self.state.vm).array_push_fn, (*self.state.vm).array_pop_fn) };
+        let vm = self.state.vm;
+        let (push, pop, array) = unsafe { ((*vm).array_push_fn, (*vm).array_pop_fn, (*vm).array_fn) };
         for j in d.0.iter().filter(|j| j.is_call()) {
-            if j.op != Op::Call || j.bail || j.forward {
+            if !matches!(j.op, Op::Call | Op::Construct) || j.bail || j.forward {
                 return None;
             }
             let ic = fb.ic(j.ic as usize);
@@ -11586,7 +11585,14 @@ impl Lowering<'_> {
             if !other.is_null() {
                 return None;
             }
-            if !((h == push && j.imm == 1) || (h == pop && j.imm == 0)) {
+            let inline = match j.op {
+                Op::Call => (h == push && j.imm == 1) || (h == pop && j.imm == 0),
+                _ => h == array && j.imm == 0,
+            };
+            if !inline {
+                if levels <= 1 {
+                    return None;
+                }
                 n += self.small_tree(h, levels - 1)?;
             }
         }

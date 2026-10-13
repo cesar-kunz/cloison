@@ -127,20 +127,28 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 let (pattern, flags, n) = regexp(&src[i..]).ok_or_else(|| err("unterminated regular expression"))?;
                 i += n;
                 Tok::RegExp(pattern, flags)
-            } else if let Some(ch) = src[i..].chars().next()
-                && is_ident_start(ch)
-            {
-                let n = src[i..]
-                    .char_indices()
-                    .find(|&(_, ch)| !is_ident_part(ch))
-                    .map_or(src.len() - i, |(n, _)| n);
+            } else if is_ascii_ident_part(c) || c >= 0x80 && src[i..].chars().next().is_some_and(is_ident_start) {
+                // ASCII a byte at a time, past it a character at a time.
+                let mut n = 1 + b[i + 1..].iter().take_while(|&&x| is_ascii_ident_part(x)).count();
+                if b.get(i + n).is_some_and(|&x| x >= 0x80) || c >= 0x80 {
+                    n = src[i..]
+                        .char_indices()
+                        .find(|&(_, ch)| !is_ident_part(ch))
+                        .map_or(src.len() - i, |(n, _)| n);
+                }
                 let word = &src[i..i + n];
                 i += n;
-                match KEYWORDS.iter().find(|&&k| k == word) {
+                // Keywords: lowercase, of 2 to 10 letters.
+                let keyword = if c.is_ascii_lowercase() && (2..=10).contains(&n) {
+                    KEYWORDS.iter().find(|&&k| k == word)
+                } else {
+                    None
+                };
+                match keyword {
                     Some(k) => Tok::Keyword(k),
                     None => Tok::Ident(word.to_string()),
                 }
-            } else if let Some(p) = PUNCTS.iter().find(|p| src[i..].starts_with(**p)) {
+            } else if let Some(p) = PUNCTS.iter().find(|p| p.as_bytes()[0] == c && src[i..].starts_with(**p)) {
                 i += p.len();
                 Tok::Punct(p)
             } else {
@@ -203,6 +211,12 @@ fn regexp(s: &str) -> Option<(String, String, usize)> {
 
 fn is_ident_start(c: char) -> bool {
     c.is_alphabetic() || c == '_' || c == '$'
+}
+
+/// An ASCII identifier character (a digit only past the first: digits
+/// begin numbers, lexed before identifiers).
+fn is_ascii_ident_part(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'$'
 }
 
 fn is_ident_part(c: char) -> bool {
@@ -312,6 +326,28 @@ mod tests {
                 Tok::Str("a\n".into()),
                 Tok::Punct(";"),
                 Tok::Ident("y".into()),
+                Tok::Eof,
+            ]
+        );
+    }
+
+    /// Identifiers: ASCII, past it, and words that only look like keywords.
+    #[test]
+    fn lexes_identifiers_and_keywords() {
+        let id = |s: &str| Tok::Ident(s.into());
+        assert_eq!(
+            toks("aé1 éb $x_9 _ instanceofx instanceof If in i iff"),
+            [
+                id("aé1"),
+                id("éb"),
+                id("$x_9"),
+                id("_"),
+                id("instanceofx"),
+                Tok::Keyword("instanceof"),
+                id("If"),
+                Tok::Keyword("in"),
+                id("i"),
+                id("iff"),
                 Tok::Eof,
             ]
         );

@@ -150,6 +150,9 @@ const SPARSE_GAP: usize = 1024;
 /// string's elements (no shape: the interpreter's hit path never takes it;
 /// compiled code reads them through the runtime).
 pub const BYTES_LOC: i32 = i32::MIN + 1;
+/// `Ic::loc` of a `SetKeyed` that stored at an array's length, growing it
+/// (`a[a.length] = v`): the JIT compiles it to append (`jit::Prop::Append`).
+pub const APPEND_LOC: i32 = i32::MIN + 2;
 const _: fn(u64, Value) -> bool = field_fits;
 
 /// The first `new` of `code` returned: shrink the capacity of its objects'

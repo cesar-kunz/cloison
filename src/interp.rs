@@ -1448,6 +1448,11 @@ handlers! {
                 }
                 next!(any, Op::SetKeyed.size(), acc)
             }
+            // An append, noted for the JIT (unless the site met bytes).
+            let ic = ic_at(regs, pc, 3);
+            if (*o).class == Class::Array && i == (*o).elems_len && (*ic).loc == 0 {
+                (*ic).loc = crate::vm::APPEND_LOC;
+            }
         }
         let r = with_top(regs, None, |vm| vm.set_keyed(*reg(pc, 1, regs), *reg(pc, 2, regs), acc));
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))

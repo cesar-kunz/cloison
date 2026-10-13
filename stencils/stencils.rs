@@ -4083,6 +4083,45 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // `a[k] = acc` where it appended before (`jit::Prop::Append`): as
+        // `set_keyed_`, at the array's length too while it has room (one
+        // more element); else through the runtime, leaving where that
+        // can't store.
+        stencil_slow!("set_keyed_ap_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            let key = load_imm(s.regs as *mut u8);
+            if is_array(s.tag, o) && s.tag.is_int32(key) {
+                let p = o.to_bits() as *mut u8;
+                let i = int(key) as u32;
+                let v = s.acc;
+                let fits = match **(p as *const *const u64) {
+                    0 => true,
+                    1 => s.tag.is_int32(v),
+                    2 => v.to_bits() & s.tag.to_bits() != 0,
+                    sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
+                };
+                let len = *(p.add(32) as *const u32);
+                if fits && (i < len || i == len && len < *(p.add(36) as *const u32)) {
+                    let at = (*(p.add(24) as *const *mut Value)).add(i as usize);
+                    *at = v;
+                    barrier(s.tag, (*(p.add(24) as *const *const u8)).sub(8), at, v);
+                    if i == len {
+                        *(p.add(32) as *mut u32) = len + 1;
+                    }
+                    next!(s)
+                }
+            }
+            slow!(s)
+        }; |s| {
+            core::arch::asm!(concat!("/* set_keyed_ap_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let key = load_imm(s.regs as *mut u8);
+            let args = [get!($loc, s), key, s.acc];
+            let r = rt_call!(s, toi_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
+            next!(s)
+        });
         set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "o_", true, is_array, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);

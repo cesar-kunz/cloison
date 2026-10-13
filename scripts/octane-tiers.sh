@@ -12,8 +12,8 @@
 #   scripts/octane-tiers.sh deltablue splay   # only these
 #
 # Runs go JOBS (default 8) at a time, each pinned to a core of its own,
-# the idlest ones (see scripts/quiet.sh): toi to one of the core's CPUs,
-# Node (whose compiler and collector run on threads of their own) to both.
+# the idlest ones (see scripts/quiet.sh), and to both of its CPUs: toi's
+# marker and Node's compiler and collector run on threads of their own.
 # Parallel runs share the L3 cache and memory bandwidth. A run past
 # TIMEOUT seconds (default 900) or giving no score counts as `-`.
 #
@@ -43,12 +43,12 @@ reps, jobs, timeout = int(reps), int(jobs), int(timeout)
 v8 = subprocess.run([node, "-p", "process.versions.v8"], capture_output=True, text=True).stdout.strip()
 runner = 'console.log(String(require("vm").runInThisContext(require("fs").readFileSync(process.argv[1], "utf8"))))'
 configs = [
-    ("toi interp", lambda f: (["target/release/toi", f], {"TOI_NO_JIT": "1"}), False),
-    ("toi JIT", lambda f: (["target/release/toi", f], {}), False),
-    ("Ignition", lambda f: ([node, "--max-opt=0", "-e", runner, f], {}), True),
-    ("Sparkplug", lambda f: ([node, "--max-opt=1", "-e", runner, f], {}), True),
-    ("Maglev", lambda f: ([node, "--max-opt=2", "-e", runner, f], {}), True),
-    ("Turbofan", lambda f: ([node, "-e", runner, f], {}), True),
+    ("toi interp", lambda f: (["target/release/toi", f], {"TOI_NO_JIT": "1"})),
+    ("toi JIT", lambda f: (["target/release/toi", f], {})),
+    ("Ignition", lambda f: ([node, "--max-opt=0", "-e", runner, f], {})),
+    ("Sparkplug", lambda f: ([node, "--max-opt=1", "-e", runner, f], {})),
+    ("Maglev", lambda f: ([node, "--max-opt=2", "-e", runner, f], {})),
+    ("Turbofan", lambda f: ([node, "-e", runner, f], {})),
 ]
 
 def siblings(c):
@@ -78,11 +78,11 @@ for c in idle_cores(jobs):
 
 def run(job):
     b, k, _ = job
-    name, cmd, whole_core = configs[k]
+    name, cmd = configs[k]
     argv, env = cmd(f"target/octane/{b}-score.js")
     core = pool.get()
     try:
-        cpus = ",".join(map(str, core if whole_core else core[:1]))
+        cpus = ",".join(map(str, core))
         try:
             r = subprocess.run(["taskset", "-c", cpus] + argv, capture_output=True, text=True,
                                timeout=timeout, env={**os.environ, **env})

@@ -8928,6 +8928,11 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
 #[allow(clippy::vec_box)]
 pub(crate) struct Snapshot {
     insns: Rc<[Insn]>,
+    /// The instruction an exit at (frame, bytecode offset) leaves at: the
+    /// first there, not a hoisted check (looked up at every exit, it took a
+    /// scan of thousands of instructions in TypeScript's inlining
+    /// functions).
+    exit_at: HashMap<(usize, usize), usize>,
     /// See [`Lowered::mats`].
     mats: HashMap<usize, Vec<Rc<Mat>>>,
     frames: Vec<InlineFrame>,
@@ -12527,6 +12532,7 @@ impl JitFunction {
             fbs: Vec::new(),
             snap: Rc::new(Snapshot {
                 insns: Rc::from([]),
+                exit_at: HashMap::default(),
                 mats: HashMap::default(),
                 frames: Vec::new(),
                 frame_regs: Vec::new(),
@@ -12686,8 +12692,15 @@ impl JitFunction {
                 .iter()
                 .map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent))
                 .collect();
+            let mut exit_at = HashMap::default();
+            for (k, i) in insns.iter().enumerate() {
+                if i.hoisted.is_none() {
+                    exit_at.entry((i.frame as usize, i.pc as usize)).or_insert(k);
+                }
+            }
             vm.snap = Rc::new(Snapshot {
                 insns,
+                exit_at,
                 mats: low.mats,
                 frames: low.frames,
                 frame_regs,
@@ -12936,11 +12949,7 @@ impl JitFunction {
             }
             return (frame, exit_pc);
         }
-        let k = snap
-            .insns
-            .iter()
-            .position(|i| i.frame as usize == frame && i.pc == exit_pc && i.hoisted.is_none())
-            .expect("an exit's instruction");
+        let k = *snap.exit_at.get(&(frame, exit_pc)).expect("an exit's instruction");
         let insn = snap.insns[k];
         let origin = (snap.frames[frame].code as usize, exit_pc);
         if insn.bail {

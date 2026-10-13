@@ -2988,3 +2988,21 @@ r.join(" ");"#;
         "3,4,5,6,7 5,6 0 2,3 1,4,5,6,7 0 1,4,x,y,5,6,7 6,7 1 object 5 1.5 4 9,8,2,3  5 1,2,3 false false 3 false 86887.5"
     );
 }
+
+/// Strings of other lengths are unequal without flattening them.
+#[test]
+fn string_equality_by_length_first() {
+    let src = r#"
+var r = [];
+var a = "ab"; a += "c";
+var b = "a"; b += "bc";
+var keys = ["abc", "abd", "ab", "abcd"];
+for (var i = 0; i < keys.length; i++) r.push(a === keys[i], a == keys[i], keys[i] !== b);
+r.push(a === b, a == b, "1" == 1, a == 3, "" == 0, null == "");
+r.push(String.fromCharCode(65), String.fromCharCode(66, 67), String.fromCharCode(65.7), String.fromCharCode(-1).charCodeAt(0));
+r.join(" ");"#;
+    assert_eq!(
+        value(src),
+        "true true false false false true false false true false false true true true true false true false A BC A 65535"
+    );
+}

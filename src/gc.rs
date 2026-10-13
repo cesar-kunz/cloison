@@ -1935,6 +1935,12 @@ impl Heap {
                         continue;
                     }
                     let n = cell_size(p as *const u8);
+                    // A dead cell a sweep hasn't reached: what it refers to
+                    // may be freed, its room young cells now.
+                    if self.gc.sweeping && m & COLOR != 0 && m & COLOR != self.color {
+                        p += n;
+                        continue;
+                    }
                     // A string's units in the cell: `elems` points to them (just
                     // past an empty string's header, at the next cell), and
                     // the trace doesn't follow it.

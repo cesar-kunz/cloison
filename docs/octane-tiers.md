@@ -28,6 +28,69 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 toi interp vs Ignition 0.74x (ahead on 9), Sparkplug 0.55x (ahead on 1), Maglev 0.09x (ahead on 0), Turbofan 0.08x (ahead on 0) (of 15; above 1x: toi scores higher)
 toi JIT vs Ignition 2.17x (ahead on 9), Sparkplug 1.62x (ahead on 8), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: toi scores higher)
 
+## 6ecaeba: toi on the whole core too
+
+From here on toi gets the whole core, as Node does: its marker thread had
+competed with the program for one CPU (splay +40%). Same code as 93e5b2d.
+
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 6ecaeba, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 6.76 26.82.
+
+| benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
+|---|---:|---:|---:|---:|---:|---:|
+| richards | 2754 | 32266 | 1689 | 1238 | 40558 | 51011 |
+| deltablue | 2728 | 58488 | 1374 | 2006 | 57133 | 116513 |
+| crypto | 2033 | 19371 | 1167 | 1979 | 36227 | 50323 |
+| raytrace | 6821 | 11100 | 5081 | 7311 | 83989 | 132458 |
+| earley-boyer | 8020 | 11815 | 8330 | 13547 | 62992 | 95730 |
+| regexp | 2796 | 3228 | 5201 | 6650 | 11523 | 11886 |
+| splay | 7142 | 7714 | 6636 | 6857 | 31812 | 34608 |
+| navier-stokes | 3288 | 7701 | 2182 | 3095 | 38173 | 47393 |
+| pdfjs | 8261 | 8597 | 10648 | 16284 | 67232 | 63155 |
+| mandreel | 4326 | 25594 | 2146 | 4830 | 55578 | 74056 |
+| gbemu | 13333 | 40996 | 9128 | 14365 | 120445 | 101209 |
+| code-load | 11840 | 11488 | 23801 | 44947 | 44854 | 44925 |
+| box2d | 7843 | 16479 | 2880 | 8068 | 114632 | 113319 |
+| zlib | 2922 | 22089 | 63646 | 109545 | 109466 | 109702 |
+| typescript | 26053 | 23200 | 19217 | 34221 | 80649 | 74783 |
+| **geomean** (15) | **5638** | **15621** | **5562** | **8608** | **54985** | **64713** |
+
+toi interp vs Ignition 1.01x (ahead on 10), Sparkplug 0.65x (ahead on 5), Maglev 0.10x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
+toi JIT vs Ignition 2.81x (ahead on 11), Sparkplug 1.81x (ahead on 9), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: toi scores higher)
+
+## Steps 0–5 of the plan
+
+Measured on the `-run.js` files against 6ecaeba (`perf stat`, medians of
+3 interleaved runs), cycles: pdfjs −23% (instructions −26%, page faults
+−42%), earley-boyer −15%, zlib −6%, gbemu −4% (page faults −45%), box2d
+−3%; DeltaBlue's instructions unchanged. The binary is 25 KB smaller;
+peak RSS from −5% (splay) to +9% (gbemu), from keeping freed large cells'
+blocks. The toi JIT's geomean went from 15621 to 16346 (+4.6%); V8's
+low tiers vary more between the two runs than toi does (load).
+
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi with steps 0–5 of the plan below, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 7.10 12.35.
+
+| benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
+|---|---:|---:|---:|---:|---:|---:|
+| richards | 2778 | 33724 | 2058 | 2743 | 40668 | 51308 |
+| deltablue | 2860 | 58951 | 2059 | 2804 | 57291 | 120738 |
+| crypto | 1977 | 19300 | 1521 | 2442 | 36493 | 50339 |
+| raytrace | 6935 | 10982 | 5175 | 7348 | 84285 | 132902 |
+| earley-boyer | 9030 | 14173 | 8428 | 13690 | 62194 | 96935 |
+| regexp | 2744 | 3188 | 5226 | 6668 | 11614 | 11851 |
+| splay | 7412 | 7480 | 6720 | 7283 | 32737 | 35231 |
+| navier-stokes | 3307 | 7934 | 2188 | 3104 | 38397 | 47441 |
+| pdfjs | 10719 | 11935 | 10688 | 16331 | 66163 | 60628 |
+| mandreel | 4323 | 25605 | 3354 | 4860 | 55716 | 72396 |
+| gbemu | 13551 | 42441 | 9559 | 14365 | 119729 | 107033 |
+| code-load | 11605 | 11279 | 45444 | 45023 | 44883 | 45102 |
+| box2d | 7843 | 16825 | 5627 | 8286 | 115487 | 112889 |
+| zlib | 3003 | 23777 | 109545 | 109623 | 109623 | 109702 |
+| typescript | 27175 | 24035 | 25199 | 34545 | 83941 | 74261 |
+| **geomean** (15) | **5834** | **16346** | **7045** | **9494** | **55264** | **64968** |
+
+toi interp vs Ignition 0.83x (ahead on 12), Sparkplug 0.61x (ahead on 4), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
+toi JIT vs Ignition 2.32x (ahead on 11), Sparkplug 1.72x (ahead on 10), Maglev 0.30x (ahead on 1), Turbofan 0.25x (ahead on 0) (of 15; above 1x: toi scores higher)
+
 ## Where the JIT gains little: findings and plan (at 93e5b2d)
 
 The JIT gains little over toi's interpreter on raytrace (1.8x), earley-boyer
@@ -143,3 +206,10 @@ regressions (`perf.sh --ab`).
 
 Order: 0–5 first (small and measured), then 6, the widest at medium
 effort, then 7–9, then 12 and 13.
+
+Done: 0–5 (see "Steps 0–5 of the plan" above). Step 4 measured smaller
+than in the investigation (typescript −1.6% instructions, box2d −1.1%).
+The barrier checker (`TOI_GC_CHECK_BARRIER`) also had a false positive
+on splay: while a sweep is pending, a dead old cell it hadn't reached
+held a stale pointer into memory already reused by young cells. The
+checker now skips cells of the old color while sweeping.

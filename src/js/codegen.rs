@@ -16,7 +16,7 @@
 //! opcode for: such programs are rejected with an error naming the
 //! construct.
 
-use std::collections::HashMap;
+use crate::jit::{HashMap, HashSet};
 
 use super::Error;
 use super::ast::*;
@@ -47,9 +47,10 @@ pub fn generate(p: &Program) -> Result<Module, Error> {
         }
     }
     let scopes = upvalues(p, &decls, &overflow);
+    let names = Default::default();
     let mut functions = Vec::with_capacity(p.functions.len());
     for i in 0..p.functions.len() {
-        functions.push(Gen::new(p, &decls, &overflow[i], &scopes, i).function()?);
+        functions.push(Gen::new(p, &decls, &overflow[i], &scopes, &names, i).function()?);
     }
     Ok(Module {
         functions,
@@ -180,8 +181,8 @@ fn references(f: &Function) -> Vec<&str> {
 
 /// Whether call `f(args)` is `g.apply(x, arguments)`.
 fn apply_arguments(f: &Expr, args: &[Expr]) -> bool {
-    matches!(&f.kind, ExprKind::Member(_, m) if m == "apply")
-        && matches!(args, [_, a] if matches!(&a.kind, ExprKind::Ident(n) if n == "arguments"))
+    matches!(&f.kind, ExprKind::Member(_, m) if &**m == "apply")
+        && matches!(args, [_, a] if matches!(&a.kind, ExprKind::Ident(n) if &**n == "arguments"))
 }
 
 /// The names function `f`'s own code refers to, or with `forwarded`, the
@@ -309,7 +310,7 @@ fn explicit_declarations(p: &Program, f: usize) -> Vec<&str> {
         }
     }
     let f = &p.functions[f];
-    let mut out: Vec<&str> = f.params.iter().map(String::as_str).collect();
+    let mut out: Vec<&str> = f.params.iter().map(|p| &**p).collect();
     for s in &f.body {
         stmt(s, p, &mut out);
     }
@@ -343,7 +344,7 @@ fn arguments_object(p: &Program, f: usize) -> bool {
     let func = &p.functions[f];
     func.uses_arguments
         && func.parent.is_some()
-        && !func.params.iter().any(|n| n == "arguments")
+        && !func.params.iter().any(|n| &**n == "arguments")
         && !forwards_arguments(p, f)
 }
 
@@ -391,7 +392,7 @@ fn hoisted(s: &Stmt, out: &mut Vec<usize>) {
 /// The statements of a `try`'s blocks.
 fn try_blocks<'a>(
     b: &'a [Stmt],
-    c: &'a Option<(String, Vec<Stmt>)>,
+    c: &'a Option<(Name, Vec<Stmt>)>,
     f: &'a Option<Vec<Stmt>>,
 ) -> impl Iterator<Item = &'a Stmt> {
     b.iter()
@@ -418,9 +419,9 @@ fn assigns(e: &Expr, name: &str) -> bool {
     use ExprKind::*;
     match &e.kind {
         Assign(_, t, v) => {
-            matches!(&t.kind, Ident(n) if n == name) || assigns(t, name) || assigns(v, name)
+            matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name) || assigns(v, name)
         }
-        Update(t, ..) => matches!(&t.kind, Ident(n) if n == name) || assigns(t, name),
+        Update(t, ..) => matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name),
         Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) | RegExp(..) => {
             false
         }
@@ -551,7 +552,7 @@ struct LabelInfo {
 
 /// A statement `break` or `continue` can leave.
 struct Target {
-    labels: Vec<String>,
+    labels: Vec<Name>,
     brk: L,
     /// For loops.
     cont: Option<L>,
@@ -559,11 +560,32 @@ struct Target {
     breakable: bool,
 }
 
+/// A set of registers.
+#[derive(Default, Clone, Copy)]
+struct RegBits([u64; 4]);
+
+impl RegBits {
+    fn one(r: u8) -> RegBits {
+        let mut s = RegBits::default();
+        s.insert(r);
+        s
+    }
+    fn insert(&mut self, r: u8) {
+        self.0[r as usize / 64] |= 1 << (r % 64);
+    }
+    fn remove(&mut self, r: u8) {
+        self.0[r as usize / 64] &= !(1 << (r % 64));
+    }
+    fn contains(&self, r: u8) -> bool {
+        self.0[r as usize / 64] & 1 << (r % 64) != 0
+    }
+}
+
 /// What the accumulator is known to hold, within a basic block.
 #[derive(Default, Clone)]
 struct Acc {
     /// Registers holding the same value.
-    regs: Vec<u8>,
+    regs: RegBits,
     smi: Option<i32>,
 }
 
@@ -575,7 +597,9 @@ struct Gen<'a> {
     f: &'a Function,
     asm: Assembler,
     labels: Vec<LabelInfo>,
-    ics: Vec<String>,
+    ics: Vec<Name>,
+    /// The names of the module's caches, each once (see [`Gen::ic`]).
+    names: &'a std::cell::RefCell<HashSet<Name>>,
     closures: Vec<usize>,
     constants: Vec<Constant>,
     nregs: usize,
@@ -590,7 +614,7 @@ struct Gen<'a> {
     reachable: bool,
     targets: Vec<Target>,
     /// Labels for the statement being compiled (`a: for …`).
-    pending_labels: Vec<String>,
+    pending_labels: Vec<Name>,
     /// Statements compiled at the end of the function: the `then` branches
     /// of `if`s whose condition can only jump when true.
     deferred: Vec<(L, &'a Stmt)>,
@@ -620,12 +644,13 @@ impl<'a> Gen<'a> {
         decls: &'a [Vec<&'a str>],
         overflow: &'a [&'a str],
         scopes: &'a Scopes<'a>,
+        names: &'a std::cell::RefCell<HashSet<Name>>,
         index: usize,
     ) -> Self {
         let f = &p.functions[index];
         // The script's names are globals.
         let locals: HashMap<&str, u8> = if index == 0 {
-            HashMap::new()
+            HashMap::default()
         } else {
             decls[index][..decls[index].len() - overflow.len()]
                 .iter()
@@ -643,12 +668,13 @@ impl<'a> Gen<'a> {
             asm: Assembler::new(),
             labels: Vec::new(),
             ics: Vec::new(),
+            names,
             closures: Vec::new(),
             constants: Vec::new(),
             nregs: 1 + f.params.len(),
             locals,
             overflow,
-            shared_ics: HashMap::new(),
+            shared_ics: HashMap::default(),
             temp,
             acc: Acc::default(),
             reachable: true,
@@ -684,7 +710,7 @@ impl<'a> Gen<'a> {
         }
         // (Not if a parameter or variable of the function has the name.)
         if let Some(n) = own_name(self.p, self.index)
-            && !self.f.params.iter().any(|p| p == n)
+            && !self.f.params.iter().any(|p| &**p == n)
             && !explicit_declarations(self.p, self.index).contains(&n)
             && self.locals.contains_key(n)
         {
@@ -746,7 +772,7 @@ impl<'a> Gen<'a> {
         }
         let name = match (self.index, &self.f.name) {
             (0, _) => "<script>".to_string(),
-            (_, Some(n)) => n.clone(),
+            (_, Some(n)) => n.to_string(),
             (_, None) => "<anonymous>".to_string(),
         };
         let upvalues = self.upvalue_sources();
@@ -791,12 +817,12 @@ impl<'a> Gen<'a> {
         fn walk<'a>(s: &'a Stmt, init: &mut Vec<&'a str>, bare: &mut Vec<&'a str>) {
             // An initializer reading its own variable (`var p = p || {}`)
             // reads it declared, before it's assigned.
-            let mut decl = |ds: &'a [(String, Option<Expr>)]| {
+            let mut decl = |ds: &'a [(Name, Option<Expr>)]| {
                 for (n, e) in ds {
                     let reads_itself = e.as_ref().is_some_and(|e| {
                         let mut refs = Vec::new();
                         expr_refs(e, &mut refs);
-                        refs.contains(&n.as_str())
+                        refs.contains(&&**n)
                     });
                     if e.is_some() && !reads_itself { &mut *init } else { &mut *bare }.push(n);
                 }
@@ -879,21 +905,21 @@ impl<'a> Gen<'a> {
         match (op, args) {
             (Op::Ldar, &[Arg::Reg(r)]) => {
                 self.acc = Acc {
-                    regs: vec![r],
+                    regs: RegBits::one(r),
                     smi: None,
                 }
             }
             (Op::LdaSmi, &[Arg::Imm(k)]) => {
                 self.acc = Acc {
-                    regs: Vec::new(),
+                    regs: RegBits::default(),
                     smi: Some(k),
                 }
             }
-            (Op::Star, &[Arg::Reg(r)]) => self.acc.regs.push(r),
+            (Op::Star, &[Arg::Reg(r)]) => self.acc.regs.insert(r),
             (Op::Mov, &[Arg::Reg(a), Arg::Reg(b)]) => {
-                self.acc.regs.retain(|&x| x != b);
-                if self.acc.regs.contains(&a) {
-                    self.acc.regs.push(b);
+                self.acc.regs.remove(b);
+                if self.acc.regs.contains(a) {
+                    self.acc.regs.insert(b);
                 }
             }
             (Op::Jump | Op::Return | Op::Throw, _) => self.reachable = false,
@@ -921,15 +947,15 @@ impl<'a> Gen<'a> {
     }
 
     fn ldar(&mut self, r: u8) {
-        if !self.acc.regs.contains(&r) {
+        if !self.acc.regs.contains(r) {
             self.emit(Op::Ldar, &[Arg::Reg(r)]);
         }
     }
 
     fn star(&mut self, r: u8) {
-        if !self.acc.regs.contains(&r) {
+        if !self.acc.regs.contains(r) {
             // `r` changes: the accumulator holds its new value.
-            self.acc.regs.retain(|&x| x != r);
+            self.acc.regs.remove(r);
             self.emit(Op::Star, &[Arg::Reg(r)]);
         }
     }
@@ -942,7 +968,7 @@ impl<'a> Gen<'a> {
 
     fn mov(&mut self, from: u8, to: u8) {
         if from == to {
-        } else if self.acc.regs.contains(&from) {
+        } else if self.acc.regs.contains(from) {
             self.star(to);
         } else {
             self.emit(Op::Mov, &[Arg::Reg(from), Arg::Reg(to)]);
@@ -960,7 +986,18 @@ impl<'a> Gen<'a> {
             }
             self.shared_ics.insert(key, self.ics.len() as u16);
         }
-        self.ics.push(name.to_string());
+        let name = {
+            let mut names = self.names.borrow_mut();
+            match names.get(name) {
+                Some(n) => n.clone(),
+                None => {
+                    let n: Name = name.into();
+                    names.insert(n.clone());
+                    n
+                }
+            }
+        };
+        self.ics.push(name);
         Arg::Index(self.ics.len() as u16 - 1)
     }
 
@@ -983,6 +1020,23 @@ impl<'a> Gen<'a> {
     fn constant(&mut self, c: Constant) {
         let i = self.const_index(c);
         self.emit(Op::LdaConstant, &[Arg::Index(i)]);
+    }
+
+    /// `LdaConstant` of string `s`.
+    fn string(&mut self, s: &str) {
+        let i = self.const_str(s);
+        self.emit(Op::LdaConstant, &[Arg::Index(i)]);
+    }
+
+    /// The index of string constant `s` (made only if new).
+    fn const_str(&mut self, s: &str) -> u16 {
+        let i = (self.constants.iter())
+            .position(|c| matches!(c, Constant::String(x) if x == s))
+            .unwrap_or_else(|| {
+                self.constants.push(Constant::String(s.to_string()));
+                self.constants.len() - 1
+            });
+        i as u16
     }
 
     /// The index of constant `c` (equal ones shared).
@@ -1086,7 +1140,7 @@ impl<'a> Gen<'a> {
     fn try_stmt(
         &mut self,
         block: &'a [Stmt],
-        catch: &'a Option<(String, Vec<Stmt>)>,
+        catch: &'a Option<(Name, Vec<Stmt>)>,
         finally: &'a Option<Vec<Stmt>>,
         pos: Pos,
     ) -> R<()> {
@@ -1291,7 +1345,7 @@ impl<'a> Gen<'a> {
     fn local(&self, e: &Expr) -> Option<u8> {
         match &e.kind {
             ExprKind::This => Some(0),
-            ExprKind::Ident(n) => self.locals.get(n.as_str()).copied(),
+            ExprKind::Ident(n) => self.locals.get(&**n).copied(),
             _ => None,
         }
     }
@@ -1331,9 +1385,9 @@ impl<'a> Gen<'a> {
             ExprKind::This => return Ok(0),
             ExprKind::Ident(n) => {
                 // (A captured one may change in any call, through a closure.)
-                if let Some(&r) = self.locals.get(n.as_str())
+                if let Some(&r) = self.locals.get(&**n)
                     && !later.iter().any(|l| assigns(l, n))
-                    && !self.scopes.captured[self.index].contains(&n.as_str())
+                    && !self.scopes.captured[self.index].contains(&&**n)
                 {
                     return Ok(r);
                 }
@@ -1383,7 +1437,7 @@ impl<'a> Gen<'a> {
                 let Num(v) = x.kind else { unreachable!() };
                 self.constant(Constant::Number(-v))
             }
-            Str(s) => self.constant(Constant::String(s.clone())),
+            Str(s) => self.string(s),
             Bool(true) => self.emit(Op::LdaTrue, &[]),
             Bool(false) => self.emit(Op::LdaFalse, &[]),
             Null => self.emit(Op::LdaNull, &[]),
@@ -1425,7 +1479,7 @@ impl<'a> Gen<'a> {
             // stored in order (a later duplicate wins).
             Object(props) => {
                 // `__proto__:` sets the prototype, not a property.
-                if props.iter().any(|(k, _)| k == "__proto__") {
+                if props.iter().any(|(k, _)| &**k == "__proto__") {
                     return unsupported(e.pos, "the key `__proto__` in an object literal");
                 }
                 // An index key is an element (`o[1]` reads it), stored as
@@ -1460,7 +1514,7 @@ impl<'a> Gen<'a> {
                             None => {
                                 if let Accessor(set, f) = v.kind {
                                     self.closure(f);
-                                    let k = self.const_index(Constant::String(name.clone()));
+                                    let k = self.const_str(name);
                                     let kind = u8::from(set);
                                     self.emit(
                                         Op::DefineAccessor,
@@ -1480,8 +1534,8 @@ impl<'a> Gen<'a> {
             Function(i) => self.closure(*i),
             Accessor(..) => unreachable!("the parser makes them object literal values only"),
             RegExp(p, f) => {
-                let p = self.const_index(Constant::String(p.clone()));
-                let f = self.const_index(Constant::String(f.clone()));
+                let p = self.const_str(p);
+                let f = self.const_str(f);
                 self.emit(Op::CreateRegExp, &[Arg::Index(p), Arg::Index(f)]);
             }
             Member(o, name) => {
@@ -1508,7 +1562,7 @@ impl<'a> Gen<'a> {
                 Member(o, name) => {
                     let mark = self.temp;
                     let r = self.reg(o, &[])?;
-                    self.constant(Constant::String(name.clone()));
+                    self.string(name);
                     self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
                     self.temp = mark;
                 }
@@ -1521,7 +1575,7 @@ impl<'a> Gen<'a> {
                 }
                 Ident(n) => match self.resolve(n, x.pos)? {
                     Var::Global => {
-                        self.constant(Constant::String(n.clone()));
+                        self.string(n);
                         self.emit(Op::DeleteGlobal, &[]);
                     }
                     _ => self.emit(Op::LdaFalse, &[]),
@@ -1624,7 +1678,7 @@ impl<'a> Gen<'a> {
             ExprKind::Null => Some(Op::TestNull),
             // `undefined` names the global (it can't be reassigned, but a
             // local may shadow it).
-            ExprKind::Ident(n) if n == "undefined" => Some(Op::TestUndefined),
+            ExprKind::Ident(n) if &**n == "undefined" => Some(Op::TestUndefined),
             _ => None,
         };
         let (x, c) = match (constant(l), constant(r)) {
@@ -2177,7 +2231,7 @@ impl<'a> Gen<'a> {
     /// falling into the next.
     fn switch(
         &mut self,
-        labels: Vec<String>,
+        labels: Vec<Name>,
         d: &Expr,
         cases: &'a [(Option<Expr>, Vec<Stmt>)],
     ) -> R<()> {
@@ -2238,7 +2292,7 @@ impl<'a> Gen<'a> {
     /// test: keys.length > i, back to body; break:`.
     fn for_in(
         &mut self,
-        labels: Vec<String>,
+        labels: Vec<Name>,
         name: &str,
         object: &Expr,
         body: &'a Stmt,
@@ -2277,7 +2331,7 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    fn var_decls(&mut self, ds: &[(String, Option<Expr>)]) -> R<()> {
+    fn var_decls(&mut self, ds: &[(Name, Option<Expr>)]) -> R<()> {
         for (name, init) in ds {
             if let Some(e) = init {
                 self.value(e)?;
@@ -2291,7 +2345,7 @@ impl<'a> Gen<'a> {
     /// jumping back to body; break:`.
     fn looping(
         &mut self,
-        labels: Vec<String>,
+        labels: Vec<Name>,
         test: Option<&Expr>,
         update: Option<&Expr>,
         body: &'a Stmt,

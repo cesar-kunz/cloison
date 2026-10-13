@@ -112,7 +112,7 @@ impl Parser<'_> {
         }
     }
 
-    fn ident(&mut self) -> R<String> {
+    fn ident(&mut self) -> R<Name> {
         match self.peek() {
             Tok::Ident(_) => match self.bump() {
                 Tok::Ident(s) => Ok(s),
@@ -123,11 +123,11 @@ impl Parser<'_> {
     }
 
     /// A property name after `.`, where reserved words are allowed.
-    fn property_name(&mut self) -> R<String> {
+    fn property_name(&mut self) -> R<Name> {
         let start = self.i;
         match self.bump() {
             Tok::Ident(s) => Ok(s),
-            Tok::Keyword(k) => Ok(k.to_string()),
+            Tok::Keyword(k) => Ok(k.into()),
             _ => {
                 self.i = start;
                 self.err("expected a property name")
@@ -305,7 +305,7 @@ impl Parser<'_> {
         Ok(body)
     }
 
-    fn var_decls(&mut self, no_in: bool) -> R<Vec<(String, Option<Expr>)>> {
+    fn var_decls(&mut self, no_in: bool) -> R<Vec<(Name, Option<Expr>)>> {
         let mut decls = Vec::new();
         loop {
             let name = self.ident()?;
@@ -366,7 +366,7 @@ impl Parser<'_> {
         })
     }
 
-    fn for_in_rest(&mut self, var: bool, name: String) -> R<StmtKind> {
+    fn for_in_rest(&mut self, var: bool, name: Name) -> R<StmtKind> {
         let object = self.expression(false)?;
         self.expect(")")?;
         let body = Box::new(self.statement()?);
@@ -457,7 +457,7 @@ impl Parser<'_> {
         if let ExprKind::Function(i) = e.kind
             && self.functions[i].name.is_none()
         {
-            self.functions[i].name = Some(name.to_string());
+            self.functions[i].name = Some(name.into());
         }
     }
 
@@ -695,7 +695,7 @@ impl Parser<'_> {
             Tok::Num(v) => ExprKind::Num(v),
             Tok::Str(s) => ExprKind::Str(s),
             Tok::Ident(s) => {
-                if s == "arguments" {
+                if &*s == "arguments" {
                     self.functions[self.current].uses_arguments = true;
                 }
                 ExprKind::Ident(s)
@@ -724,32 +724,34 @@ impl Parser<'_> {
                 ExprKind::Array(elems)
             }
             Tok::Punct("{") => {
-                let mut props: Vec<(String, Expr)> = Vec::new();
+                let mut props: Vec<(Name, Expr)> = Vec::new();
                 while !self.eat("}") {
                     let key_start = self.i;
-                    let key = match self.bump() {
-                        Tok::Ident(s) | Tok::Str(s) => s,
-                        Tok::Keyword(k) => k.to_string(),
-                        Tok::Num(v) => super::number_to_string(v),
+                    let key: Name = match self.bump() {
+                        Tok::Ident(s) => s,
+                        Tok::Str(s) => s.into(),
+                        Tok::Keyword(k) => k.into(),
+                        Tok::Num(v) => super::number_to_string(v).into(),
                         _ => {
                             self.i = key_start;
                             return self.err("expected a property name");
                         }
                     };
                     // `get k() {…}` / `set k(v) {…}`.
-                    if matches!(key.as_str(), "get" | "set") && !self.is(":") {
+                    if matches!(&*key, "get" | "set") && !self.is(":") {
                         let name_at = self.i;
-                        let name = match self.bump() {
-                            Tok::Ident(s) | Tok::Str(s) => s,
-                            Tok::Keyword(k) => k.to_string(),
-                            Tok::Num(v) => super::number_to_string(v),
+                        let name: Name = match self.bump() {
+                            Tok::Ident(s) => s,
+                            Tok::Str(s) => s.into(),
+                            Tok::Keyword(k) => k.into(),
+                            Tok::Num(v) => super::number_to_string(v).into(),
                             _ => {
                                 self.i = name_at;
                                 return self.err("expected a property name");
                             }
                         };
                         let f = self.function(false, pos)?;
-                        let kind = ExprKind::Accessor(key == "set", f);
+                        let kind = ExprKind::Accessor(&*key == "set", f);
                         props.push((name, Expr { kind, pos }));
                         if !self.is("}") {
                             self.expect(",")?;
@@ -868,7 +870,7 @@ mod tests {
         fn s(e: &Expr) -> String {
             match &e.kind {
                 ExprKind::Num(v) => format!("{v}"),
-                ExprKind::Ident(n) => n.clone(),
+                ExprKind::Ident(n) => n.to_string(),
                 ExprKind::Binary(op, l, r) => format!("({} {} {})", s(l), op.symbol(), s(r)),
                 ExprKind::Logical(and, l, r) => {
                     format!("({} {} {})", s(l), if *and { "&&" } else { "||" }, s(r))
@@ -959,7 +961,7 @@ mod tests {
         );
         let parents: Vec<_> = p.functions.iter().map(|f| f.parent).collect();
         assert_eq!(parents, [None, Some(0), Some(1), Some(1), Some(0), Some(4)]);
-        assert_eq!(p.functions[1].params, ["a", "b"]);
+        assert_eq!(p.functions[1].params, ["a".into(), "b".into()]);
         assert!(p.functions[2].declaration && !p.functions[3].declaration);
     }
 
@@ -972,7 +974,7 @@ mod tests {
         assert!(
             matches!(&b[0].kind, StmtKind::For { init: Some(ForInit::Var(d)), .. } if d.len() == 2)
         );
-        assert!(matches!(&b[1].kind, StmtKind::ForIn { var: true, name, .. } if name == "p"));
+        assert!(matches!(&b[1].kind, StmtKind::ForIn { var: true, name, .. } if &**name == "p"));
         assert!(matches!(&b[2].kind, StmtKind::ForIn { var: false, .. }));
     }
 

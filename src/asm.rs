@@ -41,7 +41,7 @@ pub struct FunctionDef {
     pub nregs: u32,
     pub code: Vec<u8>,
     /// The property name of each inline-cache slot.
-    pub ics: Vec<String>,
+    pub ics: Vec<std::rc::Rc<str>>,
     /// Module function index of each nested function (`CreateClosure`'s
     /// operand indexes this).
     pub closures: Vec<usize>,
@@ -196,7 +196,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
     for b in &blocks {
         let mut a = Assembler::new();
         let mut labels: HashMap<String, (Label, bool)> = HashMap::new();
-        let mut ics: Vec<String> = Vec::new();
+        let mut ics: Vec<std::rc::Rc<str>> = Vec::new();
         let mut closures: Vec<usize> = Vec::new();
         let mut constants: Vec<Constant> = Vec::new();
         let mut nregs = 1 + b.params as usize;
@@ -288,7 +288,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
                         if !is_ident(t) {
                             return Err(err(format!("expected a property name, got `{t}`")));
                         }
-                        ics.push(t.to_string());
+                        ics.push(t.into());
                         Arg::Index(
                             u16::try_from(ics.len() - 1)
                                 .map_err(|_| err("too many inline caches".into()))?,
@@ -432,7 +432,7 @@ pub fn disassemble(m: &Module) -> String {
                         let off = i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
                         args.push(label((pc as i64 + off as i64) as usize));
                     }
-                    Operand::Ic => args.push(f.ics[u16_at()].clone()),
+                    Operand::Ic => args.push(f.ics[u16_at()].to_string()),
                     Operand::Fn => args.push(names[f.closures[u16_at()]].clone()),
                     Operand::Const => args.push(f.constants[u16_at()].text()),
                     Operand::AutoIc => {}
@@ -492,7 +492,7 @@ mod tests {
         let f = &m.functions[1];
         assert_eq!((f.name.as_str(), f.nparams, f.nregs), ("f", 2, 7));
         // The call has an implicit cache slot.
-        assert_eq!(f.ics, ["x", "[]"]);
+        assert_eq!(f.ics, ["x".into(), "[]".into()]);
         assert_eq!(m.functions[m.script].closures, [1]);
         assert_eq!(f.code[6], Op::JumpIfLessSmiLoop as u8);
     }

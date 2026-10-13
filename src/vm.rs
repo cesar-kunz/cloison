@@ -422,7 +422,7 @@ pub struct Vm {
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
-    declared: std::collections::HashSet<Atom>,
+    declared: crate::jit::HashSet<Atom>,
     /// `Function.prototype.bind`'s JS helper, once made.
     pub(crate) bind_helper: Value,
     /// Compiled regular expressions, by pattern and flags (a literal makes
@@ -2573,6 +2573,8 @@ impl Vm {
             .iter()
             .zip(recursive)
             .map(|(f, recursive)| {
+                let scan = Scan::of(f);
+                let interpreted = !f.handlers.is_empty() || scan.callee;
                 let ics: Vec<UnsafeCell<[Ic; IC_WAYS]>> = f
                     .ics
                     .iter()
@@ -2593,7 +2595,8 @@ impl Vm {
                     name: f.name.clone(),
                     bytecode: {
                         let mut b = f.code.clone();
-                        if std::env::var_os("TOI_NO_QUICKEN").is_none() {
+                        static QUICKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                        if *QUICKEN.get_or_init(|| std::env::var_os("TOI_NO_QUICKEN").is_none()) {
                             crate::bytecode::quicken(&mut b);
                         }
                         b
@@ -2606,7 +2609,7 @@ impl Vm {
                     constants,
                     handlers: f.handlers.clone().into_boxed_slice(),
                     upvalues: f.upvalues.clone().into_boxed_slice(),
-                    interpreted: interpreted(f),
+                    interpreted,
                     field_deps: Cell::new(0),
                     ic_misses: Cell::new(0),
                     native: None,
@@ -2619,14 +2622,14 @@ impl Vm {
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_interpret: Cell::new(false),
                     closures_made: Cell::new(0),
-                    calls_left: Cell::new(match (has_loop(f), recursive || large(f)) {
-                        _ if interpreted(f) => i32::MAX,
-                        _ if f.captures && ops(f).count() > CAPTURING_ENTRY_SIZE => i32::MAX,
+                    calls_left: Cell::new(match (scan.has_loop, recursive || scan.ops >= ENTRY_COMPILE_SIZE) {
+                        _ if interpreted => i32::MAX,
+                        _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                         (true, _) => self.tier_calls,
                         (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
                         (false, false) => i32::MAX,
                     }),
-                    loop_budget: Cell::new(if !interpreted(f) {
+                    loop_budget: Cell::new(if !interpreted {
                         self.frame_budget
                     } else {
                         i64::MAX
@@ -2783,30 +2786,43 @@ impl Vm {
     }
 }
 
-/// Whether calls to a function should enter its compiled code once it is
-/// hot: if it has a loop (whose back-edge budget restarts with each frame,
-/// so a short loop in a function called often never tiers up by itself),
-/// or at least [`ENTRY_COMPILE_SIZE`] instructions ([`large`]), or if it
-/// looks recursive (see [`recursive_functions`]): its compiled code can
-/// then call itself, or the functions it recurses through, directly.
-/// Entering compiled code costs a round trip through the driver, which a
-/// small loop-free function doesn't win back; when compiled code calls it,
-/// it is inlined instead. A loop-free one is entered after
-/// [`LOOP_FREE_CALLS`] times as many calls: compiled sooner, its callers'
-/// feedback is still growing and it gets compiled again (91: f and g
-/// three and two times; DeltaBlue's methods).
-fn has_loop(f: &crate::asm::FunctionDef) -> bool {
-    ops(f).any(|op| op.is_loop())
+
+/// What `load` needs of a function's code, in one pass: whether it has a
+/// loop ([`Scan::has_loop`]), whether it reads `arguments.callee` (see
+/// `Code::interpreted`), and its instruction count (large: see
+/// [`ENTRY_COMPILE_SIZE`]).
+struct Scan {
+    /// Whether calls to a function should enter its compiled code once it is
+    /// hot: if it has a loop (whose back-edge budget restarts with each frame,
+    /// so a short loop in a function called often never tiers up by itself),
+    /// or at least [`ENTRY_COMPILE_SIZE`] instructions ([`Scan::ops`]), or if it
+    /// looks recursive (see [`recursive_functions`]): its compiled code can
+    /// then call itself, or the functions it recurses through, directly.
+    /// Entering compiled code costs a round trip through the driver, which a
+    /// small loop-free function doesn't win back; when compiled code calls it,
+    /// it is inlined instead. A loop-free one is entered after
+    /// [`LOOP_FREE_CALLS`] times as many calls: compiled sooner, its callers'
+    /// feedback is still growing and it gets compiled again (91: f and g
+    /// three and two times; DeltaBlue's methods).
+    has_loop: bool,
+    callee: bool,
+    ops: usize,
 }
 
-/// See `Code::interpreted`.
-fn interpreted(f: &crate::asm::FunctionDef) -> bool {
-    !f.handlers.is_empty() || ops(f).any(|op| op == crate::bytecode::Op::LdaCallee)
-}
-
-/// See [`has_loop`].
-fn large(f: &crate::asm::FunctionDef) -> bool {
-    ops(f).count() >= ENTRY_COMPILE_SIZE
+impl Scan {
+    fn of(f: &crate::asm::FunctionDef) -> Scan {
+        let mut s = Scan {
+            has_loop: false,
+            callee: false,
+            ops: 0,
+        };
+        for op in ops(f) {
+            s.has_loop |= op.is_loop();
+            s.callee |= op == crate::bytecode::Op::LdaCallee;
+            s.ops += 1;
+        }
+        s
+    }
 }
 
 /// The opcodes of `f`'s code.
@@ -2819,13 +2835,14 @@ fn ops(f: &crate::asm::FunctionDef) -> impl Iterator<Item = crate::bytecode::Op>
     })
 }
 
-/// See [`has_loop`]. Measured (perf.sh --ab, against entering loop-free
+/// See [`Scan::has_loop`]. Measured (perf.sh --ab, against entering loop-free
 /// functions after `TIER_CALLS` too): 91 -10%, 90 -5%, 87 -5%; 10 does the
 /// same. A higher threshold for functions with loops too cost up to +70%
 /// (61, 66, 80, 82: loops in functions called a few hundred times).
 const LOOP_FREE_CALLS: i32 = 5;
 
-/// See [`large`].
+/// Instructions past which a loop-free function is entered compiled as
+/// one with a loop is, after more calls (see [`Scan::has_loop`]).
 const ENTRY_COMPILE_SIZE: usize = 64;
 
 /// A function whose registers its closures capture and of more
@@ -2875,7 +2892,7 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
             let bases = property_bases(f);
             (f.ics.iter().enumerate())
                 .filter(|(k, _)| !bases.contains(k))
-                .filter_map(|(_, n)| by_name.get(n.as_str()).copied())
+                .filter_map(|(_, n)| by_name.get(&**n).copied())
                 .collect()
         })
         .collect();

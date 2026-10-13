@@ -319,9 +319,24 @@ Tried, and dropped:
 - *Twice the budget (64).* typescript +8.7% instructions, box2d +4.3%:
   more compiling, and the functions still don't settle.
 
-The fix is in the versions' policy:
+The versions' policy, then. Versions already survive a lowering whose
+code is the same; the churn was elsewhere:
 
-- keep versions across a lowering whose code is the same;
-- type a call entry by its arguments only while they're monomorphic, so
-  a callback called with many kinds of node gets one `Any` version early
-  instead of a version per kind.
+- *An entry that went megamorphic forgot it at the next lowering,* and
+  typed four more versions before joining again. Now each entry
+  remembers its joined types, by bytecode offset, across lowerings, and
+  its versions take them.
+- *Then exits spent the budget.* `preCollectTypes` exited 48 times: each
+  `ast.nodeType` test is a site of its own, and each needed four exits to
+  be given up. Past half a function's compilations, a site whose cache
+  is full and still misses is given up at its first exit.
+
+Measured with `perf stat` against a0626ba:
+
+- typescript −5.2% cycles (−2.9% instructions);
+- `preAssignScopes` and `emitParensAndCommentsInPlace` now run compiled,
+  and so does `preCollectTypes`, partly through the runtime from callers
+  compiled before it was;
+- gbemu +1.3% instructions, +0.5% cycles, from remembering the joins.
+  Applying them only past half the budget lost typescript's gain;
+- the others unchanged, DeltaBlue's instructions included.

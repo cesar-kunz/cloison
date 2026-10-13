@@ -8486,6 +8486,10 @@ pub struct JitFunction {
     widened: HashSet<usize>,
     /// Compiled versions per entry instruction, with their entry types.
     versions: HashMap<usize, Vec<(TypeState, Rc<JitCode>)>>,
+    /// Per entry (its bytecode offset, kept across lowerings): the join of
+    /// the types its versions took when it went megamorphic, which its
+    /// versions since take (see `version`).
+    wide: HashMap<usize, TypeState>,
     /// Liveness for entering at an instruction, which compiling there
     /// uses too.
     live_at: HashMap<usize, Rc<EntryLive>>,
@@ -12656,6 +12660,7 @@ impl JitFunction {
             },
             widened: HashSet::default(),
             versions: HashMap::default(),
+            wide: HashMap::default(),
             live_at: HashMap::default(),
             last: None,
             tiering: Some(Tiering::default()),
@@ -13180,7 +13185,17 @@ impl JitFunction {
         } else if insn.is_property() {
             vm.cool = cooling(&mut vm.coolings, out_of_compiles);
             (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
-            *vm.property_exits.entry(origin).or_insert(0) += 1;
+            // A miss of an access whose cases filled its cache, past half
+            // the function's compilations: given up at once, not after
+            // more exits each costing one (TypeScript's `ast.nodeType`
+            // tests, one site each, every kind of node: `preCollectTypes`
+            // spent its compilations on 48 such exits). Not before: a fifth
+            // shape now and then leaves a site's four (gbemu +1.5%).
+            let full = matches!(vm.props.get(k), Some(Prop::Poly { n, .. })
+                if *n as usize == crate::vm::IC_WAYS)
+                && 2 * self.stats.compiles >= max_compiles(vm.root_len);
+            let n = vm.property_exits.entry(origin).or_insert(0);
+            *n = if full { (*n).max(MAX_PROPERTY_EXITS) } else { *n + 1 };
         } else if !insn.is_call() {
             vm.widened.insert(origin);
             self.widened.insert(k);
@@ -13309,6 +13324,13 @@ impl JitFunction {
                 || matches!((a, v), (Ty::Obj(x) | Ty::Ext(x), Ty::Ext(y))
                     if unsafe { extends(x as *const Shape, y as *const Shape) })
         };
+        // An entry that went megamorphic before: the types it took then.
+        let pc = self.insns[entry].pc as usize;
+        let mut actual = actual.clone();
+        if let Some(w) = self.wide.get(&pc) {
+            actual.join(w);
+        }
+        let actual = &actual;
         let fits_all = |v: &TypeState| {
             fits(actual.acc, v.acc) && actual.regs.iter().all(|(r, a)| fits(a, v.regs[r]))
         };
@@ -13321,12 +13343,19 @@ impl JitFunction {
             None => {
                 let seen = self.versions.remove(&entry).unwrap_or_default();
                 let (state, keep) = if seen.len() >= MAX_VERSIONS {
-                    // Megamorphic: one version for everything seen.
+                    // Megamorphic: one version for everything seen, and so
+                    // this entry's versions from now on, after lowering
+                    // again too. (Typed again after each lowering,
+                    // TypeScript's walker callbacks, called with every
+                    // kind of node, spent their compilations on versions:
+                    // `preCollectTypes` 19 for new types, 6
+                    // generalizations.)
                     self.stats.generalizations += 1;
                     let mut joined = actual.clone();
                     for (st, _) in &seen {
                         joined.join(st);
                     }
+                    self.wide.insert(pc, joined.clone());
                     (joined, Vec::new())
                 } else {
                     (actual.clone(), seen)

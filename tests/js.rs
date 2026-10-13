@@ -3183,6 +3183,42 @@ main();"#;
     assert!(s.iter().any(|n| n.starts_with("char_code_at")), "{s:?}");
 }
 
+/// Keyed stores at sites that appended (`set_keyed_ap`): elements of
+/// every type, past the capacity, holes, and receivers no array (an object,
+/// a typed array, a named key).
+#[test]
+fn appending_stores_agree_with_node() {
+    let src = r#"
+function fill(a, n, f) { for (var i = 0; i < n; i++) a[a.length] = f(i); return a; }
+function put(a, k, v) { a[k] = v; }
+function sum(a) { var t = 0; for (var i = 0; i < a.length; i++) { var v = a[i]; t += typeof v == "number" ? v : (v === undefined ? 7 : (v && v.length !== undefined ? v.length : 3)); } return t; }
+function main() {
+  var r = 0;
+  for (var k = 0; k < 200; k++) {
+    var a = fill([], 40 + k % 13, function (i) { return i; });
+    fill(a, 5, function (i) { return i + 0.5; });
+    fill(a, 3, function (i) { return "s" + i; });
+    fill(a, 2, function (i) { return { x: i }; });
+    r += sum(a) + a.length;
+    var b = [1, 2, 3];
+    put(b, 5, 9); put(b, 3, 4); put(b, b.length, 10); put(b, 1, 20);
+    r += sum(b) + b.length;
+    var o = { length: 0 }; put(o, 0, 5); put(o, 1, 6); r += o[0] + o[1] + o.length;
+    var t = new Int32Array(4); put(t, 0, 3); put(t, 4, 9); r += t[0] + t.length;
+    var s = []; put(s, 0, 1); put(s, 1, 2); put(s, "x", 3); r += s.length + s.x;
+    var lineMap = [0]; for (var i = 1; i < 100; i++) lineMap[i] = i * 2; r += lineMap[99] + lineMap.length;
+  }
+  return r;
+}
+main();"#;
+    assert_eq!(value(src), "299980");
+    let app = "function app(n) { var a = []; for (var i = 0; i < n; i++) a[a.length] = i; return a; }
+var t = 0; for (var k = 0; k < 300; k++) t += app(50).length; t;";
+    let (v, s) = compiled(app, "app");
+    assert_eq!(v, "15000");
+    assert!(s.iter().any(|n| n.starts_with("set_keyed_ap")), "{s:?}");
+}
+
 /// An array literal is made with room for its elements, each appended
 /// (`create_array_n`, then `push`), whatever their types; past 255
 /// elements, it grows.

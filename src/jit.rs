@@ -2160,6 +2160,10 @@ pub(crate) enum Prop {
     Keyed { shape: u64, elems: FieldType },
     /// A `GetNamed` that read an array's or a string's `length`.
     Length,
+    /// A `SetKeyed` that appended to an array (`vm::APPEND_LOC`): in its
+    /// elements, at its length too, else through the runtime (see
+    /// `set_keyed_ap` in the stencils).
+    Append,
     /// An `instanceof`: its cache, two entries of three words at `cache`
     /// (see `test_instanceof_m` in the stencils), which the snapshot owns.
     InstanceOf { cache: u64 },
@@ -2376,9 +2380,9 @@ impl Feedback {
                 _ => Prop::Runtime,
             };
         }
-        // (A store's cache records typed arrays only.)
+        // (A store's cache records typed arrays and appends only.)
         if insn.op == Op::SetKeyed {
-            return Prop::None;
+            return if ic.loc == crate::vm::APPEND_LOC { Prop::Append } else { Prop::None };
         }
         if ic.shape.is_null() {
             return Prop::None;
@@ -4142,6 +4146,18 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ..Sel::new("set_keyed_rt", if st.acc == I32 { "i" } else { "" }, out)
             };
         }
+        // A store that appended: through the runtime where the stencil
+        // can't (exact shapes become lower bounds, as there).
+        Op::SetKeyed if spec.props.get(i) == Some(&Prop::Append) => {
+            out.regs.map(|_, t| match t {
+                Ty::Obj(x) => Ty::Ext(x),
+                t => t,
+            });
+            return Sel {
+                ops: Some((8 * insn.reg2 as i32, 0, 0)),
+                ..Sel::new("set_keyed_ap", "", out)
+            };
+        }
         // A number into a typed array of the kind the cache saw: stored as
         // the kind stores it (`tset_*`), the key in a scratch register (see
         // `stencil_for`); checked to be one unless the receiver's shape
@@ -5764,6 +5780,12 @@ fn stencil_for(
         ("tset", _) => {
             pre.extend(key_pieces(homes, insn.reg2));
             cat!("tset_", sel.case, "_", loc)
+        }
+        ("set_keyed_ap", _) => {
+            box_acc(&mut pre);
+            let k = insn.reg2;
+            pre.extend(spill_piece(homes[k as usize], k));
+            cat!("set_keyed_ap_", loc)
         }
         ("set_keyed_rt", _) => {
             if sel.case.is_empty() {
@@ -10256,7 +10278,9 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
     // array's elements, or go through the runtime for a typed array (which
     // may add it a named property); only `set_keyed_rt` writes any object's.
     let keyed_store = |rt: bool| {
-        (0..n).any(|k| out.insns[k].op == Op::SetKeyed && (out.props[k] == Prop::Runtime) == rt)
+        (0..n).any(|k| {
+            out.insns[k].op == Op::SetKeyed && matches!(out.props[k], Prop::Runtime | Prop::Append) == rt
+        })
     };
     let (keyed, keyed_typed) = (keyed_store(true), keyed_store(false));
     let set: Vec<Atom> = (out.insns.iter())

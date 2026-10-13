@@ -7271,14 +7271,28 @@ impl JitCode {
                 let (this, args) = call_types(i, st);
                 let site = vm_sites[*k as usize].get();
                 let bound = unsafe {
-                    if (*site).self_call {
-                        let ok = at_start
-                            && !(*site).bound
-                            && fits_entry(this, &args, (*site).nparams as usize);
+                    if (*site).self_call
+                        && at_start
+                        && !(*site).bound
+                        && fits_entry(this, &args, (*site).nparams as usize)
+                    {
+                        (*site).bound = true;
+                        (*site).end_off = 8 * ((*site).frame + nregs + interp::HEADER) as u64;
+                        self_sites.push(*k as usize);
+                        true
+                    } else if (*site).self_call {
+                        // A call to this function its entry doesn't take
+                        // (Earley-Boyer's `one_way_unify1_nboyer(lst1.car,
+                        // …)`, its parameters typed at entry, the cars
+                        // `Any`: 43M calls through the runtime): a copy of
+                        // the site, bound at its first call to a version for
+                        // these types (this function is being compiled
+                        // now: `pending`), as mutual recursion is.
+                        let f = Box::new(std::cell::UnsafeCell::new((*site).fork()));
+                        let ok = bind_direct(f.get(), this, &args);
                         if ok {
-                            (*site).bound = true;
-                            (*site).end_off = 8 * ((*site).frame + nregs + interp::HEADER) as u64;
-                            self_sites.push(*k as usize);
+                            forked.insert(i, f.get() as u64);
+                            forks.push(f);
                         }
                         ok
                     } else if bind_direct(site, this, &args) {

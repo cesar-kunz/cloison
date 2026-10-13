@@ -5283,3 +5283,498 @@ macro_rules! check_tail_callee_gpr {
 }
 check_tail_callee!([m]);
 with_gprs!(each_gpr! check_tail_callee_gpr);
+
+// ---- Regular expressions ----
+//
+// Stencils for a pattern's program (`regexp::Insn`), which `src/jit/rx.rs`
+// copies one per instruction. Their machine state is their own:
+//
+// | arg    | contents |
+// |--------|----------|
+// | `s`    | the string's code units |
+// | `end`  | its length |
+// | `pos`  | the position (never past `end`) |
+// | `bt`   | the backtracking stack's top (it grows up), two words an entry |
+// | `regs` | registers: 0 scratch, then the program's, then two per group (start, end; `RX_NONE` start: unset) |
+// | `ctx`  | [`RxCtx`] |
+//
+// A failing instruction jumps to `toi_jump_target`, the shared `rx_fail`,
+// which pops entries: one tagged `RX_TAG | r` restores register `r`; any
+// other is a code address to resume at, with its position. The bottom
+// entry resumes at `rx_nomatch`. Code returns the match's end, or
+// `RX_NOMATCH`, or `RX_BAIL` (the stack is full, or a unit past ASCII
+// needs case folding): the attempt is then the interpreter's.
+
+#[repr(C)]
+pub struct RxCtx {
+    /// The stack's end, less room for two entries.
+    limit: *mut usize,
+    /// Classes past ASCII, by `Class`'s `k`.
+    classes: *const RxClass,
+    /// Whether case is folded: a unit past ASCII in a class or a folded
+    /// character bails.
+    ic: usize,
+}
+
+#[repr(C)]
+pub struct RxClass {
+    ranges: *const [u16; 2],
+    n: usize,
+    neg: usize,
+}
+
+/// A repetition of one unit (`Run`, `LazyRun`) and its backtracking piece.
+#[repr(C)]
+pub struct RxRun {
+    min: usize,
+    max: usize,
+    /// The backtracking piece's address.
+    back: usize,
+    /// The unit: a class's ASCII bits and `k`; a character in `k` (folded:
+    /// `c | canon << 16`).
+    lo: u64,
+    hi: u64,
+    k: usize,
+}
+
+/// A counted repetition's head (`Head`).
+#[repr(C)]
+pub struct RxHead {
+    c: usize,
+    min: usize,
+    max: usize,
+    /// The addresses of what follows the loop and of its body.
+    exit: usize,
+    body: usize,
+}
+
+const RX_TAG: usize = 1 << 63;
+const RX_NONE: usize = usize::MAX;
+const RX_NOMATCH: usize = usize::MAX;
+const RX_BAIL: usize = usize::MAX - 1;
+
+type RxFn = unsafe extern "rust-preserve-none" fn(*const u16, usize, usize, *mut usize, *mut usize, *const RxCtx) -> usize;
+
+#[allow(clashing_extern_declarations)]
+unsafe extern "rust-preserve-none" {
+    #[link_name = "toi_continue"]
+    fn rx_continue(s: *const u16, end: usize, pos: usize, bt: *mut usize, regs: *mut usize, ctx: *const RxCtx) -> usize;
+    #[link_name = "toi_jump_target"]
+    fn rx_jump(s: *const u16, end: usize, pos: usize, bt: *mut usize, regs: *mut usize, ctx: *const RxCtx) -> usize;
+}
+
+macro_rules! rx {
+    ($name:ident; |$s:ident, $end:ident, $pos:ident, $bt:ident, $regs:ident, $ctx:ident| $body:block) => {
+        #[unsafe(export_name = concat!("toi_stencil_", stringify!($name)))]
+        #[allow(unused_mut, unused_variables)]
+        unsafe extern "rust-preserve-none" fn $name(
+            $s: *const u16, $end: usize, mut $pos: usize, mut $bt: *mut usize, $regs: *mut usize, $ctx: *const RxCtx,
+        ) -> usize {
+            unsafe { $body }
+        }
+    };
+}
+
+/// On to the next piece at `$pos`.
+macro_rules! rx_next {
+    ($s:ident, $end:ident, $pos:expr, $bt:ident, $regs:ident, $ctx:ident) => {
+        become rx_continue($s, $end, $pos, $bt, $regs, $ctx)
+    };
+}
+
+/// Fail: backtrack.
+macro_rules! rx_fail {
+    ($s:ident, $end:ident, $pos:ident, $bt:ident, $regs:ident, $ctx:ident) => {
+        become rx_jump($s, $end, $pos, $bt, $regs, $ctx)
+    };
+}
+
+/// Push an entry, or bail if the stack is full.
+macro_rules! rx_push {
+    ($bt:ident, $ctx:ident, $a:expr, $v:expr) => {{
+        if $bt >= (*$ctx).limit {
+            return RX_BAIL;
+        }
+        *$bt = $a;
+        *$bt.add(1) = $v;
+        $bt = $bt.add(2);
+    }};
+}
+
+/// Push an entry where `rx_push`'s check (room for two) already holds.
+macro_rules! rx_push_more {
+    ($bt:ident, $a:expr, $v:expr) => {{
+        *$bt = $a;
+        *$bt.add(1) = $v;
+        $bt = $bt.add(2);
+    }};
+}
+
+#[inline(always)]
+fn rx_line_terminator(c: u16) -> bool {
+    c == 0x0A || c == 0x0D || c | 1 == 0x2029
+}
+
+#[inline(always)]
+fn rx_word(c: u16) -> bool {
+    c < 128 && {
+        let c = c as u8;
+        c.is_ascii_alphanumeric() || c == b'_'
+    }
+}
+
+/// Whether `c`, past ASCII, is in class `k`: 0 or 1, or 2 to bail.
+#[cold]
+#[inline(always)]
+unsafe fn rx_wide(ctx: *const RxCtx, k: usize, c: u16) -> u64 {
+    unsafe {
+        if (*ctx).ic != 0 {
+            return 2;
+        }
+        let cl = &*(*ctx).classes.add(k);
+        let mut i = 0;
+        let mut has = false;
+        while i < cl.n {
+            let [lo, hi] = *cl.ranges.add(i);
+            if lo <= c && c <= hi {
+                has = true;
+                break;
+            }
+            i += 1;
+        }
+        (has != (cl.neg != 0)) as u64
+    }
+}
+
+/// Whether `c` is in the class of ASCII bits `lo`, `hi` and index `k`: 0
+/// or 1, or 2 to bail.
+#[inline(always)]
+unsafe fn rx_class_has(ctx: *const RxCtx, lo: u64, hi: u64, k: usize, c: u16) -> u64 {
+    if c < 128 {
+        (if c < 64 { lo } else { hi }) >> (c & 63) & 1
+    } else {
+        unsafe { rx_wide(ctx, k, c) }
+    }
+}
+
+/// Whether `c` matches character `x` folded to `canon`: 0 or 1, or 2 to
+/// bail.
+#[inline(always)]
+fn rx_fold_has(x: u32, canon: u32, c: u16) -> u64 {
+    let c = c as u32;
+    if c == x {
+        1
+    } else if c < 128 {
+        ((c as u8).to_ascii_uppercase() as u32 == canon) as u64
+    } else {
+        core::hint::cold_path();
+        2
+    }
+}
+
+rx!(rx_fail; |s, end, pos, bt, regs, ctx| {
+    loop {
+        bt = bt.sub(2);
+        let a = *bt;
+        let v = *bt.add(1);
+        if a & RX_TAG == 0 {
+            become (core::mem::transmute::<usize, RxFn>(a))(s, end, v, bt, regs, ctx);
+        }
+        *regs.add(a & !RX_TAG) = v;
+    }
+});
+
+rx!(rx_nomatch; |s, end, pos, bt, regs, ctx| { RX_NOMATCH });
+
+rx!(rx_match; |s, end, pos, bt, regs, ctx| { pos });
+
+rx!(rx_jmp; |s, end, pos, bt, regs, ctx| { rx_next!(s, end, pos, bt, regs, ctx) });
+
+rx!(rx_char; |s, end, pos, bt, regs, ctx| {
+    if pos < end && *s.add(pos) as u32 == imm() as u32 {
+        rx_next!(s, end, pos + 1, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_fold; |s, end, pos, bt, regs, ctx| {
+    if pos < end {
+        let k = imm() as u32;
+        match rx_fold_has(k & 0xFFFF, k >> 16, *s.add(pos)) {
+            1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
+            0 => {}
+            _ => return RX_BAIL,
+        }
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_any; |s, end, pos, bt, regs, ctx| {
+    if pos < end && !rx_line_terminator(*s.add(pos)) {
+        rx_next!(s, end, pos + 1, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_class; |s, end, pos, bt, regs, ctx| {
+    if pos < end {
+        match rx_class_has(ctx, imm64_full(), imm64b_full(), imm() as u32 as usize, *s.add(pos)) {
+            1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
+            0 => {}
+            _ => return RX_BAIL,
+        }
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_str; |s, end, pos, bt, regs, ctx| {
+    let n = imm() as u32 as usize;
+    let u = imm64() as *const u16;
+    if end - pos >= n {
+        let mut i = 0;
+        while i < n {
+            if *s.add(pos + i) != *u.add(i) {
+                rx_fail!(s, end, pos, bt, regs, ctx)
+            }
+            i += 1;
+        }
+        rx_next!(s, end, pos + n, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_start; |s, end, pos, bt, regs, ctx| {
+    if pos == 0 {
+        rx_next!(s, end, pos, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_start_m; |s, end, pos, bt, regs, ctx| {
+    if pos == 0 || rx_line_terminator(*s.add(pos - 1)) {
+        rx_next!(s, end, pos, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_end; |s, end, pos, bt, regs, ctx| {
+    if pos == end {
+        rx_next!(s, end, pos, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_end_m; |s, end, pos, bt, regs, ctx| {
+    if pos == end || rx_line_terminator(*s.add(pos)) {
+        rx_next!(s, end, pos, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+/// `\b` (`imm` 1) or `\B` (0).
+rx!(rx_boundary; |s, end, pos, bt, regs, ctx| {
+    let a = pos > 0 && rx_word(*s.add(pos - 1));
+    let b = pos < end && rx_word(*s.add(pos));
+    if (a != b) as u32 == imm() as u32 {
+        rx_next!(s, end, pos, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+/// A choice point: on, and on backtracking at the address `imm64`.
+rx!(rx_split; |s, end, pos, bt, regs, ctx| {
+    rx_push!(bt, ctx, imm64() as usize, pos);
+    rx_next!(s, end, pos, bt, regs, ctx)
+});
+
+/// Register `imm` takes the position.
+rx!(rx_mark; |s, end, pos, bt, regs, ctx| {
+    let r = imm() as u32 as usize;
+    rx_push!(bt, ctx, RX_TAG | r, *regs.add(r));
+    *regs.add(r) = pos;
+    rx_next!(s, end, pos, bt, regs, ctx)
+});
+
+/// Register `imm` takes 0.
+rx!(rx_zero; |s, end, pos, bt, regs, ctx| {
+    let r = imm() as u32 as usize;
+    rx_push!(bt, ctx, RX_TAG | r, *regs.add(r));
+    *regs.add(r) = 0;
+    rx_next!(s, end, pos, bt, regs, ctx)
+});
+
+/// The group at register `imm & 0xFFFF` matched from register `imm >> 16`'s
+/// position to here.
+rx!(rx_save; |s, end, pos, bt, regs, ctx| {
+    let k = imm() as u32 as usize;
+    let (g, r) = (k & 0xFFFF, k >> 16);
+    rx_push!(bt, ctx, RX_TAG | g, *regs.add(g));
+    rx_push_more!(bt, RX_TAG | (g + 1), *regs.add(g + 1));
+    *regs.add(g) = *regs.add(r);
+    *regs.add(g + 1) = pos;
+    rx_next!(s, end, pos, bt, regs, ctx)
+});
+
+/// The groups at registers `imm & 0xFFFF` up to `imm >> 16` are cleared.
+rx!(rx_clear; |s, end, pos, bt, regs, ctx| {
+    let k = imm() as u32 as usize;
+    let (mut g, hi) = (k & 0xFFFF, k >> 16);
+    while g < hi {
+        if *regs.add(g) != RX_NONE {
+            rx_push!(bt, ctx, RX_TAG | g, *regs.add(g));
+            rx_push_more!(bt, RX_TAG | (g + 1), *regs.add(g + 1));
+            *regs.add(g) = RX_NONE;
+        }
+        g += 2;
+    }
+    rx_next!(s, end, pos, bt, regs, ctx)
+});
+
+/// A counted repetition's head (`*imm64`, an `RxHead`), greedy: into the
+/// body (next) first.
+rx!(rx_head; |s, end, pos, bt, regs, ctx| {
+    let h = &*(imm64() as *const RxHead);
+    let count = *regs.add(h.c);
+    let done = count >= h.min;
+    if count < h.max {
+        if done {
+            rx_push!(bt, ctx, h.exit, pos);
+        }
+        rx_next!(s, end, pos, bt, regs, ctx)
+    }
+    if done {
+        become (core::mem::transmute::<usize, RxFn>(h.exit))(s, end, pos, bt, regs, ctx);
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+/// The same, lazy: out first.
+rx!(rx_lazy_head; |s, end, pos, bt, regs, ctx| {
+    let h = &*(imm64() as *const RxHead);
+    let count = *regs.add(h.c);
+    let more = count < h.max;
+    if count >= h.min {
+        if more {
+            rx_push!(bt, ctx, h.body, pos);
+        }
+        become (core::mem::transmute::<usize, RxFn>(h.exit))(s, end, pos, bt, regs, ctx);
+    }
+    if more {
+        rx_next!(s, end, pos, bt, regs, ctx)
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+/// A counted repetition's body done, having started at register
+/// `imm >> 16`'s position, its count in register `imm & 0xFFFF`: an empty
+/// iteration past the minimum (`imm64`) fails; otherwise the count goes up,
+/// and on to the head (the continuation).
+rx!(rx_tail; |s, end, pos, bt, regs, ctx| {
+    let k = imm() as u32 as usize;
+    let (c, p) = (k & 0xFFFF, k >> 16);
+    let count = *regs.add(c);
+    if pos == *regs.add(p) && count >= imm64() as usize {
+        rx_fail!(s, end, pos, bt, regs, ctx)
+    }
+    rx_push!(bt, ctx, RX_TAG | c, count);
+    *regs.add(c) = count + 1;
+    rx_next!(s, end, pos, bt, regs, ctx)
+});
+
+/// A greedy run backtracking: one unit fewer, again while past the limit
+/// below its entry; on at what follows the run (the continuation).
+rx!(rx_back; |s, end, pos, bt, regs, ctx| {
+    let p = pos - 1;
+    if p > *bt.sub(1) {
+        *bt = (*(imm64() as *const RxRun)).back;
+        *bt.add(1) = p;
+        bt = bt.add(2);
+    } else {
+        bt = bt.sub(2);
+    }
+    rx_next!(s, end, p, bt, regs, ctx)
+});
+
+/// Repetitions of one unit (`$has`: 0 or 1, or 2 to bail), from the
+/// `RxRun` at `imm64`: greedy (`rx_run_*`), lazy (`rx_lazy_*`), and the
+/// lazy one's backtracking piece (`rx_lazyback_*`), which takes one more.
+macro_rules! rx_runs {
+    ($run:ident, $lazy:ident, $lazyback:ident, |$ctx:ident, $r:ident, $c:ident| $has:expr) => {
+        rx!($run; |s, end, pos, bt, regs, ctx| {
+            let $r = &*(imm64() as *const RxRun);
+            let $ctx = ctx;
+            let lim = if end - pos < $r.max { end } else { pos + $r.max };
+            let mut p = pos;
+            while p < lim {
+                let $c = *s.add(p);
+                match $has {
+                    1 => p += 1,
+                    0 => break,
+                    _ => return RX_BAIL,
+                }
+            }
+            let n = p - pos;
+            if n < $r.min {
+                rx_fail!(s, end, pos, bt, regs, ctx)
+            }
+            if n > $r.min {
+                rx_push!(bt, ctx, RX_TAG, pos + $r.min);
+                rx_push_more!(bt, $r.back, p);
+            }
+            rx_next!(s, end, p, bt, regs, ctx)
+        });
+        rx!($lazy; |s, end, pos, bt, regs, ctx| {
+            let $r = &*(imm64() as *const RxRun);
+            let $ctx = ctx;
+            if end - pos < $r.min {
+                rx_fail!(s, end, pos, bt, regs, ctx)
+            }
+            let mut i = 0;
+            while i < $r.min {
+                let $c = *s.add(pos + i);
+                match $has {
+                    1 => i += 1,
+                    0 => rx_fail!(s, end, pos, bt, regs, ctx),
+                    _ => return RX_BAIL,
+                }
+            }
+            let p = pos + $r.min;
+            if $r.min < $r.max {
+                rx_push!(bt, ctx, RX_TAG, pos + $r.max);
+                rx_push_more!(bt, $r.back, p);
+            }
+            rx_next!(s, end, p, bt, regs, ctx)
+        });
+        rx!($lazyback; |s, end, pos, bt, regs, ctx| {
+            let $r = &*(imm64() as *const RxRun);
+            let $ctx = ctx;
+            if pos < end {
+                let $c = *s.add(pos);
+                match $has {
+                    1 => {
+                        let p = pos + 1;
+                        if p < *bt.sub(1) {
+                            *bt = $r.back;
+                            *bt.add(1) = p;
+                            bt = bt.add(2);
+                        } else {
+                            bt = bt.sub(2);
+                        }
+                        rx_next!(s, end, p, bt, regs, ctx)
+                    }
+                    0 => {}
+                    _ => return RX_BAIL,
+                }
+            }
+            bt = bt.sub(2);
+            rx_fail!(s, end, pos, bt, regs, ctx)
+        });
+    };
+}
+
+rx_runs!(rx_run_char, rx_lazy_char, rx_lazyback_char, |ctx, r, c| (c as usize == r.k) as u64);
+rx_runs!(rx_run_fold, rx_lazy_fold, rx_lazyback_fold, |ctx, r, c| {
+    rx_fold_has(r.k as u32 & 0xFFFF, r.k as u32 >> 16, c)
+});
+rx_runs!(rx_run_any, rx_lazy_any, rx_lazyback_any, |ctx, r, c| (!rx_line_terminator(c)) as u64);
+rx_runs!(rx_run_class, rx_lazy_class, rx_lazyback_class, |ctx, r, c| rx_class_has(ctx, r.lo, r.hi, r.k, c));

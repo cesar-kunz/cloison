@@ -87,7 +87,7 @@ use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
-use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, string_units};
+use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, string_len, string_units};
 
 pub type Handler = extern "rust-preserve-none" fn(
     *const u8,
@@ -1670,10 +1670,15 @@ pub(crate) fn strict_equals(a: Value, b: Value) -> bool {
     if let Some((x, y)) = both_numbers(a, b) {
         return x == y;
     }
-    match (string_units(a), string_units(b)) {
-        (Some(p), Some(q)) => p == q,
-        _ => a == b,
-    }
+    strings_equal(a, b).unwrap_or(a == b)
+}
+
+/// Whether two strings are equal, if both are strings: the same cell, or
+/// of the same length and units (so strings of other lengths aren't
+/// flattened to tell).
+fn strings_equal(a: Value, b: Value) -> Option<bool> {
+    let (n, m) = (string_len(a)?, string_len(b)?);
+    Some(a == b || n == m && string_units(a) == string_units(b))
 }
 
 /// An int32 quotient `a / b`, if it is one: exact, not -0, not 2^31.
@@ -2615,6 +2620,9 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
     if a == b {
         return Ok(true);
     }
+    if let Some(r) = strings_equal(a, b) {
+        return Ok(r);
+    }
     let nullish = |v: Value| v.is_null() || v.is_undefined();
     if nullish(a) || nullish(b) {
         return Ok(nullish(a) && nullish(b));
@@ -2657,7 +2665,7 @@ thread_local! {
 }
 
 fn is_string(v: Value) -> bool {
-    string_units(v).is_some()
+    string_len(v).is_some()
 }
 
 /// ToPrimitive (hint "default", as "number"): an object's `valueOf`, else

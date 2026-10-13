@@ -293,6 +293,11 @@ fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `String.fromCharCode(…codes)`: each ToUint16.
 fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    if let [v] = a
+        && v.is_int32()
+    {
+        return Ok(vm.single_char(v.as_i32_unchecked() as u16));
+    }
     let u: Vec<u16> = a
         .iter()
         .map(|&v| {

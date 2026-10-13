@@ -49,8 +49,8 @@ enum Starts {
     /// Where `^` matches (every alternative begins with it).
     Anchored,
     /// At a code unit in `ascii` (bit `c` for `c` < 128), or at any one
-    /// past ASCII if `other`; `one` if that is a single unit.
-    Units { ascii: u128, other: bool, one: Option<u16> },
+    /// past ASCII if `other`; `few` if those are at most four units.
+    Units { ascii: u128, other: bool, few: Option<([u16; 4], usize)> },
 }
 
 /// The code units a node's non-empty matches can begin with (as in
@@ -144,20 +144,24 @@ impl Regex {
         Ok(re)
     }
 
-    /// The longest run of two or more characters in the top-level
-    /// sequence (case-sensitive patterns only).
+    /// The longest run of characters in the top-level sequence that match
+    /// only themselves (folding case, ASCII but letters): of two or more,
+    /// or of one when finding where a match can start is slow otherwise.
     fn needle(&self) -> Option<Needle> {
         let Node::Seq(ns) = &self.node else {
             return None;
         };
-        if self.ignore_case {
-            return None;
-        }
+        // Folding case, characters that only match themselves: ASCII but
+        // letters.
+        let ic = self.ignore_case;
+        let fixed = |n: &Node| matches!(n, Node::Char(c) if !ic || *c < 128 && !(*c as u8).is_ascii_alphabetic());
+        // One unit will do where finding a start is slow otherwise.
+        let one = if matches!(self.starts, Starts::Units { few: Some(_), .. }) { 2 } else { 1 };
         let mut best: Option<(usize, usize)> = None;
         let mut k = 0;
         while k < ns.len() {
-            let run = ns[k..].iter().take_while(|n| matches!(n, Node::Char(_))).count();
-            if run >= 2 && best.is_none_or(|(_, len)| run > len) {
+            let run = ns[k..].iter().take_while(|n| fixed(n)).count();
+            if run >= one && best.is_none_or(|(_, len)| run > len) {
                 best = Some((k, run));
             }
             k += run.max(1);
@@ -182,7 +186,16 @@ impl Regex {
             Some((ascii, other, false)) => Starts::Units {
                 ascii,
                 other,
-                one: (ascii.count_ones() == 1 && !other).then(|| ascii.trailing_zeros() as u16),
+                few: (ascii.count_ones() <= 4 && !other).then(|| {
+                    let mut u = [0; 4];
+                    let (mut n, mut m) = (0, ascii);
+                    while m != 0 {
+                        u[n] = m.trailing_zeros() as u16;
+                        m &= m - 1;
+                        n += 1;
+                    }
+                    (u, n)
+                }),
             },
             _ => Starts::Anywhere,
         }
@@ -247,8 +260,8 @@ impl Regex {
                         at += s[at..].iter().position(|&c| is_line_terminator(c))? + 1;
                     }
                 }
-                Starts::Units { one: Some(c), .. } => {
-                    at += s[at..].iter().position(|&x| x == c)?;
+                Starts::Units { few: Some((u, n)), .. } => {
+                    at = find_any(s, &u[..n], at)?;
                 }
                 Starts::Units { ascii, other, .. } => {
                     let can = |c: u16| if c < 128 { ascii >> c & 1 != 0 } else { other };
@@ -276,11 +289,12 @@ impl Regex {
             Node::Empty | Node::Start | Node::End | Node::Boundary(_) | Node::Look(..) => {
                 Some((0, false, true))
             }
-            Node::Char(c) => units(&|x| eq(ic, x, *c), *c >= 128 || ic),
+            // (Case folding maps no unit past ASCII to one in it, or back.)
+            Node::Char(c) => units(&|x| eq(ic, x, *c), *c >= 128),
             Node::Any => units(&|x| !is_line_terminator(x), true),
             Node::Class(r, neg) => units(
                 &|x| in_class(ic, r, *neg, x),
-                *neg || ic || r.iter().any(|&(_, hi)| hi >= 128),
+                *neg || r.iter().any(|&(_, hi)| hi >= 128),
             ),
             Node::Group(inner, _) => self.first(inner),
             Node::BackRef(_) => None,
@@ -325,6 +339,32 @@ fn in_class(ic: bool, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
                 .any(|&(lo, hi)| (lo..=hi).len() < 512 && (lo..=hi).any(|x| canonical(x) == u));
     }
     r != neg
+}
+
+/// The first of `units` (one to four) in `s` at or after `from`.
+fn find_any(s: &[u16], units: &[u16], from: usize) -> Option<usize> {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+    let mut at = from;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let k = |i: usize| _mm_set1_epi16(units[i.min(units.len() - 1)] as i16);
+        let (u0, u1, u2, u3) = (k(0), k(1), k(2), k(3));
+        let p = s.as_ptr();
+        while at + 8 <= s.len() {
+            let a = _mm_loadu_si128(p.add(at).cast());
+            let eq = _mm_or_si128(
+                _mm_or_si128(_mm_cmpeq_epi16(a, u0), _mm_cmpeq_epi16(a, u1)),
+                _mm_or_si128(_mm_cmpeq_epi16(a, u2), _mm_cmpeq_epi16(a, u3)),
+            );
+            let m = _mm_movemask_epi8(eq) as u32;
+            if m != 0 {
+                return Some(at + (m.trailing_zeros() / 2) as usize);
+            }
+            at += 8;
+        }
+    }
+    (at..s.len()).find(|&i| units.contains(&s[i]))
 }
 
 /// The first `needle` in `s` at or after `from`: candidates where its
@@ -1302,7 +1342,8 @@ mod reference {
                 s,
                 caps: vec![None; self.groups],
             };
-            self.search(s, start, |at| {
+            // At every position (no skipping, which `exec` does).
+            (start..=s.len()).find(|&at| {
                 for c in m.caps.iter_mut() {
                     *c = None;
                 }
@@ -1581,7 +1622,8 @@ mod tests {
             let f = ["", "i", "m", "im"][rand(4)];
             let Ok(re) = Regex::new(&p, f) else { continue };
             for _ in 0..4 {
-                let s: Vec<u16> = (0..rand(9)).map(|_| b"abcA1 \n_"[rand(8)] as u16).collect();
+                let len = if rand(4) == 0 { rand(24) } else { rand(9) };
+                let s: Vec<u16> = (0..len).map(|_| b"abcA1 \n_"[rand(8)] as u16).collect();
                 for start in 0..=s.len() {
                     let want = re.exec_reference(&s, start);
                     matched += want.is_some() as usize;
@@ -1648,8 +1690,25 @@ mod tests {
         assert!(matches!(Regex::new("(a)|\\1b", "").unwrap().starts, Starts::Anywhere));
         assert!(matches!(
             Regex::new("[xy]z", "").unwrap().starts,
-            Starts::Units { other: false, one: None, .. }
+            Starts::Units { other: false, few: Some((_, 2)), .. }
         ));
+        assert!(matches!(Regex::new("[a-e]z", "").unwrap().starts, Starts::Units { few: None, .. }));
+        // Folding case: an ASCII unit or class begins no match past ASCII;
+        // a needle of units that fold to none but themselves.
+        assert!(matches!(
+            Regex::new("#|[x-z]", "i").unwrap().starts,
+            Starts::Units { other: false, few: None, .. }
+        ));
+        let nd = Regex::new("\\s?;\\s?", "").unwrap().needle.unwrap();
+        assert_eq!((nd.units.len(), nd.min, nd.max), (1, 0, Some(1)));
+        assert!(Regex::new("x?;", "").unwrap().needle.is_none());
+        assert_eq!(at("\\s?;\\s?", "", "a ;b; c", 3), Some((4, 6)));
+        let nd = Regex::new("##yv16##", "i").unwrap().needle.unwrap();
+        assert_eq!((nd.units.len(), nd.min, nd.max), (4, 4, Some(4)));
+        assert!(Regex::new("ab", "i").unwrap().needle.is_none());
+        assert_eq!(at("##yv16##", "i", "##yv16#x##YV16##", 0), Some((8, 16)));
+        assert_eq!(at("[#é]", "i", "aÉ#", 0), Some((1, 2)));
+        assert_eq!(at("[xy]z", "", "xxyyyyyyyyyyyyyyyyyyyyzz", 0), Some((21, 23)));
         // `^`: at 0 only, or after a line terminator with `m`.
         assert_eq!(at("^b", "", "ab", 0), None);
         assert_eq!(at("^a", "", "aa", 1), None);

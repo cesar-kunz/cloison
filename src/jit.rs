@@ -8717,8 +8717,13 @@ const MAX_COOL_SHIFT: u32 = 2;
 /// cooling up to [`MAX_COOL_SHIFT`] times, so a function whose code keeps
 /// exiting is compiled again less often. Loop entries don't cool: a loop
 /// left to the interpreter costs more than compiling it (87 +27% with
-/// them cooling too).
-fn cooling(coolings: &mut u32) -> u32 {
+/// them cooling too). None once the function is out of compilations: no
+/// new lowering will come to wait for (TypeScript's `innerScan` ran
+/// 889,000 calls in the interpreter cooling, 1,600 compiled).
+fn cooling(coolings: &mut u32, out_of_compiles: bool) -> u32 {
+    if out_of_compiles {
+        return 0;
+    }
     let n = *coolings;
     *coolings += 1;
     COOL_ENTRIES << n.min(MAX_COOL_SHIFT)
@@ -12864,6 +12869,7 @@ impl JitFunction {
             return (frame, snap.insns[call_before()].pc);
         }
         let was_dirty = std::mem::replace(&mut vm.dirty, true);
+        let out_of_compiles = self.stats.compiles >= max_compiles(vm.root_len);
         // The function may have been lowered differently since (a nested
         // entry recompiled it): then only resume. So, while it cools, for
         // code still running from before the exit that started it: what
@@ -12936,11 +12942,11 @@ impl JitFunction {
                 vm.no_entry.insert(pc);
             }
         } else if insn.guard != 0 || insn.native != 0 {
-            vm.cool = cooling(&mut vm.coolings);
+            vm.cool = cooling(&mut vm.coolings, out_of_compiles);
             (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
             *vm.callee_exits.entry(origin).or_insert(0) += 1;
         } else if insn.is_property() {
-            vm.cool = cooling(&mut vm.coolings);
+            vm.cool = cooling(&mut vm.coolings, out_of_compiles);
             (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
             *vm.property_exits.entry(origin).or_insert(0) += 1;
         } else if !insn.is_call() {

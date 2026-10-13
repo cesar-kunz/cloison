@@ -4238,6 +4238,30 @@ macro_rules! property_gpr {
 property_location!([m]);
 with_gprs!(each_gpr! property_gpr);
 
+// ---- Loads into a slot ----
+//
+// `get_own_nc_<loc>; star_g<d>` with `acc` dead after: the load straight
+// into the slot (`mov rcx, [rdi+off]`), skipping `acc`.
+
+macro_rules! load_to_gpr_pair {
+    ($d:tt, $k:tt) => {
+        stencil!("get_own_nc_g", $k, "_to_g", $d; |s| {
+            s.g[$d] = load_imm(s.g[$k].to_bits() as *mut u8);
+            next!(s)
+        });
+    };
+}
+macro_rules! load_to_gpr {
+    ($d:tt) => {
+        stencil!("get_own_nc_m_to_g", $d; |s| {
+            s.g[$d] = load_imm(load_m(s.regs).to_bits() as *mut u8);
+            next!(s)
+        });
+    };
+}
+with_gprs!(gpr_pairs! load_to_gpr_pair);
+with_gprs!(each_gpr! load_to_gpr);
+
 // ---- Typed arrays' elements ----
 //
 // `o[acc]` and `o[k] = acc` for a typed array `o` of a known element kind

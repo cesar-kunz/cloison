@@ -5490,10 +5490,12 @@ fn stencil_for(
             cat!(sel.base, "_nc_", loc)
         }
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) => cat!(sel.base, "_", loc),
-        // Stores take a boxed `acc`; a number's (`_n`) needs no barrier.
+        // Stores take a boxed `acc`; a number's (`_n`) needs no barrier,
+        // also one its check proved a number.
         ("set_own" | "set_oop" | "set_tr", _) => {
             box_acc(&mut pre);
-            let n = if matches!(st.acc, Ty::I32 | Ty::F64) { "_n" } else { "" };
+            let num_checked = matches!(sel.check, Some(("check_acc_num" | "check_acc_int", ..)));
+            let n = if matches!(st.acc, Ty::I32 | Ty::F64) || num_checked { "_n" } else { "" };
             if sel.case == "nc" {
                 cat!(sel.base, n, "_nc_", loc)
             } else {
@@ -5907,6 +5909,46 @@ impl Fusion<'_> {
     fn group(&self, i: usize, len: usize) -> bool {
         i + len <= self.insns.len()
             && (i + 1..i + len).all(|j| !self.is_target[j] && self.ins[j].is_some())
+    }
+
+    /// `LdaSmi k; TestEqual t; JumpIf…` right after a `Star t` emitted on
+    /// its own, on int32s (an inlined `this.direction ==
+    /// Direction.FORWARD`): `acc` still holds `t`, so `acc == k`
+    /// (`teq_smi_jf_i`: `cmp`, branch). Doesn't exit.
+    fn star_smi_compare(&self, j: usize, i: usize) -> Option<Fused> {
+        let insns = self.insns;
+        self.widened?;
+        let st = self.ins[i].as_ref()?;
+        let t = &insns[j];
+        if insns[i].op != Op::LdaSmi
+            || t.op != Op::Star
+            || !self.group(i, 3)
+            || !matches!(insns[i + 1].op, Op::TestEqual | Op::TestStrictEqual)
+            || insns[i + 1].reg != t.reg
+            || self.ins[j].as_ref()?.acc != Ty::I32
+            || st.regs[t.reg as usize] != Ty::I32
+            || self.live_out[i + 2]
+        {
+            return None;
+        }
+        let pol = match insns[i + 2].op {
+            Op::JumpIfTrue | Op::JumpIfToBooleanTrue => "jt",
+            Op::JumpIfFalse | Op::JumpIfToBooleanFalse => "jf",
+            _ => return None,
+        };
+        Some(Fused {
+            len: 3,
+            steps: vec![FusedStep {
+                name: format!("teq_smi_{pol}_i"),
+                imm: insns[i].imm,
+                reg: 0,
+                insn: i,
+                undo: None,
+                exit_ldar: None,
+            }],
+            ldar: String::new(),
+            acc_live_after: false,
+        })
     }
 
     /// A comparison and the `JumpIfTrue` / `JumpIfFalse` consuming its
@@ -7343,8 +7385,16 @@ impl JitCode {
                 loop_head[0] = true;
             }
         }
+        // Per instruction emitted on its own (not in a fused group): where
+        // its code ends in `hot`.
+        let mut plain_end: Vec<Option<usize>> = vec![None; n];
+        let mut plain_from: Option<usize> = None;
+        let mut plain_start: Vec<usize> = vec![0; n];
         let mut i = 0;
         while i < n {
+            if let Some(k) = plain_from.take() {
+                plain_end[k] = Some(hot.len());
+            }
             let (Some(s), Some(st)) = (&sel[i], &ins[i]) else {
                 i += 1;
                 continue;
@@ -7393,7 +7443,33 @@ impl JitCode {
                 continue;
             }
 
-            if let Some(f) = fusion.at(i) {
+            // The `Star` before, if emitted on its own with no code since.
+            // (Instructions with no code don't change the `acc` register.)
+            let star_before = (0..i)
+                .rev()
+                .take_while(|&j| plain_end[j].is_some() && !is_target[j + 1])
+                .find(|&j| insns[j].op == Op::Star && insns.get(i + 1).is_some_and(|t| t.reg == insns[j].reg))
+                .filter(|&j| hot[plain_end[j].unwrap()..].iter().all(|p| p.len() == 0));
+            let fused = match star_before.and_then(|j| Some((j, fusion.star_smi_compare(j, i)?))) {
+                Some((j, f)) => {
+                    // The `Star` is dead too if nothing reads its register
+                    // after the jump: its code goes.
+                    let t = insns[j].reg as usize;
+                    if let Some(l) = &share_live
+                        && t < direct_base
+                        && captured.get(t) != Some(&true)
+                        && succs(insns, i + 2).all(|k| k >= n || !rs_has(&l[k], t))
+                    {
+                        for p in &mut hot[plain_start[j]..plain_end[j].unwrap()] {
+                            *p = Piece::new("nop", 0);
+                        }
+                        names[j] = Some("-".into());
+                    }
+                    Some(f)
+                }
+                None => fusion.at(i),
+            };
+            if let Some(f) = fused {
                 let last = i + f.len - 1;
                 let jump = if insns[last].jumps() {
                     jump_to(last, &sel[last].as_ref().unwrap().out, &mut stubs)
@@ -7445,6 +7521,120 @@ impl JitCode {
                 continue;
             }
 
+            plain_from = Some(i);
+            plain_start[i] = hot.len();
+            // `Ldar r` right after `Star r` with no code between: `acc` holds
+            // `r` already.
+            if insn.op == Op::Ldar
+                && s.base == "ldar"
+                && s.case != "f"
+                && s.check.is_none()
+                && s.post.is_none()
+                && !insn.check_only
+                && !is_target[i]
+                && let Some(j) = (0..i)
+                    .rev()
+                    .take_while(|&j| plain_end[j].is_some() && !is_target[j + 1])
+                    .find(|&j| insns[j].op != Op::Nop)
+                && insns[j].op == Op::Star
+                && insns[j].reg == insn.reg
+                && hot[plain_end[j].unwrap()..].iter().all(|p| p.len() == 0)
+                && let Some(sj) = &ins[j]
+                && !matches!(sj.acc, Ty::F64 | Ty::Bot)
+                && sj.acc == st.regs[insn.reg as usize]
+            {
+                names[i] = Some("-".into());
+                i += 1;
+                continue;
+            }
+            // `Star b` into a GPR slot right after a load into `acc` with a
+            // variant loading into the slot (`get_own_nc_g0_to_g3`), `acc`
+            // dead after: that variant, and no `Star`.
+            if insn.op == Op::Star
+                && !is_target[i]
+                && !live_out[i]
+                && s.check.is_none()
+                && s.post.is_none()
+                && i > 0
+                && plain_end[i - 1] == Some(hot.len())
+                && plain_start[i - 1] + 1 == hot.len()
+                && let (pre, name) = stencil_for(insn, s, st, &homes, &boxed, return_spills)
+                && pre.is_empty()
+                // (A field holds a boxed value: no boxing for `star_g<d>_i`.)
+                && let Some(d) = name
+                    .strip_prefix("star_g")
+                    .map(|k| k.strip_suffix("_i").unwrap_or(k))
+                    .and_then(|k| k.parse::<u8>().ok())
+                && let Some(last) = hot.last()
+                && last.slow.is_none()
+                && last.stencil.stencil().name.starts_with("get_own_nc_")
+                && let Some(to) = Instance::find(&format!("{}_to_g{d}", last.stencil.stencil().name))
+            {
+                let last = hot.last_mut().unwrap();
+                last.stencil = to;
+                names[i - 1] = Some(to.stencil().name.to_string());
+                names[i] = Some("-".into());
+                // (`acc` doesn't hold the slot's value: not a `Star` on its
+                // own for the patterns above.)
+                plain_from = None;
+                i += 1;
+                continue;
+            }
+            // `Ldar a; Star b` with `acc` dead after: one move between the
+            // slots or the frame (`enter_*` loads a slot from the frame,
+            // `spill_*` stores one, `mov_u<b>_u<a>` copies a GPR).
+            if insn.op == Op::Ldar
+                && !insn.check_only
+                && i + 1 < n
+                && !is_target[i + 1]
+                && insns[i + 1].op == Op::Star
+                && !live_out[i + 1]
+                && s.check.is_none()
+                && s.post.is_none()
+                && let (Some(s2), Some(st2)) = (&sel[i + 1], &ins[i + 1])
+                && s2.check.is_none()
+                && s2.post.is_none()
+                && let (pre1, n1) = stencil_for(insn, s, st, &homes, &boxed, return_spills)
+                && let (pre2, n2) = stencil_for(&insns[i + 1], s2, st2, &homes, &boxed, return_spills)
+                && pre1.is_empty()
+                && pre2.is_empty()
+            {
+                let a = slot_reg(insn, s, &homes);
+                let b = slot_reg(&insns[i + 1], s2, &homes);
+                let slot = |name: &str, kind: &str| -> Option<u8> {
+                    let rest = name.strip_prefix(kind)?;
+                    let rest = rest.strip_suffix("_i").unwrap_or(rest);
+                    rest.parse().ok()
+                };
+                let piece = if n1 == "ldar_m" {
+                    match (slot(&n2, "star_g"), n2.strip_prefix("star_u").and_then(|k| k.parse::<u8>().ok())) {
+                        (Some(k), _) => Some(Piece::new(&format!("enter_g{k}"), a)),
+                        (_, Some(k)) => Some(Piece::new(&format!("enter_u{k}"), a)),
+                        _ => None,
+                    }
+                } else if let Some(x) = n1.strip_prefix("ldar_g").and_then(|k| k.parse::<u8>().ok()) {
+                    match (n2.as_str(), slot(&n2, "star_g")) {
+                        ("star_m" | "star_m_i", _) => Some(Piece::new(&format!("spill_g{x}"), b)),
+                        (_, Some(y)) if x != y => Some(Piece::new(&format!("mov_u{y}_u{x}"), 0)),
+                        _ => None,
+                    }
+                } else if let Some(x) = n1.strip_prefix("ldar_u").and_then(|k| k.parse::<u8>().ok()) {
+                    match n2.strip_prefix("star_u").and_then(|k| k.parse::<u8>().ok()) {
+                        Some(y) if x != y => Some(Piece::new(&format!("mov_u{y}_u{x}"), 0)),
+                        _ if n2 == "star_m_i" => Some(Piece::new(&format!("spill_u{x}"), b)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(piece) = piece {
+                    names[i] = Some(piece.stencil.stencil().name.to_string());
+                    names[i + 1] = Some("-".into());
+                    hot.push(piece);
+                    i += 2;
+                    continue;
+                }
+            }
             let (pre, name) = stencil_for(insn, s, st, &homes, &boxed, return_spills);
             // A site bound to the callee's code (`CallSite::by_code`).
             let by_code = |p: Option<&Prop>| match p {
@@ -7952,6 +8142,7 @@ impl JitCode {
                 let name = if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
                 arch::count_prefix(&mut buf[at..at + prefix], piece_counter(name, p.len()));
             }
+
         }
 
         mem.seal();
@@ -8360,7 +8551,8 @@ const MAX_INLINE_INSNS: usize = 64;
 /// 87 -48%, 85 -27%, 71 -8%; 91 +4%, 80 and 82 +2%. Without exempting
 /// calls in loops, 80 lost 80%; 60 cost 91 17%.
 const INLINE_BUDGET: usize = 80;
-/// Functions inlined at any depth: calling nothing and at most this long.
+/// Functions inlined at any depth: at most this long, with the small
+/// leaves they call (see `Lowering::small_leaf`).
 const MAX_LEAF_INSNS: usize = 16;
 
 /// A frame of compiled code: frame 0 is the function itself, the others
@@ -11347,15 +11539,58 @@ impl Lowering<'_> {
         captured_regs(code).iter().any(|&c| c)
     }
 
-    /// Whether `fo` is a bytecode function of at most [`MAX_LEAF_INSNS`]
-    /// instructions that calls nothing: inlined past [`MAX_INLINE_DEPTH`],
-    /// as it costs little code and inlines nothing further.
+    /// Whether `fo` is a bytecode function whose calls are all compiled
+    /// inline: `push` and `pop` (see `Lowering::emit_frame`), or calls to
+    /// small leaves themselves, one level down (`Strength.weakestOf`
+    /// calling `weaker`, and `OrderedCollection.add` pushing, in
+    /// DeltaBlue), at most [`MAX_LEAF_INSNS`] instructions with those
+    /// leaves. Inlined past [`MAX_INLINE_DEPTH`], as it costs little code
+    /// and inlines nothing further. Counting only its own instructions let
+    /// DeltaBlue's constraint methods through (`execute`, 36 with its
+    /// leaves; `inputsKnown`, 26; `markInputs`, 20), inlined at every
+    /// polymorphic site calling them: 27% more compiled code, and 6% more
+    /// cycles than with the cap.
     fn small_leaf(&mut self, fo: *mut Object) -> bool {
+        self.small_tree(fo, 2).is_some_and(|n| n <= MAX_LEAF_INSNS)
+    }
+
+    /// The instructions `fo` and the small leaves it calls inline into, if
+    /// it is a small leaf `levels` levels deep (see [`Lowering::small_leaf`]).
+    fn small_tree(&mut self, fo: *mut Object, levels: u32) -> Option<usize> {
         if fo.is_null() || unsafe { (*fo).class } != crate::object::Class::Function {
-            return false;
+            return None;
         }
-        let d = self.decoded(unsafe { (*fo).code });
-        d.0.len() <= MAX_LEAF_INSNS && !d.0.iter().any(|j| j.is_call())
+        let code = unsafe { (*fo).code };
+        let d = self.decoded(code);
+        if d.0.len() > MAX_LEAF_INSNS {
+            return None;
+        }
+        let mut n = d.0.len();
+        if !d.0.iter().any(|j| j.is_call()) {
+            return Some(n);
+        }
+        if levels <= 1 {
+            return None;
+        }
+        let fb = self.feedback(code);
+        let (push, pop) = unsafe { ((*self.state.vm).array_push_fn, (*self.state.vm).array_pop_fn) };
+        for j in d.0.iter().filter(|j| j.is_call()) {
+            if j.op != Op::Call || j.bail || j.forward {
+                return None;
+            }
+            let ic = fb.ic(j.ic as usize);
+            if unsafe { (*ic).loc } == crate::vm::VIA_CALL {
+                return None;
+            }
+            let (h, other) = unsafe { ((*ic).holder, (*ic.add(1)).holder) };
+            if !other.is_null() {
+                return None;
+            }
+            if !((h == push && j.imm == 1) || (h == pop && j.imm == 0)) {
+                n += self.small_tree(h, levels - 1)?;
+            }
+        }
+        Some(n)
     }
 
     /// The functions to inline for call `i` of frame `frame` when its

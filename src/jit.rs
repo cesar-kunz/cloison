@@ -624,6 +624,8 @@ fn runtime_function(name: &str) -> usize {
     }
 }
 
+pub(crate) mod rx;
+
 // ---- Architecture specifics ----
 
 #[cfg(target_arch = "x86_64")]

@@ -28,6 +28,10 @@ pub struct Regex {
     /// The pattern, if it is just characters (case-sensitive): found by
     /// searching for them, without the interpreter.
     literal: Option<Vec<u16>>,
+    /// `prog` as native code, compiled at the `native_after()`th exec
+    /// (`None` inside: it has instructions that don't compile).
+    native: std::cell::OnceCell<Option<Native>>,
+    execs: std::cell::Cell<u32>,
 }
 
 /// A run of characters in the pattern's top-level sequence, so in every
@@ -125,6 +129,8 @@ impl Regex {
             prog: Program::default(),
             run: Default::default(),
             literal: None,
+            native: Default::default(),
+            execs: Default::default(),
         };
         re.prog = Program::compile(&re);
         re.literal = match &re.node {
@@ -218,12 +224,42 @@ impl Regex {
             caps.push(Some((q, q + l.len())));
             return true;
         }
+        if self.native.get().is_none() {
+            let n = self.execs.get() + 1;
+            self.execs.set(n);
+            if n >= native_after() {
+                let _ = self.native.set(Native::compile(self));
+            }
+        }
+        let native = self.native.get().and_then(Option::as_ref);
         let mut kept = self.run.try_borrow_mut().ok();
-        let mut fresh = Run::default();
-        let run = kept.as_deref_mut().unwrap_or(&mut fresh);
+        let mut fresh;
+        let run = match kept.as_deref_mut() {
+            Some(run) => run,
+            None => {
+                fresh = Run::default();
+                &mut fresh
+            }
+        };
         run.caps.resize(self.groups, None);
         run.regs.resize(self.prog.nregs, 0);
-        if self.search(s, start, |at| self.prog.run(self, s, at, run)).is_none() {
+        // Native code's registers, clean from one attempt to the next (a
+        // failed one undoes its changes) unless one bailed.
+        let mut clean = false;
+        let mut attempt = |at, run: &mut Run| {
+            if let Some(n) = native {
+                if !clean {
+                    n.begin(run);
+                    clean = true;
+                }
+                match n.run(self, s, at, run) {
+                    Some(matched) => return matched,
+                    None => clean = false,
+                }
+            }
+            self.prog.run(self, s, at, run)
+        };
+        if self.search(s, start, |at| attempt(at, run)).is_none() {
             return false;
         }
         caps.extend_from_slice(&run.caps);
@@ -934,6 +970,247 @@ struct Run {
     caps: Captures,
     regs: Vec<usize>,
     stack: Vec<Bt>,
+    /// Native code's registers and backtracking stack (see [`Native`]).
+    slots: Vec<usize>,
+    bt: Vec<usize>,
+}
+
+/// The exec at which a pattern is compiled to native code: `TOI_NO_JIT`
+/// or `TOI_NO_RX_JIT` set, never.
+fn native_after() -> u32 {
+    static AFTER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *AFTER.get_or_init(|| {
+        if std::env::var_os("TOI_NO_JIT").is_some() || std::env::var_os("TOI_NO_RX_JIT").is_some() {
+            u32::MAX
+        } else {
+            NATIVE_AFTER
+        }
+    })
+}
+
+/// Execs of a pattern before it's compiled to native code.
+const NATIVE_AFTER: u32 = 3;
+
+/// The native backtracking stack's first size and largest, in words: a
+/// match that needs more is the interpreter's.
+const NATIVE_STACK: usize = 1 << 10;
+const NATIVE_STACK_MAX: usize = 1 << 20;
+
+/// A program as native code (`jit::rx`): one piece per instruction (a run
+/// and its unit share one), then `rx_fail`, `rx_nomatch` and the runs'
+/// backtracking pieces. Its registers (`Run::slots`): a scratch one (for
+/// the entries below a run's), the program's, then two per group.
+struct Native {
+    code: crate::jit::rx::Code,
+    /// The records pieces point at.
+    _runs: Box<[crate::jit::rx::Run]>,
+    _heads: Box<[crate::jit::rx::Head]>,
+    classes: Box<[crate::jit::rx::Class]>,
+    _ranges: Vec<Vec<[u16; 2]>>,
+    /// `rx_nomatch`'s address.
+    nomatch: usize,
+    /// The first group's register, and the number of registers.
+    caps_at: usize,
+    slots: usize,
+}
+
+impl Native {
+    /// `re`'s program compiled, if it has only instructions that compile
+    /// (not backreferences or lookaheads).
+    #[cold]
+    fn compile(re: &Regex) -> Option<Native> {
+        use crate::jit::rx::{self, Imm64, Piece, To};
+        let code = &re.prog.code;
+        // Each instruction's piece (a run's unit: the run's).
+        let mut idx = vec![0; code.len() + 1];
+        let (mut n, mut nruns, mut nheads) = (0, 0, 0);
+        let mut i = 0;
+        while i < code.len() {
+            idx[i] = n;
+            n += 1;
+            match code[i] {
+                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd => return None,
+                Insn::Run { .. } | Insn::LazyRun { .. } => {
+                    idx[i + 1] = idx[i];
+                    nruns += 1;
+                    i += 2;
+                    continue;
+                }
+                Insn::Head { .. } => nheads += 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let caps_at = 1 + re.prog.nregs;
+        let slots = caps_at + 2 * re.groups;
+        if slots > 0xFFFF {
+            return None;
+        }
+        let (fail, nomatch) = (n, n + 1);
+        let mut runs: Box<[rx::Run]> = (0..nruns).map(|_| rx::Run::default()).collect();
+        let mut heads: Box<[rx::Head]> = (0..nheads).map(|_| rx::Head::default()).collect();
+        let ranges: Vec<Vec<[u16; 2]>> =
+            re.prog.classes.iter().map(|(r, _)| r.iter().map(|&(lo, hi)| [lo, hi]).collect()).collect();
+        let classes: Box<[rx::Class]> = re
+            .prog
+            .classes
+            .iter()
+            .zip(&ranges)
+            .map(|((_, neg), r)| rx::Class { ranges: r.as_ptr(), n: r.len(), neg: *neg as usize })
+            .collect();
+        let reg = |r: u32| 1 + r as usize;
+        let group = |g: u32| caps_at + 2 * g as usize;
+        let piece = |name| Piece::new(name, To::Piece(fail));
+        let mut pieces = Vec::with_capacity(n + 2 + nruns);
+        let mut backs = Vec::with_capacity(nruns);
+        // (head, its exit's piece, its body's piece)
+        let mut head_at = Vec::with_capacity(nheads);
+        let (mut runs_k, mut heads_k) = (0, 0);
+        let mut i = 0;
+        while i < code.len() {
+            let p = match code[i] {
+                Insn::Char(c) => Piece { imm: c as u32, ..piece("rx_char") },
+                Insn::CharFold { c, canon } => Piece { imm: c as u32 | (canon as u32) << 16, ..piece("rx_fold") },
+                Insn::Any => piece("rx_any"),
+                Insn::Class { ascii, k } => Piece {
+                    imm: k,
+                    imm64: Imm64::Value(ascii as u64),
+                    imm64b: (ascii >> 64) as u64,
+                    ..piece("rx_class")
+                },
+                Insn::Str(k) => {
+                    let u = &re.prog.strs[k as usize];
+                    Piece { imm: u.len() as u32, imm64: Imm64::Value(u.as_ptr() as u64), ..piece("rx_str") }
+                }
+                Insn::Start => piece(if re.multiline { "rx_start_m" } else { "rx_start" }),
+                Insn::End => piece(if re.multiline { "rx_end_m" } else { "rx_end" }),
+                Insn::Boundary(b) => Piece { imm: b as u32, ..piece("rx_boundary") },
+                Insn::Split(to) => Piece { imm64: Imm64::Piece(idx[to as usize]), ..piece("rx_split") },
+                Insn::Jmp(to) => Piece { cont: To::Piece(idx[to as usize]), ..piece("rx_jmp") },
+                Insn::Mark(r) => Piece { imm: reg(r) as u32, ..piece("rx_mark") },
+                Insn::Zero(r) => Piece { imm: reg(r) as u32, ..piece("rx_zero") },
+                Insn::Save { g, r } => Piece { imm: (group(g) | reg(r) << 16) as u32, ..piece("rx_save") },
+                Insn::Clear { lo, hi } => Piece { imm: (group(lo) | group(hi) << 16) as u32, ..piece("rx_clear") },
+                Insn::Head { c, min, max, greedy, exit } => {
+                    let h = &mut heads[heads_k];
+                    (h.c, h.min, h.max) = (reg(c), min as usize, max as usize);
+                    head_at.push((heads_k, idx[exit as usize], idx[i + 1]));
+                    heads_k += 1;
+                    Piece {
+                        imm64: Imm64::Value(h as *const rx::Head as u64),
+                        ..piece(if greedy { "rx_head" } else { "rx_lazy_head" })
+                    }
+                }
+                Insn::Tail { c, p, min, head } => Piece {
+                    imm: (reg(c) | reg(p) << 16) as u32,
+                    imm64: Imm64::Value(min as u64),
+                    cont: To::Piece(idx[head as usize]),
+                    ..piece("rx_tail")
+                },
+                Insn::Run { min, max } | Insn::LazyRun { min, max } => {
+                    let greedy = matches!(code[i], Insn::Run { .. });
+                    let r = &mut runs[runs_k];
+                    runs_k += 1;
+                    (r.min, r.max) = (min as usize, max as usize);
+                    let names = match code[i + 1] {
+                        Insn::Char(c) => {
+                            r.k = c as usize;
+                            ["rx_run_char", "rx_lazy_char", "rx_lazyback_char"]
+                        }
+                        Insn::CharFold { c, canon } => {
+                            r.k = c as usize | (canon as usize) << 16;
+                            ["rx_run_fold", "rx_lazy_fold", "rx_lazyback_fold"]
+                        }
+                        Insn::Any => ["rx_run_any", "rx_lazy_any", "rx_lazyback_any"],
+                        Insn::Class { ascii, k } => {
+                            (r.lo, r.hi, r.k) = (ascii as u64, (ascii >> 64) as u64, k as usize);
+                            ["rx_run_class", "rx_lazy_class", "rx_lazyback_class"]
+                        }
+                        i => unreachable!("a run of {i:?}"),
+                    };
+                    let rec = Imm64::Value(r as *const rx::Run as u64);
+                    let back = if greedy { "rx_back" } else { names[2] };
+                    backs.push(Piece { imm64: rec, cont: To::Piece(idx[i + 2]), ..piece(back) });
+                    pieces.push(Piece { imm64: rec, ..piece(if greedy { names[0] } else { names[1] }) });
+                    i += 2;
+                    continue;
+                }
+                Insn::Match => piece("rx_match"),
+                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd => unreachable!(),
+            };
+            pieces.push(p);
+            i += 1;
+        }
+        debug_assert_eq!(pieces.len(), n);
+        pieces.push(piece("rx_fail"));
+        pieces.push(piece("rx_nomatch"));
+        pieces.extend(backs);
+        let native = rx::Code::assemble(&pieces);
+        for (k, r) in runs.iter_mut().enumerate() {
+            r.back = native.at[nomatch + 1 + k];
+        }
+        for (k, exit, body) in head_at {
+            (heads[k].exit, heads[k].body) = (native.at[exit], native.at[body]);
+        }
+        Some(Native {
+            nomatch: native.at[nomatch],
+            code: native,
+            _runs: runs,
+            _heads: heads,
+            classes,
+            _ranges: ranges,
+            caps_at,
+            slots,
+        })
+    }
+
+    /// `run`'s registers and stack set up for attempts: every group unset,
+    /// and at the stack's bottom, the entry that ends a failed attempt.
+    fn begin(&self, run: &mut Run) {
+        let Run { slots, bt, .. } = run;
+        if slots.len() != self.slots {
+            slots.resize(self.slots, 0);
+        }
+        slots[self.caps_at..].fill(crate::jit::rx::NONE);
+        if bt.len() < NATIVE_STACK {
+            bt.resize(NATIVE_STACK, 0);
+        }
+        bt[0] = self.nomatch;
+    }
+
+    /// An attempt at `at` (after [`Native::begin`], and attempts that
+    /// failed), as [`Program::run`]: whether it matched, or `None` if it's
+    /// the interpreter's (the stack filled, or a unit past ASCII needs
+    /// folding). That leaves registers changed.
+    fn run(&self, re: &Regex, s: &[u16], at: usize, run: &mut Run) -> Option<bool> {
+        use crate::jit::rx;
+        let Run { caps, slots, bt, .. } = run;
+        let ctx = rx::Ctx {
+            limit: unsafe { bt.as_mut_ptr().add(bt.len() - 4) },
+            classes: self.classes.as_ptr(),
+            ic: re.ignore_case as usize,
+        };
+        let end = unsafe {
+            (self.code.entry())(s.as_ptr(), s.len(), at, bt.as_mut_ptr().add(2), slots.as_mut_ptr(), &ctx)
+        };
+        match end {
+            rx::NOMATCH => Some(false),
+            rx::BAIL => {
+                if bt.len() < NATIVE_STACK_MAX {
+                    bt.resize(bt.len() * 2, 0);
+                }
+                None
+            }
+            end => {
+                caps[0] = Some((at, end));
+                for (g, c) in caps.iter_mut().enumerate().skip(1) {
+                    let k = self.caps_at + 2 * g;
+                    *c = (slots[k] != rx::NONE).then(|| (slots[k], slots[k + 1]));
+                }
+                Some(true)
+            }
+        }
+    }
 }
 
 impl Program {
@@ -1113,8 +1390,11 @@ impl Program {
 
     /// Run from `start` over `s`: whether a match begins there, its
     /// captures in `run.caps`.
+    // (Not inlined into `exec_into`: its frame would make every exec's
+    // setup cost more, natively run or not.)
+    #[inline(never)]
     fn run(&self, re: &Regex, s: &[u16], start: usize, run: &mut Run) -> bool {
-        let Run { caps, regs, stack } = run;
+        let Run { caps, regs, stack, .. } = run;
         caps.fill(None);
         stack.clear();
         let (mut pc, mut pos) = (0usize, start);
@@ -1616,11 +1896,17 @@ mod tests {
                 _ => format!("{}{}", pattern(rand, depth - 1), pattern(rand, depth - 1)),
             }
         }
-        let (mut tried, mut matched) = (0, 0);
-        for _ in 0..20_000 {
+        let (mut tried, mut matched, mut native) = (0, 0, 0);
+        for k in 0..20_000 {
             let p = pattern(&mut rand, 3);
             let f = ["", "i", "m", "im"][rand(4)];
             let Ok(re) = Regex::new(&p, f) else { continue };
+            // Every other pattern as native code, when it compiles.
+            if k % 2 == 0 {
+                let n = Native::compile(&re);
+                native += n.is_some() as usize;
+                let _ = re.native.set(n);
+            }
             for _ in 0..4 {
                 let len = if rand(4) == 0 { rand(24) } else { rand(9) };
                 let s: Vec<u16> = (0..len).map(|_| b"abcA1 \n_"[rand(8)] as u16).collect();
@@ -1632,8 +1918,32 @@ mod tests {
                 }
             }
         }
-        // Both ways, often.
+        // Both ways, often; native code, often.
         assert!(matched > tried / 4 && matched < tried * 3 / 4, "{matched} of {tried}");
+        assert!(native > 5000, "{native} compiled");
+    }
+
+    /// Native code leaves an attempt to the interpreter when its stack
+    /// fills, or when a unit past ASCII needs case folding.
+    #[test]
+    fn native_code_bails_to_the_interpreter() {
+        let native = |p: &str, f: &str| {
+            let re = Regex::new(p, f).unwrap();
+            let n = Native::compile(&re);
+            assert!(n.is_some(), "/{p}/ compiles");
+            let _ = re.native.set(n);
+            re
+        };
+        let s: Vec<u16> = "ab".repeat(1 << 20).encode_utf16().collect();
+        let all = Some((0, s.len()));
+        assert_eq!(native("^(?:a|b)*$", "").exec(&s, 0).unwrap()[0], all);
+        let c = native("^(ab)+$", "").exec(&s, 0).unwrap();
+        assert_eq!((c[0], c[1]), (all, Some((s.len() - 2, s.len()))));
+        let u = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        assert_eq!(native("xé+y", "i").exec(&u("_XÉéY"), 0).unwrap()[0], Some((1, 5)));
+        assert_eq!(native("[à-ï]+", "i").exec(&u("aÀÉé"), 0).unwrap()[0], Some((1, 4)));
+        assert_eq!(native("[à-ï]+", "").exec(&u("aÀÉé"), 0).unwrap()[0], Some((3, 4)));
+        assert_eq!(native("\\s+", "").exec(&u("a\u{a0}\u{2028} b"), 0).unwrap()[0], Some((1, 4)));
     }
 
     /// `find` (eight positions at a time) finds what a scan of every

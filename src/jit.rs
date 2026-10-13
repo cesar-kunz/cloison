@@ -1614,6 +1614,10 @@ struct Insn {
     /// A `Nop` [`lower`] adds before the `Return` of a function whose
     /// registers closures capture: its open upvalues closed.
     close: bool,
+    /// A named load whose cache missed in compiled code before: a miss
+    /// goes through the runtime and on, instead of exiting (see
+    /// [`SOFT_EXITS`]).
+    soft: bool,
 }
 
 impl Insn {
@@ -1958,6 +1962,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 forward,
                 delete,
                 close: false,
+                soft: false,
             }
         })
         .collect();
@@ -3163,6 +3168,8 @@ struct Sel {
     result: Option<(&'static str, u64)>,
     /// A piece after the stencil (`unbox_num_acc`).
     post: Option<&'static str>,
+    /// A soft load's miss path ([`Insn::soft`]).
+    soft: Option<Soft>,
     /// The register whose slot the stencil reads, if not the
     /// instruction's: a copy's, if in memory or a general register (see
     /// [`slot_reg`]).
@@ -3179,9 +3186,19 @@ impl Sel {
             check: None,
             result: None,
             post: None,
+            soft: None,
             reg: None,
         }
     }
+}
+
+/// A soft load's miss: the runtime's load (`get_named_rt`) of the name
+/// `name` (an `Atom`), a check that the value fits the type a hit gives
+/// (`check`, as a store's), and on to after the access.
+#[derive(Clone, Copy, Debug)]
+struct Soft {
+    name: u64,
+    check: Option<(&'static str, u64, u64)>,
 }
 
 /// The register whose slot the stencil for `insn` reads: `sel.reg` if its
@@ -3440,6 +3457,14 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     out,
                 )
             };
+        }
+        // A number, or no value, never is the callee (a soft load's may be
+        // a number; its register may then be an unboxed int32's).
+        _ if insn.guard != 0
+            && !insn.on_shape
+            && matches!(st.regs.get(insn.reg as usize), Some(Ty::I32 | Ty::F64 | Ty::Bot)) =>
+        {
+            return Sel::new("bail", "", out);
         }
         _ if insn.guard != 0 && insn.next_case => {
             return Sel {
@@ -4331,6 +4356,39 @@ unsafe fn extends(s: *const Shape, b: *const Shape) -> bool {
 /// - A transitioning store downgrades every `Obj` fact to `Ext`, as another
 ///   register may hold the same object.
 fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
+    let sel = select_cached(insn, i, st, spec);
+    if insn.soft { soften(insn, st, spec, sel) } else { sel }
+}
+
+/// A soft load's selection ([`Insn::soft`]) from its cached one: where a
+/// guard can miss, the miss goes through the runtime (see [`Soft`]), so
+/// past it the receiver's shape is what it was before; the value from the
+/// runtime gets the check its type needs.
+fn soften(insn: &Insn, st: &TypeState, spec: &Spec, mut sel: Sel) -> Sel {
+    let guarded = sel.case != "nc"
+        && matches!(sel.base, "get_own" | "get_oop" | "get_proto" | "get_length" | "poly");
+    let Some(fbs) = spec.feedback else { return sel };
+    if !guarded || insn.check_only {
+        return sel;
+    }
+    let check = match sel.out.acc {
+        Ty::I32 => Some(("check_acc_int", 0, 0)),
+        Ty::F64 => Some(("check_acc_num", 0, 0)),
+        Ty::Obj(s) | Ty::Ext(s) => Some(("check_acc_shape", s, 0)),
+        Ty::Any => None,
+        Ty::Bot => return sel,
+    };
+    let reg = st.regs.get(insn.reg as usize).copied().unwrap_or(Ty::Any);
+    sel.out.regs.set(insn.reg as usize, reg);
+    sel.soft = Some(Soft {
+        name: fbs[insn.ic_frame()].name(insn).0 as u64,
+        check,
+    });
+    sel
+}
+
+/// [`select_property`] as the cache says, whatever it held before.
+fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     use Ty::{Any, F64, I32};
     let mut out = st.clone();
     let bail = |out: TypeState| Sel::new("bail", "", out);
@@ -7573,7 +7631,7 @@ impl JitCode {
 
             if s.base == "poly" {
                 let at = exit_homes(&homes, i);
-                emit_poly(i, insn, s, st, props, polys, &at, &boxed, &mut hot, &mut exits);
+                emit_poly(i, 3 * n + i, insn, s, st, props, polys, &at, &boxed, &mut hot, &mut exits);
                 names[i] = Some(format!(
                     "poly{}_{}",
                     if insn.op == Op::GetNamed {
@@ -7984,6 +8042,17 @@ impl JitCode {
                     }
                 }
                 _ => main,
+            };
+            // A soft load's guard misses into its runtime path.
+            let main = match s.soft {
+                Some(soft) => {
+                    exits.push((3 * n + i, soft_path(i, insn, soft, &homes, hot.len())));
+                    Piece {
+                        exit: (3 * n + i) as u32,
+                        ..main
+                    }
+                }
+                None => main,
             };
             hot.push(main);
             hot.extend(result);
@@ -8690,6 +8759,9 @@ enum Tier {
 const HOT_HEAT: i64 = 1_000;
 
 const MAX_PROPERTY_EXITS: u32 = 4;
+/// Exits at a named load after which its misses go through the runtime
+/// and compiled code goes on (`Insn::soft`), short of giving it up.
+const SOFT_EXITS: u32 = 1;
 const MAX_BAIL_EXITS: u32 = 3;
 /// See `vm_finish`.
 const MAX_LATE_EXITS: u32 = 16;
@@ -9118,6 +9190,7 @@ pub(crate) struct Snapshot {
 #[allow(clippy::too_many_arguments)]
 fn emit_poly(
     i: usize,
+    soft_key: usize,
     insn: &Insn,
     s: &Sel,
     st: &TypeState,
@@ -9155,7 +9228,10 @@ fn emit_poly(
             ..Piece::new(c, 0)
         });
     }
-    hot.push(at("guard_cell"));
+    // A soft load's misses (not a cell, no shape matching) go through the
+    // runtime, then on past the accesses.
+    let miss = if s.soft.is_some() { soft_key } else { i } as u32;
+    hot.push(Piece { exit: miss, ..at("guard_cell") });
     // Only the dispatch for a load whose value is unused: a match jumps
     // past the last compare.
     if insn.check_only {
@@ -9192,6 +9268,7 @@ fn emit_poly(
             let last = c + 1 == m;
             hot.push(Piece {
                 imm64: case.base(),
+                exit: miss,
                 jump: if last {
                     Target::Next
                 } else {
@@ -9214,6 +9291,9 @@ fn emit_poly(
                 ..Piece::with_imm(&format!("{base}_nc_{loc}"), imm)
             });
         }
+        if let Some(soft) = s.soft {
+            exits.push((soft_key, soft_path(i, insn, soft, homes, end)));
+        }
         if let Some(post) = s.post {
             hot.push(Piece::new(post, 0));
         }
@@ -9225,6 +9305,31 @@ fn emit_poly(
         ..Piece::new("exit", 0)
     });
     exits.push((i, seq));
+}
+
+/// Soft load `i`'s miss path (see [`Soft`]), cold, on to after hot piece
+/// `after`: it exits, through the instruction's exit, where the runtime
+/// would throw or run code, or the value doesn't fit.
+fn soft_path(i: usize, insn: &Insn, soft: Soft, homes: &[Home], after: usize) -> Vec<Piece> {
+    let loc = homes
+        .get(insn.reg as usize)
+        .copied()
+        .unwrap_or(Home::Mem)
+        .loc();
+    let mut seq = vec![Piece {
+        reg: insn.reg,
+        imm64: soft.name,
+        exit: i as u32,
+        ..Piece::new(&format!("get_named_rt_{loc}"), 0)
+    }];
+    seq.extend(soft.check.map(|(c, imm64, imm64b)| Piece {
+        imm64,
+        imm64b,
+        exit: i as u32,
+        ..Piece::new(c, 0)
+    }));
+    seq.last_mut().unwrap().cont = Target::AfterPiece(after as u32);
+    seq
 }
 
 /// The result of [`lower`].
@@ -9317,6 +9422,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         forward: false,
         delete: 0,
         close: false,
+        soft: false,
     }
 }
 
@@ -11455,6 +11561,12 @@ impl Lowering<'_> {
                         }
                         _ => self.out.fbs[frame].prop(&i, self.epoch, &mut self.out.polys),
                     };
+                    i.soft = i.op == Op::GetNamed
+                        && self
+                            .state
+                            .property_exits
+                            .get(&origin)
+                            .is_some_and(|&n| n >= SOFT_EXITS);
                     self.push(i, prop);
                 }
             }
@@ -12407,7 +12519,8 @@ impl Lowering<'_> {
         let (g, Prop::Poly { n, at }) = (insns[get], self.out.props[get]) else {
             return none;
         };
-        if g.op != Op::GetNamed || g.frame as usize != frame || g.bail {
+        // (A soft load's value may come from any receiver.)
+        if g.op != Op::GetNamed || g.frame as usize != frame || g.bail || g.soft {
             return none;
         }
         // The call's `this` is the receiver: the same register, or one it
@@ -12524,7 +12637,7 @@ impl Lowering<'_> {
             .rposition(|j| j.frame as usize == frame && j.op == Op::Star && j.reg == r)?;
         let get = k.checked_sub(1)?;
         let g = insns[get];
-        if g.op != Op::GetNamed || g.frame as usize != frame || g.bail {
+        if g.op != Op::GetNamed || g.frame as usize != frame || g.bail || g.soft {
             return None;
         }
         let value = |addr: u64| {
@@ -12575,7 +12688,7 @@ impl Lowering<'_> {
                 .all(|c| matches!(c.loc, CaseLoc::Proto(addr) if holds(addr))),
             _ => false,
         };
-        proven && g.op == Op::GetNamed && g.frame as usize == frame && !g.bail
+        proven && g.op == Op::GetNamed && g.frame as usize == frame && !g.bail && !g.soft
     }
 
     /// For a call whose callee register `r` (of frame `frame`) is

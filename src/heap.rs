@@ -621,7 +621,7 @@ impl Heap {
                 .filter(|&&(_, free)| free >= RECYCLE)
                 .map(|&(a, _)| ((a - self.base) / BLOCK) as u32),
         );
-        let keep = self.gc.room.max(self.gc.headroom()) / BLOCK;
+        let keep = self.kept_blocks();
         let mut empty = empty.to_vec();
         empty.sort_unstable();
         let mut run: Option<(usize, usize)> = None;
@@ -649,17 +649,28 @@ impl Heap {
         }
     }
 
-    /// Free the large cell at `p` (its blocks become free).
+    /// How many free blocks keep their memory: the room the heap may grow
+    /// by before the next cycle (see `add_swept`).
+    fn kept_blocks(&self) -> usize {
+        self.gc.room.max(self.gc.headroom()) / BLOCK
+    }
+
+    /// Free the large cell at `p` (its blocks become free, kept like an
+    /// empty block's while there's room: see `add_swept`).
     pub(crate) fn free_large(&mut self, p: usize) {
         let b = (p - self.base) / BLOCK;
         let Block::LargeHead(n) = self.blocks[b] else { panic!("no large cell at {p:#x}") };
+        let n = n as usize;
         unsafe { *meta(p) = 0 };
-        for k in b..b + n as usize {
+        let kept = self.empty.len() + n <= self.kept_blocks();
+        for k in b..b + n {
             self.blocks[k] = Block::Free;
-            self.free.push(k as u32);
+            if kept { self.empty.push(k as u32) } else { self.free.push(k as u32) }
         }
-        self.used -= n as usize * BLOCK;
-        release(p, n as usize * BLOCK);
+        self.used -= n * BLOCK;
+        if !kept {
+            release(p, n * BLOCK);
+        }
     }
 
     /// The address range of each block in use: a small block's, or a large
@@ -748,9 +759,18 @@ impl Heap {
             run == n
         })? + 1
             - n;
-        self.free.retain(|&k| !(b..b + n).contains(&(k as usize)));
-        self.empty.retain(|&k| !(b..b + n).contains(&(k as usize)));
-        self.clean(b, n);
+        let run = b as u32..(b + n) as u32;
+        self.free.retain(|k| !run.contains(k));
+        // Only the kept blocks hold old bytes: released ones are zero.
+        let mut kept = Vec::new();
+        self.empty.retain(|&k| !run.contains(&k) || {
+            kept.push(k);
+            false
+        });
+        unsafe { std::ptr::write_bytes(meta(self.block_addr(b) as usize), 0, n * BLOCK / GRANULE) };
+        for k in kept {
+            unsafe { std::ptr::write_bytes(self.block_addr(k as usize), 0, BLOCK) };
+        }
         Some(b)
     }
 

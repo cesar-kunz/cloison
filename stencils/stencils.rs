@@ -2722,6 +2722,14 @@ macro_rules! rel_generic {
             slow!($s)
         }; |$s| {
             let x = $get;
+            // Two numbers, one a double (Navier-Stokes's `x > Wp5`):
+            // compared here, unordered if either is NaN.
+            if is_number($s.tag, x) && is_number($s.tag, $s.acc) {
+                let f = |v: Value| if $s.tag.is_int32(v) { i2f(int(v)) } else { $s.tag.decode_f64(v) };
+                let (a, b) = (f(x), f($s.acc));
+                let o = if a < b { 0 } else if a == b { 1 } else if a > b { 2 } else { 3 };
+                act!($act, $s, holds(imm(), o))
+            }
             let c = holds(imm(), rt_compare!($s, x, $s.acc));
             act!($act, $s, c)
         });

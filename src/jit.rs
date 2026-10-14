@@ -2218,9 +2218,12 @@ pub(crate) enum Prop {
     /// a buffer's or a string's elements (`vm::BYTES_LOC`; see
     /// `get_keyed_rt` in the stencils).
     Runtime,
-    /// An upvalue of an inlined frame's function, known: its cell
-    /// (`vm::Upvalue`), at address `cell`.
-    Upvalue { cell: u64 },
+    /// An upvalue: of an inlined frame's function, known, its cell
+    /// (`vm::Upvalue`) at address `cell` (0: the frame's function's, found
+    /// through the frame); `int` if it held an int32 when lowered, which
+    /// the load then checks (exiting, and the site isn't speculated on
+    /// again: `VmState::widened`).
+    Upvalue { cell: u64, int: bool },
     /// A `delete` (`Insn::delete`): the compiled function's epoch, and
     /// its address (`Code::field_deps`), checked after it.
     Delete { epoch: u32, addr: u64 },
@@ -2504,6 +2507,9 @@ impl Feedback {
             return Prop::None;
         }
         if insn.op == Op::GetKeyed {
+            if std::env::var_os("TOI_KEYED").is_some() {
+                eprintln!("keyed pc{} shape {:p} elems {:?}", insn.pc, ic.shape, unsafe { (*ic.shape).elems });
+            }
             return Prop::Keyed {
                 shape: ic.shape as u64,
                 elems: unsafe { (*ic.shape).elems },
@@ -4101,12 +4107,19 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 out.acc = Any;
             }
             let load = insn.op == Op::LdaUpvalue;
+            let int = matches!(spec.props.get(i), Some(Prop::Upvalue { int: true, .. })) && load;
+            if int {
+                out.acc = I32;
+            }
+            let post = int.then_some("check_acc_int");
             return match spec.props.get(i).copied() {
-                Some(Prop::Upvalue { cell }) => Sel {
+                Some(Prop::Upvalue { cell, .. }) if cell != 0 => Sel {
                     ops: Some((0, cell, 0)),
+                    post,
                     ..Sel::new(if load { "lda_upvalue_c" } else { "sta_upvalue_c" }, "", out)
                 },
                 _ => Sel {
+                    post,
                     ops: Some((
                         (crate::object::INLINE_BASE as u32
                             + 8 * unsafe { (*(*interp::current_vm()).function_shape).capacity.get() }
@@ -4443,6 +4456,9 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 (Ty::Ext(_), _) => (pick("nc", "i_nc"), FieldType::Any),
                 _ => (pick("", "i"), FieldType::Any),
             };
+            if std::env::var_os("TOI_KEYED").is_some() && matches!(elems, FieldType::Any) {
+                eprintln!("anyload pc{} reg {:?} prop {:?}", insn.pc, reg, prop);
+            }
             let (t, post) = Ty::of_field(elems);
             out.acc = t;
             return Sel {
@@ -8228,7 +8244,10 @@ impl JitCode {
             let helper_exits = main
                 .slow
                 .is_some_and(|h| h.stencil().relocs.iter().any(|r| r.2 == Sym::Exit));
-            if main.uses(Sym::Exit) || helper_exits || check.is_some() {
+            // (A check after the stencil exits before the instruction too:
+            // `lda_upvalue`'s, which only loads.)
+            let post_exits = s.post.is_some_and(|p| Piece::new(p, 0).uses(Sym::Exit));
+            if main.uses(Sym::Exit) || helper_exits || check.is_some() || post_exits {
                 // `add_smi_i` adds in place; undo it before anything else.
                 let mut seq: Vec<Piece> = Vec::new();
                 if name == "add_smi_i" {
@@ -8310,7 +8329,10 @@ impl JitCode {
             hot.push(main);
             hot.extend(result);
             if let Some(post) = s.post {
-                hot.push(Piece::new(post, 0));
+                hot.push(Piece {
+                    exit: i as u32,
+                    ..Piece::new(post, 0)
+                });
             }
             let mut full = match s.check {
                 Some((c, ..)) => format!("{c}+{name}"),
@@ -8974,6 +8996,10 @@ struct VmState {
     heat: Box<i64>,
     /// Whether the first compile chose the tier (see `inlining_pays`).
     classified: bool,
+    /// Per upvalue of the function, whether it held an int32 when a frame
+    /// first entered compiled code (its loads are speculated to give
+    /// one); empty till then.
+    int_upvalues: Vec<bool>,
 }
 
 impl VmState {
@@ -11889,11 +11915,22 @@ impl Lowering<'_> {
                 // frame's function (`lda_upvalue`).
                 Op::LdaUpvalue | Op::StaUpvalue => {
                     let func = self.out.frames[frame].func;
+                    let cell = |f: *mut Object| unsafe { *crate::vm::Vm::upvalues(f).add(i.imm as usize) };
+                    // An int32 now (the root's: when it was first entered,
+                    // see `VmState::int_upvalues`), and not exited at
+                    // since: speculated to stay one.
+                    let code = self.out.frames[frame].code as usize;
+                    let int = i.op == Op::LdaUpvalue
+                        && !self.state.widened.contains(&(code, i.pc))
+                        && if func.is_null() {
+                            frame == 0 && self.state.int_upvalues.get(i.imm as usize) == Some(&true)
+                        } else {
+                            unsafe { (**(cell(func) as *const *const Value)).is_int32() }
+                        };
                     let prop = if func.is_null() {
-                        Prop::None
+                        if int { Prop::Upvalue { cell: 0, int } } else { Prop::None }
                     } else {
-                        let cell = unsafe { *crate::vm::Vm::upvalues(func).add(i.imm as usize) };
-                        Prop::Upvalue { cell: cell as u64 }
+                        Prop::Upvalue { cell: cell(func) as u64, int }
                     };
                     self.push(i, prop);
                 }
@@ -13400,6 +13437,7 @@ impl JitFunction {
             },
             heat: Box::new(HOT_HEAT),
             classified: false,
+            int_upvalues: Vec::new(),
         }));
         f
     }
@@ -13466,6 +13504,20 @@ impl JitFunction {
                 vm.classified = true;
                 if unsafe { inlining_pays(vm.root) } {
                     vm.tier = Tier::Hot;
+                    vm.dirty = true;
+                }
+            }
+            // The upvalues' types, from the function this frame runs.
+            if vm.int_upvalues.is_empty() {
+                let n = unsafe { (&(*vm.root).upvalues).len() };
+                let f = unsafe { *(regs.byte_sub(interp::FUNC_OFF) as *const *mut Object) };
+                if n > 0 && !f.is_null() {
+                    vm.int_upvalues = (0..n)
+                        .map(|k| unsafe {
+                            let cell = *crate::vm::Vm::upvalues(f).add(k);
+                            (**(cell as *const *const Value)).is_int32()
+                        })
+                        .collect();
                     vm.dirty = true;
                 }
             }

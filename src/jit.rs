@@ -13823,6 +13823,11 @@ impl JitFunction {
             vm.cool = cooling(&mut vm.coolings, out_of_compiles);
             (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
             *vm.callee_exits.entry(origin).or_insert(0) += 1;
+        } else if insn.is_property() && matches!(vm.props.get(k), Some(Prop::Runtime)) {
+            // Given up already (through the runtime, which left where only
+            // the interpreter can go on: a function's property stored, a
+            // primitive's read): lowering again would give the same.
+            vm.dirty = was_dirty;
         } else if insn.is_property() {
             vm.cool = cooling(&mut vm.coolings, out_of_compiles);
             (vm.settle_mark, vm.settles) = (unsafe { (*vm.root).ic_misses.get() }, 0);
@@ -14260,9 +14265,13 @@ unsafe fn vm_run_(
             let mut slot = code.jit.borrow_mut();
             let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(code, vm_ptr)));
             // Cooling after an exit: calls run in the interpreter (not
-            // `NotCompiled`, which would stop entering for good).
+            // `NotCompiled`, which would stop entering for good). Not out
+            // of compilations: no lowering comes after it (TypeScript's
+            // `innerScan` ran 889K calls interpreted, 1.6K compiled).
+            let spent = f.vm.as_ref().is_some_and(|v| f.stats.compiles >= max_compiles(v.root_len));
             if left.is_none()
                 && pc == 0
+                && !spent
                 && let Some(v) = f.vm.as_mut()
                 && v.dirty
                 && v.cool > 0

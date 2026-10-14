@@ -12590,7 +12590,7 @@ impl Lowering<'_> {
         let f = self.out.frames[frame];
         let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
         self.call_in_loop = self.in_loop(f.code, i.pc);
-        if (depth >= MAX_INLINE_DEPTH && !self.small_leaf(ic.holder))
+        if (depth >= MAX_INLINE_DEPTH && !self.small_leaf(ic.holder) && !self.trampoline(ic.holder))
             || self.out.frames.len() >= 255
             || self
                 .state
@@ -12655,6 +12655,18 @@ impl Lowering<'_> {
                 .rposition(|s| s.op == Op::Star && s.reg == j.reg2)
                 .is_some_and(|s| s > 0 && insns[s - 1].op == Op::GetNamed && insns[s - 1].reg == 0)
         })
+    }
+
+    /// Whether `fo` is a trampoline, a bytecode function passing its
+    /// arguments on to a method of `this` (Prototype's `Class.create`
+    /// constructors): no inlining level (see [`Lowering::inline_case`]),
+    /// inlined at any depth; its method within the limit (or a small leaf).
+    fn trampoline(&mut self, fo: *mut Object) -> bool {
+        if fo.is_null() || unsafe { (*fo).class } != crate::object::Class::Function {
+            return false;
+        }
+        let code = unsafe { (*fo).code };
+        self.forwards(code) && self.forwards_this_method(code)
     }
 
     /// Whether `code` finds its arguments through its frame's header:
@@ -13626,7 +13638,12 @@ impl Lowering<'_> {
             }
         }
         self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
-        (guard, self.emit_frame(id, depth + 1))
+        // (A trampoline is no level: its method inlines at its depth, so a
+        // `new` in an inlined `initialize` inlines too. Raytrace's
+        // `IntersectionInfo`'s `new Color(0, 0, 0)` went through the
+        // runtime, and ran interpreted: the constructor never compiles.)
+        let level = usize::from(!self.trampoline(fo));
+        (guard, self.emit_frame(id, depth + level))
     }
 }
 

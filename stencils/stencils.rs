@@ -2256,12 +2256,15 @@ macro_rules! jump_to_boolean {
             }
             slow!(s)
         }; |s| {
-            // Without the runtime: `undefined`, `null` and doubles.
+            // Without the runtime: `undefined`, `null`, doubles and
+            // objects (cells but strings, class 4: an empty one is false).
             let b = if s.acc == Value::UNDEFINED || s.acc == Value::NULL {
                 false
             } else if s.acc.to_bits() & s.tag.to_bits() != 0 {
                 let d = s.tag.decode_f64(s.acc);
                 d < 0.0 || d > 0.0
+            } else if is_cell(s.tag, s.acc) && *(s.acc.to_bits() as *const u8).add(8) != 4 {
+                true
             } else {
                 rt_to_boolean!(s, s.acc)
             };

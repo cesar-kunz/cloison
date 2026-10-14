@@ -3739,3 +3739,18 @@ for (var i = 0; i < 30000; i++) s += f(i * 1e6 + 0.25);
 "#;
     assert_eq!(value(src), "1349961921417876,89935228932,0,NaN,-8,32");
 }
+
+/// Truthiness in compiled code (`jtotrue`/`jtofalse`): objects of every
+/// class are true without the runtime, strings by their length. The
+/// expected value is Node's.
+#[test]
+fn truthiness_of_every_kind_of_value() {
+    let src = r#"
+var vals = [{}, [], "", "a", "a" + "b", function () {}, new Date(0), 0.5, -0, NaN, null, undefined, true, false, 0, 7, new ArrayBuffer(0), /x/];
+function count(v) { var n = 0; for (var k = 0; k < 3; k++) { if (v) n++; if (!v) n += 10; } return n; }
+var out = [];
+for (var r = 0; r < 2000; r++) for (var i = 0; i < vals.length; i++) out[i] = count(vals[i]);
+out.join();
+"#;
+    assert_eq!(value(src), "3,3,30,3,3,3,3,3,30,30,30,30,3,30,30,3,3,3");
+}

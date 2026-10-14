@@ -3723,3 +3723,19 @@ for (var i = 0; i < 30000; i++) { s += f(o, i % 9); m += 1 / new V(i % 7, 1.5).m
         "30501185.765135095,10743.993963615587,1009.8377223398317,NaN,9,NaN"
     );
 }
+
+/// `Math.floor`, `ceil` and `round` results predicted int32 (checked
+/// after the call); a call giving a double, NaN or -0 leaves with it, and
+/// is predicted no more. The expected value is Node's.
+#[test]
+fn math_floor_results_predicted_int32() {
+    let src = r#"
+function f(x) { var a = Math.floor(x) + 1, b = Math.ceil(x) | 0, c = Math.round(x) * 2; return a + b + c; }
+var s = 0;
+for (var i = 0; i < 30000; i++) s += f(i * 0.75);
+var t = [f(3e10 + 0.5), f(-0.2), f(NaN), f(-2.5), f("7.5")];
+for (var i = 0; i < 30000; i++) s += f(i * 1e6 + 0.25);
+[s].concat(t).join();
+"#;
+    assert_eq!(value(src), "1349961921417876,89935228932,0,NaN,-8,32");
+}

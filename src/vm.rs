@@ -755,22 +755,28 @@ impl Vm {
                 READ_ONLY | DONT_ENUM | DONT_DELETE,
             );
         }
-        for (name, f, n) in [
-            ("log", math_log as NativeFn, 1),
-            ("exp", math_exp, 1),
-            ("sqrt", math_sqrt, 1),
-            ("abs", math_abs, 1),
-            ("floor", math_floor, 1),
-            ("ceil", math_ceil, 1),
-            ("round", math_round, 1),
-            ("sin", math_sin, 1),
-            ("cos", math_cos, 1),
-            ("pow", math_pow, 2),
-            ("min", math_min, 2),
-            ("max", math_max, 2),
-            ("random", math_random, 0),
+        // Results compiled code takes for doubles (checked, and unboxed:
+        // `1 / Math.sqrt(x)` divides doubles), or (`Any`) of any type:
+        // `Math.floor`'s and the like are mostly int32s, which as doubles
+        // would make the fields and elements they go to doubles (Crypto's
+        // digits).
+        use crate::jit::Ty::{Any, F64};
+        for (name, f, n, ty) in [
+            ("log", math_log as NativeFn, 1, F64),
+            ("exp", math_exp, 1, F64),
+            ("sqrt", math_sqrt, 1, F64),
+            ("abs", math_abs, 1, Any),
+            ("floor", math_floor, 1, Any),
+            ("ceil", math_ceil, 1, Any),
+            ("round", math_round, 1, Any),
+            ("sin", math_sin, 1, F64),
+            ("cos", math_cos, 1, F64),
+            ("pow", math_pow, 2, F64),
+            ("min", math_min, 2, Any),
+            ("max", math_max, 2, Any),
+            ("random", math_random, 0, F64),
         ] {
-            vm.define_native(math, name, f, n, crate::jit::Ty::Any, false);
+            vm.define_native(math, name, f, n, ty, false);
         }
         vm.date_prototype = vm.new_object(op);
         let dp = vm.date_prototype;

@@ -1736,8 +1736,9 @@ struct Insn {
     alloc: u64,
     /// A call [`lower`] compiles as `Array.prototype.push` (1) or `pop`
     /// (2) of its receiver, `String.prototype.charCodeAt` (4) or
-    /// `String.fromCharCode` (5), `Math.sqrt` (6) or `Math.pow` (7), after a
-    /// guard on the callee. (3: see `scalar_replace`.)
+    /// `String.fromCharCode` (5), `Math.sqrt` (6), `Math.pow` (7),
+    /// `Math.max` (8) or `Math.min` (9) of two, after a guard on the callee.
+    /// (3: see `scalar_replace`.)
     native: u8,
     /// For a `GetNamed`: only its receiver's shape check, the value unused
     /// (a proven callee's load; see `Lowering::drop_callee_load`). For the
@@ -1802,7 +1803,7 @@ impl Insn {
     /// `charCodeAt`, `fromCharCode`, `Math.sqrt`, `Math.pow`'s exponent;
     /// see [`Insn::native`]).
     fn takes_acc(&self) -> bool {
-        matches!(self.native, 1 | 4 | 5 | 6 | 7)
+        matches!(self.native, 1 | 4 | 5 | 6 | 7 | 8 | 9)
     }
 
     fn reads_reg(&self) -> bool {
@@ -3438,8 +3439,8 @@ struct Soft {
 fn slot_reg(insn: &Insn, sel: &Sel, homes: &[Home]) -> u8 {
     let own = match insn.native {
         1 | 2 | 4 => insn.reg2,
-        // `Math.pow`'s base.
-        7 => insn.reg2 + 1,
+        // `Math.pow`'s base, `Math.max`'s and `min`'s first.
+        7..=9 => insn.reg2 + 1,
         _ => insn.reg,
     };
     match sel
@@ -3677,6 +3678,13 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = F64;
             let base = if insn.native == 6 { "math_sqrt" } else { "math_pow" };
             return Sel::new(base, case, out);
+        }
+        // `Math.max` and `Math.min`: the first in its window register (in
+        // memory), the second boxed in `acc`; one of them, as it is (an
+        // int32 stays one: a double would widen the fields it goes to).
+        _ if insn.native == 8 || insn.native == 9 => {
+            out.acc = Any;
+            return Sel::new(if insn.native == 8 { "math_max" } else { "math_min" }, "", out);
         }
         _ if insn.native == 5 => {
             let case = if st.acc == I32 { "i" } else { "" };
@@ -5980,6 +5988,13 @@ fn stencil_for(
             } else {
                 cat!("math_pow_", sel.case, "_m")
             }
+        }
+        // The first, from memory; the second boxed.
+        ("math_max" | "math_min", _) => {
+            let x = insn.reg2 + 1;
+            pre.extend(spill_piece(homes.get(x as usize).copied().unwrap_or(Home::Mem), x));
+            box_acc(&mut pre);
+            cat!(sel.base, "_m")
         }
         ("call" | "call_direct" | "construct_direct", _) => {
             for r in insn.call_reads() {
@@ -11958,14 +11973,17 @@ impl Lowering<'_> {
                     (f, 1) if f == vm.from_char_code_fn => 5,
                     (f, 1) if f == vm.math_sqrt_fn => 6,
                     (f, 2) if f == vm.math_pow_fn => 7,
+                    (f, 2) if f == vm.math_max_fn => 8,
+                    (f, 2) if f == vm.math_min_fn => 9,
                     _ => 0,
                 };
                 let exits = self.state.callee_exits.get(&origin).copied().unwrap_or(0);
                 if native != 0 && other.is_null() && exits < MAX_PROPERTY_EXITS {
                     // `push`, `charCodeAt`, `fromCharCode` and `sqrt` take
-                    // their argument in `acc`, `pow` its second (there
-                    // already if the call's setup stored it last).
-                    let last_arg = i.reg2 + if native == 7 { 2 } else { 1 };
+                    // their argument in `acc`, `pow`, `max` and `min` their
+                    // second (there already if the call's setup stored it
+                    // last).
+                    let last_arg = i.reg2 + if native >= 7 { 2 } else { 1 };
                     let stored = self.out.insns.last().is_some_and(|l| {
                         l.op == Op::Star && l.reg == last_arg && l.frame == i.frame && !l.bail
                     });

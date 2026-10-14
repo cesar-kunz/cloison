@@ -5458,6 +5458,43 @@ macro_rules! math_pow {
 math_pow!("math_pow_m", |s| s.acc);
 math_pow!("math_pow_f_m", |s| s.tag.encode_f64(s.facc));
 
+// `Math.max(x, y)` and `Math.min(x, y)` (`Insn::native` 8, 9), after a
+// guard on the callee: `x` boxed in memory (the register at
+// `toi_hole_reg`), `y` boxed in `acc`; the result one of them as it is (or
+// NaN), boxed in `acc`. `max(-0, +0)` is +0, `min`'s -0. Leave where either
+// isn't a number (converting it may run code).
+macro_rules! math_max {
+    ($name:literal, $max:literal) => {
+        stencil!($name; |s| {
+            let (x, y) = (load_m(s.regs), s.acc);
+            if s.tag.is_int32(x) && s.tag.is_int32(y) {
+                if (int(y) > int(x)) == $max {
+                    s.acc = y;
+                } else {
+                    s.acc = x;
+                }
+                next!(s)
+            }
+            let f = |v: Value| if s.tag.is_int32(v) { Some(i2f(int(v))) } else if is_number(s.tag, v) { Some(s.tag.decode_f64(v)) } else { None };
+            let (Some(a), Some(b)) = (f(x), f(y)) else { exit!(s) };
+            s.acc = if a.is_nan() {
+                x
+            } else if b.is_nan() {
+                y
+            } else if (if $max { b > a } else { b < a })
+                || (a == 0.0 && b == 0.0 && a.is_sign_negative() == $max)
+            {
+                y
+            } else {
+                x
+            };
+            next!(s)
+        });
+    };
+}
+math_max!("math_max_m", true);
+math_max!("math_min_m", false);
+
 // Before an inlined call: the callee must be the function inlined
 // (`imm64`), or leave before the call.
 macro_rules! check_callee {

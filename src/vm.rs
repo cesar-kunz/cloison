@@ -2562,18 +2562,22 @@ impl Vm {
     }
 
     /// Load `module`'s functions; returns its top-level code.
-    pub fn load(&mut self, module: &Module) -> *const Code {
+    pub fn load(&mut self, module: Module) -> *const Code {
         for n in &module.declared {
             let a = self.intern(n);
             self.declared.insert(a);
         }
-        let recursive = recursive_functions(module);
+        let recursive = recursive_functions(&module);
+        static QUICKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let quicken = *QUICKEN.get_or_init(|| std::env::var_os("TOI_NO_QUICKEN").is_none());
+        let mut units = Vec::new();
+        let mut closures = Vec::with_capacity(module.functions.len());
         let codes: Vec<*const Code> = module
             .functions
-            .iter()
+            .into_iter()
             .zip(recursive)
             .map(|(f, recursive)| {
-                let scan = Scan::of(f);
+                let scan = Scan::of(&f);
                 let interpreted = !f.handlers.is_empty() || scan.callee;
                 let ics: Vec<UnsafeCell<[Ic; IC_WAYS]>> = f
                     .ics
@@ -2587,28 +2591,31 @@ impl Vm {
                     .map(|c| match c {
                         crate::asm::Constant::Number(d) => Value::number(*d),
                         crate::asm::Constant::String(t) => {
-                            self.string_constant(&t.encode_utf16().collect::<Vec<_>>())
+                            units.clear();
+                            units.extend(t.encode_utf16());
+                            self.string_constant(&units)
                         }
                     })
                     .collect();
+                let mut bytecode = f.code;
+                // (Without the slack it grew with: it lives as long as the VM.)
+                bytecode.shrink_to_fit();
+                if quicken {
+                    crate::bytecode::quicken(&mut bytecode);
+                }
+                self.max_frame = self.max_frame.max(f.nregs as usize + crate::interp::HEADER);
+                closures.push(f.closures);
                 self.add_code(Code {
-                    name: f.name.clone(),
-                    bytecode: {
-                        let mut b = f.code.clone();
-                        static QUICKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        if *QUICKEN.get_or_init(|| std::env::var_os("TOI_NO_QUICKEN").is_none()) {
-                            crate::bytecode::quicken(&mut b);
-                        }
-                        b
-                    },
+                    name: f.name,
+                    bytecode,
                     nparams: f.nparams,
                     nregs: f.nregs,
                     ics: ics.into_boxed_slice(),
                     ic_names: ic_names.into_boxed_slice(),
                     closures: Vec::new(),
                     constants,
-                    handlers: f.handlers.clone().into_boxed_slice(),
-                    upvalues: f.upvalues.clone().into_boxed_slice(),
+                    handlers: f.handlers.into_boxed_slice(),
+                    upvalues: f.upvalues.into_boxed_slice(),
                     interpreted,
                     field_deps: Cell::new(0),
                     ic_misses: Cell::new(0),
@@ -2637,10 +2644,9 @@ impl Vm {
                 })
             })
             .collect();
-        for (f, &c) in module.functions.iter().zip(&codes) {
-            let closures = f.closures.iter().map(|&i| codes[i]).collect();
+        for (nested, &c) in closures.into_iter().zip(&codes) {
+            let closures = nested.iter().map(|&i| codes[i]).collect();
             unsafe { (*c.cast_mut()).closures = closures };
-            self.max_frame = self.max_frame.max(f.nregs as usize + crate::interp::HEADER);
         }
         codes[module.script]
     }
@@ -2648,7 +2654,7 @@ impl Vm {
     /// Load and run `module`; returns its completion value.
     pub fn run(&mut self, module: &Module) -> Result<Value> {
         crate::interp::CURRENT_VM.with(|v| v.set(self));
-        let code = self.load(module);
+        let code = self.load(module.clone());
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
         // Roots on the native stack are below here (see `gc`).

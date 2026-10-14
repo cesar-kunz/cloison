@@ -46,6 +46,7 @@ pub fn generate(p: &Program) -> Result<Module, Error> {
             decls[i] = d;
         }
     }
+    let decls: Vec<Decls> = decls.into_iter().map(Decls::new).collect();
     let scopes = upvalues(p, &decls, &overflow);
     let names = Default::default();
     let mut functions = Vec::with_capacity(p.functions.len());
@@ -60,6 +61,46 @@ pub fn generate(p: &Program) -> Result<Module, Error> {
 }
 
 type R<T> = Result<T, Error>;
+
+/// A function's declarations (see [`declarations`]), in order, and past a
+/// few, where each is (the first of its name), for lookups by name: every
+/// global's reference looks in each enclosing function's.
+struct Decls<'a> {
+    list: Vec<&'a str>,
+    index: Option<HashMap<&'a str, usize>>,
+}
+
+impl<'a> Decls<'a> {
+    fn new(list: Vec<&'a str>) -> Self {
+        let index = (list.len() > 8).then(|| {
+            let mut m = HashMap::default();
+            for (i, &n) in list.iter().enumerate() {
+                m.entry(n).or_insert(i);
+            }
+            m
+        });
+        Decls { list, index }
+    }
+
+    fn position(&self, name: &str) -> Option<usize> {
+        match &self.index {
+            Some(m) => m.get(name).copied(),
+            None => self.list.iter().position(|&n| n == name),
+        }
+    }
+
+    fn contains(&self, name: &&str) -> bool {
+        self.position(name).is_some()
+    }
+}
+
+impl<'a> std::ops::Deref for Decls<'a> {
+    type Target = [&'a str];
+
+    fn deref(&self) -> &[&'a str] {
+        &self.list
+    }
+}
 
 /// A function's parameters and variables in registers, at most; the rest
 /// go in a scope object (see [`generate`]), leaving room for temporaries.
@@ -86,7 +127,7 @@ struct Scopes<'a> {
     captured: Vec<Vec<&'a str>>,
 }
 
-fn upvalues<'a>(p: &'a Program, decls: &[Vec<&'a str>], overflow: &[Vec<&'a str>]) -> Scopes<'a> {
+fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) -> Scopes<'a> {
     let n = p.functions.len();
     let (mut upvalues, mut captured) = (vec![Vec::new(); n], vec![Vec::new(); n]);
     for i in 1..n {
@@ -591,7 +632,7 @@ struct Acc {
 
 struct Gen<'a> {
     p: &'a Program<'a>,
-    decls: &'a [Vec<&'a str>],
+    decls: &'a [Decls<'a>],
     scopes: &'a Scopes<'a>,
     index: usize,
     f: &'a Function<'a>,
@@ -641,7 +682,7 @@ struct TryCtx<'a> {
 impl<'a> Gen<'a> {
     fn new(
         p: &'a Program<'a>,
-        decls: &'a [Vec<&'a str>],
+        decls: &'a [Decls<'a>],
         overflow: &'a [&'a str],
         scopes: &'a Scopes<'a>,
         names: &'a std::cell::RefCell<HashSet<Name>>,
@@ -799,7 +840,7 @@ impl<'a> Gen<'a> {
             return Vec::new();
         };
         ups.iter()
-            .map(|n| match self.decls[parent].iter().position(|d| d == n) {
+            .map(|n| match self.decls[parent].position(n) {
                 Some(k) if parent != 0 => (true, k as u8 + 1),
                 _ => {
                     let k = self.scopes.upvalues[parent].iter().position(|d| d == n);
@@ -1297,7 +1338,7 @@ impl<'a> Gen<'a> {
         // that object's register (an upvalue).
         let mut f = self.f.parent;
         while let Some(k) = f.filter(|&k| k != 0) {
-            if let Some(at) = self.decls[k].iter().position(|&n| n == name) {
+            if let Some(at) = self.decls[k].position(name) {
                 // (Past the registers: see `generate`.)
                 if at >= LOCAL_REGS
                     && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == ENV)

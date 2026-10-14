@@ -566,7 +566,7 @@ fn run_source(vm: &mut Vm, src: &str) -> Result<Value> {
             Error(format!("SyntaxError: {e}"), None)
         }
     })?;
-    let code = vm.load(&module);
+    let code = vm.load(module);
     crate::interp::run_script_at(vm, code)
 }
 

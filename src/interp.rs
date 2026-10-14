@@ -3441,7 +3441,7 @@ unsafe fn push_frame(
         }
         *new.sub(BUDGET) = Value::from_bits((*callee).loop_budget.get() as u64);
         set_header(new, CODE, callee);
-        set_header(new, ICS, (*callee).ics.as_ptr());
+        set_header(new, ICS, (*callee).ics().as_ptr());
         set_header(new, VM, vm);
         set_header(new, RET_PC, ret);
         set_header(new, CALLER, regs);
@@ -3643,7 +3643,7 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
         let regs = vm.stack.as_mut_ptr().add(HEADER);
         *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
         set_header(regs, CODE, code);
-        set_header(regs, ICS, (*code).ics.as_ptr());
+        set_header(regs, ICS, (*code).ics().as_ptr());
         set_header(regs, VM, vm as *mut Vm);
         set_header(regs, RET_PC, std::ptr::null::<u8>());
         set_header(regs, CALLER, std::ptr::null::<Value>());
@@ -3808,7 +3808,7 @@ pub(crate) unsafe fn write_frame_header(
     unsafe {
         *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
         set_header(regs, CODE, code);
-        set_header(regs, ICS, (*code).ics.as_ptr());
+        set_header(regs, ICS, (*code).ics().as_ptr());
         set_header(regs, VM, vm as *const Vm);
         set_header(regs, RET_PC, ret);
         set_header(regs, CALLER, caller);

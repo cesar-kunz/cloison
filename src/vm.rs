@@ -2184,6 +2184,8 @@ impl Vm {
             let o = self.alloc_string(words);
             let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
             fill(data);
+            // The room past the units zero, not what memory held.
+            std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
             (*o).elems = data.cast();
             (*o).elems_len = u32::try_from(len).expect("string too long");
             object_value(o)
@@ -2208,9 +2210,12 @@ impl Vm {
     /// A new string of `len` code units, which `fill` writes.
     pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
         unsafe {
-            let o = self.alloc_string(len.div_ceil(4));
+            let words = len.div_ceil(4);
+            let o = self.alloc_string(words);
             let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
             fill(std::slice::from_raw_parts_mut(data, len));
+            // The room past the units zero, not what memory held.
+            std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
             (*o).elems = data.cast();
             (*o).elems_len = u32::try_from(len).expect("string too long");
             object_value(o)

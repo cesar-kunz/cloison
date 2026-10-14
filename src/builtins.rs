@@ -2043,15 +2043,28 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
     let o = vm.new_object_with(Class::RegExp, proto, 6);
     unsafe { (*o).code = re.cast() };
     let r = unsafe { &*re };
-    for (a, v) in [
+    let props = [
         (vm.a_last_index, Value::from_i32(0)),
         (vm.a_source, source),
         (vm.a_global, Value::from_bool(r.global)),
         (vm.a_ignore_case, Value::from_bool(r.ignore_case)),
         (vm.a_multiline, Value::from_bool(r.multiline)),
-    ] {
+    ];
+    // The shape with all five found once: then only their stores.
+    let root = unsafe { (*o).shape };
+    if vm.regexp_shapes.0 == root {
+        unsafe { (*o).shape = vm.regexp_shapes.1 };
+        for (slot, (_, v)) in props.into_iter().enumerate() {
+            vm.store_field(o, slot as u32, v);
+        }
+        return object_value(o);
+    }
+    for (a, v) in props {
         let attrs = if a == vm.a_last_index { DONT_ENUM } else { DONT_ENUM | READ_ONLY };
         vm.add_property_with(o, a, v, attrs);
+    }
+    if unsafe { !(*root).unique && !(*(*o).shape).unique } {
+        vm.regexp_shapes = (root, unsafe { (*o).shape });
     }
     object_value(o)
 }
@@ -2157,36 +2170,41 @@ fn with_caps<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm, &mut crate::regexp::Capture
 /// The array `exec` returns for `caps` over `s`: the match and each group
 /// (`undefined` if it didn't match), with `index` and `input`.
 fn match_array(vm: &mut Vm, caps: &crate::regexp::Captures, s: &[u16], input: Value) -> Result<Value> {
-    let parts: Vec<Value> = caps
-        .iter()
-        .map(|c| match c {
+    let arr = vm.new_array();
+    let o = as_object(arr);
+    vm.reserve_elems(o, caps.len());
+    // The groups straight into its elements, the length counting each
+    // (a collection while a string is made sees them), then the shape
+    // for their type.
+    let mut ty = crate::object::FieldType::None;
+    for (i, c) in caps.iter().enumerate() {
+        let v = match c {
             Some((a, b)) => string(vm, &s[*a..*b]),
             None => Value::UNDEFINED,
-        })
-        .collect();
-    let arr = vm.new_array();
-    crate::vm::array_push(vm, arr, &parts)?;
-    // Defined, as ECMAScript's CreateDataProperty does (no setters), along
-    // transitions found once per shape the array has.
-    let o = as_object(arr);
-    let base = unsafe { (*o).shape };
-    if unsafe { (*base).unique } {
-        vm.add_property_with(o, vm.a_index, Value::from_i32(caps[0].unwrap().0 as i32), 0);
-        vm.add_property_with(o, vm.a_input, input, 0);
-        return Ok(arr);
+        };
+        ty = ty.join(crate::object::FieldType::of(v));
+        unsafe {
+            *(*o).elems.add(i) = v;
+            crate::heap::barrier((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), v);
+            (*o).elems_len = i as u32 + 1;
+        }
     }
-    let (with_index, with_input) = match vm.match_shapes.iter().find(|m| m.0 == base) {
-        Some(&(_, a, b)) => (a, b),
+    // Defined, as ECMAScript's CreateDataProperty does (no setters), along
+    // transitions found once per type of elements.
+    let (elems, with_index, with_input) = match vm.match_shapes.iter().find(|m| m.0 == ty) {
+        Some(&(_, e, a, b)) => (e, a, b),
         None => {
-            let a = vm.transition_with(base, vm.a_index, 0);
+            let e = vm.elements_transition(vm.array_shape, ty);
+            let a = vm.transition_with(e, vm.a_index, 0);
             let b = vm.transition_with(a, vm.a_input, 0);
             if vm.match_shapes.len() == 4 {
                 vm.match_shapes.remove(0);
             }
-            vm.match_shapes.push((base, a, b));
-            (a, b)
+            vm.match_shapes.push((ty, e, a, b));
+            (e, a, b)
         }
     };
+    unsafe { (*o).shape = elems };
     vm.add_property_shaped(o, with_index, Value::from_i32(caps[0].unwrap().0 as i32));
     vm.add_property_shaped(o, with_input, input);
     Ok(arr)

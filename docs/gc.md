@@ -442,9 +442,10 @@ Every young cell reached is old afterwards, so every card is clean after
 a minor collection.
 
 The barrier is also what found the one store site the audit missed: with
-`TOI_GC_CHECK_BARRIER`, each minor collection walks every old cell for a
-reference to a young cell it left unmarked, and the `set_keyed!` family
-of stencils, which writes `$v`, was one.
+`TOI_GC_CHECK_BARRIER`, each minor collection traces every old cell (what
+a marking would follow, not the padding past an odd number of slots,
+which no maker writes) for a reference to a young cell it left unmarked,
+and the `set_keyed!` family of stencils, which writes `$v`, was one.
 
 ### The major collection
 

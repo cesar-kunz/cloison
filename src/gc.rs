@@ -2069,6 +2069,21 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
     live
 }
 
+/// The first young cell a trace reaches (see `Heap::check_barriers`).
+struct Reached<'a> {
+    heap: &'a Heap,
+    young: Option<usize>,
+}
+
+impl Visit for Reached<'_> {
+    unsafe fn cell(&mut self, q: usize) {
+        let h = self.heap;
+        if self.young.is_none() && h.contains(q) && q.is_multiple_of(GRANULE) && unsafe { *h.meta(q) } == YOUNG {
+            self.young = Some(q);
+        }
+    }
+}
+
 impl Heap {
     /// Panic on an old cell that refers to a young cell the minor
     /// collection left unmarked: a store without its barrier
@@ -2090,34 +2105,19 @@ impl Heap {
                         p += n;
                         continue;
                     }
-                    // A string's units in the cell: `elems` points to them (just
-                    // past an empty string's header, at the next cell), and
-                    // the trace doesn't follow it.
-                    let o = p as *const Object;
-                    let units = (*(p as *const u64) & 1 == 0
-                        && (*o).class == Class::String
-                        && (*o).elems as usize == p + INLINE_BASE)
-                        .then(|| &raw const (*o).elems as usize);
+                    // What a trace of it follows (not the padding past an
+                    // odd number of slots, which no maker writes).
                     if m & COLOR != 0 {
-                        for a in (p..p + n).step_by(8) {
-                            if Some(a) == units {
-                                continue;
-                            }
-                            let w = *(a as *const usize);
-                            for q in [w, w.wrapping_sub(8)] {
-                                if self.contains(q) && q.is_multiple_of(GRANULE) && *self.meta(q) == YOUNG {
-                                    let first = *(p as *const u64);
-                                    let what = if first & 1 == 0 {
-                                        format!("{:?}", (*(p as *const Object)).class)
-                                    } else {
-                                        format!("kind {}", first & 7)
-                                    };
-                                    panic!(
-                                        "unbarriered: old {what} at {p:#x} (+{}) -> young {q:#x}",
-                                        a - p
-                                    );
-                                }
-                            }
+                        let mut r = Reached { heap: self, young: None };
+                        trace(&mut r, p, p, p + n);
+                        if let Some(q) = r.young {
+                            let first = *(p as *const u64);
+                            let what = if first & 1 == 0 {
+                                format!("{:?}", (*(p as *const Object)).class)
+                            } else {
+                                format!("kind {}", first & 7)
+                            };
+                            panic!("unbarriered: old {what} at {p:#x} -> young {q:#x}");
                         }
                     }
                     p += n;

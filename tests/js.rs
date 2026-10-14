@@ -3364,3 +3364,41 @@ out + " " + main(3);"#;
     // No `new` through the runtime, nor a call (direct ones are).
     assert!(!s.iter().any(|n| n == "call" || n.starts_with("construct")), "{s:?}");
 }
+
+/// Code that eval'd functions no longer reachable leave is freed (by a
+/// full collection, which code loaded starts), while the functions kept,
+/// and those nested in them, run on: of 3000 evals' 12,000 functions, in
+/// the interpreter, under 2000 stay. (Compiled, the call `o.f()` binds
+/// each callee, which keeps its code: see `vm::Code::pinned`.)
+#[test]
+fn dead_eval_code_is_freed() {
+    let src = r#"
+var keep = [];
+function make(i) {
+  return (0, eval)("(function () { var k = " + i + "; function inner() { return k * 2; } " +
+                   "return { f: function () { return inner() + k; } }; })()");
+}
+var sum = 0;
+for (var i = 0; i < 3000; i++) {
+  var o = make(i);
+  sum += o.f();
+  if (i % 100 == 0) keep.push(o);
+  var junk = [];
+  for (var j = 0; j < 400; j++) junk.push({ a: j });
+}
+for (var i = 0; i < keep.length; i++) sum += keep[i].f();
+sum;
+"#;
+    let module = toi::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_code_room(64 << 10);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r, Ok("13626000".to_string()), "tier at {budget}");
+        vm.heap.verify();
+        if budget == i64::MAX {
+            assert!(vm.code_count() < 2000, "{} codes", vm.code_count());
+        }
+    }
+}

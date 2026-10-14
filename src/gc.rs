@@ -85,6 +85,14 @@ pub struct Gc {
     cycles: bool,
     /// A concurrent full collection is marking.
     marking: bool,
+    /// The [`CODE_EPOCH`] the current or last full marking began in: the
+    /// codes it found live are marked with it or later.
+    codes_from: u32,
+    /// What code may take (see [`code_bytes`]) before a full collection
+    /// looks for dead code: what the last found live, at least `code_min`
+    /// ([`CODE_MIN`]; less for tests).
+    pub(crate) code_room: usize,
+    pub(crate) code_min: usize,
     /// The marker thread is sweeping after a final pause.
     pub(crate) sweeping: bool,
     /// What the heap may grow by before the next full collection (see
@@ -127,6 +135,9 @@ impl Gc {
             .ok()
             .map_or(0, |s| s.parse::<usize>().unwrap_or(256).max(1) << 10);
         Gc {
+            codes_from: 0,
+            code_room: CODE_MIN,
+            code_min: CODE_MIN,
             verify,
             stress: env("TOI_GC_STRESS"),
             stats: env("TOI_GC_STATS"),
@@ -239,6 +250,53 @@ struct Mode {
     kind: Kind,
     /// Checks every reference it follows.
     check: bool,
+}
+
+/// Full markings so far, over every VM: a code found live is marked with
+/// the epoch then (see `vm::Code::mark`).
+static CODE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The least code taken (see `Gc::code_room`) that starts a full
+/// collection.
+const CODE_MIN: usize = 32 << 20;
+
+std::thread_local! {
+    /// Bytes this thread's VM put into code since its last full marking
+    /// (loaded, inline caches made: see `Code::footprint`).
+    static CODE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Note `n` more bytes of code (see [`CODE_BYTES`]).
+pub(crate) fn code_bytes(n: usize) {
+    CODE_BYTES.with(|c| c.set(c.get() + n));
+}
+
+impl Gc {
+    /// Code has grown past its room: time for a full collection.
+    pub(crate) fn code_full(&self) -> bool {
+        CODE_BYTES.with(|c| c.get()) > self.code_room
+    }
+}
+
+pub(crate) fn code_epoch() -> u32 {
+    CODE_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Code `c` found live in the marking under way.
+#[inline(always)]
+pub(crate) fn mark_code(c: *const crate::vm::Code) {
+    unsafe { (*c).mark.store(code_epoch(), std::sync::atomic::Ordering::Relaxed) }
+}
+
+/// If the cell at `p` (header word `w`), marked, is a closure: its code
+/// found live. (Not in [`trace`]: card scanning traces dead cells too.)
+#[inline(always)]
+unsafe fn mark_function_code(p: usize, w: u64) {
+    unsafe {
+        if w & 1 == 0 && (*(p as *const Object)).class == Class::Function {
+            mark_code((*(p as *const Object)).code);
+        }
+    }
 }
 
 /// What tracing a cell does with each reference it finds.
@@ -482,6 +540,7 @@ impl Marking<'_> {
                 let w = *(p as *const u64);
                 let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                 if from == 0 {
+                    mark_function_code(p, w);
                     let size = cell_size(p as *const u8);
                     *crate::heap::meta(p + size - GRANULE) |= END;
                     self.marked += size;
@@ -655,6 +714,7 @@ unsafe fn trace_shared(
                     bytes += size;
                     n += 1;
                     let w = *(p as *const u64);
+                    mark_function_code(p, w);
                     let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                     if slots > SLICE_SLOTS {
                         trace(&mut cm, p, p + 8, p + 8 + 8 * SLICE_SLOTS);
@@ -943,8 +1003,15 @@ impl Marker {
         let mut st = sh.state.lock().unwrap();
         st.work.append(more);
         st.request = request;
-        st.run = true;
-        st.done = false;
+        // Nothing to trace (a start pause that shaded nothing): done, and
+        // the next safepoint is the final pause, which the marker, waiting
+        // for work, would never ask for.
+        let done = st.work.is_empty() && !st.busy;
+        st.run = !done;
+        st.done = done;
+        if done {
+            unsafe { (*(request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed) };
+        }
         sh.pause.store(false, std::sync::atomic::Ordering::Relaxed);
         sh.wake.notify_all();
     }
@@ -1065,7 +1132,12 @@ impl Vm {
                 // (The marker's request of the final pause came early.)
                 return;
             }
-        } else if gc.always_full || gc.cycles || self.heap.allocated() > gc.full_at || gc.promoted > gc.room.max(FULL_MIN) {
+        } else if gc.always_full
+            || gc.cycles
+            || self.heap.allocated() > gc.full_at
+            || gc.promoted > gc.room.max(FULL_MIN)
+            || gc.code_full()
+        {
             if gc.stw || gc.always_full { Collection::Full } else { Collection::Start }
         } else {
             Collection::Minor
@@ -1082,6 +1154,9 @@ impl Vm {
         }
         if matches!(kind, Collection::Start | Collection::Full) {
             self.heap.finish_sweep();
+            // The cells that could still refer to them are swept.
+            self.condemned.clear();
+            self.heap.gc.codes_from = CODE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         } else if self.heap.gc.sweeping {
             self.heap.absorb_sweep();
         }
@@ -1160,6 +1235,9 @@ impl Vm {
             if kind == Collection::Minor && self.heap.gc.check_barriers {
                 self.heap.check_barriers();
             }
+            if full {
+                self.mark_live_codes(&mut m, sp, regs);
+            }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
             }
@@ -1173,6 +1251,9 @@ impl Vm {
                 Collection::Full => self.heap.free_unmarked(color, check),
                 _ => self.heap.free_young(check),
             };
+            if full {
+                self.condemn_codes();
+            }
             times[3] = lap();
         }
         let traced = m.marked;
@@ -1283,6 +1364,84 @@ impl Vm {
         }
     }
 
+    /// Mark what code `code` refers to: its constants, and the cells its
+    /// inline caches hold (a load's prototype, a call's callee; a store's
+    /// is a field type, `FieldType::encode`, not in the heap).
+    unsafe fn mark_code_refs(&self, m: &mut Marking, code: &crate::vm::Code) {
+        unsafe {
+            for &c in code.constants.iter() {
+                m.value(c);
+            }
+            for ways in code.made_ics().iter() {
+                for ic in (*ways.get()).iter() {
+                    let h = ic.holder as usize;
+                    if self.heap.contains(h) {
+                        m.cell(h);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A full marking's codes: live if pinned, on a stack (the native
+    /// one, or the VM's, as a frame's code), or marked since it began (a
+    /// closure of it traced or made, it loaded), and with them the
+    /// functions nested in them, which they make closures of. Mark what
+    /// the live ones refer to, and what that reaches, until no more are.
+    unsafe fn mark_live_codes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let from = self.heap.gc.codes_from;
+        unsafe {
+            let stack = self.stack.as_ptr() as usize;
+            let stack_end = self.stack_end as usize;
+            let top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+            let top = (top + 8 * self.max_frame).clamp(stack, stack_end);
+            for a in (sp..self.heap.gc.stack_base).step_by(8).chain((stack..top).step_by(8)) {
+                let w = *(a as *const usize);
+                if self.code_set.contains(&w) {
+                    mark_code(w as *const crate::vm::Code);
+                }
+            }
+        }
+        let mut done = vec![false; self.codes.len()];
+        loop {
+            let mut more = false;
+            for (k, code) in self.codes.iter().enumerate() {
+                if done[k] || !(code.pinned.get() || code.mark.load(Relaxed) >= from) {
+                    continue;
+                }
+                done[k] = true;
+                more = true;
+                for &c in &code.closures {
+                    mark_code(c);
+                }
+                unsafe { self.mark_code_refs(m, code) };
+            }
+            if !more {
+                break;
+            }
+            unsafe { m.drain(&|| false) };
+        }
+    }
+
+    /// After a full marking, take the codes it didn't find live out of
+    /// use: freed at the next collection that finishes the sweep first.
+    fn condemn_codes(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let from = self.heap.gc.codes_from;
+        let (live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
+            .into_iter()
+            .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
+        self.codes = live;
+        let live: usize = self.codes.iter().map(|c| c.footprint()).sum();
+        self.heap.gc.code_room = live.max(self.heap.gc.code_min);
+        CODE_BYTES.with(|c| c.set(0));
+        for c in &dead {
+            self.code_set.remove(&(&**c as *const crate::vm::Code as usize));
+        }
+        self.condemned.extend(dead);
+    }
+
     /// Mark the roots every collection has.
     unsafe fn mark_roots(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
         unsafe {
@@ -1353,21 +1512,10 @@ impl Vm {
             for s in self.shapes() {
                 m.value(s.proto);
             }
-            for code in self.codes() {
-                for &c in code.constants.iter() {
-                    m.value(c);
-                }
-                for ways in code.ics.iter() {
-                    for ic in (*ways.get()).iter() {
-                        // A load's prototype, a call's callee; a store's
-                        // is a field type (`FieldType::encode`), not in
-                        // the heap.
-                        let h = ic.holder as usize;
-                        if self.heap.contains(h) {
-                            m.cell(h);
-                        }
-                    }
-                }
+            // The other codes' references count once they are found
+            // live (see `mark_live_codes`).
+            for code in self.codes().filter(|c| c.pinned.get()) {
+                self.mark_code_refs(m, code);
             }
             for v in self.string_constants() {
                 m.value(v);
@@ -1448,11 +1596,12 @@ impl Vm {
             for s in self.shapes() {
                 e.value(s.proto);
             }
-            for code in self.codes() {
+            let from = self.heap.gc.codes_from;
+            for code in self.codes().filter(|c| c.pinned.get() || c.mark.load(std::sync::atomic::Ordering::Relaxed) >= from) {
                 for &c in code.constants.iter() {
                     e.value(c);
                 }
-                for ways in code.ics.iter() {
+                for ways in code.made_ics().iter() {
                     for ic in (*ways.get()).iter() {
                         let h = ic.holder as usize;
                         if self.heap.contains(h) {

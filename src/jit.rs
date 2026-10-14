@@ -8803,6 +8803,7 @@ impl Caches {
     /// Function `code` decoded, with accumulator liveness after each
     /// instruction.
     fn decoded(&mut self, code: *const crate::vm::Code) -> Decoded {
+        crate::vm::pin(code);
         self.decoded
             .entry(code)
             .or_insert_with(|| {
@@ -8901,7 +8902,7 @@ impl VmState {
 /// gain little from being inlined: warm code calls their code directly.
 unsafe fn inlining_pays(code: *const crate::vm::Code) -> bool {
     let c = unsafe { &*code };
-    let ics: *const crate::vm::Ic = c.ics.as_ptr().cast();
+    let ics: *const crate::vm::Ic = c.ics().as_ptr().cast();
     decode(&c.bytecode, true).iter().any(|i| {
         if i.bail || !matches!(i.op, Op::Call | Op::CallUndefined | Op::Construct) {
             return false;
@@ -9290,6 +9291,7 @@ impl CallSite {
         let claim = self.claim.clone();
         let (vm, by_code) = (self.vm, self.by_code);
         let d = self.dispatch.as_mut().unwrap();
+        crate::vm::pin(callee);
         let site = d.sites.entry(key).or_insert_with(|| {
             if !by_code {
                 unsafe { (*vm).heap.keep(fo as usize) };
@@ -11344,7 +11346,7 @@ impl Lowering<'_> {
     fn feedback(&self, code: *const crate::vm::Code) -> Feedback {
         let code = unsafe { &*code };
         Feedback {
-            ics: code.ics.as_ptr().cast(),
+            ics: code.ics().as_ptr().cast(),
             names: code.ic_names.as_ptr(),
             global: unsafe { (*self.state.vm).global },
             vm: self.state.vm,
@@ -12032,6 +12034,7 @@ impl Lowering<'_> {
         }
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
+        crate::vm::pin(callee);
         true
     }
 
@@ -12542,6 +12545,7 @@ impl Lowering<'_> {
         site.closure = fo as u64;
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
         site.callee = unsafe { (*fo).code };
+        crate::vm::pin(site.callee);
         let site = Box::new(std::cell::UnsafeCell::new(site));
         let alloc = site.get() as u64;
         self.out.sites.push(site);
@@ -13107,6 +13111,7 @@ impl Lowering<'_> {
         }
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
         let extra = if self.forwards(callee) { (i.imm as u8).saturating_add(1) } else { 0 };
+        crate::vm::pin(callee);
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,
@@ -13250,6 +13255,7 @@ impl JitFunction {
     pub(crate) fn for_vm(code: *const crate::vm::Code, vm: *mut crate::vm::Vm) -> JitFunction {
         // (Its own epoch moves with the VM's from now on: see
         // `Vm::bump_code_epoch`.)
+        crate::vm::pin(code);
         unsafe { (*vm).jitted.push(code) };
         let root_insns = unsafe { (*vm).jit_caches.decoded(code) }.0.clone();
         let nregs = unsafe { (*code).nregs } as usize;

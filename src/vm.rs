@@ -222,6 +222,11 @@ impl Ic {
     };
 }
 
+/// Keep `code` for good (see `Code::pinned`).
+pub(crate) fn pin(code: *const Code) {
+    unsafe { (*code).pinned.set(true) }
+}
+
 /// A function's code, shared by its closures.
 pub struct Code {
     pub name: String,
@@ -229,7 +234,9 @@ pub struct Code {
     pub nparams: u32,
     /// Register count, `r0` (`this`) and the parameters included.
     pub nregs: u32,
-    pub ics: Box<[UnsafeCell<[Ic; IC_WAYS]>]>,
+    /// Its inline caches, one slot per `ic_names` entry, made when first
+    /// asked for (see [`Code::ics`]): most functions loaded never run.
+    ics: std::cell::OnceCell<Box<[UnsafeCell<[Ic; IC_WAYS]>]>>,
     /// The property name of each inline-cache slot.
     pub ic_names: Box<[Atom]>,
     /// The nested functions, by `CreateClosure` operand.
@@ -298,13 +305,51 @@ pub struct Code {
     /// function compiled meanwhile (mutual recursion) has no version of it
     /// to predict from (see `jit::JitCode::compile`).
     pub(crate) ret_hint: Cell<crate::jit::Ty>,
+    /// The collection epoch (`gc::CODE_EPOCH`) it was last found live in:
+    /// a closure of it traced or made, it on a stack, loaded or the
+    /// nested function of a live one. One not found live in a full
+    /// marking is freed (see `Vm::sweep_codes`); the marker thread writes
+    /// it too.
+    pub(crate) mark: std::sync::atomic::AtomicU32,
+    /// Never freed: a native's, or one the JIT took (compiled, inlined,
+    /// bound to a call site), which compiled code and its tables refer to
+    /// by address.
+    pub(crate) pinned: Cell<bool>,
 }
 
 impl Code {
     /// The inline-cache slot `i` (its way 0, the others following), and
     /// the name it looks up.
     pub fn ic(&self, i: u16) -> (*mut Ic, Atom) {
-        (self.ics[i as usize].get().cast(), self.ic_names[i as usize])
+        (self.ics()[i as usize].get().cast(), self.ic_names[i as usize])
+    }
+
+    /// Its inline caches, made (empty) the first time.
+    pub fn ics(&self) -> &[UnsafeCell<[Ic; IC_WAYS]>] {
+        self.ics.get_or_init(|| {
+            crate::gc::code_bytes(self.ic_names.len() * size_of::<[Ic; IC_WAYS]>());
+            (0..self.ic_names.len())
+                .map(|_| UnsafeCell::new([Ic::EMPTY; IC_WAYS]))
+                .collect()
+        })
+    }
+
+    /// About the bytes it takes, but for compiled code: the collector
+    /// starts a full marking, which frees dead code, when code grows (see
+    /// `gc::code_bytes`).
+    pub(crate) fn footprint(&self) -> usize {
+        size_of::<Code>()
+            + self.bytecode.len()
+            + self.ic_names.len() * size_of::<Atom>()
+            + self.made_ics().len() * size_of::<[Ic; IC_WAYS]>()
+            + self.constants.len() * size_of::<Value>()
+            + self.closures.len() * size_of::<*const Code>()
+    }
+
+    /// Its inline caches if it has made them (for the collector: those it
+    /// hasn't hold nothing).
+    pub(crate) fn made_ics(&self) -> &[UnsafeCell<[Ic; IC_WAYS]>] {
+        self.ics.get().map_or(&[], |b| b)
     }
 }
 
@@ -333,7 +378,12 @@ pub struct Vm {
     /// Each atom's name, once (the map's key shares it).
     atoms: Vec<std::rc::Rc<str>>,
     atom_ids: HashMap<std::rc::Rc<str>, Atom>,
-    codes: Vec<Box<Code>>,
+    pub(crate) codes: Vec<Box<Code>>,
+    /// The addresses of `codes`, to find them among a stack's words.
+    pub(crate) code_set: crate::jit::HashSet<usize>,
+    /// Codes found dead, freed once the sweep that frees their closures
+    /// (which `heap::cell_size` reads them for) is done.
+    pub(crate) condemned: Vec<Box<Code>>,
     pub global: *mut Object,
     pub object_prototype: *mut Object,
     pub function_prototype: *mut Object,
@@ -488,6 +538,8 @@ impl Vm {
             atoms: Vec::new(),
             atom_ids: HashMap::default(),
             codes: Vec::new(),
+            code_set: Default::default(),
+            condemned: Vec::new(),
             jit_caches: Default::default(),
             global: std::ptr::null_mut(),
             object_prototype: std::ptr::null_mut(),
@@ -2267,6 +2319,9 @@ impl Vm {
 
     /// Give new closure `f` its `prototype` object; `f` as a value.
     fn closure_prototype(&mut self, f: *mut Object) -> Value {
+        // (Live in a marking under way: the closure may be allocated
+        // black, untraced.)
+        crate::gc::mark_code(unsafe { (*f).code });
         let made = unsafe { &(*(*f).code).closures_made };
         made.set(made.get().saturating_add(1).min(2));
         let p = self.heap.alloc_object(unsafe { &*self.proto_object_shape });
@@ -2378,7 +2433,7 @@ impl Vm {
             bytecode: Vec::new(),
             nparams,
             nregs: 1 + nparams,
-            ics: Box::new([]),
+            ics: Default::default(),
             ic_names: Box::new([]),
             closures: Vec::new(),
             constants: Box::new([]),
@@ -2399,6 +2454,8 @@ impl Vm {
             closures_made: Cell::new(0),
             loop_budget: Cell::new(i64::MAX),
             ret_hint: Cell::new(ret),
+            mark: Default::default(),
+            pinned: Cell::new(true),
         });
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
@@ -2558,6 +2615,11 @@ impl Vm {
         let b = Box::new(c);
         let p: *const Code = &*b;
         self.codes.push(b);
+        self.code_set.insert(p as usize);
+        crate::gc::code_bytes(unsafe { (*p).footprint() });
+        if self.heap.gc.code_full() {
+            self.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         p
     }
 
@@ -2579,11 +2641,6 @@ impl Vm {
             .map(|(f, recursive)| {
                 let scan = Scan::of(&f);
                 let interpreted = !f.handlers.is_empty() || scan.callee;
-                let ics: Vec<UnsafeCell<[Ic; IC_WAYS]>> = f
-                    .ics
-                    .iter()
-                    .map(|_| UnsafeCell::new([Ic::EMPTY; IC_WAYS]))
-                    .collect();
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern(n)).collect();
                 let constants: Box<[Value]> = f
                     .constants
@@ -2610,7 +2667,7 @@ impl Vm {
                     bytecode,
                     nparams: f.nparams,
                     nregs: f.nregs,
-                    ics: ics.into_boxed_slice(),
+                    ics: Default::default(),
                     ic_names: ic_names.into_boxed_slice(),
                     closures: Vec::new(),
                     constants,
@@ -2641,6 +2698,8 @@ impl Vm {
                     } else {
                         i64::MAX
                     }),
+                    mark: crate::gc::code_epoch().into(),
+                    pinned: Cell::new(false),
                 })
             })
             .collect();
@@ -2734,6 +2793,18 @@ impl Vm {
     /// `jit::Tier`.
     pub fn set_warm_tier(&mut self, on: bool) {
         self.warm_tier = on;
+    }
+
+    /// The least code (in bytes) loaded before a full collection looks for
+    /// dead code (for tests; see `gc::CODE_MIN`).
+    pub fn set_code_room(&mut self, bytes: usize) {
+        self.heap.gc.code_min = bytes;
+        self.heap.gc.code_room = bytes;
+    }
+
+    /// The functions' codes loaded and not freed (for tests).
+    pub fn code_count(&self) -> usize {
+        self.codes.len() + self.condemned.len()
     }
 
     /// Loop back edges a frame runs in the interpreter before tiering up

@@ -260,41 +260,57 @@ macro_rules! rt_call {
     };
 }
 
+/// `jit::RT_REDO`: a runtime call's operation left to the interpreter (a
+/// conversion needed a bytecode `valueOf` or `toString`).
+const RT_REDO: u64 = u64::MAX;
+
+/// A converting runtime call's result `$r`, or leave before the instruction
+/// for the interpreter to make it (see `RT_REDO`).
+macro_rules! rt_redo {
+    ($s:ident, $r:expr) => {{
+        let r: u64 = $r;
+        if r == RT_REDO {
+            exit!($s)
+        }
+        r
+    }};
+}
+
 /// `toi_rt_add(a, b)`.
 macro_rules! rt_add {
     ($s:ident, $a:expr, $b:expr) => {
-        Value::from_bits(rt_call!($s, toi_rt_add, $a, $b))
+        Value::from_bits(rt_redo!($s, rt_call!($s, toi_rt_add, $a, $b)))
     };
 }
 /// `toi_rt_inc(a)`.
 macro_rules! rt_inc {
     ($s:ident, $a:expr) => {
-        Value::from_bits(rt_call!($s, toi_rt_inc, $a, Value::UNDEFINED))
+        Value::from_bits(rt_redo!($s, rt_call!($s, toi_rt_inc, $a, Value::UNDEFINED)))
     };
 }
 /// `toi_rt_less_than(a, b)`.
 macro_rules! rt_less_than {
     ($s:ident, $a:expr, $b:expr) => {
-        rt_call!($s, toi_rt_less_than, $a, $b) as u8 & 1 != 0
+        rt_redo!($s, rt_call!($s, toi_rt_less_than, $a, $b)) & 1 != 0
     };
 }
 
 /// `toi_rt_mod(a, b)`: `a % b` for any `a` and a number `b`.
 macro_rules! rt_mod {
     ($s:ident, $a:expr, $b:expr) => {
-        Value::from_bits(rt_call!($s, toi_rt_mod, $a, $b))
+        Value::from_bits(rt_redo!($s, rt_call!($s, toi_rt_mod, $a, $b)))
     };
 }
 /// `toi_rt_to_int32(a)`: ToInt32(ToNumber(a)).
 macro_rules! rt_to_int32 {
     ($s:ident, $a:expr) => {
-        rt_call!($s, toi_rt_to_int32, $a, Value::UNDEFINED) as u32 as i32
+        rt_redo!($s, rt_call!($s, toi_rt_to_int32, $a, Value::UNDEFINED)) as u32 as i32
     };
 }
 /// `toi_rt_loose_eq(a, b)`: `a == b`.
 macro_rules! rt_loose_eq {
     ($s:ident, $a:expr, $b:expr) => {
-        rt_call!($s, toi_rt_loose_eq, $a, $b) as u8 & 1 != 0
+        rt_redo!($s, rt_call!($s, toi_rt_loose_eq, $a, $b)) & 1 != 0
     };
 }
 /// `toi_rt_to_boolean(a)`.
@@ -2626,23 +2642,23 @@ with_gprs!(gpr_pairs! slot_cmp_pair);
 /// `r - acc` etc. through the runtime, for any values.
 macro_rules! rt_sub {
     ($s:ident, $acc:expr, $r:expr) => {
-        Value::from_bits(rt_call!($s, toi_rt_sub, $acc, $r))
+        Value::from_bits(rt_redo!($s, rt_call!($s, toi_rt_sub, $acc, $r)))
     };
 }
 macro_rules! rt_mul {
     ($s:ident, $acc:expr, $r:expr) => {
-        Value::from_bits(rt_call!($s, toi_rt_mul, $acc, $r))
+        Value::from_bits(rt_redo!($s, rt_call!($s, toi_rt_mul, $acc, $r)))
     };
 }
 macro_rules! rt_div {
     ($s:ident, $acc:expr, $r:expr) => {
-        Value::from_bits(rt_call!($s, toi_rt_div, $acc, $r))
+        Value::from_bits(rt_redo!($s, rt_call!($s, toi_rt_div, $acc, $r)))
     };
 }
 /// `toi_rt_compare(a, b)`: how `a` compares with `b` (see `order`).
 macro_rules! rt_compare {
     ($s:ident, $a:expr, $b:expr) => {
-        rt_call!($s, toi_rt_compare, $a, $b) as u32 & 3
+        rt_redo!($s, rt_call!($s, toi_rt_compare, $a, $b)) as u32 & 3
     };
 }
 /// `toi_rt_strict_eq(a, b)`: `a === b`.

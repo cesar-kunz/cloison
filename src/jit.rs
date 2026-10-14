@@ -295,31 +295,52 @@ fn has_stencil(name: &str) -> bool {
 /// operands go to the generic runtime in that order. `AddSmi` (`acc + imm`)
 /// shares it, which is fine while `+` is only numeric; strings will need a
 /// helper per order.
-extern "C" fn toi_rt_add(acc: Value, r: Value) -> Value {
+extern "C" fn toi_rt_add(acc: Value, r: Value) -> u64 {
     match (r.as_number(), acc.as_number()) {
-        (Some(x), Some(y)) => Value::from_f64_arith(x + y),
+        (Some(x), Some(y)) => Value::from_f64_arith(x + y).to_bits(),
         _ => {
             // (A string's concatenation allocates.)
             let vm = crate::interp::current_vm();
             if !vm.is_null() {
                 unsafe { (*vm).safepoint(std::ptr::null_mut()) };
             }
-            crate::interp::generic_add(r, acc)
+            converting(|| crate::interp::generic_add(r, acc).to_bits())
         }
     }
 }
 
-extern "C" fn toi_rt_inc(a: Value) -> Value {
+/// What a runtime call compiled code makes for an operation returns for
+/// the code to leave before it: a conversion needed a bytecode `valueOf`
+/// or `toString` (see `interp::to_primitive_hint`), which the interpreter
+/// then calls. No value, order or int32 is all ones.
+pub(crate) const RT_REDO: u64 = u64::MAX;
+
+/// `f`, a runtime call's conversions: [`RT_REDO`] if one needed a call.
+/// (Called only where a value is a cell: numbers' calls, the most, skip
+/// the VM's flag.)
+fn converting(f: impl FnOnce() -> u64) -> u64 {
+    let vm = crate::interp::current_vm();
+    // (No VM: code compiled for bytecode run by itself, without objects.)
+    if vm.is_null() {
+        return f();
+    }
+    let vm = unsafe { &mut *vm };
+    vm.conv_redo = false;
+    let r = f();
+    if std::mem::take(&mut vm.conv_redo) { RT_REDO } else { r }
+}
+
+extern "C" fn toi_rt_inc(a: Value) -> u64 {
     match a.as_number() {
-        Some(x) => Value::from_f64_arith(x + 1.0),
-        None => crate::interp::generic_inc(a),
+        Some(x) => Value::from_f64_arith(x + 1.0).to_bits(),
+        None => converting(|| crate::interp::generic_inc(a).to_bits()),
     }
 }
 
-extern "C" fn toi_rt_less_than(a: Value, b: Value) -> bool {
+extern "C" fn toi_rt_less_than(a: Value, b: Value) -> u64 {
     match (a.as_number(), b.as_number()) {
-        (Some(x), Some(y)) => x < y,
-        _ => crate::interp::generic_less_than(a, b),
+        (Some(x), Some(y)) => (x < y) as u64,
+        _ => converting(|| crate::interp::generic_less_than(a, b) as u64),
     }
 }
 
@@ -345,6 +366,10 @@ extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
 
 /// How `a` compares with `b`: 0 less, 1 equal, 2 greater, 3 unordered.
 extern "C" fn toi_rt_compare(a: Value, b: Value) -> u64 {
+    if a.is_cell() || b.is_cell() { converting(|| compare(a, b)) } else { compare(a, b) }
+}
+
+fn compare(a: Value, b: Value) -> u64 {
     let (a, b) = (
         crate::interp::to_primitive(a),
         crate::interp::to_primitive(b),
@@ -367,16 +392,26 @@ extern "C" fn toi_rt_compare(a: Value, b: Value) -> u64 {
 
 /// Stencils call these as `(acc, r)` for `r - acc` (and `DivSmi`'s as
 /// `(k, acc)` for `acc / k`).
-extern "C" fn toi_rt_sub(acc: Value, r: Value) -> Value {
-    crate::interp::generic_arith(Op::Sub, r, acc)
+extern "C" fn toi_rt_sub(acc: Value, r: Value) -> u64 {
+    arith(Op::Sub, r, acc)
 }
 
-extern "C" fn toi_rt_mul(acc: Value, r: Value) -> Value {
-    crate::interp::generic_arith(Op::Mul, r, acc)
+extern "C" fn toi_rt_mul(acc: Value, r: Value) -> u64 {
+    arith(Op::Mul, r, acc)
 }
 
-extern "C" fn toi_rt_div(acc: Value, r: Value) -> Value {
-    crate::interp::generic_arith(Op::Div, r, acc)
+extern "C" fn toi_rt_div(acc: Value, r: Value) -> u64 {
+    arith(Op::Div, r, acc)
+}
+
+/// `a op b` (`Sub`, `Mul`, `Div`) for compiled code.
+#[inline(always)]
+fn arith(op: Op, a: Value, b: Value) -> u64 {
+    if a.is_cell() || b.is_cell() {
+        converting(|| crate::interp::generic_arith(op, a, b).to_bits())
+    } else {
+        crate::interp::generic_arith(op, a, b).to_bits()
+    }
 }
 
 extern "C" fn toi_rt_strict_eq(a: Value, b: Value) -> bool {
@@ -384,18 +419,21 @@ extern "C" fn toi_rt_strict_eq(a: Value, b: Value) -> bool {
 }
 
 /// `a % b` (`ModSmi`'s slow path; `b` is the immediate).
-extern "C" fn toi_rt_mod(a: Value, b: Value) -> Value {
-    Value::number(crate::interp::to_number(a) % crate::interp::to_number(b))
+extern "C" fn toi_rt_mod(a: Value, b: Value) -> u64 {
+    let f = || Value::number(crate::interp::to_number(a) % crate::interp::to_number(b)).to_bits();
+    if a.is_cell() || b.is_cell() { converting(f) } else { f() }
 }
 
 /// ToInt32(ToNumber(a)), in the low 32 bits.
 extern "C" fn toi_rt_to_int32(a: Value, _: Value) -> u64 {
-    crate::interp::to_int32(crate::interp::to_number(a)) as u32 as u64
+    let f = || crate::interp::to_int32(crate::interp::to_number(a)) as u32 as u64;
+    if a.is_cell() { converting(f) } else { f() }
 }
 
 /// `a == b`.
-extern "C" fn toi_rt_loose_eq(a: Value, b: Value) -> bool {
-    crate::interp::loose_equals(a, b).unwrap_or_else(|e| panic!("JIT code: {e}"))
+extern "C" fn toi_rt_loose_eq(a: Value, b: Value) -> u64 {
+    let f = || crate::interp::loose_equals(a, b).unwrap_or_else(|e| panic!("JIT code: {e}")) as u64;
+    if a.is_cell() || b.is_cell() { converting(f) } else { f() }
 }
 
 /// `a[b]` for any `a` (a string, a typed array, …: what `get_keyed`
@@ -7982,7 +8020,23 @@ impl JitCode {
                         reg: step.reg,
                         ..Piece::with_imm(&step.name, step.imm)
                     };
-                    if piece.uses(Sym::Exit) {
+                    // (A compare-and-jump's helper exits where a conversion
+                    // needs a bytecode `valueOf`: see `jit::RT_REDO`.)
+                    let helper_exits = (piece.slow)
+                        .is_some_and(|h| h.stencil().relocs.iter().any(|r| r.2 == Sym::Exit));
+                    if (piece.uses(Sym::Exit) || helper_exits) && f.ldar.is_empty() && step.exit_ldar.is_none() {
+                        // Exit before the step's instruction, `acc` as it was.
+                        let mut seq = Vec::new();
+                        if let Some(st) = &ins[step.insn] {
+                            seq.extend(box_acc_piece(st.acc));
+                        }
+                        seq.extend(exit_spills(&homes, step.insn, &boxed));
+                        seq.push(Piece {
+                            imm: insns[step.insn].exit_record(),
+                            ..Piece::new("exit", 0)
+                        });
+                        exits.push((step.insn, seq));
+                    } else if piece.uses(Sym::Exit) || helper_exits {
                         // Exit before the step's instruction: undo the
                         // in-place op, then `acc` is the result slot.
                         let mut seq = Vec::new();
@@ -8604,7 +8658,11 @@ impl JitCode {
                     Sym::HoleReg => p.reg as u64 * size_of::<Value>() as u64,
                     Sym::Continue => base + cont as u64,
                     Sym::JumpTarget => base + jump as u64,
-                    Sym::Exit => base + exit_at[&(p.exit as usize)] as u64,
+                    Sym::Exit => {
+                        base + *exit_at.get(&(p.exit as usize)).unwrap_or_else(|| {
+                            panic!("no exit {} for {}", p.exit, s.stencil().name)
+                        }) as u64
+                    }
                     Sym::Rt(rt) => base + tramp_at[&rt] as u64,
                     Sym::Slow => {
                         let k = key.expect("helper reference outside a hot piece");

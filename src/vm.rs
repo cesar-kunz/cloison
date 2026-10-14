@@ -484,9 +484,13 @@ pub struct Vm {
     /// Captures for `exec`, `test`, `match` and `replace` to match into
     /// (taken while in use).
     pub(crate) caps_buf: crate::regexp::Captures,
-    /// `exec` arrays' shapes: from an array's, with `index` and with
-    /// `input` added (a few, by the elements' kind).
-    pub(crate) match_shapes: Vec<(*const Shape, *const Shape, *const Shape)>,
+    /// `exec` arrays' shapes, by their elements' type (a few): a new
+    /// array's with elements of it, then with `index` and with `input`
+    /// added.
+    pub(crate) match_shapes: Vec<(FieldType, *const Shape, *const Shape, *const Shape)>,
+    /// A `RegExp` object's shape when made, and with its five properties
+    /// (see `builtins::regexp_object`).
+    pub(crate) regexp_shapes: (*const Shape, *const Shape),
     /// Names of `RegExp` objects' and `exec` results' properties.
     pub(crate) a_last_index: Atom,
     pub(crate) a_source: Atom,
@@ -595,6 +599,7 @@ impl Vm {
             regexp_literals: HashMap::default(),
             caps_buf: Vec::new(),
             match_shapes: Vec::new(),
+            regexp_shapes: (std::ptr::null(), std::ptr::null()),
             a_last_index: Atom(0),
             a_source: Atom(0),
             a_global: Atom(0),

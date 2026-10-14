@@ -761,19 +761,20 @@ impl Vm {
             );
         }
         // Results compiled code takes for doubles (checked, and unboxed:
-        // `1 / Math.sqrt(x)` divides doubles), or (`Any`) of any type:
-        // `Math.floor`'s and the like are mostly int32s, which as doubles
-        // would make the fields and elements they go to doubles (Crypto's
-        // digits).
-        use crate::jit::Ty::{Any, F64};
+        // `1 / Math.sqrt(x)` divides doubles), for int32s (`Math.floor`'s
+        // and the like: as doubles they would make the fields and elements
+        // they go to doubles, Crypto's digits; a call giving another is
+        // predicted no more), or of any type (`abs`, `min`, `max`, as
+        // often of doubles).
+        use crate::jit::Ty::{Any, F64, I32};
         for (name, f, n, ty) in [
             ("log", math_log as NativeFn, 1, F64),
             ("exp", math_exp, 1, F64),
             ("sqrt", math_sqrt, 1, F64),
             ("abs", math_abs, 1, Any),
-            ("floor", math_floor, 1, Any),
-            ("ceil", math_ceil, 1, Any),
-            ("round", math_round, 1, Any),
+            ("floor", math_floor, 1, I32),
+            ("ceil", math_ceil, 1, I32),
+            ("round", math_round, 1, I32),
             ("sin", math_sin, 1, F64),
             ("cos", math_cos, 1, F64),
             ("pow", math_pow, 2, F64),

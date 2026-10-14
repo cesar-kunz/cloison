@@ -8503,13 +8503,20 @@ impl JitCode {
         }
         // Profiling: with `TOI_PERF_MAP` set, name every piece in
         // `/tmp/perf-<pid>.map`, so `perf report` shows time per stencil.
-        if std::env::var_os("TOI_PERF_MAP").is_some() {
+        // `TOI_PERF_MAP=fn`: each named after its function too
+        // (`jit:<function>:<piece>`), for time per function.
+        if let Some(how) = std::env::var_os("TOI_PERF_MAP") {
             let mut map = String::new();
+            let prefix = if how == "fn" && !root.is_null() {
+                format!("{}:", unsafe { &(*root).name })
+            } else {
+                String::new()
+            };
             // Empty pieces (`nop`) get no symbol: perf would give them the
             // samples of the piece at the same address.
             let mut sym = |at: usize, len: usize, name: &str| {
                 if len > 0 {
-                    map.push_str(&format!("{:x} {len:x} jit:{name}\n", base as usize + at));
+                    map.push_str(&format!("{:x} {len:x} jit:{prefix}{name}\n", base as usize + at));
                 }
             };
             for (p, &at) in hot.iter().zip(&code_at) {

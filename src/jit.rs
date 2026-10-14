@@ -8616,6 +8616,8 @@ impl JitCode {
         }
 
         mem.seal();
+        JIT_HOT_BYTES.fetch_add(main_len as u64, std::sync::atomic::Ordering::Relaxed);
+        JIT_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
         let ret = returned(insns, &ins, false);
         if !root.is_null() {
             unsafe { (*root).ret_hint.set(Ty::of_result(ret)) };
@@ -9918,6 +9920,11 @@ pub fn count_report() -> String {
 }
 
 pub static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Machine code compiled over the process: hot paths, and all of it (cold
+/// paths and stubs too); freed code included (`toi` prints them with
+/// `TOI_SIZES` set).
+pub static JIT_HOT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static JIT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn timed<T>(total: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> T) -> T {
     if std::ptr::eq(total, &LOWER_NS) {

@@ -108,6 +108,23 @@ fn main() -> ExitCode {
                     toi::jit::COMPILES.load(std::sync::atomic::Ordering::Relaxed)
                 );
             }
+            // `TOI_SIZES`: what the run compiled, one line of `name=value`
+            // (`scripts/octane-sizes.sh` reads it).
+            if std::env::var_os("TOI_SIZES").is_some() {
+                let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "sizes functions={} stubs={} bytecode={} jit_hot={} jit_total={} compiles={} lowers={} compile_ms={:.1} lower_ms={:.1}",
+                    n(&toi::vm::FUNCTIONS),
+                    n(&toi::vm::STUBS),
+                    n(&toi::vm::BYTECODE_BYTES),
+                    n(&toi::jit::JIT_HOT_BYTES),
+                    n(&toi::jit::JIT_BYTES),
+                    n(&toi::jit::COMPILES),
+                    n(&toi::jit::LOWERS),
+                    n(&toi::jit::COMPILE_NS) as f64 / 1e6,
+                    n(&toi::jit::LOWER_NS) as f64 / 1e6,
+                );
+            }
             // `TOI_COUNT`: hot code's stencil executions.
             if std::env::var_os("TOI_COUNT").is_some() {
                 eprint!("{}", toi::jit::count_report());

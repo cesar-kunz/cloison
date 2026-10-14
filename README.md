@@ -132,10 +132,15 @@ them against handwritten arm64 code); `tiers.sh` times every micro in toi and in
 capped at each tier; `octane.sh` runs Octane (`SCORE=1` for scores);
 `perf.sh --ab` compares two builds; `jit-asm.sh` and `stencils-asm.sh`
 disassemble generated code and stencils; `sizes.sh --record` appends
-sizes.
+sizes; `octane-sizes.sh` reports per Octane benchmark the bytecode, the
+machine code and the compile time toi spends, against V8, JavaScriptCore,
+SpiderMonkey and QuickJS (installed with `jsvu`, measured once per
+version: `bench/octane-sizes-engines.tsv`), with each engine's runtime
+size; `--record` appends toi's to `bench/octane-sizes.tsv`.
 
 Environment flags: `TOI_NO_JIT`, `TOI_TIER=<back edges>`, `TOI_TIME`,
-`TOI_JIT_TIME`, `TOI_EXITS` (exits, entries and runtime calls by count),
+`TOI_JIT_TIME`, `TOI_SIZES` (functions, bytecode, machine code and
+compile time over the run), `TOI_EXITS` (exits, entries and runtime calls by count),
 `TOI_JIT_DUMP`, `TOI_JIT_LOG`, `TOI_PERF_MAP` (names JIT code for `perf`),
 `TOI_NO_QUICKEN`, `TOI_COUNT`, `TOI_CODE_SHIFT`; for the collector,
 `TOI_GC_STATS` (each collection), `TOI_GC_NURSERY` (MiB),

@@ -227,6 +227,13 @@ pub(crate) fn pin(code: *const Code) {
     unsafe { (*code).pinned.set(true) }
 }
 
+/// Over the process: functions loaded with bytecode (compiled up front or
+/// at their first call), their bytecode's bytes, and functions loaded as
+/// stubs not compiled yet (`toi` prints them with `TOI_SIZES` set).
+pub static FUNCTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BYTECODE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static STUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A function's code, shared by its closures.
 pub struct Code {
     pub name: String,
@@ -2697,6 +2704,11 @@ impl Vm {
                 let mut bytecode = f.code;
                 // (Without the slack it grew with: it lives as long as the VM.)
                 bytecode.shrink_to_fit();
+                let counter = if f.lazy.is_some() { &STUBS } else { &FUNCTIONS };
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if f.lazy.is_none() {
+                    BYTECODE_BYTES.fetch_add(bytecode.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
                 if quicken {
                     crate::bytecode::quicken(&mut bytecode);
                 }

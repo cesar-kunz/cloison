@@ -8,9 +8,11 @@ use super::Error;
 use super::ast::*;
 use super::lex::{Tok, Token};
 
-pub fn parse(toks: &[Token]) -> Result<Program, Error> {
+/// `toks`' program, its nodes in `arena`.
+pub fn parse<'a>(toks: &[Token], arena: &'a Arenas<'a>) -> Result<Program<'a>, Error> {
     let mut p = Parser {
         toks,
+        arena,
         i: 0,
         functions: Vec::new(),
         current: 0,
@@ -35,17 +37,28 @@ pub fn parse(toks: &[Token]) -> Result<Program, Error> {
     })
 }
 
-struct Parser<'a> {
-    toks: &'a [Token],
+struct Parser<'t, 'a> {
+    toks: &'t [Token],
+    arena: &'a Arenas<'a>,
     i: usize,
-    functions: Vec<Function>,
+    functions: Vec<Function<'a>>,
     /// The function whose body is being parsed.
     current: usize,
 }
 
 type R<T> = Result<T, Error>;
 
-impl Parser<'_> {
+/// `e` in `arena`.
+fn expr<'a>(arena: &'a Arenas<'a>, e: Expr<'a>) -> &'a Expr<'a> {
+    arena.exprs.alloc(e)
+}
+
+/// `s` in `arena`.
+fn stmt<'a>(arena: &'a Arenas<'a>, s: Stmt<'a>) -> &'a Stmt<'a> {
+    arena.stmts.alloc(s)
+}
+
+impl<'a> Parser<'_, 'a> {
     fn peek(&self) -> &Tok {
         &self.toks[self.i].tok
     }
@@ -149,7 +162,7 @@ impl Parser<'_> {
 
     // ---- Statements ----
 
-    fn statement(&mut self) -> R<Stmt> {
+    fn statement(&mut self) -> R<Stmt<'a>> {
         let pos = self.pos();
         let kind = match self.peek().clone() {
             Tok::Punct("{") => {
@@ -178,9 +191,9 @@ impl Parser<'_> {
                 self.expect("(")?;
                 let c = self.expression(false)?;
                 self.expect(")")?;
-                let then = Box::new(self.statement()?);
+                let then = stmt(self.arena, self.statement()?);
                 let other = if self.eat("else") {
-                    Some(Box::new(self.statement()?))
+                    Some(stmt(self.arena, self.statement()?))
                 } else {
                     None
                 };
@@ -195,11 +208,11 @@ impl Parser<'_> {
                 self.expect("(")?;
                 let c = self.expression(false)?;
                 self.expect(")")?;
-                StmtKind::While(c, Box::new(self.statement()?))
+                StmtKind::While(c, stmt(self.arena, self.statement()?))
             }
             Tok::Keyword("do") => {
                 self.advance();
-                let body = Box::new(self.statement()?);
+                let body = stmt(self.arena, self.statement()?);
                 self.expect("while")?;
                 self.expect("(")?;
                 let c = self.expression(false)?;
@@ -282,7 +295,7 @@ impl Parser<'_> {
             Tok::Ident(name) if self.peek_at(1) == &Tok::Punct(":") => {
                 self.advance();
                 self.advance();
-                StmtKind::Labeled(name, Box::new(self.statement()?))
+                StmtKind::Labeled(name, stmt(self.arena, self.statement()?))
             }
             _ => {
                 let e = self.expression(false)?;
@@ -294,7 +307,7 @@ impl Parser<'_> {
     }
 
     /// Statements up to and including the closing `}`.
-    fn block_rest(&mut self) -> R<Vec<Stmt>> {
+    fn block_rest(&mut self) -> R<Vec<Stmt<'a>>> {
         let mut body = Vec::new();
         while !self.eat("}") {
             if *self.peek() == Tok::Eof {
@@ -305,7 +318,7 @@ impl Parser<'_> {
         Ok(body)
     }
 
-    fn var_decls(&mut self, no_in: bool) -> R<Vec<(Name, Option<Expr>)>> {
+    fn var_decls(&mut self, no_in: bool) -> R<Vec<(Name, Option<Expr<'a>>)>> {
         let mut decls = Vec::new();
         loop {
             let name = self.ident()?;
@@ -323,7 +336,7 @@ impl Parser<'_> {
         }
     }
 
-    fn for_rest(&mut self) -> R<StmtKind> {
+    fn for_rest(&mut self) -> R<StmtKind<'a>> {
         self.expect("(")?;
         let init = if self.is(";") {
             None
@@ -357,7 +370,7 @@ impl Parser<'_> {
             Some(self.expression(false)?)
         };
         self.expect(")")?;
-        let body = Box::new(self.statement()?);
+        let body = stmt(self.arena, self.statement()?);
         Ok(StmtKind::For {
             init,
             test,
@@ -366,10 +379,10 @@ impl Parser<'_> {
         })
     }
 
-    fn for_in_rest(&mut self, var: bool, name: Name) -> R<StmtKind> {
+    fn for_in_rest(&mut self, var: bool, name: Name) -> R<StmtKind<'a>> {
         let object = self.expression(false)?;
         self.expect(")")?;
-        let body = Box::new(self.statement()?);
+        let body = stmt(self.arena, self.statement()?);
         Ok(StmtKind::ForIn {
             var,
             name,
@@ -378,7 +391,7 @@ impl Parser<'_> {
         })
     }
 
-    fn switch_rest(&mut self) -> R<StmtKind> {
+    fn switch_rest(&mut self) -> R<StmtKind<'a>> {
         self.expect("(")?;
         let d = self.expression(false)?;
         self.expect(")")?;
@@ -464,21 +477,21 @@ impl Parser<'_> {
     // ---- Expressions ----
 
     /// `no_in` excludes the `in` operator (in a `for` head).
-    fn expression(&mut self, no_in: bool) -> R<Expr> {
+    fn expression(&mut self, no_in: bool) -> R<Expr<'a>> {
         let mut e = self.assignment(no_in)?;
         while self.is(",") {
             let pos = self.pos();
             self.advance();
             let r = self.assignment(no_in)?;
             e = Expr {
-                kind: ExprKind::Comma(Box::new(e), Box::new(r)),
+                kind: ExprKind::Comma(expr(self.arena, e), expr(self.arena, r)),
                 pos,
             };
         }
         Ok(e)
     }
 
-    fn assignment(&mut self, no_in: bool) -> R<Expr> {
+    fn assignment(&mut self, no_in: bool) -> R<Expr<'a>> {
         let target = self.conditional(no_in)?;
         let op = match self.peek() {
             Tok::Punct("=") => None,
@@ -507,12 +520,12 @@ impl Parser<'_> {
             }
         }
         Ok(Expr {
-            kind: ExprKind::Assign(op, Box::new(target), Box::new(value)),
+            kind: ExprKind::Assign(op, expr(self.arena, target), expr(self.arena, value)),
             pos,
         })
     }
 
-    fn conditional(&mut self, no_in: bool) -> R<Expr> {
+    fn conditional(&mut self, no_in: bool) -> R<Expr<'a>> {
         let c = self.binary(0, no_in)?;
         if !self.is("?") {
             return Ok(c);
@@ -523,13 +536,13 @@ impl Parser<'_> {
         self.expect(":")?;
         let b = self.assignment(no_in)?;
         Ok(Expr {
-            kind: ExprKind::Cond(Box::new(c), Box::new(a), Box::new(b)),
+            kind: ExprKind::Cond(expr(self.arena, c), expr(self.arena, a), expr(self.arena, b)),
             pos,
         })
     }
 
     /// Binary operators binding tighter than `min`.
-    fn binary(&mut self, min: u8, no_in: bool) -> R<Expr> {
+    fn binary(&mut self, min: u8, no_in: bool) -> R<Expr<'a>> {
         let mut l = self.unary()?;
         loop {
             let Some((prec, op)) = binary_op(self.peek()) else {
@@ -548,15 +561,15 @@ impl Parser<'_> {
             };
             let r = self.binary(rmin, no_in)?;
             let kind = match op {
-                Bin::Op(op) => ExprKind::Binary(op, Box::new(l), Box::new(r)),
-                Bin::And => ExprKind::Logical(true, Box::new(l), Box::new(r)),
-                Bin::Or => ExprKind::Logical(false, Box::new(l), Box::new(r)),
+                Bin::Op(op) => ExprKind::Binary(op, expr(self.arena, l), expr(self.arena, r)),
+                Bin::And => ExprKind::Logical(true, expr(self.arena, l), expr(self.arena, r)),
+                Bin::Or => ExprKind::Logical(false, expr(self.arena, l), expr(self.arena, r)),
             };
             l = Expr { kind, pos };
         }
     }
 
-    fn unary(&mut self) -> R<Expr> {
+    fn unary(&mut self) -> R<Expr<'a>> {
         let pos = self.pos();
         let op = match self.peek() {
             Tok::Punct("!") => UnOp::Not,
@@ -572,7 +585,7 @@ impl Parser<'_> {
                 let target = self.unary()?;
                 self.check_update_target(&target)?;
                 return Ok(Expr {
-                    kind: ExprKind::Update(Box::new(target), d, true),
+                    kind: ExprKind::Update(expr(self.arena, target), d, true),
                     pos,
                 });
             }
@@ -584,7 +597,7 @@ impl Parser<'_> {
             return self.err("parenthesize a unary operand of `**`");
         }
         Ok(Expr {
-            kind: ExprKind::Unary(op, Box::new(e)),
+            kind: ExprKind::Unary(op, expr(self.arena, e)),
             pos,
         })
     }
@@ -599,7 +612,7 @@ impl Parser<'_> {
         }
     }
 
-    fn postfix(&mut self) -> R<Expr> {
+    fn postfix(&mut self) -> R<Expr<'a>> {
         let e = self.call()?;
         if let Tok::Punct(p @ ("++" | "--")) = self.peek()
             && !self.toks[self.i].newline_before
@@ -609,7 +622,7 @@ impl Parser<'_> {
             self.check_update_target(&e)?;
             self.advance();
             return Ok(Expr {
-                kind: ExprKind::Update(Box::new(e), d, false),
+                kind: ExprKind::Update(expr(self.arena, e), d, false),
                 pos,
             });
         }
@@ -617,7 +630,7 @@ impl Parser<'_> {
     }
 
     /// Member accesses and calls.
-    fn call(&mut self) -> R<Expr> {
+    fn call(&mut self) -> R<Expr<'a>> {
         let mut e = if self.is("new") {
             self.new_expr()?
         } else {
@@ -628,7 +641,7 @@ impl Parser<'_> {
             if self.eat("(") {
                 let args = self.arguments()?;
                 e = Expr {
-                    kind: ExprKind::Call(Box::new(e), args),
+                    kind: ExprKind::Call(expr(self.arena, e), args),
                     pos,
                 };
             } else if !self.member_suffix(&mut e)? {
@@ -638,15 +651,15 @@ impl Parser<'_> {
     }
 
     /// `.name` or `[key]` applied to `e`, if one follows.
-    fn member_suffix(&mut self, e: &mut Expr) -> R<bool> {
+    fn member_suffix(&mut self, e: &mut Expr<'a>) -> R<bool> {
         let pos = self.pos();
         let kind = if self.eat(".") {
             let name = self.property_name()?;
-            ExprKind::Member(Box::new(take(e)), name)
+            ExprKind::Member(expr(self.arena, take(e)), name)
         } else if self.eat("[") {
             let k = self.expression(false)?;
             self.expect("]")?;
-            ExprKind::Index(Box::new(take(e)), Box::new(k))
+            ExprKind::Index(expr(self.arena, take(e)), expr(self.arena, k))
         } else {
             return Ok(false);
         };
@@ -656,7 +669,7 @@ impl Parser<'_> {
 
     /// `new C(args)`, where `C` is a member expression without calls, and
     /// the arguments are optional.
-    fn new_expr(&mut self) -> R<Expr> {
+    fn new_expr(&mut self) -> R<Expr<'a>> {
         let pos = self.pos();
         self.expect("new")?;
         let mut c = if self.is("new") {
@@ -671,13 +684,13 @@ impl Parser<'_> {
             Vec::new()
         };
         Ok(Expr {
-            kind: ExprKind::New(Box::new(c), args),
+            kind: ExprKind::New(expr(self.arena, c), args),
             pos,
         })
     }
 
     /// After `(`: arguments up to and including `)`.
-    fn arguments(&mut self) -> R<Vec<Expr>> {
+    fn arguments(&mut self) -> R<Vec<Expr<'a>>> {
         let mut args = Vec::new();
         while !self.eat(")") {
             if !args.is_empty() {
@@ -688,7 +701,7 @@ impl Parser<'_> {
         Ok(args)
     }
 
-    fn primary(&mut self) -> R<Expr> {
+    fn primary(&mut self) -> R<Expr<'a>> {
         let pos = self.pos();
         let start = self.i;
         let kind = match self.bump() {
@@ -724,7 +737,7 @@ impl Parser<'_> {
                 ExprKind::Array(elems)
             }
             Tok::Punct("{") => {
-                let mut props: Vec<(Name, Expr)> = Vec::new();
+                let mut props: Vec<(Name, Expr<'a>)> = Vec::new();
                 while !self.eat("}") {
                     let key_start = self.i;
                     let key: Name = match self.bump() {
@@ -778,7 +791,7 @@ impl Parser<'_> {
     }
 }
 
-fn take(e: &mut Expr) -> Expr {
+fn take<'a>(e: &mut Expr<'a>) -> Expr<'a> {
     std::mem::replace(
         e,
         Expr {
@@ -856,12 +869,13 @@ mod tests {
     use super::super::lex::lex;
     use super::*;
 
-    fn program(src: &str) -> Program {
-        parse(&lex(src).unwrap()).unwrap()
+    /// (Its nodes in an arena that lives on: these are tests.)
+    fn program(src: &str) -> Program<'static> {
+        parse(&lex(src).unwrap(), Box::leak(Box::default())).unwrap()
     }
 
     fn error(src: &str) -> String {
-        parse(&lex(src).unwrap()).unwrap_err().msg
+        parse(&lex(src).unwrap(), &Arenas::default()).unwrap_err().msg
     }
 
     /// The script's only expression statement, printed with explicit

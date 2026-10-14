@@ -2807,50 +2807,47 @@ impl Regs {
             return false;
         }
         // Whether `other` has a register `self` hasn't, or a wider type.
-        let (mut a, mut b) = (self.tys.iter().peekable(), other.tys.iter().peekable());
+        // (Both sorted by register: merged by index.)
+        let (a, b) = (&self.tys[..], &other.tys[..]);
+        let (mut x, mut y) = (0, 0);
         let changed = loop {
-            match (a.peek(), b.peek()) {
-                (Some(&&(ra, ta)), Some(&&(rb, tb))) if ra == rb => {
-                    if ta.join(tb) != ta {
-                        break true;
-                    }
-                    a.next();
-                    b.next();
-                }
-                (Some(&&(ra, _)), Some(&&(rb, _))) if ra < rb => {
-                    a.next();
-                }
-                (_, Some(_)) => break true,
-                (_, None) => break false,
+            if y == b.len() {
+                break false;
             }
+            if x == a.len() || a[x].0 > b[y].0 {
+                break true;
+            }
+            if a[x].0 < b[y].0 {
+                x += 1;
+                continue;
+            }
+            if a[x].1.join(b[y].1) != a[x].1 {
+                break true;
+            }
+            x += 1;
+            y += 1;
         };
         if !changed {
             return false;
         }
-        let mut out: Vec<(u8, Ty)> = Vec::with_capacity(self.tys.len() + other.tys.len());
-        let (mut a, mut b) = (self.tys.iter().peekable(), other.tys.iter().peekable());
-        loop {
-            match (a.peek(), b.peek()) {
-                (Some(&&(ra, ta)), Some(&&(rb, tb))) if ra == rb => {
-                    out.push((ra, ta.join(tb)));
-                    a.next();
-                    b.next();
-                }
-                (Some(&&e), Some(&&(rb, _))) if e.0 < rb => {
-                    out.push(e);
-                    a.next();
-                }
-                (_, Some(&&e)) => {
-                    out.push(e);
-                    b.next();
-                }
-                (Some(&&e), None) => {
-                    out.push(e);
-                    a.next();
-                }
-                (None, None) => break,
+        let mut out: Vec<(u8, Ty)> = Vec::with_capacity(a.len() + b.len());
+        let (mut x, mut y) = (0, 0);
+        while x < a.len() && y < b.len() {
+            let ((ra, ta), (rb, tb)) = (a[x], b[y]);
+            if ra == rb {
+                out.push((ra, ta.join(tb)));
+                x += 1;
+                y += 1;
+            } else if ra < rb {
+                out.push(a[x]);
+                x += 1;
+            } else {
+                out.push(b[y]);
+                y += 1;
             }
         }
+        out.extend_from_slice(&a[x..]);
+        out.extend_from_slice(&b[y..]);
         self.tys = Rc::new(out);
         true
     }
@@ -4970,6 +4967,19 @@ fn rs_add(s: &mut RegSet, r: usize) {
     s[r / 64] |= 1 << (r % 64);
 }
 
+/// `s` with each register `r` moved to `r + n` (those past 255 dropped).
+fn rs_shl(s: &RegSet, n: usize) -> RegSet {
+    let (w, b) = (n / 64, n % 64);
+    let mut out = [0; 4];
+    for k in w..4 {
+        out[k] = s[k - w] << b;
+        if b > 0 && k > w {
+            out[k] |= s[k - w - 1] >> (64 - b);
+        }
+    }
+    out
+}
+
 fn rs_or(a: &mut RegSet, b: &RegSet) {
     a.iter_mut().zip(b).for_each(|(x, y)| *x |= y);
 }
@@ -5595,8 +5605,17 @@ fn edge_conversions(from: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Pie
         (Ty::I32, Ty::Any) => out.push(Piece::new("box_iacc", 0)),
         _ => {}
     }
+    if Rc::ptr_eq(&from.regs.tys, &to.regs.tys) {
+        return out;
+    }
+    // Both sorted by register: `from`'s type of each of `to`'s, merged.
+    let from = &from.regs.tys[..];
+    let mut x = 0;
     for (r, b) in to.regs.iter() {
-        let a = from.regs[r];
+        while x < from.len() && (from[x].0 as usize) < r {
+            x += 1;
+        }
+        let a = from.get(x).filter(|e| e.0 as usize == r).map_or(Ty::Bot, |e| e.1);
         if a == Ty::I32 && b == Ty::F64 && matches!(homes[r], Home::Mem | Home::Gpr(_)) {
             out.push(Piece::new(&format!("conv_{}_f", homes[r].loc()), r as u8));
         }
@@ -8774,8 +8793,9 @@ pub struct JitFunction {
 /// After this many compilations in one run, finish in the interpreter.
 const MAX_COMPILES: u32 = 16;
 
-/// A function's decoded instructions, with accumulator liveness after each.
-type Decoded = Rc<(Vec<Insn>, Vec<bool>)>;
+/// A function's decoded instructions, with accumulator liveness after each
+/// and whether each is in a loop (between a backward jump and its target).
+type Decoded = Rc<(Vec<Insn>, Vec<bool>, Vec<bool>)>;
 
 /// What the JIT keeps for a function in VM frames.
 // The call sites are boxed: compiled code holds their addresses.
@@ -8797,6 +8817,9 @@ pub(crate) struct Caches {
     /// Per function inlined, its registers live into each instruction as
     /// the interpreter runs it, by bytecode offset (see [`interp_live`]).
     pc_live: HashMap<*const crate::vm::Code, Rc<PcLive>>,
+    /// Per function, the registers live into each of its instructions, in
+    /// its own frame (see [`Lowering::dead_after`]).
+    reg_live: HashMap<*const crate::vm::Code, Rc<Vec<RegSet>>>,
 }
 
 impl Caches {
@@ -8809,7 +8832,23 @@ impl Caches {
             .or_insert_with(|| {
                 let insns = decode(unsafe { &(*code).bytecode }, true);
                 let live = acc_liveness(&insns, &vec![true; insns.len()]).1;
-                Rc::new((insns, live))
+                // Each backward jump's range, by differences.
+                let mut d = vec![0i32; insns.len() + 1];
+                for (b, j) in insns.iter().enumerate() {
+                    if j.jumps() && j.target <= b {
+                        d[j.target] += 1;
+                        d[b + 1] -= 1;
+                    }
+                }
+                let mut depth = 0;
+                let in_loop = d[..insns.len()]
+                    .iter()
+                    .map(|&x| {
+                        depth += x;
+                        depth > 0
+                    })
+                    .collect();
+                Rc::new((insns, live, in_loop))
             })
             .clone()
     }
@@ -9735,9 +9774,6 @@ struct Lowering<'a> {
     epoch: u32,
     out: Lowered,
     direct: Vec<DirectSetup>,
-    /// Per function, the registers live into each of its instructions, in
-    /// its own frame (see [`Lowering::dead_after`]).
-    live: HashMap<*const crate::vm::Code, Rc<Vec<RegSet>>>,
     /// For the call being lowered, registers of its window that are
     /// copies of another register, with that register, both renamed (see
     /// [`window_sources`]).
@@ -9889,7 +9925,6 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             exit_live: Vec::new(),
         },
         direct: Vec::new(),
-        live: HashMap::default(),
         fwd: Vec::new(),
         inlined: 0,
         call_in_loop: false,
@@ -9994,9 +10029,7 @@ fn interp_live(
         let mut set = [0; 4];
         // (Past the end of the bytecode: nothing.)
         if let Some(live) = pc_live[&f.code].get(&pc) {
-            for r in rs_iter(live) {
-                rs_add(&mut set, f.base + r);
-            }
+            set = rs_shl(live, f.base);
         }
         // A restored register's source, then a parameter's argument (the
         // source may be a parameter: see `materialize`).
@@ -11300,13 +11333,20 @@ fn fold_constant_tests(insns: &mut [Insn]) {
             *t = true;
         }
     }
-    let mut regs: Vec<Option<Known>> = vec![None; 256];
+    // Each register's value, if set in generation `era` (forgetting them
+    // all is starting the next).
+    let mut regs: Vec<(u32, Option<Known>)> = vec![(0, None); 256];
+    let mut era = 1;
+    let get = |regs: &[(u32, Option<Known>)], era, r: u8| {
+        let (g, v) = regs[r as usize];
+        if g == era { v } else { None }
+    };
     let mut acc: Option<Known> = None;
     let constant = |truth, boolean| Some(Known { truth, boolean });
     for k in 0..insns.len() {
         let i = insns[k];
         if target[k] || i.bail || i.is_call() {
-            regs.fill(None);
+            era += 1;
             acc = None;
         }
         if i.bail {
@@ -11317,9 +11357,9 @@ fn fold_constant_tests(insns: &mut [Insn]) {
             Op::LdaFalse => acc = constant(false, true),
             Op::LdaUndefined | Op::LdaNull => acc = constant(false, false),
             Op::LdaSmi => acc = constant(i.imm != 0, false),
-            Op::Ldar => acc = regs[i.reg as usize],
-            Op::Star => regs[i.reg as usize] = acc,
-            Op::Mov => regs[i.reg2 as usize] = regs[i.reg as usize],
+            Op::Ldar => acc = get(&regs, era, i.reg),
+            Op::Star => regs[i.reg as usize] = (era, acc),
+            Op::Mov => regs[i.reg2 as usize] = (era, get(&regs, era, i.reg)),
             Op::Nop if i.alloc == 0 => {}
             Op::JumpIfToBooleanTrue
             | Op::JumpIfToBooleanFalse
@@ -11336,7 +11376,7 @@ fn fold_constant_tests(insns: &mut [Insn]) {
             _ => acc = None,
         }
         if !insns[k].falls_through() {
-            regs.fill(None);
+            era += 1;
             acc = None;
         }
     }
@@ -12177,11 +12217,7 @@ impl Lowering<'_> {
     /// loop of `code` (between a backward jump and its target).
     fn in_loop(&mut self, code: *const crate::vm::Code, pc: usize) -> bool {
         let d = self.decoded(code);
-        let insns = &d.0;
-        let Some(k) = insns.iter().position(|j| j.pc == pc) else {
-            return false;
-        };
-        (insns.iter().enumerate()).any(|(b, j)| j.jumps() && j.target <= k && k <= b)
+        d.0.binary_search_by_key(&pc, |j| j.pc as usize).is_ok_and(|k| d.2[k])
     }
 
     /// Whether `code` passes its own arguments on (see `Insn::forward`).
@@ -12855,7 +12891,8 @@ impl Lowering<'_> {
     fn dead_after(&mut self, code: *const crate::vm::Code, k: usize, r: u8) -> bool {
         let d = self.decoded(code);
         let live = self
-            .live
+            .caches()
+            .reg_live
             .entry(code)
             .or_insert_with(|| {
                 let insns = &d.0;

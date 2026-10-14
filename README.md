@@ -10,9 +10,10 @@ target/release/toi bench/micro/87-constraint-solver.js   # prints the completion
 target/release/toi --dump file.js                         # the bytecode instead
 ```
 
-Status (2026-10-10): every Octane benchmark runs, with a generational
-garbage collector (its old generation not yet marked concurrently). The
-language is ES5 in sloppy mode. See
+Status (2026-10-14): every Octane benchmark runs, with a generational
+garbage collector that marks and sweeps its old generation concurrently
+and frees compiled code that is no longer reachable. The language is ES5
+in sloppy mode. See
 [Where it falls short](#where-it-falls-short).
 
 ## How it works
@@ -78,16 +79,32 @@ heap sandboxing and defers it.
 All numbers are from an Ubuntu Linux host, recorded in the docs; they
 are the author's, not reproduced on other hardware.
 
-Octane scores, toi against V8 14.6 with all tiers (higher is better):
+Octane scores at 49c80a1, toi's JIT against V8 14.6 with all tiers and
+capped at Sparkplug (higher is better; medians of 3 runs, from
+`scripts/octane-tiers.sh`):
 
-| benchmark | toi | V8 |
-|---|---:|---:|
-| DeltaBlue | 58,713 | 118,616 |
-| Richards | 35,775 | 62,785 |
-| GameBoy | 40,757 | 124,442 |
-| Crypto | 16,043 | 50,085 |
-| Box2D | 15,522 | 132,428 |
-| TypeScript | 26,377 | |
+| benchmark | toi | V8 Sparkplug | V8 |
+|---|---:|---:|---:|
+| Richards | 33,657 | 2,743 | 51,308 |
+| DeltaBlue | 58,640 | 2,804 | 120,738 |
+| Crypto | 20,221 | 2,442 | 50,339 |
+| RayTrace | 22,303 | 7,348 | 132,902 |
+| EarleyBoyer | 19,341 | 13,690 | 96,935 |
+| RegExp | 5,513 | 6,668 | 11,851 |
+| Splay | 10,767 | 7,283 | 35,231 |
+| NavierStokes | 7,795 | 3,104 | 47,441 |
+| PdfJS | 14,716 | 16,331 | 60,628 |
+| Mandreel | 25,110 | 4,860 | 72,396 |
+| GameBoy | 55,987 | 14,365 | 107,033 |
+| CodeLoad | 18,374 | 45,023 | 45,102 |
+| Box2D | 16,609 | 8,286 | 112,889 |
+| zlib | 22,747 | 109,623 | 109,702 |
+| TypeScript | 29,298 | 34,545 | 74,261 |
+| **geomean** | **20,030** | **9,494** | **64,968** |
+
+V8 runs zlib (asm.js) through its wasm pipeline, and compiles the
+functions of CodeLoad's `eval`s when they are first called; toi compiles
+every function of every `eval` up front.
 
 Inside a long DeltaBlue run the JIT is about 7x the interpreter and about 2.3x
 behind V8's Maglev tier.

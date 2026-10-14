@@ -12380,7 +12380,10 @@ impl Lowering<'_> {
             let proto_at = Object::inline(fo, 0).cast::<u64>();
             vm.heap.keep(fo as usize);
             vm.heap.keep(*proto_at as usize);
-            let cap_at = (*callee).ctor_capacity.as_ptr();
+            let cap_at = match vm.ctor_proto(&*callee, (*shape).proto) {
+                Some(e) => (*e).cap.as_ptr(),
+                None => (*callee).ctor_capacity.as_ptr(),
+            };
             let site = Box::new(CtorSite {
                 heap: vm.heap.bump(),
                 proto_at,
@@ -13003,6 +13006,15 @@ impl Lowering<'_> {
         let forwards = unsafe { self.forwards((*fo).code) };
         if !forwards && (!code.ctor_settled.get() || !fits) {
             return None;
+        }
+        // (Nor, for code several classes share, before this one's capacity
+        // settled: its objects would get room for `MAX_INLINE_CAPACITY`.)
+        if code.ctor_shared.get() {
+            let vm = unsafe { &mut *self.state.vm };
+            let proto = unsafe { (*vm.ctor_root(fo)).proto };
+            if vm.ctor_proto(code, proto).is_some_and(|e| unsafe { !(*e).settled() }) {
+                return None;
+            }
         }
         let d = self.decoded(code);
         let only_undefined = d.0.iter().enumerate().all(|(k, j)| {
@@ -15283,7 +15295,8 @@ extern "C" fn toi_rt_construct_done(site: Value, this: Value) -> u64 {
         let shape = (*o).shape;
         let seen = code.ctor_result.get();
         if code.ctor_settled.get()
-            && (*shape).keys.len() as u32 <= code.ctor_capacity.get()
+            && (*shape).keys.len() as u32
+                <= crate::vm::Vm::shared_proto(code, o).map_or(code.ctor_capacity.get(), |e| e.cap.get())
             && (seen == shape || seen == crate::vm::MANY_SHAPES)
         {
             s.ctor.as_mut().unwrap().done_shape = shape as u64;

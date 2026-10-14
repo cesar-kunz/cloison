@@ -539,9 +539,12 @@ pub struct Vm {
     /// compiled code inlines (see `jit::Insn::native`).
     pub(crate) char_code_at_fn: *mut Object,
     pub(crate) from_char_code_fn: *mut Object,
-    /// `Math.sqrt` and `Math.pow`, which compiled code computes itself.
+    /// `Math.sqrt`, `Math.pow`, `Math.max` and `Math.min`, which compiled
+    /// code computes itself.
     pub(crate) math_sqrt_fn: *mut Object,
     pub(crate) math_pow_fn: *mut Object,
+    pub(crate) math_max_fn: *mut Object,
+    pub(crate) math_min_fn: *mut Object,
     a_prototype: Atom,
     a_constructor: Atom,
     a_length: Atom,
@@ -651,6 +654,8 @@ impl Vm {
             from_char_code_fn: std::ptr::null_mut(),
             math_sqrt_fn: std::ptr::null_mut(),
             math_pow_fn: std::ptr::null_mut(),
+            math_max_fn: std::ptr::null_mut(),
+            math_min_fn: std::ptr::null_mut(),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
@@ -786,6 +791,8 @@ impl Vm {
             match name {
                 "sqrt" => vm.math_sqrt_fn = fo,
                 "pow" => vm.math_pow_fn = fo,
+                "max" => vm.math_max_fn = fo,
+                "min" => vm.math_min_fn = fo,
                 _ => {}
             }
         }

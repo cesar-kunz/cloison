@@ -11,12 +11,21 @@ use super::lex::{Tok, Token};
 /// `toks`' program, its nodes in `arena` (the text of string and regular
 /// expression tokens moves to the tree).
 pub fn parse<'a>(toks: &mut [Token], arena: &'a Arenas<'a>) -> Result<Program<'a>, Error> {
+    parse_with(toks, arena, false)
+}
+
+/// [`parse`], but with `skim`, the body of each function expression or
+/// declaration not likely called at once is only skimmed (see
+/// [`Function::free`]): it compiles lazily, parsed again then.
+pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
     let mut p = Parser {
         toks,
         arena,
         i: 0,
         functions: Vec::new(),
         current: 0,
+        skim,
+        skim_spare: Vec::new(),
     };
     p.functions.push(Function {
         name: None,
@@ -27,6 +36,10 @@ pub fn parse<'a>(toks: &mut [Token], arena: &'a Arenas<'a>) -> Result<Program<'a
         binds_name: false,
         uses_arguments: false,
         pos: 0,
+        params_pos: 0,
+        end: 0,
+        eager: false,
+        free: None,
     });
     let mut body = Vec::new();
     while p.peek() != &Tok::Eof {
@@ -45,6 +58,20 @@ struct Parser<'t, 'a> {
     functions: Vec<Function<'a>>,
     /// The function whose body is being parsed.
     current: usize,
+    /// Skim functions' bodies (see [`parse_with`]).
+    skim: bool,
+    /// Empty frames for [`Parser::skim_body`] to reuse.
+    skim_spare: Vec<SkimFrame>,
+}
+
+/// A function being skimmed (see [`Parser::skim_body`]): the names it
+/// certainly declares, those it and the functions in it refer to, and
+/// the bracket level inside its body.
+#[derive(Default)]
+struct SkimFrame {
+    decls: Vec<Name>,
+    refs: Vec<Name>,
+    level: usize,
 }
 
 type R<T> = Result<T, Error>;
@@ -78,7 +105,7 @@ impl<'a> Parser<'_, 'a> {
     fn bump(&mut self) -> Tok {
         let t = match &mut self.toks[self.i].tok {
             Tok::Str(s) => Tok::Str(std::mem::take(s)),
-            Tok::RegExp(p, f) => Tok::RegExp(std::mem::take(p), std::mem::take(f)),
+            Tok::RegExp(r) => Tok::RegExp(std::mem::take(r)),
             t => t.clone(),
         };
         if self.i + 1 < self.toks.len() {
@@ -192,7 +219,7 @@ impl<'a> Parser<'_, 'a> {
             }
             Tok::Keyword("function") => {
                 self.advance();
-                StmtKind::Function(self.function(true, pos)?)
+                StmtKind::Function(self.function(true, false, pos)?)
             }
             Tok::Keyword("if") => {
                 self.advance();
@@ -432,8 +459,10 @@ impl<'a> Parser<'_, 'a> {
     }
 
     /// After `function`: the name (if `declaration`, required), parameters
-    /// and body. Returns the function's index.
-    fn function(&mut self, declaration: bool, pos: Pos) -> R<usize> {
+    /// and body. Returns the function's index. A body is only skimmed when
+    /// skimming, unless the function comes right after a `(` (`paren`) or
+    /// right before one.
+    fn function(&mut self, declaration: bool, paren: bool, pos: Pos) -> R<usize> {
         let name = match self.peek() {
             Tok::Ident(_) => Some(self.ident()?),
             _ if declaration => return self.err("expected the function's name"),
@@ -450,6 +479,10 @@ impl<'a> Parser<'_, 'a> {
             parent: Some(self.current),
             declaration,
             pos,
+            params_pos: self.pos(),
+            end: 0,
+            eager: false,
+            free: None,
         });
         self.expect("(")?;
         let mut params = Vec::new();
@@ -464,13 +497,153 @@ impl<'a> Parser<'_, 'a> {
             params.push(p);
         }
         self.expect("{")?;
+        if self.skim && !paren {
+            let start = self.i;
+            if let Some(free) = self.skim_body(&params)
+                && !self.is("(")
+            {
+                let end = self.toks[self.i - 1].pos + 1;
+                let f = &mut self.functions[index];
+                f.end = end;
+                f.params = params;
+                f.free = Some(free);
+                return Ok(index);
+            }
+            self.i = start;
+        }
         let outer = std::mem::replace(&mut self.current, index);
         let body = self.block_rest();
         self.current = outer;
+        let end = self.toks[self.i - 1].pos + 1;
         let f = &mut self.functions[index];
+        f.end = end;
         f.params = params;
         f.body = body?;
         Ok(index)
+    }
+
+    /// Past a function's `{`: skip its body, to past its `}`, and return
+    /// the names it and the functions in it may refer to from outside it:
+    /// every identifier not after a `.`, but `arguments`, less those
+    /// certainly declared where it is (parameters; a `var`'s first name,
+    /// and those after a comma at its level on the same line). Names it
+    /// doesn't use (an object literal's keys, a label, a variable declared
+    /// otherwise) only capture variables needlessly. None on what parsing
+    /// it in full may reject (the end of the input, `let`).
+    fn skim_body(&mut self, params: &[Name]) -> Option<Vec<Name>> {
+        // At `(`: a function's parameters, and where its body starts.
+        let header = |toks: &[Token], mut j: usize| -> Option<(Vec<Name>, usize)> {
+            let mut params = Vec::new();
+            if toks[j].tok != Tok::Punct("(") {
+                return None;
+            }
+            j += 1;
+            loop {
+                match &toks[j].tok {
+                    Tok::Punct(")") => break,
+                    Tok::Punct(",") => {}
+                    Tok::Ident(n) => params.push(n.clone()),
+                    _ => return None,
+                }
+                j += 1;
+            }
+            (toks[j + 1].tok == Tok::Punct("{")).then_some((params, j + 2))
+        };
+        // (Frames' vectors kept for the next function's, emptied.)
+        let mut spare = std::mem::take(&mut self.skim_spare);
+        fn frame(spare: &mut Vec<SkimFrame>, params: &[Name], level: usize) -> SkimFrame {
+            let mut f = spare.pop().unwrap_or_default();
+            f.decls.extend_from_slice(params);
+            f.level = level;
+            f
+        }
+        let mut frames = vec![frame(&mut spare, params, 1)];
+        let mut level = 1;
+        // The level of the `var` statement being read, while its
+        // declarations may follow.
+        let mut var_level = None;
+        loop {
+            let t = &self.toks[self.i];
+            if t.newline_before && var_level == Some(level) {
+                var_level = None;
+            }
+            match &t.tok {
+                Tok::Eof | Tok::Keyword("let" | "const" | "class" | "with" | "import" | "export") => return None,
+                Tok::Punct("{" | "(" | "[") => level += 1,
+                Tok::Punct(p @ ("}" | ")" | "]")) => {
+                    level -= 1;
+                    if var_level.is_some_and(|v| level < v) {
+                        var_level = None;
+                    }
+                    if *p == "}" && level + 1 == frames.last().unwrap().level {
+                        let mut f = frames.pop().unwrap();
+                        let SkimFrame { decls, refs, .. } = &mut f;
+                        let free = refs.drain(..).filter(|n| !decls.contains(n));
+                        let done = match frames.last_mut() {
+                            Some(outer) => {
+                                outer.refs.extend(free);
+                                None
+                            }
+                            None => {
+                                let mut free: Vec<Name> = free.collect();
+                                free.sort_unstable();
+                                free.dedup();
+                                Some(free)
+                            }
+                        };
+                        f.decls.clear();
+                        spare.push(f);
+                        if done.is_some() {
+                            self.i += 1;
+                            self.skim_spare = spare;
+                            return done;
+                        }
+                    }
+                }
+                Tok::Punct(";") | Tok::Keyword("in") if var_level == Some(level) => var_level = None,
+                Tok::Keyword("var") | Tok::Punct(",") if matches!(t.tok, Tok::Keyword("var")) || var_level == Some(level) => {
+                    let next = &self.toks[self.i + 1];
+                    if let Tok::Ident(n) = &next.tok
+                        && (matches!(t.tok, Tok::Keyword("var")) || !next.newline_before)
+                    {
+                        frames.last_mut().unwrap().decls.push(n.clone());
+                        var_level = Some(level);
+                        self.i += 2;
+                        continue;
+                    }
+                }
+                Tok::Keyword("function") => {
+                    let mut j = self.i + 1;
+                    if matches!(self.toks[j].tok, Tok::Ident(_)) {
+                        j += 1;
+                    }
+                    let (params, body) = header(self.toks, j)?;
+                    level += 1;
+                    frames.push(frame(&mut spare, &params, level));
+                    self.i = body;
+                    continue;
+                }
+                Tok::Ident(n) => {
+                    // An accessor (`get x() { … }`), a function too.
+                    let next = &self.toks[self.i + 1].tok;
+                    if (&**n == "get" || &**n == "set")
+                        && matches!(next, Tok::Ident(_) | Tok::Str(_) | Tok::Num(_) | Tok::Keyword(_))
+                        && self.toks[self.i + 2].tok == Tok::Punct("(")
+                    {
+                        let (params, body) = header(self.toks, self.i + 2)?;
+                        level += 1;
+                        frames.push(frame(&mut spare, &params, level));
+                        self.i = body;
+                        continue;
+                    }
+                    if &**n != "arguments" && self.toks[self.i - 1].tok != Tok::Punct(".") {
+                        frames.last_mut().unwrap().refs.push(n.clone());
+                    }
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
     }
 
     /// Name an anonymous function expression after what it's assigned to.
@@ -725,7 +898,14 @@ impl<'a> Parser<'_, 'a> {
             Tok::Keyword("true") => ExprKind::Bool(true),
             Tok::Keyword("false") => ExprKind::Bool(false),
             Tok::Keyword("null") => ExprKind::Null,
-            Tok::Keyword("function") => ExprKind::Function(self.function(false, pos)?),
+            Tok::Keyword("function") => {
+                // `(function …` or `function () { … }(`: likely called at
+                // once (see `Function::eager`).
+                let paren = start > 0 && matches!(self.toks[start - 1].tok, Tok::Punct("("));
+                let f = self.function(false, paren, pos)?;
+                self.functions[f].eager = paren || self.is("(");
+                ExprKind::Function(f)
+            }
             Tok::Punct("(") => {
                 let e = self.expression(false)?;
                 self.expect(")")?;
@@ -771,7 +951,7 @@ impl<'a> Parser<'_, 'a> {
                                 return self.err("expected a property name");
                             }
                         };
-                        let f = self.function(false, pos)?;
+                        let f = self.function(false, false, pos)?;
                         let kind = ExprKind::Accessor(&*key == "set", f);
                         props.push((name, Expr { kind, pos }));
                         if !self.is("}") {
@@ -789,7 +969,7 @@ impl<'a> Parser<'_, 'a> {
                 }
                 ExprKind::Object(props)
             }
-            Tok::RegExp(p, f) => ExprKind::RegExp(p, f),
+            Tok::RegExp(r) => ExprKind::RegExp(r.0, r.1),
             _ => {
                 self.i = start;
                 return self.unexpected();

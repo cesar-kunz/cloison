@@ -11,7 +11,9 @@ pub mod codegen;
 pub mod lex;
 pub mod parse;
 
-use crate::asm::Module;
+use std::rc::Rc;
+
+use crate::asm::{LazyFn, Module};
 
 /// An error at a byte offset of the source.
 #[derive(Debug)]
@@ -46,6 +48,52 @@ pub fn compile(src: &str) -> Result<Module, String> {
         .and_then(|mut toks| parse::parse(&mut toks, &arena))
         .and_then(|p| codegen::generate(&p))
         .map_err(|e| e.display(src))
+}
+
+/// Compile `src`, a script run by `eval` or made by `Function`, leaving
+/// its functions to compile at their first calls (see
+/// [`codegen::generate_lazy`]), their bodies only skimmed (see
+/// [`parse::parse_with`]).
+pub fn compile_script_lazy(src: &str) -> Result<Module, String> {
+    let source: Rc<str> = src.into();
+    let compile = |skim| {
+        let arena = ast::Arenas::default();
+        lex::lex(src)
+            .and_then(|mut toks| parse::parse_with(&mut toks, &arena, skim))
+            .and_then(|p| codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[]))
+    };
+    match compile(true) {
+        Err(e) if e.msg == codegen::SKIMMED_TOO_SOON => compile(false),
+        r => r,
+    }
+    .map_err(|e| e.display(src))
+}
+
+/// Compile the function `f` stands for: its text, parsed again inside a
+/// function declaring its upvalues (so their names resolve as where it
+/// came from); the functions nested in it are left for later in turn.
+/// Its code is the module's `script`.
+pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
+    let mut text = format!("(function({}){{(function ", f.upvalues.join(","));
+    if let Some(n) = &f.own_name {
+        text.push_str(n);
+    }
+    let prefix = text.len();
+    text.push_str(&f.source[f.start as usize..f.end as usize]);
+    text.push_str(")})");
+    // Offsets in `text` as in the source.
+    let at = |pos: ast::Pos| (pos as usize).saturating_sub(prefix) as u32 + f.start;
+    let compile = |skim| {
+        let arena = ast::Arenas::default();
+        lex::lex(&text)
+            .and_then(|mut toks| parse::parse_with(&mut toks, &arena, skim))
+            .and_then(|p| codegen::generate_lazy(&p, 2, &f.source, &at, &f.upvalues))
+    };
+    match compile(true) {
+        Err(e) if e.msg == codegen::SKIMMED_TOO_SOON => compile(false),
+        r => r,
+    }
+    .map_err(|e| Error::new(at(e.pos as ast::Pos) as usize, e.msg).display(&f.source))
 }
 
 /// `String(v)` for a number, as a property key.

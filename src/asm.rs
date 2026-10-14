@@ -58,6 +58,24 @@ pub struct FunctionDef {
     /// Nested functions use some of its variables (they stay in its
     /// registers, which its closures' upvalues point to until it returns).
     pub captures: bool,
+    /// Not compiled yet: compiled from its source at its first call (its
+    /// `code` the one `CompileLazy`; `name`, `nparams` and `upvalues` as
+    /// compiled).
+    pub lazy: Option<LazyFn>,
+}
+
+/// A function to compile when it is first called: its text in the source
+/// it came from, and its upvalues' names, in order (see
+/// `js::compile_lazy`).
+#[derive(Clone, Debug)]
+pub struct LazyFn {
+    pub source: std::rc::Rc<str>,
+    /// The parameter list's `(`, and past the body's `}`.
+    pub start: u32,
+    pub end: u32,
+    /// A named function expression's name, bound in its body.
+    pub own_name: Option<std::rc::Rc<str>>,
+    pub upvalues: Vec<std::rc::Rc<str>>,
 }
 
 /// A constant: a string or a number (one that isn't an int32).
@@ -344,6 +362,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             handlers: Vec::new(),
             upvalues: Vec::new(),
             captures: false,
+            lazy: None,
         });
     }
     Ok(Module {

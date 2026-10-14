@@ -18,7 +18,7 @@ pub enum Tok {
     /// An operator or punctuator.
     Punct(&'static str),
     /// A regular expression literal: its pattern and flags.
-    RegExp(String, String),
+    RegExp(Box<(String, String)>),
     Eof,
 }
 
@@ -102,8 +102,9 @@ fn puncts(c: u8) -> &'static [(u32, u32, &'static str)] {
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     let b = src.as_bytes();
-    // About a token per 4 bytes of script.
-    let mut toks = Vec::with_capacity(src.len() / 4);
+    // Minified code has a token per 2 bytes or so (jQuery's 2.2), others
+    // fewer: room no token takes costs no memory, a vector grown copies.
+    let mut toks = Vec::with_capacity(src.len() / 2 + 16);
     // Each distinct name once.
     let mut names: crate::jit::HashMap<&str, Name> = Default::default();
     let mut i = 0;
@@ -152,7 +153,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             } else if c == b'/' && !toks.last().is_some_and(|t: &Token| ends_expression(&t.tok)) {
                 let (pattern, flags, n) = regexp(&src[i..]).ok_or_else(|| err("unterminated regular expression"))?;
                 i += n;
-                Tok::RegExp(pattern, flags)
+                Tok::RegExp(Box::new((pattern, flags)))
             } else if is_ascii_ident_part(c) || c >= 0x80 && src[i..].chars().next().is_some_and(is_ident_start) {
                 // ASCII a byte at a time, past it a character at a time.
                 let mut n = 1 + b[i + 1..].iter().take_while(|&&x| is_ascii_ident_part(x)).count();

@@ -315,6 +315,9 @@ pub struct Code {
     /// bound to a call site), which compiled code and its tables refer to
     /// by address.
     pub(crate) pinned: Cell<bool>,
+    /// Not compiled yet: its bytecode is `CompileLazy`, which compiles
+    /// it from this (see `Vm::compile_lazy`).
+    pub(crate) lazy: Option<Box<crate::asm::LazyFn>>,
 }
 
 impl Code {
@@ -2466,6 +2469,7 @@ impl Vm {
             ret_hint: Cell::new(ret),
             mark: Default::default(),
             pinned: Cell::new(true),
+            lazy: None,
         });
         let fp = object_value(self.function_prototype);
         let fo = self.new_object_with(Class::Native, fp, 0);
@@ -2639,6 +2643,31 @@ impl Vm {
             let a = self.intern(n);
             self.declared.insert(a);
         }
+        let script = module.script;
+        self.load_functions(module, None)[script]
+    }
+
+    /// Compile the function of stub `code` (see `asm::LazyFn`) into it:
+    /// a syntax error (or what the code generator doesn't support) is
+    /// thrown at its call, and it stays a stub.
+    pub(crate) fn compile_lazy(&mut self, code: *const Code) -> Result<()> {
+        let c = unsafe { &*code };
+        let mut module = crate::js::compile_lazy(c.lazy.as_ref().expect("a stub")).map_err(|e| {
+            if e.contains("unsupported") {
+                Error(format!("unsupported: in eval'd code: {e}"), None)
+            } else {
+                Error(format!("SyntaxError: {e}"), None)
+            }
+        })?;
+        debug_assert_eq!(module.script, 0);
+        module.functions[0].name = c.name.clone();
+        self.load_functions(module, Some(code));
+        Ok(())
+    }
+
+    /// Load `module`'s functions, the first into `into` if given (a stub
+    /// compiled: see [`Vm::compile_lazy`]).
+    fn load_functions(&mut self, module: Module, into: Option<*const Code>) -> Vec<*const Code> {
         let recursive = recursive_functions(&module);
         static QUICKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let quicken = *QUICKEN.get_or_init(|| std::env::var_os("TOI_NO_QUICKEN").is_none());
@@ -2648,9 +2677,10 @@ impl Vm {
             .functions
             .into_iter()
             .zip(recursive)
-            .map(|(f, recursive)| {
+            .enumerate()
+            .map(|(i, (f, recursive))| {
                 let scan = Scan::of(&f);
-                let interpreted = !f.handlers.is_empty() || scan.callee;
+                let interpreted = !f.handlers.is_empty() || scan.callee || f.lazy.is_some();
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern(n)).collect();
                 let constants: Box<[Value]> = f
                     .constants
@@ -2672,6 +2702,34 @@ impl Vm {
                 }
                 self.max_frame = self.max_frame.max(f.nregs as usize + crate::interp::HEADER);
                 closures.push(f.closures);
+                let calls_left = match (scan.has_loop, recursive || scan.ops >= ENTRY_COMPILE_SIZE) {
+                    _ if interpreted => i32::MAX,
+                    _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
+                    (true, _) => self.tier_calls,
+                    (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
+                    (false, false) => i32::MAX,
+                };
+                let loop_budget = if !interpreted { self.frame_budget } else { i64::MAX };
+                if let Some(into) = into.filter(|_| i == 0) {
+                    // The stub's runtime state stays (its constructor's
+                    // slack tracking, its liveness): it has never run.
+                    let c = unsafe { &mut *into.cast_mut() };
+                    debug_assert_eq!(c.nparams, f.nparams);
+                    debug_assert_eq!(*c.upvalues, *f.upvalues);
+                    let before = c.footprint();
+                    c.bytecode = bytecode;
+                    c.nregs = f.nregs;
+                    c.ics = Default::default();
+                    c.ic_names = ic_names.into_boxed_slice();
+                    c.constants = constants;
+                    c.handlers = f.handlers.into_boxed_slice();
+                    c.interpreted = interpreted;
+                    c.calls_left.set(calls_left);
+                    c.loop_budget.set(loop_budget);
+                    c.lazy = None;
+                    crate::gc::code_bytes(c.footprint().saturating_sub(before));
+                    return into;
+                }
                 self.add_code(Code {
                     name: f.name,
                     bytecode,
@@ -2696,20 +2754,11 @@ impl Vm {
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_interpret: Cell::new(false),
                     closures_made: Cell::new(0),
-                    calls_left: Cell::new(match (scan.has_loop, recursive || scan.ops >= ENTRY_COMPILE_SIZE) {
-                        _ if interpreted => i32::MAX,
-                        _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
-                        (true, _) => self.tier_calls,
-                        (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
-                        (false, false) => i32::MAX,
-                    }),
-                    loop_budget: Cell::new(if !interpreted {
-                        self.frame_budget
-                    } else {
-                        i64::MAX
-                    }),
+                    calls_left: Cell::new(calls_left),
+                    loop_budget: Cell::new(loop_budget),
                     mark: crate::gc::code_epoch().into(),
                     pinned: Cell::new(false),
+                    lazy: f.lazy.map(Box::new),
                 })
             })
             .collect();
@@ -2717,7 +2766,7 @@ impl Vm {
             let closures = nested.iter().map(|&i| codes[i]).collect();
             unsafe { (*c.cast_mut()).closures = closures };
         }
-        codes[module.script]
+        codes
     }
 
     /// Load and run `module`; returns its completion value.

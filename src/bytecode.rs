@@ -346,6 +346,9 @@ define_ops! {
     /// into `r[w+2]` and the call is `Call`'s, with `n` 2. Laid out as
     /// `Call`, whose size it has (`CreateArguments` reads either).
     CallApplyArguments(Reg, Reg, Count, AutoIc),
+    /// The whole code of a function not compiled yet (`asm::LazyFn`):
+    /// compile it, and run it in this frame. Never compiled by the JIT.
+    CompileLazy(),
 }
 
 impl Op {

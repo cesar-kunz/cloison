@@ -539,6 +539,9 @@ pub struct Vm {
     /// compiled code inlines (see `jit::Insn::native`).
     pub(crate) char_code_at_fn: *mut Object,
     pub(crate) from_char_code_fn: *mut Object,
+    /// `Math.sqrt` and `Math.pow`, which compiled code computes itself.
+    pub(crate) math_sqrt_fn: *mut Object,
+    pub(crate) math_pow_fn: *mut Object,
     a_prototype: Atom,
     a_constructor: Atom,
     a_length: Atom,
@@ -646,6 +649,8 @@ impl Vm {
             array_pop_fn: std::ptr::null_mut(),
             char_code_at_fn: std::ptr::null_mut(),
             from_char_code_fn: std::ptr::null_mut(),
+            math_sqrt_fn: std::ptr::null_mut(),
+            math_pow_fn: std::ptr::null_mut(),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
@@ -776,7 +781,12 @@ impl Vm {
             ("max", math_max, 2, Any),
             ("random", math_random, 0, F64),
         ] {
-            vm.define_native(math, name, f, n, ty, false);
+            let fo = vm.define_native(math, name, f, n, ty, false);
+            match name {
+                "sqrt" => vm.math_sqrt_fn = fo,
+                "pow" => vm.math_pow_fn = fo,
+                _ => {}
+            }
         }
         vm.date_prototype = vm.new_object(op);
         let dp = vm.date_prototype;

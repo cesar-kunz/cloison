@@ -146,6 +146,7 @@ unsafe extern "C" {
     fn toi_rt_array_push();
     fn toi_rt_char_code_at();
     fn toi_rt_from_char_code();
+    fn toi_rt_pow();
     fn toi_rt_materialize();
     fn toi_rt_instance_of();
     fn toi_rt_in();
@@ -5407,6 +5408,52 @@ macro_rules! from_char_code {
 }
 from_char_code!("from_char_code", |s| s.tag.is_int32(s.acc).then(|| int(s.acc)));
 from_char_code!("from_char_code_i", |s| Some(int(s.acc)));
+
+// `Math.sqrt(x)` (`jit`'s `Insn::native` 6), after a guard on the callee:
+// `x` in `acc`, boxed, an int32 (`_i`) or a double (`_f`); the double in
+// `facc`. Leave where `x` isn't a number (converting it may run code).
+stencil!("math_sqrt"; |s| {
+    let x = if s.tag.is_int32(s.acc) {
+        i2f(int(s.acc))
+    } else if is_number(s.tag, s.acc) {
+        s.tag.decode_f64(s.acc)
+    } else {
+        exit!(s)
+    };
+    s.facc = x.sqrt();
+    next!(s)
+});
+stencil!("math_sqrt_i"; |s| {
+    s.facc = i2f(int(s.acc)).sqrt();
+    next!(s)
+});
+stencil!("math_sqrt_f"; |s| {
+    s.facc = s.facc.sqrt();
+    next!(s)
+});
+
+// `Math.pow(x, y)` (`Insn::native` 7), after a guard on the callee: `x`
+// boxed in memory (the register at `toi_hole_reg`), `y` in `acc`, boxed or
+// (`_f`) a double; the result in `facc`, through the runtime's `pow`
+// (fdlibm's, as `Math.pow`'s). Leave where either isn't a number.
+macro_rules! math_pow {
+    ($name:literal, |$s:ident| $y:expr) => {
+        stencil_slow!($name; |s| {
+            slow!(s)
+        }; |s| {
+            let $s = &s;
+            let y = $y;
+            let r = rt_call!(s, toi_rt_pow, load_m(s.regs), y);
+            if r == 0 {
+                exit!(s)
+            }
+            s.facc = s.tag.decode_f64(Value::from_bits(r));
+            next!(s)
+        });
+    };
+}
+math_pow!("math_pow_m", |s| s.acc);
+math_pow!("math_pow_f_m", |s| s.tag.encode_f64(s.facc));
 
 // Before an inlined call: the callee must be the function inlined
 // (`imm64`), or leave before the call.

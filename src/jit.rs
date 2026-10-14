@@ -646,6 +646,7 @@ fn runtime_function(name: &str) -> usize {
         "toi_rt_array_push" => toi_rt_array_push as *const () as usize,
         "toi_rt_char_code_at" => toi_rt_char_code_at as *const () as usize,
         "toi_rt_from_char_code" => toi_rt_from_char_code as *const () as usize,
+        "toi_rt_pow" => toi_rt_pow as *const () as usize,
         "toi_rt_materialize" => toi_rt_materialize as *const () as usize,
         "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
         "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
@@ -1735,8 +1736,8 @@ struct Insn {
     alloc: u64,
     /// A call [`lower`] compiles as `Array.prototype.push` (1) or `pop`
     /// (2) of its receiver, `String.prototype.charCodeAt` (4) or
-    /// `String.fromCharCode` (5), after a guard on the callee. (3: see
-    /// `scalar_replace`.)
+    /// `String.fromCharCode` (5), `Math.sqrt` (6) or `Math.pow` (7), after a
+    /// guard on the callee. (3: see `scalar_replace`.)
     native: u8,
     /// For a `GetNamed`: only its receiver's shape check, the value unused
     /// (a proven callee's load; see `Lowering::drop_callee_load`). For the
@@ -1798,9 +1799,10 @@ impl Insn {
     }
 
     /// An inlined native taking its argument in `acc` (`push`,
-    /// `charCodeAt`, `fromCharCode`; see [`Insn::native`]).
+    /// `charCodeAt`, `fromCharCode`, `Math.sqrt`, `Math.pow`'s exponent;
+    /// see [`Insn::native`]).
     fn takes_acc(&self) -> bool {
-        matches!(self.native, 1 | 4 | 5)
+        matches!(self.native, 1 | 4 | 5 | 6 | 7)
     }
 
     fn reads_reg(&self) -> bool {
@@ -3434,10 +3436,11 @@ struct Soft {
 /// home is memory or a general register, else the instruction's (`reg2`
 /// for `push` and `pop`).
 fn slot_reg(insn: &Insn, sel: &Sel, homes: &[Home]) -> u8 {
-    let own = if matches!(insn.native, 1 | 2 | 4) {
-        insn.reg2
-    } else {
-        insn.reg
+    let own = match insn.native {
+        1 | 2 | 4 => insn.reg2,
+        // `Math.pow`'s base.
+        7 => insn.reg2 + 1,
+        _ => insn.reg,
     };
     match sel
         .reg
@@ -3662,6 +3665,18 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 reg: (a < st.regs.len()).then(|| st.class(a)),
                 ..Sel::new("char_code_at", case, out)
             };
+        }
+        // `Math.sqrt`: its argument in `acc`; `Math.pow`: the exponent in
+        // `acc`, the base in its window register (in memory). A double.
+        _ if insn.native == 6 || insn.native == 7 => {
+            let case = match st.acc {
+                I32 if insn.native == 6 => "i",
+                F64 => "f",
+                _ => "",
+            };
+            out.acc = F64;
+            let base = if insn.native == 6 { "math_sqrt" } else { "math_pow" };
+            return Sel::new(base, case, out);
         }
         _ if insn.native == 5 => {
             let case = if st.acc == I32 { "i" } else { "" };
@@ -5953,6 +5968,17 @@ fn stencil_for(
                 cat!(sel.base, "_", at)
             } else {
                 cat!(sel.base, "_", sel.case, "_", at)
+            }
+        }
+        // The base, boxed, from memory.
+        ("math_pow", _) => {
+            let x = insn.reg2 + 1;
+            pre.extend(spill_piece(homes.get(x as usize).copied().unwrap_or(Home::Mem), x));
+            if sel.case.is_empty() {
+                box_acc(&mut pre);
+                "math_pow_m".into()
+            } else {
+                cat!("math_pow_", sel.case, "_m")
             }
         }
         ("call" | "call_direct" | "construct_direct", _) => {
@@ -11930,15 +11956,18 @@ impl Lowering<'_> {
                     (f, 0) if f == vm.array_pop_fn => 2,
                     (f, 1) if f == vm.char_code_at_fn => 4,
                     (f, 1) if f == vm.from_char_code_fn => 5,
+                    (f, 1) if f == vm.math_sqrt_fn => 6,
+                    (f, 2) if f == vm.math_pow_fn => 7,
                     _ => 0,
                 };
                 let exits = self.state.callee_exits.get(&origin).copied().unwrap_or(0);
                 if native != 0 && other.is_null() && exits < MAX_PROPERTY_EXITS {
-                    // `push`, `charCodeAt` and `fromCharCode` take their
-                    // argument in `acc` (there already if the call's setup
-                    // stored it last).
+                    // `push`, `charCodeAt`, `fromCharCode` and `sqrt` take
+                    // their argument in `acc`, `pow` its second (there
+                    // already if the call's setup stored it last).
+                    let last_arg = i.reg2 + if native == 7 { 2 } else { 1 };
                     let stored = self.out.insns.last().is_some_and(|l| {
-                        l.op == Op::Star && l.reg == i.reg2 + 1 && l.frame == i.frame && !l.bail
+                        l.op == Op::Star && l.reg == last_arg && l.frame == i.frame && !l.bail
                     });
                     if !self.proven_callee(frame, i.reg, fo) {
                         let mut guard = synth(Op::Nop, i.reg, frame, i.pc);
@@ -11950,7 +11979,7 @@ impl Lowering<'_> {
                         i.exit_const = crate::object::object_value(fo).to_bits();
                     }
                     if native != 2 && !stored {
-                        self.push(synth(Op::Ldar, i.reg2 + 1, frame, i.pc), Prop::None);
+                        self.push(synth(Op::Ldar, last_arg, frame, i.pc), Prop::None);
                     }
                     i.native = native;
                     self.push(i, Prop::None);
@@ -15176,6 +15205,15 @@ extern "C" fn toi_rt_char_code_at(s: Value, k: Value) -> u64 {
         (Some(u), true) => u
             .get(k.as_i32_unchecked() as u32 as usize)
             .map_or(0, |&c| Value::from_i32(c as i32).to_bits()),
+        _ => 0,
+    }
+}
+
+/// `Math.pow(x, y)` for `math_pow` stencils: the double, boxed, or 0 to
+/// leave where `x` or `y` isn't a number (converting it may run code).
+extern "C" fn toi_rt_pow(x: Value, y: Value) -> u64 {
+    match (x.as_number(), y.as_number()) {
+        (Some(x), Some(y)) => Value::from_f64(crate::math::pow(x, y)).to_bits(),
         _ => 0,
     }
 }

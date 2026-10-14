@@ -161,6 +161,43 @@ const _: fn(u64, Value) -> bool = field_fits;
 /// slot of those objects is in the object (they had room for more), below
 /// that count, so it stays where it is.
 fn settle(code: &Code) {
+    let root = code.ctor_shape.get();
+    if root.is_null() {
+        return;
+    }
+    // Exactly the most properties any has: objects that get more later
+    // keep those out of line, but every object is smaller (with no
+    // collector, memory is fresh pages the kernel zeroes).
+    code.ctor_capacity.set(shrink_root(root));
+}
+
+/// Objects a shared constructor (`Code::ctor_shared`) makes with a
+/// prototype before their capacity settles (see [`CtorProto`]).
+const SLACK_OBJECTS: u32 = 8;
+
+/// Slack tracking for the objects a shared constructor makes with one
+/// prototype: as `Code`'s (see [`settle`]), but settled once
+/// [`SLACK_OBJECTS`] have been made, so it counts the properties they got
+/// after their constructor too (Raytrace's `IntersectionInfo`, whose
+/// `intersect` adds five).
+pub(crate) struct CtorProto {
+    /// The capacity to give objects ([`MAX_INLINE_CAPACITY`] until settled).
+    pub(crate) cap: Cell<u32>,
+    /// The root shape last used.
+    root: Cell<*const Shape>,
+    /// Objects made, up to [`SLACK_OBJECTS`].
+    made: Cell<u32>,
+}
+
+impl CtorProto {
+    pub(crate) fn settled(&self) -> bool {
+        self.made.get() >= SLACK_OBJECTS
+    }
+}
+
+/// Shrink the capacity of the shapes reached from `root` to the most
+/// properties one has (at least 1); that capacity.
+fn shrink_root(root: *const Shape) -> u32 {
     fn walk(s: *const Shape, f: &mut dyn FnMut(&Shape)) {
         let s = unsafe { &*s };
         f(s);
@@ -171,19 +208,12 @@ fn settle(code: &Code) {
             walk(t, f);
         }
     }
-    let root = code.ctor_shape.get();
-    if root.is_null() {
-        return;
-    }
-    // Exactly the most properties any has: objects that get more later
-    // keep those out of line, but every object is smaller (with no
-    // collector, memory is fresh pages the kernel zeroes).
     let mut most = 1;
     walk(root, &mut |s| most = most.max(s.keys.len() as u32));
     if most < unsafe { (*root).capacity.get() } {
         walk(root, &mut |s| s.capacity.set(most));
     }
-    code.ctor_capacity.set(unsafe { (*root).capacity.get() });
+    unsafe { (*root).capacity.get() }
 }
 
 /// Cache `e` in the slot whose way 0 is at `ic`: in the way caching its
@@ -289,6 +319,13 @@ pub struct Code {
     /// none yet, [`MANY_SHAPES`] if not always the same. Compiled code
     /// predicts it for the result of a `new` through the runtime.
     pub(crate) ctor_result: Cell<*const Shape>,
+    /// The prototype of the objects the first `new` made, and whether a
+    /// later one made objects with another: one code for several classes
+    /// (Prototype's `Class.create` constructors), whose slack tracking is
+    /// then each prototype's ([`CtorProto`]): else every class's objects
+    /// had room for the largest one's fields (Raytrace's `Color`, 3, for 7).
+    pub(crate) ctor_proto: Cell<u64>,
+    pub(crate) ctor_shared: Cell<bool>,
     /// Compiled code, once a loop or the function got hot (see
     /// `jit::vm_run`).
     pub(crate) jit: RefCell<Option<Box<crate::jit::JitFunction>>>,
@@ -545,6 +582,9 @@ pub struct Vm {
     pub(crate) math_pow_fn: *mut Object,
     pub(crate) math_max_fn: *mut Object,
     pub(crate) math_min_fn: *mut Object,
+    /// The slack tracking of `new` for each prototype, for constructors
+    /// that have made objects with several (see `Code::ctor_shared`).
+    ctor_protos: HashMap<u64, Box<CtorProto>>,
     a_prototype: Atom,
     a_constructor: Atom,
     a_length: Atom,
@@ -656,6 +696,7 @@ impl Vm {
             math_pow_fn: std::ptr::null_mut(),
             math_max_fn: std::ptr::null_mut(),
             math_min_fn: std::ptr::null_mut(),
+            ctor_protos: HashMap::default(),
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
@@ -2543,6 +2584,8 @@ impl Vm {
             ctor_shape: Cell::new(std::ptr::null()),
             ctor_settled: Cell::new(true),
             ctor_result: Cell::new(std::ptr::null()),
+            ctor_proto: Cell::new(0),
+            ctor_shared: Cell::new(false),
             jit: RefCell::new(None),
             calls_left: Cell::new(i32::MAX),
             calls_interpret: Cell::new(false),
@@ -2641,6 +2684,19 @@ impl Vm {
             } else {
                 object_value(self.object_prototype)
             };
+            if let Some(e) = self.ctor_proto(code, proto) {
+                let e = &*e;
+                let mut s = e.root.get();
+                if s.is_null() || (*s).capacity.get() != e.cap.get() {
+                    s = if e.settled() {
+                        self.root_shape(Class::Plain, proto, e.cap.get())
+                    } else {
+                        self.private_root(proto, MAX_INLINE_CAPACITY)
+                    };
+                    e.root.set(s);
+                }
+                return s;
+            }
             let cap = code.ctor_capacity.get();
             let mut s = code.ctor_shape.get();
             if s.is_null() || (*s).proto != proto || (*s).capacity.get() != cap {
@@ -2655,6 +2711,39 @@ impl Vm {
         }
     }
 
+    /// The slack tracking of `new` of `code` for objects with prototype
+    /// `proto`, once `code` has made objects with another prototype than
+    /// its first's (see `Code::ctor_shared`); `None` before: the code's.
+    pub(crate) fn ctor_proto(&mut self, code: &Code, proto: Value) -> Option<*const CtorProto> {
+        let p = proto.to_bits();
+        if !code.ctor_shared.get() {
+            if code.ctor_proto.get() == 0 {
+                code.ctor_proto.set(p);
+            } else if code.ctor_proto.get() != p {
+                code.ctor_shared.set(true);
+            }
+        }
+        if !code.ctor_shared.get() {
+            return None;
+        }
+        let e = self.ctor_protos.entry(p).or_insert_with(|| {
+            // (The first prototype's tracking was the code's: settled, if
+            // a `new` returned.)
+            let first = code.ctor_proto.get() == p && code.ctor_settled.get();
+            let root = code.ctor_shape.get();
+            Box::new(CtorProto {
+                cap: Cell::new(if first { code.ctor_capacity.get() } else { MAX_INLINE_CAPACITY }),
+                root: Cell::new(if first && !root.is_null() && unsafe { (*root).proto } == proto {
+                    root
+                } else {
+                    std::ptr::null()
+                }),
+                made: Cell::new(if first { SLACK_OBJECTS } else { 0 }),
+            })
+        });
+        Some(&**e)
+    }
+
     /// After `new` returned `this`: grow the in-object capacity for the next
     /// objects if this one outgrew it.
     pub(crate) fn construct_done(code: &Code, this: *mut Object) {
@@ -2663,14 +2752,37 @@ impl Vm {
         }
         let shape = unsafe { (*this).shape };
         let n = unsafe { (*shape).keys.len() } as u32;
-        if n > code.ctor_capacity.get() {
-            code.ctor_capacity.set(n.min(MAX_INLINE_CAPACITY));
+        let cap = match Self::shared_proto(code, this) {
+            Some(e) if !e.settled() => {
+                e.made.set(e.made.get() + 1);
+                if e.settled() && !e.root.get().is_null() {
+                    e.cap.set(shrink_root(e.root.get()));
+                }
+                &e.cap
+            }
+            Some(e) => &e.cap,
+            None => &code.ctor_capacity,
+        };
+        if n > cap.get() {
+            cap.set(n.min(MAX_INLINE_CAPACITY));
         }
         let seen = code.ctor_result.get();
         if seen.is_null() {
             code.ctor_result.set(shape);
         } else if seen != shape {
             code.ctor_result.set(MANY_SHAPES);
+        }
+    }
+
+    /// The slack tracking of `this`'s prototype, made by `new` of `code`,
+    /// if that is shared (see [`Vm::ctor_proto`]).
+    pub(crate) fn shared_proto<'a>(code: &Code, this: *mut Object) -> Option<&'a CtorProto> {
+        if !code.ctor_shared.get() {
+            return None;
+        }
+        unsafe {
+            let vm = &mut *crate::interp::current_vm();
+            vm.ctor_proto(code, (*(*this).shape).proto).map(|e| &*e)
         }
     }
 
@@ -2845,6 +2957,8 @@ impl Vm {
                     ctor_shape: Cell::new(std::ptr::null()),
                     ctor_settled: Cell::new(false),
                     ctor_result: Cell::new(std::ptr::null()),
+                    ctor_proto: Cell::new(0),
+                    ctor_shared: Cell::new(false),
                     jit: RefCell::new(None),
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_interpret: Cell::new(false),

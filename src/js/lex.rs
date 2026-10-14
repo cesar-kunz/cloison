@@ -31,8 +31,7 @@ pub struct Token {
     pub newline_before: bool,
 }
 
-/// The reserved words, as [`keyword`] matches them.
-#[cfg(test)]
+/// The reserved words.
 const KEYWORDS: &[&str] = &[
     "break",
     "case",
@@ -80,14 +79,21 @@ const PUNCTS: &[&str] = &[
     "&", "|", "^", "!", "~", "?", ":", "=", ".",
 ];
 
+/// Up to 16 bytes as an integer, the first in the low byte (a word or a
+/// punctuator compares as one integer, with no call to `memcmp`).
+fn pack(s: &[u8]) -> u128 {
+    s.iter().enumerate().fold(0, |v, (k, &c)| v | (c as u128) << (8 * k))
+}
+
 /// The punctuators beginning with byte `c`, longest first (as in
-/// [`PUNCTS`]).
-fn puncts(c: u8) -> &'static [&'static str] {
-    static BY_FIRST: std::sync::OnceLock<Vec<Vec<&'static str>>> = std::sync::OnceLock::new();
+/// [`PUNCTS`]): each [`pack`]ed, with the mask of its bytes.
+fn puncts(c: u8) -> &'static [(u32, u32, &'static str)] {
+    static BY_FIRST: std::sync::OnceLock<Vec<Vec<(u32, u32, &'static str)>>> = std::sync::OnceLock::new();
     let by_first = BY_FIRST.get_or_init(|| {
         let mut v = vec![Vec::new(); 128];
         for &p in PUNCTS {
-            v[p.as_bytes()[0] as usize].push(p);
+            let mask = (u64::MAX >> (64 - 8 * p.len())) as u32;
+            v[p.as_bytes()[0] as usize].push((pack(p.as_bytes()) as u32, mask, p));
         }
         v
     });
@@ -96,7 +102,8 @@ fn puncts(c: u8) -> &'static [&'static str] {
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     let b = src.as_bytes();
-    let mut toks = Vec::new();
+    // About a token per 4 bytes of script.
+    let mut toks = Vec::with_capacity(src.len() / 4);
     // Each distinct name once.
     let mut names: crate::jit::HashMap<&str, Name> = Default::default();
     let mut i = 0;
@@ -159,7 +166,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 i += n;
                 // Keywords: lowercase, of 2 to 10 letters.
                 let keyword = if c.is_ascii_lowercase() && (2..=10).contains(&n) {
-                    keyword(word)
+                    keyword(b, i - n, n)
                 } else {
                     None
                 };
@@ -167,7 +174,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     Some(k) => Tok::Keyword(k),
                     None => Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone()),
                 }
-            } else if let Some(p) = puncts(c).iter().find(|p| src[i..].starts_with(**p)) {
+            } else if let Some(&(_, _, p)) = {
+                let next = match b.get(i..i + 4) {
+                    Some(w) => u32::from_le_bytes(w.try_into().unwrap()),
+                    None => pack(&b[i..]) as u32,
+                };
+                puncts(c).iter().find(|&&(v, mask, _)| next & mask == v)
+            } {
                 i += p.len();
                 Tok::Punct(p)
             } else {
@@ -228,48 +241,24 @@ fn regexp(s: &str) -> Option<(String, String, usize)> {
     Some((s[1..end].to_string(), flags, end + 1 + flags_len))
 }
 
-/// `word` as the [`KEYWORDS`] entry it is, if any (a `match`: by length,
-/// then the bytes, not a scan).
-fn keyword(word: &str) -> Option<&'static str> {
-    Some(match word {
-        "break" => "break",
-        "case" => "case",
-        "catch" => "catch",
-        "class" => "class",
-        "const" => "const",
-        "continue" => "continue",
-        "debugger" => "debugger",
-        "default" => "default",
-        "delete" => "delete",
-        "do" => "do",
-        "else" => "else",
-        "export" => "export",
-        "extends" => "extends",
-        "false" => "false",
-        "finally" => "finally",
-        "for" => "for",
-        "function" => "function",
-        "if" => "if",
-        "import" => "import",
-        "in" => "in",
-        "instanceof" => "instanceof",
-        "let" => "let",
-        "new" => "new",
-        "null" => "null",
-        "return" => "return",
-        "super" => "super",
-        "switch" => "switch",
-        "this" => "this",
-        "throw" => "throw",
-        "true" => "true",
-        "try" => "try",
-        "typeof" => "typeof",
-        "var" => "var",
-        "void" => "void",
-        "while" => "while",
-        "with" => "with",
-        _ => return None,
-    })
+/// The word of `n` bytes at `b[i..]` as the [`KEYWORDS`] entry it is,
+/// if any: one of those of its first letter and length, compared as
+/// [`pack`]ed integers.
+fn keyword(b: &[u8], i: usize, n: usize) -> Option<&'static str> {
+    static BY_FIRST: std::sync::OnceLock<Vec<Vec<(usize, u128, &'static str)>>> = std::sync::OnceLock::new();
+    let by_first = BY_FIRST.get_or_init(|| {
+        let mut v = vec![Vec::new(); 26];
+        for &k in KEYWORDS {
+            v[(k.as_bytes()[0] - b'a') as usize].push((k.len(), pack(k.as_bytes()), k));
+        }
+        v
+    });
+    let first = by_first.get(b[i].wrapping_sub(b'a') as usize)?;
+    let w = match b.get(i..i + 16) {
+        Some(w) => u128::from_le_bytes(w.try_into().unwrap()) & (u128::MAX >> (128 - 8 * n)),
+        None => pack(&b[i..i + n]),
+    };
+    first.iter().find(|&&(len, v, _)| len == n && v == w).map(|&(.., k)| k)
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -417,11 +406,16 @@ mod tests {
     }
 
     #[test]
-    fn keywords_are_found_by_match() {
+    fn keywords_are_found() {
+        let word = |w: &str| keyword(w.as_bytes(), 0, w.len());
         for &k in KEYWORDS {
-            assert_eq!(keyword(k), Some(k));
+            assert_eq!(word(k), Some(k));
+            let padded = format!("{k}_padding_beyond_16");
+            assert_eq!(keyword(padded.as_bytes(), 0, k.len()), Some(k));
         }
-        assert_eq!(keyword("iff"), None);
+        assert_eq!(word("iff"), None);
+        assert_eq!(word("thi"), None);
+        assert_eq!(word("thisx"), None);
     }
 
     #[test]

@@ -8,8 +8,9 @@ use super::Error;
 use super::ast::*;
 use super::lex::{Tok, Token};
 
-/// `toks`' program, its nodes in `arena`.
-pub fn parse<'a>(toks: &[Token], arena: &'a Arenas<'a>) -> Result<Program<'a>, Error> {
+/// `toks`' program, its nodes in `arena` (the text of string and regular
+/// expression tokens moves to the tree).
+pub fn parse<'a>(toks: &mut [Token], arena: &'a Arenas<'a>) -> Result<Program<'a>, Error> {
     let mut p = Parser {
         toks,
         arena,
@@ -38,7 +39,7 @@ pub fn parse<'a>(toks: &[Token], arena: &'a Arenas<'a>) -> Result<Program<'a>, E
 }
 
 struct Parser<'t, 'a> {
-    toks: &'t [Token],
+    toks: &'t mut [Token],
     arena: &'a Arenas<'a>,
     i: usize,
     functions: Vec<Function<'a>>,
@@ -71,8 +72,15 @@ impl<'a> Parser<'_, 'a> {
         self.toks[self.i].pos
     }
 
+    /// The current token, and on to the next. A string's or a regular
+    /// expression's text moves out: no token is read again, but for its
+    /// kind in an error message.
     fn bump(&mut self) -> Tok {
-        let t = self.toks[self.i].tok.clone();
+        let t = match &mut self.toks[self.i].tok {
+            Tok::Str(s) => Tok::Str(std::mem::take(s)),
+            Tok::RegExp(p, f) => Tok::RegExp(std::mem::take(p), std::mem::take(f)),
+            t => t.clone(),
+        };
         if self.i + 1 < self.toks.len() {
             self.i += 1;
         }
@@ -466,11 +474,11 @@ impl<'a> Parser<'_, 'a> {
     }
 
     /// Name an anonymous function expression after what it's assigned to.
-    fn infer_name(&mut self, e: &Expr, name: &str) {
+    fn infer_name(&mut self, e: &Expr, name: &Name) {
         if let ExprKind::Function(i) = e.kind
             && self.functions[i].name.is_none()
         {
-            self.functions[i].name = Some(name.into());
+            self.functions[i].name = Some(name.clone());
         }
     }
 
@@ -871,11 +879,11 @@ mod tests {
 
     /// (Its nodes in an arena that lives on: these are tests.)
     fn program(src: &str) -> Program<'static> {
-        parse(&lex(src).unwrap(), Box::leak(Box::default())).unwrap()
+        parse(&mut lex(src).unwrap(), Box::leak(Box::default())).unwrap()
     }
 
     fn error(src: &str) -> String {
-        parse(&lex(src).unwrap(), &Arenas::default()).unwrap_err().msg
+        parse(&mut lex(src).unwrap(), &Arenas::default()).unwrap_err().msg
     }
 
     /// The script's only expression statement, printed with explicit

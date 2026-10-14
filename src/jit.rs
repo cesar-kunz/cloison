@@ -7044,6 +7044,8 @@ struct VmCompile<'a> {
     mats: Option<&'a HashMap<usize, Vec<Rc<Mat>>>>,
     /// See [`Lowered::exit_live`].
     exit_live: Option<&'a [RegSet]>,
+    /// See [`Lowered::split`].
+    split: &'a [(u8, u8)],
     /// Warm code: the function's heat, which its loop headers count down
     /// (see [`Tier`]); 0 for hot code.
     heat: u64,
@@ -7095,6 +7097,7 @@ impl JitCode {
             root,
             mats,
             exit_live,
+            split,
             heat,
         } = vm;
         let n = insns.len();
@@ -7391,6 +7394,30 @@ impl JitCode {
             for (r, _) in captured.iter().enumerate().filter(|c| *c.1) {
                 if r < stats.uses.len() {
                     stats.uses[r] = 0;
+                }
+            }
+            // On arm64, a temporary split off a register (see `split_temps`)
+            // ranks as the register and all its temporaries did together:
+            // they never overlap, so they share a slot as the one register
+            // did, each with its own type (a double one its own FP slot).
+            // Not with x86-64's 6 slots: there those families took slots
+            // from loops' int32s (Navier-Stokes +12%, against zlib −3%).
+            if !split.is_empty() && GPR_SLOTS > 6 {
+                let mut family = stats.uses.clone();
+                for &(w, r) in split {
+                    if (w as usize) < nregs && (r as usize) < nregs {
+                        family[r as usize] += stats.uses[w as usize];
+                    }
+                }
+                for &(w, r) in split {
+                    if (w as usize) < nregs && (r as usize) < nregs && stats.uses[w as usize] > 0 {
+                        stats.uses[w as usize] = family[r as usize];
+                    }
+                }
+                for &(_, r) in split {
+                    if (r as usize) < nregs && stats.uses[r as usize] > 0 {
+                        stats.uses[r as usize] = family[r as usize];
+                    }
                 }
             }
             // The types and stencils with registers pinned, if any is.
@@ -9556,6 +9583,8 @@ pub(crate) struct Snapshot {
     /// parameter, for the interpreter.
     aliases: Vec<(u8, u8, u8)>,
     restores: Vec<Restore>,
+    /// See [`Lowered::split`].
+    split: Vec<(u8, u8)>,
     exit_live: Vec<RegSet>,
     /// Owned here so they live as long as code pointing to them.
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
@@ -9743,6 +9772,9 @@ struct Lowered {
     /// in its frame within its setup sets for the interpreter (see
     /// [`Lowering::drop_setup`]).
     restores: Vec<Restore>,
+    /// Temporaries split off registers (see [`split_temps`]): (the
+    /// temporary's register, the one it was split off).
+    split: Vec<(u8, u8)>,
     /// Per instruction, the registers an exit before it leaves the
     /// interpreter to read (see [`interp_live`]).
     exit_live: Vec<RegSet>,
@@ -10005,6 +10037,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             direct_base: usize::MAX,
             aliases: Vec::new(),
             restores: Vec::new(),
+            split: Vec::new(),
             exit_live: Vec::new(),
         },
         direct: Vec::new(),
@@ -10023,6 +10056,35 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             cx.out.insns[k].reg = t;
         }
     }
+    // Registers for the temporaries `split_temps` splits off theirs, as
+    // many as fit with the hoisted loads' and the direct calls' frames.
+    let temps_base = cx.out.nregs;
+    let direct_extent = (cx.direct.iter())
+        .flat_map(|d| d.stores.iter().map(|&k| cx.out.insns[k].reg as usize + 1))
+        .max()
+        .unwrap_or(0);
+    let room = 255usize.saturating_sub(temps_base + interp::HEADER + direct_extent + hoist_candidates(&cx.out));
+    // (As many as stores into frames' registers followed by straight-line
+    // code: an upper bound, cheaper than finding them twice.)
+    let temps = {
+        let insns = &cx.out.insns;
+        let mut target = vec![false; insns.len() + 1];
+        for i in insns.iter().filter(|i| i.jumps()) {
+            target[i.target.min(insns.len())] = true;
+        }
+        (0..insns.len().saturating_sub(1))
+            .filter(|&k| {
+                let i = &insns[k];
+                let f = &cx.out.frames[i.frame as usize];
+                i.op == Op::Star
+                    && !i.bail
+                    && !target[k + 1]
+                    && (f.base..f.base + unsafe { (*f.code).nregs } as usize).contains(&(i.reg as usize))
+            })
+            .count()
+            .min(room)
+    };
+    cx.out.nregs += temps;
     // Registers for the loads `hoist_loads` moves out of loops, below the
     // direct calls' frames.
     let spare_base = cx.out.nregs;
@@ -10073,6 +10135,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             break;
         }
     }
+    split_temps(&mut cx.out, temps_base, temps);
     if cx.state.tier == Tier::Warm {
         return cx.out;
     }
@@ -10082,6 +10145,111 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     let pc_live = unsafe { &(*cx.state.vm).jit_caches.pc_live };
     cx.out.exit_live = interp_live(&cx.out, pc_live);
     cx.out
+}
+
+/// Temporaries split off their registers: a `Star` of a frame's register
+/// whose reads all follow it in straight-line code of that frame (no jump,
+/// jump target, call or other write in between), after which it is dead,
+/// gets a register of its own (from `base`, `limit` of them; with `limit`
+/// 0, they are only counted). A register's home is chosen for all it holds
+/// in the region: the bytecode's temporaries, reused for an array, an index
+/// and a double in turn, joined to `Any` and stayed boxed, each partial sum
+/// of Navier-Stokes's `lin_solve` boxed and unboxed again. An exit within
+/// one's reads restores the original register from it for the
+/// interpreter (`Restore`). Returns how many were found.
+fn split_temps(out: &mut Lowered, base: usize, limit: usize) -> usize {
+    let n = out.insns.len();
+    let mut target = vec![false; n + 1];
+    for i in out.insns.iter().filter(|i| i.jumps()) {
+        target[i.target.min(n)] = true;
+    }
+    let frame_regs: Vec<FrameRegs> = (out.frames.iter())
+        .map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent))
+        .collect();
+    let captured: Vec<Vec<bool>> = out.frames.iter().map(|f| captured_regs(f.code)).collect();
+    let reach = reachable(&out.insns, 0);
+    let live = reg_live_in_mats(&out.insns, &reach, out.nregs, &frame_regs, Some(&out.mats), true);
+    // Registers some restore or alias involves already.
+    let mut involved = [0u64; 4];
+    for r in &out.restores {
+        rs_add(&mut involved, r.reg as usize);
+        if let Restored::Reg(x) = r.value {
+            rs_add(&mut involved, x as usize);
+        }
+    }
+    for &(_, p, a) in &out.aliases {
+        rs_add(&mut involved, p as usize);
+        rs_add(&mut involved, a as usize);
+    }
+    let mut found = 0;
+    for s in 0..n {
+        let i = out.insns[s];
+        if i.op != Op::Star || i.bail || i.hoisted.is_some() || !reach[s] {
+            continue;
+        }
+        // Not a variable's value loaded for its uses here (asm.js's heap
+        // views: `HEAP32[…]`): never a double, and whole, the register
+        // ranks by all its uses for a slot (split, zlib +1.3%).
+        if s > 0 && !target[s] && matches!(out.insns[s - 1].op, Op::LdaUpvalue | Op::LdaGlobal) {
+            continue;
+        }
+        let (g, r) = (i.frame as usize, i.reg as usize);
+        let (fbase, fregs, _) = frame_regs[g];
+        if r < fbase || r >= fbase + fregs || captured[g].get(r - fbase) == Some(&true) || rs_has(&involved, r) {
+            continue;
+        }
+        // Its reads, up to the one after which it is dead (on every
+        // successor: a compare-and-jump may read it).
+        let live_out = |k: usize| {
+            let mut l = [0u64; 4];
+            for t in succs(&out.insns, k).filter(|&t| t < n) {
+                rs_or(&mut l, &live[t]);
+            }
+            l
+        };
+        let mut reads = Vec::new();
+        let mut end = None;
+        for k in s + 1..n {
+            let j = &out.insns[k];
+            if target[k] || j.frame as usize != g || j.hoisted.is_some() || out.mats.contains_key(&k) {
+                break;
+            }
+            if j.reg2 as usize == r || j.is_call() && j.call_reads().any(|c| c == r) {
+                break;
+            }
+            if j.reg as usize == r && j.op != Op::Star {
+                if !j.reads_reg() || matches!(j.op, Op::Mov | Op::CreateArguments) {
+                    break;
+                }
+                reads.push(k);
+                if !rs_has(&live_out(k), r) {
+                    end = Some(k);
+                    break;
+                }
+            }
+            if j.op == Op::Star && j.reg as usize == r || j.jumps() || !j.falls_through() || j.is_call() {
+                break;
+            }
+        }
+        let Some(last) = end else { continue };
+        if found < limit {
+            let w = (base + found) as u8;
+            out.insns[s].reg = w;
+            for &k in &reads {
+                out.insns[k].reg = w;
+            }
+            out.split.push((w, r as u8));
+            out.restores.push(Restore {
+                frame: g as u8,
+                after: i.pc,
+                upto: out.insns[last].pc,
+                reg: r as u8,
+                value: Restored::Reg(w),
+            });
+        }
+        found += 1;
+    }
+    found
 }
 
 /// A function's registers live into each instruction, by bytecode offset.
@@ -13408,6 +13576,7 @@ impl JitFunction {
                 frame_regs: Vec::new(),
                 aliases: Vec::new(),
                 restores: Vec::new(),
+                split: Vec::new(),
                 exit_live: Vec::new(),
                 sites: Vec::new(),
                 caches: Vec::new(),
@@ -13599,6 +13768,7 @@ impl JitFunction {
                 frame_regs,
                 aliases: low.aliases,
                 restores: low.restores,
+                split: low.split,
                 exit_live: low.exit_live,
                 sites: low.sites,
                 caches: low.caches,
@@ -13682,6 +13852,7 @@ impl JitFunction {
                 root: vm.root,
                 mats: Some(&vm.snap.mats),
                 exit_live: Some(&vm.snap.exit_live),
+                split: &vm.snap.split,
                 heat: vm.heat_addr(),
             },
         );
@@ -14139,6 +14310,7 @@ impl JitFunction {
                     };
                     let mats = self.vm.as_ref().map(|vm| &vm.snap.mats);
                     let exit_live = self.vm.as_ref().map(|vm| &vm.snap.exit_live[..]);
+                    let split = self.vm.as_ref().map_or(&[][..], |vm| &vm.snap.split[..]);
                     let heat = self.vm.as_ref().map_or(0, |vm| vm.heat_addr());
                     JitCode::compile(
                         &self.insns,
@@ -14158,6 +14330,7 @@ impl JitFunction {
                             root,
                             mats,
                             exit_live,
+                            split,
                             heat,
                         },
                     )
@@ -14407,11 +14580,15 @@ unsafe fn vm_run_(
                 )
             };
             // Debugging: `TOI_JIT_DUMP=<file>` writes the last compilation's
-            // hot code (`TOI_JIT_LOG`: see `JitCode::log`).
+            // hot code (`TOI_JIT_LOG`: see `JitCode::log`), of the function
+            // named `TOI_JIT_DUMP_FN` if set; a `%n` in the name is the
+            // compilation's number, for a file each.
             if f.stats.compiles != compiles
                 && let Some(c) = f.last_code()
-                && let Some(path) = std::env::var_os("TOI_JIT_DUMP")
+                && let Ok(path) = std::env::var("TOI_JIT_DUMP")
+                && std::env::var("TOI_JIT_DUMP_FN").map_or(true, |n| n == code.name)
             {
+                let path = path.replace("%n", &f.stats.compiles.to_string());
                 std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
             }
             prepared

@@ -10,18 +10,57 @@ pub type Pos = u32;
 pub type Name = std::rc::Rc<str>;
 
 #[derive(Debug)]
-pub struct Program {
+pub struct Program<'a> {
     /// `functions[0]` is the script.
-    pub functions: Vec<Function>,
+    pub functions: Vec<Function<'a>>,
+}
+
+/// Where a program's nodes live (see [`Arena`]).
+#[derive(Default)]
+pub struct Arenas<'a> {
+    pub exprs: Arena<Expr<'a>>,
+    pub stmts: Arena<Stmt<'a>>,
+}
+
+/// Values allocated together and freed together: in chunks that never
+/// move once allocated (each filled up to its capacity), so a reference
+/// into one lives as long as the arena. (No `Drop` of its own: a `Vec`'s
+/// lets the values refer to each other.)
+pub struct Arena<T> {
+    chunks: std::cell::RefCell<Vec<Vec<T>>>,
+}
+
+impl<T> Default for Arena<T> {
+    fn default() -> Self {
+        Arena {
+            chunks: Default::default(),
+        }
+    }
+}
+
+impl<T> Arena<T> {
+    pub fn alloc(&self, value: T) -> &T {
+        let mut chunks = self.chunks.borrow_mut();
+        if chunks.last().is_none_or(|c| c.len() == c.capacity()) {
+            let n = chunks.last().map_or(64, |c| (c.capacity() * 2).min(4096));
+            chunks.push(Vec::with_capacity(n));
+        }
+        let chunk = chunks.last_mut().unwrap();
+        chunk.push(value);
+        let at: *const T = chunk.last().unwrap();
+        // The chunk never grows past its capacity, so the value stays
+        // where it is until the arena is dropped.
+        unsafe { &*at }
+    }
 }
 
 #[derive(Debug)]
-pub struct Function {
+pub struct Function<'a> {
     /// The declared name, or the one inferred from what an anonymous
     /// function expression is assigned to (`C.prototype.m = function …`).
     pub name: Option<Name>,
     pub params: Vec<Name>,
-    pub body: Vec<Stmt>,
+    pub body: Vec<Stmt<'a>>,
     /// The enclosing function (`None` for the script).
     pub parent: Option<usize>,
     /// A function declaration (hoisted), as opposed to an expression.
@@ -34,70 +73,70 @@ pub struct Function {
 }
 
 #[derive(Debug)]
-pub struct Stmt {
-    pub kind: StmtKind,
+pub struct Stmt<'a> {
+    pub kind: StmtKind<'a>,
     pub pos: Pos,
 }
 
 #[derive(Debug)]
-pub enum StmtKind {
-    Var(Vec<(Name, Option<Expr>)>),
+pub enum StmtKind<'a> {
+    Var(Vec<(Name, Option<Expr<'a>>)>),
     /// A function declaration: an index into [`Program::functions`].
     Function(usize),
-    Expr(Expr),
-    If(Expr, Box<Stmt>, Option<Box<Stmt>>),
+    Expr(Expr<'a>),
+    If(Expr<'a>, &'a Stmt<'a>, Option<&'a Stmt<'a>>),
     For {
-        init: Option<ForInit>,
-        test: Option<Expr>,
-        update: Option<Expr>,
-        body: Box<Stmt>,
+        init: Option<ForInit<'a>>,
+        test: Option<Expr<'a>>,
+        update: Option<Expr<'a>>,
+        body: &'a Stmt<'a>,
     },
     /// `for (var? x in e)`
     ForIn {
         var: bool,
         name: Name,
-        object: Expr,
-        body: Box<Stmt>,
+        object: Expr<'a>,
+        body: &'a Stmt<'a>,
     },
-    While(Expr, Box<Stmt>),
-    DoWhile(Box<Stmt>, Expr),
-    Return(Option<Expr>),
+    While(Expr<'a>, &'a Stmt<'a>),
+    DoWhile(&'a Stmt<'a>, Expr<'a>),
+    Return(Option<Expr<'a>>),
     Break(Option<Name>),
     Continue(Option<Name>),
-    Throw(Expr),
+    Throw(Expr<'a>),
     /// `try { … } catch (name) { … } finally { … }`, either of the last two
     /// optional.
-    Try(Vec<Stmt>, Option<(Name, Vec<Stmt>)>, Option<Vec<Stmt>>),
-    Block(Vec<Stmt>),
+    Try(Vec<Stmt<'a>>, Option<(Name, Vec<Stmt<'a>>)>, Option<Vec<Stmt<'a>>>),
+    Block(Vec<Stmt<'a>>),
     /// The discriminant, then `case` tests (`None` for `default`) with
     /// their statements.
-    Switch(Expr, Vec<(Option<Expr>, Vec<Stmt>)>),
-    Labeled(Name, Box<Stmt>),
+    Switch(Expr<'a>, Vec<(Option<Expr<'a>>, Vec<Stmt<'a>>)>),
+    Labeled(Name, &'a Stmt<'a>),
     Empty,
 }
 
 #[derive(Debug)]
-pub enum ForInit {
-    Var(Vec<(Name, Option<Expr>)>),
-    Expr(Expr),
+pub enum ForInit<'a> {
+    Var(Vec<(Name, Option<Expr<'a>>)>),
+    Expr(Expr<'a>),
 }
 
 #[derive(Debug)]
-pub struct Expr {
-    pub kind: ExprKind,
+pub struct Expr<'a> {
+    pub kind: ExprKind<'a>,
     pub pos: Pos,
 }
 
 #[derive(Debug)]
-pub enum ExprKind {
+pub enum ExprKind<'a> {
     Num(f64),
     Str(String),
     Bool(bool),
     Null,
     Ident(Name),
     This,
-    Array(Vec<Expr>),
-    Object(Vec<(Name, Expr)>),
+    Array(Vec<Expr<'a>>),
+    Object(Vec<(Name, Expr<'a>)>),
     /// A function expression: an index into [`Program::functions`].
     Function(usize),
     /// A regular expression literal: pattern, flags.
@@ -106,21 +145,21 @@ pub enum ExprKind {
     /// (true), the function's index.
     Accessor(bool, usize),
     /// `o.name`
-    Member(Box<Expr>, Name),
+    Member(&'a Expr<'a>, Name),
     /// `o[key]`
-    Index(Box<Expr>, Box<Expr>),
-    Call(Box<Expr>, Vec<Expr>),
-    New(Box<Expr>, Vec<Expr>),
-    Unary(UnOp, Box<Expr>),
+    Index(&'a Expr<'a>, &'a Expr<'a>),
+    Call(&'a Expr<'a>, Vec<Expr<'a>>),
+    New(&'a Expr<'a>, Vec<Expr<'a>>),
+    Unary(UnOp, &'a Expr<'a>),
     /// `++x`, `x--`, …: the target, `+1` or `-1`, and whether it's prefix.
-    Update(Box<Expr>, i8, bool),
-    Binary(BinOp, Box<Expr>, Box<Expr>),
+    Update(&'a Expr<'a>, i8, bool),
+    Binary(BinOp, &'a Expr<'a>, &'a Expr<'a>),
     /// `&&` (`true`) or `||` (`false`).
-    Logical(bool, Box<Expr>, Box<Expr>),
-    Cond(Box<Expr>, Box<Expr>, Box<Expr>),
+    Logical(bool, &'a Expr<'a>, &'a Expr<'a>),
+    Cond(&'a Expr<'a>, &'a Expr<'a>, &'a Expr<'a>),
     /// `target = value`, or `target op= value`.
-    Assign(Option<BinOp>, Box<Expr>, Box<Expr>),
-    Comma(Box<Expr>, Box<Expr>),
+    Assign(Option<BinOp>, &'a Expr<'a>, &'a Expr<'a>),
+    Comma(&'a Expr<'a>, &'a Expr<'a>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

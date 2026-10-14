@@ -34,14 +34,16 @@ impl Error {
     }
 }
 
-/// Parse `src`, a script.
-pub fn parse(src: &str) -> Result<ast::Program, Error> {
-    parse::parse(&lex::lex(src)?)
+/// Parse `src`, a script: its syntax error, if any.
+pub fn parse(src: &str) -> Result<(), Error> {
+    parse::parse(&lex::lex(src)?, &ast::Arenas::default()).map(|_| ())
 }
 
 /// Compile `src`, a script, to a module; errors are `line:column: message`.
 pub fn compile(src: &str) -> Result<Module, String> {
-    parse(src)
+    let arena = ast::Arenas::default();
+    lex::lex(src)
+        .and_then(|toks| parse::parse(&toks, &arena))
         .and_then(|p| codegen::generate(&p))
         .map_err(|e| e.display(src))
 }

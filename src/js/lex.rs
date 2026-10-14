@@ -80,6 +80,20 @@ const PUNCTS: &[&str] = &[
     "&", "|", "^", "!", "~", "?", ":", "=", ".",
 ];
 
+/// The punctuators beginning with byte `c`, longest first (as in
+/// [`PUNCTS`]).
+fn puncts(c: u8) -> &'static [&'static str] {
+    static BY_FIRST: std::sync::OnceLock<Vec<Vec<&'static str>>> = std::sync::OnceLock::new();
+    let by_first = BY_FIRST.get_or_init(|| {
+        let mut v = vec![Vec::new(); 128];
+        for &p in PUNCTS {
+            v[p.as_bytes()[0] as usize].push(p);
+        }
+        v
+    });
+    by_first.get(c as usize).map_or(&[], |v| v.as_slice())
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     let b = src.as_bytes();
     let mut toks = Vec::new();
@@ -153,7 +167,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     Some(k) => Tok::Keyword(k),
                     None => Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone()),
                 }
-            } else if let Some(p) = PUNCTS.iter().find(|p| p.as_bytes()[0] == c && src[i..].starts_with(**p)) {
+            } else if let Some(p) = puncts(c).iter().find(|p| src[i..].starts_with(**p)) {
                 i += p.len();
                 Tok::Punct(p)
             } else {

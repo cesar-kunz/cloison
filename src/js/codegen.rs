@@ -175,7 +175,7 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
 
 /// The names function `f`'s own code refers to (not its nested
 /// functions').
-fn references(f: &Function) -> Vec<&str> {
+fn references<'a>(f: &'a Function<'_>) -> Vec<&'a str> {
     names(f, false)
 }
 
@@ -187,7 +187,7 @@ fn apply_arguments(f: &Expr, args: &[Expr]) -> bool {
 
 /// The names function `f`'s own code refers to, or with `forwarded`, the
 /// `arguments` it passes on (see [`expr_names`]).
-fn names(f: &Function, forwarded: bool) -> Vec<&str> {
+fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
     fn stmt<'a>(s: &'a Stmt, out: &mut Vec<&'a str>, fw: bool) {
         let expr_refs = |e: &'a Expr, out: &mut Vec<&'a str>| expr_names(e, out, fw);
         let stmt = |s: &'a Stmt, out: &mut Vec<&'a str>| stmt(s, out, fw);
@@ -252,7 +252,7 @@ fn names(f: &Function, forwarded: bool) -> Vec<&str> {
 
 /// Every name a function declares: parameters, `var`s and function
 /// declarations, in order of declaration.
-fn declarations(p: &Program, f: usize) -> Vec<&str> {
+fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     let mut out = explicit_declarations(p, f);
     // `arguments`: a variable `CreateArguments` sets.
     if arguments_object(p, f) && !out.contains(&"arguments") {
@@ -269,7 +269,7 @@ fn declarations(p: &Program, f: usize) -> Vec<&str> {
 }
 
 /// The parameters and the variables and functions a function declares.
-fn explicit_declarations(p: &Program, f: usize) -> Vec<&str> {
+fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     fn stmt<'a>(s: &'a Stmt, p: &'a Program, out: &mut Vec<&'a str>) {
         let add = |n: &'a str, out: &mut Vec<&'a str>| {
             if !out.contains(&n) {
@@ -320,7 +320,7 @@ fn explicit_declarations(p: &Program, f: usize) -> Vec<&str> {
 /// The name a named function expression `f` binds in its body, if it or a
 /// function nested in it refers to it (shadowed or not: then the variable
 /// is just unused).
-fn own_name(p: &Program, f: usize) -> Option<&str> {
+fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
     let func = &p.functions[f];
     let name = func.name.as_deref().filter(|_| func.binds_name)?;
     let within = |mut g: usize| loop {
@@ -394,7 +394,7 @@ fn try_blocks<'a>(
     b: &'a [Stmt],
     c: &'a Option<(Name, Vec<Stmt>)>,
     f: &'a Option<Vec<Stmt>>,
-) -> impl Iterator<Item = &'a Stmt> {
+) -> impl Iterator<Item = &'a Stmt<'a>> {
     b.iter()
         .chain(c.iter().flat_map(|(_, c)| c))
         .chain(f.iter().flatten())
@@ -590,11 +590,11 @@ struct Acc {
 }
 
 struct Gen<'a> {
-    p: &'a Program,
+    p: &'a Program<'a>,
     decls: &'a [Vec<&'a str>],
     scopes: &'a Scopes<'a>,
     index: usize,
-    f: &'a Function,
+    f: &'a Function<'a>,
     asm: Assembler,
     labels: Vec<LabelInfo>,
     ics: Vec<Name>,
@@ -617,7 +617,7 @@ struct Gen<'a> {
     pending_labels: Vec<Name>,
     /// Statements compiled at the end of the function: the `then` branches
     /// of `if`s whose condition can only jump when true.
-    deferred: Vec<(L, &'a Stmt)>,
+    deferred: Vec<(L, &'a Stmt<'a>)>,
     /// Exception handlers: (start, end, handler) bytecode offsets, inner
     /// ones first (see `FunctionDef::handlers`).
     handlers: Vec<(u32, u32, u32)>,
@@ -634,13 +634,13 @@ struct Gen<'a> {
 struct TryCtx<'a> {
     start: u32,
     ranges: Vec<(u32, u32)>,
-    finally: Option<&'a [Stmt]>,
+    finally: Option<&'a [Stmt<'a>]>,
     targets: usize,
 }
 
 impl<'a> Gen<'a> {
     fn new(
-        p: &'a Program,
+        p: &'a Program<'a>,
         decls: &'a [Vec<&'a str>],
         overflow: &'a [&'a str],
         scopes: &'a Scopes<'a>,
@@ -1673,7 +1673,7 @@ impl<'a> Gen<'a> {
 
     /// For `x === undefined`, `null === x`, `x == null`, … (`op` `==` or
     /// `===`): `x` and the test of it.
-    fn nullish_test<'e>(op: BinOp, l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, Op)> {
+    fn nullish_test<'e, 'x>(op: BinOp, l: &'e Expr<'x>, r: &'e Expr<'x>) -> Option<(&'e Expr<'x>, Op)> {
         let constant = |e: &Expr| match &e.kind {
             ExprKind::Null => Some(Op::TestNull),
             // `undefined` names the global (it can't be reassigned, but a

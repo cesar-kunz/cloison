@@ -3402,3 +3402,35 @@ sum;
         }
     }
 }
+
+/// Arrays past `heap::LARGE` (here 3968 typed arrays, 32 KB of elements)
+/// are cells of their own blocks: one in a small block left the young
+/// values stored more than 8 KB into it, behind cards a minor collection
+/// couldn't find the cell for, to be freed (`Heap::alloc`). Checked with
+/// collections every 64 KB and freed memory poisoned.
+#[test]
+fn young_values_far_into_big_arrays_survive() {
+    let src = r#"
+function make() { return new Uint8Array(64); }
+var keep = [];
+for (var r = 0; r < 12; r++) {
+  var a = [];
+  var i = 0;
+  while (i < 0xF80) { a[i++] = make(); }
+  keep.push(a);
+}
+var ok = 0;
+for (var r = 0; r < keep.length; r++)
+  for (var i = 0; i < keep[r].length; i++) if (keep[r][i].length == 64) ok++;
+ok;
+"#;
+    let module = toi::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_gc_verify(64 << 10);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r, Ok("47616".to_string()), "tier at {budget}");
+        vm.heap.verify();
+    }
+}

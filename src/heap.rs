@@ -298,7 +298,7 @@ pub struct Heap {
     since: usize,
     used: usize,
     /// Bytes handed out after which the next collection is requested.
-    budget: usize,
+    pub(crate) budget: usize,
     /// A collection is due at the next safepoint (`Vm::safepoint`); the
     /// marker thread sets it too, for the final pause.
     pub(crate) requested: std::sync::atomic::AtomicBool,
@@ -399,7 +399,10 @@ impl Heap {
     pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
         debug_assert!(bytes.is_multiple_of(GRANULE) && bytes > 0);
         let p = self.ptr;
-        if (self.end as usize - p as usize) < bytes {
+        // (Past `LARGE`, a cell of its own blocks: in a small block, a card
+        // that far into it would find no cell start, see
+        // `cell_start_before`.)
+        if bytes > LARGE || (self.end as usize - p as usize) < bytes {
             return self.alloc_slow(bytes);
         }
         self.ptr = unsafe { p.add(bytes) };

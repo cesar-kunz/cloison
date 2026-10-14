@@ -304,9 +304,10 @@ blocks:
   from the bytes alone.
 - **Cards**, beside the heap, one byte per 128 bytes, set by the barrier.
 
-Memory is zeroed when a hole is taken (fresh blocks are zero already):
-the `create_object` stencils write a header and leave the slots, whose
-zero (`Value::EMPTY`, not a cell) a collection then reads. Blocks a full
+Memory is not zeroed when a hole is taken: each cell's maker writes all
+a collection reads (an object's header and slots, `Value::EMPTY` in the
+`create_object` stencils; an array's values), and zeroes what must
+start zero (a byte buffer). Blocks a full
 collection leaves empty are given back to the system (`madvise`), but
 for as many as the heap will grow by before the next cycle.
 

@@ -3692,11 +3692,12 @@ unsafe fn create_object(slots: usize) -> Option<*mut u64> {
         *p = imm64();
         // `Class::Plain`, flags `EXTERNAL`, `slots` in-object slots.
         *p.add(1) = 1 << 8 | (slots as u64) << 16;
-        for k in 2..6 {
-            *p.add(k) = 0;
+        // The slots zero too (`Value::EMPTY`): a collection reads them
+        // (holes aren't zeroed).
+        // (Volatile: LLVM would call `memset`, which a stencil can't.)
+        for k in 2..6 + slots {
+            p.add(k).write_volatile(0);
         }
-        // No slots: a slot is read only through a shape that has its
-        // property, and a store writes the slot no later than the shape.
         Some(p)
     }
 }
@@ -4944,11 +4945,13 @@ stencil!("construct_direct"; |s| {
             && *(*c).cap_at as u64 == (*c).cap
             && let Some(p) = bump((*c).heap, 6 + (*c).slots as usize)
         {
-            // The header only: a slot is read only through a shape that
-            // has its property, and a store writes the slot no later than
-            // the shape (a hole's memory is zero meanwhile).
+            // The header, and the slots zero (`Value::EMPTY`): a
+            // collection reads them (holes aren't zeroed).
             for k in 0..6 {
                 *p.add(k) = (*c).header[k];
+            }
+            for k in 6..6 + (*c).slots as usize {
+                p.add(k).write_volatile(0);
             }
             *(base.add((*c).this_off as usize) as *mut u64) = p as u64;
             let v = Value::from_bits(rt_call_enter!(s, toi_rt_enter, regs, Value::from_bits(site as u64)));

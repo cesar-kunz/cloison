@@ -26,9 +26,10 @@
 //! Pointers to arrays of values (an object's `props` and `elems`) and to
 //! upvalues point past that header word, at the payload.
 //!
-//! A hole's memory is zeroed when allocation takes it (blocks never used
-//! are zero already): the `create_object` stencils write a header and
-//! leave the slots.
+//! A hole's memory is not zeroed when allocation takes it: each cell's
+//! maker writes all of it a collection reads (an object's header and
+//! slots, an array's values; a string's units are never read past its
+//! length), and zeroes what must start zero (a byte buffer's).
 //!
 //! The shared reservation sits where its side tables can be at a 16th and
 //! a 128th of its addresses past one constant ([`SIDE`]): a granule's
@@ -393,8 +394,9 @@ impl Heap {
         meta(a)
     }
 
-    /// A new cell of `bytes` (a multiple of [`GRANULE`]), zeroed, its
-    /// metadata [`YOUNG`].
+    /// A new cell of `bytes` (a multiple of [`GRANULE`]), its metadata
+    /// [`YOUNG`]: what it holds is left from before, for the caller to
+    /// write all a collection may read.
     #[inline]
     pub fn alloc(&mut self, bytes: usize) -> *mut u8 {
         debug_assert!(bytes.is_multiple_of(GRANULE) && bytes > 0);
@@ -421,7 +423,6 @@ impl Heap {
             // Smaller holes would send compiled code's inline allocation
             // to the runtime every few cells.
             if let Some((s, e)) = self.next_hole(bytes.max(min_hole())) {
-                unsafe { std::ptr::write_bytes(s as *mut u8, 0, e - s) };
                 self.holes[0] += 1;
                 break (s, e);
             }
@@ -780,10 +781,7 @@ impl Heap {
     /// Zero `n` blocks from `b` that held cells, with their metadata.
     fn clean(&mut self, b: usize, n: usize) {
         let a = self.block_addr(b);
-        unsafe {
-            std::ptr::write_bytes(a, 0, n * BLOCK);
-            std::ptr::write_bytes(meta(a as usize), 0, n * BLOCK / GRANULE);
-        }
+        unsafe { std::ptr::write_bytes(meta(a as usize), 0, n * BLOCK / GRANULE) };
     }
 
     /// `n` contiguous blocks never used before: the first's index.
@@ -825,6 +823,7 @@ impl Heap {
             for i in 0..cap {
                 Object::inline(o, i).write(Value::UNDEFINED);
             }
+            std::ptr::write_bytes(Object::inline(o, cap), 0, extra);
         }
         o
     }
@@ -846,9 +845,11 @@ impl Heap {
     /// `n` zero bytes (8-aligned): the payload of a byte buffer cell.
     pub fn alloc_bytes(&mut self, n: usize) -> *mut u8 {
         let len = u32::try_from(n).expect("buffer too large") as u64;
-        let p = self.alloc((8 + n).next_multiple_of(GRANULE)).cast::<u64>();
+        let bytes = (8 + n).next_multiple_of(GRANULE);
+        let p = self.alloc(bytes).cast::<u64>();
         unsafe {
             *p = BYTES | len << 32;
+            std::ptr::write_bytes(p.add(1).cast::<u8>(), 0, bytes - 8);
             p.add(1).cast()
         }
     }
@@ -859,6 +860,7 @@ impl Heap {
         let p = self.alloc(32).cast::<u64>();
         unsafe {
             *p = UPVALUE;
+            std::ptr::write_bytes(p.add(1), 0, 3);
             p.add(1).cast()
         }
     }

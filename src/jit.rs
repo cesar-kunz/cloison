@@ -2715,49 +2715,103 @@ impl Ty {
     }
 }
 
-/// The types of `len` registers, kept for those not `Bot` only (in
-/// register order): a few are live at any point, of the dozens a frame
-/// with inlined calls has, and states are copied and joined per
-/// instruction. Copies share the list until one changes it (most
-/// instructions change `acc` only).
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+/// The types of `len` registers (at most 256), in chunks of
+/// [`CHUNK_REGS`], each shared until written, with a mask of its
+/// registers not `Bot` (none: no chunk). States are copied and joined per
+/// instruction: copies share the chunks (most instructions change `acc`
+/// or a register or two), and a join merges only the chunks that differ
+/// (zlib's `a1` joined lists of 160 registers 16,000 times a compile,
+/// rebuilding each for a register or two).
+#[derive(Clone, Default)]
 pub struct Regs {
     len: usize,
-    tys: Rc<Vec<(u8, Ty)>>,
+    chunks: Rc<[Slot; CHUNKS]>,
+}
+
+/// A chunk of [`Regs`]: its registers not `Bot`, and their types.
+#[derive(Clone, Default)]
+struct Slot {
+    occ: u16,
+    tys: Option<Rc<Chunk>>,
+}
+
+/// Registers per chunk of [`Regs`], and chunks.
+const CHUNK_REGS: usize = 16;
+const CHUNKS: usize = 256 / CHUNK_REGS;
+type Chunk = [Ty; CHUNK_REGS];
+
+/// The registers of `c` not `Bot`.
+fn occupied(c: &Chunk) -> u16 {
+    (c.iter().enumerate()).fold(0, |m, (j, &t)| m | (u16::from(t != Ty::Bot) << j))
+}
+
+/// The bits of each set bit of `m`, lowest first.
+fn bits16(mut m: u16) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        (m != 0).then(|| {
+            let b = m.trailing_zeros() as usize;
+            m &= m - 1;
+            b
+        })
+    })
 }
 
 static BOT: Ty = Ty::Bot;
 
+impl PartialEq for Regs {
+    fn eq(&self, other: &Regs) -> bool {
+        self.len == other.len
+            && (Rc::ptr_eq(&self.chunks, &other.chunks) || self.iter().eq(other.iter()))
+    }
+}
+
+impl Eq for Regs {}
+
+impl std::hash::Hash for Regs {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.len.hash(h);
+        self.iter().for_each(|e| e.hash(h));
+    }
+}
+
+impl std::fmt::Debug for Regs {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
 impl Regs {
     fn filled(len: usize, t: Ty) -> Regs {
-        let tys = if t == Ty::Bot {
-            Vec::new()
-        } else {
-            (0..len).map(|r| (r as u8, t)).collect()
-        };
-        Regs {
-            len,
-            tys: Rc::new(tys),
-        }
+        Regs::from_dense((0..len).map(|_| t))
     }
 
     /// From every register's type.
     fn from_dense(tys: impl IntoIterator<Item = Ty>) -> Regs {
-        let (mut len, mut out) = (0, Vec::new());
+        let mut chunks: [Slot; CHUNKS] = Default::default();
+        let mut len = 0;
         for t in tys {
+            assert!(len < 256, "more than 256 registers");
             if t != Ty::Bot {
-                out.push((len as u8, t));
+                let s = &mut chunks[len / CHUNK_REGS];
+                let c = s.tys.get_or_insert_with(|| Rc::new([Ty::Bot; CHUNK_REGS]));
+                Rc::get_mut(c).unwrap()[len % CHUNK_REGS] = t;
+                s.occ |= 1 << (len % CHUNK_REGS);
             }
             len += 1;
         }
         Regs {
             len,
-            tys: Rc::new(out),
+            chunks: Rc::new(chunks),
         }
     }
 
     fn len(&self) -> usize {
         self.len
+    }
+
+    /// Whether `other` is a copy of it (no register written since).
+    fn shares(&self, other: &Regs) -> bool {
+        Rc::ptr_eq(&self.chunks, &other.chunks)
     }
 
     /// Register `r`'s type, if it is one of them (as a slice's `get`).
@@ -2766,99 +2820,103 @@ impl Regs {
     }
 
     fn set(&mut self, r: usize, t: Ty) {
-        match self.tys.binary_search_by_key(&(r as u8), |e| e.0) {
-            Ok(k) if t == Ty::Bot => {
-                Rc::make_mut(&mut self.tys).remove(k);
+        if self[r] == t {
+            return;
+        }
+        let s = &mut Rc::make_mut(&mut self.chunks)[r / CHUNK_REGS];
+        let c = s.tys.get_or_insert_with(|| Rc::new([Ty::Bot; CHUNK_REGS]));
+        Rc::make_mut(c)[r % CHUNK_REGS] = t;
+        let bit = 1 << (r % CHUNK_REGS);
+        if t == Ty::Bot {
+            s.occ &= !bit;
+            if s.occ == 0 {
+                s.tys = None;
             }
-            Ok(k) if self.tys[k].1 != t => Rc::make_mut(&mut self.tys)[k].1 = t,
-            Ok(_) => {}
-            Err(_) if t == Ty::Bot => {}
-            Err(k) => Rc::make_mut(&mut self.tys).insert(k, (r as u8, t)),
+        } else {
+            s.occ |= bit;
         }
     }
 
-    /// The registers not `Bot`, with their types.
+    /// The registers not `Bot`, with their types, in order.
     fn iter(&self) -> impl Iterator<Item = (usize, Ty)> + '_ {
-        self.tys.iter().map(|&(r, t)| (r as usize, t))
+        (self.chunks.iter().enumerate())
+            .filter(|(_, s)| s.occ != 0)
+            .flat_map(|(k, s)| {
+                let c = s.tys.as_ref().unwrap();
+                bits16(s.occ).map(move |j| (k * CHUNK_REGS + j, c[j]))
+            })
     }
 
     /// Replace each type not `Bot` by `f` of it (`Bot` drops it); `f`
     /// must be a function of its arguments (it may be called twice).
     fn map(&mut self, mut f: impl FnMut(usize, Ty) -> Ty) {
-        let Some(first) = self.tys.iter().position(|&(r, t)| f(r as usize, t) != t) else {
-            return;
-        };
-        let tys = Rc::make_mut(&mut self.tys);
-        let mut k = first;
-        for j in first..tys.len() {
-            let (r, t) = tys[j];
-            let t = f(r as usize, t);
-            if t != Ty::Bot {
-                tys[k] = (r, t);
-                k += 1;
+        for k in 0..CHUNKS {
+            let s = &self.chunks[k];
+            let Some(c) = &s.tys else { continue };
+            let base = k * CHUNK_REGS;
+            if !bits16(s.occ).any(|j| f(base + j, c[j]) != c[j]) {
+                continue;
             }
+            let mut new: Chunk = **c;
+            for j in bits16(s.occ) {
+                new[j] = f(base + j, new[j]);
+            }
+            let occ = occupied(&new);
+            Rc::make_mut(&mut self.chunks)[k] = Slot {
+                occ,
+                tys: (occ != 0).then(|| Rc::new(new)),
+            };
         }
-        tys.truncate(k);
+    }
+
+    /// Only the registers in `live` (the others `Bot`).
+    fn keep_live(&mut self, live: &RegSet) {
+        let dead = |k: usize, occ: u16| occ & !((live[k / 4] >> (k % 4 * 16)) as u16) != 0;
+        if (0..CHUNKS).any(|k| dead(k, self.chunks[k].occ)) {
+            self.map(|r, t| if rs_has(live, r) { t } else { Ty::Bot });
+        }
     }
 
     /// Join `other` in; whether anything changed.
     fn join(&mut self, other: &Regs) -> bool {
-        if Rc::ptr_eq(&self.tys, &other.tys) {
+        if Rc::ptr_eq(&self.chunks, &other.chunks) {
             return false;
         }
-        // Whether `other` has a register `self` hasn't, or a wider type.
-        // (Both sorted by register: merged by index.)
-        let (a, b) = (&self.tys[..], &other.tys[..]);
-        let (mut x, mut y) = (0, 0);
-        let changed = loop {
-            if y == b.len() {
-                break false;
-            }
-            if x == a.len() || a[x].0 > b[y].0 {
-                break true;
-            }
-            if a[x].0 < b[y].0 {
-                x += 1;
-                continue;
-            }
-            if a[x].1.join(b[y].1) != a[x].1 {
-                break true;
-            }
-            x += 1;
-            y += 1;
-        };
-        if !changed {
-            return false;
+        let mut changed = false;
+        for k in 0..CHUNKS {
+            let (a, b) = (&self.chunks[k], &other.chunks[k]);
+            let new = match (&a.tys, &b.tys) {
+                (_, None) => continue,
+                (Some(x), Some(y)) if Rc::ptr_eq(x, y) => continue,
+                // Shared with `other`, as it is.
+                (None, Some(_)) => b.clone(),
+                (Some(x), Some(y)) => {
+                    if b.occ & !a.occ == 0 && bits16(b.occ).all(|j| x[j].join(y[j]) == x[j]) {
+                        continue;
+                    }
+                    let mut c = **x;
+                    for j in bits16(b.occ) {
+                        c[j] = c[j].join(y[j]);
+                    }
+                    Slot {
+                        occ: a.occ | b.occ,
+                        tys: Some(Rc::new(c)),
+                    }
+                }
+            };
+            Rc::make_mut(&mut self.chunks)[k] = new;
+            changed = true;
         }
-        let mut out: Vec<(u8, Ty)> = Vec::with_capacity(a.len() + b.len());
-        let (mut x, mut y) = (0, 0);
-        while x < a.len() && y < b.len() {
-            let ((ra, ta), (rb, tb)) = (a[x], b[y]);
-            if ra == rb {
-                out.push((ra, ta.join(tb)));
-                x += 1;
-                y += 1;
-            } else if ra < rb {
-                out.push(a[x]);
-                x += 1;
-            } else {
-                out.push(b[y]);
-                y += 1;
-            }
-        }
-        out.extend_from_slice(&a[x..]);
-        out.extend_from_slice(&b[y..]);
-        self.tys = Rc::new(out);
-        true
+        changed
     }
 }
 
 impl std::ops::Index<usize> for Regs {
     type Output = Ty;
     fn index(&self, r: usize) -> &Ty {
-        match self.tys.binary_search_by_key(&(r as u8), |e| e.0) {
-            Ok(k) => &self.tys[k].1,
-            Err(_) => &BOT,
+        match self.chunks.get(r / CHUNK_REGS).and_then(|s| s.tys.as_ref()) {
+            Some(c) => &c[r % CHUNK_REGS],
+            None => &BOT,
         }
     }
 }
@@ -4871,9 +4929,7 @@ fn infer(
             if !spec.acc_live[s] {
                 out.acc = Ty::Bot;
             }
-            let live = &spec.reg_live[s];
-            out.regs
-                .map(|r, t| if rs_has(live, r) { t } else { Ty::Bot });
+            out.regs.keep_live(&spec.reg_live[s]);
             if !out.same.is_empty() || out.acc_same.is_some() {
                 leave_dead(&mut out, &spec.reg_live[s], spec.acc_live[s]);
             }
@@ -5119,16 +5175,16 @@ fn home_stats(insns: &[Insn], ins: &[Option<TypeState>], nregs: usize) -> HomeSt
     let mut join = vec![0u8; nregs];
     // (States mostly share their registers' types with the one before:
     // each list once.)
-    let mut last: *const Vec<(u8, Ty)> = std::ptr::null();
+    let mut last: *const [Slot; CHUNKS] = std::ptr::null();
     for ((insn, st), w) in insns.iter().zip(ins).zip(&weight) {
         let Some(st) = st else { continue };
         if insn.reads_reg() {
             uses[insn.reg as usize] += w;
         }
-        if Rc::as_ptr(&st.regs.tys) == last {
+        if Rc::as_ptr(&st.regs.chunks) == last {
             continue;
         }
-        last = Rc::as_ptr(&st.regs.tys);
+        last = Rc::as_ptr(&st.regs.chunks);
         for (r, t) in st.regs.iter() {
             let j = &mut join[r];
             let k = match t {
@@ -5605,17 +5661,11 @@ fn edge_conversions(from: &TypeState, to: &TypeState, homes: &[Home]) -> Vec<Pie
         (Ty::I32, Ty::Any) => out.push(Piece::new("box_iacc", 0)),
         _ => {}
     }
-    if Rc::ptr_eq(&from.regs.tys, &to.regs.tys) {
+    if from.regs.shares(&to.regs) {
         return out;
     }
-    // Both sorted by register: `from`'s type of each of `to`'s, merged.
-    let from = &from.regs.tys[..];
-    let mut x = 0;
     for (r, b) in to.regs.iter() {
-        while x < from.len() && (from[x].0 as usize) < r {
-            x += 1;
-        }
-        let a = from.get(x).filter(|e| e.0 as usize == r).map_or(Ty::Bot, |e| e.1);
+        let a = from.regs[r];
         if a == Ty::I32 && b == Ty::F64 && matches!(homes[r], Home::Mem | Home::Gpr(_)) {
             out.push(Piece::new(&format!("conv_{}_f", homes[r].loc()), r as u8));
         }
@@ -13652,13 +13702,8 @@ impl JitFunction {
         // The live registers against the version's types, both in order
         // (a live register without one is `Bot`: no fit).
         let fits = versions.iter().map(|(st, code)| {
-            let tys = &st.regs.tys;
-            let mut k = 0;
             let regs = live.iter().filter(|&&r| checked(r)).filter_map(|&r| {
-                while k < tys.len() && tys[k].0 < r {
-                    k += 1;
-                }
-                let t = if k < tys.len() && tys[k].0 == r { tys[k].1 } else { Ty::Bot };
+                let t = st.regs[r as usize];
                 (t != Ty::Any).then_some((r, t))
             });
             Fit {

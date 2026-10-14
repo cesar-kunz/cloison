@@ -581,6 +581,7 @@ impl Shape {
             let deps = vm.field_deps.entry(cell as *const FieldCell as usize).or_default();
             if deps.last() != Some(&code) && !deps.contains(&code) {
                 deps.push(code);
+                vm.relied_cells.entry(code).or_default().push(cell as *const FieldCell as usize);
             }
         }
         cell.get()

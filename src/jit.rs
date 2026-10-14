@@ -9269,6 +9269,10 @@ pub(crate) struct CallSite {
     retry: u32,
     /// The callee's code and compiled version, for a direct call.
     callee: *const crate::vm::Code,
+    /// The function making the call (the compiled one, its code inlined
+    /// the call's frame): binding relies on what the callee's code took
+    /// (`Vm::rely_through`).
+    caller: *const crate::vm::Code,
     /// The function the call's inline cache names (bytecode or native), if
     /// any: a call through the runtime predicts its result from it.
     cached: *const crate::vm::Code,
@@ -9279,6 +9283,9 @@ pub(crate) struct CallSite {
     self_code: *const JitCode,
     /// Bound to a version (`target` or `self_code`), for good.
     bound: bool,
+    /// Unbound as the callee's code went stale (`unbind_calls`): bound
+    /// again at the next call, not after the callee's cooling.
+    rebind: bool,
     /// For a call to another function: the types of `this` and the
     /// arguments the site was claimed with, by the first caller version
     /// compiled to call directly. Only versions passing the same types may
@@ -9462,6 +9469,7 @@ impl CallSite {
             target: None,
             self_code: std::ptr::null(),
             bound: false,
+            rebind: false,
             claim: None,
             pending: false,
             retry: 0,
@@ -9521,6 +9529,7 @@ impl CallSite {
     }
 
     fn bind(&mut self, code: Rc<JitCode>, nregs: usize) {
+        unsafe { (*self.vm).rely_through(self.caller as usize, self.callee as usize) };
         self.entry = code.entry_addr();
         // (The version's own frame: it zeroes its dead registers at entry.)
         let nregs = nregs.max(code.homes.len());
@@ -9533,6 +9542,7 @@ impl CallSite {
             unsafe { (*self.vm).jit_caches.retired.push(old) };
         }
         self.bound = true;
+        self.rebind = false;
     }
 
     /// A pending site (see [`bind_direct`]): bind it if its callee isn't
@@ -9546,6 +9556,55 @@ impl CallSite {
             }
             Version::Busy => {}
             Version::None => self.pending = false,
+        }
+    }
+}
+
+/// Unbind `caller`'s direct calls into `callee`, whose code relied on a
+/// field type that generalized (see `Vm::rely_through`): their next call
+/// goes through the runtime, which binds them again to the code `callee`
+/// compiles next for the types they claimed (`bind_pending`), not waiting
+/// for the callee's cooling after exits (calls through the runtime enter
+/// versions for the types they pass, which cost Box2D's `Initialize`,
+/// short of compilations, its loop's). The sites are those of `caller`'s current lowering
+/// and its versions' (code dropped before runs no more, or notices an
+/// epoch at its next call). If `caller`'s state is in use, its code
+/// recompiles instead.
+///
+/// # Safety
+/// `caller` and `callee` must be live functions' code.
+pub(crate) unsafe fn unbind_calls(caller: *const crate::vm::Code, callee: *const crate::vm::Code) {
+    let c = unsafe { &*caller };
+    let Ok(slot) = c.jit.try_borrow() else {
+        c.field_deps.set(c.field_deps.get().wrapping_add(1));
+        return;
+    };
+    let Some(f) = slot.as_ref() else {
+        return;
+    };
+    fn unbind(s: &std::cell::UnsafeCell<CallSite>, callee: *const crate::vm::Code) {
+        let s = unsafe { &mut *s.get() };
+        if s.callee == callee && !s.self_call && s.entry != 0 {
+            s.entry = 0;
+            s.pending = s.claim.is_some();
+            s.rebind = true;
+        }
+        if let Some(d) = &s.dispatch {
+            for s in d.sites.values() {
+                unbind(s, callee);
+            }
+        }
+    }
+    let snaps = f.vm.iter().map(|v| &v.snap);
+    let codes = f.versions.values().flatten().map(|(_, c)| c);
+    for snap in snaps.chain(codes.clone().filter_map(|c| c.snap.as_ref())) {
+        for s in snap.sites.iter() {
+            unbind(s, callee);
+        }
+    }
+    for c in codes {
+        for s in c.forks.iter() {
+            unbind(s, callee);
         }
     }
 }
@@ -9602,6 +9661,7 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
     if let Some(v) = &f.vm
         && v.dirty
         && v.cool > 0
+        && !site.rebind
     {
         return Version::Busy;
     }
@@ -12246,11 +12306,13 @@ impl Lowering<'_> {
             nparams: 0,
             exits: 0,
             callee: std::ptr::null(),
+            caller: self.state.root,
             cached: std::ptr::null(),
             target: None,
             self_call: false,
             self_code: std::ptr::null(),
             bound: false,
+            rebind: false,
             claim: None,
             pending: false,
             retry: 0,

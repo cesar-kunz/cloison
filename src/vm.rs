@@ -417,6 +417,12 @@ pub struct Vm {
     /// By field cell (its address), the functions whose compiled code took
     /// its type (see `object::FieldCell::relied`).
     pub(crate) field_deps: HashMap<usize, Vec<usize>>,
+    /// By function, the field cells in `field_deps` it is listed for.
+    pub(crate) relied_cells: HashMap<usize, Vec<usize>>,
+    /// By field cell, the functions whose compiled code calls straight
+    /// into one listed for it in `field_deps`, with that callee (see
+    /// [`Vm::rely_through`]).
+    pub(crate) through_deps: HashMap<usize, Vec<(usize, usize)>>,
     /// Bumped whenever a field's type generalizes (see [`FieldType`]).
     pub field_epoch: u32,
     /// Bumped with either: compiled code checks it after calling out, as
@@ -577,6 +583,8 @@ impl Vm {
             relied_slots: Default::default(),
             jitted: Vec::new(),
             field_deps: HashMap::default(),
+            relied_cells: HashMap::default(),
+            through_deps: HashMap::default(),
             field_epoch: 0,
             code_epoch: 0,
             error: None,
@@ -1145,15 +1153,45 @@ impl Vm {
 
     /// Field `cell`, whose type compiled code took, generalized from
     /// `old`: the functions whose code did recompile (code running notices
-    /// after its calls); no code relies on an empty field's.
+    /// after its calls), and other functions' direct calls into them are
+    /// unbound; no code relies on an empty field's.
     #[cold]
     #[inline(never)]
     fn field_generalized(&mut self, cell: &FieldCell, old: FieldType) {
-        let deps = self.field_deps.remove(&(cell as *const FieldCell as usize));
+        let key = cell as *const FieldCell as usize;
+        let deps = self.field_deps.remove(&key);
+        let through = self.through_deps.remove(&key);
         if old != FieldType::None {
             for code in deps.into_iter().flatten() {
                 let c = unsafe { &*(code as *const Code) };
                 c.field_deps.set(c.field_deps.get().wrapping_add(1));
+            }
+            for (caller, callee) in through.into_iter().flatten() {
+                unsafe { crate::jit::unbind_calls(caller as *const Code, callee as *const Code) };
+            }
+        }
+    }
+
+    /// Function `caller`'s compiled code calls straight into `callee`'s
+    /// (a bound direct call), whose code took field types: generalizing
+    /// one unbinds those calls (`jit::unbind_calls`), which bind again to
+    /// the callee's next code. `caller`'s own code stays. (Mandreel's
+    /// `malloc` took global `tlsf_ptr` for an int32; a double stored there
+    /// made it recompile, but a loop calling it kept calling the old code,
+    /// which read the double's low half.)
+    pub(crate) fn rely_through(&mut self, caller: usize, callee: usize) {
+        if caller == callee || caller == 0 {
+            return;
+        }
+        let Some(cells) = self.relied_cells.get(&callee) else {
+            return;
+        };
+        for &cell in cells {
+            if self.field_deps.get(&cell).is_some_and(|deps| deps.contains(&callee)) {
+                let through = self.through_deps.entry(cell).or_default();
+                if !through.contains(&(caller, callee)) {
+                    through.push((caller, callee));
+                }
             }
         }
     }

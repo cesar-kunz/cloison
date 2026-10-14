@@ -444,6 +444,16 @@ pub struct Vm {
     /// call: the code leaves, and the interpreter makes the call instead
     /// (see `interp::call_from_jit`).
     pub(crate) redo_call: bool,
+    /// A conversion (ToPrimitive) needed a bytecode `valueOf` or
+    /// `toString` where nothing could call it (`native_top` null): the
+    /// operation is redone where something can (see
+    /// `interp::to_primitive_hint`).
+    pub(crate) conv_redo: bool,
+    /// What a `valueOf` or `toString` a conversion called threw, for the
+    /// operation converting to throw (conversions can't fail themselves);
+    /// `conv_thrown` says there is one (a flag: cheaper to test).
+    pub(crate) conv_error: Option<Error>,
+    pub(crate) conv_thrown: bool,
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
@@ -585,6 +595,9 @@ impl Vm {
             osr_regs: std::ptr::null_mut(),
             native_limit: 0,
             redo_call: false,
+            conv_redo: false,
+            conv_error: None,
+            conv_thrown: false,
             open_upvalues: Vec::new(),
             handles: Vec::new(),
             max_frame: crate::interp::HEADER,
@@ -2597,6 +2610,14 @@ impl Vm {
         } else if seen != shape {
             code.ctor_result.set(MANY_SHAPES);
         }
+    }
+
+    /// What a conversion threw (see `conv_error`), taken.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn take_conv_error(&mut self) -> Error {
+        self.conv_thrown = false;
+        self.conv_error.take().expect("a conversion's error")
     }
 
     /// Call `f` when it isn't a bytecode function (those the interpreter

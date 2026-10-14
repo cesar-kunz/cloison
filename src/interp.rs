@@ -279,6 +279,42 @@ macro_rules! handlers {
                     jump_to!((*callee).bytecode.as_ptr(), Value::UNDEFINED, new)
                 }};
             }
+            // `$e`, a conversion that may call a bytecode `valueOf` or
+            // `toString` (see `to_primitive_hint`): again where those can
+            // be called, if it needed that; what one threw unwinds.
+            #[allow(unused_macros)]
+            macro_rules! conv {
+                ($e:expr) => {{
+                    let vm = frame_vm($regs);
+                    // (No VM: bytecode run by itself, which has no objects.)
+                    if vm.is_null() {
+                        $e
+                    } else {
+                    (*vm).conv_redo = false;
+                    let mut v = $e;
+                    if (*vm).conv_redo {
+                        (*vm).conv_redo = false;
+                        v = with_top($regs, None, |_| $e);
+                    }
+                    if (*vm).conv_thrown {
+                        (*vm).error = Some((*vm).take_conv_error());
+                        tail!(op_unwind, Value::EMPTY)
+                    }
+                    v
+                    }
+                }};
+            }
+            // `conv!($e)` only where one of the values `$v` is a cell (else
+            // nothing can call anything: numbers, `undefined`, booleans).
+            #[allow(unused_macros)]
+            macro_rules! conv_if {
+                (($a:expr), $e:expr) => {
+                    if $a.is_cell() { conv!($e) } else { $e }
+                };
+                (($a:expr, $b:expr), $e:expr) => {
+                    if $a.is_cell() || $b.is_cell() { conv!($e) } else { $e }
+                };
+            }
             // Continue after this instruction with `r`, or end the run on an error.
             macro_rules! next_or_throw {
                 ($o:expr, $r:expr) => {
@@ -568,7 +604,7 @@ handlers! {
         let rhs = *reg(pc, 1, regs);
         acc = match both_numbers(acc, rhs) {
             Some((a, b)) => Value::from_f64_arith(a + b),
-            None => generic_add(rhs, acc),
+            None => conv!(generic_add(rhs, acc)),
         };
         next!(any, Op::Add.size(), acc)
     }
@@ -579,7 +615,7 @@ handlers! {
         let rhs = Value::from_i32(imm32(pc, 1));
         acc = match acc.as_number() {
             Some(a) => Value::from_f64_arith(a + imm32(pc, 1) as f64),
-            None => generic_add(acc, rhs),
+            None => conv!(generic_add(acc, rhs)),
         };
         next!(any, Op::AddSmi.size(), acc)
     }
@@ -589,7 +625,7 @@ handlers! {
     fn slow_inc(pc, acc, regs, tag) {
         acc = match acc.as_number() {
             Some(a) => Value::from_f64_arith(a + 1.0),
-            None => generic_inc(acc),
+            None => conv!(generic_inc(acc)),
         };
         next!(any, Op::Inc.size(), acc)
     }
@@ -601,7 +637,7 @@ handlers! {
         let less = match both_numbers(acc, rhs) {
             // False if either is NaN.
             Some((a, b)) => a < b,
-            None => generic_less_than(acc, rhs),
+            None => conv!(generic_less_than(acc, rhs)),
         };
         if less {
             next!(any, imm32(pc, 2), acc)
@@ -616,7 +652,7 @@ handlers! {
         let rhs = Value::from_i32(imm32(pc, 1));
         let less = match acc.as_number() {
             Some(a) => a < imm32(pc, 1) as f64,
-            None => generic_less_than(acc, rhs),
+            None => conv!(generic_less_than(acc, rhs)),
         };
         if less {
             next!(any, imm32(pc, 5), acc)
@@ -631,7 +667,7 @@ handlers! {
         let rhs = *reg(pc, 1, regs);
         let less = match both_numbers(acc, rhs) {
             Some((a, b)) => a < b,
-            None => generic_less_than(acc, rhs),
+            None => conv!(generic_less_than(acc, rhs)),
         };
         if less {
             let off = imm32(pc, 2);
@@ -647,7 +683,7 @@ handlers! {
         let rhs = Value::from_i32(imm32(pc, 1));
         let less = match acc.as_number() {
             Some(a) => a < imm32(pc, 1) as f64,
-            None => generic_less_than(acc, rhs),
+            None => conv!(generic_less_than(acc, rhs)),
         };
         if less {
             let off = imm32(pc, 5);
@@ -1019,36 +1055,36 @@ handlers! {
         let r = if tag.both_int32(a, b) && b.as_i32_unchecked() > 0 && a.as_i32_unchecked() >= 0 {
             Value::from_i32(a.as_i32_unchecked() % b.as_i32_unchecked())
         } else {
-            Value::from_f64_arith(to_number(a) % to_number(b))
+            Value::from_f64_arith(conv_if!((a, b), to_number(a) % to_number(b)))
         };
         next!(any, Op::Mod.size(), r)
     }
 
     fn op_bit_and(pc, acc, regs, tag) {
-        next_int!(Op::BitAnd.size(), int32_of(*reg(pc, 1, regs)) & int32_of(acc))
+        next_int!(Op::BitAnd.size(), conv_if!((*reg(pc, 1, regs), acc), int32_of(*reg(pc, 1, regs)) & int32_of(acc)))
     }
 
     fn op_bit_or(pc, acc, regs, tag) {
-        next_int!(Op::BitOr.size(), int32_of(*reg(pc, 1, regs)) | int32_of(acc))
+        next_int!(Op::BitOr.size(), conv_if!((*reg(pc, 1, regs), acc), int32_of(*reg(pc, 1, regs)) | int32_of(acc)))
     }
 
     fn op_bit_xor(pc, acc, regs, tag) {
-        next_int!(Op::BitXor.size(), int32_of(*reg(pc, 1, regs)) ^ int32_of(acc))
+        next_int!(Op::BitXor.size(), conv_if!((*reg(pc, 1, regs), acc), int32_of(*reg(pc, 1, regs)) ^ int32_of(acc)))
     }
 
     fn op_shift_left(pc, acc, regs, tag) {
-        let n = int32_of(acc) as u32 & 31;
-        next_int!(Op::ShiftLeft.size(), int32_of(*reg(pc, 1, regs)).wrapping_shl(n))
+        let (l, n) = conv_if!((*reg(pc, 1, regs), acc), (int32_of(*reg(pc, 1, regs)), int32_of(acc) as u32 & 31));
+        next_int!(Op::ShiftLeft.size(), l.wrapping_shl(n))
     }
 
     fn op_shift_right(pc, acc, regs, tag) {
-        let n = int32_of(acc) as u32 & 31;
-        next_int!(Op::ShiftRight.size(), int32_of(*reg(pc, 1, regs)) >> n)
+        let (l, n) = conv_if!((*reg(pc, 1, regs), acc), (int32_of(*reg(pc, 1, regs)), int32_of(acc) as u32 & 31));
+        next_int!(Op::ShiftRight.size(), l >> n)
     }
 
     fn op_shift_right_logical(pc, acc, regs, tag) {
-        let n = int32_of(acc) as u32 & 31;
-        let r = (int32_of(*reg(pc, 1, regs)) as u32) >> n;
+        let (l, n) = conv_if!((*reg(pc, 1, regs), acc), (int32_of(*reg(pc, 1, regs)), int32_of(acc) as u32 & 31));
+        let r = (l as u32) >> n;
         next!(any, Op::ShiftRightLogical.size(), Value::number(r as f64))
     }
 
@@ -1056,7 +1092,7 @@ handlers! {
         if acc.is_number() {
             next!(any, Op::ToNumber.size(), acc)
         }
-        next!(any, Op::ToNumber.size(), Value::number(to_number(acc)))
+        next!(any, Op::ToNumber.size(), Value::number(conv_if!((acc), to_number(acc))))
     }
 
     fn op_negate(pc, acc, regs, tag) {
@@ -1064,11 +1100,11 @@ handlers! {
         if tag.is_int32(acc) && acc.as_i32_unchecked() != 0 && acc.as_i32_unchecked() != i32::MIN {
             next_int!(Op::Negate.size(), -acc.as_i32_unchecked())
         }
-        next!(any, Op::Negate.size(), Value::from_f64(-to_number(acc)))
+        next!(any, Op::Negate.size(), Value::from_f64(-conv_if!((acc), to_number(acc))))
     }
 
     fn op_bit_not(pc, acc, regs, tag) {
-        next_int!(Op::BitNot.size(), !int32_of(acc))
+        next_int!(Op::BitNot.size(), !conv_if!((acc), int32_of(acc)))
     }
 
     fn op_type_of(pc, acc, regs, tag) {
@@ -1339,7 +1375,7 @@ handlers! {
         let d = imm32(pc, 1) as f64;
         let r = match acc.as_number() {
             Some(a) => Value::number(a % d),
-            None => Value::number(to_number(acc) % d),
+            None => Value::number(conv_if!((acc), to_number(acc)) % d),
         };
         next!(any, Op::ModSmi.size(), r)
     }
@@ -1347,13 +1383,13 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_bit_and_smi(pc, acc, regs, tag) {
-        next_int!(Op::BitAndSmi.size(), to_int32(to_number(acc)) & imm32(pc, 1))
+        next_int!(Op::BitAndSmi.size(), to_int32(conv_if!((acc), to_number(acc))) & imm32(pc, 1))
     }
 
     #[cold]
     #[inline(never)]
     fn slow_bit_or_smi(pc, acc, regs, tag) {
-        next_int!(Op::BitOrSmi.size(), to_int32(to_number(acc)) | imm32(pc, 1))
+        next_int!(Op::BitOrSmi.size(), to_int32(conv_if!((acc), to_number(acc))) | imm32(pc, 1))
     }
 
     #[cold]
@@ -1362,7 +1398,7 @@ handlers! {
         let lhs = *reg(pc, 1, regs);
         let r = match both_numbers(lhs, acc) {
             Some((a, b)) => a < b,
-            None => generic_less_than(lhs, acc),
+            None => conv!(generic_less_than(lhs, acc)),
         };
         next!(any, Op::TestLessThan.size(), Value::from_bool(r))
     }
@@ -1370,14 +1406,14 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_test_equal(pc, acc, regs, tag) {
-        let r = loose_equals(*reg(pc, 1, regs), acc).map(Value::from_bool);
+        let r = conv!(loose_equals(*reg(pc, 1, regs), acc)).map(Value::from_bool);
         next_or_throw!(Op::TestEqual.size(), r)
     }
 
     #[cold]
     #[inline(never)]
     fn slow_test_equal_smi(pc, acc, regs, tag) {
-        let r = loose_equals(acc, Value::from_i32(imm32(pc, 1))).map(Value::from_bool);
+        let r = conv!(loose_equals(acc, Value::from_i32(imm32(pc, 1)))).map(Value::from_bool);
         next_or_throw!(Op::TestEqualSmi.size(), r)
     }
 
@@ -1514,7 +1550,7 @@ handlers! {
         record_callee(pc, regs, tag);
         (*ic).loc = 0;
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| vm.call_other(*reg(pc, 1, regs), *w, args));
+        let r = with_top(regs, None, |vm| { let r = vm.call_other(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Call.size(), r)
     }
 
@@ -1523,7 +1559,7 @@ handlers! {
     fn slow_call_undefined(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| vm.call_other(*reg(pc, 1, regs), Value::UNDEFINED, args));
+        let r = with_top(regs, None, |vm| { let r = vm.call_other(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::CallUndefined.size(), r)
     }
 
@@ -1532,7 +1568,7 @@ handlers! {
     fn slow_construct(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| vm.construct_other(*reg(pc, 1, regs), args));
+        let r = with_top(regs, None, |vm| { let r = vm.construct_other(*reg(pc, 1, regs), args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Construct.size(), r)
     }
 }
@@ -1766,7 +1802,7 @@ macro_rules! arith_reg {
                 let lhs = *reg(pc, 1, regs);
                 let v = match both_numbers(lhs, acc) {
                     Some((x, y)) => Value::from_f64_arith(arith_f64(Op::$op, x, y)),
-                    None => generic_arith(Op::$op, lhs, acc),
+                    None => conv!(generic_arith(Op::$op, lhs, acc)),
                 };
                 next!(any, Op::$op.size(), v)
             }
@@ -1800,7 +1836,7 @@ macro_rules! arith_smi {
                 let k = imm32(pc, 1);
                 let v = match acc.as_number() {
                     Some(x) => Value::from_f64_arith(arith_f64(Op::$op, x, k as f64)),
-                    None => generic_arith(Op::$op, acc, Value::from_i32(k)),
+                    None => conv!(generic_arith(Op::$op, acc, Value::from_i32(k))),
                 };
                 next!(any, Op::$op.size(), v)
             }
@@ -1839,7 +1875,7 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_sub_smi(pc, acc, regs, tag) {
-        let v = generic_arith(Op::SubSmi, acc, Value::from_i32(imm32(pc, 1)));
+        let v = conv!(generic_arith(Op::SubSmi, acc, Value::from_i32(imm32(pc, 1))));
         next!(any, Op::SubSmi.size(), v)
     }
 }
@@ -1871,7 +1907,7 @@ macro_rules! shift_smi {
             #[cold]
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
-                let ($a, $k) = (to_int32(to_number(acc)), imm32(pc, 1) as u32 & 31);
+                let ($a, $k) = (to_int32(conv_if!((acc), to_number(acc))), imm32(pc, 1) as u32 & 31);
                 let v = match $int {
                     Some(v) => Value::from_i32(v),
                     // Only `>>>` leaves int32: a uint32 above 2^31 - 1.
@@ -1934,7 +1970,7 @@ macro_rules! relational {
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
                 let lhs = *reg(pc, 1, regs);
-                let c = if $swap { generic_compare($le, acc, lhs) } else { generic_compare($le, lhs, acc) };
+                let c = conv!(if $swap { generic_compare($le, acc, lhs) } else { generic_compare($le, lhs, acc) });
                 next!(any, Op::$op.size(), Value::from_bool(c))
             }
 
@@ -2182,7 +2218,7 @@ macro_rules! compare_jump {
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
                 let x = compare_jump!(@operand $smi, pc, regs);
-                let c = if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) };
+                let c = conv!(if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) });
                 if c {
                     next!(any, compare_jump!(@off $smi, pc), acc)
                 }
@@ -2219,7 +2255,7 @@ macro_rules! compare_jump {
             #[inline(never)]
             fn $slow_loop(pc, acc, regs, tag) {
                 let x = compare_jump!(@operand $smi, pc, regs);
-                let c = if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) };
+                let c = conv!(if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) });
                 if c {
                     let off = compare_jump!(@off $smi, pc);
                     back_edge!(regs, pc.offset(off as isize), acc);
@@ -2713,9 +2749,12 @@ pub(crate) fn to_primitive(v: Value) -> Value {
 }
 
 /// ToPrimitive with hint "string" (`string`: `toString` first) or
-/// "number". Calls native methods only: a bytecode one (natives can't call
-/// those yet) gets the default's result (`Object.prototype.toString`, or
-/// an array's `join`).
+/// "number": the first of `valueOf` and `toString` giving a primitive.
+/// A bytecode one is called where something can call it (`native_top`
+/// set: a native, an interpreter slow path in `conv!`); elsewhere (compiled
+/// code's runtime calls) it is skipped and `Vm::conv_redo` set, for the
+/// operation to be redone where it can. Conversions can't fail: what one
+/// throws is left in `Vm::conv_error` for the operation to throw.
 fn to_primitive_hint(v: Value, string: bool) -> Value {
     if !v.is_cell() || is_string(v) {
         return v;
@@ -2729,15 +2768,33 @@ fn to_primitive_hint(v: Value, string: bool) -> Value {
         };
         for name in order {
             let Ok(m) = vm.get(v, name) else { continue };
-            if !m.is_cell() || (*as_object(m)).class != Class::Native {
+            if !m.is_cell() {
                 continue;
             }
-            let native = (*(*as_object(m)).code).native.unwrap();
-            if let Ok(r) = native(vm, v, &[])
-                && (!r.is_cell() || is_string(r))
-            {
-                return r;
+            let r = match (*as_object(m)).class {
+                Class::Native => ((*(*as_object(m)).code).native.unwrap())(vm, v, &[]),
+                Class::Function if vm.native_top.is_null() => {
+                    vm.conv_redo = true;
+                    continue;
+                }
+                Class::Function => call_function(vm, m, v, &[]),
+                _ => continue,
+            };
+            match r {
+                Ok(r) if !r.is_cell() || is_string(r) => return r,
+                Ok(_) => {}
+                Err(e) => {
+                    vm.conv_error.get_or_insert(e);
+                    vm.conv_thrown = true;
+                    return Value::UNDEFINED;
+                }
             }
+        }
+        if !vm.conv_redo && !vm.native_top.is_null() {
+            vm.conv_error
+                .get_or_insert_with(|| Error::type_error("Cannot convert object to primitive value"));
+            vm.conv_thrown = true;
+            return Value::UNDEFINED;
         }
         let units = default_string(v);
         vm.new_string(&units)
@@ -3950,6 +4007,10 @@ pub(crate) unsafe fn call_from_jit(
                         vm.call_other(fv, this, std::slice::from_raw_parts(args, argc))
                     };
                     vm.native_top = saved;
+                    if vm.conv_thrown {
+                        let e = vm.take_conv_error();
+                        return throw(vm, e);
+                    }
                     return r.unwrap_or_else(|e| throw(vm, e));
                 }
             }

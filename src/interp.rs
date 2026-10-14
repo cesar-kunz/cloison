@@ -723,6 +723,29 @@ handlers! {
         next!(any, Op::CreateArguments.size(), acc)
     }
 
+    // A function's first call (see `asm::LazyFn`): its code compiled into
+    // the frame's, and run in this frame, with the registers past the
+    // stub's (`this` and the parameters) `undefined`.
+    fn op_compile_lazy(pc, acc, regs, tag) {
+        let code = frame_code(regs);
+        let old = (*code).nregs as usize;
+        if let Err(e) = with_top(regs, None, |vm| vm.compile_lazy(code)) {
+            (*frame_vm(regs)).error = Some(e);
+            tail!(op_unwind, Value::EMPTY)
+        }
+        let n = (*code).nregs as usize;
+        if regs.add(n) > (*frame_vm(regs)).stack_end {
+            (*frame_vm(regs)).error = Some(Error::range_error("Maximum call stack size exceeded"));
+            tail!(op_unwind, Value::EMPTY)
+        }
+        for i in old..n {
+            *regs.add(i) = Value::UNDEFINED;
+        }
+        set_header(regs, ICS, (*code).ics().as_ptr());
+        *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
+        jump_to!((*code).bytecode.as_ptr(), Value::UNDEFINED, regs)
+    }
+
     // `g.apply(x, arguments)` with the frame's arguments: `g` called with
     // them as they are, or (`apply` not the builtin's, or `g` not a
     // bytecode function) the object made, and the call `Call`'s.
@@ -2888,6 +2911,7 @@ static TABLE: Table = {
     t[Op::LdaGlobal as usize] = op_lda_global;
     t[Op::CreateArguments as usize] = op_create_arguments;
     t[Op::CallApplyArguments as usize] = op_call_apply_arguments;
+    t[Op::CompileLazy as usize] = op_compile_lazy;
     t[Op::TestInstanceOf as usize] = op_test_instance_of;
     t[Op::TestIn as usize] = op_test_in;
     t[Op::DeleteProperty as usize] = op_delete_property;
@@ -2992,6 +3016,7 @@ static TABLE_I32: Table = {
     t[Op::CallUndefined as usize] = op_call_undefined;
     t[Op::Construct as usize] = op_construct;
     t[Op::CallApplyArguments as usize] = op_call_apply_arguments;
+    t[Op::CompileLazy as usize] = op_compile_lazy;
     t[Op::Mov as usize] = i32_mov;
     t[Op::ModSmi as usize] = i32_mod_smi;
     t[Op::BitAndSmi as usize] = i32_bit_and_smi;

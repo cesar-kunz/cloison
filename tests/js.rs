@@ -3365,6 +3365,110 @@ out + " " + main(3);"#;
     assert!(!s.iter().any(|n| n == "call" || n.starts_with("construct")), "{s:?}");
 }
 
+/// `eval`'s and `Function`'s functions compile at their first calls,
+/// parsed again where they are (see `asm::LazyFn`): upvalues through
+/// functions not compiled yet, named function expressions, `arguments`,
+/// handlers, constructors. The expected value is Node's.
+#[test]
+fn eval_functions_compile_when_first_called() {
+    let src = r#"
+var src = "var k = 10;\n" +
+  "function outer(a) { var b = a * 2; function mid(c) { var z = 5; return function inner(d) { return [a, b, c, d, k, typeof z].join(':'); }; } return mid(1); }\n" +
+  "function counter() { var n = 0; return { inc: function () { return ++n; }, get: function () { return n; } }; }\n" +
+  "function fact(n) { return n <= 1 ? 1 : n * fact(n - 1); }\n" +
+  "var named = function self(n) { return n ? self(n - 1) + 1 : 0; };\n" +
+  "function args() { return arguments.length + ':' + Array.prototype.join.call(arguments, '/'); }\n" +
+  "function thrower() { try { (function () { throw new Error('in'); })(); } catch (e) { return 'caught ' + e.message; } }\n" +
+  "function shadow(a) { var k = 'local'; return function (k2) { return k + a + k2; }; }\n" +
+  "function deep(x) { return function (y) { return function (z) { return function () { return x + y + z; }; }; }; }\n" +
+  "function Point(x, y) { this.x = x; this.y = y; }\n" +
+  "Point.prototype.norm = function () { return Math.sqrt(this.x * this.x + this.y * this.y); };\n" +
+  "function late() { return neverCalled; function neverCalled() { return 1; } }\n" +
+  "var c = counter(); c.inc(); c.inc();\n" +
+  "[outer(3)(4), c.get(), fact(10), named(5), args(1, 2, 3), thrower(), shadow('A')('B'),\n" +
+  " deep(1)(2)(3)(), new Point(3, 4).norm(), typeof late()].join(',');";
+var direct = (0, eval)(src);
+var made = Function("p", "q", "function sq(v) { return v * v; } return sq(p) + q;")(3, 4);
+var bad = (0, eval)("(function () { return 1; })");
+direct + "|" + made + "|" + bad();
+"#;
+    assert_eq!(
+        value(src),
+        "3:6:1:4:10:number,2,3628800,5,3:1/2/3,caught in,localAB,6,5,function|13|1"
+    );
+    // Bodies only skimmed: the names they may use from outside, a few
+    // more than they do (ASI ending a `var`, accessors, keys and labels
+    // as outer variables, `catch`'s, hoisting). Node's values.
+    let skimmed = r#"
+var src = [
+  "function t1() { var x = 1; var f = function () { var g = function () { var x = 7; return x; }; return g() + x; }; return f(); }",
+  "function t2() { var b = 0; var f = function () { var a = 1\n b = 2 }; f(); return b; }",
+  "function t3() { var b = 0; var f = function () { var a = 1, b = 2; return a + b; }; return f() + ':' + b; }",
+  "function t4() { var k = 0, o = { p: 1, q: 2 }; var f = function () { var s = ''; for (var k in o) s += k; return s; }; return f() + k; }",
+  "function t5() { var y = 5; var f = function () { var o = { get v() { var y = 1; return y; }, set v(w) { y = w; } }; o.v = 9; return o.v + ':' + y; }; return f() + ':' + y; }",
+  "function t6() { var k = 3; var f = function () { return { k: 1 }.k + k; }; return f(); }",
+  "function t7() { var lbl = 4; var f = function () { lbl: for (;;) { break lbl; } return lbl; }; return f(); }",
+  "function t8() { var e = 'outer'; var f = function () { try { throw 'x'; } catch (e) { } return e; }; return f(); }",
+  "function t9() { var f = function () { var r = function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }; return r(10); }; return f(); }",
+  "function t10() { var f = function () { return function () { return arguments.length; }(1, 2, 3); }; return f(4); }",
+  "function t11(a) { return function (b) { return function (c) { return function (d) { return [a, b, c, d].join(''); }; }; }; }",
+  "function t12() { var x = 1; var f = function () { x = 2; var x; return x; }; return f() + ':' + x; }",
+  "function t13() { var n = 3; var f = function () { return h(); function h() { return n * 2; } }; return f(); }",
+  "function t14() { var m = 1; var f = function () { var a = [1, 2], m = a.length; return m; }; return f() + ':' + m; }",
+  "function t15() { var q = 1; var f = function () { var a = (q, 5); return a + q; }; return f(); }",
+  "function t16() { var z = 2; var f = function () { var a = { z: 1, w: function () { return z; } }; return a.w() + a.z; }; return f(); }",
+  "function t17() { var c = 0; var f = function () { var a = 1\n b = 2, c = 3 }; f(); return c; }",
+  "[t1(), t2(), t3(), t4(), t5(), t6(), t7(), t8(), t9(), t10(), t11(1)(2)(3)(4), t12(), t13(), t14(), t15(), t16(), t17()].join(',');"
+].join("\n");
+(0, eval)(src);
+"#;
+    assert_eq!(
+        value(skimmed),
+        "8,2,3:0,pq0,1:9:9,4,4,outer,55,3,1234,2:1,6,2:1,6,3,3"
+    );
+    // A skimmed body's syntax error is thrown at its first call (Node
+    // throws at the `eval`).
+    assert_eq!(
+        value("var f = (0, eval)('var g = function () { return 1 + ; }; g'); \
+               var r; try { f(); } catch (e) { r = String(e).indexOf('SyntaxError') >= 0; } r;"),
+        "true"
+    );
+    // What only the code generator rejects is thrown at the call.
+    assert_eq!(
+        value("var f = (0, eval)('(function () { return function () { while (1) { continue x; } }; })')(); \
+               var r; try { f(); } catch (e) { r = String(e).indexOf('no target') >= 0; } r;"),
+        "true"
+    );
+}
+
+/// Every running microbenchmark through `eval`, so each of its functions
+/// is compiled lazily, computes what it does compiled up front.
+#[test]
+fn microbenchmarks_through_eval_compute_their_expected_results() {
+    for f in files("bench/micro", "js") {
+        let name = f.file_name().unwrap().to_str().unwrap();
+        if !RUNNING.contains(&&name[..2]) {
+            continue;
+        }
+        let src = std::fs::read_to_string(&f).unwrap();
+        let expect = src.lines().find_map(|l| l.strip_prefix("// expect: ")).unwrap();
+        let mut quoted = String::from("(0, eval)(\"");
+        for c in src.chars() {
+            match c {
+                '\\' => quoted.push_str("\\\\"),
+                '"' => quoted.push_str("\\\""),
+                '\n' => quoted.push_str("\\n"),
+                '\r' => quoted.push_str("\\r"),
+                '\u{2028}' => quoted.push_str("\\u2028"),
+                '\u{2029}' => quoted.push_str("\\u2029"),
+                c => quoted.push(c),
+            }
+        }
+        quoted.push_str("\");");
+        assert_eq!(value(&quoted), expect.trim(), "{name}");
+    }
+}
+
 /// Code that eval'd functions no longer reachable leave is freed (by a
 /// full collection, which code loaded starts), while the functions kept,
 /// and those nested in them, run on: of 3000 evals' 12,000 functions, in

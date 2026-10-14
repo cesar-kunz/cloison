@@ -70,6 +70,20 @@ pub struct Function<'a> {
     /// Its body reads `arguments` (not counting nested functions').
     pub uses_arguments: bool,
     pub pos: Pos,
+    /// Where its parameter list starts (its `(`) and its body ends (past
+    /// its `}`): the text compiled again when compiled lazily (see
+    /// `codegen::generate`).
+    pub params_pos: Pos,
+    pub end: Pos,
+    /// A function expression right after a `(` or right before one: most
+    /// such are called at once (`(function () { … })()`, a module's;
+    /// `f = function () { … }()`), so compiled with the function around
+    /// them, not lazily (V8's heuristic).
+    pub eager: bool,
+    /// Skimmed, not parsed (see `parse::parse_with`): no body, and the
+    /// names it and the functions in it may refer to from outside it (at
+    /// least those they do), which stand for its references.
+    pub free: Option<Vec<Name>>,
 }
 
 #[derive(Debug)]

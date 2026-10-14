@@ -20,10 +20,57 @@ use crate::jit::{HashMap, HashSet};
 
 use super::Error;
 use super::ast::*;
-use crate::asm::{Constant, FunctionDef, Module};
+use std::rc::Rc;
+
+use crate::asm::{Constant, FunctionDef, LazyFn, Module};
 use crate::bytecode::{Arg, Assembler, Label, Op};
 
 pub fn generate(p: &Program) -> Result<Module, Error> {
+    generate_from(p, None).map(|(m, _)| m)
+}
+
+/// Compile only function `root` of `p` and leave the functions nested in
+/// it for later: each a stub ([`LazyFn`]) that compiles at its first call
+/// from its text in `source` (at the offsets `at` maps `p`'s to). Also
+/// `root`'s upvalues, by name. (`eval`'s and `Function`'s code; their
+/// functions mostly are never called: CodeLoad's.)
+pub fn generate_lazy<'p>(
+    p: &'p Program,
+    root: usize,
+    source: &Rc<str>,
+    at: &dyn Fn(Pos) -> Pos,
+    upvalues: &'p [Rc<str>],
+) -> Result<Module, Error> {
+    generate_from(p, Some((root, source, at, upvalues))).map(|(m, _)| m)
+}
+
+/// What [`generate_lazy`] fails with when a skimmed function (see
+/// `Function::free`) can't wait: one whose upvalues would include a
+/// scope object, or too many to declare again. Parsing in full then
+/// leaves it out (see `js::compile_script_lazy`).
+pub const SKIMMED_TOO_SOON: &str = "a skimmed function compiled now";
+
+/// Upvalues past which a function compiles now: a lazily compiled one's
+/// are declared again, as parameters (see `js::compile_lazy`).
+const LAZY_UPVALUES: usize = 120;
+
+/// What [`generate_from`] makes of a function.
+#[derive(Clone, Copy, PartialEq)]
+enum Emit {
+    /// Nothing: an enclosing function compiles it.
+    Skip,
+    Compile,
+    Stub,
+}
+
+/// `lazy`: compile only the root given, the functions in it stubs; with
+/// the upvalues the root's stub had (no fewer than it uses).
+#[allow(clippy::type_complexity)]
+fn generate_from<'p>(
+    p: &'p Program,
+    lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
+) -> Result<(Module, Vec<&'p str>), Error> {
+
     let mut decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
     // A function with more variables than registers keeps the last ones
     // in a scope object (`%env`, a register; see `Gen::function`).
@@ -47,17 +94,100 @@ pub fn generate(p: &Program) -> Result<Module, Error> {
         }
     }
     let decls: Vec<Decls> = decls.into_iter().map(Decls::new).collect();
-    let scopes = upvalues(p, &decls, &overflow);
+    let mut scopes = upvalues(p, &decls, &overflow);
     let names = Default::default();
-    let mut functions = Vec::with_capacity(p.functions.len());
-    for i in 0..p.functions.len() {
-        functions.push(Gen::new(p, &decls, &overflow[i], &scopes, &names, i).function()?);
+    let root = lazy.map_or(0, |(r, ..)| r);
+    // A stub's upvalues stand: they may be more than it uses, if it was
+    // skimmed; its closures were made with them.
+    if let Some((_, _, _, ups)) = lazy
+        && root != 0
+    {
+        let ups: Vec<&str> = ups.iter().map(|n| &**n).collect();
+        assert!(
+            scopes.upvalues[root].iter().all(|n| ups.contains(n)),
+            "a lazily compiled function's upvalues among its stub's"
+        );
+        scopes.upvalues[root] = ups;
     }
-    Ok(Module {
+    // The functions in `root` (after it: the parser numbers them in
+    // order), each compiled or a stub when its parent compiles; one whose
+    // upvalues include a scope object (not a name to declare again: see
+    // `js::compile_lazy`) or with too many parameters compiles now.
+    let n = p.functions.len();
+    let mut emit = vec![Emit::Skip; n];
+    let mut index = vec![usize::MAX; n];
+    let mut emitted = 0;
+    for i in root..n {
+        let f = &p.functions[i];
+        emit[i] = match f.parent {
+            _ if i == root => Emit::Compile,
+            Some(k) if emit[k] == Emit::Compile => {
+                if lazy.is_some()
+                    && !f.eager
+                    && !scopes.upvalues[i].contains(&ENV)
+                    && scopes.upvalues[i].len() <= LAZY_UPVALUES
+                    && f.params.len() < LOCAL_REGS
+                {
+                    Emit::Stub
+                } else if f.free.is_some() {
+                    return Err(Error::new(f.pos as usize, SKIMMED_TOO_SOON.to_string()));
+                } else {
+                    Emit::Compile
+                }
+            }
+            _ => Emit::Skip,
+        };
+        if emit[i] != Emit::Skip {
+            index[i] = emitted;
+            emitted += 1;
+        }
+    }
+    let mut functions = Vec::with_capacity(emitted);
+    for i in root..n {
+        match emit[i] {
+            Emit::Skip => {}
+            Emit::Compile => {
+                let mut f = Gen::new(p, &decls, &overflow[i], &scopes, &names, i).function()?;
+                f.closures.iter_mut().for_each(|c| *c = index[*c]);
+                functions.push(f);
+            }
+            Emit::Stub => {
+                let (_, source, at, _) = lazy.unwrap();
+                let f = &p.functions[i];
+                let nparams = f.params.len() as u32;
+                functions.push(FunctionDef {
+                    name: function_name(p, i),
+                    nparams,
+                    nregs: nparams + 1,
+                    code: vec![Op::CompileLazy as u8],
+                    ics: Vec::new(),
+                    closures: Vec::new(),
+                    constants: Vec::new(),
+                    handlers: Vec::new(),
+                    upvalues: upvalue_sources(p, &decls, &scopes, i),
+                    captures: false,
+                    lazy: Some(LazyFn {
+                        source: source.clone(),
+                        start: at(f.params_pos),
+                        end: at(f.end),
+                        own_name: f.name.clone().filter(|_| f.binds_name),
+                        upvalues: scopes.upvalues[i].iter().map(|&n| n.into()).collect(),
+                    }),
+                });
+            }
+        }
+    }
+    let declared = if root == 0 {
+        explicit_declarations(p, 0).iter().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    let module = Module {
         functions,
         script: 0,
-        declared: explicit_declarations(p, 0).iter().map(|s| s.to_string()).collect(),
-    })
+        declared,
+    };
+    Ok((module, std::mem::take(&mut scopes.upvalues[root])))
 }
 
 type R<T> = Result<T, Error>;
@@ -112,6 +242,33 @@ const SHARED_ICS: usize = 60000;
 
 /// The name of the register holding a function's scope object.
 const ENV: &str = "%env";
+
+/// Function `i`'s name, for its code.
+fn function_name(p: &Program, i: usize) -> String {
+    match (i, &p.functions[i].name) {
+        (0, _) => "<script>".to_string(),
+        (_, Some(n)) => n.to_string(),
+        (_, None) => "<anonymous>".to_string(),
+    }
+}
+
+/// Where each of function `i`'s upvalues comes from, in its parent: a
+/// register of the parent's (`true`), or an upvalue of its own.
+fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> Vec<(bool, u8)> {
+    let Some(parent) = p.functions[i].parent else {
+        return Vec::new();
+    };
+    scopes.upvalues[i]
+        .iter()
+        .map(|n| match decls[parent].position(n) {
+            Some(k) if parent != 0 => (true, k as u8 + 1),
+            _ => {
+                let k = scopes.upvalues[parent].iter().position(|d| d == n);
+                (false, k.expect("passed down by the parent") as u8)
+            }
+        })
+        .collect()
+}
 
 fn unsupported<T>(pos: Pos, what: impl std::fmt::Display) -> R<T> {
     Err(Error::new(pos as usize, format!("unsupported: {what}")))
@@ -217,7 +374,10 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
 /// The names function `f`'s own code refers to (not its nested
 /// functions').
 fn references<'a>(f: &'a Function<'_>) -> Vec<&'a str> {
-    names(f, false)
+    match &f.free {
+        Some(free) => free.iter().map(|n| &**n).collect(),
+        None => names(f, false),
+    }
 }
 
 /// Whether call `f(args)` is `g.apply(x, arguments)`.
@@ -811,12 +971,8 @@ impl<'a> Gen<'a> {
         if self.nregs > 256 {
             return unsupported(self.f.pos, "more than 256 registers");
         }
-        let name = match (self.index, &self.f.name) {
-            (0, _) => "<script>".to_string(),
-            (_, Some(n)) => n.to_string(),
-            (_, None) => "<anonymous>".to_string(),
-        };
-        let upvalues = self.upvalue_sources();
+        let name = function_name(self.p, self.index);
+        let upvalues = upvalue_sources(self.p, self.decls, self.scopes, self.index);
         let captures = !self.scopes.captured[self.index].is_empty();
         Ok(FunctionDef {
             name,
@@ -829,25 +985,8 @@ impl<'a> Gen<'a> {
             handlers: self.handlers,
             upvalues,
             captures,
+            lazy: None,
         })
-    }
-
-    /// Where each of the function's upvalues comes from, in its parent: a
-    /// register of the parent's (`true`), or an upvalue of its own.
-    fn upvalue_sources(&self) -> Vec<(bool, u8)> {
-        let ups = &self.scopes.upvalues[self.index];
-        let Some(parent) = self.f.parent else {
-            return Vec::new();
-        };
-        ups.iter()
-            .map(|n| match self.decls[parent].position(n) {
-                Some(k) if parent != 0 => (true, k as u8 + 1),
-                _ => {
-                    let k = self.scopes.upvalues[parent].iter().position(|d| d == n);
-                    (false, k.expect("passed down by the parent") as u8)
-                }
-            })
-            .collect()
     }
 
     /// The script's `var`s to declare before it runs: those without an

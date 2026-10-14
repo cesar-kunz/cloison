@@ -2802,6 +2802,13 @@ impl Vm {
         self.heap.gc.code_room = bytes;
     }
 
+    /// Collect every `bytes` allocated, checking references and poisoning
+    /// what is freed, as `TOI_GC_VERIFY` does (for tests).
+    pub fn set_gc_verify(&mut self, bytes: usize) {
+        self.heap.gc.verify = bytes;
+        self.heap.budget = self.heap.gc.budget();
+    }
+
     /// The functions' codes loaded and not freed (for tests).
     pub fn code_count(&self) -> usize {
         self.codes.len() + self.condemned.len()

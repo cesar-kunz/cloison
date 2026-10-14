@@ -3662,6 +3662,9 @@ struct HeapPtrs {
     end: *mut u64,
 }
 
+/// `heap::LARGE`: past it, a cell is a large one, made by the runtime.
+const LARGE: usize = 8 << 10;
+
 /// `heap::YOUNG`: a new cell's metadata byte.
 const YOUNG: u8 = 0x80;
 
@@ -3672,7 +3675,8 @@ unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
     unsafe {
         let words = (words + 1) & !1;
         let p = (*heap).ptr;
-        if ((*heap).end as usize - p as usize) < 8 * words {
+        // (Past `heap::LARGE` the runtime makes it a large cell.)
+        if 8 * words > LARGE || ((*heap).end as usize - p as usize) < 8 * words {
             return None;
         }
         (*heap).ptr = p.add(words);

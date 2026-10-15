@@ -2276,7 +2276,11 @@ impl Vm {
         }
         let o = as_object(obj);
         unsafe {
-            if !matches!((*o).class, Class::Plain | Class::Array)
+            // (A function's too: its constant fields, which stores
+            // don't cache, come here once given up. Box2D's never set
+            // `b2Distance.b2_gjkCalls`, `++`ed: `NaN`, stored at every
+            // call, kept it constant, and each call exited there.)
+            if !matches!((*o).class, Class::Plain | Class::Array | Class::Function)
                 || (*o).flags & crate::object::PROTOTYPE != 0
                 || o == self.global
             {

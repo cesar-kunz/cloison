@@ -46,7 +46,7 @@ pub fn compile(src: &str) -> Result<Module, String> {
     let arena = ast::Arenas::default();
     lex::lex(src)
         .and_then(|mut toks| parse::parse(&mut toks, &arena))
-        .and_then(|p| codegen::generate(&p))
+        .and_then(|p| codegen::generate(&p, src))
         .map_err(|e| e.display(src))
 }
 

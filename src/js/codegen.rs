@@ -25,8 +25,8 @@ use std::rc::Rc;
 use crate::asm::{Constant, FunctionDef, LazyFn, Module};
 use crate::bytecode::{Arg, Assembler, Label, Op};
 
-pub fn generate(p: &Program) -> Result<Module, Error> {
-    generate_from(p, None).map(|(m, _)| m)
+pub fn generate(p: &Program, src: &str) -> Result<Module, Error> {
+    generate_from(p, None, src).map(|(m, _)| m)
 }
 
 /// Compile only function `root` of `p` and leave the functions nested in
@@ -41,7 +41,7 @@ pub fn generate_lazy<'p>(
     at: &dyn Fn(Pos) -> Pos,
     upvalues: &'p [Rc<str>],
 ) -> Result<Module, Error> {
-    generate_from(p, Some((root, source, at, upvalues))).map(|(m, _)| m)
+    generate_from(p, Some((root, source, at, upvalues)), source).map(|(m, _)| m)
 }
 
 /// What [`generate_lazy`] fails with when a skimmed function (see
@@ -69,7 +69,9 @@ enum Emit {
 fn generate_from<'p>(
     p: &'p Program,
     lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
+    src: &str,
 ) -> Result<(Module, Vec<&'p str>), Error> {
+    let position = positions(src, lazy.map(|(_, _, at, _)| at));
 
     let mut decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
     // A function with more variables than registers keeps the last ones
@@ -149,6 +151,7 @@ fn generate_from<'p>(
             Emit::Compile => {
                 let mut f = Gen::new(p, &decls, &overflow[i], &scopes, &names, i).function()?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
+                (f.line, f.col) = position(p.functions[i].params_pos);
                 functions.push(f);
             }
             Emit::Stub => {
@@ -166,6 +169,8 @@ fn generate_from<'p>(
                     handlers: Vec::new(),
                     upvalues: upvalue_sources(p, &decls, &scopes, i),
                     captures: false,
+                    line: position(f.params_pos).0,
+                    col: position(f.params_pos).1,
                     lazy: Some(LazyFn {
                         source: source.clone(),
                         start: at(f.params_pos),
@@ -244,6 +249,32 @@ const SHARED_ICS: usize = 60000;
 const ENV: &str = "%env";
 
 /// Function `i`'s name, for its code.
+/// Where a position of the program is in `src` (through `at`, for a
+/// function compiled lazily), as 1-based line and column (bytes), for
+/// `TOI_JIT_LOG` and `TOI_JIT_DUMP_FN` (`scripts/vs-maglev.sh` matches
+/// functions by it with V8's, which places them at their parameter list's
+/// `(` too). Without either, (0, 0): finding lines scans the source, which
+/// a lazy compile would do again for every function.
+fn positions<'a>(src: &'a str, at: Option<&'a dyn Fn(Pos) -> Pos>) -> impl Fn(Pos) -> (u32, u32) + 'a {
+    static LOGGING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let logging = *LOGGING.get_or_init(|| {
+        std::env::var_os("TOI_JIT_LOG").is_some() || std::env::var_os("TOI_JIT_DUMP_FN").is_some()
+    });
+    let starts: Vec<usize> = if logging {
+        std::iter::once(0).chain(src.match_indices('\n').map(|(k, _)| k + 1)).collect()
+    } else {
+        Vec::new()
+    };
+    move |pos| {
+        if starts.is_empty() {
+            return (0, 0);
+        }
+        let off = at.map_or(pos, |at| at(pos)) as usize;
+        let line = starts.partition_point(|&s| s <= off);
+        (line as u32, (off - starts[line - 1] + 1) as u32)
+    }
+}
+
 fn function_name(p: &Program, i: usize) -> String {
     match (i, &p.functions[i].name) {
         (0, _) => "<script>".to_string(),
@@ -985,6 +1016,8 @@ impl<'a> Gen<'a> {
             handlers: self.handlers,
             upvalues,
             captures,
+            line: 0,
+            col: 0,
             lazy: None,
         })
     }

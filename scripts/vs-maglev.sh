@@ -5,7 +5,8 @@
 #
 #   scripts/vs-maglev.sh                     # every file; table in perf-history/vs-maglev-<commit>.md
 #   scripts/vs-maglev.sh bench/micro/1[0-3]*.js   # only these
-#   scripts/vs-maglev.sh --asm FILE FN       # both disassemblies of one function's last compile
+#   scripts/vs-maglev.sh --asm FILE FN [V8FN]   # both disassemblies of one function's last compile
+#                                            # (FN: `name` or `name:line:col`; V8FN: Maglev's, e.g. `Steps.add`)
 #   scripts/vs-maglev.sh --pieces [--record] [FILES]   # toi's final code per stencil and per task
 #
 # toi: `TOI_JIT_LOG` lines, each compile's hot code, out-of-line code
@@ -24,9 +25,9 @@
 # Per function, both engines' *final* code: the last compile of each
 # entry, the function's own (toi `@0`, Maglev `+`) and on-stack
 # replacement (toi `@pc`, Maglev `o+`), summed. Functions are matched by
-# name: V8 names `X.prototype.m = function` `X.m`, toi `m`, so V8's names
-# are cut after their last `.`, and same-named functions are summed in
-# both. Both inline small callees: code a function inlines is in its
+# name and source position, `name:line:col` (both place a function at its
+# parameter list's `(`; V8 names `X.prototype.m = function` `X.m`, toi
+# `m`, so V8's names are cut after their last `.`). Both inline small callees: code a function inlines is in its
 # size, and a function that is only ever inlined has none of its own (one
 # engine may compile it alone and the other not: "same fns" compares just
 # the functions both compiled).
@@ -157,7 +158,7 @@ EOF
 fi
 
 if [[ ${1:-} == --asm ]]; then
-  file=${2:?file}; fn=${3:?function}
+  file=${2:?file}; fn=${3:?function}; v8fn=${4:-${fn%%:*}}
   dump=$(mktemp); trap 'rm -f "$dump"' EXIT
   TOI_JIT_DUMP=$dump TOI_JIT_DUMP_FN=$fn target/release/toi "$file" >/dev/null
   if [[ ! -s $dump ]]; then
@@ -167,8 +168,9 @@ if [[ ${1:-} == --asm ]]; then
   fi
   [[ -s $dump ]] && objdump -D -b binary -m i386:x86-64 -M intel --no-show-raw-insn "$dump" | sed -n '/<.data>:/,$p' | tail -n +2
   echo
-  # The last Maglev code object named `fn` or `X.fn`.
-  "$NODE" --max-opt=2 --single-threaded --print-maglev-code "$file" 2>&1 | awk -v fn="$fn" '
+  # The last Maglev code object named `v8fn` or `X.v8fn` (its printed code
+  # has no source position: name `X.m` to choose between several `m`).
+  "$NODE" --max-opt=2 --single-threaded --print-maglev-code "$file" 2>&1 | awk -v fn="$v8fn" '
     /^--- Disassembly: ---/ { inblk = 0 }
     /^kind = MAGLEV/ { kind = 1; next }
     kind && /^name = / { n = substr($0, 8); kind = 0
@@ -226,7 +228,7 @@ def maglev(f):
     r = subprocess.run([node, "--max-opt=2", "--single-threaded", "--logfile=/dev/null", "--perf-basic-prof", "--perf-basic-prof-only-functions",
                         f"--perf-basic-prof-path={out}", "-e", src, os.path.abspath(f)],
                        capture_output=True, text=True, timeout=600)
-    compiles, ids = [], collections.defaultdict(set)
+    compiles = []
     for m in os.listdir(out):
         path = os.path.join(out, m)
         for line in open(path):
@@ -238,12 +240,10 @@ def maglev(f):
                 if mm:
                     # (A script's top level has no name: toi's `<script>`.)
                     name = mm.group(3).rsplit(".", 1)[-1] or "<script>"
-                    ids[name].add(mm.group(4))
+                    name += ":" + ":".join(mm.group(4).rsplit(":", 2)[1:])
                     if mm.group(2) == "+":
                         compiles.append((name, "osr" if mm.group(1) else "entry", int(p[1], 16)))
         os.remove(path)
-    # Names V8 saw on more than one function (toi's log can't tell them apart).
-    compiles += [(name, "dup", 0) for name, where in ids.items() if len(where) > 1]
     return compiles
 
 def blob(f):
@@ -259,21 +259,20 @@ for n, f in enumerate(files, 1):
     print(f"\r{n}/{len(files)} {os.path.basename(f):40}", end="", file=sys.stderr, flush=True)
     b = os.path.basename(f)[:-3]
     key = (v8, blob(f))
-    if remeasure or key not in cache:
+    # (Rows cached before functions had positions are measured again.)
+    if remeasure or key not in cache or not any(":" in c[0] for c in cache[key] if c[1] != "none"):
         cache[key] = maglev(f) or [("-", "none", 0)]
         added = True
-    dups = {c[0] for c in cache[key] if c[1] == "dup"}
     mfin, mall = final([c for c in cache[key] if c[1] in ("entry", "osr")])
     ok, (hfin, _), (cfin, call), (efin, _) = toi(f)
     names = sorted(set(mfin) | set(cfin), key=lambda k: -max(cfin[k], mfin[k]))
-    both = [k for k in names if k in mfin and k in cfin and k not in dups]
+    both = [k for k in names if k in mfin and k in cfin]
     s = lambda c, ks: sum(c[k] for k in ks)
     rows.append(dict(bench=b, ok=ok,
         toi_hot=sum(hfin.values()), toi_code=sum(cfin.values()), toi_exits=sum(efin.values()),
         maglev=sum(mfin.values()), both_code=s(cfin, both), both_maglev=s(mfin, both),
-        ambiguous=len(dups & (set(mfin) | set(cfin))), toi_all=sum(call.values()), maglev_all=sum(mall.values())))
-    details[b] = [(k + (" (several)" if k in dups else ""), hfin.get(k), cfin.get(k), efin.get(k), mfin.get(k))
-                  for k in names]
+        toi_all=sum(call.values()), maglev_all=sum(mall.values())))
+    details[b] = [(k, hfin.get(k), cfin.get(k), efin.get(k), mfin.get(k)) for k in names]
 print(file=sys.stderr)
 if added:
     with open(cache_path, "w") as out:
@@ -290,12 +289,11 @@ lines = [f"toi {commit} against Maglev (V8 {v8}, `--max-opt=2`): final machine c
          "toi hot: just the hot part; exits apart (Maglev's: a 4-byte call each, the frame in metadata). "
          "Ratios toi/Maglev (above 1: toi's is larger). Code a function inlines counts in it, and Maglev often "
          "also compiles on their own functions toi only inlines (see the per-function tables). \"same fns\": "
-         "toi/M over just the functions both compiled on their own, by name, but for names several functions "
-         "share (\"dup\": toi's log names functions without their class). \"all\": every compile's toi code, "
-         "recompiles included.", "",
-         "| benchmark | toi | toi hot | exits | Maglev | toi/M | hot/M | +exits/M | same fns toi/M | dup | toi all | Maglev all |",
-         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
-keys = ["bench", "ok", "toi_code", "toi_hot", "toi_exits", "maglev", "both_code", "both_maglev", "ambiguous",
+         "toi/M over just the functions both compiled on their own (matched by `name:line:col`). \"all\": "
+         "every compile's toi code, recompiles included.", "",
+         "| benchmark | toi | toi hot | exits | Maglev | toi/M | hot/M | +exits/M | same fns toi/M | toi all | Maglev all |",
+         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+keys = ["bench", "ok", "toi_code", "toi_hot", "toi_exits", "maglev", "both_code", "both_maglev",
         "toi_all", "maglev_all"]
 tsv = ["\t".join(keys)]
 for r in rows:
@@ -303,7 +301,7 @@ for r in rows:
     lines.append(f"| {r['bench']}{flag} | {num(r['toi_code'])} | {num(r['toi_hot'])} | {num(r['toi_exits'])} | "
                  f"{num(r['maglev'])} | {ratio(r['toi_code'], r['maglev'])} | {ratio(r['toi_hot'], r['maglev'])} | "
                  f"{ratio(r['toi_code'] + r['toi_exits'], r['maglev'])} | {ratio(r['both_code'], r['both_maglev'])} | "
-                 f"{num(r['ambiguous'])} | {num(r['toi_all'])} | {num(r['maglev_all'])} |")
+                 f"{num(r['toi_all'])} | {num(r['maglev_all'])} |")
     tsv.append("\t".join(str(r[k]) for k in keys))
 for r in rows:
     r["toi_code_exits"] = r["toi_code"] + r["toi_exits"]

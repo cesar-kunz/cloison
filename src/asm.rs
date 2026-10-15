@@ -58,6 +58,11 @@ pub struct FunctionDef {
     /// Nested functions use some of its variables (they stay in its
     /// registers, which its closures' upvalues point to until it returns).
     pub captures: bool,
+    /// Where it starts in its source (its parameter list's `(`), 1-based
+    /// line and column, for `TOI_JIT_LOG` and `TOI_JIT_DUMP_FN`: (0, 0)
+    /// if unknown or neither is set (see `codegen::positions`).
+    pub line: u32,
+    pub col: u32,
     /// Not compiled yet: compiled from its source at its first call (its
     /// `code` the one `CompileLazy`; `name`, `nparams` and `upvalues` as
     /// compiled).
@@ -362,6 +367,8 @@ pub fn parse(src: &str) -> Result<Module, String> {
             handlers: Vec::new(),
             upvalues: Vec::new(),
             captures: false,
+            line: 0,
+            col: 0,
             lazy: None,
         });
     }

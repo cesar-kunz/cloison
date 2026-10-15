@@ -6,6 +6,7 @@
 #   scripts/vs-maglev.sh                     # every file; table in perf-history/vs-maglev-<commit>.md
 #   scripts/vs-maglev.sh bench/micro/1[0-3]*.js   # only these
 #   scripts/vs-maglev.sh --asm FILE FN       # both disassemblies of one function's last compile
+#   scripts/vs-maglev.sh --pieces [--record] [FILES]   # toi's final code per stencil and per task
 #
 # toi: `TOI_JIT_LOG` lines, each compile's hot code, out-of-line code
 # (edge stubs, slow-path helpers, runtime-call wrappers) and exits (stubs
@@ -41,6 +42,119 @@ cd "$(dirname "$0")/.."
 NODE=${NODE:-$(ls -d ~/.local/share/toi-v8/node-*/bin/node 2>/dev/null | tail -1)}
 [[ -x $NODE ]] || { echo "no Node 26: run scripts/tiers.sh once, or set NODE" >&2; exit 1; }
 cargo build --release --quiet --bin toi
+
+# `--pieces`: toi's final code (as below: each function's last compile
+# per entry) per stencil family, hot, out-of-line and exits apart
+# (`TOI_JIT_LOG=pieces`), summed over the files, and per task of
+# docs/maglev-size-tasks.md (the families each task shrinks). Table in
+# perf-history/pieces-<commit>.md; `--record` appends the task totals to
+# bench/maglev-tasks.tsv (`commit<TAB>task<TAB>bytes`) and every run shows
+# the change since the last record.
+if [[ ${1:-} == --pieces ]]; then
+  shift
+  record=false
+  if [[ ${1:-} == --record ]]; then
+    record=true
+    shift
+  fi
+  commit=$(git rev-parse --short HEAD)
+  git diff --quiet HEAD -- src stencils build.rs .cargo || commit="$commit+"
+  files=("$@")
+  [[ ${#files[@]} -gt 0 ]] || files=(bench/micro/*.js)
+  mkdir -p perf-history
+  python3 - "$commit" "$record" "${files[@]}" <<'EOF'
+import collections, os, re, subprocess, sys
+
+commit, record, *files = sys.argv[1:]
+# The families each task shrinks (docs/maglev-size-tasks.md), by kind of
+# code; S5 and S8 (encodings) touch every family.
+TASKS = [
+    ("S1 push", "hot|ool", r"array_push|wrapper:toi_rt_array_push"),
+    ("S2 calls", "hot|ool", r"direct_call|call_done|check_callee|callee_jne|construct_direct|call_rt|wrapper:toi_rt_enter"),
+    ("S3 entry clearing", "hot|ool", r"words_jne|clear|copy_word|zero"),
+    ("S4 truthiness", "hot|ool", r"jtofalse|jtotrue|wrapper:toi_rt_to_boolean"),
+    ("S6 stores", "hot|ool", r"set_own|set_tr"),
+    ("S7 allocation", "hot|ool", r"create_object|create_array|wrapper:toi_rt_create_(object|array)"),
+    ("S9 cell guards", "hot|ool", r"guard_word"),
+    ("S10 heap-object checks", "hot|ool", r"guard_cell|check_acc_shape"),
+    ("S11 untyped ===", "hot|ool", r"teq_j[tf]|wrapper:toi_rt_loose_eq"),
+    ("S12 moves", "hot|ool", r"star|ldar|spill|lda_constant|mov"),
+    ("S13 keyed loads", "hot|ool", r"get_keyed_i_sh"),
+    ("C1 exits", "exit", r".*"),
+]
+
+def family(name):
+    """A stencil's name without its register variant (`spill_g1`, `get_own_nc_g0_to_g1`)."""
+    if name.startswith("wrapper:"):
+        return name
+    slow = name.endswith("__slow")
+    name = re.sub(r"__slow$", "", name)
+    name = re.sub(r"_[gumfs]\d+.*$", "", name)
+    name = re.sub(r"_[gumfs]$", "", name)
+    return name + ("__slow" if slow else "")
+
+total = collections.Counter()   # (kind, family) -> bytes
+sites = collections.Counter()
+for n, f in enumerate(files, 1):
+    print(f"\r{n}/{len(files)} {os.path.basename(f):40}", end="", file=sys.stderr, flush=True)
+    r = subprocess.run(["target/release/toi", f], capture_output=True, text=True,
+                       env={**os.environ, "TOI_JIT_LOG": "pieces"}, timeout=600)
+    last, pending = {}, None
+    for line in r.stderr.splitlines():
+        if line.startswith("pieces "):
+            pending = re.findall(r"(\w+):(\S+)=(\d+)/(\d+)", line)
+        elif line.startswith("jit ") and pending is not None:
+            m = re.match(r"jit (\S*) @(\d+)", line)
+            last[(m.group(1), m.group(2) == "0")] = pending
+            pending = None
+    for ps in last.values():
+        for kind, name, b, k in ps:
+            total[(kind, family(name))] += int(b)
+            sites[(kind, family(name))] += int(k)
+print(file=sys.stderr)
+
+kinds = ["hot", "ool", "exit"]
+sums = {k: sum(v for (kk, _), v in total.items() if kk == k) for k in kinds}
+tasks = []
+for task, ks, pat in TASKS:
+    b = sum(v for (k, fam), v in total.items() if re.fullmatch(ks, k) and re.match(pat, fam))
+    tasks.append((task, b))
+rows = [("all.hot", sums["hot"]), ("all.ool", sums["ool"]), ("all.exits", sums["exit"])] + tasks
+
+tsv = "bench/maglev-tasks.tsv"
+last = None
+if os.path.exists(tsv):
+    recs = [l.rstrip("\n").split("\t") for l in open(tsv)][1:]
+    prev = [r[0] for r in recs if r[0] != commit]
+    if prev:
+        last = {r[1]: int(r[2]) for r in recs if r[0] == prev[-1]}
+        last_commit = prev[-1]
+lines = [f"toi {commit}: final code per task of docs/maglev-size-tasks.md, bytes over {len(files)} files "
+         f"(`scripts/vs-maglev.sh --pieces`)" + (f", change since {last_commit}" if last else ""), "",
+         "| task | bytes | before | change |", "|---|---:|---:|---:|"]
+for t, b in rows:
+    before = last.get(t) if last else None
+    ch = f"{100 * (b - before) / before:+.1f}%" if before else ""
+    lines.append(f"| {t} | {b:,} | {'' if before is None else f'{before:,}'} | {ch} |")
+lines += ["", "**Per stencil family** (bytes / pieces; largest first)", "",
+          "| family | hot | ool | exits |", "|---|---:|---:|---:|"]
+fams = sorted({fam for _, fam in total}, key=lambda fam: -sum(total[(k, fam)] for k in kinds))
+cell = lambda k, fam: f"{total[(k, fam)]:,} / {sites[(k, fam)]}" if total[(k, fam)] else ""
+lines += [f"| {fam} | {cell('hot', fam)} | {cell('ool', fam)} | {cell('exit', fam)} |" for fam in fams]
+out = f"perf-history/pieces-{commit}.md"
+open(out, "w").write("\n".join(lines) + "\n")
+print("\n".join(lines[:len(rows) + 4]))
+print(f"families in {out}")
+if record == "true":
+    with open(tsv, "a") as o:
+        if not os.path.exists(tsv) or os.path.getsize(tsv) == 0:
+            o.write("commit\ttask\tbytes\n")
+        for t, b in rows:
+            o.write(f"{commit}\t{t}\t{b}\n")
+    print(f"recorded {commit} in {tsv}")
+EOF
+  exit
+fi
 
 if [[ ${1:-} == --asm ]]; then
   file=${2:?file}; fn=${3:?function}

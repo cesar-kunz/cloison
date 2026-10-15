@@ -79,7 +79,12 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   disassemblies of one function. Maglev's sizes are cached by Node
   version and file contents. Functions are matched by name, so a file
   whose hot functions have names of their own compares best (toi's log
-  names `X.prototype.m` just `m`).
+  names `X.prototype.m` just `m`). `--pieces` breaks toi's final code down
+  per stencil family and per task of
+  [docs/maglev-size-tasks.md](../docs/maglev-size-tasks.md);
+  `--pieces --record` appends the task totals to
+  [maglev-tasks.tsv](maglev-tasks.tsv), by commit, and every run shows the
+  change since the last record.
 
 - `scripts/jit-profile.sh <listing>` profiles where compiled code spends
   its cycles, per stencil piece (`TOI_PERF_MAP=1` makes the JIT name

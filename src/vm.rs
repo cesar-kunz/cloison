@@ -447,6 +447,10 @@ impl Code {
     /// starts a full marking, which frees dead code, when code grows (see
     /// `gc::code_bytes`).
     pub(crate) fn footprint(&self) -> usize {
+        // (A native's never dies, so it isn't room for code that may.)
+        if self.native.is_some() {
+            return 0;
+        }
         size_of::<Code>()
             + self.bytecode.len()
             + self.ic_names.len() * size_of::<Atom>()
@@ -1614,12 +1618,18 @@ impl Vm {
         if let Some(v) = e.1
             && crate::props::is_object(v)
         {
-            let name = self.get(v, self.a_name).unwrap_or(Value::UNDEFINED);
-            let a_message = self.intern("message");
-            let message = self.get(v, a_message).unwrap_or(Value::UNDEFINED);
-            if !name.is_undefined() || !message.is_undefined() {
-                let (n, m) = (display(name), display(message));
-                return if m.is_empty() { n } else { format!("{n}: {m}") };
+            // The run is over: its `toString` can run at the stack's base.
+            // (The conversion reaches the VM through `interp::current_vm`,
+            // not `self`: the stores must not move across it.)
+            let vm: *mut Vm = self;
+            unsafe {
+                let saved = (*vm).native_top;
+                std::ptr::write_volatile(&raw mut (*vm).native_top, (*vm).stack.as_mut_ptr());
+                let s = crate::interp::to_string_units(v);
+                std::ptr::write_volatile(&raw mut (*vm).native_top, saved);
+                std::ptr::write_volatile(&raw mut (*vm).conv_error, None);
+                std::ptr::write_volatile(&raw mut (*vm).conv_thrown, false);
+                return String::from_utf16_lossy(&s);
             }
         }
         e.0.clone()
@@ -1883,7 +1893,18 @@ impl Vm {
     pub(crate) fn read_only(&self, o: *mut Object, name: Atom) -> bool {
         match self.lookup(o, name) {
             Some((h, slot)) => unsafe { (&(*(*h).shape).attrs)[slot as usize] & READ_ONLY != 0 },
-            None => false,
+            // A function's `length` and `name`, and a string object's
+            // `length`, have no slot (see `props`) and are read-only.
+            None => unsafe {
+                match (*o).class {
+                    Class::Function | Class::Native => {
+                        name == self.a_length && (*o).flags & crate::object::FN_LENGTH_DELETED == 0
+                            || name == self.a_name && (*o).flags & crate::object::FN_NAME_DELETED == 0
+                    }
+                    Class::Wrapper => name == self.a_length && string_units(wrapped(object_value(o)).unwrap()).is_some(),
+                    _ => false,
+                }
+            },
         }
     }
 

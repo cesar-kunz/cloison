@@ -18,6 +18,7 @@ pub mod asm;
 mod builtins;
 mod array;
 mod date;
+mod json;
 pub mod props;
 pub mod regexp;
 pub mod bytecode;

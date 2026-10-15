@@ -56,8 +56,41 @@ pub(crate) fn install(vm: &mut Vm) {
             ("concat", string_concat, 1),
             ("toString", string_to_string, 0),
             ("valueOf", string_to_string, 0),
+            ("localeCompare", string_locale_compare, 1),
+            ("startsWith", string_starts_with, 1),
+            ("endsWith", string_ends_with, 1),
+            ("includes", string_includes, 1),
+            ("repeat", string_repeat, 1),
+            ("padStart", string_pad_start, 1),
+            ("padEnd", string_pad_end, 1),
+            ("trimStart", string_trim_start, 0),
+            ("trimEnd", string_trim_end, 0),
+            ("codePointAt", string_code_point_at, 1),
+            ("at", string_at, 1),
+            ("normalize", string_normalize, 0),
+            ("anchor", string_html::<0>, 1),
+            ("big", string_html::<1>, 0),
+            ("blink", string_html::<2>, 0),
+            ("bold", string_html::<3>, 0),
+            ("fixed", string_html::<4>, 0),
+            ("fontcolor", string_html::<5>, 1),
+            ("fontsize", string_html::<6>, 1),
+            ("italics", string_html::<7>, 0),
+            ("link", string_html::<8>, 1),
+            ("small", string_html::<9>, 0),
+            ("strike", string_html::<10>, 0),
+            ("sub", string_html::<11>, 0),
+            ("sup", string_html::<12>, 0),
         ],
     );
+    vm.define_native(string, "fromCodePoint", string_from_code_point, 1, any, false);
+    let a_trim_left = vm.intern("trimLeft");
+    let a_trim_right = vm.intern("trimRight");
+    let a_trim_start = vm.intern("trimStart");
+    let a_trim_end = vm.intern("trimEnd");
+    let (ts, te) = (vm.get(object_value(sp), a_trim_start).unwrap(), vm.get(object_value(sp), a_trim_end).unwrap());
+    vm.add_property_with(sp, a_trim_left, ts, DONT_ENUM);
+    vm.add_property_with(sp, a_trim_right, te, DONT_ENUM);
 
     let fp = vm.function_prototype;
     let function = vm.define_native(g, "Function", function_ctor, 1, any, true);
@@ -117,8 +150,26 @@ pub(crate) fn install(vm: &mut Vm) {
             ("asin", math_asin, 1),
             ("acos", math_acos, 1),
             ("imul", math_imul, 2),
+            ("cbrt", math_cbrt, 1),
+            ("clz32", math_clz32, 1),
+            ("cosh", math_cosh, 1),
+            ("sinh", math_sinh, 1),
+            ("tanh", math_tanh, 1),
+            ("acosh", math_acosh, 1),
+            ("asinh", math_asinh, 1),
+            ("atanh", math_atanh, 1),
+            ("expm1", math_expm1, 1),
+            ("log1p", math_log1p, 1),
+            ("log2", math_log2, 1),
+            ("log10", math_log10, 1),
+            ("sign", math_sign, 1),
+            ("trunc", math_trunc, 1),
+            ("fround", math_fround, 1),
+            ("hypot", math_hypot, 2),
         ],
     );
+    let a = vm.intern("SQRT1_2");
+    vm.add_property_with(math, a, Value::from_f64(std::f64::consts::FRAC_1_SQRT_2), READ_ONLY | DONT_ENUM | DONT_DELETE);
 
     vm.define_natives(
         g,
@@ -140,11 +191,7 @@ pub(crate) fn install(vm: &mut Vm) {
     install_typed_arrays(vm);
     install_regexps(vm);
 
-    let json = vm.new_object(object_value(op));
-    let a_json = vm.intern("JSON");
-    vm.add_property_with(g, a_json, object_value(json), DONT_ENUM);
-    vm.define_native(json, "stringify", json_stringify, 3, any, false);
-    vm.define_native(json, "parse", json_parse, 2, any, false);
+    crate::json::install(vm);
 
     // `Error` and its kinds, each prototype inheriting `Error.prototype`.
     const CTORS: [NativeFn; 7] = [
@@ -389,6 +436,199 @@ fn string_trim(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(string(vm, &u[s..e]))
 }
 
+fn string_trim_start(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let s = u.iter().position(|&c| !is_space(c)).unwrap_or(u.len());
+    Ok(string(vm, &u[s..]))
+}
+
+fn string_trim_end(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let e = u.iter().rposition(|&c| !is_space(c)).map_or(0, |e| e + 1);
+    Ok(string(vm, &u[..e]))
+}
+
+/// `localeCompare(that)`: by code units (no locales).
+fn string_locale_compare(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let v = units(arg(a, 0));
+    Ok(Value::from_i32(match u.cmp(&v) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }))
+}
+
+/// The search string of `startsWith` and the like: a `TypeError` for a
+/// regular expression.
+fn search_string<'a>(v: Value, what: &str) -> Result<Cow<'a, [u16]>> {
+    if regexp_of(v).is_some() {
+        return Err(Error::type_error(format!("First argument to String.prototype.{what} must not be a regular expression")));
+    }
+    Ok(units(v))
+}
+
+fn string_starts_with(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let s = search_string(arg(a, 0), "startsWith")?;
+    let at = int_arg(a, 1).clamp(0.0, u.len() as f64) as usize;
+    Ok(Value::from_bool(u[at..].starts_with(&s)))
+}
+
+fn string_ends_with(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let s = search_string(arg(a, 0), "endsWith")?;
+    let end = match a.get(1) {
+        Some(v) if !v.is_undefined() => int_arg(a, 1).clamp(0.0, u.len() as f64) as usize,
+        _ => u.len(),
+    };
+    Ok(Value::from_bool(u[..end].ends_with(&s)))
+}
+
+fn string_includes(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let s = search_string(arg(a, 0), "includes")?;
+    let at = int_arg(a, 1).clamp(0.0, u.len() as f64) as usize;
+    Ok(Value::from_bool(find(&u, &s, at).is_some()))
+}
+
+fn string_repeat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let n = int_arg(a, 0);
+    if n < 0.0 || n == f64::INFINITY {
+        return Err(Error::range_error("Invalid count value"));
+    }
+    if n * u.len() as f64 > (1u64 << 30) as f64 {
+        return Err(Error::range_error("Invalid string length"));
+    }
+    Ok(vm.new_string(&u.repeat(n as usize)))
+}
+
+/// `padStart` (`start`) and `padEnd`.
+fn pad(vm: &mut Vm, this: Value, a: &[Value], start: bool) -> Result<Value> {
+    let u = this_units(this)?;
+    let max = int_arg(a, 0);
+    if max <= u.len() as f64 {
+        return Ok(this_string(vm, this, &u));
+    }
+    let filler = match a.get(1) {
+        Some(v) if !v.is_undefined() => units(*v).into_owned(),
+        _ => vec![b' ' as u16],
+    };
+    if filler.is_empty() {
+        return Ok(this_string(vm, this, &u));
+    }
+    if max > (1u64 << 30) as f64 {
+        return Err(Error::range_error("Invalid string length"));
+    }
+    let fill_len = max as usize - u.len();
+    let mut f: Vec<u16> = filler.iter().cycle().take(fill_len).copied().collect();
+    let out = if start {
+        f.extend_from_slice(&u);
+        f
+    } else {
+        let mut o = u.into_owned();
+        o.extend(f);
+        o
+    };
+    Ok(vm.new_string(&out))
+}
+
+fn string_pad_start(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    pad(vm, this, a, true)
+}
+
+fn string_pad_end(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    pad(vm, this, a, false)
+}
+
+fn string_code_point_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let i = int_arg(a, 0);
+    if i < 0.0 || i >= u.len() as f64 {
+        return Ok(Value::UNDEFINED);
+    }
+    let i = i as usize;
+    let c = u[i];
+    if (0xD800..0xDC00).contains(&c) && i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]) {
+        let cp = 0x10000 + ((c as i32 - 0xD800) << 10) + (u[i + 1] as i32 - 0xDC00);
+        return Ok(Value::from_i32(cp));
+    }
+    Ok(Value::from_i32(c as i32))
+}
+
+fn string_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    let i = int_arg(a, 0);
+    let i = if i < 0.0 { u.len() as f64 + i } else { i };
+    if i < 0.0 || i >= u.len() as f64 {
+        return Ok(Value::UNDEFINED);
+    }
+    Ok(vm.single_char(u[i as usize]))
+}
+
+/// `normalize(form)`: the string itself (no normalization tables).
+fn string_normalize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    if let Some(f) = a.first().filter(|v| !v.is_undefined()) {
+        let f = String::from_utf16_lossy(&units(*f));
+        if !matches!(f.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+            return Err(Error::range_error("The normalization form should be one of NFC, NFD, NFKC, NFKD."));
+        }
+    }
+    Ok(this_string(vm, this, &u))
+}
+
+/// `String.fromCodePoint(…points)`.
+fn string_from_code_point(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let mut out = Vec::with_capacity(a.len());
+    for &v in a {
+        let d = to_number(v);
+        if d.fract() != 0.0 || !(0.0..=0x10FFFF as f64).contains(&d) {
+            return Err(Error::range_error(format!("Invalid code point {}", crate::vm::display(v))));
+        }
+        let cp = d as u32;
+        if cp >= 0x10000 {
+            let c = cp - 0x10000;
+            out.push(0xD800 + (c >> 10) as u16);
+            out.push(0xDC00 + (c & 0x3FF) as u16);
+        } else {
+            out.push(cp as u16);
+        }
+    }
+    Ok(string(vm, &out))
+}
+
+/// Annex B's HTML methods: `"<tag attr=\"value\">this</tag>"`.
+fn string_html<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    const TAGS: [(&str, &str); 13] = [
+        ("a", "name"),
+        ("big", ""),
+        ("blink", ""),
+        ("b", ""),
+        ("tt", ""),
+        ("font", "color"),
+        ("font", "size"),
+        ("i", ""),
+        ("a", "href"),
+        ("small", ""),
+        ("strike", ""),
+        ("sub", ""),
+        ("sup", ""),
+    ];
+    let u = this_units(this)?;
+    let (tag, attr) = TAGS[K];
+    let mut s = format!("<{tag}");
+    if !attr.is_empty() {
+        let v = String::from_utf16_lossy(&units(arg(a, 0))).replace('"', "&quot;");
+        s.push_str(&format!(" {attr}=\"{v}\""));
+    }
+    s.push('>');
+    s.push_str(&String::from_utf16_lossy(&u));
+    s.push_str(&format!("</{tag}>"));
+    Ok(str_value(vm, &s))
+}
+
 /// `split(sep, limit)` with a string separator (or none: the whole
 /// string; `""`: each code unit), or a regular expression (its captures
 /// spliced in).
@@ -628,7 +868,8 @@ fn boolean_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `Object.create(proto)`: a plain object with prototype `proto` (an
 /// object or `null`). (No property descriptors yet.)
 fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let Some(x) = this.as_number() else {
+    let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
+    let Some(x) = n.as_number() else {
         return Err(Error::type_error("Number.prototype.toExponential called on a non-number"));
     };
     if !x.is_finite() {
@@ -728,6 +969,73 @@ fn math_asin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 fn math_acos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(crate::math::acos(math_arg(a, 0))))
+}
+fn math_cbrt(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).cbrt()))
+}
+fn math_clz32(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_i32((crate::interp::to_int32(math_arg(a, 0)) as u32).leading_zeros() as i32))
+}
+fn math_cosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).cosh()))
+}
+fn math_sinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).sinh()))
+}
+fn math_tanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).tanh()))
+}
+fn math_acosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).acosh()))
+}
+fn math_asinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = math_arg(a, 0);
+    Ok(num(if x == 0.0 { x } else { x.asinh() }))
+}
+fn math_atanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = math_arg(a, 0);
+    Ok(num(if x == 0.0 { x } else { x.atanh() }))
+}
+fn math_expm1(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = math_arg(a, 0);
+    Ok(num(if x == 0.0 { x } else { x.exp_m1() }))
+}
+fn math_log1p(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = math_arg(a, 0);
+    Ok(num(if x == 0.0 { x } else { x.ln_1p() }))
+}
+fn math_log2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).log2()))
+}
+fn math_log10(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).log10()))
+}
+fn math_sign(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = math_arg(a, 0);
+    Ok(num(if x.is_nan() || x == 0.0 { x } else { x.signum() }))
+}
+fn math_trunc(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0).trunc()))
+}
+fn math_fround(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(math_arg(a, 0) as f32 as f64))
+}
+/// `Math.hypot(…values)`: every argument coerced first; infinity wins
+/// over NaN.
+fn math_hypot(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let xs: Vec<f64> = (0..a.len()).map(|i| math_arg(a, i)).collect();
+    if xs.iter().any(|x| x.is_infinite()) {
+        return Ok(num(f64::INFINITY));
+    }
+    if xs.iter().any(|x| x.is_nan()) {
+        return Ok(num(f64::NAN));
+    }
+    let max = xs.iter().fold(0.0f64, |m, &x| m.max(x.abs()));
+    if max == 0.0 {
+        return Ok(num(0.0));
+    }
+    let sum: f64 = xs.iter().map(|&x| (x / max) * (x / max)).sum();
+    Ok(num(sum.sqrt() * max))
 }
 fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = crate::interp::to_int32(math_arg(a, 0));
@@ -1275,295 +1583,6 @@ fn typed_byte_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 // ---- JSON ----
-
-/// `JSON.stringify(v)`: no replacer, `toJSON` or indentation; `undefined`
-/// (also for a function).
-fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    if a.len() > 1 && !(arg(a, 1).is_undefined() && arg(a, 2).is_undefined()) {
-        return Err(Error::unsupported("JSON.stringify with a replacer or indentation"));
-    }
-    let mut out = Vec::new();
-    let mut stack = Vec::new();
-    if !json_value(vm, arg(a, 0), &mut out, &mut stack)? {
-        return Ok(Value::UNDEFINED);
-    }
-    Ok(vm.new_string(&out))
-}
-
-/// `v` as JSON appended to `out`; false if it has none (`undefined`, a
-/// function).
-fn json_value(vm: &mut Vm, v: Value, out: &mut Vec<u16>, stack: &mut Vec<u64>) -> Result<bool> {
-    let push = |out: &mut Vec<u16>, s: &str| out.extend(s.encode_utf16());
-    if v.is_undefined() {
-        return Ok(false);
-    }
-    if v.is_null() {
-        push(out, "null");
-        return Ok(true);
-    }
-    if v.is_bool() {
-        push(out, if v == Value::TRUE { "true" } else { "false" });
-        return Ok(true);
-    }
-    if let Some(d) = v.as_number() {
-        push(out, &if d.is_finite() { crate::vm::display(v) } else { "null".into() });
-        return Ok(true);
-    }
-    if let Some(u) = string_units(v) {
-        json_quote(u, out);
-        return Ok(true);
-    }
-    let o = as_object(v);
-    let class = unsafe { (*o).class };
-    if matches!(class, Class::Function | Class::Native) {
-        return Ok(false);
-    }
-    if let Some(p) = wrapped(v) {
-        // A wrapper: its primitive (a number's and a string's through
-        // conversion, which may call user code).
-        let p = if p.is_number() {
-            Value::number(to_number(v))
-        } else if p.is_bool() {
-            p
-        } else {
-            let u = to_string_units(v);
-            vm.new_string(&u)
-        };
-        return json_value(vm, p, out, stack);
-    }
-    if stack.contains(&v.to_bits()) {
-        return Err(Error::type_error("Converting circular structure to JSON"));
-    }
-    stack.push(v.to_bits());
-    if class == Class::Array {
-        out.push(b'[' as u16);
-        let n = unsafe { (*o).elems_len } as usize;
-        for i in 0..n {
-            if i > 0 {
-                out.push(b',' as u16);
-            }
-            let e = vm.get_keyed(v, Value::from_i32(i as i32))?;
-            if !json_value(vm, e, out, stack)? {
-                push(out, "null");
-            }
-        }
-        out.push(b']' as u16);
-    } else {
-        out.push(b'{' as u16);
-        let mut first = true;
-        let mut keys: Vec<(Vec<u16>, Value)> = Vec::new();
-        unsafe {
-            for i in 0..(*o).elems_len as usize {
-                if Vm::has_element(o, i as u32) {
-                    let e = vm.get_keyed(v, Value::from_i32(i as i32))?;
-                    keys.push((i.to_string().encode_utf16().collect(), e));
-                }
-            }
-            let s = &*(*o).shape;
-            let names: Vec<_> = s
-                .keys
-                .iter()
-                .enumerate()
-                .filter(|&(k, _)| s.attrs[k] & DONT_ENUM == 0)
-                .map(|(_, &n)| n)
-                .collect();
-            for n in names {
-                let e = vm.get(v, n)?;
-                keys.push((vm.atom_name(n).encode_utf16().collect(), e));
-            }
-        }
-        for (k, e) in keys {
-            let mark = out.len();
-            if !first {
-                out.push(b',' as u16);
-            }
-            json_quote(&k, out);
-            out.push(b':' as u16);
-            if json_value(vm, e, out, stack)? {
-                first = false;
-            } else {
-                out.truncate(mark);
-            }
-        }
-        out.push(b'}' as u16);
-    }
-    stack.pop();
-    Ok(true)
-}
-
-fn json_quote(u: &[u16], out: &mut Vec<u16>) {
-    out.push(b'"' as u16);
-    for &c in u {
-        let esc = match c {
-            0x22 => Some("\\\""),
-            0x5C => Some("\\\\"),
-            0x08 => Some("\\b"),
-            0x0C => Some("\\f"),
-            0x0A => Some("\\n"),
-            0x0D => Some("\\r"),
-            0x09 => Some("\\t"),
-            _ => None,
-        };
-        match esc {
-            Some(e) => out.extend(e.encode_utf16()),
-            None if c < 0x20 || (0xD800..0xE000).contains(&c) => {
-                out.extend(format!("\\u{c:04x}").encode_utf16())
-            }
-            None => out.push(c),
-        }
-    }
-    out.push(b'"' as u16);
-}
-
-/// `JSON.parse(text)` (no reviver).
-fn json_parse(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let u = units(arg(a, 0)).into_owned();
-    let mut p = JsonParser { u: &u, i: 0 };
-    let v = p.value(vm)?;
-    p.space();
-    if p.i != u.len() {
-        return Err(p.error());
-    }
-    Ok(v)
-}
-
-struct JsonParser<'a> {
-    u: &'a [u16],
-    i: usize,
-}
-
-impl JsonParser<'_> {
-    fn error(&self) -> Error {
-        Error::new_syntax(format!("Unexpected token in JSON at position {}", self.i))
-    }
-    fn space(&mut self) {
-        while self.i < self.u.len() && matches!(self.u[self.i], 0x20 | 0x09 | 0x0A | 0x0D) {
-            self.i += 1;
-        }
-    }
-    fn peek(&self) -> Option<u16> {
-        self.u.get(self.i).copied()
-    }
-    fn eat(&mut self, c: u8) -> bool {
-        self.space();
-        if self.peek() == Some(c as u16) {
-            self.i += 1;
-            true
-        } else {
-            false
-        }
-    }
-    fn word(&mut self, w: &str, v: Value) -> Result<Value> {
-        let w: Vec<u16> = w.encode_utf16().collect();
-        if self.u[self.i..].starts_with(&w) {
-            self.i += w.len();
-            Ok(v)
-        } else {
-            Err(self.error())
-        }
-    }
-    fn value(&mut self, vm: &mut Vm) -> Result<Value> {
-        self.space();
-        match self.peek().map(|c| c as u8 as char) {
-            Some('{') => {
-                self.i += 1;
-                let o = object_value(vm.new_object(object_value(vm.object_prototype)));
-                if self.eat(b'}') {
-                    return Ok(o);
-                }
-                loop {
-                    self.space();
-                    let k = self.string()?;
-                    if !self.eat(b':') {
-                        return Err(self.error());
-                    }
-                    let v = self.value(vm)?;
-                    let key = vm.new_string(&k);
-                    vm.set_keyed(o, key, v)?;
-                    if self.eat(b'}') {
-                        return Ok(o);
-                    }
-                    if !self.eat(b',') {
-                        return Err(self.error());
-                    }
-                }
-            }
-            Some('[') => {
-                self.i += 1;
-                let mut elems = Vec::new();
-                if !self.eat(b']') {
-                    loop {
-                        elems.push(self.value(vm)?);
-                        if self.eat(b']') {
-                            break;
-                        }
-                        if !self.eat(b',') {
-                            return Err(self.error());
-                        }
-                    }
-                }
-                let arr = vm.new_array();
-                crate::vm::array_push(vm, arr, &elems)?;
-                Ok(arr)
-            }
-            Some('"') => {
-                let s = self.string()?;
-                Ok(vm.new_string(&s))
-            }
-            Some('t') => self.word("true", Value::TRUE),
-            Some('f') => self.word("false", Value::FALSE),
-            Some('n') => self.word("null", Value::NULL),
-            Some('-' | '0'..='9') => {
-                let start = self.i;
-                while self.i < self.u.len()
-                    && matches!(self.u[self.i] as u8 as char, '-' | '+' | '.' | 'e' | 'E' | '0'..='9')
-                    && self.u[self.i] < 128
-                {
-                    self.i += 1;
-                }
-                let s = String::from_utf16_lossy(&self.u[start..self.i]);
-                s.parse::<f64>().map(num).map_err(|_| self.error())
-            }
-            _ => Err(self.error()),
-        }
-    }
-    fn string(&mut self) -> Result<Vec<u16>> {
-        if self.peek() != Some(b'"' as u16) {
-            return Err(self.error());
-        }
-        self.i += 1;
-        let mut out = Vec::new();
-        loop {
-            let Some(c) = self.peek() else { return Err(self.error()) };
-            self.i += 1;
-            match c {
-                0x22 => return Ok(out),
-                0x5C => {
-                    let Some(e) = self.peek() else { return Err(self.error()) };
-                    self.i += 1;
-                    out.push(match e as u8 {
-                        b'"' => 0x22,
-                        b'\\' => 0x5C,
-                        b'/' => 0x2F,
-                        b'b' => 0x08,
-                        b'f' => 0x0C,
-                        b'n' => 0x0A,
-                        b'r' => 0x0D,
-                        b't' => 0x09,
-                        b'u' => {
-                            let h = self.u.get(self.i..self.i + 4).ok_or_else(|| self.error())?;
-                            let s = String::from_utf16_lossy(h);
-                            self.i += 4;
-                            u16::from_str_radix(&s, 16).map_err(|_| self.error())?
-                        }
-                        _ => return Err(self.error()),
-                    });
-                }
-                _ => out.push(c),
-            }
-        }
-    }
-}
 
 // ---- Regular expressions ----
 

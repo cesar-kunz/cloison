@@ -8734,6 +8734,37 @@ impl JitCode {
                 .unwrap();
             f.write_all(map.as_bytes()).unwrap();
         }
+        // Sizes: with `TOI_JIT_LOG=pieces`, the bytes and pieces of each
+        // stencil in this code, hot, out-of-line and exits apart, on a line
+        // before the compile's `jit` line (`scripts/vs-maglev.sh --pieces`).
+        if std::env::var_os("TOI_JIT_LOG").is_some_and(|v| v == "pieces") {
+            let mut sizes: std::collections::BTreeMap<(&str, String), (usize, usize)> = Default::default();
+            let mut add = |kind: &'static str, name: String, len: usize| {
+                if len > 0 {
+                    let e = sizes.entry((kind, name)).or_default();
+                    *e = (e.0 + len, e.1 + 1);
+                }
+            };
+            let name = |p: &Piece| if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
+            for p in &hot {
+                add("hot", name(p).to_string(), p.len());
+            }
+            for p in stubs.iter().flatten() {
+                add("ool", name(p).to_string(), p.len());
+            }
+            for &(_, h, _) in &helper_list {
+                add("ool", h.stencil().name.to_string(), h.stencil().code.len());
+            }
+            for (_, code, n) in &wrappers {
+                add("ool", format!("wrapper:{n}"), code.len());
+            }
+            for p in exits.iter().flat_map(|(_, s)| s) {
+                add("exit", name(p).to_string(), p.len());
+            }
+            let list: Vec<String> =
+                sizes.iter().map(|((kind, n), (len, k))| format!("{kind}:{n}={len}/{k}")).collect();
+            eprintln!("pieces {}", list.join(" "));
+        }
 
         let resolve = |t: Target, next: usize| match t {
             Target::Next => next,

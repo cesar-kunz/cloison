@@ -309,6 +309,9 @@ pub struct FieldCell {
     /// the functions whose code did are in `Vm::field_deps`, keyed by the
     /// cell's address; generalizing it makes them recompile, and no other.
     relied: Cell<bool>,
+    /// It went from `Int` to `Num` and may still hold int32s in objects'
+    /// own memory, until `Vm::int_fields_to_doubles` (see `FieldType::Num`).
+    ints: Cell<bool>,
 }
 
 thread_local! {
@@ -324,7 +327,17 @@ impl FieldCell {
             mutable: Cell::new(false),
             folded: Cell::new(false),
             relied: Cell::new(false),
+            ints: Cell::new(false),
         }
+    }
+
+    /// Whether objects may still hold int32s in the field (a `Num` one).
+    pub fn holds_ints(&self) -> bool {
+        self.ints.get()
+    }
+
+    pub(crate) fn set_ints(&self, ints: bool) {
+        self.ints.set(ints)
     }
 
     pub fn get(&self) -> FieldType {
@@ -382,7 +395,13 @@ pub enum FieldType {
     /// Nothing stored yet.
     None,
     Int,
-    /// A number: int32 or double.
+    /// A number, stored as a double, never an int32, so that compiled code
+    /// reads one in an object's own memory without a check (V8's double
+    /// fields, boxed the NaN way): every store converts int32s. A field that
+    /// was `Int` keeps its int32s until the JIT compiles such a load from
+    /// it (`FieldCell::holds_ints`); then those in objects' own memory
+    /// become doubles (`Vm::int_fields_to_doubles`). Out of line they may
+    /// stay, so loads from there check.
     Num,
     Obj(*const Shape),
     Any,

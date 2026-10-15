@@ -216,6 +216,17 @@ fn shrink_root(root: *const Shape) -> u32 {
     unsafe { (*root).capacity.get() }
 }
 
+/// `v` as stored in a field of type `ft`: in one typed `Num`, an int32 as
+/// a double (see `FieldType::Num`).
+#[inline(always)]
+pub(crate) fn as_field(ft: FieldType, v: Value) -> Value {
+    if ft == FieldType::Num && v.is_int32() {
+        Value::from_f64(v.as_i32_unchecked() as f64)
+    } else {
+        v
+    }
+}
+
 /// Cache `e` in the slot whose way 0 is at `ic`: in the way caching its
 /// shape if one does (it may be stale: a field generalized since, or a
 /// prototype changed), else in the first free way. With every way taken
@@ -426,6 +437,9 @@ pub struct Vm {
     atoms: Vec<std::rc::Rc<str>>,
     atom_ids: HashMap<std::rc::Rc<str>, Atom>,
     pub(crate) codes: Vec<Box<Code>>,
+    /// Fields that went from `Int` to `Num` whose int32s haven't become
+    /// doubles yet (see `int_fields_to_doubles`).
+    int_fields: Vec<*const FieldCell>,
     /// The addresses of `codes`, to find them among a stack's words.
     pub(crate) code_set: crate::jit::HashSet<usize>,
     /// Codes found dead, freed once the sweep that frees their closures
@@ -614,6 +628,7 @@ impl Vm {
             atoms: Vec::new(),
             atom_ids: HashMap::default(),
             codes: Vec::new(),
+            int_fields: Vec::new(),
             code_set: Default::default(),
             condemned: Vec::new(),
             jit_caches: Default::default(),
@@ -1170,6 +1185,7 @@ impl Vm {
             let shape = &*(*o).shape;
             let cell = &*shape.fields[slot as usize];
             let at = Object::slot(o, shape.location(slot));
+            let value = as_field(cell.get(), value);
             // The common case, calling nothing: the type holds, and the
             // field isn't constant or a prototype's, or keeps its value.
             let unchanged = *at == value;
@@ -1195,10 +1211,17 @@ impl Vm {
             let new = old.join(FieldType::of(value));
             if new != old {
                 cell.set(new);
+                // Its int32s become doubles once compiled code would read
+                // them as such (`int_fields_to_doubles`).
+                if old == FieldType::Int && new == FieldType::Num {
+                    cell.set_ints(true);
+                    self.int_fields.push(cell);
+                }
                 if cell.take_relied() {
                     self.field_generalized(cell, old);
                 }
             }
+            let value = as_field(new, value);
             let at = Object::slot(o, shape.location(slot));
             // Constant while stores fill the field or store what it holds
             // (see `FieldCell`).
@@ -1233,6 +1256,91 @@ impl Vm {
             }
             for (caller, callee) in through.into_iter().flatten() {
                 unsafe { crate::jit::unbind_calls(caller as *const Code, callee as *const Code) };
+            }
+        }
+    }
+
+    /// The fields in `int_fields`, which went from `Int` to `Num`, hold
+    /// doubles only from here on in objects' own memory (see
+    /// `FieldType::Num`): their int32s there become doubles, in every
+    /// object in the heap, live or not, in one walk of it. Out of line
+    /// they stay: a dead object's `props` may be some other cell's by now.
+    /// The JIT calls this before it compiles a load that takes a double
+    /// from one of them.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn int_fields_to_doubles(&mut self) {
+        use crate::heap::{cell_size, meta, COLOR, GRANULE, YOUNG};
+        if self.int_fields.is_empty() {
+            return;
+        }
+        let cells: std::collections::HashSet<*const FieldCell> =
+            self.int_fields.drain(..).collect();
+        for &c in &cells {
+            unsafe { (*c).set_ints(false) };
+        }
+        // Stores the interpreter's caches took for the int32s the field
+        // held check for a number now (see `FieldType::encode`).
+        let int = FieldType::Int.encode() as *mut Object;
+        for code in &self.codes {
+            for ways in code.made_ics() {
+                for w in unsafe { &mut *ways.get() } {
+                    if w.holder != int || w.shape.is_null() {
+                        continue;
+                    }
+                    let s = unsafe { &*if w.new_shape.is_null() { w.shape } else { w.new_shape } };
+                    if (0..s.fields.len() as u32)
+                        .any(|i| cells.contains(&s.fields[i as usize]) && s.location(i) == w.loc)
+                    {
+                        w.holder = FieldType::Num.encode() as *mut Object;
+                    }
+                }
+            }
+        }
+        // Per shape, its slots of `cells` in objects' own memory, as offsets.
+        // (Objects of a shape mostly come together: the last one's first.)
+        let mut slots: HashMap<*const Shape, std::rc::Rc<[i32]>> = HashMap::default();
+        let mut last: (*const Shape, std::rc::Rc<[i32]>) = (std::ptr::null(), std::rc::Rc::from([]));
+        for (start, end) in self.heap.block_ranges() {
+            let mut p = start;
+            while p < end {
+                if unsafe { *meta(p) } & (YOUNG | COLOR) == 0 {
+                    // Free space: eight granules at a time while their
+                    // metadata is all 0.
+                    while p + 8 * GRANULE <= end
+                        && unsafe { (meta(p) as *const u64).read_unaligned() } == 0
+                    {
+                        p += 8 * GRANULE;
+                    }
+                    if p < end && unsafe { *meta(p) } & (YOUNG | COLOR) == 0 {
+                        p += GRANULE;
+                    }
+                    continue;
+                }
+                unsafe {
+                    if *(p as *const u64) & 1 == 0 {
+                        let o = p as *mut Object;
+                        let shape = (*o).shape;
+                        if shape != last.0 {
+                            let at = slots.entry(shape).or_insert_with(|| {
+                                let s = &*shape;
+                                (0..s.fields.len() as u32)
+                                    .filter(|&i| cells.contains(&s.fields[i as usize]))
+                                    .map(|i| s.location(i))
+                                    .filter(|&l| l >= 0)
+                                    .collect()
+                            });
+                            last = (shape, at.clone());
+                        }
+                        for &l in last.1.iter() {
+                            let v = Object::slot(o, l);
+                            if (*v).is_int32() {
+                                *v = Value::from_f64((*v).as_i32_unchecked() as f64);
+                            }
+                        }
+                    }
+                    p += cell_size(p as *const u8);
+                }
             }
         }
     }
@@ -1952,6 +2060,8 @@ impl Vm {
             (*o).shape = new;
             for (k, v) in values.into_iter().enumerate() {
                 let at = Object::slot(o, (*new).location(k as u32));
+                // (Out of line, a `Num` field may still hold an int32.)
+                let v = as_field((*new).field_type(k as u32), v);
                 *at = v;
                 crate::heap::barrier(o.cast(), at, v);
             }

@@ -2,7 +2,8 @@
 # Sizes to track across commits: the runtime (the release `toi` binary), the
 # stencil library it copies code from, and the code the JIT generates for
 # each listing in bench/bytecode/ (summed over every compile, from
-# `TOI_JIT_LOG`: hot code, and all of it with cold stubs and wrappers).
+# `TOI_JIT_LOG`: hot code, out-of-line code (edge stubs, slow-path helpers,
+# runtime-call wrappers), exits, and all of it).
 #
 #   scripts/sizes.sh            # print, with the change since the last record
 #   scripts/sizes.sh --record   # also append this commit's values to bench/sizes.tsv
@@ -30,16 +31,16 @@ rows+=("runtime.rodata $(section target/release/toi .rodata)")
 rows+=("runtime.data.rel.ro $(section target/release/toi .data.rel.ro)")
 # Each stencil is in a section of its own (`.text.toi_stencil_…`).
 rows+=("stencils.text $(size -A "$obj" | awk '$1 ~ /^\.text/ { t += $2 } END { print t }')")
-hot_all=0 total_all=0
+hot_all=0 ool_all=0 exits_all=0 total_all=0
 for f in bench/bytecode/*.asm; do
   name=$(basename "$f" .asm)
-  read -r hot total < <(TOI_JIT_LOG=1 target/release/toi "$f" 2>&1 >/dev/null |
-    sed -n 's/^jit .* (\([0-9]*\) hot, \([0-9]*\) bytes).*/\1 \2/p' |
-    awk '{ h += $1; t += $2 } END { print h + 0, t + 0 }')
-  rows+=("jit.$name.hot $hot" "jit.$name.total $total")
-  hot_all=$((hot_all + hot)) total_all=$((total_all + total))
+  read -r hot ool exits total < <(TOI_JIT_LOG=1 target/release/toi "$f" 2>&1 >/dev/null |
+    sed -n 's/^jit .* (\([0-9]*\) hot, \([0-9]*\) out-of-line, \([0-9]*\) exits, \([0-9]*\) bytes).*/\1 \2 \3 \4/p' |
+    awk '{ h += $1; o += $2; e += $3; t += $4 } END { print h + 0, o + 0, e + 0, t + 0 }')
+  rows+=("jit.$name.hot $hot" "jit.$name.ool $ool" "jit.$name.exits $exits" "jit.$name.total $total")
+  hot_all=$((hot_all + hot)) ool_all=$((ool_all + ool)) exits_all=$((exits_all + exits)) total_all=$((total_all + total))
 done
-rows+=("jit.all.hot $hot_all" "jit.all.total $total_all")
+rows+=("jit.all.hot $hot_all" "jit.all.ool $ool_all" "jit.all.exits $exits_all" "jit.all.total $total_all")
 
 tsv=bench/sizes.tsv
 last=""

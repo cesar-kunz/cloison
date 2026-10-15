@@ -217,6 +217,9 @@ pub const LENGTH_READ_ONLY: u8 = 64;
 pub const FN_LENGTH_DELETED: u8 = 64;
 /// A function's `name` was deleted.
 pub const FN_NAME_DELETED: u8 = 128;
+/// A plain object made by an `Error` constructor (`[object Error]`);
+/// `FN_NAME_DELETED`'s bit, as errors aren't functions.
+pub const ERROR: u8 = 128;
 
 #[repr(C)]
 pub struct Object {

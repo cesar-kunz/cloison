@@ -3397,14 +3397,24 @@ pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Optio
 }
 
 /// The `this` a bytecode function gets for receiver `this`: the global
-/// object for `undefined` or `null` (sloppy mode; toi has no strict mode).
-/// Calls without a receiver pass the global object themselves; this is for
-/// `f.call(that, …)`.
-pub(crate) unsafe fn sloppy_this(vm: *const Vm, this: Value) -> Value {
-    if this == Value::UNDEFINED || this == Value::NULL {
-        object_value(unsafe { (*vm).global })
-    } else {
-        this
+/// object for `undefined` or `null`, a wrapper object for another
+/// primitive (sloppy mode; toi has no strict mode).
+pub(crate) unsafe fn sloppy_this(vm: *mut Vm, this: Value) -> Value {
+    if this.is_cell() && unsafe { (*as_object(this)).class } != Class::String {
+        return this;
+    }
+    unsafe { box_this(vm, this) }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn box_this(vm: *mut Vm, this: Value) -> Value {
+    unsafe {
+        if this == Value::UNDEFINED || this == Value::NULL {
+            object_value((*vm).global)
+        } else {
+            (*vm).new_wrapper(this)
+        }
     }
 }
 
@@ -3530,7 +3540,12 @@ unsafe fn push_frame(
         set_header(new, CALLER, regs);
         *new.sub(FLAGS) = Value::from_bits(flags);
         set_header(new, FUNC, fo);
-        *new = this;
+        // Sloppy mode: a primitive `this` is boxed (a string is a cell).
+        *new = if this.is_cell() && (*as_object(this)).class != Class::String {
+            this
+        } else {
+            sloppy_this(vm, this)
+        };
         // Scalar loops: counts are small, and vectorized ones would bloat
         // the handler with prologues and remainders.
         let k = argc.min((*callee).nparams as usize);

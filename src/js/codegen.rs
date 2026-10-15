@@ -461,7 +461,7 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 expr_refs(object, out);
                 stmt(body, out);
             }
-            StmtKind::While(c, body) | StmtKind::DoWhile(body, c) => {
+            StmtKind::While(c, body) | StmtKind::DoWhile(body, c) | StmtKind::With(c, body) => {
                 expr_refs(c, out);
                 stmt(body, out);
             }
@@ -531,6 +531,7 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
             | StmtKind::ForIn { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
+            | StmtKind::With(_, body)
             | StmtKind::Labeled(_, body) => stmt(body, p, out),
             StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, out)),
             StmtKind::Switch(_, cases) => cases
@@ -596,28 +597,11 @@ fn forwards_arguments(p: &Program, f: usize) -> bool {
 }
 
 /// The function declarations directly in a function's body (hoisted to
-/// its start), in order.
+/// its start), in order. One nested in a block is Annex B's: its `var`
+/// binding is assigned where the declaration is (see `Gen::stmt`).
 fn hoisted(s: &Stmt, out: &mut Vec<usize>) {
-    match &s.kind {
-        StmtKind::Function(i) => out.push(*i),
-        StmtKind::If(_, a, b) => {
-            hoisted(a, out);
-            if let Some(b) = b {
-                hoisted(b, out);
-            }
-        }
-        StmtKind::For { body, .. }
-        | StmtKind::ForIn { body, .. }
-        | StmtKind::While(_, body)
-        | StmtKind::DoWhile(body, _)
-        | StmtKind::Labeled(_, body) => hoisted(body, out),
-        StmtKind::Block(b) => b.iter().for_each(|s| hoisted(s, out)),
-        StmtKind::Switch(_, cases) => cases
-            .iter()
-            .flat_map(|(_, b)| b)
-            .for_each(|s| hoisted(s, out)),
-        StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| hoisted(s, out)),
-        _ => {}
+    if let StmtKind::Function(i) = &s.kind {
+        out.push(*i);
     }
 }
 
@@ -693,6 +677,7 @@ fn returns(s: &Stmt) -> bool {
             | StmtKind::ForIn { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
+            | StmtKind::With(_, body)
             | StmtKind::Labeled(_, body) => jumps(body),
             StmtKind::Block(b) => b.iter().any(jumps),
             StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).any(jumps),
@@ -858,6 +843,13 @@ struct Gen<'a> {
     in_try: u32,
     /// The `try` statements being compiled, outermost first.
     trys: Vec<TryCtx<'a>>,
+    /// The registers holding the objects of the `with` statements being
+    /// compiled, outermost first: names are looked up in them first (see
+    /// [`Gen::with_lookup`]).
+    withs: Vec<u8>,
+    /// How many statements enclose the one being compiled: 1 for the
+    /// function body's own.
+    depth: u32,
 }
 
 /// A `try` being compiled: the bytecode ranges it covers (closed around
@@ -915,6 +907,8 @@ impl<'a> Gen<'a> {
             deferred: Vec::new(),
             handlers: Vec::new(),
             in_try: 0,
+            withs: Vec::new(),
+            depth: 0,
             trys: Vec::new(),
         }
     }
@@ -997,7 +991,10 @@ impl<'a> Gen<'a> {
         while !self.deferred.is_empty() {
             let (l, s) = self.deferred.remove(0);
             self.bind(l);
+            // (A deferred `then` branch is nested in its `if`.)
+            self.depth = 1;
             self.stmt(s)?;
+            self.depth = 0;
         }
         if self.nregs > 256 {
             return unsupported(self.f.pos, "more than 256 registers");
@@ -1068,6 +1065,7 @@ impl<'a> Gen<'a> {
                 StmtKind::For { body, .. }
                 | StmtKind::While(_, body)
                 | StmtKind::DoWhile(body, _)
+                | StmtKind::With(_, body)
                 | StmtKind::Labeled(_, body) => walk(body, init, bare),
                 StmtKind::Block(b) => b.iter().for_each(|s| walk(s, init, bare)),
                 StmtKind::Switch(_, cases) => cases
@@ -1558,13 +1556,178 @@ impl<'a> Gen<'a> {
     fn local(&self, e: &Expr) -> Option<u8> {
         match &e.kind {
             ExprKind::This => Some(0),
-            ExprKind::Ident(n) => self.locals.get(&**n).copied(),
+            // (In a `with`, a name may be the object's.)
+            ExprKind::Ident(n) if self.withs.is_empty() => self.locals.get(&**n).copied(),
             _ => None,
         }
     }
 
+    // ---- `with` ----
+
+    /// Inside `with` statements: for each of their objects, innermost
+    /// first, `found(r)` where `r` holds the object, reached when the
+    /// object has property `name`; then `other()` for the name's own
+    /// binding. Every path ends at the returned label, to bind.
+    fn with_lookup(
+        &mut self,
+        name: &str,
+        pos: Pos,
+        found: &mut dyn FnMut(&mut Self, u8) -> R<()>,
+        other: &mut dyn FnMut(&mut Self) -> R<()>,
+    ) -> R<L> {
+        let end = self.label();
+        let withs = std::mem::take(&mut self.withs);
+        let mark = self.temp;
+        let k = self.alloc(pos)?;
+        self.string(name);
+        self.star(k);
+        for (i, &r) in withs.iter().enumerate().rev() {
+            let next = self.label();
+            self.ldar(r);
+            self.emit(Op::TestIn, &[Arg::Reg(k)]);
+            self.jump_if(Jmp::False, next);
+            // (The lookup continues in the enclosing `with`s only.)
+            self.withs = withs[..i].to_vec();
+            found(self, r)?;
+            self.jump(end);
+            self.bind(next);
+        }
+        self.withs = Vec::new();
+        other(self)?;
+        self.withs = withs;
+        self.temp = mark;
+        Ok(end)
+    }
+
+    /// `name` inside `with` statements, into the accumulator (`typeof`:
+    /// for `typeof name`, where an undeclared global is `undefined`).
+    fn with_load(&mut self, name: &str, pos: Pos, type_of: bool) -> R<()> {
+        let end = self.with_lookup(
+            name,
+            pos,
+            &mut |g, r| {
+                g.named(Op::GetNamed, r, name);
+                Ok(())
+            },
+            &mut |g| {
+                if type_of && matches!(g.resolve(name, pos)?, Var::Global) {
+                    g.global(Op::LdaGlobalInsideTypeof, name);
+                    return Ok(());
+                }
+                g.value_inner(&Expr {
+                    kind: ExprKind::Ident(name.into()),
+                    pos,
+                })
+            },
+        )?;
+        self.bind(end);
+        Ok(())
+    }
+
+    /// Store the accumulator in `name` inside `with` statements (the
+    /// accumulator keeps the value).
+    fn with_store(&mut self, name: &str, pos: Pos) -> R<()> {
+        let mark = self.temp;
+        let v = self.alloc(pos)?;
+        self.star(v);
+        let end = self.with_lookup(
+            name,
+            pos,
+            &mut |g, r| {
+                g.ldar(v);
+                g.named(Op::SetNamed, r, name);
+                Ok(())
+            },
+            &mut |g| {
+                g.ldar(v);
+                g.store_var(name, pos)
+            },
+        )?;
+        self.bind(end);
+        self.ldar(v);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// `delete name` inside `with` statements.
+    fn with_delete(&mut self, name: &str, pos: Pos) -> R<()> {
+        let end = self.with_lookup(
+            name,
+            pos,
+            &mut |g, r| {
+                g.string(name);
+                g.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                Ok(())
+            },
+            &mut |g| {
+                match g.resolve(name, pos)? {
+                    Var::Global => {
+                        g.string(name);
+                        g.emit(Op::DeleteGlobal, &[]);
+                    }
+                    _ => g.emit(Op::LdaFalse, &[]),
+                }
+                Ok(())
+            },
+        )?;
+        self.bind(end);
+        Ok(())
+    }
+
+    /// `name(args)` inside `with` statements: a method call on the object
+    /// that has `name`, else an ordinary call.
+    fn with_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> R<()> {
+        let n = u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
+        let c = self.alloc(pos)?;
+        let w = self.alloc(pos)?;
+        let method = self.alloc(pos)?;
+        let end = self.with_lookup(
+            name,
+            pos,
+            &mut |g, r| {
+                g.named(Op::GetNamed, r, name);
+                g.star(c);
+                g.mov(r, w);
+                g.emit(Op::LdaTrue, &[]);
+                g.star(method);
+                Ok(())
+            },
+            &mut |g| {
+                g.value_inner(&Expr {
+                    kind: ExprKind::Ident(name.into()),
+                    pos,
+                })?;
+                g.star(c);
+                g.emit(Op::LdaFalse, &[]);
+                g.star(method);
+                Ok(())
+            },
+        )?;
+        self.bind(end);
+        for _ in 0..n {
+            self.alloc(pos)?;
+        }
+        for (i, a) in args.iter().enumerate() {
+            self.into(a, w + 1 + i as u8)?;
+        }
+        let (plain, done) = (self.label(), self.label());
+        self.ldar(method);
+        self.jump_if(Jmp::False, plain);
+        let ic = self.auto_ic(Op::Call.name());
+        self.emit(Op::Call, &[Arg::Reg(c), Arg::Reg(w), Arg::Count(n), ic]);
+        self.jump(done);
+        self.bind(plain);
+        let ic = self.auto_ic(Op::CallUndefined.name());
+        self.emit(Op::CallUndefined, &[Arg::Reg(c), Arg::Reg(w + 1), Arg::Count(n), ic]);
+        self.bind(done);
+        Ok(())
+    }
+
     /// Store the accumulator in variable `name`.
     fn store_var(&mut self, name: &str, pos: Pos) -> R<()> {
+        if !self.withs.is_empty() {
+            return self.with_store(name, pos);
+        }
         match self.resolve(name, pos)? {
             Var::Reg(r) => self.star(r),
             Var::Upvalue(k) => {
@@ -1599,6 +1762,7 @@ impl<'a> Gen<'a> {
             ExprKind::Ident(n) => {
                 // (A captured one may change in any call, through a closure.)
                 if let Some(&r) = self.locals.get(&**n)
+                    && self.withs.is_empty()
                     && !later.iter().any(|l| assigns(l, n))
                     && !self.scopes.captured[self.index].contains(&&**n)
                 {
@@ -1655,6 +1819,7 @@ impl<'a> Gen<'a> {
             Bool(false) => self.emit(Op::LdaFalse, &[]),
             Null => self.emit(Op::LdaNull, &[]),
             This => self.ldar(0),
+            Ident(n) if !self.withs.is_empty() => self.with_load(n, e.pos, false)?,
             Ident(n) => match self.resolve(n, e.pos)? {
                 Var::Reg(r) => self.ldar(r),
                 Var::Upvalue(k) => {
@@ -1691,10 +1856,8 @@ impl<'a> Gen<'a> {
             // A plain object with room for the properties, then each one
             // stored in order (a later duplicate wins).
             Object(props) => {
-                // `__proto__:` sets the prototype, not a property.
-                if props.iter().any(|(k, _)| &**k == "__proto__") {
-                    return unsupported(e.pos, "the key `__proto__` in an object literal");
-                }
+                // (`__proto__: v` sets the prototype: the store reaches
+                // `Object.prototype`'s accessor.)
                 // An index key is an element (`o[1]` reads it), stored as
                 // `o[k] = v`.
                 let index = |k: &str| {
@@ -1786,6 +1949,7 @@ impl<'a> Gen<'a> {
                     self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
                     self.temp = mark;
                 }
+                Ident(n) if !self.withs.is_empty() => self.with_delete(n, x.pos)?,
                 Ident(n) => match self.resolve(n, x.pos)? {
                     Var::Global => {
                         self.string(n);
@@ -1801,6 +1965,7 @@ impl<'a> Gen<'a> {
             Unary(UnOp::Typeof, x) => {
                 // An undeclared global is "undefined", not a ReferenceError.
                 match &x.kind {
+                    Ident(n) if !self.withs.is_empty() => self.with_load(n, x.pos, true)?,
                     Ident(n) if matches!(self.resolve(n, x.pos)?, Var::Global) => {
                         self.global(Op::LdaGlobalInsideTypeof, n)
                     }
@@ -2101,6 +2266,12 @@ impl<'a> Gen<'a> {
     /// consecutive ones after it; a single argument already in a register
     /// is passed in place.
     fn call(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
+        if let ExprKind::Ident(n) = &f.kind
+            && !new
+            && !self.withs.is_empty()
+        {
+            return self.with_call(n, args, pos);
+        }
         let n =
             u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
         let method = !new && matches!(f.kind, ExprKind::Member(..) | ExprKind::Index(..));
@@ -2288,10 +2459,24 @@ impl<'a> Gen<'a> {
     // ---- Statements ----
 
     fn stmt(&mut self, s: &'a Stmt) -> R<()> {
+        self.depth += 1;
+        let r = self.stmt_inner(s);
+        self.depth -= 1;
+        r
+    }
+
+    fn stmt_inner(&mut self, s: &'a Stmt) -> R<()> {
         let mark = self.temp;
         let labels = std::mem::take(&mut self.pending_labels);
         match &s.kind {
             StmtKind::Var(ds) => self.var_decls(ds)?,
+            // A function declaration in a block (Annex B): its `var`
+            // binding, `undefined` so far, gets the function here.
+            StmtKind::Function(i) if self.depth > 1 => {
+                self.closure(*i);
+                let name = self.p.functions[*i].name.as_deref().unwrap();
+                self.store_var(name, s.pos)?;
+            }
             StmtKind::Function(_) | StmtKind::Empty => {}
             StmtKind::Expr(e) => self.effect(e)?,
             StmtKind::If(c, then, None)
@@ -2342,6 +2527,15 @@ impl<'a> Gen<'a> {
                 self.looping(labels, Some(c), None, body, !first_passes)?;
             }
             StmtKind::DoWhile(body, c) => self.looping(labels, Some(c), None, body, false)?,
+            StmtKind::With(o, body) => {
+                self.value(o)?;
+                let r = self.alloc(s.pos)?;
+                self.star(r);
+                self.withs.push(r);
+                let res = self.stmt(body);
+                self.withs.pop();
+                res?;
+            }
             StmtKind::ForIn {
                 name, object, body, ..
             } => self.for_in(labels, name, object, body, s.pos)?,

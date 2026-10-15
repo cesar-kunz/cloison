@@ -119,7 +119,8 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 
     // `Boolean`, a conversion; booleans' methods.
-    let bp = vm.new_object(object_value(op));
+    let bp = vm.new_object_with(Class::Wrapper, object_value(op), 4);
+    unsafe { (*bp).code = Value::FALSE.to_bits() as *const crate::vm::Code };
     vm.boolean_prototype = bp;
     let boolean = vm.define_native(g, "Boolean", boolean_fn, 1, any, true);
     link_constructor(vm, boolean, bp);
@@ -919,16 +920,7 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             Class::Date => "Date",
             Class::RegExp => "RegExp",
             Class::Wrapper => primitive_tag(wrapped(this).unwrap()),
-            _ if vm.error_prototypes.iter().any(|&p| {
-                let mut q = unsafe { (*(*o).shape).proto };
-                while q.is_cell() {
-                    if as_object(q) == p {
-                        return true;
-                    }
-                    q = unsafe { (*(*as_object(q)).shape).proto };
-                }
-                false
-            }) => "Error",
+            Class::Plain if unsafe { (*o).flags } & crate::object::ERROR != 0 => "Error",
             _ => "Object",
         }
     } else {
@@ -2100,6 +2092,7 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
 pub(crate) fn make_error(vm: &mut Vm, k: usize, message: Option<&[u16]>) -> Value {
     let proto = vm.error_prototypes[k];
     let o = vm.new_object(object_value(proto));
+    unsafe { (*o).flags |= crate::object::ERROR };
     if let Some(m) = message {
         let a = vm.intern("message");
         let m = vm.new_string(m);

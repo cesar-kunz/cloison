@@ -126,6 +126,8 @@ pub enum StmtKind<'a> {
     /// their statements.
     Switch(Expr<'a>, Vec<(Option<Expr<'a>>, Vec<Stmt<'a>>)>),
     Labeled(Name, &'a Stmt<'a>),
+    /// `with (object) body`
+    With(Expr<'a>, &'a Stmt<'a>),
     Empty,
 }
 

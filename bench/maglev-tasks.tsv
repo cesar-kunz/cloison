@@ -14,3 +14,18 @@ be8000c	S11 untyped ===	7007
 be8000c	S12 moves	22846
 be8000c	S13 keyed loads	5777
 be8000c	C1 exits	97307
+93110e0	all.hot	244342
+93110e0	all.ool	151929
+93110e0	all.exits	99290
+93110e0	S1 push	95911
+93110e0	S2 calls	33927
+93110e0	S3 entry clearing	36148
+93110e0	S4 truthiness	16572
+93110e0	S6 stores	30432
+93110e0	S7 allocation	29642
+93110e0	S9 cell guards	3857
+93110e0	S10 heap-object checks	10664
+93110e0	S11 untyped ===	7267
+93110e0	S12 moves	23201
+93110e0	S13 keyed loads	5777
+93110e0	C1 exits	99290

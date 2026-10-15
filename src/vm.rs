@@ -606,6 +606,10 @@ pub struct Vm {
     /// [`Vm::construct_other`]): a constructor takes it at entry
     /// ([`Vm::is_construct`]).
     pub(crate) constructing: bool,
+    /// The native being called (set by every call of one): a native with
+    /// hidden slots of its own reads them through it, first thing (see
+    /// `promise::closure`).
+    pub(crate) callee: *mut Object,
     /// The `Array` constructor: compiled code makes `new Array()` itself.
     pub(crate) array_fn: *mut Object,
     pub(crate) date_prototype: *mut Object,
@@ -617,6 +621,9 @@ pub struct Vm {
     /// `WeakSet.prototype`, `DataView.prototype`, then the map and set
     /// iterator prototypes (see `collections::Proto`).
     pub(crate) collection_prototypes: Vec<*mut Object>,
+    /// `Promise.prototype`, `Promise`, the job queue, … (see
+    /// `promise::Root`).
+    pub(crate) promise_roots: Vec<*mut Object>,
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
@@ -758,12 +765,14 @@ impl Vm {
             pending_args: (std::ptr::null(), 0),
             native_top: std::ptr::null_mut(),
             constructing: false,
+            callee: std::ptr::null_mut(),
             array_fn: std::ptr::null_mut(),
             date_prototype: std::ptr::null_mut(),
             number_prototype: std::ptr::null_mut(),
             error_prototypes: Vec::new(),
             typed_prototypes: Vec::new(),
             collection_prototypes: Vec::new(),
+            promise_roots: Vec::new(),
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
@@ -3180,6 +3189,7 @@ impl Vm {
                 if (*o).class == Class::Native {
                     let native = (*(*o).code).native.unwrap();
                     self.constructing = false;
+                    self.callee = o;
                     return native(self, this, args);
                 }
             }
@@ -3196,6 +3206,7 @@ impl Vm {
                 if (*o).class == Class::Native && (*(*o).code).constructs {
                     let native = (*(*o).code).native.unwrap();
                     self.constructing = true;
+                    self.callee = o;
                     let r = native(self, Value::UNDEFINED, args);
                     self.constructing = false;
                     return r;
@@ -3379,10 +3390,22 @@ impl Vm {
             self.heap.gc.stack_base = &raw const here as usize & !7;
         }
         let r = unsafe { crate::interp::run_script(self, code) };
+        // The script done, the promise jobs it queued run (and theirs).
+        let r = r.and_then(|v| self.run_jobs().map(|()| v));
         if outer {
             self.heap.gc.stack_base = 0;
             self.pause_marker();
         }
+        r
+    }
+
+    /// Run the promise jobs queued (see `promise::run_jobs`): the VM stack
+    /// is free, so they run from its base.
+    fn run_jobs(&mut self) -> Result<()> {
+        let saved = self.native_top;
+        self.native_top = self.stack.as_mut_ptr();
+        let r = crate::promise::run_jobs(self);
+        self.native_top = saved;
         r
     }
 
@@ -3419,6 +3442,7 @@ impl Vm {
         .into_iter()
         .chain(self.typed_prototypes.iter().copied())
         .chain(self.collection_prototypes.iter().copied())
+        .chain(self.promise_roots.iter().copied())
         .chain(self.error_prototypes.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)

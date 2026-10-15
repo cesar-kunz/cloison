@@ -250,7 +250,7 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> *mut Object {
 /// Call `f` with each value iterating `v` yields: an array's or typed
 /// array's elements, a string's code points, a map's `[key, value]` pairs
 /// or a set's keys. (No `Symbol.iterator`: anything else is a TypeError.)
-fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
+pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
     if let Some(u) = string_units(v) {
         let u = u.to_vec();
         let mut i = 0;

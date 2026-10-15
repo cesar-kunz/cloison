@@ -848,9 +848,10 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
             | Class::Set
             | Class::WeakMap
             | Class::WeakSet
-            | Class::CollectionIterator => {
+            | Class::CollectionIterator
+            | Class::Promise => {
                 // The primitive it wraps (a string is a cell), or a
-                // collection's entries array.
+                // collection's entries array, or a promise's state.
                 if within(code) {
                     v.value(Value::from_bits((*o).code as u64));
                 }

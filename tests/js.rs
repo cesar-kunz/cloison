@@ -3642,6 +3642,60 @@ fn microbenchmarks_through_eval_compute_their_expected_results() {
     }
 }
 
+/// Promise jobs run once the script is done, in the order queued, the
+/// ones they queue after them (what node prints for the same script); a
+/// later script in the VM sees what they did.
+#[test]
+fn promise_jobs_run_after_the_script() {
+    let first = toi::js::compile(
+        r#"
+var log = [];
+Promise.resolve(1).then(function (v) { log.push("a" + v); });
+Promise.reject(new Error("x")).catch(function (e) { log.push("b" + e.message); return 7; })
+  .then(function (v) { log.push("c" + v); });
+var p = new Promise(function (res, rej) { log.push("exec"); res(3); rej(4); res(5); });
+p.then(function (v) { log.push("d" + v); throw "boom"; })
+  .then(null, function (r) { log.push("e" + r); })
+  .finally(function () { log.push("f"); });
+Promise.resolve({ then: function (ok) { log.push("thenable"); ok(9); } })
+  .then(function (v) { log.push("g" + v); });
+Promise.all([1, Promise.resolve(2), { then: function (ok) { ok(3); } }])
+  .then(function (vs) { log.push("all" + vs.join(",")); });
+Promise.race([new Promise(function () {}), Promise.resolve("r")])
+  .then(function (v) { log.push("race" + v); });
+Promise.allSettled([Promise.reject("no"), 1])
+  .then(function (rs) { log.push("settled" + rs[0].status + rs[0].reason + rs[1].status + rs[1].value); });
+Promise.any([Promise.reject(1), Promise.reject(2)])
+  .catch(function (e) { log.push("any" + e.constructor.name + e.errors.join("/") + ":" + (e instanceof Error)); });
+var q = Promise.resolve();
+q.then(function () { log.push("1"); q.then(function () { log.push("3"); }); });
+q.then(function () { log.push("2"); });
+var self = new Promise(function (r) { setSelf = r; });
+setSelf(self);
+self.catch(function (e) { log.push("self" + (e instanceof TypeError)); });
+Promise.resolve(1).then(2, 3).then(function (v) { log.push("passthru" + v); });
+var rf; new Promise(function (res, rej) { rf = rej; });
+log.push(rf.name === "" && rf.length === 1 && !rf.hasOwnProperty("prototype"));
+log.push("sync");
+"#,
+    )
+    .unwrap();
+    let second = toi::js::compile("log.join(' ')").unwrap();
+    for budget in [i64::MAX, 1, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.run(&first).unwrap();
+        let r = vm.run(&second).map(display).unwrap();
+        vm.heap.verify();
+        assert_eq!(
+            r,
+            "exec true sync a1 bx d3 thenable 1 2 selftrue c7 eboom g9 racer \
+             settledrejectednofulfilled1 anyAggregateError1/2:true 3 passthru1 f all1,2,3",
+            "tier at {budget}"
+        );
+    }
+}
+
 /// Code that eval'd functions no longer reachable leave is freed (by a
 /// full collection, which code loaded starts), while the functions kept,
 /// and those nested in them, run on: of 3000 evals' 12,000 functions, in

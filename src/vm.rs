@@ -153,6 +153,12 @@ pub const BYTES_LOC: i32 = i32::MIN + 1;
 /// `Ic::loc` of a `SetKeyed` that stored at an array's length, growing it
 /// (`a[a.length] = v`): the JIT compiles it to append (`jit::Prop::Append`).
 pub const APPEND_LOC: i32 = i32::MIN + 2;
+/// `Ic::loc` of a named access that found an accessor property in a
+/// prototype, `holder`: each way's `new_shape` is a receiver's shape (way
+/// 0's null once more came than there are ways), `epoch` the prototype
+/// epoch. No shape, so the interpreter's hit path never takes it; the JIT
+/// inlines the getter or setter (`jit::Lowering::accessor`).
+pub const ACCESSOR_LOC: i32 = i32::MIN + 3;
 const _: fn(u64, Value) -> bool = field_fits;
 
 /// The first `new` of `code` returned: shrink the capacity of its objects'
@@ -241,6 +247,46 @@ unsafe fn install(ic: *mut Ic, e: Ic) {
             }
         }
         *ic = e;
+    }
+}
+
+/// Record in named-access cache `ic` that a receiver of shape `shape` found
+/// an accessor in prototype `holder` (see [`ACCESSOR_LOC`]), unless the
+/// cache holds shapes.
+///
+/// # Safety
+/// `ic` must be a live cache slot.
+unsafe fn note_accessor(ic: *mut Ic, shape: *const Shape, holder: *mut Object, epoch: u32) {
+    unsafe {
+        let ours = |w: &Ic| w.loc == ACCESSOR_LOC && w.epoch == epoch && w.holder == holder;
+        if !(*ic).shape.is_null() || ours(&*ic) && (*ic).new_shape.is_null() {
+            return;
+        }
+        let e = Ic {
+            holder,
+            new_shape: shape,
+            loc: ACCESSOR_LOC,
+            epoch,
+            ..Ic::EMPTY
+        };
+        if !ours(&*ic) {
+            for k in 0..IC_WAYS {
+                *ic.add(k) = Ic::EMPTY;
+            }
+            *ic = e;
+            return;
+        }
+        for k in 0..IC_WAYS {
+            let w = &mut *ic.add(k);
+            if w.new_shape == shape && ours(w) {
+                return;
+            }
+            if !ours(w) {
+                *w = e;
+                return;
+            }
+        }
+        (*ic).new_shape = std::ptr::null();
     }
 }
 
@@ -1661,8 +1707,12 @@ impl Vm {
                 return Ok(Value::UNDEFINED);
             };
             let loc = (*(*h).shape).location(slot);
-            // A getter's: called, never cached.
+            // A getter's: called, never cached (noted for the JIT).
             if self.is_accessor(h, slot) {
+                if h != o {
+                    self.heap.note(object_value(h));
+                    note_accessor(ic, (*o).shape, h, self.proto_epoch);
+                }
                 return self.call_getter(*Object::slot(h, loc), obj);
             }
             self.heap.note(object_value(h));
@@ -1698,9 +1748,15 @@ impl Vm {
             if (*o).class == Class::String || self.read_only(o, name) {
                 return Ok(());
             }
-            // A setter's: called, never cached.
-            if let Some(pair) = self.accessor(o, name) {
-                return self.call_setter(pair, obj, value);
+            // A setter's: called, never cached (noted for the JIT).
+            if let Some((h, slot)) = self.lookup(o, name)
+                && self.is_accessor(h, slot)
+            {
+                if h != o {
+                    self.heap.note(object_value(h));
+                    note_accessor(ic, old, h, self.proto_epoch);
+                }
+                return self.call_setter(*Object::slot(h, (*(*h).shape).location(slot)), obj, value);
             }
             if let Some(slot) = (*old).lookup(name) {
                 self.store_field(o, slot, value);

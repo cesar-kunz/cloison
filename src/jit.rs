@@ -1745,6 +1745,10 @@ struct Insn {
     /// `Star` of that value: no code (analyses still see the register
     /// overwritten, by something not an object they track).
     check_only: bool,
+    /// For a `check_only` `GetNamed` standing for a `SetNamed` whose
+    /// setter is called (see `Lowering::accessor`): an exit resumes at the
+    /// store, which takes `acc`, so it reads `acc` and leaves it.
+    store_check: bool,
     /// For a `push` or `pop` whose callee's load was dropped: the callee,
     /// which an exit before it stores to the callee's register (the
     /// interpreter makes the call again).
@@ -1803,7 +1807,7 @@ impl Insn {
     /// `charCodeAt`, `fromCharCode`, `Math.sqrt`, `Math.pow`'s exponent;
     /// see [`Insn::native`]).
     fn takes_acc(&self) -> bool {
-        matches!(self.native, 1 | 4 | 5 | 6 | 7 | 8 | 9)
+        matches!(self.native, 1 | 4 | 5 | 6 | 7 | 8 | 9) || self.store_check
     }
 
     fn reads_reg(&self) -> bool {
@@ -2122,6 +2126,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 alloc: 0,
                 native,
                 check_only: false,
+                store_check: false,
                 exit_const: 0,
                 sub,
                 hoisted: None,
@@ -3319,9 +3324,10 @@ fn may_exit_between(insn: &Insn) -> bool {
 
 /// `Some(())` if `insn` may write `acc` (other than `Ldar`).
 fn writes_acc(insn: &Insn) -> Option<()> {
-    let keeps = insn.alloc == 0
-        && insn.native == 0
-        && (insn.jumps()
+    let keeps = insn.store_check
+        || insn.alloc == 0
+            && insn.native == 0
+            && (insn.jumps()
             || matches!(
                 insn.op,
                 Op::Nop | Op::Jump | Op::Star | Op::SetNamed | Op::SetKeyed | Op::StaGlobal
@@ -3546,6 +3552,9 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         sel.case = "";
         sel.post = None;
+    }
+    if insn.store_check {
+        sel.out.acc = st.acc;
     }
     copies(insn, st, &mut sel.out, spec.fixed_from);
     sel
@@ -6278,7 +6287,9 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
     // `Ldar` writes nothing.
     let (reads, kills) = (
         |insn: &Insn| insn.bail || (reads(insn.op) && !insn.check_only) || insn.takes_acc(),
-        |insn: &Insn| !insn.bail && kills(insn.op) && !(insn.check_only && insn.op == Op::Ldar),
+        |insn: &Insn| {
+            !insn.bail && kills(insn.op) && !(insn.check_only && insn.op == Op::Ldar) && !insn.store_check
+        },
     );
     let mut live_in = vec![false; n];
     let mut live_out = vec![false; n];
@@ -9286,6 +9297,9 @@ fn max_compiles(n: usize) -> u32 {
 const COMPILE_SIZE: usize = 400;
 /// Inlining limits: nesting, and the callee's size in instructions.
 const MAX_INLINE_DEPTH: usize = 2;
+/// Registers past a frame's own for a getter or setter called, not
+/// inlined (see [`Lowering::accessor`]): the function, `this`, the value.
+const ACCESSOR_EXTRA: usize = 3;
 const MAX_INLINE_INSNS: usize = 64;
 /// Bytecode instructions a lowering inlines at call sites outside loops
 /// (small leaves aside): past it, those calls stay calls (direct ones,
@@ -10063,6 +10077,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         alloc: 0,
         native: 0,
         check_only: false,
+        store_check: false,
         exit_const: 0,
         sub: false,
         hoisted: None,
@@ -10133,6 +10148,9 @@ struct Lowering<'a> {
     /// around a `Mov` (see `emit_frame`): the register is given once the
     /// frames are laid out.
     mov_scratch: Vec<usize>,
+    /// Parameters of the call being inlined already in the callee's
+    /// registers (a setter's value, see [`Lowering::accessor`]).
+    preset_args: usize,
 }
 
 /// The function's instructions as compiled, from its code and inline caches:
@@ -10280,8 +10298,13 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
         inlined: 0,
         call_in_loop: false,
         mov_scratch: Vec::new(),
+        preset_args: 0,
     };
     cx.out.fbs.push(cx.feedback(root));
+    if cx.accessor_sites(root) {
+        cx.out.frames[0].extra = ACCESSOR_EXTRA as u8;
+        cx.out.nregs += ACCESSOR_EXTRA;
+    }
     let rets = cx.emit_frame(0, 0);
     debug_assert!(rets.is_empty());
     if !cx.mov_scratch.is_empty() {
@@ -12344,6 +12367,68 @@ impl Lowering<'_> {
                     self.push(i, prop);
                 }
                 // In a constructor passing its arguments on, inlined for
+                // A getter or setter found in a prototype: the receiver's
+                // shape checked (a load of the accessor, `check_only`), then
+                // a call of the function with the receiver as `this` and,
+                // for a setter, `acc` (stored first, which an exit at the
+                // check leaves for the interpreter's store) as its
+                // argument: inlined, or from the registers past the frame's
+                // own (`ACCESSOR_EXTRA`: the function, `this`, the value).
+                Op::GetNamed | Op::SetNamed
+                    if let Some((fo, shapes, addr, inline)) =
+                        self.accessor(frame, &i, depth, acc_out[k]) =>
+                {
+                    let set = i.op == Op::SetNamed;
+                    let w = (base + unsafe { (*f.code).nregs } as usize) as u8;
+                    if set && !inline {
+                        self.push(synth(Op::Star, w + 2, frame, i.pc), Prop::None);
+                    } else if set && unsafe { (*(*fo).code).nparams } > 0 {
+                        let param = (frame_end(&f) + 1) as u8;
+                        self.push(synth(Op::Star, param, frame, i.pc), Prop::None);
+                    }
+                    let mut check = i;
+                    (check.op, check.check_only, check.store_check) = (Op::GetNamed, true, set);
+                    let ft = FieldType::Any;
+                    let prop = if let [shape] = shapes[..] {
+                        Prop::Proto { shape, addr, ft }
+                    } else {
+                        let mut cases = [Case::NONE; crate::vm::IC_WAYS];
+                        for (c, &shape) in cases.iter_mut().zip(&shapes) {
+                            *c = Case { shape, loc: CaseLoc::Proto(addr), ft };
+                        }
+                        self.out.polys.push(cases);
+                        Prop::Poly {
+                            n: shapes.len() as u8,
+                            at: self.out.polys.len() as u32 - 1,
+                        }
+                    };
+                    self.push(check, prop);
+                    if !inline {
+                        self.mov(frame, i.pc, Some(i.reg), w + 1);
+                        unsafe { (*self.state.vm).heap.keep(fo as usize) };
+                        let prop = Prop::Const {
+                            value: crate::object::object_value(fo).to_bits(),
+                            at: 0,
+                            expect: 0,
+                            ft: FieldType::Any,
+                            obj: 0,
+                        };
+                        self.push(synth(Op::LdaConstant, 0, frame, i.pc), prop);
+                        self.push(synth(Op::Star, w, frame, i.pc), Prop::None);
+                        let mut call = synth(Op::Call, w, frame, i.pc);
+                        (call.reg2, call.imm) = (w + 1, i32::from(set));
+                        self.emit_call(frame, call, fo, true);
+                        continue;
+                    }
+                    let mut call = i;
+                    (call.op, call.reg2, call.imm) = (Op::Call, i.reg, 0);
+                    let id = self.out.frames.len();
+                    self.preset_args = usize::from(set);
+                    let guard = self.inline(frame, &call, fo, depth);
+                    self.preset_args = 0;
+                    self.out.insns[guard].guard = 0;
+                    self.out.frames[id].ret_pc = i.pc + i.op.size();
+                }
                 // `new`: a load from `this`, whose shape is the root one
                 // for the closure's prototype, from the prototype chain.
                 // (Its code is every class's: its cache isn't this one's.)
@@ -13434,6 +13519,81 @@ impl Lowering<'_> {
             && captured_regs(code).get(r as usize) != Some(&true)
     }
 
+    /// The getter (for `GetNamed` `i` of frame `frame`) or setter (for
+    /// `SetNamed`) to inline, if its cache says receivers of up to
+    /// `IC_WAYS` shapes found the accessor in a prototype
+    /// (`vm::ACCESSOR_LOC`) under this epoch, and exits there haven't given
+    /// up on it: the function, the receivers' shapes and the accessor's
+    /// slot (its value relied on), and whether to inline it (else it is
+    /// called, from the frame's registers past its own: see
+    /// [`ACCESSOR_EXTRA`]). A setter only where `acc` is dead after
+    /// (`acc_live`): the store's value, which the setter's result replaces
+    /// after an exit in it.
+    fn accessor(
+        &mut self,
+        frame: usize,
+        i: &Insn,
+        depth: usize,
+        acc_live: bool,
+    ) -> Option<(*mut Object, Vec<u64>, u64, bool)> {
+        use crate::object::{ACCESSOR, Class, as_object};
+        let f = self.out.frames[frame];
+        let fb = self.out.fbs[frame];
+        let ic = unsafe { *fb.ic(i.imm as usize) };
+        let set = i.op == Op::SetNamed;
+        if i.bail
+            || ic.loc != crate::vm::ACCESSOR_LOC
+            || ic.new_shape.is_null()
+            || ic.epoch != self.epoch
+            || set && acc_live
+            || self.state.tier == Tier::Warm
+            || self.out.frames.len() >= 255
+            || (self.state.property_exits.get(&(f.code as usize, i.pc)))
+                .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
+        {
+            return None;
+        }
+        unsafe {
+            let h = ic.holder;
+            let s = &*(*h).shape;
+            let slot = s.lookup(fb.name(i))?;
+            if s.attrs[slot as usize] & ACCESSOR == 0 {
+                return None;
+            }
+            let at = Object::slot(h, s.location(slot));
+            let fv = *(*as_object(*at)).elems.add(usize::from(set));
+            if !fv.is_cell() || (*as_object(fv)).class != Class::Function {
+                return None;
+            }
+            let fo = as_object(fv);
+            self.call_in_loop = self.in_loop(f.code, i.pc);
+            let inline = !(depth >= MAX_INLINE_DEPTH && !self.small_leaf(fo)
+                || self.forwards((*fo).code)
+                || !self.inlinable(frame, fo));
+            if !inline && (f.extra as usize) < ACCESSOR_EXTRA {
+                return None;
+            }
+            let shapes: Vec<u64> = (0..crate::vm::IC_WAYS)
+                .map(|k| *fb.ic(i.imm as usize).add(k))
+                .take_while(|w| w.loc == ic.loc && w.epoch == ic.epoch && w.holder == h)
+                .map(|w| w.new_shape as u64)
+                .collect();
+            rely_on_slot(at as u64);
+            Some((fo, shapes, at as u64, inline))
+        }
+    }
+
+    /// Whether `code` has a named access whose cache found an accessor in a
+    /// prototype (`vm::ACCESSOR_LOC`): its frames get [`ACCESSOR_EXTRA`]
+    /// registers.
+    fn accessor_sites(&mut self, code: *const crate::vm::Code) -> bool {
+        let fb = self.feedback(code);
+        self.decoded(code).0.iter().any(|j| {
+            matches!(j.op, Op::GetNamed | Op::SetNamed)
+                && unsafe { (*fb.ic(j.imm as usize)).loc } == crate::vm::ACCESSOR_LOC
+        })
+    }
+
     /// For load `i` (in frame `frame`) from `this` of `new fo`, allocated
     /// with the root shape for `fo`'s prototype: a load from the
     /// prototype holding the property, if one does with a data property.
@@ -13625,7 +13785,7 @@ impl Lowering<'_> {
         } else if i.op != Op::Construct {
             arg(self, 0, this);
         }
-        for p in 0..nparams {
+        for p in self.preset_args..nparams {
             arg(self, 1 + p, (p < argc).then_some((args + p) as u8));
         }
         aliases
@@ -13676,7 +13836,10 @@ impl Lowering<'_> {
             self.inlined += self.decoded(callee).0.len();
         }
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
-        let extra = if self.forwards(callee) { (i.imm as u8).saturating_add(1) } else { 0 };
+        let mut extra = if self.forwards(callee) { (i.imm as u8).saturating_add(1) } else { 0 };
+        if self.accessor_sites(callee) {
+            extra = extra.max(ACCESSOR_EXTRA as u8);
+        }
         crate::vm::pin(callee);
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,

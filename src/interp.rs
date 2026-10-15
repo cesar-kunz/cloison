@@ -1117,8 +1117,9 @@ handlers! {
         let ic = ic_at(regs, pc, 1);
         if (*g).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
             let at = Object::slot(g, (*ic).loc);
-            *at = acc;
-            crate::heap::barrier(g.cast(), at, acc);
+            let v = as_named(tag, (*ic).holder as u64, acc);
+            *at = v;
+            crate::heap::barrier(g.cast(), at, v);
             next!(any, Op::StaGlobal.size(), acc)
         }
         tail!(slow_sta_global, acc)
@@ -1185,8 +1186,9 @@ handlers! {
                     (*o).shape = new;
                 }
                 let at = Object::slot(o, (*ic).loc);
-                *at = acc;
-                crate::heap::barrier(o.cast(), at, acc);
+                let v = as_named(tag, (*ic).holder as u64, acc);
+                *at = v;
+                crate::heap::barrier(o.cast(), at, v);
                 next!(any, Op::SetNamed.size(), acc)
             }
             tail!(poly_set_named, acc)
@@ -1209,8 +1211,9 @@ handlers! {
                         (*o).shape = new;
                     }
                     let at = Object::slot(o, (*w).loc);
-                    *at = acc;
-                    crate::heap::barrier(o.cast(), at, acc);
+                    let v = as_named(tag, (*w).holder as u64, acc);
+                    *at = v;
+                    crate::heap::barrier(o.cast(), at, v);
                     next!(any, Op::SetNamed.size(), acc)
                 }
                 break;
@@ -1221,7 +1224,7 @@ handlers! {
 
     // `acc` is an int32: it fits any field type up to a number (encoded 0,
     // 1, 2), so the check is one compare. Also saves `i32_to_any`'s second
-    // dispatch.
+    // dispatch. Into a `Num` field it goes as a double (`as_named`).
     fn i32_set_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
         let acc = tag.rebox(acc);
@@ -1233,7 +1236,7 @@ handlers! {
                 if !new.is_null() {
                     (*o).shape = new;
                 }
-                *Object::slot(o, (*ic).loc) = acc;
+                *Object::slot(o, (*ic).loc) = as_named(tag, (*ic).holder as u64, acc);
                 next!(any, Op::SetNamed.size(), acc)
             }
             tail!(poly_set_named, acc)
@@ -3583,6 +3586,17 @@ fn construct_this(regs: *mut Value, f: *mut Object) -> Value {
     unsafe {
         (*frame_vm(regs)).safepoint(regs);
         (*frame_vm(regs)).construct_this(f)
+    }
+}
+
+/// `v` as a store whose inline cache holds field type `want` writes it: in
+/// a field typed `Num` (2), an int32 as a double (see `FieldType::Num`).
+#[inline(always)]
+fn as_named(tag: NumberTag, want: u64, v: Value) -> Value {
+    if want == 2 && tag.is_int32(v) {
+        Value::from_f64(v.as_i32_unchecked() as f64)
+    } else {
+        v
     }
 }
 

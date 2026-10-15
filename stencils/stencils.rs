@@ -4071,6 +4071,20 @@ macro_rules! property_location {
             store_imm(o, s.acc);
             next!(s)
         });
+        // `_d`: `acc` is an int32, into a field typed `Num` in the object's
+        // own memory, which holds a double (see `object::FieldType::Num`).
+        // `acc` stays: an exit after the store boxes it as an int32.
+        stencil!("set_own_d_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
+            next!(s)
+        });
+        stencil!("set_tr_d_", loc!($loc); |s| {
+            let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
+            *(o as *mut u64) = imm64b();
+            store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
+            next!(s)
+        });
         // `o[k] = acc`: an array (`_nc`: known to be one), an int32 key
         // within its length, a value its shape's elements' type
         // (`Shape::elems_code`, at offset 0) fits; else leave before. `acc`
@@ -4271,6 +4285,16 @@ macro_rules! property_location {
             let o = get!($loc, s).to_bits() as *mut u8;
             *(o as *mut u64) = imm64b();
             store_imm(o, s.acc);
+            next!(s)
+        });
+        stencil!("set_own_d_nc_", loc!($loc); |s| {
+            store_imm(get!($loc, s).to_bits() as *mut u8, s.tag.encode_f64(i2f(int(s.acc))));
+            next!(s)
+        });
+        stencil!("set_tr_d_nc_", loc!($loc); |s| {
+            let o = get!($loc, s).to_bits() as *mut u8;
+            *(o as *mut u64) = imm64b();
+            store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
             next!(s)
         });
         stencil!("set_oop_n_nc_", loc!($loc); |s| {
@@ -4763,7 +4787,27 @@ stencil!("check_acc_shape"; |s| {
     next!(s)
 });
 
-// A number loaded from a field typed `Num`, into `facc`.
+// A store's value into a field typed `Num`, which holds doubles only (see
+// `object::FieldType::Num`): exit if not a number, an int32 to a double.
+stencil!("check_acc_dbl"; |s| {
+    if s.acc.to_bits() & s.tag.to_bits() == 0 {
+        exit!(s)
+    }
+    if s.tag.is_int32(s.acc) {
+        s.acc = s.tag.encode_f64(i2f(int(s.acc)));
+    }
+    next!(s)
+});
+
+// A number loaded from an object's own memory in a field typed `Num`: a
+// double (see `object::FieldType::Num`), into `facc`.
+stencil!("decode_num_acc"; |s| {
+    s.facc = s.tag.decode_f64(s.acc);
+    next!(s)
+});
+
+// A number loaded from a field typed `Num` out of line, which may be an
+// int32 stored before the field was, into `facc`.
 stencil!("unbox_num_acc"; |s| {
     s.facc = if s.tag.is_int32(s.acc) {
         i2f(int(s.acc))

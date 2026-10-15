@@ -3402,6 +3402,10 @@ struct Sel {
     post: Option<&'static str>,
     /// A soft load's miss path ([`Insn::soft`]).
     soft: Option<Soft>,
+    /// A store of an int32 `acc` into a field typed `Num`: in the object's
+    /// own memory, it goes in as a double (the `_d` stores; see
+    /// `object::FieldType::Num`).
+    dbl: bool,
     /// The register whose slot the stencil reads, if not the
     /// instruction's: a copy's, if in memory or a general register (see
     /// [`slot_reg`]).
@@ -3420,6 +3424,7 @@ impl Sel {
             post: None,
             soft: None,
             reg: None,
+            dbl: false,
         }
     }
 }
@@ -4655,6 +4660,21 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     if insn.soft { soften(insn, st, spec, sel) } else { sel }
 }
 
+/// The piece after a load from fields typed `Num` in objects' own memory,
+/// at byte offset `off` of shape `shape` each, which takes a double: those
+/// that went from `Int` to `Num` hold no int32s there from now on
+/// (`Vm::int_fields_to_doubles`).
+fn decode_num(at: impl IntoIterator<Item = (u64, i32)>) -> Option<&'static str> {
+    let ints = at.into_iter().any(|(shape, off)| {
+        let s = unsafe { &*(shape as *const Shape) };
+        (0..s.keys.len() as u32).any(|i| s.location(i) == off && s.field_cell(i).holds_ints())
+    });
+    if ints {
+        unsafe { (*crate::interp::current_vm()).int_fields_to_doubles() };
+    }
+    Some("decode_num_acc")
+}
+
 /// A soft load's selection ([`Insn::soft`]) from its cached one: where a
 /// guard can miss, the miss goes through the runtime (see [`Soft`]), so
 /// past it the receiver's shape is what it was before; the value from the
@@ -4668,6 +4688,9 @@ fn soften(insn: &Insn, st: &TypeState, spec: &Spec, mut sel: Sel) -> Sel {
     }
     let check = match sel.out.acc {
         Ty::I32 => Some(("check_acc_int", 0, 0)),
+        // (The runtime's number may be an int32: `decode_num_acc` takes a
+        // double.)
+        Ty::F64 if sel.post == Some("decode_num_acc") => Some(("check_acc_dbl", 0, 0)),
         Ty::F64 => Some(("check_acc_num", 0, 0)),
         Ty::Obj(s) | Ty::Ext(s) => Some(("check_acc_shape", s, 0)),
         Ty::Any => None,
@@ -4718,7 +4741,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             (FieldType::Int, I32) | (FieldType::Num, I32 | F64) => Ok(None),
             (FieldType::Int, F64) => Err(()),
             (FieldType::Int, _) => Ok(Some(("check_acc_int", 0, 0))),
-            (FieldType::Num, _) => Ok(Some(("check_acc_num", 0, 0))),
+            (FieldType::Num, _) => Ok(Some(("check_acc_dbl", 0, 0))),
             (FieldType::Obj(s), acc) if acc == Ty::Obj(s as u64) => Ok(None),
             (FieldType::Obj(_), I32 | F64) => Err(()),
             (FieldType::Obj(s), _) => Ok(Some(("check_acc_shape", s as u64, 0))),
@@ -4743,6 +4766,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             match check(ft) {
                 Ok(c) => {
                     sel.check = c;
+                    sel.dbl = ft == FieldType::Num && st.acc == I32;
                     sel
                 }
                 Err(()) => bail(sel.out),
@@ -4821,7 +4845,13 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                         ops: Some((off, 0, 0)),
                         ..Sel::new(base, "nc", out)
                     };
-                    return finish(sel, shape.field_type_relied(slot));
+                    let mut sel = finish(sel, shape.field_type_relied(slot));
+                    // In the object's own memory, a double (see
+                    // `FieldType::Num`).
+                    if sel.base == "get_own" && sel.post == Some("unbox_num_acc") {
+                        sel.post = decode_num([(s, off)]);
+                    }
+                    return sel;
                 }
             }
         }
@@ -4888,9 +4918,28 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                         out.regs.map(|_, t| ext(t));
                         out.acc = ext(out.acc);
                     }
-                    return finish(Sel::new("poly", "", out), cases[0].ft);
+                    // An int32 goes into a `Num` field as a double, an
+                    // `Int` one's as itself: not both.
+                    let num = cases.iter().any(|c| c.ft == FieldType::Num);
+                    if st.acc == I32 && num && cases.iter().any(|c| c.ft == FieldType::Int) {
+                        return bail(out);
+                    }
+                    let mut sel = finish(Sel::new("poly", "", out), cases[0].ft);
+                    sel.dbl = st.acc == I32 && num;
+                    return sel;
                 }
-                return finish(Sel::new("poly", "", out), ft);
+                let mut sel = finish(Sel::new("poly", "", out), ft);
+                if sel.post == Some("unbox_num_acc")
+                    && cases
+                        .iter()
+                        .all(|c| c.ft == FieldType::Num && matches!(c.loc, CaseLoc::Own(_)))
+                {
+                    sel.post = decode_num(cases.iter().map(|c| match c.loc {
+                        CaseLoc::Own(off) => (c.shape, off),
+                        _ => unreachable!(),
+                    }));
+                }
+                return sel;
             }
             (p, _) => p,
         };
@@ -4916,10 +4965,14 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         let case = if exact { "nc" } else { "" };
         out.regs.set(r, Ty::Obj(shape));
         let mut sel = match prop {
-            Prop::Own { ft, .. } => finish(
-                Sel::new(if load { "get_own" } else { "set_own" }, case, out),
-                ft,
-            ),
+            Prop::Own { ft, off, .. } => {
+                let mut sel =
+                    finish(Sel::new(if load { "get_own" } else { "set_own" }, case, out), ft);
+                if sel.post == Some("unbox_num_acc") {
+                    sel.post = decode_num([(shape, off)]);
+                }
+                sel
+            }
             Prop::Oop { ft, .. } => finish(
                 Sel::new(if load { "get_oop" } else { "set_oop" }, case, out),
                 ft,
@@ -6013,9 +6066,21 @@ fn stencil_for(
         // Stores take a boxed `acc`; a number's (`_n`) needs no barrier,
         // also one its check proved a number.
         ("set_own" | "set_oop" | "set_tr", _) => {
-            box_acc(&mut pre);
-            let num_checked = matches!(sel.check, Some(("check_acc_num" | "check_acc_int", ..)));
-            let n = if matches!(st.acc, Ty::I32 | Ty::F64) || num_checked { "_n" } else { "" };
+            // An int32 into a `Num` field in the object: `acc` stays as it
+            // is, the `_d` store boxes it as a double.
+            let d = sel.dbl && sel.base != "set_oop";
+            if !d {
+                box_acc(&mut pre);
+            }
+            let num_checked =
+                matches!(sel.check, Some(("check_acc_num" | "check_acc_dbl" | "check_acc_int", ..)));
+            let n = if d {
+                "_d"
+            } else if matches!(st.acc, Ty::I32 | Ty::F64) || num_checked {
+                "_n"
+            } else {
+                ""
+            };
             if sel.case == "nc" {
                 cat!(sel.base, n, "_nc_", loc)
             } else {
@@ -8244,7 +8309,9 @@ impl JitCode {
                 name
             };
             let name = if defer_shape[i] {
-                name.replacen("set_tr_nc_", "set_own_nc_", 1).replacen("set_tr_n_nc_", "set_own_n_nc_", 1)
+                name.replacen("set_tr_nc_", "set_own_nc_", 1)
+                    .replacen("set_tr_n_nc_", "set_own_n_nc_", 1)
+                    .replacen("set_tr_d_nc_", "set_own_d_nc_", 1)
             } else {
                 name
             };
@@ -9855,6 +9922,8 @@ fn emit_poly(
         }
         for (base, imm, imm64b) in bodies {
             let k = hot.len();
+            // (`_d` boxes the int32 as a double into a `Num` field.)
+            let d = if s.dbl && base != "set_oop" { "_d" } else { "" };
             hot.push(Piece {
                 imm64b,
                 reg: insn.reg,
@@ -9864,7 +9933,7 @@ fn emit_poly(
                 } else {
                     Target::AfterPiece(end as u32)
                 },
-                ..Piece::with_imm(&format!("{base}_nc_{loc}"), imm)
+                ..Piece::with_imm(&format!("{base}{d}_nc_{loc}"), imm)
             });
         }
         if let Some(soft) = s.soft {

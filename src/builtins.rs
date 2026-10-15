@@ -216,6 +216,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     crate::date::install(vm);
     install_typed_arrays(vm);
+    crate::collections::install(vm);
     install_regexps(vm);
 
     crate::json::install(vm);
@@ -249,7 +250,7 @@ pub(crate) fn install(vm: &mut Vm) {
 }
 
 /// `c.prototype = proto` and `proto.constructor = c`, as the builtins'.
-fn link_constructor(vm: &mut Vm, c: *mut Object, proto: *mut Object) {
+pub(crate) fn link_constructor(vm: &mut Vm, c: *mut Object, proto: *mut Object) {
     let (a_p, a_c) = (vm.intern("prototype"), vm.intern("constructor"));
     vm.add_property_with(c, a_p, object_value(proto), READ_ONLY | DONT_ENUM | DONT_DELETE);
     vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
@@ -947,6 +948,11 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             Class::RegExp => "RegExp",
             Class::Wrapper => primitive_tag(wrapped(this).unwrap()),
             Class::Plain if unsafe { (*o).flags } & crate::object::ERROR != 0 => "Error",
+            Class::Map => "Map",
+            Class::Set => "Set",
+            Class::WeakMap => "WeakMap",
+            Class::WeakSet => "WeakSet",
+            Class::DataView => "DataView",
             _ => "Object",
         }
     } else {
@@ -1383,10 +1389,11 @@ fn install_typed_arrays(vm: &mut Vm) {
     }
 }
 
-/// An accessor `name` on `o` whose getter is the native `f`.
-fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) {
+/// An accessor `name` on `o` whose getter is the native `f` (named `get
+/// name`, as the spec has it).
+pub(crate) fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) {
     let holder = vm.new_object(Value::NULL);
-    let fo = vm.define_native(holder, name, f, 0, Ty::Any, false);
+    let fo = vm.define_native(holder, &format!("get {name}"), f, 0, Ty::Any, false);
     let a = vm.intern(name);
     vm.define_accessor(o, a, Some(object_value(fo)), None, DONT_ENUM);
 }
@@ -1397,7 +1404,7 @@ fn buffer_is_view(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// A new buffer of `n` zero bytes.
-fn new_buffer(vm: &mut Vm, n: usize) -> *mut Object {
+pub(crate) fn new_buffer(vm: &mut Vm, n: usize) -> *mut Object {
     let abp = object_value(vm.array_buffer_prototype);
     let o = vm.new_object_with(Class::ArrayBuffer, abp, 0);
     unsafe {
@@ -1420,7 +1427,7 @@ fn new_view(vm: &mut Vm, k: TypedKind, buffer: *mut Object, offset: usize, len: 
     object_value(o)
 }
 
-fn is_class(v: Value, c: Class) -> bool {
+pub(crate) fn is_class(v: Value, c: Class) -> bool {
     v.is_cell() && unsafe { (*as_object(v)).class } == c
 }
 

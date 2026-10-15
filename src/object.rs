@@ -73,6 +73,43 @@ pub enum Class {
     /// Boolean(true)`): `code`'s bits are the primitive (a value, which the
     /// collector traces: a string is a cell).
     Wrapper,
+    /// A `Map`: `code`'s bits are a hidden array holding its entries, `k0,
+    /// v0, k1, v1, …` (a deleted entry's slots are holes). See
+    /// `collections`.
+    Map,
+    /// A `Set`: as [`Class::Map`], the entries `k0, k1, …`.
+    Set,
+    /// A `WeakMap`: as [`Class::Map`] (its keys are held strongly).
+    WeakMap,
+    /// A `WeakSet`: as [`Class::Set`].
+    WeakSet,
+    /// A `DataView`: laid out as a [`Class::TypedArray`] (`elems` points
+    /// to its first byte in its buffer, `elems_len` is its byte length,
+    /// `code` holds its buffer), with no element type.
+    DataView,
+    /// A `Map` or `Set` iterator: `code`'s bits are the entries array it
+    /// walks, `elems_len` its next position, `elems_cap` what it yields
+    /// (see `collections::IterMode`).
+    CollectionIterator,
+}
+
+impl Class {
+    /// Whether an object of this class has no elements at all (a
+    /// buffer's or data view's `elems` are bytes, a collection's and an
+    /// iterator's none): to JS, no own indexed properties.
+    #[inline(always)]
+    pub fn no_elements(self) -> bool {
+        matches!(
+            self,
+            Class::ArrayBuffer
+                | Class::Map
+                | Class::Set
+                | Class::WeakMap
+                | Class::WeakSet
+                | Class::DataView
+                | Class::CollectionIterator
+        )
+    }
 }
 
 /// A typed array's element type, as `Object::kind` holds it.

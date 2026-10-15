@@ -843,13 +843,19 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 }
                 return;
             }
-            Class::Wrapper => {
-                // The primitive it wraps (a string is a cell).
+            Class::Wrapper
+            | Class::Map
+            | Class::Set
+            | Class::WeakMap
+            | Class::WeakSet
+            | Class::CollectionIterator => {
+                // The primitive it wraps (a string is a cell), or a
+                // collection's entries array.
                 if within(code) {
                     v.value(Value::from_bits((*o).code as u64));
                 }
             }
-            Class::TypedArray => {
+            Class::TypedArray | Class::DataView => {
                 // `elems` points into the buffer's bytes.
                 if within(code) {
                     v.value(Value::from_bits((*o).code as u64));

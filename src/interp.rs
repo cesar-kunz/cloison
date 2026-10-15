@@ -1028,7 +1028,7 @@ handlers! {
         if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
             next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(g, (*ic).loc))
         }
-        let r = (*frame_vm(regs)).get_global_typeof_miss(&*frame_code(regs), u16_at(pc, 1));
+        let r = with_top(regs, None, |vm| vm.get_global_typeof_miss(&*frame_code(regs), u16_at(pc, 1)));
         next_or_throw!(Op::LdaGlobalInsideTypeof.size(), r)
     }
 
@@ -1445,14 +1445,14 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_lda_global(pc, acc, regs, tag) {
-        let r = (*frame_vm(regs)).get_global_miss(&*frame_code(regs), u16_at(pc, 1));
+        let r = with_top(regs, None, |vm| vm.get_global_miss(&*frame_code(regs), u16_at(pc, 1)));
         next_or_throw!(Op::LdaGlobal.size(), r)
     }
 
     #[cold]
     #[inline(never)]
     fn slow_sta_global(pc, acc, regs, tag) {
-        let r = (*frame_vm(regs)).set_global_miss(&*frame_code(regs), u16_at(pc, 1), acc);
+        let r = with_top(regs, None, |vm| vm.set_global_miss(&*frame_code(regs), u16_at(pc, 1), acc));
         next_or_throw!(Op::StaGlobal.size(), r.map(|()| acc))
     }
 

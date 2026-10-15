@@ -126,6 +126,7 @@ fn generate_from<'p>(
             Some(k) if emit[k] == Emit::Compile => {
                 if lazy.is_some()
                     && !f.eager
+                    && f.withs.is_empty()
                     && !scopes.upvalues[i].contains(&ENV)
                     && scopes.upvalues[i].len() <= LAZY_UPVALUES
                     && f.params.len() < LOCAL_REGS
@@ -149,7 +150,7 @@ fn generate_from<'p>(
         match emit[i] {
             Emit::Skip => {}
             Emit::Compile => {
-                let mut f = Gen::new(p, &decls, &overflow[i], &scopes, &names, i).function()?;
+                let mut f = Gen::new(p, &decls, &overflow[i], &scopes, &names, i, lazy.is_some()).function()?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
                 functions.push(f);
@@ -407,10 +408,13 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
 /// The names function `f`'s own code refers to (not its nested
 /// functions').
 fn references<'a>(f: &'a Function<'_>) -> Vec<&'a str> {
-    match &f.free {
+    let mut out = match &f.free {
         Some(free) => free.iter().map(|n| &**n).collect(),
         None => names(f, false),
-    }
+    };
+    // (The objects of the `with` statements enclosing it: captured.)
+    out.extend(f.withs.iter().map(|n| &**n));
+    out
 }
 
 /// Whether call `f(args)` is `g.apply(x, arguments)`.
@@ -463,7 +467,7 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 expr_refs(object, out);
                 stmt(body, out);
             }
-            StmtKind::While(c, body) | StmtKind::DoWhile(body, c) | StmtKind::With(c, body) => {
+            StmtKind::While(c, body) | StmtKind::DoWhile(body, c) | StmtKind::With(c, _, body) => {
                 expr_refs(c, out);
                 stmt(body, out);
             }
@@ -529,11 +533,14 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
                     stmt(b, p, out);
                 }
             }
+            StmtKind::With(_, name, body) => {
+                add(name, out);
+                stmt(body, p, out)
+            }
             StmtKind::For { body, .. }
             | StmtKind::ForIn { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
-            | StmtKind::With(_, body)
             | StmtKind::Labeled(_, body) => stmt(body, p, out),
             StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, out)),
             StmtKind::Switch(_, cases) => cases
@@ -679,7 +686,7 @@ fn returns(s: &Stmt) -> bool {
             | StmtKind::ForIn { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
-            | StmtKind::With(_, body)
+            | StmtKind::With(_, _, body)
             | StmtKind::Labeled(_, body) => jumps(body),
             StmtKind::Block(b) => b.iter().any(jumps),
             StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).any(jumps),
@@ -845,10 +852,18 @@ struct Gen<'a> {
     in_try: u32,
     /// The `try` statements being compiled, outermost first.
     trys: Vec<TryCtx<'a>>,
-    /// The registers holding the objects of the `with` statements being
-    /// compiled, outermost first: names are looked up in them first (see
-    /// [`Gen::with_lookup`]).
-    withs: Vec<u8>,
+    /// The variables holding the objects of the `with` statements
+    /// enclosing the code being compiled, outermost first: names are
+    /// looked up in them first (see [`Gen::with_lookup`]).
+    withs: Vec<Name>,
+    /// Compiling `eval`'s or `Function`'s code (see [`generate_lazy`]).
+    eval: bool,
+    /// The script's completion value (`eval`'s result): a register,
+    /// in the script only.
+    completion: Option<u8>,
+    /// The statement being compiled has cleared the completion value
+    /// (so its own match arm doesn't again).
+    cleared: bool,
     /// How many statements enclose the one being compiled: 1 for the
     /// function body's own.
     depth: u32,
@@ -872,6 +887,7 @@ impl<'a> Gen<'a> {
         scopes: &'a Scopes<'a>,
         names: &'a std::cell::RefCell<HashSet<Name>>,
         index: usize,
+        eval: bool,
     ) -> Self {
         let f = &p.functions[index];
         // The script's names are globals.
@@ -909,7 +925,10 @@ impl<'a> Gen<'a> {
             deferred: Vec::new(),
             handlers: Vec::new(),
             in_try: 0,
-            withs: Vec::new(),
+            withs: f.withs.clone(),
+            eval,
+            completion: None,
+            cleared: false,
             depth: 0,
             trys: Vec::new(),
         }
@@ -961,25 +980,40 @@ impl<'a> Gen<'a> {
                 self.global(Op::LdaGlobalInsideTypeof, name);
                 self.global(Op::StaGlobal, name);
             }
-            // The script's completion value is its last expression
-            // statement's.
-            match body.split_last() {
-                Some((
-                    Stmt {
-                        kind: StmtKind::Expr(e),
-                        ..
-                    },
-                    rest,
-                )) => {
-                    for s in rest {
-                        self.stmt(s)?;
-                    }
-                    self.value(e)?;
-                    self.emit(Op::Return, &[]);
+            if self.eval {
+                // `eval`'s result is the script's completion value: each
+                // expression statement's value, as the spec's completion
+                // records have it (see `Gen::completion`).
+                let cv = self.alloc(self.f.pos)?;
+                self.completion = Some(cv);
+                self.emit(Op::LdaUndefined, &[]);
+                self.star(cv);
+                for s in body {
+                    self.stmt(s)?;
                 }
-                _ => {
-                    for s in body {
-                        self.stmt(s)?;
+                self.ldar(cv);
+                self.emit(Op::Return, &[]);
+            } else {
+                // The script's completion value (printed by `toi`) is its
+                // last expression statement's.
+                match body.split_last() {
+                    Some((
+                        Stmt {
+                            kind: StmtKind::Expr(e),
+                            ..
+                        },
+                        rest,
+                    )) => {
+                        for s in rest {
+                            self.stmt(s)?;
+                        }
+                        self.value(e)?;
+                        self.emit(Op::Return, &[]);
+                    }
+                    _ => {
+                        for s in body {
+                            self.stmt(s)?;
+                        }
                     }
                 }
             }
@@ -1068,7 +1102,7 @@ impl<'a> Gen<'a> {
                 StmtKind::For { body, .. }
                 | StmtKind::While(_, body)
                 | StmtKind::DoWhile(body, _)
-                | StmtKind::With(_, body)
+                | StmtKind::With(_, _, body)
                 | StmtKind::Labeled(_, body) => walk(body, init, bare),
                 StmtKind::Block(b) => b.iter().for_each(|s| walk(s, init, bare)),
                 StmtKind::Switch(_, cases) => cases
@@ -1584,9 +1618,14 @@ impl<'a> Gen<'a> {
         let k = self.alloc(pos)?;
         self.string(name);
         self.star(k);
-        for (i, &r) in withs.iter().enumerate().rev() {
+        let r = self.alloc(pos)?;
+        for (i, w) in withs.iter().enumerate().rev() {
             let next = self.label();
-            self.ldar(r);
+            self.value_inner(&Expr {
+                kind: ExprKind::Ident(w.clone()),
+                pos,
+            })?;
+            self.star(r);
             self.emit(Op::TestIn, &[Arg::Reg(k)]);
             self.jump_if(Jmp::False, next);
             // (The lookup continues in the enclosing `with`s only.)
@@ -2481,7 +2520,30 @@ impl<'a> Gen<'a> {
                 self.store_var(name, s.pos)?;
             }
             StmtKind::Function(_) | StmtKind::Empty => {}
+            StmtKind::Expr(e) if self.completion.is_some() => {
+                self.value(e)?;
+                self.star(self.completion.unwrap());
+            }
             StmtKind::Expr(e) => self.effect(e)?,
+            // A statement with a body completes as `undefined` unless an
+            // expression statement in it says otherwise (UpdateEmpty).
+            StmtKind::If(..)
+            | StmtKind::For { .. }
+            | StmtKind::ForIn { .. }
+            | StmtKind::While(..)
+            | StmtKind::DoWhile(..)
+            | StmtKind::Switch(..)
+            | StmtKind::Try(..)
+            | StmtKind::With(..)
+                if self.completion.is_some() && !self.cleared =>
+            {
+                self.emit(Op::LdaUndefined, &[]);
+                self.star(self.completion.unwrap());
+                self.cleared = true;
+                let r = self.stmt_inner(s);
+                self.cleared = false;
+                return r;
+            }
             StmtKind::If(c, then, None)
                 if self.in_try == 0 && returns(then) && self.jumps_when_true(c) =>
             {
@@ -2530,11 +2592,12 @@ impl<'a> Gen<'a> {
                 self.looping(labels, Some(c), None, body, !first_passes)?;
             }
             StmtKind::DoWhile(body, c) => self.looping(labels, Some(c), None, body, false)?,
-            StmtKind::With(o, body) => {
+            StmtKind::With(o, name, body) => {
                 self.value(o)?;
-                let r = self.alloc(s.pos)?;
-                self.star(r);
-                self.withs.push(r);
+                let saved = std::mem::take(&mut self.withs);
+                self.store_var(name, s.pos)?;
+                self.withs = saved;
+                self.withs.push(name.clone());
                 let res = self.stmt(body);
                 self.withs.pop();
                 res?;

@@ -791,7 +791,8 @@ handlers! {
         let mut spread = Vec::new();
         let (args, argc) = frame_args(&mut *vm, regs, &mut spread);
         if let Some(fo) = unwrap_apply(vm, *reg(pc, 1, regs), *w) {
-            let that = sloppy_this(vm, *w.add(1));
+            // (`push_frame` boxes `this` as the callee wants.)
+            let that = *w.add(1);
             enter!(fo, that, args, argc, 0, Op::CallApplyArguments.size())
         }
         let values = std::slice::from_raw_parts(args, argc);
@@ -1351,9 +1352,12 @@ handlers! {
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
             note_callee(regs, ic_at(regs, pc, 4), as_object(f));
             let args = reg(pc, 2, regs);
-            // Sloppy mode (toi has no strict mode): `this` is the global
-            // object.
-            let this = object_value((*frame_vm(regs)).global);
+            // Sloppy mode: `this` is the global object; strict: `undefined`.
+            let this = if (*(*as_object(f)).code).strict {
+                Value::UNDEFINED
+            } else {
+                object_value((*frame_vm(regs)).global)
+            };
             enter!(as_object(f), this, args, *pc.add(3) as usize, 0, Op::CallUndefined.size())
         }
         tail!(slow_call_undefined, acc)
@@ -1533,7 +1537,6 @@ handlers! {
             note_callee(regs, ic, fo);
             (*ic).loc = VIA_CALL;
             let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
-            let that = sloppy_this(frame_vm(regs), that);
             enter!(fo, that, w.add(2), argc.saturating_sub(1), 0, Op::Call.size())
         }
         // `f.apply(that, list)` with `f` a bytecode function: call `f` with
@@ -1545,7 +1548,6 @@ handlers! {
             record_callee(pc, regs, tag);
             (*ic).loc = 0;
             let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
-            let that = sloppy_this(frame_vm(regs), that);
             enter!(fo, that, spread.as_ptr(), spread.len(), 0, Op::Call.size())
         }
         record_callee(pc, regs, tag);
@@ -3232,7 +3234,7 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
         }
         write_frame_header(vm, new, callee, std::ptr::null(), std::ptr::null_mut(), 0);
         set_header(new, FUNC, fo);
-        *new = sloppy_this(vm, this);
+        *new = if (*callee).strict { this } else { sloppy_this(vm, this) };
         let k = args.len().min((*callee).nparams as usize);
         for i in 0..k {
             *new.add(1 + i) = args[i];
@@ -3541,7 +3543,7 @@ unsafe fn push_frame(
         *new.sub(FLAGS) = Value::from_bits(flags);
         set_header(new, FUNC, fo);
         // Sloppy mode: a primitive `this` is boxed (a string is a cell).
-        *new = if this.is_cell() && (*as_object(this)).class != Class::String {
+        *new = if (*callee).strict || this.is_cell() && (*as_object(this)).class != Class::String {
             this
         } else {
             sloppy_this(vm, this)
@@ -4017,7 +4019,7 @@ pub(crate) unsafe fn call_from_jit(
             match unwrap_call(vm, fv, this) {
                 Some(fo) if op == Op::Call => {
                     fv = object_value(fo);
-                    this = sloppy_this(vm, if argc == 0 { Value::UNDEFINED } else { *args });
+                    this = if argc == 0 { Value::UNDEFINED } else { *args };
                     args = args.add(1);
                     argc = argc.saturating_sub(1);
                 }
@@ -4045,6 +4047,8 @@ pub(crate) unsafe fn call_from_jit(
         // (A `Call` the JIT made of `f.call(that, …)` passes `that`.)
         let this = if op == Op::Construct {
             vm.construct_this(fo)
+        } else if (*callee).strict {
+            this
         } else {
             sloppy_this(vm, this)
         };

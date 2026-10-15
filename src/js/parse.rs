@@ -39,8 +39,10 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
         params_pos: 0,
         end: 0,
         eager: false,
+        strict: false,
         free: None,
     });
+    p.functions[0].strict = p.directive_prologue();
     let mut body = Vec::new();
     while p.peek() != &Tok::Eof {
         body.push(p.statement()?);
@@ -185,6 +187,32 @@ impl<'a> Parser<'_, 'a> {
 
     /// A statement's terminating semicolon, or where one is inserted
     /// automatically: before `}`, at the end, or after a line break.
+    /// Whether a directive prologue with `"use strict"` starts here: string
+    /// expression statements, one of them `"use strict"` (not consumed).
+    fn directive_prologue(&mut self) -> bool {
+        let mut j = self.i;
+        while let Tok::Str(s) = &self.toks[j].tok {
+            let next = &self.toks[j + 1];
+            let ends = matches!(next.tok, Tok::Punct(";" | "}") | Tok::Eof) || next.newline_before;
+            if !ends {
+                return false;
+            }
+            if s == "use strict" {
+                return true;
+            }
+            j += 1;
+            if self.toks[j].tok == Tok::Punct(";") {
+                j += 1;
+            }
+        }
+        false
+    }
+
+    /// Whether the code being parsed is strict.
+    fn strict(&self) -> bool {
+        self.functions[self.current].strict
+    }
+
     fn semicolon(&mut self) -> R<()> {
         if self.eat(";") || self.is("}") || *self.peek() == Tok::Eof {
             return Ok(());
@@ -218,6 +246,9 @@ impl<'a> Parser<'_, 'a> {
                 return self.err(format!("`{k}` is not supported"));
             }
             Tok::Keyword("with") => {
+                if self.strict() {
+                    return self.err("`with` in strict mode");
+                }
                 self.advance();
                 self.expect("(")?;
                 let o = self.expression(false)?;
@@ -489,6 +520,7 @@ impl<'a> Parser<'_, 'a> {
             params_pos: self.pos(),
             end: 0,
             eager: false,
+            strict: self.functions[self.current].strict,
             free: None,
         });
         self.expect("(")?;
@@ -501,6 +533,19 @@ impl<'a> Parser<'_, 'a> {
             params.push(p);
         }
         self.expect("{")?;
+        if self.directive_prologue() {
+            self.functions[index].strict = true;
+        }
+        if self.functions[index].strict {
+            for (k, p) in params.iter().enumerate() {
+                if params[..k].contains(p) {
+                    return self.err(format!("duplicate parameter `{p}` in strict mode"));
+                }
+                if matches!(&**p, "eval" | "arguments") {
+                    return self.err(format!("`{p}` as a parameter name in strict mode"));
+                }
+            }
+        }
         if self.skim && !paren {
             let start = self.i;
             if let Some(free) = self.skim_body(&params)
@@ -692,6 +737,12 @@ impl<'a> Parser<'_, 'a> {
             ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)
         ) {
             return self.err("invalid assignment target");
+        }
+        if let ExprKind::Ident(n) = &target.kind
+            && self.strict()
+            && matches!(&**n, "eval" | "arguments")
+        {
+            return self.err(format!("assignment to `{n}` in strict mode"));
         }
         self.advance();
         let value = self.assignment(no_in)?;

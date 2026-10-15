@@ -366,6 +366,9 @@ pub struct Code {
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
     pub constructs: bool,
+    /// Strict mode code: its `this` is the receiver as is, `undefined`
+    /// for a plain call (see `interp::push_frame`).
+    pub strict: bool,
     /// For `new`: the in-object capacity to give new objects, and the root
     /// shape last used. Slack tracking: until the first `new` returns (the
     /// capacity is not `ctor_settled`), objects get a root of their own
@@ -2922,6 +2925,7 @@ impl Vm {
             ic_misses: Cell::new(0),
             native: Some(f),
             constructs,
+            strict: false,
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
             ctor_settled: Cell::new(true),
@@ -3297,6 +3301,7 @@ impl Vm {
                     line: f.line,
                     col: f.col,
                     bytecode,
+                    strict: f.strict,
                     nparams: f.nparams,
                     nregs: f.nregs,
                     ics: Default::default(),

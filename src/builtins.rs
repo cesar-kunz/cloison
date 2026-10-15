@@ -171,6 +171,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
 
+    crate::date::install(vm);
     install_typed_arrays(vm);
     install_regexps(vm);
 
@@ -1087,7 +1088,7 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             Class::Array => "Array",
             Class::Function | Class::Native => "Function",
             Class::String => "String",
-            _ if crate::vm::date_value(this).is_some() => "Date",
+            _ if crate::date::date_value(this).is_some() => "Date",
             _ => "Object",
         }
     } else if this.is_bool() {

@@ -324,6 +324,10 @@ pub static STUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 /// A function's code, shared by its closures.
 pub struct Code {
     pub name: String,
+    /// Where it starts in its source, 1-based line and column, for
+    /// `TOI_JIT_LOG` (see `asm::FunctionDef::line`).
+    pub line: u32,
+    pub col: u32,
     pub bytecode: Vec<u8>,
     pub nparams: u32,
     /// Register count, `r0` (`this`) and the parameters included.
@@ -2746,6 +2750,8 @@ impl Vm {
     ) -> *mut Object {
         let code = self.add_code(Code {
             name: name.to_string(),
+            line: 0,
+            col: 0,
             bytecode: Vec::new(),
             nparams,
             nregs: 1 + nparams,
@@ -3125,6 +3131,8 @@ impl Vm {
                 }
                 self.add_code(Code {
                     name: f.name,
+                    line: f.line,
+                    col: f.col,
                     bytecode,
                     nparams: f.nparams,
                     nregs: f.nregs,

@@ -77,10 +77,9 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   (final code: the last compile of each entry), to find where toi's code
   is larger than it needs to be; `--asm FILE FN` prints both
   disassemblies of one function. Maglev's sizes are cached by Node
-  version and file contents. Functions are matched by name, so a file
-  whose hot functions have names of their own compares best (toi's log
-  names `X.prototype.m` just `m`). `--pieces` breaks toi's final code down
-  per stencil family and per task of
+  version and file contents. Functions are matched by name and source
+  position (`name:line:col`, which `TOI_JIT_LOG` prints). `--pieces`
+  breaks toi's final code down per stencil family and per task of
   [docs/maglev-size-tasks.md](../docs/maglev-size-tasks.md);
   `--pieces --record` appends the task totals to
   [maglev-tasks.tsv](maglev-tasks.tsv), by commit, and every run shows the

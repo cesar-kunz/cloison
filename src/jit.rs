@@ -8949,12 +8949,16 @@ impl JitCode {
     /// function's code, entered at bytecode offset `pc`, and its size in
     /// bytes: hot code, out-of-line code, exits, and all of it, alignment
     /// included (`scripts/sizes.sh` and `scripts/vs-maglev.sh` read these).
+    /// The function is named `name:line:col` where its source position is
+    /// known (see `asm::FunctionDef::line`).
     fn log(&self, function: *const crate::vm::Code, pc: usize) {
         if std::env::var_os("TOI_JIT_LOG").is_some() {
             let names: Vec<&str> = self.stencils.iter().flatten().map(String::as_str).collect();
+            let f = unsafe { &*function };
+            let name = if f.line == 0 { f.name.clone() } else { format!("{}:{}:{}", f.name, f.line, f.col) };
             eprintln!(
                 "jit {} @{pc} ({} hot, {} out-of-line, {} exits, {} bytes): {}",
-                unsafe { &(*function).name },
+                name,
                 self.main_len,
                 self.ool_len,
                 self.exit_len,
@@ -15084,12 +15088,15 @@ unsafe fn vm_run_(
             };
             // Debugging: `TOI_JIT_DUMP=<file>` writes the last compilation's
             // hot code (`TOI_JIT_LOG`: see `JitCode::log`), of the function
-            // named `TOI_JIT_DUMP_FN` if set; a `%n` in the name is the
+            // named `TOI_JIT_DUMP_FN` if set (`name`, or `name:line:col`
+            // as `TOI_JIT_LOG` prints it); a `%n` in the name is the
             // compilation's number, for a file each.
             if f.stats.compiles != compiles
                 && let Some(c) = f.last_code()
                 && let Ok(path) = std::env::var("TOI_JIT_DUMP")
-                && std::env::var("TOI_JIT_DUMP_FN").map_or(true, |n| n == code.name)
+                && std::env::var("TOI_JIT_DUMP_FN").map_or(true, |n| {
+                    n == code.name || n == format!("{}:{}:{}", code.name, code.line, code.col)
+                })
             {
                 let path = path.replace("%n", &f.stats.compiles.to_string());
                 std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");

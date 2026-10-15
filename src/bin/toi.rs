@@ -113,11 +113,13 @@ fn main() -> ExitCode {
             if std::env::var_os("TOI_SIZES").is_some() {
                 let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
-                    "sizes functions={} stubs={} bytecode={} jit_hot={} jit_total={} compiles={} lowers={} compile_ms={:.1} lower_ms={:.1}",
+                    "sizes functions={} stubs={} bytecode={} jit_hot={} jit_ool={} jit_exits={} jit_total={} compiles={} lowers={} compile_ms={:.1} lower_ms={:.1}",
                     n(&toi::vm::FUNCTIONS),
                     n(&toi::vm::STUBS),
                     n(&toi::vm::BYTECODE_BYTES),
                     n(&toi::jit::JIT_HOT_BYTES),
+                    n(&toi::jit::JIT_OOL_BYTES),
+                    n(&toi::jit::JIT_EXIT_BYTES),
                     n(&toi::jit::JIT_BYTES),
                     n(&toi::jit::COMPILES),
                     n(&toi::jit::LOWERS),

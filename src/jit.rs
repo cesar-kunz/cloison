@@ -7141,6 +7141,12 @@ pub struct JitCode {
     entry: usize,
     /// Bytes of hot code, from the start (excluding cold code).
     main_len: usize,
+    /// Bytes of out-of-line code off the hot path that isn't an exit:
+    /// edge stubs, `__slow` helpers and runtime-call wrappers (what Maglev
+    /// calls deferred code).
+    ool_len: usize,
+    /// Bytes of exit stubs (spills, then the exit to the interpreter).
+    exit_len: usize,
     /// Bytes of code: hot, cold (stubs, helpers) and runtime-call wrappers.
     len: usize,
     /// The selected stencil per instruction (`None`: unreachable from the
@@ -8597,8 +8603,12 @@ impl JitCode {
         let entry_at = if has_entry_seq { 0 } else { label(entry) };
 
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
+        let stubs_at = pos;
         let stub_ats: Vec<Vec<usize>> = stubs.iter().map(|s| place(s, &mut pos)).collect();
+        let exits_at = pos;
         let exit_ats: Vec<Vec<usize>> = exits.iter().map(|(_, s)| place(s, &mut pos)).collect();
+        let (stubs_len, exit_len) = (exits_at - stubs_at, pos - exits_at);
+        let helpers_at = pos;
         let exit_at: HashMap<usize, usize> = exits
             .iter()
             .zip(&exit_ats)
@@ -8639,7 +8649,9 @@ impl JitCode {
             .collect();
         saved_fprs.sort_unstable();
         saved_fprs.dedup();
+        let helpers_len = pos - helpers_at;
         pos = pos.next_multiple_of(arch::CODE_ALIGN);
+        let wrappers_at = pos;
         let mut tramp_at: HashMap<u8, usize> = HashMap::default();
         let mut wrappers: Vec<(usize, Vec<u8>, &str)> = Vec::new();
         let all_stencils = hot
@@ -8668,6 +8680,7 @@ impl JitCode {
         }
 
         let len = pos;
+        let ool_len = stubs_len + helpers_len + (len - wrappers_at);
         let mut mem = ExecMem::new(pos);
         let base = mem.ptr as u64;
         let buf = mem.bytes();
@@ -8696,14 +8709,14 @@ impl JitCode {
                 let name = if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
                 sym(at, p.len(), name);
             }
-            for (pieces, ats) in stubs
-                .iter()
-                .zip(&stub_ats)
-                .chain(exits.iter().map(|(_, s)| s).zip(&exit_ats))
-            {
+            // Cold pieces: `stub:` edge stubs (out-of-line code, with the
+            // helpers and wrappers; see `JitCode::ool_len`), `exit:` exits.
+            let edge = stubs.iter().zip(&stub_ats).map(|s| ("stub", s));
+            let exit = exits.iter().map(|(_, s)| s).zip(&exit_ats).map(|s| ("exit", s));
+            for (kind, (pieces, ats)) in edge.chain(exit) {
                 for (p, &at) in pieces.iter().zip(ats) {
                     let name = if p.raw != 0 { "direct_call" } else { p.stencil.stencil().name };
-                    sym(at, p.len(), &format!("cold:{name}"));
+                    sym(at, p.len(), &format!("{kind}:{name}"));
                 }
             }
             for &(_, h, at) in &helper_list {
@@ -8850,6 +8863,8 @@ impl JitCode {
 
         mem.seal();
         JIT_HOT_BYTES.fetch_add(main_len as u64, std::sync::atomic::Ordering::Relaxed);
+        JIT_OOL_BYTES.fetch_add(ool_len as u64, std::sync::atomic::Ordering::Relaxed);
+        JIT_EXIT_BYTES.fetch_add(exit_len as u64, std::sync::atomic::Ordering::Relaxed);
         JIT_BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
         let ret = returned(insns, &ins, false);
         if !root.is_null() {
@@ -8859,6 +8874,8 @@ impl JitCode {
             mem,
             entry: entry_at,
             main_len,
+            ool_len,
+            exit_len,
             len,
             stencils: names,
             homes,
@@ -8899,14 +8916,17 @@ impl JitCode {
 
     /// Debugging: with `TOI_JIT_LOG` set, print the stencils of a VM
     /// function's code, entered at bytecode offset `pc`, and its size in
-    /// bytes: hot code, and all of it (`scripts/sizes.sh` adds these up).
+    /// bytes: hot code, out-of-line code, exits, and all of it, alignment
+    /// included (`scripts/sizes.sh` and `scripts/vs-maglev.sh` read these).
     fn log(&self, function: *const crate::vm::Code, pc: usize) {
         if std::env::var_os("TOI_JIT_LOG").is_some() {
             let names: Vec<&str> = self.stencils.iter().flatten().map(String::as_str).collect();
             eprintln!(
-                "jit {} @{pc} ({} hot, {} bytes): {}",
+                "jit {} @{pc} ({} hot, {} out-of-line, {} exits, {} bytes): {}",
                 unsafe { &(*function).name },
                 self.main_len,
+                self.ool_len,
+                self.exit_len,
                 self.len,
                 names.join(" ")
             );
@@ -10238,10 +10258,12 @@ pub fn count_report() -> String {
 }
 
 pub static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Machine code compiled over the process: hot paths, and all of it (cold
-/// paths and stubs too); freed code included (`toi` prints them with
-/// `TOI_SIZES` set).
+/// Machine code compiled over the process: hot paths, out-of-line code
+/// (see `JitCode::ool_len`), exits, and all of it; freed code included
+/// (`toi` prints them with `TOI_SIZES` set).
 pub static JIT_HOT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static JIT_OOL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static JIT_EXIT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static JIT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn timed<T>(total: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> T) -> T {

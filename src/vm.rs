@@ -560,6 +560,8 @@ pub struct Vm {
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
+    /// `typeof`'s results, once made (see [`Vm::type_of`]).
+    type_names: [Option<Value>; 6],
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
@@ -714,6 +716,7 @@ impl Vm {
             conv_error: None,
             conv_thrown: false,
             open_upvalues: Vec::new(),
+            type_names: [None; 6],
             handles: Vec::new(),
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
@@ -1883,25 +1886,32 @@ impl Vm {
         self.get_named_miss(code, ic, object_value(self.global))
     }
 
-    /// `typeof v`, a string constant.
+    /// `typeof v`, a string constant (each made once: EarleyBoyer's
+    /// `sc_isNumber` and others spent 3% encoding and looking them up).
     pub fn type_of(&mut self, v: Value) -> Value {
-        let name = if v.is_number() {
-            "number"
+        const NAMES: [&str; 6] = ["number", "undefined", "boolean", "string", "function", "object"];
+        let k = if v.is_number() {
+            0
         } else if v.is_undefined() {
-            "undefined"
+            1
         } else if v.is_bool() {
-            "boolean"
+            2
         } else if v.is_cell() {
             match unsafe { (*as_object(v)).class } {
-                Class::String => "string",
-                Class::Function | Class::Native => "function",
-                _ => "object",
+                Class::String => 3,
+                Class::Function | Class::Native => 4,
+                _ => 5,
             }
         } else {
-            "object"
+            5
         };
-        let units: Vec<u16> = name.encode_utf16().collect();
-        self.string_constant(&units)
+        if let Some(s) = self.type_names[k] {
+            return s;
+        }
+        let units: Vec<u16> = NAMES[k].encode_utf16().collect();
+        let s = self.string_constant(&units);
+        self.type_names[k] = Some(s);
+        s
     }
 
     /// `StaGlobal` miss (sloppy mode: creates the global if missing). Only
@@ -3084,6 +3094,12 @@ impl Vm {
                     _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                     (true, _) => self.tier_calls,
                     (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
+                    // (One whose registers closures capture isn't inlined:
+                    // compiled callers call it through the runtime, into
+                    // the interpreter, unless it is compiled. EarleyBoyer's
+                    // `deriv_trees`, recursive through its closures, ran
+                    // interpreted for 12 million calls from `loop2`.)
+                    (false, false) if f.captures => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
                     (false, false) => i32::MAX,
                 };
                 let loop_budget = if !interpreted { self.frame_budget } else { i64::MAX };

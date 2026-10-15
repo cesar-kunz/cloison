@@ -9424,6 +9424,10 @@ pub(crate) struct CallSite {
     /// (see [`Dispatch`]).
     misses: u32,
     dispatch: Option<Box<Dispatch>>,
+    /// The callee's registers are captured and its call countdown hasn't
+    /// run out (see [`Lowering::direct_target`]): binding waits till it
+    /// has (calls meanwhile go through the runtime, counting it down).
+    wait_hot: bool,
 }
 
 /// A direct call site whose callee varies (gbemu's `OPCODE[op](this)`,
@@ -9777,6 +9781,9 @@ unsafe fn direct_version(site: *const CallSite, this: Ty, args: &[Ty]) -> Versio
     let Ok(mut slot) = (unsafe { (*callee).jit.try_borrow_mut() }) else {
         return Version::Busy;
     };
+    if site.wait_hot && unsafe { (*callee).calls_left.get() } > 0 {
+        return Version::Busy;
+    }
     let f = slot.get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, vm)));
     // Cooling after an exit: binding waits (calls meanwhile go through the
     // interpreter, which counts the cooling down).
@@ -12521,6 +12528,7 @@ impl Lowering<'_> {
             misses: 0,
             table: std::ptr::null_mut(),
             dispatch: None,
+            wait_hot: false,
         }
     }
 
@@ -12641,14 +12649,19 @@ impl Lowering<'_> {
         // before its calls made it hot (its countdown ran out): CodeLoad's,
         // made anew by each run's code and called a few times, were
         // compiled so, for nothing.
-        let cold_capturing = self.captures(callee) && unsafe { (*callee).calls_left.get() } > 0;
+        // One whose countdown is running binds once it has run out
+        // (`wait_hot`): EarleyBoyer's `loop2` called `deriv_trees` through
+        // the runtime 12 million times, lowered before it was hot.
+        let left = unsafe { (*callee).calls_left.get() };
+        let cold_capturing = self.captures(callee) && left > 0;
         if (self.state.tier == Tier::Warm || cold_capturing) && !site.self_call {
             let compiled = unsafe { (*callee).jit.try_borrow() }
                 .ok()
                 .is_some_and(|f| f.as_ref().is_some_and(|f| !f.versions.is_empty()));
-            if !compiled {
+            if !compiled && (self.state.tier == Tier::Warm || left == i32::MAX) {
                 return false;
             }
+            site.wait_hot = !compiled;
         }
         site.closure = fo as u64;
         unsafe { (*self.state.vm).heap.keep(fo as usize) };

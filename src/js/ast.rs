@@ -83,6 +83,9 @@ pub struct Function<'a> {
     /// Strict mode code (a `"use strict"` directive of its own or of an
     /// enclosing function): `this` isn't boxed or made the global object.
     pub strict: bool,
+    /// The variables of the `with` statements enclosing it (see
+    /// `StmtKind::With`), outermost first.
+    pub withs: Vec<Name>,
     /// Skimmed, not parsed (see `parse::parse_with`): no body, and the
     /// names it and the functions in it may refer to from outside it (at
     /// least those they do), which stand for its references.
@@ -129,8 +132,10 @@ pub enum StmtKind<'a> {
     /// their statements.
     Switch(Expr<'a>, Vec<(Option<Expr<'a>>, Vec<Stmt<'a>>)>),
     Labeled(Name, &'a Stmt<'a>),
-    /// `with (object) body`
-    With(Expr<'a>, &'a Stmt<'a>),
+    /// `with (object) body`: the object is kept in the variable named
+    /// (`%with0`, …), which nested functions capture (see
+    /// `codegen::Gen::with_lookup`).
+    With(Expr<'a>, Name, &'a Stmt<'a>),
     Empty,
 }
 

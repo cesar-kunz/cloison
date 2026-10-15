@@ -26,6 +26,8 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
         current: 0,
         skim,
         skim_spare: Vec::new(),
+        withs: Vec::new(),
+        with_count: 0,
     };
     p.functions.push(Function {
         name: None,
@@ -40,6 +42,7 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
         end: 0,
         eager: false,
         strict: false,
+        withs: Vec::new(),
         free: None,
     });
     p.functions[0].strict = p.directive_prologue();
@@ -64,6 +67,10 @@ struct Parser<'t, 'a> {
     skim: bool,
     /// Empty frames for [`Parser::skim_body`] to reuse.
     skim_spare: Vec<SkimFrame>,
+    /// The `with` statements being parsed: their variables (see
+    /// `StmtKind::With`), outermost first.
+    withs: Vec<Name>,
+    with_count: usize,
 }
 
 /// A function being skimmed (see [`Parser::skim_body`]): the names it
@@ -253,7 +260,12 @@ impl<'a> Parser<'_, 'a> {
                 self.expect("(")?;
                 let o = self.expression(false)?;
                 self.expect(")")?;
-                StmtKind::With(o, stmt(self.arena, self.statement()?))
+                let name: Name = format!("%with{}", self.with_count).into();
+                self.with_count += 1;
+                self.withs.push(name.clone());
+                let body = self.statement();
+                self.withs.pop();
+                StmtKind::With(o, name, stmt(self.arena, body?))
             }
             Tok::Keyword("function") => {
                 self.advance();
@@ -521,6 +533,7 @@ impl<'a> Parser<'_, 'a> {
             end: 0,
             eager: false,
             strict: self.functions[self.current].strict,
+            withs: self.withs.clone(),
             free: None,
         });
         self.expect("(")?;
@@ -546,7 +559,8 @@ impl<'a> Parser<'_, 'a> {
                 }
             }
         }
-        if self.skim && !paren {
+        // (Not inside a `with`: the function must see its object.)
+        if self.skim && !paren && self.withs.is_empty() {
             let start = self.i;
             if let Some(free) = self.skim_body(&params)
                 && !self.is("(")

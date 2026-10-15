@@ -1955,6 +1955,13 @@ impl<'a> Gen<'a> {
                     let o = self.alloc(e.pos)?;
                     self.star(o);
                     for (name, v) in props {
+                        if let Accessor(set, f) = v.kind {
+                            self.closure(f);
+                            let k = self.const_str(name);
+                            let kind = u8::from(set);
+                            self.emit(Op::DefineAccessor, &[Arg::Reg(o), Arg::Index(k), Arg::Count(kind)]);
+                            continue;
+                        }
                         match index(name) {
                             Some(i) => {
                                 let k = self.alloc(e.pos)?;
@@ -1969,16 +1976,6 @@ impl<'a> Gen<'a> {
                                 self.temp -= 1;
                             }
                             None => {
-                                if let Accessor(set, f) = v.kind {
-                                    self.closure(f);
-                                    let k = self.const_str(name);
-                                    let kind = u8::from(set);
-                                    self.emit(
-                                        Op::DefineAccessor,
-                                        &[Arg::Reg(o), Arg::Index(k), Arg::Count(kind)],
-                                    );
-                                    continue;
-                                }
                                 self.value(v)?;
                                 self.named(Op::SetNamed, o, name);
                             }

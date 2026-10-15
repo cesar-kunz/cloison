@@ -1691,6 +1691,31 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// `name op= v` inside `with` statements: the reference resolved once,
+    /// read and written in the object that has `name`.
+    fn with_compound(&mut self, name: &str, op: BinOp, v: &Expr, pos: Pos) -> R<()> {
+        let end = self.with_lookup(
+            name,
+            pos,
+            &mut |g, r| {
+                g.named(Op::GetNamed, r, name);
+                g.apply(op, v, pos)?;
+                g.named(Op::SetNamed, r, name);
+                Ok(())
+            },
+            &mut |g| {
+                g.value_inner(&Expr {
+                    kind: ExprKind::Ident(name.into()),
+                    pos,
+                })?;
+                g.apply(op, v, pos)?;
+                g.store_var(name, pos)
+            },
+        )?;
+        self.bind(end);
+        Ok(())
+    }
+
     /// `delete name` inside `with` statements.
     fn with_delete(&mut self, name: &str, pos: Pos) -> R<()> {
         let end = self.with_lookup(
@@ -2200,6 +2225,9 @@ impl<'a> Gen<'a> {
 
     fn assign(&mut self, op: Option<BinOp>, t: &Expr, v: &Expr, pos: Pos) -> R<()> {
         match &t.kind {
+            ExprKind::Ident(n) if op.is_some() && !self.withs.is_empty() => {
+                self.with_compound(n, op.unwrap(), v, pos)
+            }
             ExprKind::Ident(n) => {
                 match (op, self.resolve(n, t.pos)?) {
                     (None, _) => self.value(v)?,
@@ -2273,6 +2301,29 @@ impl<'a> Gen<'a> {
             }
         };
         match &t.kind {
+            ExprKind::Ident(n) if !self.withs.is_empty() => {
+                // (The reference is resolved once: `name` in the object
+                // that has it, read and written there.)
+                let end = self.with_lookup(
+                    n,
+                    pos,
+                    &mut |g, r| {
+                        g.named(Op::GetNamed, r, n);
+                        step(g);
+                        g.named(Op::SetNamed, r, n);
+                        Ok(())
+                    },
+                    &mut |g| {
+                        g.value_inner(&Expr {
+                            kind: ExprKind::Ident(n.clone()),
+                            pos,
+                        })?;
+                        step(g);
+                        g.store_var(n, pos)
+                    },
+                )?;
+                self.bind(end);
+            }
             ExprKind::Ident(n) => {
                 self.value(t)?;
                 step(self);

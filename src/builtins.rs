@@ -117,6 +117,19 @@ pub(crate) fn install(vm: &mut Vm) {
         let a = vm.intern(name);
         vm.add_property_with(number, a, Value::from_f64(v), READ_ONLY | DONT_ENUM | DONT_DELETE);
     }
+    for (name, v) in [("MAX_SAFE_INTEGER", 9007199254740991.0), ("MIN_SAFE_INTEGER", -9007199254740991.0)] {
+        let a = vm.intern(name);
+        vm.add_property_with(number, a, Value::from_f64(v), READ_ONLY | DONT_ENUM | DONT_DELETE);
+    }
+    vm.define_natives(
+        number,
+        &[
+            ("isInteger", number_is_integer as NativeFn, 1),
+            ("isSafeInteger", number_is_safe_integer, 1),
+            ("isFinite", number_is_finite, 1),
+            ("isNaN", number_is_nan, 1),
+        ],
+    );
 
     // `Boolean`, a conversion; booleans' methods.
     let bp = vm.new_object_with(Class::Wrapper, object_value(op), 4);
@@ -187,6 +200,19 @@ pub(crate) fn install(vm: &mut Vm) {
             ("decodeURI", decode_uri, 1),
         ],
     );
+    // `Number.parseInt` and `parseFloat` are the globals themselves.
+    for name in ["parseInt", "parseFloat"] {
+        let a = vm.intern(name);
+        let f = vm.get(object_value(g), a).unwrap();
+        vm.add_property_with(number, a, f, DONT_ENUM);
+    }
+    // A function's `caller` and `arguments`: accessors that throw (as
+    // strict functions' do; sloppy ones' don't exist here).
+    let thrower = vm.native_function("", throw_type_error, 0, any, false);
+    for name in ["caller", "arguments"] {
+        let a = vm.intern(name);
+        vm.define_accessor(fp, a, Some(object_value(thrower)), Some(object_value(thrower)), DONT_ENUM);
+    }
 
     crate::date::install(vm);
     install_typed_arrays(vm);
@@ -1273,6 +1299,29 @@ fn decode_uri(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     decode(vm, a, b";/?:@&=+$,#")
 }
 
+/// `%ThrowTypeError%`.
+fn throw_type_error(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    Err(Error::type_error("'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them"))
+}
+
+fn number_is_integer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let v = arg(a, 0);
+    Ok(Value::from_bool(v.as_number().is_some_and(|d| d.is_finite() && d.trunc() == d)))
+}
+
+fn number_is_safe_integer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let v = arg(a, 0);
+    Ok(Value::from_bool(v.as_number().is_some_and(|d| d.is_finite() && d.trunc() == d && d.abs() <= 9007199254740991.0)))
+}
+
+fn number_is_finite(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(arg(a, 0).as_number().is_some_and(f64::is_finite)))
+}
+
+fn number_is_nan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(arg(a, 0).as_number().is_some_and(f64::is_nan)))
+}
+
 fn is_nan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(math_arg(a, 0).is_nan()))
 }
@@ -1295,6 +1344,7 @@ fn install_typed_arrays(vm: &mut Vm) {
     link_constructor(vm, ab, abp);
     getter(vm, abp, "byteLength", buffer_byte_length);
     vm.define_native(abp, "slice", buffer_slice, 2, any, false);
+    vm.define_native(ab, "isView", buffer_is_view, 1, any, false);
 
     let shared = vm.new_object(op);
     vm.define_natives(
@@ -1339,6 +1389,11 @@ fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) {
     let fo = vm.define_native(holder, name, f, 0, Ty::Any, false);
     let a = vm.intern(name);
     vm.define_accessor(o, a, Some(object_value(fo)), None, DONT_ENUM);
+}
+
+/// `ArrayBuffer.isView(v)`: a typed array or a `DataView`.
+fn buffer_is_view(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(is_class(arg(a, 0), Class::TypedArray)))
 }
 
 /// A new buffer of `n` zero bytes.

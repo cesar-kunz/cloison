@@ -979,6 +979,9 @@ pub(crate) fn install(vm: &mut Vm) {
             ("isFrozen", object_is_frozen, 1),
             ("is", object_is, 2),
             ("assign", object_assign, 2),
+            ("values", object_values, 1),
+            ("entries", object_entries, 1),
+            ("getOwnPropertyDescriptors", object_get_own_property_descriptors, 1),
         ],
     );
     vm.define_natives(
@@ -1233,6 +1236,56 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         }
     }
     Ok(t)
+}
+
+/// `Object.values(o)` (`entries`: `Object.entries(o)`): the own
+/// enumerable string-keyed properties' values, or `[key, value]` pairs.
+fn values_or_entries(vm: &mut Vm, a: &[Value], entries: bool) -> Result<Value> {
+    let o = vm.to_object(arg(a, 0))?;
+    let ov = object_value(o);
+    let out = vm.new_array();
+    let mut n = 0;
+    for (key, _) in vm.own_keys(o) {
+        // (Enumerability as of now.)
+        let Some(d) = vm.own_property(o, key) else { continue };
+        if d.enumerable != Some(true) {
+            continue;
+        }
+        let v = vm.get_key(ov, key)?;
+        let item = if entries {
+            let k = vm.key_string(key);
+            let pair = vm.new_array();
+            crate::vm::array_push(vm, pair, &[k, v])?;
+            pair
+        } else {
+            v
+        };
+        vm.create_data_property(out, Key::Index(n), item)?;
+        n += 1;
+    }
+    Ok(out)
+}
+
+fn object_values(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    values_or_entries(vm, a, false)
+}
+
+fn object_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    values_or_entries(vm, a, true)
+}
+
+/// `Object.getOwnPropertyDescriptors(o)`.
+fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let o = vm.to_object(arg(a, 0))?;
+    let op = object_value(vm.object_prototype);
+    let out = object_value(vm.new_object(op));
+    for (key, _) in vm.own_keys(o) {
+        if let Some(d) = vm.own_property(o, key) {
+            let dv = vm.from_descriptor(&d);
+            vm.create_data_property(out, key, dv)?;
+        }
+    }
+    Ok(out)
 }
 
 /// `Object.prototype.hasOwnProperty(key)`.

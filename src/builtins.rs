@@ -261,6 +261,9 @@ pub(crate) fn install(vm: &mut Vm) {
         }
         vm.error_prototypes.push(proto);
     }
+
+    // (After the errors: `AggregateError` inherits `Error.prototype`.)
+    crate::promise::install(vm);
 }
 
 /// `c.prototype = proto` and `proto.constructor = c`, as the builtins'.
@@ -845,7 +848,7 @@ fn read_fn(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 
 /// Compile `src` as a script and run it (see `interp::run_script_at`): its
 /// completion value. A syntax error is a `SyntaxError`.
-fn run_source(vm: &mut Vm, src: &str) -> Result<Value> {
+pub(crate) fn run_source(vm: &mut Vm, src: &str) -> Result<Value> {
     let module = crate::js::compile_script_lazy(src).map_err(|e| {
         if e.contains("unsupported") {
             Error(format!("unsupported: in eval'd code: {e}"), None)
@@ -987,6 +990,7 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             Class::WeakMap => "WeakMap",
             Class::WeakSet => "WeakSet",
             Class::DataView => "DataView",
+            Class::Promise => "Promise",
             _ => "Object",
         }
     } else {

@@ -20,6 +20,7 @@ mod array;
 mod collections;
 mod date;
 mod json;
+mod promise;
 pub mod props;
 pub mod regexp;
 pub mod bytecode;

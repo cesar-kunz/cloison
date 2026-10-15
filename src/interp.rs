@@ -2783,7 +2783,10 @@ fn to_primitive_hint(v: Value, string: bool) -> Value {
                 continue;
             }
             let r = match (*as_object(m)).class {
-                Class::Native => ((*(*as_object(m)).code).native.unwrap())(vm, v, &[]),
+                Class::Native => {
+                    vm.callee = as_object(m);
+                    ((*(*as_object(m)).code).native.unwrap())(vm, v, &[])
+                }
                 Class::Function if vm.native_top.is_null() => {
                     vm.conv_redo = true;
                     continue;

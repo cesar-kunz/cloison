@@ -91,6 +91,9 @@ pub enum Class {
     /// walks, `elems_len` its next position, `elems_cap` what it yields
     /// (see `collections::IterMode`).
     CollectionIterator,
+    /// A `Promise`: `code`'s bits are a hidden array holding its state,
+    /// result and reactions. See `promise`.
+    Promise,
 }
 
 impl Class {
@@ -108,6 +111,7 @@ impl Class {
                 | Class::WeakSet
                 | Class::DataView
                 | Class::CollectionIterator
+                | Class::Promise
         )
     }
 }

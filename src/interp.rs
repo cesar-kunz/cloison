@@ -833,11 +833,19 @@ handlers! {
         let o = as_object(*reg(pc, 1, regs));
         let k = u16::from_le_bytes([*pc.add(2), *pc.add(3)]) as usize;
         let name = (&(*frame_code(regs)).constants)[k];
-        let name = String::from_utf16_lossy(string_units(name).unwrap_or(&[]));
-        let a = vm.intern(&name);
+        // (An index key's accessor goes where elements with attributes
+        // do: see `props`.)
+        let key = vm.property_key(name);
         let (g, s) = if *pc.add(4) == 0 { (Some(acc), None) } else { (None, Some(acc)) };
-        vm.define_accessor(o, a, g, s, 0);
-        next!(any, Op::DefineAccessor.size(), acc)
+        let d = crate::props::Desc {
+            get: g,
+            set: s,
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..Default::default()
+        };
+        let r = vm.define_own_property(o, key, &d).map(|_| acc);
+        next_or_throw!(Op::DefineAccessor.size(), r)
     }
 
     fn op_create_regexp(pc, acc, regs, tag) {

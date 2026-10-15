@@ -80,6 +80,9 @@ pub struct Function<'a> {
     /// `f = function () { … }()`), so compiled with the function around
     /// them, not lazily (V8's heuristic).
     pub eager: bool,
+    /// Strict mode code (a `"use strict"` directive of its own or of an
+    /// enclosing function): `this` isn't boxed or made the global object.
+    pub strict: bool,
     /// Skimmed, not parsed (see `parse::parse_with`): no body, and the
     /// names it and the functions in it may refer to from outside it (at
     /// least those they do), which stand for its references.

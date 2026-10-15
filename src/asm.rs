@@ -58,6 +58,8 @@ pub struct FunctionDef {
     /// Nested functions use some of its variables (they stay in its
     /// registers, which its closures' upvalues point to until it returns).
     pub captures: bool,
+    /// Strict mode code: `this` is passed as is (see `ast::Function::strict`).
+    pub strict: bool,
     /// Where it starts in its source (its parameter list's `(`), 1-based
     /// line and column, for `TOI_JIT_LOG` and `TOI_JIT_DUMP_FN`: (0, 0)
     /// if unknown or neither is set (see `codegen::positions`).
@@ -81,6 +83,8 @@ pub struct LazyFn {
     /// A named function expression's name, bound in its body.
     pub own_name: Option<std::rc::Rc<str>>,
     pub upvalues: Vec<std::rc::Rc<str>>,
+    /// Nested in strict code.
+    pub strict: bool,
 }
 
 /// A constant: a string or a number (one that isn't an int32).
@@ -367,6 +371,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             handlers: Vec::new(),
             upvalues: Vec::new(),
             captures: false,
+            strict: false,
             line: 0,
             col: 0,
             lazy: None,

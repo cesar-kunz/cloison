@@ -1594,6 +1594,42 @@ fn install_regexps(vm: &mut Vm) {
             ("toString", regexp_to_string, 0),
         ],
     );
+    // The flags and the source are accessors of the prototype (an
+    // instance's own data properties shadow them: `regexp_object`).
+    getter(vm, rp, "source", regexp_get::<0>);
+    getter(vm, rp, "flags", regexp_get::<1>);
+    getter(vm, rp, "global", regexp_get::<2>);
+    getter(vm, rp, "ignoreCase", regexp_get::<3>);
+    getter(vm, rp, "multiline", regexp_get::<4>);
+    getter(vm, rp, "sticky", regexp_get::<5>);
+    getter(vm, rp, "unicode", regexp_get::<6>);
+    getter(vm, rp, "dotAll", regexp_get::<7>);
+    getter(vm, rp, "hasIndices", regexp_get::<8>);
+}
+
+/// `RegExp.prototype`'s getters: `source` (0), `flags` (1) and the flags
+/// (2…); `undefined` (`source`: `(?:)`, `flags`: `""`) on the prototype
+/// itself, a `TypeError` on anything but a `RegExp`.
+fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    if this.is_cell() && as_object(this) == vm.regexp_prototype {
+        return Ok(match K {
+            0 => str_value(vm, "(?:)"),
+            1 => vm.new_string(&[]),
+            _ => Value::UNDEFINED,
+        });
+    }
+    let re = this_regexp(this)?;
+    Ok(match K {
+        0 => {
+            let a = vm.a_source;
+            vm.get(this, a)?
+        }
+        1 => str_value(vm, &regexp_flags(re)),
+        2 => Value::from_bool(re.global),
+        3 => Value::from_bool(re.ignore_case),
+        4 => Value::from_bool(re.multiline),
+        _ => Value::FALSE,
+    })
 }
 
 /// A new `RegExp` of `pattern` and `flags` (compiled once per pair): its

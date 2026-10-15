@@ -74,7 +74,8 @@ pub fn compile_script_lazy(src: &str) -> Result<Module, String> {
 /// came from); the functions nested in it are left for later in turn.
 /// Its code is the module's `script`.
 pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
-    let mut text = format!("(function({}){{(function ", f.upvalues.join(","));
+    let strict = if f.strict { "\"use strict\";" } else { "" };
+    let mut text = format!("(function({}){{{strict}(function ", f.upvalues.join(","));
     if let Some(n) = &f.own_name {
         text.push_str(n);
     }

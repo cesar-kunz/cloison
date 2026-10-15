@@ -169,6 +169,7 @@ fn generate_from<'p>(
                     handlers: Vec::new(),
                     upvalues: upvalue_sources(p, &decls, &scopes, i),
                     captures: false,
+                    strict: f.strict,
                     line: position(f.params_pos).0,
                     col: position(f.params_pos).1,
                     lazy: Some(LazyFn {
@@ -177,6 +178,7 @@ fn generate_from<'p>(
                         end: at(f.end),
                         own_name: f.name.clone().filter(|_| f.binds_name),
                         upvalues: scopes.upvalues[i].iter().map(|&n| n.into()).collect(),
+                        strict: f.strict,
                     }),
                 });
             }
@@ -1004,6 +1006,7 @@ impl<'a> Gen<'a> {
         let captures = !self.scopes.captured[self.index].is_empty();
         Ok(FunctionDef {
             name,
+            strict: self.f.strict,
             nparams: self.f.params.len() as u32,
             nregs: self.nregs as u32,
             code: self.asm.finish(),

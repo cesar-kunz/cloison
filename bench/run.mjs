@@ -31,6 +31,7 @@ const FEATURES = new Set([
   "loop", "double", "string", "switch", "call", "recursion", "closure",
   "object", "new", "proto", "call-method", "array", "global", "null",
   "define-property", "for-in", "throw",
+  "math", "typeof", "instanceof", "arguments", "literal", "typed-array", "getter",
 ]);
 
 const here = dirname(fileURLToPath(import.meta.url));

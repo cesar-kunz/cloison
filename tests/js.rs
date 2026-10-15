@@ -83,8 +83,16 @@ const RUNNING: &[&str] = &[
     "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32",
     "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "50", "51",
     "52", "53", "54", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "80",
-    "81", "82", "83", "84", "85", "86", "87", "90", "91", "92", "93", "94",
+    "81", "82", "83", "84", "85", "86", "87", "90", "91", "92", "93", "94", "100", "101", "102",
+    "103", "104", "105", "106", "107", "108", "109", "110", "111", "112", "113", "114", "115",
+    "116", "117", "118", "119", "120", "121", "122", "123", "124", "125", "126", "127", "128",
+    "129", "130", "131", "132", "133", "134", "135",
 ];
+
+/// A benchmark's number: its name up to the first `-`.
+fn number(name: &str) -> &str {
+    name.split('-').next().unwrap()
+}
 
 #[test]
 fn compiled_microbenchmarks_compute_their_expected_results() {
@@ -106,7 +114,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
         match vm.run(&module) {
             Ok(v) => {
                 assert_eq!(display(v), expect, "{name}");
-                ran.push(name[..2].to_string());
+                ran.push(number(name).to_string());
             }
             Err(e) => {
                 let e = e.to_string();
@@ -117,11 +125,13 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
             }
         }
     }
+    // (Files sort as text: `100-` before `11-`.)
+    ran.sort_by_key(|n| n.parse::<u32>().unwrap());
     assert_eq!(ran, RUNNING);
     // The ones that run do so through the JIT too.
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if RUNNING.contains(&&name[..2]) {
+        if RUNNING.contains(&&number(name)) {
             let src = std::fs::read_to_string(&f).unwrap();
             let expect = src
                 .lines()
@@ -140,7 +150,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
 fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if !RUNNING.contains(&&name[..2]) {
+        if !RUNNING.contains(&&number(name)) {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();
@@ -166,7 +176,7 @@ fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
 fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if !RUNNING.contains(&&name[..2]) {
+        if !RUNNING.contains(&&number(name)) {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();
@@ -3610,7 +3620,7 @@ var src = [
 fn microbenchmarks_through_eval_compute_their_expected_results() {
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if !RUNNING.contains(&&name[..2]) {
+        if !RUNNING.contains(&&number(name)) {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();

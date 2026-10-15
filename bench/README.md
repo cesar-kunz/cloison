@@ -19,7 +19,7 @@ object model, and the allocation and escape behaviour discussed in
   optimization changes it.
 - **Hot code lives in functions.** Files that test globals
   say so.
-- **ES5 only**: `var`, `function`, prototypes,
+- **ES5 only** (typed arrays aside, as in Octane): `var`, `function`, prototypes,
   `new`, `.call`, arrays, `switch`, `do`/`while`. No classes or arrow functions.
 - **Header comments:**
 
@@ -33,7 +33,8 @@ object model, and the allocation and escape behaviour discussed in
   `features` lists the language features the file needs, from a fixed
   vocabulary (`FEATURES` in `run.mjs`): loop, double, string, switch, call,
   recursion, closure, object, new, proto, call-method
-  (`Function.prototype.call`), array, global, null, define-property, for-in.
+  (`Function.prototype.call`), array, global, null, define-property, for-in,
+  throw, math, typeof, instanceof, arguments, literal, typed-array, getter.
   `--features` selects the files a front end in progress can already
   handle.
 
@@ -70,6 +71,15 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   timing both inside the process, startup excluded.
   V8's times are cached by host, V8 version and file contents, so only new
   or changed files are measured again.
+
+- `scripts/vs-maglev.sh` compares the machine code toi's JIT generates
+  for each file with V8's Maglev's (`--max-opt=2`), function by function
+  (final code: the last compile of each entry), to find where toi's code
+  is larger than it needs to be; `--asm FILE FN` prints both
+  disassemblies of one function. Maglev's sizes are cached by Node
+  version and file contents. Functions are matched by name, so a file
+  whose hot functions have names of their own compares best (toi's log
+  names `X.prototype.m` just `m`).
 
 - `scripts/jit-profile.sh <listing>` profiles where compiled code spends
   its cycles, per stencil piece (`TOI_PERF_MAP=1` makes the JIT name
@@ -159,6 +169,42 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
 | [92-tail-recursion.js](micro/92-tail-recursion.js) | A tail-recursive sum, 5000 deep, run from a loop. |
 | [93-constructor-loop.js](micro/93-constructor-loop.js) | A small constructor called in a loop, one field read back. |
 | [94-constructor-and-native.js](micro/94-constructor-and-native.js) | A constructor and `push` in the same loop. |
+| [100-int-bitops.js](micro/100-int-bitops.js) | Hash mixing with shifts, and, or, xor and unsigned shifts over int32 values. |
+| [101-lcg-double-mod.js](micro/101-lcg-double-mod.js) | Park-Miller generator in doubles: products past int32, then `%` by a constant. |
+| [102-math-builtins.js](micro/102-math-builtins.js) | Math.floor, sqrt, abs, min and max on doubles in a hot loop. |
+| [103-float64-array-relax.js](micro/103-float64-array-relax.js) | Jacobi-style relaxation over a Float64Array grid (Navier-Stokes' lin_solve). |
+| [104-byte-array-checksum.js](micro/104-byte-array-checksum.js) | Adler-32 over a Uint8Array, written through an Int32Array of words (zlib's style). |
+| [105-string-charcodeat-scan.js](micro/105-string-charcodeat-scan.js) | A lexer's loop: classify each character of a string by its code. |
+| [106-string-switch.js](micro/106-string-switch.js) | `switch` over string tokens (an interpreter's opcode names). |
+| [107-typeof-dispatch.js](micro/107-typeof-dispatch.js) | typeof tests on an array of mixed values. |
+| [108-instanceof-hierarchy.js](micro/108-instanceof-hierarchy.js) | instanceof against classes of a three-level hierarchy. |
+| [109-closure-counter.js](micro/109-closure-counter.js) | A closure reading and writing a captured variable. |
+| [110-callback-higher-order.js](micro/110-callback-higher-order.js) | A hand-written reduce taking a function argument, one callback per site. |
+| [111-arguments-variadic.js](micro/111-arguments-variadic.js) | A variadic function reading `arguments.length` and `arguments[i]`. |
+| [112-object-literal-vectors.js](micro/112-object-literal-vectors.js) | Vector math on short-lived object literals `{x, y, z}` (Raytrace's style). |
+| [113-array-literal-pairs.js](micro/113-array-literal-pairs.js) | Small array literals as tuples: returned as `[quotient, remainder]`, then read. |
+| [114-matrix-int-2d.js](micro/114-matrix-int-2d.js) | Integer matrix multiply over arrays of arrays. |
+| [115-double-array-dot.js](micro/115-double-array-dot.js) | Dot products and axpy over plain arrays holding doubles. |
+| [116-keyed-dictionary.js](micro/116-keyed-dictionary.js) | An object used as a dictionary: computed string keys stored, looked up, enumerated. |
+| [117-sieve-holey-array.js](micro/117-sieve-holey-array.js) | Sieve of Eratosthenes on an array grown by indexed stores of booleans. |
+| [118-accessor-properties.js](micro/118-accessor-properties.js) | A getter and a setter on a prototype (`Object.defineProperty`), used in a hot loop. |
+| [119-binary-trees.js](micro/119-binary-trees.js) | Recursively allocated binary trees, walked recursively. |
+| [120-linked-list-walk.js](micro/120-linked-list-walk.js) | Walking a singly linked list until null, a field read per node. |
+| [121-task-state-flags.js](micro/121-task-state-flags.js) | Tasks with bit-flag states, a scheduler picking runnable ones (Richards' style). |
+| [122-insertion-sort.js](micro/122-insertion-sort.js) | In-place insertion sort of an int array, re-shuffled each round. |
+| [123-string-equality.js](micro/123-string-equality.js) | `===` between string literals and strings built at run time. |
+| [124-mixed-int-double.js](micro/124-mixed-int-double.js) | Arithmetic on values that are ints or doubles at the same site. |
+| [125-megamorphic-get.js](micro/125-megamorphic-get.js) | One load site seeing eight shapes, the field at different offsets. |
+| [126-call-apply-forward.js](micro/126-call-apply-forward.js) | Forwarding through `Function.prototype.call` and `apply` to a method. |
+| [127-try-catch-hot.js](micro/127-try-catch-hot.js) | A hot function with a try/catch whose catch rarely runs. |
+| [128-string-build-concat.js](micro/128-string-build-concat.js) | Building strings with `+=` in a loop, then reading length and a character. |
+| [129-int-div-mod.js](micro/129-int-div-mod.js) | Integer division by `(a / b) \| 0` and `%` with variable and constant divisors. |
+| [130-loop-invariant-loads.js](micro/130-loop-invariant-loads.js) | A method loop re-reading `this.items`, its length and `this.scale` each iteration. |
+| [131-bounds-checked-sum.js](micro/131-bounds-checked-sum.js) | The canonical `for (i = 0; i < a.length; i++) s += a[i]`. |
+| [132-double-truncation.js](micro/132-double-truncation.js) | Doubles truncated with `\| 0`, `>> 0` and Math.floor, used as array indices. |
+| [133-temporary-object.js](micro/133-temporary-object.js) | A temporary object built and consumed inside one function: it never escapes. |
+| [134-strength-reduction.js](micro/134-strength-reduction.js) | Multiplies, divides and modulos by constant powers of two, and constant folding. |
+| [135-compare-chain.js](micro/135-compare-chain.js) | An if/else-if chain over int ranges. |
 
 Groups:
 
@@ -189,6 +235,17 @@ Groups:
   different feedback, and a whole DeltaBlue-style solver.
 - **9x, calls into compiled code**: recursion (self, mutual, tail),
   constructors called in a loop, a native method next to one.
+- **10x–13x, other engines' patterns**: kernels in the style of the rest
+  of Octane and of common JS, mostly to compare toi's code with Maglev's
+  (`scripts/vs-maglev.sh`): bit operations, doubles past int32, `Math`,
+  typed arrays, string scanning and `switch`, `typeof`, `instanceof`,
+  closures and callbacks, `arguments`, object and array literals, arrays
+  of arrays and of doubles, dictionaries, holey arrays, accessors,
+  recursive trees, linked lists, bit-flag state machines, sorting, string
+  equality and building, mixed int/double values, megamorphic loads,
+  `call`/`apply`, `try`/`catch`, integer division, loop-invariant loads,
+  bounds checks, truncation, non-escaping temporaries, strength reduction,
+  compare chains. Each hot function has a name of its own.
 
 ## `gc/`: the collector's open problems
 

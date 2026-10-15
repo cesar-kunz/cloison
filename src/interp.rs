@@ -2849,7 +2849,7 @@ pub(crate) fn to_number(v: Value) -> f64 {
     if !v.is_cell() {
         return v.to_number();
     }
-    if let Some(t) = crate::vm::date_value(v) {
+    if let Some(t) = crate::date::date_value(v) {
         return t;
     }
     match string_units(v) {

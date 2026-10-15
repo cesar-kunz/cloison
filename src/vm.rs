@@ -591,9 +591,13 @@ pub struct Vm {
     /// The VM stack's free top while runtime code that may call a
     /// function runs (null elsewhere): see `interp::call_function`.
     pub(crate) native_top: *mut Value,
+    /// The native being called is called by `new` (see
+    /// [`Vm::construct_other`]): a constructor takes it at entry
+    /// ([`Vm::is_construct`]).
+    pub(crate) constructing: bool,
     /// The `Array` constructor: compiled code makes `new Array()` itself.
     pub(crate) array_fn: *mut Object,
-    date_prototype: *mut Object,
+    pub(crate) date_prototype: *mut Object,
     pub(crate) number_prototype: *mut Object,
     /// Each typed array kind's prototype (`TypedKind` order), and
     /// `ArrayBuffer.prototype`.
@@ -651,9 +655,9 @@ pub struct Vm {
     /// The slack tracking of `new` for each prototype, for constructors
     /// that have made objects with several (see `Code::ctor_shared`).
     ctor_protos: HashMap<u64, Box<CtorProto>>,
-    a_prototype: Atom,
-    a_constructor: Atom,
-    a_length: Atom,
+    pub(crate) a_prototype: Atom,
+    pub(crate) a_constructor: Atom,
+    pub(crate) a_length: Atom,
     /// What the JIT worked out about functions' bytecode, for every
     /// function's compilations.
     pub(crate) jit_caches: crate::jit::Caches,
@@ -731,6 +735,7 @@ impl Vm {
             function_apply: std::ptr::null(),
             pending_args: (std::ptr::null(), 0),
             native_top: std::ptr::null_mut(),
+            constructing: false,
             array_fn: std::ptr::null_mut(),
             date_prototype: std::ptr::null_mut(),
             number_prototype: std::ptr::null_mut(),
@@ -906,11 +911,7 @@ impl Vm {
             }
         }
         vm.date_prototype = vm.new_object(op);
-        let dp = vm.date_prototype;
-        vm.define_native(dp, "getTime", date_get_time, 0, crate::jit::Ty::Any, false);
-        vm.define_native(dp, "valueOf", date_get_time, 0, crate::jit::Ty::Any, false);
         for (name, f, proto) in [
-            ("Date", date_constructor as NativeFn, vm.date_prototype),
             ("Array", array_constructor as NativeFn, vm.array_prototype),
             (
                 "Object",
@@ -931,9 +932,6 @@ impl Vm {
             );
             // Not enumerable, as the builtins' properties.
             vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
-            if name == "Date" {
-                vm.define_native(c, "now", date_now, 0, crate::jit::Ty::Any, false);
-            }
             if name == "Object" {
                 let f = object_define_property as NativeFn;
                 vm.define_native(c, "defineProperty", f, 3, crate::jit::Ty::Any, false);
@@ -2972,6 +2970,13 @@ impl Vm {
         }
     }
 
+    /// Whether the native now called was called by `new`, taken: a
+    /// constructor reads it first thing (it is cleared by any call made
+    /// after).
+    pub(crate) fn is_construct(&mut self) -> bool {
+        std::mem::replace(&mut self.constructing, false)
+    }
+
     /// What a conversion threw (see `conv_error`), taken.
     #[cold]
     #[inline(never)]
@@ -2989,6 +2994,7 @@ impl Vm {
             unsafe {
                 if (*o).class == Class::Native {
                     let native = (*(*o).code).native.unwrap();
+                    self.constructing = false;
                     return native(self, this, args);
                 }
             }
@@ -3004,7 +3010,10 @@ impl Vm {
             unsafe {
                 if (*o).class == Class::Native && (*(*o).code).constructs {
                     let native = (*(*o).code).native.unwrap();
-                    return native(self, Value::UNDEFINED, args);
+                    self.constructing = true;
+                    let r = native(self, Value::UNDEFINED, args);
+                    self.constructing = false;
+                    return r;
                 }
             }
         }
@@ -3593,7 +3602,7 @@ fn math_max(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn math_random(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     thread_local! {
         static STATE: Cell<u64> = Cell::new(
-            (now_ms() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+            (crate::date::now_ms() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
         );
     }
     let x = STATE.with(|s| {
@@ -3734,44 +3743,6 @@ fn array_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
     }
     Ok(Value::from_i32(-1))
-}
-
-/// Milliseconds since the epoch, now.
-fn now_ms() -> f64 {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    t.map_or(0.0, |d| d.as_millis() as f64)
-}
-
-/// `new Date()` (now) or `new Date(ms)`. (Called without `new`, it should
-/// give a string; it gives the object.)
-fn date_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
-    let t = match args.first() {
-        Some(v) if v.is_number() => v.as_number().unwrap().trunc(),
-        _ => now_ms(),
-    };
-    let dp = object_value(vm.date_prototype);
-    let o = vm.new_object_with(Class::Date, dp, 0);
-    unsafe { (*o).code = t.to_bits() as *const Code };
-    Ok(object_value(o))
-}
-
-/// `Date.now()`.
-fn date_now(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::number(now_ms()))
-}
-
-/// The time value of `v` if it is a `Date`.
-pub(crate) fn date_value(v: Value) -> Option<f64> {
-    let o = v.is_cell().then(|| as_object(v))?;
-    unsafe { ((*o).class == Class::Date).then(|| f64::from_bits((*o).code as u64)) }
-}
-
-/// `Date.prototype.getTime()` and `valueOf()`.
-fn date_get_time(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    match date_value(this) {
-        Some(t) => Ok(Value::number(t)),
-        None => Err(Error::type_error("this is not a Date object")),
-    }
 }
 
 fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {

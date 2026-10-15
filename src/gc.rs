@@ -843,6 +843,12 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 }
                 return;
             }
+            Class::Wrapper => {
+                // The primitive it wraps (a string is a cell).
+                if within(code) {
+                    v.value(Value::from_bits((*o).code as u64));
+                }
+            }
             Class::TypedArray => {
                 // `elems` points into the buffer's bytes.
                 if within(code) {

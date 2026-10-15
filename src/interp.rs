@@ -1539,16 +1539,14 @@ handlers! {
         // `f.apply(that, list)` with `f` a bytecode function: call `f` with
         // `list`'s elements. The cache records `apply` (compiled code calls
         // it through the runtime, which unwraps it too).
-        if let Some(fo) = unwrap_apply(frame_vm(regs), *reg(pc, 1, regs), *w) {
+        if let Some(fo) = unwrap_apply(frame_vm(regs), *reg(pc, 1, regs), *w)
+            && let Some(spread) = crate::builtins::apply_list_fast(if argc < 2 { Value::UNDEFINED } else { *w.add(2) })
+        {
             record_callee(pc, regs, tag);
             (*ic).loc = 0;
             let that = if argc == 0 { Value::UNDEFINED } else { *w.add(1) };
             let that = sloppy_this(frame_vm(regs), that);
-            let list = if argc < 2 { Value::UNDEFINED } else { *w.add(2) };
-            match crate::builtins::apply_list(list) {
-                Ok(spread) => enter!(fo, that, spread.as_ptr(), spread.len(), 0, Op::Call.size()),
-                Err(e) => next_or_throw!(Op::Call.size(), Err::<Value, Error>(e)),
-            }
+            enter!(fo, that, spread.as_ptr(), spread.len(), 0, Op::Call.size())
         }
         record_callee(pc, regs, tag);
         (*ic).loc = 0;
@@ -3372,7 +3370,7 @@ pub(crate) unsafe fn frame_args(
             }
             Some(Op::Call) if unwrap_apply(vm, fv, this).is_some() => {
                 let list = if n < 2 { Value::UNDEFINED } else { *caller.add(w + 2) };
-                *spread = crate::builtins::apply_list(list).unwrap_or_default();
+                *spread = crate::builtins::apply_list_fast(list).unwrap_or_default();
                 (spread.as_ptr(), spread.len())
             }
             // The caller's own arguments, passed on.
@@ -3993,12 +3991,9 @@ pub(crate) unsafe fn call_from_jit(
             // `f.apply(that, list)`: call `f` with `list`'s elements.
             if op == Op::Call
                 && let Some(fo) = unwrap_apply(vm, fv, this)
+                && let Some(s) = crate::builtins::apply_list_fast(if argc < 2 { Value::UNDEFINED } else { *args.add(1) })
             {
-                let list = if argc < 2 { Value::UNDEFINED } else { *args.add(1) };
-                spread = match crate::builtins::apply_list(list) {
-                    Ok(s) => s,
-                    Err(e) => return throw(vm, e),
-                };
+                spread = s;
                 fv = object_value(fo);
                 this = if argc == 0 { Value::UNDEFINED } else { *args };
                 args = spread.as_ptr().cast_mut();

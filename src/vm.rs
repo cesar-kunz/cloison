@@ -131,7 +131,8 @@ pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
 }
 
 /// A property key: an element index or a name.
-enum Key {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Key {
     Index(u32),
     Name(Atom),
 }
@@ -145,7 +146,7 @@ pub const VIA_CALL: i32 = 1;
 pub const LENGTH_LOC: i32 = i32::MIN;
 /// How far past twice its elements' length an integer key of an object
 /// that isn't an array makes it sparse (see `object::SPARSE`).
-const SPARSE_GAP: usize = 1024;
+pub(crate) const SPARSE_GAP: usize = 1024;
 /// `Ic::loc` of a `GetKeyed` that read a typed array's, a buffer's or a
 /// string's elements (no shape: the interpreter's hit path never takes it;
 /// compiled code reads them through the runtime).
@@ -658,6 +659,13 @@ pub struct Vm {
     pub(crate) a_prototype: Atom,
     pub(crate) a_constructor: Atom,
     pub(crate) a_length: Atom,
+    pub(crate) a_name: Atom,
+    pub(crate) a_value: Atom,
+    pub(crate) a_writable: Atom,
+    pub(crate) a_enumerable: Atom,
+    pub(crate) a_configurable: Atom,
+    pub(crate) a_get: Atom,
+    pub(crate) a_set: Atom,
     /// What the JIT worked out about functions' bytecode, for every
     /// function's compilations.
     pub(crate) jit_caches: crate::jit::Caches,
@@ -773,12 +781,26 @@ impl Vm {
             a_prototype: Atom(0),
             a_constructor: Atom(0),
             a_length: Atom(0),
+            a_name: Atom(0),
+            a_value: Atom(0),
+            a_writable: Atom(0),
+            a_enumerable: Atom(0),
+            a_configurable: Atom(0),
+            a_get: Atom(0),
+            a_set: Atom(0),
         };
         let budget = vm.frame_budget;
         vm.set_tier_back_edges(budget);
         vm.a_prototype = vm.intern("prototype");
         vm.a_constructor = vm.intern("constructor");
         vm.a_length = vm.intern("length");
+        vm.a_name = vm.intern("name");
+        vm.a_value = vm.intern("value");
+        vm.a_writable = vm.intern("writable");
+        vm.a_enumerable = vm.intern("enumerable");
+        vm.a_configurable = vm.intern("configurable");
+        vm.a_get = vm.intern("get");
+        vm.a_set = vm.intern("set");
         vm.a_to_string = vm.intern("toString");
         vm.a_value_of = vm.intern("valueOf");
         vm.a_last_index = vm.intern("lastIndex");
@@ -816,7 +838,7 @@ impl Vm {
         unsafe { (*vm.string_shape.cast_mut()).elems_code = NO_ELEMENTS };
         let ap = vm.array_prototype;
         vm.array_push_fn = vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
-        vm.array_pop_fn = vm.define_native(ap, "pop", array_pop, 0, crate::jit::Ty::Any, false);
+        vm.array_pop_fn = vm.define_native(ap, "pop", crate::array::array_pop, 0, crate::jit::Ty::Any, false);
         let fp = vm.function_prototype;
         let call = vm.define_native(fp, "call", function_call, 1, crate::jit::Ty::Any, false);
         vm.function_call = unsafe { (*call).code };
@@ -858,7 +880,7 @@ impl Vm {
             crate::jit::Ty::Any,
             false,
         );
-        vm.define_native(ap, "indexOf", array_index_of, 1, crate::jit::Ty::I32, false);
+        vm.define_native(ap, "indexOf", crate::array::array_index_of, 1, crate::jit::Ty::I32, false);
         let math = vm.new_object_with(Class::Plain, op, 16);
         let a = vm.intern("Math");
         vm.add_property_with(g, a, object_value(math), DONT_ENUM);
@@ -932,10 +954,6 @@ impl Vm {
             );
             // Not enumerable, as the builtins' properties.
             vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
-            if name == "Object" {
-                let f = object_define_property as NativeFn;
-                vm.define_native(c, "defineProperty", f, 3, crate::jit::Ty::Any, false);
-            }
         }
         crate::builtins::install(&mut vm);
         vm
@@ -960,7 +978,7 @@ impl Vm {
 
     // ---- Shapes ----
 
-    fn add_shape(&mut self, s: Shape) -> *const Shape {
+    pub(crate) fn add_shape(&mut self, s: Shape) -> *const Shape {
         // (A Rust structure: its prototype is logged if young.)
         self.heap.note(s.proto);
         let mut b = Box::new(s);
@@ -1090,7 +1108,7 @@ impl Vm {
     /// Flag `o` as a prototype and give it a unique shape, so that no
     /// inline cache can treat a property added to it as an ordinary
     /// transition (which would skip the epoch bump).
-    fn make_prototype(&mut self, o: *mut Object) {
+    pub(crate) fn make_prototype(&mut self, o: *mut Object) {
         unsafe {
             if (*o).flags & PROTOTYPE != 0 {
                 return;
@@ -1212,7 +1230,7 @@ impl Vm {
 
     /// Shape `s` gets a transition: drop compiled code that relied on it
     /// being stable (see `Shape::relied`).
-    fn shape_left_stable(&mut self, s: &Shape) {
+    pub(crate) fn shape_left_stable(&mut self, s: &Shape) {
         if s.relied.replace(false) {
             self.field_epoch = self.field_epoch.wrapping_add(1);
             self.bump_code_epoch();
@@ -1552,9 +1570,59 @@ impl Vm {
                     return self.call_getter(pair, obj);
                 }
                 Some((h, slot)) => *Object::slot(h, (*(*h).shape).location(slot)),
-                None => Value::UNDEFINED,
+                None => return Ok(self.virtual_get(o, name)),
             })
         }
+    }
+
+    /// `o.name` for a property without a slot (a function's `length` and
+    /// `name`, a string object's `length`: see `Vm::own_property`), else
+    /// `undefined`.
+    #[cold]
+    fn virtual_get(&mut self, o: *mut Object, name: Atom) -> Value {
+        unsafe {
+            if !matches!((*o).class, Class::Function | Class::Native | Class::Wrapper) {
+                return Value::UNDEFINED;
+            }
+            if name != self.a_length && name != self.a_name {
+                return Value::UNDEFINED;
+            }
+        }
+        match self.own_property(o, Key::Name(name)) {
+            Some(d) => d.value.unwrap_or(Value::UNDEFINED),
+            None => Value::UNDEFINED,
+        }
+    }
+
+    /// A wrapper object for primitive `v` (see `Class::Wrapper`).
+    pub(crate) fn new_wrapper(&mut self, v: Value) -> Value {
+        let proto = if v.is_number() {
+            self.number_prototype
+        } else if v.is_bool() {
+            self.boolean_prototype
+        } else {
+            self.string_prototype
+        };
+        let o = self.new_object_with(Class::Wrapper, object_value(proto), 0);
+        unsafe { (*o).code = v.to_bits() as *const Code };
+        object_value(o)
+    }
+
+    /// An uncaught error's message: a thrown error object's `name` and
+    /// `message`, else the error's own.
+    pub fn uncaught_message(&mut self, e: &Error) -> String {
+        if let Some(v) = e.1
+            && crate::props::is_object(v)
+        {
+            let name = self.get(v, self.a_name).unwrap_or(Value::UNDEFINED);
+            let a_message = self.intern("message");
+            let message = self.get(v, a_message).unwrap_or(Value::UNDEFINED);
+            if !name.is_undefined() || !message.is_undefined() {
+                let (n, m) = (display(name), display(message));
+                return if m.is_empty() { n } else { format!("{n}: {m}") };
+            }
+        }
+        e.0.clone()
     }
 
     fn is_accessor(&self, h: *mut Object, slot: u32) -> bool {
@@ -1654,8 +1722,10 @@ impl Vm {
             }
             match (*(*o).shape).lookup(name) {
                 Some(slot) => self.store_field(o, slot, value),
-                // No setters on the chain yet.
                 None => {
+                    if (*o).flags & crate::object::NOT_EXTENSIBLE != 0 {
+                        return Ok(());
+                    }
                     self.add_property(o, name, value);
                 }
             }
@@ -1699,6 +1769,11 @@ impl Vm {
             // slot, valid (like a prototype's property) while no prototype
             // changes shape.
             let Some((h, slot)) = self.lookup(o, name) else {
+                if matches!((*o).class, Class::Function | Class::Native | Class::Wrapper)
+                    && (name == self.a_length || name == self.a_name)
+                {
+                    return Ok(self.virtual_get(o, name));
+                }
                 install(
                     ic,
                     Ic {
@@ -1780,6 +1855,9 @@ impl Vm {
                         ..Ic::EMPTY
                     },
                 );
+                return Ok(());
+            }
+            if (*o).flags & crate::object::NOT_EXTENSIBLE != 0 {
                 return Ok(());
             }
             let slot = self.add_property(o, name, value);
@@ -2007,6 +2085,8 @@ impl Vm {
     /// Whether `o` has key `i` of its own: an element, or a sparse one.
     pub(crate) fn has_own_index(&mut self, o: *mut Object, i: u32) -> bool {
         Self::has_element(o, i)
+            || unsafe { (*o).class == Class::Wrapper }
+                && string_units(wrapped(object_value(o)).unwrap()).is_some_and(|u| (i as usize) < u.len())
             || unsafe { (*o).flags & crate::object::SPARSE != 0 && {
                 let a = self.intern(&i.to_string());
                 (*(*o).shape).lookup(a).is_some()
@@ -2056,23 +2136,8 @@ impl Vm {
             return Ok(true);
         }
         let o = as_object(obj);
-        match self.property_key(key) {
-            Key::Index(i) => unsafe {
-                match (*o).class {
-                    Class::String | Class::TypedArray => return Ok(i >= (*o).elems_len),
-                    Class::ArrayBuffer => return Ok(true),
-                    _ => {}
-                }
-                if i < (*o).elems_len {
-                    *(*o).elems.add(i as usize) = Value::EMPTY;
-                } else if (*o).flags & crate::object::SPARSE != 0 {
-                    let a = self.intern(&i.to_string());
-                    return Ok(self.delete_named(o, a));
-                }
-                Ok(true)
-            },
-            Key::Name(a) => Ok(self.delete_named(o, a)),
-        }
+        let key = self.property_key(key);
+        Ok(self.delete_own(o, key))
     }
 
     /// Remove property `name` of `o`, unless it can't be deleted. The
@@ -2146,7 +2211,7 @@ impl Vm {
     /// What `o[key]` accesses: an element, for an array index (a number,
     /// or its canonical string, below 2^32 - 1), else the property named
     /// by the key's string.
-    fn property_key(&mut self, key: Value) -> Key {
+    pub(crate) fn property_key(&mut self, key: Value) -> Key {
         if key.is_int32() && key.as_i32_unchecked() >= 0 {
             return Key::Index(key.as_i32_unchecked() as u32);
         }
@@ -2242,6 +2307,10 @@ impl Vm {
                 return Ok(self.string_constant(&c));
             }
             o = self.string_prototype;
+        } else if let Some(u) = wrapped(obj).and_then(string_units)
+            && (i as usize) < u.len()
+        {
+            return Ok(self.single_char(u[i as usize]));
         }
         loop {
             unsafe {
@@ -2357,7 +2426,55 @@ impl Vm {
                 let a = self.intern(&i.to_string());
                 return self.set(obj, a, value);
             }
+            if (*o).flags & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
+                return self.set_keyed_flagged(obj, o, i, value);
+            }
             if i >= (*o).elems_len {
+                self.reserve_elems(o, i as usize + 1);
+                for j in (*o).elems_len..i {
+                    *(*o).elems.add(j as usize) = Value::EMPTY;
+                }
+                (*o).elems_len = i + 1;
+            }
+            self.store_element(o, i as usize, value);
+        }
+        Ok(())
+    }
+
+    /// `obj[i] = value` on an object with elements that have attributes,
+    /// a frozen or sealed one, or one that isn't extensible (see
+    /// `props`): the store does nothing where it can't happen (sloppy
+    /// mode); a wrapped string's characters can't be set.
+    #[cold]
+    fn set_keyed_flagged(&mut self, obj: Value, o: *mut Object, i: u32, value: Value) -> Result<()> {
+        use crate::object::{FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, SPARSE};
+        unsafe {
+            let flags = (*o).flags;
+            if (*o).class == Class::Wrapper
+                && string_units(wrapped(obj).unwrap()).is_some_and(|u| (i as usize) < u.len())
+            {
+                return Ok(());
+            }
+            if flags & SPARSE != 0 {
+                let a = self.intern(&i.to_string());
+                if (*(*o).shape).lookup(a).is_some() {
+                    return self.set(obj, a, value);
+                }
+            }
+            if Self::has_element(o, i) {
+                if flags & FROZEN != 0 {
+                    return Ok(());
+                }
+                self.store_element(o, i as usize, value);
+                return Ok(());
+            }
+            if flags & NOT_EXTENSIBLE != 0 {
+                return Ok(());
+            }
+            if i >= (*o).elems_len {
+                if (*o).class == Class::Array && flags & LENGTH_READ_ONLY != 0 {
+                    return Ok(());
+                }
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
                     *(*o).elems.add(j as usize) = Value::EMPTY;
@@ -2375,6 +2492,10 @@ impl Vm {
         let d = crate::interp::to_number(value);
         if !(d >= 0.0 && d <= u32::MAX as f64 && d.fract() == 0.0) {
             return Err(Error::range_error("Invalid array length"));
+        }
+        if unsafe { (*o).flags } & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
+            let d = crate::props::Desc { value: Some(value), ..Default::default() };
+            return self.define_array_length(o, &d).map(|_| ());
         }
         let n = d as usize;
         unsafe {
@@ -2429,35 +2550,27 @@ impl Vm {
     pub fn for_in_keys(&mut self, v: Value) -> Value {
         let mut names: Vec<Vec<u16>> = Vec::new();
         if v.is_cell() {
-            let mut seen: Vec<Atom> = Vec::new();
+            let mut seen: Vec<Key> = Vec::new();
             let mut o = as_object(v);
-            unsafe {
-                // Elements first, in order (any object's: `{1: x}` has one).
-                {
-                    let n = (*o).elems_len as usize;
-                    for i in 0..n {
-                        let hole = !Self::has_element(o, i as u32);
-                        if !hole {
-                            names.push(i.to_string().encode_utf16().collect());
-                        }
+            loop {
+                for (key, enumerable) in self.own_keys(o) {
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.push(key);
+                    if enumerable {
+                        let s = match key {
+                            Key::Index(i) => i.to_string(),
+                            Key::Name(a) => self.atom_name(a).to_string(),
+                        };
+                        names.push(s.encode_utf16().collect());
                     }
                 }
-                loop {
-                    let s = &*(*o).shape;
-                    for (k, &name) in s.keys.iter().enumerate() {
-                        if seen.contains(&name) {
-                            continue;
-                        }
-                        seen.push(name);
-                        if s.attrs[k] & DONT_ENUM == 0 {
-                            names.push(self.atom_name(name).encode_utf16().collect());
-                        }
-                    }
-                    if !s.proto.is_cell() {
-                        break;
-                    }
-                    o = as_object(s.proto);
+                let proto = unsafe { (*(*o).shape).proto };
+                if !proto.is_cell() {
+                    break;
                 }
+                o = as_object(proto);
             }
         }
         let a = self.new_array();
@@ -2738,7 +2851,7 @@ impl Vm {
     }
 
     /// A native function object.
-    fn native_function(
+    pub(crate) fn native_function(
         &mut self,
         name: &str,
         f: NativeFn,
@@ -3468,28 +3581,6 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
         .collect()
 }
 
-/// `Array.prototype.pop`.
-fn array_pop(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
-        return Err(Error::unsupported("Array.prototype.pop on a non-array"));
-    }
-    let o = as_object(this);
-    unsafe {
-        let len = (*o).elems_len as usize;
-        if len == 0 {
-            return Ok(Value::UNDEFINED);
-        }
-        let v = *(*o).elems.add(len - 1);
-        *(*o).elems.add(len - 1) = Value::EMPTY;
-        (*o).elems_len = (len - 1) as u32;
-        Ok(if v == Value::EMPTY {
-            Value::UNDEFINED
-        } else {
-            v
-        })
-    }
-}
-
 /// `Array(…)` and `new Array(…)`: `Array(n)` has length `n` (holes), any
 /// other arguments are the elements.
 fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
@@ -3618,7 +3709,8 @@ fn math_random(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 
 /// `this` as a number for `Number.prototype` methods.
 fn this_number(this: Value) -> Result<f64> {
-    this.as_number()
+    let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
+    n.as_number()
         .ok_or_else(|| Error::type_error("Number.prototype method called on a non-number"))
 }
 
@@ -3719,35 +3811,10 @@ fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Valu
     Ok(vm.new_string(&units))
 }
 
-/// `Array.prototype.indexOf(x, from)`: the first index of an element
-/// strictly equal to `x`, or -1.
-fn array_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
-        return Err(Error::unsupported("Array.prototype.indexOf on a non-array"));
-    }
-    let o = as_object(this);
-    let x = a.first().copied().unwrap_or(Value::UNDEFINED);
-    let len = unsafe { (*o).elems_len } as i64;
-    let from = a.get(1).map_or(0.0, |&v| crate::interp::to_number(v));
-    let from = if from.is_nan() {
-        0
-    } else if from < 0.0 {
-        (len + from as i64).max(0)
-    } else {
-        from as i64
-    };
-    for i in from..len {
-        let e = unsafe { *(*o).elems.add(i as usize) };
-        if e != Value::EMPTY && crate::interp::strict_equals(e, x) {
-            return Ok(Value::from_i32(i as i32));
-        }
-    }
-    Ok(Value::from_i32(-1))
-}
-
 fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
+    vm.is_construct();
     match args.first() {
-        Some(&v) if v.is_cell() => Ok(v),
+        Some(&v) if !v.is_undefined() && !v.is_null() => Ok(object_value(vm.to_object(v)?)),
         _ => {
             let op = object_value(vm.object_prototype);
             Ok(object_value(vm.new_object(op)))
@@ -3755,62 +3822,13 @@ fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     }
 }
 
-/// `Object.defineProperty(o, key, descriptor)` for data properties: the
-/// descriptor's `value`, and its `writable`, `enumerable` and
-/// `configurable`, false unless given (for an existing property, as they
-/// were). Accessors (`get`, `set`) and index keys aren't supported.
-fn object_define_property(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
-    let arg = |i: usize| args.get(i).copied().unwrap_or(Value::UNDEFINED);
-    let (target, key, desc) = (arg(0), arg(1), arg(2));
-    if !target.is_cell() {
-        return Err(Error::type_error(
-            "Object.defineProperty called on non-object",
-        ));
+/// The primitive `v` wraps, if it is a wrapper object.
+pub(crate) fn wrapped(v: Value) -> Option<Value> {
+    if !v.is_cell() {
+        return None;
     }
-    if !desc.is_cell() {
-        return Err(Error::type_error("Property description must be an object"));
-    }
-    let units = crate::interp::to_string_units(key);
-    let name = String::from_utf16_lossy(&units);
-    if name.parse::<u32>().is_ok_and(|i| i.to_string() == name) {
-        return Err(Error::unsupported(
-            "Object.defineProperty with an index key",
-        ));
-    }
-    let name = vm.intern(&name);
-    let o = as_object(target);
-    let field = |vm: &mut Vm, f: &str| -> Option<Value> {
-        let a = vm.intern(f);
-        vm.lookup(as_object(desc), a)
-            .map(|(h, slot)| unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })
-    };
-    let (get, set) = (field(vm, "get"), field(vm, "set"));
-    let old = unsafe {
-        let s = &*(*o).shape;
-        s.lookup(name).map(|k| s.attrs[k as usize])
-    };
-    let mut attrs = old.unwrap_or(READ_ONLY | DONT_ENUM | DONT_DELETE);
-    for (f, bit) in [
-        ("writable", READ_ONLY),
-        ("enumerable", DONT_ENUM),
-        ("configurable", DONT_DELETE),
-    ] {
-        if let Some(v) = field(vm, f) {
-            if crate::interp::to_boolean(v) {
-                attrs &= !bit;
-            } else {
-                attrs |= bit;
-            }
-        }
-    }
-    if get.is_some() || set.is_some() {
-        // (`writable` doesn't apply to an accessor.)
-        vm.define_accessor(o, name, get, set, attrs & !READ_ONLY & !ACCESSOR);
-        return Ok(target);
-    }
-    let value = field(vm, "value");
-    vm.define_property(o, name, value, attrs & !ACCESSOR);
-    Ok(target)
+    let o = as_object(v);
+    unsafe { ((*o).class == Class::Wrapper).then(|| Value::from_bits((*o).code as u64)) }
 }
 
 /// `Function.prototype.call` on a native: a call through it to a bytecode
@@ -3820,12 +3838,10 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
         [] => (Value::UNDEFINED, args),
         [t, rest @ ..] => (*t, rest),
     };
-    if this.is_cell() && unsafe { (*as_object(this)).class } == Class::Native {
-        return vm.call_other(this, that, rest);
+    if !crate::props::is_callable(this) {
+        return Err(Error::type_error("Function.prototype.call called on a non-function"));
     }
-    Err(Error::type_error(format!(
-        "{this:?} is not a native function (call it directly)"
-    )))
+    crate::interp::call_function(vm, this, that, rest)
 }
 
 pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
@@ -3846,6 +3862,9 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
     }
     let o = as_object(this);
     unsafe {
+        if (*o).flags & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
+            return array_push_flagged(vm, this, args);
+        }
         let len = (*o).elems_len as usize;
         vm.reserve_elems(o, len + args.len());
         for (i, &v) in args.iter().enumerate() {
@@ -3854,6 +3873,23 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
         (*o).elems_len = (len + args.len()) as u32;
         Ok(Value::from_i32((*o).elems_len as i32))
     }
+}
+
+/// `push` onto an array with elements that have attributes, or that
+/// isn't extensible: through the generic stores, which throw where they
+/// can't store.
+#[cold]
+fn array_push_flagged(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
+    let o = as_object(this);
+    for &v in args {
+        let n = unsafe { (*o).elems_len };
+        vm.put_key(this, Key::Index(n), v)?;
+    }
+    let n = unsafe { (*o).elems_len };
+    let a_length = vm.a_length;
+    let len = Value::from_i32(n as i32);
+    vm.put_key(this, Key::Name(a_length), len)?;
+    Ok(len)
 }
 
 /// `String(v)` for the values that exist so far.

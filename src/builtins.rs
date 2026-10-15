@@ -9,7 +9,7 @@ use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, TypedKind, as_object, object_value};
 use crate::value::Value;
-use crate::vm::{Error, NativeFn, Result, Vm, number_to_string, string_units};
+use crate::vm::{Error, NativeFn, Result, Vm, number_to_string, string_units, wrapped};
 
 /// The kinds of error objects, in `Vm::error_prototypes` order. The
 /// runtime's own errors (`Error::type_error`, …) are caught as objects of
@@ -31,7 +31,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let any = Ty::Any;
 
     // `String`, a conversion (no wrapper objects: `new String` isn't one).
-    let string = vm.define_native(g, "String", string_fn, 1, any, false);
+    let string = vm.define_native(g, "String", string_fn, 1, any, true);
     link_constructor(vm, string, sp);
     vm.from_char_code_fn = vm.define_native(string, "fromCharCode", string_from_char_code, 1, any, false);
     vm.char_code_at_fn = vm.define_native(sp, "charCodeAt", string_char_code_at, 1, any, false);
@@ -71,7 +71,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.function_apply = unsafe { (*apply).code };
 
     // `Number`, a conversion, and its constants.
-    let number = vm.define_native(g, "Number", number_fn, 1, any, false);
+    let number = vm.define_native(g, "Number", number_fn, 1, any, true);
     link_constructor(vm, number, np_of(vm));
     for (name, v) in [
         ("MAX_VALUE", f64::MAX),
@@ -88,52 +88,17 @@ pub(crate) fn install(vm: &mut Vm) {
     // `Boolean`, a conversion; booleans' methods.
     let bp = vm.new_object(object_value(op));
     vm.boolean_prototype = bp;
-    let boolean = vm.define_native(g, "Boolean", boolean_fn, 1, any, false);
+    let boolean = vm.define_native(g, "Boolean", boolean_fn, 1, any, true);
     link_constructor(vm, boolean, bp);
     vm.define_native(bp, "toString", boolean_to_string, 0, any, false);
     vm.define_native(bp, "valueOf", boolean_value_of, 0, any, false);
 
-    // `Object`'s functions and `hasOwnProperty`.
-    let a_object = vm.intern("Object");
-    let object = as_object(vm.get(object_value(g), a_object).unwrap());
-    vm.define_natives(
-        object,
-        &[
-            ("create", object_create as NativeFn, 2),
-            ("keys", object_keys, 1),
-            ("getPrototypeOf", object_get_prototype_of, 1),
-        ],
-    );
-    vm.define_native(op, "hasOwnProperty", object_has_own_property, 1, any, false);
+    crate::props::install(vm);
 
     // The methods ToPrimitive calls.
     vm.define_native(op, "toString", object_to_string, 0, any, false);
     vm.define_native(op, "valueOf", object_value_of, 0, any, false);
-    let ap = vm.array_prototype;
-    vm.define_native(ap, "toString", array_to_string, 0, any, false);
-    vm.define_native(ap, "join", array_join, 1, any, false);
-    vm.define_natives(
-        ap,
-        &[
-            ("slice", array_slice as NativeFn, 2),
-            ("concat", array_concat, 1),
-            ("shift", array_shift, 0),
-            ("unshift", array_unshift, 1),
-            ("splice", array_splice, 2),
-            ("reverse", array_reverse, 0),
-            ("lastIndexOf", array_last_index_of, 1),
-            ("sort", array_sort, 1),
-            ("map", array_map, 1),
-            ("forEach", array_for_each, 1),
-            ("filter", array_filter, 1),
-            ("some", array_some, 1),
-            ("every", array_every, 1),
-            ("reduce", array_reduce, 1),
-        ],
-    );
-    let a_array = vm.intern("Array");
-    let array_ctor = as_object(vm.get(object_value(g), a_array).unwrap());
-    vm.define_native(array_ctor, "isArray", array_is_array, 1, any, false);
+    crate::array::install(vm);
     let np = vm.number_prototype;
     vm.define_native(np, "toExponential", number_to_exponential, 1, any, false);
     let np = vm.number_prototype;
@@ -237,6 +202,9 @@ fn this_units<'a>(this: Value) -> Result<Cow<'a, [u16]>> {
             "String.prototype method called on null or undefined",
         ));
     }
+    if let Some(u) = wrapped(this).and_then(string_units) {
+        return Ok(Cow::Borrowed(u));
+    }
     Ok(units(this))
 }
 
@@ -282,14 +250,16 @@ fn num(d: f64) -> Value {
 
 /// `String(v)`: ToString (`""` without an argument).
 fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    match a.first() {
-        None => Ok(vm.new_string(&[])),
-        Some(&v) if string_units(v).is_some() => Ok(v),
+    let construct = vm.is_construct();
+    let s = match a.first() {
+        None => vm.new_string(&[]),
+        Some(&v) if string_units(v).is_some() => v,
         Some(&v) => {
             let u = to_string_units(v);
-            Ok(vm.new_string(&u))
+            vm.new_string(&u)
         }
-    }
+    };
+    Ok(if construct { vm.new_wrapper(s) } else { s })
 }
 
 /// `String.fromCharCode(…codes)`: each ToUint16.
@@ -477,42 +447,56 @@ fn string_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn string_to_string(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    match string_units(this) {
-        Some(_) => Ok(this),
-        None => Err(Error::type_error("String.prototype.toString called on a non-string")),
+    if string_units(this).is_some() {
+        return Ok(this);
+    }
+    match wrapped(this) {
+        Some(s) if string_units(s).is_some() => Ok(s),
+        _ => Err(Error::type_error("String.prototype.toString called on a non-string")),
     }
 }
 
 // ---- Function.prototype.apply ----
 
-/// The arguments `f.apply(that, list)` passes: `list`'s elements (holes as
-/// `undefined`; none for `undefined` or `null`). `arguments` objects are
-/// arrays.
-pub(crate) fn apply_list(list: Value) -> Result<Vec<Value>> {
+/// The arguments `f.apply(that, list)` passes when `list` is a plain
+/// array (holes as `undefined`; none for `undefined` or `null`), read
+/// without running code: `None` for any other list, which
+/// `Function.prototype.apply` itself takes (`array::apply_list`).
+pub(crate) fn apply_list_fast(list: Value) -> Option<Vec<Value>> {
     if list.is_undefined() || list.is_null() {
-        return Ok(Vec::new());
+        return Some(Vec::new());
     }
     if !list.is_cell() || unsafe { (*as_object(list)).class } != Class::Array {
-        return Err(Error::type_error("CreateListFromArrayLike called on a non-array"));
+        return None;
     }
     let o = as_object(list);
+    unsafe {
+        if (*o).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 {
+            return None;
+        }
+    }
     let n = unsafe { (*o).elems_len } as usize;
-    Ok((0..n)
-        .map(|i| {
-            let e = unsafe { *(*o).elems.add(i) };
-            if e == Value::EMPTY { Value::UNDEFINED } else { e }
-        })
-        .collect())
+    Some(
+        (0..n)
+            .map(|i| {
+                let e = unsafe { *(*o).elems.add(i) };
+                if e == Value::EMPTY { Value::UNDEFINED } else { e }
+            })
+            .collect(),
+    )
 }
 
-/// `Function.prototype.apply` on a native (a call through it to a bytecode
-/// function is unwrapped where it is made: `interp::unwrap_apply`).
+/// `Function.prototype.apply(that, list)`. (A call through it to a
+/// bytecode function with a plain array is unwrapped where it is made:
+/// `interp::unwrap_apply`.)
 fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let list = apply_list(arg(a, 1))?;
-    if this.is_cell() && unsafe { (*as_object(this)).class } == Class::Native {
-        return vm.call_other(this, arg(a, 0), &list);
+    if !crate::props::is_callable(this) {
+        return Err(Error::type_error("Function.prototype.apply called on a non-function"));
     }
-    Err(Error::type_error(format!("{this:?} is not a native function (apply it directly)")))
+    vm.handle_scope(|vm| {
+        let list = crate::array::apply_list(vm, arg(a, 1))?;
+        crate::interp::call_function(vm, this, arg(a, 0), &list)
+    })
 }
 
 /// `Function(p1, …, body)` / `new Function(…)`: the function
@@ -607,21 +591,26 @@ fn np_of(vm: &Vm) -> *mut Object {
 }
 
 /// `Number(v)`: ToNumber (0 without an argument).
-fn number_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(match a.first() {
+fn number_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let construct = vm.is_construct();
+    let n = match a.first() {
         None => Value::from_i32(0),
         Some(&v) if v.is_number() => v,
         Some(&v) => num(to_number(v)),
-    })
+    };
+    Ok(if construct { vm.new_wrapper(n) } else { n })
 }
 
-fn boolean_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(crate::interp::to_boolean(arg(a, 0))))
+fn boolean_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let construct = vm.is_construct();
+    let b = Value::from_bool(crate::interp::to_boolean(arg(a, 0)));
+    Ok(if construct { vm.new_wrapper(b) } else { b })
 }
 
 fn this_boolean(this: Value) -> Result<bool> {
-    if this.is_bool() {
-        Ok(this == Value::TRUE)
+    let b = wrapped(this).filter(|v| v.is_bool()).unwrap_or(this);
+    if b.is_bool() {
+        Ok(b == Value::TRUE)
     } else {
         Err(Error::type_error("Boolean.prototype method called on a non-boolean"))
     }
@@ -638,418 +627,6 @@ fn boolean_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `Object.create(proto)`: a plain object with prototype `proto` (an
 /// object or `null`). (No property descriptors yet.)
-fn object_create(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let proto = arg(a, 0);
-    if !(proto.is_null() || (proto.is_cell() && string_units(proto).is_none())) {
-        return Err(Error::type_error("Object prototype may only be an Object or null"));
-    }
-    if !arg(a, 1).is_undefined() {
-        return Err(Error::unsupported("Object.create with property descriptors"));
-    }
-    Ok(object_value(vm.new_object(proto)))
-}
-
-/// The object `Object` functions take: a TypeError for `undefined` and
-/// `null`; `None` for other primitives (which have no own properties here).
-fn object_arg(v: Value, what: &str) -> Result<Option<*mut Object>> {
-    if v.is_undefined() || v.is_null() {
-        return Err(Error::type_error(format!("{what} called on null or undefined")));
-    }
-    Ok(v.is_cell().then(|| as_object(v)))
-}
-
-/// `Object.keys(o)`: its own enumerable keys, elements first.
-fn object_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let mut keys = Vec::new();
-    if let Some(o) = object_arg(arg(a, 0), "Object.keys")? {
-        unsafe {
-            for i in 0..(*o).elems_len as usize {
-                if Vm::has_element(o, i as u32) {
-                    keys.push(str_value(vm, &i.to_string()));
-                }
-            }
-            let s = &*(*o).shape;
-            for (k, &name) in s.keys.iter().enumerate() {
-                if s.attrs[k] & DONT_ENUM == 0 {
-                    let n = vm.atom_name(name).to_string();
-                    keys.push(str_value(vm, &n));
-                }
-            }
-        }
-    }
-    let arr = vm.new_array();
-    crate::vm::array_push(vm, arr, &keys)?;
-    Ok(arr)
-}
-
-fn object_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let v = arg(a, 0);
-    Ok(match object_arg(v, "Object.getPrototypeOf")? {
-        Some(o) if string_units(v).is_none() => unsafe { (*(*o).shape).proto },
-        Some(_) => object_value(vm.string_prototype),
-        None if v.is_number() => object_value(vm.number_prototype),
-        None => Value::NULL,
-    })
-}
-
-/// `o.hasOwnProperty(key)`: an own property or element.
-fn object_has_own_property(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let Some(o) = object_arg(this, "Object.prototype.hasOwnProperty")? else {
-        return Ok(Value::FALSE);
-    };
-    let key = arg(a, 0);
-    let u = units(key).into_owned();
-    let name = String::from_utf16_lossy(&u);
-    unsafe {
-        if let Ok(i) = name.parse::<u32>()
-            && i.to_string() == name
-        {
-            return Ok(Value::from_bool(vm.has_own_index(o, i)));
-        }
-        let a = vm.intern(&name);
-        let own = (*(*o).shape).lookup(a).is_some()
-            || (a == vm.intern("length") && matches!((*o).class, Class::Array | Class::String));
-        Ok(Value::from_bool(own))
-    }
-}
-
-// ---- Array.prototype ----
-
-/// `this` as an array: its elements (holes as `undefined`).
-fn this_array(this: Value, what: &str) -> Result<(*mut Object, Vec<Value>)> {
-    if !is_class(this, Class::Array) {
-        return Err(Error::unsupported(format!("Array.prototype.{what} on a non-array")));
-    }
-    let o = as_object(this);
-    let n = unsafe { (*o).elems_len } as usize;
-    let v = (0..n)
-        .map(|i| {
-            let e = unsafe { *(*o).elems.add(i) };
-            if e == Value::EMPTY { Value::UNDEFINED } else { e }
-        })
-        .collect();
-    Ok((o, v))
-}
-
-fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
-    let arr = vm.new_array();
-    crate::vm::array_push(vm, arr, values)?;
-    Ok(arr)
-}
-
-/// Replace `o`'s elements with `values`.
-fn set_elements(vm: &mut Vm, o: *mut Object, values: &[Value]) -> Result<()> {
-    unsafe { (*o).elems_len = 0 };
-    crate::vm::array_push(vm, object_value(o), values).map(|_| ())
-}
-
-/// `this` as an array.
-fn array_object(this: Value, what: &str) -> Result<*mut Object> {
-    if !is_class(this, Class::Array) {
-        return Err(Error::unsupported(format!("Array.prototype.{what} on a non-array")));
-    }
-    Ok(as_object(this))
-}
-
-/// A new array of `o`'s `n` elements from `at` (holes as they are).
-fn array_range(vm: &mut Vm, o: *mut Object, at: usize, n: usize) -> Value {
-    let r = vm.new_array();
-    let ro = as_object(r);
-    vm.reserve_elems(ro, n);
-    unsafe {
-        vm.store_elements(ro, 0, (*o).elems.add(at), n);
-        (*ro).elems_len = n as u32;
-    }
-    r
-}
-
-/// Replace `o`'s `n` elements from `at` with `items`, moving the ones
-/// after them in place.
-fn splice_elements(vm: &mut Vm, o: *mut Object, at: usize, n: usize, items: &[Value]) {
-    unsafe {
-        let len = (*o).elems_len as usize;
-        let k = items.len();
-        let new_len = len - n + k;
-        vm.reserve_elems(o, new_len);
-        let e = (*o).elems;
-        // The elements after moved within the array: their type fits. (The
-        // same values, in other cards.)
-        if k != n {
-            let m = len - at - n;
-            std::ptr::copy(e.add(at + n), e.add(at + k), m);
-            for i in at + k..at + k + m {
-                crate::heap::barrier(e.cast::<u8>().sub(8), e.add(i), *e.add(i));
-            }
-        }
-        for i in new_len..len {
-            *e.add(i) = Value::EMPTY;
-        }
-        vm.store_elements(o, at, items.as_ptr(), k);
-        (*o).elems_len = new_len as u32;
-    }
-}
-
-fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let o = array_object(this, "slice")?;
-    let len = unsafe { (*o).elems_len } as usize;
-    let s = relative(int_arg(a, 0), len);
-    let e = match a.get(1) {
-        Some(x) if !x.is_undefined() => relative(int_arg(a, 1), len),
-        _ => len,
-    };
-    Ok(array_range(vm, o, s, e.saturating_sub(s)))
-}
-
-fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let o = array_object(this, "concat")?;
-    let r = array_range(vm, o, 0, unsafe { (*o).elems_len } as usize);
-    let ro = as_object(r);
-    for &x in a {
-        let (from, n) = if is_class(x, Class::Array) {
-            let xo = as_object(x);
-            unsafe { ((*xo).elems.cast_const(), (*xo).elems_len as usize) }
-        } else {
-            (&raw const x, 1)
-        };
-        unsafe {
-            let len = (*ro).elems_len as usize;
-            vm.reserve_elems(ro, len + n);
-            vm.store_elements(ro, len, from, n);
-            (*ro).elems_len = (len + n) as u32;
-        }
-    }
-    Ok(r)
-}
-
-fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = array_object(this, "shift")?;
-    if unsafe { (*o).elems_len } == 0 {
-        return Ok(Value::UNDEFINED);
-    }
-    let first = unsafe { *(*o).elems };
-    splice_elements(vm, o, 0, 1, &[]);
-    Ok(if first == Value::EMPTY { Value::UNDEFINED } else { first })
-}
-
-fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let o = array_object(this, "unshift")?;
-    splice_elements(vm, o, 0, 0, a);
-    Ok(Value::from_i32(unsafe { (*o).elems_len } as i32))
-}
-
-/// `a.splice(start, count, …items)`: the removed elements.
-fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let o = array_object(this, "splice")?;
-    let len = unsafe { (*o).elems_len } as usize;
-    let s = relative(int_arg(a, 0), len);
-    let n = match a.len() {
-        0 => 0,
-        1 => len - s,
-        _ => int_arg(a, 1).clamp(0.0, (len - s) as f64) as usize,
-    };
-    let removed = array_range(vm, o, s, n);
-    splice_elements(vm, o, s, n, a.get(2..).unwrap_or(&[]));
-    Ok(removed)
-}
-
-fn array_reverse(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = array_object(this, "reverse")?;
-    unsafe {
-        let e = (*o).elems;
-        let n = (*o).elems_len as usize;
-        if n > 1 {
-            std::slice::from_raw_parts_mut(e, n).reverse();
-            // The same values, in other cards.
-            for i in 0..n {
-                crate::heap::barrier(e.cast::<u8>().sub(8), e.add(i), *e.add(i));
-            }
-        }
-    }
-    Ok(this)
-}
-
-fn array_last_index_of(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (_, v) = this_array(this, "lastIndexOf")?;
-    let x = arg(a, 0);
-    let from = match a.get(1) {
-        Some(_) => {
-            let d = int_arg(a, 1);
-            if d < 0.0 { v.len() as f64 + d } else { d.min(v.len() as f64 - 1.0) }
-        }
-        None => v.len() as f64 - 1.0,
-    };
-    if from < 0.0 {
-        return Ok(Value::from_i32(-1));
-    }
-    let r = (0..=from as usize).rev().find(|&i| crate::interp::strict_equals(v[i], x));
-    Ok(Value::from_i32(r.map_or(-1, |i| i as i32)))
-}
-
-/// `a.sort(compare)`: stable (a merge sort); `undefined`s last; without a
-/// comparison function, by the elements' strings.
-fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, v) = this_array(this, "sort")?;
-    let cmp = arg(a, 0);
-    let (mut defined, undef): (Vec<Value>, Vec<Value>) = v.into_iter().partition(|x| !x.is_undefined());
-    // The comparison may collect, and while merging, an element may be
-    // only in a `Vec`: all of them are roots meanwhile.
-    let depth = vm.handles.len();
-    vm.handles.extend_from_slice(&defined);
-    let mut err = None;
-    let mut less = |vm: &mut Vm, x: Value, y: Value| -> bool {
-        if err.is_some() {
-            return false;
-        }
-        if cmp.is_undefined() {
-            return units(x) > units(y);
-        }
-        match crate::interp::call_function(vm, cmp, Value::UNDEFINED, &[x, y]) {
-            Ok(r) => to_number(r) > 0.0,
-            Err(e) => {
-                err = Some(e);
-                false
-            }
-        }
-    };
-    // Insertion sort for short runs, merging otherwise: stable, and calls
-    // `compare` only as a sort may.
-    merge_sort(vm, &mut defined, &mut less);
-    vm.handles.truncate(depth);
-    if let Some(e) = err {
-        return Err(e);
-    }
-    defined.extend(undef);
-    set_elements(vm, o, &defined)?;
-    Ok(this)
-}
-
-/// Sort `v` stably, `after(x, y)` meaning `x` goes after `y`.
-fn merge_sort(vm: &mut Vm, v: &mut [Value], after: &mut dyn FnMut(&mut Vm, Value, Value) -> bool) {
-    let n = v.len();
-    if n <= 10 {
-        for i in 1..n {
-            let mut j = i;
-            while j > 0 && after(vm, v[j - 1], v[j]) {
-                v.swap(j - 1, j);
-                j -= 1;
-            }
-        }
-        return;
-    }
-    let mid = n / 2;
-    merge_sort(vm, &mut v[..mid], after);
-    merge_sort(vm, &mut v[mid..], after);
-    let (left, right) = (v[..mid].to_vec(), v[mid..].to_vec());
-    let (mut i, mut j) = (0, 0);
-    for slot in v.iter_mut() {
-        if j >= right.len() || (i < left.len() && !after(vm, left[i], right[j])) {
-            *slot = left[i];
-            i += 1;
-        } else {
-            *slot = right[j];
-            j += 1;
-        }
-    }
-}
-
-/// Call `f` with each element, its index and the array, as the iteration
-/// methods do.
-fn each(vm: &mut Vm, this: Value, a: &[Value], what: &str, mut on: impl FnMut(&mut Vm, usize, Value, Value) -> Result<bool>) -> Result<()> {
-    let (o, _) = this_array(this, what)?;
-    let f = arg(a, 0);
-    let that = arg(a, 1);
-    let n = unsafe { (*o).elems_len } as usize;
-    for i in 0..n.min(unsafe { (*o).elems_len } as usize) {
-        let e = unsafe { *(*o).elems.add(i) };
-        if e == Value::EMPTY {
-            continue;
-        }
-        let r = crate::interp::call_function(vm, f, that, &[e, Value::from_i32(i as i32), this])?;
-        if !on(vm, i, e, r)? {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn array_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    vm.handle_scope(|vm| {
-        let mut out = Vec::new();
-        // (The results are only here until the array is made: roots.)
-        each(vm, this, a, "map", |vm, _, _, r| {
-            out.push(r);
-            vm.handles.push(r);
-            Ok(true)
-        })?;
-        new_array_of(vm, &out)
-    })
-}
-
-fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    each(vm, this, a, "forEach", |_, _, _, _| Ok(true))?;
-    Ok(Value::UNDEFINED)
-}
-
-fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    vm.handle_scope(|vm| {
-        let mut out = Vec::new();
-        each(vm, this, a, "filter", |vm, _, e, r| {
-            if crate::interp::to_boolean(r) {
-                out.push(e);
-                vm.handles.push(e);
-            }
-            Ok(true)
-        })?;
-        new_array_of(vm, &out)
-    })
-}
-
-fn array_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let mut found = false;
-    each(vm, this, a, "some", |_, _, _, r| {
-        found = crate::interp::to_boolean(r);
-        Ok(!found)
-    })?;
-    Ok(Value::from_bool(found))
-}
-
-fn array_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let mut all = true;
-    each(vm, this, a, "every", |_, _, _, r| {
-        all = crate::interp::to_boolean(r);
-        Ok(all)
-    })?;
-    Ok(Value::from_bool(all))
-}
-
-fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (_, v) = this_array(this, "reduce")?;
-    let f = arg(a, 0);
-    // (The callback may change the array: its elements are roots.)
-    let depth = vm.handles.len();
-    vm.handles.extend_from_slice(&v);
-    let mut it = v.into_iter().enumerate();
-    let mut acc = match a.get(1) {
-        Some(&x) => x,
-        None => match it.next() {
-            Some((_, x)) => x,
-            None => return Err(Error::type_error("Reduce of empty array with no initial value")),
-        },
-    };
-    for (i, e) in it {
-        let r = crate::interp::call_function(vm, f, Value::UNDEFINED, &[acc, e, Value::from_i32(i as i32), this]);
-        acc = r.inspect_err(|_| vm.handles.truncate(depth))?;
-    }
-    vm.handles.truncate(depth);
-    Ok(acc)
-}
-
-fn array_is_array(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    Ok(Value::from_bool(is_class(arg(a, 0), Class::Array)))
-}
-
-/// `n.toExponential(digits)`: one digit, `digits` decimals (as many as
-/// needed if missing), `e±exponent`.
 fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let Some(x) = this.as_number() else {
         return Err(Error::type_error("Number.prototype.toExponential called on a non-number"));
@@ -1079,65 +656,57 @@ fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 
 /// `Object.prototype.toString`: `[object Array]`, `[object Object]`, ….
 fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let primitive_tag = |v: Value| {
+        if v.is_bool() {
+            "Boolean"
+        } else if v.is_number() {
+            "Number"
+        } else {
+            "String"
+        }
+    };
     let tag = if this.is_undefined() {
         "Undefined"
     } else if this.is_null() {
         "Null"
     } else if this.is_cell() {
-        match unsafe { (*as_object(this)).class } {
+        let o = as_object(this);
+        match unsafe { (*o).class } {
             Class::Array => "Array",
             Class::Function | Class::Native => "Function",
             Class::String => "String",
-            _ if crate::date::date_value(this).is_some() => "Date",
+            Class::Date => "Date",
+            Class::RegExp => "RegExp",
+            Class::Wrapper => primitive_tag(wrapped(this).unwrap()),
+            _ if vm.error_prototypes.iter().any(|&p| {
+                let mut q = unsafe { (*(*o).shape).proto };
+                while q.is_cell() {
+                    if as_object(q) == p {
+                        return true;
+                    }
+                    q = unsafe { (*(*as_object(q)).shape).proto };
+                }
+                false
+            }) => "Error",
             _ => "Object",
         }
-    } else if this.is_bool() {
-        "Boolean"
     } else {
-        "Number"
+        primitive_tag(this)
     };
     Ok(str_value(vm, &format!("[object {tag}]")))
 }
 
-fn object_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(this)
+fn object_value_of(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    Ok(object_value(vm.to_object(this)?))
 }
 
 fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    if this.is_number() {
-        Ok(this)
+    let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
+    if n.is_number() {
+        Ok(n)
     } else {
         Err(Error::type_error("Number.prototype.valueOf called on a non-number"))
     }
-}
-
-/// `Array.prototype.join(sep)`: elements' strings (holes, `undefined` and
-/// `null` empty), separated by `sep` (`,` by default).
-fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
-        return Err(Error::unsupported("Array.prototype.join on a non-array"));
-    }
-    let sep = match a.first() {
-        Some(v) if !v.is_undefined() => units(*v).into_owned(),
-        _ => vec![b',' as u16],
-    };
-    let o = as_object(this);
-    let n = unsafe { (*o).elems_len } as usize;
-    let mut out = Vec::new();
-    for i in 0..n {
-        if i > 0 {
-            out.extend_from_slice(&sep);
-        }
-        let e = unsafe { *(*o).elems.add(i) };
-        if e != Value::EMPTY && !e.is_undefined() && !e.is_null() {
-            out.extend_from_slice(&units(e));
-        }
-    }
-    Ok(vm.new_string(&out))
-}
-
-fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    array_join(vm, this, &[])
 }
 
 // ---- Math ----
@@ -1748,6 +1317,19 @@ fn json_value(vm: &mut Vm, v: Value, out: &mut Vec<u16>, stack: &mut Vec<u64>) -
     let class = unsafe { (*o).class };
     if matches!(class, Class::Function | Class::Native) {
         return Ok(false);
+    }
+    if let Some(p) = wrapped(v) {
+        // A wrapper: its primitive (a number's and a string's through
+        // conversion, which may call user code).
+        let p = if p.is_number() {
+            Value::number(to_number(v))
+        } else if p.is_bool() {
+            p
+        } else {
+            let u = to_string_units(v);
+            vm.new_string(&u)
+        };
+        return json_value(vm, p, out, stack);
     }
     if stack.contains(&v.to_bits()) {
         return Err(Error::type_error("Converting circular structure to JSON"));

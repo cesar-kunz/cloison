@@ -74,6 +74,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let result = vm.run(&module);
+    let uncaught = result.as_ref().err().map(|e| vm.uncaught_message(e));
     // `TOI_GC_VERIFY`: walk the heap, checking every cell (see `heap`).
     if std::env::var_os("TOI_GC_VERIFY").is_some() {
         let cells = vm.heap.verify();
@@ -133,8 +134,8 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("toi: uncaught {e}");
+        Err(_) => {
+            eprintln!("toi: uncaught {}", uncaught.unwrap());
             ExitCode::FAILURE
         }
     }

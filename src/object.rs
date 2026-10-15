@@ -69,6 +69,10 @@ pub enum Class {
     TypedArray,
     /// A `RegExp`: `code` holds its compiled `regexp::Regex`.
     RegExp,
+    /// A wrapper object (`new Number(1)`, `new String("s")`, `new
+    /// Boolean(true)`): `code`'s bits are the primitive (a value, which the
+    /// collector traces: a string is a cell).
+    Wrapper,
 }
 
 /// A typed array's element type, as `Object::kind` holds it.
@@ -199,6 +203,20 @@ pub const PROTOTYPE: u8 = 2;
 /// named properties (their decimal strings), which keyed accesses check
 /// after the elements (see `Vm::set_keyed`).
 pub const SPARSE: u8 = 4;
+/// The object takes no new properties (`Object.preventExtensions`).
+pub const NOT_EXTENSIBLE: u8 = 8;
+/// Its elements can't be deleted (`Object.seal`).
+pub const SEALED: u8 = 16;
+/// Its elements can't be written either (`Object.freeze`).
+pub const FROZEN: u8 = 32;
+/// An array's `length` is read-only (`Object.freeze`, or
+/// `Object.defineProperty` with `writable: false`).
+pub const LENGTH_READ_ONLY: u8 = 64;
+/// A function's `length` was deleted (it has no slot: see
+/// `Vm::own_property`); `LENGTH_READ_ONLY`'s bit, as arrays aren't functions.
+pub const FN_LENGTH_DELETED: u8 = 64;
+/// A function's `name` was deleted.
+pub const FN_NAME_DELETED: u8 = 128;
 
 #[repr(C)]
 pub struct Object {

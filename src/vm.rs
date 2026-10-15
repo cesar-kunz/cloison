@@ -144,6 +144,9 @@ pub const VIA_CALL: i32 = 1;
 
 /// `Ic::loc` of a `GetNamed` that read an array's `length`.
 pub const LENGTH_LOC: i32 = i32::MIN;
+/// The most elements an array can have here (they are dense: a length
+/// up to 2^32 - 1 would be allocated in full).
+pub(crate) const MAX_ELEMENTS: usize = 1 << 28;
 /// How far past twice its elements' length an integer key of an object
 /// that isn't an array makes it sparse (see `object::SPARSE`).
 pub(crate) const SPARSE_GAP: usize = 1024;
@@ -2480,6 +2483,9 @@ impl Vm {
                 return self.set_keyed_flagged(obj, o, i, value);
             }
             if i >= (*o).elems_len {
+                if i as usize >= MAX_ELEMENTS {
+                    return Err(Error::range_error("array index too large for this engine"));
+                }
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
                     *(*o).elems.add(j as usize) = Value::EMPTY;
@@ -2548,6 +2554,9 @@ impl Vm {
             return self.define_array_length(o, &d).map(|_| ());
         }
         let n = d as usize;
+        if n > MAX_ELEMENTS {
+            return Err(Error::range_error("array length too large for this engine"));
+        }
         unsafe {
             let len = (*o).elems_len as usize;
             if n > len {
@@ -3657,6 +3666,9 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
             let len = n.as_number().unwrap();
             if len < 0.0 || len.fract() != 0.0 || len > u32::MAX as f64 {
                 return Err(Error::range_error("Invalid array length"));
+            }
+            if len > MAX_ELEMENTS as f64 {
+                return Err(Error::range_error("array length too large for this engine"));
             }
             vec![Value::EMPTY; len as usize]
         }

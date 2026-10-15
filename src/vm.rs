@@ -817,9 +817,14 @@ impl Vm {
 
         vm.object_prototype = vm.new_object_with(Class::Plain, Value::NULL, 4);
         let op = object_value(vm.object_prototype);
-        vm.function_prototype = vm.new_object(op);
+        // `Function.prototype` is itself a function (returning `undefined`).
+        let fp = vm.new_object_with(Class::Native, op, 0);
+        unsafe { (*fp).code = vm.native_code("", function_prototype_fn, 0, crate::jit::Ty::Any, false) };
+        vm.function_prototype = fp;
         vm.array_prototype = vm.new_object(op);
-        vm.string_prototype = vm.new_object(op);
+        // `String.prototype` is a string object (of `""`, set below) and
+        // `Number.prototype` a number object (of 0).
+        vm.string_prototype = vm.new_object_with(Class::Wrapper, op, 4);
         vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
         // Room for the builtins and the script's globals in the object
         // itself: out-of-line globals cost compiled code a load each, and
@@ -840,6 +845,8 @@ impl Vm {
         // No value fits a string's "elements" (its code units): element
         // stores' fast paths never take one.
         unsafe { (*vm.string_shape.cast_mut()).elems_code = NO_ELEMENTS };
+        let empty = vm.new_string(&[]);
+        unsafe { (*vm.string_prototype).code = empty.to_bits() as *const Code };
         let ap = vm.array_prototype;
         vm.array_push_fn = vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
         vm.array_pop_fn = vm.define_native(ap, "pop", crate::array::array_pop, 0, crate::jit::Ty::Any, false);
@@ -858,7 +865,8 @@ impl Vm {
                 READ_ONLY | DONT_ENUM | DONT_DELETE,
             );
         }
-        vm.number_prototype = vm.new_object(op);
+        vm.number_prototype = vm.new_object_with(Class::Wrapper, op, 4);
+        unsafe { (*vm.number_prototype).code = Value::from_i32(0).to_bits() as *const Code };
         let np = vm.number_prototype;
         vm.define_native(
             np,
@@ -2880,7 +2888,23 @@ impl Vm {
         ret: crate::jit::Ty,
         constructs: bool,
     ) -> *mut Object {
-        let code = self.add_code(Code {
+        let code = self.native_code(name, f, nparams, ret, constructs);
+        let fp = object_value(self.function_prototype);
+        let fo = self.new_object_with(Class::Native, fp, 0);
+        unsafe { (*fo).code = code };
+        fo
+    }
+
+    /// A native function's code.
+    fn native_code(
+        &mut self,
+        name: &str,
+        f: NativeFn,
+        nparams: u32,
+        ret: crate::jit::Ty,
+        constructs: bool,
+    ) -> *const Code {
+        self.add_code(Code {
             name: name.to_string(),
             line: 0,
             col: 0,
@@ -2913,11 +2937,7 @@ impl Vm {
             mark: Default::default(),
             pinned: Cell::new(true),
             lazy: None,
-        });
-        let fp = object_value(self.function_prototype);
-        let fo = self.new_object_with(Class::Native, fp, 0);
-        unsafe { (*fo).code = code };
-        fo
+        })
     }
 
     /// Add properties `names` (none of which `o` has) with `values` and
@@ -3841,6 +3861,11 @@ fn object_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
             Ok(object_value(vm.new_object(op)))
         }
     }
+}
+
+/// `Function.prototype` called: `undefined`.
+fn function_prototype_fn(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    Ok(Value::UNDEFINED)
 }
 
 /// The primitive `v` wraps, if it is a wrapper object.

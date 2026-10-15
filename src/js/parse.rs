@@ -214,8 +214,15 @@ impl<'a> Parser<'_, 'a> {
                 self.semicolon()?;
                 StmtKind::Var(decls)
             }
-            Tok::Keyword(k @ ("let" | "const" | "class" | "with" | "import" | "export")) => {
+            Tok::Keyword(k @ ("let" | "const" | "class" | "import" | "export")) => {
                 return self.err(format!("`{k}` is not supported"));
+            }
+            Tok::Keyword("with") => {
+                self.advance();
+                self.expect("(")?;
+                let o = self.expression(false)?;
+                self.expect(")")?;
+                StmtKind::With(o, stmt(self.arena, self.statement()?))
             }
             Tok::Keyword("function") => {
                 self.advance();
@@ -491,9 +498,6 @@ impl<'a> Parser<'_, 'a> {
                 self.expect(",")?;
             }
             let p = self.ident()?;
-            if params.contains(&p) {
-                return self.err(format!("duplicate parameter `{p}`"));
-            }
             params.push(p);
         }
         self.expect("{")?;

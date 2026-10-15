@@ -576,7 +576,7 @@ impl Vm {
     /// Grow `o`'s elements to length `n` with holes (a `RangeError` past
     /// what the elements can hold).
     fn grow_elements(&mut self, o: *mut Object, n: usize) -> Result<()> {
-        if n > (1 << 28) {
+        if n > crate::vm::MAX_ELEMENTS {
             return Err(Error::range_error("array length too large for this engine"));
         }
         unsafe {

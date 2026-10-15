@@ -2042,6 +2042,10 @@ impl Vm {
         unsafe {
             let shape = (*g).shape;
             match (*shape).lookup(name) {
+                Some(slot) if self.is_accessor(g, slot) => {
+                    let pair = *Object::slot(g, (*shape).location(slot));
+                    return self.call_setter(pair, object_value(g), value);
+                }
                 Some(slot) => {
                     self.store_field(g, slot, value);
                     if !self.may_cache_store(g, slot) {
@@ -2054,7 +2058,15 @@ impl Vm {
                         ..Ic::EMPTY
                     };
                 }
+                // An inherited setter, else a new global (a ReferenceError
+                // in strict code).
                 None => {
+                    if let Some(pair) = self.accessor(g, name) {
+                        return self.call_setter(pair, object_value(g), value);
+                    }
+                    if code.strict {
+                        return Err(Error::reference_error(format!("{} is not defined", self.atom_name(name))));
+                    }
                     self.add_property(g, name, value);
                 }
             }

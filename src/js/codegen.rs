@@ -1073,7 +1073,7 @@ impl<'a> Gen<'a> {
     /// first, whose first store then sets the global's field type (an int,
     /// not `undefined`: 53, 80), nor function declarations.
     fn script_vars(&self) -> Vec<&'a str> {
-        fn walk<'a>(s: &'a Stmt, init: &mut Vec<&'a str>, bare: &mut Vec<&'a str>) {
+        fn walk<'a>(s: &'a Stmt, init: &mut Vec<&'a str>, bare: &mut Vec<&'a str>, p: &'a Program<'a>) {
             // An initializer reading its own variable (`var p = p || {}`)
             // reads it declared, before it's assigned.
             let mut decl = |ds: &'a [(Name, Option<Expr>)]| {
@@ -1094,7 +1094,7 @@ impl<'a> Gen<'a> {
                     ..
                 } => {
                     decl(ds);
-                    walk(body, init, bare);
+                    walk(body, init, bare, p);
                 }
                 StmtKind::ForIn {
                     var, name, body, ..
@@ -1102,26 +1102,28 @@ impl<'a> Gen<'a> {
                     if *var {
                         init.push(name);
                     }
-                    walk(body, init, bare);
+                    walk(body, init, bare, p);
                 }
-                StmtKind::Function(_) => {}
+                // (A function declaration's global exists from the start:
+                // hoisted, or Annex B's in a block, `undefined` until then.)
+                StmtKind::Function(i) => bare.push(p.functions[*i].name.as_deref().unwrap()),
                 StmtKind::If(_, a, b) => {
-                    walk(a, init, bare);
+                    walk(a, init, bare, p);
                     if let Some(b) = b {
-                        walk(b, init, bare);
+                        walk(b, init, bare, p);
                     }
                 }
                 StmtKind::For { body, .. }
                 | StmtKind::While(_, body)
                 | StmtKind::DoWhile(body, _)
                 | StmtKind::With(_, _, body)
-                | StmtKind::Labeled(_, body) => walk(body, init, bare),
-                StmtKind::Block(b) => b.iter().for_each(|s| walk(s, init, bare)),
+                | StmtKind::Labeled(_, body) => walk(body, init, bare, p),
+                StmtKind::Block(b) => b.iter().for_each(|s| walk(s, init, bare, p)),
                 StmtKind::Switch(_, cases) => cases
                     .iter()
                     .flat_map(|(_, b)| b)
-                    .for_each(|s| walk(s, init, bare)),
-                StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| walk(s, init, bare)),
+                    .for_each(|s| walk(s, init, bare, p)),
+                StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| walk(s, init, bare, p)),
                 _ => {}
             }
         }
@@ -1129,7 +1131,7 @@ impl<'a> Gen<'a> {
         self.f
             .body
             .iter()
-            .for_each(|s| walk(s, &mut init, &mut bare));
+            .for_each(|s| walk(s, &mut init, &mut bare, self.p));
         let mut fns = Vec::new();
         self.f.body.iter().for_each(|s| hoisted(s, &mut fns));
         let fns: Vec<&str> = fns

@@ -1,0 +1,16 @@
+commit	task	bytes
+be8000c	all.hot	238848
+be8000c	all.ool	146086
+be8000c	all.exits	97307
+be8000c	S1 push	89686
+be8000c	S2 calls	33908
+be8000c	S3 entry clearing	34537
+be8000c	S4 truthiness	16572
+be8000c	S6 stores	30148
+be8000c	S7 allocation	29642
+be8000c	S9 cell guards	3770
+be8000c	S10 heap-object checks	10440
+be8000c	S11 untyped ===	7007
+be8000c	S12 moves	22846
+be8000c	S13 keyed loads	5777
+be8000c	C1 exits	97307

@@ -617,6 +617,9 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_class(buffer, Class::ArrayBuffer) {
         return Err(Error::type_error("First argument to DataView constructor must be an ArrayBuffer"));
     }
+    if unsafe { (*as_object(buffer)).flags } & crate::object::DETACHED != 0 {
+        return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
+    }
     let b = as_object(buffer);
     let offset = to_index(vm, arg(a, 1))?;
     let bytes = unsafe { (*b).elems_len } as usize;
@@ -647,16 +650,30 @@ fn this_view(this: Value) -> Result<*mut Object> {
     this_of(this, Class::DataView, "DataView.prototype method")
 }
 
+/// Whether view `o`'s buffer was detached (`$262.detachArrayBuffer`).
+fn detached(o: *mut Object) -> bool {
+    unsafe { (*((*o).code as *mut Object)).flags & crate::object::DETACHED != 0 }
+}
+
+/// `this` as a `DataView` whose buffer is attached.
+fn this_live_view(this: Value) -> Result<*mut Object> {
+    let o = this_view(this)?;
+    if detached(o) {
+        return Err(Error::type_error("Cannot perform DataView operation on a detached ArrayBuffer"));
+    }
+    Ok(o)
+}
+
 fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(object_value(unsafe { (*this_view(this)?).code } as *mut Object))
 }
 
 fn view_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::from_i32(unsafe { (*this_view(this)?).elems_len } as i32))
+    Ok(Value::from_i32(unsafe { (*this_live_view(this)?).elems_len } as i32))
 }
 
 fn view_byte_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = this_view(this)?;
+    let o = this_live_view(this)?;
     unsafe {
         let b = (*o).code as *mut Object;
         Ok(Value::from_i32((*o).elems.cast::<u8>().offset_from((*b).elems.cast::<u8>()) as i32))
@@ -665,6 +682,9 @@ fn view_byte_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// The address of the `size` bytes at `i` in view `o`, if within it.
 fn view_bytes(o: *mut Object, i: usize, size: usize) -> Result<*mut u8> {
+    if detached(o) {
+        return Err(Error::type_error("Cannot perform DataView operation on a detached ArrayBuffer"));
+    }
     if i + size > unsafe { (*o).elems_len } as usize {
         return Err(Error::range_error("Offset is outside the bounds of the DataView"));
     }

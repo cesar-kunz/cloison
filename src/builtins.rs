@@ -215,6 +215,20 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 
     crate::date::install(vm);
+    // The test262 host hooks (`$262`), as a shell has them.
+    let host = vm.new_object(object_value(op));
+    let a_host = vm.intern("$262");
+    vm.add_property_with(g, a_host, object_value(host), DONT_ENUM);
+    let a_global = vm.intern("global");
+    vm.add_property_with(host, a_global, object_value(g), DONT_ENUM);
+    vm.define_natives(
+        host,
+        &[
+            ("evalScript", eval_fn as NativeFn, 1),
+            ("gc", host_gc, 0),
+            ("detachArrayBuffer", host_detach_array_buffer, 1),
+        ],
+    );
     install_typed_arrays(vm);
     crate::collections::install(vm);
     install_regexps(vm);
@@ -794,6 +808,26 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         String::from_utf16_lossy(u)
     };
     run_source(vm, &src)
+}
+
+/// `$262.gc()`: nothing (collections happen on their own).
+fn host_gc(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    Ok(Value::UNDEFINED)
+}
+
+/// `$262.detachArrayBuffer(buffer)`: the buffer loses its bytes (its
+/// views see a detached buffer: `collections::view_bytes`).
+fn host_detach_array_buffer(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let b = arg(a, 0);
+    if !is_class(b, Class::ArrayBuffer) {
+        return Err(Error::type_error("not an ArrayBuffer"));
+    }
+    unsafe {
+        let o = as_object(b);
+        (*o).elems_len = 0;
+        (*o).flags |= crate::object::DETACHED;
+    }
+    Ok(Value::NULL)
 }
 
 /// `print(…)`: the arguments' strings, separated by spaces, on a line of

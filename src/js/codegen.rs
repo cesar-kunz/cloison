@@ -127,6 +127,8 @@ fn generate_from<'p>(
                 if lazy.is_some()
                     && !f.eager
                     && f.withs.is_empty()
+                    && !f.arrow
+                    && !f.uses_this
                     && !scopes.upvalues[i].contains(&ENV)
                     && scopes.upvalues[i].len() <= LAZY_UPVALUES
                     && f.params.len() < LOCAL_REGS
@@ -496,6 +498,10 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     if arguments_object(p, f) && !out.contains(&"arguments") {
         out.push("arguments");
     }
+    // `%this`: the function's `this`, for the arrows in it.
+    if p.functions[f].uses_this && f != 0 {
+        out.push("%this");
+    }
     // A named function expression's own name, if used: a variable set to
     // the function (`LdaCallee`).
     if let Some(n) = own_name(p, f)
@@ -602,6 +608,8 @@ fn forwards_arguments(p: &Program, f: usize) -> bool {
     func.uses_arguments
         && func.parent.is_some()
         && !explicit_declarations(p, f).contains(&"arguments")
+        // (None of its own: an arrow in it reads them.)
+        && count(false) > 0
         && count(true) == count(false)
 }
 
@@ -954,6 +962,10 @@ impl<'a> Gen<'a> {
         if arguments_object(self.p, self.index) {
             let r = self.locals["arguments"];
             self.emit(Op::CreateArguments, &[Arg::Reg(r)]);
+        }
+        if self.f.uses_this {
+            self.ldar(0);
+            self.store_var("%this", self.f.pos)?;
         }
         // (Not if a parameter or variable of the function has the name.)
         if let Some(n) = own_name(self.p, self.index)

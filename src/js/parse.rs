@@ -43,6 +43,8 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
         eager: false,
         strict: false,
         withs: Vec::new(),
+        arrow: false,
+        uses_this: false,
         free: None,
     });
     p.functions[0].strict = p.directive_prologue();
@@ -534,6 +536,8 @@ impl<'a> Parser<'_, 'a> {
             eager: false,
             strict: self.functions[self.current].strict,
             withs: self.withs.clone(),
+            arrow: false,
+            uses_this: false,
             free: None,
         });
         self.expect("(")?;
@@ -576,6 +580,80 @@ impl<'a> Parser<'_, 'a> {
         }
         let outer = std::mem::replace(&mut self.current, index);
         let body = self.block_rest();
+        self.current = outer;
+        let end = self.toks[self.i - 1].pos + 1;
+        let f = &mut self.functions[index];
+        f.end = end;
+        f.params = params;
+        f.body = body?;
+        Ok(index)
+    }
+
+    /// The nearest enclosing function that isn't an arrow (the one whose
+    /// `this` and `arguments` an arrow uses).
+    fn non_arrow(&self) -> usize {
+        let mut k = self.current;
+        while self.functions[k].arrow {
+            k = self.functions[k].parent.unwrap();
+        }
+        k
+    }
+
+    /// After a `(`: whether `=>` follows its matching `)`.
+    fn arrow_ahead(&self) -> bool {
+        let (mut j, mut level) = (self.i, 1);
+        while j < self.toks.len() {
+            match &self.toks[j].tok {
+                Tok::Punct("(" | "[" | "{") => level += 1,
+                Tok::Punct(")" | "]" | "}") => {
+                    level -= 1;
+                    if level == 0 {
+                        return self.toks.get(j + 1).is_some_and(|t| t.tok == Tok::Punct("=>") && !t.newline_before);
+                    }
+                }
+                Tok::Eof => return false,
+                _ => {}
+            }
+            j += 1;
+        }
+        false
+    }
+
+    /// An arrow function after its parameters, at its `=>`: a block body,
+    /// or an expression returned.
+    fn arrow(&mut self, params: Vec<Name>, pos: Pos) -> R<usize> {
+        self.expect("=>")?;
+        let index = self.functions.len();
+        self.functions.push(Function {
+            name: None,
+            binds_name: false,
+            uses_arguments: false,
+            params: Vec::new(),
+            body: Vec::new(),
+            parent: Some(self.current),
+            declaration: false,
+            pos,
+            params_pos: pos,
+            end: 0,
+            eager: false,
+            strict: self.functions[self.current].strict,
+            withs: self.withs.clone(),
+            arrow: true,
+            uses_this: false,
+            free: None,
+        });
+        let outer = std::mem::replace(&mut self.current, index);
+        let body = if self.eat("{") {
+            self.block_rest()
+        } else {
+            let p = self.pos();
+            self.assignment(false).map(|e| {
+                vec![Stmt {
+                    kind: StmtKind::Return(Some(e)),
+                    pos: p,
+                }]
+            })
+        };
         self.current = outer;
         let end = self.toks[self.i - 1].pos + 1;
         let f = &mut self.functions[index];
@@ -631,7 +709,7 @@ impl<'a> Parser<'_, 'a> {
                 var_level = None;
             }
             match &t.tok {
-                Tok::Eof | Tok::Keyword("let" | "const" | "class" | "with" | "import" | "export") => return None,
+                Tok::Eof | Tok::Punct("=>") | Tok::Keyword("let" | "const" | "class" | "with" | "import" | "export") => return None,
                 Tok::Punct("{" | "(" | "[") => level += 1,
                 Tok::Punct(p @ ("}" | ")" | "]")) => {
                     level -= 1;
@@ -957,11 +1035,19 @@ impl<'a> Parser<'_, 'a> {
         let kind = match self.bump() {
             Tok::Num(v) => ExprKind::Num(v),
             Tok::Str(s) => ExprKind::Str(s),
+            Tok::Ident(s) if self.is("=>") => ExprKind::Function(self.arrow(vec![s], pos)?),
             Tok::Ident(s) => {
                 if &*s == "arguments" {
-                    self.functions[self.current].uses_arguments = true;
+                    // (An arrow's are the enclosing function's.)
+                    let k = self.non_arrow();
+                    self.functions[k].uses_arguments = true;
                 }
                 ExprKind::Ident(s)
+            }
+            Tok::Keyword("this") if self.functions[self.current].arrow => {
+                let k = self.non_arrow();
+                self.functions[k].uses_this = true;
+                ExprKind::Ident("%this".into())
             }
             Tok::Keyword("this") => ExprKind::This,
             Tok::Keyword("true") => ExprKind::Bool(true),
@@ -974,6 +1060,16 @@ impl<'a> Parser<'_, 'a> {
                 let f = self.function(false, paren, pos)?;
                 self.functions[f].eager = paren || self.is("(");
                 ExprKind::Function(f)
+            }
+            Tok::Punct("(") if self.arrow_ahead() => {
+                let mut params = Vec::new();
+                while !self.eat(")") {
+                    if !params.is_empty() {
+                        self.expect(",")?;
+                    }
+                    params.push(self.ident()?);
+                }
+                ExprKind::Function(self.arrow(params, pos)?)
             }
             Tok::Punct("(") => {
                 let e = self.expression(false)?;

@@ -86,6 +86,13 @@ pub struct Function<'a> {
     /// The variables of the `with` statements enclosing it (see
     /// `StmtKind::With`), outermost first.
     pub withs: Vec<Name>,
+    /// An arrow function: its `this` and `arguments` are the enclosing
+    /// function's (the parser turns `this` into the variable `%this`,
+    /// which that function sets: see `uses_this`).
+    pub arrow: bool,
+    /// An arrow function in it uses its `this`: the variable `%this` holds
+    /// it (set at entry).
+    pub uses_this: bool,
     /// Skimmed, not parsed (see `parse::parse_with`): no body, and the
     /// names it and the functions in it may refer to from outside it (at
     /// least those they do), which stand for its references.

@@ -12030,7 +12030,7 @@ impl Lowering<'_> {
             // `f.call(that, …args)` (see `vm::VIA_CALL`): a guard that the
             // callee is `Function.prototype.call`, then a call of `f`, the
             // window one register on.
-            if i.op == Op::Call && !i.bail && !i.forward {
+            if i.op == Op::Call && !i.bail && !i.forward && i.native == 0 {
                 let ic = unsafe { *self.out.fbs[frame].ic(i.ic as usize) };
                 if ic.loc == crate::vm::VIA_CALL && !ic.holder.is_null() {
                     let call = unsafe { (*self.state.vm).function_call_fn };
@@ -12901,13 +12901,15 @@ impl Lowering<'_> {
             return None;
         }
         let mut n = d.0.len();
-        if !d.0.iter().any(|j| j.is_call()) {
+        // (An array literal's pushes are calls without an inline cache.)
+        let cached_call = |j: &&Insn| j.is_call() && j.native == 0;
+        if !d.0.iter().any(|j| cached_call(&j)) {
             return Some(n);
         }
         let fb = self.feedback(code);
         let vm = self.state.vm;
         let (push, pop, array) = unsafe { ((*vm).array_push_fn, (*vm).array_pop_fn, (*vm).array_fn) };
-        for j in d.0.iter().filter(|j| j.is_call()) {
+        for j in d.0.iter().filter(cached_call) {
             if !matches!(j.op, Op::Call | Op::Construct) || j.bail || j.forward {
                 return None;
             }
@@ -12950,7 +12952,7 @@ impl Lowering<'_> {
             let code = unsafe { (*fo).code };
             let fb = cx.feedback(code);
             let d = cx.decoded(code);
-            d.0.iter().filter(|j| j.is_call()).any(|j| {
+            d.0.iter().filter(|j| j.is_call() && j.native == 0).any(|j| {
                 let ic = fb.ic(j.ic as usize);
                 if unsafe { (*ic).loc } == crate::vm::VIA_CALL {
                     return true;

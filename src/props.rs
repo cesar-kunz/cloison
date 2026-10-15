@@ -214,7 +214,7 @@ impl Vm {
                                 Desc::data(kind.load((*o).elems.cast(), i as usize), true, true, true)
                             });
                         }
-                        Class::ArrayBuffer => return None,
+                        c if c.no_elements() => return None,
                         _ => {}
                     }
                     if Self::has_element(o, i) {
@@ -278,7 +278,8 @@ impl Vm {
             }
             match class {
                 Class::TypedArray => indices.extend(0..(*o).elems_len),
-                Class::String | Class::ArrayBuffer => {}
+                Class::String => {}
+                c if c.no_elements() => {}
                 _ => {
                     for i in 0..(*o).elems_len {
                         if Self::has_element(o, i) {
@@ -483,7 +484,8 @@ impl Vm {
                         return Ok(true);
                     }
                     match class {
-                        Class::String | Class::ArrayBuffer => return Ok(false),
+                        Class::String => return Ok(false),
+                        c if c.no_elements() => return Ok(false),
                         Class::TypedArray => {
                             if i >= (*o).elems_len || full.is_accessor() || full.attrs() != 0 {
                                 return Ok(false);
@@ -667,7 +669,7 @@ impl Vm {
                     }
                     match class {
                         Class::String | Class::TypedArray => return i >= (*o).elems_len,
-                        Class::ArrayBuffer => return true,
+                        c if c.no_elements() => return true,
                         _ => {}
                     }
                     if i < (*o).elems_len && Self::has_element(o, i) {

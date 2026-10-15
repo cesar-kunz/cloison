@@ -4483,10 +4483,8 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             // A typed array's or buffer's elements are bytes: the generic
             // stencil, through the runtime.
             let bytes = reg.shape().is_some_and(|s| unsafe {
-                matches!(
-                    (*(s as *const Shape)).class,
-                    crate::object::Class::TypedArray | crate::object::Class::ArrayBuffer
-                )
+                let c = (*(s as *const Shape)).class;
+                c == crate::object::Class::TypedArray || c.no_elements()
             });
             // A typed array's element, of the kind the cache saw: checked to
             // be one unless the receiver's shape says so.

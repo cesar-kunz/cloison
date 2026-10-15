@@ -610,6 +610,10 @@ pub struct Vm {
     /// Each typed array kind's prototype (`TypedKind` order), and
     /// `ArrayBuffer.prototype`.
     pub(crate) typed_prototypes: Vec<*mut Object>,
+    /// `Map.prototype`, `Set.prototype`, `WeakMap.prototype`,
+    /// `WeakSet.prototype`, `DataView.prototype`, then the map and set
+    /// iterator prototypes (see `collections::Proto`).
+    pub(crate) collection_prototypes: Vec<*mut Object>,
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
@@ -756,6 +760,7 @@ impl Vm {
             number_prototype: std::ptr::null_mut(),
             error_prototypes: Vec::new(),
             typed_prototypes: Vec::new(),
+            collection_prototypes: Vec::new(),
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
@@ -1025,7 +1030,7 @@ impl Vm {
             elems: FieldType::None,
             // (No value fits a typed array's or buffer's bytes, so stores'
             // fast paths never take them.)
-            elems_code: if matches!(class, Class::Array | Class::TypedArray | Class::ArrayBuffer) {
+            elems_code: if matches!(class, Class::Array | Class::TypedArray) || class.no_elements() {
                 NO_ELEMENTS
             } else {
                 0
@@ -2095,8 +2100,8 @@ impl Vm {
     pub(crate) fn has_element(o: *mut Object, i: u32) -> bool {
         unsafe {
             match (*o).class {
-                Class::ArrayBuffer => false,
                 Class::String | Class::TypedArray => i < (*o).elems_len,
+                c if c.no_elements() => false,
                 _ => i < (*o).elems_len && *(*o).elems.add(i as usize) != Value::EMPTY,
             }
         }
@@ -2279,10 +2284,10 @@ impl Vm {
         // A string's elements are code units, not values, and a typed
         // array's or buffer's bytes: recorded as such (`note_bytes`).
         if obj.is_cell()
-            && matches!(
-                unsafe { (*as_object(obj)).class },
-                Class::String | Class::TypedArray | Class::ArrayBuffer
-            )
+            && unsafe {
+                let c = (*as_object(obj)).class;
+                matches!(c, Class::String | Class::TypedArray) || c.no_elements()
+            }
         {
             let (ic, _) = code.ic(ic);
             unsafe { note_bytes(ic, as_object(obj)) };
@@ -2328,7 +2333,7 @@ impl Vm {
                         Value::UNDEFINED
                     });
                 }
-                Class::ArrayBuffer => return Ok(Value::UNDEFINED),
+                c if c.no_elements() => return Ok(Value::UNDEFINED),
                 _ => {}
             }
         }
@@ -2440,7 +2445,8 @@ impl Vm {
             // A string's characters can't be changed; a typed array stores
             // within its length only (a buffer has no elements).
             match (*o).class {
-                Class::String | Class::ArrayBuffer => return Ok(()),
+                Class::String => return Ok(()),
+                c if c.no_elements() => return Ok(()),
                 Class::TypedArray => {
                     if i < (*o).elems_len {
                         let kind = crate::object::TypedKind::from_u8((*o).kind);
@@ -3391,6 +3397,7 @@ impl Vm {
         ]
         .into_iter()
         .chain(self.typed_prototypes.iter().copied())
+        .chain(self.collection_prototypes.iter().copied())
         .chain(self.error_prototypes.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)
@@ -3481,7 +3488,8 @@ impl Vm {
     /// The stencils of `function`'s most recent compiled code, if any (for
     /// tests).
     pub fn jit_stencils(&self, function: &str) -> Option<Vec<String>> {
-        let code = self.codes.iter().find(|c| c.name == function)?;
+        // (Not a native of that name, `Set.prototype.add` say.)
+        let code = self.codes.iter().find(|c| c.name == function && c.native.is_none())?;
         let jit = code.jit.borrow();
         let names = jit
             .as_ref()?

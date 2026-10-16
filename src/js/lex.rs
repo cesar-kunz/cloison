@@ -208,7 +208,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 continue;
             }
             b'/' if b.get(i + 1) == Some(&b'/') => {
-                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
+                // (To a line terminator: U+2028 and U+2029 too.)
+                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' && !b[i..].starts_with("\u{2028}".as_bytes()) && !b[i..].starts_with("\u{2029}".as_bytes()) {
                     i += 1;
                 }
                 continue;
@@ -217,7 +218,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 let end = src[i + 2..]
                     .find("*/")
                     .ok_or_else(|| err("unterminated comment"))?;
-                newline |= src[i + 2..i + 2 + end].contains(['\n', '\r']);
+                newline |= src[i + 2..i + 2 + end].contains(['\n', '\r', '\u{2028}', '\u{2029}']);
                 i += end + 4;
                 continue;
             }
@@ -230,6 +231,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 Tok::Num(v)
             } else if c == b'"' || c == b'\'' {
                 let (s, n) = string(&src[i..]).ok_or_else(|| err("unterminated string"))?;
+                // (Escapes in it: then not a directive, `"use strict"`.)
+                escaped = src[i..i + n].contains('\\');
                 i += n;
                 Tok::Str(s)
             } else if c == b'`' || (c == b'}' && braces.last() == Some(&2)) {
@@ -385,11 +388,11 @@ fn regexp(s: &str) -> Option<(String, String, usize)> {
         match c {
             '\\' => {
                 let (_, e) = it.next()?;
-                if e == '\n' || e == '\r' {
+                if matches!(e, '\n' | '\r' | '\u{2028}' | '\u{2029}') {
                     return None;
                 }
             }
-            '\n' | '\r' => return None,
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => return None,
             '[' => class = true,
             ']' => class = false,
             '/' if !class => break i,
@@ -531,7 +534,11 @@ fn number(s: &str) -> Option<(f64, usize)> {
         let n = 2 + s[2..]
             .find(|c: char| !c.is_digit(radix))
             .unwrap_or(s.len() - 2);
-        let v = u64::from_str_radix(&s[2..n], radix).ok()? as f64;
+        if n == 2 {
+            return None;
+        }
+        // (As a double: past 2^64 too.)
+        let v = s[2..n].chars().fold(0.0, |v, c| v * radix as f64 + c.to_digit(radix).unwrap() as f64);
         return (!s[n..].starts_with(is_ident_part)).then_some((v, n));
     }
     let mut n = 0;
@@ -541,6 +548,11 @@ fn number(s: &str) -> Option<(f64, usize)> {
         }
     };
     digits(&mut n);
+    // A legacy octal integer (`070`, Annex B; not `08`, decimal).
+    if b[0] == b'0' && n > 1 && b[1..n].iter().all(|d| (b'0'..=b'7').contains(d)) {
+        let v = s[1..n].bytes().fold(0.0, |v, d| v * 8.0 + (d - b'0') as f64);
+        return (!s[n..].starts_with(is_ident_part)).then_some((v, n));
+    }
     if n < b.len() && b[n] == b'.' {
         n += 1;
         digits(&mut n);

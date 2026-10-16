@@ -930,6 +930,24 @@ handlers! {
         tail!(op_return, acc)
     }
 
+    fn op_create_mapped_arguments(pc, acc, regs, tag) {
+        let vm = &mut *frame_vm(regs);
+        let mut spread = Vec::new();
+        let (args, argc) = frame_args(vm, regs, &mut spread);
+        let values = std::slice::from_raw_parts(args, argc);
+        let callee: *mut Object = header(regs, FUNC);
+        let o = crate::builtins::arguments_object_of(vm, values, callee);
+        let n = argc.min((*frame_code(regs)).nparams as usize);
+        if n > 0 {
+            vm.slow_elements(as_object(o));
+            vm.mapped_args.push(crate::vm::MappedArgs { o: as_object(o), regs, mapped: vec![true; n] });
+            // (Released where the frame ends: see `Vm::close_upvalues`.)
+            *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
+        }
+        *reg(pc, 1, regs) = o;
+        next!(any, Op::CreateMappedArguments.size(), acc)
+    }
+
     fn op_close_upvalue(pc, acc, regs, tag) {
         (*frame_vm(regs)).close_upvalue(reg(pc, 1, regs));
         next!(any, Op::CloseUpvalue.size(), acc)
@@ -3139,6 +3157,7 @@ static TABLE: Table = {
     t[Op::CloseUpvalue as usize] = op_close_upvalue;
     t[Op::LdaNewTarget as usize] = op_lda_new_target;
     t[Op::InitialYield as usize] = op_initial_yield;
+    t[Op::CreateMappedArguments as usize] = op_create_mapped_arguments;
     t[Op::Yield as usize] = op_yield;
     t[Op::CreateRest as usize] = op_create_rest;
     t[Op::StaGlobal as usize] = op_sta_global;

@@ -374,6 +374,9 @@ define_ops! {
     /// `yield acc`: generator `r` keeps this frame, which returns `acc`;
     /// resumed, it goes on from the next instruction with the value sent.
     Yield(Reg),
+    /// `r` = a sloppy function's `arguments`, its elements mapped to the
+    /// parameters while the frame runs (see `Vm::mapped_args`).
+    CreateMappedArguments(Reg),
 }
 
 impl Op {

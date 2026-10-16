@@ -193,6 +193,23 @@ impl Vm {
 
     /// `o`'s own property `key`, fully described, if it has it.
     pub(crate) fn own_property(&mut self, o: *mut Object, key: Key) -> Option<Desc> {
+        // A mapped `arguments` element's value is its parameter's.
+        if let Key::Index(i) = key
+            && let Some(p) = self.mapped_slot(o, i)
+        {
+            let mut d = self.own_property_inner(o, key)?;
+            d.value = Some(unsafe { *p });
+            return Some(d);
+        }
+        self.own_property_inner(o, key)
+    }
+
+    /// Whether element `i` of `o` is a writable data property (or absent).
+    pub(crate) fn writable_element(&mut self, o: *mut Object, i: u32) -> bool {
+        self.own_property_inner(o, Key::Index(i)).is_none_or(|d| d.writable != Some(false))
+    }
+
+    fn own_property_inner(&mut self, o: *mut Object, key: Key) -> Option<Desc> {
         unsafe {
             let class = (*o).class;
             let flags = (*o).flags;
@@ -407,6 +424,30 @@ impl Vm {
     /// `Object.defineProperty`: whether it could be (ValidateAndApply-
     /// PropertyDescriptor; a `RangeError` for an array's bad `length`).
     pub(crate) fn define_own_property(&mut self, o: *mut Object, key: Key, d: &Desc) -> Result<bool> {
+        // A mapped `arguments` element: its parameter set too, and unmapped
+        // by an accessor or a non-writable value.
+        if let Key::Index(i) = key
+            && let Some(p) = self.mapped_slot(o, i)
+        {
+            let ok = self.define_own_property_inner(o, key, d)?;
+            if ok {
+                if d.get.is_some() || d.set.is_some() {
+                    self.unmap_argument(o, i);
+                } else {
+                    if let Some(v) = d.value {
+                        unsafe { *p = v };
+                    }
+                    if d.writable == Some(false) {
+                        self.unmap_argument(o, i);
+                    }
+                }
+            }
+            return Ok(ok);
+        }
+        self.define_own_property_inner(o, key, d)
+    }
+
+    fn define_own_property_inner(&mut self, o: *mut Object, key: Key, d: &Desc) -> Result<bool> {
         let class = unsafe { (*o).class };
         if class == Class::Array && key == Key::Name(self.a_length) {
             return self.define_array_length(o, d);
@@ -669,6 +710,14 @@ impl Vm {
 
     /// `delete o[key]`: whether it is gone.
     pub(crate) fn delete_own(&mut self, o: *mut Object, key: Key) -> bool {
+        let r = self.delete_own_inner(o, key);
+        if r && let Key::Index(i) = key {
+            self.unmap_argument(o, i);
+        }
+        r
+    }
+
+    fn delete_own_inner(&mut self, o: *mut Object, key: Key) -> bool {
         unsafe {
             let class = (*o).class;
             match key {

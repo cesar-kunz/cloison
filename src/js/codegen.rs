@@ -526,6 +526,7 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             if !forwarded {
                 out.push(ctor);
                 out.push("%newtarget");
+                out.push("%this");
             }
             args.iter().for_each(|e| expr_refs(e, out));
         }
@@ -2726,6 +2727,7 @@ impl<'a> Gen<'a> {
             Bool(true) => self.emit(Op::LdaTrue, &[]),
             Bool(false) => self.emit(Op::LdaFalse, &[]),
             Null => self.emit(Op::LdaNull, &[]),
+            This if self.f.class_kind == 3 && self.f.uses_this => self.load_var("%this", e.pos)?,
             This if self.f.class_kind == 3 => {
                 self.ldar(0);
                 let k = self.const_str("this");
@@ -2903,14 +2905,15 @@ impl<'a> Gen<'a> {
                 self.star(nt);
                 let a = self.alloc(e.pos)?;
                 self.args_array(args, a, e.pos)?;
+                // (`this` the constructor's `%this`, an arrow's too.)
                 let t = self.alloc(e.pos)?;
-                self.ldar(0);
+                self.load_raw("%this", e.pos)?;
                 self.star(t);
                 self.intrinsic("super_call", c, 4);
-                self.star(0);
-                if self.f.uses_this {
-                    self.store_var("%this", e.pos)?;
+                if !self.f.arrow {
+                    self.star(0);
                 }
+                self.store_var("%this", e.pos)?;
                 self.temp = mark;
             }
             SuperMember(home, k, this) => {
@@ -2919,9 +2922,10 @@ impl<'a> Gen<'a> {
                 self.load_var(home, e.pos)?;
                 self.star(h);
                 let kr = self.alloc(e.pos)?;
-                self.into(k, kr)?;
                 let t = self.alloc(e.pos)?;
+                // (`this` resolved before the key is evaluated.)
                 self.into(this, t)?;
+                self.into(k, kr)?;
                 self.intrinsic("super_get", h, 3);
                 self.temp = mark;
             }
@@ -3310,10 +3314,11 @@ impl<'a> Gen<'a> {
                 self.load_var(home, pos)?;
                 self.star(h);
                 let kr = self.alloc(pos)?;
-                self.into(k, kr)?;
                 let vr = self.alloc(pos)?;
                 let tr = self.alloc(pos)?;
+                // (`this` resolved before the key is evaluated.)
                 self.into(this, tr)?;
+                self.into(k, kr)?;
                 match op {
                     None => self.value(v)?,
                     Some(op) => {
@@ -3339,7 +3344,9 @@ impl<'a> Gen<'a> {
                 self.mov(kr, o2);
                 self.mov(vr, o3);
                 self.mov(tr, o4);
-                self.intrinsic("super_set", order, 4);
+                // (Sloppy code's failure silent.)
+                let name = if self.f.strict { "super_set" } else { "super_set_sloppy" };
+                self.intrinsic(name, order, 4);
                 self.temp = mark;
                 Ok(())
             }
@@ -3457,6 +3464,28 @@ impl<'a> Gen<'a> {
                 step(self);
                 let ic = self.auto_ic("[]keyed");
                 self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+            }
+            ExprKind::SuperMember(home, k, this) => {
+                // `[home, key, this]` read, then `[home, key, v, this]` set.
+                let h = self.alloc(pos)?;
+                self.load_var(home, pos)?;
+                self.star(h);
+                let kr = self.alloc(pos)?;
+                let tr = self.alloc(pos)?;
+                self.into(this, tr)?;
+                self.into(k, kr)?;
+                self.intrinsic("super_get", h, 3);
+                step(self);
+                let order = self.alloc(pos)?;
+                let o2 = self.alloc(pos)?;
+                let o3 = self.alloc(pos)?;
+                let o4 = self.alloc(pos)?;
+                self.star(o3);
+                self.mov(h, order);
+                self.mov(kr, o2);
+                self.mov(tr, o4);
+                let name = if self.f.strict { "super_set" } else { "super_set_sloppy" };
+                self.intrinsic(name, order, 4);
             }
             _ => unreachable!("the parser checks increment targets"),
         }
@@ -4022,7 +4051,12 @@ impl<'a> Gen<'a> {
         let v = self.alloc(pos)?;
         self.star(v);
         let t = self.alloc(pos)?;
-        self.mov(0, t);
+        if self.f.uses_this {
+            self.load_raw("%this", pos)?;
+            self.star(t);
+        } else {
+            self.mov(0, t);
+        }
         self.intrinsic("derived_return", v, 2);
         self.temp = mark;
         Ok(())

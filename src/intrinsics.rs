@@ -27,6 +27,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("define_method", define_method),
     ("super_get", super_get),
     ("super_set", super_set),
+    ("super_set_sloppy", super_set_sloppy),
     ("super_call", super_call),
     ("derived_return", derived_return),
     ("class_call_check", class_call_check),
@@ -407,6 +408,14 @@ fn super_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Cannot assign to a read-only property"));
     }
     Ok(v)
+}
+
+/// `super[key] = v` in sloppy code: failing silently.
+fn super_set_sloppy(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let base = super_base(a[0])?;
+    let key = to_property_key(vm, a[1])?;
+    ordinary_set(vm, base, key, a[2], a[3])?;
+    Ok(a[2])
 }
 
 /// The spec's OrdinarySet: `key` looked up from `start`, stored as

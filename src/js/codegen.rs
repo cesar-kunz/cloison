@@ -1015,6 +1015,16 @@ fn hoisted(s: &Stmt, out: &mut Vec<usize>) {
     }
 }
 
+/// [`hoisted`]'s, but those with a binding of their own (made by
+/// `Gen::enter_scope`).
+fn hoisted_vars(p: &Program, s: &Stmt, out: &mut Vec<usize>) {
+    if let StmtKind::Function(i) = &s.kind
+        && p.functions[*i].binding.is_none()
+    {
+        out.push(*i);
+    }
+}
+
 /// The statements of a `try`'s blocks.
 fn try_blocks<'a>(
     b: &'a [Stmt],
@@ -1494,7 +1504,7 @@ impl<'a> Gen<'a> {
         self.enter_scope(&self.f.body, self.f.pos)?;
         self.entering = false;
         let mut fns = Vec::new();
-        self.f.body.iter().for_each(|s| hoisted(s, &mut fns));
+        self.f.body.iter().for_each(|s| hoisted_vars(self.p, s, &mut fns));
         for i in fns {
             self.closure(i);
             let name = self.p.functions[i].name.as_deref().unwrap();

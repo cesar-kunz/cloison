@@ -157,13 +157,15 @@ fn parse_pass<'a, 'p>(
 #[derive(Default)]
 struct Table {
     decls: crate::jit::HashMap<usize, Vec<(Name, u8)>>,
+    /// A function has parameter defaults (see `Parser::push_body_vars`).
+    defaults: bool,
 }
 
 impl Table {
     /// Nothing to rename but catch parameters (renamed only along with
     /// other names).
     fn trivial(&self) -> bool {
-        self.decls.values().flatten().all(|&(_, kind)| kind == CATCH)
+        !self.defaults && self.decls.values().flatten().all(|&(_, kind)| kind == CATCH)
     }
 }
 
@@ -456,6 +458,8 @@ impl<'a> Parser<'_, 'a, '_> {
                 let f = self.function(true, false, pos)?;
                 if !self.frames.last().unwrap().body {
                     self.block_function(f);
+                } else {
+                    self.body_function(f);
                 }
                 StmtKind::Function(f)
             }
@@ -673,10 +677,12 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 continue;
             }
-            let name = self.ident()?;
+            let written = self.ident()?;
+            // (A body's `var` renamed apart: see `push_body_vars`.)
+            let name = self.resolve(&written).unwrap_or_else(|| written.clone());
             let init = if self.eat("=") {
                 let e = self.assignment(no_in)?;
-                self.infer_name(&e, &name);
+                self.infer_name(&e, &written);
                 Some(e)
             } else {
                 None
@@ -1154,6 +1160,11 @@ impl<'a> Parser<'_, 'a, '_> {
         let (params, prologue) = params?;
         // (Known while its body is parsed: see `block_function`.)
         self.functions[index].params = params.clone();
+        // Defaults' closures don't see the body's `var`s: renamed apart.
+        if !prologue.is_empty() && self.collect {
+            self.table.defaults = true;
+        }
+        let body_vars = !prologue.is_empty() && self.push_body_vars(&params);
         self.expect("{")?;
         if self.directive_prologue() {
             self.functions[index].strict = true;
@@ -1188,6 +1199,9 @@ impl<'a> Parser<'_, 'a, '_> {
         let outer = std::mem::replace(&mut self.current, index);
         let body = self.scoped_block_rest();
         self.current = outer;
+        if body_vars {
+            self.frames.pop();
+        }
         let end = self.toks[self.i - 1].pos + 1;
         self.functions[index].end = end;
         let mut body = body?;
@@ -2120,6 +2134,41 @@ impl<'a> Parser<'_, 'a, '_> {
         });
     }
 
+    /// The `var`s and functions a function with parameter defaults declares
+    /// in its body (its first pass's), but its parameters, renamed apart
+    /// (its frame pushed): whether there were any.
+    fn push_body_vars(&mut self, params: &[Name]) -> bool {
+        let Some(prev) = self.prev else { return false };
+        let Some(vars) = self.frames.iter().rev().find(|f| f.vars) else { return false };
+        let pos = self.toks[vars.key].pos;
+        let fs = &prev.functions;
+        let k = fs[1..].partition_point(|f| f.params_pos < pos) + 1;
+        let Some(f) = fs.get(k).filter(|f| f.params_pos == pos) else { return false };
+        let own = f.name.clone().filter(|_| f.binds_name);
+        let mut names = Vec::new();
+        for n in var_names(fs, k) {
+            if params.contains(&n) || &*n == "arguments" || Some(&n) == own.as_ref() || names.iter().any(|(o, _)| *o == n) {
+                continue;
+            }
+            let r: Name = format!("{n}%{}", self.renames).into();
+            self.renames += 1;
+            names.push((n, r));
+        }
+        if names.is_empty() {
+            return false;
+        }
+        // (A `var`s frame: the body's scope, inside it, is the function's.)
+        self.frames.push(Frame {
+            key: usize::MAX - 1,
+            names,
+            switch: false,
+            body: false,
+            vars: true,
+            catch: false,
+        });
+        true
+    }
+
     /// Enter a function's parameters and `var`s (keyed by the token
     /// before its parameters), which shadow outer block-scoped bindings.
     /// (The names come from the first pass's function starting there.)
@@ -2212,6 +2261,17 @@ impl<'a> Parser<'_, 'a, '_> {
             let func = &mut self.functions[f];
             func.binding = Some(binding);
             func.annex_b = annex_b;
+        }
+    }
+
+    /// A function declared in a body whose `var`s are renamed apart (see
+    /// `push_body_vars`): bound by its new name, made where the body starts.
+    fn body_function(&mut self, f: usize) {
+        let name = self.functions[f].name.clone().unwrap();
+        if let Some(r) = self.resolve(&name) {
+            let func = &mut self.functions[f];
+            func.binding = Some(r);
+            func.annex_b = false;
         }
     }
 

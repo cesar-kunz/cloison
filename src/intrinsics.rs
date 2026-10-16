@@ -359,7 +359,7 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
 }
 
 /// `o[key]` from `start` on, accessors called with `receiver`.
-fn get_from(vm: &mut Vm, start: Value, key: Key, receiver: Value) -> Result<Value> {
+pub(crate) fn get_from(vm: &mut Vm, start: Value, key: Key, receiver: Value) -> Result<Value> {
     let mut o = start;
     while crate::props::is_object(o) {
         if let Some(d) = vm.own_property(as_object(o), key) {
@@ -403,43 +403,45 @@ fn super_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let base = super_base(a[0])?;
     let key = to_property_key(vm, a[1])?;
     let (v, this) = (a[2], a[3]);
-    let mut o = base;
+    if !ordinary_set(vm, base, key, v, this)? {
+        return Err(Error::type_error("Cannot assign to a read-only property"));
+    }
+    Ok(v)
+}
+
+/// The spec's OrdinarySet: `key` looked up from `start`, stored as
+/// `receiver`'s (a setter called on it); false where it can't be.
+pub(crate) fn ordinary_set(vm: &mut Vm, start: Value, key: Key, v: Value, receiver: Value) -> Result<bool> {
+    let mut o = start;
     while crate::props::is_object(o) {
         if let Some(d) = vm.own_property(as_object(o), key) {
             if d.get.is_some() || d.set.is_some() {
                 return match d.set {
-                    Some(s) if !s.is_undefined() => call_function(vm, s, this, &[v]).map(|_| v),
-                    _ => Err(Error::type_error("Cannot set a property that has only a getter")),
+                    Some(s) if !s.is_undefined() => call_function(vm, s, receiver, &[v]).map(|_| true),
+                    _ => Ok(false),
                 };
             }
             if d.writable == Some(false) {
-                return Err(Error::type_error("Cannot assign to a read-only property"));
+                return Ok(false);
             }
             break;
         }
         o = unsafe { (*(*as_object(o)).shape).proto };
     }
-    if !crate::props::is_object(this) {
-        return Err(Error::type_error("Cannot assign to a property of a primitive"));
+    if !crate::props::is_object(receiver) {
+        return Ok(false);
     }
-    match vm.own_property(as_object(this), key) {
-        Some(d) if d.get.is_some() || d.set.is_some() || d.writable == Some(false) => {
-            return Err(Error::type_error("Cannot assign to a read-only property"));
-        }
+    match vm.own_property(as_object(receiver), key) {
+        Some(d) if d.get.is_some() || d.set.is_some() || d.writable == Some(false) => Ok(false),
         Some(_) => {
             let d = Desc {
                 value: Some(v),
                 ..Default::default()
             };
-            vm.define_own_property(as_object(this), key, &d)?;
+            vm.define_own_property(as_object(receiver), key, &d)
         }
-        None => {
-            if !vm.create_data_property(this, key, v).is_ok() {
-                return Err(Error::type_error("Cannot add a property: the object is not extensible"));
-            }
-        }
+        None => Ok(vm.create_data_property(receiver, key, v).is_ok()),
     }
-    Ok(v)
 }
 
 /// `super(…args)`: `[F, new.target, args, this]`, `F` the class whose

@@ -270,6 +270,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // (After the errors: `AggregateError` inherits `Error.prototype`.)
     crate::promise::install(vm);
+    crate::reflect::install(vm);
     crate::symbol::install(vm);
     crate::generator::install(vm);
 }
@@ -917,18 +918,24 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Bind must be called on a function"));
     }
     if vm.bind_helper.is_undefined() {
-        vm.bind_helper = run_source(
+        // (Its calls through natives, not `apply` or `push`, which code may
+        // have replaced.)
+        let make = run_source(
             vm,
-            "(function (f, that, args, ctor) { \
-               if (ctor) return function () { \
-                 var all = args.slice(); \
-                 for (var i = 0; i < arguments.length; i++) all.push(arguments[i]); \
-                 return new.target ? new f(...all) : f.apply(that, all); }; \
-               return ({ bound() { \
-                 var all = args.slice(); \
-                 for (var i = 0; i < arguments.length; i++) all.push(arguments[i]); \
-                 return f.apply(that, all); } }).bound; })",
+            "(function (call, construct) { return function (f, that, args, ctor) { \
+               if (ctor) return function B(...rest) { \
+                 return new.target ? construct(f, args, rest, new.target === B ? f : new.target) \
+                   : call(f, that, args, rest); }; \
+               return ({ bound(...rest) { return call(f, that, args, rest); } }).bound; }; })",
         )?;
+        vm.bind_helper = vm.handle_scope(|vm| {
+            vm.handles.push(make);
+            let call = vm.native_function("call", bound_call, 4, crate::jit::Ty::Any, false);
+            vm.handles.push(object_value(call));
+            let construct = vm.native_function("construct", bound_construct, 4, crate::jit::Ty::Any, false);
+            vm.handles.push(object_value(construct));
+            crate::interp::call_function(vm, make, Value::UNDEFINED, &[object_value(call), object_value(construct)])
+        })?;
     }
     let rest = vm.new_array();
     crate::vm::array_push(vm, rest, a.get(1..).unwrap_or(&[]))?;
@@ -939,6 +946,8 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // (No `prototype` of its own.)
     let a_prototype = vm.a_prototype;
     vm.force_delete_named(as_object(bound), a_prototype);
+    let a_target = vm.a_bound_target;
+    vm.add_property_with(as_object(bound), a_target, this, DONT_ENUM | READ_ONLY | DONT_DELETE);
     // Its `length` (what the target's leaves) and `name` ("bound …").
     let a_length = vm.a_length;
     let len = if vm.own_property(as_object(this), crate::vm::Key::Name(a_length)).is_some() {
@@ -964,6 +973,24 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let d = crate::props::Desc::data(name, false, false, true);
     vm.define_own_property(as_object(bound), crate::vm::Key::Name(a_name), &d)?;
     Ok(bound)
+}
+
+/// A bound function's call: `[f, that, bound args, args]`.
+fn bound_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    vm.handle_scope(|vm| {
+        let mut all = crate::array::apply_list(vm, a[2])?;
+        all.extend(crate::array::apply_list(vm, a[3])?);
+        crate::interp::call_function(vm, a[0], a[1], &all)
+    })
+}
+
+/// A bound function's construction: `[f, bound args, args, new.target]`.
+fn bound_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    vm.handle_scope(|vm| {
+        let mut all = crate::array::apply_list(vm, a[1])?;
+        all.extend(crate::array::apply_list(vm, a[2])?);
+        crate::intrinsics::construct_with(vm, a[0], &all, a[3])
+    })
 }
 
 /// `Function.prototype.toString`: a function's source text, or (a native,

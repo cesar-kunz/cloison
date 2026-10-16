@@ -708,6 +708,8 @@ pub struct Vm {
     pub(crate) regexp_shapes: (*const Shape, *const Shape),
     /// Names of `RegExp` objects' and `exec` results' properties.
     pub(crate) a_last_index: Atom,
+    /// A bound function's target, a hidden key (see `function_bind`).
+    pub(crate) a_bound_target: Atom,
     pub(crate) a_source: Atom,
     pub(crate) a_global: Atom,
     pub(crate) a_ignore_case: Atom,
@@ -862,6 +864,7 @@ impl Vm {
             match_shapes: Vec::new(),
             regexp_shapes: (std::ptr::null(), std::ptr::null()),
             a_last_index: Atom(0),
+            a_bound_target: Atom(0),
             a_source: Atom(0),
             a_global: Atom(0),
             a_ignore_case: Atom(0),
@@ -907,6 +910,7 @@ impl Vm {
         vm.a_to_string = vm.intern("toString");
         vm.a_value_of = vm.intern("valueOf");
         vm.a_last_index = vm.intern("lastIndex");
+        vm.a_bound_target = vm.intern("\u{FDD0}BoundTarget");
         vm.a_source = vm.intern("source");
         vm.a_global = vm.intern("global");
         vm.a_ignore_case = vm.intern("ignoreCase");
@@ -2178,13 +2182,16 @@ impl Vm {
     }
 
     /// `v instanceof f`: whether `f.prototype` is on `v`'s prototype chain
-    /// (OrdinaryHasInstance; there are no bound functions or
+    /// (OrdinaryHasInstance, a bound function's its target's; there is no
     /// `Symbol.hasInstance`).
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
         let callable = f.is_cell()
             && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
         if !callable {
             return Err(Error::type_error("Right-hand side of 'instanceof' is not callable"));
+        }
+        if let Some(t) = self.bound_target(f) {
+            return self.instance_of(v, t);
         }
         // Strings (and symbols) are primitives.
         if !crate::props::is_object(v) {
@@ -2207,6 +2214,14 @@ impl Vm {
             }
             o = as_object(proto);
         }
+    }
+
+    /// The function bound function `f` calls, if `f` is one.
+    pub(crate) fn bound_target(&self, f: Value) -> Option<Value> {
+        let o = as_object(f);
+        let s = unsafe { &*(*o).shape };
+        let slot = s.lookup(self.a_bound_target)?;
+        Some(unsafe { *Object::slot(o, s.location(slot)) })
     }
 
     /// Whether `o` has element `i` of its own: within the length, and not
@@ -4019,29 +4034,33 @@ fn math_pow(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `Infinity`/`-Infinity`).
 fn math_min(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut r = f64::INFINITY;
+    let mut nan = false;
     for i in 0..a.len() {
         let x = num_arg(a, i);
         if x.is_nan() {
-            return Ok(Value::from_f64(f64::NAN));
+            // (The rest still converted, for their `valueOf`s' effects.)
+            nan = true;
         }
         if x < r || (x == 0.0 && r == 0.0 && x.is_sign_negative()) {
             r = x;
         }
     }
-    Ok(Value::number(r))
+    Ok(Value::number(if nan { f64::NAN } else { r }))
 }
 fn math_max(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut r = f64::NEG_INFINITY;
+    let mut nan = false;
     for i in 0..a.len() {
         let x = num_arg(a, i);
         if x.is_nan() {
-            return Ok(Value::from_f64(f64::NAN));
+            // (The rest still converted, for their `valueOf`s' effects.)
+            nan = true;
         }
         if x > r || (x == 0.0 && r == 0.0 && r.is_sign_negative()) {
             r = x;
         }
     }
-    Ok(Value::number(r))
+    Ok(Value::number(if nan { f64::NAN } else { r }))
 }
 /// `Math.random`: xorshift64*, seeded from the clock.
 fn math_random(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {

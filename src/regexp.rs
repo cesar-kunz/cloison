@@ -591,7 +591,10 @@ impl Parser<'_> {
         if min > max {
             return Err(self.error("numbers out of order in {} quantifier"));
         }
-        if matches!(atom, Node::Start | Node::End | Node::Boundary(_) | Node::Look(..)) {
+        // (A lookahead may be, outside `u` mode: Annex B.)
+        if matches!(atom, Node::Start | Node::End | Node::Boundary(_))
+            || matches!(atom, Node::Look(..)) && self.unicode
+        {
             return Err(self.error("Nothing to repeat"));
         }
         let greedy = if self.peek() == Some('?') {
@@ -820,6 +823,21 @@ impl Parser<'_> {
             'v' => 11,
             'f' => 12,
             '0' if !self.peek().is_some_and(|c| c.is_ascii_digit()) => 0,
+            // A legacy octal escape (Annex B, not `u` mode): up to 0o377.
+            '0'..='7' if !self.unicode => {
+                let mut v = e.to_digit(8).unwrap();
+                // (Three digits at most, leading zeros too; two from `\4`.)
+                let mut n = if v < 4 { 2 } else { 1 };
+                while let Some(d) = self.peek().and_then(|c| c.to_digit(8)) {
+                    if n == 0 {
+                        break;
+                    }
+                    n -= 1;
+                    v = v * 8 + d;
+                    self.i += 1;
+                }
+                v as u16
+            }
             'x' => hex(self, 2).unwrap_or(b'x' as u16),
             'u' => hex(self, 4).unwrap_or(b'u' as u16),
             'c' => match self.peek() {
@@ -909,6 +927,12 @@ impl Parser<'_> {
             '-' => {
                 self.i += 1;
                 Ok(b'-' as u16)
+            }
+            // `\c` and a digit or `_`, in a class (Annex B): a control code.
+            'c' if !self.unicode && self.c.get(self.i + 1).is_some_and(|&d| d.is_ascii_digit() || d == '_') => {
+                let d = self.c[self.i + 1];
+                self.i += 2;
+                Ok(d as u16 % 32)
             }
             'u' if self.unicode && self.c.get(self.i + 1) == Some(&'{') => {
                 // (A code point: a BMP one's unit.)

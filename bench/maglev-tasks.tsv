@@ -1,31 +1,31 @@
 commit	task	bytes
-be8000c	all.hot	238848
-be8000c	all.ool	146086
-be8000c	all.exits	97307
-be8000c	S1 push	89686
-be8000c	S2 calls	33908
-be8000c	S3 entry clearing	34537
-be8000c	S4 truthiness	16572
-be8000c	S6 stores	30148
-be8000c	S7 allocation	29642
-be8000c	S9 cell guards	3770
-be8000c	S10 heap-object checks	10440
-be8000c	S11 untyped ===	7007
-be8000c	S12 moves	22846
-be8000c	S13 keyed loads	5777
-be8000c	C1 exits	97307
-93110e0	all.hot	244342
-93110e0	all.ool	151929
-93110e0	all.exits	99290
-93110e0	S1 push	95911
-93110e0	S2 calls	33927
-93110e0	S3 entry clearing	36148
-93110e0	S4 truthiness	16572
-93110e0	S6 stores	30432
-93110e0	S7 allocation	29642
-93110e0	S9 cell guards	3857
-93110e0	S10 heap-object checks	10664
-93110e0	S11 untyped ===	7267
-93110e0	S12 moves	23201
-93110e0	S13 keyed loads	5777
-93110e0	C1 exits	99290
+d64c299	all.hot	238848
+d64c299	all.ool	146086
+d64c299	all.exits	97307
+d64c299	S1 push	89686
+d64c299	S2 calls	33908
+d64c299	S3 entry clearing	34537
+d64c299	S4 truthiness	16572
+d64c299	S6 stores	30148
+d64c299	S7 allocation	29642
+d64c299	S9 cell guards	3770
+d64c299	S10 heap-object checks	10440
+d64c299	S11 untyped ===	7007
+d64c299	S12 moves	22846
+d64c299	S13 keyed loads	5777
+d64c299	C1 exits	97307
+38b6645	all.hot	244342
+38b6645	all.ool	151929
+38b6645	all.exits	99290
+38b6645	S1 push	95911
+38b6645	S2 calls	33927
+38b6645	S3 entry clearing	36148
+38b6645	S4 truthiness	16572
+38b6645	S6 stores	30432
+38b6645	S7 allocation	29642
+38b6645	S9 cell guards	3857
+38b6645	S10 heap-object checks	10664
+38b6645	S11 untyped ===	7267
+38b6645	S12 moves	23201
+38b6645	S13 keyed loads	5777
+38b6645	C1 exits	99290

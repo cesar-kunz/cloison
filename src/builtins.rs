@@ -998,6 +998,34 @@ pub(crate) fn arguments_object(vm: &mut Vm, values: &[Value]) -> Value {
 /// mark `Object.prototype.toString` knows it by.
 pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
     let strict = callee.is_null() || unsafe { (*(*callee).code).strict };
+    if !strict {
+        // The common case: one shape (its elements of any type from the
+        // start, so `arguments.length` stays monomorphic), its slots and
+        // elements stored.
+        if vm.arguments_shape.is_null() {
+            let op = object_value(vm.object_prototype);
+            let mut s = vm.root_shape(Class::Plain, op, 4);
+            let a_iter = vm.a_sym_iterator;
+            let mark = vm.intern(ARGUMENTS_MARK);
+            let a_callee = vm.intern("callee");
+            for a in [vm.a_length, a_iter, mark, a_callee] {
+                s = vm.transition_with(s, a, DONT_ENUM);
+            }
+            vm.arguments_shape = vm.elements_transition(s, crate::object::FieldType::Any);
+        }
+        let o = vm.heap.alloc_object(unsafe { &*vm.arguments_shape });
+        let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
+        vm.store_field(o, 0, Value::from_i32(values.len() as i32));
+        vm.store_field(o, 1, values_fn.map_or(Value::UNDEFINED, object_value));
+        vm.store_field(o, 2, Value::TRUE);
+        vm.store_field(o, 3, object_value(callee));
+        vm.reserve_elems(o, values.len());
+        for (i, &v) in values.iter().enumerate() {
+            vm.store_element(o, i, v);
+        }
+        unsafe { (*o).elems_len = values.len() as u32 };
+        return object_value(o);
+    }
     let op = object_value(vm.object_prototype);
     let o = vm.new_object(op);
     let a_length = vm.a_length;

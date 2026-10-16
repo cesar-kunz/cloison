@@ -23,6 +23,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("define_getter", define_getter),
     ("define_setter", define_setter),
     ("throw_const", throw_const),
+    ("throw_invalid_target", throw_invalid_target),
     ("class_setup", class_setup),
     ("define_method", define_method),
     ("super_get", super_get),
@@ -279,6 +280,11 @@ fn define_setter(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// An assignment to a `const`: `[name]`.
+/// A call assigned to (see `Gen::invalid_target`).
+fn throw_invalid_target(_: &mut Vm, _: &[Value]) -> Result<Value> {
+    Err(Error::reference_error("Invalid left-hand side in assignment"))
+}
+
 fn throw_const(_: &mut Vm, a: &[Value]) -> Result<Value> {
     let n = String::from_utf16_lossy(crate::vm::string_units(a[0]).unwrap_or(&[]));
     Err(Error::type_error(format!("Assignment to constant variable '{n}'.")))

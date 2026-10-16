@@ -263,7 +263,8 @@ impl Vm {
                                 Some(Desc::data(n, false, false, false))
                             }
                             Class::Function | Class::Native if flags & FN_LENGTH_DELETED == 0 => {
-                                Some(Desc::data(Self::function_length(o), false, false, true))
+                                let c = flags & (SEALED | FROZEN) == 0;
+                                Some(Desc::data(Self::function_length(o), false, false, c))
                             }
                             _ => None,
                         };
@@ -273,7 +274,7 @@ impl Vm {
                         && flags & FN_NAME_DELETED == 0
                     {
                         let n = self.function_name(o);
-                        return Some(Desc::data(n, false, false, true));
+                        return Some(Desc::data(n, false, false, flags & (SEALED | FROZEN) == 0));
                     }
                     None
                 }
@@ -399,7 +400,11 @@ impl Vm {
                 .collect();
             (*o).flags |= NOT_EXTENSIBLE | SEALED;
             if freeze {
-                (*o).flags |= FROZEN | LENGTH_READ_ONLY;
+                (*o).flags |= FROZEN;
+                // (The bit is a function's `FN_LENGTH_DELETED`.)
+                if (*o).class == Class::Array {
+                    (*o).flags |= LENGTH_READ_ONLY;
+                }
             }
             self.unique_shape(o, Some(attrs), true);
         }
@@ -746,6 +751,9 @@ impl Vm {
                 Key::Name(a) => {
                     if (*(*o).shape).lookup(a).is_none() {
                         if matches!(class, Class::Function | Class::Native) {
+                            if (a == self.a_length || a == self.a_name) && (*o).flags & (SEALED | FROZEN) != 0 {
+                                return false;
+                            }
                             if a == self.a_length {
                                 (*o).flags |= FN_LENGTH_DELETED;
                             } else if a == self.a_name {
@@ -1286,7 +1294,12 @@ fn object_assign(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         }
         let so = vm.to_object(src)?;
         let s = object_value(so);
-        for (key, _) in vm.own_keys(so) {
+        // (String keys, then symbols.)
+        let mut keys: Vec<Key> = vm.own_keys(so).into_iter().map(|(k, _)| k).collect();
+        for sym in crate::symbol::own_symbol_keys(vm, so) {
+            keys.push(Key::Name(crate::symbol::symbol_atom(sym)));
+        }
+        for key in keys {
             let Some(d) = vm.own_property(so, key) else { continue };
             if d.enumerable != Some(true) {
                 continue;

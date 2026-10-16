@@ -3378,6 +3378,7 @@ impl<'a> Gen<'a> {
                 self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
                 Ok(())
             }
+            ExprKind::Call(..) => self.invalid_target(t),
             _ => unreachable!("the parser checks assignment targets"),
         }
     }
@@ -3385,6 +3386,15 @@ impl<'a> Gen<'a> {
     /// `++t` or `--t` (`d` = ±1), leaving the new value in the accumulator.
     /// `++t` / `--t`; with `postfix`, `t++` / `t--` whose value is used: the
     /// old value, as a number, ends in `acc`.
+    /// A call as an assignment's target (sloppy code, Annex B): made,
+    /// then a `ReferenceError`.
+    fn invalid_target(&mut self, call: &Expr) -> R<()> {
+        self.effect(call)?;
+        let first = self.temp as u8;
+        self.intrinsic("throw_invalid_target", first, 0);
+        Ok(())
+    }
+
     fn update(&mut self, t: &Expr, d: i8, postfix: bool, pos: Pos) -> R<()> {
         let mark = self.temp;
         let old = if postfix {
@@ -3487,6 +3497,7 @@ impl<'a> Gen<'a> {
                 let name = if self.f.strict { "super_set" } else { "super_set_sloppy" };
                 self.intrinsic(name, order, 4);
             }
+            ExprKind::Call(..) => self.invalid_target(t)?,
             _ => unreachable!("the parser checks increment targets"),
         }
         if let Some(o) = old {
@@ -4575,6 +4586,7 @@ impl<'a> Gen<'a> {
                 let ic = self.auto_ic("[]keyed");
                 self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
             }
+            (_, ExprKind::Call(..)) => self.invalid_target(target)?,
             _ => return unsupported(pos, "this `for … of` target"),
         }
         self.stmt(body)?;

@@ -34,6 +34,10 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("iterator_step", iterator_step),
     ("iterator_close", iterator_close),
     ("iterator_close_quiet", iterator_close_quiet),
+    ("pattern_step", pattern_step),
+    ("iterator_rest", iterator_rest),
+    ("require_coercible", require_coercible),
+    ("object_rest", object_rest),
 ];
 
 /// The id of the intrinsic `name`.
@@ -493,6 +497,58 @@ fn iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let _ = crate::symbol::close(vm, a[0]);
     Ok(Value::UNDEFINED)
+}
+
+/// An array pattern's step: `[iterator]` (`undefined` once done): its
+/// next value, or `HOLE`.
+fn pattern_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if a[0].is_undefined() {
+        return Ok(Value::HOLE);
+    }
+    iterator_step(vm, a)
+}
+
+/// An array pattern's rest: `[iterator]`'s remaining values.
+fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let out = vm.new_array();
+    if a[0].is_undefined() {
+        return Ok(out);
+    }
+    while let Some(v) = crate::symbol::step(vm, a[0])? {
+        crate::vm::array_push(vm, out, &[v])?;
+    }
+    Ok(out)
+}
+
+/// An object pattern's source: `[v]`, not `null` or `undefined`.
+fn require_coercible(_: &mut Vm, a: &[Value]) -> Result<Value> {
+    if a[0].is_undefined() || a[0].is_null() {
+        return Err(Error::type_error(format!("Cannot destructure '{}' as it is {}.", crate::vm::display(a[0]), crate::vm::display(a[0]))));
+    }
+    Ok(a[0])
+}
+
+/// An object pattern's rest: `[source, keys]`, a new object with
+/// `source`'s own enumerable properties but those keys.
+fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let src = vm.to_object(a[0])?;
+    let excluded: Vec<Key> = {
+        let ks = elements(vm, a[1])?;
+        let mut out = Vec::new();
+        for k in ks {
+            out.push(to_property_key(vm, k)?);
+        }
+        out
+    };
+    let out = object_value(vm.new_object(object_value(vm.object_prototype)));
+    for (key, enumerable) in vm.own_keys(src) {
+        if !enumerable || excluded.contains(&key) {
+            continue;
+        }
+        let v = vm.get_key(object_value(src), key)?;
+        vm.create_data_property(out, key, v)?;
+    }
+    Ok(out)
 }
 
 #[allow(dead_code)]

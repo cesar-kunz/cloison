@@ -190,6 +190,8 @@ pub enum StmtKind<'a> {
     ForOf {
         kind: u8,
         target: Expr<'a>,
+        /// A pattern target (then `target` is unused).
+        pattern: Option<Box<Pattern<'a>>>,
         iterable: Expr<'a>,
         body: &'a Stmt<'a>,
     },
@@ -259,6 +261,14 @@ pub enum ExprKind<'a> {
     /// `super[key]`: the variable holding the home object, the key, and
     /// `this`.
     SuperMember(Name, &'a Expr<'a>, &'a Expr<'a>),
+    /// A destructuring of the value of the expression into the pattern
+    /// (`mode` 0: assigning its targets, 1: initializing `var`s or
+    /// parameters, 2: initializing block-scoped bindings); its value is
+    /// the expression's.
+    Destructure(Box<Pattern<'a>>, &'a Expr<'a>, u8),
+    /// A declaration's name a destructuring in it sets (so not set to
+    /// `undefined` itself).
+    Bound,
     /// A runtime helper applied to its arguments (see
     /// `crate::intrinsics`), for what the parser desugars.
     Intrinsic(&'static str, Vec<Expr<'a>>),
@@ -310,6 +320,47 @@ pub struct ClassMember<'a> {
     pub kind: u8,
     pub is_static: bool,
     pub function: usize,
+}
+
+/// A destructuring pattern.
+#[derive(Debug)]
+pub enum Pattern<'a> {
+    Name(Name),
+    /// An assignment pattern's member target (`o.x`, `o[k]`).
+    Target(&'a Expr<'a>),
+    /// Elements (`None`: an elision) with their defaults, and a rest
+    /// element.
+    Array(Vec<Option<(Pattern<'a>, Option<&'a Expr<'a>>)>>, Option<Box<Pattern<'a>>>),
+    /// Properties with their defaults, and a rest property.
+    Object(Vec<(PatKey<'a>, Pattern<'a>, Option<&'a Expr<'a>>)>, Option<Box<Pattern<'a>>>),
+}
+
+#[derive(Debug)]
+pub enum PatKey<'a> {
+    Name(Name),
+    Computed(&'a Expr<'a>),
+}
+
+impl Pattern<'_> {
+    /// The names it binds or assigns, in order.
+    pub fn names(&self, out: &mut Vec<Name>) {
+        match self {
+            Pattern::Name(n) => out.push(n.clone()),
+            Pattern::Target(_) => {}
+            Pattern::Array(es, rest) => {
+                es.iter().flatten().for_each(|(p, _)| p.names(out));
+                if let Some(r) = rest {
+                    r.names(out);
+                }
+            }
+            Pattern::Object(ps, rest) => {
+                ps.iter().for_each(|(_, p, _)| p.names(out));
+                if let Some(r) = rest {
+                    r.names(out);
+                }
+            }
+        }
+    }
 }
 
 /// An object literal property's key.

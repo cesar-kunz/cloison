@@ -863,6 +863,117 @@ fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
         .then_some(name)
 }
 
+/// Whether function `f`'s code may see its `arguments` and parameters
+/// aliased (a mapped `arguments` object is slower): it assigns a
+/// parameter, or an element of `arguments` (or deletes or defines one).
+fn aliases_arguments(f: &Function) -> bool {
+    fn is_args(e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Ident(n) if &**n == "arguments")
+    }
+    fn expr(e: &Expr, f: &Function) -> bool {
+        use ExprKind::*;
+        let param = |t: &Expr| matches!(&t.kind, Ident(n) if f.params.contains(n));
+        let element = |t: &Expr| matches!(&t.kind, Index(o, _) | Member(o, _) if is_args(o));
+        match &e.kind {
+            Assign(_, t, v) => param(t) || element(t) || expr(t, f) || expr(v, f),
+            Update(t, ..) => param(t) || element(t) || expr(t, f),
+            Unary(UnOp::Delete, t) if element(t) => true,
+            Call(c, args) if args.first().is_some_and(is_args) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) => true,
+            Destructure(..) => true,
+            _ => {
+                let mut sub = Vec::new();
+                children(e, &mut sub);
+                sub.into_iter().any(|x| expr(x, f))
+            }
+        }
+    }
+    let mut found = false;
+    for_each_expr(&f.body, &mut |e| found |= expr(e, f));
+    found
+}
+
+/// The expressions directly in `e`.
+fn children<'a>(e: &'a Expr<'a>, out: &mut Vec<&'a Expr<'a>>) {
+    use ExprKind::*;
+    match &e.kind {
+        Array(es) | Template(_, es) | Intrinsic(_, es) | SuperCall(_, es) => out.extend(es.iter()),
+        Object(ps, _) => {
+            for (k, v) in ps {
+                if let PropKey::Computed(k) = k {
+                    out.push(k);
+                }
+                out.push(v);
+            }
+        }
+        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) => out.push(o),
+        Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) | Assign(_, a, b) => {
+            out.push(a);
+            out.push(b);
+        }
+        Call(c, args) | New(c, args) => {
+            out.push(c);
+            out.extend(args.iter());
+        }
+        Cond(a, b, c) => out.extend([*a, *b, *c]),
+        SuperMember(_, k, t) => out.extend([*k, *t]),
+        Yield(Some(x), _) => out.push(x),
+        Destructure(_, v, _) => out.push(v),
+        Class(c) => out.extend(c.heritage.iter()),
+        _ => {}
+    }
+}
+
+/// `f` on each expression statement's, condition's, … expression in
+/// `body` (not nested functions').
+fn for_each_expr<'a>(body: &'a [Stmt<'a>], f: &mut dyn FnMut(&'a Expr<'a>)) {
+    fn stmt<'a>(s: &'a Stmt<'a>, f: &mut dyn FnMut(&'a Expr<'a>)) {
+        match &s.kind {
+            StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => ds.iter().flat_map(|(_, e)| e).for_each(|e| f(e)),
+            StmtKind::Expr(e) | StmtKind::Throw(e) => f(e),
+            StmtKind::Return(e) => e.iter().for_each(|e| f(e)),
+            StmtKind::If(c, a, b) => {
+                f(c);
+                stmt(a, f);
+                b.iter().for_each(|b| stmt(b, f));
+            }
+            StmtKind::For { init, test, update, body } => {
+                match init {
+                    Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => ds.iter().flat_map(|(_, e)| e).for_each(|e| f(e)),
+                    Some(ForInit::Expr(e)) => f(e),
+                    None => {}
+                }
+                test.iter().chain(update).for_each(|e| f(e));
+                stmt(body, f);
+            }
+            StmtKind::ForIn { object, body, .. } => {
+                f(object);
+                stmt(body, f);
+            }
+            StmtKind::ForOf { target, iterable, body, .. } => {
+                f(target);
+                f(iterable);
+                stmt(body, f);
+            }
+            StmtKind::While(c, body) | StmtKind::DoWhile(body, c) | StmtKind::With(c, _, body) => {
+                f(c);
+                stmt(body, f);
+            }
+            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, f)),
+            StmtKind::Switch(d, cases) => {
+                f(d);
+                for (t, b) in cases {
+                    t.iter().for_each(|t| f(t));
+                    b.iter().for_each(|s| stmt(s, f));
+                }
+            }
+            StmtKind::Labeled(_, body) => stmt(body, f),
+            StmtKind::Try(b, c, fin) => try_blocks(b, c, fin).for_each(|s| stmt(s, f)),
+            _ => {}
+        }
+    }
+    body.iter().for_each(|s| stmt(s, f));
+}
+
 /// Whether function `f` gets an `arguments` object: it reads `arguments`,
 /// no parameter has that name, and it doesn't just pass them on (see
 /// [`forwards_arguments`]).
@@ -1324,8 +1435,21 @@ impl<'a> Gen<'a> {
             }
         }
         if arguments_object(self.p, self.index) {
+            // A sloppy function's with simple parameters (in registers):
+            // mapped to them.
+            let f = self.f;
+            let simple = !f.strict
+                && !f.arrow
+                && !f.rest
+                && f.param_stmts == 0
+                && !f.has_eval
+                && !f.generator
+                && !f.params.is_empty()
+                && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
+                && aliases_arguments(f);
+            let op = if simple { Op::CreateMappedArguments } else { Op::CreateArguments };
             match self.locals.get("arguments") {
-                Some(&r) => self.emit(Op::CreateArguments, &[Arg::Reg(r)]),
+                Some(&r) => self.emit(op, &[Arg::Reg(r)]),
                 None => {
                     let t = self.alloc(self.f.pos)?;
                     self.emit(Op::CreateArguments, &[Arg::Reg(t)]);

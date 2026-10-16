@@ -665,6 +665,10 @@ pub struct Vm {
     pub(crate) eval_envs: Vec<[Value; 2]>,
     /// `%ThrowTypeError%`.
     pub(crate) thrower: *mut Object,
+    /// The mapped `arguments` objects of the frames running, innermost
+    /// last: each index mapped to its parameter's register (see
+    /// `Vm::mapped_slot`), until the frame ends.
+    pub(crate) mapped_args: Vec<MappedArgs>,
     /// Sloppy functions' `arguments` objects' shape (see
     /// `builtins::arguments_object_of`).
     pub(crate) arguments_shape: *const Shape,
@@ -842,6 +846,7 @@ impl Vm {
             new_target: Value::EMPTY,
             eval_envs: Vec::new(),
             thrower: std::ptr::null_mut(),
+            mapped_args: Vec::new(),
             arguments_shape: std::ptr::null(),
             key_cache: (Value::EMPTY, Value::EMPTY),
             eval_function: std::ptr::null_mut(),
@@ -2434,6 +2439,9 @@ impl Vm {
             Key::Name(a) => return self.get(obj, a),
         };
         let mut o = as_object(obj);
+        if let Some(p) = self.mapped_slot(o, i) {
+            return Ok(unsafe { *p });
+        }
         // A typed array's elements are all there is at an index (no holes,
         // nothing inherited); a buffer has none.
         unsafe {
@@ -2554,6 +2562,12 @@ impl Vm {
             Key::Name(a) => return self.set(obj, a, value),
         };
         let o = as_object(obj);
+        // (A mapped `arguments` element: its parameter too.)
+        if let Some(p) = self.mapped_slot(o, i)
+            && self.writable_element(o, i)
+        {
+            unsafe { *p = value };
+        }
         unsafe {
             // A string's characters can't be changed; a typed array stores
             // within its length only (a buffer has no elements).
@@ -2977,6 +2991,45 @@ impl Vm {
         u
     }
 
+    /// The register parameter `i` of mapped `arguments` object `o` is in,
+    /// if mapped.
+    pub(crate) fn mapped_slot(&self, o: *mut Object, i: u32) -> Option<*mut Value> {
+        if self.mapped_args.is_empty() {
+            return None;
+        }
+        let m = self.mapped_args.iter().rev().find(|m| m.o == o)?;
+        (m.mapped.get(i as usize) == Some(&true)).then(|| unsafe { m.regs.add(1 + i as usize) })
+    }
+
+    /// Index `i` of `o` no longer mapped: its element keeps the value.
+    pub(crate) fn unmap_argument(&mut self, o: *mut Object, i: u32) {
+        if let Some(m) = self.mapped_args.iter_mut().rev().find(|m| m.o == o)
+            && let Some(on) = m.mapped.get_mut(i as usize)
+        {
+            *on = false;
+        }
+    }
+
+    /// The mapped `arguments` objects of frames at or past `level`, ended:
+    /// their elements get the parameters' values.
+    fn release_mapped(&mut self, level: *mut Value) {
+        while let Some(m) = self.mapped_args.last()
+            && m.regs >= level
+        {
+            let m = self.mapped_args.pop().unwrap();
+            for (i, &on) in m.mapped.iter().enumerate() {
+                if on && (i as u32) < unsafe { (*m.o).elems_len } {
+                    unsafe {
+                        let v = *m.regs.add(1 + i);
+                        let at = (*m.o).elems.add(i);
+                        *at = v;
+                        crate::heap::barrier(m.o.cast(), at, v);
+                    }
+                }
+            }
+        }
+    }
+
     /// Close the open upvalue of register `at`, if there is one.
     pub(crate) fn close_upvalue(&mut self, at: *mut Value) {
         if let Some(k) = self.open_upvalues.iter().rposition(|&u| unsafe { (*u).at } == at) {
@@ -2990,8 +3043,12 @@ impl Vm {
     }
 
     /// Close the open upvalues of registers at or past `level` (a frame
-    /// ending): their values move into them.
+    /// ending): their values move into them. (And its mapped `arguments`
+    /// keep its parameters' values.)
     pub(crate) fn close_upvalues(&mut self, level: *mut Value) {
+        if !self.mapped_args.is_empty() {
+            self.release_mapped(level);
+        }
         while let Some(&u) = self.open_upvalues.last()
             && unsafe { (*u).at } >= level
         {
@@ -3612,6 +3669,7 @@ impl Vm {
         .chain(self.symbols.values().copied())
         .chain(self.symbol_roots.iter().copied())
         .chain(std::iter::once(self.thrower))
+        .chain(self.mapped_args.iter().map(|m| m.o))
         .chain(std::iter::once(self.eval_function))
         .chain(self.error_prototypes.iter().copied())
         .filter(|o| !o.is_null())
@@ -3766,6 +3824,7 @@ impl Scan {
                     | crate::bytecode::Op::CloseUpvalue
                     | crate::bytecode::Op::LdaNewTarget
                     | crate::bytecode::Op::InitialYield
+                    | crate::bytecode::Op::CreateMappedArguments
                     | crate::bytecode::Op::Yield
             );
             s.ops += 1;
@@ -4181,6 +4240,14 @@ pub(crate) fn wrapped(v: Value) -> Option<Value> {
     }
     let o = as_object(v);
     unsafe { ((*o).class == Class::Wrapper).then(|| Value::from_bits((*o).code as u64)) }
+}
+
+/// A mapped `arguments` object (see `Vm::mapped_args`).
+pub(crate) struct MappedArgs {
+    pub(crate) o: *mut Object,
+    /// Its frame's registers (`r1…` its parameters).
+    pub(crate) regs: *mut Value,
+    pub(crate) mapped: Vec<bool>,
 }
 
 /// `Function.prototype.call` on a native: a call through it to a bytecode

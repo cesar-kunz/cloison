@@ -1886,6 +1886,9 @@ fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
         2 => Value::from_bool(re.global),
         3 => Value::from_bool(re.ignore_case),
         4 => Value::from_bool(re.multiline),
+        5 => Value::from_bool(re.sticky),
+        6 => Value::from_bool(re.unicode),
+        7 => Value::from_bool(re.dot_all),
         _ => Value::FALSE,
     })
 }
@@ -1985,7 +1988,14 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn regexp_flags(re: &crate::regexp::Regex) -> String {
     let mut f = String::new();
-    for (on, c) in [(re.global, 'g'), (re.ignore_case, 'i'), (re.multiline, 'm')] {
+    for (on, c) in [
+        (re.global, 'g'),
+        (re.ignore_case, 'i'),
+        (re.multiline, 'm'),
+        (re.dot_all, 's'),
+        (re.unicode, 'u'),
+        (re.sticky, 'y'),
+    ] {
         if on {
             f.push(c);
         }
@@ -2014,7 +2024,7 @@ fn regexp_match_into(
 ) -> Result<bool> {
     let a_last = vm.a_last_index;
     let plain = plain_last_index(vm, this);
-    let start = if re.global {
+    let start = if re.global || re.sticky {
         let li = match plain {
             Some(o) => unsafe { *Object::slot(o, (*(*o).shape).location(0)) },
             None => vm.get(this, a_last)?,
@@ -2029,7 +2039,7 @@ fn regexp_match_into(
         return Ok(false);
     }
     let found = re.exec_into(s, start, caps);
-    if re.global {
+    if re.global || re.sticky {
         let next = Value::from_i32(if found { caps[0].unwrap().1 } else { 0 } as i32);
         match plain {
             Some(o) => vm.store_field(o, 0, next),

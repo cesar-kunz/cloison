@@ -21,6 +21,12 @@ pub struct Regex {
     pub global: bool,
     pub ignore_case: bool,
     pub multiline: bool,
+    /// `y`: a match only where the search starts (at `lastIndex`).
+    pub sticky: bool,
+    /// `u`: code points (a surrogate pair is one character).
+    pub unicode: bool,
+    /// `s`: `.` matches line terminators too.
+    pub dot_all: bool,
     /// Where a match can start (see [`Starts`]).
     starts: Starts,
     /// A literal every match contains, if any (see [`Needle`]).
@@ -91,15 +97,18 @@ enum Node {
 }
 
 impl Regex {
-    /// Compile `pattern` with `flags` (`g`, `i`, `m`; `y`, `u`, `s` aren't
-    /// supported).
+    /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
         let (mut global, mut ignore_case, mut multiline) = (false, false, false);
+        let (mut sticky, mut unicode, mut dot_all) = (false, false, false);
         for f in flags.chars() {
             let seen = match f {
                 'g' => std::mem::replace(&mut global, true),
                 'i' => std::mem::replace(&mut ignore_case, true),
                 'm' => std::mem::replace(&mut multiline, true),
+                'y' => std::mem::replace(&mut sticky, true),
+                'u' => std::mem::replace(&mut unicode, true),
+                's' => std::mem::replace(&mut dot_all, true),
                 _ => return Err(format!("Invalid flags supplied to RegExp constructor '{flags}'")),
             };
             if seen {
@@ -113,6 +122,8 @@ impl Regex {
             i: 0,
             groups: 1,
             total,
+            unicode,
+            dot_all,
         };
         let node = p.alternation()?;
         if p.i != chars.len() {
@@ -124,6 +135,9 @@ impl Regex {
             global,
             ignore_case,
             multiline,
+            sticky,
+            unicode,
+            dot_all,
             starts: Starts::Anywhere,
             needle: None,
             prog: Program::default(),
@@ -218,6 +232,13 @@ impl Regex {
     pub fn exec_into(&self, s: &[u16], start: usize, caps: &mut Captures) -> bool {
         caps.clear();
         if let Some(l) = &self.literal {
+            if self.sticky {
+                if s.get(start..start + l.len()) != Some(&l[..]) {
+                    return false;
+                }
+                caps.push(Some((start, start + l.len())));
+                return true;
+            }
             let Some(q) = (start <= s.len()).then(|| find(s, l, start)).flatten() else {
                 return false;
             };
@@ -269,6 +290,9 @@ impl Regex {
     /// Call `attempt` at each position from `start` where a match can
     /// begin, until it finds one: where.
     fn search(&self, s: &[u16], start: usize, mut attempt: impl FnMut(usize) -> bool) -> Option<usize> {
+        if self.sticky {
+            return (start <= s.len() && attempt(start)).then_some(start);
+        }
         let mut at = start;
         // Where the needle next occurs, at or after `at` + its `min`.
         let mut next: Option<usize> = None;
@@ -507,6 +531,8 @@ struct Parser<'a> {
     /// The next capturing group's index.
     groups: usize,
     total: usize,
+    unicode: bool,
+    dot_all: bool,
 }
 
 impl Parser<'_> {
@@ -609,6 +635,11 @@ impl Parser<'_> {
         let c = self.peek().unwrap();
         self.i += 1;
         Ok(match c {
+            '.' if self.dot_all => {
+                let any = Node::Class(vec![(0, 0xFFFF)], false);
+                if self.unicode { Node::Alt(vec![surrogate_pair(), any]) } else { any }
+            }
+            '.' if self.unicode => Node::Alt(vec![surrogate_pair(), Node::Any]),
             '.' => Node::Any,
             '^' => Node::Start,
             '$' => Node::End,
@@ -641,6 +672,7 @@ impl Parser<'_> {
             '[' => self.class()?,
             '\\' => self.escape()?,
             '{' if self.braces_at_atom() => return Err(self.error("Nothing to repeat")),
+            '{' | '}' | ']' if self.unicode => return Err(self.error("Lone quantifier brackets")),
             '*' | '+' | '?' => return Err(self.error("Nothing to repeat")),
             c => char_node(c),
         })
@@ -666,7 +698,25 @@ impl Parser<'_> {
             'B' => Node::Boundary(false),
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                 let (ranges, neg) = class_escape(e);
-                Node::Class(ranges, neg)
+                if neg && self.unicode {
+                    Node::Alt(vec![surrogate_pair(), Node::Class(ranges, neg)])
+                } else {
+                    Node::Class(ranges, neg)
+                }
+            }
+            'u' if self.unicode && self.peek() == Some('{') => {
+                // `\u{…}`: a code point.
+                let s = self.i + 1;
+                let Some(end) = self.c[s..].iter().position(|&c| c == '}') else {
+                    return Err(self.error("Invalid Unicode escape"));
+                };
+                let hex: String = self.c[s..s + end].iter().collect();
+                let cp = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
+                let Some(c) = cp.filter(|_| !hex.is_empty()) else {
+                    return Err(self.error("Invalid Unicode escape"));
+                };
+                self.i = s + end + 1;
+                char_node(c)
             }
             '1'..='9' => {
                 let s = self.i - 1;
@@ -676,6 +726,8 @@ impl Parser<'_> {
                 let n: usize = self.c[s..self.i].iter().collect::<String>().parse().unwrap_or(0);
                 if n <= self.total {
                     Node::BackRef(n)
+                } else if self.unicode {
+                    return Err(self.error("Invalid escape"));
                 } else {
                     // Not a group: an octal escape, or the digits.
                     self.i = s;
@@ -697,9 +749,55 @@ impl Parser<'_> {
             }
             _ => {
                 self.i -= 1;
+                if self.unicode {
+                    self.check_unicode_escape()?;
+                }
                 Node::Char(self.char_escape())
             }
         })
+    }
+
+    /// In `u` mode, a class's escape at `self.i` (at its `\`) must be
+    /// valid (see [`Parser::check_unicode_escape`]).
+    fn check_class_escape(&mut self) -> Result<(), String> {
+        if !self.unicode || self.peek() != Some('\\') {
+            return Ok(());
+        }
+        match self.c.get(self.i + 1) {
+            Some('d' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | '-') => Ok(()),
+            Some(_) => {
+                self.i += 1;
+                let r = self.check_unicode_escape();
+                self.i -= 1;
+                r
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// In `u` mode, the escape at `self.i` (past the `\`) must be a
+    /// syntax character's, `/`, `-` (in a class) or a valid character
+    /// escape.
+    fn check_unicode_escape(&self) -> Result<(), String> {
+        let e = self.c[self.i];
+        let next = |k: usize| self.c.get(self.i + k).copied();
+        let hex = |from: usize, n: usize| (0..n).all(|k| next(from + k).is_some_and(|c| c.is_ascii_hexdigit()));
+        let ok = match e {
+            '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '/' => true,
+            'n' | 'r' | 't' | 'v' | 'f' => true,
+            '0' => !next(1).is_some_and(|c| c.is_ascii_digit()),
+            'x' => hex(1, 2),
+            'u' => {
+                hex(1, 4)
+                    || next(1) == Some('{') && {
+                        let digits = (2..).take_while(|&k| next(k).is_some_and(|c| c.is_ascii_hexdigit())).count();
+                        digits > 0 && next(2 + digits) == Some('}')
+                    }
+            }
+            'c' => next(1).is_some_and(|c| c.is_ascii_alphabetic()),
+            _ => false,
+        };
+        if ok { Ok(()) } else { Err(self.error("Invalid escape")) }
     }
 
     /// The code unit of a character escape at `self.i` (after the `\`).
@@ -749,19 +847,25 @@ impl Parser<'_> {
                 self.i += 1;
                 break;
             }
+            self.check_class_escape()?;
             // One end: a code unit, or a class escape (`\d`: no range).
             let lo = match self.class_atom() {
                 Ok(u) => u,
                 Err(set) => {
+                    if self.unicode && self.peek() == Some('-') && self.c.get(self.i + 1).is_some_and(|&c| c != ']') {
+                        return Err(self.error("Invalid character class"));
+                    }
                     ranges.extend(set);
                     continue;
                 }
             };
             if self.peek() == Some('-') && self.c.get(self.i + 1).is_some_and(|&c| c != ']') {
                 self.i += 1;
+                self.check_class_escape()?;
                 match self.class_atom() {
                     Ok(hi) if hi >= lo => ranges.push((lo, hi)),
                     Ok(_) => return Err(self.error("Range out of order in character class")),
+                    Err(_) if self.unicode => return Err(self.error("Invalid character class")),
                     Err(set) => {
                         ranges.push((lo, lo));
                         ranges.push((b'-' as u16, b'-' as u16));
@@ -773,6 +877,10 @@ impl Parser<'_> {
             }
         }
         ranges.sort();
+        // (`u` mode: a negated class's match may be an astral character.)
+        if neg && self.unicode {
+            return Ok(Node::Alt(vec![surrogate_pair(), Node::Class(ranges, neg)]));
+        }
         Ok(Node::Class(ranges, neg))
     }
 
@@ -799,9 +907,22 @@ impl Parser<'_> {
                 self.i += 1;
                 Ok(b'-' as u16)
             }
+            'u' if self.unicode && self.c.get(self.i + 1) == Some(&'{') => {
+                // (A code point: a BMP one's unit.)
+                let s = self.i + 2;
+                let end = self.c[s..].iter().position(|&c| c == '}').unwrap_or(0);
+                let hex: String = self.c[s..s + end].iter().collect();
+                self.i = s + end + 1;
+                Ok(u32::from_str_radix(&hex, 16).map_or(0, |v| v.min(0xFFFF)) as u16)
+            }
             _ => Ok(self.char_escape()),
         }
     }
+}
+
+/// A surrogate pair: an astral character in `u` mode.
+fn surrogate_pair() -> Node {
+    Node::Seq(vec![Node::Class(vec![(0xD800, 0xDBFF)], false), Node::Class(vec![(0xDC00, 0xDFFF)], false)])
 }
 
 fn char_node(c: char) -> Node {

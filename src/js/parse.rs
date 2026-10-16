@@ -76,6 +76,7 @@ fn parse_pass<'a, 'p>(
         withs: Vec::new(),
         with_count: 0,
         classes: 0,
+        sub: false,
         pending_pattern: None,
         home_uses: 0,
         pending_home: None,
@@ -200,6 +201,8 @@ struct Parser<'t, 'a, 'p> {
     with_count: usize,
     /// Classes so far (for their home objects' variables' names).
     classes: usize,
+    /// The statement about to be parsed is another's body.
+    sub: bool,
     /// A `for` head's declaration's pattern (see `pattern_declarator`).
     pending_pattern: Option<Pattern<'a>>,
     /// `super` property references so far.
@@ -381,6 +384,7 @@ impl<'a> Parser<'_, 'a, '_> {
 
     fn statement(&mut self) -> R<Stmt<'a>> {
         let pos = self.pos();
+        let sub = std::mem::replace(&mut self.sub, false);
         let kind = match self.peek().clone() {
             Tok::Punct("{") => {
                 self.advance();
@@ -402,7 +406,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.semicolon()?;
                 StmtKind::Lexical(true, decls)
             }
-            Tok::Ident(n) if self.let_ahead(&n) => {
+            Tok::Ident(n) if self.let_ahead(&n) && !(sub && self.toks[self.i + 1].newline_before) => {
                 self.advance();
                 let decls = self.lexical_decls(false, false)?;
                 self.semicolon()?;
@@ -434,7 +438,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let name: Name = format!("%with{}", self.with_count).into();
                 self.with_count += 1;
                 self.withs.push(name.clone());
-                let body = self.statement();
+                let body = self.sub_statement();
                 self.withs.pop();
                 StmtKind::With(o, name, stmt(self.arena, body?))
             }
@@ -472,11 +476,11 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.expect("(")?;
                 let c = self.expression(false)?;
                 self.expect(")")?;
-                StmtKind::While(c, stmt(self.arena, self.statement()?))
+                StmtKind::While(c, stmt(self.arena, self.sub_statement()?))
             }
             Tok::Keyword("do") => {
                 self.advance();
-                let body = stmt(self.arena, self.statement()?);
+                let body = stmt(self.arena, self.sub_statement()?);
                 self.expect("while")?;
                 self.expect("(")?;
                 let c = self.expression(false)?;
@@ -591,7 +595,7 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Ident(name) if self.peek_at(1) == &Tok::Punct(":") => {
                 self.advance();
                 self.advance();
-                StmtKind::Labeled(name, stmt(self.arena, self.statement()?))
+                StmtKind::Labeled(name, stmt(self.arena, self.sub_statement()?))
             }
             _ => {
                 let e = self.expression(false)?;
@@ -602,11 +606,20 @@ impl<'a> Parser<'_, 'a, '_> {
         Ok(Stmt { kind, pos })
     }
 
+    /// A statement that is another's body (not a declaration's place:
+    /// `let` there is an identifier).
+    fn sub_statement(&mut self) -> R<Stmt<'a>> {
+        self.sub = true;
+        let r = self.statement();
+        self.sub = false;
+        r
+    }
+
     /// An `if`'s branch: a function declaration (Annex B) as if in a
     /// block of its own.
     fn if_branch(&mut self) -> R<&'a Stmt<'a>> {
         if !self.is("function") {
-            return Ok(stmt(self.arena, self.statement()?));
+            return Ok(stmt(self.arena, self.sub_statement()?));
         }
         let pos = self.pos();
         self.push_scope(self.i, false, false);
@@ -677,7 +690,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let name = decls.into_iter().next().unwrap().0;
                 let object = self.expression(false)?;
                 self.expect(")")?;
-                let body = stmt(self.arena, self.statement()?);
+                let body = stmt(self.arena, self.sub_statement()?);
                 return Ok(StmtKind::ForIn {
                     var: false,
                     fresh: true,
@@ -737,7 +750,7 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(self.expression(false)?)
         };
         self.expect(")")?;
-        let body = stmt(self.arena, self.statement()?);
+        let body = stmt(self.arena, self.sub_statement()?);
         Ok(StmtKind::For {
             init,
             test,
@@ -757,7 +770,7 @@ impl<'a> Parser<'_, 'a, '_> {
         self.advance();
         let iterable = self.assignment(false)?;
         self.expect(")")?;
-        let body = stmt(self.arena, self.statement()?);
+        let body = stmt(self.arena, self.sub_statement()?);
         Ok(StmtKind::ForOf {
             kind,
             target: Expr { kind: target, pos },
@@ -935,7 +948,7 @@ impl<'a> Parser<'_, 'a, '_> {
     fn for_in_rest(&mut self, var: bool, name: Name) -> R<StmtKind<'a>> {
         let object = self.expression(false)?;
         self.expect(")")?;
-        let body = stmt(self.arena, self.statement()?);
+        let body = stmt(self.arena, self.sub_statement()?);
         Ok(StmtKind::ForIn {
             var,
             fresh: false,

@@ -13,7 +13,7 @@
 //! `[state, registers, pc, function, mode]`.
 
 use crate::interp::{drive, native_stack_low, write_frame_header};
-use crate::object::{Class, Object, as_object, object_value};
+use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
 
@@ -239,5 +239,45 @@ pub(crate) fn install(vm: &mut Vm) {
     let a = vm.a_sym_to_string_tag;
     let d = crate::props::Desc::data(s, false, false, true);
     let _ = vm.define_own_property(gp, crate::vm::Key::Name(a), &d);
+
+    // `%GeneratorFunction%` and `%AsyncFunction%`: constructors (not
+    // globals) inheriting `Function`, their prototypes `Function.
+    // prototype`'s, the functions' prototypes.
+    let fp = object_value(vm.function_prototype);
+    let function = {
+        let a = vm.intern("Function");
+        vm.get(object_value(vm.global), a).unwrap_or(Value::UNDEFINED)
+    };
+    let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
+    for (name, ctor, generator) in [
+        ("GeneratorFunction", crate::builtins::generator_function_ctor as crate::vm::NativeFn, true),
+        ("AsyncFunction", crate::builtins::async_function_ctor, false),
+    ] {
+        let proto = vm.new_object(fp);
+        vm.symbol_roots.push(proto);
+        let c = vm.native_function(name, ctor, 1, crate::jit::Ty::Any, true);
+        vm.symbol_roots.push(c);
+        vm.set_prototype_of(c, function);
+        let d = crate::props::Desc::data(object_value(proto), false, false, false);
+        let _ = vm.define_own_property(c, crate::vm::Key::Name(a_p), &d);
+        let d = crate::props::Desc::data(object_value(c), false, false, true);
+        let _ = vm.define_own_property(proto, crate::vm::Key::Name(a_c), &d);
+        if generator {
+            let d = crate::props::Desc::data(object_value(gp), false, false, true);
+            let _ = vm.define_own_property(proto, crate::vm::Key::Name(a_p), &d);
+        }
+        let u: Vec<u16> = name.encode_utf16().collect();
+        let s = vm.string_constant(&u);
+        let d = crate::props::Desc::data(s, false, false, true);
+        let _ = vm.define_own_property(proto, crate::vm::Key::Name(a), &d);
+        // (The same capacity as `function_shape`'s: upvalues where
+        // compiled code reads them.)
+        let root = vm.root_shape(crate::object::Class::Function, object_value(proto), 2);
+        if generator {
+            vm.generator_function_shape = vm.transition_with(root, a_p, DONT_ENUM | DONT_DELETE);
+        } else {
+            vm.async_function_shape = root;
+        }
+    }
 }
 

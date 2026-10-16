@@ -813,12 +813,27 @@ fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `Function(p1, …, body)` / `new Function(…)`: the function
 /// `(function anonymous(p1, …) { body })` evaluates to, in the global scope.
 fn function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    dynamic_function(vm, a, "function")
+}
+
+/// `GeneratorFunction(p1, …, body)`: as `Function`'s, a generator.
+pub(crate) fn generator_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    dynamic_function(vm, a, "function*")
+}
+
+/// `AsyncFunction(p1, …, body)`: as `Function`'s, an async function.
+pub(crate) fn async_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    dynamic_function(vm, a, "async function")
+}
+
+/// The function `(<kind> anonymous(p1, …) { body })` evaluates to.
+fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
     let mut params = Vec::new();
     for &p in a.iter().take(a.len().saturating_sub(1)) {
         params.push(String::from_utf16_lossy(&units(p)));
     }
     let body = a.last().map_or(String::new(), |&b| String::from_utf16_lossy(&units(b)));
-    let src = format!("(function anonymous({}\n) {{\n{}\n}})", params.join(","), body);
+    let src = format!("({kind} anonymous({}\n) {{\n{}\n}})", params.join(","), body);
     run_source(vm, &src)
 }
 

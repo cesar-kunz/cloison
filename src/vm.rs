@@ -603,6 +603,11 @@ pub struct Vm {
     /// The shape of closures that aren't constructors (arrows, methods):
     /// `function_shape` without `prototype`.
     pub(crate) method_shape: *const Shape,
+    /// Generator functions' (`function_shape` from `%GeneratorFunction.
+    /// prototype%`) and async functions' (`method_shape` from
+    /// `%AsyncFunction.prototype%`), once made (see `generator::install`).
+    pub(crate) generator_function_shape: *const Shape,
+    pub(crate) async_function_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
     pub(crate) array_shape: *const Shape,
     proto_object_shape: *const Shape,
@@ -820,6 +825,8 @@ impl Vm {
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
             method_shape: std::ptr::null(),
+            generator_function_shape: std::ptr::null(),
+            async_function_shape: std::ptr::null(),
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
             function_call: std::ptr::null(),
@@ -2975,7 +2982,12 @@ impl Vm {
 
     /// The shape a closure of `callee` gets.
     fn closure_shape(&self, callee: *const Code) -> *const Shape {
-        if matches!(unsafe { (*callee).kind }, 1 | 5) { self.method_shape } else { self.function_shape }
+        match unsafe { (*callee).kind } {
+            4 if !self.generator_function_shape.is_null() => self.generator_function_shape,
+            5 if !self.async_function_shape.is_null() => self.async_function_shape,
+            1 | 5 => self.method_shape,
+            _ => self.function_shape,
+        }
     }
 
     /// Give new closure `f` its `prototype` object; `f` as a value.

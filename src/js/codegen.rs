@@ -3007,6 +3007,9 @@ impl<'a> Gen<'a> {
                                 self.mov(o, t);
                                 let kr = self.alloc(e.pos)?;
                                 self.into(k, kr)?;
+                                // (ToPropertyKey before the value.)
+                                self.intrinsic("property_key", kr, 1);
+                                self.star(kr);
                                 let vr = self.alloc(e.pos)?;
                                 let which = match v.kind {
                                     Accessor(set, f) => {
@@ -3043,6 +3046,17 @@ impl<'a> Gen<'a> {
                                 let ic = self.auto_ic("[]keyed");
                                 self.emit(Op::SetKeyed, &[Arg::Reg(o), Arg::Reg(k), ic]);
                                 self.temp -= 1;
+                            }
+                            // `__proto__: v`: the prototype set (not
+                            // through `Object.prototype`'s accessor).
+                            None if &**name == "__proto__" => {
+                                let mark = self.temp;
+                                let t = self.alloc(e.pos)?;
+                                self.mov(o, t);
+                                let vr = self.alloc(e.pos)?;
+                                self.into(v, vr)?;
+                                self.intrinsic("literal_proto", t, 2);
+                                self.temp = mark;
                             }
                             None => {
                                 self.value(v)?;

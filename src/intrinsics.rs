@@ -23,6 +23,8 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("define_getter", define_getter),
     ("define_setter", define_setter),
     ("throw_const", throw_const),
+    ("property_key", property_key),
+    ("literal_proto", literal_proto),
     ("throw_invalid_target", throw_invalid_target),
     ("class_setup", class_setup),
     ("define_method", define_method),
@@ -280,6 +282,22 @@ fn define_setter(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// An assignment to a `const`: `[name]`.
+/// ToPropertyKey of `[k]`: a string or a symbol.
+fn property_key(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let key = to_property_key(vm, a[0])?;
+    Ok(vm.key_value(key))
+}
+
+/// An object literal's `__proto__: v`, `[o, v]`: `o`'s prototype `v` if an
+/// object or null (else nothing).
+fn literal_proto(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (o, v) = (a[0], a[1]);
+    if crate::props::is_object(v) || v.is_null() {
+        vm.set_prototype_of(as_object(o), v);
+    }
+    Ok(o)
+}
+
 /// A call assigned to (see `Gen::invalid_target`).
 fn throw_invalid_target(_: &mut Vm, _: &[Value]) -> Result<Value> {
     Err(Error::reference_error("Invalid left-hand side in assignment"))

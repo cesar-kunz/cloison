@@ -3533,6 +3533,20 @@ impl Vm {
                 return Err(Error::type_error(format!("Cannot declare global {what} '{n}'")));
             }
         }
+        // A `var` the global's prototypes have (`__proto__`'s accessor, a
+        // read-only property): its own property now, for stores not to
+        // reach theirs.
+        for n in &module.declared {
+            let a = self.intern(n);
+            if !module.function_names.contains(n)
+                && unsafe { (*(*g).shape).lookup(a).is_none() }
+                && self.lookup(g, a).is_some()
+                && extensible
+            {
+                let d = crate::props::Desc::data(Value::UNDEFINED, true, true, eval);
+                self.define_own_property(g, Key::Name(a), &d)?;
+            }
+        }
         for n in &module.function_names {
             let a = self.intern(n);
             if let Some(d) = self.own_property(g, Key::Name(a))

@@ -1692,6 +1692,8 @@ impl<'a> Parser<'_, 'a, '_> {
         let value = self.assignment(no_in)?;
         if op.is_none() {
             match &target.kind {
+                // (`o.n = function () {}`'s too, though the spec's is "":
+                // its code's name, as profiles and listings show it.)
                 ExprKind::Ident(n) | ExprKind::Member(_, n) => {
                     let n = n.clone();
                     self.infer_name(&value, &n)
@@ -2122,18 +2124,21 @@ impl<'a> Parser<'_, 'a, '_> {
                                     pos: ppos,
                                 };
                             }
-                            props.push((PropKey::Name(n), v));
+                            props.push((proto_own(PropKey::Name(n), ppos), v));
                         } else {
                             let key = self.prop_key()?;
                             if self.is("(") {
                                 let h = self.object_home(&mut home);
                                 self.pending_home = Some((Some(h), None, 0));
                                 let f = self.method(&key, None, ppos)?;
-                                props.push((key, Expr { kind: ExprKind::Function(f), pos: ppos }));
+                                props.push((proto_own(key, ppos), Expr { kind: ExprKind::Function(f), pos: ppos }));
                             } else {
                                 self.expect(":")?;
                                 let v = self.assignment(false)?;
-                                if let PropKey::Name(k) = &key {
+                                // (`__proto__: v` sets the prototype: no name.)
+                                if let PropKey::Name(k) = &key
+                                    && &**k != "__proto__"
+                                {
                                     self.infer_name(&v, k);
                                 }
                                 props.push((key, v));
@@ -2158,6 +2163,15 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         };
         Ok(Expr { kind, pos })
+    }
+}
+
+/// A shorthand's or a method's key `__proto__` as a computed one: an own
+/// property (only `__proto__: v` sets the prototype).
+fn proto_own(key: PropKey<'_>, pos: Pos) -> PropKey<'_> {
+    match key {
+        PropKey::Name(n) if &*n == "__proto__" => PropKey::Computed(Expr { kind: ExprKind::Str(n.to_string()), pos }),
+        k => k,
     }
 }
 

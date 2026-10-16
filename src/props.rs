@@ -750,6 +750,9 @@ impl Vm {
                 }
                 Key::Name(a) => {
                     if (*(*o).shape).lookup(a).is_none() {
+                        if o == self.global {
+                            return self.delete_global(a);
+                        }
                         if matches!(class, Class::Function | Class::Native) {
                             if (a == self.a_length || a == self.a_name) && (*o).flags & (SEALED | FROZEN) != 0 {
                                 return false;

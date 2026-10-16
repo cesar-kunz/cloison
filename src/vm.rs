@@ -2186,12 +2186,12 @@ impl Vm {
         if !callable {
             return Err(Error::type_error("Right-hand side of 'instanceof' is not callable"));
         }
-        // Strings are primitives.
-        if !v.is_cell() || string_units(v).is_some() {
+        // Strings (and symbols) are primitives.
+        if !crate::props::is_object(v) {
             return Ok(false);
         }
         let p = self.get(f, self.a_prototype)?;
-        if !p.is_cell() {
+        if !crate::props::is_object(p) {
             return Err(Error::type_error(
                 "Function has non-object prototype in instanceof check",
             ));

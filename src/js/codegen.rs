@@ -1967,6 +1967,22 @@ impl<'a> Gen<'a> {
         r
     }
 
+    /// Strict code's `delete` that failed (`acc` false) throws.
+    fn strict_delete_check(&mut self, pos: Pos) -> R<()> {
+        if !self.f.strict {
+            return Ok(());
+        }
+        let ok = self.label();
+        self.jump_if(Jmp::True, ok);
+        let mark = self.temp;
+        let t = self.alloc(pos)?;
+        self.intrinsic("throw_delete", t, 0);
+        self.temp = mark;
+        self.bind(ok);
+        self.emit(Op::LdaTrue, &[]);
+        Ok(())
+    }
+
     /// `acc` = intrinsic `name` of registers `first..first + n` (see
     /// `crate::intrinsics`).
     fn intrinsic(&mut self, name: &str, first: u8, n: u8) {
@@ -3042,6 +3058,7 @@ impl<'a> Gen<'a> {
                     let r = self.reg(o, &[])?;
                     self.string(name);
                     self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                    self.strict_delete_check(e.pos)?;
                     self.temp = mark;
                 }
                 Index(o, k) => {
@@ -3049,6 +3066,7 @@ impl<'a> Gen<'a> {
                     let r = self.reg(o, &[k])?;
                     self.value(k)?;
                     self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                    self.strict_delete_check(e.pos)?;
                     self.temp = mark;
                 }
                 Ident(n) if self.in_with(n) => self.with_delete(n, x.pos)?,

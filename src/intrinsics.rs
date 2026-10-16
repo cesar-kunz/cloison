@@ -600,6 +600,9 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
         }
     }
+    // (Its `var`s are the scope objects', not globals.)
+    let mut module = module;
+    module.declared.clear();
     let code = vm.load(module);
     let env = if crate::props::is_object(env) { env } else { local };
     vm.eval_envs.push([env, local]);

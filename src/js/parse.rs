@@ -78,6 +78,7 @@ fn parse_pass<'a, 'p>(
         classes: 0,
         pending_generator: false,
         pending_async: false,
+        pending_head: Vec::new(),
         sub: false,
         pending_pattern: None,
         home_uses: 0,
@@ -212,6 +213,8 @@ struct Parser<'t, 'a, 'p> {
     pending_generator: bool,
     /// The function about to be parsed is async.
     pending_async: bool,
+    /// A `for` head pattern's names (see `head_tdz`).
+    pending_head: Vec<Name>,
     /// The statement about to be parsed is another's body.
     sub: bool,
     /// A `for` head's declaration's pattern (see `pattern_declarator`).
@@ -718,6 +721,7 @@ impl<'a> Parser<'_, 'a, '_> {
             if decls.len() == 1 && decls[0].1.is_none() && self.eat("in") {
                 let name = decls.into_iter().next().unwrap().0;
                 let object = self.expression(false)?;
+                self.head_tdz(std::slice::from_ref(&name));
                 self.expect(")")?;
                 let body = stmt(self.arena, self.sub_statement()?);
                 return Ok(StmtKind::ForIn {
@@ -845,6 +849,18 @@ impl<'a> Parser<'_, 'a, '_> {
         })
     }
 
+    /// A `for` head's block-scoped names (and `pending_head`'s): not
+    /// initialized through the head's expression (its end here).
+    fn head_tdz(&mut self, names: &[Name]) {
+        let end = self.pos();
+        let pending = std::mem::take(&mut self.pending_head);
+        for n in names.iter().chain(&pending) {
+            if let Some(l) = self.lexicals.get_mut(n) {
+                l.end = end;
+            }
+        }
+    }
+
     /// At `of` in a `for` head.
     fn is_of(&self) -> bool {
         matches!(self.peek(), Tok::Ident(n) if &**n == "of") && !self.toks[self.i].escaped
@@ -855,6 +871,10 @@ impl<'a> Parser<'_, 'a, '_> {
         let pos = self.pos();
         self.advance();
         let iterable = self.assignment(false)?;
+        match &target {
+            ExprKind::Ident(n) => self.head_tdz(std::slice::from_ref(n)),
+            _ => self.head_tdz(&[]),
+        }
         self.expect(")")?;
         let body = stmt(self.arena, self.sub_statement()?);
         Ok(StmtKind::ForOf {
@@ -868,6 +888,9 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// `for (pattern of iterable) body`'s rest, at `of`.
     fn for_of_pattern(&mut self, kind: u8, p: Pattern<'a>) -> R<StmtKind<'a>> {
+        let mut names = Vec::new();
+        p.names(&mut names);
+        self.pending_head = names;
         let r = self.for_of_rest(kind, ExprKind::Null)?;
         let StmtKind::ForOf { kind, target, iterable, body, .. } = r else { unreachable!() };
         Ok(StmtKind::ForOf {

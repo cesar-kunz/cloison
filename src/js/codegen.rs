@@ -3405,7 +3405,24 @@ impl<'a> Gen<'a> {
                     &mut |g, r| {
                         g.named(Op::GetNamed, r, original(n));
                         step(g);
-                        g.named(Op::SetNamed, r, original(n));
+                        if g.f.strict {
+                            // (Strict code: the property gone meanwhile is an
+                            // error.)
+                            let m = g.temp;
+                            let val = g.alloc(pos)?;
+                            g.star(val);
+                            let a = g.alloc(pos)?;
+                            g.mov(r, a);
+                            let k = g.alloc(pos)?;
+                            g.string(original(n));
+                            g.star(k);
+                            let v2 = g.alloc(pos)?;
+                            g.mov(val, v2);
+                            g.intrinsic("with_set_strict", a, 3);
+                            g.temp = m;
+                        } else {
+                            g.named(Op::SetNamed, r, original(n));
+                        }
                         Ok(())
                     },
                     &mut |g| {
@@ -4456,6 +4473,18 @@ impl<'a> Gen<'a> {
         let it = self.alloc(pos)?;
         let hole = self.alloc(pos)?;
         let v = self.alloc(pos)?;
+        // (`let`/`const`: not initialized while the iterable is evaluated.)
+        if kind >= 2 {
+            let mut ns = Vec::new();
+            match (pattern, &target.kind) {
+                (Some(p), _) => p.names(&mut ns),
+                (None, ExprKind::Ident(n)) => ns.push(n.clone()),
+                _ => {}
+            }
+            for n in &ns {
+                self.fresh_binding(n, true, pos)?;
+            }
+        }
         self.into(iterable, v)?;
         self.intrinsic("get_iterator", v, 1);
         self.star(it);
@@ -4552,6 +4581,9 @@ impl<'a> Gen<'a> {
         body: &'a Stmt,
         pos: Pos,
     ) -> R<()> {
+        if fresh {
+            self.fresh_binding(name, true, pos)?;
+        }
         self.value(object)?;
         self.emit(Op::ForInKeys, &[]);
         let keys = self.alloc(pos)?;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run each Octane benchmark under toi, deterministically (as Octane's own
+# Run each Octane benchmark under cloison, deterministically (as Octane's own
 # `doDeterministic` runs them), and print whether it runs to the end, or
 # the first error it stops at.
 #
@@ -40,7 +40,7 @@ order="richards deltablue crypto raytrace earley-boyer regexp splay
   navier-stokes pdfjs mandreel gbemu code-load box2d zlib typescript"
 [ $# -gt 0 ] && order="$*"
 
-# The value is the script's completion value (toi prints it; Node's
+# The value is the script's completion value (cloison prints it; Node's
 # wrapper below too).
 deterministic='var done = 0, failed = "";
 BenchmarkSuite.config.doDeterministic = true;
@@ -62,7 +62,7 @@ node_value() {
   "$NODE" -e 'const r = require("vm").runInThisContext(require("fs").readFileSync(process.argv[1], "utf8")); console.log(String(r));' "$1"
 }
 if [ -n "${SCORE:-}" ]; then
-  NODE=${NODE:-$(ls -d ~/.local/share/toi-v8/node-*/bin/node 2>/dev/null | tail -1)}
+  NODE=${NODE:-$(ls -d ~/.local/share/cloison-v8/node-*/bin/node 2>/dev/null | tail -1)}
   NODE=${NODE:-node}
 fi
 
@@ -73,12 +73,12 @@ for b in $order; do
     { cat "$octane/base.js"; for p in ${files[$b]}; do cat "$octane/$p.js"; echo; done
       if [ $kind = run ]; then echo "$deterministic"; else echo "$score"; fi; } > "$f"
   done
-  r=$(timeout "$timeout" ./target/release/toi "$out/$b-run.js" 2>&1 | tail -n 1 | cut -c1-160) || true
+  r=$(timeout "$timeout" ./target/release/cloison "$out/$b-run.js" 2>&1 | tail -n 1 | cut -c1-160) || true
   [ -z "$r" ] && r="(timed out or crashed)"
   if [[ "$r" =~ ^100[1-9]$ ]]; then
     line="runs"
     if [ -n "${SCORE:-}" ]; then
-      s=$(timeout "$timeout" ./target/release/toi "$out/$b-score.js" 2>&1 | tail -n 1)
+      s=$(timeout "$timeout" ./target/release/cloison "$out/$b-score.js" 2>&1 | tail -n 1)
       v=$(node_value "$out/$b-score.js" 2>&1 | tail -n 1)
       line="runs, score $s (V8 $v)"
     fi

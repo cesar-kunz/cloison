@@ -335,14 +335,14 @@ const ENV: &str = "%env";
 /// Function `i`'s name, for its code.
 /// Where a position of the program is in `src` (through `at`, for a
 /// function compiled lazily), as 1-based line and column (bytes), for
-/// `TOI_JIT_LOG` and `TOI_JIT_DUMP_FN` (`scripts/vs-maglev.sh` matches
+/// `CLOISON_JIT_LOG` and `CLOISON_JIT_DUMP_FN` (`scripts/vs-maglev.sh` matches
 /// functions by it with V8's, which places them at their parameter list's
 /// `(` too). Without either, (0, 0): finding lines scans the source, which
 /// a lazy compile would do again for every function.
 fn positions<'a>(src: &'a str, at: Option<&'a dyn Fn(Pos) -> Pos>) -> impl Fn(Pos) -> (u32, u32) + 'a {
     static LOGGING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let logging = *LOGGING.get_or_init(|| {
-        std::env::var_os("TOI_JIT_LOG").is_some() || std::env::var_os("TOI_JIT_DUMP_FN").is_some()
+        std::env::var_os("CLOISON_JIT_LOG").is_some() || std::env::var_os("CLOISON_JIT_DUMP_FN").is_some()
     });
     let starts: Vec<usize> = if logging {
         std::iter::once(0).chain(src.match_indices('\n').map(|(k, _)| k + 1)).collect()
@@ -1551,7 +1551,7 @@ impl<'a> Gen<'a> {
                 self.ldar(cv);
                 self.emit(Op::Return, &[]);
             } else {
-                // The script's completion value (printed by `toi`) is its
+                // The script's completion value (printed by `cloison`) is its
                 // last expression statement's.
                 match body.split_last() {
                     Some((

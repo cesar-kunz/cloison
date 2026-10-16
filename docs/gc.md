@@ -3,7 +3,7 @@
 Status: 2026-10-10. Steps 1 to 6 of the plan below are implemented in
 `src/heap.rs` and `src/gc.rs` (step 7 is later work): minor collections,
 and major ones marked and swept by a second thread between two short
-pauses (`TOI_GC_STW` keeps the stop-the-world full collection).
+pauses (`CLOISON_GC_STW` keeps the stop-the-world full collection).
 This revision replaces the first one (a parallel copying
 nursery with precise roots), whose two premises implementation showed
 false: see "Why not a copying nursery". Supersedes the collector parts of
@@ -46,7 +46,7 @@ heap containers across a call into JS hold them in a handle scope.
 The first revision of this document chose V8's design: a semi-space
 nursery copied by a parallel Scavenger, precise roots read from VM frames
 and safepoint maps, and an old space that moved only in pauses. Two of
-its premises do not hold in toi, which implementation showed:
+its premises do not hold in cloison, which implementation showed:
 
 1. **Roots in compiled frames are not precise.** Stencils are machine
    code that LLVM compiled; across a runtime call, LLVM keeps live values
@@ -79,13 +79,13 @@ stay where they were allocated, interleaved with the holes that dead
 cells leave, and allocation bumps through holes rather than one free
 range. V8 measured its non-moving young generation as a loss against
 the Scavenger; Whippet measured `nofl` with sticky marks as competitive
-for Guile, whose roots are conservative like toi's. The plan measures it
+for Guile, whose roots are conservative like cloison's. The plan measures it
 at each step.
 
 ## Numbers the design is for
 
-Octane's deterministic runs on toi before the collector (2026-10-10,
-Apple silicon, `target/release/toi`; with no collector the heap's size is the
+Octane's deterministic runs on cloison before the collector (2026-10-10,
+Apple silicon, `target/release/cloison`; with no collector the heap's size is the
 allocation volume; peak RSS undercounts it on macOS, which compresses
 memory that is never touched again):
 
@@ -238,7 +238,7 @@ does not.
   heap stays movable ([Ruby][ruby-mmtk], [Julia][julia-mmtk]). Whippet's
   `nofl` space does the same for Guile with one metadata byte per 16-byte
   granule and a field-logging barrier measured at 1.05–1.5× over card
-  marking ([Wingo 2024][nofl]). toi's heap is `nofl`'s: the granule
+  marking ([Wingo 2024][nofl]). cloison's heap is `nofl`'s: the granule
   metadata byte, conservative roots checked against it, holes found from
   it, generations by sticky marks, with a card-marking barrier.
 - **Copying nurseries' failure mode.** A long live list built in one go
@@ -252,7 +252,7 @@ does not.
   allocated on the stack optimistically and moved to the heap with
   reference fixing when the speculation fails. This is the published form
   of `object-model.md`'s externalization; its baseline (0.16% of objects
-  stack-allocated by the JIT's escape analysis) is the number toi's
+  stack-allocated by the JIT's escape analysis) is the number cloison's
   bytecode-level virtual objects should beat.
 - **Pacing.** CPython shipped an incremental collector in 3.14 and
   reverted it in 3.14.5 after production heaps grew up to 5× for a pause
@@ -282,7 +282,7 @@ does not.
 All heaps of a process share one reservation of address space (16 TiB,
 inaccessible until committed, so up to 512 heaps alive at once); each
 takes a 32 GiB slice of it
-(`TOI_HEAP_LIMIT`, in MiB, lowers what it may use), committed 8 MiB at a
+(`CLOISON_HEAP_LIMIT`, in MiB, lowers what it may use), committed 8 MiB at a
 time. Sharing makes the metadata's and the cards' biases process
 constants, so the barrier needs no heap at hand. A slice is 32 KiB
 blocks:
@@ -416,7 +416,7 @@ known to be an int32 or a double have variants without the barrier
 which the JIT's types don't distinguish from cells, take the two tests.
 
 The barrier's first layout cost as much as its instructions: LLVM merges
-a stencil's tail calls into one `b toi_continue` that every early exit
+a stencil's tail calls into one `b cloison_continue` that every early exit
 branched to, so a store of an old value took two branches. `build.rs`
 now aims every branch to an inner `b <symbol>` at the symbol itself,
 after which the stencil's exits are single branches to the next piece
@@ -442,7 +442,7 @@ Every young cell reached is old afterwards, so every card is clean after
 a minor collection.
 
 The barrier is also what found the one store site the audit missed: with
-`TOI_GC_CHECK_BARRIER`, each minor collection traces every old cell (what
+`CLOISON_GC_CHECK_BARRIER`, each minor collection traces every old cell (what
 a marking would follow, not the padding past an odd number of slots,
 which no maker writes) for a reference to a young cell it left unmarked,
 and the `set_keyed!` family of stencils, which writes `$v`, was one.
@@ -491,8 +491,8 @@ Concurrent, with two short pauses, the marker thread doing the rest
    a live young cell, with what it referred to swept from under it
    (EarleyBoyer did so six times with a 1 MiB nursery).
 
-`TOI_GC_STW` marks and sweeps full collections in one pause instead;
-`TOI_GC_CYCLES` runs cycles back to back, and with `TOI_GC_VERIFY` each
+`CLOISON_GC_STW` marks and sweeps full collections in one pause instead;
+`CLOISON_GC_CYCLES` runs cycles back to back, and with `CLOISON_GC_VERIFY` each
 final pause also walks every root again in one pass and panics on a
 reachable cell the concurrent marking left unmarked.
 
@@ -518,12 +518,12 @@ pauses.
   least), counted two ways, whichever comes first: blocks in use since
   the sweep, and bytes minor collections promoted (allocation into
   recycled holes adds no blocks). Not yet: a CPU-share target, and
-  `TOI_HEAP_LIMIT` steering it.
+  `CLOISON_HEAP_LIMIT` steering it.
 - **When marking starts**: earlier by what the last cycle grew the heap
   by while marking, so the heap peaks about where a stop-the-world
   collection would have let it.
 
-`TOI_GC_STATS` prints each collection: kind, pause, bytes allocated
+`CLOISON_GC_STATS` prints each collection: kind, pause, bytes allocated
 since the last, marked, freed, and the heap's size.
 
 ### Weak references, finalization
@@ -559,7 +559,7 @@ runs) and the microbenchmarks.
    metadata and cards, hole and large allocation, self-describing cells
    (`inline_cap` in the header, arrays' and buffers' header words,
    upvalue cells), the stencils writing the metadata byte;
-   `TOI_GC_VERIFY` walks the heap and the test suite does after every
+   `CLOISON_GC_VERIFY` walks the heap and the test suite does after every
    run. Measured: +1.8% geomean on the microbenchmarks, +5 to 19% on the
    allocation-heavy ones (more memory per object, all of it fresh pages).
 2. **Roots and marking** (done). The conservative scans, the VM's
@@ -570,9 +570,9 @@ runs) and the microbenchmarks.
 3. **The minor collection** (done). The barrier in the runtime, the
    interpreter and the stencils; card scanning; freeing dead young cells
    by clearing their metadata eight bytes at a time; holes and their
-   reuse in recycled blocks; `TOI_GC_STRESS` (collect at every safepoint)
-   and `TOI_GC_CHECK_BARRIER` (find an old cell referring to a freed young
-   one). The nursery is 32 MiB (`TOI_GC_NURSERY`): at 4 MiB, RayTrace took
+   reuse in recycled blocks; `CLOISON_GC_STRESS` (collect at every safepoint)
+   and `CLOISON_GC_CHECK_BARRIER` (find an old cell referring to a freed young
+   one). The nursery is 32 MiB (`CLOISON_GC_NURSERY`): at 4 MiB, RayTrace took
    18.3 s instead of 10.8 s, nearly all of it in compiled code's inline
    allocation falling to the runtime for the next small hole between
    survivors; at 32 MiB it runs at its speed without a collector.
@@ -610,7 +610,7 @@ runs) and the microbenchmarks.
    short without them), sweeping by the marker thread with the mutator
    sweeping the blocks it needs first. The barrier compares against one
    color byte per slice instead of building table biases. Pauses in ms
-   (largest; `TOI_GC_STW` for the stop-the-world column):
+   (largest; `CLOISON_GC_STW` for the stop-the-world column):
 
    | benchmark | full (STW) | start | final | minor |
    |---|---:|---:|---:|---:|
@@ -727,7 +727,7 @@ runs) and the microbenchmarks.
      the dirty runs (split to 64 cards) scanned by up to eight threads
      once there are 4,096 dirty cards, each claiming a cell by a
      compare-and-swap of its metadata byte, in minor, start and final
-     pauses alike (`TOI_GC_THREADS`; the marker is paused then). Taking
+     pauses alike (`CLOISON_GC_THREADS`; the marker is paused then). Taking
      one run at a time from the shared counter did not scale (11.2 ->
      9.4 ms on four threads); 256 runs a take does: the card phase
      18.8 ms on one thread, 12 on two, 9 on four (eight no better on four
@@ -749,7 +749,7 @@ runs) and the microbenchmarks.
      changes.
    - *Survivors traced on several threads* (done): a pause (minor, start
      or final) traces on one thread until it has traced 16,384 cells,
-     then on up to `TOI_GC_THREADS` (`Marking::drain_parallel`): each
+     then on up to `CLOISON_GC_THREADS` (`Marking::drain_parallel`): each
      from its own stack, claiming cells as card scanning does, handing
      half its stack to a shared queue whenever that is empty
      (from 16 cells: a tree traced depth first keeps a stack about as
@@ -800,7 +800,7 @@ runs) and the microbenchmarks.
 
 ## Risks
 
-- **A missed root is a use after free.** `TOI_GC_STRESS` collects at
+- **A missed root is a use after free.** `CLOISON_GC_STRESS` collects at
   every safepoint and overwrites freed cells, so a missed root crashes on
   first use; the test suite runs under it. The VM's references and the
   Rust structures are the manual part; the conservative scans cover the
@@ -812,7 +812,7 @@ runs) and the microbenchmarks.
   size; Whippet, JSC and Guile live with it.
 - **Fragmentation.** Survivors pin their granules. Holes are granule-
   precise, so the waste is the survivors themselves and holes too small
-  for the next allocation; `TOI_GC_STATS` reports free granules in
+  for the next allocation; `CLOISON_GC_STATS` reports free granules in
   partly used blocks so the cost is visible, and evacuation is step 6's
   remedy.
 - **Concurrency bugs** are kept to the marker's reads of cells and

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use toi::vm::{Vm, display};
+use cloison::vm::{Vm, display};
 
 fn files(dir: &str, ext: &str) -> Vec<PathBuf> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
@@ -21,7 +21,7 @@ fn files(dir: &str, ext: &str) -> Vec<PathBuf> {
 /// Run `src` with the interpreter only, tiering up after 1 and 2 back
 /// edges, and with the default; all must agree.
 fn run(src: &str) -> Result<String, String> {
-    let module = toi::js::compile(src)?;
+    let module = cloison::js::compile(src)?;
     let mut result = None;
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
@@ -41,14 +41,14 @@ fn value(src: &str) -> String {
 }
 
 fn compile_error(src: &str) -> String {
-    toi::js::compile(src).expect_err(src)
+    cloison::js::compile(src).expect_err(src)
 }
 
 #[test]
 fn every_microbenchmark_parses() {
     for f in files("bench/micro", "js") {
         let src = std::fs::read_to_string(&f).unwrap();
-        if let Err(e) = toi::js::parse(&src) {
+        if let Err(e) = cloison::js::parse(&src) {
             panic!("{}:{}", f.display(), e.display(&src));
         }
     }
@@ -60,10 +60,10 @@ fn listings_are_what_the_front_end_emits() {
         let js = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("bench/micro")
             .join(f.with_extension("js").file_name().unwrap());
-        let want = toi::asm::parse(&std::fs::read_to_string(&f).unwrap()).unwrap();
-        let got = toi::js::compile(&std::fs::read_to_string(&js).unwrap())
+        let want = cloison::asm::parse(&std::fs::read_to_string(&f).unwrap()).unwrap();
+        let got = cloison::js::compile(&std::fs::read_to_string(&js).unwrap())
             .unwrap_or_else(|e| panic!("{}:{e}", js.display()));
-        let (want_text, got_text) = (toi::asm::disassemble(&want), toi::asm::disassemble(&got));
+        let (want_text, got_text) = (cloison::asm::disassemble(&want), cloison::asm::disassemble(&got));
         assert_eq!(want_text, got_text, "{} (left: listing)", js.display());
         assert_eq!(want.functions.len(), got.functions.len());
         for (w, g) in want.functions.iter().zip(&got.functions) {
@@ -105,7 +105,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
             .find_map(|l| l.strip_prefix("// expect: "))
             .unwrap()
             .trim();
-        let Ok(module) = toi::js::compile(&src) else {
+        let Ok(module) = cloison::js::compile(&src) else {
             continue;
         };
         let mut vm = Vm::new();
@@ -159,7 +159,7 @@ fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
             .find_map(|l| l.strip_prefix("// expect: "))
             .unwrap()
             .trim();
-        let module = toi::js::compile(&src).unwrap();
+        let module = cloison::js::compile(&src).unwrap();
         for budget in [1, 3] {
             let mut vm = Vm::new();
             vm.set_tier_back_edges(budget);
@@ -185,7 +185,7 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
             .find_map(|l| l.strip_prefix("// expect: "))
             .unwrap()
             .trim();
-        let module = toi::js::compile(&src).unwrap();
+        let module = cloison::js::compile(&src).unwrap();
         for budget in [1, 1000] {
             let mut vm = Vm::new();
             vm.set_warm_tier(true);
@@ -542,7 +542,7 @@ ints(1000, 9) + "|" + mixed([7, -7, 0, -0, 6, -6, 2147483647, -2147483648, 5.5, 
 /// An array of more than 1,024 values is marked a slice at a time, the
 /// rest left on the mark stack (`Marking::drain`): objects reachable only
 /// from its later slices, stored there young, must survive collections.
-/// Fails under `TOI_GC_STW=1 TOI_GC_FULL=1 TOI_GC_VERIFY=2048` if the rest
+/// Fails under `CLOISON_GC_STW=1 CLOISON_GC_FULL=1 CLOISON_GC_VERIFY=2048` if the rest
 /// of the array is dropped after the first slice.
 #[test]
 fn large_arrays_marked_in_slices_keep_their_later_values() {
@@ -577,7 +577,7 @@ run();
 /// A pause traces on several threads past 16,384 cells
 /// (`Marking::drain_parallel`), the threads handing each other parts of
 /// their stacks: a tree and an array of 40,000 cells must survive. Fails
-/// under `TOI_GC_STW=1 TOI_GC_FULL=1 TOI_GC_VERIFY=2048` if a handed-over
+/// under `CLOISON_GC_STW=1 CLOISON_GC_FULL=1 CLOISON_GC_VERIFY=2048` if a handed-over
 /// part is lost.
 #[test]
 fn heaps_traced_on_several_threads_keep_every_cell() {
@@ -2156,7 +2156,7 @@ fn loads_hoisted_from_nested_loops_agree_with_node() {
 r;")), "542668");
 }
 
-/// `this` in sloppy mode (toi has no strict mode): the global object in a
+/// `this` in sloppy mode (cloison has no strict mode): the global object in a
 /// call without a receiver, and for `f.call(null)` / `f.call()`; through
 /// inlined, direct, polymorphic and self tail calls. The expected value is
 /// Node's.
@@ -2908,7 +2908,7 @@ fn exits_at_an_instruction_never_compiled_dont_lower_again() {
 var t = 0;
 for (var k = 0; k < 300; k++) t += block(50);
 t;";
-    let m = toi::js::compile(src).unwrap();
+    let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(20);
     assert_eq!(display(vm.run(&m).unwrap()), "367800");
@@ -2933,7 +2933,7 @@ function f(n, h) {
 var t = 0;
 for (var k = 0; k < 300; k++) t += f(100, g);
 t;";
-    let m = toi::js::compile(src).unwrap();
+    let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(20);
     assert_eq!(display(vm.run(&m).unwrap()), "1515000");
@@ -2943,9 +2943,9 @@ t;";
 }
 
 /// Runs `src` tiering up after 1000 back edges (the default, whatever
-/// `TOI_TIER` says); returns its value and `function`'s stencils.
+/// `CLOISON_TIER` says); returns its value and `function`'s stencils.
 fn compiled(src: &str, function: &str) -> (String, Vec<String>) {
-    let m = toi::js::compile(src).unwrap();
+    let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(1000);
     let v = display(vm.run(&m).unwrap());
@@ -3647,7 +3647,7 @@ fn microbenchmarks_through_eval_compute_their_expected_results() {
 /// later script in the VM sees what they did.
 #[test]
 fn promise_jobs_run_after_the_script() {
-    let first = toi::js::compile(
+    let first = cloison::js::compile(
         r#"
 var log = [];
 Promise.resolve(1).then(function (v) { log.push("a" + v); });
@@ -3680,7 +3680,7 @@ log.push("sync");
 "#,
     )
     .unwrap();
-    let second = toi::js::compile("log.join(' ')").unwrap();
+    let second = cloison::js::compile("log.join(' ')").unwrap();
     for budget in [i64::MAX, 1, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
@@ -3720,7 +3720,7 @@ for (var i = 0; i < 3000; i++) {
 for (var i = 0; i < keep.length; i++) sum += keep[i].f();
 sum;
 "#;
-    let module = toi::js::compile(src).unwrap();
+    let module = cloison::js::compile(src).unwrap();
     for budget in [i64::MAX, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
@@ -3755,7 +3755,7 @@ for (var r = 0; r < keep.length; r++)
   for (var i = 0; i < keep[r].length; i++) if (keep[r][i].length == 64) ok++;
 ok;
 "#;
-    let module = toi::js::compile(src).unwrap();
+    let module = cloison::js::compile(src).unwrap();
     for budget in [i64::MAX, 2, 1000] {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);

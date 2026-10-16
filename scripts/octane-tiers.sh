@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Octane's score for each of its benchmarks in each of toi's and V8's
-# tiers: toi's interpreter alone (TOI_NO_JIT) and with the JIT; V8 capped
+# Octane's score for each of its benchmarks in each of cloison's and V8's
+# tiers: cloison's interpreter alone (CLOISON_NO_JIT) and with the JIT; V8 capped
 # at each tier (`--max-opt`): Ignition (0), Sparkplug (1), Maglev (2), and
 # everything (Turbofan, V8's default). Each score is Octane's own (its
 # harness and files unmodified: scripts/octane.sh's `-score.js` scripts),
@@ -12,14 +12,14 @@
 #   scripts/octane-tiers.sh deltablue splay   # only these
 #
 # Runs go JOBS (default 8) at a time, each pinned to a core of its own,
-# the idlest ones (see scripts/quiet.sh), and to both of its CPUs: toi's
+# the idlest ones (see scripts/quiet.sh), and to both of its CPUs: cloison's
 # marker and Node's compiler and collector run on threads of their own.
 # Parallel runs share the L3 cache and memory bandwidth. A run past
 # TIMEOUT seconds (default 900) or giving no score counts as `-`.
 #
-# V8's columns don't change with toi: they come from an earlier table
+# V8's columns don't change with cloison: they come from an earlier table
 # (V8_FROM, default the newest perf-history/octane-tiers-*.tsv), and only
-# toi runs. V8=1 measures them again.
+# cloison runs. V8=1 measures them again.
 #
 # Node: $NODE, else the Node 26 scripts/tiers.sh downloads.
 set -euo pipefail
@@ -27,12 +27,12 @@ cd "$(dirname "$0")/.."
 reps=${REPS:-3}
 jobs=${JOBS:-8}
 timeout=${TIMEOUT:-900}
-NODE=${NODE:-$(ls -d ~/.local/share/toi-v8/node-*/bin/node 2>/dev/null | tail -1)}
+NODE=${NODE:-$(ls -d ~/.local/share/cloison-v8/node-*/bin/node 2>/dev/null | tail -1)}
 [[ -x $NODE ]] || { echo "no Node 26: run scripts/tiers.sh once, or set NODE" >&2; exit 1; }
 order="richards deltablue crypto raytrace earley-boyer regexp splay
   navier-stokes pdfjs mandreel gbemu code-load box2d zlib typescript"
 [[ $# -gt 0 ]] && order="$*"
-# The `-score.js` scripts (and the toi build).
+# The `-score.js` scripts (and the cloison build).
 scripts/octane.sh $order >/dev/null
 commit=$(git rev-parse --short HEAD)
 git diff --quiet HEAD -- src stencils build.rs .cargo || commit="$commit+"
@@ -52,8 +52,8 @@ reps, jobs, timeout = int(reps), int(jobs), int(timeout)
 v8 = subprocess.run([node, "-p", "process.versions.v8"], capture_output=True, text=True).stdout.strip()
 runner = 'console.log(String(require("vm").runInThisContext(require("fs").readFileSync(process.argv[1], "utf8"))))'
 configs = [
-    ("toi interp", lambda f: (["target/release/toi", f], {"TOI_NO_JIT": "1"})),
-    ("toi JIT", lambda f: (["target/release/toi", f], {})),
+    ("cloison interp", lambda f: (["target/release/cloison", f], {"CLOISON_NO_JIT": "1"})),
+    ("cloison JIT", lambda f: (["target/release/cloison", f], {})),
     ("Ignition", lambda f: ([node, "--max-opt=0", "-e", runner, f], {})),
     ("Sparkplug", lambda f: ([node, "--max-opt=1", "-e", runner, f], {})),
     ("Maglev", lambda f: ([node, "--max-opt=2", "-e", runner, f], {})),
@@ -106,14 +106,14 @@ def run(job):
         print(f"{b} ({name}): {last[:120]}", file=sys.stderr)
         return job, None
 
-# V8's columns from an earlier table, if one is given: only toi runs.
+# V8's columns from an earlier table, if one is given: only cloison runs.
 reused = {}
 if v8_from:
     rows = [l.rstrip("\n").split("\t") for l in open(v8_from)]
     cols = rows[0]
     for r in rows[1:]:
         for k, (name, _) in enumerate(configs):
-            if not name.startswith("toi") and name in cols:
+            if not name.startswith("cloison") and name in cols:
                 v = r[cols.index(name)]
                 reused[(r[0], k)] = [None if v == "-" else float(v)]
 measured = [k for k in range(len(configs)) if not any((b, k) in reused for b in benches)]
@@ -143,7 +143,7 @@ with open(out + ".tsv", "w") as f:
 
 fmt = lambda s: "-" if s is None else f"{s:.0f}" if s >= 100 else f"{s:.3g}"
 lines = [f"Octane scores (higher is better; medians of {reps} runs, {jobs} at a time on cores of their own): "
-         f"toi {commit}, V8 {v8} capped at each tier"
+         f"cloison {commit}, V8 {v8} capped at each tier"
          + (f" (V8's columns from {v8_from})" if v8_from else "")
          + f". Load average at the start and end: {' '.join(load)}.\n",
          "| benchmark | " + " | ".join(names) + " |", "|---|" + "---:|" * len(names)]
@@ -157,7 +157,7 @@ if ok:
     for k in (0, 1):
         lines.append(f"{names[k]} vs " + ", ".join(
             f"{names[j]} {gm[k] / gm[j]:.2f}x (ahead on {sum(table[b][k] > table[b][j] for b in ok)})"
-            for j in range(2, len(configs))) + f" (of {len(ok)}; above 1x: toi scores higher)")
+            for j in range(2, len(configs))) + f" (of {len(ok)}; above 1x: cloison scores higher)")
 missing = [b for b in benches if b not in ok]
 if missing:
     lines.append("")

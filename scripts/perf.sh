@@ -81,8 +81,8 @@ case ${1:-} in
     rm -rf "$work/tree"
     git worktree prune
     git worktree add -q --detach "$work/tree" "$c"
-    if (cd "$work/tree" && CARGO_TARGET_DIR="$root/$work/target" cargo build --release --quiet --bin toi 2>/dev/null); then
-      rows=$(measure "$work/tree" "$root/$work/target/release/toi")
+    if (cd "$work/tree" && CARGO_TARGET_DIR="$root/$work/target" cargo build --release --quiet --bin cloison 2>/dev/null); then
+      rows=$(measure "$work/tree" "$root/$work/target/release/cloison")
       if [[ -n $rows ]]; then record "$c" "$rows"; echo "recorded $(wc -l <<<"$rows") benchmarks"; else echo "nothing ran"; fi
     else
       echo "build failed; skipped"
@@ -116,10 +116,10 @@ EOF
   rm -rf "$work/tree"
   git worktree prune
   git worktree add -q --detach "$work/tree" "$rev"
-  (cd "$work/tree" && CARGO_TARGET_DIR="$root/$work/target" cargo build --release --quiet --bin toi)
+  (cd "$work/tree" && CARGO_TARGET_DIR="$root/$work/target" cargo build --release --quiet --bin cloison)
   git worktree remove --force "$work/tree"
-  cargo build --release --quiet --bin toi
-  a=$work/target/release/toi b=target/release/toi
+  cargo build --release --quiet --bin cloison
+  a=$work/target/release/cloison b=target/release/cloison
   printf '%-36s %10s %10s %8s %8s %8s\n' bench "$rev" "working" change spread insns
   for f in bench/bytecode/*.asm bench/micro/*.js; do
     name=$(basename "$f") kind=asm
@@ -150,10 +150,10 @@ print(f"{sys.argv[1]:36} {st.median(ca) / 1e6:9.2f}M {st.median(cb) / 1e6:9.2f}M
 *) sed -n '2,25p' "$0"; exit 2 ;;
 esac
 
-cargo build --release --quiet --bin toi
+cargo build --release --quiet --bin cloison
 commit=$(git rev-parse --short HEAD)
 git diff --quiet HEAD -- src stencils bench build.rs Cargo.toml || commit="$commit+"
-rows=$(measure . target/release/toi)
+rows=$(measure . target/release/cloison)
 
 # The newest recorded first-parent ancestor of HEAD on this host.
 base=""

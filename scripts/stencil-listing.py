@@ -8,7 +8,7 @@ given target's), after build.rs's rewrites (stub folding, branch inversion,
 templates), and disassembles each stencil with capstone's `cstool`, marking
 the holes and continuations at their relocations and, for an arm64
 template, the slot-register fields. The instruction count excludes a
-trailing `b toi_continue`, which the JIT trims when the next piece follows.
+trailing `b cloison_continue`, which the JIT trims when the next piece follows.
 """
 import glob, os, re, subprocess, sys
 
@@ -17,7 +17,7 @@ target = ""
 if args and args[0] == "--target":
     target = args[1]; args = args[2:]
 root = os.path.join(os.path.dirname(__file__), "..", "target", target, "release", "build")
-paths = glob.glob(os.path.join(root, "toi-*", "out", "stencils.rs")) + glob.glob(os.path.join(root, "toi", "*", "out", "stencils.rs"))
+paths = glob.glob(os.path.join(root, "cloison-*", "out", "stencils.rs")) + glob.glob(os.path.join(root, "cloison", "*", "out", "stencils.rs"))
 path = max(paths, key=os.path.getmtime)
 arch = "aarch64" if ("aarch64" in target or (not target and os.uname().machine in ("arm64", "aarch64"))) else "x86_64"
 src = open(path).read()

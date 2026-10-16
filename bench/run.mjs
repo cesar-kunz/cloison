@@ -8,7 +8,7 @@
 //   --reps N            runs per file for --time (default 11)
 //   --features a,b,...  only files whose features are all in this list
 //   --engine CMD        run `CMD file` instead of Node; its stdout must print
-//                       the completion value (e.g. --engine "target/release/toi")
+//                       the completion value (e.g. --engine "target/release/cloison")
 //
 // Files may also be bytecode listings (`bench/bytecode/*.asm`, needs
 // --engine); their headers come from the benchmark of the same name in

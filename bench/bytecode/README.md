@@ -1,21 +1,21 @@
 # Expected bytecode
 
 Hand-written bytecode for some of the [microbenchmarks](../micro/), in
-toi's text assembly format (see [src/asm.rs](../../src/asm.rs)). Each
+cloison's text assembly format (see [src/asm.rs](../../src/asm.rs)). Each
 listing is what a straightforward JS-to-bytecode compiler should emit for
 the benchmark of the same name: no escape analysis, no inlining, no type
-specialization. They are the reference for toi's front end
+specialization. They are the reference for cloison's front end
 ([src/js/](../../src/js/)): `tests/js.rs` checks that it compiles
 `micro/N.js` to exactly `N.asm`, so a change to the code generator shows up
 as a change to a listing, with comments saying why.
 
 `tests/bench_bytecode.rs` runs every listing and checks the result against
-its benchmark's `// expect:` line. `toi --dump FILE.js` prints what a script
+its benchmark's `// expect:` line. `cloison --dump FILE.js` prints what a script
 compiles to, in this format. `run.mjs` takes listings too:
 
 ```sh
 cargo build --release
-node bench/run.mjs --engine target/release/toi --time bench/bytecode/*.asm
+node bench/run.mjs --engine target/release/cloison --time bench/bytecode/*.asm
 ```
 
 | listing | benchmark | exercises |

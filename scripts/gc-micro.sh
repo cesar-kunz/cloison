@@ -5,21 +5,21 @@
 #
 #   scripts/gc-micro.sh                    # every file
 #   scripts/gc-micro.sh bench/gc/cards.js  # only these
-#   TOI=path/to/toi scripts/gc-micro.sh    # another build
+#   CLOISON=path/to/cloison scripts/gc-micro.sh    # another build
 set -uo pipefail
 cd "$(dirname "$0")/.."
-toi=${TOI:-target/release/toi}
+cloison=${CLOISON:-target/release/cloison}
 files=("$@")
 [ $# -gt 0 ] || files=(bench/gc/*.js)
 printf '%-16s %7s %6s %6s %6s %13s %13s  %s\n' file seconds MB live gc% "minors (max)" "majors (max)" result
 for f in "${files[@]}"; do
   out=$(mktemp)
   if [ "$(uname)" = Darwin ]; then
-    TOI_GC_STATS=1 /usr/bin/time -l "$toi" "$f" > "$out.stdout" 2> "$out"
+    CLOISON_GC_STATS=1 /usr/bin/time -l "$cloison" "$f" > "$out.stdout" 2> "$out"
     kb=$(awk '/maximum resident set size/ {print int($1 / 1024)}' "$out")
     s=$(awk '/ real / {print $1}' "$out")
   else
-    TOI_GC_STATS=1 /usr/bin/time -f 'time %e %M' "$toi" "$f" > "$out.stdout" 2> "$out"
+    CLOISON_GC_STATS=1 /usr/bin/time -f 'time %e %M' "$cloison" "$f" > "$out.stdout" 2> "$out"
     read -r _ s kb < <(grep '^time ' "$out" | tail -n 1)
   fi
   want=$(sed -n 's|^// expect: ||p' "$f")

@@ -1,5 +1,5 @@
 // Checks in hot code whose failure throws; they never fail.
-// toi: `throw` must compile even where it never runs (DeltaBlue's harness throws from `alert`).
+// cloison: `throw` must compile even where it never runs (DeltaBlue's harness throws from `alert`).
 // features: loop, string, call, object, new, proto, throw
 // expect: 512370976
 function fail(what) { throw "check failed: " + what; }

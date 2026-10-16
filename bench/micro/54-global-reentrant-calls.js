@@ -1,5 +1,5 @@
 // Methods passing `this` to a method of a global object, which calls back into them, and they call the global again.
-// toi: the global is reassigned per phase, each time to a new object of the same shape.
+// cloison: the global is reassigned per phase, each time to a new object of the same shape.
 // features: loop, call, object, new, proto, global, null
 // expect: 37050000
 var hub = null;

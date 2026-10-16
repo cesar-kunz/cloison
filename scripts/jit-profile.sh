@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Profile a bytecode listing and show where compiled code spends its cycles,
 # per stencil piece, in layout order (the JIT names each piece in a perf map
-# with `TOI_PERF_MAP`). Without precise sampling a stall is often counted on
+# with `CLOISON_PERF_MAP`). Without precise sampling a stall is often counted on
 # the piece after it.
 #
 #   scripts/jit-profile.sh bench/bytecode/21-monomorphic-get.asm
@@ -12,12 +12,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 listing=${1:?listing}
-cargo build --release --quiet --bin toi
+cargo build --release --quiet --bin cloison
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
-TOI_PERF_MAP=1 perf record -q -e cycles:u -F "${FREQ:-20000}" -o "$dir/perf.data" \
-  target/release/toi "$listing" >/dev/null
-# The map is named after toi's pid: the newest one.
+CLOISON_PERF_MAP=1 perf record -q -e cycles:u -F "${FREQ:-20000}" -o "$dir/perf.data" \
+  target/release/cloison "$listing" >/dev/null
+# The map is named after cloison's pid: the newest one.
 map=$(ls -t /tmp/perf-*.map 2>/dev/null | head -1)
 [[ -n $map ]] || { echo "no perf map written" >&2; exit 1; }
 perf script -i "$dir/perf.data" -F ip 2>/dev/null >"$dir/ips"

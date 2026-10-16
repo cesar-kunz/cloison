@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# What each Octane benchmark costs besides its score: in toi, the bytecode
+# What each Octane benchmark costs besides its score: in cloison, the bytecode
 # loaded, the machine code the JIT generated, compilations and their time,
-# the run's time and peak RSS (`TOI_SIZES`); the same where other engines
+# the run's time and peak RSS (`CLOISON_SIZES`); the same where other engines
 # tell it: V8 (Node 26) the bytecode and code it holds at the end, Node's
 # own subtracted, and its Maglev and Turbofan compile times
 # (`--trace-opt`, which leaves Sparkplug out); JavaScriptCore its total
@@ -10,11 +10,11 @@
 #
 #   scripts/octane-sizes.sh                  # every benchmark
 #   scripts/octane-sizes.sh zlib typescript  # only these
-#   scripts/octane-sizes.sh --record         # also append toi's to bench/octane-sizes.tsv
+#   scripts/octane-sizes.sh --record         # also append cloison's to bench/octane-sizes.tsv
 #
 # Each runs the deterministic `-run.js` once (sizes don't vary, times do:
 # REPS=n takes medians), JOBS (default 8) at a time. Tables go to
-# perf-history/octane-sizes-<commit>.md (and .tsv). With --record, toi's
+# perf-history/octane-sizes-<commit>.md (and .tsv). With --record, cloison's
 # values are appended to bench/octane-sizes.tsv (`commit<TAB>bench<TAB>
 # metric<TAB>value`, `runtime` for the binary) and compared with the last
 # commit recorded there.
@@ -22,10 +22,10 @@
 # Engines: $NODE, else the Node 26 scripts/tiers.sh downloads; the others
 # from ~/.jsvu (`npx jsvu --os=linux64
 # --engines=javascriptcore,spidermonkey,quickjs`), left out if missing.
-# Only toi runs every time: the other engines' values are kept in
+# Only cloison runs every time: the other engines' values are kept in
 # bench/octane-sizes-engines.tsv by engine version, and measured
 # only when missing (a new version, a new benchmark) or with ENGINES=1.
-# OTHERS=0 leaves out all but toi and V8.
+# OTHERS=0 leaves out all but cloison and V8.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 record=false
@@ -36,9 +36,9 @@ fi
 order="richards deltablue crypto raytrace earley-boyer regexp splay
   navier-stokes pdfjs mandreel gbemu code-load box2d zlib typescript"
 [[ $# -gt 0 ]] && order="$*"
-NODE=${NODE:-$(ls -d ~/.local/share/toi-v8/node-*/bin/node 2>/dev/null | tail -1)}
+NODE=${NODE:-$(ls -d ~/.local/share/cloison-v8/node-*/bin/node 2>/dev/null | tail -1)}
 [[ -x $NODE ]] || { echo "no Node 26: run scripts/tiers.sh once, or set NODE" >&2; exit 1; }
-cargo build --release --quiet --bin toi
+cargo build --release --quiet --bin cloison
 # The `-run.js` scripts.
 scripts/octane.sh $order >/dev/null
 commit=$(git rev-parse --short HEAD)
@@ -57,7 +57,7 @@ except OSError:
     jsvu_versions = {}
 
 def wrapper(engine, path):
-    """A script printing `path`'s completion value, as toi does."""
+    """A script printing `path`'s completion value, as cloison does."""
     w = os.path.join(tmp, f"{engine}-{os.path.basename(path)}")
     if engine == "quickjs":
         w += ".mjs"
@@ -70,7 +70,7 @@ def wrapper(engine, path):
     return w
 
 engines = {
-    "toi": lambda f: (["target/release/toi", f], {"TOI_SIZES": "1"}),
+    "cloison": lambda f: (["target/release/cloison", f], {"CLOISON_SIZES": "1"}),
     "V8": lambda f: ([node, "--trace-opt", "scripts/v8sizes.js", f], {}),
 }
 if others == "1":
@@ -87,11 +87,11 @@ def run(job):
     r = subprocess.run(["/usr/bin/time", "-o", timing, "-f", "%e %M"] + argv, capture_output=True,
                        text=True, env={**os.environ, **env}, timeout=1800)
     wall, rss = open(timing).read().split()[-2:]
-    # (The result is the last line toi prints; JSC's compile times follow it.)
+    # (The result is the last line cloison prints; JSC's compile times follow it.)
     ok = any(l.strip() in ("1001", "1002") for l in r.stdout.splitlines())
     m = {"s": float(wall), "rss_mb": int(rss) / 1024, "ok": ok or b == "<empty>"}
     err = r.stderr
-    if e == "toi":
+    if e == "cloison":
         for k, v in re.findall(r"(\w+)=([\d.]+)", err.split("sizes ", 1)[-1].splitlines()[0] if "sizes " in err else ""):
             m[k] = float(v)
     elif e == "V8":
@@ -110,7 +110,7 @@ def version(e):
     if e == "V8":
         return subprocess.run([node, "-p", "process.versions.v8"], capture_output=True, text=True).stdout.strip()
     return jsvu_versions.get(e, "?")
-versions = {e: version(e) for e in engines if e != "toi"}
+versions = {e: version(e) for e in engines if e != "cloison"}
 
 # The other engines' values measured before, by engine version.
 cache_path = "bench/octane-sizes-engines.tsv"
@@ -127,13 +127,13 @@ for (e, b), m in cache.items():
 
 open(os.path.join(tmp, "empty.js"), "w").write("0\n")
 work = [(e, b) for b in benches + ["<empty>"] for e in engines
-        if (e == "toi" and b != "<empty>") or (e == "V8" and b == "<empty>" and (e, b) not in results)
-        or (e != "toi" and b != "<empty>" and (e, b) not in results)]
+        if (e == "cloison" and b != "<empty>") or (e == "V8" and b == "<empty>" and (e, b) not in results)
+        or (e != "cloison" and b != "<empty>" and (e, b) not in results)]
 work = [j for j in work for _ in range(reps)]
 measured = set()
 with cf.ThreadPoolExecutor(jobs) as ex:
     for n, (job, m) in enumerate(ex.map(run, work), 1):
-        if job[0] != "toi" and job not in measured:
+        if job[0] != "cloison" and job not in measured:
             measured.add(job)
             results[job] = []
         results.setdefault(job, []).append(m)
@@ -172,15 +172,15 @@ for (e, b), ms in results.items():
 base_bc, base_code = val("V8", "<empty>", "v8_bytecode"), val("V8", "<empty>", "v8_code")
 kb = lambda v: None if v is None else v / 1024
 cols = [
-    ("toi functions", lambda b: val("toi", b, "functions")),
-    ("toi bytecode KB", lambda b: kb(val("toi", b, "bytecode"))),
-    ("toi code KB (hot)", lambda b: kb(val("toi", b, "jit_hot"))),
-    ("toi code KB", lambda b: kb(val("toi", b, "jit_total"))),
-    ("toi compiles", lambda b: val("toi", b, "compiles")),
-    ("toi compile ms", lambda b: val("toi", b, "compile_ms")),
-    ("toi lower ms", lambda b: val("toi", b, "lower_ms")),
-    ("toi s", lambda b: val("toi", b, "s")),
-    ("toi RSS MB", lambda b: val("toi", b, "rss_mb")),
+    ("cloison functions", lambda b: val("cloison", b, "functions")),
+    ("cloison bytecode KB", lambda b: kb(val("cloison", b, "bytecode"))),
+    ("cloison code KB (hot)", lambda b: kb(val("cloison", b, "jit_hot"))),
+    ("cloison code KB", lambda b: kb(val("cloison", b, "jit_total"))),
+    ("cloison compiles", lambda b: val("cloison", b, "compiles")),
+    ("cloison compile ms", lambda b: val("cloison", b, "compile_ms")),
+    ("cloison lower ms", lambda b: val("cloison", b, "lower_ms")),
+    ("cloison s", lambda b: val("cloison", b, "s")),
+    ("cloison RSS MB", lambda b: val("cloison", b, "rss_mb")),
     ("V8 bytecode KB", lambda b: kb(None if val("V8", b, "v8_bytecode") is None else val("V8", b, "v8_bytecode") - base_bc)),
     ("V8 code KB", lambda b: kb(None if val("V8", b, "v8_code") is None else val("V8", b, "v8_code") - base_code)),
     ("V8 opt compiles", lambda b: val("V8", b, "opt_compiles")),
@@ -191,15 +191,15 @@ cols = [
 def ratio(a, b):
     return None if a is None or not b else a / b
 cols += [
-    ("toi/V8 code", lambda b: ratio(val("toi", b, "jit_total"), None if val("V8", b, "v8_code") is None else val("V8", b, "v8_code") - base_code)),
-    ("toi/V8 bytecode", lambda b: ratio(val("toi", b, "bytecode"), None if val("V8", b, "v8_bytecode") is None else val("V8", b, "v8_bytecode") - base_bc)),
-    ("toi/V8 compile ms", lambda b: ratio(val("toi", b, "compile_ms"), val("V8", b, "opt_ms"))),
-    ("toi/V8 s", lambda b: ratio(val("toi", b, "s"), val("V8", b, "s"))),
-    ("toi/V8 RSS", lambda b: ratio(val("toi", b, "rss_mb"), val("V8", b, "rss_mb"))),
+    ("cloison/V8 code", lambda b: ratio(val("cloison", b, "jit_total"), None if val("V8", b, "v8_code") is None else val("V8", b, "v8_code") - base_code)),
+    ("cloison/V8 bytecode", lambda b: ratio(val("cloison", b, "bytecode"), None if val("V8", b, "v8_bytecode") is None else val("V8", b, "v8_bytecode") - base_bc)),
+    ("cloison/V8 compile ms", lambda b: ratio(val("cloison", b, "compile_ms"), val("V8", b, "opt_ms"))),
+    ("cloison/V8 s", lambda b: ratio(val("cloison", b, "s"), val("V8", b, "s"))),
+    ("cloison/V8 RSS", lambda b: ratio(val("cloison", b, "rss_mb"), val("V8", b, "rss_mb"))),
 ]
 if "javascriptcore" in engines:
-    cols += [("toi/JSC compile ms", lambda b: ratio(val("toi", b, "compile_ms"), val("javascriptcore", b, "compile_ms"))),
-             ("toi/JSC s", lambda b: ratio(val("toi", b, "s"), val("javascriptcore", b, "s")))]
+    cols += [("cloison/JSC compile ms", lambda b: ratio(val("cloison", b, "compile_ms"), val("javascriptcore", b, "compile_ms"))),
+             ("cloison/JSC s", lambda b: ratio(val("cloison", b, "s"), val("javascriptcore", b, "s")))]
 if "javascriptcore" in engines:
     cols += [("JSC compile ms", lambda b: val("javascriptcore", b, "compile_ms")),
              ("JSC s", lambda b: val("javascriptcore", b, "s")),
@@ -227,7 +227,7 @@ def binaries(e):
     d = os.path.expanduser(f"~/.jsvu/engines/{e}")
     files = [os.path.join(d, f) for f in os.listdir(d)] + [os.path.join(d, "lib", f) for f in os.listdir(os.path.join(d, "lib"))] if os.path.isdir(os.path.join(d, "lib")) else [os.path.join(d, f) for f in os.listdir(d)]
     return [f for f in files if os.path.isfile(f) and open(f, "rb").read(4) == b"\x7fELF"]
-runtimes = [("toi", ["target/release/toi"]), ("V8 (node)", [os.path.realpath(node)])]
+runtimes = [("cloison", ["target/release/cloison"]), ("V8 (node)", [os.path.realpath(node)])]
 runtimes += [(names[e], binaries(e)) for e in engines if e in names]
 runtime_text = [(n, text(p)) for n, p in runtimes]
 
@@ -238,13 +238,13 @@ with open(out + ".tsv", "w") as f:
     for b in benches:
         f.write(b + "\t" + "\t".join("-" if (v := c[1](b)) is None else f"{v:.6g}" for c in cols) + "\n")
 others_desc = ", ".join(f"{names[e]} {versions[e]}" for e in engines if e in names) or "no other engines"
-lines = [f"Octane sizes and compile costs: toi {commit}, V8 {v8} (live at the end, Node's own subtracted; "
+lines = [f"Octane sizes and compile costs: cloison {commit}, V8 {v8} (live at the end, Node's own subtracted; "
          f"opt: Maglev and Turbofan, prepare+execute+finalize), {others_desc} (other engines' values "
          f"cached by version in {cache_path}). "
          f"Deterministic `-run.js` runs, median of {reps}.", ""]
-for title, group in [("toi", [c for c in cols if c[0].startswith("toi ")]),
-                     ("toi against V8 and JSC (ratios; below 1: toi uses less)", [c for c in cols if c[0].startswith("toi/")]),
-                     ("other engines", [c for c in cols if not c[0].startswith("toi")])]:
+for title, group in [("cloison", [c for c in cols if c[0].startswith("cloison ")]),
+                     ("cloison against V8 and JSC (ratios; below 1: cloison uses less)", [c for c in cols if c[0].startswith("cloison/")]),
+                     ("other engines", [c for c in cols if not c[0].startswith("cloison")])]:
     lines += [f"**{title}**", "", "| benchmark | " + " | ".join(c[0] for c in group) + " |",
               "|---|" + "---:|" * len(group)]
     for b in benches:
@@ -264,7 +264,7 @@ if record:
         if r[0] == prev:
             last[(r[1], r[2])] = float(r[3])
     keys = ["functions", "bytecode", "jit_hot", "jit_total", "compiles", "compile_ms"]
-    new = [(b, k, val("toi", b, k)) for b in benches for k in keys if val("toi", b, k) is not None]
+    new = [(b, k, val("cloison", b, k)) for b in benches for k in keys if val("cloison", b, k) is not None]
     new += [("runtime", "text", runtime_text[0][1])]
     with open(path, "a") as f:
         if not rows:

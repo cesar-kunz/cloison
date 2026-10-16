@@ -1,6 +1,6 @@
 # Benchmarks
 
-Small JS programs for validating and benchmarking toi's JS-to-bytecode
+Small JS programs for validating and benchmarking cloison's JS-to-bytecode
 compiler, interpreter and JIT.
 
 ## `micro/`: one pattern per file
@@ -14,7 +14,7 @@ object model, and the allocation and escape behaviour discussed in
 - **A plain script, with no host calls**: no `console`, no `print`, no
   `alert`. The result is the script's **completion value**, the value of its
   last expression statement (`main();`). That's standard JS: Node returns it
-  from `vm.runInNewContext`, and toi returns it from running a script.
+  from `vm.runInNewContext`, and cloison returns it from running a script.
 - **The result is a number**, a checksum of the work, so a wrong
   optimization changes it.
 - **Hot code lives in functions.** Files that test globals
@@ -25,7 +25,7 @@ object model, and the allocation and escape behaviour discussed in
 
   ```js
   // <what it does>
-  // toi: <what it tests in toi's object model> (some files)
+  // cloison: <what it tests in cloison's object model> (some files)
   // features: loop, call, object, ...
   // expect: 12345
   ```
@@ -45,10 +45,10 @@ node bench/run.mjs                        # check every file against `expect`
 node bench/run.mjs --time --reps 21       # plus median time per file
 node bench/run.mjs --features loop,call   # only files needing just these
 node bench/run.mjs --update               # rewrite `expect` from Node (the reference)
-node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
+node bench/run.mjs --engine "target/release/cloison" bench/micro/0*.js
 ```
 
-- `--engine CMD` runs `CMD file` and compares the number it prints. toi's
+- `--engine CMD` runs `CMD file` and compares the number it prints. cloison's
   driver should accept either a `.js` file (parsed and compiled to bytecode
   on the fly) or a bytecode file from the bytecode compiler, so both paths
   are checked against the same expectations: compile each file ahead of time
@@ -65,33 +65,33 @@ node bench/run.mjs --engine "target/release/toi" bench/micro/0*.js
   the last record. Speed comes first, but size is tracked: a small
   speedup for a large size increase is worth reconsidering.
 
-- `scripts/tiers.sh` times every file in toi's interpreter, toi with
+- `scripts/tiers.sh` times every file in cloison's interpreter, cloison with
   the JIT, and V8 capped at each of its tiers (Ignition, Sparkplug,
   Maglev, Turbofan), as a table in `perf-history/tiers-<commit>.md`,
   timing both inside the process, startup excluded.
   V8's times are cached by host, V8 version and file contents, so only new
   or changed files are measured again.
 
-- `scripts/vs-maglev.sh` compares the machine code toi's JIT generates
+- `scripts/vs-maglev.sh` compares the machine code cloison's JIT generates
   for each file with V8's Maglev's (`--max-opt=2`), function by function
-  (final code: the last compile of each entry), to find where toi's code
+  (final code: the last compile of each entry), to find where cloison's code
   is larger than it needs to be; `--asm FILE FN` prints both
   disassemblies of one function. Maglev's sizes are cached by Node
   version and file contents. Functions are matched by name and source
-  position (`name:line:col`, which `TOI_JIT_LOG` prints). `--pieces`
-  breaks toi's final code down per stencil family and per task of
+  position (`name:line:col`, which `CLOISON_JIT_LOG` prints). `--pieces`
+  breaks cloison's final code down per stencil family and per task of
   [docs/maglev-size-tasks.md](../docs/maglev-size-tasks.md);
   `--pieces --record` appends the task totals to
   [maglev-tasks.tsv](maglev-tasks.tsv), by commit, and every run shows the
   change since the last record.
 
 - `scripts/jit-profile.sh <listing>` profiles where compiled code spends
-  its cycles, per stencil piece (`TOI_PERF_MAP=1` makes the JIT name
+  its cycles, per stencil piece (`CLOISON_PERF_MAP=1` makes the JIT name
   every piece in `/tmp/perf-<pid>.map`, which `perf report` reads too).
 
 - Hand-written bytecode for some of these files is in
   [bytecode/](bytecode/), with the conventions a compiler should follow.
-  toi runs it already (`--engine target/release/toi bench/bytecode/*.asm`).
+  cloison runs it already (`--engine target/release/cloison bench/bytecode/*.asm`).
 
 ### Files
 
@@ -240,7 +240,7 @@ Groups:
 - **9x, calls into compiled code**: recursion (self, mutual, tail),
   constructors called in a loop, a native method next to one.
 - **10x–13x, other engines' patterns**: kernels in the style of the rest
-  of Octane and of common JS, mostly to compare toi's code with Maglev's
+  of Octane and of common JS, mostly to compare cloison's code with Maglev's
   (`scripts/vs-maglev.sh`): bit operations, doubles past int32, `Math`,
   typed arrays, string scanning and `switch`, `typeof`, `instanceof`,
   closures and callbacks, `arguments`, object and array literals, arrays
@@ -257,7 +257,7 @@ Each file reproduces something the collector still does badly (see the
 end of step 6 in [docs/gc.md](../docs/gc.md)), with the same
 conventions as `micro/` plus a `// gc:` line on what it shows. A
 seeded Park-Miller generator (exact in doubles) picks the random
-positions. `scripts/gc-micro.sh` runs them under `TOI_GC_STATS` and
+positions. `scripts/gc-micro.sh` runs them under `CLOISON_GC_STATS` and
 prints wall time, peak RSS, the live size full collections found,
 collecting's share of the time, and the longest minor and major pauses.
 

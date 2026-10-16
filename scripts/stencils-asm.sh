@@ -16,5 +16,5 @@ case "${1:-x86_64}" in
 esac
 cargo build --release --quiet --lib --target "$triple"
 dir=target/$triple/release
-obj=$(ls -t "$dir"/build/toi/*/out/stencils.o | head -1)
-"${objdump[@]}" -dr --no-show-raw-insn "$obj" | awk '/^[0-9a-f]+ <toi_stencil_/ {p = 1} /^$/ {if (p) print ""; p = 0} p'
+obj=$(ls -t "$dir"/build/cloison/*/out/stencils.o | head -1)
+"${objdump[@]}" -dr --no-show-raw-insn "$obj" | awk '/^[0-9a-f]+ <cloison_stencil_/ {p = 1} /^$/ {if (p) print ""; p = 0} p'

@@ -1,13 +1,25 @@
-# toi
+# cloison
 
 A JavaScript engine in Rust: a front end for ES5 and much of ES2015, a register bytecode
 interpreter, and a copy-and-patch JIT for x86-64 and arm64 (Linux, and macOS on Apple silicon) that
 grows into a mid-tier optimizing compiler without an IR beyond bytecode.
 
+The whole engine is small: a 3 MB binary with 1.7 MB of machine code,
+against 21 MB of code in a release build of V8's `d8` shell (12.8, arm64).
+Yet on several Octane benchmarks it comes close to V8 14.6 capped at its
+Maglev tier: Richards at 0.87 of Maglev's score, DeltaBlue at 0.81, Crypto
+at 0.66 and NavierStokes at 0.57 (geomean 0.32 over all of Octane; see
+[Results](#results)).
+
+The name: in cloisonné enamel, *cloisons* are thin metal walls that
+make fixed cells, which are then filled with enamel. The JIT's stencils
+are the same idea, fixed machine code with holes filled in for each
+instruction.
+
 ```sh
 cargo build --release
-target/release/toi bench/micro/87-constraint-solver.js   # prints the completion value
-target/release/toi --dump file.js                         # the bytecode instead
+target/release/cloison bench/micro/87-constraint-solver.js   # prints the completion value
+target/release/cloison --dump file.js                         # the bytecode instead
 ```
 
 Status (2026-10-14): every Octane benchmark runs, with a generational
@@ -112,7 +124,7 @@ heap sandboxing and defers it.
 test262 at 19957f8, every test under `built-ins`, `language` and
 `annexB` (not `intl402` or `staging`), run as its `INTERPRETING.md`
 says: in both strict and sloppy mode unless flagged, negative tests in
-their phase, async tests to completion; module tests fail, as toi has no
+their phase, async tests to completion; module tests fail, as cloison has no
 modules. A test counts toward the latest edition of its features; an
 untagged test counts as ES5 (`scripts/test262-editions.py`):
 
@@ -142,11 +154,11 @@ and early errors for invalid syntax that the parser accepts.
 
 ## Results
 
-Octane scores at c842d29 on an Apple silicon Mac, toi's JIT against V8 14.6
+Octane scores at c842d29 on an Apple silicon Mac, cloison's JIT against V8 14.6
 capped at Sparkplug, at Maglev, and with all tiers (higher is better;
 from `perf-history/octane-engines.sh`):
 
-| benchmark | V8 | V8 Maglev | toi | V8 Sparkplug |
+| benchmark | V8 | V8 Maglev | cloison | V8 Sparkplug |
 |---|---:|---:|---:|---:|
 | Richards | 51,460 | 37,357 | 32,393 | 2,877 |
 | DeltaBlue | 133,129 | 58,951 | 47,850 | 3,190 |
@@ -166,15 +178,15 @@ from `perf-history/octane-engines.sh`):
 | **geomean** | **88,060** | **67,804** | **22,033** | **11,951** |
 
 V8 runs zlib (asm.js) through its wasm pipeline, and compiles the
-functions of CodeLoad's `eval`s when they are first called; toi compiles
+functions of CodeLoad's `eval`s when they are first called; cloison compiles
 every function of every `eval` up front.
 
 Against other engines and V8's tiers, on an Apple silicon Mac at c842d29
 (higher is better; single runs from `perf-history/octane-engines.sh`,
-toi's JIT against V8 14.6 capped at each tier and with all of them, the
+cloison's JIT against V8 14.6 capped at each tier and with all of them, the
 macOS 27 JavaScriptCore, SpiderMonkey 140 and QuickJS 2026-06-04):
 
-| benchmark | JSC | V8 | V8 Maglev | SpiderMonkey | toi | V8 Sparkplug | V8 Ignition | QuickJS | toi / Maglev |
+| benchmark | JSC | V8 | V8 Maglev | SpiderMonkey | cloison | V8 Sparkplug | V8 Ignition | QuickJS | cloison / Maglev |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | Richards | 49,006 | 51,460 | 37,357 | 15,025 | 32,393 | 2,877 | 1,675 | 1,298 | 0.87 |
 | DeltaBlue | 82,912 | 133,129 | 58,951 | 17,118 | 47,850 | 3,190 | 1,584 | 1,379 | 0.81 |
@@ -211,36 +223,36 @@ fail when a specific conversion or undo piece is removed.
 
 ```sh
 cargo test --release
-node bench/run.mjs --engine target/release/toi        # every micro against `expect`
+node bench/run.mjs --engine target/release/cloison        # every micro against `expect`
 cargo test --target aarch64-unknown-linux-musl         # arm64 under qemu-aarch64
 ```
 
 Scripts in `scripts/`: `stencil-listing.py` lists every stencil as the
 JIT emits it, with instruction counts (`docs/arm64-targets.md` holds
-them against handwritten arm64 code); `tiers.sh` times every micro in toi and in V8
+them against handwritten arm64 code); `tiers.sh` times every micro in cloison and in V8
 capped at each tier; `octane.sh` runs Octane (`SCORE=1` for scores);
 `perf.sh --ab` compares two builds; `jit-asm.sh` and `stencils-asm.sh`
 disassemble generated code and stencils; `sizes.sh --record` appends
 sizes; `octane-sizes.sh` reports per Octane benchmark the bytecode, the
-machine code and the compile time toi spends, against V8, JavaScriptCore,
+machine code and the compile time cloison spends, against V8, JavaScriptCore,
 SpiderMonkey and QuickJS (installed with `jsvu`, measured once per
 version: `bench/octane-sizes-engines.tsv`), with each engine's runtime
-size; `--record` appends toi's to `bench/octane-sizes.tsv`.
+size; `--record` appends cloison's to `bench/octane-sizes.tsv`.
 
-Environment flags: `TOI_NO_JIT`, `TOI_TIER=<back edges>`, `TOI_TIME`,
-`TOI_JIT_TIME`, `TOI_SIZES` (functions, bytecode, machine code and
-compile time over the run), `TOI_EXITS` (exits, entries and runtime calls by count),
-`TOI_JIT_DUMP`, `TOI_JIT_LOG`, `TOI_PERF_MAP` (names JIT code for `perf`),
-`TOI_NO_QUICKEN`, `TOI_COUNT`, `TOI_CODE_SHIFT`; for the collector,
-`TOI_GC_STATS` (each collection), `TOI_GC_NURSERY` (MiB),
-`TOI_HEAP_LIMIT` (MiB), `TOI_GC_VERIFY=<KiB>` (collect that often,
-checking references and poisoning what is freed), `TOI_GC_STRESS`
-(collect at every safepoint), `TOI_GC_FULL` (every collection full),
-`TOI_GC_STW` (full collections stop the world, no marker thread),
-`TOI_GC_CYCLES` (major cycles back to back),
-`TOI_GC_THREADS` (threads a pause scans cards and traces with; 1 for none),
-`TOI_GC_CHECK_BARRIER` (find missed barriers), `TOI_HEAP_HIST` (cells by
-kind and size), `TOI_SEGV` (a backtrace on a crash). `gc-bench.sh` times
+Environment flags: `CLOISON_NO_JIT`, `CLOISON_TIER=<back edges>`, `CLOISON_TIME`,
+`CLOISON_JIT_TIME`, `CLOISON_SIZES` (functions, bytecode, machine code and
+compile time over the run), `CLOISON_EXITS` (exits, entries and runtime calls by count),
+`CLOISON_JIT_DUMP`, `CLOISON_JIT_LOG`, `CLOISON_PERF_MAP` (names JIT code for `perf`),
+`CLOISON_NO_QUICKEN`, `CLOISON_COUNT`, `CLOISON_CODE_SHIFT`; for the collector,
+`CLOISON_GC_STATS` (each collection), `CLOISON_GC_NURSERY` (MiB),
+`CLOISON_HEAP_LIMIT` (MiB), `CLOISON_GC_VERIFY=<KiB>` (collect that often,
+checking references and poisoning what is freed), `CLOISON_GC_STRESS`
+(collect at every safepoint), `CLOISON_GC_FULL` (every collection full),
+`CLOISON_GC_STW` (full collections stop the world, no marker thread),
+`CLOISON_GC_CYCLES` (major cycles back to back),
+`CLOISON_GC_THREADS` (threads a pause scans cards and traces with; 1 for none),
+`CLOISON_GC_CHECK_BARRIER` (find missed barriers), `CLOISON_HEAP_HIST` (cells by
+kind and size), `CLOISON_SEGV` (a backtrace on a crash). `gc-bench.sh` times
 Octane's deterministic runs with their peak RSS. `gc-micro.sh` runs
 the collector's microbenchmarks in `bench/gc/`, which reproduce what it
 still does badly.
@@ -272,7 +284,7 @@ rewrites branches in it, the stencil pipeline depends on LLVM's codegen
 choices. A nightly bump can change stencil shapes; the
 `every_stencil_instance_matches_its_compiled_bytes` test and
 `scripts/stencils-asm.sh` are the checks, and the generated
-`stencils.rs` (in `target/*/build/toi-*/out/`) can be diffed between
+`stencils.rs` (in `target/*/build/cloison-*/out/`) can be diffed between
 targets.
 
 ## Where it falls short

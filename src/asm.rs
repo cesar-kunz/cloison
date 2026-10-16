@@ -61,7 +61,7 @@ pub struct FunctionDef {
     /// Strict mode code: `this` is passed as is (see `ast::Function::strict`).
     pub strict: bool,
     /// Where it starts in its source (its parameter list's `(`), 1-based
-    /// line and column, for `TOI_JIT_LOG` and `TOI_JIT_DUMP_FN`: (0, 0)
+    /// line and column, for `CLOISON_JIT_LOG` and `CLOISON_JIT_DUMP_FN`: (0, 0)
     /// if unknown or neither is set (see `codegen::positions`).
     pub line: u32,
     pub col: u32,

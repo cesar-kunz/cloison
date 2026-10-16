@@ -3665,7 +3665,7 @@ pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Optio
 
 /// The `this` a bytecode function gets for receiver `this`: the global
 /// object for `undefined` or `null`, a wrapper object for another
-/// primitive (sloppy mode; toi has no strict mode).
+/// primitive (sloppy mode; cloison has no strict mode).
 pub(crate) unsafe fn sloppy_this(vm: *mut Vm, this: Value) -> Value {
     if this.is_cell() && unsafe { (*as_object(this)).class } != Class::String {
         return this;

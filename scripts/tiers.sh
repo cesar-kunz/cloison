@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Time every script in bench/micro/ in each of toi's and V8's tiers: toi's
-# interpreter alone (TOI_NO_JIT) and with the JIT; V8 capped at each tier
+# Time every script in bench/micro/ in each of cloison's and V8's tiers: cloison's
+# interpreter alone (CLOISON_NO_JIT) and with the JIT; V8 capped at each tier
 # (`--max-opt`): Ignition (0), Sparkplug (1), Maglev (2), and everything
 # (Turbofan, V8's default). The table goes to perf-history/tiers-<commit>.md
 # (and .tsv), with geometric means at the bottom.
 #
-#   scripts/tiers.sh            # measure toi; V8 only where not cached
+#   scripts/tiers.sh            # measure cloison; V8 only where not cached
 #   scripts/tiers.sh --v8       # re-measure V8 too
 #
-# V8's times don't change with toi, so they're cached in
+# V8's times don't change with cloison, so they're cached in
 # perf-history/v8-tiers.tsv by host, Node version, tier, and the
 # benchmark's contents (`git hash-object`): a new or modified benchmark is
 # measured, the rest reused. Delete the cache (or pass --v8) after changing
@@ -16,9 +16,9 @@
 #
 # Both timed inside the process, from compile to completion, process
 # startup excluded (wall clock): V8 by perf-history/v8time.js (Node's
-# startup excluded), toi by its TOI_TIME (about 0.35 ms of startup
-# excluded; scripts/vs-v8.sh times toi's whole process). Medians of REPS
-# (toi, default 7) and V8REPS (default 11) runs, pinned to an idle core
+# startup excluded), cloison by its CLOISON_TIME (about 0.35 ms of startup
+# excluded; scripts/vs-v8.sh times cloison's whole process). Medians of REPS
+# (cloison, default 7) and V8REPS (default 11) runs, pinned to an idle core
 # (scripts/quiet.sh). Results are checked against `// expect:`.
 #
 # With Octane's base.js and deltablue.js in $OCTANE (default notes/deltablue,
@@ -27,10 +27,10 @@
 #
 # The machine's load average goes in the table's header, at the start and
 # the end of the run: V8's cached times may come from a quieter (or
-# busier) time than toi's.
+# busier) time than cloison's.
 #
 # Node: $NODE, else a Node 26 (V8 14.6) the script downloads to
-# ~/.local/share/toi-v8 (the system's Node may predate Maglev).
+# ~/.local/share/cloison-v8 (the system's Node may predate Maglev).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 reps=${REPS:-7}
@@ -42,7 +42,7 @@ mkdir -p "$hist"
 
 node_ver=v26.8.2
 if [[ -z ${NODE:-} ]]; then
-  dir=$HOME/.local/share/toi-v8
+  dir=$HOME/.local/share/cloison-v8
   NODE=$dir/node-$node_ver-linux-x64/bin/node
   if [[ ! -x $NODE ]]; then
     f=node-$node_ver-linux-x64.tar.xz
@@ -66,7 +66,7 @@ EOF
 [[ -f $cache ]] || printf 'host\tv8\ttier\tbench\tsha\tms\treps\n' >"$cache"
 [[ ${1:-} == --v8 ]] && remeasure=true || remeasure=false
 
-cargo build --release --quiet --bin toi
+cargo build --release --quiet --bin cloison
 commit=$(git rev-parse --short HEAD)
 git diff --quiet HEAD -- src stencils build.rs .cargo || commit="$commit+"
 
@@ -80,12 +80,12 @@ v8_ms() {
   done | awk -v w="$4" -v t="$1" -v f="$3" '$2 != w { print "V8 (" t ") gave " $2 " for " f > "/dev/stderr" } { print $1 }' | median
 }
 
-# toi_ms FILE CORE [ENV...]
-toi_ms() {
+# cloison_ms FILE CORE [ENV...]
+cloison_ms() {
   local f=$1 core=$2 i
   shift 2
   for i in $(seq "$reps"); do
-    env "$@" TOI_TIME=1 QUIET_CPU=${core%%,*} scripts/quiet.sh target/release/toi "$f" 2>&1 >/dev/null |
+    env "$@" CLOISON_TIME=1 QUIET_CPU=${core%%,*} scripts/quiet.sh target/release/cloison "$f" 2>&1 >/dev/null |
       sed -n 's/^time //p'
   done | median
 }
@@ -102,11 +102,11 @@ for f in bench/micro/*.js; do
   sha=$(git hash-object "$f")
   core=$(scripts/quiet.sh --core)
   row=()
-  for e in TOI_NO_JIT=1 ""; do
+  for e in CLOISON_NO_JIT=1 ""; do
     e=($e)
-    got=$(env "${e[@]}" target/release/toi "$f" 2>&1 || true)
-    if [[ $got == "$want" ]]; then row+=("$(toi_ms "$f" "$core" "${e[@]}")"); else
-      echo "toi (${e[*]:-JIT}) gave '$got' for $b, expected '$want'" >&2
+    got=$(env "${e[@]}" target/release/cloison "$f" 2>&1 || true)
+    if [[ $got == "$want" ]]; then row+=("$(cloison_ms "$f" "$core" "${e[@]}")"); else
+      echo "cloison (${e[*]:-JIT}) gave '$got' for $b, expected '$want'" >&2
       row+=(-)
     fi
   done
@@ -141,8 +141,8 @@ failed == "" ? score : failed;
 JS
   core=$(scripts/quiet.sh --core)
   {
-    QUIET_CPU=${core%%,*} TOI_NO_JIT=1 scripts/quiet.sh target/release/toi "$src"
-    QUIET_CPU=${core%%,*} scripts/quiet.sh target/release/toi "$src"
+    QUIET_CPU=${core%%,*} CLOISON_NO_JIT=1 scripts/quiet.sh target/release/cloison "$src"
+    QUIET_CPU=${core%%,*} scripts/quiet.sh target/release/cloison "$src"
     for t in "${tiers[@]}"; do
       taskset -c "$core" "$NODE" ${flags[$t]} -e \
         'console.log(require("vm").runInThisContext(require("fs").readFileSync(process.argv[1], "utf8")))' "$src"
@@ -156,10 +156,10 @@ import math, os, sys
 path, commit, v8, load, scores = sys.argv[1:]
 rows = [l.rstrip("\n").split("\t") for l in open(path)]
 head, rows = rows[0], rows[1:]
-names = ["toi interp", "toi JIT", "Ignition", "Sparkplug", "Maglev", "Turbofan"]
+names = ["cloison interp", "cloison JIT", "Ignition", "Sparkplug", "Maglev", "Turbofan"]
 fmt = lambda x: "-" if x is None else f"{x:.3g}" if x < 100 else f"{x:.0f}"
 val = lambda s: None if s == "-" else float(s)
-print(f"Time (ms, medians, compile to completion, process startup excluded) per benchmark: toi {commit}, V8 {v8} capped at each tier. Load average at the start and end: {load}.\n")
+print(f"Time (ms, medians, compile to completion, process startup excluded) per benchmark: cloison {commit}, V8 {v8} capped at each tier. Load average at the start and end: {load}.\n")
 print("| benchmark | " + " | ".join(names) + " |")
 print("|---|" + "---:|" * len(names))
 cols = [[] for _ in names]
@@ -173,10 +173,10 @@ ok = [i for i in range(len(rows)) if all(c[i] is not None for c in cols)]
 gm = [math.exp(sum(math.log(c[i]) for i in ok) / len(ok)) for c in cols]
 print(f"| **geomean** ({len(ok)}) | " + " | ".join(f"**{fmt(g)}**" for g in gm) + " |")
 print()
-for k, who in ((0, "toi interp"), (1, "toi JIT")):
+for k, who in ((0, "cloison interp"), (1, "cloison JIT")):
     print(f"{who} vs " + ", ".join(
         f"{names[j]} {gm[j] / gm[k]:.2f}x (faster on {sum(cols[k][i] < cols[j][i] for i in ok)})"
-        for j in range(2, 6)) + f" (of {len(ok)}; above 1x: toi faster)")
+        for j in range(2, 6)) + f" (of {len(ok)}; above 1x: cloison faster)")
 if os.path.exists(scores):
     s = open(scores).read().split("\t")
     print()

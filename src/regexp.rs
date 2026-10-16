@@ -1123,12 +1123,12 @@ struct Run {
     bt: Vec<usize>,
 }
 
-/// The exec at which a pattern is compiled to native code: `TOI_NO_JIT`
-/// or `TOI_NO_RX_JIT` set, never.
+/// The exec at which a pattern is compiled to native code: `CLOISON_NO_JIT`
+/// or `CLOISON_NO_RX_JIT` set, never.
 fn native_after() -> u32 {
     static AFTER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AFTER.get_or_init(|| {
-        if std::env::var_os("TOI_NO_JIT").is_some() || std::env::var_os("TOI_NO_RX_JIT").is_some() {
+        if std::env::var_os("CLOISON_NO_JIT").is_some() || std::env::var_os("CLOISON_NO_RX_JIT").is_some() {
             u32::MAX
         } else {
             NATIVE_AFTER

@@ -1,5 +1,5 @@
 // Internal objects passed as arguments to a method of a global object that never stores them.
-// toi: not an escape; the arguments fixed internal.
+// cloison: not an escape; the arguments fixed internal.
 // features: loop, call, object, new, proto, global
 // expect: 7050000
 function Service() { this.mark = 0; }

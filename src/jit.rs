@@ -36,8 +36,8 @@
 //! [      fall-through conversions, then (at its label) e.g. spills       ]
 //! [      before `return`, then the instruction's stencil                 ]
 //! [ cold: edge stubs, exit stubs (spill, then exit), `__slow` helpers    ]
-//! [ runtime-call wrappers: one per `toi_rt_*` referenced, saving the     ]
-//! [      slot registers this region uses (for `toi_rt_enter`, the call   ]
+//! [ runtime-call wrappers: one per `cloison_rt_*` referenced, saving the     ]
+//! [      slot registers this region uses (for `cloison_rt_enter`, the call   ]
 //! [      into compiled code itself, inline)                              ]
 //! ```
 //!
@@ -46,7 +46,7 @@
 //! fields, and [`Instance::copy_to`] writes the slot registers in while
 //! copying (see `compact_arm64` in `build.rs`).
 //!
-//! A stencil whose last instruction jumps to `toi_continue` falls through
+//! A stencil whose last instruction jumps to `cloison_continue` falls through
 //! into the next piece with that jump trimmed. Calls to runtime functions
 //! go to wrappers in JIT memory ([`arch::runtime_wrapper`]), so `rel32` /
 //! `CALL26` relocations only ever reach inside JIT memory. The wrappers save
@@ -125,7 +125,7 @@ pub(crate) enum Sym {
     Exit,
     /// The stencil's own `__slow` helper.
     Slow,
-    /// A runtime function, `toi_rt_*`: an index into `RT_NAMES`.
+    /// A runtime function, `cloison_rt_*`: an index into `RT_NAMES`.
     Rt(u8),
 }
 
@@ -295,7 +295,7 @@ fn has_stencil(name: &str) -> bool {
 /// operands go to the generic runtime in that order. `AddSmi` (`acc + imm`)
 /// shares it, which is fine while `+` is only numeric; strings will need a
 /// helper per order.
-extern "C" fn toi_rt_add(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_add(acc: Value, r: Value) -> u64 {
     match (r.as_number(), acc.as_number()) {
         (Some(x), Some(y)) => Value::from_f64_arith(x + y).to_bits(),
         _ => {
@@ -330,14 +330,14 @@ fn converting(f: impl FnOnce() -> u64) -> u64 {
     if std::mem::take(&mut vm.conv_redo) { RT_REDO } else { r }
 }
 
-extern "C" fn toi_rt_inc(a: Value) -> u64 {
+extern "C" fn cloison_rt_inc(a: Value) -> u64 {
     match a.as_number() {
         Some(x) => Value::from_f64_arith(x + 1.0).to_bits(),
         None => converting(|| crate::interp::generic_inc(a).to_bits()),
     }
 }
 
-extern "C" fn toi_rt_less_than(a: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_less_than(a: Value, b: Value) -> u64 {
     match (a.as_number(), b.as_number()) {
         (Some(x), Some(y)) => (x < y) as u64,
         _ => converting(|| crate::interp::generic_less_than(a, b) as u64),
@@ -345,7 +345,7 @@ extern "C" fn toi_rt_less_than(a: Value, b: Value) -> u64 {
 }
 
 /// `for … in`'s keys of `v` (`for_in_keys`; `vm` is the VM's address).
-extern "C" fn toi_rt_for_in_keys(vm: Value, v: Value) -> u64 {
+extern "C" fn cloison_rt_for_in_keys(vm: Value, v: Value) -> u64 {
     unsafe {
         let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
         vm.safepoint(std::ptr::null_mut());
@@ -355,7 +355,7 @@ extern "C" fn toi_rt_for_in_keys(vm: Value, v: Value) -> u64 {
 
 /// A new object of shape `shape` (`create_object` and `create_array`,
 /// when the heap's chunk is full).
-extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_create_object(shape: Value, _: Value) -> u64 {
     unsafe {
         let vm = crate::interp::current_vm();
         (*vm).safepoint(std::ptr::null_mut());
@@ -365,7 +365,7 @@ extern "C" fn toi_rt_create_object(shape: Value, _: Value) -> u64 {
 }
 
 /// How `a` compares with `b`: 0 less, 1 equal, 2 greater, 3 unordered.
-extern "C" fn toi_rt_compare(a: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_compare(a: Value, b: Value) -> u64 {
     if a.is_cell() || b.is_cell() { converting(|| compare(a, b)) } else { compare(a, b) }
 }
 
@@ -392,15 +392,15 @@ fn compare(a: Value, b: Value) -> u64 {
 
 /// Stencils call these as `(acc, r)` for `r - acc` (and `DivSmi`'s as
 /// `(k, acc)` for `acc / k`).
-extern "C" fn toi_rt_sub(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_sub(acc: Value, r: Value) -> u64 {
     arith(Op::Sub, r, acc)
 }
 
-extern "C" fn toi_rt_mul(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_mul(acc: Value, r: Value) -> u64 {
     arith(Op::Mul, r, acc)
 }
 
-extern "C" fn toi_rt_div(acc: Value, r: Value) -> u64 {
+extern "C" fn cloison_rt_div(acc: Value, r: Value) -> u64 {
     arith(Op::Div, r, acc)
 }
 
@@ -414,24 +414,24 @@ fn arith(op: Op, a: Value, b: Value) -> u64 {
     }
 }
 
-extern "C" fn toi_rt_strict_eq(a: Value, b: Value) -> bool {
+extern "C" fn cloison_rt_strict_eq(a: Value, b: Value) -> bool {
     crate::interp::strict_equals(a, b)
 }
 
 /// `a % b` (`ModSmi`'s slow path; `b` is the immediate).
-extern "C" fn toi_rt_mod(a: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_mod(a: Value, b: Value) -> u64 {
     let f = || Value::number(crate::interp::to_number(a) % crate::interp::to_number(b)).to_bits();
     if a.is_cell() || b.is_cell() { converting(f) } else { f() }
 }
 
 /// ToInt32(ToNumber(a)), in the low 32 bits.
-extern "C" fn toi_rt_to_int32(a: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_to_int32(a: Value, _: Value) -> u64 {
     let f = || crate::interp::to_int32(crate::interp::to_number(a)) as u32 as u64;
     if a.is_cell() { converting(f) } else { f() }
 }
 
 /// `a == b`.
-extern "C" fn toi_rt_loose_eq(a: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_loose_eq(a: Value, b: Value) -> u64 {
     let f = || crate::interp::loose_equals(a, b).unwrap_or_else(|e| panic!("JIT code: {e}")) as u64;
     if a.is_cell() || b.is_cell() { converting(f) } else { f() }
 }
@@ -439,7 +439,7 @@ extern "C" fn toi_rt_loose_eq(a: Value, b: Value) -> u64 {
 /// `a[b]` for any `a` (a string, a typed array, …: what `get_keyed`
 /// stencils don't read themselves), or 0 where it would throw or call a
 /// function (the interpreter does).
-extern "C" fn toi_rt_get_keyed(a: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.get_keyed(a, b).map_or(0, |v| v.to_bits())
 }
@@ -447,7 +447,7 @@ extern "C" fn toi_rt_get_keyed(a: Value, b: Value) -> u64 {
 /// A new closure of `callee` (a `Code`) taking its upvalues from function
 /// `current` (`create_closure` stencils); 0 if it would capture the
 /// frame's registers (a function doing that isn't compiled).
-extern "C" fn toi_rt_create_closure(callee: Value, current: Value) -> u64 {
+extern "C" fn cloison_rt_create_closure(callee: Value, current: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let callee = callee.to_bits() as *const crate::vm::Code;
     if unsafe { (*callee).upvalues.iter().any(|&(local, _)| local) } {
@@ -460,7 +460,7 @@ extern "C" fn toi_rt_create_closure(callee: Value, current: Value) -> u64 {
 /// `CreateClosure` of `callee` (a `Code`) in the compiled frame `regs` of
 /// a function whose registers it captures (`create_closure_local`
 /// stencils).
-extern "C" fn toi_rt_create_closure_local(regs: Value, callee: Value) -> u64 {
+extern "C" fn cloison_rt_create_closure_local(regs: Value, callee: Value) -> u64 {
     unsafe {
         crate::interp::create_closure_of(
             regs.to_bits() as *mut Value,
@@ -472,7 +472,7 @@ extern "C" fn toi_rt_create_closure_local(regs: Value, callee: Value) -> u64 {
 
 /// Before compiled frame `regs` returns `acc`: its open upvalues closed
 /// (`close_upvalues` stencils); `acc`.
-extern "C" fn toi_rt_close_upvalues(regs: Value, acc: Value) -> u64 {
+extern "C" fn cloison_rt_close_upvalues(regs: Value, acc: Value) -> u64 {
     unsafe {
         let vm = &mut *crate::interp::current_vm();
         interp::close_frame_upvalues(vm, regs.to_bits() as *mut Value);
@@ -482,7 +482,7 @@ extern "C" fn toi_rt_close_upvalues(regs: Value, acc: Value) -> u64 {
 
 /// The `arguments` of the compiled frame `regs` (`create_arguments`
 /// stencils): found through its header, as `CreateArguments` does.
-extern "C" fn toi_rt_create_arguments(regs: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_create_arguments(regs: Value, _: Value) -> u64 {
     unsafe {
         let vm = &mut *crate::interp::current_vm();
         let mut spread = Vec::new();
@@ -493,13 +493,13 @@ extern "C" fn toi_rt_create_arguments(regs: Value, _: Value) -> u64 {
 }
 
 /// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws.
-extern "C" fn toi_rt_delete(a: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_delete(a: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.delete_property(a, b).map_or(0, |r| Value::from_bool(r).to_bits())
 }
 
 /// `delete g`, `b` the global's name (`delete_global_m` stencils).
-extern "C" fn toi_rt_delete_global(_: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_delete_global(_: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = String::from_utf16_lossy(crate::vm::string_units(b).unwrap_or(&[]));
     let a = vm.intern(&name);
@@ -507,7 +507,7 @@ extern "C" fn toi_rt_delete_global(_: Value, b: Value) -> u64 {
 }
 
 /// `typeof a`: a string constant (`type_of` stencils).
-extern "C" fn toi_rt_type_of(a: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_type_of(a: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.type_of(a).to_bits()
 }
@@ -515,7 +515,7 @@ extern "C" fn toi_rt_type_of(a: Value, _: Value) -> u64 {
 /// A regular expression literal's new `RegExp`, of pattern `p` and flags
 /// `f` (`create_regexp` stencils); 0 where it would throw (the
 /// interpreter does it).
-extern "C" fn toi_rt_create_regexp(p: Value, f: Value) -> u64 {
+extern "C" fn cloison_rt_create_regexp(p: Value, f: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     crate::builtins::regexp_literal(vm, p, f).map_or(0, |v| v.to_bits())
 }
@@ -526,7 +526,7 @@ extern "C" fn toi_rt_create_regexp(p: Value, f: Value) -> u64 {
 /// interpreter does it). It may change the elements' type, so the
 /// receiver's shape: `set_keyed_rt` forgets exact shapes (a named
 /// property's transition gives a shape extending the old one).
-extern "C" fn toi_rt_set_keyed(args: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
     use crate::object::Class;
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
@@ -565,17 +565,17 @@ extern "C" fn toi_rt_set_keyed(args: Value, _: Value) -> u64 {
 
 /// `o.name` (`name` an `Atom`), or 0 where it would throw or call a
 /// bytecode getter (`get_named_rt` stencils).
-extern "C" fn toi_rt_get_named(o: Value, name: Value) -> u64 {
+extern "C" fn cloison_rt_get_named(o: Value, name: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = crate::object::Atom(name.to_bits() as u32);
     vm.get_named_rt(o, name).map_or(0, |v| v.to_bits())
 }
 
 /// `o.name = v` (`args`: `o`, `name` an `Atom`, `v`): 1, or 0 to leave
-/// (`set_named_rt` stencils). As `toi_rt_set_keyed`'s named stores: if
+/// (`set_named_rt` stencils). As `cloison_rt_set_keyed`'s named stores: if
 /// the store changed what compiled code relies on (an epoch moved), leave;
 /// the interpreter stores again, the same.
-extern "C" fn toi_rt_set_named(args: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
     let name = crate::object::Atom(a[1].to_bits() as u32);
@@ -587,7 +587,7 @@ extern "C" fn toi_rt_set_named(args: Value, _: Value) -> u64 {
 }
 
 /// `a instanceof b`, or 0 where it would throw (the interpreter does).
-extern "C" fn toi_rt_instance_of(args: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
     let (v, f, cache) = (a[0], a[1], a[2].to_bits() as *const std::cell::Cell<u64>);
@@ -614,54 +614,54 @@ extern "C" fn toi_rt_instance_of(args: Value, _: Value) -> u64 {
 }
 
 /// `a in b`, or 0 where it would throw (the interpreter does).
-extern "C" fn toi_rt_in(a: Value, b: Value) -> u64 {
+extern "C" fn cloison_rt_in(a: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.has_property(b, a).map_or(0, |r| Value::from_bool(r).to_bits())
 }
 
-extern "C" fn toi_rt_to_boolean(a: Value, _: Value) -> bool {
+extern "C" fn cloison_rt_to_boolean(a: Value, _: Value) -> bool {
     crate::interp::to_boolean(a)
 }
 
 fn runtime_function(name: &str) -> usize {
     match name {
-        "toi_rt_mod" => toi_rt_mod as *const () as usize,
-        "toi_rt_instance_of" => toi_rt_instance_of as *const () as usize,
-        "toi_rt_get_keyed" => toi_rt_get_keyed as *const () as usize,
-        "toi_rt_get_named" => toi_rt_get_named as *const () as usize,
-        "toi_rt_set_named" => toi_rt_set_named as *const () as usize,
-        "toi_rt_create_regexp" => toi_rt_create_regexp as *const () as usize,
-        "toi_rt_type_of" => toi_rt_type_of as *const () as usize,
-        "toi_rt_create_closure" => toi_rt_create_closure as *const () as usize,
-        "toi_rt_delete" => toi_rt_delete as *const () as usize,
-        "toi_rt_create_arguments" => toi_rt_create_arguments as *const () as usize,
-        "toi_rt_create_closure_local" => toi_rt_create_closure_local as *const () as usize,
-        "toi_rt_close_upvalues" => toi_rt_close_upvalues as *const () as usize,
-        "toi_rt_delete_global" => toi_rt_delete_global as *const () as usize,
-        "toi_rt_set_keyed" => toi_rt_set_keyed as *const () as usize,
-        "toi_rt_in" => toi_rt_in as *const () as usize,
-        "toi_rt_call" => toi_rt_call as *const () as usize,
-        "toi_rt_enter" => toi_rt_enter as *const () as usize,
-        "toi_rt_construct" => toi_rt_construct as *const () as usize,
-        "toi_rt_construct_done" => toi_rt_construct_done as *const () as usize,
-        "toi_rt_array_push" => toi_rt_array_push as *const () as usize,
-        "toi_rt_char_code_at" => toi_rt_char_code_at as *const () as usize,
-        "toi_rt_from_char_code" => toi_rt_from_char_code as *const () as usize,
-        "toi_rt_pow" => toi_rt_pow as *const () as usize,
-        "toi_rt_materialize" => toi_rt_materialize as *const () as usize,
-        "toi_rt_to_int32" => toi_rt_to_int32 as *const () as usize,
-        "toi_rt_loose_eq" => toi_rt_loose_eq as *const () as usize,
-        "toi_rt_to_boolean" => toi_rt_to_boolean as *const () as usize,
-        "toi_rt_add" => toi_rt_add as *const () as usize,
-        "toi_rt_inc" => toi_rt_inc as *const () as usize,
-        "toi_rt_less_than" => toi_rt_less_than as *const () as usize,
-        "toi_rt_compare" => toi_rt_compare as *const () as usize,
-        "toi_rt_create_object" => toi_rt_create_object as *const () as usize,
-        "toi_rt_for_in_keys" => toi_rt_for_in_keys as *const () as usize,
-        "toi_rt_sub" => toi_rt_sub as *const () as usize,
-        "toi_rt_mul" => toi_rt_mul as *const () as usize,
-        "toi_rt_div" => toi_rt_div as *const () as usize,
-        "toi_rt_strict_eq" => toi_rt_strict_eq as *const () as usize,
+        "cloison_rt_mod" => cloison_rt_mod as *const () as usize,
+        "cloison_rt_instance_of" => cloison_rt_instance_of as *const () as usize,
+        "cloison_rt_get_keyed" => cloison_rt_get_keyed as *const () as usize,
+        "cloison_rt_get_named" => cloison_rt_get_named as *const () as usize,
+        "cloison_rt_set_named" => cloison_rt_set_named as *const () as usize,
+        "cloison_rt_create_regexp" => cloison_rt_create_regexp as *const () as usize,
+        "cloison_rt_type_of" => cloison_rt_type_of as *const () as usize,
+        "cloison_rt_create_closure" => cloison_rt_create_closure as *const () as usize,
+        "cloison_rt_delete" => cloison_rt_delete as *const () as usize,
+        "cloison_rt_create_arguments" => cloison_rt_create_arguments as *const () as usize,
+        "cloison_rt_create_closure_local" => cloison_rt_create_closure_local as *const () as usize,
+        "cloison_rt_close_upvalues" => cloison_rt_close_upvalues as *const () as usize,
+        "cloison_rt_delete_global" => cloison_rt_delete_global as *const () as usize,
+        "cloison_rt_set_keyed" => cloison_rt_set_keyed as *const () as usize,
+        "cloison_rt_in" => cloison_rt_in as *const () as usize,
+        "cloison_rt_call" => cloison_rt_call as *const () as usize,
+        "cloison_rt_enter" => cloison_rt_enter as *const () as usize,
+        "cloison_rt_construct" => cloison_rt_construct as *const () as usize,
+        "cloison_rt_construct_done" => cloison_rt_construct_done as *const () as usize,
+        "cloison_rt_array_push" => cloison_rt_array_push as *const () as usize,
+        "cloison_rt_char_code_at" => cloison_rt_char_code_at as *const () as usize,
+        "cloison_rt_from_char_code" => cloison_rt_from_char_code as *const () as usize,
+        "cloison_rt_pow" => cloison_rt_pow as *const () as usize,
+        "cloison_rt_materialize" => cloison_rt_materialize as *const () as usize,
+        "cloison_rt_to_int32" => cloison_rt_to_int32 as *const () as usize,
+        "cloison_rt_loose_eq" => cloison_rt_loose_eq as *const () as usize,
+        "cloison_rt_to_boolean" => cloison_rt_to_boolean as *const () as usize,
+        "cloison_rt_add" => cloison_rt_add as *const () as usize,
+        "cloison_rt_inc" => cloison_rt_inc as *const () as usize,
+        "cloison_rt_less_than" => cloison_rt_less_than as *const () as usize,
+        "cloison_rt_compare" => cloison_rt_compare as *const () as usize,
+        "cloison_rt_create_object" => cloison_rt_create_object as *const () as usize,
+        "cloison_rt_for_in_keys" => cloison_rt_for_in_keys as *const () as usize,
+        "cloison_rt_sub" => cloison_rt_sub as *const () as usize,
+        "cloison_rt_mul" => cloison_rt_mul as *const () as usize,
+        "cloison_rt_div" => cloison_rt_div as *const () as usize,
+        "cloison_rt_strict_eq" => cloison_rt_strict_eq as *const () as usize,
         _ => panic!("unknown runtime function `{name}`"),
     }
 }
@@ -687,7 +687,7 @@ mod arch {
         buf[10..13].copy_from_slice(&[0x48, 0xFF, 0x00]);
     }
 
-    /// Whether the stencil ends with `jmp toi_continue`.
+    /// Whether the stencil ends with `jmp cloison_continue`.
     pub fn ends_with_continue(code: &[u8], relocs: &[super::R]) -> bool {
         let n = code.len();
         n >= 5
@@ -737,17 +737,17 @@ mod arch {
         c
     }
 
-    /// The wrapper for `toi_rt_enter` (see [`super::toi_rt_enter`]), which
+    /// The wrapper for `cloison_rt_enter` (see [`super::cloison_rt_enter`]), which
     /// does its work inline, for compiled code calling compiled code: with
     /// `regs` in rax and the site in r11, and the slot registers `gprs` and
     /// `fprs` saved as for any runtime call, it checks the native stack
-    /// (else calls `toi_rt_call`), sets up the callee's frame register,
+    /// (else calls `cloison_rt_call`), sets up the callee's frame register,
     /// flags and `acc`, and calls its entry. The callee shares the caller's
     /// `ctx` (the exit cell, `NO_EXIT` while code runs) and tag. The
     /// callee's code uses every register; the caller relies on r13, rbx
     /// and rbp (which LLVM may keep values in across the call), so those
     /// are saved; `acc` (r12) is declared clobbered by `call_direct`. If the
-    /// callee exited, its record is in the cell: `toi_direct_exit` finishes
+    /// callee exited, its record is in the cell: `cloison_direct_exit` finishes
     /// the call, and the cell is reset.
     pub fn enter_wrapper(gprs: &[u8], fprs: &[u8], k: &super::EnterConsts) -> Vec<u8> {
         let disp8 = |d: usize| u8::try_from(d).ok().filter(|&d| d < 0x80).unwrap();
@@ -788,7 +788,7 @@ mod arch {
             let at = c.len();
             rel(c, at, done);
         };
-        // exit: toi_direct_exit(regs, site, record, acc).
+        // exit: cloison_direct_exit(regs, site, record, acc).
         let at = c.len();
         rel(&mut c, to_exit, at);
         c.extend([0x4C, 0x89, 0xEF]); // mov rdi, r13
@@ -798,7 +798,7 @@ mod arch {
         c.extend([0x48, 0x89, 0xC1]); // mov rcx, rax
         call_abs(&mut c, k.exit);
         jmp_done(&mut c);
-        // slow: toi_rt_call(regs, site).
+        // slow: cloison_rt_call(regs, site).
         let at = c.len();
         rel(&mut c, to_slow, at);
         c.extend([0x48, 0x89, 0xC7]); // mov rdi, rax
@@ -816,8 +816,8 @@ mod arch {
     /// callee register (at byte `f_off` of the frame, if `Some`) holds its
     /// closure, and the VM and native stacks have room: enter the callee's
     /// frame (`frame` bytes on) and call the entry. If the callee exited,
-    /// `toi_direct_exit` finishes the call; if the checks failed,
-    /// `toi_rt_call` makes it: both in the cold part, which jumps back. The
+    /// `cloison_direct_exit` finishes the call; if the checks failed,
+    /// `cloison_rt_call` makes it: both in the cold part, which jumps back. The
     /// result goes to `acc` (r12).
     ///
     /// Entered as stencils are, with rsp ≡ 8 (mod 16).
@@ -908,7 +908,7 @@ mod arch {
             }
             c.push(0x58 + (g & 7)); // pop g
         }
-        // The cold part. exit: toi_direct_exit(regs, site, record, acc),
+        // The cold part. exit: cloison_direct_exit(regs, site, record, acc),
         // the site in rsi.
         let mut d = Vec::new();
         let mut to_done = Vec::new();
@@ -923,7 +923,7 @@ mod arch {
         call_abs(&mut d, k.exit);
         d.extend([0xE9, 0, 0, 0, 0]); // jmp done
         to_done.push(d.len());
-        // reslow: the site back in r11; slow: toi_rt_call(regs, site).
+        // reslow: the site back in r11; slow: cloison_rt_call(regs, site).
         let reslow = d.len();
         d.extend([0x49, 0xBB]); // movabs r11, site
         d.extend(site.to_le_bytes());
@@ -1243,7 +1243,7 @@ mod arch {
             c.push(0x9100_03FF | area << 10); // add sp, sp, #area
         }
         c.push(0xA8C1_7BFD); // ldp x29, x30, [sp], #16
-        // The cold part. exit: toi_direct_exit(regs, site, record, acc),
+        // The cold part. exit: cloison_direct_exit(regs, site, record, acc),
         // the site in x1.
         let mut d: Vec<u32> = Vec::new();
         let mut to_done = Vec::new();
@@ -1259,7 +1259,7 @@ mod arch {
         d.push(0xD63F_0200); // blr x16
         to_done.push(d.len());
         d.push(0x1400_0000); // b done
-        // reslow: the site back in x9; slow: toi_rt_call(regs, site).
+        // reslow: the site back in x9; slow: cloison_rt_call(regs, site).
         let reslow = d.len();
         mov64(&mut d, 9, site);
         let slow = d.len();
@@ -1337,7 +1337,7 @@ mod arch {
         with_literals(c, &[(call, target)])
     }
 
-    /// The wrapper for `toi_rt_enter`, doing its work inline: see the
+    /// The wrapper for `cloison_rt_enter`, doing its work inline: see the
     /// x86-64 version. Besides the slot registers saved as for any runtime
     /// call, it saves the C ABI's callee-saved registers the caller may
     /// rely on and the callee's code may use (`preserve_none` preserves
@@ -1389,7 +1389,7 @@ mod arch {
             let d = (to as i64 - from as i64) as u32 & ((1 << bits) - 1);
             c[from] |= d << shift;
         };
-        // exit: toi_direct_exit(regs, site, record, acc).
+        // exit: cloison_direct_exit(regs, site, record, acc).
         let at = c.len();
         branch(&mut c, to_exit, at, 19, 5);
         c.push(0xAA15_03E0); // mov x0, x21
@@ -1405,7 +1405,7 @@ mod arch {
         let at = c.len();
         c.push(0x1400_0000); // b done
         branch(&mut c, at, done, 26, 0);
-        // slow: toi_rt_call(regs, site).
+        // slow: cloison_rt_call(regs, site).
         let at = c.len();
         branch(&mut c, to_slow, at, 19, 5);
         c.push(0xAA08_03E0); // mov x0, x8
@@ -1604,7 +1604,7 @@ mod arch {
 /// it ended within a page (`EXEC_RANGE`'s offset), so consecutive pieces
 /// use the instruction cache's sets as if they were packed. Starting each
 /// at a page boundary put every piece's first lines (the entry, its
-/// `toi_rt_enter` wrapper) in the same few sets: on DeltaBlue, any change
+/// `cloison_rt_enter` wrapper) in the same few sets: on DeltaBlue, any change
 /// to code size moved which of them conflicted, up to twice the L1i misses
 /// and 3% of the cycles.
 struct ExecMem {
@@ -1614,14 +1614,14 @@ struct ExecMem {
     offset: usize,
 }
 
-/// Measuring: `TOI_CODE_SHIFT=<bytes>` (0 to 63) starts every piece that
+/// Measuring: `CLOISON_CODE_SHIFT=<bytes>` (0 to 63) starts every piece that
 /// much past where it would, to sample how alignment alone moves a
 /// benchmark: on DeltaBlue, builds running the same instructions differ by
 /// up to 3% in cycles as the hot code's alignment changes.
 fn code_shift() -> usize {
     static SHIFT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SHIFT.get_or_init(|| {
-        std::env::var("TOI_CODE_SHIFT").ok().and_then(|s| s.parse().ok()).unwrap_or(0) % 64
+        std::env::var("CLOISON_CODE_SHIFT").ok().and_then(|s| s.parse().ok()).unwrap_or(0) % 64
     })
 }
 
@@ -1693,10 +1693,10 @@ struct Insn {
     /// Bytecode offset, in the code of frame `frame`.
     pc: usize,
     op: Op,
-    /// `toi_hole_imm`: the immediate operand (1 for `inc`; a call's
+    /// `cloison_hole_imm`: the immediate operand (1 for `inc`; a call's
     /// argument count).
     imm: i32,
-    /// `toi_hole_reg`: the register operand, if any (a call's callee,
+    /// `cloison_hole_reg`: the register operand, if any (a call's callee,
     /// `Mov`'s source).
     reg: u8,
     /// A second register operand: a call's argument window, `Mov`'s
@@ -2554,7 +2554,7 @@ impl Feedback {
             return Prop::None;
         }
         if insn.op == Op::GetKeyed {
-            if std::env::var_os("TOI_KEYED").is_some() {
+            if std::env::var_os("CLOISON_KEYED").is_some() {
                 eprintln!("keyed pc{} shape {:p} elems {:?}", insn.pc, ic.shape, unsafe { (*ic.shape).elems });
             }
             return Prop::Keyed {
@@ -4530,7 +4530,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 (Ty::Ext(_), _) => (pick("nc", "i_nc"), FieldType::Any),
                 _ => (pick("", "i"), FieldType::Any),
             };
-            if std::env::var_os("TOI_KEYED").is_some() && matches!(elems, FieldType::Any) {
+            if std::env::var_os("CLOISON_KEYED").is_some() && matches!(elems, FieldType::Any) {
                 eprintln!("anyload pc{} reg {:?} prop {:?}", insn.pc, reg, prop);
             }
             let (t, post) = Ty::of_field(elems);
@@ -5670,7 +5670,7 @@ fn pinnable(
 
 // ---- Layout and patching ----
 
-/// Where a stencil's `toi_continue` / `toi_jump_target` goes.
+/// Where a stencil's `cloison_continue` / `cloison_jump_target` goes.
 #[derive(Clone, Copy)]
 enum Target {
     /// Whatever is laid out right after this piece (lets the jump be trimmed).
@@ -5697,7 +5697,7 @@ struct Piece {
     reg: u8,
     cont: Target,
     jump: Target,
-    /// Instruction whose exit stub `toi_exit` goes to.
+    /// Instruction whose exit stub `cloison_exit` goes to.
     exit: u32,
     /// Machine code of its own instead of the stencil's (`arch::direct_call`):
     /// 1 + its index in the region's list, or 0.
@@ -8484,7 +8484,7 @@ impl JitCode {
             }
             hot.extend(check);
             // A direct call (in a VM frame, where exits' liveness is known)
-            // without the `toi_rt_enter` wrapper: `arch::direct_call`, then
+            // without the `cloison_rt_enter` wrapper: `arch::direct_call`, then
             // `call_done`'s checks.
             let main = match exit_live.filter(|e| e.len() == n) {
                 Some(e) if matches!(name.as_str(), "call_direct" | "call_direct_nc") => {
@@ -8585,7 +8585,7 @@ impl JitCode {
                 })
                 .collect()
         };
-        // Counting (`TOI_COUNT`): each hot piece behind a counter of its
+        // Counting (`CLOISON_COUNT`): each hot piece behind a counter of its
         // stencil's executions, where jumps to it and falls into it land.
         let prefix = count_prefix();
         let hot_at: Vec<usize> = hot
@@ -8664,7 +8664,7 @@ impl JitCode {
                 let Sym::Rt(rt) = r.2 else { continue };
                 tramp_at.entry(rt).or_insert_with(|| {
                     let name = RT_NAMES[rt as usize];
-                    let code = if name == "toi_rt_enter" {
+                    let code = if name == "cloison_rt_enter" {
                         arch::enter_wrapper(&saved_gprs, &saved_fprs, &EnterConsts::new())
                     } else {
                         let target = runtime_function(name) as u64;
@@ -8686,11 +8686,11 @@ impl JitCode {
         for (at, code, _) in &wrappers {
             buf[*at..*at + code.len()].copy_from_slice(code);
         }
-        // Profiling: with `TOI_PERF_MAP` set, name every piece in
+        // Profiling: with `CLOISON_PERF_MAP` set, name every piece in
         // `/tmp/perf-<pid>.map`, so `perf report` shows time per stencil.
-        // `TOI_PERF_MAP=fn`: each named after its function too
+        // `CLOISON_PERF_MAP=fn`: each named after its function too
         // (`jit:<function>:<piece>`), for time per function.
-        if let Some(how) = std::env::var_os("TOI_PERF_MAP") {
+        if let Some(how) = std::env::var_os("CLOISON_PERF_MAP") {
             let mut map = String::new();
             let prefix = if how == "fn" && !root.is_null() {
                 format!("{}:", unsafe { &(*root).name })
@@ -8733,10 +8733,10 @@ impl JitCode {
                 .unwrap();
             f.write_all(map.as_bytes()).unwrap();
         }
-        // Sizes: with `TOI_JIT_LOG=pieces`, the bytes and pieces of each
+        // Sizes: with `CLOISON_JIT_LOG=pieces`, the bytes and pieces of each
         // stencil in this code, hot, out-of-line and exits apart, on a line
         // before the compile's `jit` line (`scripts/vs-maglev.sh --pieces`).
-        if std::env::var_os("TOI_JIT_LOG").is_some_and(|v| v == "pieces") {
+        if std::env::var_os("CLOISON_JIT_LOG").is_some_and(|v| v == "pieces") {
             let mut sizes: std::collections::BTreeMap<(&str, String), (usize, usize)> = Default::default();
             let mut add = |kind: &'static str, name: String, len: usize| {
                 if len > 0 {
@@ -8944,14 +8944,14 @@ impl JitCode {
         }
     }
 
-    /// Debugging: with `TOI_JIT_LOG` set, print the stencils of a VM
+    /// Debugging: with `CLOISON_JIT_LOG` set, print the stencils of a VM
     /// function's code, entered at bytecode offset `pc`, and its size in
     /// bytes: hot code, out-of-line code, exits, and all of it, alignment
     /// included (`scripts/sizes.sh` and `scripts/vs-maglev.sh` read these).
     /// The function is named `name:line:col` where its source position is
     /// known (see `asm::FunctionDef::line`).
     fn log(&self, function: *const crate::vm::Code, pc: usize) {
-        if std::env::var_os("TOI_JIT_LOG").is_some() {
+        if std::env::var_os("CLOISON_JIT_LOG").is_some() {
             let names: Vec<&str> = self.stencils.iter().flatten().map(String::as_str).collect();
             let f = unsafe { &*function };
             let name = if f.line == 0 { f.name.clone() } else { format!("{}:{}:{}", f.name, f.line, f.col) };
@@ -9303,7 +9303,7 @@ unsafe fn inlining_pays(code: *const crate::vm::Code) -> bool {
 }
 
 /// How a function in VM frames is compiled, with the warm tier on
-/// (`Vm::set_warm_tier`, `TOI_WARM`; off by default). **Warm**: the
+/// (`Vm::set_warm_tier`, `CLOISON_WARM`; off by default). **Warm**: the
 /// function alone (no inlining; direct calls only into code compiled
 /// already), its start and loop headers counting down its heat
 /// ([`HOT_HEAT`], `tier_count`). **Hot**: everything (inlining, direct
@@ -9441,7 +9441,7 @@ pub(crate) struct CallSite {
     exits: u32,
     /// When calls went through the runtime for exits: the callee's compile
     /// count then. Once it has compiled since (with the feedback the exits
-    /// gave it), the site is bound again (see [`toi_rt_call`]).
+    /// gave it), the site is bound again (see [`cloison_rt_call`]).
     retry: u32,
     /// The callee's code and compiled version, for a direct call.
     callee: *const crate::vm::Code,
@@ -9468,7 +9468,7 @@ pub(crate) struct CallSite {
     /// call directly, as the callee's version is bound for those.
     claim: Option<(Ty, Vec<Ty>)>,
     /// Claimed, but the callee was being compiled (mutual recursion): bind
-    /// at a call ([`toi_rt_call`]).
+    /// at a call ([`cloison_rt_call`]).
     pending: bool,
     /// Bound to the callee's code, not one closure of it (`closure` is
     /// the `Code`): a function with upvalues, made anew at each call of
@@ -9510,7 +9510,7 @@ const DISPATCH_AFTER: u32 = 8;
 /// shape the callee's version is bound for (`CallSite::this_shape`), as
 /// long as what that root depends on (`Vm::ctor_root`) is unchanged: the
 /// constructor's `prototype` slot and its objects' in-object capacity.
-/// Otherwise, or when the heap's chunk is full, `toi_rt_construct`
+/// Otherwise, or when the heap's chunk is full, `cloison_rt_construct`
 /// allocates.
 #[repr(C)]
 #[derive(Clone, PartialEq)]
@@ -9529,7 +9529,7 @@ struct CtorSite {
     /// caller's registers.
     this_off: u64,
     /// A shape for which `Vm::construct_done` has nothing to do: the
-    /// constructor's objects end with it (see `toi_rt_construct_done`).
+    /// constructor's objects end with it (see `cloison_rt_construct_done`).
     done_shape: u64,
     /// The header of `this`.
     header: [u64; crate::object::INLINE_BASE / 8],
@@ -9716,7 +9716,7 @@ impl CallSite {
         self.end_off = 8 * (self.frame + nregs + interp::HEADER) as u64;
         // The code bound before may be running: a direct call into it is
         // on the native stack below this rebinding (a pending site bound
-        // by `toi_rt_call` from inside its callee, say). It stays alive
+        // by `cloison_rt_call` from inside its callee, say). It stays alive
         // with the VM, as dropping it would free code returned into.
         if let Some(old) = self.target.replace(code) {
             unsafe { (*self.vm).jit_caches.retired.push(old) };
@@ -10233,7 +10233,7 @@ struct Lowering<'a> {
 /// Every instruction keeps its frame and bytecode offset, which exits
 /// record.
 /// Time spent lowering and compiling, in nanoseconds, over the process
-/// (`toi` prints it with `TOI_JIT_TIME` set).
+/// (`cloison` prints it with `CLOISON_JIT_TIME` set).
 pub static LOWER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static COMPILE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -10246,12 +10246,12 @@ thread_local! {
 /// Run `f`, adding its time to `total` unless it runs within another timed
 /// call.
 pub static LOWERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Profiling: with `TOI_COUNT` set, hot code counts each stencil's
+/// Profiling: with `CLOISON_COUNT` set, hot code counts each stencil's
 /// executions (exactly, unlike sampling, whose skid moves samples to the
 /// next piece), reported by [`count_report`]. x86-64 only.
 fn count_prefix() -> usize {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("TOI_COUNT").is_some()) {
+    if *ON.get_or_init(|| std::env::var_os("CLOISON_COUNT").is_some()) {
         arch::COUNT_PREFIX
     } else {
         0
@@ -10273,7 +10273,7 @@ fn piece_counter(name: &'static str, len: usize) -> *mut u64 {
     &mut **n
 }
 
-/// The counts `TOI_COUNT` collected, most executed bytes first: stencil,
+/// The counts `CLOISON_COUNT` collected, most executed bytes first: stencil,
 /// executions, bytes, executions times bytes.
 pub fn count_report() -> String {
     let counts = COUNTS.lock().unwrap();
@@ -10294,7 +10294,7 @@ pub fn count_report() -> String {
 pub static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Machine code compiled over the process: hot paths, out-of-line code
 /// (see `JitCode::ool_len`), exits, and all of it; freed code included
-/// (`toi` prints them with `TOI_SIZES` set).
+/// (`cloison` prints them with `CLOISON_SIZES` set).
 pub static JIT_HOT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static JIT_OOL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static JIT_EXIT_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -12691,7 +12691,7 @@ impl Lowering<'_> {
             return false;
         }
         // A constructor's `this` is allocated by the call
-        // (`toi_rt_construct`), with the shape its root has now.
+        // (`cloison_rt_construct`), with the shape its root has now.
         if i.op == Op::Construct {
             let (ctor, shape) = self.ctor_site(fo);
             site.this_shape = shape as u64;
@@ -13215,7 +13215,7 @@ impl Lowering<'_> {
     /// The constructor to inline for `new` `i` of frame `frame`, if any: as
     /// for a call ([`Lowering::inline_target`]), and one whose objects
     /// have settled (see `Code::ctor_settled`) on one shape that
-    /// `construct_done` has nothing to do for (see `toi_rt_construct_done`),
+    /// `construct_done` has nothing to do for (see `cloison_rt_construct_done`),
     /// and that returns nothing (`this` is the result).
     fn inline_ctor(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
         let fo = self.inline_target(frame, i, depth)?;
@@ -15015,7 +15015,7 @@ pub(crate) unsafe fn vm_run(
     acc: Value,
 ) -> VmRun {
     let r = unsafe { vm_run_(vm, code, regs, pc, acc) };
-    if *EXITS_ON.get_or_init(|| std::env::var_os("TOI_EXITS").is_some()) {
+    if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) {
         let how = match &r {
             VmRun::Returned(_) => "returned",
             VmRun::Exit(_) => "exit",
@@ -15085,20 +15085,20 @@ unsafe fn vm_run_(
                     vm.field_epoch.wrapping_add(code.field_deps.get()),
                 )
             };
-            // Debugging: `TOI_JIT_DUMP=<file>` writes the last compilation's
-            // hot code (`TOI_JIT_LOG`: see `JitCode::log`), of the function
-            // named `TOI_JIT_DUMP_FN` if set (`name`, or `name:line:col`
-            // as `TOI_JIT_LOG` prints it); a `%n` in the name is the
+            // Debugging: `CLOISON_JIT_DUMP=<file>` writes the last compilation's
+            // hot code (`CLOISON_JIT_LOG`: see `JitCode::log`), of the function
+            // named `CLOISON_JIT_DUMP_FN` if set (`name`, or `name:line:col`
+            // as `CLOISON_JIT_LOG` prints it); a `%n` in the name is the
             // compilation's number, for a file each.
             if f.stats.compiles != compiles
                 && let Some(c) = f.last_code()
-                && let Ok(path) = std::env::var("TOI_JIT_DUMP")
-                && std::env::var("TOI_JIT_DUMP_FN").map_or(true, |n| {
+                && let Ok(path) = std::env::var("CLOISON_JIT_DUMP")
+                && std::env::var("CLOISON_JIT_DUMP_FN").map_or(true, |n| {
                     n == code.name || n == format!("{}:{}:{}", code.name, code.line, code.col)
                 })
             {
                 let path = path.replace("%n", &f.stats.compiles.to_string());
-                std::fs::write(path, c.main_code()).expect("writing TOI_JIT_DUMP");
+                std::fs::write(path, c.main_code()).expect("writing CLOISON_JIT_DUMP");
             }
             prepared
         };
@@ -15134,7 +15134,7 @@ unsafe fn vm_run_(
             left = Some((jit_code, frame));
             continue;
         }
-        if *EXITS_ON.get_or_init(|| std::env::var_os("TOI_EXITS").is_some()) {
+        if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) {
             let c = unsafe { &*jit_code.snap.as_ref().unwrap().frames[frame].code };
             let op = Op::from_u8(c.bytecode[exit_pc]).map_or("?", |o| o.name());
             let key = format!("{} @{exit_pc} {op}", c.name);
@@ -15148,7 +15148,7 @@ static EXITS_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static EXITS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Debugging: what `TOI_EXITS` counted, most frequent first: exits from
+/// Debugging: what `CLOISON_EXITS` counted, most frequent first: exits from
 /// compiled code (function, bytecode offset, instruction), entries into
 /// it from the interpreter (`enter`, with how they ended) and calls
 /// through the runtime (`rt_call`).
@@ -15232,7 +15232,7 @@ unsafe fn materialize(
 ///
 /// Compiled code doesn't call this function: a region's wrapper for it
 /// does the same inline, more cheaply (`arch::enter_wrapper`). This one
-/// serves `toi_rt_construct`, a Rust caller.
+/// serves `cloison_rt_construct`, a Rust caller.
 ///
 /// Its region's wrapper saves the slot registers the region uses, as for
 /// any runtime call. The callee's code uses every register freely, so this
@@ -15240,12 +15240,12 @@ unsafe fn materialize(
 /// expects (`acc` = `undefined`, the frame, the tag, an exit cell on its
 /// stack; the slots start with garbage, as the code's entry loads those it
 /// uses from the frame) and calls the entry. If the code exited,
-/// [`toi_direct_exit`] finishes the call. In asm, it costs about a third of
+/// [`cloison_direct_exit`] finishes the call. In asm, it costs about a third of
 /// a Rust function doing the same through inline asm, which had to align the
 /// stack and step over the red zone around the call.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
-extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
+extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
     core::arch::naked_asm!(
         // Too deep in native calls: through the runtime (a tail call).
         "mov rax, [rsi + {limit}]",
@@ -15266,7 +15266,7 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "lea r13, [rdi + rax * 8]",
         // The frame's flags: not a `new` frame (its header isn't written
         // otherwise; see `check_tail_callee`). For `new`, either:
-        // `toi_rt_construct` makes the result from its own `this`.
+        // `cloison_rt_construct` makes the result from its own `this`.
         "mov qword ptr [r13 - {flags}], 0",
         "movabs r14, {tag}",
         "mov r15, rsp",
@@ -15293,24 +15293,24 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         no_exit = const NO_EXIT as i32,
         flags = const 8 * interp::FLAGS,
         limit = const std::mem::offset_of!(CallSite, native_limit),
-        call = sym toi_rt_call,
+        call = sym cloison_rt_call,
         frame = const std::mem::offset_of!(CallSite, frame),
         tag = const Value::NUMBER_TAG,
         undefined = const Value::UNDEFINED.to_bits(),
-        exit = sym toi_direct_exit,
+        exit = sym cloison_direct_exit,
     )
 }
 
-/// The arm64 `toi_rt_enter`, with the too-deep branch and a stub for it
-/// as the OS needs: Linux branches to `toi_rt_call` directly (ELF
+/// The arm64 `cloison_rt_enter`, with the too-deep branch and a stub for it
+/// as the OS needs: Linux branches to `cloison_rt_call` directly (ELF
 /// `CONDBR19`); Mach-O can't relocate a conditional branch to another
 /// function, so there it goes through a local `b` placed after the cold
 /// tail. The hot path is the same on both.
 #[cfg(target_arch = "aarch64")]
-macro_rules! toi_rt_enter_arm64 {
+macro_rules! cloison_rt_enter_arm64 {
     ($too_deep:literal $(, $stub:literal)*) => {
 #[unsafe(naked)]
-extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
+extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
     core::arch::naked_asm!(
         // Too deep in native calls: through the runtime (a tail call).
         "ldr x9, [x1, #{limit}]",
@@ -15337,7 +15337,7 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "add x21, x0, x9, lsl #3",
         // The frame's flags: not a `new` frame (its header isn't written
         // otherwise; see `check_tail_callee`). For `new`, either:
-        // `toi_rt_construct` makes the result from its own `this`.
+        // `cloison_rt_construct` makes the result from its own `this`.
         "stur xzr, [x21, #-{flags}]",
         "mov x22, #{tag_hi}",
         "lsl x22, x22, #48",
@@ -15368,22 +15368,22 @@ extern "C" fn toi_rt_enter(regs: Value, site: Value) -> Value {
         "b 2b",
         $($stub,)*
         limit = const std::mem::offset_of!(CallSite, native_limit),
-        call = sym toi_rt_call,
+        call = sym cloison_rt_call,
         flags = const 8 * interp::FLAGS,
         frame = const std::mem::offset_of!(CallSite, frame),
         tag_hi = const Value::NUMBER_TAG >> 48,
         undefined = const Value::UNDEFINED.to_bits(),
-        exit = sym toi_direct_exit,
+        exit = sym cloison_direct_exit,
     )
 }
     };
 }
 #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
-toi_rt_enter_arm64!("b.lo {call}");
+cloison_rt_enter_arm64!("b.lo {call}");
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-toi_rt_enter_arm64!("b.lo 4f", "4:", "b {call}");
+cloison_rt_enter_arm64!("b.lo 4f", "4:", "b {call}");
 
-/// What the inline version of [`toi_rt_enter`] in a region's wrapper for
+/// What the inline version of [`cloison_rt_enter`] in a region's wrapper for
 /// it (`arch::enter_wrapper`) needs: `CallSite` offsets, constants and
 /// the functions it calls.
 /// The slot registers to keep across call `i`, as (GPRs, xmm registers):
@@ -15462,8 +15462,8 @@ impl DirectConsts {
             limit: std::mem::offset_of!(CallSite, native_limit),
             flags: 8 * interp::FLAGS,
             undefined: Value::UNDEFINED.to_bits(),
-            call: toi_rt_call as *const () as u64,
-            exit: toi_direct_exit as *const () as u64,
+            call: cloison_rt_call as *const () as u64,
+            exit: cloison_direct_exit as *const () as u64,
         }
     }
 }
@@ -15485,8 +15485,8 @@ impl EnterConsts {
             frame: std::mem::offset_of!(CallSite, frame),
             flags: 8 * interp::FLAGS,
             undefined: Value::UNDEFINED.to_bits(),
-            call: toi_rt_call as *const () as u64,
-            exit: toi_direct_exit as *const () as u64,
+            call: cloison_rt_call as *const () as u64,
+            exit: cloison_direct_exit as *const () as u64,
         }
     }
 }
@@ -15495,7 +15495,7 @@ impl EnterConsts {
 /// allocate `this` themselves (see [`CtorSite`]): `new` of the
 /// callee of `site` (a `CallSite`), whose frame the compiled frame `regs`
 /// has set up but for `this`. Allocate `this`, and if it has the shape the
-/// callee's version was bound for, enter that (`toi_rt_enter`); otherwise
+/// callee's version was bound for, enter that (`cloison_rt_enter`); otherwise
 /// (the constructor's root changed: its prototype, or its objects' size)
 /// go through the runtime, from now on. The result is the constructor's,
 /// if an object, else `this`. `EMPTY` on an error.
@@ -15504,7 +15504,7 @@ impl EnterConsts {
 /// keeps `this` and makes the result, also after an exit (the interpreter
 /// finishes the frame as a plain call) and after a self tail call reused
 /// the frame (whose `this` is then the tail call's).
-extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
+extern "C" fn cloison_rt_construct(regs: Value, site: Value) -> Value {
     unsafe {
         let s = site.to_bits() as *mut CallSite;
         let vm = &mut *(*s).vm;
@@ -15513,10 +15513,10 @@ extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
         let o = crate::object::as_object(this);
         if (*s).this_shape != 0 && (*o).shape as u64 != (*s).this_shape {
             (*s).entry = 0;
-            return toi_rt_call(regs, site);
+            return cloison_rt_call(regs, site);
         }
         *(regs.to_bits() as *mut Value).add((*s).frame) = this;
-        let v = toi_rt_enter(regs, site);
+        let v = cloison_rt_enter(regs, site);
         if v.to_bits() == 0 || crate::props::is_object(v) {
             // An error, or an object: the constructor's, or (through the
             // runtime, the native stack being low) `new`'s already. (Not a
@@ -15532,7 +15532,7 @@ extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
 /// `materialize` stencils, in an exit: allocate the object `mat` (a
 /// [`Mat`]) describes, its fields from the frame `regs` (spilled), and
 /// put it in its registers.
-extern "C" fn toi_rt_materialize(regs: Value, mat: Value) -> u64 {
+extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
     unsafe {
         let m = &*(mat.to_bits() as *const Mat);
         let regs = regs.to_bits() as *mut Value;
@@ -15554,7 +15554,7 @@ extern "C" fn toi_rt_materialize(regs: Value, mat: Value) -> u64 {
 /// `s.charCodeAt(k)` for `char_code_at` stencils: the unit, boxed (a cons
 /// string flattened), or 0 to leave where there is none or `s` is no
 /// string (the interpreter calls it).
-extern "C" fn toi_rt_char_code_at(s: Value, k: Value) -> u64 {
+extern "C" fn cloison_rt_char_code_at(s: Value, k: Value) -> u64 {
     match (crate::vm::string_units(s), k.is_int32()) {
         (Some(u), true) => u
             .get(k.as_i32_unchecked() as u32 as usize)
@@ -15565,7 +15565,7 @@ extern "C" fn toi_rt_char_code_at(s: Value, k: Value) -> u64 {
 
 /// `Math.pow(x, y)` for `math_pow` stencils: the double, boxed, or 0 to
 /// leave where `x` or `y` isn't a number (converting it may run code).
-extern "C" fn toi_rt_pow(x: Value, y: Value) -> u64 {
+extern "C" fn cloison_rt_pow(x: Value, y: Value) -> u64 {
     match (x.as_number(), y.as_number()) {
         (Some(x), Some(y)) => Value::from_f64(crate::math::pow(x, y)).to_bits(),
         _ => 0,
@@ -15575,14 +15575,14 @@ extern "C" fn toi_rt_pow(x: Value, y: Value) -> u64 {
 /// `String.fromCharCode(c)` for `from_char_code` stencils, `c` an int32 or
 /// (`from_char_code`) any value: the string, or 0 to leave where `c` isn't
 /// a number (converting it may run code).
-extern "C" fn toi_rt_from_char_code(c: Value, _: Value) -> u64 {
+extern "C" fn cloison_rt_from_char_code(c: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let Some(d) = c.as_number() else { return 0 };
     vm.safepoint(std::ptr::null_mut());
     vm.single_char(crate::interp::to_int32(d) as u16).to_bits()
 }
 
-extern "C" fn toi_rt_array_push(a: Value, v: Value) -> Value {
+extern "C" fn cloison_rt_array_push(a: Value, v: Value) -> Value {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.safepoint(std::ptr::null_mut());
     crate::vm::array_push(vm, a, &[v]).expect("a push onto an array")
@@ -15593,7 +15593,7 @@ extern "C" fn toi_rt_array_push(a: Value, v: Value) -> Value {
 /// do for objects of `this`'s shape from now on (their keys fit the
 /// capacity, which only grows, and the constructor's result is that
 /// shape or already several), the stencil skips the call for that shape.
-extern "C" fn toi_rt_construct_done(site: Value, this: Value) -> u64 {
+extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
     unsafe {
         let s = &mut *(site.to_bits() as *mut CallSite);
         let o = crate::object::as_object(this);
@@ -15612,8 +15612,8 @@ extern "C" fn toi_rt_construct_done(site: Value, this: Value) -> u64 {
     }
 }
 
-/// [`toi_rt_enter`]: the callee's code exited with `record` and `acc`.
-extern "C" fn toi_direct_exit(
+/// [`cloison_rt_enter`]: the callee's code exited with `record` and `acc`.
+extern "C" fn cloison_direct_exit(
     regs: *mut Value,
     site: *mut CallSite,
     record: u32,
@@ -15669,7 +15669,7 @@ unsafe fn direct_exit(
             let mut slot = (*site.callee).jit.borrow_mut();
             slot.as_mut().unwrap().vm_finish(code, 0, record as usize)
         };
-        // Not a `new` frame, even for `new`: `toi_rt_construct` makes the
+        // Not a `new` frame, even for `new`: `cloison_rt_construct` makes the
         // result. (Marked to close upvalues if its code made closures of
         // its registers.)
         let captured = interp::captured_flag(callee_regs);
@@ -15681,12 +15681,12 @@ unsafe fn direct_exit(
 
 /// `call` stencils: run the call `site` (a `CallSite`) describes, over the
 /// compiled frame `regs`. `EMPTY` on an error.
-extern "C" fn toi_rt_call(regs: Value, site: Value) -> Value {
+extern "C" fn cloison_rt_call(regs: Value, site: Value) -> Value {
     unsafe {
         let site = &mut *(site.to_bits() as *mut CallSite);
         (*site.vm).safepoint(regs.to_bits() as *mut Value);
-        // `TOI_EXITS`: also the calls through the runtime, by callee and why.
-        if *EXITS_ON.get_or_init(|| std::env::var_os("TOI_EXITS").is_some()) && !site.callee.is_null() {
+        // `CLOISON_EXITS`: also the calls through the runtime, by callee and why.
+        if *EXITS_ON.get_or_init(|| std::env::var_os("CLOISON_EXITS").is_some()) && !site.callee.is_null() {
             let key = format!(
                 "rt_call {} entry={} pending={} exits={} claim={} bound={}",
                 (*site.callee).name,

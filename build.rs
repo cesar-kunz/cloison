@@ -3,7 +3,7 @@
 //! 1. Compile `stencils/stencils.rs` on its own into an object file for the
 //!    target, with the static relocation model, so that holes and
 //!    continuations are plain relocations, not GOT/PLT indirections.
-//! 2. For every `toi_stencil_*` function, extract its machine code and
+//! 2. For every `cloison_stencil_*` function, extract its machine code and
 //!    relocations.
 //! 3. On arm64, fold trailing branch stubs ([`fold_arm64_stubs`]) and
 //!    invert conditional branches over lone jumps
@@ -26,7 +26,7 @@ use std::process::Command;
 use std::{env, fs};
 
 const SOURCE: &str = "stencils/stencils.rs";
-const PREFIX: &str = "toi_stencil_";
+const PREFIX: &str = "cloison_stencil_";
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
@@ -41,11 +41,11 @@ fn main() {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let mut extracted = extract(&compile(&rustc, &target, &obj_path, &[]), &arch);
     // x86-64: LLVM jumps to an exit or a helper with a short `jcc` to a
-    // stub after the hot path's final `jmp toi_continue`, which then can't
+    // stub after the hot path's final `jmp cloison_continue`, which then can't
     // be trimmed. Assembled with every branch long (`-mc-relax-all`), the
     // stubs fold away (`fold_x86_stubs`). That lengthens every other local
     // jump: a stencil takes its relaxed form only where that lets it end in
-    // `jmp toi_continue` and makes it no longer (DeltaBlue's `teq_jt`, 147
+    // `jmp cloison_continue` and makes it no longer (DeltaBlue's `teq_jt`, 147
     // to 158 bytes of mostly 6-byte `jcc`s, cost it 2.5%).
     if arch == "x86_64" {
         let relaxed_path = out_dir.join("stencils-relaxed.o");
@@ -89,7 +89,7 @@ fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]
     cmd.args([
         "--edition=2024",
         "--crate-type=lib",
-        "--crate-name=toi_stencils",
+        "--crate-name=cloison_stencils",
     ])
     .args(["-Copt-level=3", "-Cpanic=abort", "-Ccodegen-units=1"])
     .args(["-Crelocation-model=static", "-Ccode-model=small"]);
@@ -110,7 +110,7 @@ fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]
     fs::read(obj_path).unwrap()
 }
 
-/// Whether a stencil ends with its hot path's `jmp toi_continue` (which
+/// Whether a stencil ends with its hot path's `jmp cloison_continue` (which
 /// the JIT trims when the next stencil follows).
 fn ends_with_continue(e: &Extracted) -> bool {
     let n = e.code.len();
@@ -119,12 +119,12 @@ fn ends_with_continue(e: &Extracted) -> bool {
         _ if e.code[n - 5] == 0xE9 => e
             .relocs
             .iter()
-            .any(|r| r.offset == (n - 4) as u64 && r.symbol == "toi_continue"),
+            .any(|r| r.offset == (n - 4) as u64 && r.symbol == "cloison_continue"),
         _ => false,
     }
 }
 
-/// Every `toi_stencil_*` function of the object file `data`: its code and
+/// Every `cloison_stencil_*` function of the object file `data`: its code and
 /// relocations, after this target's rewrites.
 fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
     let file = object::File::parse(data).expect("stencil object");
@@ -217,12 +217,12 @@ fn extract(data: &[u8], arch: &str) -> Vec<Extracted> {
             // own `__slow` helper may be referenced. Anything else (rodata,
             // panics, section-relative references) would need copying data
             // the JIT doesn't have.
-            let allowed = target_name.starts_with("toi_hole_")
-                || target_name.starts_with("toi_rt_")
+            let allowed = target_name.starts_with("cloison_hole_")
+                || target_name.starts_with("cloison_rt_")
                 || target_name == format!("{PREFIX}{name}__slow")
-                || target_name == "toi_continue"
-                || target_name == "toi_jump_target"
-                || target_name == "toi_exit";
+                || target_name == "cloison_continue"
+                || target_name == "cloison_jump_target"
+                || target_name == "cloison_exit";
             assert!(
                 allowed,
                 "stencil {name}: unsupported relocation to `{target_name}` \
@@ -315,7 +315,7 @@ fn emit(entries: &[Entry]) -> String {
         .iter()
         .flat_map(|e| &e.relocs)
         .map(|r| r.symbol.as_str())
-        .filter(|s| s.starts_with("toi_rt_"))
+        .filter(|s| s.starts_with("cloison_rt_"))
         .collect();
     rt_names.sort();
     rt_names.dedup();
@@ -357,13 +357,13 @@ fn emit(entries: &[Entry]) -> String {
         let mut relocs = String::new();
         for r in &e.relocs {
             let symbol = match r.symbol.as_str() {
-                "toi_hole_imm" => "Sym::HoleImm".to_string(),
-                "toi_hole_imm64" => "Sym::HoleImm64".to_string(),
-                "toi_hole_imm64b" => "Sym::HoleImm64b".to_string(),
-                "toi_hole_reg" => "Sym::HoleReg".to_string(),
-                "toi_continue" => "Sym::Continue".to_string(),
-                "toi_jump_target" => "Sym::JumpTarget".to_string(),
-                "toi_exit" => "Sym::Exit".to_string(),
+                "cloison_hole_imm" => "Sym::HoleImm".to_string(),
+                "cloison_hole_imm64" => "Sym::HoleImm64".to_string(),
+                "cloison_hole_imm64b" => "Sym::HoleImm64b".to_string(),
+                "cloison_hole_reg" => "Sym::HoleReg".to_string(),
+                "cloison_continue" => "Sym::Continue".to_string(),
+                "cloison_jump_target" => "Sym::JumpTarget".to_string(),
+                "cloison_exit" => "Sym::Exit".to_string(),
                 "@slow" => "Sym::Slow".to_string(),
                 rt => format!(
                     "Sym::Rt({})",
@@ -598,12 +598,12 @@ const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 /// Mach-O has no relocation for a `movz`/`movk` immediate field (ELF's
 /// `MOVW_UABS_G*`), so on macOS the stencils write each hole as a magic
 /// immediate `0xB0<hole><part>` (`hole16!` in `stencils/stencils.rs`):
-/// hole 1 `toi_hole_imm`, 2 `toi_hole_reg`, 3 `toi_hole_imm64`, 4
-/// `toi_hole_imm64b`; part 0–3 the 16 bits at `16 * part`. Record each as
+/// hole 1 `cloison_hole_imm`, 2 `cloison_hole_reg`, 3 `cloison_hole_imm64`, 4
+/// `cloison_hole_imm64b`; part 0–3 the 16 bits at `16 * part`. Record each as
 /// the relocation it stands for and zero the field, so the code is what
 /// the ELF build extracts.
 fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
-    const HOLES: [&str; 4] = ["toi_hole_imm", "toi_hole_reg", "toi_hole_imm64", "toi_hole_imm64b"];
+    const HOLES: [&str; 4] = ["cloison_hole_imm", "cloison_hole_reg", "cloison_hole_imm64", "cloison_hole_imm64b"];
     const MOVW: [u32; 4] = [
         R_AARCH64_MOVW_UABS_G0_NC,
         R_AARCH64_MOVW_UABS_G1_NC,
@@ -636,8 +636,8 @@ fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
 
 /// AArch64 has no conditional tail call. For `if slow { become helper(..) }`
 /// LLVM emits a conditional branch to a local stub, `b.cc stub`, and puts
-/// `stub: b helper` at the very end, after the hot path's `b toi_continue`.
-/// So the JIT couldn't drop that `b toi_continue`, and the hot path would
+/// `stub: b helper` at the very end, after the hot path's `b cloison_continue`.
+/// So the JIT couldn't drop that `b cloison_continue`, and the hot path would
 /// pay an extra taken branch per operation.
 ///
 /// Fold such stubs: while the stencil ends in `b <symbol>`, retarget every
@@ -658,8 +658,8 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         else {
             return;
         };
-        // Don't fold the hot path's own `b toi_continue`.
-        if relocs[stub_reloc].symbol == "toi_continue" {
+        // Don't fold the hot path's own `b cloison_continue`.
+        if relocs[stub_reloc].symbol == "cloison_continue" {
             return;
         }
         // Find the branches targeting the stub.
@@ -775,10 +775,10 @@ fn local_branch(code: &[u8], at: usize) -> Option<(i64, u32, u32)> {
 
 /// LLVM often branches over a lone jump: `x: b.cond L; y: b <symbol>;
 /// L: …`. A conditional `become` produces one, either in the middle of a
-/// stencil (`b.vc L; b toi_exit`) or at its end
-/// (`b.ge z; b toi_jump_target; z: b toi_continue`, a loop's back edge).
+/// stencil (`b.vc L; b cloison_exit`) or at its end
+/// (`b.ge z; b cloison_jump_target; z: b cloison_continue`, a loop's back edge).
 /// Taking the jump then costs a not-taken `b.cond` plus a taken `b`, and at
-/// the end it also blocks trimming the final `b toi_continue`.
+/// the end it also blocks trimming the final `b cloison_continue`.
 ///
 /// Rewrite each one to `x: b.!cond <symbol>` (a new relocation) and delete
 /// `y`, fixing up local branches that cross it. Skips sites where another
@@ -907,11 +907,11 @@ fn delete_insn(code: &mut Vec<u8>, relocs: &mut [Reloc], y: usize) {
 const R_X86_64_PC32: u32 = 2;
 const R_X86_64_PLT32: u32 = 4;
 
-/// A stencil that branches both ways at its end, `jcc toi_continue; jmp X`,
+/// A stencil that branches both ways at its end, `jcc cloison_continue; jmp X`,
 /// can't have its final jump trimmed: it goes to `X`, not the continuation.
-/// LLVM produces it for `if !c { become X(..) } become toi_continue(..)`,
+/// LLVM produces it for `if !c { become X(..) } become cloison_continue(..)`,
 /// where it keeps the positive comparison and swaps the successors. Rewrite
-/// it to `j!cc X; jmp toi_continue` by flipping the condition (the low bit
+/// it to `j!cc X; jmp cloison_continue` by flipping the condition (the low bit
 /// of the `0F 8x` opcode) and swapping the two relocations: the same branch
 /// with its arms exchanged, valid for any condition. Skipped if a local jump
 /// targets the final `jmp`.
@@ -928,7 +928,7 @@ fn swap_x86_final_branch(code: &mut [u8], relocs: &mut [Reloc]) {
     let (Some(jcc), Some(jmp)) = (at(n - 9), at(n - 4)) else {
         return;
     };
-    if relocs[jcc].symbol != "toi_continue" || relocs[jmp].symbol == "toi_continue" {
+    if relocs[jcc].symbol != "cloison_continue" || relocs[jmp].symbol == "cloison_continue" {
         return;
     }
     let last = (n - 5) as i64;
@@ -961,7 +961,7 @@ fn swap_x86_final_branch(code: &mut [u8], relocs: &mut [Reloc]) {
 /// x86-64 counterpart of [`fold_arm64_stubs`], for stencils using `asm goto`
 /// (immediates folded into `add` / `cmp`, see `stencils/stencils.rs`). A
 /// label block that tail-calls becomes a stub at the end, `L: jmp <symbol>`,
-/// after the hot path's `jmp toi_continue`, which then can't be trimmed. The
+/// after the hot path's `jmp cloison_continue`, which then can't be trimmed. The
 /// asm jumps to it with a forced long form (`{disp32} jo L`), so retarget
 /// that `rel32` straight at `<symbol>` with a new relocation and drop the
 /// stub.
@@ -982,7 +982,7 @@ fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         let Some(sr) = relocs.iter().position(|r| {
             r.offset == (stub + 1) as u64
                 && matches!(r.r_type, R_X86_64_PC32 | R_X86_64_PLT32)
-                && r.symbol != "toi_continue"
+                && r.symbol != "cloison_continue"
         }) else {
             return;
         };
@@ -993,7 +993,7 @@ fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
         };
         // Nothing may fall into the stub: the instruction before it must be
         // an unconditional `jmp rel32` to a symbol (the hot path's `jmp
-        // toi_continue`, or another stub's).
+        // cloison_continue`, or another stub's).
         let jumps_away = stub >= 5
             && code[stub - 5] == 0xE9
             && relocs.iter().any(|r| {

@@ -18,7 +18,7 @@ esac
 cargo build --release --quiet --bin dispatch_bench --target "$triple"
 "${objdump[@]}" -d --no-show-raw-insn --no-addresses "target/$triple/release/dispatch_bench" |
   awk -v target="$TARGET" -v arch="${1:-x86_64}" '
-    /^<toi::interp::(op|i32|slow)_/ { name = $1; gsub(/[<>:]/, "", name); sub(/^toiinterp/, "", name); n = 0; print; next }
+    /^<cloison::interp::(op|i32|slow)_/ { name = $1; gsub(/[<>:]/, "", name); sub(/^cloisoninterp/, "", name); n = 0; print; next }
     name && /^$/  { printf "  ; %d instructions\n\n", n; if (name == "op_nop") nop = n; name = ""; next }
     name && !/int3|udf|\.word|^[[:space:]]*\.\.\.$/ { n++; print }
     END {

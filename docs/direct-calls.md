@@ -7,7 +7,7 @@ Status: design, 2026-10-08. Step 1 and a wrapper-free call on x86-64 and arm64 i
 Since compiled code calls compiled code directly, polymorphic sites
 included, the runtime no longer shows up in long DeltaBlue runs. The
 protocol of the direct call itself does: in 1000 calls of `deltaBlue()`
-(333 ms), the `toi_rt_enter` wrapper is about 13% of the cycles and
+(333 ms), the `cloison_rt_enter` wrapper is about 13% of the cycles and
 `call_direct` about 4%. fib (90) is nothing but calls: 32M instructions for
 fib(27), at 4.6 per cycle.
 
@@ -31,7 +31,7 @@ movabs r10, &code_epoch ; mov r11d, epoch ; cmp [r10], r11d ; jne exit
 mov r12, rax ; pop rax
 ```
 
-The region's wrapper for `toi_rt_enter` (`arch::enter_wrapper`):
+The region's wrapper for `cloison_rt_enter` (`arch::enter_wrapper`):
 
 ```text
 push rcx ; push rdx ; push rsi ; push rdi ; push r8   ; the live slots
@@ -119,7 +119,7 @@ exit there, the interpreter reads), checks the site's entry, closure and
 the two stacks, enters the callee's frame and calls the entry: no second
 call and return, no saves of every slot, rbx, rbp, r11 and r13. The rare
 paths (the callee exited, the checks failed) are a cold stub calling
-`toi_direct_exit` and `toi_rt_call`, as the wrapper did. Measured: fib
+`cloison_direct_exit` and `cloison_rt_call`, as the wrapper did. Measured: fib
 (90) and mutual recursion (91) -18%, 54 -8%, 63 -8%, DeltaBlue's
 `octane-db.js` -4.8% (Octane score ~46700 -> ~48300); hot code +6%
 (`jit.all.hot`). `new` (`construct_direct`) still uses the wrapper.

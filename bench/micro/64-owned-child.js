@@ -1,5 +1,5 @@
 // An object that uniquely owns a collection, accessed through the owner and through a local alias.
-// toi: candidate for object inlining (B) when every use of the alias inlines.
+// cloison: candidate for object inlining (B) when every use of the alias inlines.
 // features: loop, call, object, new, proto, array
 // expect: 35000000
 function Coll() { this.elms = new Array(); }

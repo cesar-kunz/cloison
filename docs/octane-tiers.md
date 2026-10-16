@@ -1,12 +1,12 @@
-# Octane in toi's and V8's tiers
+# Octane in cloison's and V8's tiers
 
 Made by `scripts/octane-tiers.sh` (also written to the ignored `perf-history/octane-tiers-<commit>.{md,tsv}`).
 
 ## 213fcdf
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 213fcdf, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 32.70 17.94.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 213fcdf, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 32.70 17.94.
 
-| benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
+| benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
 | richards | 2171 | 33830 | 2081 | 2785 | 40876 | 50803 |
 | deltablue | 2470 | 58858 | 2107 | 2860 | 57708 | 119032 |
@@ -25,17 +25,17 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 | typescript | 25780 | 22937 | 25184 | 34480 | 81473 | 76214 |
 | **geomean** (15) | **5224** | **15360** | **7073** | **9502** | **55698** | **64853** |
 
-toi interp vs Ignition 0.74x (ahead on 9), Sparkplug 0.55x (ahead on 1), Maglev 0.09x (ahead on 0), Turbofan 0.08x (ahead on 0) (of 15; above 1x: toi scores higher)
-toi JIT vs Ignition 2.17x (ahead on 9), Sparkplug 1.62x (ahead on 8), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: toi scores higher)
+cloison interp vs Ignition 0.74x (ahead on 9), Sparkplug 0.55x (ahead on 1), Maglev 0.09x (ahead on 0), Turbofan 0.08x (ahead on 0) (of 15; above 1x: cloison scores higher)
+cloison JIT vs Ignition 2.17x (ahead on 9), Sparkplug 1.62x (ahead on 8), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: cloison scores higher)
 
-## 6ef4928: toi on the whole core too
+## 6ef4928: cloison on the whole core too
 
-From here on toi gets the whole core, as Node does: its marker thread had
+From here on cloison gets the whole core, as Node does: its marker thread had
 competed with the program for one CPU (splay +40%). Same code as 213fcdf.
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 6ef4928, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 6.76 26.82.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 6ef4928, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 6.76 26.82.
 
-| benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
+| benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
 | richards | 2754 | 32266 | 1689 | 1238 | 40558 | 51011 |
 | deltablue | 2728 | 58488 | 1374 | 2006 | 57133 | 116513 |
@@ -54,8 +54,8 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 | typescript | 26053 | 23200 | 19217 | 34221 | 80649 | 74783 |
 | **geomean** (15) | **5638** | **15621** | **5562** | **8608** | **54985** | **64713** |
 
-toi interp vs Ignition 1.01x (ahead on 10), Sparkplug 0.65x (ahead on 5), Maglev 0.10x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
-toi JIT vs Ignition 2.81x (ahead on 11), Sparkplug 1.81x (ahead on 9), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: toi scores higher)
+cloison interp vs Ignition 1.01x (ahead on 10), Sparkplug 0.65x (ahead on 5), Maglev 0.10x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: cloison scores higher)
+cloison JIT vs Ignition 2.81x (ahead on 11), Sparkplug 1.81x (ahead on 9), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: cloison scores higher)
 
 ## Steps 0–5 of the plan
 
@@ -64,12 +64,12 @@ Measured on the `-run.js` files against 6ef4928 (`perf stat`, medians of
 −42%), earley-boyer −15%, zlib −6%, gbemu −4% (page faults −45%), box2d
 −3%; DeltaBlue's instructions unchanged. The binary is 25 KB smaller;
 peak RSS from −5% (splay) to +9% (gbemu), from keeping freed large cells'
-blocks. The toi JIT's geomean went from 15621 to 16346 (+4.6%); V8's
-low tiers vary more between the two runs than toi does (load).
+blocks. The cloison JIT's geomean went from 15621 to 16346 (+4.6%); V8's
+low tiers vary more between the two runs than cloison does (load).
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi with steps 0–5 of the plan below, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 7.10 12.35.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison with steps 0–5 of the plan below, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 7.10 12.35.
 
-| benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
+| benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
 | richards | 2778 | 33724 | 2058 | 2743 | 40668 | 51308 |
 | deltablue | 2860 | 58951 | 2059 | 2804 | 57291 | 120738 |
@@ -88,19 +88,19 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 | typescript | 27175 | 24035 | 25199 | 34545 | 83941 | 74261 |
 | **geomean** (15) | **5834** | **16346** | **7045** | **9494** | **55264** | **64968** |
 
-toi interp vs Ignition 0.83x (ahead on 12), Sparkplug 0.61x (ahead on 4), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
-toi JIT vs Ignition 2.32x (ahead on 11), Sparkplug 1.72x (ahead on 10), Maglev 0.30x (ahead on 1), Turbofan 0.25x (ahead on 0) (of 15; above 1x: toi scores higher)
+cloison interp vs Ignition 0.83x (ahead on 12), Sparkplug 0.61x (ahead on 4), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: cloison scores higher)
+cloison JIT vs Ignition 2.32x (ahead on 11), Sparkplug 1.72x (ahead on 10), Maglev 0.30x (ahead on 1), Turbofan 0.25x (ahead on 0) (of 15; above 1x: cloison scores higher)
 
 ## 668042a: after steps 0–12
 
 V8's columns are reused from the 6ef4928+ run (V8 doesn't change with
-toi). The toi JIT's geomean went from 15621 (6ef4928) to 18119: +16%.
+cloison). The cloison JIT's geomean went from 15621 (6ef4928) to 18119: +16%.
 By benchmark: raytrace +101%, earley-boyer +68%, pdfjs +49%, splay
 +41%, typescript +10%, zlib +7%; DeltaBlue level.
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 668042a, V8 14.6.202.34-node.28 capped at each tier (V8's columns from perf-history/octane-tiers-6ef4928+.tsv). Load average at the start and end: 2.36 5.05.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): cloison 668042a, V8 14.6.202.34-node.28 capped at each tier (V8's columns from perf-history/octane-tiers-6ef4928+.tsv). Load average at the start and end: 2.36 5.05.
 
-| benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
+| benchmark | cloison interp | cloison JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
 | richards | 2852 | 33742 | 2058 | 2743 | 40668 | 51308 |
 | deltablue | 2820 | 58693 | 2059 | 2804 | 57291 | 120738 |
@@ -119,12 +119,12 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 | typescript | 27309 | 25552 | 25199 | 34545 | 83941 | 74261 |
 | **geomean** (15) | **5981** | **18119** | **7045** | **9494** | **55264** | **64968** |
 
-toi interp vs Ignition 0.85x (ahead on 12), Sparkplug 0.63x (ahead on 5), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
-toi JIT vs Ignition 2.57x (ahead on 12), Sparkplug 1.91x (ahead on 10), Maglev 0.33x (ahead on 1), Turbofan 0.28x (ahead on 0) (of 15; above 1x: toi scores higher)
+cloison interp vs Ignition 0.85x (ahead on 12), Sparkplug 0.63x (ahead on 5), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: cloison scores higher)
+cloison JIT vs Ignition 2.57x (ahead on 12), Sparkplug 1.91x (ahead on 10), Maglev 0.33x (ahead on 1), Turbofan 0.28x (ahead on 0) (of 15; above 1x: cloison scores higher)
 
 ## Where the JIT gains little: findings and plan (at 213fcdf)
 
-The JIT gains little over toi's interpreter on raytrace (1.8x), earley-boyer
+The JIT gains little over cloison's interpreter on raytrace (1.8x), earley-boyer
 (1.8x), box2d (2.1x), splay (1.1x), pdfjs (1.05x) and typescript (0.9x).
 Here is each one's profile with the JIT on (share of samples):
 
@@ -173,7 +173,7 @@ host: box2d's baseline ranged from 12.8K to 15.1K.
 - *Open upvalues.* `Vm::open_upvalue` binary-searches a list averaging
   127 entries (deep recursion), loading a scattered cell on each probe.
   That's 105M calls: `closure_of` takes 12.7%.
-- *Self-recursive calls through `toi_rt_call`.* 43M calls to
+- *Self-recursive calls through `cloison_rt_call`.* 43M calls to
   `one_way_unify1_nboyer` with arguments read from `.car`. Its entry is
   typed by parameter shape, so `fits_entry` fails, and each call pays
   `vm_run` → `vm_prepare` → `fitting_version`'s scan: about 15–18%.
@@ -201,13 +201,13 @@ host: box2d's baseline ranged from 12.8K to 15.1K.
 **GC and memory** (splay, pdfjs)
 - *Blocks are handed back to the OS as soon as they empty.* `release()`
   and `free_large` call `madvise(DONTNEED)` at once, so the next use pays
-  a page fault, kernel zeroing and toi's own memset. That's the 12%
+  a page fault, kernel zeroing and cloison's own memset. That's the 12%
   kernel time in splay (393K faults) and in pdfjs.
 - *Splay's data outlives the nursery.* A payload tree lives through about
   80 MB of allocation, so each minor collection marks about 220K
   survivors (7 ms). Major collections trace 122 MiB live, 21 times.
-- *The tiers table puts toi at a disadvantage.* toi is pinned to one CPU
-  while Node gets both SMT siblings, so toi's marker thread competes with
+- *The tiers table puts cloison at a disadvantage.* cloison is pinned to one CPU
+  while Node gets both SMT siblings, so cloison's marker thread competes with
   the program. Splay scores 2755 on one CPU and about 3900 on the whole
   core. Splay's latency score is already level with V8's low tiers; its
   throughput is what lags.
@@ -219,7 +219,7 @@ regressions (`perf.sh --ab`).
 
 | # | change | effort | expected gain |
 |---|---|:-:|---|
-| 0 | `octane-tiers.sh`: give toi the whole core, as Node gets; rerun the table | S | fairer table (splay +40%) |
+| 0 | `octane-tiers.sh`: give cloison the whole core, as Node gets; rerun the table | S | fairer table (splay +40%) |
 | 1 | `open_upvalue`: scan from the top of the list | S | earley-boyer −14% cycles (measured) |
 | 2 | `slice`/`splice`/`shift`/`unshift`/`concat`: copy only the range, move in place, one type join per batch | S | pdfjs +27% (measured) |
 | 3 | Heap: keep emptied and large blocks committed; release the excess lazily; skip the memset on a released block | S | splay −9%, pdfjs +6% (measured) |
@@ -240,7 +240,7 @@ effort, then 7–9, then 12 and 13.
 
 Done: 0–5 (see "Steps 0–5 of the plan" above). Step 4 measured smaller
 than in the investigation (typescript −1.6% instructions, box2d −1.1%).
-The barrier checker (`TOI_GC_CHECK_BARRIER`) also had a false positive
+The barrier checker (`CLOISON_GC_CHECK_BARRIER`) also had a false positive
 on splay: while a sweep is pending, a dead old cell it hadn't reached
 held a stale pointer into memory already reused by young cells. The
 checker now skips cells of the old color while sweeping.
@@ -266,7 +266,7 @@ other problems:
 
 The rest of box2d's and typescript's interpreter time is in calls from
 compiled code into functions that run in the interpreter
-(`preCollectTypes`: 1M calls through `toi_rt_call`), and in functions
+(`preCollectTypes`: 1M calls through `cloison_rt_call`), and in functions
 refused or out of compilations for reasons other than named accesses.
 Those need the call-path work in step 9 and a look at the compilation
 budget (`max_compiles`).
@@ -304,7 +304,7 @@ Self calls (step 9's earley-boyer part). A self call binds directly to
 the version being compiled only if its arguments fit that version's
 entry types. `one_way_unify1_nboyer`'s entry is typed by its callers
 (pairs), and it recurses on `lst1.car`, which is `Any`. So its 43M self
-calls went through `toi_rt_call` → `vm_run` → `fitting_version`.
+calls went through `cloison_rt_call` → `vm_run` → `fitting_version`.
 
 They aren't tail calls: the call is in a loop and its result is tested.
 Now such a call gets a site of its own, claimed pending as for mutual

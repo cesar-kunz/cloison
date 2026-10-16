@@ -1,5 +1,5 @@
 // Calls to methods that do nothing or return a constant, at sites seeing three classes.
-// toi: two of the three implementations are empty; inlined, the calls should cost a guard.
+// cloison: two of the three implementations are empty; inlined, the calls should cost a guard.
 // features: loop, call, object, new, proto, array
 // expect: 659969
 function Stay(v) { this.v = v; this.mark = 0; }

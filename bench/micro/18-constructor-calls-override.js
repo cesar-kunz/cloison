@@ -1,5 +1,5 @@
 // A parent constructor calling a method that subclasses override, on an object still being built.
-// toi: the subclasses store fields before or after running the parent constructor, so in different orders.
+// cloison: the subclasses store fields before or after running the parent constructor, so in different orders.
 // features: loop, call, object, new, proto, call-method, array
 // expect: 269400
 function inherit(child, parent) {

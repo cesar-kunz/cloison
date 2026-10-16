@@ -150,8 +150,8 @@ impl Code {
                 arch::patch(&mut buf[field..], r.1 as u32, value, r.3 as i64, (base + field) as u64);
             }
         }
-        // Profiling: as the JIT's pieces (`TOI_PERF_MAP`).
-        if std::env::var_os("TOI_PERF_MAP").is_some() {
+        // Profiling: as the JIT's pieces (`CLOISON_PERF_MAP`).
+        if std::env::var_os("CLOISON_PERF_MAP").is_some() {
             use std::io::Write;
             let mut map = String::new();
             for (i, p) in pieces.iter().enumerate() {

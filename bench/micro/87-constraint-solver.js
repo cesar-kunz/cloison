@@ -1,5 +1,5 @@
 // Kernel: a whole incremental constraint solver in DeltaBlue's style, run on a chain and on a projection, repeatedly.
-// toi: the patterns of 1x-8x together, in phases whose type feedback differs (ints, then doubles; two constraint kinds, then four).
+// cloison: the patterns of 1x-8x together, in phases whose type feedback differs (ints, then doubles; two constraint kinds, then four).
 // features: loop, double, string, switch, call, object, new, proto, call-method, array, global, null, define-property
 // expect: 8677475
 

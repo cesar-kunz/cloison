@@ -1,5 +1,5 @@
 // Scanning a collection of objects of four shapes, calling a predicate on each, collecting the ones that pass.
-// toi: element loads see four shapes; `isSatisfied` is two implementations, one reading a global constant.
+// cloison: element loads see four shapes; `isSatisfied` is two implementations, one reading a global constant.
 // features: loop, call, object, new, proto, call-method, array, global, null
 // expect: 10333322
 function inherit(child, parent) {

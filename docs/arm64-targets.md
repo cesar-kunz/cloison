@@ -12,15 +12,15 @@ Reproducing:
   JIT emits it (from the generated table, after `build.rs`'s rewrites)
   with its instruction count, holes and template fields. It needs
   capstone's `cstool`.
-- `TOI_JIT_LOG=1 target/release/toi file.js` prints each compilation's
+- `CLOISON_JIT_LOG=1 target/release/cloison file.js` prints each compilation's
   hot code size, so a benchmark's compiled code is `bytes / 4`
   instructions.
-- `node bench/run.mjs --engine target/release/toi --time --reps 11` times
+- `node bench/run.mjs --engine target/release/cloison --time --reps 11` times
   every microbenchmark.
 
 Registers: `acc` x20, `regs` x21, `tag` x22 (`NUMBER_TAG`), `ctx` x23,
 slots x24–x28 and x0–x6 (x24, `g0`, in the examples), a keyed store's key
-x15, scratch x8–x17. Counts exclude the trailing `b toi_continue`, which
+x15, scratch x8–x17. Counts exclude the trailing `b cloison_continue`, which
 the JIT trims when the next piece follows.
 
 ## What was systematically off, and is now fixed
@@ -153,7 +153,7 @@ the JIT picks when the constant fits. Not done in this round.
 ## Benchmarks
 
 Every microbenchmark on Apple silicon, before and after the three fixes: the
-hot code the JIT compiled for it in all (`TOI_JIT_LOG`, bytes / 4), and
+hot code the JIT compiled for it in all (`CLOISON_JIT_LOG`, bytes / 4), and
 its time as a whole process (`bench/run.mjs --time`, the median of 11
 runs, 0.3 ms of it startup). Times on this machine vary by about ±5%
 from run to run; the two files that got slower have fewer instructions.

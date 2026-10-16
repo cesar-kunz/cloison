@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Sizes to track across commits: the runtime (the release `toi` binary), the
+# Sizes to track across commits: the runtime (the release `cloison` binary), the
 # stencil library it copies code from, and the code the JIT generates for
 # each listing in bench/bytecode/ (summed over every compile, from
-# `TOI_JIT_LOG`: hot code, out-of-line code (edge stubs, slow-path helpers,
+# `CLOISON_JIT_LOG`: hot code, out-of-line code (edge stubs, slow-path helpers,
 # runtime-call wrappers), exits, and all of it).
 #
 #   scripts/sizes.sh            # print, with the change since the last record
@@ -17,24 +17,24 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 record=false
 [[ ${1:-} == --record ]] && record=true
-cargo build --release --quiet --bin toi
+cargo build --release --quiet --bin cloison
 commit=$(git rev-parse --short HEAD)
 git diff --quiet HEAD -- src stencils build.rs Cargo.toml || commit="$commit+"
 commit=${SIZES_COMMIT:-$commit}
 
 section() { size -A "$1" | awk -v s="$2" '$1 == s { print $2 }'; }
-obj=$(find target/release/build/toi -name stencils.o -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2)
+obj=$(find target/release/build/cloison -name stencils.o -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2)
 
 declare -a rows
-rows+=("runtime.text $(section target/release/toi .text)")
-rows+=("runtime.rodata $(section target/release/toi .rodata)")
-rows+=("runtime.data.rel.ro $(section target/release/toi .data.rel.ro)")
-# Each stencil is in a section of its own (`.text.toi_stencil_…`).
+rows+=("runtime.text $(section target/release/cloison .text)")
+rows+=("runtime.rodata $(section target/release/cloison .rodata)")
+rows+=("runtime.data.rel.ro $(section target/release/cloison .data.rel.ro)")
+# Each stencil is in a section of its own (`.text.cloison_stencil_…`).
 rows+=("stencils.text $(size -A "$obj" | awk '$1 ~ /^\.text/ { t += $2 } END { print t }')")
 hot_all=0 ool_all=0 exits_all=0 total_all=0
 for f in bench/bytecode/*.asm; do
   name=$(basename "$f" .asm)
-  read -r hot ool exits total < <(TOI_JIT_LOG=1 target/release/toi "$f" 2>&1 >/dev/null |
+  read -r hot ool exits total < <(CLOISON_JIT_LOG=1 target/release/cloison "$f" 2>&1 >/dev/null |
     sed -n 's/^jit .* (\([0-9]*\) hot, \([0-9]*\) out-of-line, \([0-9]*\) exits, \([0-9]*\) bytes).*/\1 \2 \3 \4/p' |
     awk '{ h += $1; o += $2; e += $3; t += $4 } END { print h + 0, o + 0, e + 0, t + 0 }')
   rows+=("jit.$name.hot $hot" "jit.$name.ool $ool" "jit.$name.exits $exits" "jit.$name.total $total")

@@ -44,6 +44,7 @@ pub(crate) enum Root {
     ArrayIteratorPrototype,
     StringIteratorPrototype,
     ArrayValues,
+    GeneratorPrototype,
 }
 
 fn root(vm: &Vm, r: Root) -> *mut Object {

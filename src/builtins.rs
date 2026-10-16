@@ -270,6 +270,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // (After the errors: `AggregateError` inherits `Error.prototype`.)
     crate::promise::install(vm);
     crate::symbol::install(vm);
+    crate::generator::install(vm);
 }
 
 /// `c.prototype = proto` and `proto.constructor = c`, as the builtins'.

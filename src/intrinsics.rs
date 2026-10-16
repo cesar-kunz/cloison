@@ -43,6 +43,9 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("null_proto", null_proto),
     ("to_object", to_object),
     ("with_set_strict", with_set_strict),
+    ("generator_mode", generator_mode),
+    ("delegate_step", delegate_step),
+    ("delegate_done", delegate_done),
 ];
 
 /// The id of the intrinsic `name`.
@@ -626,6 +629,48 @@ fn with_set_strict(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     }
     vm.put_key(a[0], key, a[2])?;
     Ok(a[2])
+}
+
+/// How generator `[g]` was resumed (`generator::NEXT`…).
+fn generator_mode(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    Ok(crate::generator::mode(vm, a[0]))
+}
+
+/// `yield*`'s step: `[iterator, received, generator]`, the inner
+/// iterator's `next`, `throw` or `return` called as the generator was
+/// resumed: its result object.
+fn delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (it, received) = (a[0], a[1]);
+    let mode = crate::generator::mode(vm, a[2]).as_number().unwrap_or(0.0) as i32;
+    let name = match mode {
+        crate::generator::THROW => "throw",
+        crate::generator::RETURN => "return",
+        _ => "next",
+    };
+    let atom = vm.intern(name);
+    let m = vm.get(it, atom)?;
+    if m.is_undefined() || m.is_null() {
+        match mode {
+            crate::generator::RETURN => return crate::symbol::iter_result(vm, received, true),
+            crate::generator::THROW => {
+                let _ = crate::symbol::close(vm, it);
+                return Err(Error::type_error("The iterator does not provide a 'throw' method"));
+            }
+            _ => {}
+        }
+    }
+    let r = call_function(vm, m, it, &[received])?;
+    if !crate::props::is_object(r) {
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
+    }
+    Ok(r)
+}
+
+/// Whether iterator result `[r]` is done.
+fn delegate_done(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let a_done = vm.intern("done");
+    let d = vm.get(a[0], a_done)?;
+    Ok(Value::from_bool(crate::interp::to_boolean(d)))
 }
 
 #[allow(dead_code)]

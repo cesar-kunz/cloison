@@ -152,6 +152,8 @@ pub struct Function<'a> {
     /// A class's constructor: the variable holding the class (whose
     /// prototype `super(…)` constructs).
     pub ctor_var: Option<Name>,
+    /// A generator function (`function*`, `*m() {}`).
+    pub generator: bool,
     /// Its code calls `eval(…)` directly: its variables live in a scope
     /// object the eval'd code sees (see `codegen::generate_from`).
     pub has_eval: bool,
@@ -266,6 +268,8 @@ pub enum ExprKind<'a> {
     /// A tagged template's first argument: the site's frozen array of
     /// cooked strings (`None`: an invalid escape), with its `raw` ones.
     TemplateObject(Vec<(Option<String>, String)>),
+    /// `yield e` (`false`) or `yield* e` (`true`), in a generator.
+    Yield(Option<&'a Expr<'a>>, bool),
     /// A class.
     Class(Box<Class<'a>>),
     /// `super(args)` in a derived class's constructor: the variable

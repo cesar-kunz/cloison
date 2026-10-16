@@ -17,6 +17,10 @@ pub struct Program<'a> {
     /// a block, a catch parameter), each renamed apart (`x%3`: see
     /// `parse::Parser::reference`), by their new names.
     pub lexicals: std::collections::HashMap<Name, Lexical>,
+    /// Direct `eval`'s code: names are looked up in the caller's scope
+    /// object first (the variable `%e0`, a `with`'s: see
+    /// `intrinsics::direct_eval`).
+    pub direct_eval: bool,
 }
 
 /// A block-scoped binding (see [`Program::lexicals`]).
@@ -142,6 +146,9 @@ pub struct Function<'a> {
     /// A class's constructor: the variable holding the class (whose
     /// prototype `super(…)` constructs).
     pub ctor_var: Option<Name>,
+    /// Its code calls `eval(…)` directly: its variables live in a scope
+    /// object the eval'd code sees (see `codegen::generate_from`).
+    pub has_eval: bool,
     /// A function declared in a block: its block-scoped binding (see
     /// [`Program::lexicals`]).
     pub binding: Option<Name>,

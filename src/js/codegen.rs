@@ -78,6 +78,25 @@ fn generate_from<'p>(
     // in a scope object (`%env`, a register; see `Gen::function`).
     let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
     for i in 1..p.functions.len() {
+        if p.functions[i].has_eval {
+            // Its parameters and `var`s in its scope object, where direct
+            // `eval`'s code finds them (block-scoped ones, and the parser's,
+            // stay in registers).
+            let f = &p.functions[i];
+            let params = f.params.len();
+            let mut d: Vec<&str> = decls[i][..params].to_vec();
+            d.push(ENV);
+            let rest: Vec<&str> = decls[i][params..].iter().copied().filter(|&n| n != ENV).collect();
+            // (A function expression's own name, immutable, stays apart.)
+            let own = f.name.as_deref().filter(|_| f.binds_name);
+            let in_env = |n: &str| !n.starts_with('%') && !p.lexicals.contains_key(n) && Some(n) != own;
+            d.extend(rest.iter().copied().filter(|&n| !in_env(n)));
+            let env_vars: Vec<&str> = rest.iter().copied().filter(|&n| in_env(n)).collect();
+            d.extend(env_vars.iter().copied());
+            overflow[i] = decls[i][..params].iter().copied().filter(|&n| in_env(n)).chain(env_vars).collect();
+            decls[i] = d;
+            continue;
+        }
         if decls[i].len() > LOCAL_REGS {
             let f = &p.functions[i];
             let params = f.params.len();
@@ -156,7 +175,7 @@ fn generate_from<'p>(
         match emit[i] {
             Emit::Skip => {}
             Emit::Compile => {
-                let mut f = Gen::new(p, &decls, &overflow[i], &scopes, &names, i, lazy.is_some()).function()?;
+                let mut f = Gen::new(p, &decls, &overflow[i], &overflow, &scopes, &names, i, lazy.is_some()).function()?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
                 functions.push(f);
@@ -338,6 +357,23 @@ fn original(name: &str) -> &str {
     }
 }
 
+/// The variable holding a direct `eval`'s function's scope object, which
+/// the functions in it look names up in first (see `Gen::new`).
+const EVAL_SCOPE: &str = "%evalscope";
+
+/// The nearest function enclosing function `i` (itself included, but not
+/// the script) that calls `eval` directly.
+fn eval_scope(p: &Program, i: usize) -> Option<usize> {
+    let mut k = Some(i);
+    while let Some(j) = k.filter(|&j| j != 0) {
+        if p.functions[j].has_eval {
+            return Some(j);
+        }
+        k = p.functions[j].parent;
+    }
+    None
+}
+
 /// `vm::Code::kind` for `f`.
 fn function_kind(f: &Function) -> u8 {
     if f.class_kind != 0 {
@@ -367,7 +403,16 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
     let n = p.functions.len();
     let (mut upvalues, mut captured) = (vec![Vec::new(); n], vec![Vec::new(); n]);
     for i in 1..n {
-        for name in references(&p.functions[i]) {
+        let mut refs = references(&p.functions[i]);
+        // (In a direct `eval`'s function: its scope object, and an arrow's
+        // `this` for the `eval`.)
+        if eval_scope(p, i).is_some_and(|k| k != i) {
+            refs.push(EVAL_SCOPE);
+        }
+        if p.functions[i].has_eval && p.functions[i].arrow {
+            refs.push("%this");
+        }
+        for name in refs {
             // An enclosing function's variable in its scope object: the
             // object's register is what is captured.
             let mut name = name;
@@ -653,6 +698,9 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     out.extend(p.functions[f].hidden.iter().map(|n| &**n));
     if p.functions[f].uses_new_target {
         out.push("%newtarget");
+    }
+    if p.functions[f].has_eval && f != 0 {
+        out.push(EVAL_SCOPE);
     }
     // The script's variables are globals, but for its block-scoped ones.
     if f == 0 {
@@ -1055,6 +1103,8 @@ struct Gen<'a> {
     shared_ics: HashMap<String, u16>,
     /// Variables in the scope object (see [`generate`]).
     overflow: &'a [&'a str],
+    /// Every function's.
+    overflows: &'a [Vec<&'a str>],
     /// The next free temporary.
     temp: usize,
     acc: Acc,
@@ -1113,6 +1163,7 @@ impl<'a> Gen<'a> {
         p: &'a Program<'a>,
         decls: &'a [Decls<'a>],
         overflow: &'a [&'a str],
+        overflows: &'a [Vec<&'a str>],
         scopes: &'a Scopes<'a>,
         names: &'a std::cell::RefCell<HashSet<Name>>,
         index: usize,
@@ -1123,13 +1174,20 @@ impl<'a> Gen<'a> {
         let locals: HashMap<&str, u8> = if index == 0 {
             decls[0].iter().enumerate().map(|(i, &n)| (n, i as u8 + 1)).collect()
         } else {
-            decls[index][..decls[index].len() - overflow.len()]
+            decls[index]
                 .iter()
                 .enumerate()
+                .filter(|(_, n)| !overflow.contains(n))
                 .map(|(i, &n)| (n, i as u8 + 1))
                 .collect()
         };
-        let temp = 1 + locals.len();
+        // (Past the registers of the variables: some of the scope object's
+        // may be parameters, at the start.)
+        let temp = if index == 0 {
+            1 + locals.len()
+        } else {
+            1 + decls[index].iter().rposition(|n| !overflow.contains(n)).map_or(0, |k| k + 1)
+        };
         Gen {
             p,
             decls,
@@ -1145,6 +1203,7 @@ impl<'a> Gen<'a> {
             nregs: 1 + f.params.len(),
             locals,
             overflow,
+            overflows,
             shared_ics: HashMap::default(),
             temp,
             acc: Acc::default(),
@@ -1154,7 +1213,16 @@ impl<'a> Gen<'a> {
             deferred: Vec::new(),
             handlers: Vec::new(),
             in_try: 0,
-            withs: f.withs.clone(),
+            // (A direct `eval`'s function: its scope object first, as a
+            // `with`'s, for the names the eval'd code may declare.)
+            withs: {
+                let mut w = f.withs.clone();
+                if let Some(k) = eval_scope(p, index) {
+                    let at = p.functions[k].withs.len().min(w.len());
+                    w.insert(at, EVAL_SCOPE.into());
+                }
+                w
+            },
             eval,
             completion: None,
             cleared: false,
@@ -1170,6 +1238,17 @@ impl<'a> Gen<'a> {
             return unsupported(self.f.pos, "more parameters than registers");
         }
         // `new.target` first (see `Op::LdaNewTarget`).
+        if self.index == 0 && self.p.direct_eval {
+            for (k, e) in ["%e0", "%e1"].into_iter().enumerate() {
+                let mark = self.temp;
+                let t = self.alloc(self.f.pos)?;
+                self.lda_smi(k as i32);
+                self.star(t);
+                self.intrinsic("eval_env", t, 1);
+                self.temp = mark;
+                self.init_var(e, self.f.pos)?;
+            }
+        }
         if self.f.uses_new_target {
             let Var::Reg(r) = self.resolve("%newtarget", self.f.pos)? else {
                 return unsupported(self.f.pos, "`new.target` with this many variables");
@@ -1182,20 +1261,42 @@ impl<'a> Gen<'a> {
         }
         // The scope object, with each of its variables (`undefined`, in
         // order: one shape).
-        if !self.overflow.is_empty() {
+        let has_eval = self.f.has_eval && self.index != 0;
+        if !self.overflow.is_empty() || has_eval {
             let env = self.locals[ENV];
             let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
             let ic = self.auto_ic(&format!("[]{}", cap));
             self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
             self.star(env);
-            self.emit(Op::LdaUndefined, &[]);
+            if has_eval {
+                // (No `toString` and such for names to find in it.)
+                self.intrinsic("null_proto", env, 1);
+                let withs = std::mem::take(&mut self.withs);
+                self.ldar(env);
+                let r = self.store_raw(EVAL_SCOPE, self.f.pos);
+                self.withs = withs;
+                r?;
+            }
             for &n in self.overflow {
+                // A parameter's value is in its register.
+                match self.f.params.iter().position(|p| &**p == n) {
+                    Some(k) => self.ldar(k as u8 + 1),
+                    None => self.emit(Op::LdaUndefined, &[]),
+                }
                 self.named(Op::SetNamed, env, n);
             }
         }
         if arguments_object(self.p, self.index) {
-            let r = self.locals["arguments"];
-            self.emit(Op::CreateArguments, &[Arg::Reg(r)]);
+            match self.locals.get("arguments") {
+                Some(&r) => self.emit(Op::CreateArguments, &[Arg::Reg(r)]),
+                None => {
+                    let t = self.alloc(self.f.pos)?;
+                    self.emit(Op::CreateArguments, &[Arg::Reg(t)]);
+                    self.ldar(t);
+                    self.store_var("arguments", self.f.pos)?;
+                    self.temp -= 1;
+                }
+            }
         }
         if self.f.rest {
             let k = self.f.params.len() - 1;
@@ -1214,6 +1315,13 @@ impl<'a> Gen<'a> {
         {
             self.emit(Op::LdaCallee, &[]);
             self.star(self.locals[n]);
+        } else if let Some(n) = own_name(self.p, self.index)
+            && self.overflow.contains(&n)
+            && !self.f.params.iter().any(|p| &**p == n)
+            && !explicit_declarations(self.p, self.index).contains(&n)
+        {
+            self.emit(Op::LdaCallee, &[]);
+            self.store_var(n, self.f.pos)?;
         }
         // (A new frame's: no upvalues of its registers to close yet.)
         self.entering = true;
@@ -1231,7 +1339,7 @@ impl<'a> Gen<'a> {
             // `var x;` makes a global that reads as undefined.
             // Declared before the script runs, `undefined` unless a global
             // of that name exists (`var performance = performance || {}`).
-            for name in self.script_vars() {
+            for name in self.script_vars().into_iter().filter(|_| !self.p.direct_eval) {
                 self.global(Op::LdaGlobalInsideTypeof, name);
                 self.global(Op::StaGlobal, name);
             }
@@ -1586,8 +1694,29 @@ impl<'a> Gen<'a> {
         if self.withs.is_empty() {
             return false;
         }
-        let skip = self.p.lexicals.get(name).map_or(0, |l| l.withs);
-        self.withs.len() > skip
+        self.withs.len() > self.with_skip(name)
+    }
+
+    /// The enclosing `with`s that don't shadow `name`: those outside its
+    /// block-scoped binding's declaration (counting a direct `eval`'s
+    /// function's scope object, see `Gen::new`).
+    fn with_skip(&self, name: &str) -> usize {
+        let Some(l) = self.p.lexicals.get(name) else {
+            return 0;
+        };
+        // (The eval scope object is outside the block-scoped bindings
+        // declared in its function.)
+        let inside = eval_scope(self.p, self.index).is_some_and(|k| {
+            let mut j = Some(l.func);
+            while let Some(q) = j {
+                if q == k {
+                    return true;
+                }
+                j = self.p.functions[q].parent;
+            }
+            false
+        });
+        l.withs + usize::from(inside)
     }
 
     /// Entering a scope of statements `stmts`: its block-scoped variables
@@ -1921,9 +2050,9 @@ impl<'a> Gen<'a> {
         // that object's register (an upvalue).
         let mut f = self.f.parent;
         while let Some(k) = f.filter(|&k| k != 0) {
-            if let Some(at) = self.decls[k].position(name) {
-                // (Past the registers: see `generate`.)
-                if at >= LOCAL_REGS
+            if self.decls[k].position(name).is_some() {
+                // (In its scope object: see `generate`.)
+                if self.overflows[k].contains(&name)
                     && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == ENV)
                 {
                     return Ok(Var::ScopeUpvalue(u as u8));
@@ -1989,8 +2118,8 @@ impl<'a> Gen<'a> {
         other: &mut dyn FnMut(&mut Self) -> R<()>,
     ) -> R<L> {
         let end = self.label();
+        let skip = self.with_skip(name);
         let withs = std::mem::take(&mut self.withs);
-        let skip = self.p.lexicals.get(name).map_or(0, |l| l.withs);
         let mark = self.temp;
         let k = self.alloc(pos)?;
         self.string(original(name));
@@ -3007,6 +3136,50 @@ impl<'a> Gen<'a> {
     /// consecutive ones after it; a single argument already in a register
     /// is passed in place.
     fn call(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
+        if let ExprKind::Ident(n) = &f.kind
+            && &**n == "eval"
+            && !new
+            && self.f.has_eval
+            && (self.index != 0 || self.p.direct_eval)
+            && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)))
+        {
+            // Direct `eval`: `[eval, source, scope object, this, strict]`.
+            let mark = self.temp;
+            let fr = self.alloc(pos)?;
+            self.into(f, fr)?;
+            let src = self.alloc(pos)?;
+            match args.first() {
+                Some(a) => self.into(a, src)?,
+                None => {
+                    self.emit(Op::LdaUndefined, &[]);
+                    self.star(src);
+                }
+            }
+            for a in args.iter().skip(1) {
+                self.effect(a)?;
+            }
+            let env = self.alloc(pos)?;
+            if self.index == 0 {
+                // (`eval` in `eval`'s code: the same scope.)
+                self.load_raw("%e0", pos)?;
+                self.star(env);
+            } else {
+                self.mov(self.locals[ENV], env);
+            }
+            let this = self.alloc(pos)?;
+            if self.f.arrow {
+                self.load_var("%this", pos)?;
+            } else {
+                self.ldar(0);
+            }
+            self.star(this);
+            let strict = self.alloc(pos)?;
+            self.emit(if self.f.strict { Op::LdaTrue } else { Op::LdaFalse }, &[]);
+            self.star(strict);
+            self.intrinsic("direct_eval", fr, 5);
+            self.temp = mark;
+            return Ok(());
+        }
         if let ExprKind::SuperMember(_, _, this) = &f.kind
             && !new
         {
@@ -3554,7 +3727,12 @@ impl<'a> Gen<'a> {
                 if f.annex_b {
                     let b = f.binding.as_deref().unwrap();
                     self.load_raw(b, s.pos)?;
-                    self.init_var(f.name.as_deref().unwrap(), s.pos)?;
+                    if self.p.direct_eval && self.index == 0 {
+                        // (Its `var` is the caller's: in the scope object.)
+                        self.store_var(f.name.as_deref().unwrap(), s.pos)?;
+                    } else {
+                        self.init_var(f.name.as_deref().unwrap(), s.pos)?;
+                    }
                 }
             }
             StmtKind::Function(i) if self.depth > 1 => {

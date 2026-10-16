@@ -811,7 +811,7 @@ fn function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `eval(x)`: `x` itself unless a string, else the value of the script it
 /// is, run in the global scope (also when called directly: its `var`s and
 /// functions become globals, and it can't see the caller's variables).
-fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = arg(a, 0);
     let Some(u) = string_units(x) else {
         return Ok(x);

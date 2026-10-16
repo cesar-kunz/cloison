@@ -342,6 +342,8 @@ pub struct Code {
     pub kind: u8,
     /// Its code starts with `LdaNewTarget`.
     pub uses_new_target: bool,
+    /// Its source text (see `asm::FunctionDef::text`).
+    pub text: Option<(std::rc::Rc<str>, u32, u32)>,
     /// Register count, `r0` (`this`) and the parameters included.
     pub nregs: u32,
     /// Its inline caches, one slot per `ic_names` entry, made when first
@@ -660,6 +662,9 @@ pub struct Vm {
     pub(crate) eval_envs: Vec<[Value; 2]>,
     /// `%ThrowTypeError%`.
     pub(crate) thrower: *mut Object,
+    /// The global `eval` (what a direct `eval` calls: see
+    /// `intrinsics::direct_eval`).
+    pub(crate) eval_function: *mut Object,
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
@@ -823,6 +828,7 @@ impl Vm {
             new_target: Value::EMPTY,
             eval_envs: Vec::new(),
             thrower: std::ptr::null_mut(),
+            eval_function: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
@@ -3021,6 +3027,7 @@ impl Vm {
             length: nparams,
             kind: 0,
             uses_new_target: false,
+            text: None,
             nregs: 1 + nparams,
             ics: Default::default(),
             ic_names: Box::new([]),
@@ -3450,6 +3457,7 @@ impl Vm {
                     length: f.length,
                     kind: f.kind,
                     uses_new_target,
+                    text: f.text.clone(),
                     nregs: f.nregs,
                     ics: Default::default(),
                     ic_names: ic_names.into_boxed_slice(),
@@ -3557,6 +3565,7 @@ impl Vm {
         .chain(self.symbols.values().copied())
         .chain(self.symbol_roots.iter().copied())
         .chain(std::iter::once(self.thrower))
+        .chain(std::iter::once(self.eval_function))
         .chain(self.error_prototypes.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)

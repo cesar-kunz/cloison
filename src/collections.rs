@@ -18,7 +18,7 @@ use crate::jit::Ty;
 use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
-use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push, string_units};
+use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push};
 
 /// Indices into `Vm::collection_prototypes`.
 #[derive(Clone, Copy)]

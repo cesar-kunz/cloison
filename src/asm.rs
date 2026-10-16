@@ -73,6 +73,9 @@ pub struct FunctionDef {
     pub kind: u8,
     /// Its `length` property.
     pub length: u32,
+    /// Its source text: the source and the span in it, for
+    /// `Function.prototype.toString`.
+    pub text: Option<(std::rc::Rc<str>, u32, u32)>,
 }
 
 /// A function to compile when it is first called: its text in the source
@@ -384,6 +387,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             lazy: None,
             kind: 0,
             length: b.params,
+            text: None,
         });
     }
     Ok(Module {

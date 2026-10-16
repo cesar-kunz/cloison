@@ -112,6 +112,7 @@ fn parse_pass<'a, 'p>(
         has_eval: false,
         uses_new_target: false,
         hidden: Vec::new(),
+        text: None,
         home: None,
         ctor_var: None,
         free: None,
@@ -532,6 +533,8 @@ impl<'a> Parser<'_, 'a, '_> {
                             // `catch ([a, b])`: the exception in a variable
                             // of its own, destructured as the block starts.
                             let pos = self.pos();
+                            // (A pattern's names do block Annex B's `var`s.)
+                            self.frames.last_mut().unwrap().catch = false;
                             let mut names = Vec::new();
                             let mut pat = self.binding_pattern(&mut names)?;
                             let map: Vec<(Name, Name)> = names.iter().map(|n| (n.clone(), self.declare(n, LET, 0))).collect();
@@ -1020,6 +1023,7 @@ impl<'a> Parser<'_, 'a, '_> {
             has_eval: false,
             uses_new_target: false,
             hidden: Vec::new(),
+        text: None,
             home,
             ctor_var,
             free: None,
@@ -1247,6 +1251,7 @@ impl<'a> Parser<'_, 'a, '_> {
             has_eval: false,
             uses_new_target: false,
             hidden: Vec::new(),
+        text: None,
             home: None,
             ctor_var: None,
             free: None,
@@ -2134,12 +2139,12 @@ impl<'a> Parser<'_, 'a, '_> {
             if self.eat(";") {
                 continue;
             }
-            let mpos = self.pos();
             let is_static = matches!(self.peek(), Tok::Ident(n) if &**n == "static")
                 && !matches!(self.peek_at(1), Tok::Punct("(" | "="));
             if is_static {
                 self.advance();
             }
+            let mpos = self.pos();
             if self.is("*") {
                 return self.err("generator methods are not supported");
             }
@@ -2187,6 +2192,8 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(f) => f,
             None => self.default_constructor(name.clone(), class_kind, &home, &home_static, end),
         };
+        // (Its text is the class's, from `class`.)
+        self.functions[constructor].text = Some((pos, end + 1));
         let inner = match &name {
             Some(n) => {
                 let r = self.declare(n, CONST, end + 1);
@@ -2275,6 +2282,7 @@ impl<'a> Parser<'_, 'a, '_> {
             has_eval: false,
             uses_new_target: true,
             hidden: Vec::new(),
+        text: None,
             home: Some(home.clone()),
             ctor_var: Some(home_static.clone()),
             free: None,

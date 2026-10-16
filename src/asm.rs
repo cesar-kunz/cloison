@@ -171,6 +171,8 @@ pub struct Module {
     /// The script's `var` and function names: globals that exist (as
     /// `undefined`) before it assigns them (see `Vm::get_global_miss`).
     pub declared: Vec<String>,
+    /// Which of `declared` are functions' (declarations at its top level).
+    pub function_names: Vec<String>,
     /// Its own block-scoped names (`let`, `const`, `class`): a script's
     /// may not be declared by another script (see `Vm::declare_script`).
     pub lexical: Vec<String>,
@@ -395,6 +397,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
         functions,
         script,
         declared: Vec::new(),
+        function_names: Vec::new(),
     })
 }
 

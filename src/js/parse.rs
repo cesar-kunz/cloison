@@ -148,6 +148,7 @@ fn parse_pass<'a, 'p>(
             functions: p.functions,
             lexicals: p.lexicals,
             direct_eval: eval.is_some(),
+            eval_locals: false,
         },
         p.table,
     ))

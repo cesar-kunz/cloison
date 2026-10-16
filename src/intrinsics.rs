@@ -23,6 +23,13 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("define_getter", define_getter),
     ("define_setter", define_setter),
     ("throw_const", throw_const),
+    ("class_setup", class_setup),
+    ("define_method", define_method),
+    ("super_get", super_get),
+    ("super_set", super_set),
+    ("super_call", super_call),
+    ("derived_return", derived_return),
+    ("class_call_check", class_call_check),
 ];
 
 /// The id of the intrinsic `name`.
@@ -112,19 +119,51 @@ pub(crate) fn is_constructor(f: Value) -> bool {
 
 /// `new f(…args)`, from the runtime.
 pub(crate) fn construct(vm: &mut Vm, f: Value, args: &[Value]) -> Result<Value> {
+    construct_with(vm, f, args, f)
+}
+
+/// `new f(…args)` with `new.target` `nt`: a bytecode function's `this`
+/// made from `nt.prototype` (a derived class's left to `super()`).
+pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result<Value> {
     if f.is_cell() && unsafe { (*as_object(f)).class } == Class::Function {
         let o = as_object(f);
-        if !unsafe { (*(*o).code).constructor() } {
+        let code = unsafe { &*(*o).code };
+        if !code.constructor() {
             return Err(Error::type_error(format!("{} is not a constructor", crate::vm::display(f))));
         }
-        let this = vm.construct_this(o);
-        let r = call_function(vm, f, this, args)?;
-        return Ok(if r.is_cell() && crate::props::is_object(r) { r } else { this });
+        let this = if code.kind == 3 {
+            Value::HOLE
+        } else if nt == f {
+            vm.construct_this(o)
+        } else {
+            let proto = prototype_of_target(vm, nt)?;
+            object_value(vm.new_object(proto))
+        };
+        if code.uses_new_target {
+            vm.new_target = nt;
+        }
+        let r = call_function(vm, f, this, args);
+        vm.new_target = Value::EMPTY;
+        let r = r?;
+        return Ok(if crate::props::is_object(r) { r } else { this });
     }
     if !is_constructor(f) {
         return Err(Error::type_error(format!("{} is not a constructor", crate::vm::display(f))));
     }
-    vm.construct_other(f, args)
+    let r = vm.construct_other(f, args)?;
+    // (A builtin subclassed: its object gets the subclass's prototype.)
+    if nt != f && crate::props::is_object(r) {
+        let proto = prototype_of_target(vm, nt)?;
+        vm.set_prototype_of(as_object(r), proto);
+    }
+    Ok(r)
+}
+
+/// `nt.prototype` if an object, else `Object.prototype`.
+fn prototype_of_target(vm: &mut Vm, nt: Value) -> Result<Value> {
+    let a = vm.a_prototype;
+    let p = vm.get(nt, a)?;
+    Ok(if crate::props::is_object(p) { p } else { object_value(vm.object_prototype) })
 }
 
 /// A template literal: `[s0, e1, s1, e2, …]`, each substitution's
@@ -213,6 +252,201 @@ fn define_setter(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn throw_const(_: &mut Vm, a: &[Value]) -> Result<Value> {
     let n = String::from_utf16_lossy(crate::vm::string_units(a[0]).unwrap_or(&[]));
     Err(Error::type_error(format!("Assignment to constant variable '{n}'.")))
+}
+
+/// A class being made: `[heritage, F]` (heritage `HOLE` if none): sets
+/// up `F.prototype` and `F`'s prototype; returns `F.prototype`.
+fn class_setup(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (h, f) = (a[0], a[1]);
+    let function_proto = object_value(vm.function_prototype);
+    let (proto_parent, ctor_parent) = if h == Value::HOLE {
+        (object_value(vm.object_prototype), function_proto)
+    } else if h.is_null() {
+        (Value::NULL, function_proto)
+    } else if !is_constructor(h) {
+        return Err(Error::type_error(format!(
+            "Class extends value {} is not a constructor or null",
+            crate::vm::display(h)
+        )));
+    } else {
+        let a_prototype = vm.a_prototype;
+        let p = vm.get(h, a_prototype)?;
+        if !(p.is_null() || crate::props::is_object(p)) {
+            return Err(Error::type_error(format!(
+                "Class extends value does not have valid prototype property {}",
+                crate::vm::display(p)
+            )));
+        }
+        (p, h)
+    };
+    let proto = object_value(vm.new_object(proto_parent));
+    let a_constructor = vm.intern("constructor");
+    let d = Desc::data(f, true, false, true);
+    vm.define_own_property(as_object(proto), Key::Name(a_constructor), &d)?;
+    let a_prototype = vm.a_prototype;
+    let d = Desc::data(proto, false, false, false);
+    vm.define_own_property(as_object(f), Key::Name(a_prototype), &d)?;
+    vm.set_prototype_of(as_object(f), ctor_parent);
+    Ok(proto)
+}
+
+/// A class's method: `[o, key, f, computed]`, not enumerable (a computed
+/// key's function named after it).
+fn define_method(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let key = to_property_key(vm, a[1])?;
+    if a[3] == Value::TRUE {
+        set_function_name(vm, a[2], key, "")?;
+    }
+    let d = Desc::data(a[2], true, false, true);
+    vm.define_own_property(as_object(a[0]), key, &d)?;
+    Ok(a[0])
+}
+
+/// Name function `f` after property key `key`, `prefix` first.
+fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()> {
+    let k = vm.key_value(key);
+    let mut units: Vec<u16> = prefix.encode_utf16().collect();
+    if !prefix.is_empty() {
+        units.push(b' ' as u16);
+    }
+    units.extend_from_slice(crate::vm::string_units(to_string(vm, k)?).unwrap_or(&[]));
+    let name = vm.new_string(&units);
+    let a_name = vm.a_name;
+    let d = Desc::data(name, false, false, true);
+    vm.define_own_property(as_object(f), Key::Name(a_name), &d)?;
+    Ok(())
+}
+
+/// `o[key]` from `start` on, accessors called with `receiver`.
+fn get_from(vm: &mut Vm, start: Value, key: Key, receiver: Value) -> Result<Value> {
+    let mut o = start;
+    while crate::props::is_object(o) {
+        if let Some(d) = vm.own_property(as_object(o), key) {
+            if d.get.is_some() || d.set.is_some() {
+                return match d.get {
+                    Some(g) if !g.is_undefined() => call_function(vm, g, receiver, &[]),
+                    _ => Ok(Value::UNDEFINED),
+                };
+            }
+            return Ok(d.value.unwrap_or(Value::UNDEFINED));
+        }
+        o = unsafe { (*(*as_object(o)).shape).proto };
+    }
+    if o.is_cell() {
+        // (A string's prototype chain.)
+        return vm.get_key(o, key);
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// The prototype of home object `home` (where `super` looks).
+fn super_base(home: Value) -> Result<Value> {
+    if !crate::props::is_object(home) {
+        return Err(Error::type_error("'super' keyword unexpected here"));
+    }
+    Ok(unsafe { (*(*as_object(home)).shape).proto })
+}
+
+/// `super[key]`: `[home, key, this]`.
+fn super_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let base = super_base(a[0])?;
+    let key = to_property_key(vm, a[1])?;
+    if base.is_null() {
+        return Err(Error::type_error("Cannot read properties of null (reading a super property)"));
+    }
+    get_from(vm, base, key, a[2])
+}
+
+/// `super[key] = v`: `[home, key, v, this]`.
+fn super_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let base = super_base(a[0])?;
+    let key = to_property_key(vm, a[1])?;
+    let (v, this) = (a[2], a[3]);
+    let mut o = base;
+    while crate::props::is_object(o) {
+        if let Some(d) = vm.own_property(as_object(o), key) {
+            if d.get.is_some() || d.set.is_some() {
+                return match d.set {
+                    Some(s) if !s.is_undefined() => call_function(vm, s, this, &[v]).map(|_| v),
+                    _ => Err(Error::type_error("Cannot set a property that has only a getter")),
+                };
+            }
+            if d.writable == Some(false) {
+                return Err(Error::type_error("Cannot assign to a read-only property"));
+            }
+            break;
+        }
+        o = unsafe { (*(*as_object(o)).shape).proto };
+    }
+    if !crate::props::is_object(this) {
+        return Err(Error::type_error("Cannot assign to a property of a primitive"));
+    }
+    match vm.own_property(as_object(this), key) {
+        Some(d) if d.get.is_some() || d.set.is_some() || d.writable == Some(false) => {
+            return Err(Error::type_error("Cannot assign to a read-only property"));
+        }
+        Some(_) => {
+            let d = Desc {
+                value: Some(v),
+                ..Default::default()
+            };
+            vm.define_own_property(as_object(this), key, &d)?;
+        }
+        None => {
+            if !vm.create_data_property(this, key, v).is_ok() {
+                return Err(Error::type_error("Cannot add a property: the object is not extensible"));
+            }
+        }
+    }
+    Ok(v)
+}
+
+/// `super(…args)`: `[F, new.target, args, this]`, `F` the class whose
+/// prototype is the constructor called.
+fn super_call(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (f, nt, this) = (a[0], a[1], a[3]);
+    if !crate::props::is_object(f) {
+        return Err(Error::type_error("'super' keyword unexpected here"));
+    }
+    let parent = unsafe { (*(*as_object(f)).shape).proto };
+    if !is_constructor(parent) {
+        return Err(Error::type_error(format!(
+            "Super constructor {} of anonymous class is not a constructor",
+            crate::vm::display(parent)
+        )));
+    }
+    let args = elements(vm, a[2])?;
+    let r = construct_with(vm, parent, &args, nt)?;
+    if this != Value::HOLE {
+        return Err(Error::reference_error("Super constructor may only be called once"));
+    }
+    Ok(r)
+}
+
+/// What a derived class's constructor returns, `[v, this]`: `v` if an
+/// object, else `this` (initialized: `super()` called).
+fn derived_return(_: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (v, this) = (a[0], a[1]);
+    if crate::props::is_object(v) {
+        return Ok(v);
+    }
+    if !v.is_undefined() {
+        return Err(Error::type_error("Derived constructors may only return object or undefined"));
+    }
+    if this == Value::HOLE {
+        return Err(Error::reference_error(
+            "Must call super constructor in derived class before accessing 'this' or returning from derived constructor",
+        ));
+    }
+    Ok(this)
+}
+
+/// A class constructor called without `new`: `[new.target]`.
+fn class_call_check(_: &mut Vm, a: &[Value]) -> Result<Value> {
+    if a[0].is_undefined() {
+        return Err(Error::type_error("Class constructor cannot be invoked without 'new'"));
+    }
+    Ok(a[0])
 }
 
 #[allow(dead_code)]

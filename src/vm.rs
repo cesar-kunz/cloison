@@ -340,6 +340,8 @@ pub struct Code {
     /// constructor); 2: a class constructor (which only `new` calls); 3:
     /// a derived class's.
     pub kind: u8,
+    /// Its code starts with `LdaNewTarget`.
+    pub uses_new_target: bool,
     /// Register count, `r0` (`this`) and the parameters included.
     pub nregs: u32,
     /// Its inline caches, one slot per `ic_names` entry, made when first
@@ -638,6 +640,10 @@ pub struct Vm {
     /// Tagged templates' strings arrays, by site (see
     /// `intrinsics::template_object`).
     pub(crate) template_cache: crate::jit::HashMap<u64, *mut Object>,
+    /// The `new.target` of the frame about to start (set by
+    /// `intrinsics::construct_with` for a function whose first instruction
+    /// is `LdaNewTarget`, which takes it); `EMPTY` otherwise.
+    pub(crate) new_target: Value,
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
@@ -790,6 +796,7 @@ impl Vm {
             collection_prototypes: Vec::new(),
             promise_roots: Vec::new(),
             template_cache: Default::default(),
+            new_target: Value::EMPTY,
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
@@ -2981,6 +2988,7 @@ impl Vm {
             nparams,
             length: nparams,
             kind: 0,
+            uses_new_target: false,
             nregs: 1 + nparams,
             ics: Default::default(),
             ic_names: Box::new([]),
@@ -3348,6 +3356,7 @@ impl Vm {
                     })
                     .collect();
                 let mut bytecode = f.code;
+                let uses_new_target = bytecode.first() == Some(&(crate::bytecode::Op::LdaNewTarget as u8));
                 // (Without the slack it grew with: it lives as long as the VM.)
                 bytecode.shrink_to_fit();
                 let counter = if f.lazy.is_some() { &STUBS } else { &FUNCTIONS };
@@ -3403,6 +3412,7 @@ impl Vm {
                     nparams: f.nparams,
                     length: f.length,
                     kind: f.kind,
+                    uses_new_target,
                     nregs: f.nregs,
                     ics: Default::default(),
                     ic_names: ic_names.into_boxed_slice(),
@@ -3658,6 +3668,7 @@ impl Scan {
                     | crate::bytecode::Op::LdaHole
                     | crate::bytecode::Op::CheckHole
                     | crate::bytecode::Op::CloseUpvalue
+                    | crate::bytecode::Op::LdaNewTarget
             );
             s.ops += 1;
         }

@@ -127,6 +127,21 @@ pub struct Function<'a> {
     /// Its last parameter is a rest parameter (`...r`), which collects the
     /// arguments from its position on.
     pub rest: bool,
+    /// A class's constructor: 2 (a base class's), 3 (a derived class's);
+    /// 0 otherwise.
+    pub class_kind: u8,
+    /// It reads `new.target` (`%newtarget`, a variable it sets at entry;
+    /// an arrow's is the enclosing function's).
+    pub uses_new_target: bool,
+    /// Variables the parser adds to it (a class's home objects: see
+    /// [`Class::home`]).
+    pub hidden: Vec<Name>,
+    /// A class's method or constructor: the variable holding its `super`'s
+    /// home object.
+    pub home: Option<Name>,
+    /// A class's constructor: the variable holding the class (whose
+    /// prototype `super(…)` constructs).
+    pub ctor_var: Option<Name>,
     /// A function declared in a block: its block-scoped binding (see
     /// [`Program::lexicals`]).
     pub binding: Option<Name>,
@@ -226,6 +241,14 @@ pub enum ExprKind<'a> {
     /// A tagged template's first argument: the site's frozen array of
     /// cooked strings (`None`: an invalid escape), with its `raw` ones.
     TemplateObject(Vec<(Option<String>, String)>),
+    /// A class.
+    Class(Box<Class<'a>>),
+    /// `super(args)` in a derived class's constructor: the variable
+    /// holding the class (see [`Class::home_static`]).
+    SuperCall(Name, Vec<Expr<'a>>),
+    /// `super[key]`: the variable holding the home object, the key, and
+    /// `this`.
+    SuperMember(Name, &'a Expr<'a>, &'a Expr<'a>),
     /// A runtime helper applied to its arguments (see
     /// `crate::intrinsics`), for what the parser desugars.
     Intrinsic(&'static str, Vec<Expr<'a>>),
@@ -252,6 +275,31 @@ pub enum ExprKind<'a> {
     /// `target = value`, or `target op= value`.
     Assign(Option<BinOp>, &'a Expr<'a>, &'a Expr<'a>),
     Comma(&'a Expr<'a>, &'a Expr<'a>),
+}
+
+/// A class: its constructor (a function) and its methods, made where
+/// the class is evaluated.
+#[derive(Debug)]
+pub struct Class<'a> {
+    /// Its binding in its own body (renamed: see [`Program::lexicals`]).
+    pub inner: Option<Name>,
+    pub heritage: Option<Expr<'a>>,
+    pub constructor: usize,
+    pub members: Vec<ClassMember<'a>>,
+    /// The variables (in the function the class is in) holding its
+    /// prototype and itself: the home objects of its methods' and static
+    /// methods' `super`.
+    pub home: Name,
+    pub home_static: Name,
+}
+
+#[derive(Debug)]
+pub struct ClassMember<'a> {
+    pub key: PropKey<'a>,
+    /// 0: a method; 1: a getter; 2: a setter.
+    pub kind: u8,
+    pub is_static: bool,
+    pub function: usize,
 }
 
 /// An object literal property's key.

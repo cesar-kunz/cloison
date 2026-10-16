@@ -588,6 +588,9 @@ impl Parser<'_> {
             _ => return Ok(atom),
         };
         self.i += 1;
+        if min > max {
+            return Err(self.error("numbers out of order in {} quantifier"));
+        }
         if matches!(atom, Node::Start | Node::End | Node::Boundary(_) | Node::Look(..)) {
             return Err(self.error("Nothing to repeat"));
         }

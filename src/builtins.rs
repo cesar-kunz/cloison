@@ -1923,6 +1923,7 @@ fn install_regexps(vm: &mut Vm) {
     );
     // The flags and the source are accessors of the prototype (an
     // instance's own data properties shadow them: `regexp_object`).
+    vm.define_native(rp, "compile", regexp_compile, 2, Ty::Any, false);
     getter(vm, rp, "source", regexp_get::<0>);
     getter(vm, rp, "flags", regexp_get::<1>);
     getter(vm, rp, "global", regexp_get::<2>);
@@ -2032,6 +2033,55 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
 /// `v`'s compiled regular expression, if it is a `RegExp`.
 fn regexp_of<'a>(v: Value) -> Option<&'a crate::regexp::Regex> {
     is_class(v, Class::RegExp).then(|| unsafe { &*((*as_object(v)).code as *const crate::regexp::Regex) })
+}
+
+/// `RegExp.prototype.compile(pattern, flags)` (Annex B): `this` made
+/// anew, of `pattern` (a string, or another `RegExp`'s source and flags).
+fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if !is_class(this, Class::RegExp) {
+        return Err(Error::type_error("RegExp.prototype.compile called on an incompatible receiver"));
+    }
+    let (pattern, flags) = (arg(a, 0), arg(a, 1));
+    let (p, f) = if let Some(re) = regexp_of(pattern) {
+        if !flags.is_undefined() {
+            return Err(Error::type_error("Cannot supply flags when constructing one RegExp from another"));
+        }
+        let a_source = vm.a_source;
+        let src = vm.get(pattern, a_source)?;
+        let src = String::from_utf16_lossy(string_units(src).unwrap_or(&[]));
+        (if src == "(?:)" { String::new() } else { src }, regexp_flags(re))
+    } else {
+        let p = if pattern.is_undefined() {
+            String::new()
+        } else {
+            String::from_utf16_lossy(string_units(crate::intrinsics::to_string(vm, pattern)?).unwrap_or(&[]))
+        };
+        let f = if flags.is_undefined() {
+            String::new()
+        } else {
+            String::from_utf16_lossy(string_units(crate::intrinsics::to_string(vm, flags)?).unwrap_or(&[]))
+        };
+        (p, f)
+    };
+    let made = new_regexp(vm, &p, &f)?;
+    let re = regexp_of(made).unwrap() as *const crate::regexp::Regex;
+    let o = as_object(this);
+    unsafe { (*o).code = re.cast() };
+    let r = unsafe { &*re };
+    let source = if p.is_empty() { "(?:)".to_string() } else { p };
+    let source = str_value(vm, &source);
+    for (k, v) in [
+        (vm.a_source, source),
+        (vm.a_global, Value::from_bool(r.global)),
+        (vm.a_ignore_case, Value::from_bool(r.ignore_case)),
+        (vm.a_multiline, Value::from_bool(r.multiline)),
+    ] {
+        let d = crate::props::Desc::data(v, false, false, true);
+        let _ = vm.define_own_property(o, crate::vm::Key::Name(k), &d);
+    }
+    let a_last = vm.a_last_index;
+    vm.put_key(this, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
+    Ok(this)
 }
 
 /// `RegExp(pattern, flags)`: from a string, or from another `RegExp`

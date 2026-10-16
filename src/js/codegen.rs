@@ -183,6 +183,8 @@ fn generate_from<'p>(
                         upvalues: scopes.upvalues[i].iter().map(|&n| n.into()).collect(),
                         strict: f.strict,
                     }),
+                    kind: function_kind(f),
+                    length: f.length as u32,
                 });
             }
         }
@@ -306,6 +308,11 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
         .collect()
 }
 
+/// `vm::Code::kind` for `f`.
+fn function_kind(f: &Function) -> u8 {
+    if f.arrow || f.method { 1 } else { 0 }
+}
+
 fn unsupported<T>(pos: Pos, what: impl std::fmt::Display) -> R<T> {
     Err(Error::new(pos as usize, format!("unsupported: {what}")))
 }
@@ -391,10 +398,16 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             expr_refs(f, out);
             expr_refs(&args[0], out);
         }
-        Num(_) | Str(_) | Bool(_) | Null | This | Function(_) | Accessor(..) | RegExp(..) => {}
-        Array(es) => es.iter().for_each(|e| expr_refs(e, out)),
-        Object(ps) => ps.iter().for_each(|(_, e)| expr_refs(e, out)),
-        Member(o, _) | Unary(_, o) | Update(o, ..) => expr_refs(o, out),
+        Num(_) | Str(_) | Bool(_) | Null | This | Function(_) | Accessor(..) | RegExp(..) | Hole
+        | TemplateObject(_) => {}
+        Array(es) | Template(_, es) | Intrinsic(_, es) => es.iter().for_each(|e| expr_refs(e, out)),
+        Object(ps) => ps.iter().for_each(|(k, e)| {
+            if let PropKey::Computed(k) = k {
+                expr_refs(k, out);
+            }
+            expr_refs(e, out)
+        }),
+        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) => expr_refs(o, out),
         Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) | Assign(_, a, b) => {
             expr_refs(a, out);
             expr_refs(b, out);
@@ -655,12 +668,13 @@ fn assigns(e: &Expr, name: &str) -> bool {
             matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name) || assigns(v, name)
         }
         Update(t, ..) => matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name),
-        Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) | RegExp(..) => {
-            false
-        }
-        Array(es) => es.iter().any(|e| assigns(e, name)),
-        Object(ps) => ps.iter().any(|(_, e)| assigns(e, name)),
-        Member(o, _) => assigns(o, name),
+        Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) | RegExp(..) | Hole
+        | TemplateObject(_) => false,
+        Array(es) | Template(_, es) | Intrinsic(_, es) => es.iter().any(|e| assigns(e, name)),
+        Object(ps) => ps
+            .iter()
+            .any(|(k, e)| matches!(k, PropKey::Computed(k) if assigns(k, name)) || assigns(e, name)),
+        Member(o, _) | Spread(o) => assigns(o, name),
         Unary(_, x) => assigns(x, name),
         Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) => {
             assigns(a, name) || assigns(b, name)
@@ -963,6 +977,11 @@ impl<'a> Gen<'a> {
             let r = self.locals["arguments"];
             self.emit(Op::CreateArguments, &[Arg::Reg(r)]);
         }
+        if self.f.rest {
+            let k = self.f.params.len() - 1;
+            self.emit(Op::CreateRest, &[Arg::Count(k as u8)]);
+            self.store_var(&self.f.params[k], self.f.pos)?;
+        }
         if self.f.uses_this {
             self.ldar(0);
             self.store_var("%this", self.f.pos)?;
@@ -1065,6 +1084,8 @@ impl<'a> Gen<'a> {
             line: 0,
             col: 0,
             lazy: None,
+            kind: function_kind(self.f),
+            length: if self.index == 0 { 0 } else { self.f.length as u32 },
         })
     }
 
@@ -1312,6 +1333,13 @@ impl<'a> Gen<'a> {
             self.constants.len() - 1
         });
         i as u16
+    }
+
+    /// `acc` = intrinsic `name` of registers `first..first + n` (see
+    /// `crate::intrinsics`).
+    fn intrinsic(&mut self, name: &str, first: u8, n: u8) {
+        let id = crate::intrinsics::id(name);
+        self.emit(Op::Intrinsic, &[Arg::Count(id), Arg::Reg(first), Arg::Count(n)]);
     }
 
     fn closure(&mut self, f: usize) {
@@ -1928,11 +1956,72 @@ impl<'a> Gen<'a> {
                     let a = self.alloc(e.pos)?;
                     self.star(a);
                     for el in elems {
-                        self.value(el)?;
-                        self.emit(Op::PushLiteral, &[Arg::Reg(a)]);
+                        match &el.kind {
+                            Hole => self.intrinsic("hole", a, 1),
+                            Spread(x) => {
+                                let mark = self.temp;
+                                let t = self.alloc(e.pos)?;
+                                self.into(x, t)?;
+                                self.intrinsic("spread", a, 2);
+                                self.temp = mark;
+                            }
+                            _ => {
+                                self.value(el)?;
+                                self.emit(Op::PushLiteral, &[Arg::Reg(a)]);
+                            }
+                        }
                     }
                     self.ldar(a);
                 }
+            }
+            Hole | Spread(_) => unreachable!("the parser makes them array elements and arguments only"),
+            Template(strings, subs) => {
+                let mark = self.temp;
+                let first = self.temp as u8;
+                for (i, s) in strings.iter().enumerate() {
+                    let r = self.alloc(e.pos)?;
+                    self.string(s);
+                    self.star(r);
+                    if let Some(x) = subs.get(i) {
+                        let r = self.alloc(e.pos)?;
+                        self.into(x, r)?;
+                    }
+                }
+                let n = (self.temp - mark) as u8;
+                self.intrinsic("template", first, n);
+                self.temp = mark;
+            }
+            TemplateObject(parts) => {
+                static SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let site = SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mark = self.temp;
+                let first = self.alloc(e.pos)?;
+                self.constant(Constant::Number(site as f64));
+                self.star(first);
+                for (cooked, raw) in parts {
+                    let r = self.alloc(e.pos)?;
+                    match cooked {
+                        Some(c) => self.string(c),
+                        None => self.emit(Op::LdaUndefined, &[]),
+                    }
+                    self.star(r);
+                    let r = self.alloc(e.pos)?;
+                    self.string(raw);
+                    self.star(r);
+                }
+                let n = (self.temp - mark) as u8;
+                self.intrinsic("template_object", first, n);
+                self.temp = mark;
+            }
+            Intrinsic(name, args) => {
+                let mark = self.temp;
+                let first = self.temp as u8;
+                for a in args {
+                    let r = self.alloc(e.pos)?;
+                    self.into(a, r)?;
+                }
+                self.intrinsic(name, first, args.len() as u8);
+                self.temp = mark;
             }
             // A plain object with room for the properties, then each one
             // stored in order (a later duplicate wins).
@@ -1946,7 +2035,10 @@ impl<'a> Gen<'a> {
                         .ok()
                         .filter(|&i| i != u32::MAX && i.to_string() == k)
                 };
-                let named = props.iter().filter(|(k, _)| index(k).is_none()).count();
+                let named = props
+                    .iter()
+                    .filter(|(k, _)| matches!(k, PropKey::Name(k) if index(k).is_none()))
+                    .count();
                 let cap = named.min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
                 let ic = self.auto_ic(&format!("[]{}", cap));
                 self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
@@ -1954,7 +2046,33 @@ impl<'a> Gen<'a> {
                     let mark = self.temp;
                     let o = self.alloc(e.pos)?;
                     self.star(o);
-                    for (name, v) in props {
+                    for (key, v) in props {
+                        let name = match key {
+                            PropKey::Name(n) => n,
+                            PropKey::Computed(k) => {
+                                // `[o, k, v]` for the runtime.
+                                let mark = self.temp;
+                                let t = self.alloc(e.pos)?;
+                                self.mov(o, t);
+                                let kr = self.alloc(e.pos)?;
+                                self.into(k, kr)?;
+                                let vr = self.alloc(e.pos)?;
+                                let which = match v.kind {
+                                    Accessor(set, f) => {
+                                        self.closure(f);
+                                        if set { "define_setter" } else { "define_getter" }
+                                    }
+                                    _ => {
+                                        self.value(v)?;
+                                        "define_field"
+                                    }
+                                };
+                                self.star(vr);
+                                self.intrinsic(which, t, 3);
+                                self.temp = mark;
+                                continue;
+                            }
+                        };
                         if let Accessor(set, f) = v.kind {
                             self.closure(f);
                             let k = self.const_str(name);
@@ -2370,6 +2488,9 @@ impl<'a> Gen<'a> {
     /// consecutive ones after it; a single argument already in a register
     /// is passed in place.
     fn call(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
+        if args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
+            return self.call_spread(f, args, new, pos);
+        }
         if let ExprKind::Ident(n) = &f.kind
             && !new
             && !self.withs.is_empty()
@@ -2439,6 +2560,60 @@ impl<'a> Gen<'a> {
         };
         let ic = self.auto_ic(op.name());
         self.emit(op, &[Arg::Reg(c), Arg::Reg(w), Arg::Count(n), ic]);
+        Ok(())
+    }
+
+    /// A call or `new` with a spread argument: the arguments into an
+    /// array, for the runtime (`[f, this, args]` or `[f, args]`).
+    fn call_spread(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
+        let mark = self.temp;
+        let c = self.alloc(pos)?;
+        let w = if new { c } else { self.alloc(pos)? };
+        match &f.kind {
+            ExprKind::Member(o, name) if !new => {
+                self.into(o, w)?;
+                self.named(Op::GetNamed, w, name);
+                self.star(c);
+            }
+            ExprKind::Index(o, k) if !new => {
+                self.into(o, w)?;
+                self.value(k)?;
+                let ic = self.auto_ic("[]keyed");
+                self.emit(Op::GetKeyed, &[Arg::Reg(w), ic]);
+                self.star(c);
+            }
+            _ => {
+                self.into(f, c)?;
+                if !new {
+                    self.emit(Op::LdaUndefined, &[]);
+                    self.star(w);
+                }
+            }
+        }
+        let a = self.alloc(pos)?;
+        self.emit(Op::CreateArray, &[Arg::Count(args.len().min(255) as u8)]);
+        self.star(a);
+        for x in args {
+            match &x.kind {
+                ExprKind::Spread(x) => {
+                    let m = self.temp;
+                    let t = self.alloc(pos)?;
+                    self.into(x, t)?;
+                    self.intrinsic("spread", a, 2);
+                    self.temp = m;
+                }
+                _ => {
+                    self.value(x)?;
+                    self.emit(Op::PushLiteral, &[Arg::Reg(a)]);
+                }
+            }
+        }
+        if new {
+            self.intrinsic("construct_spread", c, 2);
+        } else {
+            self.intrinsic("call_spread", c, 3);
+        }
+        self.temp = mark;
         Ok(())
     }
 

@@ -848,6 +848,28 @@ handlers! {
         next_or_throw!(Op::DefineAccessor.size(), r)
     }
 
+    fn op_intrinsic(pc, acc, regs, tag) {
+        let (id, first, n) = (*pc.add(1) as usize, *pc.add(2) as usize, *pc.add(3) as usize);
+        let args: Vec<Value> = (0..n).map(|i| *regs.add(first + i)).collect();
+        let f = crate::intrinsics::INTRINSICS[id].1;
+        let r = with_top(regs, None, |vm| f(vm, &args));
+        next_or_throw!(Op::Intrinsic.size(), r)
+    }
+
+    fn op_create_rest(pc, acc, regs, tag) {
+        let vm = &mut *frame_vm(regs);
+        let mut spread = Vec::new();
+        let (args, argc) = frame_args(vm, regs, &mut spread);
+        let k = *pc.add(1) as usize;
+        let values: Vec<Value> = if argc > k {
+            std::slice::from_raw_parts(args.add(k), argc - k).to_vec()
+        } else {
+            Vec::new()
+        };
+        let r = with_top(regs, None, |vm| crate::array::new_array_of(vm, &values));
+        next_or_throw!(Op::CreateRest.size(), r)
+    }
+
     fn op_create_regexp(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
         let k = |at: usize| (&(*frame_code(regs)).constants)[u16::from_le_bytes([*pc.add(at), *pc.add(at + 1)]) as usize];
@@ -1373,7 +1395,7 @@ handlers! {
 
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && (*as_object(f)).class == Class::Function {
+        if is_cell(tag, f) && (*as_object(f)).class == Class::Function && (*(*as_object(f)).code).kind != 1 {
             note_callee(regs, ic_at(regs, pc, 4), as_object(f));
             let this = construct_this(regs, as_object(f));
             let args = reg(pc, 2, regs);
@@ -2990,6 +3012,8 @@ static TABLE: Table = {
     t[Op::LdaCallee as usize] = op_lda_callee;
     t[Op::DefineAccessor as usize] = op_define_accessor;
     t[Op::CreateRegExp as usize] = op_create_regexp;
+    t[Op::Intrinsic as usize] = op_intrinsic;
+    t[Op::CreateRest as usize] = op_create_rest;
     t[Op::StaGlobal as usize] = op_sta_global;
     t[Op::GetNamed as usize] = op_get_named;
     t[Op::SetNamed as usize] = op_set_named;

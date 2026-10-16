@@ -19,7 +19,53 @@ pub enum Tok {
     Punct(&'static str),
     /// A regular expression literal: its pattern and flags.
     RegExp(Box<(String, String)>),
+    /// A piece of a template literal: from its `` ` `` or a substitution's
+    /// `}` to its `` ` `` (`tail`) or the next `${`.
+    Template(Box<TemplatePart>),
     Eof,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemplatePart {
+    /// The text with its escapes decoded; `None` if one is invalid (only
+    /// a tagged template allows that).
+    pub cooked: Option<String>,
+    /// The text as written (line breaks normalized to `\n`).
+    pub raw: String,
+    /// It ends the template.
+    pub tail: bool,
+    /// It starts the template (at its `` ` ``).
+    pub head: bool,
+}
+
+/// Where lone surrogates (`"\uD800"`) go in a Rust string: code points
+/// `LONE_SURROGATES + (u - 0xD800)`, in a private use plane (see
+/// [`units_to_string`]; `Vm::string_constant` maps them back).
+pub const LONE_SURROGATES: u32 = 0xF0000;
+
+/// UTF-16 code units as a string, lone surrogates mapped (see
+/// [`LONE_SURROGATES`]).
+pub fn units_to_string(units: &[u16]) -> String {
+    char::decode_utf16(units.iter().copied())
+        .map(|r| match r {
+            Ok(c) => c,
+            Err(e) => char::from_u32(LONE_SURROGATES + (e.unpaired_surrogate() as u32 - 0xD800)).unwrap(),
+        })
+        .collect()
+}
+
+/// A string's UTF-16 code units, lone surrogates mapped back (see
+/// [`LONE_SURROGATES`]).
+pub fn string_units(s: &str, out: &mut Vec<u16>) {
+    for c in s.chars() {
+        let u = c as u32;
+        if (LONE_SURROGATES..LONE_SURROGATES + 0x800).contains(&u) {
+            out.push((u - LONE_SURROGATES + 0xD800) as u16);
+        } else {
+            let mut b = [0; 2];
+            out.extend_from_slice(c.encode_utf16(&mut b));
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +75,8 @@ pub struct Token {
     pub pos: u32,
     /// Whether a line break precedes it (for automatic semicolons).
     pub newline_before: bool,
+    /// An identifier written with escapes (never a contextual keyword).
+    pub escaped: bool,
 }
 
 /// The reserved words.
@@ -54,7 +102,6 @@ const KEYWORDS: &[&str] = &[
     "import",
     "in",
     "instanceof",
-    "let",
     "new",
     "null",
     "return",
@@ -109,6 +156,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     let mut names: crate::jit::HashMap<&str, Name> = Default::default();
     let mut i = 0;
     let mut newline = false;
+    // The `{`s open: a block's (0), an expression's (1: an object
+    // literal), a template substitution's (2). After a block's `}` a `/`
+    // starts a regular expression.
+    let mut braces: Vec<u8> = Vec::new();
+    let mut closed_expression = false;
+    let mut escaped = false;
+    // The tokens of the `(`s open, and of the last one closed.
+    let mut parens: Vec<usize> = Vec::new();
+    let mut closed_paren = usize::MAX;
     while i < b.len() {
         let c = b[i];
         let start = i;
@@ -158,9 +214,22 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 let (s, n) = string(&src[i..]).ok_or_else(|| err("unterminated string"))?;
                 i += n;
                 Tok::Str(s)
-            } else if c == b'`' {
-                return Err(err("template literals are not supported"));
-            } else if c == b'/' && !toks.last().is_some_and(|t: &Token| ends_expression(&t.tok)) {
+            } else if c == b'`' || (c == b'}' && braces.last() == Some(&2)) {
+                if c == b'}' {
+                    braces.pop();
+                }
+                let (mut part, n) = template(&src[i + 1..]).ok_or_else(|| err("unterminated template literal"))?;
+                part.head = c == b'`';
+                i += 1 + n;
+                if !part.tail {
+                    braces.push(2);
+                }
+                Tok::Template(Box::new(part))
+            } else if c == b'/'
+                && !toks.last().is_some_and(|t: &Token| {
+                    ends_expression(&t.tok) && (t.tok != Tok::Punct("}") || closed_expression)
+                })
+            {
                 let (pattern, flags, n) = regexp(&src[i..]).ok_or_else(|| err("unterminated regular expression"))?;
                 i += n;
                 Tok::RegExp(Box::new((pattern, flags)))
@@ -178,6 +247,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     // never a keyword.
                     let (word, m) = escaped_ident(&src[i..]).ok_or_else(|| err("bad escape in identifier"))?;
                     i += m;
+                    escaped = true;
                     {
                     let w: &str = word.leak();
                     Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
@@ -199,6 +269,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             } else if c == b'\\' && b.get(i + 1) == Some(&b'u') {
                 let (word, m) = escaped_ident(&src[i..]).ok_or_else(|| err("bad escape in identifier"))?;
                 i += m;
+                escaped = true;
                 {
                     let w: &str = word.leak();
                     Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
@@ -211,6 +282,38 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 puncts(c).iter().find(|&&(v, mask, _)| next & mask == v)
             } {
                 i += p.len();
+                if p == "{" {
+                    let expression = match toks.last().map(|t: &Token| &t.tok) {
+                        None => false,
+                        // A function expression's body (`(function () {}) / 1`).
+                        Some(Tok::Punct(")")) if closed_paren != usize::MAX => {
+                            let mut j = closed_paren;
+                            if j > 0 && matches!(toks[j - 1].tok, Tok::Ident(_)) {
+                                j -= 1;
+                            }
+                            j > 1
+                                && toks[j - 1].tok == Tok::Keyword("function")
+                                && !matches!(
+                                    toks[j - 2].tok,
+                                    Tok::Punct(";" | "}" | "{" | ")") | Tok::Keyword("else" | "do")
+                                )
+                        }
+                        Some(Tok::Punct(q)) => !matches!(*q, ")" | "]" | "}" | ";" | "{" | "=>"),
+                        Some(Tok::Keyword(k)) => matches!(
+                            *k,
+                            "return" | "typeof" | "case" | "delete" | "void" | "throw" | "new" | "in" | "instanceof"
+                        ),
+                        Some(Tok::Template(_)) => true,
+                        _ => false,
+                    };
+                    braces.push(expression as u8);
+                } else if p == "}" {
+                    closed_expression = braces.pop() == Some(1);
+                } else if p == "(" {
+                    parens.push(toks.len());
+                } else if p == ")" {
+                    closed_paren = parens.pop().unwrap_or(usize::MAX);
+                }
                 Tok::Punct(p)
             } else {
                 let ch = src[i..].chars().next().unwrap();
@@ -220,12 +323,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             tok,
             pos: start as u32,
             newline_before: std::mem::take(&mut newline),
+            escaped: std::mem::take(&mut escaped),
         });
     }
     toks.push(Token {
         tok: Tok::Eof,
         pos: src.len() as u32,
         newline_before: true,
+        escaped: false,
     });
     Ok(toks)
 }
@@ -236,6 +341,7 @@ fn ends_expression(t: &Tok) -> bool {
         Tok::Ident(_) | Tok::Num(_) | Tok::Str(_) | Tok::RegExp(..) => true,
         Tok::Keyword(k) => matches!(*k, "this" | "true" | "false" | "null" | "super"),
         Tok::Punct(p) => matches!(*p, ")" | "]" | "}" | "++" | "--"),
+        Tok::Template(t) => t.tail,
         Tok::Eof => false,
     }
 }
@@ -429,40 +535,174 @@ fn number(s: &str) -> Option<(f64, usize)> {
 
 /// A string literal at the start of `s`: its value and length.
 fn string(s: &str) -> Option<(String, usize)> {
-    let quote = s.chars().next()?;
-    let mut out = String::new();
-    let mut it = s.char_indices().skip(1);
-    while let Some((i, c)) = it.next() {
+    let b = s.as_bytes();
+    let quote = b[0];
+    let mut out: Vec<u16> = Vec::new();
+    let mut i = 1;
+    while i < b.len() {
+        let c = b[i];
+        if c == quote {
+            return Some((units_to_string(&out), i + 1));
+        }
         match c {
-            _ if c == quote => return Some((out, i + 1)),
-            '\n' | '\r' => return None,
-            '\\' => {
-                let (_, e) = it.next()?;
-                match e {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    'r' => out.push('\r'),
-                    'b' => out.push('\u{8}'),
-                    'f' => out.push('\u{c}'),
-                    'v' => out.push('\u{b}'),
-                    '0' => out.push('\0'),
-                    'x' | 'u' => {
-                        let n = if e == 'x' { 2 } else { 4 };
-                        let mut v = 0;
-                        for _ in 0..n {
-                            v = v * 16 + it.next()?.1.to_digit(16)?;
-                        }
-                        out.push(char::from_u32(v)?);
-                    }
-                    // A line continuation.
-                    '\n' => {}
-                    e => out.push(e),
+            b'\n' | b'\r' => return None,
+            b'\\' => {
+                let (ok, n) = escape(s, i, &mut out);
+                if !ok {
+                    return None;
                 }
+                i += n;
             }
-            c => out.push(c),
+            _ => {
+                let ch = s[i..].chars().next()?;
+                let mut buf = [0; 2];
+                out.extend_from_slice(ch.encode_utf16(&mut buf));
+                i += ch.len_utf8();
+            }
         }
     }
     None
+}
+
+/// The escape sequence at `s[i..]` (at its `\`): its code units onto
+/// `out`, whether it's valid, and its length (an invalid one's up to
+/// where it goes wrong, at least 2).
+fn escape(s: &str, i: usize, out: &mut Vec<u16>) -> (bool, usize) {
+    let b = s.as_bytes();
+    let Some(&e) = b.get(i + 1) else {
+        return (false, 1);
+    };
+    let unit = |out: &mut Vec<u16>, u: u16| out.push(u);
+    match e {
+        b'n' => unit(out, 10),
+        b't' => unit(out, 9),
+        b'r' => unit(out, 13),
+        b'b' => unit(out, 8),
+        b'f' => unit(out, 12),
+        b'v' => unit(out, 11),
+        b'0'..=b'7' => {
+            // `\0`, or a legacy octal escape (up to 377).
+            let mut v = (e - b'0') as u32;
+            let mut n = 2;
+            let max = if e <= b'3' { 3 } else { 2 };
+            while n < max + 1 && b.get(i + n).is_some_and(|d| (b'0'..=b'7').contains(d)) {
+                v = v * 8 + (b[i + n] - b'0') as u32;
+                n += 1;
+            }
+            unit(out, v as u16);
+            return (true, n);
+        }
+        b'x' => {
+            let v = s.get(i + 2..i + 4).and_then(|h| u32::from_str_radix(h, 16).ok().filter(|_| h.bytes().all(|c| c.is_ascii_hexdigit())));
+            match v {
+                Some(v) => {
+                    unit(out, v as u16);
+                    return (true, 4);
+                }
+                None => return (false, 2),
+            }
+        }
+        b'u' => {
+            if b.get(i + 2) == Some(&b'{') {
+                let Some(end) = s[i + 3..].find('}') else {
+                    return (false, 2);
+                };
+                let h = &s[i + 3..i + 3 + end];
+                match u32::from_str_radix(h, 16) {
+                    Ok(v) if !h.is_empty() && h.bytes().all(|c| c.is_ascii_hexdigit()) && v <= 0x10FFFF => {
+                        if v >= 0x10000 {
+                            let v = v - 0x10000;
+                            unit(out, 0xD800 + (v >> 10) as u16);
+                            unit(out, 0xDC00 + (v & 0x3FF) as u16);
+                        } else {
+                            unit(out, v as u16);
+                        }
+                        return (true, end + 4);
+                    }
+                    _ => return (false, 2),
+                }
+            }
+            let v = s.get(i + 2..i + 6).filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit())).and_then(|h| u32::from_str_radix(h, 16).ok());
+            match v {
+                Some(v) => {
+                    unit(out, v as u16);
+                    return (true, 6);
+                }
+                None => return (false, 2),
+            }
+        }
+        // A line continuation.
+        b'\r' => {
+            return (true, if b.get(i + 2) == Some(&b'\n') { 3 } else { 2 });
+        }
+        b'\n' => {}
+        _ => {
+            let ch = s[i + 1..].chars().next().unwrap();
+            if ch == '\u{2028}' || ch == '\u{2029}' {
+                return (true, 1 + ch.len_utf8());
+            }
+            let mut buf = [0; 2];
+            out.extend_from_slice(ch.encode_utf16(&mut buf));
+            return (true, 1 + ch.len_utf8());
+        }
+    }
+    (true, 2)
+}
+
+/// A template literal's piece at the start of `s` (past its `` ` `` or
+/// `}`): the piece and its length, up to and including its `` ` `` or
+/// `${`.
+fn template(s: &str) -> Option<(TemplatePart, usize)> {
+    let b = s.as_bytes();
+    let mut cooked: Option<Vec<u16>> = Some(Vec::new());
+    let mut raw = String::new();
+    let mut i = 0;
+    loop {
+        let c = *b.get(i)?;
+        match c {
+            b'`' => {
+                let cooked = cooked.map(|u| units_to_string(&u));
+                return Some((TemplatePart { cooked, raw, tail: true, head: false }, i + 1));
+            }
+            b'$' if b.get(i + 1) == Some(&b'{') => {
+                let cooked = cooked.map(|u| units_to_string(&u));
+                return Some((TemplatePart { cooked, raw, tail: false, head: false }, i + 2));
+            }
+            b'\\' => {
+                let mut units = Vec::new();
+                let (ok, n) = escape(s, i, &mut units);
+                // (`\0` followed by a digit, or an octal escape: invalid.)
+                let octal = b.get(i + 1).is_some_and(|d| d.is_ascii_digit())
+                    && !(b[i + 1] == b'0' && !b.get(i + 2).is_some_and(|d| d.is_ascii_digit()));
+                if !ok || octal {
+                    cooked = None;
+                } else if let Some(c) = &mut cooked {
+                    c.extend_from_slice(&units);
+                }
+                let n = n.max(2).min(s.len() - i);
+                // (An escaped line break is raw `\` and `\n`.)
+                raw.push_str(&s[i..i + n].replace("\r\n", "\n").replace('\r', "\n"));
+                i += n;
+            }
+            b'\r' => {
+                let n = if b.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                raw.push('\n');
+                if let Some(c) = &mut cooked {
+                    c.push(10);
+                }
+                i += n;
+            }
+            _ => {
+                let ch = s[i..].chars().next()?;
+                raw.push(ch);
+                if let Some(c) = &mut cooked {
+                    let mut buf = [0; 2];
+                    c.extend_from_slice(ch.encode_utf16(&mut buf));
+                }
+                i += ch.len_utf8();
+            }
+        }
+    }
 }
 
 #[cfg(test)]

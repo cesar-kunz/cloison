@@ -93,6 +93,15 @@ pub struct Function<'a> {
     /// An arrow function in it uses its `this`: the variable `%this` holds
     /// it (set at entry).
     pub uses_this: bool,
+    /// A method (of an object literal or a class): not a constructor, and
+    /// with no `prototype`.
+    pub method: bool,
+    /// Its `length`: the parameters before the first with a default or
+    /// the rest parameter.
+    pub length: usize,
+    /// Its last parameter is a rest parameter (`...r`), which collects the
+    /// arguments from its position on.
+    pub rest: bool,
     /// Skimmed, not parsed (see `parse::parse_with`): no body, and the
     /// names it and the functions in it may refer to from outside it (at
     /// least those they do), which stand for its references.
@@ -166,8 +175,22 @@ pub enum ExprKind<'a> {
     Null,
     Ident(Name),
     This,
+    /// Its elements: `Hole` for an elision, `Spread` for `...e`.
     Array(Vec<Expr<'a>>),
-    Object(Vec<(Name, Expr<'a>)>),
+    Object(Vec<(PropKey<'a>, Expr<'a>)>),
+    /// An array literal's elision (`[, 1]`).
+    Hole,
+    /// `...e`, in an array literal or arguments.
+    Spread(&'a Expr<'a>),
+    /// An untagged template literal: its strings (cooked) around its
+    /// substitutions.
+    Template(Vec<String>, Vec<Expr<'a>>),
+    /// A tagged template's first argument: the site's frozen array of
+    /// cooked strings (`None`: an invalid escape), with its `raw` ones.
+    TemplateObject(Vec<(Option<String>, String)>),
+    /// A runtime helper applied to its arguments (see
+    /// `crate::intrinsics`), for what the parser desugars.
+    Intrinsic(&'static str, Vec<Expr<'a>>),
     /// A function expression: an index into [`Program::functions`].
     Function(usize),
     /// A regular expression literal: pattern, flags.
@@ -191,6 +214,14 @@ pub enum ExprKind<'a> {
     /// `target = value`, or `target op= value`.
     Assign(Option<BinOp>, &'a Expr<'a>, &'a Expr<'a>),
     Comma(&'a Expr<'a>, &'a Expr<'a>),
+}
+
+/// An object literal property's key.
+#[derive(Debug)]
+pub enum PropKey<'a> {
+    Name(Name),
+    /// `[e]`
+    Computed(Expr<'a>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -917,16 +917,23 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if vm.bind_helper.is_undefined() {
         vm.bind_helper = run_source(
             vm,
-            "(function (f, that, args) { return function () { \
-               var all = args.slice(); \
-               for (var i = 0; i < arguments.length; i++) all.push(arguments[i]); \
-               return new.target ? new f(...all) : f.apply(that, all); }; })",
+            "(function (f, that, args, ctor) { \
+               if (ctor) return function () { \
+                 var all = args.slice(); \
+                 for (var i = 0; i < arguments.length; i++) all.push(arguments[i]); \
+                 return new.target ? new f(...all) : f.apply(that, all); }; \
+               return ({ bound() { \
+                 var all = args.slice(); \
+                 for (var i = 0; i < arguments.length; i++) all.push(arguments[i]); \
+                 return f.apply(that, all); } }).bound; })",
         )?;
     }
     let rest = vm.new_array();
     crate::vm::array_push(vm, rest, a.get(1..).unwrap_or(&[]))?;
     let helper = vm.bind_helper;
-    let bound = crate::interp::call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), rest])?;
+    // (A constructor only if `this` is one.)
+    let ctor = Value::from_bool(crate::intrinsics::is_constructor(this));
+    let bound = crate::interp::call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), rest, ctor])?;
     // Its `length` (what the target's leaves) and `name` ("bound …").
     let a_length = vm.a_length;
     let len = if vm.own_property(as_object(this), crate::vm::Key::Name(a_length)).is_some() {
@@ -965,7 +972,7 @@ fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     // (A bound function is the bind helper's closure.)
     let bound = vm.bind_helper.is_cell() && {
         let h = unsafe { &*(*as_object(vm.bind_helper)).code };
-        h.closures.first().is_some_and(|&c| std::ptr::eq(c, code))
+        h.closures.iter().any(|&c| std::ptr::eq(c, code))
     };
     if unsafe { (*o).class } == Class::Function
         && !bound

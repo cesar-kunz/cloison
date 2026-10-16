@@ -4091,18 +4091,21 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
 
 pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
-        // An array-like object: `this[length++] = v` for each.
-        if !this.is_cell() {
-            return Err(Error::type_error("Array.prototype.push called on a non-object"));
-        }
+        // An array-like object: `this[length++] = v` for each (a failed
+        // store throws).
+        let this = object_value(vm.to_object(this)?);
         let a_length = vm.a_length;
         let n = crate::interp::to_number(vm.get(this, a_length)?);
-        let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc() };
+        let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc().min(9007199254740991.0) };
+        if n + args.len() as f64 > 9007199254740991.0 {
+            return Err(Error::type_error("Pushing past the largest array-like length"));
+        }
         for &v in args {
-            vm.set_keyed(this, Value::number(n), v)?;
+            let k = vm.property_key(Value::number(n));
+            vm.put_key(this, k, v)?;
             n += 1.0;
         }
-        vm.set(this, a_length, Value::number(n))?;
+        vm.put_key(this, Key::Name(a_length), Value::number(n))?;
         return Ok(Value::number(n));
     }
     let o = as_object(this);

@@ -46,6 +46,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("generator_mode", generator_mode),
     ("delegate_step", delegate_step),
     ("delegate_done", delegate_done),
+    ("throw_delete", throw_delete),
 ];
 
 /// The id of the intrinsic `name`.
@@ -260,7 +261,9 @@ fn define_accessor(vm: &mut Vm, a: &[Value], set: bool) -> Result<Value> {
         configurable: Some(true),
         ..Default::default()
     };
-    vm.define_own_property(as_object(a[0]), key, &d)?;
+    if !vm.define_own_property(as_object(a[0]), key, &d)? {
+        return Err(Error::type_error("Cannot redefine a non-configurable property"));
+    }
     Ok(a[0])
 }
 
@@ -324,7 +327,9 @@ fn define_method(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         set_function_name(vm, a[2], key, "")?;
     }
     let d = Desc::data(a[2], true, false, true);
-    vm.define_own_property(as_object(a[0]), key, &d)?;
+    if !vm.define_own_property(as_object(a[0]), key, &d)? {
+        return Err(Error::type_error("Cannot redefine a non-configurable property"));
+    }
     Ok(a[0])
 }
 
@@ -671,6 +676,11 @@ fn delegate_done(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let a_done = vm.intern("done");
     let d = vm.get(a[0], a_done)?;
     Ok(Value::from_bool(crate::interp::to_boolean(d)))
+}
+
+/// Strict code's failed `delete`.
+fn throw_delete(_: &mut Vm, _: &[Value]) -> Result<Value> {
+    Err(Error::type_error("Cannot delete a non-configurable property"))
 }
 
 #[allow(dead_code)]

@@ -1706,6 +1706,9 @@ fn index_arg(a: &[Value], i: usize, default: usize) -> Result<usize> {
 }
 
 fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    if !vm.is_construct() {
+        return Err(Error::type_error("Constructor ArrayBuffer requires 'new'"));
+    }
     let n = index_arg(a, 0, 0)?;
     if n > 1 << 31 {
         return Err(Error::range_error("Array buffer allocation failed"));

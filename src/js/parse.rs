@@ -70,6 +70,7 @@ fn parse_pass<'a, 'p>(
         withs: Vec::new(),
         with_count: 0,
         classes: 0,
+        home_uses: 0,
         pending_home: None,
         keep,
         prev,
@@ -178,6 +179,8 @@ struct Parser<'t, 'a, 'p> {
     with_count: usize,
     /// Classes so far (for their home objects' variables' names).
     classes: usize,
+    /// `super` property references so far.
+    home_uses: usize,
     /// The home object variables for the method about to be parsed (see
     /// `Function::home`).
     pending_home: Option<(Option<Name>, Option<Name>, u8)>,
@@ -1471,6 +1474,8 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Tok::Punct("{") => {
                 let mut props: Vec<(PropKey<'a>, Expr<'a>)> = Vec::new();
+                let uses = self.home_uses;
+                let mut home: Option<Name> = None;
                 while !self.eat("}") {
                     let ppos = self.pos();
                     // `get k() {…}` / `set k(v) {…}`.
@@ -1485,6 +1490,8 @@ impl<'a> Parser<'_, 'a, '_> {
                         self.advance();
                         let key = self.prop_key()?;
                         let prefix = if set { "set" } else { "get" };
+                        let h = self.object_home(&mut home);
+                        self.pending_home = Some((Some(h), None, 0));
                         let f = self.method(&key, Some(prefix), ppos)?;
                         props.push((key, Expr { kind: ExprKind::Accessor(set, f), pos: ppos }));
                     } else {
@@ -1499,6 +1506,8 @@ impl<'a> Parser<'_, 'a, '_> {
                         } else {
                             let key = self.prop_key()?;
                             if self.is("(") {
+                                let h = self.object_home(&mut home);
+                                self.pending_home = Some((Some(h), None, 0));
                                 let f = self.method(&key, None, ppos)?;
                                 props.push((key, Expr { kind: ExprKind::Function(f), pos: ppos }));
                             } else {
@@ -1515,7 +1524,12 @@ impl<'a> Parser<'_, 'a, '_> {
                         self.expect(",")?;
                     }
                 }
-                ExprKind::Object(props)
+                // (A home object variable only if `super` used it.)
+                let home = home.filter(|_| self.home_uses != uses);
+                if let Some(h) = &home {
+                    self.hidden_var(h.clone());
+                }
+                ExprKind::Object(props, home)
             }
             Tok::RegExp(r) => ExprKind::RegExp(r.0, r.1),
             _ => {
@@ -1777,19 +1791,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let home: Name = format!("%proto{k}").into();
         let home_static: Name = format!("%ctor{k}").into();
         for n in [&home, &home_static] {
-            self.functions[self.current].hidden.push(n.clone());
-            self.lexicals.insert(
-                n.clone(),
-                Lexical {
-                    original: n.clone(),
-                    constant: false,
-                    hoisted: true,
-                    end: 0,
-                    func: self.current,
-                    switch: false,
-                    withs: 0,
-                },
-            );
+            self.hidden_var(n.clone());
         }
         let class_kind = if heritage.is_some() { 3 } else { 2 };
         self.expect("{")?;
@@ -1869,6 +1871,35 @@ impl<'a> Parser<'_, 'a, '_> {
         })
     }
 
+    /// A variable of the current function's, for the parser's own use
+    /// (see `Function::hidden`).
+    fn hidden_var(&mut self, n: Name) {
+        self.functions[self.current].hidden.push(n.clone());
+        self.lexicals.insert(
+            n.clone(),
+            Lexical {
+                original: n,
+                constant: false,
+                hoisted: true,
+                end: 0,
+                func: self.current,
+                switch: false,
+                withs: 0,
+            },
+        );
+    }
+
+    /// An object literal's home object variable (see `ExprKind::Object`),
+    /// named when first needed.
+    fn object_home(&mut self, home: &mut Option<Name>) -> Name {
+        home.get_or_insert_with(|| {
+            let k = self.classes;
+            self.classes += 1;
+            format!("%obj{k}").into()
+        })
+        .clone()
+    }
+
     /// A class's implicit constructor: `constructor() {}`, or a derived
     /// class's `constructor(...args) { super(...args); }`.
     fn default_constructor(&mut self, name: Option<Name>, class_kind: u8, home: &Name, home_static: &Name, end: Pos) -> usize {
@@ -1935,6 +1966,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let Some(home) = self.functions[k].home.clone() else {
             return self.err("`super` outside a method");
         };
+        self.home_uses += 1;
         let key = if self.eat(".") {
             let n = self.property_name()?;
             Expr {

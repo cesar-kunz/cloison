@@ -1074,6 +1074,8 @@ impl<'a> Parser<'_, 'a, '_> {
         let params = self.params();
         self.current = outer;
         let (params, prologue) = params?;
+        // (Known while its body is parsed: see `block_function`.)
+        self.functions[index].params = params.clone();
         self.expect("{")?;
         if self.directive_prologue() {
             self.functions[index].strict = true;
@@ -2065,7 +2067,8 @@ impl<'a> Parser<'_, 'a, '_> {
         if self.collect {
             return;
         }
-        let mut annex_b = !self.functions[self.current].strict;
+        // (Not a parameter's name.)
+        let mut annex_b = !self.functions[self.current].strict && !self.functions[self.current].params.contains(&name);
         for frame in self.frames.iter().rev().skip(1) {
             if frame.vars {
                 break;

@@ -807,12 +807,18 @@ handlers! {
     }
 
     fn op_test_in(pc, acc, regs, tag) {
-        let r = (*frame_vm(regs)).has_property(acc, *reg(pc, 1, regs));
+        let r = with_top(regs, None, |vm| {
+            let r = vm.has_property(acc, *reg(pc, 1, regs));
+            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+        });
         next_or_throw!(Op::TestIn.size(), r.map(Value::from_bool))
     }
 
     fn op_delete_property(pc, acc, regs, tag) {
-        let r = (*frame_vm(regs)).delete_property(*reg(pc, 1, regs), acc);
+        let r = with_top(regs, None, |vm| {
+            let r = vm.delete_property(*reg(pc, 1, regs), acc);
+            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+        });
         next_or_throw!(Op::DeleteProperty.size(), r.map(Value::from_bool))
     }
 
@@ -1560,7 +1566,21 @@ handlers! {
                 next!(any, Op::GetKeyed.size(), kind.load((*o).elems.cast(), i as usize))
             }
         }
-        let r = with_top(regs, None, |vm| vm.get_keyed_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc));
+        let r = with_top(regs, None, |vm| {
+            // An object key converted once, and kept for a `SetKeyed` of
+            // it right after (a compound assignment's: see `Vm::key_cache`).
+            let key = if crate::props::is_object(acc) && !obj.is_undefined() && !obj.is_null() {
+                let k = crate::intrinsics::to_property_key(vm, acc)?;
+                let kv = vm.key_value(k);
+                vm.key_cache = (acc, kv);
+                kv
+            } else {
+                acc
+            };
+            let r = vm.get_keyed_miss(&*frame_code(regs), u16_at(pc, 2), obj, key);
+            // (A key's conversion may have thrown.)
+            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+        });
         next_or_throw!(Op::GetKeyed.size(), r)
     }
 
@@ -1589,7 +1609,20 @@ handlers! {
                 (*ic).loc = crate::vm::APPEND_LOC;
             }
         }
-        let r = with_top(regs, None, |vm| vm.set_keyed(*reg(pc, 1, regs), *reg(pc, 2, regs), acc));
+        let r = with_top(regs, None, |vm| {
+            let mut key = *reg(pc, 2, regs);
+            let base = *reg(pc, 1, regs);
+            if crate::props::is_object(key) && !base.is_undefined() && !base.is_null() {
+                key = if vm.key_cache.0 == key {
+                    std::mem::replace(&mut vm.key_cache, (Value::EMPTY, Value::EMPTY)).1
+                } else {
+                    let k = crate::intrinsics::to_property_key(vm, key)?;
+                    vm.key_value(k)
+                };
+            }
+            let r = vm.set_keyed(*reg(pc, 1, regs), key, acc);
+            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+        });
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
     }
 

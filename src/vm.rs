@@ -662,6 +662,10 @@ pub struct Vm {
     pub(crate) eval_envs: Vec<[Value; 2]>,
     /// `%ThrowTypeError%`.
     pub(crate) thrower: *mut Object,
+    /// The object key the last `GetKeyed` converted, and what to: a
+    /// `SetKeyed` of it next (a compound assignment, an increment) takes
+    /// that instead of converting it again (see `interp::slow_set_keyed`).
+    pub(crate) key_cache: (Value, Value),
     /// The global `eval` (what a direct `eval` calls: see
     /// `intrinsics::direct_eval`).
     pub(crate) eval_function: *mut Object,
@@ -828,6 +832,7 @@ impl Vm {
             new_target: Value::EMPTY,
             eval_envs: Vec::new(),
             thrower: std::ptr::null_mut(),
+            key_cache: (Value::EMPTY, Value::EMPTY),
             eval_function: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),

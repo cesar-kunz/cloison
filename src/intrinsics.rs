@@ -41,6 +41,8 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("direct_eval", direct_eval),
     ("eval_env", eval_env),
     ("null_proto", null_proto),
+    ("to_object", to_object),
+    ("with_set_strict", with_set_strict),
 ];
 
 /// The id of the intrinsic `name`.
@@ -604,6 +606,22 @@ fn eval_env(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn null_proto(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     vm.set_prototype_of(as_object(a[0]), Value::NULL);
     Ok(a[0])
+}
+
+/// ToObject: `[v]` (a `with` statement's object).
+fn to_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    Ok(object_value(vm.to_object(a[0])?))
+}
+
+/// Strict code's store to a `with` object's property: `[o, name, v]`,
+/// a ReferenceError if `o` no longer has it.
+fn with_set_strict(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let key = to_property_key(vm, a[1])?;
+    if !vm.has_key(a[0], key)? {
+        return Err(Error::reference_error(format!("{} is not defined", crate::vm::display(a[1]))));
+    }
+    vm.put_key(a[0], key, a[2])?;
+    Ok(a[2])
 }
 
 #[allow(dead_code)]

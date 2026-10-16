@@ -1717,6 +1717,15 @@ impl<'a> Gen<'a> {
     /// function's scope object, see `Gen::new`).
     fn with_skip(&self, name: &str) -> usize {
         let Some(l) = self.p.lexicals.get(name) else {
+            // A function's own variable is closer than the `with`s around
+            // the function: those inside it may shadow it.
+            let mut k = Some(self.index);
+            while let Some(j) = k.filter(|&j| j != 0) {
+                if self.decls[j].contains(&name) {
+                    return self.p.functions[j].withs.len();
+                }
+                k = self.p.functions[j].parent;
+            }
             return 0;
         };
         // (The eval scope object is outside the block-scoped bindings
@@ -2208,6 +2217,65 @@ impl<'a> Gen<'a> {
         )?;
         self.bind(end);
         self.ldar(v);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// `name = v` inside `with` statements: the reference resolved first
+    /// (the object that has `name`, or `HOLE` for its own binding), then
+    /// `v`, then the store there.
+    fn with_assign(&mut self, name: &str, v: &Expr, pos: Pos) -> R<()> {
+        let mark = self.temp;
+        let target = self.alloc(pos)?;
+        let end = self.with_lookup(
+            name,
+            pos,
+            &mut |g, r| {
+                g.mov(r, target);
+                Ok(())
+            },
+            &mut |g| {
+                g.emit(Op::LdaHole, &[]);
+                g.star(target);
+                Ok(())
+            },
+        )?;
+        self.bind(end);
+        let val = self.alloc(pos)?;
+        self.value(v)?;
+        self.star(val);
+        let hole = self.alloc(pos)?;
+        self.emit(Op::LdaHole, &[]);
+        self.star(hole);
+        let (own, done) = (self.label(), self.label());
+        self.ldar(target);
+        self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+        self.jump_if(Jmp::True, own);
+        if self.f.strict {
+            // (Strict code: the property gone meanwhile is an error.)
+            let m = self.temp;
+            let a = self.alloc(pos)?;
+            self.mov(target, a);
+            let k = self.alloc(pos)?;
+            self.string(original(name));
+            self.star(k);
+            let v = self.alloc(pos)?;
+            self.mov(val, v);
+            self.intrinsic("with_set_strict", a, 3);
+            self.temp = m;
+        } else {
+            self.ldar(val);
+            self.named(Op::SetNamed, target, original(name));
+        }
+        self.jump(done);
+        self.bind(own);
+        self.ldar(val);
+        let withs = std::mem::take(&mut self.withs);
+        let r = self.store_var(name, pos);
+        self.withs = withs;
+        r?;
+        self.bind(done);
+        self.ldar(val);
         self.temp = mark;
         Ok(())
     }
@@ -2980,6 +3048,7 @@ impl<'a> Gen<'a> {
             ExprKind::Ident(n) if op.is_some() && self.in_with(n) => {
                 self.with_compound(n, op.unwrap(), v, pos)
             }
+            ExprKind::Ident(n) if self.in_with(n) => self.with_assign(n, v, pos),
             ExprKind::Ident(n) => {
                 match (op, self.resolve(n, t.pos)?) {
                     (None, _) => self.value(v)?,
@@ -3841,7 +3910,11 @@ impl<'a> Gen<'a> {
             }
             StmtKind::DoWhile(body, c) => self.looping(labels, Some(c), None, body, false)?,
             StmtKind::With(o, name, body) => {
-                self.value(o)?;
+                let mark = self.temp;
+                let t = self.alloc(s.pos)?;
+                self.into(o, t)?;
+                self.intrinsic("to_object", t, 1);
+                self.temp = mark;
                 let saved = std::mem::take(&mut self.withs);
                 self.store_var(name, s.pos)?;
                 self.withs = saved;

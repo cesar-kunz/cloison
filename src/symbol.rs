@@ -248,6 +248,16 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.define_natives(as_object(object_ctor), &[("getOwnPropertySymbols", get_own_property_symbols as NativeFn, 1)]);
     }
 
+    // `@@species` getters: the constructor itself.
+    let a_species = vm.intern(&format!("{SYMBOL_MARK}Symbol.species"));
+    for name in ["Array", "Map", "Set", "Promise", "RegExp", "ArrayBuffer"] {
+        let a = vm.intern(name);
+        let c = vm.get(object_value(g), a).unwrap_or(Value::UNDEFINED);
+        if is_object(c) {
+            define_getter(vm, as_object(c), Key::Name(a_species), "[Symbol.species]", return_this);
+        }
+    }
+
     // Iterators.
     let ip = vm.new_object(op);
     vm.symbol_roots.push(ip);

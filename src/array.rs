@@ -37,6 +37,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("findIndex", array_find_index, 1),
             ("includes", array_includes, 1),
             ("copyWithin", array_copy_within, 2),
+            ("flat", array_flat, 0),
+            ("flatMap", array_flat_map, 1),
         ],
     );
     let a_array = vm.intern("Array");
@@ -167,6 +169,91 @@ fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
     Ok(a)
 }
 
+/// ArraySpeciesCreate(original, n): a new array, or (an array whose
+/// `constructor[@@species]` says so) that constructor's object.
+fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
+    let is_array = original.is_cell() && unsafe { (*as_object(original)).class } == Class::Array;
+    if !is_array {
+        return new_array_len(vm, n);
+    }
+    let a_constructor = vm.a_constructor;
+    let mut c = vm.get(original, a_constructor)?;
+    if crate::props::is_object(c) {
+        let a_species = vm.intern(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
+        c = vm.get(c, a_species)?;
+        if c.is_null() {
+            c = Value::UNDEFINED;
+        }
+    }
+    if c.is_undefined() || (c.is_cell() && as_object(c) == vm.array_fn) {
+        return new_array_len(vm, n);
+    }
+    if !crate::intrinsics::is_constructor(c) {
+        return Err(Error::type_error("object.constructor[Symbol.species] is not a constructor"));
+    }
+    crate::intrinsics::construct(vm, c, &[Value::number(n)])
+}
+
+/// `Set(o, "length", n, true)`: a failure throws.
+fn set_length_or_throw(vm: &mut Vm, o: Value, n: f64) -> Result<()> {
+    let a_length = vm.a_length;
+    vm.put_key(o, Key::Name(a_length), Value::number(n))
+}
+
+/// Whether `concat` spreads `v`: `v[@@isConcatSpreadable]`, else IsArray.
+fn spreadable(vm: &mut Vm, v: Value) -> Result<bool> {
+    if !crate::props::is_object(v) {
+        return Ok(false);
+    }
+    let a = vm.intern(&format!("{}Symbol.isConcatSpreadable", crate::symbol::SYMBOL_MARK));
+    let s = vm.get(v, a)?;
+    if !s.is_undefined() {
+        return Ok(to_boolean(s));
+    }
+    Ok(unsafe { (*as_object(v)).class } == Class::Array)
+}
+
+/// FlattenIntoArray: `source`'s elements into `target` from `start`, to
+/// `depth` (mapped first by `f` with `that`, if given): the next index.
+fn flatten(vm: &mut Vm, target: Value, source: Value, len: f64, start: f64, depth: f64, f: Option<(Value, Value)>) -> Result<f64> {
+    let mut at = start;
+    let mut i = 0.0;
+    while i < len {
+        let (has, mut v) = element(vm, source, i)?;
+        if has {
+            if let Some((f, that)) = f {
+                v = call_function(vm, f, that, &[v, Value::number(i), source])?;
+            }
+            let is_array = v.is_cell() && unsafe { (*as_object(v)).class } == Class::Array;
+            if depth > 0.0 && is_array {
+                let n = vm.length_of(v)?;
+                at = flatten(vm, target, v, n, at, depth - 1.0, None)?;
+            } else {
+                create(vm, target, at, v)?;
+                at += 1.0;
+            }
+        }
+        i += 1.0;
+    }
+    Ok(at)
+}
+
+fn array_flat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, len) = this_object(vm, this)?;
+    let depth = if arg(a, 0).is_undefined() { 1.0 } else { to_integer(arg(a, 0)).max(0.0) };
+    let out = species_create(vm, o, 0.0)?;
+    flatten(vm, out, o, len, 0.0, depth, None)?;
+    Ok(out)
+}
+
+fn array_flat_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, len) = this_object(vm, this)?;
+    let f = callback(a, "flatMap")?;
+    let out = species_create(vm, o, 0.0)?;
+    flatten(vm, out, o, len, 0.0, 1.0, Some((f, arg(a, 1))))?;
+    Ok(out)
+}
+
 /// A new array of `values`.
 pub(crate) fn new_array_of(vm: &mut Vm, values: &[Value]) -> Result<Value> {
     let a = vm.new_array();
@@ -263,10 +350,10 @@ fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
 /// `Array.prototype.concat(…items)`: arrays spread, other values appended.
 fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = object_value(vm.to_object(this)?);
-    let out = vm.new_array();
+    let out = species_create(vm, o, 0.0)?;
     let mut n = 0.0;
     for &item in std::iter::once(&o).chain(a) {
-        let spread = item.is_cell() && unsafe { (*as_object(item)).class } == Class::Array;
+        let spread = spreadable(vm, item)?;
         if !spread {
             if n >= 9007199254740991.0 {
                 return Err(Error::type_error("Array length exceeds the maximum"));
@@ -280,7 +367,7 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             return Err(Error::type_error("Array length exceeds the maximum"));
         }
         let obj = as_object(item);
-        if dense(vm, obj) && dense(vm, as_object(out)) {
+        if unsafe { (*obj).class } == Class::Array && dense(vm, obj) && dense(vm, as_object(out)) {
             unsafe {
                 let m = (*obj).elems_len as usize;
                 let oo = as_object(out);
@@ -461,8 +548,8 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let k = relative(arg(a, 0), len, 0.0);
     let end = relative(arg(a, 1), len, len);
     let count = (end - k).max(0.0);
-    let out = new_array_len(vm, count)?;
-    if dense(vm, as_object(o)) {
+    let out = species_create(vm, o, count)?;
+    if dense(vm, as_object(o)) && dense(vm, as_object(out)) {
         let obj = as_object(o);
         let oo = as_object(out);
         unsafe {
@@ -730,7 +817,8 @@ fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     while k >= 0.0 {
         let (has, v) = element(vm, o, k)?;
         if has && strict_equals(v, x) {
-            return Ok(Value::number(k));
+            // (`-0` as `+0`.)
+            return Ok(Value::number(k + 0.0));
         }
         k -= 1.0;
     }
@@ -811,7 +899,7 @@ fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn array_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     callback(a, "map")?;
-    let out = new_array_len(vm, len)?;
+    let out = species_create(vm, o, len)?;
     each(vm, o, a, "map", |vm, i, _, r| {
         create(vm, out, i, r)?;
         Ok(true)
@@ -820,7 +908,9 @@ fn array_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let out = vm.new_array();
+    let (o, _) = this_object(vm, this)?;
+    callback(a, "filter")?;
+    let out = species_create(vm, o, 0.0)?;
     let mut n = 0.0;
     each(vm, this, a, "filter", |vm, _, v, r| {
         if to_boolean(r) {
@@ -945,20 +1035,61 @@ fn array_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Array.of(…items)`.
-fn array_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    new_array_of(vm, a)
+fn array_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let n = a.len() as f64;
+    let out = if crate::intrinsics::is_constructor(this) && !(this.is_cell() && as_object(this) == vm.array_fn) {
+        crate::intrinsics::construct(vm, this, &[Value::number(n)])?
+    } else {
+        new_array_len(vm, n)?
+    };
+    for (i, &v) in a.iter().enumerate() {
+        create(vm, out, i as f64, v)?;
+    }
+    set_length_or_throw(vm, out, n)?;
+    Ok(out)
 }
 
 /// `Array.from(items, mapfn, thisArg)` over an array-like (no iterators
 /// without symbols; a string's characters are taken as its iteration
 /// would).
-fn array_from(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let items = arg(a, 0);
     let mapfn = arg(a, 1);
     if !mapfn.is_undefined() && !is_callable(mapfn) {
         return Err(Error::type_error("Array.from: mapfn is not callable"));
     }
     let that = arg(a, 2);
+    let custom = crate::intrinsics::is_constructor(this) && !(this.is_cell() && as_object(this) == vm.array_fn);
+    // An iterable: its values (into `this`'s new object, if a constructor).
+    if !items.is_undefined() && !items.is_null() {
+        let a_iter = vm.a_sym_iterator;
+        let m = vm.get(items, a_iter)?;
+        if !m.is_undefined() && !m.is_null() && (custom || string_units(items).is_none()) {
+            let out = if custom { crate::intrinsics::construct(vm, this, &[])? } else { vm.new_array() };
+            let mut n = 0.0;
+            crate::symbol::iterate(vm, items, |vm, v| {
+                let v = if mapfn.is_undefined() { v } else { call_function(vm, mapfn, that, &[v, Value::number(n)])? };
+                create(vm, out, n, v)?;
+                n += 1.0;
+                Ok(())
+            })?;
+            set_length_or_throw(vm, out, n)?;
+            return Ok(out);
+        }
+    }
+    if custom {
+        let (o, len) = this_object(vm, items)?;
+        let out = crate::intrinsics::construct(vm, this, &[Value::number(len)])?;
+        let mut i = 0.0;
+        while i < len {
+            let v = get(vm, o, i)?;
+            let v = if mapfn.is_undefined() { v } else { call_function(vm, mapfn, that, &[v, Value::number(i)])? };
+            create(vm, out, i, v)?;
+            i += 1.0;
+        }
+        set_length_or_throw(vm, out, len)?;
+        return Ok(out);
+    }
     let out = vm.new_array();
     if let Some(u) = string_units(items) {
         let mut n = 0.0;

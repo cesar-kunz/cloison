@@ -3773,8 +3773,10 @@ impl<'a> Gen<'a> {
         // (New bindings before the closures capturing them are made.)
         self.fresh_binding(&c.home, false, pos)?;
         self.fresh_binding(&c.home_static, false, pos)?;
+        // (The inner binding not initialized while the heritage is
+        // evaluated: `class x extends x {}` is a ReferenceError.)
         if let Some(inner) = &c.inner {
-            self.fresh_binding(inner, false, pos)?;
+            self.fresh_binding(inner, true, pos)?;
         }
         let mark = self.temp;
         let h = self.alloc(pos)?;

@@ -600,6 +600,9 @@ pub struct Vm {
     /// that far past the deepest frame's registers).
     pub(crate) max_frame: usize,
     pub(crate) function_shape: *const Shape,
+    /// The shape of closures that aren't constructors (arrows, methods):
+    /// `function_shape` without `prototype`.
+    pub(crate) method_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
     pub(crate) array_shape: *const Shape,
     proto_object_shape: *const Shape,
@@ -678,6 +681,9 @@ pub struct Vm {
     declared: crate::jit::HashSet<Atom>,
     /// Loaded scripts' block-scoped names (see `Module::lexical`).
     lexical_declared: crate::jit::HashSet<Atom>,
+    /// Scripts' (not `eval`s') `var` and function names: their globals
+    /// can't be deleted.
+    script_declared: crate::jit::HashSet<Atom>,
     /// `Function.prototype.bind`'s JS helper, once made.
     pub(crate) bind_helper: Value,
     /// Compiled regular expressions, by pattern and flags (a literal makes
@@ -807,6 +813,7 @@ impl Vm {
             handles: Vec::new(),
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
+            method_shape: std::ptr::null(),
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
             function_call: std::ptr::null(),
@@ -843,6 +850,7 @@ impl Vm {
             bind_helper: Value::UNDEFINED,
             declared: Default::default(),
             lexical_declared: Default::default(),
+            script_declared: Default::default(),
             regexps: HashMap::default(),
             regexp_literals: HashMap::default(),
             caps_buf: Vec::new(),
@@ -923,6 +931,9 @@ impl Vm {
         // Functions' `prototype` and prototypes' `constructor` aren't
         // enumerable.
         vm.function_shape = vm.transition_with(root, vm.a_prototype, DONT_ENUM);
+        // (Arrows' and methods': no `prototype`, the same capacity, so
+        // upvalues are where compiled code reads them.)
+        vm.method_shape = root;
         let root = vm.root_shape(Class::Plain, op, INITIAL_CTOR_CAPACITY);
         vm.proto_object_shape = vm.transition_with(root, vm.a_constructor, DONT_ENUM);
 
@@ -2145,6 +2156,12 @@ impl Vm {
                     if let Some(pair) = self.accessor(g, name) {
                         return self.call_setter(pair, object_value(g), value);
                     }
+                    // (A script's `var` or function: not deletable; an
+                    // eval's is.)
+                    if self.script_declared.contains(&name) {
+                        self.add_property_with(g, name, value, crate::object::DONT_DELETE);
+                        return Ok(());
+                    }
                     if code.strict {
                         return Err(Error::reference_error(format!("{} is not defined", self.atom_name(name))));
                     }
@@ -2839,7 +2856,7 @@ impl Vm {
     /// A closure of `callee`, which has no upvalues.
     pub(crate) fn new_closure(&mut self, callee: *const Code) -> Value {
         unsafe {
-            let f = self.heap.alloc_object(&*self.function_shape);
+            let f = self.heap.alloc_object(&*self.closure_shape(callee));
             (*f).code = callee;
             self.closure_prototype(f)
         }
@@ -2867,7 +2884,7 @@ impl Vm {
         current: *const Object,
     ) -> Value {
         unsafe {
-            let shape = &*self.function_shape;
+            let shape = &*self.closure_shape(callee);
             let ups = &(*callee).upvalues;
             let f = if ups.is_empty() {
                 self.heap.alloc_object(shape)
@@ -2888,6 +2905,11 @@ impl Vm {
         }
     }
 
+    /// The shape a closure of `callee` gets.
+    fn closure_shape(&self, callee: *const Code) -> *const Shape {
+        if unsafe { (*callee).kind } == 1 { self.method_shape } else { self.function_shape }
+    }
+
     /// Give new closure `f` its `prototype` object; `f` as a value.
     fn closure_prototype(&mut self, f: *mut Object) -> Value {
         // (Live in a marking under way: the closure may be allocated
@@ -2895,6 +2917,10 @@ impl Vm {
         crate::gc::mark_code(unsafe { (*f).code });
         let made = unsafe { &(*(*f).code).closures_made };
         made.set(made.get().saturating_add(1).min(2));
+        // (An arrow's or a method's: none.)
+        if unsafe { (*(*f).code).kind } == 1 {
+            return object_value(f);
+        }
         // (A generator function's: a `%GeneratorPrototype%` object.)
         if unsafe { (*(*f).code).kind } == 4 {
             let gp = self.symbol_roots.get(crate::symbol::Root::GeneratorPrototype as usize).copied();
@@ -3355,6 +3381,10 @@ impl Vm {
         for n in &module.lexical {
             let a = self.intern(n);
             self.lexical_declared.insert(a);
+        }
+        for n in &module.declared {
+            let a = self.intern(n);
+            self.script_declared.insert(a);
         }
         Ok(())
     }

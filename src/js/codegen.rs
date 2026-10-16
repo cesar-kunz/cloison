@@ -1946,9 +1946,24 @@ impl<'a> Gen<'a> {
         self.in_try -= 1;
         let ranges = self.close_try();
         if self.reachable {
+            // (A `finally` block completing normally leaves the
+            // statement's completion value as it was.)
+            let saved = match self.completion {
+                Some(cv) => {
+                    let r = self.alloc(pos)?;
+                    self.mov(cv, r);
+                    Some((cv, r))
+                }
+                None => None,
+            };
             self.enter_scope(f, pos)?;
             for s in f {
                 self.stmt(s)?;
+            }
+            if let Some((cv, r)) = saved
+                && self.reachable
+            {
+                self.mov(r, cv);
             }
             if self.reachable {
                 self.jump(after);
@@ -2321,7 +2336,23 @@ impl<'a> Gen<'a> {
             &mut |g, r| {
                 g.named(Op::GetNamed, r, original(name));
                 g.apply(op, v, pos)?;
-                g.named(Op::SetNamed, r, original(name));
+                if g.f.strict {
+                    // (Strict code: the property gone meanwhile is an error.)
+                    let m = g.temp;
+                    let val = g.alloc(pos)?;
+                    g.star(val);
+                    let a = g.alloc(pos)?;
+                    g.mov(r, a);
+                    let k = g.alloc(pos)?;
+                    g.string(original(name));
+                    g.star(k);
+                    let v2 = g.alloc(pos)?;
+                    g.mov(val, v2);
+                    g.intrinsic("with_set_strict", a, 3);
+                    g.temp = m;
+                } else {
+                    g.named(Op::SetNamed, r, original(name));
+                }
                 Ok(())
             },
             &mut |g| {

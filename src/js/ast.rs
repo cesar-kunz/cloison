@@ -185,6 +185,14 @@ pub enum StmtKind<'a> {
         object: Expr<'a>,
         body: &'a Stmt<'a>,
     },
+    /// `for (target of iterable)`: `kind` 0 (an assignment target), 1
+    /// (`var`), 2 (`let`) or 3 (`const`, a declaration's name renamed).
+    ForOf {
+        kind: u8,
+        target: Expr<'a>,
+        iterable: Expr<'a>,
+        body: &'a Stmt<'a>,
+    },
     While(Expr<'a>, &'a Stmt<'a>),
     DoWhile(&'a Stmt<'a>, Expr<'a>),
     Return(Option<Expr<'a>>),

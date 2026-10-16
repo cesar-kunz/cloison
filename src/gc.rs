@@ -849,7 +849,9 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
             | Class::WeakMap
             | Class::WeakSet
             | Class::CollectionIterator
-            | Class::Promise => {
+            | Class::Promise
+            | Class::Symbol
+            | Class::ArrayIterator => {
                 // The primitive it wraps (a string is a cell), or a
                 // collection's entries array, or a promise's state.
                 if within(code) {

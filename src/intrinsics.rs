@@ -30,6 +30,10 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("super_call", super_call),
     ("derived_return", derived_return),
     ("class_call_check", class_call_check),
+    ("get_iterator", get_iterator),
+    ("iterator_step", iterator_step),
+    ("iterator_close", iterator_close),
+    ("iterator_close_quiet", iterator_close_quiet),
 ];
 
 /// The id of the intrinsic `name`.
@@ -58,8 +62,18 @@ pub(crate) fn to_string(vm: &mut Vm, v: Value) -> Result<Value> {
 
 /// ToPropertyKey, its errors thrown.
 pub(crate) fn to_property_key(vm: &mut Vm, v: Value) -> Result<Key> {
+    if crate::symbol::is_symbol(v) {
+        return Ok(Key::Name(crate::symbol::symbol_atom(v)));
+    }
     let v = if v.is_cell() && crate::vm::string_units(v).is_none() {
-        to_string(vm, v)?
+        let p = crate::interp::to_primitive_string(v);
+        if vm.conv_thrown {
+            return Err(vm.take_conv_error());
+        }
+        if crate::symbol::is_symbol(p) {
+            return Ok(Key::Name(crate::symbol::symbol_atom(p)));
+        }
+        to_string(vm, p)?
     } else {
         v
     };
@@ -309,7 +323,17 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
     if !prefix.is_empty() {
         units.push(b' ' as u16);
     }
-    units.extend_from_slice(crate::vm::string_units(to_string(vm, k)?).unwrap_or(&[]));
+    if crate::symbol::is_symbol(k) {
+        // `[description]`.
+        let d = Value::from_bits(unsafe { (*as_object(k)).code } as u64);
+        if let Some(d) = crate::vm::string_units(d) {
+            units.push(b'[' as u16);
+            units.extend_from_slice(d);
+            units.push(b']' as u16);
+        }
+    } else {
+        units.extend_from_slice(crate::vm::string_units(to_string(vm, k)?).unwrap_or(&[]));
+    }
     let name = vm.new_string(&units);
     let a_name = vm.a_name;
     let d = Desc::data(name, false, false, true);
@@ -447,6 +471,28 @@ fn class_call_check(_: &mut Vm, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Class constructor cannot be invoked without 'new'"));
     }
     Ok(a[0])
+}
+
+/// `for … of`'s iterator: `[iterable]`.
+fn get_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    crate::symbol::get_iterator(vm, a[0])
+}
+
+/// `[iterator]`: its next value, or `HOLE` when done.
+fn iterator_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    Ok(crate::symbol::step(vm, a[0])?.unwrap_or(Value::HOLE))
+}
+
+/// A `for … of` left early: `[iterator]` closed.
+fn iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    crate::symbol::close(vm, a[0]).map(|()| Value::UNDEFINED)
+}
+
+/// A `for … of` left by an exception: `[iterator]` closed, its own errors
+/// ignored (the exception goes on).
+fn iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let _ = crate::symbol::close(vm, a[0]);
+    Ok(Value::UNDEFINED)
 }
 
 #[allow(dead_code)]

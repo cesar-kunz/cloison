@@ -112,7 +112,7 @@ pub(crate) fn is_callable(v: Value) -> bool {
 
 /// Whether `v` is an object (not a primitive: strings are cells too).
 pub(crate) fn is_object(v: Value) -> bool {
-    v.is_cell() && unsafe { (*as_object(v)).class } != Class::String
+    v.is_cell() && !matches!(unsafe { (*as_object(v)).class }, Class::String | Class::Symbol)
 }
 
 /// The canonical array index `name` is, if any.
@@ -315,6 +315,10 @@ impl Vm {
                 if sparse && index_of_name(self.atom_name(name)).is_some() {
                     continue;
                 }
+                // (Symbols' keys apart: see `symbol::own_symbol_keys`.)
+                if crate::symbol::is_symbol_atom(self, name) {
+                    continue;
+                }
                 out.push((Key::Name(name), s.attrs[k] & DONT_ENUM == 0));
             }
         }
@@ -333,6 +337,11 @@ impl Vm {
 
     /// A key as a property-access key value (an index as a number).
     pub(crate) fn key_value(&mut self, key: Key) -> Value {
+        if let Key::Name(a) = key
+            && let Some(s) = crate::symbol::atom_symbol(self, a)
+        {
+            return s;
+        }
         match key {
             Key::Index(i) if i <= i32::MAX as u32 => Value::from_i32(i as i32),
             Key::Index(i) => Value::number(i as f64),

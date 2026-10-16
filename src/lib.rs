@@ -18,6 +18,7 @@ pub mod asm;
 mod builtins;
 mod array;
 mod intrinsics;
+mod symbol;
 mod collections;
 mod date;
 mod json;

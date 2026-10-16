@@ -264,6 +264,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // (After the errors: `AggregateError` inherits `Error.prototype`.)
     crate::promise::install(vm);
+    crate::symbol::install(vm);
 }
 
 /// `c.prototype = proto` and `proto.constructor = c`, as the builtins'.
@@ -346,8 +347,16 @@ fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let s = match a.first() {
         None => vm.new_string(&[]),
         Some(&v) if string_units(v).is_some() => v,
+        // (`String(symbol)` is its description; `new String(symbol)` throws.)
+        Some(&v) if crate::symbol::is_symbol(v) && !construct => {
+            let u = crate::symbol::symbol_string(v);
+            return Ok(vm.new_string(&u));
+        }
         Some(&v) => {
             let u = to_string_units(v);
+            if vm.conv_thrown {
+                return Err(vm.take_conv_error());
+            }
             vm.new_string(&u)
         }
     };
@@ -1001,11 +1010,21 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             Class::WeakSet => "WeakSet",
             Class::DataView => "DataView",
             Class::Promise => "Promise",
+            Class::Symbol => "Symbol",
             _ => "Object",
         }
     } else {
         primitive_tag(this)
     };
+    // `@@toStringTag`, if a string.
+    if this.is_cell()
+        && let Some(t) = crate::symbol::tag_of(vm, this)
+    {
+        let mut u: Vec<u16> = "[object ".encode_utf16().collect();
+        u.extend_from_slice(&t);
+        u.push(b']' as u16);
+        return Ok(vm.new_string(&u));
+    }
     Ok(str_value(vm, &format!("[object {tag}]")))
 }
 

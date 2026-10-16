@@ -69,6 +69,12 @@ pub enum Class {
     TypedArray,
     /// A `RegExp`: `code` holds its compiled `regexp::Regex`.
     RegExp,
+    /// A symbol (a primitive: see `symbol`): its key atom in `elems_len`,
+    /// its description in `code`'s bits.
+    Symbol,
+    /// An array's or a string's iterator: `code`'s bits are its state, a
+    /// hidden array (see `symbol::new_iterator`).
+    ArrayIterator,
     /// A wrapper object (`new Number(1)`, `new String("s")`, `new
     /// Boolean(true)`): `code`'s bits are the primitive (a value, which the
     /// collector traces: a string is a cell).
@@ -112,6 +118,8 @@ impl Class {
                 | Class::DataView
                 | Class::CollectionIterator
                 | Class::Promise
+                | Class::Symbol
+                | Class::ArrayIterator
         )
     }
 }

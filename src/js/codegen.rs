@@ -534,6 +534,13 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 test.iter().chain(update).for_each(|e| expr_refs(e, out));
                 stmt(body, out);
             }
+            StmtKind::ForOf {
+                target, iterable, body, ..
+            } => {
+                expr_refs(target, out);
+                expr_refs(iterable, out);
+                stmt(body, out);
+            }
             StmtKind::ForIn {
                 name, object, body, ..
             } => {
@@ -620,6 +627,14 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
                 }
             }
             StmtKind::ForIn { var, fresh, name, .. } if *var || *fresh => add(name, out),
+            StmtKind::ForOf {
+                kind: 1..=3,
+                target: Expr {
+                    kind: ExprKind::Ident(name),
+                    ..
+                },
+                ..
+            } => add(name, out),
             StmtKind::Try(_, Some((name, _)), _) if p.lexicals.contains_key(name) => add(name, out),
             _ => {}
         }
@@ -636,6 +651,7 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
             }
             StmtKind::For { body, .. }
             | StmtKind::ForIn { body, .. }
+            | StmtKind::ForOf { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
             | StmtKind::Labeled(_, body) => stmt(body, p, out),
@@ -789,6 +805,7 @@ fn returns(s: &Stmt) -> bool {
             StmtKind::If(_, a, b) => jumps(a) || b.as_deref().is_some_and(jumps),
             StmtKind::For { body, .. }
             | StmtKind::ForIn { body, .. }
+            | StmtKind::ForOf { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
             | StmtKind::With(_, _, body)
@@ -889,6 +906,8 @@ struct Target {
     cont: Option<L>,
     /// A loop or a `switch`: an unlabeled `break` leaves it.
     breakable: bool,
+    /// A `for (… of …)` loop: its `try` (see `TryCtx::close`).
+    inner_try: Option<usize>,
 }
 
 /// A set of registers.
@@ -987,6 +1006,9 @@ struct TryCtx<'a> {
     ranges: Vec<(u32, u32)>,
     finally: Option<&'a [Stmt<'a>]>,
     targets: usize,
+    /// A `for (… of …)` loop's: the register of the iterator to close when
+    /// a jump leaves it (its "finally").
+    close: Option<u8>,
 }
 
 impl<'a> Gen<'a> {
@@ -1221,6 +1243,14 @@ impl<'a> Gen<'a> {
                     ..
                 } => {
                     decl(ds);
+                    walk(body, init, bare, p);
+                }
+                StmtKind::ForOf { kind, target, body, .. } => {
+                    if *kind == 1
+                        && let ExprKind::Ident(name) = &target.kind
+                    {
+                        init.push(name);
+                    }
                     walk(body, init, bare, p);
                 }
                 StmtKind::ForIn {
@@ -1716,6 +1746,7 @@ impl<'a> Gen<'a> {
             ranges: Vec::new(),
             finally,
             targets: self.targets.len(),
+            close: None,
         });
     }
 
@@ -1741,7 +1772,11 @@ impl<'a> Gen<'a> {
                 t.ranges.push((t.start, end));
             }
             t.start = end;
-            if let Some(f) = t.finally {
+            let (close, finally) = (t.close, t.finally);
+            if let Some(r) = close {
+                self.intrinsic("iterator_close", r, 1);
+            }
+            if let Some(f) = finally {
                 let inner = self.trys.split_off(i);
                 let r = f.iter().try_for_each(|s| self.stmt(s));
                 self.trys.extend(inner);
@@ -3278,6 +3313,7 @@ impl<'a> Gen<'a> {
             StmtKind::If(..)
             | StmtKind::For { .. }
             | StmtKind::ForIn { .. }
+            | StmtKind::ForOf { .. }
             | StmtKind::While(..)
             | StmtKind::DoWhile(..)
             | StmtKind::Switch(..)
@@ -3364,6 +3400,12 @@ impl<'a> Gen<'a> {
             StmtKind::ForIn {
                 name, object, body, fresh, ..
             } => self.for_in(labels, name, *fresh, object, body, s.pos)?,
+            StmtKind::ForOf {
+                kind,
+                target,
+                iterable,
+                body,
+            } => self.for_of(labels, *kind, target, iterable, body, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
             StmtKind::Try(block, catch, finally) => self.try_stmt(block, catch, finally, s.pos)?,
             StmtKind::Throw(e) => {
@@ -3376,7 +3418,7 @@ impl<'a> Gen<'a> {
                     None => self.emit(Op::LdaUndefined, &[]),
                 }
                 self.derived_return(s.pos)?;
-                if self.trys.iter().any(|t| t.finally.is_some()) {
+                if self.trys.iter().any(|t| t.finally.is_some() || t.close.is_some()) {
                     // The value waits in a register while the `finally`
                     // blocks run.
                     let mark = self.temp;
@@ -3412,8 +3454,12 @@ impl<'a> Gen<'a> {
                 // The `try` statements inside the target, left on the way.
                 let t = target.map(|t| t as *const Target).unwrap();
                 let at = self.targets.iter().position(|x| std::ptr::eq(x, t)).unwrap();
-                let depth = self.trys.iter().position(|c| c.targets > at).unwrap_or(self.trys.len());
-                if self.trys[depth..].iter().any(|c| c.finally.is_some()) {
+                let mut depth = self.trys.iter().position(|c| c.targets > at).unwrap_or(self.trys.len());
+                // (`continue` stays in a `for … of`'s own.)
+                if !brk && let Some(k) = self.targets[at].inner_try {
+                    depth = depth.max(k + 1);
+                }
+                if self.trys[depth..].iter().any(|c| c.finally.is_some() || c.close.is_some()) {
                     self.leave_trys(depth)?;
                     self.jump(l);
                     self.reenter_trys(depth);
@@ -3436,6 +3482,7 @@ impl<'a> Gen<'a> {
                         | StmtKind::While(..)
                         | StmtKind::DoWhile(..)
                         | StmtKind::ForIn { .. }
+                        | StmtKind::ForOf { .. }
                         | StmtKind::Labeled(..)
                 ) {
                     self.pending_labels = labels;
@@ -3447,6 +3494,7 @@ impl<'a> Gen<'a> {
                         brk,
                         cont: None,
                         breakable: false,
+                        inner_try: None,
                     });
                     self.stmt(body)?;
                     self.targets.pop();
@@ -3511,6 +3559,7 @@ impl<'a> Gen<'a> {
             brk: end,
             cont: None,
             breakable: true,
+            inner_try: None,
         });
         for ((_, body), &l) in cases.iter().zip(&bodies) {
             self.bind(l);
@@ -3520,6 +3569,94 @@ impl<'a> Gen<'a> {
         }
         self.targets.pop();
         self.bind(end);
+        Ok(())
+    }
+
+    /// `for (target of iterable) body`: the iterator in a register; each
+    /// step's value (`HOLE` when done, see `intrinsics::iterator_step`) to
+    /// the target, then the body. Inside a `try` of its own whose exits
+    /// close the iterator (see `TryCtx::close`), and an exception too.
+    fn for_of(
+        &mut self,
+        labels: Vec<Name>,
+        kind: u8,
+        target: &Expr,
+        iterable: &Expr,
+        body: &'a Stmt,
+        pos: Pos,
+    ) -> R<()> {
+        let it = self.alloc(pos)?;
+        let hole = self.alloc(pos)?;
+        let v = self.alloc(pos)?;
+        self.into(iterable, v)?;
+        self.intrinsic("get_iterator", v, 1);
+        self.star(it);
+        self.emit(Op::LdaHole, &[]);
+        self.star(hole);
+        let (top, cont, done, brk) = (self.loop_label(), self.label(), self.label(), self.label());
+        self.targets.push(Target {
+            labels,
+            brk,
+            cont: Some(cont),
+            breakable: true,
+            inner_try: Some(self.trys.len()),
+        });
+        self.open_try(None);
+        self.trys.last_mut().unwrap().close = Some(it);
+        self.in_try += 1;
+        self.bind(top);
+        self.intrinsic("iterator_step", it, 1);
+        self.star(v);
+        self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+        self.jump_if(Jmp::True, done);
+        match (kind, &target.kind) {
+            (2 | 3, ExprKind::Ident(n)) => {
+                self.fresh_binding(n, false, pos)?;
+                self.ldar(v);
+                self.init_var(n, pos)?;
+            }
+            (_, ExprKind::Ident(n)) => {
+                self.ldar(v);
+                self.store_var(n, pos)?;
+            }
+            (_, ExprKind::Member(o, name)) => {
+                let ro = self.reg(o, &[])?;
+                self.ldar(v);
+                self.named(Op::SetNamed, ro, name);
+            }
+            (_, ExprKind::Index(o, k)) => {
+                let ro = self.reg(o, &[k])?;
+                let rk = self.reg(k, &[])?;
+                self.ldar(v);
+                let ic = self.auto_ic("[]keyed");
+                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+            }
+            _ => return unsupported(pos, "this `for … of` target"),
+        }
+        self.stmt(body)?;
+        self.bind(cont);
+        self.jump(top);
+        self.bind(done);
+        self.in_try -= 1;
+        let ranges = self.close_try();
+        self.targets.pop();
+        if self.reachable {
+            self.jump(brk);
+        }
+        // An exception: the iterator closed (its own errors lost), then
+        // thrown on.
+        let handler = self.label();
+        self.labels[handler.0].used = true;
+        self.reachable = false;
+        self.bind(handler);
+        let at = self.asm.offset() as u32;
+        self.handlers.extend(ranges.iter().map(|&(s, e)| (s, e, at)));
+        let e = self.alloc(pos)?;
+        self.star(e);
+        self.intrinsic("iterator_close_quiet", it, 1);
+        self.ldar(e);
+        self.emit(Op::Throw, &[]);
+        self.bind(brk);
         Ok(())
     }
 
@@ -3564,6 +3701,7 @@ impl<'a> Gen<'a> {
             brk,
             cont: Some(cont),
             breakable: true,
+            inner_try: None,
         });
         self.stmt(body)?;
         self.targets.pop();
@@ -3623,6 +3761,7 @@ impl<'a> Gen<'a> {
             brk,
             cont: Some(cont),
             breakable: true,
+            inner_try: None,
         });
         self.stmt(body)?;
         self.targets.pop();

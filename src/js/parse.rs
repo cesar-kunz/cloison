@@ -2561,6 +2561,11 @@ impl<'a> Parser<'_, 'a, '_> {
         let inner = match &name {
             Some(n) => {
                 let r = self.declare(n, CONST, end + 1);
+                // (A variable of the function: not, in the script, a
+                // global.)
+                if r != *n {
+                    self.functions[self.current].hidden.push(r.clone());
+                }
                 (r != *n).then_some(r)
             }
             None => None,

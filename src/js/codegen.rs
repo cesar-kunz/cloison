@@ -1157,6 +1157,9 @@ struct Gen<'a> {
     fresh: Vec<&'a str>,
     /// Compiling the function's entry (see [`Gen::fresh_binding`]).
     entering: bool,
+    /// Compiling its parameters' defaults (a direct `eval` there may not
+    /// declare `arguments`).
+    in_params: bool,
 }
 
 /// A `try` being compiled: the bytecode ranges it covers (closed around
@@ -1243,6 +1246,7 @@ impl<'a> Gen<'a> {
             depth: 0,
             fresh: Vec::new(),
             entering: false,
+            in_params: false,
             trys: Vec::new(),
         }
     }
@@ -1395,9 +1399,12 @@ impl<'a> Gen<'a> {
                 }
             }
         } else {
-            for s in body {
+            for (k, s) in body.iter().enumerate() {
+                // (Its parameters' defaults first: see `Gen::in_params`.)
+                self.in_params = k < self.f.param_stmts;
                 self.stmt(s)?;
             }
+            self.in_params = false;
         }
         self.emit(Op::LdaUndefined, &[]);
         self.derived_return(self.f.pos)?;
@@ -3260,7 +3267,13 @@ impl<'a> Gen<'a> {
             let strict = self.alloc(pos)?;
             self.emit(if self.f.strict { Op::LdaTrue } else { Op::LdaFalse }, &[]);
             self.star(strict);
-            self.intrinsic("direct_eval", fr, 5);
+            let params = self.alloc(pos)?;
+            // (An arrow has no `arguments` of its own: unless a parameter
+            // has the name, the eval's may be declared.)
+            let restricted = self.in_params && (!self.f.arrow || self.f.params.iter().any(|p| &**p == "arguments"));
+            self.emit(if restricted { Op::LdaTrue } else { Op::LdaFalse }, &[]);
+            self.star(params);
+            self.intrinsic("direct_eval", fr, 6);
             self.temp = mark;
             return Ok(());
         }

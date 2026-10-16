@@ -580,6 +580,10 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     })?;
     // Strict code's `var`s are its own: in a scope object of its own.
     let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
+    // (In parameters' defaults, a `var arguments` is an error.)
+    if a.get(5) == Some(&Value::TRUE) && !own_strict && module.declared.iter().any(|n| n == "arguments") {
+        return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
+    }
     let local = object_value(vm.new_object(Value::NULL));
     let target = if own_strict || !crate::props::is_object(env) { local } else { env };
     for n in &module.declared {

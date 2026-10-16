@@ -107,6 +107,7 @@ fn parse_pass<'a, 'p>(
         method: false,
         length: 0,
         rest: false,
+        param_stmts: 0,
         binding: None,
         annex_b: false,
         class_kind: 0,
@@ -1030,6 +1031,7 @@ impl<'a> Parser<'_, 'a, '_> {
             method: false,
             length: 0,
             rest: false,
+            param_stmts: 0,
             binding: None,
             annex_b: false,
             class_kind: 0,
@@ -1102,6 +1104,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let end = self.toks[self.i - 1].pos + 1;
         self.functions[index].end = end;
         let mut body = body?;
+        self.functions[index].param_stmts = prologue.len();
         if !prologue.is_empty() {
             body.splice(0..0, prologue);
         }
@@ -1258,6 +1261,7 @@ impl<'a> Parser<'_, 'a, '_> {
             method: false,
             length: 0,
             rest: false,
+            param_stmts: 0,
             binding: None,
             annex_b: false,
             class_kind: 0,
@@ -1301,6 +1305,7 @@ impl<'a> Parser<'_, 'a, '_> {
         f.end = end;
         f.params = params;
         let mut body = body?;
+        f.param_stmts = prologue.len();
         if !prologue.is_empty() {
             body.splice(0..0, prologue);
         }
@@ -2289,6 +2294,7 @@ impl<'a> Parser<'_, 'a, '_> {
             method: false,
             length: 0,
             rest: derived,
+            param_stmts: 0,
             binding: None,
             annex_b: false,
             class_kind,

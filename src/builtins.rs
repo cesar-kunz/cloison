@@ -2278,8 +2278,9 @@ fn regexp_match_into(
     } else {
         0
     };
+    // (Stores that throw where `lastIndex` is read-only.)
     if start > s.len() {
-        vm.set(this, a_last, Value::from_i32(0))?;
+        vm.put_key(this, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
         return Ok(false);
     }
     let found = re.exec_into(s, start, caps);
@@ -2287,7 +2288,7 @@ fn regexp_match_into(
         let next = Value::from_i32(if found { caps[0].unwrap().1 } else { 0 } as i32);
         match plain {
             Some(o) => vm.store_field(o, 0, next),
-            None => vm.set(this, a_last, next)?,
+            None => vm.put_key(this, crate::vm::Key::Name(a_last), next)?,
         }
     }
     Ok(found)

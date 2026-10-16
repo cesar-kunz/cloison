@@ -3972,7 +3972,9 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         let regs = vm.stack.as_mut_ptr().add(HEADER);
-        *regs.sub(BUDGET) = Value::from_bits(vm.frame_budget as u64);
+        // (Its own: none if it must stay interpreted, as with exception
+        // handlers.)
+        *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
         set_header(regs, CODE, code);
         set_header(regs, ICS, (*code).ics().as_ptr());
         set_header(regs, VM, vm as *mut Vm);

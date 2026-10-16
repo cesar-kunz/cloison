@@ -1694,21 +1694,31 @@ impl Vm {
     }
 
     /// `o.name` for a property without a slot (a function's `length` and
-    /// `name`, a string object's `length`: see `Vm::own_property`), else
-    /// `undefined`.
+    /// `name`, a string object's or an array's `length`: see
+    /// `Vm::own_property`), `o`'s or a prototype's, else `undefined`.
     #[cold]
     fn virtual_get(&mut self, o: *mut Object, name: Atom) -> Value {
-        unsafe {
-            if !matches!((*o).class, Class::Function | Class::Native | Class::Wrapper) {
-                return Value::UNDEFINED;
-            }
-            if name != self.a_length && name != self.a_name {
-                return Value::UNDEFINED;
-            }
+        if name != self.a_length && name != self.a_name {
+            return Value::UNDEFINED;
         }
-        match self.own_property(o, Key::Name(name)) {
-            Some(d) => d.value.unwrap_or(Value::UNDEFINED),
-            None => Value::UNDEFINED,
+        let mut p = o;
+        loop {
+            unsafe {
+                let class = (*p).class;
+                if name == self.a_length && matches!(class, Class::Array | Class::String | Class::TypedArray) {
+                    return Value::from_i32((*p).elems_len as i32);
+                }
+                if matches!(class, Class::Function | Class::Native | Class::Wrapper)
+                    && let Some(d) = self.own_property(p, Key::Name(name))
+                {
+                    return d.value.unwrap_or(Value::UNDEFINED);
+                }
+                let proto = (*(*p).shape).proto;
+                if !proto.is_cell() {
+                    return Value::UNDEFINED;
+                }
+                p = as_object(proto);
+            }
         }
     }
 
@@ -1895,10 +1905,13 @@ impl Vm {
             // slot, valid (like a prototype's property) while no prototype
             // changes shape.
             let Some((h, slot)) = self.lookup(o, name) else {
-                if matches!((*o).class, Class::Function | Class::Native | Class::Wrapper)
-                    && (name == self.a_length || name == self.a_name)
-                {
-                    return Ok(self.virtual_get(o, name));
+                // (A virtual `length` or `name`, maybe a prototype's: not
+                // cached.)
+                if name == self.a_length || name == self.a_name {
+                    let v = self.virtual_get(o, name);
+                    if !v.is_undefined() || matches!((*o).class, Class::Function | Class::Native | Class::Wrapper) {
+                        return Ok(v);
+                    }
                 }
                 install(
                     ic,

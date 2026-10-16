@@ -253,11 +253,18 @@ pub(crate) fn install(vm: &mut Vm) {
     ];
     let a_name = vm.intern("name");
     let a_message = vm.intern("message");
+    let mut error_ctor = Value::UNDEFINED;
     for (k, kind) in ERROR_KINDS.iter().enumerate() {
         let parent = vm.error_prototypes.first().copied().unwrap_or(op);
         let proto = vm.new_object(object_value(parent));
         let c = vm.define_native(g, kind, CTORS[k], 1, any, true);
         link_constructor(vm, c, proto);
+        // (The kinds' constructors inherit `Error`.)
+        if k == 0 {
+            error_ctor = object_value(c);
+        } else {
+            vm.set_prototype_of(c, error_ctor);
+        }
         let name = vm.new_string(&kind.encode_utf16().collect::<Vec<_>>());
         vm.add_property_with(proto, a_name, name, DONT_ENUM);
         let empty = vm.new_string(&[]);
@@ -2118,6 +2125,15 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// (its source; its flags unless given).
 fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let p = arg(a, 0);
+    // `RegExp(re)`, called: `re` itself if a regexp of `RegExp`'s.
+    if !vm.is_construct() && arg(a, 1).is_undefined() && regexp_of(p).is_some() {
+        let a_ctor = vm.a_constructor;
+        let c = vm.get(p, a_ctor)?;
+        let a_regexp = vm.intern("RegExp");
+        if c == vm.get(object_value(vm.global), a_regexp)? {
+            return Ok(p);
+        }
+    }
     let (mut pattern, mut flags) = (String::new(), String::new());
     if let Some(re) = regexp_of(p) {
         let a_source = vm.intern("source");
@@ -2173,12 +2189,16 @@ fn regexp_match_into(
 ) -> Result<bool> {
     let a_last = vm.a_last_index;
     let plain = plain_last_index(vm, this);
+    // (`lastIndex` read and converted even when not used.)
+    let li = match plain {
+        Some(o) => unsafe { *Object::slot(o, (*(*o).shape).location(0)) },
+        None => vm.get(this, a_last)?,
+    };
+    let li = if li.is_int32() { li.as_i32_unchecked() as f64 } else { to_number(li) };
+    if vm.conv_thrown {
+        return Err(vm.take_conv_error());
+    }
     let start = if re.global || re.sticky {
-        let li = match plain {
-            Some(o) => unsafe { *Object::slot(o, (*(*o).shape).location(0)) },
-            None => vm.get(this, a_last)?,
-        };
-        let li = to_number(li);
         if li.is_nan() || li < 0.0 { 0 } else { li as usize }
     } else {
         0

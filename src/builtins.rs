@@ -97,13 +97,14 @@ pub(crate) fn install(vm: &mut Vm) {
 
     let fp = vm.function_prototype;
     let function = vm.define_native(g, "Function", function_ctor, 1, any, true);
-    vm.define_native(g, "eval", eval_fn, 1, any, false);
+    vm.eval_function = vm.define_native(g, "eval", eval_fn, 1, any, false);
     // A shell's (as V8's `d8`, which Octane's emscripten code expects).
     vm.define_native(g, "print", print_fn, 1, any, false);
     vm.define_native(g, "read", read_fn, 1, any, false);
     link_constructor(vm, function, fp);
     let apply = vm.define_native(fp, "apply", function_apply, 2, any, false);
     vm.define_native(fp, "bind", function_bind, 1, any, false);
+    vm.define_native(fp, "toString", function_to_string, 0, any, false);
     vm.function_apply = unsafe { (*apply).code };
 
     // `Number`, a conversion, and its constants.
@@ -812,7 +813,7 @@ fn function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `eval(x)`: `x` itself unless a string, else the value of the script it
 /// is, run in the global scope (also when called directly: its `var`s and
 /// functions become globals, and it can't see the caller's variables).
-pub(crate) fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = arg(a, 0);
     let Some(u) = string_units(x) else {
         return Ok(x);
@@ -919,13 +920,64 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             "(function (f, that, args) { return function () { \
                var all = args.slice(); \
                for (var i = 0; i < arguments.length; i++) all.push(arguments[i]); \
-               return f.apply(that, all); }; })",
+               return new.target ? new f(...all) : f.apply(that, all); }; })",
         )?;
     }
     let rest = vm.new_array();
     crate::vm::array_push(vm, rest, a.get(1..).unwrap_or(&[]))?;
     let helper = vm.bind_helper;
-    crate::interp::call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), rest])
+    let bound = crate::interp::call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), rest])?;
+    // Its `length` (what the target's leaves) and `name` ("bound …").
+    let a_length = vm.a_length;
+    let len = if vm.own_property(as_object(this), crate::vm::Key::Name(a_length)).is_some() {
+        let l = vm.get(this, a_length)?;
+        match l.as_number() {
+            Some(n) if n == f64::INFINITY => n,
+            Some(n) if n.is_finite() => (n.trunc() - a.len().saturating_sub(1) as f64).max(0.0),
+            Some(n) if n == f64::NEG_INFINITY => 0.0,
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let d = crate::props::Desc::data(Value::number(len), false, false, true);
+    vm.define_own_property(as_object(bound), crate::vm::Key::Name(a_length), &d)?;
+    let a_name = vm.a_name;
+    let name = vm.get(this, a_name)?;
+    let mut units: Vec<u16> = "bound ".encode_utf16().collect();
+    if let Some(u) = string_units(name) {
+        units.extend_from_slice(u);
+    }
+    let name = vm.new_string(&units);
+    let d = crate::props::Desc::data(name, false, false, true);
+    vm.define_own_property(as_object(bound), crate::vm::Key::Name(a_name), &d)?;
+    Ok(bound)
+}
+
+/// `Function.prototype.toString`: a function's source text, or (a native,
+/// a bound function) `function name() { [native code] }`.
+fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    if !crate::props::is_callable(this) {
+        return Err(Error::type_error("Function.prototype.toString requires that 'this' be a Function"));
+    }
+    let o = as_object(this);
+    let code = unsafe { &*(*o).code };
+    // (A bound function is the bind helper's closure.)
+    let bound = vm.bind_helper.is_cell() && {
+        let h = unsafe { &*(*as_object(vm.bind_helper)).code };
+        h.closures.first().is_some_and(|&c| std::ptr::eq(c, code))
+    };
+    if unsafe { (*o).class } == Class::Function
+        && !bound
+        && let Some((src, a, b)) = &code.text
+        && let Some(t) = src.get(*a as usize..*b as usize)
+    {
+        let mut u = Vec::new();
+        crate::js::lex::string_units(t, &mut u);
+        return Ok(vm.new_string(&u));
+    }
+    let name = if bound { String::new() } else { code.name.clone() };
+    Ok(str_value(vm, &format!("function {name}() {{ [native code] }}")))
 }
 
 /// A new array of `values`: an `arguments` object.

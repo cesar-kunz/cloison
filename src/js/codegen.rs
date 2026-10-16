@@ -72,6 +72,16 @@ fn generate_from<'p>(
     src: &str,
 ) -> Result<(Module, Vec<&'p str>), Error> {
     let position = positions(src, lazy.map(|(_, _, at, _)| at));
+    // Functions' source text (`Function.prototype.toString`).
+    let text_source: Rc<str> = match lazy {
+        Some((_, s, ..)) => s.clone(),
+        None => src.into(),
+    };
+    let text_at = |pos: Pos| lazy.map_or(pos, |(_, _, at, _)| at(pos));
+    let text_of = |f: &Function| {
+        let (a, b) = f.text.unwrap_or((f.pos, f.end));
+        Some((text_source.clone(), text_at(a), text_at(b)))
+    };
 
     let mut decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
     // A function with more variables than registers keeps the last ones
@@ -178,6 +188,9 @@ fn generate_from<'p>(
                 let mut f = Gen::new(p, &decls, &overflow[i], &overflow, &scopes, &names, i, lazy.is_some()).function()?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
+                if i != 0 {
+                    f.text = text_of(&p.functions[i]);
+                }
                 functions.push(f);
             }
             Emit::Stub => {
@@ -208,6 +221,7 @@ fn generate_from<'p>(
                     }),
                     kind: function_kind(f),
                     length: f.length as u32,
+                    text: text_of(f),
                 });
             }
         }
@@ -1419,6 +1433,7 @@ impl<'a> Gen<'a> {
             lazy: None,
             kind: function_kind(self.f),
             length: if self.index == 0 { 0 } else { self.f.length as u32 },
+            text: None,
         })
     }
 

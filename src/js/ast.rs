@@ -140,6 +140,9 @@ pub struct Function<'a> {
     /// Variables the parser adds to it (a class's home objects: see
     /// [`Class::home`]).
     pub hidden: Vec<Name>,
+    /// Its source text's span when not `pos..end` (a class's constructor:
+    /// the class's), for `Function.prototype.toString`.
+    pub text: Option<(Pos, Pos)>,
     /// A class's method or constructor: the variable holding its `super`'s
     /// home object.
     pub home: Option<Name>,

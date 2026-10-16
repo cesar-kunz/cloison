@@ -561,9 +561,7 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// made there first, and run with the caller's `this`.
 fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (f, src, env, this, strict) = (a[0], a[1], a[2], a[3], a[4] == Value::TRUE);
-    let builtin = f.is_cell()
-        && unsafe { (*as_object(f)).class } == Class::Native
-        && unsafe { (*(*as_object(f)).code).native } == Some(crate::builtins::eval_fn as crate::vm::NativeFn);
+    let builtin = f.is_cell() && as_object(f) == vm.eval_function;
     if !builtin {
         return call_function(vm, f, Value::UNDEFINED, &[src]);
     }

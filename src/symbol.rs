@@ -37,6 +37,7 @@ const WELL_KNOWN: &[&str] = &[
 /// Indices into `Vm::symbol_roots`.
 #[derive(Clone, Copy)]
 #[repr(usize)]
+#[allow(dead_code)]
 pub(crate) enum Root {
     SymbolPrototype,
     IteratorPrototype,

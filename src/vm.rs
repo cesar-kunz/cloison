@@ -1820,7 +1820,7 @@ impl Vm {
         }
     }
 
-    fn get_primitive(&self, obj: Value, name: Atom) -> Result<Value> {
+    fn get_primitive(&mut self, obj: Value, name: Atom) -> Result<Value> {
         if obj.is_undefined() || obj.is_null() {
             return Err(Error::type_error(format!(
                 "Cannot read properties of {obj:?} (reading '{}')",
@@ -1831,10 +1831,15 @@ impl Vm {
         // `Boolean.prototype`'s.
         if obj.is_number() || obj.is_bool() {
             let o = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
-            return Ok(match self.lookup(o, name) {
-                Some((h, slot)) => unsafe { *Object::slot(h, (*(*h).shape).location(slot)) },
-                None => Value::UNDEFINED,
-            });
+            return match self.lookup(o, name) {
+                // (A getter's `this` the primitive.)
+                Some((h, slot)) if self.is_accessor(h, slot) => {
+                    let pair = unsafe { *Object::slot(h, (*(*h).shape).location(slot)) };
+                    self.call_getter(pair, obj)
+                }
+                Some((h, slot)) => Ok(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) }),
+                None => Ok(Value::UNDEFINED),
+            };
         }
         Ok(Value::UNDEFINED)
     }

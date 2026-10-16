@@ -802,7 +802,8 @@ handlers! {
     }
 
     fn op_test_instance_of(pc, acc, regs, tag) {
-        let r = (*frame_vm(regs)).instance_of(*reg(pc, 1, regs), acc);
+        // (Where a `prototype` getter can be called.)
+        let r = with_top(regs, None, |vm| vm.instance_of(*reg(pc, 1, regs), acc));
         next_or_throw!(Op::TestInstanceOf.size(), r.map(Value::from_bool))
     }
 

@@ -2121,10 +2121,14 @@ impl<'a> Gen<'a> {
         if self.reachable {
             // (A `finally` block completing normally leaves the
             // statement's completion value as it was.)
+            // (One leaving it abruptly, its own: `undefined` unless it says
+            // otherwise.)
             let saved = match self.completion {
                 Some(cv) => {
                     let r = self.alloc(pos)?;
                     self.mov(cv, r);
+                    self.emit(Op::LdaUndefined, &[]);
+                    self.star(cv);
                     Some((cv, r))
                 }
                 None => None,
@@ -2152,6 +2156,10 @@ impl<'a> Gen<'a> {
         let mark = self.temp;
         let r = self.alloc(pos)?;
         self.star(r);
+        if let Some(cv) = self.completion {
+            self.emit(Op::LdaUndefined, &[]);
+            self.star(cv);
+        }
         self.enter_scope(f, pos)?;
         for s in f {
             self.stmt(s)?;

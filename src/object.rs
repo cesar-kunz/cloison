@@ -75,6 +75,9 @@ pub enum Class {
     /// An array's or a string's iterator: `code`'s bits are its state, a
     /// hidden array (see `symbol::new_iterator`).
     ArrayIterator,
+    /// A generator object: `code`'s bits are its state, a hidden array
+    /// (see `generator`).
+    Generator,
     /// A wrapper object (`new Number(1)`, `new String("s")`, `new
     /// Boolean(true)`): `code`'s bits are the primitive (a value, which the
     /// collector traces: a string is a cell).
@@ -120,6 +123,7 @@ impl Class {
                 | Class::Promise
                 | Class::Symbol
                 | Class::ArrayIterator
+                | Class::Generator
         )
     }
 }

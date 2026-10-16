@@ -445,7 +445,7 @@ pub struct Code {
 impl Code {
     /// Whether `new` may call it.
     pub fn constructor(&self) -> bool {
-        self.kind != 1
+        !matches!(self.kind, 1 | 4)
     }
 
     /// The inline-cache slot `i` (its way 0, the others following), and
@@ -2895,6 +2895,14 @@ impl Vm {
         crate::gc::mark_code(unsafe { (*f).code });
         let made = unsafe { &(*(*f).code).closures_made };
         made.set(made.get().saturating_add(1).min(2));
+        // (A generator function's: a `%GeneratorPrototype%` object.)
+        if unsafe { (*(*f).code).kind } == 4 {
+            let gp = self.symbol_roots.get(crate::symbol::Root::GeneratorPrototype as usize).copied();
+            let proto = gp.map_or(Value::NULL, object_value);
+            let p = self.new_object(proto);
+            self.store_field(f, 0, object_value(p));
+            return object_value(f);
+        }
         let p = self.heap.alloc_object(unsafe { &*self.proto_object_shape });
         self.store_field(p, 0, object_value(f));
         self.store_field(f, 0, object_value(p));
@@ -3727,6 +3735,8 @@ impl Scan {
                     | crate::bytecode::Op::CheckHole
                     | crate::bytecode::Op::CloseUpvalue
                     | crate::bytecode::Op::LdaNewTarget
+                    | crate::bytecode::Op::InitialYield
+                    | crate::bytecode::Op::Yield
             );
             s.ops += 1;
         }

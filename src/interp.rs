@@ -905,6 +905,31 @@ handlers! {
         next!(any, Op::LdaNewTarget.size(), v)
     }
 
+    fn op_initial_yield(pc, acc, regs, tag) {
+        let f: *mut Object = header(regs, FUNC);
+        match with_top(regs, None, |vm| crate::generator::create(vm, f)) {
+            Ok(g) => {
+                *reg(pc, 1, regs) = g;
+                let code = frame_code(regs);
+                let at = pc.add(Op::InitialYield.size()).offset_from((*code).bytecode.as_ptr()) as usize;
+                crate::generator::suspend(&mut *frame_vm(regs), g, regs, code, at, false);
+                tail!(op_return, g)
+            }
+            Err(e) => {
+                (*frame_vm(regs)).error = Some(e);
+                tail!(op_unwind, Value::EMPTY)
+            }
+        }
+    }
+
+    fn op_yield(pc, acc, regs, tag) {
+        let g = *reg(pc, 1, regs);
+        let code = frame_code(regs);
+        let at = pc.add(Op::Yield.size()).offset_from((*code).bytecode.as_ptr()) as usize;
+        crate::generator::suspend(&mut *frame_vm(regs), g, regs, code, at, true);
+        tail!(op_return, acc)
+    }
+
     fn op_close_upvalue(pc, acc, regs, tag) {
         (*frame_vm(regs)).close_upvalue(reg(pc, 1, regs));
         next!(any, Op::CloseUpvalue.size(), acc)
@@ -1435,7 +1460,7 @@ handlers! {
 
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
-        if is_cell(tag, f) && (*as_object(f)).class == Class::Function && (*(*as_object(f)).code).kind != 1 {
+        if is_cell(tag, f) && (*as_object(f)).class == Class::Function && (*(*as_object(f)).code).constructor() {
             let this = if (*(*as_object(f)).code).kind == 3 {
                 // (A derived class's `this` is its base's, from `super()`.)
                 Value::HOLE
@@ -3113,6 +3138,8 @@ static TABLE: Table = {
     t[Op::CheckHole as usize] = op_check_hole;
     t[Op::CloseUpvalue as usize] = op_close_upvalue;
     t[Op::LdaNewTarget as usize] = op_lda_new_target;
+    t[Op::InitialYield as usize] = op_initial_yield;
+    t[Op::Yield as usize] = op_yield;
     t[Op::CreateRest as usize] = op_create_rest;
     t[Op::StaGlobal as usize] = op_sta_global;
     t[Op::GetNamed as usize] = op_get_named;
@@ -3492,6 +3519,14 @@ pub(crate) unsafe fn close_frame_upvalues(vm: &mut Vm, regs: *mut Value) {
 /// # Safety
 /// `regs` must be a frame on the VM stack whose caller (if a call
 /// instruction made it) is still there, its registers as at the call.
+/// Make `f` frame `regs`' function (its upvalues' owner).
+///
+/// # Safety
+/// `regs` must be a frame.
+pub(crate) unsafe fn set_frame_function(regs: *mut Value, f: *mut Object) {
+    unsafe { set_header(regs, FUNC, f) }
+}
+
 /// The function frame `regs` runs (null if none recorded).
 pub(crate) unsafe fn frame_callee(regs: *mut Value) -> *mut Object {
     unsafe { header(regs, FUNC) }

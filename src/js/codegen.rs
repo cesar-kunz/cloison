@@ -88,10 +88,12 @@ fn generate_from<'p>(
     // in a scope object (`%env`, a register; see `Gen::function`).
     let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
     for i in 1..p.functions.len() {
-        if p.functions[i].has_eval {
+        if p.functions[i].has_eval || p.functions[i].generator {
             // Its parameters and `var`s in its scope object, where direct
             // `eval`'s code finds them (block-scoped ones, and the parser's,
-            // stay in registers).
+            // stay in registers). A generator's, all of them: its frame
+            // leaves the stack at each `yield`, its closures can't point
+            // into it.
             let f = &p.functions[i];
             let params = f.params.len();
             let mut d: Vec<&str> = decls[i][..params].to_vec();
@@ -99,7 +101,13 @@ fn generate_from<'p>(
             let rest: Vec<&str> = decls[i][params..].iter().copied().filter(|&n| n != ENV).collect();
             // (A function expression's own name, immutable, stays apart.)
             let own = f.name.as_deref().filter(|_| f.binds_name);
-            let in_env = |n: &str| !n.starts_with('%') && !p.lexicals.contains_key(n) && Some(n) != own;
+            let generator = f.generator && !f.has_eval;
+            let in_env = |n: &str| {
+                if generator {
+                    return n != GEN && n != EVAL_SCOPE && Some(n) != own;
+                }
+                !n.starts_with('%') && !p.lexicals.contains_key(n) && Some(n) != own
+            };
             d.extend(rest.iter().copied().filter(|&n| !in_env(n)));
             let env_vars: Vec<&str> = rest.iter().copied().filter(|&n| in_env(n)).collect();
             d.extend(env_vars.iter().copied());
@@ -160,6 +168,7 @@ fn generate_from<'p>(
                     && !f.uses_this
                     && f.class_kind == 0
                     && !f.uses_new_target
+                    && !f.generator
                     && !scopes.upvalues[i].contains(&ENV)
                     // (Block-scoped ones' new names can't be declared again.)
                     && !scopes.upvalues[i].iter().any(|n| n.contains('%'))
@@ -371,6 +380,9 @@ fn original(name: &str) -> &str {
     }
 }
 
+/// A generator's own generator object's register (see `Op::InitialYield`).
+const GEN: &str = "%gen";
+
 /// The variable holding a direct `eval`'s function's scope object, which
 /// the functions in it look names up in first (see `Gen::new`).
 const EVAL_SCOPE: &str = "%evalscope";
@@ -390,7 +402,9 @@ fn eval_scope(p: &Program, i: usize) -> Option<usize> {
 
 /// `vm::Code::kind` for `f`.
 fn function_kind(f: &Function) -> u8 {
-    if f.class_kind != 0 {
+    if f.generator {
+        4
+    } else if f.class_kind != 0 {
         f.class_kind
     } else if f.arrow || f.method {
         1
@@ -524,6 +538,7 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             pattern_refs(p, out, forwarded);
             expr_refs(v, out);
         }
+        Yield(x, _) => x.iter().for_each(|x| expr_refs(x, out)),
         Object(ps, _) => ps.iter().for_each(|(k, e)| {
             if let PropKey::Computed(k) = k {
                 expr_refs(k, out);
@@ -715,6 +730,9 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     }
     if p.functions[f].has_eval && f != 0 {
         out.push(EVAL_SCOPE);
+    }
+    if p.functions[f].generator {
+        out.push(GEN);
     }
     // The script's variables are globals, but for its block-scoped ones.
     if f == 0 {
@@ -924,6 +942,7 @@ fn assigns(e: &Expr, name: &str) -> bool {
         }
         SuperMember(_, k, t) => assigns(k, name) || assigns(t, name),
         Bound => false,
+        Yield(x, _) => x.is_some_and(|x| assigns(x, name)),
         Destructure(p, v, _) => {
             let mut ns = Vec::new();
             p.names(&mut ns);
@@ -1280,7 +1299,7 @@ impl<'a> Gen<'a> {
         // The scope object, with each of its variables (`undefined`, in
         // order: one shape).
         let has_eval = self.f.has_eval && self.index != 0;
-        if !self.overflow.is_empty() || has_eval {
+        if !self.overflow.is_empty() || has_eval || self.f.generator {
             let env = self.locals[ENV];
             let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
             let ic = self.auto_ic(&format!("[]{}", cap));
@@ -1400,9 +1419,15 @@ impl<'a> Gen<'a> {
             }
         } else {
             for (k, s) in body.iter().enumerate() {
+                if self.f.generator && k == self.f.param_stmts {
+                    self.initial_yield()?;
+                }
                 // (Its parameters' defaults first: see `Gen::in_params`.)
                 self.in_params = k < self.f.param_stmts;
                 self.stmt(s)?;
+            }
+            if self.f.generator && body.len() <= self.f.param_stmts {
+                self.initial_yield()?;
             }
             self.in_params = false;
         }
@@ -2658,6 +2683,14 @@ impl<'a> Gen<'a> {
                 self.temp = mark;
             }
             Class(c) => self.class(c, e.pos)?,
+            Yield(Some(x), true) => self.yield_star(x, e.pos)?,
+            Yield(x, _) => {
+                match x {
+                    Some(x) => self.value(x)?,
+                    None => self.emit(Op::LdaUndefined, &[]),
+                }
+                self.yield_acc(e.pos)?;
+            }
             Bound => unreachable!("a declaration's marker"),
             Destructure(p, v, mode) => {
                 let mark = self.temp;
@@ -3654,6 +3687,115 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// `return acc`: through the `finally` blocks being left.
+    fn return_acc(&mut self, pos: Pos) -> R<()> {
+        if self.trys.iter().any(|t| t.finally.is_some() || t.close.is_some()) {
+            // The value waits in a register while the `finally` blocks run.
+            let mark = self.temp;
+            let r = self.alloc(pos)?;
+            self.star(r);
+            self.leave_trys(0)?;
+            self.ldar(r);
+            self.emit(Op::Return, &[]);
+            self.reenter_trys(0);
+            self.temp = mark;
+        } else {
+            self.emit(Op::Return, &[]);
+        }
+        Ok(())
+    }
+
+    /// A generator's start, once its parameters are set: its generator
+    /// object made, and returned (see `Op::InitialYield`).
+    fn initial_yield(&mut self) -> R<()> {
+        let Var::Reg(g) = self.resolve(GEN, self.f.pos)? else {
+            return unsupported(self.f.pos, "a generator with this many variables");
+        };
+        self.emit(Op::InitialYield, &[Arg::Reg(g)]);
+        // (Resumed by `next()`: a fresh accumulator.)
+        self.acc = Acc::default();
+        self.reachable = true;
+        Ok(())
+    }
+
+    /// Suspend at a `yield` of `acc`; resumed, the value sent (`next(v)`)
+    /// in `acc`, or its exception thrown (`throw(e)`), or a return
+    /// (`return(v)`) made, through the `finally` blocks.
+    fn yield_acc(&mut self, pos: Pos) -> R<()> {
+        let Var::Reg(g) = self.resolve(GEN, pos)? else {
+            return unsupported(pos, "a generator with this many variables");
+        };
+        self.emit(Op::Yield, &[Arg::Reg(g)]);
+        self.acc = Acc::default();
+        self.reachable = true;
+        let mark = self.temp;
+        let v = self.alloc(pos)?;
+        self.star(v);
+        self.intrinsic("generator_mode", g, 1);
+        let (thrown, returned, done) = (self.label(), self.label(), self.label());
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(1), thrown);
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), returned);
+        self.jump(done);
+        self.bind(thrown);
+        self.ldar(v);
+        self.emit(Op::Throw, &[]);
+        self.bind(returned);
+        self.ldar(v);
+        self.return_acc(pos)?;
+        self.bind(done);
+        self.ldar(v);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// `yield* x`: each of `x`'s iterator's values yielded, what's sent
+    /// passed on to it; its result's value at the end.
+    fn yield_star(&mut self, x: &Expr, pos: Pos) -> R<()> {
+        let Var::Reg(g) = self.resolve(GEN, pos)? else {
+            return unsupported(pos, "a generator with this many variables");
+        };
+        let mark = self.temp;
+        // `[iterator, received, gen]` for `delegate_step`.
+        let it = self.alloc(pos)?;
+        self.into(x, it)?;
+        self.intrinsic("get_iterator", it, 1);
+        self.star(it);
+        let received = self.alloc(pos)?;
+        self.emit(Op::LdaUndefined, &[]);
+        self.star(received);
+        let gr = self.alloc(pos)?;
+        self.mov(g, gr);
+        let result = self.alloc(pos)?;
+        let (top, done) = (self.loop_label(), self.label());
+        self.bind(top);
+        self.intrinsic("delegate_step", it, 3);
+        self.star(result);
+        self.intrinsic("delegate_done", result, 1);
+        self.jump_if(Jmp::True, done);
+        self.named(Op::GetNamed, result, "value");
+        self.emit(Op::Yield, &[Arg::Reg(g)]);
+        self.acc = Acc::default();
+        self.reachable = true;
+        self.star(received);
+        self.jump(top);
+        self.bind(done);
+        // (A `return()` passed on: the generator returns the value.)
+        let v = self.alloc(pos)?;
+        self.named(Op::GetNamed, result, "value");
+        self.star(v);
+        let (ret, end) = (self.label(), self.label());
+        self.intrinsic("generator_mode", g, 1);
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), ret);
+        self.jump(end);
+        self.bind(ret);
+        self.ldar(v);
+        self.return_acc(pos)?;
+        self.bind(end);
+        self.ldar(v);
+        self.temp = mark;
+        Ok(())
+    }
+
     /// A derived class's constructor returning `acc`: the object it
     /// returns, else `this` (see `intrinsics::derived_return`).
     fn derived_return(&mut self, pos: Pos) -> R<()> {
@@ -3958,20 +4100,7 @@ impl<'a> Gen<'a> {
                     None => self.emit(Op::LdaUndefined, &[]),
                 }
                 self.derived_return(s.pos)?;
-                if self.trys.iter().any(|t| t.finally.is_some() || t.close.is_some()) {
-                    // The value waits in a register while the `finally`
-                    // blocks run.
-                    let mark = self.temp;
-                    let r = self.alloc(s.pos)?;
-                    self.star(r);
-                    self.leave_trys(0)?;
-                    self.ldar(r);
-                    self.emit(Op::Return, &[]);
-                    self.reenter_trys(0);
-                    self.temp = mark;
-                } else {
-                    self.emit(Op::Return, &[]);
-                }
+                self.return_acc(s.pos)?;
             }
             StmtKind::Break(label) | StmtKind::Continue(label) => {
                 let brk = matches!(s.kind, StmtKind::Break(_));

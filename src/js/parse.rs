@@ -76,6 +76,7 @@ fn parse_pass<'a, 'p>(
         withs: Vec::new(),
         with_count: 0,
         classes: 0,
+        pending_generator: false,
         sub: false,
         pending_pattern: None,
         home_uses: 0,
@@ -112,6 +113,7 @@ fn parse_pass<'a, 'p>(
         annex_b: false,
         class_kind: 0,
         has_eval: false,
+        generator: false,
         uses_new_target: false,
         hidden: Vec::new(),
         text: None,
@@ -202,6 +204,8 @@ struct Parser<'t, 'a, 'p> {
     with_count: usize,
     /// Classes so far (for their home objects' variables' names).
     classes: usize,
+    /// The method about to be parsed is a generator (`*m() {}`).
+    pending_generator: bool,
     /// The statement about to be parsed is another's body.
     sub: bool,
     /// A `for` head's declaration's pattern (see `pattern_declarator`).
@@ -1004,6 +1008,7 @@ impl<'a> Parser<'_, 'a, '_> {
     /// skimming, unless the function comes right after a `(` (`paren`) or
     /// right before one.
     fn function(&mut self, declaration: bool, paren: bool, pos: Pos) -> R<usize> {
+        let generator = self.eat("*") || std::mem::take(&mut self.pending_generator);
         let name = match self.peek() {
             Tok::Ident(_) => Some(self.ident()?),
             _ if declaration => return self.err("expected the function's name"),
@@ -1036,6 +1041,7 @@ impl<'a> Parser<'_, 'a, '_> {
             annex_b: false,
             class_kind: 0,
             has_eval: false,
+            generator: false,
             uses_new_target: false,
             hidden: Vec::new(),
         text: None,
@@ -1045,6 +1051,7 @@ impl<'a> Parser<'_, 'a, '_> {
         });
         self.functions[index].class_kind = class_kind;
         self.functions[index].uses_new_target = class_kind != 0;
+        self.functions[index].generator = generator;
         let vars_key = self.i;
         self.expect("(")?;
         self.push_vars(vars_key);
@@ -1266,6 +1273,7 @@ impl<'a> Parser<'_, 'a, '_> {
             annex_b: false,
             class_kind: 0,
             has_eval: false,
+            generator: false,
             uses_new_target: false,
             hidden: Vec::new(),
         text: None,
@@ -1469,6 +1477,28 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     fn assignment(&mut self, no_in: bool) -> R<Expr<'a>> {
+        if self.functions[self.current].generator
+            && matches!(self.peek(), Tok::Ident(n) if &**n == "yield")
+            && !self.toks[self.i].escaped
+        {
+            let pos = self.pos();
+            self.advance();
+            let delegate = !self.toks[self.i].newline_before && self.eat("*");
+            let ends = self.toks[self.i].newline_before && !delegate
+                || matches!(self.peek(), Tok::Punct(")" | "]" | "}" | "," | ";" | ":") | Tok::Eof)
+                || matches!(self.peek(), Tok::Template(t) if !t.head)
+                || self.is("in") && no_in;
+            let arg = if ends && !delegate {
+                None
+            } else {
+                let e = self.assignment(no_in)?;
+                Some(expr(self.arena, e))
+            };
+            return Ok(Expr {
+                kind: ExprKind::Yield(arg, delegate),
+                pos,
+            });
+        }
         let target = self.conditional(no_in)?;
         let op = match self.peek() {
             Tok::Punct("=") => None,
@@ -1826,6 +1856,20 @@ impl<'a> Parser<'_, 'a, '_> {
                         }
                         _ => None,
                     };
+                    if self.is("*") {
+                        // `*m() {…}`: a generator method.
+                        self.advance();
+                        let key = self.prop_key()?;
+                        let h = self.object_home(&mut home);
+                        self.pending_home = Some((Some(h), None, 0));
+                        self.pending_generator = true;
+                        let f = self.method(&key, None, ppos)?;
+                        props.push((key, Expr { kind: ExprKind::Function(f), pos: ppos }));
+                        if !self.is("}") {
+                            self.expect(",")?;
+                        }
+                        continue;
+                    }
                     if let Some(set) = accessor {
                         self.advance();
                         let key = self.prop_key()?;
@@ -2163,9 +2207,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.advance();
             }
             let mpos = self.pos();
-            if self.is("*") {
-                return self.err("generator methods are not supported");
-            }
+            let generator = self.eat("*");
             let kind = match self.peek() {
                 Tok::Ident(n) if matches!(&**n, "get" | "set") && !matches!(self.peek_at(1), Tok::Punct("(" | "=" | ";" | "}")) => {
                     let k = if &**n == "get" { 1 } else { 2 };
@@ -2192,6 +2234,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             let h = if is_static { &home_static } else { &home };
             self.pending_home = Some((Some(h.clone()), None, 0));
+            self.pending_generator = generator;
             let prefix = match kind {
                 1 => Some("get"),
                 2 => Some("set"),
@@ -2299,6 +2342,7 @@ impl<'a> Parser<'_, 'a, '_> {
             annex_b: false,
             class_kind,
             has_eval: false,
+            generator: false,
             uses_new_target: true,
             hidden: Vec::new(),
         text: None,

@@ -367,6 +367,13 @@ define_ops! {
     /// `acc = new.target`: a function's first instruction, if it reads it
     /// (see `Vm::new_target`).
     LdaNewTarget(),
+    /// A generator's start (its parameters set): `r` = a new generator
+    /// object, which keeps this frame; the frame returns it (see
+    /// `generator`).
+    InitialYield(Reg),
+    /// `yield acc`: generator `r` keeps this frame, which returns `acc`;
+    /// resumed, it goes on from the next instruction with the value sent.
+    Yield(Reg),
 }
 
 impl Op {

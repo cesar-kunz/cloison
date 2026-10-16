@@ -962,12 +962,12 @@ impl Vm {
         vm.function_call_fn = call;
         // The constructors, with `prototype` and `constructor` links.
         let g = vm.global;
-        for (name, v) in [("NaN", f64::NAN), ("Infinity", f64::INFINITY)] {
+        for (name, v) in [("NaN", Value::from_f64(f64::NAN)), ("Infinity", Value::from_f64(f64::INFINITY)), ("undefined", Value::UNDEFINED)] {
             let a = vm.intern(name);
             vm.add_property_with(
                 g,
                 a,
-                Value::from_f64(v),
+                v,
                 READ_ONLY | DONT_ENUM | DONT_DELETE,
             );
         }
@@ -4073,7 +4073,9 @@ fn math_ceil(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `Math.round`: halves round up (`-2.5` is `-2`), unlike Rust's `round`.
 fn math_round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = num_arg(a, 0);
-    let r = (x + 0.5).floor();
+    // (Not `(x + 0.5).floor()`: 0.49999999999999994 + 0.5 rounds to 1.)
+    let f = x.floor();
+    let r = if x - f >= 0.5 { f + 1.0 } else { f };
     // (-0.5 rounds to -0; x + 0.5 is inexact past 2^52, where x is
     // integral already.)
     Ok(Value::number(if x.abs() >= 4503599627370496.0 {

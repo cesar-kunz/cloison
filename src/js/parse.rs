@@ -347,6 +347,15 @@ impl<'a> Parser<'_, 'a, '_> {
         }
     }
 
+    /// A declaration's name: not `eval` or `arguments` in strict code.
+    fn binding_ident(&mut self) -> R<Name> {
+        let n = self.ident()?;
+        if self.strict() && matches!(&*n, "eval" | "arguments") {
+            return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{n}` declared in strict mode")));
+        }
+        Ok(n)
+    }
+
     /// An error for a word strict code reserves (just read), if it is one.
     fn strict_word(&self, s: &str) -> R<()> {
         if self.strict()
@@ -700,7 +709,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 continue;
             }
-            let written = self.ident()?;
+            let written = self.binding_ident()?;
             // (A body's `var` renamed apart: see `push_body_vars`.)
             let name = self.resolve(&written).unwrap_or_else(|| written.clone());
             let init = if self.eat("=") {
@@ -2377,7 +2386,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 continue;
             }
-            let name = self.ident()?;
+            let name = self.binding_ident()?;
             if &*name == "let" {
                 return self.err("`let` can't be declared with `let` or `const`");
             }

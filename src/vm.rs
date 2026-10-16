@@ -985,7 +985,7 @@ impl Vm {
             np,
             "toString",
             number_to_string_method,
-            0,
+            1,
             crate::jit::Ty::Any,
             false,
         );
@@ -4002,7 +4002,7 @@ fn this_number(this: Value) -> Result<f64> {
 /// decimals, halves away from zero; `ToString` past 1e21.
 fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let x = this_number(this)?;
-    let f = a.first().map_or(0.0, |&v| crate::interp::to_number(v));
+    let f = to_integer_arg(vm, a.first().copied())?;
     if !(0.0..=100.0).contains(&f) {
         return Err(Error::range_error(
             "toFixed() digits argument must be between 0 and 100",
@@ -4012,15 +4012,11 @@ fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = if !x.is_finite() || x.abs() >= 1e21 {
         number_to_string(x)
     } else {
-        // Ties (exact in binary) go away from zero, as the spec's "larger
-        // n"; Rust's formatting would make them even.
-        let scaled = x.abs() * 10f64.powi(f as i32);
-        let n = if scaled.fract() == 0.5 {
-            scaled.ceil()
-        } else {
-            scaled.round()
-        };
-        let digits = format!("{:0>width$}", format!("{n:.0}"), width = f + 1);
+        // n: x × 10^f rounded, ties up (the spec's "larger n").
+        let (d, e) = exact_digits(x.abs());
+        let keep = e + 1 + f as i32;
+        let n = round_digits(&d, keep);
+        let digits = format!("{:0>width$}", n, width = f + 1);
         let (int, frac) = digits.split_at(digits.len() - f);
         // (The spec's sign: of x, even when it rounds to 0; -0 has none.)
         let sign = if x < 0.0 { "-" } else { "" };
@@ -4034,6 +4030,74 @@ fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(vm.new_string(&units))
 }
 
+/// ToIntegerOrInfinity of an optional argument (its conversion's errors
+/// thrown).
+fn to_integer_arg(vm: &mut Vm, v: Option<Value>) -> Result<f64> {
+    let d = v.map_or(0.0, crate::interp::to_number);
+    if vm.conv_thrown {
+        return Err(vm.take_conv_error());
+    }
+    Ok(if d.is_nan() { 0.0 } else { d.trunc() })
+}
+
+/// The exact decimal digits of finite `x` > 0 (`x` = 0.d1d2… × 10^(e+1),
+/// as `d1.d2… × 10^e`), and `e`.
+pub(crate) fn exact_digits(x: f64) -> (Vec<u8>, i32) {
+    if x == 0.0 {
+        return (vec![0], 0);
+    }
+    let s = format!("{:.1100e}", x);
+    let (m, e) = s.split_once('e').unwrap();
+    let mut d: Vec<u8> = m.bytes().filter(|c| c.is_ascii_digit()).map(|c| c - b'0').collect();
+    while d.len() > 1 && *d.last().unwrap() == 0 {
+        d.pop();
+    }
+    (d, e.parse().unwrap())
+}
+
+/// The integer of `d`'s first `keep` digits, rounded at the next one
+/// half up, as a decimal string (`keep` ≤ 0: 0 or 1).
+pub(crate) fn round_digits(d: &[u8], keep: i32) -> String {
+    if keep < 0 {
+        return "0".into();
+    }
+    let k = keep as usize;
+    let mut n: Vec<u8> = (0..k).map(|i| d.get(i).copied().unwrap_or(0)).collect();
+    if d.get(k).is_some_and(|&c| c >= 5) {
+        let mut i = n.len();
+        loop {
+            if i == 0 {
+                n.insert(0, 1);
+                break;
+            }
+            i -= 1;
+            if n[i] == 9 {
+                n[i] = 0;
+            } else {
+                n[i] += 1;
+                break;
+            }
+        }
+    }
+    let s: String = n.iter().map(|&c| (b'0' + c) as char).collect();
+    let s = s.trim_start_matches('0');
+    if s.is_empty() { "0".into() } else { s.into() }
+}
+
+/// `x`'s `p` significant digits, rounded half up (`x` > 0): the digits and
+/// the exponent of the first.
+pub(crate) fn significant(x: f64, p: usize) -> (String, i32) {
+    let (d, mut e) = exact_digits(x);
+    let mut n = round_digits(&d, p as i32);
+    if n.len() > p {
+        // (A carry: 9.99… to 10.0….)
+        n.truncate(p);
+        e += 1;
+    }
+    let n = format!("{:0<width$}", n, width = p);
+    (n, e)
+}
+
 /// `Number.prototype.toPrecision(p)`: `p` (1 to 100) significant digits,
 /// in exponent form when the exponent is below -6 or at least `p`.
 fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -4042,36 +4106,35 @@ fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         None => number_to_string(x),
         Some(&v) if v.is_undefined() => number_to_string(x),
         Some(&v) => {
-            let p = crate::interp::to_number(v);
-            if !(1.0..=100.0).contains(&p) {
-                return Err(Error::range_error(
-                    "toPrecision() argument must be between 1 and 100",
-                ));
-            }
-            let p = p as usize;
+            let p = to_integer_arg(vm, Some(v))?;
             if !x.is_finite() {
                 number_to_string(x)
-            } else if x == 0.0 {
-                if p == 1 {
-                    "0".into()
-                } else {
-                    format!("0.{}", "0".repeat(p - 1))
-                }
             } else {
-                let e = format!("{:.*e}", p - 1, x.abs());
-                let (m, exp) = e.split_once('e').unwrap();
-                let exp: i32 = exp.parse().unwrap();
-                let sign = if x < 0.0 { "-" } else { "" };
-                if exp < -6 || exp >= p as i32 {
-                    let es = if exp >= 0 {
-                        format!("+{exp}")
+                if !(1.0..=100.0).contains(&p) {
+                    return Err(Error::range_error(
+                        "toPrecision() argument must be between 1 and 100",
+                    ));
+                }
+                let p = p as usize;
+                if x == 0.0 {
+                    if p == 1 {
+                        "0".into()
                     } else {
-                        exp.to_string()
-                    };
-                    format!("{sign}{m}e{es}")
+                        format!("0.{}", "0".repeat(p - 1))
+                    }
                 } else {
-                    let decimals = (p as i32 - 1 - exp).max(0) as usize;
-                    format!("{sign}{:.*}", decimals, x.abs())
+                    let (n, exp) = significant(x.abs(), p);
+                    let sign = if x < 0.0 { "-" } else { "" };
+                    if exp < -6 || exp >= p as i32 {
+                        let es = if exp >= 0 { format!("+{exp}") } else { exp.to_string() };
+                        let m = if p == 1 { n.clone() } else { format!("{}.{}", &n[..1], &n[1..]) };
+                        format!("{sign}{m}e{es}")
+                    } else if exp >= 0 {
+                        let (int, frac) = n.split_at(exp as usize + 1);
+                        if frac.is_empty() { format!("{sign}{int}") } else { format!("{sign}{int}.{frac}") }
+                    } else {
+                        format!("{sign}0.{}{n}", "0".repeat((-exp - 1) as usize))
+                    }
                 }
             }
         }

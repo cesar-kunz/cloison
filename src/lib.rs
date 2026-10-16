@@ -19,6 +19,7 @@ mod builtins;
 mod array;
 mod intrinsics;
 mod symbol;
+mod reflect;
 mod generator;
 mod collections;
 mod date;

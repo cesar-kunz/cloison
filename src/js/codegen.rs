@@ -1291,9 +1291,10 @@ struct Gen<'a> {
     /// The script's completion value (`eval`'s result): a register,
     /// in the script only.
     completion: Option<u8>,
-    /// The statement being compiled has cleared the completion value
-    /// (so its own match arm doesn't again).
-    cleared: bool,
+    /// The statement that has cleared the completion value (so its own
+    /// match arm doesn't again; nested ones do, each completing as
+    /// `undefined` unless something in it says otherwise).
+    cleared: *const Stmt<'a>,
     /// How many statements enclose the one being compiled: 1 for the
     /// function body's own.
     depth: u32,
@@ -1387,7 +1388,7 @@ impl<'a> Gen<'a> {
             },
             eval,
             completion: None,
-            cleared: false,
+            cleared: std::ptr::null(),
             depth: 0,
             fresh: Vec::new(),
             entering: false,
@@ -4211,13 +4212,14 @@ impl<'a> Gen<'a> {
             | StmtKind::Switch(..)
             | StmtKind::Try(..)
             | StmtKind::With(..)
-                if self.completion.is_some() && !self.cleared =>
+                if self.completion.is_some() && !std::ptr::eq(self.cleared, s) =>
             {
                 self.emit(Op::LdaUndefined, &[]);
                 self.star(self.completion.unwrap());
-                self.cleared = true;
+                let outer = std::mem::replace(&mut self.cleared, s);
+                self.pending_labels = labels;
                 let r = self.stmt_inner(s);
-                self.cleared = false;
+                self.cleared = outer;
                 return r;
             }
             StmtKind::If(c, then, None)

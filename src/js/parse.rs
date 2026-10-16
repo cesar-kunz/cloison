@@ -1863,7 +1863,19 @@ impl<'a> Parser<'_, 'a, '_> {
         } else {
             self.primary()?
         };
-        while self.member_suffix(&mut c)? {}
+        // (A tagged template is a member expression too: `new tag`x``.)
+        loop {
+            if matches!(self.peek(), Tok::Template(t) if t.head) {
+                let p = self.pos();
+                let Tok::Template(part) = self.bump() else { unreachable!() };
+                let (parts, subs) = self.template_rest(part)?;
+                let mut args = vec![Expr { kind: ExprKind::TemplateObject(parts), pos: p }];
+                args.extend(subs);
+                c = Expr { kind: ExprKind::Call(expr(self.arena, c), args), pos: p };
+            } else if !self.member_suffix(&mut c)? {
+                break;
+            }
+        }
         let args = if self.eat("(") {
             self.arguments()?
         } else {

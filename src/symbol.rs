@@ -311,9 +311,11 @@ pub(crate) fn install(vm: &mut Vm) {
     if is_object(math) {
         to_string_tag(vm, as_object(math), "Math");
     }
-    let json = { let a = vm.intern("JSON"); vm.get(object_value(g), a) }.unwrap_or(Value::UNDEFINED);
-    if is_object(json) {
-        to_string_tag(vm, as_object(json), "JSON");
+    for name in ["JSON", "Reflect"] {
+        let o = { let a = vm.intern(name); vm.get(object_value(g), a) }.unwrap_or(Value::UNDEFINED);
+        if is_object(o) {
+            to_string_tag(vm, as_object(o), name);
+        }
     }
 }
 

@@ -364,6 +364,9 @@ define_ops! {
     /// captured it keep its value, and the register starts a new binding
     /// (a loop's block-scoped variable, per iteration).
     CloseUpvalue(Reg),
+    /// `acc = new.target`: a function's first instruction, if it reads it
+    /// (see `Vm::new_target`).
+    LdaNewTarget(),
 }
 
 impl Op {

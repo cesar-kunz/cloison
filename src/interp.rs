@@ -884,6 +884,20 @@ handlers! {
         next!(any, Op::CheckHole.size(), acc)
     }
 
+    fn op_lda_new_target(pc, acc, regs, tag) {
+        let vm = frame_vm(regs);
+        let pending = (*vm).new_target;
+        let v = if pending != Value::EMPTY {
+            (*vm).new_target = Value::EMPTY;
+            pending
+        } else if (*regs.sub(FLAGS)).to_bits() & CONSTRUCT != 0 {
+            object_value(header::<Object>(regs, FUNC))
+        } else {
+            Value::UNDEFINED
+        };
+        next!(any, Op::LdaNewTarget.size(), v)
+    }
+
     fn op_close_upvalue(pc, acc, regs, tag) {
         (*frame_vm(regs)).close_upvalue(reg(pc, 1, regs));
         next!(any, Op::CloseUpvalue.size(), acc)
@@ -1415,8 +1429,13 @@ handlers! {
     fn op_construct(pc, acc, regs, tag) {
         let f = *reg(pc, 1, regs);
         if is_cell(tag, f) && (*as_object(f)).class == Class::Function && (*(*as_object(f)).code).kind != 1 {
-            note_callee(regs, ic_at(regs, pc, 4), as_object(f));
-            let this = construct_this(regs, as_object(f));
+            let this = if (*(*as_object(f)).code).kind == 3 {
+                // (A derived class's `this` is its base's, from `super()`.)
+                Value::HOLE
+            } else {
+                note_callee(regs, ic_at(regs, pc, 4), as_object(f));
+                construct_this(regs, as_object(f))
+            };
             let args = reg(pc, 2, regs);
             enter!(as_object(f), this, args, *pc.add(3) as usize, CONSTRUCT, Op::Construct.size())
         }
@@ -3035,6 +3054,7 @@ static TABLE: Table = {
     t[Op::LdaHole as usize] = op_lda_hole;
     t[Op::CheckHole as usize] = op_check_hole;
     t[Op::CloseUpvalue as usize] = op_close_upvalue;
+    t[Op::LdaNewTarget as usize] = op_lda_new_target;
     t[Op::CreateRest as usize] = op_create_rest;
     t[Op::StaGlobal as usize] = op_sta_global;
     t[Op::GetNamed as usize] = op_get_named;

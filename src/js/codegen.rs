@@ -129,6 +129,8 @@ fn generate_from<'p>(
                     && f.withs.is_empty()
                     && !f.arrow
                     && !f.uses_this
+                    && f.class_kind == 0
+                    && !f.uses_new_target
                     && !scopes.upvalues[i].contains(&ENV)
                     // (Block-scoped ones' new names can't be declared again.)
                     && !scopes.upvalues[i].iter().any(|n| n.contains('%'))
@@ -338,7 +340,13 @@ fn original(name: &str) -> &str {
 
 /// `vm::Code::kind` for `f`.
 fn function_kind(f: &Function) -> u8 {
-    if f.arrow || f.method { 1 } else { 0 }
+    if f.class_kind != 0 {
+        f.class_kind
+    } else if f.arrow || f.method {
+        1
+    } else {
+        0
+    }
 }
 
 fn unsupported<T>(pos: Pos, what: impl std::fmt::Display) -> R<T> {
@@ -430,6 +438,28 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
         Num(_) | Str(_) | Bool(_) | Null | This | Function(_) | Accessor(..) | RegExp(..) | Hole
         | TemplateObject(_) => {}
         Array(es) | Template(_, es) | Intrinsic(_, es) => es.iter().for_each(|e| expr_refs(e, out)),
+        Class(c) => {
+            c.heritage.iter().for_each(|e| expr_refs(e, out));
+            for m in &c.members {
+                if let PropKey::Computed(k) = &m.key {
+                    expr_refs(k, out);
+                }
+            }
+        }
+        SuperCall(ctor, args) => {
+            if !forwarded {
+                out.push(ctor);
+                out.push("%newtarget");
+            }
+            args.iter().for_each(|e| expr_refs(e, out));
+        }
+        SuperMember(home, k, this) => {
+            if !forwarded {
+                out.push(home);
+            }
+            expr_refs(k, out);
+            expr_refs(this, out);
+        }
         Object(ps) => ps.iter().for_each(|(k, e)| {
             if let PropKey::Computed(k) = k {
                 expr_refs(k, out);
@@ -538,6 +568,10 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
 /// declarations, in order of declaration.
 fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     let mut out = explicit_declarations(p, f);
+    out.extend(p.functions[f].hidden.iter().map(|n| &**n));
+    if p.functions[f].uses_new_target {
+        out.push("%newtarget");
+    }
     // The script's variables are globals, but for its block-scoped ones.
     if f == 0 {
         out.retain(|n| p.lexicals.contains_key(*n));
@@ -714,7 +748,12 @@ fn assigns(e: &Expr, name: &str) -> bool {
         Update(t, ..) => matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name),
         Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) | RegExp(..) | Hole
         | TemplateObject(_) => false,
-        Array(es) | Template(_, es) | Intrinsic(_, es) => es.iter().any(|e| assigns(e, name)),
+        Array(es) | Template(_, es) | Intrinsic(_, es) | SuperCall(_, es) => es.iter().any(|e| assigns(e, name)),
+        Class(c) => {
+            c.heritage.as_ref().is_some_and(|e| assigns(e, name))
+                || c.members.iter().any(|m| matches!(&m.key, PropKey::Computed(k) if assigns(k, name)))
+        }
+        SuperMember(_, k, t) => assigns(k, name) || assigns(t, name),
         Object(ps) => ps
             .iter()
             .any(|(k, e)| matches!(k, PropKey::Computed(k) if assigns(k, name)) || assigns(e, name)),
@@ -1011,6 +1050,17 @@ impl<'a> Gen<'a> {
         if self.f.params.len() + 1 > LOCAL_REGS {
             return unsupported(self.f.pos, "more parameters than registers");
         }
+        // `new.target` first (see `Op::LdaNewTarget`).
+        if self.f.uses_new_target {
+            let Var::Reg(r) = self.resolve("%newtarget", self.f.pos)? else {
+                return unsupported(self.f.pos, "`new.target` with this many variables");
+            };
+            self.emit(Op::LdaNewTarget, &[]);
+            self.star(r);
+            if self.f.class_kind != 0 {
+                self.intrinsic("class_call_check", r, 1);
+            }
+        }
         // The scope object, with each of its variables (`undefined`, in
         // order: one shape).
         if !self.overflow.is_empty() {
@@ -1109,6 +1159,7 @@ impl<'a> Gen<'a> {
             }
         }
         self.emit(Op::LdaUndefined, &[]);
+        self.derived_return(self.f.pos)?;
         self.emit(Op::Return, &[]);
         while !self.deferred.is_empty() {
             let (l, s) = self.deferred.remove(0);
@@ -1778,7 +1829,7 @@ impl<'a> Gen<'a> {
     /// The register of a local variable, or of `this`.
     fn local(&self, e: &Expr) -> Option<u8> {
         match &e.kind {
-            ExprKind::This => Some(0),
+            ExprKind::This if self.f.class_kind != 3 => Some(0),
             // (In a `with`, a name may be the object's.)
             ExprKind::Ident(n) if !self.in_with(n) && !self.needs_check(n, e.pos) => self.locals.get(&**n).copied(),
             _ => None,
@@ -2044,7 +2095,7 @@ impl<'a> Gen<'a> {
     /// temporary, which the caller frees.
     fn reg(&mut self, e: &Expr, later: &[&Expr]) -> R<u8> {
         match &e.kind {
-            ExprKind::This => return Ok(0),
+            ExprKind::This if self.f.class_kind != 3 => return Ok(0),
             ExprKind::Ident(n) => {
                 // (A captured one may change in any call, through a closure.)
                 if let Some(&r) = self.locals.get(&**n)
@@ -2105,6 +2156,11 @@ impl<'a> Gen<'a> {
             Bool(true) => self.emit(Op::LdaTrue, &[]),
             Bool(false) => self.emit(Op::LdaFalse, &[]),
             Null => self.emit(Op::LdaNull, &[]),
+            This if self.f.class_kind == 3 => {
+                self.ldar(0);
+                let k = self.const_str("this");
+                self.emit(Op::CheckHole, &[Arg::Index(k)]);
+            }
             This => self.ldar(0),
             Ident(n) if self.in_with(n) => self.with_load(n, e.pos, false)?,
             Ident(n) => self.load_var(n, e.pos)?,
@@ -2134,6 +2190,10 @@ impl<'a> Gen<'a> {
     /// maybe not initialized: see [`Gen::needs_check`]).
     fn load_var(&mut self, n: &str, pos: Pos) -> R<()> {
         self.load_raw(n, pos)?;
+        if n == "%this" && self.derived_this() {
+            let k = self.const_str("this");
+            self.emit(Op::CheckHole, &[Arg::Index(k)]);
+        }
         if self.needs_check(n, pos) {
             let k = self.const_str(&self.p.lexicals[n].original.clone());
             self.emit(Op::CheckHole, &[Arg::Index(k)]);
@@ -2237,6 +2297,39 @@ impl<'a> Gen<'a> {
                 }
                 let n = (self.temp - mark) as u8;
                 self.intrinsic("template_object", first, n);
+                self.temp = mark;
+            }
+            Class(c) => self.class(c, e.pos)?,
+            SuperCall(ctor, args) => {
+                let mark = self.temp;
+                let c = self.alloc(e.pos)?;
+                self.load_var(ctor, e.pos)?;
+                self.star(c);
+                let nt = self.alloc(e.pos)?;
+                self.load_var("%newtarget", e.pos)?;
+                self.star(nt);
+                let a = self.alloc(e.pos)?;
+                self.args_array(args, a, e.pos)?;
+                let t = self.alloc(e.pos)?;
+                self.ldar(0);
+                self.star(t);
+                self.intrinsic("super_call", c, 4);
+                self.star(0);
+                if self.f.uses_this {
+                    self.store_var("%this", e.pos)?;
+                }
+                self.temp = mark;
+            }
+            SuperMember(home, k, this) => {
+                let mark = self.temp;
+                let h = self.alloc(e.pos)?;
+                self.load_var(home, e.pos)?;
+                self.star(h);
+                let kr = self.alloc(e.pos)?;
+                self.into(k, kr)?;
+                let t = self.alloc(e.pos)?;
+                self.into(this, t)?;
+                self.intrinsic("super_get", h, 3);
                 self.temp = mark;
             }
             Intrinsic(name, args) => {
@@ -2604,6 +2697,45 @@ impl<'a> Gen<'a> {
                 }
                 self.store_var(n, t.pos)
             }
+            ExprKind::SuperMember(home, k, this) => {
+                let mark = self.temp;
+                let h = self.alloc(pos)?;
+                self.load_var(home, pos)?;
+                self.star(h);
+                let kr = self.alloc(pos)?;
+                self.into(k, kr)?;
+                let vr = self.alloc(pos)?;
+                let tr = self.alloc(pos)?;
+                self.into(this, tr)?;
+                match op {
+                    None => self.value(v)?,
+                    Some(op) => {
+                        let m2 = self.temp;
+                        let g = self.alloc(pos)?;
+                        self.mov(h, g);
+                        let g2 = self.alloc(pos)?;
+                        self.mov(kr, g2);
+                        let g3 = self.alloc(pos)?;
+                        self.mov(tr, g3);
+                        self.intrinsic("super_get", g, 3);
+                        self.temp = m2;
+                        self.apply(op, v, pos)?;
+                    }
+                }
+                self.star(vr);
+                // `[home, key, value, this]`
+                let order = self.alloc(pos)?;
+                let o2 = self.alloc(pos)?;
+                let o3 = self.alloc(pos)?;
+                let o4 = self.alloc(pos)?;
+                self.mov(h, order);
+                self.mov(kr, o2);
+                self.mov(vr, o3);
+                self.mov(tr, o4);
+                self.intrinsic("super_set", order, 4);
+                self.temp = mark;
+                Ok(())
+            }
             ExprKind::Member(o, name) => {
                 let ro = self.reg(o, &[v])?;
                 match op {
@@ -2716,6 +2848,37 @@ impl<'a> Gen<'a> {
     /// consecutive ones after it; a single argument already in a register
     /// is passed in place.
     fn call(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
+        if let ExprKind::SuperMember(_, _, this) = &f.kind
+            && !new
+        {
+            // The method, then a call with `this`.
+            let mark = self.temp;
+            let c = self.alloc(pos)?;
+            self.value(f)?;
+            self.star(c);
+            if args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
+                let w = self.alloc(pos)?;
+                self.into(this, w)?;
+                let a = self.alloc(pos)?;
+                self.args_array(args, a, pos)?;
+                self.intrinsic("call_spread", c, 3);
+                self.temp = mark;
+                return Ok(());
+            }
+            let n = u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
+            let w = self.alloc(pos)?;
+            for _ in 0..n {
+                self.alloc(pos)?;
+            }
+            self.into(this, w)?;
+            for (i, a) in args.iter().enumerate() {
+                self.into(a, w + 1 + i as u8)?;
+            }
+            let ic = self.auto_ic(Op::Call.name());
+            self.emit(Op::Call, &[Arg::Reg(c), Arg::Reg(w), Arg::Count(n), ic]);
+            self.temp = mark;
+            return Ok(());
+        }
         if args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
             return self.call_spread(f, args, new, pos);
         }
@@ -2819,6 +2982,18 @@ impl<'a> Gen<'a> {
             }
         }
         let a = self.alloc(pos)?;
+        self.args_array(args, a, pos)?;
+        if new {
+            self.intrinsic("construct_spread", c, 2);
+        } else {
+            self.intrinsic("call_spread", c, 3);
+        }
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// Arguments (some spread) into a new array in register `a`.
+    fn args_array(&mut self, args: &[Expr], a: u8, pos: Pos) -> R<()> {
         self.emit(Op::CreateArray, &[Arg::Count(args.len().min(255) as u8)]);
         self.star(a);
         for x in args {
@@ -2836,13 +3011,100 @@ impl<'a> Gen<'a> {
                 }
             }
         }
-        if new {
-            self.intrinsic("construct_spread", c, 2);
-        } else {
-            self.intrinsic("call_spread", c, 3);
+        Ok(())
+    }
+
+    /// A class: its constructor, its prototype (`class_setup`), its
+    /// methods defined on them, its home objects' and inner binding's
+    /// variables set; the constructor in `acc`.
+    fn class(&mut self, c: &Class, pos: Pos) -> R<()> {
+        // (New bindings before the closures capturing them are made.)
+        self.fresh_binding(&c.home, false, pos)?;
+        self.fresh_binding(&c.home_static, false, pos)?;
+        if let Some(inner) = &c.inner {
+            self.fresh_binding(inner, false, pos)?;
         }
+        let mark = self.temp;
+        let h = self.alloc(pos)?;
+        match &c.heritage {
+            Some(x) => self.value(x)?,
+            None => self.emit(Op::LdaHole, &[]),
+        }
+        self.star(h);
+        let f = self.alloc(pos)?;
+        self.closure(c.constructor);
+        self.star(f);
+        self.intrinsic("class_setup", h, 2);
+        let p = self.alloc(pos)?;
+        self.star(p);
+        self.ldar(p);
+        self.init_var(&c.home, pos)?;
+        self.ldar(f);
+        self.init_var(&c.home_static, pos)?;
+        for m in &c.members {
+            let m4 = self.temp;
+            let o = self.alloc(pos)?;
+            self.mov(if m.is_static { f } else { p }, o);
+            let k = self.alloc(pos)?;
+            match &m.key {
+                PropKey::Name(n) => self.string(n),
+                PropKey::Computed(e) => self.value(e)?,
+            }
+            self.star(k);
+            let fr = self.alloc(pos)?;
+            self.closure(m.function);
+            self.star(fr);
+            let flag = self.alloc(pos)?;
+            if matches!(m.key, PropKey::Computed(_)) {
+                self.emit(Op::LdaTrue, &[]);
+            } else {
+                self.emit(Op::LdaFalse, &[]);
+            }
+            self.star(flag);
+            let which = match m.kind {
+                0 => "define_method",
+                1 => "define_getter",
+                _ => "define_setter",
+            };
+            self.intrinsic(which, o, 4);
+            self.temp = m4;
+        }
+        if let Some(inner) = &c.inner {
+            self.ldar(f);
+            self.init_var(inner, pos)?;
+        }
+        self.ldar(f);
         self.temp = mark;
         Ok(())
+    }
+
+    /// A derived class's constructor returning `acc`: the object it
+    /// returns, else `this` (see `intrinsics::derived_return`).
+    fn derived_return(&mut self, pos: Pos) -> R<()> {
+        if self.f.class_kind != 3 || !self.reachable {
+            return Ok(());
+        }
+        let mark = self.temp;
+        let v = self.alloc(pos)?;
+        self.star(v);
+        let t = self.alloc(pos)?;
+        self.mov(0, t);
+        self.intrinsic("derived_return", v, 2);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// Whether `this` here is a derived class constructor's (not
+    /// initialized until `super()` returns).
+    fn derived_this(&self) -> bool {
+        let mut k = self.index;
+        while self.p.functions[k].arrow {
+            match self.p.functions[k].parent {
+                Some(q) => k = q,
+                None => return false,
+            }
+        }
+        self.p.functions[k].class_kind == 3
     }
 
     // ---- Tests ----
@@ -3102,6 +3364,7 @@ impl<'a> Gen<'a> {
                     Some(e) => self.value(e)?,
                     None => self.emit(Op::LdaUndefined, &[]),
                 }
+                self.derived_return(s.pos)?;
                 if self.trys.iter().any(|t| t.finally.is_some()) {
                     // The value waits in a register while the `finally`
                     // blocks run.

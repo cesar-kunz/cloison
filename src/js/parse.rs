@@ -69,6 +69,8 @@ fn parse_pass<'a, 'p>(
         skim_spare: Vec::new(),
         withs: Vec::new(),
         with_count: 0,
+        classes: 0,
+        pending_home: None,
         keep,
         prev,
         table: table.unwrap_or_default(),
@@ -98,6 +100,11 @@ fn parse_pass<'a, 'p>(
         rest: false,
         binding: None,
         annex_b: false,
+        class_kind: 0,
+        uses_new_target: false,
+        hidden: Vec::new(),
+        home: None,
+        ctor_var: None,
         free: None,
     });
     p.functions[0].strict = p.directive_prologue();
@@ -169,6 +176,11 @@ struct Parser<'t, 'a, 'p> {
     /// `StmtKind::With`), outermost first.
     withs: Vec<Name>,
     with_count: usize,
+    /// Classes so far (for their home objects' variables' names).
+    classes: usize,
+    /// The home object variables for the method about to be parsed (see
+    /// `Function::home`).
+    pending_home: Option<(Option<Name>, Option<Name>, u8)>,
     /// Leave string tokens' text (a first pass: another follows).
     keep: bool,
     /// Scopes' declarations: being collected (the first pass), or the
@@ -370,7 +382,19 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.semicolon()?;
                 StmtKind::Lexical(false, decls)
             }
-            Tok::Keyword(k @ ("class" | "import" | "export")) => {
+            Tok::Keyword("class") => {
+                self.advance();
+                let name = self.ident()?;
+                let c = self.class(Some(name.clone()), pos)?;
+                let end = self.pos();
+                let binding = self.declare(&name, LET, end);
+                let e = Expr {
+                    kind: ExprKind::Class(Box::new(c)),
+                    pos,
+                };
+                StmtKind::Lexical(false, vec![(binding, Some(e))])
+            }
+            Tok::Keyword(k @ ("import" | "export")) => {
                 return self.err(format!("`{k}` is not supported"));
             }
             Tok::Keyword("with") => {
@@ -704,6 +728,7 @@ impl<'a> Parser<'_, 'a, '_> {
         };
         let index = self.functions.len();
         let binds_name = !declaration && name.is_some();
+        let (home, ctor_var, class_kind) = self.pending_home.take().unwrap_or_default();
         self.functions.push(Function {
             name,
             binds_name,
@@ -725,8 +750,15 @@ impl<'a> Parser<'_, 'a, '_> {
             rest: false,
             binding: None,
             annex_b: false,
+            class_kind: 0,
+            uses_new_target: false,
+            hidden: Vec::new(),
+            home,
+            ctor_var,
             free: None,
         });
+        self.functions[index].class_kind = class_kind;
+        self.functions[index].uses_new_target = class_kind != 0;
         let vars_key = self.i;
         self.expect("(")?;
         self.push_vars(vars_key);
@@ -912,6 +944,11 @@ impl<'a> Parser<'_, 'a, '_> {
             rest: false,
             binding: None,
             annex_b: false,
+            class_kind: 0,
+            uses_new_target: false,
+            hidden: Vec::new(),
+            home: None,
+            ctor_var: None,
             free: None,
         });
         let outer = std::mem::replace(&mut self.current, index);
@@ -1001,6 +1038,7 @@ impl<'a> Parser<'_, 'a, '_> {
             match &t.tok {
                 Tok::Eof | Tok::Punct("=>" | "...") | Tok::Keyword("const" | "class" | "with" | "import" | "export" | "super") => return None,
                 Tok::Ident(n) if &**n == "let" => return None,
+                Tok::Keyword("new") if self.toks[self.i + 1].tok == Tok::Punct(".") => return None,
                 Tok::Punct("{" | "(" | "[") => level += 1,
                 Tok::Punct(p @ ("}" | ")" | "]")) => {
                     level -= 1;
@@ -1080,9 +1118,12 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// Name an anonymous function expression after what it's assigned to.
     fn infer_name(&mut self, e: &Expr, name: &Name) {
-        if let ExprKind::Function(i) = e.kind
-            && self.functions[i].name.is_none()
-        {
+        let i = match &e.kind {
+            ExprKind::Function(i) => *i,
+            ExprKind::Class(c) => c.constructor,
+            _ => return,
+        };
+        if self.functions[i].name.is_none() {
             self.functions[i].name = Some(name.clone());
         }
     }
@@ -1117,7 +1158,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let pos = self.pos();
         if !matches!(
             target.kind,
-            ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)
+            ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..) | ExprKind::SuperMember(..)
         ) {
             return self.err("invalid assignment target");
         }
@@ -1300,6 +1341,21 @@ impl<'a> Parser<'_, 'a, '_> {
     fn new_expr(&mut self) -> R<Expr<'a>> {
         let pos = self.pos();
         self.expect("new")?;
+        if self.is(".") && matches!(self.peek_at(1), Tok::Ident(n) if &**n == "target") {
+            self.advance();
+            self.advance();
+            let k = self.non_arrow();
+            if k == 0 {
+                return self.err("`new.target` outside a function");
+            }
+            self.functions[k].uses_new_target = true;
+            let mut e = Expr {
+                kind: ExprKind::Ident("%newtarget".into()),
+                pos,
+            };
+            while self.member_suffix(&mut e)? {}
+            return Ok(e);
+        }
         let mut c = if self.is("new") {
             self.new_expr()?
         } else {
@@ -1367,6 +1423,14 @@ impl<'a> Parser<'_, 'a, '_> {
                 ExprKind::Ident("%this".into())
             }
             Tok::Keyword("this") => ExprKind::This,
+            Tok::Keyword("class") => {
+                let name = match self.peek() {
+                    Tok::Ident(_) => Some(self.ident()?),
+                    _ => None,
+                };
+                ExprKind::Class(Box::new(self.class(name, pos)?))
+            }
+            Tok::Keyword("super") => return self.super_expr(pos),
             Tok::Keyword("true") => ExprKind::Bool(true),
             Tok::Keyword("false") => ExprKind::Bool(false),
             Tok::Keyword("null") => ExprKind::Null,
@@ -1689,6 +1753,212 @@ impl<'a> Parser<'_, 'a, '_> {
             });
         }
         Ok(f)
+    }
+
+    /// After `class` and its name (if any): the class. Its code is strict.
+    fn class(&mut self, name: Option<Name>, pos: Pos) -> R<Class<'a>> {
+        let outer_strict = std::mem::replace(&mut self.functions[self.current].strict, true);
+        let key = self.i;
+        self.push_scope(key, false, false);
+        let r = self.class_rest(name, pos);
+        self.frames.pop();
+        self.functions[self.current].strict = outer_strict;
+        r
+    }
+
+    fn class_rest(&mut self, name: Option<Name>, pos: Pos) -> R<Class<'a>> {
+        let heritage = if self.eat("extends") {
+            Some(self.call()?)
+        } else {
+            None
+        };
+        let k = self.classes;
+        self.classes += 1;
+        let home: Name = format!("%proto{k}").into();
+        let home_static: Name = format!("%ctor{k}").into();
+        for n in [&home, &home_static] {
+            self.functions[self.current].hidden.push(n.clone());
+            self.lexicals.insert(
+                n.clone(),
+                Lexical {
+                    original: n.clone(),
+                    constant: false,
+                    hoisted: true,
+                    end: 0,
+                    func: self.current,
+                    switch: false,
+                    withs: 0,
+                },
+            );
+        }
+        let class_kind = if heritage.is_some() { 3 } else { 2 };
+        self.expect("{")?;
+        let mut constructor = None;
+        let mut members = Vec::new();
+        while !self.eat("}") {
+            if self.eat(";") {
+                continue;
+            }
+            let mpos = self.pos();
+            let is_static = matches!(self.peek(), Tok::Ident(n) if &**n == "static")
+                && !matches!(self.peek_at(1), Tok::Punct("(" | "="));
+            if is_static {
+                self.advance();
+            }
+            if self.is("*") {
+                return self.err("generator methods are not supported");
+            }
+            let kind = match self.peek() {
+                Tok::Ident(n) if matches!(&**n, "get" | "set") && !matches!(self.peek_at(1), Tok::Punct("(" | "=" | ";" | "}")) => {
+                    let k = if &**n == "get" { 1 } else { 2 };
+                    self.advance();
+                    k
+                }
+                _ => 0,
+            };
+            let key = self.prop_key()?;
+            let is_ctor = !is_static && kind == 0 && matches!(&key, PropKey::Name(n) if &**n == "constructor");
+            if is_ctor {
+                if constructor.is_some() {
+                    return self.err("a class with two constructors");
+                }
+                self.pending_home = Some((Some(home.clone()), Some(home_static.clone()), class_kind));
+                let f = self.method(&key, None, mpos)?;
+                let func = &mut self.functions[f];
+                func.method = false;
+                func.class_kind = class_kind;
+                func.uses_new_target = true;
+                func.name = name.clone();
+                constructor = Some(f);
+                continue;
+            }
+            let h = if is_static { &home_static } else { &home };
+            self.pending_home = Some((Some(h.clone()), None, 0));
+            let prefix = match kind {
+                1 => Some("get"),
+                2 => Some("set"),
+                _ => None,
+            };
+            let f = self.method(&key, prefix, mpos)?;
+            members.push(ClassMember {
+                key,
+                kind,
+                is_static,
+                function: f,
+            });
+        }
+        let end = self.toks[self.i - 1].pos;
+        let constructor = match constructor {
+            Some(f) => f,
+            None => self.default_constructor(name.clone(), class_kind, &home, &home_static, end),
+        };
+        let inner = match &name {
+            Some(n) => {
+                let r = self.declare(n, CONST, end + 1);
+                (r != *n).then_some(r)
+            }
+            None => None,
+        };
+        Ok(Class {
+            inner,
+            heritage,
+            constructor,
+            members,
+            home,
+            home_static,
+        })
+    }
+
+    /// A class's implicit constructor: `constructor() {}`, or a derived
+    /// class's `constructor(...args) { super(...args); }`.
+    fn default_constructor(&mut self, name: Option<Name>, class_kind: u8, home: &Name, home_static: &Name, end: Pos) -> usize {
+        let derived = class_kind == 3;
+        let mut body = Vec::new();
+        if derived {
+            let args = expr(self.arena, Expr { kind: ExprKind::Ident("args".into()), pos: end });
+            let spread = Expr { kind: ExprKind::Spread(args), pos: end };
+            body.push(Stmt {
+                kind: StmtKind::Expr(Expr {
+                    kind: ExprKind::SuperCall(home_static.clone(), vec![spread]),
+                    pos: end,
+                }),
+                pos: end,
+            });
+        }
+        let index = self.functions.len();
+        self.functions.push(Function {
+            name,
+            params: if derived { vec!["args".into()] } else { Vec::new() },
+            body,
+            parent: Some(self.current),
+            declaration: false,
+            binds_name: false,
+            uses_arguments: false,
+            pos: end,
+            params_pos: end,
+            end,
+            eager: false,
+            strict: true,
+            withs: self.withs.clone(),
+            arrow: false,
+            uses_this: false,
+            method: false,
+            length: 0,
+            rest: derived,
+            binding: None,
+            annex_b: false,
+            class_kind,
+            uses_new_target: true,
+            hidden: Vec::new(),
+            home: Some(home.clone()),
+            ctor_var: Some(home_static.clone()),
+            free: None,
+        });
+        index
+    }
+
+    /// `super(…)`, `super.name` or `super[key]` (at `super`).
+    fn super_expr(&mut self, pos: Pos) -> R<Expr<'a>> {
+        let k = self.non_arrow();
+        if self.is("(") {
+            let ctor = match &self.functions[k].ctor_var {
+                Some(c) if self.functions[k].class_kind == 3 && k == self.current => c.clone(),
+                _ => return self.err("`super()` outside a derived class's constructor"),
+            };
+            self.advance();
+            let args = self.arguments()?;
+            return Ok(Expr {
+                kind: ExprKind::SuperCall(ctor, args),
+                pos,
+            });
+        }
+        let Some(home) = self.functions[k].home.clone() else {
+            return self.err("`super` outside a method");
+        };
+        let key = if self.eat(".") {
+            let n = self.property_name()?;
+            Expr {
+                kind: ExprKind::Str(n.to_string()),
+                pos,
+            }
+        } else if self.eat("[") {
+            let e = self.expression(false)?;
+            self.expect("]")?;
+            e
+        } else {
+            return self.err("expected `.`, `[` or `(` after `super`");
+        };
+        let this = if self.functions[self.current].arrow {
+            self.functions[k].uses_this = true;
+            ExprKind::Ident("%this".into())
+        } else {
+            ExprKind::This
+        };
+        let this = expr(self.arena, Expr { kind: this, pos });
+        Ok(Expr {
+            kind: ExprKind::SuperMember(home, expr(self.arena, key), this),
+            pos,
+        })
     }
 
     /// A template literal's pieces from its first (`first`), and its

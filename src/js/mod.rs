@@ -44,8 +44,7 @@ pub fn parse(src: &str) -> Result<(), Error> {
 /// Compile `src`, a script, to a module; errors are `line:column: message`.
 pub fn compile(src: &str) -> Result<Module, String> {
     let arena = ast::Arenas::default();
-    lex::lex(src)
-        .and_then(|mut toks| parse::parse(&mut toks, &arena))
+    parse::parse_source(src, &arena, false)
         .and_then(|p| codegen::generate(&p, src))
         .map_err(|e| e.display(src))
 }
@@ -58,8 +57,7 @@ pub fn compile_script_lazy(src: &str) -> Result<Module, String> {
     let source: Rc<str> = src.into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        lex::lex(src)
-            .and_then(|mut toks| parse::parse_with(&mut toks, &arena, skim))
+        parse::parse_source(src, &arena, skim)
             .and_then(|p| codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[]))
     };
     match compile(true) {
@@ -86,8 +84,7 @@ pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
     let at = |pos: ast::Pos| (pos as usize).saturating_sub(prefix) as u32 + f.start;
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        lex::lex(&text)
-            .and_then(|mut toks| parse::parse_with(&mut toks, &arena, skim))
+        parse::parse_source(&text, &arena, skim)
             .and_then(|p| codegen::generate_lazy(&p, 2, &f.source, &at, &f.upvalues))
     };
     match compile(true) {

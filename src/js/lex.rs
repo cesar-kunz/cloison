@@ -193,6 +193,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 i += ch.len_utf8();
                 continue;
             }
+            // (Annex B's HTML-like comments: `<!--`, and `-->` first on a
+            // line, as `//`.)
+            b'<' if b[i..].starts_with(b"<!--") => {
+                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'-' if b[i..].starts_with(b"-->") && (newline || toks.is_empty()) => {
+                while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
+                    i += 1;
+                }
+                continue;
+            }
             b'/' if b.get(i + 1) == Some(&b'/') => {
                 while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
                     i += 1;

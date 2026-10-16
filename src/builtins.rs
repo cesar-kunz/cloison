@@ -215,6 +215,8 @@ pub(crate) fn install(vm: &mut Vm) {
     // strict functions' do; sloppy ones' don't exist here).
     let thrower = vm.native_function("", throw_type_error, 0, any, false);
     vm.thrower = thrower;
+    // (%ThrowTypeError% is frozen.)
+    vm.seal(thrower, true);
     for name in ["caller", "arguments"] {
         let a = vm.intern(name);
         vm.define_accessor(fp, a, Some(object_value(thrower)), Some(object_value(thrower)), DONT_ENUM);
@@ -1342,8 +1344,15 @@ fn math_fround(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 /// `Math.hypot(…values)`: every argument coerced first; infinity wins
 /// over NaN.
-fn math_hypot(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let xs: Vec<f64> = (0..a.len()).map(|i| math_arg(a, i)).collect();
+fn math_hypot(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let mut xs: Vec<f64> = Vec::with_capacity(a.len());
+    for i in 0..a.len() {
+        xs.push(math_arg(a, i));
+        // (No more conversions after one throws.)
+        if vm.conv_thrown {
+            return Err(vm.take_conv_error());
+        }
+    }
     if xs.iter().any(|x| x.is_infinite()) {
         return Ok(num(f64::INFINITY));
     }
@@ -2014,9 +2023,50 @@ pub(crate) fn new_regexp(vm: &mut Vm, pattern: &str, flags: &str) -> Result<Valu
             p
         }
     };
-    let source = if pattern.is_empty() { "(?:)" } else { pattern };
-    let source = str_value(vm, source);
+    let source = if pattern.is_empty() { "(?:)".to_string() } else { escape_pattern(pattern) };
+    let source = str_value(vm, &source);
     Ok(regexp_object(vm, re, source))
+}
+
+/// EscapeRegExpPattern: `pattern` as a literal's (`/…/`) would be: a `/`
+/// outside a class escaped, line terminators as escapes.
+fn escape_pattern(pattern: &str) -> String {
+    if !pattern.contains(['/', '\n', '\r', '\u{2028}', '\u{2029}']) {
+        return pattern.to_string();
+    }
+    let mut out = String::with_capacity(pattern.len() + 2);
+    let (mut class, mut escaped) = (false, false);
+    for c in pattern.chars() {
+        let terminator = match c {
+            '\n' => Some("\\n"),
+            '\r' => Some("\\r"),
+            '\u{2028}' => Some("\\u2028"),
+            '\u{2029}' => Some("\\u2029"),
+            _ => None,
+        };
+        if let Some(t) = terminator {
+            // (An escaped one, `\` and the character: the escape alone.)
+            if escaped {
+                out.pop();
+            }
+            out.push_str(t);
+            escaped = false;
+            continue;
+        }
+        if c == '/' && !escaped && !class {
+            out.push('\\');
+        }
+        out.push(c);
+        if !escaped {
+            match c {
+                '[' => class = true,
+                ']' => class = false,
+                _ => {}
+            }
+        }
+        escaped = !escaped && c == '\\';
+    }
+    out
 }
 
 /// A regular expression literal's object, its pattern and flags string
@@ -2590,7 +2640,7 @@ pub(crate) fn caught(vm: &mut Vm, e: &Error) -> Value {
 /// `Error.prototype.toString`: `name: message`, or either alone if the
 /// other is empty.
 fn error_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    if !this.is_cell() {
+    if !crate::props::is_object(this) {
         return Err(Error::type_error("Error.prototype.toString called on a non-object"));
     }
     let (a_name, a_message) = (vm.intern("name"), vm.intern("message"));

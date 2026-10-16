@@ -758,7 +758,9 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(ForInit::Var(decls))
         } else {
             let e = self.expression(true)?;
-            if matches!(e.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) && self.is_of() {
+            if (matches!(e.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) || self.call_target(&e))
+                && self.is_of()
+            {
                 return self.for_of_rest(0, e.kind);
             }
             if matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(..)) && self.is_of() {
@@ -766,7 +768,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let p = self.to_pattern(e)?;
                 return self.for_of_pattern(0, p);
             }
-            if matches!(e.kind, ExprKind::Member(..) | ExprKind::Index(..)) && self.eat("in") {
+            if (matches!(e.kind, ExprKind::Member(..) | ExprKind::Index(..)) || self.call_target(&e)) && self.eat("in") {
                 return self.for_in_target(ForInTarget::Expr(e));
             }
             if matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(..)) && self.eat("in") {
@@ -1637,10 +1639,12 @@ impl<'a> Parser<'_, 'a, '_> {
                 pos,
             });
         }
+        // (A call too in sloppy code, Annex B: a `ReferenceError` when run.)
         if !matches!(
             target.kind,
             ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..) | ExprKind::SuperMember(..)
-        ) {
+        ) && !self.call_target(&target)
+        {
             return self.err("invalid assignment target");
         }
         if let ExprKind::Ident(n) = &target.kind
@@ -1754,9 +1758,15 @@ impl<'a> Parser<'_, 'a, '_> {
         })
     }
 
+    /// Whether `e` is a call sloppy code may assign to (Annex B).
+    fn call_target(&self, e: &Expr) -> bool {
+        matches!(e.kind, ExprKind::Call(..)) && !self.strict()
+    }
+
     fn check_update_target(&self, e: &Expr) -> R<()> {
         match e.kind {
             ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..) | ExprKind::SuperMember(..) => Ok(()),
+            _ if self.call_target(e) => Ok(()),
             _ => Err(Error::new(
                 e.pos as usize,
                 "invalid increment target".into(),

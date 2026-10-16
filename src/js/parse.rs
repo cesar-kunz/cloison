@@ -1756,7 +1756,7 @@ impl<'a> Parser<'_, 'a, '_> {
 
     fn check_update_target(&self, e: &Expr) -> R<()> {
         match e.kind {
-            ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..) => Ok(()),
+            ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..) | ExprKind::SuperMember(..) => Ok(()),
             _ => Err(Error::new(
                 e.pos as usize,
                 "invalid increment target".into(),
@@ -2574,7 +2574,8 @@ impl<'a> Parser<'_, 'a, '_> {
             strict: true,
             withs: self.withs.clone(),
             arrow: false,
-            uses_this: false,
+            // (A derived one's `super(...args)`: see `super_expr`.)
+            uses_this: derived,
             method: false,
             length: 0,
             rest: derived,
@@ -2599,10 +2600,14 @@ impl<'a> Parser<'_, 'a, '_> {
     fn super_expr(&mut self, pos: Pos) -> R<Expr<'a>> {
         let k = self.non_arrow();
         if self.is("(") {
+            // (Maybe in an arrow in it: the constructor's `this` is then
+            // a variable the arrow sets, `%this`, as it is whenever the
+            // constructor calls `super()`.)
             let ctor = match &self.functions[k].ctor_var {
-                Some(c) if self.functions[k].class_kind == 3 && k == self.current => c.clone(),
+                Some(c) if self.functions[k].class_kind == 3 => c.clone(),
                 _ => return self.err("`super()` outside a derived class's constructor"),
             };
+            self.functions[k].uses_this = true;
             self.advance();
             let args = self.arguments()?;
             return Ok(Expr {

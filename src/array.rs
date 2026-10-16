@@ -273,6 +273,13 @@ fn array_is_array(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `Array.prototype.join(sep)`: elements' strings (holes, `undefined` and
 /// `null` empty), separated by `sep` (a comma by default).
+/// Whether `o` is being joined already (an array holding itself): joins
+/// root their arrays as handles marked by a hole before them, apart from
+/// other handles (`apply`'s argument lists, say).
+fn joining(vm: &Vm, o: Value) -> bool {
+    vm.handles.windows(2).any(|w| w[0] == Value::HOLE && w[1] == o)
+}
+
 fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let sep: Vec<u16> = match a.first() {
@@ -280,11 +287,11 @@ fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         _ => vec![b',' as u16],
     };
     // A cycle (an array holding itself) joins as empty, as the engines do.
-    if vm.handles.contains(&o) {
+    if joining(vm, o) {
         return Ok(vm.new_string(&[]));
     }
     vm.handle_scope(|vm| {
-        vm.handles.push(o);
+        vm.handles.extend([Value::HOLE, o]);
         let mut out: Vec<u16> = Vec::new();
         let mut i = 0.0;
         while i < len {
@@ -320,11 +327,11 @@ fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// comma-separated.
 fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
-    if vm.handles.contains(&o) {
+    if joining(vm, o) {
         return Ok(vm.new_string(&[]));
     }
     vm.handle_scope(|vm| {
-        vm.handles.push(o);
+        vm.handles.extend([Value::HOLE, o]);
         let a_tls = vm.intern("toLocaleString");
         let mut out: Vec<u16> = Vec::new();
         let mut i = 0.0;

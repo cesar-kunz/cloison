@@ -933,9 +933,9 @@ impl Vm {
 
         let fp = object_value(vm.function_prototype);
         let root = vm.root_shape(Class::Function, fp, 2);
-        // Functions' `prototype` and prototypes' `constructor` aren't
-        // enumerable.
-        vm.function_shape = vm.transition_with(root, vm.a_prototype, DONT_ENUM);
+        // Functions' `prototype` isn't enumerable nor configurable;
+        // prototypes' `constructor` isn't enumerable.
+        vm.function_shape = vm.transition_with(root, vm.a_prototype, DONT_ENUM | DONT_DELETE);
         // (Arrows' and methods': no `prototype`, the same capacity, so
         // upvalues are where compiled code reads them.)
         vm.method_shape = root;
@@ -1055,7 +1055,7 @@ impl Vm {
                 vm.object_prototype,
             ),
         ] {
-            let c = vm.define_native(g, name, f, 0, crate::jit::Ty::Any, true);
+            let c = vm.define_native(g, name, f, 1, crate::jit::Ty::Any, true);
             if name == "Array" {
                 vm.array_fn = c;
             }
@@ -2299,13 +2299,23 @@ impl Vm {
     /// made mutable (they no longer describe `o`'s), and its shape left
     /// stable.
     pub(crate) fn delete_named(&mut self, o: *mut Object, name: Atom) -> bool {
+        self.remove_named(o, name, false)
+    }
+
+    /// Remove property `name` of `o` even if not configurable (as a bound
+    /// function's `prototype`, which it shouldn't have).
+    pub(crate) fn force_delete_named(&mut self, o: *mut Object, name: Atom) -> bool {
+        self.remove_named(o, name, true)
+    }
+
+    fn remove_named(&mut self, o: *mut Object, name: Atom, force: bool) -> bool {
         unsafe {
             let s = &*(*o).shape;
             let Some(slot) = s.lookup(name) else {
                 return !(name == self.a_length
                     && matches!((*o).class, Class::Array | Class::String));
             };
-            if s.attrs[slot as usize] & DONT_DELETE != 0 {
+            if !force && s.attrs[slot as usize] & DONT_DELETE != 0 {
                 return false;
             }
             let n = s.keys.len() as u32;

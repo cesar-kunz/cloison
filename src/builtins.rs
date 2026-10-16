@@ -152,6 +152,7 @@ pub(crate) fn install(vm: &mut Vm) {
     crate::array::install(vm);
     let np = vm.number_prototype;
     vm.define_native(np, "toExponential", number_to_exponential, 1, any, false);
+    vm.define_native(np, "toLocaleString", number_to_locale_string, 0, any, false);
     let np = vm.number_prototype;
     vm.define_native(np, "valueOf", number_value_of, 0, any, false);
 
@@ -1111,18 +1112,38 @@ fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
     let Some(x) = n.as_number() else {
         return Err(Error::type_error("Number.prototype.toExponential called on a non-number"));
     };
+    // (The digits converted first, then the value's finiteness.)
+    let digits = match a.first() {
+        Some(d) if !d.is_undefined() => {
+            let f = to_number(*d);
+            if vm.conv_thrown {
+                return Err(vm.take_conv_error());
+            }
+            Some(if f.is_nan() { 0.0 } else { f.trunc() })
+        }
+        _ => None,
+    };
     if !x.is_finite() {
         return Ok(str_value(vm, &number_to_string(x)));
     }
-    let s = match a.first() {
-        Some(d) if !d.is_undefined() => {
-            let d = to_number(*d);
-            if !(0.0..=100.0).contains(&d) {
+    let sign = if x < 0.0 { "-" } else { "" };
+    let s = match digits {
+        Some(f) => {
+            if !(0.0..=100.0).contains(&f) {
                 return Err(Error::range_error("toExponential() argument must be between 0 and 100"));
             }
-            format!("{:.*e}", d as usize, x)
+            let f = f as usize;
+            if x == 0.0 {
+                if f == 0 { "0e0".to_string() } else { format!("0.{}e0", "0".repeat(f)) }
+            } else {
+                // `f + 1` digits, rounded half up.
+                let (n, e) = crate::vm::significant(x.abs(), f + 1);
+                let m = if f == 0 { n.clone() } else { format!("{}.{}", &n[..1], &n[1..]) };
+                format!("{sign}{m}e{e}")
+            }
         }
-        _ => format!("{x:e}"),
+        None if x == 0.0 => "0e0".to_string(),
+        None => format!("{x:e}"),
     };
     // Rust's `1.5e3` / `1.5e-3`: JavaScript's `1.5e+3` / `1.5e-3`.
     let s = match s.split_once('e') {
@@ -1130,6 +1151,15 @@ fn number_to_exponential(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
         _ => s,
     };
     Ok(str_value(vm, &s))
+}
+
+/// `Number.prototype.toLocaleString()`: as `toString()`.
+fn number_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
+    let Some(x) = n.as_number() else {
+        return Err(Error::type_error("Number.prototype.toLocaleString called on a non-number"));
+    };
+    Ok(str_value(vm, &number_to_string(x)))
 }
 
 // ---- What ToPrimitive calls ----

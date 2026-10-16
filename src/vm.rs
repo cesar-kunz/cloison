@@ -4027,7 +4027,7 @@ fn math_round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // integral already.)
     Ok(Value::number(if x.abs() >= 4503599627370496.0 {
         x
-    } else if r == 0.0 && x < 0.0 {
+    } else if r == 0.0 && x.is_sign_negative() {
         -0.0
     } else {
         r

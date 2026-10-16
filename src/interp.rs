@@ -2874,8 +2874,9 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
     if b.is_bool() {
         return loose_equals(a, Value::from_i32((b == Value::TRUE) as i32));
     }
-    // Two objects that aren't both strings: the same one only.
-    if a.is_cell() && b.is_cell() && !(is_string(a) && is_string(b)) {
+    // Two objects: the same one only. (Strings and symbols are cells too.)
+    let (oa, ob) = (crate::props::is_object(a), crate::props::is_object(b));
+    if oa && ob {
         return Ok(false);
     }
     match (string_units(a), string_units(b)) {
@@ -2885,14 +2886,15 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
         (None, Some(_)) if a.is_number() => return Ok(to_number(a) == to_number(b)),
         _ => {}
     }
-    if a.is_cell() && b.is_cell() {
-        return Ok(false);
-    }
-    // An object and a primitive: the object's primitive (its string).
-    if a.is_cell() {
+    // An object and a primitive: the object's primitive.
+    if oa {
         return loose_equals(to_primitive(a), b);
     }
-    loose_equals(a, to_primitive(b))
+    if ob {
+        return loose_equals(a, to_primitive(b));
+    }
+    // (A symbol and something else.)
+    Ok(false)
 }
 
 /// The VM running (stencils' runtime calls and slow paths reach it this

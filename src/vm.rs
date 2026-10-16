@@ -662,6 +662,9 @@ pub struct Vm {
     pub(crate) eval_envs: Vec<[Value; 2]>,
     /// `%ThrowTypeError%`.
     pub(crate) thrower: *mut Object,
+    /// Sloppy functions' `arguments` objects' shape (see
+    /// `builtins::arguments_object_of`).
+    pub(crate) arguments_shape: *const Shape,
     /// The object key the last `GetKeyed` converted, and what to: a
     /// `SetKeyed` of it next (a compound assignment, an increment) takes
     /// that instead of converting it again (see `interp::slow_set_keyed`).
@@ -832,6 +835,7 @@ impl Vm {
             new_target: Value::EMPTY,
             eval_envs: Vec::new(),
             thrower: std::ptr::null_mut(),
+            arguments_shape: std::ptr::null(),
             key_cache: (Value::EMPTY, Value::EMPTY),
             eval_function: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),

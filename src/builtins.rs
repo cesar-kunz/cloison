@@ -84,6 +84,9 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     vm.define_native(string, "fromCodePoint", string_from_code_point, 1, any, false);
+    vm.define_native(string, "raw", string_raw, 1, any, false);
+    let a_global_this = vm.intern("globalThis");
+    vm.add_property_with(g, a_global_this, object_value(g), DONT_ENUM);
     let a_trim_left = vm.intern("trimLeft");
     let a_trim_right = vm.intern("trimRight");
     let a_trim_start = vm.intern("trimStart");
@@ -858,6 +861,29 @@ fn print_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let parts: Vec<String> = a.iter().map(|&v| String::from_utf16_lossy(&units(v))).collect();
     println!("{}", parts.join(" "));
     Ok(Value::UNDEFINED)
+}
+
+/// `String.raw(strings, …subs)`: `strings.raw`'s pieces, the substitutions
+/// between them.
+fn string_raw(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let cooked = object_value(vm.to_object(arg(a, 0))?);
+    let a_raw = vm.intern("raw");
+    let raw = vm.get(cooked, a_raw)?;
+    let raw = object_value(vm.to_object(raw)?);
+    let n = vm.length_of(raw)?;
+    let mut out: Vec<u16> = Vec::new();
+    let mut i = 0.0;
+    while i < n {
+        let piece = vm.get_keyed(raw, Value::number(i))?;
+        let s = crate::intrinsics::to_string(vm, piece)?;
+        out.extend_from_slice(string_units(s).unwrap_or(&[]));
+        i += 1.0;
+        if i < n && (i as usize) < a.len() {
+            let s = crate::intrinsics::to_string(vm, a[i as usize])?;
+            out.extend_from_slice(string_units(s).unwrap_or(&[]));
+        }
+    }
+    Ok(vm.new_string(&out))
 }
 
 /// `read(file)`: reading files isn't supported.

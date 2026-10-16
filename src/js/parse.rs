@@ -70,6 +70,7 @@ fn parse_pass<'a, 'p>(
         withs: Vec::new(),
         with_count: 0,
         classes: 0,
+        pending_pattern: None,
         home_uses: 0,
         pending_home: None,
         keep,
@@ -179,6 +180,8 @@ struct Parser<'t, 'a, 'p> {
     with_count: usize,
     /// Classes so far (for their home objects' variables' names).
     classes: usize,
+    /// A `for` head's declaration's pattern (see `pattern_declarator`).
+    pending_pattern: Option<Pattern<'a>>,
     /// `super` property references so far.
     home_uses: usize,
     /// The home object variables for the method about to be parsed (see
@@ -506,6 +509,28 @@ impl<'a> Parser<'_, 'a, '_> {
                     self.push_scope(key, false, false);
                     self.frames.last_mut().unwrap().catch = true;
                     let r = (|| {
+                        if self.is("[") || self.is("{") {
+                            // `catch ([a, b])`: the exception in a variable
+                            // of its own, destructured as the block starts.
+                            let pos = self.pos();
+                            let mut names = Vec::new();
+                            let mut pat = self.binding_pattern(&mut names)?;
+                            let map: Vec<(Name, Name)> = names.iter().map(|n| (n.clone(), self.declare(n, LET, 0))).collect();
+                            rename_pattern(&mut pat, &map);
+                            let k = self.classes;
+                            self.classes += 1;
+                            let e: Name = format!("%catch{k}").into();
+                            self.hidden_var(e.clone());
+                            self.expect(")")?;
+                            self.expect("{")?;
+                            let mut body = self.scoped_block_rest()?;
+                            let mut decls: Vec<(Name, Option<Expr<'a>>)> =
+                                map.into_iter().map(|(_, r)| (r, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
+                            let value = expr(self.arena, Expr { kind: ExprKind::Ident(e.clone()), pos });
+                            decls.push(("".into(), Some(Expr { kind: ExprKind::Destructure(Box::new(pat), value, 2), pos })));
+                            body.insert(0, Stmt { kind: StmtKind::Lexical(false, decls), pos });
+                            return Ok((e, body));
+                        }
                         let name = self.ident()?;
                         let name = self.declare(&name, CATCH, 0);
                         self.expect(")")?;
@@ -587,6 +612,13 @@ impl<'a> Parser<'_, 'a, '_> {
     fn var_decls(&mut self, no_in: bool) -> R<Vec<(Name, Option<Expr<'a>>)>> {
         let mut decls = Vec::new();
         loop {
+            if self.is("[") || self.is("{") {
+                self.pattern_declarator(None, no_in, &mut decls)?;
+                if !self.eat(",") {
+                    return Ok(decls);
+                }
+                continue;
+            }
             let name = self.ident()?;
             let init = if self.eat("=") {
                 let e = self.assignment(no_in)?;
@@ -610,6 +642,11 @@ impl<'a> Parser<'_, 'a, '_> {
             let constant = self.is("const");
             self.advance();
             let decls = self.lexical_decls(constant, true)?;
+            if let Some(p) = self.pending_pattern.take()
+                && self.is_of()
+            {
+                return self.for_of_pattern(if constant { 3 } else { 2 }, p);
+            }
             if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
                 let (name, _) = decls.into_iter().next().unwrap();
                 return self.for_of_rest(if constant { 3 } else { 2 }, ExprKind::Ident(name));
@@ -633,6 +670,11 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(ForInit::Lexical(constant, decls))
         } else if self.eat("var") {
             let decls = self.var_decls(true)?;
+            if let Some(p) = self.pending_pattern.take()
+                && self.is_of()
+            {
+                return self.for_of_pattern(1, p);
+            }
             if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
                 let (name, _) = decls.into_iter().next().unwrap();
                 return self.for_of_rest(1, ExprKind::Ident(name));
@@ -646,6 +688,11 @@ impl<'a> Parser<'_, 'a, '_> {
             let e = self.expression(true)?;
             if matches!(e.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) && self.is_of() {
                 return self.for_of_rest(0, e.kind);
+            }
+            if matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(..)) && self.is_of() {
+                let e = expr(self.arena, e);
+                let p = self.to_pattern(e)?;
+                return self.for_of_pattern(0, p);
             }
             if let ExprKind::Ident(name) = &e.kind
                 && self.eat("in")
@@ -692,8 +739,174 @@ impl<'a> Parser<'_, 'a, '_> {
         Ok(StmtKind::ForOf {
             kind,
             target: Expr { kind: target, pos },
+            pattern: None,
             iterable,
             body,
+        })
+    }
+
+    /// `for (pattern of iterable) body`'s rest, at `of`.
+    fn for_of_pattern(&mut self, kind: u8, p: Pattern<'a>) -> R<StmtKind<'a>> {
+        let r = self.for_of_rest(kind, ExprKind::Null)?;
+        let StmtKind::ForOf { kind, target, iterable, body, .. } = r else { unreachable!() };
+        Ok(StmtKind::ForOf {
+            kind,
+            target,
+            pattern: Some(Box::new(p)),
+            iterable,
+            body,
+        })
+    }
+
+    /// A declarator with a pattern (`[a, b] = e`): its names (as
+    /// `Bound`), then the destructuring (under the name ""). `lexical`:
+    /// the names declared so, renamed. In a `for` head (`no_in`) it may
+    /// have no initializer: the pattern waits in `pending_pattern`.
+    fn pattern_declarator(&mut self, lexical: Option<u8>, no_in: bool, decls: &mut Vec<(Name, Option<Expr<'a>>)>) -> R<()> {
+        let pos = self.pos();
+        let mut names = Vec::new();
+        let mut pat = self.binding_pattern(&mut names)?;
+        let init = if self.eat("=") {
+            Some(self.assignment(no_in)?)
+        } else if no_in {
+            None
+        } else {
+            return self.err("missing initializer in a destructuring declaration");
+        };
+        let end = self.pos();
+        let names: Vec<Name> = match lexical {
+            Some(kind) => {
+                let map: Vec<(Name, Name)> = names.iter().map(|n| (n.clone(), self.declare(n, kind, end))).collect();
+                rename_pattern(&mut pat, &map);
+                map.into_iter().map(|(_, r)| r).collect()
+            }
+            None => names,
+        };
+        for n in names {
+            decls.push((n, Some(Expr { kind: ExprKind::Bound, pos })));
+        }
+        let mode = if lexical.is_some() { 2 } else { 1 };
+        match init {
+            Some(e) => {
+                let e = expr(self.arena, e);
+                decls.push(("".into(), Some(Expr { kind: ExprKind::Destructure(Box::new(pat), e, mode), pos })));
+            }
+            None => {
+                self.pending_pattern = Some(pat);
+                decls.push(("".into(), None));
+            }
+        }
+        Ok(())
+    }
+
+    /// A binding pattern: a name, `[…]` or `{…}`, its names (as written)
+    /// onto `names`.
+    fn binding_pattern(&mut self, names: &mut Vec<Name>) -> R<Pattern<'a>> {
+        if self.eat("[") {
+            let mut elems = Vec::new();
+            let mut rest = None;
+            while !self.eat("]") {
+                if self.eat(",") {
+                    elems.push(None);
+                    continue;
+                }
+                if self.eat("...") {
+                    rest = Some(Box::new(self.binding_pattern(names)?));
+                    self.eat(",");
+                    self.expect("]")?;
+                    break;
+                }
+                let p = self.binding_pattern(names)?;
+                let d = self.pattern_default()?;
+                elems.push(Some((p, d)));
+                if !self.is("]") {
+                    self.expect(",")?;
+                }
+            }
+            return Ok(Pattern::Array(elems, rest));
+        }
+        if self.eat("{") {
+            let mut props = Vec::new();
+            let mut rest = None;
+            while !self.eat("}") {
+                if self.eat("...") {
+                    let n = self.ident()?;
+                    names.push(n.clone());
+                    rest = Some(Box::new(Pattern::Name(n)));
+                    self.eat(",");
+                    self.expect("}")?;
+                    break;
+                }
+                let shorthand = matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Punct("," | "}" | "="));
+                let (key, p) = if shorthand {
+                    let n = self.ident()?;
+                    names.push(n.clone());
+                    (PatKey::Name(n.clone()), Pattern::Name(n))
+                } else {
+                    let key = match self.prop_key()? {
+                        PropKey::Name(n) => PatKey::Name(n),
+                        PropKey::Computed(e) => PatKey::Computed(expr(self.arena, e)),
+                    };
+                    self.expect(":")?;
+                    (key, self.binding_pattern(names)?)
+                };
+                let d = self.pattern_default()?;
+                props.push((key, p, d));
+                if !self.is("}") {
+                    self.expect(",")?;
+                }
+            }
+            return Ok(Pattern::Object(props, rest));
+        }
+        let n = self.ident()?;
+        names.push(n.clone());
+        Ok(Pattern::Name(n))
+    }
+
+    /// A pattern element's `= default`, if any.
+    fn pattern_default(&mut self) -> R<Option<&'a Expr<'a>>> {
+        if !self.eat("=") {
+            return Ok(None);
+        }
+        let e = self.assignment(false)?;
+        Ok(Some(expr(self.arena, e)))
+    }
+
+    /// An array or object literal (or a target) as an assignment pattern.
+    fn to_pattern(&self, e: &'a Expr<'a>) -> R<Pattern<'a>> {
+        let bad = || Err(Error::new(e.pos as usize, "invalid destructuring target".into()));
+        Ok(match &e.kind {
+            ExprKind::Ident(n) => Pattern::Name(n.clone()),
+            ExprKind::Member(..) | ExprKind::Index(..) => Pattern::Target(e),
+            ExprKind::Array(es) => {
+                let mut elems = Vec::new();
+                let mut rest = None;
+                for (k, x) in es.iter().enumerate() {
+                    match &x.kind {
+                        ExprKind::Hole => elems.push(None),
+                        ExprKind::Spread(t) if k + 1 == es.len() => rest = Some(Box::new(self.to_pattern(t)?)),
+                        ExprKind::Assign(None, t, d) => elems.push(Some((self.to_pattern(t)?, Some(*d)))),
+                        _ => elems.push(Some((self.to_pattern(x)?, None))),
+                    }
+                }
+                Pattern::Array(elems, rest)
+            }
+            ExprKind::Object(ps, _) => {
+                let mut props = Vec::new();
+                for (k, v) in ps {
+                    let key = match k {
+                        PropKey::Name(n) => PatKey::Name(n.clone()),
+                        PropKey::Computed(e) => PatKey::Computed(e),
+                    };
+                    match &v.kind {
+                        ExprKind::Assign(None, t, d) => props.push((key, self.to_pattern(t)?, Some(*d))),
+                        ExprKind::Accessor(..) | ExprKind::Function(_) if !matches!(v.kind, ExprKind::Function(_)) => return bad(),
+                        _ => props.push((key, self.to_pattern(v)?, None)),
+                    }
+                }
+                Pattern::Object(props, None)
+            }
+            _ => return bad(),
         })
     }
 
@@ -866,6 +1079,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let mut params: Vec<Name> = Vec::new();
         let mut prologue = Vec::new();
         let mut length = None;
+        let mut patterns = Vec::new();
         while !self.eat(")") {
             if !params.is_empty() {
                 self.expect(",")?;
@@ -874,7 +1088,16 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
             }
             if self.eat("...") {
-                let p = self.ident()?;
+                let pos = self.pos();
+                let p = if self.is("[") || self.is("{") {
+                    let p: Name = format!("%param{}", params.len()).into();
+                    let mut names = Vec::new();
+                    let pat = self.binding_pattern(&mut names)?;
+                    patterns.push((p.clone(), pat, names, pos));
+                    p
+                } else {
+                    self.ident()?
+                };
                 length.get_or_insert(params.len());
                 params.push(p);
                 self.functions[self.current].rest = true;
@@ -882,14 +1105,36 @@ impl<'a> Parser<'_, 'a, '_> {
                 break;
             }
             let pos = self.pos();
-            let p = self.ident()?;
+            let pattern = if self.is("[") || self.is("{") {
+                let mut names = Vec::new();
+                let pat = self.binding_pattern(&mut names)?;
+                Some((pat, names))
+            } else {
+                None
+            };
+            let p = match &pattern {
+                Some(_) => format!("%param{}", params.len()).into(),
+                None => self.ident()?,
+            };
             if self.eat("=") {
                 length.get_or_insert(params.len());
                 let e = self.assignment(false)?;
                 self.infer_name(&e, &p);
                 prologue.push(self.default_stmt(p.clone(), e, pos));
             }
+            if let Some((pat, names)) = pattern {
+                patterns.push((p.clone(), pat, names, pos));
+            }
             params.push(p);
+        }
+        // Destructured parameters: `var`s of the function, set in order
+        // after the defaults.
+        for (p, pat, names, pos) in patterns {
+            let mut decls: Vec<(Name, Option<Expr<'a>>)> =
+                names.into_iter().map(|n| (n, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
+            let value = expr(self.arena, Expr { kind: ExprKind::Ident(p), pos });
+            decls.push(("".into(), Some(Expr { kind: ExprKind::Destructure(Box::new(pat), value, 1), pos })));
+            prologue.push(Stmt { kind: StmtKind::Var(decls), pos });
         }
         self.functions[self.current].length = length.unwrap_or(params.len());
         Ok((params, prologue))
@@ -1190,6 +1435,16 @@ impl<'a> Parser<'_, 'a, '_> {
             _ => return Ok(target),
         };
         let pos = self.pos();
+        if op.is_none() && matches!(target.kind, ExprKind::Array(_) | ExprKind::Object(..)) {
+            self.advance();
+            let t = expr(self.arena, target);
+            let p = self.to_pattern(t)?;
+            let value = self.assignment(no_in)?;
+            return Ok(Expr {
+                kind: ExprKind::Destructure(Box::new(p), expr(self.arena, value), 0),
+                pos,
+            });
+        }
         if !matches!(
             target.kind,
             ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..) | ExprKind::SuperMember(..)
@@ -1527,13 +1782,22 @@ impl<'a> Parser<'_, 'a, '_> {
                         props.push((key, Expr { kind: ExprKind::Accessor(set, f), pos: ppos }));
                     } else {
                         let shorthand = match self.peek() {
-                            Tok::Ident(n) if matches!(self.peek_at(1), Tok::Punct("," | "}")) => Some(n.clone()),
+                            Tok::Ident(n) if matches!(self.peek_at(1), Tok::Punct("," | "}" | "=")) => Some(n.clone()),
                             _ => None,
                         };
                         if let Some(n) = shorthand {
                             self.advance();
                             let kind = self.reference(n.clone());
-                            props.push((PropKey::Name(n), Expr { kind, pos: ppos }));
+                            let mut v = Expr { kind, pos: ppos };
+                            // `{a = 1}`: only as a pattern (see `to_pattern`).
+                            if self.eat("=") {
+                                let d = self.assignment(false)?;
+                                v = Expr {
+                                    kind: ExprKind::Assign(None, expr(self.arena, v), expr(self.arena, d)),
+                                    pos: ppos,
+                                };
+                            }
+                            props.push((PropKey::Name(n), v));
                         } else {
                             let key = self.prop_key()?;
                             if self.is("(") {
@@ -1735,6 +1999,13 @@ impl<'a> Parser<'_, 'a, '_> {
         let kind = if constant { CONST } else { LET };
         let mut decls = Vec::new();
         loop {
+            if self.is("[") || self.is("{") {
+                self.pattern_declarator(Some(kind), no_in, &mut decls)?;
+                if !self.eat(",") {
+                    return Ok(decls);
+                }
+                continue;
+            }
             let name = self.ident()?;
             if &*name == "let" {
                 return self.err("`let` can't be declared with `let` or `const`");
@@ -2052,6 +2323,30 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 }
 
+/// Rename `p`'s names by `map` (block-scoped bindings' new names).
+fn rename_pattern(p: &mut Pattern, map: &[(Name, Name)]) {
+    match p {
+        Pattern::Name(n) => {
+            if let Some((_, r)) = map.iter().find(|(o, _)| o == n) {
+                *n = r.clone();
+            }
+        }
+        Pattern::Target(_) => {}
+        Pattern::Array(es, rest) => {
+            es.iter_mut().flatten().for_each(|(p, _)| rename_pattern(p, map));
+            if let Some(r) = rest {
+                rename_pattern(r, map);
+            }
+        }
+        Pattern::Object(ps, rest) => {
+            ps.iter_mut().for_each(|(_, p, _)| rename_pattern(p, map));
+            if let Some(r) = rest {
+                rename_pattern(r, map);
+            }
+        }
+    }
+}
+
 /// Function `f`'s `var`-scoped names: its parameters, `var`s, the
 /// functions declared in it, `arguments`, its own name.
 fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
@@ -2061,8 +2356,13 @@ fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
             | StmtKind::For {
                 init: Some(ForInit::Var(ds)),
                 ..
-            } => out.extend(ds.iter().map(|(n, _)| n.clone())),
+            } => out.extend(ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone())),
             StmtKind::ForIn { var: true, name, .. } => out.push(name.clone()),
+            StmtKind::ForOf {
+                kind: 1,
+                pattern: Some(p),
+                ..
+            } => p.names(out),
             StmtKind::ForOf {
                 kind: 1,
                 target: Expr {

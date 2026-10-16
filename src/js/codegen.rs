@@ -460,6 +460,11 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             expr_refs(k, out);
             expr_refs(this, out);
         }
+        Bound => {}
+        Destructure(p, v, _) => {
+            pattern_refs(p, out, forwarded);
+            expr_refs(v, out);
+        }
         Object(ps, _) => ps.iter().for_each(|(k, e)| {
             if let PropKey::Computed(k) = k {
                 expr_refs(k, out);
@@ -476,6 +481,73 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             args.iter().for_each(|e| expr_refs(e, out));
         }
         Cond(a, b, c) => [a, b, c].into_iter().for_each(|e| expr_refs(e, out)),
+    }
+}
+
+/// The names pattern `p` assigns and its defaults and keys refer to.
+fn pattern_refs<'a>(p: &'a Pattern, out: &mut Vec<&'a str>, forwarded: bool) {
+    match p {
+        Pattern::Name(n) => {
+            if !forwarded {
+                out.push(n)
+            }
+        }
+        Pattern::Target(e) => expr_names(e, out, forwarded),
+        Pattern::Array(es, rest) => {
+            for (p, d) in es.iter().flatten() {
+                pattern_refs(p, out, forwarded);
+                d.iter().for_each(|d| expr_names(d, out, forwarded));
+            }
+            if let Some(r) = rest {
+                pattern_refs(r, out, forwarded);
+            }
+        }
+        Pattern::Object(ps, rest) => {
+            for (k, p, d) in ps {
+                if let PatKey::Computed(k) = k {
+                    expr_names(k, out, forwarded);
+                }
+                pattern_refs(p, out, forwarded);
+                d.iter().for_each(|d| expr_names(d, out, forwarded));
+            }
+            if let Some(r) = rest {
+                pattern_refs(r, out, forwarded);
+            }
+        }
+    }
+}
+
+/// Pattern `p`'s own name `n` (borrowed from the tree).
+fn pattern_name<'a>(p: &'a Pattern, n: &str) -> Option<&'a str> {
+    match p {
+        Pattern::Name(m) if &**m == n => Some(m),
+        Pattern::Name(_) | Pattern::Target(_) => None,
+        Pattern::Array(es, rest) => es
+            .iter()
+            .flatten()
+            .find_map(|(p, _)| pattern_name(p, n))
+            .or_else(|| rest.as_ref().and_then(|r| pattern_name(r, n))),
+        Pattern::Object(ps, rest) => ps
+            .iter()
+            .find_map(|(_, p, _)| pattern_name(p, n))
+            .or_else(|| rest.as_ref().and_then(|r| pattern_name(r, n))),
+    }
+}
+
+/// Whether pattern `p`'s defaults, keys or targets may assign `name`.
+fn pattern_assigns(p: &Pattern, name: &str) -> bool {
+    match p {
+        Pattern::Name(_) => false,
+        Pattern::Target(e) => assigns(e, name),
+        Pattern::Array(es, rest) => {
+            es.iter().flatten().any(|(p, d)| pattern_assigns(p, name) || d.is_some_and(|d| assigns(d, name)))
+                || rest.as_ref().is_some_and(|r| pattern_assigns(r, name))
+        }
+        Pattern::Object(ps, rest) => {
+            ps.iter().any(|(k, p, d)| {
+                matches!(k, PatKey::Computed(k) if assigns(k, name)) || pattern_assigns(p, name) || d.is_some_and(|d| assigns(d, name))
+            }) || rest.as_ref().is_some_and(|r| pattern_assigns(r, name))
+        }
     }
 }
 
@@ -535,8 +607,11 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 stmt(body, out);
             }
             StmtKind::ForOf {
-                target, iterable, body, ..
+                target, iterable, body, pattern, ..
             } => {
+                if let Some(p) = pattern {
+                    pattern_refs(p, out, fw);
+                }
                 expr_refs(target, out);
                 expr_refs(iterable, out);
                 stmt(body, out);
@@ -616,7 +691,23 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
             | StmtKind::For {
                 init: Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)),
                 ..
-            } => ds.iter().for_each(|(n, _)| add(n, out)),
+            } => ds.iter().filter(|(n, _)| !n.is_empty()).for_each(|(n, _)| add(n, out)),
+            StmtKind::ForOf {
+                kind: 1..=3,
+                pattern: Some(pat),
+                ..
+            } => {
+                let mut ns = Vec::new();
+                pat.names(&mut ns);
+                for n in ns {
+                    if !out.iter().any(|o| *o == &*n) {
+                        // (The names live in the tree: find this one's.)
+                        if let Some(n) = pattern_name(pat, &n) {
+                            out.push(n);
+                        }
+                    }
+                }
+            }
             StmtKind::Function(i) => {
                 let f = &p.functions[*i];
                 if let Some(b) = &f.binding {
@@ -770,6 +861,12 @@ fn assigns(e: &Expr, name: &str) -> bool {
                 || c.members.iter().any(|m| matches!(&m.key, PropKey::Computed(k) if assigns(k, name)))
         }
         SuperMember(_, k, t) => assigns(k, name) || assigns(t, name),
+        Bound => false,
+        Destructure(p, v, _) => {
+            let mut ns = Vec::new();
+            p.names(&mut ns);
+            ns.iter().any(|n| &**n == name) || assigns(v, name) || pattern_assigns(p, name)
+        }
         Object(ps, _) => ps
             .iter()
             .any(|(k, e)| matches!(k, PropKey::Computed(k) if assigns(k, name)) || assigns(e, name)),
@@ -1226,7 +1323,7 @@ impl<'a> Gen<'a> {
             // An initializer reading its own variable (`var p = p || {}`)
             // reads it declared, before it's assigned.
             let mut decl = |ds: &'a [(Name, Option<Expr>)]| {
-                for (n, e) in ds {
+                for (n, e) in ds.iter().filter(|(n, _)| !n.is_empty()) {
                     let reads_itself = e.as_ref().is_some_and(|e| {
                         let mut refs = Vec::new();
                         expr_refs(e, &mut refs);
@@ -1245,11 +1342,18 @@ impl<'a> Gen<'a> {
                     decl(ds);
                     walk(body, init, bare, p);
                 }
-                StmtKind::ForOf { kind, target, body, .. } => {
+                StmtKind::ForOf { kind, target, body, pattern, .. } => {
                     if *kind == 1
                         && let ExprKind::Ident(name) = &target.kind
                     {
                         init.push(name);
+                    }
+                    if *kind == 1
+                        && let Some(pat) = pattern
+                    {
+                        let mut ns = Vec::new();
+                        pat.names(&mut ns);
+                        init.extend(ns.iter().filter_map(|n| pattern_name(pat, n)));
                     }
                     walk(body, init, bare, p);
                 }
@@ -1492,7 +1596,7 @@ impl<'a> Gen<'a> {
     fn enter_scope(&mut self, stmts: &'a [Stmt<'a>], pos: Pos) -> R<()> {
         for s in stmts {
             if let StmtKind::Lexical(_, ds) = &s.kind {
-                for (n, _) in ds {
+                for (n, _) in ds.iter().filter(|(n, _)| !n.is_empty()) {
                     self.fresh_binding(n, true, pos)?;
                 }
             }
@@ -2335,6 +2439,15 @@ impl<'a> Gen<'a> {
                 self.temp = mark;
             }
             Class(c) => self.class(c, e.pos)?,
+            Bound => unreachable!("a declaration's marker"),
+            Destructure(p, v, mode) => {
+                let mark = self.temp;
+                let r = self.alloc(e.pos)?;
+                self.into(v, r)?;
+                self.destructure(p, r, *mode, e.pos)?;
+                self.ldar(r);
+                self.temp = mark;
+            }
             SuperCall(ctor, args) => {
                 let mark = self.temp;
                 let c = self.alloc(e.pos)?;
@@ -3124,6 +3237,153 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// Destructure register `r` into pattern `p` (`mode` as
+    /// `ExprKind::Destructure`'s).
+    fn destructure(&mut self, p: &Pattern, r: u8, mode: u8, pos: Pos) -> R<()> {
+        match p {
+            Pattern::Name(n) => {
+                self.ldar(r);
+                if mode == 2 {
+                    self.init_var(n, pos)?;
+                } else {
+                    self.store_var(n, pos)?;
+                }
+            }
+            Pattern::Target(t) => match &t.kind {
+                ExprKind::Member(o, name) => {
+                    let mark = self.temp;
+                    let ro = self.reg(o, &[])?;
+                    self.ldar(r);
+                    self.named(Op::SetNamed, ro, name);
+                    self.temp = mark;
+                }
+                ExprKind::Index(o, k) => {
+                    let mark = self.temp;
+                    let ro = self.reg(o, &[k])?;
+                    let rk = self.reg(k, &[])?;
+                    self.ldar(r);
+                    let ic = self.auto_ic("[]keyed");
+                    self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+                    self.temp = mark;
+                }
+                _ => return unsupported(pos, "this destructuring target"),
+            },
+            Pattern::Array(es, rest) => {
+                let mark = self.temp;
+                let it = self.alloc(pos)?;
+                self.mov(r, it);
+                self.intrinsic("get_iterator", it, 1);
+                self.star(it);
+                let hole = self.alloc(pos)?;
+                self.emit(Op::LdaHole, &[]);
+                self.star(hole);
+                let v = self.alloc(pos)?;
+                for e in es {
+                    let have = self.label();
+                    self.intrinsic("pattern_step", it, 1);
+                    self.star(v);
+                    self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+                    self.jump_if(Jmp::False, have);
+                    // Done: no more steps, and `undefined`.
+                    self.emit(Op::LdaUndefined, &[]);
+                    self.star(it);
+                    self.star(v);
+                    self.bind(have);
+                    if let Some((p, d)) = e {
+                        self.pattern_default(v, *d)?;
+                        self.destructure(p, v, mode, pos)?;
+                    }
+                }
+                if let Some(rest) = rest {
+                    self.intrinsic("iterator_rest", it, 1);
+                    self.star(v);
+                    self.emit(Op::LdaUndefined, &[]);
+                    self.star(it);
+                    self.destructure(rest, v, mode, pos)?;
+                } else {
+                    self.intrinsic("iterator_close", it, 1);
+                }
+                self.temp = mark;
+            }
+            Pattern::Object(ps, rest) => {
+                let mark = self.temp;
+                let src = self.alloc(pos)?;
+                self.mov(r, src);
+                self.intrinsic("require_coercible", src, 1);
+                let keys = if rest.is_some() {
+                    let k = self.alloc(pos)?;
+                    self.emit(Op::CreateArray, &[Arg::Count(ps.len().min(255) as u8)]);
+                    self.star(k);
+                    Some(k)
+                } else {
+                    None
+                };
+                let v = self.alloc(pos)?;
+                for (key, p, d) in ps {
+                    match key {
+                        PatKey::Name(n) => {
+                            if let Some(k) = keys {
+                                self.string(n);
+                                self.emit(Op::PushLiteral, &[Arg::Reg(k)]);
+                            }
+                            // (An index key is an element's.)
+                            match n.parse::<i32>().ok().filter(|i| *i >= 0 && i.to_string() == **n) {
+                                Some(i) => {
+                                    self.lda_smi(i);
+                                    let ic = self.auto_ic("[]keyed");
+                                    self.emit(Op::GetKeyed, &[Arg::Reg(src), ic]);
+                                }
+                                None => self.named(Op::GetNamed, src, n),
+                            }
+                        }
+                        PatKey::Computed(e) => {
+                            let m = self.temp;
+                            let kr = self.alloc(pos)?;
+                            self.into(e, kr)?;
+                            if let Some(k) = keys {
+                                self.ldar(kr);
+                                self.emit(Op::PushLiteral, &[Arg::Reg(k)]);
+                            }
+                            self.ldar(kr);
+                            let ic = self.auto_ic("[]keyed");
+                            self.emit(Op::GetKeyed, &[Arg::Reg(src), ic]);
+                            self.temp = m;
+                        }
+                    }
+                    self.star(v);
+                    self.pattern_default(v, *d)?;
+                    self.destructure(p, v, mode, pos)?;
+                }
+                if let (Some(rest), Some(k)) = (rest, keys) {
+                    let m = self.temp;
+                    let a = self.alloc(pos)?;
+                    self.mov(src, a);
+                    let b = self.alloc(pos)?;
+                    self.mov(k, b);
+                    self.intrinsic("object_rest", a, 2);
+                    self.temp = m;
+                    self.star(v);
+                    self.destructure(rest, v, mode, pos)?;
+                }
+                self.temp = mark;
+            }
+        }
+        Ok(())
+    }
+
+    /// `v = d` if `v` is `undefined` (a pattern element's default).
+    fn pattern_default(&mut self, v: u8, d: Option<&Expr>) -> R<()> {
+        let Some(d) = d else { return Ok(()) };
+        let skip = self.label();
+        self.ldar(v);
+        self.emit(Op::TestUndefined, &[]);
+        self.jump_if(Jmp::False, skip);
+        self.value(d)?;
+        self.star(v);
+        self.bind(skip);
+        Ok(())
+    }
+
     /// A derived class's constructor returning `acc`: the object it
     /// returns, else `this` (see `intrinsics::derived_return`).
     fn derived_return(&mut self, pos: Pos) -> R<()> {
@@ -3405,7 +3665,8 @@ impl<'a> Gen<'a> {
                 target,
                 iterable,
                 body,
-            } => self.for_of(labels, *kind, target, iterable, body, s.pos)?,
+                pattern,
+            } => self.for_of(labels, *kind, target, pattern.as_deref(), iterable, body, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
             StmtKind::Try(block, catch, finally) => self.try_stmt(block, catch, finally, s.pos)?,
             StmtKind::Throw(e) => {
@@ -3581,6 +3842,7 @@ impl<'a> Gen<'a> {
         labels: Vec<Name>,
         kind: u8,
         target: &Expr,
+        pattern: Option<&Pattern>,
         iterable: &Expr,
         body: &'a Stmt,
         pos: Pos,
@@ -3610,6 +3872,17 @@ impl<'a> Gen<'a> {
         self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
         self.jump_if(Jmp::True, done);
         match (kind, &target.kind) {
+            _ if pattern.is_some() => {
+                let p = pattern.unwrap();
+                if kind >= 2 {
+                    let mut ns = Vec::new();
+                    p.names(&mut ns);
+                    for n in &ns {
+                        self.fresh_binding(n, false, pos)?;
+                    }
+                }
+                self.destructure(p, v, if kind >= 2 { 2 } else if kind == 1 { 1 } else { 0 }, pos)?;
+            }
             (2 | 3, ExprKind::Ident(n)) => {
                 self.fresh_binding(n, false, pos)?;
                 self.ldar(v);
@@ -3721,7 +3994,13 @@ impl<'a> Gen<'a> {
     fn lexical_decls(&mut self, ds: &[(Name, Option<Expr>)]) -> R<()> {
         for (name, init) in ds {
             match init {
+                Some(Expr { kind: ExprKind::Bound, .. }) => continue,
+                Some(e) if name.is_empty() => {
+                    self.effect(e)?;
+                    continue;
+                }
                 Some(e) => self.value(e)?,
+                None if name.is_empty() => continue,
                 None => self.emit(Op::LdaUndefined, &[]),
             }
             self.init_var(name, init.as_ref().map_or(0, |e| e.pos))?;
@@ -3731,6 +4010,15 @@ impl<'a> Gen<'a> {
 
     fn var_decls(&mut self, ds: &[(Name, Option<Expr>)]) -> R<()> {
         for (name, init) in ds {
+            if let Some(Expr { kind: ExprKind::Bound, .. }) = init {
+                continue;
+            }
+            if name.is_empty() {
+                if let Some(e) = init {
+                    self.effect(e)?;
+                }
+                continue;
+            }
             if let Some(e) = init {
                 self.value(e)?;
                 self.store_var(name, e.pos)?;

@@ -142,31 +142,28 @@ and early errors for invalid syntax that the parser accepts.
 
 ## Results
 
-All numbers are from an Ubuntu Linux host, recorded in the docs; they
-are the author's, not reproduced on other hardware.
+Octane scores at 242aafd on an Apple silicon Mac, toi's JIT against V8 14.6
+capped at Sparkplug, at Maglev, and with all tiers (higher is better;
+from `perf-history/octane-engines.sh`):
 
-Octane scores at 49c80a1, toi's JIT against V8 14.6 with all tiers and
-capped at Sparkplug (higher is better; medians of 3 runs, from
-`scripts/octane-tiers.sh`):
-
-| benchmark | toi | V8 Sparkplug | V8 |
-|---|---:|---:|---:|
-| Richards | 33,657 | 2,743 | 51,308 |
-| DeltaBlue | 58,640 | 2,804 | 120,738 |
-| Crypto | 20,221 | 2,442 | 50,339 |
-| RayTrace | 22,303 | 7,348 | 132,902 |
-| EarleyBoyer | 19,341 | 13,690 | 96,935 |
-| RegExp | 5,513 | 6,668 | 11,851 |
-| Splay | 10,767 | 7,283 | 35,231 |
-| NavierStokes | 7,795 | 3,104 | 47,441 |
-| PdfJS | 14,716 | 16,331 | 60,628 |
-| Mandreel | 25,110 | 4,860 | 72,396 |
-| GameBoy | 55,987 | 14,365 | 107,033 |
-| CodeLoad | 18,374 | 45,023 | 45,102 |
-| Box2D | 16,609 | 8,286 | 112,889 |
-| zlib | 22,747 | 109,623 | 109,702 |
-| TypeScript | 29,298 | 34,545 | 74,261 |
-| **geomean** | **20,030** | **9,494** | **64,968** |
+| benchmark | toi | V8 Sparkplug | V8 Maglev | V8 |
+|---|---:|---:|---:|---:|
+| Richards | 32,393 | 2,877 | 37,357 | 51,460 |
+| DeltaBlue | 47,850 | 3,190 | 58,951 | 133,129 |
+| Crypto | 22,164 | 2,887 | 33,389 | 60,295 |
+| RayTrace | 45,094 | 8,806 | 89,095 | 141,412 |
+| EarleyBoyer | 24,046 | 14,517 | 70,293 | 114,968 |
+| RegExp | 4,373 | 7,509 | 13,456 | 13,883 |
+| Splay | 17,215 | 18,651 | 100,162 | 102,198 |
+| NavierStokes | 15,403 | 3,346 | 26,955 | 40,473 |
+| PdfJS | 10,845 | 19,104 | 87,999 | 95,899 |
+| Mandreel | 6,290 | 5,744 | 68,189 | 105,810 |
+| GameBoy | 58,589 | 16,714 | 138,912 | 147,921 |
+| CodeLoad | 32,425 | 75,696 | 75,635 | 74,977 |
+| Box2D | 30,874 | 10,110 | 126,873 | 152,509 |
+| zlib | 27,564 | 124,645 | 124,544 | 123,337 |
+| TypeScript | 29,379 | 52,150 | 176,601 | 181,891 |
+| **geomean** | **22,033** | **11,951** | **67,804** | **88,060** |
 
 V8 runs zlib (asm.js) through its wasm pipeline, and compiles the
 functions of CodeLoad's `eval`s when they are first called; toi compiles
@@ -195,6 +192,8 @@ macOS 27 JavaScriptCore, SpiderMonkey 140 and QuickJS 2026-06-04):
 | PdfJS | 98,632 | 95,899 | 87,999 | 63,155 | 10,845 | 19,104 | 12,464 | 5,548 | 0.12 |
 | Mandreel | 113,441 | 105,810 | 68,189 | 42,404 | 6,290 | 5,744 | 4,061 | 4,189 | 0.09 |
 | **geomean** | **88,521** | **88,060** | **67,804** | **41,718** | **22,033** | **11,951** | **8,168** | **3,830** | **0.32** |
+
+The numbers that follow are from an Ubuntu Linux x86-64 host.
 
 Inside a long DeltaBlue run the JIT is about 7x the interpreter and about 2.3x
 behind V8's Maglev tier.

@@ -2819,6 +2819,11 @@ pub(crate) fn to_primitive(v: Value) -> Value {
     to_primitive_hint(v, false)
 }
 
+/// ToPrimitive with hint "string".
+pub(crate) fn to_primitive_string(v: Value) -> Value {
+    to_primitive_hint(v, true)
+}
+
 /// ToPrimitive with hint "string" (`string`: `toString` first) or
 /// "number": the first of `valueOf` and `toString` giving a primitive.
 /// A bytecode one is called where something can call it (`native_top`
@@ -2827,7 +2832,7 @@ pub(crate) fn to_primitive(v: Value) -> Value {
 /// operation to be redone where it can. Conversions can't fail: what one
 /// throws is left in `Vm::conv_error` for the operation to throw.
 fn to_primitive_hint(v: Value, string: bool) -> Value {
-    if !v.is_cell() || is_string(v) {
+    if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) {
         return v;
     }
     unsafe {
@@ -2875,10 +2880,25 @@ fn to_primitive_hint(v: Value, string: bool) -> Value {
     }
 }
 
+/// A symbol converted to a string or a number: a TypeError, left for the
+/// operation to throw (see `to_primitive_hint`).
+fn symbol_conversion(to: &str) {
+    unsafe {
+        let vm = &mut *current_vm();
+        vm.conv_error
+            .get_or_insert_with(|| Error::type_error(format!("Cannot convert a Symbol value to a {to}")));
+        vm.conv_thrown = true;
+    }
+}
+
 /// ToString, as UTF-16 code units.
 pub(crate) fn to_string_units(v: Value) -> Vec<u16> {
     if let Some(u) = string_units(v) {
         return u.to_vec();
+    }
+    if crate::symbol::is_symbol(v) {
+        symbol_conversion("string");
+        return Vec::new();
     }
     if v.is_cell() {
         return to_string_units(to_primitive_hint(v, true));
@@ -2919,6 +2939,10 @@ fn default_string(v: Value) -> Vec<u16> {
 pub(crate) fn to_number(v: Value) -> f64 {
     if !v.is_cell() {
         return v.to_number();
+    }
+    if crate::symbol::is_symbol(v) {
+        symbol_conversion("number");
+        return f64::NAN;
     }
     if let Some(t) = crate::date::date_value(v) {
         return t;

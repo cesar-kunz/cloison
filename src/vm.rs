@@ -589,7 +589,7 @@ pub struct Vm {
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
     /// `typeof`'s results, once made (see [`Vm::type_of`]).
-    type_names: [Option<Value>; 6],
+    type_names: [Option<Value>; 7],
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
@@ -640,6 +640,17 @@ pub struct Vm {
     /// Tagged templates' strings arrays, by site (see
     /// `intrinsics::template_object`).
     pub(crate) template_cache: crate::jit::HashMap<u64, *mut Object>,
+    /// Symbols, by their key atoms (see `symbol`).
+    pub(crate) symbols: crate::jit::HashMap<Atom, *mut Object>,
+    /// `Symbol.for`'s registry.
+    pub(crate) symbol_registry: crate::jit::HashMap<Vec<u16>, *mut Object>,
+    pub(crate) symbol_count: u64,
+    /// `Symbol.prototype`, the iterator prototypes, … (see `symbol::Root`).
+    pub(crate) symbol_roots: Vec<*mut Object>,
+    pub(crate) a_sym_iterator: Atom,
+    pub(crate) a_sym_to_string_tag: Atom,
+    pub(crate) a_sym_to_primitive: Atom,
+    pub(crate) a_sym_has_instance: Atom,
     /// The `new.target` of the frame about to start (set by
     /// `intrinsics::construct_with` for a function whose first instruction
     /// is `LdaNewTarget`, which takes it); `EMPTY` otherwise.
@@ -775,7 +786,7 @@ impl Vm {
             conv_error: None,
             conv_thrown: false,
             open_upvalues: Vec::new(),
-            type_names: [None; 6],
+            type_names: [None; 7],
             handles: Vec::new(),
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
@@ -796,6 +807,14 @@ impl Vm {
             collection_prototypes: Vec::new(),
             promise_roots: Vec::new(),
             template_cache: Default::default(),
+            symbols: Default::default(),
+            symbol_registry: Default::default(),
+            symbol_count: 0,
+            symbol_roots: Vec::new(),
+            a_sym_iterator: Atom(0),
+            a_sym_to_string_tag: Atom(0),
+            a_sym_to_primitive: Atom(0),
+            a_sym_has_instance: Atom(0),
             new_target: Value::EMPTY,
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
@@ -1657,6 +1676,8 @@ impl Vm {
             self.number_prototype
         } else if v.is_bool() {
             self.boolean_prototype
+        } else if crate::symbol::is_symbol(v) {
+            self.symbol_roots[crate::symbol::Root::SymbolPrototype as usize]
         } else {
             self.string_prototype
         };
@@ -2043,7 +2064,7 @@ impl Vm {
     /// `typeof v`, a string constant (each made once: EarleyBoyer's
     /// `sc_isNumber` and others spent 3% encoding and looking them up).
     pub fn type_of(&mut self, v: Value) -> Value {
-        const NAMES: [&str; 6] = ["number", "undefined", "boolean", "string", "function", "object"];
+        const NAMES: [&str; 7] = ["number", "undefined", "boolean", "string", "function", "object", "symbol"];
         let k = if v.is_number() {
             0
         } else if v.is_undefined() {
@@ -2054,6 +2075,7 @@ impl Vm {
             match unsafe { (*as_object(v)).class } {
                 Class::String => 3,
                 Class::Function | Class::Native => 4,
+                Class::Symbol => 6,
                 _ => 5,
             }
         } else {
@@ -2300,6 +2322,9 @@ impl Vm {
     pub(crate) fn property_key(&mut self, key: Value) -> Key {
         if key.is_int32() && key.as_i32_unchecked() >= 0 {
             return Key::Index(key.as_i32_unchecked() as u32);
+        }
+        if crate::symbol::is_symbol(key) {
+            return Key::Name(crate::symbol::symbol_atom(key));
         }
         if let Some(d) = key.as_number()
             && d >= 0.0
@@ -3517,6 +3542,8 @@ impl Vm {
         .chain(self.collection_prototypes.iter().copied())
         .chain(self.promise_roots.iter().copied())
         .chain(self.template_cache.values().copied())
+        .chain(self.symbols.values().copied())
+        .chain(self.symbol_roots.iter().copied())
         .chain(self.error_prototypes.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)
@@ -4099,6 +4126,8 @@ pub fn display(v: Value) -> String {
         (v == Value::TRUE).to_string()
     } else if let Some(s) = string_units(v) {
         String::from_utf16_lossy(s)
+    } else if crate::symbol::is_symbol(v) {
+        String::from_utf16_lossy(&crate::symbol::symbol_string(v))
     } else if v.is_cell() {
         "[object Object]".into()
     } else {

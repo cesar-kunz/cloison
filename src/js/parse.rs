@@ -610,6 +610,10 @@ impl<'a> Parser<'_, 'a, '_> {
             let constant = self.is("const");
             self.advance();
             let decls = self.lexical_decls(constant, true)?;
+            if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
+                let (name, _) = decls.into_iter().next().unwrap();
+                return self.for_of_rest(if constant { 3 } else { 2 }, ExprKind::Ident(name));
+            }
             if decls.len() == 1 && decls[0].1.is_none() && self.eat("in") {
                 let name = decls.into_iter().next().unwrap().0;
                 let object = self.expression(false)?;
@@ -629,6 +633,10 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(ForInit::Lexical(constant, decls))
         } else if self.eat("var") {
             let decls = self.var_decls(true)?;
+            if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
+                let (name, _) = decls.into_iter().next().unwrap();
+                return self.for_of_rest(1, ExprKind::Ident(name));
+            }
             if decls.len() == 1 && decls[0].1.is_none() && self.eat("in") {
                 let name = decls.into_iter().next().unwrap().0;
                 return self.for_in_rest(true, name);
@@ -636,6 +644,9 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(ForInit::Var(decls))
         } else {
             let e = self.expression(true)?;
+            if matches!(e.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) && self.is_of() {
+                return self.for_of_rest(0, e.kind);
+            }
             if let ExprKind::Ident(name) = &e.kind
                 && self.eat("in")
             {
@@ -662,6 +673,26 @@ impl<'a> Parser<'_, 'a, '_> {
             init,
             test,
             update,
+            body,
+        })
+    }
+
+    /// At `of` in a `for` head.
+    fn is_of(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(n) if &**n == "of") && !self.toks[self.i].escaped
+    }
+
+    /// At `of`: `for (target of iterable) body`'s rest.
+    fn for_of_rest(&mut self, kind: u8, target: ExprKind<'a>) -> R<StmtKind<'a>> {
+        let pos = self.pos();
+        self.advance();
+        let iterable = self.assignment(false)?;
+        self.expect(")")?;
+        let body = stmt(self.arena, self.statement()?);
+        Ok(StmtKind::ForOf {
+            kind,
+            target: Expr { kind: target, pos },
+            iterable,
             body,
         })
     }
@@ -2032,6 +2063,14 @@ fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
                 ..
             } => out.extend(ds.iter().map(|(n, _)| n.clone())),
             StmtKind::ForIn { var: true, name, .. } => out.push(name.clone()),
+            StmtKind::ForOf {
+                kind: 1,
+                target: Expr {
+                    kind: ExprKind::Ident(name),
+                    ..
+                },
+                ..
+            } => out.push(name.clone()),
             StmtKind::Function(i) => out.extend(fs[*i].name.clone()),
             _ => {}
         }
@@ -2044,6 +2083,7 @@ fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
             }
             StmtKind::For { body, .. }
             | StmtKind::ForIn { body, .. }
+            | StmtKind::ForOf { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
             | StmtKind::With(_, _, body)

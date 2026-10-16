@@ -23,7 +23,7 @@ use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push, string_units};
 /// Indices into `Vm::collection_prototypes`.
 #[derive(Clone, Copy)]
 #[repr(usize)]
-enum Proto {
+pub(crate) enum Proto {
     Map,
     Set,
     WeakMap,
@@ -250,57 +250,8 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> *mut Object {
 /// Call `f` with each value iterating `v` yields: an array's or typed
 /// array's elements, a string's code points, a map's `[key, value]` pairs
 /// or a set's keys. (No `Symbol.iterator`: anything else is a TypeError.)
-pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
-    if let Some(u) = string_units(v) {
-        let u = u.to_vec();
-        let mut i = 0;
-        while i < u.len() {
-            let c = u[i];
-            let item = if (0xD800..0xDC00).contains(&c) && u.get(i + 1).is_some_and(|d| (0xDC00..0xE000).contains(d)) {
-                i += 1;
-                vm.new_string(&[c, u[i]])
-            } else {
-                vm.single_char(c)
-            };
-            i += 1;
-            f(vm, item)?;
-        }
-        return Ok(());
-    }
-    let class = if v.is_cell() { Some(unsafe { (*as_object(v)).class }) } else { None };
-    match class {
-        Some(Class::Array | Class::TypedArray) => {
-            let a_length = vm.a_length;
-            let mut i = 0.0;
-            while i < to_number(vm.get(v, a_length)?) {
-                let item = vm.get_keyed(v, Value::number(i))?;
-                f(vm, item)?;
-                i += 1.0;
-            }
-            Ok(())
-        }
-        Some(Class::Map | Class::Set) => {
-            let o = as_object(v);
-            let (e, s) = (entries(o), stride(o));
-            let mut i = 0;
-            while i < len(e) {
-                let k = slot(e, i);
-                if k != Value::EMPTY {
-                    let item = if s == 2 {
-                        let pair = vm.new_array();
-                        array_push(vm, pair, &[k, slot(e, i + 1)])?;
-                        pair
-                    } else {
-                        k
-                    };
-                    f(vm, item)?;
-                }
-                i += s;
-            }
-            Ok(())
-        }
-        _ => Err(Error::type_error(format!("{} is not iterable", crate::vm::display(v)))),
-    }
+pub(crate) fn iterate(vm: &mut Vm, v: Value, f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
+    crate::symbol::iterate(vm, v, f)
 }
 
 /// `new Map(iterable)` and the others: each item the iterable yields (a
@@ -651,7 +602,7 @@ fn this_view(this: Value) -> Result<*mut Object> {
 }
 
 /// Whether view `o`'s buffer was detached (`$262.detachArrayBuffer`).
-fn detached(o: *mut Object) -> bool {
+pub(crate) fn detached(o: *mut Object) -> bool {
     unsafe { (*((*o).code as *mut Object)).flags & crate::object::DETACHED != 0 }
 }
 

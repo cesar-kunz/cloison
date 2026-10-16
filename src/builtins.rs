@@ -1437,8 +1437,9 @@ fn parse_int(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `Infinity`), after whitespace.
 fn parse_float(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let v = arg(a, 0);
+    // (Its string: -0's is "0".)
     if v.is_number() {
-        return Ok(v);
+        return Ok(if v.as_number() == Some(0.0) { Value::from_i32(0) } else { v });
     }
     let u = units(v);
     let s = String::from_utf16_lossy(&u);
@@ -2338,7 +2339,8 @@ fn match_array(vm: &mut Vm, caps: &crate::regexp::Captures, s: &[u16], input: Va
 
 fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = this_regexp(this)?;
-    let input = string_fn(vm, Value::UNDEFINED, &a[..a.len().min(1)])?;
+    // (No argument: "undefined".)
+    let input = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
     // Borrowed: strings don't change, and the stack scan keeps `input`.
     let s = units(input);
     with_caps(vm, |vm, caps| {
@@ -2424,6 +2426,11 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = this_units(this)?;
     let pattern = arg(a, 0);
     let replacement = arg(a, 1);
+    // (The pattern's string before the replacement's.)
+    let pattern_units = if regexp_of(pattern).is_none() { Some(units(pattern).into_owned()) } else { None };
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
     let func = replacement.is_cell()
         && matches!(unsafe { (*as_object(replacement)).class }, Class::Function | Class::Native);
     let template = if func { std::borrow::Cow::Borrowed(&[][..]) } else { units(replacement) };
@@ -2449,7 +2456,7 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             }
         }
         None => {
-            let p = units(pattern).into_owned();
+            let p = pattern_units.unwrap_or_default();
             if let Some(i) = find(&s, &p, 0) {
                 flat.push(Some((i, i + p.len())));
             }

@@ -1892,13 +1892,39 @@ fn arith_f64(op: Op, x: f64, y: f64) -> f64 {
 #[cold]
 #[inline(never)]
 pub(crate) fn generic_compare(le: bool, a: Value, b: Value) -> bool {
+    generic_compare_ordered(le, a, b, false)
+}
+
+/// [`generic_compare`] with `b` (the source's left operand: `x > y` is
+/// `y < x`) converted first if `b_first`; not the other after one throws.
+pub(crate) fn generic_compare_ordered(le: bool, a: Value, b: Value, b_first: bool) -> bool {
     let (x, y) = match both_numbers(a, b) {
         Some(p) => p,
         None => {
+            let thrown = || unsafe {
+                let vm = current_vm();
+                !vm.is_null() && std::ptr::read_volatile(&raw const (*vm).conv_thrown)
+            };
+            let (a, b) = if b_first {
+                let pb = to_primitive(b);
+                if thrown() {
+                    return false;
+                }
+                (to_primitive(a), pb)
+            } else {
+                let pa = to_primitive(a);
+                if thrown() {
+                    return false;
+                }
+                (pa, to_primitive(b))
+            };
             // Two strings compare by code units.
-            let (a, b) = (to_primitive(a), to_primitive(b));
             if let (Some(p), Some(q)) = (string_units(a), string_units(b)) {
                 return if le { p <= q } else { p < q };
+            }
+            if b_first {
+                let y = to_number(b);
+                return if le { to_number(a) <= y } else { to_number(a) < y };
             }
             (to_number(a), to_number(b))
         }
@@ -2137,7 +2163,7 @@ macro_rules! relational {
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
                 let lhs = *reg(pc, 1, regs);
-                let c = conv!(if $swap { generic_compare($le, acc, lhs) } else { generic_compare($le, lhs, acc) });
+                let c = conv!(if $swap { generic_compare_ordered($le, acc, lhs, true) } else { generic_compare($le, lhs, acc) });
                 next!(any, Op::$op.size(), Value::from_bool(c))
             }
 
@@ -2385,7 +2411,7 @@ macro_rules! compare_jump {
             #[inline(never)]
             fn $slow(pc, acc, regs, tag) {
                 let x = compare_jump!(@operand $smi, pc, regs);
-                let c = conv!(if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) });
+                let c = conv!(if $swap { generic_compare_ordered($le, x, acc, true) } else { generic_compare($le, acc, x) });
                 if c {
                     next!(any, compare_jump!(@off $smi, pc), acc)
                 }
@@ -2422,7 +2448,7 @@ macro_rules! compare_jump {
             #[inline(never)]
             fn $slow_loop(pc, acc, regs, tag) {
                 let x = compare_jump!(@operand $smi, pc, regs);
-                let c = conv!(if $swap { generic_compare($le, x, acc) } else { generic_compare($le, acc, x) });
+                let c = conv!(if $swap { generic_compare_ordered($le, x, acc, true) } else { generic_compare($le, acc, x) });
                 if c {
                     let off = compare_jump!(@off $smi, pc);
                     back_edge!(regs, pc.offset(off as isize), acc);
@@ -2592,8 +2618,8 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     {
         return concat(p, q);
     }
-    // ToPrimitive: an object is its string (no `valueOf` yet).
-    let (a, b) = (to_primitive(a), to_primitive(b));
+    // ToPrimitive, hint "default" (a date's string).
+    let (a, b) = (to_primitive_default(a), to_primitive_default(b));
     if is_string(a) || is_string(b) {
         let mut units = to_string_units(a);
         units.extend(to_string_units(b));
@@ -2888,10 +2914,10 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
     }
     // An object and a primitive: the object's primitive.
     if oa {
-        return loose_equals(to_primitive(a), b);
+        return loose_equals(to_primitive_default(a), b);
     }
     if ob {
-        return loose_equals(a, to_primitive(b));
+        return loose_equals(a, to_primitive_default(b));
     }
     // (A symbol and something else.)
     Ok(false)
@@ -2915,6 +2941,14 @@ fn is_string(v: Value) -> bool {
 /// its `toString`, whichever gives a primitive first.
 pub(crate) fn to_primitive(v: Value) -> Value {
     to_primitive_hint(v, false)
+}
+
+/// ToPrimitive with hint "default": "number", but a date's "string".
+pub(crate) fn to_primitive_default(v: Value) -> Value {
+    if v.is_cell() && crate::date::date_value(v).is_some() {
+        return to_primitive_hint(v, true);
+    }
+    to_primitive(v)
 }
 
 /// ToPrimitive with hint "string".

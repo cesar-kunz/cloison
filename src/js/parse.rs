@@ -336,11 +336,24 @@ impl<'a> Parser<'_, 'a, '_> {
     fn ident(&mut self) -> R<Name> {
         match self.peek() {
             Tok::Ident(_) => match self.bump() {
-                Tok::Ident(s) => Ok(s),
+                Tok::Ident(s) => {
+                    self.strict_word(&s)?;
+                    Ok(s)
+                }
                 _ => unreachable!(),
             },
             _ => self.err("expected an identifier"),
         }
+    }
+
+    /// An error for a word strict code reserves (just read), if it is one.
+    fn strict_word(&self, s: &str) -> R<()> {
+        if self.strict()
+            && matches!(s, "implements" | "interface" | "package" | "private" | "protected" | "public" | "static")
+        {
+            return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` is reserved in strict mode")));
+        }
+        Ok(())
     }
 
     /// A property name after `.`, where reserved words are allowed.
@@ -368,7 +381,7 @@ impl<'a> Parser<'_, 'a, '_> {
             if !ends {
                 return false;
             }
-            if s == "use strict" {
+            if s == "use strict" && !self.toks[j].escaped {
                 return true;
             }
             j += 1;
@@ -437,6 +450,12 @@ impl<'a> Parser<'_, 'a, '_> {
                     pos,
                 };
                 StmtKind::Lexical(false, vec![(binding, Some(e))])
+            }
+            // (No debugger to stop in.)
+            Tok::Keyword("debugger") => {
+                self.advance();
+                self.semicolon()?;
+                StmtKind::Empty
             }
             Tok::Keyword(k @ ("import" | "export")) => {
                 return self.err(format!("`{k}` is not supported"));
@@ -1946,7 +1965,10 @@ impl<'a> Parser<'_, 'a, '_> {
                     ExprKind::Function(self.arrow(Some(n), pos)?)
                 }
             }
-            Tok::Ident(s) => self.reference(s),
+            Tok::Ident(s) => {
+                self.strict_word(&s)?;
+                self.reference(s)
+            }
             Tok::Template(part) => {
                 let (parts, subs) = self.template_rest(part)?;
                 let mut strings = Vec::new();

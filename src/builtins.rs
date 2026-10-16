@@ -936,6 +936,9 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // (A constructor only if `this` is one.)
     let ctor = Value::from_bool(crate::intrinsics::is_constructor(this));
     let bound = crate::interp::call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), rest, ctor])?;
+    // (No `prototype` of its own.)
+    let a_prototype = vm.a_prototype;
+    vm.force_delete_named(as_object(bound), a_prototype);
     // Its `length` (what the target's leaves) and `name` ("bound …").
     let a_length = vm.a_length;
     let len = if vm.own_property(as_object(this), crate::vm::Key::Name(a_length)).is_some() {
@@ -2021,7 +2024,7 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
         return object_value(o);
     }
     for (a, v) in props {
-        let attrs = if a == vm.a_last_index { DONT_ENUM } else { DONT_ENUM | READ_ONLY };
+        let attrs = if a == vm.a_last_index { DONT_ENUM | DONT_DELETE } else { DONT_ENUM | READ_ONLY };
         vm.add_property_with(o, a, v, attrs);
     }
     if unsafe { !(*root).unique && !(*(*o).shape).unique } {
@@ -2173,7 +2176,7 @@ fn regexp_match_into(
 fn plain_last_index(vm: &Vm, this: Value) -> Option<*mut Object> {
     let o = as_object(this);
     let sh = unsafe { &*(*o).shape };
-    (sh.keys.first() == Some(&vm.a_last_index) && sh.attrs[0] == DONT_ENUM).then_some(o)
+    (sh.keys.first() == Some(&vm.a_last_index) && sh.attrs[0] == DONT_ENUM | DONT_DELETE).then_some(o)
 }
 
 /// `f` with the VM's captures buffer (see `Vm::caps_buf`).

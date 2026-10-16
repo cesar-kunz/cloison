@@ -445,7 +445,7 @@ pub struct Code {
 impl Code {
     /// Whether `new` may call it.
     pub fn constructor(&self) -> bool {
-        !matches!(self.kind, 1 | 4)
+        !matches!(self.kind, 1 | 4 | 5)
     }
 
     /// The inline-cache slot `i` (its way 0, the others following), and
@@ -2921,7 +2921,7 @@ impl Vm {
 
     /// The shape a closure of `callee` gets.
     fn closure_shape(&self, callee: *const Code) -> *const Shape {
-        if unsafe { (*callee).kind } == 1 { self.method_shape } else { self.function_shape }
+        if matches!(unsafe { (*callee).kind }, 1 | 5) { self.method_shape } else { self.function_shape }
     }
 
     /// Give new closure `f` its `prototype` object; `f` as a value.
@@ -2931,8 +2931,8 @@ impl Vm {
         crate::gc::mark_code(unsafe { (*f).code });
         let made = unsafe { &(*(*f).code).closures_made };
         made.set(made.get().saturating_add(1).min(2));
-        // (An arrow's or a method's: none.)
-        if unsafe { (*(*f).code).kind } == 1 {
+        // (An arrow's, a method's or an async function's: none.)
+        if matches!(unsafe { (*(*f).code).kind }, 1 | 5) {
             return object_value(f);
         }
         // (A generator function's: a `%GeneratorPrototype%` object.)
@@ -3825,6 +3825,7 @@ impl Scan {
                     | crate::bytecode::Op::LdaNewTarget
                     | crate::bytecode::Op::InitialYield
                     | crate::bytecode::Op::CreateMappedArguments
+                    | crate::bytecode::Op::AsyncStart
                     | crate::bytecode::Op::Yield
             );
             s.ops += 1;

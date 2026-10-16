@@ -56,6 +56,9 @@ enum Root {
     CatchFinally,
     ValueThunk,
     Thrower,
+    /// … and an async function's `await`'s.
+    AsyncFulfilled,
+    AsyncRejected,
 }
 
 /// Promise states, in the state cell (and the tag of a reaction job).
@@ -97,7 +100,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(aep, a_message, empty, DONT_ENUM);
 
     vm.promise_roots = vec![proto, c, jobs, aep, std::ptr::null_mut()];
-    let templates: [(NativeFn, u32); 11] = [
+    let templates: [(NativeFn, u32); 13] = [
         (resolve_fn, 1),
         (reject_fn, 1),
         (executor_fn, 2),
@@ -109,6 +112,8 @@ pub(crate) fn install(vm: &mut Vm) {
         (catch_finally, 1),
         (value_thunk, 0),
         (thrower, 0),
+        (async_fulfilled, 1),
+        (async_rejected, 1),
     ];
     for (f, n) in templates {
         let t = vm.native_function("", f, n, any, false);
@@ -131,6 +136,41 @@ pub(crate) fn install(vm: &mut Vm) {
         proto,
         &[("then", promise_then as NativeFn, 2), ("catch", promise_catch, 1), ("finally", promise_finally, 1)],
     );
+}
+
+// ---- Async functions ----
+
+/// A new pending promise and its resolve and reject functions.
+pub(crate) fn new_with_resolvers(vm: &mut Vm) -> (Value, Value, Value) {
+    let p = new_promise(vm);
+    let (resolve, reject) = resolving_functions(vm, p);
+    (p, resolve, reject)
+}
+
+/// An `await`'s reaction for coroutine `g`: going on with the value
+/// (`rejected`: with the reason thrown).
+pub(crate) fn async_closure(vm: &mut Vm, rejected: bool, g: Value) -> Value {
+    closure(vm, if rejected { Root::AsyncRejected } else { Root::AsyncFulfilled }, &[g])
+}
+
+/// `await v`: PromiseResolve(%Promise%, v), then the reactions.
+pub(crate) fn await_then(vm: &mut Vm, v: Value, on_fulfilled: Value, on_rejected: Value) -> Result<()> {
+    let c = object_value(root(vm, Root::Constructor));
+    let p = promise_resolve_with(vm, c, v)?;
+    let cap = new_capability(vm, c)?;
+    perform_then(vm, as_object(p), on_fulfilled, on_rejected, &cap)
+}
+
+fn async_fulfilled(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let g = slot(vm.callee, 0);
+    crate::generator::async_step(vm, g, crate::generator::NEXT, arg(a, 0))?;
+    Ok(Value::UNDEFINED)
+}
+
+fn async_rejected(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let g = slot(vm.callee, 0);
+    crate::generator::async_step(vm, g, crate::generator::THROW, arg(a, 0))?;
+    Ok(Value::UNDEFINED)
 }
 
 // ---- Helpers ----

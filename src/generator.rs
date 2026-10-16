@@ -82,6 +82,12 @@ pub(crate) unsafe fn suspend(vm: &mut Vm, g: Value, regs: *mut Value, code: *con
 /// Resume generator `g` (`mode` [`NEXT`]…, with `v`): the iterator
 /// result.
 fn resume(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<Value> {
+    let (out, done) = resume_raw(vm, g, v, mode, what)?;
+    crate::symbol::iter_result(vm, out, done)
+}
+
+/// [`resume`]'s value and whether the generator is done.
+fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<(Value, bool)> {
     let Some(st) = state_of(g) else {
         return Err(Error::type_error(format!("{what} called on an incompatible receiver")));
     };
@@ -96,8 +102,8 @@ fn resume(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<Valu
     if get(vm, st, STATE).as_i32_unchecked() == COMPLETED {
         return match mode {
             THROW => Err(Error(String::new(), Some(v))),
-            RETURN => crate::symbol::iter_result(vm, v, true),
-            _ => crate::symbol::iter_result(vm, Value::UNDEFINED, true),
+            RETURN => Ok((v, true)),
+            _ => Ok((Value::UNDEFINED, true)),
         };
     }
     set(vm, st, STATE, Value::from_i32(EXECUTING));
@@ -113,7 +119,7 @@ fn resume(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<Valu
                 set(vm, st, STATE, Value::from_i32(COMPLETED));
                 set(vm, st, REGS, Value::UNDEFINED);
             }
-            crate::symbol::iter_result(vm, out, !yielded)
+            Ok((out, !yielded))
         }
         Err(e) => {
             set(vm, st, STATE, Value::from_i32(COMPLETED));
@@ -153,6 +159,44 @@ unsafe fn run(vm: &mut Vm, f: *mut Object, saved: Value, pc: usize, v: Value) ->
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("a generator's run")));
         }
         Ok(out)
+    }
+}
+
+/// An async function's coroutine `g` started: its promise, the
+/// coroutine run until it awaits or ends (see [`async_step`]).
+pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Value> {
+    let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
+    let st = state_of(g).unwrap();
+    for (k, v) in [(5, p), (6, resolve), (7, reject)] {
+        set(vm, st, k, v);
+    }
+    async_step(vm, g, NEXT, Value::UNDEFINED)?;
+    Ok(p)
+}
+
+/// Run async coroutine `g` on (`mode`, `v`): its end resolves its
+/// promise, its exception rejects it, an `await` waits for the promise
+/// of the value awaited, whose reactions run this again.
+pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
+    let st = state_of(g).unwrap();
+    match resume_raw(vm, g, v, mode, "an async function") {
+        Ok((out, true)) => {
+            let resolve = get(vm, st, 6);
+            crate::interp::call_function(vm, resolve, Value::UNDEFINED, &[out]).map(|_| ())
+        }
+        Ok((awaited, false)) => {
+            let on_fulfilled = crate::promise::async_closure(vm, false, g);
+            let on_rejected = crate::promise::async_closure(vm, true, g);
+            crate::promise::await_then(vm, awaited, on_fulfilled, on_rejected)
+        }
+        Err(e) => {
+            let reason = match e.1 {
+                Some(v) => v,
+                None => crate::builtins::caught(vm, &e),
+            };
+            let reject = get(vm, st, 7);
+            crate::interp::call_function(vm, reject, Value::UNDEFINED, &[reason]).map(|_| ())
+        }
     }
 }
 

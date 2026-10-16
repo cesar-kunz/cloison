@@ -154,6 +154,9 @@ pub struct Function<'a> {
     pub ctor_var: Option<Name>,
     /// A generator function (`function*`, `*m() {}`).
     pub generator: bool,
+    /// An async function (`async function`, `async () => …`, `async m()
+    /// {}`): a coroutine as a generator's, driven by promises.
+    pub is_async: bool,
     /// Its code calls `eval(…)` directly: its variables live in a scope
     /// object the eval'd code sees (see `codegen::generate_from`).
     pub has_eval: bool,
@@ -268,6 +271,8 @@ pub enum ExprKind<'a> {
     /// A tagged template's first argument: the site's frozen array of
     /// cooked strings (`None`: an invalid escape), with its `raw` ones.
     TemplateObject(Vec<(Option<String>, String)>),
+    /// `await e`, in an async function.
+    Await(&'a Expr<'a>),
     /// `yield e` (`false`) or `yield* e` (`true`), in a generator.
     Yield(Option<&'a Expr<'a>>, bool),
     /// A class.

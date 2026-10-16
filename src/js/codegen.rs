@@ -88,7 +88,7 @@ fn generate_from<'p>(
     // in a scope object (`%env`, a register; see `Gen::function`).
     let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
     for i in 1..p.functions.len() {
-        if p.functions[i].has_eval || p.functions[i].generator {
+        if p.functions[i].has_eval || p.functions[i].generator || p.functions[i].is_async {
             // Its parameters and `var`s in its scope object, where direct
             // `eval`'s code finds them (block-scoped ones, and the parser's,
             // stay in registers). A generator's, all of them: its frame
@@ -101,7 +101,7 @@ fn generate_from<'p>(
             let rest: Vec<&str> = decls[i][params..].iter().copied().filter(|&n| n != ENV).collect();
             // (A function expression's own name, immutable, stays apart.)
             let own = f.name.as_deref().filter(|_| f.binds_name);
-            let generator = f.generator && !f.has_eval;
+            let generator = (f.generator || f.is_async) && !f.has_eval;
             let in_env = |n: &str| {
                 if generator {
                     return n != GEN && n != EVAL_SCOPE && Some(n) != own;
@@ -169,6 +169,7 @@ fn generate_from<'p>(
                     && f.class_kind == 0
                     && !f.uses_new_target
                     && !f.generator
+                    && !f.is_async
                     && !scopes.upvalues[i].contains(&ENV)
                     // (Block-scoped ones' new names can't be declared again.)
                     && !scopes.upvalues[i].iter().any(|n| n.contains('%'))
@@ -402,7 +403,9 @@ fn eval_scope(p: &Program, i: usize) -> Option<usize> {
 
 /// `vm::Code::kind` for `f`.
 fn function_kind(f: &Function) -> u8 {
-    if f.generator {
+    if f.is_async {
+        5
+    } else if f.generator {
         4
     } else if f.class_kind != 0 {
         f.class_kind
@@ -539,6 +542,7 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             expr_refs(v, out);
         }
         Yield(x, _) => x.iter().for_each(|x| expr_refs(x, out)),
+        Await(x) => expr_refs(x, out),
         Object(ps, _) => ps.iter().for_each(|(k, e)| {
             if let PropKey::Computed(k) = k {
                 expr_refs(k, out);
@@ -731,7 +735,7 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     if p.functions[f].has_eval && f != 0 {
         out.push(EVAL_SCOPE);
     }
-    if p.functions[f].generator {
+    if p.functions[f].generator || p.functions[f].is_async {
         out.push(GEN);
     }
     // The script's variables are globals, but for its block-scoped ones.
@@ -1054,6 +1058,7 @@ fn assigns(e: &Expr, name: &str) -> bool {
         SuperMember(_, k, t) => assigns(k, name) || assigns(t, name),
         Bound => false,
         Yield(x, _) => x.is_some_and(|x| assigns(x, name)),
+        Await(x) => assigns(x, name),
         Destructure(p, v, _) => {
             let mut ns = Vec::new();
             p.names(&mut ns);
@@ -1410,7 +1415,7 @@ impl<'a> Gen<'a> {
         // The scope object, with each of its variables (`undefined`, in
         // order: one shape).
         let has_eval = self.f.has_eval && self.index != 0;
-        if !self.overflow.is_empty() || has_eval || self.f.generator {
+        if !self.overflow.is_empty() || has_eval || self.f.generator || self.f.is_async {
             let env = self.locals[ENV];
             let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
             let ic = self.auto_ic(&format!("[]{}", cap));
@@ -1543,14 +1548,14 @@ impl<'a> Gen<'a> {
             }
         } else {
             for (k, s) in body.iter().enumerate() {
-                if self.f.generator && k == self.f.param_stmts {
+                if (self.f.generator || self.f.is_async) && k == self.f.param_stmts {
                     self.initial_yield()?;
                 }
                 // (Its parameters' defaults first: see `Gen::in_params`.)
                 self.in_params = k < self.f.param_stmts;
                 self.stmt(s)?;
             }
-            if self.f.generator && body.len() <= self.f.param_stmts {
+            if (self.f.generator || self.f.is_async) && body.len() <= self.f.param_stmts {
                 self.initial_yield()?;
             }
             self.in_params = false;
@@ -2839,6 +2844,12 @@ impl<'a> Gen<'a> {
             }
             Class(c) => self.class(c, e.pos)?,
             Yield(Some(x), true) => self.yield_star(x, e.pos)?,
+            // An `await`: a `yield` the promises the coroutine waits on
+            // resume (see `generator::async_step`).
+            Await(x) => {
+                self.value(x)?;
+                self.yield_acc(e.pos)?;
+            }
             Yield(x, _) => {
                 match x {
                     Some(x) => self.value(x)?,
@@ -3866,7 +3877,11 @@ impl<'a> Gen<'a> {
         let Var::Reg(g) = self.resolve(GEN, self.f.pos)? else {
             return unsupported(self.f.pos, "a generator with this many variables");
         };
-        self.emit(Op::InitialYield, &[Arg::Reg(g)]);
+        if self.f.is_async && self.f.generator {
+            return unsupported(self.f.pos, "async generators");
+        }
+        let op = if self.f.is_async { Op::AsyncStart } else { Op::InitialYield };
+        self.emit(op, &[Arg::Reg(g)]);
         // (Resumed by `next()`: a fresh accumulator.)
         self.acc = Acc::default();
         self.reachable = true;

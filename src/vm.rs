@@ -642,6 +642,8 @@ pub struct Vm {
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
     declared: crate::jit::HashSet<Atom>,
+    /// Loaded scripts' block-scoped names (see `Module::lexical`).
+    lexical_declared: crate::jit::HashSet<Atom>,
     /// `Function.prototype.bind`'s JS helper, once made.
     pub(crate) bind_helper: Value,
     /// Compiled regular expressions, by pattern and flags (a literal makes
@@ -792,6 +794,7 @@ impl Vm {
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
             declared: Default::default(),
+            lexical_declared: Default::default(),
             regexps: HashMap::default(),
             regexp_literals: HashMap::default(),
             caps_buf: Vec::new(),
@@ -2886,6 +2889,18 @@ impl Vm {
         u
     }
 
+    /// Close the open upvalue of register `at`, if there is one.
+    pub(crate) fn close_upvalue(&mut self, at: *mut Value) {
+        if let Some(k) = self.open_upvalues.iter().rposition(|&u| unsafe { (*u).at } == at) {
+            let u = self.open_upvalues.remove(k);
+            unsafe {
+                (*u).closed = *(*u).at;
+                (*u).at = &raw mut (*u).closed;
+                crate::heap::barrier(u.cast::<u8>().sub(8), &raw const (*u).closed, (*u).closed);
+            }
+        }
+    }
+
     /// Close the open upvalues of registers at or past `level` (a frame
     /// ending): their values move into them.
     pub(crate) fn close_upvalues(&mut self, level: *mut Value) {
@@ -3247,6 +3262,34 @@ impl Vm {
         p
     }
 
+    /// A script's global declarations: a block-scoped name may not be
+    /// another script's (any kind), nor a `var` an earlier script's
+    /// block-scoped one (a SyntaxError, before it runs).
+    pub(crate) fn declare_script(&mut self, module: &Module) -> Result<()> {
+        for n in &module.lexical {
+            let a = self.intern(n);
+            if self.declared.contains(&a) || self.lexical_declared.contains(&a) {
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+            }
+            if let Some(d) = self.own_property(self.global, Key::Name(a))
+                && d.configurable == Some(false)
+            {
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+            }
+        }
+        for n in &module.declared {
+            let a = self.intern(n);
+            if self.lexical_declared.contains(&a) {
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+            }
+        }
+        for n in &module.lexical {
+            let a = self.intern(n);
+            self.lexical_declared.insert(a);
+        }
+        Ok(())
+    }
+
     /// Load `module`'s functions; returns its top-level code.
     pub fn load(&mut self, module: Module) -> *const Code {
         for n in &module.declared {
@@ -3400,6 +3443,7 @@ impl Vm {
     /// Load and run `module`; returns its completion value.
     pub fn run(&mut self, module: &Module) -> Result<Value> {
         crate::interp::CURRENT_VM.with(|v| v.set(self));
+        self.declare_script(module)?;
         let code = self.load(module.clone());
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
@@ -3608,7 +3652,12 @@ impl Scan {
             // (And what the JIT doesn't compile, newer syntax's.)
             s.callee |= matches!(
                 op,
-                crate::bytecode::Op::LdaCallee | crate::bytecode::Op::Intrinsic | crate::bytecode::Op::CreateRest
+                crate::bytecode::Op::LdaCallee
+                    | crate::bytecode::Op::Intrinsic
+                    | crate::bytecode::Op::CreateRest
+                    | crate::bytecode::Op::LdaHole
+                    | crate::bytecode::Op::CheckHole
+                    | crate::bytecode::Op::CloseUpvalue
             );
             s.ops += 1;
         }

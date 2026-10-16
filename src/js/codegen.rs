@@ -130,6 +130,8 @@ fn generate_from<'p>(
                     && !f.arrow
                     && !f.uses_this
                     && !scopes.upvalues[i].contains(&ENV)
+                    // (Block-scoped ones' new names can't be declared again.)
+                    && !scopes.upvalues[i].iter().any(|n| n.contains('%'))
                     && scopes.upvalues[i].len() <= LAZY_UPVALUES
                     && f.params.len() < LOCAL_REGS
                 {
@@ -190,11 +192,28 @@ fn generate_from<'p>(
         }
     }
     let declared = if root == 0 {
-        explicit_declarations(p, 0).iter().map(|s| s.to_string()).collect()
+        explicit_declarations(p, 0)
+            .iter()
+            .filter(|n| !p.lexicals.contains_key(**n))
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let lexical = if root == 0 {
+        p.functions[0]
+            .body
+            .iter()
+            .flat_map(|s| match &s.kind {
+                StmtKind::Lexical(_, ds) => ds.iter().map(|(n, _)| original(n).to_string()).collect(),
+                _ => Vec::new(),
+            })
+            .collect()
     } else {
         Vec::new()
     };
     let module = Module {
+        lexical,
         functions,
         script: 0,
         declared,
@@ -299,13 +318,22 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
     scopes.upvalues[i]
         .iter()
         .map(|n| match decls[parent].position(n) {
-            Some(k) if parent != 0 => (true, k as u8 + 1),
+            Some(k) if parent != 0 || p.lexicals.contains_key(*n) => (true, k as u8 + 1),
             _ => {
                 let k = scopes.upvalues[parent].iter().position(|d| d == n);
                 (false, k.expect("passed down by the parent") as u8)
             }
         })
         .collect()
+}
+
+/// A variable's name as written (a block-scoped one is renamed `x%3`:
+/// see `ast::Program::lexicals`).
+fn original(name: &str) -> &str {
+    match name.find('%') {
+        Some(k) if k > 0 => &name[..k],
+        _ => name,
+    }
 }
 
 /// `vm::Code::kind` for `f`.
@@ -352,9 +380,10 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
                 continue;
             }
             let (mut chain, mut j) = (vec![i], p.functions[i].parent);
+            let lexical = p.lexicals.contains_key(name);
             let owner = loop {
                 match j {
-                    Some(k) if k != 0 => {
+                    Some(k) if k != 0 || lexical => {
                         if decls[k].contains(&name) {
                             break Some(k);
                         }
@@ -445,7 +474,9 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
         let expr_refs = |e: &'a Expr, out: &mut Vec<&'a str>| expr_names(e, out, fw);
         let stmt = |s: &'a Stmt, out: &mut Vec<&'a str>| stmt(s, out, fw);
         match &s.kind {
-            StmtKind::Var(ds) => ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out)),
+            StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => {
+                ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out))
+            }
             StmtKind::Function(_)
             | StmtKind::Empty
             | StmtKind::Break(_)
@@ -464,7 +495,7 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
                 body,
             } => {
                 match init {
-                    Some(ForInit::Var(ds)) => {
+                    Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => {
                         ds.iter().flat_map(|(_, e)| e).for_each(|e| expr_refs(e, out))
                     }
                     Some(ForInit::Expr(e)) => expr_refs(e, out),
@@ -507,6 +538,11 @@ fn names<'a>(f: &'a Function<'_>, forwarded: bool) -> Vec<&'a str> {
 /// declarations, in order of declaration.
 fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     let mut out = explicit_declarations(p, f);
+    // The script's variables are globals, but for its block-scoped ones.
+    if f == 0 {
+        out.retain(|n| p.lexicals.contains_key(*n));
+        return out;
+    }
     // `arguments`: a variable `CreateArguments` sets.
     if arguments_object(p, f) && !out.contains(&"arguments") {
         out.push("arguments");
@@ -535,14 +571,22 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
         };
         match &s.kind {
             StmtKind::Var(ds)
+            | StmtKind::Lexical(_, ds)
             | StmtKind::For {
-                init: Some(ForInit::Var(ds)),
+                init: Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)),
                 ..
             } => ds.iter().for_each(|(n, _)| add(n, out)),
-            StmtKind::Function(i) => add(p.functions[*i].name.as_deref().unwrap(), out),
-            StmtKind::ForIn {
-                var: true, name, ..
-            } => add(name, out),
+            StmtKind::Function(i) => {
+                let f = &p.functions[*i];
+                if let Some(b) = &f.binding {
+                    add(b, out);
+                }
+                if f.binding.is_none() || f.annex_b {
+                    add(f.name.as_deref().unwrap(), out)
+                }
+            }
+            StmtKind::ForIn { var, fresh, name, .. } if *var || *fresh => add(name, out),
+            StmtKind::Try(_, Some((name, _)), _) if p.lexicals.contains_key(name) => add(name, out),
             _ => {}
         }
         match &s.kind {
@@ -889,6 +933,11 @@ struct Gen<'a> {
     /// How many statements enclose the one being compiled: 1 for the
     /// function body's own.
     depth: u32,
+    /// A `for (let …)` loop's captured variables, for [`Gen::looping`] to
+    /// give each iteration its own.
+    fresh: Vec<&'a str>,
+    /// Compiling the function's entry (see [`Gen::fresh_binding`]).
+    entering: bool,
 }
 
 /// A `try` being compiled: the bytecode ranges it covers (closed around
@@ -914,7 +963,7 @@ impl<'a> Gen<'a> {
         let f = &p.functions[index];
         // The script's names are globals.
         let locals: HashMap<&str, u8> = if index == 0 {
-            HashMap::default()
+            decls[0].iter().enumerate().map(|(i, &n)| (n, i as u8 + 1)).collect()
         } else {
             decls[index][..decls[index].len() - overflow.len()]
                 .iter()
@@ -952,6 +1001,8 @@ impl<'a> Gen<'a> {
             completion: None,
             cleared: false,
             depth: 0,
+            fresh: Vec::new(),
+            entering: false,
             trys: Vec::new(),
         }
     }
@@ -995,6 +1046,10 @@ impl<'a> Gen<'a> {
             self.emit(Op::LdaCallee, &[]);
             self.star(self.locals[n]);
         }
+        // (A new frame's: no upvalues of its registers to close yet.)
+        self.entering = true;
+        self.enter_scope(&self.f.body, self.f.pos)?;
+        self.entering = false;
         let mut fns = Vec::new();
         self.f.body.iter().for_each(|s| hoisted(s, &mut fns));
         for i in fns {
@@ -1127,7 +1182,12 @@ impl<'a> Gen<'a> {
                 }
                 // (A function declaration's global exists from the start:
                 // hoisted, or Annex B's in a block, `undefined` until then.)
-                StmtKind::Function(i) => bare.push(p.functions[*i].name.as_deref().unwrap()),
+                StmtKind::Function(i) => {
+                    let f = &p.functions[*i];
+                    if f.binding.is_none() || f.annex_b {
+                        bare.push(f.name.as_deref().unwrap())
+                    }
+                }
                 StmtKind::If(_, a, b) => {
                     walk(a, init, bare, p);
                     if let Some(b) = b {
@@ -1335,6 +1395,66 @@ impl<'a> Gen<'a> {
         i as u16
     }
 
+    /// Whether `name` is looked up in `with` objects first: some enclose
+    /// the code, and not its block-scoped binding's declaration.
+    fn in_with(&self, name: &str) -> bool {
+        let skip = self.p.lexicals.get(name).map_or(0, |l| l.withs);
+        self.withs.len() > skip
+    }
+
+    /// Entering a scope of statements `stmts`: its block-scoped variables
+    /// not initialized (each entry a new binding: the upvalues closures
+    /// made of their registers closed first), its functions made.
+    fn enter_scope(&mut self, stmts: &'a [Stmt<'a>], pos: Pos) -> R<()> {
+        for s in stmts {
+            if let StmtKind::Lexical(_, ds) = &s.kind {
+                for (n, _) in ds {
+                    self.fresh_binding(n, true, pos)?;
+                }
+            }
+        }
+        for s in stmts {
+            if let StmtKind::Function(i) = &s.kind
+                && let Some(b) = &self.p.functions[*i].binding
+            {
+                self.fresh_binding(b, false, pos)?;
+                self.closure(*i);
+                self.init_var(b, pos)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A new binding for block-scoped `n`: its register's upvalue closed,
+    /// and (`hole`) the register not initialized.
+    fn fresh_binding(&mut self, n: &str, hole: bool, pos: Pos) -> R<()> {
+        match self.resolve(n, pos)? {
+            Var::Reg(r) => {
+                if !self.entering && self.scopes.captured[self.index].contains(&n) {
+                    self.emit(Op::CloseUpvalue, &[Arg::Reg(r)]);
+                }
+                if hole {
+                    self.emit(Op::LdaHole, &[]);
+                    self.star(r);
+                }
+            }
+            Var::Scope(_) if hole => {
+                self.emit(Op::LdaUndefined, &[]);
+                self.init_var(n, pos)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Initialize variable `n` with the accumulator (no `with` object's).
+    fn init_var(&mut self, n: &str, pos: Pos) -> R<()> {
+        let withs = std::mem::take(&mut self.withs);
+        let r = self.store_raw(n, pos);
+        self.withs = withs;
+        r
+    }
+
     /// `acc` = intrinsic `name` of registers `first..first + n` (see
     /// `crate::intrinsics`).
     fn intrinsic(&mut self, name: &str, first: u8, n: u8) {
@@ -1444,6 +1564,7 @@ impl<'a> Gen<'a> {
         match catch {
             Some((name, body)) => self.try_catch(block, name, body, pos)?,
             None => {
+                self.enter_scope(block, pos)?;
                 for s in block {
                     self.stmt(s)?;
                 }
@@ -1452,6 +1573,7 @@ impl<'a> Gen<'a> {
         self.in_try -= 1;
         let ranges = self.close_try();
         if self.reachable {
+            self.enter_scope(f, pos)?;
             for s in f {
                 self.stmt(s)?;
             }
@@ -1469,6 +1591,7 @@ impl<'a> Gen<'a> {
         let mark = self.temp;
         let r = self.alloc(pos)?;
         self.star(r);
+        self.enter_scope(f, pos)?;
         for s in f {
             self.stmt(s)?;
         }
@@ -1486,6 +1609,7 @@ impl<'a> Gen<'a> {
     fn try_catch(&mut self, block: &'a [Stmt], name: &'a str, body: &'a [Stmt], pos: Pos) -> R<()> {
         self.open_try(None);
         self.in_try += 1;
+        self.enter_scope(block, pos)?;
         for s in block {
             self.stmt(s)?;
         }
@@ -1501,9 +1625,26 @@ impl<'a> Gen<'a> {
         self.bind(handler);
         let at = self.asm.offset() as u32;
         self.handlers.extend(ranges.iter().map(|&(s, e)| (s, e, at)));
+        if self.p.lexicals.contains_key(name) {
+            // (A block-scoped binding of its own.)
+            let mark = self.temp;
+            let t = self.alloc(pos)?;
+            self.star(t);
+            self.fresh_binding(name, false, pos)?;
+            self.ldar(t);
+            self.init_var(name, pos)?;
+            self.temp = mark;
+            self.enter_scope(body, pos)?;
+            for s in body {
+                self.stmt(s)?;
+            }
+            self.bind(after);
+            return Ok(());
+        }
         let r = self.alloc(pos)?;
         self.star(r);
         let outer = self.locals.insert(name, r);
+        self.enter_scope(body, pos)?;
         for s in body {
             self.stmt(s)?;
         }
@@ -1636,7 +1777,7 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::This => Some(0),
             // (In a `with`, a name may be the object's.)
-            ExprKind::Ident(n) if self.withs.is_empty() => self.locals.get(&**n).copied(),
+            ExprKind::Ident(n) if !self.in_with(n) && !self.needs_check(n, e.pos) => self.locals.get(&**n).copied(),
             _ => None,
         }
     }
@@ -1656,12 +1797,13 @@ impl<'a> Gen<'a> {
     ) -> R<L> {
         let end = self.label();
         let withs = std::mem::take(&mut self.withs);
+        let skip = self.p.lexicals.get(name).map_or(0, |l| l.withs);
         let mark = self.temp;
         let k = self.alloc(pos)?;
-        self.string(name);
+        self.string(original(name));
         self.star(k);
         let r = self.alloc(pos)?;
-        for (i, w) in withs.iter().enumerate().rev() {
+        for (i, w) in withs.iter().enumerate().rev().filter(|&(i, _)| i >= skip) {
             let next = self.label();
             self.value_inner(&Expr {
                 kind: ExprKind::Ident(w.clone()),
@@ -1690,7 +1832,7 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.named(Op::GetNamed, r, name);
+                g.named(Op::GetNamed, r, original(name));
                 Ok(())
             },
             &mut |g| {
@@ -1719,7 +1861,7 @@ impl<'a> Gen<'a> {
             pos,
             &mut |g, r| {
                 g.ldar(v);
-                g.named(Op::SetNamed, r, name);
+                g.named(Op::SetNamed, r, original(name));
                 Ok(())
             },
             &mut |g| {
@@ -1740,9 +1882,9 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.named(Op::GetNamed, r, name);
+                g.named(Op::GetNamed, r, original(name));
                 g.apply(op, v, pos)?;
-                g.named(Op::SetNamed, r, name);
+                g.named(Op::SetNamed, r, original(name));
                 Ok(())
             },
             &mut |g| {
@@ -1764,7 +1906,7 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.string(name);
+                g.string(original(name));
                 g.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
                 Ok(())
             },
@@ -1794,7 +1936,7 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.named(Op::GetNamed, r, name);
+                g.named(Op::GetNamed, r, original(name));
                 g.star(c);
                 g.mov(r, w);
                 g.emit(Op::LdaTrue, &[]);
@@ -1832,9 +1974,41 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// Store the accumulator in variable `name`.
+    /// Store the accumulator in variable `name`: a `const` throws, a
+    /// block-scoped one not initialized yet too.
     fn store_var(&mut self, name: &str, pos: Pos) -> R<()> {
-        if !self.withs.is_empty() {
+        if self.in_with(name) {
+            return self.with_store(name, pos);
+        }
+        if let Some(l) = self.p.lexicals.get(name) {
+            if l.constant {
+                if self.needs_check(name, pos) {
+                    self.load_var(name, pos)?;
+                }
+                let mark = self.temp;
+                let r = self.alloc(pos)?;
+                self.string(&l.original.clone());
+                self.star(r);
+                self.intrinsic("throw_const", r, 1);
+                self.temp = mark;
+                return Ok(());
+            }
+            if self.needs_check(name, pos) {
+                let mark = self.temp;
+                let v = self.alloc(pos)?;
+                self.star(v);
+                self.load_var(name, pos)?;
+                self.ldar(v);
+                self.temp = mark;
+            }
+        }
+        self.store_raw(name, pos)
+    }
+
+    /// Initialize (or store, unchecked) variable `name` with the
+    /// accumulator.
+    fn store_raw(&mut self, name: &str, pos: Pos) -> R<()> {
+        if self.in_with(name) {
             return self.with_store(name, pos);
         }
         match self.resolve(name, pos)? {
@@ -1871,7 +2045,8 @@ impl<'a> Gen<'a> {
             ExprKind::Ident(n) => {
                 // (A captured one may change in any call, through a closure.)
                 if let Some(&r) = self.locals.get(&**n)
-                    && self.withs.is_empty()
+                    && !self.in_with(n)
+                    && !self.needs_check(n, e.pos)
                     && !later.iter().any(|l| assigns(l, n))
                     && !self.scopes.captured[self.index].contains(&&**n)
                 {
@@ -1928,8 +2103,64 @@ impl<'a> Gen<'a> {
             Bool(false) => self.emit(Op::LdaFalse, &[]),
             Null => self.emit(Op::LdaNull, &[]),
             This => self.ldar(0),
-            Ident(n) if !self.withs.is_empty() => self.with_load(n, e.pos, false)?,
-            Ident(n) => match self.resolve(n, e.pos)? {
+            Ident(n) if self.in_with(n) => self.with_load(n, e.pos, false)?,
+            Ident(n) => self.load_var(n, e.pos)?,
+            Hole | Spread(_) => unreachable!("the parser makes them array elements and arguments only"),
+            Template(strings, subs) => {
+                let mark = self.temp;
+                let first = self.temp as u8;
+                for (i, s) in strings.iter().enumerate() {
+                    let r = self.alloc(e.pos)?;
+                    self.string(s);
+                    self.star(r);
+                    if let Some(x) = subs.get(i) {
+                        let r = self.alloc(e.pos)?;
+                        self.into(x, r)?;
+                    }
+                }
+                let n = (self.temp - mark) as u8;
+                self.intrinsic("template", first, n);
+                self.temp = mark;
+            }
+            _ => self.value_rest(e)?,
+        }
+        Ok(())
+    }
+
+    /// Variable `name` into the accumulator (checked if block-scoped and
+    /// maybe not initialized: see [`Gen::needs_check`]).
+    fn load_var(&mut self, n: &str, pos: Pos) -> R<()> {
+        self.load_raw(n, pos)?;
+        if self.needs_check(n, pos) {
+            let k = self.const_str(&self.p.lexicals[n].original.clone());
+            self.emit(Op::CheckHole, &[Arg::Index(k)]);
+        }
+        Ok(())
+    }
+
+    /// Whether a reference to `name` at `pos` may find it not initialized:
+    /// a block-scoped variable referred to before its declaration's end, or
+    /// from a function that may run before it (a declaration, or one made
+    /// before it), or in a `switch` (which may jump past it).
+    fn needs_check(&self, name: &str, pos: Pos) -> bool {
+        let Some(l) = self.p.lexicals.get(name) else {
+            return false;
+        };
+        if l.hoisted {
+            return false;
+        }
+        if l.switch {
+            return true;
+        }
+        if self.index == l.func {
+            return pos < l.end;
+        }
+        self.f.declaration || self.f.pos < l.end
+    }
+
+    fn load_raw(&mut self, n: &str, pos: Pos) -> R<()> {
+        let e = &Expr { kind: ExprKind::Null, pos };
+        match self.resolve(n, e.pos)? {
                 Var::Reg(r) => self.ldar(r),
                 Var::Upvalue(k) => {
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
@@ -1945,7 +2176,13 @@ impl<'a> Gen<'a> {
                 }
                 Var::Undefined => self.emit(Op::LdaUndefined, &[]),
                 Var::Global => self.global(Op::LdaGlobal, n),
-            },
+            }
+        Ok(())
+    }
+
+    fn value_rest(&mut self, e: &Expr) -> R<()> {
+        use ExprKind::*;
+        match &e.kind {
             // An array with room for its elements, each appended. (Stored
             // by index, Splay's `[0, 1, …, 9]` went through the runtime at
             // the first and grew twice: 17% of its time.)
@@ -1973,23 +2210,6 @@ impl<'a> Gen<'a> {
                     }
                     self.ldar(a);
                 }
-            }
-            Hole | Spread(_) => unreachable!("the parser makes them array elements and arguments only"),
-            Template(strings, subs) => {
-                let mark = self.temp;
-                let first = self.temp as u8;
-                for (i, s) in strings.iter().enumerate() {
-                    let r = self.alloc(e.pos)?;
-                    self.string(s);
-                    self.star(r);
-                    if let Some(x) = subs.get(i) {
-                        let r = self.alloc(e.pos)?;
-                        self.into(x, r)?;
-                    }
-                }
-                let n = (self.temp - mark) as u8;
-                self.intrinsic("template", first, n);
-                self.temp = mark;
             }
             TemplateObject(parts) => {
                 static SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -2145,7 +2365,7 @@ impl<'a> Gen<'a> {
                     self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
                     self.temp = mark;
                 }
-                Ident(n) if !self.withs.is_empty() => self.with_delete(n, x.pos)?,
+                Ident(n) if self.in_with(n) => self.with_delete(n, x.pos)?,
                 Ident(n) => match self.resolve(n, x.pos)? {
                     Var::Global => {
                         self.string(n);
@@ -2161,7 +2381,7 @@ impl<'a> Gen<'a> {
             Unary(UnOp::Typeof, x) => {
                 // An undeclared global is "undefined", not a ReferenceError.
                 match &x.kind {
-                    Ident(n) if !self.withs.is_empty() => self.with_load(n, x.pos, true)?,
+                    Ident(n) if self.in_with(n) => self.with_load(n, x.pos, true)?,
                     Ident(n) if matches!(self.resolve(n, x.pos)?, Var::Global) => {
                         self.global(Op::LdaGlobalInsideTypeof, n)
                     }
@@ -2208,6 +2428,7 @@ impl<'a> Gen<'a> {
                 self.effect(a)?;
                 self.value(b)?;
             }
+            _ => unreachable!("value_inner's"),
         }
         Ok(())
     }
@@ -2354,7 +2575,7 @@ impl<'a> Gen<'a> {
 
     fn assign(&mut self, op: Option<BinOp>, t: &Expr, v: &Expr, pos: Pos) -> R<()> {
         match &t.kind {
-            ExprKind::Ident(n) if op.is_some() && !self.withs.is_empty() => {
+            ExprKind::Ident(n) if op.is_some() && self.in_with(n) => {
                 self.with_compound(n, op.unwrap(), v, pos)
             }
             ExprKind::Ident(n) => {
@@ -2363,6 +2584,7 @@ impl<'a> Gen<'a> {
                     // `x op= v` with `x` in a register: `v`, then `Op r_x`.
                     (Some(op), Var::Reg(r))
                         if smi(v).and_then(|k| Self::smi_form(op, k)).is_none()
+                            && !self.needs_check(n, t.pos)
                             && Self::reg_form(op).is_some()
                             && !assigns(v, n) =>
                     {
@@ -2430,16 +2652,16 @@ impl<'a> Gen<'a> {
             }
         };
         match &t.kind {
-            ExprKind::Ident(n) if !self.withs.is_empty() => {
+            ExprKind::Ident(n) if self.in_with(n) => {
                 // (The reference is resolved once: `name` in the object
                 // that has it, read and written there.)
                 let end = self.with_lookup(
                     n,
                     pos,
                     &mut |g, r| {
-                        g.named(Op::GetNamed, r, n);
+                        g.named(Op::GetNamed, r, original(n));
                         step(g);
-                        g.named(Op::SetNamed, r, n);
+                        g.named(Op::SetNamed, r, original(n));
                         Ok(())
                     },
                     &mut |g| {
@@ -2493,7 +2715,7 @@ impl<'a> Gen<'a> {
         }
         if let ExprKind::Ident(n) = &f.kind
             && !new
-            && !self.withs.is_empty()
+            && self.in_with(n)
         {
             return self.with_call(n, args, pos);
         }
@@ -2749,8 +2971,18 @@ impl<'a> Gen<'a> {
         let labels = std::mem::take(&mut self.pending_labels);
         match &s.kind {
             StmtKind::Var(ds) => self.var_decls(ds)?,
-            // A function declaration in a block (Annex B): its `var`
-            // binding, `undefined` so far, gets the function here.
+            StmtKind::Lexical(_, ds) => self.lexical_decls(ds)?,
+            // A function declaration in a block: its binding there was
+            // made where the block starts; in sloppy mode its `var` (Annex
+            // B), `undefined` so far, gets it here.
+            StmtKind::Function(i) if self.p.functions[*i].binding.is_some() => {
+                let f = &self.p.functions[*i];
+                if f.annex_b {
+                    let b = f.binding.as_deref().unwrap();
+                    self.load_raw(b, s.pos)?;
+                    self.init_var(f.name.as_deref().unwrap(), s.pos)?;
+                }
+            }
             StmtKind::Function(i) if self.depth > 1 => {
                 self.closure(*i);
                 let name = self.p.functions[*i].name.as_deref().unwrap();
@@ -2813,8 +3045,18 @@ impl<'a> Gen<'a> {
                 update,
                 body,
             } => {
+                let mut fresh = Vec::new();
                 match init {
                     Some(ForInit::Var(ds)) => self.var_decls(ds)?,
+                    Some(ForInit::Lexical(_, ds)) => {
+                        for (n, _) in ds {
+                            self.fresh_binding(n, true, s.pos)?;
+                            if self.scopes.captured[self.index].contains(&&**n) {
+                                fresh.push(&**n);
+                            }
+                        }
+                        self.lexical_decls(ds)?;
+                    }
                     Some(ForInit::Expr(e)) => self.effect(e)?,
                     None => {}
                 }
@@ -2822,6 +3064,7 @@ impl<'a> Gen<'a> {
                     None => true,
                     Some(c) => first_test_passes(init.as_ref(), c),
                 };
+                self.fresh = fresh;
                 self.looping(labels, test.as_ref(), update.as_ref(), body, !first_passes)?;
             }
             StmtKind::While(c, body) => {
@@ -2840,8 +3083,8 @@ impl<'a> Gen<'a> {
                 res?;
             }
             StmtKind::ForIn {
-                name, object, body, ..
-            } => self.for_in(labels, name, object, body, s.pos)?,
+                name, object, body, fresh, ..
+            } => self.for_in(labels, name, *fresh, object, body, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
             StmtKind::Try(block, catch, finally) => self.try_stmt(block, catch, finally, s.pos)?,
             StmtKind::Throw(e) => {
@@ -2899,6 +3142,7 @@ impl<'a> Gen<'a> {
                 }
             }
             StmtKind::Block(b) => {
+                self.enter_scope(b, s.pos)?;
                 for s in b {
                     self.stmt(s)?;
                 }
@@ -2959,6 +3203,9 @@ impl<'a> Gen<'a> {
                 t
             }
         };
+        for (_, body) in cases {
+            self.enter_scope(body, d.pos)?;
+        }
         let bodies: Vec<L> = cases.iter().map(|_| self.label()).collect();
         let end = self.label();
         for ((test, _), &l) in cases.iter().zip(&bodies) {
@@ -3004,6 +3251,7 @@ impl<'a> Gen<'a> {
         &mut self,
         labels: Vec<Name>,
         name: &str,
+        fresh: bool,
         object: &Expr,
         body: &'a Stmt,
         pos: Pos,
@@ -3021,7 +3269,16 @@ impl<'a> Gen<'a> {
         self.ldar(i);
         let ic = self.auto_ic("[]keyed");
         self.emit(Op::GetKeyed, &[Arg::Reg(keys), ic]);
-        self.store_var(name, pos)?;
+        if fresh {
+            let t = self.alloc(pos)?;
+            self.star(t);
+            self.fresh_binding(name, false, pos)?;
+            self.ldar(t);
+            self.init_var(name, pos)?;
+            self.temp -= 1;
+        } else {
+            self.store_var(name, pos)?;
+        }
         self.targets.push(Target {
             labels,
             brk,
@@ -3038,6 +3295,19 @@ impl<'a> Gen<'a> {
         self.named(Op::GetNamed, keys, "length");
         self.compare_jump(Op::JumpIfGreater, Arg::Reg(i), top);
         self.bind(brk);
+        Ok(())
+    }
+
+    /// `let`/`const` declarations: each initialized (`undefined` if not
+    /// given a value).
+    fn lexical_decls(&mut self, ds: &[(Name, Option<Expr>)]) -> R<()> {
+        for (name, init) in ds {
+            match init {
+                Some(e) => self.value(e)?,
+                None => self.emit(Op::LdaUndefined, &[]),
+            }
+            self.init_var(name, init.as_ref().map_or(0, |e| e.pos))?;
+        }
         Ok(())
     }
 
@@ -3061,6 +3331,7 @@ impl<'a> Gen<'a> {
         body: &'a Stmt,
         jump_to_test: bool,
     ) -> R<()> {
+        let fresh = std::mem::take(&mut self.fresh);
         let (top, cont, test_l, brk) =
             (self.loop_label(), self.label(), self.label(), self.label());
         if jump_to_test {
@@ -3076,6 +3347,10 @@ impl<'a> Gen<'a> {
         self.stmt(body)?;
         self.targets.pop();
         self.bind(cont);
+        // `for (let i …)`: closures of this iteration keep its `i`.
+        for n in fresh {
+            self.fresh_binding(n, false, body.pos)?;
+        }
         if let Some(u) = update {
             self.effect(u)?;
         }
@@ -3102,7 +3377,7 @@ fn first_test_passes(init: Option<&ForInit>, test: &Expr) -> bool {
     };
     let start = match init {
         // The last initializer must be `x`'s, so no other can change it.
-        Some(ForInit::Var(ds)) => match ds.last() {
+        Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => match ds.last() {
             Some((n, Some(e))) if n == x => smi(e),
             _ => None,
         },

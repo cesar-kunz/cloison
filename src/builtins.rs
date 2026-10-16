@@ -224,7 +224,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.define_natives(
         host,
         &[
-            ("evalScript", eval_fn as NativeFn, 1),
+            ("evalScript", eval_script as NativeFn, 1),
             ("gc", host_gc, 0),
             ("detachArrayBuffer", host_detach_array_buffer, 1),
         ],
@@ -811,6 +811,16 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         String::from_utf16_lossy(u)
     };
     run_source(vm, &src)
+}
+
+/// `$262.evalScript(src)`: `src` run as a script of its own.
+fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let x = arg(a, 0);
+    let src = String::from_utf16_lossy(string_units(x).unwrap_or(&[]));
+    let module = crate::js::compile_script_lazy(&src).map_err(|e| Error(format!("SyntaxError: {e}"), None))?;
+    vm.declare_script(&module)?;
+    let code = vm.load(module);
+    crate::interp::run_script_at(vm, code)
 }
 
 /// `$262.gc()`: nothing (collections happen on their own).

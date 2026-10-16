@@ -49,6 +49,9 @@ impl Value {
     pub const FALSE: Value = Value(Self::OTHER_TAG | Self::BOOL_TAG);
     pub const TRUE: Value = Value(Self::OTHER_TAG | Self::BOOL_TAG | 1);
     pub const UNDEFINED: Value = Value(Self::OTHER_TAG | Self::UNDEFINED_TAG);
+    /// A block-scoped binding not initialized yet (its temporal dead zone:
+    /// `CheckHole` throws on it). Never seen by JS code.
+    pub const HOLE: Value = Value(Self::OTHER_TAG | 0x10);
 
     /// The canonical NaN, as JSC's `PNaN`.
     const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;

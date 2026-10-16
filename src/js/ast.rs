@@ -128,6 +128,9 @@ pub struct Function<'a> {
     /// Its `length`: the parameters before the first with a default or
     /// the rest parameter.
     pub length: usize,
+    /// The statements at the start of its body that are its parameters'
+    /// defaults and destructurings.
+    pub param_stmts: usize,
     /// Its last parameter is a rest parameter (`...r`), which collects the
     /// arguments from its position on.
     pub rest: bool,

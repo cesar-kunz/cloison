@@ -236,7 +236,7 @@ fn generate_from<'p>(
             }
         }
     }
-    let declared = if root == 0 {
+    let declared = if root == 0 && !p.eval_locals {
         explicit_declarations(p, 0)
             .iter()
             .filter(|n| !p.lexicals.contains_key(**n))
@@ -257,11 +257,24 @@ fn generate_from<'p>(
     } else {
         Vec::new()
     };
+    let function_names = if root == 0 && !p.eval_locals {
+        p.functions[0]
+            .body
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StmtKind::Function(i) => p.functions[*i].name.as_deref().map(|n| original(n).to_string()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let module = Module {
         lexical,
         functions,
         script: 0,
         declared,
+        function_names,
     };
     Ok((module, std::mem::take(&mut scopes.upvalues[root])))
 }
@@ -363,7 +376,7 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
     scopes.upvalues[i]
         .iter()
         .map(|n| match decls[parent].position(n) {
-            Some(k) if parent != 0 || p.lexicals.contains_key(*n) => (true, k as u8 + 1),
+            Some(k) if parent != 0 || p.lexicals.contains_key(*n) || p.eval_locals => (true, k as u8 + 1),
             _ => {
                 let k = scopes.upvalues[parent].iter().position(|d| d == n);
                 (false, k.expect("passed down by the parent") as u8)
@@ -464,7 +477,9 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
                 continue;
             }
             let (mut chain, mut j) = (vec![i], p.functions[i].parent);
-            let lexical = p.lexicals.contains_key(name);
+            // (The script's own variables: its block-scoped ones, or all
+            // of strict `eval` code's.)
+            let lexical = p.lexicals.contains_key(name) || p.eval_locals;
             let owner = loop {
                 match j {
                     Some(k) if k != 0 || lexical => {
@@ -739,8 +754,9 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     if p.functions[f].generator || p.functions[f].is_async {
         out.push(GEN);
     }
-    // The script's variables are globals, but for its block-scoped ones.
-    if f == 0 {
+    // The script's variables are globals, but for its block-scoped ones
+    // (and strict `eval` code's).
+    if f == 0 && !p.eval_locals {
         out.retain(|n| p.lexicals.contains_key(*n));
         return out;
     }

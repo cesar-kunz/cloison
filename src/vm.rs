@@ -3480,6 +3480,7 @@ impl Vm {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
             }
         }
+        self.global_declarations(module, false)?;
         for n in &module.lexical {
             let a = self.intern(n);
             self.lexical_declared.insert(a);
@@ -3487,6 +3488,44 @@ impl Vm {
         for n in &module.declared {
             let a = self.intern(n);
             self.script_declared.insert(a);
+        }
+        Ok(())
+    }
+
+    /// GlobalDeclarationInstantiation's (or an eval's, `eval`) checks for
+    /// a script's `var`s and functions, a `TypeError` where the global
+    /// object can't take one; and a function's global made a writable,
+    /// enumerable data property (configurable only by an eval) if it was a
+    /// configurable property already. (Others are made when assigned:
+    /// see `Module::declared`.)
+    pub(crate) fn global_declarations(&mut self, module: &Module, eval: bool) -> Result<()> {
+        let g = self.global;
+        let extensible = Self::is_extensible(g);
+        for n in &module.declared {
+            let a = self.intern(n);
+            let function = module.function_names.contains(n);
+            let ok = match self.own_property(g, Key::Name(a)) {
+                None => extensible,
+                Some(_) if !function => true,
+                Some(d) => {
+                    d.configurable == Some(true)
+                        || d.is_data() && d.writable == Some(true) && d.enumerable == Some(true)
+                }
+            };
+            if !ok {
+                let what = if function { "function" } else { "variable" };
+                return Err(Error::type_error(format!("Cannot declare global {what} '{n}'")));
+            }
+        }
+        for n in &module.function_names {
+            let a = self.intern(n);
+            if let Some(d) = self.own_property(g, Key::Name(a))
+                && d.configurable == Some(true)
+            {
+                let v = d.value.unwrap_or(Value::UNDEFINED);
+                let d = crate::props::Desc::data(v, true, true, eval);
+                self.define_own_property(g, Key::Name(a), &d)?;
+            }
         }
         Ok(())
     }

@@ -836,7 +836,16 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     } else {
         String::from_utf16_lossy(u)
     };
-    run_source(vm, &src)
+    let module = crate::js::compile_indirect_eval(&src).map_err(|e| {
+        if e.contains("unsupported") {
+            Error(format!("unsupported: in eval'd code: {e}"), None)
+        } else {
+            Error(format!("SyntaxError: {e}"), None)
+        }
+    })?;
+    vm.global_declarations(&module, true)?;
+    let code = vm.load(module);
+    crate::interp::run_script_at(vm, code)
 }
 
 /// `$262.evalScript(src)`: `src` run as a script of its own.

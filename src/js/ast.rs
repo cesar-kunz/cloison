@@ -21,6 +21,9 @@ pub struct Program<'a> {
     /// object first (the variable `%e0`, a `with`'s: see
     /// `intrinsics::direct_eval`).
     pub direct_eval: bool,
+    /// Strict indirect `eval`'s code: its `var`s and functions are its
+    /// own, not globals.
+    pub eval_locals: bool,
 }
 
 /// A block-scoped binding (see [`Program::lexicals`]).

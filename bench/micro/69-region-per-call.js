@@ -1,5 +1,5 @@
 // A function that allocates many objects and returns only a number, called repeatedly.
-// toi: the region rule: no internal object in or out, so the bump pointer resets on return.
+// cloison: the region rule: no internal object in or out, so the bump pointer resets on return.
 // features: loop, call, object, new, array
 // expect: 204982704
 function P(x, y) { this.x = x; this.y = y; }

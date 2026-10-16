@@ -6,9 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use toi::vm::{Vm, display};
+use cloison::vm::{Vm, display};
 
-/// The scripts toi runs to Node's value (by number); the rest don't yet.
+/// The scripts cloison runs to Node's value (by number); the rest don't yet.
 /// Add a script's number here when its feature lands.
 const PASSING: &[&str] = &[
     "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", "16", "17",
@@ -29,7 +29,7 @@ fn scripts() -> Vec<PathBuf> {
 /// `src`'s value with the interpreter only, tiering up after 1 and 2 back
 /// edges, and with the default; all must agree.
 fn run(name: &str, src: &str) -> Result<String, String> {
-    let module = toi::js::compile(src)?;
+    let module = cloison::js::compile(src)?;
     let mut result = None;
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();

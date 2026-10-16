@@ -1,6 +1,6 @@
 import os,re,sys,subprocess,random,collections,tempfile
 from concurrent.futures import ThreadPoolExecutor
-T='/Users/ckunz/git/toi-gz/test262'; TOI='/Users/ckunz/git/toi-gz/target/release/toi'
+ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__))); T=f'{ROOT}/test262'; CLOISON=f'{ROOT}/target/release/cloison'
 sample=int(sys.argv[1]); random.seed(int(sys.argv[2]) if len(sys.argv)>2 else 1); only=sys.argv[3] if len(sys.argv)>3 else ''
 files=[]
 for d in ['built-ins','language','annexB']:
@@ -30,7 +30,7 @@ def run(c):
     pre=H('assert.js')+H('sta.js')+''.join(H(i) for i in inc if os.path.exists(f'{T}/harness/{i}'))
     with tempfile.NamedTemporaryFile('w',suffix='.js',delete=False) as f: f.write(pre+'\n'+s); n=f.name
     try:
-        r=subprocess.run([TOI,n],capture_output=True,text=True,timeout=10); ok=r.returncode==0; msg=(r.stderr or r.stdout).strip()[:100]
+        r=subprocess.run([CLOISON,n],capture_output=True,text=True,timeout=10); ok=r.returncode==0; msg=(r.stderr or r.stdout).strip()[:100]
         if r.returncode<0: msg='CRASH '+msg
     except subprocess.TimeoutExpired: ok=False; msg='TIMEOUT'
     os.unlink(n); return p,ok,msg

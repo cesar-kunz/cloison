@@ -1,4 +1,4 @@
-# A heap sandbox for toi
+# A heap sandbox for cloison
 
 Status: design only, **deferred**. The survey part was researched in
 October 2026 from engine sources, papers and blogs (sources at the end).
@@ -7,7 +7,7 @@ October 2026 from engine sources, papers and blogs (sources at the end).
 
 Not worth building yet:
 
-- **No user needs it yet.** toi has no embedder running untrusted code.
+- **No user needs it yet.** cloison has no embedder running untrusted code.
   A sandbox only matters to an embedder running untrusted JS in-process,
   and only once an attacker already has an engine memory-corruption bug.
 - **The heap is still moving.** The GC, strings, exceptions, closures and
@@ -29,14 +29,14 @@ What to keep in mind meanwhile, because it is cheap now and expensive later:
 3. **No Rust addresses stored in heap objects.** Natives, host objects and
    strings reach Rust-side data through tables or IDs.
 
-Revisit when toi is embedded to run untrusted code, gains Wasm, or nears
+Revisit when cloison is embedded to run untrusted code, gains Wasm, or nears
 feature completeness. The plan below then still applies, from step 2.
 
 ## Goal and threat model
 
 V8's sandbox model, adopted as is. **The attacker can read and write
 anything inside the sandbox, arbitrarily**, for example through a JIT
-type-confusion or a missed bounds check in toi. **They must not be able to
+type-confusion or a missed bounds check in cloison. **They must not be able to
 corrupt anything outside it.** The sandbox is a large virtual reservation
 holding everything JS code can touch: objects, their properties and
 elements, strings, and later buffers and Wasm memories. Everything else is
@@ -134,7 +134,7 @@ once references are offsets. But it is a separate decision and optional
 
 ### JavaScriptCore
 
-- **NaN-boxed values.** toi's encoding is JSC's. Cells are full 64-bit
+- **NaN-boxed values.** cloison's encoding is JSC's. Cells are full 64-bit
   pointers; JSC never compressed them.
 - **StructureID.** A 32-bit "compressed pointer" in every cell header.
   - It was first a table index.
@@ -239,7 +239,7 @@ once references are offsets. But it is a separate decision and optional
   neighbour's memory acts as the guard: up to 15× more instances per
   address space. A PKRU write costs tens of cycles.
 - **Software fault isolation (SFI)** gives the cost of sandboxing *arbitrary*
-  code, an upper bound for toi.
+  code, an upper bound for cloison.
   - NaCl x86-64 used `r15` as the base, a 4 GB sandbox with 40 GB guards,
     and 32-byte bundles, at 5–7%.
   - LFI on arm64 (ASPLOS '24, now an LLVM target) uses 4 GB sandboxes
@@ -286,7 +286,7 @@ once references are offsets. But it is a separate decision and optional
 6. **A test mode that grants arbitrary in-sandbox writes, plus a crash
    filter**, from the start.
 
-## toi today
+## cloison today
 
 - **Values** are NaN-boxed with JSC's encoding; cells are raw 48-bit
   addresses (`src/value.rs`).
@@ -322,7 +322,7 @@ once references are offsets. But it is a separate decision and optional
   - **`ctx`:** points to the *exit cell*, a `u32` local to the JIT driver
     (`NO_EXIT` while code runs, so nested entries can share one cell). Direct
     calls pass it along unchanged.
-- **Single-threaded.** toi has no workers or shared memory, so the
+- **Single-threaded.** cloison has no workers or shared memory, so the
   concurrent double fetches behind several V8 bypasses can only come back
   through reentrancy (a getter or native that changes the object between
   two reads).
@@ -362,7 +362,7 @@ header is data.
     stored as `u32`. Bigger buffers need V8-style bounded sizes, or masking.
   - **Nothing goes in front of the cage.** Offsets are unsigned, and
     `zext32` is part of every decode, so no access can go below `B`. Unlike
-    V8 and Wasmtime, toi needs no front guard.
+    V8 and Wasmtime, cloison needs no front guard.
 - **Page 0 of the cage stays unmapped.** The immediates (`null` = 2,
   `false` = 6, `undefined` = 10, …) and `EMPTY` = 0 decode to it, so
   treating one as an object faults inside the sandbox, which is harmless.
@@ -376,7 +376,7 @@ header is data.
 
 ### The base register costs nothing
 
-V8 and HotSpot spend a register on the base, and Dart spends a load. toi has
+V8 and HotSpot spend a register on the base, and Dart spends a load. cloison has
 `ctx`, which points to the exit cell. With the exit cell at `[B − 4]`, **`ctx`
 becomes the base**:
 
@@ -555,7 +555,7 @@ Once references are offsets, storing them in 32 bits is a layout choice:
   ```
 
 - **Value slots** stay 64-bit NaN-boxed: unboxed doubles in fields are a
-  large part of toi's numeric speed. Hermes' `SmallHermesValue` (32-bit
+  large part of cloison's numeric speed. Hermes' `SmallHermesValue` (32-bit
   slots with doubles boxed on the heap) is the alternative if memory ever
   matters more than doubles. That would be a separate, much larger
   decision.
@@ -574,7 +574,7 @@ above, and also:
     the same reservation;
   - their data pointer is an offset;
   - lengths are `u32` element counts.
-- **Wasm memories** (if toi ever runs Wasm):
+- **Wasm memories** (if cloison ever runs Wasm):
   - each memory is its own reservation of 4 GiB plus a guard covering the
     largest folded offset, as V8, Wasmtime and SpiderMonkey do;
   - the memory's base is kept in trusted instance data, and JS objects refer
@@ -594,7 +594,7 @@ All of these are optional.
   sandbox; the VM stack and VM page are tagged with an extension key. That
   catches bugs in trusted code too, which the software sandbox can't, but
   costs a PKRU write on every runtime call.
-- **Spectre guards** (`cmov` on bounds checks), only if toi ever runs
+- **Spectre guards** (`cmov` on bounds checks), only if cloison ever runs
   mutually distrusting code in one process.
 
 ## Costs, and how to measure them

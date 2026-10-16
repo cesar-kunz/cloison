@@ -5,9 +5,9 @@
 //! the interpreter, tiering up at a loop's third back edge).
 //! They must agree on the result and on the final register file.
 
-use toi::bytecode::{Arg, Assembler, Op};
-use toi::jit::{JitFunction, Tiering};
-use toi::value::Value;
+use cloison::bytecode::{Arg, Assembler, Op};
+use cloison::jit::{JitFunction, Tiering};
+use cloison::value::Value;
 
 /// The same JS value. Numbers compare by value, so int32 `3` matches
 /// double `3.0` (the specialized JIT may keep a number as a double where the
@@ -25,12 +25,12 @@ fn same(a: Value, b: Value) -> bool {
 fn exec(a: Assembler, regs: &mut [Value]) -> Value {
     let code = a.finish();
     let initial = regs.to_vec();
-    let interp = unsafe { toi::interp::run(&code, regs) };
+    let interp = unsafe { cloison::interp::run(&code, regs) };
     // With superinstructions (see `bytecode::quicken`): the same results.
     let mut quick = code.clone();
-    toi::bytecode::quicken(&mut quick);
+    cloison::bytecode::quicken(&mut quick);
     let mut quick_regs = initial.clone();
-    let q = unsafe { toi::interp::run(&quick, &mut quick_regs) };
+    let q = unsafe { cloison::interp::run(&quick, &mut quick_regs) };
     assert!(
         same(interp, q),
         "interp returned {interp:?}, quickened {q:?}"
@@ -485,7 +485,7 @@ fn too_many_recompiles_finish_in_the_interpreter() {
 
 // ---- VM registers in machine registers (milestone 3) ----
 
-use toi::jit::{GPR_SLOTS, Home};
+use cloison::jit::{GPR_SLOTS, Home};
 
 fn homes(f: &JitFunction) -> Vec<Home> {
     f.last_code().unwrap().homes.clone()

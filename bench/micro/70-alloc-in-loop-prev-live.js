@@ -1,5 +1,5 @@
 // Allocating in a loop while the previous instance is still live (`prev = v`).
-// toi: two live instances of one site: rules out scalar replacement.
+// cloison: two live instances of one site: rules out scalar replacement.
 // features: loop, object, new, null
 // expect: 44551000
 function V(i, prev) { this.value = i; this.prev = prev; }

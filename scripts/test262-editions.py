@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 T = f'{ROOT}/test262'
-TOI = f'{ROOT}/target/release/toi'
+CLOISON = f'{ROOT}/target/release/cloison'
 only = sys.argv[1] if len(sys.argv) > 1 else ''
 
 ED = {
@@ -100,7 +100,7 @@ def run_once(src, strict, neg, is_async):
         f.write(('"use strict";\n' if strict else '') + src)
         n = f.name
     try:
-        r = subprocess.run([TOI, n], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([CLOISON, n], capture_output=True, text=True, timeout=10)
         out = (r.stderr or '') + (r.stdout or '')
         if r.returncode < 0:
             return False, 'CRASH'
@@ -112,7 +112,7 @@ def run_once(src, strict, neg, is_async):
                 return False, out.strip()[-100:]
             if phase == 'runtime':
                 return f'uncaught {typ}' in out, out.strip()[-100:]
-            # (An early error: toi reports it without "uncaught".)
+            # (An early error: cloison reports it without "uncaught".)
             return 'uncaught' not in out, out.strip()[-100:]
         if r.returncode != 0:
             return False, out.strip()[-100:]

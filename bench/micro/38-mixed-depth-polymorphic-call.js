@@ -1,5 +1,5 @@
 // Call sites over four classes whose implementations live at different depths of the prototype chain.
-// toi: `weight` is found one or two levels up, `isInput` one or three: each site's cases differ in depth.
+// cloison: `weight` is found one or two levels up, `isInput` one or three: each site's cases differ in depth.
 // features: loop, call, object, new, proto, call-method, array
 // expect: 65750000
 function inherit(child, parent) {

@@ -1,5 +1,5 @@
 // A graph built internally, then made reachable from a global once, then used.
-// toi: one transitive externalization walk; it must not cost more than that.
+// cloison: one transitive externalization walk; it must not cost more than that.
 // features: loop, call, object, new, proto, array, global, null, recursion
 // expect: 167690240
 var registry = new Object();

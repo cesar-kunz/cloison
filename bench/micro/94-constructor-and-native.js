@@ -1,5 +1,5 @@
 // A constructor and a native method (`push`) in the same loop.
-// toi: direct `new`; native results typed by their declared return type
+// cloison: direct `new`; native results typed by their declared return type
 // features: loop, object, new, array
 // expect: 40000000000
 function Box(k) { this.v = k; }

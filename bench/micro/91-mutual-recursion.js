@@ -1,5 +1,5 @@
 // fib split over two mutually recursive functions.
-// toi: direct calls between functions compiled together (mutual recursion)
+// cloison: direct calls between functions compiled together (mutual recursion)
 // features: call, recursion
 // expect: 196418
 function f(n) { if (n < 2) return n; return g(n - 1) + g(n - 2); }

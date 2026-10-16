@@ -18,25 +18,25 @@
 //! minor collections meanwhile pause it and shade what they find for it;
 //! when it runs out of work, the **final** pause marks from the roots and
 //! the dirty cards again, everything not marked yet, and sweeps.
-//! `TOI_GC_STW` marks full collections in one pause instead.
+//! `CLOISON_GC_STW` marks full collections in one pause instead.
 //!
 //! Roots are scanned conservatively where their words aren't known to be
 //! values: the VM stack (every word checked against the metadata) and the
 //! native stack with the registers (interior pointers resolved to their
 //! cell).
 //!
-//! `TOI_GC_VERIFY=<KiB>` collects every that many KiB of allocation (at
+//! `CLOISON_GC_VERIFY=<KiB>` collects every that many KiB of allocation (at
 //! least a block's), checks every reference it follows, and fills freed
 //! cells with [`POISON`], so that a missed root or barrier shows up as a
-//! poisoned value on first use; `TOI_GC_STRESS` collects at every
-//! safepoint, the same way. `TOI_GC_STATS` prints each collection.
+//! poisoned value on first use; `CLOISON_GC_STRESS` collects at every
+//! safepoint, the same way. `CLOISON_GC_STATS` prints each collection.
 
 use crate::heap::{BYTES, COLOR, END, GRANULE, Heap, UPVALUE, VALUES, YOUNG, cell_size};
 use crate::object::{Class, INLINE_BASE, Object};
 use crate::value::Value;
 use crate::vm::Vm;
 
-/// The byte freed cells are filled with under `TOI_GC_VERIFY`.
+/// The byte freed cells are filled with under `CLOISON_GC_VERIFY`.
 pub const POISON: u8 = 0xdd;
 /// Bytes allocated between minor collections.
 const NURSERY: usize = 32 << 20;
@@ -52,11 +52,11 @@ pub struct Gc {
     /// Cells marked and not yet traced.
     stack: Vec<usize>,
     /// Collect every that many bytes, checking references and poisoning
-    /// what is freed (`TOI_GC_VERIFY`; 0: off).
+    /// what is freed (`CLOISON_GC_VERIFY`; 0: off).
     pub verify: usize,
-    /// Collect at every safepoint (`TOI_GC_STRESS`).
+    /// Collect at every safepoint (`CLOISON_GC_STRESS`).
     stress: bool,
-    /// Print each collection (`TOI_GC_STATS`).
+    /// Print each collection (`CLOISON_GC_STATS`).
     stats: bool,
     /// Collections so far.
     pub count: usize,
@@ -77,11 +77,11 @@ pub struct Gc {
     log_slots: Vec<usize>,
     /// The heap's blocks in use above which the next collection is full.
     full_at: usize,
-    /// Every collection full (`TOI_GC_FULL`).
+    /// Every collection full (`CLOISON_GC_FULL`).
     always_full: bool,
-    /// Full collections marked in one pause (`TOI_GC_STW`).
+    /// Full collections marked in one pause (`CLOISON_GC_STW`).
     stw: bool,
-    /// Concurrent full collections back to back (`TOI_GC_CYCLES`).
+    /// Concurrent full collections back to back (`CLOISON_GC_CYCLES`).
     cycles: bool,
     /// A concurrent full collection is marking.
     marking: bool,
@@ -104,12 +104,12 @@ pub struct Gc {
     /// would have let it.
     cycle_from: usize,
     lead: usize,
-    /// Bytes the last full collection found live (for `TOI_GC_STATS`).
+    /// Bytes the last full collection found live (for `CLOISON_GC_STATS`).
     live: usize,
     /// Dirty card runs, kept for the next collection's (see
     /// `Heap::scan_cards`).
     card_runs: Vec<(usize, usize)>,
-    /// Threads that scan dirty cards (`TOI_GC_THREADS`; 1: on the
+    /// Threads that scan dirty cards (`CLOISON_GC_THREADS`; 1: on the
     /// collecting thread only).
     threads: usize,
     /// Bytes minor collections promoted since the last major one.
@@ -118,20 +118,20 @@ pub struct Gc {
     shade: Vec<usize>,
     /// The marker thread, once a cycle needed it.
     pub(crate) marker: Option<Marker>,
-    /// Bytes allocated between minor collections (`TOI_GC_NURSERY`, MiB).
+    /// Bytes allocated between minor collections (`CLOISON_GC_NURSERY`, MiB).
     nursery: usize,
-    /// Print what each kind of root reaches (`TOI_GC_ROOTS`).
+    /// Print what each kind of root reaches (`CLOISON_GC_ROOTS`).
     roots_report: bool,
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
-    /// (`TOI_GC_CHECK_BARRIER`, slow).
+    /// (`CLOISON_GC_CHECK_BARRIER`, slow).
     check_barriers: bool,
 }
 
 impl Gc {
     pub(crate) fn new() -> Gc {
         let env = |k| std::env::var_os(k).is_some();
-        let verify = std::env::var("TOI_GC_VERIFY")
+        let verify = std::env::var("CLOISON_GC_VERIFY")
             .ok()
             .map_or(0, |s| s.parse::<usize>().unwrap_or(256).max(1) << 10);
         Gc {
@@ -139,19 +139,19 @@ impl Gc {
             code_room: CODE_MIN,
             code_min: CODE_MIN,
             verify,
-            stress: env("TOI_GC_STRESS"),
-            stats: env("TOI_GC_STATS"),
-            always_full: env("TOI_GC_FULL"),
-            stw: env("TOI_GC_STW"),
-            cycles: env("TOI_GC_CYCLES"),
-            check_barriers: env("TOI_GC_CHECK_BARRIER"),
-            roots_report: env("TOI_GC_ROOTS"),
-            nursery: std::env::var("TOI_GC_NURSERY")
+            stress: env("CLOISON_GC_STRESS"),
+            stats: env("CLOISON_GC_STATS"),
+            always_full: env("CLOISON_GC_FULL"),
+            stw: env("CLOISON_GC_STW"),
+            cycles: env("CLOISON_GC_CYCLES"),
+            check_barriers: env("CLOISON_GC_CHECK_BARRIER"),
+            roots_report: env("CLOISON_GC_ROOTS"),
+            nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .map_or(NURSERY, |mb| mb << 20),
             full_at: FULL_MIN,
-            threads: std::env::var("TOI_GC_THREADS")
+            threads: std::env::var("CLOISON_GC_THREADS")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)))
@@ -986,7 +986,7 @@ impl Marker {
         });
         let s = shared.clone();
         let thread = std::thread::Builder::new()
-            .name("toi-marker".into())
+            .name("cloison-marker".into())
             .spawn(move || marker_loop(&s))
             .expect("the marker thread");
         Marker {
@@ -1351,7 +1351,7 @@ impl Vm {
         }
     }
 
-    /// Debugging (`TOI_GC_ROOTS`): trace what the roots marked so far
+    /// Debugging (`CLOISON_GC_ROOTS`): trace what the roots marked so far
     /// reach, and print how many cells that was, for root kind `what`.
     unsafe fn roots_report(&mut self, m: &mut Marking, what: &str) {
         if !self.heap.gc.roots_report {
@@ -1540,7 +1540,7 @@ impl Vm {
         }
     }
 
-    /// Under `TOI_GC_VERIFY`, after the final pause marked: mark again from
+    /// Under `CLOISON_GC_VERIFY`, after the final pause marked: mark again from
     /// every root in one pass, with a set of its own, and panic on a cell
     /// reached that the concurrent marking left unmarked.
     unsafe fn verify_marking(&mut self, sp: usize, regs: *mut Value, color: u8) {
@@ -2103,7 +2103,7 @@ impl Visit for Reached<'_> {
 impl Heap {
     /// Panic on an old cell that refers to a young cell the minor
     /// collection left unmarked: a store without its barrier
-    /// (`TOI_GC_CHECK_BARRIER`).
+    /// (`CLOISON_GC_CHECK_BARRIER`).
     unsafe fn check_barriers(&mut self) {
         unsafe {
             for (start, end) in self.block_ranges() {

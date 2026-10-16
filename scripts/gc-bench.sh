@@ -5,11 +5,11 @@
 #
 #   scripts/gc-bench.sh                  # every benchmark that runs
 #   scripts/gc-bench.sh splay deltablue  # only these
-#   TOI=path/to/toi scripts/gc-bench.sh  # another build
+#   CLOISON=path/to/cloison scripts/gc-bench.sh  # another build
 set -uo pipefail
 cd "$(dirname "$0")/.."
 dir=${OCTANE_DIR:-target/octane}
-toi=${TOI:-target/release/toi}
+cloison=${CLOISON:-target/release/cloison}
 order="richards deltablue crypto raytrace earley-boyer regexp splay
   navier-stokes pdfjs gbemu code-load box2d typescript"
 [ $# -gt 0 ] && order="$*"
@@ -19,11 +19,11 @@ for b in $order; do
   [ -f "$f" ] || { printf '%-14s (no %s)\n' "$b" "$f"; continue; }
   out=$(mktemp)
   if [ "$(uname)" = Darwin ]; then
-    /usr/bin/time -l "$toi" "$f" > "$out.stdout" 2> "$out"
+    /usr/bin/time -l "$cloison" "$f" > "$out.stdout" 2> "$out"
     kb=$(awk '/maximum resident set size/ {print int($1 / 1024)}' "$out")
     s=$(awk '/ real / {print $1}' "$out")
   else
-    /usr/bin/time -f '%e %M' "$toi" "$f" > "$out.stdout" 2> "$out"
+    /usr/bin/time -f '%e %M' "$cloison" "$f" > "$out.stdout" 2> "$out"
     read -r s kb < <(tail -n 1 "$out")
   fi
   v=$(tail -n 1 "$out.stdout" | cut -c1-60)

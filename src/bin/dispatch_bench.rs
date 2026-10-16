@@ -37,11 +37,11 @@
 //! a side exit; `double` exits once when `s` overflows int32).
 //! ```
 //!
-//! With `TOI_JIT_DUMP=<file>`, the hot machine code the JIT compiled last
+//! With `CLOISON_JIT_DUMP=<file>`, the hot machine code the JIT compiled last
 //! is written to `<file>` after the run (see `scripts/jit-asm.sh`).
 //!
-//! The bytecode is quickened (`toi::bytecode::quicken`: comparison + jump
-//! superinstructions) unless `TOI_NO_QUICKEN` is set.
+//! The bytecode is quickened (`cloison::bytecode::quicken`: comparison + jump
+//! superinstructions) unless `CLOISON_NO_QUICKEN` is set.
 //!
 //! `n` is baked into the bytecode, as `i < 100000000` would be. In `double`,
 //! `s` leaves the int32 range after ~65k iterations and `add` takes its slow
@@ -49,9 +49,9 @@
 
 use std::process::exit;
 use std::time::Instant;
-use toi::bytecode::{Arg, Assembler, Op};
-use toi::jit::JitFunction;
-use toi::value::Value;
+use cloison::bytecode::{Arg, Assembler, Op};
+use cloison::jit::JitFunction;
+use cloison::value::Value;
 
 const S: u8 = 0;
 const I: u8 = 1;
@@ -168,8 +168,8 @@ fn main() {
     }
     a.ldar(if program == "wide" { A1 + 7 } else { S }).ret();
     let mut code = a.finish();
-    if std::env::var_os("TOI_NO_QUICKEN").is_none() {
-        toi::bytecode::quicken(&mut code);
+    if std::env::var_os("CLOISON_NO_QUICKEN").is_none() {
+        cloison::bytecode::quicken(&mut code);
     }
 
     let mut regs = [Value::UNDEFINED; 12];
@@ -185,12 +185,12 @@ fn main() {
     let start = Instant::now();
     let result = match &mut jit {
         Some(f) => unsafe { f.run(&mut regs) },
-        None => unsafe { toi::interp::run(&code, &mut regs) },
+        None => unsafe { cloison::interp::run(&code, &mut regs) },
     };
     let elapsed = start.elapsed();
-    if let (Some(f), Ok(path)) = (&jit, std::env::var("TOI_JIT_DUMP")) {
+    if let (Some(f), Ok(path)) = (&jit, std::env::var("CLOISON_JIT_DUMP")) {
         let code = f.last_code().expect("compiled code");
-        std::fs::write(path, code.main_code()).expect("writing TOI_JIT_DUMP");
+        std::fs::write(path, code.main_code()).expect("writing CLOISON_JIT_DUMP");
     }
 
     assert_eq!(

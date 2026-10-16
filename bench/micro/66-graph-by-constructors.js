@@ -1,5 +1,5 @@
 // A chain of nodes and links built entirely by constructor side effects, then walked.
-// toi: everything internal: no barriers on these stores, freed with the region.
+// cloison: everything internal: no barriers on these stores, freed with the region.
 // features: loop, call, object, new, proto, array, null
 // expect: 1515000
 function Node(i) { this.value = i; this.links = []; }

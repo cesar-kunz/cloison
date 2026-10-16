@@ -1,5 +1,5 @@
 // A worklist wrapper allocated, filled and drained inside one function; it never leaves.
-// toi: candidate for scalar replacement of the wrapper (A); the array stays a heap object.
+// cloison: candidate for scalar replacement of the wrapper (A); the array stays a heap object.
 // features: loop, call, object, new, proto, array
 // expect: 854376
 function Coll() { this.elms = new Array(); }

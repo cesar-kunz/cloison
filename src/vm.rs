@@ -320,7 +320,7 @@ pub(crate) fn pin(code: *const Code) {
 
 /// Over the process: functions loaded with bytecode (compiled up front or
 /// at their first call), their bytecode's bytes, and functions loaded as
-/// stubs not compiled yet (`toi` prints them with `TOI_SIZES` set).
+/// stubs not compiled yet (`cloison` prints them with `CLOISON_SIZES` set).
 pub static FUNCTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BYTECODE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static STUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -329,7 +329,7 @@ pub static STUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 pub struct Code {
     pub name: String,
     /// Where it starts in its source, 1-based line and column, for
-    /// `TOI_JIT_LOG` (see `asm::FunctionDef::line`).
+    /// `CLOISON_JIT_LOG` (see `asm::FunctionDef::line`).
     pub line: u32,
     pub col: u32,
     pub bytecode: Vec<u8>,
@@ -559,14 +559,14 @@ pub struct Vm {
     pub(crate) stack: Box<[Value]>,
     pub(crate) stack_end: *mut Value,
     /// Loop back edges a new frame runs in the interpreter before tiering
-    /// up into the JIT: `TOI_TIER` if set, `i64::MAX` (never) with
-    /// `TOI_NO_JIT` set.
+    /// up into the JIT: `CLOISON_TIER` if set, `i64::MAX` (never) with
+    /// `CLOISON_NO_JIT` set.
     pub(crate) frame_budget: i64,
     /// Functions are compiled warm first (see `jit::Tier`): off by
     /// default.
     pub(crate) warm_tier: bool,
     /// Calls of a function before calls to it enter compiled code (see
-    /// `Code::calls_left`); `i32::MAX` with `TOI_NO_JIT`.
+    /// `Code::calls_left`); `i32::MAX` with `CLOISON_NO_JIT`.
     pub(crate) tier_calls: i32,
     /// The frame that left the interpreter to tier up.
     pub(crate) osr_regs: *mut Value,
@@ -803,11 +803,11 @@ impl Vm {
             error: None,
             stack,
             stack_end,
-            warm_tier: std::env::var_os("TOI_WARM").is_some(),
-            frame_budget: if std::env::var_os("TOI_NO_JIT").is_some() {
+            warm_tier: std::env::var_os("CLOISON_WARM").is_some(),
+            frame_budget: if std::env::var_os("CLOISON_NO_JIT").is_some() {
                 i64::MAX
             } else {
-                std::env::var("TOI_TIER")
+                std::env::var("CLOISON_TIER")
                     .ok()
                     .and_then(|n| n.parse::<i64>().ok())
                     .map_or(TIER_BACK_EDGES, |n| n.max(1))
@@ -2103,7 +2103,7 @@ impl Vm {
         let (_, name) = code.ic(ic);
         let g = self.global;
         if self.lookup(g, name).is_none() {
-            // A script's `var` not assigned yet (`toi` makes the global on
+            // A script's `var` not assigned yet (`cloison` makes the global on
             // its first store, keeping its field's type): `undefined`.
             if self.declared.contains(&name) {
                 return Ok(Value::UNDEFINED);
@@ -3605,7 +3605,7 @@ impl Vm {
     fn load_functions(&mut self, module: Module, into: Option<*const Code>) -> Vec<*const Code> {
         let recursive = recursive_functions(&module);
         static QUICKEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let quicken = *QUICKEN.get_or_init(|| std::env::var_os("TOI_NO_QUICKEN").is_none());
+        let quicken = *QUICKEN.get_or_init(|| std::env::var_os("CLOISON_NO_QUICKEN").is_none());
         let mut units = Vec::new();
         let mut closures = Vec::with_capacity(module.functions.len());
         let codes: Vec<*const Code> = module
@@ -3825,7 +3825,7 @@ impl Vm {
     }
 
     /// Whether functions are compiled warm first, then hot, or hot from
-    /// the start (the default; `TOI_WARM` set: warm first). See
+    /// the start (the default; `CLOISON_WARM` set: warm first). See
     /// `jit::Tier`.
     pub fn set_warm_tier(&mut self, on: bool) {
         self.warm_tier = on;
@@ -3839,7 +3839,7 @@ impl Vm {
     }
 
     /// Collect every `bytes` allocated, checking references and poisoning
-    /// what is freed, as `TOI_GC_VERIFY` does (for tests).
+    /// what is freed, as `CLOISON_GC_VERIFY` does (for tests).
     pub fn set_gc_verify(&mut self, bytes: usize) {
         self.heap.gc.verify = bytes;
         self.heap.budget = self.heap.gc.budget();

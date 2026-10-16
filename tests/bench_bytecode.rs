@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use toi::vm::{Vm, display};
+use cloison::vm::{Vm, display};
 
 #[test]
 fn listings_match_their_benchmarks() {
@@ -25,7 +25,7 @@ fn listings_match_their_benchmarks() {
             .lines()
             .find_map(|l| l.strip_prefix("// expect: "))
             .unwrap_or_else(|| panic!("{}: no expect line", f.display()));
-        let module = toi::asm::parse(&std::fs::read_to_string(&f).unwrap())
+        let module = cloison::asm::parse(&std::fs::read_to_string(&f).unwrap())
             .unwrap_or_else(|e| panic!("{}: {e}", f.display()));
         // Interpreter only, tiering up after 1 and 2 back edges, and the
         // default.
@@ -46,11 +46,11 @@ fn listings_match_their_benchmarks() {
     }
 }
 
-fn listing(name: &str) -> toi::asm::Module {
+fn listing(name: &str) -> cloison::asm::Module {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("bench/bytecode")
         .join(name);
-    toi::asm::parse(&std::fs::read_to_string(path).unwrap()).unwrap()
+    cloison::asm::parse(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
 
 #[test]

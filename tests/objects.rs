@@ -2,14 +2,14 @@
 //! caches and their invalidation, constructors, prototypes, arrays,
 //! natives, errors and frames.
 
-use toi::value::Value;
-use toi::vm::{Error, Vm, display};
+use cloison::value::Value;
+use cloison::vm::{Error, Vm, display};
 
 /// Run `src` in the interpreter only, then tiering up after 1 and 2 loop
 /// back edges (so loops compile mid-run, and re-enter compiled code right
 /// after exits), then with the default tiering; the results must agree.
 fn run(src: &str) -> Result<Value, Error> {
-    let m = toi::asm::parse(src).unwrap_or_else(|e| panic!("{e}"));
+    let m = cloison::asm::parse(src).unwrap_or_else(|e| panic!("{e}"));
     let mut results = Vec::new();
     for budget in [i64::MAX, 1, 2, 1000] {
         let mut vm = Vm::new();
@@ -400,7 +400,7 @@ fn slack_tracking_grows_in_object_capacity() {
         "script\n CreateClosure P\n StaGlobal P\n LdaGlobal P\n Star r1\n Construct r1, r2, 0\n StaGlobal first\n \
          Construct r1, r2, 0\n Return\nend\n{ctor}"
     );
-    let m = toi::asm::parse(&src).unwrap();
+    let m = cloison::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     let second = vm.run(&m).unwrap();
@@ -498,7 +498,7 @@ end
 
 fn jit(src: &str) -> (String, Vec<String>) {
     let expected = ok(src);
-    let m = toi::asm::parse(src).unwrap();
+    let m = cloison::asm::parse(src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
@@ -1665,7 +1665,7 @@ call:   CallUndefined r3, r4, 1
         Return
 end
 ";
-    let m = toi::asm::parse(src).unwrap();
+    let m = cloison::asm::parse(src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     let v = display(vm.run(&m).unwrap());
@@ -1738,7 +1738,7 @@ end
     assert_eq!(ok(src), "420");
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
-    vm.run(&toi::asm::parse(src).unwrap()).unwrap();
+    vm.run(&cloison::asm::parse(src).unwrap()).unwrap();
     assert!(vm.jit_stencils("Sum").is_some(), "Sum compiled");
 }
 
@@ -2043,7 +2043,7 @@ fn recursive_program(name: &str, n: i32, function: &str) -> String {
 /// returns it and the stencils of `function`'s last compiled code.
 fn jit_function(src: &str, function: &str) -> (String, Vec<String>) {
     let expected = ok(src);
-    let m = toi::asm::parse(src).unwrap();
+    let m = cloison::asm::parse(src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     let v = display(vm.run(&m).unwrap());
@@ -2199,7 +2199,7 @@ fn runtime_call_results_are_predicted() {
     let (v, s) = jit(&two);
     assert_eq!(v, (299 * 300 / 2 + 300 * 301).to_string());
     assert!(s.iter().any(|n| n == "call+check_acc_int"), "{s:?}");
-    let m = toi::asm::parse(&src).unwrap();
+    let m = cloison::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
@@ -2327,7 +2327,7 @@ end
 
 /// A compiled loop calls `new F(3)` directly, `F` tail-calling itself and
 /// returning `this` (see `self_tail_calls_keep_new_frames`). The tail call
-/// may reuse the frame, overwriting `this` there: `toi_rt_construct` keeps
+/// may reuse the frame, overwriting `this` there: `cloison_rt_construct` keeps
 /// its own, so the result is never `undefined`.
 #[test]
 fn direct_constructors_keep_their_frames() {
@@ -2575,7 +2575,7 @@ end
 ",
     );
     assert_eq!(ok(&src), (299 * 300 / 2).to_string());
-    let m = toi::asm::parse(&src).unwrap();
+    let m = cloison::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
@@ -2637,7 +2637,7 @@ end
 ",
     );
     assert_eq!(ok(&src), "700");
-    let m = toi::asm::parse(&src).unwrap();
+    let m = cloison::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
@@ -2837,7 +2837,7 @@ end
 "
     );
     let expected: u64 = (0..500u64).map(|i| (i & 7) + 109).sum();
-    let m = toi::asm::parse(&src).unwrap();
+    let m = cloison::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     vm.set_tier_back_edges(2);
@@ -2893,7 +2893,7 @@ fn self_tail_calls_are_loops() {
 /// to a double).
 #[test]
 fn deep_self_tail_recursion() {
-    let m = toi::asm::parse(&tail_sum_program(1_000_000)).unwrap();
+    let m = cloison::asm::parse(&tail_sum_program(1_000_000)).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     assert_eq!(display(vm.run(&m).unwrap()), "500000500000");
@@ -3047,7 +3047,7 @@ fn mutual_recursion_inlined() {
 fn mutual_recursion_direct() {
     let src = mutual_program(20, 64);
     let expected = ok(&src);
-    let m = toi::asm::parse(&src).unwrap();
+    let m = cloison::asm::parse(&src).unwrap();
     let mut vm = Vm::new();
     vm.set_warm_tier(false);
     assert_eq!(display(vm.run(&m).unwrap()), expected);
@@ -3135,7 +3135,7 @@ y = 2;
 var s = 0;
 for (var i = 0; i < 1000; i++) s += get();
 s;";
-    let m = toi::js::compile(src).unwrap();
+    let m = cloison::js::compile(src).unwrap();
     let mut vm = Vm::new();
     vm.set_tier_back_edges(i64::MAX);
     assert_eq!(display(vm.run(&m).unwrap()), "1000");

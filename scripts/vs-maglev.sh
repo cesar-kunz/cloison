@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Compare the machine code toi's JIT generates for each script in
+# Compare the machine code cloison's JIT generates for each script in
 # bench/micro/ with the code V8's Maglev generates for it, function by
-# function, to find where toi's code is larger than it needs to be.
+# function, to find where cloison's code is larger than it needs to be.
 #
 #   scripts/vs-maglev.sh                     # every file; table in perf-history/vs-maglev-<commit>.md
 #   scripts/vs-maglev.sh bench/micro/1[0-3]*.js   # only these
 #   scripts/vs-maglev.sh --asm FILE FN [V8FN]   # both disassemblies of one function's last compile
 #                                            # (FN: `name` or `name:line:col`; V8FN: Maglev's, e.g. `Steps.add`)
-#   scripts/vs-maglev.sh --pieces [--record] [FILES]   # toi's final code per stencil and per task
+#   scripts/vs-maglev.sh --pieces [--record] [FILES]   # cloison's final code per stencil and per task
 #
-# toi: `TOI_JIT_LOG` lines, each compile's hot code, out-of-line code
+# cloison: `CLOISON_JIT_LOG` lines, each compile's hot code, out-of-line code
 # (edge stubs, slow-path helpers, runtime-call wrappers) and exits (stubs
 # rebuilding the interpreter's frame). Maglev: V8 capped at Maglev
 # (`--max-opt=2`), the size of each Maglev code object from V8's perf map
@@ -18,35 +18,35 @@
 # compiling on the main thread (`--single-threaded`: with background
 # compiles, which code gets installed when varies from run to run).
 #
-# "toi" is hot plus out-of-line code: what Maglev's size counts (its
+# "cloison" is hot plus out-of-line code: what Maglev's size counts (its
 # deferred code). Exits are apart: Maglev's are a 4-byte call each, the
 # frame they rebuild described in metadata.
 #
 # Per function, both engines' *final* code: the last compile of each
-# entry, the function's own (toi `@0`, Maglev `+`) and on-stack
-# replacement (toi `@pc`, Maglev `o+`), summed. Functions are matched by
+# entry, the function's own (cloison `@0`, Maglev `+`) and on-stack
+# replacement (cloison `@pc`, Maglev `o+`), summed. Functions are matched by
 # name and source position, `name:line:col` (both place a function at its
-# parameter list's `(`; V8 names `X.prototype.m = function` `X.m`, toi
+# parameter list's `(`; V8 names `X.prototype.m = function` `X.m`, cloison
 # `m`, so V8's names are cut after their last `.`). Both inline small callees: code a function inlines is in its
 # size, and a function that is only ever inlined has none of its own (one
 # engine may compile it alone and the other not: "same fns" compares just
 # the functions both compiled).
 # "all" sums every compile, recompiles after deopts included.
 #
-# Maglev's sizes don't change with toi, so they're cached in
+# Maglev's sizes don't change with cloison, so they're cached in
 # perf-history/maglev-sizes.tsv by Node version and the file's contents
 # (`git hash-object`); MAGLEV=1 measures them again.
 #
 # Node: $NODE, else the Node 26 scripts/tiers.sh downloads.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-NODE=${NODE:-$(ls -d ~/.local/share/toi-v8/node-*/bin/node 2>/dev/null | tail -1)}
+NODE=${NODE:-$(ls -d ~/.local/share/cloison-v8/node-*/bin/node 2>/dev/null | tail -1)}
 [[ -x $NODE ]] || { echo "no Node 26: run scripts/tiers.sh once, or set NODE" >&2; exit 1; }
-cargo build --release --quiet --bin toi
+cargo build --release --quiet --bin cloison
 
-# `--pieces`: toi's final code (as below: each function's last compile
+# `--pieces`: cloison's final code (as below: each function's last compile
 # per entry) per stencil family, hot, out-of-line and exits apart
-# (`TOI_JIT_LOG=pieces`), summed over the files, and per task of
+# (`CLOISON_JIT_LOG=pieces`), summed over the files, and per task of
 # docs/maglev-size-tasks.md (the families each task shrinks). Table in
 # perf-history/pieces-<commit>.md; `--record` appends the task totals to
 # bench/maglev-tasks.tsv (`commit<TAB>task<TAB>bytes`) and every run shows
@@ -70,15 +70,15 @@ commit, record, *files = sys.argv[1:]
 # The families each task shrinks (docs/maglev-size-tasks.md), by kind of
 # code; S5 and S8 (encodings) touch every family.
 TASKS = [
-    ("S1 push", "hot|ool", r"array_push|wrapper:toi_rt_array_push"),
-    ("S2 calls", "hot|ool", r"direct_call|call_done|check_callee|callee_jne|construct_direct|call_rt|wrapper:toi_rt_enter"),
+    ("S1 push", "hot|ool", r"array_push|wrapper:cloison_rt_array_push"),
+    ("S2 calls", "hot|ool", r"direct_call|call_done|check_callee|callee_jne|construct_direct|call_rt|wrapper:cloison_rt_enter"),
     ("S3 entry clearing", "hot|ool", r"words_jne|clear|copy_word|zero"),
-    ("S4 truthiness", "hot|ool", r"jtofalse|jtotrue|wrapper:toi_rt_to_boolean"),
+    ("S4 truthiness", "hot|ool", r"jtofalse|jtotrue|wrapper:cloison_rt_to_boolean"),
     ("S6 stores", "hot|ool", r"set_own|set_tr"),
-    ("S7 allocation", "hot|ool", r"create_object|create_array|wrapper:toi_rt_create_(object|array)"),
+    ("S7 allocation", "hot|ool", r"create_object|create_array|wrapper:cloison_rt_create_(object|array)"),
     ("S9 cell guards", "hot|ool", r"guard_word"),
     ("S10 heap-object checks", "hot|ool", r"guard_cell|check_acc_shape"),
-    ("S11 untyped ===", "hot|ool", r"teq_j[tf]|wrapper:toi_rt_loose_eq"),
+    ("S11 untyped ===", "hot|ool", r"teq_j[tf]|wrapper:cloison_rt_loose_eq"),
     ("S12 moves", "hot|ool", r"star|ldar|spill|lda_constant|mov"),
     ("S13 keyed loads", "hot|ool", r"get_keyed_i_sh"),
     ("C1 exits", "exit", r".*"),
@@ -98,8 +98,8 @@ total = collections.Counter()   # (kind, family) -> bytes
 sites = collections.Counter()
 for n, f in enumerate(files, 1):
     print(f"\r{n}/{len(files)} {os.path.basename(f):40}", end="", file=sys.stderr, flush=True)
-    r = subprocess.run(["target/release/toi", f], capture_output=True, text=True,
-                       env={**os.environ, "TOI_JIT_LOG": "pieces"}, timeout=600)
+    r = subprocess.run(["target/release/cloison", f], capture_output=True, text=True,
+                       env={**os.environ, "CLOISON_JIT_LOG": "pieces"}, timeout=600)
     last, pending = {}, None
     for line in r.stderr.splitlines():
         if line.startswith("pieces "):
@@ -130,7 +130,7 @@ if os.path.exists(tsv):
     if prev:
         last = {r[1]: int(r[2]) for r in recs if r[0] == prev[-1]}
         last_commit = prev[-1]
-lines = [f"toi {commit}: final code per task of docs/maglev-size-tasks.md, bytes over {len(files)} files "
+lines = [f"cloison {commit}: final code per task of docs/maglev-size-tasks.md, bytes over {len(files)} files "
          f"(`scripts/vs-maglev.sh --pieces`)" + (f", change since {last_commit}" if last else ""), "",
          "| task | bytes | before | change |", "|---|---:|---:|---:|"]
 for t, b in rows:
@@ -160,11 +160,11 @@ fi
 if [[ ${1:-} == --asm ]]; then
   file=${2:?file}; fn=${3:?function}; v8fn=${4:-${fn%%:*}}
   dump=$(mktemp); trap 'rm -f "$dump"' EXIT
-  TOI_JIT_DUMP=$dump TOI_JIT_DUMP_FN=$fn target/release/toi "$file" >/dev/null
+  CLOISON_JIT_DUMP=$dump CLOISON_JIT_DUMP_FN=$fn target/release/cloison "$file" >/dev/null
   if [[ ! -s $dump ]]; then
-    echo "=== toi: $fn not compiled on its own (inlined into its callers, or never hot)"
+    echo "=== cloison: $fn not compiled on its own (inlined into its callers, or never hot)"
   else
-    echo "=== toi: $fn, last compile, hot code ($(stat -c %s "$dump") bytes)"
+    echo "=== cloison: $fn, last compile, hot code ($(stat -c %s "$dump") bytes)"
   fi
   [[ -s $dump ]] && objdump -D -b binary -m i386:x86-64 -M intel --no-show-raw-insn "$dump" | sed -n '/<.data>:/,$p' | tail -n +2
   echo
@@ -206,9 +206,9 @@ def final(compiles):
         fin[name] += size
     return fin, every
 
-def toi(f):
-    r = subprocess.run(["target/release/toi", f], capture_output=True, text=True,
-                       env={**os.environ, "TOI_JIT_LOG": "1"}, timeout=600)
+def cloison(f):
+    r = subprocess.run(["target/release/cloison", f], capture_output=True, text=True,
+                       env={**os.environ, "CLOISON_JIT_LOG": "1"}, timeout=600)
     want = re.search(r"^// expect: (.*)$", open(f).read(), re.M)
     ok = want is not None and r.stdout.strip().splitlines()[-1:] == [want.group(1).strip()]
     hot, code, exits = [], [], []
@@ -238,7 +238,7 @@ def maglev(f):
             if len(p) == 3 and os.path.abspath(f) in p[2]:
                 mm = re.match(r"JS:(o?)([~^+*])'?(.*) (\S+)$", p[2].strip())
                 if mm:
-                    # (A script's top level has no name: toi's `<script>`.)
+                    # (A script's top level has no name: cloison's `<script>`.)
                     name = mm.group(3).rsplit(".", 1)[-1] or "<script>"
                     name += ":" + ":".join(mm.group(4).rsplit(":", 2)[1:])
                     if mm.group(2) == "+":
@@ -264,14 +264,14 @@ for n, f in enumerate(files, 1):
         cache[key] = maglev(f) or [("-", "none", 0)]
         added = True
     mfin, mall = final([c for c in cache[key] if c[1] in ("entry", "osr")])
-    ok, (hfin, _), (cfin, call), (efin, _) = toi(f)
+    ok, (hfin, _), (cfin, call), (efin, _) = cloison(f)
     names = sorted(set(mfin) | set(cfin), key=lambda k: -max(cfin[k], mfin[k]))
     both = [k for k in names if k in mfin and k in cfin]
     s = lambda c, ks: sum(c[k] for k in ks)
     rows.append(dict(bench=b, ok=ok,
-        toi_hot=sum(hfin.values()), toi_code=sum(cfin.values()), toi_exits=sum(efin.values()),
+        cloison_hot=sum(hfin.values()), cloison_code=sum(cfin.values()), cloison_exits=sum(efin.values()),
         maglev=sum(mfin.values()), both_code=s(cfin, both), both_maglev=s(mfin, both),
-        toi_all=sum(call.values()), maglev_all=sum(mall.values())))
+        cloison_all=sum(call.values()), maglev_all=sum(mall.values())))
     details[b] = [(k, hfin.get(k), cfin.get(k), efin.get(k), mfin.get(k)) for k in names]
 print(file=sys.stderr)
 if added:
@@ -283,48 +283,48 @@ if added:
 
 ratio = lambda a, b: f"{a / b:.2f}" if a and b else "-"
 num = lambda v: "-" if not v else f"{v:,}"
-lines = [f"toi {commit} against Maglev (V8 {v8}, `--max-opt=2`): final machine code in bytes, every "
-         "function's last compile of each entry summed (`scripts/vs-maglev.sh`). toi: hot plus out-of-line code "
+lines = [f"cloison {commit} against Maglev (V8 {v8}, `--max-opt=2`): final machine code in bytes, every "
+         "function's last compile of each entry summed (`scripts/vs-maglev.sh`). cloison: hot plus out-of-line code "
          "(edge stubs, slow-path helpers, runtime-call wrappers), what Maglev's size counts (its deferred code); "
-         "toi hot: just the hot part; exits apart (Maglev's: a 4-byte call each, the frame in metadata). "
-         "Ratios toi/Maglev (above 1: toi's is larger). Code a function inlines counts in it, and Maglev often "
-         "also compiles on their own functions toi only inlines (see the per-function tables). \"same fns\": "
-         "toi/M over just the functions both compiled on their own (matched by `name:line:col`). \"all\": "
-         "every compile's toi code, recompiles included.", "",
-         "| benchmark | toi | toi hot | exits | Maglev | toi/M | hot/M | +exits/M | same fns toi/M | toi all | Maglev all |",
+         "cloison hot: just the hot part; exits apart (Maglev's: a 4-byte call each, the frame in metadata). "
+         "Ratios cloison/Maglev (above 1: cloison's is larger). Code a function inlines counts in it, and Maglev often "
+         "also compiles on their own functions cloison only inlines (see the per-function tables). \"same fns\": "
+         "cloison/M over just the functions both compiled on their own (matched by `name:line:col`). \"all\": "
+         "every compile's cloison code, recompiles included.", "",
+         "| benchmark | cloison | cloison hot | exits | Maglev | cloison/M | hot/M | +exits/M | same fns cloison/M | cloison all | Maglev all |",
          "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
-keys = ["bench", "ok", "toi_code", "toi_hot", "toi_exits", "maglev", "both_code", "both_maglev",
-        "toi_all", "maglev_all"]
+keys = ["bench", "ok", "cloison_code", "cloison_hot", "cloison_exits", "maglev", "both_code", "both_maglev",
+        "cloison_all", "maglev_all"]
 tsv = ["\t".join(keys)]
 for r in rows:
     flag = "" if r["ok"] else " (wrong result)"
-    lines.append(f"| {r['bench']}{flag} | {num(r['toi_code'])} | {num(r['toi_hot'])} | {num(r['toi_exits'])} | "
-                 f"{num(r['maglev'])} | {ratio(r['toi_code'], r['maglev'])} | {ratio(r['toi_hot'], r['maglev'])} | "
-                 f"{ratio(r['toi_code'] + r['toi_exits'], r['maglev'])} | {ratio(r['both_code'], r['both_maglev'])} | "
-                 f"{num(r['toi_all'])} | {num(r['maglev_all'])} |")
+    lines.append(f"| {r['bench']}{flag} | {num(r['cloison_code'])} | {num(r['cloison_hot'])} | {num(r['cloison_exits'])} | "
+                 f"{num(r['maglev'])} | {ratio(r['cloison_code'], r['maglev'])} | {ratio(r['cloison_hot'], r['maglev'])} | "
+                 f"{ratio(r['cloison_code'] + r['cloison_exits'], r['maglev'])} | {ratio(r['both_code'], r['both_maglev'])} | "
+                 f"{num(r['cloison_all'])} | {num(r['maglev_all'])} |")
     tsv.append("\t".join(str(r[k]) for k in keys))
 for r in rows:
-    r["toi_code_exits"] = r["toi_code"] + r["toi_exits"]
-tot = {k: sum(r[k] for r in rows if r["ok"]) for k in ["toi_code", "toi_hot", "toi_exits", "maglev"]}
-matched = [r for r in rows if r["ok"] and r["maglev"] and r["toi_code"]]
+    r["cloison_code_exits"] = r["cloison_code"] + r["cloison_exits"]
+tot = {k: sum(r[k] for r in rows if r["ok"]) for k in ["cloison_code", "cloison_hot", "cloison_exits", "maglev"]}
+matched = [r for r in rows if r["ok"] and r["maglev"] and r["cloison_code"]]
 gm = lambda key: math.exp(sum(math.log(r[key] / r["maglev"]) for r in matched) / len(matched)) if matched else 0
-lines += ["", f"Sum (right results): toi {tot['toi_code']:,} (hot {tot['toi_hot']:,}), exits {tot['toi_exits']:,}, "
-          f"Maglev {tot['maglev']:,}; geomean toi/M {gm('toi_code'):.2f}, hot/M {gm('toi_hot'):.2f}, "
-          f"+exits/M {gm('toi_code_exits'):.2f} over the {len(matched)} files both compiled.", ""]
+lines += ["", f"Sum (right results): cloison {tot['cloison_code']:,} (hot {tot['cloison_hot']:,}), exits {tot['cloison_exits']:,}, "
+          f"Maglev {tot['maglev']:,}; geomean cloison/M {gm('cloison_code'):.2f}, hot/M {gm('cloison_hot'):.2f}, "
+          f"+exits/M {gm('cloison_code_exits'):.2f} over the {len(matched)} files both compiled.", ""]
 lines += ["**Per function** (final code, bytes; largest first)", ""]
 for b, ds in details.items():
-    lines += [f"<details><summary>{b}</summary>", "", "| function | toi | toi hot | exits | Maglev | toi/M |",
+    lines += [f"<details><summary>{b}</summary>", "", "| function | cloison | cloison hot | exits | Maglev | cloison/M |",
               "|---|---:|---:|---:|---:|---:|"]
     lines += [f"| {k} | {num(c)} | {num(h)} | {num(e)} | {num(m)} | {ratio(c, m)} |" for k, h, c, e, m in ds]
     lines += ["", "</details>", ""]
 out = f"perf-history/vs-maglev-{commit}"
 open(out + ".md", "w").write("\n".join(lines) + "\n")
 open(out + ".tsv", "w").write("\n".join(tsv) + "\n")
-# The terminal gets the summary table, by toi/Maglev, largest first.
-print(f"{'benchmark':40} {'toi':>8} {'toi hot':>8} {'exits':>8} {'Maglev':>8} {'toi/M':>6} {'hot/M':>6} {'same fns':>8}")
-for r in sorted(rows, key=lambda r: -(r["toi_code"] / r["maglev"]) if r["maglev"] else 0):
-    print(f"{r['bench'] + ('' if r['ok'] else ' !'):40} {r['toi_code']:8,} {r['toi_hot']:8,} {r['toi_exits']:8,} "
-          f"{r['maglev']:8,} {ratio(r['toi_code'], r['maglev']):>6} {ratio(r['toi_hot'], r['maglev']):>6} "
+# The terminal gets the summary table, by cloison/Maglev, largest first.
+print(f"{'benchmark':40} {'cloison':>8} {'cloison hot':>8} {'exits':>8} {'Maglev':>8} {'cloison/M':>6} {'hot/M':>6} {'same fns':>8}")
+for r in sorted(rows, key=lambda r: -(r["cloison_code"] / r["maglev"]) if r["maglev"] else 0):
+    print(f"{r['bench'] + ('' if r['ok'] else ' !'):40} {r['cloison_code']:8,} {r['cloison_hot']:8,} {r['cloison_exits']:8,} "
+          f"{r['maglev']:8,} {ratio(r['cloison_code'], r['maglev']):>6} {ratio(r['cloison_hot'], r['maglev']):>6} "
           f"{ratio(r['both_code'], r['both_maglev']):>8}")
 print(next(l for l in lines if l.startswith("Sum")))
 print(f"tables in {out}.md and .tsv")

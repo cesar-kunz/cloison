@@ -1,5 +1,5 @@
 // Two phases taking turns, each building fresh objects for shared functions: ints through two classes, then doubles through three.
-// toi: the shared functions' feedback changes at every phase; their compiled code shouldn't be rebuilt every time.
+// cloison: the shared functions' feedback changes at every phase; their compiled code shouldn't be rebuilt every time.
 // features: loop, double, call, object, new, proto, array
 // expect: 3479175
 function Cell(v) { this.value = v; }

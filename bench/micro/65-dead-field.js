@@ -1,5 +1,5 @@
 // A field written in the constructor and never read; its value is a fresh string.
-// toi: for internal objects the field and the concatenation can be dropped.
+// cloison: for internal objects the field and the concatenation can be dropped.
 // features: loop, object, new, string
 // expect: 153434128
 function V(name, value) { this.value = value; this.name = name; }

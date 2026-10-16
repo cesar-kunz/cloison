@@ -1,6 +1,6 @@
 # Object model
 
-Design for JS objects in toi. Goals, in order:
+Design for JS objects in cloison. Goals, in order:
 
 1. **DeltaBlue-class code runs fast**: class hierarchies, prototype methods,
    polymorphic calls, object graphs held in collections.

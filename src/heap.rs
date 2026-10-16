@@ -60,7 +60,7 @@ pub const LARGE: usize = 8 << 10;
 /// [`BASES`] it ends below 128 TiB, and its side tables stay between
 /// [`SIDE`] and the first base.
 const SPACE: usize = 16 << 40;
-/// Address space one heap may use (`TOI_HEAP_LIMIT`, in MiB, lowers it).
+/// Address space one heap may use (`CLOISON_HEAP_LIMIT`, in MiB, lowers it).
 const SLICE: usize = 32 << 30;
 /// Memory is committed this much at a time (its metadata and cards are
 /// then whole pages).
@@ -99,7 +99,7 @@ const RECYCLE: usize = 4 << 10;
 /// Holes smaller than this are left unused until the next collection.
 pub(crate) fn min_hole() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("TOI_GC_MIN_HOLE").ok().and_then(|s| s.parse().ok()).unwrap_or(256))
+    *N.get_or_init(|| std::env::var("CLOISON_GC_MIN_HOLE").ok().and_then(|s| s.parse().ok()).unwrap_or(256))
 }
 
 /// What a block holds.
@@ -306,7 +306,7 @@ pub struct Heap {
     /// The color the latest collection marked with (`COLOR`).
     pub(crate) color: u8,
     /// Since the last collection: holes taken, holes too small for the
-    /// cell asked for, granules looked at to find them (`TOI_GC_STATS`).
+    /// cell asked for, granules looked at to find them (`CLOISON_GC_STATS`).
     pub(crate) holes: [usize; 3],
     pub(crate) gc: crate::gc::Gc,
 }
@@ -328,7 +328,7 @@ impl Drop for Heap {
 
 impl Heap {
     pub fn new() -> Heap {
-        let limit = std::env::var("TOI_HEAP_LIMIT")
+        let limit = std::env::var("CLOISON_HEAP_LIMIT")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map_or(SLICE, |mb| (mb << 20).clamp(CHUNK, SLICE));
@@ -790,7 +790,7 @@ impl Heap {
         let end = (b + n) * BLOCK;
         assert!(
             end <= self.limit,
-            "out of memory: the heap is limited to {} MiB (TOI_HEAP_LIMIT)",
+            "out of memory: the heap is limited to {} MiB (CLOISON_HEAP_LIMIT)",
             self.limit >> 20
         );
         if end > self.committed {
@@ -879,12 +879,12 @@ impl Heap {
     /// Walk every cell, checking that each says how big it is and that
     /// the metadata agrees: a first granule `YOUNG` or colored, an old
     /// cell's last granule `END`, nothing else (for tests). With
-    /// `TOI_HEAP_HIST` set, print the cells by kind and size.
+    /// `CLOISON_HEAP_HIST` set, print the cells by kind and size.
     pub fn verify(&mut self) -> usize {
         self.end_region();
         let mut cells = 0;
         let mut hist: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
-        let hist_on = std::env::var_os("TOI_HEAP_HIST").is_some();
+        let hist_on = std::env::var_os("CLOISON_HEAP_HIST").is_some();
         // Small blocks by the share of them old cells fill, in tenths.
         let mut fill = [0usize; 11];
         let mut block = (0, 0);

@@ -59,7 +59,7 @@ EOF
   name=$2
   shift 2
   read -r a b <<<"$(pick "$@")"
-  extract() { awk -v n="<toi_stencil_$name>:" '$0 == n {p = 1; next} /^<toi_stencil_/ {p = 0} p' "$1/code.txt"; }
+  extract() { awk -v n="<cloison_stencil_$name>:" '$0 == n {p = 1; next} /^<cloison_stencil_/ {p = 0} p' "$1/code.txt"; }
   diff -u --label "$a" --label "$b" <(extract "$a") <(extract "$b") || true
   exit 0
   ;;
@@ -76,14 +76,14 @@ date=$(rustc -vV | sed -n 's/^commit-date: //p')
 out=$base/llvm-$llvm-nightly-$date/$arch
 mkdir -p "$out"
 cargo build --release --quiet --lib --target "$triple"
-obj=$(ls -t target/"$triple"/release/build/toi/*/out/stencils.o | head -1)
+obj=$(ls -t target/"$triple"/release/build/cloison/*/out/stencils.o | head -1)
 # One block per address (helpers included): `<name>:` (and `<alias>:` for
 # stencils LLVM merged into it, being identical), then its instructions,
 # without addresses, relocations folded onto their instruction. The
 # summary lists every stencil symbol, aliases with their target's counts.
 "${objdump[@]}" -dr --no-show-raw-insn "$obj" >"$out/.dis"
 # value, section, size, name of each stencil symbol.
-objdump -t "$obj" | awk '$NF ~ /^toi_stencil_/ && $3 == "F" { print $1, $4, $5, $NF }' >"$out/.syms"
+objdump -t "$obj" | awk '$NF ~ /^cloison_stencil_/ && $3 == "F" { print $1, $4, $5, $NF }' >"$out/.syms"
 python3 - "$out" <<'PY'
 import collections, re, sys
 out = sys.argv[1]
@@ -96,7 +96,7 @@ for line in open(f"{out}/.dis"):
     if m:
         section = m.group(1)
         continue
-    m = re.match(r"^([0-9a-f]+) <(toi_stencil_[^>]*)>:$", line)
+    m = re.match(r"^([0-9a-f]+) <(cloison_stencil_[^>]*)>:$", line)
     if m:
         cur = (section, m.group(2))
         blocks[cur] = []
@@ -112,7 +112,7 @@ for line in open(f"{out}/.dis"):
             blocks[cur].append("    ; " + re.sub(r"\s+", " ", ins.strip()))
         else:
             blocks[cur].append("  " + re.sub(r"\s+", " ", ins))
-# Each symbol is in a section of its own (`.text.toi_stencil_<name>`);
+# Each symbol is in a section of its own (`.text.cloison_stencil_<name>`);
 # a merged one is an alias at the same address of another's section.
 syms = [l.split() for l in open(f"{out}/.syms")]
 names = [n for _, _, _, n in syms]

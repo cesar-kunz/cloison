@@ -1,5 +1,5 @@
 // A local worklist passed to a helper that only pushes into it.
-// toi: stays flat only if the helper is inlined (or gets a field-passing variant).
+// cloison: stays flat only if the helper is inlined (or gets a field-passing variant).
 // features: loop, call, object, new, proto, array, null
 // expect: 9950000
 function Coll() { this.elms = new Array(); }

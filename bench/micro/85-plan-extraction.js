@@ -1,5 +1,5 @@
 // Kernel: extracting a plan: starting from the input steps, add each step whose inputs are known, mark its output, queue the steps that consume it; then run the plan.
-// toi: `inputsKnown`, `output` and `execute` see three classes; the worklist is the caller's collection (`todo = sources`).
+// cloison: `inputsKnown`, `output` and `execute` see three classes; the worklist is the caller's collection (`todo = sources`).
 // features: loop, call, object, new, proto, call-method, array, null
 // expect: 5501000
 function inherit(child, parent) {

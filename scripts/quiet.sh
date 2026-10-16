@@ -3,7 +3,7 @@
 # (`taskset`): the idlest core whose SMT sibling is idle too, so the run
 # neither migrates nor shares a core. Children inherit the pinning.
 #
-#   scripts/quiet.sh perf stat -e cycles:u target/release/toi bench/micro/44-array-scan-filter.js
+#   scripts/quiet.sh perf stat -e cycles:u target/release/cloison bench/micro/44-array-scan-filter.js
 #   QUIET_CPU=7 scripts/quiet.sh …   # pin to CPU 7
 #   scripts/quiet.sh --cpu           # print the CPU it would pick
 #   scripts/quiet.sh --core          # print that CPU and its siblings (`a,b`)

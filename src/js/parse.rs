@@ -77,6 +77,7 @@ fn parse_pass<'a, 'p>(
         with_count: 0,
         classes: 0,
         pending_generator: false,
+        pending_async: false,
         sub: false,
         pending_pattern: None,
         home_uses: 0,
@@ -114,6 +115,7 @@ fn parse_pass<'a, 'p>(
         class_kind: 0,
         has_eval: false,
         generator: false,
+        is_async: false,
         uses_new_target: false,
         hidden: Vec::new(),
         text: None,
@@ -206,6 +208,8 @@ struct Parser<'t, 'a, 'p> {
     classes: usize,
     /// The method about to be parsed is a generator (`*m() {}`).
     pending_generator: bool,
+    /// The function about to be parsed is async.
+    pending_async: bool,
     /// The statement about to be parsed is another's body.
     sub: bool,
     /// A `for` head's declaration's pattern (see `pattern_declarator`).
@@ -449,6 +453,16 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Tok::Keyword("function") => {
                 self.advance();
+                let f = self.function(true, false, pos)?;
+                if !self.frames.last().unwrap().body {
+                    self.block_function(f);
+                }
+                StmtKind::Function(f)
+            }
+            Tok::Ident(n) if self.async_function_ahead(&n) => {
+                self.advance();
+                self.advance();
+                self.pending_async = true;
                 let f = self.function(true, false, pos)?;
                 if !self.frames.last().unwrap().body {
                     self.block_function(f);
@@ -1070,6 +1084,7 @@ impl<'a> Parser<'_, 'a, '_> {
     /// right before one.
     fn function(&mut self, declaration: bool, paren: bool, pos: Pos) -> R<usize> {
         let generator = self.eat("*") || std::mem::take(&mut self.pending_generator);
+        let is_async = std::mem::take(&mut self.pending_async);
         let name = match self.peek() {
             Tok::Ident(_) => Some(self.ident()?),
             _ if declaration => return self.err("expected the function's name"),
@@ -1103,6 +1118,7 @@ impl<'a> Parser<'_, 'a, '_> {
             class_kind: 0,
             has_eval: false,
             generator: false,
+            is_async: false,
             uses_new_target: false,
             hidden: Vec::new(),
         text: None,
@@ -1113,6 +1129,7 @@ impl<'a> Parser<'_, 'a, '_> {
         self.functions[index].class_kind = class_kind;
         self.functions[index].uses_new_target = class_kind != 0;
         self.functions[index].generator = generator;
+        self.functions[index].is_async = is_async;
         let vars_key = self.i;
         self.expect("(")?;
         self.push_vars(vars_key);
@@ -1337,6 +1354,7 @@ impl<'a> Parser<'_, 'a, '_> {
             class_kind: 0,
             has_eval: false,
             generator: false,
+            is_async: std::mem::take(&mut self.pending_async),
             uses_new_target: false,
             hidden: Vec::new(),
         text: None,
@@ -1657,6 +1675,17 @@ impl<'a> Parser<'_, 'a, '_> {
 
     fn unary(&mut self) -> R<Expr<'a>> {
         let pos = self.pos();
+        if self.functions[self.current].is_async
+            && matches!(self.peek(), Tok::Ident(n) if &**n == "await")
+            && !self.toks[self.i].escaped
+        {
+            self.advance();
+            let e = self.unary()?;
+            return Ok(Expr {
+                kind: ExprKind::Await(expr(self.arena, e)),
+                pos,
+            });
+        }
         let op = match self.peek() {
             Tok::Punct("!") => UnOp::Not,
             Tok::Punct("-") => UnOp::Neg,
@@ -1839,6 +1868,25 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Ident(s) if self.is("=>") && !self.toks[self.i].newline_before => {
                 ExprKind::Function(self.arrow(Some(s), pos)?)
             }
+            Tok::Ident(s) if &*s == "async" && !self.toks[self.i - 1].escaped && !self.toks[self.i].newline_before && {
+                matches!(self.peek(), Tok::Keyword("function"))
+                    || matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == &Tok::Punct("=>")
+                    || self.is("(") && self.toks[self.i].arrow
+            } =>
+            {
+                if self.eat("function") {
+                    self.pending_async = true;
+                    let f = self.function(false, false, pos)?;
+                    ExprKind::Function(f)
+                } else if self.eat("(") {
+                    self.pending_async = true;
+                    ExprKind::Function(self.arrow(None, pos)?)
+                } else {
+                    let n = self.ident()?;
+                    self.pending_async = true;
+                    ExprKind::Function(self.arrow(Some(n), pos)?)
+                }
+            }
             Tok::Ident(s) => self.reference(s),
             Tok::Template(part) => {
                 let (parts, subs) = self.template_rest(part)?;
@@ -1919,6 +1967,25 @@ impl<'a> Parser<'_, 'a, '_> {
                         }
                         _ => None,
                     };
+                    if matches!(self.peek(), Tok::Ident(n) if &**n == "async")
+                        && !self.toks[self.i + 1].newline_before
+                        && !matches!(self.peek_at(1), Tok::Punct("(" | ":" | "," | "}" | "="))
+                    {
+                        // `async m() {…}`.
+                        self.advance();
+                        let generator = self.eat("*");
+                        let key = self.prop_key()?;
+                        let h = self.object_home(&mut home);
+                        self.pending_home = Some((Some(h), None, 0));
+                        self.pending_async = true;
+                        self.pending_generator = generator;
+                        let f = self.method(&key, None, ppos)?;
+                        props.push((key, Expr { kind: ExprKind::Function(f), pos: ppos }));
+                        if !self.is("}") {
+                            self.expect(",")?;
+                        }
+                        continue;
+                    }
                     if self.is("*") {
                         // `*m() {…}`: a generator method.
                         self.advance();
@@ -2148,6 +2215,14 @@ impl<'a> Parser<'_, 'a, '_> {
         }
     }
 
+    /// Whether `async`, the current token, starts a function declaration.
+    fn async_function_ahead(&self, n: &Name) -> bool {
+        &**n == "async"
+            && !self.toks[self.i].escaped
+            && self.peek_at(1) == &Tok::Keyword("function")
+            && !self.toks[self.i + 1].newline_before
+    }
+
     /// Whether `let`, the current token, starts a declaration.
     fn let_ahead(&self, n: &Name) -> bool {
         &**n == "let"
@@ -2271,6 +2346,12 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.advance();
             }
             let mpos = self.pos();
+            let is_async = matches!(self.peek(), Tok::Ident(n) if &**n == "async")
+                && !self.toks[self.i + 1].newline_before
+                && !matches!(self.peek_at(1), Tok::Punct("(" | "=" | ";" | "}"));
+            if is_async {
+                self.advance();
+            }
             let generator = self.eat("*");
             let kind = match self.peek() {
                 Tok::Ident(n) if matches!(&**n, "get" | "set") && !matches!(self.peek_at(1), Tok::Punct("(" | "=" | ";" | "}")) => {
@@ -2299,6 +2380,7 @@ impl<'a> Parser<'_, 'a, '_> {
             let h = if is_static { &home_static } else { &home };
             self.pending_home = Some((Some(h.clone()), None, 0));
             self.pending_generator = generator;
+            self.pending_async = is_async;
             let prefix = match kind {
                 1 => Some("get"),
                 2 => Some("set"),
@@ -2407,6 +2489,7 @@ impl<'a> Parser<'_, 'a, '_> {
             class_kind,
             has_eval: false,
             generator: false,
+            is_async: false,
             uses_new_target: true,
             hidden: Vec::new(),
         text: None,

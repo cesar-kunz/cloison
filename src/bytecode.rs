@@ -377,6 +377,10 @@ define_ops! {
     /// `r` = a sloppy function's `arguments`, its elements mapped to the
     /// parameters while the frame runs (see `Vm::mapped_args`).
     CreateMappedArguments(Reg),
+    /// An async function's start (its parameters set): as `InitialYield`,
+    /// then its coroutine run to its first `await`; the frame returns its
+    /// promise (see `generator::async_start`).
+    AsyncStart(Reg),
 }
 
 impl Op {

@@ -922,6 +922,25 @@ handlers! {
         }
     }
 
+    fn op_async_start(pc, acc, regs, tag) {
+        let f: *mut Object = header(regs, FUNC);
+        let r = with_top(regs, None, |vm| {
+            let g = crate::generator::create(vm, f)?;
+            *reg(pc, 1, regs) = g;
+            let code = frame_code(regs);
+            let at = pc.add(Op::AsyncStart.size()).offset_from((*code).bytecode.as_ptr()) as usize;
+            crate::generator::suspend(vm, g, regs, code, at, false);
+            crate::generator::async_start(vm, g)
+        });
+        match r {
+            Ok(p) => tail!(op_return, p),
+            Err(e) => {
+                (*frame_vm(regs)).error = Some(e);
+                tail!(op_unwind, Value::EMPTY)
+            }
+        }
+    }
+
     fn op_yield(pc, acc, regs, tag) {
         let g = *reg(pc, 1, regs);
         let code = frame_code(regs);
@@ -3157,6 +3176,7 @@ static TABLE: Table = {
     t[Op::CloseUpvalue as usize] = op_close_upvalue;
     t[Op::LdaNewTarget as usize] = op_lda_new_target;
     t[Op::InitialYield as usize] = op_initial_yield;
+    t[Op::AsyncStart as usize] = op_async_start;
     t[Op::CreateMappedArguments as usize] = op_create_mapped_arguments;
     t[Op::Yield as usize] = op_yield;
     t[Op::CreateRest as usize] = op_create_rest;

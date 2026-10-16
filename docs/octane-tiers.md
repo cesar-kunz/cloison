@@ -2,9 +2,9 @@
 
 Made by `scripts/octane-tiers.sh` (also written to the ignored `perf-history/octane-tiers-<commit>.{md,tsv}`).
 
-## 93e5b2d
+## 213fcdf
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 93e5b2d, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 32.70 17.94.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 213fcdf, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 32.70 17.94.
 
 | benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -28,12 +28,12 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 toi interp vs Ignition 0.74x (ahead on 9), Sparkplug 0.55x (ahead on 1), Maglev 0.09x (ahead on 0), Turbofan 0.08x (ahead on 0) (of 15; above 1x: toi scores higher)
 toi JIT vs Ignition 2.17x (ahead on 9), Sparkplug 1.62x (ahead on 8), Maglev 0.28x (ahead on 1), Turbofan 0.24x (ahead on 0) (of 15; above 1x: toi scores higher)
 
-## 6ecaeba: toi on the whole core too
+## 6ef4928: toi on the whole core too
 
 From here on toi gets the whole core, as Node does: its marker thread had
-competed with the program for one CPU (splay +40%). Same code as 93e5b2d.
+competed with the program for one CPU (splay +40%). Same code as 213fcdf.
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 6ecaeba, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 6.76 26.82.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 6ef4928, V8 14.6.202.34-node.28 capped at each tier. Load average at the start and end: 6.76 26.82.
 
 | benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -59,7 +59,7 @@ toi JIT vs Ignition 2.81x (ahead on 11), Sparkplug 1.81x (ahead on 9), Maglev 0.
 
 ## Steps 0–5 of the plan
 
-Measured on the `-run.js` files against 6ecaeba (`perf stat`, medians of
+Measured on the `-run.js` files against 6ef4928 (`perf stat`, medians of
 3 interleaved runs), cycles: pdfjs −23% (instructions −26%, page faults
 −42%), earley-boyer −15%, zlib −6%, gbemu −4% (page faults −45%), box2d
 −3%; DeltaBlue's instructions unchanged. The binary is 25 KB smaller;
@@ -91,14 +91,14 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 toi interp vs Ignition 0.83x (ahead on 12), Sparkplug 0.61x (ahead on 4), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
 toi JIT vs Ignition 2.32x (ahead on 11), Sparkplug 1.72x (ahead on 10), Maglev 0.30x (ahead on 1), Turbofan 0.25x (ahead on 0) (of 15; above 1x: toi scores higher)
 
-## 4535791: after steps 0–12
+## 668042a: after steps 0–12
 
-V8's columns are reused from the 6ecaeba+ run (V8 doesn't change with
-toi). The toi JIT's geomean went from 15621 (6ecaeba) to 18119: +16%.
+V8's columns are reused from the 6ef4928+ run (V8 doesn't change with
+toi). The toi JIT's geomean went from 15621 (6ef4928) to 18119: +16%.
 By benchmark: raytrace +101%, earley-boyer +68%, pdfjs +49%, splay
 +41%, typescript +10%, zlib +7%; DeltaBlue level.
 
-Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 4535791, V8 14.6.202.34-node.28 capped at each tier (V8's columns from perf-history/octane-tiers-6ecaeba+.tsv). Load average at the start and end: 2.36 5.05.
+Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of their own): toi 668042a, V8 14.6.202.34-node.28 capped at each tier (V8's columns from perf-history/octane-tiers-6ef4928+.tsv). Load average at the start and end: 2.36 5.05.
 
 | benchmark | toi interp | toi JIT | Ignition | Sparkplug | Maglev | Turbofan |
 |---|---:|---:|---:|---:|---:|---:|
@@ -122,7 +122,7 @@ Octane scores (higher is better; medians of 3 runs, 8 at a time on cores of thei
 toi interp vs Ignition 0.85x (ahead on 12), Sparkplug 0.63x (ahead on 5), Maglev 0.11x (ahead on 0), Turbofan 0.09x (ahead on 0) (of 15; above 1x: toi scores higher)
 toi JIT vs Ignition 2.57x (ahead on 12), Sparkplug 1.91x (ahead on 10), Maglev 0.33x (ahead on 1), Turbofan 0.28x (ahead on 0) (of 15; above 1x: toi scores higher)
 
-## Where the JIT gains little: findings and plan (at 93e5b2d)
+## Where the JIT gains little: findings and plan (at 213fcdf)
 
 The JIT gains little over toi's interpreter on raytrace (1.8x), earley-boyer
 (1.8x), box2d (2.1x), splay (1.1x), pdfjs (1.05x) and typescript (0.9x).
@@ -245,7 +245,7 @@ on splay: while a sweep is pending, a dead old cell it hadn't reached
 held a stale pointer into memory already reused by young cells. The
 checker now skips cells of the old color while sweeping.
 
-Step 6, measured with `perf stat` instructions against 5bf2b40: box2d
+Step 6, measured with `perf stat` instructions against 04becf3: box2d
 −2.6%, pdfjs −4.2%, typescript unchanged. That is far below the estimate.
 Functions that had been refused now run compiled, and that exposed three
 other problems:
@@ -276,7 +276,7 @@ its `n` elements (in compiled code `create_array_n`, the elements' cell
 from the same bump allocation), followed by a `PushLiteral` per element.
 The JIT lowers each `PushLiteral` to the `array_push` stencils, which
 join the elements' type through their push cache. Measured with
-`perf stat` against ada17a1:
+`perf stat` against 571717c:
 
 - splay −35.5% cycles, −37.5% instructions, peak RSS 778 → 650 MB;
 - pdfjs −2.5% instructions;
@@ -296,7 +296,7 @@ address is reused.
 
 The stencil reads the function's `prototype` inline when the function has
 the plain function shape. On a miss, the runtime answers and fills the
-cache. Measured with `perf stat` against 1ef392c: earley-boyer −9.2%
+cache. Measured with `perf stat` against 19f666f: earley-boyer −9.2%
 cycles (−12.7% instructions; a one-entry cache gave −6.8%), every other
 benchmark unchanged.
 
@@ -309,7 +309,7 @@ calls went through `toi_rt_call` → `vm_run` → `fitting_version`.
 They aren't tail calls: the call is in a loop and its result is tested.
 Now such a call gets a site of its own, claimed pending as for mutual
 recursion. Its first call binds a version for its types, whose own
-self calls fit it. Measured with `perf stat` against 66389ea:
+self calls fit it. Measured with `perf stat` against bfa73bc:
 earley-boyer −18% cycles (−18.8% instructions), the others unchanged.
 
 Left in earley-boyer:
@@ -319,7 +319,7 @@ Left in earley-boyer:
 - `sc_list`, which reads `arguments`: entered through `vm_run` 13M times.
 
 Calls from compiled code into functions running in the interpreter (at
-220b28e). Measured, not guessed:
+232d4ae). Measured, not guessed:
 
 - **A call through the runtime into compiled code is cheap,** about 250
   cycles. Earley-Boyer's 2.3M runtime calls to closures of an already
@@ -362,7 +362,7 @@ code is the same; the churn was elsewhere:
   be given up. Past half a function's compilations, a site whose cache
   is full and still misses is given up at its first exit.
 
-Measured with `perf stat` against a0626ba:
+Measured with `perf stat` against 4d55b75:
 
 - typescript −5.2% cycles (−2.9% instructions);
 - `preAssignScopes` and `emitParensAndCommentsInPlace` now run compiled,
@@ -395,7 +395,7 @@ the interpreter. Now `new C(…)` inlines it:
 - *Not the inlining budget:* past it, a `new` went through the runtime,
   in `renderScene` for one, with both functions interpreted.
 
-Measured with `perf stat` against 0c84419:
+Measured with `perf stat` against 96c93fc:
 
 - raytrace −48.3% cycles (−56.9% instructions), 1.9×;
 - the others unchanged;

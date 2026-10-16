@@ -109,7 +109,7 @@ heap sandboxing and defers it.
 
 ## Standards support
 
-test262 at f88e52a, every test under `built-ins`, `language` and
+test262 at 19957f8, every test under `built-ins`, `language` and
 `annexB` (not `intl402` or `staging`), run as its `INTERPRETING.md`
 says: in both strict and sloppy mode unless flagged, negative tests in
 their phase, async tests to completion; module tests fail, as toi has no
@@ -142,7 +142,7 @@ and early errors for invalid syntax that the parser accepts.
 
 ## Results
 
-Octane scores at 242aafd on an Apple silicon Mac, toi's JIT against V8 14.6
+Octane scores at c842d29 on an Apple silicon Mac, toi's JIT against V8 14.6
 capped at Sparkplug, at Maglev, and with all tiers (higher is better;
 from `perf-history/octane-engines.sh`):
 
@@ -169,7 +169,7 @@ V8 runs zlib (asm.js) through its wasm pipeline, and compiles the
 functions of CodeLoad's `eval`s when they are first called; toi compiles
 every function of every `eval` up front.
 
-Against other engines and V8's tiers, on an Apple silicon Mac at 242aafd
+Against other engines and V8's tiers, on an Apple silicon Mac at c842d29
 (higher is better; single runs from `perf-history/octane-engines.sh`,
 toi's JIT against V8 14.6 capped at each tier and with all of them, the
 macOS 27 JavaScriptCore, SpiderMonkey 140 and QuickJS 2026-06-04):

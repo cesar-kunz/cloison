@@ -77,6 +77,9 @@ pub struct Token {
     pub newline_before: bool,
     /// An identifier written with escapes (never a contextual keyword).
     pub escaped: bool,
+    /// A `(` whose `)` is followed by `=>` on its line: an arrow
+    /// function's parameters.
+    pub arrow: bool,
 }
 
 /// The reserved words.
@@ -162,6 +165,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     let mut braces: Vec<u8> = Vec::new();
     let mut closed_expression = false;
     let mut escaped = false;
+    let mut lexical = false;
     // The tokens of the `(`s open, and of the last one closed.
     let mut parens: Vec<usize> = Vec::new();
     let mut closed_paren = usize::MAX;
@@ -261,6 +265,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     } else {
                         None
                     };
+                    lexical |= n == 3 && word == "let" || matches!(keyword, Some("const" | "class"));
                     match keyword {
                         Some(k) => Tok::Keyword(k),
                         None => Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone()),
@@ -313,6 +318,12 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     parens.push(toks.len());
                 } else if p == ")" {
                     closed_paren = parens.pop().unwrap_or(usize::MAX);
+                } else if p == "=>"
+                    && !newline
+                    && toks.last().is_some_and(|t: &Token| t.tok == Tok::Punct(")"))
+                    && closed_paren != usize::MAX
+                {
+                    toks[closed_paren].arrow = true;
                 }
                 Tok::Punct(p)
             } else {
@@ -324,13 +335,16 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             pos: start as u32,
             newline_before: std::mem::take(&mut newline),
             escaped: std::mem::take(&mut escaped),
+            arrow: false,
         });
     }
     toks.push(Token {
         tok: Tok::Eof,
         pos: src.len() as u32,
         newline_before: true,
-        escaped: false,
+        // (On the end: whether `let`, `const` or `class` appear.)
+        escaped: lexical,
+        arrow: false,
     });
     Ok(toks)
 }
@@ -537,6 +551,12 @@ fn number(s: &str) -> Option<(f64, usize)> {
 fn string(s: &str) -> Option<(String, usize)> {
     let b = s.as_bytes();
     let quote = b[0];
+    // Mostly no escapes: the text as is.
+    if let Some(k) = b[1..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r') {
+        if b[1 + k] == quote {
+            return Some((s[1..1 + k].to_string(), k + 2));
+        }
+    }
     let mut out: Vec<u16> = Vec::new();
     let mut i = 1;
     while i < b.len() {

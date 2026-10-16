@@ -1398,6 +1398,9 @@ impl<'a> Gen<'a> {
     /// Whether `name` is looked up in `with` objects first: some enclose
     /// the code, and not its block-scoped binding's declaration.
     fn in_with(&self, name: &str) -> bool {
+        if self.withs.is_empty() {
+            return false;
+        }
         let skip = self.p.lexicals.get(name).map_or(0, |l| l.withs);
         self.withs.len() > skip
     }
@@ -1980,7 +1983,7 @@ impl<'a> Gen<'a> {
         if self.in_with(name) {
             return self.with_store(name, pos);
         }
-        if let Some(l) = self.p.lexicals.get(name) {
+        if !self.p.lexicals.is_empty() && let Some(l) = self.p.lexicals.get(name) {
             if l.constant {
                 if self.needs_check(name, pos) {
                     self.load_var(name, pos)?;
@@ -2143,6 +2146,9 @@ impl<'a> Gen<'a> {
     /// from a function that may run before it (a declaration, or one made
     /// before it), or in a `switch` (which may jump past it).
     fn needs_check(&self, name: &str, pos: Pos) -> bool {
+        if self.p.lexicals.is_empty() {
+            return false;
+        }
         let Some(l) = self.p.lexicals.get(name) else {
             return false;
         };

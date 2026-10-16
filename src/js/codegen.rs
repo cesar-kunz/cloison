@@ -460,7 +460,7 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             expr_refs(k, out);
             expr_refs(this, out);
         }
-        Object(ps) => ps.iter().for_each(|(k, e)| {
+        Object(ps, _) => ps.iter().for_each(|(k, e)| {
             if let PropKey::Computed(k) = k {
                 expr_refs(k, out);
             }
@@ -754,7 +754,7 @@ fn assigns(e: &Expr, name: &str) -> bool {
                 || c.members.iter().any(|m| matches!(&m.key, PropKey::Computed(k) if assigns(k, name)))
         }
         SuperMember(_, k, t) => assigns(k, name) || assigns(t, name),
-        Object(ps) => ps
+        Object(ps, _) => ps
             .iter()
             .any(|(k, e)| matches!(k, PropKey::Computed(k) if assigns(k, name)) || assigns(e, name)),
         Member(o, _) | Spread(o) => assigns(o, name),
@@ -2344,7 +2344,7 @@ impl<'a> Gen<'a> {
             }
             // A plain object with room for the properties, then each one
             // stored in order (a later duplicate wins).
-            Object(props) => {
+            Object(props, home) => {
                 // (`__proto__: v` sets the prototype: the store reaches
                 // `Object.prototype`'s accessor.)
                 // An index key is an element (`o[1]` reads it), stored as
@@ -2361,6 +2361,17 @@ impl<'a> Gen<'a> {
                 let cap = named.min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
                 let ic = self.auto_ic(&format!("[]{}", cap));
                 self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
+                if let Some(h) = home {
+                    // (Its methods' `super`: see `Gen::class`.)
+                    let mark = self.temp;
+                    let o = self.alloc(e.pos)?;
+                    self.star(o);
+                    self.fresh_binding(h, false, e.pos)?;
+                    self.ldar(o);
+                    self.init_var(h, e.pos)?;
+                    self.ldar(o);
+                    self.temp = mark;
+                }
                 if !props.is_empty() {
                     let mark = self.temp;
                     let o = self.alloc(e.pos)?;

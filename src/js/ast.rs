@@ -230,7 +230,9 @@ pub enum ExprKind<'a> {
     This,
     /// Its elements: `Hole` for an elision, `Spread` for `...e`.
     Array(Vec<Expr<'a>>),
-    Object(Vec<(PropKey<'a>, Expr<'a>)>),
+    /// Its properties, and the variable holding it if its methods' `super`
+    /// refers to it (their home object).
+    Object(Vec<(PropKey<'a>, Expr<'a>)>, Option<Name>),
     /// An array literal's elision (`[, 1]`).
     Hole,
     /// `...e`, in an array literal or arguments.

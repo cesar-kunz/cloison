@@ -658,6 +658,8 @@ pub struct Vm {
     /// The scope objects of the direct `eval`s running (see
     /// `intrinsics::direct_eval`), innermost last.
     pub(crate) eval_envs: Vec<[Value; 2]>,
+    /// `%ThrowTypeError%`.
+    pub(crate) thrower: *mut Object,
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
@@ -820,6 +822,7 @@ impl Vm {
             a_sym_has_instance: Atom(0),
             new_target: Value::EMPTY,
             eval_envs: Vec::new(),
+            thrower: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
@@ -3299,6 +3302,11 @@ impl Vm {
         p
     }
 
+    /// `%ThrowTypeError%`, as a value.
+    pub(crate) fn throw_type_error_fn(&self) -> Value {
+        object_value(self.thrower)
+    }
+
     /// A script's global declarations: a block-scoped name may not be
     /// another script's (any kind), nor a `var` an earlier script's
     /// block-scoped one (a SyntaxError, before it runs).
@@ -3548,6 +3556,7 @@ impl Vm {
         .chain(self.template_cache.values().copied())
         .chain(self.symbols.values().copied())
         .chain(self.symbol_roots.iter().copied())
+        .chain(std::iter::once(self.thrower))
         .chain(self.error_prototypes.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)

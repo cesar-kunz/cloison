@@ -1,6 +1,6 @@
 # toi
 
-A JavaScript engine in Rust: an ES5 front end, a register bytecode
+A JavaScript engine in Rust: a front end for ES5 and much of ES2015, a register bytecode
 interpreter, and a copy-and-patch JIT for x86-64 and arm64 (Linux, and macOS on Apple silicon) that
 grows into a mid-tier optimizing compiler without an IR beyond bytecode.
 
@@ -13,7 +13,8 @@ target/release/toi --dump file.js                         # the bytecode instead
 Status (2026-10-14): every Octane benchmark runs, with a generational
 garbage collector that marks and sweeps its old generation concurrently
 and frees compiled code that is no longer reachable. The language is
-most of ES2017 short of modules, `Proxy` and BigInt. See
+ES5 and much of ES2015, with parts of later editions (see
+[Standards support](#standards-support)). See
 [Where it falls short](#where-it-falls-short).
 
 ## How it works
@@ -73,6 +74,71 @@ concurrent marking of the old generation) and tracks its implementation,
 `docs/object-model.md` the object model and its escape analysis,
 `docs/direct-calls.md` the call convention, and `docs/sandbox.md` surveys
 heap sandboxing and defers it.
+
+## Design choices
+
+- **Bytecode is the only IR.** The JIT compiles straight from the
+  interpreter's bytecode, with types inferred over it; there is no SSA or
+  sea-of-nodes graph to build, keep consistent or debug.
+- **LLVM writes the machine code, ahead of time.** Copy-and-patch
+  stencils are Rust compiled by LLVM at build time, so the JIT gets an
+  optimizing backend's instruction selection without carrying one.
+- **The interpreter is a tier worth having.** Tail-calling handlers with
+  state in registers and an int32 handler table keep it near V8's
+  Ignition, so code the JIT skips still runs well.
+- **Speculate cheaply, exit freely.** Compiled code assumes the types
+  and shapes it saw and side-exits to the interpreter when wrong, into
+  the VM frames it keeps up to date (an inlined call's frame and a
+  scalar-replaced object are materialized at the exit); tier-up is by
+  on-stack replacement at loop back edges.
+- **Features land in the interpreter first.** A function using an
+  instruction the JIT doesn't know runs interpreted, so new language
+  features (classes, destructuring, generators, async functions) cost
+  the JIT nothing and can't slow hot ES5 code.
+- **A simple, non-moving collector.** Conservative native roots let
+  runtime Rust hold raw pointers without handles everywhere; a nursery,
+  card marking and concurrent old-generation marking are built on top.
+- **Bit-for-bit V8 numerics.** fdlibm `Math` and shortest round-trip
+  number printing make results match Node exactly, which makes
+  differential testing against Node possible.
+- **Measured, not assumed.** Every change is checked against Octane and
+  the microbenchmarks; code size is tracked per commit, and
+  `docs/future-work.md` records what each step measured and what failed.
+- **Small and self-contained.** One Rust crate whose only dependency is
+  `libc`; a 3 MB binary that starts in 0.29 ms.
+
+## Standards support
+
+test262 at f88e52a, every test under `built-ins`, `language` and
+`annexB` (not `intl402` or `staging`), run as its `INTERPRETING.md`
+says: in both strict and sloppy mode unless flagged, negative tests in
+their phase, async tests to completion; module tests fail, as toi has no
+modules. A test counts toward the latest edition of its features; an
+untagged test counts as ES5 (`scripts/test262-editions.py`):
+
+| edition | passed | tests | ratio |
+|---|---:|---:|---:|
+| ES5 (untagged) | 16,101 | 17,067 | 94.3% |
+| ES2015 | 5,604 | 9,197 | 60.9% |
+| ES2016 | 40 | 100 | 40.0% |
+| ES2017 | 216 | 741 | 29.1% |
+| ES2018 | 332 | 4,825 | 6.9% |
+| ES2019 | 116 | 161 | 72.0% |
+| ES2020 | 324 | 2,020 | 16.0% |
+| ES2021 | 252 | 630 | 40.0% |
+| ES2022 | 891 | 5,374 | 16.6% |
+| ES2023 | 35 | 284 | 12.3% |
+| ES2024 | 22 | 843 | 2.6% |
+| ES2025 | 137 | 998 | 13.7% |
+| ES2026 | 97 | 745 | 13.0% |
+| Stage 3 proposals | 246 | 5,650 | 4.4% |
+| **all** | **24,413** | **48,635** | **50.2%** |
+
+The gaps are mostly whole features: modules, `Proxy`, BigInt, async
+iteration (most of ES2018's tests are async generators and `for await`),
+class fields and private names (ES2022), RegExp Unicode properties,
+lookbehind and named groups, typed array and `ArrayBuffer` extensions,
+and early errors for invalid syntax that the parser accepts.
 
 ## Results
 
@@ -223,8 +289,8 @@ targets.
   async functions and `Reflect` are in; modules, `Proxy`, BigInt, async
   generators, non-ASCII identifiers (no Unicode ID tables), array
   indices past 2^28 and Unicode case folding in regexps are not.
-  test262's tests that need no feature flag (14,943 of them) pass at
-  98.9%; Octane and about 100 programs are also checked against Node.
+  See [Standards support](#standards-support) for test262 by edition;
+  Octane and about 100 programs are also checked against Node.
 - **Nightly only**, and Linux is the reference; macOS runs on Apple silicon only.
 - **Safety.** Around 560 `unsafe` sites, a raw-pointer object model, no
   fuzzing; a heap sandbox is deferred by design.

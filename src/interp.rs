@@ -2941,7 +2941,15 @@ fn to_primitive_hint(v: Value, string: bool) -> Value {
             [vm.a_value_of, vm.a_to_string]
         };
         for name in order {
-            let Ok(m) = vm.get(v, name) else { continue };
+            let m = match vm.get(v, name) {
+                Ok(m) => m,
+                // (A getter's error is the conversion's.)
+                Err(e) => {
+                    vm.conv_error.get_or_insert(e);
+                    vm.conv_thrown = true;
+                    return Value::UNDEFINED;
+                }
+            };
             if !m.is_cell() {
                 continue;
             }

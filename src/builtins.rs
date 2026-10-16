@@ -1349,7 +1349,7 @@ fn math_hypot(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     for i in 0..a.len() {
         xs.push(math_arg(a, i));
         // (No more conversions after one throws.)
-        if vm.conv_thrown {
+        if vm.conv_failed() {
             return Err(vm.take_conv_error());
         }
     }
@@ -2245,7 +2245,7 @@ fn regexp_match_into(
         None => vm.get(this, a_last)?,
     };
     let li = if li.is_int32() { li.as_i32_unchecked() as f64 } else { to_number(li) };
-    if vm.conv_thrown {
+    if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
     let start = if re.global || re.sticky {

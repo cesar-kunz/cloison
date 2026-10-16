@@ -3388,6 +3388,13 @@ impl Vm {
         std::mem::replace(&mut self.constructing, false)
     }
 
+    /// Whether a conversion threw (`conv_thrown`), read from memory: the
+    /// conversions set it through the current VM's pointer, not this
+    /// reference, so a plain read may be one from before them.
+    pub(crate) fn conv_failed(&self) -> bool {
+        unsafe { std::ptr::read_volatile(&raw const self.conv_thrown) }
+    }
+
     /// What a conversion threw (see `conv_error`), taken.
     #[cold]
     #[inline(never)]
@@ -4045,11 +4052,15 @@ fn math_pow(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 /// `Math.min`/`max` of all the arguments (NaN if any is; no arguments:
 /// `Infinity`/`-Infinity`).
-fn math_min(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn math_min(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut r = f64::INFINITY;
     let mut nan = false;
     for i in 0..a.len() {
         let x = num_arg(a, i);
+        // (Not past one that throws.)
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
         if x.is_nan() {
             // (The rest still converted, for their `valueOf`s' effects.)
             nan = true;
@@ -4060,11 +4071,15 @@ fn math_min(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     Ok(Value::number(if nan { f64::NAN } else { r }))
 }
-fn math_max(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn math_max(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut r = f64::NEG_INFINITY;
     let mut nan = false;
     for i in 0..a.len() {
         let x = num_arg(a, i);
+        // (Not past one that throws.)
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
         if x.is_nan() {
             // (The rest still converted, for their `valueOf`s' effects.)
             nan = true;

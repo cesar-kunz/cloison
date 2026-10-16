@@ -12,8 +12,8 @@ target/release/toi --dump file.js                         # the bytecode instead
 
 Status (2026-10-14): every Octane benchmark runs, with a generational
 garbage collector that marks and sweeps its old generation concurrently
-and frees compiled code that is no longer reachable. The language is ES5
-in sloppy mode. See
+and frees compiled code that is no longer reachable. The language is
+most of ES2017 short of modules, `Proxy` and BigInt. See
 [Where it falls short](#where-it-falls-short).
 
 ## How it works
@@ -218,9 +218,13 @@ targets.
   generation), Splay spends 12% of its time collecting, and it never
   moves a cell, so randomly dying cells fragment its blocks (Splay peaks
   at 657 MB for 120 MB live).
-- **ES5 sloppy mode only.** No `let`, `const`, classes, arrow functions,
-  template literals, strict mode or array holes. Correctness is checked
-  against Node on about 100 programs and Octane, not against test262.
+- **Language gaps.** Strict mode, `let`/`const`, classes, arrows,
+  templates, destructuring, spread, symbols, iterators, generators,
+  async functions and `Reflect` are in; modules, `Proxy`, BigInt, async
+  generators, non-ASCII identifiers (no Unicode ID tables), array
+  indices past 2^28 and Unicode case folding in regexps are not.
+  test262's tests that need no feature flag (14,943 of them) pass at
+  98.9%; Octane and about 100 programs are also checked against Node.
 - **Nightly only**, and Linux is the reference; macOS runs on Apple silicon only.
 - **Safety.** Around 560 `unsafe` sites, a raw-pointer object model, no
   fuzzing; a heap sandbox is deferred by design.

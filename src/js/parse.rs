@@ -1215,6 +1215,12 @@ impl<'a> Parser<'_, 'a, '_> {
             self.functions[index].strict = true;
         }
         if self.functions[index].strict {
+            // (Its own name too, though written before it was known strict.)
+            if let Some(n) = self.functions[index].name.as_deref()
+                && matches!(n, "eval" | "arguments")
+            {
+                return self.err(format!("`{n}` as a function name in strict mode"));
+            }
             for (k, p) in params.iter().enumerate() {
                 if params[..k].contains(p) {
                     return self.err(format!("duplicate parameter `{p}` in strict mode"));

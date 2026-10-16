@@ -503,7 +503,7 @@ extern "C" fn toi_rt_delete_global(_: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = String::from_utf16_lossy(crate::vm::string_units(b).unwrap_or(&[]));
     let a = vm.intern(&name);
-    Value::from_bool(vm.delete_named(vm.global, a)).to_bits()
+    Value::from_bool(vm.delete_global(a)).to_bits()
 }
 
 /// `typeof a`: a string constant (`type_of` stencils).
@@ -15517,9 +15517,10 @@ extern "C" fn toi_rt_construct(regs: Value, site: Value) -> Value {
         }
         *(regs.to_bits() as *mut Value).add((*s).frame) = this;
         let v = toi_rt_enter(regs, site);
-        if v.to_bits() == 0 || v.is_cell() {
+        if v.to_bits() == 0 || crate::props::is_object(v) {
             // An error, or an object: the constructor's, or (through the
-            // runtime, the native stack being low) `new`'s already.
+            // runtime, the native stack being low) `new`'s already. (Not a
+            // string: a primitive, though a cell.)
             v
         } else {
             crate::vm::Vm::construct_done(&*(*s).callee, o);

@@ -2331,6 +2331,17 @@ impl Vm {
     /// or relied on its shape is dropped: every field of its old shape is
     /// made mutable (they no longer describe `o`'s), and its shape left
     /// stable.
+    /// `delete name` of a global: false for a script's `var` or function
+    /// not assigned yet too (it exists, not deletable: see
+    /// `Module::declared`).
+    pub(crate) fn delete_global(&mut self, name: Atom) -> bool {
+        let g = self.global;
+        if unsafe { (*(*g).shape).lookup(name).is_none() } && self.script_declared.contains(&name) {
+            return false;
+        }
+        self.delete_named(g, name)
+    }
+
     pub(crate) fn delete_named(&mut self, o: *mut Object, name: Atom) -> bool {
         self.remove_named(o, name, false)
     }

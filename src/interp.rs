@@ -827,7 +827,7 @@ handlers! {
         let vm = &mut *frame_vm(regs);
         let name = String::from_utf16_lossy(string_units(acc).unwrap_or(&[]));
         let a = vm.intern(&name);
-        let r = vm.delete_named(vm.global, a);
+        let r = vm.delete_global(a);
         next!(any, Op::DeleteGlobal.size(), Value::from_bool(r))
     }
 
@@ -3850,7 +3850,8 @@ fn throw(vm: *mut Vm, e: Error) -> Value {
 /// else `this`, whose shape feeds the constructor's slack tracking.
 #[inline(never)]
 fn construct_result(regs: *mut Value, acc: Value) -> Value {
-    if acc.is_cell() {
+    // (An object; a string or a symbol is a cell too, but a primitive.)
+    if crate::props::is_object(acc) {
         return acc;
     }
     unsafe {

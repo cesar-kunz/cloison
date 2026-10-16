@@ -349,6 +349,11 @@ define_ops! {
     /// The whole code of a function not compiled yet (`asm::LazyFn`):
     /// compile it, and run it in this frame. Never compiled by the JIT.
     CompileLazy(),
+    /// `acc = INTRINSICS[k](r[f..f + n])` (see `crate::intrinsics`).
+    Intrinsic(Count, Reg, Count),
+    /// `acc` = an array of the frame's arguments from the `k`th on (a
+    /// rest parameter's).
+    CreateRest(Count),
 }
 
 impl Op {

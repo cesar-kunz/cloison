@@ -174,7 +174,7 @@ impl Vm {
 
     /// The number of parameters of function `f`, its `length`.
     fn function_length(f: *mut Object) -> Value {
-        unsafe { Value::from_i32((*(*f).code).nparams as i32) }
+        unsafe { Value::from_i32((*(*f).code).length as i32) }
     }
 
     /// Function `f`'s `name`: its code's, empty for an anonymous one.

@@ -334,6 +334,12 @@ pub struct Code {
     pub col: u32,
     pub bytecode: Vec<u8>,
     pub nparams: u32,
+    /// Its `length` property.
+    pub length: u32,
+    /// 0: an ordinary function; 1: an arrow function or a method (no
+    /// constructor); 2: a class constructor (which only `new` calls); 3:
+    /// a derived class's.
+    pub kind: u8,
     /// Register count, `r0` (`this`) and the parameters included.
     pub nregs: u32,
     /// Its inline caches, one slot per `ic_names` entry, made when first
@@ -433,6 +439,11 @@ pub struct Code {
 }
 
 impl Code {
+    /// Whether `new` may call it.
+    pub fn constructor(&self) -> bool {
+        self.kind != 1
+    }
+
     /// The inline-cache slot `i` (its way 0, the others following), and
     /// the name it looks up.
     pub fn ic(&self, i: u16) -> (*mut Ic, Atom) {
@@ -624,6 +635,9 @@ pub struct Vm {
     /// `Promise.prototype`, `Promise`, the job queue, … (see
     /// `promise::Root`).
     pub(crate) promise_roots: Vec<*mut Object>,
+    /// Tagged templates' strings arrays, by site (see
+    /// `intrinsics::template_object`).
+    pub(crate) template_cache: crate::jit::HashMap<u64, *mut Object>,
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
@@ -773,6 +787,7 @@ impl Vm {
             typed_prototypes: Vec::new(),
             collection_prototypes: Vec::new(),
             promise_roots: Vec::new(),
+            template_cache: Default::default(),
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
@@ -2949,6 +2964,8 @@ impl Vm {
             col: 0,
             bytecode: Vec::new(),
             nparams,
+            length: nparams,
+            kind: 0,
             nregs: 1 + nparams,
             ics: Default::default(),
             ic_names: Box::new([]),
@@ -3282,7 +3299,7 @@ impl Vm {
                         crate::asm::Constant::Number(d) => Value::number(*d),
                         crate::asm::Constant::String(t) => {
                             units.clear();
-                            units.extend(t.encode_utf16());
+                            crate::js::lex::string_units(t, &mut units);
                             self.string_constant(&units)
                         }
                     })
@@ -3341,6 +3358,8 @@ impl Vm {
                     bytecode,
                     strict: f.strict,
                     nparams: f.nparams,
+                    length: f.length,
+                    kind: f.kind,
                     nregs: f.nregs,
                     ics: Default::default(),
                     ic_names: ic_names.into_boxed_slice(),
@@ -3443,6 +3462,7 @@ impl Vm {
         .chain(self.typed_prototypes.iter().copied())
         .chain(self.collection_prototypes.iter().copied())
         .chain(self.promise_roots.iter().copied())
+        .chain(self.template_cache.values().copied())
         .chain(self.error_prototypes.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)
@@ -3585,7 +3605,11 @@ impl Scan {
         };
         for op in ops(f) {
             s.has_loop |= op.is_loop();
-            s.callee |= op == crate::bytecode::Op::LdaCallee;
+            // (And what the JIT doesn't compile, newer syntax's.)
+            s.callee |= matches!(
+                op,
+                crate::bytecode::Op::LdaCallee | crate::bytecode::Op::Intrinsic | crate::bytecode::Op::CreateRest
+            );
             s.ops += 1;
         }
         s

@@ -69,6 +69,10 @@ pub struct FunctionDef {
     /// `code` the one `CompileLazy`; `name`, `nparams` and `upvalues` as
     /// compiled).
     pub lazy: Option<LazyFn>,
+    /// What it is (see `vm::Code::kind`).
+    pub kind: u8,
+    /// Its `length` property.
+    pub length: u32,
 }
 
 /// A function to compile when it is first called: its text in the source
@@ -375,6 +379,8 @@ pub fn parse(src: &str) -> Result<Module, String> {
             line: 0,
             col: 0,
             lazy: None,
+            kind: 0,
+            length: b.params,
         });
     }
     Ok(Module {

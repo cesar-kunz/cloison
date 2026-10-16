@@ -45,6 +45,9 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
         withs: Vec::new(),
         arrow: false,
         uses_this: false,
+        method: false,
+        length: 0,
+        rest: false,
         free: None,
     });
     p.functions[0].strict = p.directive_prologue();
@@ -155,6 +158,7 @@ impl<'a> Parser<'_, 'a> {
             Tok::Num(_) => "a number".into(),
             Tok::Str(_) => "a string".into(),
             Tok::RegExp(..) => "a regular expression".into(),
+            Tok::Template(_) => "a template".into(),
             Tok::Eof => "end of input".into(),
         };
         self.err(format!("unexpected {what}"))
@@ -251,8 +255,11 @@ impl<'a> Parser<'_, 'a> {
                 self.semicolon()?;
                 StmtKind::Var(decls)
             }
-            Tok::Keyword(k @ ("let" | "const" | "class" | "import" | "export")) => {
+            Tok::Keyword(k @ ("const" | "class" | "import" | "export")) => {
                 return self.err(format!("`{k}` is not supported"));
+            }
+            Tok::Ident(n) if &*n == "let" && !self.toks[self.i].escaped && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Punct("[" | "{")) => {
+                return self.err("`let` is not supported");
             }
             Tok::Keyword("with") => {
                 if self.strict() {
@@ -538,17 +545,16 @@ impl<'a> Parser<'_, 'a> {
             withs: self.withs.clone(),
             arrow: false,
             uses_this: false,
+            method: false,
+            length: 0,
+            rest: false,
             free: None,
         });
         self.expect("(")?;
-        let mut params = Vec::new();
-        while !self.eat(")") {
-            if !params.is_empty() {
-                self.expect(",")?;
-            }
-            let p = self.ident()?;
-            params.push(p);
-        }
+        let outer = std::mem::replace(&mut self.current, index);
+        let params = self.params();
+        self.current = outer;
+        let (params, prologue) = params?;
         self.expect("{")?;
         if self.directive_prologue() {
             self.functions[index].strict = true;
@@ -564,7 +570,7 @@ impl<'a> Parser<'_, 'a> {
             }
         }
         // (Not inside a `with`: the function must see its object.)
-        if self.skim && !paren && self.withs.is_empty() {
+        if self.skim && !paren && self.withs.is_empty() && prologue.is_empty() && !self.functions[index].rest {
             let start = self.i;
             if let Some(free) = self.skim_body(&params)
                 && !self.is("(")
@@ -585,8 +591,62 @@ impl<'a> Parser<'_, 'a> {
         let f = &mut self.functions[index];
         f.end = end;
         f.params = params;
-        f.body = body?;
+        let mut body = body?;
+        if !prologue.is_empty() {
+            body.splice(0..0, prologue);
+        }
+        f.body = body;
         Ok(index)
+    }
+
+    /// After a function's `(`: its parameters, up to and including the
+    /// `)`, and the statements giving those with defaults their values
+    /// (`if (p === void 0) p = e;`). Sets the function's `length` and
+    /// `rest`; it's the current one.
+    fn params(&mut self) -> R<(Vec<Name>, Vec<Stmt<'a>>)> {
+        let mut params: Vec<Name> = Vec::new();
+        let mut prologue = Vec::new();
+        let mut length = None;
+        while !self.eat(")") {
+            if !params.is_empty() {
+                self.expect(",")?;
+                if self.eat(")") {
+                    break;
+                }
+            }
+            if self.eat("...") {
+                let p = self.ident()?;
+                length.get_or_insert(params.len());
+                params.push(p);
+                self.functions[self.current].rest = true;
+                self.expect(")")?;
+                break;
+            }
+            let pos = self.pos();
+            let p = self.ident()?;
+            if self.eat("=") {
+                length.get_or_insert(params.len());
+                let e = self.assignment(false)?;
+                self.infer_name(&e, &p);
+                prologue.push(self.default_stmt(p.clone(), e, pos));
+            }
+            params.push(p);
+        }
+        self.functions[self.current].length = length.unwrap_or(params.len());
+        Ok((params, prologue))
+    }
+
+    /// `if (name === void 0) name = e;`
+    fn default_stmt(&mut self, name: Name, e: Expr<'a>, pos: Pos) -> Stmt<'a> {
+        let x = |k| Expr { kind: k, pos };
+        let zero = expr(self.arena, x(ExprKind::Num(0.0)));
+        let undef = expr(self.arena, x(ExprKind::Unary(UnOp::Void, zero)));
+        let p1 = expr(self.arena, x(ExprKind::Ident(name.clone())));
+        let test = x(ExprKind::Binary(BinOp::StrictEq, p1, undef));
+        let p2 = expr(self.arena, x(ExprKind::Ident(name)));
+        let assign = x(ExprKind::Assign(None, p2, expr(self.arena, e)));
+        let then = stmt(self.arena, Stmt { kind: StmtKind::Expr(assign), pos });
+        Stmt { kind: StmtKind::If(test, then, None), pos }
     }
 
     /// The nearest enclosing function that isn't an arrow (the one whose
@@ -621,8 +681,7 @@ impl<'a> Parser<'_, 'a> {
 
     /// An arrow function after its parameters, at its `=>`: a block body,
     /// or an expression returned.
-    fn arrow(&mut self, params: Vec<Name>, pos: Pos) -> R<usize> {
-        self.expect("=>")?;
+    fn arrow(&mut self, single: Option<Name>, pos: Pos) -> R<usize> {
         let index = self.functions.len();
         self.functions.push(Function {
             name: None,
@@ -640,9 +699,26 @@ impl<'a> Parser<'_, 'a> {
             withs: self.withs.clone(),
             arrow: true,
             uses_this: false,
+            method: false,
+            length: 0,
+            rest: false,
             free: None,
         });
         let outer = std::mem::replace(&mut self.current, index);
+        let params = match single {
+            Some(n) => {
+                self.functions[index].length = 1;
+                Ok((vec![n], Vec::new()))
+            }
+            None => self.params(),
+        };
+        let (params, prologue) = match params.and_then(|p| self.expect("=>").map(|_| p)) {
+            Ok(p) => p,
+            Err(e) => {
+                self.current = outer;
+                return Err(e);
+            }
+        };
         let body = if self.eat("{") {
             self.block_rest()
         } else {
@@ -659,7 +735,11 @@ impl<'a> Parser<'_, 'a> {
         let f = &mut self.functions[index];
         f.end = end;
         f.params = params;
-        f.body = body?;
+        let mut body = body?;
+        if !prologue.is_empty() {
+            body.splice(0..0, prologue);
+        }
+        f.body = body;
         Ok(index)
     }
 
@@ -709,7 +789,8 @@ impl<'a> Parser<'_, 'a> {
                 var_level = None;
             }
             match &t.tok {
-                Tok::Eof | Tok::Punct("=>") | Tok::Keyword("let" | "const" | "class" | "with" | "import" | "export") => return None,
+                Tok::Eof | Tok::Punct("=>" | "...") | Tok::Keyword("const" | "class" | "with" | "import" | "export" | "super") => return None,
+                Tok::Ident(n) if &**n == "let" => return None,
                 Tok::Punct("{" | "(" | "[") => level += 1,
                 Tok::Punct(p @ ("}" | ")" | "]")) => {
                     level -= 1;
@@ -972,6 +1053,15 @@ impl<'a> Parser<'_, 'a> {
                     kind: ExprKind::Call(expr(self.arena, e), args),
                     pos,
                 };
+            } else if matches!(self.peek(), Tok::Template(t) if t.head) {
+                let Tok::Template(part) = self.bump() else { unreachable!() };
+                let (parts, subs) = self.template_rest(part)?;
+                let mut args = vec![Expr { kind: ExprKind::TemplateObject(parts), pos }];
+                args.extend(subs);
+                e = Expr {
+                    kind: ExprKind::Call(expr(self.arena, e), args),
+                    pos,
+                };
             } else if !self.member_suffix(&mut e)? {
                 return Ok(e);
             }
@@ -1023,8 +1113,17 @@ impl<'a> Parser<'_, 'a> {
         while !self.eat(")") {
             if !args.is_empty() {
                 self.expect(",")?;
+                if self.eat(")") {
+                    break;
+                }
             }
-            args.push(self.assignment(false)?);
+            let p = self.pos();
+            if self.eat("...") {
+                let x = self.assignment(false)?;
+                args.push(Expr { kind: ExprKind::Spread(expr(self.arena, x)), pos: p });
+            } else {
+                args.push(self.assignment(false)?);
+            }
         }
         Ok(args)
     }
@@ -1035,14 +1134,22 @@ impl<'a> Parser<'_, 'a> {
         let kind = match self.bump() {
             Tok::Num(v) => ExprKind::Num(v),
             Tok::Str(s) => ExprKind::Str(s),
-            Tok::Ident(s) if self.is("=>") => ExprKind::Function(self.arrow(vec![s], pos)?),
-            Tok::Ident(s) => {
-                if &*s == "arguments" {
-                    // (An arrow's are the enclosing function's.)
-                    let k = self.non_arrow();
-                    self.functions[k].uses_arguments = true;
+            Tok::Ident(s) if self.is("=>") && !self.toks[self.i].newline_before => {
+                ExprKind::Function(self.arrow(Some(s), pos)?)
+            }
+            Tok::Ident(s) => self.reference(s),
+            Tok::Template(part) => {
+                let (parts, subs) = self.template_rest(part)?;
+                let mut strings = Vec::new();
+                for (cooked, _) in parts {
+                    match cooked {
+                        Some(c) => strings.push(c),
+                        None => {
+                            return Err(Error::new(pos as usize, "invalid escape in a template literal".into()));
+                        }
+                    }
                 }
-                ExprKind::Ident(s)
+                ExprKind::Template(strings, subs)
             }
             Tok::Keyword("this") if self.functions[self.current].arrow => {
                 let k = self.non_arrow();
@@ -1061,16 +1168,7 @@ impl<'a> Parser<'_, 'a> {
                 self.functions[f].eager = paren || self.is("(");
                 ExprKind::Function(f)
             }
-            Tok::Punct("(") if self.arrow_ahead() => {
-                let mut params = Vec::new();
-                while !self.eat(")") {
-                    if !params.is_empty() {
-                        self.expect(",")?;
-                    }
-                    params.push(self.ident()?);
-                }
-                ExprKind::Function(self.arrow(params, pos)?)
-            }
+            Tok::Punct("(") if self.arrow_ahead() => ExprKind::Function(self.arrow(None, pos)?),
             Tok::Punct("(") => {
                 let e = self.expression(false)?;
                 self.expect(")")?;
@@ -1079,10 +1177,18 @@ impl<'a> Parser<'_, 'a> {
             Tok::Punct("[") => {
                 let mut elems = Vec::new();
                 while !self.eat("]") {
-                    if self.is(",") {
-                        return self.err("array holes are not supported");
+                    let p = self.pos();
+                    if self.eat(",") {
+                        elems.push(Expr { kind: ExprKind::Hole, pos: p });
+                        continue;
                     }
-                    elems.push(self.assignment(false)?);
+                    let e = if self.eat("...") {
+                        let x = self.assignment(false)?;
+                        Expr { kind: ExprKind::Spread(expr(self.arena, x)), pos: p }
+                    } else {
+                        self.assignment(false)?
+                    };
+                    elems.push(e);
                     if !self.is("]") {
                         self.expect(",")?;
                     }
@@ -1090,44 +1196,47 @@ impl<'a> Parser<'_, 'a> {
                 ExprKind::Array(elems)
             }
             Tok::Punct("{") => {
-                let mut props: Vec<(Name, Expr<'a>)> = Vec::new();
+                let mut props: Vec<(PropKey<'a>, Expr<'a>)> = Vec::new();
                 while !self.eat("}") {
-                    let key_start = self.i;
-                    let key: Name = match self.bump() {
-                        Tok::Ident(s) => s,
-                        Tok::Str(s) => s.into(),
-                        Tok::Keyword(k) => k.into(),
-                        Tok::Num(v) => super::number_to_string(v).into(),
-                        _ => {
-                            self.i = key_start;
-                            return self.err("expected a property name");
-                        }
-                    };
+                    let ppos = self.pos();
                     // `get k() {…}` / `set k(v) {…}`.
-                    if matches!(&*key, "get" | "set") && !self.is(":") {
-                        let name_at = self.i;
-                        let name: Name = match self.bump() {
-                            Tok::Ident(s) => s,
-                            Tok::Str(s) => s.into(),
-                            Tok::Keyword(k) => k.into(),
-                            Tok::Num(v) => super::number_to_string(v).into(),
-                            _ => {
-                                self.i = name_at;
-                                return self.err("expected a property name");
-                            }
-                        };
-                        let f = self.function(false, false, pos)?;
-                        let kind = ExprKind::Accessor(&*key == "set", f);
-                        props.push((name, Expr { kind, pos }));
-                        if !self.is("}") {
-                            self.expect(",")?;
+                    let accessor = match self.peek() {
+                        Tok::Ident(n) if matches!(&**n, "get" | "set") => {
+                            let set = &**n == "set";
+                            (!matches!(self.peek_at(1), Tok::Punct(":" | "(" | "," | "}" | "="))).then_some(set)
                         }
-                        continue;
+                        _ => None,
+                    };
+                    if let Some(set) = accessor {
+                        self.advance();
+                        let key = self.prop_key()?;
+                        let prefix = if set { "set" } else { "get" };
+                        let f = self.method(&key, Some(prefix), ppos)?;
+                        props.push((key, Expr { kind: ExprKind::Accessor(set, f), pos: ppos }));
+                    } else {
+                        let shorthand = match self.peek() {
+                            Tok::Ident(n) if matches!(self.peek_at(1), Tok::Punct("," | "}")) => Some(n.clone()),
+                            _ => None,
+                        };
+                        if let Some(n) = shorthand {
+                            self.advance();
+                            let kind = self.reference(n.clone());
+                            props.push((PropKey::Name(n), Expr { kind, pos: ppos }));
+                        } else {
+                            let key = self.prop_key()?;
+                            if self.is("(") {
+                                let f = self.method(&key, None, ppos)?;
+                                props.push((key, Expr { kind: ExprKind::Function(f), pos: ppos }));
+                            } else {
+                                self.expect(":")?;
+                                let v = self.assignment(false)?;
+                                if let PropKey::Name(k) = &key {
+                                    self.infer_name(&v, k);
+                                }
+                                props.push((key, v));
+                            }
+                        }
                     }
-                    self.expect(":")?;
-                    let v = self.assignment(false)?;
-                    self.infer_name(&v, &key);
-                    props.push((key, v));
                     if !self.is("}") {
                         self.expect(",")?;
                     }
@@ -1141,6 +1250,85 @@ impl<'a> Parser<'_, 'a> {
             }
         };
         Ok(Expr { kind, pos })
+    }
+}
+
+impl<'a> Parser<'_, 'a> {
+    /// A reference to the variable `name`.
+    fn reference(&mut self, name: Name) -> ExprKind<'a> {
+        if &*name == "arguments" {
+            // (An arrow's are the enclosing function's.)
+            let k = self.non_arrow();
+            self.functions[k].uses_arguments = true;
+        }
+        ExprKind::Ident(name)
+    }
+
+    /// An object literal's (or a class's) property key: a name, a string,
+    /// a number, or `[e]`.
+    fn prop_key(&mut self) -> R<PropKey<'a>> {
+        let start = self.i;
+        Ok(PropKey::Name(match self.bump() {
+            Tok::Ident(s) => s,
+            Tok::Str(s) => s.into(),
+            Tok::Keyword(k) => k.into(),
+            Tok::Num(v) => super::number_to_string(v).into(),
+            Tok::Punct("[") => {
+                let e = self.assignment(false)?;
+                self.expect("]")?;
+                return Ok(PropKey::Computed(e));
+            }
+            _ => {
+                self.i = start;
+                return self.err("expected a property name");
+            }
+        }))
+    }
+
+    /// A method at its `(`: named after its key (`prefix` first: `get`,
+    /// `set`).
+    fn method(&mut self, key: &PropKey<'a>, prefix: Option<&str>, pos: Pos) -> R<usize> {
+        if !self.is("(") {
+            return self.err("expected `(`");
+        }
+        let f = self.function(false, false, pos)?;
+        let func = &mut self.functions[f];
+        func.method = true;
+        func.binds_name = false;
+        if let PropKey::Name(k) = key {
+            func.name = Some(match prefix {
+                Some(p) => format!("{p} {k}").into(),
+                None => k.clone(),
+            });
+        }
+        Ok(f)
+    }
+
+    /// A template literal's pieces from its first (`first`), and its
+    /// substitutions.
+    #[allow(clippy::type_complexity)]
+    fn template_rest(
+        &mut self,
+        first: Box<super::lex::TemplatePart>,
+    ) -> R<(Vec<(Option<String>, String)>, Vec<Expr<'a>>)> {
+        let (mut parts, mut subs) = (Vec::new(), Vec::new());
+        let mut part = first;
+        loop {
+            let tail = part.tail;
+            let p = *part;
+            parts.push((p.cooked, p.raw));
+            if tail {
+                return Ok((parts, subs));
+            }
+            subs.push(self.expression(false)?);
+            match self.peek() {
+                Tok::Template(_) => match self.bump() {
+                    Tok::Template(t) => part = t,
+                    _ => unreachable!(),
+                },
+                _ => return self.err("expected the end of a template substitution"),
+            }
+        }
     }
 }
 

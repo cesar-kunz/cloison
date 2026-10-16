@@ -38,6 +38,9 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("iterator_rest", iterator_rest),
     ("require_coercible", require_coercible),
     ("object_rest", object_rest),
+    ("direct_eval", direct_eval),
+    ("eval_env", eval_env),
+    ("null_proto", null_proto),
 ];
 
 /// The id of the intrinsic `name`.
@@ -549,6 +552,60 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         vm.create_data_property(out, key, v)?;
     }
     Ok(out)
+}
+
+/// A direct `eval(source)`: `[eval, source, scope, this, strict]`. Not
+/// the builtin `eval`: an ordinary call. Else `source` (a string) is
+/// compiled with the caller's scope object `scope` around it (see
+/// `js::compile_direct_eval`), its `var`s and functions (sloppy code's)
+/// made there first, and run with the caller's `this`.
+fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (f, src, env, this, strict) = (a[0], a[1], a[2], a[3], a[4] == Value::TRUE);
+    let builtin = f.is_cell()
+        && unsafe { (*as_object(f)).class } == Class::Native
+        && unsafe { (*(*as_object(f)).code).native } == Some(crate::builtins::eval_fn as crate::vm::NativeFn);
+    if !builtin {
+        return call_function(vm, f, Value::UNDEFINED, &[src]);
+    }
+    let Some(u) = crate::vm::string_units(src) else {
+        return Ok(src);
+    };
+    let text = String::from_utf16_lossy(u);
+    let module = crate::js::compile_direct_eval(&text, strict).map_err(|e| {
+        if e.contains("unsupported") {
+            Error(format!("unsupported: in eval'd code: {e}"), None)
+        } else {
+            Error(format!("SyntaxError: {e}"), None)
+        }
+    })?;
+    // Strict code's `var`s are its own: in a scope object of its own.
+    let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
+    let local = object_value(vm.new_object(Value::NULL));
+    let target = if own_strict || !crate::props::is_object(env) { local } else { env };
+    for n in &module.declared {
+        let atom = vm.intern(n);
+        if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
+            vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
+        }
+    }
+    let code = vm.load(module);
+    let env = if crate::props::is_object(env) { env } else { local };
+    vm.eval_envs.push([env, local]);
+    let r = crate::interp::run_script_with(vm, code, this);
+    vm.eval_envs.pop();
+    r
+}
+
+/// Direct `eval`'s code's first instruction's: the caller's scope object.
+fn eval_env(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let k = a[0].as_number().unwrap_or(0.0) as usize;
+    Ok(vm.eval_envs.last().map_or(Value::UNDEFINED, |e| e[k.min(1)]))
+}
+
+/// `[o]` without a prototype.
+fn null_proto(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    vm.set_prototype_of(as_object(a[0]), Value::NULL);
+    Ok(a[0])
 }
 
 #[allow(dead_code)]

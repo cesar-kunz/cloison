@@ -3360,6 +3360,12 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
 /// Run the script `code` (`eval`'s, `Function`'s) in a new frame at the VM
 /// stack's free top (as [`call_function`]), `this` the global object.
 pub(crate) fn run_script_at(vm: &mut Vm, code: *const Code) -> crate::vm::Result<Value> {
+    let g = object_value(vm.global);
+    run_script_with(vm, code, g)
+}
+
+/// [`run_script_at`] with `this` (direct `eval`'s caller's).
+pub(crate) fn run_script_with(vm: &mut Vm, code: *const Code, this: Value) -> crate::vm::Result<Value> {
     unsafe {
         let top = vm.native_top;
         if top.is_null() {
@@ -3372,7 +3378,7 @@ pub(crate) fn run_script_at(vm: &mut Vm, code: *const Code) -> crate::vm::Result
         }
         write_frame_header(vm, new, code, std::ptr::null(), std::ptr::null_mut(), 0);
         set_header(new, FUNC, std::ptr::null_mut::<Object>());
-        *new = object_value(vm.global);
+        *new = this;
         for i in 1..n {
             *new.add(i) = Value::UNDEFINED;
         }

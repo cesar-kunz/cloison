@@ -67,6 +67,23 @@ pub fn compile_script_lazy(src: &str) -> Result<Module, String> {
     .map_err(|e| e.display(src))
 }
 
+/// Compile `src` as direct `eval`'s code (`strict`: the caller is): its
+/// names looked up in the caller's scope object first (see
+/// `intrinsics::direct_eval`).
+pub fn compile_direct_eval(src: &str, strict: bool) -> Result<Module, String> {
+    let source: Rc<str> = src.into();
+    let compile = |skim| {
+        let arena = ast::Arenas::default();
+        parse::parse_source_as(src, &arena, skim, Some(strict))
+            .and_then(|p| codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[]))
+    };
+    match compile(true) {
+        Err(e) if e.msg == codegen::SKIMMED_TOO_SOON => compile(false),
+        r => r,
+    }
+    .map_err(|e| e.display(src))
+}
+
 /// Compile the function `f` stands for: its text, parsed again inside a
 /// function declaring its upvalues (so their names resolve as where it
 /// came from); the functions nested in it are left for later in turn.

@@ -655,6 +655,9 @@ pub struct Vm {
     /// `intrinsics::construct_with` for a function whose first instruction
     /// is `LdaNewTarget`, which takes it); `EMPTY` otherwise.
     pub(crate) new_target: Value,
+    /// The scope objects of the direct `eval`s running (see
+    /// `intrinsics::direct_eval`), innermost last.
+    pub(crate) eval_envs: Vec<[Value; 2]>,
     pub(crate) regexp_prototype: *mut Object,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
@@ -816,6 +819,7 @@ impl Vm {
             a_sym_to_primitive: Atom(0),
             a_sym_has_instance: Atom(0),
             new_target: Value::EMPTY,
+            eval_envs: Vec::new(),
             regexp_prototype: std::ptr::null_mut(),
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,

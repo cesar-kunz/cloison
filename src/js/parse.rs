@@ -21,24 +21,29 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
     // A first pass finds each scope's block-scoped declarations; if there
     // are any, a second renames them apart (see `Parser::reference`).
     let lexical = has_lexical(toks);
-    let (first, table) = parse_pass(toks, arena, skim && !lexical, true, None, None)?;
+    let (first, table) = parse_pass(toks, arena, skim && !lexical, true, None, None, None)?;
     if table.trivial() {
         return Ok(first);
     }
-    parse_pass(toks, arena, skim, false, Some(table), Some(&first)).map(|(p, _)| p)
+    parse_pass(toks, arena, skim, false, Some(table), Some(&first), None).map(|(p, _)| p)
 }
 
 /// [`parse_with`] of source `src`, lexed again for a second pass (the
 /// first takes the strings out of its tokens).
 pub fn parse_source<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
+    parse_source_as(src, arena, skim, None)
+}
+
+/// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not).
+pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<bool>) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
-    let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None)?;
+    let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval)?;
     if table.trivial() {
         return Ok(first);
     }
     let mut toks = super::lex::lex(src)?;
-    parse_pass(&mut toks, arena, skim, false, Some(table), Some(&first)).map(|(p, _)| p)
+    parse_pass(&mut toks, arena, skim, false, Some(table), Some(&first), eval).map(|(p, _)| p)
 }
 
 /// Whether `toks` has `let`, `const` or `class` (then a first pass parses
@@ -57,6 +62,7 @@ fn parse_pass<'a, 'p>(
     keep: bool,
     table: Option<Table>,
     prev: Option<&'p Program<'a>>,
+    eval: Option<bool>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
     let mut p = Parser {
@@ -103,13 +109,25 @@ fn parse_pass<'a, 'p>(
         binding: None,
         annex_b: false,
         class_kind: 0,
+        has_eval: false,
         uses_new_target: false,
         hidden: Vec::new(),
         home: None,
         ctor_var: None,
         free: None,
     });
-    p.functions[0].strict = p.directive_prologue();
+    p.functions[0].strict = p.directive_prologue() || eval == Some(true);
+    if eval.is_some() {
+        // The caller's scope object, then the eval's own (for strict
+        // code's `var`s): what `with`s would give.
+        for e in ["%e0", "%e1"] {
+            let e: Name = e.into();
+            p.hidden_var(e.clone());
+            p.lexicals.get_mut(&e).unwrap().withs = 2;
+            p.withs.push(e.clone());
+            p.functions[0].withs.push(e);
+        }
+    }
     p.push_scope(usize::MAX, false, true);
     let mut body = Vec::new();
     while p.peek() != &Tok::Eof {
@@ -121,6 +139,7 @@ fn parse_pass<'a, 'p>(
         Program {
             functions: p.functions,
             lexicals: p.lexicals,
+            direct_eval: eval.is_some(),
         },
         p.table,
     ))
@@ -998,6 +1017,7 @@ impl<'a> Parser<'_, 'a, '_> {
             binding: None,
             annex_b: false,
             class_kind: 0,
+            has_eval: false,
             uses_new_target: false,
             hidden: Vec::new(),
             home,
@@ -1224,6 +1244,7 @@ impl<'a> Parser<'_, 'a, '_> {
             binding: None,
             annex_b: false,
             class_kind: 0,
+            has_eval: false,
             uses_new_target: false,
             hidden: Vec::new(),
             home: None,
@@ -1589,6 +1610,16 @@ impl<'a> Parser<'_, 'a, '_> {
             let pos = self.pos();
             if self.eat("(") {
                 let args = self.arguments()?;
+                if matches!(&e.kind, ExprKind::Ident(n) if &**n == "eval") {
+                    // A direct `eval` (see `Function::has_eval`), which may
+                    // read `arguments`.
+                    self.functions[self.current].has_eval = true;
+                    let k = self.non_arrow();
+                    self.functions[k].uses_arguments = true;
+                    if self.functions[self.current].arrow {
+                        self.functions[k].uses_this = true;
+                    }
+                }
                 e = Expr {
                     kind: ExprKind::Call(expr(self.arena, e), args),
                     pos,
@@ -2241,6 +2272,7 @@ impl<'a> Parser<'_, 'a, '_> {
             binding: None,
             annex_b: false,
             class_kind,
+            has_eval: false,
             uses_new_target: true,
             hidden: Vec::new(),
             home: Some(home.clone()),

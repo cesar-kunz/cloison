@@ -106,6 +106,30 @@ V8 runs zlib (asm.js) through its wasm pipeline, and compiles the
 functions of CodeLoad's `eval`s when they are first called; toi compiles
 every function of every `eval` up front.
 
+Against other engines and V8's tiers, on an Apple silicon Mac at 242aafd
+(higher is better; single runs from `perf-history/octane-engines.sh`,
+toi's JIT against V8 14.6 capped at each tier and with all of them, the
+macOS 27 JavaScriptCore, SpiderMonkey 140 and QuickJS 2026-06-04):
+
+| benchmark | JSC | V8 | V8 Maglev | SpiderMonkey | toi | V8 Sparkplug | V8 Ignition | QuickJS | toi / Maglev |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Richards | 49,006 | 51,460 | 37,357 | 15,025 | 32,393 | 2,877 | 1,675 | 1,298 | 0.87 |
+| DeltaBlue | 82,912 | 133,129 | 58,951 | 17,118 | 47,850 | 3,190 | 1,584 | 1,379 | 0.81 |
+| Crypto | 76,263 | 60,295 | 33,389 | 26,215 | 22,164 | 2,887 | 1,665 | 1,315 | 0.66 |
+| NavierStokes | 33,471 | 40,473 | 26,955 | 21,263 | 15,403 | 3,346 | 2,473 | 2,621 | 0.57 |
+| RayTrace | 204,829 | 141,412 | 89,095 | 51,452 | 45,094 | 8,806 | 5,811 | 2,841 | 0.51 |
+| CodeLoad | 82,525 | 74,977 | 75,635 | 45,252 | 32,425 | 75,696 | 75,863 | 21,234 | 0.43 |
+| GameBoy | 168,246 | 147,921 | 138,912 | 102,991 | 58,589 | 16,714 | 11,591 | 11,341 | 0.42 |
+| EarleyBoyer | 124,227 | 114,968 | 70,293 | 51,415 | 24,046 | 14,517 | 8,343 | 3,674 | 0.34 |
+| RegExp | 22,616 | 13,883 | 13,456 | 11,875 | 4,373 | 7,509 | 5,581 | 491 | 0.32 |
+| Box2D | 162,440 | 152,509 | 126,873 | 67,910 | 30,874 | 10,110 | 6,487 | 5,523 | 0.24 |
+| zlib | 46,747 | 123,337 | 124,544 | 104,811 | 27,564 | 124,645 | 122,350 | 2,731 | 0.22 |
+| Splay | 130,031 | 102,198 | 100,162 | 44,771 | 17,215 | 18,651 | 15,270 | 10,119 | 0.17 |
+| TypeScript | 175,386 | 181,891 | 176,601 | 112,638 | 29,379 | 52,150 | 30,157 | 20,696 | 0.17 |
+| PdfJS | 98,632 | 95,899 | 87,999 | 63,155 | 10,845 | 19,104 | 12,464 | 5,548 | 0.12 |
+| Mandreel | 113,441 | 105,810 | 68,189 | 42,404 | 6,290 | 5,744 | 4,061 | 4,189 | 0.09 |
+| **geomean** | **88,521** | **88,060** | **67,804** | **41,718** | **22,033** | **11,951** | **8,168** | **3,830** | **0.32** |
+
 Inside a long DeltaBlue run the JIT is about 7x the interpreter and about 2.3x
 behind V8's Maglev tier.
 

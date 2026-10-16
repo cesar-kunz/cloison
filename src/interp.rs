@@ -870,6 +870,25 @@ handlers! {
         next_or_throw!(Op::CreateRest.size(), r)
     }
 
+    fn op_lda_hole(pc, acc, regs, tag) {
+        next!(any, Op::LdaHole.size(), Value::HOLE)
+    }
+
+    fn op_check_hole(pc, acc, regs, tag) {
+        if acc == Value::HOLE {
+            let name = (&(*frame_code(regs)).constants)[u16_at(pc, 1) as usize];
+            let n = String::from_utf16_lossy(string_units(name).unwrap_or(&[]));
+            (*frame_vm(regs)).error = Some(Error::reference_error(format!("Cannot access '{n}' before initialization")));
+            tail!(op_unwind, Value::EMPTY)
+        }
+        next!(any, Op::CheckHole.size(), acc)
+    }
+
+    fn op_close_upvalue(pc, acc, regs, tag) {
+        (*frame_vm(regs)).close_upvalue(reg(pc, 1, regs));
+        next!(any, Op::CloseUpvalue.size(), acc)
+    }
+
     fn op_create_regexp(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
         let k = |at: usize| (&(*frame_code(regs)).constants)[u16::from_le_bytes([*pc.add(at), *pc.add(at + 1)]) as usize];
@@ -3013,6 +3032,9 @@ static TABLE: Table = {
     t[Op::DefineAccessor as usize] = op_define_accessor;
     t[Op::CreateRegExp as usize] = op_create_regexp;
     t[Op::Intrinsic as usize] = op_intrinsic;
+    t[Op::LdaHole as usize] = op_lda_hole;
+    t[Op::CheckHole as usize] = op_check_hole;
+    t[Op::CloseUpvalue as usize] = op_close_upvalue;
     t[Op::CreateRest as usize] = op_create_rest;
     t[Op::StaGlobal as usize] = op_sta_global;
     t[Op::GetNamed as usize] = op_get_named;

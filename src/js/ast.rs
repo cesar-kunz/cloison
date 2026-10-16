@@ -13,6 +13,31 @@ pub type Name = std::rc::Rc<str>;
 pub struct Program<'a> {
     /// `functions[0]` is the script.
     pub functions: Vec<Function<'a>>,
+    /// The block-scoped bindings (`let`, `const`, a function declared in
+    /// a block, a catch parameter), each renamed apart (`x%3`: see
+    /// `parse::Parser::reference`), by their new names.
+    pub lexicals: std::collections::HashMap<Name, Lexical>,
+}
+
+/// A block-scoped binding (see [`Program::lexicals`]).
+#[derive(Debug, Clone)]
+pub struct Lexical {
+    /// Its name as written.
+    pub original: Name,
+    pub constant: bool,
+    /// Initialized where its scope starts (a function declaration, a
+    /// catch parameter): never read uninitialized.
+    pub hoisted: bool,
+    /// Where its declaration ends: a reference past it in the same
+    /// function reads it initialized (unless in a `switch`).
+    pub end: Pos,
+    /// The function declaring it.
+    pub func: usize,
+    /// Declared in a `switch`'s cases (which may jump past it).
+    pub switch: bool,
+    /// The `with` statements enclosing its declaration (see
+    /// `Function::withs`): their objects don't shadow it.
+    pub withs: usize,
 }
 
 /// Where a program's nodes live (see [`Arena`]).
@@ -102,6 +127,12 @@ pub struct Function<'a> {
     /// Its last parameter is a rest parameter (`...r`), which collects the
     /// arguments from its position on.
     pub rest: bool,
+    /// A function declared in a block: its block-scoped binding (see
+    /// [`Program::lexicals`]).
+    pub binding: Option<Name>,
+    /// Such a function's Annex B `var` binding (sloppy mode): assigned the
+    /// function where its declaration is evaluated.
+    pub annex_b: bool,
     /// Skimmed, not parsed (see `parse::parse_with`): no body, and the
     /// names it and the functions in it may refer to from outside it (at
     /// least those they do), which stand for its references.
@@ -117,6 +148,9 @@ pub struct Stmt<'a> {
 #[derive(Debug)]
 pub enum StmtKind<'a> {
     Var(Vec<(Name, Option<Expr<'a>>)>),
+    /// `let` (`false`) or `const` declarations, their names renamed (see
+    /// [`Program::lexicals`]).
+    Lexical(bool, Vec<(Name, Option<Expr<'a>>)>),
     /// A function declaration: an index into [`Program::functions`].
     Function(usize),
     Expr(Expr<'a>),
@@ -130,6 +164,8 @@ pub enum StmtKind<'a> {
     /// `for (var? x in e)`
     ForIn {
         var: bool,
+        /// `for (let x in e)` or `const`: a binding per iteration.
+        fresh: bool,
         name: Name,
         object: Expr<'a>,
         body: &'a Stmt<'a>,
@@ -158,6 +194,8 @@ pub enum StmtKind<'a> {
 #[derive(Debug)]
 pub enum ForInit<'a> {
     Var(Vec<(Name, Option<Expr<'a>>)>),
+    /// `let` (`false`) or `const`: copied to a fresh binding per iteration.
+    Lexical(bool, Vec<(Name, Option<Expr<'a>>)>),
     Expr(Expr<'a>),
 }
 

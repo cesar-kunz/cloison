@@ -18,6 +18,24 @@ pub fn parse<'a>(toks: &mut [Token], arena: &'a Arenas<'a>) -> Result<Program<'a
 /// declaration not likely called at once is only skimmed (see
 /// [`Function::free`]): it compiles lazily, parsed again then.
 pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
+    // A first pass finds each scope's block-scoped declarations; if there
+    // are any, a second renames them apart (see `Parser::reference`).
+    let (program, table) = parse_pass(toks, arena, skim, None)?;
+    if table.decls.values().flatten().all(|&(_, kind)| kind == CATCH) {
+        return Ok(program);
+    }
+    parse_pass(toks, arena, skim, Some(table)).map(|(p, _)| p)
+}
+
+/// One pass of [`parse_with`]: the first collects its [`Table`], the
+/// second (`table` given) renames by it.
+fn parse_pass<'a>(
+    toks: &mut [Token],
+    arena: &'a Arenas<'a>,
+    skim: bool,
+    table: Option<Table>,
+) -> Result<(Program<'a>, Table), Error> {
+    let first = table.is_none();
     let mut p = Parser {
         toks,
         arena,
@@ -28,6 +46,12 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
         skim_spare: Vec::new(),
         withs: Vec::new(),
         with_count: 0,
+        keep: first,
+        table: table.unwrap_or_default(),
+        collect: first,
+        frames: Vec::new(),
+        renames: 0,
+        lexicals: Default::default(),
     };
     p.functions.push(Function {
         name: None,
@@ -48,17 +72,52 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
         method: false,
         length: 0,
         rest: false,
+        binding: None,
+        annex_b: false,
         free: None,
     });
     p.functions[0].strict = p.directive_prologue();
+    p.push_scope(usize::MAX, false, true);
     let mut body = Vec::new();
     while p.peek() != &Tok::Eof {
         body.push(p.statement()?);
     }
+    p.frames.pop();
     p.functions[0].body = body;
-    Ok(Program {
-        functions: p.functions,
-    })
+    Ok((
+        Program {
+            functions: p.functions,
+            lexicals: p.lexicals,
+        },
+        p.table,
+    ))
+}
+
+/// What a scope declares (`let`, `const`, a block's function, a catch
+/// parameter: their [`LET`]… kinds), by the token starting it; and each
+/// function's `var`-scoped names, by the token starting its parameters.
+#[derive(Default)]
+struct Table {
+    decls: crate::jit::HashMap<usize, Vec<(Name, u8)>>,
+    vars: crate::jit::HashMap<usize, Vec<Name>>,
+}
+
+const LET: u8 = 0;
+const CONST: u8 = 1;
+const BLOCK_FUNCTION: u8 = 2;
+const CATCH: u8 = 4;
+
+/// A scope being parsed: its names, renamed (the same for a function's
+/// `var`s, which shadow outer bindings).
+struct Frame {
+    key: usize,
+    names: Vec<(Name, Name)>,
+    switch: bool,
+    /// A function's body or the script: functions declared directly in
+    /// it are `var`-scoped.
+    body: bool,
+    /// A function's `var`s (and parameters).
+    vars: bool,
 }
 
 struct Parser<'t, 'a> {
@@ -76,6 +135,16 @@ struct Parser<'t, 'a> {
     /// `StmtKind::With`), outermost first.
     withs: Vec<Name>,
     with_count: usize,
+    /// Leave string tokens' text (a first pass: another follows).
+    keep: bool,
+    /// Scopes' declarations: being collected (the first pass), or the
+    /// first pass's.
+    table: Table,
+    collect: bool,
+    /// The scopes enclosing the code being parsed, innermost last.
+    frames: Vec<Frame>,
+    renames: usize,
+    lexicals: std::collections::HashMap<Name, Lexical>,
 }
 
 /// A function being skimmed (see [`Parser::skim_body`]): the names it
@@ -118,8 +187,8 @@ impl<'a> Parser<'_, 'a> {
     /// kind in an error message.
     fn bump(&mut self) -> Tok {
         let t = match &mut self.toks[self.i].tok {
-            Tok::Str(s) => Tok::Str(std::mem::take(s)),
-            Tok::RegExp(r) => Tok::RegExp(std::mem::take(r)),
+            Tok::Str(s) if !self.keep => Tok::Str(std::mem::take(s)),
+            Tok::RegExp(r) if !self.keep => Tok::RegExp(std::mem::take(r)),
             t => t.clone(),
         };
         if self.i + 1 < self.toks.len() {
@@ -243,7 +312,7 @@ impl<'a> Parser<'_, 'a> {
         let kind = match self.peek().clone() {
             Tok::Punct("{") => {
                 self.advance();
-                StmtKind::Block(self.block_rest()?)
+                StmtKind::Block(self.scoped_block_rest()?)
             }
             Tok::Punct(";") => {
                 self.advance();
@@ -255,11 +324,20 @@ impl<'a> Parser<'_, 'a> {
                 self.semicolon()?;
                 StmtKind::Var(decls)
             }
-            Tok::Keyword(k @ ("const" | "class" | "import" | "export")) => {
-                return self.err(format!("`{k}` is not supported"));
+            Tok::Keyword("const") => {
+                self.advance();
+                let decls = self.lexical_decls(true, false)?;
+                self.semicolon()?;
+                StmtKind::Lexical(true, decls)
             }
-            Tok::Ident(n) if &*n == "let" && !self.toks[self.i].escaped && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Punct("[" | "{")) => {
-                return self.err("`let` is not supported");
+            Tok::Ident(n) if self.let_ahead(&n) => {
+                self.advance();
+                let decls = self.lexical_decls(false, false)?;
+                self.semicolon()?;
+                StmtKind::Lexical(false, decls)
+            }
+            Tok::Keyword(k @ ("class" | "import" | "export")) => {
+                return self.err(format!("`{k}` is not supported"));
             }
             Tok::Keyword("with") => {
                 if self.strict() {
@@ -278,7 +356,11 @@ impl<'a> Parser<'_, 'a> {
             }
             Tok::Keyword("function") => {
                 self.advance();
-                StmtKind::Function(self.function(true, false, pos)?)
+                let f = self.function(true, false, pos)?;
+                if !self.frames.last().unwrap().body {
+                    self.block_function(f);
+                }
+                StmtKind::Function(f)
             }
             Tok::Keyword("if") => {
                 self.advance();
@@ -295,7 +377,11 @@ impl<'a> Parser<'_, 'a> {
             }
             Tok::Keyword("for") => {
                 self.advance();
-                self.for_rest()?
+                let key = self.i;
+                self.push_scope(key, false, false);
+                let r = self.for_rest();
+                self.frames.pop();
+                r?
             }
             Tok::Keyword("while") => {
                 self.advance();
@@ -352,19 +438,26 @@ impl<'a> Parser<'_, 'a> {
             Tok::Keyword("try") => {
                 self.advance();
                 self.expect("{")?;
-                let block = self.block_rest()?;
+                let block = self.scoped_block_rest()?;
                 let handler = if self.eat("catch") {
+                    let key = self.i;
                     self.expect("(")?;
-                    let name = self.ident()?;
-                    self.expect(")")?;
-                    self.expect("{")?;
-                    Some((name, self.block_rest()?))
+                    self.push_scope(key, false, false);
+                    let r = (|| {
+                        let name = self.ident()?;
+                        let name = self.declare(&name, CATCH, 0);
+                        self.expect(")")?;
+                        self.expect("{")?;
+                        Ok((name, self.scoped_block_rest()?))
+                    })();
+                    self.frames.pop();
+                    Some(r?)
                 } else {
                     None
                 };
                 let finalizer = if self.eat("finally") {
                     self.expect("{")?;
-                    Some(self.block_rest()?)
+                    Some(self.scoped_block_rest()?)
                 } else {
                     None
                 };
@@ -434,6 +527,27 @@ impl<'a> Parser<'_, 'a> {
         self.expect("(")?;
         let init = if self.is(";") {
             None
+        } else if self.is("const") || matches!(self.peek().clone(), Tok::Ident(n) if self.let_ahead(&n)) {
+            let constant = self.is("const");
+            self.advance();
+            let decls = self.lexical_decls(constant, true)?;
+            if decls.len() == 1 && decls[0].1.is_none() && self.eat("in") {
+                let name = decls.into_iter().next().unwrap().0;
+                let object = self.expression(false)?;
+                self.expect(")")?;
+                let body = stmt(self.arena, self.statement()?);
+                return Ok(StmtKind::ForIn {
+                    var: false,
+                    fresh: true,
+                    name,
+                    object,
+                    body,
+                });
+            }
+            if constant && decls.iter().any(|d| d.1.is_none()) {
+                return self.err("missing initializer in a `const` declaration");
+            }
+            Some(ForInit::Lexical(constant, decls))
         } else if self.eat("var") {
             let decls = self.var_decls(true)?;
             if decls.len() == 1 && decls[0].1.is_none() && self.eat("in") {
@@ -479,6 +593,7 @@ impl<'a> Parser<'_, 'a> {
         let body = stmt(self.arena, self.statement()?);
         Ok(StmtKind::ForIn {
             var,
+            fresh: false,
             name,
             object,
             body,
@@ -489,7 +604,15 @@ impl<'a> Parser<'_, 'a> {
         self.expect("(")?;
         let d = self.expression(false)?;
         self.expect(")")?;
+        let key = self.i;
         self.expect("{")?;
+        self.push_scope(key, true, false);
+        let r = self.switch_cases();
+        self.frames.pop();
+        Ok(StmtKind::Switch(d, r?))
+    }
+
+    fn switch_cases(&mut self) -> R<Vec<(Option<Expr<'a>>, Vec<Stmt<'a>>)>> {
         let mut cases = Vec::new();
         let mut default = false;
         while !self.eat("}") {
@@ -514,7 +637,7 @@ impl<'a> Parser<'_, 'a> {
             }
             cases.push((test, body));
         }
-        Ok(StmtKind::Switch(d, cases))
+        Ok(cases)
     }
 
     /// After `function`: the name (if `declaration`, required), parameters
@@ -548,9 +671,32 @@ impl<'a> Parser<'_, 'a> {
             method: false,
             length: 0,
             rest: false,
+            binding: None,
+            annex_b: false,
             free: None,
         });
+        let vars_key = self.i;
         self.expect("(")?;
+        self.push_vars(vars_key);
+        let r = self.function_rest(index, paren);
+        self.frames.pop();
+        let (params, body) = r?;
+        if self.collect {
+            let names = self.var_names(index, &params, body.as_deref().unwrap_or(&[]));
+            self.table.vars.insert(vars_key, names);
+        }
+        let f = &mut self.functions[index];
+        f.params = params;
+        if let Some(body) = body {
+            f.body = body;
+        }
+        Ok(index)
+    }
+
+    /// A function's parameters and body, from past its `(`: the body
+    /// `None` if skimmed (see `Function::free`).
+    #[allow(clippy::type_complexity)]
+    fn function_rest(&mut self, index: usize, paren: bool) -> R<(Vec<Name>, Option<Vec<Stmt<'a>>>)> {
         let outer = std::mem::replace(&mut self.current, index);
         let params = self.params();
         self.current = outer;
@@ -574,29 +720,28 @@ impl<'a> Parser<'_, 'a> {
             let start = self.i;
             if let Some(free) = self.skim_body(&params)
                 && !self.is("(")
+                // (Not if it refers to block-scoped bindings outside it:
+                // compiled lazily, it couldn't declare them again.)
+                && free.iter().all(|n| self.resolve(n).is_none())
             {
                 let end = self.toks[self.i - 1].pos + 1;
                 let f = &mut self.functions[index];
                 f.end = end;
-                f.params = params;
                 f.free = Some(free);
-                return Ok(index);
+                return Ok((params, None));
             }
             self.i = start;
         }
         let outer = std::mem::replace(&mut self.current, index);
-        let body = self.block_rest();
+        let body = self.scoped_block_rest();
         self.current = outer;
         let end = self.toks[self.i - 1].pos + 1;
-        let f = &mut self.functions[index];
-        f.end = end;
-        f.params = params;
+        self.functions[index].end = end;
         let mut body = body?;
         if !prologue.is_empty() {
             body.splice(0..0, prologue);
         }
-        f.body = body;
-        Ok(index)
+        Ok((params, Some(body)))
     }
 
     /// After a function's `(`: its parameters, up to and including the
@@ -682,6 +827,23 @@ impl<'a> Parser<'_, 'a> {
     /// An arrow function after its parameters, at its `=>`: a block body,
     /// or an expression returned.
     fn arrow(&mut self, single: Option<Name>, pos: Pos) -> R<usize> {
+        // (Its parameters' frame: keyed by the token before them.)
+        let vars_key = self.i - 1;
+        self.push_vars(vars_key);
+        let r = self.arrow_rest(single, pos);
+        self.frames.pop();
+        let index = r?;
+        if self.collect {
+            let f = &self.functions[index];
+            let (params, body) = (f.params.clone(), std::mem::take(&mut self.functions[index].body));
+            let names = self.var_names(index, &params, &body);
+            self.functions[index].body = body;
+            self.table.vars.insert(vars_key, names);
+        }
+        Ok(index)
+    }
+
+    fn arrow_rest(&mut self, single: Option<Name>, pos: Pos) -> R<usize> {
         let index = self.functions.len();
         self.functions.push(Function {
             name: None,
@@ -702,6 +864,8 @@ impl<'a> Parser<'_, 'a> {
             method: false,
             length: 0,
             rest: false,
+            binding: None,
+            annex_b: false,
             free: None,
         });
         let outer = std::mem::replace(&mut self.current, index);
@@ -720,7 +884,7 @@ impl<'a> Parser<'_, 'a> {
             }
         };
         let body = if self.eat("{") {
-            self.block_rest()
+            self.scoped_block_rest()
         } else {
             let p = self.pos();
             self.assignment(false).map(|e| {
@@ -1254,14 +1418,223 @@ impl<'a> Parser<'_, 'a> {
 }
 
 impl<'a> Parser<'_, 'a> {
-    /// A reference to the variable `name`.
+    /// A reference to the variable `name`: to the block-scoped binding it
+    /// names, if any, by that binding's new name (each is renamed apart:
+    /// `x%3`, a function's variable as any other, which the code
+    /// generator knows from [`Program::lexicals`]).
     fn reference(&mut self, name: Name) -> ExprKind<'a> {
         if &*name == "arguments" {
             // (An arrow's are the enclosing function's.)
             let k = self.non_arrow();
             self.functions[k].uses_arguments = true;
         }
-        ExprKind::Ident(name)
+        match self.resolve(&name) {
+            Some(r) => ExprKind::Ident(r),
+            None => ExprKind::Ident(name),
+        }
+    }
+
+    /// The new name of the block-scoped binding `name` refers to here, if
+    /// it refers to one.
+    fn resolve(&self, name: &Name) -> Option<Name> {
+        for f in self.frames.iter().rev() {
+            if let Some((_, r)) = f.names.iter().find(|(o, _)| o == name) {
+                return (r != name).then(|| r.clone());
+            }
+        }
+        None
+    }
+
+    /// Enter the scope starting at token `key`.
+    fn push_scope(&mut self, key: usize, switch: bool, body: bool) {
+        let mut names = Vec::new();
+        if !self.collect
+            && let Some(decls) = self.table.decls.get(&key)
+        {
+            for (n, _) in decls {
+                if names.iter().any(|(o, _): &(Name, Name)| o == n) {
+                    continue;
+                }
+                let r: Name = format!("{n}%{}", self.renames).into();
+                self.renames += 1;
+                names.push((n.clone(), r));
+            }
+        }
+        self.frames.push(Frame {
+            key,
+            names,
+            switch,
+            body,
+            vars: false,
+        });
+    }
+
+    /// Enter a function's parameters and `var`s (keyed by the token
+    /// before its parameters), which shadow outer block-scoped bindings.
+    fn push_vars(&mut self, key: usize) {
+        let names = match self.table.vars.get(&key) {
+            Some(v) if !self.collect => v.iter().map(|n| (n.clone(), n.clone())).collect(),
+            _ => Vec::new(),
+        };
+        self.frames.push(Frame {
+            key,
+            names,
+            switch: false,
+            body: false,
+            vars: true,
+        });
+    }
+
+    /// Past a `{`: a block's statements, in its own scope (a function's
+    /// body if in its parameters' frame).
+    fn scoped_block_rest(&mut self) -> R<Vec<Stmt<'a>>> {
+        let key = self.i - 1;
+        let body = self.frames.last().is_some_and(|f| f.vars);
+        self.push_scope(key, false, body);
+        let r = self.block_rest();
+        self.frames.pop();
+        r
+    }
+
+    /// Declare block-scoped `name` (of kind [`LET`]…) in the innermost
+    /// scope, its declaration ending at `end`: its new name.
+    fn declare(&mut self, name: &Name, kind: u8, end: Pos) -> Name {
+        let frame = self.frames.last().unwrap();
+        if self.collect {
+            let key = frame.key;
+            self.table.decls.entry(key).or_default().push((name.clone(), kind));
+            return name.clone();
+        }
+        let Some((_, r)) = frame.names.iter().find(|(o, _)| o == name) else {
+            return name.clone();
+        };
+        let r = r.clone();
+        let switch = frame.switch;
+        self.lexicals.insert(
+            r.clone(),
+            Lexical {
+                original: name.clone(),
+                constant: kind == CONST,
+                hoisted: kind == BLOCK_FUNCTION || kind == CATCH,
+                end,
+                func: self.current,
+                switch,
+                withs: self.withs.len(),
+            },
+        );
+        r
+    }
+
+    /// Function declaration `f` in a block: its binding in the block, and
+    /// in sloppy mode its Annex B `var` (unless a block-scoped binding
+    /// between the block and the function has its name).
+    fn block_function(&mut self, f: usize) {
+        let name = self.functions[f].name.clone().unwrap();
+        let binding = self.declare(&name, BLOCK_FUNCTION, 0);
+        if self.collect {
+            return;
+        }
+        let mut annex_b = !self.functions[self.current].strict;
+        for frame in self.frames.iter().rev().skip(1) {
+            if frame.vars {
+                break;
+            }
+            if frame.names.iter().any(|(o, _)| *o == name) {
+                annex_b = false;
+            }
+            if frame.body {
+                break;
+            }
+        }
+        if binding != name {
+            let func = &mut self.functions[f];
+            func.binding = Some(binding);
+            func.annex_b = annex_b;
+        }
+    }
+
+    /// Whether `let`, the current token, starts a declaration.
+    fn let_ahead(&self, n: &Name) -> bool {
+        &**n == "let"
+            && !self.toks[self.i].escaped
+            && matches!(self.peek_at(1), Tok::Ident(_) | Tok::Punct("[" | "{"))
+    }
+
+    /// Past `let` or `const`: the declarations (renamed), with their
+    /// initializers. `no_in`: in a `for` head.
+    fn lexical_decls(&mut self, constant: bool, no_in: bool) -> R<Vec<(Name, Option<Expr<'a>>)>> {
+        let kind = if constant { CONST } else { LET };
+        let mut decls = Vec::new();
+        loop {
+            let name = self.ident()?;
+            if &*name == "let" {
+                return self.err("`let` can't be declared with `let` or `const`");
+            }
+            let init = if self.eat("=") {
+                let e = self.assignment(no_in)?;
+                self.infer_name(&e, &name);
+                Some(e)
+            } else {
+                if constant && !no_in {
+                    return self.err("missing initializer in a `const` declaration");
+                }
+                None
+            };
+            let end = self.pos();
+            let r = self.declare(&name, kind, end);
+            decls.push((r, init));
+            if !self.eat(",") {
+                return Ok(decls);
+            }
+        }
+    }
+
+    /// Function `f`'s `var`-scoped names: its parameters, `var`s, the
+    /// functions declared in it, `arguments`, its own name.
+    fn var_names(&self, f: usize, params: &[Name], body: &[Stmt]) -> Vec<Name> {
+        fn walk(s: &Stmt, fs: &[Function], out: &mut Vec<Name>) {
+            match &s.kind {
+                StmtKind::Var(ds)
+                | StmtKind::For {
+                    init: Some(ForInit::Var(ds)),
+                    ..
+                } => out.extend(ds.iter().map(|(n, _)| n.clone())),
+                StmtKind::ForIn { var: true, name, .. } => out.push(name.clone()),
+                StmtKind::Function(i) => out.extend(fs[*i].name.clone()),
+                _ => {}
+            }
+            match &s.kind {
+                StmtKind::If(_, a, b) => {
+                    walk(a, fs, out);
+                    if let Some(b) = b {
+                        walk(b, fs, out);
+                    }
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::ForIn { body, .. }
+                | StmtKind::While(_, body)
+                | StmtKind::DoWhile(body, _)
+                | StmtKind::With(_, _, body)
+                | StmtKind::Labeled(_, body) => walk(body, fs, out),
+                StmtKind::Block(b) => b.iter().for_each(|s| walk(s, fs, out)),
+                StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| walk(s, fs, out)),
+                StmtKind::Try(b, c, fin) => b
+                    .iter()
+                    .chain(c.iter().flat_map(|(_, c)| c))
+                    .chain(fin.iter().flatten())
+                    .for_each(|s| walk(s, fs, out)),
+                _ => {}
+            }
+        }
+        let mut out: Vec<Name> = params.to_vec();
+        body.iter().for_each(|s| walk(s, &self.functions, &mut out));
+        if !self.functions[f].arrow {
+            out.push("arguments".into());
+        }
+        if self.functions[f].binds_name {
+            out.extend(self.functions[f].name.clone());
+        }
+        out
     }
 
     /// An object literal's (or a class's) property key: a name, a string,
@@ -1535,7 +1908,7 @@ mod tests {
 
     #[test]
     fn reports_errors() {
-        assert!(error("let x = 1;").contains("not supported"));
+        assert!(error("import x from \"y\";").contains("not supported"));
         assert!(error("f(").contains("end of input"));
         assert!(error("1 = 2").contains("assignment target"));
         assert!(error("return 1").contains("outside a function"));

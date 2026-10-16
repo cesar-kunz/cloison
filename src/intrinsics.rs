@@ -22,6 +22,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("define_field", define_field),
     ("define_getter", define_getter),
     ("define_setter", define_setter),
+    ("throw_const", throw_const),
 ];
 
 /// The id of the intrinsic `name`.
@@ -206,6 +207,12 @@ fn define_getter(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 fn define_setter(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     define_accessor(vm, a, true)
+}
+
+/// An assignment to a `const`: `[name]`.
+fn throw_const(_: &mut Vm, a: &[Value]) -> Result<Value> {
+    let n = String::from_utf16_lossy(crate::vm::string_units(a[0]).unwrap_or(&[]));
+    Err(Error::type_error(format!("Assignment to constant variable '{n}'.")))
 }
 
 #[allow(dead_code)]

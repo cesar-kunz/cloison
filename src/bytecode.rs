@@ -354,6 +354,16 @@ define_ops! {
     /// `acc` = an array of the frame's arguments from the `k`th on (a
     /// rest parameter's).
     CreateRest(Count),
+    /// `acc = HOLE` (a block-scoped binding's value before its
+    /// declaration: see `Value::HOLE`).
+    LdaHole(),
+    /// Throw a ReferenceError if `acc` is `HOLE`: the variable named by
+    /// constant `c` is read before its declaration.
+    CheckHole(Const),
+    /// Close the open upvalue of register `r`, if any: closures that
+    /// captured it keep its value, and the register starts a new binding
+    /// (a loop's block-scoped variable, per iteration).
+    CloseUpvalue(Reg),
 }
 
 impl Op {

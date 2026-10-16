@@ -682,10 +682,14 @@ impl<'a> Parser<'_, 'a, '_> {
             let constant = self.is("const");
             self.advance();
             let decls = self.lexical_decls(constant, true)?;
-            if let Some(p) = self.pending_pattern.take()
-                && self.is_of()
-            {
-                return self.for_of_pattern(if constant { 3 } else { 2 }, p);
+            if let Some(p) = self.pending_pattern.take() {
+                if self.is_of() {
+                    return self.for_of_pattern(if constant { 3 } else { 2 }, p);
+                }
+                if self.eat("in") {
+                    let names: Vec<Name> = decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect();
+                    return self.for_in_target(ForInTarget::Pattern(p, Some(constant), names));
+                }
             }
             if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
                 let (name, _) = decls.into_iter().next().unwrap();
@@ -710,10 +714,14 @@ impl<'a> Parser<'_, 'a, '_> {
             Some(ForInit::Lexical(constant, decls))
         } else if self.eat("var") {
             let decls = self.var_decls(true)?;
-            if let Some(p) = self.pending_pattern.take()
-                && self.is_of()
-            {
-                return self.for_of_pattern(1, p);
+            if let Some(p) = self.pending_pattern.take() {
+                if self.is_of() {
+                    return self.for_of_pattern(1, p);
+                }
+                if self.eat("in") {
+                    let names: Vec<Name> = decls.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect();
+                    return self.for_in_target(ForInTarget::Pattern(p, None, names));
+                }
             }
             if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
                 let (name, _) = decls.into_iter().next().unwrap();
@@ -733,6 +741,14 @@ impl<'a> Parser<'_, 'a, '_> {
                 let e = expr(self.arena, e);
                 let p = self.to_pattern(e)?;
                 return self.for_of_pattern(0, p);
+            }
+            if matches!(e.kind, ExprKind::Member(..) | ExprKind::Index(..)) && self.eat("in") {
+                return self.for_in_target(ForInTarget::Expr(e));
+            }
+            if matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(..)) && self.eat("in") {
+                let e = expr(self.arena, e);
+                let p = self.to_pattern(e)?;
+                return self.for_in_target(ForInTarget::Pattern(p, None, Vec::new()));
             }
             if let ExprKind::Ident(name) = &e.kind
                 && self.eat("in")
@@ -760,6 +776,51 @@ impl<'a> Parser<'_, 'a, '_> {
             init,
             test,
             update,
+            body,
+        })
+    }
+
+    /// Past `in`: `for (target in object) body` with a target other than a
+    /// name, as `for (%forinN in object) { target = %forinN; body }`.
+    fn for_in_target(&mut self, target: ForInTarget<'a>) -> R<StmtKind<'a>> {
+        let pos = self.pos();
+        let k = self.classes;
+        self.classes += 1;
+        let h: Name = format!("%forin{k}").into();
+        self.hidden_var(h.clone());
+        let object = self.expression(false)?;
+        self.expect(")")?;
+        let body = self.sub_statement()?;
+        let key = expr(self.arena, Expr { kind: ExprKind::Ident(h.clone()), pos });
+        let first = match target {
+            ForInTarget::Expr(t) => Stmt {
+                kind: StmtKind::Expr(Expr { kind: ExprKind::Assign(None, expr(self.arena, t), key), pos }),
+                pos,
+            },
+            ForInTarget::Pattern(p, lexical, names) => {
+                let mode = if lexical.is_some() { 2 } else if names.is_empty() { 0 } else { 1 };
+                let mut decls: Vec<(Name, Option<Expr<'a>>)> =
+                    names.into_iter().map(|n| (n, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
+                let d = Expr { kind: ExprKind::Destructure(Box::new(p), key, mode), pos };
+                match lexical {
+                    Some(constant) => {
+                        decls.push(("".into(), Some(d)));
+                        Stmt { kind: StmtKind::Lexical(constant, decls), pos }
+                    }
+                    None if mode == 1 => {
+                        decls.push(("".into(), Some(d)));
+                        Stmt { kind: StmtKind::Var(decls), pos }
+                    }
+                    None => Stmt { kind: StmtKind::Expr(d), pos },
+                }
+            }
+        };
+        let body = stmt(self.arena, Stmt { kind: StmtKind::Block(vec![first, body]), pos });
+        Ok(StmtKind::ForIn {
+            var: false,
+            fresh: false,
+            name: h,
+            object,
             body,
         })
     }
@@ -2427,6 +2488,14 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         }
     }
+}
+
+/// A `for … in` head's target other than a name.
+enum ForInTarget<'a> {
+    Expr(Expr<'a>),
+    /// A pattern, `let`/`const` (`Some(constant)`) or not, and the names it
+    /// declares (none: an assignment pattern).
+    Pattern(Pattern<'a>, Option<bool>, Vec<Name>),
 }
 
 /// Rename `p`'s names by `map` (block-scoped bindings' new names).

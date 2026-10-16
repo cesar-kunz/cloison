@@ -755,7 +755,8 @@ handlers! {
         let mut spread = Vec::new();
         let (args, argc) = frame_args(vm, regs, &mut spread);
         let values = std::slice::from_raw_parts(args, argc);
-        *reg(pc, 1, regs) = crate::builtins::arguments_object(vm, values);
+        let callee: *mut Object = header(regs, FUNC);
+        *reg(pc, 1, regs) = crate::builtins::arguments_object_of(vm, values, callee);
         next!(any, Op::CreateArguments.size(), acc)
     }
 
@@ -3458,6 +3459,11 @@ pub(crate) unsafe fn close_frame_upvalues(vm: &mut Vm, regs: *mut Value) {
 /// # Safety
 /// `regs` must be a frame on the VM stack whose caller (if a call
 /// instruction made it) is still there, its registers as at the call.
+/// The function frame `regs` runs (null if none recorded).
+pub(crate) unsafe fn frame_callee(regs: *mut Value) -> *mut Object {
+    unsafe { header(regs, FUNC) }
+}
+
 pub(crate) unsafe fn frame_args(
     vm: &mut Vm,
     regs: *mut Value,

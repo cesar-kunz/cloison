@@ -487,7 +487,8 @@ extern "C" fn toi_rt_create_arguments(regs: Value, _: Value) -> u64 {
         let vm = &mut *crate::interp::current_vm();
         let mut spread = Vec::new();
         let (args, n) = interp::frame_args(vm, regs.to_bits() as *mut Value, &mut spread);
-        crate::builtins::arguments_object(vm, std::slice::from_raw_parts(args, n)).to_bits()
+        let callee = interp::frame_callee(regs.to_bits() as *mut Value);
+        crate::builtins::arguments_object_of(vm, std::slice::from_raw_parts(args, n), callee).to_bits()
     }
 }
 

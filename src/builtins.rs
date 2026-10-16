@@ -212,6 +212,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // A function's `caller` and `arguments`: accessors that throw (as
     // strict functions' do; sloppy ones' don't exist here).
     let thrower = vm.native_function("", throw_type_error, 0, any, false);
+    vm.thrower = thrower;
     for name in ["caller", "arguments"] {
         let a = vm.intern(name);
         vm.define_accessor(fp, a, Some(object_value(thrower)), Some(object_value(thrower)), DONT_ENUM);
@@ -929,10 +930,50 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// A new array of `values`: an `arguments` object.
 pub(crate) fn arguments_object(vm: &mut Vm, values: &[Value]) -> Value {
-    let arr = vm.new_array();
-    crate::vm::array_push(vm, arr, values).expect("an array");
-    arr
+    arguments_object_of(vm, values, std::ptr::null_mut())
 }
+
+/// An `arguments` object of function `callee` (null: unknown, as strict
+/// code's): an ordinary object with the values as elements, `length`,
+/// `callee` (a strict function's throws), `@@iterator`, and the hidden
+/// mark `Object.prototype.toString` knows it by.
+pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
+    let strict = callee.is_null() || unsafe { (*(*callee).code).strict };
+    let op = object_value(vm.object_prototype);
+    let o = vm.new_object(op);
+    let a_length = vm.a_length;
+    vm.add_property_with(o, a_length, Value::from_i32(values.len() as i32), DONT_ENUM);
+    let a_iter = vm.a_sym_iterator;
+    let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
+    if let Some(f) = values_fn {
+        vm.add_property_with(o, a_iter, object_value(f), DONT_ENUM);
+    }
+    let mark = vm.intern(ARGUMENTS_MARK);
+    vm.add_property_with(o, mark, Value::TRUE, DONT_ENUM);
+    let a_callee = vm.intern("callee");
+    if strict {
+        let thrower = vm.throw_type_error_fn();
+        let d = crate::props::Desc {
+            get: Some(thrower),
+            set: Some(thrower),
+            enumerable: Some(false),
+            configurable: Some(false),
+            ..Default::default()
+        };
+        let _ = vm.define_own_property(o, crate::vm::Key::Name(a_callee), &d);
+    } else {
+        vm.add_property_with(o, a_callee, object_value(callee), DONT_ENUM);
+    }
+    let ov = object_value(o);
+    for (i, &v) in values.iter().enumerate() {
+        let _ = vm.put_key(ov, crate::vm::Key::Index(i as u32), v);
+    }
+    ov
+}
+
+/// The hidden property marking `arguments` objects (a symbol atom no
+/// symbol has: no enumeration lists it).
+pub(crate) const ARGUMENTS_MARK: &str = "\u{FDD0}arguments";
 
 // ---- Number and Object ----
 
@@ -1030,6 +1071,13 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             Class::RegExp => "RegExp",
             Class::Wrapper => primitive_tag(wrapped(this).unwrap()),
             Class::Plain if unsafe { (*o).flags } & crate::object::ERROR != 0 => "Error",
+            Class::Plain if {
+                let mark = vm.intern(ARGUMENTS_MARK);
+                vm.own_property(o, crate::vm::Key::Name(mark)).is_some()
+            } =>
+            {
+                "Arguments"
+            }
             Class::Map => "Map",
             Class::Set => "Set",
             Class::WeakMap => "WeakMap",

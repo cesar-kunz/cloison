@@ -133,7 +133,7 @@ impl Vm {
             if s.unique && same_attrs && (!no_elements || s.elems_code == NO_ELEMENTS) {
                 return;
             }
-            self.shape_left_stable(s);
+            self.shape_left(s);
             let u = Shape {
                 class: s.class,
                 proto: s.proto,
@@ -149,6 +149,9 @@ impl Vm {
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: s,
             };
             (*o).shape = self.add_shape(u);
             self.bump_code_epoch();
@@ -804,7 +807,7 @@ impl Vm {
             if proto.is_cell() {
                 self.make_prototype(as_object(proto));
             }
-            self.shape_left_stable(s);
+            self.shape_left(s);
             let u = Shape {
                 class: s.class,
                 proto,
@@ -820,6 +823,9 @@ impl Vm {
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: s,
             };
             (*o).shape = self.add_shape(u);
             self.bump_code_epoch();

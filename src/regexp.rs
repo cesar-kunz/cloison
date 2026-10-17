@@ -124,6 +124,7 @@ impl Regex {
             total,
             unicode,
             dot_all,
+            depth: 0,
         };
         let node = p.alternation()?;
         if p.i != chars.len() {
@@ -533,7 +534,13 @@ struct Parser<'a> {
     total: usize,
     unicode: bool,
     dot_all: bool,
+    /// Groups open around the current position (up to [`MAX_NESTING`]).
+    depth: usize,
 }
+
+/// The deepest groups may nest: the parser, and the passes over the tree
+/// after it, recurse once per level, on the native stack.
+const MAX_NESTING: usize = 500;
 
 impl Parser<'_> {
     fn peek(&self) -> Option<char> {
@@ -664,7 +671,12 @@ impl Parser<'_> {
                     self.groups += 1;
                     (0, Some(g))
                 };
+                self.depth += 1;
+                if self.depth > MAX_NESTING {
+                    return Err(self.error("Regular expression too large"));
+                }
                 let inner = self.alternation()?;
+                self.depth -= 1;
                 if self.peek() != Some(')') {
                     return Err(self.error("Unterminated group"));
                 }

@@ -310,6 +310,16 @@ impl<'a> Parser<'_, 'a, '_> {
         Err(Error::new(self.pos() as usize, msg.into()))
     }
 
+    /// An error where nesting has used up the native stack (see
+    /// `crate::stack`): called by the functions every level of nesting goes
+    /// through (statements, expressions, patterns).
+    fn deep(&self) -> R<()> {
+        if crate::stack::low() {
+            return self.err("too deeply nested");
+        }
+        Ok(())
+    }
+
     fn unexpected<T>(&self) -> R<T> {
         let what = match self.peek() {
             Tok::Ident(s) => format!("`{s}`"),
@@ -420,6 +430,7 @@ impl<'a> Parser<'_, 'a, '_> {
     // ---- Statements ----
 
     fn statement(&mut self) -> R<Stmt<'a>> {
+        self.deep()?;
         let pos = self.pos();
         let sub = std::mem::replace(&mut self.sub, false);
         let kind = match self.peek().clone() {
@@ -977,6 +988,7 @@ impl<'a> Parser<'_, 'a, '_> {
     /// A binding pattern: a name, `[…]` or `{…}`, its names (as written)
     /// onto `names`.
     fn binding_pattern(&mut self, names: &mut Vec<Name>) -> R<Pattern<'a>> {
+        self.deep()?;
         if self.eat("[") {
             let mut elems = Vec::new();
             let mut rest = None;
@@ -1632,6 +1644,7 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     fn assignment(&mut self, no_in: bool) -> R<Expr<'a>> {
+        self.deep()?;
         if self.functions[self.current].generator
             && matches!(self.peek(), Tok::Ident(n) if &**n == "yield")
             && !self.toks[self.i].escaped
@@ -1752,6 +1765,7 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     fn unary(&mut self) -> R<Expr<'a>> {
+        self.deep()?;
         let pos = self.pos();
         if self.functions[self.current].is_async
             && matches!(self.peek(), Tok::Ident(n) if &**n == "await")
@@ -1888,6 +1902,7 @@ impl<'a> Parser<'_, 'a, '_> {
     /// `new C(args)`, where `C` is a member expression without calls, and
     /// the arguments are optional.
     fn new_expr(&mut self) -> R<Expr<'a>> {
+        self.deep()?;
         let pos = self.pos();
         self.expect("new")?;
         if self.is(".") && matches!(self.peek_at(1), Tok::Ident(n) if &**n == "target") {

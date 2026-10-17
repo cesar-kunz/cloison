@@ -27,6 +27,7 @@ mod json;
 mod promise;
 pub mod props;
 pub mod regexp;
+mod stack;
 pub mod bytecode;
 pub mod gc;
 pub mod heap;

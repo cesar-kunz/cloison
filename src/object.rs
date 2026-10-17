@@ -579,6 +579,20 @@ pub struct Shape {
     /// that has exactly it, as the shape is stable ([`Shape::is_stable`]):
     /// a transition from it drops the code (`Vm::shape_left_stable`).
     pub(crate) relied: Cell<bool>,
+    /// An object of this shape or of one made from it ([`Shape::parent`])
+    /// lost a property or changed one's attributes or its prototype
+    /// (`Vm::shape_left`): an object typed as having at least this shape
+    /// (`Ty::Ext`, as from a field typed `FieldType::Obj`) may not have
+    /// its slots, and the shape is never stable again.
+    pub(crate) left: Cell<bool>,
+    /// Compiled code takes an object typed as having at least this shape
+    /// to have its slots, as no object has left it ([`Shape::left`]): one
+    /// leaving drops the code.
+    pub(crate) lineage_relied: Cell<bool>,
+    /// The shape this one was made from (by a transition, or a copy of its
+    /// own for an object), null for a root: objects that leave this one
+    /// leave it too.
+    pub(crate) parent: *const Shape,
 }
 
 /// Property attributes: not writable, not enumerable, not configurable
@@ -656,6 +670,7 @@ impl Shape {
     /// compiled code (`array_push`).
     pub fn is_stable(&self) -> bool {
         !self.unique
+            && !self.left.get()
             && !matches!(self.class, Class::Array | Class::String)
             && self.transitions.borrow().is_empty()
             && self.elem_transitions.borrow().is_empty()
@@ -733,6 +748,9 @@ mod tests {
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: std::ptr::null(),
         };
         assert_eq!(s.location(0), 48);
         assert_eq!(s.location(1), 56);

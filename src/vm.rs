@@ -1146,6 +1146,9 @@ impl Vm {
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: std::ptr::null(),
         });
         self.roots.insert(key, s);
         s
@@ -1172,6 +1175,9 @@ impl Vm {
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: std::ptr::null(),
         })
     }
 
@@ -1222,6 +1228,9 @@ impl Vm {
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: s,
         });
         if !s.unique {
             self.shape_left_stable(s);
@@ -1257,6 +1266,9 @@ impl Vm {
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
             relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: s,
             };
             (*o).shape = self.add_shape(u);
         }
@@ -1359,6 +1371,24 @@ impl Vm {
         if s.relied.replace(false) {
             self.field_epoch = self.field_epoch.wrapping_add(1);
             self.bump_code_epoch();
+        }
+    }
+
+    /// An object of shape `s` moves to one without some of its slots (or
+    /// another prototype): `s` and the shapes it was made from are no longer
+    /// stable, now or later, and compiled code that took an object of at
+    /// least one of them to have its slots is dropped (see `Shape::left`).
+    pub(crate) fn shape_left(&mut self, s: &Shape) {
+        self.shape_left_stable(s);
+        let mut p: *const Shape = s;
+        while !p.is_null() && unsafe { !(*p).left.get() } {
+            let shape = unsafe { &*p };
+            shape.left.set(true);
+            if shape.lineage_relied.replace(false) {
+                self.field_epoch = self.field_epoch.wrapping_add(1);
+                self.bump_code_epoch();
+            }
+            p = shape.parent;
         }
     }
 
@@ -1607,6 +1637,9 @@ impl Vm {
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: s,
         });
         if !s.unique {
             self.shape_left_stable(s);
@@ -2067,7 +2100,7 @@ impl Vm {
                 return;
             };
             if s.attrs[slot as usize] != attrs {
-                self.shape_left_stable(s);
+                self.shape_left(s);
                 let mut slot_attrs = s.attrs.clone();
                 slot_attrs[slot as usize] = attrs;
                 let u = Shape {
@@ -2085,6 +2118,9 @@ impl Vm {
                     transitions: RefCell::default(),
                     elem_transitions: RefCell::default(),
             relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: s,
                 };
                 (*o).shape = self.add_shape(u);
                 self.bump_code_epoch();
@@ -2375,7 +2411,7 @@ impl Vm {
                 .iter()
                 .map(|&k| *Object::slot(o, s.location(k)))
                 .collect();
-            self.shape_left_stable(s);
+            self.shape_left(s);
             for &cell in &s.fields {
                 self.field_made_mutable(&*cell);
             }
@@ -2401,6 +2437,9 @@ impl Vm {
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: s,
             };
             let new = self.add_shape(u);
             (*o).shape = new;
@@ -3262,6 +3301,9 @@ impl Vm {
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: s,
             });
             // Out-of-line room for the slots past the object's capacity.
             let cap = (*new).capacity.get() as usize;

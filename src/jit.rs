@@ -4813,8 +4813,21 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 .all(|c| matches!(c.loc, CaseLoc::Proto(_))),
             _ => false,
         };
+        // An object typed as having at least the shape (`Ext`) has its slots
+        // while no object has left it (`Shape::left`: one that lost a
+        // property may have others); the code relies on that.
+        let known = |s: u64| {
+            reg == Ty::Obj(s) || {
+                let shape = unsafe { &*(s as *const Shape) };
+                !shape.left.get() && {
+                    shape.lineage_relied.set(true);
+                    true
+                }
+            }
+        };
         if let (Some(s), Some(fbs)) = (reg.shape(), spec.feedback)
             && !(load && from_proto)
+            && known(s)
         {
             let fb = &fbs[insn.ic_frame()];
             let shape = unsafe { &*(s as *const Shape) };

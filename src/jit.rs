@@ -540,9 +540,11 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
         && unsafe { (*crate::object::as_object(key)).class } == Class::String
     {
         let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
+        vm.store_failed = false;
         return u64::from(
             vm.set_named_plain(o, key, v).is_some()
-                && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before,
+                && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
+                && !vm.store_failed,
         );
     }
     if !o.is_cell() || !key.is_int32() || key.as_i32_unchecked() < 0 {
@@ -560,7 +562,10 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
             _ => return 0,
         }
     }
-    u64::from(vm.set_keyed(o, key, v).is_ok())
+    // (A store that did nothing: the interpreter's again, which throws in
+    // strict code.)
+    vm.store_failed = false;
+    u64::from(vm.set_keyed(o, key, v).is_ok() && !vm.store_failed)
 }
 
 /// `o.name` (`name` an `Atom`), or 0 where it would throw or call a
@@ -580,9 +585,11 @@ extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
     let name = crate::object::Atom(a[1].to_bits() as u32);
     let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
+    vm.store_failed = false;
     u64::from(
         vm.set_named_rt(a[0], name, a[2]).is_some()
-            && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before,
+            && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
+            && !vm.store_failed,
     )
 }
 

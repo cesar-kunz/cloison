@@ -1619,7 +1619,12 @@ handlers! {
     #[inline(never)]
     fn slow_set_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let r = with_top(regs, None, |vm| vm.set_named_miss(&*frame_code(regs), u16_at(pc, 2), obj, acc));
+        let r = with_top(regs, None, |vm| {
+            vm.store_failed = false;
+            let code = &*frame_code(regs);
+            let r = vm.set_named_miss(code, u16_at(pc, 2), obj, acc);
+            strict_store_check(vm, code, r, |vm| vm.atom_name(code.ic(u16_at(pc, 2)).1).to_string())
+        });
         next_or_throw!(Op::SetNamed.size(), r.map(|()| acc))
     }
 
@@ -1696,8 +1701,10 @@ handlers! {
                     vm.key_value(k)
                 };
             }
+            vm.store_failed = false;
             let r = vm.set_keyed(*reg(pc, 1, regs), key, acc);
-            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+            let r = if vm.conv_thrown { Err(vm.take_conv_error()) } else { r };
+            strict_store_check(vm, &*frame_code(regs), r, |_| crate::vm::display(key))
         });
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
     }
@@ -3839,6 +3846,15 @@ unsafe fn push_frame(
         }
         new
     }
+}
+
+/// After a store that did nothing as it can't happen (`Vm::store_failed`):
+/// in strict code, a `TypeError` naming the property (`name`).
+fn strict_store_check(vm: &mut Vm, code: &Code, r: crate::vm::Result<()>, name: impl FnOnce(&Vm) -> String) -> crate::vm::Result<()> {
+    if r.is_ok() && std::mem::take(&mut vm.store_failed) && code.strict {
+        return Err(Error::type_error(format!("Cannot assign to read only property '{}' of object", name(vm))));
+    }
+    r
 }
 
 #[cold]

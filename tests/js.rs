@@ -3508,6 +3508,71 @@ a2().then(v => r.push(v));
     }
 }
 
+/// Mapped `arguments` read their parameters (also through a cached keyed
+/// load, and when a closure assigns one); `for … in` skips a key deleted
+/// before its turn; an indexed getter on a prototype gets the receiver.
+#[test]
+fn arguments_for_in_and_indexed_getters() {
+    let src = r#"
+var r = [];
+function f1(a) { var t = 0; for (var i = 0; i < 2; i++) { a = i; t += arguments[0]; } return t; }
+r.push(f1(0));
+function k(a) { var s = 0; for (var i = 0; i < 3; i++) { a = i + 1; s += arguments[0]; } return s; }
+var ks = 0; for (var j = 0; j < 3000; j++) ks += k(0); r.push(ks);
+function f2(x) { (function () { x = 42; })(); return arguments[0]; }
+r.push(f2(0));
+function f3(x) { arguments[0] = 9; return (function () { return x; })(); }
+r.push(f3(1));
+var d = { a: 1, b: 2, c: 3, d: 4 }, s = []; for (var key in d) { s.push(key); if (key == "a") delete d.c; }
+r.push(s.join(""));
+var e = { a: 1, b: 2, c: 3 }, s2 = []; function del(o) { delete o.b; } for (var key in e) { s2.push(key); del(e); }
+r.push(s2.join(""));
+var str = [], z; for (z in "ab") str.push(z + "x" + "ab".length); r.push(str.join());
+var P = { x: 1 }; var C = Object.create(P); C.y = 2; var s3 = []; for (var key in C) { s3.push(key); if (key == "y") delete P.x; } r.push(s3.join(""));
+var h = [1, , 3]; Object.defineProperty(Array.prototype, "1", { get: function () { return this === h; }, configurable: true });
+r.push(h[1]); delete Array.prototype[1];
+var o = { q: 7 }; Object.defineProperty(o, "2", { get: function () { return this.q; } }); var ch = Object.create(o); ch.q = 8; r.push(ch[2], o[2]);
+Object.defineProperty(String.prototype, "5", { get: function () { return typeof this; }, configurable: true }); r.push("abc"[5]);
+r.join();"#;
+    assert_eq!(value(src), "1,18000,42,9,abd,ac,0x2,1x2,y,true,8,7,object");
+}
+
+/// Strict code's store that can't happen throws a `TypeError` (to a
+/// read-only or frozen property, a non-extensible object, a primitive, an
+/// accessor without a setter); sloppy code's does nothing
+/// (`Vm::store_failed`), compiled code's as the interpreter's.
+#[test]
+fn strict_stores_that_fail_throw() {
+    let src = r#"
+var r = [];
+function t(name, f) { try { f(); r.push(name + ":ok"); } catch (e) { r.push(name + ":" + e.name); } }
+var fr = Object.freeze({ a: 1 }), ro = {}; Object.defineProperty(ro, "x", { value: 1 });
+var ne = Object.preventExtensions({}), go = { get g() { return 1; } }, fa = Object.freeze([1, 2]);
+var inh = Object.create(ro), one = [1, 2]; Object.defineProperty(one, 0, { writable: false });
+t("frozen", function () { "use strict"; fr.a = 2; });
+t("readonly", function () { "use strict"; ro.x = 2; });
+t("nonext", function () { "use strict"; ne.y = 1; });
+t("getter", function () { "use strict"; go.g = 2; });
+t("strlen", function () { "use strict"; "abc".length = 1; });
+t("num", function () { "use strict"; (1).x = 1; });
+t("inherited", function () { "use strict"; inh.x = 5; });
+t("frozenarr", function () { "use strict"; fa[0] = 9; });
+t("frozenpush", function () { "use strict"; fa[5] = 9; });
+t("elemro", function () { "use strict"; one[0] = 9; });
+t("keyed", function () { "use strict"; var k = "a"; fr[k] = 3; });
+t("sloppy", function () { fr.a = 2; ro.x = 2; ne.y = 1; go.g = 2; (1).x = 1; fa[0] = 9; one[0] = 9; });
+t("ok", function () { "use strict"; var o = { a: 1 }; o.a = 2; o.b = 3; o["c"] = 4; one[1] = 5; });
+var n = 0; function hot(o) { "use strict"; o.a = 1; } for (var i = 0; i < 5000; i++) { try { hot(i % 1000 == 999 ? fr : {}); } catch (e) { n++; } }
+r.push(n, one.join(), fa.join());
+r.join();"#;
+    assert_eq!(
+        value(src),
+        "frozen:TypeError,readonly:TypeError,nonext:TypeError,getter:TypeError,strlen:TypeError,\
+         num:TypeError,inherited:TypeError,frozenarr:TypeError,frozenpush:TypeError,elemro:TypeError,\
+         keyed:TypeError,sloppy:ok,ok:ok,5,1,5,1,2"
+    );
+}
+
 /// A load into the slot of the register it loads from (`o = o.o`, as
 /// `get_own_nc_g1_to_g1`): on arm64 a family template, whose registers the
 /// fused name must give.

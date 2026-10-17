@@ -968,6 +968,26 @@ fn aliases_arguments(f: &Function) -> bool {
     found
 }
 
+/// Whether running `body` may delete a property: a `delete` in it, or code
+/// it calls (a getter's or a setter's aside).
+fn may_delete(body: &Stmt) -> bool {
+    fn expr(e: &Expr) -> bool {
+        use ExprKind::*;
+        match &e.kind {
+            Unary(UnOp::Delete, _) | Call(..) | New(..) | SuperCall(..) | Yield(..) | Await(..) | Spread(_) | Destructure(..)
+            | Intrinsic(..) => true,
+            _ => {
+                let mut sub = Vec::new();
+                children(e, &mut sub);
+                sub.into_iter().any(expr)
+            }
+        }
+    }
+    let mut found = false;
+    for_each_expr(std::slice::from_ref(body), &mut |e| found |= expr(e));
+    found
+}
+
 /// The expressions directly in `e`.
 fn children<'a>(e: &'a Expr<'a>, out: &mut Vec<&'a Expr<'a>>) {
     use ExprKind::*;
@@ -1548,7 +1568,8 @@ impl<'a> Gen<'a> {
                 && !f.generator
                 && !f.params.is_empty()
                 && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
-                && aliases_arguments(f);
+                // (A closure may assign a parameter it captures.)
+                && (aliases_arguments(f) || f.params.iter().any(|p| self.scopes.captured[self.index].contains(&&**p)));
             let op = if simple { Op::CreateMappedArguments } else { Op::CreateArguments };
             match self.locals.get("arguments") {
                 Some(&r) => self.emit(op, &[Arg::Reg(r)]),
@@ -4790,7 +4811,14 @@ impl<'a> Gen<'a> {
         if fresh {
             self.fresh_binding(name, true, pos)?;
         }
+        // A key deleted before its turn isn't visited: checked where the
+        // body may delete (see `may_delete`), with the object and the key.
+        let check = may_delete(body);
+        let pair = if check { Some((self.alloc(pos)?, self.alloc(pos)?)) } else { None };
         self.value(object)?;
+        if let Some((o, _)) = pair {
+            self.star(o);
+        }
         self.emit(Op::ForInKeys, &[]);
         let keys = self.alloc(pos)?;
         self.star(keys);
@@ -4803,6 +4831,12 @@ impl<'a> Gen<'a> {
         self.ldar(i);
         let ic = self.auto_ic("[]keyed");
         self.emit(Op::GetKeyed, &[Arg::Reg(keys), ic]);
+        if let Some((o, k)) = pair {
+            self.star(k);
+            self.intrinsic("for_in_has", o, 2);
+            self.jump_if(Jmp::False, cont);
+            self.ldar(k);
+        }
         if fresh {
             let t = self.alloc(pos)?;
             self.star(t);

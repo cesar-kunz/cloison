@@ -76,7 +76,9 @@ pub type NativeFn = fn(&mut Vm, Value, &[Value]) -> Result<Value>;
 /// the value is at `loc` in the receiver, or, if `holder` is set, in that
 /// prototype, provided no prototype has changed shape since (`epoch`). A
 /// store hits on `shape` too, and moves the object to `new_shape` first if
-/// set (a cached transition, always to an in-object slot). For a store,
+/// set (a cached transition, always to an in-object slot), provided no
+/// prototype has changed shape since (`epoch`: one may have gained a setter
+/// or a read-only property of that name). For a store,
 /// `holder` is instead the field's type, encoded by [`FieldType::encode`]:
 /// the stored value must fit it, or the store takes the slow path, which
 /// generalizes it. 32 bytes, so
@@ -2054,7 +2056,7 @@ impl Vm {
                         holder: (*new).field_type(slot).encode() as *mut Object,
                         new_shape: new,
                         loc: (*new).location(slot),
-                        ..Ic::EMPTY
+                        epoch: self.proto_epoch,
                     },
                 );
             }

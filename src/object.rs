@@ -82,9 +82,9 @@ pub enum Class {
     /// Boolean(true)`): `code`'s bits are the primitive (a value, which the
     /// collector traces: a string is a cell).
     Wrapper,
-    /// A `Map`: `code`'s bits are a hidden array holding its entries, `k0,
-    /// v0, k1, v1, …` (a deleted entry's slots are holes). See
-    /// `collections`.
+    /// A `Map`: `code`'s bits are a hidden array holding a header (its hash
+    /// index, …) and its entries, `k0, v0, k1, v1, …` (a deleted entry's
+    /// slots are holes). See `collections`.
     Map,
     /// A `Set`: as [`Class::Map`], the entries `k0, k1, …`.
     Set,

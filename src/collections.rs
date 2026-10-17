@@ -3,14 +3,14 @@
 //!
 //! A collection keeps its entries in a hidden array (`Class::Array`, which
 //! JS never sees) whose value is in the object's `code` bits (traced by the
-//! collector as a wrapper's primitive is): the elements are `k0, v0, k1,
-//! v1, …` for maps, `k0, k1, …` for sets, in insertion order, and a
-//! deleted entry's slots are holes. Lookups are linear scans by
-//! SameValueZero. Adding an entry to an array more than half holes first
-//! copies the live ones into a fresh array: an iteration in progress keeps
-//! the old one (so misses entries added after; `clear` only empties the
-//! slots, as the spec does, so iterators see it). The weak kinds hold their
-//! keys strongly.
+//! collector as a wrapper's primitive is): after a header (see [`BASE`]),
+//! the elements are `k0, v0, k1, v1, …` for maps, `k0, k1, …` for sets, in
+//! insertion order, and a deleted entry's slots are holes. Lookups go
+//! through a hash index (see [`new_index`]) and compare by SameValueZero.
+//! Adding an entry to an array more than half holes first copies the live
+//! ones into a fresh array, as `clear` does, and the old one forwards to
+//! it: an iteration in progress moves there (see [`current`]), so it sees
+//! entries added after. The weak kinds hold their keys strongly.
 
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_int32, to_number};
@@ -18,7 +18,7 @@ use crate::jit::Ty;
 use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
-use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push};
+use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push, string_units};
 
 /// Indices into `Vm::collection_prototypes`.
 #[derive(Clone, Copy)]
@@ -167,6 +167,37 @@ fn normalize(k: Value) -> Value {
     if k.is_double() && k.as_f64_unchecked() == 0.0 { Value::from_i32(0) } else { k }
 }
 
+/// The entries array's header: its hash index (see [`new_index`]), the
+/// array it was compacted into (`undefined` until then: see [`current`]),
+/// and the number of live entries. The entries follow, from [`BASE`].
+const INDEX: usize = 0;
+const FORWARD: usize = 1;
+const COUNT: usize = 2;
+const BASE: usize = 3;
+
+/// No entry, in a hash index.
+const NONE: i32 = -1;
+
+/// A key's hash, equal for keys SameValueZero finds equal: a number's by
+/// its value (an integral double as the int32), a string's by its units,
+/// anything else's by its bits (a cell's address: cells never move).
+fn hash(k: Value) -> u32 {
+    let bits = if let Some(f) = k.as_number() {
+        if f.is_nan() {
+            f64::NAN.to_bits()
+        } else if f == f as i32 as f64 {
+            f as i32 as u32 as u64
+        } else {
+            f.to_bits()
+        }
+    } else if let Some(u) = string_units(k) {
+        u.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3))
+    } else {
+        k.to_bits()
+    };
+    (bits.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as u32
+}
+
 /// The entries array of collection (or iterator) `o`.
 fn entries(o: *mut Object) -> *mut Object {
     unsafe { as_object(Value::from_bits((*o).code as u64)) }
@@ -185,8 +216,22 @@ fn slot(e: *mut Object, i: usize) -> Value {
     unsafe { *(*e).elems.add(i) }
 }
 
+/// Set element `i` of `e` (an array of any values) to `v`.
+fn put(e: *mut Object, i: usize, v: Value) {
+    unsafe {
+        let at = (*e).elems.add(i);
+        *at = v;
+        crate::heap::barrier(e.cast(), at, v);
+    }
+}
+
 fn len(e: *mut Object) -> usize {
     unsafe { (*e).elems_len as usize }
+}
+
+/// An int32 element of a header or an index.
+fn int(e: *mut Object, i: usize) -> i32 {
+    slot(e, i).as_i32_unchecked()
 }
 
 /// A collection's entry width: 2 for the maps, 1 for the sets.
@@ -194,39 +239,116 @@ fn stride(o: *mut Object) -> usize {
     if matches!(unsafe { (*o).class }, Class::Map | Class::WeakMap) { 2 } else { 1 }
 }
 
+/// The entries array `e` was compacted into, or itself: an iterator's
+/// position `pos` in `e` moves with it, past as many live entries.
+fn current(mut e: *mut Object, pos: &mut usize, s: usize) -> *mut Object {
+    while slot(e, FORWARD).is_cell() {
+        let live = (BASE..(*pos).min(len(e))).step_by(s).filter(|&i| slot(e, i) != Value::EMPTY).count();
+        e = as_object(slot(e, FORWARD));
+        *pos = BASE + live * s;
+    }
+    e
+}
+
+/// A hash index of entries array `e` (entries `s` wide) with `n` (a power
+/// of 2) buckets: an array of int32s, `n`, then each bucket's last entry,
+/// then each entry's previous one in its bucket ([`NONE`] for none). An
+/// entry is numbered by its position: `BASE + number * s`.
+fn new_index(vm: &mut Vm, e: *mut Object, s: usize, n: usize) -> Result<Value> {
+    let total = (len(e) - BASE) / s;
+    let mut ix = vec![Value::from_i32(NONE); 1 + n + total];
+    ix[0] = Value::from_i32(n as i32);
+    for j in 0..total {
+        let k = slot(e, BASE + j * s);
+        if k != Value::EMPTY {
+            let b = 1 + (hash(k) as usize & (n - 1));
+            ix[1 + n + j] = ix[b];
+            ix[b] = Value::from_i32(j as i32);
+        }
+    }
+    let a = vm.new_array();
+    array_push(vm, a, &ix)?;
+    Ok(a)
+}
+
 /// The position of `key`'s entry in collection `o`, if it has one.
 fn find(o: *mut Object, key: Value) -> Option<usize> {
     let (e, s) = (entries(o), stride(o));
-    (0..len(e)).step_by(s).find(|&i| {
-        let k = slot(e, i);
-        k != Value::EMPTY && same_value_zero(k, key)
-    })
+    let ix = as_object(slot(e, INDEX));
+    let n = int(ix, 0) as usize;
+    let mut j = int(ix, 1 + (hash(key) as usize & (n - 1)));
+    while j != NONE {
+        let at = BASE + j as usize * s;
+        let k = slot(e, at);
+        if k != Value::EMPTY && same_value_zero(k, key) {
+            return Some(at);
+        }
+        j = int(ix, 1 + n + j as usize);
+    }
+    None
 }
 
 /// The entries collection `o` has.
 fn live(o: *mut Object) -> usize {
-    let (e, s) = (entries(o), stride(o));
-    (0..len(e)).step_by(s).filter(|&i| slot(e, i) != Value::EMPTY).count()
+    int(entries(o), COUNT) as usize
+}
+
+/// A new entries array for entries `s` wide: `entries`' live ones (none if
+/// null), indexed.
+fn new_entries(vm: &mut Vm, from: Option<*mut Object>, s: usize) -> Result<*mut Object> {
+    let mut kv = vec![Value::UNDEFINED, Value::UNDEFINED, Value::from_i32(0)];
+    if let Some(old) = from {
+        for i in (BASE..len(old)).step_by(s) {
+            if slot(old, i) != Value::EMPTY {
+                kv.extend((0..s).map(|j| slot(old, i + j)));
+            }
+        }
+    }
+    let count = (kv.len() - BASE) / s;
+    kv[COUNT] = Value::from_i32(count as i32);
+    let fresh = vm.new_array();
+    array_push(vm, fresh, &kv)?;
+    let e = as_object(fresh);
+    let ix = new_index(vm, e, s, (count * 2).next_power_of_two().max(8))?;
+    put(e, INDEX, ix);
+    Ok(e)
+}
+
+/// Move collection `o` to a new entries array of its live entries: the old
+/// one forwards to it, for iterators in progress (see [`current`]).
+fn move_entries(vm: &mut Vm, o: *mut Object) -> Result<()> {
+    let old = entries(o);
+    let fresh = new_entries(vm, Some(old), stride(o))?;
+    put(old, FORWARD, object_value(fresh));
+    hold_entries(o, object_value(fresh));
+    Ok(())
 }
 
 /// Append `entry` (a key, or a key and value) to collection `o`'s
-/// entries, compacting them first when more than half are holes.
+/// entries, compacting them first when more than half are holes, and
+/// index it (the index grown once entries outnumber its buckets).
 fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
-    let mut e = entries(o);
     let s = stride(o);
-    let n = len(e);
-    if n >= 32 && live(o) * s * 2 < n {
-        let fresh = vm.new_array();
-        for i in (0..n).step_by(s) {
-            if slot(e, i) != Value::EMPTY {
-                let kv: Vec<Value> = (0..s).map(|j| slot(e, i + j)).collect();
-                array_push(vm, fresh, &kv)?;
-            }
-        }
-        hold_entries(o, fresh);
-        e = as_object(fresh);
+    let total = (len(entries(o)) - BASE) / s;
+    if total >= 32 && live(o) * 2 < total {
+        move_entries(vm, o)?;
     }
+    let e = entries(o);
+    let j = (len(e) - BASE) / s;
     array_push(vm, object_value(e), entry)?;
+    put(e, COUNT, Value::from_i32(int(e, COUNT) + 1));
+    let mut ix = as_object(slot(e, INDEX));
+    let n = int(ix, 0) as usize;
+    if j >= n {
+        let fresh = new_index(vm, e, s, n * 2)?;
+        put(e, INDEX, fresh);
+        return Ok(());
+    }
+    array_push(vm, object_value(ix), &[Value::from_i32(NONE)])?;
+    ix = as_object(slot(e, INDEX));
+    let b = 1 + (hash(entry[0]) as usize & (n - 1));
+    put(ix, 1 + n + j, slot(ix, b));
+    put(ix, b, Value::from_i32(j as i32));
     Ok(())
 }
 
@@ -236,15 +358,17 @@ fn remove(o: *mut Object, i: usize) {
     for j in 0..stride(o) {
         unsafe { *(*e).elems.add(i + j) = Value::EMPTY };
     }
+    put(e, COUNT, Value::from_i32(int(e, COUNT) - 1));
 }
 
 /// A new, empty collection of class `class`.
-fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> *mut Object {
-    let e = vm.new_array();
+fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object> {
+    let s = if matches!(class, Class::Map | Class::WeakMap) { 2 } else { 1 };
+    let e = new_entries(vm, None, s)?;
     let p = object_value(vm.collection_prototypes[proto as usize]);
     let o = vm.new_object_with(class, p, 0);
-    hold_entries(o, e);
-    o
+    hold_entries(o, object_value(e));
+    Ok(o)
 }
 
 /// Call `f` with each value iterating `v` yields: an array's or typed
@@ -261,7 +385,7 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     if !vm.is_construct() {
         return Err(Error::type_error(format!("Constructor {name} requires 'new'")));
     }
-    let o = object_value(new_collection(vm, class, proto));
+    let o = object_value(new_collection(vm, class, proto)?);
     let iterable = arg(a, 0);
     if iterable.is_undefined() || iterable.is_null() {
         return Ok(o);
@@ -304,7 +428,10 @@ fn new_iterator(vm: &mut Vm, o: *mut Object, mode: IterMode) -> Value {
     let proto = vm.collection_prototypes[if s == 2 { Proto::MapIterator } else { Proto::SetIterator } as usize];
     let it = vm.new_object_with(Class::CollectionIterator, object_value(proto), 0);
     hold_entries(it, Value::from_bits(unsafe { (*o).code } as u64));
-    unsafe { (*it).elems_cap = mode as u32 | (s as u32) << 2 };
+    unsafe {
+        (*it).elems_cap = mode as u32 | (s as u32) << 2;
+        (*it).elems_len = BASE as u32;
+    }
     object_value(it)
 }
 
@@ -340,19 +467,21 @@ fn map_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(find(o, arg(a, 0)).inspect(|&i| remove(o, i)).is_some()))
 }
 
-/// `map.clear()`: every entry's slots become holes (iterators in progress
-/// keep the list, as the spec has it).
-fn map_clear(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+/// `map.clear()`: every entry's slots become holes, and the map moves to
+/// a new entries array (iterators in progress go on there, from its start,
+/// as the spec has it).
+fn map_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.clear")?;
-    clear(o);
+    clear(vm, o)?;
     Ok(Value::UNDEFINED)
 }
 
-fn clear(o: *mut Object) {
+fn clear(vm: &mut Vm, o: *mut Object) -> Result<()> {
     let e = entries(o);
-    for i in 0..len(e) {
+    for i in BASE..len(e) {
         unsafe { *(*e).elems.add(i) = Value::EMPTY };
     }
+    move_entries(vm, o)
 }
 
 /// `map.forEach(f, thisArg)`: `f(value, key, map)` for each entry, in
@@ -368,9 +497,14 @@ fn for_each(vm: &mut Vm, o: *mut Object, a: &[Value], this: Value) -> Result<Val
         return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
     }
     let t = arg(a, 1);
-    let (e, s) = (entries(o), stride(o));
-    let mut i = 0;
-    while i < len(e) {
+    let s = stride(o);
+    let (mut e, mut i) = (entries(o), BASE);
+    loop {
+        // (The callback may have compacted or cleared the entries.)
+        e = current(e, &mut i, s);
+        if i >= len(e) {
+            break;
+        }
         let k = slot(e, i);
         if k != Value::EMPTY {
             let v = if s == 2 { slot(e, i + 1) } else { k };
@@ -427,9 +561,9 @@ fn set_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(find(o, arg(a, 0)).inspect(|&i| remove(o, i)).is_some()))
 }
 
-fn set_clear(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn set_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.clear")?;
-    clear(o);
+    clear(vm, o)?;
     Ok(Value::UNDEFINED)
 }
 
@@ -463,9 +597,10 @@ fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if unsafe { (*it).code }.is_null() {
         return Ok(iter_result(vm, Value::UNDEFINED, true));
     }
-    let e = entries(it);
     let (mode, s) = unsafe { ((*it).elems_cap & 3, ((*it).elems_cap >> 2) as usize) };
     let mut i = unsafe { (*it).elems_len } as usize;
+    let e = current(entries(it), &mut i, s);
+    hold_entries(it, object_value(e));
     while i < len(e) {
         let k = slot(e, i);
         i += s;

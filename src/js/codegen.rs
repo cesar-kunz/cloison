@@ -84,6 +84,7 @@ fn generate_from<'p>(
     };
 
     let mut decls: Vec<Vec<&str>> = (0..p.functions.len()).map(|i| declarations(p, i)).collect();
+    let boxed = boxed_lexicals(p, &decls);
     // A function with more variables than registers keeps the last ones
     // in a scope object (`%env`, a register; see `Gen::function`).
     let mut overflow: Vec<Vec<&str>> = vec![Vec::new(); p.functions.len()];
@@ -104,7 +105,7 @@ fn generate_from<'p>(
             let generator = (f.generator || f.is_async) && !f.has_eval;
             let in_env = |n: &str| {
                 if generator {
-                    return n != GEN && n != EVAL_SCOPE && Some(n) != own;
+                    return n != GEN && n != EVAL_SCOPE && Some(n) != own && !boxed[i].contains(&n);
                 }
                 !n.starts_with('%') && !p.lexicals.contains_key(n) && Some(n) != own
             };
@@ -171,6 +172,7 @@ fn generate_from<'p>(
                     && !f.generator
                     && !f.is_async
                     && !scopes.upvalues[i].contains(&ENV)
+                    && !boxed_upvalue(p, &boxed, i, &scopes.upvalues[i])
                     // (Block-scoped ones' new names can't be declared again.)
                     && !scopes.upvalues[i].iter().any(|n| n.contains('%'))
                     && scopes.upvalues[i].len() <= LAZY_UPVALUES
@@ -195,7 +197,7 @@ fn generate_from<'p>(
         match emit[i] {
             Emit::Skip => {}
             Emit::Compile => {
-                let mut f = Gen::new(p, &decls, &overflow[i], &overflow, &scopes, &names, i, lazy.is_some()).function()?;
+                let mut f = Gen::new(p, &decls, &overflow[i], &overflow, &boxed, &scopes, &names, i, lazy.is_some()).function()?;
                 f.closures.iter_mut().for_each(|c| *c = index[*c]);
                 (f.line, f.col) = position(p.functions[i].params_pos);
                 if i != 0 {
@@ -331,6 +333,49 @@ const SHARED_ICS: usize = 60000;
 
 /// The name of the register holding a function's scope object.
 const ENV: &str = "%env";
+
+/// Per function, its block-scoped variables kept in boxes: a generator's
+/// (or an async function's) that nested functions use. Its other variables
+/// those use are in its scope object, one for the call, as its frame
+/// leaves the stack at each `yield`; but each binding of a block-scoped one
+/// (each loop iteration's) is its own. So its register holds a box, an
+/// object whose property of its name is the variable: a new one for each
+/// binding (see [`Gen::fresh_binding`]), which closures capture as they
+/// would the variable (see [`Gen::resolve`]).
+fn boxed_lexicals<'a>(p: &'a Program, decls: &[Vec<&'a str>]) -> Vec<Vec<&'a str>> {
+    let n = p.functions.len();
+    let mut used: Vec<HashSet<&str>> = vec![HashSet::default(); n];
+    for c in 1..n {
+        let refs = references(&p.functions[c]);
+        let mut j = p.functions[c].parent;
+        while let Some(k) = j {
+            used[k].extend(refs.iter().copied());
+            j = p.functions[k].parent;
+        }
+    }
+    (0..n)
+        .map(|i| {
+            let f = &p.functions[i];
+            if i == 0 || !(f.generator || f.is_async) || f.has_eval {
+                return Vec::new();
+            }
+            decls[i].iter().copied().filter(|n| p.lexicals.contains_key(*n) && used[i].contains(n)).collect()
+        })
+        .collect()
+}
+
+/// Whether one of function `i`'s upvalues is an enclosing function's boxed
+/// variable (see [`boxed_lexicals`]): it can't compile on its own, lazily.
+fn boxed_upvalue(p: &Program, boxed: &[Vec<&str>], i: usize, upvalues: &[&str]) -> bool {
+    let mut j = p.functions[i].parent;
+    while let Some(k) = j {
+        if upvalues.iter().any(|n| boxed[k].contains(n)) {
+            return true;
+        }
+        j = p.functions[k].parent;
+    }
+    false
+}
 
 /// Function `i`'s name, for its code.
 /// Where a position of the program is in `src` (through `at`, for a
@@ -1291,6 +1336,8 @@ struct Gen<'a> {
     overflow: &'a [&'a str],
     /// Every function's.
     overflows: &'a [Vec<&'a str>],
+    /// Every function's variables in boxes (see [`boxed_lexicals`]).
+    boxed: &'a [Vec<&'a str>],
     /// The next free temporary.
     temp: usize,
     acc: Acc,
@@ -1354,6 +1401,7 @@ impl<'a> Gen<'a> {
         decls: &'a [Decls<'a>],
         overflow: &'a [&'a str],
         overflows: &'a [Vec<&'a str>],
+        boxed: &'a [Vec<&'a str>],
         scopes: &'a Scopes<'a>,
         names: &'a std::cell::RefCell<HashSet<Name>>,
         index: usize,
@@ -1394,6 +1442,7 @@ impl<'a> Gen<'a> {
             locals,
             overflow,
             overflows,
+            boxed,
             shared_ics: HashMap::default(),
             temp,
             acc: Acc::default(),
@@ -1476,6 +1525,16 @@ impl<'a> Gen<'a> {
                 }
                 self.named(Op::SetNamed, env, n);
             }
+        }
+        // Each boxed variable's first box (see `boxed_lexicals`).
+        let boxed = self.boxed;
+        for &n in &boxed[self.index] {
+            let mark = self.temp;
+            let t = self.alloc(self.f.pos)?;
+            self.emit(Op::LdaUndefined, &[]);
+            self.star(t);
+            self.new_box(self.locals[n], t, n);
+            self.temp = mark;
         }
         if arguments_object(self.p, self.index) {
             // A sloppy function's with simple parameters (in registers):
@@ -1968,6 +2027,9 @@ impl<'a> Gen<'a> {
     /// A new binding for block-scoped `n`: its register's upvalue closed,
     /// and (`hole`) the register not initialized.
     fn fresh_binding(&mut self, n: &str, hole: bool, pos: Pos) -> R<()> {
+        if self.boxed[self.index].contains(&n) {
+            return self.fresh_box(n, hole, pos);
+        }
         match self.resolve(n, pos)? {
             Var::Reg(r) => {
                 if !self.entering && self.scopes.captured[self.index].contains(&n) {
@@ -1985,6 +2047,36 @@ impl<'a> Gen<'a> {
             _ => {}
         }
         Ok(())
+    }
+
+    /// A new box for boxed variable `n` (see [`boxed_lexicals`]): its
+    /// register's upvalue closed (closures so far keep the old box), and
+    /// the variable `undefined` (`hole`) or its value so far.
+    fn fresh_box(&mut self, n: &str, hole: bool, pos: Pos) -> R<()> {
+        let r = self.locals[n];
+        let mark = self.temp;
+        let t = self.alloc(pos)?;
+        if hole {
+            self.emit(Op::LdaUndefined, &[]);
+        } else {
+            self.named(Op::GetNamed, r, n);
+        }
+        self.star(t);
+        if !self.entering {
+            self.emit(Op::CloseUpvalue, &[Arg::Reg(r)]);
+        }
+        self.new_box(r, t, n);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// A box into register `r` whose variable `n` is register `v`'s value.
+    fn new_box(&mut self, r: u8, v: u8, n: &str) {
+        let ic = self.auto_ic("[]1");
+        self.emit(Op::CreateObject, &[Arg::Count(1), ic]);
+        self.star(r);
+        self.ldar(v);
+        self.named(Op::SetNamed, r, n);
     }
 
     /// Initialize variable `n` with the accumulator (no `with` object's).
@@ -2303,6 +2395,10 @@ impl<'a> Gen<'a> {
 
     fn resolve(&self, name: &str, pos: Pos) -> R<Var> {
         if let Some(&r) = self.locals.get(name) {
+            // (A box's property: see `boxed_lexicals`.)
+            if self.boxed[self.index].contains(&name) {
+                return Ok(Var::Scope(r));
+            }
             return Ok(Var::Reg(r));
         }
         if self.overflow.contains(&name) {
@@ -2316,6 +2412,12 @@ impl<'a> Gen<'a> {
                 // (In its scope object: see `generate`.)
                 if self.overflows[k].contains(&name)
                     && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == ENV)
+                {
+                    return Ok(Var::ScopeUpvalue(u as u8));
+                }
+                // (In its box, the upvalue.)
+                if self.boxed[k].contains(&name)
+                    && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == name)
                 {
                     return Ok(Var::ScopeUpvalue(u as u8));
                 }
@@ -2361,7 +2463,9 @@ impl<'a> Gen<'a> {
         match &e.kind {
             ExprKind::This if self.f.class_kind != 3 => Some(0),
             // (In a `with`, a name may be the object's.)
-            ExprKind::Ident(n) if !self.in_with(n) && !self.needs_check(n, e.pos) => self.locals.get(&**n).copied(),
+            ExprKind::Ident(n) if !self.in_with(n) && !self.needs_check(n, e.pos) && !self.boxed[self.index].contains(&&**n) => {
+                self.locals.get(&**n).copied()
+            }
             _ => None,
         }
     }

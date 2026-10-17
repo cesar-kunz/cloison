@@ -3462,6 +3462,52 @@ r.join();"#;
     assert_eq!(value(src), "ro,false,false,5,3000");
 }
 
+/// Each binding of a generator's or an async function's block-scoped
+/// variable that closures use is its own (each loop iteration's), kept in
+/// a box (`js::codegen::boxed_lexicals`), and shared with the closures
+/// across `yield`s and `await`s.
+#[test]
+fn generator_block_bindings_are_per_iteration() {
+    let src = r#"
+var r = [];
+function* g1() { var fs = []; for (let i = 0; i < 3; i++) fs.push(() => i); yield fs.map(f => f()).join(""); }
+r.push(g1().next().value);
+function* g2() { var fs = []; for (let i = 0; i < 3; i++) { fs.push(() => i); yield i; i += 10; } return fs.map(f => f()).join("/"); }
+var it = g2(), x; while (!(x = it.next()).done); r.push(x.value);
+function* g3() { var fs = []; for (const v of ["a", "b", "c"]) { fs.push(function () { return v; }); yield; } return fs.map(f => f()).join(""); }
+it = g3(); while (!(x = it.next()).done); r.push(x.value);
+function* g4() { var fs = []; for (var k = 0; k < 3; k++) { let y = k * 2; fs.push(() => y++); } yield fs.map(f => f() + f()).join(","); }
+r.push(g4().next().value);
+function* g5() { let shared = 0; var inc = () => ++shared; yield inc(); yield inc() + shared; }
+it = g5(); r.push(it.next().value, it.next().value);
+function* g6() { var fs = []; for (let k in { p: 1, q: 2 }) fs.push(() => k); yield fs.map(f => f()).join(""); }
+r.push(g6().next().value);
+function* g7() { var out = []; for (let i = 0; i < 2; i++) { let c = i; var f = () => { c += 100; return c; }; yield f(); out.push(c); } return out.join(); }
+it = g7(); var ys = []; while (!(x = it.next()).done) ys.push(x.value); r.push(ys.join(), x.value);
+function* g8() { var fs = []; for (let i = 0; i < 3; i++) fs.push(function () { return function () { return i; }; }); yield fs.map(f => f()()).join(""); }
+r.push(g8().next().value);
+r.join();"#;
+    assert_eq!(value(src), "012,10,abc,1,5,9,1,4,pq,100,101,100,101,012");
+    let first = cloison::js::compile(
+        r#"
+var r = [];
+async function a1() { var fs = []; for (let i = 0; i < 3; i++) { await null; fs.push(() => i); } return fs.map(f => f()).join(""); }
+a1().then(v => { r.push(v); });
+async function a2() { const t = 5; let u = 6; await 0; u++; return (() => t + u)(); }
+a2().then(v => r.push(v));
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("r.join()").unwrap();
+    for budget in [i64::MAX, 1, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.run(&first).unwrap();
+        let r = vm.run(&second).map(display).unwrap();
+        assert_eq!(r, "12,012", "tier at {budget}");
+    }
+}
+
 /// A load into the slot of the register it loads from (`o = o.o`, as
 /// `get_own_nc_g1_to_g1`): on arm64 a family template, whose registers the
 /// fused name must give.

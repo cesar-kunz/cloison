@@ -3910,12 +3910,14 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     (base, "f")
                 }
                 // Not known to be a number: checked to be an int32 (and
-                // compiled generic once that check has exited).
+                // compiled generic once that check has exited), then as one
+                // (a count of 0 mod 32 leaves it as is).
                 Any if !shr0 && !widened.contains(&i) => {
                     out.acc = I32;
+                    let (base, case) = if insn.imm & 31 == 0 { ("nop", "") } else { (base, "i") };
                     return Sel {
                         check: Some(("check_acc_int", 0, 0)),
-                        ..Sel::new(base, "i", out)
+                        ..Sel::new(base, case, out)
                     };
                 }
                 _ => {
@@ -6004,15 +6006,15 @@ fn stencil_for(
         ("ldar", _) => cat!("ldar_", loc),
         ("star", Home::Fpr(k)) if sel.case == "f" => format!("star_f{k}"),
         ("star", Home::Fpr(k)) => format!("star_i_f{k}"),
-        ("star", _) if sel.case == "f" => cat!("star_", loc, "_f"),
-        ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => cat!("star_", loc, "_i"),
         // Into an int32 slot, a value compiled code never reads (it would
         // be int32 there) but the interpreter may, after an exit: kept
-        // boxed, which `spill_u` writes back as it is.
+        // boxed, which `spill_u` writes back as it is. (A double too.)
         ("star", Home::Int(k)) if sel.case != "i" => {
             box_acc(&mut pre);
             format!("star_u{k}_v")
         }
+        ("star", _) if sel.case == "f" => cat!("star_", loc, "_f"),
+        ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => cat!("star_", loc, "_i"),
         ("star", _) => cat!("star_", loc),
         ("check_callee", _) => cat!("check_callee_", loc),
         ("callee_jne", _) => cat!("callee_jne_", loc),
@@ -12826,7 +12828,7 @@ impl Lowering<'_> {
         if i.op == Op::Call {
             mov(self, Some(w), 0);
         } else if live[0] {
-            self.global_this(0, pc);
+            self.global_this(0, pc, unsafe { (*root).strict });
             self.push(synth(Op::Star, 0, 0, pc), Prop::None);
         }
         for (r, &l) in live.iter().enumerate().skip(1 + argc) {
@@ -12874,9 +12876,13 @@ impl Lowering<'_> {
             && self.entry_live(unsafe { (*fo).code })[0]
     }
 
-    /// Load the global object into `acc`: `this` of a call without a
-    /// receiver (sloppy mode).
-    fn global_this(&mut self, frame: usize, pc: usize) {
+    /// Load `this` of a call without a receiver into `acc`: the global
+    /// object, or `undefined` for a `strict` callee.
+    fn global_this(&mut self, frame: usize, pc: usize, strict: bool) {
+        if strict {
+            self.push(synth(Op::LdaUndefined, 0, frame, pc), Prop::None);
+            return;
+        }
         let g = unsafe { (*self.state.vm).global };
         let prop = Prop::Const {
             value: crate::object::object_value(g).to_bits(),
@@ -13052,6 +13058,18 @@ impl Lowering<'_> {
         if last_level && fos.len() > 1 && fos.iter().any(|&fo| calls(self, fo)) {
             return Vec::new();
         }
+        // Without a receiver, `this` is the global object for sloppy
+        // callees and `undefined` for strict ones: not both (`arg_moves`).
+        if i.op == Op::CallUndefined {
+            let strict: Vec<bool> = (fos.iter())
+                .map(|&fo| unsafe { (*fo).code })
+                .filter(|&c| self.entry_live(c)[0])
+                .map(|c| unsafe { (*c).strict })
+                .collect();
+            if strict.iter().any(|&x| x != strict[0]) {
+                return Vec::new();
+            }
+        }
         fos
     }
 
@@ -13140,7 +13158,7 @@ impl Lowering<'_> {
         // (`usize::MAX`: `this` of a call without a receiver).
         let mut store = |cx: &mut Self, src: Option<usize>, j: usize| {
             match src {
-                Some(usize::MAX) => cx.global_this(frame, pc),
+                Some(usize::MAX) => cx.global_this(frame, pc, unsafe { (*callee).strict }),
                 Some(r) => {
                     cx.push(synth(Op::Ldar, r as u8, frame, pc), Prop::None);
                 }
@@ -13862,9 +13880,11 @@ impl Lowering<'_> {
             _ => cx.mov(frame, i.pc, src, (base + p) as u8),
         };
         // `new` allocated `this` already; a call without a receiver passes
-        // the global object.
+        // the global object, or `undefined` to strict callees (all that
+        // read it are, or none: see `inline_targets`).
         if i.op == Op::CallUndefined && callees.iter().any(|&c| self.entry_live(c)[0]) {
-            self.global_this(frame, i.pc);
+            let strict = callees.iter().any(|&c| unsafe { (*c).strict } && self.entry_live(c)[0]);
+            self.global_this(frame, i.pc, strict);
             self.push(synth(Op::Star, base as u8, frame, i.pc), Prop::None);
         } else if i.op != Op::Construct {
             arg(self, 0, this);

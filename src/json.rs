@@ -2,7 +2,7 @@
 //! `JSON.parse` (with a reviver), as the spec has them. Installed by
 //! [`install`].
 
-use crate::interp::{call_function, to_number, to_string_units};
+use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
 use crate::object::{Class, DONT_ENUM, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
@@ -109,6 +109,7 @@ fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// SerializeJSONProperty: `holder[key]` as JSON appended to `out`; false
 /// if it has none (`undefined`, a function).
 fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mut Vec<u16>) -> Result<bool> {
+    check_native_stack(vm)?;
     let mut v = vm.get_keyed(holder, key)?;
     if is_object(v) {
         let f = vm.get(v, st.a_to_json)?;
@@ -288,6 +289,7 @@ fn json_parse(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// InternalizeJSONProperty: `holder[name]` revived, its properties first.
 fn internalize(vm: &mut Vm, reviver: Value, holder: Value, name: Value) -> Result<Value> {
+    check_native_stack(vm)?;
     let v = vm.get_keyed(holder, name)?;
     if is_object(v) {
         let o = as_object(v);
@@ -351,6 +353,7 @@ impl Parser<'_> {
     }
 
     fn value(&mut self, vm: &mut Vm) -> Result<Value> {
+        check_native_stack(vm)?;
         self.space();
         match self.peek().map(|c| c as u8 as char) {
             Some('{') if self.peek() < Some(128) => {

@@ -262,8 +262,10 @@ macro_rules! handlers {
                 ($fo:expr, $this:expr, $args:expr, $argc:expr, $flags:expr, $size:expr) => {{
                     let callee: *const Code = (*$fo).code;
                     let new = push_frame($regs, $fo, callee, $this, $args, $argc, $flags, $pc.add($size));
+                    // (Thrown from the call: a `catch` around it catches it.)
                     if new.is_null() {
-                        return stack_overflow($regs);
+                        stack_overflow($regs);
+                        tail!(op_unwind, Value::EMPTY)
                     }
                     let left = (*callee).calls_left.get() - 1;
                     (*callee).calls_left.set(left);
@@ -4221,6 +4223,16 @@ pub(crate) const NATIVE_STACK: usize = 1 << 20;
 pub(crate) fn native_stack_low(vm: &Vm) -> bool {
     let here = 0u8;
     (&raw const here as usize) < vm.native_limit
+}
+
+/// A `RangeError` if the native stack is past the run's limit: for
+/// natives that recurse over their input (`JSON.parse`'s nesting).
+#[inline(always)]
+pub(crate) fn check_native_stack(vm: &Vm) -> crate::vm::Result<()> {
+    if native_stack_low(vm) {
+        return Err(Error::range_error("Maximum call stack size exceeded"));
+    }
+    Ok(())
 }
 
 /// A call from compiled code (`jit`'s `call` stencil): `op` is `Call`,

@@ -433,6 +433,16 @@ fn unsupported<T>(pos: Pos, what: impl std::fmt::Display) -> R<T> {
     Err(Error::new(pos as usize, format!("unsupported: {what}")))
 }
 
+/// An error where nesting has used up the native stack (see
+/// `crate::stack`): called by the functions every level of nesting goes
+/// through (as the parser's `deep`).
+fn deep(pos: Pos) -> R<()> {
+    if crate::stack::low() {
+        return Err(Error::new(pos as usize, "too deeply nested".into()));
+    }
+    Ok(())
+}
+
 /// Per function, the variables of enclosing functions it uses (its
 /// upvalues, in order; for a function between the one declaring a
 /// variable and one using it, too, to pass it down), and its own variables
@@ -2739,6 +2749,7 @@ impl<'a> Gen<'a> {
     }
 
     fn value_inner(&mut self, e: &Expr) -> R<()> {
+        deep(e.pos)?;
         use ExprKind::*;
         match &e.kind {
             Num(_) | Unary(UnOp::Neg, _) if smi(e).is_some() => self.lda_smi(smi(e).unwrap()),
@@ -3835,6 +3846,7 @@ impl<'a> Gen<'a> {
     /// Destructure register `r` into pattern `p` (`mode` as
     /// `ExprKind::Destructure`'s).
     fn destructure(&mut self, p: &Pattern, r: u8, mode: u8, pos: Pos) -> R<()> {
+        deep(pos)?;
         match p {
             Pattern::Name(n) => {
                 self.ldar(r);
@@ -4131,6 +4143,7 @@ impl<'a> Gen<'a> {
     /// Jump to `t` if `e` is truthy and to `f` otherwise, one of which is
     /// reached by falling through (see [`Fall`]).
     fn test(&mut self, e: &Expr, t: L, f: L, fall: Fall) -> R<()> {
+        deep(e.pos)?;
         let mark = self.temp;
         match &e.kind {
             ExprKind::Unary(UnOp::Not, x) => self.test(x, f, t, fall.flip())?,
@@ -4254,6 +4267,7 @@ impl<'a> Gen<'a> {
     }
 
     fn stmt_inner(&mut self, s: &'a Stmt) -> R<()> {
+        deep(s.pos)?;
         let mark = self.temp;
         let labels = std::mem::take(&mut self.pending_labels);
         match &s.kind {

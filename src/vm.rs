@@ -589,6 +589,11 @@ pub struct Vm {
     /// `conv_thrown` says there is one (a flag: cheaper to test).
     pub(crate) conv_error: Option<Error>,
     pub(crate) conv_thrown: bool,
+    /// A store just did nothing, as it can't happen (to a read-only
+    /// property, a non-extensible object, a primitive, an accessor without
+    /// a setter): strict code's store throws then (see
+    /// `interp::strict_store_check`). Cleared before the stores that check.
+    pub(crate) store_failed: bool,
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
@@ -821,6 +826,7 @@ impl Vm {
             conv_redo: false,
             conv_error: None,
             conv_thrown: false,
+            store_failed: false,
             open_upvalues: Vec::new(),
             type_names: [None; 7],
             handles: Vec::new(),
@@ -1830,6 +1836,7 @@ impl Vm {
     fn call_setter(&mut self, pair: Value, this: Value, value: Value) -> Result<()> {
         let s = unsafe { *(*as_object(pair)).elems.add(1) };
         if s.is_undefined() {
+            self.store_failed = true;
             return Ok(());
         }
         crate::interp::call_function(self, s, this, &[value]).map(|_| ())
@@ -1898,6 +1905,7 @@ impl Vm {
             }
             // A string is a primitive: stores to it do nothing.
             if (*o).class == Class::String || self.read_only(o, name) {
+                self.store_failed = true;
                 return Ok(());
             }
             if let Some(pair) = self.accessor(o, name) {
@@ -1907,6 +1915,7 @@ impl Vm {
                 Some(slot) => self.store_field(o, slot, value),
                 None => {
                     if (*o).flags & crate::object::NOT_EXTENSIBLE != 0 {
+                        self.store_failed = true;
                         return Ok(());
                     }
                     self.add_property(o, name, value);
@@ -1916,13 +1925,14 @@ impl Vm {
         Ok(())
     }
 
-    fn set_primitive(&self, obj: Value, name: Atom) -> Result<()> {
+    fn set_primitive(&mut self, obj: Value, name: Atom) -> Result<()> {
         if obj.is_undefined() || obj.is_null() {
             return Err(Error::type_error(format!(
                 "Cannot set properties of {obj:?} (setting '{}')",
                 self.atom_name(name)
             )));
         }
+        self.store_failed = true;
         Ok(())
     }
 
@@ -2009,9 +2019,11 @@ impl Vm {
             if (*o).class == Class::Array && name == self.a_length {
                 return self.set_array_length(o, value);
             }
-            // Sloppy mode: a store to a read-only property, own or
-            // inherited, does nothing (and isn't cached, so it stays slow).
+            // A store to a read-only property, own or inherited, does
+            // nothing (and isn't cached, so it stays slow); strict code's
+            // throws (see `store_failed`).
             if (*o).class == Class::String || self.read_only(o, name) {
+                self.store_failed = true;
                 return Ok(());
             }
             // A setter's: called, never cached (noted for the JIT).
@@ -2044,6 +2056,7 @@ impl Vm {
                 return Ok(());
             }
             if (*o).flags & crate::object::NOT_EXTENSIBLE != 0 {
+                self.store_failed = true;
                 return Ok(());
             }
             let slot = self.add_property(o, name, value);
@@ -2301,15 +2314,20 @@ impl Vm {
     }
 
     /// A sparse object's own key `i`, stored as a named property (see
-    /// `object::SPARSE`), if it has it.
-    fn sparse_get(&mut self, o: *mut Object, i: u32) -> Result<Option<Value>> {
+    /// `object::SPARSE`), if it has it: a getter's gets `receiver` (`o`, or
+    /// an object `o` is a prototype of).
+    fn sparse_get(&mut self, o: *mut Object, i: u32, receiver: Value) -> Result<Option<Value>> {
         let a = self.intern(&i.to_string());
         unsafe {
-            if (*(*o).shape).lookup(a).is_none() {
+            let Some(slot) = (*(*o).shape).lookup(a) else {
                 return Ok(None);
+            };
+            let v = *Object::slot(o, (*(*o).shape).location(slot));
+            if self.is_accessor(o, slot) {
+                return self.call_getter(v, receiver).map(Some);
             }
+            Ok(Some(v))
         }
-        self.get(object_value(o), a).map(Some)
     }
 
     /// Whether `o` has key `i` of its own: an element, or a sparse one.
@@ -2511,7 +2529,11 @@ impl Vm {
         {
             let (ic, _) = code.ic(ic);
             unsafe { note_bytes(ic, as_object(obj)) };
-        } else if obj.is_cell() {
+        } else if obj.is_cell()
+            // (Not a mapped `arguments` object's: its elements' values are
+            // the parameters', see `mapped_slot`.)
+            && !self.mapped_args.iter().any(|m| m.o == as_object(obj))
+        {
             let (ic, _) = code.ic(ic);
             unsafe {
                 install(
@@ -2581,7 +2603,7 @@ impl Vm {
                     }
                 }
                 if (*o).flags & crate::object::SPARSE != 0
-                    && let Some(v) = self.sparse_get(o, i)?
+                    && let Some(v) = self.sparse_get(o, i, obj)?
                 {
                     return Ok(v);
                 }
@@ -2657,6 +2679,7 @@ impl Vm {
                     "Cannot set properties of {obj:?}"
                 )));
             }
+            self.store_failed = true;
             return Ok(());
         }
         let i = match self.property_key(key) {
@@ -2674,7 +2697,10 @@ impl Vm {
             // A string's characters can't be changed; a typed array stores
             // within its length only (a buffer has no elements).
             match (*o).class {
-                Class::String => return Ok(()),
+                Class::String => {
+                    self.store_failed = true;
+                    return Ok(());
+                }
                 c if c.no_elements() => return Ok(()),
                 Class::TypedArray => {
                     if i < (*o).elems_len {
@@ -2723,6 +2749,7 @@ impl Vm {
             if (*o).class == Class::Wrapper
                 && string_units(wrapped(obj).unwrap()).is_some_and(|u| (i as usize) < u.len())
             {
+                self.store_failed = true;
                 return Ok(());
             }
             if flags & SPARSE != 0 {
@@ -2732,17 +2759,20 @@ impl Vm {
                 }
             }
             if Self::has_element(o, i) {
-                if flags & FROZEN != 0 {
+                if flags & FROZEN != 0 || !self.writable_element(o, i) {
+                    self.store_failed = true;
                     return Ok(());
                 }
                 self.store_element(o, i as usize, value);
                 return Ok(());
             }
             if flags & NOT_EXTENSIBLE != 0 {
+                self.store_failed = true;
                 return Ok(());
             }
             if i >= (*o).elems_len {
                 if (*o).class == Class::Array && flags & LENGTH_READ_ONLY != 0 {
+                    self.store_failed = true;
                     return Ok(());
                 }
                 self.reserve_elems(o, i as usize + 1);

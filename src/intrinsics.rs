@@ -51,6 +51,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("delegate_step", delegate_step),
     ("delegate_done", delegate_done),
     ("throw_delete", throw_delete),
+    ("for_in_has", for_in_has),
 ];
 
 /// The id of the intrinsic `name`.
@@ -538,6 +539,15 @@ fn iterator_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// A `for … of` left early: `[iterator]` closed.
 fn iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     crate::symbol::close(vm, a[0]).map(|()| Value::UNDEFINED)
+}
+
+/// A `for … in`'s key `[object, key]` still to visit: the object (if not
+/// a primitive, whose keys stay) still has it, not deleted in the loop.
+fn for_in_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if !crate::props::is_object(a[0]) {
+        return Ok(Value::TRUE);
+    }
+    vm.has_property(a[0], a[1]).map(Value::from_bool)
 }
 
 /// A `for … of` left by an exception: `[iterator]` closed, its own errors

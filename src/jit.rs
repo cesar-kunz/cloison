@@ -2634,6 +2634,9 @@ impl Feedback {
                 addr: unsafe { Object::slot(holder, ic.loc) } as u64,
                 ft: field(unsafe { (*holder).shape }),
             },
+            // (A setter or a read-only property may be on the prototype
+            // chain since: see `Ic`.)
+            Op::SetNamed if !ic.new_shape.is_null() && ic.epoch != epoch => Prop::None,
             Op::SetNamed if !ic.new_shape.is_null() => Prop::Transition {
                 shape,
                 new_shape: ic.new_shape as u64,

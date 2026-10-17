@@ -1319,6 +1319,10 @@ handlers! {
             if (*o).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
+                    // (See `Ic::epoch`.)
+                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch {
+                        tail!(slow_set_named, acc)
+                    }
                     (*o).shape = new;
                 }
                 let at = Object::slot(o, (*ic).loc);
@@ -1344,6 +1348,9 @@ handlers! {
                 if fits_field(tag, (*w).holder as u64, acc) {
                     let new = (*w).new_shape;
                     if !new.is_null() {
+                        if (*w).epoch != (*frame_vm(regs)).proto_epoch {
+                            break;
+                        }
                         (*o).shape = new;
                     }
                     let at = Object::slot(o, (*w).loc);
@@ -1370,6 +1377,10 @@ handlers! {
             if (*o).shape == (*ic).shape && ((*ic).holder as u64) <= 2 {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
+                    // (See `Ic::epoch`.)
+                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch {
+                        tail!(slow_set_named, acc)
+                    }
                     (*o).shape = new;
                 }
                 *Object::slot(o, (*ic).loc) = as_named(tag, (*ic).holder as u64, acc);

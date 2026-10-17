@@ -3320,6 +3320,63 @@ main();"#;
     assert_eq!(value(src), "NaN,400,400,700,91,250000");
 }
 
+/// Shifts by a constant of 0 mod 32 of a value not known to be a number:
+/// checked to be an int32, then nothing (there is no `sar_smi_i_0`).
+#[test]
+fn shifts_by_multiples_of_32_of_any_value() {
+    let src = r#"
+function f(a) {
+  var s = 0;
+  for (var i = 0; i < 20000; i++) {
+    var x = a[i & 1];
+    s += (x >> 0) + (x << 32) + (x >> 64) + (x >>> 0) + (x << 65536);
+  }
+  return s;
+}
+f([1, "2"]) + "," + f([-3, "4.5"]);"#;
+    assert_eq!(value(src), "150000,42949673010000");
+}
+
+/// A double stored into a register with an int32 home is kept boxed
+/// (`star_u<k>_v`; there is no `star_u<k>_f`).
+#[test]
+fn doubles_into_int32_homes() {
+    let src = r#"
+function f(n) {
+  var a = -2147483648, b = -7, d = NaN, h = 0;
+  for (var i = 0; i < n; i++) {
+    b = ((b * 5) - Math.round(2)); b = (d - b); a |= 4294967296; b = (b | 0);
+    h = (h * 31 + (b !== b ? 3 : 2)) | 0;
+  }
+  return h;
+}
+f(3000) + "," + f(300000);"#;
+    assert_eq!(value(src), "-1471031552,-1750991872");
+}
+
+/// A strict function called without a receiver gets `undefined` as `this`
+/// from compiled code too: inlined (also among several callees), called
+/// directly, and in a self tail call.
+#[test]
+fn strict_callees_get_undefined_this() {
+    let src = r#"
+function s1() { "use strict"; return this === undefined; }
+function big() {
+  "use strict";
+  var x = 0;
+  for (var j = 0; j < 3; j++) { x += j * 2; x ^= j; x += j % 3; x -= 1; x *= 1; x += 7; x -= 7; x |= 0; }
+  return (this === undefined ? 1 : 2) + x - x;
+}
+function sloppy() { return this === undefined; }
+function tr(n, acc) { "use strict"; if (n == 0) return acc; return tr(n - 1, acc + (this === undefined ? 1 : 0)); }
+var fs = [s1, sloppy, function () { "use strict"; return typeof this; }, function () { return typeof this; }];
+var a = 0, b = 0, c = 0, q = {};
+for (var i = 0; i < 20000; i++) { if (s1()) a++; b += big(); if (sloppy()) c++; }
+for (var i = 0; i < 20000; i++) { var g = fs[i & 3]; q[g()] = 1; }
+[a, b, c, tr(5000, 0), Object.keys(q).sort().join("/")].join();"#;
+    assert_eq!(value(src), "20000,20000,0,5000,false/object/true/undefined");
+}
+
 /// A load into the slot of the register it loads from (`o = o.o`, as
 /// `get_own_nc_g1_to_g1`): on arm64 a family template, whose registers the
 /// fused name must give.

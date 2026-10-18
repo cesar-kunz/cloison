@@ -332,7 +332,7 @@ fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `Array.prototype.toLocaleString()`: each element's `toLocaleString()`,
 /// comma-separated.
-fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     if joining(vm, o) {
         return Ok(vm.new_string(&[]));
@@ -441,7 +441,7 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
 }
 
 /// `Array.prototype.reverse()`, in place.
-fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     if dense(vm, as_object(o)) {
         let obj = as_object(o);
@@ -820,7 +820,7 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
 }
 
 /// `Array.prototype.lastIndexOf(x, from)`.
-fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let x = arg(a, 0);
     if len == 0.0 {
@@ -841,7 +841,7 @@ fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `Array.prototype.includes(x, from)`: SameValueZero, holes as
 /// `undefined`.
-fn array_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let x = arg(a, 0);
     if len == 0.0 {
@@ -887,7 +887,7 @@ fn each(
     Ok(())
 }
 
-fn array_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut all = true;
     each(vm, this, a, "every", |_, _, _, r| {
         all = to_boolean(r);
@@ -896,7 +896,7 @@ fn array_every(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(all))
 }
 
-fn array_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut any = false;
     each(vm, this, a, "some", |_, _, _, r| {
         any = to_boolean(r);
@@ -905,7 +905,7 @@ fn array_some(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(any))
 }
 
-fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     each(vm, this, a, "forEach", |_, _, _, _| Ok(true))?;
     Ok(Value::UNDEFINED)
 }
@@ -936,7 +936,7 @@ fn array_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(out)
 }
 
-fn array_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let f = callback(a, "find")?;
     let that = arg(a, 1);
@@ -952,7 +952,7 @@ fn array_find(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::UNDEFINED)
 }
 
-fn array_find_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_find_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let f = callback(a, "findIndex")?;
     let that = arg(a, 1);
@@ -999,11 +999,11 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], right: bool) -> Result<Value> {
     Ok(acc)
 }
 
-fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_reduce(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     reduce(vm, this, a, false)
 }
 
-fn array_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     reduce(vm, this, a, true)
 }
 
@@ -1021,7 +1021,7 @@ fn array_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Array.prototype.copyWithin(target, start, end)`.
-fn array_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let mut to = relative(arg(a, 0), len, 0.0);
     let mut from = relative(arg(a, 1), len, 0.0);
@@ -1157,7 +1157,7 @@ pub(crate) fn apply_list(vm: &mut Vm, list: Value) -> Result<Vec<Value>> {
 }
 
 /// `at(i)`: element `i`, counted from the end if negative.
-fn array_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let n = to_integer(arg(a, 0));
     let k = if n < 0.0 { len + n } else { n };
@@ -1185,11 +1185,11 @@ fn find_last(vm: &mut Vm, this: Value, a: &[Value], index: bool) -> Result<Value
     Ok(if index { Value::from_i32(-1) } else { Value::UNDEFINED })
 }
 
-fn array_find_last(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_find_last(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     find_last(vm, this, a, false)
 }
 
-fn array_find_last_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_find_last_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     find_last(vm, this, a, true)
 }
 

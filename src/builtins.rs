@@ -1689,7 +1689,11 @@ fn install_typed_arrays(vm: &mut Vm) {
     vm.define_native(abp, "slice", buffer_slice, 2, any, false);
     vm.define_native(ab, "isView", buffer_is_view, 1, any, false);
 
+    // `%TypedArray%` (abstract) and its prototype, the concrete kinds'.
     let shared = vm.new_object(op);
+    let ta = vm.native_function("TypedArray", typed_array_abstract, 0, any, true);
+    link_constructor(vm, ta, shared);
+    vm.define_natives(ta, &[("from", typed_from as NativeFn, 1), ("of", typed_of, 0)]);
     vm.define_natives(
         shared,
         &[
@@ -1698,6 +1702,29 @@ fn install_typed_arrays(vm: &mut Vm) {
             ("join", typed_join, 1),
             ("toString", typed_to_string, 0),
             ("fill", typed_fill, 3),
+            ("map", typed_map, 1),
+            ("filter", typed_filter, 1),
+            ("slice", typed_slice, 2),
+            ("sort", typed_sort, 1),
+            ("toSorted", typed_to_sorted, 1),
+            ("toReversed", typed_to_reversed, 0),
+            ("with", typed_with, 2),
+            ("at", typed_generic::<0>, 1),
+            ("copyWithin", typed_generic::<1>, 2),
+            ("every", typed_generic::<2>, 1),
+            ("find", typed_generic::<3>, 1),
+            ("findIndex", typed_generic::<4>, 1),
+            ("findLast", typed_generic::<5>, 1),
+            ("findLastIndex", typed_generic::<6>, 1),
+            ("forEach", typed_generic::<7>, 1),
+            ("includes", typed_generic::<8>, 1),
+            ("indexOf", typed_generic::<9>, 1),
+            ("lastIndexOf", typed_generic::<10>, 1),
+            ("reduce", typed_generic::<11>, 1),
+            ("reduceRight", typed_generic::<12>, 1),
+            ("reverse", typed_generic::<13>, 0),
+            ("some", typed_generic::<14>, 1),
+            ("toLocaleString", typed_generic::<15>, 0),
         ],
     );
     getter(vm, shared, "buffer", typed_buffer);
@@ -1719,6 +1746,7 @@ fn install_typed_arrays(vm: &mut Vm) {
         let proto = vm.new_object(object_value(shared));
         let c = vm.define_native(g, kind.name(), CTORS[k], 3, any, true);
         link_constructor(vm, c, proto);
+        vm.set_prototype_of(c, object_value(ta));
         let size = Value::from_i32(kind.size() as i32);
         vm.add_property_with(c, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
         vm.add_property_with(proto, a_bpe, size, READ_ONLY | DONT_ENUM | DONT_DELETE);
@@ -1971,6 +1999,293 @@ fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn typed_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     typed_join(vm, this, &[])
+}
+
+/// `%TypedArray%` itself: not to be called or constructed.
+fn typed_array_abstract(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    Err(Error::type_error("Abstract class TypedArray not directly constructable"))
+}
+
+/// The Array methods a typed array's of the index delegates to, once
+/// `this` is checked to be one.
+const TYPED_GENERIC: [NativeFn; 16] = [
+    crate::array::array_at,
+    crate::array::array_copy_within,
+    crate::array::array_every,
+    crate::array::array_find,
+    crate::array::array_find_index,
+    crate::array::array_find_last,
+    crate::array::array_find_last_index,
+    crate::array::array_for_each,
+    crate::array::array_includes,
+    crate::array::array_index_of,
+    crate::array::array_last_index_of,
+    crate::array::array_reduce,
+    crate::array::array_reduce_right,
+    crate::array::array_reverse,
+    crate::array::array_some,
+    crate::array::array_to_locale_string,
+];
+
+fn typed_generic<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    this_typed(this)?;
+    TYPED_GENERIC[K](vm, this, a)
+}
+
+/// `get %TypedArray%.prototype[Symbol.toStringTag]`: the kind's name.
+pub(crate) fn typed_to_string_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    if !is_class(this, Class::TypedArray) {
+        return Ok(Value::UNDEFINED);
+    }
+    Ok(str_value(vm, kind_of(as_object(this)).name()))
+}
+
+/// A new typed array of kind `k`, `n` elements of `values` (zero past
+/// them).
+fn new_typed(vm: &mut Vm, k: TypedKind, n: usize, values: &[f64]) -> Result<Value> {
+    typed_length(n, k.size())?;
+    let b = new_buffer(vm, n * k.size());
+    let v = new_view(vm, k, b, 0, n);
+    for (i, &d) in values.iter().enumerate() {
+        unsafe { k.store((*b).elems.cast(), i, d) };
+    }
+    Ok(v)
+}
+
+/// Typed array `o`'s elements as numbers.
+fn typed_values(o: *mut Object) -> Vec<f64> {
+    let k = kind_of(o);
+    (0..unsafe { (*o).elems_len } as usize)
+        .map(|i| unsafe { k.load((*o).elems.cast(), i) }.to_number())
+        .collect()
+}
+
+/// The callback argument, checked callable.
+fn typed_callback(a: &[Value], what: &str) -> Result<Value> {
+    let f = arg(a, 0);
+    if !crate::props::is_callable(f) {
+        return Err(Error::type_error(format!("{} is not a function (%TypedArray%.prototype.{what})", crate::vm::display(f))));
+    }
+    Ok(f)
+}
+
+/// `t.map(f, thisArg)`: a typed array of the kind of `f`'s results.
+fn typed_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let f = typed_callback(a, "map")?;
+    let k = kind_of(o);
+    let n = unsafe { (*o).elems_len } as usize;
+    let out = new_typed(vm, k, n, &[])?;
+    for i in 0..n {
+        let v = if i < unsafe { (*o).elems_len } as usize { unsafe { k.load((*o).elems.cast(), i) } } else { Value::UNDEFINED };
+        let r = crate::interp::call_function(vm, f, arg(a, 1), &[v, Value::from_i32(i as i32), this])?;
+        vm.set_keyed(out, Value::from_i32(i as i32), r)?;
+    }
+    Ok(out)
+}
+
+/// `t.filter(f, thisArg)`: a typed array of the kind of the elements `f`
+/// accepts.
+fn typed_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let f = typed_callback(a, "filter")?;
+    let k = kind_of(o);
+    let mut kept = Vec::new();
+    for i in 0..unsafe { (*o).elems_len } as usize {
+        let v = unsafe { k.load((*o).elems.cast(), i) };
+        let r = crate::interp::call_function(vm, f, arg(a, 1), &[v, Value::from_i32(i as i32), this])?;
+        if crate::interp::to_boolean(r) {
+            kept.push(v.to_number());
+        }
+    }
+    new_typed(vm, k, kept.len(), &kept)
+}
+
+/// `t.slice(begin, end)`: a copy of those elements.
+fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let len = unsafe { (*o).elems_len } as usize;
+    let s = relative(int_arg(a, 0), len);
+    let e = match a.get(1) {
+        Some(v) if !v.is_undefined() => relative(int_arg(a, 1), len),
+        _ => len,
+    };
+    let values = typed_values(o);
+    let part = &values[s.min(len)..e.max(s).min(len)];
+    new_typed(vm, kind_of(o), part.len(), part)
+}
+
+/// Sort `values` (stably) by `cmp` (a function, or `undefined`: numeric
+/// order, -0 before +0, NaN last).
+fn sort_numbers(vm: &mut Vm, values: &mut Vec<f64>, cmp: Value) -> Result<()> {
+    if !cmp.is_undefined() && !crate::props::is_callable(cmp) {
+        return Err(Error::type_error("The comparison function must be either a function or undefined"));
+    }
+    let mut after = |vm: &mut Vm, x: f64, y: f64| -> Result<bool> {
+        if cmp.is_undefined() {
+            return Ok(match (x.is_nan(), y.is_nan()) {
+                (true, _) => !y.is_nan(),
+                (false, true) => false,
+                _ => x > y || (x == 0.0 && y == 0.0 && x.is_sign_positive() && y.is_sign_negative()),
+            });
+        }
+        let r = crate::interp::call_function(vm, cmp, Value::UNDEFINED, &[Value::number(x), Value::number(y)])?;
+        Ok(to_number(r) > 0.0)
+    };
+    // A merge sort: a comparator that isn't consistent still ends.
+    let mut width = 1;
+    let n = values.len();
+    let mut buf = values.clone();
+    while width < n {
+        let mut lo = 0;
+        while lo < n {
+            let mid = (lo + width).min(n);
+            let hi = (lo + 2 * width).min(n);
+            let (mut i, mut j, mut k) = (lo, mid, lo);
+            while i < mid && j < hi {
+                if after(vm, values[i], values[j])? {
+                    buf[k] = values[j];
+                    j += 1;
+                } else {
+                    buf[k] = values[i];
+                    i += 1;
+                }
+                k += 1;
+            }
+            buf[k..k + mid - i].copy_from_slice(&values[i..mid]);
+            k += mid - i;
+            buf[k..k + hi - j].copy_from_slice(&values[j..hi]);
+            lo = hi;
+        }
+        std::mem::swap(values, &mut buf);
+        width *= 2;
+    }
+    Ok(())
+}
+
+/// `t.sort(cmp)`: in place.
+fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let cmp = arg(a, 0);
+    if !cmp.is_undefined() && !crate::props::is_callable(cmp) {
+        return Err(Error::type_error("The comparison function must be either a function or undefined"));
+    }
+    let o = this_typed(this)?;
+    let mut values = typed_values(o);
+    sort_numbers(vm, &mut values, cmp)?;
+    let k = kind_of(o);
+    for (i, d) in values.into_iter().enumerate() {
+        if i < unsafe { (*o).elems_len } as usize {
+            unsafe { k.store((*o).elems.cast(), i, d) };
+        }
+    }
+    Ok(this)
+}
+
+/// `t.toSorted(cmp)`: a sorted copy.
+fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let cmp = arg(a, 0);
+    if !cmp.is_undefined() && !crate::props::is_callable(cmp) {
+        return Err(Error::type_error("The comparison function must be either a function or undefined"));
+    }
+    let o = this_typed(this)?;
+    let mut values = typed_values(o);
+    sort_numbers(vm, &mut values, cmp)?;
+    new_typed(vm, kind_of(o), values.len(), &values)
+}
+
+/// `t.toReversed()`: a reversed copy.
+fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let mut values = typed_values(o);
+    values.reverse();
+    new_typed(vm, kind_of(o), values.len(), &values)
+}
+
+/// `t.with(i, v)`: a copy with element `i` (from the end if negative) `v`.
+fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    let len = unsafe { (*o).elems_len } as f64;
+    let n = to_number(arg(a, 0));
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    let i = if n < 0.0 { len + n } else { n };
+    let d = to_number(arg(a, 1));
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    if i < 0.0 || i >= unsafe { (*o).elems_len } as f64 {
+        return Err(Error::range_error("Invalid typed array index"));
+    }
+    let mut values = typed_values(o);
+    values[i as usize] = d;
+    new_typed(vm, kind_of(o), values.len(), &values)
+}
+
+/// `TA.from(source, mapFn, thisArg)`: a new `this` typed array of the
+/// source's values (iterated, or of an array-like), mapped.
+fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if !crate::intrinsics::is_constructor(this) {
+        return Err(Error::type_error("TypedArray.from: this is not a constructor"));
+    }
+    let (source, f) = (arg(a, 0), arg(a, 1));
+    if !f.is_undefined() && !crate::props::is_callable(f) {
+        return Err(Error::type_error("TypedArray.from: the mapping function is not callable"));
+    }
+    let a_iter = vm.a_sym_iterator;
+    let iter = if crate::props::is_object(source) || string_units(source).is_some() {
+        let o = object_value(vm.to_object(source)?);
+        vm.get(o, a_iter)?
+    } else {
+        Value::UNDEFINED
+    };
+    let values = vm.handle_scope(|vm| -> Result<Vec<Value>> {
+        let mut values = Vec::new();
+        if !iter.is_undefined() && !iter.is_null() {
+            crate::symbol::iterate(vm, source, |vm, v| {
+                vm.handles.push(v);
+                values.push(v);
+                Ok(())
+            })?;
+        } else {
+            let o = object_value(vm.to_object(source)?);
+            let n = vm.length_of(o)?;
+            let mut i = 0.0;
+            while i < n {
+                let v = vm.get_keyed(o, Value::number(i))?;
+                vm.handles.push(v);
+                values.push(v);
+                i += 1.0;
+            }
+        }
+        Ok(values)
+    })?;
+    let out = crate::intrinsics::construct(vm, this, &[Value::from_i32(values.len() as i32)])?;
+    if !is_class(out, Class::TypedArray) || (unsafe { (*as_object(out)).elems_len } as usize) < values.len() {
+        return Err(Error::type_error("TypedArray.from: the constructor made no typed array that long"));
+    }
+    for (i, &v) in values.iter().enumerate() {
+        let v = if f.is_undefined() {
+            v
+        } else {
+            crate::interp::call_function(vm, f, arg(a, 2), &[v, Value::from_i32(i as i32)])?
+        };
+        vm.set_keyed(out, Value::from_i32(i as i32), v)?;
+    }
+    Ok(out)
+}
+
+/// `TA.of(...items)`: a new `this` typed array of them.
+fn typed_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if !crate::intrinsics::is_constructor(this) {
+        return Err(Error::type_error("TypedArray.of: this is not a constructor"));
+    }
+    let out = crate::intrinsics::construct(vm, this, &[Value::from_i32(a.len() as i32)])?;
+    if !is_class(out, Class::TypedArray) || (unsafe { (*as_object(out)).elems_len } as usize) < a.len() {
+        return Err(Error::type_error("TypedArray.of: the constructor made no typed array that long"));
+    }
+    for (i, &v) in a.iter().enumerate() {
+        vm.set_keyed(out, Value::from_i32(i as i32), v)?;
+    }
+    Ok(out)
 }
 
 fn typed_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

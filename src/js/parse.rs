@@ -722,7 +722,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             let written = self.binding_ident()?;
             // (A body's `var` renamed apart: see `push_body_vars`.)
-            let name = self.resolve(&written).unwrap_or_else(|| written.clone());
+            let name = self.resolve_var(&written).unwrap_or_else(|| written.clone());
             let init = if self.eat("=") {
                 let e = self.assignment(no_in)?;
                 self.infer_name(&e, &written);
@@ -730,7 +730,17 @@ impl<'a> Parser<'_, 'a, '_> {
             } else {
                 None
             };
-            decls.push((name, init));
+            // `catch (e) { var e = 1; }`: the `var` is the function's, the
+            // initializer stores to the catch parameter (Annex B.3.5).
+            if let (Some(target), Some(e)) = (self.resolve(&written).filter(|t| *t != name), &init) {
+                let pos = e.pos;
+                let target = expr(self.arena, Expr { kind: ExprKind::Ident(target), pos });
+                let value = expr(self.arena, init.unwrap());
+                decls.push((name, None));
+                decls.push(("".into(), Some(Expr { kind: ExprKind::Assign(None, target, value), pos })));
+            } else {
+                decls.push((name, init));
+            }
             if !self.eat(",") {
                 return Ok(decls);
             }
@@ -2214,6 +2224,20 @@ impl<'a> Parser<'_, 'a, '_> {
             return None;
         }
         for f in self.frames.iter().rev() {
+            if let Some((_, r)) = f.names.iter().find(|(o, _)| o == name) {
+                return (r != name).then(|| r.clone());
+            }
+        }
+        None
+    }
+
+    /// What `var name` declares: [`Parser::resolve`]'s, but past catch
+    /// parameters, which a `var` of the same name doesn't redeclare.
+    fn resolve_var(&self, name: &Name) -> Option<Name> {
+        if self.collect || self.renames == 0 {
+            return None;
+        }
+        for f in self.frames.iter().rev().filter(|f| !f.catch) {
             if let Some((_, r)) = f.names.iter().find(|(o, _)| o == name) {
                 return (r != name).then(|| r.clone());
             }

@@ -353,6 +353,10 @@ pub struct Code {
     ics: std::cell::OnceCell<Box<[UnsafeCell<[Ic; IC_WAYS]>]>>,
     /// The property name of each inline-cache slot.
     pub ic_names: Box<[Atom]>,
+    /// The `SetNamed` slots that define their property, an object
+    /// literal's: what a prototype's setter or read-only property of the
+    /// name doesn't change (see `Vm::set_named_miss`).
+    pub define_ics: Box<[u16]>,
     /// The nested functions, by `CreateClosure` operand.
     pub closures: Vec<*const Code>,
     /// `LdaConstant`'s values.
@@ -667,6 +671,9 @@ pub struct Vm {
     pub(crate) a_sym_iterator: Atom,
     pub(crate) a_sym_to_string_tag: Atom,
     pub(crate) a_sym_to_primitive: Atom,
+    /// Some object has had a `Symbol.toPrimitive` property, which
+    /// conversions then look for (see `interp::to_primitive_hint`).
+    pub(crate) to_primitive_defined: bool,
     pub(crate) a_sym_has_instance: Atom,
     /// The `new.target` of the frame about to start (set by
     /// `intrinsics::construct_with` for a function whose first instruction
@@ -859,6 +866,7 @@ impl Vm {
             a_sym_iterator: Atom(0),
             a_sym_to_string_tag: Atom(0),
             a_sym_to_primitive: Atom(0),
+            to_primitive_defined: false,
             a_sym_has_instance: Atom(0),
             new_target: Value::EMPTY,
             eval_envs: Vec::new(),
@@ -1215,6 +1223,9 @@ impl Vm {
                 .find(|&&(n, a, _)| n == name && a == attrs)
         {
             return t;
+        }
+        if name == self.a_sym_to_primitive {
+            self.to_primitive_defined = true;
         }
         let keys = Self::grown(&s.keys, name);
         let slot_attrs = Self::grown(&s.attrs, attrs);
@@ -1896,15 +1907,19 @@ impl Vm {
     /// `obj[name] = value`.
     pub fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
         if !obj.is_cell() {
-            return self.set_primitive(obj, name);
+            return self.set_primitive(obj, name, value);
         }
         let o = as_object(obj);
         unsafe {
             if (*o).class == Class::Array && name == self.a_length {
                 return self.set_array_length(o, value);
             }
-            // A string is a primitive: stores to it do nothing.
-            if (*o).class == Class::String || self.read_only(o, name) {
+            // A string is a primitive: stores to it do nothing, but call
+            // setters.
+            if (*o).class == Class::String {
+                return self.set_string(obj, o, name, value);
+            }
+            if self.read_only(o, name) {
                 self.store_failed = true;
                 return Ok(());
             }
@@ -1925,12 +1940,29 @@ impl Vm {
         Ok(())
     }
 
-    fn set_primitive(&mut self, obj: Value, name: Atom) -> Result<()> {
+    fn set_primitive(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
         if obj.is_undefined() || obj.is_null() {
             return Err(Error::type_error(format!(
                 "Cannot set properties of {obj:?} (setting '{}')",
                 self.atom_name(name)
             )));
+        }
+        // (An inherited setter's `this` the primitive.)
+        let o = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
+        if let Some(pair) = self.accessor(o, name) {
+            return self.call_setter(pair, obj, value);
+        }
+        self.store_failed = true;
+        Ok(())
+    }
+
+    /// A store to string `o`'s property `name`: an inherited setter's
+    /// call, or nothing (a primitive's own properties can't be set).
+    fn set_string(&mut self, obj: Value, o: *mut Object, name: Atom, value: Value) -> Result<()> {
+        if name != self.a_length
+            && let Some(pair) = self.accessor(o, name)
+        {
+            return self.call_setter(pair, obj, value);
         }
         self.store_failed = true;
         Ok(())
@@ -2007,11 +2039,11 @@ impl Vm {
     }
 
     /// `SetNamed` miss: store `obj.name = value` and cache how, if possible.
-    pub fn set_named_miss(&mut self, code: &Code, ic: u16, obj: Value, value: Value) -> Result<()> {
+    pub fn set_named_miss(&mut self, code: &Code, k: u16, obj: Value, value: Value) -> Result<()> {
         code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
-        let (ic, name) = code.ic(ic);
+        let (ic, name) = code.ic(k);
         if !obj.is_cell() {
-            return self.set_primitive(obj, name);
+            return self.set_primitive(obj, name, value);
         }
         let o = as_object(obj);
         unsafe {
@@ -2022,7 +2054,16 @@ impl Vm {
             // A store to a read-only property, own or inherited, does
             // nothing (and isn't cached, so it stays slow); strict code's
             // throws (see `store_failed`).
-            if (*o).class == Class::String || self.read_only(o, name) {
+            if (*o).class == Class::String {
+                return self.set_string(obj, o, name, value);
+            }
+            // An object literal's property past a prototype's setter or
+            // read-only property: defined, not cached.
+            let defines = || code.define_ics.iter().any(|&d| d == k);
+            if self.read_only(o, name) {
+                if defines() {
+                    return self.create_data_property(obj, Key::Name(name), value);
+                }
                 self.store_failed = true;
                 return Ok(());
             }
@@ -2030,6 +2071,9 @@ impl Vm {
             if let Some((h, slot)) = self.lookup(o, name)
                 && self.is_accessor(h, slot)
             {
+                if defines() {
+                    return self.create_data_property(obj, Key::Name(name), value);
+                }
                 if h != o {
                     self.heap.note(object_value(h));
                     note_accessor(ic, old, h, self.proto_epoch);
@@ -2679,6 +2723,9 @@ impl Vm {
                     "Cannot set properties of {obj:?}"
                 )));
             }
+            if let Key::Name(a) = self.property_key(key) {
+                return self.set_primitive(obj, a, value);
+            }
             self.store_failed = true;
             return Ok(());
         }
@@ -3277,6 +3324,7 @@ impl Vm {
             nregs: 1 + nparams,
             ics: Default::default(),
             ic_names: Box::new([]),
+            define_ics: Box::new([]),
             closures: Vec::new(),
             constants: Box::new([]),
             handlers: Box::new([]),
@@ -3313,6 +3361,9 @@ impl Vm {
         unsafe {
             let s = &*(*o).shape;
             let n = s.keys.len() + names.len();
+            if names.contains(&self.a_sym_to_primitive) {
+                self.to_primitive_defined = true;
+            }
             let mut keys = Vec::with_capacity(n);
             keys.extend_from_slice(&s.keys);
             keys.extend_from_slice(names);
@@ -3751,6 +3802,7 @@ impl Vm {
                     c.nregs = f.nregs;
                     c.ics = Default::default();
                     c.ic_names = ic_names.into_boxed_slice();
+                    c.define_ics = f.defines.into_boxed_slice();
                     c.constants = constants;
                     c.handlers = f.handlers.into_boxed_slice();
                     c.interpreted = interpreted;
@@ -3774,6 +3826,7 @@ impl Vm {
                     nregs: f.nregs,
                     ics: Default::default(),
                     ic_names: ic_names.into_boxed_slice(),
+                    define_ics: f.defines.into_boxed_slice(),
                     closures: Vec::new(),
                     constants,
                     handlers: f.handlers.into_boxed_slice(),

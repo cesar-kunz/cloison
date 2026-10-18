@@ -3587,6 +3587,95 @@ r.join();"#;
     assert_eq!(value(src), "f64:RangeError,i8:RangeError,like:RangeError,ok:16,loop:RangeError");
 }
 
+/// `catch (e) { var e = 1; }` declares the function's `e` and stores to the
+/// catch parameter, also when other block-scoped bindings rename names.
+#[test]
+fn vars_named_as_catch_parameters() {
+    let src = r#"
+let r = [];
+function f() { try { throw 2 } catch (e) { var e = 3; r.push(e); } r.push(e === undefined); }
+function g() { try { throw 2 } catch (e) { var e; r.push(e); } r.push(e === undefined); }
+function h() { var e = 9; try { throw 2 } catch (e) { var e = 3, x = e + 1; r.push(e, x); } r.push(e); }
+function k() { try { throw 2 } catch (e) { var e = function () {}; r.push(typeof e); } return typeof e; }
+f(); g(); h(); r.push(k());
+try { throw 5 } catch (q) { var q = 7; r.push(q); } r.push(typeof q);
+r.join();"#;
+    assert_eq!(value(src), "3,true,2,true,3,4,9,function,undefined,7,undefined");
+}
+
+/// Stores to numbers, booleans and strings call their prototypes' setters,
+/// with the primitive for `this`.
+#[test]
+fn primitives_call_inherited_setters() {
+    let src = r#"
+var r = [];
+Object.defineProperty(Number.prototype, "sx", { set: function (v) { "use strict"; r.push(typeof this, v); }, configurable: true });
+Object.defineProperty(String.prototype, "lx", { set: function (v) { "use strict"; r.push(typeof this, v); }, configurable: true });
+Object.defineProperty(Boolean.prototype, "bx", { set: function (v) { r.push(typeof this, v); }, configurable: true });
+(1).sx = 5; "s".lx = 6; var k = "sx"; (2)[k] = 7; true.bx = 8; "s".length = 1;
+var n = 0; Object.defineProperty(Number.prototype, "hx", { set: function (v) { n += v; } });
+function hot(p) { p.hx = 1; } for (var i = 0; i < 3000; i++) hot(i);
+r.push(n);
+r.join();"#;
+    assert_eq!(value(src), "number,5,string,6,number,7,object,8,3000");
+}
+
+/// An object literal defines its properties: a prototype's setter or
+/// read-only property of the name doesn't apply, also once compiled code
+/// caches the literal's stores (as an assignment's does apply).
+#[test]
+fn object_literals_define_past_prototype_setters() {
+    let src = r#"
+var log = [], r = [];
+function mk(x) { return { a: x, b: 2, c: 3 }; }
+function plain(o, x) { o.a = x; return o; }
+var o;
+for (var i = 0; i < 5000; i++) { o = mk(i); plain({}, i); }
+Object.defineProperty(Object.prototype, "a", { set: function (v) { log[log.length] = v; }, get: function () { return "pa"; }, configurable: true });
+for (var i = 0; i < 5000; i++) { o = mk(i); }
+r.push(o.a, Object.keys(o).join("|"));
+var p = plain({}, 7); r.push(p.a, Object.keys(p).length);
+Object.defineProperty(Object.prototype, "b", { value: 0, writable: false, configurable: true });
+for (var i = 0; i < 3000; i++) { o = mk(i); }
+r.push(o.b, Object.keys(o).join("|"), log.length);
+delete Object.prototype.a; delete Object.prototype.b;
+r.join();"#;
+    assert_eq!(value(src), "4999,a|b|c,pa,0,2,a|b|c,1");
+}
+
+/// Conversions call an object's `Symbol.toPrimitive` method, with the
+/// hint, before `valueOf` and `toString`.
+#[test]
+fn conversions_call_symbol_to_primitive() {
+    let src = r#"
+var r = [];
+function t(n, f) { var v; try { v = String(f()); } catch (e) { v = "!" + e.name; } r.push(n + "=" + v); }
+var hints = [];
+var o = { [Symbol.toPrimitive](h) { hints.push(h); return h == "number" ? 42 : "s" + h; }, valueOf() { return 1; } };
+t("plus", () => +o);
+t("add", () => o + 1);
+t("tmpl", () => `${o}`);
+t("str", () => String(o));
+t("lt", () => o < 50);
+t("eq", () => o == "sdefault");
+t("arith", () => o * 2);
+t("bad", () => +{ [Symbol.toPrimitive]: 1 });
+t("obj", () => +{ [Symbol.toPrimitive]() { return {}; } });
+t("thr", () => +{ [Symbol.toPrimitive]() { throw new RangeError(); } });
+t("nul", () => +{ [Symbol.toPrimitive]: null, valueOf() { return 7; } });
+class D { [Symbol.toPrimitive](h) { return h; } }
+t("cls", () => new D() + "");
+var hot = 0; for (var i = 0; i < 3000; i++) hot += +o; t("hot", () => hot);
+t("date", () => typeof (new Date(0) + 1));
+t("hints", () => hints.slice(0, 7).join());
+r.join(" ");"#;
+    assert_eq!(
+        value(src),
+        "plus=42 add=sdefault1 tmpl=sstring str=sstring lt=true eq=true arith=84 bad=!TypeError obj=!TypeError \
+         thr=!RangeError nul=7 cls=default hot=126000 date=string hints=number,default,string,string,number,default,number"
+    );
+}
+
 /// A load into the slot of the register it loads from (`o = o.o`, as
 /// `get_own_nc_g1_to_g1`): on arm64 a family template, whose registers the
 /// fused name must give.

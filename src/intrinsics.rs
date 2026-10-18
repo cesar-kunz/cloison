@@ -4,6 +4,7 @@
 //! paths all: the JIT leaves them to the interpreter.
 
 use crate::interp::{call_function, to_string_units};
+use crate::js::ast::{EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST};
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::Desc;
 use crate::value::Value;
@@ -633,7 +634,8 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(out)
 }
 
-/// A direct `eval(source)`: `[eval, source, scope, this, strict]`. Not
+/// A direct `eval(source)`: `[eval, source, scope, this, strict, in
+/// parameters, scope for its declarations, with objects…]`. Not
 /// the builtin `eval`: an ordinary call. Else `source` (a string) is
 /// compiled with the caller's scope object `scope` around it (see
 /// `js::compile_direct_eval`), its `var`s and functions (sloppy code's)
@@ -648,7 +650,9 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(src);
     };
     let text = String::from_utf16_lossy(u);
-    let module = crate::js::compile_direct_eval(&text, strict).map_err(|e| {
+    // (The objects of the `with` statements around it, outermost first.)
+    let withs = a.get(7..).unwrap_or(&[]);
+    let module = crate::js::compile_direct_eval(&text, strict, withs.len()).map_err(|e| {
         if e.contains("unsupported") {
             Error(format!("unsupported: in eval'd code: {e}"), None)
         } else {
@@ -666,6 +670,16 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // other bindings it sees: see `Gen::call`.)
     let decl = a.get(6).copied().filter(|&d| crate::props::is_object(d)).unwrap_or(env);
     let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
+    let over = target == decl && env != decl && crate::props::is_object(env);
+    // A `var` by a block-scoped binding's name (but a catch parameter's)
+    // is an error.
+    for n in module.declared.iter().filter(|_| over) {
+        let key = Key::Name(vm.intern(n));
+        let kind = binding_kind(vm, env, key).unwrap_or(0);
+        if kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0 {
+            return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+        }
+    }
     for n in &module.declared {
         let atom = vm.intern(n);
         if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
@@ -674,8 +688,8 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         // A `var` of the function's shadows an enclosing function's
         // binding: the scope object over the function's has it no more
         // (and it takes back its value unchanged).
-        if target == decl && env != decl && crate::props::is_object(env) {
-            vm.delete_own(as_object(env), Key::Name(atom));
+        if over && binding_kind(vm, env, Key::Name(atom)).unwrap_or(0) & EVAL_BLOCK_SCOPED as i32 == 0 {
+            vm.force_delete_named(as_object(env), atom);
         }
     }
     // (Its `var`s are the scope objects', not globals.)
@@ -683,16 +697,17 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     module.declared.clear();
     let code = vm.load(module);
     let env = if crate::props::is_object(env) { env } else { local };
-    vm.eval_envs.push([env, local]);
+    vm.eval_envs.push([env, local].into_iter().chain(withs.iter().copied()).collect());
     let r = crate::interp::run_script_with(vm, code, this);
     vm.eval_envs.pop();
     r
 }
 
-/// Direct `eval`'s code's first instruction's: the caller's scope object.
+/// Direct `eval`'s code's first instructions': `[k]` the caller's scope
+/// object (0), the eval's own (1), a `with` object (2…).
 fn eval_env(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let k = a[0].as_number().unwrap_or(0.0) as usize;
-    Ok(vm.eval_envs.last().map_or(Value::UNDEFINED, |e| e[k.min(1)]))
+    Ok(vm.eval_envs.last().and_then(|e| e.get(k).copied()).unwrap_or(Value::UNDEFINED))
 }
 
 /// `[o]` without a prototype.
@@ -1038,23 +1053,104 @@ fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     call_function(vm, m, a[0], &[])
 }
 
-/// A direct `eval`'s scope object: `[proto, name, value, …]`, its
-/// prototype the function's (or `null`), a data property for each binding
-/// it sees (but one not initialized yet, a hole).
+/// A direct `eval`'s scope object: `[proto, block-scoped count, bindings'
+/// function, name, value, binding, …]`, its prototype the function's (or
+/// `null`), a property for each binding it sees: where `binding` tells
+/// (`(k << 4) | kind`: the bindings' function's upvalue `k`, `kind` its
+/// `EVAL_CONST`… flags), an accessor of the variable itself (`value` its
+/// name, a box's property's: see `codegen::boxed_lexicals`), else a data
+/// property of its value (but a binding not initialized yet has none).
 fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let proto = if crate::props::is_object(a[0]) { a[0] } else { Value::NULL };
     let o = object_value(vm.new_object(proto));
     let nlex = a[1].as_number().unwrap_or(0.0) as usize;
-    for (i, pair) in a[2..].chunks(2).enumerate() {
-        if pair[1] != Value::HOLE {
-            let key = to_property_key(vm, pair[0])?;
-            if i >= nlex && shadowed(vm, proto, key) {
-                continue;
-            }
-            vm.create_data_property(o, key, pair[1])?;
+    let bindings = a[2];
+    for (i, t) in a[3..].chunks(3).enumerate() {
+        let key = to_property_key(vm, t[0])?;
+        if i >= nlex && shadowed(vm, proto, key) {
+            continue;
+        }
+        if let Some(b) = t[2].as_number()
+            && crate::props::is_object(bindings)
+        {
+            let data = [bindings, Value::from_i32(b as i32), t[0], t[1]];
+            let get = crate::promise::binding_accessor(vm, false, &data);
+            let set = crate::promise::binding_accessor(vm, true, &data);
+            vm.define_own_property(as_object(o), key, &Desc::accessor(get, set, true, false))?;
+        } else if t[1] != Value::HOLE {
+            vm.create_data_property(o, key, t[1])?;
         }
     }
     Ok(o)
+}
+
+
+/// A direct `eval`'s binding accessor's binding (the callee's `[function,
+/// binding, name, variable]`: see `eval_scope`): its variable's upvalue,
+/// its kind, its name, and (in a box) the box and its property's key.
+fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Option<(Value, Key)>)> {
+    let me = vm.callee;
+    let slot = |i| crate::promise::slot(me, i);
+    let (f, b, name, var) = (slot(0), slot(1), slot(2), slot(3));
+    let b = b.as_number().unwrap_or(0.0) as i32;
+    let u = unsafe { *Vm::upvalues(as_object(f)).add((b >> 4) as usize) };
+    let boxed = if b & EVAL_BOXED as i32 != 0 { Some((unsafe { *(*u).at }, to_property_key(vm, var)?)) } else { None };
+    Ok((u, b & 15, name, boxed))
+}
+
+fn uninitialized(name: Value) -> Error {
+    Error::reference_error(format!("Cannot access '{}' before initialization", crate::vm::display(name)))
+}
+
+/// A direct `eval`'s binding's getter: its variable's value (a
+/// ReferenceError before it is initialized).
+pub(crate) fn binding_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    let (u, _, name, boxed) = binding_of(vm)?;
+    let v = match boxed {
+        Some((b, key)) => vm.get_key(b, key)?,
+        None => unsafe { *(*u).at },
+    };
+    if v == Value::HOLE {
+        return Err(uninitialized(name));
+    }
+    Ok(v)
+}
+
+/// A direct `eval`'s binding's setter: its variable set (a TypeError for a
+/// `const`'s).
+pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let (u, kind, name, boxed) = binding_of(vm)?;
+    let old = match boxed {
+        Some((b, key)) => vm.get_key(b, key)?,
+        None => unsafe { *(*u).at },
+    };
+    if old == Value::HOLE {
+        return Err(uninitialized(name));
+    }
+    if kind & EVAL_CONST as i32 != 0 {
+        return Err(Error::type_error("Assignment to constant variable."));
+    }
+    let v = arg(a, 0);
+    if let Some((b, key)) = boxed {
+        vm.put_key(b, key, v)?;
+        return Ok(Value::UNDEFINED);
+    }
+    unsafe {
+        *(*u).at = v;
+        // (A closed upvalue's variable is its own `closed`, in the heap.)
+        if (*u).at == &raw mut (*u).closed {
+            crate::heap::barrier(u.cast::<u8>().sub(8), (*u).at, v);
+        }
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// The kind of `scope`'s own property `key` if it is a binding's accessor
+/// (see `eval_scope`).
+fn binding_kind(vm: &mut Vm, scope: Value, key: Key) -> Option<i32> {
+    let d = vm.own_property(as_object(scope), key)?;
+    let get = d.get.filter(|&g| crate::promise::is_binding_get(vm, g))?;
+    crate::promise::slot(as_object(get), 1).as_number().map(|b| b as i32 & 15)
 }
 
 /// Whether an enclosing function's binding by `key` is shadowed by a `var`

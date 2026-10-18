@@ -180,6 +180,19 @@ pub struct Function<'a> {
     pub free: Option<Vec<Name>>,
 }
 
+/// The name of the function the parser makes for a direct `eval`'s
+/// bindings (see `Parser::eval_bindings`).
+pub const EVAL_BINDINGS: &str = "%evalbindings";
+/// What the parser tells of a binding a direct `eval` sees: a `const`, a
+/// catch clause's parameter (which a `var` of the `eval`'s may redeclare),
+/// or neither (0); and what the code generator adds: block-scoped (not an
+/// enclosing function's variable), in a box (see
+/// `codegen::boxed_lexicals`). (See `intrinsics::eval_scope`.)
+pub const EVAL_CONST: u8 = 1;
+pub const EVAL_CATCH: u8 = 2;
+pub const EVAL_BLOCK_SCOPED: u8 = 4;
+pub const EVAL_BOXED: u8 = 8;
+
 #[derive(Debug)]
 pub struct Stmt<'a> {
     pub kind: StmtKind<'a>,

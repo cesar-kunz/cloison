@@ -130,8 +130,8 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,483 | 17,067 | 96.6% |
-| ES2015 | 8,204 | 9,197 | 89.2% |
+| ES5 (untagged) | 16,484 | 17,067 | 96.6% |
+| ES2015 | 8,214 | 9,197 | 89.3% |
 | ES2016 | 96 | 100 | 96.0% |
 | ES2017 | 330 | 741 | 44.5% |
 | ES2018 | 4,698 | 4,825 | 97.4% |
@@ -144,17 +144,14 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES2025 | 378 | 998 | 37.9% |
 | ES2026 | 98 | 745 | 13.2% |
 | Stage 3 proposals | 251 | 5,650 | 4.4% |
-| **all** | **36,589** | **48,635** | **75.2%** |
+| **all** | **36,600** | **48,635** | **75.3%** |
 
 The gaps are mostly whole features: modules (`import()` and top-level
 `await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
 failures), resizable `ArrayBuffer`s (ES2024), iterator helpers, the
 RegExp `v` flag and modifiers, explicit resource management (`using`),
 non-ASCII identifiers (no Unicode ID tables), and early errors for
-invalid syntax that the parser accepts. A direct `eval` sees the
-caller's block-scoped bindings and enclosing functions' variables as
-copies written back after it returns, so closures it makes don't share
-them and their `const`ness isn't enforced.
+invalid syntax that the parser accepts.
 
 ## Results
 

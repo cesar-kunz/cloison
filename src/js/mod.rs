@@ -85,14 +85,14 @@ pub fn compile_indirect_eval(src: &str) -> Result<Module, String> {
     .map_err(|e| e.display(src))
 }
 
-/// Compile `src` as direct `eval`'s code (`strict`: the caller is): its
-/// names looked up in the caller's scope object first (see
-/// `intrinsics::direct_eval`).
-pub fn compile_direct_eval(src: &str, strict: bool) -> Result<Module, String> {
+/// Compile `src` as direct `eval`'s code (`strict`: the caller is), in
+/// `withs` `with` statements: its names looked up in their objects, then
+/// in the caller's scope object (see `intrinsics::direct_eval`).
+pub fn compile_direct_eval(src: &str, strict: bool, withs: usize) -> Result<Module, String> {
     let source: Rc<str> = src.into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source_as(src, &arena, skim, Some(strict))
+        parse::parse_source_as(src, &arena, skim, Some((strict, withs)))
             .and_then(|p| codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[]))
     };
     match compile(true) {

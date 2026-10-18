@@ -59,6 +59,9 @@ enum Root {
     /// … and an async function's `await`'s.
     AsyncFulfilled,
     AsyncRejected,
+    /// (Not a promise's: a direct `eval`'s binding's accessors.)
+    BindingGet,
+    BindingSet,
 }
 
 /// Promise states, in the state cell (and the tag of a reaction job).
@@ -100,7 +103,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(aep, a_message, empty, DONT_ENUM);
 
     vm.promise_roots = vec![proto, c, jobs, aep, std::ptr::null_mut()];
-    let templates: [(NativeFn, u32); 13] = [
+    let templates: [(NativeFn, u32); 15] = [
         (resolve_fn, 1),
         (reject_fn, 1),
         (executor_fn, 2),
@@ -114,6 +117,8 @@ pub(crate) fn install(vm: &mut Vm) {
         (thrower, 0),
         (async_fulfilled, 1),
         (async_rejected, 1),
+        (crate::intrinsics::binding_get, 0),
+        (crate::intrinsics::binding_set, 1),
     ];
     for (f, n) in templates {
         let t = vm.native_function("", f, n, any, false);
@@ -270,7 +275,18 @@ fn closure(vm: &mut Vm, template: Root, data: &[Value]) -> Value {
 }
 
 /// Hidden slot `i` of closure `o`.
-fn slot(o: *mut Object, i: usize) -> Value {
+/// A direct `eval`'s binding's getter (`setter`: its setter), a closure
+/// of `data` (see `intrinsics::binding_get`).
+pub(crate) fn binding_accessor(vm: &mut Vm, setter: bool, data: &[Value]) -> Value {
+    closure(vm, if setter { Root::BindingSet } else { Root::BindingGet }, data)
+}
+
+/// Whether `v` is a direct `eval`'s binding's getter.
+pub(crate) fn is_binding_get(vm: &Vm, v: Value) -> bool {
+    crate::props::is_object(v) && unsafe { (*as_object(v)).code == (*root(vm, Root::BindingGet)).code }
+}
+
+pub(crate) fn slot(o: *mut Object, i: usize) -> Value {
     unsafe { *Object::inline(o, i) }
 }
 

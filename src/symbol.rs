@@ -262,6 +262,7 @@ pub(crate) fn install(vm: &mut Vm) {
         let _ = vm.define_own_property(ctor, Key::Name(a), &d);
     }
     vm.a_sym_iterator = vm.intern(&format!("{SYMBOL_MARK}Symbol.iterator"));
+    vm.a_sym_species = vm.intern(&format!("{SYMBOL_MARK}Symbol.species"));
     vm.a_sym_to_string_tag = vm.intern(&format!("{SYMBOL_MARK}Symbol.toStringTag"));
     vm.a_sym_to_primitive = vm.intern(&format!("{SYMBOL_MARK}Symbol.toPrimitive"));
     vm.a_sym_has_instance = vm.intern(&format!("{SYMBOL_MARK}Symbol.hasInstance"));
@@ -308,16 +309,11 @@ pub(crate) fn install(vm: &mut Vm) {
     let values = vm.define_native(ap, "values", array_values, 0, crate::jit::Ty::Any, false);
     vm.symbol_roots.push(values);
     vm.add_property_with(ap, a_iter, object_value(values), DONT_ENUM);
-    // (On `%TypedArray%.prototype`, the kinds' prototypes' prototype.)
-    if let Some(&tp) = vm.typed_prototypes.first().filter(|tp| !tp.is_null()) {
-        let shared = as_object(unsafe { (*(*tp).shape).proto });
-        vm.define_natives(shared, &[("keys", array_keys as NativeFn, 0), ("entries", array_entries, 0)]);
-        let v = vm.define_native(shared, "values", array_values, 0, crate::jit::Ty::Any, false);
-        vm.add_property_with(shared, a_iter, object_value(v), DONT_ENUM);
-        let holder = vm.new_object(Value::NULL);
-        let tag = vm.define_native(holder, "get [Symbol.toStringTag]", crate::builtins::typed_to_string_tag, 0, crate::jit::Ty::Any, false);
-        let a = vm.a_sym_to_string_tag;
-        vm.define_accessor(shared, a, Some(object_value(tag)), None, DONT_ENUM);
+    // (`%TypedArray%`'s `@@species`: the kinds' constructors' prototype.)
+    if let Some(&c) = vm.typed_constructors.first() {
+        let ta = as_object(unsafe { (*(*c).shape).proto });
+        define_getter(vm, ta, Key::Name(a_species), "[Symbol.species]", return_this);
+        crate::typed::install_symbols(vm);
     }
     let strp = vm.string_prototype;
     define_symbol_native(vm, strp, a_iter, "[Symbol.iterator]", string_iterator, 0);
@@ -384,6 +380,11 @@ pub(crate) fn array_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Valu
     new_iterator(vm, t, 1, Root::ArrayIteratorPrototype)
 }
 
+/// An array iterator over `target` of kind `kind` (see `new_iterator`).
+pub(crate) fn array_iterator(vm: &mut Vm, target: Value, kind: i32) -> Result<Value> {
+    new_iterator(vm, target, kind, Root::ArrayIteratorPrototype)
+}
+
 fn array_keys(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let t = this_target(vm, this)?;
     new_iterator(vm, t, 0, Root::ArrayIteratorPrototype)
@@ -428,10 +429,10 @@ fn array_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let kind = vm.get_keyed(state, Value::from_i32(2))?.as_number().unwrap_or(1.0) as i32;
     let o = as_object(target);
     let len = if unsafe { (*o).class } == Class::TypedArray {
-        if crate::collections::detached(o) {
-            return Err(Error::type_error("Cannot perform %ArrayIteratorPrototype%.next on a detached ArrayBuffer"));
+        match crate::typed::ta_length(o) {
+            Some(n) => n as f64,
+            None => return Err(Error::type_error("Cannot perform %ArrayIteratorPrototype%.next on a detached or out of bounds typed array")),
         }
-        unsafe { (*o).elems_len as f64 }
     } else {
         vm.length_of(target)?
     };

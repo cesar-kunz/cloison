@@ -792,51 +792,43 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_class(buffer, Class::ArrayBuffer) {
         return Err(Error::type_error("First argument to DataView constructor must be an ArrayBuffer"));
     }
-    if unsafe { (*as_object(buffer)).flags } & crate::object::DETACHED != 0 {
-        return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
-    }
     let b = as_object(buffer);
     let offset = to_index(vm, arg(a, 1))?;
+    if crate::typed::is_detached(b) {
+        return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
+    }
     let bytes = unsafe { (*b).elems_len } as usize;
     if offset > bytes {
         return Err(Error::range_error(format!("Start offset {offset} is outside the bounds of the buffer")));
     }
+    // (A resizable buffer's view without a length tracks its length.)
     let len = match a.get(2) {
         Some(&v) if !v.is_undefined() => {
             let n = to_index(vm, v)?;
             if offset + n > bytes {
                 return Err(Error::range_error(format!("Invalid DataView length {n}")));
             }
-            n
+            Some(n)
         }
-        _ => bytes - offset,
+        _ if crate::typed::is_resizable(b) => None,
+        _ => Some(bytes - offset),
     };
     let proto = object_value(vm.collection_prototypes[Proto::DataView as usize]);
-    let o = vm.new_object_with(Class::DataView, proto, 0);
-    unsafe {
-        (*o).elems = (*b).elems.cast::<u8>().add(offset).cast();
-        (*o).elems_len = len as u32;
-        (*o).code = b.cast();
-    }
-    Ok(object_value(o))
+    crate::typed::make_view(vm, Class::DataView, proto, crate::object::TypedKind::U8, b, offset, len)
 }
 
 fn this_view(this: Value) -> Result<*mut Object> {
     this_of(this, Class::DataView, "DataView.prototype method")
 }
 
-/// Whether view `o`'s buffer was detached (`$262.detachArrayBuffer`).
-pub(crate) fn detached(o: *mut Object) -> bool {
-    unsafe { (*((*o).code as *mut Object)).flags & crate::object::DETACHED != 0 }
-}
-
-/// `this` as a `DataView` whose buffer is attached.
-fn this_live_view(this: Value) -> Result<*mut Object> {
+/// `this` as a `DataView` in bounds (its buffer attached), and its byte
+/// length.
+fn this_live_view(this: Value) -> Result<(*mut Object, usize)> {
     let o = this_view(this)?;
-    if detached(o) {
-        return Err(Error::type_error("Cannot perform DataView operation on a detached ArrayBuffer"));
+    match crate::typed::view_byte_length(o) {
+        Some(n) => Ok((o, n)),
+        None => Err(Error::type_error("Cannot perform DataView operation on a detached or out of bounds ArrayBuffer")),
     }
-    Ok(o)
 }
 
 fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -844,23 +836,18 @@ fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 fn view_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::from_i32(unsafe { (*this_live_view(this)?).elems_len } as i32))
+    Ok(Value::number(this_live_view(this)?.1 as f64))
 }
 
 fn view_byte_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = this_live_view(this)?;
-    unsafe {
-        let b = (*o).code as *mut Object;
-        Ok(Value::from_i32((*o).elems.cast::<u8>().offset_from((*b).elems.cast::<u8>()) as i32))
-    }
+    let (o, _) = this_live_view(this)?;
+    Ok(Value::number(crate::typed::offset_of(o) as f64))
 }
 
 /// The address of the `size` bytes at `i` in view `o`, if within it.
 fn view_bytes(o: *mut Object, i: usize, size: usize) -> Result<*mut u8> {
-    if detached(o) {
-        return Err(Error::type_error("Cannot perform DataView operation on a detached ArrayBuffer"));
-    }
-    if i + size > unsafe { (*o).elems_len } as usize {
+    let (o, len) = this_live_view(object_value(o))?;
+    if i + size > len {
         return Err(Error::range_error("Offset is outside the bounds of the DataView"));
     }
     Ok(unsafe { (*o).elems.cast::<u8>().add(i) })
@@ -899,7 +886,7 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_view(this)?;
     let i = to_index(vm, arg(a, 0))?;
-    let big = if T >= 8 { crate::bigint::to_bits(crate::builtins::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?) } else { 0 };
+    let big = if T >= 8 { crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?) } else { 0 };
     let d = if T >= 8 { 0.0 } else { to_number(arg(a, 1)) };
     if vm.conv_thrown {
         return Err(vm.take_conv_error());

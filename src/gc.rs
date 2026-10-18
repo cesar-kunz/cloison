@@ -894,6 +894,12 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 }
                 return;
             }
+            Class::ArrayBuffer => {
+                // A resizable one's views (see `typed`).
+                if !(*o).code.is_null() && within(code) {
+                    v.value(Value::from_bits((*o).code as u64));
+                }
+            }
             Class::Function => {
                 // After the in-object slots it was allocated with, as
                 // `cell_size` has it: the marker thread reads no shape.

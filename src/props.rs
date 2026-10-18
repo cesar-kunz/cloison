@@ -229,7 +229,7 @@ impl Vm {
                     }
                     match class {
                         Class::TypedArray => {
-                            return (i < (*o).elems_len).then(|| {
+                            return ((i as usize) < crate::typed::ta_length(o).unwrap_or(0)).then(|| {
                                 let kind = crate::object::TypedKind::from_u8((*o).kind);
                                 Desc::data(kind.load((*o).elems.cast(), i as usize), true, true, true)
                             });
@@ -248,6 +248,9 @@ impl Vm {
                     None
                 }
                 Key::Name(a) => {
+                    if self.typed_numeric(o, a) {
+                        return None;
+                    }
                     if let Some(d) = self.own_named(o, a) {
                         return Some(d);
                     }
@@ -260,10 +263,6 @@ impl Vm {
                             Class::Array => {
                                 let n = Value::from_i32((*o).elems_len as i32);
                                 Some(Desc::data(n, flags & LENGTH_READ_ONLY == 0, false, false))
-                            }
-                            Class::TypedArray => {
-                                let n = Value::from_i32((*o).elems_len as i32);
-                                Some(Desc::data(n, false, false, false))
                             }
                             Class::Function | Class::Native if flags & FN_LENGTH_DELETED == 0 => {
                                 let c = flags & (SEALED | FROZEN) == 0;
@@ -298,7 +297,7 @@ impl Vm {
                 indices.extend(0..u.len() as u32);
             }
             match class {
-                Class::TypedArray => indices.extend(0..(*o).elems_len),
+                Class::TypedArray => indices.extend(0..crate::typed::ta_length(o).unwrap_or(0) as u32),
                 Class::String => {}
                 c if c.no_elements() => {}
                 _ => {
@@ -325,7 +324,7 @@ impl Vm {
             out.extend(indices.into_iter().map(|i| (Key::Index(i), far_enum(i))));
             // The properties without slots (see `own_property`).
             let flags = (*o).flags;
-            let length = Self::string_of(o).is_some() || matches!(class, Class::Array | Class::TypedArray);
+            let length = Self::string_of(o).is_some() || class == Class::Array;
             if length || matches!(class, Class::Function | Class::Native) && flags & FN_LENGTH_DELETED == 0 {
                 out.push((Key::Name(self.a_length), false));
             }
@@ -484,6 +483,13 @@ impl Vm {
         if class == Class::Array && key == Key::Name(self.a_length) {
             return self.define_array_length(o, d);
         }
+        // (A typed array's numeric property that is no index: none to
+        // define.)
+        if let Key::Name(a) = key
+            && self.typed_numeric(o, a)
+        {
+            return Ok(false);
+        }
         let Some(cur) = self.own_property(o, key) else {
             if !Self::is_extensible(o) {
                 return Ok(false);
@@ -569,11 +575,12 @@ impl Vm {
                         Class::String => return Ok(false),
                         c if c.no_elements() => return Ok(false),
                         Class::TypedArray => {
-                            if i >= (*o).elems_len || full.is_accessor() || full.attrs() != 0 {
+                            let valid = (i as usize) < crate::typed::ta_length(o).unwrap_or(0);
+                            if !valid || full.is_accessor() || full.attrs() != 0 {
                                 return Ok(false);
                             }
                             let kind = crate::object::TypedKind::from_u8((*o).kind);
-                            let v = crate::builtins::to_element(self, kind, full.value.unwrap())?;
+                            let v = crate::typed::to_element(self, kind, full.value.unwrap())?;
                             kind.store_value((*o).elems.cast(), i as usize, v);
                             return Ok(true);
                         }
@@ -764,7 +771,8 @@ impl Vm {
                         return false;
                     }
                     match class {
-                        Class::String | Class::TypedArray => return i >= (*o).elems_len,
+                        Class::String => return i >= (*o).elems_len,
+                        Class::TypedArray => return i as usize >= crate::typed::ta_length(o).unwrap_or(0),
                         c if c.no_elements() => return true,
                         _ => {}
                     }
@@ -782,6 +790,9 @@ impl Vm {
                     true
                 }
                 Key::Name(a) => {
+                    if self.typed_numeric(o, a) {
+                        return true;
+                    }
                     if (*(*o).shape).lookup(a).is_none() {
                         if o == self.global {
                             return self.delete_global(a);
@@ -797,9 +808,7 @@ impl Vm {
                             }
                             return true;
                         }
-                        let length = a == self.a_length
-                            && (Self::string_of(o).is_some()
-                                || matches!(class, Class::Array | Class::TypedArray));
+                        let length = a == self.a_length && (Self::string_of(o).is_some() || class == Class::Array);
                         return !length;
                     }
                     let deleted = self.delete_named(o, a);

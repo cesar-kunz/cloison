@@ -138,20 +138,20 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES2019 | 159 | 161 | 98.8% |
 | ES2020 | 1,064 | 2,020 | 52.7% |
 | ES2021 | 518 | 630 | 82.2% |
-| ES2022 | 4,048 | 5,374 | 75.3% |
-| ES2023 | 201 | 284 | 70.8% |
+| ES2022 | 4,821 | 5,374 | 89.7% |
+| ES2023 | 209 | 284 | 73.6% |
 | ES2024 | 61 | 843 | 7.2% |
 | ES2025 | 378 | 998 | 37.9% |
 | ES2026 | 98 | 745 | 13.2% |
 | Stage 3 proposals | 251 | 5,650 | 4.4% |
-| **all** | **36,600** | **48,635** | **75.3%** |
+| **all** | **37,381** | **48,635** | **76.9%** |
 
 The gaps are mostly whole features: modules (`import()` and top-level
 `await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
 failures), resizable `ArrayBuffer`s (ES2024), iterator helpers, the
 RegExp `v` flag and modifiers, explicit resource management (`using`),
-non-ASCII identifiers (no Unicode ID tables), and early errors for
-invalid syntax that the parser accepts.
+non-ASCII identifiers beyond a rough approximation (no Unicode ID
+tables), and early errors for invalid syntax that the parser accepts.
 
 ## Results
 

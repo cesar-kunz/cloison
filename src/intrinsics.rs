@@ -206,7 +206,10 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
     if vm.proxies_exist && crate::proxy::is_proxy(vm, as_object(f)) {
         vm.new_target = nt;
     }
-    let r = vm.construct_other(f, args)?;
+    let derived = std::mem::replace(&mut vm.derived_construct, if nt != f { f } else { Value::UNDEFINED });
+    let r = vm.construct_other(f, args);
+    vm.derived_construct = derived;
+    let r = r?;
     // (A builtin subclassed: its object gets the subclass's prototype.)
     if nt != f && crate::props::is_object(r) {
         let proto = prototype_of_target(vm, nt)?;

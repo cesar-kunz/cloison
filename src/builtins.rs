@@ -284,6 +284,7 @@ pub(crate) fn install(vm: &mut Vm) {
     crate::reflect::install(vm);
     crate::proxy::install(vm);
     crate::symbol::install(vm);
+    crate::iterator::install(vm);
     crate::bigint::install(vm);
     crate::generator::install(vm);
     // (`Symbol.prototype`'s is called directly: a symbol is a primitive.)

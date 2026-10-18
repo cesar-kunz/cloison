@@ -676,6 +676,13 @@ pub struct Vm {
     /// `Promise.prototype`, `Promise`, the job queue, … (see
     /// `promise::Root`).
     pub(crate) promise_roots: Vec<*mut Object>,
+    /// `Iterator`, `%IteratorHelperPrototype%` and
+    /// `%WrapForValidIteratorPrototype%` (see `iterator`).
+    pub(crate) iterator_roots: Vec<*mut Object>,
+    /// The builtin constructor a subclass's constructor constructs
+    /// through (`new.target` another), while it runs (see
+    /// `intrinsics::construct_with`); `undefined` otherwise.
+    pub(crate) derived_construct: Value,
     /// Tagged templates' strings arrays, by site (see
     /// `intrinsics::template_object`).
     pub(crate) template_cache: crate::jit::HashMap<u64, *mut Object>,
@@ -894,6 +901,8 @@ impl Vm {
             typed_prototypes: Vec::new(),
             collection_prototypes: Vec::new(),
             promise_roots: Vec::new(),
+            iterator_roots: Vec::new(),
+            derived_construct: Value::UNDEFINED,
             template_cache: Default::default(),
             symbols: Default::default(),
             symbol_registry: Default::default(),
@@ -4068,6 +4077,7 @@ impl Vm {
         .chain(self.typed_prototypes.iter().copied())
         .chain(self.collection_prototypes.iter().copied())
         .chain(self.promise_roots.iter().copied())
+        .chain(self.iterator_roots.iter().copied())
         .chain(self.template_cache.values().copied())
         .chain(self.symbols.values().copied())
         .chain(self.symbol_roots.iter().copied())

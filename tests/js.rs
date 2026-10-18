@@ -5043,3 +5043,12 @@ t("subclass", () => { class X extends Uint8Array {} var x = X.from([1, 2]); retu
 out.join(" | ");"##;
     assert_eq!(value(src), "shape function,TypedArray,true,true | abstract !TypeError | callAbstract !TypeError | map Int16Array:5000,-3000,10000,0,7000 | filter 5,10,7 | slice -3,10,0|0,7 | sort -Infinity,0,0,1,3,NaN|true | sortCmp 3,2,1 | toSorted -3,0,5,7,10|5,-3,10,0,7 | toReversed 7,0,10,-3,5 | with 5,-3,10,0,99|300,-3,10,0,7 | withRange !RangeError | generic 7,2,3,true,-3,3,7,true,true,19,7010-35 | reverse 3,2,1 | copyWithin 4,5,3,4,5 | forEach 19 | from 1,2,44|1.5,2|8,10 | of 1,2,4464 | tag [object Int16Array],Int16Array, | badThis !TypeError | badThis2 !TypeError | locale 1,2 | subclass true:1,2");
 }
+
+/// A reserved word spelled with escapes is no identifier.
+#[test]
+fn escaped_reserved_words_are_not_identifiers() {
+    for src in ["var x = ({ bre\\u0061k }) => {};", "var x = { c\\u0061tch } = { catch: 42 };", "var v\\u0061r = 1;"] {
+        compile_error(src);
+    }
+    assert_eq!(value("var \\u0061b = 1; var o = { \\u0069f: 2 }; l\\u0065t: 1; ab + o.if;"), "3");
+}

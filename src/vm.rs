@@ -669,6 +669,8 @@ pub struct Vm {
     /// Each typed array kind's prototype (`TypedKind` order), and
     /// `ArrayBuffer.prototype`.
     pub(crate) typed_prototypes: Vec<*mut Object>,
+    /// The typed array kinds' constructors, then `ArrayBuffer` (see `typed`).
+    pub(crate) typed_constructors: Vec<*mut Object>,
     /// `Map.prototype`, `Set.prototype`, `WeakMap.prototype`,
     /// `WeakSet.prototype`, `DataView.prototype`, then the map and set
     /// iterator prototypes (see `collections::Proto`).
@@ -694,6 +696,7 @@ pub struct Vm {
     /// `Symbol.prototype`, the iterator prototypes, … (see `symbol::Root`).
     pub(crate) symbol_roots: Vec<*mut Object>,
     pub(crate) a_sym_iterator: Atom,
+    pub(crate) a_sym_species: Atom,
     pub(crate) a_sym_to_string_tag: Atom,
     pub(crate) a_sym_to_primitive: Atom,
     /// Some object has had a `Symbol.toPrimitive` property, which
@@ -899,6 +902,7 @@ impl Vm {
             bigint_prototype: std::ptr::null_mut(),
             error_prototypes: Vec::new(),
             typed_prototypes: Vec::new(),
+            typed_constructors: Vec::new(),
             collection_prototypes: Vec::new(),
             promise_roots: Vec::new(),
             iterator_roots: Vec::new(),
@@ -909,6 +913,7 @@ impl Vm {
             symbol_count: 0,
             symbol_roots: Vec::new(),
             a_sym_iterator: Atom(0),
+            a_sym_species: Atom(0),
             a_sym_to_string_tag: Atom(0),
             a_sym_to_primitive: Atom(0),
             to_primitive_defined: false,
@@ -1791,7 +1796,10 @@ impl Vm {
             if name == self.a_length
                 && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
             {
-                return Ok(Value::from_i32((*o).elems_len as i32));
+                return Ok(Value::from_i32(Self::length_field(o) as i32));
+            }
+            if self.typed_numeric(o, name) {
+                return Ok(Value::UNDEFINED);
             }
             Ok(match self.lookup(o, name) {
                 Some((h, slot)) if self.is_accessor(h, slot) => {
@@ -1807,6 +1815,23 @@ impl Vm {
     /// `o.name` for a property without a slot (a function's `length` and
     /// `name`, a string object's or an array's `length`: see
     /// `Vm::own_property`), `o`'s or a prototype's, else `undefined`.
+    /// Whether `name` is a canonical numeric string and `o` a typed array
+    /// (see `typed::canonical_numeric`).
+    pub(crate) fn typed_numeric(&self, o: *mut Object, name: Atom) -> bool {
+        (unsafe { (*o).class == Class::TypedArray }) && crate::typed::canonical_numeric(self.atom_name(name))
+    }
+
+    /// An array's, a string's or a typed array's `length` (a typed array's
+    /// 0 once its buffer is detached: see `typed::ta_length`).
+    fn length_field(o: *mut Object) -> u32 {
+        unsafe {
+            if (*o).class == Class::TypedArray {
+                return crate::typed::ta_length(o).unwrap_or(0) as u32;
+            }
+            (*o).elems_len
+        }
+    }
+
     #[cold]
     fn virtual_get(&mut self, o: *mut Object, name: Atom) -> Value {
         if name != self.a_length && name != self.a_name {
@@ -1979,6 +2004,13 @@ impl Vm {
             if (*o).class == Class::String {
                 return self.set_string(obj, o, name, value);
             }
+            // (A typed array's numeric property that is no index: the
+            // value converted, then nothing.)
+            if self.typed_numeric(o, name) {
+                let kind = crate::object::TypedKind::from_u8((*o).kind);
+                crate::typed::to_element(self, kind, value)?;
+                return Ok(());
+            }
             if self.read_only(o, name) {
                 self.store_failed = true;
                 return Ok(());
@@ -2052,7 +2084,7 @@ impl Vm {
                     loc: LENGTH_LOC,
                     ..Ic::EMPTY
                 };
-                return Ok(Value::from_i32((*o).elems_len as i32));
+                return Ok(Value::from_i32(Self::length_field(o) as i32));
             }
             // Absent: cached as a load from `missing_holder`'s `undefined`
             // slot, valid (like a prototype's property) while no prototype
@@ -2425,7 +2457,8 @@ impl Vm {
     pub(crate) fn has_element(o: *mut Object, i: u32) -> bool {
         unsafe {
             match (*o).class {
-                Class::String | Class::TypedArray => i < (*o).elems_len,
+                Class::String => i < (*o).elems_len,
+                Class::TypedArray => (i as usize) < crate::typed::ta_length(o).unwrap_or(0),
                 c if c.no_elements() => false,
                 _ => i < (*o).elems_len && *(*o).elems.add(i as usize) != Value::EMPTY,
             }
@@ -2476,12 +2509,17 @@ impl Vm {
             return crate::proxy::generic_has(self, obj, k);
         }
         match self.property_key(key) {
+            Key::Name(a) if self.typed_numeric(o, a) => Ok(false),
             Key::Name(a) => Ok(self.lookup(o, a).is_some()
                 || (a == self.a_length && unsafe { (*o).class } == Class::Array)),
             Key::Index(i) => loop {
                 unsafe {
                     if (*o).class != Class::String && self.has_own_index(o, i) {
                         return Ok(true);
+                    }
+                    // (A typed array's indices are its own, or none.)
+                    if (*o).class == Class::TypedArray {
+                        return Ok(false);
                     }
                     let proto = (*(*o).shape).proto;
                     if !proto.is_cell() {
@@ -2701,7 +2739,7 @@ impl Vm {
         unsafe {
             match (*o).class {
                 Class::TypedArray => {
-                    return Ok(if i < (*o).elems_len {
+                    return Ok(if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
                         let kind = crate::object::TypedKind::from_u8((*o).kind);
                         kind.load((*o).elems.cast(), i as usize)
                     } else {
@@ -2843,15 +2881,12 @@ impl Vm {
                 }
                 c if c.no_elements() => return Ok(()),
                 Class::TypedArray => {
+                    // (Converted first: the conversion may detach or
+                    // shrink its buffer.)
                     let kind = crate::object::TypedKind::from_u8((*o).kind);
-                    if kind.is_big() {
-                        let v = crate::builtins::to_element(self, kind, value)?;
-                        if i < (*o).elems_len {
-                            kind.store_value((*o).elems.cast(), i as usize, v);
-                        }
-                    } else if i < (*o).elems_len {
-                        let d = crate::interp::to_number(value);
-                        kind.store((*o).elems.cast(), i as usize, d);
+                    let v = crate::typed::to_element(self, kind, value)?;
+                    if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
+                        kind.store_value((*o).elems.cast(), i as usize, v);
                     }
                     return Ok(());
                 }
@@ -4075,6 +4110,7 @@ impl Vm {
         ]
         .into_iter()
         .chain(self.typed_prototypes.iter().copied())
+        .chain(self.typed_constructors.iter().copied())
         .chain(self.collection_prototypes.iter().copied())
         .chain(self.promise_roots.iter().copied())
         .chain(self.iterator_roots.iter().copied())

@@ -25,7 +25,7 @@ target/release/cloison --dump file.js                         # the bytecode ins
 Status (2026-10-14): every Octane benchmark runs, with a generational
 garbage collector that marks and sweeps its old generation concurrently
 and frees compiled code that is no longer reachable. The language is
-ES5 through ES2023 with gaps, three quarters of test262 (see
+ES5 through ES2023 with gaps, four fifths of test262 (see
 [Standards support](#standards-support)). See
 [Where it falls short](#where-it-falls-short).
 
@@ -130,28 +130,28 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,484 | 17,067 | 96.6% |
-| ES2015 | 8,214 | 9,197 | 89.3% |
+| ES5 (untagged) | 16,486 | 17,067 | 96.6% |
+| ES2015 | 8,601 | 9,197 | 93.5% |
 | ES2016 | 96 | 100 | 96.0% |
 | ES2017 | 330 | 741 | 44.5% |
 | ES2018 | 4,698 | 4,825 | 97.4% |
 | ES2019 | 159 | 161 | 98.8% |
-| ES2020 | 1,064 | 2,020 | 52.7% |
-| ES2021 | 518 | 630 | 82.2% |
-| ES2022 | 4,821 | 5,374 | 89.7% |
-| ES2023 | 209 | 284 | 73.6% |
-| ES2024 | 61 | 843 | 7.2% |
+| ES2020 | 1,405 | 2,020 | 69.6% |
+| ES2021 | 589 | 630 | 93.5% |
+| ES2022 | 4,826 | 5,374 | 89.8% |
+| ES2023 | 265 | 284 | 93.3% |
+| ES2024 | 484 | 843 | 57.4% |
 | ES2025 | 761 | 998 | 76.3% |
 | ES2026 | 130 | 745 | 17.4% |
-| Stage 3 proposals | 464 | 5,650 | 8.2% |
-| **all** | **38,009** | **48,635** | **78.2%** |
+| Stage 3 proposals | 465 | 5,650 | 8.2% |
+| **all** | **39,295** | **48,635** | **80.8%** |
 
 The gaps are mostly whole features: modules (`import()` and top-level
 `await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
-failures), resizable `ArrayBuffer`s (ES2024), the RegExp `v` flag and
-modifiers, explicit resource management (`using`), non-ASCII
-identifiers beyond a rough approximation (no Unicode ID tables), and
-early errors for invalid syntax that the parser accepts.
+failures, and ES2024's), the RegExp `v` flag and modifiers, explicit
+resource management (`using`), non-ASCII identifiers beyond a rough
+approximation (no Unicode ID tables), and early errors for invalid
+syntax that the parser accepts.
 
 ## Results
 

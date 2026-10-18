@@ -210,10 +210,14 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
     let r = vm.construct_other(f, args);
     vm.derived_construct = derived;
     let r = r?;
-    // (A builtin subclassed: its object gets the subclass's prototype.)
+    // (A builtin subclassed: its object gets the subclass's prototype, or
+    // keeps the builtin's if that isn't an object.)
     if nt != f && crate::props::is_object(r) {
-        let proto = prototype_of_target(vm, nt)?;
-        vm.set_prototype_of(as_object(r), proto);
+        let a = vm.a_prototype;
+        let proto = vm.get(nt, a)?;
+        if crate::props::is_object(proto) {
+            vm.set_prototype_of(as_object(r), proto);
+        }
     }
     Ok(r)
 }

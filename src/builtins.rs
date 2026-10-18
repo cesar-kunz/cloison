@@ -1849,6 +1849,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         let a_length = vm.intern("length");
         let n = to_number(vm.get(first, a_length)?);
         let n = if n.is_nan() || n < 0.0 { 0 } else { n as usize };
+        typed_length(n, k.size())?;
         let b = new_buffer(vm, n * k.size());
         let v = new_view(vm, k, b, 0, n);
         for i in 0..n {
@@ -1858,8 +1859,18 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         return Ok(v);
     }
     let n = index_arg(a, 0, 0)?;
+    typed_length(n, k.size())?;
     let b = new_buffer(vm, n * k.size());
     Ok(new_view(vm, k, b, 0, n))
+}
+
+/// A typed array of `n` elements `size` bytes each fits a buffer (as
+/// `ArrayBuffer`'s limit), else a RangeError.
+fn typed_length(n: usize, size: usize) -> Result<()> {
+    if n.checked_mul(size).is_none_or(|b| b > 1 << 31) {
+        return Err(Error::range_error(format!("Invalid typed array length: {n}")));
+    }
+    Ok(())
 }
 
 fn this_typed(this: Value) -> Result<*mut Object> {

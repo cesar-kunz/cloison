@@ -2970,6 +2970,15 @@ impl Vm {
     /// length, not quadratic (pdfjs: 138 GB).
     pub(crate) fn new_cons(&mut self, a: Value, b: Value) -> Value {
         let len = string_len(a).unwrap() + string_len(b).unwrap();
+        // Past the longest string (as `repeat`'s): a RangeError, left for
+        // the operation to throw as a conversion's (compiled code's redone
+        // in the interpreter, see `jit::converting`).
+        if len > MAX_STRING_LEN {
+            self.conv_error.get_or_insert_with(|| Error::range_error("Invalid string length"));
+            self.conv_thrown = true;
+            self.conv_redo = true;
+            return a;
+        }
         unsafe {
             let o = self.alloc_string(0);
             (*o).elems = std::ptr::null_mut();
@@ -4579,6 +4588,9 @@ pub(crate) fn string_len(v: Value) -> Option<usize> {
     let o = as_object(v);
     unsafe { ((*o).class == Class::String).then(|| (*o).elems_len as usize) }
 }
+
+/// The most code units a string made by concatenation has.
+pub(crate) const MAX_STRING_LEN: usize = 1 << 30;
 
 /// Make the cons string `o` (see [`Vm::new_cons`]) flat: its units copied
 /// out of its pieces (iteratively: `s += c` makes a chain as long as the

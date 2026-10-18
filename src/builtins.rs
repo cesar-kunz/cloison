@@ -708,6 +708,9 @@ fn string_html<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<
 /// string; `""`: each code unit), or a regular expression (its captures
 /// spliced in).
 fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if let Some(r) = delegate(vm, "split", this, a)? {
+        return Ok(r);
+    }
     let u = this_units(this)?.into_owned();
     if let Some(re) = regexp_of(arg(a, 0)) {
         return regexp_split(vm, re, &u, a.get(1).copied());
@@ -2007,6 +2010,20 @@ fn install_regexps(vm: &mut Vm) {
             ("toString", regexp_to_string, 0),
         ],
     );
+    // `[Symbol.match]` and the others: the String methods', the RegExp
+    // the pattern.
+    let symbols: [(&str, NativeFn, u32); 5] = [
+        ("match", regexp_symbol::<0>, 1),
+        ("matchAll", regexp_symbol::<1>, 1),
+        ("replace", regexp_symbol::<2>, 2),
+        ("search", regexp_symbol::<3>, 1),
+        ("split", regexp_symbol::<4>, 2),
+    ];
+    for (name, f, n) in symbols {
+        let fo = vm.native_function(&format!("[Symbol.{name}]"), f, n, Ty::Any, false);
+        let a = vm.intern(&format!("{}Symbol.{name}", crate::symbol::SYMBOL_MARK));
+        vm.add_property_with(rp, a, object_value(fo), DONT_ENUM);
+    }
     // The flags and the source are accessors of the prototype (an
     // instance's own data properties shadow them: `regexp_object`).
     vm.define_native(rp, "compile", regexp_compile, 2, Ty::Any, false);
@@ -2429,7 +2446,49 @@ fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
 /// `s.matchAll(re)`: an iterator over `exec`'s arrays for each match (a
 /// `RegExp` must be global; anything else is a pattern made one). The
 /// matches are found at once, from the `RegExp`'s `lastIndex`.
+/// `RegExp.prototype[Symbol.match]` (`K` 0), `[Symbol.matchAll]` (1),
+/// `[Symbol.replace]` (2), `[Symbol.search]` (3), `[Symbol.split]` (4):
+/// the String method, of the string argument, with this RegExp.
+fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if regexp_of(this).is_none() {
+        return Err(Error::type_error("RegExp method called on an incompatible receiver"));
+    }
+    let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
+    let mut args = vec![this];
+    args.extend_from_slice(a.get(1..).unwrap_or(&[]));
+    match K {
+        0 => string_match(vm, s, &args),
+        1 => string_match_all(vm, s, &args),
+        2 => string_replace(vm, s, &args),
+        3 => string_search(vm, s, &args),
+        _ => string_split(vm, s, &args),
+    }
+}
+
+/// A String method's pattern `a[0]`, if an object (not a RegExp) with a
+/// `Symbol.<name>` method: that method's result, of `this` and the rest.
+fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value]) -> Result<Option<Value>> {
+    let pattern = arg(a, 0);
+    if !crate::props::is_object(pattern) || regexp_of(pattern).is_some() {
+        return Ok(None);
+    }
+    if this.is_undefined() || this.is_null() {
+        return Err(Error::type_error("String.prototype method called on null or undefined"));
+    }
+    let atom = vm.intern(&format!("{}Symbol.{name}", crate::symbol::SYMBOL_MARK));
+    let m = vm.get(pattern, atom)?;
+    if m.is_undefined() || m.is_null() {
+        return Ok(None);
+    }
+    let mut args = vec![this];
+    args.extend_from_slice(a.get(1..).unwrap_or(&[]));
+    crate::interp::call_function(vm, m, pattern, &args).map(Some)
+}
+
 fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if let Some(r) = delegate(vm, "matchAll", this, a)? {
+        return Ok(r);
+    }
     let s = this_units(this)?;
     let pattern = arg(a, 0);
     let rv = match regexp_of(pattern) {
@@ -2468,6 +2527,9 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
 /// none).
 fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if let Some(r) = delegate(vm, "match", this, a)? {
+        return Ok(r);
+    }
     let s = this_units(this)?;
     let rv = as_regexp(vm, arg(a, 0))?;
     let re = regexp_of(rv).unwrap();
@@ -2502,6 +2564,9 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if let Some(r) = delegate(vm, "search", this, a)? {
+        return Ok(r);
+    }
     let s = this_units(this)?;
     let rv = as_regexp(vm, arg(a, 0))?;
     let re = regexp_of(rv).unwrap();
@@ -2513,12 +2578,18 @@ fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// a string (with `$&`, `$1`…, `$$`, `` $` ``, `$'`) or a function's
 /// result (called with the match, the groups, the index and `s`).
 fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if let Some(r) = delegate(vm, "replace", this, a)? {
+        return Ok(r);
+    }
     replace(vm, this, a, false)
 }
 
 /// `s.replaceAll(pattern, replacement)`: every match replaced (a
 /// `RegExp` pattern must be global).
 fn string_replace_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if let Some(r) = delegate(vm, "replace", this, a)? {
+        return Ok(r);
+    }
     if regexp_of(arg(a, 0)).is_some_and(|re| !re.global) {
         return Err(Error::type_error("replaceAll must be called with a global RegExp"));
     }

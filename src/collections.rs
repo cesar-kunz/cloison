@@ -85,6 +85,13 @@ pub(crate) fn install(vm: &mut Vm) {
             ("clear", set_clear, 0),
             ("forEach", set_for_each, 1),
             ("entries", set_entries, 0),
+            ("union", set_union, 1),
+            ("intersection", set_intersection, 1),
+            ("difference", set_difference, 1),
+            ("symmetricDifference", set_symmetric_difference, 1),
+            ("isSubsetOf", set_is_subset_of, 1),
+            ("isSupersetOf", set_is_superset_of, 1),
+            ("isDisjointFrom", set_is_disjoint_from, 1),
         ],
     );
     // `keys` is the very function `values` is.
@@ -851,4 +858,207 @@ fn map_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         Ok(())
     })?;
     Ok(out)
+}
+
+// ---- Set methods (ES2025) ----
+
+/// GetSetRecord(other): its object, size, `has` and `keys`.
+struct SetRecord {
+    set: Value,
+    size: f64,
+    has: Value,
+    keys: Value,
+}
+
+fn set_record(vm: &mut Vm, other: Value) -> Result<SetRecord> {
+    if !is_object(other) {
+        return Err(Error::type_error("The argument must be a set-like object"));
+    }
+    let a_size = vm.intern("size");
+    let raw = vm.get(other, a_size)?;
+    let n = to_number(raw);
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    if n.is_nan() {
+        return Err(Error::type_error("The set-like's size is not a number"));
+    }
+    let size = n.trunc();
+    if size < 0.0 {
+        return Err(Error::range_error("The set-like's size is negative"));
+    }
+    let (a_has, a_keys) = (vm.intern("has"), vm.intern("keys"));
+    let has = vm.get(other, a_has)?;
+    if !is_callable(has) {
+        return Err(Error::type_error("The set-like's has is not a function"));
+    }
+    let keys = vm.get(other, a_keys)?;
+    if !is_callable(keys) {
+        return Err(Error::type_error("The set-like's keys is not a function"));
+    }
+    Ok(SetRecord { set: other, size, has, keys })
+}
+
+/// `rec.has(v)`, as a boolean.
+fn record_has(vm: &mut Vm, rec: &SetRecord, v: Value) -> Result<bool> {
+    Ok(to_boolean(call_function(vm, rec.has, rec.set, &[v])?))
+}
+
+/// Each value of `rec.keys()`'s iterator to `f` until it returns false
+/// (the iterator then closed): whether it went through all of them.
+fn record_keys(vm: &mut Vm, rec: &SetRecord, mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
+    let it = call_function(vm, rec.keys, rec.set, &[])?;
+    if !is_object(it) {
+        return Err(Error::type_error("The set-like's keys() is not an iterator"));
+    }
+    let a_next = vm.intern("next");
+    let next = vm.get(it, a_next)?;
+    let (a_done, a_value) = (vm.intern("done"), vm.a_value);
+    loop {
+        let r = call_function(vm, next, it, &[])?;
+        if !is_object(r) {
+            return Err(Error::type_error("Iterator result is not an object"));
+        }
+        if to_boolean(vm.get(r, a_done)?) {
+            return Ok(true);
+        }
+        let v = vm.get(r, a_value)?;
+        if !f(vm, normalize(v))? {
+            crate::symbol::close(vm, it)?;
+            return Ok(false);
+        }
+    }
+}
+
+/// Each value set `o` has (its entries read as the loop goes on, so a
+/// value added meanwhile is seen) to `f` until it returns false: whether
+/// it went through all of them.
+fn each_value(vm: &mut Vm, o: *mut Object, mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
+    let mut e = entries(o);
+    let mut pos = BASE;
+    loop {
+        e = current(e, &mut pos, 1);
+        if pos >= len(e) {
+            return Ok(true);
+        }
+        let v = slot(e, pos);
+        pos += 1;
+        if v != Value::EMPTY && !f(vm, v)? {
+            return Ok(false);
+        }
+    }
+}
+
+/// A new set of set `o`'s values.
+fn copy_set(vm: &mut Vm, o: *mut Object) -> Result<*mut Object> {
+    let out = new_collection(vm, Class::Set, Proto::Set)?;
+    each_value(vm, o, |vm, v| append(vm, out, &[v]).map(|()| true))?;
+    Ok(out)
+}
+
+fn set_add_value(vm: &mut Vm, o: *mut Object, v: Value) -> Result<()> {
+    if find(o, v).is_none() {
+        append(vm, o, &[v])?;
+    }
+    Ok(())
+}
+
+fn set_remove_value(o: *mut Object, v: Value) {
+    if let Some(i) = find(o, v) {
+        remove(o, i);
+    }
+}
+
+fn set_union(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::Set, "Set.prototype.union")?;
+    let rec = set_record(vm, arg(a, 0))?;
+    let out = copy_set(vm, o)?;
+    record_keys(vm, &rec, |vm, v| set_add_value(vm, out, v).map(|()| true))?;
+    Ok(object_value(out))
+}
+
+fn set_intersection(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::Set, "Set.prototype.intersection")?;
+    let rec = set_record(vm, arg(a, 0))?;
+    let out = new_collection(vm, Class::Set, Proto::Set)?;
+    if live(o) as f64 <= rec.size {
+        each_value(vm, o, |vm, v| {
+            if record_has(vm, &rec, v)? {
+                set_add_value(vm, out, v)?;
+            }
+            Ok(true)
+        })?;
+    } else {
+        record_keys(vm, &rec, |vm, v| {
+            if find(o, v).is_some() {
+                set_add_value(vm, out, v)?;
+            }
+            Ok(true)
+        })?;
+    }
+    Ok(object_value(out))
+}
+
+fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::Set, "Set.prototype.difference")?;
+    let rec = set_record(vm, arg(a, 0))?;
+    let out = copy_set(vm, o)?;
+    if live(o) as f64 <= rec.size {
+        each_value(vm, o, |vm, v| {
+            if record_has(vm, &rec, v)? {
+                set_remove_value(out, v);
+            }
+            Ok(true)
+        })?;
+    } else {
+        record_keys(vm, &rec, |_, v| {
+            set_remove_value(out, v);
+            Ok(true)
+        })?;
+    }
+    Ok(object_value(out))
+}
+
+fn set_symmetric_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::Set, "Set.prototype.symmetricDifference")?;
+    let rec = set_record(vm, arg(a, 0))?;
+    let out = copy_set(vm, o)?;
+    record_keys(vm, &rec, |vm, v| {
+        if find(o, v).is_some() {
+            set_remove_value(out, v);
+        } else {
+            set_add_value(vm, out, v)?;
+        }
+        Ok(true)
+    })?;
+    Ok(object_value(out))
+}
+
+fn set_is_subset_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::Set, "Set.prototype.isSubsetOf")?;
+    let rec = set_record(vm, arg(a, 0))?;
+    if live(o) as f64 > rec.size {
+        return Ok(Value::FALSE);
+    }
+    Ok(Value::from_bool(each_value(vm, o, |vm, v| record_has(vm, &rec, v))?))
+}
+
+fn set_is_superset_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::Set, "Set.prototype.isSupersetOf")?;
+    let rec = set_record(vm, arg(a, 0))?;
+    if (live(o) as f64) < rec.size {
+        return Ok(Value::FALSE);
+    }
+    Ok(Value::from_bool(record_keys(vm, &rec, |_, v| Ok(find(o, v).is_some()))?))
+}
+
+fn set_is_disjoint_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::Set, "Set.prototype.isDisjointFrom")?;
+    let rec = set_record(vm, arg(a, 0))?;
+    let r = if live(o) as f64 <= rec.size {
+        each_value(vm, o, |vm, v| Ok(!record_has(vm, &rec, v)?))?
+    } else {
+        record_keys(vm, &rec, |_, v| Ok(find(o, v).is_none()))?
+    };
+    Ok(Value::from_bool(r))
 }

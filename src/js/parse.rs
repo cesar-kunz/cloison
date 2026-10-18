@@ -394,6 +394,11 @@ impl<'a> Parser<'_, 'a, '_> {
         {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` is reserved in strict mode")));
         }
+        // (Escaped, these reach here as identifiers.)
+        let f = &self.functions[self.current];
+        if s == "yield" && (self.strict() || f.generator) || s == "await" && f.is_async {
+            return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` as an identifier here")));
+        }
         Ok(())
     }
 
@@ -703,6 +708,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Tok::Ident(name) if self.peek_at(1) == &Tok::Punct(":") => {
                 self.advance();
+                self.strict_word(&name)?;
                 self.advance();
                 StmtKind::Labeled(name, stmt(self.arena, self.sub_statement()?))
             }
@@ -1066,7 +1072,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     break;
                 }
                 let p = self.binding_pattern(names)?;
-                let d = self.pattern_default()?;
+                let d = self.pattern_default(&p)?;
                 elems.push(Some((p, d)));
                 if !self.is("]") {
                     self.expect(",")?;
@@ -1099,7 +1105,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     self.expect(":")?;
                     (key, self.binding_pattern(names)?)
                 };
-                let d = self.pattern_default()?;
+                let d = self.pattern_default(&p)?;
                 props.push((key, p, d));
                 if !self.is("}") {
                     self.expect(",")?;
@@ -1113,11 +1119,15 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     /// A pattern element's `= default`, if any.
-    fn pattern_default(&mut self) -> R<Option<&'a Expr<'a>>> {
+    /// (An anonymous function's name that of a name pattern `p`.)
+    fn pattern_default(&mut self, p: &Pattern) -> R<Option<&'a Expr<'a>>> {
         if !self.eat("=") {
             return Ok(None);
         }
         let e = self.assignment(false)?;
+        if let Pattern::Name(n) = p {
+            self.infer_name(&e, n);
+        }
         Ok(Some(expr(self.arena, e)))
     }
 
@@ -1307,6 +1317,10 @@ impl<'a> Parser<'_, 'a, '_> {
         let body_vars = !prologue.is_empty() && self.push_body_vars(&bound);
         self.expect("{")?;
         if self.directive_prologue() {
+            // (Only with simple parameters.)
+            if !prologue.is_empty() || self.functions[index].rest {
+                return self.err("\"use strict\" in a function with non-simple parameters");
+            }
             self.functions[index].strict = true;
         }
         if self.functions[index].strict {
@@ -1541,8 +1555,12 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         };
         let body = if self.eat("{") {
-            // (`"use strict"` of its own.)
+            // (`"use strict"` of its own, with simple parameters only.)
             if self.directive_prologue() {
+                if !prologue.is_empty() || self.functions[index].rest {
+                    self.current = outer;
+                    return self.err("\"use strict\" in a function with non-simple parameters");
+                }
                 self.functions[index].strict = true;
             }
             self.scoped_block_rest()
@@ -2300,6 +2318,7 @@ impl<'a> Parser<'_, 'a, '_> {
                             // `{a = 1}`: only as a pattern (see `to_pattern`).
                             if self.eat("=") {
                                 let d = self.assignment(false)?;
+                                self.infer_name(&d, &n);
                                 v = Expr {
                                     kind: ExprKind::Assign(None, expr(self.arena, v), expr(self.arena, d)),
                                     pos: ppos,

@@ -5619,3 +5619,76 @@ r.join(" ");"#;
         "TypeError 1 TypeError false TypeError TypeError 0 TypeError TypeError TypeError TypeError TypeError ok TypeError TypeError"
     );
 }
+
+/// `shift` and `reverse` move a plain array's elements in place, and
+/// must barrier the slots they write: a young object moved into a slot
+/// on a clean card is otherwise missed by the next collection. Fails
+/// under `CLOISON_GC_CYCLES=1 CLOISON_GC_VERIFY=8` without the barriers.
+#[test]
+fn elements_moved_in_place_survive_collections() {
+    assert_eq!(
+        value(
+            r#"
+function run(move) {
+  var keep = [];
+  for (var r = 0; r < 200; r++) {
+    var a = [];
+    for (var i = 0; i < 16; i++) a.push({ id: i });
+    move(a);
+    keep.push(a);
+    for (var j = 0; j < 50; j++) var junk = { a: j };
+  }
+  var sum = 0;
+  for (var k = 0; k < keep.length; k++)
+    for (var m = 0; m < keep[k].length; m++) sum += keep[k][m].id;
+  return sum;
+}
+run(function (a) { a.shift(); }) + " " + run(function (a) { a.reverse(); });
+"#
+        ),
+        "24000 24000"
+    );
+}
+
+/// `slice` and `splice` convert their arguments, which may change the
+/// array's length, after reading it: their fast paths must not use
+/// indices measured against the old one (before, `splice` copied past
+/// the elements' end).
+#[test]
+fn slice_and_splice_arguments_that_shrink_the_array() {
+    assert_eq!(
+        value(
+            r#"
+var a = []; for (var i = 0; i < 100; i++) a[i] = { i: i };
+var s = a.slice(0, { valueOf: function () { a.length = 10; return 100; } });
+var b = []; for (var i = 0; i < 100; i++) b[i] = i;
+var r = b.splice({ valueOf: function () { b.length = 10; return 50; } }, 1);
+[s.length, s[5].i, s[50], r.length, b.length, b[9]].join(" ");
+"#
+        ),
+        "100 5  1 99 9"
+    );
+}
+
+/// In the interpreter's int32 state the accumulator is unboxed, and the
+/// int32s 2 and 10 have `null`'s and `undefined`'s bits: neither is
+/// either.
+#[test]
+fn unboxed_int32s_are_not_null_or_undefined() {
+    assert_eq!(
+        value(
+            r#"
+var r = 0;
+for (var i = 0; i < 1000; i++) {
+  var x = (i % 12) + 0;
+  if (x === undefined) r += 1000;
+  if (x === null) r += 100;
+  if (x == null) r += 10;
+  if ((x ?? -1) < 0) r += 1;
+}
+[r, (10 + 0) === undefined, (2 + 0) === null].join(" ");
+"#
+        ),
+        "0 false false"
+    );
+}

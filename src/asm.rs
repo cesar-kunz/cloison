@@ -275,6 +275,11 @@ pub fn parse(src: &str) -> Result<Module, String> {
             let (mnemonic, operands) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
             let op = Op::from_name(mnemonic)
                 .ok_or_else(|| err(format!("unknown opcode `{mnemonic}`")))?;
+            // (A function read here has no upvalues: one indexed would be
+            // past the closure's.)
+            if matches!(op, Op::LdaUpvalue | Op::StaUpvalue) {
+                return Err(err(format!("{mnemonic}: the text form has no upvalues")));
+            }
             // A constant is the only operand, and may contain commas.
             let toks: Vec<&str> = if op.operands() == [Operand::Const] {
                 vec![operands.trim()]
@@ -601,5 +606,7 @@ mod tests {
         assert!(e.contains("never bound"), "{e}");
         let e = parse("script\n  Ldar 3\nend\n").unwrap_err();
         assert!(e.contains("register"), "{e}");
+        let e = parse("script\n  LdaUpvalue 0\n  Return\nend\n").unwrap_err();
+        assert!(e.contains("no upvalues"), "{e}");
     }
 }

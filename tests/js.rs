@@ -5305,3 +5305,26 @@ t("fastStill", () => "a1b22".replace(/\d+/g, "#") + "|" + "x,y".split(/,/).join(
 out.join(" ");"##;
     assert_eq!(value(src), "replaceCustomExec=aXcX exec@0,exec@2,exec@4 matchCustomExec=b,b 3 testCustom=true searchCustom=7 splitCustom=a|b|c fakeObj=abc flagsGeneric=gy flagsReal=gimsuy replaceFnGroups=[1]x[2] namedTemplate=y<2020> execBadResult=!TypeError symReplaceOverride=custom:axb! species=a|b matchAllCustom=1,2 fastStill=a#b#|x/y|1");
 }
+
+/// A direct `eval`'s scope object leaves the function's own scope alone
+/// when nothing else is in sight (its `var`s deletable there), and a
+/// binding takes back its value, not a `var` the `eval` declared by its
+/// name.
+#[test]
+fn direct_eval_scope_edge_cases() {
+    let src = r#"
+var r = [];
+var initial = null, postDeletion;
+(function () { eval('initial = x; delete x; postDeletion = function () { return typeof x; }; var x;'); })();
+r.push(initial, postDeletion());
+function testAssignment() {
+  var x = 0;
+  var innerX = (function () { x = (eval("var x;"), 1); return x; })();
+  r.push(innerX, x);
+}
+testAssignment();
+function F() { return eval("new.target === F"); }
+r.push(new F() instanceof F, F());
+r.join();"#;
+    assert_eq!(value(src), ",undefined,,1,true,false");
+}

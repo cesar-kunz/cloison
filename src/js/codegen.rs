@@ -1599,6 +1599,12 @@ impl<'a> Gen<'a> {
                 let r = self.store_raw(EVAL_SCOPE, self.f.pos);
                 self.withs = withs;
                 r?;
+                // (Its `new.target`, which the `eval`'s code reads there:
+                // see `Parser::new_expr`.)
+                if self.f.uses_new_target && !self.f.arrow {
+                    self.load_raw("%newtarget", self.f.pos)?;
+                    self.named(Op::SetNamed, env, "%newtarget");
+                }
             }
             for &n in self.overflow {
                 // A parameter's value is in its register.
@@ -4067,10 +4073,6 @@ impl<'a> Gen<'a> {
                     bindings.push((n, n, false));
                 }
             }
-            // (Its code's `new.target`: see `Parser::new_expr`.)
-            if self.f.uses_new_target || self.f.arrow {
-                bindings.push(("%newtarget", "%newtarget", true));
-            }
             let mut kept = Vec::new();
             for b in bindings {
                 if !matches!(self.resolve(b.1, pos)?, Var::Global) {
@@ -4132,7 +4134,12 @@ impl<'a> Gen<'a> {
                 self.load_raw(v, pos)?;
                 self.star(cur);
                 self.intrinsic("eval_scope_get", s, 3);
-                self.store_raw(v, pos)?;
+                // (The binding itself, not a `var` of the `eval`'s by its
+                // name, which a function's lookups would find first.)
+                let withs = std::mem::take(&mut self.withs);
+                let r = self.store_raw(v, pos);
+                self.withs = withs;
+                r?;
                 self.temp = m3;
             }
             self.ldar(result);

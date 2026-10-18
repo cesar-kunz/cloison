@@ -89,6 +89,10 @@ pub const VALUES: u64 = 1;
 pub const BYTES: u64 = 3;
 /// Header word of an upvalue (`vm::Upvalue` follows).
 pub const UPVALUE: u64 = 5;
+/// Header word of a weak collection's entries (see `collections`): as
+/// [`VALUES`]'s, but the collector traces only its header slots, leaving
+/// the keys and values to the ephemeron pass (`Vm::ephemerons`).
+pub const WEAK_VALUES: u64 = 7;
 const KIND: u64 = 7;
 
 /// A block is allocated in again after a minor collection only if it took
@@ -974,7 +978,7 @@ pub unsafe fn cell_size(p: *const u8) -> usize {
             return object_bytes(words);
         }
         let n = match w & KIND {
-            VALUES => 8 + 8 * (w >> 32) as usize,
+            VALUES | WEAK_VALUES => 8 + 8 * (w >> 32) as usize,
             BYTES => 8 + (w >> 32) as usize,
             UPVALUE => 24,
             _ => panic!("no cell at {p:?}: header word {w:#x}"),

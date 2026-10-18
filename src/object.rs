@@ -88,7 +88,8 @@ pub enum Class {
     Map,
     /// A `Set`: as [`Class::Map`], the entries `k0, k1, …`.
     Set,
-    /// A `WeakMap`: as [`Class::Map`] (its keys are held strongly).
+    /// A `WeakMap`: as [`Class::Map`], its keys held weakly (see
+    /// `collections`).
     WeakMap,
     /// A `WeakSet`: as [`Class::Set`].
     WeakSet,

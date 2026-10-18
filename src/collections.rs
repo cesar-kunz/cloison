@@ -10,7 +10,9 @@
 //! Adding an entry to an array more than half holes first copies the live
 //! ones into a fresh array, as `clear` does, and the old one forwards to
 //! it: an iteration in progress moves there (see [`current`]), so it sees
-//! entries added after. The weak kinds hold their keys strongly.
+//! entries added after. The weak kinds' entries are a buffer the
+//! collector doesn't trace (`heap::WEAK_VALUES`): it keeps the value of
+//! each entry whose key is live and clears the others (`Vm::ephemerons`).
 
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_int32, to_number};
@@ -182,8 +184,11 @@ fn normalize(k: Value) -> Value {
 /// and the number of live entries. The entries follow, from [`BASE`].
 const INDEX: usize = 0;
 const FORWARD: usize = 1;
-const COUNT: usize = 2;
-const BASE: usize = 3;
+pub(crate) const COUNT: usize = 2;
+pub(crate) const BASE: usize = 3;
+/// The header's length: what the collector traces of a weak collection's
+/// entries array (see `gc::trace_weak_entries`).
+pub(crate) const WEAK_HEADER: usize = BASE;
 
 /// No entry, in a hash index.
 const NONE: i32 = -1;
@@ -303,6 +308,11 @@ fn live(o: *mut Object) -> usize {
     int(entries(o), COUNT) as usize
 }
 
+/// The entries collection `o` has (for `Vm::weak_entry_count`).
+pub(crate) fn live_entries(o: *mut Object) -> usize {
+    live(o)
+}
+
 /// A new entries array for entries `s` wide: `entries`' live ones (none if
 /// null), indexed.
 fn new_entries(vm: &mut Vm, from: Option<*mut Object>, s: usize) -> Result<*mut Object> {
@@ -331,6 +341,7 @@ fn move_entries(vm: &mut Vm, o: *mut Object) -> Result<()> {
     let fresh = new_entries(vm, Some(old), stride(o))?;
     put(old, FORWARD, object_value(fresh));
     hold_entries(o, object_value(fresh));
+    weaken(o);
     Ok(())
 }
 
@@ -346,6 +357,7 @@ fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
     let e = entries(o);
     let j = (len(e) - BASE) / s;
     array_push(vm, object_value(e), entry)?;
+    weaken(o);
     put(e, COUNT, Value::from_i32(int(e, COUNT) + 1));
     let mut ix = as_object(slot(e, INDEX));
     let n = int(ix, 0) as usize;
@@ -378,7 +390,32 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object
     let p = object_value(vm.collection_prototypes[proto as usize]);
     let o = vm.new_object_with(class, p, 0);
     hold_entries(o, object_value(e));
+    // (The collector's to find: see `Vm::ephemerons`.)
+    if matches!(class, Class::WeakMap | Class::WeakSet) {
+        vm.weak_tables.push(o);
+        weaken(o);
+    }
     Ok(o)
+}
+
+/// A weak collection `o`'s entries buffer (new, or grown) tagged so the
+/// collector leaves its keys and values to the ephemeron pass (see
+/// `heap::WEAK_VALUES`).
+fn weaken(o: *mut Object) {
+    unsafe {
+        if !matches!((*o).class, Class::WeakMap | Class::WeakSet) {
+            return;
+        }
+        let e = entries(o);
+        let elems = (*e).elems;
+        if elems.is_null() {
+            return;
+        }
+        let w = elems.cast::<u64>().sub(1);
+        if *w & 7 == crate::heap::VALUES {
+            *w = (*w & !7) | crate::heap::WEAK_VALUES;
+        }
+    }
 }
 
 /// Call `f` with each value iterating `v` yields: an array's or typed

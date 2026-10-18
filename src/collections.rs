@@ -132,11 +132,31 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, dp, "buffer", view_buffer);
     getter(vm, dp, "byteLength", view_byte_length);
     getter(vm, dp, "byteOffset", view_byte_offset);
-    const GETS: [NativeFn; 8] =
-        [view_get::<0>, view_get::<1>, view_get::<2>, view_get::<3>, view_get::<4>, view_get::<5>, view_get::<6>, view_get::<7>];
-    const SETS: [NativeFn; 8] =
-        [view_set::<0>, view_set::<1>, view_set::<2>, view_set::<3>, view_set::<4>, view_set::<5>, view_set::<6>, view_set::<7>];
-    let names: Vec<(String, NativeFn, u32)> = (0..8)
+    const GETS: [NativeFn; 10] = [
+        view_get::<0>,
+        view_get::<1>,
+        view_get::<2>,
+        view_get::<3>,
+        view_get::<4>,
+        view_get::<5>,
+        view_get::<6>,
+        view_get::<7>,
+        view_get::<8>,
+        view_get::<9>,
+    ];
+    const SETS: [NativeFn; 10] = [
+        view_set::<0>,
+        view_set::<1>,
+        view_set::<2>,
+        view_set::<3>,
+        view_set::<4>,
+        view_set::<5>,
+        view_set::<6>,
+        view_set::<7>,
+        view_set::<8>,
+        view_set::<9>,
+    ];
+    let names: Vec<(String, NativeFn, u32)> = (0..10)
         .flat_map(|t| [(format!("get{}", VIEW_TYPES[t].0), GETS[t], 1), (format!("set{}", VIEW_TYPES[t].0), SETS[t], 2)])
         .collect();
     let fs: Vec<(&str, NativeFn, u32)> = names.iter().map(|(n, f, k)| (n.as_str(), *f, *k)).collect();
@@ -204,7 +224,8 @@ const NONE: i32 = -1;
 
 /// A key's hash, equal for keys SameValueZero finds equal: a number's by
 /// its value (an integral double as the int32), a string's by its units,
-/// anything else's by its bits (a cell's address: cells never move).
+/// a BigInt's by its value, anything else's by its bits (a cell's
+/// address: cells never move).
 fn hash(k: Value) -> u32 {
     let bits = if let Some(f) = k.as_number() {
         if f.is_nan() {
@@ -216,6 +237,8 @@ fn hash(k: Value) -> u32 {
         }
     } else if let Some(u) = string_units(k) {
         u.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3))
+    } else if crate::bigint::is_bigint(k) {
+        crate::bigint::hash(k) as u64
     } else {
         k.to_bits()
     };
@@ -746,8 +769,18 @@ fn weak_set_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// The element types of `DataView`'s `get` and `set` methods, and their
 /// sizes (`view_get`'s and `view_set`'s `T` indexes them).
-const VIEW_TYPES: [(&str, usize); 8] =
-    [("Int8", 1), ("Uint8", 1), ("Int16", 2), ("Uint16", 2), ("Int32", 4), ("Uint32", 4), ("Float32", 4), ("Float64", 8)];
+const VIEW_TYPES: [(&str, usize); 10] = [
+    ("Int8", 1),
+    ("Uint8", 1),
+    ("Int16", 2),
+    ("Uint16", 2),
+    ("Int32", 4),
+    ("Uint32", 4),
+    ("Float32", 4),
+    ("Float64", 8),
+    ("BigInt64", 8),
+    ("BigUint64", 8),
+];
 
 /// `new DataView(buffer, byteOffset, byteLength)`: a view of the buffer's
 /// bytes from `byteOffset` (0), `byteLength` of them (the rest).
@@ -855,7 +888,8 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
         4 => Value::from_i32(i32::from_le_bytes([b[0], b[1], b[2], b[3]])),
         5 => Value::number(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
         6 => Value::number(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-        _ => Value::number(f64::from_le_bytes(b)),
+        7 => Value::number(f64::from_le_bytes(b)),
+        _ => crate::bigint::from_bits(u64::from_le_bytes(b), T == 8),
     })
 }
 
@@ -865,7 +899,8 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_view(this)?;
     let i = to_index(vm, arg(a, 0))?;
-    let d = to_number(arg(a, 1));
+    let big = if T >= 8 { crate::bigint::to_bits(crate::builtins::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?) } else { 0 };
+    let d = if T >= 8 { 0.0 } else { to_number(arg(a, 1)) };
     if vm.conv_thrown {
         return Err(vm.take_conv_error());
     }
@@ -878,7 +913,8 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
         2 | 3 => b[..2].copy_from_slice(&(to_int32(d) as u16).to_le_bytes()),
         4 | 5 => b[..4].copy_from_slice(&(to_int32(d) as u32).to_le_bytes()),
         6 => b[..4].copy_from_slice(&(d as f32).to_le_bytes()),
-        _ => b = d.to_le_bytes(),
+        7 => b = d.to_le_bytes(),
+        _ => b = big.to_le_bytes(),
     }
     if !little {
         b[..size].reverse();

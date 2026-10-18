@@ -114,7 +114,15 @@ pub enum Class {
     /// unregister tokens' registration counts, its cleanup callback in
     /// slot 0 (see `collections`).
     FinalizationRegistry,
+    /// A BigInt (a primitive: see `bigint`): its sign in `elems_cap`, its
+    /// magnitude's 32-bit limbs in `elems` (a byte buffer), their count in
+    /// `elems_len`.
+    BigInt,
 }
+
+// (Stencils read a cell's class byte: a string's 4, a symbol's 9, a
+// BigInt's 23.)
+const _: () = assert!(Class::String as u8 == 4 && Class::Symbol as u8 == 9 && Class::BigInt as u8 == 23);
 
 impl Class {
     /// Whether an object of this class has no elements at all (a
@@ -133,6 +141,7 @@ impl Class {
                 | Class::CollectionIterator
                 | Class::Promise
                 | Class::Symbol
+                | Class::BigInt
                 | Class::ArrayIterator
                 | Class::Generator
                 | Class::Proxy
@@ -154,10 +163,13 @@ pub enum TypedKind {
     U32,
     F32,
     F64,
+    /// `BigInt64Array`'s: BigInts (see [`TypedKind::is_big`]).
+    I64,
+    U64,
 }
 
 impl TypedKind {
-    pub const ALL: [TypedKind; 9] = [
+    pub const ALL: [TypedKind; 11] = [
         TypedKind::I8,
         TypedKind::U8,
         TypedKind::U8Clamped,
@@ -167,7 +179,16 @@ impl TypedKind {
         TypedKind::U32,
         TypedKind::F32,
         TypedKind::F64,
+        TypedKind::I64,
+        TypedKind::U64,
     ];
+
+    /// Whether its elements are BigInts (which compiled code leaves to
+    /// the runtime: their loads allocate, their stores convert with
+    /// ToBigInt).
+    pub fn is_big(self) -> bool {
+        matches!(self, TypedKind::I64 | TypedKind::U64)
+    }
 
     pub fn from_u8(k: u8) -> TypedKind {
         TypedKind::ALL[k as usize]
@@ -179,7 +200,7 @@ impl TypedKind {
             TypedKind::I8 | TypedKind::U8 | TypedKind::U8Clamped => 1,
             TypedKind::I16 | TypedKind::U16 => 2,
             TypedKind::I32 | TypedKind::U32 | TypedKind::F32 => 4,
-            TypedKind::F64 => 8,
+            TypedKind::F64 | TypedKind::I64 | TypedKind::U64 => 8,
         }
     }
 
@@ -195,10 +216,13 @@ impl TypedKind {
             TypedKind::U32 => "Uint32Array",
             TypedKind::F32 => "Float32Array",
             TypedKind::F64 => "Float64Array",
+            TypedKind::I64 => "BigInt64Array",
+            TypedKind::U64 => "BigUint64Array",
         }
     }
 
-    /// Element `i` at `p` (the first element), as a number.
+    /// Element `i` at `p` (the first element), as a number (a BigInt,
+    /// allocated, of a BigInt kind).
     ///
     /// # Safety
     /// `p` must point to at least `i + 1` elements of this kind.
@@ -213,6 +237,10 @@ impl TypedKind {
                 TypedKind::U32 => Value::number(p.cast::<u32>().add(i).read_unaligned() as f64),
                 TypedKind::F32 => Value::number(p.cast::<f32>().add(i).read_unaligned() as f64),
                 TypedKind::F64 => Value::number(p.cast::<f64>().add(i).read_unaligned()),
+                TypedKind::I64 | TypedKind::U64 => {
+                    let bits = p.cast::<u64>().add(i).read_unaligned();
+                    crate::bigint::from_bits(bits, self == TypedKind::I64)
+                }
             }
         }
     }
@@ -231,6 +259,8 @@ impl TypedKind {
                 TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(v as u32),
                 TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(v as f32),
                 TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(v as f64),
+                // (Not for BigInts: see `store_value`.)
+                TypedKind::I64 | TypedKind::U64 => {}
             }
         }
     }
@@ -255,6 +285,22 @@ impl TypedKind {
                 TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(int() as u32),
                 TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(d as f32),
                 TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(d),
+                TypedKind::I64 | TypedKind::U64 => {}
+            }
+        }
+    }
+
+    /// Store `v`, a number (a BigInt of a BigInt kind: see
+    /// `builtins::to_element`), as element `i` at `p`.
+    ///
+    /// # Safety
+    /// As [`TypedKind::load`].
+    pub unsafe fn store_value(self, p: *mut u8, i: usize, v: Value) {
+        unsafe {
+            if self.is_big() {
+                p.cast::<u64>().add(i).write_unaligned(crate::bigint::to_bits(v));
+            } else {
+                self.store(p, i, v.to_number());
             }
         }
     }

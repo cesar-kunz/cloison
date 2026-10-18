@@ -5328,3 +5328,73 @@ r.push(new F() instanceof F, F());
 r.join();"#;
     assert_eq!(value(src), ",undefined,,1,true,false");
 }
+
+/// BigInts: literals, the operators (a number mixed in is a TypeError),
+/// comparisons and equality with numbers and strings, by value as Map
+/// keys, `++`/`--` (not `x - 1`'s `SubSmi`), the builtins, and the same
+/// in hot code the JIT compiles for numbers first.
+#[test]
+fn bigints() {
+    let src = r#"
+var r = [];
+function t(f) { try { r.push(String(f())); } catch (e) { r.push(e.name); } }
+t(() => 10n ** 30n); t(() => -7n / 2n); t(() => -7n % 2n); t(() => 0x1fn + 0b101n + 0o17n + 1_000n);
+t(() => typeof 1n); t(() => [1n == 1, 1n === 1, 1n == "1", 2n > 1, 1n < 1.5, "2" > 1n, 0n ? 1 : 0].join());
+t(() => [BigInt(10), BigInt("0x10"), BigInt.asIntN(8, 255n), BigInt.asUintN(64, -1n), (255n).toString(16)].join());
+t(() => [-5n >> 1n, 5n << 3n, -6n & 3n, 6n | 1n, 6n ^ 3n, ~5n, -(-5n)].join());
+t(() => { var x = 5n; x++; x--; x--; var y = x++; return [y, x, --x, ++x].join(); });
+t(() => 1n + 1); t(() => 1n / 0n); t(() => 1n >>> 0n); t(() => +1n); t(() => 5n - 1); t(() => 5n & 1);
+t(() => JSON.stringify({a: 1n})); t(() => new BigInt(1)); t(() => BigInt(1.5));
+t(() => [Number(2n ** 64n), Object.is(1n, 1n), [1n, 2n].includes(2n), new Map([[1n, "a"]]).get(1n), new Set([1n, 1n]).size].join());
+t(() => [Object(1n) + 1n, typeof Object(1n), Object.prototype.toString.call(1n), {valueOf() { return 3n; }} * 2n].join());
+t(() => 123456789012345678901234567890n * 987654321098765432109876543210n);
+t(() => (2n ** 200n).toString(36));
+function sub(a, b) { return a - b; }
+function eq(a, b) { return a === b; }
+function dec(a) { a--; return a; }
+function m1(a) { return a - 1; }
+for (var k = 0; k < 20000; k++) { sub(k, 3); eq(k, 5); dec(k); m1(k); }
+t(() => [sub(17n, 3n), eq(5n, 5n), eq(5n, 6n), dec(5n)].join()); t(() => m1(5n));
+t(() => { var a = 0n, b = 1n; for (var i = 0; i < 100; i++) { var c = a + b; a = b; b = c; } return a; });
+r.join(" ");"#;
+    assert_eq!(
+        value(src),
+        "1000000000000000000000000000000 -3 -1 1051 bigint true,false,true,true,true,true,0 10,16,-1,18446744073709551615,ff \
+         -3,40,2,7,5,-6,5 4,5,4,5 TypeError RangeError TypeError TypeError TypeError TypeError TypeError TypeError RangeError \
+         18446744073709552000,true,true,a,1 2,object,[object BigInt],6 \
+         121932631137021795226185032733622923332237463801111263526900 bnklg118comha6gqury14067gur54n8won6guf4 \
+         14,true,false,4 TypeError 354224848179261915075"
+    );
+}
+
+/// `BigInt64Array`, `BigUint64Array` and `DataView`'s BigInt methods:
+/// elements converted with ToBigInt (a number is a TypeError), read as
+/// BigInts, through the builtins and in hot code.
+#[test]
+fn bigint_typed_arrays() {
+    let src = r#"
+var r = [];
+function t(f) { try { r.push(String(f())); } catch (e) { r.push(e.name); } }
+var a = new BigInt64Array(4);
+a[0] = -1n; a[1] = 2n ** 63n; a[2] = 5n; a[3] = 2n ** 64n + 7n;
+t(() => a.join()); t(() => new BigUint64Array(a.buffer).join());
+t(() => { a[0] = 1; }); t(() => new BigInt64Array([1n, "2", true]).join());
+t(() => [a.slice(1, 3).join(), a.filter(x => x > 0n).join(), a.map(x => x * 2n).join()].join("|"));
+t(() => new BigInt64Array([3n, -1n, 2n]).sort().join()); t(() => a.fill(9n, 2).join()); t(() => a.fill(1));
+t(() => [a.indexOf(9n), a.includes(9n), BigInt64Array.of(1n, 2n).join(), a.with(0, 4n).join()].join("|"));
+var dv = new DataView(new ArrayBuffer(16));
+dv.setBigInt64(0, -2n); dv.setBigUint64(8, 2n ** 64n - 2n, true);
+t(() => [dv.getBigInt64(0), dv.getBigUint64(0), dv.getBigInt64(8, true), dv.getInt32(4)].join());
+t(() => dv.setBigInt64(0, 1));
+var big = new BigInt64Array(100), s = 0n;
+for (var k = 0; k < 3000; k++) { for (var i = 0; i < 100; i++) big[i] = BigInt(i) * BigInt(k); }
+for (var i = 0; i < 100; i++) s += big[i];
+t(() => s);
+r.join(" ");"#;
+    assert_eq!(
+        value(src),
+        "-1,-9223372036854775808,5,7 18446744073709551615,9223372036854775808,5,7 TypeError 1,2,1 \
+         -9223372036854775808,5|5,7|-2,0,10,14 -1,2,3 -1,-9223372036854775808,9,9 TypeError 2|true|1,2|4,-9223372036854775808,9,9 \
+         -2,18446744073709551614,-2,-2 TypeError 14845050"
+    );
+}

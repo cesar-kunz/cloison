@@ -14,6 +14,9 @@ pub enum Tok {
     /// A reserved word (`function`, `var`, `this`, `true`, …).
     Keyword(&'static str),
     Num(f64),
+    /// A BigInt literal: its digits (after a `0x`, `0o` or `0b`), without
+    /// separators or the `n`.
+    BigInt(String),
     Str(String),
     /// An operator or punctuator.
     Punct(&'static str),
@@ -226,9 +229,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
         }
         let tok =
             if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
-                let (v, n) = number(&src[i..]).ok_or_else(|| err("bad number"))?;
-                i += n;
-                Tok::Num(v)
+                if let Some((digits, n)) = bigint(&src[i..]) {
+                    i += n;
+                    Tok::BigInt(digits)
+                } else {
+                    let (v, n) = number(&src[i..]).ok_or_else(|| err("bad number"))?;
+                    i += n;
+                    Tok::Num(v)
+                }
             } else if c == b'"' || c == b'\'' {
                 let (s, n) = string(&src[i..]).ok_or_else(|| err("unterminated string"))?;
                 // (Escapes in it: then not a directive, `"use strict"`.)
@@ -383,7 +391,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
 /// Whether a `/` after `t` divides (`t` ends an expression).
 fn ends_expression(t: &Tok) -> bool {
     match t {
-        Tok::Ident(_) | Tok::Num(_) | Tok::Str(_) | Tok::RegExp(..) => true,
+        Tok::Ident(_) | Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::RegExp(..) => true,
         Tok::Keyword(k) => matches!(*k, "this" | "true" | "false" | "null" | "super"),
         Tok::Punct(p) => matches!(*p, ")" | "]" | "}" | "++" | "--"),
         Tok::Template(t) => t.tail,
@@ -601,6 +609,30 @@ fn number(s: &str) -> Option<(f64, usize)> {
         return None;
     }
     Some((s[..n].replace('_', "").parse().ok()?, n))
+}
+
+/// A BigInt literal at the start of `s` (integer digits and `n`): its
+/// digits, with their radix prefix, and its length.
+fn bigint(s: &str) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    let (radix, start) = match b {
+        [b'0', p, ..] if matches!(p | 0x20, b'x' | b'o' | b'b') => {
+            (match p | 0x20 { b'x' => 16, b'o' => 8, _ => 2 }, 2)
+        }
+        _ => (10, 0),
+    };
+    let n = start + s[start..].find(|c: char| !c.is_digit(radix) && c != '_').unwrap_or(s.len() - start);
+    if n == start || b.get(n) != Some(&b'n') || !separated(&s[start..n]) {
+        return None;
+    }
+    // (No leading zero: not `01n`, legacy octal.)
+    if radix == 10 && b[0] == b'0' && n > 1 {
+        return None;
+    }
+    if s[n + 1..].starts_with(is_ident_part) {
+        return None;
+    }
+    Some((s[..start].to_ascii_lowercase() + &s[start..n].replace('_', ""), n + 1))
 }
 
 /// Whether digits `s`' separators (`_`) are each between two digits.

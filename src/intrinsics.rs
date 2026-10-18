@@ -70,6 +70,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("eval_scope", eval_scope),
     ("eval_scope_get", eval_scope_get),
     ("eval_scope_flush", eval_scope_flush),
+    ("bigint", crate::bigint::literal),
 ];
 
 /// The id of the intrinsic `name`.
@@ -775,15 +776,22 @@ fn object(o: *mut Object) -> Value {
 
 /// `a ** b` (Number::exponentiate, as `Math.pow`).
 fn exp(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let x = crate::interp::to_number(arg(a, 0));
+    let x = crate::interp::to_numeric(arg(a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
-    let y = crate::interp::to_number(arg(a, 1));
+    let y = crate::interp::to_numeric(arg(a, 1));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
-    Ok(Value::number(crate::math::pow(x, y)))
+    if crate::bigint::is_bigint(x) || crate::bigint::is_bigint(y) {
+        let r = crate::bigint::binary(crate::bigint::BinOp::Exp, x, y);
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
+        return Ok(r);
+    }
+    Ok(Value::number(crate::math::pow(x.to_number(), y.to_number())))
 }
 
 /// `{...source}` into object `[target, source]`: the source's own

@@ -348,7 +348,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let what = match self.peek() {
             Tok::Ident(s) => format!("`{s}`"),
             Tok::Keyword(k) | Tok::Punct(k) => format!("`{k}`"),
-            Tok::Num(_) => "a number".into(),
+            Tok::Num(_) | Tok::BigInt(_) => "a number".into(),
             Tok::Str(_) => "a string".into(),
             Tok::RegExp(..) => "a regular expression".into(),
             Tok::Template(_) => "a template".into(),
@@ -1730,7 +1730,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     // An accessor (`get x() { … }`), a function too.
                     let next = &self.toks[self.i + 1].tok;
                     if (&**n == "get" || &**n == "set")
-                        && matches!(next, Tok::Ident(_) | Tok::Str(_) | Tok::Num(_) | Tok::Keyword(_))
+                        && matches!(next, Tok::Ident(_) | Tok::Str(_) | Tok::Num(_) | Tok::BigInt(_) | Tok::Keyword(_))
                         && self.toks[self.i + 2].tok == Tok::Punct("(")
                     {
                         let (params, body) = header(self.toks, self.i + 2)?;
@@ -2195,6 +2195,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let start = self.i;
         let kind = match self.bump() {
             Tok::Num(v) => ExprKind::Num(v),
+            Tok::BigInt(d) => ExprKind::Intrinsic("bigint", vec![Expr { kind: ExprKind::Str(d), pos }]),
             Tok::Str(s) => ExprKind::Str(s),
             Tok::Ident(s) if self.is("=>") && !self.toks[self.i].newline_before => {
                 ExprKind::Function(self.arrow(Some(s), pos)?)
@@ -2794,6 +2795,7 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Str(s) => s.into(),
             Tok::Keyword(k) => k.into(),
             Tok::Num(v) => super::number_to_string(v).into(),
+            Tok::BigInt(d) => crate::bigint::literal_key(&d).into(),
             Tok::Punct("[") => {
                 let e = self.assignment(false)?;
                 self.expect("]")?;

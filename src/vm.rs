@@ -116,7 +116,8 @@ pub const NO_ELEMENTS: u64 = 3;
 /// `ic` must be a live cache slot and `o` a live object.
 pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
     unsafe {
-        let kind = if (*o).class == Class::TypedArray {
+        // (A BigInt kind's as anything else's: its loads allocate.)
+        let kind = if (*o).class == Class::TypedArray && !crate::object::TypedKind::from_u8((*o).kind).is_big() {
             (*o).kind as u32 + 1
         } else {
             u32::MAX
@@ -618,7 +619,7 @@ pub struct Vm {
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
     /// `typeof`'s results, once made (see [`Vm::type_of`]).
-    type_names: [Option<Value>; 7],
+    type_names: [Option<Value>; 8],
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
@@ -664,6 +665,7 @@ pub struct Vm {
     pub(crate) array_fn: *mut Object,
     pub(crate) date_prototype: *mut Object,
     pub(crate) number_prototype: *mut Object,
+    pub(crate) bigint_prototype: *mut Object,
     /// Each typed array kind's prototype (`TypedKind` order), and
     /// `ArrayBuffer.prototype`.
     pub(crate) typed_prototypes: Vec<*mut Object>,
@@ -867,7 +869,7 @@ impl Vm {
             conv_thrown: false,
             store_failed: false,
             open_upvalues: Vec::new(),
-            type_names: [None; 7],
+            type_names: [None; 8],
             handles: Vec::new(),
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
@@ -886,6 +888,7 @@ impl Vm {
             array_fn: std::ptr::null_mut(),
             date_prototype: std::ptr::null_mut(),
             number_prototype: std::ptr::null_mut(),
+            bigint_prototype: std::ptr::null_mut(),
             error_prototypes: Vec::new(),
             typed_prototypes: Vec::new(),
             collection_prototypes: Vec::new(),
@@ -1828,6 +1831,8 @@ impl Vm {
             self.boolean_prototype
         } else if crate::symbol::is_symbol(v) {
             self.symbol_roots[crate::symbol::Root::SymbolPrototype as usize]
+        } else if crate::bigint::is_bigint(v) {
+            self.bigint_prototype
         } else {
             self.string_prototype
         };
@@ -2281,7 +2286,7 @@ impl Vm {
     /// `typeof v`, a string constant (each made once: EarleyBoyer's
     /// `sc_isNumber` and others spent 3% encoding and looking them up).
     pub fn type_of(&mut self, v: Value) -> Value {
-        const NAMES: [&str; 7] = ["number", "undefined", "boolean", "string", "function", "object", "symbol"];
+        const NAMES: [&str; 8] = ["number", "undefined", "boolean", "string", "function", "object", "symbol", "bigint"];
         let k = if v.is_number() {
             0
         } else if v.is_undefined() {
@@ -2293,6 +2298,7 @@ impl Vm {
                 Class::String => 3,
                 Class::Function | Class::Native => 4,
                 Class::Symbol => 6,
+                Class::BigInt => 7,
                 _ => 5,
             }
         } else {
@@ -2827,8 +2833,13 @@ impl Vm {
                 }
                 c if c.no_elements() => return Ok(()),
                 Class::TypedArray => {
-                    if i < (*o).elems_len {
-                        let kind = crate::object::TypedKind::from_u8((*o).kind);
+                    let kind = crate::object::TypedKind::from_u8((*o).kind);
+                    if kind.is_big() {
+                        let v = crate::builtins::to_element(self, kind, value)?;
+                        if i < (*o).elems_len {
+                            kind.store_value((*o).elems.cast(), i as usize, v);
+                        }
+                    } else if i < (*o).elems_len {
                         let d = crate::interp::to_number(value);
                         kind.store((*o).elems.cast(), i as usize, d);
                     }
@@ -4045,6 +4056,7 @@ impl Vm {
             self.array_fn,
             self.date_prototype,
             self.number_prototype,
+            self.bigint_prototype,
             self.regexp_prototype,
             self.boolean_prototype,
             self.array_buffer_prototype,
@@ -4759,6 +4771,8 @@ pub fn display(v: Value) -> String {
         String::from_utf16_lossy(s)
     } else if crate::symbol::is_symbol(v) {
         String::from_utf16_lossy(&crate::symbol::symbol_string(v))
+    } else if crate::bigint::is_bigint(v) {
+        crate::bigint::to_string(v)
     } else if v.is_cell() {
         "[object Object]".into()
     } else {

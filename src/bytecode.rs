@@ -381,6 +381,12 @@ define_ops! {
     /// then its coroutine run to its first `await`; the frame returns its
     /// promise (see `generator::async_start`).
     AsyncStart(Reg),
+    /// `acc = acc - 1` (`--`: `SubSmi 1` but for a BigInt, which `x - 1`
+    /// can't take).
+    Dec(),
+    /// `acc = ToNumeric(acc)`: a postfix `++`'s or `--`'s old value (a
+    /// number, or a BigInt).
+    ToNumeric(),
 }
 
 impl Op {

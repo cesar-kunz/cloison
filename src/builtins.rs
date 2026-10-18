@@ -284,6 +284,7 @@ pub(crate) fn install(vm: &mut Vm) {
     crate::reflect::install(vm);
     crate::proxy::install(vm);
     crate::symbol::install(vm);
+    crate::bigint::install(vm);
     crate::generator::install(vm);
     // (`Symbol.prototype`'s is called directly: a symbol is a primitive.)
     vm.to_primitive_defined = false;
@@ -352,7 +353,7 @@ fn string(vm: &mut Vm, u: &[u16]) -> Value {
     vm.new_string(u)
 }
 
-fn str_value(vm: &mut Vm, s: &str) -> Value {
+pub(crate) fn str_value(vm: &mut Vm, s: &str) -> Value {
     let u: Vec<u16> = s.encode_utf16().collect();
     vm.new_string(&u)
 }
@@ -1147,7 +1148,11 @@ fn number_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let n = match a.first() {
         None => Value::from_i32(0),
         Some(&v) if v.is_number() => v,
-        Some(&v) => num(to_number(v)),
+        // (ToNumeric: a BigInt's value.)
+        Some(&v) => {
+            let p = crate::interp::to_numeric(v);
+            if crate::bigint::is_bigint(p) { num(crate::bigint::big_of(p).to_f64()) } else { p }
+        }
     };
     Ok(if construct { vm.new_wrapper(n) } else { n })
 }
@@ -1733,7 +1738,7 @@ fn install_typed_arrays(vm: &mut Vm) {
     getter(vm, shared, "buffer", typed_buffer);
     getter(vm, shared, "byteLength", typed_byte_length);
     getter(vm, shared, "byteOffset", typed_byte_offset);
-    const CTORS: [NativeFn; 9] = [
+    const CTORS: [NativeFn; 11] = [
         typed_ctor::<0>,
         typed_ctor::<1>,
         typed_ctor::<2>,
@@ -1743,6 +1748,8 @@ fn install_typed_arrays(vm: &mut Vm) {
         typed_ctor::<6>,
         typed_ctor::<7>,
         typed_ctor::<8>,
+        typed_ctor::<9>,
+        typed_ctor::<10>,
     ];
     let a_bpe = vm.intern("BYTES_PER_ELEMENT");
     for (k, kind) in TypedKind::ALL.iter().enumerate() {
@@ -1892,7 +1899,8 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         let v = new_view(vm, k, b, 0, n);
         for i in 0..n {
             let e = vm.get_keyed(first, Value::from_i32(i as i32))?;
-            unsafe { k.store((*b).elems.cast(), i, to_number(e)) };
+            let e = to_element(vm, k, e)?;
+            unsafe { k.store_value((*b).elems.cast(), i, e) };
         }
         return Ok(v);
     }
@@ -1917,6 +1925,26 @@ fn this_typed(this: Value) -> Result<*mut Object> {
     } else {
         Err(Error::type_error("this is not a typed array."))
     }
+}
+
+/// `v` converted for an element of kind `k`: ToBigInt for a BigInt kind
+/// (a BigInt), else ToNumber (a number).
+pub(crate) fn to_element(vm: &mut Vm, k: TypedKind, v: Value) -> Result<Value> {
+    if k.is_big() {
+        if crate::bigint::is_bigint(v) {
+            return Ok(v);
+        }
+        let b = crate::bigint::to_bigint(vm, v)?;
+        return Ok(crate::bigint::new_bigint(vm, b));
+    }
+    if v.is_number() {
+        return Ok(v);
+    }
+    let d = to_number(v);
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    Ok(Value::number(d))
 }
 
 fn kind_of(o: *mut Object) -> TypedKind {
@@ -1955,29 +1983,34 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::range_error("offset is out of bounds"));
     }
     // Read them all first: `list` may share the bytes.
-    let mut vals = Vec::with_capacity(n);
-    for i in 0..n {
-        vals.push(to_number(vm.get_keyed(src, Value::from_i32(i as i32))?));
-    }
-    for (i, d) in vals.into_iter().enumerate() {
-        unsafe { k.store((*o).elems.cast(), offset + i, d) };
-    }
-    Ok(Value::UNDEFINED)
+    vm.handle_scope(|vm| {
+        let mut vals = Vec::with_capacity(n);
+        for i in 0..n {
+            let e = vm.get_keyed(src, Value::from_i32(i as i32))?;
+            let e = to_element(vm, k, e)?;
+            vm.handles.push(e);
+            vals.push(e);
+        }
+        for (i, e) in vals.into_iter().enumerate() {
+            unsafe { k.store_value((*o).elems.cast(), offset + i, e) };
+        }
+        Ok(Value::UNDEFINED)
+    })
 }
 
 /// `t.fill(v, begin, end)`.
-fn typed_fill(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
     let k = kind_of(o);
     let len = unsafe { (*o).elems_len } as usize;
-    let d = to_number(arg(a, 0));
+    let d = to_element(vm, k, arg(a, 0))?;
     let s = relative(int_arg(a, 1), len);
     let e = match a.get(2) {
         Some(v) if !v.is_undefined() => relative(int_arg(a, 2), len),
         _ => len,
     };
     for i in s..e.max(s) {
-        unsafe { k.store((*o).elems.cast(), i, d) };
+        unsafe { k.store_value((*o).elems.cast(), i, d) };
     }
     Ok(this)
 }
@@ -2044,23 +2077,28 @@ pub(crate) fn typed_to_string_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Resu
 }
 
 /// A new typed array of kind `k`, `n` elements of `values` (zero past
-/// them).
-fn new_typed(vm: &mut Vm, k: TypedKind, n: usize, values: &[f64]) -> Result<Value> {
+/// them; elements converted, see [`to_element`]).
+fn new_typed(vm: &mut Vm, k: TypedKind, n: usize, values: &[Value]) -> Result<Value> {
     typed_length(n, k.size())?;
     let b = new_buffer(vm, n * k.size());
     let v = new_view(vm, k, b, 0, n);
-    for (i, &d) in values.iter().enumerate() {
-        unsafe { k.store((*b).elems.cast(), i, d) };
+    for (i, &e) in values.iter().enumerate() {
+        unsafe { k.store_value((*b).elems.cast(), i, e) };
     }
     Ok(v)
 }
 
-/// Typed array `o`'s elements as numbers.
-fn typed_values(o: *mut Object) -> Vec<f64> {
+/// Typed array `o`'s elements, numbers or BigInts (rooted in
+/// `Vm::handles`: the caller's in a handle scope).
+fn typed_values(vm: &mut Vm, o: *mut Object) -> Vec<Value> {
     let k = kind_of(o);
-    (0..unsafe { (*o).elems_len } as usize)
-        .map(|i| unsafe { k.load((*o).elems.cast(), i) }.to_number())
-        .collect()
+    let values: Vec<Value> = (0..unsafe { (*o).elems_len } as usize)
+        .map(|i| unsafe { k.load((*o).elems.cast(), i) })
+        .collect();
+    if k.is_big() {
+        vm.handles.extend_from_slice(&values);
+    }
+    values
 }
 
 /// The callback argument, checked callable.
@@ -2093,15 +2131,18 @@ fn typed_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
     let f = typed_callback(a, "filter")?;
     let k = kind_of(o);
-    let mut kept = Vec::new();
-    for i in 0..unsafe { (*o).elems_len } as usize {
-        let v = unsafe { k.load((*o).elems.cast(), i) };
-        let r = crate::interp::call_function(vm, f, arg(a, 1), &[v, Value::from_i32(i as i32), this])?;
-        if crate::interp::to_boolean(r) {
-            kept.push(v.to_number());
+    vm.handle_scope(|vm| {
+        let mut kept = Vec::new();
+        for i in 0..unsafe { (*o).elems_len } as usize {
+            let v = unsafe { k.load((*o).elems.cast(), i) };
+            vm.handles.push(v);
+            let r = crate::interp::call_function(vm, f, arg(a, 1), &[v, Value::from_i32(i as i32), this])?;
+            if crate::interp::to_boolean(r) {
+                kept.push(v);
+            }
         }
-    }
-    new_typed(vm, k, kept.len(), &kept)
+        new_typed(vm, k, kept.len(), &kept)
+    })
 }
 
 /// `t.slice(begin, end)`: a copy of those elements.
@@ -2113,27 +2154,38 @@ fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         Some(v) if !v.is_undefined() => relative(int_arg(a, 1), len),
         _ => len,
     };
-    let values = typed_values(o);
-    let part = &values[s.min(len)..e.max(s).min(len)];
-    new_typed(vm, kind_of(o), part.len(), part)
+    vm.handle_scope(|vm| {
+        let values = typed_values(vm, o);
+        let part = &values[s.min(len)..e.max(s).min(len)];
+        new_typed(vm, kind_of(o), part.len(), part)
+    })
 }
 
-/// Sort `values` (stably) by `cmp` (a function, or `undefined`: numeric
-/// order, -0 before +0, NaN last).
-fn sort_numbers(vm: &mut Vm, values: &mut Vec<f64>, cmp: Value) -> Result<()> {
+/// Sort `values`, numbers or BigInts, (stably) by `cmp` (a function, or
+/// `undefined`: numeric order, -0 before +0, NaN last).
+fn sort_numbers(vm: &mut Vm, values: &mut Vec<Value>, cmp: Value) -> Result<()> {
     if !cmp.is_undefined() && !crate::props::is_callable(cmp) {
         return Err(Error::type_error("The comparison function must be either a function or undefined"));
     }
-    let after = |vm: &mut Vm, x: f64, y: f64| -> Result<bool> {
+    let after = |vm: &mut Vm, x: Value, y: Value| -> Result<bool> {
         if cmp.is_undefined() {
+            if crate::bigint::is_bigint(x) {
+                let (p, q) = (crate::bigint::big_of(x), crate::bigint::big_of(y));
+                return Ok(p.cmp(&q) == std::cmp::Ordering::Greater);
+            }
+            let (x, y) = (x.to_number(), y.to_number());
             return Ok(match (x.is_nan(), y.is_nan()) {
                 (true, _) => !y.is_nan(),
                 (false, true) => false,
                 _ => x > y || (x == 0.0 && y == 0.0 && x.is_sign_positive() && y.is_sign_negative()),
             });
         }
-        let r = crate::interp::call_function(vm, cmp, Value::UNDEFINED, &[Value::number(x), Value::number(y)])?;
-        Ok(to_number(r) > 0.0)
+        let r = crate::interp::call_function(vm, cmp, Value::UNDEFINED, &[x, y])?;
+        let d = to_number(r);
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
+        Ok(d > 0.0)
     };
     // A merge sort: a comparator that isn't consistent still ends.
     let mut width = 1;
@@ -2173,15 +2225,17 @@ fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("The comparison function must be either a function or undefined"));
     }
     let o = this_typed(this)?;
-    let mut values = typed_values(o);
-    sort_numbers(vm, &mut values, cmp)?;
-    let k = kind_of(o);
-    for (i, d) in values.into_iter().enumerate() {
-        if i < unsafe { (*o).elems_len } as usize {
-            unsafe { k.store((*o).elems.cast(), i, d) };
+    vm.handle_scope(|vm| {
+        let mut values = typed_values(vm, o);
+        sort_numbers(vm, &mut values, cmp)?;
+        let k = kind_of(o);
+        for (i, e) in values.into_iter().enumerate() {
+            if i < unsafe { (*o).elems_len } as usize {
+                unsafe { k.store_value((*o).elems.cast(), i, e) };
+            }
         }
-    }
-    Ok(this)
+        Ok(this)
+    })
 }
 
 /// `t.toSorted(cmp)`: a sorted copy.
@@ -2191,17 +2245,21 @@ fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("The comparison function must be either a function or undefined"));
     }
     let o = this_typed(this)?;
-    let mut values = typed_values(o);
-    sort_numbers(vm, &mut values, cmp)?;
-    new_typed(vm, kind_of(o), values.len(), &values)
+    vm.handle_scope(|vm| {
+        let mut values = typed_values(vm, o);
+        sort_numbers(vm, &mut values, cmp)?;
+        new_typed(vm, kind_of(o), values.len(), &values)
+    })
 }
 
 /// `t.toReversed()`: a reversed copy.
 fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
-    let mut values = typed_values(o);
-    values.reverse();
-    new_typed(vm, kind_of(o), values.len(), &values)
+    vm.handle_scope(|vm| {
+        let mut values = typed_values(vm, o);
+        values.reverse();
+        new_typed(vm, kind_of(o), values.len(), &values)
+    })
 }
 
 /// `t.with(i, v)`: a copy with element `i` (from the end if negative) `v`.
@@ -2211,16 +2269,19 @@ fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let n = to_number(arg(a, 0));
     let n = if n.is_nan() { 0.0 } else { n.trunc() };
     let i = if n < 0.0 { len + n } else { n };
-    let d = to_number(arg(a, 1));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
+    let d = to_element(vm, kind_of(o), arg(a, 1))?;
     if i < 0.0 || i >= unsafe { (*o).elems_len } as f64 {
         return Err(Error::range_error("Invalid typed array index"));
     }
-    let mut values = typed_values(o);
-    values[i as usize] = d;
-    new_typed(vm, kind_of(o), values.len(), &values)
+    vm.handle_scope(|vm| {
+        vm.handles.push(d);
+        let mut values = typed_values(vm, o);
+        values[i as usize] = d;
+        new_typed(vm, kind_of(o), values.len(), &values)
+    })
 }
 
 /// `TA.from(source, mapFn, thisArg)`: a new `this` typed array of the

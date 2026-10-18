@@ -235,7 +235,7 @@ fn define_getter(vm: &mut Vm, o: *mut Object, key: Key, name: &str, f: NativeFn)
 }
 
 /// `o[@@toStringTag] = tag`, read-only.
-fn to_string_tag(vm: &mut Vm, o: *mut Object, tag: &str) {
+pub(crate) fn to_string_tag(vm: &mut Vm, o: *mut Object, tag: &str) {
     let u: Vec<u16> = tag.encode_utf16().collect();
     let s = vm.string_constant(&u);
     let a = vm.a_sym_to_string_tag;

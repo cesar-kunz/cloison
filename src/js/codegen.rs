@@ -3887,14 +3887,10 @@ impl<'a> Gen<'a> {
         };
         let step = |g: &mut Self| {
             if let Some(o) = old {
-                g.emit(Op::ToNumber, &[]);
+                g.emit(Op::ToNumeric, &[]);
                 g.star(o);
             }
-            if d > 0 {
-                g.emit(Op::Inc, &[]);
-            } else {
-                g.emit(Op::SubSmi, &[Arg::Imm(1)]);
-            }
+            g.emit(if d > 0 { Op::Inc } else { Op::Dec }, &[]);
         };
         match &t.kind {
             ExprKind::Ident(n) if self.in_with(n) => {

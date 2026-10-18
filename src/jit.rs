@@ -333,7 +333,7 @@ fn converting(f: impl FnOnce() -> u64) -> u64 {
 extern "C" fn cloison_rt_inc(a: Value) -> u64 {
     match a.as_number() {
         Some(x) => Value::from_f64_arith(x + 1.0).to_bits(),
-        None => converting(|| crate::interp::generic_inc(a).to_bits()),
+        None => converting(|| crate::interp::generic_inc(a, 1).to_bits()),
     }
 }
 
@@ -1977,6 +1977,14 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     sub = true;
                     Op::AddSmi
                 }
+                // (`SubSmi 1`, a BigInt apart: where the runtime meets
+                // one, the interpreter redoes the instruction.)
+                Op::Dec => {
+                    imm = -1;
+                    sub = true;
+                    Op::AddSmi
+                }
+                Op::ToNumeric => Op::ToNumber,
                 Op::CallApplyArguments if vm => {
                     forward = true;
                     Op::Call
@@ -3521,8 +3529,9 @@ fn rel_code(op: Op) -> i32 {
 /// Whether a value of type `t` is an object other than a string: two such
 /// are equal (`==` or `===`) only if they are the same object.
 fn identity_ty(t: Ty) -> bool {
-    t.shape()
-        .is_some_and(|s| unsafe { (*(s as *const Shape)).class } != crate::object::Class::String)
+    t.shape().is_some_and(|s| {
+        !matches!(unsafe { (*(s as *const Shape)).class }, crate::object::Class::String | crate::object::Class::BigInt)
+    })
 }
 
 /// Whether a value of type `t` is never null or undefined.
@@ -4055,6 +4064,8 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 I32 | F64 => Some("number"),
                 Ty::Obj(s) | Ty::Ext(s) => Some(match class(s) {
                     crate::object::Class::String => "string",
+                    crate::object::Class::Symbol => "symbol",
+                    crate::object::Class::BigInt => "bigint",
                     crate::object::Class::Function | crate::object::Class::Native => "function",
                     _ => "object",
                 }),
@@ -4521,6 +4532,8 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     K::U32 => ("u32f", F64),
                     K::F32 => ("f32", F64),
                     K::F64 => ("f64", F64),
+                    // (Not cached: see `vm::note_bytes`.)
+                    K::I64 | K::U64 => return Sel::new("bail", "", out),
                 };
                 const CHECKED: [&str; 9] =
                     ["i8_chk", "u8_chk", "u8_chk", "i16_chk", "u16_chk", "i32_chk", "u32f_chk", "f32_chk", "f64_chk"];
@@ -4635,6 +4648,7 @@ fn typed_store(kind: Option<u8>, int: bool) -> Option<&'static str> {
         (K::F32, false) => "f32_f",
         (K::F64, true) => "f64_i",
         (K::F64, false) => "f64_f",
+        (K::I64 | K::U64, _) => return None,
     })
 }
 

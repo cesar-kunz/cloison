@@ -215,6 +215,7 @@ fn generate_from<'p>(
                     nregs: nparams + 1,
                     code: vec![Op::CompileLazy as u8],
                     ics: Vec::new(),
+                    defines: Vec::new(),
                     closures: Vec::new(),
                     constants: Vec::new(),
                     handlers: Vec::new(),
@@ -1344,6 +1345,8 @@ struct Gen<'a> {
     asm: Assembler,
     labels: Vec<LabelInfo>,
     ics: Vec<Name>,
+    /// The slots of `ics` that define properties (see `FunctionDef::defines`).
+    defines: Vec<u16>,
     /// The names of the module's caches, each once (see [`Gen::ic`]).
     names: &'a std::cell::RefCell<HashSet<Name>>,
     closures: Vec<usize>,
@@ -1455,6 +1458,7 @@ impl<'a> Gen<'a> {
             asm: Assembler::new(),
             labels: Vec::new(),
             ics: Vec::new(),
+            defines: Vec::new(),
             names,
             closures: Vec::new(),
             constants: Vec::new(),
@@ -1702,6 +1706,7 @@ impl<'a> Gen<'a> {
             nregs: self.nregs as u32,
             code: self.asm.finish(),
             ics: self.ics,
+            defines: self.defines,
             closures: self.closures,
             constants: self.constants,
             handlers: self.handlers,
@@ -3194,9 +3199,14 @@ impl<'a> Gen<'a> {
                                 self.intrinsic("literal_proto", t, 2);
                                 self.temp = mark;
                             }
+                            // (Defined: not through a prototype's setter.)
                             None => {
                                 self.value(v)?;
-                                self.named(Op::SetNamed, o, name);
+                                let ic = self.ic("SetNamed define", name);
+                                if let Arg::Index(k) = ic {
+                                    self.defines.push(k);
+                                }
+                                self.emit(Op::SetNamed, &[Arg::Reg(o), ic]);
                             }
                         }
                     }

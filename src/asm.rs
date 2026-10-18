@@ -42,6 +42,9 @@ pub struct FunctionDef {
     pub code: Vec<u8>,
     /// The property name of each inline-cache slot.
     pub ics: Vec<std::rc::Rc<str>>,
+    /// The `SetNamed` slots of object literals' properties, which define
+    /// them (see `vm::Code::define_ics`).
+    pub defines: Vec<u16>,
     /// Module function index of each nested function (`CreateClosure`'s
     /// operand indexes this).
     pub closures: Vec<usize>,
@@ -378,6 +381,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             nregs: nregs as u32,
             code: a.finish(),
             ics,
+            defines: Vec::new(),
             closures,
             constants,
             handlers: Vec::new(),

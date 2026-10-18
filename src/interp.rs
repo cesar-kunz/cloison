@@ -2961,36 +2961,70 @@ fn is_string(v: Value) -> bool {
 /// ToPrimitive (hint "default", as "number"): an object's `valueOf`, else
 /// its `toString`, whichever gives a primitive first.
 pub(crate) fn to_primitive(v: Value) -> Value {
-    to_primitive_hint(v, false)
+    to_primitive_hint(v, NUMBER)
 }
 
 /// ToPrimitive with hint "default": "number", but a date's "string".
 pub(crate) fn to_primitive_default(v: Value) -> Value {
     if v.is_cell() && crate::date::date_value(v).is_some() {
-        return to_primitive_hint(v, true);
+        return to_primitive_hint(v, STRING);
     }
-    to_primitive(v)
+    to_primitive_hint(v, DEFAULT)
 }
 
 /// ToPrimitive with hint "string".
 pub(crate) fn to_primitive_string(v: Value) -> Value {
-    to_primitive_hint(v, true)
+    to_primitive_hint(v, STRING)
 }
 
-/// ToPrimitive with hint "string" (`string`: `toString` first) or
-/// "number": the first of `valueOf` and `toString` giving a primitive.
+/// ToPrimitive's hints.
+const NUMBER: u8 = 0;
+const STRING: u8 = 1;
+const DEFAULT: u8 = 2;
+
+/// ToPrimitive with `hint`: the object's `Symbol.toPrimitive` method's
+/// result, if it has one (looked for once some object has had one), else
+/// the first of `valueOf` and `toString` (`toString` first for hint
+/// "string") giving a primitive.
 /// A bytecode one is called where something can call it (`native_top`
 /// set: a native, an interpreter slow path in `conv!`); elsewhere (compiled
 /// code's runtime calls) it is skipped and `Vm::conv_redo` set, for the
 /// operation to be redone where it can. Conversions can't fail: what one
 /// throws is left in `Vm::conv_error` for the operation to throw.
-fn to_primitive_hint(v: Value, string: bool) -> Value {
+fn to_primitive_hint(v: Value, hint: u8) -> Value {
     if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) {
         return v;
     }
     unsafe {
         let vm = &mut *current_vm();
-        let order = if string {
+        if vm.to_primitive_defined {
+            let fail = |vm: &mut Vm, e: Error| {
+                vm.conv_error.get_or_insert(e);
+                vm.conv_thrown = true;
+                Value::UNDEFINED
+            };
+            let m = match vm.get(v, vm.a_sym_to_primitive) {
+                Ok(m) => m,
+                Err(e) => return fail(vm, e),
+            };
+            if !m.is_undefined() && !m.is_null() {
+                if !crate::props::is_callable(m) {
+                    return fail(vm, Error::type_error("Symbol.toPrimitive is not a function"));
+                }
+                if vm.native_top.is_null() && (*as_object(m)).class != Class::Native {
+                    vm.conv_redo = true;
+                    return Value::UNDEFINED;
+                }
+                let name = ["number", "string", "default"][hint as usize];
+                let h = vm.new_string(&name.encode_utf16().collect::<Vec<u16>>());
+                return match call_function(vm, m, v, &[h]) {
+                    Ok(r) if !r.is_cell() || is_string(r) || crate::symbol::is_symbol(r) => r,
+                    Ok(_) => fail(vm, Error::type_error("Cannot convert object to primitive value")),
+                    Err(e) => fail(vm, e),
+                };
+            }
+        }
+        let order = if hint == STRING {
             [vm.a_to_string, vm.a_value_of]
         } else {
             [vm.a_value_of, vm.a_to_string]
@@ -3062,7 +3096,7 @@ pub(crate) fn to_string_units(v: Value) -> Vec<u16> {
         return Vec::new();
     }
     if v.is_cell() {
-        return to_string_units(to_primitive_hint(v, true));
+        return to_string_units(to_primitive_hint(v, STRING));
     }
     crate::vm::display(v).encode_utf16().collect()
 }

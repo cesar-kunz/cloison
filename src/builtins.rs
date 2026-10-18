@@ -282,6 +282,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // (After the errors: `AggregateError` inherits `Error.prototype`.)
     crate::promise::install(vm);
     crate::reflect::install(vm);
+    crate::proxy::install(vm);
     crate::symbol::install(vm);
     crate::generator::install(vm);
     // (`Symbol.prototype`'s is called directly: a symbol is a primitive.)
@@ -1273,6 +1274,8 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             Class::DataView => "DataView",
             Class::Promise => "Promise",
             Class::Symbol => "Symbol",
+            // (A proxy of an array is one.)
+            Class::Proxy if crate::proxy::is_array(vm, this)? => "Array",
             _ => "Object",
         }
     } else {
@@ -2121,7 +2124,7 @@ fn sort_numbers(vm: &mut Vm, values: &mut Vec<f64>, cmp: Value) -> Result<()> {
     if !cmp.is_undefined() && !crate::props::is_callable(cmp) {
         return Err(Error::type_error("The comparison function must be either a function or undefined"));
     }
-    let mut after = |vm: &mut Vm, x: f64, y: f64| -> Result<bool> {
+    let after = |vm: &mut Vm, x: f64, y: f64| -> Result<bool> {
         if cmp.is_undefined() {
             return Ok(match (x.is_nan(), y.is_nan()) {
                 (true, _) => !y.is_nan(),

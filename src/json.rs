@@ -158,7 +158,7 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     let stepback = st.indent.clone();
     st.indent.extend_from_slice(&st.gap.clone());
     let o = as_object(v);
-    let array = unsafe { (*o).class } == Class::Array;
+    let array = crate::proxy::is_array(vm, v)?;
     let mut parts: Vec<Vec<u16>> = Vec::new();
     if array {
         let len = vm.length_of(v)?;
@@ -176,6 +176,15 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     } else {
         let keys: Vec<Value> = match &st.keys {
             Some(k) => k.clone(),
+            None if vm.proxies_exist && crate::proxy::is_proxy(vm, o) => {
+                let mut ks = Vec::new();
+                for key in crate::proxy::enumerable_own_keys(vm, o)? {
+                    let s = vm.key_string(key);
+                    vm.handles.push(s);
+                    ks.push(s);
+                }
+                ks
+            }
             None => {
                 let mut ks = Vec::new();
                 for (key, enumerable) in vm.own_keys(o) {

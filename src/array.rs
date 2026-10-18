@@ -273,8 +273,11 @@ fn create(vm: &mut Vm, o: Value, i: f64, v: Value) -> Result<()> {
     vm.create_data_property(o, key(i), v)
 }
 
-fn array_is_array(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn array_is_array(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let v = arg(a, 0);
+    if vm.proxies_exist {
+        return crate::proxy::is_array(vm, v).map(Value::from_bool);
+    }
     Ok(Value::from_bool(v.is_cell() && unsafe { (*as_object(v)).class } == Class::Array))
 }
 

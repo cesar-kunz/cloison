@@ -565,6 +565,12 @@ pub struct Vm {
     /// Some object has had an indexed accessor or a read-only element
     /// (see `protect_indices`).
     pub(crate) indices_protected: bool,
+    /// A proxy has been made: property operations look for them on
+    /// prototype chains (see `proxy`).
+    pub(crate) proxies_exist: bool,
+    /// The codes of callable proxies (a non-constructor's, a
+    /// constructor's) and of a revocable proxy's `revoke`.
+    pub(crate) proxy_codes: [*const Code; 3],
     pub(crate) error: Option<Error>,
     pub(crate) stack: Box<[Value]>,
     pub(crate) stack_end: *mut Value,
@@ -819,6 +825,8 @@ impl Vm {
             field_epoch: 0,
             code_epoch: 0,
             indices_protected: false,
+            proxies_exist: false,
+            proxy_codes: [std::ptr::null(); 3],
             error: None,
             stack,
             stack_end,
@@ -1740,6 +1748,9 @@ impl Vm {
             return self.get_primitive(obj, name);
         }
         let o = as_object(obj);
+        if crate::proxy::chain_has_proxy(self, o) {
+            return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
+        }
         unsafe {
             if name == self.a_length
                 && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
@@ -1915,6 +1926,12 @@ impl Vm {
             return self.set_primitive(obj, name, value);
         }
         let o = as_object(obj);
+        if crate::proxy::chain_has_proxy(self, o) {
+            if !crate::proxy::generic_set(self, obj, Key::Name(name), value, obj)? {
+                self.store_failed = true;
+            }
+            return Ok(());
+        }
         unsafe {
             if (*o).class == Class::Array && name == self.a_length {
                 return self.set_array_length(o, value);
@@ -1983,6 +2000,10 @@ impl Vm {
             return self.get_primitive(obj, name);
         }
         let o = as_object(obj);
+        // (Never cached through a proxy.)
+        if crate::proxy::chain_has_proxy(self, o) {
+            return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
+        }
         unsafe {
             if name == self.a_length
                 && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
@@ -2051,6 +2072,12 @@ impl Vm {
             return self.set_primitive(obj, name, value);
         }
         let o = as_object(obj);
+        if crate::proxy::chain_has_proxy(self, o) {
+            if !crate::proxy::generic_set(self, obj, Key::Name(name), value, obj)? {
+                self.store_failed = true;
+            }
+            return Ok(());
+        }
         unsafe {
             let old = (*o).shape;
             if (*o).class == Class::Array && name == self.a_length {
@@ -2330,7 +2357,11 @@ impl Vm {
         }
         let mut o = as_object(v);
         loop {
-            let proto = unsafe { (*(*o).shape).proto };
+            let proto = if self.proxies_exist {
+                crate::proxy::get_prototype_of(self, o)?
+            } else {
+                unsafe { (*(*o).shape).proto }
+            };
             if !proto.is_cell() {
                 return Ok(false);
             }
@@ -2401,6 +2432,10 @@ impl Vm {
             )));
         }
         let mut o = as_object(obj);
+        if crate::proxy::chain_has_proxy(self, o) {
+            let k = self.property_key(key);
+            return crate::proxy::generic_has(self, obj, k);
+        }
         match self.property_key(key) {
             Key::Name(a) => Ok(self.lookup(o, a).is_some()
                 || (a == self.a_length && unsafe { (*o).class } == Class::Array)),
@@ -2434,6 +2469,9 @@ impl Vm {
         }
         let o = as_object(obj);
         let key = self.property_key(key);
+        if self.proxies_exist {
+            return crate::proxy::delete(self, o, key);
+        }
         Ok(self.delete_own(o, key))
     }
 
@@ -2607,6 +2645,10 @@ impl Vm {
             }
             return Ok(Value::UNDEFINED);
         }
+        if crate::proxy::chain_has_proxy(self, as_object(obj)) {
+            let k = self.property_key(key);
+            return crate::proxy::generic_get(self, obj, k, obj);
+        }
         let i = match self.property_key(key) {
             Key::Index(i) => i,
             Key::Name(a) => return self.get(obj, a),
@@ -2732,6 +2774,13 @@ impl Vm {
                 return self.set_primitive(obj, a, value);
             }
             self.store_failed = true;
+            return Ok(());
+        }
+        if crate::proxy::chain_has_proxy(self, as_object(obj)) {
+            let k = self.property_key(key);
+            if !crate::proxy::generic_set(self, obj, k, value, obj)? {
+                self.store_failed = true;
+            }
             return Ok(());
         }
         let i = match self.property_key(key) {
@@ -2942,7 +2991,16 @@ impl Vm {
     /// further up. Null and undefined have none.
     pub fn for_in_keys(&mut self, v: Value) -> Value {
         let mut names: Vec<Vec<u16>> = Vec::new();
-        if v.is_cell() {
+        // (Through a proxy's traps: what they throw, a conversion's error.)
+        if v.is_cell() && crate::proxy::chain_has_proxy(self, as_object(v)) {
+            match crate::proxy::for_in_names(self, as_object(v)) {
+                Ok(n) => names = n,
+                Err(e) => {
+                    self.conv_error.get_or_insert(e);
+                    self.conv_thrown = true;
+                }
+            }
+        } else if v.is_cell() {
             let mut seen: Vec<Key> = Vec::new();
             let mut o = as_object(v);
             loop {

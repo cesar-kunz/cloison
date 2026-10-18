@@ -871,6 +871,7 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
             | Class::WeakMap
             | Class::WeakSet
             | Class::WeakRef
+            | Class::FinalizationRegistry
             | Class::CollectionIterator
             | Class::Promise
             | Class::Symbol
@@ -1406,7 +1407,7 @@ impl Vm {
                 return None;
             }
             let e = crate::object::as_object(e);
-            let s = if (*t).class == Class::WeakMap { 2 } else { 1 };
+            let s = if matches!((*t).class, Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
             Some(((*e).elems, (*e).elems_len as usize, s))
         };
         unsafe {

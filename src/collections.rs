@@ -34,6 +34,7 @@ pub(crate) enum Proto {
     MapIterator,
     SetIterator,
     WeakRef,
+    FinalizationRegistry,
 }
 
 /// What an iterator yields; `elems_cap`'s low two bits.
@@ -49,7 +50,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
-    for _ in 0..8 {
+    for _ in 0..9 {
         let p = vm.new_object(op);
         vm.collection_prototypes.push(p);
     }
@@ -118,6 +119,10 @@ pub(crate) fn install(vm: &mut Vm) {
     let wr = vm.define_native(g, "WeakRef", weak_ref_ctor, 1, any, true);
     link_constructor(vm, wr, protos[Proto::WeakRef as usize]);
     vm.define_native(protos[Proto::WeakRef as usize], "deref", weak_ref_deref, 0, any, false);
+    let fr = vm.define_native(g, "FinalizationRegistry", finalization_ctor, 1, any, true);
+    let frp = protos[Proto::FinalizationRegistry as usize];
+    link_constructor(vm, fr, frp);
+    vm.define_natives(frp, &[("register", finalization_register as NativeFn, 2), ("unregister", finalization_unregister, 1)]);
     vm.define_native(protos[Proto::MapIterator as usize], "next", iterator_next, 0, any, false);
     vm.define_native(protos[Proto::SetIterator as usize], "next", iterator_next, 0, any, false);
 
@@ -255,7 +260,7 @@ fn int(e: *mut Object, i: usize) -> i32 {
 
 /// A collection's entry width: 2 for the maps, 1 for the sets.
 fn stride(o: *mut Object) -> usize {
-    if matches!(unsafe { (*o).class }, Class::Map | Class::WeakMap) { 2 } else { 1 }
+    if matches!(unsafe { (*o).class }, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 }
 }
 
 /// The entries array `e` was compacted into, or itself: an iterator's
@@ -389,13 +394,13 @@ fn remove(o: *mut Object, i: usize) {
 
 /// A new, empty collection of class `class`.
 fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object> {
-    let s = if matches!(class, Class::Map | Class::WeakMap) { 2 } else { 1 };
+    let s = if matches!(class, Class::Map | Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
     let e = new_entries(vm, None, s)?;
     let p = object_value(vm.collection_prototypes[proto as usize]);
     let o = vm.new_object_with(class, p, 0);
     hold_entries(o, object_value(e));
     // (The collector's to find: see `Vm::ephemerons`.)
-    if matches!(class, Class::WeakMap | Class::WeakSet | Class::WeakRef) {
+    if matches!(class, Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
         vm.weak_tables.push(o);
         weaken(o);
     }
@@ -407,7 +412,7 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object
 /// `heap::WEAK_VALUES`).
 fn weaken(o: *mut Object) {
     unsafe {
-        if !matches!((*o).class, Class::WeakMap | Class::WeakSet | Class::WeakRef) {
+        if !matches!((*o).class, Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
             return;
         }
         let e = entries(o);
@@ -1143,4 +1148,52 @@ fn weak_ref_deref(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     }
     vm.kept_alive.push(t);
     Ok(t)
+}
+
+// ---- FinalizationRegistry ----
+
+/// `new FinalizationRegistry(cleanup)`. (Its callback is never called:
+/// the spec lets an implementation not; registering a target keeps
+/// nothing alive.)
+fn finalization_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    if !vm.is_construct() {
+        return Err(Error::type_error("Constructor FinalizationRegistry requires 'new'"));
+    }
+    if !is_callable(arg(a, 0)) {
+        return Err(Error::type_error("FinalizationRegistry: cleanup must be callable"));
+    }
+    let o = new_collection(vm, Class::FinalizationRegistry, Proto::FinalizationRegistry)?;
+    Ok(object_value(o))
+}
+
+/// `registry.register(target, held, token)`.
+fn finalization_register(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::FinalizationRegistry, "FinalizationRegistry.prototype.register")?;
+    let (target, held, token) = (arg(a, 0), arg(a, 1), arg(a, 2));
+    if !can_be_held_weakly(vm, target) {
+        return Err(Error::type_error("FinalizationRegistry.prototype.register: invalid target"));
+    }
+    if same_value(target, held) {
+        return Err(Error::type_error("FinalizationRegistry.prototype.register: target and holdings must not be same"));
+    }
+    if !token.is_undefined() {
+        if !can_be_held_weakly(vm, token) {
+            return Err(Error::type_error("FinalizationRegistry.prototype.register: invalid unregister token"));
+        }
+        match find(o, token) {
+            Some(i) => put(entries(o), i + 1, Value::from_i32(slot(entries(o), i + 1).as_i32_unchecked() + 1)),
+            None => append(vm, o, &[token, Value::from_i32(1)])?,
+        }
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// `registry.unregister(token)`: whether anything was registered with it.
+fn finalization_unregister(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::FinalizationRegistry, "FinalizationRegistry.prototype.unregister")?;
+    let token = arg(a, 0);
+    if !can_be_held_weakly(vm, token) {
+        return Err(Error::type_error("FinalizationRegistry.prototype.unregister: invalid unregister token"));
+    }
+    Ok(Value::from_bool(find(o, token).inspect(|&i| remove(o, i)).is_some()))
 }

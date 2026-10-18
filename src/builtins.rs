@@ -2328,6 +2328,8 @@ fn install_regexps(vm: &mut Vm) {
             ("toString", regexp_to_string, 0),
         ],
     );
+    vm.regexp_atoms[0] = vm.intern("exec");
+    vm.regexp_fns[0] = as_object(vm.get(object_value(rp), vm.regexp_atoms[0]).unwrap());
     // `[Symbol.match]` and the others: the String methods', the RegExp
     // the pattern.
     let symbols: [(&str, NativeFn, u32); 5] = [
@@ -2337,10 +2339,12 @@ fn install_regexps(vm: &mut Vm) {
         ("search", regexp_symbol::<3>, 1),
         ("split", regexp_symbol::<4>, 2),
     ];
-    for (name, f, n) in symbols {
+    for (k, (name, f, n)) in symbols.into_iter().enumerate() {
         let fo = vm.native_function(&format!("[Symbol.{name}]"), f, n, Ty::Any, false);
         let a = vm.intern(&format!("{}Symbol.{name}", crate::symbol::SYMBOL_MARK));
         vm.add_property_with(rp, a, object_value(fo), DONT_ENUM);
+        vm.regexp_fns[1 + k] = fo;
+        vm.regexp_atoms[1 + k] = a;
     }
     // The flags and the source are accessors of the prototype (an
     // instance's own data properties shadow them: `regexp_object`).
@@ -2360,6 +2364,10 @@ fn install_regexps(vm: &mut Vm) {
 /// (2…); `undefined` (`source`: `(?:)`, `flags`: `""`) on the prototype
 /// itself, a `TypeError` on anything but a `RegExp`.
 fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    // (`flags`: generic, any object's.)
+    if K == 1 {
+        return regexp_flags_getter(vm, this);
+    }
     if this.is_cell() && as_object(this) == vm.regexp_prototype {
         return Ok(match K {
             0 => str_value(vm, "(?:)"),
@@ -2739,6 +2747,11 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    // (Through a user's `exec`, as the spec has it.)
+    if crate::props::is_object(this) && !pristine(vm, this)? {
+        let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
+        return Ok(Value::from_bool(!rx_exec(vm, this, s)?.is_null()));
+    }
     let re = this_regexp(this)?;
     let s = units(arg(a, 0));
     with_caps(vm, |vm, caps| Ok(Value::from_bool(regexp_match_into(vm, this, re, &s, caps)?)))
@@ -2767,11 +2780,24 @@ fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
 /// `RegExp.prototype[Symbol.match]` (`K` 0), `[Symbol.matchAll]` (1),
 /// `[Symbol.replace]` (2), `[Symbol.search]` (3), `[Symbol.split]` (4):
 /// the String method, of the string argument, with this RegExp.
+#[cold]
+#[inline(never)]
 fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if regexp_of(this).is_none() {
+    if !crate::props::is_object(this) {
         return Err(Error::type_error("RegExp method called on an incompatible receiver"));
     }
     let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
+    // (One whose `exec` isn't the builtin one, or no RegExp: as the spec
+    // has it, through `exec`.)
+    if !pristine(vm, this)? {
+        return match K {
+            0 => rx_match(vm, this, s),
+            1 => rx_match_all(vm, this, s),
+            2 => rx_replace(vm, this, s, arg(a, 1)),
+            3 => rx_search(vm, this, s),
+            _ => rx_split(vm, this, s, arg(a, 1)),
+        };
+    }
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
     match K {
@@ -2786,14 +2812,19 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
 /// A String method's pattern `a[0]`, if an object (not a RegExp) with a
 /// `Symbol.<name>` method: that method's result, of `this` and the rest.
 fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value]) -> Result<Option<Value>> {
+    let k = ["match", "matchAll", "replace", "search", "split"].iter().position(|&n| n == name).unwrap_or(0);
     let pattern = arg(a, 0);
-    if !crate::props::is_object(pattern) || regexp_of(pattern).is_some() {
+    if !crate::props::is_object(pattern) {
         return Ok(None);
     }
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype method called on null or undefined"));
     }
-    let atom = vm.intern(&format!("{}Symbol.{name}", crate::symbol::SYMBOL_MARK));
+    // (A RegExp's builtin method with the builtin `exec`: the fast path.)
+    if pristine_for(vm, pattern, Some(k))? {
+        return Ok(None);
+    }
+    let atom = vm.regexp_atoms[1 + k];
     let m = vm.get(pattern, atom)?;
     if m.is_undefined() || m.is_null() {
         return Ok(None);
@@ -3280,4 +3311,532 @@ pub(crate) fn radix_string(d: f64, radix: u32) -> String {
         s.extend(frac_digits.iter().map(|&d| chars[d as usize] as char));
     }
     s
+}
+
+// ---- RegExp's generic algorithms (through `exec`) ----
+
+/// Whether `rx` is a RegExp whose `exec` is the builtin one: its methods'
+/// fast paths then do what the generic algorithms would.
+pub(crate) fn pristine(vm: &mut Vm, rx: Value) -> Result<bool> {
+    pristine_for(vm, rx, None)
+}
+
+/// [`pristine`], and its `Symbol.<k>` method (`regexp_fns[1 + k]`) the
+/// builtin one too. Quick for a RegExp of the usual shape while
+/// `RegExp.prototype` keeps the shape it had when its methods were last
+/// found the builtin ones (the slots then read where they were).
+#[inline(always)]
+fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
+    if !is_class(rx, Class::RegExp) {
+        return Ok(false);
+    }
+    unsafe {
+        let rp = vm.regexp_prototype;
+        if (*as_object(rx)).shape == vm.regexp_shapes.1 && (*rp).shape == vm.regexp_proto_shape {
+            let at = |i: usize| *Object::slot(rp, vm.regexp_slots[i]);
+            let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
+            return Ok(ok(0) && k.is_none_or(|k| ok(1 + k)));
+        }
+    }
+    pristine_slow(vm, rx, k)
+}
+
+/// [`pristine_for`] by lookups (the prototype's slots noted, for its
+/// quick check).
+#[cold]
+#[inline(never)]
+fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
+    let a = vm.regexp_atoms[0];
+    let e = vm.get(rx, a)?;
+    if !(e.is_cell() && as_object(e) == vm.regexp_fns[0]) {
+        return Ok(false);
+    }
+    if let Some(k) = k {
+        let m = vm.get(rx, vm.regexp_atoms[1 + k])?;
+        if !(m.is_cell() && as_object(m) == vm.regexp_fns[1 + k]) {
+            return Ok(false);
+        }
+    }
+    // (Where the prototype's methods are, for the next time.)
+    unsafe {
+        let rp = vm.regexp_prototype;
+        let s = &*(*rp).shape;
+        let mut slots = [0; 6];
+        for (i, slot) in slots.iter_mut().enumerate() {
+            match s.lookup(vm.regexp_atoms[i]) {
+                Some(j) if *Object::slot(rp, s.location(j)) == object_value(vm.regexp_fns[i]) => *slot = s.location(j),
+                _ => return Ok(true),
+            }
+        }
+        vm.regexp_slots = slots;
+        vm.regexp_proto_shape = (*rp).shape;
+    }
+    Ok(true)
+}
+
+/// RegExpExec(r, s): `r.exec(s)` (an object or null), or the builtin's.
+#[cold]
+#[inline(never)]
+fn rx_exec(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
+    let a = vm.intern("exec");
+    let exec = vm.get(r, a)?;
+    if crate::props::is_callable(exec) {
+        let res = crate::interp::call_function(vm, exec, r, &[s])?;
+        if !crate::props::is_object(res) && !res.is_null() {
+            return Err(Error::type_error("exec result must be an object or null"));
+        }
+        return Ok(res);
+    }
+    if regexp_of(r).is_none() {
+        return Err(Error::type_error("RegExp method called on an incompatible receiver"));
+    }
+    regexp_exec(vm, r, &[s])
+}
+
+/// ToString(Get(o, name)), as units.
+#[cold]
+#[inline(never)]
+fn get_units(vm: &mut Vm, o: Value, name: &str) -> Result<Vec<u16>> {
+    let v = get_named(vm, o, name)?;
+    let s = crate::intrinsics::to_string(vm, v)?;
+    Ok(string_units(s).unwrap_or(&[]).to_vec())
+}
+
+/// Get(o, name), `name` an index (`"0"`) or a name.
+#[cold]
+#[inline(never)]
+fn get_named(vm: &mut Vm, o: Value, name: &str) -> Result<Value> {
+    match name.parse::<i32>() {
+        Ok(i) => vm.get_keyed(o, Value::from_i32(i)),
+        Err(_) => {
+            let a = vm.intern(name);
+            vm.get(o, a)
+        }
+    }
+}
+
+/// ToLength(Get(o, name)).
+#[cold]
+#[inline(never)]
+fn get_length(vm: &mut Vm, o: Value, name: &str) -> Result<f64> {
+    let v = get_named(vm, o, name)?;
+    let d = to_number(v);
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    Ok(if d.is_nan() || d <= 0.0 { 0.0 } else { d.trunc().min(9007199254740991.0) })
+}
+
+#[cold]
+#[inline(never)]
+fn set_last_index(vm: &mut Vm, r: Value, v: f64) -> Result<()> {
+    let a = vm.a_last_index;
+    vm.put_key(r, crate::vm::Key::Name(a), Value::number(v))
+}
+
+/// AdvanceStringIndex(s, i, unicode).
+#[cold]
+#[inline(never)]
+fn advance(s: &[u16], i: f64, unicode: bool) -> f64 {
+    let k = i as usize;
+    if unicode && k + 1 < s.len() && (0xD800..0xDC00).contains(&s[k]) && (0xDC00..0xE000).contains(&s[k + 1]) {
+        i + 2.0
+    } else {
+        i + 1.0
+    }
+}
+
+/// Whether a `flags` string has `c` (and `u` or `v`, unicode).
+#[cold]
+#[inline(never)]
+fn flags_have(f: &[u16], c: u8) -> bool {
+    // (Not `contains`: a second caller of `[u16]`'s took it out of line,
+    // and the regex search's with it: RegExp 8% slower.)
+    f.iter().any(|&x| x == c as u16)
+}
+
+/// `RegExp.prototype[Symbol.match]` generically.
+#[cold]
+#[inline(never)]
+fn rx_match(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
+    let flags = get_units(vm, r, "flags")?;
+    if !flags_have(&flags, b'g') {
+        return rx_exec(vm, r, s);
+    }
+    let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
+    set_last_index(vm, r, 0.0)?;
+    let su = string_units(s).unwrap_or(&[]).to_vec();
+    let out = vm.new_array();
+    let mut n = 0;
+    loop {
+        let res = rx_exec(vm, r, s)?;
+        if res.is_null() {
+            return Ok(if n == 0 { Value::NULL } else { out });
+        }
+        let m = get_units(vm, res, "0")?;
+        let mv = vm.new_string(&m);
+        crate::vm::array_push(vm, out, &[mv])?;
+        n += 1;
+        if m.is_empty() {
+            let i = get_length(vm, r, "lastIndex")?;
+            set_last_index(vm, r, advance(&su, i, unicode))?;
+        }
+    }
+}
+
+/// `RegExp.prototype[Symbol.search]` generically.
+#[cold]
+#[inline(never)]
+fn rx_search(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
+    let a = vm.a_last_index;
+    let prev = vm.get(r, a)?;
+    // (SameValue by bits: a number that is 0 is the int32 0 or ±0.0;
+    // keeping `same_value` to its callers keeps it inlined there.)
+    let same = |x: Value, y: Value| x.to_bits() == y.to_bits() || x.is_number() && y.is_number() && x.to_number() == y.to_number() && x.to_number().is_sign_negative() == y.to_number().is_sign_negative();
+    if !same(prev, Value::from_i32(0)) {
+        set_last_index(vm, r, 0.0)?;
+    }
+    let res = rx_exec(vm, r, s)?;
+    let cur = vm.get(r, a)?;
+    if !same(cur, prev) {
+        vm.put_key(r, crate::vm::Key::Name(a), prev)?;
+    }
+    if res.is_null() {
+        return Ok(Value::from_i32(-1));
+    }
+    let ai = vm.intern("index");
+    vm.get(res, ai)
+}
+
+/// GetSubstitution of `template` for match `matched` at `position` in
+/// `s`, its captures `caps` (`None`: undefined) and named groups `named`
+/// (an object, or undefined).
+#[cold]
+#[inline(never)]
+fn substitution(
+    vm: &mut Vm,
+    matched: &[u16],
+    s: &[u16],
+    position: usize,
+    caps: &[Option<Vec<u16>>],
+    named: Value,
+    t: &[u16],
+) -> Result<Vec<u16>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let tail = (position + matched.len()).min(s.len());
+    while i < t.len() {
+        let c = t[i];
+        if c != b'$' as u16 || i + 1 == t.len() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let n = t[i + 1];
+        match n {
+            0x24 => {
+                out.push(0x24);
+                i += 2;
+            }
+            0x26 => {
+                out.extend_from_slice(matched);
+                i += 2;
+            }
+            0x60 => {
+                out.extend_from_slice(&s[..position.min(s.len())]);
+                i += 2;
+            }
+            0x27 => {
+                out.extend_from_slice(&s[tail..]);
+                i += 2;
+            }
+            0x30..=0x39 => {
+                let d1 = (n - 0x30) as usize;
+                let two = t.get(i + 2).filter(|&&d| (0x30..=0x39).contains(&d)).map(|&d| d1 * 10 + (d - 0x30) as usize);
+                let (g, len) = match two {
+                    Some(g) if g >= 1 && g <= caps.len() => (g, 3),
+                    _ => (d1, 2),
+                };
+                if g == 0 || g > caps.len() {
+                    out.push(c);
+                    i += 1;
+                    continue;
+                }
+                if let Some(cap) = &caps[g - 1] {
+                    out.extend_from_slice(cap);
+                }
+                i += len;
+            }
+            0x3C if !named.is_undefined() => match t[i + 2..].iter().position(|&c| c == b'>' as u16) {
+                Some(k) => {
+                    let name = vm.new_string(&t[i + 2..i + 2 + k]);
+                    let key = crate::intrinsics::to_property_key(vm, name)?;
+                    let v = vm.get_key(named, key)?;
+                    if !v.is_undefined() {
+                        let sv = crate::intrinsics::to_string(vm, v)?;
+                        out.extend_from_slice(string_units(sv).unwrap_or(&[]));
+                    }
+                    i += k + 3;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            },
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `RegExp.prototype[Symbol.replace]` generically.
+#[cold]
+#[inline(never)]
+fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> {
+    let su = string_units(s).unwrap_or(&[]).to_vec();
+    let functional = crate::props::is_callable(replace);
+    let template = if functional {
+        Vec::new()
+    } else {
+        let t = crate::intrinsics::to_string(vm, replace)?;
+        string_units(t).unwrap_or(&[]).to_vec()
+    };
+    let flags = get_units(vm, r, "flags")?;
+    let global = flags_have(&flags, b'g');
+    let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
+    if global {
+        set_last_index(vm, r, 0.0)?;
+    }
+    let results = vm.handle_scope(|vm| -> Result<Vec<Value>> {
+        let mut results = Vec::new();
+        loop {
+            let res = rx_exec(vm, r, s)?;
+            if res.is_null() {
+                break;
+            }
+            vm.handles.push(res);
+            results.push(res);
+            if !global {
+                break;
+            }
+            let m = get_units(vm, res, "0")?;
+            if m.is_empty() {
+                let i = get_length(vm, r, "lastIndex")?;
+                set_last_index(vm, r, advance(&su, i, unicode))?;
+            }
+        }
+        Ok(results)
+    })?;
+    let mut out = Vec::new();
+    let mut next = 0;
+    for res in results {
+        let n = get_length(vm, res, "length")?;
+        let ncaps = (n - 1.0).max(0.0) as usize;
+        let matched = get_units(vm, res, "0")?;
+        let ai = vm.intern("index");
+        let pv = vm.get(res, ai)?;
+        let p = to_number(pv);
+        let position = if p.is_nan() { 0 } else { p.max(0.0).min(su.len() as f64) as usize };
+        let mut caps = Vec::with_capacity(ncaps);
+        for k in 1..=ncaps {
+            let v = vm.get_keyed(res, Value::from_i32(k as i32))?;
+            caps.push(if v.is_undefined() {
+                None
+            } else {
+                let sv = crate::intrinsics::to_string(vm, v)?;
+                Some(string_units(sv).unwrap_or(&[]).to_vec())
+            });
+        }
+        let ag = vm.intern("groups");
+        let named = vm.get(res, ag)?;
+        let replacement = if functional {
+            let mut args = vec![vm.new_string(&matched)];
+            for c in &caps {
+                args.push(match c {
+                    Some(u) => vm.new_string(u),
+                    None => Value::UNDEFINED,
+                });
+            }
+            args.push(Value::from_i32(position as i32));
+            args.push(s);
+            if !named.is_undefined() {
+                args.push(named);
+            }
+            let v = vm.handle_scope(|vm| {
+                vm.handles.extend_from_slice(&args);
+                crate::interp::call_function(vm, replace, Value::UNDEFINED, &args)
+            })?;
+            let sv = crate::intrinsics::to_string(vm, v)?;
+            string_units(sv).unwrap_or(&[]).to_vec()
+        } else {
+            let named = if named.is_undefined() { named } else { object_value(vm.to_object(named)?) };
+            substitution(vm, &matched, &su, position, &caps, named, &template)?
+        };
+        if position >= next {
+            out.extend_from_slice(&su[next..position]);
+            out.extend_from_slice(&replacement);
+            next = (position + matched.len()).min(su.len());
+        }
+    }
+    out.extend_from_slice(&su[next.min(su.len())..]);
+    Ok(vm.new_string(&out))
+}
+
+/// SpeciesConstructor(r, %RegExp%).
+#[cold]
+#[inline(never)]
+fn rx_species(vm: &mut Vm, r: Value) -> Result<Value> {
+    let a_c = vm.a_constructor;
+    let regexp = vm.get(object_value(vm.regexp_prototype), a_c)?;
+    let c = vm.get(r, a_c)?;
+    if c.is_undefined() {
+        return Ok(regexp);
+    }
+    if !crate::props::is_object(c) {
+        return Err(Error::type_error("object.constructor is not an object"));
+    }
+    let a_s = vm.intern(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
+    let sp = vm.get(c, a_s)?;
+    if sp.is_undefined() || sp.is_null() {
+        return Ok(regexp);
+    }
+    // (A constructor's check through `construct`, which the caller does:
+    // its own callers keep `is_constructor` inlined.)
+    if !crate::props::is_callable(sp) {
+        return Err(Error::type_error("object.constructor[Symbol.species] is not a constructor"));
+    }
+    Ok(sp)
+}
+
+/// `RegExp.prototype[Symbol.split]` generically: a sticky copy (of the
+/// species constructor) tried at each position.
+#[cold]
+#[inline(never)]
+fn rx_split(vm: &mut Vm, r: Value, s: Value, limit: Value) -> Result<Value> {
+    let c = rx_species(vm, r)?;
+    let mut flags = get_units(vm, r, "flags")?;
+    let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
+    if !flags_have(&flags, b'y') {
+        flags.push(b'y' as u16);
+    }
+    let fv = vm.new_string(&flags);
+    let splitter = crate::intrinsics::construct(vm, c, &[r, fv])?;
+    let out = vm.new_array();
+    let lim = if limit.is_undefined() {
+        u32::MAX as f64
+    } else {
+        let d = to_number(limit);
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
+        crate::interp::to_int32(d) as u32 as f64
+    };
+    if lim == 0.0 {
+        return Ok(out);
+    }
+    let su = string_units(s).unwrap_or(&[]).to_vec();
+    let size = su.len();
+    let mut n = 0.0;
+    if size == 0 {
+        if rx_exec(vm, splitter, s)?.is_null() {
+            crate::vm::array_push(vm, out, &[s])?;
+        }
+        return Ok(out);
+    }
+    let (mut p, mut q) = (0usize, 0usize);
+    while q < size {
+        set_last_index(vm, splitter, q as f64)?;
+        let z = rx_exec(vm, splitter, s)?;
+        if z.is_null() {
+            q = advance(&su, q as f64, unicode) as usize;
+            continue;
+        }
+        let e = (get_length(vm, splitter, "lastIndex")? as usize).min(size);
+        if e == p {
+            q = advance(&su, q as f64, unicode) as usize;
+            continue;
+        }
+        let part = vm.new_string(&su[p..q]);
+        crate::vm::array_push(vm, out, &[part])?;
+        n += 1.0;
+        if n == lim {
+            return Ok(out);
+        }
+        p = e;
+        let ncaps = (get_length(vm, z, "length")? - 1.0).max(0.0) as usize;
+        for k in 1..=ncaps {
+            let v = vm.get_keyed(z, Value::from_i32(k as i32))?;
+            crate::vm::array_push(vm, out, &[v])?;
+            n += 1.0;
+            if n == lim {
+                return Ok(out);
+            }
+        }
+        q = p;
+    }
+    let part = vm.new_string(&su[p.min(size)..]);
+    crate::vm::array_push(vm, out, &[part])?;
+    Ok(out)
+}
+
+/// `RegExp.prototype[Symbol.matchAll]` generically: a copy (of the
+/// species constructor) from `lastIndex`, its matches found at once.
+#[cold]
+#[inline(never)]
+fn rx_match_all(vm: &mut Vm, r: Value, s: Value) -> Result<Value> {
+    let c = rx_species(vm, r)?;
+    let flags = get_units(vm, r, "flags")?;
+    let fv = vm.new_string(&flags);
+    let matcher = crate::intrinsics::construct(vm, c, &[r, fv])?;
+    let li = get_length(vm, r, "lastIndex")?;
+    set_last_index(vm, matcher, li)?;
+    let global = flags_have(&flags, b'g');
+    let unicode = flags_have(&flags, b'u') || flags_have(&flags, b'v');
+    let su = string_units(s).unwrap_or(&[]).to_vec();
+    let out = vm.new_array();
+    loop {
+        let res = rx_exec(vm, matcher, s)?;
+        if res.is_null() {
+            break;
+        }
+        crate::vm::array_push(vm, out, &[res])?;
+        if !global {
+            break;
+        }
+        let m = get_units(vm, res, "0")?;
+        if m.is_empty() {
+            let i = get_length(vm, matcher, "lastIndex")?;
+            set_last_index(vm, matcher, advance(&su, i, unicode))?;
+        }
+    }
+    crate::symbol::array_values(vm, out, &[])
+}
+
+/// `get RegExp.prototype.flags`: each flag's getter asked.
+#[cold]
+#[inline(never)]
+fn regexp_flags_getter(vm: &mut Vm, this: Value) -> Result<Value> {
+    if !crate::props::is_object(this) {
+        return Err(Error::type_error("RegExp.prototype.flags getter called on non-object"));
+    }
+    let mut out = String::new();
+    for (name, c) in [
+        ("hasIndices", 'd'),
+        ("global", 'g'),
+        ("ignoreCase", 'i'),
+        ("multiline", 'm'),
+        ("dotAll", 's'),
+        ("unicode", 'u'),
+        ("unicodeSets", 'v'),
+        ("sticky", 'y'),
+    ] {
+        let a = vm.intern(name);
+        if crate::interp::to_boolean(vm.get(this, a)?) {
+            out.push(c);
+        }
+    }
+    Ok(str_value(vm, &out))
 }

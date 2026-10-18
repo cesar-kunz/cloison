@@ -11,10 +11,14 @@
 //! (`Vm::proxies_exist`), the caches' miss paths and the runtime's
 //! property operations look for one on the prototype chain and, finding
 //! one, take the generic paths here instead.
+//!
+//! A trap's result is checked against its target (the invariants of
+//! §10.5.*: a non-configurable property can't be reported otherwise than
+//! the target has it, nor a non-extensible target otherwise than it is).
 
 use crate::interp::{call_function, to_boolean};
 use crate::object::{Class, Object, as_object, object_value};
-use crate::props::{Desc, is_callable, is_object};
+use crate::props::{Desc, is_callable, is_object, same_value};
 use crate::value::Value;
 use crate::vm::{Error, Key, Result, Vm};
 
@@ -92,6 +96,32 @@ fn trap(vm: &mut Vm, h: Value, name: &str) -> Result<Option<Value>> {
         return Err(Error::type_error(format!("The proxy's '{name}' trap is not a function")));
     }
     Ok(Some(m))
+}
+
+/// A trap's result that breaks an invariant: a TypeError.
+fn broken(name: &str, what: &str) -> Error {
+    Error::type_error(format!("The proxy's '{name}' trap {what}"))
+}
+
+/// IsCompatiblePropertyDescriptor: whether defining `d` on an object
+/// whose property is `cur` (none: `None`), extensible if `extensible`,
+/// would be allowed.
+fn compatible(extensible: bool, d: &Desc, cur: Option<&Desc>) -> bool {
+    let Some(cur) = cur else { return extensible };
+    if cur.configurable != Some(false) {
+        return true;
+    }
+    if d.configurable == Some(true) || d.enumerable.is_some() && d.enumerable != cur.enumerable {
+        return false;
+    }
+    if (d.is_accessor() || d.is_data()) && d.is_accessor() != cur.is_accessor() {
+        return false;
+    }
+    let same = |a: Option<Value>, b: Option<Value>| a.is_none_or(|a| same_value(a, b.unwrap_or(Value::UNDEFINED)));
+    if cur.is_accessor() {
+        return same(d.get, cur.get) && same(d.set, cur.set);
+    }
+    cur.writable != Some(false) || d.writable != Some(true) && same(d.value, cur.value)
 }
 
 /// A new proxy of `target` and `handler`.
@@ -190,7 +220,18 @@ fn get(vm: &mut Vm, p: *mut Object, key: Key, receiver: Value) -> Result<Value> 
     match trap(vm, h, "get")? {
         Some(f) => {
             let k = vm.key_value(key);
-            call_function(vm, f, h, &[t, k, receiver])
+            let v = call_function(vm, f, h, &[t, k, receiver])?;
+            if let Some(d) = get_own_property(vm, as_object(t), key)?
+                && d.configurable == Some(false)
+            {
+                if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
+                    return Err(broken("get", "reported a non-writable, non-configurable property's value otherwise"));
+                }
+                if d.is_accessor() && d.get.is_none_or(|g| g.is_undefined()) && !v.is_undefined() {
+                    return Err(broken("get", "reported a value for a non-configurable property without a getter"));
+                }
+            }
+            Ok(v)
         }
         None => generic_get(vm, t, key, receiver),
     }
@@ -201,7 +242,20 @@ fn set(vm: &mut Vm, p: *mut Object, key: Key, v: Value, receiver: Value) -> Resu
     match trap(vm, h, "set")? {
         Some(f) => {
             let k = vm.key_value(key);
-            Ok(to_boolean(call_function(vm, f, h, &[t, k, v, receiver])?))
+            if !to_boolean(call_function(vm, f, h, &[t, k, v, receiver])?) {
+                return Ok(false);
+            }
+            if let Some(d) = get_own_property(vm, as_object(t), key)?
+                && d.configurable == Some(false)
+            {
+                if d.is_data() && d.writable == Some(false) && !same_value(v, d.value.unwrap_or(Value::UNDEFINED)) {
+                    return Err(broken("set", "set a non-writable, non-configurable property otherwise"));
+                }
+                if d.is_accessor() && d.set.is_none_or(|s| s.is_undefined()) {
+                    return Err(broken("set", "set a non-configurable property without a setter"));
+                }
+            }
+            Ok(true)
         }
         None => generic_set(vm, t, key, v, receiver),
     }
@@ -212,7 +266,18 @@ fn has(vm: &mut Vm, p: *mut Object, key: Key) -> Result<bool> {
     match trap(vm, h, "has")? {
         Some(f) => {
             let k = vm.key_value(key);
-            Ok(to_boolean(call_function(vm, f, h, &[t, k])?))
+            if to_boolean(call_function(vm, f, h, &[t, k])?) {
+                return Ok(true);
+            }
+            if let Some(d) = get_own_property(vm, as_object(t), key)? {
+                if d.configurable == Some(false) {
+                    return Err(broken("has", "hid a non-configurable property"));
+                }
+                if !is_extensible(vm, as_object(t))? {
+                    return Err(broken("has", "hid a property of a non-extensible target"));
+                }
+            }
+            Ok(false)
         }
         None => generic_has(vm, t, key),
     }
@@ -310,7 +375,18 @@ pub(crate) fn delete(vm: &mut Vm, o: *mut Object, key: Key) -> Result<bool> {
     match trap(vm, h, "deleteProperty")? {
         Some(f) => {
             let k = vm.key_value(key);
-            Ok(to_boolean(call_function(vm, f, h, &[t, k])?))
+            if !to_boolean(call_function(vm, f, h, &[t, k])?) {
+                return Ok(false);
+            }
+            if let Some(d) = get_own_property(vm, as_object(t), key)? {
+                if d.configurable == Some(false) {
+                    return Err(broken("deleteProperty", "deleted a non-configurable property"));
+                }
+                if !is_extensible(vm, as_object(t))? {
+                    return Err(broken("deleteProperty", "deleted a property of a non-extensible target"));
+                }
+            }
+            Ok(true)
         }
         None => delete(vm, as_object(t), key),
     }
@@ -327,12 +403,22 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
     };
     let k = vm.key_value(key);
     let r = call_function(vm, f, h, &[t, k])?;
-    if r.is_undefined() {
-        return Ok(None);
-    }
-    if !is_object(r) {
+    if !r.is_undefined() && !is_object(r) {
         return Err(Error::type_error("The proxy's 'getOwnPropertyDescriptor' trap returned neither an object nor undefined"));
     }
+    let target = get_own_property(vm, as_object(t), key)?;
+    if r.is_undefined() {
+        if let Some(td) = target {
+            if td.configurable == Some(false) {
+                return Err(broken("getOwnPropertyDescriptor", "hid a non-configurable property"));
+            }
+            if !is_extensible(vm, as_object(t))? {
+                return Err(broken("getOwnPropertyDescriptor", "hid a property of a non-extensible target"));
+            }
+        }
+        return Ok(None);
+    }
+    let extensible = is_extensible(vm, as_object(t))?;
     let mut d = vm.to_descriptor(r)?;
     // (Completed: absent fields take their defaults.)
     if d.is_accessor() {
@@ -344,6 +430,19 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
     }
     d.enumerable.get_or_insert(false);
     d.configurable.get_or_insert(false);
+    if !compatible(extensible, &d, target.as_ref()) {
+        return Err(broken("getOwnPropertyDescriptor", "reported a property incompatible with the target's"));
+    }
+    if d.configurable == Some(false) {
+        match target {
+            Some(td) if td.configurable == Some(false) => {
+                if d.writable == Some(false) && td.writable == Some(true) {
+                    return Err(broken("getOwnPropertyDescriptor", "reported a writable property as non-writable"));
+                }
+            }
+            _ => return Err(broken("getOwnPropertyDescriptor", "reported a configurable or missing property as non-configurable")),
+        }
+    }
     Ok(Some(d))
 }
 
@@ -363,7 +462,29 @@ pub(crate) fn proxy_define(vm: &mut Vm, o: *mut Object, key: Key, d: &Desc) -> R
     };
     let k = vm.key_value(key);
     let dv = from_partial_descriptor(vm, d);
-    Ok(to_boolean(call_function(vm, f, h, &[t, k, dv])?))
+    if !to_boolean(call_function(vm, f, h, &[t, k, dv])?) {
+        return Ok(false);
+    }
+    let target = get_own_property(vm, as_object(t), key)?;
+    let extensible = is_extensible(vm, as_object(t))?;
+    let config_false = d.configurable == Some(false);
+    match target {
+        None if !extensible => Err(broken("defineProperty", "added a property to a non-extensible target")),
+        None if config_false => Err(broken("defineProperty", "defined a non-configurable property the target lacks")),
+        None => Ok(true),
+        Some(td) => {
+            if !compatible(extensible, d, Some(&td)) {
+                return Err(broken("defineProperty", "defined a property incompatible with the target's"));
+            }
+            if config_false && td.configurable == Some(true) {
+                return Err(broken("defineProperty", "defined a property configurable on the target as non-configurable"));
+            }
+            if td.is_data() && td.configurable == Some(false) && td.writable == Some(true) && d.writable == Some(false) {
+                return Err(broken("defineProperty", "made a writable, non-configurable property non-writable"));
+            }
+            Ok(true)
+        }
+    }
 }
 
 /// A descriptor object of just the fields `d` has.
@@ -418,6 +539,39 @@ pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
         keys.push(key);
         i += 1.0;
     }
+    // Every non-configurable key of the target's (and of a non-extensible
+    // one's, every key and no other).
+    let target = as_object(t);
+    let extensible = is_extensible(vm, target)?;
+    let (mut fixed, mut other) = (Vec::new(), Vec::new());
+    for k in own_keys(vm, target)? {
+        match get_own_property(vm, target, k)? {
+            Some(d) if d.configurable == Some(false) => fixed.push(k),
+            _ => other.push(k),
+        }
+    }
+    if extensible && fixed.is_empty() {
+        return Ok(keys);
+    }
+    let mut unchecked = keys.clone();
+    for k in fixed {
+        let Some(at) = unchecked.iter().position(|&u| u == k) else {
+            return Err(broken("ownKeys", "omitted a non-configurable key"));
+        };
+        unchecked.swap_remove(at);
+    }
+    if extensible {
+        return Ok(keys);
+    }
+    for k in other {
+        let Some(at) = unchecked.iter().position(|&u| u == k) else {
+            return Err(broken("ownKeys", "omitted a key of a non-extensible target"));
+        };
+        unchecked.swap_remove(at);
+    }
+    if !unchecked.is_empty() {
+        return Err(broken("ownKeys", "added a key to a non-extensible target"));
+    }
     Ok(keys)
 }
 
@@ -451,6 +605,9 @@ pub(crate) fn get_prototype_of(vm: &mut Vm, o: *mut Object) -> Result<Value> {
     if !is_object(r) && !r.is_null() {
         return Err(Error::type_error("The proxy's 'getPrototypeOf' trap returned neither an object nor null"));
     }
+    if !is_extensible(vm, as_object(t))? && !same_value(r, get_prototype_of(vm, as_object(t))?) {
+        return Err(broken("getPrototypeOf", "reported a non-extensible target's prototype otherwise"));
+    }
     Ok(r)
 }
 
@@ -460,10 +617,16 @@ pub(crate) fn set_prototype_of(vm: &mut Vm, o: *mut Object, proto: Value) -> Res
         return Ok(vm.set_prototype_of(o, proto));
     }
     let (t, h) = parts(o)?;
-    match trap(vm, h, "setPrototypeOf")? {
-        Some(f) => Ok(to_boolean(call_function(vm, f, h, &[t, proto])?)),
-        None => set_prototype_of(vm, as_object(t), proto),
+    let Some(f) = trap(vm, h, "setPrototypeOf")? else {
+        return set_prototype_of(vm, as_object(t), proto);
+    };
+    if !to_boolean(call_function(vm, f, h, &[t, proto])?) {
+        return Ok(false);
     }
+    if !is_extensible(vm, as_object(t))? && !same_value(proto, get_prototype_of(vm, as_object(t))?) {
+        return Err(broken("setPrototypeOf", "changed a non-extensible target's prototype"));
+    }
+    Ok(true)
 }
 
 /// `o.[[IsExtensible]]()`.
@@ -472,10 +635,14 @@ pub(crate) fn is_extensible(vm: &mut Vm, o: *mut Object) -> Result<bool> {
         return Ok(Vm::is_extensible(o));
     }
     let (t, h) = parts(o)?;
-    match trap(vm, h, "isExtensible")? {
-        Some(f) => Ok(to_boolean(call_function(vm, f, h, &[t])?)),
-        None => is_extensible(vm, as_object(t)),
+    let Some(f) = trap(vm, h, "isExtensible")? else {
+        return is_extensible(vm, as_object(t));
+    };
+    let r = to_boolean(call_function(vm, f, h, &[t])?);
+    if r != is_extensible(vm, as_object(t))? {
+        return Err(broken("isExtensible", "reported the target's extensibility otherwise"));
     }
+    Ok(r)
 }
 
 /// `o.[[PreventExtensions]]()`: whether it now isn't extensible.
@@ -485,10 +652,14 @@ pub(crate) fn prevent_extensions(vm: &mut Vm, o: *mut Object) -> Result<bool> {
         return Ok(true);
     }
     let (t, h) = parts(o)?;
-    match trap(vm, h, "preventExtensions")? {
-        Some(f) => Ok(to_boolean(call_function(vm, f, h, &[t])?)),
-        None => prevent_extensions(vm, as_object(t)),
+    let Some(f) = trap(vm, h, "preventExtensions")? else {
+        return prevent_extensions(vm, as_object(t));
+    };
+    let r = to_boolean(call_function(vm, f, h, &[t])?);
+    if r && is_extensible(vm, as_object(t))? {
+        return Err(broken("preventExtensions", "reported an extensible target as not"));
     }
+    Ok(r)
 }
 
 /// The target a proxy (or proxy of a proxy …) stands for at the end, for

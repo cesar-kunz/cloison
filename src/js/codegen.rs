@@ -357,7 +357,7 @@ fn boxed_lexicals<'a>(p: &'a Program, decls: &[Vec<&'a str>]) -> Vec<Vec<&'a str
     (0..n)
         .map(|i| {
             let f = &p.functions[i];
-            if i == 0 || !(f.generator || f.is_async) || f.has_eval {
+            if i == 0 || !(f.generator || f.is_async) {
                 return Vec::new();
             }
             decls[i].iter().copied().filter(|n| p.lexicals.contains_key(*n) && used[i].contains(n)).collect()
@@ -529,6 +529,12 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
         // (What a direct `eval` in it sees of the enclosing functions'.)
         if p.functions[i].has_eval {
             refs.extend(eval_outer_names(p, decls, i));
+        }
+        // (A direct `eval`'s bindings' function: those too, its upvalues.)
+        if p.functions[i].name.as_deref() == Some(EVAL_BINDINGS)
+            && let Some(k) = p.functions[i].parent
+        {
+            refs.extend(eval_outer_names(p, decls, k));
         }
         // (In a direct `eval`'s function: its scope object, and an arrow's
         // `this` for the `eval`.)
@@ -1556,10 +1562,17 @@ impl<'a> Gen<'a> {
         }
         // `new.target` first (see `Op::LdaNewTarget`).
         if self.index == 0 && self.p.direct_eval {
-            for (k, e) in ["%e0", "%e1"].into_iter().enumerate() {
+            // (`%e0`, `%e1`, then the `with` objects `%w0`….)
+            let f = self.f;
+            for e in &f.withs {
+                let k = match &**e {
+                    "%e0" => 0,
+                    "%e1" => 1,
+                    w => 2 + w[2..].parse::<i32>().unwrap_or(0),
+                };
                 let mark = self.temp;
                 let t = self.alloc(self.f.pos)?;
-                self.lda_smi(k as i32);
+                self.lda_smi(k);
                 self.star(t);
                 self.intrinsic("eval_env", t, 1);
                 self.temp = mark;
@@ -4006,14 +4019,21 @@ impl<'a> Gen<'a> {
             && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)))
         {
             // Direct `eval`: `[eval, source, scope object, this, strict,
-            // in parameters, scope for its declarations]`. The scope object
-            // it looks names up in: the function's (with its parameters and
-            // `var`s), under one of the other bindings it sees (block-scoped
-            // ones, enclosing functions' variables), whose values those
-            // bindings take back after.
+            // in parameters, scope for its declarations, with objects…]`.
+            // The scope object it looks names up in: the function's (with
+            // its parameters and `var`s), under one of the other bindings
+            // it sees (block-scoped ones, enclosing functions' variables),
+            // accessors of the variables themselves (or, for one the
+            // bindings' function has no upvalue of, a copy whose value the
+            // binding takes back after).
             let (args, visible): (&[Expr], &[Expr]) = match args.split_last() {
                 Some((Expr { kind: ExprKind::Intrinsic("%eval_scope", v), .. }, rest)) => (rest, v),
                 _ => (args, &[]),
+            };
+            // (Its bindings' function last: see `Parser::eval_bindings`.)
+            let (carrier, visible) = match visible.split_last() {
+                Some((Expr { kind: ExprKind::Function(f), .. }, rest)) => (Some(*f), rest),
+                _ => (None, visible),
             };
             let mark = self.temp;
             let fr = self.alloc(pos)?;
@@ -4055,36 +4075,66 @@ impl<'a> Gen<'a> {
             self.star(params);
             let decl = self.alloc(pos)?;
             self.mov(env, decl);
+            // The objects of the `with` statements around it in the
+            // function (or in the `eval`'s code, and those around that
+            // `eval`), whose properties its names find first.
+            let withs: Vec<Name> = match self.withs.iter().position(|w| &**w == EVAL_SCOPE || &**w == "%e1") {
+                Some(at) => self.withs[..at]
+                    .iter()
+                    .filter(|w| w.starts_with("%w"))
+                    .chain(&self.withs[at + 1..])
+                    .cloned()
+                    .collect(),
+                None => Vec::new(),
+            };
+            for w in &withs {
+                let r = self.alloc(pos)?;
+                self.load_raw(w, pos)?;
+                self.star(r);
+            }
+            let nargs = (7 + withs.len()) as u8;
             // The bindings: the parser's, then the enclosing functions'
             // variables none of those shadows (none with no variable here).
             // (Block-scoped ones first, then the enclosing functions':
             // those a `var` of the function's by the name, which an `eval`
             // may declare, shadows.)
-            let mut bindings: Vec<(&str, &str, bool)> = visible
+            // Each binding's: a kind (see `intrinsics::eval_scope`), and the
+            // index of the upvalue of the bindings' function that is it (an
+            // accessor of the scope object reads and writes it), if any.
+            let mut bindings: Vec<(&str, &str, i32)> = visible
                 .chunks(3)
                 .filter_map(|t| match (&t[0].kind, &t[1].kind, &t[2].kind) {
-                    (ExprKind::Str(o), ExprKind::Ident(v), ExprKind::Bool(c)) => Some((o.as_str(), &**v, *c)),
+                    (ExprKind::Str(o), ExprKind::Ident(v), ExprKind::Num(k)) => {
+                        Some((o.as_str(), &**v, *k as i32 | EVAL_BLOCK_SCOPED as i32))
+                    }
                     _ => None,
                 })
                 .collect();
             let lexical = bindings.len();
             for n in eval_outer_names(self.p, self.decls, self.index) {
                 if !bindings.iter().any(|(o, ..)| *o == n) {
-                    bindings.push((n, n, false));
+                    bindings.push((n, n, 0));
                 }
             }
             let mut kept = Vec::new();
             let mut nlex = 0;
             for (i, b) in bindings.into_iter().enumerate() {
                 if !matches!(self.resolve(b.1, pos)?, Var::Global) {
-                    kept.push(b);
+                    let up = carrier.and_then(|f| self.scopes.upvalues[f].iter().position(|&u| u == b.1));
+                    // (One in a box: see `boxed_lexicals`.)
+                    let mut k = Some(self.index);
+                    while let Some(j) = k.filter(|&j| !self.decls[j].contains(&b.1)) {
+                        k = self.p.functions[j].parent;
+                    }
+                    let boxed = k.is_some_and(|j| self.boxed[j].contains(&b.1));
+                    kept.push((b.0, b.1, b.2 | if boxed { EVAL_BOXED as i32 } else { 0 }, up));
                     nlex += (i < lexical) as i32;
                 }
             }
-            kept.truncate(120);
+            kept.truncate(80);
             let nlex = nlex.min(kept.len() as i32);
             if kept.is_empty() {
-                self.intrinsic("direct_eval", fr, 7);
+                self.intrinsic("direct_eval", fr, nargs);
                 self.temp = mark;
                 return Ok(());
             }
@@ -4094,19 +4144,36 @@ impl<'a> Gen<'a> {
             let n = self.alloc(pos)?;
             self.emit(Op::LdaSmi, &[Arg::Imm(nlex)]);
             self.star(n);
-            for (o, v, _) in &kept {
+            let c = self.alloc(pos)?;
+            match carrier {
+                Some(f) if kept.iter().any(|b| b.3.is_some()) => self.closure(f),
+                _ => self.emit(Op::LdaUndefined, &[]),
+            }
+            self.star(c);
+            for &(o, v, kind, up) in &kept {
                 let k = self.alloc(pos)?;
                 self.string(o);
                 self.star(k);
+                // (The value of one with no accessor; else the variable's
+                // name, a box's property's.)
                 let r = self.alloc(pos)?;
-                self.load_raw(v, pos)?;
+                match up {
+                    Some(_) => self.string(v),
+                    None => self.load_raw(v, pos)?,
+                }
                 self.star(r);
+                let b = self.alloc(pos)?;
+                match up {
+                    Some(u) => self.emit(Op::LdaSmi, &[Arg::Imm(((u as i32) << 4) | kind)]),
+                    None => self.emit(Op::LdaUndefined, &[]),
+                }
+                self.star(b);
             }
-            self.intrinsic("eval_scope", scope, (2 + 2 * kept.len()) as u8);
+            self.intrinsic("eval_scope", scope, (3 + 3 * kept.len()) as u8);
             self.star(scope);
             self.temp = m2;
             self.mov(scope, env);
-            self.intrinsic("direct_eval", fr, 7);
+            self.intrinsic("direct_eval", fr, nargs);
             let result = self.alloc(pos)?;
             self.star(result);
             // What it stored in the scope object but to the bindings (the
@@ -4129,8 +4196,8 @@ impl<'a> Gen<'a> {
                 self.intrinsic("eval_scope_flush", s, (3 + kept.len()) as u8);
                 self.temp = m3;
             }
-            for (i, (o, v, constant)) in kept.iter().enumerate() {
-                if *constant {
+            for (i, &(o, v, kind, up)) in kept.iter().enumerate() {
+                if kind & EVAL_CONST as i32 != 0 || up.is_some() {
                     continue;
                 }
                 let m3 = self.temp;

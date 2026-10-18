@@ -698,8 +698,9 @@ pub struct Vm {
     /// is `LdaNewTarget`, which takes it); `EMPTY` otherwise.
     pub(crate) new_target: Value,
     /// The scope objects of the direct `eval`s running (see
-    /// `intrinsics::direct_eval`), innermost last.
-    pub(crate) eval_envs: Vec<[Value; 2]>,
+    /// `intrinsics::direct_eval`), innermost last: the caller's, the
+    /// eval's own, then the `with` objects around it.
+    pub(crate) eval_envs: Vec<Vec<Value>>,
     /// `%ThrowTypeError%`.
     pub(crate) thrower: *mut Object,
     /// The mapped `arguments` objects of the frames running, innermost

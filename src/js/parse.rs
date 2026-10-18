@@ -34,8 +34,9 @@ pub fn parse_source<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool) -> Result<
     parse_source_as(src, arena, skim, None)
 }
 
-/// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not).
-pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<bool>) -> Result<Program<'a>, Error> {
+/// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, and
+/// in that many `with` statements).
+pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize)>) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval)?;
@@ -62,7 +63,7 @@ fn parse_pass<'a, 'p>(
     keep: bool,
     table: Option<Table>,
     prev: Option<&'p Program<'a>>,
-    eval: Option<bool>,
+    eval: Option<(bool, usize)>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
     let mut p = Parser {
@@ -131,16 +132,20 @@ fn parse_pass<'a, 'p>(
         free: None,
         fields: None,
     });
-    p.functions[0].strict = p.directive_prologue() || eval == Some(true);
-    if eval.is_some() {
-        // The caller's scope object, then the eval's own (for strict
-        // code's `var`s): what `with`s would give.
-        for e in ["%e0", "%e1"] {
-            let e: Name = e.into();
+    p.functions[0].strict = p.directive_prologue() || eval.is_some_and(|(strict, _)| strict);
+    if let Some((_, withs)) = eval {
+        // The caller's scope object, the objects of the `with` statements
+        // around the `eval` (outermost first), then the eval's own (for
+        // strict code's `var`s): what `with`s would give.
+        let names: Vec<Name> = std::iter::once("%e0".into())
+            .chain((0..withs).map(|k| format!("%w{k}").into()))
+            .chain(std::iter::once("%e1".into()))
+            .collect();
+        for e in &names {
             p.hidden_var(e.clone());
-            p.lexicals.get_mut(&e).unwrap().withs = 2;
+            p.lexicals.get_mut(e).unwrap().withs = names.len();
             p.withs.push(e.clone());
-            p.functions[0].withs.push(e);
+            p.functions[0].withs.push(e.clone());
         }
     }
     p.push_scope(usize::MAX, false, true);
@@ -2063,12 +2068,18 @@ impl<'a> Parser<'_, 'a, '_> {
                     }
                     // The block-scoped bindings it sees, for its scope
                     // object (see `Gen::call`): a last argument the
-                    // direct `eval`'s code takes apart.
+                    // direct `eval`'s code takes apart. Then a function
+                    // that refers to each of them (and to the enclosing
+                    // functions' variables it sees: see
+                    // `codegen::upvalues`), never called: its upvalues are
+                    // theirs, which the scope object's accessors read and
+                    // write.
                     if self.current != 0 && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
-                        let visible = self.eval_visible(pos);
-                        if !visible.is_empty() {
-                            args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
-                        }
+                        let mut visible = self.eval_visible(pos);
+                        let end = self.toks[self.i - 1].pos;
+                        let f = self.eval_bindings(&visible, end);
+                        visible.push(Expr { kind: ExprKind::Function(f), pos });
+                        args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
                     }
                 }
                 e = Expr {
@@ -2676,7 +2687,7 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// The block-scoped bindings (and catch parameters) a direct `eval`
     /// here sees, innermost first, as triples: the name, the binding (a
-    /// variable), and whether it is constant. (Not one a function's `var`
+    /// variable), and its kind (`EVAL_CONST`…). (Not one a function's `var`
     /// between here and it shadows; the functions' own variables are the
     /// code generator's to add.)
     fn eval_visible(&self, pos: Pos) -> Vec<Expr<'a>> {
@@ -2693,12 +2704,32 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 seen.push(orig.clone());
                 let constant = self.table.decls.get(&frame.key).is_some_and(|ds| ds.iter().any(|(n, k)| n == orig && *k == CONST));
+                let kind = if frame.catch { EVAL_CATCH } else if constant { EVAL_CONST } else { 0 };
                 out.push(Expr { kind: ExprKind::Str(orig.to_string()), pos });
                 out.push(Expr { kind: ExprKind::Ident(renamed.clone()), pos });
-                out.push(Expr { kind: ExprKind::Bool(constant), pos });
+                out.push(Expr { kind: ExprKind::Num(kind as f64), pos });
             }
         }
         out
+    }
+
+    /// The function a direct `eval` at `pos` (its call's end) makes for
+    /// the bindings it sees (`visible`, of [`Parser::eval_visible`]): an
+    /// arrow named [`EVAL_BINDINGS`] whose body refers to each.
+    fn eval_bindings(&mut self, visible: &[Expr<'a>], pos: Pos) -> usize {
+        let body = visible
+            .chunks(3)
+            .filter_map(|t| match &t[1].kind {
+                ExprKind::Ident(v) => Some(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Ident(v.clone()), pos }), pos }),
+                _ => None,
+            })
+            .collect();
+        let f = self.synthetic_method(&Name::from(""), pos);
+        let strict = self.functions[self.current].strict;
+        let func = &mut self.functions[f];
+        (func.name, func.body, func.arrow, func.method, func.home, func.strict) =
+            (Some(Name::from(EVAL_BINDINGS)), body, true, false, None, strict);
+        f
     }
 
     /// Function declaration `f` in a block: its binding in the block, and

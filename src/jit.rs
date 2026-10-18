@@ -2555,8 +2555,11 @@ impl Feedback {
             return Prop::Length;
         }
         if matches!(insn.op, Op::GetKeyed | Op::SetKeyed) && ic.loc == crate::vm::BYTES_LOC {
+            // (A typed array's length may be stale once a fixed-length
+            // buffer has been detached: see `Vm::views_detached`.)
+            let views_detached = unsafe { (*crate::interp::current_vm()).views_detached };
             return match ic.epoch {
-                k @ 1..=9 => Prop::Typed { kind: k as u8 - 1 },
+                k @ 1..=9 if !views_detached => Prop::Typed { kind: k as u8 - 1 },
                 _ if insn.op == Op::SetKeyed => Prop::None,
                 _ => Prop::Runtime,
             };
@@ -3396,6 +3399,9 @@ struct Spec<'a> {
     /// The VM's indices are protected (see `Vm::protect_indices`): element
     /// stores through the interpreter.
     indices_protected: bool,
+    /// A fixed-length buffer has been detached (see `Vm::views_detached`):
+    /// a typed array's `length` through the runtime.
+    views_detached: bool,
     /// Registers from here keep their types: what an instruction learns
     /// about a copy of one isn't given to it (see [`copies`]). The values
     /// of loads moved out of loops (`hoist_loads`): a loop learning their
@@ -4819,18 +4825,30 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             return bail(out);
         }
         // An array's or string's length: no check if the receiver's shape
-        // is one's.
+        // is one's. Once a typed array's may be stale (`views_detached`),
+        // a typed array's through the runtime, and the check takes arrays
+        // and strings only (`nt`).
         if prop == Prop::Length {
-            let array = reg.shape().is_some_and(|s| {
-                matches!(
-                    unsafe { (*(s as *const Shape)).class },
-                    crate::object::Class::Array
-                        | crate::object::Class::String
-                        | crate::object::Class::TypedArray
-                )
+            use crate::object::Class;
+            let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
+            if spec.views_detached && class == Some(Class::TypedArray) {
+                let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
+                out.acc = Any;
+                return Sel {
+                    ops: Some((0, name, 0)),
+                    ..Sel::new("get_named_rt", "", out)
+                };
+            }
+            let array = class.is_some_and(|c| {
+                matches!(c, Class::Array | Class::String) || c == Class::TypedArray && !spec.views_detached
             });
             out.acc = I32;
-            return Sel::new("get_length", if array { "nc" } else { "" }, out);
+            let case = match (array, spec.views_detached) {
+                (true, _) => "nc",
+                (false, true) => "nt",
+                (false, false) => "",
+            };
+            return Sel::new("get_length", case, out);
         }
         // A known shape with the property. Not for a load from a
         // prototype's slot as cached (all its cases, if several): lowering
@@ -6115,6 +6133,7 @@ fn stencil_for(
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) if sel.case == "nc" => {
             cat!(sel.base, "_nc_", loc)
         }
+        ("get_length", _) if sel.case == "nt" => cat!(sel.base, "_nt_", loc),
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) => cat!(sel.base, "_", loc),
         // Stores take a boxed `acc`; a number's (`_n`) needs no barrier,
         // also one its check proved a number.
@@ -7569,6 +7588,7 @@ impl JitCode {
                 rets: &rets,
                 stable_ok,
                 indices_protected: !cur.is_null() && unsafe { (*cur).indices_protected },
+                views_detached: !cur.is_null() && unsafe { (*cur).views_detached },
                 fixed_from: direct_base,
                 captured: &captured,
             };

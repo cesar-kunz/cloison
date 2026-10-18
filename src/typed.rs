@@ -161,11 +161,20 @@ fn refresh_views(vm: &mut Vm, b: *mut Object) -> Result<()> {
     Ok(())
 }
 
-/// DetachArrayBuffer.
+/// DetachArrayBuffer. A fixed-length buffer doesn't keep its views, whose
+/// lengths then stay what they were: from the first such detach on, what
+/// reads elements by a view's length checks its buffer too (the
+/// interpreter's direct accesses), or reads the length from it (compiled
+/// code, dropped now and compiled through the runtime: see
+/// `Vm::views_detached`).
 pub(crate) fn detach(vm: &mut Vm, b: *mut Object) -> Result<()> {
     unsafe {
         (*b).elems_len = 0;
         (*b).flags |= DETACHED;
+    }
+    if !is_resizable(b) && !vm.views_detached {
+        vm.views_detached = true;
+        vm.bump_code_epoch();
     }
     refresh_views(vm, b)
 }

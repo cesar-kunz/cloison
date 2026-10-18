@@ -3959,15 +3959,26 @@ macro_rules! keyed_load {
     };
 }
 
-/// `o.length` for an array or string `o` at a boxed location: its
-/// elements' or code units' count (`Object::elems_len`, at byte 32), after
-/// a check that it is one (`Object::class` at byte 8 is `Class::Array`, 1,
-/// or `Class::String`, 4) unless its shape is known (`_nc`).
+/// `o.length` for an array, string or typed array `o` at a boxed
+/// location: its elements' or code units' count (`Object::elems_len`, at
+/// byte 32), after a check that it is one (`Object::class` at byte 8 is
+/// `Class::Array`, 1, `Class::String`, 4, or `Class::TypedArray`, 7)
+/// unless its shape is known (`_nc`); `_nt` takes no typed array (whose
+/// length may be stale once a fixed-length buffer has been detached: see
+/// `Vm::views_detached`).
 macro_rules! array_length {
     ($loc:tt) => {
         stencil!("get_length_", loc!($loc); |s| {
             let o = get!($loc, s);
             if !is_cell(s.tag, o) || !matches!(*(o.to_bits() as *const u8).add(8), 1 | 4 | 7) {
+                exit!(s)
+            }
+            s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());
+            next!(s)
+        });
+        stencil!("get_length_nt_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if !is_cell(s.tag, o) || !matches!(*(o.to_bits() as *const u8).add(8), 1 | 4) {
                 exit!(s)
             }
             s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());

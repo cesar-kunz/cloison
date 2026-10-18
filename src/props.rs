@@ -1338,7 +1338,7 @@ fn object_freeze(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     if is_object(o) {
         let obj = as_object(o);
-        if unsafe { (*obj).class == Class::TypedArray && (*obj).elems_len > 0 } {
+        if unsafe { (*obj).class == Class::TypedArray } && crate::typed::ta_length(obj).unwrap_or(0) > 0 {
             return Err(Error::type_error("Cannot freeze array buffer views with elements"));
         }
         vm.seal(obj, true);

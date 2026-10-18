@@ -1702,15 +1702,18 @@ impl<'a> Gen<'a> {
                 }
             }
         } else {
+            // A generator starts once its parameters are set; an async
+            // function before (what they throw rejects its promise).
+            let start = if self.f.is_async && !self.f.generator { 0 } else { self.f.param_stmts };
             for (k, s) in body.iter().enumerate() {
-                if (self.f.generator || self.f.is_async) && k == self.f.param_stmts {
+                if (self.f.generator || self.f.is_async) && k == start {
                     self.initial_yield()?;
                 }
                 // (Its parameters' defaults first: see `Gen::in_params`.)
                 self.in_params = k < self.f.param_stmts;
                 self.stmt(s)?;
             }
-            if (self.f.generator || self.f.is_async) && body.len() <= self.f.param_stmts {
+            if (self.f.generator || self.f.is_async) && body.len() <= start {
                 self.initial_yield()?;
             }
             self.in_params = false;

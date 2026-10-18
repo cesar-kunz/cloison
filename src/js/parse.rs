@@ -395,6 +395,9 @@ impl<'a> Parser<'_, 'a, '_> {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` is reserved in strict mode")));
         }
         // (Escaped, these reach here as identifiers.)
+        if self.toks[self.i - 1].escaped && is_reserved_word(s) {
+            return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` (escaped) is a reserved word")));
+        }
         let f = &self.functions[self.current];
         if s == "yield" && (self.strict() || f.generator) || s == "await" && f.is_async {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` as an identifier here")));
@@ -2343,6 +2346,7 @@ impl<'a> Parser<'_, 'a, '_> {
                         };
                         if let Some(n) = shorthand {
                             self.advance();
+                            self.strict_word(&n)?;
                             let kind = self.reference(n.clone());
                             let mut v = Expr { kind, pos: ppos };
                             // `{a = 1}`: only as a pattern (see `to_pattern`).
@@ -2394,6 +2398,17 @@ impl<'a> Parser<'_, 'a, '_> {
         };
         Ok(Expr { kind, pos })
     }
+}
+
+/// Whether `s` is a reserved word (never an identifier, even escaped).
+fn is_reserved_word(s: &str) -> bool {
+    matches!(
+        s,
+        "break" | "case" | "catch" | "class" | "const" | "continue" | "debugger" | "default" | "delete" | "do"
+            | "else" | "enum" | "export" | "extends" | "false" | "finally" | "for" | "function" | "if" | "import"
+            | "in" | "instanceof" | "new" | "null" | "return" | "super" | "switch" | "this" | "throw" | "true"
+            | "try" | "typeof" | "var" | "void" | "while" | "with"
+    )
 }
 
 /// Whether `names` has one twice.

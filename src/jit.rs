@@ -3385,6 +3385,9 @@ struct Spec<'a> {
     /// which could add a transition while the code runs (only calls check
     /// the code epoch after them).
     stable_ok: bool,
+    /// The VM's indices are protected (see `Vm::protect_indices`): element
+    /// stores through the interpreter.
+    indices_protected: bool,
     /// Registers from here keep their types: what an instruction learns
     /// about a copy of one isn't given to it (see [`copies`]). The values
     /// of loads moved out of loops (`hoist_loads`): a loop learning their
@@ -4405,6 +4408,9 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         {
             ("bail", "")
         }
+        // Element stores through the interpreter once a prototype may
+        // have a setter or read-only element (see `Vm::protect_indices`).
+        Op::SetKeyed if spec.indices_protected => ("bail", ""),
         // A store whose site gave up on the stencils: through the runtime,
         // which may change the receiver's elements' type (and so its
         // shape: exact shapes become lower bounds, as after a call).
@@ -7548,6 +7554,7 @@ impl JitCode {
                 feedback,
                 rets: &rets,
                 stable_ok,
+                indices_protected: !cur.is_null() && unsafe { (*cur).indices_protected },
                 fixed_from: direct_base,
                 captured: &captured,
             };
@@ -12147,7 +12154,7 @@ impl Lowering<'_> {
                 let (fo, other) = unsafe { ((*ic).holder, (*ic.add(1)).holder) };
                 let vm = unsafe { &*self.state.vm };
                 let native = match (fo, i.imm) {
-                    (f, 1) if f == vm.array_push_fn => 1,
+                    (f, 1) if f == vm.array_push_fn && !vm.indices_protected => 1,
                     (f, 0) if f == vm.array_pop_fn => 2,
                     (f, 1) if f == vm.char_code_at_fn => 4,
                     (f, 1) if f == vm.from_char_code_fn => 5,

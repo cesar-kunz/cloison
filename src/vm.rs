@@ -562,6 +562,9 @@ pub struct Vm {
     /// Bumped with either: compiled code checks it after calling out, as
     /// the callee may have invalidated what it assumes.
     pub code_epoch: u32,
+    /// Some object has had an indexed accessor or a read-only element
+    /// (see `protect_indices`).
+    pub(crate) indices_protected: bool,
     pub(crate) error: Option<Error>,
     pub(crate) stack: Box<[Value]>,
     pub(crate) stack_end: *mut Value,
@@ -815,6 +818,7 @@ impl Vm {
             through_deps: HashMap::default(),
             field_epoch: 0,
             code_epoch: 0,
+            indices_protected: false,
             error: None,
             stack,
             stack_end,
@@ -978,7 +982,7 @@ impl Vm {
         let empty = vm.new_string(&[]);
         unsafe { (*vm.string_prototype).code = empty.to_bits() as *const Code };
         let ap = vm.array_prototype;
-        vm.array_push_fn = vm.define_native(ap, "push", array_push, 1, crate::jit::Ty::I32, false);
+        vm.array_push_fn = vm.define_native(ap, "push", array_push_method, 1, crate::jit::Ty::I32, false);
         vm.array_pop_fn = vm.define_native(ap, "pop", crate::array::array_pop, 0, crate::jit::Ty::Any, false);
         let fp = vm.function_prototype;
         let call = vm.define_native(fp, "call", function_call, 1, crate::jit::Ty::Any, false);
@@ -2767,6 +2771,11 @@ impl Vm {
                 let a = self.intern(&i.to_string());
                 return self.set(obj, a, value);
             }
+            // (A new element: a prototype's setter or read-only one may
+            // take the store.)
+            if self.indices_protected && !Self::has_element(o, i) && self.set_new_element(obj, o, i, value)? {
+                return Ok(());
+            }
             if (*o).flags & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
                 return self.set_keyed_flagged(obj, o, i, value);
             }
@@ -2783,6 +2792,39 @@ impl Vm {
             self.store_element(o, i as usize, value);
         }
         Ok(())
+    }
+
+    /// `obj[i] = value` where `obj` (object `o`) has no element `i`, once
+    /// indices are protected (see `protect_indices`): whether the store
+    /// is done, by a setter on the prototype chain, or failed on a
+    /// read-only element there (else `obj` gets the element).
+    #[cold]
+    fn set_new_element(&mut self, obj: Value, o: *mut Object, i: u32, value: Value) -> Result<bool> {
+        if self.own_property(o, Key::Index(i)).is_some() {
+            return Ok(false);
+        }
+        let mut p = unsafe { (*(*o).shape).proto };
+        while p.is_cell() {
+            let po = as_object(p);
+            if let Some(d) = self.own_property(po, Key::Index(i)) {
+                if d.is_accessor() {
+                    match d.set.filter(|f| !f.is_undefined()) {
+                        Some(f) => {
+                            crate::interp::call_function(self, f, obj, &[value])?;
+                        }
+                        None => self.store_failed = true,
+                    }
+                    return Ok(true);
+                }
+                if d.writable == Some(false) {
+                    self.store_failed = true;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+            p = unsafe { (*(*po).shape).proto };
+        }
+        Ok(false)
     }
 
     /// `obj[i] = value` on an object with elements that have attributes,
@@ -4544,24 +4586,40 @@ fn function_call(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     crate::interp::call_function(vm, this, that, rest)
 }
 
+/// `this[length++] = v` for each argument (a failed store throws), as
+/// `push` does on an array-like object.
+fn array_push_generic(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
+    let this = object_value(vm.to_object(this)?);
+    let a_length = vm.a_length;
+    let n = crate::interp::to_number(vm.get(this, a_length)?);
+    let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc().min(9007199254740991.0) };
+    if n + args.len() as f64 > 9007199254740991.0 {
+        return Err(Error::type_error("Pushing past the largest array-like length"));
+    }
+    for &v in args {
+        let k = vm.property_key(Value::number(n));
+        vm.put_key(this, k, v)?;
+        n += 1.0;
+    }
+    vm.put_key(this, Key::Name(a_length), Value::number(n))?;
+    Ok(Value::number(n))
+}
+
+/// `Array.prototype.push`: [`array_push`], but each element stored with
+/// `Set` once a prototype may have a setter or read-only element there
+/// (see `Vm::protect_indices`).
+fn array_push_method(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
+    if vm.indices_protected {
+        return array_push_generic(vm, this, args);
+    }
+    array_push(vm, this, args)
+}
+
+/// Push onto array `this` (as array literals do: elements defined, not
+/// stored through prototypes).
 pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     if !this.is_cell() || unsafe { (*as_object(this)).class } != Class::Array {
-        // An array-like object: `this[length++] = v` for each (a failed
-        // store throws).
-        let this = object_value(vm.to_object(this)?);
-        let a_length = vm.a_length;
-        let n = crate::interp::to_number(vm.get(this, a_length)?);
-        let mut n = if n.is_nan() || n < 0.0 { 0.0 } else { n.trunc().min(9007199254740991.0) };
-        if n + args.len() as f64 > 9007199254740991.0 {
-            return Err(Error::type_error("Pushing past the largest array-like length"));
-        }
-        for &v in args {
-            let k = vm.property_key(Value::number(n));
-            vm.put_key(this, k, v)?;
-            n += 1.0;
-        }
-        vm.put_key(this, Key::Name(a_length), Value::number(n))?;
-        return Ok(Value::number(n));
+        return array_push_generic(vm, this, args);
     }
     let o = as_object(this);
     unsafe {

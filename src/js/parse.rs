@@ -1541,6 +1541,10 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         };
         let body = if self.eat("{") {
+            // (`"use strict"` of its own.)
+            if self.directive_prologue() {
+                self.functions[index].strict = true;
+            }
             self.scoped_block_rest()
         } else {
             let p = self.pos();

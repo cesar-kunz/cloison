@@ -340,6 +340,7 @@ pub(crate) fn install(vm: &mut Vm) {
     to_string_tag(vm, cp[Proto::WeakMap as usize], "WeakMap");
     to_string_tag(vm, cp[Proto::WeakSet as usize], "WeakSet");
     to_string_tag(vm, cp[Proto::WeakRef as usize], "WeakRef");
+    to_string_tag(vm, cp[Proto::FinalizationRegistry as usize], "FinalizationRegistry");
     to_string_tag(vm, cp[Proto::DataView as usize], "DataView");
     let math = { let a = vm.intern("Math"); vm.get(object_value(g), a) }.unwrap_or(Value::UNDEFINED);
     if is_object(math) {

@@ -110,6 +110,10 @@ pub enum Class {
     /// A `WeakRef`: as a [`Class::WeakSet`] of its target alone (cleared
     /// once the target dies).
     WeakRef,
+    /// A `FinalizationRegistry`: as a [`Class::WeakMap`] of its
+    /// unregister tokens' registration counts, its cleanup callback in
+    /// slot 0 (see `collections`).
+    FinalizationRegistry,
 }
 
 impl Class {

@@ -509,6 +509,8 @@ pub(crate) fn run_jobs(vm: &mut Vm) -> Result<()> {
             truncate(jobs, n - i);
             i = 0;
         }
+        // (ClearKeptObjects, before each job.)
+        vm.kept_alive.clear();
         run_job(vm, &job)?;
     }
     truncate(jobs, 0);

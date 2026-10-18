@@ -574,6 +574,9 @@ pub struct Vm {
     /// The `WeakMap`s and `WeakSet`s, live or not yet found dead by a
     /// collection (not roots: see `Vm::ephemerons`).
     pub(crate) weak_tables: Vec<*mut Object>,
+    /// The targets of the `WeakRef`s made or dereferenced in the current
+    /// job, kept alive until it ends (the spec's KeepDuringJob).
+    pub(crate) kept_alive: Vec<Value>,
     pub(crate) error: Option<Error>,
     pub(crate) stack: Box<[Value]>,
     pub(crate) stack_end: *mut Value,
@@ -831,6 +834,7 @@ impl Vm {
             proxies_exist: false,
             proxy_codes: [std::ptr::null(); 3],
             weak_tables: Vec::new(),
+            kept_alive: Vec::new(),
             error: None,
             stack,
             stack_end,
@@ -3984,6 +3988,7 @@ impl Vm {
         let r = unsafe { crate::interp::run_script(self, code) };
         // The script done, the promise jobs it queued run (and theirs).
         let r = r.and_then(|v| self.run_jobs().map(|()| v));
+        self.kept_alive.clear();
         if outer {
             self.heap.gc.stack_base = 0;
             self.pause_marker();

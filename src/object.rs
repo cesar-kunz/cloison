@@ -107,6 +107,9 @@ pub enum Class {
     /// A proxy whose target isn't callable (one whose target is, is a
     /// native function): see `proxy`.
     Proxy,
+    /// A `WeakRef`: as a [`Class::WeakSet`] of its target alone (cleared
+    /// once the target dies).
+    WeakRef,
 }
 
 impl Class {
@@ -129,6 +132,7 @@ impl Class {
                 | Class::ArrayIterator
                 | Class::Generator
                 | Class::Proxy
+                | Class::WeakRef
         )
     }
 }

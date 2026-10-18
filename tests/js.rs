@@ -5164,3 +5164,40 @@ ok + ":" + steps;
     vm.heap.verify();
     assert!(vm.weak_entry_count() < 100000, "{} weak entries", vm.weak_entry_count());
 }
+
+/// A `WeakRef`'s target stays through the job that made (or dereferenced)
+/// it, and goes once unreachable after; brand checks and argument errors
+/// as the spec has them.
+#[test]
+fn weak_refs() {
+    let first = cloison::js::compile(
+        r#"
+var out = [];
+function t(n, f) { try { out.push(n + "=" + f()); } catch (e) { out.push(n + "=!" + e.name); } }
+var keep = { k: 1 }, rk = new WeakRef(keep), refs = [];
+t("tag", () => Object.prototype.toString.call(rk));
+t("noNew", () => WeakRef({}));
+t("prim", () => new WeakRef(1));
+t("regSym", () => new WeakRef(Symbol.for("x")));
+t("sym", () => typeof new WeakRef(Symbol("y")).deref());
+t("brand", () => WeakRef.prototype.deref.call({}));
+t("wsBrand", () => WeakSet.prototype.has.call(rk, keep));
+for (var i = 0; i < 1000; i++) refs.push(new WeakRef({ i: i }));
+t("sameJob", () => refs.filter(x => x.deref() === undefined).length);
+Promise.resolve().then(() => {
+  for (var r = 0; r < 300; r++) { var a = []; for (var q = 0; q < 2000; q++) a.push({ q: q }); }
+  t("later", () => refs.filter(x => x.deref() === undefined).length > 500);
+  t("kept", () => rk.deref() === keep);
+});
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("out.join(' ')").unwrap();
+    let mut vm = Vm::new();
+    vm.run(&first).unwrap();
+    assert_eq!(
+        vm.run(&second).map(display).unwrap(),
+        "tag=[object WeakRef] noNew=!TypeError prim=!TypeError regSym=!TypeError sym=symbol brand=!TypeError \
+         wsBrand=!TypeError sameJob=0 later=true kept=true"
+    );
+}

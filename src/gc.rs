@@ -31,7 +31,7 @@
 //! poisoned value on first use; `CLOISON_GC_STRESS` collects at every
 //! safepoint, the same way. `CLOISON_GC_STATS` prints each collection.
 
-use crate::heap::{BYTES, COLOR, END, GRANULE, Heap, UPVALUE, VALUES, YOUNG, cell_size};
+use crate::heap::{BYTES, COLOR, END, GRANULE, Heap, UPVALUE, VALUES, WEAK_VALUES, YOUNG, cell_size};
 use crate::object::{Class, INLINE_BASE, Object};
 use crate::value::Value;
 use crate::vm::Vm;
@@ -329,6 +329,7 @@ trait Visit {
             unsafe { self.cell(q - 8) }
         }
     }
+
 }
 
 /// Marking: the color and kind, the cells marked and not yet traced, the
@@ -392,6 +393,7 @@ impl Visit for Marking<'_> {
             }
         }
     }
+
 }
 
 /// Card scanning: the references on dirty cards pass through a ring,
@@ -474,6 +476,7 @@ impl Visit for CardMarking {
             }
         }
     }
+
 }
 
 /// A heap shared by the card-scanning threads, which only read it (but
@@ -818,6 +821,16 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 UPVALUE => {
                     if within(p + 16) {
                         v.value(*((p + 16) as *const Value));
+                    }
+                }
+                // (Its header only: see `heap::WEAK_VALUES`.)
+                WEAK_VALUES => {
+                    let n = ((w >> 32) as usize).min(crate::collections::WEAK_HEADER);
+                    let mut a = (p + 8).max(lo).next_multiple_of(8);
+                    let last = (p + 8 + 8 * n).min(hi);
+                    while a < last {
+                        v.value(*(a as *const Value));
+                        a += 8;
                     }
                 }
                 BYTES => {}
@@ -1259,6 +1272,8 @@ impl Vm {
             } else {
                 m.drain(&|| false)
             };
+            // (The weak collections' entries, once what is live is known.)
+            self.ephemerons(&mut m);
             if kind == Collection::Minor && self.heap.gc.check_barriers {
                 self.heap.check_barriers();
             }
@@ -1360,6 +1375,76 @@ impl Vm {
         if self.heap.gc.stress {
             self.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// The weak collections' ephemerons, once marking has found what the
+    /// roots reach: the value of each entry whose key is live marked (and
+    /// what that reaches, which may make other keys live, until none
+    /// does), then the entries of keys not live cleared; collections not
+    /// live leave `weak_tables`. A minor collection keeps old cells, and
+    /// the keys an old collection's entries refer to were marked from its
+    /// dirty cards: it clears young collections' entries only.
+    unsafe fn ephemerons(&mut self, m: &mut Marking) {
+        if self.weak_tables.is_empty() {
+            return;
+        }
+        let mode = m.mode;
+        let live = |p: usize| unsafe {
+            let b = *crate::heap::meta(p);
+            match mode.kind {
+                Kind::Minor | Kind::MinorShade => b != YOUNG,
+                _ => b & COLOR == mode.color,
+            }
+        };
+        let tables: Vec<*mut Object> = self.weak_tables.iter().copied().filter(|&t| live(t as usize)).collect();
+        // The entries of each live collection: its buffer, its length, and
+        // its entries' width.
+        let entries = |t: *mut Object| unsafe {
+            let e = Value::from_bits((*t).code as u64);
+            if !e.is_cell() {
+                return None;
+            }
+            let e = crate::object::as_object(e);
+            let s = if (*t).class == Class::WeakMap { 2 } else { 1 };
+            Some(((*e).elems, (*e).elems_len as usize, s))
+        };
+        unsafe {
+            loop {
+                let mut more = false;
+                for &t in &tables {
+                    let Some((buf, len, 2)) = entries(t) else { continue };
+                    let mut i = crate::collections::BASE;
+                    while i + 1 < len {
+                        let (k, v) = (*buf.add(i), *buf.add(i + 1));
+                        if k.is_cell() && live(k.to_bits() as usize) && v.is_cell() && !live(v.to_bits() as usize) {
+                            m.cell(v.to_bits() as usize);
+                            more = true;
+                        }
+                        i += 2;
+                    }
+                }
+                if !more {
+                    break;
+                }
+                m.drain(&|| false);
+            }
+            for &t in &tables {
+                let Some((buf, len, s)) = entries(t) else { continue };
+                let mut i = crate::collections::BASE;
+                while i + s <= len {
+                    let k = *buf.add(i);
+                    if k.is_cell() && !live(k.to_bits() as usize) {
+                        for j in 0..s {
+                            *buf.add(i + j) = Value::EMPTY;
+                        }
+                        let count = buf.add(crate::collections::COUNT);
+                        *count = Value::from_i32((*count).as_i32_unchecked() - 1);
+                    }
+                    i += s;
+                }
+            }
+        }
+        self.weak_tables = tables;
     }
 
     /// Debugging (`CLOISON_GC_ROOTS`): trace what the roots marked so far

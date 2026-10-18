@@ -5134,3 +5134,33 @@ t("freeze", () => { var q = new Proxy({ a: 1 }, {}); Object.freeze(q); return Ob
 out.join(" | ");"##;
     assert_eq!(value(src), "get 10,20,missing,10 | set 6 | has true,false | delete false | keys b,c,virtual | forin b,c,virtual | json {\"x\":1,\"y\":[1,2]} | spread {\"s\":1} | calls get a;get b;get zzz;get a;set c;has a;has hidden;delete a;ownKeys;gopd b;gopd c;gopd virtual;ownKeys;gopd b;gopd c;gopd virtual | apply applied 5 function | construct {\"made\":7} | transparent 3,F,1 | proto true,true | isArray true,[object Array] | protoChain 1 from proxy inherited | protoSet x true | revocable 1 | revoked !TypeError revoked | revokedTypeof object | noNew !TypeError | badArgs !TypeError | defineTrap z:4 4 | trapReturnsFalse !TypeError | hot 3000 | hotProtoChain 15000 | reflect true,1,a,true,true,false | freeze true false");
 }
+
+/// A `WeakMap`'s and a `WeakSet`'s entries go once their keys are
+/// unreachable (values reachable only from them too, ephemeron chains
+/// followed); live keys keep theirs.
+#[test]
+fn weak_collections_drop_unreachable_keys() {
+    let src = r#"
+var wm = new WeakMap(), ws = new WeakSet(), keep = [];
+for (var i = 0; i < 100000; i++) {
+  var k = { i: i };
+  if (i % 1000 == 0) keep.push(k);
+  wm.set(k, { v: i, big: new Array(8).fill(i) });
+  ws.add(k);
+}
+var head = { n: 0 }, cur = head;
+for (var j = 1; j < 50; j++) { var next = { n: j }; wm.set(cur, { next: next }); cur = next; }
+wm.set(cur, { end: true });
+for (var r = 0; r < 200; r++) { var a = []; for (var q = 0; q < 2000; q++) a.push({ q: q }); }
+var ok = keep.every(function (k) { return wm.get(k).v === k.i && wm.get(k).big[7] === k.i && ws.has(k); });
+var steps = 0, c = head;
+while (wm.has(c) && !wm.get(c).end) { c = wm.get(c).next; steps++; }
+ok + ":" + steps;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r, Ok("true:49".to_string()));
+    vm.heap.verify();
+    assert!(vm.weak_entry_count() < 100000, "{} weak entries", vm.weak_entry_count());
+}

@@ -571,6 +571,9 @@ pub struct Vm {
     /// The codes of callable proxies (a non-constructor's, a
     /// constructor's) and of a revocable proxy's `revoke`.
     pub(crate) proxy_codes: [*const Code; 3],
+    /// The `WeakMap`s and `WeakSet`s, live or not yet found dead by a
+    /// collection (not roots: see `Vm::ephemerons`).
+    pub(crate) weak_tables: Vec<*mut Object>,
     pub(crate) error: Option<Error>,
     pub(crate) stack: Box<[Value]>,
     pub(crate) stack_end: *mut Value,
@@ -827,6 +830,7 @@ impl Vm {
             indices_protected: false,
             proxies_exist: false,
             proxy_codes: [std::ptr::null(); 3],
+            weak_tables: Vec::new(),
             error: None,
             stack,
             stack_end,
@@ -4088,6 +4092,12 @@ impl Vm {
     /// The functions' codes loaded and not freed (for tests).
     pub fn code_count(&self) -> usize {
         self.codes.len() + self.condemned.len()
+    }
+
+    /// The entries the weak collections (`WeakMap`s, `WeakSet`s) not yet
+    /// found dead hold (for tests of the ephemeron pass).
+    pub fn weak_entry_count(&self) -> usize {
+        self.weak_tables.iter().map(|&t| crate::collections::live_entries(t)).sum()
     }
 
     /// Loop back edges a frame runs in the interpreter before tiering up

@@ -528,8 +528,17 @@ since the last, marked, freed, and the heap's size.
 
 ### Weak references, finalization
 
-None in ES5. `WeakMap` and `WeakRef` arrive with ES6 and need ephemeron
-processing in the final pause. Rust-side resources reachable from cells
+`WeakMap` and `WeakSet` keep their entries in a buffer tagged
+`WEAK_VALUES`, whose tracing (a card scan's too) stops at its header: its
+keys and values are reached only by the ephemeron pass every collection
+runs once its marking is drained (`Vm::ephemerons`). Over the weak
+collections still live (`Vm::weak_tables`, not roots), it marks the
+value of each entry whose key is live and drains again, until no new
+value is marked, then clears the entries whose keys are not live. A
+minor collection counts old cells live, so it clears young keys' entries
+only; entries stored while the marker runs are no different (the
+barrier's card marks don't make them strong). `WeakRef` and
+`FinalizationRegistry` don't exist yet. Rust-side resources reachable from cells
 (`Regex` boxes) are freed by the sweeper when the cell dies; nothing else
 needs a finalizer.
 

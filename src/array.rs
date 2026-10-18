@@ -452,6 +452,11 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
             let n = (*obj).elems_len as usize;
             let e = std::slice::from_raw_parts_mut((*obj).elems, n);
             e.reverse();
+            // (Every slot may now hold what was elsewhere: barriered.)
+            for i in 0..n {
+                let v = *(*obj).elems.add(i);
+                crate::heap::barrier((*obj).elems.cast::<u8>().sub(8), (*obj).elems.add(i), v);
+            }
         }
         return Ok(o);
     }
@@ -495,6 +500,10 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             std::ptr::copy((*obj).elems.add(1), (*obj).elems, n - 1);
             *(*obj).elems.add(n - 1) = Value::EMPTY;
             (*obj).elems_len = (n - 1) as u32;
+            for i in 0..n - 1 {
+                let v = *(*obj).elems.add(i);
+                crate::heap::barrier((*obj).elems.cast::<u8>().sub(8), (*obj).elems.add(i), v);
+            }
             return Ok(if first == Value::EMPTY { Value::UNDEFINED } else { first });
         }
     }
@@ -566,7 +575,10 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let end = relative(arg(a, 1), len, len);
     let count = (end - k).max(0.0);
     let out = species_create(vm, o, count)?;
-    if dense(vm, as_object(o)) && dense(vm, as_object(out)) {
+    // (The arguments' conversions and the species lookup may have run
+    // code that changed the length: the fast path only over the one
+    // measured.)
+    if dense(vm, as_object(o)) && dense(vm, as_object(out)) && unsafe { (*as_object(o)).elems_len } as f64 == len {
         let obj = as_object(o);
         let oo = as_object(out);
         unsafe {
@@ -613,7 +625,9 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Array length exceeds the maximum"));
     }
     let removed = new_array_len(vm, del)?;
-    if dense(vm, as_object(o)) {
+    // (As in `slice`: `start` and `deleteCount`'s conversions may have
+    // changed the length.)
+    if dense(vm, as_object(o)) && unsafe { (*as_object(o)).elems_len } as f64 == len {
         let obj = as_object(o);
         let ro = as_object(removed);
         unsafe {

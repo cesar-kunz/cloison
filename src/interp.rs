@@ -2486,10 +2486,23 @@ relational!(
 );
 
 /// A test of `acc` alone (`TestUndefined`, …), plain and fused with the
-/// jump after it. It ignores the state: both tables use these.
+/// jump after it, and its I32-state forms: an int32 is none of these
+/// (though an unboxed one's bits may be 0x2 or 0xA).
 macro_rules! acc_test {
-    ($op:ident, $test:ident, $jt:ident, $jf:ident, |$v:ident| $c:expr) => {
+    ($op:ident, $test:ident, $jt:ident, $jf:ident, $i32_test:ident, $i32_jt:ident, $i32_jf:ident, |$v:ident| $c:expr) => {
         handlers! {
+            fn $i32_test(pc, acc, regs, tag) {
+                next!(any, Op::$op.size(), Value::FALSE)
+            }
+
+            fn $i32_jt(pc, acc, regs, tag) {
+                next!(any, 1 + Op::JumpIfTrue.size(), Value::FALSE)
+            }
+
+            fn $i32_jf(pc, acc, regs, tag) {
+                next!(any, 1 + imm32(pc, 1 + 1) as isize, Value::FALSE)
+            }
+
             fn $test(pc, acc, regs, tag) {
                 let $v = acc;
                 next!(any, Op::$op.size(), Value::from_bool($c))
@@ -2514,13 +2527,14 @@ macro_rules! acc_test {
     };
 }
 
-// In the I32 state `acc` is an int32, which is none of these: they read
-// it unboxed or boxed alike, as an int32's bits are neither 0x2 nor 0xA.
 acc_test!(
     TestUndefined,
     op_test_undefined,
     op_test_undefined_jt,
     op_test_undefined_jf,
+    i32_test_undefined,
+    i32_test_undefined_jt,
+    i32_test_undefined_jf,
     |v| v == Value::UNDEFINED
 );
 acc_test!(
@@ -2528,6 +2542,9 @@ acc_test!(
     op_test_null,
     op_test_null_jt,
     op_test_null_jf,
+    i32_test_null,
+    i32_test_null_jt,
+    i32_test_null_jf,
     |v| v == Value::NULL
 );
 acc_test!(
@@ -2535,6 +2552,9 @@ acc_test!(
     op_test_nullish,
     op_test_nullish_jt,
     op_test_nullish_jf,
+    i32_test_nullish,
+    i32_test_nullish_jt,
+    i32_test_nullish_jf,
     |v| v.to_bits() & !Value::UNDEFINED_TAG == Value::NULL.to_bits()
 );
 
@@ -3617,9 +3637,9 @@ static TABLE_I32: Table = {
     t[Op::TestGreaterThan as usize] = i32_test_gt;
     t[Op::TestLessThanOrEqual as usize] = i32_test_le;
     t[Op::TestGreaterThanOrEqual as usize] = i32_test_ge;
-    t[Op::TestUndefined as usize] = op_test_undefined;
-    t[Op::TestNull as usize] = op_test_null;
-    t[Op::TestNullish as usize] = op_test_nullish;
+    t[Op::TestUndefined as usize] = i32_test_undefined;
+    t[Op::TestNull as usize] = i32_test_null;
+    t[Op::TestNullish as usize] = i32_test_nullish;
     t[Op::JumpIfLessEqual as usize] = i32_jle;
     t[Op::JumpIfGreater as usize] = i32_jgt;
     t[Op::JumpIfGreaterEqual as usize] = i32_jge;
@@ -3639,12 +3659,12 @@ static TABLE_I32: Table = {
     t[Op::TestLessThanOrEqualJumpIfFalse as usize] = i32_test_le_jf;
     t[Op::TestGreaterThanOrEqualJumpIfTrue as usize] = i32_test_ge_jt;
     t[Op::TestGreaterThanOrEqualJumpIfFalse as usize] = i32_test_ge_jf;
-    t[Op::TestUndefinedJumpIfTrue as usize] = op_test_undefined_jt;
-    t[Op::TestUndefinedJumpIfFalse as usize] = op_test_undefined_jf;
-    t[Op::TestNullJumpIfTrue as usize] = op_test_null_jt;
-    t[Op::TestNullJumpIfFalse as usize] = op_test_null_jf;
-    t[Op::TestNullishJumpIfTrue as usize] = op_test_nullish_jt;
-    t[Op::TestNullishJumpIfFalse as usize] = op_test_nullish_jf;
+    t[Op::TestUndefinedJumpIfTrue as usize] = i32_test_undefined_jt;
+    t[Op::TestUndefinedJumpIfFalse as usize] = i32_test_undefined_jf;
+    t[Op::TestNullJumpIfTrue as usize] = i32_test_null_jt;
+    t[Op::TestNullJumpIfFalse as usize] = i32_test_null_jf;
+    t[Op::TestNullishJumpIfTrue as usize] = i32_test_nullish_jt;
+    t[Op::TestNullishJumpIfFalse as usize] = i32_test_nullish_jf;
     Table(t)
 };
 

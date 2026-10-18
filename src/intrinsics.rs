@@ -671,6 +671,12 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
         }
+        // A `var` of the function's shadows an enclosing function's
+        // binding: the scope object over the function's has it no more
+        // (and it takes back its value unchanged).
+        if target == decl && env != decl && crate::props::is_object(env) {
+            vm.delete_own(as_object(env), Key::Name(atom));
+        }
     }
     // (Its `var`s are the scope objects', not globals.)
     let mut module = module;
@@ -1038,36 +1044,56 @@ fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let proto = if crate::props::is_object(a[0]) { a[0] } else { Value::NULL };
     let o = object_value(vm.new_object(proto));
-    for pair in a[1..].chunks(2) {
+    let nlex = a[1].as_number().unwrap_or(0.0) as usize;
+    for (i, pair) in a[2..].chunks(2).enumerate() {
         if pair[1] != Value::HOLE {
             let key = to_property_key(vm, pair[0])?;
+            if i >= nlex && shadowed(vm, proto, key) {
+                continue;
+            }
             vm.create_data_property(o, key, pair[1])?;
         }
     }
     Ok(o)
 }
 
-/// After a direct `eval`: binding `[scope, name, current]`'s value, its
-/// scope object's own property (`current` if it has none).
+/// Whether an enclosing function's binding by `key` is shadowed by a `var`
+/// of the function's an `eval` declared, in its scope object `decl`.
+fn shadowed(vm: &mut Vm, decl: Value, key: Key) -> bool {
+    crate::props::is_object(decl) && vm.own_property(as_object(decl), key).is_some()
+}
+
+/// After a direct `eval`: binding `[scope, name, current, decl]`'s value,
+/// its scope object's own property (`current` if it has none, or for an
+/// enclosing function's binding, `decl` the function's scope object, if
+/// a `var` there shadows it).
 fn eval_scope_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
+    if shadowed(vm, a[3], key) {
+        return Ok(a[2]);
+    }
     Ok(match vm.own_property(as_object(a[0]), key) {
         Some(d) if d.is_data() => d.value.unwrap_or(Value::UNDEFINED),
         _ => a[2],
     })
 }
 
-/// After a direct `eval`: `[scope, function's scope, binding names…]`,
-/// the scope object's own properties but the bindings' set on the
-/// function's scope object (the `var`s it assigned or declared there).
+/// After a direct `eval`: `[scope, function's scope, block-scoped count,
+/// binding names…]`, the scope object's own properties but the bindings'
+/// set on the function's scope object (the `var`s it assigned or declared
+/// there, those by an enclosing function's binding's name too).
 fn eval_scope_flush(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (scope, target) = (a[0], a[1]);
     if !crate::props::is_object(target) {
         return Ok(Value::UNDEFINED);
     }
+    let nlex = a[2].as_number().unwrap_or(0.0) as usize;
     let mut bindings = Vec::new();
-    for &n in &a[2..] {
-        bindings.push(to_property_key(vm, n)?);
+    for (i, &n) in a[3..].iter().enumerate() {
+        let key = to_property_key(vm, n)?;
+        if i < nlex || !shadowed(vm, target, key) {
+            bindings.push(key);
+        }
     }
     for (key, _) in vm.own_keys(as_object(scope)) {
         if bindings.contains(&key) {

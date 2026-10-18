@@ -4057,6 +4057,9 @@ impl<'a> Gen<'a> {
             self.mov(env, decl);
             // The bindings: the parser's, then the enclosing functions'
             // variables none of those shadows (none with no variable here).
+            // (Block-scoped ones first, then the enclosing functions':
+            // those a `var` of the function's by the name, which an `eval`
+            // may declare, shadows.)
             let mut bindings: Vec<(&str, &str, bool)> = visible
                 .chunks(3)
                 .filter_map(|t| match (&t[0].kind, &t[1].kind, &t[2].kind) {
@@ -4064,18 +4067,22 @@ impl<'a> Gen<'a> {
                     _ => None,
                 })
                 .collect();
+            let lexical = bindings.len();
             for n in eval_outer_names(self.p, self.decls, self.index) {
                 if !bindings.iter().any(|(o, ..)| *o == n) {
                     bindings.push((n, n, false));
                 }
             }
             let mut kept = Vec::new();
-            for b in bindings {
+            let mut nlex = 0;
+            for (i, b) in bindings.into_iter().enumerate() {
                 if !matches!(self.resolve(b.1, pos)?, Var::Global) {
                     kept.push(b);
+                    nlex += (i < lexical) as i32;
                 }
             }
             kept.truncate(120);
+            let nlex = nlex.min(kept.len() as i32);
             if kept.is_empty() {
                 self.intrinsic("direct_eval", fr, 7);
                 self.temp = mark;
@@ -4084,6 +4091,9 @@ impl<'a> Gen<'a> {
             let scope = self.alloc(pos)?;
             let m2 = self.temp;
             self.mov(env, scope);
+            let n = self.alloc(pos)?;
+            self.emit(Op::LdaSmi, &[Arg::Imm(nlex)]);
+            self.star(n);
             for (o, v, _) in &kept {
                 let k = self.alloc(pos)?;
                 self.string(o);
@@ -4092,7 +4102,7 @@ impl<'a> Gen<'a> {
                 self.load_raw(v, pos)?;
                 self.star(r);
             }
-            self.intrinsic("eval_scope", scope, (1 + 2 * kept.len()) as u8);
+            self.intrinsic("eval_scope", scope, (2 + 2 * kept.len()) as u8);
             self.star(scope);
             self.temp = m2;
             self.mov(scope, env);
@@ -4108,15 +4118,18 @@ impl<'a> Gen<'a> {
                 self.mov(scope, s);
                 let d = self.alloc(pos)?;
                 self.mov(decl, d);
+                let n = self.alloc(pos)?;
+                self.emit(Op::LdaSmi, &[Arg::Imm(nlex)]);
+                self.star(n);
                 for (o, ..) in &kept {
                     let k = self.alloc(pos)?;
                     self.string(o);
                     self.star(k);
                 }
-                self.intrinsic("eval_scope_flush", s, (2 + kept.len()) as u8);
+                self.intrinsic("eval_scope_flush", s, (3 + kept.len()) as u8);
                 self.temp = m3;
             }
-            for (o, v, constant) in &kept {
+            for (i, (o, v, constant)) in kept.iter().enumerate() {
                 if *constant {
                     continue;
                 }
@@ -4129,7 +4142,14 @@ impl<'a> Gen<'a> {
                 let cur = self.alloc(pos)?;
                 self.load_raw(v, pos)?;
                 self.star(cur);
-                self.intrinsic("eval_scope_get", s, 3);
+                let d = self.alloc(pos)?;
+                if (i as i32) < nlex {
+                    self.emit(Op::LdaUndefined, &[]);
+                    self.star(d);
+                } else {
+                    self.mov(decl, d);
+                }
+                self.intrinsic("eval_scope_get", s, 4);
                 // (The binding itself, not a `var` of the `eval`'s by its
                 // name, which a function's lookups would find first.)
                 let withs = std::mem::take(&mut self.withs);

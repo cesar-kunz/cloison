@@ -2257,13 +2257,14 @@ macro_rules! jump_to_boolean {
             slow!(s)
         }; |s| {
             // Without the runtime: `undefined`, `null`, doubles and
-            // objects (cells but strings, class 4: an empty one is false).
+            // objects (cells but strings, class 4: an empty one is false;
+            // and BigInts, class 23: 0n is).
             let b = if s.acc == Value::UNDEFINED || s.acc == Value::NULL {
                 false
             } else if s.acc.to_bits() & s.tag.to_bits() != 0 {
                 let d = s.tag.decode_f64(s.acc);
                 d < 0.0 || d > 0.0
-            } else if is_cell(s.tag, s.acc) && *(s.acc.to_bits() as *const u8).add(8) != 4 {
+            } else if is_cell(s.tag, s.acc) && !matches!(*(s.acc.to_bits() as *const u8).add(8), 4 | 23) {
                 true
             } else {
                 rt_to_boolean!(s, s.acc)
@@ -2451,8 +2452,10 @@ unsafe fn loose_eq_fast(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
     if nullish(l) || nullish(r) {
         return Some(nullish(l) && nullish(r));
     }
-    let string = |v: Value| unsafe { *(v.to_bits() as *const u8).add(8) } == 4;
-    if is_cell(tag, l) && is_cell(tag, r) && !(string(l) && string(r)) {
+    // Two objects are equal only if the same; a primitive cell (a string,
+    // class 4; a symbol, 9; a BigInt, 23) may equal another value.
+    let object = |v: Value| unsafe { !matches!(*(v.to_bits() as *const u8).add(8), 4 | 9 | 23) };
+    if is_cell(tag, l) && is_cell(tag, r) && object(l) && object(r) {
         return Some(false);
     }
     None

@@ -83,6 +83,7 @@
 //! caller's `regs`. Neither touches the native stack, so JS recursion
 //! depth is bounded by the VM stack, not Rust's.
 
+use crate::bigint::BinOp as BigOp;
 use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Object, as_object, object_value};
@@ -386,6 +387,15 @@ handlers! {
         tail!(slow_inc, acc)
     }
 
+    fn op_dec(pc, acc, regs, tag) {
+        if tag.is_int32(acc)
+            && let Some(n) = acc.as_i32_unchecked().checked_sub(1)
+        {
+            next_int!(Op::Dec.size(), n)
+        }
+        tail!(slow_dec, acc)
+    }
+
     fn op_jump_if_less(pc, acc, regs, tag) {
         let rhs = *reg(pc, 1, regs);
         if !tag.both_int32(acc, rhs) {
@@ -540,6 +550,14 @@ handlers! {
         next!(i32, Op::Inc.size(), unboxed(n))
     }
 
+    fn i32_dec(pc, acc, regs, tag) {
+        let (n, overflow) = raw_i32(acc).overflowing_sub(1);
+        if overflow {
+            tail!(slow_dec, tag.rebox(unboxed(n.wrapping_add(1))))
+        }
+        next!(i32, Op::Dec.size(), unboxed(n))
+    }
+
     fn i32_jump_if_less(pc, acc, regs, tag) {
         let rhs = *reg(pc, 1, regs);
         if !tag.is_int32(rhs) {
@@ -627,9 +645,32 @@ handlers! {
     fn slow_inc(pc, acc, regs, tag) {
         acc = match acc.as_number() {
             Some(a) => Value::from_f64_arith(a + 1.0),
-            None => conv!(generic_inc(acc)),
+            None => conv!(generic_inc(acc, 1)),
         };
         next!(any, Op::Inc.size(), acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_dec(pc, acc, regs, tag) {
+        acc = match acc.as_number() {
+            Some(a) => Value::from_f64_arith(a - 1.0),
+            None => conv!(generic_inc(acc, -1)),
+        };
+        next!(any, Op::Dec.size(), acc)
+    }
+
+    // `r OP acc` for `%` and the bitwise operators, or `OP acc` (`-`, `~`,
+    // ToNumeric), where an operand is a cell: maybe a BigInt.
+    #[cold]
+    #[inline(never)]
+    fn slow_numeric(pc, acc, regs, tag) {
+        let op = std::mem::transmute::<u8, Op>(*pc);
+        let v = match op {
+            Op::Negate | Op::BitNot | Op::ToNumeric => conv!(generic_unary(op, acc)),
+            _ => conv!(generic_bitwise(op, *reg(pc, 1, regs), acc)),
+        };
+        next!(any, op.size(), v)
     }
 
     #[cold]
@@ -1190,36 +1231,62 @@ handlers! {
         let (a, b) = (*reg(pc, 1, regs), acc);
         let r = if tag.both_int32(a, b) && b.as_i32_unchecked() > 0 && a.as_i32_unchecked() >= 0 {
             Value::from_i32(a.as_i32_unchecked() % b.as_i32_unchecked())
+        } else if a.is_cell() || b.is_cell() {
+            tail!(slow_numeric, acc)
         } else {
-            Value::from_f64_arith(conv_if!((a, b), to_number(a) % to_number(b)))
+            Value::from_f64_arith(to_number(a) % to_number(b))
         };
         next!(any, Op::Mod.size(), r)
     }
 
     fn op_bit_and(pc, acc, regs, tag) {
-        next_int!(Op::BitAnd.size(), conv_if!((*reg(pc, 1, regs), acc), int32_of(*reg(pc, 1, regs)) & int32_of(acc)))
+        let a = *reg(pc, 1, regs);
+        if a.is_cell() || acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        next_int!(Op::BitAnd.size(), int32_of(a) & int32_of(acc))
     }
 
     fn op_bit_or(pc, acc, regs, tag) {
-        next_int!(Op::BitOr.size(), conv_if!((*reg(pc, 1, regs), acc), int32_of(*reg(pc, 1, regs)) | int32_of(acc)))
+        let a = *reg(pc, 1, regs);
+        if a.is_cell() || acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        next_int!(Op::BitOr.size(), int32_of(a) | int32_of(acc))
     }
 
     fn op_bit_xor(pc, acc, regs, tag) {
-        next_int!(Op::BitXor.size(), conv_if!((*reg(pc, 1, regs), acc), int32_of(*reg(pc, 1, regs)) ^ int32_of(acc)))
+        let a = *reg(pc, 1, regs);
+        if a.is_cell() || acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        next_int!(Op::BitXor.size(), int32_of(a) ^ int32_of(acc))
     }
 
     fn op_shift_left(pc, acc, regs, tag) {
-        let (l, n) = conv_if!((*reg(pc, 1, regs), acc), (int32_of(*reg(pc, 1, regs)), int32_of(acc) as u32 & 31));
+        let a = *reg(pc, 1, regs);
+        if a.is_cell() || acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        let (l, n) = (int32_of(a), int32_of(acc) as u32 & 31);
         next_int!(Op::ShiftLeft.size(), l.wrapping_shl(n))
     }
 
     fn op_shift_right(pc, acc, regs, tag) {
-        let (l, n) = conv_if!((*reg(pc, 1, regs), acc), (int32_of(*reg(pc, 1, regs)), int32_of(acc) as u32 & 31));
+        let a = *reg(pc, 1, regs);
+        if a.is_cell() || acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        let (l, n) = (int32_of(a), int32_of(acc) as u32 & 31);
         next_int!(Op::ShiftRight.size(), l >> n)
     }
 
     fn op_shift_right_logical(pc, acc, regs, tag) {
-        let (l, n) = conv_if!((*reg(pc, 1, regs), acc), (int32_of(*reg(pc, 1, regs)), int32_of(acc) as u32 & 31));
+        let a = *reg(pc, 1, regs);
+        if a.is_cell() || acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        let (l, n) = (int32_of(a), int32_of(acc) as u32 & 31);
         let r = (l as u32) >> n;
         next!(any, Op::ShiftRightLogical.size(), Value::number(r as f64))
     }
@@ -1236,11 +1303,24 @@ handlers! {
         if tag.is_int32(acc) && acc.as_i32_unchecked() != 0 && acc.as_i32_unchecked() != i32::MIN {
             next_int!(Op::Negate.size(), -acc.as_i32_unchecked())
         }
-        next!(any, Op::Negate.size(), Value::from_f64(-conv_if!((acc), to_number(acc))))
+        if acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        next!(any, Op::Negate.size(), Value::from_f64(-to_number(acc)))
     }
 
     fn op_bit_not(pc, acc, regs, tag) {
-        next_int!(Op::BitNot.size(), !conv_if!((acc), int32_of(acc)))
+        if acc.is_cell() {
+            tail!(slow_numeric, acc)
+        }
+        next_int!(Op::BitNot.size(), !int32_of(acc))
+    }
+
+    fn op_to_numeric(pc, acc, regs, tag) {
+        if !acc.is_cell() {
+            next!(any, Op::ToNumeric.size(), Value::number(to_number(acc)))
+        }
+        tail!(slow_numeric, acc)
     }
 
     fn op_type_of(pc, acc, regs, tag) {
@@ -1682,7 +1762,10 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(key) && acc.is_number() {
             let o = as_object(obj);
             let i = key.as_i32_unchecked() as u32;
-            if (*o).class == Class::TypedArray && i < (*o).elems_len {
+            if (*o).class == Class::TypedArray
+                && i < (*o).elems_len
+                && !crate::object::TypedKind::from_u8((*o).kind).is_big()
+            {
                 crate::vm::note_bytes(ic_at(regs, pc, 3), o);
                 let kind = crate::object::TypedKind::from_u8((*o).kind);
                 if tag.is_int32(acc) {
@@ -1902,9 +1985,88 @@ handlers! {
 pub(crate) fn generic_arith(op: Op, a: Value, b: Value) -> Value {
     let (x, y) = match both_numbers(a, b) {
         Some(p) => p,
+        None if a.is_cell() || b.is_cell() => {
+            let (p, q) = (to_numeric(a), to_numeric(b));
+            if is_bigint(p) || is_bigint(q) {
+                let op = match op {
+                    Op::Sub | Op::SubSmi => BigOp::Sub,
+                    Op::Mul | Op::MulSmi => BigOp::Mul,
+                    _ => BigOp::Div,
+                };
+                return crate::bigint::binary(op, p, q);
+            }
+            (p.to_number(), q.to_number())
+        }
         None => (to_number(a), to_number(b)),
     };
     Value::from_f64_arith(arith_f64(op, x, y))
+}
+
+/// ToNumeric: a number, or a BigInt (an object's primitive's).
+pub(crate) fn to_numeric(v: Value) -> Value {
+    if !v.is_cell() {
+        return Value::number(v.to_number());
+    }
+    let p = to_primitive(v);
+    if is_bigint(p) { p } else { Value::number(to_number(p)) }
+}
+
+fn is_bigint(v: Value) -> bool {
+    crate::bigint::is_bigint(v)
+}
+
+/// `a OP b` for `%` and the bitwise operators (`Mod`, `BitAnd`, …, as
+/// their `…Smi` forms), where either may be a BigInt.
+#[cold]
+#[inline(never)]
+pub(crate) fn generic_bitwise(op: Op, a: Value, b: Value) -> Value {
+    let (p, q) = (to_numeric(a), to_numeric(b));
+    if is_bigint(p) || is_bigint(q) {
+        let op = match op {
+            Op::Mod => BigOp::Mod,
+            Op::BitAnd => BigOp::And,
+            Op::BitOr => BigOp::Or,
+            Op::BitXor => BigOp::Xor,
+            Op::ShiftLeft => BigOp::Shl,
+            Op::ShiftRight => BigOp::Sar,
+            _ => BigOp::Shr,
+        };
+        return crate::bigint::binary(op, p, q);
+    }
+    let (x, y) = (p.to_number(), q.to_number());
+    let (l, n) = (to_int32(x), to_int32(y));
+    match op {
+        Op::Mod => Value::from_f64_arith(x % y),
+        Op::BitAnd => Value::from_i32(l & n),
+        Op::BitOr => Value::from_i32(l | n),
+        Op::BitXor => Value::from_i32(l ^ n),
+        Op::ShiftLeft => Value::from_i32(l.wrapping_shl(n as u32 & 31)),
+        Op::ShiftRight => Value::from_i32(l >> (n as u32 & 31)),
+        _ => Value::number(((l as u32) >> (n as u32 & 31)) as f64),
+    }
+}
+
+/// `-v`, `~v` or ToNumeric(v) (`Negate`, `BitNot`, `ToNumeric`).
+#[cold]
+#[inline(never)]
+pub(crate) fn generic_unary(op: Op, v: Value) -> Value {
+    let p = to_numeric(v);
+    if is_bigint(p) {
+        return match op {
+            Op::Negate => crate::bigint::negate(p),
+            Op::BitNot => crate::bigint::bit_not(p),
+            _ => {
+                // (Nothing to allocate: as compiled code's.)
+                p
+            }
+        };
+    }
+    let x = p.to_number();
+    match op {
+        Op::Negate => Value::from_f64(-x),
+        Op::BitNot => Value::from_i32(!to_int32(x)),
+        _ => Value::number(x),
+    }
 }
 
 /// `x OP y` for `Sub`, `Mul`, `Div` (or their `…Smi` forms).
@@ -1951,6 +2113,9 @@ pub(crate) fn generic_compare_ordered(le: bool, a: Value, b: Value, b_first: boo
             if let (Some(p), Some(q)) = (string_units(a), string_units(b)) {
                 return if le { p <= q } else { p < q };
             }
+            if is_bigint(a) || is_bigint(b) {
+                return crate::bigint::less(a, b, le);
+            }
             if b_first {
                 let y = to_number(b);
                 return if le { to_number(a) <= y } else { to_number(a) < y };
@@ -1966,7 +2131,14 @@ pub(crate) fn strict_equals(a: Value, b: Value) -> bool {
     if let Some((x, y)) = both_numbers(a, b) {
         return x == y;
     }
-    strings_equal(a, b).unwrap_or(a == b)
+    strings_equal(a, b).unwrap_or_else(|| a == b || a.is_cell() && b.is_cell() && bigints_equal(a, b))
+}
+
+/// Whether `a` and `b` are BigInts of the same value.
+#[cold]
+#[inline(never)]
+pub(crate) fn bigints_equal(a: Value, b: Value) -> bool {
+    is_bigint(a) && is_bigint(b) && crate::bigint::equal(a, b)
 }
 
 /// Whether two strings are equal, if both are strings: the same cell, or
@@ -2254,8 +2426,10 @@ fn strict_fast(tag: NumberTag, a: Value, b: Value) -> Option<bool> {
     if a == b {
         return Some(true);
     }
-    // Two cells are equal only as strings.
-    if a.is_cell() && b.is_cell() && is_string(a) && is_string(b) {
+    // Two cells are equal only as strings or BigInts.
+    if a.is_cell() && b.is_cell() && unsafe { (*as_object(a)).class == (*as_object(b)).class }
+        && matches!(unsafe { (*as_object(a)).class }, Class::String | Class::BigInt)
+    {
         return None;
     }
     Some(false)
@@ -2654,6 +2828,9 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
         units.extend(to_string_units(b));
         return unsafe { (*current_vm()).new_string(&units) };
     }
+    if is_bigint(a) || is_bigint(b) {
+        return crate::bigint::binary(BigOp::Add, a, b);
+    }
     Value::number(to_number(a) + to_number(b))
 }
 
@@ -2860,11 +3037,15 @@ fn concat(p: Piece, q: Piece) -> Value {
     }
 }
 
-/// `a + 1` where `a` is not a number.
+/// `a + d` (`++`, `--`: `d` is 1 or -1) where `a` is not a number.
 #[cold]
 #[inline(never)]
-pub(crate) fn generic_inc(a: Value) -> Value {
-    Value::number(to_number(a) + 1.0)
+pub(crate) fn generic_inc(a: Value, d: i32) -> Value {
+    let p = to_numeric(a);
+    if is_bigint(p) {
+        return crate::bigint::inc(p, d as i64);
+    }
+    Value::number(p.to_number() + d as f64)
 }
 
 /// `a < b` (IsLessThan) where at least one side is not a number.
@@ -2881,8 +3062,8 @@ pub(crate) fn to_boolean(v: Value) -> bool {
     } else if let Some(u) = string_units(v) {
         !u.is_empty()
     } else {
-        // Objects are truthy; there are no BigInts yet.
-        v == Value::TRUE || v.is_cell()
+        // Objects are truthy, BigInts but 0n.
+        v == Value::TRUE || v.is_cell() && !(is_bigint(v) && unsafe { (*as_object(v)).elems_len } == 0)
     }
 }
 
@@ -2922,6 +3103,13 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
     let nullish = |v: Value| v.is_null() || v.is_undefined();
     if nullish(a) || nullish(b) {
         return Ok(nullish(a) && nullish(b));
+    }
+    if is_bigint(a) || is_bigint(b) {
+        let (x, y) = if is_bigint(a) { (a, b) } else { (b, a) };
+        if crate::props::is_object(y) {
+            return loose_equals(x, to_primitive_default(y));
+        }
+        return Ok(crate::bigint::loose_equal(x, y));
     }
     if a.is_bool() {
         return loose_equals(Value::from_i32((a == Value::TRUE) as i32), b);
@@ -3000,7 +3188,7 @@ const DEFAULT: u8 = 2;
 /// operation to be redone where it can. Conversions can't fail: what one
 /// throws is left in `Vm::conv_error` for the operation to throw.
 fn to_primitive_hint(v: Value, hint: u8) -> Value {
-    if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) {
+    if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) || is_bigint(v) {
         return v;
     }
     unsafe {
@@ -3026,7 +3214,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 let name = ["number", "string", "default"][hint as usize];
                 let h = vm.new_string(&name.encode_utf16().collect::<Vec<u16>>());
                 return match call_function(vm, m, v, &[h]) {
-                    Ok(r) if !r.is_cell() || is_string(r) || crate::symbol::is_symbol(r) => r,
+                    Ok(r) if !crate::props::is_object(r) => r,
                     Ok(_) => fail(vm, Error::type_error("Cannot convert object to primitive value")),
                     Err(e) => fail(vm, e),
                 };
@@ -3063,7 +3251,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 _ => continue,
             };
             match r {
-                Ok(r) if !r.is_cell() || is_string(r) => return r,
+                Ok(r) if !crate::props::is_object(r) => return r,
                 Ok(_) => {}
                 Err(e) => {
                     vm.conv_error.get_or_insert(e);
@@ -3102,6 +3290,9 @@ pub(crate) fn to_string_units(v: Value) -> Vec<u16> {
     if crate::symbol::is_symbol(v) {
         symbol_conversion("string");
         return Vec::new();
+    }
+    if is_bigint(v) {
+        return crate::bigint::to_string(v).encode_utf16().collect();
     }
     if v.is_cell() {
         return to_string_units(to_primitive_hint(v, STRING));
@@ -3145,6 +3336,18 @@ pub(crate) fn to_number(v: Value) -> f64 {
     }
     if crate::symbol::is_symbol(v) {
         symbol_conversion("number");
+        return f64::NAN;
+    }
+    if is_bigint(v) {
+        // (Compiled code's runtime calls leave the instruction to the
+        // interpreter, whose BigInt cases are before ToNumber.)
+        if !crate::bigint::redo() {
+            unsafe {
+                let vm = &mut *current_vm();
+                vm.conv_error.get_or_insert_with(|| Error::type_error("Cannot convert a BigInt value to a number"));
+                vm.conv_thrown = true;
+            }
+        }
         return f64::NAN;
     }
     if let Some(t) = crate::date::date_value(v) {
@@ -3228,6 +3431,8 @@ static TABLE: Table = {
     t[Op::Star as usize] = op_star;
     t[Op::Add as usize] = op_add;
     t[Op::Inc as usize] = op_inc;
+    t[Op::Dec as usize] = op_dec;
+    t[Op::ToNumeric as usize] = op_to_numeric;
     t[Op::JumpIfLess as usize] = op_jump_if_less;
     t[Op::Jump as usize] = op_jump;
     t[Op::AddSmi as usize] = op_add_smi;
@@ -3361,6 +3566,7 @@ static TABLE_I32: Table = {
     t[Op::Star as usize] = i32_star;
     t[Op::Add as usize] = i32_add;
     t[Op::Inc as usize] = i32_inc;
+    t[Op::Dec as usize] = i32_dec;
     t[Op::JumpIfLess as usize] = i32_jump_if_less;
     t[Op::Jump as usize] = i32_jump;
     t[Op::AddSmi as usize] = i32_add_smi;

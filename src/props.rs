@@ -112,7 +112,7 @@ pub(crate) fn is_callable(v: Value) -> bool {
 
 /// Whether `v` is an object (not a primitive: strings are cells too).
 pub(crate) fn is_object(v: Value) -> bool {
-    v.is_cell() && !matches!(unsafe { (*as_object(v)).class }, Class::String | Class::Symbol)
+    v.is_cell() && !matches!(unsafe { (*as_object(v)).class }, Class::String | Class::Symbol | Class::BigInt)
 }
 
 /// The canonical array index `name` is, if any.
@@ -573,7 +573,8 @@ impl Vm {
                                 return Ok(false);
                             }
                             let kind = crate::object::TypedKind::from_u8((*o).kind);
-                            kind.store((*o).elems.cast(), i as usize, to_number(full.value.unwrap()));
+                            let v = crate::builtins::to_element(self, kind, full.value.unwrap())?;
+                            kind.store_value((*o).elems.cast(), i as usize, v);
                             return Ok(true);
                         }
                         _ => {}

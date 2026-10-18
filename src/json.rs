@@ -111,7 +111,7 @@ fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mut Vec<u16>) -> Result<bool> {
     check_native_stack(vm)?;
     let mut v = vm.get_keyed(holder, key)?;
-    if is_object(v) {
+    if is_object(v) || crate::bigint::is_bigint(v) {
         let f = vm.get(v, st.a_to_json)?;
         if is_callable(f) {
             v = call_function(vm, f, v, &[key])?;
@@ -146,6 +146,9 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     if let Some(d) = v.as_number() {
         push(out, &if d.is_finite() { crate::vm::display(v) } else { "null".into() });
         return Ok(true);
+    }
+    if crate::bigint::is_bigint(v) {
+        return Err(Error::type_error("Do not know how to serialize a BigInt"));
     }
     if !is_object(v) || is_callable(v) {
         return Ok(false);

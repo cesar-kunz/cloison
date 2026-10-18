@@ -4587,6 +4587,37 @@ res.join(" ");"##;
     );
 }
 
+/// Private names written with escapes or non-ASCII letters: the same
+/// names as written plainly (`#\u{6F}` is `#o`); an escape that isn't an
+/// identifier character is a SyntaxError.
+#[test]
+fn private_names_with_escapes() {
+    let src = r##"
+var r = [];
+class C {
+  #\u{6F} = 1; #℘ = 2; #ZW_‌_NJ = 3; #$ = 4; #yield = 5;
+  static #\u{6F}m() { return "s"; }
+  get() { return [this.#o, this.#℘, this.#ZW_‌_NJ, this.#$, this.#yield, C.#om(), #\u{6F} in this].join(); }
+}
+r.push(new C().get());
+try { eval("class D { #\\u0030x }"); r.push("no"); } catch (e) { r.push(e.name); }
+try { eval("class D { #a\\u0020 }"); r.push("no"); } catch (e) { r.push(e.name); }
+r.join(" | ");"##;
+    assert_eq!(value(src), "1,2,3,4,5,s,true | SyntaxError | SyntaxError");
+}
+
+/// A hashbang comment, first thing in a script or `eval`'s code only.
+#[test]
+fn hashbang_comments() {
+    assert_eq!(value("#!/usr/bin/env cloison\n1 + 1"), "2");
+    let src = r##"
+var r = [eval("#!x\n3"), eval("#!\u2028 4")];
+for (var s of [" #!\n1", "1\n#!\n", "\\u0023!\n1"]) { try { eval(s); r.push("no"); } catch (e) { r.push(e.name); } }
+try { Function("#!\n"); r.push("no"); } catch (e) { r.push(e.name); }
+r.join();"##;
+    assert_eq!(value(src), "3,4,SyntaxError,SyntaxError,SyntaxError,SyntaxError");
+}
+
 /// Class fields (computed, static), private fields, methods and
 /// accessors (static too, with brand checks and `#x in o`), and static
 /// blocks, in the order the spec defines.

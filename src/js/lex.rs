@@ -172,6 +172,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     // The tokens of the `(`s open, and of the last one closed.
     let mut parens: Vec<usize> = Vec::new();
     let mut closed_paren = usize::MAX;
+    // A hashbang comment (`#!…`), first thing in the source only: to the
+    // end of its line.
+    if src.starts_with("#!") {
+        i = src.find(['\n', '\r', '\u{2028}', '\u{2029}']).unwrap_or(src.len());
+    }
     while i < b.len() {
         let c = b[i];
         let start = i;
@@ -263,17 +268,26 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 i += n;
                 Tok::RegExp(Box::new((pattern, flags)))
             } else if c == b'#'
-                && src[i + 1..].chars().next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '$' || !ch.is_ascii() && is_ident_start(ch))
+                && src[i + 1..].chars().next().is_some_and(|ch| {
+                    ch.is_ascii_alphabetic() || ch == '_' || ch == '$' || ch == '\\' || !ch.is_ascii() && is_ident_start(ch)
+                })
             {
                 // A private name (`#x`): an identifier its `#` begins,
-                // never a keyword.
+                // never a keyword (its escapes decoded: `#\u{6F}` is `#o`).
                 let n = 1 + src[i + 1..]
                     .char_indices()
                     .find(|&(_, ch)| !is_ident_part(ch))
                     .map_or(src.len() - i - 1, |(n, _)| n);
-                let word = &src[i..i + n];
-                i += n;
-                Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone())
+                if b.get(i + n) == Some(&b'\\') {
+                    let (word, m) = escaped_ident(&src[i + 1..]).ok_or_else(|| err("bad escape in identifier"))?;
+                    i += 1 + m;
+                    let w: &str = format!("#{word}").leak();
+                    Tok::Ident(names.entry(w).or_insert_with(|| w.into()).clone())
+                } else {
+                    let word = &src[i..i + n];
+                    i += n;
+                    Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone())
+                }
             } else if is_ascii_ident_part(c) || c >= 0x80 && src[i..].chars().next().is_some_and(is_ident_start) {
                 // ASCII a byte at a time, past it a character at a time.
                 let mut n = 1 + b[i + 1..].iter().take_while(|&&x| is_ascii_ident_part(x)).count();

@@ -460,6 +460,26 @@ fn eval_scope(p: &Program, i: usize) -> Option<usize> {
     None
 }
 
+/// The variables of the functions enclosing function `i` (not the
+/// script's, which are globals) a direct `eval` in it sees beyond its
+/// own: their parameters, `var`s and functions, innermost first, none an
+/// inner one's shadows. (Their block-scoped ones the parser lists where
+/// the `eval` is: see `Parser::eval_visible`.)
+fn eval_outer_names<'a>(p: &'a Program, decls: &[Decls<'a>], i: usize) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut j = p.functions[i].parent;
+    while let Some(k) = j.filter(|&k| k != 0) {
+        for &n in &decls[k].list {
+            if n.contains('%') || n == "arguments" || p.lexicals.contains_key(n) || decls[i].contains(&n) || out.contains(&n) {
+                continue;
+            }
+            out.push(n);
+        }
+        j = p.functions[k].parent;
+    }
+    out
+}
+
 /// `vm::Code::kind` for `f`.
 fn function_kind(f: &Function) -> u8 {
     if f.is_async && f.generator {
@@ -506,6 +526,10 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
     let (mut upvalues, mut captured) = (vec![Vec::new(); n], vec![Vec::new(); n]);
     for i in 1..n {
         let mut refs = references(&p.functions[i]);
+        // (What a direct `eval` in it sees of the enclosing functions'.)
+        if p.functions[i].has_eval {
+            refs.extend(eval_outer_names(p, decls, i));
+        }
         // (In a direct `eval`'s function: its scope object, and an arrow's
         // `this` for the `eval`.)
         if eval_scope(p, i).is_some_and(|k| k != i) {
@@ -1174,6 +1198,8 @@ fn assigns(e: &Expr, name: &str) -> bool {
         Update(t, ..) => matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name),
         Num(_) | Str(_) | Bool(_) | Null | Ident(_) | This | Function(_) | Accessor(..) | RegExp(..) | Hole
         | TemplateObject(_) => false,
+        // (A direct `eval` may assign the bindings it sees.)
+        Intrinsic("%eval_scope", es) => es.iter().any(|e| matches!(&e.kind, Ident(n) if &**n == name)),
         Array(es) | Template(_, es) | Intrinsic(_, es) | SuperCall(_, es) => es.iter().any(|e| assigns(e, name)),
         Class(c) => {
             c.heritage.as_ref().is_some_and(|e| assigns(e, name))
@@ -2858,12 +2884,20 @@ impl<'a> Gen<'a> {
     /// `name op= v` inside `with` statements: the reference resolved once,
     /// read and written in the object that has `name`.
     fn with_compound(&mut self, name: &str, op: BinOp, v: &Expr, pos: Pos) -> R<()> {
+        // (`v` is evaluated inside all the `with`s, wherever `name` is.)
+        let full = self.withs.clone();
+        let apply = |g: &mut Self| -> R<()> {
+            let inner = std::mem::replace(&mut g.withs, full.clone());
+            let r = g.apply(op, v, pos);
+            g.withs = inner;
+            r
+        };
         let end = self.with_lookup(
             name,
             pos,
             &mut |g, r| {
                 g.named(Op::GetNamed, r, original(name));
-                g.apply(op, v, pos)?;
+                apply(g)?;
                 if g.f.strict {
                     // (Strict code: the property gone meanwhile is an error.)
                     let m = g.temp;
@@ -2888,7 +2922,7 @@ impl<'a> Gen<'a> {
                     kind: ExprKind::Ident(name.into()),
                     pos,
                 })?;
-                g.apply(op, v, pos)?;
+                apply(g)?;
                 g.store_var(name, pos)
             },
         )?;
@@ -3969,7 +4003,16 @@ impl<'a> Gen<'a> {
             && (self.index != 0 || self.p.direct_eval)
             && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)))
         {
-            // Direct `eval`: `[eval, source, scope object, this, strict]`.
+            // Direct `eval`: `[eval, source, scope object, this, strict,
+            // in parameters, scope for its declarations]`. The scope object
+            // it looks names up in: the function's (with its parameters and
+            // `var`s), under one of the other bindings it sees (block-scoped
+            // ones, enclosing functions' variables), whose values those
+            // bindings take back after.
+            let (args, visible): (&[Expr], &[Expr]) = match args.split_last() {
+                Some((Expr { kind: ExprKind::Intrinsic("%eval_scope", v), .. }, rest)) => (rest, v),
+                _ => (args, &[]),
+            };
             let mark = self.temp;
             let fr = self.alloc(pos)?;
             self.into(f, fr)?;
@@ -4008,7 +4051,91 @@ impl<'a> Gen<'a> {
             let restricted = self.in_params && (!self.f.arrow || self.f.params.iter().any(|p| &**p == "arguments"));
             self.emit(if restricted { Op::LdaTrue } else { Op::LdaFalse }, &[]);
             self.star(params);
-            self.intrinsic("direct_eval", fr, 6);
+            let decl = self.alloc(pos)?;
+            self.mov(env, decl);
+            // The bindings: the parser's, then the enclosing functions'
+            // variables none of those shadows (none with no variable here).
+            let mut bindings: Vec<(&str, &str, bool)> = visible
+                .chunks(3)
+                .filter_map(|t| match (&t[0].kind, &t[1].kind, &t[2].kind) {
+                    (ExprKind::Str(o), ExprKind::Ident(v), ExprKind::Bool(c)) => Some((o.as_str(), &**v, *c)),
+                    _ => None,
+                })
+                .collect();
+            for n in eval_outer_names(self.p, self.decls, self.index) {
+                if !bindings.iter().any(|(o, ..)| *o == n) {
+                    bindings.push((n, n, false));
+                }
+            }
+            // (Its code's `new.target`: see `Parser::new_expr`.)
+            if self.f.uses_new_target || self.f.arrow {
+                bindings.push(("%newtarget", "%newtarget", true));
+            }
+            let mut kept = Vec::new();
+            for b in bindings {
+                if !matches!(self.resolve(b.1, pos)?, Var::Global) {
+                    kept.push(b);
+                }
+            }
+            kept.truncate(120);
+            if kept.is_empty() {
+                self.intrinsic("direct_eval", fr, 7);
+                self.temp = mark;
+                return Ok(());
+            }
+            let scope = self.alloc(pos)?;
+            let m2 = self.temp;
+            self.mov(env, scope);
+            for (o, v, _) in &kept {
+                let k = self.alloc(pos)?;
+                self.string(o);
+                self.star(k);
+                let r = self.alloc(pos)?;
+                self.load_raw(v, pos)?;
+                self.star(r);
+            }
+            self.intrinsic("eval_scope", scope, (1 + 2 * kept.len()) as u8);
+            self.star(scope);
+            self.temp = m2;
+            self.mov(scope, env);
+            self.intrinsic("direct_eval", fr, 7);
+            let result = self.alloc(pos)?;
+            self.star(result);
+            // What it stored in the scope object but to the bindings (the
+            // function's `var`s it assigned, the ones it declared) goes on
+            // to the function's.
+            {
+                let m3 = self.temp;
+                let s = self.alloc(pos)?;
+                self.mov(scope, s);
+                let d = self.alloc(pos)?;
+                self.mov(decl, d);
+                for (o, ..) in &kept {
+                    let k = self.alloc(pos)?;
+                    self.string(o);
+                    self.star(k);
+                }
+                self.intrinsic("eval_scope_flush", s, (2 + kept.len()) as u8);
+                self.temp = m3;
+            }
+            for (o, v, constant) in &kept {
+                if *constant {
+                    continue;
+                }
+                let m3 = self.temp;
+                let s = self.alloc(pos)?;
+                self.mov(scope, s);
+                let k = self.alloc(pos)?;
+                self.string(o);
+                self.star(k);
+                let cur = self.alloc(pos)?;
+                self.load_raw(v, pos)?;
+                self.star(cur);
+                self.intrinsic("eval_scope_get", s, 3);
+                self.store_raw(v, pos)?;
+                self.temp = m3;
+            }
+            self.ldar(result);
             self.temp = mark;
             return Ok(());
         }

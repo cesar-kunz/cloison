@@ -85,6 +85,7 @@ fn parse_pass<'a, 'p>(
         privates: Vec::new(),
         super_fns: Vec::new(),
         redeclared: None,
+        in_eval: eval.is_some(),
         param_names: Vec::new(),
         home_uses: 0,
         pending_home: None,
@@ -239,6 +240,8 @@ struct Parser<'t, 'a, 'p> {
     super_fns: Vec<(Name, usize)>,
     /// Each function's parameters' names (destructured ones' too).
     param_names: Vec<(usize, Vec<Name>)>,
+    /// Direct `eval`'s code (whose `new.target` is its caller's).
+    in_eval: bool,
     /// A redeclaration found (an early error, reported once parsed).
     redeclared: Option<(Pos, String)>,
     /// `super` property references so far.
@@ -2044,14 +2047,28 @@ impl<'a> Parser<'_, 'a, '_> {
                 return self.err("a tagged template in an optional chain");
             } else if self.eat("(") {
                 let args = self.arguments()?;
+                let mut args = args;
                 if matches!(&e.kind, ExprKind::Ident(n) if &**n == "eval") {
                     // A direct `eval` (see `Function::has_eval`), which may
                     // read `arguments`.
                     self.functions[self.current].has_eval = true;
                     let k = self.non_arrow();
                     self.functions[k].uses_arguments = true;
+                    // (Its code may read `new.target`.)
+                    if k != 0 {
+                        self.functions[k].uses_new_target = true;
+                    }
                     if self.functions[self.current].arrow {
                         self.functions[k].uses_this = true;
+                    }
+                    // The block-scoped bindings it sees, for its scope
+                    // object (see `Gen::call`): a last argument the
+                    // direct `eval`'s code takes apart.
+                    if self.current != 0 && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
+                        let visible = self.eval_visible(pos);
+                        if !visible.is_empty() {
+                            args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
+                        }
                     }
                 }
                 e = Expr {
@@ -2105,10 +2122,14 @@ impl<'a> Parser<'_, 'a, '_> {
             self.advance();
             self.advance();
             let k = self.non_arrow();
-            if k == 0 {
+            if k == 0 && !self.in_eval {
                 return self.err("`new.target` outside a function");
             }
-            self.functions[k].uses_new_target = true;
+            // (In direct `eval`'s code, its caller's: a binding of its
+            // scope object, see `Gen::call`.)
+            if k != 0 {
+                self.functions[k].uses_new_target = true;
+            }
             let mut e = Expr {
                 kind: ExprKind::Ident("%newtarget".into()),
                 pos,
@@ -2641,6 +2662,33 @@ impl<'a> Parser<'_, 'a, '_> {
             return self.err(format!("`{name}` has already been declared"));
         }
         Ok(())
+    }
+
+    /// The block-scoped bindings (and catch parameters) a direct `eval`
+    /// here sees, innermost first, as triples: the name, the binding (a
+    /// variable), and whether it is constant. (Not one a function's `var`
+    /// between here and it shadows; the functions' own variables are the
+    /// code generator's to add.)
+    fn eval_visible(&self, pos: Pos) -> Vec<Expr<'a>> {
+        let mut out = Vec::new();
+        let mut seen: Vec<Name> = Vec::new();
+        for frame in self.frames.iter().rev() {
+            if frame.vars {
+                seen.extend(frame.names.iter().map(|(o, _)| o.clone()));
+                continue;
+            }
+            for (orig, renamed) in &frame.names {
+                if orig == renamed || orig.contains('%') || seen.contains(orig) {
+                    continue;
+                }
+                seen.push(orig.clone());
+                let constant = self.table.decls.get(&frame.key).is_some_and(|ds| ds.iter().any(|(n, k)| n == orig && *k == CONST));
+                out.push(Expr { kind: ExprKind::Str(orig.to_string()), pos });
+                out.push(Expr { kind: ExprKind::Ident(renamed.clone()), pos });
+                out.push(Expr { kind: ExprKind::Bool(constant), pos });
+            }
+        }
+        out
     }
 
     /// Function declaration `f` in a block: its binding in the block, and

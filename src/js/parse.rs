@@ -459,6 +459,20 @@ impl<'a> Parser<'_, 'a, '_> {
         self.deep()?;
         let pos = self.pos();
         let sub = std::mem::replace(&mut self.sub, false);
+        // A statement's body (`if`, a loop's, a label's) is no declaration
+        // (but in sloppy code a plain function's, Annex B).
+        if sub {
+            let declaration = match self.peek() {
+                Tok::Keyword("const" | "class") => true,
+                Tok::Ident(n) if self.let_ahead(n) => !self.toks[self.i + 1].newline_before,
+                Tok::Ident(n) if self.async_function_ahead(n) => true,
+                Tok::Keyword("function") => self.strict() || self.peek_at(1) == &Tok::Punct("*"),
+                _ => false,
+            };
+            if declaration {
+                return self.err("a declaration as a statement's body");
+            }
+        }
         let kind = match self.peek().clone() {
             Tok::Punct("{") => {
                 self.advance();
@@ -735,6 +749,10 @@ impl<'a> Parser<'_, 'a, '_> {
     fn if_branch(&mut self) -> R<&'a Stmt<'a>> {
         if !self.is("function") {
             return Ok(stmt(self.arena, self.sub_statement()?));
+        }
+        // (Not in strict code, nor a generator.)
+        if self.strict() || self.peek_at(1) == &Tok::Punct("*") {
+            return self.err("a declaration as a statement's body");
         }
         let pos = self.pos();
         self.push_scope(self.i, false, false);
@@ -1313,6 +1331,11 @@ impl<'a> Parser<'_, 'a, '_> {
         }
         let mut bound = std::mem::take(&mut self.pattern_names);
         bound.extend(params.iter().cloned());
+        // (No duplicates in non-simple parameters, or a method's.)
+        let f = &self.functions[index];
+        if (!prologue.is_empty() || f.rest || f.method || f.class_kind != 0) && has_duplicate(&bound) {
+            return self.err("duplicate parameter names");
+        }
         self.param_names.push((index, bound.clone()));
         let body_vars = !prologue.is_empty() && self.push_body_vars(&bound);
         self.expect("{")?;
@@ -1554,6 +1577,13 @@ impl<'a> Parser<'_, 'a, '_> {
                 return Err(e);
             }
         };
+        // (An arrow's parameters are never duplicates.)
+        let mut bound = std::mem::take(&mut self.pattern_names);
+        bound.extend(params.iter().filter(|p| !p.starts_with('%')).cloned());
+        if has_duplicate(&bound) {
+            self.current = outer;
+            return self.err("duplicate parameter names");
+        }
         let body = if self.eat("{") {
             // (`"use strict"` of its own, with simple parameters only.)
             if self.directive_prologue() {
@@ -2366,6 +2396,11 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 }
 
+/// Whether `names` has one twice.
+fn has_duplicate(names: &[Name]) -> bool {
+    names.iter().enumerate().any(|(k, n)| names[..k].contains(n))
+}
+
 /// A shorthand's or a method's key `__proto__` as a computed one: an own
 /// property (only `__proto__: v` sets the prototype).
 fn proto_own(key: PropKey<'_>, pos: Pos) -> PropKey<'_> {
@@ -2715,6 +2750,10 @@ impl<'a> Parser<'_, 'a, '_> {
             return self.err("expected `(`");
         }
         let f = self.function(false, false, pos)?;
+        // (A method's parameters are never duplicates.)
+        if self.param_names.iter().rev().find(|(g, _)| *g == f).is_some_and(|(_, ns)| has_duplicate(ns)) {
+            return self.err("duplicate parameter names");
+        }
         let func = &mut self.functions[f];
         func.method = true;
         func.binds_name = false;

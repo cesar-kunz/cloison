@@ -84,6 +84,8 @@ fn parse_pass<'a, 'p>(
         pattern_names: Vec::new(),
         privates: Vec::new(),
         super_fns: Vec::new(),
+        redeclared: None,
+        param_names: Vec::new(),
         home_uses: 0,
         pending_home: None,
         keep,
@@ -146,6 +148,9 @@ fn parse_pass<'a, 'p>(
         body.push(p.statement()?);
     }
     p.frames.pop();
+    if let Some((pos, msg)) = p.redeclared.take() {
+        return Err(Error::new(pos as usize, msg));
+    }
     p.functions[0].body = body;
     Ok((
         Program {
@@ -232,6 +237,10 @@ struct Parser<'t, 'a, 'p> {
     /// The functions with a `super(…)` call, with the variable holding
     /// their class (see `Function::fields`).
     super_fns: Vec<(Name, usize)>,
+    /// Each function's parameters' names (destructured ones' too).
+    param_names: Vec<(usize, Vec<Name>)>,
+    /// A redeclaration found (an early error, reported once parsed).
+    redeclared: Option<(Pos, String)>,
     /// `super` property references so far.
     home_uses: usize,
     /// The home object variables for the method about to be parsed (see
@@ -755,6 +764,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 continue;
             }
             let written = self.binding_ident()?;
+            self.check_var(&written)?;
             // (A body's `var` renamed apart: see `push_body_vars`.)
             let name = self.resolve_var(&written).unwrap_or_else(|| written.clone());
             let init = if self.eat("=") {
@@ -1006,6 +1016,12 @@ impl<'a> Parser<'_, 'a, '_> {
             return self.err("missing initializer in a destructuring declaration");
         };
         let end = self.pos();
+        for n in &names {
+            match lexical {
+                Some(_) => self.check_not_param(n)?,
+                None => self.check_var(n)?,
+            }
+        }
         let names: Vec<Name> = match lexical {
             Some(kind) => {
                 let map: Vec<(Name, Name)> = names.iter().map(|n| (n.clone(), self.declare(n, kind, end))).collect();
@@ -1287,6 +1303,7 @@ impl<'a> Parser<'_, 'a, '_> {
         }
         let mut bound = std::mem::take(&mut self.pattern_names);
         bound.extend(params.iter().cloned());
+        self.param_names.push((index, bound.clone()));
         let body_vars = !prologue.is_empty() && self.push_body_vars(&bound);
         self.expect("{")?;
         if self.directive_prologue() {
@@ -2483,7 +2500,16 @@ impl<'a> Parser<'_, 'a, '_> {
         let frame = self.frames.last().unwrap();
         if self.collect {
             let key = frame.key;
-            self.table.decls.entry(key).or_default().push((name.clone(), kind));
+            // (Sloppy code's block functions may share a name, Annex B.)
+            let strict = self.functions[self.current].strict;
+            let decls = self.table.decls.entry(key).or_default();
+            if decls.iter().any(|&(ref n, k)| {
+                n == name && !(k == BLOCK_FUNCTION && kind == BLOCK_FUNCTION && !strict) && k != CATCH && kind != CATCH
+            }) && self.redeclared.is_none()
+            {
+                self.redeclared = Some((self.toks[self.i.saturating_sub(1)].pos, format!("`{name}` has already been declared")));
+            }
+            decls.push((name.clone(), kind));
             return name.clone();
         }
         let Some((_, r)) = frame.names.iter().find(|(o, _)| o == name) else {
@@ -2504,6 +2530,44 @@ impl<'a> Parser<'_, 'a, '_> {
             },
         );
         r
+    }
+
+    /// A `var` of `name` here: an error if a block-scoped declaration of
+    /// it (not a catch parameter's) is in a scope between here and the
+    /// function's.
+    fn check_var(&self, name: &Name) -> R<()> {
+        if self.collect {
+            return Ok(());
+        }
+        for frame in self.frames.iter().rev() {
+            if frame.vars {
+                break;
+            }
+            if frame.catch {
+                continue;
+            }
+            // (A function declared directly in a body is a `var` too.)
+            let clash = self.table.decls.get(&frame.key).is_some_and(|ds| {
+                ds.iter().any(|(n, k)| n == name && *k != CATCH && !(*k == BLOCK_FUNCTION && frame.body))
+            });
+            if clash {
+                return self.err(format!("`{name}` has already been declared"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A block-scoped declaration of `name` here: an error directly in a
+    /// function's body if a parameter has the name.
+    fn check_not_param(&self, name: &Name) -> R<()> {
+        let params = self.param_names.iter().rev().find(|(f, _)| *f == self.current);
+        if self.frames.last().is_some_and(|fr| fr.body)
+            && self.current != 0
+            && params.is_some_and(|(_, ns)| ns.contains(name))
+        {
+            return self.err(format!("`{name}` has already been declared"));
+        }
+        Ok(())
     }
 
     /// Function declaration `f` in a block: its binding in the block, and
@@ -2589,6 +2653,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 None
             };
             let end = self.pos();
+            self.check_not_param(&name)?;
             let r = self.declare(&name, kind, end);
             decls.push((r, init));
             if !self.eat(",") {

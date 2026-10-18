@@ -4830,3 +4830,40 @@ out.join(" | ");"##;
         "groups 2020,01,31,,y,m,d | noGroups has | unmatched {} | backref \"hi\" | fwdNameRef true | replaceTpl 31/01/2020 | | replaceFn 1a2b | matchAll k1:v1,k2:v2 | dupName !SyntaxError | badName !SyntaxError | kWithoutNames true | behind 5,7 | negBehind 6 | behindVar 123,456 | behindAlt 1,3 | behindStart true,false | behindCapture [\"b\",\"a\"] | behindReplace price: 10, cost: X | lookahead a1_2 | behindSticky true | behindNested b | hot 2000"
     );
 }
+
+/// A name declared twice where one is block-scoped is an early error;
+/// what may share a name (`var`s, a catch parameter's `var`, sloppy
+/// block functions, the same name in sibling blocks) still compiles.
+#[test]
+fn redeclarations_are_early_errors() {
+    for src in [
+        "let x; var x;",
+        "var x; let x;",
+        "let x; let x;",
+        "const x = 1; let x;",
+        "{ let y; var y; }",
+        "{ var z; } let z;",
+        "function f(a) { let a; }",
+        "function f({ a }) { const a = 1; }",
+        "'use strict'; { function g() {} function g() {} }",
+        "{ function h() {} var h; }",
+        "switch (1) { case 1: let s; case 2: let s; }",
+        "for (let i;;) { var i; }",
+        "class C {} let C;",
+        "function u() { let w; { var w; } }",
+    ] {
+        assert!(compile_error(src).contains("has already been declared"), "{src}");
+    }
+    let src = r#"
+for (let i = 0; i < 1; i++) {} for (let i = 0; i < 1; i++) {}
+{ let x = 1; } { let x = 2; }
+function f(a) { var a; function a() {} return typeof a; }
+function g(a) { { let a = 1; } }
+var dup; var dup;
+function h() {} function h() {}
+try {} catch (e) { var e = 1; }
+{ function k() {} function k() {} }
+let outer = 1; function inner() { let outer = 2; var y; return outer; }
+f(1) + inner();"#;
+    assert_eq!(value(src), "function2");
+}

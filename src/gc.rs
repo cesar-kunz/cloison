@@ -870,6 +870,7 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
             | Class::Set
             | Class::WeakMap
             | Class::WeakSet
+            | Class::WeakRef
             | Class::CollectionIterator
             | Class::Promise
             | Class::Symbol
@@ -1595,6 +1596,9 @@ impl Vm {
             for i in 0..self.handles.len() {
                 m.value(self.handles[i]);
             }
+            for i in 0..self.kept_alive.len() {
+                m.value(self.kept_alive[i]);
+            }
             for i in 0..self.open_upvalues.len() {
                 m.payload(self.open_upvalues[i] as usize);
             }
@@ -1704,6 +1708,9 @@ impl Vm {
             }
             for i in 0..self.handles.len() {
                 e.value(self.handles[i]);
+            }
+            for i in 0..self.kept_alive.len() {
+                e.value(self.kept_alive[i]);
             }
             for i in 0..self.open_upvalues.len() {
                 e.payload(self.open_upvalues[i] as usize);

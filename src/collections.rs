@@ -33,6 +33,7 @@ pub(crate) enum Proto {
     DataView,
     MapIterator,
     SetIterator,
+    WeakRef,
 }
 
 /// What an iterator yields; `elems_cap`'s low two bits.
@@ -48,7 +49,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let any = Ty::Any;
-    for _ in 0..7 {
+    for _ in 0..8 {
         let p = vm.new_object(op);
         vm.collection_prototypes.push(p);
     }
@@ -114,6 +115,9 @@ pub(crate) fn install(vm: &mut Vm) {
         protos[Proto::WeakSet as usize],
         &[("add", weak_set_add as NativeFn, 1), ("has", weak_set_has, 1), ("delete", weak_set_delete, 1)],
     );
+    let wr = vm.define_native(g, "WeakRef", weak_ref_ctor, 1, any, true);
+    link_constructor(vm, wr, protos[Proto::WeakRef as usize]);
+    vm.define_native(protos[Proto::WeakRef as usize], "deref", weak_ref_deref, 0, any, false);
     vm.define_native(protos[Proto::MapIterator as usize], "next", iterator_next, 0, any, false);
     vm.define_native(protos[Proto::SetIterator as usize], "next", iterator_next, 0, any, false);
 
@@ -391,7 +395,7 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object
     let o = vm.new_object_with(class, p, 0);
     hold_entries(o, object_value(e));
     // (The collector's to find: see `Vm::ephemerons`.)
-    if matches!(class, Class::WeakMap | Class::WeakSet) {
+    if matches!(class, Class::WeakMap | Class::WeakSet | Class::WeakRef) {
         vm.weak_tables.push(o);
         weaken(o);
     }
@@ -403,7 +407,7 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object
 /// `heap::WEAK_VALUES`).
 fn weaken(o: *mut Object) {
     unsafe {
-        if !matches!((*o).class, Class::WeakMap | Class::WeakSet) {
+        if !matches!((*o).class, Class::WeakMap | Class::WeakSet | Class::WeakRef) {
             return;
         }
         let e = entries(o);
@@ -1098,4 +1102,45 @@ fn set_is_disjoint_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> 
         record_keys(vm, &rec, |_, v| Ok(find(o, v).is_none()))?
     };
     Ok(Value::from_bool(r))
+}
+
+// ---- WeakRef ----
+
+/// Whether `v` can be held weakly: an object, or a symbol not in the
+/// registry (`Symbol.for`'s).
+fn can_be_held_weakly(vm: &Vm, v: Value) -> bool {
+    if is_object(v) {
+        return true;
+    }
+    crate::symbol::is_symbol(v) && !vm.symbol_registry.values().any(|&s| s == as_object(v))
+}
+
+/// `new WeakRef(target)`.
+fn weak_ref_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    if !vm.is_construct() {
+        return Err(Error::type_error("Constructor WeakRef requires 'new'"));
+    }
+    let t = arg(a, 0);
+    if !can_be_held_weakly(vm, t) {
+        return Err(Error::type_error("WeakRef: target must be an object or a non-registered symbol"));
+    }
+    let o = new_collection(vm, Class::WeakRef, Proto::WeakRef)?;
+    append(vm, o, &[t])?;
+    vm.kept_alive.push(t);
+    Ok(object_value(o))
+}
+
+/// `weakRef.deref()`: its target, or `undefined` once collected.
+fn weak_ref_deref(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let o = this_of(this, Class::WeakRef, "WeakRef.prototype.deref")?;
+    let e = entries(o);
+    if len(e) <= BASE {
+        return Ok(Value::UNDEFINED);
+    }
+    let t = slot(e, BASE);
+    if t == Value::EMPTY {
+        return Ok(Value::UNDEFINED);
+    }
+    vm.kept_alive.push(t);
+    Ok(t)
 }

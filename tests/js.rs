@@ -5052,3 +5052,28 @@ fn escaped_reserved_words_are_not_identifiers() {
     }
     assert_eq!(value("var \\u0061b = 1; var o = { \\u0069f: 2 }; l\\u0065t: 1; ab + o.if;"), "3");
 }
+
+/// What an async function's parameters throw rejects its promise (a
+/// generator's still throws from the call).
+#[test]
+fn async_functions_reject_for_their_parameters() {
+    let first = cloison::js::compile(
+        r#"
+var out = [];
+async function f(a = (() => { throw new Error("param"); })()) { out.push("body"); }
+var p = f(); out.push(p instanceof Promise ? "promise" : "no");
+p.catch(e => out.push("rejected " + e.message));
+async function g(x = 1, y = x + 1) { return x + y; }
+g().then(v => out.push("g " + v));
+function* h(a = (() => { throw new Error("gen"); })()) {}
+try { h(); } catch (e) { out.push("sync " + e.message); }
+async function k({ a }) { return a; }
+k().catch(e => out.push("destructure " + e.name));
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("out.join(' | ')").unwrap();
+    let mut vm = Vm::new();
+    vm.run(&first).unwrap();
+    assert_eq!(vm.run(&second).map(display).unwrap(), "promise | sync gen | rejected param | g 3 | destructure TypeError");
+}

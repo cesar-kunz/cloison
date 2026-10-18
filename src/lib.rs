@@ -19,6 +19,7 @@ mod builtins;
 mod array;
 mod intrinsics;
 mod symbol;
+mod iterator;
 mod bigint;
 mod reflect;
 mod generator;

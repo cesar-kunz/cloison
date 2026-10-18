@@ -118,6 +118,9 @@ pub enum Class {
     /// magnitude's 32-bit limbs in `elems` (a byte buffer), their count in
     /// `elems_len`.
     BigInt,
+    /// An iterator helper, or `Iterator.from`'s wrapper: `code`'s bits
+    /// are its state, a hidden array (see `iterator`).
+    IteratorHelper,
 }
 
 // (Stencils read a cell's class byte: a string's 4, a symbol's 9, a
@@ -143,6 +146,7 @@ impl Class {
                 | Class::Symbol
                 | Class::BigInt
                 | Class::ArrayIterator
+                | Class::IteratorHelper
                 | Class::Generator
                 | Class::Proxy
                 | Class::WeakRef

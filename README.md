@@ -141,17 +141,17 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES2022 | 4,821 | 5,374 | 89.7% |
 | ES2023 | 209 | 284 | 73.6% |
 | ES2024 | 61 | 843 | 7.2% |
-| ES2025 | 378 | 998 | 37.9% |
-| ES2026 | 98 | 745 | 13.2% |
-| Stage 3 proposals | 251 | 5,650 | 4.4% |
-| **all** | **37,381** | **48,635** | **76.9%** |
+| ES2025 | 761 | 998 | 76.3% |
+| ES2026 | 130 | 745 | 17.4% |
+| Stage 3 proposals | 464 | 5,650 | 8.2% |
+| **all** | **38,009** | **48,635** | **78.2%** |
 
 The gaps are mostly whole features: modules (`import()` and top-level
 `await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
-failures), resizable `ArrayBuffer`s (ES2024), iterator helpers, the
-RegExp `v` flag and modifiers, explicit resource management (`using`),
-non-ASCII identifiers beyond a rough approximation (no Unicode ID
-tables), and early errors for invalid syntax that the parser accepts.
+failures), resizable `ArrayBuffer`s (ES2024), the RegExp `v` flag and
+modifiers, explicit resource management (`using`), non-ASCII
+identifiers beyond a rough approximation (no Unicode ID tables), and
+early errors for invalid syntax that the parser accepts.
 
 ## Results
 
@@ -298,8 +298,8 @@ targets.
   at 657 MB for 120 MB live).
 - **Language gaps.** Strict mode, `let`/`const`, classes, arrows,
   templates, destructuring, spread, symbols, iterators, generators,
-  async functions and generators, `Reflect`, `Proxy`, BigInt and class
-  fields are in; modules, non-ASCII identifiers (no Unicode ID tables),
+  async functions and generators, `Reflect`, `Proxy`, BigInt, class
+  fields and iterator helpers are in; modules, non-ASCII identifiers (no Unicode ID tables),
   array indices past 2^28 and Unicode case folding in regexps are not.
   See [Standards support](#standards-support) for test262 by edition;
   Octane and about 100 programs are also checked against Node.

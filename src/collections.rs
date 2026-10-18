@@ -196,7 +196,7 @@ fn to_index(vm: &mut Vm, v: Value) -> Result<usize> {
 }
 
 /// SameValueZero: SameValue, but the zeros are equal.
-fn same_value_zero(a: Value, b: Value) -> bool {
+pub(crate) fn same_value_zero(a: Value, b: Value) -> bool {
     if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
         return x == y || x.is_nan() && y.is_nan();
     }

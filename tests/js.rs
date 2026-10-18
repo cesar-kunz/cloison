@@ -4980,3 +4980,28 @@ fn identifier_early_errors_and_default_names() {
     let src = "var [x = function () {}] = []; var { y = () => 1 } = {}; var z; ({ z = function () {} } = {}); function f([w = class {}]) { return w.name; } [x.name, y.name, z.name, f([])].join();";
     assert_eq!(value(src), "x,y,z,w");
 }
+
+/// A statement's body is no declaration (but a sloppy plain function's),
+/// and non-simple parameters, an arrow's and a method's have no duplicate
+/// names.
+#[test]
+fn declaration_bodies_and_duplicate_parameters_are_errors() {
+    for src in [
+        "if (1) let x = 1;",
+        "if (1) const x = 1;",
+        "while (0) class C {}",
+        "if (1) function* g() {}",
+        "l: async function f() {}",
+        "'use strict'; if (1) function f() {}",
+        "function f(a, a = 1) {}",
+        "function f(a, ...a) {}",
+        "function f({ a }, a) {}",
+        "(a, a) => 1",
+        "({ a }, [a]) => 1",
+        "x = { m(a, a) {} }",
+    ] {
+        compile_error(src);
+    }
+    let src = "if (1) function f() { return 1; } l: function g() { return 2; } function h(a, a) { return a; } f() + g() + h(1, 3);";
+    assert_eq!(value(src), "6");
+}

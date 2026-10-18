@@ -93,6 +93,8 @@ pub struct Gc {
     /// ([`CODE_MIN`]; less for tests).
     pub(crate) code_room: usize,
     pub(crate) code_min: usize,
+    /// [`CODE_BYTES`] when the current or last full collection began.
+    code_at_start: usize,
     /// The marker thread is sweeping after a final pause.
     pub(crate) sweeping: bool,
     /// What the heap may grow by before the next full collection (see
@@ -137,6 +139,7 @@ impl Gc {
         Gc {
             codes_from: 0,
             code_room: CODE_MIN,
+            code_at_start: 0,
             code_min: CODE_MIN,
             verify,
             stress: env("CLOISON_GC_STRESS"),
@@ -275,6 +278,12 @@ impl Gc {
     /// Code has grown past its room: time for a full collection.
     pub(crate) fn code_full(&self) -> bool {
         CODE_BYTES.with(|c| c.get()) > self.code_room
+    }
+
+    /// Code has grown past twice its room: a marking under way is
+    /// finished, not left to the marker (see `Vm::collect`).
+    fn code_outgrown(&self) -> bool {
+        CODE_BYTES.with(|c| c.get()) > 2 * self.code_room
     }
 }
 
@@ -1138,9 +1147,10 @@ impl Vm {
             // after this is kept for the next safepoint.
             self.heap.requested.store(false, std::sync::atomic::Ordering::Relaxed);
             let done = gc.marker.as_ref().is_some_and(|m| m.shared.state.lock().unwrap().done);
-            // The final pause: the marker is done, or the heap has outgrown
-            // the cycle (the mutator then finishes the marking).
-            if done || self.heap.allocated() > 2 * gc.full_at {
+            // The final pause: the marker is done, or the heap or code has
+            // outgrown the cycle (the mutator then finishes the marking: a
+            // marker short of time left code dead `eval`s made to pile up).
+            if done || self.heap.allocated() > 2 * gc.full_at || gc.code_outgrown() {
                 Collection::Final
             } else if self.heap.since() >= gc.budget() {
                 Collection::MinorShade
@@ -1173,6 +1183,7 @@ impl Vm {
             // The cells that could still refer to them are swept.
             self.condemned.clear();
             self.heap.gc.codes_from = CODE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            self.heap.gc.code_at_start = CODE_BYTES.with(|c| c.get());
         } else if self.heap.gc.sweeping {
             self.heap.absorb_sweep();
         }
@@ -1450,7 +1461,10 @@ impl Vm {
             .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
         self.codes = live;
         let live: usize = self.codes.iter().map(|c| c.footprint()).sum();
-        self.heap.gc.code_room = live.max(self.heap.gc.code_min);
+        // (Less the code made while the marker ran, all found live: its
+        // room grew with each marking a slow marker drew out.)
+        let made = CODE_BYTES.with(|c| c.get()).saturating_sub(self.heap.gc.code_at_start);
+        self.heap.gc.code_room = live.saturating_sub(made).max(self.heap.gc.code_min);
         CODE_BYTES.with(|c| c.set(0));
         for c in &dead {
             self.code_set.remove(&(&**c as *const crate::vm::Code as usize));

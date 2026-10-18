@@ -715,6 +715,17 @@ pub struct Vm {
     /// `intrinsics::direct_eval`).
     pub(crate) eval_function: *mut Object,
     pub(crate) regexp_prototype: *mut Object,
+    /// `RegExp.prototype.exec` and `[Symbol.match]`, `[Symbol.matchAll]`,
+    /// `[Symbol.replace]`, `[Symbol.search]`, `[Symbol.split]` as made
+    /// (see `builtins::pristine`).
+    pub(crate) regexp_fns: [*mut Object; 6],
+    /// Their keys: `exec`, `Symbol.match`, … (as `regexp_fns`).
+    pub(crate) regexp_atoms: [Atom; 6],
+    /// `RegExp.prototype`'s shape when `regexp_fns` were last found its
+    /// properties, and their slots' locations there (see
+    /// `builtins::pristine`).
+    pub(crate) regexp_proto_shape: *const crate::object::Shape,
+    pub(crate) regexp_slots: [i32; 6],
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
     declared: crate::jit::HashSet<Atom>,
@@ -897,6 +908,10 @@ impl Vm {
             key_cache: (Value::EMPTY, Value::EMPTY),
             eval_function: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),
+            regexp_fns: [std::ptr::null_mut(); 6],
+            regexp_atoms: [Atom(0); 6],
+            regexp_proto_shape: std::ptr::null(),
+            regexp_slots: [0; 6],
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
             declared: Default::default(),

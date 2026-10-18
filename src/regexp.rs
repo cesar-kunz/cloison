@@ -81,6 +81,9 @@ enum Node {
     Any,
     /// A class: sorted inclusive ranges, and whether it is negated.
     Class(Vec<(u16, u16)>, bool),
+    /// A surrogate pair whose astral code point is in the sorted inclusive
+    /// ranges (`u` mode).
+    Astral(Vec<(u32, u32)>),
     /// `^`, `$`.
     Start,
     End,
@@ -100,8 +103,17 @@ enum Node {
 }
 
 impl Regex {
-    /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
-    pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
+    /// Whether `pattern` with `flags` is a valid regular expression (a
+    /// literal's early error), as [`Regex::new`] would find, without
+    /// compiling it.
+    pub fn check(pattern: &str, flags: &str) -> Result<(), String> {
+        Regex::parse(pattern, flags).map(|_| ())
+    }
+
+    /// `pattern`'s tree, group count and names, and `flags`
+    /// (`g`, `i`, `m`, `y`, `u`, `s`, in that order).
+    #[allow(clippy::type_complexity)]
+    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 6]), String> {
         let (mut global, mut ignore_case, mut multiline) = (false, false, false);
         let (mut sticky, mut unicode, mut dot_all) = (false, false, false);
         for f in flags.chars() {
@@ -129,15 +141,22 @@ impl Regex {
             unicode,
             dot_all,
             depth: 0,
+            pending: None,
         };
         let node = p.alternation()?;
         if p.i != chars.len() {
             return Err(format!("Invalid regular expression: /{pattern}/: Unmatched ')'"));
         }
+        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all]))
+    }
+
+    /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
+    pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
+        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all]) = Regex::parse(pattern, flags)?;
         let mut re = Regex {
             node,
-            groups: p.groups,
-            names: p.names,
+            groups,
+            names,
             global,
             ignore_case,
             multiline,
@@ -362,6 +381,7 @@ impl Regex {
                 &|x| in_class(ic, r, *neg, x),
                 *neg || r.iter().any(|&(_, hi)| hi >= 128),
             ),
+            Node::Astral(_) => Some((0, true, false)),
             Node::Group(inner, _) => self.first(inner),
             Node::BackRef(_) => None,
             Node::Repeat(inner, min, ..) => {
@@ -480,6 +500,7 @@ fn width(n: &Node) -> (usize, Option<usize>) {
     match n {
         Node::Empty | Node::Start | Node::End | Node::Boundary(_) | Node::Look(..) => (0, Some(0)),
         Node::Char(_) | Node::Any | Node::Class(..) => (1, Some(1)),
+        Node::Astral(_) => (2, Some(2)),
         Node::Group(inner, _) => width(inner),
         Node::BackRef(_) => (0, None),
         Node::Alt(alts) => alts.iter().map(width).fold((usize::MAX, Some(0)), |(a, b), (c, d)| {
@@ -552,6 +573,8 @@ struct Parser<'a> {
     dot_all: bool,
     /// Groups open around the current position (up to [`MAX_NESTING`]).
     depth: usize,
+    /// An error a class's member found (see `Parser::class_atom`).
+    pending: Option<String>,
 }
 
 /// The deepest groups may nest: the parser, and the passes over the tree
@@ -775,6 +798,10 @@ impl Parser<'_> {
             }
             'b' => Node::Boundary(true),
             'B' => Node::Boundary(false),
+            'p' | 'P' if self.unicode => {
+                let set = self.property(e == 'P')?;
+                cp_class(set, false)
+            }
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                 let (ranges, neg) = class_escape(e);
                 if neg && self.unicode {
@@ -843,7 +870,7 @@ impl Parser<'_> {
             return Ok(());
         }
         match self.c.get(self.i + 1) {
-            Some('d' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | '-') => Ok(()),
+            Some('d' | 'D' | 'w' | 'W' | 's' | 'S' | 'b' | '-' | 'p' | 'P') => Ok(()),
             Some(_) => {
                 self.i += 1;
                 let r = self.check_unicode_escape();
@@ -932,7 +959,8 @@ impl Parser<'_> {
         if neg {
             self.i += 1;
         }
-        let mut ranges: Vec<(u16, u16)> = Vec::new();
+        // (Code points: units but in `u` mode.)
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
         loop {
             let Some(c) = self.peek() else {
                 return Err(self.error("Unterminated character class"));
@@ -962,7 +990,7 @@ impl Parser<'_> {
                     Err(_) if self.unicode => return Err(self.error("Invalid character class")),
                     Err(set) => {
                         ranges.push((lo, lo));
-                        ranges.push((b'-' as u16, b'-' as u16));
+                        ranges.push((b'-' as u32, b'-' as u32));
                         ranges.extend(set);
                     }
                 }
@@ -970,28 +998,51 @@ impl Parser<'_> {
                 ranges.push((lo, lo));
             }
         }
-        ranges.sort();
-        // (`u` mode: a negated class's match may be an astral character.)
-        if neg && self.unicode {
-            return Ok(Node::Alt(vec![surrogate_pair(), Node::Class(ranges, neg)]));
+        if let Some(m) = self.pending.take() {
+            return Err(m);
         }
-        Ok(Node::Class(ranges, neg))
+        if self.unicode {
+            return Ok(cp_class(ranges, neg));
+        }
+        let mut units: Vec<(u16, u16)> = ranges.into_iter().map(|(lo, hi)| (lo as u16, hi as u16)).collect();
+        units.sort();
+        Ok(Node::Class(units, neg))
     }
 
-    /// A class member: a code unit, or (`Err`) a class escape's ranges.
-    fn class_atom(&mut self) -> Result<u16, Vec<(u16, u16)>> {
+    /// A class member: a code point (a code unit but in `u` mode), or
+    /// (`Err`) a class escape's ranges.
+    fn class_atom(&mut self) -> Result<u32, Vec<(u32, u32)>> {
         let c = self.c[self.i];
         self.i += 1;
         if c != '\\' {
+            if self.unicode {
+                return Ok(c as u32);
+            }
             let mut b = [0u16; 2];
-            return Ok(c.encode_utf16(&mut b)[0]);
+            return Ok(c.encode_utf16(&mut b)[0] as u32);
         }
-        let Some(e) = self.peek() else { return Ok(b'\\' as u16) };
+        let Some(e) = self.peek() else { return Ok(b'\\' as u32) };
+        let wide = |r: Vec<(u16, u16)>| r.into_iter().map(|(lo, hi)| (lo as u32, hi as u32)).collect::<Vec<_>>();
         match e {
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                 self.i += 1;
                 let (r, neg) = class_escape(e);
-                Err(if neg { complement(&r) } else { r })
+                Err(match (neg, self.unicode) {
+                    (false, _) => wide(r),
+                    (true, false) => wide(complement(&r)),
+                    (true, true) => complement_points(&wide(r)),
+                })
+            }
+            'p' | 'P' if self.unicode => {
+                self.i += 1;
+                // (An invalid name: no ranges, the error noted for later.)
+                match self.property(e == 'P') {
+                    Ok(set) => Err(set),
+                    Err(m) => {
+                        self.pending.get_or_insert(m);
+                        Err(Vec::new())
+                    }
+                }
             }
             'b' => {
                 self.i += 1;
@@ -999,25 +1050,100 @@ impl Parser<'_> {
             }
             '-' => {
                 self.i += 1;
-                Ok(b'-' as u16)
+                Ok(b'-' as u32)
             }
             // `\c` and a digit or `_`, in a class (Annex B): a control code.
             'c' if !self.unicode && self.c.get(self.i + 1).is_some_and(|&d| d.is_ascii_digit() || d == '_') => {
                 let d = self.c[self.i + 1];
                 self.i += 2;
-                Ok(d as u16 % 32)
+                Ok(d as u32 % 32)
             }
             'u' if self.unicode && self.c.get(self.i + 1) == Some(&'{') => {
-                // (A code point: a BMP one's unit.)
                 let s = self.i + 2;
                 let end = self.c[s..].iter().position(|&c| c == '}').unwrap_or(0);
                 let hex: String = self.c[s..s + end].iter().collect();
                 self.i = s + end + 1;
-                Ok(u32::from_str_radix(&hex, 16).map_or(0, |v| v.min(0xFFFF)) as u16)
+                Ok(u32::from_str_radix(&hex, 16).map_or(0, |v| v.min(0x10FFFF)))
             }
-            _ => Ok(self.char_escape()),
+            _ => {
+                let u = self.char_escape() as u32;
+                // (`u` mode: `\uD83D\uDE00`, a surrogate pair's escapes, is
+                // the one code point.)
+                if self.unicode
+                    && (0xD800..0xDC00).contains(&u)
+                    && self.c.get(self.i..self.i + 2) == Some(&['\\', 'u'])
+                    && let Some(t) = self.c.get(self.i + 2..self.i + 6).and_then(|h| {
+                        u32::from_str_radix(&h.iter().collect::<String>(), 16).ok()
+                    })
+                    && (0xDC00..0xE000).contains(&t)
+                {
+                    self.i += 6;
+                    return Ok(0x10000 + ((u - 0xD800) << 10) + (t - 0xDC00));
+                }
+                Ok(u)
+            }
         }
     }
+
+    /// `\p{…}` (or `\P{…}`, `neg`) at `self.i` (past the `p`), in `u` mode:
+    /// the code points of the property (a binary one, a general category,
+    /// a script, … by any of their names: see `unicode_props`).
+    fn property(&mut self, neg: bool) -> Result<Vec<(u32, u32)>, String> {
+        if self.peek() != Some('{') {
+            return Err(self.error("Invalid property name"));
+        }
+        let s = self.i + 1;
+        let Some(end) = self.c[s..].iter().position(|&c| c == '}') else {
+            return Err(self.error("Invalid property name"));
+        };
+        let name: String = self.c[s..s + end].iter().collect();
+        self.i = s + end + 1;
+        let names = &crate::unicode_props::NAMES;
+        let Ok(k) = names.binary_search_by(|(n, _)| (*n).cmp(name.as_str())) else {
+            return Err(self.error("Invalid property name"));
+        };
+        let set = crate::unicode_props::SETS[names[k].1 as usize];
+        Ok(if neg { complement_points(set) } else { set.to_vec() })
+    }
+}
+
+/// The code points `0..=0x10FFFF` not in sorted ranges `r`.
+fn complement_points(r: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut r = r.to_vec();
+    r.sort();
+    let mut out = Vec::new();
+    let mut next = 0;
+    for &(lo, hi) in &r {
+        if lo > next {
+            out.push((next, lo - 1));
+        }
+        next = next.max(hi + 1);
+    }
+    if next <= 0x10FFFF {
+        out.push((next, 0x10FFFF));
+    }
+    out
+}
+
+/// A class of code points `ranges` (negated if `neg`), in `u` mode: of a
+/// unit for the BMP's, and of a surrogate pair for the astral ones' (tried
+/// first: an astral character is one, not its halves).
+fn cp_class(mut ranges: Vec<(u32, u32)>, neg: bool) -> Node {
+    ranges.sort();
+    let mut astral: Vec<(u32, u32)> =
+        ranges.iter().filter(|r| r.1 >= 0x10000).map(|&(lo, hi)| (lo.max(0x10000), hi.min(0x10FFFF))).collect();
+    let mut bmp: Vec<(u16, u16)> =
+        ranges.iter().filter(|r| r.0 <= 0xFFFF).map(|&(lo, hi)| (lo as u16, hi.min(0xFFFF) as u16)).collect();
+    if neg {
+        astral = complement_points(&astral).into_iter().filter(|r| r.1 >= 0x10000).map(|(lo, hi)| (lo.max(0x10000), hi)).collect();
+        // (Not a pair's first half: its character is astral.)
+        bmp.push((0xD800, 0xDBFF));
+        bmp.sort();
+    }
+    if astral.is_empty() {
+        return Node::Class(bmp, neg);
+    }
+    Node::Alt(vec![Node::Astral(astral), Node::Class(bmp, neg)])
 }
 
 /// A surrogate pair: an astral character in `u` mode.
@@ -1072,6 +1198,19 @@ fn complement(r: &[(u16, u16)]) -> Vec<(u16, u16)> {
     out
 }
 
+/// The astral code point of the surrogate pair at `s[i..]`, if one is.
+fn astral_at(s: &[u16], i: usize) -> Option<u32> {
+    let (&a, &b) = (s.get(i)?, s.get(i + 1)?);
+    ((0xD800..0xDC00).contains(&a) && (0xDC00..0xE000).contains(&b))
+        .then(|| 0x10000 + (((a - 0xD800) as u32) << 10) + (b - 0xDC00) as u32)
+}
+
+/// Whether `c` is in sorted inclusive ranges `r`.
+fn in_points(r: &[(u32, u32)], c: u32) -> bool {
+    let k = r.partition_point(|&(_, hi)| hi < c);
+    k < r.len() && r[k].0 <= c
+}
+
 fn is_line_terminator(c: u16) -> bool {
     matches!(c, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
@@ -1113,6 +1252,8 @@ enum Insn {
     /// A class: ASCII members by `ascii`'s bits, the rest by
     /// `Program::classes[k]`.
     Class { ascii: u128, k: u32 },
+    /// A surrogate pair of a code point in `Program::astral[k]`.
+    Astral(u32),
     Start,
     End,
     /// `\b` (true) or `\B`.
@@ -1163,6 +1304,8 @@ struct Program {
     classes: Vec<(Vec<(u16, u16)>, bool)>,
     /// `Str`'s code units.
     strs: Vec<Vec<u16>>,
+    /// `Astral`'s ranges.
+    astral: Vec<Vec<(u32, u32)>>,
     /// Registers: positions and repetition counts.
     nregs: usize,
     /// Whether case is folded (`i`).
@@ -1255,7 +1398,12 @@ impl Native {
             idx[i] = n;
             n += 1;
             match code[i] {
-                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd | Insn::Behind { .. } | Insn::BehindEnd => return None,
+                Insn::BackRef(_)
+                | Insn::Look { .. }
+                | Insn::LookEnd
+                | Insn::Behind { .. }
+                | Insn::BehindEnd
+                | Insn::Astral(_) => return None,
                 Insn::Run { .. } | Insn::LazyRun { .. } => {
                     idx[i + 1] = idx[i];
                     nruns += 1;
@@ -1362,9 +1510,12 @@ impl Native {
                     continue;
                 }
                 Insn::Match => piece("rx_match"),
-                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd | Insn::Behind { .. } | Insn::BehindEnd => {
-                    unreachable!()
-                }
+                Insn::BackRef(_)
+                | Insn::Look { .. }
+                | Insn::LookEnd
+                | Insn::Behind { .. }
+                | Insn::BehindEnd
+                | Insn::Astral(_) => unreachable!(),
             };
             pieces.push(p);
             i += 1;
@@ -1482,6 +1633,10 @@ impl Program {
         match n {
             Node::Empty => {}
             Node::Char(_) | Node::Any | Node::Class(..) => unreachable!(),
+            Node::Astral(r) => {
+                self.astral.push(r.clone());
+                self.code.push(Insn::Astral((self.astral.len() - 1) as u32));
+            }
             Node::Start => self.code.push(Insn::Start),
             Node::End => self.code.push(Insn::End),
             Node::Boundary(b) => self.code.push(Insn::Boundary(*b)),
@@ -1649,6 +1804,12 @@ impl Program {
                     let ok = s.get(pos..pos + u.len()) == Some(&u[..]);
                     pos += u.len();
                     pc += 1;
+                    ok
+                }
+                Insn::Astral(k) => {
+                    pc += 1;
+                    let ok = pos + 1 < s.len() && astral_at(s, pos).is_some_and(|c| in_points(&self.astral[k as usize], c));
+                    pos += 2;
                     ok
                 }
                 Insn::Start => {
@@ -1918,6 +2079,7 @@ impl<'a> Matcher<'a> {
             Node::Char(c) => i < s.len() && self.eq(s[i], *c) && k(self, i + 1),
             Node::Any => i < s.len() && !is_line_terminator(s[i]) && k(self, i + 1),
             Node::Class(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && k(self, i + 1),
+            Node::Astral(r) => astral_at(s, i).is_some_and(|c| in_points(r, c)) && k(self, i + 2),
             Node::Start => {
                 (i == 0 || (self.re.multiline && is_line_terminator(s[i - 1]))) && k(self, i)
             }

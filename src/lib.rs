@@ -29,6 +29,7 @@ mod promise;
 mod proxy;
 pub mod props;
 pub mod regexp;
+mod unicode_props;
 mod stack;
 pub mod bytecode;
 pub mod gc;

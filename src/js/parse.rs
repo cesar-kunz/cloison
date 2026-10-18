@@ -2412,7 +2412,16 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 ExprKind::Object(props, home)
             }
-            Tok::RegExp(r) => ExprKind::RegExp(r.0, r.1),
+            Tok::RegExp(r) => {
+                // (An invalid pattern is an early error; but a flag not
+                // supported yet is left to the runtime's error.)
+                if !r.1.contains(['d', 'v'])
+                    && let Err(m) = crate::regexp::Regex::check(&r.0, &r.1)
+                {
+                    return Err(Error::new(pos as usize, m));
+                }
+                ExprKind::RegExp(r.0, r.1)
+            }
             _ => {
                 self.i = start;
                 return self.unexpected();

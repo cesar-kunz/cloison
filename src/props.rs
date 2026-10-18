@@ -407,6 +407,10 @@ impl Vm {
                 })
                 .collect();
             (*o).flags |= NOT_EXTENSIBLE | SEALED;
+            // (Read-only elements: see `protect_indices`.)
+            if freeze && ((*o).elems_len > 0 || (*o).flags & SPARSE != 0) {
+                self.protect_indices();
+            }
             if freeze {
                 (*o).flags |= FROZEN;
                 // (The bit is a function's `FN_LENGTH_DELETED`.)
@@ -415,6 +419,18 @@ impl Vm {
                 }
             }
             self.unique_shape(o, Some(attrs), true);
+        }
+    }
+
+    /// An object has an indexed accessor or a read-only element: from now
+    /// on a store adding an element looks for one on the prototype chain
+    /// (see `Vm::set_new_element`), and compiled code (which stores
+    /// elements without looking) is dropped and compiles them through the
+    /// interpreter.
+    pub(crate) fn protect_indices(&mut self) {
+        if !self.indices_protected {
+            self.indices_protected = true;
+            self.bump_code_epoch();
         }
     }
 
@@ -574,7 +590,12 @@ impl Vm {
                         self.set_element(o, i, full.value.unwrap());
                         return Ok(true);
                     }
-                    // A named property, its element slot a hole.
+                    // A named property, its element slot a hole. (An
+                    // accessor or a read-only one: stores of elements
+                    // check prototypes from now on.)
+                    if full.is_accessor() || full.writable == Some(false) {
+                        self.protect_indices();
+                    }
                     if class == Class::Array && i >= (*o).elems_len {
                         self.grow_elements(o, i as usize + 1)?;
                     }

@@ -1429,7 +1429,10 @@ handlers! {
         if is_cell(tag, obj) && tag.is_int32(key) {
             let o = as_object(obj);
             let i = key.as_i32_unchecked() as u32;
-            if i < (*o).elems_len && fits_field(tag, (*(*o).shape).elems_code, acc) {
+            if i < (*o).elems_len
+                && fits_field(tag, (*(*o).shape).elems_code, acc)
+                && (*(*o).elems.add(i as usize) != Value::EMPTY || !(*frame_vm(regs)).indices_protected)
+            {
                 let at = (*o).elems.add(i as usize);
                 *at = acc;
                 crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, acc);

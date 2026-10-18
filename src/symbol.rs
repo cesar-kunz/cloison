@@ -45,6 +45,7 @@ pub(crate) enum Root {
     StringIteratorPrototype,
     ArrayValues,
     GeneratorPrototype,
+    AsyncGeneratorPrototype,
 }
 
 fn root(vm: &Vm, r: Root) -> *mut Object {
@@ -68,6 +69,25 @@ pub(crate) fn symbol_atom(v: Value) -> Atom {
 /// Whether atom `a` is a symbol's.
 pub(crate) fn is_symbol_atom(vm: &Vm, a: Atom) -> bool {
     vm.atom_name(a).starts_with(SYMBOL_MARK)
+}
+
+/// Whether atom `a` is a private name's (see [`new_private_symbol`]).
+pub(crate) fn is_private_atom(vm: &Vm, a: Atom) -> bool {
+    let n = vm.atom_name(a);
+    n.starts_with(SYMBOL_MARK) && n[SYMBOL_MARK.len_utf8()..].starts_with('#')
+}
+
+/// A new private name's symbol, described `desc` (`#x`): its key no
+/// reflection lists.
+pub(crate) fn new_private_symbol(vm: &mut Vm, desc: Value) -> Value {
+    vm.symbol_count += 1;
+    let name = format!("{SYMBOL_MARK}#{}", vm.symbol_count);
+    make_symbol(vm, desc, Some(name))
+}
+
+/// Symbol `v`'s description as a string (a private name's `#x`).
+pub(crate) fn description_string(v: Value) -> String {
+    String::from_utf16_lossy(crate::vm::string_units(description(v)).unwrap_or(&[]))
 }
 
 /// The symbol whose key atom `a` is.
@@ -179,7 +199,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
 pub(crate) fn own_symbol_keys(vm: &mut Vm, o: *mut Object) -> Vec<Value> {
     let keys: Vec<Atom> = unsafe { (*(*o).shape).keys.to_vec() };
     keys.into_iter()
-        .filter(|&a| is_symbol_atom(vm, a))
+        .filter(|&a| is_symbol_atom(vm, a) && !is_private_atom(vm, a))
         .filter_map(|a| atom_symbol(vm, a))
         .collect()
 }
@@ -344,7 +364,7 @@ fn this_target(vm: &mut Vm, this: Value) -> Result<Value> {
     Ok(object_value(vm.to_object(this)?))
 }
 
-fn array_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let t = this_target(vm, this)?;
     new_iterator(vm, t, 1, Root::ArrayIteratorPrototype)
 }

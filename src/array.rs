@@ -39,6 +39,13 @@ pub(crate) fn install(vm: &mut Vm) {
             ("copyWithin", array_copy_within, 2),
             ("flat", array_flat, 0),
             ("flatMap", array_flat_map, 1),
+            ("at", array_at, 1),
+            ("findLast", array_find_last, 1),
+            ("findLastIndex", array_find_last_index, 1),
+            ("toReversed", array_to_reversed, 0),
+            ("toSorted", array_to_sorted, 1),
+            ("toSpliced", array_to_spliced, 2),
+            ("with", array_with, 2),
         ],
     );
     let a_array = vm.intern("Array");
@@ -1147,4 +1154,112 @@ pub(crate) fn apply_list(vm: &mut Vm, list: Value) -> Result<Vec<Value>> {
         i += 1.0;
     }
     Ok(out)
+}
+
+/// `at(i)`: element `i`, counted from the end if negative.
+fn array_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, len) = this_object(vm, this)?;
+    let n = to_integer(arg(a, 0));
+    let k = if n < 0.0 { len + n } else { n };
+    if k < 0.0 || k >= len {
+        return Ok(Value::UNDEFINED);
+    }
+    get(vm, o, k)
+}
+
+/// `findLast` (`index`: `findLastIndex`): the last element the callback
+/// accepts, or its index.
+fn find_last(vm: &mut Vm, this: Value, a: &[Value], index: bool) -> Result<Value> {
+    let (o, len) = this_object(vm, this)?;
+    let f = callback(a, if index { "findLastIndex" } else { "findLast" })?;
+    let that = arg(a, 1);
+    let mut i = len - 1.0;
+    while i >= 0.0 {
+        let v = get(vm, o, i)?;
+        let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
+        if to_boolean(r) {
+            return Ok(if index { Value::number(i) } else { v });
+        }
+        i -= 1.0;
+    }
+    Ok(if index { Value::from_i32(-1) } else { Value::UNDEFINED })
+}
+
+fn array_find_last(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    find_last(vm, this, a, false)
+}
+
+fn array_find_last_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    find_last(vm, this, a, true)
+}
+
+/// A new array of `len` elements, element `i` from `f(i)`.
+fn array_from_fn(vm: &mut Vm, len: f64, mut f: impl FnMut(&mut Vm, f64) -> Result<Value>) -> Result<Value> {
+    if len > u32::MAX as f64 {
+        return Err(Error::range_error("Invalid array length"));
+    }
+    let out = vm.new_array();
+    let mut i = 0.0;
+    while i < len {
+        let v = f(vm, i)?;
+        create(vm, out, i, v)?;
+        i += 1.0;
+    }
+    Ok(out)
+}
+
+/// `toReversed()`: a reversed copy.
+fn array_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let (o, len) = this_object(vm, this)?;
+    array_from_fn(vm, len, |vm, i| get(vm, o, len - 1.0 - i))
+}
+
+/// `toSorted(compare)`: a sorted copy.
+fn array_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let cmp = arg(a, 0);
+    if !cmp.is_undefined() && !is_callable(cmp) {
+        return Err(Error::type_error("The comparison function must be either a function or undefined"));
+    }
+    let (o, len) = this_object(vm, this)?;
+    let out = array_from_fn(vm, len, |vm, i| get(vm, o, i))?;
+    array_sort(vm, out, &[cmp])
+}
+
+/// `toSpliced(start, skipCount, ...items)`: a copy with the elements
+/// `splice` would remove replaced by the items.
+fn array_to_spliced(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, len) = this_object(vm, this)?;
+    let start = relative(arg(a, 0), len, 0.0);
+    let skip = match a.len() {
+        0 => 0.0,
+        1 => len - start,
+        _ => to_integer(a[1]).clamp(0.0, len - start),
+    };
+    let items = a.get(2..).unwrap_or(&[]);
+    let n = len + items.len() as f64 - skip;
+    if n > 9007199254740991.0 {
+        return Err(Error::type_error("Invalid array length"));
+    }
+    array_from_fn(vm, n, |vm, i| {
+        if i < start {
+            get(vm, o, i)
+        } else if i < start + items.len() as f64 {
+            Ok(items[(i - start) as usize])
+        } else {
+            get(vm, o, i - items.len() as f64 + skip)
+        }
+    })
+}
+
+/// `with(i, v)`: a copy with element `i` (counted from the end if
+/// negative) `v`.
+fn array_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let (o, len) = this_object(vm, this)?;
+    let n = to_integer(arg(a, 0));
+    let k = if n < 0.0 { len + n } else { n };
+    if k < 0.0 || k >= len {
+        return Err(Error::range_error("Invalid index"));
+    }
+    let v = arg(a, 1);
+    array_from_fn(vm, len, |vm, i| if i == k { Ok(v) } else { get(vm, o, i) })
 }

@@ -28,6 +28,18 @@ const SUSPENDED_YIELD: i32 = 1;
 const EXECUTING: i32 = 2;
 const COMPLETED: i32 = 3;
 
+/// An async generator's cells past a generator's: its requests (`[mode,
+/// value, resolve, reject]` each, oldest first), whether it last
+/// suspended at a `yield` (else at an `await`), whether a request is
+/// being run, and the mark of one (an async function's coroutine uses
+/// cells 5 to 7 for its promise).
+const AG_QUEUE: i32 = 5;
+const AG_YIELD: i32 = 6;
+const AG_BUSY: i32 = 7;
+const AG_MARK: i32 = 8;
+/// A request's width.
+const REQUEST: usize = 4;
+
 /// How a generator resumes: `next(v)`, `throw(e)`, `return(v)`.
 pub(crate) const NEXT: i32 = 0;
 pub(crate) const THROW: i32 = 1;
@@ -54,11 +66,17 @@ fn set(vm: &mut Vm, st: Value, k: i32, v: Value) {
 pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
     let a_prototype = vm.a_prototype;
     let p = vm.get(object_value(f), a_prototype)?;
-    let proto = if crate::props::is_object(p) { p } else { object_value(vm.symbol_roots[crate::symbol::Root::GeneratorPrototype as usize]) };
-    let st = crate::array::new_array_of(
-        vm,
-        &[Value::from_i32(SUSPENDED_START), Value::UNDEFINED, Value::from_i32(0), object_value(f), Value::from_i32(NEXT)],
-    )?;
+    // (An async generator function's: kind 6, see `vm::Code::kind`.)
+    let is_async = unsafe { (*(*f).code).kind } == 6;
+    let root = if is_async { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
+    let proto = if crate::props::is_object(p) { p } else { object_value(vm.symbol_roots[root as usize]) };
+    let mut cells =
+        vec![Value::from_i32(SUSPENDED_START), Value::UNDEFINED, Value::from_i32(0), object_value(f), Value::from_i32(NEXT)];
+    if is_async {
+        let queue = vm.new_array();
+        cells.extend([queue, Value::FALSE, Value::FALSE, Value::TRUE]);
+    }
+    let st = crate::array::new_array_of(vm, &cells)?;
     let g = vm.new_object_with(Class::Generator, proto, 0);
     unsafe { (*g).code = st.to_bits() as *const Code };
     Ok(object_value(g))
@@ -179,6 +197,9 @@ pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Value> {
 /// of the value awaited, whose reactions run this again.
 pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
     let st = state_of(g).unwrap();
+    if get(vm, st, AG_MARK) == Value::TRUE {
+        return async_gen_step(vm, g, mode, v);
+    }
     match resume_raw(vm, g, v, mode, "an async function") {
         Ok((out, true)) => {
             let resolve = get(vm, st, 6);
@@ -198,6 +219,105 @@ pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
             crate::interp::call_function(vm, reject, Value::UNDEFINED, &[reason]).map(|_| ())
         }
     }
+}
+
+/// The value of async generator `[g]`'s coming suspension is `yield`ed
+/// (not awaited).
+pub(crate) fn async_gen_yield(vm: &mut Vm, g: Value) {
+    if let Some(st) = state_of(g) {
+        set(vm, st, AG_YIELD, Value::TRUE);
+    }
+}
+
+/// `next(v)`, `throw(v)` or `return(v)` (`mode`) of async generator `g`: a
+/// promise for the iterator result, the request queued (and run unless
+/// one is).
+fn async_gen_enqueue(vm: &mut Vm, g: Value, v: Value, mode: i32) -> Result<Value> {
+    let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
+    let st = match state_of(g) {
+        Some(st) if get(vm, st, AG_MARK) == Value::TRUE => st,
+        _ => {
+            let e = crate::builtins::caught(vm, &Error::type_error("not an async generator"));
+            crate::interp::call_function(vm, reject, Value::UNDEFINED, &[e])?;
+            return Ok(p);
+        }
+    };
+    let q = get(vm, st, AG_QUEUE);
+    crate::vm::array_push(vm, q, &[Value::from_i32(mode), v, resolve, reject])?;
+    if get(vm, st, AG_BUSY) != Value::TRUE {
+        async_gen_run(vm, g)?;
+    }
+    Ok(p)
+}
+
+/// Run async generator `g`'s oldest request, if any.
+fn async_gen_run(vm: &mut Vm, g: Value) -> Result<()> {
+    let st = state_of(g).unwrap();
+    let q = get(vm, st, AG_QUEUE);
+    if vm.length_of(q)? == 0.0 {
+        set(vm, st, AG_BUSY, Value::FALSE);
+        return Ok(());
+    }
+    set(vm, st, AG_BUSY, Value::TRUE);
+    let mode = get(vm, q, 0).as_i32_unchecked();
+    let v = get(vm, q, 1);
+    async_gen_step(vm, g, mode, v)
+}
+
+/// Resume async generator `g` (`mode`, `v`) until it awaits (the
+/// reactions resuming it again: see [`async_step`]) or settles its oldest
+/// request, by a `yield`, its end or its exception; the next request runs
+/// then.
+fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
+    let st = state_of(g).unwrap();
+    let settled = match resume_raw(vm, g, v, mode, "an async generator") {
+        Ok((out, false)) if get(vm, st, AG_YIELD) == Value::TRUE => {
+            set(vm, st, AG_YIELD, Value::FALSE);
+            Ok((out, false))
+        }
+        Ok((awaited, false)) => {
+            let on_fulfilled = crate::promise::async_closure(vm, false, g);
+            let on_rejected = crate::promise::async_closure(vm, true, g);
+            return crate::promise::await_then(vm, awaited, on_fulfilled, on_rejected);
+        }
+        Ok((out, true)) => Ok((out, true)),
+        Err(e) => Err(match e.1 {
+            Some(v) => v,
+            None => crate::builtins::caught(vm, &e),
+        }),
+    };
+    let q = get(vm, st, AG_QUEUE);
+    let (resolve, reject) = (get(vm, q, 2), get(vm, q, 3));
+    let len = vm.length_of(q)? as i32;
+    let rest: Vec<Value> = (REQUEST as i32..len).map(|i| get(vm, q, i)).collect();
+    let rest = crate::array::new_array_of(vm, &rest)?;
+    set(vm, st, AG_QUEUE, rest);
+    match settled {
+        Ok((v, done)) => {
+            let r = crate::symbol::iter_result(vm, v, done)?;
+            crate::interp::call_function(vm, resolve, Value::UNDEFINED, &[r])?;
+        }
+        Err(reason) => {
+            crate::interp::call_function(vm, reject, Value::UNDEFINED, &[reason])?;
+        }
+    }
+    async_gen_run(vm, g)
+}
+
+fn async_generator_next(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), NEXT)
+}
+
+fn async_generator_return(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), RETURN)
+}
+
+fn async_generator_throw(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    async_gen_enqueue(vm, this, a.first().copied().unwrap_or(Value::UNDEFINED), THROW)
+}
+
+fn return_this(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    Ok(this)
 }
 
 /// How the generator in `[g]` was resumed (the code after a `yield`
@@ -226,6 +346,28 @@ pub(crate) fn install(vm: &mut Vm) {
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
     let gp = vm.new_object(object_value(ip));
     vm.symbol_roots.push(gp);
+    // `%AsyncIteratorPrototype%` (its async iterator itself) and
+    // `%AsyncGeneratorPrototype%`.
+    let op = object_value(vm.object_prototype);
+    let aip = vm.new_object(op);
+    let a_async_iterator = vm.intern(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
+    let f = vm.native_function("[Symbol.asyncIterator]", return_this, 0, crate::jit::Ty::Any, false);
+    vm.add_property_with(aip, a_async_iterator, object_value(f), DONT_ENUM);
+    let agp = vm.new_object(object_value(aip));
+    vm.symbol_roots.push(agp);
+    vm.define_natives(
+        agp,
+        &[
+            ("next", async_generator_next as crate::vm::NativeFn, 1),
+            ("return", async_generator_return, 1),
+            ("throw", async_generator_throw, 1),
+        ],
+    );
+    let u: Vec<u16> = "AsyncGenerator".encode_utf16().collect();
+    let s = vm.string_constant(&u);
+    let a = vm.a_sym_to_string_tag;
+    let d = crate::props::Desc::data(s, false, false, true);
+    let _ = vm.define_own_property(agp, crate::vm::Key::Name(a), &d);
     vm.define_natives(
         gp,
         &[

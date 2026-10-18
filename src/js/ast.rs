@@ -155,6 +155,11 @@ pub struct Function<'a> {
     /// A class's constructor: the variable holding the class (whose
     /// prototype `super(…)` constructs).
     pub ctor_var: Option<Name>,
+    /// The constructor of a class with instance fields (or private
+    /// methods), or a function calling `super(…)` in a derived one's:
+    /// the variable holding the function that initializes them on
+    /// `this` (see [`Class::fields`]).
+    pub fields: Option<Name>,
     /// A generator function (`function*`, `*m() {}`).
     pub generator: bool,
     /// An async function (`async function`, `async () => …`, `async m()
@@ -215,6 +220,8 @@ pub enum StmtKind<'a> {
         pattern: Option<Box<Pattern<'a>>>,
         iterable: Expr<'a>,
         body: &'a Stmt<'a>,
+        /// `for await (…)`, in an async function: over an async iterator.
+        is_await: bool,
     },
     While(Expr<'a>, &'a Stmt<'a>),
     DoWhile(&'a Stmt<'a>, Expr<'a>),
@@ -316,9 +323,20 @@ pub enum ExprKind<'a> {
     Binary(BinOp, &'a Expr<'a>, &'a Expr<'a>),
     /// `&&` (`true`) or `||` (`false`).
     Logical(bool, &'a Expr<'a>, &'a Expr<'a>),
+    /// `a ?? b`
+    Nullish(&'a Expr<'a>, &'a Expr<'a>),
     Cond(&'a Expr<'a>, &'a Expr<'a>, &'a Expr<'a>),
     /// `target = value`, or `target op= value`.
     Assign(Option<BinOp>, &'a Expr<'a>, &'a Expr<'a>),
+    /// `target &&= value` (0), `target ||= value` (1), `target ??= value`
+    /// (2).
+    LogicalAssign(u8, &'a Expr<'a>, &'a Expr<'a>),
+    /// An optional chain (`a?.b.c`), `undefined` if any of its
+    /// [`Optional`](ExprKind::Optional) parts is null or undefined.
+    Chain(&'a Expr<'a>),
+    /// In a [`Chain`](ExprKind::Chain), the value before a `?.`: its
+    /// evaluation ends the chain if it's null or undefined.
+    Optional(&'a Expr<'a>),
     Comma(&'a Expr<'a>, &'a Expr<'a>),
 }
 
@@ -336,15 +354,29 @@ pub struct Class<'a> {
     /// methods' `super`.
     pub home: Name,
     pub home_static: Name,
+    /// Its private names' variables (each holding a new private symbol
+    /// when the class is evaluated), with their names (`#x`).
+    pub privates: Vec<(Name, Name)>,
+    /// The variable holding, and the function, defining its private
+    /// methods and its fields on a new instance (called with it as
+    /// `this`).
+    pub fields: Option<(Name, usize)>,
+    /// Functions run in order once its methods are defined, with the
+    /// class as `this`: its static fields' and static blocks'.
+    pub statics: Vec<usize>,
 }
 
 #[derive(Debug)]
 pub struct ClassMember<'a> {
     pub key: PropKey<'a>,
-    /// 0: a method; 1: a getter; 2: a setter.
+    /// 0: a method; 1: a getter; 2: a setter; 3: a field's computed key,
+    /// evaluated into variable `var` (`function` unused). A private one
+    /// (`#m() {}`): its function into variable `var` (a static one's
+    /// also defined on the class).
     pub kind: u8,
     pub is_static: bool,
     pub function: usize,
+    pub var: Option<Name>,
 }
 
 /// A destructuring pattern.

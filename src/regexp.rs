@@ -18,6 +18,8 @@ pub struct Regex {
     run: std::cell::RefCell<Run>,
     /// Capture groups, group 0 (the whole match) included.
     pub groups: usize,
+    /// The named groups (`(?<name>…)`), with their indices.
+    pub names: Vec<(String, usize)>,
     pub global: bool,
     pub ignore_case: bool,
     pub multiline: bool,
@@ -86,8 +88,9 @@ enum Node {
     Boundary(bool),
     /// A group: capturing (its index) or not.
     Group(Box<Node>, Option<usize>),
-    /// `(?=…)` (true) or `(?!…)`.
-    Look(Box<Node>, bool),
+    /// `(?=…)` (true) or `(?!…)`; behind (the third), `(?<=…)` or
+    /// `(?<!…)`.
+    Look(Box<Node>, bool, bool),
     BackRef(usize),
     Alt(Vec<Node>),
     Seq(Vec<Node>),
@@ -116,12 +119,13 @@ impl Regex {
             }
         }
         let chars: Vec<char> = pattern.chars().collect();
-        let total = count_groups(&chars);
+        let (total, names) = count_groups(&chars);
         let mut p = Parser {
             c: &chars,
             i: 0,
             groups: 1,
             total,
+            names,
             unicode,
             dot_all,
             depth: 0,
@@ -133,6 +137,7 @@ impl Regex {
         let mut re = Regex {
             node,
             groups: p.groups,
+            names: p.names,
             global,
             ignore_case,
             multiline,
@@ -511,19 +516,28 @@ fn anchored(n: &Node) -> bool {
 }
 
 /// The number of capturing groups (for telling `\N` backreferences).
-fn count_groups(c: &[char]) -> usize {
+/// The capture groups in pattern `c`, and the named ones (with their
+/// indices).
+fn count_groups(c: &[char]) -> (usize, Vec<(String, usize)>) {
     let (mut n, mut i, mut class) = (0, 0, false);
+    let mut names = Vec::new();
     while i < c.len() {
         match c[i] {
             '\\' => i += 1,
             '[' => class = true,
             ']' => class = false,
             '(' if !class && c.get(i + 1) != Some(&'?') => n += 1,
+            // `(?<name>`, not `(?<=` or `(?<!`.
+            '(' if !class && c[i + 1..].starts_with(&['?', '<']) && !matches!(c.get(i + 3), Some('=' | '!')) => {
+                n += 1;
+                let name: String = c[i + 3..].iter().take_while(|&&ch| ch != '>').collect();
+                names.push((name, n));
+            }
             _ => {}
         }
         i += 1;
     }
-    n
+    (n, names)
 }
 
 struct Parser<'a> {
@@ -532,6 +546,8 @@ struct Parser<'a> {
     /// The next capturing group's index.
     groups: usize,
     total: usize,
+    /// The named groups (all of them, found first).
+    names: Vec<(String, usize)>,
     unicode: bool,
     dot_all: bool,
     /// Groups open around the current position (up to [`MAX_NESTING`]).
@@ -666,6 +682,22 @@ impl Parser<'_> {
                 } else if self.c[self.i..].starts_with(&['?', '!']) {
                     self.i += 2;
                     (2, None)
+                } else if self.c[self.i..].starts_with(&['?', '<', '=']) {
+                    self.i += 3;
+                    (3, None)
+                } else if self.c[self.i..].starts_with(&['?', '<', '!']) {
+                    self.i += 3;
+                    (4, None)
+                } else if self.c[self.i..].starts_with(&['?', '<']) {
+                    // `(?<name>…)`
+                    self.i += 2;
+                    let name = self.group_name()?;
+                    let g = self.groups;
+                    self.groups += 1;
+                    if self.names.iter().filter(|(n, _)| *n == name).count() > 1 {
+                        return Err(self.error("Duplicate capture group name"));
+                    }
+                    (0, Some(g))
                 } else {
                     let g = self.groups;
                     self.groups += 1;
@@ -683,7 +715,7 @@ impl Parser<'_> {
                 self.i += 1;
                 match kind {
                     0 => Node::Group(Box::new(inner), cap),
-                    k => Node::Look(Box::new(inner), k == 1),
+                    k => Node::Look(Box::new(inner), k == 1 || k == 3, k >= 3),
                 }
             }
             ')' => return Err(self.error("Unmatched ')'")),
@@ -706,12 +738,41 @@ impl Parser<'_> {
         q
     }
 
+    /// A group's name, past its `<`, and its `>`.
+    fn group_name(&mut self) -> Result<String, String> {
+        let s = self.i;
+        while self.peek().is_some_and(|c| c != '>') {
+            self.i += 1;
+        }
+        let name: String = self.c[s..self.i].iter().collect();
+        let ok = name.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$')
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+        if self.peek() != Some('>') || !ok {
+            return Err(self.error("Invalid capture group name"));
+        }
+        self.i += 1;
+        Ok(name)
+    }
+
     fn escape(&mut self) -> Result<Node, String> {
         let Some(e) = self.peek() else {
             return Err(self.error("\\ at end of pattern"));
         };
         self.i += 1;
         Ok(match e {
+            // `\k<name>`: a named group's backreference (else, without
+            // named groups and `u`, a `k`).
+            'k' if !self.names.is_empty() || self.unicode => {
+                if self.peek() != Some('<') {
+                    return Err(self.error("Invalid named reference"));
+                }
+                self.i += 1;
+                let name = self.group_name()?;
+                match self.names.iter().find(|(n, _)| *n == name) {
+                    Some(&(_, g)) => Node::BackRef(g),
+                    None => return Err(self.error("Invalid named capture referenced")),
+                }
+            }
             'b' => Node::Boundary(true),
             'B' => Node::Boundary(false),
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
@@ -1086,6 +1147,11 @@ enum Insn {
     /// `after`.
     Look { negative: bool, after: u32 },
     LookEnd,
+    /// A lookbehind: its body (ending in `BehindEnd`) matched from each
+    /// position its width allows (from `min` to `max` units back, the
+    /// nearest first) to here.
+    Behind { negative: bool, after: u32, min: u32, max: u32 },
+    BehindEnd,
     Match,
 }
 
@@ -1189,7 +1255,7 @@ impl Native {
             idx[i] = n;
             n += 1;
             match code[i] {
-                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd => return None,
+                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd | Insn::Behind { .. } | Insn::BehindEnd => return None,
                 Insn::Run { .. } | Insn::LazyRun { .. } => {
                     idx[i + 1] = idx[i];
                     nruns += 1;
@@ -1296,7 +1362,9 @@ impl Native {
                     continue;
                 }
                 Insn::Match => piece("rx_match"),
-                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd => unreachable!(),
+                Insn::BackRef(_) | Insn::Look { .. } | Insn::LookEnd | Insn::Behind { .. } | Insn::BehindEnd => {
+                    unreachable!()
+                }
             };
             pieces.push(p);
             i += 1;
@@ -1425,13 +1493,23 @@ impl Program {
                 self.emit(re, inner);
                 self.code.push(Insn::Save { g: *g as u32, r });
             }
-            Node::Look(inner, positive) => {
+            Node::Look(inner, positive, false) => {
                 let at = self.code.len();
                 self.code.push(Insn::Look { negative: !positive, after: 0 });
                 self.emit(re, inner);
                 self.code.push(Insn::LookEnd);
                 let after = self.here();
                 self.code[at] = Insn::Look { negative: !positive, after };
+            }
+            Node::Look(inner, positive, true) => {
+                let (min, max) = width(inner);
+                let (min, max) = (min.min(u32::MAX as usize) as u32, max.map_or(u32::MAX, |m| m.min(u32::MAX as usize - 1) as u32));
+                let at = self.code.len();
+                self.code.push(Insn::Behind { negative: !positive, after: 0, min, max });
+                self.emit(re, inner);
+                self.code.push(Insn::BehindEnd);
+                let after = self.here();
+                self.code[at] = Insn::Behind { negative: !positive, after, min, max };
             }
             Node::Alt(alts) => {
                 let mut jumps = Vec::new();
@@ -1698,7 +1776,27 @@ impl Program {
                     pc += 1;
                     true
                 }
-                Insn::LookEnd => {
+                Insn::Behind { negative, after, min, max } => {
+                    stack.push(Bt::Look(Box::new((pos, after, negative, caps.clone()))));
+                    match pos.checked_sub(min as usize) {
+                        Some(near) => {
+                            let far = if max == u32::MAX { 0 } else { pos.saturating_sub(max as usize) };
+                            // (The nearest start first: the farther ones
+                            // as choice points.)
+                            for k in far..near {
+                                stack.push(Bt::Resume { pc: pc as u32 + 1, pos: k });
+                            }
+                            (pc, pos) = (pc + 1, near);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Insn::BehindEnd if !matches!(stack.iter().rev().find_map(|b| match b {
+                    Bt::Look(l) => Some(l.0),
+                    _ => None,
+                }), Some(at) if at == pos) => false,
+                Insn::LookEnd | Insn::BehindEnd => {
                     // The body matched: its choice points go (a lookahead
                     // matches once), its captures stay.
                     let (at, after, negative, saved) = loop {
@@ -1844,9 +1942,13 @@ impl<'a> Matcher<'a> {
                     false
                 })
             }
-            Node::Look(inner, positive) => {
+            Node::Look(inner, positive, behind) => {
                 let saved = self.caps.clone();
-                let found = self.node(inner, i, &mut |_, _| true);
+                let found = if *behind {
+                    (0..=i).rev().any(|k| self.node(inner, k, &mut |_, end| end == i))
+                } else {
+                    self.node(inner, i, &mut |_, _| true)
+                };
                 if found == *positive {
                     if k(self, i) {
                         return true;

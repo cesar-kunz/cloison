@@ -2859,8 +2859,7 @@ fn untyped_shifts_agree_with_node() {
 #[test]
 fn regexp_last_index_and_exec_arrays() {
     // `lastIndex` read and stored in its slot, `exec` arrays given their
-    // shape by a cache, literals found by search: as Node does (without
-    // ES2018's `groups`).
+    // shape by a cache, literals found by search: as Node does.
     let src = r#"var out = [], re = /a(b)?/g, s = "xab ab a";
 re.lastIndex = "2"; var m = re.exec(s); out.push(m.index, m[0], m[1], re.lastIndex);
 re.lastIndex = 3.7; m = re.exec(s); out.push(m.index, m[1], re.lastIndex);
@@ -2872,7 +2871,7 @@ m.index = 7; m.extra = 1; out.push(Object.keys(m).join("|"));
 var n = /(\d)(\d)?/.exec("a1b"); out.push(Object.keys(n).join("|"), n.index, n.input, n.length);
 var lit = /ab/; out.push(lit.exec("zzab").index, lit.test("a b"), "xxabab".replace(/ab/, "-"), "a,b,,c".split(/,/).length);
 out.join(",");"#;
-    assert_eq!(value(src), "4,ab,b,6,4,b,6,1,3,,0,7,undefined,8,false,0,true,3,0|1|index|input,true,2,0|1|index|input|extra,0|1|2|index|input,1,a1b,3,2,false,xx-ab,4");
+    assert_eq!(value(src), "4,ab,b,6,4,b,6,1,3,,0,7,undefined,8,false,0,true,3,0|1|index|input|groups,true,2,0|1|index|input|groups|extra,0|1|2|index|input|groups,1,a1b,3,2,false,xx-ab,4");
 }
 
 #[test]
@@ -4469,5 +4468,365 @@ main();"#;
     assert_eq!(
         value(src),
         "534000:number,number,undefined,boolean,string,function,object,object,function"
+    );
+}
+
+/// Destructured parameters, `**`, `??`, logical assignment, optional
+/// chains, numeric separators, optional catch bindings and object spread.
+#[test]
+fn modern_operators_and_literals() {
+    let src = r##"
+var out = [];
+function log() { out.push(Array.prototype.slice.call(arguments).map(String).join(" ")); }
+// destructured params
+function f1({b=2}={}, [c]=[3]) { return b + c; }
+function f2(a, {b}) { var b2 = b; return a + b2; }
+log(f1(), f1({b:5},[1]), f2(1, {b:2}));
+// **
+var x = 2; x **= 3; log(2**10, x, (-2)**2, 2**-1, 2**3**2, Math.pow(1, NaN), 1 ** NaN);
+var o = {v: 3}; o.v **= 2; var arr = [2]; arr[0] **= 4; log(o.v, arr[0]);
+log({valueOf(){ return 3 }} ** 2);
+// ??
+log(null ?? 1, 0 ?? 2, undefined ?? "u", false ?? true, "" ?? "e");
+var calls = 0; function side() { calls++; return 5; }
+log(1 ?? side(), calls);
+// logical assignment
+var a = null; a ??= 5; var b = 0; b ||= 3; var c = 1; c &&= 7; var d = 0; d &&= 9;
+log(a, b, c, d);
+var obj = {p: null, q: 1}; obj.p ??= "set"; obj.q ??= "no"; obj.r ||= "r";
+log(obj.p, obj.q, obj.r);
+var cnt = 0; var holder = {get g(){ cnt++; return 1 }, set g(v){ cnt += 100 }}; holder.g ||= 2; log(cnt);
+var ks = 0; var ar2 = [0, 1]; ar2[ks++] ||= 8; log(ar2.join(), ks);
+var fn = null; fn ??= function () {}; log(fn.name);
+// ?.
+var n = null, u, deep = {a: {b: {c: 1}}, f() { return this === deep; }, arr: [10]};
+log(n?.x, u?.x.y.z, deep?.a?.b?.c, deep.a?.["b"].c, deep.f?.(), deep.g?.(), deep.arr?.[0]);
+log(n?.(), deep?.f(), typeof u?.[side()], calls);
+log((n?.a)?.b, delete n?.x, delete deep?.a.b, JSON.stringify(deep.a));
+log(true?.5:1);
+var spreadArgs = [1,2]; var mm = {m(...xs){ return this === mm && xs.join(); }}; log(mm.m?.(...spreadArgs), mm.z?.(...spreadArgs));
+// numeric separators
+log(1_000_000, 0b1010_1010, 1_0.5_0, 1e1_0, 0o7_7);
+// optional catch
+try { throw 1 } catch { log("caught") }
+// object spread / rest
+var src = {a: 1, b: 2}; var sp = {...src, c: 3, ...null, ...undefined, ..."hi"};
+log(JSON.stringify(sp));
+var {a: aa, ...rest} = {a: 1, b: 2, c: 3}; log(aa, JSON.stringify(rest));
+var r2; ({a: aa, ...r2} = {a: 4, z: 5}); log(aa, JSON.stringify(r2));
+var getterCalls = 0; var gs = {...{get g() { getterCalls++; return 1; }}}; log(getterCalls, Object.getOwnPropertyDescriptor(gs, "g").value);
+var protoSetter = 0; Object.defineProperty(Object.prototype, "ps", {set(v) { protoSetter++; }, configurable: true});
+var sp2 = {...{ps: 1}}; log(protoSetter, sp2.ps); delete Object.prototype.ps;
+out.join(" | ");"##;
+    assert_eq!(
+        value(src),
+        "5 6 3 | 1024 8 4 0.5 512 NaN NaN | 9 16 | 9 | 1 0 u false  | 1 0 | 5 3 7 0 | set 1 r | 1 | 8,1 1 | fn | undefined undefined 1 1 true undefined 10 | undefined true undefined 0 | undefined true true {} | 0.5 | 1,2 undefined | 1000000 170 10.5 10000000000 63 | caught | {\"0\":\"h\",\"1\":\"i\",\"a\":1,\"b\":2,\"c\":3} | 1 {\"b\":2,\"c\":3} | 4 {\"z\":5} | 1 1 | 0 1"
+    );
+}
+
+/// `at`, `findLast`, the copying array methods, `replaceAll`,
+/// `matchAll`, `Object.fromEntries`/`hasOwn`/`groupBy`, `Map.groupBy`
+/// and errors' `cause`.
+#[test]
+fn newer_builtins() {
+    let src = r##"
+var out = [];
+function log() { out.push(Array.prototype.slice.call(arguments).map(String).join(" ")); }
+log([1,2,3].at(-1), [1,2,3].at(5), "abc".at(-1), [1,2,3].at(0.5));
+log([1,2,3,4].findLast(x => x % 2), [1,2,3,4].findLastIndex(x => x > 9), [1,2,3,4].findLastIndex(x => x < 3));
+var orig = [3,1,2]; log(orig.toSorted().join(), orig.join(), orig.toReversed().join(), orig.with(-1, 9).join(), orig.toSpliced(1, 1, "a", "b").join());
+log([1,,3].toSorted().length, [5, 1, 10].toSorted((a, b) => a - b).join());
+try { [1].with(5, 0) } catch (e) { log(e.name) }
+log("aXbXc".replaceAll("X", "-"), "aaa".replaceAll("a", "$&$&"), "abc".replaceAll("", "_"), "a.b.c".replaceAll(".", (m, i) => i));
+log("a1b2c3".replaceAll(/\d/g, "#"));
+try { "a".replaceAll(/a/, "b") } catch (e) { log(e.name) }
+log([..."a1b22c333".matchAll(/\d+/g)].map(m => m[0] + "@" + m.index).join());
+log([..."x.y.z".matchAll(".")].length);
+try { "a".matchAll(/a/) } catch (e) { log(e.name) }
+log(JSON.stringify(Object.fromEntries([["a", 1], ["b", 2]])), JSON.stringify(Object.fromEntries(new Map([["m", 3]]))));
+log(Object.hasOwn({a: 1}, "a"), Object.hasOwn({a: 1}, "toString"));
+var g = Object.groupBy([1, 2, 3, 4, 5], x => x % 2 ? "odd" : "even"); log(Object.getPrototypeOf(g), JSON.stringify(g));
+var mg = Map.groupBy([1, 2, 3], x => x > 1); log(mg.get(true).join(), mg.get(false).join(), mg.size);
+var e = new Error("x", {cause: "why"}); log(e.cause, Object.keys(e).length, "cause" in new Error("y"), new TypeError("t", {cause: 0}).cause);
+out.join(" | ");"##;
+    assert_eq!(
+        value(src),
+        "3 undefined c 1 | 3 -1 1 | 1,2,3 3,1,2 2,1,3 3,1,9 3,a,b,2 | 3 1,5,10 | RangeError | a-b-c aaaaaa _a_b_c_ a1b3c | a#b#c# | TypeError | 1@1,22@3,333@6 | 5 | TypeError | {\"a\":1,\"b\":2} {\"m\":3} | true false | null {\"odd\":[1,3,5],\"even\":[2,4]} | 2,3 1 2 | why 0 false 0"
+    );
+}
+
+/// The new operators in code hot enough to compile.
+#[test]
+fn modern_operators_when_compiled() {
+    let src = r##"
+function hot(o, i) {
+  var s = 0;
+  s += o?.a?.b ?? 1;
+  s += o?.m?.(i) ?? 2;
+  s += i ** 2;
+  var q = o.c; q ??= 3; s += q;
+  o.d ||= i; s += o.d;
+  o.e &&= 5; s += o.e ?? 0;
+  var { x = 1, ...r } = o.rest ?? {}; s += x + Object.keys(r).length;
+  var sp = { ...o.rest, z: i }; s += sp.z;
+  return s;
+}
+var total = 0;
+for (var i = 0; i < 20000; i++) {
+  var o = i % 3 == 0 ? { a: { b: i }, m(k) { return k + 1; }, c: null, e: 1, rest: { x: 2, y: 3 } }
+        : i % 3 == 1 ? { a: null, c: 7, d: 4 } : { a: { b: null }, m: null, e: 0 };
+  total += hot(o, i % 100);
+}
+var res = [total];
+var t = 0; for (var j = 0; j < 10000; j++) { t += (j % 7) ** 0.5; } res.push(t.toFixed(6));
+var u; for (var k = 0; k < 10000; k++) { u = k % 2 ? null : { v: k }; t += u?.v ?? -1; } res.push(t.toFixed(6));
+res.join(" ");"##;
+    assert_eq!(
+        value(src),
+        "134540037 15471.988209 25005471.988209"
+    );
+}
+
+/// Class fields (computed, static), private fields, methods and
+/// accessors (static too, with brand checks and `#x in o`), and static
+/// blocks, in the order the spec defines.
+#[test]
+fn class_fields_private_names_and_static_blocks() {
+    let src = r##"
+var out = [];
+function log() { out.push(Array.prototype.slice.call(arguments).map(String).join(" ")); }
+function t(name, f) { try { log(name, f()); } catch (e) { log(name, "!" + e.name); } }
+class A {
+  x = 1;
+  y = this.x + 1;
+  #p = 3;
+  static s = 10;
+  static #sp = 20;
+  ["comp" + 1] = "c";
+  arrow = () => this.x;
+  fn = function () {};
+  noinit;
+  get p() { return this.#p; }
+  set p(v) { this.#p = v; }
+  #m() { return "m" + this.#p; }
+  callM() { return this.#m(); }
+  get #g() { return "g"; }
+  set #g(v) { this.log = v; }
+  useG() { this.#g = 5; return this.#g + this.log; }
+  static sp() { return A.#sp; }
+  static #sm() { return "sm"; }
+  static callSm() { return this.#sm(); }
+  static has(o) { return #p in o; }
+  static { A.block = A.s + 1; var local = 2; A.local = local; }
+  static self = this;
+}
+var a = new A();
+t("fields", () => [a.x, a.y, a.p, a.comp1, a.arrow(), a.fn.name, "noinit" in a, a.noinit].join());
+t("set", () => { a.p = 7; return a.p; });
+t("method", () => a.callM());
+t("accessor", () => a.useG());
+t("statics", () => [A.s, A.sp(), A.callSm(), A.block, A.local, A.self === A].join());
+t("has", () => [A.has(a), A.has({})].join());
+t("hasPrim", () => A.has(1));
+t("keys", () => JSON.stringify(Object.keys(a)) + Object.getOwnPropertySymbols(a).length + Reflect.ownKeys(a).length);
+t("brand", () => A.prototype.callM.call({}));
+t("brandSet", () => Object.getOwnPropertyDescriptor(A.prototype, "p").set.call({}, 1));
+t("distinct", () => { var b = new A(); b.p = 100; return a.p + "," + b.p; });
+class B extends A {
+  z = this.x * 10;
+  #q = "q";
+  constructor(k) { super(); this.k = k; }
+  q() { return this.#q + this.z + this.k; }
+}
+var b = new B(4);
+t("derived", () => [b.q(), b.x, b.p, b instanceof A].join());
+class C extends A { w = 2; }
+t("defaultDerived", () => [new C().w, new C().x].join());
+class D extends A { v = 1; constructor() { var f = () => super(); f(); this.after = this.v; } }
+t("arrowSuper", () => new D().after);
+class E2 { #x = 1; static get(o) { return o.#x; } }
+t("otherClass", () => E2.get(new A()));
+class F { #x = 1; m() { class G { #x = 2; read(o) { return o.#x; } } return new G().read(this); } }
+t("shadow", () => new F().m());
+class H { static #c = 0; static inc() { return ++H.#c; } static add() { H.#c += 10; return H.#c; } }
+t("update", () => [H.inc(), H.inc(), H.add()].join());
+class I { #v = null; f() { this.#v ??= 5; this.#v ||= 6; return this.#v; } g() { return this?.#v; } }
+t("logical", () => new I().f());
+t("optional", () => new I().g());
+class J { #m() {} tryWrite() { this.#m = 1; } }
+t("writeMethod", () => new J().tryWrite());
+class K { get #r() { return 1; } w() { this.#r = 2; } }
+t("noSetter", () => new K().w());
+var order = [];
+class L { a = order.push("a"); static s = order.push("s"); b = order.push("b"); constructor() { order.push("ctor"); } }
+new L();
+t("order", () => order.join());
+class M { x = 1; constructor() { return { y: 2 }; } }
+t("ctorReturn", () => JSON.stringify(new M()));
+var counter = 0;
+class N { [counter++] = counter; [counter++] = counter; }
+t("computedOnce", () => JSON.stringify(new N()) + JSON.stringify(new N()) + counter);
+class O { #x = 1; static peek(o) { return o.#x; } constructor() { Object.freeze(this); } bump() { this.#x++; return this.#x; } }
+t("frozen", () => new O().bump());
+t("spreadNoPriv", () => JSON.stringify({ ...new O() }));
+class P { static x = 1; static y = P.x + 1; static z = this.y + 1; }
+t("staticThis", () => [P.x, P.y, P.z].join());
+class Q { 'quoted' = 1; 42 = 2; static async = 3; get = 4; set; static = 5; }
+var q = new Q();
+t("oddNames", () => [q.quoted, q[42], Q.async, q.get, "set" in q, q.static].join());
+class R { x = 1
+  y = 2
+  #z = 3
+  sum() { return this.x + this.y + this.#z } }
+t("asi", () => new R().sum());
+for (var i = 0; i < 3; i++) { class S { #v = i; static read(o) { return o.#v; } } if (i == 2) t("loopClasses", () => S.read(new S())); }
+var Ss = []; for (let i = 0; i < 2; i++) Ss.push(class { #v = i; static read(o) { return o.#v; } });
+t("perEval", () => Ss[0].read(new Ss[1]()));
+t("toString", () => String(class X { y = 1 }).length > 0);
+out.join(" | ");"##;
+    assert_eq!(
+        value(src),
+        "fields 1,2,3,c,1,fn,true, | set 7 | method m7 | accessor g5 | statics 10,20,sm,11,2,true | has true,false | hasPrim !TypeError | keys [\"x\",\"y\",\"comp1\",\"arrow\",\"fn\",\"noinit\",\"log\"]07 | brand !TypeError | brandSet !TypeError | distinct 7,100 | derived q104,1,3,true | defaultDerived 2,1 | arrowSuper 1 | otherClass !TypeError | shadow !TypeError | update 1,2,12 | logical 5 | optional null | writeMethod !TypeError | noSetter !TypeError | order s,a,b,ctor | ctorReturn {\"y\":2} | computedOnce {\"0\":2,\"1\":2}{\"0\":2,\"1\":2}2 | frozen 2 | spreadNoPriv {} | staticThis 1,2,3 | oddNames 1,2,3,4,true,5 | asi 6 | loopClasses 2 | perEval !TypeError | toString true"
+    );
+}
+
+/// Private fields and fields of derived classes in code hot enough to
+/// compile.
+#[test]
+fn class_fields_when_compiled() {
+    let src = r##"
+class Vec { #x; #y; static count = 0;
+  constructor(x, y) { this.#x = x; this.#y = y; Vec.count++; }
+  get x() { return this.#x; }
+  add(o) { return new Vec(this.#x + o.#x, this.#y + o.#y); }
+  len2() { return this.#x * this.#x + this.#y * this.#y; } }
+class Vec3 extends Vec { z = 0; #w = 1; constructor(x, y, z) { super(x, y); this.z = z; } w() { return this.#w++; } }
+var acc = new Vec(0, 0), s = 0;
+for (var i = 0; i < 5000; i++) { acc = acc.add(new Vec(i % 3, 1)); var v3 = new Vec3(1, 2, i); s += v3.z + v3.w() + v3.len2(); }
+var res = [acc.x, acc.len2(), Vec.count, s];
+class Pt { x = 1; y = 2; }
+var t = 0; for (var j = 0; j < 5000; j++) { var p = new Pt(); p.x += j; t += p.x + p.y; } res.push(t); res.join(" ");"##;
+    assert_eq!(
+        value(src),
+        "4999 49990001 15001 12527500 12512500"
+    );
+}
+
+/// Async generators (awaits, queued requests, `return`/`throw`, `finally`)
+/// and `for await` over async, sync and custom iterators, with `yield*`.
+#[test]
+fn async_generators_and_for_await() {
+    for (src, expected) in [
+        (
+            r##"
+var out = [];
+function log() { out.push(Array.prototype.slice.call(arguments).map(String).join(" ")); }
+async function* gen(n) {
+  for (let i = 0; i < n; i++) { await null; yield i; }
+  return "end";
+}
+async function* thrower() { yield 1; throw new Error("boom"); }
+async function* awaitsYield() { var x = yield Promise.resolve("p"); log("got", x); yield x * 2; }
+async function* withFinally() { try { yield 1; yield 2; } finally { log("cleanup"); } }
+var syncIterable = { [Symbol.iterator]() { var i = 0; return { next() { i++; return { value: i < 4 ? Promise.resolve(i * 10) : undefined, done: i >= 4 }; }, return() { log("sync return"); return {}; } }; } };
+var customAsync = { [Symbol.asyncIterator]() { var i = 0; return { next() { i++; return Promise.resolve({ value: "c" + i, done: i > 2 }); }, return() { log("async return"); return Promise.resolve({ done: true }); } }; } };
+(async () => {
+  var it = gen(3);
+  log(typeof it.next, Object.prototype.toString.call(it), typeof it[Symbol.asyncIterator], it[Symbol.asyncIterator]() === it);
+  var r1 = it.next(), r2 = it.next();
+  log(r1 instanceof Promise, JSON.stringify(await r1), JSON.stringify(await r2));
+  log(JSON.stringify(await it.next()), JSON.stringify(await it.next()), JSON.stringify(await it.next()));
+  var vals = []; for await (var v of gen(4)) vals.push(v); log("for await gen", vals.join());
+  var t = thrower(); log(JSON.stringify(await t.next()));
+  try { await t.next(); } catch (e) { log("caught", e.message); }
+  log(JSON.stringify(await t.next()));
+  var ay = awaitsYield(); log(JSON.stringify(await ay.next())); log(JSON.stringify(await ay.next(21))); log(JSON.stringify(await ay.next()));
+  var wf = withFinally(); log(JSON.stringify(await wf.next())); log(JSON.stringify(await wf.return("r"))); log(JSON.stringify(await wf.next()));
+  for await (var w of withFinally()) { log("w", w); break; }
+  var sv = []; for await (const s of syncIterable) sv.push(s); log("sync", sv.join());
+  for await (const s of syncIterable) { log("s", s); break; }
+  var cv = []; for await (let c of customAsync) cv.push(c); log("custom", cv.join());
+  for await (let c of customAsync) { break; }
+  var arr = []; for await (const x of [1, Promise.resolve(2), 3]) arr.push(x); log("array", arr.join());
+  try { for await (const x of gen(5)) { if (x == 1) throw new Error("inner"); } } catch (e) { log("loop throw", e.message); }
+  var early = gen(2); var ret = await early.return(7); log("early return", JSON.stringify(ret), JSON.stringify(await early.next()));
+  var ethrow = gen(2); try { await ethrow.throw(new Error("et")); } catch (e) { log("early throw", e.message); }
+  async function* inf() { var i = 0; while (true) yield i++; }
+  var s = 0; for await (const x of inf()) { if (x > 100) break; s += x; } log("inf", s);
+  var queued = gen(3); var ps = [queued.next(), queued.next(), queued.next(), queued.next()]; log("queued", (await Promise.all(ps)).map(r => r.value + "/" + r.done).join());
+  class K { async *m() { yield this.v; } constructor() { this.v = "method"; } }
+  for await (const x of new K().m()) log(x);
+  var o = { async *[Symbol.asyncIterator]() { yield "obj"; } }; for await (const x of o) log(x);
+  var ae = async function* () { yield await new Promise(r => r("x")); };
+})().catch(e => log("ERR", e));"##,
+            "function [object AsyncGenerator] function true | true {\"value\":0,\"done\":false} {\"value\":1,\"done\":false} | {\"value\":2,\"done\":false} {\"value\":\"end\",\"done\":true} {\"done\":true} | for await gen 0,1,2,3 | {\"value\":1,\"done\":false} | caught boom | {\"done\":true} | {\"value\":\"p\",\"done\":false} | got 21 | {\"value\":42,\"done\":false} | {\"done\":true} | {\"value\":1,\"done\":false} | cleanup | {\"value\":\"r\",\"done\":true} | {\"done\":true} | w 1 | cleanup | sync 10,20,30 | s 10 | sync return | custom c1,c2 | async return | array 1,2,3 | loop throw inner | early return {\"value\":7,\"done\":true} {\"done\":true} | early throw et | inf 5050 | queued 0/false,1/false,2/false,end/true | method | obj",
+        ),
+        (
+            r##"
+var out = [];
+function log() { out.push(Array.prototype.slice.call(arguments).map(String).join(" ")); }
+async function* inner() { var x = yield 1; log("inner got", x); try { yield 2; } finally { log("inner finally"); } return "inner-done"; }
+async function* outer() { var r = yield* inner(); log("delegate result", r); yield 3; }
+async function* overSync() { var r = yield* [Promise.resolve("a"), "b"]; log("sync r", r); }
+async function* overThrow() { try { yield* inner(); } catch (e) { log("outer caught", e); yield "recovered"; } }
+async function* plain() { yield* (async function* () { yield 10; yield 20; })(); }
+(async () => {
+  var it = outer();
+  log(JSON.stringify(await it.next()), JSON.stringify(await it.next("X")), JSON.stringify(await it.next()), JSON.stringify(await it.next()), JSON.stringify(await it.next()));
+  var vs = []; for await (const v of overSync()) vs.push(v); log("over sync", vs.join());
+  var t = overThrow(); await t.next(); await t.next(); log(JSON.stringify(await t.throw("E")));
+  var r = outer(); await r.next(); log(JSON.stringify(await r.return("early")), JSON.stringify(await r.next()));
+  var p = []; for await (const v of plain()) p.push(v); log("plain", p.join());
+})().catch(e => log("ERR", e));"##,
+            "inner got X | inner finally | delegate result inner-done | {\"value\":1,\"done\":false} {\"value\":2,\"done\":false} {\"value\":3,\"done\":false} {\"done\":true} {\"done\":true} | sync r undefined | over sync a,b | inner got undefined | inner finally | outer caught E | {\"value\":\"recovered\",\"done\":false} | {\"value\":\"early\",\"done\":true} {\"done\":true} | plain 10,20",
+        ),
+    ] {
+        let first = cloison::js::compile(src).unwrap();
+        let second = cloison::js::compile("out.join(' | ')").unwrap();
+        for budget in [i64::MAX, 1, 1000] {
+            let mut vm = Vm::new();
+            vm.set_tier_back_edges(budget);
+            vm.run(&first).unwrap();
+            let r = vm.run(&second).map(display).unwrap();
+            assert_eq!(r, expected, "tier at {budget}");
+        }
+    }
+}
+
+/// Named capture groups (`groups`, `\k<name>`, `$<name>`, a replacer's
+/// last argument) and lookbehinds, positive and negative.
+#[test]
+fn regexp_named_groups_and_lookbehind() {
+    let src = r##"
+var out = [];
+function log() { out.push(Array.prototype.slice.call(arguments).map(String).join(" ")); }
+function t(name, f) { try { log(name, f()); } catch (e) { log(name, "!" + e.name); } }
+var m = "2020-01-31".match(/(?<y>\d{4})-(?<m>\d\d)-(?<d>\d\d)/);
+t("groups", () => [m.groups.y, m.groups.m, m.groups.d, Object.getPrototypeOf(m.groups), Object.keys(m.groups).join()].join());
+t("noGroups", () => "groups" in "a".match(/a/) ? "has" : "none");
+t("unmatched", () => JSON.stringify("b".match(/(?<a>a)?b/).groups));
+t("backref", () => /(?<q>['"]).*?\k<q>/.exec(`say "hi" 'x'`)[0]);
+t("fwdNameRef", () => /\k<x>(?<x>a)/.test("a"));
+t("replaceTpl", () => "2020-01-31".replace(/(?<y>\d+)-(?<m>\d+)-(?<d>\d+)/, "$<d>/$<m>/$<y> $<nope>|"));
+t("replaceFn", () => "a1b2".replace(/(?<l>[a-z])(?<n>\d)/g, (...args) => { var g = args[args.length - 1]; return g.n + g.l; }));
+t("matchAll", () => [..."k1=v1;k2=v2".matchAll(/(?<k>\w+)=(?<v>\w+)/g)].map(m => m.groups.k + ":" + m.groups.v).join());
+t("dupName", () => new RegExp("(?<a>x)(?<a>y)"));
+t("badName", () => new RegExp("(?<1a>x)"));
+t("kWithoutNames", () => /\k/.test("k"));
+t("behind", () => "$5 €6 $7".match(/(?<=\$)\d/g).join());
+t("negBehind", () => "$5 €6 $7".match(/(?<!\$)\d/g).join());
+t("behindVar", () => "abc123 xyz456".match(/(?<=[a-z]+)\d+/g).join());
+t("behindAlt", () => "ab1 cd2 ef3".match(/(?<=ab|ef)\d/g).join());
+t("behindStart", () => /(?<=^)x/.test("x") + "," + /(?<=a)x/.test("x"));
+t("behindCapture", () => JSON.stringify("ab".match(/(?<=(a))b/)));
+t("behindReplace", () => "price: 10, cost: 20".replace(/(?<=cost: )\d+/, "X"));
+t("lookahead", () => "a1b2".replace(/[a-z](?=2)/, "_"));
+t("behindSticky", () => { var r = /(?<=a)b/y; r.lastIndex = 1; return r.test("ab"); });
+t("behindNested", () => "xaby".match(/(?<=(?<!q)a)b/)[0]);
+t("hot", () => { var n = 0; for (var i = 0; i < 2000; i++) { if (/(?<=x)y/.test("axy" + i)) n++; } return n; });
+out.join(" | ");"##;
+    assert_eq!(
+        value(src),
+        "groups 2020,01,31,,y,m,d | noGroups has | unmatched {} | backref \"hi\" | fwdNameRef true | replaceTpl 31/01/2020 | | replaceFn 1a2b | matchAll k1:v1,k2:v2 | dupName !SyntaxError | badName !SyntaxError | kWithoutNames true | behind 5,7 | negBehind 6 | behindVar 123,456 | behindAlt 1,3 | behindStart true,false | behindCapture [\"b\",\"a\"] | behindReplace price: 10, cost: X | lookahead a1_2 | behindSticky true | behindNested b | hot 2000"
     );
 }

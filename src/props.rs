@@ -390,10 +390,15 @@ impl Vm {
     pub(crate) fn seal(&mut self, o: *mut Object, freeze: bool) {
         unsafe {
             let s = &*(*o).shape;
+            // (Not private names' properties, which stay as they are.)
             let attrs: Vec<u8> = s
                 .attrs
                 .iter()
-                .map(|&a| {
+                .zip(s.keys.iter())
+                .map(|(&a, &key)| {
+                    if crate::symbol::is_private_atom(self, key) {
+                        return a;
+                    }
                     let mut a = a | DONT_DELETE;
                     if freeze && a & ACCESSOR == 0 {
                         a |= READ_ONLY;
@@ -1059,6 +1064,9 @@ pub(crate) fn install(vm: &mut Vm) {
             ("values", object_values, 1),
             ("entries", object_entries, 1),
             ("getOwnPropertyDescriptors", object_get_own_property_descriptors, 1),
+            ("fromEntries", object_from_entries, 1),
+            ("hasOwn", object_has_own, 2),
+            ("groupBy", object_group_by, 2),
         ],
     );
     vm.define_natives(
@@ -1367,6 +1375,78 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: &[Value]) -> Re
             vm.create_data_property(out, key, dv)?;
         }
     }
+    Ok(out)
+}
+
+/// `Object.fromEntries(iterable)`: a plain object of its `[key, value]`
+/// entries.
+fn object_from_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let it = arg(a, 0);
+    if it.is_undefined() || it.is_null() {
+        return Err(Error::type_error(format!("{} is not iterable", crate::vm::display(it))));
+    }
+    let op = object_value(vm.object_prototype);
+    let out = object_value(vm.new_object(op));
+    crate::symbol::iterate(vm, it, |vm, entry| {
+        if !is_object(entry) {
+            return Err(Error::type_error(format!(
+                "Iterator value {} is not an entry object",
+                crate::vm::display(entry)
+            )));
+        }
+        let k = vm.get_key(entry, Key::Index(0))?;
+        let v = vm.get_key(entry, Key::Index(1))?;
+        let key = crate::intrinsics::to_property_key(vm, k)?;
+        vm.create_data_property(out, key, v)
+    })?;
+    Ok(out)
+}
+
+/// `Object.hasOwn(o, key)`.
+fn object_has_own(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let o = vm.to_object(arg(a, 0))?;
+    let key = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
+    Ok(Value::from_bool(vm.own_property(o, key).is_some()))
+}
+
+/// GroupBy(items, callback): each item with the key the callback gives it
+/// (in order of first appearance), to `add`.
+pub(crate) fn group_by(
+    vm: &mut Vm,
+    a: &[Value],
+    mut add: impl FnMut(&mut Vm, Value, Value) -> Result<()>,
+) -> Result<()> {
+    let (items, f) = (arg(a, 0), arg(a, 1));
+    if items.is_undefined() || items.is_null() {
+        return Err(Error::type_error(format!("{} is not iterable", crate::vm::display(items))));
+    }
+    if !is_callable(f) {
+        return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
+    }
+    let mut k = 0.0;
+    crate::symbol::iterate(vm, items, |vm, v| {
+        let key = call_function(vm, f, Value::UNDEFINED, &[v, Value::number(k)])?;
+        k += 1.0;
+        add(vm, key, v)
+    })
+}
+
+/// `Object.groupBy(items, callback)`: a null-prototype object of arrays.
+fn object_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let out = object_value(vm.new_object(Value::NULL));
+    group_by(vm, a, |vm, key, v| {
+        let key = crate::intrinsics::to_property_key(vm, key)?;
+        let group = match vm.own_property(as_object(out), key) {
+            Some(_) => vm.get_key(out, key)?,
+            None => {
+                let g = vm.new_array();
+                vm.create_data_property(out, key, g)?;
+                g
+            }
+        };
+        crate::vm::array_push(vm, group, &[v])?;
+        Ok(())
+    })?;
     Ok(out)
 }
 

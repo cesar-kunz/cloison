@@ -462,7 +462,9 @@ fn eval_scope(p: &Program, i: usize) -> Option<usize> {
 
 /// `vm::Code::kind` for `f`.
 fn function_kind(f: &Function) -> u8 {
-    if f.is_async {
+    if f.is_async && f.generator {
+        6
+    } else if f.is_async {
         5
     } else if f.generator {
         4
@@ -621,8 +623,19 @@ fn expr_names<'a>(e: &'a Expr, out: &mut Vec<&'a str>, forwarded: bool) {
             }
             expr_refs(e, out)
         }),
-        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) => expr_refs(o, out),
-        Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) | Assign(_, a, b) => {
+        // (A private name's variable too.)
+        Member(o, n) if n.starts_with('#') && !forwarded => {
+            out.push(n);
+            expr_refs(o, out);
+        }
+        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) | Chain(o) | Optional(o) => expr_refs(o, out),
+        Index(a, b)
+        | Binary(_, a, b)
+        | Logical(_, a, b)
+        | Nullish(a, b)
+        | Comma(a, b)
+        | Assign(_, a, b)
+        | LogicalAssign(_, a, b) => {
             expr_refs(a, out);
             expr_refs(b, out);
         }
@@ -710,6 +723,8 @@ fn references<'a>(f: &'a Function<'_>) -> Vec<&'a str> {
     };
     // (The objects of the `with` statements enclosing it: captured.)
     out.extend(f.withs.iter().map(|n| &**n));
+    // (Its class's fields' function, which it calls.)
+    out.extend(f.fields.as_deref());
     out
 }
 
@@ -1002,8 +1017,14 @@ fn children<'a>(e: &'a Expr<'a>, out: &mut Vec<&'a Expr<'a>>) {
                 out.push(v);
             }
         }
-        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) => out.push(o),
-        Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) | Assign(_, a, b) => {
+        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) | Chain(o) | Optional(o) => out.push(o),
+        Index(a, b)
+        | Binary(_, a, b)
+        | Logical(_, a, b)
+        | Nullish(a, b)
+        | Comma(a, b)
+        | Assign(_, a, b)
+        | LogicalAssign(_, a, b) => {
             out.push(a);
             out.push(b);
         }
@@ -1147,7 +1168,7 @@ fn smi(e: &Expr) -> Option<i32> {
 fn assigns(e: &Expr, name: &str) -> bool {
     use ExprKind::*;
     match &e.kind {
-        Assign(_, t, v) => {
+        Assign(_, t, v) | LogicalAssign(_, t, v) => {
             matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name) || assigns(v, name)
         }
         Update(t, ..) => matches!(&t.kind, Ident(n) if &**n == name) || assigns(t, name),
@@ -1170,9 +1191,9 @@ fn assigns(e: &Expr, name: &str) -> bool {
         Object(ps, _) => ps
             .iter()
             .any(|(k, e)| matches!(k, PropKey::Computed(k) if assigns(k, name)) || assigns(e, name)),
-        Member(o, _) | Spread(o) => assigns(o, name),
+        Member(o, _) | Spread(o) | Chain(o) | Optional(o) => assigns(o, name),
         Unary(_, x) => assigns(x, name),
-        Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Comma(a, b) => {
+        Index(a, b) | Binary(_, a, b) | Logical(_, a, b) | Nullish(a, b) | Comma(a, b) => {
             assigns(a, name) || assigns(b, name)
         }
         Call(f, args) | New(f, args) => assigns(f, name) || args.iter().any(|e| assigns(e, name)),
@@ -1347,6 +1368,9 @@ struct Gen<'a> {
     ics: Vec<Name>,
     /// The slots of `ics` that define properties (see `FunctionDef::defines`).
     defines: Vec<u16>,
+    /// The optional chains being compiled: where each one's evaluation
+    /// goes once a part of it is null or undefined.
+    chains: Vec<L>,
     /// The names of the module's caches, each once (see [`Gen::ic`]).
     names: &'a std::cell::RefCell<HashSet<Name>>,
     closures: Vec<usize>,
@@ -1416,6 +1440,8 @@ struct TryCtx<'a> {
     /// A `for (… of …)` loop's: the register of the iterator to close when
     /// a jump leaves it (its "finally").
     close: Option<u8>,
+    /// A `for await` loop's: the close awaited.
+    close_async: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -1459,6 +1485,7 @@ impl<'a> Gen<'a> {
             labels: Vec::new(),
             ics: Vec::new(),
             defines: Vec::new(),
+            chains: Vec::new(),
             names,
             closures: Vec::new(),
             constants: Vec::new(),
@@ -1522,6 +1549,12 @@ impl<'a> Gen<'a> {
             if self.f.class_kind != 0 {
                 self.intrinsic("class_call_check", r, 1);
             }
+        }
+        // A base class's fields, defined on `this` first.
+        if self.f.class_kind == 2
+            && let Some(v) = &self.f.fields
+        {
+            self.init_fields(v, 0, self.f.pos)?;
         }
         // The scope object, with each of its variables (`undefined`, in
         // order: one shape).
@@ -1951,6 +1984,35 @@ impl<'a> Gen<'a> {
         self.emit(op, &[Arg::Reg(obj), ic]);
     }
 
+    /// `GetNamed`/`SetNamed` of property `name` of a member expression
+    /// (`o.name`): a private name's (see `Parser::private_ref`) through
+    /// the runtime, with its variable's symbol.
+    fn member(&mut self, op: Op, obj: u8, name: &str) -> R<()> {
+        if !name.starts_with('#') {
+            self.named(op, obj, name);
+            return Ok(());
+        }
+        let mark = self.temp;
+        let pos = self.f.pos;
+        let o = self.alloc(pos)?;
+        let k = self.alloc(pos)?;
+        if op == Op::SetNamed {
+            let v = self.alloc(pos)?;
+            self.star(v);
+            self.mov(obj, o);
+            self.load_var(name, pos)?;
+            self.star(k);
+            self.intrinsic("private_set", o, 3);
+        } else {
+            self.mov(obj, o);
+            self.load_var(name, pos)?;
+            self.star(k);
+            self.intrinsic("private_get", o, 2);
+        }
+        self.temp = mark;
+        Ok(())
+    }
+
     /// `LdaConstant` of `c`, one slot per distinct constant.
     fn constant(&mut self, c: Constant) {
         let i = self.const_index(c);
@@ -2114,6 +2176,138 @@ impl<'a> Gen<'a> {
     }
 
     /// Strict code's `delete` that failed (`acc` false) throws.
+    /// `delete x`: a property or element (the key in `acc`), a global
+    /// (its name in `acc`); a variable isn't deleted (false), and anything
+    /// else is just evaluated (true).
+    fn delete(&mut self, x: &Expr, pos: Pos) -> R<()> {
+        use ExprKind::*;
+        match &x.kind {
+            Member(o, name) => {
+                let mark = self.temp;
+                let r = self.reg(o, &[])?;
+                self.string(name);
+                self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                self.strict_delete_check(pos)?;
+                self.temp = mark;
+            }
+            Index(o, k) => {
+                let mark = self.temp;
+                let r = self.reg(o, &[k])?;
+                self.value(k)?;
+                self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                self.strict_delete_check(pos)?;
+                self.temp = mark;
+            }
+            Ident(n) if self.in_with(n) => self.with_delete(n, x.pos)?,
+            Ident(n) => match self.resolve(n, x.pos)? {
+                Var::Global => {
+                    self.string(n);
+                    self.emit(Op::DeleteGlobal, &[]);
+                }
+                _ => self.emit(Op::LdaFalse, &[]),
+            },
+            // `delete a?.b`: true if the chain ends early.
+            Chain(c) => {
+                let (nil, end) = (self.label(), self.label());
+                self.chains.push(nil);
+                let r = self.delete(c, pos);
+                self.chains.pop();
+                r?;
+                self.jump(end);
+                self.bind(nil);
+                self.emit(Op::LdaTrue, &[]);
+                self.bind(end);
+            }
+            _ => {
+                self.effect(x)?;
+                self.emit(Op::LdaTrue, &[]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Call the function in variable `v` (a class's fields' function: see
+    /// `Class::fields`) with register `this` as `this`.
+    fn init_fields(&mut self, v: &str, this: u8, pos: Pos) -> R<()> {
+        let mark = self.temp;
+        let f = self.alloc(pos)?;
+        self.load_var(v, pos)?;
+        self.star(f);
+        let t = self.alloc(pos)?;
+        self.mov(this, t);
+        let ic = self.auto_ic(Op::Call.name());
+        self.emit(Op::Call, &[Arg::Reg(f), Arg::Reg(t), Arg::Count(0), ic]);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// In an optional chain, the value in `acc` (kept) ending it if null
+    /// or undefined.
+    fn chain_check(&mut self, pos: Pos) -> R<()> {
+        let mark = self.temp;
+        let t = self.alloc(pos)?;
+        self.star(t);
+        self.emit(Op::TestNullish, &[]);
+        let nil = *self.chains.last().expect("an optional part outside a chain");
+        self.jump_if(Jmp::True, nil);
+        self.ldar(t);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// `t &&= v` (`kind` 0), `t ||= v` (1) or `t ??= v` (2): `v` assigned
+    /// unless `t`'s value decides the result, which is then that value.
+    fn logical_assign(&mut self, kind: u8, t: &Expr, v: &Expr, pos: Pos) -> R<()> {
+        let mark = self.temp;
+        let end = self.label();
+        // (The target's value in `acc`.)
+        let decide = |g: &mut Self| -> R<()> {
+            match kind {
+                0 => g.jump_if(Jmp::ToBooleanFalse, end),
+                1 => g.jump_if(Jmp::ToBooleanTrue, end),
+                _ => {
+                    let old = g.alloc(pos)?;
+                    g.star(old);
+                    g.emit(Op::TestNullish, &[]);
+                    let set = g.label();
+                    g.jump_if(Jmp::True, set);
+                    g.ldar(old);
+                    g.jump(end);
+                    g.bind(set);
+                }
+            }
+            Ok(())
+        };
+        match &t.kind {
+            ExprKind::Member(o, name) => {
+                let ro = self.reg(o, &[v])?;
+                self.member(Op::GetNamed, ro, name)?;
+                decide(self)?;
+                self.value(v)?;
+                self.member(Op::SetNamed, ro, name)?;
+            }
+            ExprKind::Index(o, k) => {
+                let ro = self.reg(o, &[k, v])?;
+                let rk = self.reg(k, &[v])?;
+                self.ldar(rk);
+                let ic = self.auto_ic("[]keyed");
+                self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
+                decide(self)?;
+                self.value(v)?;
+                let ic = self.auto_ic("[]keyed");
+                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+            }
+            _ => {
+                self.value(t)?;
+                decide(self)?;
+                self.assign(None, t, v, pos)?;
+            }
+        }
+        self.bind(end);
+        self.temp = mark;
+        Ok(())
+    }
+
     fn strict_delete_check(&mut self, pos: Pos) -> R<()> {
         if !self.f.strict {
             return Ok(());
@@ -2360,6 +2554,7 @@ impl<'a> Gen<'a> {
             finally,
             targets: self.targets.len(),
             close: None,
+            close_async: false,
         });
     }
 
@@ -2385,9 +2580,18 @@ impl<'a> Gen<'a> {
                 t.ranges.push((t.start, end));
             }
             t.start = end;
-            let (close, finally) = (t.close, t.finally);
+            let (close, finally, close_async) = (t.close, t.finally, t.close_async);
             if let Some(r) = close {
-                self.intrinsic("iterator_close", r, 1);
+                if close_async {
+                    // (Compiled as outside the loop: the `await` may return.)
+                    let inner = self.trys.split_off(i);
+                    self.intrinsic("async_iterator_close", r, 1);
+                    let r = self.yield_acc(self.f.pos);
+                    self.trys.extend(inner);
+                    r?;
+                } else {
+                    self.intrinsic("iterator_close", r, 1);
+                }
             }
             if let Some(f) = finally {
                 let inner = self.trys.split_off(i);
@@ -3037,6 +3241,7 @@ impl<'a> Gen<'a> {
                 self.temp = mark;
             }
             Class(c) => self.class(c, e.pos)?,
+            Yield(Some(x), true) if self.f.is_async => self.async_yield_star(x, e.pos)?,
             Yield(Some(x), true) => self.yield_star(x, e.pos)?,
             // An `await`: a `yield` the promises the coroutine waits on
             // resume (see `generator::async_step`).
@@ -3048,6 +3253,20 @@ impl<'a> Gen<'a> {
                 match x {
                     Some(x) => self.value(x)?,
                     None => self.emit(Op::LdaUndefined, &[]),
+                }
+                if self.f.is_async {
+                    // An async generator's: the value awaited, then yielded
+                    // as one (see `generator::async_gen_step`).
+                    self.yield_acc(e.pos)?;
+                    let mark = self.temp;
+                    let t = self.alloc(e.pos)?;
+                    self.star(t);
+                    let g = self.alloc(e.pos)?;
+                    self.load_var(GEN, e.pos)?;
+                    self.star(g);
+                    self.intrinsic("async_gen_yield", g, 1);
+                    self.ldar(t);
+                    self.temp = mark;
                 }
                 self.yield_acc(e.pos)?;
             }
@@ -3079,6 +3298,12 @@ impl<'a> Gen<'a> {
                     self.star(0);
                 }
                 self.store_var("%this", e.pos)?;
+                // The class's fields, defined on the new `this`.
+                if let Some(v) = &self.f.fields {
+                    self.star(t);
+                    self.init_fields(v, t, e.pos)?;
+                    self.ldar(t);
+                }
                 self.temp = mark;
             }
             SuperMember(home, k, this) => {
@@ -3139,6 +3364,17 @@ impl<'a> Gen<'a> {
                     let o = self.alloc(e.pos)?;
                     self.star(o);
                     for (key, v) in props {
+                        if let Spread(x) = &v.kind {
+                            // `[o, source]` for the runtime.
+                            let mark = self.temp;
+                            let t = self.alloc(e.pos)?;
+                            self.mov(o, t);
+                            let sr = self.alloc(e.pos)?;
+                            self.into(x, sr)?;
+                            self.intrinsic("copy_data_properties", t, 2);
+                            self.temp = mark;
+                            continue;
+                        }
                         let name = match key {
                             PropKey::Name(n) => n,
                             PropKey::Computed(k) => {
@@ -3223,7 +3459,7 @@ impl<'a> Gen<'a> {
             }
             Member(o, name) => {
                 let r = self.reg(o, &[])?;
-                self.named(Op::GetNamed, r, name);
+                self.member(Op::GetNamed, r, name)?;
             }
             Index(o, k) => {
                 let r = self.reg(o, &[k])?;
@@ -3238,39 +3474,7 @@ impl<'a> Gen<'a> {
                 self.effect(x)?;
                 self.emit(Op::LdaUndefined, &[]);
             }
-            // `delete`: a property or element (the key in `acc`), a global
-            // (its name in `acc`); a variable isn't deleted (false), and
-            // anything else is just evaluated (true).
-            Unary(UnOp::Delete, x) => match &x.kind {
-                Member(o, name) => {
-                    let mark = self.temp;
-                    let r = self.reg(o, &[])?;
-                    self.string(name);
-                    self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
-                    self.strict_delete_check(e.pos)?;
-                    self.temp = mark;
-                }
-                Index(o, k) => {
-                    let mark = self.temp;
-                    let r = self.reg(o, &[k])?;
-                    self.value(k)?;
-                    self.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
-                    self.strict_delete_check(e.pos)?;
-                    self.temp = mark;
-                }
-                Ident(n) if self.in_with(n) => self.with_delete(n, x.pos)?,
-                Ident(n) => match self.resolve(n, x.pos)? {
-                    Var::Global => {
-                        self.string(n);
-                        self.emit(Op::DeleteGlobal, &[]);
-                    }
-                    _ => self.emit(Op::LdaFalse, &[]),
-                },
-                _ => {
-                    self.effect(x)?;
-                    self.emit(Op::LdaTrue, &[]);
-                }
-            },
+            Unary(UnOp::Delete, x) => self.delete(x, e.pos)?,
             Unary(UnOp::Typeof, x) => {
                 // An undeclared global is "undefined", not a ReferenceError.
                 match &x.kind {
@@ -3305,6 +3509,37 @@ impl<'a> Gen<'a> {
                 self.jump_if(c, end);
                 self.value(r)?;
                 self.bind(end);
+            }
+            Nullish(l, r) => {
+                let mark = self.temp;
+                let (rhs, end) = (self.label(), self.label());
+                self.value(l)?;
+                let t = self.alloc(e.pos)?;
+                self.star(t);
+                self.emit(Op::TestNullish, &[]);
+                self.jump_if(Jmp::True, rhs);
+                self.ldar(t);
+                self.jump(end);
+                self.bind(rhs);
+                self.temp = mark;
+                self.value(r)?;
+                self.bind(end);
+            }
+            LogicalAssign(kind, t, v) => self.logical_assign(*kind, t, v, e.pos)?,
+            Chain(x) => {
+                let (nil, end) = (self.label(), self.label());
+                self.chains.push(nil);
+                let r = self.value(x);
+                self.chains.pop();
+                r?;
+                self.jump(end);
+                self.bind(nil);
+                self.emit(Op::LdaUndefined, &[]);
+                self.bind(end);
+            }
+            Optional(x) => {
+                self.value(x)?;
+                self.chain_check(e.pos)?;
             }
             Cond(c, a, b) => {
                 let (lt, lf, end) = (self.label(), self.label(), self.label());
@@ -3440,6 +3675,17 @@ impl<'a> Gen<'a> {
             self.bind(end);
             return Ok(());
         }
+        // (`**` has no opcode: a runtime helper's.)
+        if op == BinOp::Exp {
+            let mark = self.temp;
+            let t = self.alloc(pos)?;
+            self.into(l, t)?;
+            let u = self.alloc(pos)?;
+            self.into(r, u)?;
+            self.intrinsic("exp", t, 2);
+            self.temp = mark;
+            return Ok(());
+        }
         let Some(rop) = Self::reg_form(op) else {
             return unsupported(pos, format!("the operator `{}`", op.symbol()));
         };
@@ -3454,6 +3700,16 @@ impl<'a> Gen<'a> {
     fn apply(&mut self, op: BinOp, v: &Expr, pos: Pos) -> R<()> {
         if let Some((sop, k)) = smi(v).and_then(|k| Self::smi_form(op, k)) {
             self.emit(sop, &[Arg::Imm(k)]);
+            return Ok(());
+        }
+        if op == BinOp::Exp {
+            let mark = self.temp;
+            let t = self.alloc(pos)?;
+            self.star(t);
+            let u = self.alloc(pos)?;
+            self.into(v, u)?;
+            self.intrinsic("exp", t, 2);
+            self.temp = mark;
             return Ok(());
         }
         let Some(rop) = Self::reg_form(op) else {
@@ -3539,11 +3795,11 @@ impl<'a> Gen<'a> {
                 match op {
                     None => self.value(v)?,
                     Some(op) => {
-                        self.named(Op::GetNamed, ro, name);
+                        self.member(Op::GetNamed, ro, name)?;
                         self.apply(op, v, pos)?;
                     }
                 }
-                self.named(Op::SetNamed, ro, name);
+                self.member(Op::SetNamed, ro, name)?;
                 Ok(())
             }
             ExprKind::Index(o, k) => {
@@ -3645,9 +3901,9 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Member(o, name) => {
                 let ro = self.reg(o, &[])?;
-                self.named(Op::GetNamed, ro, name);
+                self.member(Op::GetNamed, ro, name)?;
                 step(self);
-                self.named(Op::SetNamed, ro, name);
+                self.member(Op::SetNamed, ro, name)?;
             }
             ExprKind::Index(o, k) => {
                 let ro = self.reg(o, &[k])?;
@@ -3696,6 +3952,13 @@ impl<'a> Gen<'a> {
     /// consecutive ones after it; a single argument already in a register
     /// is passed in place.
     fn call(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
+        // `o.m?.()`: the method (with `o` its `this`) checked.
+        let (f, optional) = match &f.kind {
+            ExprKind::Optional(m) if !new && matches!(m.kind, ExprKind::Member(..) | ExprKind::Index(..)) => {
+                (&**m, true)
+            }
+            _ => (f, false),
+        };
         if let ExprKind::Ident(n) = &f.kind
             && &**n == "eval"
             && !new
@@ -3778,7 +4041,7 @@ impl<'a> Gen<'a> {
             return Ok(());
         }
         if args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
-            return self.call_spread(f, args, new, pos);
+            return self.call_spread(f, args, new, optional, pos);
         }
         if let ExprKind::Ident(n) = &f.kind
             && !new
@@ -3809,7 +4072,7 @@ impl<'a> Gen<'a> {
                 }
             };
             match key {
-                Ok(name) => self.named(Op::GetNamed, ro, name),
+                Ok(name) => self.member(Op::GetNamed, ro, name)?,
                 Err(k) => {
                     self.value(k)?;
                     let ic = self.auto_ic("[]keyed");
@@ -3817,6 +4080,9 @@ impl<'a> Gen<'a> {
                 }
             }
             self.star(c);
+            if optional {
+                self.chain_check(pos)?;
+            }
             self.mov(ro, w);
             for _ in 0..n {
                 self.alloc(pos)?;
@@ -3854,14 +4120,14 @@ impl<'a> Gen<'a> {
 
     /// A call or `new` with a spread argument: the arguments into an
     /// array, for the runtime (`[f, this, args]` or `[f, args]`).
-    fn call_spread(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
+    fn call_spread(&mut self, f: &Expr, args: &[Expr], new: bool, optional: bool, pos: Pos) -> R<()> {
         let mark = self.temp;
         let c = self.alloc(pos)?;
         let w = if new { c } else { self.alloc(pos)? };
         match &f.kind {
             ExprKind::Member(o, name) if !new => {
                 self.into(o, w)?;
-                self.named(Op::GetNamed, w, name);
+                self.member(Op::GetNamed, w, name)?;
                 self.star(c);
             }
             ExprKind::Index(o, k) if !new => {
@@ -3878,6 +4144,10 @@ impl<'a> Gen<'a> {
                     self.star(w);
                 }
             }
+        }
+        if optional {
+            self.ldar(c);
+            self.chain_check(pos)?;
         }
         let a = self.alloc(pos)?;
         self.args_array(args, a, pos)?;
@@ -3919,6 +4189,22 @@ impl<'a> Gen<'a> {
         // (New bindings before the closures capturing them are made.)
         self.fresh_binding(&c.home, false, pos)?;
         self.fresh_binding(&c.home_static, false, pos)?;
+        let vars = (c.privates.iter().map(|(v, _)| v))
+            .chain(c.fields.iter().map(|(v, _)| v))
+            .chain(c.members.iter().filter_map(|m| m.var.as_ref()));
+        for v in vars {
+            self.fresh_binding(v, false, pos)?;
+        }
+        // Its private names: a new symbol each.
+        for (v, n) in &c.privates {
+            let mark = self.temp;
+            let t = self.alloc(pos)?;
+            self.string(n);
+            self.star(t);
+            self.intrinsic("private_name", t, 1);
+            self.init_var(v, pos)?;
+            self.temp = mark;
+        }
         // (The inner binding not initialized while the heritage is
         // evaluated: `class x extends x {}` is a ReferenceError.)
         if let Some(inner) = &c.inner {
@@ -3943,6 +4229,39 @@ impl<'a> Gen<'a> {
         self.init_var(&c.home_static, pos)?;
         for m in &c.members {
             let m4 = self.temp;
+            if m.kind == 3 {
+                // A field's computed key.
+                let PropKey::Computed(e) = &m.key else { unreachable!() };
+                let k = self.alloc(pos)?;
+                self.into(e, k)?;
+                self.intrinsic("property_key", k, 1);
+                self.init_var(m.var.as_ref().unwrap(), pos)?;
+                self.temp = m4;
+                continue;
+            }
+            if let Some(v) = &m.var {
+                // A private method: (a static one's defined on the class.)
+                self.closure(m.function);
+                self.init_var(v, pos)?;
+                if m.is_static {
+                    let o = self.alloc(pos)?;
+                    self.mov(f, o);
+                    let k = self.alloc(pos)?;
+                    let PropKey::Name(n) = &m.key else { unreachable!() };
+                    let pv = &c.privates.iter().find(|(_, p)| p == n).unwrap().0;
+                    self.load_var(pv, pos)?;
+                    self.star(k);
+                    let fr = self.alloc(pos)?;
+                    self.load_var(v, pos)?;
+                    self.star(fr);
+                    let kind = self.alloc(pos)?;
+                    self.lda_smi(m.kind as i32);
+                    self.star(kind);
+                    self.intrinsic("private_method", o, 4);
+                }
+                self.temp = m4;
+                continue;
+            }
             let o = self.alloc(pos)?;
             self.mov(if m.is_static { f } else { p }, o);
             let k = self.alloc(pos)?;
@@ -3969,9 +4288,25 @@ impl<'a> Gen<'a> {
             self.intrinsic(which, o, 4);
             self.temp = m4;
         }
+        if let Some((v, init)) = &c.fields {
+            self.closure(*init);
+            self.init_var(v, pos)?;
+        }
         if let Some(inner) = &c.inner {
             self.ldar(f);
             self.init_var(inner, pos)?;
+        }
+        // Its static fields and blocks, in order, with the class `this`.
+        for &s in &c.statics {
+            let m = self.temp;
+            let fr = self.alloc(pos)?;
+            self.closure(s);
+            self.star(fr);
+            let t = self.alloc(pos)?;
+            self.mov(f, t);
+            let ic = self.auto_ic(Op::Call.name());
+            self.emit(Op::Call, &[Arg::Reg(fr), Arg::Reg(t), Arg::Count(0), ic]);
+            self.temp = m;
         }
         self.ldar(f);
         self.temp = mark;
@@ -3996,7 +4331,7 @@ impl<'a> Gen<'a> {
                     let mark = self.temp;
                     let ro = self.reg(o, &[])?;
                     self.ldar(r);
-                    self.named(Op::SetNamed, ro, name);
+                    self.member(Op::SetNamed, ro, name)?;
                     self.temp = mark;
                 }
                 ExprKind::Index(o, k) => {
@@ -4150,10 +4485,7 @@ impl<'a> Gen<'a> {
         let Var::Reg(g) = self.resolve(GEN, self.f.pos)? else {
             return unsupported(self.f.pos, "a generator with this many variables");
         };
-        if self.f.is_async && self.f.generator {
-            return unsupported(self.f.pos, "async generators");
-        }
-        let op = if self.f.is_async { Op::AsyncStart } else { Op::InitialYield };
+        let op = if self.f.is_async && !self.f.generator { Op::AsyncStart } else { Op::InitialYield };
         self.emit(op, &[Arg::Reg(g)]);
         // (Resumed by `next()`: a fresh accumulator.)
         self.acc = Acc::default();
@@ -4228,6 +4560,82 @@ impl<'a> Gen<'a> {
         self.star(v);
         let (ret, end) = (self.label(), self.label());
         self.intrinsic("generator_mode", g, 1);
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), ret);
+        self.jump(end);
+        self.bind(ret);
+        self.ldar(v);
+        self.return_acc(pos)?;
+        self.bind(end);
+        self.ldar(v);
+        self.temp = mark;
+        Ok(())
+    }
+
+    /// `yield* x` in an async generator: as [`Self::yield_star`] over
+    /// `x`'s async iterator, each result awaited (a sync iterator's
+    /// values too), the mode a resumption was in kept for the next step.
+    fn async_yield_star(&mut self, x: &Expr, pos: Pos) -> R<()> {
+        let Var::Reg(g) = self.resolve(GEN, pos)? else {
+            return unsupported(pos, "a generator with this many variables");
+        };
+        let mark = self.temp;
+        // `[iterator, received, mode]` for `async_delegate_step`.
+        let it = self.alloc(pos)?;
+        let received = self.alloc(pos)?;
+        let mode = self.alloc(pos)?;
+        let sync = self.alloc(pos)?;
+        let result = self.alloc(pos)?;
+        let v = self.alloc(pos)?;
+        let gr = self.alloc(pos)?;
+        self.into(x, it)?;
+        self.intrinsic("async_iterator_kind", it, 1);
+        self.star(sync);
+        self.mov(sync, received);
+        self.intrinsic("get_async_iterator", it, 2);
+        self.star(it);
+        self.emit(Op::LdaUndefined, &[]);
+        self.star(received);
+        self.lda_smi(0);
+        self.star(mode);
+        let (top, done) = (self.loop_label(), self.label());
+        self.bind(top);
+        self.intrinsic("async_delegate_step", it, 3);
+        self.yield_acc(pos)?;
+        self.star(result);
+        // The result's value into `v` (a sync iterator's awaited).
+        let value = |g: &mut Self| -> R<()> {
+            let ready = g.label();
+            g.named(Op::GetNamed, result, "value");
+            g.star(v);
+            g.ldar(sync);
+            g.jump_if(Jmp::False, ready);
+            g.ldar(v);
+            g.yield_acc(pos)?;
+            g.star(v);
+            g.bind(ready);
+            Ok(())
+        };
+        self.intrinsic("delegate_done", result, 1);
+        self.jump_if(Jmp::True, done);
+        value(self)?;
+        // Yielded as it is; what the generator resumes with (and how) sent
+        // on.
+        self.mov(g, gr);
+        self.intrinsic("async_gen_yield", gr, 1);
+        self.ldar(v);
+        self.emit(Op::Yield, &[Arg::Reg(g)]);
+        self.acc = Acc::default();
+        self.reachable = true;
+        self.star(received);
+        self.mov(g, gr);
+        self.intrinsic("generator_mode", gr, 1);
+        self.star(mode);
+        self.jump(top);
+        self.bind(done);
+        // (A `return()` passed on: the generator returns the value.)
+        value(self)?;
+        let (ret, end) = (self.label(), self.label());
+        self.ldar(mode);
         self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), ret);
         self.jump(end);
         self.bind(ret);
@@ -4538,7 +4946,8 @@ impl<'a> Gen<'a> {
                 iterable,
                 body,
                 pattern,
-            } => self.for_of(labels, *kind, target, pattern.as_deref(), iterable, body, s.pos)?,
+                is_await,
+            } => self.for_of(labels, *kind, target, pattern.as_deref(), iterable, body, *is_await, s.pos)?,
             StmtKind::Switch(d, cases) => self.switch(labels, d, cases)?,
             StmtKind::Try(block, catch, finally) => self.try_stmt(block, catch, finally, s.pos)?,
             StmtKind::Throw(e) => {
@@ -4549,6 +4958,10 @@ impl<'a> Gen<'a> {
                 match e {
                     Some(e) => self.value(e)?,
                     None => self.emit(Op::LdaUndefined, &[]),
+                }
+                // (An async generator's value awaited.)
+                if self.f.is_async && self.f.generator && e.is_some() {
+                    self.yield_acc(s.pos)?;
                 }
                 self.derived_return(s.pos)?;
                 self.return_acc(s.pos)?;
@@ -4704,11 +5117,15 @@ impl<'a> Gen<'a> {
         pattern: Option<&Pattern>,
         iterable: &Expr,
         body: &'a Stmt,
+        is_await: bool,
         pos: Pos,
     ) -> R<()> {
         let it = self.alloc(pos)?;
         let hole = self.alloc(pos)?;
         let v = self.alloc(pos)?;
+        // (`for await`: whether over a sync iterator, whose values are
+        // awaited instead of its results.)
+        let sync = if is_await { Some(self.alloc(pos)?) } else { None };
         // (`let`/`const`: not initialized while the iterable is evaluated.)
         if kind >= 2 {
             let mut ns = Vec::new();
@@ -4722,7 +5139,14 @@ impl<'a> Gen<'a> {
             }
         }
         self.into(iterable, v)?;
-        self.intrinsic("get_iterator", v, 1);
+        match sync {
+            Some(sync) => {
+                self.intrinsic("async_iterator_kind", v, 1);
+                self.star(sync);
+                self.intrinsic("get_async_iterator", v, 2);
+            }
+            None => self.intrinsic("get_iterator", v, 1),
+        }
         self.star(it);
         self.emit(Op::LdaHole, &[]);
         self.star(hole);
@@ -4736,9 +5160,36 @@ impl<'a> Gen<'a> {
         });
         self.open_try(None);
         self.trys.last_mut().unwrap().close = Some(it);
+        self.trys.last_mut().unwrap().close_async = is_await;
         self.in_try += 1;
         self.bind(top);
-        self.intrinsic("iterator_step", it, 1);
+        match sync {
+            // `await it.next()` (a sync iterator's result as it is), then
+            // its value (a sync iterator's awaited).
+            Some(sync) => {
+                let (result_ready, value_ready) = (self.label(), self.label());
+                self.intrinsic("async_iterator_next", it, 1);
+                self.star(v);
+                self.ldar(sync);
+                self.jump_if(Jmp::True, result_ready);
+                self.ldar(v);
+                self.yield_acc(pos)?;
+                self.star(v);
+                self.bind(result_ready);
+                self.intrinsic("async_iterator_value", v, 1);
+                self.star(v);
+                self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+                self.jump_if(Jmp::True, done);
+                self.ldar(sync);
+                self.jump_if(Jmp::False, value_ready);
+                self.ldar(v);
+                self.yield_acc(pos)?;
+                self.star(v);
+                self.bind(value_ready);
+                self.ldar(v);
+            }
+            None => self.intrinsic("iterator_step", it, 1),
+        }
         self.star(v);
         self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
         self.jump_if(Jmp::True, done);
@@ -4766,7 +5217,7 @@ impl<'a> Gen<'a> {
             (_, ExprKind::Member(o, name)) => {
                 let ro = self.reg(o, &[])?;
                 self.ldar(v);
-                self.named(Op::SetNamed, ro, name);
+                self.member(Op::SetNamed, ro, name)?;
             }
             (_, ExprKind::Index(o, k)) => {
                 let ro = self.reg(o, &[k])?;

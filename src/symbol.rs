@@ -187,7 +187,17 @@ fn symbol_description(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `Object.getOwnPropertySymbols(o)`.
 fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = vm.to_object(arg(a, 0))?;
-    let keys = own_symbol_keys(vm, o);
+    let keys: Vec<Value> = if vm.proxies_exist && crate::proxy::is_proxy(vm, o) {
+        let ks = crate::proxy::own_keys(vm, o)?;
+        ks.into_iter()
+            .filter_map(|k| match k {
+                Key::Name(a) => atom_symbol(vm, a),
+                Key::Index(_) => None,
+            })
+            .collect()
+    } else {
+        own_symbol_keys(vm, o)
+    };
     let out = vm.new_array();
     for s in keys {
         crate::vm::array_push(vm, out, &[s])?;

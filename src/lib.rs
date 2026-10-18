@@ -25,6 +25,7 @@ mod collections;
 mod date;
 mod json;
 mod promise;
+mod proxy;
 pub mod props;
 pub mod regexp;
 mod stack;

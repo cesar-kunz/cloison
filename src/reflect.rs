@@ -84,34 +84,37 @@ fn reflect_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> 
     let o = target(a, "defineProperty")?;
     let key = to_property_key(vm, arg(a, 1))?;
     let d = vm.to_descriptor(arg(a, 2))?;
-    vm.define_own_property(o, key, &d).map(Value::from_bool)
+    crate::proxy::define_property(vm, o, key, &d).map(Value::from_bool)
 }
 
 fn reflect_delete_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "deleteProperty")?;
     let key = to_property_key(vm, arg(a, 1))?;
-    Ok(Value::from_bool(vm.delete_own(o, key)))
+    crate::proxy::delete(vm, o, key).map(Value::from_bool)
 }
 
 fn reflect_get(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "get")?;
     let key = to_property_key(vm, arg(a, 1))?;
     let receiver = if a.len() > 2 { a[2] } else { object_value(o) };
+    if crate::proxy::chain_has_proxy(vm, o) {
+        return crate::proxy::generic_get(vm, object_value(o), key, receiver);
+    }
     get_from(vm, object_value(o), key, receiver)
 }
 
 fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "getOwnPropertyDescriptor")?;
     let key = to_property_key(vm, arg(a, 1))?;
-    Ok(match vm.own_property(o, key) {
+    Ok(match crate::proxy::get_own_property(vm, o, key)? {
         Some(d) => vm.from_descriptor(&d),
         None => Value::UNDEFINED,
     })
 }
 
-fn reflect_get_prototype_of(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn reflect_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "getPrototypeOf")?;
-    Ok(unsafe { (*(*o).shape).proto })
+    crate::proxy::get_prototype_of(vm, o)
 }
 
 fn reflect_has(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -120,23 +123,21 @@ fn reflect_has(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     vm.has_key(object_value(o), key).map(Value::from_bool)
 }
 
-fn reflect_is_extensible(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn reflect_is_extensible(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "isExtensible")?;
-    Ok(Value::from_bool(Vm::is_extensible(o)))
+    crate::proxy::is_extensible(vm, o).map(Value::from_bool)
 }
 
 /// `Reflect.ownKeys(o)`: its string keys, then its symbols.
 fn reflect_own_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "ownKeys")?;
-    let keys = vm.own_keys(o);
+    let keys = crate::proxy::own_keys(vm, o)?;
     let out = vm.new_array();
     vm.handle_scope(|vm| {
         vm.handles.push(out);
-        for (key, _) in keys {
-            let s = vm.key_string(key);
-            crate::vm::array_push(vm, out, &[s])?;
-        }
-        for s in crate::symbol::own_symbol_keys(vm, o) {
+        for key in keys {
+            let s = vm.key_value(key);
+            let s = if s.is_number() { vm.key_string(key) } else { s };
             crate::vm::array_push(vm, out, &[s])?;
         }
         Ok(out)
@@ -145,8 +146,7 @@ fn reflect_own_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 fn reflect_prevent_extensions(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "preventExtensions")?;
-    vm.prevent_extensions(o);
-    Ok(Value::TRUE)
+    crate::proxy::prevent_extensions(vm, o).map(Value::from_bool)
 }
 
 fn reflect_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -154,6 +154,9 @@ fn reflect_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, arg(a, 1))?;
     let receiver = if a.len() > 3 { a[3] } else { object_value(o) };
     let v = arg(a, 2);
+    if crate::proxy::chain_has_proxy(vm, o) {
+        return crate::proxy::generic_set(vm, object_value(o), key, v, receiver).map(Value::from_bool);
+    }
     ordinary_set(vm, object_value(o), key, v, receiver).map(Value::from_bool)
 }
 
@@ -163,5 +166,5 @@ fn reflect_set_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
     if !(proto.is_null() || is_object(proto)) {
         return Err(Error::type_error("Object prototype may only be an Object or null"));
     }
-    Ok(Value::from_bool(vm.set_prototype_of(o, proto)))
+    crate::proxy::set_prototype_of(vm, o, proto).map(Value::from_bool)
 }

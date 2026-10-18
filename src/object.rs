@@ -103,6 +103,9 @@ pub enum Class {
     /// A `Promise`: `code`'s bits are a hidden array holding its state,
     /// result and reactions. See `promise`.
     Promise,
+    /// A proxy whose target isn't callable (one whose target is, is a
+    /// native function): see `proxy`.
+    Proxy,
 }
 
 impl Class {
@@ -124,6 +127,7 @@ impl Class {
                 | Class::Symbol
                 | Class::ArrayIterator
                 | Class::Generator
+                | Class::Proxy
         )
     }
 }

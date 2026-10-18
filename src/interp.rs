@@ -1471,7 +1471,12 @@ handlers! {
     }
 
     fn op_for_in_keys(pc, acc, regs, tag) {
-        let keys = (*frame_vm(regs)).for_in_keys(acc);
+        // (A proxy's traps may run.)
+        let keys = with_top(regs, None, |vm| vm.for_in_keys(acc));
+        if (*frame_vm(regs)).conv_failed() {
+            let e = (*frame_vm(regs)).take_conv_error();
+            next_or_throw!(Op::ForInKeys.size(), Err::<Value, _>(e))
+        }
         next!(any, Op::ForInKeys.size(), keys)
     }
 

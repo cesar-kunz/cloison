@@ -430,6 +430,24 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object
     Ok(o)
 }
 
+/// A new weak set for the runtime's own use, never seen by scripts (a
+/// resizable buffer's views: see `typed`).
+pub(crate) fn new_weak_set(vm: &mut Vm) -> Result<*mut Object> {
+    new_collection(vm, Class::WeakSet, Proto::WeakSet)
+}
+
+/// Add object `v`, which isn't in it, to weak set `o` (see
+/// [`new_weak_set`]).
+pub(crate) fn weak_set_insert(vm: &mut Vm, o: *mut Object, v: Value) -> Result<()> {
+    append(vm, o, &[v])
+}
+
+/// The values of weak set `o` (see [`new_weak_set`]) not collected.
+pub(crate) fn weak_set_values(o: *mut Object) -> Vec<Value> {
+    let e = entries(o);
+    (BASE..len(e)).map(|i| slot(e, i)).filter(|&v| v != Value::EMPTY).collect()
+}
+
 /// A weak collection `o`'s entries buffer (new, or grown) tagged so the
 /// collector leaves its keys and values to the ephemeron pass (see
 /// `heap::WEAK_VALUES`).

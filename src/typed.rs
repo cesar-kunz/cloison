@@ -5,8 +5,9 @@
 //! bytes, `elems_len` is their count (0 once detached, flag `DETACHED`).
 //! A resizable one (flag [`RESIZABLE`]) has room for its maximum byte
 //! length (`elems_cap`) from the start, so its bytes never move, and
-//! `code` holds a hidden array of the views on it (typed arrays and
-//! `DataView`s), which a resize brings up to date.
+//! `code` holds a hidden weak set of the views on it (typed arrays and
+//! `DataView`s; `collections::new_weak_set`), which a resize brings up to
+//! date.
 //!
 //! A typed array (class `TypedArray`) has `elems` pointing to its first
 //! element in its buffer's bytes, `elems_len` its length (what compiled
@@ -119,8 +120,8 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
         if let Some(max) = max {
             (*o).flags |= RESIZABLE;
             (*o).elems_cap = max as u32;
-            let views = vm.new_array();
-            (*o).code = views.to_bits() as *const crate::vm::Code;
+            let views = crate::collections::new_weak_set(vm)?;
+            (*o).code = object_value(views).to_bits() as *const crate::vm::Code;
         }
     }
     Ok(o)
@@ -134,22 +135,21 @@ pub(crate) fn new_buffer(vm: &mut Vm, n: usize) -> *mut Object {
 /// Record view `v` of resizable buffer `b` (see the module's docs).
 fn register(vm: &mut Vm, b: *mut Object, v: Value) -> Result<()> {
     if is_resizable(b) {
-        let views = Value::from_bits(unsafe { (*b).code } as u64);
-        crate::vm::array_push(vm, views, &[v])?;
+        let views = as_object(Value::from_bits(unsafe { (*b).code } as u64));
+        crate::collections::weak_set_insert(vm, views, v)?;
     }
     Ok(())
 }
 
 /// The views of resizable buffer `b` brought up to date (a resize, a
 /// detach).
-fn refresh_views(vm: &mut Vm, b: *mut Object) -> Result<()> {
+fn refresh_views(b: *mut Object) {
     if !is_resizable(b) {
-        return Ok(());
+        return;
     }
-    let views = Value::from_bits(unsafe { (*b).code } as u64);
-    let n = vm.length_of(views)? as usize;
-    for i in 0..n {
-        let v = as_object(vm.get_keyed(views, Value::from_i32(i as i32))?);
+    let views = as_object(Value::from_bits(unsafe { (*b).code } as u64));
+    for v in crate::collections::weak_set_values(views) {
+        let v = as_object(v);
         unsafe {
             (*v).elems_len = if (*v).class == Class::TypedArray {
                 ta_length(v).unwrap_or(0) as u32
@@ -158,7 +158,6 @@ fn refresh_views(vm: &mut Vm, b: *mut Object) -> Result<()> {
             };
         }
     }
-    Ok(())
 }
 
 /// DetachArrayBuffer. A fixed-length buffer doesn't keep its views, whose
@@ -176,7 +175,8 @@ pub(crate) fn detach(vm: &mut Vm, b: *mut Object) -> Result<()> {
         vm.views_detached = true;
         vm.bump_code_epoch();
     }
-    refresh_views(vm, b)
+    refresh_views(b);
+    Ok(())
 }
 
 /// A view's byte offset in its buffer.
@@ -310,7 +310,7 @@ fn buffer_resize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         (*b).elems_len = n as u32;
     }
-    refresh_views(vm, b)?;
+    refresh_views(b);
     Ok(Value::UNDEFINED)
 }
 

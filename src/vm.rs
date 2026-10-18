@@ -566,6 +566,9 @@ pub struct Vm {
     /// Some object has had an indexed accessor or a read-only element
     /// (see `protect_indices`).
     pub(crate) indices_protected: bool,
+    /// A fixed-length buffer has been detached (see `typed::detach`): its
+    /// views' lengths, which nothing brought up to date, may be stale.
+    pub(crate) views_detached: bool,
     /// A proxy has been made: property operations look for them on
     /// prototype chains (see `proxy`).
     pub(crate) proxies_exist: bool,
@@ -855,6 +858,7 @@ impl Vm {
             field_epoch: 0,
             code_epoch: 0,
             indices_protected: false,
+            views_detached: false,
             proxies_exist: false,
             proxy_codes: [std::ptr::null(); 3],
             weak_tables: Vec::new(),

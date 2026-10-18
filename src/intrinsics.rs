@@ -67,6 +67,9 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("async_iterator_value", async_iterator_value),
     ("async_iterator_close", async_iterator_close),
     ("async_delegate_step", async_delegate_step),
+    ("eval_scope", eval_scope),
+    ("eval_scope_get", eval_scope_get),
+    ("eval_scope_flush", eval_scope_flush),
 ];
 
 /// The id of the intrinsic `name`.
@@ -658,7 +661,10 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
     }
     let local = object_value(vm.new_object(Value::NULL));
-    let target = if own_strict || !crate::props::is_object(env) { local } else { env };
+    // (Declared in the function's scope object, under the one of the
+    // other bindings it sees: see `Gen::call`.)
+    let decl = a.get(6).copied().filter(|&d| crate::props::is_object(d)).unwrap_or(env);
+    let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
     for n in &module.declared {
         let atom = vm.intern(n);
         if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
@@ -1016,4 +1022,54 @@ fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(Value::UNDEFINED);
     }
     call_function(vm, m, a[0], &[])
+}
+
+/// A direct `eval`'s scope object: `[proto, name, value, …]`, its
+/// prototype the function's (or `null`), a data property for each binding
+/// it sees (but one not initialized yet, a hole).
+fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let proto = if crate::props::is_object(a[0]) { a[0] } else { Value::NULL };
+    let o = object_value(vm.new_object(proto));
+    for pair in a[1..].chunks(2) {
+        if pair[1] != Value::HOLE {
+            let key = to_property_key(vm, pair[0])?;
+            vm.create_data_property(o, key, pair[1])?;
+        }
+    }
+    Ok(o)
+}
+
+/// After a direct `eval`: binding `[scope, name, current]`'s value, its
+/// scope object's own property (`current` if it has none).
+fn eval_scope_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let key = to_property_key(vm, a[1])?;
+    Ok(match vm.own_property(as_object(a[0]), key) {
+        Some(d) if d.is_data() => d.value.unwrap_or(Value::UNDEFINED),
+        _ => a[2],
+    })
+}
+
+/// After a direct `eval`: `[scope, function's scope, binding names…]`,
+/// the scope object's own properties but the bindings' set on the
+/// function's scope object (the `var`s it assigned or declared there).
+fn eval_scope_flush(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (scope, target) = (a[0], a[1]);
+    if !crate::props::is_object(target) {
+        return Ok(Value::UNDEFINED);
+    }
+    let mut bindings = Vec::new();
+    for &n in &a[2..] {
+        bindings.push(to_property_key(vm, n)?);
+    }
+    for (key, _) in vm.own_keys(as_object(scope)) {
+        if bindings.contains(&key) {
+            continue;
+        }
+        if let Some(d) = vm.own_property(as_object(scope), key)
+            && let Some(v) = d.value
+        {
+            vm.put_key(target, key, v)?;
+        }
+    }
+    Ok(Value::UNDEFINED)
 }

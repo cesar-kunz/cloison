@@ -298,13 +298,16 @@ pub(crate) fn install(vm: &mut Vm) {
     let values = vm.define_native(ap, "values", array_values, 0, crate::jit::Ty::Any, false);
     vm.symbol_roots.push(values);
     vm.add_property_with(ap, a_iter, object_value(values), DONT_ENUM);
-    for &tp in &vm.typed_prototypes.clone() {
-        if tp.is_null() {
-            continue;
-        }
-        vm.define_natives(tp, &[("keys", array_keys as NativeFn, 0), ("entries", array_entries, 0)]);
-        let v = vm.define_native(tp, "values", array_values, 0, crate::jit::Ty::Any, false);
-        vm.add_property_with(tp, a_iter, object_value(v), DONT_ENUM);
+    // (On `%TypedArray%.prototype`, the kinds' prototypes' prototype.)
+    if let Some(&tp) = vm.typed_prototypes.first().filter(|tp| !tp.is_null()) {
+        let shared = as_object(unsafe { (*(*tp).shape).proto });
+        vm.define_natives(shared, &[("keys", array_keys as NativeFn, 0), ("entries", array_entries, 0)]);
+        let v = vm.define_native(shared, "values", array_values, 0, crate::jit::Ty::Any, false);
+        vm.add_property_with(shared, a_iter, object_value(v), DONT_ENUM);
+        let holder = vm.new_object(Value::NULL);
+        let tag = vm.define_native(holder, "get [Symbol.toStringTag]", crate::builtins::typed_to_string_tag, 0, crate::jit::Ty::Any, false);
+        let a = vm.a_sym_to_string_tag;
+        vm.define_accessor(shared, a, Some(object_value(tag)), None, DONT_ENUM);
     }
     let strp = vm.string_prototype;
     define_symbol_native(vm, strp, a_iter, "[Symbol.iterator]", string_iterator, 0);

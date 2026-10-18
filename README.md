@@ -25,7 +25,7 @@ target/release/cloison --dump file.js                         # the bytecode ins
 Status (2026-10-14): every Octane benchmark runs, with a generational
 garbage collector that marks and sweeps its old generation concurrently
 and frees compiled code that is no longer reachable. The language is
-ES5 and much of ES2015, with parts of later editions (see
+ES5 through ES2023 with gaps, three quarters of test262 (see
 [Standards support](#standards-support)). See
 [Where it falls short](#where-it-falls-short).
 
@@ -121,7 +121,7 @@ heap sandboxing and defers it.
 
 ## Standards support
 
-test262 at 19957f8, every test under `built-ins`, `language` and
+test262 at d53ebc8, every test under `built-ins`, `language` and
 `annexB` (not `intl402` or `staging`), run as its `INTERPRETING.md`
 says: in both strict and sloppy mode unless flagged, negative tests in
 their phase, async tests to completion; module tests fail, as cloison has no
@@ -130,27 +130,31 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,101 | 17,067 | 94.3% |
-| ES2015 | 5,604 | 9,197 | 60.9% |
-| ES2016 | 40 | 100 | 40.0% |
-| ES2017 | 216 | 741 | 29.1% |
-| ES2018 | 332 | 4,825 | 6.9% |
-| ES2019 | 116 | 161 | 72.0% |
-| ES2020 | 324 | 2,020 | 16.0% |
-| ES2021 | 252 | 630 | 40.0% |
-| ES2022 | 891 | 5,374 | 16.6% |
-| ES2023 | 35 | 284 | 12.3% |
-| ES2024 | 22 | 843 | 2.6% |
-| ES2025 | 137 | 998 | 13.7% |
-| ES2026 | 97 | 745 | 13.0% |
-| Stage 3 proposals | 246 | 5,650 | 4.4% |
-| **all** | **24,413** | **48,635** | **50.2%** |
+| ES5 (untagged) | 16,483 | 17,067 | 96.6% |
+| ES2015 | 8,204 | 9,197 | 89.2% |
+| ES2016 | 96 | 100 | 96.0% |
+| ES2017 | 330 | 741 | 44.5% |
+| ES2018 | 4,698 | 4,825 | 97.4% |
+| ES2019 | 159 | 161 | 98.8% |
+| ES2020 | 1,064 | 2,020 | 52.7% |
+| ES2021 | 518 | 630 | 82.2% |
+| ES2022 | 4,048 | 5,374 | 75.3% |
+| ES2023 | 201 | 284 | 70.8% |
+| ES2024 | 61 | 843 | 7.2% |
+| ES2025 | 378 | 998 | 37.9% |
+| ES2026 | 98 | 745 | 13.2% |
+| Stage 3 proposals | 251 | 5,650 | 4.4% |
+| **all** | **36,589** | **48,635** | **75.2%** |
 
-The gaps are mostly whole features: modules, `Proxy`, BigInt, async
-iteration (most of ES2018's tests are async generators and `for await`),
-class fields and private names (ES2022), RegExp Unicode properties,
-lookbehind and named groups, typed array and `ArrayBuffer` extensions,
-and early errors for invalid syntax that the parser accepts.
+The gaps are mostly whole features: modules (`import()` and top-level
+`await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
+failures), resizable `ArrayBuffer`s (ES2024), iterator helpers, the
+RegExp `v` flag and modifiers, explicit resource management (`using`),
+non-ASCII identifiers (no Unicode ID tables), and early errors for
+invalid syntax that the parser accepts. A direct `eval` sees the
+caller's block-scoped bindings and enclosing functions' variables as
+copies written back after it returns, so closures it makes don't share
+them and their `const`ness isn't enforced.
 
 ## Results
 
@@ -297,9 +301,9 @@ targets.
   at 657 MB for 120 MB live).
 - **Language gaps.** Strict mode, `let`/`const`, classes, arrows,
   templates, destructuring, spread, symbols, iterators, generators,
-  async functions and `Reflect` are in; modules, `Proxy`, BigInt, async
-  generators, non-ASCII identifiers (no Unicode ID tables), array
-  indices past 2^28 and Unicode case folding in regexps are not.
+  async functions and generators, `Reflect`, `Proxy`, BigInt and class
+  fields are in; modules, non-ASCII identifiers (no Unicode ID tables),
+  array indices past 2^28 and Unicode case folding in regexps are not.
   See [Standards support](#standards-support) for test262 by edition;
   Octane and about 100 programs are also checked against Node.
 - **Nightly only**, and Linux is the reference; macOS runs on Apple silicon only.

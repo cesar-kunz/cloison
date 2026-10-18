@@ -52,6 +52,21 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("delegate_done", delegate_done),
     ("throw_delete", throw_delete),
     ("for_in_has", for_in_has),
+    ("exp", exp),
+    ("copy_data_properties", copy_data_properties),
+    ("private_name", private_name),
+    ("private_get", private_get),
+    ("private_set", private_set),
+    ("private_define", private_define),
+    ("private_method", private_method),
+    ("private_has", private_has),
+    ("async_gen_yield", async_gen_yield),
+    ("async_iterator_kind", async_iterator_kind),
+    ("get_async_iterator", get_async_iterator),
+    ("async_iterator_next", async_iterator_next),
+    ("async_iterator_value", async_iterator_value),
+    ("async_iterator_close", async_iterator_close),
+    ("async_delegate_step", async_delegate_step),
 ];
 
 /// The id of the intrinsic `name`.
@@ -693,8 +708,19 @@ fn generator_mode(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// iterator's `next`, `throw` or `return` called as the generator was
 /// resumed: its result object.
 fn delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let (it, received) = (a[0], a[1]);
     let mode = crate::generator::mode(vm, a[2]).as_number().unwrap_or(0.0) as i32;
+    delegate_call(vm, a[0], a[1], mode)
+}
+
+/// An async generator's `yield*` step: `[iterator, received, mode]`, the
+/// mode the generator last resumed in at the `yield`.
+fn async_delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    delegate_call(vm, a[0], a[1], a[2].as_number().unwrap_or(0.0) as i32)
+}
+
+/// `iterator.next(received)` (or with `mode`, `throw` or `return`): the
+/// result.
+fn delegate_call(vm: &mut Vm, it: Value, received: Value, mode: i32) -> Result<Value> {
     let name = match mode {
         crate::generator::THROW => "throw",
         crate::generator::RETURN => "return",
@@ -734,4 +760,258 @@ fn throw_delete(_: &mut Vm, _: &[Value]) -> Result<Value> {
 #[allow(dead_code)]
 fn object(o: *mut Object) -> Value {
     object_value(o)
+}
+
+/// `a ** b` (Number::exponentiate, as `Math.pow`).
+fn exp(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let x = crate::interp::to_number(arg(a, 0));
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    let y = crate::interp::to_number(arg(a, 1));
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    Ok(Value::number(crate::math::pow(x, y)))
+}
+
+/// `{...source}` into object `[target, source]`: the source's own
+/// enumerable properties, symbols' too (none for null or undefined).
+fn copy_data_properties(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (target, source) = (a[0], a[1]);
+    if source == Value::UNDEFINED || source == Value::NULL {
+        return Ok(target);
+    }
+    let src = vm.to_object(source)?;
+    let mut keys: Vec<Key> = vm.own_keys(src).into_iter().map(|(k, _)| k).collect();
+    for s in crate::symbol::own_symbol_keys(vm, src) {
+        keys.push(Key::Name(crate::symbol::symbol_atom(s)));
+    }
+    for key in keys {
+        // (Enumerable when reached: a getter may change that.)
+        if !vm.own_property(src, key).is_some_and(|d| d.enumerable == Some(true)) {
+            continue;
+        }
+        let v = vm.get_key(object_value(src), key)?;
+        vm.create_data_property(target, key, v)?;
+    }
+    Ok(target)
+}
+
+/// A class's private name `[#x]`: a new private symbol.
+fn private_name(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    Ok(crate::symbol::new_private_symbol(vm, a[0]))
+}
+
+/// The own property of `o` private symbol `s` keys, if `o` has one.
+fn private_property(vm: &mut Vm, o: Value, s: Value) -> Option<Desc> {
+    if !crate::props::is_object(o) {
+        return None;
+    }
+    vm.own_property(as_object(o), Key::Name(crate::symbol::symbol_atom(s)))
+}
+
+/// `o.#x`: `[o, symbol]`.
+fn private_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (o, s) = (a[0], a[1]);
+    match private_property(vm, o, s) {
+        Some(Desc { get: Some(g), .. }) => {
+            if g.is_undefined() {
+                return Err(Error::type_error(format!(
+                    "'{}' was defined without a getter",
+                    crate::symbol::description_string(s)
+                )));
+            }
+            call_function(vm, g, o, &[])
+        }
+        Some(Desc { get: None, set: Some(_), .. }) => Err(Error::type_error(format!(
+            "'{}' was defined without a getter",
+            crate::symbol::description_string(s)
+        ))),
+        Some(d) => Ok(d.value.unwrap_or(Value::UNDEFINED)),
+        None => Err(Error::type_error(format!(
+            "Cannot read private member {} from an object whose class did not declare it",
+            crate::symbol::description_string(s)
+        ))),
+    }
+}
+
+/// `o.#x = v`: `[o, symbol, v]`, `v`.
+fn private_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (o, s, v) = (a[0], a[1], a[2]);
+    let key = Key::Name(crate::symbol::symbol_atom(s));
+    match private_property(vm, o, s) {
+        Some(d) if d.get.is_some() || d.set.is_some() => {
+            match d.set.filter(|f| !f.is_undefined()) {
+                Some(f) => call_function(vm, f, o, &[v])?,
+                None => {
+                    return Err(Error::type_error(format!(
+                        "'{}' was defined without a setter",
+                        crate::symbol::description_string(s)
+                    )));
+                }
+            };
+        }
+        Some(d) if d.writable == Some(false) => {
+            return Err(Error::type_error(format!(
+                "Private method '{}' is not writable",
+                crate::symbol::description_string(s)
+            )));
+        }
+        Some(_) => {
+            let d = Desc { value: Some(v), ..Desc::default() };
+            vm.define_own_property(as_object(o), key, &d)?;
+        }
+        None => {
+            return Err(Error::type_error(format!(
+                "Cannot write private member {} to an object whose class did not declare it",
+                crate::symbol::description_string(s)
+            )));
+        }
+    }
+    Ok(v)
+}
+
+/// Define private property `key` of `o` as `d`, unless `o` has it.
+fn private_add(vm: &mut Vm, o: Value, s: Value, d: &Desc) -> Result<()> {
+    if private_property(vm, o, s).is_some() {
+        return Err(Error::type_error(format!(
+            "Cannot initialize {} twice on the same object",
+            crate::symbol::description_string(s)
+        )));
+    }
+    let key = Key::Name(crate::symbol::symbol_atom(s));
+    if !vm.define_own_property(as_object(o), key, d)? {
+        return Err(Error::type_error(format!(
+            "Cannot define private member {} on a non-extensible object",
+            crate::symbol::description_string(s)
+        )));
+    }
+    Ok(())
+}
+
+/// A private field `#x = v` of a new instance: `[o, symbol, v]`.
+fn private_define(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    private_add(vm, a[0], a[1], &Desc::data(a[2], true, false, true))?;
+    Ok(a[2])
+}
+
+/// A private method (`kind` 0), getter (1) or setter (2) of an instance
+/// or (a static one's) a class: `[o, symbol, f, kind]`. A getter and a
+/// setter of the name make one accessor.
+fn private_method(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (o, s, f) = (a[0], a[1], a[2]);
+    let kind = a[3].to_number() as u8;
+    if kind == 0 {
+        private_add(vm, o, s, &Desc::data(f, false, false, true))?;
+        return Ok(o);
+    }
+    let (mut get, mut set) = (Value::UNDEFINED, Value::UNDEFINED);
+    if let Some(d) = private_property(vm, o, s) {
+        match (d.get, d.set) {
+            (Some(g), Some(st)) if (kind == 1 && g.is_undefined()) || (kind == 2 && st.is_undefined()) => {
+                (get, set) = (g, st);
+                let key = Key::Name(crate::symbol::symbol_atom(s));
+                vm.delete_key(o, key)?;
+            }
+            _ => {
+                return Err(Error::type_error(format!(
+                    "Cannot initialize {} twice on the same object",
+                    crate::symbol::description_string(s)
+                )));
+            }
+        }
+    }
+    if kind == 1 {
+        get = f;
+    } else {
+        set = f;
+    }
+    private_add(vm, o, s, &Desc::accessor(get, set, false, true))?;
+    Ok(o)
+}
+
+/// `#x in o`: `[o, symbol]`.
+fn private_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (o, s) = (a[0], a[1]);
+    if !crate::props::is_object(o) {
+        return Err(Error::type_error(format!(
+            "Cannot use 'in' operator to search for '{}' in {}",
+            crate::symbol::description_string(s),
+            crate::vm::display(o)
+        )));
+    }
+    Ok(Value::from_bool(private_property(vm, o, s).is_some()))
+}
+
+/// An async generator's `yield`: `[generator]` marked as yielding the
+/// value it suspends with.
+fn async_gen_yield(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    crate::generator::async_gen_yield(vm, a[0]);
+    Ok(Value::UNDEFINED)
+}
+
+/// `[v]`'s `Symbol.asyncIterator` method, if it has one.
+fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
+    let a = vm.intern(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
+    let o = object_value(vm.to_object(v)?);
+    let m = vm.get(o, a)?;
+    Ok((!m.is_undefined() && !m.is_null()).then_some(m))
+}
+
+/// A `for await`'s iterable `[v]`: whether it has no async iterator, its
+/// sync one used instead.
+fn async_iterator_kind(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(async_iterator_method(vm, a[0])?.is_none()))
+}
+
+/// `[v, sync]`: `v`'s async iterator (with `sync`, its iterator).
+fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if a[1] == Value::TRUE {
+        return crate::symbol::get_iterator(vm, a[0]);
+    }
+    let m = async_iterator_method(vm, a[0])?.unwrap_or(Value::UNDEFINED);
+    if !crate::props::is_callable(m) {
+        return Err(Error::type_error("Symbol.asyncIterator is not a function"));
+    }
+    let it = call_function(vm, m, a[0], &[])?;
+    if !crate::props::is_object(it) {
+        return Err(Error::type_error("Result of the Symbol.asyncIterator method is not an object"));
+    }
+    Ok(it)
+}
+
+/// `[iterator]`: `iterator.next()`.
+fn async_iterator_next(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let a_next = vm.intern("next");
+    let next = vm.get(a[0], a_next)?;
+    if !crate::props::is_callable(next) {
+        return Err(Error::type_error("iterator.next is not a function"));
+    }
+    call_function(vm, next, a[0], &[])
+}
+
+/// A `for await`'s iterator result `[r]`: its value, or `HOLE` if done.
+fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let r = a[0];
+    if !crate::props::is_object(r) {
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
+    }
+    let a_done = vm.intern("done");
+    if crate::interp::to_boolean(vm.get(r, a_done)?) {
+        return Ok(Value::HOLE);
+    }
+    let a_value = vm.a_value;
+    vm.get(r, a_value)
+}
+
+/// A `for await` left early: `[iterator]`'s `return()` called, what it
+/// gives (awaited after), or `undefined` without one.
+fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let a_return = vm.intern("return");
+    let m = vm.get(a[0], a_return)?;
+    if m.is_undefined() || m.is_null() {
+        return Ok(Value::UNDEFINED);
+    }
+    call_function(vm, m, a[0], &[])
 }

@@ -55,6 +55,9 @@ pub(crate) fn install(vm: &mut Vm) {
     for (k, (name, f)) in ctors.into_iter().enumerate() {
         let c = vm.define_native(g, name, f, 0, any, true);
         link_constructor(vm, c, protos[k]);
+        if name == "Map" {
+            vm.define_native(c, "groupBy", map_group_by, 2, any, false);
+        }
     }
     let mp = protos[Proto::Map as usize];
     vm.define_natives(
@@ -829,4 +832,23 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
     }
     unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, size) };
     Ok(Value::UNDEFINED)
+}
+
+/// `Map.groupBy(items, callback)`: a Map of arrays.
+fn map_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let out = object_value(new_collection(vm, Class::Map, Proto::Map)?);
+    let (a_get, a_set) = (vm.intern("get"), vm.intern("set"));
+    let (get, set) = (vm.get(out, a_get)?, vm.get(out, a_set)?);
+    crate::props::group_by(vm, a, |vm, key, v| {
+        // (-0 as +0, as `set` keeps it.)
+        let key = if key.is_number() && key.to_number() == 0.0 { Value::from_i32(0) } else { key };
+        let mut group = call_function(vm, get, out, &[key])?;
+        if group.is_undefined() {
+            group = vm.new_array();
+            call_function(vm, set, out, &[key, group])?;
+        }
+        array_push(vm, group, &[v])?;
+        Ok(())
+    })?;
+    Ok(out)
 }

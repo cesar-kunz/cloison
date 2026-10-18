@@ -340,7 +340,8 @@ pub struct Code {
     pub length: u32,
     /// 0: an ordinary function; 1: an arrow function or a method (no
     /// constructor); 2: a class constructor (which only `new` calls); 3:
-    /// a derived class's.
+    /// a derived class's; 4: a generator function; 5: an async function;
+    /// 6: an async generator function.
     pub kind: u8,
     /// Its code starts with `LdaNewTarget`.
     pub uses_new_target: bool,
@@ -451,7 +452,7 @@ pub struct Code {
 impl Code {
     /// Whether `new` may call it.
     pub fn constructor(&self) -> bool {
-        !matches!(self.kind, 1 | 4 | 5)
+        !matches!(self.kind, 1 | 4 | 5 | 6)
     }
 
     /// The inline-cache slot `i` (its way 0, the others following), and
@@ -721,7 +722,7 @@ pub struct Vm {
     /// `exec` arrays' shapes, by their elements' type (a few): a new
     /// array's with elements of it, then with `index` and with `input`
     /// added.
-    pub(crate) match_shapes: Vec<(FieldType, *const Shape, *const Shape, *const Shape)>,
+    pub(crate) match_shapes: Vec<(FieldType, *const Shape, *const Shape, *const Shape, *const Shape)>,
     /// A `RegExp` object's shape when made, and with its five properties
     /// (see `builtins::regexp_object`).
     pub(crate) regexp_shapes: (*const Shape, *const Shape),
@@ -3110,7 +3111,7 @@ impl Vm {
     /// The shape a closure of `callee` gets.
     fn closure_shape(&self, callee: *const Code) -> *const Shape {
         match unsafe { (*callee).kind } {
-            4 if !self.generator_function_shape.is_null() => self.generator_function_shape,
+            4 | 6 if !self.generator_function_shape.is_null() => self.generator_function_shape,
             5 if !self.async_function_shape.is_null() => self.async_function_shape,
             1 | 5 => self.method_shape,
             _ => self.function_shape,
@@ -3128,9 +3129,12 @@ impl Vm {
         if matches!(unsafe { (*(*f).code).kind }, 1 | 5) {
             return object_value(f);
         }
-        // (A generator function's: a `%GeneratorPrototype%` object.)
-        if unsafe { (*(*f).code).kind } == 4 {
-            let gp = self.symbol_roots.get(crate::symbol::Root::GeneratorPrototype as usize).copied();
+        // (A generator function's: a `%GeneratorPrototype%` object; an
+        // async one's, an `%AsyncGeneratorPrototype%` one.)
+        let kind = unsafe { (*(*f).code).kind };
+        if kind == 4 || kind == 6 {
+            let root = if kind == 6 { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
+            let gp = self.symbol_roots.get(root as usize).copied();
             let proto = gp.map_or(Value::NULL, object_value);
             let p = self.new_object(proto);
             self.store_field(f, 0, object_value(p));

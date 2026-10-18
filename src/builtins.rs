@@ -52,6 +52,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("split", string_split, 2),
             ("match", string_match, 1),
             ("replace", string_replace, 2),
+            ("replaceAll", string_replace_all, 2),
+            ("matchAll", string_match_all, 1),
             ("search", string_search, 1),
             ("concat", string_concat, 1),
             ("toString", string_to_string, 0),
@@ -2325,7 +2327,7 @@ fn with_caps<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm, &mut crate::regexp::Capture
 
 /// The array `exec` returns for `caps` over `s`: the match and each group
 /// (`undefined` if it didn't match), with `index` and `input`.
-fn match_array(vm: &mut Vm, caps: &crate::regexp::Captures, s: &[u16], input: Value) -> Result<Value> {
+fn match_array(vm: &mut Vm, re: &crate::regexp::Regex, caps: &crate::regexp::Captures, s: &[u16], input: Value) -> Result<Value> {
     let arr = vm.new_array();
     let o = as_object(arr);
     vm.reserve_elems(o, caps.len());
@@ -2347,23 +2349,43 @@ fn match_array(vm: &mut Vm, caps: &crate::regexp::Captures, s: &[u16], input: Va
     }
     // Defined, as ECMAScript's CreateDataProperty does (no setters), along
     // transitions found once per type of elements.
-    let (elems, with_index, with_input) = match vm.match_shapes.iter().find(|m| m.0 == ty) {
-        Some(&(_, e, a, b)) => (e, a, b),
+    let (elems, with_index, with_input, with_groups) = match vm.match_shapes.iter().find(|m| m.0 == ty) {
+        Some(&(_, e, a, b, c)) => (e, a, b, c),
         None => {
             let e = vm.elements_transition(vm.array_shape, ty);
             let a = vm.transition_with(e, vm.a_index, 0);
             let b = vm.transition_with(a, vm.a_input, 0);
+            let a_groups = vm.intern("groups");
+            let c = vm.transition_with(b, a_groups, 0);
             if vm.match_shapes.len() == 4 {
                 vm.match_shapes.remove(0);
             }
-            vm.match_shapes.push((ty, e, a, b));
-            (e, a, b)
+            vm.match_shapes.push((ty, e, a, b, c));
+            (e, a, b, c)
         }
     };
     unsafe { (*o).shape = elems };
     vm.add_property_shaped(o, with_index, Value::from_i32(caps[0].unwrap().0 as i32));
     vm.add_property_shaped(o, with_input, input);
+    // `groups`: with named groups, each one's match.
+    let groups = if re.names.is_empty() { Value::UNDEFINED } else { named_groups(vm, re, caps, s)? };
+    vm.add_property_shaped(o, with_groups, groups);
     Ok(arr)
+}
+
+/// A match's named groups: a null-prototype object of their matches
+/// (`undefined` where a group didn't match).
+fn named_groups(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>], s: &[u16]) -> Result<Value> {
+    let groups = object_value(vm.new_object(Value::NULL));
+    for (name, g) in &re.names {
+        let v = match caps.get(*g).copied().flatten() {
+            Some((a, b)) => string(vm, &s[a..b]),
+            None => Value::UNDEFINED,
+        };
+        let key = vm.intern(name);
+        vm.create_data_property(groups, crate::vm::Key::Name(key), v)?;
+    }
+    Ok(groups)
 }
 
 fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -2374,7 +2396,7 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = units(input);
     with_caps(vm, |vm, caps| {
         if regexp_match_into(vm, this, re, &s, caps)? {
-            match_array(vm, caps, &s, input)
+            match_array(vm, re, caps, &s, input)
         } else {
             Ok(Value::NULL)
         }
@@ -2404,6 +2426,45 @@ fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
     new_regexp(vm, &p, "")
 }
 
+/// `s.matchAll(re)`: an iterator over `exec`'s arrays for each match (a
+/// `RegExp` must be global; anything else is a pattern made one). The
+/// matches are found at once, from the `RegExp`'s `lastIndex`.
+fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let s = this_units(this)?;
+    let pattern = arg(a, 0);
+    let rv = match regexp_of(pattern) {
+        Some(re) if !re.global => {
+            return Err(Error::type_error("String.prototype.matchAll called with a non-global RegExp argument"));
+        }
+        Some(_) => pattern,
+        None => {
+            let p = if pattern.is_undefined() { String::new() } else { String::from_utf16_lossy(&units(pattern)) };
+            if vm.conv_failed() {
+                return Err(vm.take_conv_error());
+            }
+            new_regexp(vm, &p, "g")?
+        }
+    };
+    let re = regexp_of(rv).unwrap();
+    let a_last = vm.a_last_index;
+    let li = vm.get(rv, a_last)?;
+    let li = to_number(li);
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    let input = this_string(vm, this, &s);
+    let out = vm.new_array();
+    let mut at = if li.is_nan() || li < 0.0 { 0 } else { li.min(s.len() as f64 + 1.0) as usize };
+    let mut caps = Vec::new();
+    while at <= s.len() && re.exec_into(&s, at, &mut caps) {
+        let (x, y) = caps[0].unwrap();
+        at = if y == x { y + 1 } else { y };
+        let m = match_array(vm, re, &caps, &s, input)?;
+        crate::vm::array_push(vm, out, &[m])?;
+    }
+    crate::symbol::array_values(vm, out, &[])
+}
+
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
 /// none).
 fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -2414,7 +2475,7 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !re.global {
         return with_caps(vm, |vm, caps| {
             if regexp_match_into(vm, rv, re, &s, caps)? {
-                match_array(vm, caps, &s, input)
+                match_array(vm, re, caps, &s, input)
             } else {
                 Ok(Value::NULL)
             }
@@ -2452,6 +2513,20 @@ fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// a string (with `$&`, `$1`…, `$$`, `` $` ``, `$'`) or a function's
 /// result (called with the match, the groups, the index and `s`).
 fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    replace(vm, this, a, false)
+}
+
+/// `s.replaceAll(pattern, replacement)`: every match replaced (a
+/// `RegExp` pattern must be global).
+fn string_replace_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if regexp_of(arg(a, 0)).is_some_and(|re| !re.global) {
+        return Err(Error::type_error("replaceAll must be called with a global RegExp"));
+    }
+    replace(vm, this, a, true)
+}
+
+/// `replace` (`all`: `replaceAll`).
+fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
     let s = this_units(this)?;
     let pattern = arg(a, 0);
     let replacement = arg(a, 1);
@@ -2486,8 +2561,14 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         None => {
             let p = pattern_units.unwrap_or_default();
-            if let Some(i) = find(&s, &p, 0) {
+            let mut at = 0;
+            while let Some(i) = find(&s, &p, at) {
                 flat.push(Some((i, i + p.len())));
+                // (An empty pattern matches between each unit.)
+                at = i + p.len().max(1);
+                if !all || at > s.len() {
+                    break;
+                }
             }
         }
     }
@@ -2511,6 +2592,11 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 .collect();
             args.push(Value::from_i32(x as i32));
             args.push(input);
+            // (With named groups, their object last.)
+            if let Some(re) = regexp_of(pattern).filter(|re| !re.names.is_empty()) {
+                let g = named_groups(vm, re, caps, &s)?;
+                args.push(g);
+            }
             // (The captures are only in `args`: roots for the call.)
             let r = vm.handle_scope(|vm| {
                 vm.handles.extend_from_slice(&args);
@@ -2518,7 +2604,8 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             })?;
             out.extend_from_slice(&units(r));
         } else {
-            expand(&template, &s, caps, &mut out);
+            let names = regexp_of(pattern).map_or(&[][..], |re| &re.names[..]);
+            expand(&template, &s, caps, names, &mut out);
         }
         last = y;
     }
@@ -2527,7 +2614,7 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// A replacement template's `$` patterns expanded for one match.
-fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], out: &mut Vec<u16>) {
+fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(String, usize)], out: &mut Vec<u16>) {
     let (x, y) = caps[0].unwrap();
     let mut i = 0;
     while i < t.len() {
@@ -2555,6 +2642,22 @@ fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], out: &mut Vec<u
                 out.extend_from_slice(&s[y..]);
                 i += 2;
             }
+            // `$<name>`, with named groups: that group's match.
+            b'<' if !names.is_empty() => match t[i + 2..].iter().position(|&c| c == b'>' as u16) {
+                Some(k) => {
+                    let name = String::from_utf16_lossy(&t[i + 2..i + 2 + k]);
+                    if let Some(&(_, g)) = names.iter().find(|(n, _)| *n == name)
+                        && let Some((p, q)) = caps[g]
+                    {
+                        out.extend_from_slice(&s[p..q]);
+                    }
+                    i += k + 3;
+                }
+                None => {
+                    out.push(c);
+                    i += 1;
+                }
+            },
             b'0'..=b'9' if n < 128 => {
                 // `$nn` if that group exists, else `$n`.
                 let d1 = (n - b'0' as u16) as usize;
@@ -2653,7 +2756,17 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         Some(v) if !v.is_undefined() => Some(units(*v).into_owned()),
         _ => None,
     };
-    Ok(make_error(vm, K, message.as_deref()))
+    let e = make_error(vm, K, message.as_deref());
+    // `{ cause }` in the options: its own `cause`.
+    let options = arg(a, 1);
+    if crate::props::is_object(options) {
+        let a_cause = vm.intern("cause");
+        if vm.has_key(options, crate::vm::Key::Name(a_cause))? {
+            let cause = vm.get(options, a_cause)?;
+            vm.add_property_with(as_object(e), a_cause, cause, DONT_ENUM);
+        }
+    }
+    Ok(e)
 }
 
 /// A new error object of kind `k`, with its own `message` if given.

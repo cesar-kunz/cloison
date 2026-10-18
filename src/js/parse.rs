@@ -81,6 +81,9 @@ fn parse_pass<'a, 'p>(
         pending_head: Vec::new(),
         sub: false,
         pending_pattern: None,
+        pattern_names: Vec::new(),
+        privates: Vec::new(),
+        super_fns: Vec::new(),
         home_uses: 0,
         pending_home: None,
         keep,
@@ -123,6 +126,7 @@ fn parse_pass<'a, 'p>(
         home: None,
         ctor_var: None,
         free: None,
+        fields: None,
     });
     p.functions[0].strict = p.directive_prologue() || eval == Some(true);
     if eval.is_some() {
@@ -220,6 +224,14 @@ struct Parser<'t, 'a, 'p> {
     sub: bool,
     /// A `for` head's declaration's pattern (see `pattern_declarator`).
     pending_pattern: Option<Pattern<'a>>,
+    /// The names the last parameter list's patterns bind.
+    pattern_names: Vec<Name>,
+    /// The private names of the classes being parsed (innermost last),
+    /// each with its variable.
+    privates: Vec<Vec<(Name, Name)>>,
+    /// The functions with a `super(…)` call, with the variable holding
+    /// their class (see `Function::fields`).
+    super_fns: Vec<(Name, usize)>,
     /// `super` property references so far.
     home_uses: usize,
     /// The home object variables for the method about to be parsed (see
@@ -531,11 +543,24 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Tok::Keyword("for") => {
                 self.advance();
+                // `for await (x of it)`, in an async function.
+                let is_await = self.functions[self.current].is_async
+                    && matches!(self.peek(), Tok::Ident(n) if &**n == "await")
+                    && !self.toks[self.i].escaped;
+                if is_await {
+                    self.advance();
+                }
                 let key = self.i;
                 self.push_scope(key, false, false);
                 let r = self.for_rest();
                 self.frames.pop();
-                r?
+                match r? {
+                    StmtKind::ForOf { kind, target, pattern, iterable, body, .. } if is_await => {
+                        StmtKind::ForOf { kind, target, pattern, iterable, body, is_await }
+                    }
+                    _ if is_await => return self.err("`for await` without `of`"),
+                    r => r,
+                }
             }
             Tok::Keyword("while") => {
                 self.advance();
@@ -593,7 +618,16 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.advance();
                 self.expect("{")?;
                 let block = self.scoped_block_rest()?;
-                let handler = if self.eat("catch") {
+                let handler = if self.is("catch") && matches!(self.peek_at(1), Tok::Punct("{")) {
+                    // `catch {`: the exception in a variable of its own.
+                    self.advance();
+                    let k = self.classes;
+                    self.classes += 1;
+                    let e: Name = format!("%catch{k}").into();
+                    self.hidden_var(e.clone());
+                    self.expect("{")?;
+                    Some((e, self.scoped_block_rest()?))
+                } else if self.eat("catch") {
                     let key = self.i;
                     self.expect("(")?;
                     self.push_scope(key, false, false);
@@ -935,6 +969,7 @@ impl<'a> Parser<'_, 'a, '_> {
             pattern: None,
             iterable,
             body,
+            is_await: false,
         })
     }
 
@@ -951,6 +986,7 @@ impl<'a> Parser<'_, 'a, '_> {
             pattern: Some(Box::new(p)),
             iterable,
             body,
+            is_await: false,
         })
     }
 
@@ -1090,7 +1126,15 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             ExprKind::Object(ps, _) => {
                 let mut props = Vec::new();
-                for (k, v) in ps {
+                let mut rest = None;
+                for (i, (k, v)) in ps.iter().enumerate() {
+                    if let ExprKind::Spread(t) = &v.kind {
+                        if i + 1 < ps.len() || !matches!(t.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) {
+                            return bad();
+                        }
+                        rest = Some(Box::new(self.to_pattern(t)?));
+                        continue;
+                    }
                     let key = match k {
                         PropKey::Name(n) => PatKey::Name(n.clone()),
                         PropKey::Computed(e) => PatKey::Computed(e),
@@ -1101,7 +1145,7 @@ impl<'a> Parser<'_, 'a, '_> {
                         _ => props.push((key, self.to_pattern(v)?, None)),
                     }
                 }
-                Pattern::Object(props, None)
+                Pattern::Object(props, rest)
             }
             _ => return bad(),
         })
@@ -1207,6 +1251,7 @@ impl<'a> Parser<'_, 'a, '_> {
             home,
             ctor_var,
             free: None,
+            fields: None,
         });
         self.functions[index].class_kind = class_kind;
         self.functions[index].uses_new_target = class_kind != 0;
@@ -1240,7 +1285,9 @@ impl<'a> Parser<'_, 'a, '_> {
         if !prologue.is_empty() && self.collect {
             self.table.defaults = true;
         }
-        let body_vars = !prologue.is_empty() && self.push_body_vars(&params);
+        let mut bound = std::mem::take(&mut self.pattern_names);
+        bound.extend(params.iter().cloned());
+        let body_vars = !prologue.is_empty() && self.push_body_vars(&bound);
         self.expect("{")?;
         if self.directive_prologue() {
             self.functions[index].strict = true;
@@ -1352,7 +1399,9 @@ impl<'a> Parser<'_, 'a, '_> {
         }
         // Destructured parameters: `var`s of the function, set in order
         // after the defaults.
+        self.pattern_names.clear();
         for (p, pat, names, pos) in patterns {
+            self.pattern_names.extend(names.iter().cloned());
             let mut decls: Vec<(Name, Option<Expr<'a>>)> =
                 names.into_iter().map(|n| (n, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
             let value = expr(self.arena, Expr { kind: ExprKind::Ident(p), pos });
@@ -1457,6 +1506,7 @@ impl<'a> Parser<'_, 'a, '_> {
             home: None,
             ctor_var: None,
             free: None,
+            fields: None,
         });
         let outer = std::mem::replace(&mut self.current, index);
         let params = match single {
@@ -1545,7 +1595,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             match &t.tok {
                 Tok::Eof | Tok::Punct("=>" | "...") | Tok::Keyword("const" | "class" | "with" | "import" | "export" | "super") => return None,
-                Tok::Ident(n) if &**n == "let" => return None,
+                Tok::Ident(n) if &**n == "let" || n.starts_with('#') => return None,
                 Tok::Keyword("new") if self.toks[self.i + 1].tok == Tok::Punct(".") => return None,
                 Tok::Punct("{" | "(" | "[") => level += 1,
                 Tok::Punct(p @ ("}" | ")" | "]")) => {
@@ -1678,6 +1728,33 @@ impl<'a> Parser<'_, 'a, '_> {
             });
         }
         let target = self.conditional(no_in)?;
+        if let Tok::Punct(p @ ("&&=" | "||=" | "??=")) = self.peek() {
+            let kind = match *p {
+                "&&=" => 0,
+                "||=" => 1,
+                _ => 2,
+            };
+            if !matches!(target.kind, ExprKind::Ident(_) | ExprKind::Member(..) | ExprKind::Index(..)) {
+                return self.err("invalid assignment target");
+            }
+            if let ExprKind::Ident(n) = &target.kind
+                && self.strict()
+                && matches!(&**n, "eval" | "arguments")
+            {
+                return self.err(format!("assignment to `{n}` in strict mode"));
+            }
+            let pos = self.pos();
+            self.advance();
+            let value = self.assignment(no_in)?;
+            if let ExprKind::Ident(n) = &target.kind {
+                let n = n.clone();
+                self.infer_name(&value, &n);
+            }
+            return Ok(Expr {
+                kind: ExprKind::LogicalAssign(kind, expr(self.arena, target), expr(self.arena, value)),
+                pos,
+            });
+        }
         let op = match self.peek() {
             Tok::Punct("=") => None,
             Tok::Punct(p) => match compound(p) {
@@ -1765,10 +1842,18 @@ impl<'a> Parser<'_, 'a, '_> {
                 prec
             };
             let r = self.binary(rmin, no_in)?;
+            // `#x in o`: whether `o` has the private name.
+            if let (Bin::Op(BinOp::In), ExprKind::Ident(n)) = (&op, &l.kind)
+                && n.starts_with('#')
+            {
+                l = Expr { kind: ExprKind::Intrinsic("private_has", vec![r, take(&mut l)]), pos };
+                continue;
+            }
             let kind = match op {
                 Bin::Op(op) => ExprKind::Binary(op, expr(self.arena, l), expr(self.arena, r)),
                 Bin::And => ExprKind::Logical(true, expr(self.arena, l), expr(self.arena, r)),
                 Bin::Or => ExprKind::Logical(false, expr(self.arena, l), expr(self.arena, r)),
+                Bin::Nullish => ExprKind::Nullish(expr(self.arena, l), expr(self.arena, r)),
             };
             l = Expr { kind, pos };
         }
@@ -1810,6 +1895,12 @@ impl<'a> Parser<'_, 'a, '_> {
         };
         self.advance();
         let e = self.unary()?;
+        if op == UnOp::Delete
+            && let ExprKind::Member(_, n) | ExprKind::Chain(Expr { kind: ExprKind::Member(_, n), .. }) = &e.kind
+            && n.starts_with('#')
+        {
+            return self.err("deleting a private member");
+        }
         if self.is("**") {
             return self.err("parenthesize a unary operand of `**`");
         }
@@ -1859,9 +1950,27 @@ impl<'a> Parser<'_, 'a, '_> {
         } else {
             self.primary()?
         };
+        // In an optional chain (`a?.b`): the whole of it, made `Chain`.
+        let mut chain = false;
         loop {
             let pos = self.pos();
-            if self.eat("(") {
+            if self.eat("?.") {
+                chain = true;
+                let base = expr(self.arena, Expr { kind: ExprKind::Optional(expr(self.arena, take(&mut e))), pos });
+                let kind = if self.eat("(") {
+                    ExprKind::Call(base, self.arguments()?)
+                } else if self.eat("[") {
+                    let k = self.expression(false)?;
+                    self.expect("]")?;
+                    ExprKind::Index(base, expr(self.arena, k))
+                } else {
+                    let name = self.property_name()?;
+                    ExprKind::Member(base, self.private_ref(name)?)
+                };
+                e = Expr { kind, pos };
+            } else if matches!(self.peek(), Tok::Template(_)) && chain {
+                return self.err("a tagged template in an optional chain");
+            } else if self.eat("(") {
                 let args = self.arguments()?;
                 if matches!(&e.kind, ExprKind::Ident(n) if &**n == "eval") {
                     // A direct `eval` (see `Function::has_eval`), which may
@@ -1887,6 +1996,10 @@ impl<'a> Parser<'_, 'a, '_> {
                     pos,
                 };
             } else if !self.member_suffix(&mut e)? {
+                if chain {
+                    let pos = e.pos;
+                    e = Expr { kind: ExprKind::Chain(expr(self.arena, e)), pos };
+                }
                 return Ok(e);
             }
         }
@@ -1897,6 +2010,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let pos = self.pos();
         let kind = if self.eat(".") {
             let name = self.property_name()?;
+            let name = self.private_ref(name)?;
             ExprKind::Member(expr(self.arena, take(e)), name)
         } else if self.eat("[") {
             let k = self.expression(false)?;
@@ -1947,6 +2061,9 @@ impl<'a> Parser<'_, 'a, '_> {
             } else if !self.member_suffix(&mut c)? {
                 break;
             }
+        }
+        if self.is("?.") {
+            return self.err("an optional chain in `new`");
         }
         let args = if self.eat("(") {
             self.arguments()?
@@ -2007,6 +2124,14 @@ impl<'a> Parser<'_, 'a, '_> {
                     self.pending_async = true;
                     ExprKind::Function(self.arrow(Some(n), pos)?)
                 }
+            }
+            // `#x in o` (see `binary`).
+            Tok::Ident(s) if s.starts_with('#') => {
+                if !self.is("in") {
+                    self.i = start;
+                    return self.unexpected();
+                }
+                ExprKind::Ident(self.private_ref(s)?)
             }
             Tok::Ident(s) => {
                 self.strict_word(&s)?;
@@ -2083,6 +2208,16 @@ impl<'a> Parser<'_, 'a, '_> {
                 let mut home: Option<Name> = None;
                 while !self.eat("}") {
                     let ppos = self.pos();
+                    // `...e`: its own enumerable properties copied.
+                    if self.eat("...") {
+                        let v = self.assignment(false)?;
+                        let v = Expr { kind: ExprKind::Spread(expr(self.arena, v)), pos: ppos };
+                        props.push((PropKey::Name("...".into()), v));
+                        if !self.is("}") {
+                            self.expect(",")?;
+                        }
+                        continue;
+                    }
                     // `get k() {…}` / `set k(v) {…}`.
                     let accessor = match self.peek() {
                         Tok::Ident(n) if matches!(&**n, "get" | "set") => {
@@ -2529,15 +2664,40 @@ impl<'a> Parser<'_, 'a, '_> {
             self.hidden_var(n.clone());
         }
         let class_kind = if heritage.is_some() { 3 } else { 2 };
-        self.expect("{")?;
+        if !self.is("{") {
+            return self.err("expected `{`");
+        }
+        // Its private names, wherever in its body declared: variables.
+        let privates: Vec<(Name, Name)> =
+            self.private_names().into_iter().map(|n| (format!("{n}%p{k}").into(), n)).collect();
+        for (v, _) in &privates {
+            self.hidden_var(v.clone());
+        }
+        self.privates.push(privates.iter().map(|(v, n)| (n.clone(), v.clone())).collect());
+        self.advance();
         let mut constructor = None;
         let mut members = Vec::new();
+        // The function defining the instance fields, and its statements:
+        // the private methods', then the fields'.
+        let mut fields_fn = None;
+        let mut method_stmts = Vec::new();
+        let mut field_stmts = Vec::new();
+        let mut statics = Vec::new();
+        // The private names declared so far: kind (0 a field or method, 1
+        // a getter, 2 a setter) and whether static.
+        let mut declared: Vec<(Name, u8, bool)> = Vec::new();
         while !self.eat("}") {
             if self.eat(";") {
                 continue;
             }
+            // `static { … }`
+            if matches!(self.peek(), Tok::Ident(n) if &**n == "static") && self.peek_at(1) == &Tok::Punct("{") {
+                let f = self.static_block(&home_static)?;
+                statics.push(f);
+                continue;
+            }
             let is_static = matches!(self.peek(), Tok::Ident(n) if &**n == "static")
-                && !matches!(self.peek_at(1), Tok::Punct("(" | "="));
+                && !matches!(self.peek_at(1), Tok::Punct("(" | "=" | ";" | "}"));
             if is_static {
                 self.advance();
             }
@@ -2550,7 +2710,11 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             let generator = self.eat("*");
             let kind = match self.peek() {
-                Tok::Ident(n) if matches!(&**n, "get" | "set") && !matches!(self.peek_at(1), Tok::Punct("(" | "=" | ";" | "}")) => {
+                Tok::Ident(n)
+                    if matches!(&**n, "get" | "set")
+                        && !matches!(self.peek_at(1), Tok::Punct("(" | "=" | ";" | "}"))
+                        && !self.toks[self.i + 1].newline_before =>
+                {
                     let k = if &**n == "get" { 1 } else { 2 };
                     self.advance();
                     k
@@ -2558,6 +2722,94 @@ impl<'a> Parser<'_, 'a, '_> {
                 _ => 0,
             };
             let key = self.prop_key()?;
+            let private = match &key {
+                PropKey::Name(n) if n.starts_with('#') => {
+                    if &**n == "#constructor" {
+                        return self.err("a private name `#constructor`");
+                    }
+                    // (A getter and a setter may share one.)
+                    let clash = declared.iter().any(|(d, k, st)| {
+                        d == n && !(*st == is_static && (*k, kind) == (1, 2) || *st == is_static && (*k, kind) == (2, 1))
+                    });
+                    if clash || declared.iter().filter(|(d, ..)| d == n).count() > 1 {
+                        return self.err(format!("private name `{n}` declared twice"));
+                    }
+                    declared.push((n.clone(), kind, is_static));
+                    Some(self.private_ref(n.clone())?)
+                }
+                _ => None,
+            };
+            // A field: no `(` after its key.
+            if kind == 0 && !generator && !is_async && !self.is("(") {
+                if let PropKey::Name(n) = &key
+                    && (&**n == "constructor" || is_static && &**n == "prototype")
+                {
+                    return self.err(format!("a field named `{n}`"));
+                }
+                let fpos = self.pos();
+                let h = if is_static { &home_static } else { &home };
+                let f = match fields_fn {
+                    Some(f) if !is_static => f,
+                    _ => {
+                        let f = self.synthetic_method(h, fpos);
+                        if !is_static {
+                            fields_fn = Some(f);
+                        }
+                        f
+                    }
+                };
+                let x = |kind| Expr { kind, pos: fpos };
+                let (which, key) = match (&private, key) {
+                    (Some(v), _) => ("private_define", x(ExprKind::Ident(v.clone()))),
+                    (None, PropKey::Name(n)) => ("define_field", x(ExprKind::Str(n.to_string()))),
+                    (None, PropKey::Computed(e)) => {
+                        // (Evaluated with the class, in order.)
+                        let v: Name = format!("%key{k}_{}", members.len()).into();
+                        self.hidden_var(v.clone());
+                        members.push(ClassMember {
+                            key: PropKey::Computed(e),
+                            kind: 3,
+                            is_static,
+                            function: usize::MAX,
+                            var: Some(v.clone()),
+                        });
+                        ("define_field", x(ExprKind::Ident(v)))
+                    }
+                };
+                let value = if self.eat("=") {
+                    let outer = std::mem::replace(&mut self.current, f);
+                    let v = self.assignment(false);
+                    self.current = outer;
+                    let v = v?;
+                    match &key.kind {
+                        ExprKind::Str(n) => self.infer_name(&v, &n.as_str().into()),
+                        ExprKind::Ident(_) if private.is_some() => {
+                            let n = privates.iter().find(|(pv, _)| Some(pv) == private.as_ref()).unwrap().1.clone();
+                            self.infer_name(&v, &n);
+                        }
+                        _ => {}
+                    }
+                    v
+                } else {
+                    let zero = expr(self.arena, x(ExprKind::Num(0.0)));
+                    x(ExprKind::Unary(UnOp::Void, zero))
+                };
+                if !self.eat(";") && !self.is("}") && !self.toks[self.i].newline_before {
+                    return self.err("expected `;` after a field");
+                }
+                let stmt = Stmt {
+                    kind: StmtKind::Expr(x(ExprKind::Intrinsic(which, vec![x(ExprKind::This), key, value]))),
+                    pos: fpos,
+                };
+                if is_static {
+                    self.functions[f].body = vec![stmt];
+                    self.functions[f].end = self.toks[self.i - 1].pos + 1;
+                    statics.push(f);
+                } else {
+                    field_stmts.push(stmt);
+                }
+                continue;
+            }
             let is_ctor = !is_static && kind == 0 && matches!(&key, PropKey::Name(n) if &**n == "constructor");
             if is_ctor {
                 if constructor.is_some() {
@@ -2583,20 +2835,69 @@ impl<'a> Parser<'_, 'a, '_> {
                 _ => None,
             };
             let f = self.method(&key, prefix, mpos)?;
+            // A private method: its function in a variable, defined on each
+            // instance (on the class, a static one).
+            let var = match &private {
+                Some(v) => {
+                    let fv: Name = format!("{v}${kind}").into();
+                    self.hidden_var(fv.clone());
+                    if !is_static {
+                        let x = |kind| Expr { kind, pos: mpos };
+                        let args = vec![
+                            x(ExprKind::This),
+                            x(ExprKind::Ident(v.clone())),
+                            x(ExprKind::Ident(fv.clone())),
+                            x(ExprKind::Num(kind as f64)),
+                        ];
+                        method_stmts.push(Stmt {
+                            kind: StmtKind::Expr(x(ExprKind::Intrinsic("private_method", args))),
+                            pos: mpos,
+                        });
+                    }
+                    Some(fv)
+                }
+                None => None,
+            };
             members.push(ClassMember {
                 key,
                 kind,
                 is_static,
                 function: f,
+                var,
             });
         }
+        self.privates.pop();
         let end = self.toks[self.i - 1].pos;
+        let fields = if fields_fn.is_some() || !method_stmts.is_empty() {
+            let f = match fields_fn {
+                Some(f) => f,
+                None => self.synthetic_method(&home, end),
+            };
+            method_stmts.append(&mut field_stmts);
+            self.functions[f].body = method_stmts;
+            self.functions[f].end = end + 1;
+            let v: Name = format!("%fields{k}").into();
+            self.hidden_var(v.clone());
+            Some((v, f))
+        } else {
+            None
+        };
         let constructor = match constructor {
             Some(f) => f,
             None => self.default_constructor(name.clone(), class_kind, &home, &home_static, end),
         };
         // (Its text is the class's, from `class`.)
         self.functions[constructor].text = Some((pos, end + 1));
+        if let Some((v, _)) = &fields {
+            self.functions[constructor].fields = Some(v.clone());
+            for (c, f) in std::mem::take(&mut self.super_fns) {
+                if c == home_static {
+                    self.functions[f].fields = Some(v.clone());
+                } else {
+                    self.super_fns.push((c, f));
+                }
+            }
+        }
         let inner = match &name {
             Some(n) => {
                 let r = self.declare(n, CONST, end + 1);
@@ -2616,7 +2917,114 @@ impl<'a> Parser<'_, 'a, '_> {
             members,
             home,
             home_static,
+            privates,
+            fields,
+            statics,
         })
+    }
+
+    /// The private names (`#x`) the class body at `self.i` (its `{`)
+    /// declares: those directly in it not after `.` or before `in`.
+    fn private_names(&self) -> Vec<Name> {
+        let mut out: Vec<Name> = Vec::new();
+        let mut depth = 0;
+        let mut j = self.i;
+        loop {
+            match &self.toks[j].tok {
+                Tok::Punct("{") => depth += 1,
+                Tok::Punct("}") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return out;
+                    }
+                }
+                Tok::Eof => return out,
+                Tok::Ident(n)
+                    if depth == 1
+                        && n.starts_with('#')
+                        && !matches!(self.toks[j - 1].tok, Tok::Punct("." | "?."))
+                        && self.toks[j + 1].tok != Tok::Keyword("in")
+                        && !out.contains(n) =>
+                {
+                    out.push(n.clone())
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+    }
+
+    /// Property name `name`, or if a private name, its variable (in the
+    /// innermost class declaring it).
+    fn private_ref(&self, name: Name) -> R<Name> {
+        if !name.starts_with('#') {
+            return Ok(name);
+        }
+        for scope in self.privates.iter().rev() {
+            if let Some((_, v)) = scope.iter().find(|(n, _)| *n == name) {
+                return Ok(v.clone());
+            }
+        }
+        self.err(format!("private name `{name}` not declared in an enclosing class"))
+    }
+
+    /// A function the parser makes for a class (its fields' initializers,
+    /// a static block's code), from `pos`: a method of home object `home`,
+    /// never compiled lazily.
+    fn synthetic_method(&mut self, home: &Name, pos: Pos) -> usize {
+        let index = self.functions.len();
+        self.functions.push(Function {
+            name: None,
+            params: Vec::new(),
+            body: Vec::new(),
+            parent: Some(self.current),
+            declaration: false,
+            binds_name: false,
+            uses_arguments: false,
+            pos,
+            params_pos: pos,
+            end: pos,
+            eager: true,
+            strict: true,
+            withs: self.withs.clone(),
+            arrow: false,
+            uses_this: false,
+            method: true,
+            length: 0,
+            rest: false,
+            param_stmts: 0,
+            binding: None,
+            annex_b: false,
+            class_kind: 0,
+            has_eval: false,
+            generator: false,
+            is_async: false,
+            uses_new_target: false,
+            hidden: Vec::new(),
+            text: None,
+            home: Some(home.clone()),
+            ctor_var: None,
+            free: None,
+            fields: None,
+        });
+        index
+    }
+
+    /// `static { … }` (at `static`): its code, a function of its own (with
+    /// its own `var`s).
+    fn static_block(&mut self, home_static: &Name) -> R<usize> {
+        let key = self.i;
+        let f = self.synthetic_method(home_static, self.pos());
+        self.advance();
+        self.expect("{")?;
+        self.push_vars(key);
+        let outer = std::mem::replace(&mut self.current, f);
+        let body = self.scoped_block_rest();
+        self.current = outer;
+        self.frames.pop();
+        self.functions[f].body = body?;
+        self.functions[f].end = self.toks[self.i - 1].pos + 1;
+        Ok(f)
     }
 
     /// A variable of the current function's, for the parser's own use
@@ -2698,6 +3106,7 @@ impl<'a> Parser<'_, 'a, '_> {
             home: Some(home.clone()),
             ctor_var: Some(home_static.clone()),
             free: None,
+            fields: None,
         });
         index
     }
@@ -2714,6 +3123,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 _ => return self.err("`super()` outside a derived class's constructor"),
             };
             self.functions[k].uses_this = true;
+            self.super_fns.push((ctor.clone(), self.current));
             self.advance();
             let args = self.arguments()?;
             return Ok(Expr {
@@ -2888,6 +3298,7 @@ enum Bin {
     Op(BinOp),
     And,
     Or,
+    Nullish,
 }
 
 /// A binary operator token's precedence (higher binds tighter) and meaning.
@@ -2900,6 +3311,7 @@ fn binary_op(t: &Tok) -> Option<(u8, Bin)> {
     };
     Some(match s {
         "||" => (1, Bin::Or),
+        "??" => (1, Bin::Nullish),
         "&&" => (2, Bin::And),
         "|" => (3, Bin::Op(BitOr)),
         "^" => (4, Bin::Op(BitXor)),

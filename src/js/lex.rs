@@ -254,6 +254,18 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 let (pattern, flags, n) = regexp(&src[i..]).ok_or_else(|| err("unterminated regular expression"))?;
                 i += n;
                 Tok::RegExp(Box::new((pattern, flags)))
+            } else if c == b'#'
+                && src[i + 1..].chars().next().is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '$' || !ch.is_ascii() && is_ident_start(ch))
+            {
+                // A private name (`#x`): an identifier its `#` begins,
+                // never a keyword.
+                let n = 1 + src[i + 1..]
+                    .char_indices()
+                    .find(|&(_, ch)| !is_ident_part(ch))
+                    .map_or(src.len() - i - 1, |(n, _)| n);
+                let word = &src[i..i + n];
+                i += n;
+                Tok::Ident(names.entry(word).or_insert_with(|| word.into()).clone())
             } else if is_ascii_ident_part(c) || c >= 0x80 && src[i..].chars().next().is_some_and(is_ident_start) {
                 // ASCII a byte at a time, past it a character at a time.
                 let mut n = 1 + b[i + 1..].iter().take_while(|&&x| is_ascii_ident_part(x)).count();
@@ -303,6 +315,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                 };
                 puncts(c).iter().find(|&&(v, mask, _)| next & mask == v)
             } {
+                // (`a?.5:b` is a conditional.)
+                let p = if p == "?." && b.get(i + 2).is_some_and(u8::is_ascii_digit) { "?" } else { p };
                 i += p.len();
                 if p == "{" {
                     let expression = match toks.last().map(|t: &Token| &t.tok) {
@@ -532,22 +546,30 @@ fn number(s: &str) -> Option<(f64, usize)> {
             _ => 2,
         };
         let n = 2 + s[2..]
-            .find(|c: char| !c.is_digit(radix))
+            .find(|c: char| !c.is_digit(radix) && c != '_')
             .unwrap_or(s.len() - 2);
-        if n == 2 {
+        if n == 2 || !separated(&s[2..n]) {
             return None;
         }
         // (As a double: past 2^64 too.)
-        let v = s[2..n].chars().fold(0.0, |v, c| v * radix as f64 + c.to_digit(radix).unwrap() as f64);
+        let v = s[2..n]
+            .chars()
+            .filter(|&c| c != '_')
+            .fold(0.0, |v, c| v * radix as f64 + c.to_digit(radix).unwrap() as f64);
         return (!s[n..].starts_with(is_ident_part)).then_some((v, n));
     }
     let mut n = 0;
+    // (With numeric separators, `1_000`.)
     let digits = |n: &mut usize| {
-        while *n < b.len() && b[*n].is_ascii_digit() {
+        while *n < b.len() && (b[*n].is_ascii_digit() || b[*n] == b'_') {
             *n += 1;
         }
     };
     digits(&mut n);
+    // (No separator in one with a leading zero.)
+    if b[0] == b'0' && n > 1 && b[..n].contains(&b'_') {
+        return None;
+    }
     // A legacy octal integer (`070`, Annex B; not `08`, decimal).
     if b[0] == b'0' && n > 1 && b[1..n].iter().all(|d| (b'0'..=b'7').contains(d)) {
         let v = s[1..n].bytes().fold(0.0, |v, d| v * 8.0 + (d - b'0') as f64);
@@ -570,7 +592,20 @@ fn number(s: &str) -> Option<(f64, usize)> {
     if s[n..].starts_with(is_ident_part) {
         return None;
     }
-    Some((s[..n].parse().ok()?, n))
+    if !s[..n].contains('_') {
+        return Some((s[..n].parse().ok()?, n));
+    }
+    // Each separator between two digits.
+    let parts_ok = s[..n].split(['.', 'e', 'E', '+', '-']).all(separated);
+    if !parts_ok {
+        return None;
+    }
+    Some((s[..n].replace('_', "").parse().ok()?, n))
+}
+
+/// Whether digits `s`' separators (`_`) are each between two digits.
+fn separated(s: &str) -> bool {
+    !s.starts_with('_') && !s.ends_with('_') && !s.contains("__")
 }
 
 /// A string literal at the start of `s`: its value and length.

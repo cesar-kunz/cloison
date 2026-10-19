@@ -344,10 +344,15 @@ extern "C" fn cloison_rt_less_than(a: Value, b: Value) -> u64 {
     }
 }
 
-/// `for … in`'s keys of `v` (`for_in_keys`; `vm` is the VM's address).
+/// `for … in`'s keys of `v` (`for_in_keys`; `vm` is the VM's address); 0
+/// for a proxy's, which its traps, bytecode functions, find: the
+/// interpreter calls them.
 extern "C" fn cloison_rt_for_in_keys(vm: Value, v: Value) -> u64 {
     unsafe {
         let vm = &mut *(vm.to_bits() as *mut crate::vm::Vm);
+        if v.is_cell() && crate::proxy::chain_has_proxy(vm, crate::object::as_object(v)) {
+            return 0;
+        }
         vm.safepoint(std::ptr::null_mut());
         vm.for_in_keys(v).to_bits()
     }

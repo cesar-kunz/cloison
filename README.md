@@ -354,3 +354,7 @@ tests/           differential tests;  tests/octane/  feature scripts per benchma
 bench/micro/     one pattern per file;  bench/bytecode/  handwritten bytecode
 docs/            design log and designs
 ```
+
+## License
+
+Licensed under the Apache License, Version 2.0; see `LICENSE`.

@@ -3,7 +3,7 @@
 //! [`install`].
 
 use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
-use crate::object::{Class, DONT_ENUM, as_object, object_value};
+use crate::object::{DONT_ENUM, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units, wrapped};
@@ -45,7 +45,7 @@ fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     };
     if is_callable(replacer) {
         st.replacer = Some(replacer);
-    } else if replacer.is_cell() && unsafe { (*as_object(replacer)).class } == Class::Array {
+    } else if crate::proxy::is_array(vm, replacer)? {
         let len = vm.length_of(replacer)?;
         let mut keys: Vec<Value> = Vec::new();
         let mut i = 0.0;
@@ -305,7 +305,7 @@ fn internalize(vm: &mut Vm, reviver: Value, holder: Value, name: Value) -> Resul
     let v = vm.get_keyed(holder, name)?;
     if is_object(v) {
         let o = as_object(v);
-        let keys: Vec<Key> = if unsafe { (*o).class } == Class::Array {
+        let keys: Vec<Key> = if crate::proxy::is_array(vm, v)? {
             let len = vm.length_of(v)?;
             (0..len as u32).map(Key::Index).collect()
         } else {

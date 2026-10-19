@@ -196,6 +196,27 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// A proxy of an array is an array to `concat`, `flat`, species creation
+/// and `JSON`'s replacer and reviver (IsArray), a revoked one a TypeError.
+#[test]
+fn proxies_of_arrays_are_arrays_to_builtins() {
+    assert_eq!(
+        value(
+            r#"
+var r = [[].concat(new Proxy([1, 2], {})).length, JSON.stringify([1, new Proxy([2, 3], {})].flat()),
+  JSON.stringify({ a: 1, b: 2, c: 3 }, new Proxy(["a", "c"], {})),
+  JSON.stringify(JSON.parse("[1,[2,3]]", function (k, v) { return Array.isArray(v) ? new Proxy(v, {}) : v * 2; }))];
+class A extends Array {}
+r.push(Array.prototype.map.call(new Proxy(new A(1, 2, 3), {}), x => x).constructor === A);
+var rev = Proxy.revocable([], {}); rev.revoke();
+try { [].concat(rev.proxy); r.push("no"); } catch (e) { r.push(e.name); }
+r.join(" ");
+"#
+        ),
+        r#"2 [1,2,3] {"a":1,"c":3} [2,[4,6]] true TypeError"#
+    );
+}
+
 /// A function's slot-less `length` and `name`, and a string object's
 /// `length`, are read-only also inherited, and one redefined into a slot
 /// is listed once.

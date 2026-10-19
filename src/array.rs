@@ -179,8 +179,7 @@ fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
 /// ArraySpeciesCreate(original, n): a new array, or (an array whose
 /// `constructor[@@species]` says so) that constructor's object.
 fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
-    let is_array = original.is_cell() && unsafe { (*as_object(original)).class } == Class::Array;
-    if !is_array {
+    if !crate::proxy::is_array(vm, original)? {
         return new_array_len(vm, n);
     }
     let a_constructor = vm.a_constructor;
@@ -217,7 +216,7 @@ fn spreadable(vm: &mut Vm, v: Value) -> Result<bool> {
     if !s.is_undefined() {
         return Ok(to_boolean(s));
     }
-    Ok(unsafe { (*as_object(v)).class } == Class::Array)
+    crate::proxy::is_array(vm, v)
 }
 
 /// FlattenIntoArray: `source`'s elements into `target` from `start`, to
@@ -231,8 +230,7 @@ fn flatten(vm: &mut Vm, target: Value, source: Value, len: f64, start: f64, dept
             if let Some((f, that)) = f {
                 v = call_function(vm, f, that, &[v, Value::number(i), source])?;
             }
-            let is_array = v.is_cell() && unsafe { (*as_object(v)).class } == Class::Array;
-            if depth > 0.0 && is_array {
+            if depth > 0.0 && crate::proxy::is_array(vm, v)? {
                 let n = vm.length_of(v)?;
                 at = flatten(vm, target, v, n, at, depth - 1.0, None)?;
             } else {

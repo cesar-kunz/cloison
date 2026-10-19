@@ -259,11 +259,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
                     braces.push(2);
                 }
                 Tok::Template(Box::new(part))
-            } else if c == b'/'
-                && !toks.last().is_some_and(|t: &Token| {
-                    ends_expression(&t.tok) && (t.tok != Tok::Punct("}") || closed_expression)
-                })
-            {
+            } else if c == b'/' && !divides(&toks, closed_expression, closed_paren) {
                 let (pattern, flags, n) = regexp(&src[i..]).ok_or_else(|| err("unterminated regular expression"))?;
                 i += n;
                 Tok::RegExp(Box::new((pattern, flags)))
@@ -400,6 +396,31 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
         arrow: false,
     });
     Ok(toks)
+}
+
+/// Whether a `/` after the tokens `toks` divides, else starts a regular
+/// expression: after what ends an expression, but a block's `}` (not
+/// `closed_expression`), a statement's head (`if (x) /a/.test(s)`, its
+/// `(` at `closed_paren`), a prefix `++` or `--` (not after an operand on
+/// its line), `yield` and `await` (as keywords: `yield /a/`), `of` after
+/// an operand.
+fn divides(toks: &[Token], closed_expression: bool, closed_paren: usize) -> bool {
+    let Some(t) = toks.last() else {
+        return false;
+    };
+    match &t.tok {
+        Tok::Punct("}") => closed_expression,
+        Tok::Punct(")") => !(closed_paren != usize::MAX
+            && closed_paren > 0
+            && matches!(toks[closed_paren - 1].tok, Tok::Keyword("if" | "while" | "for" | "with"))),
+        Tok::Punct("++" | "--") => {
+            !t.newline_before && toks.len() >= 2 && ends_expression(&toks[toks.len() - 2].tok)
+        }
+        Tok::Ident(n) if matches!(&**n, "yield" | "await") => false,
+        // `for (x of /a/g…)`: `of` after an operand is the keyword.
+        Tok::Ident(n) if &**n == "of" && toks.len() >= 2 && ends_expression(&toks[toks.len() - 2].tok) => false,
+        t => ends_expression(t),
+    }
 }
 
 /// Whether a `/` after `t` divides (`t` ends an expression).

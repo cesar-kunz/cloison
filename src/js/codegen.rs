@@ -219,6 +219,7 @@ fn generate_from<'p>(
                     closures: Vec::new(),
                     constants: Vec::new(),
                     handlers: Vec::new(),
+                    compound_keys: Vec::new(),
                     upvalues: upvalue_sources(p, &decls, &scopes, i),
                     captures: false,
                     strict: f.strict,
@@ -1430,6 +1431,8 @@ struct Gen<'a> {
     /// Exception handlers: (start, end, handler) bytecode offsets, inner
     /// ones first (see `FunctionDef::handlers`).
     handlers: Vec<(u32, u32, u32)>,
+    /// See `FunctionDef::compound_keys`.
+    compound_keys: Vec<(u32, u32)>,
     /// `try` blocks being compiled: none of their statements goes out of
     /// line, outside the handler's range.
     in_try: u32,
@@ -1537,6 +1540,7 @@ impl<'a> Gen<'a> {
             pending_labels: Vec::new(),
             deferred: Vec::new(),
             handlers: Vec::new(),
+            compound_keys: Vec::new(),
             in_try: 0,
             // (A direct `eval`'s function: its scope object first, as a
             // `with`'s, for the names the eval'd code may declare.)
@@ -1794,6 +1798,7 @@ impl<'a> Gen<'a> {
             closures: self.closures,
             constants: self.constants,
             handlers: self.handlers,
+            compound_keys: self.compound_keys,
             upvalues,
             captures,
             line: 0,
@@ -2018,6 +2023,26 @@ impl<'a> Gen<'a> {
         };
         self.ics.push(name);
         Arg::Index(self.ics.len() as u16 - 1)
+    }
+
+    /// The `GetKeyed` of `ro[acc]` that a read-modify-write's `SetKeyed`
+    /// (`keyed_write`) stores back to: its offset.
+    fn keyed_read(&mut self, ro: u8) -> u32 {
+        let at = self.asm.offset() as u32;
+        let ic = self.auto_ic("[]keyed");
+        self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
+        at
+    }
+
+    /// `ro[rk] = acc`, storing back what the `GetKeyed` at `read` read:
+    /// an object key converted once for both (`FunctionDef::compound_keys`).
+    fn keyed_write(&mut self, ro: u8, rk: u8, read: u32) {
+        let at = self.asm.offset() as u32;
+        let ic = self.auto_ic("[]keyed");
+        self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+        if self.reachable {
+            self.compound_keys.push((read, at));
+        }
     }
 
     /// A slot for an instruction with an implicit inline cache, of `kind`.
@@ -2341,12 +2366,10 @@ impl<'a> Gen<'a> {
                 let ro = self.reg(o, &[k, v])?;
                 let rk = self.reg(k, &[v])?;
                 self.ldar(rk);
-                let ic = self.auto_ic("[]keyed");
-                self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
+                let read = self.keyed_read(ro);
                 decide(self)?;
                 self.value(v)?;
-                let ic = self.auto_ic("[]keyed");
-                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+                self.keyed_write(ro, rk, read);
             }
             _ => {
                 self.value(t)?;
@@ -3872,9 +3895,10 @@ impl<'a> Gen<'a> {
                     None => self.value(v)?,
                     Some(op) => {
                         self.ldar(rk);
-                        let ic = self.auto_ic("[]keyed");
-                        self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
+                        let read = self.keyed_read(ro);
                         self.apply(op, v, pos)?;
+                        self.keyed_write(ro, rk, read);
+                        return Ok(());
                     }
                 }
                 let ic = self.auto_ic("[]keyed");
@@ -3968,11 +3992,9 @@ impl<'a> Gen<'a> {
                 let ro = self.reg(o, &[k])?;
                 let rk = self.reg(k, &[])?;
                 self.ldar(rk);
-                let ic = self.auto_ic("[]keyed");
-                self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
+                let read = self.keyed_read(ro);
                 step(self);
-                let ic = self.auto_ic("[]keyed");
-                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+                self.keyed_write(ro, rk, read);
             }
             ExprKind::SuperMember(home, k, this) => {
                 // `[home, key, this]` read, then `[home, key, v, this]` set.

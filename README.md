@@ -221,6 +221,22 @@ geomean for it.
 
 The numbers that follow are from an Ubuntu Linux x86-64 host.
 
+ARKTS there, where its build has the asm interpreter and its JIT, on the
+six benchmarks it runs, at f2c093c (median of three runs; `ark_js_vm` at
+ets_runtime ce9f9d11f, its asm interpreter and with `--compiler-enable-jit`
+(arksteed), each benchmark compiled by `es2abc` at ets_frontend 333c4cf06,
+with `var alert;` first as above; V8 is Node 24's, V8 13.6):
+
+| benchmark | V8 | cloison | ARKTS JIT | ARKTS asm interpreter | cloison / ARKTS JIT |
+|---|---:|---:|---:|---:|---:|
+| Richards | 26,508 | 14,340 | 3,047 | 1,058 | 4.7 |
+| DeltaBlue | 76,254 | 33,476 | 2,810 | 1,190 | 11.9 |
+| RayTrace | 65,341 | 28,564 | 2,312 | 2,506 | 12.4 |
+| RegExp | 6,558 | 2,962 | 450 | 429 | 6.6 |
+| Splay | 37,981 | 8,069 | 6,356 | 5,532 | 1.3 |
+| Box2D | 76,915 | 13,944 | 8,754 | 3,743 | 1.6 |
+| **geomean** | **36,914** | **12,882** | **2,813** | **1,743** | **4.6** |
+
 Inside a long DeltaBlue run the JIT is about 7x the interpreter and about 2.3x
 behind V8's Maglev tier.
 

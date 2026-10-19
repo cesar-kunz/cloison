@@ -21,6 +21,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("template", template),
     ("template_object", template_object),
     ("define_field", define_field),
+    ("define_named_field", define_named_field),
     ("define_getter", define_getter),
     ("define_setter", define_setter),
     ("throw_const", throw_const),
@@ -283,6 +284,20 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `{[k]: v}`: `[o, k, v]`.
 fn define_field(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
+    vm.create_data_property(a[0], key, a[2])?;
+    Ok(a[0])
+}
+
+/// `[o, k, f]` of `{ [k]: function () {} }`: as `define_field`, the
+/// anonymous function or class `f` named after the key first (but a
+/// class's own static `name`).
+fn define_named_field(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let key = to_property_key(vm, a[1])?;
+    let a_name = vm.a_name;
+    let own = vm.own_property(as_object(a[2]), Key::Name(a_name));
+    if own.is_none_or(|d| d.value.is_some_and(|v| crate::vm::string_units(v).is_some_and(|u| u.is_empty()))) {
+        set_function_name(vm, a[2], key, "")?;
+    }
     vm.create_data_property(a[0], key, a[2])?;
     Ok(a[0])
 }

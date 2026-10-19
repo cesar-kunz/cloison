@@ -3475,6 +3475,16 @@ impl<'a> Gen<'a> {
                                         self.closure(f);
                                         if set { "define_setter" } else { "define_getter" }
                                     }
+                                    // (An anonymous function or class named
+                                    // after the key.)
+                                    Function(f) if self.p.functions[f].name.is_none() => {
+                                        self.value(v)?;
+                                        "define_named_field"
+                                    }
+                                    Class(ref c) if self.p.functions[c.constructor].name.is_none() => {
+                                        self.value(v)?;
+                                        "define_named_field"
+                                    }
                                     _ => {
                                         self.value(v)?;
                                         "define_field"

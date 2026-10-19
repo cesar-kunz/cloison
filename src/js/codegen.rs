@@ -3791,11 +3791,15 @@ impl<'a> Gen<'a> {
                 match (op, self.resolve(n, t.pos)?) {
                     (None, _) => self.value(v)?,
                     // `x op= v` with `x` in a register: `v`, then `Op r_x`.
+                    // (Not if `v` may change `x` first: a closure capturing
+                    // it, or `arguments` aliasing it, in a call `v` makes.)
                     (Some(op), Var::Reg(r))
                         if smi(v).and_then(|k| Self::smi_form(op, k)).is_none()
                             && !self.needs_check(n, t.pos)
                             && Self::reg_form(op).is_some()
-                            && !assigns(v, n) =>
+                            && !assigns(v, n)
+                            && !self.scopes.captured[self.index].contains(&&**n)
+                            && !(arguments_object(self.p, self.index) && self.f.params.iter().any(|p| &**p == &**n)) =>
                     {
                         self.value(v)?;
                         self.emit(Self::reg_form(op).unwrap(), &[Arg::Reg(r)]);

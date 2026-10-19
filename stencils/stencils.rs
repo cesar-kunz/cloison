@@ -4503,6 +4503,36 @@ unsafe fn is_typed(tag: NumberTag, o: Value, want: u32) -> bool {
     is_cell(tag, o) && unsafe { *(p.add(8) as *const u32) & 0xff00ff == want }
 }
 
+/// A double read from a float array's bytes, its NaNs made the canonical
+/// one: a NaN's payload is anything the bytes are, and `facc` boxes as is
+/// (see `value`), so one with a high payload would be another value.
+#[inline(always)]
+fn pure(d: f64) -> f64 {
+    if d.is_nan() { nan() } else { d }
+}
+
+/// `f64::NAN`: on x86-64 built in a register (LLVM loads it from
+/// `.rodata`, which a stencil can't have).
+#[inline(always)]
+fn nan() -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let d: f64;
+        core::arch::asm!(
+            "mov {t}, 0x7ff8000000000000",
+            "movq {d}, {t}",
+            d = out(xmm_reg) d,
+            t = out(reg) _,
+            options(pure, nomem, nostack),
+        );
+        d
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        f64::NAN
+    }
+}
+
 macro_rules! typed_load {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $set:expr) => {
         stencil!("tget_", $w, "_", loc!($loc); |$s| {
@@ -4648,8 +4678,8 @@ macro_rules! typed_location {
             }
         });
         typed_load!($loc, "u32f", 4, |s, e| s.facc = *(e as *const u32) as f64);
-        typed_load!($loc, "f32", 4, |s, e| s.facc = *(e as *const f32) as f64);
-        typed_load!($loc, "f64", 8, |s, e| s.facc = *(e as *const f64));
+        typed_load!($loc, "f32", 4, |s, e| s.facc = pure(*(e as *const f32) as f64));
+        typed_load!($loc, "f64", 8, |s, e| s.facc = pure(*(e as *const f64)));
 
         // An int32 `acc` (`_i`) or a double in `facc` (`_f`); into an
         // integer kind, a double ToInt32 can't truncate exits.

@@ -131,9 +131,5 @@ pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
 
 /// `String(v)` for a number, as a property key.
 pub(crate) fn number_to_string(v: f64) -> String {
-    if v == v.trunc() && v.abs() < 1e21 {
-        format!("{}", v as i64)
-    } else {
-        format!("{v}")
-    }
+    crate::vm::number_to_string(v)
 }

@@ -295,8 +295,11 @@ fn local_time(t: f64) -> f64 {
 
 /// `UTC(t)`: local time value `t` as a UTC one (the offset at `t` taken
 /// as if UTC, then refined once: right except at a zone transition).
+/// NaN for a `t` no offset (less than a day) brings into TimeClip's range,
+/// as what it gives goes through TimeClip: `year_from_time` of a year past
+/// 2^53 would never end.
 fn utc(t: f64) -> f64 {
-    if !t.is_finite() {
+    if !t.is_finite() || t.abs() > MAX_TIME + MS_PER_DAY {
         return f64::NAN;
     }
     let guess = t - local_tza(t).0;

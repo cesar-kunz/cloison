@@ -843,8 +843,18 @@ fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
         params.push(String::from_utf16_lossy(&units(p)));
     }
     let body = a.last().map_or(String::new(), |&b| String::from_utf16_lossy(&units(b)));
-    let src = format!("({kind} anonymous({}\n) {{\n{}\n}})", params.join(","), body);
-    run_source(vm, &src)
+    let params = params.join(",");
+    // The parameters and the body each as such (CreateDynamicFunction
+    // parses them apart), not ending the function early.
+    let whole = |p: &str, b: &str| format!("({kind} anonymous({p}\n) {{\n{b}\n}})");
+    for (p, b) in [(&*params, ""), ("", &*body)] {
+        if !crate::js::is_one_function(&whole(p, b)) {
+            let what = if b.is_empty() { "parameter list" } else { "function body" };
+            let e = crate::js::compile_script_lazy(&whole(p, b)).err().unwrap_or_else(|| format!("invalid {what}"));
+            return Err(Error(format!("SyntaxError: {e}"), None));
+        }
+    }
+    run_source(vm, &whole(&params, &body))
 }
 
 /// `eval(x)`: `x` itself unless a string, else the value of the script it

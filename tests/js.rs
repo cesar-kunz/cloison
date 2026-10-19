@@ -196,6 +196,28 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// `Function`'s parameters and body are each a parameter list and a body:
+/// text in either that would end the function and go on after it is a
+/// `SyntaxError`, never run.
+#[test]
+fn function_constructor_parameters_and_body_stay_inside() {
+    assert_eq!(
+        value(
+            r#"
+var r = [], hit = 0; globalThis.evil = function () { hit++; };
+function t(f) { try { var x = f(); return "fn:" + x.apply(null, [1, 2]); } catch (e) { return e.name; } }
+r.push(t(() => Function("", "}); evil(); (function(){")), t(() => Function("/*", "*/){")),
+  t(() => Function("a = evil()) { }, (function(", "")), t(() => Function("", "}")));
+r.push(t(() => Function("a, b", "return a + b")), t(() => Function("a", "b", "return a * b")),
+  t(() => Function("a //", "return a")), t(() => Function("", "return '})' + /}/.source")));
+r.push(hit);
+r.join(" ");
+"#
+        ),
+        "SyntaxError SyntaxError SyntaxError SyntaxError fn:3 fn:2 fn:1 fn:})} 0"
+    );
+}
+
 /// A numeric literal as a property key is its `String` (`1e21` "1e+21",
 /// `2e-7` "2e-7"), in literals, classes and patterns.
 #[test]

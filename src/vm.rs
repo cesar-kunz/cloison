@@ -560,8 +560,10 @@ pub struct Vm {
     pub(crate) through_deps: HashMap<usize, Vec<(usize, usize)>>,
     /// Bumped whenever a field's type generalizes (see [`FieldType`]).
     pub field_epoch: u32,
-    /// Bumped with either: compiled code checks it after calling out, as
-    /// the callee may have invalidated what it assumes.
+    /// Bumped with anything compiled code may rely on changing (see
+    /// `bump_code_epoch`), and with a field type it took generalizing
+    /// (`field_generalized`): stores through the runtime check it, as one
+    /// may have invalidated what the code storing assumes.
     pub code_epoch: u32,
     /// Some object has had an indexed accessor or a read-only element
     /// (see `protect_indices`).
@@ -1556,6 +1558,9 @@ impl Vm {
         let deps = self.field_deps.remove(&key);
         let through = self.through_deps.remove(&key);
         if old != FieldType::None {
+            // (Compiled code that stored through the runtime goes on only
+            // if nothing it relies on changed: `jit::cloison_rt_set_named`.)
+            self.code_epoch = self.code_epoch.wrapping_add(1);
             for code in deps.into_iter().flatten() {
                 let c = unsafe { &*(code as *const Code) };
                 c.field_deps.set(c.field_deps.get().wrapping_add(1));

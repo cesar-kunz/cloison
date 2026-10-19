@@ -4298,6 +4298,8 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = ty;
             ("add", case)
         }
+        // A double's `x - 0` is `x` (-0 too, which `x + 0` isn't).
+        Op::AddSmi if insn.sub && insn.imm == 0 && st.acc == F64 => ("nop", ""),
         // Untyped, a `SubSmi` subtracts (`sub_smi`, with k).
         Op::AddSmi if insn.sub && !matches!(st.acc, I32 | F64) => {
             out.acc = Any;
@@ -6589,7 +6591,11 @@ impl Fusion<'_> {
                 format!("undo_addi_u{a}"),
                 mid.imm,
             ),
-            (Op::AddSmi | Op::Inc, Home::Fpr(a)) if dbl => fused(3, format!("addi_f{a}"), mid.imm),
+            // (Not a double's `x - 0`, which is `x`, not `x + 0`: see
+            // `select`.)
+            (Op::AddSmi | Op::Inc, Home::Fpr(a)) if dbl && !(mid.sub && mid.imm == 0) => {
+                fused(3, format!("addi_f{a}"), mid.imm)
+            }
             _ => None,
         }
     }

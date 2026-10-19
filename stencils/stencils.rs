@@ -3662,9 +3662,14 @@ macro_rules! value_test_slot {
 with_gprs!(each_gpr! value_test_slot);
 
 // `ForInKeys`: `for … in`'s keys of a boxed `acc`, from the runtime (the
-// VM's address is the 64-bit immediate).
+// VM's address is the 64-bit immediate); 0: the interpreter's to find
+// (through a proxy's traps).
 stencil!("for_in_keys"; |s| {
-    s.acc = Value::from_bits(rt_call!(s, cloison_rt_for_in_keys, Value::from_bits(imm64()), s.acc));
+    let r = rt_call!(s, cloison_rt_for_in_keys, Value::from_bits(imm64()), s.acc);
+    if r == 0 {
+        exit!(s)
+    }
+    s.acc = Value::from_bits(r);
     next!(s)
 });
 

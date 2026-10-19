@@ -41,6 +41,17 @@ pub fn parse(src: &str) -> Result<(), Error> {
     parse::parse(&mut lex::lex(src)?, &ast::Arenas::default()).map(|_| ())
 }
 
+/// Whether `src` is a script of one function expression alone, as what
+/// `Function` makes of its parameters and body must be: text of either
+/// can't end the function and go on after it (`"}); f(); (function(){"`).
+pub fn is_one_function(src: &str) -> bool {
+    let arena = ast::Arenas::default();
+    parse::parse_source(src, &arena, true).is_ok_and(|p| {
+        matches!(&p.functions[0].body[..], [ast::Stmt { kind: ast::StmtKind::Expr(e), .. }]
+            if matches!(e.kind, ast::ExprKind::Function(_)))
+    })
+}
+
 /// Compile `src`, a script, to a module; errors are `line:column: message`.
 pub fn compile(src: &str) -> Result<Module, String> {
     let arena = ast::Arenas::default();

@@ -1881,6 +1881,34 @@ impl Vm {
         }
     }
 
+    /// Whether `o` or a prototype has `name` with no slot, as
+    /// `virtual_get` reads it: an array's or a string wrapper's `length`, a
+    /// function's `length` and `name`.
+    fn virtual_has(&mut self, o: *mut Object, name: Atom) -> bool {
+        if name != self.a_length && name != self.a_name {
+            return false;
+        }
+        let mut p = o;
+        loop {
+            unsafe {
+                let class = (*p).class;
+                if name == self.a_length && matches!(class, Class::Array | Class::String | Class::TypedArray) {
+                    return true;
+                }
+                if matches!(class, Class::Function | Class::Native | Class::Wrapper)
+                    && self.own_property(p, Key::Name(name)).is_some()
+                {
+                    return true;
+                }
+                let proto = (*(*p).shape).proto;
+                if !proto.is_cell() {
+                    return false;
+                }
+                p = as_object(proto);
+            }
+        }
+    }
+
     /// A wrapper object for primitive `v` (see `Class::Wrapper`).
     pub(crate) fn new_wrapper(&mut self, v: Value) -> Value {
         let proto = if v.is_number() {
@@ -2533,8 +2561,7 @@ impl Vm {
         }
         match self.property_key(key) {
             Key::Name(a) if self.typed_numeric(o, a) => Ok(false),
-            Key::Name(a) => Ok(self.lookup(o, a).is_some()
-                || (a == self.a_length && unsafe { (*o).class } == Class::Array)),
+            Key::Name(a) => Ok(self.lookup(o, a).is_some() || self.virtual_has(o, a)),
             Key::Index(i) => loop {
                 unsafe {
                     if (*o).class != Class::String && self.has_own_index(o, i) {
@@ -2785,6 +2812,12 @@ impl Vm {
     fn get_index_from(&mut self, mut o: *mut Object, i: u32, obj: Value) -> Result<Value> {
         loop {
             unsafe {
+                // A string wrapper's code units, as its own elements.
+                if let Some(u) = wrapped(object_value(o)).and_then(string_units)
+                    && (i as usize) < u.len()
+                {
+                    return Ok(self.single_char(u[i as usize]));
+                }
                 // A typed array's elements are all there is at an index (no
                 // holes, nothing inherited), on the receiver or on its chain;
                 // a buffer has none. Their `elems` are bytes.

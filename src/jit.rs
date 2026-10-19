@@ -438,8 +438,11 @@ extern "C" fn cloison_rt_loose_eq(a: Value, b: Value) -> u64 {
 
 /// `a[b]` for any `a` (a string, a typed array, …: what `get_keyed`
 /// stencils don't read themselves), or 0 where it would throw or call a
-/// function (the interpreter does).
+/// function (the interpreter does), as an object key's ToPropertyKey may.
 extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
+    if crate::props::is_object(b) {
+        return 0;
+    }
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.get_keyed(a, b).map_or(0, |v| v.to_bits())
 }
@@ -492,8 +495,12 @@ extern "C" fn cloison_rt_create_arguments(regs: Value, _: Value) -> u64 {
     }
 }
 
-/// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws.
+/// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws or
+/// would call a function (an object key's ToPropertyKey).
 extern "C" fn cloison_rt_delete(a: Value, b: Value) -> u64 {
+    if crate::props::is_object(b) {
+        return 0;
+    }
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.delete_property(a, b).map_or(0, |r| Value::from_bool(r).to_bits())
 }
@@ -620,8 +627,12 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
     r.to_bits()
 }
 
-/// `a in b`, or 0 where it would throw (the interpreter does).
+/// `a in b`, or 0 where it would throw or call a function, as an object
+/// key's ToPropertyKey may (the interpreter does).
 extern "C" fn cloison_rt_in(a: Value, b: Value) -> u64 {
+    if crate::props::is_object(a) {
+        return 0;
+    }
     let vm = unsafe { &mut *crate::interp::current_vm() };
     vm.has_property(b, a).map_or(0, |r| Value::from_bool(r).to_bits())
 }

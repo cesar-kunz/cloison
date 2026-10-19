@@ -54,6 +54,10 @@ pub struct FunctionDef {
     /// `start..end` continues at `handler` with its value in `acc` (the
     /// first that covers it: inner `try`s come first).
     pub handlers: Vec<(u32, u32, u32)>,
+    /// The `GetKeyed` and the `SetKeyed` of each `o[k] op= v`, `o[k]++` or
+    /// `o[k] ??= v` (bytecode offsets): an object key is converted once
+    /// for both (see `Vm::key_cache`).
+    pub compound_keys: Vec<(u32, u32)>,
     /// Where each upvalue `CreateClosure` gives the function comes from in
     /// the function creating it: a register (`true`) or an upvalue of its
     /// own (see `vm::Upvalue`).
@@ -390,6 +394,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
             closures,
             constants,
             handlers: Vec::new(),
+            compound_keys: Vec::new(),
             upvalues: Vec::new(),
             captures: false,
             strict: false,

@@ -150,6 +150,10 @@ pub const LENGTH_LOC: i32 = i32::MIN;
 /// The most elements an array can have here (they are dense: a length
 /// up to 2^32 - 1 would be allocated in full).
 pub(crate) const MAX_ELEMENTS: usize = 1 << 28;
+
+/// The most object keys `Vm::key_cache` holds.
+pub(crate) const KEY_CACHE: usize = 32;
+
 /// How far past twice its elements' length an integer key of an object
 /// that isn't an array makes it sparse (see `object::SPARSE`).
 pub(crate) const SPARSE_GAP: usize = 1024;
@@ -367,6 +371,8 @@ pub struct Code {
     /// any runs only in the interpreter, which unwinds into them
     /// (`interp::unwind`): it isn't compiled, inlined or called directly.
     pub handlers: Box<[(u32, u32, u32)]>,
+    /// See `FunctionDef::compound_keys`.
+    pub compound_keys: Box<[(u32, u32)]>,
     /// Where its upvalues come from (see `FunctionDef::upvalues`).
     pub upvalues: Box<[(bool, u8)]>,
     /// Runs only in the interpreter: it has exception handlers or variables
@@ -729,10 +735,13 @@ pub struct Vm {
     /// Sloppy functions' `arguments` objects' shape (see
     /// `builtins::arguments_object_of`).
     pub(crate) arguments_shape: *const Shape,
-    /// The object key the last `GetKeyed` converted, and what to: a
-    /// `SetKeyed` of it next (a compound assignment, an increment) takes
-    /// that instead of converting it again (see `interp::slow_set_keyed`).
-    pub(crate) key_cache: (Value, Value),
+    /// The object keys read-modify-writes' `GetKeyed`s converted, what to,
+    /// in which frame (its registers) and for the `SetKeyed` at which offset
+    /// (`Code::compound_keys`): that one takes its key instead of converting
+    /// it again (see `interp::slow_set_keyed`), no other. One per such
+    /// assignment under way (nested in calls in another's value); one an
+    /// exception left goes once there are `KEY_CACHE` more.
+    pub(crate) key_cache: Vec<(Value, Value, *mut Value, u32)>,
     /// The global `eval` (what a direct `eval` calls: see
     /// `intrinsics::direct_eval`).
     pub(crate) eval_function: *mut Object,
@@ -934,7 +943,7 @@ impl Vm {
             thrower: std::ptr::null_mut(),
             mapped_args: Vec::new(),
             arguments_shape: std::ptr::null(),
-            key_cache: (Value::EMPTY, Value::EMPTY),
+            key_cache: Vec::new(),
             eval_function: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),
             regexp_fns: [std::ptr::null_mut(); 6],
@@ -3524,6 +3533,7 @@ impl Vm {
             closures: Vec::new(),
             constants: Box::new([]),
             handlers: Box::new([]),
+            compound_keys: Box::new([]),
             upvalues: Box::new([]),
             interpreted: false,
             field_deps: Cell::new(0),
@@ -4005,6 +4015,7 @@ impl Vm {
                     c.define_ics = f.defines.into_boxed_slice();
                     c.constants = constants;
                     c.handlers = f.handlers.into_boxed_slice();
+                    c.compound_keys = f.compound_keys.into_boxed_slice();
                     c.interpreted = interpreted;
                     c.calls_left.set(calls_left);
                     c.loop_budget.set(loop_budget);
@@ -4030,6 +4041,7 @@ impl Vm {
                     closures: Vec::new(),
                     constants,
                     handlers: f.handlers.into_boxed_slice(),
+                    compound_keys: f.compound_keys.into_boxed_slice(),
                     upvalues: f.upvalues.into_boxed_slice(),
                     interpreted,
                     field_deps: Cell::new(0),

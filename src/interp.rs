@@ -1737,12 +1737,20 @@ handlers! {
             }
         }
         let r = with_top(regs, None, |vm| {
-            // An object key converted once, and kept for a `SetKeyed` of
-            // it right after (a compound assignment's: see `Vm::key_cache`).
+            // An object key converted once, and kept for the `SetKeyed`
+            // storing back to it if any (a compound assignment's, an
+            // increment's: see `Vm::key_cache`).
             let key = if crate::props::is_object(acc) && !obj.is_undefined() && !obj.is_null() {
                 let k = crate::intrinsics::to_property_key(vm, acc)?;
                 let kv = vm.key_value(k);
-                vm.key_cache = (acc, kv);
+                let code = &*frame_code(regs);
+                let at = pc.offset_from(code.bytecode.as_ptr()) as u32;
+                if let Some(&(_, set)) = code.compound_keys.iter().find(|&&(get, _)| get == at) {
+                    if vm.key_cache.len() >= crate::vm::KEY_CACHE {
+                        vm.key_cache.remove(0);
+                    }
+                    vm.key_cache.push((acc, kv, regs, set));
+                }
                 kv
             } else {
                 acc
@@ -1787,8 +1795,10 @@ handlers! {
             let mut key = *reg(pc, 2, regs);
             let base = *reg(pc, 1, regs);
             if crate::props::is_object(key) && !base.is_undefined() && !base.is_null() {
-                key = if vm.key_cache.0 == key {
-                    std::mem::replace(&mut vm.key_cache, (Value::EMPTY, Value::EMPTY)).1
+                let at = pc.offset_from((*frame_code(regs)).bytecode.as_ptr()) as u32;
+                let cached = vm.key_cache.iter().rposition(|&(k, _, frame, set)| k == key && frame == regs && set == at);
+                key = if let Some(i) = cached {
+                    vm.key_cache.remove(i).1
                 } else {
                     let k = crate::intrinsics::to_property_key(vm, key)?;
                     vm.key_value(k)

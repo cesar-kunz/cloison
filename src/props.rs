@@ -324,11 +324,14 @@ impl Vm {
             out.extend(indices.into_iter().map(|i| (Key::Index(i), far_enum(i))));
             // The properties without slots (see `own_property`).
             let flags = (*o).flags;
+            // (Not those a slot redefined: listed with the slots.)
             let length = Self::string_of(o).is_some() || class == Class::Array;
-            if length || matches!(class, Class::Function | Class::Native) && flags & FN_LENGTH_DELETED == 0 {
+            if (length || matches!(class, Class::Function | Class::Native) && flags & FN_LENGTH_DELETED == 0)
+                && s.lookup(self.a_length).is_none()
+            {
                 out.push((Key::Name(self.a_length), false));
             }
-            if matches!(class, Class::Function | Class::Native) && flags & FN_NAME_DELETED == 0 {
+            if matches!(class, Class::Function | Class::Native) && flags & FN_NAME_DELETED == 0 && s.lookup(self.a_name).is_none() {
                 out.push((Key::Name(self.a_name), false));
             }
             for (k, &name) in s.keys.iter().enumerate() {

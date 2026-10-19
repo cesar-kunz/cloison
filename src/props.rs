@@ -846,6 +846,9 @@ impl Vm {
             if proto.is_cell() {
                 self.make_prototype(as_object(proto));
             }
+            if s.class == Class::TypedArray {
+                crate::typed::note_proto(self, (*o).kind, proto);
+            }
             self.shape_left(s);
             let u = Shape {
                 class: s.class,

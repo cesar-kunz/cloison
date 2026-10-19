@@ -4615,8 +4615,6 @@ fn rely_on_slot(addr: u64) {
     unsafe { (*crate::interp::current_vm()).relied_slots.insert(addr as usize) };
 }
 
-/// The element kind (`object::TypedKind`) of typed arrays of shape `s`,
-/// if they are: each kind has its own prototype.
 /// What `tget_*_chk` / `tset_*_chk` compare an object's bytes 8 to 11
 /// with, its flags (byte 9) masked off: class `TypedArray` and `kind`.
 fn typed_class_kind(kind: u8) -> i32 {
@@ -4624,13 +4622,16 @@ fn typed_class_kind(kind: u8) -> i32 {
     7 | (kind as i32) << 16
 }
 
+/// The element kind (`object::TypedKind`) of typed arrays of shape `s`,
+/// if they are: each kind has its own prototype, until a typed array has
+/// had another's (`Vm::typed_protos_crossed`).
 fn typed_kind(s: u64) -> Option<u8> {
     unsafe {
         let s = &*(s as *const Shape);
-        if s.class != crate::object::Class::TypedArray {
+        let vm = &*crate::interp::current_vm();
+        if s.class != crate::object::Class::TypedArray || vm.typed_protos_crossed {
             return None;
         }
-        let vm = &*crate::interp::current_vm();
         (vm.typed_prototypes.iter())
             .position(|&p| crate::object::object_value(p) == s.proto)
             .map(|k| k as u8)

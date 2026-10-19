@@ -1787,6 +1787,9 @@ struct Insn {
     /// `null`, which the callee would see as the global object: not the
     /// caller's own `this` (see [`Lowering::nullable_this`]).
     nullable_this: bool,
+    /// A `Call` whose receiver is its sloppy frame's `this`, so an object
+    /// (see [`Lowering::receiver_is_object`]).
+    this_object: bool,
     /// A `Call` decoded from `CallApplyArguments` (`g.apply(x, arguments)`
     /// with the frame's arguments), its window `g` and `x` (`imm` 1): made
     /// through the runtime, which reads the arguments from the frame's
@@ -2163,6 +2166,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 sub,
                 hoisted: None,
                 nullable_this: false,
+                this_object: false,
                 forward,
                 delete,
                 close: false,
@@ -3774,6 +3778,18 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
         }
         _ if insn.on_shape && insn.guard == 1 => return Sel::new("guard_cell", "", out),
+        // A sloppy callee's `this`: nothing if known to be an object, an exit
+        // if never one (a number, or no value: an unboxed register's).
+        _ if insn.on_shape && insn.guard == THIS_GUARD => {
+            return match reg {
+                Ty::Obj(s) | Ty::Ext(s) if !primitive_cell(s) => Sel::new("nop", "", out),
+                Ty::I32 | Ty::F64 | Ty::Bot => Sel::new("bail", "", out),
+                _ => Sel {
+                    ops: Some((PRIMITIVE_CELLS, 0, 0)),
+                    ..Sel::new("guard_object", "", out)
+                },
+            };
+        }
         _ if insn.on_shape => {
             let family = insn.guard & FAMILY != 0;
             return Sel {
@@ -4631,6 +4647,22 @@ impl Drop for Compiling {
 /// store of another drops it (`Vm::relied_slots`).
 fn rely_on_slot(addr: u64) {
     unsafe { (*crate::interp::current_vm()).relied_slots.insert(addr as usize) };
+}
+
+/// The classes of cells that are primitives (`props::is_object`): a mask,
+/// what `guard_object` exits on.
+const PRIMITIVE_CELLS: i32 = {
+    use crate::object::Class;
+    1 << Class::String as u32 | 1 << Class::Symbol as u32 | 1 << Class::BigInt as u32
+};
+
+/// `Insn::guard` of an `on_shape` guard on a sloppy callee's `this`
+/// (`Lowering::guard_this`).
+const THIS_GUARD: u64 = 2;
+
+/// Whether cells of shape `s` are primitives (strings, symbols, BigInts).
+fn primitive_cell(s: u64) -> bool {
+    PRIMITIVE_CELLS >> unsafe { (*(s as *const Shape)).class as u32 } & 1 != 0
 }
 
 /// What `tget_*_chk` / `tset_*_chk` compare an object's bytes 8 to 11
@@ -6086,8 +6118,8 @@ fn stencil_for(
         ("check_callee", _) => cat!("check_callee_", loc),
         ("callee_jne", _) => cat!("callee_jne_", loc),
         (
-            "guard_cell" | "shape_jne" | "shape_guard" | "family_jne" | "family_guard"
-            | "check_shape",
+            "guard_cell" | "guard_object" | "shape_jne" | "shape_guard" | "family_jne"
+            | "family_guard" | "check_shape",
             _,
         ) => {
             cat!(sel.base, "_", loc)
@@ -10233,6 +10265,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         sub: false,
         hoisted: None,
         nullable_this: false,
+        this_object: false,
         forward: false,
         delete: 0,
         close: false,
@@ -12188,15 +12221,23 @@ impl Lowering<'_> {
                     i.reg = i.reg2;
                     i.reg2 += 1;
                     // `X.call(this, …)` passes the caller's `this`, never
-                    // `undefined` or `null` (sloppy mode).
+                    // `undefined` or `null` in sloppy mode (a strict
+                    // caller's may be).
                     let this = renamed(0);
-                    i.nullable_this = !self.fwd.iter().any(|&(w, x)| w == i.reg2 && x == this);
+                    let strict = unsafe { (*self.out.frames[frame].code).strict };
+                    i.nullable_this = strict || !self.fwd.iter().any(|&(w, x)| w == i.reg2 && x == this);
                     if i.imm == 0 {
                         i.op = Op::CallUndefined;
                     } else {
                         i.imm -= 1;
                     }
                 }
+            }
+            if i.op == Op::Call {
+                let this = renamed(0);
+                let strict = unsafe { (*self.out.frames[frame].code).strict };
+                i.this_object =
+                    !strict && (i.reg2 == this || self.fwd.iter().any(|&(w, x)| w == i.reg2 && x == this));
             }
             // An array literal's element: its `push`, nothing to guard.
             if i.native == 1 && !i.bail {
@@ -12718,7 +12759,17 @@ impl Lowering<'_> {
         if i.forward {
             site.op = Op::CallApplyArguments;
         }
-        let direct = self.direct_target(&i, fo, &mut site) && i.imm as u32 <= site.nparams;
+        let mut direct = self.direct_target(&i, fo, &mut site) && i.imm as u32 <= site.nparams;
+        // (Through the runtime, which boxes it, once a primitive `this` has
+        // left at the guard too often.)
+        if direct && self.boxes_this(&i, fo) && !self.receiver_is_object(frame, &i) {
+            let code = self.out.frames[frame].code;
+            if (self.state.callee_exits.get(&(code as usize, i.pc))).is_some_and(|&n| n >= MAX_PROPERTY_EXITS) {
+                direct = false;
+            } else {
+                self.guard_this(frame, &i, fo);
+            }
+        }
         let proven = direct && (guarded || self.proven_callee(frame, i.reg, fo));
         let p = Prop::Call {
             site: self.out.sites.len() as u32,
@@ -12938,6 +12989,76 @@ impl Lowering<'_> {
             return None;
         }
         self.inlinable(frame, ic.holder).then_some(ic.holder)
+    }
+
+    /// Whether call `i` passes its receiver to `fo` as `this`, which `fo`
+    /// reads and, sloppy, sees as an object: a primitive's cell (a string,
+    /// …) boxed, as the interpreter's calls do (`interp::sloppy_this`).
+    fn boxes_this(&mut self, i: &Insn, fo: *mut Object) -> bool {
+        i.op == Op::Call
+            && !fo.is_null()
+            && unsafe { (*fo).class } == crate::object::Class::Function
+            && !unsafe { (*(*fo).code).strict }
+            && self.entry_live(unsafe { (*fo).code })[0]
+    }
+
+    /// Whether call `i`'s receiver is an object: its sloppy frame's `this`
+    /// (`Insn::this_object`), or as the load of its callee from it says: one
+    /// guarded on shapes (`Own`, `Oop`, `Proto`, `Poly`),
+    /// all of objects, from the call's `this` register or one it was copied
+    /// to since (see [`Self::receiver_shapes`]), not written again.
+    fn receiver_is_object(&self, frame: usize, i: &Insn) -> bool {
+        if i.this_object {
+            return true;
+        }
+        let insns = &self.out.insns;
+        let Some(k) = insns
+            .iter()
+            .rposition(|j| j.frame as usize == frame && j.op == Op::Star && j.reg == i.reg)
+        else {
+            return false;
+        };
+        let Some(get) = k.checked_sub(1) else {
+            return false;
+        };
+        let g = insns[get];
+        if g.op != Op::GetNamed || g.frame as usize != frame || g.bail || g.soft {
+            return false;
+        }
+        let writes = |j: &Insn, r: u8| {
+            j.frame as usize == frame
+                && (j.op == Op::Star && j.reg == r || j.op == Op::Mov && j.reg2 == r)
+        };
+        let last = insns[k + 1..].iter().rposition(|j| writes(j, i.reg2));
+        let same = match last {
+            None => i.reg2 == g.reg,
+            Some(m) => {
+                let (j, prev) = (insns[k + 1 + m], insns[k + m]);
+                j.op == Op::Mov && j.reg == g.reg
+                    || j.op == Op::Star && m > 0 && prev.op == Op::Ldar && prev.reg == g.reg && prev.frame == j.frame
+            }
+        };
+        if !same || insns[k + 1..].iter().any(|j| writes(j, g.reg)) {
+            return false;
+        }
+        let object = |s: u64| s != 0 && !primitive_cell(s);
+        match self.out.props[get] {
+            Prop::Own { shape, .. } | Prop::Oop { shape, .. } | Prop::Proto { shape, .. } => object(shape),
+            Prop::Poly { n, at } => poly_cases(&self.out.polys, n, at).iter().all(|c| object(c.shape)),
+            _ => false,
+        }
+    }
+
+    /// Before call `i`, inlined or direct, to `fo` (see [`Self::boxes_this`]):
+    /// a guard leaving to the interpreter, at the call, on a receiver that
+    /// isn't an object (`guard_object`; nothing where its type says it is,
+    /// nor where the callee's load from it does).
+    fn guard_this(&mut self, frame: usize, i: &Insn, fo: *mut Object) {
+        if self.boxes_this(i, fo) && !self.receiver_is_object(frame, i) {
+            let mut g = synth(Op::Nop, i.reg2, frame, i.pc);
+            (g.guard, g.on_shape) = (THIS_GUARD, true);
+            self.push(g, Prop::None);
+        }
     }
 
     /// Whether call `i` may pass `fo` an `undefined` or `null` `this`
@@ -13755,6 +13876,11 @@ impl Lowering<'_> {
                 .take_while(|w| w.loc == ic.loc && w.epoch == ic.epoch && w.holder == h)
                 .map(|w| w.new_shape as u64)
                 .collect();
+            // A sloppy accessor's `this` of a primitive's cell is boxed: by
+            // the runtime.
+            if !(*(*fo).code).strict && self.entry_live((*fo).code)[0] && shapes.iter().any(|&s| primitive_cell(s)) {
+                return None;
+            }
             rely_on_slot(at as u64);
             Some((fo, shapes, at as u64, inline))
         }
@@ -14041,6 +14167,11 @@ impl Lowering<'_> {
             guard.guard = 0;
         }
         let guard = self.push(guard, Prop::None);
+        // (Not in a case of a polymorphic call whose receiver has a shape
+        // of objects: see `inline_poly`.)
+        if !hoisted.is_some_and(|(shape, _)| shape != 0 && !primitive_cell(shape)) {
+            self.guard_this(frame, i, fo);
+        }
         // `new`: `this`, allocated (see `Lowering::inline_construct`).
         if alloc != 0 {
             let mut a = synth(Op::Nop, i.reg, frame, pc);

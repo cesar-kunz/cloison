@@ -196,6 +196,32 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// A store through the runtime that generalizes a field compiled code took
+/// the type of (a string into a field of numbers) leaves that code: the
+/// load after it doesn't take the string for a number.
+#[test]
+fn a_runtime_store_generalizing_a_field_leaves_compiled_code() {
+    assert_eq!(
+        value(
+            r#"
+function f0(b, n) {
+  var o1 = { x: 1, y: 2.5 }, r = [];
+  for (var i = 0; i < n; i++) {
+    if (i) o1 = { x: b, w: 1 };
+    o1.y = b;
+    var v = o1.y;
+    if (i == 0) r.push(typeof v, String(v), v === b);
+  }
+  return r.join(",");
+}
+for (var k = 0; k < 20; k++) f0(2, 2000);
+[f0(2, 2000), f0("s", 2000), f0({}, 2000), f0(1.5, 2000)].join(" ");
+"#
+        ),
+        "number,2,true string,s,true object,[object Object],true number,1.5,true"
+    );
+}
+
 /// Warm code tiering up looks at the calls its function makes for ones
 /// worth inlining (`jit::inlining_pays`): an array literal's elements are
 /// calls with no cache, in a function that may have no other.

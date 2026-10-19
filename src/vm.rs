@@ -569,6 +569,10 @@ pub struct Vm {
     /// A fixed-length buffer has been detached (see `typed::detach`): its
     /// views' lengths, which nothing brought up to date, may be stale.
     pub(crate) views_detached: bool,
+    /// Some typed array has had another kind's prototype (see
+    /// `typed::note_proto`): a shape no longer says the kind of its typed
+    /// arrays' elements.
+    pub(crate) typed_protos_crossed: bool,
     /// A proxy has been made: property operations look for them on
     /// prototype chains (see `proxy`).
     pub(crate) proxies_exist: bool,
@@ -859,6 +863,7 @@ impl Vm {
             code_epoch: 0,
             indices_protected: false,
             views_detached: false,
+            typed_protos_crossed: false,
             proxies_exist: false,
             proxy_codes: [std::ptr::null(); 3],
             weak_tables: Vec::new(),

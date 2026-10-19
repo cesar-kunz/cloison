@@ -215,6 +215,9 @@ pub(crate) fn view_byte_length(o: *mut Object) -> Option<usize> {
 /// A view (`class` `TypedArray` of kind `k`, or `DataView`) of `len`
 /// elements of `b` from byte `offset` (`None`: tracking its length).
 pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b: *mut Object, offset: usize, len: Option<usize>) -> Result<Value> {
+    if class == Class::TypedArray {
+        note_proto(vm, k as u8, proto);
+    }
     let o = vm.new_object_with(class, proto, 0);
     unsafe {
         // (A `DataView`'s `kind` is its inline capacity, as other objects'.)
@@ -228,6 +231,22 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
     }
     register(vm, b, object_value(o))?;
     Ok(object_value(o))
+}
+
+/// A typed array of kind `k` gets prototype `proto`. Compiled code takes
+/// a typed array's kind from its shape's prototype (`jit::typed_kind`),
+/// so from the first that gets another kind's (`Reflect.construct`'s new
+/// target, `Object.setPrototypeOf`) on it can't: compiled code is dropped
+/// and checks the kind of each (`Vm::typed_protos_crossed`).
+pub(crate) fn note_proto(vm: &mut Vm, k: u8, proto: Value) {
+    if vm.typed_protos_crossed || !proto.is_cell() {
+        return;
+    }
+    let p = as_object(proto);
+    if vm.typed_prototypes.iter().enumerate().any(|(i, &q)| q == p && i != k as usize) {
+        vm.typed_protos_crossed = true;
+        vm.bump_code_epoch();
+    }
 }
 
 fn new_view(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, len: Option<usize>) -> Result<Value> {

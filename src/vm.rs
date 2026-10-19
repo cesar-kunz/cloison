@@ -3764,6 +3764,9 @@ impl Vm {
             let o = as_object(f);
             unsafe {
                 if (*o).class == Class::Native {
+                    // (A native calling natives, as iterator helpers' chains
+                    // or a proxy's of proxies do, recurses natively alone.)
+                    crate::interp::check_native_stack(self)?;
                     let native = (*(*o).code).native.unwrap();
                     self.constructing = false;
                     self.callee = o;
@@ -3781,6 +3784,7 @@ impl Vm {
             let o = as_object(f);
             unsafe {
                 if (*o).class == Class::Native && (*(*o).code).constructs {
+                    crate::interp::check_native_stack(self)?;
                     let native = (*(*o).code).native.unwrap();
                     self.constructing = true;
                     self.callee = o;

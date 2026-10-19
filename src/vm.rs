@@ -2743,22 +2743,6 @@ impl Vm {
         if let Some(p) = self.mapped_slot(o, i) {
             return Ok(unsafe { *p });
         }
-        // A typed array's elements are all there is at an index (no holes,
-        // nothing inherited); a buffer has none.
-        unsafe {
-            match (*o).class {
-                Class::TypedArray => {
-                    return Ok(if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
-                        let kind = crate::object::TypedKind::from_u8((*o).kind);
-                        kind.load((*o).elems.cast(), i as usize)
-                    } else {
-                        Value::UNDEFINED
-                    });
-                }
-                c if c.no_elements() => return Ok(Value::UNDEFINED),
-                _ => {}
-            }
-        }
         // A string's index is its code unit there, as a string.
         if let Some(u) = string_units(obj) {
             if (i as usize) < u.len() {
@@ -2773,6 +2757,21 @@ impl Vm {
         }
         loop {
             unsafe {
+                // A typed array's elements are all there is at an index (no
+                // holes, nothing inherited), on the receiver or on its chain;
+                // a buffer has none. Their `elems` are bytes.
+                match (*o).class {
+                    Class::TypedArray => {
+                        return Ok(if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
+                            let kind = crate::object::TypedKind::from_u8((*o).kind);
+                            kind.load((*o).elems.cast(), i as usize)
+                        } else {
+                            Value::UNDEFINED
+                        });
+                    }
+                    c if c.no_elements() => return Ok(Value::UNDEFINED),
+                    _ => {}
+                }
                 if i < (*o).elems_len && (*o).class != Class::String {
                     let v = *(*o).elems.add(i as usize);
                     if v != Value::EMPTY {

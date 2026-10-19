@@ -1405,7 +1405,10 @@ impl Vm {
                 _ => b & COLOR == mode.color,
             }
         };
-        let tables: Vec<*mut Object> = self.weak_tables.iter().copied().filter(|&t| live(t as usize)).collect();
+        // The live collections, found as they become live: one may be
+        // reached only through another's value (`m.set(k, new WeakMap)`).
+        let mut tables: Vec<*mut Object> = Vec::new();
+        let mut found = vec![false; self.weak_tables.len()];
         // The entries of each live collection: its buffer, its length, and
         // its entries' width.
         let entries = |t: *mut Object| unsafe {
@@ -1420,6 +1423,12 @@ impl Vm {
         unsafe {
             loop {
                 let mut more = false;
+                for (j, &t) in self.weak_tables.iter().enumerate() {
+                    if !found[j] && live(t as usize) {
+                        found[j] = true;
+                        tables.push(t);
+                    }
+                }
                 for &t in &tables {
                     let Some((buf, len, 2)) = entries(t) else { continue };
                     let mut i = crate::collections::BASE;

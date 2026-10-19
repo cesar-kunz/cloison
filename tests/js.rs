@@ -5272,6 +5272,39 @@ ok + ":" + steps;
     assert!(vm.weak_entry_count() < 100000, "{} weak entries", vm.weak_entry_count());
 }
 
+/// A weak collection reached only through another's value, a `WeakMap`
+/// or a resizable buffer's set of views, becomes live while the ephemerons
+/// are followed: its live keys keep their values too, and its dead keys go.
+#[test]
+fn weak_collections_reached_through_weak_collections() {
+    let src = r#"
+var outer = new WeakMap(), key = {}, k2 = {};
+function setup() {
+  var vals = [];
+  for (var j = 0; j < 4000; j++) vals.push({ payload: "mine" });
+  var inner = new WeakMap();
+  inner.set(k2, vals[2000]);
+  outer.set(key, inner);
+  outer.set(k2, new ArrayBuffer(16, { maxByteLength: 64 }));
+}
+setup();
+var junk = [];
+for (var i = 0; i < 1000000; i++) junk[i & 4095] = { payload: "junk" };
+function views() { var b = outer.get(k2); for (var j = 0; j < 4000; j++) new Uint8Array(b); }
+views();
+for (var i = 0; i < 1000000; i++) junk[i & 4095] = [i, i, i];
+outer.get(k2).resize(32);
+var bad = 0;
+for (var i = 0; i < 4096; i++) if (junk[i].length !== 3) bad++;
+outer.get(key).get(k2).payload + " " + bad;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r, Ok("mine 0".to_string()));
+    vm.heap.verify();
+}
+
 /// A `WeakRef`'s target stays through the job that made (or dereferenced)
 /// it, and goes once unreachable after; brand checks and argument errors
 /// as the spec has them.

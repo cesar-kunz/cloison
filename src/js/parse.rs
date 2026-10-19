@@ -1762,7 +1762,12 @@ impl<'a> Parser<'_, 'a, '_> {
             _ => return,
         };
         if self.functions[i].name.is_none() {
-            self.functions[i].name = Some(name.clone());
+            // (A renamed `let`'s, `a%0`, is its source name's.)
+            let name = match name.find('%') {
+                Some(k) if k > 0 => name[..k].into(),
+                _ => name.clone(),
+            };
+            self.functions[i].name = Some(name);
         }
     }
 

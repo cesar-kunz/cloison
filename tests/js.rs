@@ -196,6 +196,29 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// An anonymous function or class is named after what it is assigned to:
+/// a renamed `let`'s source name (not `a%0`), a computed key's value (a
+/// symbol's in brackets), but a class's own static `name`.
+#[test]
+fn anonymous_functions_are_named_after_lets_and_computed_keys() {
+    assert_eq!(
+        value(
+            r#"
+var r = [];
+let a; a = () => {}; r.push(a.name);
+let y; y ??= function () {}; r.push(y.name);
+{ let w; w = function () {}; r.push(w.name); }
+let d; d = class {}; r.push(d.name);
+var o = { ["comp"]: () => {}, [Symbol("d")]: function () {}, [1 + 1]: () => {}, ["c"]: class {},
+  ["s"]: class { static name() {} }, ["n"]: function named() {}, ["v"]: (0, function () {}) };
+r.push(o.comp.name, o[Object.getOwnPropertySymbols(o)[0]].name, o[2].name, o.c.name, typeof o.s.name, o.n.name, o.v.name);
+JSON.stringify(r);
+"#
+        ),
+        r#"["a","y","w","d","comp","[d]","2","c","function","named",""]"#
+    );
+}
+
 /// A sloppy function compiled code calls, inlined or directly, or as an
 /// accessor, sees a string receiver as a `String` object, as the
 /// interpreter's calls give it; and a strict caller's `f.call(this)`

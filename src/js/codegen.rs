@@ -1521,7 +1521,10 @@ impl<'a> Gen<'a> {
             names,
             closures: Vec::new(),
             constants: Vec::new(),
-            nregs: 1 + f.params.len(),
+            // (Each variable's register, used or not: a closure's upvalue
+            // may point to one the function itself never names, which the
+            // call must still clear.)
+            nregs: temp.max(1 + f.params.len()),
             locals,
             overflow,
             overflows,

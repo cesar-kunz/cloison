@@ -2277,21 +2277,43 @@ impl Vm {
     /// Whether a store of `name` to `o` is blocked by a read-only property
     /// of that name: `o`'s own, or else the nearest on its prototype chain.
     pub(crate) fn read_only(&self, o: *mut Object, name: Atom) -> bool {
-        match self.lookup(o, name) {
-            Some((h, slot)) => unsafe { (&(*(*h).shape).attrs)[slot as usize] & READ_ONLY != 0 },
-            // A function's `length` and `name`, and a string object's
-            // `length`, have no slot (see `props`) and are read-only.
-            None => unsafe {
-                match (*o).class {
-                    Class::Function | Class::Native => {
-                        name == self.a_length && (*o).flags & crate::object::FN_LENGTH_DELETED == 0
-                            || name == self.a_name && (*o).flags & crate::object::FN_NAME_DELETED == 0
-                    }
-                    Class::Wrapper => name == self.a_length && string_units(wrapped(object_value(o)).unwrap()).is_some(),
-                    _ => false,
-                }
-            },
+        let Some((h, slot)) = self.lookup(o, name) else {
+            return self.virtual_read_only(o, name, std::ptr::null_mut());
+        };
+        // (A slot-less one nearer than the slot shadows it.)
+        unsafe { self.virtual_read_only(o, name, h) || (&(*(*h).shape).attrs)[slot as usize] & READ_ONLY != 0 }
+    }
+
+    /// Whether `o` or a prototype of it before `until` has `name` with no
+    /// slot, which is read-only: a function's `length` and `name`, a string
+    /// object's `length` (see `props`).
+    fn virtual_read_only(&self, mut o: *mut Object, name: Atom, until: *mut Object) -> bool {
+        if name != self.a_length && name != self.a_name {
+            return false;
         }
+        unsafe {
+            while o != until {
+                // (Not one a slot of its own redefined.)
+                let own = (*(*o).shape).lookup(name).is_none()
+                    && match (*o).class {
+                        Class::Function | Class::Native => {
+                            name == self.a_length && (*o).flags & crate::object::FN_LENGTH_DELETED == 0
+                                || name == self.a_name && (*o).flags & crate::object::FN_NAME_DELETED == 0
+                        }
+                        Class::Wrapper => name == self.a_length && wrapped(object_value(o)).and_then(string_units).is_some(),
+                        _ => false,
+                    };
+                if own {
+                    return true;
+                }
+                let proto = (*(*o).shape).proto;
+                if !proto.is_cell() {
+                    return false;
+                }
+                o = as_object(proto);
+            }
+        }
+        false
     }
 
     /// `Object.defineProperty(o, name, …)` of a data property: `value` (if

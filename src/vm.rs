@@ -2743,7 +2743,15 @@ impl Vm {
                     "Cannot read properties of {obj:?}"
                 )));
             }
-            return Ok(Value::UNDEFINED);
+            // A number's or a boolean's properties are `Number.prototype`'s
+            // or `Boolean.prototype`'s, the primitive the receiver (as
+            // `get_primitive`'s).
+            let i = match self.property_key(key) {
+                Key::Index(i) => i,
+                Key::Name(a) => return self.get(obj, a),
+            };
+            let proto = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
+            return self.get_index_from(proto, i, obj);
         }
         if crate::proxy::chain_has_proxy(self, as_object(obj)) {
             let k = self.property_key(key);
@@ -2769,6 +2777,12 @@ impl Vm {
         {
             return Ok(self.single_char(u[i as usize]));
         }
+        self.get_index_from(o, i, obj)
+    }
+
+    /// Index `i` of `o` or the first of its prototypes to have it, for
+    /// receiver `obj`.
+    fn get_index_from(&mut self, mut o: *mut Object, i: u32, obj: Value) -> Result<Value> {
         loop {
             unsafe {
                 // A typed array's elements are all there is at an index (no

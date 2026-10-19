@@ -4225,6 +4225,16 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // A sloppy callee's `this` (`jit::Lowering::guard_this`): exits
+        // unless an object, not a cell of a class in the mask `imm` (a
+        // string's, a symbol's, a BigInt's).
+        stencil!("guard_object_", loc!($loc); |s| {
+            let v = get!($loc, s);
+            if !is_cell(s.tag, v) || (imm() as u32 >> *(v.to_bits() as *const u8).add(8)) & 1 != 0 {
+                exit!(s)
+            }
+            next!(s)
+        });
         stencil!("shape_jeq_", loc!($loc); |s| {
             if *(get!($loc, s).to_bits() as *const u64) == imm64() {
                 jump!(s)

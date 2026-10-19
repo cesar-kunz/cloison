@@ -196,6 +196,29 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// Warm code tiering up looks at the calls its function makes for ones
+/// worth inlining (`jit::inlining_pays`): an array literal's elements are
+/// calls with no cache, in a function that may have no other.
+#[test]
+fn warm_functions_with_array_literals_tier_up() {
+    let src = r#"
+function f(x, n) { for (var i = 0; i < n; i++) {} return [x]; }
+function g(a) { return a + 1; }
+function h(x, n) { var s = 0; for (var i = 0; i < n; i++) s = g(s); return [x, s, [x, x]]; }
+var t = f(1, 2000)[0];
+for (var k = 0; k < 300; k++) t += h(k, 50)[1] + f(k, 20)[0];
+t + " " + JSON.stringify(h(7, 3));
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [1, 1000] {
+        let mut vm = Vm::new();
+        vm.set_warm_tier(true);
+        vm.set_tier_back_edges(budget);
+        let v = vm.run(&module).unwrap();
+        assert_eq!(display(v), "59851 [7,3,[7,7]]", "tier at {budget}");
+    }
+}
+
 #[test]
 fn statements() {
     // `while`, `do … while`, `break` and `continue`, labeled ones too.

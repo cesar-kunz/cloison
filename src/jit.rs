@@ -9353,7 +9353,8 @@ unsafe fn inlining_pays(code: *const crate::vm::Code) -> bool {
     let c = unsafe { &*code };
     let ics: *const crate::vm::Ic = c.ics().as_ptr().cast();
     decode(&c.bytecode, true).iter().any(|i| {
-        if i.bail || !matches!(i.op, Op::Call | Op::CallUndefined | Op::Construct) {
+        // (Not a `PushLiteral`'s call, which has no cache: `Insn::native`.)
+        if i.bail || i.native != 0 || !matches!(i.op, Op::Call | Op::CallUndefined | Op::Construct) {
             return false;
         }
         let fo = unsafe { (*ics.add(i.ic as usize * crate::vm::IC_WAYS)).holder };

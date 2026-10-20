@@ -1698,8 +1698,18 @@ impl Vm {
                         continue;
                     }
                     let s = unsafe { &*if w.new_shape.is_null() { w.shape } else { w.new_shape } };
-                    if (0..s.fields.len() as u32)
-                        .any(|i| cells.contains(&s.fields[i as usize]) && s.location(i) == w.loc)
+                    // (The slot at `w.loc`, inverting `Shape::location`: not a
+                    // search of every field, which shapes of objects with
+                    // hundreds of properties out of line made slow.)
+                    let cap = s.capacity.get() as i64;
+                    let slot = if w.loc >= 0 {
+                        (w.loc as i64 - crate::object::INLINE_BASE as i64) / 8
+                    } else {
+                        cap + !w.loc as i64
+                    };
+                    if (0..s.fields.len() as i64).contains(&slot)
+                        && s.location(slot as u32) == w.loc
+                        && cells.contains(&s.fields[slot as usize])
                     {
                         w.holder = FieldType::Num.encode() as *mut Object;
                     }
@@ -2336,8 +2346,21 @@ impl Vm {
 
     /// `SetNamed` miss: store `obj.name = value` and cache how, if possible.
     pub fn set_named_miss(&mut self, code: &Code, k: u16, obj: Value, value: Value) -> Result<()> {
-        code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         let (ic, name) = code.ic(k);
+        // (Not a miss where the cache has the transition, out of line, and
+        // only the object's `props` had no room: the store grows them. As
+        // misses, Box2D's initializers kept cooling in the interpreter, see
+        // `jit::MAX_SETTLE`.)
+        let room_only = obj.is_cell()
+            && unsafe {
+                (*ic).shape == (*as_object(obj)).shape
+                    && !(*ic).new_shape.is_null()
+                    && (*ic).loc < 0
+                    && (*ic).epoch == self.proto_epoch
+            };
+        if !room_only {
+            code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
+        }
         if !obj.is_cell() {
             return self.set_primitive(obj, name, value);
         }
@@ -2413,7 +2436,11 @@ impl Vm {
             }
             let slot = self.add_property(o, name, value);
             let new = (*o).shape;
-            if !(*old).unique && slot < (*new).capacity.get() {
+            // (Out of line too: the fast paths check there is room, see
+            // `interp::has_room`. Without, an initializer adding properties
+            // past the constructor's slots (Box2D's `b2Contact.Reset`) missed
+            // at every store, and compiled code left at each.)
+            if !(*old).unique {
                 install(
                     ic,
                     Ic {

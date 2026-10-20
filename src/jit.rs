@@ -2611,12 +2611,14 @@ impl Feedback {
         let mut cases = [Case::NONE; crate::vm::IC_WAYS];
         let mut n = 0;
         let mut first = Prop::None;
+        let mut runtime = false;
         for k in 0..crate::vm::IC_WAYS {
             let w = unsafe { *self.ic(insn.imm as usize).add(k) };
             if w.shape.is_null() {
                 break;
             }
             let p = self.way(insn, w, epoch);
+            runtime |= p == Prop::Runtime;
             let Some(c) = Case::of(p) else { continue };
             // Loads from one prototype slot by shapes of one family (arrays
             // whose elements' types differ, say): one case for the family,
@@ -2642,6 +2644,9 @@ impl Feedback {
             n += 1;
         }
         match n {
+            // (A way only the runtime takes, a store adding a property out
+            // of line: there, not an exit.)
+            0 if runtime => Prop::Runtime,
             0 => Prop::None,
             1 if !cases[0].is_family() => first,
             _ => {
@@ -2679,6 +2684,9 @@ impl Feedback {
             // (A setter or a read-only property may be on the prototype
             // chain since: see `Ic`.)
             Op::SetNamed if !ic.new_shape.is_null() && ic.epoch != epoch => Prop::None,
+            // (Out of line: through the runtime, which grows the object's
+            // `props` if needed; the transition stencils store in-object.)
+            Op::SetNamed if !ic.new_shape.is_null() && oop => Prop::Runtime,
             Op::SetNamed if !ic.new_shape.is_null() => Prop::Transition {
                 shape,
                 new_shape: ic.new_shape as u64,

@@ -3478,13 +3478,16 @@ impl Vm {
         }
     }
 
-    /// The string of the one code unit `c` (shared below 256).
+    /// The string of the one code unit `c` (below 256, the string
+    /// constant: shared).
     pub(crate) fn single_char(&mut self, c: u16) -> Value {
         if c >= 256 {
             return self.new_string(&[c]);
         }
         if self.single_chars[c as usize] == Value::EMPTY {
-            self.single_chars[c as usize] = self.new_string(&[c]);
+            // (The constant `"c"` itself: equal to a literal's by identity,
+            // which compiled `==` tells without the runtime.)
+            self.single_chars[c as usize] = self.string_constant(&[c]);
         }
         self.single_chars[c as usize]
     }

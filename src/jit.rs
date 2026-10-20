@@ -4312,6 +4312,18 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 _ => ("", Any),
             };
             out.acc = ty;
+            let vm = crate::interp::current_vm();
+            if case.is_empty() && !vm.is_null() {
+                // (The string shape and the young heap's hole, for two short
+                // strings' concatenation: `concat_short` in the stencils.
+                // Compiled with no VM, as tests do, there are no strings.)
+                let vm = unsafe { &mut *vm };
+                debug_assert_eq!(unsafe { (*vm.string_shape).capacity.get() }, 0);
+                return Sel {
+                    ops: Some((0, vm.string_shape as u64, vm.heap.bump() as u64)),
+                    ..Sel::new("add", case, out)
+                };
+            }
             ("add", case)
         }
         // A double's `x - 0` is `x` (-0 too, which `x + 0` isn't).
@@ -4538,13 +4550,19 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         }
         // An exact receiver shape, known or guarded against the cached one,
         // types the element; any known shape skips the cell check.
-        // A string's elements are code units: the interpreter reads them.
+        // A string's elements are code units: `str_get`, its unit's
+        // single-unit string from the VM's table.
         Op::GetKeyed
             if reg.shape().is_some_and(|s| unsafe {
                 (*(s as *const Shape)).class == crate::object::Class::String
             }) =>
         {
-            ("bail", "")
+            out.acc = Any;
+            let table = unsafe { (*crate::interp::current_vm()).single_chars_at() };
+            return Sel {
+                ops: Some((0, table, 0)),
+                ..Sel::new("str_get", if st.acc == I32 { "i" } else { "" }, out)
+            };
         }
         Op::GetKeyed => {
             let ix = st.acc == I32;
@@ -4588,7 +4606,11 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let known = ix && matches!(reg, Ty::Obj(_) | Ty::Ext(_));
             if bytes || matches!(prop, Prop::Typed { .. }) || (prop == Prop::Runtime && !known) {
                 out.acc = Any;
-                return Sel::new("get_keyed_rt", "", out);
+                let table = unsafe { (*crate::interp::current_vm()).single_chars_at() };
+                return Sel {
+                    ops: Some((0, table, 0)),
+                    ..Sel::new("get_keyed_rt", "", out)
+                };
             }
             let (case, elems) = match (reg, prop) {
                 (Ty::Obj(s), _) => (pick("nc", "i_nc"), unsafe { (*(s as *const Shape)).elems }),
@@ -6230,6 +6252,11 @@ fn stencil_for(
                 cat!("set_keyed_", sel.case, "_", loc)
             }
         }
+        ("str_get", _) if sel.case.is_empty() => {
+            box_acc(&mut pre);
+            cat!("str_get_", loc)
+        }
+        ("str_get", _) => cat!("str_get_i_", loc),
         ("get_keyed_rt", _) => {
             box_acc(&mut pre);
             cat!("get_keyed_rt_", loc)

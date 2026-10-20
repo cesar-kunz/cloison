@@ -7158,3 +7158,26 @@ r.join(" | ");"#;
          SyntaxError | SyntaxError | SyntaxError | SyntaxError | SyntaxError | SyntaxError"
     );
 }
+
+/// An async arrow (or generator) in an async function (or generator)
+/// captures the outer one's variables, which live in its scope object:
+/// the inner one has a scope object of its own, of the same name.
+#[test]
+fn async_closures_in_async_functions() {
+    let src = r#"
+var out = [];
+function* g() { var x = 5; var h = function* () { yield x; x++; }; yield* h(); yield x; }
+out.push([...g()].join("/"));
+(async function () {
+  var d = 1;
+  var f = async () => { d += 1; return d; };
+  out.push(await f(), d);
+})().then(() => { globalThis.result = out.join(); });
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("result");
+    let g = cloison::object::object_value(vm.global);
+    assert_eq!(display(vm.get(g, a).unwrap()), "5/6,2,2");
+}

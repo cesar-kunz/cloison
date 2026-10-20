@@ -80,7 +80,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("dispose_add", dispose_add),
     ("dispose_run", dispose_run),
     ("dispose_run_async", dispose_run_async),
-    ("dynamic_import", |vm, a| crate::module::dynamic_import(vm, a[0], a[1], a[2])),
+    ("dynamic_import", |vm, a| crate::module::dynamic_import(vm, a[0], a[1], a[2], a[3])),
     ("import_meta", |vm, a| crate::module::import_meta(vm, a[0])),
 ];
 
@@ -527,7 +527,19 @@ fn super_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if base.is_null() {
         return Err(Error::type_error("Cannot read properties of null (reading a super property)"));
     }
+    // (Through a proxy on the chain: its trap.)
+    if crate::props::is_object(base) {
+        return crate::proxy::generic_get(vm, base, key, a[2]);
+    }
     get_from(vm, base, key, a[2])
+}
+
+/// OrdinarySet from `base` (a proxy on its chain: the proxy's [[Set]]).
+fn super_store(vm: &mut Vm, base: Value, key: Key, v: Value, this: Value) -> Result<bool> {
+    if crate::props::is_object(base) {
+        return crate::proxy::generic_set(vm, base, key, v, this);
+    }
+    ordinary_set(vm, base, key, v, this)
 }
 
 /// `super[key] = v`: `[home, key, v, this]`.
@@ -535,7 +547,7 @@ fn super_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let base = super_base(a[0])?;
     let key = to_property_key(vm, a[1])?;
     let (v, this) = (a[2], a[3]);
-    if !ordinary_set(vm, base, key, v, this)? {
+    if !super_store(vm, base, key, v, this)? {
         return Err(Error::type_error("Cannot assign to a read-only property"));
     }
     Ok(v)
@@ -545,7 +557,7 @@ fn super_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn super_set_sloppy(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let base = super_base(a[0])?;
     let key = to_property_key(vm, a[1])?;
-    ordinary_set(vm, base, key, a[2], a[3])?;
+    super_store(vm, base, key, a[2], a[3])?;
     Ok(a[2])
 }
 

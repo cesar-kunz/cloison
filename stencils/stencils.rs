@@ -2461,6 +2461,42 @@ unsafe fn loose_eq_fast(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
     None
 }
 
+/// `l == r` or `l === r` for two strings, if told apart without the
+/// runtime: lengths (`elems_len`, byte 32) that differ, or first units
+/// that do where both are flat (`elems`, byte 24, not null: a cons
+/// string's is). Otherwise, and for anything but two strings, `None`.
+/// (Unrolled, no loop: one may become a `memcmp` call, which a stencil
+/// can't make.) Most of PdfJS's `token == 'RD'` are unequal so.
+#[inline(always)]
+unsafe fn strings_differ(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
+    let string = |v: Value| is_cell(tag, v) && unsafe { *(v.to_bits() as *const u8).add(8) } == 4;
+    if !string(l) || !string(r) {
+        return None;
+    }
+    let (p, q) = (l.to_bits() as *const u8, r.to_bits() as *const u8);
+    unsafe {
+        let n = *(p.add(32) as *const u32);
+        if n != *(q.add(32) as *const u32) {
+            return Some(true);
+        }
+        let (a, b) = (*(p.add(24) as *const *const u16), *(q.add(24) as *const *const u16));
+        if n > 0 && !a.is_null() && !b.is_null() && *a != *b {
+            return Some(true);
+        }
+    }
+    None
+}
+
+/// What `==` gives in a slow path before the runtime (`lt`: nothing).
+macro_rules! slow_rel {
+    (lt, $tag:expr, $l:expr, $r:expr) => {
+        None::<bool>
+    };
+    (eq, $tag:expr, $l:expr, $r:expr) => {
+        strings_differ($tag, $l, $r).map(|_| false)
+    };
+}
+
 macro_rules! cmp_boxed {
     ($loc:tt, $rel:ident, $act:ident, $name:literal) => {
         stencil_slow!($name, "_", loc!($loc); |s| {
@@ -2474,6 +2510,9 @@ macro_rules! cmp_boxed {
             slow!(s)
         }; |s| {
             let l = get!($loc, s);
+            if let Some(c) = slow_rel!($rel, s.tag, l, s.acc) {
+                act!($act, s, c)
+            }
             let c = rel_rt!($rel, s, l, s.acc);
             act!($act, s, c)
         });
@@ -2783,6 +2822,9 @@ macro_rules! strict_generic {
             slow!($s)
         }; |$s| {
             let x = $get;
+            if strings_differ($s.tag, x, $s.acc).is_some() {
+                act!($act, $s, false)
+            }
             let c = rt_strict_eq!($s, x, $s.acc);
             act!($act, $s, c)
         });

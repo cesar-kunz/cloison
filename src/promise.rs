@@ -991,7 +991,20 @@ fn aggregate_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         }
         _ => None,
     };
+    // (`{ cause }` in the options read before the errors are, as
+    // InstallErrorCause comes first.)
+    let options = arg(a, 2);
+    let a_cause = vm.intern("cause");
+    let cause = if crate::props::is_object(options) && vm.has_key(options, crate::vm::Key::Name(a_cause))? {
+        Some(vm.get(options, a_cause)?)
+    } else {
+        None
+    };
     let errors = vm.new_array();
     iterate(vm, arg(a, 0), |vm, e| array_push(vm, errors, &[e]).map(drop))?;
-    Ok(new_aggregate_error(vm, errors, message.as_deref()))
+    let e = new_aggregate_error(vm, errors, message.as_deref());
+    if let Some(c) = cause {
+        vm.add_property_with(as_object(e), a_cause, c, crate::object::DONT_ENUM);
+    }
+    Ok(e)
 }

@@ -2632,6 +2632,21 @@ impl<'a> Gen<'a> {
         });
     }
 
+    /// The innermost `try`'s range ends here, for what follows until
+    /// [`Self::resume_try`] to be outside it.
+    fn pause_try(&mut self) {
+        let end = self.asm.offset() as u32;
+        let t = self.trys.last_mut().expect("a try");
+        if end > t.start {
+            t.ranges.push((t.start, end));
+        }
+    }
+
+    /// The innermost `try`'s range goes on from here.
+    fn resume_try(&mut self) {
+        self.trys.last_mut().expect("a try").start = self.asm.offset() as u32;
+    }
+
     /// The innermost `try`'s ranges, closed (empty ones dropped).
     fn close_try(&mut self) -> Vec<(u32, u32)> {
         let mut t = self.trys.pop().expect("a try");
@@ -5464,6 +5479,9 @@ impl<'a> Gen<'a> {
         self.trys.last_mut().unwrap().close_async = is_await;
         self.in_try += 1;
         self.bind(top);
+        // (What the step throws, `next()`, a result's `done` or `value`,
+        // doesn't close the iterator: outside the loop's `try`.)
+        self.pause_try();
         match sync {
             // `await it.next()` (a sync iterator's result as it is), then
             // its value (a sync iterator's awaited).
@@ -5492,6 +5510,7 @@ impl<'a> Gen<'a> {
             None => self.intrinsic("iterator_step", it, 1),
         }
         self.star(v);
+        self.resume_try();
         self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
         self.jump_if(Jmp::True, done);
         match (kind, &target.kind) {

@@ -4,7 +4,8 @@ Every test under test/{built-ins,language,annexB} (not intl402 or
 staging), run as test262's INTERPRETING.md says: strict and sloppy for a
 test without `onlyStrict`/`noStrict`/`raw` (both must pass), `negative`
 tests must fail in their phase with their error, `async` ones must print
-`Test262:AsyncTestComplete`. A module test runs as a module (`--module`),
+`Test262:AsyncTestComplete`, `CanBlockIsFalse` ones run with `--no-block`.
+A module test runs as a module (`--module`),
 the harness a script before it (`--prelude`); every test's file is
 written next to it, where its fixtures are.
 
@@ -97,12 +98,13 @@ def harness(n):
         H[n] = open(p).read() if os.path.exists(p) else ''
     return H[n]
 
-def run_once(src, strict, neg, is_async, test_dir, module=None):
+def run_once(src, strict, neg, is_async, test_dir, module=None, flags=()):
     n = os.path.join(test_dir, f'__t262_{uuid.uuid4().hex}.js')
     with open(n, 'w') as f:
         f.write(('"use strict";\n' if strict else '') + src)
     try:
-        cmd = [CLOISON, '--prelude', n, '--module', module] if module else [CLOISON, n]
+        nb = ['--no-block'] if 'CanBlockIsFalse' in flags else []
+        cmd = [CLOISON] + nb + (['--prelude', n, '--module', module] if module else [n])
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         out = (r.stderr or '') + (r.stdout or '')
         if r.returncode < 0:
@@ -139,10 +141,10 @@ def run(p):
         pre = ''.join(harness(i) for i in names) + '\n'
     modes = [True] if 'onlyStrict' in fl else [False] if ('noStrict' in fl or 'raw' in fl) else [False, True]
     if 'module' in fl:
-        ok, msg = run_once(pre, False, neg, is_async, os.path.dirname(p), p)
+        ok, msg = run_once(pre, False, neg, is_async, os.path.dirname(p), p, fl)
         return p, ed, ok, msg.replace('\n', ' ')
     for strict in modes:
-        ok, msg = run_once(pre + s, strict, neg, is_async, os.path.dirname(p))
+        ok, msg = run_once(pre + s, strict, neg, is_async, os.path.dirname(p), None, fl)
         if not ok:
             return p, ed, False, ('strict: ' if strict else '') + msg.replace('\n', ' ')
     return p, ed, True, ''

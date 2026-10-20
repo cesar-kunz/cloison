@@ -7402,3 +7402,71 @@ fn module_early_errors() {
     assert!(compile_error("import x from 'y';").contains("module"));
     assert!(compile_error("import.meta").contains("module"));
 }
+
+/// `SharedArrayBuffer`, `Atomics` and `Atomics.waitAsync` on one agent.
+#[test]
+fn shared_buffers_and_atomics() {
+    let src = r#"
+        var sab = new SharedArrayBuffer(8, { maxByteLength: 16 });
+        var ta = new Int32Array(sab);
+        var out = [Object.prototype.toString.call(sab), sab.growable, ta.length];
+        Atomics.store(ta, 0, 5);
+        out.push(Atomics.add(ta, 0, 3), Atomics.compareExchange(ta, 0, 8, 1), Atomics.exchange(ta, 0, 2), Atomics.load(ta, 0));
+        sab.grow(16);
+        out.push(ta.length, sab.slice(4).byteLength);
+        out.push(Atomics.wait(ta, 0, 0, 0), Atomics.wait(ta, 0, 2, 1), Atomics.notify(ta, 0));
+        var big = new BigInt64Array(new SharedArrayBuffer(8));
+        out.push(Atomics.sub(big, 0, 5n), big[0]);
+        try { Atomics.wait(new Int32Array(4), 0, 0); } catch (e) { out.push(e.name); }
+        try { Atomics.add(new Float64Array(sab), 0, 1); } catch (e) { out.push(e.name); }
+        var timed = Atomics.waitAsync(ta, 1, 0, 5);
+        var woken = Atomics.waitAsync(ta, 2, 0);
+        out.push(timed.async, Atomics.waitAsync(ta, 1, 7).value);
+        timed.value.then(v => out.push("1 " + v));
+        woken.value.then(v => out.push("2 " + v));
+        Promise.resolve().then(() => out.push(Atomics.notify(ta, 2)));
+        globalThis.out = out;
+        out.length
+    "#;
+    for _ in 0..2 {
+        let mut vm = Vm::new();
+        let module = cloison::js::compile(src).unwrap();
+        vm.run(&module).unwrap();
+        let module = cloison::js::compile("out.join()").unwrap();
+        let r = vm.run(&module).map(display).unwrap();
+        assert_eq!(
+            r,
+            "[object SharedArrayBuffer],true,2,5,8,1,2,4,12,not-equal,timed-out,0,0,-5,TypeError,TypeError,true,not-equal,1,2 ok,1 timed-out"
+        );
+    }
+}
+
+/// `$262.agent`: agents on threads of their own, blocked in
+/// `Atomics.wait` until the main one notifies them.
+#[test]
+fn agents_wait_and_are_notified() {
+    let src = r#"
+        var sab = new SharedArrayBuffer(8);
+        var ta = new Int32Array(sab);
+        for (var i = 0; i < 2; i++) {
+            $262.agent.start(`
+                $262.agent.receiveBroadcast(function (sab) {
+                    var ta = new Int32Array(sab);
+                    Atomics.add(ta, 1, 1);
+                    $262.agent.report(Atomics.wait(ta, 0, 0));
+                    $262.agent.leaving();
+                });
+            `);
+        }
+        $262.agent.broadcast(sab);
+        var woken = 0;
+        while (woken < 2) woken += Atomics.notify(ta, 0);
+        var reports = [];
+        while (reports.length < 2) {
+            var r = $262.agent.getReport();
+            if (r !== null) reports.push(r);
+        }
+        reports.join() + "," + woken + "," + Atomics.load(ta, 1)
+    "#;
+    assert_eq!(value(src), "ok,ok,2,2");
+}

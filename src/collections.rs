@@ -870,11 +870,14 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Constructor DataView requires 'new'"));
     }
     let buffer = arg(a, 0);
-    if !is_class(buffer, Class::ArrayBuffer) {
+    if !is_class(buffer, Class::ArrayBuffer) && !is_class(buffer, Class::SharedArrayBuffer) {
         return Err(Error::type_error("First argument to DataView constructor must be an ArrayBuffer"));
     }
     let b = as_object(buffer);
     let offset = to_index(vm, arg(a, 1))?;
+    if crate::shared::is_shared(b) {
+        crate::shared::sync_length(b);
+    }
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }

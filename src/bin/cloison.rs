@@ -8,6 +8,9 @@
 //! it imports, instead; `--prelude SCRIPT` runs a script first (test262's
 //! harness, before a module test).
 //!
+//! `--no-block`: `Atomics.wait` throws rather than block the main agent
+//! (test262's `CanBlockIsFalse`).
+//!
 //! `CLOISON_TIME` set: also prints, to stderr, the milliseconds from compiling
 //! to completion (wall clock; process startup excluded, as V8's in-process
 //! timings exclude Node's: see `scripts/tiers.sh`).
@@ -46,6 +49,7 @@ fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut prelude = None;
     let mut module = false;
+    let mut no_block = false;
     while args.len() > 1 {
         match args[0].as_str() {
             "--prelude" if args.len() > 2 => {
@@ -56,6 +60,10 @@ fn main() -> ExitCode {
                 module = true;
                 args.remove(0);
             }
+            "--no-block" => {
+                no_block = true;
+                args.remove(0);
+            }
             _ => break,
         }
     }
@@ -63,12 +71,12 @@ fn main() -> ExitCode {
         [p] => (false, p),
         [flag, p] if flag == "--dump" => (true, p),
         _ => {
-            eprintln!("usage: cloison [--dump] FILE.js|FILE.asm\n       cloison [--prelude SCRIPT] [--module] FILE");
+            eprintln!("usage: cloison [--dump] FILE.js|FILE.asm\n       cloison [--prelude SCRIPT] [--module] [--no-block] FILE");
             return ExitCode::from(2);
         }
     };
     if module || path.ends_with(".mjs") {
-        return run_module(prelude.as_deref(), path);
+        return run_module(prelude.as_deref(), path, no_block);
     }
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -78,6 +86,7 @@ fn main() -> ExitCode {
         }
     };
     let mut vm = cloison::vm::Vm::new();
+    vm.set_can_block(!no_block);
     vm.set_script_path(path);
     let start = std::time::Instant::now();
     let module = if path.ends_with(".js") {
@@ -165,8 +174,9 @@ fn main() -> ExitCode {
 }
 
 /// `cloison [--prelude SCRIPT] --module FILE`: SCRIPT run, then module FILE.
-fn run_module(prelude: Option<&str>, path: &str) -> ExitCode {
+fn run_module(prelude: Option<&str>, path: &str, no_block: bool) -> ExitCode {
     let mut vm = cloison::vm::Vm::new();
+    vm.set_can_block(!no_block);
     if let Some(p) = prelude {
         let r = std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|src| cloison::js::compile(&src));
         let module = match r {

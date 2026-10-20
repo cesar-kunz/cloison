@@ -124,6 +124,9 @@ pub enum Class {
     /// A `DisposableStack` or `AsyncDisposableStack`: `code`'s bits are
     /// its state, a hidden array (see `dispose`).
     DisposableStack,
+    /// A `SharedArrayBuffer`: as [`Class::ArrayBuffer`], its bytes in a
+    /// block outside the heap, which agents share (see `typed::Block`).
+    SharedArrayBuffer,
 }
 
 // (Stencils read a cell's class byte: a string's 4, a symbol's 9, a
@@ -139,6 +142,7 @@ impl Class {
         matches!(
             self,
             Class::ArrayBuffer
+                | Class::SharedArrayBuffer
                 | Class::Map
                 | Class::Set
                 | Class::WeakMap

@@ -1266,6 +1266,11 @@ macro_rules! boxed_location {
                 s.acc = s.tag.encode_f64(num(s.tag, rhs) + num(s.tag, s.acc));
                 next!(s)
             }
+            // Two short flat strings: their concatenation, made here.
+            if let Some(v) = concat_short(s.tag, rhs, s.acc) {
+                s.acc = v;
+                next!(s)
+            }
             s.acc = rt_add!(s, s.acc, rhs);
             next!(s)
         });
@@ -2485,6 +2490,26 @@ unsafe fn strings_differ(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
         }
     }
     None
+}
+
+/// String `o`'s unit `i` as the VM's single-unit string, from the table
+/// at `imm64` (`Vm::single_char`), if `o` is flat (`elems`, byte 24, not
+/// null), `i` below its length (byte 32) and the unit below 256 and made.
+#[inline(always)]
+unsafe fn string_unit_string(o: Value, i: u32) -> Option<Value> {
+    let p = o.to_bits() as *const u8;
+    unsafe {
+        let units = *(p.add(24) as *const *const u16);
+        if units.is_null() || i >= *(p.add(32) as *const u32) {
+            return None;
+        }
+        let c = *units.add(i as usize);
+        if c >= 256 {
+            return None;
+        }
+        let v = *(imm64() as *const Value).add(c as usize);
+        (v.to_bits() != 0).then_some(v)
+    }
 }
 
 /// What `==` gives in a slow path before the runtime (`lt`: nothing).
@@ -3763,6 +3788,55 @@ unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
     }
 }
 
+/// Units at most in a concatenation `concat_short` makes.
+const CONCAT_SHORT: u32 = 32;
+
+/// `a + b` for two flat strings (`elems`, byte 24, not null) of at most
+/// [`CONCAT_SHORT`] units together, a new young string made as
+/// `Vm::new_string_raw` makes one: the string shape at `imm64` (its
+/// in-object capacity 0: `Class::String`, 4, flags `EXTERNAL`), the units
+/// after the header (`INLINE_BASE`, 48 bytes), `elems` pointing at them,
+/// `elems_len` the count and `elems_cap` the words, the room past the
+/// units zero; in the hole at `imm64b`. Else (or no room there) `None`.
+/// (Volatile stores: LLVM would call `memcpy` or `memset`, which a
+/// stencil can't.)
+#[inline(always)]
+unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
+    let string = |v: Value| is_cell(tag, v) && unsafe { *(v.to_bits() as *const u8).add(8) } == 4;
+    if !string(a) || !string(b) {
+        return None;
+    }
+    unsafe {
+        let (p, q) = (a.to_bits() as *const u8, b.to_bits() as *const u8);
+        let (m, n) = (*(p.add(32) as *const u32), *(q.add(32) as *const u32));
+        let (x, y) = (*(p.add(24) as *const *const u16), *(q.add(24) as *const *const u16));
+        let len = m + n;
+        if x.is_null() || y.is_null() || len > CONCAT_SHORT || imm64b() == 0 {
+            return None;
+        }
+        let words = (len as usize).div_ceil(4);
+        let o = bump(imm64b() as *mut HeapPtrs, 6 + words)?;
+        let units = o.add(6);
+        *o = imm64();
+        *o.add(1) = 4 | 1 << 8;
+        *o.add(2) = 0;
+        *o.add(3) = units as u64;
+        *o.add(4) = len as u64 | (words as u64) << 32;
+        *o.add(5) = 0;
+        for k in 0..words {
+            units.add(k).write_volatile(0);
+        }
+        let out = units.cast::<u16>();
+        for k in 0..m as usize {
+            out.add(k).write_volatile(*x.add(k));
+        }
+        for k in 0..n as usize {
+            out.add(m as usize + k).write_volatile(*y.add(k));
+        }
+        Some(Value::from_bits(o as u64))
+    }
+}
+
 #[inline(always)]
 unsafe fn create_object(slots: usize) -> Option<*mut u64> {
     unsafe {
@@ -4422,20 +4496,73 @@ macro_rules! property_location {
             }
             next!(s)
         });
-        // (An object's own element first, as `get_keyed_`.)
+        // `s[i]` for a string `s` (its shape known): a flat string's unit
+        // below 256, the VM's string of it from the table at `imm64`, after
+        // a check of `i` against its length (`elems_len`, byte 32); `_i`,
+        // `i` an int32 in `acc`. Else (a cons string, a unit past 255, an
+        // index out of bounds or not an int32) the runtime's.
+        stencil_slow!("str_get_", loc!($loc); |s| {
+            if s.tag.is_int32(s.acc)
+                && let Some(v) = string_unit_string(get!($loc, s), int(s.acc) as u32)
+            {
+                s.acc = v;
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            // (Not the same code as `get_keyed_rt_`'s, which the compiler
+            // would make one.)
+            core::arch::asm!(concat!("/* str_get_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let r = rt_call!(s, cloison_rt_get_keyed, get!($loc, s), s.acc);
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
+        stencil_slow!("str_get_i_", loc!($loc); |s| {
+            if let Some(v) = string_unit_string(get!($loc, s), int(s.acc) as u32) {
+                s.acc = v;
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
+            let key = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            let r = rt_call!(s, cloison_rt_get_keyed, get!($loc, s), key);
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
+        // (An object's own element first, as `get_keyed_`; a flat
+        // string's unit below 256, the VM's string of it from the table at
+        // `imm64`, as `from_char_code`.)
         stencil_slow!("get_keyed_rt_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if is_cell(s.tag, o)
-                && s.tag.is_int32(s.acc)
-                && matches!(*(o.to_bits() as *const u8).add(8), 0..=3 | 5)
-            {
+            if is_cell(s.tag, o) && s.tag.is_int32(s.acc) {
                 let p = o.to_bits() as *const u8;
                 let i = int(s.acc) as u32;
+                let class = *p.add(8);
                 if i < *(p.add(32) as *const u32) {
-                    let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
-                    if v.to_bits() != 0 {
-                        s.acc = v;
-                        next!(s)
+                    if matches!(class, 0..=3 | 5) {
+                        let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+                        if v.to_bits() != 0 {
+                            s.acc = v;
+                            next!(s)
+                        }
+                    } else if class == 4 {
+                        let units = *(p.add(24) as *const *const u16);
+                        if !units.is_null() {
+                            let c = *units.add(i as usize);
+                            if c < 256 {
+                                let v = *(imm64() as *const Value).add(c as usize);
+                                if v.to_bits() != 0 {
+                                    s.acc = v;
+                                    next!(s)
+                                }
+                            }
+                        }
                     }
                 }
             }

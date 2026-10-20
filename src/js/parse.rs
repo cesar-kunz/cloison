@@ -2088,7 +2088,10 @@ impl<'a> Parser<'_, 'a, '_> {
                         let mut visible = self.eval_visible(pos);
                         if self.current != 0 || !visible.is_empty() {
                             let end = self.toks[self.i - 1].pos;
-                            let f = self.eval_bindings(&visible, end);
+                            // (In an arrow, the function's `arguments` and
+                            // `new.target` it sees too.)
+                            let extra: &[&str] = if k != self.current && k != 0 { &["arguments", "%newtarget"] } else { &[] };
+                            let f = self.eval_bindings(&visible, extra, end);
                             visible.push(Expr { kind: ExprKind::Function(f), pos });
                             args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
                         }
@@ -2731,13 +2734,15 @@ impl<'a> Parser<'_, 'a, '_> {
     /// The function a direct `eval` at `pos` (its call's end) makes for
     /// the bindings it sees (`visible`, of [`Parser::eval_visible`]): an
     /// arrow named [`EVAL_BINDINGS`] whose body refers to each.
-    fn eval_bindings(&mut self, visible: &[Expr<'a>], pos: Pos) -> usize {
+    fn eval_bindings(&mut self, visible: &[Expr<'a>], extra: &[&str], pos: Pos) -> usize {
+        let refer = |v: Name| Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Ident(v), pos }), pos };
         let body = visible
             .chunks(3)
             .filter_map(|t| match &t[1].kind {
-                ExprKind::Ident(v) => Some(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Ident(v.clone()), pos }), pos }),
+                ExprKind::Ident(v) => Some(refer(v.clone())),
                 _ => None,
             })
+            .chain(extra.iter().map(|&n| refer(n.into())))
             .collect();
         let f = self.synthetic_method(&Name::from(""), pos);
         let strict = self.functions[self.current].strict;

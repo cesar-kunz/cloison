@@ -218,6 +218,24 @@ r.join(" ");
     );
 }
 
+/// A direct `eval` in an arrow sees the enclosing function's `arguments`
+/// and `new.target`, as the arrow does.
+#[test]
+fn eval_in_arrows_sees_arguments_and_new_target() {
+    assert_eq!(
+        value(
+            r#"
+var r = [(function () { return (() => eval("arguments[0]"))(); })(8)];
+function F() { this.v = (() => eval("new.target"))() === F; } r.push(new F().v);
+function G() { return (() => (() => eval("arguments.length"))())(); } r.push(G(1, 2, 3));
+r.push((function () { return (() => eval("this.k"))(); }).call({ k: 3 }));
+r.join(" ");
+"#
+        ),
+        "8 true 3 3"
+    );
+}
+
 /// A script's direct `eval` sees the script's lexical bindings (its
 /// `let`s, `const`s, classes, a block's), reads and writes them, and its
 /// `var`s are still the global object's.

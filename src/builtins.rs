@@ -2408,7 +2408,7 @@ fn legacy_paren<const N: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result
 /// The legacy static accessors on `RegExp` (`c`).
 fn install_legacy(vm: &mut Vm, c: *mut Object) {
     let holder = vm.new_object(Value::NULL);
-    let mut native = |vm: &mut Vm, name: &str, f: NativeFn, n: u32| object_value(vm.define_native(holder, name, f, n, Ty::Any, false));
+    let native = |vm: &mut Vm, name: &str, f: NativeFn, n: u32| object_value(vm.define_native(holder, name, f, n, Ty::Any, false));
     let input_get = native(vm, "get input", legacy_input_get, 0);
     let input_set = native(vm, "set input", legacy_input_set, 1);
     for name in ["input", "$_"] {

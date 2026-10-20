@@ -117,7 +117,7 @@ pub const NO_ELEMENTS: u64 = 3;
 pub(crate) unsafe fn note_bytes(ic: *mut Ic, o: *mut Object) {
     unsafe {
         // (A BigInt kind's as anything else's: its loads allocate.)
-        let kind = if (*o).class == Class::TypedArray && !crate::object::TypedKind::from_u8((*o).kind).is_big() {
+        let kind = if (*o).class == Class::TypedArray && crate::object::TypedKind::from_u8((*o).kind).compiled() {
             (*o).kind as u32 + 1
         } else {
             u32::MAX

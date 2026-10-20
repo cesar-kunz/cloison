@@ -1321,7 +1321,7 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, shared, "byteLength", typed_byte_length);
     getter(vm, shared, "byteOffset", typed_byte_offset);
     getter(vm, shared, "length", typed_length_getter);
-    const CTORS: [NativeFn; 11] = [
+    const CTORS: [NativeFn; 12] = [
         typed_ctor::<0>,
         typed_ctor::<1>,
         typed_ctor::<2>,
@@ -1333,6 +1333,7 @@ pub(crate) fn install(vm: &mut Vm) {
         typed_ctor::<8>,
         typed_ctor::<9>,
         typed_ctor::<10>,
+        typed_ctor::<11>,
     ];
     let a_bpe = vm.intern("BYTES_PER_ELEMENT");
     for (k, kind) in TypedKind::ALL.iter().enumerate() {

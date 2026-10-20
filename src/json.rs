@@ -126,7 +126,8 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         } else if string_units(p).is_some() {
             let u = to_string_units(v);
             v = vm.new_string(&u);
-        } else {
+        } else if !crate::symbol::is_symbol(p) {
+            // (A boolean's or a BigInt's; a symbol's stays an object.)
             v = p;
         }
     }

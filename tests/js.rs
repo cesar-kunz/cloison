@@ -196,6 +196,31 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// A symbol's wrapper is an object to `JSON.stringify`; a symbol not in
+/// the registry is a `WeakMap`'s or a `WeakSet`'s key; `AggregateError`
+/// takes its options' `cause`, read before its errors.
+#[test]
+fn symbol_wrappers_weak_symbol_keys_and_aggregate_error_cause() {
+    assert_eq!(
+        value(
+            r#"
+var r = [JSON.stringify(Object(Symbol())), JSON.stringify({ a: Object(Symbol("x")), b: Object(true) })];
+var wm = new WeakMap(), ws = new WeakSet(), s = Symbol("k");
+wm.set(s, 1); ws.add(s); r.push(wm.get(s), ws.has(s));
+try { wm.set(Symbol.for("reg"), 1); } catch (e) { r.push(e.name); }
+var ae = new AggregateError([1, 2], "m", { cause: 5 });
+r.push(ae.cause, ae.errors.length, Object.prototype.hasOwnProperty.call(new AggregateError([]), "cause"));
+var log = [];
+new AggregateError({ [Symbol.iterator]() { log.push("it"); return [][Symbol.iterator](); } }, undefined,
+  { get cause() { log.push("cause"); return 1; } });
+r.push(log.join("+"));
+r.join(" ");
+"#
+        ),
+        r#"{} {"a":{},"b":true} 1 true TypeError 5 2 false cause+it"#
+    );
+}
+
 /// `instanceof` calls a `Symbol.hasInstance` method, `Function.prototype`'s
 /// fixed one OrdinaryHasInstance; a date converts by its own
 /// `Symbol.toPrimitive`; `with` leaves out what `Symbol.unscopables` names,

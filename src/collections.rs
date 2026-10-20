@@ -732,11 +732,12 @@ fn weak_map_get(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(find(o, arg(a, 0)).map_or(Value::UNDEFINED, |i| slot(entries(o), i + 1)))
 }
 
-/// `weakMap.set(key, value)`: the key must be an object.
+/// `weakMap.set(key, value)`: the key must be an object or a symbol not
+/// in the registry.
 fn weak_map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::WeakMap, "WeakMap.prototype.set")?;
     let (k, v) = (arg(a, 0), arg(a, 1));
-    if !is_object(k) {
+    if !can_be_held_weakly(vm, k) {
         return Err(Error::type_error("Invalid value used as weak map key"));
     }
     match find(o, k) {
@@ -760,11 +761,12 @@ fn weak_set_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     collection_ctor(vm, a, Class::WeakSet, Proto::WeakSet, "WeakSet")
 }
 
-/// `weakSet.add(value)`: the value must be an object.
+/// `weakSet.add(value)`: the value must be an object or a symbol not in
+/// the registry.
 fn weak_set_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::WeakSet, "WeakSet.prototype.add")?;
     let k = arg(a, 0);
-    if !is_object(k) {
+    if !can_be_held_weakly(vm, k) {
         return Err(Error::type_error("Invalid value used in weak set"));
     }
     if find(o, k).is_none() {

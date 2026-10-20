@@ -684,11 +684,12 @@ pub(crate) fn for_in_names(vm: &mut Vm, o: *mut Object) -> Result<Vec<Vec<u16>>>
             }
             seen.push(key);
             if get_own_property(vm, cur, key)?.is_some_and(|d| d.enumerable == Some(true)) {
-                let s = match key {
-                    Key::Index(i) => i.to_string(),
-                    Key::Name(a) => vm.atom_name(a).to_string(),
-                };
-                out.push(s.encode_utf16().collect());
+                let mut u = Vec::new();
+                match key {
+                    Key::Index(i) => u.extend(i.to_string().encode_utf16()),
+                    Key::Name(a) => crate::js::lex::string_units(vm.atom_name(a), &mut u),
+                }
+                out.push(u);
             }
         }
         let p = get_prototype_of(vm, cur)?;

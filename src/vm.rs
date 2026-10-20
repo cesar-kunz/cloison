@@ -2782,7 +2782,9 @@ impl Vm {
             return Key::Index(d as u32);
         }
         let units = crate::interp::to_string_units(key);
-        let name = String::from_utf16_lossy(&units);
+        // (A lone surrogate kept, as the front end keeps it in a literal:
+        // `js::lex::units_to_string`.)
+        let name = crate::js::lex::units_to_string(&units);
         if let Ok(i) = name.parse::<u32>()
             && i != u32::MAX
             && i.to_string() == name
@@ -3237,11 +3239,12 @@ impl Vm {
                     }
                     seen.push(key);
                     if enumerable {
-                        let s = match key {
-                            Key::Index(i) => i.to_string(),
-                            Key::Name(a) => self.atom_name(a).to_string(),
-                        };
-                        names.push(s.encode_utf16().collect());
+                        let mut u = Vec::new();
+                        match key {
+                            Key::Index(i) => u.extend(i.to_string().encode_utf16()),
+                            Key::Name(a) => crate::js::lex::string_units(self.atom_name(a), &mut u),
+                        }
+                        names.push(u);
                     }
                 }
                 let proto = unsafe { (*(*o).shape).proto };

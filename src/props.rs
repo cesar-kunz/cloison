@@ -574,6 +574,10 @@ impl Vm {
                         // Validated above: nothing changes.
                         return Ok(true);
                     }
+                    // (An array whose `length` is read-only doesn't grow.)
+                    if class == Class::Array && i >= (*o).elems_len && (*o).flags & LENGTH_READ_ONLY != 0 {
+                        return Ok(false);
+                    }
                     match class {
                         Class::String => return Ok(false),
                         c if c.no_elements() => return Ok(false),
@@ -1010,6 +1014,10 @@ impl Vm {
             let blocked = match own {
                 Some(d) if d.is_data() => d.writable == Some(false),
                 Some(d) => d.set.is_some_and(|s| s.is_undefined()),
+                // (An array whose `length` is read-only doesn't grow.)
+                None if matches!(key, Key::Index(i) if unsafe {
+                    (*obj).class == Class::Array && i >= (*obj).elems_len && (*obj).flags & LENGTH_READ_ONLY != 0
+                }) => true,
                 None => {
                     // An inherited read-only or a setter-less accessor
                     // blocks too; else the object must be extensible.

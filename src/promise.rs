@@ -132,6 +132,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("all", promise_all, 1),
             ("race", promise_race, 1),
             ("allSettled", promise_all_settled, 1),
+            ("allKeyed", promise_all_keyed, 1),
+            ("allSettledKeyed", promise_all_settled_keyed, 1),
             ("any", promise_any, 1),
             ("withResolvers", promise_with_resolvers, 0),
             ("try", promise_try, 1),
@@ -141,6 +143,12 @@ pub(crate) fn install(vm: &mut Vm) {
         proto,
         &[("then", promise_then as NativeFn, 2), ("catch", promise_catch, 1), ("finally", promise_finally, 1)],
     );
+}
+
+/// `Promise.prototype[@@toStringTag]` (`symbol::install` calls it).
+pub(crate) fn install_symbols(vm: &mut Vm) {
+    let p = root(vm, Root::Prototype);
+    crate::symbol::to_string_tag(vm, p, "Promise");
 }
 
 // ---- Async functions ----
@@ -773,11 +781,19 @@ fn promise_with_resolvers(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
     Ok(object_value(o))
 }
 
-/// `Promise.try(f, …args)`: a promise for `f(…args)`, rejected if it throws.
+/// `Promise.try(f, …args)`: a promise for `f(…args)`, rejected if it
+/// throws (what it returns itself if a promise of `this`).
 fn promise_try(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let c = this_constructor(this, "Promise.try")?;
     let cap = new_capability(vm, c)?;
     match call_function(vm, arg(a, 0), Value::UNDEFINED, a.get(1..).unwrap_or(&[])) {
+        Ok(v) if is_class(v, Class::Promise) && {
+            let a_constructor = vm.intern("constructor");
+            vm.get(v, a_constructor)? == c
+        } =>
+        {
+            return Ok(v);
+        }
         Ok(v) => cap_resolve(vm, &cap, v)?,
         Err(e) => {
             let v = thrown(vm, e)?;
@@ -889,16 +905,103 @@ fn promise_any(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     combine(vm, this, a, Combinator::Any)
 }
 
+/// `Promise.allKeyed(promises)` (`settled`: `allSettledKeyed`): as
+/// `all` (`allSettled`) of the values of the object's own enumerable
+/// properties, settled with an object of them by the same keys.
+fn combine_keyed(vm: &mut Vm, this: Value, a: &[Value], settled: bool) -> Result<Value> {
+    let mut cap = new_capability(vm, this)?;
+    materialize(vm, &mut cap);
+    if let Err(e) = perform_keyed(vm, this, &cap, arg(a, 0), settled) {
+        let v = thrown(vm, e)?;
+        cap_reject(vm, &cap, v)?;
+    }
+    Ok(cap.promise)
+}
+
+/// PerformPromiseAllKeyed.
+fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: bool) -> Result<()> {
+    let a_resolve = vm.intern("resolve");
+    let promise_resolve = vm.get(c, a_resolve)?;
+    if !is_callable(promise_resolve) {
+        return Err(Error::type_error("Promise resolve is not a function"));
+    }
+    if !is_object(promises) {
+        return Err(Error::type_error("Promise.allKeyed: the argument is not an object"));
+    }
+    let o = as_object(promises);
+    let a_then = vm.intern("then");
+    let keys = vm.new_array();
+    let values = vm.new_array();
+    let state = vm.new_array();
+    array_push(vm, state, &[Value::from_i32(1)])?;
+    let mut index = 0;
+    for key in crate::proxy::own_keys(vm, o)? {
+        if !crate::proxy::get_own_property(vm, o, key)?.is_some_and(|d| d.enumerable == Some(true)) {
+            continue;
+        }
+        let k = vm.key_value(key);
+        let value = vm.get_keyed(promises, k)?;
+        array_push(vm, keys, &[k])?;
+        array_push(vm, values, &[Value::UNDEFINED])?;
+        let next_promise = call_function(vm, promise_resolve, c, &[value])?;
+        let data = [values, state, cap.promise, cap.resolve, Value::from_i32(index), Value::FALSE, Value::UNDEFINED, keys];
+        let (on_fulfilled, on_rejected) = if settled {
+            let f = closure(vm, Root::SettledFulfill, &data);
+            let mut data = data;
+            data[PARTNER] = f;
+            let r = closure(vm, Root::SettledReject, &data);
+            set_slot(as_object(f), PARTNER, r);
+            (f, r)
+        } else {
+            (closure(vm, Root::AllElement, &data), cap.reject)
+        };
+        let s = as_object(state);
+        put(s, 0, Value::from_i32(elem(s, 0).as_i32_unchecked() + 1));
+        let then = vm.get(next_promise, a_then)?;
+        call_function(vm, then, next_promise, &[on_fulfilled, on_rejected])?;
+        index += 1;
+    }
+    let s = as_object(state);
+    let remaining = elem(s, 0).as_i32_unchecked() - 1;
+    put(s, 0, Value::from_i32(remaining));
+    if remaining == 0 {
+        let r = keyed_result(vm, keys, values)?;
+        cap_resolve(vm, cap, r)?;
+    }
+    Ok(())
+}
+
+/// CreateKeyedPromiseCombinatorResultObject: a null-prototype object of
+/// `values` by `keys` (arrays).
+fn keyed_result(vm: &mut Vm, keys: Value, values: Value) -> Result<Value> {
+    let o = object_value(vm.new_object(Value::NULL));
+    let (k, v) = (as_object(keys), as_object(values));
+    for i in 0..len(k) {
+        let key = crate::intrinsics::to_property_key(vm, elem(k, i))?;
+        vm.create_data_property(o, key, elem(v, i))?;
+    }
+    Ok(o)
+}
+
+fn promise_all_keyed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    combine_keyed(vm, this, a, false)
+}
+
+fn promise_all_settled_keyed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    combine_keyed(vm, this, a, true)
+}
+
 /// An element function's slots: the values array, the `[remaining]`
 /// array, the capability's promise and the function to settle it with,
 /// the element's index, whether it was called (and for `allSettled`, the
-/// partner sharing that).
+/// partner sharing that; a keyed combinator's, its keys).
 const VALUES: usize = 0;
 const REMAINING: usize = 1;
 const SETTLE: usize = 3;
 const INDEX: usize = 4;
 const CALLED: usize = 5;
 const PARTNER: usize = 6;
+const KEYS: usize = 7;
 
 /// Store `v` as the element function `me`'s value, and settle the
 /// capability if it was the last: with the values, or (`any`) an
@@ -911,7 +1014,13 @@ fn element_done(vm: &mut Vm, me: *mut Object, v: Value) -> Result<Value> {
     put(s, 0, Value::from_i32(remaining));
     if remaining == 0 {
         let any = unsafe { (*me).code } == unsafe { (*root(vm, Root::AnyElement)).code };
-        let result = if any { aggregate_error(vm, values) } else { values };
+        let result = if unsafe { Object::inline_cap(me) } > KEYS {
+            keyed_result(vm, slot(me, KEYS), values)?
+        } else if any {
+            aggregate_error(vm, values)
+        } else {
+            values
+        };
         call_function(vm, slot(me, SETTLE), Value::UNDEFINED, &[result])?;
     }
     Ok(Value::UNDEFINED)
@@ -925,7 +1034,7 @@ fn take_element(vm: &mut Vm) -> Option<*mut Object> {
         return None;
     }
     set_slot(me, CALLED, Value::TRUE);
-    if unsafe { Object::inline_cap(me) } > PARTNER {
+    if unsafe { Object::inline_cap(me) } > PARTNER && slot(me, PARTNER).is_cell() {
         set_slot(as_object(slot(me, PARTNER)), CALLED, Value::TRUE);
     }
     Some(me)

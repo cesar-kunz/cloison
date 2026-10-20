@@ -4964,6 +4964,25 @@ stencil!("sta_upvalue"; |s| {
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
+// An inlined frame's (`Prop::UpvalueAt`): its function at `imm64` bytes
+// from the registers (in its header), the cell `imm` bytes into it.
+#[inline(always)]
+unsafe fn upvalue_cell_at(regs: *mut Value) -> *const *mut Value {
+    unsafe {
+        let f = *((regs as *const u8).offset(imm64() as i64 as isize) as *const *mut u8);
+        load_imm(f).to_bits() as *const *mut Value
+    }
+}
+stencil!("lda_upvalue_fr"; |s| {
+    s.acc = **upvalue_cell_at(s.regs);
+    next!(s)
+});
+stencil!("sta_upvalue_fr"; |s| {
+    let u = upvalue_cell_at(s.regs);
+    **u = s.acc;
+    upvalue_barrier(s.tag, u, s.acc);
+    next!(s)
+});
 stencil!("lda_upvalue_c"; |s| {
     s.acc = **(imm64() as *const *const Value);
     next!(s)
@@ -5799,6 +5818,20 @@ macro_rules! check_callee {
             if get!($loc, s).to_bits() != imm64() {
                 exit!(s)
             }
+            next!(s)
+        });
+        // A call inlined for any closure of a code (`CODE_GUARD`): the
+        // callee a function (`Class::Function`, 2, at byte 8) running it
+        // (`code`, byte 40, is `imm64`), written to the inlined frame's
+        // header (`imm` bytes from the registers), where its upvalues are
+        // read (`lda_upvalue_fr`).
+        stencil!("check_callee_code_", loc!($loc); |s| {
+            let f = get!($loc, s);
+            let p = f.to_bits() as *const u8;
+            if !is_cell(s.tag, f) || *p.add(8) != 2 || *(p.add(40) as *const u64) != imm64() {
+                exit!(s)
+            }
+            *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = f.to_bits();
             next!(s)
         });
         // A case of a polymorphic inlined call: another callee takes the

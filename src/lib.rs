@@ -23,6 +23,7 @@ mod iterator;
 mod typed;
 mod shared;
 mod agent;
+mod temporal;
 mod dispose;
 mod module;
 mod base64;

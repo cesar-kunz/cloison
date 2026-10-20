@@ -833,6 +833,8 @@ pub struct Vm {
     pub(crate) shared_atomics: *mut Object,
     /// Whether `Atomics.wait` may block this agent.
     pub(crate) can_block: bool,
+    /// Temporal's state: its prototypes, the time zones in use.
+    pub(crate) temporal: crate::temporal::State,
     /// The agent's part, if it is one (see `agent`).
     pub(crate) agent: crate::agent::State,
     /// `Error.prototype` and its kinds' (see `builtins::ERROR_KINDS`).
@@ -1024,6 +1026,7 @@ impl Vm {
             shared_atomics: std::ptr::null_mut(),
             can_block: true,
             agent: crate::agent::State::default(),
+            temporal: crate::temporal::State::default(),
             single_chars: vec![Value::EMPTY; 256],
             a_to_string: Atom(0),
             a_value_of: Atom(0),
@@ -4459,6 +4462,7 @@ impl Vm {
         v.extend(self.shared.roots());
         v.extend([self.legacy_match.0, self.legacy_input].into_iter().filter(|v| v.is_cell()));
         v.extend(self.agent.roots());
+        v.extend(self.temporal.roots());
         v.extend_from_slice(&self.single_chars);
         if let Some(Error(_, Some(e))) = &self.error {
             v.push(*e);

@@ -12,7 +12,7 @@
 //! The object (class `Generator`) keeps a hidden array in `code`:
 //! `[state, registers, pc, function, mode]`.
 
-use crate::interp::{drive, native_stack_low, write_frame_header};
+use crate::interp::{native_stack_low, write_frame_header};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
@@ -176,7 +176,8 @@ unsafe fn run(vm: &mut Vm, f: *mut Object, saved: Value, pc: usize, v: Value) ->
         }
         let saved_top = vm.native_top;
         vm.native_top = std::ptr::null_mut();
-        let out = drive(vm, (*code).bytecode.as_ptr().add(pc), v, new);
+        let start = crate::interp::Resume { regs: new, pc: (*code).bytecode.as_ptr().add(pc), acc: v };
+        let out = crate::interp::run_in_realm(vm, &*code, new, start);
         vm.native_top = saved_top;
         if out == Value::EMPTY {
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("a generator's run")));
@@ -396,10 +397,12 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.get(object_value(vm.global), a).unwrap_or(Value::UNDEFINED)
     };
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);
-    for (name, ctor, generator) in [
-        ("GeneratorFunction", crate::builtins::generator_function_ctor as crate::vm::NativeFn, true),
-        ("AsyncFunction", crate::builtins::async_function_ctor, false),
+    for (name, ctor, instances) in [
+        ("GeneratorFunction", crate::builtins::generator_function_ctor as crate::vm::NativeFn, gp),
+        ("AsyncFunction", crate::builtins::async_function_ctor, std::ptr::null_mut()),
+        ("AsyncGeneratorFunction", crate::builtins::async_generator_function_ctor, agp),
     ] {
+        let generator = !instances.is_null();
         let proto = vm.new_object(fp);
         vm.symbol_roots.push(proto);
         let c = vm.native_function(name, ctor, 1, crate::jit::Ty::Any, true);
@@ -410,8 +413,10 @@ pub(crate) fn install(vm: &mut Vm) {
         let d = crate::props::Desc::data(object_value(c), false, false, true);
         let _ = vm.define_own_property(proto, crate::vm::Key::Name(a_c), &d);
         if generator {
-            let d = crate::props::Desc::data(object_value(gp), false, false, true);
+            let d = crate::props::Desc::data(object_value(instances), false, false, true);
             let _ = vm.define_own_property(proto, crate::vm::Key::Name(a_p), &d);
+            let d = crate::props::Desc::data(object_value(proto), false, false, true);
+            let _ = vm.define_own_property(instances, crate::vm::Key::Name(a_c), &d);
         }
         let u: Vec<u16> = name.encode_utf16().collect();
         let s = vm.string_constant(&u);
@@ -420,10 +425,12 @@ pub(crate) fn install(vm: &mut Vm) {
         // (The same capacity as `function_shape`'s: upvalues where
         // compiled code reads them.)
         let root = vm.root_shape(crate::object::Class::Function, object_value(proto), 2);
-        if generator {
+        if !generator {
+            vm.async_function_shape = root;
+        } else if instances == gp {
             vm.generator_function_shape = vm.transition_with(root, a_p, DONT_ENUM | DONT_DELETE);
         } else {
-            vm.async_function_shape = root;
+            vm.async_generator_function_shape = vm.transition_with(root, a_p, DONT_ENUM | DONT_DELETE);
         }
     }
 }

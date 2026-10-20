@@ -85,8 +85,8 @@ impl Slots {
 /// time zones in use, the system's named zones.
 #[derive(Default)]
 pub(crate) struct State {
-    protos: Vec<*mut Object>,
-    ctors: Vec<*mut Object>,
+    pub(crate) protos: Vec<*mut Object>,
+    pub(crate) ctors: Vec<*mut Object>,
     zones: Vec<tz::Zone>,
     zone_ids: HashMap<String, u32>,
     registry: tz::Registry,

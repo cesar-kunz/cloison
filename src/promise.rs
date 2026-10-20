@@ -89,7 +89,11 @@ pub(crate) fn install(vm: &mut Vm) {
     let proto = vm.new_object(op);
     let c = vm.define_native(g, "Promise", promise_ctor, 1, any, true);
     link_constructor(vm, c, proto);
-    let jobs = as_object(vm.new_array());
+    // (One queue for every realm.)
+    if vm.job_queue.is_null() {
+        vm.job_queue = as_object(vm.new_array());
+    }
+    let jobs = vm.job_queue;
 
     // `AggregateError`, as the error kinds are made in `builtins`.
     let ep = object_value(vm.error_prototypes[0]);

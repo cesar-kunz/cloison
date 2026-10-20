@@ -191,6 +191,8 @@ fn template(vm: &mut Vm, t: Template) -> *mut Object {
         let names = ["get", "set", "has", "deleteProperty", "defineProperty", "getOwnPropertyDescriptor", "ownKeys", "", "", "", "", ""];
         for ((f, n), name) in fs.into_iter().zip(names) {
             let o = vm.native_function(name, f, n, any, false);
+            // (Every realm's: they run in their caller's.)
+            unsafe { (*(*o).code.cast_mut()).realm = crate::realm::NONE };
             vm.modules.templates.push(o);
         }
     }
@@ -1073,6 +1075,19 @@ fn early(e: Error) -> std::result::Result<String, Error> {
 /// `phase`: 0 for `import()`, 1 for `import.defer()` (a deferred
 /// namespace, the module's async dependencies evaluated first), 2 for
 /// `import.source()` (the module's source object).
+/// The module `specifier` names (from the script's directory) loaded,
+/// linked and evaluated now (`ShadowRealm.prototype.importValue`'s): it,
+/// and the promise of its evaluation.
+pub(crate) fn import_now(vm: &mut Vm, specifier: Value) -> Result<(usize, Value)> {
+    let spec = String::from_utf16_lossy(string_units(specifier).unwrap_or(&[]));
+    let from = vm.modules.script_path.clone().unwrap_or_else(|| "./script".into());
+    let path = resolve_path(&from, &spec);
+    let m = load(vm, &path, request_type(None)?)?;
+    link(vm, m)?;
+    let p = evaluate(vm, m)?;
+    Ok((m, p))
+}
+
 pub(crate) fn dynamic_import(vm: &mut Vm, specifier: Value, options: Value, referrer: Value, phase: Value) -> Result<Value> {
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
     match import_request(vm, specifier, options) {

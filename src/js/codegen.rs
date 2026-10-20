@@ -1790,7 +1790,8 @@ impl<'a> Gen<'a> {
             // `var x;` makes a global that reads as undefined.
             // Declared before the script runs, `undefined` unless a global
             // of that name exists (`var performance = performance || {}`).
-            for name in self.script_vars().into_iter().filter(|_| !self.p.direct_eval) {
+            // (Strict `eval` code's are its own: registers, `undefined`.)
+            for name in self.script_vars().into_iter().filter(|_| !self.p.direct_eval && !self.p.eval_locals) {
                 self.global(Op::LdaGlobalInsideTypeof, name);
                 self.global(Op::StaGlobal, name);
             }
@@ -4238,7 +4239,9 @@ impl<'a> Gen<'a> {
             && &**n == "eval"
             && !new
             && self.f.has_eval
-            && (self.index != 0 || self.p.direct_eval || script_lexicals())
+            // (A sloppy script's own, with no block-scoped names, an
+            // indirect one's; a strict script's has its own `var`s.)
+            && (self.index != 0 || self.p.direct_eval || self.f.strict || script_lexicals())
             && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)))
         {
             // Direct `eval`: `[eval, source, scope object, this, strict,
@@ -4271,6 +4274,13 @@ impl<'a> Gen<'a> {
             }
             for a in args.iter().skip(1) {
                 self.effect(a)?;
+            }
+            // A strict script's own: an indirect one's, strict (its
+            // `var`s its own, no `new.target`, the global names).
+            if self.index == 0 && !self.p.direct_eval && !script_lexicals() {
+                self.intrinsic("strict_eval", fr, 2);
+                self.temp = mark;
+                return Ok(());
             }
             let env = self.alloc(pos)?;
             if self.index == 0 && self.p.direct_eval {

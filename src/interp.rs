@@ -3286,6 +3286,8 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 continue;
             }
             let r = match (*as_object(m)).class {
+                // (Another realm's: run there.)
+                Class::Native if !vm.realms.is_empty() => vm.call_other(m, v, &[]),
                 Class::Native => {
                     vm.callee = as_object(m);
                     ((*(*as_object(m)).code).native.unwrap())(vm, v, &[])
@@ -4475,6 +4477,25 @@ fn enter_compiled(regs: *mut Value) -> Entered {
             pc: std::ptr::null(),
             acc,
         };
+        // Several realms: no compiled code; a call into another realm runs
+        // its frame there, to its end (see `realm`).
+        if !vm.realms.is_empty() {
+            code.calls_left.set(0);
+            if code.realm == vm.realm || code.realm == crate::realm::NONE {
+                return done(ENTER_INTERPRET, Value::UNDEFINED);
+            }
+            if native_stack_low(vm) {
+                vm.error = Some(Error::range_error("Maximum call stack size exceeded"));
+                return done(ENTER_ERROR, Value::EMPTY);
+            }
+            let mut spread = Vec::new();
+            let args = frame_args(vm, regs, &mut spread);
+            let outer = std::mem::replace(&mut vm.pending_args, args);
+            set_header(regs, RET_PC, std::ptr::null::<u8>());
+            let v = run_in_realm(vm, code, regs, Resume { regs, pc: code.bytecode.as_ptr(), acc: Value::UNDEFINED });
+            vm.pending_args = outer;
+            return if v == Value::EMPTY { done(ENTER_ERROR, v) } else { done(ENTER_RETURNED, v) };
+        }
         match crate::jit::vm_run(vm, code, regs, 0, Value::UNDEFINED) {
             VmRun::NotCompiled => {
                 code.calls_left.set(i32::MAX);
@@ -4711,6 +4732,10 @@ unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags
             pc: (*callee).bytecode.as_ptr(),
             acc: Value::UNDEFINED,
         };
+        if !vm.realms.is_empty() {
+            (*callee).calls_left.set(0);
+            return run_in_realm(vm, &*callee, new, start);
+        }
         // A hot callee runs compiled; an exit resumes in the interpreter.
         // So does one compiled before (for direct calls, say: a function
         // without loops has no countdown, and a site that stopped calling
@@ -4736,6 +4761,31 @@ unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags
             }
         }
         drive(vm, start.pc, start.acc, start.regs)
+    }
+}
+
+/// Run frame `regs` of `code` from `start` to its end (it returns to
+/// native code) in `code`'s realm: the result, or `EMPTY` with what it
+/// threw made an object of that realm's.
+pub(crate) unsafe fn run_in_realm(vm: &mut Vm, code: &Code, regs: *mut Value, start: Resume) -> Value {
+    unsafe {
+        let r = code.realm;
+        if r == vm.realm || r == crate::realm::NONE {
+            return drive(vm, start.pc, start.acc, start.regs);
+        }
+        // A sloppy function's `this` for `undefined`: its own realm's
+        // global object (the caller's was passed).
+        let g = object_value(vm.global);
+        let old = crate::realm::enter(vm, r);
+        if !code.strict && *regs == g && start.pc == code.bytecode.as_ptr() {
+            *regs = object_value(vm.global);
+        }
+        let v = drive(vm, start.pc, start.acc, start.regs);
+        if v == Value::EMPTY {
+            crate::realm::own_pending_error(vm);
+        }
+        crate::realm::enter(vm, old);
+        v
     }
 }
 

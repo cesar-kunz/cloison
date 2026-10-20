@@ -241,6 +241,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("evalScript", eval_script as NativeFn, 1),
             ("gc", host_gc, 0),
             ("detachArrayBuffer", host_detach_array_buffer, 1),
+            ("createRealm", crate::realm::host_create_realm, 0),
         ],
     );
     crate::agent::install(vm, host);
@@ -301,6 +302,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // (After the generators: `%AsyncIteratorPrototype%`.)
     crate::dispose::install(vm).expect("installing the dispose builtins");
     crate::temporal::install(vm);
+    crate::shadow::install(vm);
     // (`Symbol.prototype`'s is called directly: a symbol is a primitive.)
     vm.to_primitive_defined = false;
     vm.has_instance_defined = false;
@@ -903,6 +905,11 @@ fn function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `GeneratorFunction(p1, …, body)`: as `Function`'s, a generator.
 pub(crate) fn generator_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     dynamic_function(vm, a, "function*")
+}
+
+/// `AsyncGeneratorFunction(p1, …, body)`: an async generator function.
+pub(crate) fn async_generator_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    dynamic_function(vm, a, "async function*")
 }
 
 /// `AsyncFunction(p1, …, body)`: as `Function`'s, an async function.
@@ -2137,6 +2144,7 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
         for (slot, (_, v)) in props.into_iter().enumerate() {
             vm.store_field(o, slot as u32, v);
         }
+        note_realm(vm, o);
         return object_value(o);
     }
     for (a, v) in props {
@@ -2146,7 +2154,26 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
     if unsafe { !(*root).unique && !(*(*o).shape).unique } {
         vm.regexp_shapes = (root, unsafe { (*o).shape });
     }
+    note_realm(vm, o);
     object_value(o)
+}
+
+/// A `RegExp`'s realm, if not the first (see `realm`): a hidden key's
+/// value (for `compile`, which takes only its own realm's).
+fn note_realm(vm: &mut Vm, o: *mut Object) {
+    if vm.realm != 0 {
+        let a = vm.intern("\u{FDD0}Realm");
+        vm.add_property_with(o, a, Value::from_i32(vm.realm as i32), DONT_ENUM | READ_ONLY | DONT_DELETE);
+    }
+}
+
+/// The realm `RegExp` `o` was made in.
+fn realm_of(vm: &mut Vm, o: *mut Object) -> u32 {
+    let a = vm.intern("\u{FDD0}Realm");
+    match vm.own_property(o, crate::vm::Key::Name(a)).and_then(|d| d.value) {
+        Some(v) => v.as_number().unwrap_or(0.0) as u32,
+        None => 0,
+    }
 }
 
 /// `v`'s compiled regular expression, if it is a `RegExp`.
@@ -2162,6 +2189,9 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
     if unsafe { (*as_object(this)).flags } & crate::object::LEGACY_DISABLED != 0 {
         return Err(Error::type_error("RegExp.prototype.compile called on a subclass's RegExp"));
+    }
+    if !vm.realms.is_empty() && realm_of(vm, as_object(this)) != vm.realm {
+        return Err(Error::type_error("RegExp.prototype.compile called on another realm's RegExp"));
     }
     let (pattern, flags) = (arg(a, 0), arg(a, 1));
     let (p, f) = if let Some(re) = regexp_of(pattern) {
@@ -2620,7 +2650,8 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
     // (One whose `exec` isn't the builtin one, or no RegExp: as the spec
     // has it, through `exec`.)
-    if !pristine(vm, this)? {
+    // (`matchAll` and `split` make a copy by SpeciesConstructor.)
+    if !pristine(vm, this)? || matches!(K, 1 | 4) && !species_pristine(vm, this) {
         return match K {
             0 => rx_match(vm, this, s),
             1 => rx_match_all(vm, this, s),
@@ -3693,6 +3724,40 @@ fn rx_species(vm: &mut Vm, r: Value) -> Result<Value> {
         return Err(Error::type_error("object.constructor[Symbol.species] is not a constructor"));
     }
     Ok(sp)
+}
+
+/// Whether `r`'s SpeciesConstructor is `%RegExp%`, found without
+/// calling anything: its `constructor` a data property, `RegExp`'s
+/// `@@species` the builtin getter.
+fn species_pristine(vm: &mut Vm, r: Value) -> bool {
+    let o = as_object(r);
+    if crate::proxy::chain_has_proxy(vm, o) {
+        return false;
+    }
+    let a_c = vm.a_constructor;
+    let mut p = o;
+    let d = loop {
+        if let Some(d) = vm.own_property(p, crate::vm::Key::Name(a_c)) {
+            break d;
+        }
+        let proto = unsafe { (*(*p).shape).proto };
+        if !proto.is_cell() {
+            return false;
+        }
+        p = as_object(proto);
+    };
+    if d.is_accessor() || d.value != Some(object_value(vm.regexp_constructor)) {
+        return false;
+    }
+    let a_s = vm.intern(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
+    let rc = vm.regexp_constructor;
+    match vm.own_property(rc, crate::vm::Key::Name(a_s)).and_then(|d| d.get) {
+        Some(g) if g.is_cell() => unsafe {
+            let g = as_object(g);
+            (*g).class == Class::Native && (*(*g).code).name == "get [Symbol.species]"
+        },
+        _ => false,
+    }
 }
 
 /// `RegExp.prototype[Symbol.split]` generically: a sticky copy (of the

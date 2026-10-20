@@ -463,6 +463,9 @@ pub struct Code {
     /// Not compiled yet: its bytecode is `CompileLazy`, which compiles
     /// it from this (see `Vm::compile_lazy`).
     pub(crate) lazy: Option<Box<crate::asm::LazyFn>>,
+    /// The realm it was made in (see `realm`): its calls run there.
+    /// `realm::NONE` for code that runs in its caller's (a proxy's).
+    pub(crate) realm: u32,
 }
 
 impl Code {
@@ -660,9 +663,10 @@ pub struct Vm {
     /// `%AsyncFunction.prototype%`), once made (see `generator::install`).
     pub(crate) generator_function_shape: *const Shape,
     pub(crate) async_function_shape: *const Shape,
+    pub(crate) async_generator_function_shape: *const Shape,
     /// The root shape of arrays (cached: `root_shape` hashes).
     pub(crate) array_shape: *const Shape,
-    proto_object_shape: *const Shape,
+    pub(crate) proto_object_shape: *const Shape,
     /// `Function.prototype.call`'s code: a call through it is a call of its
     /// receiver (see `interp::unwrap_call`).
     pub(crate) function_call: *const Code,
@@ -778,12 +782,12 @@ pub struct Vm {
     pub(crate) regexp_slots: [i32; 6],
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
-    declared: crate::jit::HashSet<Atom>,
+    pub(crate) declared: crate::jit::HashSet<Atom>,
     /// Loaded scripts' block-scoped names (see `Module::lexical`).
-    lexical_declared: crate::jit::HashSet<Atom>,
+    pub(crate) lexical_declared: crate::jit::HashSet<Atom>,
     /// Scripts' (not `eval`s') `var` and function names: their globals
     /// can't be deleted.
-    script_declared: crate::jit::HashSet<Atom>,
+    pub(crate) script_declared: crate::jit::HashSet<Atom>,
     /// `Function.prototype.bind`'s JS helper, once made.
     pub(crate) bind_helper: Value,
     /// `Array.fromAsync`'s JS helper, once made.
@@ -872,6 +876,15 @@ pub struct Vm {
     /// What the JIT worked out about functions' bytecode, for every
     /// function's compilations.
     pub(crate) jit_caches: crate::jit::Caches,
+    /// The current realm (see `realm`), and every realm's intrinsics but
+    /// the current's (whose slot is blank): empty until a second realm is
+    /// made.
+    pub(crate) realm: u32,
+    pub(crate) realms: Vec<Box<crate::realm::Realm>>,
+    /// The promise job queue, which the realms share.
+    pub(crate) job_queue: *mut Object,
+    /// `ShadowRealm.prototype`, … (see `shadow::Root`).
+    pub(crate) shadow_roots: Vec<*mut Object>,
 }
 
 impl Default for Vm {
@@ -950,6 +963,7 @@ impl Vm {
             method_shape: std::ptr::null(),
             generator_function_shape: std::ptr::null(),
             async_function_shape: std::ptr::null(),
+            async_generator_function_shape: std::ptr::null(),
             array_shape: std::ptr::null(),
             proto_object_shape: std::ptr::null(),
             function_call: std::ptr::null(),
@@ -1049,6 +1063,10 @@ impl Vm {
             a_configurable: Atom(0),
             a_get: Atom(0),
             a_set: Atom(0),
+            realm: 0,
+            realms: Vec::new(),
+            job_queue: std::ptr::null_mut(),
+            shadow_roots: Vec::new(),
         };
         let budget = vm.frame_budget;
         vm.set_tier_back_edges(budget);
@@ -1072,7 +1090,15 @@ impl Vm {
         vm.a_multiline = vm.intern("multiline");
         vm.a_index = vm.intern("index");
         vm.a_input = vm.intern("input");
+        vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
+        vm.init_realm();
+        vm
+    }
 
+    /// Make the current realm's intrinsics: its global object, the
+    /// builtins.
+    pub(crate) fn init_realm(&mut self) {
+        let vm = self;
         vm.object_prototype = vm.new_object_with(Class::Plain, Value::NULL, 4);
         let op = object_value(vm.object_prototype);
         // `Function.prototype` is itself a function (returning `undefined`).
@@ -1083,7 +1109,6 @@ impl Vm {
         // `String.prototype` is a string object (of `""`, set below) and
         // `Number.prototype` a number object (of 0).
         vm.string_prototype = vm.new_object_with(Class::Wrapper, op, 4);
-        vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
         // Room for the builtins and the script's globals in the object
         // itself: out-of-line globals cost compiled code a load each, and
         // aren't folded as constants. (64 slots, the builtins took them
@@ -1102,10 +1127,14 @@ impl Vm {
         vm.proto_object_shape = vm.transition_with(root, vm.a_constructor, DONT_ENUM);
 
         vm.array_shape = vm.root_shape(Class::Array, object_value(vm.array_prototype), 0);
-        vm.string_shape = vm.root_shape(Class::String, object_value(vm.string_prototype), 0);
-        // No value fits a string's "elements" (its code units): element
-        // stores' fast paths never take one.
-        unsafe { (*vm.string_shape.cast_mut()).elems_code = NO_ELEMENTS };
+        // (Strings, primitives, share the first realm's shape: property
+        // reads on one find the current realm's `String.prototype`.)
+        if vm.string_shape.is_null() {
+            vm.string_shape = vm.root_shape(Class::String, object_value(vm.string_prototype), 0);
+            // No value fits a string's "elements" (its code units): element
+            // stores' fast paths never take one.
+            unsafe { (*vm.string_shape.cast_mut()).elems_code = NO_ELEMENTS };
+        }
         let empty = vm.new_string(&[]);
         unsafe { (*vm.string_prototype).code = empty.to_bits() as *const Code };
         let ap = vm.array_prototype;
@@ -1228,8 +1257,7 @@ impl Vm {
             // Not enumerable, as the builtins' properties.
             vm.add_property_with(proto, a_c, object_value(c), DONT_ENUM);
         }
-        crate::builtins::install(&mut vm);
-        vm
+        crate::builtins::install(vm);
     }
 
     // ---- Names ----
@@ -1873,6 +1901,12 @@ impl Vm {
             return self.get_primitive(obj, name);
         }
         let o = as_object(obj);
+        if !self.realms.is_empty()
+            && name != self.a_length
+            && let Some(p) = self.realm_proto(o)
+        {
+            return self.get_through(p, name, obj);
+        }
         if crate::proxy::chain_has_proxy(self, o) {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
         }
@@ -2071,6 +2105,51 @@ impl Vm {
         }
     }
 
+    /// For a primitive cell (a string, a symbol, a bigint) whose prototype
+    /// is another realm's, the current realm's (whose properties a
+    /// primitive has).
+    fn realm_proto(&self, o: *mut Object) -> Option<*mut Object> {
+        let p = match unsafe { (*o).class } {
+            Class::String => self.string_prototype,
+            Class::Symbol => self.symbol_roots[crate::symbol::Root::SymbolPrototype as usize],
+            Class::BigInt => self.bigint_prototype,
+            _ => return None,
+        };
+        (unsafe { (*(*o).shape).proto } != object_value(p)).then_some(p)
+    }
+
+    /// `p.[[Get]](name, receiver)`.
+    fn get_through(&mut self, p: *mut Object, name: Atom, receiver: Value) -> Result<Value> {
+        if crate::proxy::chain_has_proxy(self, p) {
+            return crate::proxy::generic_get(self, object_value(p), Key::Name(name), receiver);
+        }
+        match self.lookup(p, name) {
+            // (A getter's `this` the primitive.)
+            Some((h, slot)) if self.is_accessor(h, slot) => {
+                let pair = unsafe { *Object::slot(h, (*(*h).shape).location(slot)) };
+                self.call_getter(pair, receiver)
+            }
+            Some((h, slot)) => Ok(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) }),
+            None => Ok(self.virtual_get(p, name)),
+        }
+    }
+
+    /// `p.[[Set]](name, value, receiver)` for a primitive `receiver`:
+    /// an inherited setter's call (or a proxy's trap), or nothing.
+    fn set_through(&mut self, p: *mut Object, name: Atom, value: Value, receiver: Value) -> Result<()> {
+        if crate::proxy::chain_has_proxy(self, p) {
+            if !crate::proxy::generic_set(self, object_value(p), Key::Name(name), value, receiver)? {
+                self.store_failed = true;
+            }
+            return Ok(());
+        }
+        if let Some(pair) = self.accessor(p, name) {
+            return self.call_setter(pair, receiver, value);
+        }
+        self.store_failed = true;
+        Ok(())
+    }
+
     fn get_primitive(&mut self, obj: Value, name: Atom) -> Result<Value> {
         if obj.is_undefined() || obj.is_null() {
             return Err(Error::type_error(format!(
@@ -2101,6 +2180,12 @@ impl Vm {
             return self.set_primitive(obj, name, value);
         }
         let o = as_object(obj);
+        if !self.realms.is_empty()
+            && name != self.a_length
+            && let Some(p) = self.realm_proto(o)
+        {
+            return self.set_through(p, name, value, obj);
+        }
         if crate::proxy::chain_has_proxy(self, o) {
             if !crate::proxy::generic_set(self, obj, Key::Name(name), value, obj)? {
                 self.store_failed = true;
@@ -2153,11 +2238,7 @@ impl Vm {
         }
         // (An inherited setter's `this` the primitive.)
         let o = if obj.is_number() { self.number_prototype } else { self.boolean_prototype };
-        if let Some(pair) = self.accessor(o, name) {
-            return self.call_setter(pair, obj, value);
-        }
-        self.store_failed = true;
-        Ok(())
+        self.set_through(o, name, value, obj)
     }
 
     /// A store to string `o`'s property `name`: an inherited setter's
@@ -2182,6 +2263,13 @@ impl Vm {
             return self.get_primitive(obj, name);
         }
         let o = as_object(obj);
+        // (A primitive of another realm's: never cached.)
+        if !self.realms.is_empty()
+            && name != self.a_length
+            && let Some(p) = self.realm_proto(o)
+        {
+            return self.get_through(p, name, obj);
+        }
         // (Never cached through a proxy.)
         if crate::proxy::chain_has_proxy(self, o) {
             return crate::proxy::generic_get(self, obj, Key::Name(name), obj);
@@ -2254,6 +2342,12 @@ impl Vm {
             return self.set_primitive(obj, name, value);
         }
         let o = as_object(obj);
+        if !self.realms.is_empty()
+            && name != self.a_length
+            && let Some(p) = self.realm_proto(o)
+        {
+            return self.set_through(p, name, value, obj);
+        }
         if crate::proxy::chain_has_proxy(self, o) {
             if !crate::proxy::generic_set(self, obj, Key::Name(name), value, obj)? {
                 self.store_failed = true;
@@ -3502,7 +3596,8 @@ impl Vm {
     /// The shape a closure of `callee` gets.
     fn closure_shape(&self, callee: *const Code) -> *const Shape {
         match unsafe { (*callee).kind } {
-            4 | 6 if !self.generator_function_shape.is_null() => self.generator_function_shape,
+            4 if !self.generator_function_shape.is_null() => self.generator_function_shape,
+            6 if !self.async_generator_function_shape.is_null() => self.async_generator_function_shape,
             5 if !self.async_function_shape.is_null() => self.async_function_shape,
             1 | 5 => self.method_shape,
             _ => self.function_shape,
@@ -3746,6 +3841,7 @@ impl Vm {
             mark: Default::default(),
             pinned: Cell::new(true),
             lazy: None,
+            realm: 0,
         })
     }
 
@@ -3837,6 +3933,9 @@ impl Vm {
             let p = *Object::inline(f, 0);
             let proto = if p.is_cell() {
                 p
+            } else if !self.realms.is_empty() && code.realm != self.realm {
+                // (`f`'s realm's.)
+                crate::realm::intrinsic(self, code.realm, |vm| object_value(vm.object_prototype))
             } else {
                 object_value(self.object_prototype)
             };
@@ -3953,7 +4052,10 @@ impl Vm {
         let nt = std::mem::replace(&mut self.native_new_target, (Value::EMPTY, Value::EMPTY)).1;
         let a = self.a_prototype;
         let p = self.get(nt, a)?;
-        Ok(if crate::props::is_object(p) { p } else { default })
+        if crate::props::is_object(p) {
+            return Ok(p);
+        }
+        crate::realm::default_proto(self, nt, default)
     }
 
     /// Whether the native now called was called by `new`, taken: a
@@ -3990,6 +4092,13 @@ impl Vm {
                     // or a proxy's of proxies do, recurses natively alone.)
                     crate::interp::check_native_stack(self)?;
                     let native = (*(*o).code).native.unwrap();
+                    if !self.realms.is_empty() && (*(*o).code).realm != self.realm {
+                        return crate::realm::run_in(self, (*(*o).code).realm, |vm| {
+                            vm.constructing = false;
+                            vm.callee = o;
+                            native(vm, this, args)
+                        });
+                    }
                     self.constructing = false;
                     self.callee = o;
                     return native(self, this, args);
@@ -4008,6 +4117,15 @@ impl Vm {
                 if (*o).class == Class::Native && (*(*o).code).constructs {
                     crate::interp::check_native_stack(self)?;
                     let native = (*(*o).code).native.unwrap();
+                    if !self.realms.is_empty() && (*(*o).code).realm != self.realm {
+                        return crate::realm::run_in(self, (*(*o).code).realm, |vm| {
+                            vm.constructing = true;
+                            vm.callee = o;
+                            let r = native(vm, Value::UNDEFINED, args);
+                            vm.constructing = false;
+                            r
+                        });
+                    }
                     self.constructing = true;
                     self.callee = o;
                     let r = native(self, Value::UNDEFINED, args);
@@ -4021,7 +4139,8 @@ impl Vm {
 
     // ---- Loading and running ----
 
-    fn add_code(&mut self, c: Code) -> *const Code {
+    fn add_code(&mut self, mut c: Code) -> *const Code {
+        c.realm = self.realm;
         let b = Box::new(c);
         let p: *const Code = &*b;
         self.codes.push(b);
@@ -4195,6 +4314,8 @@ impl Vm {
                 self.max_frame = self.max_frame.max(f.nregs as usize + crate::interp::HEADER);
                 closures.push(f.closures);
                 let calls_left = match (scan.has_loop, recursive || scan.ops >= ENTRY_COMPILE_SIZE) {
+                    // (Several realms: every call checks the callee's.)
+                    _ if !self.realms.is_empty() => 0,
                     _ if interpreted => i32::MAX,
                     _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                     (true, _) => self.tier_calls,
@@ -4270,6 +4391,7 @@ impl Vm {
                     mark: crate::gc::code_epoch().into(),
                     pinned: Cell::new(false),
                     lazy: f.lazy.map(Box::new),
+                    realm: 0,
                 })
             })
             .collect();
@@ -4452,6 +4574,7 @@ impl Vm {
         .chain(self.mapped_args.iter().map(|m| m.o))
         .chain(std::iter::once(self.eval_function))
         .chain(self.error_prototypes.iter().copied())
+        .chain(self.shadow_roots.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)
         .collect();
@@ -4464,6 +4587,12 @@ impl Vm {
         v.extend(self.agent.roots());
         v.extend(self.temporal.roots());
         v.extend_from_slice(&self.single_chars);
+        for r in &self.realms {
+            r.trace(&mut v);
+        }
+        if !self.job_queue.is_null() {
+            v.push(object_value(self.job_queue));
+        }
         if let Some(Error(_, Some(e))) = &self.error {
             v.push(*e);
         }

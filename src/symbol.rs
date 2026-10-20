@@ -104,6 +104,13 @@ fn description(v: Value) -> Value {
 
 /// A new symbol, its key atom named `name` (a new one if `None`).
 fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
+    // (A well-known symbol is every realm's.)
+    if let Some(n) = &name
+        && let a = vm.intern(n)
+        && let Some(&o) = vm.symbols.get(&a)
+    {
+        return object_value(o);
+    }
     let name = name.unwrap_or_else(|| {
         vm.symbol_count += 1;
         format!("{SYMBOL_MARK}{}", vm.symbol_count)

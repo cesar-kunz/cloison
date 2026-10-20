@@ -2926,17 +2926,28 @@ impl Vm {
         {
             return Key::Index(d as u32);
         }
+        // A string's atom, once found, is kept in its `props_cap` (plus
+        // one), which a string doesn't use otherwise: a key looked up again
+        // isn't converted and hashed again (PdfJS's `map[command]`).
+        let string = string_len(key).is_some();
+        if string {
+            let cached = unsafe { (*as_object(key)).props_cap };
+            if cached != 0 {
+                return Key::Name(Atom(cached - 1));
+            }
+        }
         let units = crate::interp::to_string_units(key);
+        if let Some(i) = canonical_index(&units) {
+            return Key::Index(i);
+        }
         // (A lone surrogate kept, as the front end keeps it in a literal:
         // `js::lex::units_to_string`.)
         let name = crate::js::lex::units_to_string(&units);
-        if let Ok(i) = name.parse::<u32>()
-            && i != u32::MAX
-            && i.to_string() == name
-        {
-            return Key::Index(i);
+        let a = self.intern(&name);
+        if string && a.0 < u32::MAX {
+            unsafe { (*as_object(key)).props_cap = a.0 + 1 };
         }
-        Key::Name(self.intern(&name))
+        Key::Name(a)
     }
 
     /// `GetKeyed` miss: remember the receiver's shape (for the JIT: its
@@ -3117,10 +3128,18 @@ impl Vm {
     /// throw or call a bytecode getter (the interpreter does). A native
     /// getter (a typed array's `byteLength`) is called.
     pub(crate) fn get_named_rt(&mut self, obj: Value, name: Atom) -> Option<Value> {
-        if !obj.is_cell() {
+        // A number's or a boolean's: its prototype's (PdfJS's
+        // `command.charAt`, a number's or a string's, left at each number).
+        let holder = if obj.is_cell() {
+            as_object(obj)
+        } else if obj.is_number() {
+            self.number_prototype
+        } else if obj.is_bool() {
+            self.boolean_prototype
+        } else {
             return None;
-        }
-        if let Some(pair) = self.accessor(as_object(obj), name) {
+        };
+        if let Some(pair) = self.accessor(holder, name) {
             let g = unsafe { *(*as_object(pair)).elems };
             if g.is_cell() && unsafe { (*as_object(g)).class } != Class::Native {
                 return None;
@@ -5311,6 +5330,22 @@ pub fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
         }
         Some(std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize))
     }
+}
+
+/// The array index `units` spell canonically (`"7"`, not `"07"`), below
+/// 2^32 - 1.
+fn canonical_index(units: &[u16]) -> Option<u32> {
+    if units.is_empty() || units.len() > 10 || (units[0] == b'0' as u16 && units.len() > 1) {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &c in units {
+        if !(b'0' as u16..=b'9' as u16).contains(&c) {
+            return None;
+        }
+        n = n * 10 + (c - b'0' as u16) as u64;
+    }
+    (n < u32::MAX as u64).then_some(n as u32)
 }
 
 /// A string's length without flattening it (see [`Vm::new_cons`]).

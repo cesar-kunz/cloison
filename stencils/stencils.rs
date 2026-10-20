@@ -4605,6 +4605,30 @@ macro_rules! property_location {
             next!(s)
         });
         keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);
+        // `get_keyed_i_nc_` at a site given up on (`Prop::Runtime`): a hole
+        // or an index past the end through the runtime, not an exit.
+        stencil_slow!("get_keyed_i_nc_rt_", loc!($loc); |s| {
+            let p = get!($loc, s).to_bits() as *const u8;
+            let i = int(s.acc) as u32;
+            if i < *(p.add(32) as *const u32) {
+                let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+                if v.to_bits() != 0 {
+                    s.acc = v;
+                    next!(s)
+                }
+            }
+            slow!(s)
+        }; |s| {
+            // (Not `str_get_i_`'s code, which the compiler would make one.)
+            core::arch::asm!(concat!("/* get_keyed_i_nc_rt_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let key = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            let r = rt_call!(s, cloison_rt_get_keyed, get!($loc, s), key);
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
         keyed_load!($loc, "get_keyed_nc_", false, |s, o| true);
         keyed_load!($loc, "get_keyed_i_sh_", true, |s, o| guard_shape(s.tag, o).is_some());
         keyed_load!($loc, "get_keyed_sh_", false, |s, o| guard_shape(s.tag, o).is_some());

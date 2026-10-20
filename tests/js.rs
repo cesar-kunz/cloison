@@ -217,6 +217,26 @@ r.join(" ");
     );
 }
 
+/// Strict code's store to a read-only global (`NaN`, a non-writable
+/// property of the global object) or a string object's character throws;
+/// sloppy code's does nothing.
+#[test]
+fn strict_stores_to_read_only_globals_and_characters_throw() {
+    assert_eq!(
+        value(
+            r#"
+function t(f) { try { f(); return "ok"; } catch (e) { return e.name; } }
+Object.defineProperty(globalThis, "ro", { value: 1, writable: false });
+var s = new String("ab");
+var strict = (function () { "use strict"; return [t(() => { NaN = 1; }), t(() => { undefined = 1; }), t(() => { ro = 2; }), t(() => { s[0] = "x"; }), t(() => { s[5] = "y"; })]; })();
+var sloppy = [t(() => { NaN = 1; }), t(() => { ro = 2; }), t(() => { s[0] = "z"; })];
+strict.concat(sloppy, [ro, s[0], s[5]]).join(" ");
+"#
+        ),
+        "TypeError TypeError TypeError TypeError ok ok ok ok 1 a y"
+    );
+}
+
 /// A symbol's wrapper is an object to `JSON.stringify`; a symbol not in
 /// the registry is a `WeakMap`'s or a `WeakSet`'s key; `AggregateError`
 /// takes its options' `cause`, read before its errors.

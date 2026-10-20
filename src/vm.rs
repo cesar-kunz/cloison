@@ -2444,6 +2444,8 @@ impl Vm {
         let (ic, name) = code.ic(ic);
         let g = self.global;
         if self.read_only(g, name) {
+            // (In strict code a TypeError: `interp::strict_store_check`.)
+            self.store_failed = true;
             return Ok(());
         }
         unsafe {
@@ -3024,6 +3026,11 @@ impl Vm {
                     if (i as usize) < crate::typed::ta_length(o).unwrap_or(0) {
                         kind.store_value((*o).elems.cast(), i as usize, v);
                     }
+                    return Ok(());
+                }
+                // (A string object's characters are read-only.)
+                Class::Wrapper if wrapped(obj).and_then(string_units).is_some_and(|u| (i as usize) < u.len()) => {
+                    self.store_failed = true;
                     return Ok(());
                 }
                 _ => {}

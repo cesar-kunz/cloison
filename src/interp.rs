@@ -1691,7 +1691,12 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_sta_global(pc, acc, regs, tag) {
-        let r = with_top(regs, None, |vm| vm.set_global_miss(&*frame_code(regs), u16_at(pc, 1), acc));
+        let r = with_top(regs, None, |vm| {
+            vm.store_failed = false;
+            let code = &*frame_code(regs);
+            let r = vm.set_global_miss(code, u16_at(pc, 1), acc);
+            strict_store_check(vm, code, r, |vm| vm.atom_name(code.ic(u16_at(pc, 1)).1).to_string())
+        });
         next_or_throw!(Op::StaGlobal.size(), r.map(|()| acc))
     }
 

@@ -597,17 +597,25 @@ fn class_call_check(_: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// `for … of`'s iterator: `[iterable]`.
 fn get_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    crate::symbol::get_iterator(vm, a[0])
+    let it = crate::symbol::get_iterator(vm, a[0])?;
+    crate::symbol::record(vm, it)
 }
 
-/// `[iterator]`: its next value, or `HOLE` when done.
+/// `[record]` (`get_iterator`'s): its next value, or `HOLE` when done.
 fn iterator_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    Ok(crate::symbol::step(vm, a[0])?.unwrap_or(Value::HOLE))
+    let (it, next) = crate::symbol::record_parts(a[0]);
+    Ok(crate::symbol::step_with(vm, it, next)?.unwrap_or(Value::HOLE))
 }
 
-/// A `for … of` left early: `[iterator]` closed.
+/// A record's iterator (a record's or a value's: `undefined` once an
+/// array pattern's is done).
+fn iterator_of(r: Value) -> Value {
+    if crate::props::is_object(r) { crate::symbol::record_parts(r).0 } else { r }
+}
+
+/// A `for … of` left early: `[record]`'s iterator closed.
 fn iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    crate::symbol::close(vm, a[0]).map(|()| Value::UNDEFINED)
+    crate::symbol::close(vm, iterator_of(a[0])).map(|()| Value::UNDEFINED)
 }
 
 /// A `for … in`'s key `[object, key]` still to visit: the object (if not
@@ -623,7 +631,7 @@ fn for_in_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// A `for … of` left by an exception: `[iterator]` closed, its own errors
 /// ignored (the exception goes on).
 fn iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let _ = crate::symbol::close(vm, a[0]);
+    let _ = crate::symbol::close(vm, iterator_of(a[0]));
     Ok(Value::UNDEFINED)
 }
 
@@ -642,7 +650,8 @@ fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[0].is_undefined() {
         return Ok(out);
     }
-    while let Some(v) = crate::symbol::step(vm, a[0])? {
+    let (it, next) = crate::symbol::record_parts(a[0]);
+    while let Some(v) = crate::symbol::step_with(vm, it, next)? {
         crate::vm::array_push(vm, out, &[v])?;
     }
     Ok(out)
@@ -827,14 +836,16 @@ fn async_delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// `iterator.next(received)` (or with `mode`, `throw` or `return`): the
 /// result.
-fn delegate_call(vm: &mut Vm, it: Value, received: Value, mode: i32) -> Result<Value> {
-    let name = match mode {
-        crate::generator::THROW => "throw",
-        crate::generator::RETURN => "return",
-        _ => "next",
+/// (`record`'s `next`, read once; `throw` and `return` as they are then.)
+fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Result<Value> {
+    let (it, next) = crate::symbol::record_parts(record);
+    let m = match mode {
+        crate::generator::THROW | crate::generator::RETURN => {
+            let atom = vm.intern(if mode == crate::generator::THROW { "throw" } else { "return" });
+            vm.get(it, atom)?
+        }
+        _ => next,
     };
-    let atom = vm.intern(name);
-    let m = vm.get(it, atom)?;
     if m.is_undefined() || m.is_null() {
         match mode {
             crate::generator::RETURN => return crate::symbol::iter_result(vm, received, true),
@@ -1079,7 +1090,8 @@ fn async_iterator_kind(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `[v, sync]`: `v`'s async iterator (with `sync`, its iterator).
 fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[1] == Value::TRUE {
-        return crate::symbol::get_iterator(vm, a[0]);
+        let it = crate::symbol::get_iterator(vm, a[0])?;
+        return crate::symbol::record(vm, it);
     }
     let m = async_iterator_method(vm, a[0])?.unwrap_or(Value::UNDEFINED);
     if !crate::props::is_callable(m) {
@@ -1089,17 +1101,16 @@ fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !crate::props::is_object(it) {
         return Err(Error::type_error("Result of the Symbol.asyncIterator method is not an object"));
     }
-    Ok(it)
+    crate::symbol::record(vm, it)
 }
 
-/// `[iterator]`: `iterator.next()`.
+/// `[record]`: `iterator.next()`, by the `next` the record read.
 fn async_iterator_next(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let a_next = vm.intern("next");
-    let next = vm.get(a[0], a_next)?;
+    let (it, next) = crate::symbol::record_parts(a[0]);
     if !crate::props::is_callable(next) {
         return Err(Error::type_error("iterator.next is not a function"));
     }
-    call_function(vm, next, a[0], &[])
+    call_function(vm, next, it, &[])
 }
 
 /// A `for await`'s iterator result `[r]`: its value, or `HOLE` if done.
@@ -1119,12 +1130,13 @@ fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// A `for await` left early: `[iterator]`'s `return()` called, what it
 /// gives (awaited after), or `undefined` without one.
 fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let it = iterator_of(a[0]);
     let a_return = vm.intern("return");
-    let m = vm.get(a[0], a_return)?;
+    let m = vm.get(it, a_return)?;
     if m.is_undefined() || m.is_null() {
         return Ok(Value::UNDEFINED);
     }
-    call_function(vm, m, a[0], &[])
+    call_function(vm, m, it, &[])
 }
 
 /// A direct `eval`'s scope object: `[proto, block-scoped count, bindings'

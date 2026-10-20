@@ -1,6 +1,7 @@
 //! ECMAScript modules (ECMA-262 §16.2): a module graph loaded from files,
 //! linked, and evaluated (top-level `await` too); namespace objects;
-//! `import()` and `import.meta`; JSON modules (`with { type: "json" }`).
+//! `import()` and `import.meta`; JSON, text and bytes modules (`with {
+//! type: "json" }`, `"text"`, `"bytes"`).
 //!
 //! A module compiles to a script whose value is the module's function
 //! (see `parse::Parser::module_body`): a generator whose call (linking)
@@ -42,12 +43,24 @@ pub(crate) enum Status {
     Evaluated,
 }
 
+/// What a module is, by its request's `type`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Kind {
+    Js,
+    Json,
+    /// Its file as a string (UTF-8).
+    Text,
+    /// Its file's bytes, a `Uint8Array` on an immutable `ArrayBuffer`.
+    Bytes,
+}
+
 /// A module record (a Cyclic Module Record's fields).
 pub(crate) struct Record {
     /// Its file, canonical.
     path: String,
-    /// A JSON module (whose only export, `default`, is its value).
-    json: bool,
+    /// What it is: a JSON, text or bytes one's only export, `default`, is
+    /// its value.
+    kind: Kind,
     source: String,
     info: ModuleInfo,
     /// Each request's module (see `ModuleInfo::requests`).
@@ -90,7 +103,7 @@ impl Record {
 pub(crate) struct Modules {
     records: Vec<Record>,
     /// Each module's index, by its path and whether it is JSON.
-    by_path: std::collections::HashMap<(String, bool), usize>,
+    by_path: std::collections::HashMap<(String, Kind), usize>,
     /// The natives the closures here are made of (see [`Template`]).
     templates: Vec<*mut Object>,
     /// The next [[AsyncEvaluation]] order.
@@ -188,33 +201,43 @@ fn resolve_path(referrer: &str, specifier: &str) -> String {
     }
 }
 
-/// The module at `path` (a JSON one if `json`), loaded with the modules
-/// it requests (their graph), each once: its index. A file that can't be
+/// The module at `path` (of kind `kind`), loaded with the modules it
+/// requests (their graph), each once: its index. A file that can't be
 /// read is an error; a syntax error in one, a SyntaxError.
-fn load(vm: &mut Vm, path: &str, json: bool) -> Result<usize> {
-    if let Some(&m) = vm.modules.by_path.get(&(path.to_string(), json)) {
+fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
+    if let Some(&m) = vm.modules.by_path.get(&(path.to_string(), kind)) {
         return Ok(m);
     }
-    let source = std::fs::read_to_string(path).map_err(|e| Error::type_error(format!("Cannot load module '{path}': {e}")))?;
+    let bytes = std::fs::read(path).map_err(|e| Error::type_error(format!("Cannot load module '{path}': {e}")))?;
     let m = vm.modules.records.len();
     let mut info = ModuleInfo::default();
     let env = object_value(vm.new_object(Value::NULL));
-    if json {
-        let u: Vec<u16> = source.encode_utf16().collect();
-        let v = crate::json::parse_json(vm, &u)?;
+    let source = if kind == Kind::Bytes { String::new() } else { String::from_utf8_lossy(&bytes).into_owned() };
+    if kind == Kind::Js {
+        info = crate::js::module_info(&source, m as i32).map_err(|e| syntax(format!("{path}:{e}")))?;
+    } else {
+        let v = match kind {
+            Kind::Json => {
+                let u: Vec<u16> = source.encode_utf16().collect();
+                crate::json::parse_json(vm, &u)?
+            }
+            Kind::Text => {
+                let u: Vec<u16> = source.encode_utf16().collect();
+                vm.new_string(&u)
+            }
+            _ => crate::typed::immutable_bytes(vm, &bytes)?,
+        };
         let a = vm.intern("default");
         vm.set(env, a, v)?;
         info.local_exports.push(("default".into(), "default".into()));
-    } else {
-        info = crate::js::module_info(&source, m as i32).map_err(|e| syntax(format!("{path}:{e}")))?;
     }
     vm.modules.records.push(Record {
         path: path.to_string(),
-        json,
+        kind,
         source,
         info,
         requested: Vec::new(),
-        status: if json { Status::Linked } else { Status::New },
+        status: if kind == Kind::Js { Status::New } else { Status::Linked },
         env,
         namespace: Value::UNDEFINED,
         generator: Value::UNDEFINED,
@@ -230,31 +253,33 @@ fn load(vm: &mut Vm, path: &str, json: bool) -> Result<usize> {
         meta: Value::UNDEFINED,
         exports: Vec::new(),
     });
-    vm.modules.by_path.insert((path.to_string(), json), m);
+    vm.modules.by_path.insert((path.to_string(), kind), m);
     let requests = rec(vm, m).info.requests.clone();
     let r = (|| {
         for (specifier, ty) in &requests {
-            let json = request_type(ty.as_deref())?;
+            let k = request_type(ty.as_deref())?;
             let p = resolve_path(path, specifier);
-            let dep = load(vm, &p, json)?;
+            let dep = load(vm, &p, k)?;
             rec_mut(vm, m).requested.push(dep);
         }
         Ok(())
     })();
     if let Err(e) = r {
         // (Not kept: loading it again fails again, or not.)
-        vm.modules.by_path.remove(&(path.to_string(), json));
+        vm.modules.by_path.remove(&(path.to_string(), kind));
         return Err(e);
     }
     Ok(m)
 }
 
-/// Whether a request's `type` attribute asks for a JSON module (none: a
+/// The kind of module a request's `type` attribute asks for (none: a
 /// JavaScript one); another is unsupported, a TypeError.
-fn request_type(ty: Option<&str>) -> Result<bool> {
+fn request_type(ty: Option<&str>) -> Result<Kind> {
     match ty {
-        None => Ok(false),
-        Some("json") => Ok(true),
+        None => Ok(Kind::Js),
+        Some("json") => Ok(Kind::Json),
+        Some("text") => Ok(Kind::Text),
+        Some("bytes") => Ok(Kind::Bytes),
         Some(t) => Err(Error::type_error(format!("Unsupported module type \"{t}\""))),
     }
 }
@@ -700,7 +725,7 @@ fn inner_evaluate(vm: &mut Vm, m: usize, stack: &mut Vec<usize>, index: usize) -
 
 /// ExecuteModule, synchronously: its body run.
 fn execute(vm: &mut Vm, m: usize) -> Result<()> {
-    if rec(vm, m).json {
+    if rec(vm, m).kind != Kind::Js {
         return Ok(());
     }
     let g = rec(vm, m).generator;
@@ -819,7 +844,7 @@ fn module_rejected(vm: &mut Vm, m: usize, error: Value) -> Result<()> {
 /// it threw. Else: the promise of its evaluation.
 pub(crate) fn run_main(vm: &mut Vm, path: &str) -> std::result::Result<Value, std::result::Result<String, Error>> {
     let path = resolve_path(".", path);
-    let m = load(vm, &path, false).map_err(early)?;
+    let m = load(vm, &path, Kind::Js).map_err(early)?;
     link(vm, m).map_err(early)?;
     evaluate(vm, m).map_err(Err)
 }
@@ -897,7 +922,7 @@ fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let r = (|| {
         let spec = String::from_utf16_lossy(string_units(spec).unwrap_or(&[]));
         let ty = string_units(ty).map(String::from_utf16_lossy);
-        let json = request_type(ty.as_deref())?;
+        let kind = request_type(ty.as_deref())?;
         let k = referrer.as_i32_unchecked();
         let from = if k >= 0 {
             rec(vm, k as usize).path.clone()
@@ -905,7 +930,7 @@ fn import_job(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
             vm.modules.script_path.clone().unwrap_or_else(|| "./script".into())
         };
         let path = resolve_path(&from, &spec);
-        let m = load(vm, &path, json)?;
+        let m = load(vm, &path, kind)?;
         link(vm, m)?;
         let p = evaluate(vm, m)?;
         let done = closure(vm, Template::ImportDone, &[Value::from_i32(m as i32), resolve]);

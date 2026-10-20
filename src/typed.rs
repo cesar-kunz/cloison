@@ -166,6 +166,15 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
     Ok(o)
 }
 
+/// A `Uint8Array` of `bytes`, on an immutable buffer (a bytes module's
+/// value).
+pub(crate) fn immutable_bytes(vm: &mut Vm, bytes: &[u8]) -> Result<Value> {
+    let b = new_buffer_max(vm, bytes.len(), None)?;
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*b).elems.cast::<u8>(), bytes.len()) };
+    make_immutable(vm, b);
+    new_view(vm, TypedKind::U8, b, 0, Some(bytes.len()))
+}
+
 /// A new fixed-length buffer of `n` zero bytes.
 pub(crate) fn new_buffer(vm: &mut Vm, n: usize) -> *mut Object {
     new_buffer_max(vm, n, None).expect("buffer too large")

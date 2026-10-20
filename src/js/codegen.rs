@@ -794,6 +794,12 @@ fn references<'a>(f: &'a Function<'_>) -> Vec<&'a str> {
     out
 }
 
+/// Whether `s` is the `try` statement of a statement list with `using`
+/// declarations (see `ast::USING_CATCH`).
+fn using_try(s: &Stmt) -> bool {
+    matches!(&s.kind, StmtKind::Try(_, Some((c, _)), _) if c.starts_with(crate::js::ast::USING_CATCH))
+}
+
 /// Whether call `f(args)` is `g.apply(x, arguments)`.
 fn apply_arguments(f: &Expr, args: &[Expr]) -> bool {
     matches!(&f.kind, ExprKind::Member(_, m) if &**m == "apply")
@@ -1552,8 +1558,10 @@ impl<'a> Gen<'a> {
         };
         // (Past the registers of the variables: some of the scope object's
         // may be parameters, at the start.)
+        // (A name may be declared twice, as a hidden variable and as what
+        // binds it, a `catch`'s: its registers are counted, not the names.)
         let temp = if index == 0 {
-            1 + locals.len()
+            1 + decls[0].len()
         } else {
             1 + decls[index].iter().rposition(|n| !overflow.contains(n)).map_or(0, |k| k + 1)
         };
@@ -5370,7 +5378,7 @@ impl<'a> Gen<'a> {
             | StmtKind::Switch(..)
             | StmtKind::Try(..)
             | StmtKind::With(..)
-                if self.completion.is_some() && !std::ptr::eq(self.cleared, s) =>
+                if self.completion.is_some() && !std::ptr::eq(self.cleared, s) && !using_try(s) =>
             {
                 self.emit(Op::LdaUndefined, &[]);
                 self.star(self.completion.unwrap());

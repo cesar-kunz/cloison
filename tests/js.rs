@@ -7248,3 +7248,44 @@ class C { static { (() => { let await = 1; })(); (function await() {}); this.ok 
 C.ok;"#;
     assert_eq!(value(src), "2");
 }
+
+/// `using` and `await using`: resources disposed of, last first, when
+/// their block, function body or loop iteration ends however it ends;
+/// errors suppressing the earlier ones; not at a script's top level nor
+/// in a `case`.
+#[test]
+fn using_declarations() {
+    let src = r#"
+var log = [];
+function res(n, fail) { return { [Symbol.dispose]() { log.push("dispose " + n); if (fail) throw new Error(n); } }; }
+{ using a = res("a"), b = res("b"); log.push("body"); }
+function f() { using x = res("x"); return "ret"; }
+log.push(f());
+try { { using y = res("y", true); throw new TypeError("body"); } } catch (e) {
+  log.push(e.name + ":" + e.error.message + "/" + e.suppressed.name);
+}
+for (using z of [res("z1"), res("z2")]) log.push("iter");
+for (using w = res("w"); ;) { log.push("loop"); break; }
+var using = 5, of = [[1]];
+for (using of of [0]) log.push("ident " + using);
+for (const k of ["using q = null", "switch (1) { case 1: using q = null; }", "{ using [q] = null; }"]) {
+  try { eval(k); } catch (e) { log.push(e.name); }
+}
+log.push(eval("4; { using c = null; }"));
+(async function () {
+  { await using p = { async [Symbol.asyncDispose]() { log.push("async dispose"); } }; log.push("async body"); }
+  log.push("after");
+})().then(() => { globalThis.result = log.join(" | "); });
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("result");
+    let g = cloison::object::object_value(vm.global);
+    assert_eq!(
+        display(vm.get(g, a).unwrap()),
+        "body | dispose b | dispose a | dispose x | ret | dispose y | SuppressedError:y/TypeError | iter | dispose z1 | \
+         iter | dispose z2 | loop | dispose w | ident 1 | SyntaxError | SyntaxError | ReferenceError | 4 | async body | \
+         async dispose | after"
+    );
+}

@@ -165,6 +165,11 @@ pub(crate) fn new_state(vm: &mut Vm, async_: bool) -> Result<Value> {
     crate::array::new_array_of(vm, &[Value::from_bool(async_), Value::FALSE, resources])
 }
 
+/// Whether capability `state` has no resources.
+pub(crate) fn is_empty(state: Value) -> bool {
+    len(elem(state, RESOURCES)) == 0
+}
+
 // ---- Resources ----
 
 /// GetMethod(v, `key`): undefined if absent, a TypeError if not callable.

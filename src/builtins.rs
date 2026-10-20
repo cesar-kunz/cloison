@@ -1804,6 +1804,7 @@ fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
         5 => Value::from_bool(re.sticky),
         6 => Value::from_bool(re.unicode),
         7 => Value::from_bool(re.dot_all),
+        8 => Value::from_bool(re.has_indices),
         _ => Value::FALSE,
     })
 }
@@ -2014,6 +2015,7 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn regexp_flags(re: &crate::regexp::Regex) -> String {
     let mut f = String::new();
     for (on, c) in [
+        (re.has_indices, 'd'),
         (re.global, 'g'),
         (re.ignore_case, 'i'),
         (re.multiline, 'm'),
@@ -2140,7 +2142,42 @@ fn match_array(vm: &mut Vm, re: &crate::regexp::Regex, caps: &crate::regexp::Cap
     // `groups`: with named groups, each one's match.
     let groups = if re.names.is_empty() { Value::UNDEFINED } else { named_groups(vm, re, caps, s)? };
     vm.add_property_shaped(o, with_groups, groups);
+    if re.has_indices {
+        let indices = match_indices(vm, re, caps)?;
+        let a_indices = vm.intern("indices");
+        vm.create_data_property(arr, crate::vm::Key::Name(a_indices), indices)?;
+    }
     Ok(arr)
+}
+
+/// A `d` match's `indices`: each group's `[start, end]` (`undefined` if it
+/// didn't match), and their `groups` by name as `groups` has their matches.
+fn match_indices(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>]) -> Result<Value> {
+    let pair = |vm: &mut Vm, c: Option<(usize, usize)>| -> Result<Value> {
+        let Some((a, b)) = c else { return Ok(Value::UNDEFINED) };
+        let p = vm.new_array();
+        crate::vm::array_push(vm, p, &[Value::from_i32(a as i32), Value::from_i32(b as i32)])?;
+        Ok(p)
+    };
+    let indices = vm.new_array();
+    for &c in caps {
+        let p = pair(vm, c)?;
+        crate::vm::array_push(vm, indices, &[p])?;
+    }
+    let groups = if re.names.is_empty() {
+        Value::UNDEFINED
+    } else {
+        let groups = object_value(vm.new_object(Value::NULL));
+        for (name, g) in &re.names {
+            let p = pair(vm, caps.get(*g).copied().flatten())?;
+            let key = vm.intern(name);
+            vm.create_data_property(groups, crate::vm::Key::Name(key), p)?;
+        }
+        groups
+    };
+    let a_groups = vm.intern("groups");
+    vm.create_data_property(indices, crate::vm::Key::Name(a_groups), groups)?;
+    Ok(indices)
 }
 
 /// A match's named groups: a null-prototype object of their matches

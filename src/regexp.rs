@@ -29,6 +29,8 @@ pub struct Regex {
     pub unicode: bool,
     /// `s`: `.` matches line terminators too.
     pub dot_all: bool,
+    /// `d`: a match's array has the groups' `indices` too.
+    pub has_indices: bool,
     /// Where a match can start (see [`Starts`]).
     starts: Starts,
     /// A literal every match contains, if any (see [`Needle`]).
@@ -190,11 +192,11 @@ impl Regex {
     }
 
     /// `pattern`'s tree, group count and names, and `flags`
-    /// (`g`, `i`, `m`, `y`, `u`, `s`, in that order).
+    /// (`g`, `i`, `m`, `y`, `u`, `s`, `d`, in that order).
     #[allow(clippy::type_complexity)]
-    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 6]), String> {
+    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 7]), String> {
         let (mut global, mut ignore_case, mut multiline) = (false, false, false);
-        let (mut sticky, mut unicode, mut dot_all) = (false, false, false);
+        let (mut sticky, mut unicode, mut dot_all, mut has_indices) = (false, false, false, false);
         for f in flags.chars() {
             let seen = match f {
                 'g' => std::mem::replace(&mut global, true),
@@ -203,6 +205,7 @@ impl Regex {
                 'y' => std::mem::replace(&mut sticky, true),
                 'u' => std::mem::replace(&mut unicode, true),
                 's' => std::mem::replace(&mut dot_all, true),
+                'd' => std::mem::replace(&mut has_indices, true),
                 _ => return Err(format!("Invalid flags supplied to RegExp constructor '{flags}'")),
             };
             if seen {
@@ -226,12 +229,13 @@ impl Regex {
         if p.i != chars.len() {
             return Err(format!("Invalid regular expression: /{pattern}/: Unmatched ')'"));
         }
-        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all]))
+        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices]))
     }
 
     /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
-        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all]) = Regex::parse(pattern, flags)?;
+        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices]) =
+            Regex::parse(pattern, flags)?;
         let node = if unicode { code_points(node) } else { node };
         let mut re = Regex {
             node,
@@ -243,6 +247,7 @@ impl Regex {
             sticky,
             unicode,
             dot_all,
+            has_indices,
             starts: Starts::Anywhere,
             needle: None,
             prog: Program::default(),

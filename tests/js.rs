@@ -7181,3 +7181,43 @@ out.push([...g()].join("/"));
     let g = cloison::object::object_value(vm.global);
     assert_eq!(display(vm.get(g, a).unwrap()), "5/6,2,2");
 }
+
+/// `DisposableStack`, `AsyncDisposableStack` and `SuppressedError`:
+/// resources disposed of last first, errors suppressing the earlier ones.
+#[test]
+fn disposable_stacks() {
+    let src = r#"
+var log = [];
+var s = new DisposableStack();
+s.use({ [Symbol.dispose]() { log.push("use"); } });
+s.adopt(7, v => log.push("adopt " + v));
+s.defer(() => log.push("defer"));
+var moved = s.move();
+log.push(s.disposed, moved.disposed);
+moved.dispose();
+log.push(moved.disposed);
+var t = new DisposableStack();
+t.defer(() => { throw new TypeError("first"); });
+t.defer(() => { throw new RangeError("second"); });
+try { t.dispose(); } catch (e) {
+  log.push(e.name, e.error.name, e.suppressed.name, Object.keys(e).length);
+}
+try { new DisposableStack().use(1); } catch (e) { log.push(e.name); }
+try { s.use(null); } catch (e) { log.push(e.name); }
+var a = new AsyncDisposableStack();
+a.use({ [Symbol.dispose]() { log.push("sync in async"); } });
+a.use({ async [Symbol.asyncDispose]() { log.push("async"); } });
+a.disposeAsync().then(() => { log.push(a.disposed); globalThis.result = log.join(); });
+var e = new SuppressedError(1, 2, "m");
+log.push(e.error, e.suppressed, e.message, e instanceof Error);
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("result");
+    let g = cloison::object::object_value(vm.global);
+    assert_eq!(
+        display(vm.get(g, a).unwrap()),
+        "true,false,defer,adopt 7,use,true,SuppressedError,TypeError,RangeError,0,TypeError,ReferenceError,async,1,2,m,true,sync in async,true"
+    );
+}

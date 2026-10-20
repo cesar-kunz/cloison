@@ -121,6 +121,9 @@ pub enum Class {
     /// An iterator helper, or `Iterator.from`'s wrapper: `code`'s bits
     /// are its state, a hidden array (see `iterator`).
     IteratorHelper,
+    /// A `DisposableStack` or `AsyncDisposableStack`: `code`'s bits are
+    /// its state, a hidden array (see `dispose`).
+    DisposableStack,
 }
 
 // (Stencils read a cell's class byte: a string's 4, a symbol's 9, a
@@ -147,6 +150,7 @@ impl Class {
                 | Class::BigInt
                 | Class::ArrayIterator
                 | Class::IteratorHelper
+                | Class::DisposableStack
                 | Class::Generator
                 | Class::Proxy
                 | Class::WeakRef

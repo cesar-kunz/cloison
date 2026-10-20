@@ -132,21 +132,21 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,767 | 17,067 | 98.2% |
-| ES2015 | 8,825 | 9,197 | 96.0% |
+| ES5 (untagged) | 16,794 | 17,067 | 98.4% |
+| ES2015 | 8,937 | 9,197 | 97.2% |
 | ES2016 | 97 | 100 | 97.0% |
-| ES2017 | 695 | 741 | 93.8% |
-| ES2018 | 4,715 | 4,825 | 97.7% |
+| ES2017 | 699 | 741 | 94.3% |
+| ES2018 | 4,735 | 4,825 | 98.1% |
 | ES2019 | 159 | 161 | 98.8% |
-| ES2020 | 1,964 | 2,020 | 97.2% |
-| ES2021 | 602 | 630 | 95.6% |
-| ES2022 | 5,159 | 5,374 | 96.0% |
+| ES2020 | 1,979 | 2,020 | 98.0% |
+| ES2021 | 617 | 630 | 97.9% |
+| ES2022 | 5,170 | 5,374 | 96.2% |
 | ES2023 | 284 | 284 | 100.0% |
-| ES2024 | 839 | 843 | 99.5% |
-| ES2025 | 978 | 998 | 98.0% |
-| ES2026 | 738 | 745 | 99.1% |
-| Stage 3 proposals | 5,552 | 5,650 | 98.3% |
-| **all** | **47,374** | **48,635** | **97.4%** |
+| ES2024 | 840 | 843 | 99.6% |
+| ES2025 | 980 | 998 | 98.2% |
+| ES2026 | 745 | 745 | 100.0% |
+| Stage 3 proposals | 5,625 | 5,650 | 99.6% |
+| **all** | **47,661** | **48,635** | **98.0%** |
 
 The `Atomics` tests that need several agents run them as test262's
 `$262.agent` has them: each agent a thread with a VM of its own, sharing
@@ -157,10 +157,14 @@ Temporal has the ISO 8601 calendar alone (as without ECMA-402), and
 takes named time zones from the system's database (`TZDIR`, else
 `/usr/share/zoneinfo`).
 
-The gaps are mostly whole features: realms (`ShadowRealm`,
-`$262.createRealm`), decorators, non-ASCII identifiers beyond a rough
-approximation (no Unicode ID tables), and early errors for invalid
-syntax that the parser accepts.
+Realms (`ShadowRealm`, `$262.createRealm`) share the one heap: each
+has its own global object and intrinsics, which a call of another
+realm's function swaps in for the call (`src/realm.rs`). Until a second
+realm is made, nothing checks; after, the JIT is off.
+
+The gaps are mostly whole features: decorators, non-ASCII identifiers
+beyond a rough approximation (no Unicode ID tables), and early errors
+for invalid syntax that the parser accepts.
 
 ## Results
 

@@ -2082,12 +2082,16 @@ impl<'a> Parser<'_, 'a, '_> {
                     // `codegen::upvalues`), never called: its upvalues are
                     // theirs, which the scope object's accessors read and
                     // write.
-                    if self.current != 0 && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
+                    // (A script's too where it sees any: its `let`s and
+                    // the like, which aren't the global object's.)
+                    if !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
                         let mut visible = self.eval_visible(pos);
-                        let end = self.toks[self.i - 1].pos;
-                        let f = self.eval_bindings(&visible, end);
-                        visible.push(Expr { kind: ExprKind::Function(f), pos });
-                        args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
+                        if self.current != 0 || !visible.is_empty() {
+                            let end = self.toks[self.i - 1].pos;
+                            let f = self.eval_bindings(&visible, end);
+                            visible.push(Expr { kind: ExprKind::Function(f), pos });
+                            args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
+                        }
                     }
                 }
                 e = Expr {

@@ -3029,6 +3029,11 @@ impl Vm {
                 }
                 c if c.no_elements() => return Ok(()),
                 Class::TypedArray => {
+                    // (An immutable buffer's element can't be set.)
+                    if crate::typed::is_immutable_view(o) {
+                        self.store_failed = true;
+                        return Ok(());
+                    }
                     // (Converted first: the conversion may detach or
                     // shrink its buffer.)
                     let kind = crate::object::TypedKind::from_u8((*o).kind);

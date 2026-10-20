@@ -7086,3 +7086,25 @@ r.join(" | ");"#;
          true 6,7 6,7 | TypeError | 140000 1,2,3,4,0,0"
     );
 }
+
+/// `Error.prototype.stack`: an accessor whose getter gives an error's
+/// kind and message, and whose setter makes the receiver's own `stack`.
+#[test]
+fn error_stack_accessor() {
+    let src = r#"
+var r = [];
+var d = Object.getOwnPropertyDescriptor(Error.prototype, "stack");
+r.push(typeof d.get, d.get.name, d.set.name, d.enumerable, d.configurable);
+var e = new TypeError("bad");
+r.push(e.stack, Object.prototype.hasOwnProperty.call(e, "stack"), d.get.call({}));
+e.stack = "custom";
+r.push(e.stack, Object.getOwnPropertyDescriptor(e, "stack").enumerable);
+try { d.set.call(e, 1); } catch (x) { r.push(x.name); }
+try { Error.prototype.stack = ""; } catch (x) { r.push(x.name); }
+try { d.get.call(1); } catch (x) { r.push(x.name); }
+r.join();"#;
+    assert_eq!(
+        value(src),
+        "function,get stack,set stack,false,true,TypeError: bad,false,,custom,true,TypeError,TypeError,TypeError"
+    );
+}

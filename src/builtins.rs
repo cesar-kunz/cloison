@@ -280,6 +280,10 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.add_property_with(proto, a_message, empty, DONT_ENUM);
         if k == 0 {
             vm.define_native(proto, "toString", error_to_string, 0, any, false);
+            let get = vm.native_function("get stack", error_stack_get, 0, any, false);
+            let set = vm.native_function("set stack", error_stack_set, 1, any, false);
+            let a_stack = vm.intern("stack");
+            vm.define_accessor(proto, a_stack, Some(object_value(get)), Some(object_value(set)), DONT_ENUM);
         }
         vm.error_prototypes.push(proto);
     }
@@ -2926,6 +2930,59 @@ fn error_is_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(
         crate::props::is_object(v) && unsafe { (*as_object(v)).flags } & crate::object::ERROR != 0,
     ))
+}
+
+/// `get Error.prototype.stack`: for an error object, a string of its kind
+/// and its own `message` (cloison records no stack trace); `undefined`
+/// for any other object.
+fn error_stack_get(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    if !crate::props::is_object(this) {
+        return Err(Error::type_error("Error.prototype.stack getter called on a non-object"));
+    }
+    let o = as_object(this);
+    if unsafe { (*o).flags } & crate::object::ERROR == 0 {
+        return Ok(Value::UNDEFINED);
+    }
+    // (Without running code: the kind by the prototype the error was made
+    // with, if it still has it, and `message` if an own data property.)
+    let proto = unsafe { (*(*o).shape).proto };
+    let k = vm.error_prototypes.iter().position(|&p| object_value(p) == proto).unwrap_or(0);
+    let mut s: Vec<u16> = ERROR_KINDS[k].encode_utf16().collect();
+    let a_message = vm.intern("message");
+    if let Some(crate::props::Desc { value: Some(m), .. }) = vm.own_property(o, crate::vm::Key::Name(a_message))
+        && let Some(u) = string_units(m)
+        && !u.is_empty()
+    {
+        s.extend(": ".encode_utf16());
+        s.extend_from_slice(u);
+    }
+    Ok(vm.new_string(&s))
+}
+
+/// `set Error.prototype.stack`: a string `v` as the receiver's own `stack`
+/// (SetterThatIgnoresPrototypeProperties: never on `Error.prototype`).
+fn error_stack_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if !crate::props::is_object(this) {
+        return Err(Error::type_error("Error.prototype.stack setter called on a non-object"));
+    }
+    let v = arg(a, 0);
+    if string_units(v).is_none() {
+        return Err(Error::type_error("Error.prototype.stack must be set to a string"));
+    }
+    let o = as_object(this);
+    if o == vm.error_prototypes[0] {
+        return Err(Error::type_error("Cannot set Error.prototype.stack"));
+    }
+    let key = crate::vm::Key::Name(vm.intern("stack"));
+    if crate::proxy::get_own_property(vm, o, key)?.is_none() {
+        let d = crate::props::Desc::data(v, true, true, true);
+        if !crate::proxy::define_property(vm, o, key, &d)? {
+            return Err(Error::type_error("Cannot define property 'stack'"));
+        }
+    } else if !crate::proxy::generic_set(vm, this, key, v, this)? {
+        return Err(Error::type_error("Cannot assign to read only property 'stack'"));
+    }
+    Ok(Value::UNDEFINED)
 }
 
 /// A new error object of kind `k`, with its own `message` if given.

@@ -47,11 +47,11 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("object_rest", object_rest),
     ("direct_eval", direct_eval),
     ("eval_env", eval_env),
-    ("null_proto", null_proto),
+    ("null_object", null_object),
     ("to_object", to_object),
     ("with_set_strict", with_set_strict),
     ("with_has", with_has),
-    ("fix_scope", fix_scope),
+    ("scope_var", scope_var),
     ("async_from_sync", |vm, a| crate::promise::async_from_sync(vm, a[0])),
     ("generator_mode", generator_mode),
     ("delegate_step", delegate_step),
@@ -853,10 +853,12 @@ fn eval_env(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(vm.eval_envs.last().and_then(|e| e.get(k).copied()).unwrap_or(Value::UNDEFINED))
 }
 
-/// `[o]` without a prototype.
-fn null_proto(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    vm.set_prototype_of(as_object(a[0]), Value::NULL);
-    Ok(a[0])
+/// A plain object without a prototype, with room for `[capacity]`
+/// properties. (Made so, not given a null prototype afterwards: changing
+/// a prototype drops every function's compiled code.)
+fn null_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let capacity = a[0].as_number().unwrap_or(0.0) as u32;
+    Ok(object_value(vm.new_object_with(crate::object::Class::Plain, Value::NULL, capacity)))
 }
 
 /// ToObject: `[v]` (a `with` statement's object).
@@ -864,15 +866,14 @@ fn to_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(object_value(vm.to_object(a[0])?))
 }
 
-/// `[scope]`: a function's scope object's bindings, its own (parameters,
-/// `var`s, functions), not deletable.
-fn fix_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let o = as_object(a[0]);
-    let keys: Vec<Key> = vm.own_keys(o).into_iter().map(|(k, _)| k).collect();
-    for k in keys {
-        let d = Desc { configurable: Some(false), ..Default::default() };
-        vm.define_own_property(o, k, &d)?;
-    }
+/// `[scope, name, value]`: a binding of a function's scope object, its
+/// own (a parameter, `var` or function), not deletable. (Added so, not
+/// made non-configurable afterwards: changing a property's attributes
+/// drops every function's compiled code.)
+fn scope_var(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let name = vm.property_key(a[1]);
+    let d = Desc::data(a[2], true, true, false);
+    vm.define_own_property(as_object(a[0]), name, &d)?;
     Ok(a[0])
 }
 

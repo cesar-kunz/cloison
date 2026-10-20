@@ -1678,6 +1678,13 @@ impl<'a> Gen<'a> {
             if self.f.module {
                 // (A module's: its loader's, which other modules read.)
                 self.ldar(self.locals[MODULE_ENV]);
+            } else if has_eval {
+                // (No prototype: no `toString` and such for names to find
+                // in it.)
+                let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as i32;
+                self.lda_smi(cap);
+                self.star(env);
+                self.intrinsic("null_object", env, 1);
             } else {
                 let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
                 let ic = self.auto_ic(&format!("[]{}", cap));
@@ -1685,8 +1692,6 @@ impl<'a> Gen<'a> {
             }
             self.star(env);
             if has_eval {
-                // (No `toString` and such for names to find in it.)
-                self.intrinsic("null_proto", env, 1);
                 let withs = std::mem::take(&mut self.withs);
                 self.ldar(env);
                 let r = self.store_raw(EVAL_SCOPE, self.f.pos);
@@ -1696,7 +1701,7 @@ impl<'a> Gen<'a> {
                 // see `Parser::new_expr`.)
                 if self.f.uses_new_target && !self.f.arrow {
                     self.load_raw("%newtarget", self.f.pos)?;
-                    self.named(Op::SetNamed, env, "%newtarget");
+                    self.scope_var(env, "%newtarget")?;
                 }
             }
             for &n in self.overflow {
@@ -1705,12 +1710,11 @@ impl<'a> Gen<'a> {
                     Some(k) => self.ldar(k as u8 + 1),
                     None => self.emit(Op::LdaUndefined, &[]),
                 }
-                self.named(Op::SetNamed, env, n);
-            }
-            // (Its own bindings can't be deleted, from an `eval` in it;
-            // those an `eval` declares can.)
-            if has_eval {
-                self.intrinsic("fix_scope", env, 1);
+                if has_eval {
+                    self.scope_var(env, n)?;
+                } else {
+                    self.named(Op::SetNamed, env, n);
+                }
             }
         }
         // Each boxed variable's first box (see `boxed_lexicals`).
@@ -2493,6 +2497,23 @@ impl<'a> Gen<'a> {
                 self.closures.len() - 1
             });
         self.emit(Op::CreateClosure, &[Arg::Index(i as u16)]);
+    }
+
+    /// The accumulator stored to variable `name` of scope object `env`, a
+    /// direct `eval`'s function's: its own bindings can't be deleted from
+    /// an `eval` in it (those an `eval` declares can).
+    fn scope_var(&mut self, env: u8, name: &str) -> R<()> {
+        let (m, pos) = (self.temp, self.f.pos);
+        let a = self.alloc(pos)?;
+        let k = self.alloc(pos)?;
+        let v = self.alloc(pos)?;
+        self.star(v);
+        self.mov(env, a);
+        self.string(name);
+        self.star(k);
+        self.intrinsic("scope_var", a, 3);
+        self.temp = m;
+        Ok(())
     }
 
     fn alloc(&mut self, pos: Pos) -> R<u8> {

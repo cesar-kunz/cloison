@@ -15,10 +15,19 @@
 //! element type, `code` its buffer, and `elems_cap` the length it was
 //! made with, or [`TRACKING`] if it follows its resizable buffer's length.
 //! A `DataView` is laid out the same way, in bytes.
+//!
+//! An immutable buffer (ES2026: `transferToImmutable`,
+//! `sliceToImmutable`) is a fixed-length one whose `code` is itself; its
+//! views have flag `IMMUTABLE_VIEW`, and nothing writes through them. From
+//! the first one on, compiled code leaves typed arrays' elements to the
+//! runtime, as it does once a buffer has been detached
+//! (`Vm::views_detached`).
 
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_number};
-use crate::object::{Class, DETACHED, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, TypedKind, as_object, object_value};
+use crate::object::{
+    Class, DETACHED, DONT_DELETE, DONT_ENUM, IMMUTABLE_VIEW, Object, READ_ONLY, TypedKind, as_object, object_value,
+};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Error, NativeFn, Result, Vm, string_units};
@@ -101,6 +110,36 @@ pub(crate) fn is_resizable(b: *mut Object) -> bool {
     unsafe { (*b).flags & RESIZABLE != 0 }
 }
 
+/// Whether buffer `b` is immutable.
+pub(crate) fn is_immutable(b: *mut Object) -> bool {
+    !is_resizable(b) && unsafe { (*b).code } as *mut Object == b
+}
+
+/// Whether view `o` (a typed array or a `DataView`) is of an immutable
+/// buffer.
+pub(crate) fn is_immutable_view(o: *mut Object) -> bool {
+    unsafe { (*o).flags & IMMUTABLE_VIEW != 0 }
+}
+
+/// A TypeError unless view `o` is of a mutable buffer (ValidateTypedArray
+/// for a write, before anything else is read).
+pub(crate) fn writable_view(o: *mut Object) -> Result<()> {
+    if is_immutable_view(o) {
+        return Err(Error::type_error("Cannot write to an immutable ArrayBuffer"));
+    }
+    Ok(())
+}
+
+/// Make fixed-length buffer `b` immutable: from now on compiled code takes
+/// typed arrays' elements through the runtime (see the module docs).
+fn make_immutable(vm: &mut Vm, b: *mut Object) {
+    unsafe { (*b).code = b.cast() };
+    if !vm.views_detached {
+        vm.views_detached = true;
+        vm.bump_code_epoch();
+    }
+}
+
 /// A view's buffer.
 pub(crate) fn buffer_of(o: *mut Object) -> *mut Object {
     unsafe { (*o).code as *mut Object }
@@ -167,6 +206,9 @@ fn refresh_views(b: *mut Object) {
 /// code, dropped now and compiled through the runtime: see
 /// `Vm::views_detached`).
 pub(crate) fn detach(vm: &mut Vm, b: *mut Object) -> Result<()> {
+    if is_immutable(b) {
+        return Err(Error::type_error("Cannot detach an immutable ArrayBuffer"));
+    }
     unsafe {
         (*b).elems_len = 0;
         (*b).flags |= DETACHED;
@@ -228,6 +270,9 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
         (*o).code = b.cast();
         (*o).elems_cap = len.map_or(TRACKING, |n| n as u32);
         (*o).elems_len = if class == Class::TypedArray { ta_length(o) } else { view_byte_length(o) }.unwrap_or(0) as u32;
+        if is_immutable(b) {
+            (*o).flags |= IMMUTABLE_VIEW;
+        }
     }
     register(vm, b, object_value(o))?;
     Ok(object_value(o))
@@ -355,6 +400,9 @@ fn buffer_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if is_detached(o) {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the new buffer is detached"));
     }
+    if is_immutable(o) {
+        return Err(Error::type_error("ArrayBuffer.prototype.slice: the new buffer is immutable"));
+    }
     if o == b {
         return Err(Error::type_error("ArrayBuffer.prototype.slice: the species returned the same buffer"));
     }
@@ -381,8 +429,8 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
         v if v.is_undefined() => (unsafe { (*b).elems_len }) as usize,
         v => to_index(vm, v)?,
     };
-    if is_detached(b) {
-        return Err(Error::type_error("ArrayBuffer.prototype.transfer: the buffer is detached"));
+    if is_detached(b) || is_immutable(b) {
+        return Err(Error::type_error("ArrayBuffer.prototype.transfer: the buffer is detached or immutable"));
     }
     let max = (!fixed && is_resizable(b)).then(|| unsafe { (*b).elems_cap } as usize);
     if max.is_some_and(|m| n > m) {
@@ -393,6 +441,54 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
     unsafe { std::ptr::copy_nonoverlapping((*b).elems.cast::<u8>(), (*out).elems.cast::<u8>(), count) };
     detach(vm, b)?;
     Ok(object_value(out))
+}
+
+/// `transferToImmutable(newLength)`: a new immutable buffer with the bytes
+/// (zeros past them), this one detached.
+fn buffer_transfer_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let b = this_buffer(this, "transferToImmutable")?;
+    let n = match arg(a, 0) {
+        v if v.is_undefined() => (unsafe { (*b).elems_len }) as usize,
+        v => to_index(vm, v)?,
+    };
+    if is_detached(b) || is_immutable(b) {
+        return Err(Error::type_error("ArrayBuffer.prototype.transferToImmutable: the buffer is detached or immutable"));
+    }
+    let out = new_buffer_max(vm, n, None)?;
+    let count = n.min(unsafe { (*b).elems_len } as usize);
+    unsafe { std::ptr::copy_nonoverlapping((*b).elems.cast::<u8>(), (*out).elems.cast::<u8>(), count) };
+    detach(vm, b)?;
+    make_immutable(vm, out);
+    Ok(object_value(out))
+}
+
+/// `sliceToImmutable(start, end)`: a new immutable buffer with those
+/// bytes, the bounds from the length before their conversions (a
+/// RangeError if it shrank below them since).
+fn buffer_slice_immutable(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let b = this_buffer(this, "sliceToImmutable")?;
+    if is_detached(b) {
+        return Err(Error::type_error("ArrayBuffer.prototype.sliceToImmutable: the buffer is detached"));
+    }
+    let len = unsafe { (*b).elems_len } as usize;
+    let first = relative(integer(vm, arg(a, 0))?, len);
+    let end = arg(a, 1);
+    let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
+    let n = last.saturating_sub(first);
+    if is_detached(b) {
+        return Err(Error::type_error("ArrayBuffer.prototype.sliceToImmutable: the buffer is detached"));
+    }
+    if first + n > unsafe { (*b).elems_len } as usize {
+        return Err(Error::range_error("ArrayBuffer.prototype.sliceToImmutable: the buffer shrank"));
+    }
+    let out = new_buffer_max(vm, n, None)?;
+    unsafe { std::ptr::copy_nonoverlapping((*b).elems.cast::<u8>().add(first), (*out).elems.cast::<u8>(), n) };
+    make_immutable(vm, out);
+    Ok(object_value(out))
+}
+
+fn buffer_immutable(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(is_immutable(this_buffer(this, "immutable")?)))
 }
 
 fn buffer_transfer(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -481,6 +577,10 @@ fn constructor_of(vm: &mut Vm, k: TypedKind) -> Result<Value> {
 fn create_from(vm: &mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Result<*mut Object> {
     let out = crate::intrinsics::construct(vm, c, args)?;
     let (o, len) = validate(out)?;
+    // (With `n`, the caller writes into it.)
+    if n.is_some() {
+        writable_view(o)?;
+    }
     if n.is_some_and(|n| len < n) {
         return Err(Error::type_error("The typed array constructor made too short a typed array"));
     }
@@ -741,6 +841,7 @@ fn typed_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn typed_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = validate(this)?;
+    writable_view(o)?;
     let to = relative(integer(vm, arg(a, 0))?, len);
     let from = relative(integer(vm, arg(a, 1))?, len);
     let end = arg(a, 2);
@@ -818,6 +919,7 @@ fn typed_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = validate(this)?;
+    writable_view(o)?;
     let v = to_element(vm, kind_of(o), arg(a, 0))?;
     let s = relative(integer(vm, arg(a, 1))?, len);
     let end = arg(a, 2);
@@ -972,6 +1074,7 @@ fn typed_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn typed_reverse(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = validate(this)?;
+    writable_view(o)?;
     for i in 0..len / 2 {
         let (x, y) = (get(o, i), get(o, len - 1 - i));
         put(o, i, y);
@@ -984,6 +1087,7 @@ fn typed_reverse(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// array-like's) stored from `offset` on.
 fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
+    writable_view(o)?;
     let offset = integer(vm, arg(a, 1))?;
     if offset < 0.0 {
         return Err(Error::range_error("offset is out of bounds"));
@@ -1145,6 +1249,7 @@ fn values(vm: &mut Vm, o: *mut Object, len: usize) -> Vec<Value> {
 fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let cmp = comparator(a)?;
     let (o, len) = validate(this)?;
+    writable_view(o)?;
     vm.handle_scope(|vm| {
         let mut values = values(vm, o, len);
         sort_numbers(vm, &mut values, cmp)?;
@@ -1265,6 +1370,7 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, abp, "maxByteLength", buffer_max_byte_length);
     getter(vm, abp, "resizable", buffer_resizable);
     getter(vm, abp, "detached", buffer_detached);
+    getter(vm, abp, "immutable", buffer_immutable);
     vm.define_natives(
         abp,
         &[
@@ -1272,6 +1378,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("resize", buffer_resize, 1),
             ("transfer", buffer_transfer, 0),
             ("transferToFixedLength", buffer_transfer_fixed, 0),
+            ("transferToImmutable", buffer_transfer_immutable, 0),
+            ("sliceToImmutable", buffer_slice_immutable, 2),
         ],
     );
     vm.define_native(ab, "isView", buffer_is_view, 1, any, false);

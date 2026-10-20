@@ -276,6 +276,7 @@ fn written(vm: &mut Vm, o: *mut Object, d: Decoded) -> Result<Value> {
 
 fn set_from_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = uint8_array(this)?;
+    crate::typed::writable_view(o)?;
     let s = string_arg(arg(a, 0))?;
     let opts = options(arg(a, 1))?;
     let url = url_alphabet(vm, opts)?;
@@ -287,6 +288,7 @@ fn set_from_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn set_from_hex(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = uint8_array(this)?;
+    crate::typed::writable_view(o)?;
     let s = string_arg(arg(a, 0))?;
     let max = bytes_of(o)?.len();
     let d = decode_hex(s, max);

@@ -975,6 +975,7 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 /// the offset checked (as the spec orders it).
 fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_view(this)?;
+    crate::typed::writable_view(o)?;
     let i = to_index(vm, arg(a, 0))?;
     let is_big = T == 8 || T == 9;
     let big = if is_big { crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?) } else { 0 };

@@ -349,6 +349,9 @@ pub const FN_NAME_DELETED: u8 = 128;
 /// An `ArrayBuffer` detached (`$262.detachArrayBuffer`): its views throw;
 /// `LENGTH_READ_ONLY`'s bit, as buffers aren't arrays.
 pub const DETACHED: u8 = 64;
+/// A typed array or `DataView` of an immutable buffer (see `typed`):
+/// stores into it fail; `LENGTH_READ_ONLY`'s bit, as views aren't arrays.
+pub const IMMUTABLE_VIEW: u8 = 64;
 /// A plain object made by `JSON.rawJSON` ([[IsRawJSON]]);
 /// `LENGTH_READ_ONLY`'s bit, as plain objects aren't arrays.
 pub const RAW_JSON: u8 = 64;

@@ -231,7 +231,10 @@ impl Vm {
                         Class::TypedArray => {
                             return ((i as usize) < crate::typed::ta_length(o).unwrap_or(0)).then(|| {
                                 let kind = crate::object::TypedKind::from_u8((*o).kind);
-                                Desc::data(kind.load((*o).elems.cast(), i as usize), true, true, true)
+                                // (An immutable buffer's: neither writable nor
+                                // configurable.)
+                                let mutable = !crate::typed::is_immutable_view(o);
+                                Desc::data(kind.load((*o).elems.cast(), i as usize), mutable, true, mutable)
                             });
                         }
                         c if c.no_elements() => return None,
@@ -582,6 +585,11 @@ impl Vm {
                     match class {
                         Class::String => return Ok(false),
                         c if c.no_elements() => return Ok(false),
+                        // (An immutable buffer's element: what validating it
+                        // against its current one let through changes nothing.)
+                        Class::TypedArray if crate::typed::is_immutable_view(o) => {
+                            return Ok((i as usize) < crate::typed::ta_length(o).unwrap_or(0));
+                        }
                         Class::TypedArray => {
                             let valid = (i as usize) < crate::typed::ta_length(o).unwrap_or(0);
                             if !valid || full.is_accessor() || full.attrs() != 0 {

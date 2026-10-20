@@ -1778,7 +1778,8 @@ handlers! {
             let i = key.as_i32_unchecked() as u32;
             if (*o).class == Class::TypedArray
                 && i < (*o).elems_len
-                && (!(*frame_vm(regs)).views_detached || !crate::typed::is_detached(crate::typed::buffer_of(o)))
+                && (!(*frame_vm(regs)).views_detached
+                    || !crate::typed::is_detached(crate::typed::buffer_of(o)) && !crate::typed::is_immutable_view(o))
                 && !crate::object::TypedKind::from_u8((*o).kind).is_big()
             {
                 crate::vm::note_bytes(ic_at(regs, pc, 3), o);

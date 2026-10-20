@@ -1632,6 +1632,11 @@ impl<'a> Gen<'a> {
                 }
                 self.named(Op::SetNamed, env, n);
             }
+            // (Its own bindings can't be deleted, from an `eval` in it;
+            // those an `eval` declares can.)
+            if has_eval {
+                self.intrinsic("fix_scope", env, 1);
+            }
         }
         // Each boxed variable's first box (see `boxed_lexicals`).
         let boxed = self.boxed;

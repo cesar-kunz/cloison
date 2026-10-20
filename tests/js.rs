@@ -196,6 +196,27 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// `delete x` in a direct `eval` leaves the function's own bindings (its
+/// parameters, `var`s and functions), deleting only what an `eval`
+/// declared.
+#[test]
+fn eval_deletes_only_what_eval_declared() {
+    assert_eq!(
+        value(
+            r#"
+var r = [];
+function f() { var dd = 1; var res = eval("delete dd"); return res + "," + typeof dd; } r.push(f());
+function g(p) { var res = eval("delete p"); return res + "," + typeof p; } r.push(g(1));
+function h() { eval("var e = 1"); var res = eval("delete e"); return res + "," + typeof e; } r.push(h());
+function k() { function inner() {} var res = eval("delete inner"); return res + "," + typeof inner; } r.push(k());
+function v() { var w = 1; eval("var w = 2"); return w; } r.push(v());
+r.join(" ");
+"#
+        ),
+        "false,number false,number true,undefined false,function 2"
+    );
+}
+
 /// RegExp odds and ends: a global `replace` or `match` sets `lastIndex`
 /// with throw; a RegExp-like object makes a RegExp of its `source` and
 /// `flags`; Annex B's `\c` before a non-letter is a backslash, then `c`.

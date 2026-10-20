@@ -315,6 +315,11 @@ fn json_parse(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
+/// `u` parsed as a whole JSON text (a JSON module's).
+pub(crate) fn parse_json(vm: &mut Vm, u: &[u16]) -> Result<Value> {
+    parse_text(vm, u, false).map(|(v, _)| v)
+}
+
 /// `u` parsed as a whole JSON text; with `track`, its values' records too
 /// (each one rooted in `vm.handles` while the caller's scope lasts).
 fn parse_text(vm: &mut Vm, u: &[u16], track: bool) -> Result<(Value, Record)> {

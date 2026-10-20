@@ -154,6 +154,12 @@ fn puncts(c: u8) -> &'static [(u32, u32, &'static str)] {
 }
 
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
+    lex_as(src, false)
+}
+
+/// [`lex`]; `module`: as a module's source, where HTML-like comments are
+/// none (Annex B's are scripts' only).
+pub fn lex_as(src: &str, module: bool) -> Result<Vec<Token>, Error> {
     let b = src.as_bytes();
     // Minified code has a token per 2 bytes or so (jQuery's 2.2), others
     // fewer: room no token takes costs no memory, a vector grown copies.
@@ -203,13 +209,13 @@ pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
             }
             // (Annex B's HTML-like comments: `<!--`, and `-->` first on a
             // line, as `//`.)
-            b'<' if b[i..].starts_with(b"<!--") => {
+            b'<' if !module && b[i..].starts_with(b"<!--") => {
                 while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
                     i += 1;
                 }
                 continue;
             }
-            b'-' if b[i..].starts_with(b"-->") && (newline || toks.is_empty()) => {
+            b'-' if !module && b[i..].starts_with(b"-->") && (newline || toks.is_empty()) => {
                 while i < b.len() && b[i] != b'\n' && b[i] != b'\r' {
                     i += 1;
                 }

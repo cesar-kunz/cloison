@@ -7289,3 +7289,116 @@ log.push(eval("4; { using c = null; }"));
          async dispose | after"
     );
 }
+
+/// Files `files` (name, text) in a directory of their own, for modules to
+/// import each other: its path.
+fn module_dir(test: &str, files: &[(&str, &str)]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("cloison-{test}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, text) in files {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+    dir
+}
+
+/// Module `main` of `dir` run (its jobs too): its `globalThis.result`.
+fn run_module(dir: &Path, main: &str) -> Result<String, String> {
+    let mut vm = Vm::new();
+    let r = vm.run_module(dir.join(main).to_str().unwrap());
+    vm.heap.verify();
+    match r {
+        Ok(()) => {
+            let a = vm.intern("result");
+            let g = cloison::object::object_value(vm.global);
+            Ok(display(vm.get(g, a).unwrap()))
+        }
+        Err(cloison::vm::ModuleError::Early(m)) => Err(format!("early: {m}")),
+        Err(cloison::vm::ModuleError::Thrown(e)) => Err(vm.uncaught_message(&e)),
+    }
+}
+
+/// Modules: imports are live bindings to their exporters' variables
+/// (uninitialized ones too, in a cycle), default exports name anonymous
+/// functions and classes `default`, re-exports resolve through `export *`
+/// and `export … from`, and a namespace object reads them all, sorted.
+#[test]
+fn modules_bind_live() {
+    let dir = module_dir(
+        "live",
+        &[
+            (
+                "main.mjs",
+                r#"
+import { count, inc, later } from "./counter.mjs";
+import f, * as all from "./reexports.mjs";
+import cls from "./cls.mjs";
+import value from "./value.mjs";
+let out = [];
+out.push(count); inc(); out.push(count);
+try { count = 0; } catch (e) { out.push(e.name); }
+out.push(f.name, f(), cls.name, value);
+out.push(Object.keys(all).join("/"), all[Symbol.toStringTag], all.count, all.renamed, typeof all.ns.inc);
+out.push(Object.getPrototypeOf(all), Object.isExtensible(all), Reflect.deleteProperty(all, "count"), Reflect.set(all, "count", 1));
+out.push(JSON.stringify(Object.getOwnPropertyDescriptor(all, "count")));
+out.push(later(), this, typeof arguments, import.meta === import.meta, Object.getPrototypeOf(import.meta));
+globalThis.result = out.join();
+"#,
+            ),
+            ("counter.mjs", "export let count = 1; export function inc() { count++; }\nimport { early } from './cycle.mjs';\nexport function later() { return early; }"),
+            ("cycle.mjs", "import { count } from './counter.mjs';\nexport let early = 'cycle';\ntry { count; } catch (e) { early = e.name; }"),
+            ("reexports.mjs", "export * from './counter.mjs';\nexport { count as renamed } from './counter.mjs';\nexport * as ns from './counter.mjs';\nexport default function () { return 'fn'; }"),
+            ("cls.mjs", "export default class {}"),
+            ("value.mjs", "export default 6 * 7;"),
+        ],
+    );
+    assert_eq!(
+        run_module(&dir, "main.mjs").unwrap(),
+        "1,2,TypeError,default,fn,default,42,count/default/inc/later/ns/renamed,Module,2,2,function,\
+         ,false,false,false,{\"value\":2,\"writable\":true,\"enumerable\":true,\"configurable\":false},\
+         ReferenceError,,undefined,true,"
+    );
+}
+
+/// Top-level `await`: a module waits for its async dependencies, which
+/// run in order; `import()` evaluates a module once and resolves to its
+/// namespace; a JSON module's default export is its value.
+#[test]
+fn modules_await_and_import() {
+    let dir = module_dir(
+        "await",
+        &[
+            ("main.mjs", "import { log } from './log.mjs';\nimport './a.mjs';\nimport './b.mjs';\nlog.push('main');\nconst ns = await import('./a.mjs');\nconst again = await import('./a.mjs');\nimport data from './data.json' with { type: 'json' };\nlog.push(ns === again, ns.a, data.list.length);\ntry { await import('./missing-export.mjs'); } catch (e) { log.push(e.name); }\nglobalThis.result = log.join();"),
+            ("log.mjs", "export const log = [];"),
+            ("a.mjs", "import { log } from './log.mjs';\nlog.push('a start');\nawait null;\nlog.push('a end');\nexport const a = 'A';"),
+            ("b.mjs", "import { log } from './log.mjs';\nlog.push('b');"),
+            ("data.json", "{ \"list\": [1, 2, 3] }"),
+            ("missing-export.mjs", "import { nothing } from './log.mjs';"),
+        ],
+    );
+    assert_eq!(run_module(&dir, "main.mjs").unwrap(), "a start,b,a end,main,true,A,3,SyntaxError");
+}
+
+/// A module's early errors: before any of the graph runs.
+#[test]
+fn module_early_errors() {
+    let dir = module_dir(
+        "early",
+        &[
+            ("dup.mjs", "globalThis.ran = 1; export let a; export { a };"),
+            ("undeclared.mjs", "export { nope };"),
+            ("unresolved.mjs", "import { nope } from './dup2.mjs';"),
+            ("dup2.mjs", "export const x = 1;"),
+            ("lex.mjs", "import { x } from './dup2.mjs'; function x() {}"),
+            ("html.mjs", "<!-- not a comment\n"),
+            ("arguments.mjs", "globalThis.result = typeof arguments; await 0;"),
+        ],
+    );
+    for (f, what) in [("dup.mjs", "twice"), ("undeclared.mjs", "not declared"), ("unresolved.mjs", "no export"), ("lex.mjs", "already")] {
+        let e = run_module(&dir, f).unwrap_err();
+        assert!(e.starts_with("early: SyntaxError") && e.contains(what), "{f}: {e}");
+    }
+    assert!(run_module(&dir, "html.mjs").unwrap_err().starts_with("early: SyntaxError"));
+    assert_eq!(run_module(&dir, "arguments.mjs").unwrap(), "undefined");
+    assert!(compile_error("import x from 'y';").contains("module"));
+    assert!(compile_error("import.meta").contains("module"));
+}

@@ -22,6 +22,7 @@ mod symbol;
 mod iterator;
 mod typed;
 mod dispose;
+mod module;
 mod base64;
 mod bigint;
 mod reflect;

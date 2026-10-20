@@ -145,6 +145,7 @@ unsafe extern "C" {
     fn cloison_rt_construct_done();
     fn cloison_rt_array_push();
     fn cloison_rt_char_code_at();
+    fn cloison_rt_props_room();
     fn cloison_rt_from_char_code();
     fn cloison_rt_pow();
     fn cloison_rt_materialize();
@@ -4043,6 +4044,53 @@ unsafe fn props(o: *mut u8) -> *mut u8 {
     unsafe { *(o.add(16) as *const *mut u8) }
 }
 
+/// `set_tro` stencils (see `set_tro_`): `$guard`, the receiver's shape
+/// checked; `$barrier`, `acc` may be a cell.
+macro_rules! set_tro {
+    ($name:literal, $loc:tt, $guard:literal, $barrier:literal) => {
+        stencil_slow!($name, loc!($loc); |s| {
+            let v = get!($loc, s);
+            if $guard && guard_shape(s.tag, v).is_none() {
+                exit!(s)
+            }
+            let o = v.to_bits() as *mut u8;
+            if !props_room(o) {
+                slow!(s)
+            }
+            tro_store(s.tag, o, s.acc, $barrier);
+            next!(s)
+        }; |s| {
+            core::arch::asm!(concat!("/* ", $name, loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let o = get!($loc, s).to_bits() as *mut u8;
+            rt_call!(s, cloison_rt_props_room, Value::from_bits(o as u64), Value::from_i32(imm() / 8));
+            let o = get!($loc, s).to_bits() as *mut u8;
+            tro_store(s.tag, o, s.acc, $barrier);
+            next!(s)
+        });
+    };
+}
+
+/// A `set_tro` stencil's transition: the new shape (`imm64b`), then `acc`
+/// into the out-of-line slot at byte `imm`.
+#[inline(always)]
+unsafe fn tro_store(tag: NumberTag, o: *mut u8, v: Value, barrier_needed: bool) {
+    unsafe {
+        *(o as *mut u64) = imm64b();
+        let p = props(o);
+        store_imm(p, v);
+        if barrier_needed {
+            barrier(tag, p.sub(8), p.offset(imm() as isize), v);
+        }
+    }
+}
+
+/// Whether object `o`'s `props` have room for the slot at byte `imm`
+/// (`props_cap`, a u32 at byte 12, counts their slots).
+#[inline(always)]
+unsafe fn props_room(o: *mut u8) -> bool {
+    (imm() as u32 / 8) < unsafe { *(o.add(12) as *const u32) }
+}
+
 /// A keyed load stencil: `$ok` vets the receiver `$o`; `$int_key` says the
 /// key is known to be an int32.
 macro_rules! keyed_load {
@@ -4189,6 +4237,12 @@ macro_rules! property_location {
             barrier(s.tag, o, o, s.acc);
             next!(s)
         });
+        // A transition out of line (`jit::Prop::Transition` with `oop`): the
+        // object's `props` (byte 16) need room for the slot at byte `imm`
+        // (`props_cap`, a u32 at byte 12, counts slots); the slow helper
+        // makes it (`cloison_rt_props_room`), then stores.
+        set_tro!("set_tro_", $loc, true, true);
+        set_tro!("set_tro_n_", $loc, true, false);
         // `_n`: `acc` is known to be a number, never a cell: no barrier.
         stencil!("set_own_n_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
@@ -4446,6 +4500,8 @@ macro_rules! property_location {
             store_imm(props(get!($loc, s).to_bits() as *mut u8), s.acc);
             next!(s)
         });
+        set_tro!("set_tro_nc_", $loc, false, true);
+        set_tro!("set_tro_n_nc_", $loc, false, false);
         // Elements at offset 24, length (u32) at 32. A hole is `EMPTY` (0).
         // `_i`: the key is known to be an int32. `_nc`: the receiver is
         // known to be an object; `_sh`: its shape must be `imm64` (the

@@ -6902,3 +6902,32 @@ for (var i = 0; i < 200; i++) s += +o + o * 2;
 [(1n)[0], Symbol()[0], f.call(1n), f.call(Symbol()), s].join();"#;
     assert_eq!(value(src), "z,s,object,object,4200");
 }
+
+/// `Array.fromAsync` over sync and async iterables and array-likes, with
+/// a mapper, a constructor `this`, and an iterator closed when the mapper
+/// throws.
+#[test]
+fn array_from_async() {
+    let src = r#"
+var log = [];
+async function* ag() { yield 1; yield Promise.resolve(2); }
+var closed = 0;
+var it = { [Symbol.iterator]() { var i = 0; return { next() { return { done: ++i > 2, value: i }; }, return() { closed++; return {}; } }; } };
+function C() {}
+(async () => {
+  log.push((await Array.fromAsync([1, Promise.resolve(2)])).join());
+  log.push((await Array.fromAsync(ag(), (x, k) => Promise.resolve(x * 10 + k))).join());
+  log.push((await Array.fromAsync({ length: 2, 0: "a", 1: Promise.resolve("b") })).join());
+  var c = await Array.fromAsync.call(C, [1]);
+  log.push(c instanceof C, c.length);
+  try { await Array.fromAsync(it, () => { throw new SyntaxError; }); } catch (e) { log.push(e.name, closed); }
+  try { await Array.fromAsync([1], 5); } catch (e) { log.push(e.name); }
+})().then(() => { globalThis.out = log.join(" "); });
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("out");
+    let g = cloison::object::object_value(vm.global);
+    assert_eq!(display(vm.get(g, a).unwrap()), "1,2 10,21 a,b true 1 SyntaxError 1 TypeError");
+}

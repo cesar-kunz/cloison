@@ -234,6 +234,32 @@ geomean for it.
 
 The numbers that follow are from an Ubuntu Linux x86-64 host.
 
+Octane there at 957e562, cloison's JIT against V8 14.6 (Node 26) capped at
+Maglev and at Sparkplug (medians of three runs, from
+`scripts/octane-tiers.sh`, which also has cloison's interpreter and V8's other
+tiers). At c842d29, above, a function calling `eval` directly dropped
+every function's compiled code each time it ran; Mandreel (5,156 here
+before the fix) and PdfJS (9,094) were the benchmarks it hit:
+
+| benchmark | V8 Maglev | cloison | V8 Sparkplug | cloison / Maglev |
+|---|---:|---:|---:|---:|
+| DeltaBlue | 57,146 | 58,514 | 2,863 | 1.02 |
+| Richards | 40,813 | 34,282 | 2,768 | 0.84 |
+| Crypto | 36,112 | 21,635 | 2,477 | 0.60 |
+| CodeLoad | 45,145 | 26,644 | 44,877 | 0.59 |
+| Mandreel | 55,386 | 31,711 | 4,879 | 0.57 |
+| NavierStokes | 38,063 | 21,200 | 3,121 | 0.56 |
+| RayTrace | 83,101 | 38,997 | 7,370 | 0.47 |
+| GameBoy | 119,967 | 55,879 | 14,378 | 0.47 |
+| RegExp | 11,649 | 4,312 | 6,675 | 0.37 |
+| EarleyBoyer | 63,367 | 22,606 | 13,590 | 0.36 |
+| TypeScript | 82,688 | 28,379 | 34,377 | 0.34 |
+| Splay | 31,343 | 10,130 | 7,167 | 0.32 |
+| Box2D | 115,372 | 27,137 | 8,231 | 0.24 |
+| zlib | 109,310 | 23,320 | 109,702 | 0.21 |
+| PdfJS | 67,232 | 13,297 | 16,362 | 0.20 |
+| **geomean** | **55,061** | **23,628** | **9,508** | **0.43** |
+
 ARKTS there, where its build has the asm interpreter and its JIT, on the
 six benchmarks it runs, at f2c093c (median of three runs; `ark_js_vm` at
 ets_runtime ce9f9d11f, its asm interpreter and with `--compiler-enable-jit`

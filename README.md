@@ -131,7 +131,7 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
 | ES5 (untagged) | 16,511 | 17,067 | 96.7% |
-| ES2015 | 8,752 | 9,197 | 95.2% |
+| ES2015 | 8,758 | 9,197 | 95.2% |
 | ES2016 | 97 | 100 | 97.0% |
 | ES2017 | 335 | 741 | 45.2% |
 | ES2018 | 4,707 | 4,825 | 97.6% |
@@ -141,10 +141,10 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES2022 | 4,843 | 5,374 | 90.1% |
 | ES2023 | 283 | 284 | 99.6% |
 | ES2024 | 502 | 843 | 59.5% |
-| ES2025 | 780 | 998 | 78.2% |
-| ES2026 | 245 | 745 | 32.9% |
+| ES2025 | 818 | 998 | 82.0% |
+| ES2026 | 375 | 745 | 50.3% |
 | Stage 3 proposals | 465 | 5,650 | 8.2% |
-| **all** | **39,708** | **48,635** | **81.6%** |
+| **all** | **39,882** | **48,635** | **82.0%** |
 
 The gaps are mostly whole features: modules (`import()` and top-level
 `await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's

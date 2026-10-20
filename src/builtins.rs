@@ -244,6 +244,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     crate::agent::install(vm, host);
+    crate::module::install(vm, host);
     crate::typed::install(vm);
     crate::collections::install(vm);
     install_regexps(vm);

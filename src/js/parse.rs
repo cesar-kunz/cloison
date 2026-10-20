@@ -2499,7 +2499,10 @@ impl<'a> Parser<'_, 'a, '_> {
             while self.member_suffix(&mut e)? {}
             return Ok(e);
         }
-        if self.is("import") && self.peek_at(1) == &Tok::Punct("(") {
+        if self.is("import")
+            && (self.peek_at(1) == &Tok::Punct("(")
+                || self.peek_at(1) == &Tok::Punct(".") && matches!(self.peek_at(2), Tok::Ident(n) if &**n == "defer" || &**n == "source"))
+        {
             return self.err("`new import(…)`");
         }
         let mut c = if self.is("new") {
@@ -2555,6 +2558,27 @@ impl<'a> Parser<'_, 'a, '_> {
         Ok(args)
     }
 
+    /// An import call's arguments, past its `(`: the specifier, the
+    /// options (`undefined` if none), and the referrer (this module, or
+    /// the script: -1).
+    fn import_call_args(&mut self, pos: Pos) -> R<Vec<Expr<'a>>> {
+        if self.is(")") {
+            return self.err("`import()` without a specifier");
+        }
+        let mut args = vec![self.assignment(false)?];
+        if self.eat(",") && !self.is(")") {
+            args.push(self.assignment(false)?);
+            self.eat(",");
+        }
+        self.expect(")")?;
+        if args.len() < 2 {
+            let zero = expr(self.arena, Expr { kind: ExprKind::Num(0.0), pos });
+            args.push(Expr { kind: ExprKind::Unary(UnOp::Void, zero), pos });
+        }
+        args.push(Expr { kind: ExprKind::Num(self.module.unwrap_or(-1) as f64), pos });
+        Ok(args)
+    }
+
     fn primary(&mut self) -> R<Expr<'a>> {
         let pos = self.pos();
         let start = self.i;
@@ -2562,6 +2586,19 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Num(v) => ExprKind::Num(v),
             Tok::BigInt(d) => ExprKind::Intrinsic("bigint", vec![Expr { kind: ExprKind::Str(d), pos }]),
             Tok::Str(s) => ExprKind::Str(s),
+            // `import.defer(specifier, options)`, `import.source(…)`: as
+            // `import()`, a deferred namespace or a module source.
+            Tok::Keyword("import") if self.is(".") && (matches!(self.peek_at(1), Tok::Ident(n) if &**n == "defer" || &**n == "source")) => {
+                self.advance();
+                let phase = if self.is_word("defer") { 1.0 } else if self.is_word("source") { 2.0 } else {
+                    return self.err("an escaped `defer` or `source` after `import.`");
+                };
+                self.advance();
+                self.expect("(")?;
+                let mut args = self.import_call_args(pos)?;
+                args.push(Expr { kind: ExprKind::Num(phase), pos });
+                ExprKind::Intrinsic("dynamic_import", args)
+            }
             // `import.meta`, a module's (see `module::import_meta`).
             Tok::Keyword("import") if self.eat(".") => {
                 if !self.is_word("meta") {
@@ -2577,20 +2614,8 @@ impl<'a> Parser<'_, 'a, '_> {
             // namespace (see `module::dynamic_import`), from this module's
             // (or the script's: -1).
             Tok::Keyword("import") if self.eat("(") => {
-                if self.is(")") {
-                    return self.err("`import()` without a specifier");
-                }
-                let mut args = vec![self.assignment(false)?];
-                if self.eat(",") && !self.is(")") {
-                    args.push(self.assignment(false)?);
-                    self.eat(",");
-                }
-                self.expect(")")?;
-                if args.len() < 2 {
-                    let zero = expr(self.arena, Expr { kind: ExprKind::Num(0.0), pos });
-                    args.push(Expr { kind: ExprKind::Unary(UnOp::Void, zero), pos });
-                }
-                args.push(Expr { kind: ExprKind::Num(self.module.unwrap_or(-1) as f64), pos });
+                let mut args = self.import_call_args(pos)?;
+                args.push(Expr { kind: ExprKind::Num(0.0), pos });
                 ExprKind::Intrinsic("dynamic_import", args)
             }
             Tok::Ident(s) if self.is("=>") && !self.toks[self.i].newline_before => {
@@ -3786,6 +3811,11 @@ impl<'a> Parser<'_, 'a, '_> {
     /// A module specifier and its `with { … }` attributes: the module's
     /// request (see `ModuleInfo::requests`).
     fn module_request(&mut self) -> R<usize> {
+        self.module_request_in(Phase::Evaluation)
+    }
+
+    /// [`Parser::module_request`] of phase `phase`.
+    fn module_request_in(&mut self, phase: Phase) -> R<usize> {
         if !matches!(self.peek(), Tok::Str(_)) {
             return self.err("expected a module specifier");
         }
@@ -3823,7 +3853,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         }
         let spec: String = spec.chars().map(|c| if lone_surrogate(c) { '\u{FFFD}' } else { c }).collect();
-        let request = (spec, ty);
+        let request = (spec, ty, phase);
         Ok(match self.info.requests.iter().position(|r| *r == request) {
             Some(k) => k,
             None => {
@@ -3843,17 +3873,40 @@ impl<'a> Parser<'_, 'a, '_> {
             self.semicolon()?;
             return Ok(Stmt { kind: StmtKind::Empty, pos });
         }
-        // (The name imported, `None` for the namespace; the binding.)
-        let mut bindings: Vec<(Option<String>, Name)> = Vec::new();
+        // `import defer * as ns from "m"`, `import source x from "m"` (a
+        // binding named `defer` or `source` otherwise).
+        let word_at = |p: &Self, k: usize, w: &str| matches!(p.peek_at(k), Tok::Ident(n) if &**n == w) && !p.toks[p.i + k].escaped;
+        let ident_at = |p: &Self, k: usize| matches!(p.peek_at(k), Tok::Ident(_) | Tok::Keyword("yield" | "await" | "let" | "static"));
+        let phase = if self.is_word("defer") && self.peek_at(1) == &Tok::Punct("*") {
+            self.advance();
+            Phase::Defer
+        } else if self.is_word("source") && ident_at(self, 1) && (!word_at(self, 1, "from") || word_at(self, 2, "from")) {
+            self.advance();
+            Phase::Source
+        } else {
+            Phase::Evaluation
+        };
+        if phase == Phase::Source {
+            let local = self.binding_ident()?;
+            self.expect_word("from")?;
+            let request = self.module_request_in(phase)?;
+            self.semicolon()?;
+            self.import_binding(request, ImportName::Source, local);
+            return Ok(Stmt { kind: StmtKind::Empty, pos });
+        }
+        // (What is imported; the binding.)
+        let mut bindings: Vec<(ImportName, Name)> = Vec::new();
         let mut more = true;
-        if matches!(self.peek(), Tok::Ident(_)) && !self.is_word("from") || self.is_word("from") && self.peek_at(1) != &Tok::Punct("'") && matches!(self.peek_at(1), Tok::Punct(",") | Tok::Ident(_)) {
-            bindings.push((Some("default".into()), self.binding_ident()?));
+        if phase == Phase::Evaluation && (matches!(self.peek(), Tok::Ident(_)) && !self.is_word("from") || self.is_word("from") && self.peek_at(1) != &Tok::Punct("'") && matches!(self.peek_at(1), Tok::Punct(",") | Tok::Ident(_))) {
+            bindings.push((ImportName::Name("default".into()), self.binding_ident()?));
             more = self.eat(",");
         }
         if more {
             if self.eat("*") {
                 self.expect_word("as")?;
-                bindings.push((None, self.binding_ident()?));
+                bindings.push((ImportName::Namespace, self.binding_ident()?));
+            } else if phase == Phase::Defer {
+                return self.err("expected `* as` after `import defer`");
             } else if self.eat("{") {
                 while !self.eat("}") {
                     let name = self.module_export_name()?;
@@ -3867,7 +3920,7 @@ impl<'a> Parser<'_, 'a, '_> {
                         self.check_binding(n)?;
                         n.clone()
                     };
-                    bindings.push((Some(name.text()), local));
+                    bindings.push((ImportName::Name(name.text()), local));
                     if !self.eat(",") {
                         self.expect("}")?;
                         break;
@@ -3878,16 +3931,21 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         }
         self.expect_word("from")?;
-        let request = self.module_request()?;
+        let request = self.module_request_in(phase)?;
         self.semicolon()?;
         for (name, local) in bindings {
-            let local = self.declare(&local, IMPORT, 0);
-            let k = self.info.imports.len();
-            self.info.imports.push((request, name, local.clone()));
-            let original = self.lexicals.get(&local).map_or(local.clone(), |l| l.original.clone());
-            self.imports.insert(local, Import { original, index: k, holder: format!("%imp{k}").into(), prop: None });
+            self.import_binding(request, name, local);
         }
         Ok(Stmt { kind: StmtKind::Empty, pos })
+    }
+
+    /// Import binding `local` of `name` from `request`, declared.
+    fn import_binding(&mut self, request: usize, name: ImportName, local: Name) {
+        let local = self.declare(&local, IMPORT, 0);
+        let k = self.info.imports.len();
+        self.info.imports.push((request, name, local.clone()));
+        let original = self.lexicals.get(&local).map_or(local.clone(), |l| l.original.clone());
+        self.imports.insert(local, Import { original, index: k, holder: format!("%imp{k}").into(), prop: None });
     }
 
     /// Identifier `n` (just read) as a binding: not a reserved word (in
@@ -3932,7 +3990,7 @@ impl<'a> Parser<'_, 'a, '_> {
             match name {
                 Some(n) => {
                     self.export_name(&n, pos)?;
-                    self.info.indirect_exports.push((n, request, None));
+                    self.info.indirect_exports.push((n, request, ImportName::Namespace));
                 }
                 None => self.info.star_exports.push(request),
             }
@@ -3961,7 +4019,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.semicolon()?;
                 for (local, exported, at) in specs {
                     self.export_name(&exported, at)?;
-                    self.info.indirect_exports.push((exported, request, Some(local.text())));
+                    self.info.indirect_exports.push((exported, request, ImportName::Name(local.text())));
                 }
             } else {
                 self.semicolon()?;
@@ -4098,11 +4156,12 @@ impl<'a> Parser<'_, 'a, '_> {
                 return Err(Error::new(at as usize, format!("`{original}` exported but not declared")));
             }
             match self.imports.get(&local) {
-                Some(imp) => match &self.info.imports[imp.index] {
-                    (request, Some(name), _) => self.info.indirect_exports.push((exported, *request, Some(name.clone()))),
-                    // (A namespace's: re-exported as `export * as x` is.)
-                    (request, None, _) => self.info.indirect_exports.push((exported, *request, None)),
-                },
+                // (A namespace's: re-exported as `export * as x` is; a
+                // source's, as its source.)
+                Some(imp) => {
+                    let (request, name, _) = self.info.imports[imp.index].clone();
+                    self.info.indirect_exports.push((exported, request, name));
+                }
                 None => self.info.local_exports.push((exported, local.to_string())),
             }
         }

@@ -57,22 +57,43 @@ pub struct Import {
     pub prop: Option<String>,
 }
 
+/// A module request's phase: an ordinary one, `import defer`'s (the
+/// module evaluated when its namespace is first read), or `import
+/// source`'s (the module's source object, not its instance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase {
+    Evaluation,
+    Defer,
+    Source,
+}
+
+/// What an import or a re-export takes from a module: an export, its
+/// namespace (a deferred one through a `Phase::Defer` request), or its
+/// source object.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImportName {
+    Name(String),
+    Namespace,
+    Source,
+}
+
 /// A module's requests and its import and export entries (ECMA-262
 /// §16.2.1.6), names as written, local ones as the module's variables'
 /// (renamed: see [`Program::lexicals`]).
 #[derive(Debug, Clone, Default)]
 pub struct ModuleInfo {
-    /// The modules it requests, in order, each once: the specifier and
-    /// its `type` attribute (`with { type: "json" }`), if any.
-    pub requests: Vec<(String, Option<String>)>,
-    /// `import … from`: the request, the name imported (`None` for `* as
-    /// ns`), the local binding (see [`Import`]).
-    pub imports: Vec<(usize, Option<String>, Name)>,
+    /// The modules it requests, in order, each once: the specifier, its
+    /// `type` attribute (`with { type: "json" }`), if any, and the phase.
+    pub requests: Vec<(String, Option<String>, Phase)>,
+    /// `import … from`: the request, what is imported, the local binding
+    /// (see [`Import`]).
+    pub imports: Vec<(usize, ImportName, Name)>,
     /// `export`ed variables: the name exported, the variable.
     pub local_exports: Vec<(String, String)>,
-    /// `export { x as y } from "m"`: the name exported, the request, the
-    /// name imported (`None` for `export * as ns from "m"`).
-    pub indirect_exports: Vec<(String, usize, Option<String>)>,
+    /// `export { x as y } from "m"`: the name exported, the request, what
+    /// is imported (`export * as ns from "m"`: the namespace; an imported
+    /// binding re-exported: the import's).
+    pub indirect_exports: Vec<(String, usize, ImportName)>,
     /// `export * from "m"`: the requests.
     pub star_exports: Vec<usize>,
     /// It has a top-level `await` (its function is async).

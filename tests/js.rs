@@ -7510,3 +7510,20 @@ fn legacy_regexp_statics() {
     "#;
     assert_eq!(value(src), "b,true,b,a,d,abd,y,x,TypeError,q,TypeError");
 }
+
+/// `import defer`: the module linked, evaluated when its namespace is
+/// first read (not by a symbol, or `"then"`); `import source` of a
+/// JavaScript module: a SyntaxError.
+#[test]
+fn modules_deferred_and_source_phase() {
+    let dir = module_dir(
+        "defer",
+        &[
+            ("main.mjs", "import defer * as ns from './dep.mjs';\nconst log = globalThis.log = [];\nlog.push(ns[Symbol.toStringTag], ns.then === undefined, String(globalThis.ran));\nlog.push(ns.x, String(globalThis.ran));\nconst again = await import.defer('./dep.mjs');\nlog.push(again === ns);\ntry { await import.source('./dep.mjs'); } catch (e) { log.push(e.name); }\nglobalThis.result = log.join();"),
+            ("dep.mjs", "globalThis.ran = true; export const x = 1;"),
+            ("source.mjs", "import source s from './dep.mjs';"),
+        ],
+    );
+    assert_eq!(run_module(&dir, "main.mjs").unwrap(), "Deferred Module,true,undefined,1,true,true,SyntaxError");
+    assert!(run_module(&dir, "source.mjs").unwrap_err().contains("SyntaxError"));
+}

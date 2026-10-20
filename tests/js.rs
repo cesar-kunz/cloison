@@ -7470,3 +7470,43 @@ fn agents_wait_and_are_notified() {
     "#;
     assert_eq!(value(src), "ok,ok,2,2");
 }
+
+/// `Promise.allKeyed` and `allSettledKeyed`: an object's own enumerable
+/// properties' values awaited, by the same keys.
+#[test]
+fn promise_keyed_combinators() {
+    let src = r#"
+        var out = [];
+        Promise.allKeyed({ a: Promise.resolve(1), b: 2, [Symbol.iterator]: 3 }).then(r => {
+            out.push(Object.getPrototypeOf(r), Reflect.ownKeys(r).length, r.a, r.b);
+        });
+        Promise.allSettledKeyed({ x: Promise.reject(4) }).then(r => out.push(r.x.status, r.x.reason));
+        Promise.allKeyed(5).catch(e => out.push(e.name));
+        globalThis.out = out;
+    "#;
+    let mut vm = Vm::new();
+    vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let r = vm.run(&cloison::js::compile("out.join()").unwrap()).map(display).unwrap();
+    assert_eq!(r, "TypeError,,3,1,2,rejected,4");
+}
+
+/// `RegExp.$1` and the other legacy static properties: the last match's,
+/// invalid after a subclass's.
+#[test]
+fn legacy_regexp_statics() {
+    let src = r#"
+        var o = [];
+        /(b)(c)?/.exec("abd");
+        o.push(RegExp.$1, RegExp.$2 === "", RegExp.lastMatch, RegExp["$`"], RegExp["$'"], RegExp.input);
+        "xyz".replace(/(y)/g, "-");
+        o.push(RegExp.$1, RegExp.leftContext);
+        class R extends RegExp {}
+        new R("a").test("a");
+        try { RegExp.$1; } catch (e) { o.push(e.name); }
+        /q/.test("q");
+        o.push(RegExp.lastMatch);
+        try { Object.getOwnPropertyDescriptor(RegExp, "$1").get.call(R); } catch (e) { o.push(e.name); }
+        o.join()
+    "#;
+    assert_eq!(value(src), "b,true,b,a,d,abd,y,x,TypeError,q,TypeError");
+}

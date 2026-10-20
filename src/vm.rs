@@ -819,6 +819,14 @@ pub struct Vm {
     pub(crate) a_index: Atom,
     pub(crate) a_input: Atom,
     pub(crate) array_buffer_prototype: *mut Object,
+    /// The legacy static properties of `RegExp` (`RegExp.$1`, …): the last
+    /// match's input and groups, `input` (set apart), and whether they are
+    /// valid (not after a subclass's match). See `builtins::note_legacy`.
+    pub(crate) legacy_match: (Value, crate::regexp::Captures),
+    pub(crate) legacy_input: Value,
+    pub(crate) legacy_valid: bool,
+    /// `%RegExp%`.
+    pub(crate) regexp_constructor: *mut Object,
     /// The shared memory's state: `SharedArrayBuffer`s' blocks, async
     /// waiters (see `shared`).
     pub(crate) shared: crate::shared::State,
@@ -1008,6 +1016,10 @@ impl Vm {
             a_index: Atom(0),
             a_input: Atom(0),
             array_buffer_prototype: std::ptr::null_mut(),
+            legacy_match: (Value::EMPTY, Vec::new()),
+            legacy_input: Value::EMPTY,
+            legacy_valid: true,
+            regexp_constructor: std::ptr::null_mut(),
             shared: crate::shared::State::default(),
             shared_atomics: std::ptr::null_mut(),
             can_block: true,
@@ -4420,6 +4432,7 @@ impl Vm {
             self.boolean_prototype,
             self.array_buffer_prototype,
             self.shared_atomics,
+            self.regexp_constructor,
             self.array_push_fn,
             self.array_pop_fn,
         ]
@@ -4444,6 +4457,7 @@ impl Vm {
         v.extend_from_slice(&self.dispose_roots);
         v.extend(self.modules.roots());
         v.extend(self.shared.roots());
+        v.extend([self.legacy_match.0, self.legacy_input].into_iter().filter(|v| v.is_cell()));
         v.extend(self.agent.roots());
         v.extend_from_slice(&self.single_chars);
         if let Some(Error(_, Some(e))) = &self.error {

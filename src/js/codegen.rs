@@ -1694,7 +1694,7 @@ impl<'a> Gen<'a> {
             && !explicit_declarations(self.p, self.index).contains(&n)
         {
             self.emit(Op::LdaCallee, &[]);
-            self.store_var(n, self.f.pos)?;
+            self.init_var(n, self.f.pos)?;
         }
         // (A new frame's: no upvalues of its registers to close yet.)
         self.entering = true;
@@ -3055,11 +3055,47 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// Whether `name` here is a named function expression's own name: the
+    /// function's, or an enclosing one's, with no parameter or `var` of
+    /// that name in it or in the functions between.
+    fn own_name_binding(&self, name: &str) -> bool {
+        let mut g = self.index;
+        loop {
+            let f = &self.p.functions[g];
+            if g == 0
+                || f.params.iter().any(|p| &**p == name)
+                || explicit_declarations(self.p, g).contains(&name)
+            {
+                return false;
+            }
+            if own_name(self.p, g) == Some(name) {
+                return true;
+            }
+            match f.parent {
+                Some(q) => g = q,
+                None => return false,
+            }
+        }
+    }
+
     /// Store the accumulator in variable `name`: a `const` throws, a
     /// block-scoped one not initialized yet too.
     fn store_var(&mut self, name: &str, pos: Pos) -> R<()> {
         if self.in_with(name) {
             return self.with_store(name, pos);
+        }
+        // A function expression's own name is immutable: a store does
+        // nothing, in strict code throws.
+        if self.own_name_binding(name) {
+            if self.f.strict {
+                let mark = self.temp;
+                let r = self.alloc(pos)?;
+                self.string(name);
+                self.star(r);
+                self.intrinsic("throw_const", r, 1);
+                self.temp = mark;
+            }
+            return Ok(());
         }
         if !self.p.lexicals.is_empty() && let Some(l) = self.p.lexicals.get(name) {
             if l.constant {

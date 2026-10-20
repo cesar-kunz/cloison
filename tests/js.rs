@@ -196,6 +196,29 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// A derived class's constructor checks what it returns as it returns,
+/// after its `finally` blocks and outside its own `try`s: a `catch` in it
+/// doesn't catch the TypeError, a `super()` in a `finally` counts.
+#[test]
+fn derived_constructors_check_their_returns_last() {
+    assert_eq!(
+        value(
+            r#"
+var r = [];
+function t(f) { try { var o = f(); return typeof o; } catch (e) { return e.name; } }
+class B {}
+r.push(t(() => new (class extends B { constructor() { super(); try { return 0; } catch (e) { return; } } })()));
+r.push(t(() => new (class extends B { constructor() { try { return; } finally { super(); } } })()));
+r.push(t(() => new (class extends B { constructor() { super(); try { return 1; } finally { } } })()));
+r.push(t(() => new (class extends B { constructor() { try { super(); return 7; } catch (e) { return {}; } } })()));
+r.push(t(() => new (class extends B { constructor() { return; } })()));
+r.join(" ");
+"#
+        ),
+        "TypeError object TypeError TypeError ReferenceError"
+    );
+}
+
 /// A property key with a lone surrogate is its own key, not U+FFFD's: two
 /// such keys are two properties, listed and found as they are.
 #[test]

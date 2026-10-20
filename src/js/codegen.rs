@@ -2257,7 +2257,7 @@ impl<'a> Gen<'a> {
                 }
             }
             Var::Scope(_) if hole => {
-                self.emit(Op::LdaUndefined, &[]);
+                self.emit(Op::LdaHole, &[]);
                 self.init_var(n, pos)?;
             }
             _ => {}
@@ -2273,7 +2273,7 @@ impl<'a> Gen<'a> {
         let mark = self.temp;
         let t = self.alloc(pos)?;
         if hole {
-            self.emit(Op::LdaUndefined, &[]);
+            self.emit(Op::LdaHole, &[]);
         } else {
             self.named(Op::GetNamed, r, n);
         }

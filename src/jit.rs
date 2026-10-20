@@ -9657,6 +9657,16 @@ struct CtorSite {
     header: [u64; crate::object::INLINE_BASE / 8],
 }
 
+/// Whether two lowerings' property operands are the same. An
+/// `instanceof`'s cache (`Prop::InstanceOf`) is boxed afresh by each
+/// lowering: any two are alike. (Compared by address, every function with
+/// an `instanceof` dropped its versions at each lowering: PdfJS's 122 of
+/// 313.)
+fn same_props(a: &[Prop], b: &[Prop]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| x == y || matches!((x, y), (Prop::InstanceOf { .. }, Prop::InstanceOf { .. })))
+}
+
 /// Whether two lowerings' instructions are the same. An inlined `new`'s
 /// allocation site (`Insn::alloc`) is boxed afresh by each lowering: it is
 /// compared by what it allocates.
@@ -14468,7 +14478,7 @@ impl JitFunction {
             || vm.field_epoch != field_epoch
             || self.versions.is_empty()
             || !same_insns(&low.insns, &self.insns)
-            || low.props != vm.props
+            || !same_props(&low.props, &vm.props)
             || low.polys != vm.polys
             || low.frames != vm.snap.frames
         {

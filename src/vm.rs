@@ -3011,8 +3011,7 @@ impl Vm {
         // A string's index is its code unit there, as a string.
         if let Some(u) = string_units(obj) {
             if (i as usize) < u.len() {
-                let c = [u[i as usize]];
-                return Ok(self.string_constant(&c));
+                return Ok(self.single_char(u[i as usize]));
             }
             o = self.string_prototype;
         } else if let Some(u) = wrapped(obj).and_then(string_units)

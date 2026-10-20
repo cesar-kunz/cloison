@@ -289,6 +289,7 @@ pub(crate) fn install(vm: &mut Vm) {
     crate::generator::install(vm);
     // (`Symbol.prototype`'s is called directly: a symbol is a primitive.)
     vm.to_primitive_defined = false;
+    vm.has_instance_defined = false;
 }
 
 /// `c.prototype = proto` and `proto.constructor = c`, as the builtins'.

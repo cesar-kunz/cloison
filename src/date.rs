@@ -321,6 +321,31 @@ pub(crate) fn date_value(v: Value) -> Option<f64> {
 }
 
 /// `thisTimeValue(this)`: a TypeError unless `this` is a `Date`.
+/// `Date.prototype[Symbol.toPrimitive](hint)`: OrdinaryToPrimitive,
+/// `toString` first for "string" and "default", `valueOf` for "number".
+pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if !crate::props::is_object(this) {
+        return Err(Error::type_error("Date.prototype[Symbol.toPrimitive] called on a non-object"));
+    }
+    let hint = a.first().and_then(|&h| crate::vm::string_units(h)).map(String::from_utf16_lossy);
+    let order = match hint.as_deref() {
+        Some("string" | "default") => ["toString", "valueOf"],
+        Some("number") => ["valueOf", "toString"],
+        _ => return Err(Error::type_error("Invalid hint")),
+    };
+    for name in order {
+        let a = vm.intern(name);
+        let m = vm.get(this, a)?;
+        if crate::props::is_callable(m) {
+            let r = crate::interp::call_function(vm, m, this, &[])?;
+            if !crate::props::is_object(r) {
+                return Ok(r);
+            }
+        }
+    }
+    Err(Error::type_error("Cannot convert object to primitive value"))
+}
+
 fn this_time(this: Value) -> Result<f64> {
     date_value(this).ok_or_else(|| Error::type_error("this is not a Date object"))
 }

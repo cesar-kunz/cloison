@@ -2802,7 +2802,13 @@ impl<'a> Gen<'a> {
                 pos,
             })?;
             self.star(r);
-            self.emit(Op::TestIn, &[Arg::Reg(k)]);
+            // (A `with`'s object, unlike an `eval`'s scope, leaves out what
+            // its `Symbol.unscopables` names: `[k, r]`.)
+            if w.starts_with("%w") {
+                self.intrinsic("with_has", k, 2);
+            } else {
+                self.emit(Op::TestIn, &[Arg::Reg(k)]);
+            }
             self.jump_if(Jmp::False, next);
             // (The lookup continues in the enclosing `with`s only.)
             self.withs = withs[..i].to_vec();

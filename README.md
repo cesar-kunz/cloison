@@ -131,25 +131,25 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
 | ES5 (untagged) | 16,511 | 17,067 | 96.7% |
-| ES2015 | 8,758 | 9,197 | 95.2% |
+| ES2015 | 8,771 | 9,197 | 95.4% |
 | ES2016 | 97 | 100 | 97.0% |
 | ES2017 | 335 | 741 | 45.2% |
-| ES2018 | 4,707 | 4,825 | 97.6% |
+| ES2018 | 4,715 | 4,825 | 97.7% |
 | ES2019 | 159 | 161 | 98.8% |
 | ES2020 | 1,432 | 2,020 | 70.9% |
 | ES2021 | 597 | 630 | 94.8% |
-| ES2022 | 4,843 | 5,374 | 90.1% |
+| ES2022 | 4,847 | 5,374 | 90.2% |
 | ES2023 | 283 | 284 | 99.6% |
-| ES2024 | 502 | 843 | 59.5% |
-| ES2025 | 818 | 998 | 82.0% |
+| ES2024 | 680 | 843 | 80.7% |
+| ES2025 | 888 | 998 | 89.0% |
 | ES2026 | 375 | 745 | 50.3% |
-| Stage 3 proposals | 465 | 5,650 | 8.2% |
-| **all** | **39,882** | **48,635** | **82.0%** |
+| Stage 3 proposals | 544 | 5,650 | 9.6% |
+| **all** | **40,234** | **48,635** | **82.7%** |
 
 The gaps are mostly whole features: modules (`import()` and top-level
 `await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
-failures, and ES2024's), the RegExp `v` flag and modifiers, explicit
-resource management (`using`), non-ASCII identifiers beyond a rough
+failures, and ES2024's), explicit resource management (`using`),
+non-ASCII identifiers beyond a rough
 approximation (no Unicode ID tables), and early errors for invalid
 syntax that the parser accepts.
 

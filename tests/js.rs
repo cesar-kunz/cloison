@@ -196,6 +196,27 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// Array methods' fast paths: `indexOf` within the length it read, a
+/// subclass's `splice` giving one of its own (ArraySpeciesCreate), and a
+/// prototype chain longer than `Array.prototype`, `Object.prototype` seen.
+#[test]
+fn array_fast_paths_lengths_species_and_chains() {
+    assert_eq!(
+        value(
+            r#"
+var r = [];
+var a = [1, 2]; r.push(a.indexOf(3, { valueOf() { a.push(3); return 0; } }));
+class A extends Array {} var x = new A(1, 2, 3); var rm = x.splice(0, 1); r.push(rm instanceof A, rm.length, x.join());
+var b = [, 1]; var saved = Object.getPrototypeOf(Array.prototype); Object.setPrototypeOf(Array.prototype, { 0: "p" });
+r.push(b.slice().hasOwnProperty(0), b.indexOf("p"), [].concat(b)[0]);
+Object.setPrototypeOf(Array.prototype, saved);
+r.join(" ");
+"#
+        ),
+        "-1 true 1 2,3 true 0 p"
+    );
+}
+
 /// Each run of a `with` statement has its own binding of its object:
 /// closures made in it keep theirs, in a loop, a generator or a script; and
 /// the binding isn't a property of the global object.

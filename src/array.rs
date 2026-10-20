@@ -82,12 +82,15 @@ fn relative(v: Value, len: f64, default: f64) -> f64 {
 
 /// Whether `o` is a plain array whose elements the fast paths may read
 /// directly: no attributes on them, and nothing indexed on its prototype
-/// chain (holes are then absent).
+/// chain (holes are then absent), `Array.prototype` then
+/// `Object.prototype`.
 fn dense(vm: &Vm, o: *mut Object) -> bool {
     unsafe {
         (*o).class == Class::Array
             && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0
             && (*(*o).shape).proto == object_value(vm.array_prototype)
+            && (*(*vm.array_prototype).shape).proto == object_value(vm.object_prototype)
+            && (*(*vm.object_prototype).shape).proto.is_null()
             && (*vm.array_prototype).elems_len == 0
             && (*vm.object_prototype).elems_len == 0
             && (*vm.array_prototype).flags & crate::object::SPARSE == 0
@@ -622,10 +625,16 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if len + n - del > 9007199254740991.0 {
         return Err(Error::type_error("Array length exceeds the maximum"));
     }
-    let removed = new_array_len(vm, del)?;
+    // (ArraySpeciesCreate: a subclass's `splice` gives one of its own.)
+    let removed = species_create(vm, o, del)?;
     // (As in `slice`: `start` and `deleteCount`'s conversions may have
-    // changed the length.)
-    if dense(vm, as_object(o)) && unsafe { (*as_object(o)).elems_len } as f64 == len {
+    // changed the length. The fast path writes `removed`'s elements: an
+    // array's of its own.)
+    if dense(vm, as_object(o))
+        && unsafe { (*as_object(o)).elems_len } as f64 == len
+        && is_object(removed)
+        && dense(vm, as_object(removed))
+    {
         let obj = as_object(o);
         let ro = as_object(removed);
         unsafe {
@@ -814,7 +823,9 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
     if dense(vm, as_object(o)) {
         let obj = as_object(o);
         unsafe {
-            let m = (*obj).elems_len as usize;
+            // (Not past the length it had: `fromIndex`'s conversion may have
+            // pushed more.)
+            let m = ((*obj).elems_len as usize).min(len as usize);
             for i in k as usize..m {
                 let e = *(*obj).elems.add(i);
                 if e != Value::EMPTY && strict_equals(e, x) {

@@ -3098,24 +3098,36 @@ impl<'a> Gen<'a> {
 
     /// Whether `name` here is a named function expression's own name: the
     /// function's, or an enclosing one's, with no parameter or `var` of
-    /// that name in it or in the functions between.
+    /// that name in it or in the functions between. (The function by the
+    /// name found first, by names alone: compiling stores it is on.)
     fn own_name_binding(&self, name: &str) -> bool {
-        let mut g = self.index;
-        loop {
+        let named = |g: usize| {
             let f = &self.p.functions[g];
-            if g == 0
-                || f.params.iter().any(|p| &**p == name)
-                || explicit_declarations(self.p, g).contains(&name)
-            {
+            f.binds_name && f.name.as_deref() == Some(name)
+        };
+        let mut g = self.index;
+        let top = loop {
+            if g == 0 {
                 return false;
             }
-            if own_name(self.p, g) == Some(name) {
-                return true;
+            if named(g) {
+                break g;
             }
-            match f.parent {
+            match self.p.functions[g].parent {
                 Some(q) => g = q,
                 None => return false,
             }
+        };
+        let mut g = self.index;
+        loop {
+            let f = &self.p.functions[g];
+            if f.params.iter().any(|p| &**p == name) || explicit_declarations(self.p, g).contains(&name) {
+                return false;
+            }
+            if g == top {
+                return true;
+            }
+            g = f.parent.unwrap();
         }
     }
 

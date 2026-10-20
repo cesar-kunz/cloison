@@ -4671,10 +4671,33 @@ impl<'a> Gen<'a> {
                 self.emit(Op::LdaHole, &[]);
                 self.star(hole);
                 let v = self.alloc(pos)?;
+                // Where something but a step may throw (a default, a
+                // nested pattern, a target), a handler closes the iterator
+                // unless done (`it` then `undefined`) and throws on: the
+                // steps outside it. (Not otherwise: a function with a
+                // handler isn't compiled.)
+                let close = es.iter().flatten().any(|(p, d)| self.may_throw(p, *d, mode))
+                    || rest.as_ref().is_some_and(|p| self.may_throw(p, None, mode));
+                if close {
+                    self.open_try(None);
+                    self.trys.last_mut().unwrap().close = Some(it);
+                    self.in_try += 1;
+                }
                 for e in es {
+                    // (A target's object and key first, then the step.)
+                    let target = match e {
+                        Some((Pattern::Target(t), _)) => Some(self.target_ref(t, pos)?),
+                        _ => None,
+                    };
                     let have = self.label();
+                    if close {
+                        self.pause_try();
+                    }
                     self.intrinsic("pattern_step", it, 1);
                     self.star(v);
+                    if close {
+                        self.resume_try();
+                    }
                     self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
                     self.jump_if(Jmp::False, have);
                     // Done: no more steps, and `undefined`.
@@ -4684,16 +4707,53 @@ impl<'a> Gen<'a> {
                     self.bind(have);
                     if let Some((p, d)) = e {
                         self.pattern_default(v, *d)?;
-                        self.destructure(p, v, mode, pos)?;
+                        match target {
+                            Some(t) => self.store_target(t, v)?,
+                            None => self.destructure(p, v, mode, pos)?,
+                        }
                     }
                 }
                 if let Some(rest) = rest {
+                    let target = match &**rest {
+                        Pattern::Target(t) => Some(self.target_ref(t, pos)?),
+                        _ => None,
+                    };
+                    if close {
+                        self.pause_try();
+                    }
                     self.intrinsic("iterator_rest", it, 1);
                     self.star(v);
                     self.emit(Op::LdaUndefined, &[]);
                     self.star(it);
-                    self.destructure(rest, v, mode, pos)?;
-                } else {
+                    if close {
+                        self.resume_try();
+                    }
+                    match target {
+                        Some(t) => self.store_target(t, v)?,
+                        None => self.destructure(rest, v, mode, pos)?,
+                    }
+                }
+                if close {
+                    self.in_try -= 1;
+                    let ranges = self.close_try();
+                    let end = self.label();
+                    if self.reachable {
+                        self.jump(end);
+                    }
+                    let handler = self.label();
+                    self.labels[handler.0].used = true;
+                    self.reachable = false;
+                    self.bind(handler);
+                    let at = self.asm.offset() as u32;
+                    self.handlers.extend(ranges.iter().map(|&(s, e)| (s, e, at)));
+                    let e = self.alloc(pos)?;
+                    self.star(e);
+                    self.intrinsic("iterator_close_quiet", it, 1);
+                    self.ldar(e);
+                    self.emit(Op::Throw, &[]);
+                    self.bind(end);
+                }
+                if rest.is_none() {
                     self.intrinsic("iterator_close", it, 1);
                 }
                 self.temp = mark;
@@ -4765,6 +4825,61 @@ impl<'a> Gen<'a> {
     }
 
     /// `v = d` if `v` is `undefined` (a pattern element's default).
+    /// Whether destructuring `p` (with default `d`, in `mode`: see
+    /// [`Self::destructure`]) may throw: a default not a literal, a nested
+    /// pattern, a target, an assignment to what isn't a local variable.
+    fn may_throw(&self, p: &Pattern, d: Option<&Expr>, mode: u8) -> bool {
+        let literal = |e: &Expr| matches!(e.kind, ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Null);
+        if d.is_some_and(|e| !literal(e)) {
+            return true;
+        }
+        match p {
+            Pattern::Name(n) => {
+                mode == 0
+                    && !(self.locals.contains_key(&**n)
+                        && !self.in_with(n)
+                        && !self.needs_check(n, 0)
+                        && !self.p.lexicals.get(&**n).is_some_and(|l| l.constant))
+            }
+            _ => true,
+        }
+    }
+
+    /// An assignment target's object, and key if computed (`o.x`, `o[k]`),
+    /// evaluated into temporaries, and the property's name: for
+    /// [`Self::store_target`] after.
+    fn target_ref(&mut self, t: &Expr, pos: Pos) -> R<(u8, Option<u8>, Option<Name>)> {
+        match &t.kind {
+            ExprKind::Member(o, name) => {
+                let ro = self.alloc(pos)?;
+                self.into(o, ro)?;
+                Ok((ro, None, Some(name.clone())))
+            }
+            ExprKind::Index(o, k) => {
+                let ro = self.alloc(pos)?;
+                self.into(o, ro)?;
+                let rk = self.alloc(pos)?;
+                self.into(k, rk)?;
+                Ok((ro, Some(rk), None))
+            }
+            _ => unsupported(pos, "this destructuring target"),
+        }
+    }
+
+    /// `v` stored into a target [`Self::target_ref`] evaluated.
+    fn store_target(&mut self, (ro, rk, name): (u8, Option<u8>, Option<Name>), v: u8) -> R<()> {
+        self.ldar(v);
+        match (rk, name) {
+            (Some(rk), _) => {
+                let ic = self.auto_ic("[]keyed");
+                self.emit(Op::SetKeyed, &[Arg::Reg(ro), Arg::Reg(rk), ic]);
+                Ok(())
+            }
+            (None, Some(n)) => self.member(Op::SetNamed, ro, &n),
+            _ => unreachable!(),
+        }
+    }
+
     fn pattern_default(&mut self, v: u8, d: Option<&Expr>) -> R<()> {
         let Some(d) = d else { return Ok(()) };
         let skip = self.label();

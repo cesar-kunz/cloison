@@ -4602,9 +4602,17 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 };
             }
             // (A site that gave up on the stencils, but with an int32 key
-            // into a receiver of known shape: `get_keyed_i_nc`, as before.)
+            // into a receiver of known shape whose elements are values (not
+            // a typed array's or buffer's bytes): `get_keyed_i_nc_rt`, whose
+            // holes and indices past the end go through the runtime.
+            // `get_keyed_i_nc` exited there: PdfJS's `this.widths[charcode]`,
+            // 1,270 times a run.)
             let known = ix && matches!(reg, Ty::Obj(_) | Ty::Ext(_));
-            if bytes || matches!(prop, Prop::Typed { .. }) || (prop == Prop::Runtime && !known) {
+            if prop == Prop::Runtime && known && !bytes {
+                out.acc = Any;
+                return Sel::new("get_keyed", "i_nc_rt", out);
+            }
+            if bytes || matches!(prop, Prop::Typed { .. } | Prop::Runtime) {
                 out.acc = Any;
                 let table = unsafe { (*crate::interp::current_vm()).single_chars_at() };
                 return Sel {

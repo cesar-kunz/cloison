@@ -367,6 +367,7 @@ pub(crate) fn install(vm: &mut Vm) {
         to_string_tag(vm, o, tag);
     }
     crate::promise::install_symbols(vm);
+    crate::module::install_symbols(vm);
     to_string_tag(vm, cp[Proto::WeakMap as usize], "WeakMap");
     to_string_tag(vm, cp[Proto::WeakSet as usize], "WeakSet");
     to_string_tag(vm, cp[Proto::WeakRef as usize], "WeakRef");

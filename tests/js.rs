@@ -196,6 +196,24 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// With `i` and `u`, case compares by Unicode simple case folding: the
+/// Kelvin sign is `k`, `ẞ` is `ß`, `ſ` is `s` (and a word character),
+/// `ς` is `σ`; `ı` is only itself. Without `u` none of them.
+#[test]
+fn unicode_case_insensitive_regexps_fold_case() {
+    assert_eq!(
+        value(
+            r#"
+var r = [/K/iu.test("k"), /k/iu.test("K"), /k/i.test("K"), /ß/iu.test("ẞ"), /ß/i.test("ẞ"),
+  /\w/iu.test("ſ"), /\w/i.test("ſ"), /\W/iu.test("ſ"), /[a-z]/iu.test("K"), /s/iu.test("ſ"),
+  /i/iu.test("ı"), /σ/iu.test("ς"), /\bſ/iu.test("ſ"), "xKk".replace(/k/giu, "_")];
+r.join(" ");
+"#
+        ),
+        "true true false true false true false false true true false true true x__"
+    );
+}
+
 /// A lookbehind's body matches backwards, right to left: its greedy
 /// quantifiers and captures as the spec has them, and backreferences in it
 /// to groups on their right.

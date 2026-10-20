@@ -833,6 +833,14 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         _ if crate::typed::is_resizable(b) => None,
         _ => Some(bytes - offset),
     };
+    // (Again: `byteLength`'s conversion may have detached or shrunk it.)
+    if crate::typed::is_detached(b) {
+        return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
+    }
+    let bytes = unsafe { (*b).elems_len } as usize;
+    if offset > bytes || len.is_some_and(|n| offset + n > bytes) {
+        return Err(Error::range_error(format!("Invalid DataView length {}", len.unwrap_or(0))));
+    }
     let proto = object_value(vm.collection_prototypes[Proto::DataView as usize]);
     crate::typed::make_view(vm, Class::DataView, proto, crate::object::TypedKind::U8, b, offset, len)
 }

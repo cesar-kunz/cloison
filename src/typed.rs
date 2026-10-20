@@ -1049,7 +1049,14 @@ fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             let size = k.size();
             let n = e.saturating_sub(s) * size;
             let room = ta_length(out).unwrap_or(0) * size;
-            unsafe { std::ptr::copy((*o).elems.cast::<u8>().add(s * size), (*out).elems.cast::<u8>(), n.min(room)) };
+            // (Byte by byte, first to last, as the spec has it: where `out`
+            // views the same bytes, not as `memmove` would.)
+            unsafe {
+                let (from, to) = ((*o).elems.cast::<u8>().add(s * size), (*out).elems.cast::<u8>());
+                for b in 0..n.min(room) {
+                    *to.add(b) = *from.add(b);
+                }
+            }
         } else {
             vm.handle_scope(|vm| {
                 vm.handles.push(object_value(out));

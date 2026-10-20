@@ -76,6 +76,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("keys", map_keys, 0),
             ("values", map_values, 0),
             ("entries", map_entries, 0),
+            ("getOrInsert", get_or_insert::<false>, 2),
+            ("getOrInsertComputed", get_or_insert_computed::<false>, 2),
         ],
     );
     getter(vm, mp, "size", map_size);
@@ -110,6 +112,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("set", weak_map_set, 2),
             ("has", weak_map_has, 1),
             ("delete", weak_map_delete, 1),
+            ("getOrInsert", get_or_insert::<true>, 2),
+            ("getOrInsertComputed", get_or_insert_computed::<true>, 2),
         ],
     );
     vm.define_natives(
@@ -750,6 +754,60 @@ fn weak_map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn weak_map_has(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::WeakMap, "WeakMap.prototype.has")?;
     Ok(Value::from_bool(find(o, arg(a, 0)).is_some()))
+}
+
+/// `map.getOrInsert(key, value)` (`WEAK`: a `WeakMap`'s): `key`'s value,
+/// `value` added for it first if it has none.
+fn get_or_insert<const WEAK: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of_map::<WEAK>(this, "getOrInsert")?;
+    let k = key_of::<WEAK>(vm, arg(a, 0))?;
+    if let Some(i) = find(o, k) {
+        return Ok(slot(entries(o), i + 1));
+    }
+    let v = arg(a, 1);
+    append(vm, o, &[k, v])?;
+    Ok(v)
+}
+
+/// `map.getOrInsertComputed(key, f)`: `key`'s value, `f(key)` added for
+/// it first if it has none (set over what `f` itself added for it).
+fn get_or_insert_computed<const WEAK: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let o = this_of_map::<WEAK>(this, "getOrInsertComputed")?;
+    let f = arg(a, 1);
+    if !is_callable(f) {
+        return Err(Error::type_error("getOrInsertComputed: the callback is not a function"));
+    }
+    let k = key_of::<WEAK>(vm, arg(a, 0))?;
+    if let Some(i) = find(o, k) {
+        return Ok(slot(entries(o), i + 1));
+    }
+    let v = call_function(vm, f, Value::UNDEFINED, &[k])?;
+    match find(o, k) {
+        Some(i) => vm.set_keyed(object_value(entries(o)), Value::from_i32(i as i32 + 1), v)?,
+        None => append(vm, o, &[k, v])?,
+    }
+    Ok(v)
+}
+
+fn this_of_map<const WEAK: bool>(this: Value, method: &str) -> Result<*mut Object> {
+    if WEAK {
+        this_of(this, Class::WeakMap, &format!("WeakMap.prototype.{method}"))
+    } else {
+        this_of(this, Class::Map, &format!("Map.prototype.{method}"))
+    }
+}
+
+/// A key as a map holds it: -0 as +0; for a `WeakMap`, only one that can
+/// be held weakly.
+fn key_of<const WEAK: bool>(vm: &Vm, k: Value) -> Result<Value> {
+    if WEAK {
+        if !can_be_held_weakly(vm, k) {
+            return Err(Error::type_error("Invalid value used as weak map key"));
+        }
+        Ok(k)
+    } else {
+        Ok(normalize(k))
+    }
 }
 
 fn weak_map_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

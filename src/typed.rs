@@ -628,8 +628,11 @@ fn iterate_with(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
     }
     vm.handles.push(it);
+    let a_next = vm.intern("next");
+    let next = vm.get(it, a_next)?;
+    vm.handles.push(next);
     let mut out = Vec::new();
-    while let Some(x) = crate::symbol::step(vm, it)? {
+    while let Some(x) = crate::symbol::step_with(vm, it, next)? {
         vm.handles.push(x);
         out.push(x);
     }

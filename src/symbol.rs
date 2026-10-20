@@ -522,10 +522,33 @@ pub(crate) fn get_iterator(vm: &mut Vm, v: Value) -> Result<Value> {
     Ok(it)
 }
 
-/// IteratorStep: the next value, or `None` when done.
-pub(crate) fn step(vm: &mut Vm, it: Value) -> Result<Option<Value>> {
+/// An iterator record for bytecode, which keeps it in a register: the
+/// iterator and its `next`, read once as GetIterator does, in the two
+/// in-object slots of an object no JS code ever sees (no properties, the
+/// collector tracing the slots by its capacity).
+pub(crate) fn record(vm: &mut Vm, it: Value) -> Result<Value> {
     let a_next = vm.intern("next");
     let next = vm.get(it, a_next)?;
+    let o = vm.new_object_with(crate::object::Class::Plain, Value::NULL, 2);
+    for (i, v) in [it, next].into_iter().enumerate() {
+        unsafe {
+            let at = crate::object::Object::inline(o, i);
+            *at = v;
+            crate::heap::barrier(o.cast(), at, v);
+        }
+    }
+    Ok(crate::object::object_value(o))
+}
+
+/// A [`record`]'s iterator and `next`.
+pub(crate) fn record_parts(r: Value) -> (Value, Value) {
+    let o = crate::object::as_object(r);
+    unsafe { (*crate::object::Object::inline(o, 0), *crate::object::Object::inline(o, 1)) }
+}
+
+/// IteratorStep of `it` with its `next`: the next value, or `None` when
+/// done.
+pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
     if !is_callable(next) {
         return Err(Error::type_error("iterator.next is not a function"));
     }
@@ -564,9 +587,11 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
 /// Each value `v` iterates over, to `f` (the iterator closed if `f`
 /// fails).
 pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
-    // (`it` is rooted on the native stack.)
+    // (`it` and `next` are rooted on the native stack.)
     let it = get_iterator(vm, v)?;
-    while let Some(x) = step(vm, it)? {
+    let a_next = vm.intern("next");
+    let next = vm.get(it, a_next)?;
+    while let Some(x) = step_with(vm, it, next)? {
         if let Err(e) = f(vm, x) {
             let _ = close(vm, it);
             return Err(e);

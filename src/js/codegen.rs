@@ -469,13 +469,22 @@ fn eval_scope(p: &Program, i: usize) -> Option<usize> {
 fn eval_outer_names<'a>(p: &'a Program, decls: &[Decls<'a>], i: usize) -> Vec<&'a str> {
     let mut out: Vec<&'a str> = Vec::new();
     let mut j = p.functions[i].parent;
+    // (Through arrows only: the function's `arguments` and `new.target`
+    // are an arrow's too.)
+    let mut arrows = p.functions[i].arrow;
     while let Some(k) = j.filter(|&k| k != 0) {
         for &n in &decls[k].list {
+            let own = matches!(n, "arguments" | "%newtarget");
+            if own && arrows && !decls[i].contains(&n) && !out.contains(&n) {
+                out.push(n);
+                continue;
+            }
             if n.contains('%') || n == "arguments" || p.lexicals.contains_key(n) || decls[i].contains(&n) || out.contains(&n) {
                 continue;
             }
             out.push(n);
         }
+        arrows &= p.functions[k].arrow;
         j = p.functions[k].parent;
     }
     out

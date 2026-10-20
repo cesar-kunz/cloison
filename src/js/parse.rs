@@ -542,6 +542,9 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.expect(")")?;
                 let name: Name = format!("%with{}", self.with_count).into();
                 self.with_count += 1;
+                // (A variable of the function's own, also a script's: not a
+                // property of the global object.)
+                self.hidden_var(name.clone());
                 self.withs.push(name.clone());
                 let body = self.sub_statement();
                 self.withs.pop();

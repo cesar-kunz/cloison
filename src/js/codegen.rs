@@ -939,10 +939,8 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
                     stmt(b, p, out);
                 }
             }
-            StmtKind::With(_, name, body) => {
-                add(name, out);
-                stmt(body, p, out)
-            }
+            // (Its object's variable: `Function::hidden`.)
+            StmtKind::With(_, _, body) => stmt(body, p, out),
             StmtKind::For { body, .. }
             | StmtKind::ForIn { body, .. }
             | StmtKind::ForOf { body, .. }
@@ -5359,6 +5357,12 @@ impl<'a> Gen<'a> {
             }
             StmtKind::DoWhile(body, c) => self.looping(labels, Some(c), None, body, false)?,
             StmtKind::With(o, name, body) => {
+                // (Each time the statement runs, its own binding: closures in
+                // it keep their object, `for (…) with (o) f = () => x`. First:
+                // a box's copies its value through `acc`.)
+                let saved = std::mem::take(&mut self.withs);
+                self.fresh_binding(name, false, s.pos)?;
+                self.withs = saved;
                 let mark = self.temp;
                 let t = self.alloc(s.pos)?;
                 self.into(o, t)?;

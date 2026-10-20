@@ -196,6 +196,27 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// Each run of a `with` statement has its own binding of its object:
+/// closures made in it keep theirs, in a loop, a generator or a script; and
+/// the binding isn't a property of the global object.
+#[test]
+fn with_objects_are_bound_per_execution() {
+    assert_eq!(
+        value(
+            r#"
+var r = [];
+var fs = []; for (var i = 0; i < 3; i++) { with ({ i }) fs.push(() => i); } r.push(fs.map(f => f()).join());
+var gs = []; for (var o of [{ v: "a" }, { v: "b" }]) with (o) gs.push(function () { return v; }); r.push(gs.map(f => f()).join());
+function* g() { for (var j = 0; j < 2; j++) with ({ j }) yield () => j; } r.push([...g()].map(f => f()).join());
+function h() { var hs = []; for (var k = 0; k < 2; k++) with ({ k }) hs.push(() => k); return hs.map(f => f()).join(); } r.push(h());
+r.push(Object.getOwnPropertyNames(globalThis).some(k => k[0] == "%"));
+r.join(" ");
+"#
+        ),
+        "0,1,2 a,b 0,1 0,1 false"
+    );
+}
+
 /// A derived class's constructor checks what it returns as it returns,
 /// after its `finally` blocks and outside its own `try`s: a `catch` in it
 /// doesn't catch the TypeError, a `super()` in a `finally` counts.

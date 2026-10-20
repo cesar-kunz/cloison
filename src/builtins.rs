@@ -712,7 +712,7 @@ fn string_html<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<
 /// string; `""`: each code unit), or a regular expression (its captures
 /// spliced in).
 fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "split", this, a)? {
+    if let Some(r) = delegate(vm, "split", this, a, string_split)? {
         return Ok(r);
     }
     let u = this_units(this)?.into_owned();
@@ -2208,7 +2208,9 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
 
 /// A String method's pattern `a[0]`, if an object (not a RegExp) with a
 /// `Symbol.<name>` method: that method's result, of `this` and the rest.
-fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value]) -> Result<Option<Value>> {
+/// A RegExp without one is a string, as any object: the method `f` again
+/// with it as one (else its fast path would take it for a RegExp).
+fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> Result<Option<Value>> {
     let k = ["match", "matchAll", "replace", "search", "split"].iter().position(|&n| n == name).unwrap_or(0);
     let pattern = arg(a, 0);
     if !crate::props::is_object(pattern) {
@@ -2224,7 +2226,16 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value]) -> Result<Option<
     let atom = vm.regexp_atoms[1 + k];
     let m = vm.get(pattern, atom)?;
     if m.is_undefined() || m.is_null() {
-        return Ok(None);
+        if regexp_of(pattern).is_none() {
+            return Ok(None);
+        }
+        let u = crate::interp::to_string_units(pattern);
+        if vm.conv_thrown {
+            return Err(vm.take_conv_error());
+        }
+        let mut args = vec![vm.new_string(&u)];
+        args.extend_from_slice(a.get(1..).unwrap_or(&[]));
+        return f(vm, this, &args).map(Some);
     }
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
@@ -2232,7 +2243,7 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value]) -> Result<Option<
 }
 
 fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "matchAll", this, a)? {
+    if let Some(r) = delegate(vm, "matchAll", this, a, string_match_all)? {
         return Ok(r);
     }
     let s = this_units(this)?;
@@ -2273,7 +2284,7 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `s.match(re)`: `exec`'s array, or with `g` every match (`null` if
 /// none).
 fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "match", this, a)? {
+    if let Some(r) = delegate(vm, "match", this, a, string_match)? {
         return Ok(r);
     }
     let s = this_units(this)?;
@@ -2310,7 +2321,7 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "search", this, a)? {
+    if let Some(r) = delegate(vm, "search", this, a, string_search)? {
         return Ok(r);
     }
     let s = this_units(this)?;
@@ -2324,7 +2335,7 @@ fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// a string (with `$&`, `$1`…, `$$`, `` $` ``, `$'`) or a function's
 /// result (called with the match, the groups, the index and `s`).
 fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "replace", this, a)? {
+    if let Some(r) = delegate(vm, "replace", this, a, string_replace)? {
         return Ok(r);
     }
     replace(vm, this, a, false)
@@ -2333,13 +2344,43 @@ fn string_replace(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `s.replaceAll(pattern, replacement)`: every match replaced (a
 /// `RegExp` pattern must be global).
 fn string_replace_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    if let Some(r) = delegate(vm, "replace", this, a)? {
+    if this.is_undefined() || this.is_null() {
+        return Err(Error::type_error("String.prototype.replaceAll called on null or undefined"));
+    }
+    // A RegExp (IsRegExp) whose `flags` have no "g": first.
+    let pattern = arg(a, 0);
+    if is_regexp(vm, pattern)? {
+        let a_flags = vm.intern("flags");
+        let flags = vm.get(pattern, a_flags)?;
+        if flags.is_undefined() || flags.is_null() {
+            return Err(Error::type_error("String.prototype.replaceAll called with a RegExp whose flags are undefined"));
+        }
+        let f = crate::interp::to_string_units(flags);
+        if vm.conv_thrown {
+            return Err(vm.take_conv_error());
+        }
+        // (Not `[u16]::contains`: another caller of it slows RegExp's
+        // searches, which then call it out of line.)
+        if !f.iter().any(|&c| c == b'g' as u16) {
+            return Err(Error::type_error("replaceAll must be called with a global RegExp"));
+        }
+    }
+    if let Some(r) = delegate(vm, "replace", this, a, string_replace_all)? {
         return Ok(r);
     }
-    if regexp_of(arg(a, 0)).is_some_and(|re| !re.global) {
-        return Err(Error::type_error("replaceAll must be called with a global RegExp"));
-    }
     replace(vm, this, a, true)
+}
+
+/// IsRegExp(v): an object whose `Symbol.match` says so, else a RegExp.
+fn is_regexp(vm: &mut Vm, v: Value) -> Result<bool> {
+    if !crate::props::is_object(v) {
+        return Ok(false);
+    }
+    let m = vm.get(v, vm.regexp_atoms[1])?;
+    if !m.is_undefined() {
+        return Ok(crate::interp::to_boolean(m));
+    }
+    Ok(is_class(v, Class::RegExp))
 }
 
 /// `replace` (`all`: `replaceAll`).
@@ -2524,6 +2565,9 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
         let (mut p, mut q) = (0, 0);
         while q < s.len() {
             match re.exec(s, q) {
+                // (A sticky one's match only at `q`: the splitter's, which
+                // always is, tries the next position.)
+                None if re.sticky => q += 1,
                 None => break,
                 Some(caps) => {
                     let (x, e) = caps[0].unwrap();
@@ -2729,7 +2773,19 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     }
     unsafe {
         let rp = vm.regexp_prototype;
-        if (*as_object(rx)).shape == vm.regexp_shapes.1 && (*rp).shape == vm.regexp_proto_shape {
+        // (Its `global`, `ignoreCase` and `multiline`, slots 2 to 4, as it
+        // was made: redefined, they may not be.)
+        let s = vm.regexp_shapes.1;
+        let flags_kept = |re: &crate::regexp::Regex| {
+            let flag = |i: u32| *Object::slot(as_object(rx), (*s).location(i));
+            flag(2) == Value::from_bool(re.global)
+                && flag(3) == Value::from_bool(re.ignore_case)
+                && flag(4) == Value::from_bool(re.multiline)
+        };
+        if (*as_object(rx)).shape == s
+            && (*rp).shape == vm.regexp_proto_shape
+            && regexp_of(rx).is_some_and(flags_kept)
+        {
             let at = |i: usize| *Object::slot(rp, vm.regexp_slots[i]);
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
             return Ok(ok(0) && k.is_none_or(|k| ok(1 + k)));
@@ -2743,6 +2799,29 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
 #[cold]
 #[inline(never)]
 fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
+    // (Not with own flags other than it was made with, which the
+    // algorithms read: the fast paths take the ones it has. Its own
+    // `global`, `ignoreCase` and `multiline` are data properties; an own
+    // `flags` is left alone, as V8 does: the generic paths would loop on
+    // a "g" the RegExp hasn't.)
+    if let Some(re) = regexp_of(rx) {
+        let flags = [
+            ("global", re.global),
+            ("ignoreCase", re.ignore_case),
+            ("multiline", re.multiline),
+            ("sticky", re.sticky),
+            ("unicode", re.unicode),
+            ("dotAll", re.dot_all),
+        ];
+        for (name, has) in flags {
+            let a = vm.intern(name);
+            if let Some(d) = vm.own_property(as_object(rx), crate::vm::Key::Name(a))
+                && d.value != Some(Value::from_bool(has))
+            {
+                return Ok(false);
+            }
+        }
+    }
     let a = vm.regexp_atoms[0];
     let e = vm.get(rx, a)?;
     if !(e.is_cell() && as_object(e) == vm.regexp_fns[0]) {

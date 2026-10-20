@@ -196,6 +196,24 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// A lookbehind's body matches backwards, right to left: its greedy
+/// quantifiers and captures as the spec has them, and backreferences in it
+/// to groups on their right.
+#[test]
+fn lookbehind_matches_backwards() {
+    assert_eq!(
+        value(
+            r#"
+function j(m) { return JSON.stringify(m); }
+[j(/(?<=(\d+)(\d+))$/.exec("1053")), j(/(?<=(\w)+)c/.exec("abc")), j(/(?<=(a|b)*)c/.exec("abc")),
+ j(/(?<=(a)\1)b/.exec("aab")), j(/(?<=\1(a))b/.exec("aab")), j(/(?<=(.))x/u.exec("\u{1F600}x")),
+ j(/(?<=\$)\d+(\.\d*)?/.exec("cost $10.53")), j(/(?<=ab(?=c)\w)d/.exec("abcd")), j(/(?<=x{2,3})y/.exec("xxxy"))].join(" ");
+"#
+        ),
+        r#"["","1","053"] ["c","a"] ["c","a"] ["b","a"] ["b","a"] ["x","😀"] ["10.53",".53"] ["d"] ["y"]"#
+    );
+}
+
 /// In `u` mode the input is code points: an empty match advances past a
 /// surrogate pair, and a lone surrogate (a character, a class member)
 /// matches alone, not half of a pair; an escaped pair is its code point.

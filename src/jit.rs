@@ -15274,7 +15274,7 @@ unsafe fn vm_run_(
     pc: usize,
     acc: Value,
 ) -> VmRun {
-    if pc == 0 && interp::native_stack_low(vm) {
+    if pc == 0 && interp::native_stack_low(vm) || !vm.realms.is_empty() {
         return VmRun::Interpret;
     }
     let vm_ptr: *mut crate::vm::Vm = vm;

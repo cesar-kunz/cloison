@@ -188,6 +188,13 @@ fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
     }
     let a_constructor = vm.a_constructor;
     let mut c = vm.get(original, a_constructor)?;
+    // (Another realm's `Array`: an array of this one's.)
+    if !vm.realms.is_empty() && crate::intrinsics::is_constructor(c) {
+        let r = crate::realm::function_realm(vm, c)?;
+        if r != vm.realm && crate::realm::intrinsic(vm, r, |vm| object_value(vm.array_fn)) == c {
+            c = Value::UNDEFINED;
+        }
+    }
     if crate::props::is_object(c) {
         let a_species = vm.intern(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
         c = vm.get(c, a_species)?;

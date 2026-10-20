@@ -120,6 +120,15 @@ pub fn compile_indirect_eval(src: &str) -> Result<Module, String> {
     .map_err(|e| e.display(src))
 }
 
+/// [`compile_indirect_eval`] of strict code: a strict script's own direct
+/// `eval`'s (as an indirect one's, but strict).
+pub fn compile_strict_eval(src: &str) -> Result<Module, String> {
+    parse::STRICT.set(true);
+    let r = compile_indirect_eval(src);
+    parse::STRICT.set(false);
+    r
+}
+
 /// Compile `src` as direct `eval`'s code (`strict`: the caller is), in
 /// `withs` `with` statements: its names looked up in their objects, then
 /// in the caller's scope object (see `intrinsics::direct_eval`).

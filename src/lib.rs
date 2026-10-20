@@ -35,6 +35,8 @@ mod date;
 mod json;
 mod promise;
 mod proxy;
+mod realm;
+mod shadow;
 pub mod props;
 pub mod regexp;
 mod unicode_props;

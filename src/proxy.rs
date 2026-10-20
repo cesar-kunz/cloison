@@ -33,6 +33,10 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.native_function("", revoke, 0, any, false),
     ]
     .map(|f| unsafe { (*f).code });
+    // (A proxy's call runs in its caller's realm: see `realm`.)
+    for c in vm.proxy_codes {
+        unsafe { (*c.cast_mut()).realm = crate::realm::NONE };
+    }
 }
 
 /// Whether `o` is a proxy.
@@ -707,4 +711,9 @@ pub(crate) fn is_array(vm: &Vm, v: Value) -> Result<bool> {
     }
     let o = final_target(vm, as_object(v))?;
     Ok(unsafe { (*o).class } == Class::Array)
+}
+
+/// Proxy `o`'s target (a TypeError once revoked).
+pub(crate) fn target(o: *mut Object) -> Result<Value> {
+    Ok(parts(o)?.0)
 }

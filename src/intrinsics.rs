@@ -35,6 +35,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("super_set_sloppy", super_set_sloppy),
     ("super_call", super_call),
     ("derived_return", derived_return),
+    ("strict_eval", strict_eval),
     ("class_call_check", class_call_check),
     ("get_iterator", get_iterator),
     ("iterator_step", iterator_step),
@@ -256,6 +257,13 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
         let proto = vm.get(nt, a)?;
         if crate::props::is_object(proto) {
             vm.set_prototype_of(as_object(r), proto);
+        } else if !vm.realms.is_empty() {
+            // (The builtin's prototype of `nt`'s realm.)
+            let own = unsafe { (*(*as_object(r)).shape).proto };
+            let p = crate::realm::default_proto(vm, nt, own)?;
+            if p != own {
+                vm.set_prototype_of(as_object(r), p);
+            }
         }
         // (A view's buffer checked again after: the spec reads the
         // prototype first, and its getter may have detached or shrunk it.)
@@ -287,7 +295,11 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
 fn prototype_of_target(vm: &mut Vm, nt: Value) -> Result<Value> {
     let a = vm.a_prototype;
     let p = vm.get(nt, a)?;
-    Ok(if crate::props::is_object(p) { p } else { object_value(vm.object_prototype) })
+    if crate::props::is_object(p) {
+        return Ok(p);
+    }
+    let op = object_value(vm.object_prototype);
+    crate::realm::default_proto(vm, nt, op)
 }
 
 /// A template literal: `[s0, e1, s1, e2, …]`, each substitution's
@@ -621,6 +633,10 @@ fn super_call(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(r)
 }
 
+pub(crate) const DERIVED_RESULT: &str = "TypeError: Derived constructors may only return object or undefined";
+pub(crate) const DERIVED_THIS: &str =
+    "ReferenceError: Must call super constructor in derived class before accessing 'this' or returning from derived constructor";
+
 /// What a derived class's constructor returns, `[v, this]`: `v` if an
 /// object, else `this` (initialized: `super()` called).
 fn derived_return(_: &mut Vm, a: &[Value]) -> Result<Value> {
@@ -629,12 +645,10 @@ fn derived_return(_: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(v);
     }
     if !v.is_undefined() {
-        return Err(Error::type_error("Derived constructors may only return object or undefined"));
+        return Err(Error(DERIVED_RESULT.into(), None));
     }
     if this == Value::HOLE {
-        return Err(Error::reference_error(
-            "Must call super constructor in derived class before accessing 'this' or returning from derived constructor",
-        ));
+        return Err(Error(DERIVED_THIS.into(), None));
     }
     Ok(this)
 }
@@ -807,6 +821,29 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let r = crate::interp::run_script_with(vm, code, this);
     vm.eval_envs.pop();
     r
+}
+
+/// A direct `eval(source)` of a strict script's own: `[eval, source]`.
+/// As the builtin `eval`'s (indirect) of strict code.
+fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (f, src) = (a[0], a[1]);
+    if !(f.is_cell() && as_object(f) == vm.eval_function) {
+        return call_function(vm, f, Value::UNDEFINED, &[src]);
+    }
+    let Some(u) = crate::vm::string_units(src) else {
+        return Ok(src);
+    };
+    let text = crate::vm::source_text(u);
+    let module = crate::js::compile_strict_eval(&text).map_err(|e| {
+        if e.contains("unsupported") {
+            Error(format!("unsupported: in eval'd code: {e}"), None)
+        } else {
+            Error(format!("SyntaxError: {e}"), None)
+        }
+    })?;
+    vm.global_declarations(&module, true)?;
+    let code = vm.load(module);
+    crate::interp::run_script_at(vm, code)
 }
 
 /// Direct `eval`'s code's first instructions': `[k]` the caller's scope

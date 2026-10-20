@@ -54,6 +54,11 @@ pub fn parse_source<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool) -> Result<
     parse_source_as(src, arena, skim, None)
 }
 
+thread_local! {
+    /// Scripts parsed are strict code (see `js::compile_strict_eval`).
+    pub(crate) static STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, and
 /// in that many `with` statements).
 pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize)>) -> Result<Program<'a>, Error> {
@@ -177,7 +182,8 @@ fn parse_pass<'a, 'p>(
         fields: None,
         module: false,
     });
-    p.functions[0].strict = p.directive_prologue() || eval.is_some_and(|(strict, _)| strict) || module.is_some();
+    p.functions[0].strict =
+        p.directive_prologue() || eval.is_some_and(|(strict, _)| strict) || module.is_some() || STRICT.get();
     if let Some((_, withs)) = eval {
         // The caller's scope object, the objects of the `with` statements
         // around the `eval` (outermost first), then the eval's own (for

@@ -133,23 +133,22 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES5 (untagged) | 16,511 | 17,067 | 96.7% |
 | ES2015 | 8,771 | 9,197 | 95.4% |
 | ES2016 | 97 | 100 | 97.0% |
-| ES2017 | 335 | 741 | 45.2% |
+| ES2017 | 356 | 741 | 48.0% |
 | ES2018 | 4,715 | 4,825 | 97.7% |
 | ES2019 | 159 | 161 | 98.8% |
 | ES2020 | 1,432 | 2,020 | 70.9% |
 | ES2021 | 597 | 630 | 94.8% |
-| ES2022 | 4,847 | 5,374 | 90.2% |
+| ES2022 | 4,871 | 5,374 | 90.6% |
 | ES2023 | 283 | 284 | 99.6% |
 | ES2024 | 680 | 843 | 80.7% |
 | ES2025 | 888 | 998 | 89.0% |
-| ES2026 | 375 | 745 | 50.3% |
+| ES2026 | 721 | 745 | 96.8% |
 | Stage 3 proposals | 544 | 5,650 | 9.6% |
-| **all** | **40,234** | **48,635** | **82.7%** |
+| **all** | **40,625** | **48,635** | **83.5%** |
 
 The gaps are mostly whole features: modules (`import()` and top-level
 `await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
-failures, and ES2024's), explicit resource management (`using`),
-non-ASCII identifiers beyond a rough
+failures, and ES2024's), non-ASCII identifiers beyond a rough
 approximation (no Unicode ID tables), and early errors for invalid
 syntax that the parser accepts.
 
@@ -328,7 +327,7 @@ targets.
 - **Language gaps.** Strict mode, `let`/`const`, classes, arrows,
   templates, destructuring, spread, symbols, iterators, generators,
   async functions and generators, `Reflect`, `Proxy`, BigInt, class
-  fields and iterator helpers are in; modules, non-ASCII identifiers (no Unicode ID tables),
+  fields, iterator helpers and `using` declarations are in; modules, non-ASCII identifiers (no Unicode ID tables),
   array indices past 2^28 and Unicode case folding in regexps are not.
   See [Standards support](#standards-support) for test262 by edition;
   Octane and about 100 programs are also checked against Node.

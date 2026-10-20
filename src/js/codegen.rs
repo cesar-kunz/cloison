@@ -4212,13 +4212,21 @@ impl<'a> Gen<'a> {
             let mut bindings: Vec<(&str, &str, i32)> = visible
                 .chunks(3)
                 .filter_map(|t| match (&t[0].kind, &t[1].kind, &t[2].kind) {
+                    // (An enclosing function's, past the function's own
+                    // variables: to the `eval` as an enclosing function's
+                    // variable, which a `var` it declares shadows.)
+                    (ExprKind::Str(o), ExprKind::Ident(v), ExprKind::Num(k)) if *k as u8 & EVAL_OUTER != 0 => {
+                        Some((o.as_str(), &**v, (*k as u8 & !EVAL_OUTER) as i32))
+                    }
                     (ExprKind::Str(o), ExprKind::Ident(v), ExprKind::Num(k)) => {
                         Some((o.as_str(), &**v, *k as i32 | EVAL_BLOCK_SCOPED as i32))
                     }
                     _ => None,
                 })
                 .collect();
-            let lexical = bindings.len();
+            // (Block-scoped first: an enclosing function's after.)
+            bindings.sort_by_key(|b| b.2 & EVAL_BLOCK_SCOPED as i32 == 0);
+            let lexical = bindings.iter().filter(|b| b.2 & EVAL_BLOCK_SCOPED as i32 != 0).count();
             for n in eval_outer_names(self.p, self.decls, self.index) {
                 if !bindings.iter().any(|(o, ..)| *o == n) {
                     bindings.push((n, n, 0));

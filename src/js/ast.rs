@@ -192,6 +192,9 @@ pub const EVAL_CONST: u8 = 1;
 pub const EVAL_CATCH: u8 = 2;
 pub const EVAL_BLOCK_SCOPED: u8 = 4;
 pub const EVAL_BOXED: u8 = 8;
+/// An enclosing function's (past the `eval`'s function's own scope): a
+/// `var` the `eval` declares shadows it, as a variable of the function's.
+pub const EVAL_OUTER: u8 = 16;
 
 #[derive(Debug)]
 pub struct Stmt<'a> {

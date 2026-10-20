@@ -20,6 +20,7 @@ instruction.
 cargo build --release
 target/release/cloison bench/micro/87-constraint-solver.js   # prints the completion value
 target/release/cloison --dump file.js                         # the bytecode instead
+target/release/cloison --module main.mjs                      # a module (a .mjs file is one anyway)
 ```
 
 Status (2026-10-14): every Octane benchmark runs, with a generational
@@ -124,31 +125,31 @@ heap sandboxing and defers it.
 test262 at d53ebc8, every test under `built-ins`, `language` and
 `annexB` (not `intl402` or `staging`), run as its `INTERPRETING.md`
 says: in both strict and sloppy mode unless flagged, negative tests in
-their phase, async tests to completion; module tests fail, as cloison has no
-modules. A test counts toward the latest edition of its features; an
+their phase, async tests to completion, module tests as modules (the
+harness a script run first: `cloison --prelude harness.js --module test.js`).
+A test counts toward the latest edition of its features; an
 untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,511 | 17,067 | 96.7% |
-| ES2015 | 8,771 | 9,197 | 95.4% |
+| ES5 (untagged) | 16,767 | 17,067 | 98.2% |
+| ES2015 | 8,823 | 9,197 | 95.9% |
 | ES2016 | 97 | 100 | 97.0% |
 | ES2017 | 356 | 741 | 48.0% |
 | ES2018 | 4,715 | 4,825 | 97.7% |
 | ES2019 | 159 | 161 | 98.8% |
-| ES2020 | 1,432 | 2,020 | 70.9% |
+| ES2020 | 1,875 | 2,020 | 92.8% |
 | ES2021 | 597 | 630 | 94.8% |
-| ES2022 | 4,871 | 5,374 | 90.6% |
-| ES2023 | 283 | 284 | 99.6% |
-| ES2024 | 680 | 843 | 80.7% |
-| ES2025 | 888 | 998 | 89.0% |
-| ES2026 | 721 | 745 | 96.8% |
-| Stage 3 proposals | 544 | 5,650 | 9.6% |
-| **all** | **40,625** | **48,635** | **83.5%** |
+| ES2022 | 5,159 | 5,374 | 96.0% |
+| ES2023 | 284 | 284 | 100.0% |
+| ES2024 | 683 | 843 | 81.0% |
+| ES2025 | 976 | 998 | 97.8% |
+| ES2026 | 733 | 745 | 98.4% |
+| Stage 3 proposals | 551 | 5,650 | 9.8% |
+| **all** | **41,775** | **48,635** | **85.9%** |
 
-The gaps are mostly whole features: modules (`import()` and top-level
-`await` too), `SharedArrayBuffer` and `Atomics` (most of ES2017's
-failures, and ES2024's), non-ASCII identifiers beyond a rough
+The gaps are mostly whole features: `SharedArrayBuffer` and `Atomics`
+(most of ES2017's failures, and ES2024's), non-ASCII identifiers beyond a rough
 approximation (no Unicode ID tables), and early errors for invalid
 syntax that the parser accepts.
 
@@ -327,7 +328,8 @@ targets.
 - **Language gaps.** Strict mode, `let`/`const`, classes, arrows,
   templates, destructuring, spread, symbols, iterators, generators,
   async functions and generators, `Reflect`, `Proxy`, BigInt, class
-  fields, iterator helpers and `using` declarations are in; modules, non-ASCII identifiers (no Unicode ID tables),
+  fields, iterator helpers, `using` declarations and modules (top-level
+  `await`, `import()`, JSON modules) are in; non-ASCII identifiers (no Unicode ID tables),
   array indices past 2^28 and Unicode case folding in regexps are not.
   See [Standards support](#standards-support) for test262 by edition;
   Octane and about 100 programs are also checked against Node.

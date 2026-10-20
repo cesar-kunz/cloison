@@ -490,13 +490,32 @@ fn string_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn string_to_lower_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let s = String::from_utf16_lossy(&this_units(this)?).to_lowercase();
-    Ok(str_value(vm, &s))
+    let u = map_case(&this_units(this)?, str::to_lowercase);
+    Ok(vm.new_string(&u))
 }
 
 fn string_to_upper_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let s = String::from_utf16_lossy(&this_units(this)?).to_uppercase();
-    Ok(str_value(vm, &s))
+    let u = map_case(&this_units(this)?, str::to_uppercase);
+    Ok(vm.new_string(&u))
+}
+
+/// `u` with `f` (`to_lowercase`, `to_uppercase`) applied to its runs of
+/// code points: a lone surrogate stays as it is (not U+FFFD).
+fn map_case(u: &[u16], f: fn(&str) -> String) -> Vec<u16> {
+    let mut out = Vec::with_capacity(u.len());
+    let mut run = String::new();
+    for c in char::decode_utf16(u.iter().copied()) {
+        match c {
+            Ok(c) => run.push(c),
+            Err(e) => {
+                out.extend(f(&run).encode_utf16());
+                run.clear();
+                out.push(e.unpaired_surrogate());
+            }
+        }
+    }
+    out.extend(f(&run).encode_utf16());
+    out
 }
 
 /// JavaScript's whitespace and line terminators.
@@ -841,9 +860,9 @@ pub(crate) fn async_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<
 fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
     let mut params = Vec::new();
     for &p in a.iter().take(a.len().saturating_sub(1)) {
-        params.push(String::from_utf16_lossy(&units(p)));
+        params.push(crate::vm::source_text(&units(p)));
     }
-    let body = a.last().map_or(String::new(), |&b| String::from_utf16_lossy(&units(b)));
+    let body = a.last().map_or(String::new(), |&b| crate::vm::source_text(&units(b)));
     let params = params.join(",");
     // The parameters and the body each as such (CreateDynamicFunction
     // parses them apart), not ending the function early.
@@ -870,7 +889,7 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let src = if u.iter().all(|&c| c < 0x80) {
         String::from_utf8(u.iter().map(|&c| c as u8).collect()).unwrap()
     } else {
-        String::from_utf16_lossy(u)
+        crate::vm::source_text(u)
     };
     let module = crate::js::compile_indirect_eval(&src).map_err(|e| {
         if e.contains("unsupported") {
@@ -887,7 +906,7 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// `$262.evalScript(src)`: `src` run as a script of its own.
 fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = arg(a, 0);
-    let src = String::from_utf16_lossy(string_units(x).unwrap_or(&[]));
+    let src = crate::vm::source_text(string_units(x).unwrap_or(&[]));
     let module = crate::js::compile_script_lazy(&src).map_err(|e| Error(format!("SyntaxError: {e}"), None))?;
     vm.declare_script(&module)?;
     let code = vm.load(module);
@@ -1856,7 +1875,7 @@ pub(crate) fn regexp_literal(vm: &mut Vm, pattern: Value, flags: Value) -> Resul
     let re = match vm.regexp_literals.get(&key) {
         Some(&re) => re,
         None => {
-            let (p, f) = (String::from_utf16_lossy(&units(pattern)), String::from_utf16_lossy(&units(flags)));
+            let (p, f) = (crate::vm::source_text(&units(pattern)), String::from_utf16_lossy(&units(flags)));
             let made = new_regexp(vm, &p, &f)?;
             vm.regexp_literals.insert(key, regexp_of(made).unwrap());
             return Ok(made);
@@ -1915,13 +1934,13 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         let a_source = vm.a_source;
         let src = vm.get(pattern, a_source)?;
-        let src = String::from_utf16_lossy(string_units(src).unwrap_or(&[]));
+        let src = crate::vm::source_text(string_units(src).unwrap_or(&[]));
         (if src == "(?:)" { String::new() } else { src }, regexp_flags(re))
     } else {
         let p = if pattern.is_undefined() {
             String::new()
         } else {
-            String::from_utf16_lossy(string_units(crate::intrinsics::to_string(vm, pattern)?).unwrap_or(&[]))
+            crate::vm::source_text(string_units(crate::intrinsics::to_string(vm, pattern)?).unwrap_or(&[]))
         };
         let f = if flags.is_undefined() {
             String::new()
@@ -1967,10 +1986,10 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let (mut pattern, mut flags) = (String::new(), String::new());
     if let Some(re) = regexp_of(p) {
         let a_source = vm.intern("source");
-        pattern = String::from_utf16_lossy(&units(vm.get(p, a_source)?));
+        pattern = crate::vm::source_text(&units(vm.get(p, a_source)?));
         flags = regexp_flags(re);
     } else if !p.is_undefined() {
-        pattern = String::from_utf16_lossy(&units(p));
+        pattern = crate::vm::source_text(&units(p));
     }
     if pattern == "(?:)" {
         pattern.clear();
@@ -2167,7 +2186,7 @@ fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
     if regexp_of(v).is_some() {
         return Ok(v);
     }
-    let p = if v.is_undefined() { String::new() } else { String::from_utf16_lossy(&units(v)) };
+    let p = if v.is_undefined() { String::new() } else { crate::vm::source_text(&units(v)) };
     new_regexp(vm, &p, "")
 }
 
@@ -2254,7 +2273,7 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         Some(_) => pattern,
         None => {
-            let p = if pattern.is_undefined() { String::new() } else { String::from_utf16_lossy(&units(pattern)) };
+            let p = if pattern.is_undefined() { String::new() } else { crate::vm::source_text(&units(pattern)) };
             if vm.conv_failed() {
                 return Err(vm.take_conv_error());
             }

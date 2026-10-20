@@ -21,6 +21,7 @@ mod intrinsics;
 mod symbol;
 mod iterator;
 mod typed;
+mod base64;
 mod bigint;
 mod reflect;
 mod generator;

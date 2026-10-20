@@ -220,6 +220,23 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
         if crate::props::is_object(proto) {
             vm.set_prototype_of(as_object(r), proto);
         }
+        // (A view's buffer checked again after: the spec reads the
+        // prototype first, and its getter may have detached or shrunk it.)
+        let o = as_object(r);
+        let class = unsafe { (*o).class };
+        if matches!(class, Class::TypedArray | Class::DataView) {
+            if crate::typed::is_detached(crate::typed::buffer_of(o)) {
+                return Err(Error::type_error("Cannot construct a view on a detached ArrayBuffer"));
+            }
+            let fits = if class == Class::TypedArray {
+                crate::typed::ta_length(o).is_some()
+            } else {
+                crate::typed::view_byte_length(o).is_some()
+            };
+            if !fits {
+                return Err(Error::range_error("The view is out of its buffer's bounds"));
+            }
+        }
     }
     Ok(r)
 }

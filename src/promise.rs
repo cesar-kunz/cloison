@@ -166,6 +166,17 @@ pub(crate) fn await_then(vm: &mut Vm, v: Value, on_fulfilled: Value, on_rejected
     perform_then(vm, as_object(p), on_fulfilled, on_rejected, &cap)
 }
 
+/// AsyncFromSyncIterator's promise of a step's value `v`:
+/// `PromiseResolve(%Promise%, v).then()`, settling as `v` does, a job
+/// after.
+pub(crate) fn async_from_sync(vm: &mut Vm, v: Value) -> Result<Value> {
+    let c = object_value(root(vm, Root::Constructor));
+    let wrapper = promise_resolve_with(vm, c, v)?;
+    let cap = new_capability(vm, c)?;
+    perform_then(vm, as_object(wrapper), Value::UNDEFINED, Value::UNDEFINED, &cap)?;
+    Ok(cap.promise)
+}
+
 fn async_fulfilled(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let g = slot(vm.callee, 0);
     crate::generator::async_step(vm, g, crate::generator::NEXT, arg(a, 0))?;

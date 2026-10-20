@@ -218,6 +218,26 @@ r.join(" ");
     );
 }
 
+/// `for await` over a sync iterable steps as AsyncFromSyncIterator does:
+/// two jobs a value (the done step too), a rejected value seen as late.
+#[test]
+fn for_await_over_sync_iterables_takes_the_specs_jobs() {
+    let src = r#"
+var log = [];
+var th = { then(r) { r("T"); } };
+(async () => { for await (const x of ["s1", th]) log.push(x); log.push("end"); })();
+(async () => { try { for await (const x of [Promise.reject("bad")]) log.push(x); } catch (e) { log.push("caught"); } })();
+var p = Promise.resolve(); for (var i = 0; i < 8; i++) { let k = i; p = p.then(() => log.push(k)); }
+p.then(() => { globalThis.out = log.join(" "); });
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("out");
+    let g = cloison::object::object_value(vm.global);
+    assert_eq!(display(vm.get(g, a).unwrap()), "0 s1 caught 1 2 3 T 4 5 end 6 7");
+}
+
 /// A direct `eval` in an arrow sees the enclosing function's `arguments`
 /// and `new.target`, as the arrow does.
 #[test]

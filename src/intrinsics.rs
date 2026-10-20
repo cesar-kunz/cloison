@@ -51,6 +51,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("with_set_strict", with_set_strict),
     ("with_has", with_has),
     ("fix_scope", fix_scope),
+    ("async_from_sync", |vm, a| crate::promise::async_from_sync(vm, a[0])),
     ("generator_mode", generator_mode),
     ("delegate_step", delegate_step),
     ("delegate_done", delegate_done),

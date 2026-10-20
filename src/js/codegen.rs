@@ -4892,19 +4892,23 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// `return acc`: through the `finally` blocks being left.
+    /// `return acc`: through the `finally` blocks being left. (A derived
+    /// class's constructor checks what it returns after them, outside its
+    /// `try`s: `derived_return`.)
     fn return_acc(&mut self, pos: Pos) -> R<()> {
-        if self.trys.iter().any(|t| t.finally.is_some() || t.close.is_some()) {
+        if self.trys.iter().any(|t| t.finally.is_some() || t.close.is_some()) || self.f.class_kind == 3 && !self.trys.is_empty() {
             // The value waits in a register while the `finally` blocks run.
             let mark = self.temp;
             let r = self.alloc(pos)?;
             self.star(r);
             self.leave_trys(0)?;
             self.ldar(r);
+            self.derived_return(pos)?;
             self.emit(Op::Return, &[]);
             self.reenter_trys(0);
             self.temp = mark;
         } else {
+            self.derived_return(pos)?;
             self.emit(Op::Return, &[]);
         }
         Ok(())
@@ -5394,7 +5398,6 @@ impl<'a> Gen<'a> {
                 if self.f.is_async && self.f.generator && e.is_some() {
                     self.yield_acc(s.pos)?;
                 }
-                self.derived_return(s.pos)?;
                 self.return_acc(s.pos)?;
             }
             StmtKind::Break(label) | StmtKind::Continue(label) => {

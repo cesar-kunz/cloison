@@ -1974,8 +1974,11 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// (its source; its flags unless given).
 fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let p = arg(a, 0);
+    let construct = vm.is_construct();
+    // (IsRegExp: a RegExp, or an object whose `Symbol.match` says so.)
+    let is_re = is_regexp(vm, p)?;
     // `RegExp(re)`, called: `re` itself if a regexp of `RegExp`'s.
-    if !vm.is_construct() && arg(a, 1).is_undefined() && regexp_of(p).is_some() {
+    if !construct && arg(a, 1).is_undefined() && is_re {
         let a_ctor = vm.a_constructor;
         let c = vm.get(p, a_ctor)?;
         let a_regexp = vm.intern("RegExp");
@@ -1984,10 +1987,18 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         }
     }
     let (mut pattern, mut flags) = (String::new(), String::new());
+    let a_source = vm.intern("source");
     if let Some(re) = regexp_of(p) {
-        let a_source = vm.intern("source");
         pattern = crate::vm::source_text(&units(vm.get(p, a_source)?));
         flags = regexp_flags(re);
+    } else if is_re {
+        // (A RegExp-like object: its `source`, and its `flags` unless
+        // given.)
+        pattern = crate::vm::source_text(&units(vm.get(p, a_source)?));
+        if arg(a, 1).is_undefined() {
+            let a_flags = vm.intern("flags");
+            flags = String::from_utf16_lossy(&units(vm.get(p, a_flags)?));
+        }
     } else if !p.is_undefined() {
         pattern = crate::vm::source_text(&units(p));
     }
@@ -2329,8 +2340,9 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             break;
         }
     }
+    // (Set with throw: a read-only `lastIndex` is a TypeError.)
     let a_last = vm.intern("lastIndex");
-    vm.set(rv, a_last, Value::from_i32(0))?;
+    vm.put_key(rv, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
     if found.is_empty() {
         return Ok(Value::NULL);
     }
@@ -2429,8 +2441,9 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
                     at = if y == x { advance(&s, y as f64, re.unicode) as usize } else { y };
                     flat.extend_from_slice(&caps);
                 }
+                // (Set with throw: a read-only `lastIndex` is a TypeError.)
                 let a_last = vm.intern("lastIndex");
-                vm.set(pattern, a_last, Value::from_i32(0))?;
+                vm.put_key(pattern, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
             } else if let Some(c) = regexp_match(vm, pattern, re, &s)? {
                 stride = c.len();
                 flat.extend_from_slice(&c);

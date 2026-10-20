@@ -1083,7 +1083,11 @@ impl Parser<'_> {
                     self.i += 1;
                     (l as u16) % 32
                 }
-                _ => b'\\' as u16,
+                // (Annex B: a backslash, the `c` then a character of its own.)
+                _ => {
+                    self.i -= 1;
+                    b'\\' as u16
+                }
             },
             c => {
                 let mut b = [0u16; 2];

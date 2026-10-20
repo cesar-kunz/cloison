@@ -5650,13 +5650,26 @@ impl<'a> Gen<'a> {
                 self.bind(result_ready);
                 self.intrinsic("async_iterator_value", v, 1);
                 self.star(v);
-                self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
-                self.jump_if(Jmp::True, done);
                 self.ldar(sync);
                 self.jump_if(Jmp::False, value_ready);
+                // A sync iterator's step, as AsyncFromSyncIterator's: a
+                // promise of its value (`undefined` once done) settling a
+                // job after it, awaited.
+                let not_done = self.label();
+                let finished = self.alloc(pos)?;
                 self.ldar(v);
+                self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+                self.star(finished);
+                self.jump_if(Jmp::False, not_done);
+                self.emit(Op::LdaUndefined, &[]);
+                self.star(v);
+                self.bind(not_done);
+                self.intrinsic("async_from_sync", v, 1);
                 self.yield_acc(pos)?;
                 self.star(v);
+                self.ldar(finished);
+                self.temp -= 1;
+                self.jump_if(Jmp::True, done);
                 self.bind(value_ready);
                 self.ldar(v);
             }

@@ -133,7 +133,7 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
 | ES5 (untagged) | 16,767 | 17,067 | 98.2% |
-| ES2015 | 8,824 | 9,197 | 95.9% |
+| ES2015 | 8,825 | 9,197 | 96.0% |
 | ES2016 | 97 | 100 | 97.0% |
 | ES2017 | 695 | 741 | 93.8% |
 | ES2018 | 4,715 | 4,825 | 97.7% |
@@ -143,17 +143,22 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES2022 | 5,159 | 5,374 | 96.0% |
 | ES2023 | 284 | 284 | 100.0% |
 | ES2024 | 839 | 843 | 99.5% |
-| ES2025 | 976 | 998 | 97.8% |
+| ES2025 | 978 | 998 | 98.0% |
 | ES2026 | 738 | 745 | 99.1% |
-| Stage 3 proposals | 563 | 5,650 | 10.0% |
-| **all** | **42,382** | **48,635** | **87.1%** |
+| Stage 3 proposals | 5,552 | 5,650 | 98.3% |
+| **all** | **47,374** | **48,635** | **97.4%** |
 
 The `Atomics` tests that need several agents run them as test262's
 `$262.agent` has them: each agent a thread with a VM of its own, sharing
 `SharedArrayBuffer`s' memory with the main one (`CanBlockIsFalse` tests
 run with `cloison --no-block`).
 
-The gaps are mostly whole features: non-ASCII identifiers beyond a rough
+Temporal has the ISO 8601 calendar alone (as without ECMA-402), and
+takes named time zones from the system's database (`TZDIR`, else
+`/usr/share/zoneinfo`).
+
+The gaps are mostly whole features: realms (`ShadowRealm`,
+`$262.createRealm`), decorators, non-ASCII identifiers beyond a rough
 approximation (no Unicode ID tables), and early errors for invalid
 syntax that the parser accepts.
 

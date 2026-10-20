@@ -445,7 +445,7 @@ impl Regex {
     /// tested as matching does, so with its case folding (which maps no
     /// unit past ASCII to one in it, or back).
     fn first(&self, n: &Node) -> First {
-        let ic = self.ignore_case;
+        let ic = Case::of(self);
         let units = |one: &dyn Fn(u16) -> bool, other: bool| {
             let ascii = (0..128u16).filter(|&c| one(c)).fold(0u128, |m, c| m | 1 << c);
             Some((ascii, other, false))
@@ -454,12 +454,13 @@ impl Regex {
             Node::Empty | Node::Start | Node::End | Node::Boundary(_) | Node::Look(..) => {
                 Some((0, false, true))
             }
-            // (Case folding maps no unit past ASCII to one in it, or back.)
-            Node::Char(c) => units(&|x| eq(ic, x, *c), *c >= 128),
+            // (Case folding maps no unit past ASCII to one in it, or back,
+            // but Unicode's: `ſ` and the Kelvin sign.)
+            Node::Char(c) => units(&|x| eq(ic, x, *c), *c >= 128 || ic == Case::Unicode),
             Node::Any => units(&|x| !is_line_terminator(x), true),
             Node::Class(r, neg) => units(
                 &|x| in_class(ic, r, *neg, x),
-                *neg || r.iter().any(|&(_, hi)| hi >= 128),
+                *neg || r.iter().any(|&(_, hi)| hi >= 128) || ic == Case::Unicode,
             ),
             Node::Astral(_) => Some((0, true, false)),
             Node::Group(inner, _) => self.first(inner),
@@ -488,21 +489,78 @@ impl Regex {
 }
 
 /// Whether `a` matches `b`, folding case if `ic`.
-fn eq(ic: bool, a: u16, b: u16) -> bool {
-    a == b || (ic && canonical(a) == canonical(b))
+fn eq(ic: Case, a: u16, b: u16) -> bool {
+    a == b || (ic != Case::Exact && ic.canon(a) == ic.canon(b))
+}
+
+/// How case compares: exactly, folded as without `u` (`i`), or by Unicode
+/// simple case folding (`i` and `u`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Case {
+    #[default]
+    Exact,
+    Fold,
+    Unicode,
+}
+
+impl Case {
+    fn of(re: &Regex) -> Case {
+        match (re.ignore_case, re.unicode) {
+            (false, _) => Case::Exact,
+            (true, false) => Case::Fold,
+            (true, true) => Case::Unicode,
+        }
+    }
+
+    /// `c`'s form, the same for units that match each other.
+    fn canon(self, c: u16) -> u16 {
+        match self {
+            Case::Exact => c,
+            Case::Fold => canonical(c),
+            Case::Unicode => simple_fold(c),
+        }
+    }
+
+    /// Whether `c` is a word character (`\b`): with `u` and `i`, `ſ` and
+    /// the Kelvin sign too, which fold to `s` and `k`.
+    fn word(self, c: u16) -> bool {
+        is_word(c) || self == Case::Unicode && matches!(c, 0x017F | 0x212A)
+    }
+}
+
+/// `c`'s simple case folding (CaseFolding.txt's C and S, a unit's): its
+/// upper case's lower case, where each is one character (the same for the
+/// units that fold together); `ı` folds to itself.
+fn simple_fold(c: u16) -> u16 {
+    let Some(ch) = char::from_u32(c as u32) else {
+        return c;
+    };
+    if c < 0x80 {
+        return (c as u8).to_ascii_lowercase() as u16;
+    }
+    if c == 0x0131 {
+        return c;
+    }
+    let one = |s: &mut dyn Iterator<Item = char>| match (s.next(), s.next()) {
+        (Some(x), None) => Some(x),
+        _ => None,
+    };
+    let up = one(&mut ch.to_uppercase()).unwrap_or(ch);
+    let low = one(&mut up.to_lowercase()).unwrap_or(up);
+    if (low as u32) < 0x10000 { low as u16 } else { c }
 }
 
 /// Whether `c` is in the class of `ranges` (negated if `neg`), folding
 /// case if `ic`.
-fn in_class(ic: bool, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
+fn in_class(ic: Case, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
     let has = |c: u16| ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
     let mut r = has(c);
-    if !r && ic {
-        let u = canonical(c);
+    if !r && ic != Case::Exact {
+        let u = ic.canon(c);
         r = has(u)
             || ranges
                 .iter()
-                .any(|&(lo, hi)| (lo..=hi).len() < 512 && (lo..=hi).any(|x| canonical(x) == u));
+                .any(|&(lo, hi)| (lo..=hi).len() < 512 && (lo..=hi).any(|x| ic.canon(x) == u));
     }
     r != neg
 }
@@ -1393,8 +1451,8 @@ struct Program {
     astral: Vec<Vec<(u32, u32)>>,
     /// Registers: positions and repetition counts.
     nregs: usize,
-    /// Whether case is folded (`i`).
-    ic: bool,
+    /// How case compares (`i`, `u`).
+    ic: Case,
     /// Compiling a lookbehind's body: matched right to left.
     backward: bool,
 }
@@ -1476,6 +1534,10 @@ impl Native {
     #[cold]
     fn compile(re: &Regex) -> Option<Native> {
         use crate::jit::rx::{self, Imm64, Piece, To};
+        // (`rx_fold` folds as without `u`.)
+        if Case::of(re) == Case::Unicode {
+            return None;
+        }
         let code = &re.prog.code;
         // Each instruction's piece (a run's unit: the run's).
         let mut idx = vec![0; code.len() + 1];
@@ -1687,7 +1749,7 @@ impl Native {
 
 impl Program {
     fn compile(re: &Regex) -> Program {
-        let mut p = Program { ic: re.ignore_case, ..Program::default() };
+        let mut p = Program { ic: Case::of(re), ..Program::default() };
         p.emit(re, &re.node);
         p.code.push(Insn::Match);
         p
@@ -1704,9 +1766,9 @@ impl Program {
 
     /// The instruction matching the single unit `n` stands for, if it does.
     fn unit(&mut self, re: &Regex, n: &Node) -> Option<Insn> {
-        let ic = re.ignore_case;
+        let ic = Case::of(re);
         Some(match n {
-            Node::Char(c) if ic => Insn::CharFold { c: *c, canon: canonical(*c) },
+            Node::Char(c) if ic != Case::Exact => Insn::CharFold { c: *c, canon: ic.canon(*c) },
             Node::Char(c) => Insn::Char(*c),
             Node::Any => Insn::Any,
             Node::Class(r, neg) => {
@@ -1884,7 +1946,7 @@ impl Program {
     fn unit_matches(&self, i: Insn, c: u16) -> bool {
         match i {
             Insn::Char(x) => c == x,
-            Insn::CharFold { c: x, canon } => c == x || canonical(c) == canon,
+            Insn::CharFold { c: x, canon } => c == x || self.ic.canon(c) == canon,
             Insn::Any => !is_line_terminator(c),
             Insn::Class { ascii, k } => {
                 if c < 128 {
@@ -1939,8 +2001,8 @@ impl Program {
                 }
                 Insn::Boundary(want) => {
                     pc += 1;
-                    let a = pos > 0 && is_word(s[pos - 1]);
-                    let b = pos < s.len() && is_word(s[pos]);
+                    let a = pos > 0 && self.ic.word(s[pos - 1]);
+                    let b = pos < s.len() && self.ic.word(s[pos]);
                     (a != b) == want
                 }
                 Insn::BackRef(g) => {
@@ -1949,7 +2011,7 @@ impl Program {
                         None => true,
                         Some((a, b)) => {
                             let n = b - a;
-                            let ok = pos + n <= s.len() && (0..n).all(|d| eq(re.ignore_case, s[pos + d], s[a + d]));
+                            let ok = pos + n <= s.len() && (0..n).all(|d| eq(Case::of(re), s[pos + d], s[a + d]));
                             pos += n;
                             ok
                         }
@@ -2076,7 +2138,7 @@ impl Program {
                         None => true,
                         Some((a, b)) => {
                             let n = b - a;
-                            let ok = n <= pos && (0..n).all(|d| eq(re.ignore_case, s[pos - n + d], s[a + d]));
+                            let ok = n <= pos && (0..n).all(|d| eq(Case::of(re), s[pos - n + d], s[a + d]));
                             pos = pos.saturating_sub(n);
                             ok
                         }
@@ -2190,11 +2252,11 @@ type K<'k, 'a> = &'k mut dyn FnMut(&mut Matcher<'a>, usize) -> bool;
 
 impl<'a> Matcher<'a> {
     fn eq(&self, a: u16, b: u16) -> bool {
-        eq(self.re.ignore_case, a, b)
+        eq(Case::of(self.re), a, b)
     }
 
     fn in_class(&self, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
-        in_class(self.re.ignore_case, ranges, neg, c)
+        in_class(Case::of(self.re), ranges, neg, c)
     }
 
     fn node(&mut self, n: &Node, i: usize, k: K<'_, 'a>) -> bool {

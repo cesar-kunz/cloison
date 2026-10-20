@@ -7236,3 +7236,15 @@ a(); [...g()];
 out.join();"#;
     assert_eq!(value(src), "ReferenceError,none,ReferenceError,none");
 }
+
+/// `await` is no identifier in a class static block's own code (but in a
+/// function's or an arrow's in it, and as a function expression's name).
+#[test]
+fn await_in_class_static_blocks() {
+    assert!(compile_error("class C { static { let await = 1; } }").contains("await"));
+    assert!(compile_error("class C { static { await; } }").contains("await"));
+    let src = r#"
+class C { static { (() => { let await = 1; })(); (function await() {}); this.ok = (function () { var await = 2; return await; })(); } }
+C.ok;"#;
+    assert_eq!(value(src), "2");
+}

@@ -87,6 +87,8 @@ fn parse_pass<'a, 'p>(
         super_fns: Vec::new(),
         redeclared: None,
         in_eval: eval.is_some(),
+        static_blocks: Vec::new(),
+        naming_function: false,
         param_names: Vec::new(),
         home_uses: 0,
         pending_home: None,
@@ -247,6 +249,11 @@ struct Parser<'t, 'a, 'p> {
     param_names: Vec<(usize, Vec<Name>)>,
     /// Direct `eval`'s code (whose `new.target` is its caller's).
     in_eval: bool,
+    /// The functions that are class static blocks, where `await` is no
+    /// identifier.
+    static_blocks: Vec<usize>,
+    /// Whether the identifier being read is a function expression's name.
+    naming_function: bool,
     /// A redeclaration found (an early error, reported once parsed).
     redeclared: Option<(Pos, String)>,
     /// `super` property references so far.
@@ -407,7 +414,7 @@ impl<'a> Parser<'_, 'a, '_> {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` (escaped) is a reserved word")));
         }
         let f = &self.functions[self.current];
-        if s == "yield" && (self.strict() || f.generator) || s == "await" && f.is_async {
+        if s == "yield" && (self.strict() || f.generator) || s == "await" && (f.is_async || self.in_static_block()) {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` as an identifier here")));
         }
         Ok(())
@@ -1270,7 +1277,12 @@ impl<'a> Parser<'_, 'a, '_> {
         let generator = self.eat("*") || std::mem::take(&mut self.pending_generator);
         let is_async = std::mem::take(&mut self.pending_async);
         let name = match self.peek() {
-            Tok::Ident(_) => Some(self.ident()?),
+            Tok::Ident(_) => {
+                let outer = std::mem::replace(&mut self.naming_function, !declaration);
+                let n = self.ident();
+                self.naming_function = outer;
+                Some(n?)
+            }
             _ if declaration => return self.err("expected the function's name"),
             _ => None,
         };
@@ -3261,9 +3273,17 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// `static { … }` (at `static`): its code, a function of its own (with
     /// its own `var`s).
+    /// Whether the code being parsed is a class static block's own (not
+    /// a function's in it, an arrow's either), but for a function
+    /// expression's name, which is the function's.
+    fn in_static_block(&self) -> bool {
+        !self.naming_function && self.static_blocks.contains(&self.current)
+    }
+
     fn static_block(&mut self, home_static: &Name) -> R<usize> {
         let key = self.i;
         let f = self.synthetic_method(home_static, self.pos());
+        self.static_blocks.push(f);
         self.advance();
         self.expect("{")?;
         self.push_vars(key);

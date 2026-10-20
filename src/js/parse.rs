@@ -10,6 +10,26 @@ use super::lex::{Tok, Token};
 
 /// `toks`' program, its nodes in `arena` (the text of string and regular
 /// expression tokens moves to the tree).
+/// A statement list that may have `using` declarations (see
+/// `Parser::using_scopes`): whether it may, and its disposal's hidden
+/// variables once one is found, and whether one is `await using`.
+struct UsingScope {
+    allowed: bool,
+    names: Option<UsingNames>,
+    is_await: bool,
+}
+
+/// The hidden variables of a statement list's disposal (see
+/// `Parser::lower_using`).
+#[derive(Clone)]
+struct UsingNames {
+    state: Name,
+    has: Name,
+    error: Name,
+    caught: Name,
+    pending: Name,
+}
+
 pub fn parse<'a>(toks: &mut [Token], arena: &'a Arenas<'a>) -> Result<Program<'a>, Error> {
     parse_with(toks, arena, false)
 }
@@ -87,6 +107,7 @@ fn parse_pass<'a, 'p>(
         super_fns: Vec::new(),
         redeclared: None,
         in_eval: eval.is_some(),
+        using_scopes: Vec::new(),
         static_blocks: Vec::new(),
         naming_function: false,
         param_names: Vec::new(),
@@ -249,6 +270,10 @@ struct Parser<'t, 'a, 'p> {
     param_names: Vec<(usize, Vec<Name>)>,
     /// Direct `eval`'s code (whose `new.target` is its caller's).
     in_eval: bool,
+    /// The statement lists being parsed that may have `using` declarations
+    /// (a block's, a function body's: not a `case`'s, nor the script's,
+    /// which have none here), and what their disposal needs.
+    using_scopes: Vec<UsingScope>,
     /// The functions that are class static blocks, where `await` is no
     /// identifier.
     static_blocks: Vec<usize>,
@@ -512,6 +537,8 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.semicolon()?;
                 StmtKind::Lexical(true, decls)
             }
+            Tok::Ident(_) if !sub && self.using_ahead(false) => self.using_declaration(false)?,
+            Tok::Ident(_) if !sub && self.using_ahead(true) => self.using_declaration(true)?,
             Tok::Ident(n) if self.let_ahead(&n) && !(sub && self.toks[self.i + 1].newline_before) => {
                 self.advance();
                 let decls = self.lexical_decls(false, false)?;
@@ -788,6 +815,18 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// Statements up to and including the closing `}`.
     fn block_rest(&mut self) -> R<Vec<Stmt<'a>>> {
+        let pos = self.pos();
+        self.using_scopes.push(UsingScope { allowed: true, names: None, is_await: false });
+        let body = self.statements_to_brace();
+        let scope = self.using_scopes.pop().unwrap();
+        let body = body?;
+        Ok(match scope.names {
+            Some(names) => self.lower_using(body, names, scope.is_await, pos),
+            None => body,
+        })
+    }
+
+    fn statements_to_brace(&mut self) -> R<Vec<Stmt<'a>>> {
         let mut body = Vec::new();
         while !self.eat("}") {
             if *self.peek() == Tok::Eof {
@@ -796,6 +835,212 @@ impl<'a> Parser<'_, 'a, '_> {
             body.push(self.statement()?);
         }
         Ok(body)
+    }
+
+    /// Whether a `using` declaration starts here (`using x`, on one line),
+    /// or with `await_`, an `await using` one (in an async function).
+    fn using_ahead(&self, await_: bool) -> bool {
+        let tok = |k: usize| &self.toks[(self.i + k).min(self.toks.len() - 1)];
+        let ident = |k: usize, s: &str| matches!(self.peek_at(k), Tok::Ident(n) if &**n == s) && !tok(k).escaped;
+        let binding = |k: usize| matches!(self.peek_at(k), Tok::Ident(_)) && !tok(k).newline_before;
+        if await_ {
+            self.functions[self.current].is_async
+                && ident(0, "await")
+                && ident(1, "using")
+                && !tok(1).newline_before
+                && binding(2)
+        } else {
+            ident(0, "using") && binding(1)
+        }
+    }
+
+    /// Hidden variables for disposing of a statement list's resources (see
+    /// [`Parser::lower_using`]).
+    fn using_names(&mut self) -> UsingNames {
+        let k = self.classes;
+        self.classes += 1;
+        let names = UsingNames {
+            state: format!("%using{k}").into(),
+            has: format!("%usinghas{k}").into(),
+            error: format!("%usingerr{k}").into(),
+            caught: format!("{}{k}", super::ast::USING_CATCH).into(),
+            pending: format!("%usingres{k}").into(),
+        };
+        for n in [&names.state, &names.has, &names.error, &names.caught, &names.pending] {
+            self.hidden_var(n.clone());
+        }
+        names
+    }
+
+    /// `using` declarations' bindings (`no_in`: in a `for` head, where
+    /// they may lack an initializer): names only, as `const`.
+    fn using_bindings(&mut self, no_in: bool) -> R<Vec<(Name, Option<Expr<'a>>)>> {
+        let mut decls = Vec::new();
+        loop {
+            if self.is("[") || self.is("{") {
+                return self.err("a `using` declaration binds names, not patterns");
+            }
+            let name = self.binding_ident()?;
+            if &*name == "let" {
+                return self.err("`let` can't be declared with `using`");
+            }
+            let init = if self.eat("=") {
+                let e = self.assignment(no_in)?;
+                self.infer_name(&e, &name);
+                Some(e)
+            } else {
+                if !no_in {
+                    return self.err("missing initializer in a `using` declaration");
+                }
+                None
+            };
+            let end = self.pos();
+            self.check_not_param(&name)?;
+            let r = self.declare(&name, CONST, end);
+            decls.push((r, init));
+            if !self.eat(",") {
+                return Ok(decls);
+            }
+        }
+    }
+
+    /// `using` declarations' initializers, each value added to the
+    /// resources of capability `state` as it is bound.
+    fn using_inits(&self, decls: Vec<(Name, Option<Expr<'a>>)>, state: &Name, is_await: bool) -> Vec<(Name, Option<Expr<'a>>)> {
+        decls
+            .into_iter()
+            .map(|(n, init)| {
+                let init = init.map(|e| {
+                    let pos = e.pos;
+                    let args = vec![Expr { kind: ExprKind::Ident(state.clone()), pos }, e, Expr { kind: ExprKind::Bool(is_await), pos }];
+                    Expr { kind: ExprKind::Intrinsic("dispose_add", args), pos }
+                });
+                (n, init)
+            })
+            .collect()
+    }
+
+    /// A `using` (`await using`, `is_await`) declaration statement, its
+    /// resources the innermost statement list's.
+    fn using_declaration(&mut self, is_await: bool) -> R<StmtKind<'a>> {
+        if !self.using_scopes.last().is_some_and(|s| s.allowed) {
+            return self.err("a `using` declaration isn't allowed here");
+        }
+        if is_await {
+            self.advance();
+        }
+        self.advance();
+        let decls = self.using_bindings(false)?;
+        self.semicolon()?;
+        let names = match self.using_scopes.last().unwrap().names.clone() {
+            Some(n) => n,
+            None => {
+                let n = self.using_names();
+                self.using_scopes.last_mut().unwrap().names = Some(n.clone());
+                n
+            }
+        };
+        if is_await {
+            self.using_scopes.last_mut().unwrap().is_await = true;
+        }
+        Ok(StmtKind::Lexical(true, self.using_inits(decls, &names.state, is_await)))
+    }
+
+    /// Statement list `body` with `using` declarations, as
+    /// `%state = new; %has = false; try { body } catch (%caught) { %has =
+    /// true; %error = %caught; } finally { dispose }`: its resources
+    /// disposed of however it ends, what disposing throws thrown instead
+    /// (with `is_await`, awaited: if there are resources to dispose of).
+    fn lower_using(&mut self, body: Vec<Stmt<'a>>, names: UsingNames, is_await: bool, pos: Pos) -> Vec<Stmt<'a>> {
+        let id = |n: &Name| Expr { kind: ExprKind::Ident(n.clone()), pos };
+        // (Not expression statements: the completion value isn't theirs.)
+        let assign = |p: &Self, n: &Name, v: Expr<'a>| Stmt {
+            kind: StmtKind::Lexical(
+                false,
+                vec![("".into(), Some(Expr { kind: ExprKind::Assign(None, expr(p.arena, id(n)), expr(p.arena, v)), pos }))],
+            ),
+            pos,
+        };
+        let state = Expr { kind: ExprKind::Intrinsic("dispose_new", Vec::new()), pos };
+        let init = vec![assign(self, &names.state, state), assign(self, &names.has, Expr { kind: ExprKind::Bool(false), pos })];
+        let catch = vec![
+            assign(self, &names.has, Expr { kind: ExprKind::Bool(true), pos }),
+            assign(self, &names.error, id(&names.caught)),
+        ];
+        let args = vec![id(&names.state), id(&names.has), id(&names.error)];
+        let finally = if is_await {
+            let run = Expr { kind: ExprKind::Intrinsic("dispose_run_async", args), pos };
+            let wait = Stmt {
+                kind: StmtKind::Lexical(false, vec![("".into(), Some(Expr { kind: ExprKind::Await(expr(self.arena, id(&names.pending))), pos }))]),
+                pos,
+            };
+            vec![
+                assign(self, &names.pending, run),
+                Stmt { kind: StmtKind::If(id(&names.pending), stmt(self.arena, wait), None), pos },
+            ]
+        } else {
+            vec![Stmt { kind: StmtKind::Lexical(false, vec![("".into(), Some(Expr { kind: ExprKind::Intrinsic("dispose_run", args), pos }))]), pos }]
+        };
+        let mut out = init;
+        out.push(Stmt { kind: StmtKind::Try(body, Some((names.caught, catch)), Some(finally)), pos });
+        out
+    }
+
+    /// `for (using x of it) body`, `for (using x = e; …; …) body` (or
+    /// `await using`), past `(`: the first with each value disposed of
+    /// after its iteration, the second with its resources after the loop.
+    fn for_using(&mut self, is_await: bool) -> R<StmtKind<'a>> {
+        let pos = self.pos();
+        if is_await {
+            self.advance();
+        }
+        self.advance();
+        let decls = self.using_bindings(true)?;
+        if self.is("in") {
+            return self.err("a `using` declaration in a `for … in` head");
+        }
+        if decls.len() == 1 && decls[0].1.is_none() && self.is_of() {
+            let name = decls.into_iter().next().unwrap().0;
+            self.advance();
+            let iterable = self.assignment(false)?;
+            self.head_tdz(std::slice::from_ref(&name));
+            self.expect(")")?;
+            let body = self.sub_statement()?;
+            let names = self.using_names();
+            let args = vec![
+                Expr { kind: ExprKind::Ident(names.state.clone()), pos },
+                Expr { kind: ExprKind::Ident(name.clone()), pos },
+                Expr { kind: ExprKind::Bool(is_await), pos },
+            ];
+            let first = Stmt {
+                kind: StmtKind::Lexical(false, vec![("".into(), Some(Expr { kind: ExprKind::Intrinsic("dispose_add", args), pos }))]),
+                pos,
+            };
+            let lowered = self.lower_using(vec![first, body], names, is_await, pos);
+            let body = stmt(self.arena, Stmt { kind: StmtKind::Block(lowered), pos });
+            return Ok(StmtKind::ForOf {
+                kind: 3,
+                target: Expr { kind: ExprKind::Ident(name), pos },
+                pattern: None,
+                iterable,
+                body,
+                is_await: false,
+            });
+        }
+        if decls.iter().any(|d| d.1.is_none()) {
+            return self.err("missing initializer in a `using` declaration");
+        }
+        let names = self.using_names();
+        let decls = self.using_inits(decls, &names.state, is_await);
+        self.expect(";")?;
+        let test = if self.is(";") { None } else { Some(self.expression(false)?) };
+        self.expect(";")?;
+        let update = if self.is(")") { None } else { Some(self.expression(false)?) };
+        self.expect(")")?;
+        let body = stmt(self.arena, self.sub_statement()?);
+        let declaration = Stmt { kind: StmtKind::Lexical(true, decls), pos };
+        let lp = Stmt { kind: StmtKind::For { init: None, test, update, body }, pos };
+        Ok(StmtKind::Block(self.lower_using(vec![declaration, lp], names, is_await, pos)))
     }
 
     fn var_decls(&mut self, no_in: bool) -> R<Vec<(Name, Option<Expr<'a>>)>> {
@@ -838,6 +1083,16 @@ impl<'a> Parser<'_, 'a, '_> {
 
     fn for_rest(&mut self) -> R<StmtKind<'a>> {
         self.expect("(")?;
+        if self.using_ahead(true) {
+            return self.for_using(true);
+        }
+        // (`for (using of …` is the identifier `using`, but `for (using of =
+        // …;;)` declares `of`.)
+        if self.using_ahead(false)
+            && (!matches!(self.peek_at(1), Tok::Ident(n) if &**n == "of") || self.peek_at(2) == &Tok::Punct("="))
+        {
+            return self.for_using(false);
+        }
         let init = if self.is(";") {
             None
         } else if self.is("const") || matches!(self.peek().clone(), Tok::Ident(n) if self.let_ahead(&n)) {
@@ -1258,12 +1513,22 @@ impl<'a> Parser<'_, 'a, '_> {
             };
             self.expect(":")?;
             let mut body = Vec::new();
+            // (No `using` declarations directly in a clause.)
+            self.using_scopes.push(UsingScope { allowed: false, names: None, is_await: false });
             while !self.is("case") && !self.is("default") && !self.is("}") {
                 if *self.peek() == Tok::Eof {
+                    self.using_scopes.pop();
                     return self.err("expected `}` before end of input");
                 }
-                body.push(self.statement()?);
+                match self.statement() {
+                    Ok(s) => body.push(s),
+                    Err(e) => {
+                        self.using_scopes.pop();
+                        return Err(e);
+                    }
+                }
             }
+            self.using_scopes.pop();
             cases.push((test, body));
         }
         Ok(cases)

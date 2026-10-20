@@ -76,7 +76,36 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("eval_scope_get", eval_scope_get),
     ("eval_scope_flush", eval_scope_flush),
     ("bigint", crate::bigint::literal),
+    ("dispose_new", |vm, _| crate::dispose::new_state(vm, false)),
+    ("dispose_add", dispose_add),
+    ("dispose_run", dispose_run),
+    ("dispose_run_async", dispose_run_async),
 ];
+
+/// `using x = v` (`[state, v, async]`): `v` added to the statement list's
+/// resources, and the binding's value.
+fn dispose_add(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    crate::dispose::add_resource(vm, a[0], a[1], a[2] == Value::TRUE)?;
+    Ok(a[1])
+}
+
+/// A statement list with `using` declarations ended (`[state, threw,
+/// error]`): its resources disposed of, what that throws (or `error`,
+/// else) thrown.
+fn dispose_run(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let completion = if a[1] == Value::TRUE { Err(Error::thrown(a[2])) } else { Ok(Value::UNDEFINED) };
+    crate::dispose::dispose_resources(vm, a[0], completion)
+}
+
+/// As [`dispose_run`] with `await using` declarations: a promise of their
+/// disposal to await, or `undefined` if there is nothing to dispose of (no
+/// await then; `error` thrown, if any).
+fn dispose_run_async(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if crate::dispose::is_empty(a[0]) {
+        return if a[1] == Value::TRUE { Err(Error::thrown(a[2])) } else { Ok(Value::UNDEFINED) };
+    }
+    crate::dispose::dispose_resources_async(vm, a[0], a[1] == Value::TRUE, a[2])
+}
 
 /// The id of the intrinsic `name`.
 pub fn id(name: &str) -> u8 {

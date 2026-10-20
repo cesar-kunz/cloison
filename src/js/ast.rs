@@ -196,6 +196,11 @@ pub const EVAL_BOXED: u8 = 8;
 /// `var` the `eval` declares shadows it, as a variable of the function's.
 pub const EVAL_OUTER: u8 = 16;
 
+/// The start of the name of the exception a statement list with `using`
+/// declarations catches (see `Parser::lower_using`): its `try` statement
+/// is the list's, which leaves the completion value as a block does.
+pub const USING_CATCH: &str = "%usingcatch";
+
 #[derive(Debug)]
 pub struct Stmt<'a> {
     pub kind: StmtKind<'a>,

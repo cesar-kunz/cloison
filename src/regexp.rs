@@ -1368,11 +1368,16 @@ enum Insn {
     /// `after`.
     Look { negative: bool, after: u32 },
     LookEnd,
-    /// A lookbehind: its body (ending in `BehindEnd`) matched from each
-    /// position its width allows (from `min` to `max` units back, the
-    /// nearest first) to here.
-    Behind { negative: bool, after: u32, min: u32, max: u32 },
+    /// A lookbehind: its body (ending in `BehindEnd`) matched backwards
+    /// from here, right to left (see `Program::backward`); on at `after`.
+    Behind { negative: bool, after: u32 },
     BehindEnd,
+    /// A step back, one unit (before and after a unit matched backwards).
+    Back,
+    /// Group `g` matched backwards, from here to register `r`'s position.
+    SaveBack { g: u32, r: u32 },
+    /// A backreference matched backwards: the text before here.
+    BackRefBack(u32),
     Match,
 }
 
@@ -1390,6 +1395,8 @@ struct Program {
     nregs: usize,
     /// Whether case is folded (`i`).
     ic: bool,
+    /// Compiling a lookbehind's body: matched right to left.
+    backward: bool,
 }
 
 /// What backtracking pops.
@@ -1483,6 +1490,9 @@ impl Native {
                 | Insn::LookEnd
                 | Insn::Behind { .. }
                 | Insn::BehindEnd
+                | Insn::Back
+                | Insn::SaveBack { .. }
+                | Insn::BackRefBack(_)
                 | Insn::Astral(_) => return None,
                 Insn::Run { .. } | Insn::LazyRun { .. } => {
                     idx[i + 1] = idx[i];
@@ -1595,6 +1605,9 @@ impl Native {
                 | Insn::LookEnd
                 | Insn::Behind { .. }
                 | Insn::BehindEnd
+                | Insn::Back
+                | Insn::SaveBack { .. }
+                | Insn::BackRefBack(_)
                 | Insn::Astral(_) => unreachable!(),
             };
             pieces.push(p);
@@ -1707,7 +1720,12 @@ impl Program {
 
     fn emit(&mut self, re: &Regex, n: &Node) {
         if let Some(i) = self.unit(re, n) {
-            self.code.push(i);
+            // (Backwards: the unit before here.)
+            if self.backward {
+                self.code.extend([Insn::Back, i, Insn::Back]);
+            } else {
+                self.code.push(i);
+            }
             return;
         }
         match n {
@@ -1715,36 +1733,46 @@ impl Program {
             Node::Char(_) | Node::Any | Node::Class(..) => unreachable!(),
             Node::Astral(r) => {
                 self.astral.push(r.clone());
-                self.code.push(Insn::Astral((self.astral.len() - 1) as u32));
+                let i = Insn::Astral((self.astral.len() - 1) as u32);
+                if self.backward {
+                    self.code.extend([Insn::Back, Insn::Back, i, Insn::Back, Insn::Back]);
+                } else {
+                    self.code.push(i);
+                }
             }
             Node::Start => self.code.push(Insn::Start),
             Node::End => self.code.push(Insn::End),
             Node::Boundary(b) => self.code.push(Insn::Boundary(*b)),
+            Node::BackRef(g) if self.backward => self.code.push(Insn::BackRefBack(*g as u32)),
             Node::BackRef(g) => self.code.push(Insn::BackRef(*g as u32)),
             Node::Group(inner, None) => self.emit(re, inner),
             Node::Group(inner, Some(g)) => {
                 let r = self.reg();
                 self.code.push(Insn::Mark(r));
                 self.emit(re, inner);
-                self.code.push(Insn::Save { g: *g as u32, r });
+                self.code.push(if self.backward { Insn::SaveBack { g: *g as u32, r } } else { Insn::Save { g: *g as u32, r } });
             }
+            // A lookahead's body forwards, a lookbehind's backwards, wherever
+            // they are.
             Node::Look(inner, positive, false) => {
                 let at = self.code.len();
                 self.code.push(Insn::Look { negative: !positive, after: 0 });
+                let backward = std::mem::replace(&mut self.backward, false);
                 self.emit(re, inner);
+                self.backward = backward;
                 self.code.push(Insn::LookEnd);
                 let after = self.here();
                 self.code[at] = Insn::Look { negative: !positive, after };
             }
             Node::Look(inner, positive, true) => {
-                let (min, max) = width(inner);
-                let (min, max) = (min.min(u32::MAX as usize) as u32, max.map_or(u32::MAX, |m| m.min(u32::MAX as usize - 1) as u32));
                 let at = self.code.len();
-                self.code.push(Insn::Behind { negative: !positive, after: 0, min, max });
+                self.code.push(Insn::Behind { negative: !positive, after: 0 });
+                let backward = std::mem::replace(&mut self.backward, true);
                 self.emit(re, inner);
+                self.backward = backward;
                 self.code.push(Insn::BehindEnd);
                 let after = self.here();
-                self.code[at] = Insn::Behind { negative: !positive, after, min, max };
+                self.code[at] = Insn::Behind { negative: !positive, after };
             }
             Node::Alt(alts) => {
                 let mut jumps = Vec::new();
@@ -1763,6 +1791,12 @@ impl Program {
                 let end = self.here();
                 for j in jumps {
                     self.code[j] = Insn::Jmp(end);
+                }
+            }
+            // Backwards, the last first, unit by unit.
+            Node::Seq(nodes) if self.backward => {
+                for n in nodes.iter().rev() {
+                    self.emit(re, n);
                 }
             }
             Node::Seq(nodes) => {
@@ -1788,7 +1822,10 @@ impl Program {
                 }
             }
             Node::Repeat(inner, min, max, greedy, groups) => {
-                if let Some(i) = self.unit(re, inner) {
+                // (A run goes forwards.)
+                if !self.backward
+                    && let Some(i) = self.unit(re, inner)
+                {
                     let (min, max) = (*min, *max);
                     self.code.push(if *greedy { Insn::Run { min, max } } else { Insn::LazyRun { min, max } });
                     self.code.push(i);
@@ -2012,31 +2049,39 @@ impl Program {
                     }
                     ok
                 }
-                Insn::Look { negative, after } => {
+                Insn::Look { negative, after } | Insn::Behind { negative, after } => {
                     stack.push(Bt::Look(Box::new((pos, after, negative, caps.clone()))));
                     pc += 1;
                     true
                 }
-                Insn::Behind { negative, after, min, max } => {
-                    stack.push(Bt::Look(Box::new((pos, after, negative, caps.clone()))));
-                    match pos.checked_sub(min as usize) {
-                        Some(near) => {
-                            let far = if max == u32::MAX { 0 } else { pos.saturating_sub(max as usize) };
-                            // (The nearest start first: the farther ones
-                            // as choice points.)
-                            for k in far..near {
-                                stack.push(Bt::Resume { pc: pc as u32 + 1, pos: k });
-                            }
-                            (pc, pos) = (pc + 1, near);
+                Insn::Back => {
+                    pc += 1;
+                    match pos.checked_sub(1) {
+                        Some(p) => {
+                            pos = p;
                             true
                         }
                         None => false,
                     }
                 }
-                Insn::BehindEnd if !matches!(stack.iter().rev().find_map(|b| match b {
-                    Bt::Look(l) => Some(l.0),
-                    _ => None,
-                }), Some(at) if at == pos) => false,
+                Insn::SaveBack { g, r } => {
+                    stack.push(Bt::Cap { g, old: caps[g as usize] });
+                    caps[g as usize] = Some((pos, regs[r as usize]));
+                    pc += 1;
+                    true
+                }
+                Insn::BackRefBack(g) => {
+                    pc += 1;
+                    match caps[g as usize] {
+                        None => true,
+                        Some((a, b)) => {
+                            let n = b - a;
+                            let ok = n <= pos && (0..n).all(|d| eq(re.ignore_case, s[pos - n + d], s[a + d]));
+                            pos = pos.saturating_sub(n);
+                            ok
+                        }
+                    }
+                }
                 Insn::LookEnd | Insn::BehindEnd => {
                     // The body matched: its choice points go (a lookahead
                     // matches once), its captures stay.
@@ -2186,6 +2231,9 @@ impl<'a> Matcher<'a> {
             }
             Node::Look(inner, positive, behind) => {
                 let saved = self.caps.clone();
+                // (A lookbehind's body forwards from each start, the nearest
+                // first: its captures not the spec's, which `Program`'s
+                // matches backwards, `Insn::Back`.)
                 let found = if *behind {
                     (0..=i).rev().any(|k| self.node(inner, k, &mut |_, end| end == i))
                 } else {

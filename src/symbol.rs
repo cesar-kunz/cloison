@@ -32,6 +32,8 @@ const WELL_KNOWN: &[&str] = &[
     "toPrimitive",
     "toStringTag",
     "unscopables",
+    "dispose",
+    "asyncDispose",
 ];
 
 /// Indices into `Vm::symbol_roots`.

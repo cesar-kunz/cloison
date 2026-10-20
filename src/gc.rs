@@ -877,6 +877,7 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
             | Class::Symbol
             | Class::ArrayIterator
             | Class::IteratorHelper
+            | Class::DisposableStack
             | Class::Generator => {
                 // The primitive it wraps (a string is a cell), or a
                 // collection's entries array, or a promise's state.

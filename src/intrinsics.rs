@@ -50,6 +50,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("to_object", to_object),
     ("with_set_strict", with_set_strict),
     ("with_has", with_has),
+    ("fix_scope", fix_scope),
     ("generator_mode", generator_mode),
     ("delegate_step", delegate_step),
     ("delegate_done", delegate_done),
@@ -766,6 +767,18 @@ fn to_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// Strict code's store to a `with` object's property: `[o, name, v]`,
 /// a ReferenceError if `o` no longer has it.
+/// `[scope]`: a function's scope object's bindings, its own (parameters,
+/// `var`s, functions), not deletable.
+fn fix_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let o = as_object(a[0]);
+    let keys: Vec<Key> = vm.own_keys(o).into_iter().map(|(k, _)| k).collect();
+    for k in keys {
+        let d = Desc { configurable: Some(false), ..Default::default() };
+        vm.define_own_property(o, k, &d)?;
+    }
+    Ok(a[0])
+}
+
 /// `[name, o]`: whether a `with` over `o` binds `name` (HasBinding of an
 /// object environment): `o` has it, and `o[Symbol.unscopables]` doesn't
 /// say so.

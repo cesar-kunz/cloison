@@ -1,9 +1,10 @@
-//! `JSON.stringify` (with `toJSON`, a replacer and a gap) and
-//! `JSON.parse` (with a reviver), as the spec has them. Installed by
+//! `JSON.stringify` (with `toJSON`, a replacer and a gap), `JSON.parse`
+//! (with a reviver, which gets each primitive's source text), and
+//! `JSON.rawJSON` and `isRawJSON`, as the spec has them. Installed by
 //! [`install`].
 
 use crate::interp::{call_function, check_native_stack, to_number, to_string_units};
-use crate::object::{DONT_ENUM, as_object, object_value};
+use crate::object::{Class, DONT_ENUM, RAW_JSON, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
 use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units, wrapped};
@@ -14,7 +15,15 @@ pub(crate) fn install(vm: &mut Vm) {
     let json = vm.new_object(op);
     let a_json = vm.intern("JSON");
     vm.add_property_with(g, a_json, object_value(json), DONT_ENUM);
-    vm.define_natives(json, &[("stringify", json_stringify as NativeFn, 3), ("parse", json_parse, 2)]);
+    vm.define_natives(
+        json,
+        &[
+            ("stringify", json_stringify as NativeFn, 3),
+            ("parse", json_parse, 2),
+            ("rawJSON", json_raw_json, 1),
+            ("isRawJSON", json_is_raw_json, 1),
+        ],
+    );
 }
 
 fn arg(a: &[Value], i: usize) -> Value {
@@ -130,6 +139,12 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
             // (A boolean's or a BigInt's; a symbol's stays an object.)
             v = p;
         }
+    }
+    if is_raw_json(v) {
+        let a_raw = vm.intern("rawJSON");
+        let raw = vm.get(v, a_raw)?;
+        out.extend_from_slice(&to_string_units(raw));
+        return Ok(true);
     }
     let push = |out: &mut Vec<u16>, s: &str| out.extend(s.encode_utf16());
     if v.is_null() {
@@ -280,54 +295,153 @@ fn quote(u: &[u16], out: &mut Vec<u16>) {
 /// `JSON.parse(text, reviver)`.
 fn json_parse(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let u = to_string_units(arg(a, 0));
-    let mut p = Parser { u: &u, i: 0 };
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    let reviver = arg(a, 1);
+    if !is_callable(reviver) {
+        return parse_text(vm, &u, false).map(|(v, _)| v);
+    }
+    vm.handle_scope(|vm| {
+        let (v, record) = parse_text(vm, &u, true)?;
+        let op = object_value(vm.object_prototype);
+        let root = object_value(vm.new_object(op));
+        vm.handles.push(root);
+        let empty = vm.intern("");
+        vm.create_data_property(root, Key::Name(empty), v)?;
+        let key = vm.new_string(&[]);
+        let a_source = vm.intern("source");
+        internalize(vm, reviver, root, key, Some(&record), &u, a_source)
+    })
+}
+
+/// `u` parsed as a whole JSON text; with `track`, its values' records too
+/// (each one rooted in `vm.handles` while the caller's scope lasts).
+fn parse_text(vm: &mut Vm, u: &[u16], track: bool) -> Result<(Value, Record)> {
+    let mut p = Parser { u, i: 0, track, records: Vec::new() };
     let v = p.value(vm)?;
     p.space();
     if p.i != u.len() {
         return Err(p.error());
     }
-    let reviver = arg(a, 1);
-    if !is_callable(reviver) {
-        return Ok(v);
-    }
-    vm.handle_scope(|vm| {
-        let op = object_value(vm.object_prototype);
-        let root = object_value(vm.new_object(op));
-        let empty = vm.intern("");
-        vm.create_data_property(root, Key::Name(empty), v)?;
-        let key = vm.new_string(&[]);
-        internalize(vm, reviver, root, key)
-    })
+    let r = p.records.pop().unwrap_or(Record { value: v, kind: RecordKind::None });
+    Ok((v, r))
 }
 
-/// InternalizeJSONProperty: `holder[name]` revived, its properties first.
-fn internalize(vm: &mut Vm, reviver: Value, holder: Value, name: Value) -> Result<Value> {
+/// A JSON Parse Record: the value a piece of the text made, and where the
+/// text was (a primitive's source) or its elements' or entries' records.
+struct Record {
+    value: Value,
+    kind: RecordKind,
+}
+
+enum RecordKind {
+    /// Not tracked.
+    None,
+    /// A primitive, from `start` to `end` in the text.
+    Source(usize, usize),
+    Elements(Vec<Record>),
+    /// By key; the last of a duplicated one.
+    Entries(crate::jit::HashMap<Vec<u16>, Record>),
+}
+
+/// InternalizeJSONProperty: `holder[name]` revived, its properties first;
+/// `record` what the parse made there, if anything: while `holder[name]`
+/// is still that, the reviver gets a primitive's source text in its
+/// third argument, `{ source }`.
+#[allow(clippy::too_many_arguments)]
+fn internalize(
+    vm: &mut Vm,
+    reviver: Value,
+    holder: Value,
+    name: Value,
+    record: Option<&Record>,
+    text: &[u16],
+    a_source: crate::object::Atom,
+) -> Result<Value> {
     check_native_stack(vm)?;
     let v = vm.get_keyed(holder, name)?;
+    let record = record.filter(|r| crate::props::same_value(r.value, v));
+    let context = object_value(vm.new_object(object_value(vm.object_prototype)));
+    if let Some(&Record { kind: RecordKind::Source(start, end), .. }) = record
+        && !is_object(v)
+    {
+        let source = vm.new_string(&text[start..end]);
+        vm.create_data_property(context, Key::Name(a_source), source)?;
+    }
     if is_object(v) {
         let o = as_object(v);
-        let keys: Vec<Key> = if crate::proxy::is_array(vm, v)? {
+        let array = crate::proxy::is_array(vm, v)?;
+        let keys: Vec<Key> = if array {
             let len = vm.length_of(v)?;
             (0..len as u32).map(Key::Index).collect()
+        } else if crate::proxy::is_proxy(vm, o) {
+            crate::proxy::enumerable_own_keys(vm, o)?
         } else {
             vm.own_keys(o).into_iter().filter(|&(_, e)| e).map(|(k, _)| k).collect()
         };
         for k in keys {
             let ks = vm.key_string(k);
-            let nv = internalize(vm, reviver, v, ks)?;
+            let child = match (record.map(|r| &r.kind), k) {
+                (Some(RecordKind::Elements(es)), Key::Index(i)) if array => es.get(i as usize),
+                (Some(RecordKind::Entries(es)), _) if !array => {
+                    string_units(ks).and_then(|u| es.get(u))
+                }
+                _ => None,
+            };
+            let nv = internalize(vm, reviver, v, ks, child, text, a_source)?;
+            // (A proxy's traps, and what they throw; a property that can't
+            // be deleted or defined stays.)
             if nv.is_undefined() {
-                vm.delete_own(o, k);
+                crate::proxy::delete(vm, o, k)?;
             } else {
-                let _ = vm.create_data_property(v, k, nv);
+                let d = crate::props::Desc::data(nv, true, true, true);
+                crate::proxy::define_property(vm, o, k, &d)?;
             }
         }
     }
-    call_function(vm, reviver, holder, &[name, v])
+    call_function(vm, reviver, holder, &[name, v, context])
+}
+
+/// Whether `v` is a `JSON.rawJSON` object.
+fn is_raw_json(v: Value) -> bool {
+    is_object(v) && unsafe { (*as_object(v)).class == Class::Plain && (*as_object(v)).flags & RAW_JSON != 0 }
+}
+
+/// `JSON.rawJSON(text)`: a frozen null-prototype object whose `rawJSON`
+/// is `text`, which `stringify` writes as it is: a primitive's JSON text,
+/// without whitespace around it.
+fn json_raw_json(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let u = to_string_units(arg(a, 0));
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    let bad_end = |c: Option<&u16>| c.is_none_or(|&c| matches!(c, 0x09 | 0x0A | 0x0D | 0x20));
+    if bad_end(u.first()) || bad_end(u.last()) || matches!(u[0], 0x5B | 0x7B) {
+        return Err(Error::new_syntax("JSON.rawJSON: not a primitive's JSON text"));
+    }
+    parse_text(vm, &u, false)?;
+    let o = vm.new_object(Value::NULL);
+    let s = vm.new_string(&u);
+    let a_raw = vm.intern("rawJSON");
+    vm.create_data_property(object_value(o), Key::Name(a_raw), s)?;
+    unsafe { (*o).flags |= RAW_JSON };
+    vm.seal(o, true);
+    Ok(object_value(o))
+}
+
+fn json_is_raw_json(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(is_raw_json(arg(a, 0))))
 }
 
 struct Parser<'a> {
     u: &'a [u16],
     i: usize,
+    /// Whether to make each value's [`Record`]: each one parsed is pushed
+    /// on `records`, an array's or object's taking its elements' or
+    /// entries' off.
+    track: bool,
+    records: Vec<Record>,
 }
 
 impl Parser<'_> {
@@ -365,33 +479,41 @@ impl Parser<'_> {
         }
     }
 
+    /// A value; if tracking, its record pushed (its value rooted).
     fn value(&mut self, vm: &mut Vm) -> Result<Value> {
         check_native_stack(vm)?;
         self.space();
-        match self.peek().map(|c| c as u8 as char) {
+        let start = self.i;
+        let base = self.records.len();
+        let mut keys: Vec<Vec<u16>> = Vec::new();
+        // (`container`: whether an object's, or an array's.)
+        let (v, container) = match self.peek().map(|c| c as u8 as char) {
             Some('{') if self.peek() < Some(128) => {
                 self.i += 1;
                 let o = object_value(vm.new_object(object_value(vm.object_prototype)));
-                if self.eat(b'}') {
-                    return Ok(o);
+                if !self.eat(b'}') {
+                    loop {
+                        self.space();
+                        let k = self.string()?;
+                        if !self.eat(b':') {
+                            return Err(self.error());
+                        }
+                        let v = self.value(vm)?;
+                        let key = vm.new_string(&k);
+                        let key = vm.to_key(key);
+                        vm.create_data_property(o, key, v)?;
+                        if self.track {
+                            keys.push(k);
+                        }
+                        if self.eat(b'}') {
+                            break;
+                        }
+                        if !self.eat(b',') {
+                            return Err(self.error());
+                        }
+                    }
                 }
-                loop {
-                    self.space();
-                    let k = self.string()?;
-                    if !self.eat(b':') {
-                        return Err(self.error());
-                    }
-                    let v = self.value(vm)?;
-                    let key = vm.new_string(&k);
-                    let key = vm.to_key(key);
-                    vm.create_data_property(o, key, v)?;
-                    if self.eat(b'}') {
-                        return Ok(o);
-                    }
-                    if !self.eat(b',') {
-                        return Err(self.error());
-                    }
-                }
+                (o, Some(true))
             }
             Some('[') if self.peek() < Some(128) => {
                 self.i += 1;
@@ -410,18 +532,30 @@ impl Parser<'_> {
                         }
                     }
                 }
-                Ok(arr)
+                (arr, Some(false))
             }
             Some('"') if self.peek() < Some(128) => {
                 let s = self.string()?;
-                Ok(vm.new_string(&s))
+                (vm.new_string(&s), None)
             }
-            Some('t') if self.peek() < Some(128) => self.word("true", Value::TRUE),
-            Some('f') if self.peek() < Some(128) => self.word("false", Value::FALSE),
-            Some('n') if self.peek() < Some(128) => self.word("null", Value::NULL),
-            Some('-' | '0'..='9') if self.peek() < Some(128) => self.number(),
-            _ => Err(self.error()),
+            Some('t') if self.peek() < Some(128) => (self.word("true", Value::TRUE)?, None),
+            Some('f') if self.peek() < Some(128) => (self.word("false", Value::FALSE)?, None),
+            Some('n') if self.peek() < Some(128) => (self.word("null", Value::NULL)?, None),
+            Some('-' | '0'..='9') if self.peek() < Some(128) => (self.number()?, None),
+            _ => return Err(self.error()),
+        };
+        if self.track {
+            if v.is_cell() {
+                vm.handles.push(v);
+            }
+            let kind = match container {
+                None => RecordKind::Source(start, self.i),
+                Some(true) => RecordKind::Entries(keys.into_iter().zip(self.records.split_off(base)).collect()),
+                Some(false) => RecordKind::Elements(self.records.split_off(base)),
+            };
+            self.records.push(Record { value: v, kind });
         }
+        Ok(v)
     }
 
     /// A JSON number: `-? int frac? exp?`, `int` without leading zeros.

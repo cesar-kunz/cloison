@@ -6997,3 +6997,28 @@ for (var j = 0; j < 64; j++) sum += f[j];
         "1.0009765625,1,1.0009765625,65504,Infinity,0,5.960464477539063e-8,NaN,0 true 0.0999755859375 -2.5 193 2 671.999755859375"
     );
 }
+
+/// `JSON.parse`'s reviver gets a primitive's source text while the value
+/// is still the parsed one; `JSON.rawJSON` text is what `stringify`
+/// writes.
+#[test]
+fn json_source_text_and_raw_json() {
+    let src = r#"
+var seen = [];
+JSON.parse('{"a": 1.50, "b": [12345678901234567890, "x\\u0041"], "a": -0e1}', function (k, v, c) {
+  seen.push(k + "=" + (c.source === undefined ? typeof v : c.source));
+  if (k === "0") this[1] = "changed";
+  return v;
+});
+var raw = JSON.rawJSON("1e1000");
+var r = [seen.join(" "), JSON.stringify({ n: raw, s: [JSON.rawJSON('"y"')] }), JSON.isRawJSON(raw), JSON.isRawJSON({}),
+  Object.isFrozen(raw), Object.getPrototypeOf(raw)];
+try { JSON.rawJSON(" 1"); } catch (e) { r.push(e.name); }
+try { JSON.rawJSON("{}"); } catch (e) { r.push(e.name); }
+r.join(" | ");"#;
+    assert_eq!(
+        value(src),
+        "a=-0e1 0=12345678901234567890 1=string b=object =object | {\"n\":1e1000,\"s\":[\"y\"]} | true | false | true |  | \
+         SyntaxError | SyntaxError"
+    );
+}

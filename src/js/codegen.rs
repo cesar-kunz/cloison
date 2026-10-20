@@ -995,30 +995,44 @@ fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
 
 /// Whether function `f`'s code may see its `arguments` and parameters
 /// aliased (a mapped `arguments` object is slower): it assigns a
-/// parameter, or an element of `arguments` (or deletes or defines one).
-fn aliases_arguments(f: &Function) -> bool {
+/// parameter, or an element of `arguments` (or deletes or defines one),
+/// or lets `arguments` go anywhere but to `apply` (which copies it): to a
+/// variable, a call, a return. Arrows in it too, whose `arguments` is its.
+fn aliases_arguments(p: &Program, f: &Function) -> bool {
     fn is_args(e: &Expr) -> bool {
         matches!(&e.kind, ExprKind::Ident(n) if &**n == "arguments")
     }
-    fn expr(e: &Expr, f: &Function) -> bool {
+    fn expr(e: &Expr, p: &Program, f: &Function) -> bool {
         use ExprKind::*;
         let param = |t: &Expr| matches!(&t.kind, Ident(n) if f.params.contains(n));
         let element = |t: &Expr| matches!(&t.kind, Index(o, _) | Member(o, _) if is_args(o));
         match &e.kind {
-            Assign(_, t, v) => param(t) || element(t) || expr(t, f) || expr(v, f),
-            Update(t, ..) => param(t) || element(t) || expr(t, f),
+            Assign(_, t, v) => param(t) || element(t) || expr(t, p, f) || expr(v, p, f),
+            Update(t, ..) => param(t) || element(t) || expr(t, p, f),
             Unary(UnOp::Delete, t) if element(t) => true,
             Call(c, args) if args.first().is_some_and(is_args) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) => true,
             Destructure(..) => true,
+            // (Reading it, or its elements, aliases nothing; `apply` copies.)
+            Index(o, k) if is_args(o) => expr(k, p, f),
+            Member(o, _) if is_args(o) => false,
+            Call(c, args) if matches!(&c.kind, Member(_, m) if &**m == "apply") && args.len() == 2 && is_args(&args[1]) => {
+                expr(c, p, f) || expr(&args[0], p, f)
+            }
+            Ident(n) if &**n == "arguments" => true,
+            Function(i) if p.functions[*i].arrow => {
+                let mut found = false;
+                for_each_expr(&p.functions[*i].body, &mut |e| found |= expr(e, p, f));
+                found
+            }
             _ => {
                 let mut sub = Vec::new();
                 children(e, &mut sub);
-                sub.into_iter().any(|x| expr(x, f))
+                sub.into_iter().any(|x| expr(x, p, f))
             }
         }
     }
     let mut found = false;
-    for_each_expr(&f.body, &mut |e| found |= expr(e, f));
+    for_each_expr(&f.body, &mut |e| found |= expr(e, p, f));
     found
 }
 
@@ -1670,7 +1684,7 @@ impl<'a> Gen<'a> {
                 && !f.params.is_empty()
                 && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
                 // (A closure may assign a parameter it captures.)
-                && (aliases_arguments(f) || f.params.iter().any(|p| self.scopes.captured[self.index].contains(&&**p)));
+                && (aliases_arguments(self.p, f) || f.params.iter().any(|p| self.scopes.captured[self.index].contains(&&**p)));
             let op = if simple { Op::CreateMappedArguments } else { Op::CreateArguments };
             match self.locals.get("arguments") {
                 Some(&r) => self.emit(op, &[Arg::Reg(r)]),

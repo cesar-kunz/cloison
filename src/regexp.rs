@@ -29,6 +29,10 @@ pub struct Regex {
     pub unicode: bool,
     /// `s`: `.` matches line terminators too.
     pub dot_all: bool,
+    /// How units compare (see [`Case`]): as `i` and `u` say, but exactly
+    /// where the pattern has an `i` modifier, its nodes then made to match
+    /// as their place's case says (see `Parser::fold`).
+    fold: Case,
     /// `d`: a match's array has the groups' `indices` too.
     pub has_indices: bool,
     /// Where a match can start (see [`Starts`]).
@@ -86,17 +90,19 @@ enum Node {
     /// A surrogate pair whose astral code point is in the sorted inclusive
     /// ranges (`u` mode).
     Astral(Vec<(u32, u32)>),
-    /// `^`, `$`.
-    Start,
-    End,
-    /// `\b` (true) or `\B`.
-    Boundary(bool),
+    /// `^`, `$`, multiline (`m`, or a modifier's) or not.
+    Start(bool),
+    End(bool),
+    /// `\b` (true) or `\B`, with the case where it is (`i` and `u` make
+    /// `ſ` and the Kelvin sign word characters).
+    Boundary(bool, Case),
     /// A group: capturing (its index) or not.
     Group(Box<Node>, Option<usize>),
     /// `(?=…)` (true) or `(?!…)`; behind (the third), `(?<=…)` or
     /// `(?<!…)`.
     Look(Box<Node>, bool, bool),
-    BackRef(usize),
+    /// A group's match again, compared as the case says where it is.
+    BackRef(usize, Case),
     Alt(Vec<Node>),
     Seq(Vec<Node>),
     /// A repetition: minimum, maximum (`u32::MAX`: none), greedy, and the
@@ -191,10 +197,11 @@ impl Regex {
         Regex::parse(pattern, flags).map(|_| ())
     }
 
-    /// `pattern`'s tree, group count and names, and `flags`
-    /// (`g`, `i`, `m`, `y`, `u`, `s`, `d`, in that order).
+    /// `pattern`'s tree, group count and names, `flags` (`g`, `i`, `m`,
+    /// `y`, `u`, `s`, `d`, in that order), and whether its case is explicit
+    /// in its nodes (an `i` modifier: see `Parser::fold`).
     #[allow(clippy::type_complexity)]
-    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 7]), String> {
+    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 7], bool), String> {
         let (mut global, mut ignore_case, mut multiline) = (false, false, false);
         let (mut sticky, mut unicode, mut dot_all, mut has_indices) = (false, false, false, false);
         for f in flags.chars() {
@@ -214,6 +221,7 @@ impl Regex {
         }
         let chars: Vec<char> = pattern.chars().collect();
         let (total, names) = count_groups(&chars);
+        let explicit = has_case_modifier(&chars);
         let mut p = Parser {
             c: &chars,
             i: 0,
@@ -222,6 +230,9 @@ impl Regex {
             names,
             unicode,
             dot_all,
+            ignore_case,
+            multiline,
+            explicit,
             depth: 0,
             pending: None,
         };
@@ -229,13 +240,18 @@ impl Regex {
         if p.i != chars.len() {
             return Err(format!("Invalid regular expression: /{pattern}/: Unmatched ')'"));
         }
-        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices]))
+        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices], explicit))
     }
 
     /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
-        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices]) =
+        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices], explicit) =
             Regex::parse(pattern, flags)?;
+        let fold = match (ignore_case && !explicit, unicode) {
+            (false, _) => Case::Exact,
+            (true, false) => Case::Fold,
+            (true, true) => Case::Unicode,
+        };
         let node = if unicode { code_points(node) } else { node };
         let mut re = Regex {
             node,
@@ -248,6 +264,7 @@ impl Regex {
             unicode,
             dot_all,
             has_indices,
+            fold,
             starts: Starts::Anywhere,
             needle: None,
             prog: Program::default(),
@@ -258,7 +275,7 @@ impl Regex {
         };
         re.prog = Program::compile(&re);
         re.literal = match &re.node {
-            _ if re.ignore_case => None,
+            _ if re.fold != Case::Exact => None,
             Node::Char(c) => Some(vec![*c]),
             Node::Seq(ns) => ns
                 .iter()
@@ -283,7 +300,7 @@ impl Regex {
         };
         // Folding case, characters that only match themselves: ASCII but
         // letters.
-        let ic = self.ignore_case;
+        let ic = self.fold != Case::Exact;
         let fixed = |n: &Node| matches!(n, Node::Char(c) if !ic || *c < 128 && !(*c as u8).is_ascii_alphabetic());
         // One unit will do where finding a start is slow otherwise.
         let one = if matches!(self.starts, Starts::Units { few: Some(_), .. }) { 2 } else { 1 };
@@ -309,7 +326,7 @@ impl Regex {
     }
 
     fn starts(&self) -> Starts {
-        if anchored(&self.node) {
+        if anchored(&self.node, self.multiline) {
             return Starts::Anchored;
         }
         match self.first(&self.node) {
@@ -450,13 +467,13 @@ impl Regex {
     /// tested as matching does, so with its case folding (which maps no
     /// unit past ASCII to one in it, or back).
     fn first(&self, n: &Node) -> First {
-        let ic = Case::of(self);
+        let ic = self.fold;
         let units = |one: &dyn Fn(u16) -> bool, other: bool| {
             let ascii = (0..128u16).filter(|&c| one(c)).fold(0u128, |m, c| m | 1 << c);
             Some((ascii, other, false))
         };
         match n {
-            Node::Empty | Node::Start | Node::End | Node::Boundary(_) | Node::Look(..) => {
+            Node::Empty | Node::Start(_) | Node::End(_) | Node::Boundary(..) | Node::Look(..) => {
                 Some((0, false, true))
             }
             // (Case folding maps no unit past ASCII to one in it, or back,
@@ -469,7 +486,7 @@ impl Regex {
             ),
             Node::Astral(_) => Some((0, true, false)),
             Node::Group(inner, _) => self.first(inner),
-            Node::BackRef(_) => None,
+            Node::BackRef(..) => None,
             Node::Repeat(inner, min, ..) => {
                 let (a, o, empty) = self.first(inner)?;
                 Some((a, o, empty || *min == 0))
@@ -641,11 +658,11 @@ pub(crate) fn find(s: &[u16], needle: &[u16], from: usize) -> Option<usize> {
 /// The shortest and longest `n` matches (`None`: no bound).
 fn width(n: &Node) -> (usize, Option<usize>) {
     match n {
-        Node::Empty | Node::Start | Node::End | Node::Boundary(_) | Node::Look(..) => (0, Some(0)),
+        Node::Empty | Node::Start(_) | Node::End(_) | Node::Boundary(..) | Node::Look(..) => (0, Some(0)),
         Node::Char(_) | Node::Any | Node::Class(..) => (1, Some(1)),
         Node::Astral(_) => (2, Some(2)),
         Node::Group(inner, _) => width(inner),
-        Node::BackRef(_) => (0, None),
+        Node::BackRef(..) => (0, None),
         Node::Alt(alts) => alts.iter().map(width).fold((usize::MAX, Some(0)), |(a, b), (c, d)| {
             (a.min(c), b.zip(d).map(|(b, d)| b.max(d)))
         }),
@@ -668,10 +685,12 @@ fn seq_width(nodes: &[Node]) -> (usize, Option<usize>) {
     })
 }
 
-/// Whether every match of `n` begins where `^` matches.
-fn anchored(n: &Node) -> bool {
+/// Whether every match of `n` begins where `^` matches (multiline as
+/// `multiline` says: the pattern's).
+fn anchored(n: &Node, multiline: bool) -> bool {
+    let anchored = |n: &Node| anchored(n, multiline);
     match n {
-        Node::Start => true,
+        Node::Start(m) => *m == multiline,
         Node::Group(inner, _) => anchored(inner),
         Node::Seq(nodes) => nodes.first().is_some_and(anchored),
         Node::Alt(alts) => alts.iter().all(anchored),
@@ -704,6 +723,72 @@ fn count_groups(c: &[char]) -> (usize, Vec<(String, usize)>) {
     (n, names)
 }
 
+/// Whether pattern `c` has a modifier group that sets or clears `i`
+/// (`(?i:…)`, `(?-i:…)`, …): its case is then made explicit in its nodes.
+fn has_case_modifier(c: &[char]) -> bool {
+    let (mut i, mut class) = (0, false);
+    while i < c.len() {
+        match c[i] {
+            '\\' => i += 1,
+            '[' => class = true,
+            ']' => class = false,
+            '(' if !class && c.get(i + 1) == Some(&'?') => {
+                let flags: Vec<char> = c[i + 2..].iter().copied().take_while(|ch| "ims-".contains(*ch)).collect();
+                if c.get(i + 2 + flags.len()) == Some(&':') && flags.contains(&'i') {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Each unit's equivalents under case `case` (the units of the same
+/// canonical form), by canonical form; made once for each folding.
+fn case_members(case: Case) -> &'static std::collections::HashMap<u16, Vec<u16>> {
+    use std::sync::OnceLock;
+    static FOLD: OnceLock<std::collections::HashMap<u16, Vec<u16>>> = OnceLock::new();
+    static UNICODE: OnceLock<std::collections::HashMap<u16, Vec<u16>>> = OnceLock::new();
+    let cell = if case == Case::Unicode { &UNICODE } else { &FOLD };
+    cell.get_or_init(|| {
+        let mut m: std::collections::HashMap<u16, Vec<u16>> = std::collections::HashMap::new();
+        for c in 0..=0xFFFFu16 {
+            let k = case.canon(c);
+            if k != c || m.contains_key(&k) {
+                m.entry(k).or_insert_with(|| vec![k]).push(c);
+            }
+        }
+        m
+    })
+}
+
+/// The units of `ranges` with every unit that matches one of them folding
+/// case as `case` does, as sorted inclusive ranges.
+fn fold_ranges(ranges: &[(u16, u16)], case: Case) -> Vec<(u16, u16)> {
+    let members = case_members(case);
+    let mut units: Vec<u16> = Vec::new();
+    for &(a, b) in ranges {
+        for c in a..=b {
+            units.push(c);
+            if let Some(ms) = members.get(&case.canon(c)) {
+                units.extend_from_slice(ms);
+            }
+        }
+    }
+    units.sort_unstable();
+    units.dedup();
+    let mut out: Vec<(u16, u16)> = Vec::new();
+    for u in units {
+        match out.last_mut() {
+            Some((_, hi)) if *hi as u32 + 1 == u as u32 => *hi = u,
+            _ => out.push((u, u)),
+        }
+    }
+    out
+}
+
 struct Parser<'a> {
     c: &'a [char],
     i: usize,
@@ -713,7 +798,15 @@ struct Parser<'a> {
     /// The named groups (all of them, found first).
     names: Vec<(String, usize)>,
     unicode: bool,
+    /// `s`, `i` and `m` where the parser is: the flags', or a modifier
+    /// group's around it.
     dot_all: bool,
+    ignore_case: bool,
+    multiline: bool,
+    /// Whether case is explicit in the nodes (the pattern has an `i`
+    /// modifier): where `ignore_case` holds, characters and classes are
+    /// made classes of every unit they match, and matching is exact.
+    explicit: bool,
     /// Groups open around the current position (up to [`MAX_NESTING`]).
     depth: usize,
     /// An error a class's member found (see `Parser::class_atom`).
@@ -725,6 +818,35 @@ struct Parser<'a> {
 const MAX_NESTING: usize = 500;
 
 impl Parser<'_> {
+    /// How case compares where the parser is.
+    fn case(&self) -> Case {
+        match (self.ignore_case, self.unicode) {
+            (false, _) => Case::Exact,
+            (true, false) => Case::Fold,
+            (true, true) => Case::Unicode,
+        }
+    }
+
+    /// Atom `n` as it matches where the parser is, case made explicit (see
+    /// `explicit`): a character or a class (within a class's or an
+    /// escape's alternatives) as a class of the units it matches.
+    fn fold(&self, n: Node) -> Node {
+        if !self.explicit || !self.ignore_case {
+            return n;
+        }
+        let case = self.case();
+        match n {
+            Node::Char(c) => {
+                let r = fold_ranges(&[(c, c)], case);
+                if r == [(c, c)] { Node::Char(c) } else { Node::Class(r, false) }
+            }
+            Node::Class(r, neg) => Node::Class(fold_ranges(&r, case), neg),
+            Node::Alt(v) => Node::Alt(v.into_iter().map(|n| self.fold(n)).collect()),
+            Node::Seq(v) => Node::Seq(v.into_iter().map(|n| self.fold(n)).collect()),
+            n => n,
+        }
+    }
+
     fn peek(&self) -> Option<char> {
         self.c.get(self.i).copied()
     }
@@ -781,7 +903,7 @@ impl Parser<'_> {
             return Err(self.error("numbers out of order in {} quantifier"));
         }
         // (A lookahead may be, outside `u` mode: Annex B.)
-        if matches!(atom, Node::Start | Node::End | Node::Boundary(_))
+        if matches!(atom, Node::Start(_) | Node::End(_) | Node::Boundary(..))
             || matches!(atom, Node::Look(..)) && self.unicode
         {
             return Err(self.error("Nothing to repeat"));
@@ -827,6 +949,47 @@ impl Parser<'_> {
     }
 
     fn atom(&mut self) -> Result<Node, String> {
+        let n = self.atom_node()?;
+        Ok(self.fold(n))
+    }
+
+    /// `(?ims-ims:` past `(`: the flags it sets and clears, consumed, if
+    /// it is one (an early error if a flag repeats or none is given).
+    fn modifiers(&mut self) -> Result<Option<([bool; 3], [bool; 3])>, String> {
+        if self.peek() != Some('?') || !self.c.get(self.i + 1).is_some_and(|c| "ims-".contains(*c)) {
+            return Ok(None);
+        }
+        let mut j = self.i + 1;
+        let (mut add, mut remove) = ([false; 3], [false; 3]);
+        let (mut adding, mut any) = (true, false);
+        loop {
+            let Some(&c) = self.c.get(j) else { return Err(self.error("Invalid group")) };
+            j += 1;
+            let k = match c {
+                ':' => break,
+                '-' if adding => {
+                    adding = false;
+                    continue;
+                }
+                'i' => 0,
+                'm' => 1,
+                's' => 2,
+                _ => return Err(self.error("Invalid group")),
+            };
+            if add[k] || remove[k] {
+                return Err(self.error("Repeated flag in modifiers"));
+            }
+            if adding { add[k] = true } else { remove[k] = true }
+            any = true;
+        }
+        if !any {
+            return Err(self.error("Invalid group"));
+        }
+        self.i = j;
+        Ok(Some((add, remove)))
+    }
+
+    fn atom_node(&mut self) -> Result<Node, String> {
         let c = self.peek().unwrap();
         self.i += 1;
         Ok(match c {
@@ -836,10 +999,22 @@ impl Parser<'_> {
             }
             '.' if self.unicode => Node::Alt(vec![surrogate_pair(), Node::Any]),
             '.' => Node::Any,
-            '^' => Node::Start,
-            '$' => Node::End,
+            '^' => Node::Start(self.multiline),
+            '$' => Node::End(self.multiline),
             '(' => {
-                let (kind, cap) = if self.c[self.i..].starts_with(&['?', ':']) {
+                // `(?ims-ims:…)`: the flags as it says inside, then as they
+                // were.
+                let saved = (self.ignore_case, self.multiline, self.dot_all);
+                let modifiers = self.modifiers()?;
+                if let Some((add, remove)) = modifiers {
+                    let set = |on: &mut bool, k: usize| *on = (*on || add[k]) && !remove[k];
+                    set(&mut self.ignore_case, 0);
+                    set(&mut self.multiline, 1);
+                    set(&mut self.dot_all, 2);
+                }
+                let (kind, cap) = if modifiers.is_some() {
+                    (0, None)
+                } else if self.c[self.i..].starts_with(&['?', ':']) {
                     self.i += 2;
                     (0, None)
                 } else if self.c[self.i..].starts_with(&['?', '=']) {
@@ -874,6 +1049,7 @@ impl Parser<'_> {
                     return Err(self.error("Regular expression too large"));
                 }
                 let inner = self.alternation()?;
+                (self.ignore_case, self.multiline, self.dot_all) = saved;
                 self.depth -= 1;
                 if self.peek() != Some(')') {
                     return Err(self.error("Unterminated group"));
@@ -935,12 +1111,12 @@ impl Parser<'_> {
                 self.i += 1;
                 let name = self.group_name()?;
                 match self.names.iter().find(|(n, _)| *n == name) {
-                    Some(&(_, g)) => Node::BackRef(g),
+                    Some(&(_, g)) => Node::BackRef(g, self.case()),
                     None => return Err(self.error("Invalid named capture referenced")),
                 }
             }
-            'b' => Node::Boundary(true),
-            'B' => Node::Boundary(false),
+            'b' => Node::Boundary(true, self.case()),
+            'B' => Node::Boundary(false, self.case()),
             'p' | 'P' if self.unicode => {
                 let set = self.property(e == 'P')?;
                 cp_class(set, false)
@@ -974,7 +1150,7 @@ impl Parser<'_> {
                 }
                 let n: usize = self.c[s..self.i].iter().collect::<String>().parse().unwrap_or(0);
                 if n <= self.total {
-                    Node::BackRef(n)
+                    Node::BackRef(n, self.case())
                 } else if self.unicode {
                     return Err(self.error("Invalid escape"));
                 } else {
@@ -1401,11 +1577,12 @@ enum Insn {
     Class { ascii: u128, k: u32 },
     /// A surrogate pair of a code point in `Program::astral[k]`.
     Astral(u32),
-    Start,
-    End,
-    /// `\b` (true) or `\B`.
-    Boundary(bool),
-    BackRef(u32),
+    /// `^`, `$`: multiline or not.
+    Start(bool),
+    End(bool),
+    /// `\b` (true) or `\B`, as the case says.
+    Boundary(bool, Case),
+    BackRef(u32, Case),
     /// Continue with the next instruction; on backtracking, at `to`.
     Split(u32),
     Jmp(u32),
@@ -1444,7 +1621,7 @@ enum Insn {
     /// Group `g` matched backwards, from here to register `r`'s position.
     SaveBack { g: u32, r: u32 },
     /// A backreference matched backwards: the text before here.
-    BackRefBack(u32),
+    BackRefBack(u32, Case),
     Match,
 }
 
@@ -1544,10 +1721,14 @@ impl Native {
     fn compile(re: &Regex) -> Option<Native> {
         use crate::jit::rx::{self, Imm64, Piece, To};
         // (`rx_fold` folds as without `u`.)
-        if Case::of(re) == Case::Unicode {
+        if re.fold == Case::Unicode {
             return None;
         }
         let code = &re.prog.code;
+        // (Nor `\b` where `i` and `u` widen the word characters.)
+        if code.iter().any(|i| matches!(i, Insn::Boundary(_, Case::Unicode))) {
+            return None;
+        }
         // Each instruction's piece (a run's unit: the run's).
         let mut idx = vec![0; code.len() + 1];
         let (mut n, mut nruns, mut nheads) = (0, 0, 0);
@@ -1556,14 +1737,14 @@ impl Native {
             idx[i] = n;
             n += 1;
             match code[i] {
-                Insn::BackRef(_)
+                Insn::BackRef(..)
                 | Insn::Look { .. }
                 | Insn::LookEnd
                 | Insn::Behind { .. }
                 | Insn::BehindEnd
                 | Insn::Back
                 | Insn::SaveBack { .. }
-                | Insn::BackRefBack(_)
+                | Insn::BackRefBack(..)
                 | Insn::Astral(_) => return None,
                 Insn::Run { .. } | Insn::LazyRun { .. } => {
                     idx[i + 1] = idx[i];
@@ -1617,9 +1798,9 @@ impl Native {
                     let u = &re.prog.strs[k as usize];
                     Piece { imm: u.len() as u32, imm64: Imm64::Value(u.as_ptr() as u64), ..piece("rx_str") }
                 }
-                Insn::Start => piece(if re.multiline { "rx_start_m" } else { "rx_start" }),
-                Insn::End => piece(if re.multiline { "rx_end_m" } else { "rx_end" }),
-                Insn::Boundary(b) => Piece { imm: b as u32, ..piece("rx_boundary") },
+                Insn::Start(m) => piece(if m { "rx_start_m" } else { "rx_start" }),
+                Insn::End(m) => piece(if m { "rx_end_m" } else { "rx_end" }),
+                Insn::Boundary(b, _) => Piece { imm: b as u32, ..piece("rx_boundary") },
                 Insn::Split(to) => Piece { imm64: Imm64::Piece(idx[to as usize]), ..piece("rx_split") },
                 Insn::Jmp(to) => Piece { cont: To::Piece(idx[to as usize]), ..piece("rx_jmp") },
                 Insn::Mark(r) => Piece { imm: reg(r) as u32, ..piece("rx_mark") },
@@ -1671,14 +1852,14 @@ impl Native {
                     continue;
                 }
                 Insn::Match => piece("rx_match"),
-                Insn::BackRef(_)
+                Insn::BackRef(..)
                 | Insn::Look { .. }
                 | Insn::LookEnd
                 | Insn::Behind { .. }
                 | Insn::BehindEnd
                 | Insn::Back
                 | Insn::SaveBack { .. }
-                | Insn::BackRefBack(_)
+                | Insn::BackRefBack(..)
                 | Insn::Astral(_) => unreachable!(),
             };
             pieces.push(p);
@@ -1731,7 +1912,7 @@ impl Native {
         let ctx = rx::Ctx {
             limit: unsafe { bt.as_mut_ptr().add(bt.len() - 4) },
             classes: self.classes.as_ptr(),
-            ic: re.ignore_case as usize,
+            ic: (re.fold != Case::Exact) as usize,
         };
         let end = unsafe {
             (self.code.entry())(s.as_ptr(), s.len(), at, bt.as_mut_ptr().add(2), slots.as_mut_ptr(), &ctx)
@@ -1758,7 +1939,7 @@ impl Native {
 
 impl Program {
     fn compile(re: &Regex) -> Program {
-        let mut p = Program { ic: Case::of(re), ..Program::default() };
+        let mut p = Program { ic: re.fold, ..Program::default() };
         p.emit(re, &re.node);
         p.code.push(Insn::Match);
         p
@@ -1775,7 +1956,7 @@ impl Program {
 
     /// The instruction matching the single unit `n` stands for, if it does.
     fn unit(&mut self, re: &Regex, n: &Node) -> Option<Insn> {
-        let ic = Case::of(re);
+        let ic = re.fold;
         Some(match n {
             Node::Char(c) if ic != Case::Exact => Insn::CharFold { c: *c, canon: ic.canon(*c) },
             Node::Char(c) => Insn::Char(*c),
@@ -1811,11 +1992,11 @@ impl Program {
                     self.code.push(i);
                 }
             }
-            Node::Start => self.code.push(Insn::Start),
-            Node::End => self.code.push(Insn::End),
-            Node::Boundary(b) => self.code.push(Insn::Boundary(*b)),
-            Node::BackRef(g) if self.backward => self.code.push(Insn::BackRefBack(*g as u32)),
-            Node::BackRef(g) => self.code.push(Insn::BackRef(*g as u32)),
+            Node::Start(m) => self.code.push(Insn::Start(*m)),
+            Node::End(m) => self.code.push(Insn::End(*m)),
+            Node::Boundary(b, c) => self.code.push(Insn::Boundary(*b, *c)),
+            Node::BackRef(g, c) if self.backward => self.code.push(Insn::BackRefBack(*g as u32, *c)),
+            Node::BackRef(g, c) => self.code.push(Insn::BackRef(*g as u32, *c)),
             Node::Group(inner, None) => self.emit(re, inner),
             Node::Group(inner, Some(g)) => {
                 let r = self.reg();
@@ -1875,7 +2056,7 @@ impl Program {
                 while k < nodes.len() {
                     // Two or more characters (case not folded): one `Str`.
                     let run = nodes[k..].iter().take_while(|n| matches!(n, Node::Char(_))).count();
-                    if run >= 2 && !re.ignore_case {
+                    if run >= 2 && re.fold == Case::Exact {
                         let units = nodes[k..k + run]
                             .iter()
                             .map(|n| match n {
@@ -2000,27 +2181,27 @@ impl Program {
                     pos += 2;
                     ok
                 }
-                Insn::Start => {
+                Insn::Start(m) => {
                     pc += 1;
-                    pos == 0 || re.multiline && is_line_terminator(s[pos - 1])
+                    pos == 0 || m && is_line_terminator(s[pos - 1])
                 }
-                Insn::End => {
+                Insn::End(m) => {
                     pc += 1;
-                    pos == s.len() || re.multiline && is_line_terminator(s[pos])
+                    pos == s.len() || m && is_line_terminator(s[pos])
                 }
-                Insn::Boundary(want) => {
+                Insn::Boundary(want, case) => {
                     pc += 1;
-                    let a = pos > 0 && self.ic.word(s[pos - 1]);
-                    let b = pos < s.len() && self.ic.word(s[pos]);
+                    let a = pos > 0 && case.word(s[pos - 1]);
+                    let b = pos < s.len() && case.word(s[pos]);
                     (a != b) == want
                 }
-                Insn::BackRef(g) => {
+                Insn::BackRef(g, case) => {
                     pc += 1;
                     match caps[g as usize] {
                         None => true,
                         Some((a, b)) => {
                             let n = b - a;
-                            let ok = pos + n <= s.len() && (0..n).all(|d| eq(Case::of(re), s[pos + d], s[a + d]));
+                            let ok = pos + n <= s.len() && (0..n).all(|d| eq(case, s[pos + d], s[a + d]));
                             pos += n;
                             ok
                         }
@@ -2141,13 +2322,13 @@ impl Program {
                     pc += 1;
                     true
                 }
-                Insn::BackRefBack(g) => {
+                Insn::BackRefBack(g, case) => {
                     pc += 1;
                     match caps[g as usize] {
                         None => true,
                         Some((a, b)) => {
                             let n = b - a;
-                            let ok = n <= pos && (0..n).all(|d| eq(Case::of(re), s[pos - n + d], s[a + d]));
+                            let ok = n <= pos && (0..n).all(|d| eq(case, s[pos - n + d], s[a + d]));
                             pos = pos.saturating_sub(n);
                             ok
                         }
@@ -2261,11 +2442,11 @@ type K<'k, 'a> = &'k mut dyn FnMut(&mut Matcher<'a>, usize) -> bool;
 
 impl<'a> Matcher<'a> {
     fn eq(&self, a: u16, b: u16) -> bool {
-        eq(Case::of(self.re), a, b)
+        eq(self.re.fold, a, b)
     }
 
     fn in_class(&self, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
-        in_class(Case::of(self.re), ranges, neg, c)
+        in_class(self.re.fold, ranges, neg, c)
     }
 
     fn node(&mut self, n: &Node, i: usize, k: K<'_, 'a>) -> bool {
@@ -2276,15 +2457,11 @@ impl<'a> Matcher<'a> {
             Node::Any => i < s.len() && !is_line_terminator(s[i]) && k(self, i + 1),
             Node::Class(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && k(self, i + 1),
             Node::Astral(r) => astral_at(s, i).is_some_and(|c| in_points(r, c)) && k(self, i + 2),
-            Node::Start => {
-                (i == 0 || (self.re.multiline && is_line_terminator(s[i - 1]))) && k(self, i)
-            }
-            Node::End => {
-                (i == s.len() || (self.re.multiline && is_line_terminator(s[i]))) && k(self, i)
-            }
-            Node::Boundary(want) => {
-                let a = i > 0 && is_word(s[i - 1]);
-                let b = i < s.len() && is_word(s[i]);
+            Node::Start(m) => (i == 0 || (*m && is_line_terminator(s[i - 1]))) && k(self, i),
+            Node::End(m) => (i == s.len() || (*m && is_line_terminator(s[i]))) && k(self, i),
+            Node::Boundary(want, case) => {
+                let a = i > 0 && case.word(s[i - 1]);
+                let b = i < s.len() && case.word(s[i]);
                 ((a != b) == *want) && k(self, i)
             }
             Node::Group(inner, None) => self.node(inner, i, k),
@@ -2318,13 +2495,13 @@ impl<'a> Matcher<'a> {
                 self.caps = saved;
                 false
             }
-            Node::BackRef(g) => {
+            Node::BackRef(g, case) => {
                 let Some((a, b)) = self.caps.get(*g).copied().flatten() else {
                     return k(self, i);
                 };
                 let n = b - a;
                 i + n <= s.len()
-                    && (0..n).all(|d| self.eq(s[i + d], s[a + d]))
+                    && (0..n).all(|d| eq(*case, s[i + d], s[a + d]))
                     && k(self, i + n)
             }
             // A failed match leaves the captures as they were (a group

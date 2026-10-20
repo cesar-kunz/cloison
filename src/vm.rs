@@ -1490,6 +1490,24 @@ impl Vm {
         self.add_property_shaped(o, new, value)
     }
 
+    /// Room in `o`'s out-of-line slots (`props`) for slot `i`: doubled
+    /// (at least 4) if there is none.
+    #[inline]
+    pub(crate) fn reserve_props(&mut self, o: *mut Object, i: u32) {
+        unsafe {
+            if i >= (*o).props_cap {
+                let cap = ((*o).props_cap * 2).max(4).max(i + 1);
+                let p = self.heap.alloc_values(cap as usize);
+                if !(*o).props.is_null() {
+                    std::ptr::copy_nonoverlapping((*o).props, p, (*o).props_cap as usize);
+                }
+                (*o).props = p;
+                crate::heap::barrier_young(o.cast(), &raw const (*o).props);
+                (*o).props_cap = cap;
+            }
+        }
+    }
+
     /// Add the property that shape `new`, a transition from `o`'s, adds,
     /// with `value`: its slot.
     pub(crate) fn add_property_shaped(&mut self, o: *mut Object, new: *const Shape, value: Value) -> u32 {
@@ -1497,17 +1515,7 @@ impl Vm {
             let ns = &*new;
             let slot = ns.keys.len() as u32 - 1;
             if slot >= ns.capacity.get() {
-                let i = slot - ns.capacity.get();
-                if i >= (*o).props_cap {
-                    let cap = ((*o).props_cap * 2).max(4);
-                    let p = self.heap.alloc_values(cap as usize);
-                    if !(*o).props.is_null() {
-                        std::ptr::copy_nonoverlapping((*o).props, p, (*o).props_cap as usize);
-                    }
-                    (*o).props = p;
-                    crate::heap::barrier_young(o.cast(), &raw const (*o).props);
-                    (*o).props_cap = cap;
-                }
+                self.reserve_props(o, slot - ns.capacity.get());
             }
             (*o).shape = new;
             self.store_field(o, slot, value);

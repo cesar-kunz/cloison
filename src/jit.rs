@@ -669,6 +669,7 @@ fn runtime_function(name: &str) -> usize {
         "cloison_rt_construct_done" => cloison_rt_construct_done as *const () as usize,
         "cloison_rt_array_push" => cloison_rt_array_push as *const () as usize,
         "cloison_rt_char_code_at" => cloison_rt_char_code_at as *const () as usize,
+        "cloison_rt_props_room" => cloison_rt_props_room as *const () as usize,
         "cloison_rt_from_char_code" => cloison_rt_from_char_code as *const () as usize,
         "cloison_rt_pow" => cloison_rt_pow as *const () as usize,
         "cloison_rt_materialize" => cloison_rt_materialize as *const () as usize,
@@ -2334,12 +2335,14 @@ pub(crate) enum Prop {
         ft: FieldType,
     },
     /// A store adding the property: write `new_shape`, then the in-object
-    /// slot at `off`.
+    /// slot at `off`, or (`oop`) the out-of-line one at byte `off` of the
+    /// object's `props`, if they have room for it (`set_tro`).
     Transition {
         shape: u64,
         new_shape: u64,
         off: i32,
         ft: FieldType,
+        oop: bool,
     },
     /// A load folded to the value it had when compiled, `value`, of a
     /// field of type `ft`, after a check that the word at `at` still is
@@ -2435,7 +2438,7 @@ pub(crate) enum CaseLoc {
     Own(i32),
     Oop(i32),
     Proto(u64),
-    Transition { new_shape: u64, off: i32 },
+    Transition { new_shape: u64, off: i32, oop: bool },
 }
 
 /// Bit 0 of a [`Case`]'s `shape`: the case stands for every shape of a
@@ -2486,7 +2489,8 @@ impl Case {
                 new_shape,
                 off,
                 ft,
-            } => (shape, CaseLoc::Transition { new_shape, off }, ft),
+                oop,
+            } => (shape, CaseLoc::Transition { new_shape, off, oop }, ft),
             _ => return None,
         };
         Some(Case { shape, loc, ft })
@@ -2499,11 +2503,12 @@ impl Case {
             CaseLoc::Own(off) => Prop::Own { shape, off, ft },
             CaseLoc::Oop(off) => Prop::Oop { shape, off, ft },
             CaseLoc::Proto(addr) => Prop::Proto { shape, addr, ft },
-            CaseLoc::Transition { new_shape, off } => Prop::Transition {
+            CaseLoc::Transition { new_shape, off, oop } => Prop::Transition {
                 shape,
                 new_shape,
                 off,
                 ft,
+                oop,
             },
         }
     }
@@ -2517,7 +2522,8 @@ impl Case {
             (CaseLoc::Proto(addr), true) => ("get_proto", 0, addr),
             (CaseLoc::Own(off), false) => ("set_own", off, 0),
             (CaseLoc::Oop(off), false) => ("set_oop", off, 0),
-            (CaseLoc::Transition { new_shape, off }, false) => ("set_tr", off, new_shape),
+            (CaseLoc::Transition { new_shape, off, oop: false }, false) => ("set_tr", off, new_shape),
+            (CaseLoc::Transition { new_shape, off, oop: true }, false) => ("set_tro", off, new_shape),
             _ => unreachable!("a load's case is no transition, a store's no prototype's"),
         }
     }
@@ -2684,14 +2690,12 @@ impl Feedback {
             // (A setter or a read-only property may be on the prototype
             // chain since: see `Ic`.)
             Op::SetNamed if !ic.new_shape.is_null() && ic.epoch != epoch => Prop::None,
-            // (Out of line: through the runtime, which grows the object's
-            // `props` if needed; the transition stencils store in-object.)
-            Op::SetNamed if !ic.new_shape.is_null() && oop => Prop::Runtime,
             Op::SetNamed if !ic.new_shape.is_null() => Prop::Transition {
                 shape,
                 new_shape: ic.new_shape as u64,
                 off,
                 ft: field(ic.new_shape),
+                oop,
             },
             Op::GetNamed | Op::SetNamed if oop => Prop::Oop {
                 shape,
@@ -5175,7 +5179,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 ft,
             ),
             Prop::Proto { ft, .. } if load => finish(Sel::new("get_proto", case, out), ft),
-            Prop::Transition { new_shape, ft, .. } if !load => {
+            Prop::Transition { new_shape, ft, oop, .. } if !load => {
                 let ext = |t: Ty| match t {
                     Ty::Obj(x) => Ty::Ext(x),
                     t => t,
@@ -5183,7 +5187,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 out.regs.map(|_, t| ext(t));
                 out.acc = ext(out.acc);
                 out.regs.set(r, Ty::Obj(new_shape));
-                finish(Sel::new("set_tr", case, out), ft)
+                finish(Sel::new(if oop { "set_tro" } else { "set_tr" }, case, out), ft)
             }
             _ => bail(out),
         };
@@ -6264,10 +6268,11 @@ fn stencil_for(
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) => cat!(sel.base, "_", loc),
         // Stores take a boxed `acc`; a number's (`_n`) needs no barrier,
         // also one its check proved a number.
-        ("set_own" | "set_oop" | "set_tr", _) => {
+        ("set_own" | "set_oop" | "set_tr" | "set_tro", _) => {
             // An int32 into a `Num` field in the object: `acc` stays as it
-            // is, the `_d` store boxes it as a double.
-            let d = sel.dbl && sel.base != "set_oop";
+            // is, the `_d` store boxes it as a double. (Out of line, a
+            // `Num` field may hold int32s: no `_d`.)
+            let d = sel.dbl && !matches!(sel.base, "set_oop" | "set_tro");
             if !d {
                 box_acc(&mut pre);
             }
@@ -10211,7 +10216,7 @@ fn emit_poly(
         for (base, imm, imm64b) in bodies {
             let k = hot.len();
             // (`_d` boxes the int32 as a double into a `Num` field.)
-            let d = if s.dbl && base != "set_oop" { "_d" } else { "" };
+            let d = if s.dbl && !matches!(base, "set_oop" | "set_tro") { "_d" } else { "" };
             hot.push(Piece {
                 imm64b,
                 reg: insn.reg,
@@ -15898,6 +15903,14 @@ extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
 /// `array_push` stencils, when the value doesn't fit the elements' type or
 /// the elements are full: `Array.prototype.push` of `v` onto `a` (an
 /// array), its new length.
+/// Room in object `o`'s out-of-line slots for slot `i` (an int32), for a
+/// transition's store there (`set_tro` stencils): 1.
+extern "C" fn cloison_rt_props_room(o: Value, i: Value) -> u64 {
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    vm.reserve_props(crate::object::as_object(o), i.as_i32_unchecked() as u32);
+    1
+}
+
 /// `s.charCodeAt(k)` for `char_code_at` stencils: the unit, boxed (a cons
 /// string flattened), or 0 to leave where there is none or `s` is no
 /// string (the interpreter calls it).

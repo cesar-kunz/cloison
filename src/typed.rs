@@ -506,7 +506,7 @@ fn create_same(vm: &mut Vm, exemplar: *mut Object, n: usize) -> Result<*mut Obje
 }
 
 /// A new typed array of kind `k`, `n` zero elements.
-fn allocate(vm: &mut Vm, k: TypedKind, n: usize) -> Result<Value> {
+pub(crate) fn allocate(vm: &mut Vm, k: TypedKind, n: usize) -> Result<Value> {
     if n.checked_mul(k.size()).is_none_or(|b| b > MAX_BYTES) {
         return Err(Error::range_error(format!("Invalid typed array length: {n}")));
     }
@@ -1347,6 +1347,7 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.typed_constructors.push(c);
     }
     vm.typed_constructors.push(ab);
+    crate::base64::install(vm);
 }
 
 /// What needs the well-known symbols (`symbol::install` calls it):

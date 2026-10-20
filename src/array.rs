@@ -56,6 +56,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("isArray", array_is_array as NativeFn, 1),
             ("of", array_of, 0),
             ("from", array_from, 1),
+            ("fromAsync", array_from_async, 1),
         ],
     );
 }
@@ -1092,6 +1093,162 @@ fn array_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `Array.from(items, mapfn, thisArg)` over an array-like (no iterators
 /// without symbols; a string's characters are taken as its iteration
 /// would).
+/// `Array.fromAsync(items, mapfn, thisArg)`: a promise of the array
+/// `Array.from` would make, each value (and each mapped one) awaited. An
+/// async JS helper, made on first use, runs the algorithm; what it calls
+/// it gets from here, not from globals or prototypes code may have
+/// replaced.
+fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if vm.from_async_helper.is_undefined() {
+        let make = crate::builtins::run_source(vm, FROM_ASYNC)?;
+        vm.from_async_helper = vm.handle_scope(|vm| {
+            vm.handles.push(make);
+            let mut natives = Vec::new();
+            for (name, f, n) in [
+                ("isConstructor", from_async_is_constructor as NativeFn, 1),
+                ("call", from_async_call, 2),
+                ("define", from_async_define, 3),
+                ("typeError", from_async_type_error, 1),
+                ("fromSync", from_async_from_sync, 1),
+            ] {
+                let f = object_value(vm.native_function(name, f, n, crate::jit::Ty::Any, false));
+                vm.handles.push(f);
+                natives.push(f);
+            }
+            let a_async = vm.intern(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
+            natives.push(crate::symbol::atom_symbol(vm, a_async).expect("Symbol.asyncIterator"));
+            natives.push(crate::symbol::atom_symbol(vm, vm.a_sym_iterator).expect("Symbol.iterator"));
+            call_function(vm, make, Value::UNDEFINED, &natives)
+        })?;
+    }
+    let helper = vm.from_async_helper;
+    call_function(vm, helper, Value::UNDEFINED, &[this, arg(a, 0), arg(a, 1), arg(a, 2)])
+}
+
+/// `Array.fromAsync`'s algorithm (ECMA-262 §23.1.2.2), its steps as the
+/// spec orders them. `fromSync(v)` is a sync iterator's step as
+/// AsyncFromSyncIterator takes it (the promise `for await` awaits).
+const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, fromSync, asyncIterator, iterator) {
+  "use strict";
+  function isObject(x) { return (typeof x === "object" && x !== null) || typeof x === "function"; }
+  function getMethod(o, key) {
+    const m = o[key];
+    if (m === void 0 || m === null) return void 0;
+    if (typeof m !== "function") typeError("Array.fromAsync: an iterator method is not a function");
+    return m;
+  }
+  async function closeAsync(it, sync, e) {
+    try {
+      const ret = getMethod(it, "return");
+      if (ret !== void 0) {
+        const r = call(ret, it);
+        if (sync) {
+          if (isObject(r)) { r.done; await fromSync(r.value); }
+        } else {
+          await r;
+        }
+      }
+    } catch (_) {}
+    throw e;
+  }
+  return async function (C, items, mapfn, thisArg) {
+    const mapping = mapfn !== void 0;
+    if (mapping && typeof mapfn !== "function") typeError("Array.fromAsync: the mapper is not a function");
+    const usingAsync = getMethod(items, asyncIterator);
+    const usingSync = usingAsync === void 0 ? getMethod(items, iterator) : void 0;
+    if (usingAsync !== void 0 || usingSync !== void 0) {
+      const sync = usingAsync === void 0;
+      const it = call(sync ? usingSync : usingAsync, items);
+      if (!isObject(it)) typeError("Array.fromAsync: the iterator is not an object");
+      const next = it.next;
+      const A = isConstructor(C) ? new C() : [];
+      for (let k = 0; ; k++) {
+        let r = call(next, it);
+        if (!sync) r = await r;
+        if (!isObject(r)) typeError("Array.fromAsync: an iterator result is not an object");
+        const done = !!r.done;
+        let v;
+        if (sync) {
+          // (AsyncFromSyncIterator: the value awaited even when done; a
+          // rejection closes the iterator if it isn't.)
+          v = r.value;
+          try {
+            v = await fromSync(v);
+          } catch (e) {
+            if (!done) {
+              try {
+                const ret = getMethod(it, "return");
+                if (ret !== void 0) call(ret, it);
+              } catch (_) {}
+            }
+            throw e;
+          }
+        }
+        if (done) {
+          A.length = k;
+          return A;
+        }
+        if (!sync) v = r.value;
+        if (mapping) {
+          try {
+            v = await call(mapfn, thisArg, v, k);
+          } catch (e) {
+            return closeAsync(it, sync, e);
+          }
+        }
+        try {
+          define(A, k, v);
+        } catch (e) {
+          return closeAsync(it, sync, e);
+        }
+      }
+    }
+    // An array-like: its length, then each element awaited.
+    let len = +items.length;
+    len = len !== len || len <= 0 ? 0 : len === Infinity ? 9007199254740991 : len - len % 1;
+    if (len > 9007199254740991) len = 9007199254740991;
+    let A;
+    if (isConstructor(C)) {
+      A = new C(len);
+    } else {
+      A = [];
+      A.length = len;
+    }
+    for (let k = 0; k < len; k++) {
+      let v = await items[k];
+      if (mapping) v = await call(mapfn, thisArg, v, k);
+      define(A, k, v);
+    }
+    A.length = len;
+    return A;
+  };
+})"#;
+
+fn from_async_is_constructor(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(crate::intrinsics::is_constructor(arg(a, 0))))
+}
+
+/// `call(f, that, ...args)`: `f` called with `this` `that`.
+fn from_async_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    call_function(vm, arg(a, 0), arg(a, 1), a.get(2..).unwrap_or(&[]))
+}
+
+/// `define(o, k, v)`: CreateDataPropertyOrThrow.
+fn from_async_define(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let key = crate::intrinsics::to_property_key(vm, arg(a, 1))?;
+    vm.create_data_property(arg(a, 0), key, arg(a, 2))?;
+    Ok(Value::UNDEFINED)
+}
+
+fn from_async_type_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let m = to_string_units(arg(a, 0));
+    Err(Error::type_error(String::from_utf16_lossy(&m)))
+}
+
+fn from_async_from_sync(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    crate::promise::async_from_sync(vm, arg(a, 0))
+}
+
 fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let items = arg(a, 0);
     let mapfn = arg(a, 1);

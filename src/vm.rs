@@ -772,6 +772,8 @@ pub struct Vm {
     script_declared: crate::jit::HashSet<Atom>,
     /// `Function.prototype.bind`'s JS helper, once made.
     pub(crate) bind_helper: Value,
+    /// `Array.fromAsync`'s JS helper, once made.
+    pub(crate) from_async_helper: Value,
     /// Compiled regular expressions, by pattern and flags (a literal makes
     /// a new object each time it runs, sharing one).
     pub(crate) regexps: HashMap<(String, String), Box<crate::regexp::Regex>>,
@@ -959,6 +961,7 @@ impl Vm {
             regexp_slots: [0; 6],
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
+            from_async_helper: Value::UNDEFINED,
             declared: Default::default(),
             lexical_declared: Default::default(),
             script_declared: Default::default(),
@@ -4291,6 +4294,7 @@ impl Vm {
         .map(object_value)
         .collect();
         v.push(self.bind_helper);
+        v.push(self.from_async_helper);
         v.extend_from_slice(&self.single_chars);
         if let Some(Error(_, Some(e))) = &self.error {
             v.push(*e);

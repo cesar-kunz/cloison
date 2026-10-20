@@ -196,6 +196,24 @@ fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     }
 }
 
+/// A property key with a lone surrogate is its own key, not U+FFFD's: two
+/// such keys are two properties, listed and found as they are.
+#[test]
+fn property_keys_keep_lone_surrogates() {
+    assert_eq!(
+        value(
+            r#"
+var r = [], o = {}; o["\ud800"] = 1; o["\udc00"] = 2;
+r.push(Object.keys(o).length, Object.keys(o).map(k => k.charCodeAt(0)).join("/"));
+r.push(({ ["\ud800"]: 1 })["\udc00"], ({ "\ud800": 5 })["\ud800"], JSON.stringify(JSON.parse('{"\\ud800":1,"\\udc00":2}')));
+var ks = []; for (var k in { "\ud83d": 1 }) ks.push(k.charCodeAt(0)); r.push(ks.join());
+r.join(" ");
+"#
+        ),
+        r#"2 55296/56320  5 {"\ud800":1,"\udc00":2} 55357"#
+    );
+}
+
 /// A lone surrogate survives `toLowerCase`/`toUpperCase`, `eval`'d and
 /// `Function`'s source, and a pattern given as a string: not U+FFFD.
 #[test]

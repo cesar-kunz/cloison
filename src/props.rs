@@ -350,11 +350,12 @@ impl Vm {
 
     /// A key as a string value.
     pub(crate) fn key_string(&mut self, key: Key) -> Value {
-        let s = match key {
-            Key::Index(i) => i.to_string(),
-            Key::Name(a) => self.atom_name(a).to_string(),
-        };
-        let u: Vec<u16> = s.encode_utf16().collect();
+        let mut u = Vec::new();
+        match key {
+            Key::Index(i) => u.extend(i.to_string().encode_utf16()),
+            // (Its lone surrogates mapped back: see `property_key`.)
+            Key::Name(a) => crate::js::lex::string_units(self.atom_name(a), &mut u),
+        }
         self.string_constant(&u)
     }
 

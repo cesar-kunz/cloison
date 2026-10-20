@@ -765,8 +765,6 @@ fn to_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(object_value(vm.to_object(a[0])?))
 }
 
-/// Strict code's store to a `with` object's property: `[o, name, v]`,
-/// a ReferenceError if `o` no longer has it.
 /// `[scope]`: a function's scope object's bindings, its own (parameters,
 /// `var`s, functions), not deletable.
 fn fix_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
@@ -796,6 +794,8 @@ fn with_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(Value::TRUE)
 }
 
+/// Strict code's store to a `with` object's property: `[o, name, v]`,
+/// a ReferenceError if `o` no longer has it.
 fn with_set_strict(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
     if !vm.has_key(a[0], key)? {

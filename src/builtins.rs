@@ -70,6 +70,8 @@ pub(crate) fn install(vm: &mut Vm) {
             ("codePointAt", string_code_point_at, 1),
             ("at", string_at, 1),
             ("normalize", string_normalize, 0),
+            ("isWellFormed", string_is_well_formed, 0),
+            ("toWellFormed", string_to_well_formed, 0),
             ("anchor", string_html::<0>, 1),
             ("big", string_html::<1>, 0),
             ("blink", string_html::<2>, 0),
@@ -187,6 +189,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("trunc", math_trunc, 1),
             ("fround", math_fround, 1),
             ("hypot", math_hypot, 2),
+            ("sumPrecise", math_sum_precise, 1),
         ],
     );
     let a = vm.intern("SQRT1_2");
@@ -266,6 +269,7 @@ pub(crate) fn install(vm: &mut Vm) {
         // (The kinds' constructors inherit `Error`.)
         if k == 0 {
             error_ctor = object_value(c);
+            vm.define_native(c, "isError", error_is_error, 1, any, false);
         } else {
             vm.set_prototype_of(c, error_ctor);
         }
@@ -663,6 +667,46 @@ fn string_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Ok(Value::UNDEFINED);
     }
     Ok(vm.single_char(u[i as usize]))
+}
+
+/// Whether `u` has no lone surrogates.
+fn well_formed(u: &[u16]) -> bool {
+    let mut i = 0;
+    while i < u.len() {
+        match u[i] {
+            0xD800..0xDC00 if i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]) => i += 2,
+            0xD800..0xE000 => return false,
+            _ => i += 1,
+        }
+    }
+    true
+}
+
+fn string_is_well_formed(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    Ok(Value::from_bool(well_formed(&u)))
+}
+
+/// `toWellFormed()`: the string with each lone surrogate replaced by
+/// U+FFFD.
+fn string_to_well_formed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let u = this_units(this)?;
+    if well_formed(&u) {
+        return Ok(this_string(vm, this, &u));
+    }
+    let mut out = u.into_owned();
+    let mut i = 0;
+    while i < out.len() {
+        match out[i] {
+            0xD800..0xDC00 if i + 1 < out.len() && (0xDC00..0xE000).contains(&out[i + 1]) => i += 2,
+            0xD800..0xE000 => {
+                out[i] = 0xFFFD;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(vm.new_string(&out))
 }
 
 /// `normalize(form)`: the string itself (no normalization tables).
@@ -1432,6 +1476,133 @@ fn math_hypot(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let sum: f64 = xs.iter().map(|&x| (x / max) * (x / max)).sum();
     Ok(num(sum.sqrt() * max))
 }
+/// `Math.sumPrecise(items)`: the exact sum of the numbers `items` yields,
+/// rounded once. Anything else than a number is a TypeError (the iterator
+/// closed); no number at all, or only -0s, is -0.
+fn math_sum_precise(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let (mut sum, mut any_finite) = (ExactSum::default(), false);
+    let (mut nan, mut plus_inf, mut minus_inf) = (false, false, false);
+    crate::symbol::iterate(vm, arg(a, 0), |_, v| {
+        let Some(x) = v.as_number() else {
+            return Err(Error::type_error("Math.sumPrecise: an item is not a number"));
+        };
+        if x.is_nan() {
+            nan = true;
+        } else if x == f64::INFINITY {
+            plus_inf = true;
+        } else if x == f64::NEG_INFINITY {
+            minus_inf = true;
+        } else if !(x == 0.0 && x.is_sign_negative()) {
+            any_finite = true;
+            sum.add(x);
+        }
+        Ok(())
+    })?;
+    Ok(num(if nan || (plus_inf && minus_inf) {
+        f64::NAN
+    } else if plus_inf {
+        f64::INFINITY
+    } else if minus_inf {
+        f64::NEG_INFINITY
+    } else if !any_finite {
+        -0.0
+    } else {
+        sum.round()
+    }))
+}
+
+/// An exact sum of finite doubles: a two's complement integer counting
+/// 2^-1074, the least subnormal. A double is at most 2^1024 = 2^2098 of
+/// those, so 34 limbs (2176 bits) hold any sum of up to 2^53 of them.
+struct ExactSum([u64; 34]);
+
+impl Default for ExactSum {
+    fn default() -> Self {
+        ExactSum([0; 34])
+    }
+}
+
+impl ExactSum {
+    fn add(&mut self, x: f64) {
+        let bits = x.to_bits();
+        let exp = ((bits >> 52) & 0x7FF) as usize;
+        let frac = bits & ((1 << 52) - 1);
+        // `x` = `m` * 2^(`shift` - 1074).
+        let (m, shift) = if exp == 0 { (frac, 0) } else { (frac | 1 << 52, exp - 1) };
+        let (limb, at) = (shift / 64, shift % 64);
+        let wide = (m as u128) << at;
+        // The addend, in two's complement when negative.
+        let mut addend = [0u64; 34];
+        addend[limb] = wide as u64;
+        if limb + 1 < addend.len() {
+            addend[limb + 1] = (wide >> 64) as u64;
+        }
+        if x < 0.0 {
+            let mut carry = 1u64;
+            for l in addend.iter_mut() {
+                let (r, c) = (!*l).overflowing_add(carry);
+                *l = r;
+                carry = c as u64;
+            }
+        }
+        // (A carry out of the top limb wraps, as two's complement does.)
+        let mut carry = false;
+        for (l, a) in self.0.iter_mut().zip(addend) {
+            let (r, c1) = l.overflowing_add(a);
+            let (r, c2) = r.overflowing_add(carry as u64);
+            *l = r;
+            carry = c1 || c2;
+        }
+    }
+
+    /// The sum as the nearest double (ties to even; +0 if exactly zero).
+    fn round(&self) -> f64 {
+        let negative = self.0[self.0.len() - 1] >> 63 != 0;
+        let mut mag = self.0;
+        if negative {
+            let mut carry = 1u64;
+            for limb in mag.iter_mut() {
+                let (r, c) = (!*limb).overflowing_add(carry);
+                *limb = r;
+                carry = c as u64;
+            }
+        }
+        let Some(top) = mag.iter().rposition(|&l| l != 0) else {
+            return 0.0;
+        };
+        let p = top * 64 + 63 - mag[top].leading_zeros() as usize;
+        let bit = |i: usize| mag[i / 64] >> (i % 64) & 1 != 0;
+        let d = if p < 53 {
+            // Exact: fewer bits than a double's significand.
+            mag[0] as f64 * 5e-324
+        } else {
+            let shift = p - 52;
+            let mut m = 0u64;
+            for i in 0..53 {
+                m |= (bit(shift + i) as u64) << i;
+            }
+            let half = bit(shift - 1);
+            let sticky = (0..shift - 1).any(|i| bit(i));
+            let mut e = shift;
+            if half && (sticky || m & 1 != 0) {
+                m += 1;
+                if m == 1 << 53 {
+                    m >>= 1;
+                    e += 1;
+                }
+            }
+            // The leading bit's exponent: (`e` + 52) - 1074.
+            let exp = e as i64 + 52 - 1074;
+            if exp > 1023 {
+                f64::INFINITY
+            } else {
+                f64::from_bits(((exp + 1023) as u64) << 52 | (m & ((1 << 52) - 1)))
+            }
+        };
+        if negative { -d } else { d }
+    }
+}
+
 fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = crate::interp::to_int32(math_arg(a, 0));
     let y = crate::interp::to_int32(math_arg(a, 1));
@@ -1728,6 +1899,50 @@ pub(crate) fn is_class(v: Value, c: Class) -> bool {
 
 // ---- Regular expressions ----
 
+/// `RegExp.escape(s)`: `s` as a pattern matching it literally, in any
+/// context (after `\`, `\c` or a digit, in a class, with `u` or `v`).
+fn regexp_escape(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let Some(u) = string_units(arg(a, 0)) else {
+        return Err(Error::type_error("RegExp.escape requires a string"));
+    };
+    let mut out: Vec<u16> = Vec::with_capacity(u.len() * 2);
+    let push = |out: &mut Vec<u16>, s: &str| out.extend(s.encode_utf16());
+    let mut i = 0;
+    while i < u.len() {
+        // The code point at `i`: a pair, or a unit (a lone surrogate too).
+        let (c, n) = match u[i] {
+            hi @ 0xD800..0xDC00 if i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]) => {
+                (0x10000 + ((hi as u32 - 0xD800) << 10) + (u[i + 1] as u32 - 0xDC00), 2)
+            }
+            c => (c as u32, 1),
+        };
+        let ch = char::from_u32(c);
+        if i == 0 && ch.is_some_and(|ch| ch.is_ascii_alphanumeric()) {
+            // (A leading digit or letter: not one continuing `\1` or `\c`.)
+            push(&mut out, &format!("\\x{c:02x}"));
+        } else if "^$\\.*+?()[]{}|/".contains(ch.unwrap_or('\0')) && c < 0x80 {
+            out.push(b'\\' as u16);
+            out.push(c as u16);
+        } else if let Some(k) = [0x09, 0x0A, 0x0B, 0x0C, 0x0D].iter().position(|&x| x == c) {
+            out.push(b'\\' as u16);
+            out.push(b"tnvfr"[k] as u16);
+        } else if (c < 0x80 && ",-=<>#&!%:;@~'`\"".contains(ch.unwrap()))
+            || matches!(c, 0x20 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F | 0x3000 | 0xFEFF)
+            || (0xD800..0xE000).contains(&c)
+        {
+            if c <= 0xFF {
+                push(&mut out, &format!("\\x{c:02x}"));
+            } else {
+                push(&mut out, &format!("\\u{c:04x}"));
+            }
+        } else {
+            out.extend_from_slice(&u[i..i + n]);
+        }
+        i += n;
+    }
+    Ok(vm.new_string(&out))
+}
+
 fn install_regexps(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
@@ -1736,6 +1951,7 @@ fn install_regexps(vm: &mut Vm) {
     vm.regexp_prototype = rp;
     let c = vm.define_native(g, "RegExp", regexp_ctor, 2, any, true);
     link_constructor(vm, c, rp);
+    vm.define_native(c, "escape", regexp_escape, 1, any, false);
     vm.define_natives(
         rp,
         &[
@@ -2697,6 +2913,15 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
         }
     }
     Ok(e)
+}
+
+/// `Error.isError(v)`: whether `v` is an error object (has
+/// [[ErrorData]]), not one that only inherits from `Error.prototype`.
+fn error_is_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let v = arg(a, 0);
+    Ok(Value::from_bool(
+        crate::props::is_object(v) && unsafe { (*as_object(v)).flags } & crate::object::ERROR != 0,
+    ))
 }
 
 /// A new error object of kind `k`, with its own `message` if given.

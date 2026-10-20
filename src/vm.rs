@@ -5045,6 +5045,21 @@ unsafe fn flatten(o: *mut Object) {
     }
 }
 
+/// Code units as source text for the front end or the regular expression
+/// parser, which take Rust strings: a lone surrogate as the escape
+/// `\uXXXX`, which means it in string literals, template literals' cooked
+/// values and patterns (not U+FFFD, as a lossy conversion would make it).
+pub(crate) fn source_text(u: &[u16]) -> String {
+    let mut s = String::with_capacity(u.len());
+    for c in char::decode_utf16(u.iter().copied()) {
+        match c {
+            Ok(c) => s.push(c),
+            Err(e) => s.push_str(&format!("\\u{:04X}", e.unpaired_surrogate())),
+        }
+    }
+    s
+}
+
 /// Number::toString(10): the shortest digits that round-trip, laid out as
 /// ECMA-262 says (no exponent from 1e-6 up to 1e21).
 pub fn number_to_string(d: f64) -> String {

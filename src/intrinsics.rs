@@ -672,7 +672,7 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
-    let text = String::from_utf16_lossy(u);
+    let text = crate::vm::source_text(u);
     // (The objects of the `with` statements around it, outermost first.)
     let withs = a.get(7..).unwrap_or(&[]);
     let module = crate::js::compile_direct_eval(&text, strict, withs.len()).map_err(|e| {

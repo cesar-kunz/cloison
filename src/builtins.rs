@@ -1897,8 +1897,7 @@ fn is_finite(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// An accessor `name` on `o` whose getter is the native `f` (named `get
 /// name`, as the spec has it).
 pub(crate) fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) {
-    let holder = vm.new_object(Value::NULL);
-    let fo = vm.define_native(holder, &format!("get {name}"), f, 0, Ty::Any, false);
+    let fo = vm.native_function(&format!("get {name}"), f, 0, Ty::Any, false);
     let a = vm.intern(name);
     vm.define_accessor(o, a, Some(object_value(fo)), None, DONT_ENUM);
 }

@@ -188,6 +188,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("sign", math_sign, 1),
             ("trunc", math_trunc, 1),
             ("fround", math_fround, 1),
+            ("f16round", math_f16round, 1),
             ("hypot", math_hypot, 2),
             ("sumPrecise", math_sum_precise, 1),
         ],
@@ -1451,6 +1452,9 @@ fn math_trunc(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 fn math_fround(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0) as f32 as f64))
+}
+fn math_f16round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(num(crate::math::f16_value(crate::math::f16_bits(math_arg(a, 0)))))
 }
 /// `Math.hypot(…values)`: every argument coerced first; infinity wins
 /// over NaN.

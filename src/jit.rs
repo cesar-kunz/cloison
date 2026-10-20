@@ -4573,7 +4573,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     K::F32 => ("f32", F64),
                     K::F64 => ("f64", F64),
                     // (Not cached: see `vm::note_bytes`.)
-                    K::I64 | K::U64 => return Sel::new("bail", "", out),
+                    K::I64 | K::U64 | K::F16 => return Sel::new("bail", "", out),
                 };
                 const CHECKED: [&str; 9] =
                     ["i8_chk", "u8_chk", "u8_chk", "i16_chk", "u16_chk", "i32_chk", "u32f_chk", "f32_chk", "f64_chk"];
@@ -4705,7 +4705,7 @@ fn typed_store(kind: Option<u8>, int: bool) -> Option<&'static str> {
         (K::F32, false) => "f32_f",
         (K::F64, true) => "f64_i",
         (K::F64, false) => "f64_f",
-        (K::I64 | K::U64, _) => return None,
+        (K::I64 | K::U64 | K::F16, _) => return None,
     })
 }
 

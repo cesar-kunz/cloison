@@ -1307,3 +1307,43 @@ mod tests {
         assert_eq!(b(atan2(-0.0, -1.0)), b(-std::f64::consts::PI));
     }
 }
+
+/// `d` rounded to the nearest IEEE binary16 (ties to even), as its bits:
+/// what a `Float16Array` stores and `Math.f16round` rounds to. NaN is the
+/// canonical quiet NaN.
+pub fn f16_bits(d: f64) -> u16 {
+    if d.is_nan() {
+        return 0x7E00;
+    }
+    let sign = if d.is_sign_negative() { 0x8000 } else { 0 };
+    let a = d.abs();
+    // Below 2^-14, subnormals: multiples of 2^-24 (1024 is the least
+    // normal, which its bits are too).
+    if a < 2f64.powi(-14) {
+        return sign | (a * 2f64.powi(24)).round_ties_even() as u16;
+    }
+    // `a` = 2^`e` * `m`, `m` in [1, 2): 10 bits of `m` kept. (Each step is
+    // exact: scaling by a power of two, and `m - 1` of a double in [1, 2).)
+    let mut e = ((a.to_bits() >> 52) as i32) - 1023;
+    let mut frac = ((a / 2f64.powi(e) - 1.0) * 1024.0).round_ties_even() as u16;
+    if frac == 1024 {
+        frac = 0;
+        e += 1;
+    }
+    if e > 15 {
+        return sign | 0x7C00;
+    }
+    sign | ((e + 15) as u16) << 10 | frac
+}
+
+/// The binary16 of bits `h`, as a double (exactly).
+pub fn f16_value(h: u16) -> f64 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = ((h >> 10) & 0x1F, (h & 0x3FF) as f64);
+    sign * match e {
+        0 => m * 2f64.powi(-24),
+        31 if m == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        e => (1024.0 + m) * 2f64.powi(e as i32 - 25),
+    }
+}

@@ -170,10 +170,12 @@ pub enum TypedKind {
     /// `BigInt64Array`'s: BigInts (see [`TypedKind::is_big`]).
     I64,
     U64,
+    /// `Float16Array`'s: IEEE binary16 (`math::f16_bits`).
+    F16,
 }
 
 impl TypedKind {
-    pub const ALL: [TypedKind; 11] = [
+    pub const ALL: [TypedKind; 12] = [
         TypedKind::I8,
         TypedKind::U8,
         TypedKind::U8Clamped,
@@ -185,6 +187,7 @@ impl TypedKind {
         TypedKind::F64,
         TypedKind::I64,
         TypedKind::U64,
+        TypedKind::F16,
     ];
 
     /// Whether its elements are BigInts (which compiled code leaves to
@@ -192,6 +195,12 @@ impl TypedKind {
     /// ToBigInt).
     pub fn is_big(self) -> bool {
         matches!(self, TypedKind::I64 | TypedKind::U64)
+    }
+
+    /// Whether compiled code loads and stores its elements itself (not a
+    /// BigInt kind's, nor binary16's, which the runtime converts).
+    pub fn compiled(self) -> bool {
+        !matches!(self, TypedKind::I64 | TypedKind::U64 | TypedKind::F16)
     }
 
     pub fn from_u8(k: u8) -> TypedKind {
@@ -202,7 +211,7 @@ impl TypedKind {
     pub fn size(self) -> usize {
         match self {
             TypedKind::I8 | TypedKind::U8 | TypedKind::U8Clamped => 1,
-            TypedKind::I16 | TypedKind::U16 => 2,
+            TypedKind::I16 | TypedKind::U16 | TypedKind::F16 => 2,
             TypedKind::I32 | TypedKind::U32 | TypedKind::F32 => 4,
             TypedKind::F64 | TypedKind::I64 | TypedKind::U64 => 8,
         }
@@ -222,6 +231,7 @@ impl TypedKind {
             TypedKind::F64 => "Float64Array",
             TypedKind::I64 => "BigInt64Array",
             TypedKind::U64 => "BigUint64Array",
+            TypedKind::F16 => "Float16Array",
         }
     }
 
@@ -241,6 +251,7 @@ impl TypedKind {
                 TypedKind::U32 => Value::number(p.cast::<u32>().add(i).read_unaligned() as f64),
                 TypedKind::F32 => Value::number(p.cast::<f32>().add(i).read_unaligned() as f64),
                 TypedKind::F64 => Value::number(p.cast::<f64>().add(i).read_unaligned()),
+                TypedKind::F16 => Value::number(crate::math::f16_value(p.cast::<u16>().add(i).read_unaligned())),
                 TypedKind::I64 | TypedKind::U64 => {
                     let bits = p.cast::<u64>().add(i).read_unaligned();
                     crate::bigint::from_bits(bits, self == TypedKind::I64)
@@ -263,6 +274,7 @@ impl TypedKind {
                 TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(v as u32),
                 TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(v as f32),
                 TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(v as f64),
+                TypedKind::F16 => p.cast::<u16>().add(i).write_unaligned(crate::math::f16_bits(v as f64)),
                 // (Not for BigInts: see `store_value`.)
                 TypedKind::I64 | TypedKind::U64 => {}
             }
@@ -289,6 +301,7 @@ impl TypedKind {
                 TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(int() as u32),
                 TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(d as f32),
                 TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(d),
+                TypedKind::F16 => p.cast::<u16>().add(i).write_unaligned(crate::math::f16_bits(d)),
                 TypedKind::I64 | TypedKind::U64 => {}
             }
         }

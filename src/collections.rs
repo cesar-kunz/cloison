@@ -136,7 +136,7 @@ pub(crate) fn install(vm: &mut Vm) {
     getter(vm, dp, "buffer", view_buffer);
     getter(vm, dp, "byteLength", view_byte_length);
     getter(vm, dp, "byteOffset", view_byte_offset);
-    const GETS: [NativeFn; 10] = [
+    const GETS: [NativeFn; 11] = [
         view_get::<0>,
         view_get::<1>,
         view_get::<2>,
@@ -147,8 +147,9 @@ pub(crate) fn install(vm: &mut Vm) {
         view_get::<7>,
         view_get::<8>,
         view_get::<9>,
+        view_get::<10>,
     ];
-    const SETS: [NativeFn; 10] = [
+    const SETS: [NativeFn; 11] = [
         view_set::<0>,
         view_set::<1>,
         view_set::<2>,
@@ -159,8 +160,9 @@ pub(crate) fn install(vm: &mut Vm) {
         view_set::<7>,
         view_set::<8>,
         view_set::<9>,
+        view_set::<10>,
     ];
-    let names: Vec<(String, NativeFn, u32)> = (0..10)
+    let names: Vec<(String, NativeFn, u32)> = (0..VIEW_TYPES.len())
         .flat_map(|t| [(format!("get{}", VIEW_TYPES[t].0), GETS[t], 1), (format!("set{}", VIEW_TYPES[t].0), SETS[t], 2)])
         .collect();
     let fs: Vec<(&str, NativeFn, u32)> = names.iter().map(|(n, f, k)| (n.as_str(), *f, *k)).collect();
@@ -847,7 +849,7 @@ fn weak_set_delete(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// The element types of `DataView`'s `get` and `set` methods, and their
 /// sizes (`view_get`'s and `view_set`'s `T` indexes them).
-const VIEW_TYPES: [(&str, usize); 10] = [
+const VIEW_TYPES: [(&str, usize); 11] = [
     ("Int8", 1),
     ("Uint8", 1),
     ("Int16", 2),
@@ -858,6 +860,7 @@ const VIEW_TYPES: [(&str, usize); 10] = [
     ("Float64", 8),
     ("BigInt64", 8),
     ("BigUint64", 8),
+    ("Float16", 2),
 ];
 
 /// `new DataView(buffer, byteOffset, byteLength)`: a view of the buffer's
@@ -962,6 +965,7 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
         5 => Value::number(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
         6 => Value::number(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
         7 => Value::number(f64::from_le_bytes(b)),
+        10 => Value::number(crate::math::f16_value(u16::from_le_bytes([b[0], b[1]]))),
         _ => crate::bigint::from_bits(u64::from_le_bytes(b), T == 8),
     })
 }
@@ -972,8 +976,9 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_view(this)?;
     let i = to_index(vm, arg(a, 0))?;
-    let big = if T >= 8 { crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?) } else { 0 };
-    let d = if T >= 8 { 0.0 } else { to_number(arg(a, 1)) };
+    let is_big = T == 8 || T == 9;
+    let big = if is_big { crate::bigint::to_bits(crate::typed::to_element(vm, crate::object::TypedKind::I64, arg(a, 1))?) } else { 0 };
+    let d = if is_big { 0.0 } else { to_number(arg(a, 1)) };
     if vm.conv_thrown {
         return Err(vm.take_conv_error());
     }
@@ -987,6 +992,7 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
         4 | 5 => b[..4].copy_from_slice(&(to_int32(d) as u32).to_le_bytes()),
         6 => b[..4].copy_from_slice(&(d as f32).to_le_bytes()),
         7 => b = d.to_le_bytes(),
+        10 => b[..2].copy_from_slice(&crate::math::f16_bits(d).to_le_bytes()),
         _ => b = big.to_le_bytes(),
     }
     if !little {

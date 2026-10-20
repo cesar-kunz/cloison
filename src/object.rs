@@ -363,6 +363,10 @@ pub const IMMUTABLE_VIEW: u8 = 64;
 /// A plain object made by `JSON.rawJSON` ([[IsRawJSON]]);
 /// `LENGTH_READ_ONLY`'s bit, as plain objects aren't arrays.
 pub const RAW_JSON: u8 = 64;
+/// A `RegExp` made by a subclass's constructor ([[LegacyFeaturesEnabled]]
+/// false: see `builtins::note_legacy`); `LENGTH_READ_ONLY`'s bit, as
+/// regular expressions aren't arrays.
+pub const LEGACY_DISABLED: u8 = 64;
 /// A plain object made by an `Error` constructor (`[object Error]`);
 /// `FN_NAME_DELETED`'s bit, as errors aren't functions.
 pub const ERROR: u8 = 128;

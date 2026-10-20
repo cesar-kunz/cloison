@@ -1963,6 +1963,8 @@ fn install_regexps(vm: &mut Vm) {
     let c = vm.define_native(g, "RegExp", regexp_ctor, 2, any, true);
     link_constructor(vm, c, rp);
     vm.define_native(c, "escape", regexp_escape, 1, any, false);
+    vm.regexp_constructor = c;
+    install_legacy(vm, c);
     vm.define_natives(
         rp,
         &[
@@ -2157,6 +2159,9 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !is_class(this, Class::RegExp) {
         return Err(Error::type_error("RegExp.prototype.compile called on an incompatible receiver"));
     }
+    if unsafe { (*as_object(this)).flags } & crate::object::LEGACY_DISABLED != 0 {
+        return Err(Error::type_error("RegExp.prototype.compile called on a subclass's RegExp"));
+    }
     let (pattern, flags) = (arg(a, 0), arg(a, 1));
     let (p, f) = if let Some(re) = regexp_of(pattern) {
         if !flags.is_undefined() {
@@ -2319,6 +2324,128 @@ fn plain_last_index(vm: &Vm, this: Value) -> Option<*mut Object> {
     (sh.keys.first() == Some(&vm.a_last_index) && sh.attrs[0] == DONT_ENUM | DONT_DELETE).then_some(o)
 }
 
+// ---- Legacy static properties (Annex B) ----
+
+/// A match of regular expression `rx` in `input` (a string), its groups
+/// `caps`: UpdateLegacyRegExpStaticProperties, or, of a subclass's,
+/// InvalidateLegacyRegExpStaticProperties.
+fn note_legacy(vm: &mut Vm, rx: Value, input: Value, caps: &[Option<(usize, usize)>]) {
+    if rx.is_cell() && unsafe { (*as_object(rx)).flags } & crate::object::LEGACY_DISABLED != 0 {
+        vm.legacy_valid = false;
+        return;
+    }
+    vm.legacy_valid = true;
+    vm.legacy_input = input;
+    vm.legacy_match.0 = input;
+    vm.legacy_match.1.clear();
+    vm.legacy_match.1.extend_from_slice(caps);
+}
+
+/// GetLegacyRegExpStaticProperty's checks: `this` is `RegExp` itself,
+/// and the properties valid.
+fn legacy_this(vm: &mut Vm, this: Value) -> Result<()> {
+    if this != object_value(vm.regexp_constructor) {
+        return Err(Error::type_error("RegExp legacy static property read on another receiver"));
+    }
+    if !vm.legacy_valid {
+        return Err(Error::type_error("RegExp legacy static properties are invalid after a subclass's match"));
+    }
+    Ok(())
+}
+
+/// Part `range` of the last match's input (the empty string before any).
+fn legacy_part(vm: &mut Vm, range: impl FnOnce(&[Option<(usize, usize)>], usize) -> Option<(usize, usize)>) -> Value {
+    let (input, caps) = (vm.legacy_match.0, std::mem::take(&mut vm.legacy_match.1));
+    let s = if input.is_cell() { units(input).into_owned() } else { Vec::new() };
+    let r = if caps.is_empty() { None } else { range(&caps, s.len()) };
+    vm.legacy_match.1 = caps;
+    match r {
+        Some((a, b)) => string(vm, &s[a..b]),
+        None => vm.new_string(&[]),
+    }
+}
+
+fn legacy_input_get(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    legacy_this(vm, this)?;
+    Ok(if vm.legacy_input.is_cell() { vm.legacy_input } else { vm.new_string(&[]) })
+}
+
+/// SetLegacyRegExpStaticProperty of `input`.
+fn legacy_input_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if this != object_value(vm.regexp_constructor) {
+        return Err(Error::type_error("RegExp legacy static property set on another receiver"));
+    }
+    vm.legacy_input = crate::intrinsics::to_string(vm, arg(a, 0))?;
+    Ok(Value::UNDEFINED)
+}
+
+fn legacy_last_match(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    legacy_this(vm, this)?;
+    Ok(legacy_part(vm, |c, _| c[0]))
+}
+
+fn legacy_last_paren(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    legacy_this(vm, this)?;
+    Ok(legacy_part(vm, |c, _| if c.len() > 1 { c[c.len() - 1] } else { None }))
+}
+
+fn legacy_left_context(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    legacy_this(vm, this)?;
+    Ok(legacy_part(vm, |c, _| c[0].map(|(a, _)| (0, a))))
+}
+
+fn legacy_right_context(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    legacy_this(vm, this)?;
+    Ok(legacy_part(vm, |c, n| c[0].map(|(_, b)| (b, n))))
+}
+
+/// `RegExp.$1` … `RegExp.$9`.
+fn legacy_paren<const N: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    legacy_this(vm, this)?;
+    Ok(legacy_part(vm, |c, _| c.get(N).copied().flatten()))
+}
+
+/// The legacy static accessors on `RegExp` (`c`).
+fn install_legacy(vm: &mut Vm, c: *mut Object) {
+    let holder = vm.new_object(Value::NULL);
+    let mut native = |vm: &mut Vm, name: &str, f: NativeFn, n: u32| object_value(vm.define_native(holder, name, f, n, Ty::Any, false));
+    let input_get = native(vm, "get input", legacy_input_get, 0);
+    let input_set = native(vm, "set input", legacy_input_set, 1);
+    for name in ["input", "$_"] {
+        let a = vm.intern(name);
+        vm.define_accessor(c, a, Some(input_get), Some(input_set), DONT_ENUM);
+    }
+    let getters: [(&str, &str, NativeFn); 4] = [
+        ("lastMatch", "$&", legacy_last_match),
+        ("lastParen", "$+", legacy_last_paren),
+        ("leftContext", "$`", legacy_left_context),
+        ("rightContext", "$'", legacy_right_context),
+    ];
+    for (name, alias, f) in getters {
+        let g = native(vm, &format!("get {name}"), f, 0);
+        for n in [name, alias] {
+            let a = vm.intern(n);
+            vm.define_accessor(c, a, Some(g), None, DONT_ENUM);
+        }
+    }
+    const PARENS: [NativeFn; 9] = [
+        legacy_paren::<1>,
+        legacy_paren::<2>,
+        legacy_paren::<3>,
+        legacy_paren::<4>,
+        legacy_paren::<5>,
+        legacy_paren::<6>,
+        legacy_paren::<7>,
+        legacy_paren::<8>,
+        legacy_paren::<9>,
+    ];
+    for (i, f) in PARENS.into_iter().enumerate() {
+        let g = native(vm, &format!("get ${}", i + 1), f, 0);
+        let a = vm.intern(&format!("${}", i + 1));
+        vm.define_accessor(c, a, Some(g), None, DONT_ENUM);
+    }
+}
+
 /// `f` with the VM's captures buffer (see `Vm::caps_buf`).
 fn with_caps<R>(vm: &mut Vm, f: impl FnOnce(&mut Vm, &mut crate::regexp::Captures) -> R) -> R {
     let mut caps = std::mem::take(&mut vm.caps_buf);
@@ -2433,6 +2560,7 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = units(input);
     with_caps(vm, |vm, caps| {
         if regexp_match_into(vm, this, re, &s, caps)? {
+            note_legacy(vm, this, input, caps);
             match_array(vm, re, caps, &s, input)
         } else {
             Ok(Value::NULL)
@@ -2447,8 +2575,16 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Ok(Value::from_bool(!rx_exec(vm, this, s)?.is_null()));
     }
     let re = this_regexp(this)?;
-    let s = units(arg(a, 0));
-    with_caps(vm, |vm, caps| Ok(Value::from_bool(regexp_match_into(vm, this, re, &s, caps)?)))
+    let input = arg(a, 0);
+    let s = units(input);
+    with_caps(vm, |vm, caps| {
+        let found = regexp_match_into(vm, this, re, &s, caps)?;
+        if found {
+            let input = if string_units(input).is_some() { input } else { string(vm, &s) };
+            note_legacy(vm, this, input, caps);
+        }
+        Ok(Value::from_bool(found))
+    })
 }
 
 fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -2572,6 +2708,7 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     while at <= s.len() && re.exec_into(&s, at, &mut caps) {
         let (x, y) = caps[0].unwrap();
         at = if y == x { advance(&s, y as f64, re.unicode) as usize } else { y };
+        note_legacy(vm, rv, input, &caps);
         let m = match_array(vm, re, &caps, &s, input)?;
         crate::vm::array_push(vm, out, &[m])?;
     }
@@ -2591,6 +2728,7 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !re.global {
         return with_caps(vm, |vm, caps| {
             if regexp_match_into(vm, rv, re, &s, caps)? {
+                note_legacy(vm, rv, input, caps);
                 match_array(vm, re, caps, &s, input)
             } else {
                 Ok(Value::NULL)
@@ -2601,6 +2739,7 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut at = 0;
     while let Some(caps) = re.exec(&s, at) {
         let (x, y) = caps[0].unwrap();
+        note_legacy(vm, rv, input, &caps);
         found.push(string(vm, &s[x..y]));
         at = if y == x { advance(&s, y as f64, re.unicode) as usize } else { y };
         if at > s.len() {
@@ -2625,7 +2764,10 @@ fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = this_units(this)?;
     let rv = as_regexp(vm, arg(a, 0))?;
     let re = regexp_of(rv).unwrap();
-    Ok(Value::from_i32(re.exec(&s, 0).map_or(-1, |c| c[0].unwrap().0 as i32)))
+    let Some(caps) = re.exec(&s, 0) else { return Ok(Value::from_i32(-1)) };
+    let input = this_string(vm, this, &s);
+    note_legacy(vm, rv, input, &caps);
+    Ok(Value::from_i32(caps[0].unwrap().0 as i32))
 }
 
 /// `s.replace(pattern, replacement)`: the first match of a string
@@ -2734,6 +2876,9 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
         return Ok(this_string(vm, this, &s));
     }
     let input = this_string(vm, this, &s);
+    if regexp_of(pattern).is_some() {
+        note_legacy(vm, pattern, input, &flat[flat.len() - stride..]);
+    }
     let mut out = Vec::with_capacity(s.len());
     let mut last = 0;
     for caps in flat.chunks(stride) {

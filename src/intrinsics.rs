@@ -261,6 +261,11 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
         // prototype first, and its getter may have detached or shrunk it.)
         let o = as_object(r);
         let class = unsafe { (*o).class };
+        // (A subclass's `RegExp` has no legacy features: see
+        // `builtins::note_legacy`.)
+        if class == Class::RegExp {
+            unsafe { (*o).flags |= crate::object::LEGACY_DISABLED };
+        }
         if matches!(class, Class::TypedArray | Class::DataView) {
             if crate::typed::is_detached(crate::typed::buffer_of(o)) {
                 return Err(Error::type_error("Cannot construct a view on a detached ArrayBuffer"));

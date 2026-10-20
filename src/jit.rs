@@ -2306,6 +2306,10 @@ pub(crate) enum Prop {
     /// the load then checks (exiting, and the site isn't speculated on
     /// again: `VmState::widened`).
     Upvalue { cell: u64, int: bool },
+    /// An upvalue of an inlined frame's function, known by its code only
+    /// (`CODE_GUARD`): through the function its guard wrote to the
+    /// frame's header, `off` bytes from the compiled frame's registers.
+    UpvalueAt { off: i32 },
     /// A `delete` (`Insn::delete`): the compiled function's epoch, and
     /// its address (`Code::field_deps`), checked after it.
     Delete { epoch: u32, addr: u64 },
@@ -3814,6 +3818,12 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         {
             return Sel::new("bail", "", out);
         }
+        _ if insn.guard & CODE_GUARD != 0 && !insn.next_case => {
+            return Sel {
+                ops: Some((insn.imm, insn.guard & !CODE_GUARD, 0)),
+                ..Sel::new("check_callee_code", "", out)
+            };
+        }
         _ if insn.guard != 0 && insn.next_case => {
             return Sel {
                 ops: Some((0, insn.guard, 0)),
@@ -4253,6 +4263,16 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             }
             let post = int.then_some("check_acc_int");
             return match spec.props.get(i).copied() {
+                Some(Prop::UpvalueAt { off }) => Sel {
+                    ops: Some((
+                        (crate::object::INLINE_BASE as u32
+                            + 8 * unsafe { (*(*interp::current_vm()).function_shape).capacity.get() }
+                            + 8 * insn.imm as u32) as i32,
+                        off as i64 as u64,
+                        0,
+                    )),
+                    ..Sel::new(if load { "lda_upvalue_fr" } else { "sta_upvalue_fr" }, "", out)
+                },
                 Some(Prop::Upvalue { cell, .. }) if cell != 0 => Sel {
                     ops: Some((0, cell, 0)),
                     post,
@@ -4689,6 +4709,23 @@ const PRIMITIVE_CELLS: i32 = {
 /// `Insn::guard` of an `on_shape` guard on a sloppy callee's `this`
 /// (`Lowering::guard_this`).
 const THIS_GUARD: u64 = 2;
+
+/// In `Insn::guard` of a callee guard (not `on_shape`): the rest is a
+/// `Code`, and the guard checks the callee runs it, whichever closure of
+/// it, and writes it to the inlined frame's header (`imm` bytes from the
+/// registers): `check_callee_code` (see `inline_by_code`).
+const CODE_GUARD: u64 = 1;
+
+/// Whether call `i` to `fo` is inlined for any closure of `fo`'s code, not
+/// `fo` alone: its code made closures more than once (PdfJS's canvas
+/// contexts each have their own `save`, `transform`, … : a guard on one
+/// left at the next context's), it makes none itself (whose upvalues would
+/// be the frame's function's), and it isn't `new`'s (whose `this` comes
+/// from the closure's `prototype`).
+fn inline_by_code(fo: *mut Object, i: &Insn) -> bool {
+    i.op != Op::Construct
+        && unsafe { (*(*fo).code).closures_made.get() > 1 && (&(*(*fo).code).closures).is_empty() }
+}
 
 /// Whether cells of shape `s` are primitives (strings, symbols, BigInts).
 fn primitive_cell(s: u64) -> bool {
@@ -6146,6 +6183,7 @@ fn stencil_for(
         ("star", Home::Mem | Home::Gpr(_)) if sel.case == "i" => cat!("star_", loc, "_i"),
         ("star", _) => cat!("star_", loc),
         ("check_callee", _) => cat!("check_callee_", loc),
+        ("check_callee_code", _) => cat!("check_callee_code_", loc),
         ("callee_jne", _) => cat!("callee_jne_", loc),
         (
             "guard_cell" | "guard_object" | "shape_jne" | "shape_guard" | "family_jne"
@@ -12598,7 +12636,12 @@ impl Lowering<'_> {
                         } else {
                             unsafe { (**(cell(func) as *const *const Value)).is_int32() }
                         };
-                    let prop = if func.is_null() {
+                    let prop = if func.is_null() && frame != 0 {
+                        // (An inlined frame's function known by its code:
+                        // its guard wrote it to the frame's header.)
+                        let base = self.out.frames[frame].base;
+                        Prop::UpvalueAt { off: (8 * base) as i32 - interp::FUNC_OFF as i32 }
+                    } else if func.is_null() {
                         if int { Prop::Upvalue { cell: 0, int } } else { Prop::None }
                     } else {
                         Prop::Upvalue { cell: cell(func) as u64, int }
@@ -13287,6 +13330,10 @@ impl Lowering<'_> {
             let fo = unsafe { (*ic.add(k)).holder };
             if fo.is_null() {
                 break;
+            }
+            // (Another closure of the code inlined for any of them.)
+            if unsafe { (*fo).code == (*first).code } && inline_by_code(first, i) {
+                continue;
             }
             if !self.inlinable(frame, fo)
                 || self.nullable_this(i, fo)
@@ -14191,10 +14238,11 @@ impl Lowering<'_> {
             extra = extra.max(ACCESSOR_EXTRA as u8);
         }
         crate::vm::pin(callee);
+        let by_code = !next_case && hoisted.is_none() && alloc == 0 && inline_by_code(fo, i);
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,
-            func: fo,
+            func: if by_code { std::ptr::null_mut() } else { fo },
             base,
             parent: frame,
             ret_pc: i.pc + i.op.size(),
@@ -14207,8 +14255,12 @@ impl Lowering<'_> {
         let mut guard = synth(Op::Nop, i.reg, frame, pc);
         guard.guard = fo as u64;
         guard.next_case = next_case;
-        // A callee loaded from a prototype holding it needs no check.
-        if !next_case && self.proven_callee(frame, i.reg, fo) {
+        if by_code {
+            // (Never dropped: it writes the frame's function.)
+            guard.guard = callee as u64 | CODE_GUARD;
+            guard.imm = (8 * base) as i32 - interp::FUNC_OFF as i32;
+        } else if !next_case && self.proven_callee(frame, i.reg, fo) {
+            // A callee loaded from a prototype holding it needs no check.
             guard.guard = 0;
         }
         let guard = self.push(guard, Prop::None);
@@ -15473,7 +15525,10 @@ unsafe fn materialize(
                 regs.add(parent.base),
                 if fr.construct { interp::CONSTRUCT } else { 0 },
             );
-            interp::set_frame_func(regs.add(fr.base), fr.func);
+            // (A frame inlined by code has it there: its guard wrote it.)
+            if !fr.func.is_null() {
+                interp::set_frame_func(regs.add(fr.base), fr.func);
+            }
         }
         g = fr.parent;
     }

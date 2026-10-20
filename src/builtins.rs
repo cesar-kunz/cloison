@@ -243,6 +243,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("detachArrayBuffer", host_detach_array_buffer, 1),
         ],
     );
+    crate::agent::install(vm, host);
     crate::typed::install(vm);
     crate::collections::install(vm);
     install_regexps(vm);

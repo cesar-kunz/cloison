@@ -552,6 +552,10 @@ pub(crate) fn run_jobs(vm: &mut Vm) -> Result<()> {
         // (ClearKeptObjects, before each job.)
         vm.kept_alive.clear();
         run_job(vm, &job)?;
+        // The async waiters notified or timed out meanwhile.
+        if vm.shared.waiting() {
+            crate::shared::poll(vm)?;
+        }
     }
     truncate(jobs, 0);
     Ok(())

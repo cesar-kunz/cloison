@@ -37,8 +37,8 @@ pub(crate) const RESIZABLE: u8 = 128;
 /// A view's `elems_cap`: it tracks its buffer's length.
 pub(crate) const TRACKING: u32 = u32::MAX;
 /// The most bytes a buffer may have (a resizable one at its maximum).
-const MAX_BYTES: usize = 1 << 31;
-const MAX_RESIZABLE: usize = 1 << 30;
+pub(crate) const MAX_BYTES: usize = 1 << 31;
+pub(crate) const MAX_RESIZABLE: usize = 1 << 30;
 
 fn arg(a: &[Value], i: usize) -> Value {
     a.get(i).copied().unwrap_or(Value::UNDEFINED)
@@ -75,12 +75,12 @@ pub(crate) fn to_index(vm: &mut Vm, v: Value) -> Result<usize> {
 
 /// A relative index (`begin` and such: from the end if negative) clamped
 /// to `0..=len`.
-fn relative(d: f64, len: usize) -> usize {
+pub(crate) fn relative(d: f64, len: usize) -> usize {
     if d < 0.0 { (len as f64 + d).max(0.0) as usize } else { d.min(len as f64) as usize }
 }
 
 /// SpeciesConstructor(o, default).
-fn species_constructor(vm: &mut Vm, o: Value, default: Value) -> Result<Value> {
+pub(crate) fn species_constructor(vm: &mut Vm, o: Value, default: Value) -> Result<Value> {
     let a_constructor = vm.a_constructor;
     let c = vm.get(o, a_constructor)?;
     if c.is_undefined() {
@@ -182,7 +182,7 @@ fn register(vm: &mut Vm, b: *mut Object, v: Value) -> Result<()> {
 
 /// The views of resizable buffer `b` brought up to date (a resize, a
 /// detach).
-fn refresh_views(b: *mut Object) {
+pub(crate) fn refresh_views(b: *mut Object) {
     if !is_resizable(b) {
         return;
     }
@@ -325,7 +325,11 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if max.is_some_and(|m| n > m) {
         return Err(Error::range_error("ArrayBuffer length exceeds its maxByteLength"));
     }
-    Ok(object_value(new_buffer_max(vm, n, max)?))
+    let c = vm.typed_constructors[TypedKind::ALL.len()];
+    let proto = vm.take_new_target(c, object_value(vm.array_buffer_prototype))?;
+    let o = new_buffer_max(vm, n, max)?;
+    vm.set_prototype_of(o, proto);
+    Ok(object_value(o))
 }
 
 fn buffer_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -647,7 +651,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
             });
             Ok(out)
         }
-        Class::ArrayBuffer => {
+        Class::ArrayBuffer | Class::SharedArrayBuffer => {
             let offset = to_index(vm, arg(a, 1))?;
             if offset % k.size() != 0 {
                 return Err(Error::range_error(format!("start offset of {} should be a multiple of {}", k.name(), k.size())));
@@ -695,6 +699,9 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, n: Option
     let size = k.size();
     if is_detached(b) {
         return Err(Error::type_error("Cannot construct a typed array on a detached ArrayBuffer"));
+    }
+    if crate::shared::is_shared(b) {
+        crate::shared::sync_length(b);
     }
     let bytes = unsafe { (*b).elems_len } as usize;
     let len = match n {
@@ -1459,6 +1466,7 @@ pub(crate) fn install(vm: &mut Vm) {
         vm.typed_constructors.push(c);
     }
     vm.typed_constructors.push(ab);
+    crate::shared::install(vm);
     crate::base64::install(vm);
 }
 
@@ -1477,6 +1485,7 @@ pub(crate) fn install_symbols(vm: &mut Vm) {
     vm.define_accessor(shared, a_tag, Some(object_value(tag)), None, DONT_ENUM);
     let abp = vm.array_buffer_prototype;
     crate::symbol::to_string_tag(vm, abp, "ArrayBuffer");
+    crate::shared::install_symbols(vm);
 }
 
 /// Whether property name `s` is a canonical numeric string (but an array

@@ -315,7 +315,7 @@ pub(crate) fn install(vm: &mut Vm) {
 
     // `@@species` getters: the constructor itself.
     let a_species = vm.intern(&format!("{SYMBOL_MARK}Symbol.species"));
-    for name in ["Array", "Map", "Set", "Promise", "RegExp", "ArrayBuffer"] {
+    for name in ["Array", "Map", "Set", "Promise", "RegExp", "ArrayBuffer", "SharedArrayBuffer"] {
         let a = vm.intern(name);
         let c = vm.get(object_value(g), a).unwrap_or(Value::UNDEFINED);
         if is_object(c) {

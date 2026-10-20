@@ -736,6 +736,11 @@ pub struct Vm {
     /// `intrinsics::construct_with` for a function whose first instruction
     /// is `LdaNewTarget`, which takes it); `EMPTY` otherwise.
     pub(crate) new_target: Value,
+    /// A native constructor called with another `new.target` from the
+    /// runtime (`Reflect.construct`, `super()`), and that target: for a
+    /// constructor that reads its prototype itself, before allocating
+    /// (see [`Vm::take_new_target`]).
+    pub(crate) native_new_target: (Value, Value),
     /// The scope objects of the direct `eval`s running (see
     /// `intrinsics::direct_eval`), innermost last: the caller's, the
     /// eval's own, then the `with` objects around it.
@@ -814,6 +819,14 @@ pub struct Vm {
     pub(crate) a_index: Atom,
     pub(crate) a_input: Atom,
     pub(crate) array_buffer_prototype: *mut Object,
+    /// The shared memory's state: `SharedArrayBuffer`s' blocks, async
+    /// waiters (see `shared`).
+    pub(crate) shared: crate::shared::State,
+    pub(crate) shared_atomics: *mut Object,
+    /// Whether `Atomics.wait` may block this agent.
+    pub(crate) can_block: bool,
+    /// The agent's part, if it is one (see `agent`).
+    pub(crate) agent: crate::agent::State,
     /// `Error.prototype` and its kinds' (see `builtins::ERROR_KINDS`).
     pub(crate) error_prototypes: Vec<*mut Object>,
     /// Strings of one code unit below 256, made on first use.
@@ -961,6 +974,7 @@ impl Vm {
             a_sym_has_instance: Atom(0),
             has_instance_fn: std::ptr::null_mut(),
             new_target: Value::EMPTY,
+            native_new_target: (Value::EMPTY, Value::EMPTY),
             eval_envs: Vec::new(),
             thrower: std::ptr::null_mut(),
             mapped_args: Vec::new(),
@@ -994,6 +1008,10 @@ impl Vm {
             a_index: Atom(0),
             a_input: Atom(0),
             array_buffer_prototype: std::ptr::null_mut(),
+            shared: crate::shared::State::default(),
+            shared_atomics: std::ptr::null_mut(),
+            can_block: true,
+            agent: crate::agent::State::default(),
             single_chars: vec![Value::EMPTY; 256],
             a_to_string: Atom(0),
             a_value_of: Atom(0),
@@ -3909,6 +3927,20 @@ impl Vm {
         }
     }
 
+    /// `new.target`'s prototype, if constructor `f` (a native) was called
+    /// with another target, and Get it: OrdinaryCreateFromConstructor's
+    /// read (which the runtime leaves to `f` then: see
+    /// `intrinsics::construct_with`).
+    pub(crate) fn take_new_target(&mut self, f: *mut Object, default: Value) -> Result<Value> {
+        if self.native_new_target.0 != object_value(f) {
+            return Ok(default);
+        }
+        let nt = std::mem::replace(&mut self.native_new_target, (Value::EMPTY, Value::EMPTY)).1;
+        let a = self.a_prototype;
+        let p = self.get(nt, a)?;
+        Ok(if crate::props::is_object(p) { p } else { default })
+    }
+
     /// Whether the native now called was called by `new`, taken: a
     /// constructor reads it first thing (it is cleared by any call made
     /// after).
@@ -4246,14 +4278,47 @@ impl Vm {
             self.heap.gc.stack_base = &raw const here as usize & !7;
         }
         let r = unsafe { crate::interp::run_script(self, code) };
-        // The script done, the promise jobs it queued run (and theirs).
-        let r = r.and_then(|v| self.run_jobs().map(|()| v));
+        // The script done, the promise jobs it queued run (and theirs),
+        // and the outermost's event loop until no async waiter is left.
+        let r = r.and_then(|v| if outer { self.run_event_loop() } else { self.run_jobs() }.map(|()| v));
         self.kept_alive.clear();
         if outer {
             self.heap.gc.stack_base = 0;
             self.pause_marker();
         }
         r
+    }
+
+    /// Run `f` from the host, as `run` runs a script (then the event
+    /// loop): an agent's broadcast callback (see `agent`).
+    pub(crate) fn enter(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value>) -> Result<Value> {
+        crate::interp::CURRENT_VM.with(|v| v.set(self));
+        let here = 0u8;
+        self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
+        let outer = self.heap.gc.stack_base == 0;
+        if outer {
+            self.heap.gc.stack_base = &raw const here as usize & !7;
+        }
+        let r = self.handle_scope(|vm| {
+            let saved = vm.native_top;
+            vm.native_top = vm.stack.as_mut_ptr();
+            let r = f(vm);
+            vm.native_top = saved;
+            r
+        });
+        let r = r.and_then(|v| self.run_event_loop().map(|()| v));
+        self.kept_alive.clear();
+        if outer {
+            self.heap.gc.stack_base = 0;
+            self.pause_marker();
+        }
+        r
+    }
+
+    /// Whether `Atomics.wait` may block (test262's `CanBlockIsTrue`, the
+    /// default; `CanBlockIsFalse`, as a browser's main thread).
+    pub fn set_can_block(&mut self, on: bool) {
+        self.can_block = on;
     }
 
     /// The script's file: its `import()`s resolve from its directory.
@@ -4280,7 +4345,7 @@ impl Vm {
             match r {
                 Ok(p) => {
                     vm.handles.push(p);
-                    vm.run_jobs().map_err(ModuleError::Thrown)?;
+                    if outer { vm.run_event_loop() } else { vm.run_jobs() }.map_err(ModuleError::Thrown)?;
                     match crate::promise::state(p) {
                         (2, v) => Err(ModuleError::Thrown(Error::thrown(v))),
                         _ => Ok(()),
@@ -4306,6 +4371,24 @@ impl Vm {
         let r = crate::promise::run_jobs(self);
         self.native_top = saved;
         r
+    }
+
+    /// Run the promise jobs queued, then wait for the async waiters
+    /// (`Atomics.waitAsync`'s) to be notified or time out, running the
+    /// jobs their promises queue, until none is left (see `shared`).
+    pub(crate) fn run_event_loop(&mut self) -> Result<()> {
+        loop {
+            self.run_jobs()?;
+            if !self.shared.waiting() {
+                return Ok(());
+            }
+            crate::shared::idle(self);
+            let saved = self.native_top;
+            self.native_top = self.stack.as_mut_ptr();
+            let r = crate::shared::poll(self);
+            self.native_top = saved;
+            r?;
+        }
     }
 
     /// Run `f` with the values `vm.handles` gets meanwhile rooted: Rust
@@ -4336,6 +4419,7 @@ impl Vm {
             self.regexp_prototype,
             self.boolean_prototype,
             self.array_buffer_prototype,
+            self.shared_atomics,
             self.array_push_fn,
             self.array_pop_fn,
         ]
@@ -4359,6 +4443,8 @@ impl Vm {
         v.push(self.from_async_helper);
         v.extend_from_slice(&self.dispose_roots);
         v.extend(self.modules.roots());
+        v.extend(self.shared.roots());
+        v.extend(self.agent.roots());
         v.extend_from_slice(&self.single_chars);
         if let Some(Error(_, Some(e))) = &self.error {
             v.push(*e);

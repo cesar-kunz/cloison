@@ -21,6 +21,8 @@ mod intrinsics;
 mod symbol;
 mod iterator;
 mod typed;
+mod shared;
+mod agent;
 mod dispose;
 mod module;
 mod base64;

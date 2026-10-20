@@ -83,6 +83,9 @@ pub struct Gc {
     stw: bool,
     /// Concurrent full collections back to back (`CLOISON_GC_CYCLES`).
     cycles: bool,
+    /// A full collection is due for memory outside the heap (shared
+    /// buffers' blocks: see `shared`), whose dead owners only it finds.
+    pub(crate) external_full: bool,
     /// A concurrent full collection is marking.
     marking: bool,
     /// The [`CODE_EPOCH`] the current or last full marking began in: the
@@ -901,6 +904,16 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                     v.value(Value::from_bits((*o).code as u64));
                 }
             }
+            Class::SharedArrayBuffer => {
+                // A growable one's views; its bytes are no cell.
+                if !(*o).code.is_null() && within(code) {
+                    v.value(Value::from_bits((*o).code as u64));
+                }
+                if within(props) {
+                    v.payload((*o).props as usize);
+                }
+                return;
+            }
             Class::Function => {
                 // After the in-object slots it was allocated with, as
                 // `cell_size` has it: the marker thread reads no shape.
@@ -1164,6 +1177,7 @@ impl Vm {
     #[inline(never)]
     fn collect(&mut self, regs: *mut Value) {
         let vm: *mut Vm = self;
+        let external = !self.heap.gc.marking && std::mem::take(&mut self.heap.gc.external_full);
         let gc = &self.heap.gc;
         let kind = if gc.marking {
             // Cleared before `done` is read: a request the marker makes
@@ -1182,6 +1196,7 @@ impl Vm {
                 return;
             }
         } else if gc.always_full
+            || external
             || gc.cycles
             || self.heap.allocated() > gc.full_at
             || gc.promoted > gc.room.max(FULL_MIN)

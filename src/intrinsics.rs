@@ -242,12 +242,16 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
         vm.new_target = nt;
     }
     let derived = std::mem::replace(&mut vm.derived_construct, if nt != f { f } else { Value::UNDEFINED });
+    let outer = std::mem::replace(&mut vm.native_new_target, if nt != f { (f, nt) } else { (Value::EMPTY, Value::EMPTY) });
     let r = vm.construct_other(f, args);
     vm.derived_construct = derived;
+    // (Unless the constructor read the target's prototype itself.)
+    let taken = nt != f && vm.native_new_target.0 != f;
+    vm.native_new_target = outer;
     let r = r?;
     // (A builtin subclassed: its object gets the subclass's prototype, or
     // keeps the builtin's if that isn't an object.)
-    if nt != f && crate::props::is_object(r) {
+    if nt != f && !taken && crate::props::is_object(r) {
         let a = vm.a_prototype;
         let proto = vm.get(nt, a)?;
         if crate::props::is_object(proto) {

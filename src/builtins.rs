@@ -1998,6 +1998,7 @@ fn install_regexps(vm: &mut Vm) {
     getter(vm, rp, "unicode", regexp_get::<6>);
     getter(vm, rp, "dotAll", regexp_get::<7>);
     getter(vm, rp, "hasIndices", regexp_get::<8>);
+    getter(vm, rp, "unicodeSets", regexp_get::<9>);
 }
 
 /// `RegExp.prototype`'s getters: `source` (0), `flags` (1) and the flags
@@ -2026,9 +2027,10 @@ fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
         3 => Value::from_bool(re.ignore_case),
         4 => Value::from_bool(re.multiline),
         5 => Value::from_bool(re.sticky),
-        6 => Value::from_bool(re.unicode),
+        6 => Value::from_bool(re.unicode && !re.unicode_sets),
         7 => Value::from_bool(re.dot_all),
         8 => Value::from_bool(re.has_indices),
+        9 => Value::from_bool(re.unicode_sets),
         _ => Value::FALSE,
     })
 }
@@ -2244,7 +2246,8 @@ fn regexp_flags(re: &crate::regexp::Regex) -> String {
         (re.ignore_case, 'i'),
         (re.multiline, 'm'),
         (re.dot_all, 's'),
-        (re.unicode, 'u'),
+        (re.unicode && !re.unicode_sets, 'u'),
+        (re.unicode_sets, 'v'),
         (re.sticky, 'y'),
     ] {
         if on {
@@ -3165,7 +3168,8 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
             ("ignoreCase", re.ignore_case),
             ("multiline", re.multiline),
             ("sticky", re.sticky),
-            ("unicode", re.unicode),
+            ("unicode", re.unicode && !re.unicode_sets),
+            ("unicodeSets", re.unicode_sets),
             ("dotAll", re.dot_all),
         ];
         for (name, has) in flags {

@@ -1400,7 +1400,7 @@ handlers! {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
                     // (See `Ic::epoch`.)
-                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch {
+                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*ic).loc) {
                         tail!(slow_set_named, acc)
                     }
                     (*o).shape = new;
@@ -1428,7 +1428,7 @@ handlers! {
                 if fits_field(tag, (*w).holder as u64, acc) {
                     let new = (*w).new_shape;
                     if !new.is_null() {
-                        if (*w).epoch != (*frame_vm(regs)).proto_epoch {
+                        if (*w).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*w).loc) {
                             break;
                         }
                         (*o).shape = new;
@@ -1458,7 +1458,7 @@ handlers! {
                 let new = (*ic).new_shape;
                 if !new.is_null() {
                     // (See `Ic::epoch`.)
-                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch {
+                    if (*ic).epoch != (*frame_vm(regs)).proto_epoch || !has_room(o, (*ic).loc) {
                         tail!(slow_set_named, acc)
                     }
                     (*o).shape = new;
@@ -3180,6 +3180,14 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
 
 /// The VM running (stencils' runtime calls and slow paths reach it this
 /// way to allocate strings).
+/// Whether a cached transition's store to location `loc` fits `o`: in
+/// the object, or out of line within its `props`' room (else the slow
+/// path grows them).
+#[inline(always)]
+unsafe fn has_room(o: *mut Object, loc: i32) -> bool {
+    loc >= 0 || unsafe { (!loc as u32) < (*o).props_cap }
+}
+
 pub(crate) fn current_vm() -> *mut Vm {
     CURRENT_VM.with(|v| v.get())
 }

@@ -33,6 +33,7 @@ mod proxy;
 pub mod props;
 pub mod regexp;
 mod unicode_props;
+mod unicode_strings;
 mod stack;
 pub mod bytecode;
 pub mod gc;

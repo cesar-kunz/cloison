@@ -35,6 +35,9 @@ pub struct Regex {
     fold: Case,
     /// `d`: a match's array has the groups' `indices` too.
     pub has_indices: bool,
+    /// `v`: classes are sets, with operations and strings (and the
+    /// rest as `u`, whose matching `unicode` says it has).
+    pub unicode_sets: bool,
     /// Where a match can start (see [`Starts`]).
     starts: Starts,
     /// A literal every match contains, if any (see [`Needle`]).
@@ -189,6 +192,244 @@ fn unit_class(r: &[(u16, u16)]) -> Node {
     Node::Alt(alts)
 }
 
+impl Parser<'_> {
+    /// `[…]` in `v` mode (past the `[`): a set of code points and strings,
+    /// its operations done as it is parsed, as the node matching them: its
+    /// strings, longest first, then its code points.
+    fn class_set(&mut self) -> Result<Node, String> {
+        let (set, _) = self.nested_class()?;
+        Ok(self.set_node(set))
+    }
+
+    /// A node matching set `set`'s strings (longest first) or code points.
+    fn set_node(&self, set: ClassSet) -> Node {
+        let mut strs: Vec<Vec<u32>> = set.strs.into_iter().collect();
+        strs.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let mut alts: Vec<Node> = strs
+            .into_iter()
+            .map(|s| match s.len() {
+                0 => Node::Empty,
+                _ => Node::Seq(s.into_iter().map(|c| char_node(char::from_u32(c).unwrap_or('\u{FFFD}'))).collect()),
+            })
+            .collect();
+        if !set.cps.is_empty() || alts.is_empty() {
+            alts.push(cp_class(set.cps, false));
+        }
+        if alts.len() == 1 { alts.pop().unwrap() } else { Node::Alt(alts) }
+    }
+
+    /// A class's contents and `]` past its `[` (and `^`, negating it): its
+    /// set, and whether it may contain strings.
+    fn nested_class(&mut self) -> Result<(ClassSet, bool), String> {
+        let neg = self.peek() == Some('^');
+        if neg {
+            self.i += 1;
+        }
+        let (set, may) = self.class_contents()?;
+        if !neg {
+            return Ok((set, may));
+        }
+        if may {
+            return Err(self.error("Negated character class may contain strings"));
+        }
+        // (Folding case, of the code points folding leaves as they are.)
+        let mut cps = complement_points(&set.cps);
+        if self.ignore_case {
+            cps = intersect_points(&cps, &complement_points(unfolded_points()));
+        }
+        Ok((ClassSet::of_ranges(cps), false))
+    }
+
+    /// A union (with ranges), an intersection (`&&`) or a subtraction
+    /// (`--`) of operands, up to and past `]`: not two kinds at one level.
+    fn class_contents(&mut self) -> Result<(ClassSet, bool), String> {
+        if self.peek() == Some(']') {
+            self.i += 1;
+            return Ok((ClassSet::default(), false));
+        }
+        let first = self.set_operand()?;
+        let op = if self.at("&&") {
+            Some('&')
+        } else if self.at("--") {
+            Some('-')
+        } else {
+            None
+        };
+        if let Some(op) = op {
+            let (mut acc, mut may) = self.operand_set(first);
+            loop {
+                if self.peek() == Some(']') {
+                    self.i += 1;
+                    return Ok((acc, may));
+                }
+                if !self.at(if op == '&' { "&&" } else { "--" }) {
+                    return Err(self.error("Invalid set operation in character class"));
+                }
+                self.i += 2;
+                if op == '&' && self.peek() == Some('&') {
+                    return Err(self.error("Invalid set operation in character class"));
+                }
+                let (s, m) = {
+                    let o = self.set_operand()?;
+                    self.operand_set(o)
+                };
+                if op == '&' {
+                    acc = acc.intersect(s);
+                    may = may && m;
+                } else {
+                    acc = acc.subtract(s);
+                }
+            }
+        }
+        let (mut acc, mut may) = (ClassSet::default(), false);
+        let mut cur = first;
+        loop {
+            match cur {
+                Operand::Char(lo) if self.peek() == Some('-') && !self.at("--") => {
+                    self.i += 1;
+                    let Operand::Char(hi) = self.set_operand()? else {
+                        return Err(self.error("Invalid character class"));
+                    };
+                    if hi < lo {
+                        return Err(self.error("Range out of order in character class"));
+                    }
+                    acc = acc.union(self.maybe_fold(ClassSet::of_ranges(vec![(lo, hi)])));
+                }
+                o => {
+                    let (s, m) = self.operand_set(o);
+                    acc = acc.union(s);
+                    may |= m;
+                }
+            }
+            if self.peek() == Some(']') {
+                self.i += 1;
+                return Ok((acc, may));
+            }
+            if self.at("&&") || self.at("--") {
+                return Err(self.error("Invalid set operation in character class"));
+            }
+            cur = self.set_operand()?;
+        }
+    }
+
+    fn at(&self, s: &str) -> bool {
+        s.chars().enumerate().all(|(k, c)| self.c.get(self.i + k) == Some(&c))
+    }
+
+    /// `s` folded if `i` holds here.
+    fn maybe_fold(&self, s: ClassSet) -> ClassSet {
+        if self.ignore_case { s.folded() } else { s }
+    }
+
+    fn operand_set(&self, o: Operand) -> (ClassSet, bool) {
+        match o {
+            Operand::Char(c) => (self.maybe_fold(ClassSet::of_ranges(vec![(c, c)])), false),
+            Operand::Set(s, m) => (s, m),
+        }
+    }
+
+    /// One operand: a nested class, a class escape, a property (of code
+    /// points or strings), `\q{…}`, or a character (escaped or not: not a
+    /// syntax character, nor the first of a reserved double punctuator).
+    fn set_operand(&mut self) -> Result<Operand, String> {
+        let Some(c) = self.peek() else {
+            return Err(self.error("Unterminated character class"));
+        };
+        match c {
+            '[' => {
+                self.i += 1;
+                let (s, m) = self.nested_class()?;
+                Ok(Operand::Set(s, m))
+            }
+            '\\' => {
+                let Some(&e) = self.c.get(self.i + 1) else {
+                    return Err(self.error("\\ at end of pattern"));
+                };
+                match e {
+                    'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
+                        self.i += 2;
+                        let (r, neg) = class_escape(e);
+                        let r: Vec<(u32, u32)> = r.into_iter().map(|(lo, hi)| (lo as u32, hi as u32)).collect();
+                        let r = if neg { complement_points(&r) } else { r };
+                        Ok(Operand::Set(self.maybe_fold(ClassSet::of_ranges(r)), false))
+                    }
+                    'p' | 'P' => {
+                        self.i += 2;
+                        let (s, m) = self.set_property(e == 'P')?;
+                        Ok(Operand::Set(self.maybe_fold(s), m))
+                    }
+                    'q' if self.c.get(self.i + 2) == Some(&'{') => {
+                        self.i += 3;
+                        let (mut set, mut may) = (ClassSet::default(), false);
+                        let mut cur: Vec<u32> = Vec::new();
+                        loop {
+                            match self.peek() {
+                                None => return Err(self.error("Invalid escape")),
+                                Some('}') | Some('|') => {
+                                    let end = self.peek() == Some('}');
+                                    self.i += 1;
+                                    may |= cur.len() != 1;
+                                    set = set.union(ClassSet::of_string(std::mem::take(&mut cur)));
+                                    if end {
+                                        break;
+                                    }
+                                }
+                                Some(_) => match self.set_operand()? {
+                                    Operand::Char(c) => cur.push(c),
+                                    Operand::Set(..) => return Err(self.error("Invalid escape")),
+                                },
+                            }
+                        }
+                        Ok(Operand::Set(self.maybe_fold(set), may))
+                    }
+                    'b' => {
+                        self.i += 2;
+                        Ok(Operand::Char(8))
+                    }
+                    '&' | '-' | '!' | '#' | '%' | ',' | ':' | ';' | '<' | '=' | '>' | '@' | '`' | '~' => {
+                        self.i += 2;
+                        Ok(Operand::Char(e as u32))
+                    }
+                    _ => {
+                        self.i += 1;
+                        self.check_unicode_escape()?;
+                        self.i -= 1;
+                        match self.class_atom() {
+                            Ok(u) => Ok(Operand::Char(u)),
+                            Err(_) => Err(self.error("Invalid escape")),
+                        }
+                    }
+                }
+            }
+            '(' | ')' | ']' | '{' | '}' | '/' | '-' | '|' => Err(self.error("Invalid character in character class")),
+            _ if "&!#$%*+,.:;<=>?@^`~".contains(c) && self.c.get(self.i + 1) == Some(&c) => {
+                Err(self.error("Invalid set operation in character class"))
+            }
+            _ => {
+                self.i += 1;
+                Ok(Operand::Char(c as u32))
+            }
+        }
+    }
+
+    /// `\p{…}` (`\P{…}`, `neg`) at `self.i` past the `p`, in `v` mode: a
+    /// property of code points, or of strings (not negated).
+    fn set_property(&mut self, neg: bool) -> Result<(ClassSet, bool), String> {
+        let name: String = match self.c[self.i..].iter().position(|&c| c == '}') {
+            Some(end) if self.peek() == Some('{') => self.c[self.i + 1..self.i + end].iter().collect(),
+            _ => String::new(),
+        };
+        if let Some(set) = string_property(&name) {
+            if neg {
+                return Err(self.error("Invalid property name"));
+            }
+            self.i += name.chars().count() + 2;
+            return Ok((ClassSet { cps: set.cps.clone(), strs: set.strs.clone() }, true));
+        }
+        Ok((ClassSet::of_ranges(self.property(neg)?), false))
+    }
+}
+
 impl Regex {
     /// Whether `pattern` with `flags` is a valid regular expression (a
     /// literal's early error), as [`Regex::new`] would find, without
@@ -198,12 +439,13 @@ impl Regex {
     }
 
     /// `pattern`'s tree, group count and names, `flags` (`g`, `i`, `m`,
-    /// `y`, `u`, `s`, `d`, in that order), and whether its case is explicit
-    /// in its nodes (an `i` modifier: see `Parser::fold`).
+    /// `y`, `u` (or `v`), `s`, `d`, `v`, in that order), and whether its
+    /// case is explicit in its nodes (an `i` modifier: see `Parser::fold`).
     #[allow(clippy::type_complexity)]
-    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 7], bool), String> {
+    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 8], bool), String> {
         let (mut global, mut ignore_case, mut multiline) = (false, false, false);
         let (mut sticky, mut unicode, mut dot_all, mut has_indices) = (false, false, false, false);
+        let mut sets = false;
         for f in flags.chars() {
             let seen = match f {
                 'g' => std::mem::replace(&mut global, true),
@@ -213,12 +455,17 @@ impl Regex {
                 'u' => std::mem::replace(&mut unicode, true),
                 's' => std::mem::replace(&mut dot_all, true),
                 'd' => std::mem::replace(&mut has_indices, true),
+                'v' => std::mem::replace(&mut sets, true),
                 _ => return Err(format!("Invalid flags supplied to RegExp constructor '{flags}'")),
             };
             if seen {
                 return Err(format!("Invalid flags supplied to RegExp constructor '{flags}'"));
             }
         }
+        if unicode && sets {
+            return Err(format!("Invalid flags supplied to RegExp constructor '{flags}'"));
+        }
+        let unicode = unicode || sets;
         let chars: Vec<char> = pattern.chars().collect();
         let (total, names) = count_groups(&chars);
         let explicit = has_case_modifier(&chars);
@@ -229,6 +476,7 @@ impl Regex {
             total,
             names,
             unicode,
+            sets,
             dot_all,
             ignore_case,
             multiline,
@@ -240,18 +488,14 @@ impl Regex {
         if p.i != chars.len() {
             return Err(format!("Invalid regular expression: /{pattern}/: Unmatched ')'"));
         }
-        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices], explicit))
+        Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, sets], explicit))
     }
 
     /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
-        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices], explicit) =
+        let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, unicode_sets], explicit) =
             Regex::parse(pattern, flags)?;
-        let fold = match (ignore_case && !explicit, unicode) {
-            (false, _) => Case::Exact,
-            (true, false) => Case::Fold,
-            (true, true) => Case::Unicode,
-        };
+        let fold = Case::of(ignore_case && !explicit, unicode);
         let node = if unicode { code_points(node) } else { node };
         let mut re = Regex {
             node,
@@ -264,6 +508,7 @@ impl Regex {
             unicode,
             dot_all,
             has_indices,
+            unicode_sets,
             fold,
             starts: Starts::Anywhere,
             needle: None,
@@ -405,7 +650,7 @@ impl Regex {
                     None => clean = false,
                 }
             }
-            self.prog.run(self, s, at, run)
+            self.prog.run(s, at, run)
         };
         if self.search(s, start, |at| attempt(at, run)).is_none() {
             return false;
@@ -526,8 +771,9 @@ enum Case {
 }
 
 impl Case {
-    fn of(re: &Regex) -> Case {
-        match (re.ignore_case, re.unicode) {
+    /// How `i` (`ignore_case`) folds, with `u` or `v` (`unicode`) or not.
+    fn of(ignore_case: bool, unicode: bool) -> Case {
+        match (ignore_case, unicode) {
             (false, _) => Case::Exact,
             (true, false) => Case::Fold,
             (true, true) => Case::Unicode,
@@ -798,6 +1044,8 @@ struct Parser<'a> {
     /// The named groups (all of them, found first).
     names: Vec<(String, usize)>,
     unicode: bool,
+    /// `v` mode: classes are sets (see `Parser::class_set`).
+    sets: bool,
     /// `s`, `i` and `m` where the parser is: the flags', or a modifier
     /// group's around it.
     dot_all: bool,
@@ -820,11 +1068,7 @@ const MAX_NESTING: usize = 500;
 impl Parser<'_> {
     /// How case compares where the parser is.
     fn case(&self) -> Case {
-        match (self.ignore_case, self.unicode) {
-            (false, _) => Case::Exact,
-            (true, false) => Case::Fold,
-            (true, true) => Case::Unicode,
-        }
+        Case::of(self.ignore_case, self.unicode)
     }
 
     /// Atom `n` as it matches where the parser is, case made explicit (see
@@ -1061,6 +1305,7 @@ impl Parser<'_> {
                 }
             }
             ')' => return Err(self.error("Unmatched ')'")),
+            '[' if self.sets => self.class_set()?,
             '[' => self.class()?,
             '\\' => self.escape()?,
             '{' if self.braces_at_atom() => return Err(self.error("Nothing to repeat")),
@@ -1117,6 +1362,11 @@ impl Parser<'_> {
             }
             'b' => Node::Boundary(true, self.case()),
             'B' => Node::Boundary(false, self.case()),
+            // (In `v` mode, a property of strings too.)
+            'p' | 'P' if self.sets => {
+                let (set, _) = self.set_property(e == 'P')?;
+                self.set_node(set)
+            }
             'p' | 'P' if self.unicode => {
                 let set = self.property(e == 'P')?;
                 cp_class(set, false)
@@ -1428,6 +1678,136 @@ impl Parser<'_> {
         let set = crate::unicode_props::SETS[names[k].1 as usize];
         Ok(if neg { complement_points(set) } else { set.to_vec() })
     }
+}
+
+/// A `v` mode class's members: code points (sorted, merged inclusive
+/// ranges) and strings of any other length than one.
+#[derive(Default)]
+struct ClassSet {
+    cps: Vec<(u32, u32)>,
+    strs: std::collections::BTreeSet<Vec<u32>>,
+}
+
+impl ClassSet {
+    fn of_ranges(r: Vec<(u32, u32)>) -> ClassSet {
+        ClassSet { cps: merge(r), strs: Default::default() }
+    }
+
+    /// A string's set: a code point's if it is one.
+    fn of_string(s: Vec<u32>) -> ClassSet {
+        if s.len() == 1 {
+            return ClassSet::of_ranges(vec![(s[0], s[0])]);
+        }
+        ClassSet { cps: Vec::new(), strs: [s].into_iter().collect() }
+    }
+
+    fn union(mut self, o: ClassSet) -> ClassSet {
+        self.cps.extend(o.cps);
+        self.cps = merge(std::mem::take(&mut self.cps));
+        self.strs.extend(o.strs);
+        self
+    }
+
+    fn intersect(self, o: ClassSet) -> ClassSet {
+        let cps = intersect_points(&self.cps, &o.cps);
+        ClassSet { cps, strs: self.strs.intersection(&o.strs).cloned().collect() }
+    }
+
+    fn subtract(self, o: ClassSet) -> ClassSet {
+        let cps = intersect_points(&self.cps, &complement_points(&o.cps));
+        ClassSet { cps, strs: self.strs.difference(&o.strs).cloned().collect() }
+    }
+
+    /// The set with each member simply case folded (MaybeSimpleCaseFolding,
+    /// `i` and `v`).
+    fn folded(self) -> ClassSet {
+        let mut cps = Vec::new();
+        for (lo, hi) in self.cps {
+            for c in lo..=hi {
+                let f = fold_point(c);
+                cps.push((f, f));
+            }
+        }
+        let strs = self.strs.into_iter().map(|s| s.into_iter().map(fold_point).collect()).collect();
+        ClassSet { cps: merge(cps), strs }
+    }
+}
+
+/// Sorted inclusive ranges `r`, overlapping and adjacent ones merged.
+fn merge(mut r: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    r.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(r.len());
+    for (lo, hi) in r {
+        match out.last_mut() {
+            Some((_, h)) if lo <= h.saturating_add(1) => *h = (*h).max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// The code points in both sorted, merged ranges `a` and `b`.
+fn intersect_points(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let (mut i, mut j, mut out) = (0, 0, Vec::new());
+    while i < a.len() && j < b.len() {
+        let (lo, hi) = (a[i].0.max(b[j].0), a[i].1.min(b[j].1));
+        if lo <= hi {
+            out.push((lo, hi));
+        }
+        if a[i].1 < b[j].1 { i += 1 } else { j += 1 }
+    }
+    out
+}
+
+/// Code point `c`'s simple case folding (as [`simple_fold`] for a unit,
+/// any code point's).
+fn fold_point(c: u32) -> u32 {
+    if c < 0x10000 {
+        return simple_fold(c as u16) as u32;
+    }
+    let Some(ch) = char::from_u32(c) else { return c };
+    let one = |s: &mut dyn Iterator<Item = char>| match (s.next(), s.next()) {
+        (Some(x), None) => Some(x),
+        _ => None,
+    };
+    let up = one(&mut ch.to_uppercase()).unwrap_or(ch);
+    one(&mut up.to_lowercase()).unwrap_or(up) as u32
+}
+
+/// The code points simple case folding changes (made once): with `i` and
+/// `v`, a complement has only the others (CharacterComplement).
+fn unfolded_points() -> &'static [(u32, u32)] {
+    static SET: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| merge((0..=0x10FFFF).filter(|&c| fold_point(c) != c).map(|c| (c, c)).collect()))
+}
+
+/// Each property of strings' set (`unicode_strings`; `RGI_Emoji` their
+/// union), by name, made once.
+fn string_property(name: &str) -> Option<&'static ClassSet> {
+    static SETS: std::sync::OnceLock<Vec<(&'static str, ClassSet)>> = std::sync::OnceLock::new();
+    let sets = SETS.get_or_init(|| {
+        let mut all = ClassSet::default();
+        let mut out = Vec::new();
+        for (n, text) in crate::unicode_strings::STRINGS.iter() {
+            let mut set = ClassSet::default();
+            for line in text.split('\n') {
+                set = set.union(ClassSet::of_string(line.chars().map(|c| c as u32).collect()));
+            }
+            all = all.union(ClassSet { cps: set.cps.clone(), strs: set.strs.clone() });
+            out.push((*n, set));
+        }
+        out.push(("RGI_Emoji", all));
+        out
+    });
+    sets.iter().find(|(n, _)| *n == name).map(|(_, s)| s)
+}
+
+/// An operand of a `v` mode class: a single character (which may begin a
+/// range), or a set, with whether it may contain strings (as the grammar
+/// says, MayContainStrings).
+enum Operand {
+    Char(u32),
+    Set(ClassSet, bool),
 }
 
 /// The code points `0..=0x10FFFF` not in sorted ranges `r`.
@@ -2155,7 +2535,7 @@ impl Program {
     // (Not inlined into `exec_into`: its frame would make every exec's
     // setup cost more, natively run or not.)
     #[inline(never)]
-    fn run(&self, re: &Regex, s: &[u16], start: usize, run: &mut Run) -> bool {
+    fn run(&self, s: &[u16], start: usize, run: &mut Run) -> bool {
         let Run { caps, regs, stack, .. } = run;
         caps.fill(None);
         stack.clear();

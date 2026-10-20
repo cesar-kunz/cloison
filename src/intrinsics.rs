@@ -49,6 +49,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("null_proto", null_proto),
     ("to_object", to_object),
     ("with_set_strict", with_set_strict),
+    ("with_has", with_has),
     ("generator_mode", generator_mode),
     ("delegate_step", delegate_step),
     ("delegate_done", delegate_done),
@@ -745,6 +746,23 @@ fn to_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// Strict code's store to a `with` object's property: `[o, name, v]`,
 /// a ReferenceError if `o` no longer has it.
+/// `[name, o]`: whether a `with` over `o` binds `name` (HasBinding of an
+/// object environment): `o` has it, and `o[Symbol.unscopables]` doesn't
+/// say so.
+fn with_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (k, o) = (a[0], a[1]);
+    if !vm.has_property(o, k)? {
+        return Ok(Value::FALSE);
+    }
+    let au = vm.intern(&format!("{}Symbol.unscopables", crate::symbol::SYMBOL_MARK));
+    let u = vm.get(o, au)?;
+    if crate::props::is_object(u) {
+        let blocked = vm.get_keyed(u, k)?;
+        return Ok(Value::from_bool(!crate::interp::to_boolean(blocked)));
+    }
+    Ok(Value::TRUE)
+}
+
 fn with_set_strict(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
     if !vm.has_key(a[0], key)? {

@@ -221,6 +221,12 @@ fn define_symbol_native(vm: &mut Vm, o: *mut Object, a: Atom, name: &str, f: Nat
     fo
 }
 
+/// `Function.prototype[Symbol.hasInstance](v)`: OrdinaryHasInstance.
+fn function_has_instance(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    let v = a.first().copied().unwrap_or(Value::UNDEFINED);
+    vm.ordinary_has_instance(v, this).map(Value::from_bool)
+}
+
 /// A getter `name` on `o`.
 fn define_getter(vm: &mut Vm, o: *mut Object, key: Key, name: &str, f: NativeFn) {
     let g = vm.native_function(&format!("get {name}"), f, 0, crate::jit::Ty::Any, false);
@@ -266,6 +272,31 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.a_sym_to_string_tag = vm.intern(&format!("{SYMBOL_MARK}Symbol.toStringTag"));
     vm.a_sym_to_primitive = vm.intern(&format!("{SYMBOL_MARK}Symbol.toPrimitive"));
     vm.a_sym_has_instance = vm.intern(&format!("{SYMBOL_MARK}Symbol.hasInstance"));
+    // `Function.prototype[Symbol.hasInstance]`: fixed.
+    let hi = vm.native_function("[Symbol.hasInstance]", function_has_instance, 1, crate::jit::Ty::Any, false);
+    vm.has_instance_fn = hi;
+    let d = Desc::data(object_value(hi), false, false, false);
+    let (fp, a_hi) = (vm.function_prototype, vm.a_sym_has_instance);
+    let _ = vm.define_own_property(fp, Key::Name(a_hi), &d);
+    // `Date.prototype[Symbol.toPrimitive]`.
+    let dtp = vm.native_function("[Symbol.toPrimitive]", crate::date::date_to_primitive, 1, crate::jit::Ty::Any, false);
+    let d = Desc::data(object_value(dtp), false, false, true);
+    let (dp, a_tp) = (vm.date_prototype, vm.intern(&format!("{SYMBOL_MARK}Symbol.toPrimitive")));
+    let _ = vm.define_own_property(dp, Key::Name(a_tp), &d);
+    // `Array.prototype[Symbol.unscopables]`: what `with` over an array
+    // doesn't find (ES2015 on).
+    let u = vm.new_object(Value::NULL);
+    for name in [
+        "at", "copyWithin", "entries", "fill", "find", "findIndex", "findLast", "findLastIndex", "flat", "flatMap",
+        "includes", "keys", "toReversed", "toSorted", "toSpliced", "values",
+    ] {
+        let a = vm.intern(name);
+        vm.add_property_with(u, a, Value::TRUE, 0);
+    }
+    let a_unscopables = vm.intern(&format!("{SYMBOL_MARK}Symbol.unscopables"));
+    let d = Desc::data(object_value(u), false, false, true);
+    let ap = vm.array_prototype;
+    let _ = vm.define_own_property(ap, Key::Name(a_unscopables), &d);
     vm.define_natives(ctor, &[("for", symbol_for as NativeFn, 1), ("keyFor", symbol_key_for, 1)]);
     vm.define_natives(sp, &[("toString", symbol_to_string as NativeFn, 0), ("valueOf", symbol_value_of, 0)]);
     let a_description = vm.intern("description");

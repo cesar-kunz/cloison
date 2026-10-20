@@ -717,7 +717,12 @@ pub struct Vm {
     /// Some object has had a `Symbol.toPrimitive` property, which
     /// conversions then look for (see `interp::to_primitive_hint`).
     pub(crate) to_primitive_defined: bool,
+    /// Some object but `Function.prototype` has had a `Symbol.hasInstance`
+    /// property, which `instance_of` then looks for.
+    pub(crate) has_instance_defined: bool,
     pub(crate) a_sym_has_instance: Atom,
+    /// `Function.prototype[Symbol.hasInstance]` (see `instance_of`).
+    pub(crate) has_instance_fn: *mut Object,
     /// The `new.target` of the frame about to start (set by
     /// `intrinsics::construct_with` for a function whose first instruction
     /// is `LdaNewTarget`, which takes it); `EMPTY` otherwise.
@@ -937,7 +942,9 @@ impl Vm {
             a_sym_to_string_tag: Atom(0),
             a_sym_to_primitive: Atom(0),
             to_primitive_defined: false,
+            has_instance_defined: false,
             a_sym_has_instance: Atom(0),
+            has_instance_fn: std::ptr::null_mut(),
             new_target: Value::EMPTY,
             eval_envs: Vec::new(),
             thrower: std::ptr::null_mut(),
@@ -1300,6 +1307,9 @@ impl Vm {
         }
         if name == self.a_sym_to_primitive {
             self.to_primitive_defined = true;
+        }
+        if name == self.a_sym_has_instance {
+            self.has_instance_defined = true;
         }
         let keys = Self::grown(&s.keys, name);
         let slot_attrs = Self::grown(&s.attrs, attrs);
@@ -2477,14 +2487,49 @@ impl Vm {
         Ok(())
     }
 
-    /// `v instanceof f`: whether `f.prototype` is on `v`'s prototype chain
-    /// (OrdinaryHasInstance, a bound function's its target's; there is no
-    /// `Symbol.hasInstance`).
+    /// `v instanceof f` (InstanceofOperator): `f[Symbol.hasInstance](v)`,
+    /// which for a function is `Function.prototype`'s (it can't be changed
+    /// there: not looked up for a plain function, of `function_shape`, nor
+    /// until some other object has had one), OrdinaryHasInstance.
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
+        let function = f.is_cell() && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
+        if !function || self.has_instance_defined && unsafe { (*as_object(f)).shape } != self.function_shape {
+            return self.instance_of_generic(v, f);
+        }
+        self.ordinary_has_instance(v, f)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn instance_of_generic(&mut self, v: Value, f: Value) -> Result<bool> {
+        if !crate::props::is_object(f) {
+            return Err(Error::type_error("Right-hand side of 'instanceof' is not an object"));
+        }
+        let h = self.get(f, self.a_sym_has_instance)?;
+        if !h.is_undefined() && !h.is_null() && h != object_value(self.has_instance_fn) {
+            if !crate::props::is_callable(h) {
+                return Err(Error::type_error("Symbol.hasInstance is not a function"));
+            }
+            let r = crate::interp::call_function(self, h, f, &[v])?;
+            return Ok(crate::interp::to_boolean(r));
+        }
+        if h.is_undefined() || h.is_null() {
+            if !crate::props::is_callable(f) {
+                return Err(Error::type_error("Right-hand side of 'instanceof' is not callable"));
+            }
+        }
+        self.ordinary_has_instance(v, f)
+    }
+
+    /// OrdinaryHasInstance(f, v): whether `f.prototype` is on `v`'s
+    /// prototype chain (a bound function's target's instances, through its
+    /// `instanceof`).
+    #[inline(always)]
+    pub(crate) fn ordinary_has_instance(&mut self, v: Value, f: Value) -> Result<bool> {
         let callable = f.is_cell()
             && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
         if !callable {
-            return Err(Error::type_error("Right-hand side of 'instanceof' is not callable"));
+            return Ok(false);
         }
         if let Some(t) = self.bound_target(f) {
             return self.instance_of(v, t);
@@ -3636,6 +3681,9 @@ impl Vm {
         unsafe {
             let s = &*(*o).shape;
             let n = s.keys.len() + names.len();
+            if names.contains(&self.a_sym_has_instance) {
+                self.has_instance_defined = true;
+            }
             if names.contains(&self.a_sym_to_primitive) {
                 self.to_primitive_defined = true;
             }

@@ -2274,7 +2274,7 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut caps = Vec::new();
     while at <= s.len() && re.exec_into(&s, at, &mut caps) {
         let (x, y) = caps[0].unwrap();
-        at = if y == x { y + 1 } else { y };
+        at = if y == x { advance(&s, y as f64, re.unicode) as usize } else { y };
         let m = match_array(vm, re, &caps, &s, input)?;
         crate::vm::array_push(vm, out, &[m])?;
     }
@@ -2305,7 +2305,7 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     while let Some(caps) = re.exec(&s, at) {
         let (x, y) = caps[0].unwrap();
         found.push(string(vm, &s[x..y]));
-        at = if y == x { y + 1 } else { y };
+        at = if y == x { advance(&s, y as f64, re.unicode) as usize } else { y };
         if at > s.len() {
             break;
         }
@@ -2407,7 +2407,7 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
                 stride = re.groups;
                 while at <= s.len() && re.exec_into(&s, at, &mut caps) {
                     let (x, y) = caps[0].unwrap();
-                    at = if y == x { y + 1 } else { y };
+                    at = if y == x { advance(&s, y as f64, re.unicode) as usize } else { y };
                     flat.extend_from_slice(&caps);
                 }
                 let a_last = vm.intern("lastIndex");
@@ -2575,11 +2575,11 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
                         break;
                     }
                     if e == p || (e == x && x == q && e == p) {
-                        q = x + 1;
+                        q = advance(s, x as f64, re.unicode) as usize;
                         continue;
                     }
                     if e == x && x == p {
-                        q = x + 1;
+                        q = advance(s, x as f64, re.unicode) as usize;
                         continue;
                     }
                     parts.push(string(vm, &s[p..x]));
@@ -2596,7 +2596,7 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
                         }
                     }
                     p = e;
-                    q = if e == x { e + 1 } else { e };
+                    q = if e == x { advance(s, e as f64, re.unicode) as usize } else { e };
                 }
             }
         }

@@ -133,23 +133,27 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
 | ES5 (untagged) | 16,767 | 17,067 | 98.2% |
-| ES2015 | 8,823 | 9,197 | 95.9% |
+| ES2015 | 8,824 | 9,197 | 95.9% |
 | ES2016 | 97 | 100 | 97.0% |
-| ES2017 | 356 | 741 | 48.0% |
+| ES2017 | 695 | 741 | 93.8% |
 | ES2018 | 4,715 | 4,825 | 97.7% |
 | ES2019 | 159 | 161 | 98.8% |
-| ES2020 | 1,875 | 2,020 | 92.8% |
-| ES2021 | 597 | 630 | 94.8% |
+| ES2020 | 1,964 | 2,020 | 97.2% |
+| ES2021 | 602 | 630 | 95.6% |
 | ES2022 | 5,159 | 5,374 | 96.0% |
 | ES2023 | 284 | 284 | 100.0% |
-| ES2024 | 683 | 843 | 81.0% |
+| ES2024 | 839 | 843 | 99.5% |
 | ES2025 | 976 | 998 | 97.8% |
-| ES2026 | 733 | 745 | 98.4% |
-| Stage 3 proposals | 551 | 5,650 | 9.8% |
-| **all** | **41,775** | **48,635** | **85.9%** |
+| ES2026 | 738 | 745 | 99.1% |
+| Stage 3 proposals | 563 | 5,650 | 10.0% |
+| **all** | **42,382** | **48,635** | **87.1%** |
 
-The gaps are mostly whole features: `SharedArrayBuffer` and `Atomics`
-(most of ES2017's failures, and ES2024's), non-ASCII identifiers beyond a rough
+The `Atomics` tests that need several agents run them as test262's
+`$262.agent` has them: each agent a thread with a VM of its own, sharing
+`SharedArrayBuffer`s' memory with the main one (`CanBlockIsFalse` tests
+run with `cloison --no-block`).
+
+The gaps are mostly whole features: non-ASCII identifiers beyond a rough
 approximation (no Unicode ID tables), and early errors for invalid
 syntax that the parser accepts.
 

@@ -2705,9 +2705,12 @@ impl<'a> Parser<'_, 'a, '_> {
     fn eval_visible(&self, pos: Pos) -> Vec<Expr<'a>> {
         let mut out = Vec::new();
         let mut seen: Vec<Name> = Vec::new();
+        // (Past the function's own variables: enclosing functions'.)
+        let mut outer = false;
         for frame in self.frames.iter().rev() {
             if frame.vars {
                 seen.extend(frame.names.iter().map(|(o, _)| o.clone()));
+                outer = true;
                 continue;
             }
             for (orig, renamed) in &frame.names {
@@ -2716,7 +2719,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 seen.push(orig.clone());
                 let constant = self.table.decls.get(&frame.key).is_some_and(|ds| ds.iter().any(|(n, k)| n == orig && *k == CONST));
-                let kind = if frame.catch { EVAL_CATCH } else if constant { EVAL_CONST } else { 0 };
+                let kind = (if frame.catch { EVAL_CATCH } else if constant { EVAL_CONST } else { 0 }) | if outer { EVAL_OUTER } else { 0 };
                 out.push(Expr { kind: ExprKind::Str(orig.to_string()), pos });
                 out.push(Expr { kind: ExprKind::Ident(renamed.clone()), pos });
                 out.push(Expr { kind: ExprKind::Num(kind as f64), pos });

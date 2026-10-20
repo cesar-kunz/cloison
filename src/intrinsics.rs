@@ -529,16 +529,19 @@ pub(crate) fn ordinary_set(vm: &mut Vm, start: Value, key: Key, v: Value, receiv
     if !crate::props::is_object(receiver) {
         return Ok(false);
     }
-    match vm.own_property(as_object(receiver), key) {
+    // (A proxy receiver's traps: `getOwnPropertyDescriptor`,
+    // `defineProperty`.)
+    let r = as_object(receiver);
+    match crate::proxy::get_own_property(vm, r, key)? {
         Some(d) if d.get.is_some() || d.set.is_some() || d.writable == Some(false) => Ok(false),
         Some(_) => {
             let d = Desc {
                 value: Some(v),
                 ..Default::default()
             };
-            vm.define_own_property(as_object(receiver), key, &d)
+            crate::proxy::define_property(vm, r, key, &d)
         }
-        None => Ok(vm.create_data_property(receiver, key, v).is_ok()),
+        None => crate::proxy::define_property(vm, r, key, &Desc::data(v, true, true, true)),
     }
 }
 

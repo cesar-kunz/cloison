@@ -3238,6 +3238,11 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
             };
             let m = match vm.get(v, vm.a_sym_to_primitive) {
                 Ok(m) => m,
+                // (A bytecode getter or trap: again where it can run.)
+                Err(e) if is_no_top(vm, &e) => {
+                    vm.conv_redo = true;
+                    return Value::UNDEFINED;
+                }
                 Err(e) => return fail(vm, e),
             };
             if !m.is_undefined() && !m.is_null() {
@@ -3265,6 +3270,10 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
         for name in order {
             let m = match vm.get(v, name) {
                 Ok(m) => m,
+                Err(e) if is_no_top(vm, &e) => {
+                    vm.conv_redo = true;
+                    return Value::UNDEFINED;
+                }
                 // (A getter's error is the conversion's.)
                 Err(e) => {
                     vm.conv_error.get_or_insert(e);
@@ -3755,6 +3764,17 @@ unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
     unsafe { header::<Ic>(regs, ICS).add(u16_at(pc, off) as usize * IC_WAYS) }
 }
 
+/// What [`call_function`] says when it can't call a bytecode function: no
+/// frame top recorded (compiled code's runtime calls, see [`with_top`]).
+const NO_TOP: &str = "calling a function from here (compiled code)";
+
+/// Whether `e` is [`call_function`]'s error for a call it couldn't make
+/// without a frame top: before the function ran, so the operation can be
+/// redone where it can (`Vm::conv_redo`).
+fn is_no_top(vm: &Vm, e: &Error) -> bool {
+    vm.native_top.is_null() && e.0.strip_prefix("unsupported: ") == Some(NO_TOP)
+}
+
 /// Record the object a call at `pc` calls in its inline cache, as the fast
 /// paths do for bytecode functions: a cache left empty then means the call
 /// never ran (the JIT leaves such calls to the interpreter).
@@ -3773,7 +3793,7 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
         }
         let top = vm.native_top;
         if top.is_null() {
-            return Err(Error::unsupported("calling a function from here (compiled code)"));
+            return Err(Error::unsupported(NO_TOP));
         }
         vm.safepoint(top);
         let fo = as_object(f);
@@ -3972,7 +3992,7 @@ pub(crate) unsafe fn unwrap_apply(vm: *const Vm, f: Value, this: Value) -> Optio
 /// object for `undefined` or `null`, a wrapper object for another
 /// primitive (sloppy mode; cloison has no strict mode).
 pub(crate) unsafe fn sloppy_this(vm: *mut Vm, this: Value) -> Value {
-    if this.is_cell() && unsafe { (*as_object(this)).class } != Class::String {
+    if crate::props::is_object(this) {
         return this;
     }
     unsafe { box_this(vm, this) }
@@ -4112,8 +4132,9 @@ unsafe fn push_frame(
         set_header(new, CALLER, regs);
         *new.sub(FLAGS) = Value::from_bits(flags);
         set_header(new, FUNC, fo);
-        // Sloppy mode: a primitive `this` is boxed (a string is a cell).
-        *new = if (*callee).strict || this.is_cell() && (*as_object(this)).class != Class::String {
+        // Sloppy mode: a primitive `this` is boxed (a string, a symbol or a
+        // bigint is a cell).
+        *new = if (*callee).strict || crate::props::is_object(this) {
             this
         } else {
             sloppy_this(vm, this)

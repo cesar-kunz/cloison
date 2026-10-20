@@ -2874,6 +2874,11 @@ impl Vm {
             && (i as usize) < u.len()
         {
             return Ok(self.single_char(u[i as usize]));
+        } else if crate::symbol::is_symbol(obj) {
+            // (A symbol's or a bigint's indices are its prototype's.)
+            o = self.symbol_roots[crate::symbol::Root::SymbolPrototype as usize];
+        } else if crate::bigint::is_bigint(obj) {
+            o = self.bigint_prototype;
         }
         self.get_index_from(o, i, obj)
     }

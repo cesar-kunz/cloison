@@ -7527,3 +7527,37 @@ fn modules_deferred_and_source_phase() {
     assert_eq!(run_module(&dir, "main.mjs").unwrap(), "Deferred Module,true,undefined,1,true,true,SyntaxError");
     assert!(run_module(&dir, "source.mjs").unwrap_err().contains("SyntaxError"));
 }
+
+/// Temporal: dates, durations rounded relative to a starting point, and
+/// named time zones (where the system has the database).
+#[test]
+fn temporal_dates_durations_and_zones() {
+    let src = r#"
+        var o = [];
+        var d = Temporal.PlainDate.from("2024-02-29");
+        o.push(String(d), d.dayOfWeek, d.add({ years: 1 }), d.until("2025-03-31", { largestUnit: "months" }));
+        o.push(Temporal.Duration.from("P1DT12H").total({ unit: "hours" }));
+        o.push(Temporal.Duration.from({ hours: 25 }).round({ largestUnit: "days" }));
+        o.push(Temporal.Duration.from({ months: 1 }).total({ unit: "days", relativeTo: "2024-02-01" }));
+        o.push(Temporal.Instant.fromEpochMilliseconds(1e12).toString({ timeZone: "+05:30" }));
+        o.push(Temporal.PlainDateTime.from("2020-01-01T12:34:56.789").round({ smallestUnit: "second" }));
+        o.push(Temporal.PlainYearMonth.from("2020-05").add({ months: 9 }), Temporal.PlainMonthDay.from("--02-29"));
+        try { Temporal.PlainDate.from("2021-02-30"); } catch (e) { o.push(e.name); }
+        o.join()
+    "#;
+    assert_eq!(
+        value(src),
+        "2024-02-29,4,2025-02-28,P13M2D,36,P1DT1H,29,2001-09-09T07:16:40+05:30,2020-01-01T12:34:57,2021-02,02-29,RangeError"
+    );
+    // (Named zones need the system's time zone database.)
+    if std::path::Path::new("/usr/share/zoneinfo/Europe/Vienna").exists() {
+        let src = r#"
+            var z = Temporal.ZonedDateTime.from("2021-03-28T01:30:00+01:00[europe/vienna]");
+            [z.timeZoneId, z.add({ hours: 1 }), z.hoursInDay, z.getTimeZoneTransition("next").toString()].join()
+        "#;
+        assert_eq!(
+            value(src),
+            "Europe/Vienna,2021-03-28T03:30:00+02:00[Europe/Vienna],23,2021-03-28T03:00:00+02:00[Europe/Vienna]"
+        );
+    }
+}

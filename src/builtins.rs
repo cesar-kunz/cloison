@@ -300,6 +300,7 @@ pub(crate) fn install(vm: &mut Vm) {
     crate::generator::install(vm);
     // (After the generators: `%AsyncIteratorPrototype%`.)
     crate::dispose::install(vm).expect("installing the dispose builtins");
+    crate::temporal::install(vm);
     // (`Symbol.prototype`'s is called directly: a symbol is a primitive.)
     vm.to_primitive_defined = false;
     vm.has_instance_defined = false;

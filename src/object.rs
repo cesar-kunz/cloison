@@ -127,6 +127,9 @@ pub enum Class {
     /// A `SharedArrayBuffer`: as [`Class::ArrayBuffer`], its bytes in a
     /// block outside the heap, which agents share (see `typed::Block`).
     SharedArrayBuffer,
+    /// A Temporal object: its internal slots in bytes `elems` points to
+    /// (see `temporal`).
+    Temporal,
 }
 
 // (Stencils read a cell's class byte: a string's 4, a symbol's 9, a
@@ -143,6 +146,7 @@ impl Class {
             self,
             Class::ArrayBuffer
                 | Class::SharedArrayBuffer
+                | Class::Temporal
                 | Class::Map
                 | Class::Set
                 | Class::WeakMap

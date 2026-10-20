@@ -558,6 +558,7 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
             // An enclosing function's variable in its scope object: the
             // object's register is what is captured.
             let mut name = name;
+            let mut env_of = None;
             let mut j = p.functions[i].parent;
             while let Some(k) = j.filter(|&k| k != 0) {
                 if decls[i].contains(&name) {
@@ -566,10 +567,35 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
                 if decls[k].contains(&name) {
                     if overflow[k].contains(&name) {
                         name = ENV;
+                        env_of = Some(k);
                     }
                     break;
                 }
                 j = p.functions[k].parent;
+            }
+            // (Function `k`'s scope object, though this one has its own, an
+            // async function's or a generator's, of the same name: from `k`
+            // down, unless a function between has one too, which can't pass
+            // it on under that name.)
+            if let Some(k) = env_of {
+                let mut chain = vec![i];
+                let mut j = p.functions[i].parent;
+                while let Some(m) = j.filter(|&m| m != k) {
+                    chain.push(m);
+                    j = p.functions[m].parent;
+                }
+                if chain[1..].iter().any(|&m| decls[m].contains(&ENV)) {
+                    continue;
+                }
+                for c in chain {
+                    if !upvalues[c].contains(&ENV) {
+                        upvalues[c].push(ENV);
+                    }
+                }
+                if !captured[k].contains(&ENV) {
+                    captured[k].push(ENV);
+                }
+                continue;
             }
             if decls[i].contains(&name) {
                 continue;

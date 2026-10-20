@@ -320,7 +320,6 @@ pub(crate) fn date_value(v: Value) -> Option<f64> {
     unsafe { ((*o).class == Class::Date).then(|| f64::from_bits((*o).code as u64)) }
 }
 
-/// `thisTimeValue(this)`: a TypeError unless `this` is a `Date`.
 /// `Date.prototype[Symbol.toPrimitive](hint)`: OrdinaryToPrimitive,
 /// `toString` first for "string" and "default", `valueOf` for "number".
 pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -346,6 +345,7 @@ pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: &[Value]) -> Result
     Err(Error::type_error("Cannot convert object to primitive value"))
 }
 
+/// `thisTimeValue(this)`: a TypeError unless `this` is a `Date`.
 fn this_time(this: Value) -> Result<f64> {
     date_value(this).ok_or_else(|| Error::type_error("this is not a Date object"))
 }

@@ -4110,11 +4110,17 @@ impl<'a> Gen<'a> {
             }
             _ => (f, false),
         };
+        // (A script's: where it sees lexical bindings, its own `let`s and
+        // the like, which an ordinary call of the global `eval` wouldn't.)
+        let script_lexicals = || {
+            matches!(args.last(), Some(Expr { kind: ExprKind::Intrinsic("%eval_scope", v), .. })
+                if v.iter().any(|e| matches!(e.kind, ExprKind::Str(_))))
+        };
         if let ExprKind::Ident(n) = &f.kind
             && &**n == "eval"
             && !new
             && self.f.has_eval
-            && (self.index != 0 || self.p.direct_eval)
+            && (self.index != 0 || self.p.direct_eval || script_lexicals())
             && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)))
         {
             // Direct `eval`: `[eval, source, scope object, this, strict,
@@ -4149,10 +4155,13 @@ impl<'a> Gen<'a> {
                 self.effect(a)?;
             }
             let env = self.alloc(pos)?;
-            if self.index == 0 {
+            if self.index == 0 && self.p.direct_eval {
                 // (`eval` in `eval`'s code: the same scope.)
                 self.load_raw("%e0", pos)?;
                 self.star(env);
+            } else if self.index == 0 {
+                // (A script's: its `var`s are the global object's, `this`.)
+                self.mov(0, env);
             } else {
                 self.mov(self.locals[ENV], env);
             }

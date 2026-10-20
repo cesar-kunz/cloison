@@ -80,6 +80,8 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("dispose_add", dispose_add),
     ("dispose_run", dispose_run),
     ("dispose_run_async", dispose_run_async),
+    ("dynamic_import", |vm, a| crate::module::dynamic_import(vm, a[0], a[1], a[2])),
+    ("import_meta", |vm, a| crate::module::import_meta(vm, a[0])),
 ];
 
 /// `using x = v` (`[state, v, async]`): `v` added to the statement list's

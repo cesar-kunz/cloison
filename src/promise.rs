@@ -271,13 +271,20 @@ fn truncate(e: *mut Object, n: usize) {
 /// capacity may be below its object's). The native reads them through
 /// `Vm::callee`.
 fn closure(vm: &mut Vm, template: Root, data: &[Value]) -> Value {
+    let t = root(vm, template);
+    native_closure(vm, t, data)
+}
+
+/// A closure of native function `template`'s code (see [`closure`]),
+/// which reads `data` with [`slot`].
+pub(crate) fn native_closure(vm: &mut Vm, template: *mut Object, data: &[Value]) -> Value {
     let fp = object_value(vm.function_prototype);
     let full = vm.root_shape(Class::Native, fp, data.len() as u32);
     let bare = vm.root_shape(Class::Native, fp, 0);
     let o = vm.heap.alloc_object(unsafe { &*full });
     unsafe {
         (*o).shape = bare;
-        (*o).code = (*root(vm, template)).code;
+        (*o).code = (*template).code;
         for (i, &v) in data.iter().enumerate() {
             set_slot(o, i, v);
         }
@@ -301,7 +308,7 @@ pub(crate) fn slot(o: *mut Object, i: usize) -> Value {
     unsafe { *Object::inline(o, i) }
 }
 
-fn set_slot(o: *mut Object, i: usize, v: Value) {
+pub(crate) fn set_slot(o: *mut Object, i: usize, v: Value) {
     unsafe {
         let at = Object::inline(o, i);
         *at = v;
@@ -322,6 +329,12 @@ fn new_promise(vm: &mut Vm) -> Value {
         crate::heap::barrier(o.cast(), &raw const (*o).code, cells);
     }
     object_value(o)
+}
+
+/// Promise `p`'s state (pending 0, fulfilled 1, rejected 2) and result.
+pub(crate) fn state(p: Value) -> (i32, Value) {
+    let e = cells(as_object(p));
+    (elem(e, STATE).as_i32_unchecked(), elem(e, RESULT))
 }
 
 /// Promise `p`'s hidden array.

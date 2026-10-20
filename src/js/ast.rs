@@ -24,6 +24,59 @@ pub struct Program<'a> {
     /// Strict indirect `eval`'s code: its `var`s and functions are its
     /// own, not globals.
     pub eval_locals: bool,
+    /// A module's imported bindings, by their new names (see
+    /// [`Import`]).
+    pub imports: std::collections::HashMap<Name, Import>,
+    /// A module's requests, imports and exports (see [`ModuleInfo`]).
+    pub module: Option<ModuleInfo>,
+}
+
+/// The name of a module's function (`functions[1]`, whose body is the
+/// module's: see `parse::parse_module`).
+pub const MODULE_FUNCTION: &str = "%module";
+/// Its first parameter: the module's scope object, which its loader
+/// makes (see `module`) and the function fills (see `codegen`).
+pub const MODULE_ENV: &str = "%modenv";
+
+/// An imported binding (`import { x as y } from "m"`): a reference to it
+/// reads the variable it resolves to in the module exporting it, live, in
+/// that module's scope object, which the module function gets as its
+/// parameter `holder`; or with no `prop`, the parameter's value itself
+/// (a namespace object). Assigning it throws.
+#[derive(Debug, Clone)]
+pub struct Import {
+    /// Its name as written.
+    pub original: Name,
+    /// Its index in [`ModuleInfo::imports`].
+    pub index: usize,
+    /// The module function's parameter holding the scope object (or the
+    /// namespace).
+    pub holder: Name,
+    /// The variable's name in that object, once linked (see
+    /// `module::link`).
+    pub prop: Option<String>,
+}
+
+/// A module's requests and its import and export entries (ECMA-262
+/// §16.2.1.6), names as written, local ones as the module's variables'
+/// (renamed: see [`Program::lexicals`]).
+#[derive(Debug, Clone, Default)]
+pub struct ModuleInfo {
+    /// The modules it requests, in order, each once: the specifier and
+    /// its `type` attribute (`with { type: "json" }`), if any.
+    pub requests: Vec<(String, Option<String>)>,
+    /// `import … from`: the request, the name imported (`None` for `* as
+    /// ns`), the local binding (see [`Import`]).
+    pub imports: Vec<(usize, Option<String>, Name)>,
+    /// `export`ed variables: the name exported, the variable.
+    pub local_exports: Vec<(String, String)>,
+    /// `export { x as y } from "m"`: the name exported, the request, the
+    /// name imported (`None` for `export * as ns from "m"`).
+    pub indirect_exports: Vec<(String, usize, Option<String>)>,
+    /// `export * from "m"`: the requests.
+    pub star_exports: Vec<usize>,
+    /// It has a top-level `await` (its function is async).
+    pub has_await: bool,
 }
 
 /// A block-scoped binding (see [`Program::lexicals`]).
@@ -45,6 +98,10 @@ pub struct Lexical {
     /// The `with` statements enclosing its declaration (see
     /// `Function::withs`): their objects don't shadow it.
     pub withs: usize,
+    /// Declared in a module's own scope (not a block in it): a variable
+    /// of its scope object, which other modules may import (never in a
+    /// box: see `codegen::boxed_lexicals`).
+    pub module_top: bool,
 }
 
 /// Where a program's nodes live (see [`Arena`]).
@@ -160,6 +217,8 @@ pub struct Function<'a> {
     /// the variable holding the function that initializes them on
     /// `this` (see [`Class::fields`]).
     pub fields: Option<Name>,
+    /// A module's function (see [`MODULE_FUNCTION`]).
+    pub module: bool,
     /// A generator function (`function*`, `*m() {}`).
     pub generator: bool,
     /// An async function (`async function`, `async () => …`, `async m()

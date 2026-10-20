@@ -80,20 +80,20 @@ fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-fn reflect_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn reflect_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "defineProperty")?;
     let key = to_property_key(vm, arg(a, 1))?;
     let d = vm.to_descriptor(arg(a, 2))?;
     crate::proxy::define_property(vm, o, key, &d).map(Value::from_bool)
 }
 
-fn reflect_delete_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn reflect_delete_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "deleteProperty")?;
     let key = to_property_key(vm, arg(a, 1))?;
     crate::proxy::delete(vm, o, key).map(Value::from_bool)
 }
 
-fn reflect_get(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn reflect_get(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "get")?;
     let key = to_property_key(vm, arg(a, 1))?;
     let receiver = if a.len() > 2 { a[2] } else { object_value(o) };
@@ -103,7 +103,7 @@ fn reflect_get(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     get_from(vm, object_value(o), key, receiver)
 }
 
-fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn reflect_get_own_property_descriptor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "getOwnPropertyDescriptor")?;
     let key = to_property_key(vm, arg(a, 1))?;
     Ok(match crate::proxy::get_own_property(vm, o, key)? {
@@ -117,7 +117,7 @@ fn reflect_get_prototype_of(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
     crate::proxy::get_prototype_of(vm, o)
 }
 
-fn reflect_has(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn reflect_has(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "has")?;
     let key = to_property_key(vm, arg(a, 1))?;
     vm.has_key(object_value(o), key).map(Value::from_bool)
@@ -129,7 +129,7 @@ fn reflect_is_extensible(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Reflect.ownKeys(o)`: its string keys, then its symbols.
-fn reflect_own_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn reflect_own_keys(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = target(a, "ownKeys")?;
     let keys = crate::proxy::own_keys(vm, o)?;
     let out = vm.new_array();

@@ -4,7 +4,9 @@ Every test under test/{built-ins,language,annexB} (not intl402 or
 staging), run as test262's INTERPRETING.md says: strict and sloppy for a
 test without `onlyStrict`/`noStrict`/`raw` (both must pass), `negative`
 tests must fail in their phase with their error, `async` ones must print
-`Test262:AsyncTestComplete`. Modules aren't supported: those tests fail.
+`Test262:AsyncTestComplete`. A module test runs as a module (`--module`),
+the harness a script before it (`--prelude`); every test's file is
+written next to it, where its fixtures are.
 
 A test's edition is the latest of its features' (ES5 for one with none:
 test262 tags features from ES2015 on, mostly); a feature not in a
@@ -16,7 +18,7 @@ count.
 Writes editions.tsv (edition, passed, total) and fails-all.txt in the
 current directory.
 """
-import os, re, sys, subprocess, collections, tempfile
+import os, re, sys, subprocess, collections, uuid
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -95,12 +97,13 @@ def harness(n):
         H[n] = open(p).read() if os.path.exists(p) else ''
     return H[n]
 
-def run_once(src, strict, neg, is_async):
-    with tempfile.NamedTemporaryFile('w', suffix='.js', delete=False) as f:
+def run_once(src, strict, neg, is_async, test_dir, module=None):
+    n = os.path.join(test_dir, f'__t262_{uuid.uuid4().hex}.js')
+    with open(n, 'w') as f:
         f.write(('"use strict";\n' if strict else '') + src)
-        n = f.name
     try:
-        r = subprocess.run([CLOISON, n], capture_output=True, text=True, timeout=10)
+        cmd = [CLOISON, '--prelude', n, '--module', module] if module else [CLOISON, n]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         out = (r.stderr or '') + (r.stdout or '')
         if r.returncode < 0:
             return False, 'CRASH'
@@ -128,8 +131,6 @@ def run(p):
     s = open(p, encoding='utf8', errors='replace').read()
     ft, fl, inc, neg = meta(s)
     ed = edition(ft)
-    if 'module' in fl:
-        return p, ed, False, 'module'
     is_async = 'async' in fl
     if 'raw' in fl:
         pre = ''
@@ -137,8 +138,11 @@ def run(p):
         names = ['assert.js', 'sta.js'] + (['doneprintHandle.js'] if is_async else []) + inc
         pre = ''.join(harness(i) for i in names) + '\n'
     modes = [True] if 'onlyStrict' in fl else [False] if ('noStrict' in fl or 'raw' in fl) else [False, True]
+    if 'module' in fl:
+        ok, msg = run_once(pre, False, neg, is_async, os.path.dirname(p), p)
+        return p, ed, ok, msg.replace('\n', ' ')
     for strict in modes:
-        ok, msg = run_once(pre + s, strict, neg, is_async)
+        ok, msg = run_once(pre + s, strict, neg, is_async, os.path.dirname(p))
         if not ok:
             return p, ed, False, ('strict: ' if strict else '') + msg.replace('\n', ' ')
     return p, ed, True, ''
@@ -148,7 +152,7 @@ for d in ['built-ins', 'language', 'annexB']:
     for r, _, fs in os.walk(f'{T}/test/{d}'):
         for f in fs:
             p = f'{r}/{f}'
-            if f.endswith('.js') and '_FIXTURE' not in f and only in p:
+            if f.endswith('.js') and '_FIXTURE' not in f and not f.startswith('__t262_') and only in p:
                 files.append(p)
 with ThreadPoolExecutor(os.cpu_count()) as ex:
     res = list(ex.map(run, sorted(files)))

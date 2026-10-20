@@ -4,6 +4,10 @@
 //! `cloison --dump FILE.js` prints the bytecode the script compiles to instead,
 //! in the text form.
 //!
+//! `cloison --module FILE` (or a `.mjs` file) runs a module, and the modules
+//! it imports, instead; `--prelude SCRIPT` runs a script first (test262's
+//! harness, before a module test).
+//!
 //! `CLOISON_TIME` set: also prints, to stderr, the milliseconds from compiling
 //! to completion (wall clock; process startup excluded, as V8's in-process
 //! timings exclude Node's: see `scripts/tiers.sh`).
@@ -39,15 +43,33 @@ fn main() -> ExitCode {
             libc::sigaction(libc::SIGBUS, &sa, std::ptr::null_mut());
         }
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut prelude = None;
+    let mut module = false;
+    while args.len() > 1 {
+        match args[0].as_str() {
+            "--prelude" if args.len() > 2 => {
+                prelude = Some(args.remove(1));
+                args.remove(0);
+            }
+            "--module" => {
+                module = true;
+                args.remove(0);
+            }
+            _ => break,
+        }
+    }
     let (dump, path) = match &args[..] {
         [p] => (false, p),
         [flag, p] if flag == "--dump" => (true, p),
         _ => {
-            eprintln!("usage: cloison [--dump] FILE.js|FILE.asm");
+            eprintln!("usage: cloison [--dump] FILE.js|FILE.asm\n       cloison [--prelude SCRIPT] [--module] FILE");
             return ExitCode::from(2);
         }
     };
+    if module || path.ends_with(".mjs") {
+        return run_module(prelude.as_deref(), path);
+    }
     let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
@@ -56,6 +78,7 @@ fn main() -> ExitCode {
         }
     };
     let mut vm = cloison::vm::Vm::new();
+    vm.set_script_path(path);
     let start = std::time::Instant::now();
     let module = if path.ends_with(".js") {
         cloison::js::compile(&src)
@@ -139,4 +162,39 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `cloison [--prelude SCRIPT] --module FILE`: SCRIPT run, then module FILE.
+fn run_module(prelude: Option<&str>, path: &str) -> ExitCode {
+    let mut vm = cloison::vm::Vm::new();
+    if let Some(p) = prelude {
+        let r = std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|src| cloison::js::compile(&src));
+        let module = match r {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("cloison: {p}:{e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        vm.set_script_path(p);
+        if let Err(e) = vm.run(&module) {
+            eprintln!("cloison: uncaught {}", vm.uncaught_message(&e));
+            return ExitCode::FAILURE;
+        }
+    }
+    let r = vm.run_module(path);
+    let code = match r {
+        Ok(()) => ExitCode::SUCCESS,
+        // (Not "uncaught": test262's runners tell early errors so.)
+        Err(cloison::vm::ModuleError::Early(m)) => {
+            eprintln!("cloison: {m}");
+            ExitCode::FAILURE
+        }
+        Err(cloison::vm::ModuleError::Thrown(e)) => {
+            eprintln!("cloison: uncaught {}", vm.uncaught_message(&e));
+            ExitCode::FAILURE
+        }
+    };
+    std::mem::forget(vm);
+    code
 }

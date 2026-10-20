@@ -24,6 +24,15 @@ use crate::value::Value;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error(pub String, pub Option<Value>);
 
+/// How running a module failed (see [`Vm::run_module`]).
+#[derive(Debug)]
+pub enum ModuleError {
+    /// Before it ran: a syntax error, an import that can't be resolved.
+    Early(String),
+    /// What it threw.
+    Thrown(Error),
+}
+
 impl Error {
     pub fn type_error(m: impl fmt::Display) -> Error {
         Error(format!("TypeError: {m}"), None)
@@ -776,6 +785,8 @@ pub struct Vm {
     pub(crate) from_async_helper: Value,
     /// `dispose`'s prototypes and helpers (see `dispose::Root`).
     pub(crate) dispose_roots: Vec<Value>,
+    /// The modules loaded (see `module`).
+    pub(crate) modules: crate::module::Modules,
     /// Compiled regular expressions, by pattern and flags (a literal makes
     /// a new object each time it runs, sharing one).
     pub(crate) regexps: HashMap<(String, String), Box<crate::regexp::Regex>>,
@@ -965,6 +976,7 @@ impl Vm {
             bind_helper: Value::UNDEFINED,
             from_async_helper: Value::UNDEFINED,
             dispose_roots: Vec::new(),
+            modules: Default::default(),
             declared: Default::default(),
             lexical_declared: Default::default(),
             script_declared: Default::default(),
@@ -4244,6 +4256,48 @@ impl Vm {
         r
     }
 
+    /// The script's file: its `import()`s resolve from its directory.
+    pub fn set_script_path(&mut self, path: &str) {
+        self.modules.script_path = Some(path.to_string());
+    }
+
+    /// Run module `path` (see `module`) and the modules it imports, then
+    /// the promise jobs queued. Fails with an early error (a syntax error,
+    /// an import that can't be resolved), or what its evaluation threw.
+    pub fn run_module(&mut self, path: &str) -> std::result::Result<(), ModuleError> {
+        crate::interp::CURRENT_VM.with(|v| v.set(self));
+        let here = 0u8;
+        self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
+        let outer = self.heap.gc.stack_base == 0;
+        if outer {
+            self.heap.gc.stack_base = &raw const here as usize & !7;
+        }
+        let r = self.handle_scope(|vm| {
+            let saved = vm.native_top;
+            vm.native_top = vm.stack.as_mut_ptr();
+            let r = crate::module::run_main(vm, path);
+            vm.native_top = saved;
+            match r {
+                Ok(p) => {
+                    vm.handles.push(p);
+                    vm.run_jobs().map_err(ModuleError::Thrown)?;
+                    match crate::promise::state(p) {
+                        (2, v) => Err(ModuleError::Thrown(Error::thrown(v))),
+                        _ => Ok(()),
+                    }
+                }
+                Err(Ok(m)) => Err(ModuleError::Early(m)),
+                Err(Err(e)) => Err(ModuleError::Thrown(e)),
+            }
+        });
+        self.kept_alive.clear();
+        if outer {
+            self.heap.gc.stack_base = 0;
+            self.pause_marker();
+        }
+        r
+    }
+
     /// Run the promise jobs queued (see `promise::run_jobs`): the VM stack
     /// is free, so they run from its base.
     fn run_jobs(&mut self) -> Result<()> {
@@ -4304,6 +4358,7 @@ impl Vm {
         v.push(self.bind_helper);
         v.push(self.from_async_helper);
         v.extend_from_slice(&self.dispose_roots);
+        v.extend(self.modules.roots());
         v.extend_from_slice(&self.single_chars);
         if let Some(Error(_, Some(e))) = &self.error {
             v.push(*e);

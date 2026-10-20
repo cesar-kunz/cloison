@@ -60,6 +60,30 @@ pub fn compile(src: &str) -> Result<Module, String> {
         .map_err(|e| e.display(src))
 }
 
+/// Module `src`'s requests, imports and exports (module `id`'s); errors
+/// are `line:column: message`.
+pub fn module_info(src: &str, id: i32) -> Result<ast::ModuleInfo, String> {
+    let arena = ast::Arenas::default();
+    let p = parse::parse_module(src, &arena, id).map_err(|e| e.display(src))?;
+    Ok(p.module.unwrap_or_default())
+}
+
+/// Compile module `src` (module `id`, see `module`): a script whose value
+/// is the module's function (see `ast::MODULE_FUNCTION`). `links`: per
+/// import (see `ast::ModuleInfo::imports`), the variable of the scope
+/// object its holder is, or none (the holder is the value).
+pub fn compile_module(src: &str, id: i32, links: &[Option<String>]) -> Result<Module, String> {
+    let arena = ast::Arenas::default();
+    parse::parse_module(src, &arena, id)
+        .and_then(|mut p| {
+            for imp in p.imports.values_mut() {
+                imp.prop = links[imp.index].clone();
+            }
+            codegen::generate(&p, src)
+        })
+        .map_err(|e| e.display(src))
+}
+
 /// Compile `src`, a script run by `eval` or made by `Function`, leaving
 /// its functions to compile at their first calls (see
 /// [`codegen::generate_lazy`]), their bodies only skimmed (see

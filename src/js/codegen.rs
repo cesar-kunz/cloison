@@ -105,7 +105,7 @@ fn generate_from<'p>(
             let generator = (f.generator || f.is_async) && !f.has_eval;
             let in_env = |n: &str| {
                 if generator {
-                    return n != GEN && n != EVAL_SCOPE && Some(n) != own && !boxed[i].contains(&n);
+                    return n != GEN && n != EVAL_SCOPE && n != MODULE_ENV && Some(n) != own && !boxed[i].contains(&n);
                 }
                 !n.starts_with('%') && !p.lexicals.contains_key(n) && Some(n) != own
             };
@@ -361,7 +361,13 @@ fn boxed_lexicals<'a>(p: &'a Program, decls: &[Vec<&'a str>]) -> Vec<Vec<&'a str
             if i == 0 || !(f.generator || f.is_async) {
                 return Vec::new();
             }
-            decls[i].iter().copied().filter(|n| p.lexicals.contains_key(*n) && used[i].contains(n)).collect()
+            // (Not a module's own: its scope object's, which other modules
+            // import from.)
+            decls[i]
+                .iter()
+                .copied()
+                .filter(|n| p.lexicals.get(*n).is_some_and(|l| !l.module_top) && used[i].contains(n))
+                .collect()
         })
         .collect()
 }
@@ -492,7 +498,11 @@ fn eval_outer_names<'a>(p: &'a Program, decls: &[Decls<'a>], i: usize) -> Vec<&'
 
 /// `vm::Code::kind` for `f`.
 fn function_kind(f: &Function) -> u8 {
-    if f.is_async && f.generator {
+    // (A module's: a generator, async or not, its loader drives: see
+    // `module`.)
+    if f.module {
+        4
+    } else if f.is_async && f.generator {
         6
     } else if f.is_async {
         5
@@ -556,8 +566,9 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
         }
         for name in refs {
             // An enclosing function's variable in its scope object: the
-            // object's register is what is captured.
-            let mut name = name;
+            // object's register is what is captured. (An import: the
+            // module function's parameter holding it.)
+            let mut name = p.imports.get(name).map_or(name, |imp| &*imp.holder);
             let mut env_of = None;
             let mut j = p.functions[i].parent;
             while let Some(k) = j.filter(|&k| k != 0) {
@@ -1342,6 +1353,8 @@ enum Var {
     Upvalue(u8),
     Global,
     Undefined,
+    /// A module's imported binding (see `ast::Import`).
+    Import,
 }
 
 /// Which outcome of a test falls through to the next instruction (the
@@ -1662,9 +1675,14 @@ impl<'a> Gen<'a> {
         let has_eval = self.f.has_eval && self.index != 0;
         if !self.overflow.is_empty() || has_eval || self.f.generator || self.f.is_async {
             let env = self.locals[ENV];
-            let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
-            let ic = self.auto_ic(&format!("[]{}", cap));
-            self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
+            if self.f.module {
+                // (A module's: its loader's, which other modules read.)
+                self.ldar(self.locals[MODULE_ENV]);
+            } else {
+                let cap = self.overflow.len().min(crate::vm::MAX_INLINE_CAPACITY as usize) as u8;
+                let ic = self.auto_ic(&format!("[]{}", cap));
+                self.emit(Op::CreateObject, &[Arg::Count(cap), ic]);
+            }
             self.star(env);
             if has_eval {
                 // (No `toString` and such for names to find in it.)
@@ -2773,6 +2791,9 @@ impl<'a> Gen<'a> {
     // ---- Names ----
 
     fn resolve(&self, name: &str, pos: Pos) -> R<Var> {
+        if !self.p.imports.is_empty() && self.p.imports.contains_key(name) {
+            return Ok(Var::Import);
+        }
         if let Some(&r) = self.locals.get(name) {
             // (A box's property: see `boxed_lexicals`.)
             if self.boxed[self.index].contains(&name) {
@@ -3234,6 +3255,15 @@ impl<'a> Gen<'a> {
                 self.temp = mark;
             }
             Var::Global | Var::Undefined => self.global(Op::StaGlobal, name),
+            // (A constant: see `Parser::import_declaration`.)
+            Var::Import => {
+                let mark = self.temp;
+                let r = self.alloc(pos)?;
+                self.string(&self.p.imports[name].original.clone());
+                self.star(r);
+                self.intrinsic("throw_const", r, 1);
+                self.temp = mark;
+            }
         }
         Ok(())
     }
@@ -3350,6 +3380,10 @@ impl<'a> Gen<'a> {
             let k = self.const_str(&self.p.lexicals[n].original.clone());
             self.emit(Op::CheckHole, &[Arg::Index(k)]);
         }
+        if let Some(imp) = self.p.imports.get(n).filter(|imp| imp.prop.is_some()) {
+            let k = self.const_str(&imp.original.clone());
+            self.emit(Op::CheckHole, &[Arg::Index(k)]);
+        }
         Ok(())
     }
 
@@ -3394,6 +3428,21 @@ impl<'a> Gen<'a> {
                 }
                 Var::Undefined => self.emit(Op::LdaUndefined, &[]),
                 Var::Global => self.global(Op::LdaGlobal, n),
+                // Its holder's property, live (a hole until its module
+                // sets it: `load_var` checks), or the holder itself (a
+                // namespace).
+                Var::Import => {
+                    let imp = &self.p.imports[n];
+                    let (holder, prop) = (imp.holder.clone(), imp.prop.clone());
+                    self.load_raw(&holder, pos)?;
+                    if let Some(prop) = prop {
+                        let mark = self.temp;
+                        let env = self.alloc(pos)?;
+                        self.star(env);
+                        self.named(Op::GetNamed, env, &prop);
+                        self.temp = mark;
+                    }
+                }
             }
         Ok(())
     }

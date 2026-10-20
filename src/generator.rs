@@ -147,6 +147,11 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     }
 }
 
+/// Run module generator `g` (see `module`) to its end.
+pub(crate) fn run_module(vm: &mut Vm, g: Value) -> Result<()> {
+    resume_raw(vm, g, Value::UNDEFINED, NEXT, "a module").map(drop)
+}
+
 /// Run function `f`'s code from offset `pc` in a frame of registers
 /// `saved` (an array), `acc` `v`: what it returns or yields.
 unsafe fn run(vm: &mut Vm, f: *mut Object, saved: Value, pc: usize, v: Value) -> Result<Value> {

@@ -41,11 +41,11 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
     // A first pass finds each scope's block-scoped declarations; if there
     // are any, a second renames them apart (see `Parser::reference`).
     let lexical = has_lexical(toks);
-    let (first, table) = parse_pass(toks, arena, skim && !lexical, true, None, None, None)?;
+    let (first, table) = parse_pass(toks, arena, skim && !lexical, true, None, None, None, None)?;
     if table.trivial() {
         return Ok(first);
     }
-    parse_pass(toks, arena, skim, false, Some(table), Some(&first), None).map(|(p, _)| p)
+    parse_pass(toks, arena, skim, false, Some(table), Some(&first), None, None).map(|(p, _)| p)
 }
 
 /// [`parse_with`] of source `src`, lexed again for a second pass (the
@@ -59,12 +59,26 @@ pub fn parse_source<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool) -> Result<
 pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize)>) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
-    let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval)?;
+    let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
     if table.trivial() {
         return Ok(first);
     }
     let mut toks = super::lex::lex(src)?;
-    parse_pass(&mut toks, arena, skim, false, Some(table), Some(&first), eval).map(|(p, _)| p)
+    parse_pass(&mut toks, arena, skim, false, Some(table), Some(&first), eval, None).map(|(p, _)| p)
+}
+
+/// Module `src`: a script of one function expression, the module's (see
+/// [`Parser::module_body`]), with the module's entries
+/// ([`Program::module`]). `id`: the module's (see `module`), which its
+/// `import()`s and `import.meta` name.
+pub fn parse_module<'a>(src: &str, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
+    let mut toks = super::lex::lex_as(src, true)?;
+    let (first, table) = parse_pass(&mut toks, arena, false, false, None, None, None, Some(id))?;
+    if table.trivial() {
+        return Ok(first);
+    }
+    let mut toks = super::lex::lex_as(src, true)?;
+    parse_pass(&mut toks, arena, false, false, Some(table), Some(&first), None, Some(id)).map(|(p, _)| p)
 }
 
 /// Whether `toks` has `let`, `const` or `class` (then a first pass parses
@@ -84,6 +98,7 @@ fn parse_pass<'a, 'p>(
     table: Option<Table>,
     prev: Option<&'p Program<'a>>,
     eval: Option<(bool, usize)>,
+    module: Option<i32>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
     let mut p = Parser {
@@ -120,6 +135,12 @@ fn parse_pass<'a, 'p>(
         frames: Vec::new(),
         renames: 0,
         lexicals: Default::default(),
+        module,
+        info: ModuleInfo::default(),
+        imports: Default::default(),
+        local_exports: Vec::new(),
+        exported: Vec::new(),
+        labels: Vec::new(),
     };
     p.functions.push(Function {
         name: None,
@@ -154,8 +175,9 @@ fn parse_pass<'a, 'p>(
         ctor_var: None,
         free: None,
         fields: None,
+        module: false,
     });
-    p.functions[0].strict = p.directive_prologue() || eval.is_some_and(|(strict, _)| strict);
+    p.functions[0].strict = p.directive_prologue() || eval.is_some_and(|(strict, _)| strict) || module.is_some();
     if let Some((_, withs)) = eval {
         // The caller's scope object, the objects of the `with` statements
         // around the `eval` (outermost first), then the eval's own (for
@@ -173,6 +195,9 @@ fn parse_pass<'a, 'p>(
     }
     p.push_scope(usize::MAX, false, true);
     let mut body = Vec::new();
+    if module.is_some() {
+        body.push(p.module_body()?);
+    }
     while p.peek() != &Tok::Eof {
         body.push(p.statement()?);
     }
@@ -187,6 +212,8 @@ fn parse_pass<'a, 'p>(
             lexicals: p.lexicals,
             direct_eval: eval.is_some(),
             eval_locals: false,
+            imports: std::mem::take(&mut p.imports),
+            module: module.map(|_| std::mem::take(&mut p.info)),
         },
         p.table,
     ))
@@ -213,6 +240,13 @@ const LET: u8 = 0;
 const CONST: u8 = 1;
 const BLOCK_FUNCTION: u8 = 2;
 const CATCH: u8 = 4;
+/// An imported binding (see `ast::Import`): a constant, initialized
+/// before the module runs (reading one before its exporter sets it is a
+/// ReferenceError, which the reference checks: see `codegen`).
+const IMPORT: u8 = 5;
+
+/// The key of a module's own scope (see [`Parser::module_body`]).
+const MODULE_SCOPE: usize = usize::MAX - 2;
 
 /// A scope being parsed: its names, renamed (the same for a function's
 /// `var`s, which shadow outer bindings).
@@ -296,6 +330,18 @@ struct Parser<'t, 'a, 'p> {
     frames: Vec<Frame>,
     renames: usize,
     lexicals: std::collections::HashMap<Name, Lexical>,
+    /// Parsing a module: its id (see [`parse_module`]).
+    module: Option<i32>,
+    /// A module's entries so far (see [`Program::module`]).
+    info: ModuleInfo,
+    imports: std::collections::HashMap<Name, Import>,
+    /// `export { x as y }`: the name exported, the variable (as written,
+    /// or renamed), where; checked declared once the module is parsed.
+    local_exports: Vec<(String, Name, Pos)>,
+    /// The names a module exports so far (each once: an early error).
+    exported: Vec<String>,
+    /// The labels of the statements being parsed, each with its function.
+    labels: Vec<(usize, Name)>,
 }
 
 /// A function being skimmed (see [`Parser::skim_body`]): the names it
@@ -439,7 +485,7 @@ impl<'a> Parser<'_, 'a, '_> {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` (escaped) is a reserved word")));
         }
         let f = &self.functions[self.current];
-        if s == "yield" && (self.strict() || f.generator) || s == "await" && (f.is_async || self.in_static_block()) {
+        if s == "yield" && (self.strict() || f.generator) || s == "await" && (f.is_async || self.in_static_block() || self.module.is_some()) {
             return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{s}` as an identifier here")));
         }
         Ok(())
@@ -563,8 +609,9 @@ impl<'a> Parser<'_, 'a, '_> {
                 self.semicolon()?;
                 StmtKind::Empty
             }
-            Tok::Keyword(k @ ("import" | "export")) => {
-                return self.err(format!("`{k}` is not supported"));
+            // (`import(…)` and `import.meta` are expressions.)
+            Tok::Keyword(k @ ("import" | "export")) if k == "export" || !matches!(self.peek_at(1), Tok::Punct("(" | ".")) => {
+                return self.err(format!("`{k}` declaration not at a module's top level"));
             }
             Tok::Keyword("with") => {
                 if self.strict() {
@@ -625,6 +672,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     && !self.toks[self.i].escaped;
                 if is_await {
                     self.advance();
+                    self.note_await();
                 }
                 let key = self.i;
                 self.push_scope(key, false, false);
@@ -659,7 +707,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Tok::Keyword("return") => {
                 self.advance();
-                if self.current == 0 {
+                if self.current == 0 || self.module_top() {
                     return Err(Error::new(
                         pos as usize,
                         "`return` outside a function".into(),
@@ -771,8 +819,14 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Ident(name) if self.peek_at(1) == &Tok::Punct(":") => {
                 self.advance();
                 self.strict_word(&name)?;
+                if self.labels.iter().any(|(f, l)| *f == self.current && *l == name) {
+                    return self.err(format!("label `{name}` inside a statement of the same label"));
+                }
                 self.advance();
-                StmtKind::Labeled(name, stmt(self.arena, self.sub_statement()?))
+                self.labels.push((self.current, name.clone()));
+                let body = self.sub_statement();
+                self.labels.pop();
+                StmtKind::Labeled(name, stmt(self.arena, body?))
             }
             _ => {
                 let e = self.expression(false)?;
@@ -928,6 +982,7 @@ impl<'a> Parser<'_, 'a, '_> {
         }
         if is_await {
             self.advance();
+            self.note_await();
         }
         self.advance();
         let decls = self.using_bindings(false)?;
@@ -993,6 +1048,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let pos = self.pos();
         if is_await {
             self.advance();
+            self.note_await();
         }
         self.advance();
         let decls = self.using_bindings(true)?;
@@ -1587,6 +1643,7 @@ impl<'a> Parser<'_, 'a, '_> {
             ctor_var,
             free: None,
             fields: None,
+            module: false,
         });
         self.functions[index].class_kind = class_kind;
         self.functions[index].uses_new_target = class_kind != 0;
@@ -1852,6 +1909,7 @@ impl<'a> Parser<'_, 'a, '_> {
             ctor_var: None,
             free: None,
             fields: None,
+            module: false,
         });
         let outer = std::mem::replace(&mut self.current, index);
         let params = match single {
@@ -2232,6 +2290,7 @@ impl<'a> Parser<'_, 'a, '_> {
             && !self.toks[self.i].escaped
         {
             self.advance();
+            self.note_await();
             let e = self.unary()?;
             return Ok(Expr {
                 kind: ExprKind::Await(expr(self.arena, e)),
@@ -2425,7 +2484,7 @@ impl<'a> Parser<'_, 'a, '_> {
             self.advance();
             self.advance();
             let k = self.non_arrow();
-            if k == 0 && !self.in_eval {
+            if k == 0 && !self.in_eval || self.functions[k].module {
                 return self.err("`new.target` outside a function");
             }
             // (In direct `eval`'s code, its caller's: a binding of its
@@ -2439,6 +2498,9 @@ impl<'a> Parser<'_, 'a, '_> {
             };
             while self.member_suffix(&mut e)? {}
             return Ok(e);
+        }
+        if self.is("import") && self.peek_at(1) == &Tok::Punct("(") {
+            return self.err("`new import(…)`");
         }
         let mut c = if self.is("new") {
             self.new_expr()?
@@ -2500,6 +2562,37 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Num(v) => ExprKind::Num(v),
             Tok::BigInt(d) => ExprKind::Intrinsic("bigint", vec![Expr { kind: ExprKind::Str(d), pos }]),
             Tok::Str(s) => ExprKind::Str(s),
+            // `import.meta`, a module's (see `module::import_meta`).
+            Tok::Keyword("import") if self.eat(".") => {
+                if !self.is_word("meta") {
+                    return self.err("expected `meta` after `import.`");
+                }
+                self.advance();
+                let Some(id) = self.module else {
+                    return self.err("`import.meta` outside a module");
+                };
+                ExprKind::Intrinsic("import_meta", vec![Expr { kind: ExprKind::Num(id as f64), pos }])
+            }
+            // `import(specifier, options)`: a promise of the module's
+            // namespace (see `module::dynamic_import`), from this module's
+            // (or the script's: -1).
+            Tok::Keyword("import") if self.eat("(") => {
+                if self.is(")") {
+                    return self.err("`import()` without a specifier");
+                }
+                let mut args = vec![self.assignment(false)?];
+                if self.eat(",") && !self.is(")") {
+                    args.push(self.assignment(false)?);
+                    self.eat(",");
+                }
+                self.expect(")")?;
+                if args.len() < 2 {
+                    let zero = expr(self.arena, Expr { kind: ExprKind::Num(0.0), pos });
+                    args.push(Expr { kind: ExprKind::Unary(UnOp::Void, zero), pos });
+                }
+                args.push(Expr { kind: ExprKind::Num(self.module.unwrap_or(-1) as f64), pos });
+                ExprKind::Intrinsic("dynamic_import", args)
+            }
             Tok::Ident(s) if self.is("=>") && !self.toks[self.i].newline_before => {
                 ExprKind::Function(self.arrow(Some(s), pos)?)
             }
@@ -2763,9 +2856,12 @@ impl<'a> Parser<'_, 'a, '_> {
     /// generator knows from [`Program::lexicals`]).
     fn reference(&mut self, name: Name) -> ExprKind<'a> {
         if &*name == "arguments" {
-            // (An arrow's are the enclosing function's.)
+            // (An arrow's are the enclosing function's; a module has
+            // none: a global's.)
             let k = self.non_arrow();
-            self.functions[k].uses_arguments = true;
+            if !self.functions[k].module {
+                self.functions[k].uses_arguments = true;
+            }
         }
         match self.resolve(&name) {
             Some(r) => ExprKind::Ident(r),
@@ -2921,16 +3017,18 @@ impl<'a> Parser<'_, 'a, '_> {
         };
         let r = r.clone();
         let switch = frame.switch;
+        let frame_key = frame.key;
         self.lexicals.insert(
             r.clone(),
             Lexical {
                 original: name.clone(),
-                constant: kind == CONST,
-                hoisted: kind == BLOCK_FUNCTION || kind == CATCH,
+                constant: kind == CONST || kind == IMPORT,
+                hoisted: kind == BLOCK_FUNCTION || kind == CATCH || kind == IMPORT,
                 end,
                 func: self.current,
                 switch,
                 withs: self.withs.len(),
+                module_top: frame_key == MODULE_SCOPE,
             },
         );
         r
@@ -2995,7 +3093,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     continue;
                 }
                 seen.push(orig.clone());
-                let constant = self.table.decls.get(&frame.key).is_some_and(|ds| ds.iter().any(|(n, k)| n == orig && *k == CONST));
+                let constant = self.table.decls.get(&frame.key).is_some_and(|ds| ds.iter().any(|(n, k)| n == orig && (*k == CONST || *k == IMPORT)));
                 let kind = (if frame.catch { EVAL_CATCH } else if constant { EVAL_CONST } else { 0 }) | if outer { EVAL_OUTER } else { 0 };
                 out.push(Expr { kind: ExprKind::Str(orig.to_string()), pos });
                 out.push(Expr { kind: ExprKind::Ident(renamed.clone()), pos });
@@ -3532,6 +3630,7 @@ impl<'a> Parser<'_, 'a, '_> {
             ctor_var: None,
             free: None,
             fields: None,
+            module: false,
         });
         index
     }
@@ -3541,6 +3640,475 @@ impl<'a> Parser<'_, 'a, '_> {
     /// Whether the code being parsed is a class static block's own (not
     /// a function's in it, an arrow's either), but for a function
     /// expression's name, which is the function's.
+    // ---- Modules ----
+
+    /// A module's body, as the body of a function in the script (see
+    /// `ast::MODULE_FUNCTION`): strict, a generator the loader calls to
+    /// make the module's bindings (its functions, its other variables
+    /// uninitialized) and resumes to run it, async if it has a top-level
+    /// `await` (see `module`). Its parameters: the scope object, then the
+    /// holders of its imports (see `ast::Import`). The script's statement:
+    /// an expression of the function.
+    fn module_body(&mut self) -> R<Stmt<'a>> {
+        let pos = self.pos();
+        let index = self.functions.len();
+        self.functions.push(Function {
+            name: Some(MODULE_FUNCTION.into()),
+            params: Vec::new(),
+            body: Vec::new(),
+            parent: Some(0),
+            declaration: false,
+            binds_name: false,
+            uses_arguments: false,
+            pos,
+            params_pos: pos,
+            end: 0,
+            eager: true,
+            strict: true,
+            withs: Vec::new(),
+            arrow: false,
+            uses_this: false,
+            method: false,
+            length: 0,
+            rest: false,
+            param_stmts: 0,
+            binding: None,
+            annex_b: false,
+            class_kind: 0,
+            has_eval: false,
+            // (A generator once parsed: `yield` is no expression in it.
+            // Async while parsed: `await` is one at its top level.)
+            generator: false,
+            is_async: true,
+            uses_new_target: false,
+            hidden: Vec::new(),
+            text: None,
+            home: None,
+            ctor_var: None,
+            free: None,
+            fields: None,
+            module: true,
+        });
+        self.current = index;
+        self.push_vars(self.i);
+        self.push_scope(MODULE_SCOPE, false, true);
+        self.using_scopes.push(UsingScope { allowed: true, names: None, is_await: false });
+        let r = (|| {
+            let mut body = Vec::new();
+            while self.peek() != &Tok::Eof {
+                body.push(self.module_item()?);
+            }
+            Ok(body)
+        })();
+        let scope = self.using_scopes.pop().unwrap();
+        let r = r.and_then(|body| {
+            self.functions[index].body = body;
+            self.check_module(index)
+        });
+        self.frames.pop();
+        self.frames.pop();
+        self.current = 0;
+        r?;
+        let mut body = std::mem::take(&mut self.functions[index].body);
+        if let Some(names) = scope.names {
+            // (Its functions out of the `try`: made before it runs.)
+            let (mut fns, rest): (Vec<_>, Vec<_>) = body.into_iter().partition(|s| matches!(s.kind, StmtKind::Function(_)));
+            fns.extend(self.lower_using(rest, names, scope.is_await, pos));
+            body = fns;
+        }
+        let imports = self.info.imports.len();
+        let f = &mut self.functions[index];
+        f.body = body;
+        f.end = self.toks[self.i].pos;
+        f.params = std::iter::once(MODULE_ENV.into()).chain((0..imports).map(|k| format!("%imp{k}").into())).collect();
+        f.generator = true;
+        f.is_async = self.info.has_await;
+        Ok(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Function(index), pos }), pos })
+    }
+
+    /// Whether the code being parsed is a module's own (not a function's
+    /// in it).
+    fn module_top(&self) -> bool {
+        self.functions[self.current].module
+    }
+
+    /// An `await` at a module's top level: the module is async.
+    fn note_await(&mut self) {
+        if self.module_top() {
+            self.info.has_await = true;
+        }
+    }
+
+    /// A statement of a module's body: an import or export declaration, or
+    /// any other.
+    fn module_item(&mut self) -> R<Stmt<'a>> {
+        match self.peek() {
+            Tok::Keyword("import") if !matches!(self.peek_at(1), Tok::Punct("(" | ".")) => self.import_declaration(),
+            Tok::Keyword("export") => self.export_declaration(),
+            _ => self.statement(),
+        }
+    }
+
+    /// Whether the current token is contextual keyword `word` (as written:
+    /// not escaped).
+    fn is_word(&self, word: &str) -> bool {
+        matches!(self.peek(), Tok::Ident(n) if &**n == word) && !self.toks[self.i].escaped
+    }
+
+    fn expect_word(&mut self, word: &str) -> R<()> {
+        if !self.is_word(word) {
+            return self.err(format!("expected `{word}`"));
+        }
+        self.advance();
+        Ok(())
+    }
+
+    /// A ModuleExportName: an identifier name (a reserved word too) or a
+    /// string (well-formed Unicode).
+    fn module_export_name(&mut self) -> R<ExportName> {
+        match self.bump() {
+            Tok::Ident(n) => Ok(ExportName::Ident(n)),
+            Tok::Keyword(k) => Ok(ExportName::Reserved(k.into())),
+            Tok::Str(s) => {
+                if s.chars().any(lone_surrogate) {
+                    self.i -= 1;
+                    return self.err("an export name that isn't well-formed Unicode");
+                }
+                Ok(ExportName::Str(s))
+            }
+            _ => {
+                self.i -= 1;
+                self.err("expected a name")
+            }
+        }
+    }
+
+    /// A module specifier and its `with { … }` attributes: the module's
+    /// request (see `ModuleInfo::requests`).
+    fn module_request(&mut self) -> R<usize> {
+        if !matches!(self.peek(), Tok::Str(_)) {
+            return self.err("expected a module specifier");
+        }
+        let Tok::Str(spec) = self.bump() else { unreachable!() };
+        let mut ty = None;
+        if self.eat("with") {
+            self.expect("{")?;
+            let mut keys: Vec<String> = Vec::new();
+            while !self.eat("}") {
+                let key = match self.bump() {
+                    Tok::Ident(n) => n.to_string(),
+                    Tok::Keyword(k) => k.to_string(),
+                    Tok::Str(s) => s,
+                    _ => {
+                        self.i -= 1;
+                        return self.err("expected an attribute's key");
+                    }
+                };
+                self.expect(":")?;
+                let Tok::Str(value) = self.bump() else {
+                    self.i -= 1;
+                    return self.err("expected an attribute's value, a string");
+                };
+                if keys.contains(&key) {
+                    return self.err(format!("duplicate attribute `{key}`"));
+                }
+                if key == "type" {
+                    ty = Some(value);
+                }
+                keys.push(key);
+                if !self.eat(",") {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+        }
+        let spec: String = spec.chars().map(|c| if lone_surrogate(c) { '\u{FFFD}' } else { c }).collect();
+        let request = (spec, ty);
+        Ok(match self.info.requests.iter().position(|r| *r == request) {
+            Some(k) => k,
+            None => {
+                self.info.requests.push(request);
+                self.info.requests.len() - 1
+            }
+        })
+    }
+
+    /// `import …;`, past nothing: its bindings declared (see
+    /// [`Parser::import_binding`]); no statement of its own.
+    fn import_declaration(&mut self) -> R<Stmt<'a>> {
+        let pos = self.pos();
+        self.advance();
+        if matches!(self.peek(), Tok::Str(_)) {
+            self.module_request()?;
+            self.semicolon()?;
+            return Ok(Stmt { kind: StmtKind::Empty, pos });
+        }
+        // (The name imported, `None` for the namespace; the binding.)
+        let mut bindings: Vec<(Option<String>, Name)> = Vec::new();
+        let mut more = true;
+        if matches!(self.peek(), Tok::Ident(_)) && !self.is_word("from") || self.is_word("from") && self.peek_at(1) != &Tok::Punct("'") && matches!(self.peek_at(1), Tok::Punct(",") | Tok::Ident(_)) {
+            bindings.push((Some("default".into()), self.binding_ident()?));
+            more = self.eat(",");
+        }
+        if more {
+            if self.eat("*") {
+                self.expect_word("as")?;
+                bindings.push((None, self.binding_ident()?));
+            } else if self.eat("{") {
+                while !self.eat("}") {
+                    let name = self.module_export_name()?;
+                    let local = if self.is_word("as") {
+                        self.advance();
+                        self.binding_ident()?
+                    } else {
+                        let ExportName::Ident(n) = &name else {
+                            return self.err("expected `as` and a binding");
+                        };
+                        self.check_binding(n)?;
+                        n.clone()
+                    };
+                    bindings.push((Some(name.text()), local));
+                    if !self.eat(",") {
+                        self.expect("}")?;
+                        break;
+                    }
+                }
+            } else {
+                return self.err("expected `*` or `{`");
+            }
+        }
+        self.expect_word("from")?;
+        let request = self.module_request()?;
+        self.semicolon()?;
+        for (name, local) in bindings {
+            let local = self.declare(&local, IMPORT, 0);
+            let k = self.info.imports.len();
+            self.info.imports.push((request, name, local.clone()));
+            let original = self.lexicals.get(&local).map_or(local.clone(), |l| l.original.clone());
+            self.imports.insert(local, Import { original, index: k, holder: format!("%imp{k}").into(), prop: None });
+        }
+        Ok(Stmt { kind: StmtKind::Empty, pos })
+    }
+
+    /// Identifier `n` (just read) as a binding: not a reserved word (in
+    /// strict code), `eval` or `arguments`.
+    fn check_binding(&self, n: &Name) -> R<()> {
+        self.strict_word(n)?;
+        if is_reserved_word(n) || matches!(&**n, "eval" | "arguments") {
+            return Err(Error::new(self.toks[self.i - 1].pos as usize, format!("`{n}` as a binding")));
+        }
+        Ok(())
+    }
+
+    /// Export name `name` (an early error if exported already).
+    fn export_name(&mut self, name: &str, pos: Pos) -> R<()> {
+        if self.exported.iter().any(|n| n == name) {
+            return Err(Error::new(pos as usize, format!("`{name}` exported twice")));
+        }
+        self.exported.push(name.to_string());
+        Ok(())
+    }
+
+    /// A variable's name as written (a block-scoped one is renamed).
+    fn original_name(&self, n: &Name) -> String {
+        self.lexicals.get(n).map_or_else(|| n.to_string(), |l| l.original.to_string())
+    }
+
+    /// `export …`: a declaration's statement (its names exported), or none.
+    fn export_declaration(&mut self) -> R<Stmt<'a>> {
+        let pos = self.pos();
+        self.advance();
+        let empty = Stmt { kind: StmtKind::Empty, pos };
+        if self.eat("*") {
+            let name = if self.is_word("as") {
+                self.advance();
+                Some(self.module_export_name()?.text())
+            } else {
+                None
+            };
+            self.expect_word("from")?;
+            let request = self.module_request()?;
+            self.semicolon()?;
+            match name {
+                Some(n) => {
+                    self.export_name(&n, pos)?;
+                    self.info.indirect_exports.push((n, request, None));
+                }
+                None => self.info.star_exports.push(request),
+            }
+            return Ok(empty);
+        }
+        if self.eat("{") {
+            let mut specs = Vec::new();
+            while !self.eat("}") {
+                let at = self.pos();
+                let local = self.module_export_name()?;
+                let exported = if self.is_word("as") {
+                    self.advance();
+                    self.module_export_name()?.text()
+                } else {
+                    local.text()
+                };
+                specs.push((local, exported, at));
+                if !self.eat(",") {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+            if self.is_word("from") {
+                self.advance();
+                let request = self.module_request()?;
+                self.semicolon()?;
+                for (local, exported, at) in specs {
+                    self.export_name(&exported, at)?;
+                    self.info.indirect_exports.push((exported, request, Some(local.text())));
+                }
+            } else {
+                self.semicolon()?;
+                for (local, exported, at) in specs {
+                    // (A reference: no string, no reserved word.)
+                    let n = match local {
+                        ExportName::Ident(n)
+                            if !is_reserved_word(&n)
+                                && !matches!(
+                                    &*n,
+                                    "implements" | "interface" | "package" | "private" | "protected" | "public" | "static" | "await"
+                                ) =>
+                        {
+                            n
+                        }
+                        _ => return Err(Error::new(at as usize, "exported without `from`: not a variable's name".into())),
+                    };
+                    self.export_name(&exported, at)?;
+                    let local = self.resolve(&n).unwrap_or(n.clone());
+                    self.local_exports.push((exported, local, at));
+                    let _ = n;
+                }
+            }
+            return Ok(empty);
+        }
+        if self.eat("default") {
+            return self.export_default(pos);
+        }
+        let declaration = match self.peek().clone() {
+            Tok::Keyword("var" | "const" | "function" | "class") => true,
+            Tok::Ident(n) => self.let_ahead(&n) || self.async_function_ahead(&n),
+            _ => false,
+        };
+        if !declaration {
+            return self.err("expected a declaration, `default`, `*` or `{` after `export`");
+        }
+        let s = self.statement()?;
+        let names: Vec<Name> = match &s.kind {
+            StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone()).collect(),
+            StmtKind::Function(i) => {
+                let f = &self.functions[*i];
+                f.binding.clone().or(f.name.clone()).into_iter().collect()
+            }
+            _ => Vec::new(),
+        };
+        for n in names {
+            let exported = self.original_name(&n);
+            self.export_name(&exported, pos)?;
+            self.info.local_exports.push((exported, n.to_string()));
+        }
+        Ok(s)
+    }
+
+    /// `export default …`, past `default`: a function or class declaration
+    /// (anonymous ones bound to `default`, a name no code can write), or
+    /// an expression's value in a constant `default`.
+    fn export_default(&mut self, pos: Pos) -> R<Stmt<'a>> {
+        self.export_name("default", pos)?;
+        let start = self.pos();
+        let is_async = matches!(self.peek().clone(), Tok::Ident(n) if self.async_function_ahead(&n));
+        if self.is("function") || is_async {
+            let mut k = if is_async { 2 } else { 1 };
+            if self.peek_at(k) == &Tok::Punct("*") {
+                k += 1;
+            }
+            if matches!(self.peek_at(k), Tok::Ident(_)) {
+                let s = self.statement()?;
+                let StmtKind::Function(i) = s.kind else { unreachable!() };
+                let f = &self.functions[i];
+                let local = f.binding.clone().or(f.name.clone()).unwrap();
+                self.info.local_exports.push(("default".into(), local.to_string()));
+                return Ok(s);
+            }
+            if is_async {
+                self.advance();
+                self.pending_async = true;
+            }
+            self.advance();
+            let f = self.function(false, false, start)?;
+            let func = &mut self.functions[f];
+            func.name = Some("default".into());
+            func.declaration = true;
+            self.body_function(f);
+            self.info.local_exports.push(("default".into(), "default".into()));
+            return Ok(Stmt { kind: StmtKind::Function(f), pos });
+        }
+        if self.eat("class") {
+            let name = match self.peek() {
+                Tok::Ident(_) => Some(self.ident()?),
+                _ => None,
+            };
+            let c = self.class(name.clone(), start)?;
+            let end = self.pos();
+            let e = Expr { kind: ExprKind::Class(Box::new(c)), pos: start };
+            let default: Name = "default".into();
+            if name.is_none() {
+                self.infer_name(&e, &default);
+            }
+            let binding = self.declare(name.as_ref().unwrap_or(&default), LET, end);
+            self.info.local_exports.push(("default".into(), binding.to_string()));
+            return Ok(Stmt { kind: StmtKind::Lexical(false, vec![(binding, Some(e))]), pos });
+        }
+        let e = self.assignment(false)?;
+        self.semicolon()?;
+        let default: Name = "default".into();
+        self.infer_name(&e, &default);
+        let end = self.pos();
+        let binding = self.declare(&default, CONST, end);
+        self.info.local_exports.push(("default".into(), binding.to_string()));
+        Ok(Stmt { kind: StmtKind::Lexical(true, vec![(binding, Some(e))]), pos })
+    }
+
+    /// A module parsed (function `index`'s body): the early errors of its
+    /// declarations (its functions are lexical, as its `let`s: none may
+    /// share a name with another declaration), and its `export { x }`s,
+    /// each of a variable it declares (an import's re-exported).
+    fn check_module(&mut self, index: usize) -> R<()> {
+        let vars = var_declared_names(&self.functions, index);
+        let lexical: Vec<Name> = self.table.decls.get(&MODULE_SCOPE).map_or_else(Vec::new, |ds| ds.iter().map(|(n, _)| n.clone()).collect());
+        let mut fns: Vec<Name> = Vec::new();
+        for s in &self.functions[index].body {
+            if let StmtKind::Function(i) = &s.kind {
+                let f = &self.functions[*i];
+                let n = f.name.clone().unwrap();
+                if fns.contains(&n) || vars.contains(&n) || lexical.contains(&n) {
+                    return Err(Error::new(f.pos as usize, format!("`{n}` has already been declared")));
+                }
+                fns.push(n);
+            }
+        }
+        for (exported, local, at) in std::mem::take(&mut self.local_exports) {
+            let original: Name = self.original_name(&local).into();
+            if !vars.contains(&original) && !lexical.contains(&original) && !fns.contains(&original) {
+                return Err(Error::new(at as usize, format!("`{original}` exported but not declared")));
+            }
+            match self.imports.get(&local) {
+                Some(imp) => match &self.info.imports[imp.index] {
+                    (request, Some(name), _) => self.info.indirect_exports.push((exported, *request, Some(name.clone()))),
+                    // (A namespace's: re-exported as `export * as x` is.)
+                    (request, None, _) => self.info.indirect_exports.push((exported, *request, None)),
+                },
+                None => self.info.local_exports.push((exported, local.to_string())),
+            }
+        }
+        Ok(())
+    }
+
     fn in_static_block(&self) -> bool {
         !self.naming_function && self.static_blocks.contains(&self.current)
     }
@@ -3575,6 +4143,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 func: self.current,
                 switch: false,
                 withs: 0,
+                module_top: false,
             },
         );
     }
@@ -3641,6 +4210,7 @@ impl<'a> Parser<'_, 'a, '_> {
             ctor_var: Some(home_static.clone()),
             free: None,
             fields: None,
+            module: false,
         });
         index
     }
@@ -3758,7 +4328,22 @@ fn rename_pattern(p: &mut Pattern, map: &[(Name, Name)]) {
 /// Function `f`'s `var`-scoped names: its parameters, `var`s, the
 /// functions declared in it, `arguments`, its own name.
 fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
-    fn walk(s: &Stmt, fs: &[Function], out: &mut Vec<Name>) {
+    let mut out = var_names_of(fs, f, true);
+    let func = &fs[f];
+    if !func.arrow {
+        out.push("arguments".into());
+    }
+    if func.binds_name {
+        out.extend(func.name.clone());
+    }
+    out
+}
+
+/// Function `f`'s parameters and `var`s, and (`functions`) the functions
+/// declared in it.
+fn var_names_of(fs: &[Function], f: usize, functions: bool) -> Vec<Name> {
+    fn walk(s: &Stmt, fs: &[Function], out: &mut Vec<Name>, functions: bool) {
+        let walk = |s: &Stmt, out: &mut Vec<Name>| walk(s, fs, out, functions);
         match &s.kind {
             StmtKind::Var(ds)
             | StmtKind::For {
@@ -3779,14 +4364,14 @@ fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
                 },
                 ..
             } => out.push(name.clone()),
-            StmtKind::Function(i) => out.extend(fs[*i].name.clone()),
+            StmtKind::Function(i) if functions => out.extend(fs[*i].name.clone()),
             _ => {}
         }
         match &s.kind {
             StmtKind::If(_, a, b) => {
-                walk(a, fs, out);
+                walk(a, out);
                 if let Some(b) = b {
-                    walk(b, fs, out);
+                    walk(b, out);
                 }
             }
             StmtKind::For { body, .. }
@@ -3795,26 +4380,50 @@ fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
             | StmtKind::With(_, _, body)
-            | StmtKind::Labeled(_, body) => walk(body, fs, out),
-            StmtKind::Block(b) => b.iter().for_each(|s| walk(s, fs, out)),
-            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| walk(s, fs, out)),
+            | StmtKind::Labeled(_, body) => walk(body, out),
+            StmtKind::Block(b) => b.iter().for_each(|s| walk(s, out)),
+            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| walk(s, out)),
             StmtKind::Try(b, c, fin) => b
                 .iter()
                 .chain(c.iter().flat_map(|(_, c)| c))
                 .chain(fin.iter().flatten())
-                .for_each(|s| walk(s, fs, out)),
+                .for_each(|s| walk(s, out)),
             _ => {}
         }
     }
     let func = &fs[f];
     let mut out: Vec<Name> = func.params.to_vec();
-    func.body.iter().for_each(|s| walk(s, fs, &mut out));
-    if !func.arrow {
-        out.push("arguments".into());
+    func.body.iter().for_each(|s| walk(s, fs, &mut out, functions));
+    out
+}
+
+/// A ModuleExportName (see `Parser::module_export_name`).
+enum ExportName {
+    Ident(Name),
+    Reserved(Name),
+    Str(String),
+}
+
+impl ExportName {
+    fn text(&self) -> String {
+        match self {
+            ExportName::Ident(n) | ExportName::Reserved(n) => n.to_string(),
+            ExportName::Str(s) => s.clone(),
+        }
     }
-    if func.binds_name {
-        out.extend(func.name.clone());
-    }
+}
+
+/// Whether `c` stands for a lone surrogate (see `lex::LONE_SURROGATES`).
+fn lone_surrogate(c: char) -> bool {
+    (super::lex::LONE_SURROGATES..super::lex::LONE_SURROGATES + 0x800).contains(&(c as u32))
+}
+
+/// Function `f`'s `var`s (not its parameters, nor the functions declared
+/// in it).
+fn var_declared_names(fs: &[Function], f: usize) -> Vec<Name> {
+    let mut out = var_names_of(fs, f, false);
+    let params = fs[f].params.len();
+    out.drain(..params);
     out
 }
 
@@ -4023,7 +4632,7 @@ mod tests {
 
     #[test]
     fn reports_errors() {
-        assert!(error("import x from \"y\";").contains("not supported"));
+        assert!(error("import x from \"y\";").contains("not at a module's top level"));
         assert!(error("f(").contains("end of input"));
         assert!(error("1 = 2").contains("assignment target"));
         assert!(error("return 1").contains("outside a function"));

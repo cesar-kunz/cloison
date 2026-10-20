@@ -3156,7 +3156,12 @@ impl Vm {
         }
         if unsafe { (*o).flags } & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
             let d = crate::props::Desc { value: Some(value), ..Default::default() };
-            return self.define_array_length(o, &d).map(|_| ());
+            // (Short of what it was set to: a non-configurable element
+            // stops it, a TypeError in strict code.)
+            if !self.define_array_length(o, &d)? {
+                self.store_failed = true;
+            }
+            return Ok(());
         }
         let n = d as usize;
         if n > MAX_ELEMENTS {

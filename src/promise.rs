@@ -585,9 +585,8 @@ fn promise_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(p)
 }
 
-/// SpeciesConstructor(o, %Promise%): `o.constructor`, or `Promise` if
-/// that is undefined. (No symbols: `C[@@species]` is `C` for `Promise`
-/// and what inherits from it, undefined for anything else.)
+/// SpeciesConstructor(o, %Promise%): `o.constructor[Symbol.species]`, or
+/// `Promise` if either is undefined (or the species null).
 fn species_constructor(vm: &mut Vm, o: Value) -> Result<Value> {
     let a_constructor = vm.intern("constructor");
     let c = vm.get(o, a_constructor)?;
@@ -598,17 +597,14 @@ fn species_constructor(vm: &mut Vm, o: Value) -> Result<Value> {
     if !is_object(c) {
         return Err(Error::type_error("The .constructor property is not an object"));
     }
-    let mut k = as_object(c);
-    loop {
-        if k == root(vm, Root::Constructor) {
-            return Ok(c);
-        }
-        let proto = unsafe { (*(*k).shape).proto };
-        if !proto.is_cell() {
-            return Ok(intrinsic);
-        }
-        k = as_object(proto);
+    let s = vm.get(c, vm.a_sym_species)?;
+    if s.is_undefined() || s.is_null() {
+        return Ok(intrinsic);
     }
+    if crate::intrinsics::is_constructor(s) {
+        return Ok(s);
+    }
+    Err(Error::type_error("object.constructor[Symbol.species] is not a constructor"))
 }
 
 // ---- The prototype ----

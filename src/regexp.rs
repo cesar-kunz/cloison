@@ -102,6 +102,85 @@ enum Node {
     Repeat(Box<Node>, u32, u32, bool, std::ops::Range<usize>),
 }
 
+/// `u` mode's lone surrogates in `n`, where the input is code points: one,
+/// as a character or a class's member, matches only alone, not half of a
+/// pair (a lead not followed by a trail, a trail not preceded by a lead).
+/// (`.` and negated classes match a pair whole already: see `atom`.)
+fn code_points(n: Node) -> Node {
+    let rec = |b: Box<Node>| Box::new(code_points(*b));
+    match n {
+        Node::Char(c @ 0xD800..=0xDBFF) => Node::Seq(vec![Node::Char(c), not_followed_by_trail()]),
+        Node::Char(c @ 0xDC00..=0xDFFF) => Node::Seq(vec![not_preceded_by_lead(), Node::Char(c)]),
+        Node::Class(r, false) if r.iter().any(|&(a, b)| a <= TRAILS.1 && b >= LEADS.0) => unit_class(&r),
+        Node::Group(b, g) => Node::Group(rec(b), g),
+        Node::Look(b, pos, behind) => Node::Look(rec(b), pos, behind),
+        Node::Alt(v) => Node::Alt(v.into_iter().map(code_points).collect()),
+        // (A lead then a trail, `\ud83d\ude00`, a surrogate pair's classes,
+        // is a pair's code point.)
+        Node::Seq(v) => {
+            let mut out = Vec::with_capacity(v.len());
+            let mut it = v.into_iter().peekable();
+            while let Some(n) = it.next() {
+                let lead = |n: &Node| match n {
+                    Node::Char(c) => (LEADS.0..=LEADS.1).contains(c),
+                    Node::Class(r, false) => r.iter().all(|&(a, b)| a >= LEADS.0 && b <= LEADS.1),
+                    _ => false,
+                };
+                let trail = |n: &Node| match n {
+                    Node::Char(c) => (TRAILS.0..=TRAILS.1).contains(c),
+                    Node::Class(r, false) => r.iter().all(|&(a, b)| a >= TRAILS.0 && b <= TRAILS.1),
+                    _ => false,
+                };
+                if lead(&n) && it.peek().is_some_and(trail) {
+                    out.push(n);
+                    out.push(it.next().unwrap());
+                    continue;
+                }
+                out.push(code_points(n));
+            }
+            Node::Seq(out)
+        }
+        Node::Repeat(b, min, max, greedy, gs) => Node::Repeat(rec(b), min, max, greedy, gs),
+        n => n,
+    }
+}
+
+const LEADS: (u16, u16) = (0xD800, 0xDBFF);
+const TRAILS: (u16, u16) = (0xDC00, 0xDFFF);
+
+fn not_followed_by_trail() -> Node {
+    Node::Look(Box::new(Node::Class(vec![TRAILS], false)), false, false)
+}
+
+fn not_preceded_by_lead() -> Node {
+    Node::Look(Box::new(Node::Class(vec![LEADS], false)), false, true)
+}
+
+/// A class of the units in `r` in `u` mode: its surrogates alone only (see
+/// [`code_points`]).
+fn unit_class(r: &[(u16, u16)]) -> Node {
+    let part = |(lo, hi): (u16, u16)| -> Vec<(u16, u16)> {
+        r.iter().filter_map(|&(a, b)| (a.max(lo) <= b.min(hi)).then(|| (a.max(lo), b.min(hi)))).collect()
+    };
+    let (leads, trails) = (part(LEADS), part(TRAILS));
+    let others: Vec<(u16, u16)> = r
+        .iter()
+        .flat_map(|&(a, b)| [(a, b.min(LEADS.0 - 1)), (a.max(TRAILS.1 + 1), b)])
+        .filter(|&(x, y)| x <= y && (y < LEADS.0 || x > TRAILS.1))
+        .collect();
+    let mut alts = Vec::new();
+    if !others.is_empty() {
+        alts.push(Node::Class(others, false));
+    }
+    if !leads.is_empty() {
+        alts.push(Node::Seq(vec![Node::Class(leads, false), not_followed_by_trail()]));
+    }
+    if !trails.is_empty() {
+        alts.push(Node::Seq(vec![not_preceded_by_lead(), Node::Class(trails, false)]));
+    }
+    Node::Alt(alts)
+}
+
 impl Regex {
     /// Whether `pattern` with `flags` is a valid regular expression (a
     /// literal's early error), as [`Regex::new`] would find, without
@@ -153,6 +232,7 @@ impl Regex {
     /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
         let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all]) = Regex::parse(pattern, flags)?;
+        let node = if unicode { code_points(node) } else { node };
         let mut re = Regex {
             node,
             groups,

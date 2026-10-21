@@ -209,7 +209,9 @@ impl Parser<'_> {
             .into_iter()
             .map(|s| match s.len() {
                 0 => Node::Empty,
-                _ => Node::Seq(s.into_iter().map(|c| char_node(char::from_u32(c).unwrap_or('\u{FFFD}'))).collect()),
+                // (A lone surrogate as its code unit, matching alone: see
+                // `code_points`.)
+                _ => Node::Seq(s.into_iter().map(|c| char::from_u32(c).map_or(Node::Char(c as u16), char_node)).collect()),
             })
             .collect();
         if !set.cps.is_empty() || alts.is_empty() {

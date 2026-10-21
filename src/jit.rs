@@ -16584,7 +16584,115 @@ mod tests {
         }
     }
 
-    /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's    /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's
+    /// The x86-64 code the JIT assembles itself (runtime-call wrappers,
+    /// `cloison_rt_enter`'s, direct calls): it decodes, its branches land
+    /// on its instructions, every call is made with rsp aligned to 16
+    /// (entered with rsp ≡ 8, as from a call), every path reaches an
+    /// instruction with one stack depth, and it returns, or reaches the
+    /// code that follows it (`next`), with the stack as on entry.
+    #[cfg(target_arch = "x86_64")]
+    fn check_x86_stack(code: &[u8], next: Option<usize>) -> Result<(), String> {
+        use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic, OpKind, Register};
+        let mut d = Decoder::with_ip(64, code, 0, DecoderOptions::NONE);
+        let insns: Vec<_> = std::iter::from_fn(|| d.can_decode().then(|| d.decode())).collect();
+        let at = |ip: u64| insns.binary_search_by_key(&ip, |i| i.ip()).ok();
+        // (instruction, bytes pushed since entry) to visit.
+        let mut work = vec![(0usize, 0i64)];
+        let mut depth: Vec<Option<i64>> = vec![None; insns.len()];
+        while let Some((k, pushed)) = work.pop() {
+            let i = &insns[k];
+            if i.is_invalid() {
+                return Err(format!("no instruction at {:#x}", i.ip()));
+            }
+            match depth[k] {
+                Some(p) if p == pushed => continue,
+                Some(p) => return Err(format!("{:#x} reached with {p} and {pushed} bytes pushed", i.ip())),
+                None => depth[k] = Some(pushed),
+            }
+            let mut after = pushed;
+            if matches!(i.mnemonic(), Mnemonic::Sub | Mnemonic::Add)
+                && i.op0_register() == Register::RSP
+                && matches!(i.op1_kind(), OpKind::Immediate8to64 | OpKind::Immediate32to64)
+            {
+                let n = i.immediate(1) as i64;
+                after += if i.mnemonic() == Mnemonic::Sub { n } else { -n };
+            }
+            let flow = i.flow_control();
+            match flow {
+                FlowControl::Call | FlowControl::IndirectCall => {
+                    if pushed % 16 != 8 {
+                        return Err(format!("call at {:#x} with rsp unaligned ({pushed} pushed)", i.ip()));
+                    }
+                }
+                FlowControl::Return => {
+                    if pushed != 0 {
+                        return Err(format!("ret at {:#x} with {pushed} bytes pushed", i.ip()));
+                    }
+                    continue;
+                }
+                _ => after -= i.stack_pointer_increment() as i64,
+            }
+            let mut to = Vec::new();
+            if matches!(flow, FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch) {
+                to.push(i.near_branch_target());
+            }
+            if flow != FlowControl::UnconditionalBranch {
+                to.push(i.next_ip());
+            }
+            for t in to {
+                if Some(t as usize) == next {
+                    if after != 0 {
+                        return Err(format!("{:#x} leaves with {after} bytes pushed", i.ip()));
+                    }
+                } else if let Some(j) = at(t) {
+                    work.push((j, after));
+                } else {
+                    return Err(format!("{:#x} goes to {t:#x}, no instruction", i.ip()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// [`check_x86_stack`] for every set of registers the code may save.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn assembled_x86_code_decodes_and_keeps_the_stack() {
+        let gpr_slots: Vec<u8> = (0..6).filter_map(arch::caller_saved_gpr_slot).collect();
+        let xmms: Vec<u8> = (0..8).collect();
+        let subset = |all: &[u8], m: u32| -> Vec<u8> {
+            all.iter().enumerate().filter(|(k, _)| m >> k & 1 != 0).map(|(_, &r)| r).collect()
+        };
+        let (enter, direct) = (EnterConsts::new(), DirectConsts::new());
+        for gm in 0..1 << gpr_slots.len() {
+            for fm in 0..1 << xmms.len() {
+                let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&xmms, fm));
+                let what = format!("gprs {gprs:?}, fprs {fprs:?}");
+                let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs);
+                check_x86_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
+                let w = arch::enter_wrapper(&gprs, &fprs, &enter);
+                check_x86_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
+                for f_off in [None, Some(0x40)] {
+                    // The hot part, a gap, the cold part, linked as placed.
+                    let call = arch::direct_call(&gprs, &fprs, 0x1234_5678, f_off, 0x100, &direct);
+                    let cold = call.hot.len() + 16;
+                    let mut code = call.hot.clone();
+                    code.resize(cold, 0xCC);
+                    code.extend(&call.cold);
+                    for &(f, to) in &call.hot_to_cold {
+                        arch::link_raw(&mut code, f, cold + to);
+                    }
+                    for &(f, to) in &call.cold_to_hot {
+                        arch::link_raw(&mut code, cold + f, to);
+                    }
+                    check_x86_stack(&code, Some(call.hot.len()))
+                        .unwrap_or_else(|e| panic!("direct call, {what}, f_off {f_off:?}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's
     /// lookup and copy, including (on arm64) those rebuilt from a family
     /// template by patching register fields.
     #[test]

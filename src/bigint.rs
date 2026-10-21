@@ -673,6 +673,10 @@ pub(crate) fn binary(op: BinOp, a: Value, b: Value) -> Value {
             let n = if y.mag.len() > 1 { i64::MAX / 2 } else { y.mag.first().copied().unwrap_or(0) as i64 };
             let n = if y.neg { -n } else { n };
             let n = if op == BinOp::Sar { -n } else { n };
+            // (0n shifted any way is 0n: no size to exceed.)
+            if x.is_zero() {
+                return new_bigint(vm(), Big::zero());
+            }
             if n > (1 << 30) {
                 throw(Error::range_error("Maximum BigInt size exceeded"));
                 return Value::UNDEFINED;

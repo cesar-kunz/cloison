@@ -7797,3 +7797,12 @@ r.join();
 "#;
     assert_eq!(value(src), "NaN,1,1,SyntaxError,2");
 }
+
+/// `0n` shifted by any count is `0n`, without a size to exceed.
+#[test]
+fn shifting_zero_n_by_a_huge_count_is_zero_n() {
+    assert_eq!(
+        value("[0n << 999999999999n, 0n >> -999999999999n, 0n << -5n, 5n << 2n, -5n >> 1n].join()"),
+        "0,0,0,20,-3"
+    );
+}

@@ -79,14 +79,15 @@ for e in ("javascriptcore", "spidermonkey", "quickjs"):
 names = {"cloison": "cloison", "V8": "V8", "javascriptcore": "JSC", "spidermonkey": "SpiderMonkey", "quickjs": "QuickJS"}
 
 def tree_rss(pid):
-    """The resident KiB of `pid` and its descendants (0 once gone)."""
+    """The resident KiB of `pid`'s descendants (0 once gone)."""
     kb, todo = 0, [pid]
     while todo:
         p = todo.pop()
         try:
-            for l in open(f"/proc/{p}/status"):
-                if l.startswith("VmRSS:"):
-                    kb += int(l.split()[1])
+            if p != pid:
+                for l in open(f"/proc/{p}/status"):
+                    if l.startswith("VmRSS:"):
+                        kb += int(l.split()[1])
             for c in glob.glob(f"/proc/{p}/task/*/children"):
                 todo += map(int, open(c).read().split())
         except (OSError, ValueError):
@@ -98,13 +99,14 @@ def run(job):
     f = os.path.abspath(f"target/octane/{b}-run.js") if b != "<empty>" else os.path.join(tmp, "empty.js")
     argv, env = engines[e](f)
     out, err = tempfile.TemporaryFile("w+"), tempfile.TemporaryFile("w+")
+    # The peak from `time`: a child of this process would count the
+    # memory it was forked with, Python's, before its exec.
+    peak_file = os.path.join(tmp, f"peak-{e}-{b}-{job[2]}")
     t0 = time.monotonic()
-    p = subprocess.Popen(argv, stdout=out, stderr=err, env={**os.environ, **env})
-    samples, status, usage = [], None, None
-    while True:
-        pid, status, usage = os.wait4(p.pid, os.WNOHANG)
-        if pid:
-            break
+    p = subprocess.Popen(["/usr/bin/time", "-f", "%M", "-o", peak_file] + argv, stdout=out, stderr=err,
+                         env={**os.environ, **env})
+    samples = []
+    while p.poll() is None:
         samples.append(tree_rss(p.pid))
         if time.monotonic() - t0 > 1800:
             p.kill()
@@ -112,9 +114,9 @@ def run(job):
     s = time.monotonic() - t0
     out.seek(0); err.seek(0)
     stdout, stderr = out.read(), err.read()
-    # (wait4's peak covers the children the process waited for: a shell
+    # (`time`'s peak covers the children the process waited for: a shell
     # wrapper's engine.)
-    peak = max([usage.ru_maxrss] + samples) / 1024
+    peak = max([int(open(peak_file).read().split()[-1])] + samples) / 1024
     m = {"s": s, "peak_mb": peak, "mean_mb": statistics.mean(samples) / 1024 if samples else peak,
          "ok": b == "<empty>" or any(l.strip() in ("1001", "1002") for l in stdout.splitlines())}
     if e == "cloison":
@@ -233,10 +235,12 @@ for b in benches:
     h, l = val("cloison", b, "heap_peak"), val("cloison", b, "live_peak")
     lines.append(f"| {b} | " + " | ".join(f"{v:.0f}" if v is not None and k in ("minors", "fulls") else fmt(v)
                                           for v, (k, _, _) in zip(row, gc_cols)) + f" | {fmt(h / l) if h and l else '-'} |")
-ratios = [val("cloison", b, "heap_peak") / val("cloison", b, "live_peak") for b in benches
-          if val("cloison", b, "heap_peak") and val("cloison", b, "live_peak")]
-if ratios:
-    lines.append(f"| **geomean** ({len(ratios)}) | " + " |" * len(gc_cols) + f" **{gm(ratios):.2f}** |")
+# (Over the benchmarks that keep at least a quarter of the nursery live:
+# below, the nursery is most of the heap's peak.)
+big = [b for b in benches if (val("cloison", b, "live_peak") or 0) >= 8 << 20 and val("cloison", b, "heap_peak")]
+if big:
+    g = gm([val("cloison", b, "heap_peak") / val("cloison", b, "live_peak") for b in big])
+    lines.append(f"| **geomean** ({', '.join(big)}) | " + " |" * len(gc_cols) + f" **{g:.2f}** |")
 for b in benches:
     tsv[benches.index(b) + 1] += "\t" + "\t".join("-" if (v := val("cloison", b, k)) is None else f"{v:.6g}" for k, _, _ in gc_cols)
 tsv[0] += "\t" + "\t".join(f"cloison {k}" for k, _, _ in gc_cols)

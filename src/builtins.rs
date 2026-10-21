@@ -539,7 +539,9 @@ fn map_case(u: &[u16], f: fn(&str) -> String) -> Vec<u16> {
 }
 
 /// JavaScript's whitespace and line terminators.
-fn is_space(c: u16) -> bool {
+/// ECMAScript's WhiteSpace or LineTerminator (StrWhiteSpaceChar): not
+/// `char::is_whitespace`, which has U+0085 and lacks U+FEFF.
+pub(crate) fn is_space(c: u16) -> bool {
     matches!(
         c,
         0x09..=0x0D | 0x20 | 0xA0 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x2029 | 0x202F | 0x205F

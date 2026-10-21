@@ -1318,7 +1318,7 @@ mod arch {
             };
             d.push(ldr(10, 9, k.table)); // ldr x10, [x9, #table]
             back(&mut d, 0xB400_000A, slow); // cbz x10, slow
-            assert!(super::DISPATCH == 1024);
+            const { assert!(super::DISPATCH == 1024) };
             d.push(0xD340_0000 | 4 << 16 | 13 << 10 | 16 << 5 | 17); // ubfx x17, x16, #4, #10
             d.push(0xF860_7800 | 17 << 16 | 10 << 5 | 9); // ldr x9, [x10, x17, lsl #3]
             back(&mut d, 0xB400_0009, reslow); // cbz x9, reslow
@@ -16090,14 +16090,13 @@ extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
     )
 }
 
-/// The arm64 `cloison_rt_enter`, with the too-deep branch and a stub for it
-/// as the OS needs: Linux branches to `cloison_rt_call` directly (ELF
-/// `CONDBR19`); Mach-O can't relocate a conditional branch to another
-/// function, so there it goes through a local `b` placed after the cold
-/// tail. The hot path is the same on both.
+/// The arm64 `cloison_rt_enter`. The too-deep branch goes to `cloison_rt_call`
+/// through a local `b` placed after the cold tail: a conditional branch
+/// reaches 1 MiB, which the linker doesn't extend (ELF `CONDBR19`; Mach-O
+/// can't relocate one to another function at all), and the two functions
+/// can be further apart (they were, in the library's test binary); a `b`
+/// reaches 128 MiB, and the linker adds a veneer past that.
 #[cfg(target_arch = "aarch64")]
-macro_rules! cloison_rt_enter_arm64 {
-    ($too_deep:literal $(, $stub:literal)*) => {
 #[unsafe(naked)]
 extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
     core::arch::naked_asm!(
@@ -16106,7 +16105,7 @@ extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
         "ldr x9, [x9]",
         "mov x10, sp",
         "cmp x10, x9",
-        $too_deep,
+        "b.lo 4f",
         "stp x29, x30, [sp, #-192]!",
         "mov x29, sp",
         "stp x19, x20, [sp, #16]",
@@ -16155,7 +16154,8 @@ extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
         "ldp x0, x1, [sp, #160]",
         "bl {exit}",
         "b 2b",
-        $($stub,)*
+        "4:",
+        "b {call}",
         limit = const std::mem::offset_of!(CallSite, native_limit),
         call = sym cloison_rt_call,
         flags = const 8 * interp::FLAGS,
@@ -16165,12 +16165,6 @@ extern "C" fn cloison_rt_enter(regs: Value, site: Value) -> Value {
         exit = sym cloison_direct_exit,
     )
 }
-    };
-}
-#[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
-cloison_rt_enter_arm64!("b.lo {call}");
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-cloison_rt_enter_arm64!("b.lo 4f", "4:", "b {call}");
 
 /// What the inline version of [`cloison_rt_enter`] in a region's wrapper for
 /// it (`arch::enter_wrapper`) needs: `CallSite` offsets, constants and
@@ -16686,6 +16680,197 @@ mod tests {
                         arch::link_raw(&mut code, cold + f, to);
                     }
                     check_x86_stack(&code, Some(call.hot.len()))
+                        .unwrap_or_else(|e| panic!("direct call, {what}, f_off {f_off:?}: {e}"));
+                }
+            }
+        }
+    }
+
+    /// One instruction of the arm64 code the JIT assembles itself, as
+    /// [`check_arm64_stack`] needs it: only the forms that code uses
+    /// decode, so a mistyped encoding is no instruction.
+    #[cfg(target_arch = "aarch64")]
+    #[derive(Default)]
+    struct A64 {
+        /// `sp` after it, by this much (bytes, positive: popped).
+        sp: i64,
+        /// It accesses memory at `sp` (before any writeback).
+        sp_access: bool,
+        /// A conditional branch's or `cbz`'s target, or a `b`'s.
+        branch: Option<i64>,
+        /// Nothing follows it: `b`, `ret`.
+        ends: bool,
+        call: bool,
+        ret: bool,
+        /// `stp x29, x30, [sp, #-16]!` (saves the link register) or `ldp
+        /// x29, x30, [sp], #16` (restores it).
+        lr: Option<bool>,
+        /// An `ldr` (literal)'s target.
+        literal: Option<i64>,
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn decode_a64(i: u32) -> Option<A64> {
+        let sext = |v: u32, bits: u32| ((v as i64) << (64 - bits)) >> (64 - bits);
+        let rn = i >> 5 & 31;
+        let rd = i & 31;
+        let on_sp = rn == 31;
+        let mut d = A64::default();
+        match i {
+            0xA9BF_7BFD => (d.sp, d.sp_access, d.lr) = (-16, true, Some(true)),
+            0xA8C1_7BFD => (d.sp, d.sp_access, d.lr) = (16, true, Some(false)),
+            0xD65F_03C0 => (d.ends, d.ret) = (true, true),
+            _ if i & 0xFFFF_FC1F == 0xD63F_0000 => d.call = true, // blr
+            _ if i & 0xFC00_0000 == 0x1400_0000 => (d.branch, d.ends) = (Some(4 * sext(i & 0x3FF_FFFF, 26)), true),
+            _ if i & 0xFF00_0010 == 0x5400_0000 || i & 0xFF00_0000 == 0xB400_0000 => {
+                d.branch = Some(4 * sext(i >> 5 & 0x7_FFFF, 19)) // b.cond, cbz x
+            }
+            _ if i & 0xFF00_001F == 0x5800_0010 => d.literal = Some(4 * sext(i >> 5 & 0x7_FFFF, 19)), // ldr x16, lit
+            // add / sub (immediate), 64-bit, unshifted: sp when rd is.
+            _ if i & 0xFFC0_0000 == 0x9100_0000 || i & 0xFFC0_0000 == 0xD100_0000 => {
+                if rd == 31 {
+                    assert!(on_sp, "sp from another register");
+                    let n = (i >> 10 & 0xFFF) as i64;
+                    d.sp = if i >> 30 & 1 == 0 { n } else { -n };
+                }
+            }
+            // Loads and stores, unsigned offset: x, w, d; and pairs of x or d
+            // at a signed offset.
+            _ if [0xF900_0000, 0xF940_0000, 0xB900_0000, 0xB940_0000, 0xFD00_0000, 0xFD40_0000]
+                .contains(&(i & 0xFFC0_0000))
+                || [0xA900_0000, 0xA940_0000, 0x6D00_0000, 0x6D40_0000].contains(&(i & 0xFFC0_0000)) =>
+            {
+                d.sp_access = on_sp
+            }
+            // str x pre-index, ldr x post-index: sp by the offset.
+            _ if i & 0xFFE0_0C00 == 0xF800_0C00 || i & 0xFFE0_0C00 == 0xF840_0400 => {
+                assert!(on_sp, "writeback to another register");
+                (d.sp, d.sp_access) = (sext(i >> 12 & 0x1FF, 9), true)
+            }
+            // stur x (unscaled), ldr x (register offset).
+            _ if i & 0xFFE0_0C00 == 0xF800_0000 || i & 0xFFE0_FC00 == 0xF860_7800 => d.sp_access = on_sp,
+            // mov (orr, x or w), add / subs / adds (shifted register): no sp.
+            _ if i & 0xFFE0_FFE0 == 0xAA00_03E0
+                || i & 0xFFE0_FFE0 == 0x2A00_03E0
+                || i & 0xFF20_0000 == 0x8B00_0000
+                || i & 0xFF20_001F == 0xEB00_001F => {}
+            // cmn w (adds immediate), movz / movk x, movn w, ubfx x.
+            _ if i & 0xFF80_001F == 0x3100_001F
+                || i & 0xFF80_0000 == 0xD280_0000
+                || i & 0xFF80_0000 == 0xF280_0000
+                || i & 0xFF80_0000 == 0x1280_0000
+                || i & 0xFFC0_0000 == 0xD340_0000 => {}
+            _ => return None,
+        }
+        Some(d)
+    }
+
+    /// The arm64 code the JIT assembles itself (runtime-call wrappers,
+    /// `cloison_rt_enter`'s, direct calls), walked from its start: every
+    /// instruction reached decodes ([`decode_a64`]) and isn't a literal,
+    /// branches and literals stay in the code, `sp` is 16-byte aligned at
+    /// every access through it and every call (the hardware checks the
+    /// former), each instruction is reached with one `sp` and one state of
+    /// the link register, a call is made only while x29 and x30 are saved,
+    /// and it returns, or reaches the code that follows it (`next`), with
+    /// them restored and `sp` as on entry.
+    #[cfg(target_arch = "aarch64")]
+    fn check_arm64_stack(code: &[u8], next: Option<usize>) -> Result<(), String> {
+        let word = |at: usize| u32::from_le_bytes(code[at..at + 4].try_into().unwrap());
+        let mut literals = std::collections::HashSet::new();
+        let mut state: std::collections::HashMap<usize, (i64, bool)> = Default::default();
+        // (address, bytes pushed, link register saved) to visit.
+        let mut work = vec![(0usize, 0i64, false)];
+        while let Some((at, pushed, lr)) = work.pop() {
+            if Some(at) == next {
+                if pushed != 0 || lr {
+                    return Err(format!("falls through with {pushed} bytes pushed, lr saved: {lr}"));
+                }
+                continue;
+            }
+            if at + 4 > code.len() {
+                return Err(format!("runs off the code at {at:#x}"));
+            }
+            match state.insert(at, (pushed, lr)) {
+                Some(s) if s == (pushed, lr) => continue,
+                Some(s) => return Err(format!("{at:#x} reached as {s:?} and {:?}", (pushed, lr))),
+                None => {}
+            }
+            let i = word(at);
+            let d = decode_a64(i).ok_or_else(|| format!("{i:#010x} at {at:#x} is no instruction expected"))?;
+            if d.sp_access && pushed % 16 != 0 {
+                return Err(format!("{at:#x} accesses memory through an unaligned sp"));
+            }
+            if d.call && (pushed % 16 != 0 || !lr) {
+                return Err(format!("call at {at:#x} with {pushed} bytes pushed, lr saved: {lr}"));
+            }
+            if d.ret {
+                if pushed != 0 || lr {
+                    return Err(format!("ret at {at:#x} with {pushed} bytes pushed, lr saved: {lr}"));
+                }
+                continue;
+            }
+            if let Some(l) = d.literal {
+                let l = at as i64 + l;
+                if l < 0 || l as usize + 8 > code.len() {
+                    return Err(format!("literal of {at:#x} outside the code"));
+                }
+                literals.insert(l as usize);
+                literals.insert(l as usize + 4);
+            }
+            let (after, lr) = (pushed - d.sp, d.lr.unwrap_or(lr));
+            if let Some(b) = d.branch {
+                let t = at as i64 + b;
+                if t < 0 {
+                    return Err(format!("branch at {at:#x} before the code"));
+                }
+                work.push((t as usize, after, lr));
+            }
+            if !d.ends {
+                work.push((at + 4, after, lr));
+            }
+        }
+        if let Some(&l) = literals.iter().find(|l| state.contains_key(l)) {
+            return Err(format!("the literal at {l:#x} is executed"));
+        }
+        Ok(())
+    }
+
+    /// [`check_arm64_stack`] for every set of registers the code may save.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn assembled_arm64_code_decodes_and_keeps_the_stack() {
+        let gpr_slots: Vec<u8> = (0..12).filter_map(arch::caller_saved_gpr_slot).collect();
+        let fp_regs: Vec<u8> = (0..8).collect();
+        let subset = |all: &[u8], m: u32| -> Vec<u8> {
+            all.iter().enumerate().filter(|(k, _)| m >> k & 1 != 0).map(|(_, &r)| r).collect()
+        };
+        let (enter, direct) = (EnterConsts::new(), DirectConsts::new());
+        for gm in 0..1 << gpr_slots.len() {
+            for fm in 0..1 << fp_regs.len() {
+                let (gprs, fprs) = (subset(&gpr_slots, gm), subset(&fp_regs, fm));
+                let what = format!("gprs {gprs:?}, fprs {fprs:?}");
+                let w = arch::runtime_wrapper(0x1234_5678_9abc, &gprs, &fprs);
+                check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("runtime wrapper, {what}: {e}"));
+                let w = arch::enter_wrapper(&gprs, &fprs, &enter);
+                check_arm64_stack(&w, None).unwrap_or_else(|e| panic!("enter wrapper, {what}: {e}"));
+                // (Direct calls save the slot registers live after them, FP
+                // ones d1–d7.)
+                let fprs: Vec<u8> = fprs.into_iter().filter(|&r| r > 0).collect();
+                for f_off in [None, Some(0x40)] {
+                    // The hot part, a gap, the cold part, linked as placed.
+                    let call = arch::direct_call(&gprs, &fprs, 0x1234_5678, f_off, 0x100, &direct);
+                    let cold = call.hot.len() + 16;
+                    let mut code = call.hot.clone();
+                    code.resize(cold, 0);
+                    code.extend(&call.cold);
+                    for &(at, to) in &call.hot_to_cold {
+                        arch::link_raw(&mut code, at, cold + to);
+                    }
+                    for &(at, to) in &call.cold_to_hot {
+                        arch::link_raw(&mut code, cold + at, to);
+                    }
+                    check_arm64_stack(&code, Some(call.hot.len()))
                         .unwrap_or_else(|e| panic!("direct call, {what}, f_off {f_off:?}: {e}"));
                 }
             }

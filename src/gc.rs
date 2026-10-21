@@ -44,6 +44,11 @@ const NURSERY: usize = 32 << 20;
 /// last one, by this many times what it left marked less one, and at least
 /// [`FULL_MIN`].
 const GROWTH: usize = 2;
+/// A full marking collects shapes (`Vm::sweep_shapes`) once this many have
+/// been made since the last that did, and an eighth of the shapes there
+/// are: marking them costs every object traced a check (Splay, which makes
+/// few, spent 1.5% of its cycles on it in every marking).
+const SHAPE_SWEEP_MIN: usize = 256;
 const FULL_MIN: usize = 64 << 20;
 
 /// The collector's state, in the heap.
@@ -119,6 +124,9 @@ pub struct Gc {
     threads: usize,
     /// Bytes minor collections promoted since the last major one.
     promoted: usize,
+    /// The full marking under way, or the last, collects shapes (see
+    /// [`SHAPE_SWEEP_MIN`]).
+    pub(crate) shape_cycle: bool,
     /// Bytes the pauses of the current marking cycle before its final one
     /// marked with its color (the young cells they promoted): live, but
     /// not the final pause's or the marker's to count.
@@ -260,6 +268,14 @@ struct Mode {
     kind: Kind,
     /// Checks every reference it follows.
     check: bool,
+    /// Marks the shapes of the objects it traces (see
+    /// [`mark_object_shape`]): a full marking that collects shapes
+    /// (`Gc::shape_cycle`), and its start pause, which promotes young cells
+    /// made before it. Not the minor collections during the marking: the
+    /// cells they promote were made since it began, with shapes made since,
+    /// pinned, the VM's, or given out by `Vm::root_shape`, `Vm::ctor_root`
+    /// or `Vm::create_object`, all live.
+    shapes: bool,
 }
 
 /// Full markings so far, over every VM: a code found live is marked with
@@ -334,12 +350,11 @@ unsafe fn mark_function_code(p: usize, w: u64) {
 /// are kept by the object. (Not in [`trace`]: card scanning traces dead
 /// cells too.)
 #[inline(always)]
-unsafe fn mark_object_shape(v: &mut impl Visit, w: u64) {
+unsafe fn mark_object_shape(v: &mut impl Visit, w: u64, epoch: u32) {
     use std::sync::atomic::Ordering::Relaxed;
     if w & 1 != 0 {
         return;
     }
-    let epoch = code_epoch();
     let mut s = w as *const crate::object::Shape;
     unsafe {
         while !s.is_null() && (*s).mark.load(Relaxed) < epoch {
@@ -585,6 +600,7 @@ impl Marking<'_> {
         const RING: usize = 8;
         let mut ring = [(0usize, 0usize); RING];
         let (mut head, mut len) = (0, 0);
+        let epoch = code_epoch();
         unsafe {
             loop {
                 while len < RING {
@@ -611,8 +627,8 @@ impl Marking<'_> {
                 let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                 if from == 0 {
                     mark_function_code(p, w);
-                    if self.mode.kind != Kind::Minor {
-                        mark_object_shape(self, w);
+                    if self.mode.shapes {
+                        mark_object_shape(self, w, epoch);
                     }
                     let size = cell_size(p as *const u8);
                     *crate::heap::meta(p + size - GRANULE) |= END;
@@ -769,6 +785,7 @@ unsafe fn trace_shared(
     const RING: usize = 8;
     let mut ring = [0usize; RING];
     let (mut head, mut len) = (0, 0);
+    let epoch = code_epoch();
     unsafe {
         loop {
             loop {
@@ -788,8 +805,8 @@ unsafe fn trace_shared(
                     n += 1;
                     let w = *(p as *const u64);
                     mark_function_code(p, w);
-                    if mode.kind != Kind::Minor {
-                        mark_object_shape(&mut cm, w);
+                    if mode.shapes {
+                        mark_object_shape(&mut cm, w, epoch);
                     }
                     let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                     if slots > SLICE_SLOTS {
@@ -1060,6 +1077,8 @@ struct MarkerState {
     work: Vec<usize>,
     color: u8,
     heap: (usize, usize),
+    /// The marking collects shapes (see `Mode::shapes`).
+    shapes: bool,
     /// Marking (the mutator handed it work and hasn't paused it).
     run: bool,
     /// Tracing right now (with work of its own, off `work`).
@@ -1158,7 +1177,7 @@ fn marker_loop(sh: &Shared) {
     let mut stack = Vec::new();
     let mut shade = Vec::new();
     loop {
-        let (color, heap) = {
+        let (color, heap, shapes) = {
             let mut st = sh.state.lock().unwrap();
             loop {
                 if st.quit {
@@ -1195,13 +1214,14 @@ fn marker_loop(sh: &Shared) {
             }
             std::mem::swap(&mut stack, &mut st.work);
             st.busy = true;
-            (st.color, st.heap)
+            (st.color, st.heap, st.shapes)
         };
         let mut m = Marking {
             mode: Mode {
                 color,
                 kind: Kind::Old,
                 check: false,
+                shapes,
             },
             stack: &mut stack,
             shade: &mut shade,
@@ -1286,7 +1306,9 @@ impl Vm {
             self.heap.gc.code_at_start = CODE_BYTES.with(|c| c.get());
             // Compiled code may give an object a shape a cache holds now,
             // and the cache drop it before the final pause: they are live.
-            if kind == Collection::Start {
+            let made = self.shapes_made();
+            self.heap.gc.shape_cycle = made >= (self.shape_count() / 8).max(SHAPE_SWEEP_MIN);
+            if kind == Collection::Start && self.heap.gc.shape_cycle {
                 self.mark_cached_shapes();
             }
         } else if self.heap.gc.sweeping {
@@ -1307,6 +1329,7 @@ impl Vm {
                 Collection::Full | Collection::Final => Kind::Full,
             },
             check,
+            shapes: self.heap.gc.shape_cycle && !matches!(kind, Collection::Minor | Collection::MinorShade),
         };
         let (marked, freed);
         let mut times = [0f64; 4];
@@ -1370,7 +1393,11 @@ impl Vm {
                 self.heap.check_barriers();
             }
             if full {
-                self.mark_live_codes_and_shapes(&mut m, sp, regs);
+                if self.heap.gc.shape_cycle {
+                    self.mark_live_codes_and_shapes(&mut m, sp, regs);
+                } else {
+                    self.mark_live_codes(&mut m, sp, regs, &mut Vec::new());
+                }
             }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
@@ -1386,7 +1413,9 @@ impl Vm {
                 _ => self.heap.free_young(check),
             };
             if full {
-                self.sweep_shapes_after(color);
+                if self.heap.gc.shape_cycle {
+                    self.sweep_shapes_after(color);
+                }
                 self.condemn_codes();
             }
             times[3] = lap();
@@ -1477,6 +1506,7 @@ impl Vm {
                 let mut st = mk.shared.state.lock().unwrap();
                 st.color = color;
                 st.heap = range;
+                st.shapes = self.heap.gc.shape_cycle;
             }
             mk.resume(&mut shade, request);
         } else if self.heap.gc.sweeping
@@ -1702,15 +1732,16 @@ impl Vm {
         }
     }
 
-    /// At the start of a marking: mark the shapes the caches hold that
-    /// compiled code or the interpreter may give objects before the final
-    /// pause, even if the cache drops them by then: inline caches', the
-    /// megamorphic store table's and `push` caches' transitions, and
-    /// constructors' shapes. (What they take in later comes with a shape
-    /// given to an object, or made: see [`mark_live_codes_and_shapes`].
-    /// `CreateObject`'s root shape, an inline cache's `shape`, is made
-    /// again if it died: see `Vm::create_object`.) Shapes these hold are
-    /// live or zombies, whose memory stays.
+    /// At the start of a marking: mark the shapes the tables compiled code
+    /// reads hold, which it may give objects before the final pause even if
+    /// the table drops them by then: the megamorphic store table's and
+    /// `push` caches' transitions. (What they take in later comes with a
+    /// shape given to an object, or made: see
+    /// [`mark_live_codes_and_shapes`]. The interpreter takes inline
+    /// caches' transitions through `object::set_shape`, compiled code
+    /// those it embeds, pinned; `CreateObject`'s root shape, an inline
+    /// cache's `shape`, is made again if it died, see `Vm::create_object`.)
+    /// Shapes these hold are live or zombies, whose memory stays.
     fn mark_cached_shapes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let epoch = code_epoch();
@@ -1719,15 +1750,6 @@ impl Vm {
                 unsafe { (*s).mark.store(epoch, Relaxed) };
             }
         };
-        for code in self.codes() {
-            for ways in code.made_ics() {
-                for ic in unsafe { (*ways.get()).iter() } {
-                    mark(ic.new_shape);
-                }
-            }
-            mark(code.ctor_shape.get());
-            mark(code.ctor_result.get());
-        }
         for e in self.mega_store_entries() {
             mark(e.new_shape as *const crate::object::Shape);
         }
@@ -1747,6 +1769,7 @@ impl Vm {
     /// tracking of prototypes it didn't mark goes, and the shapes it didn't
     /// find live become zombies (see `Vm::sweep_shapes`).
     fn sweep_shapes_after(&mut self, color: u8) {
+        self.reset_shapes_made();
         let range = self.heap.cells_range();
         self.sweep_ctor_protos(|p| is_cell_in(range, p) && unsafe { *crate::heap::meta(p) } & COLOR == color);
         let from = self.heap.gc.codes_from;
@@ -1836,8 +1859,8 @@ impl Vm {
     }
 
     /// Mark what Rust structures refer to: code, compiled code, the VM's
-    /// tables (shapes are found live by marking: see
-    /// `mark_live_codes_and_shapes`).
+    /// tables, and shapes, unless the marking collects them (then they are
+    /// found live: see `mark_live_codes_and_shapes`).
     unsafe fn mark_structures(&mut self, m: &mut Marking) {
         unsafe {
             for i in 0..self.heap.gc.kept.len() {
@@ -1845,6 +1868,12 @@ impl Vm {
                 self.mark_interior(m, a);
             }
             self.roots_report(m, "kept");
+            // (A marking that doesn't collect shapes keeps them all.)
+            if !self.heap.gc.shape_cycle {
+                for s in self.shapes() {
+                    m.value(s.proto);
+                }
+            }
             // The other codes' references count once they are found
             // live (see `mark_live_codes`).
             for code in self.codes().filter(|c| c.pinned.get()) {
@@ -1876,9 +1905,10 @@ impl Vm {
             }
         }
         let from = self.heap.gc.codes_from;
+        let collecting = self.heap.gc.shape_cycle;
         let shape_live = |p: usize| unsafe {
             let w = *(p as *const u64);
-            if w & 1 == 0 {
+            if collecting && w & 1 == 0 {
                 let s = w as *const crate::object::Shape;
                 assert!(
                     (*s).pinned.get() || (*s).mark.load(std::sync::atomic::Ordering::Relaxed) >= from,
@@ -1942,8 +1972,9 @@ impl Vm {
                 e.payload(self.open_upvalues[i] as usize);
             }
             let from = self.heap.gc.codes_from;
+            let all = !self.heap.gc.shape_cycle;
             for s in self.shapes() {
-                if s.pinned.get() || s.mark.load(std::sync::atomic::Ordering::Relaxed) >= from {
+                if all || s.pinned.get() || s.mark.load(std::sync::atomic::Ordering::Relaxed) >= from {
                     e.value(s.proto);
                 }
             }

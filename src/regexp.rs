@@ -227,9 +227,10 @@ impl Parser<'_> {
         if neg {
             self.i += 1;
         }
-        // (Nested classes count as groups do: their parsing recurses.)
+        // (Nested classes count as groups do: their parsing recurses. So
+        // does the thread's stack, as the JS parser checks it.)
         self.depth += 1;
-        if self.depth > MAX_NESTING {
+        if self.depth > MAX_NESTING || crate::stack::low() {
             return Err(self.error("Regular expression too large"));
         }
         let contents = self.class_contents();
@@ -1299,7 +1300,7 @@ impl Parser<'_> {
                     (0, Some(g))
                 };
                 self.depth += 1;
-                if self.depth > MAX_NESTING {
+                if self.depth > MAX_NESTING || crate::stack::low() {
                     return Err(self.error("Regular expression too large"));
                 }
                 let inner = self.alternation()?;

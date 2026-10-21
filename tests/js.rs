@@ -7771,3 +7771,16 @@ var f = new Date(0); Object.defineProperty(f, Symbol.toPrimitive, { value: funct
 "#;
     assert_eq!(value(src), "42,0,8,5,9,3");
 }
+
+/// Deeply nested `v`-mode classes: a SyntaxError, not a native stack
+/// overflow.
+#[test]
+fn deeply_nested_unicode_set_classes_are_a_syntax_error() {
+    let src = r#"
+var r = [];
+try { new RegExp('['.repeat(10000) + 'a' + ']'.repeat(10000), 'v'); r.push('no error'); } catch (e) { r.push(e.name); }
+r.push(new RegExp('[[[a]]]', 'v').test('a'));
+r.join();
+"#;
+    assert_eq!(value(src), "SyntaxError,true");
+}

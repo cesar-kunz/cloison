@@ -225,7 +225,14 @@ impl Parser<'_> {
         if neg {
             self.i += 1;
         }
-        let (set, may) = self.class_contents()?;
+        // (Nested classes count as groups do: their parsing recurses.)
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            return Err(self.error("Regular expression too large"));
+        }
+        let contents = self.class_contents();
+        self.depth -= 1;
+        let (set, may) = contents?;
         if !neg {
             return Ok((set, may));
         }
@@ -1055,7 +1062,8 @@ struct Parser<'a> {
     /// modifier): where `ignore_case` holds, characters and classes are
     /// made classes of every unit they match, and matching is exact.
     explicit: bool,
-    /// Groups open around the current position (up to [`MAX_NESTING`]).
+    /// Groups (and `v` mode's nested classes) open around the current
+    /// position (up to [`MAX_NESTING`]).
     depth: usize,
     /// An error a class's member found (see `Parser::class_atom`).
     pending: Option<String>,

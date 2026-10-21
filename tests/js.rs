@@ -7715,3 +7715,18 @@ out.join(' ');
 "#;
     assert_eq!(value(src), "throw,caught throw,caught t,caught cmp,caught v,caught");
 }
+
+/// Built-ins converting several arguments stop at the first whose
+/// conversion throws: the next one's isn't run.
+#[test]
+fn multi_argument_built_ins_stop_at_a_throwing_conversion() {
+    let src = r#"
+var out = [];
+for (var f of [(x, y) => Math.atan2(x, y), (x, y) => String.fromCharCode(x, y), (x, y) => Math.max(x, y), (x, y) => 'abc'.slice(x, y)]) {
+  var log = []; var x = { valueOf() { log.push('first'); throw 1; } }; var y = { valueOf() { log.push('second'); return 1; } };
+  try { f(x, y); } catch (e) { log.push('caught'); } out.push(log.join(','));
+}
+out.join(' ');
+"#;
+    assert_eq!(value(src), "first,caught first,caught first,caught first,caught");
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Snapshot the stencils' machine code per toolchain, to catch an LLVM
-# update that makes them worse. rust-toolchain.toml follows nightly, so
-# LLVM changes with `rustup update`; a snapshot is keyed by the LLVM
+# update that makes them worse. rust-toolchain.toml pins the nightly: take
+# a snapshot before and after bumping it; a snapshot is keyed by the LLVM
 # version and the nightly's commit date.
 #
 #   scripts/stencil-snapshot.sh [aarch64]         # snapshot this toolchain's stencils

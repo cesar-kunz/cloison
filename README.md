@@ -350,11 +350,15 @@ features: `explicit_tail_calls`, `rust_preserve_none_cc` and
 
 Because `build.rs` extracts stencils from LLVM's machine code and then
 rewrites branches in it, the stencil pipeline depends on LLVM's codegen
-choices. A nightly bump can change stencil shapes; the
-`every_stencil_instance_matches_its_compiled_bytes` test and
-`scripts/stencils-asm.sh` are the checks, and the generated
-`stencils.rs` (in `target/*/build/cloison-*/out/`) can be diffed between
-targets.
+choices, so `rust-toolchain.toml` pins the nightly, and a bump is a
+deliberate change. The build checks every stencil's code for what the
+JIT relies on (`build/verify.rs`: it decodes, its relocations are
+branches' or operands' fields, its local branches stay inside, it
+references no data, an exit comes before any store) and fails
+otherwise. `scripts/stencil-snapshot.sh` compares the stencils of two
+toolchains, `scripts/stencils-asm.sh` disassembles them, and the
+generated `stencils.rs` (in `target/*/build/cloison-*/out/`) can be
+diffed between targets.
 
 ## Where it falls short
 

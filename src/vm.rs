@@ -1326,6 +1326,28 @@ impl Vm {
 
     // ---- Shapes ----
 
+    /// Shapes made so far and the bytes they take with their slot vectors,
+    /// transitions and field cells; codes, the bytes they take, and those
+    /// of them pinned (`CLOISON_SIZES`).
+    pub fn memory_stats(&self) -> [usize; 5] {
+        let shape_bytes: usize = self
+            .shapes
+            .iter()
+            .map(|s| {
+                size_of::<Shape>()
+                    + s.keys.capacity() * size_of::<Atom>()
+                    + s.attrs.capacity()
+                    + s.fields.capacity() * size_of::<*const FieldCell>()
+                    + s.transitions.borrow().capacity() * size_of::<(Atom, u8, *const Shape)>()
+                    + s.elem_transitions.borrow().capacity() * size_of::<(FieldType, *const Shape)>()
+            })
+            .sum::<usize>()
+            + self.field_cells.len() * size_of::<FieldCell>();
+        let code_bytes = self.codes.iter().map(|c| c.footprint()).sum();
+        let pinned = self.codes.iter().filter(|c| c.pinned.get()).count();
+        [self.shapes.len(), shape_bytes, self.codes.len(), code_bytes, pinned]
+    }
+
     pub(crate) fn add_shape(&mut self, s: Shape) -> *const Shape {
         // (A Rust structure: its prototype is logged if young.)
         self.heap.note(s.proto);

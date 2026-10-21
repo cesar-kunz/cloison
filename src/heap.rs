@@ -265,6 +265,10 @@ pub struct Heap {
     /// Since the last collection: holes taken, holes too small for the
     /// cell asked for, granules looked at to find them (`CLOISON_GC_STATS`).
     pub(crate) holes: [usize; 3],
+    /// Since the last full collection's sweep began: blocks it left with
+    /// cells, the bytes free in them, those of them allocated in again,
+    /// and blocks it emptied (`CLOISON_GC_STATS`).
+    pub(crate) swept: [usize; 4],
     pub(crate) gc: crate::gc::Gc,
 }
 
@@ -298,6 +302,7 @@ impl Heap {
         let mut heap = Heap {
             budget: gc.budget(),
             holes: [0; 3],
+            swept: [0; 4],
             requested: std::sync::atomic::AtomicBool::new(false),
             color: 1,
             gc,
@@ -577,6 +582,10 @@ impl Heap {
     /// sweeps empty a hundred MiB a cycle that it allocates in again, took
     /// 444,000 page faults a run giving all back.)
     pub(crate) fn add_swept(&mut self, partly: &[(usize, usize)], empty: &[usize]) {
+        self.swept[0] += partly.len();
+        self.swept[1] += partly.iter().map(|&(_, free)| free).sum::<usize>();
+        self.swept[2] += partly.iter().filter(|&&(_, free)| free >= RECYCLE).count();
+        self.swept[3] += empty.len();
         self.recycle.extend(
             (partly.iter().rev())
                 .filter(|&&(_, free)| free >= RECYCLE)
@@ -608,6 +617,11 @@ impl Heap {
         if let Some((s, e)) = run {
             release(s, e - s);
         }
+    }
+
+    /// Free blocks that keep their memory (see `add_swept`).
+    pub(crate) fn kept_empty(&self) -> usize {
+        self.empty.len()
     }
 
     /// How many free blocks keep their memory: the room the heap may grow

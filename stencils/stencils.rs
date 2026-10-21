@@ -5410,6 +5410,8 @@ stencil!("call_done"; |s| {
 // constructor's, if an object, else `this`, after `construct_done`
 // (`cloison_rt_construct_done`) unless that has nothing to do for its shape.
 // Otherwise `cloison_rt_construct` allocates and enters.
+// (It stores before its exits: allowed by `build/verify.rs`, as they
+// come after the call.)
 stencil!("construct_direct"; |s| {
     let regs = Value::from_bits(s.regs as u64);
     let site = imm64() as *const DirectSite;
@@ -5505,6 +5507,7 @@ stencil!("store_const_m"; |s| {
 // At a loop header of warm code (see `jit::Tier`): count down the
 // function's heat (an `i64` at `imm64`); when it runs out, leave at the
 // header to tier up.
+// (It stores before its exit: allowed by `build/verify.rs`.)
 stencil!("tier_count"; |s| {
     let heat = imm64() as *mut i64;
     *heat -= 1;

@@ -20,5 +20,11 @@ lto = "fat"
 panic = "abort"
 debug = "line-tables-only"
 
+[dev-dependencies]
+# For the tests of build/verify.rs.
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }
+
 [build-dependencies]
 object = { version = "0.40", default-features = false, features = ["read_core", "elf", "macho"] }
+# Decodes the x86-64 stencils for build.rs's checks and rewrites (build/verify.rs).
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder", "instr_info"] }

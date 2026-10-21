@@ -14,10 +14,14 @@
 //!    second compile with every branch long, where they fold (`main`).
 //! 4. On arm64, compact each family of per-slot variants into one template
 //!    whose register fields the JIT patches ([`compact_arm64`]).
-//! 5. Write `$OUT_DIR/stencils.rs`, included by `src/jit.rs`.
+//! 5. Check every stencil's code ([`verify`]): a violation fails the build.
+//! 6. Write `$OUT_DIR/stencils.rs`, included by `src/jit.rs`.
 //!
 //! The object file is kept as `$OUT_DIR/stencils.o` for inspection:
 //! `scripts/stencils-asm.sh` disassembles it.
+
+#[path = "build/verify.rs"]
+mod verify;
 
 use object::{Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SymbolKind};
 use std::fmt::Write as _;
@@ -32,6 +36,7 @@ fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
     println!("cargo:rerun-if-changed=src/value.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build/verify.rs");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
@@ -69,6 +74,24 @@ fn main() {
         !extracted.is_empty(),
         "no {PREFIX}* symbols in {}",
         obj_path.display()
+    );
+    let violations: Vec<String> = extracted
+        .iter()
+        .flat_map(|e| {
+            let relocs: Vec<verify::Reloc> = e
+                .relocs
+                .iter()
+                .map(|r| verify::Reloc { offset: r.offset as usize, r_type: r.r_type, symbol: &r.symbol })
+                .collect();
+            verify::check(&e.name, &arch, &e.code, &relocs)
+                .into_iter()
+                .map(move |v| format!("  {}: {v}", e.name))
+        })
+        .collect();
+    assert!(
+        violations.is_empty(),
+        "stencils the JIT can't copy as they are:\n{}",
+        violations.join("\n")
     );
 
     let mut entries = if arch == "aarch64" {
@@ -916,46 +939,28 @@ const R_X86_64_PLT32: u32 = 4;
 /// with its arms exchanged, valid for any condition. Skipped if a local jump
 /// targets the final `jmp`.
 fn swap_x86_final_branch(code: &mut [u8], relocs: &mut [Reloc]) {
-    let n = code.len();
-    if n < 11
-        || code[n - 5] != 0xE9
-        || code[n - 11] != 0x0F
-        || !(0x80..=0x8F).contains(&code[n - 10])
-    {
+    use verify::x86::{decode, is_rel32_jump};
+    let Ok(insns) = decode(code) else { return };
+    let [.., jcc, jmp] = &insns[..] else { return };
+    if !(is_rel32_jump(code, jcc) && code[jcc.at] == 0x0F && is_rel32_jump(code, jmp) && code[jmp.at] == 0xE9) {
         return;
     }
     let at = |off: usize| relocs.iter().position(|r| r.offset == off as u64);
-    let (Some(jcc), Some(jmp)) = (at(n - 9), at(n - 4)) else {
+    let (Some(jcc_r), Some(jmp_r)) = (at(jcc.at + 2), at(jmp.at + 1)) else {
         return;
     };
-    if relocs[jcc].symbol != "cloison_continue" || relocs[jmp].symbol == "cloison_continue" {
+    if relocs[jcc_r].symbol != "cloison_continue" || relocs[jmp_r].symbol == "cloison_continue" {
         return;
     }
-    let last = (n - 5) as i64;
-    let covered = |p: usize| {
-        relocs
-            .iter()
-            .any(|r| (r.offset as usize..r.offset as usize + 4).contains(&p))
-    };
-    let jumped_to = (0..n - 5).any(|p| {
-        let short = ((0x70..=0x7F).contains(&code[p]) || code[p] == 0xEB)
-            && p + 1 < n
-            && p as i64 + 2 + code[p + 1] as i8 as i64 == last;
-        let long = p + 5 <= n
-            && !covered(p + 1)
-            && (code[p] == 0xE9
-                || (p >= 1 && code[p - 1] == 0x0F && (0x80..=0x8F).contains(&code[p])))
-            && p as i64 + 5 + i32::from_le_bytes(code[p + 1..p + 5].try_into().unwrap()) as i64
-                == last;
-        short || long
-    });
-    if jumped_to {
+    // Nothing else may jump to the final `jmp`.
+    let local = |i: &verify::Insn| !relocs.iter().any(|r| (i.at..i.at + i.len).contains(&(r.offset as usize)));
+    if insns.iter().any(|i| local(i) && i.target == Some(jmp.at as i64)) {
         return;
     }
-    code[n - 10] ^= 1;
-    let (a, b) = (relocs[jcc].symbol.clone(), relocs[jmp].symbol.clone());
-    relocs[jcc].symbol = b;
-    relocs[jmp].symbol = a;
+    code[jcc.at + 1] ^= 1;
+    let (a, b) = (relocs[jcc_r].symbol.clone(), relocs[jmp_r].symbol.clone());
+    relocs[jcc_r].symbol = b;
+    relocs[jmp_r].symbol = a;
 }
 
 /// x86-64 counterpart of [`fold_arm64_stubs`], for stencils using `asm goto`
@@ -966,69 +971,54 @@ fn swap_x86_final_branch(code: &mut [u8], relocs: &mut [Reloc]) {
 /// that `rel32` straight at `<symbol>` with a new relocation and drop the
 /// stub.
 ///
-/// There's no x86 decoder here, so this is conservative: it folds only a
-/// stub reached by `jcc rel32` / `jmp rel32` alone (`0F 8x d32` / `E9 d32`
-/// with no relocation on it), not fallen into, and only if nothing that
-/// could be a short jump targets it. LLVM emits long local jumps to such
-/// stubs only where told to: the `asm goto` sites, and the stencils
-/// assembled with `-mc-relax-all` (see `main`).
+/// On decoded instructions ([`verify::x86::decode`]): it folds a stub
+/// reached by `jcc rel32` / `jmp rel32` alone, not fallen into; a short
+/// jump to it (whose field can't reach a symbol) leaves it. LLVM emits
+/// long local jumps to such stubs only where told to: the `asm goto`
+/// sites, and the stencils assembled with `-mc-relax-all` (see `main`).
 fn fold_x86_stubs(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
+    use verify::x86::{decode, is_rel32_jump};
+    let pc32 = |r: &Reloc| matches!(r.r_type, R_X86_64_PC32 | R_X86_64_PLT32);
     loop {
-        let n = code.len();
-        if n < 7 || code[n - 5] != 0xE9 {
+        let Ok(insns) = decode(code) else { return };
+        let [.., before, stub] = &insns[..] else { return };
+        if !(is_rel32_jump(code, stub) && code[stub.at] == 0xE9) {
             return;
         }
-        let stub = n - 5;
-        let Some(sr) = relocs.iter().position(|r| {
-            r.offset == (stub + 1) as u64
-                && matches!(r.r_type, R_X86_64_PC32 | R_X86_64_PLT32)
-                && r.symbol != "cloison_continue"
-        }) else {
+        let Some(sr) = relocs
+            .iter()
+            .position(|r| r.offset == (stub.at + 1) as u64 && pc32(r) && r.symbol != "cloison_continue")
+        else {
             return;
-        };
-        let covered = |at: usize| {
-            relocs
-                .iter()
-                .any(|r| (r.offset as usize..r.offset as usize + 4).contains(&at))
         };
         // Nothing may fall into the stub: the instruction before it must be
         // an unconditional `jmp rel32` to a symbol (the hot path's `jmp
         // cloison_continue`, or another stub's).
-        let jumps_away = stub >= 5
-            && code[stub - 5] == 0xE9
-            && relocs.iter().any(|r| {
-                r.offset == (stub - 4) as u64 && matches!(r.r_type, R_X86_64_PC32 | R_X86_64_PLT32)
-            });
+        let jumps_away = code[before.at] == 0xE9
+            && is_rel32_jump(code, before)
+            && relocs.iter().any(|r| r.offset == (before.at + 1) as u64 && pc32(r));
         if !jumps_away {
             return;
         }
-        let rel32 = |f: usize| i32::from_le_bytes(code[f..f + 4].try_into().unwrap()) as i64;
-        let mut users = Vec::new();
-        for f in 1..stub.saturating_sub(3) {
-            let long_jcc = f >= 2 && code[f - 2] == 0x0F && (0x80..=0x8F).contains(&code[f - 1]);
-            if (long_jcc || code[f - 1] == 0xE9)
-                && (f - 2..f + 4).all(|at| !covered(at))
-                && f as i64 + 4 + rel32(f) == stub as i64
-            {
-                users.push(f);
-            }
-        }
-        let short_to_stub = (0..stub.saturating_sub(1)).any(|p| {
-            ((0x70..=0x7F).contains(&code[p]) || code[p] == 0xEB)
-                && p as i64 + 2 + code[p + 1] as i8 as i64 == stub as i64
-        });
-        if users.is_empty() || short_to_stub {
+        // Every local jump to the stub, each of which must have a rel32
+        // field to take the relocation (a short one can't reach a symbol).
+        let local = |i: &verify::Insn| !relocs.iter().any(|r| (i.at..i.at + i.len).contains(&(r.offset as usize)));
+        let users: Vec<&verify::Insn> = insns
+            .iter()
+            .filter(|i| local(i) && i.target == Some(stub.at as i64))
+            .collect();
+        if users.is_empty() || !users.iter().all(|i| is_rel32_jump(code, i)) {
             return;
         }
         let target = relocs.remove(sr);
-        for &f in &users {
+        for i in users {
             relocs.push(Reloc {
-                offset: f as u64,
+                offset: (i.at + i.len - 4) as u64,
                 r_type: target.r_type,
                 symbol: target.symbol.clone(),
                 addend: target.addend,
             });
         }
-        code.truncate(stub);
+        code.truncate(stub.at);
     }
 }

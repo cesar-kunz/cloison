@@ -49,6 +49,11 @@ mod racy;
 // (Some of it only the stencils use.)
 #[allow(dead_code)]
 mod layout;
+// The checks `build.rs` makes of the stencils, for their tests.
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build/verify.rs"]
+mod stencil_verify;
 mod agent;
 mod temporal;
 mod dispose;

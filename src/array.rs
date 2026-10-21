@@ -233,6 +233,8 @@ fn spreadable(vm: &mut Vm, v: Value) -> Result<bool> {
 /// FlattenIntoArray: `source`'s elements into `target` from `start`, to
 /// `depth` (mapped first by `f` with `that`, if given): the next index.
 fn flatten(vm: &mut Vm, target: Value, source: Value, len: f64, start: f64, depth: f64, f: Option<(Value, Value)>) -> Result<f64> {
+    // (Nested deeply, or in a cycle, as deep as `depth`: a RangeError.)
+    crate::interp::check_native_stack(vm)?;
     let mut at = start;
     let mut i = 0.0;
     while i < len {

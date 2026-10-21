@@ -181,8 +181,8 @@ fn main() -> ExitCode {
                 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
                 let malloc = 0;
                 eprintln!(
-                    "mem shapes={} shape_bytes={} codes={} code_bytes={} pinned_codes={} malloc={malloc}",
-                    mem[0], mem[1], mem[2], mem[3], mem[4]
+                    "mem shapes={} shape_bytes={} codes={} code_bytes={} pinned_codes={} dead_shapes={} malloc={malloc}",
+                    mem[0], mem[1], mem[2], mem[3], mem[4], mem[5]
                 );
             }
             // `CLOISON_COUNT`: hot code's stencil executions.

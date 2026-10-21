@@ -759,6 +759,13 @@ In place:
 - Shapes with shared transition trees, roots keyed by class, prototype and
   in-object capacity, and slack tracking per constructor (settled in place
   after the first `new`, to exactly the properties its objects have).
+  A lineage of shapes shares one slot table, each shape a prefix of it
+  (`object::Slots`, as V8's maps share descriptor arrays), so an object's
+  properties cost one slot each, not one copy of its slots per shape.
+  Shapes are traced, not roots: an object keeps its shape, the shapes it
+  was made from and their prototypes; at a full collection the shapes no
+  object can have any more become zombies (`Vm::sweep_shapes`), whose
+  prototypes may die and whose addresses are never reused.
 - Scalar replacement of objects that never escape compiled code, which
   allocates them only at exits (see `docs/future-work.md`).
 - Inline caches for `GetNamed`, `SetNamed` (including cached transitions

@@ -2164,7 +2164,7 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
     // The shape with all five found once: then only their stores.
     let root = unsafe { (*o).shape };
     if vm.regexp_shapes.0 == root {
-        unsafe { (*o).shape = vm.regexp_shapes.1 };
+        unsafe { crate::object::set_shape(o, vm.regexp_shapes.1) };
         for (slot, (_, v)) in props.into_iter().enumerate() {
             vm.store_field(o, slot as u32, v);
         }
@@ -2548,7 +2548,7 @@ fn match_array(vm: &mut Vm, re: &crate::regexp::Regex, caps: &crate::regexp::Cap
             (e, a, b, c)
         }
     };
-    unsafe { (*o).shape = elems };
+    unsafe { crate::object::set_shape(o, elems) };
     vm.add_property_shaped(o, with_index, Value::from_i32(caps[0].unwrap().0 as i32));
     vm.add_property_shaped(o, with_input, input);
     // `groups`: with named groups, each one's match.

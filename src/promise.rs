@@ -295,7 +295,7 @@ pub(crate) fn native_closure(vm: &mut Vm, template: *mut Object, data: &[Value])
     let bare = vm.root_shape(Class::Native, fp, 0);
     let o = vm.heap.alloc_object(unsafe { &*full });
     unsafe {
-        (*o).shape = bare;
+        crate::object::set_shape(o, bare);
         (*o).code = (*template).code;
         for (i, &v) in data.iter().enumerate() {
             set_slot(o, i, v);

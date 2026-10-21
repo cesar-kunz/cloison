@@ -43,25 +43,18 @@
 use crate::object::{Class, INLINE_BASE, Object, Shape, object_header};
 use crate::value::Value;
 
-/// Allocation granule: cell addresses and sizes are multiples of it.
-pub const GRANULE: usize = 16;
+// What compiled code knows of the heap is defined with the other layouts
+// it shares: the granule, card and large-cell sizes, the metadata bytes,
+// the side tables' place, the address space of a heap.
+pub use crate::layout::{CARD, COLOR, GRANULE, LARGE, SIDE, SLICE, VALUES, YOUNG, card, card_mark, color_byte, meta};
 /// Block size: allocation's unit of memory.
 pub const BLOCK: usize = 32 << 10;
 const GRANULES_PER_BLOCK: usize = BLOCK / GRANULE;
-/// Bytes per card.
-/// (128 rather than 512: a minor collection scans what dirty cards hold,
-/// and a random store dirties a fourth as much. cards.js's longest pause
-/// 33 ms -> 25 ms; `card_mark` in `stencils/stencils.rs` shifts by 7.)
-pub const CARD: usize = 1 << 7;
-/// Cells larger than this get blocks of their own.
-pub const LARGE: usize = 8 << 10;
 /// Address space all heaps share: room for 512 heaps of a [`SLICE`] each.
 /// Only reserved (no page is touched until committed); from any of
 /// [`BASES`] it ends below 128 TiB, and its side tables stay between
 /// [`SIDE`] and the first base.
 const SPACE: usize = 16 << 40;
-/// Address space one heap may use (`CLOISON_HEAP_LIMIT`, in MiB, lowers it).
-const SLICE: usize = 32 << 30;
 /// Memory is committed this much at a time (its metadata and cards are
 /// then whole pages).
 const CHUNK: usize = 8 << 20;
@@ -74,17 +67,9 @@ pub(crate) const PAGE: usize = if cfg!(all(target_os = "macos", target_arch = "a
     4 << 10
 };
 
-/// Metadata byte of a cell's first granule: allocated since the last
-/// collection.
-pub const YOUNG: u8 = 0x80;
-/// Metadata bits of an old cell's first granule: the color it was marked
-/// with (never 0).
-pub const COLOR: u8 = 0x03;
 /// Metadata bit of an old cell's last granule.
 pub const END: u8 = 0x04;
 
-/// Header word of an array of values: `VALUES | capacity << 32`.
-pub const VALUES: u64 = 1;
 /// Header word of a byte buffer: `BYTES | length << 32`.
 pub const BYTES: u64 = 3;
 /// Header word of an upvalue (`vm::Upvalue` follows).
@@ -144,13 +129,6 @@ fn reserve_at(at: usize, len: usize) -> bool {
     }
     true
 }
-
-/// Where the side tables are, past their share of the reservation's
-/// addresses: a granule's metadata byte at `SIDE + addr / 16`, a card at
-/// `SIDE + addr / 128` (see [`meta`], [`card`]). One constant, which arm64
-/// builds in one instruction, so the barrier needs no operand. (macOS
-/// grants addresses asked for only from 8 TiB up.)
-pub const SIDE: usize = 1 << 43;
 
 /// Candidate addresses for the reservation (16, 32, 48, 64 TiB): above
 /// [`SIDE`] plus their side tables, all where Linux and macOS leave room.
@@ -212,27 +190,6 @@ fn release(a: usize, len: usize) {
     unsafe { libc::madvise(a as *mut libc::c_void, len, advice) };
 }
 
-/// The metadata byte of the granule at `a` (in a heap).
-#[inline(always)]
-pub fn meta(a: usize) -> *mut u8 {
-    (SIDE + a / GRANULE) as *mut u8
-}
-
-/// The card byte of address `a` (in a heap).
-#[inline(always)]
-pub fn card(a: usize) -> *mut u8 {
-    (SIDE + a / CARD) as *mut u8
-}
-
-/// Mark the card of `a`. A minor collection scans the old cells' words on
-/// dirty cards, and the whole of an object that starts on one: so for a
-/// store to an object's in-object slot, or to its `props` or `elems`, `a`
-/// may be the object's own address (what compiled code passes).
-#[inline(always)]
-pub fn card_mark<T>(a: *const T) {
-    unsafe { *card(a as usize) = 1 };
-}
-
 /// The write barrier: `v` was stored at `a`, in the cell at `host`. A
 /// reference from an old cell to one that isn't marked with the heap's
 /// current color is recorded, by marking the card of `a`: outside a
@@ -252,13 +209,6 @@ pub fn barrier<T>(host: *const u8, a: *const T, v: Value) {
     }
 }
 
-/// The byte holding the current color of the heap address `a` is in: the
-/// metadata of its slice's first granule (a block of no cells).
-#[inline(always)]
-pub fn color_byte(a: usize) -> *mut u8 {
-    meta(a & !(SLICE - 1))
-}
-
 /// The write barrier for a store at `a`, in the cell at `host`, of a
 /// pointer to a young array (an object's new `props` or `elems`).
 #[inline(always)]
@@ -268,9 +218,12 @@ pub fn barrier_young<T>(host: *const u8, a: *const T) {
     }
 }
 
+crate::layout::same_layout!(Heap, crate::layout::HeapPtrs: ptr, end);
+
 #[repr(C)]
 pub struct Heap {
-    // Read by compiled code (`Heap::bump`): keep first, in this order.
+    // Read by compiled code (`Heap::bump`, `layout::HeapPtrs`): keep first,
+    // in this order.
     ptr: *mut u8,
     end: *mut u8,
     /// Where the current hole started (allocations since are a region).
@@ -381,7 +334,7 @@ impl Heap {
     }
 
     /// Where compiled code finds the free space: `ptr`, then `end`.
-    pub(crate) fn bump(&mut self) -> *mut [*mut u64; 2] {
+    pub(crate) fn bump(&mut self) -> *mut crate::layout::HeapPtrs {
         (&raw mut self.ptr).cast()
     }
 

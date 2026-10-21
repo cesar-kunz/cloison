@@ -45,56 +45,7 @@ impl Piece {
     }
 }
 
-/// The stencils' `RxCtx`.
-#[repr(C)]
-pub(crate) struct Ctx {
-    /// The backtracking stack's end, less room for two entries.
-    pub limit: *mut usize,
-    pub classes: *const Class,
-    /// Whether case is folded.
-    pub ic: usize,
-}
-
-/// The stencils' `RxClass`: a class's ranges, for units past ASCII.
-#[repr(C)]
-pub(crate) struct Class {
-    pub ranges: *const [u16; 2],
-    pub n: usize,
-    pub neg: usize,
-}
-
-/// The stencils' `RxRun`: a repetition of one unit.
-#[repr(C)]
-#[derive(Default)]
-pub(crate) struct Run {
-    pub min: usize,
-    pub max: usize,
-    /// The address of its backtracking piece.
-    pub back: usize,
-    pub lo: u64,
-    pub hi: u64,
-    pub k: usize,
-}
-
-/// The stencils' `RxHead`: a counted repetition's head.
-#[repr(C)]
-#[derive(Default)]
-pub(crate) struct Head {
-    pub c: usize,
-    pub min: usize,
-    pub max: usize,
-    pub exit: usize,
-    pub body: usize,
-}
-
-/// A group's start when it is unset.
-pub(crate) const NONE: usize = usize::MAX;
-pub(crate) const NOMATCH: usize = usize::MAX;
-pub(crate) const BAIL: usize = usize::MAX - 1;
-
-/// Compiled code's entry: `(s, end, pos, bt, regs, ctx)`.
-pub(crate) type Entry =
-    unsafe extern "rust-preserve-none" fn(*const u16, usize, usize, *mut usize, *mut usize, *const Ctx) -> usize;
+pub(crate) use crate::layout::rx::{BAIL, Class, Ctx, Entry, Head, NOMATCH, NONE, Run};
 
 /// Pieces laid out and patched.
 pub(crate) struct Code {

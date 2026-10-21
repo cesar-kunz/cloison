@@ -46,6 +46,9 @@ mod iterator;
 mod typed;
 mod shared;
 mod racy;
+// (Some of it only the stencils use.)
+#[allow(dead_code)]
+mod layout;
 mod agent;
 mod temporal;
 mod dispose;

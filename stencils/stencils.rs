@@ -28,6 +28,10 @@
 //!   the asm passes every caller-saved slot register through as an in/out
 //!   operand, and the call goes to a per-region wrapper that the JIT emits
 //!   in JIT memory, saving only the slots that region uses.
+//! - What stencils read and write of the runtime's memory (object
+//!   headers, shapes, the heap's side tables, caches, call sites) comes
+//!   from `src/layout.rs`, which the runtime includes too and checks
+//!   against its own types: never offsets or numbers written here.
 //! - Side exits leave through `cloison_exit`, patched to a per-instruction stub
 //!   (spills, then the `exit` stencil). It records the instruction's
 //!   bytecode offset in `*ctx` and returns `acc` to the JIT driver. An
@@ -74,6 +78,19 @@
 mod value;
 
 use value::{NumberTag, Value};
+
+// The runtime's memory as compiled code sees it: cells, the heap's side
+// tables, caches, call sites (see `src/layout.rs`).
+#[path = "../src/layout.rs"]
+#[allow(dead_code, unused_macros)]
+mod layout;
+
+use layout::{
+    COLOR, DirectSite, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
+    LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
+    Class, EXTERNAL, FUNC_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
+    mega_index, mega_pair, shape_of, class_kind,
+};
 
 #[cfg(target_arch = "x86_64")]
 const G: usize = 6;
@@ -699,36 +716,22 @@ fn imm64b() -> u64 {
     imm64_of!(cloison_hole_imm64b)
 }
 
-/// `heap::SIDE`: the side tables are at it plus an address shifted right
-/// (`heap`'s reservation is placed for that).
-const SIDE: usize = 1 << 43;
-
-/// Mark the card of `a` (`heap::card_mark`; `heap::CARD` is 128 bytes).
-#[inline(always)]
-unsafe fn card_mark<T>(a: *const T) {
-    unsafe { *((SIDE + (a as usize >> 7)) as *mut u8) = 1 };
-}
-
-/// The metadata byte of the granule at `a` (`heap::meta`).
+/// The metadata byte of the granule at `a` (`layout::meta`).
 #[inline(always)]
 unsafe fn meta_of(a: usize) -> u8 {
-    unsafe { *((SIDE + (a >> 4)) as *const u8) }
+    unsafe { *meta(a) }
 }
-
-/// `heap::SLICE`: a heap's address space, aligned to it; the metadata of
-/// its first granule is the heap's current color (`heap::color_byte`).
-const SLICE: usize = 32 << 30;
 
 /// The write barrier (`heap::barrier`): `v` was stored at `a`, in the cell
 /// at `host`; a reference from an old cell to one not marked with the
-/// heap's current color (young, `heap::YOUNG`, or not marked yet during a
+/// heap's current color (young, `YOUNG`, or not marked yet during a
 /// marking cycle) marks the card of `a`.
 #[inline(always)]
 unsafe fn barrier<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
     unsafe {
         if is_cell(tag, v)
             && v.to_bits() != 0
-            && meta_of(v.to_bits() as usize) & (YOUNG | 3) != meta_of(host as usize & !(SLICE - 1))
+            && meta_of(v.to_bits() as usize) & (YOUNG | COLOR) != *color_byte(host as usize)
             && meta_of(host as usize) != YOUNG
         {
             core::hint::cold_path();
@@ -737,15 +740,15 @@ unsafe fn barrier<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
     }
 }
 
-/// The barrier for a store of `v` to upvalue `u`'s variable (at `*u`):
-/// only if it is closed, its variable then its own `closed` word (after
-/// `at`), in the cell before `u`.
+/// The barrier for a store of `v` to upvalue `u`'s variable (at `at`):
+/// only if it is closed, its variable then its own `closed` word, in the
+/// cell `u` is the payload of.
 #[inline(always)]
-unsafe fn upvalue_barrier(tag: NumberTag, u: *const *mut Value, v: Value) {
+unsafe fn upvalue_barrier(tag: NumberTag, u: *const Upvalue, v: Value) {
     unsafe {
-        let at = *u;
-        if at as usize == u as usize + 8 {
-            barrier(tag, (u as *const u8).sub(8), at, v);
+        let at = (*u).at;
+        if at.cast_const() == &raw const (*u).closed {
+            barrier(tag, payload_cell(u), at, v);
         }
     }
 }
@@ -1910,14 +1913,14 @@ stencil!("lda_false"; |s| {
 // where it would throw (0).
 stencil_slow!("test_instanceof_m"; |s| {
     let v = load_m(s.regs);
-    let c = imm64() as *const u64;
+    let c = imm64() as *const InstanceOfEntry;
     if !c.is_null() && is_cell(s.tag, v) && is_cell(s.tag, s.acc) {
         let f = s.acc.to_bits() as *const u8;
-        if *(f as *const u64) == imm64b() {
-            let (shape, p) = (*(v.to_bits() as *const u64), *(f.add(imm() as usize) as *const u64));
-            for e in [c, c.add(3)] {
-                if shape == *e && p == *e.add(1) {
-                    s.acc = Value::from_bits(*e.add(2));
+        if (*header(f)).shape == imm64b() {
+            let (shape, p) = ((*cell(v)).shape, *(f.add(imm() as usize) as *const u64));
+            for e in [c, c.add(1)] {
+                if shape == (*e).shape && p == (*e).proto {
+                    s.acc = Value::from_bits((*e).result);
                     next!(s)
                 }
             }
@@ -2276,14 +2279,14 @@ macro_rules! jump_to_boolean {
             slow!(s)
         }; |s| {
             // Without the runtime: `undefined`, `null`, doubles and
-            // objects (cells but strings, class 4: an empty one is false;
-            // and BigInts, class 23: 0n is).
+            // objects (cells but strings: an empty one is false; and
+            // BigInts: 0n is).
             let b = if s.acc == Value::UNDEFINED || s.acc == Value::NULL {
                 false
             } else if s.acc.to_bits() & s.tag.to_bits() != 0 {
                 let d = s.tag.decode_f64(s.acc);
                 d < 0.0 || d > 0.0
-            } else if is_cell(s.tag, s.acc) && !matches!(*(s.acc.to_bits() as *const u8).add(8), 4 | 23) {
+            } else if is_cell(s.tag, s.acc) && !matches!((*cell(s.acc)).class, class::STRING | class::BIGINT) {
                 true
             } else {
                 rt_to_boolean!(s, s.acc)
@@ -2472,8 +2475,8 @@ unsafe fn loose_eq_fast(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
         return Some(nullish(l) && nullish(r));
     }
     // Two objects are equal only if the same; a primitive cell (a string,
-    // class 4; a symbol, 9; a BigInt, 23) may equal another value.
-    let object = |v: Value| unsafe { !matches!(*(v.to_bits() as *const u8).add(8), 4 | 9 | 23) };
+    // a symbol, a BigInt) may equal another value.
+    let object = |v: Value| unsafe { !matches!((*cell(v)).class, class::STRING | class::SYMBOL | class::BIGINT) };
     if is_cell(tag, l) && is_cell(tag, r) && object(l) && object(r) {
         return Some(false);
     }
@@ -2481,24 +2484,22 @@ unsafe fn loose_eq_fast(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
 }
 
 /// `l == r` or `l === r` for two strings, if told apart without the
-/// runtime: lengths (`elems_len`, byte 32) that differ, or first units
-/// that do where both are flat (`elems`, byte 24, not null: a cons
-/// string's is). Otherwise, and for anything but two strings, `None`.
+/// runtime: lengths (`elems_len`) that differ, or first units that do
+/// where both are flat (`elems` not null: a cons string's is). Otherwise, and for anything but two strings, `None`.
 /// (Unrolled, no loop: one may become a `memcmp` call, which a stencil
 /// can't make.) Most of PdfJS's `token == 'RD'` are unequal so.
 #[inline(always)]
 unsafe fn strings_differ(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
-    let string = |v: Value| is_cell(tag, v) && unsafe { *(v.to_bits() as *const u8).add(8) } == 4;
-    if !string(l) || !string(r) {
+    if !is_string(tag, l) || !is_string(tag, r) {
         return None;
     }
     let (p, q) = (l.to_bits() as *const u8, r.to_bits() as *const u8);
     unsafe {
-        let n = *(p.add(32) as *const u32);
-        if n != *(q.add(32) as *const u32) {
+        let n = (*header(p)).elems_len;
+        if n != (*header(q)).elems_len {
             return Some(true);
         }
-        let (a, b) = (*(p.add(24) as *const *const u16), *(q.add(24) as *const *const u16));
+        let (a, b) = ((*header(p)).elems.cast::<u16>(), (*header(q)).elems.cast::<u16>());
         if n > 0 && !a.is_null() && !b.is_null() && *a != *b {
             return Some(true);
         }
@@ -2507,14 +2508,14 @@ unsafe fn strings_differ(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
 }
 
 /// String `o`'s unit `i` as the VM's single-unit string, from the table
-/// at `imm64` (`Vm::single_char`), if `o` is flat (`elems`, byte 24, not
-/// null), `i` below its length (byte 32) and the unit below 256 and made.
+/// at `imm64` (`Vm::single_char`), if `o` is flat (`elems` not null), `i`
+/// below its length and the unit below 256 and made.
 #[inline(always)]
 unsafe fn string_unit_string(o: Value, i: u32) -> Option<Value> {
     let p = o.to_bits() as *const u8;
     unsafe {
-        let units = *(p.add(24) as *const *const u16);
-        if units.is_null() || i >= *(p.add(32) as *const u32) {
+        let units = (*header(p)).elems.cast::<u16>();
+        if units.is_null() || i >= (*header(p)).elems_len {
             return None;
         }
         let c = *units.add(i as usize);
@@ -3772,32 +3773,19 @@ stencil!("lda_constant_f"; |s| {
 // (`create_object_<n>`, straight-line stores), then `create_object` with
 // the count in `imm`.
 
-/// `heap::Heap`'s first words: the free space's next byte and end.
-#[repr(C)]
-struct HeapPtrs {
-    ptr: *mut u64,
-    end: *mut u64,
-}
-
-/// `heap::LARGE`: past it, a cell is a large one, made by the runtime.
-const LARGE: usize = 8 << 10;
-
-/// `heap::YOUNG`: a new cell's metadata byte.
-const YOUNG: u8 = 0x80;
-
 /// Bump `heap` for a cell of `words` words (rounded up to 16 bytes,
-/// `heap::GRANULE`), if its hole has room, and write its metadata byte.
+/// `layout::GRANULE`), if its hole has room, and write its metadata byte.
 #[inline(always)]
 unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
     unsafe {
         let words = (words + 1) & !1;
         let p = (*heap).ptr;
-        // (Past `heap::LARGE` the runtime makes it a large cell.)
+        // (Past `LARGE` the runtime makes it a large cell.)
         if 8 * words > LARGE || ((*heap).end as usize - p as usize) < 8 * words {
             return None;
         }
         (*heap).ptr = p.add(words);
-        *((SIDE + (p as usize >> 4)) as *mut u8) = YOUNG;
+        *meta(p as usize) = YOUNG;
         Some(p)
     }
 }
@@ -3805,41 +3793,48 @@ unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
 /// Units at most in a concatenation `concat_short` makes.
 const CONCAT_SHORT: u32 = 32;
 
-/// `a + b` for two flat strings (`elems`, byte 24, not null) of at most
+/// `a + b` for two flat strings (`elems` not null) of at most
 /// [`CONCAT_SHORT`] units together, a new young string made as
 /// `Vm::new_string_raw` makes one: the string shape at `imm64` (its
-/// in-object capacity 0: `Class::String`, 4, flags `EXTERNAL`), the units
-/// after the header (`INLINE_BASE`, 48 bytes), `elems` pointing at them,
-/// `elems_len` the count and `elems_cap` the words, the room past the
-/// units zero; in the hole at `imm64b`. Else (or no room there) `None`.
+/// in-object capacity 0), the units after the header (`HEADER_WORDS`),
+/// `elems` pointing at them, `elems_len` the count and `elems_cap` the
+/// words, the room past the units zero; in the hole at `imm64b`. Else (or
+/// no room there) `None`.
 /// (Volatile stores: LLVM would call `memcpy` or `memset`, which a
 /// stencil can't.)
+/// Whether `v` is a string.
+#[inline(always)]
+fn is_string(tag: NumberTag, v: Value) -> bool {
+    is_cell(tag, v) && unsafe { (*cell(v)).class } == class::STRING
+}
+
 #[inline(always)]
 unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
-    let string = |v: Value| is_cell(tag, v) && unsafe { *(v.to_bits() as *const u8).add(8) } == 4;
-    if !string(a) || !string(b) {
+    if !is_string(tag, a) || !is_string(tag, b) {
         return None;
     }
     unsafe {
-        let (p, q) = (a.to_bits() as *const u8, b.to_bits() as *const u8);
-        let (m, n) = (*(p.add(32) as *const u32), *(q.add(32) as *const u32));
-        let (x, y) = (*(p.add(24) as *const *const u16), *(q.add(24) as *const *const u16));
+        let (p, q) = (cell(a), cell(b));
+        let (m, n) = ((*p).elems_len, (*q).elems_len);
+        let (x, y) = ((*p).elems as *const u16, (*q).elems as *const u16);
         let len = m + n;
         if x.is_null() || y.is_null() || len > CONCAT_SHORT || imm64b() == 0 {
             return None;
         }
         let words = (len as usize).div_ceil(4);
-        let o = bump(imm64b() as *mut HeapPtrs, 6 + words)?;
-        let units = o.add(6);
-        *o = imm64();
-        *o.add(1) = 4 | 1 << 8;
+        let o = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS + words)?;
+        let units = o.add(HEADER_WORDS);
+        let h = header(o);
+        (*h).shape = imm64();
+        set_header_word(h, header_word(Class::String, EXTERNAL, 0));
         // Volatile: arm64 LLVM would merge it with the word before into
         // one 16-byte store of a constant from `.rodata`, which a stencil
         // can't reference.
-        o.add(2).write_volatile(0);
-        *o.add(3) = units as u64;
-        *o.add(4) = len as u64 | (words as u64) << 32;
-        *o.add(5) = 0;
+        (&raw mut (*h).props).write_volatile(core::ptr::null_mut());
+        (*h).elems = units.cast();
+        (*h).elems_len = len;
+        (*h).elems_cap = words as u32;
+        (*h).code = 0;
         for k in 0..words {
             units.add(k).write_volatile(0);
         }
@@ -3857,14 +3852,13 @@ unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
 #[inline(always)]
 unsafe fn create_object(slots: usize) -> Option<*mut u64> {
     unsafe {
-        let p = bump(imm64b() as *mut HeapPtrs, 6 + slots)?;
-        *p = imm64();
-        // `Class::Plain`, flags `EXTERNAL`, `slots` in-object slots.
-        *p.add(1) = 1 << 8 | (slots as u64) << 16;
-        // The slots zero too (`Value::EMPTY`): a collection reads them
-        // (holes aren't zeroed).
+        let p = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS + slots)?;
+        (*header(p)).shape = imm64();
+        set_header_word(header(p), header_word(Class::Plain, EXTERNAL, slots as u64));
+        // The rest of the header zero, and the slots (`Value::EMPTY`): a
+        // collection reads them (holes aren't zeroed).
         // (Volatile: LLVM would call `memset`, which a stencil can't.)
-        for k in 2..6 + slots {
+        for k in 2..HEADER_WORDS + slots {
             p.add(k).write_volatile(0);
         }
         Some(p)
@@ -3897,11 +3891,10 @@ stencil_slow!("create_object"; |s| {
 // `CreateArray`: a new, empty array of shape `imm64`, as `create_object_0`
 // (no slots nor elements).
 stencil_slow!("create_array"; |s| {
-    let Some(p) = bump(imm64b() as *mut HeapPtrs, 6) else { slow!(s) };
-    *p = imm64();
-    // `Class::Array`, flags `EXTERNAL`.
-    *p.add(1) = 1 | 1 << 8;
-    for k in 2..6 {
+    let Some(p) = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS) else { slow!(s) };
+    (*header(p)).shape = imm64();
+    set_header_word(header(p), header_word(Class::Array, EXTERNAL, 0));
+    for k in 2..HEADER_WORDS {
         *p.add(k) = 0;
     }
     s.acc = Value::from_bits(p as u64);
@@ -3918,23 +3911,23 @@ stencil_slow!("create_array"; |s| {
 // heap's free space has it too (else none: `push` makes room).
 stencil_slow!("create_array_n"; |s| {
     let heap = imm64b() as *mut HeapPtrs;
-    let Some(p) = bump(heap, 6) else { slow!(s) };
-    *p = imm64();
-    *p.add(1) = 1 | 1 << 8;
-    for k in 2..6 {
+    let Some(p) = bump(heap, HEADER_WORDS) else { slow!(s) };
+    (*header(p)).shape = imm64();
+    set_header_word(header(p), header_word(Class::Array, EXTERNAL, 0));
+    for k in 2..HEADER_WORDS {
         *p.add(k) = 0;
     }
     let n = imm() as usize;
     if let Some(e) = bump(heap, 1 + n) {
-        // `heap::VALUES`, the capacity.
-        *e = 1 | (n as u64) << 32;
+        // An array of values' header word: its capacity.
+        *e = VALUES | (n as u64) << 32;
         // Volatile: LLVM would call `memset`-like code from a constant pool.
         for k in 1..=n {
             e.add(k).write_volatile(Value::UNDEFINED.to_bits());
         }
-        *p.add(3) = e.add(1) as u64;
-        // Length 0, capacity `n` (at 32 and 36).
-        *p.add(4) = (n as u64) << 32;
+        // (Its length 0, from the header's zero words.)
+        (*header(p)).elems = e.add(1).cast();
+        (*header(p)).elems_cap = n as u32;
     }
     s.acc = Value::from_bits(p as u64);
     next!(s)
@@ -4026,7 +4019,7 @@ fn is_cell(tag: NumberTag, v: Value) -> bool {
 #[inline(always)]
 unsafe fn guard_shape(tag: NumberTag, o: Value) -> Option<*mut u8> {
     let p = o.to_bits() as *mut u8;
-    if is_cell(tag, o) && unsafe { *(p as *const u64) } == imm64() {
+    if is_cell(tag, o) && unsafe { (*header(p)).shape } == imm64() {
         Some(p)
     } else {
         None
@@ -4054,20 +4047,10 @@ unsafe fn store_imm(base: *mut u8, v: Value) {
 }
 ldst_imm!(load_imm, store_imm, cloison_hole_imm, "#:lo12:{s}", "{s}@PAGEOFF");
 
-/// The object's out-of-line slots (`Object::props`, at offset 16).
+/// The object's out-of-line slots.
 #[inline(always)]
 unsafe fn props(o: *mut u8) -> *mut u8 {
-    unsafe { *(o.add(16) as *const *mut u8) }
-}
-
-/// Entries of the runtime's megamorphic tables past the first
-/// (`vm::MEGAS`).
-const MEGAS: usize = 2048;
-
-/// `vm::mega_index`: the entry of `shape` and `name` in those tables.
-#[inline(always)]
-fn mega_index(shape: u64, name: u32) -> usize {
-    1 + ((shape ^ (name as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MEGAS.trailing_zeros())) as usize
+    unsafe { (*header(o)).props.cast() }
 }
 
 /// `o.name` (the name an `Atom`, in `imm64`) as the runtime's megamorphic
@@ -4079,22 +4062,22 @@ unsafe fn mega_load(tag: NumberTag, o: Value) -> Option<Value> {
             return None;
         }
         let p = o.to_bits() as *mut u8;
-        let shape = *(p as *const u64);
+        let shape = (*header(p)).shape;
         let name = imm64() as u32;
-        let t = imm64b() as *const u8;
-        let k = mega_index(shape, name);
-        let e = t.add(k * 32);
-        if *(e as *const u64) != shape || *(e.add(8) as *const u32) != name {
+        let t = imm64b() as *const MegaEntry;
+        let e = t.add(mega_index(shape, name));
+        if (*e).shape != shape || (*e).name != name {
             return None;
         }
-        let addr = *(e.add(24) as *const *const Value);
+        let addr = (*e).addr as *const Value;
         if addr.is_null() {
-            let off = *(e.add(16) as *const i32);
+            let off = (*e).off;
             let base = if off >= 0 { p } else { props(p) };
             return Some(*(base.add((off ^ (off >> 31)) as usize) as *const Value));
         }
-        let epoch = *(*(t.add(24) as *const *const u32));
-        (*(e.add(12) as *const u32) == epoch).then(|| *addr)
+        // (Entry 0's `addr`: the prototype epoch's.)
+        let epoch = *((*t).addr as *const u32);
+        ((*e).epoch == epoch).then(|| *addr)
     }
 }
 
@@ -4110,34 +4093,35 @@ unsafe fn mega_store(tag: NumberTag, o: Value, v: Value) -> bool {
             return false;
         }
         let p = o.to_bits() as *mut u8;
-        let shape = *(p as *const u64);
+        let shape = (*header(p)).shape;
         let name = imm64() as u32;
-        let t = imm64b() as *const u8;
+        let t = imm64b() as *const MegaStore;
         let k = mega_index(shape, name);
-        let mut e = t.add(k * 40);
-        if *(e as *const u64) != shape || *(e.add(8) as *const u32) != name {
-            e = t.add((((k - 1) ^ 1) + 1) * 40);
-            if *(e as *const u64) != shape || *(e.add(8) as *const u32) != name {
+        let mut e = t.add(k);
+        if (*e).shape != shape || (*e).name != name {
+            e = t.add(mega_pair(k));
+            if (*e).shape != shape || (*e).name != name {
                 return false;
             }
         }
-        let fits = match *(e.add(16) as *const u64) {
-            0 => true,
-            1 => tag.is_int32(v),
-            2 => is_number(tag, v) && !tag.is_int32(v),
-            s => is_cell(tag, v) && *(v.to_bits() as *const u64) == s,
+        let fits = match (*e).ft {
+            FIELD_ANY => true,
+            FIELD_INT => tag.is_int32(v),
+            FIELD_NUM => is_number(tag, v) && !tag.is_int32(v),
+            s => is_cell(tag, v) && (*cell(v)).shape == s,
         };
         if !fits {
             return false;
         }
-        let loc = *(e.add(32) as *const i32);
-        let new = *(e.add(24) as *const u64);
+        let loc = (*e).loc;
+        let new = (*e).new_shape;
         if new != 0 {
-            let epoch = *(*(t.add(24) as *const *const u32));
-            if *(e.add(12) as *const u32) != epoch || loc < 0 && !loc as u32 >= *(p.add(12) as *const u32) {
+            // (Entry 0's `new_shape`: the prototype epoch's address.)
+            let epoch = *((*t).new_shape as *const u32);
+            if (*e).epoch != epoch || loc < 0 && !loc as u32 >= (*header(p)).props_cap {
                 return false;
             }
-            *(p as *mut u64) = new;
+            (*header(p)).shape = new;
         }
         if loc >= 0 {
             let at = p.add(loc as usize) as *mut Value;
@@ -4147,7 +4131,7 @@ unsafe fn mega_store(tag: NumberTag, o: Value, v: Value) -> bool {
             let q = props(p);
             let at = (q as *mut Value).add(!loc as usize);
             *at = v;
-            barrier(tag, q.sub(8), at, v);
+            barrier(tag, payload_cell(q), at, v);
         }
         true
     }
@@ -4184,20 +4168,20 @@ macro_rules! set_tro {
 #[inline(always)]
 unsafe fn tro_store(tag: NumberTag, o: *mut u8, v: Value, barrier_needed: bool) {
     unsafe {
-        *(o as *mut u64) = imm64b();
+        (*header(o)).shape = imm64b();
         let p = props(o);
         store_imm(p, v);
         if barrier_needed {
-            barrier(tag, p.sub(8), p.offset(imm() as isize), v);
+            barrier(tag, payload_cell(p), p.offset(imm() as isize), v);
         }
     }
 }
 
 /// Whether object `o`'s `props` have room for the slot at byte `imm`
-/// (`props_cap`, a u32 at byte 12, counts their slots).
+/// (`props_cap` counts their slots).
 #[inline(always)]
 unsafe fn props_room(o: *mut u8) -> bool {
-    (imm() as u32 / 8) < unsafe { *(o.add(12) as *const u32) }
+    (imm() as u32 / 8) < unsafe { (*header(o)).props_cap }
 }
 
 /// A keyed load stencil: `$ok` vets the receiver `$o`; `$int_key` says the
@@ -4211,10 +4195,10 @@ macro_rules! keyed_load {
             }
             let p = $o.to_bits() as *const u8;
             let i = int($s.acc) as u32;
-            if i >= *(p.add(32) as *const u32) {
+            if i >= (*header(p)).elems_len {
                 exit!($s)
             }
-            let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+            let v = *((*header(p)).elems.cast::<Value>()).add(i as usize);
             // x86-64: the hole check through `asm goto`, so the exit is the
             // conditional jump (folded straight to the exit stub) and the
             // continuation the final, trimmed one. LLVM otherwise ends with
@@ -4238,9 +4222,9 @@ macro_rules! keyed_load {
 }
 
 /// `o.length` for an array, string or typed array `o` at a boxed
-/// location: its elements' or code units' count (`Object::elems_len`, at
-/// byte 32), after a check that it is one (`Object::class` at byte 8 is
-/// `Class::Array`, 1, `Class::String`, 4, or `Class::TypedArray`, 7)
+/// location: its elements' or code units' count (`elems_len`), after a
+/// check that it is one (its class `Class::Array`, `Class::String` or
+/// `Class::TypedArray`)
 /// unless its shape is known (`_nc`); `_nt` takes no typed array (whose
 /// length may be stale once a fixed-length buffer has been detached: see
 /// `Vm::views_detached`).
@@ -4248,23 +4232,23 @@ macro_rules! array_length {
     ($loc:tt) => {
         stencil!("get_length_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !matches!(*(o.to_bits() as *const u8).add(8), 1 | 4 | 7) {
+            if !is_cell(s.tag, o) || !matches!((*cell(o)).class, class::ARRAY | class::STRING | class::TYPED_ARRAY) {
                 exit!(s)
             }
-            s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());
+            s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
         stencil!("get_length_nt_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !matches!(*(o.to_bits() as *const u8).add(8), 1 | 4) {
+            if !is_cell(s.tag, o) || !matches!((*cell(o)).class, class::ARRAY | class::STRING) {
                 exit!(s)
             }
-            s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());
+            s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
         stencil!("get_length_nc_", loc!($loc); |s| {
             let o = get!($loc, s);
-            s.acc = unboxed(*(o.to_bits() as *const u8).add(32).cast::<i32>());
+            s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
     };
@@ -4293,14 +4277,14 @@ macro_rules! set_keyed {
                 let $t = &$s;
                 $value
             };
-            let $code = **(p as *const *const u64);
-            if i >= *(p.add(32) as *const u32) || !($fits) {
+            let $code = (*shape_of(p)).elems_code;
+            if i >= (*header(p)).elems_len || !($fits) {
                 exit!($s)
             }
-            let at = (*(p.add(24) as *const *mut Value)).add(key as usize);
+            let at = ((*header(p)).elems.cast::<Value>()).add(key as usize);
             *at = $v;
             if $card {
-                barrier($s.tag, (*(p.add(24) as *const *const u8)).sub(8), at, $v);
+                barrier($s.tag, payload_cell((*header(p)).elems), at, $v);
             }
             next!($s)
         });
@@ -4336,19 +4320,19 @@ macro_rules! property_location {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             let p = props(o);
             store_imm(p, s.acc);
-            barrier(s.tag, p.sub(8), p.offset(imm() as isize), s.acc);
+            barrier(s.tag, payload_cell(p), p.offset(imm() as isize), s.acc);
             next!(s)
         });
         stencil!("set_tr_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            *(o as *mut u64) = imm64b();
+            (*header(o)).shape = imm64b();
             store_imm(o, s.acc);
             barrier(s.tag, o, o, s.acc);
             next!(s)
         });
         // A transition out of line (`jit::Prop::Transition` with `oop`): the
-        // object's `props` (byte 16) need room for the slot at byte `imm`
-        // (`props_cap`, a u32 at byte 12, counts slots); the slow helper
+        // object's `props` need room for the slot at byte `imm`
+        // (`props_cap` counts slots); the slow helper
         // makes it (`cloison_rt_props_room`), then stores.
         set_tro!("set_tro_", $loc, true, true);
         set_tro!("set_tro_n_", $loc, true, false);
@@ -4365,7 +4349,7 @@ macro_rules! property_location {
         });
         stencil!("set_tr_n_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            *(o as *mut u64) = imm64b();
+            (*header(o)).shape = imm64b();
             store_imm(o, s.acc);
             next!(s)
         });
@@ -4379,14 +4363,14 @@ macro_rules! property_location {
         });
         stencil!("set_tr_d_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            *(o as *mut u64) = imm64b();
+            (*header(o)).shape = imm64b();
             store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
             next!(s)
         });
         // `o[k] = acc`: an array (`_nc`: known to be one), an int32 key
         // within its length, a value its shape's elements' type
-        // (`Shape::elems_code`, at offset 0) fits; else leave before. `acc`
-        // boxed, or (`_i`) an int32, which fits codes 0 to 2, or (`_o`) an
+        // (`Shape::elems_code`) fits; else leave before. `acc`
+        // boxed, or (`_i`) an int32, which fits codes up to `FIELD_NUM`, or (`_o`) an
         // object, which fits code 0 or its shape. The key in r11 / x15
         // (`key_x`); the generic stencil's at `regs + imm`, its `__slow`
         // helper (a typed array, through the runtime) reading it there too.
@@ -4394,7 +4378,7 @@ macro_rules! property_location {
             let o = get!($loc, s);
             let key = load_imm(s.regs as *mut u8);
             if !is_array(s.tag, o) {
-                if is_cell(s.tag, o) && *(o.to_bits() as *const u8).add(8) == 7 {
+                if is_cell(s.tag, o) && (*cell(o)).class == class::TYPED_ARRAY {
                     slow!(s)
                 }
                 exit!(s)
@@ -4405,19 +4389,14 @@ macro_rules! property_location {
             let p = o.to_bits() as *mut u8;
             let i = int(key) as u32;
             let v = s.acc;
-            let code = **(p as *const *const u64);
-            let fits = match code {
-                0 => true,
-                1 => s.tag.is_int32(v),
-                2 => v.to_bits() & s.tag.to_bits() != 0,
-                sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
-            };
-            if i >= *(p.add(32) as *const u32) || !fits {
+            let code = (*shape_of(p)).elems_code;
+            let fits = fits_code(s.tag, code, v);
+            if i >= (*header(p)).elems_len || !fits {
                 exit!(s)
             }
-            let at = (*(p.add(24) as *const *mut Value)).add(i as usize);
+            let at = ((*header(p)).elems.cast::<Value>()).add(i as usize);
             *at = v;
-            barrier(s.tag, (*(p.add(24) as *const *const u8)).sub(8), at, v);
+            barrier(s.tag, payload_cell((*header(p)).elems), at, v);
             next!(s)
         }; |s| {
             let key = load_imm(s.regs as *mut u8);
@@ -4439,19 +4418,14 @@ macro_rules! property_location {
                 let p = o.to_bits() as *mut u8;
                 let i = int(key) as u32;
                 let v = s.acc;
-                let fits = match **(p as *const *const u64) {
-                    0 => true,
-                    1 => s.tag.is_int32(v),
-                    2 => v.to_bits() & s.tag.to_bits() != 0,
-                    sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
-                };
-                let len = *(p.add(32) as *const u32);
-                if fits && (i < len || i == len && len < *(p.add(36) as *const u32)) {
-                    let at = (*(p.add(24) as *const *mut Value)).add(i as usize);
+                let fits = fits_code(s.tag, (*shape_of(p)).elems_code, v);
+                let len = (*header(p)).elems_len;
+                if fits && (i < len || i == len && len < (*header(p)).elems_cap) {
+                    let at = ((*header(p)).elems.cast::<Value>()).add(i as usize);
                     *at = v;
-                    barrier(s.tag, (*(p.add(24) as *const *const u8)).sub(8), at, v);
+                    barrier(s.tag, payload_cell((*header(p)).elems), at, v);
                     if i == len {
-                        *(p.add(32) as *mut u32) = len + 1;
+                        (*header(p)).elems_len = len + 1;
                     }
                     next!(s)
                 }
@@ -4476,12 +4450,12 @@ macro_rules! property_location {
             if is_array(s.tag, o) {
                 let p = o.to_bits() as *mut u8;
                 let i = key as u32;
-                let len = *(p.add(32) as *const u32);
-                if **(p as *const *const u64) <= 2 && (i < len || i == len && len < *(p.add(36) as *const u32)) {
-                    *(*(p.add(24) as *const *mut Value)).add(i as usize) =
+                let len = (*header(p)).elems_len;
+                if (*shape_of(p)).elems_code <= FIELD_NUM && (i < len || i == len && len < (*header(p)).elems_cap) {
+                    *((*header(p)).elems.cast::<Value>()).add(i as usize) =
                         Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
                     if i == len {
-                        *(p.add(32) as *mut u32) = len + 1;
+                        (*header(p)).elems_len = len + 1;
                     }
                     next!(s)
                 }
@@ -4498,18 +4472,13 @@ macro_rules! property_location {
             }
             next!(s)
         });
-        set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= 2,
+        set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= FIELD_NUM,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
-        set_keyed!($loc, "o_", true, is_array, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
-        set_keyed!($loc, "nc_", true, |_, _| true, |s, v, code| match code {
-            0 => true,
-            1 => s.tag.is_int32(v),
-            2 => v.to_bits() & s.tag.to_bits() != 0,
-            sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
-        }, |s| s.acc);
-        set_keyed!($loc, "nc_i_", false, |_, _| true, |s, v, code| code <= 2,
+        set_keyed!($loc, "o_", true, is_array, |s, v, code| code == FIELD_ANY || code == (*cell(v)).shape, |s| s.acc);
+        set_keyed!($loc, "nc_", true, |_, _| true, |s, v, code| fits_code(s.tag, code, v), |s| s.acc);
+        set_keyed!($loc, "nc_i_", false, |_, _| true, |s, v, code| code <= FIELD_NUM,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
-        set_keyed!($loc, "nc_o_", true, |_, _| true, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);
+        set_keyed!($loc, "nc_o_", true, |_, _| true, |s, v, code| code == FIELD_ANY || code == (*cell(v)).shape, |s| s.acc);
         // The array's exact shape known, so its elements' type: any
         // (`nc_a`), numbers (`nc_n`), or an int32 into int32s, numbers or
         // any (`nc_ia`): no dispatch on the code.
@@ -4540,25 +4509,25 @@ macro_rules! property_location {
         // string's, a symbol's, a BigInt's).
         stencil!("guard_object_", loc!($loc); |s| {
             let v = get!($loc, s);
-            if !is_cell(s.tag, v) || (imm() as u32 >> *(v.to_bits() as *const u8).add(8)) & 1 != 0 {
+            if !is_cell(s.tag, v) || (imm() as u32 >> (*cell(v)).class) & 1 != 0 {
                 exit!(s)
             }
             next!(s)
         });
         stencil!("shape_jeq_", loc!($loc); |s| {
-            if *(get!($loc, s).to_bits() as *const u64) == imm64() {
+            if (*cell(get!($loc, s))).shape == imm64() {
                 jump!(s)
             }
             next!(s)
         });
         stencil!("shape_jne_", loc!($loc); |s| {
-            if *(get!($loc, s).to_bits() as *const u64) != imm64() {
+            if (*cell(get!($loc, s))).shape != imm64() {
                 jump!(s)
             }
             next!(s)
         });
         stencil!("shape_guard_", loc!($loc); |s| {
-            if *(get!($loc, s).to_bits() as *const u64) != imm64() {
+            if (*cell(get!($loc, s))).shape != imm64() {
                 exit!(s)
             }
             next!(s)
@@ -4567,19 +4536,19 @@ macro_rules! property_location {
         // 8): any shape differing from the cached ones in its elements'
         // type alone.
         stencil!("family_jeq_", loc!($loc); |s| {
-            if *(*(get!($loc, s).to_bits() as *const *const u64)).add(1) == imm64() {
+            if (*shape_of(get!($loc, s).to_bits() as *const u8)).family == imm64() {
                 jump!(s)
             }
             next!(s)
         });
         stencil!("family_jne_", loc!($loc); |s| {
-            if *(*(get!($loc, s).to_bits() as *const *const u64)).add(1) != imm64() {
+            if (*shape_of(get!($loc, s).to_bits() as *const u8)).family != imm64() {
                 jump!(s)
             }
             next!(s)
         });
         stencil!("family_guard_", loc!($loc); |s| {
-            if *(*(get!($loc, s).to_bits() as *const *const u64)).add(1) != imm64() {
+            if (*shape_of(get!($loc, s).to_bits() as *const u8)).family != imm64() {
                 exit!(s)
             }
             next!(s)
@@ -4605,7 +4574,7 @@ macro_rules! property_location {
         });
         stencil!("set_tr_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
-            *(o as *mut u64) = imm64b();
+            (*header(o)).shape = imm64b();
             store_imm(o, s.acc);
             barrier(s.tag, o, o, s.acc);
             next!(s)
@@ -4613,7 +4582,7 @@ macro_rules! property_location {
         stencil!("set_oop_nc_", loc!($loc); |s| {
             let p = props(get!($loc, s).to_bits() as *mut u8);
             store_imm(p, s.acc);
-            barrier(s.tag, p.sub(8), p.offset(imm() as isize), s.acc);
+            barrier(s.tag, payload_cell(p), p.offset(imm() as isize), s.acc);
             next!(s)
         });
         stencil!("set_own_n_nc_", loc!($loc); |s| {
@@ -4622,7 +4591,7 @@ macro_rules! property_location {
         });
         stencil!("set_tr_n_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
-            *(o as *mut u64) = imm64b();
+            (*header(o)).shape = imm64b();
             store_imm(o, s.acc);
             next!(s)
         });
@@ -4632,7 +4601,7 @@ macro_rules! property_location {
         });
         stencil!("set_tr_d_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
-            *(o as *mut u64) = imm64b();
+            (*header(o)).shape = imm64b();
             store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
             next!(s)
         });
@@ -4642,16 +4611,16 @@ macro_rules! property_location {
         });
         set_tro!("set_tro_nc_", $loc, false, true);
         set_tro!("set_tro_n_nc_", $loc, false, false);
-        // Elements at offset 24, length (u32) at 32. A hole is `EMPTY` (0).
+        // Elements at `elems`, `elems_len` of them. A hole is `EMPTY` (0).
         // `_i`: the key is known to be an int32. `_nc`: the receiver is
         // known to be an object; `_sh`: its shape must be `imm64` (the
         // elements' type comes with it).
-        // An object whose elements are values: not a string (class 4, at
-        // byte 8: code units), a buffer or a typed array (6 and 7: bytes).
+        // An object whose elements are values: not a string (code units),
+        // a buffer or a typed array (bytes).
         keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell(s.tag, o)
-            && matches!(*(o.to_bits() as *const u8).add(8), 0..=3 | 5));
+            && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
         keyed_load!($loc, "get_keyed_", false, |s, o| is_cell(s.tag, o)
-            && matches!(*(o.to_bits() as *const u8).add(8), 0..=3 | 5));
+            && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
         // `acc = o[acc]` through the runtime (`acc` boxed): a typed array's
         // element, or a site whose receivers the fast ones keep leaving
         // for. Leaves only where it would throw or call a function.
@@ -4694,7 +4663,7 @@ macro_rules! property_location {
         });
         // `s[i]` for a string `s` (its shape known): a flat string's unit
         // below 256, the VM's string of it from the table at `imm64`, after
-        // a check of `i` against its length (`elems_len`, byte 32); `_i`,
+        // a check of `i` against its length (`elems_len`); `_i`,
         // `i` an int32 in `acc`. Else (a cons string, a unit past 255, an
         // index out of bounds or not an int32) the runtime's.
         stencil_slow!("str_get_", loc!($loc); |s| {
@@ -4739,16 +4708,16 @@ macro_rules! property_location {
             if is_cell(s.tag, o) && s.tag.is_int32(s.acc) {
                 let p = o.to_bits() as *const u8;
                 let i = int(s.acc) as u32;
-                let class = *p.add(8);
-                if i < *(p.add(32) as *const u32) {
-                    if matches!(class, 0..=3 | 5) {
-                        let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+                let cls = (*header(p)).class;
+                if i < (*header(p)).elems_len {
+                    if matches!(cls, class::PLAIN..=class::NATIVE | class::DATE) {
+                        let v = *((*header(p)).elems.cast::<Value>()).add(i as usize);
                         if v.to_bits() != 0 {
                             s.acc = v;
                             next!(s)
                         }
-                    } else if class == 4 {
-                        let units = *(p.add(24) as *const *const u16);
+                    } else if cls == class::STRING {
+                        let units = (*header(p)).elems.cast::<u16>();
                         if !units.is_null() {
                             let c = *units.add(i as usize);
                             if c < 256 {
@@ -4817,8 +4786,8 @@ macro_rules! property_location {
         stencil_slow!("get_keyed_i_nc_rt_", loc!($loc); |s| {
             let p = get!($loc, s).to_bits() as *const u8;
             let i = int(s.acc) as u32;
-            if i < *(p.add(32) as *const u32) {
-                let v = *(*(p.add(24) as *const *const Value)).add(i as usize);
+            if i < (*header(p)).elems_len {
+                let v = *((*header(p)).elems.cast::<Value>()).add(i as usize);
                 if v.to_bits() != 0 {
                     s.acc = v;
                     next!(s)
@@ -4877,22 +4846,21 @@ with_gprs!(each_gpr! load_to_gpr);
 // ---- Typed arrays' elements ----
 //
 // `o[acc]` and `o[k] = acc` for a typed array `o` of a known element kind
-// (`jit::typed_kind`): `elems` (byte 24) points to its first element,
-// `elems_len` (byte 32) is its length. An index out of bounds exits (the
-// interpreter reads `undefined`, stores nothing). `_chk` first checks that
-// `o` is a typed array (`class`, byte 8, 7) of the kind the inline cache
-// saw (`kind`, byte 10): the word at byte 8, its flags (byte 9) masked
-// off, is `imm`, `7 | kind << 16`.
+// (`jit::typed_kind`): `elems` points to its first element, `elems_len`
+// is its length. An index out of bounds exits (the interpreter reads
+// `undefined`, stores nothing). `_chk` first checks that `o` is a typed
+// array of the kind the inline cache saw: its class and kind
+// (`layout::class_kind`) are `imm`, `TypedArray | kind << 16`.
 
 /// The typed array at `o` and its element `i`'s address, `size` bytes
 /// each, if `i` is in bounds.
 #[inline(always)]
 unsafe fn typed_elem(o: Value, i: u32, size: usize) -> Option<*mut u8> {
     let p = o.to_bits() as *const u8;
-    if i >= unsafe { *(p.add(32) as *const u32) } {
+    if i >= unsafe { (*header(p)).elems_len } {
         return None;
     }
-    Some(unsafe { elem_at(*(p.add(24) as *const *mut u8), i, size) })
+    Some(unsafe { elem_at((*header(p)).elems, i, size) })
 }
 
 /// Element `i` of `size` bytes at `elems`, indexed through a pointer of
@@ -4910,12 +4878,12 @@ unsafe fn elem_at(elems: *mut u8, i: u32, size: usize) -> *mut u8 {
     }
 }
 
-/// Whether `o` is a typed array of kind `k`: class and kind, its bytes 8
-/// and 10, are `want` (`7 | k << 16`).
+/// Whether `o` is a typed array of kind `k`: its class and kind
+/// (`layout::class_kind`) are `want` (`TypedArray | k << 16`).
 #[inline(always)]
 unsafe fn is_typed(tag: NumberTag, o: Value, want: u32) -> bool {
     let p = o.to_bits() as *const u8;
-    is_cell(tag, o) && unsafe { *(p.add(8) as *const u32) & 0xff00ff == want }
+    is_cell(tag, o) && unsafe { class_kind(header(p)) == want }
 }
 
 /// A double read from a float array's bytes, its NaNs made the canonical
@@ -4993,10 +4961,10 @@ macro_rules! typed_store {
 unsafe fn typed_elem_x(o: Value, i: u64, size: usize) -> Option<*mut u8> {
     let p = o.to_bits() as *const u8;
     // (A 32-bit compare: the key's high half is zero.)
-    if i as u32 >= unsafe { *(p.add(32) as *const u32) } {
+    if i as u32 >= unsafe { (*header(p)).elems_len } {
         return None;
     }
-    Some(unsafe { elem_at(*(p.add(24) as *const *mut u8), i as u32, size) })
+    Some(unsafe { elem_at((*header(p)).elems, i as u32, size) })
 }
 
 // ---- A keyed store's key in a scratch register ----
@@ -5138,15 +5106,12 @@ with_gprs!(each_gpr! typed_gpr);
 // every function object with upvalues has as many of (`Vm::upvalues`).
 // `_c`: the cell at `imm64`.
 
-/// `interp::FUNC_OFF` (the JIT checks they agree).
-const FUNC_OFF: usize = 80;
-
-/// The upvalue (its payload: `at`, then `closed`) of the frame's function.
+/// The upvalue (its payload) of the frame's function.
 #[inline(always)]
-unsafe fn upvalue_cell(regs: *mut Value) -> *const *mut Value {
+unsafe fn upvalue_cell(regs: *mut Value) -> *const Upvalue {
     unsafe {
         let f = *(regs.byte_sub(FUNC_OFF) as *const *mut u8);
-        load_imm(f).to_bits() as *const *mut Value
+        load_imm(f).to_bits() as *const Upvalue
     }
 }
 
@@ -5162,48 +5127,48 @@ stencil!("set_frame_func_r"; |s| {
     next!(s)
 });
 stencil!("lda_upvalue"; |s| {
-    s.acc = **upvalue_cell(s.regs);
+    s.acc = *(*upvalue_cell(s.regs)).at;
     next!(s)
 });
 stencil!("sta_upvalue"; |s| {
     let u = upvalue_cell(s.regs);
-    **u = s.acc;
+    *(*u).at = s.acc;
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
 // An inlined frame's (`Prop::UpvalueAt`): its function at `imm64` bytes
 // from the registers (in its header), the cell `imm` bytes into it.
 #[inline(always)]
-unsafe fn upvalue_cell_at(regs: *mut Value) -> *const *mut Value {
+unsafe fn upvalue_cell_at(regs: *mut Value) -> *const Upvalue {
     unsafe {
         let f = *((regs as *const u8).offset(imm64() as i64 as isize) as *const *mut u8);
-        load_imm(f).to_bits() as *const *mut Value
+        load_imm(f).to_bits() as *const Upvalue
     }
 }
 stencil!("lda_upvalue_fr"; |s| {
-    s.acc = **upvalue_cell_at(s.regs);
+    s.acc = *(*upvalue_cell_at(s.regs)).at;
     next!(s)
 });
 stencil!("sta_upvalue_fr"; |s| {
     let u = upvalue_cell_at(s.regs);
-    **u = s.acc;
+    *(*u).at = s.acc;
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
 stencil!("lda_upvalue_c"; |s| {
-    s.acc = **(imm64() as *const *const Value);
+    s.acc = *(*(imm64() as *const Upvalue)).at;
     next!(s)
 });
 stencil!("sta_upvalue_c"; |s| {
-    let u = imm64() as *const *mut Value;
-    **u = s.acc;
+    let u = imm64() as *const Upvalue;
+    *(*u).at = s.acc;
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
 
 stencil!("lda_global"; |s| {
     let g = imm64b() as *mut u8;
-    if *(g as *const u64) != imm64() {
+    if (*header(g)).shape != imm64() {
         exit!(s)
     }
     s.acc = load_imm(g);
@@ -5211,7 +5176,7 @@ stencil!("lda_global"; |s| {
 });
 stencil!("lda_global_oop"; |s| {
     let g = imm64b() as *mut u8;
-    if *(g as *const u64) != imm64() {
+    if (*header(g)).shape != imm64() {
         exit!(s)
     }
     s.acc = load_imm(props(g));
@@ -5219,7 +5184,7 @@ stencil!("lda_global_oop"; |s| {
 });
 stencil!("sta_global"; |s| {
     let g = imm64b() as *mut u8;
-    if *(g as *const u64) != imm64() {
+    if (*header(g)).shape != imm64() {
         exit!(s)
     }
     store_imm(g, s.acc);
@@ -5228,12 +5193,12 @@ stencil!("sta_global"; |s| {
 });
 stencil!("sta_global_oop"; |s| {
     let g = imm64b() as *mut u8;
-    if *(g as *const u64) != imm64() {
+    if (*header(g)).shape != imm64() {
         exit!(s)
     }
     let p = props(g);
     store_imm(p, s.acc);
-    barrier(s.tag, p.sub(8), p.offset(imm() as isize), s.acc);
+    barrier(s.tag, payload_cell(p), p.offset(imm() as isize), s.acc);
     next!(s)
 });
 
@@ -5259,7 +5224,7 @@ stencil!("check_acc_num"; |s| {
     next!(s)
 });
 stencil!("check_acc_shape"; |s| {
-    if !is_cell(s.tag, s.acc) || *(s.acc.to_bits() as *const u64) != imm64() {
+    if !is_cell(s.tag, s.acc) || (*cell(s.acc)).shape != imm64() {
         exit!(s)
     }
     next!(s)
@@ -5313,28 +5278,6 @@ stencil!("call"; |s| {
     next!(s)
 });
 
-/// The part of a call site (`jit::CallSite`, `repr(C)`) that `call_direct`
-/// and `construct_direct` read. Offsets are in bytes from the caller's
-/// registers.
-#[repr(C)]
-struct DirectSite {
-    /// The callee's compiled entry; 0: call through the runtime.
-    entry: u64,
-    /// The function compiled: the callee register must hold it.
-    closure: u64,
-    f_off: u64,
-    /// Where the callee's compiled frame ends: before `stack_end`.
-    end_off: u64,
-    stack_end: u64,
-    native_limit: u64,
-    this_shape: u64,
-    /// For `new`: how to allocate `this` (null if not a direct `new`).
-    ctor: *mut CtorAlloc,
-    /// Sites for other callees, by the callee's address (bits 4 and up),
-    /// or null (`jit::Dispatch`).
-    table: *const *const DirectSite,
-}
-
 /// The site in `site`'s table (`jit::Dispatch`) for callee `key` (the
 /// function, or its code for a site bound by code), if it has an entry and
 /// the VM stack room for the callee's frame from `base`.
@@ -5345,28 +5288,13 @@ unsafe fn dispatched(site: *const DirectSite, key: u64, base: *const u8) -> Opti
         if table.is_null() {
             return None;
         }
-        let d = *table.add((key >> 4) as usize % 1024);
+        let d = *table.add(dispatch_slot(key));
         (!d.is_null()
             && (*d).closure == key
             && (*d).entry != 0
             && base as u64 + (*d).end_off <= (*d).stack_end)
             .then_some(d)
     }
-}
-
-/// `jit::CtorSite`: how `construct_direct` allocates `this`.
-#[repr(C)]
-struct CtorAlloc {
-    /// The VM heap's free space (`heap::Heap::bump`).
-    heap: *mut HeapPtrs,
-    proto_at: *const u64,
-    proto: u64,
-    cap_at: *const u32,
-    cap: u64,
-    slots: u64,
-    this_off: u64,
-    done_shape: u64,
-    header: [u64; 6],
 }
 
 /// `rt_call!` to `cloison_rt_enter`, whose wrapper (`arch::enter_wrapper` in
@@ -5420,15 +5348,15 @@ stencil!("call_direct"; |s| {
 // `call_direct` for a site bound to a function's code, not one closure of
 // it (`DirectSite::closure` is the `Code`): one made anew at each call of
 // the function making it. The callee register must hold a bytecode
-// function (class 2, at byte 8) of that code (at byte 40); its frame's
+// function (`Class::Function`) of that code (`code`); its frame's
 // header gets it (`set_frame_func_r`).
 stencil!("call_direct_code"; |s| {
     let regs = Value::from_bits(s.regs as u64);
     let site = imm64() as *const DirectSite;
     let base = s.regs as *const u8;
     let f = *(base.add((*site).f_off as usize) as *const u64);
-    let function = f != 0 && is_cell(s.tag, Value::from_bits(f)) && *(f as *const u8).add(8) == 2;
-    let code = if function { *((f as *const u8).add(40) as *const u64) } else { 0 };
+    let function = f != 0 && is_cell(s.tag, Value::from_bits(f)) && (*header(f as *const u8)).class == class::FUNCTION;
+    let code = if function { (*header(f as *const u8)).code } else { 0 };
     let r = if (*site).entry != 0
         && function
         && code == (*site).closure
@@ -5493,14 +5421,14 @@ stencil!("construct_direct"; |s| {
         let c = (*site).ctor;
         if *(*c).proto_at == (*c).proto
             && *(*c).cap_at as u64 == (*c).cap
-            && let Some(p) = bump((*c).heap, 6 + (*c).slots as usize)
+            && let Some(p) = bump((*c).heap, HEADER_WORDS + (*c).slots as usize)
         {
             // The header, and the slots zero (`Value::EMPTY`): a
             // collection reads them (holes aren't zeroed).
-            for k in 0..6 {
+            for k in 0..HEADER_WORDS {
                 *p.add(k) = (*c).header[k];
             }
-            for k in 6..6 + (*c).slots as usize {
+            for k in HEADER_WORDS..HEADER_WORDS + (*c).slots as usize {
                 p.add(k).write_volatile(0);
             }
             *(base.add((*c).this_off as usize) as *mut u64) = p as u64;
@@ -5613,18 +5541,12 @@ stencil!("materialize"; |s| {
 // `a.push(v)` (`a` in its slot, `v` in `acc`, boxed; `_i`: an int32): a
 // store at the end and the length bumped, if `a` is an array (else leave
 // before the call; `_nc`: known to be one) whose elements have room and
-// whose shape's elements' type (`Shape::elems_code`, at offset 0) `v`
+// whose shape's elements' type (`Shape::elems_code`) `v`
 // fits; otherwise the runtime pushes (growing the elements, moving `a` to a
 // more general shape). `acc` = the new length, an int32.
 // `a.pop()` (`a` in its slot): the last element, its slot made a hole and
 // the length one less, or `undefined` if empty (or a hole), if `a` is an
 // array; else leave before the call.
-/// `vm::NO_ELEMENTS`: the elements' code of a shape with no elements yet.
-const NO_ELEMENTS: u64 = 3;
-/// `object::PUSH_WAYS`, and the word of `object::PushCache::any`.
-const PUSH_WAYS: usize = 4;
-const PUSH_ANY: usize = 2 * PUSH_WAYS;
-
 /// The elements a push's helper gives an array without any (as a new one).
 /// In Octane's DeltaBlue, 7.3M of 8.9M pushes through the runtime were the
 /// first onto an array; allocating them with every array instead cost
@@ -5634,10 +5556,10 @@ const FIRST_ELEMENTS: usize = 4;
 /// If the array at `o` has no room for elements at all, give it
 /// [`FIRST_ELEMENTS`] (`undefined`) from the heap's free space (`imm64`:
 /// `Heap::bump`), if there is that much: an array cell, its header word
-/// (`heap::VALUES`, the capacity) and the values.
+/// (`VALUES`, the capacity) and the values.
 #[inline(always)]
 unsafe fn first_elements(o: *mut u8) {
-    if *(o.add(36) as *const u32) != 0 {
+    if (*header(o)).elems_cap != 0 {
         return;
     }
     let heap = imm64() as *mut HeapPtrs;
@@ -5645,19 +5567,19 @@ unsafe fn first_elements(o: *mut u8) {
         return;
     }
     let Some(p) = bump(heap, 1 + FIRST_ELEMENTS) else { return };
-    *p = 1 | (FIRST_ELEMENTS as u64) << 32;
+    *p = VALUES | (FIRST_ELEMENTS as u64) << 32;
     let p = p.add(1);
     // Volatile: LLVM would vectorize the stores from a constant pool,
     // which a stencil can't refer to.
     for k in 0..FIRST_ELEMENTS {
         p.add(k).write_volatile(Value::UNDEFINED.to_bits());
     }
-    *(o.add(24) as *mut *mut u64) = p;
+    (*header(o)).elems = p.cast();
     // (A young array: only an old array needs the card.)
     if meta_of(o as usize) != YOUNG {
         card_mark(o);
     }
-    *(o.add(36) as *mut u32) = FIRST_ELEMENTS as u32;
+    (*header(o)).elems_cap = FIRST_ELEMENTS as u32;
 }
 
 /// For a push of `v` that doesn't fit the elements of an array of `shape`
@@ -5666,40 +5588,39 @@ unsafe fn first_elements(o: *mut u8) {
 /// `object::PushCache`), else 0. An int32 onto int32 elements fits; another
 /// number generalizes them to numbers, which is left to the runtime.
 #[inline(always)]
-unsafe fn push_transition(tag: NumberTag, shape: *const u64, v: Value) -> u64 {
-    let code = *shape;
-    // `Shape::push`, an `object::PushCache`.
-    let cache = *shape.add(2) as *const u64;
+unsafe fn push_transition(tag: NumberTag, shape: *const ShapeHead, v: Value) -> u64 {
+    let code = (*shape).elems_code;
+    let cache = (*shape).push;
     if cache.is_null() {
         return 0;
     }
     let number = v.to_bits() & tag.to_bits() != 0;
     if code == NO_ELEMENTS {
+        // `object::push_key`.
         let key = if tag.is_int32(v) {
-            1
+            FIELD_INT
         } else if number {
-            2
+            FIELD_NUM
         } else if is_cell(tag, v) {
-            *(v.to_bits() as *const u64)
+            (*cell(v)).shape
         } else {
-            0
+            FIELD_ANY
         };
         push_target(cache, key)
-    } else if code == 1 && number || code == 0 {
+    } else if code == FIELD_INT && number || code == FIELD_ANY {
         0
     } else {
-        *cache.add(PUSH_ANY)
+        (*cache).any
     }
 }
 
-/// The shape `PushCache::to` (at `cache`) moves an array to for a value of
-/// key `key`, or 0.
+/// The shape `cache.to` moves an array to for a value of key `key`, or 0.
 #[inline(always)]
-unsafe fn push_target(cache: *const u64, key: u64) -> u64 {
+unsafe fn push_target(cache: *const PushCache, key: u64) -> u64 {
     let mut to = 0;
     for k in 0..PUSH_WAYS {
-        if to == 0 && *cache.add(2 * k) == key {
-            to = *cache.add(2 * k + 1);
+        if to == 0 && (*cache).to[k].0 == key {
+            to = (*cache).to[k].1;
         }
     }
     to
@@ -5716,29 +5637,37 @@ unsafe fn own_element_store(tag: NumberTag, o: Value, key: Value, v: Value, int3
     }
     let p = o.to_bits() as *mut u8;
     unsafe {
-        let fits = match **(p as *const *const u64) {
-            code if int32 => code <= 2,
-            0 => true,
-            1 => tag.is_int32(v),
-            2 => v.to_bits() & tag.to_bits() != 0,
-            sh => is_cell(tag, v) && *(v.to_bits() as *const u64) == sh,
-        };
+        let code = (*shape_of(p)).elems_code;
+        // (An int32 fits every code up to `FIELD_NUM`.)
+        let fits = if int32 { code <= FIELD_NUM } else { fits_code(tag, code, v) };
         let i = int(key) as u32;
-        if !fits || i >= *(p.add(32) as *const u32) {
+        if !fits || i >= (*header(p)).elems_len {
             return false;
         }
-        let at = (*(p.add(24) as *const *mut Value)).add(i as usize);
+        let at = ((*header(p)).elems.cast::<Value>()).add(i as usize);
         *at = v;
         if !int32 {
-            barrier(tag, (*(p.add(24) as *const *const u8)).sub(8), at, v);
+            barrier(tag, payload_cell((*header(p)).elems), at, v);
         }
         true
     }
 }
 
+/// Whether `v` fits elements' or a field's type `code` (`FIELD_*`, or a
+/// shape: objects of it).
+#[inline(always)]
+unsafe fn fits_code(tag: NumberTag, code: u64, v: Value) -> bool {
+    match code {
+        FIELD_ANY => true,
+        FIELD_INT => tag.is_int32(v),
+        FIELD_NUM => v.to_bits() & tag.to_bits() != 0,
+        sh => is_cell(tag, v) && unsafe { (*cell(v)).shape } == sh,
+    }
+}
+
 #[inline(always)]
 fn is_array(tag: NumberTag, a: Value) -> bool {
-    is_cell(tag, a) && unsafe { *(a.to_bits() as *const u8).add(8) } == 1
+    is_cell(tag, a) && unsafe { (*cell(a)).class } == class::ARRAY
 }
 macro_rules! array_methods {
     ($loc:tt, $nc:literal, $array:expr) => {
@@ -5749,20 +5678,15 @@ macro_rules! array_methods {
                 exit!(s)
             }
             let o = a.to_bits() as *mut u8;
-            let fits = match **(o as *const *const u64) {
-                0 => true,
-                1 => s.tag.is_int32(v),
-                2 => v.to_bits() & s.tag.to_bits() != 0,
-                sh => is_cell(s.tag, v) && *(v.to_bits() as *const u64) == sh,
-            };
-            let len = *(o.add(32) as *const u32);
-            if !fits || len >= *(o.add(36) as *const u32) {
+            let fits = fits_code(s.tag, (*shape_of(o)).elems_code, v);
+            let len = (*header(o)).elems_len;
+            if !fits || len >= (*header(o)).elems_cap {
                 slow!(s)
             }
-            let at = (*(o.add(24) as *const *mut Value)).add(len as usize);
+            let at = ((*header(o)).elems.cast::<Value>()).add(len as usize);
             *at = v;
-            barrier(s.tag, (*(o.add(24) as *const *const u8)).sub(8), at, v);
-            *(o.add(32) as *mut u32) = len + 1;
+            barrier(s.tag, payload_cell((*header(o)).elems), at, v);
+            (*header(o)).elems_len = len + 1;
             s.acc = unboxed(len as i32 + 1);
             next!(s)
         }; |s| {
@@ -5771,16 +5695,16 @@ macro_rules! array_methods {
             let a = get!($loc, s);
             let v = s.acc;
             let o = a.to_bits() as *mut u8;
-            let len = *(o.add(32) as *const u32);
+            let len = (*header(o)).elems_len;
             first_elements(o);
-            if len < *(o.add(36) as *const u32) {
-                let to = push_transition(s.tag, *(o as *const *const u64), v);
+            if len < (*header(o)).elems_cap {
+                let to = push_transition(s.tag, shape_of(o), v);
                 if to != 0 {
-                    *(o as *mut u64) = to;
-                    let at = (*(o.add(24) as *const *mut Value)).add(len as usize);
+                    (*header(o)).shape = to;
+                    let at = ((*header(o)).elems.cast::<Value>()).add(len as usize);
                     *at = v;
-                    barrier(s.tag, (*(o.add(24) as *const *const u8)).sub(8), at, v);
-                    *(o.add(32) as *mut u32) = len + 1;
+                    barrier(s.tag, payload_cell((*header(o)).elems), at, v);
+                    (*header(o)).elems_len = len + 1;
                     s.acc = unboxed(len as i32 + 1);
                     next!(s)
                 }
@@ -5796,12 +5720,12 @@ macro_rules! array_methods {
                 exit!(s)
             }
             let o = a.to_bits() as *mut u8;
-            let len = *(o.add(32) as *const u32);
-            if **(o as *const *const u64) > 2 || len >= *(o.add(36) as *const u32) {
+            let len = (*header(o)).elems_len;
+            if (*shape_of(o)).elems_code > FIELD_NUM || len >= (*header(o)).elems_cap {
                 slow!(s)
             }
-            *(*(o.add(24) as *const *mut u64)).add(len as usize) = s.acc.to_bits() as u32 as u64 | s.tag.to_bits();
-            *(o.add(32) as *mut u32) = len + 1;
+            *((*header(o)).elems.cast::<u64>()).add(len as usize) = s.acc.to_bits() as u32 as u64 | s.tag.to_bits();
+            (*header(o)).elems_len = len + 1;
             s.acc = unboxed(len as i32 + 1);
             next!(s)
         }; |s| {
@@ -5809,14 +5733,14 @@ macro_rules! array_methods {
             let a = get!($loc, s);
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             let o = a.to_bits() as *mut u8;
-            let len = *(o.add(32) as *const u32);
+            let len = (*header(o)).elems_len;
             first_elements(o);
-            if len < *(o.add(36) as *const u32) {
-                let to = push_transition(s.tag, *(o as *const *const u64), v);
+            if len < (*header(o)).elems_cap {
+                let to = push_transition(s.tag, shape_of(o), v);
                 if to != 0 {
-                    *(o as *mut u64) = to;
-                    *(*(o.add(24) as *const *mut Value)).add(len as usize) = v;
-                    *(o.add(32) as *mut u32) = len + 1;
+                    (*header(o)).shape = to;
+                    *((*header(o)).elems.cast::<Value>()).add(len as usize) = v;
+                    (*header(o)).elems_len = len + 1;
                     s.acc = unboxed(len as i32 + 1);
                     next!(s)
                 }
@@ -5830,13 +5754,13 @@ macro_rules! array_methods {
                 exit!(s)
             }
             let o = a.to_bits() as *mut u8;
-            let len = *(o.add(32) as *const u32);
+            let len = (*header(o)).elems_len;
             s.acc = Value::UNDEFINED;
             if len != 0 {
-                let at = (*(o.add(24) as *const *mut Value)).add(len as usize - 1);
+                let at = ((*header(o)).elems.cast::<Value>()).add(len as usize - 1);
                 let v = *at;
                 *at = Value::EMPTY;
-                *(o.add(32) as *mut u32) = len - 1;
+                (*header(o)).elems_len = len - 1;
                 if v != Value::EMPTY {
                     s.acc = v;
                 }
@@ -5859,19 +5783,18 @@ with_gprs!(each_gpr! array_methods_gpr);
 
 // `s.charCodeAt(i)` (`jit`'s `Insn::native` 4), after a guard on the
 // callee: the receiver `s` at a location, `i` in `acc`, boxed or (`_i`) an
-// int32. A flat string's unit (`Object::elems`, at byte 24, its count at
-// 32); else (a cons string, an index not an int32) the runtime's, or leave
+// int32. A flat string's unit (`elems`, `elems_len` of them); else (a cons string, an index not an int32) the runtime's, or leave
 // where that is no unit (`NaN`) or the receiver no string.
 macro_rules! char_code_at {
     ($loc:tt, $i:literal, |$s:ident| $index:expr) => {
         stencil_slow!("char_code_at_", $i, loc!($loc); |s| {
             let a = get!($loc, s);
             let $s = &s;
-            if is_cell(s.tag, a) && *(a.to_bits() as *const u8).add(8) == 4 && ($index).is_some() {
+            if is_string(s.tag, a) && ($index).is_some() {
                 let o = a.to_bits() as *const u8;
-                let units = *(o.add(24) as *const *const u16);
+                let units = (*header(o)).elems.cast::<u16>();
                 let k = int(s.acc) as u32;
-                if !units.is_null() && k < *(o.add(32) as *const u32) {
+                if !units.is_null() && k < (*header(o)).elems_len {
                     s.acc = unboxed(*units.add(k as usize) as i32);
                     next!(s)
                 }
@@ -6028,14 +5951,14 @@ macro_rules! check_callee {
             next!(s)
         });
         // A call inlined for any closure of a code (`CODE_GUARD`): the
-        // callee a function (`Class::Function`, 2, at byte 8) running it
-        // (`code`, byte 40, is `imm64`), written to the inlined frame's
+        // callee a function (`Class::Function`) running it
+        // (`code` is `imm64`), written to the inlined frame's
         // header (`imm` bytes from the registers), where its upvalues are
         // read (`lda_upvalue_fr`).
         stencil!("check_callee_code_", loc!($loc); |s| {
             let f = get!($loc, s);
             let p = f.to_bits() as *const u8;
-            if !is_cell(s.tag, f) || *p.add(8) != 2 || *(p.add(40) as *const u64) != imm64() {
+            if !is_cell(s.tag, f) || (*header(p)).class != class::FUNCTION || (*header(p)).code != imm64() {
                 exit!(s)
             }
             *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = f.to_bits();
@@ -6094,72 +6017,24 @@ with_gprs!(each_gpr! check_tail_callee_gpr);
 // | `end`  | its length |
 // | `pos`  | the position (never past `end`) |
 // | `bt`   | the backtracking stack's top (it grows up), two words an entry |
-// | `regs` | registers: 0 scratch, then the program's, then two per group (start, end; `RX_NONE` start: unset) |
-// | `ctx`  | [`RxCtx`] |
+// | `regs` | registers: 0 scratch, then the program's, then two per group (start, end; `rx::NONE` start: unset) |
+// | `ctx`  | [`rx::Ctx`] |
 //
 // A failing instruction jumps to `cloison_jump_target`, the shared `rx_fail`,
-// which pops entries: one tagged `RX_TAG | r` restores register `r`; any
+// which pops entries: one tagged `rx::TAG | r` restores register `r`; any
 // other is a code address to resume at, with its position. The bottom
 // entry resumes at `rx_nomatch`. Code returns the match's end, or
-// `RX_NOMATCH`, or `RX_BAIL` (the stack is full, or a unit past ASCII
+// `rx::NOMATCH`, or `rx::BAIL` (the stack is full, or a unit past ASCII
 // needs case folding): the attempt is then the interpreter's.
 
-#[repr(C)]
-pub struct RxCtx {
-    /// The stack's end, less room for two entries.
-    limit: *mut usize,
-    /// Classes past ASCII, by `Class`'s `k`.
-    classes: *const RxClass,
-    /// Whether case is folded: a unit past ASCII in a class or a folded
-    /// character bails.
-    ic: usize,
-}
-
-#[repr(C)]
-pub struct RxClass {
-    ranges: *const [u16; 2],
-    n: usize,
-    neg: usize,
-}
-
-/// A repetition of one unit (`Run`, `LazyRun`) and its backtracking piece.
-#[repr(C)]
-pub struct RxRun {
-    min: usize,
-    max: usize,
-    /// The backtracking piece's address.
-    back: usize,
-    /// The unit: a class's ASCII bits and `k`; a character in `k` (folded:
-    /// `c | canon << 16`).
-    lo: u64,
-    hi: u64,
-    k: usize,
-}
-
-/// A counted repetition's head (`Head`).
-#[repr(C)]
-pub struct RxHead {
-    c: usize,
-    min: usize,
-    max: usize,
-    /// The addresses of what follows the loop and of its body.
-    exit: usize,
-    body: usize,
-}
-
-const RX_TAG: usize = 1 << 63;
-const RX_NONE: usize = usize::MAX;
-const RX_NOMATCH: usize = usize::MAX;
-const RX_BAIL: usize = usize::MAX - 1;
-
-type RxFn = unsafe extern "rust-preserve-none" fn(*const u16, usize, usize, *mut usize, *mut usize, *const RxCtx) -> usize;
+use layout::rx;
 
 #[allow(clashing_extern_declarations)]
 unsafe extern "rust-preserve-none" {
     #[link_name = "cloison_continue"]
-    fn rx_continue(s: *const u16, end: usize, pos: usize, bt: *mut usize, regs: *mut usize, ctx: *const RxCtx) -> usize;
+    fn rx_continue(s: *const u16, end: usize, pos: usize, bt: *mut usize, regs: *mut usize, ctx: *const rx::Ctx) -> usize;
     #[link_name = "cloison_jump_target"]
-    fn rx_jump(s: *const u16, end: usize, pos: usize, bt: *mut usize, regs: *mut usize, ctx: *const RxCtx) -> usize;
+    fn rx_jump(s: *const u16, end: usize, pos: usize, bt: *mut usize, regs: *mut usize, ctx: *const rx::Ctx) -> usize;
 }
 
 macro_rules! rx {
@@ -6167,7 +6042,7 @@ macro_rules! rx {
         #[unsafe(export_name = concat!("cloison_stencil_", stringify!($name)))]
         #[allow(unused_mut, unused_variables)]
         unsafe extern "rust-preserve-none" fn $name(
-            $s: *const u16, $end: usize, mut $pos: usize, mut $bt: *mut usize, $regs: *mut usize, $ctx: *const RxCtx,
+            $s: *const u16, $end: usize, mut $pos: usize, mut $bt: *mut usize, $regs: *mut usize, $ctx: *const rx::Ctx,
         ) -> usize {
             unsafe { $body }
         }
@@ -6192,7 +6067,7 @@ macro_rules! rx_fail {
 macro_rules! rx_push {
     ($bt:ident, $ctx:ident, $a:expr, $v:expr) => {{
         if $bt >= (*$ctx).limit {
-            return RX_BAIL;
+            return rx::BAIL;
         }
         *$bt = $a;
         *$bt.add(1) = $v;
@@ -6225,7 +6100,7 @@ fn rx_word(c: u16) -> bool {
 /// Whether `c`, past ASCII, is in class `k`: 0 or 1, or 2 to bail.
 #[cold]
 #[inline(always)]
-unsafe fn rx_wide(ctx: *const RxCtx, k: usize, c: u16) -> u64 {
+unsafe fn rx_wide(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
     unsafe {
         if (*ctx).ic != 0 {
             return 2;
@@ -6248,7 +6123,7 @@ unsafe fn rx_wide(ctx: *const RxCtx, k: usize, c: u16) -> u64 {
 /// Whether `c` is in the class of ASCII bits `lo`, `hi` and index `k`: 0
 /// or 1, or 2 to bail.
 #[inline(always)]
-unsafe fn rx_class_has(ctx: *const RxCtx, lo: u64, hi: u64, k: usize, c: u16) -> u64 {
+unsafe fn rx_class_has(ctx: *const rx::Ctx, lo: u64, hi: u64, k: usize, c: u16) -> u64 {
     if c < 128 {
         (if c < 64 { lo } else { hi }) >> (c & 63) & 1
     } else {
@@ -6276,14 +6151,14 @@ rx!(rx_fail; |s, end, pos, bt, regs, ctx| {
         bt = bt.sub(2);
         let a = *bt;
         let v = *bt.add(1);
-        if a & RX_TAG == 0 {
-            become (core::mem::transmute::<usize, RxFn>(a))(s, end, v, bt, regs, ctx);
+        if a & rx::TAG == 0 {
+            become (core::mem::transmute::<usize, rx::Entry>(a))(s, end, v, bt, regs, ctx);
         }
-        *regs.add(a & !RX_TAG) = v;
+        *regs.add(a & !rx::TAG) = v;
     }
 });
 
-rx!(rx_nomatch; |s, end, pos, bt, regs, ctx| { RX_NOMATCH });
+rx!(rx_nomatch; |s, end, pos, bt, regs, ctx| { rx::NOMATCH });
 
 rx!(rx_match; |s, end, pos, bt, regs, ctx| { pos });
 
@@ -6302,7 +6177,7 @@ rx!(rx_fold; |s, end, pos, bt, regs, ctx| {
         match rx_fold_has(k & 0xFFFF, k >> 16, *s.add(pos)) {
             1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
             0 => {}
-            _ => return RX_BAIL,
+            _ => return rx::BAIL,
         }
     }
     rx_fail!(s, end, pos, bt, regs, ctx)
@@ -6320,7 +6195,7 @@ rx!(rx_class; |s, end, pos, bt, regs, ctx| {
         match rx_class_has(ctx, imm64_full(), imm64b_full(), imm() as u32 as usize, *s.add(pos)) {
             1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
             0 => {}
-            _ => return RX_BAIL,
+            _ => return rx::BAIL,
         }
     }
     rx_fail!(s, end, pos, bt, regs, ctx)
@@ -6389,7 +6264,7 @@ rx!(rx_split; |s, end, pos, bt, regs, ctx| {
 /// Register `imm` takes the position.
 rx!(rx_mark; |s, end, pos, bt, regs, ctx| {
     let r = imm() as u32 as usize;
-    rx_push!(bt, ctx, RX_TAG | r, *regs.add(r));
+    rx_push!(bt, ctx, rx::TAG | r, *regs.add(r));
     *regs.add(r) = pos;
     rx_next!(s, end, pos, bt, regs, ctx)
 });
@@ -6397,7 +6272,7 @@ rx!(rx_mark; |s, end, pos, bt, regs, ctx| {
 /// Register `imm` takes 0.
 rx!(rx_zero; |s, end, pos, bt, regs, ctx| {
     let r = imm() as u32 as usize;
-    rx_push!(bt, ctx, RX_TAG | r, *regs.add(r));
+    rx_push!(bt, ctx, rx::TAG | r, *regs.add(r));
     *regs.add(r) = 0;
     rx_next!(s, end, pos, bt, regs, ctx)
 });
@@ -6407,8 +6282,8 @@ rx!(rx_zero; |s, end, pos, bt, regs, ctx| {
 rx!(rx_save; |s, end, pos, bt, regs, ctx| {
     let k = imm() as u32 as usize;
     let (g, r) = (k & 0xFFFF, k >> 16);
-    rx_push!(bt, ctx, RX_TAG | g, *regs.add(g));
-    rx_push_more!(bt, RX_TAG | (g + 1), *regs.add(g + 1));
+    rx_push!(bt, ctx, rx::TAG | g, *regs.add(g));
+    rx_push_more!(bt, rx::TAG | (g + 1), *regs.add(g + 1));
     *regs.add(g) = *regs.add(r);
     *regs.add(g + 1) = pos;
     rx_next!(s, end, pos, bt, regs, ctx)
@@ -6419,20 +6294,20 @@ rx!(rx_clear; |s, end, pos, bt, regs, ctx| {
     let k = imm() as u32 as usize;
     let (mut g, hi) = (k & 0xFFFF, k >> 16);
     while g < hi {
-        if *regs.add(g) != RX_NONE {
-            rx_push!(bt, ctx, RX_TAG | g, *regs.add(g));
-            rx_push_more!(bt, RX_TAG | (g + 1), *regs.add(g + 1));
-            *regs.add(g) = RX_NONE;
+        if *regs.add(g) != rx::NONE {
+            rx_push!(bt, ctx, rx::TAG | g, *regs.add(g));
+            rx_push_more!(bt, rx::TAG | (g + 1), *regs.add(g + 1));
+            *regs.add(g) = rx::NONE;
         }
         g += 2;
     }
     rx_next!(s, end, pos, bt, regs, ctx)
 });
 
-/// A counted repetition's head (`*imm64`, an `RxHead`), greedy: into the
+/// A counted repetition's head (`*imm64`, an `rx::Head`), greedy: into the
 /// body (next) first.
 rx!(rx_head; |s, end, pos, bt, regs, ctx| {
-    let h = &*(imm64() as *const RxHead);
+    let h = &*(imm64() as *const rx::Head);
     let count = *regs.add(h.c);
     let done = count >= h.min;
     if count < h.max {
@@ -6442,21 +6317,21 @@ rx!(rx_head; |s, end, pos, bt, regs, ctx| {
         rx_next!(s, end, pos, bt, regs, ctx)
     }
     if done {
-        become (core::mem::transmute::<usize, RxFn>(h.exit))(s, end, pos, bt, regs, ctx);
+        become (core::mem::transmute::<usize, rx::Entry>(h.exit))(s, end, pos, bt, regs, ctx);
     }
     rx_fail!(s, end, pos, bt, regs, ctx)
 });
 
 /// The same, lazy: out first.
 rx!(rx_lazy_head; |s, end, pos, bt, regs, ctx| {
-    let h = &*(imm64() as *const RxHead);
+    let h = &*(imm64() as *const rx::Head);
     let count = *regs.add(h.c);
     let more = count < h.max;
     if count >= h.min {
         if more {
             rx_push!(bt, ctx, h.body, pos);
         }
-        become (core::mem::transmute::<usize, RxFn>(h.exit))(s, end, pos, bt, regs, ctx);
+        become (core::mem::transmute::<usize, rx::Entry>(h.exit))(s, end, pos, bt, regs, ctx);
     }
     if more {
         rx_next!(s, end, pos, bt, regs, ctx)
@@ -6475,7 +6350,7 @@ rx!(rx_tail; |s, end, pos, bt, regs, ctx| {
     if pos == *regs.add(p) && count >= imm64() as usize {
         rx_fail!(s, end, pos, bt, regs, ctx)
     }
-    rx_push!(bt, ctx, RX_TAG | c, count);
+    rx_push!(bt, ctx, rx::TAG | c, count);
     *regs.add(c) = count + 1;
     rx_next!(s, end, pos, bt, regs, ctx)
 });
@@ -6485,7 +6360,7 @@ rx!(rx_tail; |s, end, pos, bt, regs, ctx| {
 rx!(rx_back; |s, end, pos, bt, regs, ctx| {
     let p = pos - 1;
     if p > *bt.sub(1) {
-        *bt = (*(imm64() as *const RxRun)).back;
+        *bt = (*(imm64() as *const rx::Run)).back;
         *bt.add(1) = p;
         bt = bt.add(2);
     } else {
@@ -6495,12 +6370,12 @@ rx!(rx_back; |s, end, pos, bt, regs, ctx| {
 });
 
 /// Repetitions of one unit (`$has`: 0 or 1, or 2 to bail), from the
-/// `RxRun` at `imm64`: greedy (`rx_run_*`), lazy (`rx_lazy_*`), and the
+/// `rx::Run` at `imm64`: greedy (`rx_run_*`), lazy (`rx_lazy_*`), and the
 /// lazy one's backtracking piece (`rx_lazyback_*`), which takes one more.
 macro_rules! rx_runs {
     ($run:ident, $lazy:ident, $lazyback:ident, |$ctx:ident, $r:ident, $c:ident| $has:expr) => {
         rx!($run; |s, end, pos, bt, regs, ctx| {
-            let $r = &*(imm64() as *const RxRun);
+            let $r = &*(imm64() as *const rx::Run);
             let $ctx = ctx;
             let lim = if end - pos < $r.max { end } else { pos + $r.max };
             let mut p = pos;
@@ -6509,7 +6384,7 @@ macro_rules! rx_runs {
                 match $has {
                     1 => p += 1,
                     0 => break,
-                    _ => return RX_BAIL,
+                    _ => return rx::BAIL,
                 }
             }
             let n = p - pos;
@@ -6517,13 +6392,13 @@ macro_rules! rx_runs {
                 rx_fail!(s, end, pos, bt, regs, ctx)
             }
             if n > $r.min {
-                rx_push!(bt, ctx, RX_TAG, pos + $r.min);
+                rx_push!(bt, ctx, rx::TAG, pos + $r.min);
                 rx_push_more!(bt, $r.back, p);
             }
             rx_next!(s, end, p, bt, regs, ctx)
         });
         rx!($lazy; |s, end, pos, bt, regs, ctx| {
-            let $r = &*(imm64() as *const RxRun);
+            let $r = &*(imm64() as *const rx::Run);
             let $ctx = ctx;
             if end - pos < $r.min {
                 rx_fail!(s, end, pos, bt, regs, ctx)
@@ -6534,18 +6409,18 @@ macro_rules! rx_runs {
                 match $has {
                     1 => i += 1,
                     0 => rx_fail!(s, end, pos, bt, regs, ctx),
-                    _ => return RX_BAIL,
+                    _ => return rx::BAIL,
                 }
             }
             let p = pos + $r.min;
             if $r.min < $r.max {
-                rx_push!(bt, ctx, RX_TAG, pos + $r.max);
+                rx_push!(bt, ctx, rx::TAG, pos + $r.max);
                 rx_push_more!(bt, $r.back, p);
             }
             rx_next!(s, end, p, bt, regs, ctx)
         });
         rx!($lazyback; |s, end, pos, bt, regs, ctx| {
-            let $r = &*(imm64() as *const RxRun);
+            let $r = &*(imm64() as *const rx::Run);
             let $ctx = ctx;
             if pos < end {
                 let $c = *s.add(pos);
@@ -6562,7 +6437,7 @@ macro_rules! rx_runs {
                         rx_next!(s, end, p, bt, regs, ctx)
                     }
                     0 => {}
-                    _ => return RX_BAIL,
+                    _ => return rx::BAIL,
                 }
             }
             bt = bt.sub(2);

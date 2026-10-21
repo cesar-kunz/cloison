@@ -178,10 +178,20 @@ fn prune(vm: &mut Vm) -> Result<()> {
     }
     s.pruned = count;
     let values = crate::collections::weak_set_values(s.live);
-    let live: std::collections::HashSet<usize> = values.iter().map(|&v| block_of(as_object(v)) as usize).collect();
+    // Each live buffer keeps one reference to its block (the VM holds one
+    // per buffer: several on the same block, broadcast again, each hold
+    // one), the dead ones' released.
+    let mut live: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &v in &values {
+        *live.entry(block_of(as_object(v)) as usize).or_default() += 1;
+    }
     let mut freed = 0;
     s.blocks.retain(|&b| {
-        let keep = live.contains(&(b as usize));
+        let keep = live.get_mut(&(b as usize)).is_some_and(|n| {
+            let left = *n > 0;
+            *n = n.saturating_sub(1);
+            left
+        });
         if !keep {
             freed += unsafe { (*b).room };
             release(b);

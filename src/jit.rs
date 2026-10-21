@@ -5411,7 +5411,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                         .all(|c| c.ft == FieldType::Num && matches!(c.loc, CaseLoc::Own(_)))
                 {
                     sel.post = decode_num(cases.iter().map(|c| match c.loc {
-                        CaseLoc::Own(off) => (c.shape, off),
+                        CaseLoc::Own(off) => (c.base(), off),
                         _ => unreachable!(),
                     }));
                 }
@@ -11850,8 +11850,11 @@ fn hoist_guards(out: &mut Lowered) {
                     | Prop::Oop { shape, .. }
                     | Prop::Transition { shape, .. },
                 ) => shapes.push(shape),
+                // (A family's stores may be to any of its descendants.)
                 (Op::SetNamed, Prop::Poly { n, at }) => {
-                    shapes.extend(poly_cases(&out.polys, n, at).iter().map(|c| c.shape))
+                    let cases = poly_cases(&out.polys, n, at);
+                    all |= cases.iter().any(|c| c.is_family());
+                    shapes.extend(cases.iter().map(|c| c.shape))
                 }
                 (Op::SetNamed | Op::SetKeyed, _) => all = true,
                 (Op::StaGlobal, _) => globals = true,
@@ -13511,7 +13514,7 @@ impl Lowering<'_> {
         let object = |s: u64| s != 0 && !primitive_cell(s);
         match self.out.props[get] {
             Prop::Own { shape, .. } | Prop::Oop { shape, .. } | Prop::Proto { shape, .. } => object(shape),
-            Prop::Poly { n, at } => poly_cases(&self.out.polys, n, at).iter().all(|c| object(c.shape)),
+            Prop::Poly { n, at } => poly_cases(&self.out.polys, n, at).iter().all(|c| object(c.base())),
             _ => false,
         }
     }
@@ -14161,7 +14164,7 @@ impl Lowering<'_> {
         // callee found under several shapes once per shape, to dispatch on
         // the shape alone, cost 87 more compiling than it saved: +15%.)
         let shapes: Vec<u64> = (by_callee.iter())
-            .map(|ss| if ss.len() == 1 { ss[0] } else { 0 })
+            .map(|ss| if ss.len() == 1 && ss[0] & FAMILY == 0 { ss[0] } else { 0 })
             .collect();
         let mut fused = None;
         if dead

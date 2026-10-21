@@ -869,7 +869,7 @@ handlers! {
 
     fn op_delete_global(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
-        let name = String::from_utf16_lossy(string_units(acc).unwrap_or(&[]));
+        let name = crate::js::lex::units_to_string(string_units(acc).unwrap_or(&[]));
         let a = vm.intern(&name);
         let r = vm.delete_global(a);
         next!(any, Op::DeleteGlobal.size(), Value::from_bool(r))

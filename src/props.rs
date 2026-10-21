@@ -184,7 +184,7 @@ impl Vm {
     fn function_name(&mut self, f: *mut Object) -> Value {
         let name = unsafe { &(*(*f).code).name };
         let name = if name.starts_with('<') { "" } else { name.as_str() };
-        let u: Vec<u16> = name.encode_utf16().collect();
+        let u = crate::js::lex::to_units(name);
         self.new_string(&u)
     }
 

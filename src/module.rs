@@ -429,7 +429,7 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
         for n in exported_names(vm, m, &mut Vec::new()) {
             match resolve_export(vm, m, &n, &mut Vec::new()) {
                 None | Some(Resolution::Ambiguous) => {}
-                Some(res) => exports.push((n.encode_utf16().collect(), res)),
+                Some(res) => exports.push((crate::js::lex::to_units(&n), res)),
             }
         }
         exports.sort_by(|a, b| a.0.cmp(&b.0));

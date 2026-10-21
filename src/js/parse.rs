@@ -3801,7 +3801,7 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::Ident(n) => Ok(ExportName::Ident(n)),
             Tok::Keyword(k) => Ok(ExportName::Reserved(k.into())),
             Tok::Str(s) => {
-                if s.chars().any(lone_surrogate) {
+                if super::lex::has_lone_surrogate(&s) {
                     self.i -= 1;
                     return self.err("an export name that isn't well-formed Unicode");
                 }
@@ -3858,7 +3858,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
             }
         }
-        let spec: String = spec.chars().map(|c| if lone_surrogate(c) { '\u{FFFD}' } else { c }).collect();
+        let spec = String::from_utf16_lossy(&super::lex::to_units(&spec));
         let request = (spec, ty, phase);
         Ok(match self.info.requests.iter().position(|r| *r == request) {
             Some(k) => k,
@@ -4476,11 +4476,6 @@ impl ExportName {
             ExportName::Str(s) => s.clone(),
         }
     }
-}
-
-/// Whether `c` stands for a lone surrogate (see `lex::LONE_SURROGATES`).
-fn lone_surrogate(c: char) -> bool {
-    (super::lex::LONE_SURROGATES..super::lex::LONE_SURROGATES + 0x800).contains(&(c as u32))
 }
 
 /// Function `f`'s `var`s (not its parameters, nor the functions declared

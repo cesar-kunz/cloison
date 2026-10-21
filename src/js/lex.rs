@@ -43,32 +43,98 @@ pub struct TemplatePart {
 
 /// Where lone surrogates (`"\uD800"`) go in a Rust string: code points
 /// `LONE_SURROGATES + (u - 0xD800)`, in a private use plane (see
-/// [`units_to_string`]; `Vm::string_constant` maps them back).
+/// [`units_to_string`]; `Vm::string_constant` maps them back). A code
+/// point of the string itself from there to [`ESCAPE`] (which may be in
+/// a string as well) follows an `ESCAPE`, so that the mapping goes back
+/// unambiguously. So does a U+FDD0 of the string: the runtime's own names
+/// start with one (`symbol::SYMBOL_MARK`), which no string's then does.
 pub const LONE_SURROGATES: u32 = 0xF0000;
+
+/// What a code point of a string in [`LONE_SURROGATES`]' range, this one
+/// or U+FDD0, follows in a Rust string.
+pub const ESCAPE: u32 = LONE_SURROGATES + 0x800;
+
+/// Whether code point `c` is mapped (see [`LONE_SURROGATES`]): a lone
+/// surrogate's, or one an [`ESCAPE`] precedes.
+fn mapped(c: u32) -> bool {
+    (LONE_SURROGATES..=ESCAPE).contains(&c)
+}
+
+/// Whether code point `c` of a string follows an [`ESCAPE`].
+fn escaped(c: u32) -> bool {
+    mapped(c) || c == 0xFDD0
+}
 
 /// UTF-16 code units as a string, lone surrogates mapped (see
 /// [`LONE_SURROGATES`]).
 pub fn units_to_string(units: &[u16]) -> String {
-    char::decode_utf16(units.iter().copied())
-        .map(|r| match r {
-            Ok(c) => c,
-            Err(e) => char::from_u32(LONE_SURROGATES + (e.unpaired_surrogate() as u32 - 0xD800)).unwrap(),
-        })
-        .collect()
+    let mut s = String::with_capacity(units.len());
+    for r in char::decode_utf16(units.iter().copied()) {
+        match r {
+            Ok(c) => {
+                if escaped(c as u32) {
+                    s.push(char::from_u32(ESCAPE).unwrap());
+                }
+                s.push(c);
+            }
+            Err(e) => s.push(char::from_u32(LONE_SURROGATES + (e.unpaired_surrogate() as u32 - 0xD800)).unwrap()),
+        }
+    }
+    s
+}
+
+/// A character of source text as [`units_to_string`] has it: pushed to
+/// `s`, after an [`ESCAPE`] if [`escaped`].
+pub fn push_source_char(s: &mut String, c: char) {
+    if escaped(c as u32) {
+        s.push(char::from_u32(ESCAPE).unwrap());
+    }
+    s.push(c);
 }
 
 /// A string's UTF-16 code units, lone surrogates mapped back (see
 /// [`LONE_SURROGATES`]).
 pub fn string_units(s: &str, out: &mut Vec<u16>) {
+    let mut escaped = false;
     for c in s.chars() {
         let u = c as u32;
-        if (LONE_SURROGATES..LONE_SURROGATES + 0x800).contains(&u) {
+        if !escaped && u == ESCAPE {
+            escaped = true;
+            continue;
+        }
+        if !escaped && mapped(u) {
             out.push((u - LONE_SURROGATES + 0xD800) as u16);
         } else {
             let mut b = [0; 2];
             out.extend_from_slice(c.encode_utf16(&mut b));
         }
+        escaped = false;
     }
+}
+
+/// [`string_units`], into a new vector.
+pub fn to_units(s: &str) -> Vec<u16> {
+    let mut out = Vec::with_capacity(s.len());
+    string_units(s, &mut out);
+    out
+}
+
+/// Whether string `s` (as [`units_to_string`] has it) has a lone
+/// surrogate.
+pub fn has_lone_surrogate(s: &str) -> bool {
+    let mut escaped = false;
+    for c in s.chars() {
+        let u = c as u32;
+        if !escaped && u == ESCAPE {
+            escaped = true;
+            continue;
+        }
+        if !escaped && mapped(u) {
+            return true;
+        }
+        escaped = false;
+    }
+    false
 }
 
 #[derive(Clone, Debug)]
@@ -467,7 +533,9 @@ fn regexp(s: &str) -> Option<(String, String, usize)> {
         .find(|&(_, c)| !is_ident_part(c))
         .map_or(s.len() - end - 1, |(n, _)| n);
     let flags = s[end + 1..end + 1 + flags_len].to_string();
-    Some((s[1..end].to_string(), flags, end + 1 + flags_len))
+    let mut body = String::with_capacity(end);
+    s[1..end].chars().for_each(|c| push_source_char(&mut body, c));
+    Some((body, flags, end + 1 + flags_len))
 }
 
 /// The word of `n` bytes at `b[i..]` as the [`KEYWORDS`] entry it is,
@@ -687,8 +755,11 @@ fn string(s: &str) -> Option<(String, usize)> {
     let quote = b[0];
     // Mostly no escapes: the text as is.
     if let Some(k) = b[1..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r') {
-        if b[1 + k] == quote {
-            return Some((s[1..1 + k].to_string(), k + 2));
+        // (Unless it has a character to escape: see `ESCAPE`. Theirs and
+        // U+FDD0's UTF-8 start with byte 0xEF or more.)
+        let t = &s[1..1 + k];
+        if b[1 + k] == quote && !(t.bytes().any(|c| c >= 0xEF) && t.chars().any(|c| escaped(c as u32))) {
+            return Some((t.to_string(), k + 2));
         }
     }
     let mut out: Vec<u16> = Vec::new();
@@ -835,7 +906,9 @@ fn template(s: &str) -> Option<(TemplatePart, usize)> {
                 }
                 let n = n.max(2).min(s.len() - i);
                 // (An escaped line break is raw `\` and `\n`.)
-                raw.push_str(&s[i..i + n].replace("\r\n", "\n").replace('\r', "\n"));
+                for ch in s[i..i + n].replace("\r\n", "\n").replace('\r', "\n").chars() {
+                    push_source_char(&mut raw, ch);
+                }
                 i += n;
             }
             b'\r' => {
@@ -848,7 +921,7 @@ fn template(s: &str) -> Option<(TemplatePart, usize)> {
             }
             _ => {
                 let ch = s[i..].chars().next()?;
-                raw.push(ch);
+                push_source_char(&mut raw, ch);
                 if let Some(c) = &mut cooked {
                     let mut buf = [0; 2];
                     c.extend_from_slice(ch.encode_utf16(&mut buf));

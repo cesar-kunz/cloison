@@ -7430,6 +7430,24 @@ impl Fusion<'_> {
 /// the next instruction: it says nothing about that instruction.
 const AFTER_CALL: i32 = 1 << 23;
 
+/// The instruction an exit after call `i` resumes at: the next one, but
+/// past what the call's lowering put at its own offset, the jump of a
+/// polymorphic call's case to the code after the call. (Resumed at the
+/// call's offset, the interpreter made the call again: TypeScript's AST
+/// walker called its `pre` callback twice for a node, its result not of
+/// the shape predicted.)
+fn after_call(insns: &[Insn], i: usize) -> usize {
+    let call = &insns[i];
+    let mut j = i + 1;
+    while let Some(n) = insns.get(j)
+        && n.frame == call.frame
+        && n.pc == call.pc
+    {
+        j = if n.op == Op::Jump { n.target } else { j + 1 };
+    }
+    j
+}
+
 /// Set in an after-call exit record by the check of the call's result
 /// against its prediction (see [`Ty::of_result`]): the call shouldn't be
 /// predicted anymore.
@@ -8856,10 +8874,11 @@ impl JitCode {
             );
             // The check of a call's result exits after the call too, through
             // a stub of its own, whose record says the check failed.
+            let after = after_call(insns, i);
             let result = s.result.map(|(name, imm64)| {
-                let mut seq = exit_spills(&homes, i + 1, &boxed);
+                let mut seq = exit_spills(&homes, after, &boxed);
                 seq.push(Piece {
-                    imm: insns[i + 1].exit_record() | AFTER_CALL | BAD_RESULT,
+                    imm: insns[after].exit_record() | AFTER_CALL | BAD_RESULT,
                     ..Piece::new("exit", 0)
                 });
                 exits.push((n + i, seq));
@@ -8888,12 +8907,12 @@ impl JitCode {
                 // A call exits after it (on an error, or when the callee
                 // changed the code epoch), with its result, boxed, in `acc`.
                 let record = if is_call {
-                    insns[i + 1].exit_record() | AFTER_CALL
+                    insns[after].exit_record() | AFTER_CALL
                 } else {
                     seq.extend(box_acc_piece(st.acc));
                     insn.exit_record() | if insn.hoisted.is_some() { HOISTED } else { 0 }
                 };
-                seq.extend(exit_spills(&homes, if is_call { i + 1 } else { i }, &boxed));
+                seq.extend(exit_spills(&homes, if is_call { after } else { i }, &boxed));
                 if insn.exit_const != 0 {
                     seq.push(Piece {
                         imm64: insn.exit_const,
@@ -15168,17 +15187,19 @@ impl JitFunction {
             return (frame, exit_pc);
         }
         let vm = self.vm.as_mut().unwrap();
-        // The call is the instruction before the one an after-call exit
-        // resumes at.
+        // The call is the last one of the frame before the instruction an
+        // after-call exit resumes at (a polymorphic call's cases jump past
+        // the others, and past inlined ones: see `after_call`).
         let call_before = || {
-            let k = snap
+            let at = snap
                 .insns
                 .iter()
                 .position(|i| i.frame as usize == frame && i.pc == exit_pc)
-                .expect("an exit's instruction")
-                - 1;
-            debug_assert!(snap.insns[k].is_call());
-            k
+                .expect("an exit's instruction");
+            (0..at)
+                .rev()
+                .find(|&k| snap.insns[k].frame as usize == frame && snap.insns[k].is_call())
+                .expect("the call an after-call exit follows")
         };
         // A call that found the native stack too deep: the interpreter
         // makes it. Nothing the code assumed changed, so the next entry
@@ -15209,11 +15230,14 @@ impl JitFunction {
             // ran out of compilations).
             let k = call_before();
             vm.bad_results += 1;
-            let calls: Vec<usize> = if vm.bad_results >= 2 {
-                (0..snap.insns.len()).filter(|&j| snap.insns[j].is_call()).collect()
-            } else {
-                vec![k]
-            };
+            // (Every case of a polymorphic call: they share its offset.)
+            let site = (snap.insns[k].frame, snap.insns[k].pc);
+            let calls: Vec<usize> = (0..snap.insns.len())
+                .filter(|&j| {
+                    let c = &snap.insns[j];
+                    c.is_call() && (vm.bad_results >= 2 || (c.frame, c.pc) == site)
+                })
+                .collect();
             for j in calls {
                 let call = snap.insns[j];
                 vm.widened

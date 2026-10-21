@@ -276,6 +276,7 @@ macro_rules! handlers {
                             ENTER_RETURNED => next!(any, $size, e.acc),
                             ENTER_RESUME => jump_to!(e.pc, e.acc, e.regs),
                             ENTER_ERROR => tail!(op_unwind, Value::EMPTY),
+                            ENTER_UNWIND => become op_unwind(e.pc.sub(1), Value::EMPTY, e.regs, $tag, tbl, ti32),
                             _ => {}
                         }
                     }
@@ -4393,8 +4394,18 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
 /// so leaving the handler chain loses nothing. Returns `EMPTY` on an error,
 /// left in `vm.error`.
 pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value) -> Value {
+    unsafe { drive_from(vm, pc, acc, regs, false) }
+}
+
+/// [`drive`], from unwinding `vm.error` at `pc` if `unwinding` (compiled
+/// code left there throwing: the frames' handlers, from there out, catch
+/// it). An error compiled code leaves with is a call's (other
+/// instructions leave before they throw, for the interpreter to run them
+/// again), and it resumes past the call: unwinding starts inside it, as
+/// `op_unwind` does in callers' frames (a call last in a `try` is in it).
+pub(crate) unsafe fn drive_from(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value, unwinding: bool) -> Value {
     unsafe {
-        let mut v = dispatch_at(pc, acc, regs);
+        let mut v = if unwinding { unwind_at(pc.sub(1), regs) } else { dispatch_at(pc, acc, regs) };
         loop {
             if vm.error.is_some() || v != Value::EMPTY {
                 return v;
@@ -4427,7 +4438,7 @@ pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Va
             // An error in the compiled code: unwind from where it left (its
             // frames have no handlers; a caller's may).
             v = if vm.error.is_some() {
-                unwind_at(resume.pc, resume.regs)
+                unwind_at(resume.pc.sub(1), resume.regs)
             } else {
                 dispatch_at(resume.pc, resume.acc, resume.regs)
             };
@@ -4469,6 +4480,7 @@ const ENTER_INTERPRET: u64 = 0;
 const ENTER_RETURNED: u64 = 1;
 const ENTER_RESUME: u64 = 2;
 const ENTER_ERROR: u64 = 3;
+const ENTER_UNWIND: u64 = 4;
 
 /// A call to a hot function (its call countdown ran out): run its compiled
 /// code for the new frame `regs`. Returned: the result, for the caller
@@ -4518,7 +4530,13 @@ fn enter_compiled(regs: *mut Value) -> Entered {
                 };
                 done(ENTER_RETURNED, v)
             }
-            VmRun::Exit(_) if vm.error.is_some() => done(ENTER_ERROR, Value::EMPTY),
+            // (Unwinding from where it left: its handlers catch it.)
+            VmRun::Exit(r) if vm.error.is_some() => Entered {
+                kind: ENTER_UNWIND,
+                regs: r.regs,
+                pc: r.pc,
+                acc: r.acc,
+            },
             VmRun::Exit(r) => Entered {
                 kind: ENTER_RESUME,
                 regs: r.regs,
@@ -4689,7 +4707,9 @@ pub(crate) unsafe fn call_from_jit(
         let callee = (*fo).code;
         // (A `Call` the JIT made of `f.call(that, …)` passes `that`.)
         let this = if op == Op::Construct {
-            vm.construct_this(fo)
+            // (A derived class's `this` is its base's, from `super()`, as
+            // `op_construct` has it.)
+            if (*callee).kind == 3 { Value::HOLE } else { vm.construct_this(fo) }
         } else if (*callee).strict {
             this
         } else {
@@ -4762,8 +4782,8 @@ unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags
                         v
                     };
                 }
-                VmRun::Exit(_) if vm.error.is_some() => {
-                    return Value::EMPTY;
+                VmRun::Exit(r) if vm.error.is_some() => {
+                    return drive_from(vm, r.pc, r.acc, r.regs, true);
                 }
                 VmRun::Exit(r) => start = r,
             }

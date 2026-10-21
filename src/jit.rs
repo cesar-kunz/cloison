@@ -13804,6 +13804,12 @@ impl Lowering<'_> {
     fn inline_ctor(&mut self, frame: usize, i: &Insn, depth: usize) -> Option<*mut Object> {
         let fo = self.inline_target(frame, i, depth)?;
         let code = unsafe { &*(*fo).code };
+        // Not a derived class's: its `this` is `super(…)`'s, and a return
+        // without that call throws (test262's `super-must-be-called`, once
+        // `assert.throws`, which has a `try`, ran compiled).
+        if code.kind == 3 {
+            return None;
+        }
         let seen = code.ctor_result.get();
         let fits = !seen.is_null()
             && seen != crate::vm::MANY_SHAPES

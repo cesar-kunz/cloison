@@ -112,6 +112,8 @@ fn main() -> ExitCode {
         let cells = vm.heap.verify();
         eprintln!("heap: {cells} cells, {} MiB of blocks", vm.heap.allocated() >> 20);
     }
+    // (What the heap holds at the end counts for its peak too.)
+    cloison::gc::HEAP_PEAK.fetch_max(vm.heap.allocated() as u64, std::sync::atomic::Ordering::Relaxed);
     // The process exits next: freeing the VM's shapes and code one by one
     // would only cost time (about 100k instructions).
     std::mem::forget(vm);
@@ -142,7 +144,8 @@ fn main() -> ExitCode {
                 );
             }
             // `CLOISON_SIZES`: what the run compiled, one line of `name=value`
-            // (`scripts/octane-sizes.sh` reads it).
+            // (`scripts/octane-sizes.sh` reads it), and its collections, another
+            // (`scripts/octane-memory.sh`).
             if std::env::var_os("CLOISON_SIZES").is_some() {
                 let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
@@ -158,6 +161,15 @@ fn main() -> ExitCode {
                     n(&cloison::jit::LOWERS),
                     n(&cloison::jit::COMPILE_NS) as f64 / 1e6,
                     n(&cloison::jit::LOWER_NS) as f64 / 1e6,
+                );
+                eprintln!(
+                    "gc minors={} fulls={} pause_ms={:.1} max_pause_ms={:.2} heap_peak={} live_peak={}",
+                    n(&cloison::gc::MINORS),
+                    n(&cloison::gc::FULLS),
+                    n(&cloison::gc::PAUSE_NS) as f64 / 1e6,
+                    n(&cloison::gc::MAX_PAUSE_NS) as f64 / 1e6,
+                    n(&cloison::gc::HEAP_PEAK),
+                    n(&cloison::gc::LIVE_PEAK),
                 );
             }
             // `CLOISON_COUNT`: hot code's stencil executions.

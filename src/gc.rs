@@ -262,6 +262,19 @@ struct Mode {
 /// the epoch then (see `vm::Code::mark`).
 static CODE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
+/// Totals over every VM's collections (`cloison` prints them with
+/// `CLOISON_SIZES` set, `scripts/octane-memory.sh` reads them): pauses,
+/// minor and full (a concurrent full collection's two pauses count as one
+/// full), their nanoseconds and the longest; the bytes of blocks in use at
+/// the start of a collection (where the heap peaks), and the most a full
+/// collection found live.
+pub static MINORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PAUSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MAX_PAUSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static HEAP_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LIVE_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The least code taken (see `Gc::code_room`) that starts a full
 /// collection.
 const CODE_MIN: usize = 32 << 20;
@@ -1213,6 +1226,7 @@ impl Vm {
     fn collect_from(&mut self, sp: usize, regs: *mut Value, kind: Collection) {
         let start = std::time::Instant::now();
         let check = self.heap.gc.checking();
+        HEAP_PEAK.fetch_max(self.heap.allocated() as u64, std::sync::atomic::Ordering::Relaxed);
         if let Some(m) = &self.heap.gc.marker {
             m.pause();
         }
@@ -1343,6 +1357,7 @@ impl Vm {
             // and room to grow by what was live, times `GROWTH - 1`.
             let live = traced + concurrent;
             let room = ((GROWTH - 1) * live).max(FULL_MIN);
+            LIVE_PEAK.fetch_max(live as u64, std::sync::atomic::Ordering::Relaxed);
             self.heap.gc.live = live;
             self.heap.gc.room = room;
             if kind == Collection::Final {
@@ -1374,6 +1389,17 @@ impl Vm {
             if full {
                 self.heap.gc.report_room();
             }
+        }
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let ns = start.elapsed().as_nanos() as u64;
+            PAUSE_NS.fetch_add(ns, Relaxed);
+            MAX_PAUSE_NS.fetch_max(ns, Relaxed);
+            match kind {
+                Collection::Minor | Collection::MinorShade => MINORS.fetch_add(1, Relaxed),
+                Collection::Full | Collection::Final => FULLS.fetch_add(1, Relaxed),
+                Collection::Start => 0,
+            };
         }
         self.heap.holes = [0; 3];
         let next = self.heap.gc.budget();

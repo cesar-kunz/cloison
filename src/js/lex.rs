@@ -68,6 +68,10 @@ fn escaped(c: u32) -> bool {
 /// UTF-16 code units as a string, lone surrogates mapped (see
 /// [`LONE_SURROGATES`]).
 pub fn units_to_string(units: &[u16]) -> String {
+    // (Mostly ASCII: nothing to map.)
+    if units.iter().all(|&u| u < 0x80) {
+        return units.iter().map(|&u| u as u8 as char).collect();
+    }
     let mut s = String::with_capacity(units.len());
     for r in char::decode_utf16(units.iter().copied()) {
         match r {
@@ -95,6 +99,10 @@ pub fn push_source_char(s: &mut String, c: char) {
 /// A string's UTF-16 code units, lone surrogates mapped back (see
 /// [`LONE_SURROGATES`]).
 pub fn string_units(s: &str, out: &mut Vec<u16>) {
+    if s.is_ascii() {
+        out.extend(s.bytes().map(u16::from));
+        return;
+    }
     let mut escaped = false;
     for c in s.chars() {
         let u = c as u32;

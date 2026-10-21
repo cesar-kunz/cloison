@@ -253,21 +253,20 @@ impl TypedKind {
     /// # Safety
     /// `p` must point to at least `i + 1` elements of this kind.
     pub unsafe fn load(self, p: *const u8, i: usize) -> Value {
+        use crate::racy::load;
         unsafe {
+            let at = p.add(i * self.size());
             match self {
-                TypedKind::I8 => Value::from_i32(*p.cast::<i8>().add(i) as i32),
-                TypedKind::U8 | TypedKind::U8Clamped => Value::from_i32(*p.add(i) as i32),
-                TypedKind::I16 => Value::from_i32(p.cast::<i16>().add(i).read_unaligned() as i32),
-                TypedKind::U16 => Value::from_i32(p.cast::<u16>().add(i).read_unaligned() as i32),
-                TypedKind::I32 => Value::from_i32(p.cast::<i32>().add(i).read_unaligned()),
-                TypedKind::U32 => Value::number(p.cast::<u32>().add(i).read_unaligned() as f64),
-                TypedKind::F32 => Value::number(p.cast::<f32>().add(i).read_unaligned() as f64),
-                TypedKind::F64 => Value::number(p.cast::<f64>().add(i).read_unaligned()),
-                TypedKind::F16 => Value::number(crate::math::f16_value(p.cast::<u16>().add(i).read_unaligned())),
-                TypedKind::I64 | TypedKind::U64 => {
-                    let bits = p.cast::<u64>().add(i).read_unaligned();
-                    crate::bigint::from_bits(bits, self == TypedKind::I64)
-                }
+                TypedKind::I8 => Value::from_i32(load::<1>(at) as i8 as i32),
+                TypedKind::U8 | TypedKind::U8Clamped => Value::from_i32(load::<1>(at) as i32),
+                TypedKind::I16 => Value::from_i32(load::<2>(at) as i16 as i32),
+                TypedKind::U16 => Value::from_i32(load::<2>(at) as i32),
+                TypedKind::I32 => Value::from_i32(load::<4>(at) as i32),
+                TypedKind::U32 => Value::number(load::<4>(at) as u32 as f64),
+                TypedKind::F32 => Value::number(f32::from_bits(load::<4>(at) as u32) as f64),
+                TypedKind::F64 => Value::number(f64::from_bits(load::<8>(at))),
+                TypedKind::F16 => Value::number(crate::math::f16_value(load::<2>(at) as u16)),
+                TypedKind::I64 | TypedKind::U64 => crate::bigint::from_bits(load::<8>(at), self == TypedKind::I64),
             }
         }
     }
@@ -278,15 +277,17 @@ impl TypedKind {
     /// # Safety
     /// As [`TypedKind::load`].
     pub unsafe fn store_i32(self, p: *mut u8, i: usize, v: i32) {
+        use crate::racy::store;
         unsafe {
+            let at = p.add(i * self.size());
             match self {
-                TypedKind::I8 | TypedKind::U8 => *p.add(i) = v as u8,
-                TypedKind::U8Clamped => *p.add(i) = v.clamp(0, 255) as u8,
-                TypedKind::I16 | TypedKind::U16 => p.cast::<u16>().add(i).write_unaligned(v as u16),
-                TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(v as u32),
-                TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(v as f32),
-                TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(v as f64),
-                TypedKind::F16 => p.cast::<u16>().add(i).write_unaligned(crate::math::f16_bits(v as f64)),
+                TypedKind::I8 | TypedKind::U8 => store::<1>(at, v as u64),
+                TypedKind::U8Clamped => store::<1>(at, v.clamp(0, 255) as u64),
+                TypedKind::I16 | TypedKind::U16 => store::<2>(at, v as u64),
+                TypedKind::I32 | TypedKind::U32 => store::<4>(at, v as u32 as u64),
+                TypedKind::F32 => store::<4>(at, (v as f32).to_bits() as u64),
+                TypedKind::F64 => store::<8>(at, (v as f64).to_bits()),
+                TypedKind::F16 => store::<2>(at, crate::math::f16_bits(v as f64) as u64),
                 // (Not for BigInts: see `store_value`.)
                 TypedKind::I64 | TypedKind::U64 => {}
             }
@@ -298,22 +299,24 @@ impl TypedKind {
     /// # Safety
     /// As [`TypedKind::load`].
     pub unsafe fn store(self, p: *mut u8, i: usize, d: f64) {
-        let int = || crate::interp::to_int32(d);
+        use crate::racy::store;
+        let int = || crate::interp::to_int32(d) as u32 as u64;
         unsafe {
+            let at = p.add(i * self.size());
             match self {
-                TypedKind::I8 | TypedKind::U8 => *p.add(i) = int() as u8,
+                TypedKind::I8 | TypedKind::U8 => store::<1>(at, int()),
                 TypedKind::U8Clamped => {
                     // Round half to even, clamped to 0..=255 (NaN is 0).
                     let c = if d.is_nan() { 0.0 } else { d.clamp(0.0, 255.0) };
                     let r = c.round();
                     let r = if (c - c.floor()) == 0.5 && r % 2.0 != 0.0 { r - 1.0 } else { r };
-                    *p.add(i) = r as u8;
+                    store::<1>(at, r as u8 as u64);
                 }
-                TypedKind::I16 | TypedKind::U16 => p.cast::<u16>().add(i).write_unaligned(int() as u16),
-                TypedKind::I32 | TypedKind::U32 => p.cast::<u32>().add(i).write_unaligned(int() as u32),
-                TypedKind::F32 => p.cast::<f32>().add(i).write_unaligned(d as f32),
-                TypedKind::F64 => p.cast::<f64>().add(i).write_unaligned(d),
-                TypedKind::F16 => p.cast::<u16>().add(i).write_unaligned(crate::math::f16_bits(d)),
+                TypedKind::I16 | TypedKind::U16 => store::<2>(at, int()),
+                TypedKind::I32 | TypedKind::U32 => store::<4>(at, int()),
+                TypedKind::F32 => store::<4>(at, (d as f32).to_bits() as u64),
+                TypedKind::F64 => store::<8>(at, d.to_bits()),
+                TypedKind::F16 => store::<2>(at, crate::math::f16_bits(d) as u64),
                 TypedKind::I64 | TypedKind::U64 => {}
             }
         }
@@ -327,7 +330,7 @@ impl TypedKind {
     pub unsafe fn store_value(self, p: *mut u8, i: usize, v: Value) {
         unsafe {
             if self.is_big() {
-                p.cast::<u64>().add(i).write_unaligned(crate::bigint::to_bits(v));
+                crate::racy::store::<8>(p.add(i * 8), crate::bigint::to_bits(v));
             } else {
                 self.store(p, i, v.to_number());
             }

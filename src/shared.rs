@@ -357,7 +357,7 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if sync_length(p) < n {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the new buffer is too small"));
     }
-    unsafe { std::ptr::copy((*o).elems.cast::<u8>().add(first), (*p).elems.cast::<u8>(), n) };
+    unsafe { crate::racy::copy((*o).elems.cast::<u8>().add(first), (*p).elems.cast::<u8>(), n) };
     Ok(out)
 }
 

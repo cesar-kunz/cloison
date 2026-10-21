@@ -44,12 +44,19 @@ fn uint8_array(v: Value) -> Result<*mut Object> {
     }
 }
 
-/// A `Uint8Array`'s bytes, if in bounds (GetUint8ArrayBytes).
-fn bytes_of<'a>(o: *mut Object) -> Result<&'a mut [u8]> {
-    match crate::typed::ta_length(o) {
-        Some(n) => Ok(unsafe { std::slice::from_raw_parts_mut((*o).elems.cast::<u8>(), n) }),
-        None => Err(Error::type_error("Cannot perform this operation on a detached or out of bounds typed array")),
-    }
+/// A `Uint8Array`'s length, if in bounds.
+fn length_of(o: *mut Object) -> Result<usize> {
+    crate::typed::ta_length(o)
+        .ok_or_else(|| Error::type_error("Cannot perform this operation on a detached or out of bounds typed array"))
+}
+
+/// A copy of a `Uint8Array`'s bytes, if in bounds (GetUint8ArrayBytes):
+/// another agent may write them meanwhile (see `racy`).
+fn bytes_of(o: *mut Object) -> Result<Vec<u8>> {
+    let n = length_of(o)?;
+    let mut bytes = vec![0; n];
+    unsafe { crate::racy::copy((*o).elems.cast::<u8>(), bytes.as_mut_ptr(), n) };
+    Ok(bytes)
 }
 
 /// The string argument, or a TypeError.
@@ -262,8 +269,8 @@ fn from_hex(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// written, then its error thrown, or `{ read, written }`.
 fn written(vm: &mut Vm, o: *mut Object, d: Decoded) -> Result<Value> {
     // (A decoding runs no code: `o` is as it was checked.)
-    let into = bytes_of(o)?;
-    into[..d.bytes.len()].copy_from_slice(&d.bytes);
+    assert!(d.bytes.len() <= length_of(o)?);
+    unsafe { crate::racy::copy(d.bytes.as_ptr(), (*o).elems.cast::<u8>(), d.bytes.len()) };
     if let Some(e) = d.error {
         return Err(e);
     }
@@ -281,7 +288,7 @@ fn set_from_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let opts = options(arg(a, 1))?;
     let url = url_alphabet(vm, opts)?;
     let last = last_chunk(vm, opts)?;
-    let max = bytes_of(o)?.len();
+    let max = length_of(o)?;
     let d = decode_base64(s, url, last, max);
     written(vm, o, d)
 }
@@ -290,7 +297,7 @@ fn set_from_hex(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = uint8_array(this)?;
     crate::typed::writable_view(o)?;
     let s = string_arg(arg(a, 0))?;
-    let max = bytes_of(o)?.len();
+    let max = length_of(o)?;
     let d = decode_hex(s, max);
     written(vm, o, d)
 }

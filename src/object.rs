@@ -568,14 +568,9 @@ pub struct Shape {
     /// Number of in-object slots. Shrinks once, in place, for the shapes
     /// of a constructor's first objects (see `Vm::construct_done`).
     pub capacity: Cell<u32>,
-    /// The property in each slot.
-    pub keys: Vec<Atom>,
-    /// Each slot's attributes ([`READ_ONLY`], [`DONT_ENUM`], [`DONT_DELETE`];
-    /// 0 for an ordinary property).
-    pub attrs: Vec<u8>,
-    /// The type of the field in each slot, and whether it is constant (see
-    /// [`FieldCell`]).
-    pub fields: Vec<*const FieldCell>,
+    /// Its slots: the property in each, its attributes and its field's
+    /// cell, a prefix of a table its lineage shares (see [`Slots`]).
+    pub slots: Slots,
     /// The type of every element stored in objects of this shape. Unlike a field's
     /// type it is part of the shape, as V8's elements kinds are part of the
     /// map: an element store that doesn't fit moves the object to a shape
@@ -621,6 +616,189 @@ pub const ACCESSOR: u8 = 8;
 
 crate::layout::same_layout!(Shape, crate::layout::ShapeHead: elems_code, family, push);
 
+/// The slots of a lineage of shapes, as V8 shares a descriptor array along
+/// a transition chain: each shape has a prefix of it ([`Slots`]), and a
+/// transition from the shape that has all of it appends in place, rather
+/// than each shape copying its parent's slots (memory quadratic in an
+/// object's properties: 114 MiB of PdfJS's, its literals having thousands).
+///
+/// Append-only and within a capacity fixed when made: what a prefix holds
+/// never moves or changes, so its slices stay valid while the table grows
+/// past them; a full table is copied, twice as large.
+pub struct SlotTable {
+    /// The property in each slot.
+    keys: *mut Atom,
+    /// Each slot's attributes ([`READ_ONLY`], [`DONT_ENUM`], [`DONT_DELETE`],
+    /// [`ACCESSOR`]; 0 for an ordinary property).
+    attrs: *mut u8,
+    /// The type of the field in each slot, and whether it is constant (see
+    /// [`FieldCell`]).
+    fields: *mut *const FieldCell,
+    len: Cell<u32>,
+    cap: u32,
+    /// Slot by property, over the first `indexed` slots: a long prefix is
+    /// searched there (a table's keys are distinct, a lineage's slots).
+    index: RefCell<std::collections::HashMap<Atom, u32>>,
+    indexed: Cell<u32>,
+}
+
+/// Prefixes up to this long are searched linearly (V8's limit too).
+const LINEAR_LOOKUP: u32 = 8;
+
+impl SlotTable {
+    fn with_capacity(cap: u32) -> SlotTable {
+        fn array<T>(cap: u32) -> *mut T {
+            let layout = std::alloc::Layout::array::<T>(cap as usize).unwrap();
+            if layout.size() == 0 {
+                return std::ptr::NonNull::dangling().as_ptr();
+            }
+            let p = unsafe { std::alloc::alloc(layout) };
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            p.cast()
+        }
+        SlotTable {
+            keys: array(cap),
+            attrs: array(cap),
+            fields: array(cap),
+            len: Cell::new(0),
+            cap,
+            index: RefCell::default(),
+            indexed: Cell::new(0),
+        }
+    }
+
+    fn push(&self, key: Atom, attrs: u8, field: *const FieldCell) {
+        let n = self.len.get();
+        assert!(n < self.cap);
+        // (Past every prefix: no slice covers it.)
+        unsafe {
+            self.keys.add(n as usize).write(key);
+            self.attrs.add(n as usize).write(attrs);
+            self.fields.add(n as usize).write(field);
+        }
+        self.len.set(n + 1);
+    }
+
+    /// The bytes it takes (for `Vm::memory_stats`).
+    pub(crate) fn bytes(&self) -> usize {
+        size_of::<SlotTable>()
+            + self.cap as usize * (size_of::<Atom>() + 1 + size_of::<*const FieldCell>())
+            + self.index.borrow().capacity() * (size_of::<(Atom, u32)>() + 1)
+    }
+}
+
+impl Drop for SlotTable {
+    fn drop(&mut self) {
+        unsafe fn free<T>(p: *mut T, cap: u32) {
+            let layout = std::alloc::Layout::array::<T>(cap as usize).unwrap();
+            if layout.size() != 0 {
+                unsafe { std::alloc::dealloc(p.cast(), layout) };
+            }
+        }
+        unsafe {
+            free(self.keys, self.cap);
+            free(self.attrs, self.cap);
+            free(self.fields, self.cap);
+        }
+    }
+}
+
+/// A shape's slots: the first `len` of a [`SlotTable`].
+#[derive(Clone)]
+pub struct Slots {
+    table: std::rc::Rc<SlotTable>,
+    len: u32,
+}
+
+impl Slots {
+    /// No slots.
+    pub fn empty() -> Slots {
+        Slots { table: std::rc::Rc::new(SlotTable::with_capacity(0)), len: 0 }
+    }
+
+    /// These slots, in a table of their own.
+    pub fn new(keys: &[Atom], attrs: &[u8], fields: &[*const FieldCell]) -> Slots {
+        assert!(keys.len() == attrs.len() && keys.len() == fields.len());
+        let n = keys.len() as u32;
+        let table = SlotTable::with_capacity(n);
+        for i in 0..keys.len() {
+            table.push(keys[i], attrs[i], fields[i]);
+        }
+        Slots { table: std::rc::Rc::new(table), len: n }
+    }
+
+    /// These slots and one more: in place if they are all of their table
+    /// and it has room, else in a copy (a branch of the lineage, or a full
+    /// table) with room to grow.
+    pub fn with(&self, key: Atom, attrs: u8, field: *const FieldCell) -> Slots {
+        let t = &self.table;
+        if t.len.get() == self.len && self.len < t.cap {
+            t.push(key, attrs, field);
+            return Slots { table: t.clone(), len: self.len + 1 };
+        }
+        let table = SlotTable::with_capacity((self.len + 1).max(4).next_power_of_two());
+        for i in 0..self.len as usize {
+            table.push(self.keys()[i], self.attrs()[i], self.fields()[i]);
+        }
+        table.push(key, attrs, field);
+        Slots { table: std::rc::Rc::new(table), len: self.len + 1 }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn keys(&self) -> &[Atom] {
+        unsafe { std::slice::from_raw_parts(self.table.keys, self.len as usize) }
+    }
+
+    pub fn attrs(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.table.attrs, self.len as usize) }
+    }
+
+    pub fn fields(&self) -> &[*const FieldCell] {
+        unsafe { std::slice::from_raw_parts(self.table.fields, self.len as usize) }
+    }
+
+    /// The slot of `name`.
+    pub fn lookup(&self, name: Atom) -> Option<u32> {
+        if self.len <= LINEAR_LOOKUP {
+            return self.keys().iter().position(|&k| k == name).map(|i| i as u32);
+        }
+        let t = &self.table;
+        let mut index = t.index.borrow_mut();
+        let all = t.len.get();
+        if t.indexed.get() < all {
+            let keys = unsafe { std::slice::from_raw_parts(t.keys, all as usize) };
+            for (i, &k) in keys.iter().enumerate().skip(t.indexed.get() as usize) {
+                index.insert(k, i as u32);
+            }
+            t.indexed.set(all);
+        }
+        index.get(&name).copied().filter(|&i| i < self.len)
+    }
+
+    /// Whether `other`'s slots are the first of these.
+    pub fn starts_with(&self, other: &Slots) -> bool {
+        other.len <= self.len
+            && (std::rc::Rc::ptr_eq(&self.table, &other.table)
+                || (self.keys().starts_with(other.keys())
+                    && self.attrs().starts_with(other.attrs())
+                    && self.fields().starts_with(other.fields())))
+    }
+
+    /// The table, to count it once (`Vm::memory_stats`).
+    pub(crate) fn table(&self) -> &SlotTable {
+        &self.table
+    }
+}
+
 pub use crate::layout::{PUSH_WAYS, PushCache};
 
 impl Drop for Shape {
@@ -661,7 +839,22 @@ pub fn push_key(v: Value) -> u64 {
 
 impl Shape {
     pub fn lookup(&self, name: Atom) -> Option<u32> {
-        self.keys.iter().position(|&k| k == name).map(|i| i as u32)
+        self.slots.lookup(name)
+    }
+
+    /// The property in each slot.
+    pub fn keys(&self) -> &[Atom] {
+        self.slots.keys()
+    }
+
+    /// Each slot's attributes.
+    pub fn attrs(&self) -> &[u8] {
+        self.slots.attrs()
+    }
+
+    /// Each slot's field cell.
+    pub fn fields(&self) -> &[*const FieldCell] {
+        self.slots.fields()
     }
 
     /// Whether no object of this shape has gained a property or moved to
@@ -701,7 +894,7 @@ impl Shape {
 
     /// The cell of the field in slot `i`.
     pub fn field_cell(&self, i: u32) -> &FieldCell {
-        unsafe { &*self.fields[i as usize] }
+        unsafe { &*self.fields()[i as usize] }
     }
 
     /// Where slot `i` lives, as an inline cache records it: the byte offset
@@ -738,9 +931,7 @@ mod tests {
             class: Class::Plain,
             proto: Value::NULL,
             capacity: Cell::new(2),
-            keys: vec![Atom(7), Atom(8), Atom(9)],
-            attrs: vec![0; 3],
-            fields: Vec::new(),
+            slots: Slots::new(&[Atom(7), Atom(8), Atom(9)], &[0; 3], &[std::ptr::null(); 3]),
             elems: FieldType::None,
             elems_code: 0,
             family: std::ptr::null(),

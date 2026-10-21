@@ -2376,7 +2376,7 @@ fn regexp_match_into(
 fn plain_last_index(vm: &Vm, this: Value) -> Option<*mut Object> {
     let o = as_object(this);
     let sh = unsafe { &*(*o).shape };
-    (sh.keys.first() == Some(&vm.a_last_index) && sh.attrs[0] == DONT_ENUM | DONT_DELETE).then_some(o)
+    (sh.keys().first() == Some(&vm.a_last_index) && sh.attrs()[0] == DONT_ENUM | DONT_DELETE).then_some(o)
 }
 
 // ---- Legacy static properties (Annex B) ----

@@ -2573,7 +2573,7 @@ fn exact_transition(s: u64, name: Atom) -> Option<Prop> {
             return None;
         }
         if let Some(k) = ps.lookup(name) {
-            if ps.attrs[k as usize] & (ACCESSOR | READ_ONLY) != 0 {
+            if ps.attrs()[k as usize] & (ACCESSOR | READ_ONLY) != 0 {
                 return None;
             }
             break;
@@ -5069,9 +5069,7 @@ unsafe fn extends(s: *const Shape, b: *const Shape) -> bool {
     s.class == b.class
         && s.proto == b.proto
         && s.capacity.get() == b.capacity.get()
-        && s.keys.starts_with(&b.keys)
-        && s.attrs.starts_with(&b.attrs)
-        && s.fields.starts_with(&b.fields)
+        && s.slots.starts_with(&b.slots)
 }
 
 /// `select` for `GetNamed`, `SetNamed`, `LdaGlobal` and `StaGlobal`.
@@ -5098,7 +5096,7 @@ fn select_property(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
 fn decode_num(at: impl IntoIterator<Item = (u64, i32)>) -> Option<&'static str> {
     let ints = at.into_iter().any(|(shape, off)| {
         let s = unsafe { &*(shape as *const Shape) };
-        (0..s.keys.len() as u32).any(|i| s.location(i) == off && s.field_cell(i).holds_ints())
+        (0..s.keys().len() as u32).any(|i| s.location(i) == off && s.field_cell(i).holds_ints())
     });
     if ints {
         unsafe { (*crate::interp::current_vm()).int_fields_to_doubles() };
@@ -5269,7 +5267,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             // (Not an accessor's slot: the runtime calls its functions.)
             if let Some(slot) = shape
                 .lookup(fb.name(insn))
-                .filter(|&k| shape.attrs[k as usize] & crate::object::ACCESSOR == 0)
+                .filter(|&k| shape.attrs()[k as usize] & crate::object::ACCESSOR == 0)
             {
                 // A store to a read-only property does nothing, one to a
                 // prototype's (a unique shape's) must bump the epoch, and one
@@ -5280,7 +5278,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 let cell = shape.field_cell(slot);
                 let function = shape.class == crate::object::Class::Function;
                 if !load
-                    && (shape.attrs[slot as usize] & crate::object::READ_ONLY != 0
+                    && (shape.attrs()[slot as usize] & crate::object::READ_ONLY != 0
                         || shape.unique
                         || (function && cell.is_constant()))
                 {
@@ -11350,7 +11348,7 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
                 }
                 let shape = unsafe { &*st.shape };
                 let slot = shape.lookup(fb.name(&insn))? as usize;
-                if shape.attrs[slot] & crate::object::ACCESSOR != 0 {
+                if shape.attrs()[slot] & crate::object::ACCESSOR != 0 {
                     return None;
                 }
                 if shape.location(slot as u32) < 0 {
@@ -11366,7 +11364,7 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
                 let shape = unsafe { &*st.shape };
                 let name = fb.name(&insn);
                 let slot = match shape.lookup(name) {
-                    Some(k) if shape.attrs[k as usize] & crate::object::ACCESSOR != 0 => {
+                    Some(k) if shape.attrs()[k as usize] & crate::object::ACCESSOR != 0 => {
                         return None;
                     }
                     Some(k) => k as usize,
@@ -11479,7 +11477,7 @@ fn apply_replacement(out: &mut Lowered, a: usize, plan: Replacement) {
     // The allocation: only its checks (`acc` = `undefined`).
     out.insns[a].native = 3;
     for (i, shape, regs) in plan.live {
-        let fields = (0..unsafe { (*shape).keys.len() }).map(h).collect();
+        let fields = (0..unsafe { (*shape).keys().len() }).map(h).collect();
         // Before the objects replaced earlier: one may hold this one in a
         // field (a slot register this allocation writes). (Not the other
         // way: an object stored into one replaced later escapes there.)
@@ -13907,7 +13905,7 @@ impl Lowering<'_> {
         let seen = code.ctor_result.get();
         let fits = !seen.is_null()
             && seen != crate::vm::MANY_SHAPES
-            && unsafe { (*seen).keys.len() } as u32 <= code.ctor_capacity.get();
+            && unsafe { (*seen).keys().len() } as u32 <= code.ctor_capacity.get();
         // A constructor passing its arguments on (Prototype's
         // `Class.create`, `this.initialize.apply(this, arguments)`) is one
         // code for every class: the shapes its objects end with say
@@ -14345,7 +14343,7 @@ impl Lowering<'_> {
             let h = ic.holder;
             let s = &*(*h).shape;
             let slot = s.lookup(fb.name(i))?;
-            if s.attrs[slot as usize] & ACCESSOR == 0 {
+            if s.attrs()[slot as usize] & ACCESSOR == 0 {
                 return None;
             }
             let at = Object::slot(h, s.location(slot));
@@ -14402,7 +14400,7 @@ impl Lowering<'_> {
                 let o = crate::object::as_object(p);
                 let s = &*(*o).shape;
                 if let Some(slot) = s.lookup(name) {
-                    if s.attrs[slot as usize] & crate::object::ACCESSOR != 0 {
+                    if s.attrs()[slot as usize] & crate::object::ACCESSOR != 0 {
                         return None;
                     }
                     let addr = Object::slot(o, s.location(slot)) as u64;
@@ -16393,7 +16391,7 @@ extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
         let shape = (*o).shape;
         let seen = code.ctor_result.get();
         if code.ctor_settled.get()
-            && (*shape).keys.len() as u32
+            && (*shape).keys().len() as u32
                 <= crate::vm::Vm::shared_proto(code, o).map_or(code.ctor_capacity.get(), |e| e.cap.get())
             && (seen == shape || seen == crate::vm::MANY_SHAPES)
         {

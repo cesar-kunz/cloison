@@ -7561,3 +7561,28 @@ fn temporal_dates_durations_and_zones() {
         );
     }
 }
+
+#[test]
+fn a_second_closure_drops_code_folding_the_first_ones_upvalues() {
+    // The closure's loop compiled while its code had made one closure,
+    // `list` taken as a constant: `g` pushed to `a`.
+    assert_eq!(
+        value(
+            "function mk(list) {
+               return function (n) {
+                 for (var i = 0; i < n; i++) list.push(i);
+                 return list.length;
+               };
+             }
+             var a = [];
+             var f = mk(a);
+             f(3000);
+             f(3000);
+             var b = [];
+             var g = mk(b);
+             g(3000);
+             a.length + ' ' + b.length"
+        ),
+        "6000 3000"
+    );
+}

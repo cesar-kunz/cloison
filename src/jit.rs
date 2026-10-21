@@ -13918,6 +13918,7 @@ impl Lowering<'_> {
         let func = if !f.func.is_null() {
             f.func
         } else if frame == 0 && unsafe { (*f.code).closures_made.get() } == 1 {
+            unsafe { (*f.code).upvalues_folded.set(true) };
             self.state.root_func
         } else {
             return None;

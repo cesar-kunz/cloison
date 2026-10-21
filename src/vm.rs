@@ -518,6 +518,10 @@ pub struct Code {
     /// call of the function making it), and calls bind to the code, not a
     /// closure (see `jit::CallSite::by_code`).
     pub(crate) closures_made: Cell<u8>,
+    /// Compiled code of it took the upvalues of its only closure as
+    /// constants (`jit::Lowering::constant_upvalue`): a second closure,
+    /// with cells of its own, drops that code.
+    pub(crate) upvalues_folded: Cell<bool>,
     /// Loop back edges left before the interpreter tiers up: a frame of
     /// the function starts with it and gives back what it didn't use when
     /// it returns, so loops tier up after that many back edges over all
@@ -3824,6 +3828,17 @@ impl Vm {
         crate::gc::mark_code(unsafe { (*f).code });
         let made = unsafe { &(*(*f).code).closures_made };
         made.set(made.get().saturating_add(1).min(2));
+        // A second closure: compiled code that took the first one's
+        // upvalues for its own (as its only closure's) mustn't run for it.
+        // (TypeScript's parser appended a lambda's parameters to an
+        // earlier lambda's list, through `translateBinExOperand`'s folded
+        // `formals`.) Only that code is lowered again: calls straight into
+        // it check for the first closure (`jit::CallSite::closure`); sites
+        // bound to the code come once there are two.
+        let code = unsafe { &*(*f).code };
+        if made.get() == 2 && code.upvalues_folded.replace(false) {
+            code.field_deps.set(code.field_deps.get().wrapping_add(1));
+        }
         // (An arrow's, a method's or an async function's: none.)
         if matches!(unsafe { (*(*f).code).kind }, 1 | 5) {
             return object_value(f);
@@ -4049,6 +4064,7 @@ impl Vm {
             calls_left: Cell::new(i32::MAX),
             calls_interpret: Cell::new(false),
             closures_made: Cell::new(0),
+            upvalues_folded: Cell::new(false),
             loop_budget: Cell::new(i64::MAX),
             ret_hint: Cell::new(ret),
             mark: Default::default(),
@@ -4608,6 +4624,7 @@ impl Vm {
                     ret_hint: Cell::new(crate::jit::Ty::Any),
                     calls_interpret: Cell::new(false),
                     closures_made: Cell::new(0),
+                    upvalues_folded: Cell::new(false),
                     calls_left: Cell::new(calls_left),
                     loop_budget: Cell::new(loop_budget),
                     mark: crate::gc::code_epoch().into(),

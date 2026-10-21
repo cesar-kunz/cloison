@@ -336,6 +336,9 @@ fn this_units<'a>(this: Value) -> Result<Cow<'a, [u16]>> {
             "String.prototype method called on null or undefined",
         ));
     }
+    if let Some(u) = string_units(this) {
+        return Ok(Cow::Borrowed(u));
+    }
     // (A String object too is converted, through its `toString`, which
     // code may have replaced: ToString of `this`.)
     let u = units(this);

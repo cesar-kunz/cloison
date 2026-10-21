@@ -245,6 +245,7 @@ pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -
     let derived = std::mem::replace(&mut vm.derived_construct, if nt != f { f } else { Value::UNDEFINED });
     let outer = std::mem::replace(&mut vm.native_new_target, if nt != f { (f, nt) } else { (Value::EMPTY, Value::EMPTY) });
     let r = vm.construct_other(f, args);
+    let r = if vm.conv_failed() { Err(vm.take_conv_error()) } else { r };
     vm.derived_construct = derived;
     // (Unless the constructor read the target's prototype itself.)
     let taken = nt != f && vm.native_new_target.0 != f;

@@ -4293,7 +4293,8 @@ pub enum Run {
 /// # Safety
 /// `code` must be well formed: every instruction complete, every register
 /// operand `< frame.regs().len()`, every jump landing on an instruction
-/// boundary, and every path ending in `Return`. There is no verifier yet.
+/// boundary, and every path ending in `Return`: `js::compile`'s code, or
+/// code `asm::verify` accepts.
 pub unsafe fn run_frame(
     code: &[u8],
     pc: usize,

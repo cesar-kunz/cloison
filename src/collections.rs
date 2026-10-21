@@ -1069,15 +1069,26 @@ fn record_has(vm: &mut Vm, rec: &SetRecord, v: Value) -> Result<bool> {
     Ok(to_boolean(call_function(vm, rec.has, rec.set, &[v])?))
 }
 
-/// Each value of `rec.keys()`'s iterator to `f` until it returns false
-/// (the iterator then closed): whether it went through all of them.
-fn record_keys(vm: &mut Vm, rec: &SetRecord, mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
+/// `rec.keys()`'s iterator and its `next` (GetIteratorFromMethod).
+fn record_iterator(vm: &mut Vm, rec: &SetRecord) -> Result<(Value, Value)> {
     let it = call_function(vm, rec.keys, rec.set, &[])?;
     if !is_object(it) {
         return Err(Error::type_error("The set-like's keys() is not an iterator"));
     }
     let a_next = vm.intern("next");
     let next = vm.get(it, a_next)?;
+    Ok((it, next))
+}
+
+/// Each value of `rec.keys()`'s iterator to `f` until it returns false
+/// (the iterator then closed): whether it went through all of them.
+fn record_keys(vm: &mut Vm, rec: &SetRecord, f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
+    let iterator = record_iterator(vm, rec)?;
+    each_key(vm, iterator, f)
+}
+
+/// [`record_keys`] of an iterator already got (`record_iterator`).
+fn each_key(vm: &mut Vm, (it, next): (Value, Value), mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
     let (a_done, a_value) = (vm.intern("done"), vm.a_value);
     loop {
         let r = call_function(vm, next, it, &[])?;
@@ -1137,8 +1148,11 @@ fn set_remove_value(o: *mut Object, v: Value) {
 fn set_union(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.union")?;
     let rec = set_record(vm, arg(a, 0))?;
+    // (The iterator got before the copy: `keys` and `next`'s getter may
+    // change this set.)
+    let iterator = record_iterator(vm, &rec)?;
     let out = copy_set(vm, o)?;
-    record_keys(vm, &rec, |vm, v| set_add_value(vm, out, v).map(|()| true))?;
+    each_key(vm, iterator, |vm, v| set_add_value(vm, out, v).map(|()| true))?;
     Ok(object_value(out))
 }
 
@@ -1169,7 +1183,8 @@ fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let rec = set_record(vm, arg(a, 0))?;
     let out = copy_set(vm, o)?;
     if live(o) as f64 <= rec.size {
-        each_value(vm, o, |vm, v| {
+        // (The copy's values, which `has` can't change: not this set's.)
+        each_value(vm, out, |vm, v| {
             if record_has(vm, &rec, v)? {
                 set_remove_value(out, v);
             }

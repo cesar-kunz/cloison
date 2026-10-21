@@ -4411,7 +4411,16 @@ impl Vm {
             .enumerate()
             .map(|(i, (f, recursive))| {
                 let scan = Scan::of(&f);
+                // Not inlined nor called directly from compiled code (whose
+                // frames an exception unwinds without their handlers):
+                // `Code::interpreted`. With handlers, though, it is compiled,
+                // entered from the runtime and at its loops: an exception
+                // there unwinds from where its compiled code left, its
+                // handlers included (`interp::drive_from`). (GameBoy's
+                // `fromTypedArray`, a copy loop in a `try`, ran interpreted
+                // at each run.)
                 let interpreted = !f.handlers.is_empty() || scan.callee || f.lazy.is_some();
+                let only_interpreted = scan.callee || f.lazy.is_some();
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern(n)).collect();
                 let constants: Box<[Value]> = f
                     .constants
@@ -4442,7 +4451,7 @@ impl Vm {
                 let calls_left = match (scan.has_loop, recursive || scan.ops >= ENTRY_COMPILE_SIZE) {
                     // (Several realms: every call checks the callee's.)
                     _ if !self.realms.is_empty() => 0,
-                    _ if interpreted => i32::MAX,
+                    _ if only_interpreted => i32::MAX,
                     _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                     (true, _) => self.tier_calls,
                     (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
@@ -4454,7 +4463,7 @@ impl Vm {
                     (false, false) if f.captures => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
                     (false, false) => i32::MAX,
                 };
-                let loop_budget = if !interpreted { self.frame_budget } else { i64::MAX };
+                let loop_budget = if !only_interpreted { self.frame_budget } else { i64::MAX };
                 if let Some(into) = into.filter(|_| i == 0) {
                     // The stub's runtime state stays (its constructor's
                     // slack tracking, its liveness): it has never run.

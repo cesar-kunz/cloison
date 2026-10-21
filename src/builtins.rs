@@ -336,10 +336,14 @@ fn this_units<'a>(this: Value) -> Result<Cow<'a, [u16]>> {
             "String.prototype method called on null or undefined",
         ));
     }
-    if let Some(u) = wrapped(this).and_then(string_units) {
-        return Ok(Cow::Borrowed(u));
+    // (A String object too is converted, through its `toString`, which
+    // code may have replaced: ToString of `this`.)
+    let u = units(this);
+    let vm = unsafe { &mut *crate::interp::current_vm() };
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
     }
-    Ok(units(this))
+    Ok(u)
 }
 
 /// ToIntegerOrInfinity of argument `i` (0 if missing or NaN).

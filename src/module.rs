@@ -137,6 +137,17 @@ pub(crate) struct Modules {
     pub(crate) script_path: Option<String>,
     /// `%AbstractModuleSource%` and its prototype (see [`install`]).
     pub(crate) abstract_source: Vec<Value>,
+    /// A walk of re-exports stopped near the stack's end (see
+    /// [`resolve_export`]): its caller throws a RangeError.
+    too_deep: std::cell::Cell<bool>,
+}
+
+/// The RangeError of a walk of re-exports stopped (`Modules::too_deep`).
+fn re_exports_ok(vm: &Vm) -> Result<()> {
+    if vm.modules.too_deep.replace(false) {
+        return Err(Error::range_error("Maximum call stack size exceeded"));
+    }
+    Ok(())
 }
 
 impl Modules {
@@ -238,10 +249,24 @@ fn resolve_path(referrer: &str, specifier: &str) -> String {
     }
 }
 
+/// A RangeError if the thread's stack is nearly out: a module graph's
+/// walks recurse as deep as its imports go. (The thread's own end, not
+/// the run's budget for compiled calls, `Vm::native_limit`: a graph a few
+/// thousand deep must load, as the front end parses a deep program.)
+fn check_stack() -> Result<()> {
+    if crate::stack::low() {
+        return Err(Error::range_error("Maximum call stack size exceeded"));
+    }
+    Ok(())
+}
+
 /// The module at `path` (of kind `kind`), loaded with the modules it
 /// requests (their graph), each once: its index. A file that can't be
 /// read is an error; a syntax error in one, a SyntaxError.
 fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
+    // (A graph as deep as the native stack allows: past it, a RangeError.
+    // So for linking and evaluating, which recurse as deep.)
+    check_stack()?;
     let kind = if path == HOST_SOURCE { Kind::HostSource } else { kind };
     if let Some(&m) = vm.modules.by_path.get(&(path.to_string(), kind)) {
         return Ok(m);
@@ -351,6 +376,11 @@ enum Resolution {
 /// ResolveExport (§16.2.1.6.3): what module `m`'s export `name` is, if
 /// anything (`None`: nothing, or a cycle of re-exports).
 fn resolve_export(vm: &Vm, m: usize, name: &str, set: &mut Vec<(usize, String)>) -> Option<Resolution> {
+    // (Re-exports as deep as the stack allows: see `re_exports_ok`.)
+    if crate::stack::low() {
+        vm.modules.too_deep.set(true);
+        return None;
+    }
     if set.iter().any(|(k, n)| *k == m && n == name) {
         return None;
     }
@@ -388,6 +418,10 @@ fn resolve_export(vm: &Vm, m: usize, name: &str, set: &mut Vec<(usize, String)>)
 
 /// GetExportedNames (§16.2.1.6.2).
 fn exported_names(vm: &Vm, m: usize, set: &mut Vec<usize>) -> Vec<String> {
+    if crate::stack::low() {
+        vm.modules.too_deep.set(true);
+        return Vec::new();
+    }
     if set.contains(&m) {
         return Vec::new();
     }
@@ -435,6 +469,7 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
                 Some(res) => exports.push((crate::js::lex::to_units(&n), res)),
             }
         }
+        re_exports_ok(vm)?;
         exports.sort_by(|a, b| a.0.cmp(&b.0));
         rec_mut(vm, m).exports = exports;
     }
@@ -649,6 +684,7 @@ fn link(vm: &mut Vm, root: usize) -> Result<()> {
 }
 
 fn link_from(vm: &mut Vm, m: usize, done: &mut Vec<usize>) -> Result<()> {
+    check_stack()?;
     if rec(vm, m).status != Status::New {
         return Ok(());
     }
@@ -675,7 +711,9 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
     let imports = r.info.imports.clone();
     let requested = r.requested.clone();
     for e in indirect {
-        match resolve_export(vm, m, &e, &mut Vec::new()) {
+        let res = resolve_export(vm, m, &e, &mut Vec::new());
+        re_exports_ok(vm)?;
+        match res {
             Some(Resolution::Binding(..) | Resolution::Namespace(..) | Resolution::Source(_)) => {}
             Some(Resolution::Ambiguous) => return Err(syntax(format!("{path}: the export '{e}' is ambiguous"))),
             None => return Err(syntax(format!("{path}: the export '{e}' can't be resolved"))),
@@ -688,7 +726,7 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
         let res = match name {
             ImportName::Namespace => Resolution::Namespace(dep, rec(vm, m).phase(*req) == Phase::Defer),
             ImportName::Source => Resolution::Source(dep),
-            ImportName::Name(n) => match resolve_export(vm, dep, n, &mut Vec::new()) {
+            ImportName::Name(n) => match (resolve_export(vm, dep, n, &mut Vec::new()), re_exports_ok(vm)?).0 {
                 Some(Resolution::Ambiguous) => {
                     return Err(syntax(format!("{path}: the requested module '{}' has an ambiguous export '{n}'", rec(vm, dep).path)));
                 }
@@ -787,6 +825,7 @@ fn inner_evaluate(vm: &mut Vm, m: usize, stack: &mut Vec<usize>, index: usize) -
         Status::Evaluating => return Ok(index),
         _ => {}
     }
+    check_stack()?;
     {
         let r = rec_mut(vm, m);
         r.status = Status::Evaluating;
@@ -944,7 +983,20 @@ fn execute(vm: &mut Vm, m: usize) -> Result<()> {
         return Ok(());
     }
     let g = rec(vm, m).generator;
-    crate::generator::run_module(vm, g)
+    with_budget(vm, |vm| crate::generator::run_module(vm, g))
+}
+
+/// Run `f`, a module's body, with the run's native stack budget for its
+/// calls (`Vm::native_limit`) from here, as deep in a graph's evaluation
+/// as it is: what is left of the thread's stack bounds it.
+fn with_budget<T>(vm: &mut Vm, f: impl FnOnce(&mut Vm) -> Result<T>) -> Result<T> {
+    let here = 0u8;
+    let saved = vm.native_limit;
+    let budget = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
+    vm.native_limit = budget.max(crate::stack::end() + crate::stack::RESERVE);
+    let r = f(vm);
+    vm.native_limit = saved;
+    r
 }
 
 /// ExecuteAsyncModule (§16.2.1.5.3.2): its body run as an async function
@@ -952,7 +1004,7 @@ fn execute(vm: &mut Vm, m: usize) -> Result<()> {
 /// waiting for it.
 fn execute_async(vm: &mut Vm, m: usize) -> Result<()> {
     let g = rec(vm, m).generator;
-    let p = crate::generator::async_start(vm, g)?;
+    let p = with_budget(vm, |vm| crate::generator::async_start(vm, g))?;
     let on_fulfilled = closure(vm, Template::Fulfilled, &[Value::from_i32(m as i32)]);
     let on_rejected = closure(vm, Template::Rejected, &[Value::from_i32(m as i32)]);
     crate::promise::await_then(vm, p, on_fulfilled, on_rejected)

@@ -41,6 +41,14 @@ fn find_end() -> usize {
     }
 }
 
+/// The lowest address of this thread's stack (1 if unknown).
+pub(crate) fn end() -> usize {
+    match END.with(Cell::get) {
+        0 => find_end(),
+        end => end,
+    }
+}
+
 /// Whether less than [`RESERVE`] of this thread's stack is left.
 #[inline]
 pub(crate) fn low() -> bool {

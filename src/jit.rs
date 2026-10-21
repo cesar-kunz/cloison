@@ -5269,9 +5269,14 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 }
             }
         }
-        // A site that gave up on the stencils: through the runtime (a
-        // store may change shapes: exact ones become lower bounds, as after
-        // a call), the name an operand.
+        // A site that gave up on the stencils: through the runtime, the name
+        // an operand. A store may change the receiver's shape (only: it
+        // leaves where it would call a setter, or store to a prototype),
+        // so values that may be the receiver, exact, become lower bounds;
+        // others stay exact (TypeScript's scanner, stores to its tokens
+        // through the runtime made its `this` lower bound, and calls to
+        // `innerScan` from there took a version of their own it had no
+        // compilations left for: it ran interpreted).
         if prop == Prop::Runtime
             && matches!(insn.op, Op::GetNamed | Op::SetNamed)
             && let Some(fbs) = spec.feedback
@@ -5281,8 +5286,13 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 out.acc = Any;
                 Sel::new("get_named_rt", "", out)
             } else {
+                let may_be_receiver = |x: u64| match reg {
+                    Ty::Obj(r) => r == x,
+                    Ty::Ext(r) => unsafe { extends(x as *const Shape, r as *const Shape) },
+                    _ => true,
+                };
                 let ext = |t: Ty| match t {
-                    Ty::Obj(x) => Ty::Ext(x),
+                    Ty::Obj(x) if may_be_receiver(x) => Ty::Ext(x),
                     t => t,
                 };
                 out.regs.map(|_, t| ext(t));

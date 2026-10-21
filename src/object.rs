@@ -735,12 +735,14 @@ impl Drop for Shape {
 }
 
 impl Shape {
-    /// The shape's [`PushCache`], made if it has none.
-    pub(crate) fn push_cache(&self) -> &mut PushCache {
+    /// `f` of the shape's [`PushCache`], made if it has none. (A borrow
+    /// that can't outlive `f`: no two overlap. Compiled code reads the
+    /// cache through `push`, never while this runs.)
+    pub(crate) fn with_push_cache<T>(&self, f: impl FnOnce(&mut PushCache) -> T) -> T {
         if self.push.get().is_null() {
             self.push.set(Box::into_raw(Box::default()));
         }
-        unsafe { &mut *self.push.get() }
+        f(unsafe { &mut *self.push.get() })
     }
 }
 

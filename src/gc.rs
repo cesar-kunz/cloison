@@ -2176,7 +2176,7 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
     let mut p = start;
     unsafe {
         while p < end {
-            if p + 8 * GRANULE <= end && *(meta(p) as *const u64) == 0 {
+            if p + 8 * GRANULE <= end && (meta(p) as *const u64).read_unaligned() == 0 {
                 p += 8 * GRANULE;
                 continue;
             }

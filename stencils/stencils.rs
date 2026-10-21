@@ -4057,9 +4057,15 @@ unsafe fn props(o: *mut u8) -> *mut u8 {
     unsafe { *(o.add(16) as *const *mut u8) }
 }
 
-/// Entries of the runtime's megamorphic load table past the first
+/// Entries of the runtime's megamorphic tables past the first
 /// (`vm::MEGAS`).
 const MEGAS: usize = 2048;
+
+/// `vm::mega_index`: the entry of `shape` and `name` in those tables.
+#[inline(always)]
+fn mega_index(shape: u64, name: u32) -> usize {
+    1 + ((shape ^ (name as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MEGAS.trailing_zeros())) as usize
+}
 
 /// `o.name` (the name an `Atom`, in `imm64`) as the runtime's megamorphic
 /// load table (at `imm64b`; see `vm::MegaEntry`) has it, if it does.
@@ -4073,7 +4079,7 @@ unsafe fn mega_load(tag: NumberTag, o: Value) -> Option<Value> {
         let shape = *(p as *const u64);
         let name = imm64() as u32;
         let t = imm64b() as *const u8;
-        let k = 1 + ((shape >> 4) as u32 ^ name.wrapping_mul(0x9E37_79B1)) as usize % MEGAS;
+        let k = mega_index(shape, name);
         let e = t.add(k * 32);
         if *(e as *const u64) != shape || *(e.add(8) as *const u32) != name {
             return None;
@@ -4086,6 +4092,61 @@ unsafe fn mega_load(tag: NumberTag, o: Value) -> Option<Value> {
         }
         let epoch = *(*(t.add(24) as *const *const u32));
         (*(e.add(12) as *const u32) == epoch).then(|| *addr)
+    }
+}
+
+/// `o.name = v` (the name an `Atom`, in `imm64`; `v` boxed) as the
+/// runtime's megamorphic store table (at `imm64b`; see `vm::MegaStore`) has
+/// it, if it does, as the interpreter's store cache does: whether it did.
+/// (An int32 into a `Num` field, which takes it as a double, is left to
+/// the runtime.)
+#[inline(always)]
+unsafe fn mega_store(tag: NumberTag, o: Value, v: Value) -> bool {
+    unsafe {
+        if !is_cell(tag, o) {
+            return false;
+        }
+        let p = o.to_bits() as *mut u8;
+        let shape = *(p as *const u64);
+        let name = imm64() as u32;
+        let t = imm64b() as *const u8;
+        let k = mega_index(shape, name);
+        let mut e = t.add(k * 40);
+        if *(e as *const u64) != shape || *(e.add(8) as *const u32) != name {
+            e = t.add((((k - 1) ^ 1) + 1) * 40);
+            if *(e as *const u64) != shape || *(e.add(8) as *const u32) != name {
+                return false;
+            }
+        }
+        let fits = match *(e.add(16) as *const u64) {
+            0 => true,
+            1 => tag.is_int32(v),
+            2 => is_number(tag, v) && !tag.is_int32(v),
+            s => is_cell(tag, v) && *(v.to_bits() as *const u64) == s,
+        };
+        if !fits {
+            return false;
+        }
+        let loc = *(e.add(32) as *const i32);
+        let new = *(e.add(24) as *const u64);
+        if new != 0 {
+            let epoch = *(*(t.add(24) as *const *const u32));
+            if *(e.add(12) as *const u32) != epoch || loc < 0 && !loc as u32 >= *(p.add(12) as *const u32) {
+                return false;
+            }
+            *(p as *mut u64) = new;
+        }
+        if loc >= 0 {
+            let at = p.add(loc as usize) as *mut Value;
+            *at = v;
+            barrier(tag, p, at, v);
+        } else {
+            let q = props(p);
+            let at = (q as *mut Value).add(!loc as usize);
+            *at = v;
+            barrier(tag, q.sub(8), at, v);
+        }
+        true
     }
 }
 
@@ -4725,6 +4786,9 @@ macro_rules! property_location {
             next!(s)
         });
         stencil!("set_named_rt_", loc!($loc); |s| {
+            if mega_store(s.tag, get!($loc, s), s.acc) {
+                next!(s)
+            }
             let args = [get!($loc, s), Value::from_bits(imm64()), s.acc];
             let r = rt_call!(s, cloison_rt_set_named, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
@@ -4734,6 +4798,9 @@ macro_rules! property_location {
         });
         stencil!("set_named_rt_i_", loc!($loc); |s| {
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            if mega_store(s.tag, get!($loc, s), v) {
+                next!(s)
+            }
             let args = [get!($loc, s), Value::from_bits(imm64()), v];
             let r = rt_call!(s, cloison_rt_set_named, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {

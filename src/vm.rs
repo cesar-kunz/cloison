@@ -4753,7 +4753,9 @@ impl Vm {
         codes
     }
 
-    /// Load and run `module`; returns its completion value.
+    /// Load and run `module`; returns its completion value. The module
+    /// is `js::compile`'s or `asm::parse`'s, or one `asm::verify` accepts:
+    /// its bytecode is run unchecked.
     pub fn run(&mut self, module: &Module) -> Result<Value> {
         crate::interp::CURRENT_VM.with(|v| v.set(self));
         self.declare_script(module)?;

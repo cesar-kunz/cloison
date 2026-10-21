@@ -406,13 +406,170 @@ pub fn parse(src: &str) -> Result<Module, String> {
             text: None,
         });
     }
-    Ok(Module {
+    let module = Module {
         lexical: Vec::new(),
         functions,
         script,
         declared: Vec::new(),
         function_names: Vec::new(),
-    })
+    };
+    verify(&module)?;
+    Ok(module)
+}
+
+/// Check that `m` is bytecode the interpreter can run safely, which it
+/// assumes without checking (see `interp::run_frame`): every instruction
+/// a known one and complete, every path ending in a `Return`, `Throw` or
+/// jump, jumps and handlers landing on instructions, registers (calls'
+/// windows too) within the frame, and table indices within their tables.
+/// A module from `js::compile` is right by construction; one made any
+/// other way (the text format, or [`Module`] built directly) must pass
+/// this before `Vm::run`.
+///
+/// Only bytecode whose safety this can see is accepted: not the
+/// instructions whose operands must hold what the front end put there
+/// (generators' `InitialYield`, `Yield` and `AsyncStart`, `PushLiteral`'s
+/// array, `DefineAccessor`'s object), lazily compiled stubs, nor class
+/// constructors, generators or async functions (`kind` over 1).
+pub fn verify(m: &Module) -> Result<(), String> {
+    let n = m.functions.len();
+    if m.script >= n {
+        return Err("the script is not one of the functions".into());
+    }
+    // How many upvalues each function's closures get.
+    let upvalues: Vec<usize> = m.functions.iter().map(|f| f.upvalues.len()).collect();
+    if upvalues[m.script] != 0 {
+        return Err("the script has upvalues".into());
+    }
+    for f in &m.functions {
+        let err = |at: usize, what: String| Err(format!("{}: at {at}: {what}", f.name));
+        if f.lazy.is_some() || f.kind > 1 {
+            return Err(format!("{}: a stub, class constructor, generator or async function", f.name));
+        }
+        if f.nregs > 256 || f.nregs < f.nparams + 1 {
+            return Err(format!("{}: {} registers for {} parameters", f.name, f.nregs, f.nparams));
+        }
+        if let Some(&c) = f.closures.iter().find(|&&c| c >= n) {
+            return Err(format!("{}: nested function {c} is not one of the module's", f.name));
+        }
+        // Where a closure's upvalues come from: here.
+        for &c in &f.closures {
+            for &(local, k) in &m.functions[c].upvalues {
+                if local && k as u32 >= f.nregs || !local && k as usize >= f.upvalues.len() {
+                    return Err(format!("{}: an upvalue of {} out of range", f.name, m.functions[c].name));
+                }
+            }
+        }
+        let code = &f.code;
+        // Instruction boundaries.
+        let mut starts = vec![false; code.len() + 1];
+        let mut at = 0;
+        let mut last = None;
+        while at < code.len() {
+            starts[at] = true;
+            let Some(op) = Op::from_u8(code[at]) else {
+                return err(at, format!("opcode {} unknown", code[at]));
+            };
+            if at + op.size() > code.len() {
+                return err(at, format!("{op:?} incomplete"));
+            }
+            last = Some(op);
+            at += op.size();
+        }
+        let Some(last) = last else {
+            return Err(format!("{}: no instructions", f.name));
+        };
+        if !matches!(last, Op::Return | Op::Throw | Op::Jump | Op::JumpLoop) {
+            return Err(format!("{}: its last instruction ({last:?}) falls off its end", f.name));
+        }
+        let mut at = 0;
+        while at < code.len() {
+            let op = Op::from_u8(code[at]).unwrap();
+            let mut regs: Vec<usize> = Vec::new();
+            let mut operand = at + 1;
+            let mut vals: Vec<i64> = Vec::new();
+            for &k in op.operands() {
+                let b = &code[operand..operand + k.width()];
+                let v = match k.width() {
+                    1 => b[0] as i64,
+                    2 => u16::from_le_bytes([b[0], b[1]]) as i64,
+                    _ => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
+                };
+                vals.push(v);
+                match k {
+                    Operand::Reg => regs.push(v as usize),
+                    Operand::Off => {
+                        let t = at as i64 + v;
+                        if t < 0 || t as usize >= code.len() || !starts[t as usize] {
+                            return err(at, format!("{op:?} jumps to {t}, not an instruction"));
+                        }
+                    }
+                    Operand::Ic | Operand::AutoIc if v as usize >= f.ics.len() => {
+                        return err(at, format!("{op:?}: cache slot {v} out of range"));
+                    }
+                    Operand::Fn if v as usize >= f.closures.len() => {
+                        return err(at, format!("{op:?}: nested function {v} out of range"));
+                    }
+                    Operand::Const if v as usize >= f.constants.len() => {
+                        return err(at, format!("{op:?}: constant {v} out of range"));
+                    }
+                    _ => {}
+                }
+                operand += k.width();
+            }
+            // Registers past the operands': calls' argument windows.
+            let end = match op {
+                Op::Call => Some(vals[1] + vals[2] + 1),
+                Op::CallUndefined | Op::Construct => Some(vals[1] + vals[2]),
+                Op::CallApplyArguments => Some(vals[1] + 3),
+                Op::Intrinsic => Some(vals[1] + vals[2]),
+                _ => None,
+            };
+            if regs.iter().any(|&r| r >= f.nregs as usize) || end.is_some_and(|e| e > f.nregs as i64) {
+                return err(at, format!("{op:?}: a register out of the frame's {}", f.nregs));
+            }
+            let string = |k: i64| matches!(f.constants[k as usize], Constant::String(_));
+            match op {
+                Op::CompileLazy | Op::InitialYield | Op::Yield | Op::AsyncStart | Op::PushLiteral | Op::DefineAccessor => {
+                    return err(at, format!("{op:?} is the front end's only"));
+                }
+                Op::LdaUpvalue | Op::StaUpvalue if vals[0] as usize >= f.upvalues.len() => {
+                    return err(at, format!("{op:?}: upvalue {} out of range", vals[0]));
+                }
+                Op::Intrinsic if vals[0] as usize >= crate::intrinsics::INTRINSICS.len() => {
+                    return err(at, format!("intrinsic {} unknown", vals[0]));
+                }
+                Op::CreateRegExp if !string(vals[0]) || !string(vals[1]) => {
+                    return err(at, "CreateRegExp of a constant that isn't a string".into());
+                }
+                Op::CheckHole if !string(vals[0]) => {
+                    return err(at, "CheckHole of a constant that isn't a string".into());
+                }
+                _ => {}
+            }
+            // A fused comparison reads the jump after it (see `quicken`).
+            if op.plain() != op && !op.is_loop() {
+                let next = at + op.size();
+                if !matches!(code.get(next).and_then(|&b| Op::from_u8(b)), Some(Op::JumpIfTrue | Op::JumpIfFalse)) {
+                    return err(at, format!("{op:?} not followed by its jump"));
+                }
+            }
+            at += op.size();
+        }
+        let inside = |o: u32| (o as usize) < code.len() && starts[o as usize];
+        for &(start, end, handler) in &f.handlers {
+            if start > end || end as usize > code.len() || !inside(handler) {
+                return Err(format!("{}: a handler out of range", f.name));
+            }
+        }
+        if f.compound_keys.iter().any(|&(g, s)| !inside(g) || !inside(s)) {
+            return Err(format!("{}: a compound key out of range", f.name));
+        }
+        if f.defines.iter().any(|&d| d as usize >= f.ics.len()) {
+            return Err(format!("{}: a define slot out of range", f.name));
+        }
+    }
+    Ok(())
 }
 
 /// The text form of a module, which [`parse`] reads back into the same
@@ -613,5 +770,34 @@ mod tests {
         assert!(e.contains("register"), "{e}");
         let e = parse("script\n  LdaUpvalue 0\n  Return\nend\n").unwrap_err();
         assert!(e.contains("no upvalues"), "{e}");
+    }
+
+    /// What [`verify`] rejects: code the interpreter would run off, out
+    /// of its frame or its tables with.
+    #[test]
+    fn verify_rejects_unsafe_bytecode() {
+        let ok = parse("script\n  LdaSmi 1\n  Return\nend\n").unwrap();
+        let bad = |edit: &dyn Fn(&mut FunctionDef)| {
+            let mut m = ok.clone();
+            edit(&mut m.functions[0]);
+            verify(&m).unwrap_err()
+        };
+        assert!(parse("script\nend\n").unwrap_err().contains("no instructions"));
+        assert!(parse("script\n  LdaSmi 1\nend\n").unwrap_err().contains("falls off"));
+        assert!(bad(&|f| f.code.truncate(3)).contains("incomplete"));
+        assert!(bad(&|f| f.code[0] = 255).contains("unknown"));
+        // `Jump` into the middle of `LdaSmi`.
+        assert!(bad(&|f| f.code = vec![Op::Jump as u8, 2, 0, 0, 0, Op::Return as u8]).contains("not an instruction"));
+        assert!(bad(&|f| f.code = vec![Op::Ldar as u8, 9, Op::Return as u8]).contains("register"));
+        // `Call r0, r0, 5`'s window past the frame.
+        assert!(bad(&|f| {
+            f.code = vec![Op::Call as u8, 0, 0, 5, 0, 0, Op::Return as u8];
+            f.ics.push("".into());
+        })
+        .contains("register"));
+        assert!(bad(&|f| f.code = vec![Op::LdaConstant as u8, 0, 0, Op::Return as u8]).contains("constant"));
+        assert!(bad(&|f| f.code = vec![Op::TestNullJumpIfTrue as u8, Op::Return as u8]).contains("its jump"));
+        assert!(bad(&|f| f.kind = 4).contains("generator"));
+        assert!(bad(&|f| f.handlers.push((0, 6, 3))).contains("handler"));
     }
 }

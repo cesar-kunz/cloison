@@ -7632,3 +7632,26 @@ fn broadcasts_skip_agents_that_ended() {
     "#;
     assert_eq!(value(src), "done");
 }
+
+/// A graph whose load failed (a module missing, in a cycle) is not kept
+/// in part: importing another module of the cycle again loads the graph
+/// again, and fails again, rather than linking it without the missing
+/// edge. Then the missing module made, it loads.
+#[test]
+fn a_failed_module_graph_is_loaded_again() {
+    let dir = module_dir(
+        "retry",
+        &[
+            (
+                "main.mjs",
+                "var log = [];\n\
+                 try { await import('./a.mjs'); log.push('a loaded'); } catch (e) { log.push(e.name); }\n\
+                 try { await import('./b.mjs'); log.push('b loaded'); } catch (e) { log.push(e.name); }\n\
+                 globalThis.result = log.join();",
+            ),
+            ("a.mjs", "import './b.mjs';\nimport './missing.mjs';\nexport const a = 1;"),
+            ("b.mjs", "import './a.mjs';\nexport const b = 1;"),
+        ],
+    );
+    assert_eq!(run_module(&dir, "main.mjs").unwrap(), "TypeError,TypeError");
+}

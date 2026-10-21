@@ -312,8 +312,11 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
         Ok(())
     })();
     if let Err(e) = r {
-        // (Not kept: loading it again fails again, or not.)
-        vm.modules.by_path.remove(&(path.to_string(), kind));
+        // Not kept (loading it again fails again, or not), nor any module
+        // loaded since, as part of its graph: one may request it, through
+        // a cycle, and its requests stopped at the failure. (One loaded
+        // before, complete then, requests only modules loaded before.)
+        vm.modules.by_path.retain(|_, &mut k| k < m);
         return Err(e);
     }
     Ok(m)

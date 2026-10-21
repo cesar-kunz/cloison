@@ -4264,6 +4264,18 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // `imm`: after the in-object slots of the function shape, which
         // every function object with upvalues has (`Vm::upvalues`); `_c`
         // has the cell (`Prop::Upvalue`).
+        // An upvalue folded to its value (`Lowering::constant_upvalue`): a
+        // typed array keeps its kind (no `_chk` on its elements).
+        Op::LdaUpvalue if let Some(Prop::Const { value, .. }) = spec.props.get(i).copied() => {
+            out.acc = match Ty::of(Value::from_bits(value)) {
+                Ty::Obj(s) => Ty::Ext(s),
+                t => t,
+            };
+            return Sel {
+                ops: Some((0, value, 0)),
+                ..Sel::new("lda_constant", "", out)
+            };
+        }
         Op::LdaUpvalue | Op::StaUpvalue => {
             if insn.op == Op::LdaUpvalue {
                 out.acc = Any;
@@ -4727,6 +4739,127 @@ const THIS_GUARD: u64 = 2;
 /// it, and writes it to the inlined frame's header (`imm` bytes from the
 /// registers): `check_callee_code` (see `inline_by_code`).
 const CODE_GUARD: u64 = 1;
+
+/// Whether code may assign the variable upvalue `k` of `code` is, once
+/// the function declaring it has returned: whether a function nested in
+/// that one has a `StaUpvalue` to it, or may (a nested function not
+/// compiled yet that has it as an upvalue), or the declaring function makes
+/// a mapped `arguments` (whose elements are its parameters). Assigned
+/// unless shown otherwise; the answer "no" is kept, as it can't change.
+fn variable_assigned(vm: &crate::vm::Vm, code: *const crate::vm::Code, k: usize) -> bool {
+    use crate::vm::Code;
+    thread_local! {
+        static PARENTS: std::cell::RefCell<(usize, HashMap<usize, usize>)> = Default::default();
+        static CONSTANT: std::cell::RefCell<HashSet<(usize, usize)>> = Default::default();
+    }
+    if CONSTANT.with(|c| c.borrow().contains(&(code as usize, k))) {
+        return false;
+    }
+    let parent = |c: *const Code| -> Option<*const Code> {
+        PARENTS.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.0 != vm.codes.len() {
+                p.1.clear();
+                for c in &vm.codes {
+                    for &n in &c.closures {
+                        p.1.insert(n as usize, &**c as *const Code as usize);
+                    }
+                }
+                p.0 = vm.codes.len();
+            }
+            p.1.get(&(c as usize)).map(|&x| x as *const Code)
+        })
+    };
+    // The declaring function and the variable's register there.
+    let (mut c, mut idx) = (code, k);
+    let (decl, reg) = loop {
+        let Some(&(local, j)) = (unsafe { (&(*c).upvalues).get(idx) }) else { return true };
+        let Some(p) = parent(c) else { return true };
+        if local {
+            break (p, j);
+        }
+        (c, idx) = (p, j as usize);
+    };
+    if bytecode_facts(decl).0 {
+        return true;
+    }
+    // Down from it: each nested function's upvalues that are the variable.
+    let mut stack: Vec<(*const Code, Vec<usize>)> = unsafe { &(*decl).closures }
+        .iter()
+        .map(|&n| {
+            let s = unsafe { &(*n).upvalues }.iter().enumerate();
+            (n, s.filter(|&(_, &(l, j))| l && j == reg).map(|(m, _)| m).collect())
+        })
+        .collect();
+    while let Some((n, these)) = stack.pop() {
+        if !these.is_empty() {
+            if unsafe { (*n).lazy.is_some() } {
+                // (Not compiled yet: compiled here, not installed.)
+                match lazy_writes(n) {
+                    Some(w) if !these.iter().any(|m| w.contains(m)) => continue,
+                    _ => return true,
+                }
+            }
+            if bytecode_facts(n).1.iter().any(|m| these.contains(m)) {
+                return true;
+            }
+        }
+        for &m in unsafe { &(*n).closures } {
+            let s = unsafe { &(*m).upvalues }.iter().enumerate();
+            let theirs: Vec<usize> =
+                s.filter(|&(_, &(l, j))| !l && these.contains(&(j as usize))).map(|(q, _)| q).collect();
+            stack.push((m, theirs));
+        }
+    }
+    CONSTANT.with(|c| c.borrow_mut().insert((code as usize, k)));
+    false
+}
+
+/// What [`variable_assigned`] reads of `code`'s bytecode, decoded once:
+/// whether it makes a mapped `arguments`, and the upvalues it assigns.
+fn bytecode_facts(code: *const crate::vm::Code) -> std::rc::Rc<(bool, Vec<usize>)> {
+    thread_local! {
+        static FACTS: std::cell::RefCell<HashMap<usize, std::rc::Rc<(bool, Vec<usize>)>>> = Default::default();
+    }
+    FACTS.with(|f| {
+        f.borrow_mut()
+            .entry(code as usize)
+            .or_insert_with(|| {
+                let insns = decode(unsafe { &(*code).bytecode }, true);
+                let mapped = insns.iter().any(|i| i.op == Op::CreateMappedArguments);
+                let sta = insns.iter().filter(|i| i.op == Op::StaUpvalue).map(|i| i.imm as usize).collect();
+                std::rc::Rc::new((mapped, sta))
+            })
+            .clone()
+    })
+}
+
+/// The upvalues stub `code` (a function not compiled yet) assigns, from
+/// its source compiled here (not installed); `None` if a function nested
+/// in it may assign one of them, or it doesn't compile.
+fn lazy_writes(code: *const crate::vm::Code) -> Option<std::rc::Rc<Vec<usize>>> {
+    thread_local! {
+        static WRITES: std::cell::RefCell<HashMap<usize, Option<std::rc::Rc<Vec<usize>>>>> = Default::default();
+    }
+    if let Some(w) = WRITES.with(|w| w.borrow().get(&(code as usize)).cloned()) {
+        return w;
+    }
+    let w = (|| {
+        let module = crate::js::compile_lazy(unsafe { (*code).lazy.as_ref()? }).ok()?;
+        let (f0, nested) = module.functions.split_first()?;
+        let sta = |f: &crate::asm::FunctionDef| -> Vec<usize> {
+            decode(&f.code, true).iter().filter(|i| i.op == Op::StaUpvalue).map(|i| i.imm as usize).collect()
+        };
+        // (A nested function's assignment to an upvalue of its parent's:
+        // possibly the stub's.)
+        if nested.iter().any(|g| sta(g).iter().any(|&m| g.upvalues.get(m).is_none_or(|&(local, _)| !local))) {
+            return None;
+        }
+        Some(std::rc::Rc::new(sta(f0)))
+    })();
+    WRITES.with(|c| c.borrow_mut().insert(code as usize, w.clone()));
+    w
+}
 
 /// Whether call `i` to `fo` is inlined for any closure of `fo`'s code, not
 /// `fo` alone: its code made closures more than once (PdfJS's canvas
@@ -9472,6 +9605,10 @@ struct VmState {
     /// first entered compiled code (its loads are speculated to give
     /// one); empty till then.
     int_upvalues: Vec<bool>,
+    /// The function object that frame ran (its upvalues' cells), recorded
+    /// then too: the only one there is if its code made one closure (see
+    /// [`Lowering::constant_upvalue`]).
+    root_func: *mut Object,
 }
 
 impl VmState {
@@ -12635,6 +12772,19 @@ impl Lowering<'_> {
                 // An upvalue: in an inlined frame, of its (checked) callee,
                 // whose cells are known; in the root frame, through the
                 // frame's function (`lda_upvalue`).
+                // An upvalue no code assigns once its cell is closed (an
+                // asm.js module's heap views): its value, as a constant.
+                Op::LdaUpvalue if let Some(v) = self.constant_upvalue(frame, i.imm as usize) => {
+                    unsafe { (*self.state.vm).heap.keep(v.to_bits() as usize) };
+                    let prop = Prop::Const {
+                        value: v.to_bits(),
+                        at: 0,
+                        expect: 0,
+                        ft: FieldType::Any,
+                        obj: 0,
+                    };
+                    self.push(i, prop);
+                }
                 Op::LdaUpvalue | Op::StaUpvalue => {
                     let func = self.out.frames[frame].func;
                     let cell = |f: *mut Object| unsafe { *crate::vm::Vm::upvalues(f).add(i.imm as usize) };
@@ -12931,6 +13081,20 @@ impl Lowering<'_> {
         // its frame's header (see `Insn::forward`).
         if unsafe { (*callee).interpreted } || self.nullable_this(i, fo) || self.frame_args(callee) {
             return false;
+        }
+        // Its only closure, which its lowerings for direct calls (with no
+        // frame of its own to find it in) fold constant upvalues of (see
+        // `VmState::root_func`). (Past the checks above: a function that
+        // must run interpreted gets no JIT state.)
+        if unsafe { (*callee).closures_made.get() } == 1
+            && let Ok(mut slot) = unsafe { (*callee).jit.try_borrow_mut() }
+            && let Some(v) = slot
+                .get_or_insert_with(|| Box::new(JitFunction::for_vm(callee, self.state.vm)))
+                .vm
+                .as_mut()
+            && v.root_func.is_null()
+        {
+            v.root_func = fo;
         }
         // A constructor's `this` is allocated by the call
         // (`cloison_rt_construct`), with the shape its root has now.
@@ -13608,6 +13772,39 @@ impl Lowering<'_> {
     }
 
     /// Returns the index of the callee's guard.
+    /// Upvalue `k` of frame `frame`'s function, if it is a constant: the
+    /// frame's function object is known (an inlined frame's, or the
+    /// compiled function's if its code made one closure), the upvalue's
+    /// cell is closed (the function declaring the variable has returned:
+    /// only closures reach it now) and no closure assigns the variable
+    /// ([`variable_assigned`]). Only objects: a number's or other
+    /// primitive's type the load's own speculation takes.
+    fn constant_upvalue(&mut self, frame: usize, k: usize) -> Option<Value> {
+        let f = self.out.frames[frame];
+        let func = if !f.func.is_null() {
+            f.func
+        } else if frame == 0 && unsafe { (*f.code).closures_made.get() } == 1 {
+            self.state.root_func
+        } else {
+            return None;
+        };
+        if func.is_null() || unsafe { (*func).code } != f.code || k >= unsafe { (&(*f.code).upvalues).len() } {
+            return None;
+        }
+        let v = unsafe {
+            let u = *crate::vm::Vm::upvalues(func).add(k);
+            if (*u).at != &raw mut (*u).closed {
+                return None;
+            }
+            (*u).closed
+        };
+        if !crate::props::is_object(v) {
+            return None;
+        }
+        let vm = unsafe { &*self.state.vm };
+        (!variable_assigned(vm, f.code, k)).then_some(v)
+    }
+
     fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) -> usize {
         let (guard, rets) = self.inline_case(frame, i, fo, depth, false, None, 0);
         self.return_past(rets);
@@ -14462,6 +14659,7 @@ impl JitFunction {
             heat: Box::new(HOT_HEAT),
             classified: false,
             int_upvalues: Vec::new(),
+            root_func: std::ptr::null_mut(),
         }));
         f
     }
@@ -14536,6 +14734,7 @@ impl JitFunction {
                 let n = unsafe { (&(*vm.root).upvalues).len() };
                 let f = unsafe { *(regs.byte_sub(interp::FUNC_OFF) as *const *mut Object) };
                 if n > 0 && !f.is_null() {
+                    vm.root_func = f;
                     vm.int_upvalues = (0..n)
                         .map(|k| unsafe {
                             let cell = *crate::vm::Vm::upvalues(f).add(k);

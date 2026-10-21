@@ -303,11 +303,24 @@ macro_rules! rt_mod {
         Value::from_bits(rt_redo!($s, rt_call!($s, cloison_rt_mod, $a, $b)))
     };
 }
-/// `cloison_rt_to_int32(a)`: ToInt32(ToNumber(a)).
+/// `cloison_rt_to_int32(a)`: ToInt32(ToNumber(a)). A number or a boolean
+/// is converted here (an int32 as it is, a double truncated and wrapped,
+/// see `f64_to_int32`; `true` 1, `false` 0); the runtime takes the rest
+/// (NaN, the infinities and doubles past 2^63 too). zlib's asm.js
+/// `(a == b) | 0` called it 7 million times a run.
 macro_rules! rt_to_int32 {
-    ($s:ident, $a:expr) => {
-        rt_redo!($s, rt_call!($s, cloison_rt_to_int32, $a, Value::UNDEFINED)) as u32 as i32
-    };
+    ($s:ident, $a:expr) => {{
+        let a: Value = $a;
+        if $s.tag.is_int32(a) {
+            int(a)
+        } else if a.to_bits() | 1 == boolean(true).to_bits() {
+            (a.to_bits() & 1) as i32
+        } else if let Some(i) = (is_number($s.tag, a)).then(|| f64_to_int32($s.tag.decode_f64(a))).flatten() {
+            i
+        } else {
+            rt_redo!($s, rt_call!($s, cloison_rt_to_int32, a, Value::UNDEFINED)) as u32 as i32
+        }
+    }};
 }
 /// `cloison_rt_loose_eq(a, b)`: `a == b`.
 macro_rules! rt_loose_eq {

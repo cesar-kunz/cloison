@@ -7441,10 +7441,16 @@ fn shared_buffers_and_atomics() {
     }
 }
 
+/// The tests starting agents, one at a time: agents are the process's,
+/// and a broadcast goes to every one (another test's, blocked in
+/// `Atomics.wait`, would never take it).
+static AGENT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// `$262.agent`: agents on threads of their own, blocked in
 /// `Atomics.wait` until the main one notifies them.
 #[test]
 fn agents_wait_and_are_notified() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
     let src = r#"
         var sab = new SharedArrayBuffer(8);
         var ta = new Int32Array(sab);
@@ -7608,4 +7614,21 @@ r.join(",");
         ),
         "2,2,true,56192,2,2,1,55296,2,3,10,true,3,2,3,function,2"
     );
+}
+
+/// `$262.agent.broadcast` to agents ending meanwhile (their callbacks
+/// throw): one that has ended is skipped, not waited for.
+#[test]
+fn broadcasts_skip_agents_that_ended() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let src = r#"
+        var sab = new SharedArrayBuffer(8);
+        for (var k = 0; k < 5; k++) {
+            for (var i = 0; i < 4; i++)
+                $262.agent.start("var n = 0; $262.agent.receiveBroadcast(function () { if (++n == " + (1 + i * 3) + ") throw 1; });");
+            for (var b = 0; b < 20; b++) $262.agent.broadcast(sab);
+        }
+        "done"
+    "#;
+    assert_eq!(value(src), "done");
 }

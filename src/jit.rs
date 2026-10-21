@@ -9820,6 +9820,8 @@ fn max_compiles(n: usize) -> u32 {
 
 /// See [`max_compiles`].
 const COMPILE_SIZE: usize = 400;
+/// See [`JitFunction::spent`].
+const RESERVE_CALLS: u32 = 1000;
 /// Inlining limits: nesting, and the callee's size in instructions.
 const MAX_INLINE_DEPTH: usize = 2;
 /// Registers past a frame's own for a getter or setter called, not
@@ -14864,12 +14866,16 @@ impl JitFunction {
             // the epochs they assumed changed (an exit only made the function
             // `dirty`, for a lowering that won't come). Dropping them left
             // zlib's `a1` interpreted after its fourth exit.
-            if self.stats.compiles >= max_compiles(vm.root_len) {
+            let spent = self.spent(pc);
+            let vm = self.vm.as_mut().unwrap();
+            if spent {
                 if vm.epoch != epoch || vm.field_epoch != field_epoch {
                     return None;
                 }
                 let found = unsafe { self.fitting_version(pc, acc, regs) };
-                if found.is_none() && pc == 0 {
+                // (Not while the start's reserved compilation waits for its
+                // calls: see `spent`.)
+                if found.is_none() && pc == 0 && self.spent_for_good() {
                     self.late_miss(false);
                 }
                 return found.and_then(|found| fits_stack(found, regs, stack_end));
@@ -14984,6 +14990,41 @@ impl JitFunction {
         }
     }
 
+    /// Whether the function is out of compilations for an entry at
+    /// bytecode offset `pc`: past `max_compiles`, but for one more at its
+    /// start while no version is there, once called [`RESERVE_CALLS`]
+    /// times so. (Loops' entries had taken the last ones after a lowering
+    /// dropped the start's version: TypeScript's `innerScan`, called at
+    /// each token, then ran interpreted for good. Without the calls,
+    /// zlib's and Mandreel's large functions, entered a few times for
+    /// their loops, compiled once more for little: −2% and −4.5%.)
+    fn spent(&self, pc: usize) -> bool {
+        let Some(vm) = self.vm.as_ref() else {
+            return false;
+        };
+        let max = max_compiles(vm.root_len);
+        let started = || self.versions.keys().any(|&e| {
+            let i = &self.insns[e];
+            i.pc == 0 && i.frame == 0
+        });
+        self.stats.compiles >= max
+            && (pc != 0 || self.stats.compiles > max || vm.late.0 < RESERVE_CALLS || started())
+    }
+
+    /// Whether no compilation is left, not even the start's (see `spent`).
+    fn spent_for_good(&self) -> bool {
+        let Some(vm) = self.vm.as_ref() else {
+            return false;
+        };
+        let max = max_compiles(vm.root_len);
+        self.stats.compiles > max
+            || self.stats.compiles == max
+                && self.versions.keys().any(|&e| {
+                    let i = &self.insns[e];
+                    i.pc == 0 && i.frame == 0
+                })
+    }
+
     /// Whether `vm_prepare` refuses the entry at instruction 0 from now on:
     /// it is refused for good, or the function is out of compilations with
     /// no version there, or with versions compiled under other `epochs`
@@ -14992,14 +15033,18 @@ impl JitFunction {
         let Some(vm) = self.vm.as_ref() else {
             return false;
         };
+        let max = max_compiles(vm.root_len);
+        let started = self.versions.keys().any(|&e| {
+            let i = &self.insns[e];
+            i.pc == 0 && i.frame == 0
+        });
+        // (The compilation kept for the start, unused: calls go on trying,
+        // and count, see `spent`.)
+        let reserve = self.stats.compiles == max && !started;
         vm.no_entry.contains(&0)
-            || self.stats.compiles >= max_compiles(vm.root_len)
-                && (vm.epoch != epoch
-                    || vm.field_epoch != field_epoch
-                    || !self.versions.keys().any(|&e| {
-                        let i = &self.insns[e];
-                        i.pc == 0 && i.frame == 0
-                    }))
+            || !reserve
+                && self.stats.compiles >= max
+                && (vm.epoch != epoch || vm.field_epoch != field_epoch || !started)
     }
 
     /// A version entered at instruction 0 that values of the types
@@ -15013,8 +15058,11 @@ impl JitFunction {
         field_epoch: u32,
         make_state: impl Fn(&[bool], bool) -> TypeState,
     ) -> Option<(Rc<JitCode>, usize)> {
+        if self.spent(0) {
+            return None;
+        }
         let vm = self.vm.as_mut().unwrap();
-        if vm.no_entry.contains(&0) || self.stats.compiles >= max_compiles(vm.root_len) {
+        if vm.no_entry.contains(&0) {
             return None;
         }
         let _compiling = Compiling::of(vm.root);

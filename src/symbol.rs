@@ -216,7 +216,7 @@ fn get_own_property_symbols(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
 
 /// `o`'s own symbol-keyed properties' symbols, in order.
 pub(crate) fn own_symbol_keys(vm: &mut Vm, o: *mut Object) -> Vec<Value> {
-    let keys: Vec<Atom> = unsafe { (*(*o).shape).keys.to_vec() };
+    let keys: Vec<Atom> = unsafe { (*(*o).shape).keys().to_vec() };
     keys.into_iter()
         .filter(|&a| is_symbol_atom(vm, a) && !is_private_atom(vm, a))
         .filter_map(|a| atom_symbol(vm, a))

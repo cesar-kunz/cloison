@@ -10,7 +10,7 @@ use crate::jit::HashMap;
 use std::fmt;
 
 use crate::asm::Module;
-use crate::object::{
+use crate::object::{Slots, 
     ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FieldCell, FieldType, Object, PROTOTYPE, READ_ONLY,
     Shape,
     as_object, field_fits, object_value,
@@ -262,7 +262,7 @@ fn shrink_root(root: *const Shape) -> u32 {
         }
     }
     let mut most = 1;
-    walk(root, &mut |s| most = most.max(s.keys.len() as u32));
+    walk(root, &mut |s| most = most.max(s.keys().len() as u32));
     if most < unsafe { (*root).capacity.get() } {
         walk(root, &mut |s| s.capacity.set(most));
     }
@@ -1330,14 +1330,15 @@ impl Vm {
     /// transitions and field cells; codes, the bytes they take, and those
     /// of them pinned (`CLOISON_SIZES`).
     pub fn memory_stats(&self) -> [usize; 5] {
+        // (Each slot table once.)
+        let mut tables: crate::jit::HashSet<usize> = Default::default();
         let shape_bytes: usize = self
             .shapes
             .iter()
             .map(|s| {
+                let t = s.slots.table();
                 size_of::<Shape>()
-                    + s.keys.capacity() * size_of::<Atom>()
-                    + s.attrs.capacity()
-                    + s.fields.capacity() * size_of::<*const FieldCell>()
+                    + if tables.insert(t as *const _ as usize) { t.bytes() } else { 0 }
                     + s.transitions.borrow().capacity() * size_of::<(Atom, u8, *const Shape)>()
                     + s.elem_transitions.borrow().capacity() * size_of::<(FieldType, *const Shape)>()
             })
@@ -1374,9 +1375,7 @@ impl Vm {
             class,
             proto,
             capacity: Cell::new(capacity),
-            keys: Vec::new(),
-            attrs: Vec::new(),
-            fields: Vec::new(),
+            slots: Slots::empty(),
             elems: FieldType::None,
             // (No value fits a typed array's or buffer's bytes, so stores'
             // fast paths never take them.)
@@ -1409,9 +1408,7 @@ impl Vm {
             class: Class::Plain,
             proto,
             capacity: Cell::new(capacity),
-            keys: Vec::new(),
-            attrs: Vec::new(),
-            fields: Vec::new(),
+            slots: Slots::empty(),
             elems: FieldType::None,
             elems_code: 0,
             family: std::ptr::null(),
@@ -1427,16 +1424,9 @@ impl Vm {
     }
 
     /// `shape` plus property `name` with attributes `attrs`. Shared shapes
-    /// share transitions; unique shapes get a fresh unique successor.
-    /// `v` and `x`, allocated at its final size (a clone and a push
-    /// reallocates).
-    fn grown<T: Copy>(v: &[T], x: T) -> Vec<T> {
-        let mut w = Vec::with_capacity(v.len() + 1);
-        w.extend_from_slice(v);
-        w.push(x);
-        w
-    }
-
+    /// share transitions; unique shapes get a fresh unique successor. Its
+    /// slots extend `shape`'s table in place if `shape` has all of it (see
+    /// `Slots::with`).
     pub(crate) fn transition_with(
         &mut self,
         shape: *const Shape,
@@ -1459,18 +1449,14 @@ impl Vm {
         if name == self.a_sym_has_instance {
             self.has_instance_defined = true;
         }
-        let keys = Self::grown(&s.keys, name);
-        let slot_attrs = Self::grown(&s.attrs, attrs);
         let cell = Box::new(FieldCell::new());
-        let fields = Self::grown(&s.fields, &*cell as *const FieldCell);
+        let slots = s.slots.with(name, attrs, &*cell);
         self.field_cells.push(cell);
         let t = self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
             capacity: Cell::new(s.capacity.get()),
-            keys,
-            attrs: slot_attrs,
-            fields,
+            slots,
             elems: s.elems,
             elems_code: s.elems_code,
             family: std::ptr::null(),
@@ -1506,9 +1492,7 @@ impl Vm {
                 class: s.class,
                 proto: s.proto,
                 capacity: Cell::new(s.capacity.get()),
-                keys: s.keys.clone(),
-                attrs: s.attrs.clone(),
-                fields: s.fields.clone(),
+                slots: s.slots.clone(),
                 elems: s.elems,
                 elems_code: s.elems_code,
                 family: std::ptr::null(),
@@ -1582,7 +1566,7 @@ impl Vm {
     pub(crate) fn add_property_shaped(&mut self, o: *mut Object, new: *const Shape, value: Value) -> u32 {
         unsafe {
             let ns = &*new;
-            let slot = ns.keys.len() as u32 - 1;
+            let slot = ns.keys().len() as u32 - 1;
             if slot >= ns.capacity.get() {
                 self.reserve_props(o, slot - ns.capacity.get());
             }
@@ -1666,7 +1650,7 @@ impl Vm {
     pub(crate) fn store_field(&mut self, o: *mut Object, slot: u32, value: Value) {
         unsafe {
             let shape = &*(*o).shape;
-            let cell = &*shape.fields[slot as usize];
+            let cell = &*shape.fields()[slot as usize];
             let at = Object::slot(o, shape.location(slot));
             let value = as_field(cell.get(), value);
             // The common case, calling nothing: the type holds, and the
@@ -1689,7 +1673,7 @@ impl Vm {
     fn store_field_slow(&mut self, o: *mut Object, slot: u32, value: Value) {
         unsafe {
             let shape = &*(*o).shape;
-            let cell = &*shape.fields[slot as usize];
+            let cell = &*shape.fields()[slot as usize];
             let old = cell.get();
             let new = old.join(FieldType::of(value));
             if new != old {
@@ -1784,9 +1768,9 @@ impl Vm {
                     } else {
                         cap + !w.loc as i64
                     };
-                    if (0..s.fields.len() as i64).contains(&slot)
+                    if (0..s.fields().len() as i64).contains(&slot)
                         && s.location(slot as u32) == w.loc
-                        && cells.contains(&s.fields[slot as usize])
+                        && cells.contains(&s.fields()[slot as usize])
                     {
                         w.holder = FieldType::Num.encode() as *mut Object;
                     }
@@ -1820,8 +1804,8 @@ impl Vm {
                         if shape != last.0 {
                             let at = slots.entry(shape).or_insert_with(|| {
                                 let s = &*shape;
-                                (0..s.fields.len() as u32)
-                                    .filter(|&i| cells.contains(&s.fields[i as usize]))
+                                (0..s.fields().len() as u32)
+                                    .filter(|&i| cells.contains(&s.fields()[i as usize]))
                                     .map(|i| s.location(i))
                                     .filter(|&l| l >= 0)
                                     .collect()
@@ -1898,9 +1882,7 @@ impl Vm {
             class: s.class,
             proto: s.proto,
             capacity: Cell::new(s.capacity.get()),
-            keys: s.keys.clone(),
-            attrs: s.attrs.clone(),
-            fields: s.fields.clone(),
+            slots: s.slots.clone(),
             elems,
             elems_code: elems.encode(),
             family: s.family,
@@ -2259,7 +2241,7 @@ impl Vm {
     }
 
     fn is_accessor(&self, h: *mut Object, slot: u32) -> bool {
-        unsafe { (&(*(*h).shape).attrs)[slot as usize] & ACCESSOR != 0 }
+        unsafe { (&(*(*h).shape).attrs())[slot as usize] & ACCESSOR != 0 }
     }
 
     /// The accessor property `name` of `o` or its prototypes, if that is
@@ -2305,7 +2287,7 @@ impl Vm {
     ) {
         unsafe {
             let s = &*(*o).shape;
-            let old = s.lookup(name).filter(|&k| s.attrs[k as usize] & ACCESSOR != 0);
+            let old = s.lookup(name).filter(|&k| s.attrs()[k as usize] & ACCESSOR != 0);
             let (mut g, mut st) = (Value::UNDEFINED, Value::UNDEFINED);
             if let Some(k) = old {
                 let pair = as_object(*Object::slot(o, s.location(k)));
@@ -2666,7 +2648,7 @@ impl Vm {
             return self.virtual_read_only(o, name, std::ptr::null_mut());
         };
         // (A slot-less one nearer than the slot shadows it.)
-        unsafe { self.virtual_read_only(o, name, h) || (&(*(*h).shape).attrs)[slot as usize] & READ_ONLY != 0 }
+        unsafe { self.virtual_read_only(o, name, h) || (&(*(*h).shape).attrs())[slot as usize] & READ_ONLY != 0 }
     }
 
     /// Whether `o` or a prototype of it before `until` has `name` with no
@@ -2718,17 +2700,15 @@ impl Vm {
                 self.add_property_with(o, name, value.unwrap_or(Value::UNDEFINED), attrs);
                 return;
             };
-            if s.attrs[slot as usize] != attrs {
+            if s.attrs()[slot as usize] != attrs {
                 self.shape_left(s);
-                let mut slot_attrs = s.attrs.clone();
+                let mut slot_attrs = s.attrs().to_vec();
                 slot_attrs[slot as usize] = attrs;
                 let u = Shape {
                     class: s.class,
                     proto: s.proto,
                     capacity: Cell::new(s.capacity.get()),
-                    keys: s.keys.clone(),
-                    attrs: slot_attrs,
-                    fields: s.fields.clone(),
+                    slots: Slots::new(s.keys(), &slot_attrs, s.fields()),
                     elems: s.elems,
                     elems_code: s.elems_code,
                     family: std::ptr::null(),
@@ -3080,23 +3060,23 @@ impl Vm {
                 return !(name == self.a_length
                     && matches!((*o).class, Class::Array | Class::String));
             };
-            if !force && s.attrs[slot as usize] & DONT_DELETE != 0 {
+            if !force && s.attrs()[slot as usize] & DONT_DELETE != 0 {
                 return false;
             }
-            let n = s.keys.len() as u32;
+            let n = s.keys().len() as u32;
             let kept: Vec<u32> = (0..n).filter(|&k| k != slot).collect();
             let values: Vec<Value> = kept
                 .iter()
                 .map(|&k| *Object::slot(o, s.location(k)))
                 .collect();
             self.shape_left(s);
-            for &cell in &s.fields {
+            for &cell in s.fields() {
                 self.field_made_mutable(&*cell);
             }
             let mut fields = Vec::with_capacity(kept.len());
             for &k in &kept {
                 let cell = Box::new(FieldCell::new());
-                cell.set((*s.fields[k as usize]).get());
+                cell.set((*s.fields()[k as usize]).get());
                 fields.push(&*cell as *const FieldCell);
                 self.field_cells.push(cell);
             }
@@ -3104,9 +3084,11 @@ impl Vm {
                 class: s.class,
                 proto: s.proto,
                 capacity: Cell::new(s.capacity.get()),
-                keys: kept.iter().map(|&k| s.keys[k as usize]).collect(),
-                attrs: kept.iter().map(|&k| s.attrs[k as usize]).collect(),
-                fields,
+                slots: Slots::new(
+                    &kept.iter().map(|&k| s.keys()[k as usize]).collect::<Vec<_>>(),
+                    &kept.iter().map(|&k| s.attrs()[k as usize]).collect::<Vec<_>>(),
+                    &fields,
+                ),
                 elems: s.elems,
                 elems_code: s.elems_code,
                 family: std::ptr::null(),
@@ -4116,7 +4098,7 @@ impl Vm {
     pub(crate) fn add_properties(&mut self, o: *mut Object, names: &[Atom], values: &[Value], attrs: u8) {
         unsafe {
             let s = &*(*o).shape;
-            let n = s.keys.len() + names.len();
+            let n = s.keys().len() + names.len();
             if names.contains(&self.a_sym_has_instance) {
                 self.has_instance_defined = true;
             }
@@ -4124,13 +4106,13 @@ impl Vm {
                 self.to_primitive_defined = true;
             }
             let mut keys = Vec::with_capacity(n);
-            keys.extend_from_slice(&s.keys);
+            keys.extend_from_slice(s.keys());
             keys.extend_from_slice(names);
             let mut slot_attrs = Vec::with_capacity(n);
-            slot_attrs.extend_from_slice(&s.attrs);
+            slot_attrs.extend_from_slice(s.attrs());
             slot_attrs.resize(n, attrs);
             let mut fields = Vec::with_capacity(n);
-            fields.extend_from_slice(&s.fields);
+            fields.extend_from_slice(s.fields());
             for _ in names {
                 let cell = Box::new(FieldCell::new());
                 fields.push(&*cell as *const FieldCell);
@@ -4141,9 +4123,7 @@ impl Vm {
                 class: s.class,
                 proto: s.proto,
                 capacity: Cell::new(s.capacity.get()),
-                keys,
-                attrs: slot_attrs,
-                fields,
+                slots: Slots::new(&keys, &slot_attrs, &fields),
                 elems: s.elems,
                 elems_code: s.elems_code,
                 family: std::ptr::null(),
@@ -4270,7 +4250,7 @@ impl Vm {
             settle(code);
         }
         let shape = unsafe { (*this).shape };
-        let n = unsafe { (*shape).keys.len() } as u32;
+        let n = unsafe { (*shape).keys().len() } as u32;
         let cap = match Self::shared_proto(code, this) {
             Some(e) if !e.settled() => {
                 e.made.set(e.made.get() + 1);

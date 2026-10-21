@@ -17,7 +17,7 @@
 use std::cell::{Cell, RefCell};
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number};
-use crate::object::{
+use crate::object::{Slots, 
     ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FN_LENGTH_DELETED, FN_NAME_DELETED, FROZEN,
     LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, READ_ONLY, SEALED, SPARSE, Shape, as_object,
     object_value,
@@ -129,7 +129,7 @@ impl Vm {
     pub(crate) fn unique_shape(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, no_elements: bool) {
         unsafe {
             let s = &*(*o).shape;
-            let same_attrs = attrs.as_ref().is_none_or(|a| *a == s.attrs);
+            let same_attrs = attrs.as_ref().is_none_or(|a| a == s.attrs());
             if s.unique && same_attrs && (!no_elements || s.elems_code == NO_ELEMENTS) {
                 return;
             }
@@ -138,9 +138,10 @@ impl Vm {
                 class: s.class,
                 proto: s.proto,
                 capacity: Cell::new(s.capacity.get()),
-                keys: s.keys.clone(),
-                attrs: attrs.unwrap_or_else(|| s.attrs.clone()),
-                fields: s.fields.clone(),
+                slots: match attrs {
+                    Some(a) if a != s.attrs() => Slots::new(s.keys(), &a, s.fields()),
+                    _ => s.slots.clone(),
+                },
                 elems: s.elems,
                 elems_code: if no_elements { NO_ELEMENTS } else { s.elems_code },
                 family: std::ptr::null(),
@@ -171,7 +172,7 @@ impl Vm {
         unsafe {
             let s = &*(*o).shape;
             let slot = s.lookup(name)?;
-            Some(Desc::from_attrs(s.attrs[slot as usize], *Object::slot(o, s.location(slot))))
+            Some(Desc::from_attrs(s.attrs()[slot as usize], *Object::slot(o, s.location(slot))))
         }
     }
 
@@ -314,9 +315,9 @@ impl Vm {
             let sparse = (*o).flags & SPARSE != 0;
             let mut far: Vec<(u32, bool)> = Vec::new();
             if sparse {
-                for (k, &name) in s.keys.iter().enumerate() {
+                for (k, &name) in s.keys().iter().enumerate() {
                     if let Some(i) = index_of_name(self.atom_name(name)) {
-                        far.push((i, s.attrs[k] & DONT_ENUM == 0));
+                        far.push((i, s.attrs()[k] & DONT_ENUM == 0));
                     }
                 }
             }
@@ -337,7 +338,7 @@ impl Vm {
             if matches!(class, Class::Function | Class::Native) && flags & FN_NAME_DELETED == 0 && s.lookup(self.a_name).is_none() {
                 out.push((Key::Name(self.a_name), false));
             }
-            for (k, &name) in s.keys.iter().enumerate() {
+            for (k, &name) in s.keys().iter().enumerate() {
                 if sparse && index_of_name(self.atom_name(name)).is_some() {
                     continue;
                 }
@@ -345,7 +346,7 @@ impl Vm {
                 if crate::symbol::is_symbol_atom(self, name) {
                     continue;
                 }
-                out.push((Key::Name(name), s.attrs[k] & DONT_ENUM == 0));
+                out.push((Key::Name(name), s.attrs()[k] & DONT_ENUM == 0));
             }
         }
         out
@@ -398,9 +399,9 @@ impl Vm {
             let s = &*(*o).shape;
             // (Not private names' properties, which stay as they are.)
             let attrs: Vec<u8> = s
-                .attrs
+                .attrs()
                 .iter()
-                .zip(s.keys.iter())
+                .zip(s.keys().iter())
                 .map(|(&a, &key)| {
                     if crate::symbol::is_private_atom(self, key) {
                         return a;
@@ -740,7 +741,7 @@ impl Vm {
                             let a = self.intern(&i.to_string());
                             let s = &*(*o).shape;
                             if let Some(k) = s.lookup(a) {
-                                if s.attrs[k as usize] & DONT_DELETE != 0 {
+                                if s.attrs()[k as usize] & DONT_DELETE != 0 {
                                     stop = i + 1;
                                     break;
                                 }
@@ -870,9 +871,7 @@ impl Vm {
                 class: s.class,
                 proto,
                 capacity: Cell::new(s.capacity.get()),
-                keys: s.keys.clone(),
-                attrs: s.attrs.clone(),
-                fields: s.fields.clone(),
+                slots: s.slots.clone(),
                 elems: s.elems,
                 elems_code: s.elems_code,
                 family: std::ptr::null(),

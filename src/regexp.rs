@@ -171,7 +171,7 @@ fn not_preceded_by_lead() -> Node {
 /// [`code_points`]).
 fn unit_class(r: &[(u16, u16)]) -> Node {
     let part = |(lo, hi): (u16, u16)| -> Vec<(u16, u16)> {
-        r.iter().filter_map(|&(a, b)| (a.max(lo) <= b.min(hi)).then(|| (a.max(lo), b.min(hi)))).collect()
+        r.iter().filter(|&&(a, b)| a.max(lo) <= b.min(hi)).map(|&(a, b)| (a.max(lo), b.min(hi))).collect()
     };
     let (leads, trails) = (part(LEADS), part(TRAILS));
     let others: Vec<(u16, u16)> = r

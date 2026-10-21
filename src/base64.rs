@@ -223,7 +223,7 @@ fn decode_base64(s: &[u16], url: bool, last: LastChunk, max: usize) -> Decoded {
 /// FromHex: `s` decoded, at most `max` bytes of it.
 fn decode_hex(s: &[u16], max: usize) -> Decoded {
     let mut bytes = Vec::new();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return syntax_error(0, bytes, "hex: odd length");
     }
     let digit = |c: u16| char::from_u32(c as u32).and_then(|c| c.to_digit(16));

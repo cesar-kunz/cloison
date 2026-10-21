@@ -624,7 +624,7 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
     if !cache.is_null() && v.is_cell() {
         let fo = crate::object::as_object(f);
         unsafe {
-            if (*fo).shape as *const Shape == vm.function_shape {
+            if std::ptr::eq((*fo).shape, vm.function_shape) {
                 let p = *Object::slot(fo, (*vm.function_shape).location(0));
                 // The new entry first, the first one moved to second.
                 for k in 0..3 {
@@ -4525,7 +4525,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             {
                 let shape = unsafe { &*(*vm).function_shape };
                 let at = shape.location(0);
-                if at >= 0 && at <= MAX_SLOT_OFF {
+                if (0..=MAX_SLOT_OFF).contains(&at) {
                     return Sel {
                         ops: Some((at, cache, shape as *const Shape as u64)),
                         ..Sel::new("test_instanceof", "", out)
@@ -12206,7 +12206,7 @@ fn hoist_loads(
             if target[k] {
                 last_target = k;
             }
-            let wrote = (!i.bail).then(|| match i.op {
+            let wrote = (!i.bail).then_some(match i.op {
                 Op::Star => Some(i.reg),
                 Op::Mov => Some(i.reg2),
                 _ => None,
@@ -13564,7 +13564,7 @@ impl Lowering<'_> {
     /// loop of `code` (between a backward jump and its target).
     fn in_loop(&mut self, code: *const crate::vm::Code, pc: usize) -> bool {
         let d = self.decoded(code);
-        d.0.binary_search_by_key(&pc, |j| j.pc as usize).is_ok_and(|k| d.2[k])
+        d.0.binary_search_by_key(&pc, |j| j.pc).is_ok_and(|k| d.2[k])
     }
 
     /// Whether `code` passes its own arguments on (see `Insn::forward`).
@@ -15026,7 +15026,7 @@ impl JitFunction {
             let mut exit_at = HashMap::default();
             for (k, i) in insns.iter().enumerate() {
                 if i.hoisted.is_none() {
-                    exit_at.entry((i.frame as usize, i.pc as usize)).or_insert(k);
+                    exit_at.entry((i.frame as usize, i.pc)).or_insert(k);
                 }
             }
             vm.snap = Rc::new(Snapshot {
@@ -15562,7 +15562,7 @@ impl JitFunction {
                     if unsafe { extends(x as *const Shape, y as *const Shape) })
         };
         // An entry that went megamorphic before: the types it took then.
-        let pc = self.insns[entry].pc as usize;
+        let pc = self.insns[entry].pc;
         let mut actual = actual.clone();
         if let Some(w) = self.wide.get(&pc) {
             actual.join(w);

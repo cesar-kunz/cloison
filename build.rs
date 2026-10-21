@@ -720,7 +720,7 @@ fn fold_arm64_stubs(name: &str, code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
 /// a `b <symbol>` at the symbol itself, with a relocation of its own
 /// (`invert_arm64_branch_over_jump` can then fold the `b` the fall-through
 /// path still takes).
-fn retarget_arm64_jumps(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
+fn retarget_arm64_jumps(code: &mut [u8], relocs: &mut Vec<Reloc>) {
     // Not the final `b`: the JIT drops it when the next piece follows, so
     // branching to it is branching to that piece, and falling into it is
     // free.
@@ -830,7 +830,7 @@ fn invert_arm64_branch_over_jump(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
 /// past that in large functions. Rewrite each one with a relocation, `tbz
 /// Rt, #b, sym`, to `tst Rt, #(1 << b); b.eq sym` (`b.ne` for `tbnz`), which
 /// reaches 1 MiB.
-fn widen_arm64_tbz(code: &mut Vec<u8>, relocs: &mut Vec<Reloc>) {
+fn widen_arm64_tbz(code: &mut Vec<u8>, relocs: &mut [Reloc]) {
     while let Some(k) = relocs.iter().position(|r| r.r_type == R_AARCH64_TSTBR14) {
         let at = relocs[k].offset as usize;
         let i = u32::from_le_bytes(code[at..at + 4].try_into().unwrap());

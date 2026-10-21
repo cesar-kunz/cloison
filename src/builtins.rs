@@ -1608,7 +1608,7 @@ impl ExactSum {
                 m |= (bit(shift + i) as u64) << i;
             }
             let half = bit(shift - 1);
-            let sticky = (0..shift - 1).any(|i| bit(i));
+            let sticky = (0..shift - 1).any(&bit);
             let mut e = shift;
             if half && (sticky || m & 1 != 0) {
                 m += 1;
@@ -1814,8 +1814,8 @@ fn unescape_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn encode(vm: &mut Vm, a: &[Value], keep: &[u8]) -> Result<Value> {
     let u = units(arg(a, 0)).into_owned();
     let mut out = Vec::new();
-    let mut it = char::decode_utf16(u.iter().copied());
-    while let Some(c) = it.next() {
+    let it = char::decode_utf16(u.iter().copied());
+    for c in it {
         let c = c.map_err(|_| Error(String::from("URIError: URI malformed"), None))?;
         if c.is_ascii_alphanumeric() || (c.is_ascii() && keep.contains(&(c as u8))) {
             out.push(c as u16);
@@ -2854,7 +2854,7 @@ fn string_replace_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         // (Not `[u16]::contains`: another caller of it slows RegExp's
         // searches, which then call it out of line.)
-        if !f.iter().any(|&c| c == b'g' as u16) {
+        if !f.contains(&(b'g' as u16)) {
             return Err(Error::type_error("replaceAll must be called with a global RegExp"));
         }
     }
@@ -3488,7 +3488,7 @@ fn advance(s: &[u16], i: f64, unicode: bool) -> f64 {
 fn flags_have(f: &[u16], c: u8) -> bool {
     // (Not `contains`: a second caller of `[u16]`'s took it out of line,
     // and the regex search's with it: RegExp 8% slower.)
-    f.iter().any(|&x| x == c as u16)
+    f.contains(&(c as u16))
 }
 
 /// `RegExp.prototype[Symbol.match]` generically.

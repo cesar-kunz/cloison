@@ -131,7 +131,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
     // The ones that run do so through the JIT too.
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if RUNNING.contains(&&number(name)) {
+        if RUNNING.contains(&number(name)) {
             let src = std::fs::read_to_string(&f).unwrap();
             let expect = src
                 .lines()
@@ -150,7 +150,7 @@ fn compiled_microbenchmarks_compute_their_expected_results() {
 fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if !RUNNING.contains(&&number(name)) {
+        if !RUNNING.contains(&number(name)) {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();
@@ -176,7 +176,7 @@ fn microbenchmarks_tiering_up_early_compute_their_expected_results() {
 fn microbenchmarks_through_the_warm_tier_compute_their_expected_results() {
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if !RUNNING.contains(&&number(name)) {
+        if !RUNNING.contains(&number(name)) {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();
@@ -5020,7 +5020,7 @@ var src = [
 fn microbenchmarks_through_eval_compute_their_expected_results() {
     for f in files("bench/micro", "js") {
         let name = f.file_name().unwrap().to_str().unwrap();
-        if !RUNNING.contains(&&number(name)) {
+        if !RUNNING.contains(&number(name)) {
             continue;
         }
         let src = std::fs::read_to_string(&f).unwrap();

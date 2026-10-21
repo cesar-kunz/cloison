@@ -7681,3 +7681,12 @@ fn deep_module_graphs_load_or_throw_a_range_error() {
     let dir = module_dir("deep", &refs);
     assert_eq!(run_module(&dir, "main.mjs").unwrap(), "RangeError,1");
 }
+
+/// `flat(Infinity)` of an array holding itself: a RangeError.
+#[test]
+fn flattening_a_cyclic_array_throws_a_range_error() {
+    assert_eq!(
+        value("var a = []; a[0] = a; var r; try { a.flat(Infinity); r = 'no error'; } catch (e) { r = e.name; } r"),
+        "RangeError"
+    );
+}

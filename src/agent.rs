@@ -34,10 +34,30 @@ struct Message {
 // (A number or `undefined`: no cell.)
 unsafe impl Send for Message {}
 
-/// An agent's mailbox: the broadcast it hasn't taken yet.
+/// An agent's mailbox: the broadcast it hasn't taken yet, and whether
+/// the agent has ended (then it takes none: a broadcast skips it).
 struct Mailbox {
-    message: Mutex<Option<Message>>,
+    slot: Mutex<Slot>,
     cv: Condvar,
+}
+
+#[derive(Default)]
+struct Slot {
+    message: Option<Message>,
+    closed: bool,
+}
+
+impl Mailbox {
+    /// Ended: no broadcast waits for it any more (one it had not taken
+    /// released).
+    fn close(&self) {
+        let mut slot = lock(&self.slot);
+        slot.closed = true;
+        if let Some(m) = slot.message.take() {
+            crate::shared::release(m.block as *mut crate::shared::Block);
+        }
+        self.cv.notify_all();
+    }
 }
 
 /// The agents started, the reports they made, and when the process
@@ -74,13 +94,19 @@ fn source_of(v: Value) -> Result<String> {
 /// `$262.agent.start(source)`.
 fn agent_start(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let src = source_of(arg(a, 0))?;
-    let mailbox = Arc::new(Mailbox { message: Mutex::new(None), cv: Condvar::new() });
+    let mailbox = Arc::new(Mailbox { slot: Mutex::new(Slot::default()), cv: Condvar::new() });
     lock(&AGENTS).push(mailbox.clone());
-    std::thread::Builder::new()
+    let agent = mailbox.clone();
+    let spawned = std::thread::Builder::new()
         .name("agent".into())
         .stack_size(64 << 20)
-        .spawn(move || run_agent(&src, &mailbox))
-        .map_err(|e| Error::type_error(format!("$262.agent.start: {e}")))?;
+        .spawn(move || run_agent(&src, &agent));
+    if let Err(e) = spawned {
+        // (No thread to take its broadcasts.)
+        lock(&AGENTS).retain(|m| !Arc::ptr_eq(m, &mailbox));
+        mailbox.close();
+        return Err(Error::type_error(format!("$262.agent.start: {e}")));
+    }
     Ok(Value::UNDEFINED)
 }
 
@@ -89,11 +115,9 @@ fn agent_start(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn run_agent(src: &str, mailbox: &Arc<Mailbox>) {
     run_agent_vm(src, mailbox);
     lock(&AGENTS).retain(|m| !Arc::ptr_eq(m, mailbox));
-    // (A broadcast sent meanwhile.)
-    if let Some(m) = lock(&mailbox.message).take() {
-        crate::shared::release(m.block as *mut crate::shared::Block);
-        mailbox.cv.notify_all();
-    }
+    // (A broadcaster that listed it before may be posting to it: closed,
+    // under the lock it posts and waits under, it takes nothing.)
+    mailbox.close();
 }
 
 fn run_agent_vm(src: &str, mailbox: &Mailbox) {
@@ -111,9 +135,9 @@ fn run_agent_vm(src: &str, mailbox: &Mailbox) {
     }
     loop {
         let m = {
-            let mut slot = lock(&mailbox.message);
+            let mut slot = lock(&mailbox.slot);
             loop {
-                if let Some(m) = slot.take() {
+                if let Some(m) = slot.message.take() {
                     mailbox.cv.notify_all();
                     break m;
                 }
@@ -152,19 +176,23 @@ fn agent_broadcast(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let id = arg(a, 1);
     let id = if id.is_number() { Value::number(id.to_number()) } else { Value::UNDEFINED };
     let agents: Vec<Arc<Mailbox>> = lock(&AGENTS).clone();
+    // (An agent that ends meanwhile is closed: skipped, not waited for.)
     for m in &agents {
-        crate::shared::retain(block);
-        let mut slot = lock(&m.message);
+        let mut slot = lock(&m.slot);
         // (The one before taken first.)
-        while slot.is_some() {
+        while slot.message.is_some() && !slot.closed {
             slot = m.cv.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
-        *slot = Some(Message { block: block as usize, growable, id });
+        if slot.closed {
+            continue;
+        }
+        crate::shared::retain(block);
+        slot.message = Some(Message { block: block as usize, growable, id });
         m.cv.notify_all();
     }
     for m in &agents {
-        let mut slot = lock(&m.message);
-        while slot.is_some() {
+        let mut slot = lock(&m.slot);
+        while slot.message.is_some() && !slot.closed {
             slot = m.cv.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
     }

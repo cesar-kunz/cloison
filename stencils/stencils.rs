@@ -4057,6 +4057,38 @@ unsafe fn props(o: *mut u8) -> *mut u8 {
     unsafe { *(o.add(16) as *const *mut u8) }
 }
 
+/// Entries of the runtime's megamorphic load table past the first
+/// (`vm::MEGAS`).
+const MEGAS: usize = 2048;
+
+/// `o.name` (the name an `Atom`, in `imm64`) as the runtime's megamorphic
+/// load table (at `imm64b`; see `vm::MegaEntry`) has it, if it does.
+#[inline(always)]
+unsafe fn mega_load(tag: NumberTag, o: Value) -> Option<Value> {
+    unsafe {
+        if !is_cell(tag, o) {
+            return None;
+        }
+        let p = o.to_bits() as *mut u8;
+        let shape = *(p as *const u64);
+        let name = imm64() as u32;
+        let t = imm64b() as *const u8;
+        let k = 1 + ((shape >> 4) as u32 ^ name.wrapping_mul(0x9E37_79B1)) as usize % MEGAS;
+        let e = t.add(k * 32);
+        if *(e as *const u64) != shape || *(e.add(8) as *const u32) != name {
+            return None;
+        }
+        let addr = *(e.add(24) as *const *const Value);
+        if addr.is_null() {
+            let off = *(e.add(16) as *const i32);
+            let base = if off >= 0 { p } else { props(p) };
+            return Some(*(base.add((off ^ (off >> 31)) as usize) as *const Value));
+        }
+        let epoch = *(*(t.add(24) as *const *const u32));
+        (*(e.add(12) as *const u32) == epoch).then(|| *addr)
+    }
+}
+
 /// `set_tro` stencils (see `set_tro_`): `$guard`, the receiver's shape
 /// checked; `$barrier`, `acc` may be a cell.
 macro_rules! set_tro {
@@ -4680,6 +4712,11 @@ macro_rules! property_location {
         // leaving for), the name (an `Atom`) in `imm64`; `acc` boxed, or
         // (`_i`) an int32. Leave where they would throw or run code.
         stencil!("get_named_rt_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if let Some(v) = mega_load(s.tag, o) {
+                s.acc = v;
+                next!(s)
+            }
             let r = rt_call!(s, cloison_rt_get_named, get!($loc, s), Value::from_bits(imm64()));
             if r == 0 {
                 exit!(s)

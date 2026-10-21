@@ -65,18 +65,7 @@ impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// An enclosing function's variable as a closure sees it (Lua's design):
-/// while that function's frame is live, `at` points to its register
-/// (open: the function itself reads and writes the register as any
-/// other); when the frame ends, the value moves to `closed` and `at`
-/// points there. Closures of one frame share it. It is the payload of an
-/// upvalue cell (`heap::UPVALUE`): a pointer to it points past the cell's
-/// header word.
-#[repr(C)]
-pub struct Upvalue {
-    pub at: *mut Value,
-    pub closed: Value,
-}
+pub use crate::layout::Upvalue;
 
 /// A [`Vm::lookup`] result for receivers of shape `shape` and property
 /// `name`: the receiver's own slot `slot` (`holder` null), which its shape
@@ -105,89 +94,7 @@ impl LookupEntry {
     };
 }
 
-/// An entry of `Vm::megas`: a named load's data property, by the
-/// receiver's shape and the name, for compiled code to probe inline (the
-/// `get_named_rt` stencils, at sites given up on as megamorphic): in the
-/// receiver at `off` bytes (`!off` bytes into its out-of-line slots if
-/// negative) if `addr` is 0, else at `addr`, a prototype's slot, while
-/// the prototype epoch is still `epoch`. Entry 0 holds, in `addr`, the
-/// address of `Vm::proto_epoch` instead. The stencils know this layout.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(crate) struct MegaEntry {
-    shape: u64,
-    name: u32,
-    epoch: u32,
-    off: i32,
-    _pad: u32,
-    addr: u64,
-}
-
-impl MegaEntry {
-    const EMPTY: MegaEntry = MegaEntry {
-        shape: 0,
-        name: 0,
-        epoch: 0,
-        off: 0,
-        _pad: 0,
-        addr: 0,
-    };
-}
-
-/// An entry of `Vm::mega_stores`: how compiled code stores a named
-/// property (the `set_named_rt` stencils, at sites given up on as
-/// megamorphic), by the receiver's shape and the name, as the interpreter's
-/// store cache does (`interp::op_set_named`): into the slot at `loc` if the
-/// value fits field type `ft` (`FieldType::encode`), moving the object to
-/// `new_shape` first if not null, while the prototype epoch is `epoch` and
-/// the object has room. Entry 0 holds, in `new_shape`, the address of
-/// `Vm::proto_epoch`. The stencils know this layout.
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub(crate) struct MegaStore {
-    shape: u64,
-    name: u32,
-    epoch: u32,
-    ft: u64,
-    new_shape: u64,
-    loc: i32,
-    _pad: u32,
-}
-
-impl MegaStore {
-    const EMPTY: MegaStore = MegaStore {
-        shape: 0,
-        name: 0,
-        epoch: 0,
-        ft: 0,
-        new_shape: 0,
-        loc: 0,
-        _pad: 0,
-    };
-}
-
-const _: () = assert!(size_of::<MegaStore>() == 40);
-
-/// Entries of `Vm::megas` and `Vm::mega_stores` past the first (a power of
-/// two; the stencils' `MEGAS`).
-const MEGAS: usize = 2048;
-
-/// [`MegaEntry`] `shape`/`name`'s index in `Vm::megas` (the stencils'
-/// `mega_index`).
-#[inline(always)]
-fn mega_index(shape: u64, name: u32) -> usize {
-    // (The product's top bits, which every bit of the shape and the name
-    // reach: shapes come at strides that left the low bits few values, and
-    // TypeScript's syntax tree's stores collided in three of four probes.)
-    1 + ((shape ^ (name as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MEGAS.trailing_zeros())) as usize
-}
-
-/// The other way of entry `k` of `Vm::mega_stores` (the stencils'
-/// `mega_pair`).
-#[inline(always)]
-fn mega_pair(k: usize) -> usize {
-    ((k - 1) ^ 1) + 1
-}
+use crate::layout::{MEGAS, MegaEntry, MegaStore, mega_index, mega_pair};
 
 /// [`LookupEntry::holder`] of a property no object on the chain has.
 const PROTO_NONE: *mut Object = std::ptr::dangling_mut::<Object>();
@@ -233,9 +140,8 @@ const _: () = assert!(size_of::<Ic>() == 32);
 /// is a shift.
 pub const IC_WAYS: usize = 4;
 
-/// An elements' type code (`Shape::elems_code`) that no value fits: not a
-/// type code (0–2) nor a shape's address.
-pub const NO_ELEMENTS: u64 = 3;
+/// An elements' type code (`Shape::elems_code`) that no value fits.
+pub use crate::layout::NO_ELEMENTS;
 
 /// Record in keyed-access cache `ic` that it met `o`'s bytes (a string's,
 /// a typed array's or a buffer's: `BYTES_LOC`), and for the JIT a typed

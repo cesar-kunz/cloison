@@ -44,97 +44,8 @@ use crate::vm::Code;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Atom(pub u32);
 
-#[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Class {
-    Plain,
-    Array,
-    /// A bytecode function: `code` is set, and its slot 0 is `prototype`.
-    Function,
-    /// A function implemented in Rust: `code` is set, with `native`.
-    Native,
-    /// A string: its UTF-16 code units follow the header; `elems` points
-    /// to them and `elems_len` is the length (as arrays', so `length` reads
-    /// the same field).
-    String,
-    /// A `Date`: its time value (milliseconds since the epoch, an `f64`) is
-    /// kept in `code`'s bits (see `vm::date_value`).
-    Date,
-    /// An `ArrayBuffer`: `elems` points to its bytes, `elems_len` is their
-    /// count.
-    ArrayBuffer,
-    /// A typed array (`Uint8Array`, …): `elems` points to its first
-    /// element in its buffer's bytes, `elems_len` is its length, `kind` its
-    /// element type ([`TypedKind`]), and `code` holds its buffer.
-    TypedArray,
-    /// A `RegExp`: `code` holds its compiled `regexp::Regex`.
-    RegExp,
-    /// A symbol (a primitive: see `symbol`): its key atom in `elems_len`,
-    /// its description in `code`'s bits.
-    Symbol,
-    /// An array's or a string's iterator: `code`'s bits are its state, a
-    /// hidden array (see `symbol::new_iterator`).
-    ArrayIterator,
-    /// A generator object: `code`'s bits are its state, a hidden array
-    /// (see `generator`).
-    Generator,
-    /// A wrapper object (`new Number(1)`, `new String("s")`, `new
-    /// Boolean(true)`): `code`'s bits are the primitive (a value, which the
-    /// collector traces: a string is a cell).
-    Wrapper,
-    /// A `Map`: `code`'s bits are a hidden array holding a header (its hash
-    /// index, …) and its entries, `k0, v0, k1, v1, …` (a deleted entry's
-    /// slots are holes). See `collections`.
-    Map,
-    /// A `Set`: as [`Class::Map`], the entries `k0, k1, …`.
-    Set,
-    /// A `WeakMap`: as [`Class::Map`], its keys held weakly (see
-    /// `collections`).
-    WeakMap,
-    /// A `WeakSet`: as [`Class::Set`].
-    WeakSet,
-    /// A `DataView`: laid out as a [`Class::TypedArray`] (`elems` points
-    /// to its first byte in its buffer, `elems_len` is its byte length,
-    /// `code` holds its buffer), with no element type.
-    DataView,
-    /// A `Map` or `Set` iterator: `code`'s bits are the entries array it
-    /// walks, `elems_len` its next position, `elems_cap` what it yields
-    /// (see `collections::IterMode`).
-    CollectionIterator,
-    /// A `Promise`: `code`'s bits are a hidden array holding its state,
-    /// result and reactions. See `promise`.
-    Promise,
-    /// A proxy whose target isn't callable (one whose target is, is a
-    /// native function): see `proxy`.
-    Proxy,
-    /// A `WeakRef`: as a [`Class::WeakSet`] of its target alone (cleared
-    /// once the target dies).
-    WeakRef,
-    /// A `FinalizationRegistry`: as a [`Class::WeakMap`] of its
-    /// unregister tokens' registration counts, its cleanup callback in
-    /// slot 0 (see `collections`).
-    FinalizationRegistry,
-    /// A BigInt (a primitive: see `bigint`): its sign in `elems_cap`, its
-    /// magnitude's 32-bit limbs in `elems` (a byte buffer), their count in
-    /// `elems_len`.
-    BigInt,
-    /// An iterator helper, or `Iterator.from`'s wrapper: `code`'s bits
-    /// are its state, a hidden array (see `iterator`).
-    IteratorHelper,
-    /// A `DisposableStack` or `AsyncDisposableStack`: `code`'s bits are
-    /// its state, a hidden array (see `dispose`).
-    DisposableStack,
-    /// A `SharedArrayBuffer`: as [`Class::ArrayBuffer`], its bytes in a
-    /// block outside the heap, which agents share (see `typed::Block`).
-    SharedArrayBuffer,
-    /// A Temporal object: its internal slots in bytes `elems` points to
-    /// (see `temporal`).
-    Temporal,
-}
-
-// (Stencils read a cell's class byte: a string's 4, a symbol's 9, a
-// BigInt's 23.)
-const _: () = assert!(Class::String as u8 == 4 && Class::Symbol as u8 == 9 && Class::BigInt as u8 == 23);
+/// What an object is (defined with the layouts compiled code shares).
+pub use crate::layout::Class;
 
 impl Class {
     /// Whether an object of this class has no elements at all (a
@@ -339,8 +250,8 @@ impl TypedKind {
 }
 
 /// The object is reachable from outside the internal heap. Always set for
-/// now (see the module docs).
-pub const EXTERNAL: u8 = 1;
+/// now (see the module docs). (Compiled code writes it.)
+pub use crate::layout::EXTERNAL;
 /// The object is some shape's prototype.
 pub const PROTOTYPE: u8 = 2;
 /// The object has integer keys too far past its elements to store there:
@@ -397,7 +308,9 @@ pub struct Object {
 
 /// Byte offset of the first in-object slot.
 pub const INLINE_BASE: usize = size_of::<Object>();
-const _: () = assert!(INLINE_BASE == 48);
+const _: () = assert!(INLINE_BASE == 48 && INLINE_BASE == crate::layout::INLINE_BASE);
+crate::layout::same_layout!(Object, crate::layout::Header:
+    shape, class, flags, kind, cap_hi, props_cap, props, elems, elems_len, elems_cap, code);
 
 /// A new object's header, as words: `shape`, external, its in-object
 /// capacity the shape's, nothing out of line. (`Object` has no padding, so
@@ -614,9 +527,9 @@ impl FieldType {
     /// or nothing yet), 1 for an int32, 2 for a number, else the shape.
     pub fn encode(self) -> u64 {
         match self {
-            FieldType::None | FieldType::Any => 0,
-            FieldType::Int => 1,
-            FieldType::Num => 2,
+            FieldType::None | FieldType::Any => crate::layout::FIELD_ANY,
+            FieldType::Int => crate::layout::FIELD_INT,
+            FieldType::Num => crate::layout::FIELD_NUM,
             FieldType::Obj(s) => s as u64,
         }
     }
@@ -626,14 +539,14 @@ impl FieldType {
 #[inline(always)]
 pub fn field_fits(want: u64, v: Value) -> bool {
     match want {
-        1 => v.is_int32(),
-        2 => v.is_number(),
+        crate::layout::FIELD_INT => v.is_int32(),
+        crate::layout::FIELD_NUM => v.is_number(),
         s => v.is_cell() && unsafe { (*as_object(v)).shape } as u64 == s,
     }
 }
 
-/// A hidden class. `repr(C)` with `elems_code` first: stencils read it
-/// (`array_push`).
+/// A hidden class. `repr(C)`: compiled code reads its first fields
+/// (`layout::ShapeHead`, checked against them below).
 #[repr(C)]
 pub struct Shape {
     /// [`Shape::elems`] encoded for store checks ([`FieldType::encode`]);
@@ -706,24 +619,9 @@ pub const DONT_DELETE: u8 = 4;
 /// runtime calls them (see `Vm::get`, `Vm::set`).
 pub const ACCESSOR: u8 = 8;
 
-const _: () = assert!(std::mem::offset_of!(Shape, elems_code) == 0);
-const _: () = assert!(std::mem::offset_of!(Shape, family) == 8);
-const _: () = assert!(std::mem::offset_of!(Shape, push) == 16);
+crate::layout::same_layout!(Shape, crate::layout::ShapeHead: elems_code, family, push);
 
-/// Entries of [`PushCache::to`]. DeltaBlue's collections start with
-/// objects of several constructors.
-pub const PUSH_WAYS: usize = 4;
-
-/// [`Shape::push`]: an array of the shape, with no elements yet, moves to
-/// `to[k].1` when a value whose key ([`push_key`]) is `to[k].0` is pushed
-/// onto it (null: no entry; the latest first); `any`, if not null, is the
-/// shape with elements of any type it moves to. The stencils read it.
-#[repr(C)]
-#[derive(Default)]
-pub struct PushCache {
-    pub to: [(u64, u64); PUSH_WAYS],
-    pub any: u64,
-}
+pub use crate::layout::{PUSH_WAYS, PushCache};
 
 impl Drop for Shape {
     fn drop(&mut self) {
@@ -751,13 +649,13 @@ impl Shape {
 /// have one [`FieldType`].
 pub fn push_key(v: Value) -> u64 {
     if v.is_int32() {
-        1
+        crate::layout::FIELD_INT
     } else if v.is_number() {
-        2
+        crate::layout::FIELD_NUM
     } else if v.is_cell() {
         unsafe { (*as_object(v)).shape as u64 }
     } else {
-        0
+        crate::layout::FIELD_ANY
     }
 }
 

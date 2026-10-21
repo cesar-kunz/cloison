@@ -4602,9 +4602,8 @@ pub(crate) unsafe fn set_frame_func(regs: *mut Value, f: *const Object) {
 
 /// `regs[-FUNC]`'s offset in bytes below the registers (compiled code
 /// reads a function's upvalues through it).
-pub(crate) const FUNC_OFF: usize = 8 * FUNC;
-// The stencils' copy (`lda_upvalue`).
-const _: () = assert!(FUNC_OFF == 80);
+pub(crate) const FUNC_OFF: usize = crate::layout::FUNC_OFF;
+const _: () = assert!(FUNC_OFF == 8 * FUNC);
 
 /// Native stack a run lets calls from compiled code use (each runs its
 /// callee to completion on the native stack). Past it, the interpreter

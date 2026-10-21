@@ -58,8 +58,13 @@
 
 use crate::bytecode::Op;
 use crate::interp::{self, Frame, Run};
-use crate::object::{Atom, FieldType, Object, PAGE, Shape};
+use crate::object::{Atom, Class, FieldType, Object, PAGE, Shape};
+use crate::layout::InstanceOfEntry;
 use crate::value::{NumberTag, Value};
+
+/// An `instanceof` site's cache (`Prop::InstanceOf`): two entries, the
+/// latest first.
+type InstanceOfCache = [std::cell::Cell<InstanceOfEntry>; 2];
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 
@@ -616,7 +621,7 @@ extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
 extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
-    let (v, f, cache) = (a[0], a[1], a[2].to_bits() as *const std::cell::Cell<u64>);
+    let (v, f, cache) = (a[0], a[1], a[2].to_bits() as *const InstanceOfCache);
     let Ok(r) = vm.instance_of(v, f) else { return 0 };
     let r = Value::from_bool(r);
     // The site's cache: the receiver's shape and the prototype, read as the
@@ -627,12 +632,13 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
             if std::ptr::eq((*fo).shape, vm.function_shape) {
                 let p = *Object::slot(fo, (*vm.function_shape).location(0));
                 // The new entry first, the first one moved to second.
-                for k in 0..3 {
-                    (*cache.add(3 + k)).set((*cache.add(k)).get());
-                }
-                (*cache).set((*crate::object::as_object(v)).shape as u64);
-                (*cache.add(1)).set(p.to_bits());
-                (*cache.add(2)).set(r.to_bits());
+                let cache = &*cache;
+                cache[1].set(cache[0].get());
+                cache[0].set(InstanceOfEntry {
+                    shape: (*crate::object::as_object(v)).shape as u64,
+                    proto: p.to_bits(),
+                    result: r.to_bits(),
+                });
             }
         }
     }
@@ -4994,11 +5000,10 @@ fn primitive_cell(s: u64) -> bool {
     PRIMITIVE_CELLS >> unsafe { (*(s as *const Shape)).class as u32 } & 1 != 0
 }
 
-/// What `tget_*_chk` / `tset_*_chk` compare an object's bytes 8 to 11
-/// with, its flags (byte 9) masked off: class `TypedArray` and `kind`.
+/// What `tget_*_chk` / `tset_*_chk` compare an object's class and kind
+/// with (`layout::class_kind`): class `TypedArray` and `kind`.
 fn typed_class_kind(kind: u8) -> i32 {
-    const _: () = assert!(crate::object::Class::TypedArray as u8 == 7);
-    7 | (kind as i32) << 16
+    (Class::TypedArray as u32 | (kind as u32) << 16) as i32
 }
 
 /// The element kind (`object::TypedKind`) of typed arrays of shape `s`,
@@ -9927,8 +9932,8 @@ fn frame_end(f: &InlineFrame) -> usize {
 /// operands, renamed into the compiled frame, and where a callee's frame
 /// goes (past every register the compiled code uses). For a direct call,
 /// the callee's compiled entry and what `call_direct` checks before calling
-/// it: the first fields, which it reads (`DirectSite` in
-/// `stencils/stencils.rs`).
+/// it: the first fields, which it reads (`layout::DirectSite`, checked
+/// against them below).
 #[repr(C)]
 pub(crate) struct CallSite {
     /// Entry address of the callee's compiled code; 0: always call through
@@ -10024,41 +10029,13 @@ struct Dispatch {
     sites: HashMap<u64, Box<std::cell::UnsafeCell<CallSite>>>,
 }
 
-/// Slots of a [`Dispatch`] table (`dispatched` in the stencils too).
-const DISPATCH: usize = 1024;
-// (`DirectSite` in the stencils reads it after the fields before it.)
-const _: () = assert!(std::mem::offset_of!(CallSite, table) == 8 * 8);
+// A dispatch table's slots (`dispatched` in the stencils too).
+use crate::layout::{DISPATCH, dispatch_slot};
+crate::layout::same_layout!(CallSite, crate::layout::DirectSite:
+    entry, closure, f_off, end_off, stack_end, native_limit, this_shape, ctor, table);
 const DISPATCH_AFTER: u32 = 8;
 
-/// How `construct_direct` allocates `this` for a direct `new` (read by the
-/// stencil as `CtorAlloc`): from the VM heap's free space, with the root
-/// shape the callee's version is bound for (`CallSite::this_shape`), as
-/// long as what that root depends on (`Vm::ctor_root`) is unchanged: the
-/// constructor's `prototype` slot and its objects' in-object capacity.
-/// Otherwise, or when the heap's chunk is full, `cloison_rt_construct`
-/// allocates.
-#[repr(C)]
-#[derive(Clone, PartialEq)]
-struct CtorSite {
-    /// The heap's `ptr` and `end` (`Heap::bump`).
-    heap: *mut [*mut u64; 2],
-    /// The constructor's `prototype` slot, and its value then.
-    proto_at: *const u64,
-    proto: u64,
-    /// The constructor's `Code::ctor_capacity`, and its value then.
-    cap_at: *const u32,
-    cap: u64,
-    /// In-object slots of the shape, set to `undefined`.
-    slots: u64,
-    /// Where `this` goes: the callee frame's `r0`, in bytes from the
-    /// caller's registers.
-    this_off: u64,
-    /// A shape for which `Vm::construct_done` has nothing to do: the
-    /// constructor's objects end with it (see `cloison_rt_construct_done`).
-    done_shape: u64,
-    /// The header of `this`.
-    header: [u64; crate::object::INLINE_BASE / 8],
-}
+use crate::layout::CtorSite;
 
 /// Whether two lowerings' property operands are the same. An
 /// `instanceof`'s cache (`Prop::InstanceOf`) is boxed afresh by each
@@ -10214,7 +10191,7 @@ impl CallSite {
         let callee = unsafe { (*fo).code };
         // (By code, as the site is, or by closure.)
         let key = if self.by_code { callee as u64 } else { fv.to_bits() };
-        let k = (key >> 4) as usize % DISPATCH;
+        let k = dispatch_slot(key);
         let at = unsafe { *self.table.add(k) } as *mut CallSite;
         if !at.is_null() && unsafe { (*at).closure } == key {
             return unsafe { &mut *at };
@@ -10432,7 +10409,7 @@ pub(crate) struct Snapshot {
     /// Owned here so they live as long as code pointing to them.
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
     #[allow(dead_code)]
-    caches: Vec<Box<[std::cell::Cell<u64>; 6]>>,
+    caches: Vec<Box<InstanceOfCache>>,
 }
 
 /// Emit polymorphic access `i` ([`Prop::Poly`]): a store's boxing and
@@ -10616,7 +10593,7 @@ struct Lowered {
     fbs: Vec<Feedback>,
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
     /// The `instanceof` caches ([`Prop::InstanceOf`]).
-    caches: Vec<Box<[std::cell::Cell<u64>; 6]>>,
+    caches: Vec<Box<InstanceOfCache>>,
     nregs: usize,
     /// Where direct calls' frames start: registers from there are set up
     /// for callees, which read them from memory (see [`lower`]). Or where
@@ -12948,7 +12925,7 @@ impl Lowering<'_> {
                 }
                 // `instanceof`: a cache of its own (see `Prop::InstanceOf`).
                 Op::TestInstanceOf => {
-                    let cache = Box::new([const { std::cell::Cell::new(0) }; 6]);
+                    let cache: Box<InstanceOfCache> = Box::default();
                     let prop = Prop::InstanceOf {
                         cache: cache.as_ptr() as u64,
                     };

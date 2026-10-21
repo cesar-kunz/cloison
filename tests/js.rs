@@ -7757,3 +7757,17 @@ var e; try { String.prototype.indexOf.call(u, 'a'); } catch (x) { e = x; }
 "#;
     assert_eq!(value(src), "xy,MN,thrown,bc,ef");
 }
+
+/// ToNumber of a Date goes through its `valueOf` (or `@@toPrimitive`).
+#[test]
+fn to_number_of_a_date_calls_its_value_of() {
+    let src = r#"
+var d = new Date(0); d.valueOf = function () { return 42; };
+// (Date.prototype's `@@toPrimitive` is read-only: an assignment makes no
+// own one, `defineProperty` does.)
+var e = new Date(0); e[Symbol.toPrimitive] = function (h) { return h === 'number' ? 7 : 'x'; };
+var f = new Date(0); Object.defineProperty(f, Symbol.toPrimitive, { value: function (h) { return h === 'number' ? 8 : 'y'; } });
+[Math.abs(d), +e, +f, +new Date(5), new Date(9) - 0, Number(new Date(3))].join();
+"#;
+    assert_eq!(value(src), "42,0,8,5,9,3");
+}

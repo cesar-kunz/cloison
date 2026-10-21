@@ -3414,9 +3414,8 @@ pub(crate) fn to_number(v: Value) -> f64 {
         }
         return f64::NAN;
     }
-    if let Some(t) = crate::date::date_value(v) {
-        return t;
-    }
+    // (A Date too: through its `@@toPrimitive` and `valueOf`, which code
+    // may have replaced.)
     match string_units(v) {
         Some(u) => string_to_number(&String::from_utf16_lossy(u)),
         None => to_number(to_primitive(v)),

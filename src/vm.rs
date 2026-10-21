@@ -105,6 +105,46 @@ impl LookupEntry {
     };
 }
 
+/// An entry of `Vm::megas`: a named load's data property, by the
+/// receiver's shape and the name, for compiled code to probe inline (the
+/// `get_named_rt` stencils, at sites given up on as megamorphic): in the
+/// receiver at `off` bytes (`!off` bytes into its out-of-line slots if
+/// negative) if `addr` is 0, else at `addr`, a prototype's slot, while
+/// the prototype epoch is still `epoch`. Entry 0 holds, in `addr`, the
+/// address of `Vm::proto_epoch` instead. The stencils know this layout.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct MegaEntry {
+    shape: u64,
+    name: u32,
+    epoch: u32,
+    off: i32,
+    _pad: u32,
+    addr: u64,
+}
+
+impl MegaEntry {
+    const EMPTY: MegaEntry = MegaEntry {
+        shape: 0,
+        name: 0,
+        epoch: 0,
+        off: 0,
+        _pad: 0,
+        addr: 0,
+    };
+}
+
+/// Entries of `Vm::megas` past the first (a power of two; the stencils'
+/// `MEGAS`).
+const MEGAS: usize = 2048;
+
+/// [`MegaEntry`] `shape`/`name`'s index in `Vm::megas` (the stencils'
+/// `mega_index`).
+#[inline(always)]
+fn mega_index(shape: u64, name: u32) -> usize {
+    1 + ((shape >> 4) as u32 ^ name.wrapping_mul(0x9E37_79B1)) as usize % MEGAS
+}
+
 /// [`LookupEntry::holder`] of a property no object on the chain has.
 const PROTO_NONE: *mut Object = 1 as *mut Object;
 /// Entries of `Vm::lookups` (a power of two).
@@ -293,17 +333,18 @@ pub(crate) fn as_field(ft: FieldType, v: Value) -> Value {
 /// Cache `e` in the slot whose way 0 is at `ic`: in the way caching its
 /// shape if one does (it may be stale: a field generalized since, or a
 /// prototype changed), else in the first free way. With every way taken
-/// (the site is megamorphic), `e` replaces way 0.
-unsafe fn install(ic: *mut Ic, e: Ic) {
+/// (the site is megamorphic), `e` replaces way 0, and the result is true.
+unsafe fn install(ic: *mut Ic, e: Ic) -> bool {
     unsafe {
         for k in 0..IC_WAYS {
             let w = &mut *ic.add(k);
             if w.shape.is_null() || w.shape == e.shape {
                 *w = e;
-                return;
+                return false;
             }
         }
         *ic = e;
+        true
     }
 }
 
@@ -600,6 +641,12 @@ pub struct Vm {
     /// [`Vm::lookup`]'s results, by the receiver's shape and the name (see
     /// [`LookupEntry`]).
     lookups: Box<[std::cell::Cell<LookupEntry>]>,
+    /// See [`MegaEntry`].
+    megas: Box<[MegaEntry]>,
+    /// Named-load cache slots (way 0's address) that met more receiver
+    /// shapes than they have ways: compiled through `megas`, not a
+    /// dispatch on the shapes the ways hold at the time.
+    pub(crate) megamorphic: crate::jit::HashSet<usize>,
     /// Prototype slots whose values compiled code folded (`jit::rely_on_slot`):
     /// a store of another value to one bumps `proto_epoch`; to another
     /// prototype slot, nothing (compiled code reads those when it runs).
@@ -962,6 +1009,8 @@ impl Vm {
             strings: HashMap::default(),
             proto_epoch: 0,
             lookups: vec![std::cell::Cell::new(LookupEntry::EMPTY); LOOKUPS].into_boxed_slice(),
+            megas: vec![MegaEntry::EMPTY; 1 + MEGAS].into_boxed_slice(),
+            megamorphic: Default::default(),
             relied_slots: Default::default(),
             jitted: Vec::new(),
             field_deps: HashMap::default(),
@@ -1967,6 +2016,44 @@ impl Vm {
         found
     }
 
+    /// The address of [`MegaEntry`] table `Vm::megas`.
+    pub(crate) fn megas_addr(&self) -> u64 {
+        self.megas.as_ptr() as u64
+    }
+
+    /// Note in `Vm::megas` where `o.name` is, if a data property's slot
+    /// is what `Vm::get` reads (not a proxy's, a typed array's, a
+    /// `length`, an accessor, another realm's).
+    pub(crate) fn mega_note(&mut self, o: Value, name: Atom) {
+        if !o.is_cell() || name == self.a_length || self.proxies_exist || !self.realms.is_empty() {
+            return;
+        }
+        let o = as_object(o);
+        if unsafe { (*o).class } == Class::TypedArray {
+            return;
+        }
+        let Some((h, slot)) = self.lookup(o, name) else { return };
+        if self.is_accessor(h, slot) {
+            return;
+        }
+        let shape = unsafe { (*o).shape } as u64;
+        let loc = unsafe { (*(*h).shape).location(slot) };
+        let (off, addr) = if h == o {
+            (if loc >= 0 { loc } else { !(!loc * 8) }, 0)
+        } else {
+            (0, unsafe { Object::slot(h, loc) } as u64)
+        };
+        self.megas[0].addr = &raw const self.proto_epoch as u64;
+        self.megas[mega_index(shape, name.0)] = MegaEntry {
+            shape,
+            name: name.0,
+            epoch: self.proto_epoch,
+            off,
+            _pad: 0,
+            addr,
+        };
+    }
+
     /// [`Vm::lookup`], without its cache.
     fn lookup_uncached(&self, o: *mut Object, name: Atom) -> Option<(*mut Object, u32)> {
         let mut o = o;
@@ -2385,16 +2472,16 @@ impl Vm {
                         return Ok(v);
                     }
                 }
-                install(
-                    ic,
-                    Ic {
-                        shape: (*o).shape,
-                        holder: self.missing_holder,
-                        new_shape: std::ptr::null(),
-                        loc: crate::object::INLINE_BASE as i32,
-                        epoch: self.proto_epoch,
-                    },
-                );
+                let e = Ic {
+                    shape: (*o).shape,
+                    holder: self.missing_holder,
+                    new_shape: std::ptr::null(),
+                    loc: crate::object::INLINE_BASE as i32,
+                    epoch: self.proto_epoch,
+                };
+                if install(ic, e) {
+                    self.megamorphic.insert(ic as usize);
+                }
                 return Ok(Value::UNDEFINED);
             };
             let loc = (*(*h).shape).location(slot);
@@ -2407,16 +2494,16 @@ impl Vm {
                 return self.call_getter(*Object::slot(h, loc), obj);
             }
             self.heap.note(object_value(h));
-            install(
-                ic,
-                Ic {
-                    shape: (*o).shape,
-                    holder: if h == o { std::ptr::null_mut() } else { h },
-                    new_shape: std::ptr::null(),
-                    loc,
-                    epoch: self.proto_epoch,
-                },
-            );
+            let e = Ic {
+                shape: (*o).shape,
+                holder: if h == o { std::ptr::null_mut() } else { h },
+                new_shape: std::ptr::null(),
+                loc,
+                epoch: self.proto_epoch,
+            };
+            if install(ic, e) {
+                self.megamorphic.insert(ic as usize);
+            }
             Ok(*Object::slot(h, loc))
         }
     }

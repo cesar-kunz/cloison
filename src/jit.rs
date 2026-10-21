@@ -585,7 +585,11 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
 extern "C" fn cloison_rt_get_named(o: Value, name: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = crate::object::Atom(name.to_bits() as u32);
-    vm.get_named_rt(o, name).map_or(0, |v| v.to_bits())
+    let v = vm.get_named_rt(o, name).map_or(0, |v| v.to_bits());
+    if v != 0 {
+        vm.mega_note(o, name);
+    }
+    v
 }
 
 /// `o.name = v` (`args`: `o`, `name` an `Atom`, `v`): 1, or 0 to leave
@@ -2653,6 +2657,16 @@ impl Feedback {
             // (A way only the runtime takes, a store adding a property out
             // of line: there, not an exit.)
             0 if runtime => Prop::Runtime,
+            // A load that met more shapes than its ways hold: through the
+            // runtime's megamorphic table, not on the ways' shapes of the
+            // moment (they rotate: TypeScript's syntax tree walks went
+            // from one four-shape version to the next).
+            crate::vm::IC_WAYS
+                if insn.op == Op::GetNamed
+                    && unsafe { (*crate::interp::current_vm()).megamorphic.contains(&(self.ic(insn.imm as usize) as usize)) } =>
+            {
+                Prop::Runtime
+            }
             0 => Prop::None,
             1 if !cases[0].is_family() => first,
             _ => {
@@ -5161,7 +5175,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
                 out.acc = Any;
                 return Sel {
-                    ops: Some((0, name, 0)),
+                    ops: Some((0, name, megas_addr())),
                     ..Sel::new("get_named_rt", "", out)
                 };
             }
@@ -5273,7 +5287,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 Sel::new("set_named_rt", if st.acc == I32 { "i" } else { "" }, out)
             };
             return Sel {
-                ops: Some((0, name, 0)),
+                ops: Some((0, name, if load { megas_addr() } else { 0 })),
                 ..sel
             };
         }
@@ -10462,6 +10476,12 @@ fn emit_poly(
     exits.push((i, seq));
 }
 
+/// The `get_named_rt` stencils' table (`Vm::megas`), the current VM's.
+fn megas_addr() -> u64 {
+    let vm = crate::interp::current_vm();
+    if vm.is_null() { 0 } else { unsafe { (*vm).megas_addr() } }
+}
+
 /// Soft load `i`'s miss path (see [`Soft`]), cold, on to after hot piece
 /// `after`: it exits, through the instruction's exit, where the runtime
 /// would throw or run code, or the value doesn't fit.
@@ -10474,6 +10494,7 @@ fn soft_path(i: usize, insn: &Insn, soft: Soft, homes: &[Home], after: usize) ->
     let mut seq = vec![Piece {
         reg: insn.reg,
         imm64: soft.name,
+        imm64b: megas_addr(),
         exit: i as u32,
         ..Piece::new(&format!("get_named_rt_{loc}"), 0)
     }];
@@ -15260,8 +15281,7 @@ impl JitFunction {
             // spent its compilations on 48 such exits). Not before: a fifth
             // shape now and then leaves a site's four (gbemu +1.5%).
             let full = matches!(vm.props.get(k), Some(Prop::Poly { n, .. })
-                if *n as usize == crate::vm::IC_WAYS)
-                && 2 * self.stats.compiles >= max_compiles(vm.root_len);
+                if *n as usize == crate::vm::IC_WAYS);
             let n = vm.property_exits.entry(origin).or_insert(0);
             *n = if full { (*n).max(MAX_PROPERTY_EXITS) } else { *n + 1 };
         } else if !insn.is_call() {

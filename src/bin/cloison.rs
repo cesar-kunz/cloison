@@ -112,6 +112,7 @@ fn main() -> ExitCode {
         let cells = vm.heap.verify();
         eprintln!("heap: {cells} cells, {} MiB of blocks", vm.heap.allocated() >> 20);
     }
+    let mem = vm.memory_stats();
     // (What the heap holds at the end counts for its peak too.)
     cloison::gc::HEAP_PEAK.fetch_max(vm.heap.allocated() as u64, std::sync::atomic::Ordering::Relaxed);
     // The process exits next: freeing the VM's shapes and code one by one
@@ -170,6 +171,18 @@ fn main() -> ExitCode {
                     n(&cloison::gc::MAX_PAUSE_NS) as f64 / 1e6,
                     n(&cloison::gc::HEAP_PEAK),
                     n(&cloison::gc::LIVE_PEAK),
+                );
+                // (glibc's count of what malloc has handed out and not freed.)
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                let malloc = {
+                    let m = unsafe { libc::mallinfo2() };
+                    m.uordblks + m.hblkhd
+                };
+                #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+                let malloc = 0;
+                eprintln!(
+                    "mem shapes={} shape_bytes={} codes={} code_bytes={} pinned_codes={} malloc={malloc}",
+                    mem[0], mem[1], mem[2], mem[3], mem[4]
                 );
             }
             // `CLOISON_COUNT`: hot code's stencil executions.

@@ -120,9 +120,10 @@ def run(job):
     m = {"s": s, "peak_mb": peak, "mean_mb": statistics.mean(samples) / 1024 if samples else peak,
          "ok": b == "<empty>" or any(l.strip() in ("1001", "1002") for l in stdout.splitlines())}
     if e == "cloison":
-        line = next((l for l in stderr.splitlines() if l.startswith("gc ")), "")
-        for k, v in re.findall(r"(\w+)=([\d.]+)", line):
-            m[k] = float(v)
+        for l in stderr.splitlines():
+            if l.startswith(("gc ", "mem ")):
+                for k, v in re.findall(r"(\w+)=([\d.]+)", l):
+                    m[k] = float(v)
     return job, m
 
 def version(e):
@@ -225,9 +226,11 @@ for k, title in (("peak_mb", "peak RSS"), ("mean_mb", "mean RSS")):
 
 gc_cols = [("minors", "minors", None), ("fulls", "fulls", None), ("pause_ms", "pauses ms", None),
            ("max_pause_ms", "longest ms", None), ("heap_peak", "heap peak MB", 1 << 20),
-           ("live_peak", "live peak MB", 1 << 20)]
+           ("live_peak", "live peak MB", 1 << 20), ("shape_bytes", "shapes MB", 1 << 20),
+           ("code_bytes", "code MB", 1 << 20), ("malloc", "malloc at end MB", 1 << 20)]
 lines += ["**cloison's collector** (heap: bytes of blocks in use at its peak; live: the most a full "
-          "collection found live)", "",
+          "collection found live, a concurrent one's floating garbage included; outside the heap at the "
+          "end: shapes, codes (bytecode, inline caches), all malloc)", "",
           "| benchmark | " + " | ".join(c[1] for c in gc_cols) + " | heap/live |", "|---|" + "---:|" * (len(gc_cols) + 1)]
 for b in benches:
     row = [val("cloison", b, k) for k, _, _ in gc_cols]
@@ -255,7 +258,8 @@ if record:
     rows = [l.rstrip("\n").split("\t") for l in open(path)][1:] if os.path.exists(path) else []
     prev = next((r[0] for r in reversed(rows) if r[0] != commit), None)
     last = {(r[1], r[2]): float(r[3]) for r in rows if r[0] == prev}
-    keys = ["peak_mb", "mean_mb", "heap_peak", "live_peak", "minors", "fulls", "pause_ms", "max_pause_ms"]
+    keys = ["peak_mb", "mean_mb", "heap_peak", "live_peak", "minors", "fulls", "pause_ms", "max_pause_ms",
+            "shape_bytes", "code_bytes", "malloc"]
     new = [(b, k, val("cloison", b, k)) for b in benches + ["<empty>"] for k in keys if val("cloison", b, k) is not None]
     with open(path, "a") as f:
         if not rows:

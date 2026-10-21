@@ -119,6 +119,10 @@ pub struct Gc {
     threads: usize,
     /// Bytes minor collections promoted since the last major one.
     promoted: usize,
+    /// Bytes the pauses of the current marking cycle before its final one
+    /// marked with its color (the young cells they promoted): live, but
+    /// not the final pause's or the marker's to count.
+    cycle_marked: usize,
     /// Old cells a minor collection during marking shaded for the marker.
     shade: Vec<usize>,
     /// The marker thread, once a cycle needed it.
@@ -1343,6 +1347,11 @@ impl Vm {
         } else {
             self.heap.gc.promoted += traced;
         }
+        match kind {
+            Collection::Start => self.heap.gc.cycle_marked = traced,
+            Collection::MinorShade => self.heap.gc.cycle_marked += traced,
+            _ => {}
+        }
         self.heap.gc.stack = stack;
         self.heap.gc.log.clear();
         self.heap.gc.log_kept.clear();
@@ -1357,7 +1366,10 @@ impl Vm {
             // and room to grow by what was live, times `GROWTH - 1`.
             let live = traced + concurrent;
             let room = ((GROWTH - 1) * live).max(FULL_MIN);
-            LIVE_PEAK.fetch_max(live as u64, std::sync::atomic::Ordering::Relaxed);
+            // (What the cycle's earlier pauses marked is live too; the
+            // room above leaves it out.)
+            let cycle = if kind == Collection::Final { std::mem::take(&mut self.heap.gc.cycle_marked) } else { 0 };
+            LIVE_PEAK.fetch_max((live + cycle) as u64, std::sync::atomic::Ordering::Relaxed);
             self.heap.gc.live = live;
             self.heap.gc.room = room;
             if kind == Collection::Final {
@@ -2130,6 +2142,18 @@ impl Heap {
         if over && self.gc.sweeping {
             self.gc.sweeping = false;
             self.gc.full_at = self.allocated() + self.gc.headroom();
+            if self.gc.stats {
+                let [partly, free, recycled, empty] = std::mem::take(&mut self.swept);
+                eprintln!(
+                    "  swept: {partly} blocks with cells ({} MiB, {} MiB of it free, {recycled} to reuse), \
+                     {empty} emptied; {} MiB of blocks in use, {} MiB kept empty, next cycle at {} MiB",
+                    (partly * crate::heap::BLOCK) >> 20,
+                    free >> 20,
+                    self.allocated() >> 20,
+                    (self.kept_empty() * crate::heap::BLOCK) >> 20,
+                    self.gc.full_at >> 20
+                );
+            }
         }
         over
     }

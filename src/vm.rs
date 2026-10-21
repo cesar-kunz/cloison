@@ -4678,7 +4678,13 @@ impl Vm {
                     // slack tracking, its liveness): it has never run.
                     let c = unsafe { &mut *into.cast_mut() };
                     debug_assert_eq!(c.nparams, f.nparams);
-                    debug_assert_eq!(*c.upvalues, *f.upvalues);
+                    // Its upvalues in the stub's order: the names its
+                    // closures captured, declared again in that order (see
+                    // `js::compile_lazy`). The stub's sources, where they
+                    // are in its parent, stay; the new ones are where they
+                    // are in the wrapper declaring them.
+                    debug_assert_eq!(c.upvalues.len(), f.upvalues.len());
+                    debug_assert_eq!(c.lazy.as_ref().map(|l| l.upvalues.len()), Some(f.upvalues.len()));
                     let before = c.footprint();
                     c.bytecode = bytecode;
                     c.nregs = f.nregs;

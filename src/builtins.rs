@@ -1633,14 +1633,29 @@ fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `parseInt(s, radix)`: the longest prefix of digits in `radix` (2 to 36;
 /// 0 or missing: 10, or 16 after `0x`), after whitespace and a sign.
-fn parse_int(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn parse_int(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let v = arg(a, 0);
-    let radix = a.get(1).map_or(0, |&r| crate::interp::to_int32(to_number(r)));
-    // An int32 in radix 10 is itself (box2d's `parseInt(count)`).
-    if v.is_int32() && matches!(radix, 0 | 10) {
-        return Ok(v);
-    }
-    let u = units(v);
+    // ToString of the input, then ToInt32 of the radix (§19.2.5 steps 1
+    // and 6), each one's exception thrown before the next runs.
+    let radix_of = |vm: &mut Vm| -> Result<i32> {
+        let r = a.get(1).map_or(0, |&r| crate::interp::to_int32(to_number(r)));
+        if vm.conv_failed() { Err(vm.take_conv_error()) } else { Ok(r) }
+    };
+    // An int32 in radix 10 is itself (box2d's `parseInt(count)`): its
+    // string, which runs no code, can wait for the radix.
+    let (u, radix) = if v.is_int32() {
+        let radix = radix_of(vm)?;
+        if matches!(radix, 0 | 10) {
+            return Ok(v);
+        }
+        (units(v), radix)
+    } else {
+        let u = units(v);
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
+        (u, radix_of(vm)?)
+    };
     let mut i = u.iter().position(|&c| !is_space(c)).unwrap_or(u.len());
     let mut neg = false;
     if i < u.len() && (u[i] == b'-' as u16 || u[i] == b'+' as u16) {

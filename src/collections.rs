@@ -488,7 +488,16 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     if !vm.is_construct() {
         return Err(Error::type_error(format!("Constructor {name} requires 'new'")));
     }
-    let o = object_value(new_collection(vm, class, proto)?);
+    // OrdinaryCreateFromConstructor: a subclass's prototype first, where
+    // its adder is looked up (an override of `set` or `add` called).
+    let f = vm.callee;
+    let default = object_value(vm.collection_prototypes[proto as usize]);
+    let p = vm.take_new_target(f, default)?;
+    let c = new_collection(vm, class, proto)?;
+    if p != default {
+        vm.set_prototype_of(c, p);
+    }
+    let o = object_value(c);
     let iterable = arg(a, 0);
     if iterable.is_undefined() || iterable.is_null() {
         return Ok(o);

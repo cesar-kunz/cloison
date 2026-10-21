@@ -78,6 +78,43 @@ pub struct Upvalue {
     pub closed: Value,
 }
 
+/// A [`Vm::lookup`] result for receivers of shape `shape` and property
+/// `name`: the receiver's own slot `slot` (`holder` null), which its shape
+/// alone fixes; or, while no prototype changes (`epoch`, the VM's
+/// `proto_epoch` then), prototype `holder`'s slot, or none (`holder`
+/// `PROTO_NONE`). Shapes never change their keys (a change is a new shape)
+/// nor go away, so an entry is never another shape's. (V8's megamorphic
+/// stub cache, for the runtime's lookups: TypeScript's syntax tree nodes,
+/// of many shapes, read by name through it.)
+#[derive(Clone, Copy)]
+pub(crate) struct LookupEntry {
+    shape: *const crate::object::Shape,
+    name: u32,
+    epoch: u32,
+    holder: *mut Object,
+    slot: u32,
+}
+
+impl LookupEntry {
+    const EMPTY: LookupEntry = LookupEntry {
+        shape: std::ptr::null(),
+        name: 0,
+        epoch: 0,
+        holder: std::ptr::null_mut(),
+        slot: 0,
+    };
+}
+
+/// [`LookupEntry::holder`] of a property no object on the chain has.
+const PROTO_NONE: *mut Object = 1 as *mut Object;
+/// Entries of `Vm::lookups` (a power of two).
+const LOOKUPS: usize = 4096;
+
+#[inline(always)]
+fn lookup_index(shape: *const crate::object::Shape, name: Atom) -> usize {
+    ((shape as usize >> 4) ^ (name.0 as usize).wrapping_mul(0x9E37_79B1)) & (LOOKUPS - 1)
+}
+
 /// A function implemented in Rust: `(vm, this, args)`.
 pub type NativeFn = fn(&mut Vm, Value, &[Value]) -> Result<Value>;
 
@@ -560,6 +597,9 @@ pub struct Vm {
     strings: HashMap<Vec<u16>, Value>,
     /// Bumped whenever a prototype changes shape; see [`Ic`].
     pub proto_epoch: u32,
+    /// [`Vm::lookup`]'s results, by the receiver's shape and the name (see
+    /// [`LookupEntry`]).
+    lookups: Box<[std::cell::Cell<LookupEntry>]>,
     /// Prototype slots whose values compiled code folded (`jit::rely_on_slot`):
     /// a store of another value to one bumps `proto_epoch`; to another
     /// prototype slot, nothing (compiled code reads those when it runs).
@@ -921,6 +961,7 @@ impl Vm {
             string_shape: std::ptr::null(),
             strings: HashMap::default(),
             proto_epoch: 0,
+            lookups: vec![std::cell::Cell::new(LookupEntry::EMPTY); LOOKUPS].into_boxed_slice(),
             relied_slots: Default::default(),
             jitted: Vec::new(),
             field_deps: HashMap::default(),
@@ -1900,6 +1941,34 @@ impl Vm {
     /// The object holding `name` on `o`'s prototype chain (`o` included),
     /// and its slot there.
     pub(crate) fn lookup(&self, o: *mut Object, name: Atom) -> Option<(*mut Object, u32)> {
+        let shape = unsafe { (*o).shape };
+        let e = &self.lookups[lookup_index(shape, name)];
+        let c = e.get();
+        if c.shape == shape && c.name == name.0 {
+            if c.holder.is_null() {
+                return Some((o, c.slot));
+            }
+            if c.epoch == self.proto_epoch {
+                return (c.slot != u32::MAX).then_some((c.holder, c.slot));
+            }
+        }
+        let found = self.lookup_uncached(o, name);
+        e.set(LookupEntry {
+            shape,
+            name: name.0,
+            epoch: self.proto_epoch,
+            holder: match found {
+                Some((h, _)) if h == o => std::ptr::null_mut(),
+                Some((h, _)) => h,
+                None => PROTO_NONE,
+            },
+            slot: found.map_or(u32::MAX, |f| f.1),
+        });
+        found
+    }
+
+    /// [`Vm::lookup`], without its cache.
+    fn lookup_uncached(&self, o: *mut Object, name: Atom) -> Option<(*mut Object, u32)> {
         let mut o = o;
         loop {
             let s = unsafe { &*(*o).shape };

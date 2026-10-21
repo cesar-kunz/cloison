@@ -602,11 +602,14 @@ extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
     let name = crate::object::Atom(a[1].to_bits() as u32);
     let before = (vm.proto_epoch, vm.field_epoch, vm.code_epoch);
     vm.store_failed = false;
-    u64::from(
-        vm.set_named_rt(a[0], name, a[2]).is_some()
-            && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
-            && !vm.store_failed,
-    )
+    let old = if a[0].is_cell() { unsafe { (*crate::object::as_object(a[0])).shape } } else { std::ptr::null() };
+    let ok = vm.set_named_rt(a[0], name, a[2]).is_some()
+        && (vm.proto_epoch, vm.field_epoch, vm.code_epoch) == before
+        && !vm.store_failed;
+    if ok {
+        vm.mega_store_note(a[0], old, name);
+    }
+    u64::from(ok)
 }
 
 /// `a instanceof b`, or 0 where it would throw (the interpreter does).
@@ -2657,13 +2660,13 @@ impl Feedback {
             // (A way only the runtime takes, a store adding a property out
             // of line: there, not an exit.)
             0 if runtime => Prop::Runtime,
-            // A load that met more shapes than its ways hold: through the
-            // runtime's megamorphic table, not on the ways' shapes of the
-            // moment (they rotate: TypeScript's syntax tree walks went
-            // from one four-shape version to the next).
+            // An access that met more shapes than its ways hold: through
+            // the runtime's megamorphic tables, not on the ways' shapes of
+            // the moment (they rotate: TypeScript's syntax tree walks went
+            // from one four-shape version to the next, its constructors'
+            // stores, of every subclass's objects, too).
             crate::vm::IC_WAYS
-                if insn.op == Op::GetNamed
-                    && unsafe { (*crate::interp::current_vm()).megamorphic.contains(&(self.ic(insn.imm as usize) as usize)) } =>
+                if unsafe { (*crate::interp::current_vm()).megamorphic.contains(&(self.ic(insn.imm as usize) as usize)) } =>
             {
                 Prop::Runtime
             }
@@ -5287,7 +5290,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 Sel::new("set_named_rt", if st.acc == I32 { "i" } else { "" }, out)
             };
             return Sel {
-                ops: Some((0, name, if load { megas_addr() } else { 0 })),
+                ops: Some((0, name, if load { megas_addr() } else { mega_stores_addr() })),
                 ..sel
             };
         }
@@ -10493,6 +10496,13 @@ fn emit_poly(
         ..Piece::new("exit", 0)
     });
     exits.push((i, seq));
+}
+
+/// The `set_named_rt` stencils' table (`Vm::mega_stores`), the current
+/// VM's.
+fn mega_stores_addr() -> u64 {
+    let vm = crate::interp::current_vm();
+    if vm.is_null() { 0 } else { unsafe { (*vm).mega_stores_addr() } }
 }
 
 /// The `get_named_rt` stencils' table (`Vm::megas`), the current VM's.

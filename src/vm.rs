@@ -134,15 +134,59 @@ impl MegaEntry {
     };
 }
 
-/// Entries of `Vm::megas` past the first (a power of two; the stencils'
-/// `MEGAS`).
+/// An entry of `Vm::mega_stores`: how compiled code stores a named
+/// property (the `set_named_rt` stencils, at sites given up on as
+/// megamorphic), by the receiver's shape and the name, as the interpreter's
+/// store cache does (`interp::op_set_named`): into the slot at `loc` if the
+/// value fits field type `ft` (`FieldType::encode`), moving the object to
+/// `new_shape` first if not null, while the prototype epoch is `epoch` and
+/// the object has room. Entry 0 holds, in `new_shape`, the address of
+/// `Vm::proto_epoch`. The stencils know this layout.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct MegaStore {
+    shape: u64,
+    name: u32,
+    epoch: u32,
+    ft: u64,
+    new_shape: u64,
+    loc: i32,
+    _pad: u32,
+}
+
+impl MegaStore {
+    const EMPTY: MegaStore = MegaStore {
+        shape: 0,
+        name: 0,
+        epoch: 0,
+        ft: 0,
+        new_shape: 0,
+        loc: 0,
+        _pad: 0,
+    };
+}
+
+const _: () = assert!(size_of::<MegaStore>() == 40);
+
+/// Entries of `Vm::megas` and `Vm::mega_stores` past the first (a power of
+/// two; the stencils' `MEGAS`).
 const MEGAS: usize = 2048;
 
 /// [`MegaEntry`] `shape`/`name`'s index in `Vm::megas` (the stencils'
 /// `mega_index`).
 #[inline(always)]
 fn mega_index(shape: u64, name: u32) -> usize {
-    1 + ((shape >> 4) as u32 ^ name.wrapping_mul(0x9E37_79B1)) as usize % MEGAS
+    // (The product's top bits, which every bit of the shape and the name
+    // reach: shapes come at strides that left the low bits few values, and
+    // TypeScript's syntax tree's stores collided in three of four probes.)
+    1 + ((shape ^ (name as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MEGAS.trailing_zeros())) as usize
+}
+
+/// The other way of entry `k` of `Vm::mega_stores` (the stencils'
+/// `mega_pair`).
+#[inline(always)]
+fn mega_pair(k: usize) -> usize {
+    ((k - 1) ^ 1) + 1
 }
 
 /// [`LookupEntry::holder`] of a property no object on the chain has.
@@ -647,7 +691,9 @@ pub struct Vm {
     lookups: Box<[std::cell::Cell<LookupEntry>]>,
     /// See [`MegaEntry`].
     megas: Box<[MegaEntry]>,
-    /// Named-load cache slots (way 0's address) that met more receiver
+    /// See [`MegaStore`].
+    mega_stores: Box<[MegaStore]>,
+    /// Named-access cache slots (way 0's address) that met more receiver
     /// shapes than they have ways: compiled through `megas`, not a
     /// dispatch on the shapes the ways hold at the time.
     pub(crate) megamorphic: crate::jit::HashSet<usize>,
@@ -1014,6 +1060,7 @@ impl Vm {
             proto_epoch: 0,
             lookups: vec![std::cell::Cell::new(LookupEntry::EMPTY); LOOKUPS].into_boxed_slice(),
             megas: vec![MegaEntry::EMPTY; 1 + MEGAS].into_boxed_slice(),
+            mega_stores: vec![MegaStore::EMPTY; 1 + MEGAS].into_boxed_slice(),
             megamorphic: Default::default(),
             relied_slots: Default::default(),
             jitted: Vec::new(),
@@ -2020,6 +2067,65 @@ impl Vm {
         found
     }
 
+    /// The address of [`MegaStore`] table `Vm::mega_stores`.
+    pub(crate) fn mega_stores_addr(&self) -> u64 {
+        self.mega_stores.as_ptr() as u64
+    }
+
+    /// Note in `Vm::mega_stores` how `o.name` was just stored, `o` of
+    /// shape `old` before: as `set_named_miss` would cache it, for a plain
+    /// object (not a prototype, nor the global object), in place or by a
+    /// transition `old` made the new shape by.
+    pub(crate) fn mega_store_note(&mut self, o: Value, old: *const Shape, name: Atom) {
+        if !o.is_cell() || self.proxies_exist || !self.realms.is_empty() {
+            return;
+        }
+        let o = as_object(o);
+        unsafe {
+            if (*o).class != Class::Plain || (*o).flags & PROTOTYPE != 0 || o == self.global {
+                return;
+            }
+            let new = (*o).shape;
+            let e = if new == old {
+                let Some(slot) = (*old).lookup(name) else { return };
+                if (*old).field_cell(slot).is_constant() {
+                    return;
+                }
+                MegaStore {
+                    shape: old as u64,
+                    name: name.0,
+                    ft: (*old).field_type(slot).encode(),
+                    loc: (*old).location(slot),
+                    ..MegaStore::EMPTY
+                }
+            } else {
+                if (*old).unique || (*new).unique || (*new).parent != old {
+                    return;
+                }
+                let Some(slot) = (*new).lookup(name) else { return };
+                MegaStore {
+                    shape: old as u64,
+                    name: name.0,
+                    epoch: self.proto_epoch,
+                    ft: (*new).field_type(slot).encode(),
+                    new_shape: new as u64,
+                    loc: (*new).location(slot),
+                    _pad: 0,
+                }
+            };
+            self.mega_stores[0].new_shape = &raw const self.proto_epoch as u64;
+            // Two ways: the entry's own, and its neighbour's (`mega_pair`),
+            // which the entry there moves to (as JSC's megamorphic cache
+            // moves its primary entry to its secondary table).
+            let k = mega_index(old as u64, name.0);
+            let here = self.mega_stores[k];
+            if here.shape != 0 && (here.shape, here.name) != (e.shape, e.name) {
+                self.mega_stores[mega_pair(k)] = here;
+            }
+            self.mega_stores[k] = e;
+        }
+    }
+
     /// The address of [`MegaEntry`] table `Vm::megas`.
     pub(crate) fn megas_addr(&self) -> u64 {
         self.megas.as_ptr() as u64
@@ -2587,15 +2693,15 @@ impl Vm {
                 if (*o).flags & PROTOTYPE != 0 || !self.may_cache_store(o, slot) {
                     return Ok(());
                 }
-                install(
-                    ic,
-                    Ic {
-                        shape: old,
-                        holder: (*old).field_type(slot).encode() as *mut Object,
-                        loc: (*old).location(slot),
-                        ..Ic::EMPTY
-                    },
-                );
+                let e = Ic {
+                    shape: old,
+                    holder: (*old).field_type(slot).encode() as *mut Object,
+                    loc: (*old).location(slot),
+                    ..Ic::EMPTY
+                };
+                if install(ic, e) {
+                    self.megamorphic.insert(ic as usize);
+                }
                 return Ok(());
             }
             if (*o).flags & crate::object::NOT_EXTENSIBLE != 0 {
@@ -2609,16 +2715,16 @@ impl Vm {
             // past the constructor's slots (Box2D's `b2Contact.Reset`) missed
             // at every store, and compiled code left at each.)
             if !(*old).unique {
-                install(
-                    ic,
-                    Ic {
-                        shape: old,
-                        holder: (*new).field_type(slot).encode() as *mut Object,
-                        new_shape: new,
-                        loc: (*new).location(slot),
-                        epoch: self.proto_epoch,
-                    },
-                );
+                let e = Ic {
+                    shape: old,
+                    holder: (*new).field_type(slot).encode() as *mut Object,
+                    new_shape: new,
+                    loc: (*new).location(slot),
+                    epoch: self.proto_epoch,
+                };
+                if install(ic, e) {
+                    self.megamorphic.insert(ic as usize);
+                }
             }
         }
         Ok(())

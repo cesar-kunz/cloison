@@ -90,7 +90,15 @@ fn parts(o: *mut Object) -> Result<(Value, Value)> {
 }
 
 /// Handler `h`'s trap `name`, if it has one.
+/// Every internal method of a proxy looks its trap up first: a chain of
+/// proxies forwarding to their targets recurses through here, near the
+/// thread's stack's end a RangeError. (Not `Vm::native_limit`, the run's
+/// budget for compiled calls: a module namespace, a proxy, is read deep
+/// in a deep graph's evaluation.)
 fn trap(vm: &mut Vm, h: Value, name: &str) -> Result<Option<Value>> {
+    if crate::stack::low() {
+        return Err(Error::range_error("Maximum call stack size exceeded"));
+    }
     let a = vm.intern(name);
     let m = vm.get(h, a)?;
     if m.is_undefined() || m.is_null() {

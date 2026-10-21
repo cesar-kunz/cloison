@@ -1187,8 +1187,9 @@ fn set_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn set_symmetric_difference(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.symmetricDifference")?;
     let rec = set_record(vm, arg(a, 0))?;
+    let iterator = record_iterator(vm, &rec)?;
     let out = copy_set(vm, o)?;
-    record_keys(vm, &rec, |vm, v| {
+    each_key(vm, iterator, |vm, v| {
         if find(o, v).is_some() {
             set_remove_value(out, v);
         } else {

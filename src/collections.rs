@@ -1009,15 +1009,15 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
 /// `Map.groupBy(items, callback)`: a Map of arrays.
 fn map_group_by(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let out = object_value(new_collection(vm, Class::Map, Proto::Map)?);
-    let (a_get, a_set) = (vm.intern("get"), vm.intern("set"));
-    let (get, set) = (vm.get(out, a_get)?, vm.get(out, a_set)?);
+    // (Its data made directly, as the spec has it: not through `get` and
+    // `set`, which code may have replaced.)
     crate::props::group_by(vm, a, |vm, key, v| {
         // (-0 as +0, as `set` keeps it.)
         let key = if key.is_number() && key.to_number() == 0.0 { Value::from_i32(0) } else { key };
-        let mut group = call_function(vm, get, out, &[key])?;
+        let mut group = map_get(vm, out, &[key])?;
         if group.is_undefined() {
             group = vm.new_array();
-            call_function(vm, set, out, &[key, group])?;
+            map_set(vm, out, &[key, group])?;
         }
         array_push(vm, group, &[v])?;
         Ok(())

@@ -322,6 +322,10 @@ fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             let v = get(vm, o, i)?;
             if !v.is_undefined() && !v.is_null() {
                 out.extend(to_string_units(v));
+                // (Its exception stops the join: no next element read.)
+                if vm.conv_failed() {
+                    return Err(vm.take_conv_error());
+                }
             }
             i += 1.0;
         }
@@ -368,6 +372,9 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> R
                 }
                 let s = call_function(vm, f, v, &[])?;
                 out.extend(to_string_units(s));
+                if vm.conv_failed() {
+                    return Err(vm.take_conv_error());
+                }
             }
             i += 1.0;
         }
@@ -755,16 +762,22 @@ fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             if err.is_some() {
                 return false;
             }
-            if cmp.is_undefined() {
-                return to_string_units(x) > to_string_units(y);
-            }
-            match call_function(vm, cmp, Value::UNDEFINED, &[x, y]) {
-                Ok(r) => to_number(r) > 0.0,
-                Err(e) => {
-                    err = Some(e);
-                    false
+            // (A conversion's exception ends the sort as a comparator's.)
+            let r = if cmp.is_undefined() {
+                to_string_units(x) > to_string_units(y)
+            } else {
+                match call_function(vm, cmp, Value::UNDEFINED, &[x, y]) {
+                    Ok(r) => to_number(r) > 0.0,
+                    Err(e) => {
+                        err = Some(e);
+                        return false;
+                    }
                 }
+            };
+            if vm.conv_failed() {
+                err = Some(vm.take_conv_error());
             }
+            r
         };
         merge_sort(vm, &mut defined, &mut after);
         if let Some(e) = err {

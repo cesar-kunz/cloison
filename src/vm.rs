@@ -4436,7 +4436,13 @@ impl Vm {
                     }
                     self.constructing = false;
                     self.callee = o;
-                    return native(self, this, args);
+                    let r = native(self, this, args);
+                    // (Its conversion's exception thrown to its caller,
+                    // a native too, maybe: not left for it to go on.)
+                    if self.conv_failed() {
+                        return Err(self.take_conv_error());
+                    }
+                    return r;
                 }
             }
         }
@@ -4465,6 +4471,9 @@ impl Vm {
                     self.callee = o;
                     let r = native(self, Value::UNDEFINED, args);
                     self.constructing = false;
+                    if self.conv_failed() {
+                        return Err(self.take_conv_error());
+                    }
                     return r;
                 }
             }

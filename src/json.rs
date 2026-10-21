@@ -68,7 +68,11 @@ fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             } else if let Some(p) = wrapped(v)
                 && (p.is_number() || string_units(p).is_some())
             {
+                // (Its exception stops the operation: no next entry read.)
                 let u = to_string_units(v);
+                if vm.conv_failed() {
+                    return Err(vm.take_conv_error());
+                }
                 Some(vm.new_string(&u))
             } else {
                 None
@@ -90,6 +94,9 @@ fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         } else if string_units(p).is_some() {
             let u = to_string_units(space);
             space = vm.new_string(&u);
+        }
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
         }
     }
     if let Some(d) = space.as_number() {
@@ -138,6 +145,9 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         } else if !crate::symbol::is_symbol(p) {
             // (A boolean's or a BigInt's; a symbol's stays an object.)
             v = p;
+        }
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
         }
     }
     if is_raw_json(v) {

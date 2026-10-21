@@ -3240,6 +3240,12 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
     }
     unsafe {
         let vm = &mut *current_vm();
+        // An earlier conversion threw, its error not taken yet: no more of
+        // the operation's runs user code (`Math.atan2(x, y)` with `x`'s
+        // `valueOf` throwing doesn't call `y`'s), as it would have stopped.
+        if vm.conv_failed() {
+            return Value::UNDEFINED;
+        }
         if vm.to_primitive_defined {
             let fail = |vm: &mut Vm, e: Error| {
                 vm.conv_error.get_or_insert(e);

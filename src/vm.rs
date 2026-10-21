@@ -2003,11 +2003,12 @@ impl Vm {
                 // For the `array_push` stencils (see `Shape::push_key`).
                 if !s.unique && s.class == crate::object::Class::Array {
                     if s.elems == FieldType::None {
-                        let c = s.push_cache();
-                        c.to.rotate_right(1);
-                        c.to[0] = (crate::object::push_key(value), t as u64);
+                        s.with_push_cache(|c| {
+                            c.to.rotate_right(1);
+                            c.to[0] = (crate::object::push_key(value), t as u64);
+                        });
                     } else if elems == FieldType::Any {
-                        s.push_cache().any = t as u64;
+                        s.with_push_cache(|c| c.any = t as u64);
                     }
                 }
                 (*o).shape = t;

@@ -593,13 +593,19 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         unsafe {
             let (k, count) = (k as usize, count as usize);
             vm.reserve_elems(oo, count);
-            for i in 0..count {
-                let v = *(*obj).elems.add(k + i);
-                if v == Value::EMPTY {
-                    *(*oo).elems.add(i) = Value::EMPTY;
-                } else {
-                    vm.store_element(oo, i, v);
-                }
+            // The result takes the source's elements' type at once, which
+            // all the values fit: copied, not checked and stored one by one
+            // (PdfJS's `decrypt`, `decryptedString.slice(n)`, spent more there
+            // than in its loop).
+            let want = (*(*oo).shape).elems.join((*(*obj).shape).elems);
+            if want != (*(*oo).shape).elems {
+                (*oo).shape = vm.elements_transition((*oo).shape, want);
+            }
+            // (Numbers alone, no cells: nothing for the barrier to note.)
+            if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
+                std::ptr::copy_nonoverlapping((*obj).elems.add(k), (*oo).elems, count);
+            } else {
+                vm.store_elements(oo, 0, (*obj).elems.add(k), count);
             }
             (*oo).elems_len = count as u32;
         }

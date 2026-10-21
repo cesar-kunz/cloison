@@ -4371,6 +4371,37 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // `set_keyed_ap_` of an int32 `acc` (`_i`), the key in r11 / x15
+        // (`key_x`) and in memory too, for the helper: no barrier, no
+        // registers saved (PdfJS's `decrypt`, `decryptedString[i] = …`).
+        stencil_slow!("set_keyed_ap_i_", loc!($loc); |s| {
+            let key = key_x();
+            let o = get!($loc, s);
+            if is_array(s.tag, o) {
+                let p = o.to_bits() as *mut u8;
+                let i = key as u32;
+                let len = *(p.add(32) as *const u32);
+                if **(p as *const *const u64) <= 2 && (i < len || i == len && len < *(p.add(36) as *const u32)) {
+                    *(*(p.add(24) as *const *mut Value)).add(i as usize) =
+                        Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+                    if i == len {
+                        *(p.add(32) as *mut u32) = len + 1;
+                    }
+                    next!(s)
+                }
+            }
+            slow!(s)
+        }; |s| {
+            core::arch::asm!(concat!("/* set_keyed_ap_i_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let key = load_imm(s.regs as *mut u8);
+            let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            let args = [get!($loc, s), key, v];
+            let r = rt_call!(s, cloison_rt_set_keyed, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
+            if r == 0 {
+                exit!(s)
+            }
+            next!(s)
+        });
         set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= 2,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "o_", true, is_array, |s, v, code| code == 0 || code == *(v.to_bits() as *const u64), |s| s.acc);

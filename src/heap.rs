@@ -834,12 +834,19 @@ impl Heap {
 
     /// Room for `n` values, all `undefined`: the payload of an array cell.
     pub fn alloc_values(&mut self, n: usize) -> *mut Value {
+        self.alloc_values_from(n, 0)
+    }
+
+    /// [`Heap::alloc_values`], the values before `from` left for the caller
+    /// to write before anything can collect (a growing array's copied
+    /// elements: not written twice).
+    pub fn alloc_values_from(&mut self, n: usize, from: usize) -> *mut Value {
         let cap = u32::try_from(n).expect("array too large") as u64;
         let p = self.alloc((8 + 8 * n).next_multiple_of(GRANULE)).cast::<u64>();
         unsafe {
             *p = VALUES | cap << 32;
             let v = p.add(1).cast::<Value>();
-            for i in 0..n {
+            for i in from.min(n)..n {
                 v.add(i).write(Value::UNDEFINED);
             }
             v

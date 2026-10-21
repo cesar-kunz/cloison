@@ -3925,7 +3925,13 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 out.acc = I32;
                 (base, "ii")
             } else {
-                out.acc = Any;
+                // Two numbers: an int32 whatever they are (the generic
+                // stencil's, boxed, which is an int32 `acc` too), but for
+                // `>>>`'s uint32. Not a BigInt's, which needs a BigInt.
+                // (PdfJS's `decrypt`: `(... * c1 + c2) & 0xffff` of a
+                // product that overflowed left `r`, and the loop, untyped.)
+                let num = |t: Ty| matches!(t, I32 | F64);
+                out.acc = if num(st.acc) && num(reg) && insn.op != Op::ShiftRightLogical { I32 } else { Any };
                 (base, "")
             }
         }
@@ -4538,9 +4544,11 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 Ty::Obj(x) => Ty::Ext(x),
                 t => t,
             });
+            // (An int32 value with an int32 key: `set_keyed_ap_i`.)
+            let int = st.acc == I32 && st.regs.get(insn.reg2 as usize).copied() == Some(I32);
             return Sel {
                 ops: Some((8 * insn.reg2 as i32, 0, 0)),
-                ..Sel::new("set_keyed_ap", "", out)
+                ..Sel::new("set_keyed_ap", if int { "i" } else { "" }, out)
             };
         }
         // A number into a typed array of the kind the cache saw: stored as
@@ -4746,29 +4754,25 @@ const CODE_GUARD: u64 = 1;
 /// compiled yet that has it as an upvalue), or the declaring function makes
 /// a mapped `arguments` (whose elements are its parameters). Assigned
 /// unless shown otherwise; the answer "no" is kept, as it can't change.
-fn variable_assigned(vm: &crate::vm::Vm, code: *const crate::vm::Code, k: usize) -> bool {
+fn variable_assigned(vm: *mut crate::vm::Vm, code: *const crate::vm::Code, k: usize) -> bool {
+    let caches = unsafe { &mut (*vm).jit_caches };
+    if let Some(&a) = caches.assigned.get(&(code, k)) {
+        return a;
+    }
+    let a = variable_assigned_uncached(vm, code, k);
+    crate::vm::pin(code);
+    unsafe { (*vm).jit_caches.assigned.insert((code, k), a) };
+    a
+}
+
+fn variable_assigned_uncached(vm: *mut crate::vm::Vm, code: *const crate::vm::Code, k: usize) -> bool {
     use crate::vm::Code;
-    thread_local! {
-        static PARENTS: std::cell::RefCell<(usize, HashMap<usize, usize>)> = Default::default();
-        static CONSTANT: std::cell::RefCell<HashSet<(usize, usize)>> = Default::default();
-    }
-    if CONSTANT.with(|c| c.borrow().contains(&(code as usize, k))) {
-        return false;
-    }
+    // (The function `c` is nested in, among the VM's.)
     let parent = |c: *const Code| -> Option<*const Code> {
-        PARENTS.with(|p| {
-            let mut p = p.borrow_mut();
-            if p.0 != vm.codes.len() {
-                p.1.clear();
-                for c in &vm.codes {
-                    for &n in &c.closures {
-                        p.1.insert(n as usize, &**c as *const Code as usize);
-                    }
-                }
-                p.0 = vm.codes.len();
-            }
-            p.1.get(&(c as usize)).map(|&x| x as *const Code)
-        })
+        unsafe { &(*vm).codes }
+            .iter()
+            .find(|p| p.closures.contains(&c))
+            .map(|p| &**p as *const Code)
     };
     // The declaring function and the variable's register there.
     let (mut c, mut idx) = (code, k);
@@ -4780,7 +4784,7 @@ fn variable_assigned(vm: &crate::vm::Vm, code: *const crate::vm::Code, k: usize)
         }
         (c, idx) = (p, j as usize);
     };
-    if bytecode_facts(decl).0 {
+    if bytecode_facts(vm, decl).0 {
         return true;
     }
     // Down from it: each nested function's upvalues that are the variable.
@@ -4795,12 +4799,12 @@ fn variable_assigned(vm: &crate::vm::Vm, code: *const crate::vm::Code, k: usize)
         if !these.is_empty() {
             if unsafe { (*n).lazy.is_some() } {
                 // (Not compiled yet: compiled here, not installed.)
-                match lazy_writes(n) {
+                match lazy_writes(vm, n) {
                     Some(w) if !these.iter().any(|m| w.contains(m)) => continue,
                     _ => return true,
                 }
             }
-            if bytecode_facts(n).1.iter().any(|m| these.contains(m)) {
+            if bytecode_facts(vm, n).1.iter().any(|m| these.contains(m)) {
                 return true;
             }
         }
@@ -4811,38 +4815,31 @@ fn variable_assigned(vm: &crate::vm::Vm, code: *const crate::vm::Code, k: usize)
             stack.push((m, theirs));
         }
     }
-    CONSTANT.with(|c| c.borrow_mut().insert((code as usize, k)));
     false
 }
 
 /// What [`variable_assigned`] reads of `code`'s bytecode, decoded once:
 /// whether it makes a mapped `arguments`, and the upvalues it assigns.
-fn bytecode_facts(code: *const crate::vm::Code) -> std::rc::Rc<(bool, Vec<usize>)> {
-    thread_local! {
-        static FACTS: std::cell::RefCell<HashMap<usize, std::rc::Rc<(bool, Vec<usize>)>>> = Default::default();
+fn bytecode_facts(vm: *mut crate::vm::Vm, code: *const crate::vm::Code) -> Rc<(bool, Vec<usize>)> {
+    let caches = unsafe { &mut (*vm).jit_caches };
+    if let Some(f) = caches.facts.get(&code) {
+        return f.clone();
     }
-    FACTS.with(|f| {
-        f.borrow_mut()
-            .entry(code as usize)
-            .or_insert_with(|| {
-                let insns = decode(unsafe { &(*code).bytecode }, true);
-                let mapped = insns.iter().any(|i| i.op == Op::CreateMappedArguments);
-                let sta = insns.iter().filter(|i| i.op == Op::StaUpvalue).map(|i| i.imm as usize).collect();
-                std::rc::Rc::new((mapped, sta))
-            })
-            .clone()
-    })
+    let insns = decode(unsafe { &(*code).bytecode }, true);
+    let mapped = insns.iter().any(|i| i.op == Op::CreateMappedArguments);
+    let sta = insns.iter().filter(|i| i.op == Op::StaUpvalue).map(|i| i.imm as usize).collect();
+    let f = Rc::new((mapped, sta));
+    crate::vm::pin(code);
+    caches.facts.insert(code, f.clone());
+    f
 }
 
 /// The upvalues stub `code` (a function not compiled yet) assigns, from
 /// its source compiled here (not installed); `None` if a function nested
 /// in it may assign one of them, or it doesn't compile.
-fn lazy_writes(code: *const crate::vm::Code) -> Option<std::rc::Rc<Vec<usize>>> {
-    thread_local! {
-        static WRITES: std::cell::RefCell<HashMap<usize, Option<std::rc::Rc<Vec<usize>>>>> = Default::default();
-    }
-    if let Some(w) = WRITES.with(|w| w.borrow().get(&(code as usize)).cloned()) {
-        return w;
+fn lazy_writes(vm: *mut crate::vm::Vm, code: *const crate::vm::Code) -> Option<Rc<Vec<usize>>> {
+    if let Some(w) = unsafe { (*vm).jit_caches.lazy_writes.get(&code) } {
+        return w.clone();
     }
     let w = (|| {
         let module = crate::js::compile_lazy(unsafe { (*code).lazy.as_ref()? }).ok()?;
@@ -4855,10 +4852,76 @@ fn lazy_writes(code: *const crate::vm::Code) -> Option<std::rc::Rc<Vec<usize>>> 
         if nested.iter().any(|g| sta(g).iter().any(|&m| g.upvalues.get(m).is_none_or(|&(local, _)| !local))) {
             return None;
         }
-        Some(std::rc::Rc::new(sta(f0)))
+        Some(Rc::new(sta(f0)))
     })();
-    WRITES.with(|c| c.borrow_mut().insert(code as usize, w.clone()));
+    crate::vm::pin(code);
+    unsafe { (*vm).jit_caches.lazy_writes.insert(code, w.clone()) };
     w
+}
+
+/// Per register of `code` (decoded as `insns`), the int32 it always holds
+/// when read, if every write to it is a `Star` of that `LdaSmi` (none at a
+/// jump target) and nothing else names it but instructions reading it: a
+/// `var c1 = 52845` that is never assigned again (PdfJS's `decrypt`, whose
+/// constants took a register slot and a load in its loop). Not `this`, a
+/// parameter or a register closures capture, nor in a generator or an
+/// async function (whose frames are restored as they were).
+fn smi_registers(
+    vm: *mut crate::vm::Vm,
+    code: *const crate::vm::Code,
+    insns: &[Insn],
+    is_target: &[bool],
+) -> Rc<Vec<Option<i32>>> {
+    if let Some(v) = unsafe { (*vm).jit_caches.smis.get(&code) } {
+        return v.clone();
+    }
+    let c = unsafe { &*code };
+    let n = c.nregs as usize;
+    // Per register: no (None), the value so far (Some(Some(v))), unknown.
+    let mut val: Vec<Option<Option<i32>>> = vec![Some(None); n];
+    for r in 0..=(c.nparams as usize).min(n.saturating_sub(1)) {
+        val[r] = None;
+    }
+    for (r, cap) in captured_regs(code).into_iter().enumerate() {
+        if cap && r < n {
+            val[r] = None;
+        }
+    }
+    let ok = matches!(c.kind, 0..=3);
+    for (k, j) in insns.iter().enumerate() {
+        let r = j.reg as usize;
+        match j.op {
+            Op::Star if r < n => {
+                let lit = (k > 0 && !is_target[k] && !j.bail && insns[k - 1].op == Op::LdaSmi && !insns[k - 1].bail)
+                    .then(|| insns[k - 1].imm);
+                val[r] = match (val[r], lit) {
+                    (Some(None), Some(v)) => Some(Some(v)),
+                    (Some(Some(w)), Some(v)) if w == v => Some(Some(v)),
+                    _ => None,
+                };
+            }
+            Op::Mov => {
+                if (j.reg2 as usize) < n {
+                    val[j.reg2 as usize] = None;
+                }
+            }
+            Op::Ldar => {}
+            _ if j.bail && r < n => val[r] = None,
+            _ if j.reads_reg() || j.is_call() => {}
+            // (An instruction naming a register it may write.)
+            Op::CreateArguments | Op::CreateMappedArguments => {
+                if r < n {
+                    val[r] = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    let out: Vec<Option<i32>> = if ok { val.into_iter().map(Option::flatten).collect() } else { vec![None; n] };
+    let out = Rc::new(out);
+    crate::vm::pin(code);
+    unsafe { (*vm).jit_caches.smis.insert(code, out.clone()) };
+    out
 }
 
 /// Whether call `i` to `fo` is inlined for any closure of `fo`'s code, not
@@ -6467,6 +6530,13 @@ fn stencil_for(
         ("tset", _) => {
             pre.extend(key_pieces(homes, insn.reg2));
             cat!("tset_", sel.case, "_", loc)
+        }
+        // The key in r11 / x15 for `_i`, and in memory for its helper.
+        ("set_keyed_ap", _) if sel.case == "i" => {
+            let k = insn.reg2;
+            pre.extend(spill_piece(homes[k as usize], k));
+            pre.extend(key_pieces(homes, k));
+            cat!("set_keyed_ap_i_", loc)
         }
         ("set_keyed_ap", _) => {
             box_acc(&mut pre);
@@ -9499,6 +9569,16 @@ pub(crate) struct Caches {
     /// Per function, the registers live into each of its instructions, in
     /// its own frame (see [`Lowering::dead_after`]).
     reg_live: HashMap<*const crate::vm::Code, Rc<Vec<RegSet>>>,
+    /// Per (function, upvalue), whether code may assign the variable (see
+    /// [`variable_assigned`]); per function, what that reads of its
+    /// bytecode ([`bytecode_facts`]), and of a stub's
+    /// ([`lazy_writes`]); per function, its registers only ever set to one
+    /// int32 ([`smi_registers`]). (Here, the functions pinned: a freed
+    /// one's address may be another's.)
+    assigned: HashMap<(*const crate::vm::Code, usize), bool>,
+    facts: HashMap<*const crate::vm::Code, Rc<(bool, Vec<usize>)>>,
+    lazy_writes: HashMap<*const crate::vm::Code, Option<Rc<Vec<usize>>>>,
+    smis: HashMap<*const crate::vm::Code, Rc<Vec<Option<i32>>>>,
 }
 
 impl Caches {
@@ -12382,10 +12462,18 @@ impl Lowering<'_> {
         for j in insns.iter().filter(|j| j.jumps()) {
             is_target[j.target] = true;
         }
+        let smis = smi_registers(self.state.vm, f.code, insns, &is_target);
         for (k, orig) in insns.iter().enumerate() {
             start[k] = self.out.insns.len();
             let mut i = *orig;
             i.frame = frame as u8;
+            // A register only ever set to one int32 literal: read as it.
+            if i.op == Op::Ldar
+                && !i.bail
+                && let Some(&Some(v)) = smis.get(i.reg as usize)
+            {
+                (i.op, i.imm) = (Op::LdaSmi, v);
+            }
             let renamed = |r: u8| {
                 let r = (r as usize + base) as u8;
                 aliases.iter().find(|a| a.0 == r).map_or(r, |a| a.1)
@@ -13801,8 +13889,7 @@ impl Lowering<'_> {
         if !crate::props::is_object(v) {
             return None;
         }
-        let vm = unsafe { &*self.state.vm };
-        (!variable_assigned(vm, f.code, k)).then_some(v)
+        (!variable_assigned(self.state.vm, f.code, k)).then_some(v)
     }
 
     fn inline(&mut self, frame: usize, i: &Insn, fo: *mut Object, depth: usize) -> usize {

@@ -572,6 +572,8 @@ pub struct Vm {
     /// so that their addresses aren't reused.
     #[allow(clippy::vec_box)]
     zombies: Vec<Box<Shape>>,
+    /// Shapes made since a full marking last collected them.
+    shapes_made: usize,
     field_cells: Vec<Box<FieldCell>>,
     roots: HashMap<(Class, u64, u32), *const Shape>,
     /// Each atom's name, once (the map's key shares it).
@@ -955,6 +957,7 @@ impl Vm {
             shapes: Vec::new(),
             shape_set: Default::default(),
             zombies: Vec::new(),
+            shapes_made: 0,
             field_cells: Vec::new(),
             roots: HashMap::default(),
             atoms: Vec::new(),
@@ -1378,6 +1381,16 @@ impl Vm {
         self.shapes.len()
     }
 
+    /// Shapes made since a full marking last collected them (see
+    /// `gc::SHAPE_SWEEP_MIN`).
+    pub(crate) fn shapes_made(&self) -> usize {
+        self.shapes_made
+    }
+
+    pub(crate) fn reset_shapes_made(&mut self) {
+        self.shapes_made = 0;
+    }
+
     /// After a full marking: the constructor tracking for prototypes it
     /// left unmarked goes (their addresses may be reused), the others'
     /// root shapes are live.
@@ -1444,6 +1457,7 @@ impl Vm {
         b.mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed);
         self.shapes.push(b);
         self.shape_set.insert(p as usize);
+        self.shapes_made += 1;
         p
     }
 
@@ -1454,7 +1468,7 @@ impl Vm {
         if let Some(&s) = self.roots.get(&key) {
             // (Live in a full marking under way: it may go to a cache, not
             // an object, as `CreateObject`'s.)
-            unsafe { (*s).mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed) };
+            unsafe { crate::object::mark_shape(s) };
             return s;
         }
         if proto.is_cell() {
@@ -3713,6 +3727,8 @@ impl Vm {
                 let op = object_value(self.object_prototype);
                 (*ic).shape = self.root_shape(Class::Plain, op, n);
             }
+            // (Given to an object a full marking under way may not trace.)
+            crate::object::mark_shape((*ic).shape);
             object_value(self.heap.alloc_object(&*(*ic).shape))
         }
     }
@@ -4285,6 +4301,8 @@ impl Vm {
     /// `f.prototype` (or `Object.prototype` if that is not an object).
     pub(crate) fn construct_this(&mut self, f: *mut Object) -> Value {
         let s = self.ctor_root(f);
+        // (Given to an object a full marking under way may not trace.)
+        unsafe { crate::object::mark_shape(s) };
         object_value(self.heap.alloc_object(unsafe { &*s }))
     }
 

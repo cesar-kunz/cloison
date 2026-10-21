@@ -625,6 +625,22 @@ pub unsafe fn pin_shape(s: *const Shape) {
     unsafe { (*s).pinned.set(true) }
 }
 
+/// Shape `s` found live by a full marking under way (if any). The marker
+/// reads its mark for every object of it: written only if older.
+///
+/// # Safety
+/// `s` must be a live shape.
+#[inline]
+pub unsafe fn mark_shape(s: *const Shape) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let epoch = crate::gc::code_epoch();
+    unsafe {
+        if (*s).mark.load(Relaxed) < epoch {
+            (*s).mark.store(epoch, Relaxed);
+        }
+    }
+}
+
 /// Give object `o` shape `s`, which a full marking under way then finds
 /// live: `o` may have been traced with its old shape (the collector's
 /// barrier for shapes, which are Rust structures).
@@ -635,7 +651,7 @@ pub unsafe fn pin_shape(s: *const Shape) {
 pub unsafe fn set_shape(o: *mut Object, s: *const Shape) {
     unsafe {
         (*o).shape = s;
-        (*s).mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed);
+        mark_shape(s);
     }
 }
 

@@ -3806,7 +3806,14 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
             return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
         }
         if (*as_object(f)).class == Class::Native {
-            return vm.call_other(f, this, args);
+            let r = vm.call_other(f, this, args);
+            // (Its conversion's exception thrown to its caller, a native
+            // maybe: not left for it to go on. The interpreter's calls
+            // check after `call_other` themselves.)
+            if vm.conv_failed() {
+                return Err(vm.take_conv_error());
+            }
+            return r;
         }
         let top = vm.native_top;
         if top.is_null() {

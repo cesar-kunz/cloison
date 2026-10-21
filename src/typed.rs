@@ -145,6 +145,12 @@ pub(crate) fn buffer_of(o: *mut Object) -> *mut Object {
     unsafe { (*o).code as *mut Object }
 }
 
+/// Whether view `o`'s bytes are a shared buffer's, which other agents may
+/// access meanwhile (see `racy`).
+pub(crate) fn shares(o: *mut Object) -> bool {
+    crate::shared::is_shared(buffer_of(o))
+}
+
 /// A new buffer of `n` zero bytes (resizable up to `max` bytes, if given).
 pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Result<*mut Object> {
     let room = max.unwrap_or(n);
@@ -874,7 +880,7 @@ fn typed_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if n > 0 {
             unsafe {
                 let base = (*o).elems.cast::<u8>();
-                std::ptr::copy(base.add(from), base.add(to), n);
+                crate::racy::copy_if(shares(o), base.add(from), base.add(to), n);
             }
         }
     }
@@ -1127,7 +1133,8 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         let offset = offset as usize;
         if sk == k {
-            unsafe { std::ptr::copy((*s).elems.cast::<u8>(), (*o).elems.cast::<u8>().add(offset * k.size()), n * k.size()) };
+            let (from, to) = unsafe { ((*s).elems.cast::<u8>(), (*o).elems.cast::<u8>().add(offset * k.size())) };
+            unsafe { crate::racy::copy_if(shares(s) || shares(o), from, to, n * k.size()) };
             return Ok(Value::UNDEFINED);
         }
         // (Read them all first: the source may share the bytes.)
@@ -1177,7 +1184,7 @@ fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             unsafe {
                 let (from, to) = ((*o).elems.cast::<u8>().add(s * size), (*out).elems.cast::<u8>());
                 for b in 0..n.min(room) {
-                    *to.add(b) = *from.add(b);
+                    crate::racy::store::<1>(to.add(b), crate::racy::load::<1>(from.add(b)));
                 }
             }
         } else {

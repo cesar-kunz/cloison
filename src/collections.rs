@@ -955,7 +955,7 @@ fn view_get<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
     let size = VIEW_TYPES[T].1;
     let p = view_bytes(o, i, size)?;
     let mut b = [0u8; 8];
-    unsafe { std::ptr::copy_nonoverlapping(p, b.as_mut_ptr(), size) };
+    unsafe { crate::racy::copy(p, b.as_mut_ptr(), size) };
     if !little {
         b[..size].reverse();
     }
@@ -1002,7 +1002,7 @@ fn view_set<const T: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Val
     if !little {
         b[..size].reverse();
     }
-    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p, size) };
+    unsafe { crate::racy::copy(b.as_ptr(), p, size) };
     Ok(Value::UNDEFINED)
 }
 

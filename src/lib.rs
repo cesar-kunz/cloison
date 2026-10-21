@@ -22,6 +22,7 @@ mod symbol;
 mod iterator;
 mod typed;
 mod shared;
+mod racy;
 mod agent;
 mod temporal;
 mod dispose;

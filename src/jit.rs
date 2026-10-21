@@ -2549,6 +2549,43 @@ pub(crate) struct Feedback {
     pub constants: *const Value,
 }
 
+/// See the `SetNamed` case of `select_cached`: the transition adding
+/// `name` to plain objects of shape `s`, if `s` has one and no prototype of
+/// theirs has `name` as an accessor or read-only.
+fn exact_transition(s: u64, name: Atom) -> Option<Prop> {
+    use crate::object::{ACCESSOR, Class, READ_ONLY};
+    let vm = unsafe { &*crate::interp::current_vm() };
+    let shape = unsafe { &*(s as *const Shape) };
+    if shape.class != Class::Plain || shape.unique || vm.proxies_exist || shape.lookup(name).is_some() {
+        return None;
+    }
+    let new = (shape.transitions.borrow().iter()).find(|&&(a, attrs, _)| a == name && attrs == 0)?.2;
+    let mut p = shape.proto;
+    while p.is_cell() {
+        let ps = unsafe { &*(*crate::object::as_object(p)).shape };
+        if ps.class != Class::Plain {
+            return None;
+        }
+        if let Some(k) = ps.lookup(name) {
+            if ps.attrs[k as usize] & (ACCESSOR | READ_ONLY) != 0 {
+                return None;
+            }
+            break;
+        }
+        p = ps.proto;
+    }
+    let ns = unsafe { &*new };
+    let slot = ns.lookup(name)?;
+    let (oop, off) = split_location(ns.location(slot));
+    (off <= MAX_SLOT_OFF).then(|| Prop::Transition {
+        shape: s,
+        new_shape: new as u64,
+        off,
+        ft: ns.field_type_relied(slot),
+        oop,
+    })
+}
+
 /// A slot location (`Shape::location`) as `(out of line, byte offset)`.
 fn split_location(loc: i32) -> (bool, i32) {
     if loc >= 0 {
@@ -5269,6 +5306,21 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 }
             }
         }
+        // A store given up on (megamorphic) to an object whose shape is
+        // known exactly, adding the property: the transition its shape
+        // has, as its cache would have it (an inlined constructor's stores
+        // to `this`, after its allocation or the previous transition), its
+        // operands this one's. Not past a prototype's setter or read-only
+        // property (the code's prototype epoch holds that).
+        let (prop, derived) = match (prop, reg, spec.feedback) {
+            (Prop::Runtime, Ty::Obj(s), Some(fbs)) if !load && insn.op == Op::SetNamed => {
+                match exact_transition(s, fbs[insn.ic_frame()].name(insn)) {
+                    Some(p) => (p, true),
+                    None => (prop, false),
+                }
+            }
+            _ => (prop, false),
+        };
         // A site that gave up on the stencils: through the runtime, the name
         // an operand. A store may change the receiver's shape (only: it
         // leaves where it would call a setter, or store to a prototype),
@@ -5414,9 +5466,9 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             }
             _ => bail(out),
         };
-        // The instruction's cache holds the other cases too: the operands
-        // are this one's.
-        if collapsed && sel.base != "bail" {
+        // The instruction's cache holds the other cases too, or none (a
+        // derived transition): the operands are this one's.
+        if (collapsed || derived) && sel.base != "bail" {
             sel.ops = prop.operands();
         }
         sel

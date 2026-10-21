@@ -69,7 +69,7 @@
 //! to `acc`, boxed. Stencils reading an int32 `acc` use only its low 32
 //! bits, so a boxed int32 is a valid int32 `acc` too.
 
-#![feature(explicit_tail_calls, rust_preserve_none_cc, cold_path)]
+#![feature(explicit_tail_calls, rust_preserve_none_cc)]
 #![cfg_attr(target_arch = "x86_64", feature(asm_goto_with_outputs))]
 #![allow(incomplete_features, non_snake_case, unused_unsafe, clippy::missing_safety_doc)]
 
@@ -5562,27 +5562,29 @@ const FIRST_ELEMENTS: usize = 4;
 /// (`VALUES`, the capacity) and the values.
 #[inline(always)]
 unsafe fn first_elements(o: *mut u8) {
-    if (*header(o)).elems_cap != 0 {
-        return;
+    unsafe {
+        if (*header(o)).elems_cap != 0 {
+            return;
+        }
+        let heap = imm64() as *mut HeapPtrs;
+        if heap.is_null() {
+            return;
+        }
+        let Some(p) = bump(heap, 1 + FIRST_ELEMENTS) else { return };
+        *p = VALUES | (FIRST_ELEMENTS as u64) << 32;
+        let p = p.add(1);
+        // Volatile: LLVM would vectorize the stores from a constant pool,
+        // which a stencil can't refer to.
+        for k in 0..FIRST_ELEMENTS {
+            p.add(k).write_volatile(Value::UNDEFINED.to_bits());
+        }
+        (*header(o)).elems = p.cast();
+        // (A young array: only an old array needs the card.)
+        if meta_of(o as usize) != YOUNG {
+            card_mark(o);
+        }
+        (*header(o)).elems_cap = FIRST_ELEMENTS as u32;
     }
-    let heap = imm64() as *mut HeapPtrs;
-    if heap.is_null() {
-        return;
-    }
-    let Some(p) = bump(heap, 1 + FIRST_ELEMENTS) else { return };
-    *p = VALUES | (FIRST_ELEMENTS as u64) << 32;
-    let p = p.add(1);
-    // Volatile: LLVM would vectorize the stores from a constant pool,
-    // which a stencil can't refer to.
-    for k in 0..FIRST_ELEMENTS {
-        p.add(k).write_volatile(Value::UNDEFINED.to_bits());
-    }
-    (*header(o)).elems = p.cast();
-    // (A young array: only an old array needs the card.)
-    if meta_of(o as usize) != YOUNG {
-        card_mark(o);
-    }
-    (*header(o)).elems_cap = FIRST_ELEMENTS as u32;
 }
 
 /// For a push of `v` that doesn't fit the elements of an array of `shape`
@@ -5592,41 +5594,45 @@ unsafe fn first_elements(o: *mut u8) {
 /// number generalizes them to numbers, which is left to the runtime.
 #[inline(always)]
 unsafe fn push_transition(tag: NumberTag, shape: *const ShapeHead, v: Value) -> u64 {
-    let code = (*shape).elems_code;
-    let cache = (*shape).push;
-    if cache.is_null() {
-        return 0;
-    }
-    let number = v.to_bits() & tag.to_bits() != 0;
-    if code == NO_ELEMENTS {
-        // `object::push_key`.
-        let key = if tag.is_int32(v) {
-            FIELD_INT
-        } else if number {
-            FIELD_NUM
-        } else if is_cell(tag, v) {
-            (*cell(v)).shape
+    unsafe {
+        let code = (*shape).elems_code;
+        let cache = (*shape).push;
+        if cache.is_null() {
+            return 0;
+        }
+        let number = v.to_bits() & tag.to_bits() != 0;
+        if code == NO_ELEMENTS {
+            // `object::push_key`.
+            let key = if tag.is_int32(v) {
+                FIELD_INT
+            } else if number {
+                FIELD_NUM
+            } else if is_cell(tag, v) {
+                (*cell(v)).shape
+            } else {
+                FIELD_ANY
+            };
+            push_target(cache, key)
+        } else if code == FIELD_INT && number || code == FIELD_ANY {
+            0
         } else {
-            FIELD_ANY
-        };
-        push_target(cache, key)
-    } else if code == FIELD_INT && number || code == FIELD_ANY {
-        0
-    } else {
-        (*cache).any
+            (*cache).any
+        }
     }
 }
 
 /// The shape `cache.to` moves an array to for a value of key `key`, or 0.
 #[inline(always)]
 unsafe fn push_target(cache: *const PushCache, key: u64) -> u64 {
-    let mut to = 0;
-    for k in 0..PUSH_WAYS {
-        if to == 0 && (*cache).to[k].0 == key {
-            to = (*cache).to[k].1;
+    unsafe {
+        let mut to = 0;
+        for k in 0..PUSH_WAYS {
+            if to == 0 && (*cache).to[k].0 == key {
+                to = (*cache).to[k].1;
+            }
         }
+        to
     }
-    to
 }
 
 /// `o[key] = v` for an object `o` whose elements' type
@@ -6248,7 +6254,7 @@ rx!(rx_end_m; |s, end, pos, bt, regs, ctx| {
     rx_fail!(s, end, pos, bt, regs, ctx)
 });
 
-/// `\b` (`imm` 1) or `\B` (0).
+// `\b` (`imm` 1) or `\B` (0).
 rx!(rx_boundary; |s, end, pos, bt, regs, ctx| {
     let a = pos > 0 && rx_word(*s.add(pos - 1));
     let b = pos < end && rx_word(*s.add(pos));
@@ -6258,13 +6264,13 @@ rx!(rx_boundary; |s, end, pos, bt, regs, ctx| {
     rx_fail!(s, end, pos, bt, regs, ctx)
 });
 
-/// A choice point: on, and on backtracking at the address `imm64`.
+// A choice point: on, and on backtracking at the address `imm64`.
 rx!(rx_split; |s, end, pos, bt, regs, ctx| {
     rx_push!(bt, ctx, imm64() as usize, pos);
     rx_next!(s, end, pos, bt, regs, ctx)
 });
 
-/// Register `imm` takes the position.
+// Register `imm` takes the position.
 rx!(rx_mark; |s, end, pos, bt, regs, ctx| {
     let r = imm() as u32 as usize;
     rx_push!(bt, ctx, rx::TAG | r, *regs.add(r));
@@ -6272,7 +6278,7 @@ rx!(rx_mark; |s, end, pos, bt, regs, ctx| {
     rx_next!(s, end, pos, bt, regs, ctx)
 });
 
-/// Register `imm` takes 0.
+// Register `imm` takes 0.
 rx!(rx_zero; |s, end, pos, bt, regs, ctx| {
     let r = imm() as u32 as usize;
     rx_push!(bt, ctx, rx::TAG | r, *regs.add(r));
@@ -6280,8 +6286,8 @@ rx!(rx_zero; |s, end, pos, bt, regs, ctx| {
     rx_next!(s, end, pos, bt, regs, ctx)
 });
 
-/// The group at register `imm & 0xFFFF` matched from register `imm >> 16`'s
-/// position to here.
+// The group at register `imm & 0xFFFF` matched from register `imm >> 16`'s
+// position to here.
 rx!(rx_save; |s, end, pos, bt, regs, ctx| {
     let k = imm() as u32 as usize;
     let (g, r) = (k & 0xFFFF, k >> 16);
@@ -6292,7 +6298,7 @@ rx!(rx_save; |s, end, pos, bt, regs, ctx| {
     rx_next!(s, end, pos, bt, regs, ctx)
 });
 
-/// The groups at registers `imm & 0xFFFF` up to `imm >> 16` are cleared.
+// The groups at registers `imm & 0xFFFF` up to `imm >> 16` are cleared.
 rx!(rx_clear; |s, end, pos, bt, regs, ctx| {
     let k = imm() as u32 as usize;
     let (mut g, hi) = (k & 0xFFFF, k >> 16);
@@ -6307,8 +6313,8 @@ rx!(rx_clear; |s, end, pos, bt, regs, ctx| {
     rx_next!(s, end, pos, bt, regs, ctx)
 });
 
-/// A counted repetition's head (`*imm64`, an `rx::Head`), greedy: into the
-/// body (next) first.
+// A counted repetition's head (`*imm64`, an `rx::Head`), greedy: into the
+// body (next) first.
 rx!(rx_head; |s, end, pos, bt, regs, ctx| {
     let h = &*(imm64() as *const rx::Head);
     let count = *regs.add(h.c);
@@ -6325,7 +6331,7 @@ rx!(rx_head; |s, end, pos, bt, regs, ctx| {
     rx_fail!(s, end, pos, bt, regs, ctx)
 });
 
-/// The same, lazy: out first.
+// The same, lazy: out first.
 rx!(rx_lazy_head; |s, end, pos, bt, regs, ctx| {
     let h = &*(imm64() as *const rx::Head);
     let count = *regs.add(h.c);
@@ -6342,10 +6348,10 @@ rx!(rx_lazy_head; |s, end, pos, bt, regs, ctx| {
     rx_fail!(s, end, pos, bt, regs, ctx)
 });
 
-/// A counted repetition's body done, having started at register
-/// `imm >> 16`'s position, its count in register `imm & 0xFFFF`: an empty
-/// iteration past the minimum (`imm64`) fails; otherwise the count goes up,
-/// and on to the head (the continuation).
+// A counted repetition's body done, having started at register
+// `imm >> 16`'s position, its count in register `imm & 0xFFFF`: an empty
+// iteration past the minimum (`imm64`) fails; otherwise the count goes up,
+// and on to the head (the continuation).
 rx!(rx_tail; |s, end, pos, bt, regs, ctx| {
     let k = imm() as u32 as usize;
     let (c, p) = (k & 0xFFFF, k >> 16);
@@ -6358,8 +6364,8 @@ rx!(rx_tail; |s, end, pos, bt, regs, ctx| {
     rx_next!(s, end, pos, bt, regs, ctx)
 });
 
-/// A greedy run backtracking: one unit fewer, again while past the limit
-/// below its entry; on at what follows the run (the continuation).
+// A greedy run backtracking: one unit fewer, again while past the limit
+// below its entry; on at what follows the run (the continuation).
 rx!(rx_back; |s, end, pos, bt, regs, ctx| {
     let p = pos - 1;
     if p > *bt.sub(1) {

@@ -115,7 +115,12 @@ fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]
         "--crate-name=cloison_stencils",
     ])
     .args(["-Copt-level=3", "-Cpanic=abort", "-Ccodegen-units=1"])
-    .args(["-Crelocation-model=static", "-Ccode-model=small"]);
+    .args(["-Crelocation-model=static", "-Ccode-model=small"])
+    // Cargo doesn't show a build script's compiler warnings: as errors,
+    // they can't pile up unseen (the nightly is pinned, so new lints come
+    // with a deliberate bump). Edition 2024 warns of an unsafe operation
+    // outside an `unsafe` block in an `unsafe fn`.
+    .arg("-Dwarnings");
     // Darwin's default CPU is the host's (`apple-m1`), whose scheduling
     // model orders instructions differently; `generic` is Linux's default,
     // so the stencils come out the same bytes on both.

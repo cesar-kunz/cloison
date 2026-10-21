@@ -3426,7 +3426,7 @@ pub(crate) fn to_number(v: Value) -> f64 {
 /// exponent), `0x`/`0o`/`0b` integers, or `Infinity`; empty is 0, anything
 /// else NaN.
 pub(crate) fn string_to_number(s: &str) -> f64 {
-    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let t = s.trim_matches(|c: char| c <= '\u{FFFF}' && crate::builtins::is_space(c as u16));
     if t.is_empty() {
         return 0.0;
     }

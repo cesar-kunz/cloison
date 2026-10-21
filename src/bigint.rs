@@ -478,7 +478,7 @@ impl Big {
     /// StringToBigInt: whitespace around an optional sign and decimal
     /// digits, or `0x`/`0o`/`0b` digits; empty is 0n; else `None`.
     pub(crate) fn parse(s: &str) -> Option<Big> {
-        let s = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+        let s = s.trim_matches(|c: char| c <= '\u{FFFF}' && crate::builtins::is_space(c as u16));
         if s.is_empty() {
             return Some(Big::zero());
         }

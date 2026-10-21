@@ -7784,3 +7784,16 @@ r.join();
 "#;
     assert_eq!(value(src), "SyntaxError,true");
 }
+
+/// StringToNumber and StringToBigInt trim ECMAScript's white space and
+/// line terminators: not U+0085, but U+FEFF.
+#[test]
+fn numeric_strings_trim_only_ecmascript_white_space() {
+    let src = r#"
+var r = [String(Number('\u00851\u0085')), String(Number('﻿1　')), String(Number(' 1\t'))];
+try { r.push(BigInt('\u00851\u0085')); } catch (e) { r.push(e.name); }
+r.push(BigInt('﻿2 '));
+r.join();
+"#;
+    assert_eq!(value(src), "NaN,1,1,SyntaxError,2");
+}

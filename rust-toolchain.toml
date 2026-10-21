@@ -1,4 +1,8 @@
 [toolchain]
-channel = "nightly"
+# Pinned: the stencils are LLVM's machine code, so a toolchain update
+# changes them. Bump it on purpose: build (build/verify.rs checks every
+# stencil), compare `scripts/stencil-snapshot.sh` snapshots of both
+# toolchains, run the tests on both targets and Octane.
+channel = "nightly-2026-10-06"
 components = ["rustfmt", "clippy"]
 targets = ["aarch64-unknown-linux-musl"]

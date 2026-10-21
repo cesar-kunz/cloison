@@ -565,6 +565,13 @@ const STACK_VALUES: usize = 1 << 18;
 pub struct Vm {
     pub heap: Heap,
     shapes: Vec<Box<Shape>>,
+    /// The shapes' addresses (to tell a shape among compiled code's
+    /// constants: see `jit`).
+    pub(crate) shape_set: crate::jit::HashSet<usize>,
+    /// Shapes a full marking found dead (see [`Vm::sweep_shapes`]): kept,
+    /// so that their addresses aren't reused.
+    #[allow(clippy::vec_box)]
+    zombies: Vec<Box<Shape>>,
     field_cells: Vec<Box<FieldCell>>,
     roots: HashMap<(Class, u64, u32), *const Shape>,
     /// Each atom's name, once (the map's key shares it).
@@ -946,6 +953,8 @@ impl Vm {
         let mut vm = Vm {
             heap: Heap::new(),
             shapes: Vec::new(),
+            shape_set: Default::default(),
+            zombies: Vec::new(),
             field_cells: Vec::new(),
             roots: HashMap::default(),
             atoms: Vec::new(),
@@ -1328,8 +1337,8 @@ impl Vm {
 
     /// Shapes made so far and the bytes they take with their slot vectors,
     /// transitions and field cells; codes, the bytes they take, and those
-    /// of them pinned (`CLOISON_SIZES`).
-    pub fn memory_stats(&self) -> [usize; 5] {
+    /// of them pinned; zombie shapes (`CLOISON_SIZES`).
+    pub fn memory_stats(&self) -> [usize; 6] {
         // (Each slot table once.)
         let mut tables: crate::jit::HashSet<usize> = Default::default();
         let shape_bytes: usize = self
@@ -1346,7 +1355,81 @@ impl Vm {
             + self.field_cells.len() * size_of::<FieldCell>();
         let code_bytes = self.codes.iter().map(|c| c.footprint()).sum();
         let pinned = self.codes.iter().filter(|c| c.pinned.get()).count();
-        [self.shapes.len(), shape_bytes, self.codes.len(), code_bytes, pinned]
+        [self.shapes.len(), shape_bytes, self.codes.len(), code_bytes, pinned, self.zombies.len()]
+    }
+
+    /// The shapes the VM's tables hold: each realm's intrinsics'.
+    pub(crate) fn fixed_shapes(&self) -> Vec<*const Shape> {
+        let mut out = vec![self.string_shape];
+        crate::realm::current_shapes(self, &mut out);
+        for r in &self.realms {
+            r.shapes(&mut out);
+        }
+        out.retain(|s| !s.is_null());
+        out
+    }
+
+    /// The shapes made, by index (for the collector).
+    pub(crate) fn shape_at(&self, i: usize) -> &Shape {
+        &self.shapes[i]
+    }
+
+    pub(crate) fn shape_count(&self) -> usize {
+        self.shapes.len()
+    }
+
+    /// After a full marking: the constructor tracking for prototypes it
+    /// left unmarked goes (their addresses may be reused), the others'
+    /// root shapes are live.
+    pub(crate) fn sweep_ctor_protos(&mut self, live: impl Fn(usize) -> bool) {
+        let epoch = crate::gc::code_epoch();
+        self.ctor_protos.retain(|&p, e| {
+            if !live(p as usize) {
+                return false;
+            }
+            let s = e.root.get();
+            if !s.is_null() {
+                unsafe { (*s).mark.store(epoch, std::sync::atomic::Ordering::Relaxed) };
+            }
+            true
+        });
+    }
+
+    /// After a full marking, the shapes it didn't find live, nor were made
+    /// or given to an object since it began, nor are pinned: no object has
+    /// one or can be given one (no live shape has a transition to it, no
+    /// cache or table holds it, compiled code doesn't make it). Each becomes
+    /// a zombie: its transitions, push cache and prototype dropped (the
+    /// prototype may die), its capacity impossible, kept so that its
+    /// address isn't reused, for compiled code and the JIT's records may
+    /// still compare a shape with it (never equal now) or read its slots.
+    pub(crate) fn sweep_shapes(&mut self, from: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let live = |s: *const Shape| unsafe { (*s).pinned.get() || (*s).mark.load(Relaxed) >= from };
+        let (keep, dead): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.shapes).into_iter().partition(|s| live(&**s));
+        self.shapes = keep;
+        if dead.is_empty() {
+            return;
+        }
+        for s in &self.shapes {
+            s.transitions.borrow_mut().retain(|&(_, _, t)| live(t));
+            s.elem_transitions.borrow_mut().retain(|&(_, t)| live(t));
+        }
+        self.roots.retain(|_, s| live(*s));
+        for mut z in dead {
+            self.shape_set.remove(&(&*z as *const Shape as usize));
+            z.proto = Value::NULL;
+            // (`Shape::is_zombie`.)
+            z.capacity.set(u32::MAX);
+            z.transitions.take();
+            z.elem_transitions.take();
+            let p = z.push.replace(std::ptr::null_mut());
+            if !p.is_null() {
+                drop(unsafe { Box::from_raw(p) });
+            }
+            self.zombies.push(z);
+        }
     }
 
     pub(crate) fn add_shape(&mut self, s: Shape) -> *const Shape {
@@ -1357,7 +1440,10 @@ impl Vm {
         if b.family.is_null() {
             b.family = p;
         }
+        // (Live in a full marking under way: no object it finds has it yet.)
+        b.mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed);
         self.shapes.push(b);
+        self.shape_set.insert(p as usize);
         p
     }
 
@@ -1366,6 +1452,9 @@ impl Vm {
     pub(crate) fn root_shape(&mut self, class: Class, proto: Value, capacity: u32) -> *const Shape {
         let key = (class, proto.to_bits(), capacity);
         if let Some(&s) = self.roots.get(&key) {
+            // (Live in a full marking under way: it may go to a cache, not
+            // an object, as `CreateObject`'s.)
+            unsafe { (*s).mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed) };
             return s;
         }
         if proto.is_cell() {
@@ -1393,6 +1482,9 @@ impl Vm {
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
             parent: std::ptr::null(),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
         });
         self.roots.insert(key, s);
         s
@@ -1420,6 +1512,9 @@ impl Vm {
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
             parent: std::ptr::null(),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
         })
     }
 
@@ -1468,6 +1563,9 @@ impl Vm {
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
             parent: s,
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
         });
         if !s.unique {
             self.shape_left_stable(s);
@@ -1504,8 +1602,11 @@ impl Vm {
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
             parent: s,
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
             };
-            (*o).shape = self.add_shape(u);
+            crate::object::set_shape(o, self.add_shape(u));
         }
     }
 
@@ -1570,7 +1671,7 @@ impl Vm {
             if slot >= ns.capacity.get() {
                 self.reserve_props(o, slot - ns.capacity.get());
             }
-            (*o).shape = new;
+            crate::object::set_shape(o, new);
             self.store_field(o, slot, value);
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
@@ -1894,6 +1995,9 @@ impl Vm {
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
             parent: s,
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
         });
         if !s.unique {
             self.shape_left_stable(s);
@@ -1921,7 +2025,7 @@ impl Vm {
                         s.with_push_cache(|c| c.any = t as u64);
                     }
                 }
-                (*o).shape = t;
+                crate::object::set_shape(o, t);
             }
             *(*o).elems.add(i) = value;
             crate::heap::barrier((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), value);
@@ -1976,6 +2080,12 @@ impl Vm {
             slot: found.map_or(u32::MAX, |f| f.1),
         });
         found
+    }
+
+    /// The megamorphic store table's entries (the first holds the
+    /// prototype epoch's address in `new_shape`).
+    pub(crate) fn mega_store_entries(&self) -> &[MegaStore] {
+        &self.mega_stores[1..]
     }
 
     /// The address of [`MegaStore`] table `Vm::mega_stores`.
@@ -2720,8 +2830,11 @@ impl Vm {
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
             parent: s,
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
                 };
-                (*o).shape = self.add_shape(u);
+                crate::object::set_shape(o, self.add_shape(u));
                 self.bump_code_epoch();
                 if (*o).flags & PROTOTYPE != 0 {
                     self.proto_epoch = self.proto_epoch.wrapping_add(1);
@@ -3100,9 +3213,12 @@ impl Vm {
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
                 parent: s,
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
             };
             let new = self.add_shape(u);
-            (*o).shape = new;
+            crate::object::set_shape(o, new);
             for (k, v) in values.into_iter().enumerate() {
                 let at = Object::slot(o, (*new).location(k as u32));
                 // (Out of line, a `Num` field may still hold an int32.)
@@ -3591,7 +3707,9 @@ impl Vm {
     pub fn create_object(&mut self, code: &Code, ic: u16, n: u32) -> Value {
         let (ic, _) = code.ic(ic);
         unsafe {
-            if (*ic).shape.is_null() {
+            // (Or made again if no object had it at a full collection:
+            // `Vm::sweep_shapes` left it a zombie.)
+            if (*ic).shape.is_null() || (*(*ic).shape).is_zombie() {
                 let op = object_value(self.object_prototype);
                 (*ic).shape = self.root_shape(Class::Plain, op, n);
             }
@@ -4135,6 +4253,9 @@ impl Vm {
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
                 parent: s,
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
             });
             // Out-of-line room for the slots past the object's capacity.
             let cap = (*new).capacity.get() as usize;
@@ -4148,7 +4269,7 @@ impl Vm {
                 crate::heap::barrier_young(o.cast(), &raw const (*o).props);
                 (*o).props_cap = want as u32;
             }
-            (*o).shape = new;
+            crate::object::set_shape(o, new);
             let first = n - names.len();
             for (k, &v) in values.iter().enumerate() {
                 self.store_field(o, (first + k) as u32, v);

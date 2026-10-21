@@ -602,6 +602,41 @@ pub struct Shape {
     /// own for an object), null for a root: objects that leave this one
     /// leave it too.
     pub(crate) parent: *const Shape,
+    /// The latest full marking that found it live ([`crate::gc::code_epoch`],
+    /// as `Code::mark`): an object of it was traced, it was made or given
+    /// to an object since the marking began ([`set_shape`]), a live shape
+    /// was made from it. One a full marking leaves older is dead: a
+    /// zombie (see `Vm::sweep_shapes`).
+    pub(crate) mark: std::sync::atomic::AtomicU32,
+    /// The final pause that marked its prototype (and its ancestors'), by
+    /// the marking's epoch (see `gc::trace_shape`).
+    pub(crate) traced: Cell<u32>,
+    /// Live whatever the marking finds: compiled code gives it to objects
+    /// (an allocation's or a transition's constant, a `new`'s `this`).
+    pub(crate) pinned: Cell<bool>,
+}
+
+/// Keep shape `s` live for good: compiled code gives it to objects.
+///
+/// # Safety
+/// `s` must be a live shape.
+#[inline]
+pub unsafe fn pin_shape(s: *const Shape) {
+    unsafe { (*s).pinned.set(true) }
+}
+
+/// Give object `o` shape `s`, which a full marking under way then finds
+/// live: `o` may have been traced with its old shape (the collector's
+/// barrier for shapes, which are Rust structures).
+///
+/// # Safety
+/// `o` must be an object and `s` a live shape.
+#[inline]
+pub unsafe fn set_shape(o: *mut Object, s: *const Shape) {
+    unsafe {
+        (*o).shape = s;
+        (*s).mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Property attributes: not writable, not enumerable, not configurable
@@ -842,6 +877,12 @@ impl Shape {
         self.slots.lookup(name)
     }
 
+    /// Whether a full collection found no object could have it (see
+    /// `Vm::sweep_shapes`).
+    pub fn is_zombie(&self) -> bool {
+        self.capacity.get() == u32::MAX
+    }
+
     /// The property in each slot.
     pub fn keys(&self) -> &[Atom] {
         self.slots.keys()
@@ -943,6 +984,9 @@ mod tests {
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
             parent: std::ptr::null(),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
         };
         assert_eq!(s.location(0), 48);
         assert_eq!(s.location(1), 56);

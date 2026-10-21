@@ -328,6 +328,44 @@ unsafe fn mark_function_code(p: usize, w: u64) {
     }
 }
 
+/// If the cell at `p` (header word `w`), marked, is an object: its shape
+/// and those it was made from found live, their prototypes traced (see
+/// `Shape::mark`). Shapes aren't roots: an object's shape and prototype
+/// are kept by the object. (Not in [`trace`]: card scanning traces dead
+/// cells too.)
+#[inline(always)]
+unsafe fn mark_object_shape(v: &mut impl Visit, w: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if w & 1 != 0 {
+        return;
+    }
+    let epoch = code_epoch();
+    let mut s = w as *const crate::object::Shape;
+    unsafe {
+        while !s.is_null() && (*s).mark.load(Relaxed) < epoch {
+            (*s).mark.store(epoch, Relaxed);
+            v.value((*s).proto);
+            s = (*s).parent;
+        }
+    }
+}
+
+/// Live shape `s` and those it was made from: their prototypes marked,
+/// once in the final pause of the marking `epoch` (see `Shape::traced`).
+unsafe fn trace_shape(m: &mut impl Visit, mut s: *const crate::object::Shape, epoch: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    unsafe {
+        while !s.is_null() && (*s).traced.get() != epoch {
+            (*s).traced.set(epoch);
+            if (*s).mark.load(Relaxed) < epoch {
+                (*s).mark.store(epoch, Relaxed);
+            }
+            m.value((*s).proto);
+            s = (*s).parent;
+        }
+    }
+}
+
 /// What tracing a cell does with each reference it finds.
 trait Visit {
     /// The cell at `p`.
@@ -573,6 +611,9 @@ impl Marking<'_> {
                 let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                 if from == 0 {
                     mark_function_code(p, w);
+                    if self.mode.kind != Kind::Minor {
+                        mark_object_shape(self, w);
+                    }
                     let size = cell_size(p as *const u8);
                     *crate::heap::meta(p + size - GRANULE) |= END;
                     self.marked += size;
@@ -747,6 +788,9 @@ unsafe fn trace_shared(
                     n += 1;
                     let w = *(p as *const u64);
                     mark_function_code(p, w);
+                    if mode.kind != Kind::Minor {
+                        mark_object_shape(&mut cm, w);
+                    }
                     let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                     if slots > SLICE_SLOTS {
                         trace(&mut cm, p, p + 8, p + 8 + 8 * SLICE_SLOTS);
@@ -1240,6 +1284,11 @@ impl Vm {
             self.condemned.clear();
             self.heap.gc.codes_from = CODE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             self.heap.gc.code_at_start = CODE_BYTES.with(|c| c.get());
+            // Compiled code may give an object a shape a cache holds now,
+            // and the cache drop it before the final pause: they are live.
+            if kind == Collection::Start {
+                self.mark_cached_shapes();
+            }
         } else if self.heap.gc.sweeping {
             self.heap.absorb_sweep();
         }
@@ -1321,7 +1370,7 @@ impl Vm {
                 self.heap.check_barriers();
             }
             if full {
-                self.mark_live_codes(&mut m, sp, regs);
+                self.mark_live_codes_and_shapes(&mut m, sp, regs);
             }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
@@ -1337,6 +1386,7 @@ impl Vm {
                 _ => self.heap.free_young(check),
             };
             if full {
+                self.sweep_shapes_after(color);
                 self.condemn_codes();
             }
             times[3] = lap();
@@ -1572,7 +1622,8 @@ impl Vm {
     /// closure of it traced or made, it loaded), and with them the
     /// functions nested in them, which they make closures of. Mark what
     /// the live ones refer to, and what that reaches, until no more are.
-    unsafe fn mark_live_codes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
+    /// `done`: the codes whose references are marked already, by index.
+    unsafe fn mark_live_codes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value, done: &mut Vec<bool>) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
         unsafe {
@@ -1587,7 +1638,7 @@ impl Vm {
                 }
             }
         }
-        let mut done = vec![false; self.codes.len()];
+        done.resize(self.codes.len(), false);
         loop {
             let mut more = false;
             for (k, code) in self.codes.iter().enumerate() {
@@ -1606,6 +1657,100 @@ impl Vm {
             }
             unsafe { m.drain(&|| false) };
         }
+    }
+
+    /// A full marking's codes and shapes (see `mark_live_codes`): a shape is
+    /// live if an object traced has it or one made from it (see
+    /// [`mark_object_shape`]), if it was made or given to an object since
+    /// the marking began (`Vm::add_shape`, `object::set_shape`,
+    /// `Vm::root_shape`), if a cache held it when the marking began (see
+    /// `collect_from`), if it is pinned, or if the VM's tables or a live
+    /// code's `new` hold it. Live shapes' prototypes, and their ancestors',
+    /// are marked, until no more codes or shapes are found live.
+    unsafe fn mark_live_codes_and_shapes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let from = self.heap.gc.codes_from;
+        let epoch = code_epoch();
+        let mut live = self.fixed_shapes();
+        for i in 0..self.shape_count() {
+            let s = self.shape_at(i);
+            if s.pinned.get() || s.mark.load(Relaxed) >= from {
+                live.push(s);
+            }
+        }
+        let mut codes_done = vec![false; self.codes().count()];
+        let mut ctors_done = vec![false; codes_done.len()];
+        loop {
+            for s in live.drain(..) {
+                unsafe { trace_shape(m, s, epoch) };
+            }
+            unsafe { m.drain(&|| false) };
+            unsafe { self.mark_live_codes(m, sp, regs, &mut codes_done) };
+            for (k, code) in self.codes().enumerate() {
+                if !ctors_done[k] && (code.pinned.get() || code.mark.load(Relaxed) >= from) {
+                    ctors_done[k] = true;
+                    for s in [code.ctor_shape.get(), code.ctor_result.get()] {
+                        if !s.is_null() && s != crate::vm::MANY_SHAPES {
+                            live.push(s);
+                        }
+                    }
+                }
+            }
+            if live.is_empty() {
+                break;
+            }
+        }
+    }
+
+    /// At the start of a marking: mark the shapes the caches hold that
+    /// compiled code or the interpreter may give objects before the final
+    /// pause, even if the cache drops them by then: inline caches', the
+    /// megamorphic store table's and `push` caches' transitions, and
+    /// constructors' shapes. (What they take in later comes with a shape
+    /// given to an object, or made: see [`mark_live_codes_and_shapes`].
+    /// `CreateObject`'s root shape, an inline cache's `shape`, is made
+    /// again if it died: see `Vm::create_object`.) Shapes these hold are
+    /// live or zombies, whose memory stays.
+    fn mark_cached_shapes(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let epoch = code_epoch();
+        let mark = |s: *const crate::object::Shape| {
+            if !s.is_null() && s != crate::vm::MANY_SHAPES && unsafe { (*s).mark.load(Relaxed) } < epoch {
+                unsafe { (*s).mark.store(epoch, Relaxed) };
+            }
+        };
+        for code in self.codes() {
+            for ways in code.made_ics() {
+                for ic in unsafe { (*ways.get()).iter() } {
+                    mark(ic.new_shape);
+                }
+            }
+            mark(code.ctor_shape.get());
+            mark(code.ctor_result.get());
+        }
+        for e in self.mega_store_entries() {
+            mark(e.new_shape as *const crate::object::Shape);
+        }
+        for i in 0..self.shape_count() {
+            let push = self.shape_at(i).push.get();
+            if !push.is_null() {
+                let c = unsafe { &*push };
+                for &(_, t) in &c.to {
+                    mark(t as *const crate::object::Shape);
+                }
+                mark(c.any as *const crate::object::Shape);
+            }
+        }
+    }
+
+    /// After a full marking that marked with `color`: the constructor
+    /// tracking of prototypes it didn't mark goes, and the shapes it didn't
+    /// find live become zombies (see `Vm::sweep_shapes`).
+    fn sweep_shapes_after(&mut self, color: u8) {
+        let range = self.heap.cells_range();
+        self.sweep_ctor_protos(|p| is_cell_in(range, p) && unsafe { *crate::heap::meta(p) } & COLOR == color);
+        let from = self.heap.gc.codes_from;
+        self.sweep_shapes(from);
     }
 
     /// After a full marking, take the codes it didn't find live out of
@@ -1690,8 +1835,9 @@ impl Vm {
         }
     }
 
-    /// Mark what Rust structures refer to: shapes, code, compiled code, the
-    /// VM's tables.
+    /// Mark what Rust structures refer to: code, compiled code, the VM's
+    /// tables (shapes are found live by marking: see
+    /// `mark_live_codes_and_shapes`).
     unsafe fn mark_structures(&mut self, m: &mut Marking) {
         unsafe {
             for i in 0..self.heap.gc.kept.len() {
@@ -1699,9 +1845,6 @@ impl Vm {
                 self.mark_interior(m, a);
             }
             self.roots_report(m, "kept");
-            for s in self.shapes() {
-                m.value(s.proto);
-            }
             // The other codes' references count once they are found
             // live (see `mark_live_codes`).
             for code in self.codes().filter(|c| c.pinned.get()) {
@@ -1732,6 +1875,17 @@ impl Vm {
                 }
             }
         }
+        let from = self.heap.gc.codes_from;
+        let shape_live = |p: usize| unsafe {
+            let w = *(p as *const u64);
+            if w & 1 == 0 {
+                let s = w as *const crate::object::Shape;
+                assert!(
+                    (*s).pinned.get() || (*s).mark.load(std::sync::atomic::Ordering::Relaxed) >= from,
+                    "{p:#x} reachable, its shape {s:?} not live"
+                );
+            }
+        };
         let mut r = Reach {
             seen: Default::default(),
             stack: Vec::new(),
@@ -1740,6 +1894,7 @@ impl Vm {
         unsafe {
             self.each_root(sp, regs, &mut |p| r.cell(p));
             while let Some(p) = r.stack.pop() {
+                shape_live(p);
                 trace(&mut r, p, 0, usize::MAX);
             }
         }
@@ -1786,10 +1941,12 @@ impl Vm {
             for i in 0..self.open_upvalues.len() {
                 e.payload(self.open_upvalues[i] as usize);
             }
-            for s in self.shapes() {
-                e.value(s.proto);
-            }
             let from = self.heap.gc.codes_from;
+            for s in self.shapes() {
+                if s.pinned.get() || s.mark.load(std::sync::atomic::Ordering::Relaxed) >= from {
+                    e.value(s.proto);
+                }
+            }
             for code in self.codes().filter(|c| c.pinned.get() || c.mark.load(std::sync::atomic::Ordering::Relaxed) >= from) {
                 for &c in code.constants.iter() {
                     e.value(c);

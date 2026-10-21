@@ -153,8 +153,11 @@ impl Vm {
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
                 parent: s,
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
             };
-            (*o).shape = self.add_shape(u);
+            crate::object::set_shape(o, self.add_shape(u));
             self.bump_code_epoch();
             if (*o).flags & crate::object::PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
@@ -883,8 +886,11 @@ impl Vm {
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
                 parent: s,
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
             };
-            (*o).shape = self.add_shape(u);
+            crate::object::set_shape(o, self.add_shape(u));
             self.bump_code_epoch();
             self.proto_epoch = self.proto_epoch.wrapping_add(1);
             true

@@ -608,7 +608,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             // than in its loop).
             let want = (*(*oo).shape).elems.join((*(*obj).shape).elems);
             if want != (*(*oo).shape).elems {
-                (*oo).shape = vm.elements_transition((*oo).shape, want);
+                crate::object::set_shape(oo, vm.elements_transition((*oo).shape, want));
             }
             // (Numbers alone, no cells: nothing for the barrier to note.)
             if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {

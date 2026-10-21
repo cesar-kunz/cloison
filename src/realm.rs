@@ -25,6 +25,8 @@ pub(crate) const NONE: u32 = u32::MAX;
 trait Field {
     fn trace(&self, _: &mut Vec<Value>) {}
     fn pairs(&self, _: &Self, _: &mut dyn FnMut(Value, Value)) {}
+    /// The shapes it holds, which a full marking keeps (see `Shape::mark`).
+    fn shapes(&self, _: &mut Vec<*const Shape>) {}
 }
 
 impl Field for *mut Object {
@@ -54,6 +56,9 @@ impl Field for Value {
 }
 
 impl<T: Field> Field for Vec<T> {
+    fn shapes(&self, out: &mut Vec<*const Shape>) {
+        self.iter().for_each(|x| x.shapes(out));
+    }
     fn trace(&self, out: &mut Vec<Value>) {
         self.iter().for_each(|x| x.trace(out));
     }
@@ -63,6 +68,9 @@ impl<T: Field> Field for Vec<T> {
 }
 
 impl<T: Field, const N: usize> Field for [T; N] {
+    fn shapes(&self, out: &mut Vec<*const Shape>) {
+        self.iter().for_each(|x| x.shapes(out));
+    }
     fn trace(&self, out: &mut Vec<Value>) {
         self.iter().for_each(|x| x.trace(out));
     }
@@ -78,12 +86,27 @@ impl Field for (Value, crate::regexp::Captures) {
 }
 
 type MatchShape = (FieldType, *const Shape, *const Shape, *const Shape, *const Shape);
-impl Field for *const Shape {}
+impl Field for *const Shape {
+    fn shapes(&self, out: &mut Vec<*const Shape>) {
+        if !self.is_null() {
+            out.push(*self);
+        }
+    }
+}
 impl Field for *const Code {}
 impl Field for i32 {}
 impl Field for bool {}
-impl Field for (*const Shape, *const Shape) {}
-impl Field for MatchShape {}
+impl Field for (*const Shape, *const Shape) {
+    fn shapes(&self, out: &mut Vec<*const Shape>) {
+        self.0.shapes(out);
+        self.1.shapes(out);
+    }
+}
+impl Field for MatchShape {
+    fn shapes(&self, out: &mut Vec<*const Shape>) {
+        [self.1, self.2, self.3, self.4].shapes(out);
+    }
+}
 impl Field for crate::jit::HashSet<Atom> {}
 
 macro_rules! realm_fields {
@@ -104,10 +127,20 @@ macro_rules! realm_fields {
                 $(Field::trace(&self.$name, out);)*
             }
 
+            /// The shapes it holds.
+            pub(crate) fn shapes(&self, out: &mut Vec<*const Shape>) {
+                $(Field::shapes(&self.$name, out);)*
+            }
+
             /// Each of its intrinsics with `other`'s same one.
             fn pairs(&self, other: &Realm, f: &mut dyn FnMut(Value, Value)) {
                 $(Field::pairs(&self.$name, &other.$name, f);)*
             }
+        }
+
+        /// The shapes the current realm's intrinsics hold.
+        pub(crate) fn current_shapes(vm: &Vm, out: &mut Vec<*const Shape>) {
+            $(Field::shapes(&vm.$($path).+, out);)*
         }
 
         /// Exchange the VM's current intrinsics with `r`'s.

@@ -4260,7 +4260,9 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 return Sel::new("bail", "", out);
             };
             let shape = unsafe { (*fb.ic(insn.ic as usize)).shape };
-            if shape.is_null() {
+            // (A zombie's, no object may have: the interpreter makes it
+            // again, see `Vm::create_object`.)
+            if shape.is_null() || unsafe { (*shape).is_zombie() } {
                 return Sel::new("bail", "", out);
             }
             debug_assert_eq!(
@@ -9320,11 +9322,17 @@ impl JitCode {
                     // A cell, or an address in one, that the code embeds
                     // (a folded constant, a callee it checks for, a
                     // prototype's slot): kept alive (see `gc`).
+                    // A shape it gives objects is pinned (see `Shape::pinned`).
                     Sym::HoleImm64 | Sym::HoleImm64b => {
                         let v = if r.2 == Sym::HoleImm64 { p.imm64 } else { p.imm64b };
                         let vm = crate::interp::current_vm();
                         if !vm.is_null() {
-                            unsafe { (*vm).heap.keep(v as usize) };
+                            unsafe {
+                                (*vm).heap.keep(v as usize);
+                                if (*vm).shape_set.contains(&(v as usize)) {
+                                    crate::object::pin_shape(v as *const Shape);
+                                }
+                            }
                         }
                         v
                     }
@@ -11477,6 +11485,8 @@ fn apply_replacement(out: &mut Lowered, a: usize, plan: Replacement) {
     // The allocation: only its checks (`acc` = `undefined`).
     out.insns[a].native = 3;
     for (i, shape, regs) in plan.live {
+        // (An exit allocates the object with it.)
+        unsafe { crate::object::pin_shape(shape) };
         let fields = (0..unsafe { (*shape).keys().len() }).map(h).collect();
         // Before the objects replaced earlier: one may hold this one in a
         // field (a slot register this allocation writes). (Not the other
@@ -13157,6 +13167,8 @@ impl Lowering<'_> {
             let vm = &mut *self.state.vm;
             let callee = (*fo).code;
             let shape = vm.ctor_root(fo);
+            // (The site allocates `this` with it.)
+            crate::object::pin_shape(shape);
             let proto_at = Object::inline(fo, 0).cast::<u64>();
             vm.heap.keep(fo as usize);
             vm.heap.keep(*proto_at as usize);
@@ -16395,6 +16407,7 @@ extern "C" fn cloison_rt_construct_done(site: Value, this: Value) -> u64 {
                 <= crate::vm::Vm::shared_proto(code, o).map_or(code.ctor_capacity.get(), |e| e.cap.get())
             && (seen == shape || seen == crate::vm::MANY_SHAPES)
         {
+            crate::object::pin_shape(shape);
             s.ctor.as_mut().unwrap().done_shape = shape as u64;
         }
         0

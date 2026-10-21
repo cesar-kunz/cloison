@@ -3398,9 +3398,10 @@ impl Vm {
             }
             let cap = n.max((*o).elems_cap as usize * 2).max(4);
             let cap = u32::try_from(cap).expect("array too large");
-            let e = self.heap.alloc_values(cap as usize);
-            if !(*o).elems.is_null() {
-                std::ptr::copy_nonoverlapping((*o).elems, e, (*o).elems_len as usize);
+            let len = if (*o).elems.is_null() { 0 } else { (*o).elems_len as usize };
+            let e = self.heap.alloc_values_from(cap as usize, len);
+            if len > 0 {
+                std::ptr::copy_nonoverlapping((*o).elems, e, len);
             }
             (*o).elems = e;
             crate::heap::barrier_young(o.cast(), &raw const (*o).elems);

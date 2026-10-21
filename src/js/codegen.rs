@@ -1245,8 +1245,27 @@ fn try_blocks<'a>(
         .chain(f.iter().flatten())
 }
 
-/// An int32 literal (`-0` is not one).
+/// An int32 literal (`-0` is not one), or an int32 an expression of them
+/// and integer operators makes (`(1 << 16) - 1`: folded, not computed at
+/// each run, as PdfJS's `decrypt` did in its loop).
 fn smi(e: &Expr) -> Option<i32> {
+    if let ExprKind::Binary(op, l, r) = &e.kind {
+        let (a, b) = (smi(l)?, smi(r)?);
+        let k = b as u32 & 31;
+        return match op {
+            BinOp::Add => a.checked_add(b),
+            BinOp::Sub => a.checked_sub(b),
+            // (Not -0: `0 * -1`.)
+            BinOp::Mul => a.checked_mul(b).filter(|&p| p != 0 || (a >= 0 && b >= 0)),
+            BinOp::Shl => Some(a.wrapping_shl(k)),
+            BinOp::Sar => Some(a >> k),
+            BinOp::Shr => i32::try_from((a as u32) >> k).ok(),
+            BinOp::BitAnd => Some(a & b),
+            BinOp::BitOr => Some(a | b),
+            BinOp::BitXor => Some(a ^ b),
+            _ => None,
+        };
+    }
     let v = match &e.kind {
         ExprKind::Num(v) => *v,
         ExprKind::Unary(UnOp::Neg, x) => match x.kind {

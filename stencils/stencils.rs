@@ -3833,7 +3833,10 @@ unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
         let units = o.add(6);
         *o = imm64();
         *o.add(1) = 4 | 1 << 8;
-        *o.add(2) = 0;
+        // Volatile: arm64 LLVM would merge it with the word before into
+        // one 16-byte store of a constant from `.rodata`, which a stencil
+        // can't reference.
+        o.add(2).write_volatile(0);
         *o.add(3) = units as u64;
         *o.add(4) = len as u64 | (words as u64) << 32;
         *o.add(5) = 0;

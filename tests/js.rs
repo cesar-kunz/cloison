@@ -7655,3 +7655,29 @@ fn a_failed_module_graph_is_loaded_again() {
     );
     assert_eq!(run_module(&dir, "main.mjs").unwrap(), "TypeError,TypeError");
 }
+
+/// An import graph deeper than the stack allows fails with a RangeError
+/// that can be caught (no native stack overflow); a deep one that fits
+/// loads.
+#[test]
+fn deep_module_graphs_load_or_throw_a_range_error() {
+    let n = 20000;
+    let mut files: Vec<(String, String)> = (0..n)
+        .map(|i| {
+            let text = if i + 1 < n { format!("export * from './{}.mjs';\n", i + 1) } else { "export const x = 1;\n".into() };
+            (format!("{i}.mjs"), text)
+        })
+        .collect();
+    files.push(("300.mjs".into(), "export * from './301.mjs';\n".into()));
+    files.push((
+        "main.mjs".into(),
+        "var log = [];\n\
+         try { await import('./0.mjs'); log.push('loaded'); } catch (e) { log.push(e.name); }\n\
+         log.push((await import('./19700.mjs')).x);\n\
+         globalThis.result = log.join();"
+            .into(),
+    ));
+    let refs: Vec<(&str, &str)> = files.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let dir = module_dir("deep", &refs);
+    assert_eq!(run_module(&dir, "main.mjs").unwrap(), "RangeError,1");
+}

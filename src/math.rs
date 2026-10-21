@@ -11,6 +11,12 @@
 //! `e_exp.c`, `e_log.c`, `e_pow.c`, `s_scalbn.c`), with the same operation
 //! order, since that is what fixes the rounding. `sqrt` is exact everywhere
 //! and stays the hardware's.
+//!
+//! So fdlibm's idioms stay as written, where Clippy would change them:
+//! `x - x` and `x / x` make NaN or raise flags on purpose (`eq_op`), its
+//! constants keep all their digits (`excessive_precision`), and some are
+//! near `π`'s or `ln 2`'s without being them (`approx_constant`).
+#![allow(clippy::eq_op, clippy::excessive_precision, clippy::approx_constant)]
 
 /// The high 32 bits, as fdlibm's `__HI`.
 #[inline(always)]

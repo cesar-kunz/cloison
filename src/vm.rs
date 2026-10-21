@@ -190,7 +190,7 @@ fn mega_pair(k: usize) -> usize {
 }
 
 /// [`LookupEntry::holder`] of a property no object on the chain has.
-const PROTO_NONE: *mut Object = 1 as *mut Object;
+const PROTO_NONE: *mut Object = std::ptr::dangling_mut::<Object>();
 /// Entries of `Vm::lookups` (a power of two).
 const LOOKUPS: usize = 4096;
 
@@ -2665,7 +2665,7 @@ impl Vm {
             }
             // An object literal's property past a prototype's setter or
             // read-only property: defined, not cached.
-            let defines = || code.define_ics.iter().any(|&d| d == k);
+            let defines = || code.define_ics.contains(&k);
             if self.read_only(o, name) {
                 if defines() {
                     return self.create_data_property(obj, Key::Name(name), value);

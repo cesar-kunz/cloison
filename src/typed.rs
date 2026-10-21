@@ -727,7 +727,7 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, n: Option
             None
         }
         None => {
-            if bytes % size != 0 || offset > bytes {
+            if !bytes.is_multiple_of(size) || offset > bytes {
                 return Err(Error::range_error(format!("Invalid typed array length: byte length of {} should be a multiple of {size}", k.name())));
             }
             Some((bytes - offset) / size)

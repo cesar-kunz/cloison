@@ -603,7 +603,7 @@ fn unicode_general_category(c: char) -> Option<&'static str> {
     if matches!(u, 0x203F | 0x2040 | 0x2054 | 0xFE33 | 0xFE34 | 0xFE4D..=0xFE4F | 0xFF3F) {
         return Some("Pc");
     }
-    if c.is_numeric() && c.to_digit(10).is_some() {
+    if c.is_ascii_digit() {
         return Some("Nd");
     }
     None

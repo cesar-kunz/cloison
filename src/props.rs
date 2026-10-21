@@ -323,7 +323,7 @@ impl Vm {
             indices.extend(far.iter().map(|&(i, _)| i));
             indices.sort_unstable();
             indices.dedup();
-            let far_enum = |i: u32| far.iter().find(|&&(j, _)| j == i).map_or(true, |&(_, e)| e);
+            let far_enum = |i: u32| far.iter().find(|&&(j, _)| j == i).is_none_or(|&(_, e)| e);
             out.extend(indices.into_iter().map(|i| (Key::Index(i), far_enum(i))));
             // The properties without slots (see `own_property`).
             let flags = (*o).flags;

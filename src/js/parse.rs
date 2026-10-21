@@ -95,13 +95,13 @@ fn has_lexical(toks: &[Token]) -> bool {
 
 /// One pass of [`parse_with`]: the first collects its [`Table`], the
 /// second (`table` given) renames by it.
-fn parse_pass<'a, 'p>(
+fn parse_pass<'a>(
     toks: &mut [Token],
     arena: &'a Arenas<'a>,
     skim: bool,
     keep: bool,
     table: Option<Table>,
-    prev: Option<&'p Program<'a>>,
+    prev: Option<&Program<'a>>,
     eval: Option<(bool, usize)>,
     module: Option<i32>,
 ) -> Result<(Program<'a>, Table), Error> {
@@ -3666,11 +3666,6 @@ impl<'a> Parser<'_, 'a, '_> {
         index
     }
 
-    /// `static { … }` (at `static`): its code, a function of its own (with
-    /// its own `var`s).
-    /// Whether the code being parsed is a class static block's own (not
-    /// a function's in it, an arrow's either), but for a function
-    /// expression's name, which is the function's.
     // ---- Modules ----
 
     /// A module's body, as the body of a function in the script (see

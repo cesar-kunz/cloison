@@ -599,7 +599,7 @@ pub fn parse_duration(s: &str) -> R<DurationFields> {
     };
     let mut f = [0f64; 10];
     let mut any = false;
-    let order = [b'Y', b'M', b'W', b'D'];
+    let order = *b"YMWD";
     let mut next = 0;
     while p.peek().is_some_and(|c| c.is_ascii_digit()) {
         let (v, fraction, d) = number(&mut p).ok_or_else(err)?;
@@ -614,7 +614,7 @@ pub fn parse_duration(s: &str) -> R<DurationFields> {
     let mut excess = 0f64;
     if matches!(p.peek(), Some(b'T' | b't')) {
         p.i += 1;
-        let order = [b'H', b'M', b'S'];
+        let order = *b"HMS";
         let mut next = 0;
         let mut fractional = false;
         let mut any_time = false;

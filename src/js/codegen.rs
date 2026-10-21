@@ -1141,9 +1141,9 @@ fn children<'a>(e: &'a Expr<'a>, out: &mut Vec<&'a Expr<'a>>) {
 fn for_each_expr<'a>(body: &'a [Stmt<'a>], f: &mut dyn FnMut(&'a Expr<'a>)) {
     fn stmt<'a>(s: &'a Stmt<'a>, f: &mut dyn FnMut(&'a Expr<'a>)) {
         match &s.kind {
-            StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => ds.iter().flat_map(|(_, e)| e).for_each(|e| f(e)),
+            StmtKind::Var(ds) | StmtKind::Lexical(_, ds) => ds.iter().flat_map(|(_, e)| e).for_each(&mut *f),
             StmtKind::Expr(e) | StmtKind::Throw(e) => f(e),
-            StmtKind::Return(e) => e.iter().for_each(|e| f(e)),
+            StmtKind::Return(e) => e.iter().for_each(&mut *f),
             StmtKind::If(c, a, b) => {
                 f(c);
                 stmt(a, f);
@@ -1151,11 +1151,11 @@ fn for_each_expr<'a>(body: &'a [Stmt<'a>], f: &mut dyn FnMut(&'a Expr<'a>)) {
             }
             StmtKind::For { init, test, update, body } => {
                 match init {
-                    Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => ds.iter().flat_map(|(_, e)| e).for_each(|e| f(e)),
+                    Some(ForInit::Var(ds) | ForInit::Lexical(_, ds)) => ds.iter().flat_map(|(_, e)| e).for_each(&mut *f),
                     Some(ForInit::Expr(e)) => f(e),
                     None => {}
                 }
-                test.iter().chain(update).for_each(|e| f(e));
+                test.iter().chain(update).for_each(&mut *f);
                 stmt(body, f);
             }
             StmtKind::ForIn { object, body, .. } => {
@@ -1175,7 +1175,7 @@ fn for_each_expr<'a>(body: &'a [Stmt<'a>], f: &mut dyn FnMut(&'a Expr<'a>)) {
             StmtKind::Switch(d, cases) => {
                 f(d);
                 for (t, b) in cases {
-                    t.iter().for_each(|t| f(t));
+                    t.iter().for_each(&mut *f);
                     b.iter().for_each(|s| stmt(s, f));
                 }
             }
@@ -4051,7 +4051,7 @@ impl<'a> Gen<'a> {
                             && Self::reg_form(op).is_some()
                             && !assigns(v, n)
                             && !self.scopes.captured[self.index].contains(&&**n)
-                            && !(arguments_object(self.p, self.index) && self.f.params.iter().any(|p| &**p == &**n)) =>
+                            && !(arguments_object(self.p, self.index) && self.f.params.iter().any(|p| **p == **n)) =>
                     {
                         self.value(v)?;
                         self.emit(Self::reg_form(op).unwrap(), &[Arg::Reg(r)]);

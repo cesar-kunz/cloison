@@ -9,7 +9,7 @@ use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, as_object, object_value};
 use crate::value::Value;
-use crate::vm::{Error, NativeFn, Result, Vm, number_to_string, string_units, wrapped};
+use crate::vm::{Error, NativeFn, Result, Vm, number_to_string, string_len, string_units, wrapped};
 
 /// The kinds of error objects, in `Vm::error_prototypes` order. The
 /// runtime's own errors (`Error::type_error`, …) are caught as objects of
@@ -371,6 +371,20 @@ fn relative(d: f64, len: usize) -> usize {
     }
 }
 
+/// The string of units `s..e` of `this`'s, `u`: `this` itself if a
+/// string and that is all of it (TypeScript's `getText(0, length)` copied
+/// its 6 MB source 4 times over), an equal short one made recently (see
+/// `Vm::short_string`), or a new one.
+fn part(vm: &mut Vm, this: Value, u: &[u16], s: usize, e: usize) -> Value {
+    if s == 0 && e == u.len() && string_len(this).is_some() {
+        return this;
+    }
+    match &u[s..e] {
+        [c] => vm.single_char(*c),
+        part => vm.short_string(part),
+    }
+}
+
 fn string(vm: &mut Vm, u: &[u16]) -> Value {
     if let [c] = u {
         return vm.single_char(*c);
@@ -489,7 +503,7 @@ fn string_substring(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         _ => u.len(),
     };
     let (s, e) = (s.min(e), s.max(e));
-    Ok(string(vm, &u[s..e]))
+    Ok(part(vm, this, &u, s, e))
 }
 
 fn string_substr(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -499,7 +513,7 @@ fn string_substr(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         Some(v) if !v.is_undefined() => int_arg(a, 1).clamp(0.0, (u.len() - s) as f64) as usize,
         _ => u.len() - s,
     };
-    Ok(string(vm, &u[s..s + n]))
+    Ok(part(vm, this, &u, s, s + n))
 }
 
 fn string_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -509,7 +523,7 @@ fn string_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         Some(v) if !v.is_undefined() => relative(int_arg(a, 1), u.len()),
         _ => u.len(),
     };
-    Ok(string(vm, if s < e { &u[s..e] } else { &[] }))
+    Ok(part(vm, this, &u, s, e.max(s)))
 }
 
 fn string_to_lower_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -556,7 +570,7 @@ fn string_trim(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let s = u.iter().position(|&c| !is_space(c)).unwrap_or(u.len());
     let e = u.iter().rposition(|&c| !is_space(c)).map_or(s, |e| e + 1);
-    Ok(string(vm, &u[s..e]))
+    Ok(part(vm, this, &u, s, e))
 }
 
 fn string_trim_start(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

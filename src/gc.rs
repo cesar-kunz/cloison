@@ -287,6 +287,12 @@ impl Heap {
         self.gc.log_slots.push(slot as usize);
     }
 
+    /// Forget the slots logged at addresses `from..to` (see `note_slot`):
+    /// the structure holding them freed.
+    pub(crate) fn forget_slots(&mut self, from: usize, to: usize) {
+        self.gc.log_slots.retain(|s| !(from..to).contains(s));
+    }
+
     /// A Rust structure refers to the cell at or around address `a` for
     /// good: compiled code embedding it, a call site caching it.
     pub fn keep(&mut self, a: usize) {

@@ -396,8 +396,9 @@ pub struct Code {
     /// Register count, `r0` (`this`) and the parameters included.
     pub nregs: u32,
     /// Its inline caches, one slot per `ic_names` entry, made when first
-    /// asked for (see [`Code::ics`]): most functions loaded never run.
-    ics: std::cell::OnceCell<Box<[UnsafeCell<[Ic; IC_WAYS]>]>>,
+    /// asked for (see [`Code::ics`]): most functions loaded never run. A
+    /// script's are dropped once it has run (see [`Code::release`]).
+    ics: UnsafeCell<std::cell::OnceCell<Box<[UnsafeCell<[Ic; IC_WAYS]>]>>>,
     /// The property name of each inline-cache slot.
     pub ic_names: Box<[Atom]>,
     /// The `SetNamed` slots that define their property, an object
@@ -518,7 +519,7 @@ impl Code {
 
     /// Its inline caches, made (empty) the first time.
     pub fn ics(&self) -> &[UnsafeCell<[Ic; IC_WAYS]>] {
-        self.ics.get_or_init(|| {
+        unsafe { &*self.ics.get() }.get_or_init(|| {
             crate::gc::code_bytes(self.ic_names.len() * size_of::<[Ic; IC_WAYS]>());
             (0..self.ic_names.len())
                 .map(|_| UnsafeCell::new([Ic::EMPTY; IC_WAYS]))
@@ -542,10 +543,26 @@ impl Code {
             + self.closures.len() * size_of::<*const Code>()
     }
 
+    /// Drop its inline caches and compiled code: a script's, which has run
+    /// and won't again (each `eval` loads its code anew; no function
+    /// inlines a script). CodeLoad's evaluated scripts' caches took 20 MiB.
+    ///
+    /// # Safety
+    /// No frame of it may be running, nor anything hold its caches'
+    /// addresses but `heap`'s log (its own compiled code's are dropped
+    /// with it).
+    pub(crate) unsafe fn release(&self, heap: &mut crate::heap::Heap) {
+        let ics = self.made_ics();
+        let from = ics.as_ptr() as usize;
+        heap.forget_slots(from, from + size_of_val(ics));
+        drop(unsafe { (*self.ics.get()).take() });
+        drop(self.jit.borrow_mut().take());
+    }
+
     /// Its inline caches if it has made them (for the collector: those it
     /// hasn't hold nothing).
     pub(crate) fn made_ics(&self) -> &[UnsafeCell<[Ic; IC_WAYS]>] {
-        self.ics.get().map_or(&[], |b| b)
+        unsafe { &*self.ics.get() }.get().map_or(&[], |b| b)
     }
 }
 

@@ -259,7 +259,7 @@ if record:
     prev = next((r[0] for r in reversed(rows) if r[0] != commit), None)
     last = {(r[1], r[2]): float(r[3]) for r in rows if r[0] == prev}
     keys = ["peak_mb", "mean_mb", "heap_peak", "live_peak", "minors", "fulls", "pause_ms", "max_pause_ms",
-            "shape_bytes", "code_bytes", "malloc"]
+            "shape_bytes", "code_bytes", "jit_bytes", "malloc"]
     new = [(b, k, val("cloison", b, k)) for b in benches + ["<empty>"] for k in keys if val("cloison", b, k) is not None]
     with open(path, "a") as f:
         if not rows:

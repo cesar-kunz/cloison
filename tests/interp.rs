@@ -363,10 +363,8 @@ fn jit(a: &Assembler, regs: &mut [Value]) -> (Value, JitFunction) {
 fn stencils(f: &JitFunction) -> Vec<String> {
     f.last_code()
         .unwrap()
-        .stencils
-        .iter()
-        .flatten()
-        .cloned()
+        .stencils()
+        .map(String::from)
         .collect()
 }
 

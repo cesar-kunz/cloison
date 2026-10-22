@@ -164,6 +164,9 @@ pub struct Gc {
     last_end: Option<std::time::Instant>,
     /// Print what each kind of root reaches (`CLOISON_GC_ROOTS`).
     roots_report: bool,
+    /// After each stop-the-world full collection, print the small blocks'
+    /// occupancy and what in them could not move (`CLOISON_GC_FRAG`).
+    frag_report: bool,
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
     /// (`CLOISON_GC_CHECK_BARRIER`, slow).
@@ -189,6 +192,7 @@ impl Gc {
             cycles: env("CLOISON_GC_CYCLES"),
             check_barriers: env("CLOISON_GC_CHECK_BARRIER"),
             roots_report: env("CLOISON_GC_ROOTS"),
+            frag_report: env("CLOISON_GC_FRAG"),
             nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -1466,6 +1470,9 @@ impl Vm {
                 }
                 self.condemn_codes();
             }
+            if kind == Collection::Full && self.heap.gc.frag_report {
+                self.frag_report(sp);
+            }
             times[3] = lap();
         }
         let traced = m.marked;
@@ -1909,6 +1916,139 @@ impl Vm {
             }
             self.roots_report(m, "handles, upvalues, log");
         }
+    }
+
+    /// After a stop-the-world full collection (every cell left is live and
+    /// old), for `CLOISON_GC_FRAG`: the small blocks by occupancy, in
+    /// tenths, with the bytes of their cells that could not move were
+    /// cells evacuated: those a native stack word may point into
+    /// (conservative roots), those Rust structures and compiled code hold
+    /// by address (`kept`, the cells the JIT's tables key by address), and
+    /// collections' keys hashed by address. And what evacuating the
+    /// movable cells of the blocks under half full would leave: the blocks
+    /// with no pinned cell freed, their cells packed into blocks of their
+    /// own.
+    #[cold]
+    #[inline(never)]
+    unsafe fn frag_report(&mut self, sp: usize) {
+        use crate::heap::BLOCK;
+        const STACK: u8 = 1;
+        const KEPT: u8 = 2;
+        const HASHED: u8 = 4;
+        let mut pin: std::collections::HashMap<usize, u8> = Default::default();
+        let heap = &self.heap;
+        let add = |pin: &mut std::collections::HashMap<usize, u8>, a: usize, why: u8| {
+            if let Some(p) = heap.cell_containing(a) {
+                *pin.entry(p).or_default() |= why;
+            }
+        };
+        unsafe {
+            for a in (sp..self.heap.gc.stack_base).step_by(8) {
+                add(&mut pin, *(a as *const usize), STACK);
+            }
+        }
+        for &a in self.heap.gc.kept.iter().chain(&self.heap.gc.log_kept).chain(&self.relied_slots) {
+            add(&mut pin, a, KEPT);
+        }
+        for &k in self.ctor_protos_keys().iter() {
+            add(&mut pin, k, KEPT);
+        }
+        let ranges = self.heap.block_ranges();
+        let cells = |f: &mut dyn FnMut(usize, usize)| {
+            for &(start, end) in &ranges {
+                let mut p = start;
+                while p < end {
+                    let m = unsafe { *crate::heap::meta(p) };
+                    if m & (YOUNG | COLOR) == 0 {
+                        p += crate::heap::GRANULE;
+                        continue;
+                    }
+                    let n = unsafe { cell_size(p as *const u8) };
+                    f(p, n);
+                    p += n;
+                }
+            }
+        };
+        cells(&mut |p, _| {
+            if unsafe { *(p as *const u64) } & 1 == 0 {
+                crate::collections::address_keys(p as *mut crate::object::Object, &mut |k| add(&mut pin, k, HASHED));
+            }
+        });
+        // By block: live bytes, pinned bytes (any reason), by reason.
+        let mut blocks: std::collections::BTreeMap<usize, [usize; 5]> = Default::default();
+        let mut large = 0;
+        cells(&mut |p, n| {
+            if !matches!(self.heap.block_kind(p), Some(true)) {
+                large += n;
+                return;
+            }
+            let b = blocks.entry(p & !(BLOCK - 1)).or_default();
+            b[0] += n;
+            let why = pin.get(&p).copied().unwrap_or(0);
+            if why != 0 {
+                b[1] += n;
+            }
+            for (k, w) in [STACK, KEPT, HASHED].into_iter().enumerate() {
+                if why & w != 0 {
+                    b[2 + k] += n;
+                }
+            }
+        });
+        let mut tenths = [[0usize; 6]; 10];
+        let (mut freed, mut moved, mut kept_blocks) = (0, 0, 0);
+        for b in blocks.values() {
+            let t = &mut tenths[(b[0] * 10 / BLOCK).min(9)];
+            t[0] += 1;
+            for k in 0..5 {
+                t[1 + k] += b[k];
+            }
+            if b[0] < BLOCK / 2 {
+                moved += b[0] - b[1];
+                if b[1] == 0 {
+                    freed += 1;
+                } else {
+                    kept_blocks += 1;
+                }
+            }
+        }
+        let mib = |x: usize| x as f64 / (1 << 20) as f64;
+        let total: usize = blocks.values().map(|b| b[0]).sum();
+        let pinned: usize = blocks.values().map(|b| b[1]).sum();
+        eprintln!(
+            "frag: {} small blocks ({:.1} MiB) holding {:.1} MiB live ({:.0}% full), {:.2} MiB pinned \
+             ({} cells: stack, kept, hashed below); large cells {:.1} MiB",
+            blocks.len(),
+            mib(blocks.len() * BLOCK),
+            mib(total),
+            100.0 * total as f64 / (blocks.len() * BLOCK).max(1) as f64,
+            mib(pinned),
+            pin.len(),
+            mib(large)
+        );
+        for (i, t) in tenths.iter().enumerate() {
+            if t[0] > 0 {
+                eprintln!(
+                    "  {:>3}-{:<3}% full: {:6} blocks, {:8.2} MiB live, pinned {:6.3} MiB (stack {:.3}, kept {:.3}, hashed {:.3})",
+                    i * 10,
+                    i * 10 + 10,
+                    t[0],
+                    mib(t[1]),
+                    mib(t[2]),
+                    mib(t[3]),
+                    mib(t[4]),
+                    mib(t[5])
+                );
+            }
+        }
+        let after = blocks.len() - freed + moved.div_ceil(BLOCK * 9 / 10);
+        eprintln!(
+            "  evacuating the blocks under half full: {:.1} MiB moved, {freed} blocks freed ({kept_blocks} kept by a pinned \
+             cell), {} blocks -> {after} ({:.1} MiB -> {:.1})",
+            mib(moved),
+            blocks.len(),
+            mib(blocks.len() * BLOCK),
+            mib(after * BLOCK)
+        );
     }
 
     /// Mark what Rust structures refer to: code, compiled code, the VM's

@@ -317,7 +317,7 @@ Environment flags: `CLOISON_NO_JIT`, `CLOISON_TIER=<back edges>`, `CLOISON_TIME`
 compile time over the run; and the collections: pauses, heap peak, live peak), `CLOISON_EXITS` (exits, entries and runtime calls by count),
 `CLOISON_JIT_DUMP`, `CLOISON_JIT_LOG`, `CLOISON_PERF_MAP` (names JIT code for `perf`),
 `CLOISON_NO_QUICKEN`, `CLOISON_COUNT`, `CLOISON_CODE_SHIFT`; for the collector,
-`CLOISON_GC_STATS` (each collection), `CLOISON_GC_NURSERY` (MiB),
+`CLOISON_GC_STATS` (each collection), `CLOISON_GC_NURSERY` (MiB, fixed; else 8 to 32, grown on minor collections' share of the time),
 `CLOISON_HEAP_LIMIT` (MiB), `CLOISON_GC_VERIFY=<KiB>` (collect that often,
 checking references and poisoning what is freed), `CLOISON_GC_STRESS`
 (collect at every safepoint), `CLOISON_GC_FULL` (every collection full),

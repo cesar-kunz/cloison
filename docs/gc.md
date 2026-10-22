@@ -511,8 +511,10 @@ pauses.
 
 - **Nursery size**: the bytes allocated between minor collections. Its
   cost is the roots and the survivors marked; a larger nursery gives
-  cells more time to die but leaves the cache. Measured: start from the
-  last-level cache's size and climb on marked bytes per allocated byte.
+  cells more time to die but leaves the cache, and takes memory a small
+  program never needs. It starts at 8 MiB and doubles, up to 32 MiB,
+  whenever minor collections took over 2% of the time across the last
+  four (see step 6, *Adaptive nursery*).
 - **Old-generation headroom**: the next major cycle starts when the old
   generation has grown by its live size after the last cycle (64 MiB at
   least), counted two ways, whichever comes first: blocks in use since
@@ -664,6 +666,26 @@ runs) and the microbenchmarks.
      EarleyBoyer 31.1 s (pauses halve); at 64 MiB they gain 2-3% while
      TypeScript's largest pause doubles to 31 ms and Splay's peak grows
      to 810 MB.
+   - *Adaptive nursery* (done): 32 MiB took memory small programs never
+     use (Richards' peak RSS 40 MB, its live data under 1). Fixed sizes
+     against 32 MiB, Octane score and peak RSS: at 4 MiB Richards 11 MB,
+     Crypto 20 (from 46), RegExp 53 (from 79) and 3% faster, Splay 10%
+     faster; but RayTrace -35%, EarleyBoyer -27%, DeltaBlue -9% (and 84
+     MB, from 63: more promoted). RayTrace's loss is not its pauses (0.2%
+     of its 4 MiB survives) but allocation: the few cells each minor
+     collection promotes die soon after, no full collection runs below
+     64 MiB, and the dead cells cut the recycled blocks into holes of
+     ~700 bytes, 5,700 a nursery, each an `alloc_slow` (12.6% of its
+     time). EarleyBoyer's is its pauses (23% of the time at 4 MiB, 8% at
+     32). Minor collections' share of the time sorts them: under 2% at 4
+     MiB for Richards, Crypto, RegExp, CodeLoad, GBEmu; 6-23% for
+     RayTrace, DeltaBlue, PdfJS, EarleyBoyer, Splay. Hence the nursery
+     grows on that share. Starting at 4 MiB cost Box2D 1.7% (its short
+     run spent at 4 MiB); from 8, Octane +0.2% (RegExp +3.2%,
+     RayTrace -0.8%, the garbage its early nurseries promoted); peak RSS
+     Richards 40 -> 15 MB, Crypto 46 -> 22, RegExp 79 -> 56, Box2D 70 ->
+     57, CodeLoad 185 -> 176. Faster growth (two collections sampled, or
+     one) did not win RayTrace back. `CLOISON_GC_NURSERY` fixes the size.
    - *Not done, not warranted by measurement*: more marker threads (the
      marker finishes well inside a cycle: the lead is under a third of the
      room), an age bit (EarleyBoyer, the most promoting benchmark, spends

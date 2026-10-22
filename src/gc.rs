@@ -38,8 +38,20 @@ use crate::vm::Vm;
 
 /// The byte freed cells are filled with under `CLOISON_GC_VERIFY`.
 pub const POISON: u8 = 0xdd;
-/// Bytes allocated between minor collections.
+/// Bytes allocated between minor collections: from `NURSERY_MIN`, doubled
+/// up to `NURSERY` while minor collections take more than
+/// 1/`NURSERY_OVERHEAD` of the time. A program that allocates little or
+/// whose young cells all die keeps a small nursery (peak RSS at 32 MiB and
+/// now: Richards 40 MB and 15, Crypto 46 and 22, RegExp 79 and 56, 3%
+/// faster); one whose minor collections cost grows it, fewer of them
+/// promoting less (fixed at 4 MiB RayTrace lost 35%, the garbage it
+/// promoted, not collected below `FULL_MIN`, leaving allocation small
+/// holes; EarleyBoyer 27%, its pauses). From 4 MiB Box2D lost 1.7%.
 const NURSERY: usize = 32 << 20;
+const NURSERY_MIN: usize = 8 << 20;
+const NURSERY_OVERHEAD: u64 = 50;
+/// Minor collections the overhead is measured over before a resize.
+const NURSERY_SAMPLE: u32 = 4;
 /// A full collection runs when the heap's blocks have grown, since the
 /// last one, by this many times what it left marked less one, and at least
 /// [`FULL_MIN`].
@@ -138,8 +150,18 @@ pub struct Gc {
     shade: Vec<usize>,
     /// The marker thread, once a cycle needed it.
     pub(crate) marker: Option<Marker>,
-    /// Bytes allocated between minor collections (`CLOISON_GC_NURSERY`, MiB).
+    /// Bytes allocated between minor collections (`CLOISON_GC_NURSERY`, MiB:
+    /// fixed), and whether it grows (see [`NURSERY`]).
     nursery: usize,
+    nursery_fixed: bool,
+    /// Since the last resize: minor collections, their pauses, and the time
+    /// from the end of the collection before the first to the end of the
+    /// last (ns).
+    minors_sampled: u32,
+    minor_pause_ns: u64,
+    minor_span_ns: u64,
+    /// When the last collection ended.
+    last_end: Option<std::time::Instant>,
     /// Print what each kind of root reaches (`CLOISON_GC_ROOTS`).
     roots_report: bool,
     /// After each minor collection's marking, look for an old cell that
@@ -170,7 +192,8 @@ impl Gc {
             nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .map_or(NURSERY, |mb| mb << 20),
+                .map_or(NURSERY_MIN, |mb| mb << 20),
+            nursery_fixed: env("CLOISON_GC_NURSERY"),
             full_at: FULL_MIN,
             threads: std::env::var("CLOISON_GC_THREADS")
                 .ok()
@@ -201,6 +224,28 @@ impl Gc {
             _ if self.stress => 0,
             0 => self.nursery,
             n => n,
+        }
+    }
+
+    /// A minor collection that took `pause` ended at `end`: double the
+    /// nursery if minor collections took too much of the time since the
+    /// last resize.
+    fn sample_minor(&mut self, pause: u64, end: std::time::Instant) {
+        if let Some(last) = self.last_end {
+            self.minors_sampled += 1;
+            self.minor_pause_ns += pause;
+            self.minor_span_ns += (end - last).as_nanos() as u64;
+        }
+        if self.minors_sampled >= NURSERY_SAMPLE {
+            if !self.nursery_fixed
+                && self.nursery < NURSERY
+                && self.minor_pause_ns * NURSERY_OVERHEAD > self.minor_span_ns
+            {
+                self.nursery *= 2;
+            }
+            self.minors_sampled = 0;
+            self.minor_pause_ns = 0;
+            self.minor_span_ns = 0;
         }
     }
 
@@ -1462,7 +1507,7 @@ impl Vm {
         if self.heap.gc.stats {
             let (top, recycle, free, large) = self.heap.block_counts();
             eprintln!(
-                "gc {} {:?}: {:.3} ms (roots {:.3}, {} {:.3}, trace {:.3}, free {:.3}), {marked} cells marked, \
+                "gc {} {:?}: {:.3} ms (roots {:.3}, {} {:.3}, trace {:.3}, free {:.3}), {marked} cells marked ({} KiB), \
                  {} shaded, {} KiB freed, {} MiB of blocks ({top} blocks, {recycle} to reuse, {free} free, \
                  {large} large), holes {:?}, to sweep {}",
                 self.heap.gc.count,
@@ -1473,6 +1518,7 @@ impl Vm {
                 times[1],
                 times[2],
                 times[3],
+                traced >> 10,
                 shade.len(),
                 freed >> 10,
                 self.heap.allocated() >> 20,
@@ -1485,7 +1531,12 @@ impl Vm {
         }
         {
             use std::sync::atomic::Ordering::Relaxed;
-            let ns = start.elapsed().as_nanos() as u64;
+            let end = std::time::Instant::now();
+            let ns = (end - start).as_nanos() as u64;
+            if !full {
+                self.heap.gc.sample_minor(ns, end);
+            }
+            self.heap.gc.last_end = Some(end);
             PAUSE_NS.fetch_add(ns, Relaxed);
             MAX_PAUSE_NS.fetch_max(ns, Relaxed);
             match kind {

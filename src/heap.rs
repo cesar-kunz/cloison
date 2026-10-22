@@ -180,8 +180,12 @@ fn decommit(a: usize, len: usize) {
     }
 }
 
+/// Whether memory given back by [`release`] reads zero when used again
+/// (Linux drops the pages; macOS may hand them back as they were).
+const RELEASED_ZERO: bool = !cfg!(target_os = "macos");
+
 /// Let the system take back the memory of `len` bytes at `a` (blocks that
-/// hold nothing, which are zeroed when used again).
+/// hold nothing).
 fn release(a: usize, len: usize) {
     #[cfg(target_os = "macos")]
     let advice = libc::MADV_FREE_REUSABLE;
@@ -703,7 +707,8 @@ impl Heap {
         self.hole = self.ptr;
     }
 
-    /// A large cell: blocks of its own.
+    /// A large cell: blocks of its own, all zero but its first granule's
+    /// metadata (fresh blocks are, and `free_run` zeroes the others).
     fn alloc_large(&mut self, bytes: usize) -> *mut u8 {
         let n = bytes.div_ceil(BLOCK);
         let b = self.free_run(n).unwrap_or_else(|| self.fresh_blocks(n));
@@ -736,15 +741,20 @@ impl Heap {
             - n;
         let run = b as u32..(b + n) as u32;
         self.free.retain(|k| !run.contains(k));
-        // Only the kept blocks hold old bytes: released ones are zero.
+        // Only the kept blocks hold old bytes, where released ones are
+        // zero (see `RELEASED_ZERO`).
         let mut kept = Vec::new();
         self.empty.retain(|&k| !run.contains(&k) || {
             kept.push(k);
             false
         });
         unsafe { std::ptr::write_bytes(meta(self.block_addr(b) as usize), 0, n * BLOCK / GRANULE) };
-        for k in kept {
-            unsafe { std::ptr::write_bytes(self.block_addr(k as usize), 0, BLOCK) };
+        if RELEASED_ZERO {
+            for k in kept {
+                unsafe { std::ptr::write_bytes(self.block_addr(k as usize), 0, BLOCK) };
+            }
+        } else {
+            unsafe { std::ptr::write_bytes(self.block_addr(b), 0, n * BLOCK) };
         }
         Some(b)
     }
@@ -821,13 +831,19 @@ impl Heap {
     }
 
     /// `n` zero bytes (8-aligned): the payload of a byte buffer cell.
+    /// A large cell's blocks are zero already (fresh, released or zeroed:
+    /// see `alloc_large`), and left untouched until written, so a buffer
+    /// takes memory only for the pages a program uses (Zlib's 128 MiB
+    /// Emscripten heap took 128 MiB of RSS).
     pub fn alloc_bytes(&mut self, n: usize) -> *mut u8 {
         let len = u32::try_from(n).expect("buffer too large") as u64;
         let bytes = (8 + n).next_multiple_of(GRANULE);
         let p = self.alloc(bytes).cast::<u64>();
         unsafe {
             *p = BYTES | len << 32;
-            std::ptr::write_bytes(p.add(1).cast::<u8>(), 0, bytes - 8);
+            if bytes <= LARGE {
+                std::ptr::write_bytes(p.add(1).cast::<u8>(), 0, bytes - 8);
+            }
             p.add(1).cast()
         }
     }

@@ -522,7 +522,7 @@ impl<'a> Parser<'_, 'a, '_> {
             if !ends {
                 return false;
             }
-            if s == "use strict" && !self.toks[j].escaped {
+            if &**s == "use strict" && !self.toks[j].escaped {
                 return true;
             }
             j += 1;
@@ -894,6 +894,9 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             body.push(self.statement()?);
         }
+        // (The tree lives until the script is compiled: a vector's room
+        // past its statements, 3 more for one, took Mandreel 40 MB.)
+        body.shrink_to_fit();
         Ok(body)
     }
 
@@ -1082,9 +1085,9 @@ impl<'a> Parser<'_, 'a, '_> {
             let body = stmt(self.arena, Stmt { kind: StmtKind::Block(lowered), pos });
             return Ok(StmtKind::ForOf {
                 kind: 3,
-                target: Expr { kind: ExprKind::Ident(name), pos },
+                target: expr(self.arena, Expr { kind: ExprKind::Ident(name), pos }),
                 pattern: None,
-                iterable,
+                iterable: expr(self.arena, iterable),
                 body,
                 is_await: false,
             });
@@ -1101,7 +1104,15 @@ impl<'a> Parser<'_, 'a, '_> {
         self.expect(")")?;
         let body = stmt(self.arena, self.sub_statement()?);
         let declaration = Stmt { kind: StmtKind::Lexical(true, decls), pos };
-        let lp = Stmt { kind: StmtKind::For { init: None, test, update, body }, pos };
+        let lp = Stmt {
+            kind: StmtKind::For {
+                init: None,
+                test: test.map(|e| expr(self.arena, e)),
+                update: update.map(|e| expr(self.arena, e)),
+                body,
+            },
+            pos,
+        };
         Ok(StmtKind::Block(self.lower_using(vec![declaration, lp], names, is_await, pos)))
     }
 
@@ -1184,7 +1195,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     var: false,
                     fresh: true,
                     name,
-                    object,
+                    object: expr(self.arena, object),
                     body,
                 });
             }
@@ -1238,7 +1249,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let name = name.clone();
                 return self.for_in_rest(false, name);
             }
-            Some(ForInit::Expr(e))
+            Some(ForInit::Expr(expr(self.arena, e)))
         };
         self.expect(";")?;
         let test = if self.is(";") {
@@ -1256,8 +1267,8 @@ impl<'a> Parser<'_, 'a, '_> {
         let body = stmt(self.arena, self.sub_statement()?);
         Ok(StmtKind::For {
             init,
-            test,
-            update,
+            test: test.map(|e| expr(self.arena, e)),
+            update: update.map(|e| expr(self.arena, e)),
             body,
         })
     }
@@ -1302,7 +1313,7 @@ impl<'a> Parser<'_, 'a, '_> {
             var: false,
             fresh: false,
             name: h,
-            object,
+            object: expr(self.arena, object),
             body,
         })
     }
@@ -1337,9 +1348,9 @@ impl<'a> Parser<'_, 'a, '_> {
         let body = stmt(self.arena, self.sub_statement()?);
         Ok(StmtKind::ForOf {
             kind,
-            target: Expr { kind: target, pos },
+            target: expr(self.arena, Expr { kind: target, pos }),
             pattern: None,
-            iterable,
+            iterable: expr(self.arena, iterable),
             body,
             is_await: false,
         })
@@ -1541,7 +1552,7 @@ impl<'a> Parser<'_, 'a, '_> {
             var,
             fresh: false,
             name,
-            object,
+            object: expr(self.arena, object),
             body,
         })
     }
@@ -2561,6 +2572,8 @@ impl<'a> Parser<'_, 'a, '_> {
                 args.push(self.assignment(false)?);
             }
         }
+        // (As a block's statements: see `statements_to_brace`.)
+        args.shrink_to_fit();
         Ok(args)
     }
 
@@ -2590,8 +2603,8 @@ impl<'a> Parser<'_, 'a, '_> {
         let start = self.i;
         let kind = match self.bump() {
             Tok::Num(v) => ExprKind::Num(v),
-            Tok::BigInt(d) => ExprKind::Intrinsic("bigint", vec![Expr { kind: ExprKind::Str(d), pos }]),
-            Tok::Str(s) => ExprKind::Str(s),
+            Tok::BigInt(d) => ExprKind::Intrinsic("bigint", vec![Expr { kind: ExprKind::Str(d.into()), pos }]),
+            Tok::Str(s) => ExprKind::Str(s.into()),
             // `import.defer(specifier, options)`, `import.source(…)`: as
             // `import()`, a deferred namespace or a module source.
             Tok::Keyword("import") if self.is(".") && (matches!(self.peek_at(1), Tok::Ident(n) if &**n == "defer" || &**n == "source")) => {
@@ -2669,7 +2682,7 @@ impl<'a> Parser<'_, 'a, '_> {
                         }
                     }
                 }
-                ExprKind::Template(strings, subs)
+                ExprKind::Template(strings.into(), subs)
             }
             Tok::Keyword("this") if self.functions[self.current].arrow => {
                 let k = self.non_arrow();
@@ -2844,7 +2857,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 if let Err(m) = crate::regexp::Regex::check(&r.0, &r.1) {
                     return Err(Error::new(pos as usize, m));
                 }
-                ExprKind::RegExp(r.0, r.1)
+                ExprKind::RegExp(r)
             }
             _ => {
                 self.i = start;
@@ -3800,7 +3813,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     self.i -= 1;
                     return self.err("an export name that isn't well-formed Unicode");
                 }
-                Ok(ExportName::Str(s))
+                Ok(ExportName::Str(s.into()))
             }
             _ => {
                 self.i -= 1;
@@ -3829,7 +3842,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 let key = match self.bump() {
                     Tok::Ident(n) => n.to_string(),
                     Tok::Keyword(k) => k.to_string(),
-                    Tok::Str(s) => s,
+                    Tok::Str(s) => s.into(),
                     _ => {
                         self.i -= 1;
                         return self.err("expected an attribute's key");
@@ -3844,7 +3857,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     return self.err(format!("duplicate attribute `{key}`"));
                 }
                 if key == "type" {
-                    ty = Some(value);
+                    ty = Some(value.into());
                 }
                 keys.push(key);
                 if !self.eat(",") {

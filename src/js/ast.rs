@@ -297,10 +297,12 @@ pub enum StmtKind<'a> {
     Function(usize),
     Expr(Expr<'a>),
     If(Expr<'a>, &'a Stmt<'a>, Option<&'a Stmt<'a>>),
+    /// (The loops' expressions in the arena: every statement takes as
+    /// much as the largest kind, 96 bytes, 208 with these inline.)
     For {
         init: Option<ForInit<'a>>,
-        test: Option<Expr<'a>>,
-        update: Option<Expr<'a>>,
+        test: Option<&'a Expr<'a>>,
+        update: Option<&'a Expr<'a>>,
         body: &'a Stmt<'a>,
     },
     /// `for (var? x in e)`
@@ -309,17 +311,17 @@ pub enum StmtKind<'a> {
         /// `for (let x in e)` or `const`: a binding per iteration.
         fresh: bool,
         name: Name,
-        object: Expr<'a>,
+        object: &'a Expr<'a>,
         body: &'a Stmt<'a>,
     },
     /// `for (target of iterable)`: `kind` 0 (an assignment target), 1
     /// (`var`), 2 (`let`) or 3 (`const`, a declaration's name renamed).
     ForOf {
         kind: u8,
-        target: Expr<'a>,
+        target: &'a Expr<'a>,
         /// A pattern target (then `target` is unused).
         pattern: Option<Box<Pattern<'a>>>,
-        iterable: Expr<'a>,
+        iterable: &'a Expr<'a>,
         body: &'a Stmt<'a>,
         /// `for await (…)`, in an async function: over an async iterator.
         is_await: bool,
@@ -350,7 +352,7 @@ pub enum ForInit<'a> {
     Var(Vec<(Name, Option<Expr<'a>>)>),
     /// `let` (`false`) or `const`: copied to a fresh binding per iteration.
     Lexical(bool, Vec<(Name, Option<Expr<'a>>)>),
-    Expr(Expr<'a>),
+    Expr(&'a Expr<'a>),
 }
 
 #[derive(Debug)]
@@ -378,7 +380,7 @@ pub enum ExprKind<'a> {
     Spread(&'a Expr<'a>),
     /// An untagged template literal: its strings (cooked) around its
     /// substitutions.
-    Template(Vec<String>, Vec<Expr<'a>>),
+    Template(Box<[String]>, Vec<Expr<'a>>),
     /// A tagged template's first argument: the site's frozen array of
     /// cooked strings (`None`: an invalid escape), with its `raw` ones.
     TemplateObject(Vec<(Option<String>, String)>),
@@ -408,7 +410,7 @@ pub enum ExprKind<'a> {
     /// A function expression: an index into [`Program::functions`].
     Function(usize),
     /// A regular expression literal: pattern, flags.
-    RegExp(String, String),
+    RegExp(Box<(String, String)>),
     /// In an object literal only: `get k() {…}` (false) or `set k(v) {…}`
     /// (true), the function's index.
     Accessor(bool, usize),

@@ -16,8 +16,10 @@ pub enum Tok {
     Num(f64),
     /// A BigInt literal: its digits (after a `0x`, `0o` or `0b`), without
     /// separators or the `n`.
-    BigInt(String),
-    Str(String),
+    BigInt(Box<str>),
+    /// (Strings boxed, not `String`s: a token takes 32 bytes, not 40, and
+    /// Mandreel's source is 1.5 million of them.)
+    Str(Box<str>),
     /// An operator or punctuator.
     Punct(&'static str),
     /// A regular expression literal: its pattern and flags.
@@ -316,7 +318,7 @@ pub fn lex_as(src: &str, module: bool) -> Result<Vec<Token>, Error> {
             if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
                 if let Some((digits, n)) = bigint(&src[i..]) {
                     i += n;
-                    Tok::BigInt(digits)
+                    Tok::BigInt(digits.into())
                 } else {
                     let (v, n) = number(&src[i..]).ok_or_else(|| err("bad number"))?;
                     i += n;
@@ -327,7 +329,7 @@ pub fn lex_as(src: &str, module: bool) -> Result<Vec<Token>, Error> {
                 // (Escapes in it: then not a directive, `"use strict"`.)
                 escaped = src[i..i + n].contains('\\');
                 i += n;
-                Tok::Str(s)
+                Tok::Str(s.into())
             } else if c == b'`' || (c == b'}' && braces.last() == Some(&2)) {
                 if c == b'}' {
                     braces.pop();

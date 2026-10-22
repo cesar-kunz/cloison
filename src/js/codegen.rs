@@ -1155,7 +1155,7 @@ fn for_each_expr<'a>(body: &'a [Stmt<'a>], f: &mut dyn FnMut(&'a Expr<'a>)) {
                     Some(ForInit::Expr(e)) => f(e),
                     None => {}
                 }
-                test.iter().chain(update).for_each(&mut *f);
+                test.iter().chain(update).copied().for_each(&mut *f);
                 stmt(body, f);
             }
             StmtKind::ForIn { object, body, .. } => {
@@ -3763,7 +3763,8 @@ impl<'a> Gen<'a> {
             }
             Function(i) => self.closure(*i),
             Accessor(..) => unreachable!("the parser makes them object literal values only"),
-            RegExp(p, f) => {
+            RegExp(r) => {
+                let (p, f) = &**r;
                 let p = self.const_str(p);
                 let f = self.const_str(f);
                 self.emit(Op::CreateRegExp, &[Arg::Index(p), Arg::Index(f)]);
@@ -5539,7 +5540,7 @@ impl<'a> Gen<'a> {
                     Some(c) => first_test_passes(init.as_ref(), c),
                 };
                 self.fresh = fresh;
-                self.looping(labels, test.as_ref(), update.as_ref(), body, !first_passes)?;
+                self.looping(labels, *test, *update, body, !first_passes)?;
             }
             StmtKind::While(c, body) => {
                 let first_passes = matches!(c.kind, ExprKind::Bool(true));

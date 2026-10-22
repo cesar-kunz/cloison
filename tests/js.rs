@@ -1630,6 +1630,27 @@ bad + "," + (src.substring(0) === src) + "," + src.slice(0, 5) + src.substr(6, 4
     );
 }
 
+/// An evaluated script's inline caches are dropped once it has run
+/// (`Code::release`): its calls of a young function logged the caches'
+/// slots for the next collection, which must not read them after.
+#[test]
+fn evaluated_scripts_caches_dropped_after_running() {
+    assert_eq!(
+        value(
+            r#"
+var sum = 0;
+for (var r = 0; r < 400; r++) {
+  sum += (0, eval)("var o = { f: function () { return 1; }, g: [1, 2] }; " +
+    "var s = 0; for (var i = 0; i < 3; i++) s += o.f() + o.g.length; " +
+    "var junk = []; for (var j = 0; j < 3000; j++) junk.push({ j: j, k: [j] }); s");
+}
+sum
+"#
+        ),
+        "3600"
+    );
+}
+
 /// A pause traces on several threads past 16,384 cells
 /// (`Marking::drain_parallel`), the threads handing each other parts of
 /// their stacks: a tree and an array of 40,000 cells must survive. Fails

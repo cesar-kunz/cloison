@@ -3880,6 +3880,8 @@ pub(crate) fn run_script_with(vm: &mut Vm, code: *const Code, this: Value) -> cr
         vm.native_top = std::ptr::null_mut();
         let v = drive(vm, (*code).bytecode.as_ptr(), Value::UNDEFINED, new);
         vm.native_top = saved;
+        // It has run, for good: its caches go (see `Code::release`).
+        (*code).release(&mut vm.heap);
         if v == Value::EMPTY {
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("eval")));
         }

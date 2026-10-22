@@ -2049,6 +2049,52 @@ impl Vm {
             mib(blocks.len() * BLOCK),
             mib(after * BLOCK)
         );
+        // The live cells by kind (an object's class), and the room objects
+        // leave unused: in-object slots past their shape's, property and
+        // element storage past what they hold.
+        let mut kinds: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        let (mut inline_unused, mut props_unused, mut elems_unused) = (0, 0, 0);
+        cells(&mut |p, n| {
+            let w = unsafe { *(p as *const u64) };
+            let k = if w & 1 == 0 {
+                let o = p as *const crate::object::Object;
+                unsafe {
+                    let used = (*(*o).shape).slots.len();
+                    let inline = crate::object::Object::inline_cap(o);
+                    inline_unused += 8 * inline.saturating_sub(used);
+                    if !(*o).props.is_null() {
+                        props_unused += 8 * ((*o).props_cap as usize).saturating_sub(used.saturating_sub(inline));
+                    }
+                    if !(*o).elems.is_null() && (*o).class != crate::object::Class::String {
+                        elems_unused += 8 * ((*o).elems_cap as usize).saturating_sub((*o).elems_len as usize);
+                    }
+                    format!("{:?}", (*o).class)
+                }
+            } else {
+                match w & 7 {
+                    crate::heap::VALUES => "values",
+                    crate::heap::WEAK_VALUES => "weak values",
+                    crate::heap::BYTES => "bytes",
+                    crate::heap::UPVALUE => "upvalue",
+                    _ => "?",
+                }
+                .to_string()
+            };
+            let e = kinds.entry(k).or_default();
+            e.0 += 1;
+            e.1 += n;
+        });
+        let mut kinds: Vec<_> = kinds.into_iter().collect();
+        kinds.sort_by_key(|k| std::cmp::Reverse(k.1.1));
+        let line: Vec<String> =
+            kinds.iter().take(12).map(|(k, (c, b))| format!("{k} {:.1} MiB ({c})", mib(*b))).collect();
+        eprintln!("  live by kind: {}", line.join(", "));
+        eprintln!(
+            "  unused room: in-object slots {:.1} MiB, property storage {:.1}, element storage {:.1}",
+            mib(inline_unused),
+            mib(props_unused),
+            mib(elems_unused)
+        );
     }
 
     /// Mark what Rust structures refer to: code, compiled code, the VM's

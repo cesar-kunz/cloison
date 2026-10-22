@@ -127,10 +127,13 @@ pub struct Gc {
     /// The full marking under way, or the last, collects shapes (see
     /// [`SHAPE_SWEEP_MIN`]).
     pub(crate) shape_cycle: bool,
-    /// Bytes the pauses of the current marking cycle before its final one
-    /// marked with its color (the young cells they promoted): live, but
-    /// not the final pause's or the marker's to count.
-    cycle_marked: usize,
+    /// Bytes the start pause of the current marking cycle marked with its
+    /// color (the young cells it promoted): live when the cycle began, as a
+    /// stop-the-world collection would have found them, but not the final
+    /// pause's or the marker's to count. (Not the cells later minor
+    /// collections promote: made since, they are marked as they come, dead
+    /// or not: Splay's live peak read 241 MiB with them, 140 stop-the-world.)
+    start_marked: usize,
     /// Old cells a minor collection during marking shaded for the marker.
     shade: Vec<usize>,
     /// The marker thread, once a cycle needed it.
@@ -1426,10 +1429,8 @@ impl Vm {
         } else {
             self.heap.gc.promoted += traced;
         }
-        match kind {
-            Collection::Start => self.heap.gc.cycle_marked = traced,
-            Collection::MinorShade => self.heap.gc.cycle_marked += traced,
-            _ => {}
+        if kind == Collection::Start {
+            self.heap.gc.start_marked = traced;
         }
         self.heap.gc.stack = stack;
         self.heap.gc.log.clear();
@@ -1442,13 +1443,14 @@ impl Vm {
                 std::mem::take(&mut mk.shared.state.lock().unwrap().marked)
             });
             // The blocks the sweep left in use (partly free ones too),
-            // and room to grow by what was live, times `GROWTH - 1`.
+            // and room to grow by what was live, times `GROWTH - 1`: what
+            // this pause and the marker marked. (Not what the cycle's start
+            // pause promoted, live too: the pacing was tuned without it, and
+            // counting it grew Splay's peak RSS 4% at the same speed.)
             let live = traced + concurrent;
             let room = ((GROWTH - 1) * live).max(FULL_MIN);
-            // (What the cycle's earlier pauses marked is live too; the
-            // room above leaves it out.)
-            let cycle = if kind == Collection::Final { std::mem::take(&mut self.heap.gc.cycle_marked) } else { 0 };
-            LIVE_PEAK.fetch_max((live + cycle) as u64, std::sync::atomic::Ordering::Relaxed);
+            let start = if kind == Collection::Final { std::mem::take(&mut self.heap.gc.start_marked) } else { 0 };
+            LIVE_PEAK.fetch_max((live + start) as u64, std::sync::atomic::Ordering::Relaxed);
             self.heap.gc.live = live;
             self.heap.gc.room = room;
             if kind == Collection::Final {

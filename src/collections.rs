@@ -251,6 +251,31 @@ fn hash(k: Value) -> u32 {
     (bits.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 32) as u32
 }
 
+/// Whether `k` is hashed by its address (see [`hash`]): a cell that isn't
+/// a string or a BigInt.
+pub(crate) fn hashed_by_address(k: Value) -> bool {
+    k.is_cell() && k.as_number().is_none() && string_units(k).is_none() && !crate::bigint::is_bigint(k)
+}
+
+/// The keys of collection `o` that are hashed by their address (for
+/// `CLOISON_GC_FRAG`: they could not move).
+pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
+    if !matches!(unsafe { (*o).class }, Class::Map | Class::Set | Class::WeakMap | Class::WeakSet) {
+        return;
+    }
+    let e = Value::from_bits(unsafe { (*o).code } as u64);
+    if !e.is_cell() {
+        return;
+    }
+    let (e, s) = (as_object(e), stride(o));
+    for i in (BASE..len(e)).step_by(s) {
+        let k = slot(e, i);
+        if hashed_by_address(k) {
+            f(k.to_bits() as usize);
+        }
+    }
+}
+
 /// The entries array of collection (or iterator) `o`.
 fn entries(o: *mut Object) -> *mut Object {
     unsafe { as_object(Value::from_bits((*o).code as u64)) }

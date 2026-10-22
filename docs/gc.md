@@ -695,6 +695,20 @@ runs) and the microbenchmarks.
      would need the concurrent marker to record slots into candidate
      blocks and pin what conservative words and compiled code refer to,
      for one benchmark's memory (still a seventh of no collector's).
+   - *Evacuation, measured* (`CLOISON_GC_FRAG`: after each
+     stop-the-world full collection, the small blocks by occupancy and
+     the bytes in them that could not move). What pins a cell: a native
+     stack word pointing into it, an address Rust structures or compiled
+     code hold (`kept`, the prototype slots compiled code folded, the
+     prototypes constructor tracking knows by address), a collection's key
+     hashed by address. All together under 0.1% of the live bytes (Splay
+     0.004 MiB of 106; TypeScript 0.13 of 172, mostly `kept`): nearly
+     everything could move. Evacuating the movable cells of the blocks
+     under half full: Splay's blocks 266 MiB -> 138 (40% full, 48 MiB
+     moved), PdfJS 42 -> 16, EarleyBoyer 23 -> 7; TypeScript 246 -> 232,
+     CodeLoad 15 -> 12, GBEmu nothing (70-90% full). Not counted: Rust
+     code holding a raw cell address none of these record, which an
+     evacuation stress mode would have to find.
 
    Octane after step 6 (seconds, peak RSS): Richards 1.86 s, 41 MB;
    DeltaBlue 1.09 s, 64 MB; Crypto 5.60 s, 49 MB; RayTrace 10.85 s,

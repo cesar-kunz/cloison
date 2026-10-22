@@ -4352,6 +4352,14 @@ impl Vm {
     /// The slack tracking of `new` of `code` for objects with prototype
     /// `proto`, once `code` has made objects with another prototype than
     /// its first's (see `Code::ctor_shared`); `None` before: the code's.
+    /// The prototypes constructor tracking knows by address (codes' first
+    /// and `ctor_protos`' keys), for `CLOISON_GC_FRAG`.
+    pub(crate) fn ctor_protos_keys(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.ctor_protos.keys().map(|&k| k as usize).collect();
+        v.extend(self.codes().map(|c| c.ctor_proto.get() as usize).filter(|&p| p != 0));
+        v
+    }
+
     pub(crate) fn ctor_proto(&mut self, code: &Code, proto: Value) -> Option<*const CtorProto> {
         let p = proto.to_bits();
         if !code.ctor_shared.get() {

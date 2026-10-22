@@ -654,6 +654,15 @@ impl Heap {
 
     /// The address range of each block in use: a small block's, or a large
     /// cell's first granule.
+    /// Whether `a` is in a small block (`Some(false)`: a large cell's).
+    pub(crate) fn block_kind(&self, a: usize) -> Option<bool> {
+        match *self.blocks.get(a.checked_sub(self.base)? / BLOCK)? {
+            Block::Small => Some(true),
+            Block::LargeHead(_) | Block::LargeTail => Some(false),
+            Block::Free | Block::Header => None,
+        }
+    }
+
     pub(crate) fn block_ranges(&self) -> Vec<(usize, usize)> {
         let mut v = Vec::with_capacity(self.blocks.len());
         for (b, &k) in self.blocks.iter().enumerate() {

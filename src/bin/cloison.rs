@@ -113,6 +113,7 @@ fn main() -> ExitCode {
         eprintln!("heap: {cells} cells, {} MiB of blocks", vm.heap.allocated() >> 20);
     }
     let mem = vm.memory_stats();
+    let jit = if std::env::var_os("CLOISON_SIZES").is_some() { cloison::jit::census(&vm) } else { Default::default() };
     // (What the heap holds at the end counts for its peak too.)
     cloison::gc::HEAP_PEAK.fetch_max(vm.heap.allocated() as u64, std::sync::atomic::Ordering::Relaxed);
     // The process exits next: freeing the VM's shapes and code one by one
@@ -145,8 +146,8 @@ fn main() -> ExitCode {
                 );
             }
             // `CLOISON_SIZES`: what the run compiled, one line of `name=value`
-            // (`scripts/octane-sizes.sh` reads it), and its collections, another
-            // (`scripts/octane-memory.sh`).
+            // (`scripts/octane-sizes.sh` reads it), its collections and memory,
+            // others (`scripts/octane-memory.sh`), and what the JIT keeps.
             if std::env::var_os("CLOISON_SIZES").is_some() {
                 let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
@@ -180,10 +181,14 @@ fn main() -> ExitCode {
                 };
                 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
                 let malloc = 0;
+                let jit_bytes: usize = jit.1.iter().map(|(_, v)| v).sum();
                 eprintln!(
-                    "mem shapes={} shape_bytes={} codes={} code_bytes={} pinned_codes={} dead_shapes={} malloc={malloc}",
+                    "mem shapes={} shape_bytes={} codes={} code_bytes={} pinned_codes={} dead_shapes={} jit_bytes={jit_bytes} malloc={malloc}",
                     mem[0], mem[1], mem[2], mem[3], mem[4], mem[5]
                 );
+                // What the JIT keeps, by kind (see `jit::census`).
+                let line: Vec<String> = jit.0.iter().chain(&jit.1).map(|(k, v)| format!("{k}={v}")).collect();
+                eprintln!("jit {}", line.join(" "));
             }
             // `CLOISON_COUNT`: hot code's stencil executions.
             if std::env::var_os("CLOISON_COUNT").is_some() {

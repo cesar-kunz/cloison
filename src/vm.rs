@@ -5098,10 +5098,8 @@ impl Vm {
         let names = jit
             .as_ref()?
             .last_code()?
-            .stencils
-            .iter()
-            .flatten()
-            .cloned()
+            .stencils()
+            .map(String::from)
             .collect();
         Some(names)
     }

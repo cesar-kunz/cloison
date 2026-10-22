@@ -7658,10 +7658,12 @@ pub struct JitCode {
     exit_len: usize,
     /// Bytes of code: hot, cold (stubs, helpers) and runtime-call wrappers.
     len: usize,
-    /// The selected stencil per instruction (`None`: unreachable from the
-    /// entry, or covered by the fused stencil of an earlier instruction),
-    /// for inspection and tests.
-    pub stencils: Vec<Option<String>>,
+    /// The stencils selected, in instruction order (but for instructions
+    /// unreachable from the entry, or covered by the fused stencil of an
+    /// earlier one), separated by spaces, for inspection and tests (see
+    /// [`JitCode::stencils`]). (One string: a `String` per instruction
+    /// took TypeScript 12 MB.)
+    stencils: Box<str>,
     /// Where each VM register lived.
     pub homes: Vec<Home>,
     /// What its `Return`s give (the join of `acc`'s types there), `Bot` if
@@ -7731,6 +7733,11 @@ struct Options {
 }
 
 impl JitCode {
+    /// The stencils selected, in instruction order (see `stencils`).
+    pub fn stencils(&self) -> impl Iterator<Item = &str> {
+        self.stencils.split(' ').filter(|s| !s.is_empty())
+    }
+
     /// Compile `insns` for entry at instruction `entry` with the exact types
     /// `actual` of the live values.
     fn compile(
@@ -9426,7 +9433,7 @@ impl JitCode {
             ool_len,
             exit_len,
             len,
-            stencils: names,
+            stencils: names.into_iter().flatten().collect::<Vec<_>>().join(" ").into(),
             homes,
             ret,
             self_sites,
@@ -9471,7 +9478,7 @@ impl JitCode {
     /// known (see `asm::FunctionDef::line`).
     fn log(&self, function: *const crate::vm::Code, pc: usize) {
         if std::env::var_os("CLOISON_JIT_LOG").is_some() {
-            let names: Vec<&str> = self.stencils.iter().flatten().map(String::as_str).collect();
+            let names: Vec<&str> = self.stencils().collect();
             let f = unsafe { &*function };
             let name = if f.line == 0 { f.name.clone() } else { format!("{}:{}:{}", f.name, f.line, f.col) };
             eprintln!(
@@ -15003,6 +15010,9 @@ impl JitFunction {
             self.nregs = low.nregs;
             vm.direct_base = low.direct_base;
             vm.props = low.props;
+            // (Kept with the lowering: room for 4 times the function's
+            // instructions, which inlining rarely takes, cost Mandreel 12 MB.)
+            vm.props.shrink_to_fit();
             vm.polys = low.polys;
             vm.fbs = low.fbs;
             let frame_regs = low
@@ -16548,6 +16558,117 @@ extern "C" fn cloison_rt_call(regs: Value, site: Value) -> Value {
             site.frame,
         )
     }
+}
+
+/// What the JIT keeps (`CLOISON_SIZES`): the functions it lowered, their
+/// compiled versions and those retired (counts), and the bytes of its
+/// tables by kind: per function its lowering's (instructions, the exits'
+/// instruction and liveness, property accesses, ...), per compiled
+/// version its own and its machine code, the VM's caches of bytecode
+/// facts.
+pub fn census(vm: &crate::vm::Vm) -> (Vec<(&'static str, usize)>, Vec<(&'static str, usize)>) {
+    use std::mem::size_of;
+    fn map<K, V, S>(m: &std::collections::HashMap<K, V, S>) -> usize {
+        m.capacity() * (size_of::<(K, V)>() + 1)
+    }
+    fn set<K, S>(m: &std::collections::HashSet<K, S>) -> usize {
+        m.capacity() * (size_of::<K>() + 1)
+    }
+    fn vec<T>(v: &[T]) -> usize {
+        std::mem::size_of_val(v)
+    }
+    let mut seen: HashSet<usize> = HashSet::default();
+    let mut once = |p: usize| seen.insert(p);
+    let (mut insns, mut snap, mut exit_at, mut exit_live, mut lowered, mut props) = (0, 0, 0, 0, 0, 0);
+    let (mut versions, mut names, mut machine, mut entry, mut fits, mut funcs, mut codes) = (0, 0, 0, 0, 0, 0, 0);
+    let mut vtables = 0;
+    let mut jit_code = |c: &Rc<JitCode>, once: &mut dyn FnMut(usize) -> bool| {
+        if !once(Rc::as_ptr(c) as usize) {
+            return;
+        }
+        codes += 1;
+        names += c.stencils.len();
+        versions += size_of::<JitCode>() + vec(&c.homes) + vec(&c.self_sites) + c.forks.len() * size_of::<CallSite>();
+        machine += c.mem.len;
+    };
+    for code in &vm.codes {
+        let jit = code.jit.borrow();
+        let Some(f) = jit.as_ref() else { continue };
+        funcs += 1;
+        let mut snaps = Vec::new();
+        if once(f.insns.as_ptr() as usize) {
+            insns += vec(&f.insns);
+        }
+        lowered += f.code.capacity() + set(&f.widened) + map(&f.wide);
+        for vs in f.versions.values() {
+            vtables += vec(vs);
+            for (_, c) in vs {
+                jit_code(c, &mut once);
+                snaps.extend(c.snap.clone());
+            }
+        }
+        for l in f.live_at.values() {
+            if once(Rc::as_ptr(l) as usize) {
+                entry += vec(&l.reach) + vec(&l.regs) + vec(&l.acc) + vec(&l.at_entry) + vec(&l.live_list) + vec(&l.read_at_entry);
+            }
+        }
+        entry += map(&f.live_at);
+        for fit in f.fits.borrow().values() {
+            fits += vec(fit);
+            for x in fit.iter() {
+                jit_code(&x.code, &mut once);
+                fits += vec(&x.regs);
+            }
+        }
+        if let Some(v) = f.vm.as_ref() {
+            props += v.props.capacity() * size_of::<Prop>();
+            lowered += vec(&v.polys) + vec(&v.fbs) + set(&v.widened) + map(&v.property_exits) + map(&v.callee_exits)
+                + map(&v.bail_exits) + set(&v.no_entry) + vec(&v.int_upvalues) + size_of::<VmState>();
+            snaps.push(v.snap.clone());
+        }
+        for s in snaps {
+            if !once(Rc::as_ptr(&s) as usize) {
+                continue;
+            }
+            if once(s.insns.as_ptr() as usize) {
+                insns += vec(&s.insns);
+            }
+            exit_at += map(&s.exit_at);
+            exit_live += s.exit_live.capacity() * size_of::<RegSet>();
+            snap += size_of::<Snapshot>() + map(&s.mats) + s.mats.values().map(|m| vec(m) + m.len() * size_of::<Mat>()).sum::<usize>()
+                + vec(&s.frames) + vec(&s.frame_regs) + vec(&s.aliases) + vec(&s.restores) + vec(&s.split)
+                + s.sites.len() * size_of::<CallSite>() + s.caches.len() * size_of::<InstanceOfCache>();
+        }
+    }
+    let c = &vm.jit_caches;
+    for r in &c.retired {
+        jit_code(r, &mut once);
+    }
+    let decoded = map(&c.decoded) + c.decoded.values().map(|d| vec(&d.0) + vec(&d.1) + vec(&d.2)).sum::<usize>();
+    let pc_live = map(&c.pc_live) + c.pc_live.values().map(|m| map(m)).sum::<usize>();
+    let reg_live = map(&c.reg_live) + c.reg_live.values().map(|v| vec(v)).sum::<usize>();
+    let other = map(&c.entry_live) + c.entry_live.values().map(|v| vec(v)).sum::<usize>() + map(&c.assigned) + map(&c.facts)
+        + map(&c.lazy_writes) + map(&c.smis) + c.smis.values().map(|v| vec(v)).sum::<usize>();
+    let counts = vec![("funcs", funcs), ("versions", codes), ("retired", c.retired.len())];
+    let bytes = vec![
+        ("insns", insns),
+        ("exit_at", exit_at),
+        ("exit_live", exit_live),
+        ("snap", snap),
+        ("props", props),
+        ("lowered", lowered),
+        ("version", versions),
+        ("names", names),
+        ("machine", machine),
+        ("entry_live", entry),
+        ("fits", fits),
+        ("vtables", vtables),
+        ("decoded", decoded),
+        ("pc_live", pc_live),
+        ("reg_live", reg_live),
+        ("caches", other),
+    ];
+    (counts, bytes)
 }
 
 #[cfg(test)]

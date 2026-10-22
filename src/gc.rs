@@ -1350,6 +1350,7 @@ impl Vm {
         if let Some(m) = &self.heap.gc.marker {
             m.pause();
         }
+        self.short_strings.fill(Value::EMPTY);
         if matches!(kind, Collection::Start | Collection::Full) {
             self.heap.finish_sweep();
             // The cells that could still refer to them are swept.

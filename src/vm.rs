@@ -369,6 +369,10 @@ pub static FUNCTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static BYTECODE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static STUBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Entries of [`Vm::short_strings`], and the longest string kept there.
+const SHORT_STRINGS: usize = 1024;
+const SHORT_STRING_UNITS: usize = 32;
+
 /// A function's code, shared by its closures.
 pub struct Code {
     pub name: String,
@@ -897,6 +901,11 @@ pub struct Vm {
     pub(crate) error_prototypes: Vec<*mut Object>,
     /// Strings of one code unit below 256, made on first use.
     single_chars: Vec<Value>,
+    /// Short strings substrings made, by a hash of their units, to give
+    /// an equal one again (see [`Vm::short_string`]). Emptied as each
+    /// collection starts, so it holds no string the collector has found
+    /// dead nor one a concurrent marking hasn't seen.
+    pub(crate) short_strings: Vec<Value>,
     pub(crate) a_to_string: Atom,
     pub(crate) a_value_of: Atom,
     /// `Array.prototype.push` and `pop`, which the JIT compiles inline.
@@ -1101,6 +1110,7 @@ impl Vm {
             agent: crate::agent::State::default(),
             temporal: crate::temporal::State::default(),
             single_chars: vec![Value::EMPTY; 256],
+            short_strings: vec![Value::EMPTY; SHORT_STRINGS],
             a_to_string: Atom(0),
             a_value_of: Atom(0),
             array_push_fn: std::ptr::null_mut(),
@@ -3842,6 +3852,28 @@ impl Vm {
             (*o).elems_len = u32::try_from(len).expect("string too long");
             object_value(o)
         }
+    }
+
+    /// A string of `units`: one made from equal units since the last
+    /// collection began, if [`Vm::short_strings`] still has it, else a new
+    /// one. For substrings: a scanner's identifiers repeat (TypeScript's
+    /// live strings were 223,000 of 7,000 distinct contents).
+    pub(crate) fn short_string(&mut self, units: &[u16]) -> Value {
+        if !(2..=SHORT_STRING_UNITS).contains(&units.len()) {
+            return self.new_string(units);
+        }
+        let mut h = units.len() as u64;
+        for &c in units {
+            h = (h.rotate_left(5) ^ c as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+        let slot = (h >> 54) as usize % SHORT_STRINGS;
+        let v = self.short_strings[slot];
+        if v != Value::EMPTY && string_units(v) == Some(units) {
+            return v;
+        }
+        let v = self.new_string(units);
+        self.short_strings[slot] = v;
+        v
     }
 
     /// The string of the one code unit `c` (below 256, the string

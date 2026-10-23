@@ -2239,9 +2239,11 @@ fn unswap_backward_jumps(insns: &mut [Insn]) {
 /// bytecode `code` (decoded) as the interpreter runs it. Conservative:
 /// every register operand is read, but the destinations of `Star` and
 /// `Mov`, and it covers instructions the JIT doesn't compile (which
-/// [`reg_live_in`] doesn't). Live into the first: what the function may
-/// read before writing, when called (see [`Lowering::entry_live`]).
-fn bytecode_live(code: &[u8], insns: &[Insn]) -> Vec<RegSet> {
+/// [`reg_live_in`] doesn't), and a `CreateClosure` reads the registers
+/// its closure captures (`closures`: the function's nested codes). Live
+/// into the first: what the function may read before writing, when called
+/// (see [`Lowering::entry_live`]).
+fn bytecode_live(code: &[u8], insns: &[Insn], closures: &[*const crate::vm::Code]) -> Vec<RegSet> {
     use crate::bytecode::Operand;
     // Per instruction: registers read, and the register written.
     let effects: Vec<(RegSet, Option<usize>)> = insns
@@ -2268,6 +2270,18 @@ fn bytecode_live(code: &[u8], insns: &[Insn]) -> Vec<RegSet> {
                     let n = count + usize::from(op == Op::Call);
                     for r in std::iter::once(regs[0]).chain(regs[1]..regs[1] + n) {
                         rs_add(&mut reads, r);
+                    }
+                    None
+                }
+                // (A direct call sets a missing parameter to `undefined`
+                // only if it is live: `(() => p)()` captured the previous
+                // call's argument.)
+                Op::CreateClosure => {
+                    let k = u16::from_le_bytes([code[insn.pc + 1], code[insn.pc + 2]]) as usize;
+                    for &(local, r) in unsafe { (*closures[k]).upvalues.iter() } {
+                        if local {
+                            rs_add(&mut reads, r as usize);
+                        }
                     }
                     None
                 }
@@ -12540,7 +12554,7 @@ impl Lowering<'_> {
             return l.clone();
         }
         let d = self.decoded(code);
-        let live = bytecode_live(unsafe { &(*code).bytecode }, &d.0);
+        let live = bytecode_live(unsafe { &(*code).bytecode }, &d.0, unsafe { &(*code).closures });
         let l: Rc<PcLive> = Rc::new(d.0.iter().map(|i| i.pc).zip(live).collect());
         self.caches().pc_live.insert(code, l.clone());
         l

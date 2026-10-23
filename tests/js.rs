@@ -8341,3 +8341,34 @@ out.join(' ');
 "#;
     assert_eq!(value(src), "false,number,false trueundefined true false");
 }
+
+/// Agents belong to the VM that starts them: dropped with it (an agent
+/// waiting for a broadcast ends), reached by its broadcasts only, at most
+/// `MAX_AGENTS` at once (cloison-fuzz BUGS.md #2: 512 dropped VMs' agents
+/// outlived them and their heaps ran out).
+#[test]
+fn agents_end_with_their_vm() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let module = cloison::js::compile("$262.agent.start('$262.agent.receiveBroadcast(function () {})'); 1").unwrap();
+    for _ in 0..600 {
+        let mut vm = Vm::new();
+        vm.run(&module).unwrap();
+    }
+    // Another VM's broadcast doesn't reach this one's agent.
+    let mut a = Vm::new();
+    a.run(&cloison::js::compile(
+        "$262.agent.start('$262.agent.receiveBroadcast(function () { $262.agent.report(1); })'); 1",
+    ).unwrap()).unwrap();
+    let mut b = Vm::new();
+    b.run(&cloison::js::compile("$262.agent.broadcast(new SharedArrayBuffer(8)); 1").unwrap()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let none = cloison::js::compile("$262.agent.getReport()").unwrap();
+    assert_eq!(cloison::vm::display(a.run(&none).unwrap()), "null");
+    let src = r#"
+        var n = 0, r;
+        try { for (;;) { $262.agent.start('$262.agent.receiveBroadcast(function () {})'); n++; } }
+        catch (e) { r = n + " " + e.constructor.name; }
+        r
+    "#;
+    assert_eq!(value(src), "64 TypeError");
+}

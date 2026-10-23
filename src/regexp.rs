@@ -90,6 +90,10 @@ enum Node {
     Any,
     /// A class: sorted inclusive ranges, and whether it is negated.
     Class(Vec<(u16, u16)>, bool),
+    /// A class's unit that is no surrogate pair's half (`u` mode, where
+    /// the input is code points): a lead not followed by a trail, a trail
+    /// not preceded by a lead, or any other.
+    Alone(Vec<(u16, u16)>, bool),
     /// A surrogate pair whose astral code point is in the sorted inclusive
     /// ranges (`u` mode).
     Astral(Vec<(u32, u32)>),
@@ -741,7 +745,7 @@ impl Regex {
             // but Unicode's: `ſ` and the Kelvin sign.)
             Node::Char(c) => units(&|x| eq(ic, x, *c), *c >= 128 || ic == Case::Unicode),
             Node::Any => units(&|x| !is_line_terminator(x), true),
-            Node::Class(r, neg) => units(
+            Node::Class(r, neg) | Node::Alone(r, neg) => units(
                 &|x| in_class(ic, r, *neg, x),
                 *neg || r.iter().any(|&(_, hi)| hi >= 128) || ic == Case::Unicode,
             ),
@@ -926,7 +930,7 @@ pub(crate) fn find(s: &[u16], needle: &[u16], from: usize) -> Option<usize> {
 fn width(n: &Node) -> (usize, Option<usize>) {
     match n {
         Node::Empty | Node::Start(_) | Node::End(_) | Node::Boundary(..) | Node::Look(..) => (0, Some(0)),
-        Node::Char(_) | Node::Any | Node::Class(..) => (1, Some(1)),
+        Node::Char(_) | Node::Any | Node::Class(..) | Node::Alone(..) => (1, Some(1)),
         Node::Astral(_) => (2, Some(2)),
         Node::Group(inner, _) => width(inner),
         Node::BackRef(..) => (0, None),
@@ -1119,6 +1123,7 @@ impl Parser<'_> {
                 if r == [(c, c)] { Node::Char(c) } else { Node::Class(r, false) }
             }
             Node::Class(r, neg) => Node::Class(fold_ranges(&r, case), neg),
+            Node::Alone(r, neg) => Node::Alone(fold_ranges(&r, case), neg),
             Node::Alt(v) => Node::Alt(v.into_iter().map(|n| self.fold(n)).collect()),
             Node::Seq(v) => Node::Seq(v.into_iter().map(|n| self.fold(n)).collect()),
             n => n,
@@ -1272,10 +1277,9 @@ impl Parser<'_> {
         self.i += 1;
         Ok(match c {
             '.' if self.dot_all => {
-                let any = Node::Class(vec![(0, 0xFFFF)], false);
-                if self.unicode { Node::Alt(vec![surrogate_pair(), any]) } else { any }
+                if self.unicode { pair_or_unit(&[]) } else { Node::Class(vec![(0, 0xFFFF)], false) }
             }
-            '.' if self.unicode => Node::Alt(vec![surrogate_pair(), Node::Any]),
+            '.' if self.unicode => pair_or_unit(&[(0x0A, 0x0A), (0x0D, 0x0D), (0x2028, 0x2029)]),
             '.' => Node::Any,
             '^' => Node::Start(self.multiline),
             '$' => Node::End(self.multiline),
@@ -1408,7 +1412,7 @@ impl Parser<'_> {
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                 let (ranges, neg) = self.class_escape(e);
                 if neg && self.unicode {
-                    Node::Alt(vec![surrogate_pair(), Node::Class(ranges, neg)])
+                    pair_or_unit(&ranges)
                 } else {
                     Node::Class(ranges, neg)
                 }
@@ -1869,36 +1873,28 @@ fn cp_class(mut ranges: Vec<(u32, u32)>, neg: bool) -> Node {
     ranges.sort();
     let mut astral: Vec<(u32, u32)> =
         ranges.iter().filter(|r| r.1 >= 0x10000).map(|&(lo, hi)| (lo.max(0x10000), hi.min(0x10FFFF))).collect();
-    let mut bmp: Vec<(u16, u16)> =
+    let bmp: Vec<(u16, u16)> =
         ranges.iter().filter(|r| r.0 <= 0xFFFF).map(|&(lo, hi)| (lo as u16, hi.min(0xFFFF) as u16)).collect();
-    // A lead alone, not followed by a trail, is a code point of its own,
-    // which a negated class matches unless it names it.
-    let mut lone = None;
     if neg {
         astral = complement_points(&astral).into_iter().filter(|r| r.1 >= 0x10000).map(|(lo, hi)| (lo.max(0x10000), hi)).collect();
-        let named: Vec<(u32, u32)> = bmp.iter().map(|&(a, b)| (a as u32, b as u32)).collect();
-        let leads: Vec<(u16, u16)> = complement_points(&named)
-            .into_iter()
-            .filter(|&(a, b)| a <= LEADS.1 as u32 && b >= LEADS.0 as u32)
-            .map(|(a, b)| (a.max(LEADS.0 as u32) as u16, b.min(LEADS.1 as u32) as u16))
-            .collect();
-        if !leads.is_empty() {
-            lone = Some(Node::Seq(vec![Node::Class(leads, false), not_followed_by_trail()]));
-        }
-        // (Not a pair's first half: its character is astral.)
-        bmp.push((0xD800, 0xDBFF));
-        bmp.sort();
     }
     let mut alts = Vec::new();
     if !astral.is_empty() {
         alts.push(Node::Astral(astral));
     }
-    alts.push(Node::Class(bmp, neg));
-    alts.extend(lone);
+    alts.push(if neg { Node::Alone(bmp, true) } else { Node::Class(bmp, false) });
     if alts.len() == 1 {
         return alts.pop().unwrap();
     }
     Node::Alt(alts)
+}
+
+/// In `u` mode, a character but those in `excluded` (`.`, `\W`) matches
+/// as one code point: a surrogate pair whole, or a unit that is no pair's
+/// half (which backtracking, or a lookbehind matching backwards, would
+/// otherwise split a pair at).
+fn pair_or_unit(excluded: &[(u16, u16)]) -> Node {
+    Node::Alt(vec![surrogate_pair(), Node::Alone(excluded.to_vec(), true)])
 }
 
 /// A surrogate pair: an astral character in `u` mode.
@@ -1966,6 +1962,16 @@ fn in_points(r: &[(u32, u32)], c: u32) -> bool {
     k < r.len() && r[k].0 <= c
 }
 
+/// Whether `s[i]` is no surrogate pair's half (see `Node::Alone`).
+#[inline]
+fn alone(s: &[u16], i: usize) -> bool {
+    match s[i] {
+        0xD800..=0xDBFF => !s.get(i + 1).is_some_and(|c| (0xDC00..0xE000).contains(c)),
+        0xDC00..=0xDFFF => i == 0 || !(0xD800..0xDC00).contains(&s[i - 1]),
+        _ => true,
+    }
+}
+
 fn is_line_terminator(c: u16) -> bool {
     matches!(c, 0x0A | 0x0D | 0x2028 | 0x2029)
 }
@@ -2007,6 +2013,9 @@ enum Insn {
     /// A class: ASCII members by `ascii`'s bits, the rest by
     /// `Program::classes[k]`.
     Class { ascii: u128, k: u32 },
+    /// A class's unit that is no surrogate pair's half (`Node::Alone`), as
+    /// `Class`.
+    Alone { ascii: u128, k: u32 },
     /// A surrogate pair of a code point in `Program::astral[k]`.
     Astral(u32),
     /// `^`, `$`: multiline or not.
@@ -2062,7 +2071,8 @@ enum Insn {
 struct Program {
     code: Vec<Insn>,
     /// Classes' ranges and negation, for units past ASCII.
-    classes: Vec<(Vec<(u16, u16)>, bool)>,
+    /// (Ranges, negated, and whether for `Insn::Alone`.)
+    classes: Vec<(Vec<(u16, u16)>, bool, bool)>,
     /// `Str`'s code units.
     strs: Vec<Vec<u16>>,
     /// `Astral`'s ranges.
@@ -2198,13 +2208,13 @@ impl Native {
         let mut runs: Box<[rx::Run]> = (0..nruns).map(|_| rx::Run::default()).collect();
         let mut heads: Box<[rx::Head]> = (0..nheads).map(|_| rx::Head::default()).collect();
         let ranges: Vec<Vec<[u16; 2]>> =
-            re.prog.classes.iter().map(|(r, _)| r.iter().map(|&(lo, hi)| [lo, hi]).collect()).collect();
+            re.prog.classes.iter().map(|(r, ..)| r.iter().map(|&(lo, hi)| [lo, hi]).collect()).collect();
         let classes: Box<[rx::Class]> = re
             .prog
             .classes
             .iter()
             .zip(&ranges)
-            .map(|((_, neg), r)| rx::Class { ranges: r.as_ptr(), n: r.len(), neg: *neg as usize })
+            .map(|((_, neg, alone), r)| rx::Class { ranges: r.as_ptr(), n: r.len(), neg: *neg as usize | (*alone as usize) << 1 })
             .collect();
         let reg = |r: u32| 1 + r as usize;
         let group = |g: u32| caps_at + 2 * g as usize;
@@ -2220,7 +2230,8 @@ impl Native {
                 Insn::Char(c) => Piece { imm: c as u32, ..piece("rx_char") },
                 Insn::CharFold { c, canon } => Piece { imm: c as u32 | (canon as u32) << 16, ..piece("rx_fold") },
                 Insn::Any => piece("rx_any"),
-                Insn::Class { ascii, k } => Piece {
+                // (An `Alone` class's surrogates bail: see `rx::Class::neg`.)
+                Insn::Class { ascii, k } | Insn::Alone { ascii, k } => Piece {
                     imm: k,
                     imm64: Imm64::Value(ascii as u64),
                     imm64b: (ascii >> 64) as u64,
@@ -2393,10 +2404,12 @@ impl Program {
             Node::Char(c) if ic != Case::Exact => Insn::CharFold { c: *c, canon: ic.canon(*c) },
             Node::Char(c) => Insn::Char(*c),
             Node::Any => Insn::Any,
-            Node::Class(r, neg) => {
+            Node::Class(r, neg) | Node::Alone(r, neg) => {
+                let alone = matches!(n, Node::Alone(..));
                 let ascii = (0..128u16).filter(|&x| in_class(ic, r, *neg, x)).fold(0u128, |m, x| m | 1 << x);
-                self.classes.push((r.clone(), *neg));
-                Insn::Class { ascii, k: (self.classes.len() - 1) as u32 }
+                self.classes.push((r.clone(), *neg, alone));
+                let k = (self.classes.len() - 1) as u32;
+                if alone { Insn::Alone { ascii, k } } else { Insn::Class { ascii, k } }
             }
             _ => return None,
         })
@@ -2414,7 +2427,7 @@ impl Program {
         }
         match n {
             Node::Empty => {}
-            Node::Char(_) | Node::Any | Node::Class(..) => unreachable!(),
+            Node::Char(_) | Node::Any | Node::Class(..) | Node::Alone(..) => unreachable!(),
             Node::Astral(r) => {
                 self.astral.push(r.clone());
                 let i = Insn::Astral((self.astral.len() - 1) as u32);
@@ -2506,8 +2519,10 @@ impl Program {
                 }
             }
             Node::Repeat(inner, min, max, greedy, groups) => {
-                // (A run goes forwards.)
+                // (A run goes forwards, of a unit that doesn't look past
+                // itself.)
                 if !self.backward
+                    && !matches!(**inner, Node::Alone(..))
                     && let Some(i) = self.unit(re, inner)
                 {
                     let (min, max) = (*min, *max);
@@ -2574,7 +2589,7 @@ impl Program {
                 if c < 128 {
                     ascii >> c & 1 != 0
                 } else {
-                    let (r, neg) = &self.classes[k as usize];
+                    let (r, neg, _) = &self.classes[k as usize];
                     in_class(self.ic, r, *neg, c)
                 }
             }
@@ -2596,6 +2611,12 @@ impl Program {
             let ok = match self.code[pc] {
                 i @ (Insn::Char(_) | Insn::CharFold { .. } | Insn::Any | Insn::Class { .. }) => {
                     let ok = pos < s.len() && self.unit_matches(i, s[pos]);
+                    pos += 1;
+                    pc += 1;
+                    ok
+                }
+                Insn::Alone { ascii, k } => {
+                    let ok = pos < s.len() && self.unit_matches(Insn::Class { ascii, k }, s[pos]) && alone(s, pos);
                     pos += 1;
                     pc += 1;
                     ok
@@ -2888,6 +2909,7 @@ impl<'a> Matcher<'a> {
             Node::Char(c) => i < s.len() && self.eq(s[i], *c) && k(self, i + 1),
             Node::Any => i < s.len() && !is_line_terminator(s[i]) && k(self, i + 1),
             Node::Class(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && k(self, i + 1),
+            Node::Alone(r, neg) => i < s.len() && self.in_class(r, *neg, s[i]) && alone(s, i) && k(self, i + 1),
             Node::Astral(r) => astral_at(s, i).is_some_and(|c| in_points(r, c)) && k(self, i + 2),
             Node::Start(m) => (i == 0 || (*m && is_line_terminator(s[i - 1]))) && k(self, i),
             Node::End(m) => (i == s.len() || (*m && is_line_terminator(s[i]))) && k(self, i),
@@ -3176,6 +3198,57 @@ mod tests {
         assert_eq!(native("[à-ï]+", "i").exec(&u("aÀÉé"), 0).unwrap()[0], Some((1, 4)));
         assert_eq!(native("[à-ï]+", "").exec(&u("aÀÉé"), 0).unwrap()[0], Some((3, 4)));
         assert_eq!(native("\\s+", "").exec(&u("a\u{a0}\u{2028} b"), 0).unwrap()[0], Some((1, 4)));
+    }
+
+    /// In `u` mode, native code for `.`, `\W` and negated classes, which
+    /// match a pair whole or a unit that is no pair's half (`Node::Alone`,
+    /// bailing at a surrogate), and the interpreter match as the reference
+    /// matcher does, backtracking and in lookbehinds too, on text of pairs,
+    /// lone halves and ASCII. (Whether a half is alone, all three ask
+    /// `alone`: `tests/js.rs` has the cases.)
+    #[test]
+    fn unicode_units_never_split_pairs() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let atoms = [".", "\\W", "\\S", "\\D", "[^a]", "[^\\ud83d]", "[^\\ude00]", "a", ",", "(.)", "\\B", "\\b"];
+        let quants = ["", "", "*", "+", "?", "{2,}", "*?", "+?"];
+        let units = [b'a' as u16, b',' as u16, 0xD83D, 0xDE00, 0xD83D, 0xDE00];
+        let (mut tried, mut matched) = (0, 0);
+        for k in 0..4000 {
+            let mut p: String = (0..1 + rand(3)).map(|_| format!("{}{}", atoms[rand(atoms.len())], quants[rand(quants.len())])).collect();
+            match rand(4) {
+                0 => p = format!("a(?<={p})"),
+                1 => p = format!("(?<!{p}),"),
+                _ => {}
+            }
+            let f = ["u", "ui", "us", "uy"][rand(4)];
+            let Ok(re) = Regex::new(&p, f) else { continue };
+            if k % 2 == 0 {
+                let _ = re.native.set(Native::compile(&re));
+            }
+            for _ in 0..4 {
+                let s: Vec<u16> = (0..rand(9)).map(|_| units[rand(units.len())]).collect();
+                for start in 0..=s.len() {
+                    // (The first place a match begins at: not between a
+                    // pair's halves, past `start`, where a search doesn't
+                    // try.)
+                    let inside = |at: usize| at > start && at < s.len() && astral_at(&s, at - 1).is_some();
+                    let last = if re.sticky { start } else { s.len() };
+                    let want = (start..=last)
+                        .filter(|&at| !inside(at))
+                        .find_map(|at| re.exec_reference(&s, at).filter(|c| c[0].unwrap().0 == at));
+                    matched += want.is_some() as usize;
+                    tried += 1;
+                    assert_eq!(re.exec(&s, start).map(|c| c[0]), want.map(|c| c[0]), "/{p}/{f} on {s:x?} from {start}");
+                }
+            }
+        }
+        assert!(matched > tried / 5 && matched < tried * 4 / 5, "{matched} of {tried}");
     }
 
     /// `find` (eight positions at a time) finds what a scan of every

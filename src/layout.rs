@@ -535,6 +535,9 @@ pub mod rx {
     pub struct Class {
         pub ranges: *const [u16; 2],
         pub n: usize,
+        /// Negated (bit 0), and matching a unit only where it is no
+        /// surrogate pair's half (bit 1: `regexp::Insn::Alone`; a surrogate
+        /// bails).
         pub neg: usize,
     }
 

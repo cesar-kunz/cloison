@@ -843,8 +843,13 @@ fn in_class(ic: Case, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
     r != neg
 }
 
-/// The first of `units` (one to four) in `s` at or after `from`.
+/// The first of `units` (none to four) in `s` at or after `from`.
 fn find_any(s: &[u16], units: &[u16], from: usize) -> Option<usize> {
+    // A pattern that starts with an empty class (`/[]a/`) has no first unit
+    // and matches nowhere.
+    if units.is_empty() {
+        return None;
+    }
     #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
     let mut at = from;
     #[cfg(target_arch = "x86_64")]

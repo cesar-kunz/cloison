@@ -471,24 +471,28 @@ fn eval_scope(p: &Program, i: usize) -> Option<usize> {
 /// script's, which are globals) a direct `eval` in it sees beyond its
 /// own: their parameters, `var`s and functions, innermost first, none an
 /// inner one's shadows. (Their block-scoped ones the parser lists where
-/// the `eval` is: see `Parser::eval_visible`.)
-fn eval_outer_names<'a>(p: &'a Program, decls: &[Decls<'a>], i: usize) -> Vec<&'a str> {
-    let mut out: Vec<&'a str> = Vec::new();
+/// the `eval` is: see `Parser::eval_visible`.) Each as the name the `eval`
+/// sees and the variable: a renamed body `var`'s differ (see
+/// `Program::body_vars`).
+fn eval_outer_names<'a>(p: &'a Program, decls: &[Decls<'a>], i: usize) -> Vec<(&'a str, &'a str)> {
+    let mut out: Vec<(&'a str, &'a str)> = Vec::new();
     let mut j = p.functions[i].parent;
     // (Through arrows only: the function's `arguments` and `new.target`
     // are an arrow's too.)
     let mut arrows = p.functions[i].arrow;
     while let Some(k) = j.filter(|&k| k != 0) {
-        for &n in &decls[k].list {
+        for &v in &decls[k].list {
+            let n = p.body_vars.get(v).map_or(v, |n| &**n);
+            let seen = out.iter().any(|&(o, _)| o == n);
             let own = matches!(n, "arguments" | "%newtarget");
-            if own && arrows && !decls[i].contains(&n) && !out.contains(&n) {
-                out.push(n);
+            if own && arrows && !decls[i].contains(&n) && !seen {
+                out.push((n, v));
                 continue;
             }
-            if n.contains('%') || n == "arguments" || p.lexicals.contains_key(n) || decls[i].contains(&n) || out.contains(&n) {
+            if n.contains('%') || n == "arguments" || p.lexicals.contains_key(n) || decls[i].contains(&n) || seen {
                 continue;
             }
-            out.push(n);
+            out.push((n, v));
         }
         arrows &= p.functions[k].arrow;
         j = p.functions[k].parent;
@@ -548,13 +552,13 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
         let mut refs = references(&p.functions[i]);
         // (What a direct `eval` in it sees of the enclosing functions'.)
         if p.functions[i].has_eval {
-            refs.extend(eval_outer_names(p, decls, i));
+            refs.extend(eval_outer_names(p, decls, i).into_iter().map(|(_, v)| v));
         }
         // (A direct `eval`'s bindings' function: those too, its upvalues.)
         if p.functions[i].name.as_deref() == Some(EVAL_BINDINGS)
             && let Some(k) = p.functions[i].parent
         {
-            refs.extend(eval_outer_names(p, decls, k));
+            refs.extend(eval_outer_names(p, decls, k).into_iter().map(|(_, v)| v));
         }
         // (In a direct `eval`'s function: its scope object, and an arrow's
         // `this` for the `eval`.)
@@ -1732,7 +1736,7 @@ impl<'a> Gen<'a> {
                 if has_eval {
                     self.scope_var(env, n)?;
                 } else {
-                    self.named(Op::SetNamed, env, n);
+                    self.named(Op::SetNamed, env, self.env_key(n));
                 }
             }
         }
@@ -2157,6 +2161,15 @@ impl<'a> Gen<'a> {
         self.emit(op, &[ic]);
     }
 
+    /// The property of a scope object that is variable `name`: a renamed
+    /// body `var`'s by its name (see `Program::body_vars`).
+    fn env_key<'n>(&self, name: &'n str) -> &'n str
+    where
+        'a: 'n,
+    {
+        self.p.body_vars.get(name).map_or(name, |n| &**n)
+    }
+
     fn named(&mut self, op: Op, obj: u8, name: &str) {
         let ic = self.ic(op.name(), name);
         self.emit(op, &[Arg::Reg(obj), ic]);
@@ -2522,6 +2535,7 @@ impl<'a> Gen<'a> {
     /// direct `eval`'s function's: its own bindings can't be deleted from
     /// an `eval` in it (those an `eval` declares can).
     fn scope_var(&mut self, env: u8, name: &str) -> R<()> {
+        let name = self.env_key(name);
         let (m, pos) = (self.temp, self.f.pos);
         let a = self.alloc(pos)?;
         let k = self.alloc(pos)?;
@@ -3282,7 +3296,7 @@ impl<'a> Gen<'a> {
             Var::Upvalue(k) => {
                 self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
             }
-            Var::Scope(env) => self.named(Op::SetNamed, env, name),
+            Var::Scope(env) => self.named(Op::SetNamed, env, self.env_key(name)),
             Var::ScopeUpvalue(k) => {
                 // (`acc` stays the value.)
                 let mark = self.temp;
@@ -3292,7 +3306,7 @@ impl<'a> Gen<'a> {
                 self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                 self.star(env);
                 self.ldar(v);
-                self.named(Op::SetNamed, env, name);
+                self.named(Op::SetNamed, env, self.env_key(name));
                 self.temp = mark;
             }
             Var::Global | Var::Undefined => self.global(Op::StaGlobal, name),
@@ -3458,13 +3472,13 @@ impl<'a> Gen<'a> {
                 Var::Upvalue(k) => {
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                 }
-                Var::Scope(env) => self.named(Op::GetNamed, env, n),
+                Var::Scope(env) => self.named(Op::GetNamed, env, self.env_key(n)),
                 Var::ScopeUpvalue(k) => {
                     let mark = self.temp;
                     let env = self.alloc(e.pos)?;
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                     self.star(env);
-                    self.named(Op::GetNamed, env, n);
+                    self.named(Op::GetNamed, env, self.env_key(n));
                     self.temp = mark;
                 }
                 Var::Undefined => self.emit(Op::LdaUndefined, &[]),
@@ -4407,9 +4421,9 @@ impl<'a> Gen<'a> {
             // (Block-scoped first: an enclosing function's after.)
             bindings.sort_by_key(|b| b.2 & EVAL_BLOCK_SCOPED as i32 == 0);
             let lexical = bindings.iter().filter(|b| b.2 & EVAL_BLOCK_SCOPED as i32 != 0).count();
-            for n in eval_outer_names(self.p, self.decls, self.index) {
+            for (n, v) in eval_outer_names(self.p, self.decls, self.index) {
                 if !bindings.iter().any(|(o, ..)| *o == n) {
-                    bindings.push((n, n, 0));
+                    bindings.push((n, v, 0));
                 }
             }
             let mut kept = Vec::new();

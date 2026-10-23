@@ -19,6 +19,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("call_spread", call_spread),
     ("construct_spread", construct_spread),
     ("template", template),
+    ("template_part", template_part),
     ("template_object", template_object),
     ("define_field", define_field),
     ("define_named_field", define_named_field),
@@ -311,18 +312,28 @@ fn template(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         if i % 2 == 0 {
             units.extend_from_slice(crate::vm::string_units(v).unwrap_or(&[]));
         } else {
-            if !v.is_cell() || crate::vm::string_units(v).is_some() {
-                if v.is_cell() || v.is_number() || v.is_bool() || v.is_undefined() || v.is_null() {
-                } else {
-                    // (A symbol.)
-                    return Err(Error::type_error("Cannot convert a Symbol value to a string"));
-                }
-            }
-            let s = to_string(vm, v)?;
+            let s = template_string(vm, v)?;
             units.extend_from_slice(crate::vm::string_units(s).unwrap_or(&[]));
         }
     }
     Ok(vm.new_string(&units))
+}
+
+/// A template literal's substitution `[e]` as its ToString, before the
+/// next one is evaluated (as the literal's evaluation orders them).
+fn template_part(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    template_string(vm, a[0])
+}
+
+fn template_string(vm: &mut Vm, v: Value) -> Result<Value> {
+    if !v.is_cell() || crate::vm::string_units(v).is_some() {
+        if v.is_cell() || v.is_number() || v.is_bool() || v.is_undefined() || v.is_null() {
+        } else {
+            // (A symbol.)
+            return Err(Error::type_error("Cannot convert a Symbol value to a string"));
+        }
+    }
+    to_string(vm, v)
 }
 
 /// A tagged template's strings array: `[site, cooked0, raw0, …]`, one

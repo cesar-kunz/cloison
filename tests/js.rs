@@ -8223,3 +8223,39 @@ for (i = 0; i < 50; i++) {
 "#;
     assert_eq!(value(src), "done");
 }
+
+/// A template literal's substitution is converted (ToString, hint
+/// "string") before the next one is evaluated, which may observe it or
+/// throw (cloison-fuzz BUGS.md #17).
+#[test]
+fn template_substitutions_convert_in_order() {
+    let src = r#"
+var log = [];
+var p = { [Symbol.toPrimitive](h) { log.push(h); return h === "string" ? "s" : 5; } };
+var t = `${p}${p}|${(log.push("mid"), 1)}|${p}`;
+try { `${p}${(() => { throw 0; })()}`; } catch (x) { log.push("threw"); }
+try { `${Symbol()}${(log.push("after"), 0)}`; } catch (x) { log.push(x.constructor.name); }
+[t, log.join(",")].join(" ");
+"#;
+    assert_eq!(value(src), "ss|1|s string,string,mid,string,string,threw,TypeError");
+}
+
+/// A substitution followed only by literals and locals no call can set
+/// converts with the rest, at the end; one followed by a local a closure
+/// captures, a parameter a mapped `arguments` aliases, or a `let` before
+/// its declaration, before them (cloison-fuzz BUGS.md #17).
+#[test]
+fn template_substitutions_convert_before_what_may_observe_them() {
+    let src = r#"
+var log = [];
+var p = { toString() { log.push("p"); return "P"; } };
+function locals() { var a = 1, b = "b"; return `${p}${a}${b}${2}`; }
+function tdz() { try { return `${p}${x}`; } catch (e) { log.push(e.constructor.name); } let x = 1; }
+function captured() { var a = 1; var q = { toString() { a = 2; return "Q"; } }; return `${q}${a}`; }
+function mapped(a) { var q = { toString: () => { arguments[0] = 9; return "Q"; } }; return `${q}${a}`; }
+function aliased(a) { var args = arguments; var q = { toString() { args[0] = 8; return "Q"; } }; return `${q}${a}`; }
+function param(a, b) { var q = { toString() { b = 5; return "Q"; } }; return `${q}${a}${b}`; }
+[locals(), tdz(), captured(), mapped(1), aliased(1), param(1, 2), log.join()].join(" ");
+"#;
+    assert_eq!(value(src), "P1b2  Q2 Q9 Q8 Q15 p,p,ReferenceError");
+}

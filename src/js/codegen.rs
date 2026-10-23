@@ -1751,20 +1751,7 @@ impl<'a> Gen<'a> {
             self.temp = mark;
         }
         if arguments_object(self.p, self.index) {
-            // A sloppy function's with simple parameters (in registers):
-            // mapped to them.
-            let f = self.f;
-            let simple = !f.strict
-                && !f.arrow
-                && !f.rest
-                && f.param_stmts == 0
-                && !f.has_eval
-                && !f.generator
-                && !f.params.is_empty()
-                && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
-                // (A closure may assign a parameter it captures.)
-                && (aliases_arguments(self.p, f) || f.params.iter().any(|p| self.scopes.captured[self.index].contains(&&**p)));
-            let op = if simple { Op::CreateMappedArguments } else { Op::CreateArguments };
+            let op = if self.maps_arguments() { Op::CreateMappedArguments } else { Op::CreateArguments };
             match self.locals.get("arguments") {
                 Some(&r) => self.emit(op, &[Arg::Reg(r)]),
                 None => {
@@ -3412,6 +3399,14 @@ impl<'a> Gen<'a> {
                     if let Some(x) = subs.get(i) {
                         let r = self.alloc(e.pos)?;
                         self.into(x, r)?;
+                        // Its ToString before the next substitution's
+                        // evaluation, which may observe it: unless what
+                        // follows is literals and initialized locals no
+                        // conversion can change.
+                        if !subs[i + 1..].iter().all(|x| self.unobservable(x)) {
+                            self.intrinsic("template_part", r, 1);
+                            self.star(r);
+                        }
                     }
                 }
                 let n = (self.temp - mark) as u8;
@@ -3425,6 +3420,43 @@ impl<'a> Gen<'a> {
 
     /// Variable `name` into the accumulator (checked if block-scoped and
     /// maybe not initialized: see [`Gen::needs_check`]).
+    /// Whether the function's `arguments` object is mapped to its
+    /// parameters: a sloppy one's with simple parameters (in registers),
+    /// when something may assign either.
+    fn maps_arguments(&self) -> bool {
+        let f = self.f;
+        arguments_object(self.p, self.index)
+            && !f.strict
+            && !f.arrow
+            && !f.rest
+            && f.param_stmts == 0
+            && !f.has_eval
+            && !f.generator
+            && !f.params.is_empty()
+            && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
+            // (A closure may assign a parameter it captures.)
+            && (aliases_arguments(self.p, f) || f.params.iter().any(|p| self.scopes.captured[self.index].contains(&&**p)))
+    }
+
+    /// Whether evaluating `e` can't observe what ran before it, or throw:
+    /// a literal, or an initialized variable in a register that no closure
+    /// captures (as `reg`'s) and no mapped `arguments` aliases, which no
+    /// call can set.
+    fn unobservable(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Null => true,
+            ExprKind::Ident(n) => {
+                !self.in_with(n)
+                    && !self.needs_check(n, e.pos)
+                    && !self.p.imports.contains_key(&**n)
+                    && !self.scopes.captured[self.index].contains(&&**n)
+                    && !(self.f.params.contains(n) && self.maps_arguments())
+                    && matches!(self.resolve(n, e.pos), Ok(Var::Reg(_)))
+            }
+            _ => false,
+        }
+    }
+
     fn load_var(&mut self, n: &str, pos: Pos) -> R<()> {
         self.load_raw(n, pos)?;
         if n == "%this" && self.derived_this() {

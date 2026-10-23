@@ -8056,3 +8056,15 @@ out.join(' | ');
 "#;
     assert_eq!(value(src), "true,2,1 | true,2,3 | true,1,1 | true,true,1 | adder threw | NT.set | true,4 | proto,iter | true | 1");
 }
+
+/// A pattern starting with an empty class has no first unit: it matches
+/// nothing, where the scan for its first units indexed an empty set and
+/// panicked (cloison-fuzz BUGS.md #1).
+#[test]
+fn empty_class_matches_nothing() {
+    let src = r#"
+var J = JSON.stringify;
+J(/[]/.exec("abcdefg")) + J(/[]a/.exec("aaa")) + J(/[^]/.exec("x")) + J("ab".split(/[]/));
+"#;
+    assert_eq!(value(src), r#"nullnull["x"]["ab"]"#);
+}

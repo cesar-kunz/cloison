@@ -8068,3 +8068,14 @@ J(/[]/.exec("abcdefg")) + J(/[]a/.exec("aaa")) + J(/[^]/.exec("x")) + J("ab".spl
 "#;
     assert_eq!(value(src), r#"nullnull["x"]["ab"]"#);
 }
+
+/// `split` with a regular expression stops as soon as the result reaches
+/// the limit, also when a capture reaches it (cloison-fuzz BUGS.md #4).
+#[test]
+fn regexp_split_stops_at_limit_in_captures() {
+    let src = r#"
+var J = JSON.stringify;
+J("a1b2c".split(/(\d)/, 2)) + J("a1b2c".split(/(\d)/, 1)) + J("a1b2c".split(/(\d)/, 3));
+"#;
+    assert_eq!(value(src), r#"["a","1"]["a"]["a","1","b"]"#);
+}

@@ -3109,6 +3109,9 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
                             break;
                         }
                     }
+                    if parts.len() == limit {
+                        break;
+                    }
                     p = e;
                     q = if e == x { advance(s, e as f64, re.unicode) as usize } else { e };
                 }

@@ -570,6 +570,19 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
     unsafe {
         let p = crate::object::as_object(o);
         match (*p).class {
+            // A value whose conversion may call code (an object's
+            // `valueOf`, which a runtime call skips, see
+            // `interp::to_primitive_hint`) or throws (a BigInt for a
+            // number's element): the interpreter stores it, before
+            // anything is stored here.
+            Class::TypedArray
+                if v.is_cell()
+                    && crate::vm::string_units(v).is_none()
+                    && !(crate::bigint::is_bigint(v)
+                        && crate::object::TypedKind::from_u8((*p).kind).is_big()) =>
+            {
+                return 0;
+            }
             Class::TypedArray => {}
             Class::Plain | Class::Array => {
                 if key.as_i32_unchecked() as usize > (*p).elems_len as usize * 2 + 1024 {
@@ -580,9 +593,11 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
         }
     }
     // (A store that did nothing: the interpreter's again, which throws in
-    // strict code.)
+    // strict code. One whose conversion needed a call too.)
     vm.store_failed = false;
-    u64::from(vm.set_keyed(o, key, v).is_ok() && !vm.store_failed)
+    vm.conv_redo = false;
+    let stored = vm.set_keyed(o, key, v).is_ok() && !vm.store_failed;
+    u64::from(stored && !std::mem::take(&mut vm.conv_redo))
 }
 
 /// `o.name` (`name` an `Atom`), or 0 where it would throw or call a

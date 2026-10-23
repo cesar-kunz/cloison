@@ -8102,3 +8102,14 @@ J(/[^\u{1F600}]/u.exec("\u{1F600}a")) + J("a\u{1F600}".split(/\B/uy).length) + /
 "#;
     assert_eq!(value(src), r#"["a"]132"#);
 }
+
+/// With `i` and `u`, `\w` has the characters folding to its units (U+017F,
+/// U+212A), and `\W` and `[\W]` don't (cloison-fuzz BUGS.md #7).
+#[test]
+fn unicode_ignore_case_word_class() {
+    let src = r#"
+[/[\W]/iu.test("\u212a"), /[\W]/iu.test("\u017f"), /\W/iu.test("\u212a"), /\w/iu.test("\u017f"), /[\w]/iu.test("\u212a"), /[\W]/i.test("\u212a"),
+ /[\W]/iv.test("\u212a"), /\w/iv.test("\u017f"), /[^\w]/iu.test("\u212a"), /\b/iu.test("\u017f")].join();
+"#;
+    assert_eq!(value(src), "false,false,false,true,true,true,false,true,false,true");
+}

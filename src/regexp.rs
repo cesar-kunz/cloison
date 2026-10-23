@@ -358,7 +358,7 @@ impl Parser<'_> {
                 match e {
                     'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                         self.i += 2;
-                        let (r, neg) = class_escape(e);
+                        let (r, neg) = self.class_escape(e);
                         let r: Vec<(u32, u32)> = r.into_iter().map(|(lo, hi)| (lo as u32, hi as u32)).collect();
                         let r = if neg { complement_points(&r) } else { r };
                         Ok(Operand::Set(self.maybe_fold(ClassSet::of_ranges(r)), false))
@@ -1093,6 +1093,18 @@ impl Parser<'_> {
         Case::of(self.ignore_case, self.unicode)
     }
 
+    /// `\d`, `\w`, `\s` and their negations where the parser is: with `i`
+    /// and `u`, `\w`'s characters are those that fold to one of its units,
+    /// `ſ` and the Kelvin sign too, which `\W` (and so `[\W]`) excludes.
+    fn class_escape(&self, e: char) -> (Vec<(u16, u16)>, bool) {
+        let (mut r, neg) = class_escape(e);
+        if e.eq_ignore_ascii_case(&'w') && self.case() == Case::Unicode {
+            r.extend([(0x017F, 0x017F), (0x212A, 0x212A)]);
+            r.sort();
+        }
+        (r, neg)
+    }
+
     /// Atom `n` as it matches where the parser is, case made explicit (see
     /// `explicit`): a character or a class (within a class's or an
     /// escape's alternatives) as a class of the units it matches.
@@ -1394,7 +1406,7 @@ impl Parser<'_> {
                 cp_class(set, false)
             }
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
-                let (ranges, neg) = class_escape(e);
+                let (ranges, neg) = self.class_escape(e);
                 if neg && self.unicode {
                     Node::Alt(vec![surrogate_pair(), Node::Class(ranges, neg)])
                 } else {
@@ -1621,7 +1633,7 @@ impl Parser<'_> {
         match e {
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                 self.i += 1;
-                let (r, neg) = class_escape(e);
+                let (r, neg) = self.class_escape(e);
                 Err(match (neg, self.unicode) {
                     (false, _) => wide(r),
                     (true, false) => wide(complement(&r)),

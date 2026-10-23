@@ -1853,16 +1853,34 @@ fn cp_class(mut ranges: Vec<(u32, u32)>, neg: bool) -> Node {
         ranges.iter().filter(|r| r.1 >= 0x10000).map(|&(lo, hi)| (lo.max(0x10000), hi.min(0x10FFFF))).collect();
     let mut bmp: Vec<(u16, u16)> =
         ranges.iter().filter(|r| r.0 <= 0xFFFF).map(|&(lo, hi)| (lo as u16, hi.min(0xFFFF) as u16)).collect();
+    // A lead alone, not followed by a trail, is a code point of its own,
+    // which a negated class matches unless it names it.
+    let mut lone = None;
     if neg {
         astral = complement_points(&astral).into_iter().filter(|r| r.1 >= 0x10000).map(|(lo, hi)| (lo.max(0x10000), hi)).collect();
+        let named: Vec<(u32, u32)> = bmp.iter().map(|&(a, b)| (a as u32, b as u32)).collect();
+        let leads: Vec<(u16, u16)> = complement_points(&named)
+            .into_iter()
+            .filter(|&(a, b)| a <= LEADS.1 as u32 && b >= LEADS.0 as u32)
+            .map(|(a, b)| (a.max(LEADS.0 as u32) as u16, b.min(LEADS.1 as u32) as u16))
+            .collect();
+        if !leads.is_empty() {
+            lone = Some(Node::Seq(vec![Node::Class(leads, false), not_followed_by_trail()]));
+        }
         // (Not a pair's first half: its character is astral.)
         bmp.push((0xD800, 0xDBFF));
         bmp.sort();
     }
-    if astral.is_empty() {
-        return Node::Class(bmp, neg);
+    let mut alts = Vec::new();
+    if !astral.is_empty() {
+        alts.push(Node::Astral(astral));
     }
-    Node::Alt(vec![Node::Astral(astral), Node::Class(bmp, neg)])
+    alts.push(Node::Class(bmp, neg));
+    alts.extend(lone);
+    if alts.len() == 1 {
+        return alts.pop().unwrap();
+    }
+    Node::Alt(alts)
 }
 
 /// A surrogate pair: an astral character in `u` mode.

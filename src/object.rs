@@ -254,19 +254,12 @@ impl TypedKind {
 pub use crate::layout::EXTERNAL;
 /// The object is some shape's prototype.
 pub const PROTOTYPE: u8 = 2;
-/// The object has integer keys too far past its elements to store there:
-/// named properties (their decimal strings), which keyed accesses check
-/// after the elements (see `Vm::set_keyed`).
-pub const SPARSE: u8 = 4;
+/// The object has integer keys too far past its elements, its elements
+/// are sealed or frozen, an array's `length` is read-only. (Compiled code
+/// reads them.)
+pub use crate::layout::{FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE};
 /// The object takes no new properties (`Object.preventExtensions`).
 pub const NOT_EXTENSIBLE: u8 = 8;
-/// Its elements can't be deleted (`Object.seal`).
-pub const SEALED: u8 = 16;
-/// Its elements can't be written either (`Object.freeze`).
-pub const FROZEN: u8 = 32;
-/// An array's `length` is read-only (`Object.freeze`, or
-/// `Object.defineProperty` with `writable: false`).
-pub const LENGTH_READ_ONLY: u8 = 64;
 /// A function's `length` was deleted (it has no slot: see
 /// `Vm::own_property`); `LENGTH_READ_ONLY`'s bit, as arrays aren't functions.
 pub const FN_LENGTH_DELETED: u8 = 64;

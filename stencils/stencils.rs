@@ -88,7 +88,7 @@ mod layout;
 use layout::{
     COLOR, DirectSite, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
-    Class, EXTERNAL, FUNC_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
+    Class, EXTERNAL, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
 };
 
@@ -5678,8 +5678,18 @@ unsafe fn fits_code(tag: NumberTag, code: u64, v: Value) -> bool {
 fn is_array(tag: NumberTag, a: Value) -> bool {
     is_cell(tag, a) && unsafe { (*cell(a)).class } == class::ARRAY
 }
+/// An array whose `pop` the interpreter's does (see `array_pop_`).
+const POP_EXIT_FLAGS: u8 = SPARSE | SEALED | FROZEN | LENGTH_READ_ONLY;
+
+/// Cell `a`'s class and, above it, those of its flags in
+/// [`POP_EXIT_FLAGS`], in one load: `class::ARRAY` for an array compiled
+/// code pops.
+#[inline(always)]
+unsafe fn pop_class_flags(a: Value) -> u16 {
+    unsafe { (&raw const (*cell(a)).class).cast::<u16>().read() & (0xff | (POP_EXIT_FLAGS as u16) << 8) }
+}
 macro_rules! array_methods {
-    ($loc:tt, $nc:literal, $array:expr) => {
+    ($loc:tt, $nc:literal, $array:expr, $poppable:expr) => {
         stencil_slow!("array_push_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
             let v = s.acc;
@@ -5757,9 +5767,14 @@ macro_rules! array_methods {
             s.acc = unboxed(int(Value::from_bits(rt_call!(s, cloison_rt_array_push, a, v))));
             next!(s)
         });
+        // Left to the interpreter's `pop` for an array frozen, sealed, of
+        // a read-only `length` or sparse (`object::FROZEN`, `SEALED`,
+        // `LENGTH_READ_ONLY`, `SPARSE`: it throws, or the elements aren't
+        // all there is), and for a hole at the end, which a prototype may
+        // fill.
         stencil!("array_pop_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
-            if !$array(s.tag, a) {
+            if !$poppable(s.tag, a) {
                 exit!(s)
             }
             let o = a.to_bits() as *mut u8;
@@ -5768,18 +5783,19 @@ macro_rules! array_methods {
             if len != 0 {
                 let at = ((*header(o)).elems.cast::<Value>()).add(len as usize - 1);
                 let v = *at;
+                if v == Value::EMPTY {
+                    exit!(s)
+                }
                 *at = Value::EMPTY;
                 (*header(o)).elems_len = len - 1;
-                if v != Value::EMPTY {
-                    s.acc = v;
-                }
+                s.acc = v;
             }
             next!(s)
         });
     };
     ($loc:tt) => {
-        array_methods!($loc, "", is_array);
-        array_methods!($loc, "nc_", |_, _| true);
+        array_methods!($loc, "", is_array, |tag, a| is_cell(tag, a) && pop_class_flags(a) == class::ARRAY as u16);
+        array_methods!($loc, "nc_", |_, _| true, |_, a| pop_class_flags(a) == class::ARRAY as u16);
     };
 }
 macro_rules! array_methods_gpr {

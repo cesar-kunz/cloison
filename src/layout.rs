@@ -138,6 +138,17 @@ pub mod class {
 /// Flag of [`Header::flags`]: the object is reachable from outside the
 /// internal heap (`object::EXTERNAL`, with the other flags).
 pub const EXTERNAL: u8 = 1;
+/// Flag: the object has integer keys too far past its elements to store
+/// there: named properties (their decimal strings), which keyed accesses
+/// check after the elements (`object::SPARSE`; see `Vm::set_keyed`).
+pub const SPARSE: u8 = 4;
+/// Flag: its elements can't be deleted (`Object.seal`).
+pub const SEALED: u8 = 16;
+/// Flag: its elements can't be written either (`Object.freeze`).
+pub const FROZEN: u8 = 32;
+/// Flag: an array's `length` is read-only (`Object.freeze`, or
+/// `Object.defineProperty` with `writable: false`).
+pub const LENGTH_READ_ONLY: u8 = 64;
 
 /// An object's header: `object::Object`'s fields, as compiled code sees
 /// them (the shape and the code as addresses). Its in-object slots follow

@@ -8079,3 +8079,14 @@ J("a1b2c".split(/(\d)/, 2)) + J("a1b2c".split(/(\d)/, 1)) + J("a1b2c".split(/(\d
 "#;
     assert_eq!(value(src), r#"["a","1"]["a"]["a","1","b"]"#);
 }
+
+/// In `u` mode a lone lead surrogate is a code point of its own, which a
+/// negated class not naming it matches (cloison-fuzz BUGS.md #5).
+#[test]
+fn negated_class_matches_lone_lead_in_unicode_mode() {
+    let src = r#"
+var J = JSON.stringify;
+J(/[^x]/u.exec("\ud800")) + J(/[^x]+/u.exec("a\ud800b")) + J(/[^\ud800]/u.exec("\ud800")) + J(/[^x]/u.exec("😀")[0].length);
+"#;
+    assert_eq!(value(src), r#"["\ud800"]["a\ud800b"]null2"#);
+}

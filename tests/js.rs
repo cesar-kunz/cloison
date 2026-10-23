@@ -8142,3 +8142,21 @@ seen.join();
 "#;
     assert_eq!(value(src), "get:string,set:string,getOwnPropertyDescriptor:string,defineProperty:string,has:string,getOwnPropertyDescriptor:string,defineProperty:string,deleteProperty:string");
 }
+
+/// An object literal's index keys and a strict `arguments`' elements are
+/// defined, not set: a prototype's accessor for the index doesn't run
+/// (cloison-fuzz BUGS.md #14).
+#[test]
+fn literal_index_keys_and_strict_arguments_are_defined() {
+    let src = r#"
+var hits = 0;
+Object.defineProperty(Object.prototype, "7", { get() { return "G7"; }, set(v) { hits++; }, configurable: true });
+var out = [({ "7": 1 })[7], ({ 7.0: 1 })[7], ({ ...{ 7: 1 } })[7],
+  (function () { "use strict"; return arguments[7]; })(0, 1, 2, 3, 4, 5, 6, "a7"),
+  ({ 7: function () {} })[7].name];
+delete Object.prototype[7];
+out.push(hits);
+out.join(' ');
+"#;
+    assert_eq!(value(src), "1 1 1 a7 7 0");
+}

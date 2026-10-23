@@ -1237,8 +1237,9 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         vm.add_property_with(o, a_callee, object_value(callee), DONT_ENUM);
     }
     let ov = object_value(o);
+    // Defined, not set: a prototype's setter for an index isn't called.
     for (i, &v) in values.iter().enumerate() {
-        let _ = vm.put_key(ov, crate::vm::Key::Index(i as u32), v);
+        let _ = vm.create_data_property(ov, crate::vm::Key::Index(i as u32), v);
     }
     ov
 }

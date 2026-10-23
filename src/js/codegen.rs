@@ -3635,8 +3635,9 @@ impl<'a> Gen<'a> {
             Object(props, home) => {
                 // (`__proto__: v` sets the prototype: the store reaches
                 // `Object.prototype`'s accessor.)
-                // An index key is an element (`o[1]` reads it), stored as
-                // `o[k] = v`.
+                // An index key is an element (`o[1]` reads it), defined
+                // like a computed key's (not `o[k] = v`, which reaches a
+                // prototype's setter for it).
                 let index = |k: &str| {
                     k.parse::<u32>()
                         .ok()
@@ -3724,16 +3725,26 @@ impl<'a> Gen<'a> {
                         }
                         match index(name) {
                             Some(i) => {
-                                let k = self.alloc(e.pos)?;
+                                // `[o, k, v]` for the runtime.
+                                let mark = self.temp;
+                                let t = self.alloc(e.pos)?;
+                                self.mov(o, t);
+                                let kr = self.alloc(e.pos)?;
                                 match i32::try_from(i) {
                                     Ok(i) => self.emit(Op::LdaSmi, &[Arg::Imm(i)]),
                                     Err(_) => self.constant(Constant::Number(i as f64)),
                                 }
-                                self.star(k);
+                                self.star(kr);
+                                let vr = self.alloc(e.pos)?;
+                                let anonymous = match v.kind {
+                                    Function(f) => self.p.functions[f].name.is_none(),
+                                    Class(ref c) => self.p.functions[c.constructor].name.is_none(),
+                                    _ => false,
+                                };
                                 self.value(v)?;
-                                let ic = self.auto_ic("[]keyed");
-                                self.emit(Op::SetKeyed, &[Arg::Reg(o), Arg::Reg(k), ic]);
-                                self.temp -= 1;
+                                self.star(vr);
+                                self.intrinsic(if anonymous { "define_named_field" } else { "define_field" }, t, 3);
+                                self.temp = mark;
                             }
                             // `__proto__: v`: the prototype set (not
                             // through `Object.prototype`'s accessor).

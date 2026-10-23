@@ -710,6 +710,12 @@ impl Regex {
                     at += s[at..].iter().position(|&c| can(c))?;
                 }
             }
+            // (`u`: a match begins at a code point, never between a pair's
+            // halves, where `lastIndex` advances past both.)
+            if self.unicode && at > start && at < s.len() && (0xD800..0xDC00).contains(&s[at - 1]) && (0xDC00..0xE000).contains(&s[at]) {
+                at += 1;
+                continue;
+            }
             if attempt(at) {
                 return Some(at);
             }

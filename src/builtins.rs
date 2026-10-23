@@ -3081,7 +3081,7 @@ fn regexp_split(vm: &mut Vm, re: &crate::regexp::Regex, s: &[u16], limit: Option
             match re.exec(s, q) {
                 // (A sticky one's match only at `q`: the splitter's, which
                 // always is, tries the next position.)
-                None if re.sticky => q += 1,
+                None if re.sticky => q = advance(s, q as f64, re.unicode) as usize,
                 None => break,
                 Some(caps) => {
                     let (x, e) = caps[0].unwrap();

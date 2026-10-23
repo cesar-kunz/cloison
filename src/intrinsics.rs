@@ -52,6 +52,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("to_object", to_object),
     ("with_set_strict", with_set_strict),
     ("with_has", with_has),
+    ("scope_delete", scope_delete),
     ("scope_var", scope_var),
     ("async_from_sync", |vm, a| crate::promise::async_from_sync(vm, a[0])),
     ("generator_mode", generator_mode),
@@ -902,6 +903,22 @@ fn with_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if crate::props::is_object(u) {
         let blocked = vm.get_keyed(u, k)?;
         return Ok(Value::from_bool(!crate::interp::to_boolean(blocked)));
+    }
+    Ok(Value::TRUE)
+}
+
+/// `delete name` of a binding a scope object has (`[name, o]`, see
+/// `Gen::with_lookup`): deleted from the object on `o`'s chain that owns
+/// it, as from its environment. A direct eval's scope object inherits
+/// its function's variables, which can't be deleted.
+fn scope_delete(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let key = to_property_key(vm, a[0])?;
+    let mut o = a[1];
+    while crate::props::is_object(o) {
+        if vm.own_property(as_object(o), key).is_some() {
+            return Ok(Value::from_bool(vm.delete_property(o, a[0])?));
+        }
+        o = unsafe { (*(*as_object(o)).shape).proto };
     }
     Ok(Value::TRUE)
 }

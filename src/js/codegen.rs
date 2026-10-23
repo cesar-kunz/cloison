@@ -1531,6 +1531,9 @@ struct Gen<'a> {
     /// enclosing the code being compiled, outermost first: names are
     /// looked up in them first (see [`Gen::with_lookup`]).
     withs: Vec<Name>,
+    /// In [`Gen::with_lookup`]'s `found`: the object that has the name is
+    /// a scope's (a direct `eval`'s or its function's), not a `with`'s.
+    found_scope: bool,
     /// Compiling `eval`'s or `Function`'s code (see [`generate_lazy`]).
     eval: bool,
     /// The script's completion value (`eval`'s result): a register,
@@ -1643,6 +1646,7 @@ impl<'a> Gen<'a> {
                 }
                 w
             },
+            found_scope: false,
             eval,
             completion: None,
             cleared: std::ptr::null(),
@@ -2950,6 +2954,7 @@ impl<'a> Gen<'a> {
             self.jump_if(Jmp::False, next);
             // (The lookup continues in the enclosing `with`s only.)
             self.withs = withs[..i].to_vec();
+            self.found_scope = !w.starts_with("%w");
             found(self, r)?;
             self.jump(end);
             self.bind(next);
@@ -3125,8 +3130,22 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.string(original(name));
-                g.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                // (A scope object's binding is deleted where it is, not
+                // from an eval's scope object inheriting it: `delete` of
+                // the function's `var` is false.)
+                if g.found_scope {
+                    let m = g.temp;
+                    let k = g.alloc(pos)?;
+                    g.string(original(name));
+                    g.star(k);
+                    let o = g.alloc(pos)?;
+                    g.mov(r, o);
+                    g.intrinsic("scope_delete", k, 2);
+                    g.temp = m;
+                } else {
+                    g.string(original(name));
+                    g.emit(Op::DeleteProperty, &[Arg::Reg(r)]);
+                }
                 Ok(())
             },
             &mut |g| {

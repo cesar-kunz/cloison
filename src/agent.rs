@@ -9,6 +9,11 @@
 //! (`null` if there is none yet), and `leaving()` ends the agent once the
 //! callback has returned (and its event loop run out). Both sides have
 //! `sleep(ms)` and `monotonicNow()`.
+//!
+//! Agents belong to the VM that starts them: its broadcasts reach those
+//! only, and their reports only it; dropping it closes their mailboxes
+//! (one waiting for a broadcast ends) and joins their threads, those that
+//! end within [`JOIN_WAIT`]. At most [`MAX_AGENTS`] run at once per VM.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -60,22 +65,57 @@ impl Mailbox {
     }
 }
 
-/// The agents started, the reports they made, and when the process
-/// started (`monotonicNow`).
-static AGENTS: Mutex<Vec<Arc<Mailbox>>> = Mutex::new(Vec::new());
-static REPORTS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// When the process started (`monotonicNow`).
 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// An agent's VM's part: its `receiveBroadcast` callback, and whether it
-/// is leaving.
+/// Agents one VM runs at once, at most: `start` past them is a
+/// `TypeError` (a script starting agents in a loop made a thread, with
+/// a 64 MiB stack and a heap, each time).
+pub const MAX_AGENTS: usize = 64;
+/// How long dropping a VM waits for its agents' threads to end, in all:
+/// one still running then (a script that doesn't return, a callback
+/// blocked) is left to end on its own.
+pub const JOIN_WAIT: Duration = Duration::from_secs(1);
+
+/// An agent a VM started: its mailbox and its thread.
+struct Started {
+    mailbox: Arc<Mailbox>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+type Reports = Arc<Mutex<VecDeque<String>>>;
+
+/// A VM's part: the agents it started and the reports they made; if it
+/// is an agent, its `receiveBroadcast` callback, whether it is leaving,
+/// and where its reports go (its starter's).
 #[derive(Default)]
 pub(crate) struct State {
     callback: Option<Value>,
     leaving: bool,
+    started: Vec<Started>,
+    reports: Reports,
+    report_to: Option<Reports>,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        for a in &self.started {
+            a.mailbox.close();
+        }
+        let deadline = Instant::now() + JOIN_WAIT;
+        for a in std::mem::take(&mut self.started) {
+            while !a.thread.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if a.thread.is_finished() {
+                let _ = a.thread.join();
+            }
+        }
+    }
 }
 
 impl State {
@@ -92,36 +132,43 @@ fn source_of(v: Value) -> Result<String> {
 }
 
 /// `$262.agent.start(source)`.
-fn agent_start(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn agent_start(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let src = source_of(arg(a, 0))?;
+    // (Those that ended are joined.)
+    let (ended, running): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut vm.agent.started).into_iter().partition(|a| a.thread.is_finished());
+    vm.agent.started = running;
+    for a in ended {
+        let _ = a.thread.join();
+    }
+    if vm.agent.started.len() >= MAX_AGENTS {
+        return Err(Error::type_error(format!("$262.agent.start: more than {MAX_AGENTS} agents")));
+    }
     let mailbox = Arc::new(Mailbox { slot: Mutex::new(Slot::default()), cv: Condvar::new() });
-    lock(&AGENTS).push(mailbox.clone());
-    let agent = mailbox.clone();
+    let (agent, reports) = (mailbox.clone(), vm.agent.reports.clone());
     let spawned = std::thread::Builder::new()
         .name("agent".into())
         .stack_size(64 << 20)
-        .spawn(move || run_agent(&src, &agent));
-    if let Err(e) = spawned {
-        // (No thread to take its broadcasts.)
-        lock(&AGENTS).retain(|m| !Arc::ptr_eq(m, &mailbox));
-        mailbox.close();
-        return Err(Error::type_error(format!("$262.agent.start: {e}")));
+        .spawn(move || run_agent(&src, &agent, reports));
+    match spawned {
+        Ok(thread) => vm.agent.started.push(Started { mailbox, thread }),
+        Err(e) => return Err(Error::type_error(format!("$262.agent.start: {e}"))),
     }
     Ok(Value::UNDEFINED)
 }
 
 /// An agent's thread: its script, then each broadcast's callback, until
-/// it leaves (or throws).
-fn run_agent(src: &str, mailbox: &Arc<Mailbox>) {
-    run_agent_vm(src, mailbox);
-    lock(&AGENTS).retain(|m| !Arc::ptr_eq(m, mailbox));
-    // (A broadcaster that listed it before may be posting to it: closed,
-    // under the lock it posts and waits under, it takes nothing.)
+/// it leaves (or throws, or its starter is dropped).
+fn run_agent(src: &str, mailbox: &Arc<Mailbox>, reports: Reports) {
+    run_agent_vm(src, mailbox, reports);
+    // (A broadcaster may be posting to it: closed, under the lock it
+    // posts and waits under, it takes nothing.)
     mailbox.close();
 }
 
-fn run_agent_vm(src: &str, mailbox: &Mailbox) {
+fn run_agent_vm(src: &str, mailbox: &Mailbox, reports: Reports) {
     let mut vm = Vm::new();
+    vm.agent.report_to = Some(reports);
     let module = match crate::js::compile(src) {
         Ok(m) => m,
         Err(e) => {
@@ -140,6 +187,9 @@ fn run_agent_vm(src: &str, mailbox: &Mailbox) {
                 if let Some(m) = slot.message.take() {
                     mailbox.cv.notify_all();
                     break m;
+                }
+                if slot.closed {
+                    return;
                 }
                 slot = mailbox.cv.wait(slot).unwrap_or_else(|e| e.into_inner());
             }
@@ -165,7 +215,7 @@ fn run_agent_vm(src: &str, mailbox: &Mailbox) {
 
 /// `$262.agent.broadcast(sab, id)`: to every agent, once each has taken
 /// it.
-fn agent_broadcast(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn agent_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let b = arg(a, 0);
     if !is_class(b, Class::SharedArrayBuffer) {
         return Err(Error::type_error("$262.agent.broadcast: not a SharedArrayBuffer"));
@@ -175,7 +225,7 @@ fn agent_broadcast(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let growable = crate::typed::is_resizable(o);
     let id = arg(a, 1);
     let id = if id.is_number() { Value::number(id.to_number()) } else { Value::UNDEFINED };
-    let agents: Vec<Arc<Mailbox>> = lock(&AGENTS).clone();
+    let agents: Vec<Arc<Mailbox>> = vm.agent.started.iter().map(|a| a.mailbox.clone()).collect();
     // (An agent that ends meanwhile is closed: skipped, not waited for.)
     for m in &agents {
         let mut slot = lock(&m.slot);
@@ -201,7 +251,7 @@ fn agent_broadcast(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `$262.agent.getReport()`: the oldest report not taken, or `null`.
 fn agent_get_report(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
-    let r = lock(&REPORTS).pop_front();
+    let r = lock(&vm.agent.reports).pop_front();
     Ok(match r {
         Some(s) => {
             let u: Vec<u16> = s.encode_utf16().collect();
@@ -217,11 +267,12 @@ fn agent_receive_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> 
     Ok(Value::UNDEFINED)
 }
 
-/// `$262.agent.report(value)`: its string queued.
+/// `$262.agent.report(value)`: its string queued, for the agent's
+/// starter (a VM no agent's: its own).
 fn agent_report(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let s = crate::intrinsics::to_string(vm, arg(a, 0))?;
     let s = String::from_utf16_lossy(string_units(s).unwrap_or(&[]));
-    lock(&REPORTS).push_back(s);
+    lock(vm.agent.report_to.as_ref().unwrap_or(&vm.agent.reports)).push_back(s);
     Ok(Value::UNDEFINED)
 }
 

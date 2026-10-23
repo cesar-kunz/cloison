@@ -1755,17 +1755,34 @@ impl<'a> Gen<'a> {
             self.temp = mark;
         }
         if arguments_object(self.p, self.index) {
-            let op = if self.maps_arguments() { Op::CreateMappedArguments } else { Op::CreateArguments };
-            match self.locals.get("arguments") {
-                Some(&r) => self.emit(op, &[Arg::Reg(r)]),
-                None => {
-                    let t = self.alloc(self.f.pos)?;
-                    self.emit(Op::CreateArguments, &[Arg::Reg(t)]);
-                    self.ldar(t);
-                    self.store_var("arguments", self.f.pos)?;
-                    self.temp -= 1;
+            let f = self.f;
+            let mapped = self.maps_arguments();
+            let mark = self.temp;
+            let t = match self.locals.get("arguments") {
+                Some(&r) => r,
+                None => self.alloc(self.f.pos)?,
+            };
+            self.emit(if mapped { Op::CreateMappedArguments } else { Op::CreateArguments }, &[Arg::Reg(t)]);
+            // (With a direct `eval`, mapped to the scope object's
+            // properties: `[arguments, scope, names…]`, see
+            // `intrinsics::map_arguments_to_scope`.)
+            if mapped && self.eval_keeps_params() {
+                let a = self.alloc(self.f.pos)?;
+                self.mov(t, a);
+                let e = self.alloc(self.f.pos)?;
+                self.mov(self.locals[ENV], e);
+                for p in &f.params {
+                    let k = self.alloc(self.f.pos)?;
+                    self.string(self.env_key(p));
+                    self.star(k);
                 }
+                self.intrinsic("map_arguments_to_scope", a, 2 + f.params.len() as u8);
             }
+            if !self.locals.contains_key("arguments") {
+                self.ldar(t);
+                self.store_var("arguments", self.f.pos)?;
+            }
+            self.temp = mark;
         }
         if self.f.rest {
             let k = self.f.params.len() - 1;
@@ -3439,9 +3456,16 @@ impl<'a> Gen<'a> {
 
     /// Variable `name` into the accumulator (checked if block-scoped and
     /// maybe not initialized: see [`Gen::needs_check`]).
+    /// Whether a function's direct `eval` has it keep its parameters in
+    /// its scope object (`%env`), by name.
+    fn eval_keeps_params(&self) -> bool {
+        self.f.has_eval && self.index != 0
+    }
+
     /// Whether the function's `arguments` object is mapped to its
-    /// parameters: a sloppy one's with simple parameters (in registers),
-    /// when something may assign either.
+    /// parameters: a sloppy one's with simple parameters (in registers,
+    /// or with a direct `eval` in its scope object), when something may
+    /// assign either.
     fn maps_arguments(&self) -> bool {
         let f = self.f;
         arguments_object(self.p, self.index)
@@ -3449,12 +3473,16 @@ impl<'a> Gen<'a> {
             && !f.arrow
             && !f.rest
             && f.param_stmts == 0
-            && !f.has_eval
             && !f.generator
+            && !f.is_async
             && !f.params.is_empty()
             && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
-            // (A closure may assign a parameter it captures.)
-            && (aliases_arguments(self.p, f) || f.params.iter().any(|p| self.scopes.captured[self.index].contains(&&**p)))
+            // (A closure may assign a parameter it captures, a direct
+            // `eval`'s code any: the function keeps them in its scope
+            // object then.)
+            && (self.eval_keeps_params()
+                || aliases_arguments(self.p, f)
+                || f.params.iter().any(|p| self.scopes.captured[self.index].contains(&&**p)))
     }
 
     /// Whether evaluating `e` can't observe what ran before it, or throw:

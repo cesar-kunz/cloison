@@ -202,10 +202,10 @@ impl Vm {
     pub(crate) fn own_property(&mut self, o: *mut Object, key: Key) -> Option<Desc> {
         // A mapped `arguments` element's value is its parameter's.
         if let Key::Index(i) = key
-            && let Some(p) = self.mapped_slot(o, i)
+            && let Some(v) = self.mapped_get(o, i)
         {
             let mut d = self.own_property_inner(o, key)?;
-            d.value = Some(unsafe { *p });
+            d.value = Some(v);
             return Some(d);
         }
         self.own_property_inner(o, key)
@@ -469,7 +469,7 @@ impl Vm {
         // A mapped `arguments` element: its parameter set too, and unmapped
         // by an accessor or a non-writable value.
         if let Key::Index(i) = key
-            && let Some(p) = self.mapped_slot(o, i)
+            && self.mapped_get(o, i).is_some()
         {
             let ok = self.define_own_property_inner(o, key, d)?;
             if ok {
@@ -477,7 +477,7 @@ impl Vm {
                     self.unmap_argument(o, i);
                 } else {
                     if let Some(v) = d.value {
-                        unsafe { *p = v };
+                        self.mapped_set(o, i, v);
                     }
                     if d.writable == Some(false) {
                         self.unmap_argument(o, i);

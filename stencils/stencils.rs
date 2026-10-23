@@ -6115,6 +6115,11 @@ unsafe fn rx_wide(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
             return 2;
         }
         let cl = &*(*ctx).classes.add(k);
+        // (A unit that must be no surrogate pair's half: the interpreter's,
+        // which sees its neighbours.)
+        if cl.neg & 2 != 0 && c & 0xF800 == 0xD800 {
+            return 2;
+        }
         let mut i = 0;
         let mut has = false;
         while i < cl.n {
@@ -6125,7 +6130,7 @@ unsafe fn rx_wide(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
             }
             i += 1;
         }
-        (has != (cl.neg != 0)) as u64
+        (has != (cl.neg & 1 != 0)) as u64
     }
 }
 

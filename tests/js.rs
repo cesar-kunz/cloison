@@ -8090,3 +8090,15 @@ J(/[^x]/u.exec("\ud800")) + J(/[^x]+/u.exec("a\ud800b")) + J(/[^\ud800]/u.exec("
 "#;
     assert_eq!(value(src), r#"["\ud800"]["a\ud800b"]null2"#);
 }
+
+/// In `u` mode a search, and `split`'s sticky one, never starts between a
+/// surrogate pair's halves: it advances by code points
+/// (AdvanceStringIndex; cloison-fuzz BUGS.md #6).
+#[test]
+fn unicode_search_skips_inside_pairs() {
+    let src = r#"
+var J = JSON.stringify;
+J(/[^\u{1F600}]/u.exec("\u{1F600}a")) + J("a\u{1F600}".split(/\B/uy).length) + /\B/u.exec("A\u{1F600}").index + J("\u{1F600}\u{1F600}".split(/(?:)/u).length);
+"#;
+    assert_eq!(value(src), r#"["a"]132"#);
+}

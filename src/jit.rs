@@ -11338,6 +11338,13 @@ fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> 
         if is_held && (i == a || header[i] || insn.bail && st.acc != NO) {
             return None;
         }
+        // Its fields' registers come past the frames, where a call that
+        // isn't inlined puts its callee's (as `hoist_loads`'s do): none
+        // while it is held, or the call overwrites them and an exit after
+        // it materializes it from what the callee left there.
+        if is_held && insn.is_call() {
+            return None;
+        }
         // Registers holding it that the interpreter would read after an
         // exit here must hold it for sure.
         if meets(&st.maybe, &live[i]) {

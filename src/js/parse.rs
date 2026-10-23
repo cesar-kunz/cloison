@@ -140,6 +140,7 @@ fn parse_pass<'a>(
         frames: Vec::new(),
         renames: 0,
         lexicals: Default::default(),
+        body_vars: Default::default(),
         module,
         info: ModuleInfo::default(),
         imports: Default::default(),
@@ -216,6 +217,7 @@ fn parse_pass<'a>(
         Program {
             functions: p.functions,
             lexicals: p.lexicals,
+            body_vars: std::mem::take(&mut p.body_vars),
             direct_eval: eval.is_some(),
             eval_locals: false,
             imports: std::mem::take(&mut p.imports),
@@ -336,6 +338,8 @@ struct Parser<'t, 'a, 'p> {
     frames: Vec<Frame>,
     renames: usize,
     lexicals: std::collections::HashMap<Name, Lexical>,
+    /// (See `Program::body_vars`.)
+    body_vars: std::collections::HashMap<Name, Name>,
     /// Parsing a module: its id (see [`parse_module`]).
     module: Option<i32>,
     /// A module's entries so far (see [`Program::module`]).
@@ -2984,6 +2988,7 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             let r: Name = format!("{n}%{}", self.renames).into();
             self.renames += 1;
+            self.body_vars.insert(r.clone(), n.clone());
             names.push((n, r));
         }
         if names.is_empty() {

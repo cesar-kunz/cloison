@@ -17,6 +17,12 @@ pub struct Program<'a> {
     /// a block, a catch parameter), each renamed apart (`x%3`: see
     /// `parse::Parser::reference`), by their new names.
     pub lexicals: std::collections::HashMap<Name, Lexical>,
+    /// The body's `var`s of functions with parameter expressions, renamed
+    /// apart from the parameters' scope (`x%3`: see
+    /// `parse::Parser::push_body_vars`): their names, by their new ones.
+    /// A scope object has them by those names (its property keys), where
+    /// a direct `eval` finds them.
+    pub body_vars: std::collections::HashMap<Name, Name>,
     /// Direct `eval`'s code: names are looked up in the caller's scope
     /// object first (the variable `%e0`, a `with`'s: see
     /// `intrinsics::direct_eval`).

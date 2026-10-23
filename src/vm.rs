@@ -826,7 +826,7 @@ pub struct Vm {
     pub(crate) thrower: *mut Object,
     /// The mapped `arguments` objects of the frames running, innermost
     /// last: each index mapped to its parameter's register (see
-    /// `Vm::mapped_slot`), until the frame ends.
+    /// `Vm::mapped_get`), until the frame ends.
     pub(crate) mapped_args: Vec<MappedArgs>,
     /// Sloppy functions' `arguments` objects' shape (see
     /// `builtins::arguments_object_of`).
@@ -3346,7 +3346,7 @@ impl Vm {
             unsafe { note_bytes(ic, as_object(obj)) };
         } else if obj.is_cell()
             // (Not a mapped `arguments` object's: its elements' values are
-            // the parameters', see `mapped_slot`.)
+            // the parameters', see `mapped_get`.)
             && !self.mapped_args.iter().any(|m| m.o == as_object(obj))
         {
             let (ic, _) = code.ic(ic);
@@ -3390,8 +3390,8 @@ impl Vm {
             Key::Name(a) => return self.get(obj, a),
         };
         let mut o = as_object(obj);
-        if let Some(p) = self.mapped_slot(o, i) {
-            return Ok(unsafe { *p });
+        if let Some(v) = self.mapped_get(o, i) {
+            return Ok(v);
         }
         // A string's index is its code unit there, as a string.
         if let Some(u) = string_units(obj) {
@@ -3548,10 +3548,8 @@ impl Vm {
         };
         let o = as_object(obj);
         // (A mapped `arguments` element: its parameter too.)
-        if let Some(p) = self.mapped_slot(o, i)
-            && self.writable_element(o, i)
-        {
-            unsafe { *p = value };
+        if self.mapped_get(o, i).is_some() && self.writable_element(o, i) {
+            self.mapped_set(o, i, value);
         }
         unsafe {
             // A string's characters can't be changed; a typed array stores
@@ -4107,14 +4105,29 @@ impl Vm {
         u
     }
 
-    /// The register parameter `i` of mapped `arguments` object `o` is in,
-    /// if mapped.
-    pub(crate) fn mapped_slot(&self, o: *mut Object, i: u32) -> Option<*mut Value> {
+    /// The value of parameter `i` of mapped `arguments` object `o`, if
+    /// mapped: in its register, or in its function's scope object (see
+    /// [`MappedArgs::scope`]).
+    pub(crate) fn mapped_get(&self, o: *mut Object, i: u32) -> Option<Value> {
         if self.mapped_args.is_empty() {
             return None;
         }
         let m = self.mapped_args.iter().rev().find(|m| m.o == o)?;
-        (m.mapped.get(i as usize) == Some(&true)).then(|| unsafe { m.regs.add(1 + i as usize) })
+        (m.mapped.get(i as usize) == Some(&true)).then(|| unsafe { m.value(i as usize) })
+    }
+
+    /// Set parameter `i` of mapped `arguments` object `o`, if mapped.
+    pub(crate) fn mapped_set(&mut self, o: *mut Object, i: u32, v: Value) {
+        let Some(m) = self.mapped_args.iter().rev().find(|m| m.o == o) else {
+            return;
+        };
+        if m.mapped.get(i as usize) != Some(&true) {
+            return;
+        }
+        match m.scope_slot(i as usize) {
+            Some((env, slot)) => self.store_field(env, slot, v),
+            None => unsafe { *m.regs.add(1 + i as usize) = v },
+        }
     }
 
     /// Index `i` of `o` no longer mapped: its element keeps the value.
@@ -4136,7 +4149,7 @@ impl Vm {
             for (i, &on) in m.mapped.iter().enumerate() {
                 if on && (i as u32) < unsafe { (*m.o).elems_len } {
                     unsafe {
-                        let v = *m.regs.add(1 + i);
+                        let v = m.value(i);
                         let at = (*m.o).elems.add(i);
                         *at = v;
                         crate::heap::barrier(m.o.cast(), at, v);
@@ -5035,6 +5048,7 @@ impl Vm {
         .chain(self.symbol_roots.iter().copied())
         .chain(std::iter::once(self.thrower))
         .chain(self.mapped_args.iter().map(|m| m.o))
+        .chain(self.mapped_args.iter().map(|m| m.scope.0))
         .chain(std::iter::once(self.eval_function))
         .chain(self.error_prototypes.iter().copied())
         .chain(self.shadow_roots.iter().copied())
@@ -5646,6 +5660,31 @@ pub(crate) struct MappedArgs {
     /// Its frame's registers (`r1…` its parameters).
     pub(crate) regs: *mut Value,
     pub(crate) mapped: Vec<bool>,
+    /// A function with a direct `eval` keeps its parameters in its scope
+    /// object, by name: that object (null if they are in registers) and
+    /// the parameters' names.
+    pub(crate) scope: (*mut Object, Vec<Atom>),
+}
+
+impl MappedArgs {
+    /// Where parameter `i` is in the scope object: it and the slot.
+    fn scope_slot(&self, i: usize) -> Option<(*mut Object, u32)> {
+        let env = self.scope.0;
+        if env.is_null() {
+            return None;
+        }
+        let slot = unsafe { (*(*env).shape).lookup(*self.scope.1.get(i)?) }?;
+        Some((env, slot))
+    }
+
+    unsafe fn value(&self, i: usize) -> Value {
+        unsafe {
+            match self.scope_slot(i) {
+                Some((env, slot)) => *Object::slot(env, (*(*env).shape).location(slot)),
+                None => *self.regs.add(1 + i),
+            }
+        }
+    }
 }
 
 /// `Function.prototype.call` on a native: a call through it to a bytecode

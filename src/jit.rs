@@ -16486,7 +16486,11 @@ unsafe fn direct_exit(
     acc: Value,
 ) -> Value {
     unsafe {
+        // (Its frame ends with the exception, never an interpreted one
+        // that would unwind: closures of its registers keep their values,
+        // else their upvalues stay open on the stack past it.)
         if vm.error.is_some() {
+            interp::close_frame_upvalues(vm, caller.add(site.frame));
             return Value::EMPTY;
         }
         // Through the runtime from now on, or for a site claimed by types,

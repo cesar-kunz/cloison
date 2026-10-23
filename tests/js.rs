@@ -8391,3 +8391,25 @@ for (var i = 0; i < 300; i++) s += m(i) - i;
 "#;
     assert_eq!(value(src), "99 undefinedundefined 55 7  9true 6 1undefined -43050");
 }
+
+/// A compiled function called directly that throws from a runtime call
+/// closes its frame's upvalues: its closures kept pointing into the
+/// stack past it, read what later calls left there, and an unwind
+/// further down closed them from that (cloison-fuzz BUGS.md #20: a
+/// segmentation fault in the write barrier).
+#[test]
+fn directly_called_frames_that_throw_close_their_upvalues() {
+    let src = r#"
+var kept = [];
+function g(p) { kept.push(() => p); decodeURIComponent(p % 3 == 0 ? "%" : "a"); return p; }
+function caller(n) { var s = 0; for (var i = 0; i < n; i++) { try { s += g(i); } catch (e) { s -= 1; } } return s; }
+function clobber(a, b, c, d, e, f) { return a + b + c + d + e + f; }
+function outer(n) { var s = 0; for (var i = 0; i < n; i++) s += clobber(i, 1.5, 2.5, 3.5, 4.5, 5.5); return s; }
+var s = caller(3000);
+outer(3000);
+var bad = 0;
+for (var i = 0; i < kept.length; i++) if (kept[i]() !== i) bad++;
+s + " " + bad;
+"#;
+    assert_eq!(value(src), "2999000 0");
+}

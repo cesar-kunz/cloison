@@ -2701,6 +2701,11 @@ impl Vm {
             return self.set_primitive(obj, name, value);
         }
         let o = as_object(obj);
+        // An object literal's property past a proxy or another realm's
+        // prototype: defined, not that prototype's [[Set]].
+        if (!self.realms.is_empty() || crate::proxy::chain_has_proxy(self, o)) && code.define_ics.contains(&k) {
+            return self.create_data_property(obj, Key::Name(name), value);
+        }
         if !self.realms.is_empty()
             && name != self.a_length
             && let Some(p) = self.realm_proto(o)

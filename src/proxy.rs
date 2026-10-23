@@ -89,6 +89,15 @@ fn parts(o: *mut Object) -> Result<(Value, Value)> {
     Ok((t, h))
 }
 
+/// A key as a trap gets it: a property key, a String or a Symbol (an index
+/// too, as its string: not the number `key_value` makes it for access).
+fn trap_key(vm: &mut Vm, key: Key) -> Value {
+    match key {
+        Key::Index(_) => vm.key_string(key),
+        Key::Name(_) => vm.key_value(key),
+    }
+}
+
 /// Handler `h`'s trap `name`, if it has one.
 /// Every internal method of a proxy looks its trap up first: a chain of
 /// proxies forwarding to their targets recurses through here, near the
@@ -231,7 +240,7 @@ fn get(vm: &mut Vm, p: *mut Object, key: Key, receiver: Value) -> Result<Value> 
     let (t, h) = parts(p)?;
     match trap(vm, h, "get")? {
         Some(f) => {
-            let k = vm.key_value(key);
+            let k = trap_key(vm, key);
             let v = call_function(vm, f, h, &[t, k, receiver])?;
             if let Some(d) = get_own_property(vm, as_object(t), key)?
                 && d.configurable == Some(false)
@@ -253,7 +262,7 @@ fn set(vm: &mut Vm, p: *mut Object, key: Key, v: Value, receiver: Value) -> Resu
     let (t, h) = parts(p)?;
     match trap(vm, h, "set")? {
         Some(f) => {
-            let k = vm.key_value(key);
+            let k = trap_key(vm, key);
             if !to_boolean(call_function(vm, f, h, &[t, k, v, receiver])?) {
                 return Ok(false);
             }
@@ -277,7 +286,7 @@ fn has(vm: &mut Vm, p: *mut Object, key: Key) -> Result<bool> {
     let (t, h) = parts(p)?;
     match trap(vm, h, "has")? {
         Some(f) => {
-            let k = vm.key_value(key);
+            let k = trap_key(vm, key);
             if to_boolean(call_function(vm, f, h, &[t, k])?) {
                 return Ok(true);
             }
@@ -386,7 +395,7 @@ pub(crate) fn delete(vm: &mut Vm, o: *mut Object, key: Key) -> Result<bool> {
     let (t, h) = parts(o)?;
     match trap(vm, h, "deleteProperty")? {
         Some(f) => {
-            let k = vm.key_value(key);
+            let k = trap_key(vm, key);
             if !to_boolean(call_function(vm, f, h, &[t, k])?) {
                 return Ok(false);
             }
@@ -413,7 +422,7 @@ pub(crate) fn get_own_property(vm: &mut Vm, o: *mut Object, key: Key) -> Result<
     let Some(f) = trap(vm, h, "getOwnPropertyDescriptor")? else {
         return get_own_property(vm, as_object(t), key);
     };
-    let k = vm.key_value(key);
+    let k = trap_key(vm, key);
     let r = call_function(vm, f, h, &[t, k])?;
     if !r.is_undefined() && !is_object(r) {
         return Err(Error::type_error("The proxy's 'getOwnPropertyDescriptor' trap returned neither an object nor undefined"));
@@ -472,7 +481,7 @@ pub(crate) fn proxy_define(vm: &mut Vm, o: *mut Object, key: Key, d: &Desc) -> R
     let Some(f) = trap(vm, h, "defineProperty")? else {
         return define_property(vm, as_object(t), key, d);
     };
-    let k = vm.key_value(key);
+    let k = trap_key(vm, key);
     let dv = from_partial_descriptor(vm, d);
     if !to_boolean(call_function(vm, f, h, &[t, k, dv])?) {
         return Ok(false);

@@ -8160,3 +8160,17 @@ out.join(' ');
 "#;
     assert_eq!(value(src), "1 1 1 a7 7 0");
 }
+
+/// An object literal's named key past a Proxy prototype is defined, not
+/// the proxy's [[Set]] (cloison-fuzz BUGS.md #15).
+#[test]
+fn literal_keys_past_a_proxy_prototype_are_defined() {
+    let src = r#"
+var hits = 0;
+var ro = {}; Object.defineProperty(ro, "w", { value: 37, writable: false, configurable: true });
+var px = new Proxy({}, { set() { hits += 100; return true; }, get(t, k) { return "P"; } });
+[({ __proto__: px, w: 1 }).w, ({ __proto__: new Proxy(ro, {}), w: 1 }).w,
+  Object.getOwnPropertyNames({ __proto__: px, w: 1 }).join(), hits].join(' ');
+"#;
+    assert_eq!(value(src), "1 1 w 0");
+}

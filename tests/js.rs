@@ -8321,3 +8321,23 @@ out.join(' ');
 "#;
     assert_eq!(value(src), "200 3 200 3 200 3 200 x 495000");
 }
+
+/// A direct eval's `delete` of a binding its scope object inherits
+/// deletes it where it is: the function's `var` isn't deleted, false
+/// (cloison-fuzz BUGS.md #16); a `with` object's inherited property is
+/// still true.
+#[test]
+fn eval_delete_of_function_variables_inside_lexical_scopes() {
+    let src = r#"
+var out = [];
+{
+  let z = 1;
+  out.push((function (p) { var l = 3; return [eval("delete l"), typeof l, eval("delete p")].join(); })(5));
+  out.push((function () { eval("var q = 1"); return eval("delete q") + typeof q; })());
+  out.push((function () { var o = Object.create({ x: 1 }); var r; with (o) { r = eval("delete x"); } return r; })());
+  out.push((function () { let b = 2; return eval("delete b"); })());
+}
+out.join(' ');
+"#;
+    assert_eq!(value(src), "false,number,false trueundefined true false");
+}

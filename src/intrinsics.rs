@@ -160,7 +160,7 @@ pub(crate) fn to_property_key(vm: &mut Vm, v: Value) -> Result<Key> {
 /// `[…, , …]`: the array one longer, with a hole.
 fn hole(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let arr = a[0];
-    let n = unsafe { (*as_object(arr)).elems_len };
+    let n = crate::far::array_length(as_object(arr));
     let a_length = vm.a_length;
     vm.put_key(arr, Key::Name(a_length), Value::number(n as f64 + 1.0))?;
     Ok(arr)

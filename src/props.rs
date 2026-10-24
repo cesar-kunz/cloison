@@ -127,6 +127,12 @@ impl Vm {
     /// path fits (see the module docs). Compiled code relying on the old
     /// shape is dropped.
     pub(crate) fn unique_shape(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, no_elements: bool) {
+        self.unique_shape_with(o, attrs, no_elements, true);
+    }
+
+    /// `unique_shape`, dropping compiled code relying on the old shape only
+    /// if `drop_code`.
+    fn unique_shape_with(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, no_elements: bool, drop_code: bool) {
         unsafe {
             let s = &*(*o).shape;
             let same_attrs = attrs.as_ref().is_none_or(|a| a == s.attrs());
@@ -161,7 +167,9 @@ impl Vm {
                 pinned: Cell::new(false),
             };
             crate::object::set_shape(o, self.add_shape(u));
-            self.bump_code_epoch();
+            if drop_code {
+                self.bump_code_epoch();
+            }
             if (*o).flags & crate::object::PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
@@ -171,6 +179,61 @@ impl Vm {
     /// Every element store to `o` takes the runtime path from now on.
     pub(crate) fn slow_elements(&mut self, o: *mut Object) {
         self.unique_shape(o, None, true);
+    }
+
+    /// `slow_elements` for an array going far (see `far`): compiled code
+    /// stays. It may store in place into the dense prefix, whose elements
+    /// are the array's, but appends and pushes check the shape's
+    /// `elems_code`, and the `length` reads and `pop` exit on `FAR`.
+    pub(crate) fn far_elements(&mut self, o: *mut Object) {
+        self.unique_shape_with(o, None, true, false);
+    }
+
+    /// Array `o`, far until now, given a shape whose elements take the
+    /// stores' fast paths again: the array shape moved to its elements'
+    /// type if it has no properties, else a unique shape of that type.
+    pub(crate) fn dense_elements(&mut self, o: *mut Object) {
+        unsafe {
+            let mut elems = FieldType::None;
+            for k in 0..(*o).elems_len as usize {
+                let v = *(*o).elems.add(k);
+                if v != Value::EMPTY {
+                    elems = elems.join(FieldType::of(v));
+                }
+            }
+            let s = &*(*o).shape;
+            let root = &*self.array_shape;
+            if s.keys().is_empty() && s.proto == root.proto && s.capacity.get() == root.capacity.get() {
+                let t = if elems == FieldType::None { self.array_shape } else { self.elements_transition(self.array_shape, elems) };
+                crate::object::set_shape(o, t);
+                return;
+            }
+            self.shape_left(s);
+            let u = Shape {
+                class: s.class,
+                proto: s.proto,
+                capacity: Cell::new(s.capacity.get()),
+                slots: s.slots.clone(),
+                elems,
+                elems_code: elems.encode(),
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: true,
+                transitions: RefCell::default(),
+                elem_transitions: RefCell::default(),
+                relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: s,
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
+            };
+            crate::object::set_shape(o, self.add_shape(u));
+            if (*o).flags & crate::object::PROTOTYPE != 0 {
+                self.proto_epoch = self.proto_epoch.wrapping_add(1);
+            }
+        }
     }
 
     /// `o`'s own property `name` kept in a slot, if any.
@@ -251,6 +314,11 @@ impl Vm {
                         let v = *(*o).elems.add(i as usize);
                         return Some(Desc::data(v, flags & FROZEN == 0, true, flags & SEALED == 0));
                     }
+                    if crate::far::is_far(o)
+                        && let Some(v) = crate::far::get(o, i)
+                    {
+                        return Some(Desc::data(v, flags & FROZEN == 0, true, flags & SEALED == 0));
+                    }
                     if flags & SPARSE != 0 {
                         let a = self.intern(&i.to_string());
                         return self.own_named(o, a);
@@ -271,7 +339,7 @@ impl Vm {
                         }
                         return match class {
                             Class::Array => {
-                                let n = Value::from_i32((*o).elems_len as i32);
+                                let n = Value::number(crate::far::array_length(o) as f64);
                                 Some(Desc::data(n, flags & LENGTH_READ_ONLY == 0, false, false))
                             }
                             Class::Function | Class::Native if flags & FN_LENGTH_DELETED == 0 => {
@@ -328,6 +396,9 @@ impl Vm {
                 }
             }
             indices.extend(far.iter().map(|&(i, _)| i));
+            if crate::far::is_far(o) {
+                indices.extend(crate::far::keys(o));
+            }
             indices.sort_unstable();
             indices.dedup();
             let far_enum = |i: u32| far.iter().find(|&&(j, _)| j == i).is_none_or(|&(_, e)| e);
@@ -421,7 +492,7 @@ impl Vm {
                 .collect();
             (*o).flags |= NOT_EXTENSIBLE | SEALED;
             // (Read-only elements: see `protect_indices`.)
-            if freeze && ((*o).elems_len > 0 || (*o).flags & SPARSE != 0) {
+            if freeze && ((*o).elems_len > 0 || (*o).flags & SPARSE != 0 || crate::far::is_far(o)) {
                 self.protect_indices();
             }
             if freeze {
@@ -586,7 +657,7 @@ impl Vm {
                         return Ok(true);
                     }
                     // (An array whose `length` is read-only doesn't grow.)
-                    if class == Class::Array && i >= (*o).elems_len && (*o).flags & LENGTH_READ_ONLY != 0 {
+                    if class == Class::Array && i >= crate::far::array_length(o) && (*o).flags & LENGTH_READ_ONLY != 0 {
                         return Ok(false);
                     }
                     match class {
@@ -630,11 +701,14 @@ impl Vm {
                     if full.is_accessor() || full.writable == Some(false) {
                         self.protect_indices();
                     }
-                    if class == Class::Array && i >= (*o).elems_len {
+                    if class == Class::Array && i >= crate::far::array_length(o) {
                         self.grow_elements(o, i as usize + 1)?;
                     }
                     if i < (*o).elems_len && Self::has_element(o, i) {
                         *(*o).elems.add(i as usize) = Value::EMPTY;
+                    }
+                    if crate::far::is_far(o) {
+                        crate::far::remove(o, i);
                     }
                     (*o).flags |= SPARSE;
                     if !far {
@@ -680,6 +754,18 @@ impl Vm {
     /// or buffer), the elements grown to hold it.
     fn set_element(&mut self, o: *mut Object, i: u32, v: Value) {
         unsafe {
+            // (Past an array's dense elements: far if it is, or if they
+            // would be too sparse: see `far::Density`.)
+            if (*o).class == Class::Array
+                && i >= (*o).elems_len
+                && (crate::far::is_far(o) || self.density.goes_far((*o).elems_len as usize + 1, i as usize + 1))
+            {
+                if !crate::far::is_far(o) {
+                    crate::far::make_far(self, o, (*o).elems_len);
+                }
+                crate::far::set(self, o, i, v);
+                return;
+            }
             if i >= (*o).elems_len {
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
@@ -691,11 +777,18 @@ impl Vm {
         }
     }
 
-    /// Grow `o`'s elements to length `n` with holes (a `RangeError` past
-    /// what the elements can hold).
+    /// Grow array `o` to length `n` with holes: its elements, or its far
+    /// store's length where it is or goes far (see `far::Density`).
     fn grow_elements(&mut self, o: *mut Object, n: usize) -> Result<()> {
-        if n > crate::vm::MAX_ELEMENTS {
-            return Err(Error::range_error("array length too large for this engine"));
+        if crate::far::is_far(o) {
+            if n as u32 > crate::far::length(o) {
+                crate::far::set_length(o, n as u32);
+            }
+            return Ok(());
+        }
+        if self.density.goes_far(unsafe { (*o).elems_len } as usize, n) {
+            crate::far::make_far(self, o, n as u32);
+            return Ok(());
         }
         unsafe {
             let len = (*o).elems_len as usize;
@@ -726,7 +819,7 @@ impl Vm {
                     Some(u as u32)
                 }
             };
-            let old_len = (*o).elems_len;
+            let old_len = crate::far::array_length(o);
             if read_only {
                 if d.writable == Some(true) {
                     return Ok(false);
@@ -743,22 +836,36 @@ impl Vm {
                     if (*o).flags & SEALED != 0 {
                         stop = old_len;
                     } else if (*o).flags & SPARSE != 0 {
-                        for i in (n..old_len).rev() {
-                            let a = self.intern(&i.to_string());
+                        // The index names at `n` or past it, from the
+                        // highest (not each index: a far array's length
+                        // may be 2^32 - 1).
+                        let s = &*(*o).shape;
+                        let mut named: Vec<(u32, Atom)> = s
+                            .keys()
+                            .iter()
+                            .filter_map(|&a| index_of_name(self.atom_name(a)).filter(|&k| k >= n).map(|k| (k, a)))
+                            .collect();
+                        named.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
+                        for (k, a) in named {
                             let s = &*(*o).shape;
-                            if let Some(k) = s.lookup(a) {
-                                if s.attrs()[k as usize] & DONT_DELETE != 0 {
-                                    stop = i + 1;
+                            if let Some(slot) = s.lookup(a) {
+                                if s.attrs()[slot as usize] & DONT_DELETE != 0 {
+                                    stop = k + 1;
                                     break;
                                 }
                                 self.delete_named(o, a);
                             }
                         }
                     }
-                    for i in stop..old_len {
-                        *(*o).elems.add(i as usize) = Value::EMPTY;
+                    if crate::far::is_far(o) {
+                        crate::far::truncate(o, stop);
+                        crate::far::maybe_dense(self, o);
+                    } else {
+                        for i in stop..old_len {
+                            *(*o).elems.add(i as usize) = Value::EMPTY;
+                        }
+                        (*o).elems_len = stop;
                     }
-                    (*o).elems_len = stop;
                     if stop != n {
                         if d.writable == Some(false) {
                             (*o).flags |= LENGTH_READ_ONLY;
@@ -804,6 +911,13 @@ impl Vm {
                             return false;
                         }
                         *(*o).elems.add(i as usize) = Value::EMPTY;
+                        return true;
+                    }
+                    if crate::far::is_far(o) && crate::far::has(o, i) {
+                        if (*o).flags & SEALED != 0 {
+                            return false;
+                        }
+                        crate::far::remove(o, i);
                         return true;
                     }
                     if (*o).flags & SPARSE != 0 {
@@ -1033,7 +1147,7 @@ impl Vm {
                 Some(d) => d.set.is_some_and(|s| s.is_undefined()),
                 // (An array whose `length` is read-only doesn't grow.)
                 None if matches!(key, Key::Index(i) if unsafe {
-                    (*obj).class == Class::Array && i >= (*obj).elems_len && (*obj).flags & LENGTH_READ_ONLY != 0
+                    (*obj).class == Class::Array && i >= crate::far::array_length(obj) && (*obj).flags & LENGTH_READ_ONLY != 0
                 }) => true,
                 None => {
                     // An inherited read-only or a setter-less accessor

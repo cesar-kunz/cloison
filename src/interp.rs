@@ -1371,7 +1371,7 @@ handlers! {
         let o = as_object(*reg(pc, 1, regs));
         let ic = ic_at(regs, pc, 2);
         // An array's or a string's `length` (cached without a shape).
-        if (*ic).loc == LENGTH_LOC && matches!((*o).class, Class::Array | Class::String) {
+        if (*ic).loc == LENGTH_LOC && matches!((*o).class, Class::Array | Class::String) && (*o).flags & crate::far::FAR == 0 {
             next!(any, Op::GetNamed.size(), Value::from_i32((*o).elems_len as i32))
         }
         for k in 1..IC_WAYS {
@@ -3372,13 +3372,19 @@ fn default_string(v: Value) -> Vec<u16> {
         // An array: its elements' strings, joined by commas (holes,
         // undefined and null as empty strings).
         if unsafe { (*o).class } == Class::Array {
-            let n = unsafe { (*o).elems_len } as usize;
+            // (A far array's far elements too, as long as a string can be.)
+            let n = (crate::far::array_length(o) as usize).min(crate::vm::MAX_STRING_LEN);
+            let dense = unsafe { (*o).elems_len } as usize;
             let mut out = Vec::new();
             for i in 0..n {
                 if i > 0 {
                     out.push(b',' as u16);
                 }
-                let e = unsafe { *(*o).elems.add(i) };
+                let e = if i < dense {
+                    unsafe { *(*o).elems.add(i) }
+                } else {
+                    crate::far::get(o, i as u32).unwrap_or(Value::EMPTY)
+                };
                 if e != Value::EMPTY && !e.is_undefined() && !e.is_null() {
                     out.extend(to_string_units(e));
                 }

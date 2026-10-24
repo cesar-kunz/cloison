@@ -40,6 +40,7 @@ compile_error!("cloison supports x86_64 and aarch64 only (dispatch is tuned per 
 pub mod asm;
 mod builtins;
 mod array;
+pub mod far;
 mod intrinsics;
 mod symbol;
 mod iterator;

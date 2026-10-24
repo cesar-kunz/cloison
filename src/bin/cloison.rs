@@ -64,6 +64,14 @@ fn main() -> ExitCode {
                 no_block = true;
                 args.remove(0);
             }
+            "--array-density" if args.len() > 2 => {
+                let Some(d) = cloison::far::Density::parse(&args[1]) else {
+                    eprintln!("--array-density: D[,D'[,W]], fractions (1/8, 0.125) and bytes (64k, 1m, inf)");
+                    return ExitCode::from(2);
+                };
+                cloison::far::set_density(d);
+                args.drain(..2);
+            }
             _ => break,
         }
     }
@@ -71,7 +79,7 @@ fn main() -> ExitCode {
         [p] => (false, p),
         [flag, p] if flag == "--dump" => (true, p),
         _ => {
-            eprintln!("usage: cloison [--dump] FILE.js|FILE.asm\n       cloison [--prelude SCRIPT] [--module] [--no-block] FILE");
+            eprintln!("usage: cloison [--dump] FILE.js|FILE.asm\n       cloison [--prelude SCRIPT] [--module] [--no-block] [--array-density D[,D'[,W]]] FILE");
             return ExitCode::from(2);
         }
     };

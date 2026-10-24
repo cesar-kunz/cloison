@@ -18,7 +18,7 @@ use std::cell::{Cell, RefCell};
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number};
 use crate::object::{Slots, 
-    ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FN_LENGTH_DELETED, FN_NAME_DELETED, FROZEN,
+    ACCESSOR, Atom, Class, DONT_DELETE, DONT_ENUM, FN_LENGTH_DELETED, FN_NAME_DELETED, FROZEN, FieldType,
     LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, READ_ONLY, SEALED, SPARSE, Shape, as_object,
     object_value,
 };
@@ -130,7 +130,10 @@ impl Vm {
         unsafe {
             let s = &*(*o).shape;
             let same_attrs = attrs.as_ref().is_none_or(|a| a == s.attrs());
-            if s.unique && same_attrs && (!no_elements || s.elems_code == NO_ELEMENTS) {
+            // (With no store's fast path for good: elements typed `Any`, so
+            // no store generalizes them, which would give the shape an
+            // `elems_code` of a type again, as `elements_transition` does.)
+            if s.unique && same_attrs && (!no_elements || s.elems_code == NO_ELEMENTS && s.elems == FieldType::Any) {
                 return;
             }
             self.shape_left(s);
@@ -142,7 +145,7 @@ impl Vm {
                     Some(a) if a != s.attrs() => Slots::new(s.keys(), &a, s.fields()),
                     _ => s.slots.clone(),
                 },
-                elems: s.elems,
+                elems: if no_elements { FieldType::Any } else { s.elems },
                 elems_code: if no_elements { NO_ELEMENTS } else { s.elems_code },
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),

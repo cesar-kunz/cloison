@@ -8322,6 +8322,24 @@ out.join(' ');
     assert_eq!(value(src), "200 3 200 3 200 3 200 x 495000");
 }
 
+/// A sealed or non-extensible array whose elements change type (an int32
+/// array given a double) still takes no element through compiled code:
+/// its shape's elements kept no type, so no fast path appends.
+#[test]
+fn compiled_append_respects_integrity_after_an_element_type_change() {
+    let src = r#"
+"use strict";
+function f(a, v) { a[a.length] = v; }
+for (var i = 0; i < 100000; i++) f([1, 2], i);
+function errs(a) { var n = 0; for (var i = 0; i < 1000; i++) { try { f(a, 7); } catch (e) { n++; } } return n; }
+var s = [1, 2, 3], p = [1, 2, 3];
+Object.seal(s); Object.preventExtensions(p);
+s[0] = 1.5; p[0] = 1.5;
+[errs(s), s.length, errs(p), p.length, s.join()].join(' ');
+"#;
+    assert_eq!(value(src), "1000 3 1000 3 1.5,2,3");
+}
+
 /// A direct eval's `delete` of a binding its scope object inherits
 /// deletes it where it is: the function's `var` isn't deleted, false
 /// (cloison-fuzz BUGS.md #16); a `with` object's inherited property is

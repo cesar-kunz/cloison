@@ -584,14 +584,22 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
                 return 0;
             }
             Class::TypedArray => {}
-            Class::Plain | Class::Array => {
+            // (Far past a plain object's elements: a named property, a
+            // transition. An array's far elements are no property: see
+            // `far`.)
+            Class::Plain => {
                 if key.as_i32_unchecked() as usize > (*p).elems_len as usize * 2 + 1024 {
                     return 0;
                 }
             }
+            Class::Array => {}
             _ => return 0,
         }
     }
+    // (It may grow the elements: a collection asked for is made first, as
+    // compiled code growing an array by index may reach no other
+    // safepoint, 1.1 GB of dead elements left for the next one.)
+    vm.safepoint(std::ptr::null_mut());
     // (A store that did nothing: the interpreter's again, which throws in
     // strict code. One whose conversion needed a call too.)
     vm.store_failed = false;
@@ -3696,7 +3704,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         sel.base = "nop";
         sel.case = "";
     } else if insn.check_only && sel.base.starts_with("get_") {
-        if sel.case == "nc" {
+        if matches!(sel.case, "nc" | "na") {
             sel.base = "nop";
         } else if let Some(c) = spec.props.get(i).and_then(|&p| Case::of(p)) {
             sel.base = "check_shape";
@@ -3734,7 +3742,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         };
         let mut sel = select_types(insn, i, &any, &no);
         // Generic code knows no shapes.
-        if sel.case == "nc" {
+        if matches!(sel.case, "nc" | "na") {
             return Sel::new("bail", "", any);
         }
         let (base, case) = (sel.base, sel.case);
@@ -5140,7 +5148,7 @@ fn decode_num(at: impl IntoIterator<Item = (u64, i32)>) -> Option<&'static str> 
 /// past it the receiver's shape is what it was before; the value from the
 /// runtime gets the check its type needs.
 fn soften(insn: &Insn, st: &TypeState, spec: &Spec, mut sel: Sel) -> Sel {
-    let guarded = sel.case != "nc"
+    let guarded = !matches!(sel.case, "nc" | "na")
         && matches!(sel.base, "get_own" | "get_oop" | "get_proto" | "get_length" | "poly");
     let Some(fbs) = spec.feedback else { return sel };
     if !guarded || insn.check_only {
@@ -5253,11 +5261,15 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                     ..Sel::new("get_named_rt", "", out)
                 };
             }
-            let array = class.is_some_and(|c| {
+            let known = class.is_some_and(|c| {
                 matches!(c, Class::Array | Class::String) || c == Class::TypedArray && !spec.views_detached
             });
             out.acc = I32;
-            let case = match (array, spec.views_detached) {
+            // (A known array may have gone far in a call, its shape still
+            // extending the known one: `na` checks; a string's or a typed
+            // array's length is where `nc` reads it.)
+            let case = match (known, spec.views_detached) {
+                (true, _) if class == Some(Class::Array) => "na",
                 (true, _) => "nc",
                 (false, true) => "nt",
                 (false, false) => "",
@@ -6574,6 +6586,7 @@ fn stencil_for(
             cat!(sel.base, "_nc_", loc)
         }
         ("get_length", _) if sel.case == "nt" => cat!(sel.base, "_nt_", loc),
+        ("get_length", _) if sel.case == "na" => cat!(sel.base, "_na_", loc),
         ("get_own" | "get_oop" | "get_proto" | "get_length", _) => cat!(sel.base, "_", loc),
         // Stores take a boxed `acc`; a number's (`_n`) needs no barrier,
         // also one its check proved a number.

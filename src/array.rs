@@ -86,17 +86,49 @@ fn relative(v: Value, len: f64, default: f64) -> f64 {
 /// chain (holes are then absent), `Array.prototype` then
 /// `Object.prototype`.
 fn dense(vm: &Vm, o: *mut Object) -> bool {
+    unsafe { (*o).class == Class::Array && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0 && plain_protos(vm, o) }
+}
+
+/// Whether `o`'s prototypes are `Array.prototype` then `Object.prototype`
+/// with nothing indexed (`dense`'s condition on them).
+fn plain_protos(vm: &Vm, o: *mut Object) -> bool {
     unsafe {
-        (*o).class == Class::Array
-            && (*o).flags & !(EXTERNAL | PROTOTYPE) == 0
-            && (*(*o).shape).proto == object_value(vm.array_prototype)
+        (*(*o).shape).proto == object_value(vm.array_prototype)
             && (*(*vm.array_prototype).shape).proto == object_value(vm.object_prototype)
             && (*(*vm.object_prototype).shape).proto.is_null()
             && (*vm.array_prototype).elems_len == 0
             && (*vm.object_prototype).elems_len == 0
-            && (*vm.array_prototype).flags & crate::object::SPARSE == 0
+            && (*vm.array_prototype).flags & (crate::object::SPARSE | crate::far::FAR) == 0
             && (*vm.object_prototype).flags & crate::object::SPARSE == 0
     }
+}
+
+/// Whether `o` is a far array whose missing indices nothing sees: none of
+/// its own a named property (`SPARSE`), and its prototypes `plain_protos`.
+fn skips(vm: &Vm, o: *mut Object) -> bool {
+    crate::far::is_far(o) && unsafe { (*o).flags } & crate::object::SPARSE == 0 && plain_protos(vm, o)
+}
+
+/// Where a loop over `o`'s present elements, at `k` and below `len`, goes
+/// on: past a far array's missing indices (where `skips`), to its next
+/// far key or `len`; else `k`.
+fn skip(vm: &mut Vm, o: Value, k: f64, len: f64) -> f64 {
+    let obj = as_object(o);
+    if k >= u32::MAX as f64 || !skips(vm, obj) || k < unsafe { (*obj).elems_len } as f64 {
+        return k;
+    }
+    crate::far::next_key(vm, obj, k as u32).map_or(len, |i| (i as f64).min(len))
+}
+
+/// `skip` for a loop going down from `k`: a far array's last far key at
+/// `k` or before, else the end of its dense prefix (-1 for none).
+fn skip_back(vm: &mut Vm, o: Value, k: f64) -> f64 {
+    let obj = as_object(o);
+    let n = unsafe { (*obj).elems_len } as f64;
+    if k >= u32::MAX as f64 || !skips(vm, obj) || k < n {
+        return k;
+    }
+    crate::far::prev_key(vm, obj, k as u32).map_or(n - 1.0, |i| i as f64)
 }
 
 /// A key for index `i` (an `f64`, as lengths go to 2^53).
@@ -238,6 +270,10 @@ fn flatten(vm: &mut Vm, target: Value, source: Value, len: f64, start: f64, dept
     let mut at = start;
     let mut i = 0.0;
     while i < len {
+        i = skip(vm, source, i, len);
+        if i >= len {
+            break;
+        }
         let (has, mut v) = element(vm, source, i)?;
         if has {
             if let Some((f, that)) = f {
@@ -310,6 +346,11 @@ fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // A cycle (an array holding itself) joins as empty, as the engines do.
     if joining(vm, o) {
         return Ok(vm.new_string(&[]));
+    }
+    // (Its separators alone past the longest string: thrown before any
+    // element is read, as a far array's length may be 2^32 - 1.)
+    if (len - 1.0) * sep.len() as f64 > crate::vm::MAX_STRING_LEN as f64 {
+        return Err(Error::range_error("Invalid string length"));
     }
     vm.handle_scope(|vm| {
         vm.handles.extend([Value::HOLE, o]);
@@ -429,6 +470,12 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         let mut i = 0.0;
         while i < len {
+            let j = skip(vm, item, i, len);
+            n += j - i;
+            i = j;
+            if i >= len {
+                break;
+            }
             let (has, v) = element(vm, item, i)?;
             if has {
                 create(vm, out, n, v)?;
@@ -629,6 +676,12 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut n = 0.0;
     let mut i = k;
     while i < end {
+        let j = skip(vm, o, i, end);
+        n += j - i;
+        i = j;
+        if i >= end {
+            break;
+        }
         let (has, v) = element(vm, o, i)?;
         if has {
             create(vm, out, n, v)?;
@@ -754,6 +807,10 @@ fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let mut present = 0.0;
         let mut i = 0.0;
         while i < len {
+            i = skip(vm, o, i, len);
+            if i >= len {
+                break;
+            }
             let (has, v) = element(vm, o, i)?;
             if has {
                 vm.handles.push(v);
@@ -795,6 +852,10 @@ fn array_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         let mut i = present;
         while i < len {
+            i = skip(vm, o, i, len);
+            if i >= len {
+                break;
+            }
             delete(vm, o, i)?;
             i += 1.0;
         }
@@ -871,6 +932,10 @@ pub(crate) fn array_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
         return Ok(Value::from_i32(-1));
     }
     while k < len {
+        k = skip(vm, o, k, len);
+        if k >= len {
+            break;
+        }
         let (has, v) = element(vm, o, k)?;
         if has && strict_equals(v, x) {
             return Ok(Value::number(k));
@@ -890,6 +955,10 @@ pub(crate) fn array_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Resu
     let n = if a.len() > 1 { to_integer(a[1]) } else { len - 1.0 };
     let mut k = if n >= 0.0 { n.min(len - 1.0) } else { len + n };
     while k >= 0.0 {
+        k = skip_back(vm, o, k);
+        if k < 0.0 {
+            break;
+        }
         let (has, v) = element(vm, o, k)?;
         if has && strict_equals(v, x) {
             // (`-0` as `+0`.)
@@ -911,6 +980,15 @@ pub(crate) fn array_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Va
     let n = if a.len() > 1 { to_integer(a[1]) } else { 0.0 };
     let mut k = if n >= 0.0 { n } else { (len + n).max(0.0) };
     while k < len {
+        // (Past missing indices, each `undefined`.)
+        let j = skip(vm, o, k, len);
+        if j > k && x.is_undefined() {
+            return Ok(Value::TRUE);
+        }
+        k = j;
+        if k >= len {
+            break;
+        }
         let v = get(vm, o, k)?;
         let same = same_value(v, x) || v.as_number().is_some_and(|d| d == 0.0 && x.as_number() == Some(0.0));
         if same {
@@ -936,6 +1014,10 @@ fn each(
     let that = arg(a, 1);
     let mut i = 0.0;
     while i < len {
+        i = skip(vm, o, i, len);
+        if i >= len {
+            break;
+        }
         let (has, v) = element(vm, o, i)?;
         if has {
             let r = call_function(vm, f, that, &[v, Value::number(i), o])?;
@@ -1036,11 +1118,16 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], right: bool) -> Result<Value> {
     let mut k = if right { len - 1.0 } else { 0.0 };
     let step = if right { -1.0 } else { 1.0 };
     let in_range = |k: f64| if right { k >= 0.0 } else { k < len };
+    let skip_to = |vm: &mut Vm, k: f64| if right { skip_back(vm, o, k) } else { skip(vm, o, k, len) };
     let mut acc = if a.len() > 1 {
         a[1]
     } else {
         let mut found = None;
         while in_range(k) {
+            k = skip_to(vm, k);
+            if !in_range(k) {
+                break;
+            }
             let (has, v) = element(vm, o, k)?;
             k += step;
             if has {
@@ -1051,6 +1138,10 @@ fn reduce(vm: &mut Vm, this: Value, a: &[Value], right: bool) -> Result<Value> {
         found.ok_or_else(|| Error::type_error("Reduce of empty array with no initial value"))?
     };
     while in_range(k) {
+        k = skip_to(vm, k);
+        if !in_range(k) {
+            break;
+        }
         let (has, v) = element(vm, o, k)?;
         if has {
             acc = call_function(vm, f, Value::UNDEFINED, &[acc, v, Value::number(k), o])?;

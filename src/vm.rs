@@ -183,8 +183,8 @@ pub const VIA_CALL: i32 = 1;
 
 /// `Ic::loc` of a `GetNamed` that read an array's `length`.
 pub const LENGTH_LOC: i32 = i32::MIN;
-/// The most elements an array can have here (they are dense: a length
-/// up to 2^32 - 1 would be allocated in full).
+/// The most elements an array keeps dense: past it, it is far (see
+/// `far`).
 pub(crate) const MAX_ELEMENTS: usize = 1 << 28;
 
 /// The most object keys `Vm::key_cache` holds.
@@ -659,6 +659,10 @@ pub struct Vm {
     /// Some object has had an indexed accessor or a read-only element
     /// (see `protect_indices`).
     pub(crate) indices_protected: bool,
+    /// When arrays go far, and back (see `far::Density`).
+    pub(crate) density: crate::far::Density,
+    /// The far keys `far::next_key` searched last.
+    pub(crate) far_keys: crate::far::SortedKeys,
     /// A fixed-length buffer has been detached (see `typed::detach`): its
     /// views' lengths, which nothing brought up to date, may be stale.
     pub(crate) views_detached: bool,
@@ -1014,6 +1018,8 @@ impl Vm {
             field_epoch: 0,
             code_epoch: 0,
             indices_protected: false,
+            density: crate::far::Density::from_env(),
+            far_keys: Default::default(),
             views_detached: false,
             typed_protos_crossed: false,
             proxies_exist: false,
@@ -2260,7 +2266,7 @@ impl Vm {
             if name == self.a_length
                 && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
             {
-                return Ok(Value::from_i32(Self::length_field(o) as i32));
+                return Ok(Value::number(Self::length_field(o) as f64));
             }
             if self.typed_numeric(o, name) {
                 return Ok(Value::UNDEFINED);
@@ -2286,13 +2292,14 @@ impl Vm {
     }
 
     /// An array's, a string's or a typed array's `length` (a typed array's
-    /// 0 once its buffer is detached: see `typed::ta_length`).
+    /// 0 once its buffer is detached: see `typed::ta_length`; a far array's
+    /// its store's: see `far`).
     fn length_field(o: *mut Object) -> u32 {
         unsafe {
             if (*o).class == Class::TypedArray {
                 return crate::typed::ta_length(o).unwrap_or(0) as u32;
             }
-            (*o).elems_len
+            crate::far::array_length(o)
         }
     }
 
@@ -2306,7 +2313,7 @@ impl Vm {
             unsafe {
                 let class = (*p).class;
                 if name == self.a_length && matches!(class, Class::Array | Class::String | Class::TypedArray) {
-                    return Value::from_i32((*p).elems_len as i32);
+                    return Value::number(Self::length_field(p) as f64);
                 }
                 if matches!(class, Class::Function | Class::Native | Class::Wrapper)
                     && let Some(d) = self.own_property(p, Key::Name(name))
@@ -2630,7 +2637,7 @@ impl Vm {
                     loc: LENGTH_LOC,
                     ..Ic::EMPTY
                 };
-                return Ok(Value::from_i32(Self::length_field(o) as i32));
+                return Ok(Value::number(Self::length_field(o) as f64));
             }
             // Absent: cached as a load from `missing_holder`'s `undefined`
             // slot, valid (like a prototype's property) while no prototype
@@ -3121,6 +3128,7 @@ impl Vm {
         Self::has_element(o, i)
             || unsafe { (*o).class == Class::Wrapper }
                 && string_units(wrapped(object_value(o)).unwrap()).is_some_and(|u| (i as usize) < u.len())
+            || crate::far::is_far(o) && crate::far::has(o, i)
             || unsafe { (*o).flags & crate::object::SPARSE != 0 && {
                 let a = self.intern(&i.to_string());
                 (*(*o).shape).lookup(a).is_some()
@@ -3444,6 +3452,11 @@ impl Vm {
                         return Ok(v);
                     }
                 }
+                if crate::far::is_far(o)
+                    && let Some(v) = crate::far::get(o, i)
+                {
+                    return Ok(v);
+                }
                 if (*o).flags & crate::object::SPARSE != 0
                     && let Some(v) = self.sparse_get(o, i, obj)?
                 {
@@ -3594,13 +3607,18 @@ impl Vm {
             if self.indices_protected && !Self::has_element(o, i) && self.set_new_element(obj, o, i, value)? {
                 return Ok(());
             }
+            // Past an array's dense elements: far if it is, or if the
+            // store would leave it too sparse (see `far::Density`).
+            if (*o).class == Class::Array
+                && i >= (*o).elems_len
+                && (crate::far::is_far(o) || crate::far::goes_far(self, o, i as usize + 1, 1))
+            {
+                return self.set_far(obj, o, i, value);
+            }
             if (*o).flags & !(crate::object::EXTERNAL | PROTOTYPE) != 0 {
                 return self.set_keyed_flagged(obj, o, i, value);
             }
             if i >= (*o).elems_len {
-                if i as usize >= MAX_ELEMENTS {
-                    return Err(Error::range_error("array index too large for this engine"));
-                }
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
                     *(*o).elems.add(j as usize) = Value::EMPTY;
@@ -3643,6 +3661,42 @@ impl Vm {
             p = unsafe { (*(*po).shape).proto };
         }
         Ok(false)
+    }
+
+    /// `obj[i] = value` on array `o` past its dense elements, where it is
+    /// far or goes far (see `far`): an element with attributes (a named
+    /// property: `SPARSE`) as such, else a plain one, unless the array's
+    /// flags forbid it (sloppy mode: nothing done).
+    #[cold]
+    fn set_far(&mut self, obj: Value, o: *mut Object, i: u32, value: Value) -> Result<()> {
+        use crate::object::{FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, SPARSE};
+        unsafe {
+            let flags = (*o).flags;
+            if flags & SPARSE != 0 {
+                let a = self.intern(&i.to_string());
+                if (*(*o).shape).lookup(a).is_some() {
+                    return self.set(obj, a, value);
+                }
+            }
+            let far = crate::far::is_far(o);
+            if far && crate::far::has(o, i) {
+                if flags & FROZEN != 0 {
+                    self.store_failed = true;
+                } else {
+                    crate::far::insert(self, o, i, value);
+                }
+                return Ok(());
+            }
+            if flags & NOT_EXTENSIBLE != 0 || i >= crate::far::array_length(o) && flags & LENGTH_READ_ONLY != 0 {
+                self.store_failed = true;
+                return Ok(());
+            }
+            if !far {
+                crate::far::make_far(self, o, (*o).elems_len);
+            }
+            crate::far::set(self, o, i, value);
+        }
+        Ok(())
     }
 
     /// `obj[i] = value` on an object with elements that have attributes,
@@ -3718,11 +3772,12 @@ impl Vm {
             return Ok(());
         }
         let n = d as usize;
-        if n > MAX_ELEMENTS {
-            return Err(Error::range_error("array length too large for this engine"));
-        }
         unsafe {
             let len = (*o).elems_len as usize;
+            if n > len && crate::far::goes_far(self, o, n, 0) {
+                crate::far::make_far(self, o, n as u32);
+                return Ok(());
+            }
             if n > len {
                 self.reserve_elems(o, n);
             }
@@ -3732,6 +3787,22 @@ impl Vm {
             (*o).elems_len = n as u32;
         }
         Ok(())
+    }
+
+    /// Reallocate `o`'s elements to just their count (room for 4 at
+    /// least): what was past them freed at the next collection.
+    pub(crate) fn shrink_elems(&mut self, o: *mut Object) {
+        unsafe {
+            let len = (*o).elems_len as usize;
+            let cap = len.max(4);
+            let e = self.heap.alloc_values_from(cap, len);
+            if len > 0 {
+                std::ptr::copy_nonoverlapping((*o).elems, e, len);
+            }
+            (*o).elems = e;
+            crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
+            (*o).elems_cap = cap as u32;
+        }
     }
 
     /// Make room for `n` elements.
@@ -5337,8 +5408,9 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
             if len < 0.0 || len.fract() != 0.0 || len > u32::MAX as f64 {
                 return Err(Error::range_error("Invalid array length"));
             }
-            if len > MAX_ELEMENTS as f64 {
-                return Err(Error::range_error("array length too large for this engine"));
+            if vm.density.goes_far(0, len as usize, false) {
+                crate::far::make_far(vm, o, len as u32);
+                return Ok(a);
             }
             vec![Value::EMPTY; len as usize]
         }
@@ -5764,12 +5836,12 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
 fn array_push_flagged(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     let o = as_object(this);
     for &v in args {
-        let n = unsafe { (*o).elems_len };
+        let n = crate::far::array_length(o);
         vm.put_key(this, Key::Index(n), v)?;
     }
-    let n = unsafe { (*o).elems_len };
+    let n = crate::far::array_length(o);
     let a_length = vm.a_length;
-    let len = Value::from_i32(n as i32);
+    let len = Value::number(n as f64);
     vm.put_key(this, Key::Name(a_length), len)?;
     Ok(len)
 }

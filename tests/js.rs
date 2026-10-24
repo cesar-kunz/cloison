@@ -8322,6 +8322,122 @@ out.join(' ');
     assert_eq!(value(src), "200 3 200 3 200 3 200 x 495000");
 }
 
+/// A sealed or non-extensible array whose elements change type (an int32
+/// array given a double) still takes no element through compiled code:
+/// its shape's elements kept no type, so no fast path appends.
+#[test]
+fn compiled_append_respects_integrity_after_an_element_type_change() {
+    let src = r#"
+"use strict";
+function f(a, v) { a[a.length] = v; }
+for (var i = 0; i < 100000; i++) f([1, 2], i);
+function errs(a) { var n = 0; for (var i = 0; i < 1000; i++) { try { f(a, 7); } catch (e) { n++; } } return n; }
+var s = [1, 2, 3], p = [1, 2, 3];
+Object.seal(s); Object.preventExtensions(p);
+s[0] = 1.5; p[0] = 1.5;
+[errs(s), s.length, errs(p), p.length, s.join()].join(' ');
+"#;
+    assert_eq!(value(src), "1000 3 1000 3 1.5,2,3");
+}
+
+/// Arrays far apart are sparse (`far`, docs/sparse-arrays.md): an index
+/// or a length up to 2^32 - 1 takes memory for the elements present, and
+/// the length, keys, deletes, truncation, freezing, attributes and the
+/// fill back to dense agree with SpiderMonkey and JSC.
+#[test]
+fn sparse_arrays() {
+    let src = r#"
+var out = [];
+var x = []; x[2 ** 27] = 1;
+out.push(x.length, x[2 ** 27], x[5], 2 ** 27 in x, Object.keys(x).join());
+var y = []; y[4294967294] = "big"; out.push(y.length, y[4294967294]);
+y[0] = 1; y[1] = 2; out.push(y.length, Object.keys(y).join());
+var z = new Array(1e9); out.push(z.length, 0 in z);
+z.length = 3; out.push(z.length);
+var w = [1, 2, 3]; w[1e6] = 4; w[500] = 5; out.push(w.length, Object.keys(w).join());
+delete w[1e6]; out.push(w.length, Object.keys(w).join(), w.indexOf(5));
+w.length = 400; out.push(w.length, Object.keys(w).join());
+var f = []; f[1e8] = 1; Object.freeze(f); f[1e8] = 2; f[3] = 3; out.push(f[1e8], f[3], f.length);
+var r = []; for (var i = 1e6; i >= 0; i--) r[i] = i; out.push(r.length, r[5], r[999999]);
+var p = []; p[2e6] = 'x'; for (var i = 0; i < 2e6; i++) p[i] = i; out.push(p.length, p[2e6], p[123]);
+var q = []; q[1e7] = 1; q.push(2); out.push(q.length, q[1e7 + 1]);
+var s = []; s[1e7] = 1; out.push(s.pop(), s.length);
+var t = []; t.length = 4294967295; out.push(t.length);
+try { t.push(1); } catch (e) { out.push(e.constructor.name); }
+var u = []; u[1e8] = 7; Object.defineProperty(u, 1e9, { value: 9, writable: false });
+out.push(u.length, u[1e9]); u.length = 5e8; out.push(u.length, u[1e8]);
+out.join(' ');
+"#;
+    assert_eq!(
+        value(src),
+        "134217729 1  true 134217728 4294967295 big 4294967295 0,1,4294967294 1000000000 false 3 1000001 \
+         0,1,2,500,1000000 1000001 0,1,2,500 500 400 0,1,2 1  100000001 1000001 5 999999 2000001 x 123 \
+         10000002 2 1 10000000 4294967295 RangeError 1000000001 9 1000000001 7"
+    );
+}
+
+/// Compiled code on an array that goes far in a call: its `length` (the
+/// known-class read too, past 2^31 as well), `push`, `pop` and appends
+/// leave it to the runtime.
+#[test]
+fn sparse_arrays_in_compiled_code() {
+    let src = r#"
+function goFar(a, i) { a[i] = 1; }
+function len(a) { return a.length; }
+function lens(a, k) { var s = 0; for (var j = 0; j < 3; j++) { s += a.length; if (j == 1) goFar(a, k); } return s; }
+function push(a, v) { return a.push(v); }
+function pop(a) { return a.pop(); }
+function app(a, v) { a[a.length] = v; return a.length; }
+var out = [];
+for (var i = 0; i < 20000; i++) { var d = [1, 2, 3]; len(d); lens(d, 3); push(d, 4); pop(d); app(d, 5); }
+var a = [1, 2, 3]; out.push(lens(a, 3e9), a.length);
+var b = [1, 2, 3]; goFar(b, 1e8);
+out.push(len(b), push(b, 9), b[1e8 + 1], pop(b), b.length, app(b, 7), b[1e8 + 1], b.length);
+var c = [1, 2]; c[2 ** 31] = 0; out.push(len(c), typeof len(c));
+var e = [0]; e[3e6] = 1; var s = 0; for (var k = 0; k < 10; k++) { e[k] = k; s += e[k]; }
+out.push(s, e.length, Object.keys(e).length);
+out.join(' ');
+"#;
+    assert_eq!(
+        value(src),
+        "3000000007 3000000001 100000001 100000002 9 9 100000001 100000002 7 100000002 2147483649 number 45 3000001 11"
+    );
+}
+
+/// Array methods over a far array visit its present elements without
+/// stepping through the missing indices (lengths near 2^32 finish at
+/// once), elements added by a callback included; `includes(undefined)`
+/// sees the holes; a join longer than a string can be throws at once.
+/// (SpiderMonkey, JSC and V8 agree with every result at lengths near 4e6.)
+#[test]
+fn sparse_array_methods() {
+    let src = r#"
+function mk() { var a = [1, 2, 3]; a[4e9] = 'z'; a[3e9] = 'y'; a[2e9] = 'x'; return a; }
+var out = [];
+var a = mk(), seen = [];
+a.forEach(function (v, i) { seen.push(i + ':' + v); if (i == 2) a[1e9] = 'added'; });
+out.push(seen.join());
+out.push(mk().indexOf('y'), mk().lastIndexOf(2), mk().lastIndexOf('z'), mk().includes(undefined), [1, 2].includes(undefined), mk().includes('x'));
+out.push(mk().map(function (v) { return v + '!'; }).length, Object.keys(mk().map(function (v) { return v + '!'; })).join());
+out.push(mk().filter(function (v) { return typeof v == 'string'; }).join());
+out.push(mk().reduce(function (s, v) { return s + v; }, ''), mk().reduceRight(function (s, v) { return s + v; }, ''), mk().reduce(function (s, v) { return s + v; }));
+out.push(mk().some(function (v) { return v == 'z'; }), mk().every(function (v) { return v; }));
+var s = mk().slice(2, 3e9 + 1); out.push(s.length, Object.keys(s).join());
+var c = [0].concat(mk()); out.push(c.length, Object.keys(c).join());
+var so = mk(); so.sort(); out.push(so.length, Object.keys(so).join(), so.slice(0, 6).join());
+try { mk().join(); } catch (e) { out.push(e.constructor.name); }
+var f = []; f[1e7] = [1, [2]]; f[5] = 0; out.push(f.flat(2).join());
+out.join(' | ');
+"#;
+    assert_eq!(
+        value(src),
+        "0:1,1:2,2:3,1000000000:added,2000000000:x,3000000000:y,4000000000:z | 3000000000 | 1 | 4000000000 | \
+         true | false | true | 4000000001 | 0,1,2,2000000000,3000000000,4000000000 | x,y,z | 123xyz | zyx321 | \
+         6xyz | true | true | 2999999999 | 0,1999999998,2999999998 | 4000000002 | \
+         0,1,2,3,2000000001,3000000001,4000000001 | 4000000001 | 0,1,2,3,4,5 | 1,2,3,x,y,z | RangeError | 0,1,2"
+    );
+}
+
 /// A direct eval's `delete` of a binding its scope object inherits
 /// deletes it where it is: the function's `var` isn't deleted, false
 /// (cloison-fuzz BUGS.md #16); a `with` object's inherited property is

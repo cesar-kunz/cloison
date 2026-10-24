@@ -58,6 +58,9 @@ node bench/run.mjs --engine "target/release/cloison" bench/micro/0*.js
   accesses globals in such a context slowly, which shows in the
   files that use globals (10–16, 28–32, 50–53).
 
+- [sparse/](sparse/) holds the sparse-array workloads and the sweep
+  that chose the density settings (docs/sparse-arrays.md).
+
 - `scripts/sizes.sh` reports the size of the runtime, of the stencils,
   and of the code the JIT generates for each listing in
   [bytecode/](bytecode/); `--record` appends them to

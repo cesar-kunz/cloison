@@ -584,11 +584,15 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
                 return 0;
             }
             Class::TypedArray => {}
-            Class::Plain | Class::Array => {
+            // (Far past a plain object's elements: a named property, a
+            // transition. An array's far elements are no property: see
+            // `far`.)
+            Class::Plain => {
                 if key.as_i32_unchecked() as usize > (*p).elems_len as usize * 2 + 1024 {
                     return 0;
                 }
             }
+            Class::Array => {}
             _ => return 0,
         }
     }

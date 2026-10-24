@@ -661,6 +661,8 @@ pub struct Vm {
     pub(crate) indices_protected: bool,
     /// When arrays go far, and back (see `far::Density`).
     pub(crate) density: crate::far::Density,
+    /// The far keys `far::next_key` searched last.
+    pub(crate) far_keys: crate::far::SortedKeys,
     /// A fixed-length buffer has been detached (see `typed::detach`): its
     /// views' lengths, which nothing brought up to date, may be stale.
     pub(crate) views_detached: bool,
@@ -1017,6 +1019,7 @@ impl Vm {
             code_epoch: 0,
             indices_protected: false,
             density: crate::far::Density::from_env(),
+            far_keys: Default::default(),
             views_detached: false,
             typed_protos_crossed: false,
             proxies_exist: false,
@@ -3608,7 +3611,7 @@ impl Vm {
             // store would leave it too sparse (see `far::Density`).
             if (*o).class == Class::Array
                 && i >= (*o).elems_len
-                && (crate::far::is_far(o) || self.density.goes_far((*o).elems_len as usize + 1, i as usize + 1))
+                && (crate::far::is_far(o) || crate::far::goes_far(self, o, i as usize + 1, 1))
             {
                 return self.set_far(obj, o, i, value);
             }
@@ -3771,7 +3774,7 @@ impl Vm {
         let n = d as usize;
         unsafe {
             let len = (*o).elems_len as usize;
-            if n > len && self.density.goes_far(len, n) {
+            if n > len && crate::far::goes_far(self, o, n, 0) {
                 crate::far::make_far(self, o, n as u32);
                 return Ok(());
             }
@@ -3784,6 +3787,22 @@ impl Vm {
             (*o).elems_len = n as u32;
         }
         Ok(())
+    }
+
+    /// Reallocate `o`'s elements to just their count (room for 4 at
+    /// least): what was past them freed at the next collection.
+    pub(crate) fn shrink_elems(&mut self, o: *mut Object) {
+        unsafe {
+            let len = (*o).elems_len as usize;
+            let cap = len.max(4);
+            let e = self.heap.alloc_values_from(cap, len);
+            if len > 0 {
+                std::ptr::copy_nonoverlapping((*o).elems, e, len);
+            }
+            (*o).elems = e;
+            crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
+            (*o).elems_cap = cap as u32;
+        }
     }
 
     /// Make room for `n` elements.
@@ -5389,7 +5408,7 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
             if len < 0.0 || len.fract() != 0.0 || len > u32::MAX as f64 {
                 return Err(Error::range_error("Invalid array length"));
             }
-            if vm.density.goes_far(0, len as usize) {
+            if vm.density.goes_far(0, len as usize, false) {
                 crate::far::make_far(vm, o, len as u32);
                 return Ok(a);
             }

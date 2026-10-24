@@ -4563,7 +4563,7 @@ impl Vm {
                 }
             }
         }
-        Err(Error::type_error(format!("{f:?} is not a function")))
+        Err(Error::type_error(format!("{} is not a function", display(f))))
     }
 
     /// `new f(…args)` when `f` isn't a bytecode function: a native that
@@ -4592,7 +4592,7 @@ impl Vm {
                 }
             }
         }
-        Err(Error::type_error(format!("{f:?} is not a constructor")))
+        Err(Error::type_error(format!("{} is not a constructor", display(f))))
     }
 
     // ---- Loading and running ----

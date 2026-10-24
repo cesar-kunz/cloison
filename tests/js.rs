@@ -8456,3 +8456,18 @@ function* h() { for (let v = 0; v < 3; v++) { try { for (const w of [1, 2]) if (
 "#;
     assert_eq!(value(src), "-39 -27 -27 0 9");
 }
+
+/// Calling or constructing an object that can't be names it as `display`
+/// does, not by its heap address (cloison-fuzz BUGS.md #23).
+#[test]
+fn not_callable_errors_show_no_addresses() {
+    let src = r#"
+var ms = [];
+for (const f of [Math, {}, Object.create(null), new Proxy({}, {}), JSON]) {
+  try { f(); } catch (e) { ms.push(e.message); }
+  try { new f(); } catch (e) { ms.push(e.message); }
+}
+ms.some((m) => m.includes("0x")) + " " + ms[0] + " / " + ms[1];
+"#;
+    assert_eq!(value(src), "false [object Object] is not a function / [object Object] is not a constructor");
+}

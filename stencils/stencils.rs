@@ -4226,10 +4226,11 @@ macro_rules! keyed_load {
 /// check that it is one (its class `Class::Array`, `Class::String` or
 /// `Class::TypedArray`) and not a far array (whose `length` is in its far
 /// store: `FAR`, checked with the class in one load, see
-/// [`length_class`]), only the latter if its shape is known (`_nc`: an
-/// array may go far in a call, its shape still extending the known one);
-/// `_nt` takes no typed array (whose length may be stale once a
-/// fixed-length buffer has been detached: see `Vm::views_detached`).
+/// [`length_class`]); no check where its shape is known to be a string's or
+/// a typed array's (`_nc`), only `FAR` where an array's (`_na`: it may go
+/// far in a call, its shape still extending the known one); `_nt` takes no
+/// typed array (whose length may be stale once a fixed-length buffer has
+/// been detached: see `Vm::views_detached`).
 macro_rules! array_length {
     ($loc:tt) => {
         stencil!("get_length_", loc!($loc); |s| {
@@ -4249,6 +4250,11 @@ macro_rules! array_length {
             next!(s)
         });
         stencil!("get_length_nc_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            s.acc = unboxed((*cell(o)).elems_len as i32);
+            next!(s)
+        });
+        stencil!("get_length_na_", loc!($loc); |s| {
             let o = get!($loc, s);
             if (*cell(o)).flags & FAR != 0 {
                 exit!(s)

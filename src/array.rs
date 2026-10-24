@@ -94,7 +94,7 @@ fn dense(vm: &Vm, o: *mut Object) -> bool {
             && (*(*vm.object_prototype).shape).proto.is_null()
             && (*vm.array_prototype).elems_len == 0
             && (*vm.object_prototype).elems_len == 0
-            && (*vm.array_prototype).flags & crate::object::SPARSE == 0
+            && (*vm.array_prototype).flags & (crate::object::SPARSE | crate::far::FAR) == 0
             && (*vm.object_prototype).flags & crate::object::SPARSE == 0
     }
 }

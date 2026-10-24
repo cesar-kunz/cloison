@@ -88,7 +88,7 @@ mod layout;
 use layout::{
     COLOR, DirectSite, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
-    Class, EXTERNAL, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
+    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
 };
 
@@ -4224,15 +4224,17 @@ macro_rules! keyed_load {
 /// `o.length` for an array, string or typed array `o` at a boxed
 /// location: its elements' or code units' count (`elems_len`), after a
 /// check that it is one (its class `Class::Array`, `Class::String` or
-/// `Class::TypedArray`)
-/// unless its shape is known (`_nc`); `_nt` takes no typed array (whose
-/// length may be stale once a fixed-length buffer has been detached: see
-/// `Vm::views_detached`).
+/// `Class::TypedArray`) and not a far array (whose `length` is in its far
+/// store: `FAR`, checked with the class in one load, see
+/// [`length_class`]), only the latter if its shape is known (`_nc`: an
+/// array may go far in a call, its shape still extending the known one);
+/// `_nt` takes no typed array (whose length may be stale once a
+/// fixed-length buffer has been detached: see `Vm::views_detached`).
 macro_rules! array_length {
     ($loc:tt) => {
         stencil!("get_length_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !matches!((*cell(o)).class, class::ARRAY | class::STRING | class::TYPED_ARRAY) {
+            if !is_cell(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING | LENGTH_TYPED_ARRAY) {
                 exit!(s)
             }
             s.acc = unboxed((*cell(o)).elems_len as i32);
@@ -4240,7 +4242,7 @@ macro_rules! array_length {
         });
         stencil!("get_length_nt_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !matches!((*cell(o)).class, class::ARRAY | class::STRING) {
+            if !is_cell(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING) {
                 exit!(s)
             }
             s.acc = unboxed((*cell(o)).elems_len as i32);
@@ -4248,11 +4250,24 @@ macro_rules! array_length {
         });
         stencil!("get_length_nc_", loc!($loc); |s| {
             let o = get!($loc, s);
+            if (*cell(o)).flags & FAR != 0 {
+                exit!(s)
+            }
             s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
     };
 }
+
+/// Cell `o`'s class and, above it, its `FAR` flag, in one load (a
+/// string's and a typed array's bit is clear).
+#[inline(always)]
+unsafe fn length_class(o: Value) -> u16 {
+    unsafe { (&raw const (*cell(o)).class).cast::<u16>().read() & (0xff | (FAR as u16) << 8) }
+}
+const LENGTH_ARRAY: u16 = class::ARRAY as u16;
+const LENGTH_STRING: u16 = class::STRING as u16;
+const LENGTH_TYPED_ARRAY: u16 = class::TYPED_ARRAY as u16;
 array_length!([m]);
 macro_rules! array_length_gpr {
     ($k:tt) => {
@@ -5679,7 +5694,7 @@ fn is_array(tag: NumberTag, a: Value) -> bool {
     is_cell(tag, a) && unsafe { (*cell(a)).class } == class::ARRAY
 }
 /// An array whose `pop` the interpreter's does (see `array_pop_`).
-const POP_EXIT_FLAGS: u8 = SPARSE | SEALED | FROZEN | LENGTH_READ_ONLY;
+const POP_EXIT_FLAGS: u8 = SPARSE | SEALED | FROZEN | LENGTH_READ_ONLY | FAR;
 
 /// Cell `a`'s class and, above it, those of its flags in
 /// [`POP_EXIT_FLAGS`], in one load: `class::ARRAY` for an array compiled

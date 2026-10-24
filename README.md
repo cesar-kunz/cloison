@@ -376,8 +376,8 @@ diffed between targets.
   templates, destructuring, spread, symbols, iterators, generators,
   async functions and generators, `Reflect`, `Proxy`, BigInt, class
   fields, iterator helpers, `using` declarations and modules (top-level
-  `await`, `import()`, JSON modules) are in; non-ASCII identifiers (no Unicode ID tables),
-  array indices past 2^28 and Unicode case folding in regexps are not.
+  `await`, `import()`, JSON modules) are in; non-ASCII identifiers (no Unicode ID tables)
+  and Unicode case folding in regexps are not.
   See [Standards support](#standards-support) for test262 by edition;
   Octane and about 100 programs are also checked against Node.
 - **Nightly only**, and Linux is the reference; macOS runs on Apple silicon only.

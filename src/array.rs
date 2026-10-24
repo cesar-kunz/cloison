@@ -402,7 +402,13 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             return Err(Error::type_error("Array length exceeds the maximum"));
         }
         let obj = as_object(item);
-        if unsafe { (*obj).class } == Class::Array && dense(vm, obj) && dense(vm, as_object(out)) {
+        // (Only where `out`'s elements end at `n`: an item before may have
+        // been copied element by element, its holes only counted.)
+        if unsafe { (*obj).class } == Class::Array
+            && dense(vm, obj)
+            && dense(vm, as_object(out))
+            && unsafe { (*as_object(out)).elems_len } as f64 == n
+        {
             unsafe {
                 let m = (*obj).elems_len as usize;
                 let oo = as_object(out);

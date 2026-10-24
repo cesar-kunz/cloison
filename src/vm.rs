@@ -3697,6 +3697,13 @@ impl Vm {
     /// `a.length = value`: truncated (the elements past it removed) or
     /// grown with holes.
     fn set_array_length(&mut self, o: *mut Object, value: Value) -> Result<()> {
+        // A read-only length fails before anything (OrdinarySet: the
+        // property isn't writable), even set to what it is, and without
+        // converting the value.
+        if unsafe { (*o).flags } & crate::object::LENGTH_READ_ONLY != 0 {
+            self.store_failed = true;
+            return Ok(());
+        }
         let d = crate::interp::to_number(value);
         if !(d >= 0.0 && d <= u32::MAX as f64 && d.fract() == 0.0) {
             return Err(Error::range_error("Invalid array length"));

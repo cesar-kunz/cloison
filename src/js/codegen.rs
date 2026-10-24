@@ -2824,8 +2824,14 @@ impl<'a> Gen<'a> {
                 }
             }
             if let Some(f) = finally {
+                // Compiled where the `try` is: a `break` or `continue` in it
+                // sees the loops around the `try`, not those inside it that
+                // the jump leaves.
+                let targets = self.trys[i].targets;
                 let inner = self.trys.split_off(i);
+                let inner_targets = self.targets.split_off(targets);
                 let r = f.iter().try_for_each(|s| self.stmt(s));
+                self.targets.extend(inner_targets);
                 self.trys.extend(inner);
                 r?;
                 if !self.reachable {

@@ -596,6 +596,10 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
             _ => return 0,
         }
     }
+    // (It may grow the elements: a collection asked for is made first, as
+    // compiled code growing an array by index may reach no other
+    // safepoint, 1.1 GB of dead elements left for the next one.)
+    vm.safepoint(std::ptr::null_mut());
     // (A store that did nothing: the interpreter's again, which throws in
     // strict code. One whose conversion needed a call too.)
     vm.store_failed = false;

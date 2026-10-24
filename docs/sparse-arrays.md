@@ -67,11 +67,12 @@ it the same way. Its layout:
 ```text
  0  length      number (up to 2^32 - 1)
  1  count       int32, live entries
- 2  mutations   int32, bumped on each insertion (see "Builtins")
- 3  mask        int32, buckets - 1 (a power of 2, minus one)
- 4… key, value  open addressing, linear probing
-                key: int32 or number (an index up to 2^32 - 2)
-                EMPTY: a free bucket; a deleted one: key -1
+ 2  used        int32, live and deleted entries
+ 3  mutations   int32, bumped by each new key (see "Builtins")
+ 4  mask        int32, buckets - 1 (a power of 2, minus one)
+ 5… key, value  open addressing, linear probing, at most 3/4 used
+                key: an index as a number; EMPTY a free bucket, -1 a
+                deleted one
 ```
 
 It holds plain data elements only (writable, enumerable, configurable).
@@ -96,49 +97,44 @@ them to the far store would end the shape growth that
 
 Dense storage is faster. Far storage is smaller once most indices are
 holes. A dense slot costs 8 bytes whether or not it holds an element. A far
-entry costs about 16 bytes divided by the table's load, so 24 to 32 bytes.
-On memory alone, the break-even density (present elements over length) is
-therefore about 1/4. Speed pulls the threshold lower: hole-heavy dense
-arrays are still worth keeping up to some waste. So the choice is one
-policy with three parameters, not the separate rules (2x plus 1024, a
-preallocation limit, a density check) of a first draft:
+entry costs 16 bytes divided by the table's load (at most 3/4), so 21 to
+32 bytes. On memory alone, the break-even density (present elements over
+length) is therefore about 1/3 to 1/4. Speed pulls the threshold lower.
+Four parameters (`far::Density`) set the policy:
 
-| Parameter | Meaning | Starting point |
+| Parameter | Meaning | Default |
 |---|---|---|
-| `dense_min` (D) | an array stays or becomes dense only while present / length ≥ D | 1/8 |
-| `dense_back` (D') | a far array goes back to dense once present / length ≥ D' (D' > D: hysteresis, so an array near the line doesn't flip back and forth) | 1/2 |
-| `waste_floor` (W) | an array whose holes take at most W bytes stays dense whatever its density: small arrays and moderate preallocation never go far | 1 MiB (2^17 holes) |
+| `min` (D) | an array stays or becomes dense only while present / length ≥ D | 1/16 |
+| `back` (D') | a far array goes back to dense once present / length ≥ D' (D' ≥ D: hysteresis, so an array near the line doesn't flip back and forth) | 1/8 |
+| `waste` (W) | an array whose holes take at most W bytes stays dense whatever its density | 8 KiB (1,024 holes) |
+| `prealloc` (P) | W for a length set with no element (`new Array(n)`, `a.length = n`), mostly filled next from 0 | 16 MiB |
+
+The defaults come from a sweep (see "Choosing the defaults").
 
 Dense arrays don't keep a count of present elements, so the policy uses
-the bound it has at each decision point:
+the bound it has at each decision point (`far::goes_far`):
 
-- **A store at `i ≥ elems_len`** (`a[i] = v`, `defineProperty`). The new
-  length is `i + 1`, and at most `elems_len + 1` elements are present. Go
-  far if `(i + 1 − elems_len) * 8 > W` and `(elems_len + 1) / (i + 1) < D`.
-  An append (`i == elems_len`) never qualifies. With D = 1/2 and W = 8 KiB,
-  this is close to today's object rule (`2 * elems_len + SPARSE_GAP`).
-  It takes the larger of the two terms where today's rule adds them, so
-  objects that aren't arrays can share it. The JIT's store helper repeats the rule
-  at `jit.rs:588`; make both call one function.
+- **A store at `i ≥ elems_len`** (`a[i] = v`, a plain `defineProperty`).
+  The new length is `i + 1`, and at most `elems_len + 1` elements are
+  present: go far if the holes, `(i + 1 − present) * 8` bytes, pass W and
+  `present / (i + 1) < D`. An append never qualifies.
 - **A length that grows with no elements** (`a.length = n`, `new Array(n)`,
   ArraySetLength, an array literal's trailing holes): the same test with
-  `n` as the new length. `new Array(n)` followed by a fill stays dense, and
-  compiled, up to `n = W / 8`, which is 131,072 with the starting values. That covers every size Octane uses (navier-stokes: 16,900).
-- **`reserve_elems` growing the elements.** It copies the old elements
-  anyway, so it counts the present ones during the copy, at no extra
-  cost. If the count is below `D * n` and the holes exceed W, the array
-  goes far instead of growing. This closes the chain that the store test
-  alone allows (`a[1024]`, `a[3072]`, `a[7168]`, … stay just under the
-  bound each time and would reach 2 GB in 18 stores).
+  `n`, and P for W.
+- **The elements reallocated.** Where the bound keeps the array dense but
+  the store or length outgrows `elems_cap`, and the array is large enough
+  for its holes to pass W, the present elements are counted: that costs
+  what the copy does. Without it, `a[i * 16] = v` stays dense with 15 holes
+  in 16 (each store is within the bound), and `a[1024]`, `a[3072]`,
+  `a[7168]`, … reach 4 GB in 18 stores (now 7.6 MB).
 - **Index ≥ `MAX_ELEMENTS`**: always far, whatever the density. That store
   no longer throws.
 
-Going far takes these steps:
-
-1. Allocate the store with `length` set to the new length.
-2. Keep the dense prefix as it is.
-3. Apply `slow_elements`.
-4. Set `FAR`.
+Going far (`far::make_far`): the store is allocated with the new length,
+the elements up to the first hole stay the dense prefix, the ones after it
+move to the store (and the elements shrink if that frees half of them), the
+shape goes slow (`far_elements`: `slow_elements` without dropping compiled
+code, since in-place stores into the prefix stay right), and `FAR` is set.
 
 ### Far → dense
 
@@ -146,72 +142,59 @@ Going far takes these steps:
   in keys `elems_len, elems_len + 1, …` from the store for as long as they
   are present. So `a[1e6] = 1` followed by a fill from 0 keeps a dense
   prefix that grows, with one far key.
-- **Back to dense.** When `elems_len + count ≥ D' * length` and
-  `length ≤ MAX_ELEMENTS`, move every key into the dense elements, drop
-  `FAR` and the store, and give the array a shared shape again. That is
-  `array_shape` if it has no named properties, with `NO_ELEMENTS`, so the
-  next push picks the elements' type again. This is checked where the
-  count grows past a power of two (the table's rehash, amortized) and where
-  the prefix catches up with the length.
+- **Back to dense** (`far::maybe_dense`, after each far store and each
+  truncation). Once `elems_len + count ≥ D' * length` (or the holes would
+  fit in W) and `length ≤ MAX_ELEMENTS`, every key moves to the dense
+  elements, `FAR` and the store go, and the array gets a shape whose
+  elements take stores' fast paths again: `array_shape` moved to the
+  elements' type if it has no properties, else a unique shape of that type.
 
 ### Settings
 
 The policy runs only in the runtime: in `set_keyed`'s slow paths,
-`set_array_length`, `define_own_property` and `reserve_elems`. Compiled
-code only exits to it. So the parameters can be read at run time with no
-cost to any fast path. `Vm::new` reads them once into `Vm` fields, as
-`CLOISON_GC_NURSERY` and the other heap settings are read:
+`set_array_length`, `define_own_property`, `grow_elements` and the `Array`
+constructor. Compiled code only exits to it. So the parameters cost no fast
+path anything, and are read once per VM (`Density::from_env`):
 
-- **Run time.** `CLOISON_ARRAY_DENSE_MIN`, `CLOISON_ARRAY_DENSE_BACK` (a
-  fraction such as `1/8` or `0.125`) and `CLOISON_ARRAY_WASTE` (bytes, with
-  `k`/`m` suffixes). A matching `--array-density D[,D'[,W]]` option in
-  `bin/cloison.rs` is for one-off runs.
-- **Build time.** The defaults are consts in `vm.rs`. Each can be
-  overridden when building through `option_env!` with the same variable
-  names, so an embedder builds its own defaults
-  (`CLOISON_ARRAY_WASTE=64k cargo build --release`). A build-time default
-  still yields to the run-time variable.
-- `D = 1` with `W = ∞` means always dense: today's behaviour, except that
-  `MAX_ELEMENTS` goes far instead of throwing. `D = 1` with `W = 0` means
-  far as soon as there is any gap. These two ends bracket the sweep and
-  make a regression easy to bisect to the policy.
+- **Run time.** `CLOISON_ARRAY_DENSE_MIN` and `CLOISON_ARRAY_DENSE_BACK`
+  (fractions, `1/16` or `0.0625`), `CLOISON_ARRAY_WASTE` and
+  `CLOISON_ARRAY_PREALLOC` (bytes, `k`/`m`/`g` suffixes, `inf`), or
+  `--array-density D[,D'[,W[,P]]]` for a run.
+- **Build time.** The same variables, set when building, become that
+  build's defaults (`option_env!`), and still yield to the run-time ones:
+  `CLOISON_ARRAY_WASTE=64k cargo build --release`.
+- `0,0,inf,inf` is always dense (the behaviour before, except that
+  `MAX_ELEMENTS` goes far instead of throwing); `1,1,0,0` is far at any gap.
+  The two ends bracket the sweep.
 
 ### Choosing the defaults
 
-The starting values above are guesses. The defaults come from a sweep.
+The workloads are in `bench/sparse/` (its README lists them), timed and
+measured by `bench/sparse/sweep.sh` over a grid: D ∈ {1/2, 1/4, 1/8, 1/16,
+1/32}, D' ∈ {2D, 4D}, W ∈ {8 KiB, 64 KiB, 256 KiB, 1 MiB}, P = 16 MiB (and
+1 MiB, 128 MiB at one point), both ends, and V8, SpiderMonkey and JSC.
+`bench/sparse/pareto.py` scores each setting by the geometric mean of
+its time and peak RSS as multiples of the best setting per workload, and
+lists the Pareto front. `bench/sparse/results.tsv` is the run the defaults
+come from (cloison 45d00fe, 3 runs a point, host load about 30 of 96).
 
-The workloads go in `bench/sparse/`. Each file prints its time and does its
-own checks:
-
-| File | Pattern |
-|---|---|
-| `fill-forward.js` | `a = []`, then `a[i] = i` for i from 0 (pure appends) |
-| `prealloc.js` | `new Array(n)`, then a fill from 0, for n from 10^3 to 10^7 |
-| `fill-reverse.js` | `a[n − 1]` first, down to 0: far at first, it must come back to dense |
-| `fill-random.js` | a random permutation of `[0, n)`: density rises from 0 to 1 |
-| `strided.js` | every k-th index, k ∈ {2, 4, 8, 16, 64, 1024}: the region around D |
-| `prefix-plus-far.js` | a dense prefix and a few far keys (`a[1e9] = x`) |
-| `id-map.js` | integer ids in a large range (10^6 to 10^9) used as keys: stays far |
-| `truncate.js` | a large length set, then cut back |
-| `methods.js` | `forEach`, `indexOf`, `sort`, `join`, `slice` and `concat` on each of the shapes above |
-
-For each workload and each point of the grid, record time (median of 5)
-and peak RSS (`/usr/bin/time -f %M`, or the heap record). The grid is
-D ∈ {1/2, 1/4, 1/8, 1/16, 1/32}, D' ∈ {2D, 4D}, W ∈ {8 KiB, 64 KiB,
-1 MiB, 8 MiB}. Run the same files on V8, SpiderMonkey and JSC, for
-reference on both axes.
-
-Choose from the Pareto front, under these constraints:
-
-- Octane runs and peak memory are unchanged against the always-dense
-  setting. Only the `length` stencils' new test may move them.
-- No workload is more than 2x slower than always-dense.
-- No workload uses more than 1/D times the memory of its present elements,
-  plus W.
-
-Keep the sweep script (`bench/sparse/sweep.sh`) and its table in
-`bench/`, as with `octane-memory.tsv`, so that the choice can be rerun
-after the JIT changes.
+- **W decides most.** Every setting on the front has W = 8 KiB. With a
+  larger W, `many` (2,000 arrays of ten elements and one key 20,000 past
+  them) keeps 160 KB of holes per array: 230-250 times slower and 45-60
+  times larger than the best.
+- **The front:** `1/32,1/16,8k` (time 1.18, memory 1.19), `1/16,1/8,8k`
+  (1.23, 1.12) and `1/8,1/4,8k` (1.41, 1.11). The middle one is the
+  default. Its worst cases are a fill from the end, `reverse` N=1e6, 2.9
+  times always-dense's time (320 ms; V8 638), and `strided` K=16 at 2.1
+  times the smallest memory. Against the engines' best per workload it is
+  1.56 times the time and 1.06 times the memory, faster than all three on
+  `prefix-far`, `reverse` and `random`.
+- **P** barely moves it: with D' = 1/8 a far preallocation goes dense once
+  an eighth is filled. 1 MiB doubles `prealloc` N=1e6; 16 MiB to infinity
+  are level.
+- The first sweep's memory was the collector's, not the arrays': compiled
+  code growing an array by index reached no safepoint, so the collection
+  asked for waited (fixed in 45d00fe: `strided` K=64 dense took 13 GB).
 
 ## Runtime (Rust)
 
@@ -287,13 +270,15 @@ present index instead. That holds when:
   elements or index names (the prototype clause of `dense()`);
 - there is no Proxy.
 
-The helper is `next_present(o, k, len) -> Option<u32>`. It returns the
-smallest present index at or above `k`: the first present element of the
-prefix, then the far keys taken from a sorted snapshot. If the store's
-`mutations` count has changed since the snapshot was taken (a callback
-added elements), the snapshot is taken again from `k`. The prototype
-clause is re-checked at each step, which is constant time. Shape-named
-index keys (`SPARSE`) join in through `own_keys`'s index list.
+The helpers are `array::skip` (and `skip_back`, going down), over
+`far::next_key` and `far::prev_key`. Inside the dense prefix a loop steps
+as before; past it, `skip` returns the smallest far key at `k` or above (or
+the length), found in a sorted copy of the keys kept on the VM. A store
+rehashed into, or a `mutations` count moved since (a callback added a key),
+sorts them again; a key deleted since is still in the copy, and the loop's
+HasProperty finds it absent. The conditions are checked again at each step,
+in constant time. An array with shape-named index keys (`SPARSE`) isn't
+skipped.
 
 Which methods use it:
 
@@ -316,37 +301,32 @@ Which methods use it:
   `toSorted`, `with`, `toSpliced`): O(length) as the spec says. The
   copying ones hit `MAX_ELEMENTS` and throw, as today.
 
-## Plan
+## Status
 
-1. **Store and flag.** `FAR`, the far store, `far_length` and
-   `far_get`/`far_set`/`far_delete`. All the runtime sites above. The
-   density policy with its settings, without going back to dense. The fast-path guards: the length
-   stencils, the interpreter's length IC and `POP_EXIT_FLAGS`. Remove the
-   "too large for this engine" errors where an index or length is the cause.
+Implemented: 6fb8658 (store, flag, policy, settings, compiled-code
+guards), 4939098 (builtins over present elements, the density count at
+reallocation, the preallocation floor), 45d00fe (the collection before a
+keyed store from compiled code), and the defaults from the sweep. test262:
+19 more pass (the 18 "too large for this engine" ones and
+`S15.4_A1.1_T10`, an oom), none fewer. 209f9f8 fixed, on the way, compiled
+appends to a sealed or non-extensible array whose elements had changed
+type, which the slow shape relies on.
 
-   Checks:
-   - test262 `built-ins/Array`, `built-ins/Object`, `language`;
-   - an Octane A/B for the `get_length_*` test;
-   - a memory record of `x = []; x[2 ** 27] = 1` and of `15.4_A1.1_T10`;
-   - the fuzzer's far-write cases against sm/jsc/qjs.
-2. **Builtins.** `next_present` and the method list above.
-   `define_array_length` truncation over keys. The up-front `join` and JSON
-   size checks.
-3. **Density.** The check in `reserve_elems`, going back to dense, the
-   `bench/sparse` workloads and the sweep. Then fix the defaults. Optionally,
-   plain objects' far keys move to the far store under the same policy.
+Not done: plain objects' far keys stay shape names (`SPARSE`), `reverse`,
+`shift`, `unshift`, `splice`, `copyWithin` and `fill` still step through
+every index (as the spec has `fill` and `copyWithin` do anyway).
 
 ## Open questions
 
-- A preallocation past the dense limit (`new Array(5e6)` then a fill from 0)
-  appends through the runtime until the prefix reaches `D' * length`, and
-  then goes back to dense. The `prealloc.js` row of the sweep measures
-  that cost. If it is too high, treat a fill from the prefix's end as
-  evidence of intent, and go dense early once the prefix passes W.
-- Overwrites in the prefix of a `FAR` array go to the runtime, because
-  `slow_elements` gates every store. That is acceptable for a rare case. If
-  it matters, give `FAR` arrays a shape whose `elems_code` admits in-place
-  stores but no push cache, so appends still exit.
-- Arguments objects and arrays with a frozen or sealed prefix: `FAR`
-  composes with `FROZEN` and `SEALED` through the existing flag paths.
-  Check each in `set_keyed_flagged`.
+- Overwrites in the prefix of a `FAR` array go to the runtime: the slow
+  shape's `elems_code` fails every compiled store, in place too
+  (`prefix-far` is still faster than the engines). A shape whose
+  `elems_code` admits in-place stores but has no push cache would keep
+  them compiled while appends still exit.
+- A far store costs about 130 ns from compiled code (the runtime call, two
+  probes, the length and density checks), against 6 ns dense: the fills
+  that start far (`reverse`, `random`) are 2-3 times always-dense. A store
+  that knows the key is new would save a probe.
+- Large young cells are freed by minor collections, but a cell that
+  survives one (a growing store, a growing array's elements) waits for a
+  full collection.

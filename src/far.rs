@@ -71,7 +71,10 @@ pub struct Density {
 }
 
 impl Density {
-    const DEFAULT: Density = Density { min: 1.0 / 8.0, back: 0.5, waste: 1 << 20, prealloc: 16 << 20 };
+    /// From the sweep over `bench/sparse` (`bench/sparse/README.md`): on
+    /// the Pareto front of time and memory, within 1.23 and 1.12 times the
+    /// best setting per workload (geometric means).
+    const DEFAULT: Density = Density { min: 1.0 / 16.0, back: 1.0 / 8.0, waste: 8 << 10, prealloc: 16 << 20 };
 
     /// The settings from the environment, as the module docs say.
     pub fn from_env() -> Density {

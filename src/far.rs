@@ -12,7 +12,7 @@
 //!  0  length     number, up to 2^32 - 1
 //!  1  count      int32, live entries
 //!  2  used       int32, live entries and deleted ones
-//!  3  mutations  int32, bumped by each new key
+//!  3  mutations  int32, bumped by each new key (see [`next_key`])
 //!  4  mask       int32, buckets - 1
 //!  5… key, value a key is an index as a number (up to 2^32 - 2); a free
 //!                bucket's is `EMPTY`, a deleted one's `DELETED`
@@ -49,8 +49,9 @@ const MIN_BUCKETS: usize = 8;
 
 /// When an array is dense, and when far (see the module docs and
 /// `docs/sparse-arrays.md`, "Transitions"). Read once per VM: from
-/// `CLOISON_ARRAY_DENSE_MIN`, `CLOISON_ARRAY_DENSE_BACK` and
-/// `CLOISON_ARRAY_WASTE` at run time, else as they were set when building,
+/// `CLOISON_ARRAY_DENSE_MIN`, `CLOISON_ARRAY_DENSE_BACK`,
+/// `CLOISON_ARRAY_WASTE` and `CLOISON_ARRAY_PREALLOC` at run time, else as
+/// they were set when building,
 /// else the defaults here; `--array-density` sets them for a run (see
 /// [`set_density`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -64,10 +65,13 @@ pub struct Density {
     /// An array whose holes take at most this many bytes stays dense, as
     /// sparse as it is.
     pub waste: usize,
+    /// `waste` for a length set with no element (`new Array(n)`,
+    /// `a.length = n`): mostly filled next, from 0.
+    pub prealloc: usize,
 }
 
 impl Density {
-    const DEFAULT: Density = Density { min: 1.0 / 8.0, back: 0.5, waste: 1 << 20 };
+    const DEFAULT: Density = Density { min: 1.0 / 8.0, back: 0.5, waste: 1 << 20, prealloc: 16 << 20 };
 
     /// The settings from the environment, as the module docs say.
     pub fn from_env() -> Density {
@@ -85,23 +89,29 @@ impl Density {
         let waste = var("CLOISON_ARRAY_WASTE", option_env!("CLOISON_ARRAY_WASTE"))
             .and_then(|s| parse_bytes(&s))
             .unwrap_or(d.waste);
-        Density { min, back: back.max(min), waste }
+        let prealloc = var("CLOISON_ARRAY_PREALLOC", option_env!("CLOISON_ARRAY_PREALLOC"))
+            .and_then(|s| parse_bytes(&s))
+            .unwrap_or(d.prealloc);
+        Density { min, back: back.max(min), waste, prealloc }
     }
 
-    /// `D[,D'[,W]]`, as `--array-density` takes them: fractions (`1/8` or
-    /// `0.125`) and bytes (`64k`, `1m`, `inf`).
+    /// `D[,D'[,W[,P]]]`, as `--array-density` takes them: fractions (`1/8`
+    /// or `0.125`) and bytes (`64k`, `1m`, `inf`).
     pub fn parse(s: &str) -> Option<Density> {
         let mut it = s.split(',');
         let min = parse_fraction(it.next()?)?;
         let back = it.next().map_or(Some(Density::DEFAULT.back.max(min)), parse_fraction)?;
         let waste = it.next().map_or(Some(Density::DEFAULT.waste), parse_bytes)?;
-        Some(Density { min, back: back.max(min), waste })
+        let prealloc = it.next().map_or(Some(Density::DEFAULT.prealloc), parse_bytes)?;
+        Some(Density { min, back: back.max(min), waste, prealloc })
     }
 
     /// Whether an array going to length `n`, with at most `present`
-    /// elements, should be far.
-    pub fn goes_far(&self, present: usize, n: usize) -> bool {
-        n > MAX_ELEMENTS || (n - present.min(n)).saturating_mul(8) > self.waste && (present as f64) < self.min * n as f64
+    /// elements, should be far: by a store if `store`, else by a length
+    /// set alone (`prealloc` for `waste`).
+    pub fn goes_far(&self, present: usize, n: usize, store: bool) -> bool {
+        let waste = if store { self.waste } else { self.prealloc.max(self.waste) };
+        n > MAX_ELEMENTS || (n - present.min(n)).saturating_mul(8) > waste && (present as f64) < self.min * n as f64
     }
 
     /// Whether a far array of length `n` with `present` elements should be
@@ -139,6 +149,28 @@ fn parse_bytes(s: &str) -> Option<usize> {
         _ => (&s[..], 1),
     };
     num.parse::<usize>().ok()?.checked_mul(mul)
+}
+
+/// Whether dense array `o`, going to length `n` with `adding` elements
+/// past its elements, should go far. Its elements' count bounds the
+/// present ones; where that bound keeps it dense but its elements are
+/// reallocated, large enough for their holes to pass `Density::waste`, the
+/// present ones are counted, which costs what the copy does (else
+/// `a[i * 16] = v` would leave 15 holes in 16 with each store under the
+/// bound, and `a[1024]`, `a[3072]`, `a[7168]`, … would double the elements
+/// each time).
+pub(crate) fn goes_far(vm: &Vm, o: *mut Object, n: usize, adding: usize) -> bool {
+    let (len, cap) = unsafe { ((*o).elems_len as usize, (*o).elems_cap as usize) };
+    let d = &vm.density;
+    let store = adding > 0;
+    if d.goes_far(len + adding, n, store) {
+        return true;
+    }
+    if n <= cap || n.saturating_mul(8) <= if store { d.waste } else { d.prealloc.max(d.waste) } {
+        return false;
+    }
+    let present = (0..len).filter(|&k| unsafe { *(*o).elems.add(k) } != Value::EMPTY).count();
+    d.goes_far(present + adding, n, store)
 }
 
 /// Whether `o` is a far array (the bit is another flag in other classes).
@@ -190,6 +222,42 @@ pub(crate) fn set_length(o: *mut Object, n: u32) {
 /// The number of far array `o`'s far elements.
 pub(crate) fn count(o: *mut Object) -> usize {
     int(store(o), COUNT)
+}
+
+/// Far array `o`'s far keys in order, as [`next_key`] and [`prev_key`]
+/// search them: sorted once, and again once a key has been added (a store
+/// rehashed into is another; a key deleted since is still there, which
+/// the caller's HasProperty finds absent).
+#[derive(Default)]
+pub(crate) struct SortedKeys {
+    store: usize,
+    mutations: usize,
+    keys: Vec<u32>,
+}
+
+fn sorted(vm: &mut Vm, o: *mut Object) -> &[u32] {
+    let e = store(o);
+    let (at, m) = (e as usize, int(e, MUTATIONS));
+    let c = &mut vm.far_keys;
+    if c.store != at || c.mutations != m {
+        c.keys = keys(o);
+        c.keys.sort_unstable();
+        c.store = at;
+        c.mutations = m;
+    }
+    &vm.far_keys.keys
+}
+
+/// Far array `o`'s first far key at `k` or past it.
+pub(crate) fn next_key(vm: &mut Vm, o: *mut Object, k: u32) -> Option<u32> {
+    let keys = sorted(vm, o);
+    keys.get(keys.partition_point(|&x| x < k)).copied()
+}
+
+/// Far array `o`'s last far key at `k` or before it.
+pub(crate) fn prev_key(vm: &mut Vm, o: *mut Object, k: u32) -> Option<u32> {
+    let keys = sorted(vm, o);
+    keys.partition_point(|&x| x <= k).checked_sub(1).map(|j| keys[j])
 }
 
 fn key_value(i: u32) -> Value {
@@ -247,9 +315,11 @@ pub(crate) fn insert(vm: &mut Vm, o: *mut Object, i: u32, v: Value) {
     let buckets = int(e, MASK) + 1;
     if (int(e, USED) + 1) * 4 > buckets * 3 {
         // (Grown if more than half live, else rehashed as large: deleted
-        // entries dropped.)
+        // entries dropped. Small ones grow 4 times over: fewer tables left
+        // to collect while an array fills.)
         let live = int(e, COUNT) + 1;
-        let n = if live * 2 > buckets { buckets * 2 } else { buckets };
+        let grow = if buckets < 1024 { 4 } else { 2 };
+        let n = if live * 2 > buckets { buckets * grow } else { buckets };
         rehash(vm, o, n);
         e = store(o);
     }
@@ -364,13 +434,35 @@ fn rehash(vm: &mut Vm, o: *mut Object, buckets: usize) {
 }
 
 /// Make array `o` far with length `len` (at least its elements' count):
-/// its elements stay its dense prefix.
+/// its elements up to the first hole stay its dense prefix, the ones after
+/// move to the store (and the elements shrink, if that frees half).
 pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
     debug_assert!(unsafe { (*o).class == Class::Array } && !is_far(o));
-    let e = new_store(vm, MIN_BUCKETS, len.max(unsafe { (*o).elems_len }));
+    let n = unsafe { (*o).elems_len } as usize;
+    let first_hole = (0..n).find(|&k| unsafe { *(*o).elems.add(k) } == Value::EMPTY).unwrap_or(n);
+    let rest: Vec<(u32, Value)> = (first_hole..n)
+        .filter_map(|k| {
+            let v = unsafe { *(*o).elems.add(k) };
+            (v != Value::EMPTY).then_some((k as u32, v))
+        })
+        .collect();
+    let buckets = (rest.len() * 2).next_power_of_two().max(MIN_BUCKETS);
+    let e = new_store(vm, buckets, len.max(n as u32));
     hold(o, e);
     vm.far_elements(o);
-    unsafe { (*o).flags |= FAR };
+    unsafe {
+        (*o).flags |= FAR;
+        for k in first_hole..n {
+            *(*o).elems.add(k) = Value::EMPTY;
+        }
+        (*o).elems_len = first_hole as u32;
+        if first_hole * 2 < (*o).elems_cap as usize {
+            vm.shrink_elems(o);
+        }
+    }
+    for (k, v) in rest {
+        insert(vm, o, k, v);
+    }
 }
 
 /// Far array `o` given element `i` (past its dense prefix: its first

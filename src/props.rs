@@ -758,7 +758,7 @@ impl Vm {
             // would be too sparse: see `far::Density`.)
             if (*o).class == Class::Array
                 && i >= (*o).elems_len
-                && (crate::far::is_far(o) || self.density.goes_far((*o).elems_len as usize + 1, i as usize + 1))
+                && (crate::far::is_far(o) || crate::far::goes_far(self, o, i as usize + 1, 1))
             {
                 if !crate::far::is_far(o) {
                     crate::far::make_far(self, o, (*o).elems_len);
@@ -786,7 +786,7 @@ impl Vm {
             }
             return Ok(());
         }
-        if self.density.goes_far(unsafe { (*o).elems_len } as usize, n) {
+        if crate::far::goes_far(self, o, n, 0) {
             crate::far::make_far(self, o, n as u32);
             return Ok(());
         }

@@ -3994,7 +3994,7 @@ pub(crate) unsafe fn frame_args(
             }
             Some(Op::Call) if unwrap_apply(vm, fv, this).is_some() => {
                 let list = if n < 2 { Value::UNDEFINED } else { *caller.add(w + 2) };
-                *spread = crate::builtins::apply_list_fast(list).unwrap_or_default();
+                *spread = crate::builtins::applied_list(list);
                 (spread.as_ptr(), spread.len())
             }
             // The caller's own arguments, passed on.

@@ -879,10 +879,21 @@ fn string_to_string(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 // ---- Function.prototype.apply ----
 
 /// The arguments `f.apply(that, list)` passes when `list` is a plain
-/// array (holes as `undefined`; none for `undefined` or `null`), read
-/// without running code: `None` for any other list, which
-/// `Function.prototype.apply` itself takes (`array::apply_list`).
+/// array without holes (none for `undefined` or `null`), read without
+/// running code: `None` for any other list, which
+/// `Function.prototype.apply` itself takes (`array::apply_list`: a hole's
+/// element is a prototype's, if one has it).
 pub(crate) fn apply_list_fast(list: Value) -> Option<Vec<Value>> {
+    plain_list(list, false)
+}
+
+/// [`apply_list_fast`]'s list again for the frame a call through it made
+/// (`interp::frame_args`): a hole since (the callee's doing) `undefined`.
+pub(crate) fn applied_list(list: Value) -> Vec<Value> {
+    plain_list(list, true).unwrap_or_default()
+}
+
+fn plain_list(list: Value, holes: bool) -> Option<Vec<Value>> {
     if list.is_undefined() || list.is_null() {
         return Some(Vec::new());
     }
@@ -896,14 +907,11 @@ pub(crate) fn apply_list_fast(list: Value) -> Option<Vec<Value>> {
         }
     }
     let n = unsafe { (*o).elems_len } as usize;
-    Some(
-        (0..n)
-            .map(|i| {
-                let e = unsafe { *(*o).elems.add(i) };
-                if e == Value::EMPTY { Value::UNDEFINED } else { e }
-            })
-            .collect(),
-    )
+    let elems = unsafe { std::slice::from_raw_parts((*o).elems, n) };
+    if !elems.contains(&Value::EMPTY) {
+        return Some(elems.to_vec());
+    }
+    holes.then(|| elems.iter().map(|&e| if e == Value::EMPTY { Value::UNDEFINED } else { e }).collect())
 }
 
 /// `Function.prototype.apply(that, list)`. (A call through it to a

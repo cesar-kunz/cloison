@@ -284,7 +284,17 @@ impl Heap {
     /// next collection is a root of it.
     #[inline]
     pub fn note_slot(&mut self, slot: *const *mut Object) {
-        self.gc.log_slots.push(slot as usize);
+        let s = &mut self.gc.log_slots;
+        // Full: without its repeats before it grows. (A call site turning
+        // between young callees logs its ways at every turn: interpreted,
+        // Richards logged the same few slots 34 million times before its
+        // first minor collection, 272 MB, and that collection read them in
+        // 35 ms.)
+        if s.len() == s.capacity() && s.len() >= 1024 {
+            s.sort_unstable();
+            s.dedup();
+        }
+        s.push(slot as usize);
     }
 
     /// Forget the slots logged at addresses `from..to` (see `note_slot`):

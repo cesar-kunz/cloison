@@ -8734,3 +8734,37 @@ __miss;
 "##;
     assert_eq!(value(src), "0");
 }
+
+#[test]
+fn a_scripts_arrows_read_its_this_from_a_register_not_a_global() {
+    // (cloison-fuzz triage/BUGS.md #27: the script's `%this` was a global
+    // variable, an assignment to an undeclared one in strict code.)
+    let strict = r#"
+"use strict";
+var out = [];
+out.push((() => this)() === globalThis);
+out.push((() => () => this)()() === globalThis);
+out.push((() => eval("this"))() === globalThis);
+out.push(eval("(() => this)()") === globalThis);
+out.push((0, eval)("(() => this)()") === globalThis);
+function f() { return (() => this)(); }
+out.push(f.call(7) === 7, f() === undefined);
+class C { x = (() => this)(); static s = (() => this)(); }
+out.push(new C().x instanceof C, C.s === C);
+{ let t = (() => this)(); out.push(t === globalThis); }
+out.push([1].map(() => this)[0] === globalThis);
+out.push(Object.getOwnPropertyNames(globalThis).includes("%this"));
+out.join(",");
+"#;
+    assert_eq!(value(strict), "true,true,true,true,true,true,true,true,true,true,true,false");
+    let sloppy = r#"
+var out = [];
+out.push((() => this)() === globalThis);
+function k() { return eval("(() => this)()"); }
+out.push(k.call(5) instanceof Number);
+out.push(new Function("return (() => this)()").call(3) instanceof Number);
+out.push(Object.getOwnPropertyNames(globalThis).includes("%this"));
+out.join(",");
+"#;
+    assert_eq!(value(sloppy), "true,true,true,false");
+}

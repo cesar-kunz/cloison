@@ -216,8 +216,17 @@ pub struct Function<'a> {
     /// the rest parameter.
     pub length: usize,
     /// The statements at the start of its body that are its parameters'
-    /// defaults and destructurings.
+    /// defaults and destructurings, each parameter's in turn.
     pub param_stmts: usize,
+    /// Where each parameter ends (past its default): its statements are
+    /// before, and it is initialized from there on.
+    pub param_ends: Vec<Pos>,
+    /// The names its parameters bind that a default or a pattern's may read
+    /// before they are initialized (a parameter's own or a later one's, or
+    /// any after a direct `eval`), with the parameter binding each: held
+    /// uninitialized until their turn (a hole, read through `CheckHole`;
+    /// see `codegen::Gen::param_tdz`).
+    pub tdz_params: Vec<(Name, usize)>,
     /// Its last parameter is a rest parameter (`...r`), which collects the
     /// arguments from its position on.
     pub rest: bool,
@@ -403,9 +412,9 @@ pub enum ExprKind<'a> {
     /// `this`.
     SuperMember(Name, &'a Expr<'a>, &'a Expr<'a>),
     /// A destructuring of the value of the expression into the pattern
-    /// (`mode` 0: assigning its targets, 1: initializing `var`s or
-    /// parameters, 2: initializing block-scoped bindings); its value is
-    /// the expression's.
+    /// (`mode` 0: assigning its targets, 1: initializing `var`s, 2:
+    /// initializing block-scoped bindings or parameters, which may be
+    /// held uninitialized until then); its value is the expression's.
     Destructure(Box<Pattern<'a>>, &'a Expr<'a>, u8),
     /// A declaration's name a destructuring in it sets (so not set to
     /// `undefined` itself).

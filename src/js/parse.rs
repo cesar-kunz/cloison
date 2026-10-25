@@ -128,6 +128,7 @@ fn parse_pass<'a>(
         redeclared: None,
         in_eval: eval.is_some(),
         using_scopes: Vec::new(),
+        param_refs: Vec::new(),
         static_blocks: Vec::new(),
         naming_function: false,
         param_names: Vec::new(),
@@ -168,6 +169,8 @@ fn parse_pass<'a>(
         length: 0,
         rest: false,
         param_stmts: 0,
+        param_ends: Vec::new(),
+        tdz_params: Vec::new(),
         binding: None,
         annex_b: false,
         class_kind: 0,
@@ -316,6 +319,9 @@ struct Parser<'t, 'a, 'p> {
     /// (a block's, a function body's: not a `case`'s, nor the script's,
     /// which have none here), and what their disposal needs.
     using_scopes: Vec<UsingScope>,
+    /// The parameter lists being parsed (innermost last): the names each
+    /// refers to, and where (see `Function::tdz_params`).
+    param_refs: Vec<Vec<(Name, Pos)>>,
     /// The functions that are class static blocks, where `await` is no
     /// identifier.
     static_blocks: Vec<usize>,
@@ -1651,6 +1657,8 @@ impl<'a> Parser<'_, 'a, '_> {
             length: 0,
             rest: false,
             param_stmts: 0,
+            param_ends: Vec::new(),
+            tdz_params: Vec::new(),
             binding: None,
             annex_b: false,
             class_kind: 0,
@@ -1732,7 +1740,15 @@ impl<'a> Parser<'_, 'a, '_> {
             }
         }
         // (Not inside a `with`: the function must see its object.)
-        if self.skim && !paren && self.withs.is_empty() && prologue.is_empty() && !self.functions[index].rest {
+        // (Nor in a parameter list: its references must be known, see
+        // `Function::tdz_params`.)
+        if self.skim
+            && !paren
+            && self.withs.is_empty()
+            && prologue.is_empty()
+            && !self.functions[index].rest
+            && self.param_refs.is_empty()
+        {
             let start = self.i;
             if let Some(free) = self.skim_body(&params)
                 && !self.is("(")
@@ -1765,14 +1781,50 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     /// After a function's `(`: its parameters, up to and including the
-    /// `)`, and the statements giving those with defaults their values
-    /// (`if (p === void 0) p = e;`). Sets the function's `length` and
-    /// `rest`; it's the current one.
+    /// `)`, and the statements giving them their values, each parameter's
+    /// in turn: its default (`if (p === void 0) p = e;`), then its
+    /// pattern's names. Sets the function's `length`, `rest`, `param_ends`
+    /// and `tdz_params`; it's the current one.
     fn params(&mut self) -> R<(Vec<Name>, Vec<Stmt<'a>>)> {
+        self.param_refs.push(Vec::new());
+        let r = self.params_inner();
+        let refs = self.param_refs.pop().unwrap_or_default();
+        let (params, prologue, bound, ends) = r?;
+        // The names a default or a pattern's may read before their
+        // parameter's turn: referred to before its end (or after a direct
+        // `eval`), by the defaults or the functions in them. (One such
+        // function's own binding of a name holds the parameter all the
+        // same, harmlessly: its references are to its own.)
+        if refs.is_empty() {
+            return Ok((params, prologue));
+        }
+        let eval = refs.iter().filter(|(n, _)| &**n == "eval").map(|&(_, p)| p).min();
+        let mut tdz = Vec::new();
+        for (n, j) in bound {
+            if eval.is_some_and(|p| p < ends[j]) || refs.iter().any(|(r, p)| *r == n && *p < ends[j]) {
+                tdz.push((n, j));
+            }
+        }
+        if !tdz.is_empty() {
+            let f = &mut self.functions[self.current];
+            f.param_ends = ends;
+            f.tdz_params = tdz;
+        }
+        Ok((params, prologue))
+    }
+
+    /// [`Parser::params`]'s parameters and statements, the names each
+    /// parameter binds, and where each ends: from the first with a default
+    /// or a pattern only (no reference comes before it), those before it
+    /// ending at 0.
+    #[allow(clippy::type_complexity)]
+    fn params_inner(&mut self) -> R<(Vec<Name>, Vec<Stmt<'a>>, Vec<(Name, usize)>, Vec<Pos>)> {
         let mut params: Vec<Name> = Vec::new();
         let mut prologue = Vec::new();
         let mut length = None;
-        let mut patterns = Vec::new();
+        let mut bound = Vec::new();
+        let mut ends = Vec::new();
+        let mut pattern_names = Vec::new();
         while !self.eat(")") {
             if !params.is_empty() {
                 self.expect(",")?;
@@ -1780,23 +1832,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     break;
                 }
             }
-            if self.eat("...") {
-                let pos = self.pos();
-                let p = if self.is("[") || self.is("{") {
-                    let p: Name = format!("%param{}", params.len()).into();
-                    let mut names = Vec::new();
-                    let pat = self.binding_pattern(&mut names)?;
-                    patterns.push((p.clone(), pat, names, pos));
-                    p
-                } else {
-                    self.ident()?
-                };
-                length.get_or_insert(params.len());
-                params.push(p);
-                self.functions[self.current].rest = true;
-                self.expect(")")?;
-                break;
-            }
+            let rest = self.eat("...");
             let pos = self.pos();
             let pattern = if self.is("[") || self.is("{") {
                 let mut names = Vec::new();
@@ -1809,30 +1845,47 @@ impl<'a> Parser<'_, 'a, '_> {
                 Some(_) => format!("%param{}", params.len()).into(),
                 None => self.ident()?,
             };
-            if self.eat("=") {
+            if rest {
+                length.get_or_insert(params.len());
+                self.functions[self.current].rest = true;
+            } else if self.eat("=") {
                 length.get_or_insert(params.len());
                 let e = self.assignment(false)?;
                 self.infer_name(&e, &p);
                 prologue.push(self.default_stmt(p.clone(), e, pos));
             }
-            if let Some((pat, names)) = pattern {
-                patterns.push((p.clone(), pat, names, pos));
+            let j = params.len();
+            // (From the first parameter with a default or a pattern: see
+            // above.)
+            if !prologue.is_empty() || pattern.is_some() || !ends.is_empty() {
+                ends.resize(j, 0);
+                ends.push(self.pos());
+            }
+            let held = !ends.is_empty();
+            match pattern {
+                // Destructured: `var`s of the function, set after its
+                // default (initialized, not stored: see `tdz_params`).
+                Some((pat, names)) => {
+                    bound.extend(names.iter().map(|n| (n.clone(), j)));
+                    pattern_names.extend(names.iter().cloned());
+                    let mut decls: Vec<(Name, Option<Expr<'a>>)> =
+                        names.into_iter().map(|n| (n, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
+                    let value = expr(self.arena, Expr { kind: ExprKind::Ident(p.clone()), pos });
+                    decls.push(("".into(), Some(Expr { kind: ExprKind::Destructure(Box::new(pat), value, 2), pos })));
+                    prologue.push(Stmt { kind: StmtKind::Var(decls), pos });
+                }
+                None if held => bound.push((p.clone(), j)),
+                None => {}
             }
             params.push(p);
+            if rest {
+                self.expect(")")?;
+                break;
+            }
         }
-        // Destructured parameters: `var`s of the function, set in order
-        // after the defaults.
-        self.pattern_names.clear();
-        for (p, pat, names, pos) in patterns {
-            self.pattern_names.extend(names.iter().cloned());
-            let mut decls: Vec<(Name, Option<Expr<'a>>)> =
-                names.into_iter().map(|n| (n, Some(Expr { kind: ExprKind::Bound, pos }))).collect();
-            let value = expr(self.arena, Expr { kind: ExprKind::Ident(p), pos });
-            decls.push(("".into(), Some(Expr { kind: ExprKind::Destructure(Box::new(pat), value, 1), pos })));
-            prologue.push(Stmt { kind: StmtKind::Var(decls), pos });
-        }
+        self.pattern_names = pattern_names;
         self.functions[self.current].length = length.unwrap_or(params.len());
-        Ok((params, prologue))
+        Ok((params, prologue, bound, ends))
     }
 
     /// `if (name === void 0) name = e;`
@@ -1917,6 +1970,8 @@ impl<'a> Parser<'_, 'a, '_> {
             length: 0,
             rest: false,
             param_stmts: 0,
+            param_ends: Vec::new(),
+            tdz_params: Vec::new(),
             binding: None,
             annex_b: false,
             class_kind: 0,
@@ -2903,6 +2958,12 @@ impl<'a> Parser<'_, 'a, '_> {
     /// `x%3`, a function's variable as any other, which the code
     /// generator knows from [`Program::lexicals`]).
     fn reference(&mut self, name: Name) -> ExprKind<'a> {
+        if !self.param_refs.is_empty() {
+            let pos = self.toks[self.i.saturating_sub(1)].pos;
+            for refs in &mut self.param_refs {
+                refs.push((name.clone(), pos));
+            }
+        }
         if &*name == "arguments" {
             // (An arrow's are the enclosing function's; a module has
             // none: a global's.)
@@ -3666,6 +3727,8 @@ impl<'a> Parser<'_, 'a, '_> {
             length: 0,
             rest: false,
             param_stmts: 0,
+            param_ends: Vec::new(),
+            tdz_params: Vec::new(),
             binding: None,
             annex_b: false,
             class_kind: 0,
@@ -3716,6 +3779,8 @@ impl<'a> Parser<'_, 'a, '_> {
             length: 0,
             rest: false,
             param_stmts: 0,
+            param_ends: Vec::new(),
+            tdz_params: Vec::new(),
             binding: None,
             annex_b: false,
             class_kind: 0,
@@ -4275,6 +4340,8 @@ impl<'a> Parser<'_, 'a, '_> {
             length: 0,
             rest: derived,
             param_stmts: 0,
+            param_ends: Vec::new(),
+            tdz_params: Vec::new(),
             binding: None,
             annex_b: false,
             class_kind,

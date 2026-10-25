@@ -331,12 +331,12 @@ benchmarks (lower is better but for scores):
 | other files it needs | — | 10.8 MB ICU data | 39 MB ICU libraries | 3 NSPR libraries | — |
 | shared libraries loaded | 0 (static) | 4 | 21 | 9 | 0 (static) |
 | Octane, JIT | 27,476 | 75,961 | 72,924 | 47,127 | — |
-| Octane, no JIT | **6,397** | 5,521 | 4,285 | 2,206 | 1,874 |
+| Octane, no JIT | **6,298** | 5,521 | 4,285 | 2,206 | 1,874 |
 | fixed work, JIT: G instructions | 29.9 | 12.6 | 12.0 | 15.6 | — |
 | fixed work, JIT: CPU s | 2.23 | 1.29 | 1.30 | 1.42 | — |
 | fixed work, no JIT: G instructions | **104** | 157 | 151 | 361 | 315 |
 | peak RSS, JIT: MB | 78.8 | 68.9 | 216 | 83.3 | — |
-| peak RSS, no JIT: MB | 57.8 | 55.8 | 107 | 76.5 | 39.4 |
+| peak RSS, no JIT: MB | 53.1 | 55.8 | 107 | 76.5 | 39.4 |
 
 The binaries' sizes are what each engine needs to run: JavaScriptCore's is
 its 0.5 MB shell and its 36.3 MB library, SpiderMonkey carries ICU in its
@@ -351,29 +351,32 @@ LLInt on Splay:
 
 | benchmark | cloison | V8 Ignition | JSC LLInt | SpiderMonkey | QuickJS |
 |---|---:|---:|---:|---:|---:|
-| Richards | 2,725 | 1,966 | 1,860 | 482 | 748 |
-| DeltaBlue | 2,565 | 1,953 | 1,163 | 491 | 765 |
-| Crypto | 2,110 | 1,420 | 1,793 | 820 | 444 |
-| RayTrace | 6,720 | 5,465 | 2,804 | 1,488 | 1,244 |
-| EarleyBoyer | 8,325 | 8,134 | 4,670 | 1,999 | 2,156 |
-| RegExp | 3,587 | 3,833 | 752 | 923 | 338 |
-| Splay | 10,613 | 9,794 | 12,313 | 6,524 | 5,966 |
-| NavierStokes | 3,558 | 2,179 | 2,743 | 1,413 | 1,265 |
-| PdfJS | 10,246 | 10,792 | 8,737 | 5,233 | 3,066 |
-| Mandreel | 4,051 | 3,333 | 2,637 | 1,133 | 1,115 |
-| GameBoy | 12,354 | 9,683 | 8,372 | 3,661 | 4,073 |
-| CodeLoad | 32,524 | 51,407 | 44,468 | 48,917 | 19,747 |
-| Box2D | 8,068 | 5,859 | 6,588 | 2,320 | 3,291 |
-| zlib | 2,987 | 2,423 | 2,287 | 1,428 | 662 |
-| TypeScript | 27,344 | 26,764 | 18,088 | 8,261 | 11,821 |
-| **geomean** | **6,397** | **5,521** | **4,285** | **2,206** | **1,874** |
+| Richards | 2,743 | 1,966 | 1,860 | 482 | 748 |
+| DeltaBlue | 2,616 | 1,953 | 1,163 | 491 | 765 |
+| Crypto | 1,865 | 1,420 | 1,793 | 820 | 444 |
+| RayTrace | 6,467 | 5,465 | 2,804 | 1,488 | 1,244 |
+| EarleyBoyer | 8,261 | 8,134 | 4,670 | 1,999 | 2,156 |
+| RegExp | 3,521 | 3,833 | 752 | 923 | 338 |
+| Splay | 11,108 | 9,794 | 12,313 | 6,524 | 5,966 |
+| NavierStokes | 3,145 | 2,179 | 2,743 | 1,413 | 1,265 |
+| PdfJS | 10,389 | 10,792 | 8,737 | 5,233 | 3,066 |
+| Mandreel | 4,114 | 3,333 | 2,637 | 1,133 | 1,115 |
+| GameBoy | 12,590 | 9,683 | 8,372 | 3,661 | 4,073 |
+| CodeLoad | 32,572 | 51,407 | 44,468 | 48,917 | 19,747 |
+| Box2D | 7,896 | 5,859 | 6,588 | 2,320 | 3,291 |
+| zlib | 2,920 | 2,423 | 2,287 | 1,428 | 662 |
+| TypeScript | 27,368 | 26,764 | 18,088 | 8,261 | 11,821 |
+| **geomean** | **6,298** | **5,521** | **4,285** | **2,206** | **1,874** |
 
 With the JIT, cloison runs 2.5 times the instructions of JavaScriptCore for
 the same work and takes 1.7 times its CPU time; its memory is second to V8's
-(JavaScriptCore's heap is about 3 times the others'). Without the JIT, Splay
-peaks at 1.85 GB of RSS (673 MB with it): its full collections find 1.7
-million payload trees live where the compiled run's find 256 thousand,
-dead nodes some interpreted state still reaches (not yet found).
+(JavaScriptCore's heap is about 3 times the others'). Measuring this found
+two bugs of the interpreter, fixed since (the cloison rows without a JIT
+are after them): a call site turning between young callees logged the
+same few cache slots millions of times (Richards peaked at 256 MB, now 13.5;
+5b6d2c8), and a frame's tier-up slots, never cleared, kept a removed Splay
+node and every node removed after it reachable (1.85 GB, now 509 MB;
+47b57d1). `docs/weak-points.md` takes up where cloison does worse.
 
 The collectors, from each engine's own trace of the fixed work (cloison's
 `CLOISON_SIZES` and `CLOISON_GC_STATS`, V8's `--trace-gc-nvp`,
@@ -411,23 +414,26 @@ thousand and a million; QuickJS's from its own count of what malloc holds,
 
 | object | cloison | V8 | JSC | SpiderMonkey | QuickJS |
 |---|---:|---:|---:|---:|---:|
-| `{}` | 54 | 29 | 79 | 58 | 120 |
-| `{a, b, c}` | 109 | 44 | 63 | 58 | 136 |
-| `new P(x)`, 3 fields | 103 | 33 | 58 | 58 | 136 |
-| 10 properties | 146 | 51 | 130 | 126 | 304 |
-| `[i, i, i]` | 104 | 40 | 66 | 74 | 160 |
-| 3 doubles in an array | 104 | 51 | 67 | 74 | 160 |
-| a closure | 224 | 52 | 103 | 116 | 208 |
-| a 16-character string (concatenated) | 197 | 43 | 98 | 24 | 56 |
+| `{}` | 51 | 25 | 81 | 58 | 120 |
+| `{a, b, c}` | 99 | 42 | 71 | 58 | 136 |
+| `new P(x)`, 3 fields | 100 | 42 | 62 | 58 | 136 |
+| 10 properties | 161 | 51 | 133 | 126 | 304 |
+| `[i, i, i]` | 84 | 38 | 70 | 74 | 160 |
+| 3 doubles in an array | 98 | 51 | 61 | 74 | 160 |
+| a closure | 218 | 53 | 98 | 115 | 208 |
+| a 16-character string (8 + 8 concatenated) | 162 | 51 | 103 | 24 | 56 |
 | a double | 0 | 4 | 0 | 0 | 0 |
-| a `Map` entry | 111 | 15 | 109 | 28 | 96 |
-| an array element (pushed) | 17 | 13 | 40 | 8 | 11 |
+| a `Map` entry | 110 | 15 | 110 | 28 | 96 |
+| an array element (pushed) | 17 | 12 | 33 | 8 | 11 |
 
 cloison's objects are 2 to 4 times V8's (which compresses pointers to 4
 bytes): every object starts with a 48-byte header (shape, class, property
 and element storage and their sizes, code), every value is 8 bytes, a
-string keeps its UTF-16 or rope halves behind such a header, and a closure
-its upvalues as cells of their own. NaN-boxing (cloison, JavaScriptCore,
+string keeps its UTF-16 behind such a header (one of 16 characters is a
+96-byte cell, a concatenation under 256 characters a flat copy), and a
+closure gets a `prototype` object made eagerly and its captured variables
+as cells of their own. RSS adds about 7% for the collector's side tables
+(a byte per 16-byte granule, one per 128-byte card). NaN-boxing (cloison, JavaScriptCore,
 SpiderMonkey) and QuickJS's 16-byte values keep a double unboxed.
 
 Compiling, over the 15 benchmarks: loading a script (its source in a
@@ -438,37 +444,42 @@ deoptimizations over the fixed work, each engine by its own flags (cloison
 `CLOISON_SIZES` and the exits `CLOISON_EXITS` counts, V8 `--trace-opt` for
 Maglev and Turbofan, not Sparkplug, and `--trace-deopt`, JavaScriptCore
 `--reportTotalCompileTimes` and `--printEachOSRExit`; a release
-SpiderMonkey shell traces neither):
+SpiderMonkey shell traces neither; loading leaves EarleyBoyer out: in a
+function, one of its expressions needs more than the 256 registers cloison
+has, which it doesn't compile):
 
 | | cloison | V8 | JSC | SpiderMonkey | QuickJS |
 |---|---:|---:|---:|---:|---:|
-| loading, ms per MB (geomean) | 42.0 | 6.6 | 6.8 | 11.3 | 58.7 |
-| loading, million instructions per MB | 260 | 84 | 54 | 87 | 551 |
+| loading, ms per MB (geomean) | 42.4 | 6.2 | 6.6 | 11.3 | 59.4 |
+| loading, million instructions per MB | 263 | 81 | 52 | 86 | 554 |
 | JIT compile ms per benchmark (geomean) | **60** | 182 | 174 | — | — |
 | JIT compile ms, all 15 | 2,310 | 5,454 | 4,259 | — | — |
 | deoptimizations, all 15 | 38,313 | 932 | 47,185 | — | — |
 
 Copying stencils compiles in a third of the time of V8's and
-JavaScriptCore's optimizing tiers; parsing and compiling to bytecode is 6
-times slower than theirs. Most of cloison's exits are TypeScript's (28,186)
+JavaScriptCore's optimizing tiers; loading a script is about 7 times slower
+than theirs: the shell compiles every function of it up front. Most of cloison's exits are TypeScript's (28,186)
 and Box2D's (5,743).
 
 And what scripts probe (`probes.py`):
 
 | | cloison | V8 | JSC | SpiderMonkey | QuickJS |
 |---|---:|---:|---:|---:|---:|
-| RSS holding 400 MB of small arrays, MB | 426 | 228 | 475 | 390 | 791 |
-| RSS once dropped and collected, MB | 426 | 242 | 464 | 375 | 791 |
-| 0.5 s later | 426 | 243 | 53 | 374 | 791 |
-| 2 s later | 426 | 243 | 52 | 25 | 791 |
-| deepest recursion, default stack | 18,727 | 17,205 | 67,979 | 13,293 | 536 |
+| RSS holding 400 MB of small arrays, MB | 438 | 224 | 473 | 389 | 791 |
+| RSS once dropped and collected, MB | 132 | 235 | 462 | 374 | 791 |
+| 0.5 s later | 132 | 235 | 53 | 373 | 791 |
+| 2 s later | 132 | 235 | 53 | 24 | 791 |
+| deepest recursion, default stack | 18,727 | 16,370 | 67,241 | 15,493 | 536 |
 | longest string (doubled), characters | 2^30 | 2^28 | 2^30 | 2^29 | 2^29 |
-| a new realm: µs | 823 | 388 | 103 | 428 | — |
-| a new realm: KB | 710 | 170 | 98 | 118 | — |
+| a new realm: µs | 830 | 393 | 100 | 436 | — |
+| a new realm: KB | 720 | 169 | 98 | 118 | — |
 
-JavaScriptCore and SpiderMonkey give a heap's memory back once it is
-garbage; cloison keeps its emptied blocks (and V8's `d8`, which has no idle
-time to shrink its heap in, its pages). A realm costs cloison 2 to 8 times
+JavaScriptCore and SpiderMonkey give back nearly all of a heap's memory
+once it is garbage; cloison gives back what its next cycle's room doesn't
+keep, 64 MB here, but not yet its side tables (`$262.gc()` did nothing
+until 9bc410b, and a stop-the-world collection kept every emptied block
+until d8dc491); V8's `d8`, which has no idle time to shrink its heap in,
+keeps its pages. A realm costs cloison 2 to 8 times
 the others' time and 4 to 7 times their memory: each installs every
 builtin anew (`realm::create`), and once there are two, nothing more is
 compiled (compiled code would call another realm's functions without

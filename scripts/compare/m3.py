@@ -15,7 +15,7 @@ KINDS = {
     "array [i,i,i]": "[i, i, i]",
     "array of 3 doubles": "[i + 0.5, i + 1.5, i + 2.5]",
     "closure": "mk(i)",
-    "string, 16 chars": "('abcdefgh' + (10000000 + i)).slice(0, 16) + ''",
+    "string, 16 chars": "'abcdefgh' + (10000000 + i)",
     "heap double": "i + 0.5",
     "Map entry": None,   # (a Map of N entries, int keys)
     "array element (int)": None,  # (an array of N ints, the holder left out)

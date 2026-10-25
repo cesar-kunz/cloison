@@ -38,16 +38,6 @@ sm	raytrace	load_Minstr_per_mb	96.44
 sm	raytrace	load_ms_per_mb	11.160
 qjs	raytrace	load_Minstr_per_mb	626.57
 qjs	raytrace	load_ms_per_mb	75.581
-cloison	earley-boyer	load_Minstr_per_mb	224.13
-cloison	earley-boyer	load_ms_per_mb	36.350
-v8	earley-boyer	load_Minstr_per_mb	133.43
-v8	earley-boyer	load_ms_per_mb	13.977
-jsc	earley-boyer	load_Minstr_per_mb	79.80
-jsc	earley-boyer	load_ms_per_mb	11.262
-sm	earley-boyer	load_Minstr_per_mb	102.03
-sm	earley-boyer	load_ms_per_mb	11.363
-qjs	earley-boyer	load_Minstr_per_mb	506.98
-qjs	earley-boyer	load_ms_per_mb	50.629
 cloison	regexp	load_Minstr_per_mb	355.91
 cloison	regexp	load_ms_per_mb	49.796
 v8	regexp	load_Minstr_per_mb	77.27

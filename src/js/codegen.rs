@@ -420,6 +420,13 @@ fn function_name(p: &Program, i: usize) -> String {
     }
 }
 
+/// A variable of the script's own, a register, not a global: one of its
+/// block-scoped ones, any of strict `eval` code's, or its `this` for the
+/// arrows in it (`%this`).
+fn script_local(p: &Program, n: &str) -> bool {
+    p.eval_locals || p.lexicals.contains_key(n) || n == "%this"
+}
+
 /// Where each of function `i`'s upvalues comes from, in its parent: a
 /// register of the parent's (`true`), or an upvalue of its own.
 fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> Vec<(bool, u8)> {
@@ -429,7 +436,7 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
     scopes.upvalues[i]
         .iter()
         .map(|n| match decls[parent].position(n) {
-            Some(k) if parent != 0 || p.lexicals.contains_key(*n) || p.eval_locals => (true, k as u8 + 1),
+            Some(k) if parent != 0 || script_local(p, n) => (true, k as u8 + 1),
             _ => {
                 let k = scopes.upvalues[parent].iter().position(|d| d == n);
                 (false, k.expect("passed down by the parent") as u8)
@@ -616,9 +623,8 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
                 continue;
             }
             let (mut chain, mut j) = (vec![i], p.functions[i].parent);
-            // (The script's own variables: its block-scoped ones, or all
-            // of strict `eval` code's.)
-            let lexical = p.lexicals.contains_key(name) || p.eval_locals;
+            // (The script's own variables: see `script_local`.)
+            let lexical = script_local(p, name);
             let owner = loop {
                 match j {
                     Some(k) if k != 0 || lexical => {
@@ -912,20 +918,21 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     if p.functions[f].generator || p.functions[f].is_async {
         out.push(GEN);
     }
+    // `%this`: the function's `this`, for the arrows in it (the script's
+    // too: a register, not a global).
+    let this = p.functions[f].uses_this.then_some("%this");
     // The script's variables are globals, but for its block-scoped ones
     // (and strict `eval` code's).
     if f == 0 && !p.eval_locals {
         out.retain(|n| p.lexicals.contains_key(*n));
+        out.extend(this);
         return out;
     }
     // `arguments`: a variable `CreateArguments` sets.
     if arguments_object(p, f) && !out.contains(&"arguments") {
         out.push("arguments");
     }
-    // `%this`: the function's `this`, for the arrows in it.
-    if p.functions[f].uses_this && f != 0 {
-        out.push("%this");
-    }
+    out.extend(this);
     // A named function expression's own name, if used: a variable set to
     // the function (`LdaCallee`).
     if let Some(n) = own_name(p, f)

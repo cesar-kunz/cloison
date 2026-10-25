@@ -23,6 +23,10 @@ pub struct Program<'a> {
     /// A scope object has them by those names (its property keys), where
     /// a direct `eval` finds them.
     pub body_vars: std::collections::HashMap<Name, Name>,
+    /// The parameters whose names their function's body declares again
+    /// (see `parse::Parser::push_body_vars`), by function: in a scope
+    /// object, a property of their own (`x%param`), the name the body's.
+    pub shadowed_params: std::collections::HashSet<(usize, Name)>,
     /// Direct `eval`'s code: names are looked up in the caller's scope
     /// object first (the variable `%e0`, a `with`'s: see
     /// `intrinsics::direct_eval`).

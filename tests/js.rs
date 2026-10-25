@@ -8814,3 +8814,40 @@ r.join(",");
 ReferenceError,3,3,ReferenceError,5,7,ReferenceError,1,1,ReferenceError,9,ReferenceError,1,2,4,20000,20000"
     );
 }
+
+#[test]
+fn a_bodys_vars_are_not_its_parameters_closures() {
+    // A function whose parameters have expressions has its body's `var`s
+    // apart (FunctionDeclarationInstantiation step 28): a `var` of a
+    // parameter's name is the body's, its value the parameter's where the
+    // body starts, and the defaults' closures (and `eval`s in them) see
+    // the parameter. V8 and SpiderMonkey agree (JavaScriptCore but on the
+    // generator, where its closure sees the body's).
+    let src = r#"
+var r = [];
+function t(f) { try { r.push(JSON.stringify(f())); } catch (e) { r.push(e.name); } }
+t(() => (function (x, y = () => x) { var x = 2; return [x, y()]; })(1));
+t(() => (function (x, y = () => x) { var x; return [x, y()]; })(1));
+t(() => (function (x, y = () => { x = 5; }) { var x; y(); return x; })(1));
+t(() => (function (x, y = () => { x = 5; }) { y(); return x; })(1));
+t(() => (function (x = 1, y = () => x) { function x() {} return [typeof x, y()]; })());
+t(() => (function (x, y = () => x) { { function x() {} } return [typeof x, y()]; })(1));
+t(() => ((x, y = () => x) => { var x = 2; return [x, y()]; })(1));
+t(() => ((a = () => b) => { var b = 1; return a(); })());
+t(() => ({ m(x, y = () => x) { var x = 2; return [x, y()]; } }).m(1));
+t(() => (function* (x, y = () => x) { var x = 2; yield [x, y()]; })(1).next().value);
+t(() => (function ({ x }, y = () => x) { var x = 2; return [x, y()]; })({ x: 1 }));
+t(() => (function (x, y = () => x) { for (var x of [7]); return [x, y()]; })(1));
+t(() => (function (x, y = () => x) { var x = 2; return [eval("x"), y(), x]; })(1));
+t(() => (function (x, y = () => eval("x")) { var x = 2; return [x, y()]; })(1));
+t(() => (function (x, y = () => x) { var x = 2; eval("var x = 3"); return [x, y()]; })(1));
+t(() => (function (a = eval("var z = 1"), b = () => typeof z) { return [b(), typeof z]; })());
+t(() => (function (x, y = () => x) { var x = 2; return (() => eval("x"))() + y(); })(1));
+t(() => (function (a, b = () => a) { var a = a + 1; return [a, b()]; })(10));
+var s = 0; function hot(x, y = () => x) { var x = x * 2; return x + y(); }
+for (var i = 0; i < 20000; i++) s += hot(i);
+r.push(s);
+r.join(" ");
+"#;
+    assert_eq!(value(src), r#"[2,1] [1,1] 1 5 ["function",1] ["number",1] [2,1] ReferenceError [2,1] [2,1] [2,1] [7,1] [2,1,2] [2,1] [3,1] ["number","number"] 3 [11,10] 599970000"#);
+}

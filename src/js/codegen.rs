@@ -490,6 +490,14 @@ fn eval_scope(p: &Program, i: usize) -> Option<usize> {
     None
 }
 
+/// Whether function `child`, made in function `j`, is made in its
+/// parameter list, when it has statements for it (defaults, patterns):
+/// it sees `j`'s parameters, not its body's variables.
+fn in_param_list(p: &Program, child: usize, j: usize) -> bool {
+    let f = &p.functions[j];
+    f.param_stmts > 0 && p.functions[child].pos < f.body.get(f.param_stmts).map_or(f.end, |s| s.pos)
+}
+
 /// The variables of the functions enclosing function `i` (not the
 /// script's, which are globals) a direct `eval` in it sees beyond its
 /// own: their parameters, `var`s and functions, innermost first, none an
@@ -503,8 +511,15 @@ fn eval_outer_names<'a>(p: &'a Program, decls: &[Decls<'a>], i: usize) -> Vec<(&
     // (Through arrows only: the function's `arguments` and `new.target`
     // are an arrow's too.)
     let mut arrows = p.functions[i].arrow;
+    let mut child = i;
     while let Some(k) = j.filter(|&k| k != 0) {
+        // (From its parameter list, its parameters, not its body's `var`s;
+        // else a parameter the body declares again is the body's.)
+        let params = in_param_list(p, child, k);
         for &v in &decls[k].list {
+            if if params { p.body_vars.contains_key(v) } else { p.shadowed_params.contains(&(k, v.into())) } {
+                continue;
+            }
             let n = p.body_vars.get(v).map_or(v, |n| &**n);
             let seen = out.iter().any(|&(o, _)| o == n);
             let own = matches!(n, "arguments" | "%newtarget");
@@ -518,6 +533,7 @@ fn eval_outer_names<'a>(p: &'a Program, decls: &[Decls<'a>], i: usize) -> Vec<(&
             out.push((n, v));
         }
         arrows &= p.functions[k].arrow;
+        child = k;
         j = p.functions[k].parent;
     }
     out
@@ -1822,7 +1838,7 @@ impl<'a> Gen<'a> {
                 if has_eval {
                     self.scope_var(env, n)?;
                 } else {
-                    self.named(Op::SetNamed, env, self.env_key(n));
+                    self.named(Op::SetNamed, env, &self.env_key(n));
                 }
             }
         }
@@ -1855,7 +1871,7 @@ impl<'a> Gen<'a> {
                 self.mov(self.locals[ENV], e);
                 for p in &f.params {
                     let k = self.alloc(self.f.pos)?;
-                    self.string(self.env_key(p));
+                    self.string(&self.env_key(p));
                     self.star(k);
                 }
                 self.intrinsic("map_arguments_to_scope", a, 2 + f.params.len() as u8);
@@ -2275,12 +2291,29 @@ impl<'a> Gen<'a> {
     }
 
     /// The property of a scope object that is variable `name`: a renamed
-    /// body `var`'s by its name (see `Program::body_vars`).
-    fn env_key<'n>(&self, name: &'n str) -> &'n str
+    /// body `var`'s by its name (see `Program::body_vars`), a parameter
+    /// whose name the body declares again by one of its own (see
+    /// `Program::shadowed_params`).
+    fn env_key<'n>(&self, name: &'n str) -> std::borrow::Cow<'n, str>
     where
         'a: 'n,
     {
-        self.p.body_vars.get(name).map_or(name, |n| &**n)
+        if let Some(n) = self.p.body_vars.get(name) {
+            return std::borrow::Cow::Borrowed(n);
+        }
+        if !self.p.shadowed_params.is_empty() {
+            let mut k = Some(self.index);
+            while let Some(i) = k {
+                if self.decls[i].contains(&name) {
+                    if self.p.shadowed_params.contains(&(i, name.into())) {
+                        return std::borrow::Cow::Owned(format!("{name}%param"));
+                    }
+                    break;
+                }
+                k = self.p.functions[i].parent;
+            }
+        }
+        std::borrow::Cow::Borrowed(name)
     }
 
     fn named(&mut self, op: Op, obj: u8, name: &str) {
@@ -2368,13 +2401,16 @@ impl<'a> Gen<'a> {
     fn with_skip(&self, name: &str) -> usize {
         let Some(l) = self.p.lexicals.get(name) else {
             // A function's own variable is closer than the `with`s around
-            // the function: those inside it may shadow it.
-            let mut k = Some(self.index);
+            // the function: those inside it may shadow it. (From its
+            // parameter list, its eval scope object too, the body's, where
+            // its own variable is found as the body's: see `in_param_list`.)
+            let (mut child, mut k) = (self.index, Some(self.index));
             while let Some(j) = k.filter(|&j| j != 0) {
                 if self.decls[j].contains(&name) {
-                    return self.p.functions[j].withs.len();
+                    let f = &self.p.functions[j];
+                    return f.withs.len() + usize::from(f.has_eval && child != j && in_param_list(self.p, child, j));
                 }
-                k = self.p.functions[j].parent;
+                (child, k) = (j, self.p.functions[j].parent);
             }
             return 0;
         };
@@ -2655,7 +2691,7 @@ impl<'a> Gen<'a> {
         let v = self.alloc(pos)?;
         self.star(v);
         self.mov(env, a);
-        self.string(name);
+        self.string(&name);
         self.star(k);
         self.intrinsic("scope_var", a, 3);
         self.temp = m;
@@ -3449,7 +3485,7 @@ impl<'a> Gen<'a> {
             Var::Upvalue(k) => {
                 self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
             }
-            Var::Scope(env) => self.named(Op::SetNamed, env, self.env_key(name)),
+            Var::Scope(env) => self.named(Op::SetNamed, env, &self.env_key(name)),
             Var::ScopeUpvalue(k) => {
                 // (`acc` stays the value.)
                 let mark = self.temp;
@@ -3459,7 +3495,7 @@ impl<'a> Gen<'a> {
                 self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                 self.star(env);
                 self.ldar(v);
-                self.named(Op::SetNamed, env, self.env_key(name));
+                self.named(Op::SetNamed, env, &self.env_key(name));
                 self.temp = mark;
             }
             Var::Global | Var::Undefined => self.global(Op::StaGlobal, name),
@@ -3704,13 +3740,13 @@ impl<'a> Gen<'a> {
                 Var::Upvalue(k) => {
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                 }
-                Var::Scope(env) => self.named(Op::GetNamed, env, self.env_key(n)),
+                Var::Scope(env) => self.named(Op::GetNamed, env, &self.env_key(n)),
                 Var::ScopeUpvalue(k) => {
                     let mark = self.temp;
                     let env = self.alloc(e.pos)?;
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                     self.star(env);
-                    self.named(Op::GetNamed, env, self.env_key(n));
+                    self.named(Op::GetNamed, env, &self.env_key(n));
                     self.temp = mark;
                 }
                 Var::Undefined => self.emit(Op::LdaUndefined, &[]),

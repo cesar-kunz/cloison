@@ -142,6 +142,7 @@ fn parse_pass<'a>(
         renames: 0,
         lexicals: Default::default(),
         body_vars: Default::default(),
+        shadowed_params: Default::default(),
         module,
         info: ModuleInfo::default(),
         imports: Default::default(),
@@ -221,6 +222,7 @@ fn parse_pass<'a>(
             functions: p.functions,
             lexicals: p.lexicals,
             body_vars: std::mem::take(&mut p.body_vars),
+            shadowed_params: std::mem::take(&mut p.shadowed_params),
             direct_eval: eval.is_some(),
             eval_locals: false,
             imports: std::mem::take(&mut p.imports),
@@ -346,6 +348,8 @@ struct Parser<'t, 'a, 'p> {
     lexicals: std::collections::HashMap<Name, Lexical>,
     /// (See `Program::body_vars`.)
     body_vars: std::collections::HashMap<Name, Name>,
+    /// (See `Program::shadowed_params`.)
+    shadowed_params: std::collections::HashSet<(usize, Name)>,
     /// Parsing a module: its id (see [`parse_module`]).
     module: Option<i32>,
     /// A module's entries so far (see [`Program::module`]).
@@ -1714,7 +1718,8 @@ impl<'a> Parser<'_, 'a, '_> {
             return self.err("duplicate parameter names");
         }
         self.param_names.push((index, bound.clone()));
-        let body_vars = !prologue.is_empty() && self.push_body_vars(&bound);
+        let body_vars = if prologue.is_empty() { None } else { self.push_body_vars(index, &bound) };
+        let body_pos = self.pos();
         self.expect("{")?;
         if self.directive_prologue() {
             // (Only with simple parameters.)
@@ -1767,13 +1772,17 @@ impl<'a> Parser<'_, 'a, '_> {
         let outer = std::mem::replace(&mut self.current, index);
         let body = self.scoped_block_rest();
         self.current = outer;
-        if body_vars {
+        let copies = body_vars.inspect(|_| {
             self.frames.pop();
-        }
+        });
         let end = self.toks[self.i - 1].pos + 1;
         self.functions[index].end = end;
         let mut body = body?;
         self.functions[index].param_stmts = prologue.len();
+        if let Some(copies) = copies {
+            let copies = self.copy_params(copies, body_pos);
+            body.splice(0..0, copies);
+        }
         if !prologue.is_empty() {
             body.splice(0..0, prologue);
         }
@@ -2009,6 +2018,10 @@ impl<'a> Parser<'_, 'a, '_> {
             self.current = outer;
             return self.err("duplicate parameter names");
         }
+        // (Its body's `var`s renamed apart from its defaults' closures, as a
+        // function's: see `function_rest`.)
+        let mut copies = None;
+        let body_pos = self.pos();
         let body = if self.eat("{") {
             // (`"use strict"` of its own, with simple parameters only.)
             if self.directive_prologue() {
@@ -2018,7 +2031,17 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 self.functions[index].strict = true;
             }
-            self.scoped_block_rest()
+            if !prologue.is_empty() {
+                if self.collect {
+                    self.table.defaults = true;
+                }
+                copies = self.push_body_vars(index, &bound);
+            }
+            let body = self.scoped_block_rest();
+            if copies.is_some() {
+                self.frames.pop();
+            }
+            body
         } else {
             let p = self.pos();
             self.assignment(false).map(|e| {
@@ -2035,6 +2058,11 @@ impl<'a> Parser<'_, 'a, '_> {
         f.params = params;
         let mut body = body?;
         f.param_stmts = prologue.len();
+        if let Some(copies) = copies {
+            let copies = self.copy_params(copies, body_pos);
+            body.splice(0..0, copies);
+        }
+        let f = &mut self.functions[index];
         if !prologue.is_empty() {
             body.splice(0..0, prologue);
         }
@@ -3032,28 +3060,54 @@ impl<'a> Parser<'_, 'a, '_> {
     }
 
     /// The `var`s and functions a function with parameter defaults declares
-    /// in its body (its first pass's), but its parameters, renamed apart
-    /// (its frame pushed): whether there were any.
-    fn push_body_vars(&mut self, params: &[Name]) -> bool {
-        let Some(prev) = self.prev else { return false };
-        let Some(vars) = self.frames.iter().rev().find(|f| f.vars) else { return false };
+    /// in its body (its first pass's), renamed apart (its frame pushed), if
+    /// any: a parameter's name too where the body declares it again, the
+    /// `var`s of those to copy the parameter's value to, `(parameter, var)`.
+    fn push_body_vars(&mut self, index: usize, params: &[Name]) -> Option<Vec<(Name, Name)>> {
+        let prev = self.prev?;
+        let vars = self.frames.iter().rev().find(|f| f.vars)?;
         let pos = self.toks[vars.key].pos;
         let fs = &prev.functions;
         let k = fs[1..].partition_point(|f| f.params_pos < pos) + 1;
-        let Some(f) = fs.get(k).filter(|f| f.params_pos == pos) else { return false };
+        let f = fs.get(k).filter(|f| f.params_pos == pos)?;
         let own = f.name.clone().filter(|_| f.binds_name);
+        // (What the body itself declares, past its parameters' statements,
+        // which declare their patterns' names: its `var`s, and the
+        // functions at its top level, not in a block, whose names aren't
+        // the body's when a parameter's: Annex B.3.2.1.)
+        let (mut vars, mut functions) = (Vec::new(), Vec::new());
+        for s in &f.body[f.param_stmts.min(f.body.len())..] {
+            declared_in(s, fs, &mut vars, false);
+            if let StmtKind::Function(i) = &s.kind {
+                functions.extend(fs[*i].name.clone());
+            }
+        }
         let mut names = Vec::new();
+        let mut copies = Vec::new();
         for n in var_names(fs, k) {
-            if params.contains(&n) || &*n == "arguments" || Some(&n) == own.as_ref() || names.iter().any(|(o, _)| *o == n) {
+            if &*n == "arguments" || Some(&n) == own.as_ref() || names.iter().any(|(o, _)| *o == n) {
+                continue;
+            }
+            // A parameter's name the body declares again is a binding of
+            // the body's, its value the parameter's where the body starts
+            // (a function of the body's its own).
+            let param = params.contains(&n);
+            if param && !vars.contains(&n) && !functions.contains(&n) {
                 continue;
             }
             let r: Name = format!("{n}%{}", self.renames).into();
             self.renames += 1;
             self.body_vars.insert(r.clone(), n.clone());
+            if param {
+                self.shadowed_params.insert((index, n.clone()));
+                if !functions.contains(&n) {
+                    copies.push((n.clone(), r.clone()));
+                }
+            }
             names.push((n, r));
         }
         if names.is_empty() {
-            return false;
+            return None;
         }
         // (A `var`s frame: the body's scope, inside it, is the function's.)
         self.frames.push(Frame {
@@ -3064,7 +3118,21 @@ impl<'a> Parser<'_, 'a, '_> {
             vars: true,
             catch: false,
         });
-        true
+        Some(copies)
+    }
+
+    /// The statements copying parameters' values to the body's `var`s of
+    /// their names (see `push_body_vars`), at the body's start.
+    fn copy_params(&self, copies: Vec<(Name, Name)>, pos: Pos) -> Vec<Stmt<'a>> {
+        let x = |k| Expr { kind: k, pos };
+        copies
+            .into_iter()
+            .map(|(p, v)| {
+                let target = expr(self.arena, x(ExprKind::Ident(v)));
+                let value = expr(self.arena, x(ExprKind::Ident(p)));
+                Stmt { kind: StmtKind::Expr(x(ExprKind::Assign(None, target, value))), pos }
+            })
+            .collect()
     }
 
     /// Enter a function's parameters and `var`s (keyed by the token
@@ -4487,59 +4555,61 @@ fn var_names(fs: &[Function], f: usize) -> Vec<Name> {
 /// Function `f`'s parameters and `var`s, and (`functions`) the functions
 /// declared in it.
 fn var_names_of(fs: &[Function], f: usize, functions: bool) -> Vec<Name> {
-    fn walk(s: &Stmt, fs: &[Function], out: &mut Vec<Name>, functions: bool) {
-        let walk = |s: &Stmt, out: &mut Vec<Name>| walk(s, fs, out, functions);
-        match &s.kind {
-            StmtKind::Var(ds)
-            | StmtKind::For {
-                init: Some(ForInit::Var(ds)),
-                ..
-            } => out.extend(ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone())),
-            StmtKind::ForIn { var: true, name, .. } => out.push(name.clone()),
-            StmtKind::ForOf {
-                kind: 1,
-                pattern: Some(p),
-                ..
-            } => p.names(out),
-            StmtKind::ForOf {
-                kind: 1,
-                target: Expr {
-                    kind: ExprKind::Ident(name),
-                    ..
-                },
-                ..
-            } => out.push(name.clone()),
-            StmtKind::Function(i) if functions => out.extend(fs[*i].name.clone()),
-            _ => {}
-        }
-        match &s.kind {
-            StmtKind::If(_, a, b) => {
-                walk(a, out);
-                if let Some(b) = b {
-                    walk(b, out);
-                }
-            }
-            StmtKind::For { body, .. }
-            | StmtKind::ForIn { body, .. }
-            | StmtKind::ForOf { body, .. }
-            | StmtKind::While(_, body)
-            | StmtKind::DoWhile(body, _)
-            | StmtKind::With(_, _, body)
-            | StmtKind::Labeled(_, body) => walk(body, out),
-            StmtKind::Block(b) => b.iter().for_each(|s| walk(s, out)),
-            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| walk(s, out)),
-            StmtKind::Try(b, c, fin) => b
-                .iter()
-                .chain(c.iter().flat_map(|(_, c)| c))
-                .chain(fin.iter().flatten())
-                .for_each(|s| walk(s, out)),
-            _ => {}
-        }
-    }
     let func = &fs[f];
     let mut out: Vec<Name> = func.params.to_vec();
-    func.body.iter().for_each(|s| walk(s, fs, &mut out, functions));
+    func.body.iter().for_each(|s| declared_in(s, fs, &mut out, functions));
     out
+}
+
+/// The `var`s (and, `functions`, the functions) statement `s` declares.
+fn declared_in(s: &Stmt, fs: &[Function], out: &mut Vec<Name>, functions: bool) {
+    let walk = |s: &Stmt, out: &mut Vec<Name>| declared_in(s, fs, out, functions);
+    match &s.kind {
+        StmtKind::Var(ds)
+        | StmtKind::For {
+            init: Some(ForInit::Var(ds)),
+            ..
+        } => out.extend(ds.iter().filter(|(n, _)| !n.is_empty()).map(|(n, _)| n.clone())),
+        StmtKind::ForIn { var: true, name, .. } => out.push(name.clone()),
+        StmtKind::ForOf {
+            kind: 1,
+            pattern: Some(p),
+            ..
+        } => p.names(out),
+        StmtKind::ForOf {
+            kind: 1,
+            target: Expr {
+                kind: ExprKind::Ident(name),
+                ..
+            },
+            ..
+        } => out.push(name.clone()),
+        StmtKind::Function(i) if functions => out.extend(fs[*i].name.clone()),
+        _ => {}
+    }
+    match &s.kind {
+        StmtKind::If(_, a, b) => {
+            walk(a, out);
+            if let Some(b) = b {
+                walk(b, out);
+            }
+        }
+        StmtKind::For { body, .. }
+        | StmtKind::ForIn { body, .. }
+        | StmtKind::ForOf { body, .. }
+        | StmtKind::While(_, body)
+        | StmtKind::DoWhile(body, _)
+        | StmtKind::With(_, _, body)
+        | StmtKind::Labeled(_, body) => walk(body, out),
+        StmtKind::Block(b) => b.iter().for_each(|s| walk(s, out)),
+        StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).for_each(|s| walk(s, out)),
+        StmtKind::Try(b, c, fin) => b
+            .iter()
+            .chain(c.iter().flat_map(|(_, c)| c))
+            .chain(fin.iter().flatten())
+            .for_each(|s| walk(s, out)),
+        _ => {}
+    }
 }
 
 /// A ModuleExportName (see `Parser::module_export_name`).

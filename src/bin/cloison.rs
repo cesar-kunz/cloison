@@ -173,13 +173,15 @@ fn main() -> ExitCode {
                     n(&cloison::jit::LOWER_NS) as f64 / 1e6,
                 );
                 eprintln!(
-                    "gc minors={} fulls={} pause_ms={:.1} max_pause_ms={:.2} heap_peak={} live_peak={}",
+                    "gc minors={} fulls={} pause_ms={:.1} max_pause_ms={:.2} heap_peak={} live_peak={} allocated={} promoted={}",
                     n(&cloison::gc::MINORS),
                     n(&cloison::gc::FULLS),
                     n(&cloison::gc::PAUSE_NS) as f64 / 1e6,
                     n(&cloison::gc::MAX_PAUSE_NS) as f64 / 1e6,
                     n(&cloison::gc::HEAP_PEAK),
                     n(&cloison::gc::LIVE_PEAK),
+                    n(&cloison::gc::ALLOCATED),
+                    n(&cloison::gc::PROMOTED),
                 );
                 // (glibc's count of what malloc has handed out and not freed.)
                 #[cfg(all(target_os = "linux", target_env = "gnu"))]

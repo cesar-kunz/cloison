@@ -8851,3 +8851,32 @@ r.join(" ");
 "#;
     assert_eq!(value(src), r#"[2,1] [1,1] 1 5 ["function",1] ["number",1] [2,1] ReferenceError [2,1] [2,1] [2,1] [7,1] [2,1,2] [2,1] [3,1] ["number","number"] 3 [11,10] 599970000"#);
 }
+
+#[test]
+fn a_scripts_vars_are_globals_before_it_runs() {
+    // GlobalDeclarationInstantiation: every `var` (with an initializer, in
+    // a `for-in`, never reached) a global property before the script's
+    // first statement, not deletable (an indirect eval's are, and then
+    // gone). V8, JavaScriptCore and SpiderMonkey agree.
+    let src = r#"
+var r = [];
+var d = (n) => JSON.stringify(Object.getOwnPropertyDescriptor(globalThis, n));
+r.push("a" in globalThis, d("a"), Object.prototype.hasOwnProperty.call(globalThis, "c"));
+r.push(Object.keys(globalThis).includes("d"), delete globalThis.a, typeof f);
+var a = 1;
+if (false) { var b; }
+for (var c in {}) ;
+for (var d2 of []) ;
+var d = d;
+function f() {}
+r.push(d("a"));
+var s = 0;
+for (var i = 0; i < 20000; i++) s = (s + i) | 0;
+r.push(s);
+(0, eval)("var e1 = 2;");
+r.push(JSON.stringify(Object.getOwnPropertyDescriptor(globalThis, "e1")), delete globalThis.e1, "e1" in globalThis);
+try { e1; r.push("read"); } catch (e) { r.push(e.name); }
+r.join(" ");
+"#;
+    assert_eq!(value(src), r#"true {"writable":true,"enumerable":true,"configurable":false} true true false function {"value":1,"writable":true,"enumerable":true,"configurable":false} 199990000 {"value":2,"writable":true,"enumerable":true,"configurable":true} true false ReferenceError"#);
+}

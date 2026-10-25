@@ -305,12 +305,111 @@ Code size is tracked per commit in `bench/sizes.tsv`: the release
 binary's machine code is about 4.1 MB, stencil code about 170 KB (x86-64,
 at 52f4c0e).
 
+### Against other engines, besides peak speed
+
+On the same Linux host (an AMD EPYC 9454P, Zen 4) at 56dc4da, against
+the jsvu builds of V8 15.8 (`d8`), JavaScriptCore 323696 (the GTK port),
+SpiderMonkey 159 and QuickJS-ng 0.17, each also without its JIT (V8
+`--jitless`, JavaScriptCore `--useJIT=false`, SpiderMonkey `--no-blinterp
+--no-baseline --no-ion --no-native-regexp`, cloison `CLOISON_NO_JIT`).
+`scripts/compare/` measures it and keeps the results in `bench/compare/`
+(`report.py` makes the tables, each with every engine's ratio to the best and
+its rank). The engines' binaries run directly, not through jsvu's shell
+wrappers, whose shell costs about a millisecond and 2 million instructions.
+Octane is a single run of each `-score.js`, and the deterministic `-run.js`
+(the same fixed work for every engine) under `perf stat`, one run at a time,
+the host at a load of 3 to 4. Instruction counts don't vary with load, but
+they don't weigh a cache miss as time does. Geomeans are over the 15
+benchmarks (lower is better but for scores):
+
+| | cloison | V8 | JSC | SpiderMonkey | QuickJS |
+|---|---:|---:|---:|---:|---:|
+| empty script: wall ms | 1.9 | 12.3 | 16.2 | 11.1 | 1.4 |
+| empty script: million instructions | 6.7 | 30.2 | 79.1 | 49.5 | 3.8 |
+| empty script: RSS MB | 3.8 | 16.5 | 31.5 | 19.5 | 3.6 |
+| binary, stripped, MB | 5.7 | 35.6 | 36.8 | 44.7 | 1.8 |
+| other files it needs | — | 10.8 MB ICU data | 39 MB ICU libraries | 3 NSPR libraries | — |
+| shared libraries loaded | 0 (static) | 4 | 21 | 9 | 0 (static) |
+| Octane, JIT | 27,476 | 75,961 | 72,924 | 47,127 | — |
+| Octane, no JIT | **6,397** | 5,521 | 4,285 | 2,206 | 1,874 |
+| fixed work, JIT: G instructions | 29.9 | 12.6 | 12.0 | 15.6 | — |
+| fixed work, JIT: CPU s | 2.23 | 1.29 | 1.30 | 1.42 | — |
+| fixed work, no JIT: G instructions | **104** | 157 | 151 | 361 | 315 |
+| peak RSS, JIT: MB | 78.8 | 68.9 | 216 | 83.3 | — |
+| peak RSS, no JIT: MB | 57.8 | 55.8 | 107 | 76.5 | 39.4 |
+
+The binaries' sizes are what each engine needs to run: JavaScriptCore's is
+its 0.5 MB shell and its 36.3 MB library, SpiderMonkey carries ICU in its
+18.5 MB of read-only data. cloison and QuickJS have no `Intl`, much of the
+difference. Startup and an empty script's memory put cloison next to
+QuickJS, 6 to 8 times faster and 4 to 8 times smaller than the others.
+
+Without a JIT, cloison's interpreter is the fastest of the five, first on
+11 of the 15 benchmarks; V8's Ignition is ahead on RegExp, PdfJS and CodeLoad
+(cloison compiles all of an `eval`'s functions up front), JavaScriptCore's
+LLInt on Splay:
+
+| benchmark | cloison | V8 Ignition | JSC LLInt | SpiderMonkey | QuickJS |
+|---|---:|---:|---:|---:|---:|
+| Richards | 2,725 | 1,966 | 1,860 | 482 | 748 |
+| DeltaBlue | 2,565 | 1,953 | 1,163 | 491 | 765 |
+| Crypto | 2,110 | 1,420 | 1,793 | 820 | 444 |
+| RayTrace | 6,720 | 5,465 | 2,804 | 1,488 | 1,244 |
+| EarleyBoyer | 8,325 | 8,134 | 4,670 | 1,999 | 2,156 |
+| RegExp | 3,587 | 3,833 | 752 | 923 | 338 |
+| Splay | 10,613 | 9,794 | 12,313 | 6,524 | 5,966 |
+| NavierStokes | 3,558 | 2,179 | 2,743 | 1,413 | 1,265 |
+| PdfJS | 10,246 | 10,792 | 8,737 | 5,233 | 3,066 |
+| Mandreel | 4,051 | 3,333 | 2,637 | 1,133 | 1,115 |
+| GameBoy | 12,354 | 9,683 | 8,372 | 3,661 | 4,073 |
+| CodeLoad | 32,524 | 51,407 | 44,468 | 48,917 | 19,747 |
+| Box2D | 8,068 | 5,859 | 6,588 | 2,320 | 3,291 |
+| zlib | 2,987 | 2,423 | 2,287 | 1,428 | 662 |
+| TypeScript | 27,344 | 26,764 | 18,088 | 8,261 | 11,821 |
+| **geomean** | **6,397** | **5,521** | **4,285** | **2,206** | **1,874** |
+
+With the JIT, cloison runs 2.5 times the instructions of JavaScriptCore for
+the same work and takes 1.7 times its CPU time; its memory is second to V8's
+(JavaScriptCore's heap is about 3 times the others'). Without the JIT, Splay
+peaks at 1.85 GB of RSS (673 MB with it): its full collections find 1.7
+million payload trees live where the compiled run's find 256 thousand,
+dead nodes some interpreted state still reaches (not yet found).
+
+The collectors, from each engine's own trace of the fixed work (cloison's
+`CLOISON_SIZES` and `CLOISON_GC_STATS`, V8's `--trace-gc-nvp`,
+SpiderMonkey's `JS_GC_PROFILE_NURSERY` and `JS_GC_PROFILE`, JavaScriptCore's
+`--logGC=1`; QuickJS counts references, with no generations):
+
+| | cloison | V8 | JSC | SpiderMonkey |
+|---|---:|---:|---:|---:|
+| bytes allocated, MB (geomean) | 567 | 155 | 333 | — |
+| allocated young, % (geomean) | 100 | 73 | 100 | — |
+| young bytes promoted, % (geomean) | 5.1 | 1.5 | 0.9 | 3.9 |
+| minor collections (all 15) | 1,411 | 2,797 | 69 | 4,702 |
+| major collections (all 15) | 42 | 9 | 3 | 31 |
+| minor pauses, ms (all 15) | 1,268 | 467 | 126 | 378 |
+| major pauses, ms (all 15) | 182 | 23 | 11 | 119 |
+| longest minor pause, ms | 8.3 | 19.1 | 7.5 | 10.5 |
+| longest major pause, ms | 9.3 | 5.4 | 4.4 | 5.0 |
+
+Every cell cloison or JavaScriptCore allocates starts young; V8 allocates
+some straight in its old generation (Splay 92% of its 626 MB, once its
+allocation sites show they survive). cloison allocates 3.7 times V8's bytes:
+Splay 4.1 GB, 70% of it promoted. Its major figures count both pauses of a
+concurrent cycle, V8's only the final pause of an incremental marking (not
+its steps), JavaScriptCore's every increment. SpiderMonkey's trace has only
+its nursery's size and promotion rate: its allocation outside the nursery
+is unknown, its young bytes a bound (the nursery's size at each
+collection). JavaScriptCore's promotion is what an Eden collection leaves
+above the heap the last one left (it moves nothing); its large heap makes
+few collections.
+
 ## Testing
 
 The differential tests run each program in four engine configurations
 (the interpreter alone, and tiered up after 1, 2 and 1,000 loop back
 edges) and the results must agree: the JavaScript tests (`tests/js.rs`,
-291, which also verify the heap after each run), the bytecode ones
+294, which also verify the heap after each run), the bytecode ones
 (`tests/objects.rs`), the 112 programs of `bench/micro/` and the 33 of
 `tests/octane/`, which carry Node's value as the reference
 (`tests/interp.rs` tests the interpreter alone). Several tests are
@@ -346,7 +445,13 @@ pinned to the idlest core; `vs-v8.sh` times every micro against Node and
 function; `jit-profile.sh` profiles compiled code per stencil piece;
 `dispatch-asm.sh` disassembles the interpreter's handlers.
 `bench/sparse/sweep.sh` and `pareto.py` choose the sparse-array settings
-(`bench/sparse/README.md`).
+(`bench/sparse/README.md`). `scripts/compare/` compares cloison with the
+jsvu engines, with and without their JITs: `startup.py` (an empty script's
+time, instructions and memory), `octane.py` (scores, and the fixed work's
+instructions, CPU time and peak RSS), `gcgen.py` (generations and pauses
+from each collector's trace), `m3.py` (bytes per object of each kind, from
+the RSS `probe.py` samples after full collections) and `report.py` (the
+tables, ratios and ranks), results in `bench/compare/`.
 
 Environment flags: `CLOISON_NO_JIT` (the interpreter alone),
 `CLOISON_NO_RX_JIT` (regexps interpreted), `CLOISON_WARM` (compile warm
@@ -458,6 +563,7 @@ src/realm.rs     realms;  src/shadow.rs  ShadowRealm;  src/agent.rs  test262's a
 tests/           differential tests;  tests/octane/  feature scripts per benchmark
 bench/micro/     one pattern per file;  bench/bytecode/  handwritten bytecode
 bench/gc/        the collector's microbenchmarks;  bench/sparse/  sparse-array workloads, sweep
+bench/compare/   against other engines (scripts/compare/)
 docs/            designs (the design log is the commit messages)
 ```
 

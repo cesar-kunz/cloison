@@ -1,15 +1,16 @@
 # cloison
 
-A JavaScript engine in Rust: a front end for ES5 and much of ES2015, a register bytecode
+A JavaScript engine in Rust: a front end for ES5 through ES2026, a register bytecode
 interpreter, and a copy-and-patch JIT for x86-64 and arm64 (Linux, and macOS on Apple silicon) that
 grows into a mid-tier optimizing compiler without an IR beyond bytecode.
 
-The whole engine is small: a 3 MB binary with 1.7 MB of machine code,
-against 21 MB of code in a release build of V8's `d8` shell (12.8, arm64).
+The whole engine is small: a 5.7 MB binary (stripped, static, x86-64) with
+4.1 MB of machine code, against 21 MB of code in a release build of V8's
+`d8` shell (12.8, arm64).
 Yet on several Octane benchmarks it comes close to V8 14.6 capped at its
 Maglev tier: Richards at 0.87 of Maglev's score, DeltaBlue at 0.81, Crypto
-at 0.66 and NavierStokes at 0.57 (geomean 0.32 over all of Octane; see
-[Results](#results)).
+at 0.66 and NavierStokes at 0.57 on an Apple silicon Mac (geomean 0.32
+over all of Octane there, 0.43 on Linux x86-64; see [Results](#results)).
 
 The name: in cloisonné enamel, *cloisons* are thin metal walls that
 make fixed cells, which are then filled with enamel. The JIT's stencils
@@ -21,13 +22,16 @@ cargo build --release
 target/release/cloison bench/micro/87-constraint-solver.js   # prints the completion value
 target/release/cloison --dump file.js                         # the bytecode instead
 target/release/cloison --module main.mjs                      # a module (a .mjs file is one anyway)
+target/release/cloison --array-density 1/16,1/8,8k,16m f.js   # when arrays go sparse (see below)
 ```
 
-Status (2026-10-14): every Octane benchmark runs, with a generational
+Status (2026-10-25): every Octane benchmark runs, with a generational
 garbage collector that marks and sweeps its old generation concurrently
 and frees compiled code that is no longer reachable. The language is
-ES5 through ES2023 with gaps, four fifths of test262 (see
-[Standards support](#standards-support)). See
+ES5 through ES2026 and most Stage 3 proposals, with gaps: 98.2% of
+test262 (see [Standards support](#standards-support)). A differential
+fuzzing campaign against V8, JavaScriptCore, SpiderMonkey and QuickJS has
+found 28 bugs so far, all fixed. See
 [Where it falls short](#where-it-falls-short).
 
 ## How it works
@@ -44,6 +48,16 @@ ES5 through ES2023 with gaps, four fifths of test262 (see
   trees, in-object slots, inline caches that record field types and
   element kinds, and a global prototype epoch that invalidates cached
   prototype-chain loads. Closures use Lua-style upvalues.
+- **Arrays** keep their elements dense until too few are present for the
+  room they take (`src/far.rs`): then the dense prefix stays and the rest,
+  with the length, moves to a hash table, so `a = []; a[2 ** 31] = 1`
+  peaks at 4.6 MB of RSS (an empty script at 3.8) and indices up to
+  2^32 − 2 work; array methods skip what isn't there. The trade-off
+  between speed and memory (how sparse, how much waste) was chosen by a
+  sweep over nine workloads (`bench/sparse/`) and can be set at run time
+  or when building (`CLOISON_ARRAY_DENSE_MIN`,
+  `CLOISON_ARRAY_DENSE_BACK`, `CLOISON_ARRAY_WASTE`,
+  `CLOISON_ARRAY_PREALLOC`, or `--array-density`).
 - **The JIT** (`src/jit.rs`, `stencils/stencils.rs`, `build.rs`) is
   copy-and-patch: `build.rs` compiles the stencils into an ELF object,
   extracts each one's machine code and relocations, and the JIT copies
@@ -79,14 +93,16 @@ ES5 through ES2023 with gaps, four fifths of test262 (see
   and Rust's own formatting doesn't; checked on 22,000 doubles against
   Node.
 
-`docs/future-work.md` is the design log: each step with what it took,
-what it measured, and what did not work. `docs/gc.md` designs the
-collector (non-moving and generational, cells in 16-byte granules with a
-metadata byte each, conservative native roots, a card-marking barrier,
-concurrent marking of the old generation) and tracks its implementation,
-`docs/object-model.md` the object model and its escape analysis,
-`docs/direct-calls.md` the call convention, and `docs/sandbox.md` surveys
-heap sandboxing and defers it.
+The commit messages are the design log: each step with what it took and
+what it measured. `docs/gc.md` designs the collector (non-moving and
+generational, cells in 16-byte granules with a metadata byte each,
+conservative native roots, a card-marking barrier, concurrent marking of
+the old generation) and tracks its implementation, `docs/object-model.md`
+the object model and its escape analysis, `docs/sparse-arrays.md` sparse
+arrays and how their defaults were chosen, `docs/direct-calls.md` the
+call convention, `docs/arm64-targets.md` the stencils against handwritten
+arm64 code, `docs/octane-tiers.md` Octane in cloison's and V8's tiers over
+time, and `docs/sandbox.md` surveys heap sandboxing and defers it.
 
 ## Design choices
 
@@ -115,10 +131,12 @@ heap sandboxing and defers it.
   number printing make results match Node exactly, which makes
   differential testing against Node possible.
 - **Measured, not assumed.** Every change is checked against Octane and
-  the microbenchmarks; code size is tracked per commit, and
-  `docs/future-work.md` records what each step measured and what failed.
+  the microbenchmarks, and its commit message records what it measured;
+  code size (`bench/sizes.tsv`), Octane's memory (`bench/octane-memory.tsv`)
+  and its code sizes (`bench/octane-sizes.tsv`) are tracked per commit.
 - **Small and self-contained.** One Rust crate whose only dependency is
-  `libc`; a 3 MB binary that starts in 0.29 ms.
+  `libc`; a static 5.7 MB binary whose empty script runs in about 1 ms
+  more than `/bin/true` (Linux x86-64).
 
 ## Standards support
 
@@ -132,12 +150,12 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,794 | 17,067 | 98.4% |
-| ES2015 | 8,937 | 9,197 | 97.2% |
-| ES2016 | 97 | 100 | 97.0% |
+| ES5 (untagged) | 16,823 | 17,067 | 98.6% |
+| ES2015 | 8,982 | 9,197 | 97.7% |
+| ES2016 | 100 | 100 | 100.0% |
 | ES2017 | 699 | 741 | 94.3% |
-| ES2018 | 4,735 | 4,825 | 98.1% |
-| ES2019 | 159 | 161 | 98.8% |
+| ES2018 | 4,759 | 4,825 | 98.6% |
+| ES2019 | 161 | 161 | 100.0% |
 | ES2020 | 1,979 | 2,020 | 98.0% |
 | ES2021 | 617 | 630 | 97.9% |
 | ES2022 | 5,170 | 5,374 | 96.2% |
@@ -145,8 +163,8 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES2024 | 840 | 843 | 99.6% |
 | ES2025 | 980 | 998 | 98.2% |
 | ES2026 | 745 | 745 | 100.0% |
-| Stage 3 proposals | 5,625 | 5,650 | 99.6% |
-| **all** | **47,661** | **48,635** | **98.0%** |
+| Stage 3 proposals | 5,628 | 5,650 | 99.6% |
+| **all** | **47,767** | **48,635** | **98.2%** |
 
 The `Atomics` tests that need several agents run them as test262's
 `$262.agent` has them: each agent a thread with a VM of its own, sharing
@@ -162,15 +180,19 @@ has its own global object and intrinsics, which a call of another
 realm's function swaps in for the call (`src/realm.rs`). Until a second
 realm is made, nothing checks; after, the JIT is off.
 
-The gaps are mostly whole features: decorators, non-ASCII identifiers
-beyond a rough approximation (no Unicode ID tables), and early errors
-for invalid syntax that the parser accepts.
+The gaps are mostly whole features and early errors: decorators,
+non-ASCII identifiers beyond an approximation (Rust's `is_alphabetic`, not
+Unicode's ID_Start and ID_Continue), early errors for invalid syntax that
+the parser accepts (most of the failures left), `super` and private names
+in a direct `eval` in a class field's initializer, and part of Unicode's
+case folding in regexps (`/\u0390/ui` doesn't match `\u1fd3`).
 
 ## Results
 
 Octane scores at c842d29 on an Apple silicon Mac, cloison's JIT against V8 14.6
 capped at Sparkplug, at Maglev, and with all tiers (higher is better;
-from `perf-history/octane-engines.sh`):
+single runs from a local script, `perf-history/octane-engines.sh`, which the
+repository ignores):
 
 | benchmark | V8 | V8 Maglev | cloison | V8 Sparkplug |
 |---|---:|---:|---:|---:|
@@ -196,7 +218,7 @@ functions of CodeLoad's `eval`s when they are first called; cloison compiles
 every function of every `eval` up front.
 
 Against other engines and V8's tiers, on an Apple silicon Mac at c842d29
-(higher is better; single runs from `perf-history/octane-engines.sh`,
+(higher is better; single runs from the same local script,
 cloison's JIT against V8 14.6 capped at each tier and with all of them, the
 macOS 27 JavaScriptCore, SpiderMonkey 140 and QuickJS 2026-06-04; ARKTS
 is OpenHarmony's ARK JS runtime, `ark_js_vm` at ets_runtime cf2d2a08f, each
@@ -280,15 +302,21 @@ Inside a long DeltaBlue run the JIT is about 7x the interpreter and about 2.3x
 behind V8's Maglev tier.
 
 Code size is tracked per commit in `bench/sizes.tsv`: the release
-binary is about 3 MB, stencil code about 98 KB.
+binary's machine code is about 4.1 MB, stencil code about 170 KB (x86-64,
+at 52f4c0e).
 
 ## Testing
 
-Every test program runs through seven engine configurations (the
-interpreter, the JIT at each milestone, and tiered with tiny thresholds)
-and the results must agree; `bench/micro/` and `tests/octane/` carry
-Node's value as the reference. Several tests are mutation checks that
-fail when a specific conversion or undo piece is removed.
+The differential tests run each program in four engine configurations
+(the interpreter alone, and tiered up after 1, 2 and 1,000 loop back
+edges) and the results must agree: the JavaScript tests (`tests/js.rs`,
+291, which also verify the heap after each run), the bytecode ones
+(`tests/objects.rs`), the 112 programs of `bench/micro/` and the 33 of
+`tests/octane/`, which carry Node's value as the reference
+(`tests/interp.rs` tests the interpreter alone). Several tests are
+mutation checks that fail when a specific conversion or undo piece is
+removed. test262 runs with `scripts/test262-editions.py` (a
+checkout in `test262/`), which writes the table above.
 
 ```sh
 cargo test --release
@@ -311,21 +339,38 @@ size; `--record` appends cloison's to `bench/octane-sizes.tsv`.
 cloison and of those engines (`bench/octane-memory-engines.tsv`), and
 cloison's collections: pauses, the heap's peak against the most found
 live; `--record` appends cloison's to `bench/octane-memory.tsv`.
+`octane-tiers.sh` scores Octane in cloison's interpreter and JIT and in
+each of V8's tiers (`docs/octane-tiers.md`); `quiet.sh` runs a command
+pinned to the idlest core; `vs-v8.sh` times every micro against Node and
+`vs-maglev.sh` compares the machine code with Maglev's, function by
+function; `jit-profile.sh` profiles compiled code per stencil piece;
+`dispatch-asm.sh` disassembles the interpreter's handlers.
+`bench/sparse/sweep.sh` and `pareto.py` choose the sparse-array settings
+(`bench/sparse/README.md`).
 
-Environment flags: `CLOISON_NO_JIT`, `CLOISON_TIER=<back edges>`, `CLOISON_TIME`,
+Environment flags: `CLOISON_NO_JIT` (the interpreter alone),
+`CLOISON_NO_RX_JIT` (regexps interpreted), `CLOISON_WARM` (compile warm
+first), `CLOISON_TIER=<back edges>`, `CLOISON_TIME`,
 `CLOISON_JIT_TIME`, `CLOISON_SIZES` (functions, bytecode, machine code and
 compile time over the run; the collections: pauses, heap peak, live peak; and what the JIT keeps, by kind), `CLOISON_EXITS` (exits, entries and runtime calls by count),
-`CLOISON_JIT_DUMP`, `CLOISON_JIT_LOG`, `CLOISON_PERF_MAP` (names JIT code for `perf`),
+`CLOISON_JIT_DUMP` (`CLOISON_JIT_DUMP_FN=<name>` for one function),
+`CLOISON_JIT_LOG`, `CLOISON_KEYED` (keyed loads' shapes as compiled),
+`CLOISON_PERF_MAP` (names JIT code for `perf`),
 `CLOISON_NO_QUICKEN`, `CLOISON_COUNT`, `CLOISON_CODE_SHIFT`; for the collector,
 `CLOISON_GC_STATS` (each collection), `CLOISON_GC_FRAG` (blocks by occupancy and what could not move, after stop-the-world full collections), `CLOISON_GC_NURSERY` (MiB, fixed; else 8 to 32, grown on minor collections' share of the time),
-`CLOISON_HEAP_LIMIT` (MiB), `CLOISON_GC_VERIFY=<KiB>` (collect that often,
+`CLOISON_HEAP_LIMIT` (MiB), `CLOISON_GC_MIN_HOLE` (bytes; smaller holes wait
+for the next collection), `CLOISON_GC_ROOTS` (what each kind of root
+reaches), `CLOISON_GC_VERIFY=<KiB>` (collect that often,
 checking references and poisoning what is freed), `CLOISON_GC_STRESS`
 (collect at every safepoint), `CLOISON_GC_FULL` (every collection full),
 `CLOISON_GC_STW` (full collections stop the world, no marker thread),
 `CLOISON_GC_CYCLES` (major cycles back to back),
 `CLOISON_GC_THREADS` (threads a pause scans cards and traces with; 1 for none),
 `CLOISON_GC_CHECK_BARRIER` (find missed barriers), `CLOISON_HEAP_HIST` (cells by
-kind and size), `CLOISON_SEGV` (a backtrace on a crash). `gc-bench.sh` times
+kind and size), `CLOISON_SEGV` (a backtrace on a crash); for arrays,
+`CLOISON_ARRAY_DENSE_MIN`, `CLOISON_ARRAY_DENSE_BACK`, `CLOISON_ARRAY_WASTE`
+and `CLOISON_ARRAY_PREALLOC` (also read when building: see
+`docs/sparse-arrays.md`). `gc-bench.sh` times
 Octane's deterministic runs with their peak RSS. `gc-micro.sh` runs
 the collector's microbenchmarks in `bench/gc/`, which reproduce what it
 still does badly.
@@ -368,21 +413,27 @@ diffed between targets.
 
 - **The collector's pauses grow with the nursery's survivors**, though
   pauses trace and scan cards on several threads (up to 8 ms on
-  TypeScript, 4.5 ms on Splay; a second thread marks and sweeps the old
-  generation), Splay spends 12% of its time collecting, and it never
+  TypeScript and on Splay; a second thread marks and sweeps the old
+  generation), Splay spends 18% of its time in pauses, and it never
   moves a cell, so randomly dying cells fragment its blocks (Splay peaks
-  at 657 MB for 120 MB live).
+  at about 670 MB of RSS for 160 to 180 MB live). Measured on the Linux
+  host at 52f4c0e, deterministic runs.
 - **Language gaps.** Strict mode, `let`/`const`, classes, arrows,
   templates, destructuring, spread, symbols, iterators, generators,
   async functions and generators, `Reflect`, `Proxy`, BigInt, class
   fields, iterator helpers, `using` declarations and modules (top-level
-  `await`, `import()`, JSON modules) are in; non-ASCII identifiers (no Unicode ID tables)
-  and Unicode case folding in regexps are not.
+  `await`, `import()`, JSON modules) and arrays of any length up to
+  2^32 − 1, sparse ones too, are in; decorators, Unicode's identifier tables and part of its
+  case folding in regexps are not.
   See [Standards support](#standards-support) for test262 by edition;
-  Octane and about 100 programs are also checked against Node.
+  Octane and about 145 programs are also checked against Node.
 - **Nightly only**, and Linux is the reference; macOS runs on Apple silicon only.
-- **Safety.** Around 560 `unsafe` sites, a raw-pointer object model, no
-  fuzzing; a heap sandbox is deferred by design.
+- **Safety.** Around 1,200 `unsafe` blocks and functions, a raw-pointer
+  object model, and no heap sandbox (deferred by design). It is fuzzed
+  differentially (against V8, JavaScriptCore, SpiderMonkey and QuickJS,
+  across its own tiers and collector settings): 28 bugs so far, each fixed
+  with a regression test (wrong results, crashes, a collector bug that
+  gave objects a dead shape).
 - **Compile-time churn** on large programs: TypeScript, pdfjs and
   code-load slowed when more of their functions compiled, from
   recompiling as feedback changes. A cheaper baseline tier is the
@@ -394,13 +445,20 @@ diffed between targets.
 src/js/          lexer, parser, AST, bytecode generation
 src/bytecode.rs  the instruction set;  src/asm.rs  its text form
 src/interp.rs    the interpreter;  src/vm.rs  runtime, builtins' host
-src/object.rs    objects, shapes;  src/builtins.rs  the builtins
+src/object.rs    objects, shapes;  src/props.rs  properties;  src/builtins.rs  the builtins
+src/array.rs     Array's methods;  src/far.rs  sparse arrays' far store and density
 src/heap.rs      the heap;  src/gc.rs  the collector
 src/jit.rs       the JIT;  stencils/stencils.rs  its stencils;  build.rs  extraction
 src/regexp.rs    regular expressions;  src/math.rs  Math's transcendental functions (fdlibm)
+src/promise.rs   Promise;  src/generator.rs  generators;  src/module.rs  modules
+src/iterator.rs  iterator helpers;  src/collections.rs  Map, Set, weak ones;  src/dispose.rs  `using`
+src/typed.rs     ArrayBuffer, typed arrays;  src/shared.rs  SharedArrayBuffer, Atomics
+src/proxy.rs, src/reflect.rs, src/bigint.rs, src/date.rs, src/temporal/  as named
+src/realm.rs     realms;  src/shadow.rs  ShadowRealm;  src/agent.rs  test262's agents
 tests/           differential tests;  tests/octane/  feature scripts per benchmark
 bench/micro/     one pattern per file;  bench/bytecode/  handwritten bytecode
-docs/            design log and designs
+bench/gc/        the collector's microbenchmarks;  bench/sparse/  sparse-array workloads, sweep
+docs/            designs (the design log is the commit messages)
 ```
 
 ## License

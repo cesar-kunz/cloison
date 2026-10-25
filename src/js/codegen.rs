@@ -177,6 +177,7 @@ fn generate_from<'p>(
                     && !scopes.upvalues[i].iter().any(|n| n.contains('%'))
                     && scopes.upvalues[i].len() <= LAZY_UPVALUES
                     && f.params.len() < LOCAL_REGS
+                    && !in_held_params(p, i)
                 {
                     Emit::Stub
                 } else if f.free.is_some() {
@@ -370,6 +371,21 @@ fn boxed_lexicals<'a>(p: &'a Program, decls: &[Vec<&'a str>]) -> Vec<Vec<&'a str
                 .collect()
         })
         .collect()
+}
+
+/// Whether function `i` is made in the parameter list of a function holding
+/// parameters uninitialized (see `Function::tdz_params`): compiled on its
+/// own, lazily, it wouldn't check them.
+fn in_held_params(p: &Program, i: usize) -> bool {
+    let mut child = i;
+    while let Some(k) = p.functions[child].parent {
+        let f = &p.functions[k];
+        if !f.tdz_params.is_empty() && f.param_ends.last().is_some_and(|&end| p.functions[child].pos < end) {
+            return true;
+        }
+        child = k;
+    }
+    false
 }
 
 /// Whether one of function `i`'s upvalues is an enclosing function's boxed
@@ -1561,6 +1577,9 @@ struct Gen<'a> {
     /// Compiling its parameters' defaults (a direct `eval` there may not
     /// declare `arguments`).
     in_params: bool,
+    /// It or an enclosing function holds parameters uninitialized (see
+    /// [`Gen::param_tdz`]).
+    param_tdz_near: bool,
 }
 
 /// A `try` being compiled: the bytecode ranges it covers (closed around
@@ -1661,8 +1680,64 @@ impl<'a> Gen<'a> {
             fresh: Vec::new(),
             entering: false,
             in_params: false,
+            param_tdz_near: {
+                let mut j = Some(index);
+                std::iter::from_fn(|| {
+                    let k = j?;
+                    j = p.functions[k].parent;
+                    Some(k)
+                })
+                .any(|k| !p.functions[k].tdz_params.is_empty())
+            },
             trys: Vec::new(),
         }
+    }
+
+    /// Before its parameters' statements: those of `tdz_params` held
+    /// uninitialized (a hole) until their turn, a parameter's argument kept
+    /// in a register meanwhile: `(name, parameter, register)` for each.
+    fn hold_params(&mut self) -> R<Vec<(&'a str, usize, u8)>> {
+        let f = self.f;
+        let mut held = Vec::new();
+        for (n, j) in &f.tdz_params {
+            if f.params[*j] == *n {
+                let r = self.alloc(f.pos)?;
+                self.load_raw(n, f.pos)?;
+                self.star(r);
+                held.push((&**n, *j, r));
+            }
+            self.emit(Op::LdaHole, &[]);
+            self.init_var(n, f.pos)?;
+        }
+        Ok(held)
+    }
+
+    /// The held parameters before parameter `upto` initialized to their
+    /// arguments (those with no default, whose turn passed).
+    fn release_params(&mut self, held: &mut Vec<(&'a str, usize, u8)>, upto: usize) -> R<()> {
+        for &(n, _, r) in held.iter().filter(|&&(_, j, _)| j < upto) {
+            self.ldar(r);
+            self.init_var(n, self.f.pos)?;
+        }
+        held.retain(|&(_, j, _)| j >= upto);
+        Ok(())
+    }
+
+    /// A held parameter's default (`if (p === void 0) p = e;`): its
+    /// argument in `r`, the default evaluated with it still uninitialized.
+    fn held_default(&mut self, n: &str, r: u8, e: &'a Expr, pos: Pos) -> R<()> {
+        let (given, end) = (self.label(), self.label());
+        self.ldar(r);
+        self.emit(Op::TestUndefined, &[]);
+        self.jump_if(Jmp::False, given);
+        self.value(e)?;
+        self.init_var(n, pos)?;
+        self.jump(end);
+        self.bind(given);
+        self.ldar(r);
+        self.init_var(n, pos)?;
+        self.bind(end);
+        Ok(())
     }
 
     fn function(mut self) -> R<FunctionDef> {
@@ -1878,13 +1953,36 @@ impl<'a> Gen<'a> {
             // A generator starts once its parameters are set; an async
             // function before (what they throw rejects its promise).
             let start = if self.f.is_async && !self.f.generator { 0 } else { self.f.param_stmts };
+            let mut held = Vec::new();
             for (k, s) in body.iter().enumerate() {
                 if (self.f.generator || self.f.is_async) && k == start {
                     self.initial_yield()?;
                 }
                 // (Its parameters' defaults first: see `Gen::in_params`.)
                 self.in_params = k < self.f.param_stmts;
+                if self.in_params && !self.f.tdz_params.is_empty() {
+                    if k == 0 {
+                        held = self.hold_params()?;
+                    }
+                    // (A statement is its parameter's: the first ending past it.)
+                    let j = self.f.param_ends.partition_point(|&end| end <= s.pos);
+                    self.release_params(&mut held, j)?;
+                    if let Some(&(n, _, r)) = held.iter().find(|&&(_, i, _)| i == j)
+                        && let StmtKind::If(_, then, None) = &s.kind
+                        && let StmtKind::Expr(Expr { kind: ExprKind::Assign(None, _, e), .. }) = &then.kind
+                    {
+                        held.retain(|&(_, i, _)| i != j);
+                        self.held_default(n, r, e, s.pos)?;
+                        continue;
+                    }
+                }
+                if k == self.f.param_stmts && !held.is_empty() {
+                    self.release_params(&mut held, usize::MAX)?;
+                }
                 self.stmt(s)?;
+            }
+            if !held.is_empty() {
+                self.release_params(&mut held, usize::MAX)?;
             }
             if (self.f.generator || self.f.is_async) && body.len() <= start {
                 self.initial_yield()?;
@@ -2996,6 +3094,17 @@ impl<'a> Gen<'a> {
         Ok(end)
     }
 
+    /// Property `name` of the `with` object or scope object in `r`, into
+    /// the accumulator: a scope object's binding not initialized yet (a
+    /// parameter held by `Gen::hold_params`) a ReferenceError.
+    fn with_get(&mut self, r: u8, name: &str) {
+        self.named(Op::GetNamed, r, original(name));
+        if self.found_scope {
+            let k = self.const_str(original(name));
+            self.emit(Op::CheckHole, &[Arg::Index(k)]);
+        }
+    }
+
     /// `name` inside `with` statements, into the accumulator (`typeof`:
     /// for `typeof name`, where an undeclared global is `undefined`).
     fn with_load(&mut self, name: &str, pos: Pos, type_of: bool) -> R<()> {
@@ -3003,7 +3112,7 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.named(Op::GetNamed, r, original(name));
+                g.with_get(r, name);
                 Ok(())
             },
             &mut |g| {
@@ -3120,7 +3229,7 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.named(Op::GetNamed, r, original(name));
+                g.with_get(r, name);
                 apply(g)?;
                 if g.f.strict {
                     // (Strict code: the property gone meanwhile is an error.)
@@ -3204,7 +3313,7 @@ impl<'a> Gen<'a> {
             name,
             pos,
             &mut |g, r| {
-                g.named(Op::GetNamed, r, original(name));
+                g.with_get(r, name);
                 g.star(c);
                 g.mov(r, w);
                 g.emit(Op::LdaTrue, &[]);
@@ -3317,6 +3426,14 @@ impl<'a> Gen<'a> {
                 self.ldar(v);
                 self.temp = mark;
             }
+        } else if self.param_tdz_near && self.param_tdz(name, pos) {
+            // (A parameter not yet initialized: see `Gen::param_tdz`.)
+            let mark = self.temp;
+            let v = self.alloc(pos)?;
+            self.star(v);
+            self.load_var(name, pos)?;
+            self.ldar(v);
+            self.temp = mark;
         }
         self.store_raw(name, pos)
     }
@@ -3524,7 +3641,7 @@ impl<'a> Gen<'a> {
             self.emit(Op::CheckHole, &[Arg::Index(k)]);
         }
         if self.needs_check(n, pos) {
-            let k = self.const_str(&self.p.lexicals[n].original.clone());
+            let k = self.const_str(&self.p.lexicals.get(n).map_or(n.into(), |l| l.original.clone()));
             self.emit(Op::CheckHole, &[Arg::Index(k)]);
         }
         if let Some(imp) = self.p.imports.get(n).filter(|imp| imp.prop.is_some()) {
@@ -3539,6 +3656,9 @@ impl<'a> Gen<'a> {
     /// from a function that may run before it (a declaration, or one made
     /// before it), or in a `switch` (which may jump past it).
     fn needs_check(&self, name: &str, pos: Pos) -> bool {
+        if self.param_tdz_near && self.param_tdz(name, pos) {
+            return true;
+        }
         if self.p.lexicals.is_empty() {
             return false;
         }
@@ -3555,6 +3675,26 @@ impl<'a> Gen<'a> {
             return pos < l.end;
         }
         self.f.declaration || self.f.pos < l.end
+    }
+
+    /// Whether a reference to `name` at `pos` may find a parameter not yet
+    /// initialized (see `Function::tdz_params`): in the function's own
+    /// parameter list, before that parameter's end; from a function made
+    /// in one (which may run before), always.
+    fn param_tdz(&self, name: &str, pos: Pos) -> bool {
+        let fs = &self.p.functions;
+        let tdz = |k: usize| fs[k].tdz_params.iter().find(|(n, _)| &**n == name).map(|&(_, j)| j);
+        if self.decls[self.index].contains(&name) {
+            return self.in_params && tdz(self.index).is_some_and(|j| pos < self.f.param_ends[j]);
+        }
+        let mut child = self.index;
+        while let Some(k) = fs[child].parent {
+            if self.decls[k].contains(&name) {
+                return tdz(k).is_some() && fs[k].param_ends.last().is_some_and(|&end| fs[child].pos < end);
+            }
+            child = k;
+        }
+        false
     }
 
     fn load_raw(&mut self, n: &str, pos: Pos) -> R<()> {
@@ -4291,7 +4431,7 @@ impl<'a> Gen<'a> {
                     n,
                     pos,
                     &mut |g, r| {
-                        g.named(Op::GetNamed, r, original(n));
+                        g.with_get(r, n);
                         step(g);
                         if g.f.strict {
                             // (Strict code: the property gone meanwhile is an

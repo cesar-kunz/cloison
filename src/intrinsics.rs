@@ -954,17 +954,22 @@ fn with_set_strict(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(a[2])
 }
 
-/// How generator `[g]` was resumed (`generator::NEXT`…).
+/// How generator `[g]` was resumed (`generator::NEXT`…); a mode given
+/// for `g` is itself (`yield*`'s before its first resumption).
 fn generator_mode(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if a[0].is_number() {
+        return Ok(a[0]);
+    }
     Ok(crate::generator::mode(vm, a[0]))
 }
 
-/// `yield*`'s step: `[iterator, received, generator]`, the inner
-/// iterator's `next`, `throw` or `return` called as the generator was
-/// resumed: its result object.
+/// `yield*`'s step: `[iterator, received, mode]`, the inner iterator's
+/// `next`, `throw` or `return` called as the generator was resumed at the
+/// `yield*`: `mode` is `next` for the first step, then the generator,
+/// whose mode is read only here (no call per step to fetch it).
 fn delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let mode = crate::generator::mode(vm, a[2]).as_number().unwrap_or(0.0) as i32;
-    delegate_call(vm, a[0], a[1], mode)
+    let mode = generator_mode(vm, &a[2..])?;
+    delegate_call(vm, a[0], a[1], mode.as_number().unwrap_or(0.0) as i32)
 }
 
 /// An async generator's `yield*` step: `[iterator, received, mode]`, the

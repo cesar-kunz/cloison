@@ -5264,16 +5264,20 @@ impl<'a> Gen<'a> {
             return unsupported(pos, "a generator with this many variables");
         };
         let mark = self.temp;
-        // `[iterator, received, gen]` for `delegate_step`.
+        // `[iterator, received, mode]` for `delegate_step`: the first step a
+        // `next`, whatever the generator last resumed with before this
+        // `yield*` (a `throw()` caught, a `return()` running a `finally`),
+        // then the generator, whose mode is that of its resumption here.
         let it = self.alloc(pos)?;
+        let received = self.alloc(pos)?;
+        let mode = self.alloc(pos)?;
         self.into(x, it)?;
         self.intrinsic("get_iterator", it, 1);
         self.star(it);
-        let received = self.alloc(pos)?;
         self.emit(Op::LdaUndefined, &[]);
         self.star(received);
-        let gr = self.alloc(pos)?;
-        self.mov(g, gr);
+        self.lda_smi(0);
+        self.star(mode);
         let result = self.alloc(pos)?;
         let (top, done) = (self.loop_label(), self.label());
         self.bind(top);
@@ -5286,6 +5290,7 @@ impl<'a> Gen<'a> {
         self.acc = Acc::default();
         self.reachable = true;
         self.star(received);
+        self.mov(g, mode);
         self.jump(top);
         self.bind(done);
         // (A `return()` passed on: the generator returns the value.)
@@ -5293,7 +5298,7 @@ impl<'a> Gen<'a> {
         self.named(Op::GetNamed, result, "value");
         self.star(v);
         let (ret, end) = (self.label(), self.label());
-        self.intrinsic("generator_mode", g, 1);
+        self.intrinsic("generator_mode", mode, 1);
         self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), ret);
         self.jump(end);
         self.bind(ret);

@@ -175,8 +175,8 @@ pub struct Module {
     pub functions: Vec<FunctionDef>,
     /// Index of the top-level code in `functions`.
     pub script: usize,
-    /// The script's `var` and function names: globals that exist (as
-    /// `undefined`) before it assigns them (see `Vm::get_global_miss`).
+    /// The script's `var` and function names: globals made (`undefined`)
+    /// before it runs (see `Vm::global_declarations`).
     pub declared: Vec<String>,
     /// Which of `declared` are functions' (declarations at its top level).
     pub function_names: Vec<String>,

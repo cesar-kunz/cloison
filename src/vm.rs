@@ -2904,11 +2904,8 @@ impl Vm {
         let (_, name) = code.ic(ic);
         let g = self.global;
         if self.lookup(g, name).is_none() {
-            // A script's `var` not assigned yet (`cloison` makes the global on
-            // its first store, keeping its field's type): `undefined`.
-            if self.declared.contains(&name) {
-                return Ok(Value::UNDEFINED);
-            }
+            // (A script's `var`s are made before it runs: see
+            // `global_declarations`.)
             return Err(Error::reference_error(format!(
                 "{} is not defined",
                 self.atom_name(name)
@@ -3200,8 +3197,7 @@ impl Vm {
     /// made mutable (they no longer describe `o`'s), and its shape left
     /// stable.
     /// `delete name` of a global: false for a script's `var` or function
-    /// not assigned yet too (it exists, not deletable: see
-    /// `Module::declared`).
+    /// (made before it runs, not deletable: see `global_declarations`).
     pub(crate) fn delete_global(&mut self, name: Atom) -> bool {
         let g = self.global;
         if unsafe { (*(*g).shape).lookup(name).is_none() } && self.script_declared.contains(&name) {
@@ -4728,10 +4724,11 @@ impl Vm {
 
     /// GlobalDeclarationInstantiation's (or an eval's, `eval`) checks for
     /// a script's `var`s and functions, a `TypeError` where the global
-    /// object can't take one; and a function's global made a writable,
+    /// object can't take one; a function's global made a writable,
     /// enumerable data property (configurable only by an eval) if it was a
-    /// configurable property already. (Others are made when assigned:
-    /// see `Module::declared`.)
+    /// configurable property already; and the globals the script declares
+    /// that don't exist yet made, functions' then `var`s' (see
+    /// [`Vm::declare_global`]).
     pub(crate) fn global_declarations(&mut self, module: &Module, eval: bool) -> Result<()> {
         let g = self.global;
         let extensible = Self::is_extensible(g);
@@ -4775,7 +4772,46 @@ impl Vm {
                 self.define_own_property(g, Key::Name(a), &d)?;
             }
         }
+        if extensible {
+            let attrs = if eval { 0 } else { DONT_DELETE };
+            let functions = module.function_names.iter();
+            let vars = module.declared.iter().filter(|n| !module.function_names.contains(n));
+            for n in functions.chain(vars) {
+                let a = self.intern(n);
+                if unsafe { (*(*g).shape).lookup(a).is_none() } {
+                    self.declare_global(a, attrs);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Global `name` made `undefined` before the script declaring it runs,
+    /// its field left as though nothing were stored yet: its first store
+    /// sets the field's type and constant value, as when the store made
+    /// the global (an int, not `undefined`, for compiled code to read; see
+    /// `FieldCell`), and compiled code folds no `undefined`.
+    fn declare_global(&mut self, name: Atom, attrs: u8) {
+        let g = self.global;
+        unsafe {
+            let new = self.transition_with((*g).shape, name, attrs);
+            let ns = &*new;
+            let slot = ns.keys().len() as u32 - 1;
+            if slot >= ns.capacity.get() {
+                self.reserve_props(g, slot - ns.capacity.get());
+            }
+            crate::object::set_shape(g, new);
+            if (*ns.fields()[slot as usize]).get() == FieldType::None {
+                *Object::slot(g, ns.location(slot)) = Value::UNDEFINED;
+            } else {
+                // (A field another global's shape typed: a realm's.)
+                self.store_field(g, slot, Value::UNDEFINED);
+            }
+            if (*g).flags & PROTOTYPE != 0 {
+                self.proto_epoch = self.proto_epoch.wrapping_add(1);
+                self.bump_code_epoch();
+            }
+        }
     }
 
     /// Load `module`'s functions; returns its top-level code.

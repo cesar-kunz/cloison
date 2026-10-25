@@ -1005,8 +1005,9 @@ fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     crate::interp::run_script_at(vm, code)
 }
 
-/// `$262.gc()`: nothing (collections happen on their own).
-fn host_gc(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+/// `$262.gc()`: a full collection now (`Vm::collect_full_now`).
+fn host_gc(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    vm.collect_full_now();
     Ok(Value::UNDEFINED)
 }
 

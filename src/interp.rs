@@ -3770,6 +3770,19 @@ unsafe fn set_header<T>(regs: *mut Value, slot: usize, p: *const T) {
     unsafe { *regs.sub(slot) = Value::from_bits(p as u64) }
 }
 
+/// A new frame's tier-up slots, written only when it leaves to tier up:
+/// otherwise what an earlier frame left at their addresses, which the
+/// collector, marking the VM stack word by word, took for live (a removed
+/// Splay node there, never overwritten without the JIT, kept every node
+/// removed since through their links: 1.85 GB).
+#[inline(always)]
+unsafe fn clear_osr(regs: *mut Value) {
+    unsafe {
+        *regs.sub(OSR_PC) = Value::from_bits(0);
+        *regs.sub(OSR_ACC) = Value::from_bits(0);
+    }
+}
+
 #[inline(always)]
 unsafe fn frame_vm(regs: *mut Value) -> *mut Vm {
     unsafe { header(regs, VM) }
@@ -4157,6 +4170,7 @@ unsafe fn push_frame(
             return std::ptr::null_mut();
         }
         *new.sub(BUDGET) = Value::from_bits((*callee).loop_budget.get() as u64);
+        clear_osr(new);
         set_header(new, CODE, callee);
         set_header(new, ICS, (*callee).ics().as_ptr());
         set_header(new, VM, vm);
@@ -4389,6 +4403,7 @@ pub unsafe fn run_script(vm: &mut Vm, code: *const Code) -> Result<Value, Error>
         // (Its own: none if it must stay interpreted, as with exception
         // handlers.)
         *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
+        clear_osr(regs);
         set_header(regs, CODE, code);
         set_header(regs, ICS, (*code).ics().as_ptr());
         set_header(regs, VM, vm as *mut Vm);
@@ -4590,6 +4605,7 @@ pub(crate) unsafe fn write_frame_header(
 ) {
     unsafe {
         *regs.sub(BUDGET) = Value::from_bits((*code).loop_budget.get() as u64);
+        clear_osr(regs);
         set_header(regs, CODE, code);
         set_header(regs, ICS, (*code).ics().as_ptr());
         set_header(regs, VM, vm as *const Vm);

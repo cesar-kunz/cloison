@@ -1332,6 +1332,26 @@ impl Vm {
         }
     }
 
+    /// A full collection now (`$262.gc()`): a concurrent cycle under way
+    /// finished first, then a stop-the-world one and its sweep, so what
+    /// died is free, and beyond the room kept, given back to the system.
+    /// From a native: the running frame's registers are found through the
+    /// native stack, as at a native's safepoint.
+    pub(crate) fn collect_full_now(&mut self) {
+        if self.heap.gc.stack_base == 0 {
+            return;
+        }
+        let vm: *mut Vm = self;
+        if self.heap.gc.marking {
+            with_registers_spilled(&mut |sp| unsafe {
+                (*vm).collect_from(sp, std::ptr::null_mut(), Collection::Final)
+            });
+        }
+        self.heap.finish_sweep();
+        with_registers_spilled(&mut |sp| unsafe { (*vm).collect_from(sp, std::ptr::null_mut(), Collection::Full) });
+        self.heap.finish_sweep();
+    }
+
     #[cold]
     #[inline(never)]
     fn collect(&mut self, regs: *mut Value) {

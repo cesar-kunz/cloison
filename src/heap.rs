@@ -259,6 +259,9 @@ pub struct Heap {
     /// Bytes handed out since the last collection, and blocks in use.
     since: usize,
     used: usize,
+    /// Bytes cells took since the last collection (`gc::ALLOCATED`): the
+    /// regions' and large cells', not the holes' room left unused.
+    filled: usize,
     /// Bytes handed out after which the next collection is requested.
     pub(crate) budget: usize,
     /// A collection is due at the next safepoint (`Vm::safepoint`); the
@@ -328,6 +331,7 @@ impl Heap {
             room: Vec::new(),
             since: 0,
             used: 0,
+            filled: 0,
         };
         // The header block, and the current color in it.
         let b = heap.fresh_blocks(1);
@@ -553,6 +557,11 @@ impl Heap {
         self.since
     }
 
+    /// Bytes cells took since the last call (regions ended so far).
+    pub(crate) fn take_filled(&mut self) -> usize {
+        std::mem::take(&mut self.filled)
+    }
+
     /// Where cells may be: from the block after the header to the end of
     /// the last handed out.
     pub(crate) fn cells_range(&self) -> (usize, usize) {
@@ -712,6 +721,7 @@ impl Heap {
     pub(crate) fn end_region(&mut self) {
         if self.ptr > self.hole {
             self.regions.push((self.hole as usize, self.ptr as usize));
+            self.filled += self.ptr as usize - self.hole as usize;
         }
         self.hole = self.ptr;
     }
@@ -727,6 +737,7 @@ impl Heap {
         }
         let p = self.block_addr(b);
         self.regions.push((p as usize, p as usize + bytes));
+        self.filled += bytes;
         self.since += n * BLOCK;
         self.used += n * BLOCK;
         if self.since >= self.budget {

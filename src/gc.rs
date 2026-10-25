@@ -355,13 +355,17 @@ static CODE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::
 /// minor and full (a concurrent full collection's two pauses count as one
 /// full), their nanoseconds and the longest; the bytes of blocks in use at
 /// the start of a collection (where the heap peaks), and the most a full
-/// collection found live.
+/// collection found live; the bytes allocated before a collection (not
+/// those after the last), and those minor collections (and a cycle's start
+/// pause) found live, old from then on.
 pub static MINORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PAUSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MAX_PAUSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static HEAP_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LIVE_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ALLOCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PROMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The least code taken (see `Gc::code_room`) that starts a full
 /// collection.
@@ -1569,6 +1573,10 @@ impl Vm {
             self.heap.gc.last_end = Some(end);
             PAUSE_NS.fetch_add(ns, Relaxed);
             MAX_PAUSE_NS.fetch_max(ns, Relaxed);
+            ALLOCATED.fetch_add(self.heap.take_filled() as u64, Relaxed);
+            if !full {
+                PROMOTED.fetch_add(traced as u64, Relaxed);
+            }
             match kind {
                 Collection::Minor | Collection::MinorShade => MINORS.fetch_add(1, Relaxed),
                 Collection::Full | Collection::Final => FULLS.fetch_add(1, Relaxed),

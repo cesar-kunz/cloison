@@ -1,0 +1,110 @@
+cloison	empty {}	bytes	54.0
+cloison	empty {}	bytes_at_2n	60.0
+v8	empty {}	bytes	28.9
+v8	empty {}	bytes_at_2n	39.7
+jsc	empty {}	bytes	79.2
+jsc	empty {}	bytes_at_2n	83.5
+sm	empty {}	bytes	57.7
+sm	empty {}	bytes_at_2n	57.4
+cloison	{a,b,c} literal	bytes	108.9
+cloison	{a,b,c} literal	bytes_at_2n	102.6
+v8	{a,b,c} literal	bytes	44.1
+v8	{a,b,c} literal	bytes_at_2n	44.5
+jsc	{a,b,c} literal	bytes	62.7
+jsc	{a,b,c} literal	bytes_at_2n	66.2
+sm	{a,b,c} literal	bytes	57.7
+sm	{a,b,c} literal	bytes_at_2n	57.4
+cloison	ctor, 3 fields	bytes	103.3
+cloison	ctor, 3 fields	bytes_at_2n	100.6
+v8	ctor, 3 fields	bytes	33.0
+v8	ctor, 3 fields	bytes_at_2n	39.6
+jsc	ctor, 3 fields	bytes	57.6
+jsc	ctor, 3 fields	bytes_at_2n	66.2
+sm	ctor, 3 fields	bytes	57.7
+sm	ctor, 3 fields	bytes_at_2n	57.5
+cloison	{10 props} literal	bytes	146.3
+cloison	{10 props} literal	bytes_at_2n	147.6
+v8	{10 props} literal	bytes	50.9
+v8	{10 props} literal	bytes_at_2n	73.6
+jsc	{10 props} literal	bytes	130.3
+jsc	{10 props} literal	bytes_at_2n	133.9
+sm	{10 props} literal	bytes	126.0
+sm	{10 props} literal	bytes_at_2n	125.7
+cloison	array [i,i,i]	bytes	104.3
+cloison	array [i,i,i]	bytes_at_2n	100.4
+v8	array [i,i,i]	bytes	40.3
+v8	array [i,i,i]	bytes_at_2n	59.2
+jsc	array [i,i,i]	bytes	66.0
+jsc	array [i,i,i]	bytes_at_2n	69.1
+sm	array [i,i,i]	bytes	74.2
+sm	array [i,i,i]	bytes_at_2n	73.9
+cloison	array of 3 doubles	bytes	104.5
+cloison	array of 3 doubles	bytes_at_2n	101.3
+v8	array of 3 doubles	bytes	51.0
+v8	array of 3 doubles	bytes_at_2n	71.3
+jsc	array of 3 doubles	bytes	67.1
+jsc	array of 3 doubles	bytes_at_2n	67.8
+sm	array of 3 doubles	bytes	74.2
+sm	array of 3 doubles	bytes_at_2n	73.9
+cloison	closure	bytes	224.5
+cloison	closure	bytes_at_2n	222.6
+v8	closure	bytes	52.2
+v8	closure	bytes_at_2n	72.9
+jsc	closure	bytes	103.2
+jsc	closure	bytes_at_2n	102.3
+sm	closure	bytes	115.5
+sm	closure	bytes_at_2n	115.3
+cloison	string, 16 chars	bytes	196.8
+cloison	string, 16 chars	bytes_at_2n	199.1
+v8	string, 16 chars	bytes	43.1
+v8	string, 16 chars	bytes_at_2n	62.7
+jsc	string, 16 chars	bytes	98.1
+jsc	string, 16 chars	bytes_at_2n	102.4
+sm	string, 16 chars	bytes	24.5
+sm	string, 16 chars	bytes_at_2n	27.6
+cloison	heap double	bytes	0.0
+cloison	heap double	bytes_at_2n	0.1
+v8	heap double	bytes	4.2
+v8	heap double	bytes_at_2n	8.7
+jsc	heap double	bytes	0.4
+jsc	heap double	bytes_at_2n	0.1
+sm	heap double	bytes	0.0
+sm	heap double	bytes_at_2n	-0.2
+cloison	Map entry	bytes	110.8
+cloison	Map entry	bytes_at_2n	106.4
+v8	Map entry	bytes	14.6
+v8	Map entry	bytes_at_2n	15.5
+jsc	Map entry	bytes	109.0
+jsc	Map entry	bytes_at_2n	107.5
+sm	Map entry	bytes	28.2
+sm	Map entry	bytes_at_2n	29.5
+cloison	array element (int)	bytes	16.8
+cloison	array element (int)	bytes_at_2n	17.1
+v8	array element (int)	bytes	12.8
+v8	array element (int)	bytes_at_2n	15.9
+jsc	array element (int)	bytes	39.7
+jsc	array element (int)	bytes_at_2n	31.3
+sm	array element (int)	bytes	8.0
+sm	array element (int)	bytes_at_2n	8.9
+qjs	empty {}	bytes	120.0
+qjs	empty {}	bytes_at_2n	120.0
+qjs	{a,b,c} literal	bytes	136.0
+qjs	{a,b,c} literal	bytes_at_2n	136.0
+qjs	ctor, 3 fields	bytes	136.0
+qjs	ctor, 3 fields	bytes_at_2n	136.0
+qjs	{10 props} literal	bytes	304.0
+qjs	{10 props} literal	bytes_at_2n	304.0
+qjs	array [i,i,i]	bytes	160.0
+qjs	array [i,i,i]	bytes_at_2n	160.0
+qjs	array of 3 doubles	bytes	160.0
+qjs	array of 3 doubles	bytes_at_2n	160.0
+qjs	closure	bytes	208.0
+qjs	closure	bytes_at_2n	208.0
+qjs	string, 16 chars	bytes	56.0
+qjs	string, 16 chars	bytes_at_2n	56.0
+qjs	heap double	bytes	0.0
+qjs	heap double	bytes_at_2n	0.0
+qjs	Map entry	bytes	96.4
+qjs	Map entry	bytes_at_2n	96.4
+qjs	array element (int)	bytes	11.2
+qjs	array element (int)	bytes_at_2n	16.8

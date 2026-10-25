@@ -4,8 +4,9 @@ slope between them (fixed costs and heap rounding cancel) is the figure.
 Appends to m3.tsv: engine, kind, metric, value."""
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from probe import run_probe
-from eng import ENGINES, OUT
+import re
+from probe import run_probe, prelude
+from eng import ENGINES, OUT, TMP, run
 KINDS = {
     "empty {}": "{}",
     "{a,b,c} literal": "{a: i, b: i, c: i}",
@@ -50,6 +51,29 @@ print(keep.length);
 """
 
 
+def qjs_allocated(src):
+    """QuickJS's own count of the bytes malloc holds for it (`-d`, at exit):
+    its allocator reuses what the holder's growth freed, which RSS misses."""
+    f = f"{TMP}/m3-qjs.mjs"
+    open(f, "w").write(prelude("qjs").replace("print(\"@\" + name); spin(", "(") + src)
+    r = run("qjs", f, args=["-d"], timeout=600)
+    return int(re.search(r"memory allocated\s+\d+\s+(\d+)", r.stdout + r.stderr).group(1))
+
+
+def qjs_bytes(k, n):
+    """Per object: N of them less the holder alone (its N zeros)."""
+    holder = body("array element (int)", n) if k == "array element (int)" else body(k, n).replace(
+        f"keep[i] = {KINDS[k]};", "keep[i] = 0;") if KINDS[k] else None
+    full = qjs_allocated(body(k, n))
+    if k == "Map entry":
+        empty = qjs_allocated(body(k, n).replace("m.set(i, i);", ""))
+    elif k == "array element (int)":
+        empty = qjs_allocated(body(k, n).replace("a.push(i);", ""))
+    else:
+        empty = qjs_allocated(holder)
+    return full - empty
+
+
 if __name__ == "__main__":
     engines = sys.argv[1].split(",") if len(sys.argv) > 1 else ["cloison", "v8", "jsc", "sm", "qjs"]
     kinds = sys.argv[2:] or list(KINDS)
@@ -60,6 +84,9 @@ if __name__ == "__main__":
         for e in engines:
             d = {}
             for n in (N, 2 * N):
+                if e == "qjs":
+                    d[n] = qjs_bytes(k, n)
+                    continue
                 marks, lines = run_probe(e, body(k, n))
                 if "base" in marks and "full" in marks and marks["base"] and marks["full"]:
                     d[n] = (marks["full"] - marks["base"]) * 1024

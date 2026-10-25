@@ -404,6 +404,76 @@ collection). JavaScriptCore's promotion is what an Eden collection leaves
 above the heap the last one left (it moves nothing); its large heap makes
 few collections.
 
+Bytes an object takes, from the RSS of a million of them kept alive less
+that of their holder alone, after full collections (the slope between 500
+thousand and a million; QuickJS's from its own count of what malloc holds,
+`-d`, slack included, its allocator reusing what RSS can't see):
+
+| object | cloison | V8 | JSC | SpiderMonkey | QuickJS |
+|---|---:|---:|---:|---:|---:|
+| `{}` | 54 | 29 | 79 | 58 | 120 |
+| `{a, b, c}` | 109 | 44 | 63 | 58 | 136 |
+| `new P(x)`, 3 fields | 103 | 33 | 58 | 58 | 136 |
+| 10 properties | 146 | 51 | 130 | 126 | 304 |
+| `[i, i, i]` | 104 | 40 | 66 | 74 | 160 |
+| 3 doubles in an array | 104 | 51 | 67 | 74 | 160 |
+| a closure | 224 | 52 | 103 | 116 | 208 |
+| a 16-character string (concatenated) | 197 | 43 | 98 | 24 | 56 |
+| a double | 0 | 4 | 0 | 0 | 0 |
+| a `Map` entry | 111 | 15 | 109 | 28 | 96 |
+| an array element (pushed) | 17 | 13 | 40 | 8 | 11 |
+
+cloison's objects are 2 to 4 times V8's (which compresses pointers to 4
+bytes): every object starts with a 48-byte header (shape, class, property
+and element storage and their sizes, code), every value is 8 bytes, a
+string keeps its UTF-16 or rope halves behind such a header, and a closure
+its upvalues as cells of their own. NaN-boxing (cloison, JavaScriptCore,
+SpiderMonkey) and QuickJS's 16-byte values keep a double unboxed.
+
+Compiling, over the 15 benchmarks: loading a script (its source in a
+function never called: the parse, lazy for inner functions in every
+engine, and what is compiled eagerly; instructions and CPU time over an
+empty script's, per MB of source), the JIT's compile time and its
+deoptimizations over the fixed work, each engine by its own flags (cloison
+`CLOISON_SIZES` and the exits `CLOISON_EXITS` counts, V8 `--trace-opt` for
+Maglev and Turbofan, not Sparkplug, and `--trace-deopt`, JavaScriptCore
+`--reportTotalCompileTimes` and `--printEachOSRExit`; a release
+SpiderMonkey shell traces neither):
+
+| | cloison | V8 | JSC | SpiderMonkey | QuickJS |
+|---|---:|---:|---:|---:|---:|
+| loading, ms per MB (geomean) | 42.0 | 6.6 | 6.8 | 11.3 | 58.7 |
+| loading, million instructions per MB | 260 | 84 | 54 | 87 | 551 |
+| JIT compile ms per benchmark (geomean) | **60** | 182 | 174 | — | — |
+| JIT compile ms, all 15 | 2,310 | 5,454 | 4,259 | — | — |
+| deoptimizations, all 15 | 38,313 | 932 | 47,185 | — | — |
+
+Copying stencils compiles in a third of the time of V8's and
+JavaScriptCore's optimizing tiers; parsing and compiling to bytecode is 6
+times slower than theirs. Most of cloison's exits are TypeScript's (28,186)
+and Box2D's (5,743).
+
+And what scripts probe (`probes.py`):
+
+| | cloison | V8 | JSC | SpiderMonkey | QuickJS |
+|---|---:|---:|---:|---:|---:|
+| RSS holding 400 MB of small arrays, MB | 426 | 228 | 475 | 390 | 791 |
+| RSS once dropped and collected, MB | 426 | 242 | 464 | 375 | 791 |
+| 0.5 s later | 426 | 243 | 53 | 374 | 791 |
+| 2 s later | 426 | 243 | 52 | 25 | 791 |
+| deepest recursion, default stack | 18,727 | 17,205 | 67,979 | 13,293 | 536 |
+| longest string (doubled), characters | 2^30 | 2^28 | 2^30 | 2^29 | 2^29 |
+| a new realm: µs | 823 | 388 | 103 | 428 | — |
+| a new realm: KB | 710 | 170 | 98 | 118 | — |
+
+JavaScriptCore and SpiderMonkey give a heap's memory back once it is
+garbage; cloison keeps its emptied blocks (and V8's `d8`, which has no idle
+time to shrink its heap in, its pages). A realm costs cloison 2 to 8 times
+the others' time and 4 to 7 times their memory: each installs every
+builtin anew (`realm::create`), and once there are two, nothing more is
+compiled (compiled code would call another realm's functions without
+switching realms).
+
 ## Testing
 
 The differential tests run each program in four engine configurations
@@ -450,8 +520,10 @@ jsvu engines, with and without their JITs: `startup.py` (an empty script's
 time, instructions and memory), `octane.py` (scores, and the fixed work's
 instructions, CPU time and peak RSS), `gcgen.py` (generations and pauses
 from each collector's trace), `m3.py` (bytes per object of each kind, from
-the RSS `probe.py` samples after full collections) and `report.py` (the
-tables, ratios and ranks), results in `bench/compare/`.
+the RSS `probe.py` samples after full collections), `compile.py` (loading,
+JIT compile time, deoptimizations), `probes.py` (memory given back, limits,
+realms) and `report.py` (the tables, ratios and ranks), results in
+`bench/compare/`.
 
 Environment flags: `CLOISON_NO_JIT` (the interpreter alone),
 `CLOISON_NO_RX_JIT` (regexps interpreted), `CLOISON_WARM` (compile warm

@@ -1767,9 +1767,10 @@ impl Vm {
     /// [`mark_object_shape`]), if it was made or given to an object since
     /// the marking began (`Vm::add_shape`, `object::set_shape`,
     /// `Vm::root_shape`), if a cache held it when the marking began (see
-    /// `collect_from`), if it is pinned, or if the VM's tables or a live
-    /// code's `new` hold it. Live shapes' prototypes, and their ancestors',
-    /// are marked, until no more codes or shapes are found live.
+    /// `collect_from`), if it is pinned, or if the VM's tables, a live
+    /// code's `new` or a store transition in its inline caches hold it.
+    /// Live shapes' prototypes, and their ancestors', are marked, until no
+    /// more codes or shapes are found live.
     unsafe fn mark_live_codes_and_shapes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
@@ -1795,6 +1796,16 @@ impl Vm {
                     for s in [code.ctor_shape.get(), code.ctor_result.get()] {
                         if !s.is_null() && s != crate::vm::MANY_SHAPES {
                             live.push(s);
+                        }
+                    }
+                    // A store's transition: the shape a hit gives the
+                    // object, not just compares with its own (a zombie's
+                    // prototype is null), here and in code compiled from it.
+                    for ways in code.made_ics().iter() {
+                        for ic in unsafe { (*ways.get()).iter() } {
+                            if !ic.new_shape.is_null() {
+                                live.push(ic.new_shape);
+                            }
                         }
                     }
                 }

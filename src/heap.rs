@@ -607,17 +607,40 @@ impl Heap {
         let keep = self.kept_blocks();
         let mut empty = empty.to_vec();
         empty.sort_unstable();
-        let mut run: Option<(usize, usize)> = None;
+        let mut given = Vec::new();
         for &a in &empty {
             let b = (a - self.base) / BLOCK;
             self.blocks[b] = Block::Free;
             self.used -= BLOCK;
             if self.empty.len() < keep {
                 self.empty.push(b as u32);
-                continue;
+            } else {
+                given.push(b as u32);
             }
-            self.free.push(b as u32);
-            // Contiguous blocks go back in one call.
+        }
+        self.give_back(&given);
+    }
+
+    /// Free blocks kept beyond the room go back to the system: after a full
+    /// collection that found less live than the last, whose room the sweep
+    /// kept them by (a stop-the-world one sweeps before it sets the room).
+    /// Dropping 400 MB and collecting kept all of it.
+    pub(crate) fn trim_empty(&mut self) {
+        let keep = self.kept_blocks();
+        if self.empty.len() > keep {
+            let mut given = self.empty.split_off(keep);
+            given.sort_unstable();
+            self.give_back(&given);
+        }
+    }
+
+    /// Free blocks `bs` (in order) go back to the system, onto the free
+    /// list; contiguous ones in one call.
+    fn give_back(&mut self, bs: &[u32]) {
+        let mut run: Option<(usize, usize)> = None;
+        for &b in bs {
+            self.free.push(b);
+            let a = self.block_addr(b as usize) as usize;
             run = match run {
                 Some((s, e)) if e == a => Some((s, a + BLOCK)),
                 Some((s, e)) => {

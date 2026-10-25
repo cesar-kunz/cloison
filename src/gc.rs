@@ -1557,6 +1557,7 @@ impl Vm {
             }
             // (After a final pause, again once the sweep has freed blocks.)
             self.heap.gc.full_at = self.heap.allocated() + self.heap.gc.headroom();
+            self.heap.trim_empty();
         }
         if self.heap.gc.stats {
             let (top, recycle, free, large) = self.heap.block_counts();

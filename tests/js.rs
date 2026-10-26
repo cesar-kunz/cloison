@@ -1293,6 +1293,10 @@ fn rejects_what_it_cannot_compile() {
     }
     assert!(compile_error("var a = 1;\nvar b = ;").starts_with("2:9:"));
     assert!(compile_error("while (1) { continue x; }").contains("no target"));
+    // A tagged template can't follow an optional chain, but a template's
+    // continuation after a chain in a substitution isn't one.
+    assert!(compile_error("var x; x?.y`t`;").contains("optional chain"));
+    assert!(compile_error("var x; x?.y\n`t`;").contains("optional chain"));
 }
 
 /// The group 2 operators (`-`, `*`, `/`, shifts, `>`, `<=`, `>=`, `===`,
@@ -5645,6 +5649,7 @@ log(n?.(), deep?.f(), typeof u?.[side()], calls);
 log((n?.a)?.b, delete n?.x, delete deep?.a.b, JSON.stringify(deep.a));
 log(true?.5:1);
 var spreadArgs = [1,2]; var mm = {m(...xs){ return this === mm && xs.join(); }}; log(mm.m?.(...spreadArgs), mm.z?.(...spreadArgs));
+log(`a${deep.arr?.[0]}b${n?.x}c`, `${mm?.m(3)}`);
 // numeric separators
 log(1_000_000, 0b1010_1010, 1_0.5_0, 1e1_0, 0o7_7);
 // optional catch
@@ -5660,7 +5665,7 @@ var sp2 = {...{ps: 1}}; log(protoSetter, sp2.ps); delete Object.prototype.ps;
 out.join(" | ");"##;
     assert_eq!(
         value(src),
-        "5 6 3 | 1024 8 4 0.5 512 NaN NaN | 9 16 | 9 | 1 0 u false  | 1 0 | 5 3 7 0 | set 1 r | 1 | 8,1 1 | fn | undefined undefined 1 1 true undefined 10 | undefined true undefined 0 | undefined true true {} | 0.5 | 1,2 undefined | 1000000 170 10.5 10000000000 63 | caught | {\"0\":\"h\",\"1\":\"i\",\"a\":1,\"b\":2,\"c\":3} | 1 {\"b\":2,\"c\":3} | 4 {\"z\":5} | 1 1 | 0 1"
+        "5 6 3 | 1024 8 4 0.5 512 NaN NaN | 9 16 | 9 | 1 0 u false  | 1 0 | 5 3 7 0 | set 1 r | 1 | 8,1 1 | fn | undefined undefined 1 1 true undefined 10 | undefined true undefined 0 | undefined true true {} | 0.5 | 1,2 undefined | a10bundefinedc 3 | 1000000 170 10.5 10000000000 63 | caught | {\"0\":\"h\",\"1\":\"i\",\"a\":1,\"b\":2,\"c\":3} | 1 {\"b\":2,\"c\":3} | 4 {\"z\":5} | 1 1 | 0 1"
     );
 }
 

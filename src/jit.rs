@@ -2250,8 +2250,15 @@ fn unswap_backward_jumps(insns: &mut [Insn]) {
 /// [`reg_live_in`] doesn't), and a `CreateClosure` reads the registers
 /// its closure captures (`closures`: the function's nested codes). Live
 /// into the first: what the function may read before writing, when called
-/// (see [`Lowering::entry_live`]).
-fn bytecode_live(code: &[u8], insns: &[Insn], closures: &[*const crate::vm::Code]) -> Vec<RegSet> {
+/// (see [`Lowering::entry_live`]). An instruction in a `try` may go on at
+/// its handler (`handlers`, as `Code::handlers`), which the interpreter
+/// runs after an exception in compiled code: what that reads is live there.
+fn bytecode_live(
+    code: &[u8],
+    insns: &[Insn],
+    closures: &[*const crate::vm::Code],
+    handlers: &[(u32, u32, u32)],
+) -> Vec<RegSet> {
     use crate::bytecode::Operand;
     // Per instruction: registers read, and the register written.
     let effects: Vec<(RegSet, Option<usize>)> = insns
@@ -2302,6 +2309,17 @@ fn bytecode_live(code: &[u8], insns: &[Insn], closures: &[*const crate::vm::Code
         })
         .collect();
     let n = insns.len();
+    // Per instruction, the handler an exception there goes to (the first
+    // covering it: inner `try`s come first).
+    let at: HashMap<usize, usize> = insns.iter().enumerate().map(|(k, i)| (i.pc, k)).collect();
+    let handler: Vec<Option<usize>> = insns
+        .iter()
+        .map(|i| {
+            let pc = i.pc as u32;
+            let &(_, _, h) = handlers.iter().find(|&&(start, end, _)| start <= pc && pc < end)?;
+            at.get(&(h as usize)).copied()
+        })
+        .collect();
     let mut live_in: Vec<RegSet> = vec![[0; 4]; n];
     let mut changed = true;
     while changed {
@@ -2309,6 +2327,9 @@ fn bytecode_live(code: &[u8], insns: &[Insn], closures: &[*const crate::vm::Code
         for k in (0..n).rev() {
             let insn = &insns[k];
             let mut live = [0; 4];
+            if let Some(h) = handler[k] {
+                rs_or(&mut live, &live_in[h]);
+            }
             let falls = !matches!(insn.op, Op::Jump | Op::Return | Op::Throw);
             let jumps = is_compare_jump(insn.op)
                 || matches!(
@@ -12571,7 +12592,7 @@ impl Lowering<'_> {
             return l.clone();
         }
         let d = self.decoded(code);
-        let live = bytecode_live(unsafe { &(*code).bytecode }, &d.0, unsafe { &(*code).closures });
+        let live = unsafe { bytecode_live(&(*code).bytecode, &d.0, &(*code).closures, &(*code).handlers) };
         let l: Rc<PcLive> = Rc::new(d.0.iter().map(|i| i.pc).zip(live).collect());
         self.caches().pc_live.insert(code, l.clone());
         l

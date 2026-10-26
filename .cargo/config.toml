@@ -1,3 +1,10 @@
+# The target's flags below are not the host's: build scripts and proc
+# macros (ICU4X's, with the `intl` feature) are built without them (a
+# proc macro can't be linked statically).
+target-applies-to-host = false
+[unstable]
+target-applies-to-host = true
+
 # arm64 cross builds: musl ships its own CRT, so the bundled rust-lld is the
 # only linker needed, and the static binaries run under qemu-user.
 #   cargo test --target aarch64-unknown-linux-musl

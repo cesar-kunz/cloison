@@ -10043,7 +10043,13 @@ fn frame_end(f: &InlineFrame) -> usize {
 
 /// A call compiled code makes (`call` and `call_direct` stencils): `op`'s
 /// operands, renamed into the compiled frame, and where a callee's frame
-/// goes (past every register the compiled code uses). For a direct call,
+/// goes. A direct call's goes past every register the compiled code uses
+/// (`place_direct_frames`); a call through the runtime's past the calling
+/// frame's registers only (`frame_end`), over registers the compiled code
+/// uses beyond them that no value lives in across a call: split
+/// temporaries, the scratch register, accessor windows, spare hoisted
+/// loads (`hoist_loads` keeps none in a loop with a runtime call) and
+/// direct calls' frames. For a direct call,
 /// the callee's compiled entry and what `call_direct` checks before calling
 /// it: the first fields, which it reads (`layout::DirectSite`, checked
 /// against them below).

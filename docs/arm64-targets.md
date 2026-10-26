@@ -3,7 +3,7 @@
 Status: 2026-10-10, on Apple silicon (the first arm64 hardware the project
 has run on). The stencils added since group 1 (polymorphism, calls,
 constructors, arrays, constants, upvalues, typed arrays, frames) held
-against handwritten arm64 code, as `notes/opcode-targets.md` did for the
+against handwritten arm64 code, as `docs/opcode-targets.md` did for the
 arithmetic, then the systematic gaps closed and the round measured.
 
 Reproducing:
@@ -12,6 +12,10 @@ Reproducing:
   JIT emits it (from the generated table, after `build.rs`'s rewrites)
   with its instruction count, holes and template fields. It needs
   capstone's `cstool`.
+- `scripts/stencil-targets.py` checks every stencil against its target, the
+  `target` comments in `stencils/stencils.rs` that this document's and
+  `docs/opcode-targets.md`'s tables became, on both architectures, and
+  lists the families with no target yet.
 - `CLOISON_JIT_LOG=1 target/release/cloison file.js` prints each compilation's
   hot code size, so a benchmark's compiled code is `bytes / 4`
   instructions.

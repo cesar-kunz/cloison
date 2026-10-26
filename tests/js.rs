@@ -3654,6 +3654,46 @@ fn many_variables_agree_with_node() {
     assert_eq!(value(&src), "2001571,4543976");
 }
 
+/// A function with more variables than registers, read and written by a
+/// function nested in an async function or a generator, which has a scope
+/// object of its own: the outer one is passed down under another name. The
+/// expected value is V8's and SpiderMonkey's.
+#[test]
+fn scope_objects_pass_through_async_functions_and_generators() {
+    let vars = |p: &str| (0..300).map(|i| format!("var {p}{i} = {i};\n")).collect::<String>();
+    let src = format!(
+        r#"
+var log = [];
+(() => {{
+{v}
+  var counter = 0;
+  function bump(x) {{ counter += x; return counter; }}
+  var a = async (t) => {{ await 0; var g = function (y) {{ counter = counter + y; v299 += 1; return bump(y); }}; return g(t) + g(t); }};
+  var gen = function* () {{ var h = () => {{ v0 += 10; return v0 + v299; }}; yield h(); yield h(); }};
+  for (var x of gen()) log.push("gen " + x);
+  function inner() {{
+{w}
+    var z = async function () {{ await null; return [1, 2].map(function (k) {{ return k + w299 + v299 + counter; }}); }};
+    return z();
+  }}
+  var fs = [];
+  var b = async () => {{ for (let i = 0; i < 3; i++) {{ await i; fs.push(function () {{ return i + v1 + counter; }}); }} }};
+  a(5).then(r => {{ log.push("a " + r + " " + counter + " " + v299);
+    return inner(); }}).then(r => {{ log.push("inner " + r);
+    return b(); }}).then(() => {{ log.push("fs " + fs.map(f => f()).join()); globalThis.out = log.join(" | "); }});
+}})();
+"#,
+        v = vars("v"),
+        w = vars("w")
+    );
+    let module = cloison::js::compile(&src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("out");
+    let g = cloison::object::object_value(vm.global);
+    assert_eq!(display(vm.get(g, a).unwrap()), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
+}
+
 /// Cons strings (long strings built by `+`, flattened when read) and
 /// sparse integer keys (an object used as a map by numbers), `push` on an
 /// array-like. The expected value is Node's.

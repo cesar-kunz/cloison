@@ -685,8 +685,7 @@ impl Vm {
                         let a = self.intern(&i.to_string());
                         (*(*o).shape).lookup(a).is_some()
                     };
-                    let far = class != Class::Array
-                        && i as usize > (*o).elems_len as usize * 2 + crate::vm::SPARSE_GAP;
+                    let far = class != Class::Array && self.sparse_key(o, i);
                     if plain && !far {
                         if named {
                             let a = self.intern(&i.to_string());

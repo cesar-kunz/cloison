@@ -3593,7 +3593,7 @@ impl Vm {
             }
             // Far past the elements of an object that isn't an array (a
             // map keyed by numbers): a named property, not as many holes.
-            if (*o).class != Class::Array && i as usize > (*o).elems_len as usize * 2 + SPARSE_GAP {
+            if (*o).class != Class::Array && self.sparse_key(o, i) {
                 (*o).flags |= crate::object::SPARSE;
                 let a = self.intern(&i.to_string());
                 return self.set(obj, a, value);
@@ -3802,6 +3802,17 @@ impl Vm {
     }
 
     /// Make room for `n` elements.
+    /// Whether element `i` of object `o`, not an array, is kept as a named
+    /// property: far past its elements, or where storing it would leave
+    /// them too sparse (as an array goes far: see `far::goes_far`). A
+    /// TypeScript enum's flags (`NodeFlags[1 << 24] = "…"`, each key twice
+    /// the last) doubled the elements up to 2^30, out of memory.
+    pub(crate) fn sparse_key(&self, o: *mut Object, i: u32) -> bool {
+        let len = unsafe { (*o).elems_len } as usize;
+        let i = i as usize;
+        i >= len && (i > len * 2 + SPARSE_GAP || crate::far::goes_far(self, o, i + 1, 1))
+    }
+
     pub(crate) fn reserve_elems(&mut self, o: *mut Object, n: usize) {
         unsafe {
             if n <= (*o).elems_cap as usize {

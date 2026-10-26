@@ -1025,9 +1025,11 @@ fn num(tag: NumberTag, v: Value) -> f64 {
 
 stencil!("nop"; |s| { next!(s) });
 stencil!("jump"; |s| { jump!(s) });
+// target aarch64 return: 2 `ret` with acc in place (docs/arm64-targets.md)
 stencil!("return"; |s| { s.acc });
 
 // Exit stub tail: record the bytecode offset (`imm`) and return to the driver.
+// target aarch64 exit: 4 now 5 the bytecode offset in one `movz` when it fits (docs/arm64-targets.md)
 stencil!("exit"; |s| {
     *s.ctx = imm() as u32;
     s.acc
@@ -1073,6 +1075,7 @@ stencil_slow!("add_smi"; |s| {
 // undoes (`undo_add_smi_i`), so the add is `add r12d, k; jo exit`. On
 // x86-64 the immediate is part of the `add` (inline asm, with `asm goto`
 // for the overflow branch); LLVM would load it into a register first.
+// target x86_64 add_smi_i: 2 `add r12d, k; jo exit` (also `SubSmi k` as `-k`; docs/opcode-targets.md, group 1)
 imm_variants!("add_smi_i"; |s, k| {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1175,6 +1178,8 @@ stencil_slow!("jlt_smi"; |s| {
     next!(s)
 });
 
+// target x86_64 jlt_smi_i,jge_smi_i: 2 `cmp r12d, k; jl L` (docs/opcode-targets.md, group 1)
+// target aarch64 jlt_smi_i_k16: 2 now 3 `cmp w20, #k; b.lt L`: needs `k` in `imm12` (docs/arm64-targets.md)
 imm_variants!("jlt_smi_i"; |s, k| {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1236,6 +1241,7 @@ stencil!("unbox_facc"; |s| {
 
 macro_rules! boxed_location {
     ($loc:tt) => {
+        // target aarch64 ldar_m: 1 `ldr x20, [x21, #off]` (docs/arm64-targets.md)
         stencil!("ldar_", loc!($loc); |s| {
             s.acc = get!($loc, s);
             next!(s)
@@ -1244,6 +1250,8 @@ macro_rules! boxed_location {
             s.facc = s.tag.decode_f64(get!($loc, s));
             next!(s)
         });
+        // target aarch64 star_m: 1 `str x20, [x21, #off]` (docs/arm64-targets.md)
+        // target aarch64 star_m_i: 2 `orr x20, x22, x20; str` (docs/arm64-targets.md)
         stencil!("star_", loc!($loc); |s| {
             set!($loc, s, s.acc);
             next!(s)
@@ -1339,6 +1347,8 @@ macro_rules! boxed_location {
             }
             next!(s)
         });
+        // target x86_64 jlt_ii_*,jge_ii_*,tlt_jt_ii_*,tlt_jf_ii_*: 2 `cmp r12d, esi; jl L` (docs/opcode-targets.md, group 1)
+        // target aarch64 jlt_ii_[gu]{},jge_ii_[gu]{},tlt_j?_ii_[gu]{}: 2 `cmp w20, w25; b.lt L` (docs/opcode-targets.md, group 1)
         stencil!("jlt_ii_", loc!($loc); |s| {
             if int(s.acc) < int(get!($loc, s)) {
                 jump!(s)
@@ -1370,10 +1380,12 @@ macro_rules! boxed_location {
 macro_rules! gpr_slot {
     ($k:literal) => {
         boxed_location!([g $k]);
+        // target aarch64 enter_g{}: 1 `ldr x24, [x21, #off]` (docs/arm64-targets.md)
         stencil!("enter_g", $k; |s| {
             s.g[$k] = load_m(s.regs);
             next!(s)
         });
+        // target aarch64 spill_g{}: 1 `str x24, [x21, #off]` (docs/arm64-targets.md)
         stencil!("spill_g", $k; |s| {
             store_m(s.regs, s.g[$k]);
             next!(s)
@@ -1433,6 +1445,7 @@ macro_rules! fp_slot {
             next!(s)
         });
 
+        // target aarch64 enter_f{}_i: 2 `ldr w8; scvtf` (docs/arm64-targets.md)
         stencil!("enter_f", $k, "_i"; |s| {
             s.f[$k] = i2f(load_m_i32(s.regs));
             next!(s)
@@ -1640,6 +1653,7 @@ macro_rules! int_slot {
             s.g[$k] = unboxed(int(s.acc));
             next!(s)
         });
+        // target aarch64 enter_u{}: 1 `ldr w24, [x21, #off]` (docs/arm64-targets.md)
         stencil!("enter_u", $k; |s| {
             s.g[$k] = load_m_unboxed(s.regs);
             next!(s)
@@ -1650,6 +1664,7 @@ macro_rules! int_slot {
             s.g[$k] = s.acc;
             next!(s)
         });
+        // target aarch64 spill_u{}: 2 `orr x8, x24, x22; str` (docs/arm64-targets.md)
         stencil!("spill_u", $k; |s| {
             store_m(s.regs, s.tag.rebox(s.g[$k]));
             next!(s)
@@ -1729,6 +1744,7 @@ macro_rules! int_slot {
         // the exit stub undoes it (`undo_addi_u`) before spilling, so the
         // exit still happens "before" the instruction. Writing the slot
         // first lets the add happen in place: `add edi, k; jo exit`.
+        // target aarch64 addi_u{}_k16: 2 now 3 `adds w24, w24, #k; b.vs exit`: needs `k` in `imm12` (docs/arm64-targets.md)
         imm_variants!("addi_u", $k; |s, k| {
             #[cfg(target_arch = "x86_64")]
             {
@@ -1762,6 +1778,7 @@ macro_rules! int_slot {
             s.g[$k] = unboxed(raw(s.g[$k]).wrapping_sub(imm()));
             next!(s)
         });
+        // target aarch64 incjlt_u{}_k16: 4 now 5 `adds; b.vs; cmp w24, #k; b.lt` (docs/arm64-targets.md)
         imm_variants!("incjlt_u", $k; |s, k| {
             let (v, overflow) = raw(s.g[$k]).overflowing_add(1);
             s.g[$k] = unboxed(v);
@@ -2704,6 +2721,7 @@ macro_rules! slot_int_ops {
         slot_imm_jump!("teq_smi_jf", $k, jf, "cmp", "e", |v, i| v == i);
         slot_imm_jump!("tstz_jt", $k, jt, "test", "z", |v, i| v & i == 0);
         slot_imm_jump!("tstz_jf", $k, jf, "test", "z", |v, i| v & i == 0);
+        // target aarch64 andi_u{}_k16: 1 now 2 `and w24, w24, #k` for a logical immediate (docs/arm64-targets.md)
         slot_bitwise!("andi_u", $k, &, "and");
         slot_bitwise!("ori_u", $k, |, "or");
     };
@@ -2875,6 +2893,8 @@ macro_rules! strict_generic {
 macro_rules! rel_int32 {
     ($loc:expr, |$s:ident| $x:expr) => {
         stencil!("jge_ii_", $loc; |$s| { act!(jt, $s, int($s.acc) >= $x) });
+        // target x86_64 test_lt_ii_*,test_gt_ii_*,test_le_ii_*,test_ge_ii_*: 4 now 5 `xor; cmp; setcc; lea r12, [rax+6]`, not `or 6; mov` (docs/opcode-targets.md, group 1)
+        // target aarch64 test_lt_ii_[gu]{},test_gt_ii_[gu]{},test_le_ii_[gu]{},test_ge_ii_[gu]{}: 3 `cmp; mov #6; cinc` (docs/opcode-targets.md, group 1)
         stencil!("test_gt_ii_", $loc; |$s| { act!(test, $s, $x > int($s.acc)) });
         stencil!("test_le_ii_", $loc; |$s| { act!(test, $s, $x <= int($s.acc)) });
         stencil!("test_ge_ii_", $loc; |$s| { act!(test, $s, $x >= int($s.acc)) });
@@ -2899,6 +2919,8 @@ macro_rules! group2_generic {
             s.acc = rt_sub!(s, s.acc, l);
             next!(s)
         });
+        // target x86_64 sub_ii_g{},sub_ii_u{},sub_ii_m: 4 `mov eax, esi; sub eax, r12d; jo exit; mov r12d, eax` (docs/opcode-targets.md, group 1)
+        // target aarch64 sub_ii_g{},sub_ii_u{}: 2 now 3 `subs w20, w25, w20; b.vs exit`, in place, with an undo stub (docs/opcode-targets.md, group 1)
         stencil!("sub_ii_", loc!($loc); |s| {
             match int(get!($loc, s)).checked_sub(int(s.acc)) {
                 Some(v) => {
@@ -2912,6 +2934,7 @@ macro_rules! group2_generic {
             s.acc = unboxed(int(get!($loc, s)).wrapping_sub(int(s.acc)));
             next!(s)
         });
+        // target x86_64 sub_iif_g{},sub_iif_u{}: 5 `xorps; cvtsi2sd; xorps; cvtsi2sd; subsd` (`xorps` against the false dependency; docs/opcode-targets.md, group 1)
         stencil!("sub_iif_", loc!($loc); |s| {
             s.facc = i2f(int(get!($loc, s))) - i2f(int(s.acc));
             next!(s)
@@ -2945,6 +2968,8 @@ macro_rules! group2_generic {
         });
         // A zero product is -0 if a factor is negative: checked out of
         // line (`imul; jo exit; test; jz slow`).
+        // target x86_64 mul_ii_g{},mul_ii_u{}: 6 `mov eax, r12d; imul eax, esi; jo exit; test eax, eax; je slow; mov r12d, eax` (docs/opcode-targets.md, group 1)
+        // target aarch64 mul_ii_g{},mul_ii_u{}: 5 `smull; cmp sxtw; b.ne; cbz; mov` (docs/opcode-targets.md, group 1)
         stencil_slow!("mul_ii_", loc!($loc); |s| {
             mul_ii_fast!(s, int(get!($loc, s)))
         }; |s| {
@@ -2983,6 +3008,7 @@ macro_rules! group2_generic {
             s.acc = rt_div!(s, s.acc, l);
             next!(s)
         });
+        // target x86_64 div_ii_g{},div_ii_u{}: 5 `xorps; cvtsi2sd; xorps; cvtsi2sd; divsd` (docs/opcode-targets.md, group 1)
         stencil!("div_ii_", loc!($loc); |s| {
             s.facc = i2f(int(get!($loc, s))) / i2f(int(s.acc));
             next!(s)
@@ -3188,6 +3214,8 @@ macro_rules! group2_boxed_typed {
 /// it (`undo_subr_u<x>_u<y>`).
 macro_rules! group2_int_slot_pair {
     ($a:tt, $b:tt) => {
+        // target x86_64 subr_ii_u{}_u{}: 2 `sub esi, edi; jo exit` (docs/opcode-targets.md, group 1)
+        // target aarch64 subr_ii_u{}_u{}: 2 `subs w25, w25, w24; b.vs exit` (docs/opcode-targets.md, group 1)
         stencil!("subr_ii_u", $a, "_u", $b; |s| {
             let (v, overflow) = raw(s.g[$a]).overflowing_sub(raw(s.g[$b]));
             s.g[$a] = unboxed(v);
@@ -3270,6 +3298,7 @@ fn fneg(d: f64) -> f64 {
 
 // An int32's negation: 0 gives -0 and INT32_MIN 2^31, doubles: exit, and
 // once it has, `neg_iif` gives a double.
+// target x86_64 neg_i: 3 `test r12d, 0x7fffffff; jz exit; neg r12d` (docs/opcode-targets.md, group 3)
 stencil!("neg_i"; |s| {
     let v = int(s.acc);
     // (On x86-64 a long `jz` to the exit, as `exit_unless_int32`.)
@@ -3288,10 +3317,14 @@ stencil!("neg_i"; |s| {
     s.acc = unboxed(-v);
     next!(s)
 });
+// target x86_64 neg_iif: 5 `xorps; cvtsi2sd; movabs; movq; xorpd` (docs/opcode-targets.md, group 3)
+// target aarch64 neg_iif: 2 `scvtf; fneg` (docs/opcode-targets.md, group 3)
 stencil!("neg_iif"; |s| {
     s.facc = fneg(i2f(int(s.acc)));
     next!(s)
 });
+// target x86_64 neg_f: 3 `movabs rax, 1<<63; movq xmm8, rax; xorpd xmm0, xmm8` (docs/opcode-targets.md, group 3)
+// target aarch64 neg_f: 1 `fneg d0, d0` (docs/opcode-targets.md, group 3)
 stencil!("neg_f"; |s| {
     s.facc = fneg(s.facc);
     next!(s)
@@ -3312,10 +3345,13 @@ stencil_slow!("neg"; |s| {
     s.acc = rt_mul!(s, s.acc, s.tag.box_i32(-1));
     next!(s)
 });
+// target x86_64 bit_not_i: 1 `not r12d` (docs/opcode-targets.md, group 3)
+// target aarch64 bit_not_i: 1 `mvn w20, w20` (docs/opcode-targets.md, group 3)
 stencil!("bit_not_i"; |s| {
     s.acc = unboxed(!int(s.acc));
     next!(s)
 });
+// target x86_64 bit_not: 4 `cmp r12, r14; jb slow; not r12d; or r12, r14` (docs/opcode-targets.md, group 3)
 stencil_slow!("bit_not"; |s| {
     if s.tag.is_int32(s.acc) {
         s.acc = s.tag.box_i32(!int(s.acc));
@@ -3335,6 +3371,8 @@ stencil_slow!("bit_not"; |s| {
 /// has, `shr_iif` gives a double.
 macro_rules! bitwise_int32 {
     ($loc:expr, |$s:ident| $x:expr) => {
+        // target x86_64 bit_and_ii_*,bit_or_ii_*,bit_xor_ii_*: 1 `and r12d, edi` (`_m`: `and r12d, [r13+k]`; docs/opcode-targets.md, group 3)
+        // target aarch64 bit_and_ii_[gu]{},bit_or_ii_[gu]{},bit_xor_ii_[gu]{}: 1 `and w20, w20, w25` (docs/opcode-targets.md, group 3)
         stencil!("bit_and_ii_", $loc; |$s| {
             $s.acc = unboxed($x & int($s.acc));
             next!($s)
@@ -3347,6 +3385,8 @@ macro_rules! bitwise_int32 {
             $s.acc = unboxed($x ^ int($s.acc));
             next!($s)
         });
+        // target x86_64 shl_ii_*,sar_ii_*: 1 now 5 `shl r12d, cl` with the count in rcx, a slot here: saved and restored (docs/opcode-targets.md, group 3)
+        // target aarch64 shl_ii_[gu]{},sar_ii_[gu]{}: 1 `lsl w20, w25, w20` (docs/opcode-targets.md, group 3)
         stencil!("shl_ii_", $loc; |$s| {
             $s.acc = unboxed($x.wrapping_shl(int($s.acc) as u32));
             next!($s)
@@ -3355,6 +3395,8 @@ macro_rules! bitwise_int32 {
             $s.acc = unboxed($x.wrapping_shr(int($s.acc) as u32));
             next!($s)
         });
+        // target x86_64 shr_ii_*: 4 now 8 as `shl_ii` with `test; js exit` (docs/opcode-targets.md, group 3)
+        // target aarch64 shr_ii_[gu]{}: 3 now 4 `lsr; tbnz exit; mov` (3 on 2026-10-09; docs/opcode-targets.md, group 3)
         stencil!("shr_ii_", $loc; |$s| {
             let v = ($x as u32).wrapping_shr(int($s.acc) as u32);
             if (v as i32) < 0 {
@@ -3485,9 +3527,12 @@ macro_rules! mul_smi_i {
         });
     };
 }
+// target x86_64 mul_smi_pos_i: 3 `imul eax, r12d, k; jo exit; mov r12d, eax` (docs/opcode-targets.md, group 1)
+// target x86_64 mul_smi_neg_i: 5 `imul eax, r12d, k; jo exit; test eax, eax; je exit; mov r12d, eax` (docs/opcode-targets.md, group 1)
 mul_smi_i!("mul_smi_pos_i", false);
 mul_smi_i!("mul_smi_neg_i", true);
 // `x * 0`: 0, or -0 for a negative `x`.
+// target x86_64 mul_smi_zero_i: 3 `test r12d, r12d; js exit; xor r12d, r12d` (docs/opcode-targets.md, group 1)
 stencil!("mul_smi_zero_i"; |s| {
     if int(s.acc) < 0 {
         exit!(s)
@@ -3514,6 +3559,7 @@ stencil_slow!("div_smi"; |s| {
     s.acc = rt_div!(s, Value::from_i32(imm()), s.acc);
     next!(s)
 });
+// target x86_64 div_smi_i: 6 `mov eax, k; xorps; cvtsi2sd; xorps; cvtsi2sd; divsd` (docs/opcode-targets.md, group 1)
 stencil!("div_smi_i"; |s| {
     s.facc = i2f(int(s.acc)) / i2f(imm());
     next!(s)
@@ -3529,6 +3575,8 @@ stencil!("div_smi_f"; |s| {
 // immediate.
 macro_rules! shift_by {
     ($($k:literal)*) => {$(
+        // target x86_64 shl_smi_i_*,sar_smi_i_*,shr_smi_i_*,!shr_smi_i_0: 1 `sar r12d, k` (the count in the name; docs/opcode-targets.md, group 1)
+        // target aarch64 shl_smi_i_*,sar_smi_i_*,shr_smi_i_*,!shr_smi_i_0: 1 `asr w20, w20, #k` (docs/opcode-targets.md, group 1)
         stencil!("shl_smi_i_", $k; |s| {
             s.acc = unboxed(int(s.acc) << $k);
             next!(s)
@@ -3545,6 +3593,8 @@ macro_rules! shift_by {
 }
 shift_by!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31);
 // `x >>> 0` of an int32: itself if it isn't negative.
+// target x86_64 shr_smi_i_0: 2 `test r12d, r12d; js exit` (docs/opcode-targets.md, group 1)
+// target aarch64 shr_smi_i_0: 1 now 2 `tbnz w20, #31, exit` (1 on 2026-10-07; docs/opcode-targets.md, group 1)
 stencil!("shr_smi_i_0"; |s| {
     if int(s.acc) < 0 {
         exit!(s)
@@ -3639,6 +3689,7 @@ stencil!("jge_smi_f"; |s| {
 });
 // `JumpIfStrictEqualSmi k` (a `switch` case): `acc === k`, which only an
 // int32 or a double can be, so the generic form needs no runtime.
+// target x86_64 jseq_smi_i: 2 `cmp r12d, k; je L` (docs/opcode-targets.md, switch)
 imm_variants!("jseq_smi_i"; |s, k| {
     // As `jlt_smi_i`: the immediate in the `cmp`.
     #[cfg(target_arch = "x86_64")]
@@ -3728,6 +3779,10 @@ macro_rules! value_test {
         });
     };
 }
+// target x86_64 tund_j?,tund_j?_g{},tnull_j?,tnull_j?_g{}: 2 `cmp r12, 10; jne L` (docs/opcode-targets.md, group 1)
+// target aarch64 tund_j?,tund_j?_g{},tnull_j?,tnull_j?_g{}: 2 `cmp x20, #10; b.ne L` (docs/opcode-targets.md, group 1)
+// target x86_64 tnsh_j?,tnsh_j?_g{}: 3 now 4 `lea rax, [r12-2]; test rax, -9; je L` (3 on 2026-10-07: `mov; add` for the `lea` since; docs/opcode-targets.md, group 1)
+// target aarch64 tnsh_j?,tnsh_j?_g{}: 3 `sub; tst; b.eq L` (docs/opcode-targets.md, group 1)
 value_test!("test_undefined", "tund_jt", "tund_jf", |v| v == Value::UNDEFINED);
 value_test!("test_null", "tnull_jt", "tnull_jf", |v| v == Value::NULL);
 value_test!("test_nullish", "tnsh_jt", "tnsh_jf", |v| nullish(v));
@@ -3757,6 +3812,9 @@ stencil!("for_in_keys"; |s| {
 
 // `LdaConstant`: the constant's bits are the 64-bit immediate (`_f`: a
 // double's, into `facc`).
+// target x86_64 lda_constant: 1 `movabs r12, imm64` (docs/opcode-targets.md, strings)
+// target aarch64 lda_constant: 4 `movz; movk; movk; movk`: a `Value` is 64 bits (docs/arm64-targets.md)
+// target x86_64 lda_constant_f: 2 `movabs rax, imm64; movq xmm0, rax` (docs/opcode-targets.md, strings)
 stencil!("lda_constant"; |s| {
     s.acc = Value::from_bits(imm64_full());
     next!(s)
@@ -3978,6 +4036,7 @@ stencil!("create_regexp"; |s| {
 macro_rules! identity {
     ($loc:tt) => {
         stencil!("test_id_", loc!($loc); |s| { act!(test, s, get!($loc, s) == s.acc) });
+        // target x86_64 tid_j?_g{},tid_j?_m: 2 now 4 `cmp rsi, r12; je L` (2 on 2026-10-07; docs/opcode-targets.md, strings)
         stencil!("tid_jt_", loc!($loc); |s| { act!(jt, s, get!($loc, s) == s.acc) });
         stencil!("tid_jf_", loc!($loc); |s| { act!(jf, s, get!($loc, s) == s.acc) });
     };
@@ -4249,6 +4308,8 @@ macro_rules! array_length {
             s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
+        // target x86_64 get_length_nc_g{}: 1 `mov r12d, [rsi+32]` (docs/opcode-targets.md, group 2)
+        // target aarch64 get_length_nc_g{}: 1 (docs/arm64-targets.md)
         stencil!("get_length_nc_", loc!($loc); |s| {
             let o = get!($loc, s);
             s.acc = unboxed((*cell(o)).elems_len as i32);
@@ -4286,6 +4347,7 @@ with_gprs!(each_gpr! array_length_gpr);
 // for an int32 or a number).
 macro_rules! set_keyed {
     ($loc:tt, $case:literal, $card:literal, $array:expr, |$s:ident, $v:ident, $code:ident| $fits:expr, |$t:ident| $value:expr) => {
+        // target aarch64 set_keyed_nc_i_g{}: 9 now 10 a redundant `mov w8, w20` before boxing (docs/arm64-targets.md)
         stencil!("set_keyed_", $case, loc!($loc); |$s| {
             let key = key_x();
             let o = get!($loc, $s);
@@ -4314,6 +4376,7 @@ macro_rules! set_keyed {
 
 macro_rules! property_location {
     ($loc:tt) => {
+        // target aarch64 get_own_g{}: 10 the guard, then `ldr x20, [x24, #off]` (docs/arm64-targets.md)
         stencil!("get_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             s.acc = load_imm(o);
@@ -4324,6 +4387,7 @@ macro_rules! property_location {
             s.acc = load_imm(props(o));
             next!(s)
         });
+        // target aarch64 get_proto_g{}: 13 the guard, the slot's address (3), `ldr` (docs/arm64-targets.md)
         stencil!("get_proto_", loc!($loc); |s| {
             if guard_shape(s.tag, get!($loc, s)).is_none() {
                 exit!(s)
@@ -4331,6 +4395,7 @@ macro_rules! property_location {
             s.acc = *(imm64b() as *const Value);
             next!(s)
         });
+        // target aarch64 set_own_g{}: 10 now 30 the guard and `str` (2026-10-10, before the write barrier: to judge again; docs/arm64-targets.md)
         stencil!("set_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             store_imm(o, s.acc);
@@ -4344,6 +4409,7 @@ macro_rules! property_location {
             barrier(s.tag, payload_cell(p), p.offset(imm() as isize), s.acc);
             next!(s)
         });
+        // target aarch64 set_tr_g{}: 14 now 34 the new shape (3), `str` it, `str` the value (2026-10-10, before the write barrier: to judge again; docs/arm64-targets.md)
         stencil!("set_tr_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             (*header(o)).shape = imm64b();
@@ -4513,12 +4579,14 @@ macro_rules! property_location {
         // through to its access.
         // A load whose value is unused (`jit::Insn::check_only`): its
         // receiver's shape guard alone.
+        // target aarch64 check_shape_g{}: 9 cell test (3), `ldr` shape, shape (3), `cmp`, `b.ne` (docs/arm64-targets.md)
         stencil!("check_shape_", loc!($loc); |s| {
             if guard_shape(s.tag, get!($loc, s)).is_none() {
                 exit!(s)
             }
             next!(s)
         });
+        // target aarch64 guard_cell_g{}: 3 `orr; tst; b.ne` (docs/arm64-targets.md)
         stencil!("guard_cell_", loc!($loc); |s| {
             if !is_cell(s.tag, get!($loc, s)) {
                 exit!(s)
@@ -4547,6 +4615,7 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // target aarch64 shape_guard_g{}: 6 (docs/arm64-targets.md)
         stencil!("shape_guard_", loc!($loc); |s| {
             if (*cell(get!($loc, s))).shape != imm64() {
                 exit!(s)
@@ -4568,6 +4637,7 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // target aarch64 family_guard_g{}: 7 `ldr x8, [x24]; ldr x8, [x8, #8]`, family (3), `cmp`, `b.ne` (docs/arm64-targets.md)
         stencil!("family_guard_", loc!($loc); |s| {
             if (*shape_of(get!($loc, s).to_bits() as *const u8)).family != imm64() {
                 exit!(s)
@@ -4575,14 +4645,17 @@ macro_rules! property_location {
             next!(s)
         });
         // The receiver's shape is known to be the cached one: no guard.
+        // target aarch64 get_own_nc_g{}: 1 `ldr x20, [x24, #off]` (docs/arm64-targets.md)
         stencil!("get_own_nc_", loc!($loc); |s| {
             s.acc = load_imm(get!($loc, s).to_bits() as *mut u8);
             next!(s)
         });
+        // target aarch64 get_oop_nc_g{}: 2 `ldr x8, [x24, #16]; ldr x20, [x8, #off]` (docs/arm64-targets.md)
         stencil!("get_oop_nc_", loc!($loc); |s| {
             s.acc = load_imm(props(get!($loc, s).to_bits() as *mut u8));
             next!(s)
         });
+        // target aarch64 get_proto_nc_g{}: 4 the slot's address (3), `ldr` (docs/arm64-targets.md)
         stencil!("get_proto_nc_", loc!($loc); |s| {
             s.acc = *(imm64b() as *const Value);
             next!(s)
@@ -4801,6 +4874,7 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // target aarch64 get_keyed_i_nc_g{}: 7 the load into x8, moved to x20 after the hole check (docs/arm64-targets.md)
         keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);
         // `get_keyed_i_nc_` at a site given up on (`Prop::Runtime`): a hole
         // or an index past the end through the runtime, not an exit.
@@ -4939,11 +5013,14 @@ fn nan() -> f64 {
 
 macro_rules! typed_load {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $set:expr) => {
+        // target x86_64 tget_u8_g{},tget_u16_g{},tget_i32_g{}: 5 `cmp [rsi+32], r12d; jbe exit; mov rax, [rsi+24]; mov r10d, r12d; movzx r12d, word [rax+r10*2]` (docs/opcode-targets.md, group 3)
+        // target aarch64 tget_u16_g{},tget_i32_g{}: 5 `ldr w8, [x25,#32]; cmp w8, w20; b.ls exit; ldr x8, [x25,#24]; ldrh w20, [x8, w20, uxtw #1]` (docs/opcode-targets.md, group 3)
         stencil!("tget_", $w, "_", loc!($loc); |$s| {
             let Some($e) = typed_elem(get!($loc, $s), int($s.acc) as u32, $size) else { exit!($s) };
             $set;
             next!($s)
         });
+        // target x86_64 tget_u16_chk_g{},tget_i32_chk_g{}: 13 now 14 the kind as a masked dword compare (`and eax, 0xff00ff; cmp eax, 7 | k<<16`) (docs/opcode-targets.md, group 3)
         stencil!("tget_", $w, "_chk_", loc!($loc); |$s| {
             let o = get!($loc, $s);
             if !is_typed($s.tag, o, imm() as u32) {
@@ -4958,6 +5035,7 @@ macro_rules! typed_load {
 
 macro_rules! typed_store {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $store:expr) => {
+        // target aarch64 tset_b32_i_g{}: 5 (docs/arm64-targets.md)
         stencil!("tset_", $w, "_", loc!($loc); |$s| {
             let key = key_x();
             let Some($e) = typed_elem_x(get!($loc, $s), key, $size) else { exit!($s) };
@@ -5057,6 +5135,7 @@ macro_rules! key_gpr {
             set_key_x(int(s.g[$k]));
             next!(s)
         });
+        // target aarch64 key_u{}: 1 (docs/arm64-targets.md)
         stencil!("key_u", $k; |s| {
             set_key_x(raw(s.g[$k]));
             next!(s)
@@ -5138,6 +5217,7 @@ unsafe fn upvalue_cell(regs: *mut Value) -> *const Upvalue {
 
 // Before a direct call to a function with upvalues: the function object
 // (`imm64`) into the callee frame's header, `imm` bytes from the registers.
+// target aarch64 set_frame_func: 6 function (3), offset, `str` (docs/arm64-targets.md)
 stencil!("set_frame_func"; |s| {
     *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = imm64();
     next!(s)
@@ -5147,6 +5227,8 @@ stencil!("set_frame_func_r"; |s| {
     *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = *((s.regs as *const u8).add(imm64() as usize) as *const u64);
     next!(s)
 });
+// target x86_64 lda_upvalue: 4 four loads, the offset computed by the JIT (docs/opcode-targets.md, group 3)
+// target aarch64 lda_upvalue: 4 `ldur` func, `ldr [x8, #off]`, `ldr`, `ldr` (docs/arm64-targets.md)
 stencil!("lda_upvalue"; |s| {
     s.acc = *(*upvalue_cell(s.regs)).at;
     next!(s)
@@ -5176,6 +5258,8 @@ stencil!("sta_upvalue_fr"; |s| {
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
+// target x86_64 lda_upvalue_c: 3 `movabs; mov; mov` (docs/opcode-targets.md, group 3)
+// target aarch64 lda_upvalue_c: 5 cell (3), `ldr`, `ldr` (docs/arm64-targets.md)
 stencil!("lda_upvalue_c"; |s| {
     s.acc = *(*(imm64() as *const Upvalue)).at;
     next!(s)
@@ -5187,6 +5271,7 @@ stencil!("sta_upvalue_c"; |s| {
     next!(s)
 });
 
+// target aarch64 lda_global: 10 global object (3), `ldr` shape, shape (3), `cmp`, `b.ne`, `ldr` (docs/arm64-targets.md)
 stencil!("lda_global"; |s| {
     let g = imm64b() as *mut u8;
     if (*header(g)).shape != imm64() {
@@ -5238,6 +5323,7 @@ stencil!("check_acc_int"; |s| {
     }
     next!(s)
 });
+// target x86_64 check_acc_num: 2 `test r12, r14; jz exit` (docs/opcode-targets.md, group 3)
 stencil!("check_acc_num"; |s| {
     if s.acc.to_bits() & s.tag.to_bits() == 0 {
         exit!(s)
@@ -5417,6 +5503,7 @@ stencil!("call_direct_nc"; |s| {
 // After a direct call the JIT made without the `cloison_rt_enter` wrapper
 // (`arch::direct_call` in `src/jit.rs`), its result in `acc`: leave as
 // `call_direct` does.
+// target aarch64 call_done: 8 now 9 an epoch in 16 bits (`_k16`) saves one (docs/arm64-targets.md)
 stencil!("call_done"; |s| {
     if s.acc.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
         exit!(s)
@@ -5538,6 +5625,7 @@ stencil!("tier_count"; |s| {
     next!(s)
 });
 
+// target aarch64 guard_word: 10 address (3), `ldr`, word (4), `cmp`, `b.ne` (docs/arm64-targets.md)
 stencil!("guard_word"; |s| {
     if *(imm64() as *const u64) != imm64b_full() {
         exit!(s)
@@ -5547,6 +5635,7 @@ stencil!("guard_word"; |s| {
 
 // An inlined `new` whose object scalar replacement doesn't allocate: the
 // check `guard_word` makes, then `acc` = `undefined`.
+// target aarch64 ctor_check: 11 `guard_word` and `mov w20, #undefined` (docs/arm64-targets.md)
 stencil!("ctor_check"; |s| {
     if *(imm64() as *const u64) != imm64b_full() {
         exit!(s)
@@ -5557,6 +5646,7 @@ stencil!("ctor_check"; |s| {
 
 // In an exit: allocate an object scalar replacement left unallocated
 // (`imm64` describes it, `jit::Mat`), from the spilled registers.
+// target aarch64 materialize: 8 a runtime call (docs/arm64-targets.md)
 stencil!("materialize"; |s| {
     rt_call!(s, cloison_rt_materialize, Value::from_bits(s.regs as u64), Value::from_bits(imm64()));
     next!(s)
@@ -5754,6 +5844,7 @@ macro_rules! array_methods {
         });
         // An int32 fits elements of any type but objects of a shape
         // (codes 0 to 2; `NO_ELEMENTS` is 3, a shape's address more).
+        // target aarch64 array_push_i_nc_g{}: 12 now 13 `orr x10, x22, x20` alone boxes the int32 (docs/arm64-targets.md)
         stencil_slow!("array_push_i_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
             if !$array(s.tag, a) {
@@ -5793,6 +5884,7 @@ macro_rules! array_methods {
         // `LENGTH_READ_ONLY`, `SPARSE`: it throws, or the elements aren't
         // all there is), and for a hole at the end, which a prototype may
         // fill.
+        // target aarch64 array_pop_nc_g{}: 10 now 14 `sub` first, then `ldr`/`str [x9, w8, uxtw #3]` (13 on 2026-10-10; docs/arm64-targets.md)
         stencil!("array_pop_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
             if !$poppable(s.tag, a) {
@@ -5990,6 +6082,7 @@ math_max!("math_min_m", false);
 // (`imm64`), or leave before the call.
 macro_rules! check_callee {
     ($loc:tt) => {
+        // target aarch64 check_callee_g{}: 5 callee (3), `cmp`, branch (docs/arm64-targets.md)
         stencil!("check_callee_", loc!($loc); |s| {
             if get!($loc, s).to_bits() != imm64() {
                 exit!(s)
@@ -6012,6 +6105,7 @@ macro_rules! check_callee {
         });
         // A case of a polymorphic inlined call: another callee takes the
         // branch, to the next case.
+        // target aarch64 callee_jne_g{}: 5 callee (3), `cmp`, branch (docs/arm64-targets.md)
         stencil!("callee_jne_", loc!($loc); |s| {
             if get!($loc, s).to_bits() != imm64() {
                 jump!(s)

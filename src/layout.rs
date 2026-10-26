@@ -119,6 +119,10 @@ pub enum Class {
     /// A Temporal object: its internal slots in bytes `elems` points to
     /// (see `temporal`).
     Temporal,
+    /// An `Intl` object (an `Intl.Collator`): its internal slots in hidden
+    /// in-object slots, beyond its shape's capacity, as a native closure's
+    /// data (see `promise::native_closure`, and `intl`).
+    Intl,
 }
 
 /// [`Class`] numbers as a header's byte holds them, for patterns.

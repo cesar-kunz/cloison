@@ -9,9 +9,16 @@ default = ["acc-i32"]
 # Accumulator type-state dispatch (see src/interp.rs). Optional so it can be
 # benchmarked against plain ANY-state dispatch.
 acc-i32 = []
+# ECMA-402's `Intl` (`Intl.Collator` alone so far), on ICU4X, its locale
+# data read at runtime from a blob (see docs/intl.md).
+intl = ["dep:icu_collator", "dep:icu_locale_core", "dep:icu_provider", "dep:icu_provider_blob"]
 
 [dependencies]
 libc = "0.2"
+icu_collator = { version = "2.4", default-features = false, features = ["serde"], optional = true }
+icu_locale_core = { version = "2.4", default-features = false, optional = true }
+icu_provider = { version = "2.4", default-features = false, features = ["sync"], optional = true }
+icu_provider_blob = { version = "2.4", default-features = false, features = ["alloc"], optional = true }
 
 [profile.release]
 opt-level = 3

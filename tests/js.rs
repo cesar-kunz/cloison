@@ -3836,6 +3836,50 @@ r.join(" ");
     );
 }
 
+/// `Intl.Collator` (the `intl` feature): ICU4X's root collation for
+/// English, its options (sensitivity, numeric, caseFirst, punctuation),
+/// in the options or the locale's `-u-` keywords, and the locale it
+/// resolves to. V8's and SpiderMonkey's results.
+#[cfg(feature = "intl")]
+#[test]
+fn intl_collators_compare_by_locale_and_options() {
+    let src = r#"
+var words = ["b", "a", "B", "A", "file10", "file9", "_x", "$y", "ä", "a1", "a01", "Zeta", "zeta", "éclair", "eclair", "x-y", "xy", "ß", "ss"];
+var c = new Intl.Collator(undefined, { usage: "sort", sensitivity: "variant", numeric: true });
+var cmp = (o, xs) => xs.map(x => new Intl.Collator("en", o).compare("a", x)).join(",");
+var r = [
+  words.slice().sort(c.compare).join(" "),
+  JSON.stringify(c.resolvedOptions()),
+  c.compare === c.compare, c.compare.length, c.compare.name === "",
+  Object.prototype.toString.call(c), String(Intl),
+  ["b", "a", "B", "A"].sort(new Intl.Collator("en", { caseFirst: "upper" }).compare).join(""),
+  ["b", "a", "B", "A"].sort(Intl.Collator("en-u-kf-lower").compare).join(""),
+  cmp({ sensitivity: "base" }, ["á", "A"]), cmp({ sensitivity: "accent" }, ["á", "A"]),
+  cmp({ sensitivity: "case" }, ["á", "A"]), cmp({}, ["á", "A", "b"]),
+  new Intl.Collator("en", { ignorePunctuation: true }).compare("a-b", "ab"),
+  new Intl.Collator("en-US-u-kn-kf-upper", { caseFirst: "lower" }).resolvedOptions().locale,
+  Intl.Collator.supportedLocalesOf(["EN-us", "en-u-co-phonebk", "en-GB-oxendict"]).join(),
+  c.compare(undefined, "undefined"),
+];
+for (var f of [() => new Intl.Collator("en_US"), () => new Intl.Collator("en", { usage: "x" }), () => Intl.Collator.prototype.compare, () => new Intl.Collator([1])])
+  try { f(); r.push("no error") } catch (e) { r.push(e.name) }
+class C extends Intl.Collator {}
+r.push(new C() instanceof C, new C().compare("a", "b"));
+r.join(" | ");
+"#;
+    assert_eq!(
+        value(src),
+        "_x $y a A ä a1 a01 b B eclair éclair file9 file10 ss ß x-y xy zeta Zeta | {\"locale\":\"en-US\",\"usage\":\"sort\",\"sensitivity\":\"variant\",\"ignorePunctuation\":false,\"collation\":\"default\",\"numeric\":true,\"caseFirst\":\"false\"} | true | 2 | true | [object Intl.Collator] | [object Intl] | AaBb | aAbB | 0,0 | -1,0 | 0,-1 | -1,-1,-1 | 0 | en-US-u-kn | en-US,en-u-co-phonebk,en-GB-oxendict | 0 | RangeError | RangeError | TypeError | TypeError | true | -1"
+    );
+}
+
+/// Without the `intl` feature, there is no `Intl`.
+#[cfg(not(feature = "intl"))]
+#[test]
+fn intl_is_absent_without_its_feature() {
+    assert_eq!(value("typeof Intl"), "undefined");
+}
+
 /// A proxy on the global object's prototype chain answers whether a
 /// global exists (its `has`), and takes stores to globals the global
 /// object hasn't (its `set`). A strict store to one it says doesn't exist

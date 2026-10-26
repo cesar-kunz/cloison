@@ -57,6 +57,8 @@ mod layout;
 mod stencil_verify;
 mod agent;
 mod temporal;
+#[cfg(feature = "intl")]
+mod intl;
 mod dispose;
 mod module;
 mod base64;

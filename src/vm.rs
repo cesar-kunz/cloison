@@ -916,6 +916,12 @@ pub struct Vm {
     pub(crate) can_block: bool,
     /// Temporal's state: its prototypes, the time zones in use.
     pub(crate) temporal: crate::temporal::State,
+    /// `Intl`'s prototypes and the like (empty without the `intl`
+    /// feature: see `intl::Root`).
+    pub(crate) intl_roots: Vec<*mut Object>,
+    /// `Intl`'s state: its collators (see `intl`).
+    #[cfg(feature = "intl")]
+    pub(crate) intl: crate::intl::State,
     /// The agent's part, if it is one (see `agent`).
     pub(crate) agent: crate::agent::State,
     /// `Error.prototype` and its kinds' (see `builtins::ERROR_KINDS`).
@@ -1132,6 +1138,9 @@ impl Vm {
             can_block: true,
             agent: crate::agent::State::default(),
             temporal: crate::temporal::State::default(),
+            intl_roots: Vec::new(),
+            #[cfg(feature = "intl")]
+            intl: crate::intl::State::default(),
             single_chars: vec![Value::EMPTY; 256],
             short_strings: vec![Value::EMPTY; SHORT_STRINGS],
             a_to_string: Atom(0),
@@ -5200,6 +5209,7 @@ impl Vm {
         .chain(std::iter::once(self.eval_function))
         .chain(self.error_prototypes.iter().copied())
         .chain(self.shadow_roots.iter().copied())
+        .chain(self.intl_roots.iter().copied())
         .filter(|o| !o.is_null())
         .map(object_value)
         .collect();

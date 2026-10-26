@@ -744,16 +744,25 @@ fn string_to_well_formed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value>
     Ok(vm.new_string(&out))
 }
 
-/// `normalize(form)`: the string itself (no normalization tables).
+/// `normalize(form)`: the string in Unicode normalization form `form`
+/// (NFC if undefined; see `normalize`).
 fn string_normalize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    use crate::normalize::Form;
     let u = this_units(this)?;
+    let mut form = Form::Nfc;
     if let Some(f) = a.first().filter(|v| !v.is_undefined()) {
-        let f = String::from_utf16_lossy(&units(*f));
-        if !matches!(f.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
-            return Err(Error::range_error("The normalization form should be one of NFC, NFD, NFKC, NFKD."));
-        }
+        form = match String::from_utf16_lossy(&units(*f)).as_str() {
+            "NFC" => Form::Nfc,
+            "NFD" => Form::Nfd,
+            "NFKC" => Form::Nfkc,
+            "NFKD" => Form::Nfkd,
+            _ => return Err(Error::range_error("The normalization form should be one of NFC, NFD, NFKC, NFKD.")),
+        };
     }
-    Ok(this_string(vm, this, &u))
+    match crate::normalize::normalize(&u, form) {
+        Some(n) => Ok(vm.new_string(&n)),
+        None => Ok(this_string(vm, this, &u)),
+    }
 }
 
 /// `String.fromCodePoint(…points)`.

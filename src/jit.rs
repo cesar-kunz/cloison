@@ -15357,9 +15357,11 @@ impl JitFunction {
             return (frame, exit_pc);
         }
         let vm = self.vm.as_mut().unwrap();
-        // The call is the last one of the frame before the instruction an
-        // after-call exit resumes at (a polymorphic call's cases jump past
-        // the others, and past inlined ones: see `after_call`).
+        // The call is the last one before the instruction an after-call
+        // exit resumes at whose exits resume there (a polymorphic call's
+        // cases jump past the others, and past inlined ones: see
+        // `after_call`). It may be in an inlined frame the instruction is
+        // not in: the last of that frame, returning its result.
         let call_before = || {
             let at = snap
                 .insns
@@ -15368,7 +15370,7 @@ impl JitFunction {
                 .expect("an exit's instruction");
             (0..at)
                 .rev()
-                .find(|&k| snap.insns[k].frame as usize == frame && snap.insns[k].is_call())
+                .find(|&k| snap.insns[k].is_call() && self::after_call(&snap.insns, k) == at)
                 .expect("the call an after-call exit follows")
         };
         // A call that found the native stack too deep: the interpreter
@@ -15376,7 +15378,8 @@ impl JitFunction {
         // needn't lower the function again (past the limit, every frame
         // leaves at its first call).
         if after_call && std::mem::take(unsafe { &mut (*vm.vm).redo_call }) {
-            return (frame, snap.insns[call_before()].pc);
+            let call = &snap.insns[call_before()];
+            return (call.frame as usize, call.pc);
         }
         let was_dirty = std::mem::replace(&mut vm.dirty, true);
         let out_of_compiles = self.stats.compiles >= max_compiles(vm.root_len);

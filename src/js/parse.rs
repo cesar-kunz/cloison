@@ -1415,7 +1415,22 @@ impl<'a> Parser<'_, 'a, '_> {
                 rename_pattern(&mut pat, &map);
                 map.into_iter().map(|(_, r)| r).collect()
             }
-            None => names,
+            // (A body's `var`s renamed apart, as `var_decls` does: see
+            // `push_body_vars`. Not where a catch parameter is the binding
+            // the store goes to.)
+            None => {
+                let map: Vec<(Name, Name)> = names
+                    .iter()
+                    .map(|n| {
+                        let r = self.resolve_var(n).filter(|r| self.resolve(n).as_ref() == Some(r));
+                        (n.clone(), r.unwrap_or_else(|| n.clone()))
+                    })
+                    .collect();
+                if map.iter().any(|(n, r)| n != r) {
+                    rename_pattern(&mut pat, &map);
+                }
+                map.into_iter().map(|(_, r)| r).collect()
+            }
         };
         for n in names {
             decls.push((n, Some(Expr { kind: ExprKind::Bound, pos })));

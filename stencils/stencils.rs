@@ -1024,8 +1024,11 @@ fn num(tag: NumberTag, v: Value) -> f64 {
 // ---- Accumulator-only and control stencils ----
 
 stencil!("nop"; |s| { next!(s) });
+// target x86_64 jump: 1 `jmp L` (judged 2026-10-26)
+// target aarch64 jump: 1 `b L` (judged 2026-10-26)
 stencil!("jump"; |s| { jump!(s) });
 // target aarch64 return: 2 `ret` with acc in place (docs/arm64-targets.md)
+// target x86_64 return: 2 `mov rax, r12; ret` (judged 2026-10-26)
 stencil!("return"; |s| { s.acc });
 
 // Exit stub tail: record the bytecode offset (`imm`) and return to the driver.
@@ -1041,6 +1044,9 @@ stencil!("lda_smi"; |s| {
 });
 
 // `lda_smi` with an unboxed int32 result (specialized code).
+// target x86_64 lda_smi_i: 1 `mov r12d, k` (judged 2026-10-26)
+// target aarch64 lda_smi_i: 2 now 3 `movz w20, #lo; movk w20, #hi, lsl #16`, not through w8 (judged 2026-10-26)
+// target aarch64 lda_smi_i_k16: 1 now 2 `movz w20, #k` (judged 2026-10-26)
 imm_variants!("lda_smi_i"; |s, k| {
     #[cfg(target_arch = "x86_64")]
     {
@@ -1057,6 +1063,8 @@ imm_variants!("lda_smi_i"; |s, k| {
     next!(s)
 });
 
+// target x86_64 add_smi: 7 `cmp r12, r14; jb slow; mov eax, k; add eax, r12d; jo slow; mov r12d, eax; or r12, r14` (in place with an undo: 4; judged 2026-10-26)
+// target aarch64 add_smi: 7 `cmp; b.lo slow; movz; movk; adds w8, w20, w8; b.vs slow; orr x20, x22, x8` (a `_k16` variant: 6; judged 2026-10-26)
 stencil_slow!("add_smi"; |s| {
     if s.tag.is_int32(s.acc)
         && let Some(sum) = int(s.acc).checked_add(imm())
@@ -1107,6 +1115,9 @@ imm_variants!("add_smi_i"; |s, k| {
 });
 
 // See `add_wrap_ii_*`.
+// target x86_64 add_smi_wrap_i: 1 now 2 `add r12d, k`, the immediate in the `add` as `add_smi_i` (judged 2026-10-26)
+// target aarch64 add_smi_wrap_i: 3 `movz w8; movk w8; add w20, w20, w8` (judged 2026-10-26)
+// target aarch64 add_smi_wrap_i_k16: 1 now 2 `add w20, w20, #k`: needs `k` in `imm12` (judged 2026-10-26)
 imm_variants!("add_smi_wrap_i"; |s, k| {
     s.acc = unboxed(int(s.acc).wrapping_add(k));
     next!(s)
@@ -1117,6 +1128,8 @@ stencil!("undo_add_smi_i"; |s| {
     next!(s)
 });
 
+// target x86_64 add_smi_iif: 4 now 6 `movsxd rax, r12d; add rax, k; xorps xmm0, xmm0; cvtsi2sd xmm0, rax` (k sign-extended in the `add`; judged 2026-10-26)
+// target aarch64 add_smi_iif: 5 `movz; movk; sxtw x8, w8; add x8, x8, w20, sxtw; scvtf d0, x8` (judged 2026-10-26)
 stencil!("add_smi_iif"; |s| {
     s.facc = l2f(int(s.acc) as i64 + imm() as i64);
     next!(s)
@@ -1130,6 +1143,8 @@ stencil!("add_smi_f"; |s| {
     next!(s)
 });
 
+// target x86_64 inc: 7 `cmp r12, r14; jb slow; mov eax, r12d; inc eax; jo slow; mov r12d, eax; or r12, r14` (judged 2026-10-26)
+// target aarch64 inc: 5 `cmp x20, x22; b.lo slow; adds w8, w20, #1; b.vs slow; orr x20, x22, x8` (judged 2026-10-26)
 stencil_slow!("inc"; |s| {
     if s.tag.is_int32(s.acc)
         && let Some(n) = int(s.acc).checked_add(1)
@@ -1143,6 +1158,8 @@ stencil_slow!("inc"; |s| {
     next!(s)
 });
 
+// target x86_64 inc_i: 2 now 4 `add r12d, 1; jo exit`, in place, the stub undoing it as `add_smi_i`'s (judged 2026-10-26)
+// target aarch64 inc_i: 2 now 3 `adds w20, w20, #1; b.vs exit`, in place, with an undo stub (judged 2026-10-26)
 stencil!("inc_i"; |s| {
     match int(s.acc).checked_add(1) {
         Some(n) => {
@@ -1211,6 +1228,8 @@ stencil!("jlt_smi_f"; |s| {
 });
 
 // int32 acc → double facc, where a join widened acc's type.
+// target x86_64 conv_acc_f: 2 `xorps xmm0, xmm0; cvtsi2sd xmm0, r12d` (judged 2026-10-26)
+// target aarch64 conv_acc_f: 1 `scvtf d0, w20` (judged 2026-10-26)
 stencil!("conv_acc_f"; |s| {
     s.facc = i2f(int(s.acc));
     next!(s)
@@ -1221,11 +1240,15 @@ stencil!("conv_acc_f"; |s| {
 // Box an int32 acc (low 32 bits valid, high bits 0 or the tag): before
 // generic stencils, exits and `return`, and where a join widens acc from
 // int32 to any. `or`-ing the tag is right for both forms.
+// target x86_64 box_iacc: 1 `or r12, r14` (judged 2026-10-26)
+// target aarch64 box_iacc: 1 `orr x20, x22, x20` (judged 2026-10-26)
 stencil!("box_iacc"; |s| {
     s.acc = s.tag.rebox(s.acc);
     next!(s)
 });
 
+// target x86_64 box_facc: 2 `movq r12, xmm0; sub r12, r14` (judged 2026-10-26)
+// target aarch64 box_facc: 2 `fmov x8, d0; sub x20, x8, x22` (judged 2026-10-26)
 stencil!("box_facc"; |s| {
     s.acc = s.tag.encode_f64(s.facc);
     next!(s)
@@ -1242,16 +1265,24 @@ stencil!("unbox_facc"; |s| {
 macro_rules! boxed_location {
     ($loc:tt) => {
         // target aarch64 ldar_m: 1 `ldr x20, [x21, #off]` (docs/arm64-targets.md)
+        // target x86_64 ldar_m,ldar_g{}: 1 `mov r12, [r13+off]` / `mov r12, rdi` (judged 2026-10-26)
+        // target aarch64 ldar_g{}: 1 `mov x20, x24` (judged 2026-10-26)
         stencil!("ldar_", loc!($loc); |s| {
             s.acc = get!($loc, s);
             next!(s)
         });
+        // target x86_64 ldar_m_f: 3 `mov rax, r14; add rax, [r13+off]; movq xmm0, rax` (judged 2026-10-26)
+        // target x86_64 ldar_g{}_f: 2 `lea rax, [rdi+r14]; movq xmm0, rax` (judged 2026-10-26)
+        // target aarch64 ldar_m_f: 3 `ldr x8, [x21, #off]; add x8, x8, x22; fmov d0, x8` (judged 2026-10-26)
+        // target aarch64 ldar_g{}_f: 2 `add x8, x24, x22; fmov d0, x8` (judged 2026-10-26)
         stencil!("ldar_", loc!($loc), "_f"; |s| {
             s.facc = s.tag.decode_f64(get!($loc, s));
             next!(s)
         });
         // target aarch64 star_m: 1 `str x20, [x21, #off]` (docs/arm64-targets.md)
         // target aarch64 star_m_i: 2 `orr x20, x22, x20; str` (docs/arm64-targets.md)
+        // target x86_64 star_m,star_g{}: 1 `mov [r13+off], r12` / `mov rdi, r12` (judged 2026-10-26)
+        // target aarch64 star_g{}: 1 `mov x24, x20` (judged 2026-10-26)
         stencil!("star_", loc!($loc); |s| {
             set!($loc, s, s.acc);
             next!(s)
@@ -1259,11 +1290,17 @@ macro_rules! boxed_location {
         // Store an int32 acc, which may be unboxed, into a boxed location.
         // Box acc in place (a boxed int32 is still a valid int32 acc):
         // boxing into a scratch register costs an extra `mov` on x86-64.
+        // target x86_64 star_m_i,star_g{}_i: 2 `or r12, r14; mov [r13+off], r12` / `mov rdi, r12` (judged 2026-10-26)
+        // target aarch64 star_g{}_i: 1 now 3 `orr x24, x22, x20`, acc left as it is (judged 2026-10-26)
         stencil!("star_", loc!($loc), "_i"; |s| {
             s.acc = s.tag.rebox(s.acc);
             set!($loc, s, s.acc);
             next!(s)
         });
+        // target x86_64 star_g{}_f: 2 `movq rdi, xmm0; sub rdi, r14` (judged 2026-10-26)
+        // target x86_64 star_m_f: 3 `movq rax, xmm0; sub rax, r14; mov [r13+off], rax` (judged 2026-10-26)
+        // target aarch64 star_g{}_f: 2 `fmov x8, d0; sub x24, x8, x22` (judged 2026-10-26)
+        // target aarch64 star_m_f: 3 `fmov x8, d0; sub x8, x8, x22; str` (judged 2026-10-26)
         stencil!("star_", loc!($loc), "_f"; |s| {
             set!($loc, s, s.tag.encode_f64(s.facc));
             next!(s)
@@ -1274,6 +1311,9 @@ macro_rules! boxed_location {
             next!(s)
         });
 
+        // target x86_64 add_g{},add_m: 9 `mov rax, rsi; and rax, r12; cmp rax, r14; jb slow; mov eax, esi; add eax, r12d; jo slow; mov r12d, eax; or r12, r14` (judged 2026-10-26)
+        // target aarch64 add_g{}: 6 `and x8, x24, x20; cmp x8, x22; b.lo slow; adds w8, w20, w24; b.vs slow; orr x20, x22, x8` (judged 2026-10-26)
+        // target aarch64 add_m: 7 as add_g{} after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil_slow!("add_", loc!($loc); |s| {
             let rhs = get!($loc, s);
             if s.tag.both_int32(s.acc, rhs)
@@ -1299,6 +1339,9 @@ macro_rules! boxed_location {
             s.acc = rt_add!(s, s.acc, rhs);
             next!(s)
         });
+        // target x86_64 add_ii_*: 2 now 4 `add r12d, esi; jo exit` (`_m`: `add r12d, [r13+k]`), in place, with an undo stub (`sub`) as `add_smi_i` (judged 2026-10-26)
+        // target aarch64 add_ii_[gu]{}: 2 now 3 `adds w20, w20, w24; b.vs exit`, in place, with an undo stub (judged 2026-10-26)
+        // target aarch64 add_ii_m: 3 now 4 `ldr w8, [x21, #off]; adds w20, w20, w8; b.vs exit`, in place (judged 2026-10-26)
         stencil!("add_ii_", loc!($loc); |s| {
             match int(s.acc).checked_add(int(get!($loc, s))) {
                 Some(sum) => {
@@ -1310,27 +1353,49 @@ macro_rules! boxed_location {
         });
         // An add whose result only feeds a bitwise operation (ToInt32):
         // `(a + b) | 0` is the wrapping add, so no overflow check.
+        // target x86_64 add_wrap_ii_*: 1 `add r12d, esi` (`_m`: `add r12d, [r13+k]`; judged 2026-10-26)
+        // target aarch64 add_wrap_ii_[gu]{}: 1 `add w20, w24, w20` (judged 2026-10-26)
+        // target aarch64 add_wrap_ii_m: 2 `ldr w8, [x21, #off]; add w20, w20, w8` (judged 2026-10-26)
         stencil!("add_wrap_ii_", loc!($loc); |s| {
             s.acc = unboxed(int(s.acc).wrapping_add(int(get!($loc, s))));
             next!(s)
         });
+        // target x86_64 add_iif_*: 5 `movsxd rax, r12d; movsxd r10, esi; add r10, rax; xorps xmm0, xmm0; cvtsi2sd xmm0, r10` (judged 2026-10-26)
+        // target aarch64 add_iif_[gu]{}: 3 `sxtw x8, w24; add x8, x8, w20, sxtw; scvtf d0, x8` (judged 2026-10-26)
+        // target aarch64 add_iif_m: 3 now 4 `ldrsw x8, [x21, #off]` for `ldr; sxtw` (judged 2026-10-26)
         stencil!("add_iif_", loc!($loc); |s| {
             s.facc = l2f(int(s.acc) as i64 + int(get!($loc, s)) as i64);
             next!(s)
         });
+        // target x86_64 add_if_g{}: 5 `xorps; cvtsi2sd xmm8, r12d; lea rax, [rsi+r14]; movq xmm0, rax; addsd xmm0, xmm8` (judged 2026-10-26)
+        // target x86_64 add_if_m: 6 as add_if_g{} with `mov rax, r14; add rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 add_if_g{}: 4 `scvtf d0, w20; add x8, x24, x22; fmov d8, x8; fadd d0, d0, d8` (judged 2026-10-26)
+        // target aarch64 add_if_m: 5 as add_if_g{} after `ldr` (judged 2026-10-26)
         stencil!("add_if_", loc!($loc); |s| {
             s.facc = i2f(int(s.acc)) + s.tag.decode_f64(get!($loc, s));
             next!(s)
         });
+        // target x86_64 add_fi_g{}: 3 `xorps xmm8, xmm8; cvtsi2sd xmm8, esi; addsd xmm0, xmm8` (judged 2026-10-26)
+        // target x86_64 add_fi_m: 3 now 4 `xorps; cvtsi2sd xmm8, dword [r13+k]; addsd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 add_fi_g{}: 2 `scvtf d8, w24; fadd d0, d0, d8` (judged 2026-10-26)
+        // target aarch64 add_fi_m: 3 `ldr x8, [x21, #k]; scvtf d8, w8; fadd d0, d0, d8` (judged 2026-10-26)
         stencil!("add_fi_", loc!($loc); |s| {
             s.facc += i2f(int(get!($loc, s)));
             next!(s)
         });
+        // target x86_64 add_ff_g{}: 3 `lea rax, [rsi+r14]; movq xmm8, rax; addsd xmm0, xmm8` (judged 2026-10-26)
+        // target x86_64 add_ff_m: 4 `mov rax, r14; add rax, [r13+k]; movq xmm8, rax; addsd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 add_ff_g{}: 3 `add x8, x24, x22; fmov d8, x8; fadd d0, d0, d8` (judged 2026-10-26)
+        // target aarch64 add_ff_m: 4 `ldr; add; fmov; fadd` (judged 2026-10-26)
         stencil!("add_ff_", loc!($loc); |s| {
             s.facc += s.tag.decode_f64(get!($loc, s));
             next!(s)
         });
 
+        // target x86_64 jlt_g{}: 6 `mov rax, rsi; and rax, r12; cmp rax, r14; jb slow; cmp r12d, esi; jl L` (judged 2026-10-26)
+        // target x86_64 jlt_m: 6 now 7 `mov rax, r12; and rax, [r13+k]; ...; cmp r12d, [r13+k]; jl L` (a `mov` copy; judged 2026-10-26)
+        // target aarch64 jlt_g{}: 5 `and x8, x24, x20; cmp x8, x22; b.lo slow; cmp w20, w24; b.lt L` (judged 2026-10-26)
+        // target aarch64 jlt_m: 6 `ldr`, then as `jlt_g{}` (judged 2026-10-26)
         stencil_slow!("jlt_", loc!($loc); |s| {
             let rhs = get!($loc, s);
             if !s.tag.both_int32(s.acc, rhs) {
@@ -1381,11 +1446,13 @@ macro_rules! gpr_slot {
     ($k:literal) => {
         boxed_location!([g $k]);
         // target aarch64 enter_g{}: 1 `ldr x24, [x21, #off]` (docs/arm64-targets.md)
+        // target x86_64 enter_g{}: 1 `mov rdi, [r13+off]` (judged 2026-10-26)
         stencil!("enter_g", $k; |s| {
             s.g[$k] = load_m(s.regs);
             next!(s)
         });
         // target aarch64 spill_g{}: 1 `str x24, [x21, #off]` (docs/arm64-targets.md)
+        // target x86_64 spill_g{}: 1 `mov [r13+off], rdi` (judged 2026-10-26)
         stencil!("spill_g", $k; |s| {
             store_m(s.regs, s.g[$k]);
             next!(s)
@@ -1397,10 +1464,14 @@ macro_rules! gpr_slot {
 
 macro_rules! fp_slot {
     ($k:literal) => {
+        // target x86_64 ldar_f{}: 1 `movaps xmm0, xmm1` (judged 2026-10-26)
+        // target aarch64 ldar_f{}: 1 `fmov d0, d1` (judged 2026-10-26)
         stencil!("ldar_f", $k; |s| {
             s.facc = s.f[$k];
             next!(s)
         });
+        // target x86_64 star_f{}: 1 `movaps xmm1, xmm0` (judged 2026-10-26)
+        // target aarch64 star_f{}: 1 `fmov d1, d0` (judged 2026-10-26)
         stencil!("star_f", $k; |s| {
             s.f[$k] = s.facc;
             next!(s)
@@ -1411,15 +1482,21 @@ macro_rules! fp_slot {
             next!(s)
         });
 
+        // target x86_64 add_f{}: 11 runtime call, `push rax` … `pop rax` for alignment (judged 2026-10-26)
+        // target aarch64 add_f{}: 9 now 10 runtime call: `str x30` / `ldr x30`, not the frame-pointer `stp; mov x29, sp; ldp` (judged 2026-10-26)
         stencil!("add_f", $k; |s| {
             let rhs = s.tag.encode_f64(s.f[$k]);
             s.acc = rt_add!(s, s.acc, rhs);
             next!(s)
         });
+        // target x86_64 add_if_f{}: 3 `xorps xmm0, xmm0; cvtsi2sd xmm0, r12d; addsd xmm0, xmm2` (judged 2026-10-26)
+        // target aarch64 add_if_f{}: 2 `scvtf d0, w20; fadd d0, d1, d0` (judged 2026-10-26)
         stencil!("add_if_f", $k; |s| {
             s.facc = i2f(int(s.acc)) + s.f[$k];
             next!(s)
         });
+        // target x86_64 add_ff_f{}: 1 `addsd xmm0, xmm2` (judged 2026-10-26)
+        // target aarch64 add_ff_f{}: 1 `fadd d0, d0, d1` (judged 2026-10-26)
         stencil!("add_ff_f", $k; |s| {
             s.facc += s.f[$k];
             next!(s)
@@ -1454,6 +1531,8 @@ macro_rules! fp_slot {
             s.f[$k] = s.tag.decode_f64(load_m(s.regs));
             next!(s)
         });
+        // target x86_64 spill_f{}: 3 `movq rax, xmm1; sub rax, r14; mov [r13+off], rax` (judged 2026-10-26)
+        // target aarch64 spill_f{}: 3 `fmov x8, d1; sub x8, x8, x22; str` (judged 2026-10-26)
         stencil!("spill_f", $k; |s| {
             store_m(s.regs, s.tag.encode_f64(s.f[$k]));
             next!(s)
@@ -1534,6 +1613,8 @@ macro_rules! fp_gpr_pairs {
 
 macro_rules! fused_gpr {
     ($a:tt) => {
+        // target x86_64 addi_g{}: 3 now 5 `add esi, k; jo exit; or rsi, r14`, in place with an undo stub as `addi_u` (4 without: `mov eax, esi; add eax, k; jo exit; lea rsi, [rax+r14]`; judged 2026-10-26)
+        // target aarch64 addi_g{}: 5 `movz; movk; adds w8, w24, w8; b.vs exit; orr x24, x22, x8` (a `_k16` variant 4, `imm12` 3; judged 2026-10-26)
         stencil!("addi_g", $a; |s| {
             match int(s.g[$a]).checked_add(imm()) {
                 Some(v) => {
@@ -1586,6 +1667,8 @@ macro_rules! fused_gpr_gpr {
 
 macro_rules! fused_fp {
     ($a:tt) => {
+        // target x86_64 addi_f{}: 4 `mov eax, k; xorps xmm8, xmm8; cvtsi2sd xmm8, eax; addsd xmm2, xmm8` (judged 2026-10-26)
+        // target aarch64 addi_f{}: 4 `movz; movk; scvtf d8, w8; fadd d1, d1, d8` (judged 2026-10-26)
         stencil!("addi_f", $a; |s| {
             s.f[$a] += i2f(imm());
             next!(s)
@@ -1645,15 +1728,20 @@ fn unboxed(i: i32) -> Value {
 macro_rules! int_slot {
     ($k:tt) => {
         // acc typed int32 may be unboxed, so this is a plain move.
+        // target x86_64 ldar_u{}: 1 `mov r12, rdi` (judged 2026-10-26)
+        // target aarch64 ldar_u{}: 1 `mov x20, x24` (judged 2026-10-26)
         stencil!("ldar_u", $k; |s| {
             s.acc = s.g[$k];
             next!(s)
         });
+        // target x86_64 star_u{}: 1 `mov edi, r12d`: zero-extends, acc may carry the tag (judged 2026-10-26)
+        // target aarch64 star_u{}: 1 `mov w24, w20` (judged 2026-10-26)
         stencil!("star_u", $k; |s| {
             s.g[$k] = unboxed(int(s.acc));
             next!(s)
         });
         // target aarch64 enter_u{}: 1 `ldr w24, [x21, #off]` (docs/arm64-targets.md)
+        // target x86_64 enter_u{}: 1 `mov edi, dword [r13+off]` (judged 2026-10-26)
         stencil!("enter_u", $k; |s| {
             s.g[$k] = load_m_unboxed(s.regs);
             next!(s)
@@ -1665,6 +1753,7 @@ macro_rules! int_slot {
             next!(s)
         });
         // target aarch64 spill_u{}: 2 `orr x8, x24, x22; str` (docs/arm64-targets.md)
+        // target x86_64 spill_u{}: 2 now 3 `lea rax, [rdi+r14]; mov [r13+off], rax`: zero-extended slot, so `add` = `or` (judged 2026-10-26)
         stencil!("spill_u", $k; |s| {
             store_m(s.regs, s.tag.rebox(s.g[$k]));
             next!(s)
@@ -1677,6 +1766,8 @@ macro_rules! int_slot {
             next!(s)
         });
 
+        // target x86_64 add_u{}: 7 `cmp r12, r14; jb slow; mov eax, esi; add eax, r12d; jo slow; mov r12d, eax; or r12, r14` (judged 2026-10-26)
+        // target aarch64 add_u{}: 5 `cmp x20, x22; b.lo slow; adds w8, w20, w24; b.vs slow; orr x20, x22, x8` (judged 2026-10-26)
         stencil_slow!("add_u", $k; |s| {
             if s.tag.is_int32(s.acc)
                 && let Some(sum) = int(s.acc).checked_add(raw(s.g[$k]))
@@ -1707,11 +1798,15 @@ macro_rules! int_slot {
             s.facc = l2f(int(s.acc) as i64 + raw(s.g[$k]) as i64);
             next!(s)
         });
+        // target x86_64 add_fi_u{}: 3 `xorps xmm8, xmm8; cvtsi2sd xmm8, esi; addsd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 add_fi_u{}: 2 `scvtf d8, w24; fadd d0, d0, d8` (judged 2026-10-26)
         stencil!("add_fi_u", $k; |s| {
             s.facc += i2f(raw(s.g[$k]));
             next!(s)
         });
 
+        // target x86_64 jlt_u{}: 4 `cmp r12, r14; jb slow; cmp r12d, esi; jl L` (judged 2026-10-26)
+        // target aarch64 jlt_u{}: 4 `cmp x20, x22; b.lo slow; cmp w20, w24; b.lt L` (judged 2026-10-26)
         stencil_slow!("jlt_u", $k; |s| {
             if !s.tag.is_int32(s.acc) {
                 slow!(s)
@@ -1745,6 +1840,8 @@ macro_rules! int_slot {
         // exit still happens "before" the instruction. Writing the slot
         // first lets the add happen in place: `add edi, k; jo exit`.
         // target aarch64 addi_u{}_k16: 2 now 3 `adds w24, w24, #k; b.vs exit`: needs `k` in `imm12` (docs/arm64-targets.md)
+        // target x86_64 addi_u{}: 2 `add esi, k; jo exit` (docs/opcode-targets.md, group 1)
+        // target aarch64 addi_u{}: 4 `movz; movk; adds w24, w24, w8; b.vs exit` (judged 2026-10-26)
         imm_variants!("addi_u", $k; |s, k| {
             #[cfg(target_arch = "x86_64")]
             {
@@ -1881,6 +1978,8 @@ with_gprs!(fp_gpr_pairs! fp_int_slot_pair);
 
 macro_rules! mov_int_pair {
     ($c:tt, $a:tt) => {
+        // target x86_64 mov_u{}_u{}: 1 `mov rdi, rsi` (0 when c = a) (judged 2026-10-26)
+        // target aarch64 mov_u{}_u{}: 1 `mov x24, x25` (0 when c = a) (judged 2026-10-26)
         stencil!("mov_u", $c, "_u", $a; |s| {
             s.g[$c] = s.g[$a];
             next!(s)
@@ -1890,6 +1989,8 @@ macro_rules! mov_int_pair {
 
 macro_rules! mov_fp_pair {
     ($c:tt, $a:tt) => {
+        // target x86_64 mov_f{}_f{}: 1 `movaps xmm1, xmm2` (0 when c = a) (judged 2026-10-26)
+        // target aarch64 mov_f{}_f{}: 1 `fmov d1, d2` (0 when c = a) (judged 2026-10-26)
         stencil!("mov_f", $c, "_f", $a; |s| {
             s.f[$c] = s.f[$a];
             next!(s)
@@ -1899,6 +2000,8 @@ macro_rules! mov_fp_pair {
 
 macro_rules! mov_fp_int_pair {
     ($c:tt, $a:tt) => {
+        // target x86_64 mov_f{}_u{}: 2 `xorps xmm1, xmm1; cvtsi2sd xmm1, edi` (judged 2026-10-26)
+        // target aarch64 mov_f{}_u{}: 1 `scvtf d1, w24` (judged 2026-10-26)
         stencil!("mov_f", $c, "_u", $a; |s| {
             s.f[$c] = i2f(raw(s.g[$a]));
             next!(s)
@@ -1912,10 +2015,14 @@ cartesian!(mov_fp_pair [0 1 2 3 4 5 6] [0 1 2 3 4 5 6]);
 
 // ---- Constants, bitwise and modulo operations, ToBoolean jumps ----
 
+// target x86_64 lda_true: 1 `mov r12d, 7` (judged 2026-10-26)
+// target aarch64 lda_true: 1 `mov w20, #7` (judged 2026-10-26)
 stencil!("lda_true"; |s| {
     s.acc = Value::TRUE;
     next!(s)
 });
+// target x86_64 lda_false: 1 `mov r12d, 6` (judged 2026-10-26)
+// target aarch64 lda_false: 1 `mov w20, #6` (judged 2026-10-26)
 stencil!("lda_false"; |s| {
     s.acc = Value::FALSE;
     next!(s)
@@ -1928,6 +2035,10 @@ stencil!("lda_false"; |s| {
 // cached prototype gets the cached result. Else, and on a miss, through
 // the runtime, which fills the cache; out to the interpreter (before)
 // where it would throw (0).
+// target x86_64 test_instanceof_m: 25 now 28 `... cmp r11, [rax]; jne e1; cmp rbx, [rax+8]; je hit0; cmp r11, [rax+0x18]; ...`: entries by displacement, the offset by `imm_zext` (judged 2026-10-26)
+// target aarch64 test_instanceof_m: 30 now 34 `... ldp x12, x13, [x8]; cmp; b.ne e1; cmp; b.eq hit0; ldp x12, x13, [x8, #24]; ...` (judged 2026-10-26)
+// target x86_64 test_instanceof_m__slow: 12 now 15 the three arguments pushed, no `mov r11d, 0xA` (judged 2026-10-26)
+// target aarch64 test_instanceof_m__slow: 15 now 16 no `mov w9, #10` (judged 2026-10-26)
 stencil_slow!("test_instanceof_m"; |s| {
     let v = load_m(s.regs);
     let c = imm64() as *const InstanceOfEntry;
@@ -2010,10 +2121,14 @@ stencil!("test_in_m"; |s| {
     next!(s)
 });
 
+// target x86_64 lda_undefined: 1 `mov r12d, 0xA` (judged 2026-10-26)
+// target aarch64 lda_undefined: 1 `mov w20, #10` (judged 2026-10-26)
 stencil!("lda_undefined"; |s| {
     s.acc = Value::UNDEFINED;
     next!(s)
 });
+// target x86_64 lda_null: 1 `mov r12d, 2` (judged 2026-10-26)
+// target aarch64 lda_null: 1 `mov w20, #2` (judged 2026-10-26)
 stencil!("lda_null"; |s| {
     s.acc = Value::NULL;
     next!(s)
@@ -2039,6 +2154,10 @@ fn f64_to_int32(d: f64) -> Option<i32> {
 
 macro_rules! bitwise_smi {
     ($name:literal, $op:tt, $x86:literal) => {
+        // target x86_64 bit_or_smi: 4 now 6 `cmp r12, r14; jb slow; mov eax, k; or r12, rax`: OR-ing a zero-extended k into a boxed int32 keeps it boxed (judged 2026-10-26)
+        // target aarch64 bit_or_smi: 5 now 6 `cmp x20, x22; b.lo slow; movz w8; movk w8; orr x20, x20, x8` (judged 2026-10-26)
+        // target x86_64 bit_and_smi: 4 now 5 `cmp r12, r14; jb slow; and r12d, k; or r12, r14` (judged 2026-10-26)
+        // target aarch64 bit_and_smi: 6 `cmp; b.lo slow; movz; movk; and w8, w20, w8; orr x20, x8, x22` (judged 2026-10-26)
         stencil_slow!($name; |s| {
             if s.tag.is_int32(s.acc) {
                 s.acc = s.tag.box_i32(int(s.acc) $op imm());
@@ -2072,6 +2191,8 @@ macro_rules! bitwise_smi {
             }
             next!(s)
         });
+        // target x86_64 bit_or_smi_f,bit_and_smi_f: 5 now 8 `cvttsd2si rax, xmm0; cmp rax, 1; jo slow; or eax, k; mov r12, rax`: the conversion's 0x8000… for the exponent test (judged 2026-10-26)
+        // target aarch64 bit_or_smi_f,bit_and_smi_f: 8 `fmov; ubfx; cmp #1086; b.hs slow; fcvtzs x8, d0; movz; movk; orr w20, w9, w8` (judged 2026-10-26)
         stencil_slow!($name, "_f"; |s| {
             if let Some(i) = f64_to_int32(s.facc) {
                 s.acc = unboxed(i $op imm());
@@ -2085,6 +2206,9 @@ macro_rules! bitwise_smi {
         });
     };
 }
+// target x86_64 bit_and_smi_i: 1 `and r12d, k` (judged 2026-10-26)
+// target aarch64 bit_and_smi_i: 3 `movz; movk; and w20, w20, w8` (1 for a logical immediate; judged 2026-10-26)
+// target aarch64 bit_and_smi_i_k16: 1 now 2 `and w20, w20, #k` for a logical immediate (as `andi_u{}_k16`; judged 2026-10-26)
 bitwise_smi!("bit_and_smi", &, "and");
 bitwise_smi!("bit_or_smi", |, "or");
 
@@ -2203,6 +2327,9 @@ macro_rules! mod_smi_shift {
             s.acc = Value::from_bits($rem(s.acc.to_bits()));
             next!(s)
         });
+        // target x86_64 mod_smi_i_s[0-9][0-9]: 8 `test r12d, r12d; js slow; mov eax, m; mov ebx, r12d; imul rbx, rax; shr rbx, S; imul ebx, ebx, d; sub r12d, ebx` (judged 2026-10-26)
+        // target aarch64 mod_smi_i_s[0-9][0-9]: 8 now 9 `tbnz w20, #31, slow` for `tst; b.ne`, d (2), m (2), `umull; lsr; msub` (judged 2026-10-26)
+        // target aarch64 mod_smi_i_s*_k16: 7 now 8 as `mod_smi_i_s<S>`, d in one `movz` (judged 2026-10-26)
         stencil_slow!("mod_smi_i_s", $s $(, $suffix)?; |s| {
             if int(s.acc) >= 0 {
                 s.acc = Value::from_bits($rem(s.acc.to_bits()));
@@ -2264,12 +2391,16 @@ stencil!("mod_smi_pow2_iif"; |s| {
 });
 
 // `JumpIfTrue` / `JumpIfFalse`: acc is a boolean.
+// target x86_64 jtrue: 2 now 4 `cmp r12, 7; je L`, not `mov r12d, 7` again (judged 2026-10-26)
+// target aarch64 jtrue: 2 `cmp x20, #7; b.eq L` (judged 2026-10-26)
 stencil!("jtrue"; |s| {
     if s.acc == Value::TRUE {
         jump!(s)
     }
     next!(s)
 });
+// target x86_64 jfalse: 2 now 4 `cmp r12, 6; je L`, not `mov r12d, 6` again (judged 2026-10-26)
+// target aarch64 jfalse: 2 `cmp x20, #6; b.eq L` (judged 2026-10-26)
 stencil!("jfalse"; |s| {
     if s.acc == Value::FALSE {
         jump!(s)
@@ -2280,6 +2411,12 @@ stencil!("jfalse"; |s| {
 // `JumpIfToBooleanTrue` / `False`.
 macro_rules! jump_to_boolean {
     ($name:literal, $want:literal) => {
+        // target x86_64 jtofalse: 4 now 7 `cmp r12, 6; je L; cmp r12, 7; jne int` (judged 2026-10-26)
+        // target x86_64 jtotrue: 4 now 6 `cmp r12, 7; je L; cmp r12, 6; jne int`, not `mov r12d, 7` again (judged 2026-10-26)
+        // target x86_64 jtofalse__slow,jtotrue__slow: 4 now 7 `mov rax, r12; and rax, -9; cmp rax, 2; je L`: `push rax` belongs to the call path (judged 2026-10-26)
+        // target aarch64 jtofalse: 4 now 6 `cmp x20, #6; b.eq L; cmp x20, #7; b.ne int` (judged 2026-10-26)
+        // target aarch64 jtotrue: 4 now 8 `cmp x20, #7; b.eq L; cmp x20, #6; b.ne int`: the int path laid inline (judged 2026-10-26)
+        // target aarch64 jtofalse__slow,jtotrue__slow: 10 now 11 `and; cmp #2; b.eq; tst; b.eq; add; fmov; fcmp; b.eq; b.vs` (judged 2026-10-26)
         stencil_slow!($name; |s| {
             if s.acc == Value::TRUE || s.acc == Value::FALSE {
                 if (s.acc == Value::TRUE) == $want {
@@ -2320,6 +2457,8 @@ macro_rules! jump_to_boolean {
             next!(s)
         });
         // NaN is false: `d < 0 || d > 0`, not `d != 0`.
+        // target x86_64 jtofalse_f,jtotrue_f: 3 `xorpd xmm8, xmm8; ucomisd xmm0, xmm8; je L` (judged 2026-10-26)
+        // target aarch64 jtofalse_f,jtotrue_f: 3 `fcmp d0, #0.0; b.eq L; b.vs L` (judged 2026-10-26)
         stencil!($name, "_f"; |s| {
             if (s.facc < 0.0 || s.facc > 0.0) == $want {
                 jump!(s)
@@ -2444,7 +2583,13 @@ macro_rules! act_imm {
     }};
 }
 
+// target x86_64 test_eq_smi_i: 4 now 5 `xor eax, eax; cmp r12d, k; sete al; lea r12, [rax+6]` (judged 2026-10-26)
+// target aarch64 test_eq_smi_i: 5 `movz; movk; cmp w20, w8; mov w8, #6; cinc x20, x8, eq` (judged 2026-10-26)
+// target aarch64 test_eq_smi_i_k16: 3 now 4 `cmp w20, #k; mov w8, #6; cinc`: needs `k` in `imm12` (judged 2026-10-26)
 cmp_smi!("test_eq_smi", test);
+// target x86_64 teq_smi_j?_i: 2 `cmp r12d, k; je L` (`jne` for `_jf`; judged 2026-10-26)
+// target aarch64 teq_smi_j?_i: 4 `movz; movk; cmp w20, w8; b.eq L` (judged 2026-10-26)
+// target aarch64 teq_smi_j?_i_k16: 2 now 3 `cmp w20, #k; b.eq L`: needs `k` in `imm12` (as `jlt_smi_i_k16`; judged 2026-10-26)
 cmp_smi!("teq_smi_jt", jt);
 cmp_smi!("teq_smi_jf", jf);
 
@@ -2556,6 +2701,18 @@ macro_rules! slow_rel {
 
 macro_rules! cmp_boxed {
     ($loc:tt, $rel:ident, $act:ident, $name:literal) => {
+        // target x86_64 teq_j?_g{}: 6 now 37 the int32 case falling through, `mov rax, rsi; and rax, r12; cmp rax, r14; jb other; cmp esi, r12d; je L`, the rest (`loose_eq_fast`) out of line (judged 2026-10-26)
+        // target x86_64 teq_j?_m: 6 now 38 as `teq_j?_g{}` with `mov rax, r12; and rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 teq_j?_g{}: 5 now 33 `and x8, x24, x20; cmp x8, x22; b.lo other; cmp w24, w20; b.eq L`, the rest out of line (judged 2026-10-26)
+        // target aarch64 teq_j?_m: 6 now 34 `ldr`, then as `teq_j?_g{}` (judged 2026-10-26)
+        // target x86_64 tlt_jf_g{}: 6 `mov rax, rsi; and rax, r12; cmp rax, r14; jb slow; cmp esi, r12d; jge L` (judged 2026-10-26)
+        // target x86_64 tlt_jf_m: 6 now 7 as `tlt_jf_g{}` with `mov rax, r12; and rax, [r13+k]` (a `mov` copy; judged 2026-10-26)
+        // target aarch64 tlt_jf_g{}: 5 `and x8, x24, x20; cmp x8, x22; b.lo slow; cmp w24, w20; b.ge L` (judged 2026-10-26)
+        // target aarch64 tlt_jf_m: 6 `ldr`, then as `tlt_jf_g{}` (judged 2026-10-26)
+        // target x86_64 test_eq_m: 9 now 40 `mov rax, [r13+k]; mov r10, rax; and r10, r12; cmp r10, r14; jb other; xor; cmp eax, r12d; sete; lea r12, [r10+6]`: the int32 path is out of line now, the counted one is objects' (27 by hand) (judged 2026-10-26)
+        // target x86_64 test_eq_g{}: 8 now 39 as test_eq_m without the load: the int32 path is out of line now (judged 2026-10-26)
+        // target aarch64 test_eq_m: 7 now 37 `ldr; and; cmp; b.lo other; cmp w8, w20; mov w9, #6; cinc x20, x9, eq`: the int32 path is out of line now, the counted one is objects' (28 by hand) (judged 2026-10-26)
+        // target aarch64 test_eq_g{}: 6 now 36 as test_eq_m without the load (judged 2026-10-26)
         stencil_slow!($name, "_", loc!($loc); |s| {
             let l = get!($loc, s);
             if s.tag.both_int32(l, s.acc) {
@@ -2573,15 +2730,29 @@ macro_rules! cmp_boxed {
             let c = rel_rt!($rel, s, l, s.acc);
             act!($act, s, c)
         });
+        // target x86_64 test_eq_ii_*: 4 now 5 `xor eax, eax; cmp esi, r12d; sete al; lea r12, [rax+6]`, not `or 6; mov` (judged 2026-10-26)
+        // target aarch64 test_eq_ii_[gu]{}: 3 `cmp w24, w20; mov w8, #6; cinc x20, x8, eq` (judged 2026-10-26)
+        // target aarch64 test_eq_ii_m: 4 `ldr`, then as `test_eq_ii_g{}` (judged 2026-10-26)
+        // target x86_64 teq_j?_ii_*: 2 `cmp esi, r12d; jne L` (`_m`: `cmp [r13+k], r12d`; judged 2026-10-26)
+        // target aarch64 teq_j?_ii_[gu]{}: 2 `cmp w24, w20; b.ne L` (judged 2026-10-26)
+        // target aarch64 teq_j?_ii_m: 3 `ldr; cmp; b.ne L` (judged 2026-10-26)
         stencil!($name, "_ii_", loc!($loc); |s| {
             act!($act, s, rel!($rel, int(get!($loc, s)), int(s.acc)))
         });
         stencil!($name, "_if_", loc!($loc); |s| {
             act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), i2f(int(s.acc))))
         });
+        // target x86_64 tlt_jt_fi_g{}: 4 `xorps xmm8, xmm8; cvtsi2sd xmm8, esi; ucomisd xmm0, xmm8; ja L` (judged 2026-10-26)
+        // target x86_64 tlt_jt_fi_m: 4 now 5 `xorps; cvtsi2sd xmm8, dword [r13+k]; ucomisd xmm0, xmm8; ja L` (judged 2026-10-26)
+        // target aarch64 tlt_jt_fi_g{}: 3 `scvtf d8, w24; fcmp d0, d8; b.gt L` (judged 2026-10-26)
+        // target aarch64 tlt_jt_fi_m: 4 `ldr x8, [x21, #k]; scvtf d8, w8; fcmp d0, d8; b.gt L` (judged 2026-10-26)
         stencil!($name, "_fi_", loc!($loc); |s| {
             act!($act, s, rel!($rel, i2f(int(get!($loc, s))), s.facc))
         });
+        // target x86_64 tlt_jf_ff_g{}: 4 `lea rax, [rsi+r14]; movq xmm8, rax; ucomisd xmm0, xmm8; jbe L` (judged 2026-10-26)
+        // target x86_64 tlt_jf_ff_m: 5 `mov rax, [r13+k]; add rax, r14; movq xmm8, rax; ucomisd xmm0, xmm8; jbe L` (judged 2026-10-26)
+        // target aarch64 tlt_jf_ff_g{}: 4 `add x8, x24, x22; fmov d8, x8; fcmp d0, d8; b.le L` (judged 2026-10-26)
+        // target aarch64 tlt_jf_ff_m: 5 `ldr; add; fmov; fcmp d0, d8; b.le L` (judged 2026-10-26)
         stencil!($name, "_ff_", loc!($loc); |s| {
             act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), s.facc))
         });
@@ -2591,6 +2762,12 @@ macro_rules! cmp_boxed {
 /// A comparison family on an FP slot (an unboxed double).
 macro_rules! cmp_fp {
     ($k:tt, $rel:ident, $act:ident, $name:literal) => {
+        // target x86_64 teq_jt_f{},jlt_f{}: 12 `push rax; movq; sub r, r14; mov; lea rsp; call; lea rsp; cmp rax, -1; je exit; test al, 1; jnz L; pop rax` (judged 2026-10-26)
+        // target x86_64 teq_jf_f{},tlt_jf_f{}: 12 now 13 as `teq_jt_f{}` with `jz L`, not `jne` over a `jmp L` (judged 2026-10-26)
+        // target aarch64 teq_jt_f{},jlt_f{}: 9 now 10 `stp x29, x30; fmov; mov; sub; bl; ldp x29, x30; cmn x8, #1; b.eq exit; tbnz w8, #0, L`: no `mov x29, sp` (judged 2026-10-26)
+        // target aarch64 teq_jf_f{},tlt_jf_f{}: 9 now 11 as `teq_jt_f{}` with `tbz` (judged 2026-10-26)
+        // target x86_64 test_eq_f{}: 12 now 13 runtime call: `and eax, 1; lea r12, [rax+6]` for `and; or; mov` (judged 2026-10-26)
+        // target aarch64 test_eq_f{}: 10 now 11 runtime call: `str x30` / `ldr x30`, not the frame-pointer `stp; mov x29, sp; ldp` (judged 2026-10-26)
         stencil!($name, "_f", $k; |s| {
             let l = s.tag.encode_f64(s.f[$k]);
             let c = rel_rt!($rel, s, l, s.acc);
@@ -2599,6 +2776,8 @@ macro_rules! cmp_fp {
         stencil!($name, "_if_f", $k; |s| {
             act!($act, s, rel!($rel, s.f[$k], i2f(int(s.acc))))
         });
+        // target x86_64 tlt_jf_ff_f{}: 2 `ucomisd xmm0, xmm2; jbe L` (judged 2026-10-26)
+        // target aarch64 tlt_jf_ff_f{}: 2 `fcmp d1, d0; b.pl L` (judged 2026-10-26)
         stencil!($name, "_ff_f", $k; |s| {
             act!($act, s, rel!($rel, s.f[$k], s.facc))
         });
@@ -2608,6 +2787,10 @@ macro_rules! cmp_fp {
 /// A comparison family on an unboxed int32 slot.
 macro_rules! cmp_int {
     ($k:tt, $rel:ident, $act:ident, $name:literal) => {
+        // target x86_64 teq_j?_u{},tlt_jf_u{}: 4 `cmp r12, r14; jb slow; cmp esi, r12d; je L` (judged 2026-10-26)
+        // target aarch64 teq_j?_u{},tlt_jf_u{}: 4 `cmp x20, x22; b.lo slow; cmp w24, w20; b.eq L` (judged 2026-10-26)
+        // target x86_64 test_eq_u{}: 6 now 7 `cmp r12, r14; jb slow; xor eax, eax; cmp esi, r12d; sete al; lea r12, [rax+6]` (judged 2026-10-26)
+        // target aarch64 test_eq_u{}: 5 `cmp x20, x22; b.lo slow; cmp w24, w20; mov w8, #6; cinc x20, x8, eq` (judged 2026-10-26)
         stencil_slow!($name, "_u", $k; |s| {
             if s.tag.is_int32(s.acc) {
                 act!($act, s, rel!($rel, raw(s.g[$k]), int(s.acc)))
@@ -2621,6 +2804,8 @@ macro_rules! cmp_int {
         stencil!($name, "_ii_u", $k; |s| {
             act!($act, s, rel!($rel, raw(s.g[$k]), int(s.acc)))
         });
+        // target x86_64 tlt_jt_fi_u{}: 4 `xorps xmm8, xmm8; cvtsi2sd xmm8, esi; ucomisd xmm0, xmm8; ja L` (judged 2026-10-26)
+        // target aarch64 tlt_jt_fi_u{}: 3 `scvtf d8, w24; fcmp d0, d8; b.gt L` (judged 2026-10-26)
         stencil!($name, "_fi_u", $k; |s| {
             act!($act, s, rel!($rel, i2f(raw(s.g[$k])), s.facc))
         });
@@ -2663,6 +2848,8 @@ cmp_families!(cmp_fp, 6);
 // `teq_jf_u<a>_u<b>`, …; `teq_smi_jt_u<a>`, `tstz_jf_u<a>`, `andi_u<b>`,
 // `ori_u<b>`.
 
+// target x86_64 teq_j?_u{}_u{},tlt_jf_u{}_u{}: 2 `cmp edx, esi; jne L` (1 or 0 on one slot: a jump or nothing; judged 2026-10-26)
+// target aarch64 teq_j?_u{}_u{},tlt_jf_u{}_u{}: 2 `cmp w25, w24; b.ne L` (judged 2026-10-26)
 macro_rules! slot_cmp_pair {
     ($a:tt, $b:tt) => {
         stencil!("tlt_jt_u", $a, "_u", $b; |s| { act!(jt, s, raw(s.g[$b]) < raw(s.g[$a])) });
@@ -2834,6 +3021,10 @@ fn holds(mask: i32, order: u32) -> bool {
 /// `$get` (boxed).
 macro_rules! rel_generic {
     ($name:literal, $loc:expr, $act:ident, |$s:ident| $get:expr) => {
+        // target x86_64 jnrel_m,jrel_m: 13 now 14 `…; jb slow; xor r10d, r10d; cmp eax, r12d; setg r10b; setge bl; add r10b, bl; mov eax, imm; bt eax, r10d; jnc L` (judged 2026-10-26)
+        // target aarch64 jnrel_m,jrel_m: 11 now 12 `…; b.lo slow; movz w9, #mask; cmp; cset gt; cinc ge; lsr; tst; b.eq L`: the mask fits `imm16` (judged 2026-10-26)
+        // target x86_64 test_rel_m: 14 now 15 as jnrel_m, then `mov eax, imm; xor r12d, r12d; bt eax, r10d; adc r12d, 6` (judged 2026-10-26)
+        // target aarch64 test_rel_m: 11 now 12 as jnrel_m, then `mov w20, #6; …; lsr; bfxil`: the mask fits `imm16` (judged 2026-10-26)
         stencil_slow!($name, $loc; |$s| {
             let x = $get;
             if $s.tag.both_int32(x, $s.acc) {
@@ -2865,6 +3056,8 @@ fn is_number(tag: NumberTag, v: Value) -> bool {
 /// either side, equal bits.
 macro_rules! strict_generic {
     ($name:literal, $loc:expr, $act:ident, |$s:ident| $get:expr) => {
+        // target x86_64 test_seq_m: 14 now 31 `mov rax, [r13+k]; cmp rax, r12; je eqbits; mov r10, rax; and r10, r12; cmp r10, r14; jae F; mov r10, rax; or r10, r12; test r10, r14; jnz slow; test r10b, 2; jz slow; mov r12d, 6` (judged 2026-10-26)
+        // target aarch64 test_seq_m: 12 now 21 `ldr; cmp; b.eq eqbits; and; cmp; b.hs F; orr x9, x8, x20; tst x9, x22; b.ne slow; tst x9, #2; b.eq slow; mov w20, #6` (judged 2026-10-26)
         stencil_slow!($name, $loc; |$s| {
             let x = $get;
             // Equal bits are equal but for a NaN; two int32s, or a cell and
@@ -2943,15 +3136,21 @@ macro_rules! group2_generic {
             s.facc = s.tag.decode_f64(get!($loc, s)) - i2f(int(s.acc));
             next!(s)
         });
+        // target x86_64 sub_fi_m: 4 now 5 `xorps; cvtsi2sd xmm8, dword [r13+k]; subsd xmm8, xmm0; movapd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 sub_fi_m: 3 `ldr x8, [x21, #k]; scvtf d8, w8; fsub d0, d8, d0` (judged 2026-10-26)
         stencil!("sub_fi_", loc!($loc); |s| {
             s.facc = i2f(int(get!($loc, s))) - s.facc;
             next!(s)
         });
+        // target x86_64 sub_ff_m: 5 `mov rax, r14; add rax, [r13+k]; movq xmm8, rax; subsd xmm8, xmm0; movapd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 sub_ff_m: 4 `ldr; add; fmov; fsub d0, d8, d0` (judged 2026-10-26)
         stencil!("sub_ff_", loc!($loc); |s| {
             s.facc = s.tag.decode_f64(get!($loc, s)) - s.facc;
             next!(s)
         });
 
+        // target x86_64 mul_m: 11 now 16 `…; jb slow; imul eax, r12d; jo slow; test eax, eax; jz zero; or rax, r14; mov r12, rax`, the sign test out of line as in mul_ii (judged 2026-10-26)
+        // target aarch64 mul_m: 10 now 12 `…; b.lo slow; smull; cmp sxtw; b.ne slow; cbz w9, zero; mov w9, w9; orr x20, x22, x9` (judged 2026-10-26)
         stencil_slow!("mul_", loc!($loc); |s| {
             let l = get!($loc, s);
             if s.tag.both_int32(l, s.acc)
@@ -2987,10 +3186,14 @@ macro_rules! group2_generic {
             s.facc = s.tag.decode_f64(get!($loc, s)) * i2f(int(s.acc));
             next!(s)
         });
+        // target x86_64 mul_fi_m: 3 now 4 `xorps; cvtsi2sd xmm8, dword [r13+k]; mulsd`: the load folded into the conversion (judged 2026-10-26)
+        // target aarch64 mul_fi_m: 3 `ldr x8, [x21, #k]; scvtf d8, w8; fmul d0, d0, d8` (judged 2026-10-26)
         stencil!("mul_fi_", loc!($loc); |s| {
             s.facc *= i2f(int(get!($loc, s)));
             next!(s)
         });
+        // target x86_64 mul_ff_m: 4 `mov rax, r14; add rax, [r13+k]; movq xmm8, rax; mulsd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 mul_ff_m: 4 `ldr x8, [x21, #k]; add x8, x8, x22; fmov d8, x8; fmul d0, d0, d8` (judged 2026-10-26)
         stencil!("mul_ff_", loc!($loc); |s| {
             s.facc *= s.tag.decode_f64(get!($loc, s));
             next!(s)
@@ -3070,7 +3273,11 @@ macro_rules! group2_generic {
         rel_generic!("jrel_", loc!($loc), jt, |s| get!($loc, s));
         rel_generic!("jnrel_", loc!($loc), jf, |s| get!($loc, s));
         strict_generic!("test_seq_", loc!($loc), test, |s| get!($loc, s));
+        // target x86_64 tseq_jt_m: 17 now 25 `mov rax, [r13+k]; cmp rax, r12; je same; mov r10, rax; and r10, r12; cmp r10, r14; jae next; ...; test r10b, 2; jz slow`: equal bits out of line, bit 1 for the mask (judged 2026-10-26)
+        // target aarch64 tseq_jt_m: 12 now 17 `ldr; cmp; b.eq same; and; cmp; b.hs next; orr; tst; b.ne slow; cbz; cbz; tbz x9, #1, slow` (judged 2026-10-26)
         strict_generic!("tseq_jt_", loc!($loc), jt, |s| get!($loc, s));
+        // target x86_64 tseq_jf_m: 18 now 25 as `tseq_jt_m`, ending `test r10b, 2; jnz L; jmp slow` (judged 2026-10-26)
+        // target aarch64 tseq_jf_m: 13 now 18 as `tseq_jt_m`, ending `tbnz x9, #1, L; b slow` (judged 2026-10-26)
         strict_generic!("tseq_jf_", loc!($loc), jf, |s| get!($loc, s));
     };
 
@@ -3155,10 +3362,14 @@ macro_rules! group2_boxed_typed {
             s.facc = s.tag.decode_f64(get!($loc, s)) - i2f(int(s.acc));
             next!(s)
         });
+        // target x86_64 sub_fi_g{},sub_fi_u{}: 4 `xorps xmm8, xmm8; cvtsi2sd xmm8, esi; subsd xmm8, xmm0; movapd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 sub_fi_g{},sub_fi_u{}: 2 `scvtf d8, w24; fsub d0, d8, d0` (judged 2026-10-26)
         stencil!("sub_fi_", loc!($loc); |s| {
             s.facc = i2f(int(get!($loc, s))) - s.facc;
             next!(s)
         });
+        // target x86_64 sub_ff_g{}: 4 `lea rax, [rsi+r14]; movq xmm8, rax; subsd xmm8, xmm0; movapd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 sub_ff_g{}: 3 `add x8, x24, x22; fmov d8, x8; fsub d0, d8, d0` (judged 2026-10-26)
         stencil!("sub_ff_", loc!($loc); |s| {
             s.facc = s.tag.decode_f64(get!($loc, s)) - s.facc;
             next!(s)
@@ -3182,10 +3393,14 @@ macro_rules! group2_boxed_typed {
             s.facc = s.tag.decode_f64(get!($loc, s)) * i2f(int(s.acc));
             next!(s)
         });
+        // target x86_64 mul_fi_g{},mul_fi_u{}: 3 `xorps xmm8, xmm8; cvtsi2sd xmm8, esi; mulsd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 mul_fi_g{},mul_fi_u{}: 2 `scvtf d8, w24; fmul d0, d0, d8` (judged 2026-10-26)
         stencil!("mul_fi_", loc!($loc); |s| {
             s.facc *= i2f(int(get!($loc, s)));
             next!(s)
         });
+        // target x86_64 mul_ff_g{}: 3 `lea rax, [rsi+r14]; movq xmm8, rax; mulsd xmm0, xmm8` (judged 2026-10-26)
+        // target aarch64 mul_ff_g{}: 3 `add x8, x24, x22; fmov d8, x8; fmul d0, d0, d8` (judged 2026-10-26)
         stencil!("mul_ff_", loc!($loc); |s| {
             s.facc *= s.tag.decode_f64(get!($loc, s));
             next!(s)
@@ -3237,6 +3452,8 @@ macro_rules! group2_fp_slot {
             s.facc = s.f[$k] - i2f(int(s.acc));
             next!(s)
         });
+        // target x86_64 sub_ff_f{}: 3 `movapd xmm8, xmm2; subsd xmm8, xmm0; movapd xmm0, xmm8` (SSE2: two-operand; judged 2026-10-26)
+        // target aarch64 sub_ff_f{}: 1 `fsub d0, d1, d0` (judged 2026-10-26)
         stencil!("sub_ff_f", $k; |s| {
             s.facc = s.f[$k] - s.facc;
             next!(s)
@@ -3245,6 +3462,8 @@ macro_rules! group2_fp_slot {
             s.facc = s.f[$k] * i2f(int(s.acc));
             next!(s)
         });
+        // target x86_64 mul_ff_f{}: 1 `mulsd xmm0, xmm2` (judged 2026-10-26)
+        // target aarch64 mul_ff_f{}: 1 `fmul d0, d0, d1` (judged 2026-10-26)
         stencil!("mul_ff_f", $k; |s| {
             s.facc *= s.f[$k];
             next!(s)
@@ -3424,6 +3643,12 @@ with_gprs!(each_gpr! bitwise_gpr);
 /// the runtime (the register's first, as JavaScript converts them).
 macro_rules! bitwise_generic {
     ($name:literal, |$l:ident, $a:ident| $e:expr) => {
+        // target x86_64 bit_xor_m: 7 now 8 `mov rax, [r13+k]; mov r10, rax; and r10, r12; cmp r10, r14; jb slow; xor r12d, eax; or r12, r14` (judged 2026-10-26)
+        // target aarch64 bit_xor_m: 6 `ldr; and; cmp; b.lo slow; eor w8, w8, w20; orr x20, x8, x22` (judged 2026-10-26)
+        // target x86_64 bit_and_m: 5 now 6 `mov rax, [r13+k]; and rax, r12; cmp rax, r14; jb slow; mov r12, rax`: the AND of two boxed int32s is boxed (judged 2026-10-26)
+        // target aarch64 bit_and_m: 5 now 6 `ldr x8; and x8, x8, x20; cmp x8, x22; b.lo slow; mov x20, x8` (judged 2026-10-26)
+        // target x86_64 shl_m: 10 `mov rax, rcx; mov rcx, r12; mov r12, [r13+k]; mov r10, r12; and r10, rcx; cmp r10, r14; jb slow; shl r12d, cl; or r12, r14; mov rcx, rax` (judged 2026-10-26)
+        // target aarch64 shl_m: 6 `ldr; and; cmp; b.lo slow; lsl w8, w8, w20; orr x20, x22, x8` (judged 2026-10-26)
         stencil_slow!($name, "_m"; |s| {
             let l = load_m(s.regs);
             if s.tag.both_int32(l, s.acc) {
@@ -3464,6 +3689,8 @@ group2_fp_slot!(4);
 group2_fp_slot!(5);
 group2_fp_slot!(6);
 
+// target x86_64 sub_smi: 7 now 8 `cmp r12, r14; jb slow; mov eax, r12d; sub eax, k; jo slow; mov r12d, eax; or r12, r14` (judged 2026-10-26)
+// target aarch64 sub_smi: 7 `cmp; b.lo slow; movz; movk; subs w8, w20, w8; b.vs slow; orr x20, x22, x8` (judged 2026-10-26)
 // `SubSmi k` on any value (the typed cases are `add_smi_*` of -k).
 stencil_slow!("sub_smi"; |s| {
     if s.tag.is_int32(s.acc)
@@ -3612,6 +3839,8 @@ fn box_shifted(tag: NumberTag, v: i64) -> Value {
 }
 macro_rules! shift_generic {
     ($name:literal, |$a:ident, $k:ident| $op:expr, |$wa:ident, $wk:ident| $wide:expr) => {
+        // target x86_64 shr_smi: 9 now 11 `cmp r12, r14; jb slow; mov rax, rcx; mov ecx, k; shr r12d, cl; mov rcx, rax; test r12d, r12d; js dbl; or r12, r14` (judged 2026-10-26)
+        // target aarch64 shr_smi: 7 now 11 `cmp x20, x22; b.lo slow; movz w8, #k; lsr w8, w20, w8; tst; b.ne dbl; orr x20, x22, x8`, the double out of line (judged 2026-10-26)
         stencil_slow!($name; |s| {
             if s.tag.is_int32(s.acc) {
                 let ($wa, $wk) = (int(s.acc), imm() as u32 & 31);
@@ -3624,6 +3853,8 @@ macro_rules! shift_generic {
             s.acc = box_shifted(s.tag, $wide);
             next!(s)
         });
+        // target x86_64 sar_smi_f: 8 now 10 `cvttsd2si rax, xmm0; cmp rax, 1; jo slow; mov r10, rcx; mov ecx, k; sar eax, cl; mov rcx, r10; mov r12, rax`: the conversion's 0x8000… for the exponent test (judged 2026-10-26)
+        // target aarch64 sar_smi_f: 7 now 8 `fmov; ubfx; cmp #1086; b.hs slow; fcvtzs; movz w9, #k; asr w20, w8, w9`: k & 31 fits `imm16` (judged 2026-10-26)
         stencil_slow!($name, "_f"; |s| {
             if let Some($a) = f64_to_int32(s.facc) {
                 let $k = imm() as u32 & 31;
@@ -3922,6 +4153,16 @@ unsafe fn create_object(slots: usize) -> Option<*mut u64> {
         Some(p)
     }
 }
+// target x86_64 create_object_0: 16 now 19 bump `lea; cmp [heap+8]; ja` (not `mov; sub; cmp; jb; lea`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
+// target x86_64 create_object_[12]: 17 now 21 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target x86_64 create_object_[34]: 18 now 23 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target x86_64 create_object_[56]: 19 now 25 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target x86_64 create_object_[78]: 20 now 27 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target aarch64 create_object_0: 19 now 22 heap (3), `ldp; add; cmp; b.hi; str`, meta (4), header (5), `stp xzr, xzr` ×2 (judged 2026-10-26)
+// target aarch64 create_object_[12]: 21 now 25 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target aarch64 create_object_[34]: 22 now 27 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target aarch64 create_object_[56]: 23 now 29 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target aarch64 create_object_[78]: 24 now 31 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
 macro_rules! create_object_n {
     ($($n:literal)*) => {$(
         stencil_slow!("create_object_", $n; |s| {
@@ -3937,6 +4178,8 @@ macro_rules! create_object_n {
     )*};
 }
 create_object_n!(0 1 2 3 4 5 6 7 8);
+// target x86_64 create_object: 28 now 60 `mov rax, imm32; movabs; lea; and; cmp; ja; …; L: movups [r11], xmm8; add r11, 16; cmp; jb L` (loop counted once; judged 2026-10-26)
+// target aarch64 create_object: 30 now 37 count by `imm_zext`, …, `L: stp xzr, xzr, [x12], #16; cmp; b.lo L` (judged 2026-10-26)
 stencil_slow!("create_object"; |s| {
     let Some(p) = create_object(imm() as usize) else { slow!(s) };
     s.acc = Value::from_bits(p as u64);
@@ -3948,6 +4191,8 @@ stencil_slow!("create_object"; |s| {
 
 // `CreateArray`: a new, empty array of shape `imm64`, as `create_object_0`
 // (no slots nor elements).
+// target x86_64 create_array: 16 now 18 bump `lea; cmp [heap+8]; ja; mov` (not `mov; sub; cmp; jb; lea; mov`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
+// target aarch64 create_array: 19 now 20 bump `ldp; add; cmp; b.hi; str` (not `sub; cmp; b.lo; add`) (judged 2026-10-26)
 stencil_slow!("create_array"; |s| {
     let Some(p) = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS) else { slow!(s) };
     (*header(p)).shape = imm64();
@@ -3967,6 +4212,8 @@ stencil_slow!("create_array"; |s| {
 // `CreateArray n` (a literal's, `imm` its count): as `create_array`, with
 // room for `n` elements (`undefined`) in a cell of their own, if the
 // heap's free space has it too (else none: `push` makes room).
+// target x86_64 create_array_n: 42 now 85 as `create_array` (16), then `mov ebx, imm; lea rax,[rbx*8+16]; and rax,-16; …; L: mov qword [r10+rbx*8], 10; dec rbx; jnz L` (loop counted once; judged 2026-10-26)
+// target aarch64 create_array_n: 43 now 51 as `create_array` (19), the count by `imm_zext`, SIDE and 0x80 kept, `L: str x10, [x13, x8, lsl #3]; subs; b.ne L` (judged 2026-10-26)
 stencil_slow!("create_array_n"; |s| {
     let heap = imm64b() as *mut HeapPtrs;
     let Some(p) = bump(heap, HEADER_WORDS) else { slow!(s) };
@@ -4022,6 +4269,8 @@ stencil!("type_of"; |s| {
 // `CreateRegExp`: a new `RegExp` from the runtime, of the pattern and the
 // flags (strings) that are the 64-bit immediates; leaves where it would
 // throw (a pattern the engine doesn't support).
+// target x86_64 create_regexp: 10 `push rax; movabs ×2; lea rsp; call; lea rsp; test; je; mov r12, rax; pop rax` (rt_call!'s contract; judged 2026-10-26)
+// target aarch64 create_regexp: 12 `stp; mov x29, sp; movz/movk ×6; bl; cbz; mov x20, x8; ldp` (judged 2026-10-26)
 stencil!("create_regexp"; |s| {
     let r = rt_call!(s, cloison_rt_create_regexp, Value::from_bits(imm64()), Value::from_bits(imm64b()));
     if r == 0 {
@@ -4292,6 +4541,10 @@ macro_rules! keyed_load {
 /// been detached: see `Vm::views_detached`).
 macro_rules! array_length {
     ($loc:tt) => {
+        // target x86_64 get_length_g{}: 11 now 12 `lea; test; jnz`, `movzx eax, word [rdi+8]; and eax, 0x80ff; cmp eax, 7; ja exit; mov ebx, 0x92; bt ebx, eax; jnc exit; mov r12d, [rdi+32]` (judged 2026-10-26)
+        // target x86_64 get_length_m: 12 now 13 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_length_g{}: 11 now 12 cell (3), `ldrh; and; cmp #7; b.hi; mov w9, #0x92; lsr; tbz w8, #0, exit; ldr w20`: `tbz` widened (judged 2026-10-26)
+        // target aarch64 get_length_m: 12 now 13 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_length_", loc!($loc); |s| {
             let o = get!($loc, s);
             if !is_cell(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING | LENGTH_TYPED_ARRAY) {
@@ -4315,6 +4568,10 @@ macro_rules! array_length {
             s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
+        // target x86_64 get_length_na_g{}: 3 `cmp byte [rdi+9], 0; js exit; mov r12d, [rdi+32]` (judged 2026-10-26)
+        // target x86_64 get_length_na_m: 4 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_length_na_g{}: 3 now 4 `ldrb w8, [x24, #9]; tbnz w8, #7, exit; ldr w20, [x24, #32]`: `tbnz` widened (judged 2026-10-26)
+        // target aarch64 get_length_na_m: 4 now 5 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_length_na_", loc!($loc); |s| {
             let o = get!($loc, s);
             if (*cell(o)).flags & FAR != 0 {
@@ -4377,17 +4634,27 @@ macro_rules! set_keyed {
 macro_rules! property_location {
     ($loc:tt) => {
         // target aarch64 get_own_g{}: 10 the guard, then `ldr x20, [x24, #off]` (docs/arm64-targets.md)
+        // target x86_64 get_own_g{}: 7 now 8 `lea rax, [r14+2]; test rdi, rax; jnz exit; movabs rax, shape; cmp [rdi], rax; jne exit; mov r12, [rdi+off]` (judged 2026-10-26)
+        // target x86_64 get_own_m: 8 now 9 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_own_m: 11 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             s.acc = load_imm(o);
             next!(s)
         });
+        // target x86_64 get_oop_g{}: 8 now 9 `lea rax, [r14+2]; test; jnz exit`, shape (3), `mov rax, [rdi+16]; mov r12, [rax+off]` (judged 2026-10-26)
+        // target x86_64 get_oop_m: 9 now 10 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_oop_g{}: 11 cell (3), shape (6), `ldr x8, [x24, #16]; ldr x20, [x8, #off]` (judged 2026-10-26)
+        // target aarch64 get_oop_m: 12 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_oop_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             s.acc = load_imm(props(o));
             next!(s)
         });
         // target aarch64 get_proto_g{}: 13 the guard, the slot's address (3), `ldr` (docs/arm64-targets.md)
+        // target x86_64 get_proto_g{}: 8 now 9 `lea; test; jnz exit`, shape (3), `movabs rax, addr; mov r12, [rax]` (judged 2026-10-26)
+        // target x86_64 get_proto_m: 9 now 10 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_proto_m: 14 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_proto_", loc!($loc); |s| {
             if guard_shape(s.tag, get!($loc, s)).is_none() {
                 exit!(s)
@@ -4395,7 +4662,9 @@ macro_rules! property_location {
             s.acc = *(imm64b() as *const Value);
             next!(s)
         });
-        // target aarch64 set_own_g{}: 10 now 30 the guard and `str` (2026-10-10, before the write barrier: to judge again; docs/arm64-targets.md)
+        // target aarch64 set_own_g{}: 25 now 30 the guard (9), `str`, the barrier (15): cell test `tst; b.ne; cbz; tbnz #1`, young `ldrb; tbnz #7`, card mark cold (judged again 2026-10-26, with the write barrier; docs/arm64-targets.md)
+        // target x86_64 set_own_g{},set_own_m: 24 now 34 the guard (7), `mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 13; cell path 34; judged 2026-10-26)
+        // target aarch64 set_own_m: 26 now 32 (judged 2026-10-26)
         stencil!("set_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             store_imm(o, s.acc);
@@ -4409,7 +4678,9 @@ macro_rules! property_location {
             barrier(s.tag, payload_cell(p), p.offset(imm() as isize), s.acc);
             next!(s)
         });
-        // target aarch64 set_tr_g{}: 14 now 34 the new shape (3), `str` it, `str` the value (2026-10-10, before the write barrier: to judge again; docs/arm64-targets.md)
+        // target aarch64 set_tr_g{}: 29 now 34 the guard (9), the new shape (3), `str` it, `str` the value, the barrier (15) (judged again 2026-10-26, with the write barrier; docs/arm64-targets.md)
+        // target x86_64 set_tr_g{},set_tr_m: 26 now 36 the guard (7), new shape (2), `mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 15; cell path 36; judged 2026-10-26)
+        // target aarch64 set_tr_m: 30 now 36 (judged 2026-10-26)
         stencil!("set_tr_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             (*header(o)).shape = imm64b();
@@ -4424,6 +4695,10 @@ macro_rules! property_location {
         set_tro!("set_tro_", $loc, true, true);
         set_tro!("set_tro_n_", $loc, true, false);
         // `_n`: `acc` is known to be a number, never a cell: no barrier.
+        // target x86_64 set_own_n_g{}: 8 `mov rax, r14; or rax, 2; test rdi, rax; jnz; movabs; cmp [rdi], rax; jne; mov [rdi+off], r12` (judged 2026-10-26)
+        // target x86_64 set_own_n_m: 9 (judged 2026-10-26)
+        // target aarch64 set_own_n_g{}: 10 the guard (9) and `str` (judged 2026-10-26)
+        // target aarch64 set_own_n_m: 11 (judged 2026-10-26)
         stencil!("set_own_n_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             store_imm(o, s.acc);
@@ -4461,6 +4736,10 @@ macro_rules! property_location {
         // object, which fits code 0 or its shape. The key in r11 / x15
         // (`key_x`); the generic stencil's at `regs + imm`, its `__slow`
         // helper (a typed array, through the runtime) reading it there too.
+        // target x86_64 set_keyed_g{}: 31 fallthrough 21 the checks (16), `mov r10, [rdi+24]; mov [r10+rax*8], r12`, the barrier in place (15) (fall-through: code 2, 21; ANY-cell path 52: `fits_code` as a setcc boolean; judged 2026-10-26)
+        // target x86_64 set_keyed_m: 32 fallthrough 22 (judged 2026-10-26)
+        // target aarch64 set_keyed_g{}: 32 fallthrough 20 (fall-through 20; ANY-cell path 39; judged 2026-10-26)
+        // target aarch64 set_keyed_m: 33 fallthrough 21 (judged 2026-10-26)
         stencil_slow!("set_keyed_", loc!($loc); |s| {
             let o = get!($loc, s);
             let key = load_imm(s.regs as *mut u8);
@@ -4498,6 +4777,10 @@ macro_rules! property_location {
         // `set_keyed_`, at the array's length too while it has room (one
         // more element); else through the runtime, leaving where that
         // can't store.
+        // target x86_64 set_keyed_ap_g{}: 37 fallthrough 23 the checks (18), `elems_len` bumped before the store, the store (2), the barrier in place (15) (fall-through: code 2 with a non-number, 23; designated path 67: r8/r9/rsi/rdx/rcx spilled, r15 borrowed; judged 2026-10-26)
+        // target x86_64 set_keyed_ap_m: 38 fallthrough 21 (fall-through 21; judged 2026-10-26)
+        // target aarch64 set_keyed_ap_g{}: 38 fallthrough 19 the checks (21), `add; str` the length, `ldr; str`, the barrier (15) (fall-through 19; designated path 44; judged 2026-10-26)
+        // target aarch64 set_keyed_ap_m: 39 fallthrough 19 (judged 2026-10-26)
         stencil_slow!("set_keyed_ap_", loc!($loc); |s| {
             let o = get!($loc, s);
             let key = load_imm(s.regs as *mut u8);
@@ -4531,6 +4814,10 @@ macro_rules! property_location {
         // `set_keyed_ap_` of an int32 `acc` (`_i`), the key in r11 / x15
         // (`key_x`) and in memory too, for the helper: no barrier, no
         // registers saved (PdfJS's `decrypt`, `decryptedString[i] = …`).
+        // target x86_64 set_keyed_ap_i_g{}: 20 now 26 the checks (15), `inc eax; mov [rdi+32], eax` before the store, `or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12` (judged 2026-10-26)
+        // target x86_64 set_keyed_ap_i_m: 21 now 32 (r9 and r12 borrowed as scratch; judged 2026-10-26)
+        // target aarch64 set_keyed_ap_i_g{}: 22 now 25 (judged 2026-10-26)
+        // target aarch64 set_keyed_ap_i_m: 23 now 26 (judged 2026-10-26)
         stencil_slow!("set_keyed_ap_i_", loc!($loc); |s| {
             let key = key_x();
             let o = get!($loc, s);
@@ -4562,7 +4849,14 @@ macro_rules! property_location {
         set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= FIELD_NUM,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "o_", true, is_array, |s, v, code| code == FIELD_ANY || code == (*cell(v)).shape, |s| s.acc);
+        // target x86_64 set_keyed_nc_g{}: 22 fallthrough 18 `cmp [rdi+32], r11d; jbe; mov rax, [rdi]; cmp qword [rax], 0; jne; mov r10, [rdi+24]; mov [r10+r11*8], r12`, the barrier in place (15) (code 2 is the fall-through, 18; ANY-cell path 37; judged 2026-10-26)
+        // target x86_64 set_keyed_nc_m: 23 fallthrough 19 (fall-through 19; ANY-cell path 38; judged 2026-10-26)
+        // target aarch64 set_keyed_nc_g{}: 23 fallthrough 13 `ldr w8; cmp; b.ls; ldr; ldr; cbnz`, `ldr; str [x9, x15, lsl #3]`, the barrier (15) (fall-through: code 2 with a non-number, 13; ANY-cell path 28; judged 2026-10-26)
+        // target aarch64 set_keyed_nc_m: 24 fallthrough 14 (fall-through 14; ANY-cell path 29; judged 2026-10-26)
         set_keyed!($loc, "nc_", true, |_, _| true, |s, v, code| fits_code(s.tag, code, v), |s| s.acc);
+        // target x86_64 set_keyed_nc_i_g{}: 8 now 9 `acc | tag` boxes in place: no `mov eax, r12d` (judged 2026-10-26)
+        // target x86_64 set_keyed_nc_i_m: 9 now 10 (judged 2026-10-26)
+        // target aarch64 set_keyed_nc_i_m: 10 now 11 (judged 2026-10-26)
         set_keyed!($loc, "nc_i_", false, |_, _| true, |s, v, code| code <= FIELD_NUM,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "nc_o_", true, |_, _| true, |s, v, code| code == FIELD_ANY || code == (*cell(v)).shape, |s| s.acc);
@@ -4570,7 +4864,15 @@ macro_rules! property_location {
         // (`nc_a`), numbers (`nc_n`), or an int32 into int32s, numbers or
         // any (`nc_ia`): no dispatch on the code.
         set_keyed!($loc, "nc_a_", true, |_, _| true, |s, v, code| true, |s| s.acc);
+        // target x86_64 set_keyed_nc_n_g{}: 6 `test r12, r14; jz; cmp [rdi+32], r11d; jbe; mov rax, [rdi+24]; mov [rax+r11*8], r12` (judged 2026-10-26)
+        // target x86_64 set_keyed_nc_n_m: 7 (judged 2026-10-26)
+        // target aarch64 set_keyed_nc_n_g{}: 7 (judged 2026-10-26)
+        // target aarch64 set_keyed_nc_n_m: 8 (judged 2026-10-26)
         set_keyed!($loc, "nc_n_", false, |_, _| true, |s, v, code| v.to_bits() & s.tag.to_bits() != 0, |s| s.acc);
+        // target x86_64 set_keyed_nc_ia_g{}: 5 now 6 `cmp [rdi+32], r11d; jbe; or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12`: `acc | tag` boxes an int32 acc, no `mov eax, r12d` (judged 2026-10-26)
+        // target x86_64 set_keyed_nc_ia_m: 6 now 7 (judged 2026-10-26)
+        // target aarch64 set_keyed_nc_ia_g{}: 6 now 7 `orr x20, x22, x20` boxes it, no `mov w8, w20` (judged 2026-10-26)
+        // target aarch64 set_keyed_nc_ia_m: 7 now 8 (judged 2026-10-26)
         set_keyed!($loc, "nc_ia_", false, |_, _| true, |s, v, code| true,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         // A polymorphic access (`jit::Prop::Poly`): a cell check, then a
@@ -4580,6 +4882,9 @@ macro_rules! property_location {
         // A load whose value is unused (`jit::Insn::check_only`): its
         // receiver's shape guard alone.
         // target aarch64 check_shape_g{}: 9 cell test (3), `ldr` shape, shape (3), `cmp`, `b.ne` (docs/arm64-targets.md)
+        // target x86_64 check_shape_g{}: 6 now 7 `lea rax, [r14+2]; test rdi, rax; jnz exit; movabs rax, shape; cmp [rdi], rax; jne exit` (judged 2026-10-26)
+        // target x86_64 check_shape_m: 7 now 8 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 check_shape_m: 10 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("check_shape_", loc!($loc); |s| {
             if guard_shape(s.tag, get!($loc, s)).is_none() {
                 exit!(s)
@@ -4587,6 +4892,8 @@ macro_rules! property_location {
             next!(s)
         });
         // target aarch64 guard_cell_g{}: 3 `orr; tst; b.ne` (docs/arm64-targets.md)
+        // target x86_64 guard_cell_g{},guard_cell_m: 3 now 4 `lea rax, [r14+2]; test rdi, rax; jnz exit` (`_m`: `test [r13+k], rax`) (judged 2026-10-26)
+        // target aarch64 guard_cell_m: 4 `ldr x8, [x21, #k]; orr; tst; b.ne` (judged 2026-10-26)
         stencil!("guard_cell_", loc!($loc); |s| {
             if !is_cell(s.tag, get!($loc, s)) {
                 exit!(s)
@@ -4603,12 +4910,20 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // target x86_64 shape_jeq_g{}: 3 `movabs rax, shape; cmp [rdi], rax; je L` (judged 2026-10-26)
+        // target x86_64 shape_jeq_m: 4 `mov rax, [r13+k]`, then as `_g{}` (judged 2026-10-26)
+        // target aarch64 shape_jeq_g{}: 6 `ldr x8, [x24]`, shape (3), `cmp`, `b.eq L` (judged 2026-10-26)
+        // target aarch64 shape_jeq_m: 7 `ldr x8, [x21, #k]`, then as `_g{}` (judged 2026-10-26)
         stencil!("shape_jeq_", loc!($loc); |s| {
             if (*cell(get!($loc, s))).shape == imm64() {
                 jump!(s)
             }
             next!(s)
         });
+        // target x86_64 shape_jne_g{}: 3 `movabs rax, shape; cmp [rdi], rax; jne L` (judged 2026-10-26)
+        // target x86_64 shape_jne_m: 4 `mov rax, [r13+k]`, then as `_g{}` (judged 2026-10-26)
+        // target aarch64 shape_jne_g{}: 6 `ldr x8, [x24]`, shape (3), `cmp`, `b.ne L` (judged 2026-10-26)
+        // target aarch64 shape_jne_m: 7 `ldr x8, [x21, #k]`, then as `_g{}` (judged 2026-10-26)
         stencil!("shape_jne_", loc!($loc); |s| {
             if (*cell(get!($loc, s))).shape != imm64() {
                 jump!(s)
@@ -4616,6 +4931,9 @@ macro_rules! property_location {
             next!(s)
         });
         // target aarch64 shape_guard_g{}: 6 (docs/arm64-targets.md)
+        // target x86_64 shape_guard_g{}: 3 `movabs rax, shape; cmp [rdi], rax; jne exit` (judged 2026-10-26)
+        // target x86_64 shape_guard_m: 4 `mov rax, [r13+k]`, then as `_g{}` (judged 2026-10-26)
+        // target aarch64 shape_guard_m: 7 `ldr x8, [x21, #k]`, then as `_g{}` (judged 2026-10-26)
         stencil!("shape_guard_", loc!($loc); |s| {
             if (*cell(get!($loc, s))).shape != imm64() {
                 exit!(s)
@@ -4638,6 +4956,9 @@ macro_rules! property_location {
             next!(s)
         });
         // target aarch64 family_guard_g{}: 7 `ldr x8, [x24]; ldr x8, [x8, #8]`, family (3), `cmp`, `b.ne` (docs/arm64-targets.md)
+        // target x86_64 family_guard_g{}: 4 `mov rax, [rdi]; movabs r10, family; cmp [rax+8], r10; jne exit` (judged 2026-10-26)
+        // target x86_64 family_guard_m: 5 `mov rax, [r13+k]`, then as `_g{}` (judged 2026-10-26)
+        // target aarch64 family_guard_m: 8 `ldr x8, [x21, #k]`, then as `_g{}` (judged 2026-10-26)
         stencil!("family_guard_", loc!($loc); |s| {
             if (*shape_of(get!($loc, s).to_bits() as *const u8)).family != imm64() {
                 exit!(s)
@@ -4646,26 +4967,40 @@ macro_rules! property_location {
         });
         // The receiver's shape is known to be the cached one: no guard.
         // target aarch64 get_own_nc_g{}: 1 `ldr x20, [x24, #off]` (docs/arm64-targets.md)
+        // target x86_64 get_own_nc_g{}: 1 `mov r12, [rdi+off]` (judged 2026-10-26)
+        // target x86_64 get_own_nc_m: 2 `mov rax, [r13+k]; mov r12, [rax+off]` (judged 2026-10-26)
+        // target aarch64 get_own_nc_m: 2 `ldr x8, [x21, #k]; ldr x20, [x8, #off]` (judged 2026-10-26)
         stencil!("get_own_nc_", loc!($loc); |s| {
             s.acc = load_imm(get!($loc, s).to_bits() as *mut u8);
             next!(s)
         });
         // target aarch64 get_oop_nc_g{}: 2 `ldr x8, [x24, #16]; ldr x20, [x8, #off]` (docs/arm64-targets.md)
+        // target x86_64 get_oop_nc_g{}: 2 `mov rax, [rdi+16]; mov r12, [rax+off]` (judged 2026-10-26)
+        // target x86_64 get_oop_nc_m: 3 `mov rax, [r13+k]`, then as `_g{}` (judged 2026-10-26)
+        // target aarch64 get_oop_nc_m: 3 `ldr x8, [x21, #k]`, then as `_g{}` (judged 2026-10-26)
         stencil!("get_oop_nc_", loc!($loc); |s| {
             s.acc = load_imm(props(get!($loc, s).to_bits() as *mut u8));
             next!(s)
         });
         // target aarch64 get_proto_nc_g{}: 4 the slot's address (3), `ldr` (docs/arm64-targets.md)
+        // target x86_64 get_proto_nc_g{},get_proto_nc_m: 2 `movabs rax, addr; mov r12, [rax]` (judged 2026-10-26)
+        // target aarch64 get_proto_nc_m: 4 the slot's address (3), `ldr` (judged 2026-10-26)
         stencil!("get_proto_nc_", loc!($loc); |s| {
             s.acc = *(imm64b() as *const Value);
             next!(s)
         });
+        // target x86_64 set_own_nc_g{},set_own_nc_m: 17 now 27 `mov [rdi+off], r12`, the barrier: `test r12, r14; jnz; cmp r12, 0x20; jb; movabs; ...`, card mark cold (`_m`: number store is the fall-through, 6; cell path 27; judged 2026-10-26)
+        // target aarch64 set_own_nc_g{}: 16 now 21 `str`, the barrier (15): cell test `tst; b.ne; cbz; tbnz #1`, young `ldrb; tbnz #7`, card mark cold (judged 2026-10-26)
+        // target aarch64 set_own_nc_m: 17 now 23 `ldr x8, [x21, #k]`, then as `_g` (judged 2026-10-26)
         stencil!("set_own_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             store_imm(o, s.acc);
             barrier(s.tag, o, o, s.acc);
             next!(s)
         });
+        // target x86_64 set_tr_nc_g{},set_tr_nc_m: 19 now 29 `movabs; mov [rdi], rax; mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 8; cell path 29; judged 2026-10-26)
+        // target aarch64 set_tr_nc_g{}: 20 now 25 shape (3), `str`, `str`, the barrier (15) (judged 2026-10-26)
+        // target aarch64 set_tr_nc_m: 21 now 27 (judged 2026-10-26)
         stencil!("set_tr_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             (*header(o)).shape = imm64b();
@@ -4673,36 +5008,64 @@ macro_rules! property_location {
             barrier(s.tag, o, o, s.acc);
             next!(s)
         });
+        // target x86_64 set_oop_nc_g{}: 17 fallthrough 6 `mov rax, [rdi+16]; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 6; cell path 27; judged 2026-10-26)
+        // target x86_64 set_oop_nc_m: 18 fallthrough 7 (number store is the fall-through, 7; cell path 28; judged 2026-10-26)
+        // target aarch64 set_oop_nc_g{}: 17 now 27 `ldr x8, [x24, #16]; str`, the barrier on `x8>>4` (props is 8 mod 16: no `sub`), offset only in the cold card mark (judged 2026-10-26)
+        // target aarch64 set_oop_nc_m: 18 now 28 (judged 2026-10-26)
         stencil!("set_oop_nc_", loc!($loc); |s| {
             let p = props(get!($loc, s).to_bits() as *mut u8);
             store_imm(p, s.acc);
             barrier(s.tag, payload_cell(p), p.offset(imm() as isize), s.acc);
             next!(s)
         });
+        // target x86_64 set_own_n_nc_g{}: 1 `mov [rdi+off], r12` (judged 2026-10-26)
+        // target x86_64 set_own_n_nc_m: 2 (judged 2026-10-26)
+        // target aarch64 set_own_n_nc_g{}: 1 `str x20, [x24, #off]` (judged 2026-10-26)
+        // target aarch64 set_own_n_nc_m: 2 (judged 2026-10-26)
         stencil!("set_own_n_nc_", loc!($loc); |s| {
             store_imm(get!($loc, s).to_bits() as *mut u8, s.acc);
             next!(s)
         });
+        // target x86_64 set_tr_n_nc_g{}: 3 `movabs rax, shape; mov [rdi], rax; mov [rdi+off], r12` (judged 2026-10-26)
+        // target x86_64 set_tr_n_nc_m: 4 (judged 2026-10-26)
+        // target aarch64 set_tr_n_nc_g{}: 5 shape (3), `str`, `str` (judged 2026-10-26)
+        // target aarch64 set_tr_n_nc_m: 6 (judged 2026-10-26)
         stencil!("set_tr_n_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             (*header(o)).shape = imm64b();
             store_imm(o, s.acc);
             next!(s)
         });
+        // target x86_64 set_own_d_nc_g{}: 5 `xorps; cvtsi2sd; movq; sub rax, r14; mov` (judged 2026-10-26)
+        // target x86_64 set_own_d_nc_m: 6 (judged 2026-10-26)
+        // target aarch64 set_own_d_nc_g{}: 4 `scvtf; fmov; sub; str` (judged 2026-10-26)
+        // target aarch64 set_own_d_nc_m: 5 (judged 2026-10-26)
         stencil!("set_own_d_nc_", loc!($loc); |s| {
             store_imm(get!($loc, s).to_bits() as *mut u8, s.tag.encode_f64(i2f(int(s.acc))));
             next!(s)
         });
+        // target x86_64 set_tr_d_nc_g{}: 7 (judged 2026-10-26)
+        // target x86_64 set_tr_d_nc_m: 8 (judged 2026-10-26)
+        // target aarch64 set_tr_d_nc_g{}: 8 (judged 2026-10-26)
+        // target aarch64 set_tr_d_nc_m: 9 (judged 2026-10-26)
         stencil!("set_tr_d_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             (*header(o)).shape = imm64b();
             store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
             next!(s)
         });
+        // target x86_64 set_oop_n_nc_g{}: 2 `mov rax, [rdi+16]; mov [rax+off], r12` (judged 2026-10-26)
+        // target x86_64 set_oop_n_nc_m: 3 (judged 2026-10-26)
+        // target aarch64 set_oop_n_nc_g{}: 2 `ldr x8, [x24, #16]; str x20, [x8, #off]` (judged 2026-10-26)
+        // target aarch64 set_oop_n_nc_m: 3 (judged 2026-10-26)
         stencil!("set_oop_n_nc_", loc!($loc); |s| {
             store_imm(props(get!($loc, s).to_bits() as *mut u8), s.acc);
             next!(s)
         });
+        // target x86_64 set_tro_nc_g{}: 23 fallthrough 12 room (4), shape (2), `mov rax, [rdi+16]; mov [rax+imm], r12`, the barrier in place (15) (number store is the fall-through, 12; cell path 33; judged 2026-10-26)
+        // target x86_64 set_tro_nc_m: 24 fallthrough 13 (fall-through 13; cell path 34; judged 2026-10-26)
+        // target aarch64 set_tro_nc_g{}: 26 now 34 room (5), shape (4), `ldr; str`, the barrier (15) (judged 2026-10-26)
+        // target aarch64 set_tro_nc_m: 27 now 35 (judged 2026-10-26)
         set_tro!("set_tro_nc_", $loc, false, true);
         set_tro!("set_tro_n_nc_", $loc, false, false);
         // Elements at `elems`, `elems_len` of them. A hole is `EMPTY` (0).
@@ -4711,8 +5074,16 @@ macro_rules! property_location {
         // elements' type comes with it).
         // An object whose elements are values: not a string (code units),
         // a buffer or a typed array (bytes).
+        // target x86_64 get_keyed_i_g{}: 14 now 17 cell (3), `movzx eax, byte [rdi+8]; cmp eax, 4; jae cold` (DATE out of line), bounds (2), element (6) (judged 2026-10-26)
+        // target x86_64 get_keyed_i_m: 15 now 18 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_g{}: 13 now 15 cell (3), `ldrb; cmp #4; b.hs cold` (DATE out of line), bounds (3), element (4) (judged 2026-10-26)
+        // target aarch64 get_keyed_i_m: 14 now 15 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell(s.tag, o)
             && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
+        // target x86_64 get_keyed_g{}: 16 now 17 cell (3), `movzx; cmp al, 4; jae cold`, `cmp r12, r14; jb exit`, bounds (2), element (6) (judged 2026-10-26)
+        // target x86_64 get_keyed_m: 17 now 18 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_keyed_g{}: 15 fallthrough 9 cell (3), `ldrb; cmp #4; b.hs cold`, `cmp x20, x22; b.lo exit`, bounds (3), element (4); counted 9 while the int test jumps over a `b exit` (judged 2026-10-26)
+        // target aarch64 get_keyed_m: 16 fallthrough 10 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_", false, |s, o| is_cell(s.tag, o)
             && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
         // `acc = o[acc]` through the runtime (`acc` boxed): a typed array's
@@ -4722,6 +5093,10 @@ macro_rules! property_location {
         // from memory, at `regs + imm`; `acc` boxed, or (`_i`) an int32.
         // (An object's own element first, as the interpreter's
         // `op_set_keyed` stores it: see `own_element_store`.)
+        // target x86_64 set_keyed_rt_g{}: 29 fallthrough 18 the checks (12), `mov r10, [rdi+24]; mov [r10+rax*8], r12`, the barrier in place (15) (fall-through: code 2 with a non-number, 18; ANY-cell path 45; judged 2026-10-26)
+        // target x86_64 set_keyed_rt_m: 30 fallthrough 19 (judged 2026-10-26)
+        // target aarch64 set_keyed_rt_g{}: 29 fallthrough 17 (fall-through 17; ANY-cell path 35; judged 2026-10-26)
+        // target aarch64 set_keyed_rt_m: 30 fallthrough 18 (judged 2026-10-26)
         stencil_slow!("set_keyed_rt_", loc!($loc); |s| {
             if own_element_store(s.tag, get!($loc, s), load_imm(s.regs as *mut u8), s.acc, false) {
                 next!(s)
@@ -4739,6 +5114,10 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // target x86_64 set_keyed_rt_i_g{}: 15 now 17 `cmp [r13+k], r14; jb; mov eax, [r13+k]` for the key, `or r12, r14` boxes (judged 2026-10-26)
+        // target x86_64 set_keyed_rt_i_m: 16 now 18 (judged 2026-10-26)
+        // target aarch64 set_keyed_rt_i_g{}: 16 now 18 `orr; tst; b.ne` for the receiver, `orr x20, x22, x20` boxes (judged 2026-10-26)
+        // target aarch64 set_keyed_rt_i_m: 17 now 19 (judged 2026-10-26)
         stencil_slow!("set_keyed_rt_i_", loc!($loc); |s| {
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             if own_element_store(s.tag, get!($loc, s), load_imm(s.regs as *mut u8), v, true) {
@@ -4797,6 +5176,12 @@ macro_rules! property_location {
         // (An object's own element first, as `get_keyed_`; a flat
         // string's unit below 256, the VM's string of it from the table at
         // `imm64`, as `from_char_code`.)
+        // target x86_64 get_keyed_rt_g{}: 16 now 19 `cmp r12, r14; jb slow`, cell (3), bounds (2), `movzx; cmp eax, 4; jae cold`, element (6) with the hit falling through (judged 2026-10-26)
+        // target x86_64 get_keyed_rt_m: 17 now 20 as `_g{}` with `mov rax, [r13+k]` (judged 2026-10-26)
+        // target x86_64 get_keyed_rt_g{}__slow,get_keyed_rt_m__slow: 8 now 10 the call with `lea rsp, [rsp-136]`, no `push`/`pop` (judged 2026-10-26)
+        // target aarch64 get_keyed_rt_g{}: 15 now 17 `cmp x20, x22; b.lo slow`, cell (3), bounds (3), `ldrb; cmp #4; b.hs cold`, element (4) (judged 2026-10-26)
+        // target aarch64 get_keyed_rt_m: 16 now 19 as `_g{}` with `ldr x8, [x21, #k]` (judged 2026-10-26)
+        // target aarch64 get_keyed_rt_g{}__slow,get_keyed_rt_m__slow: 8 `stp; mov x29, sp; mov x8, x24; mov x9, x20; bl; cbz; mov x20, x8; ldp` (judged 2026-10-26)
         stencil_slow!("get_keyed_rt_", loc!($loc); |s| {
             let o = get!($loc, s);
             if is_cell(s.tag, o) && s.tag.is_int32(s.acc) {
@@ -4838,6 +5223,10 @@ macro_rules! property_location {
         // (`jit::Prop::Runtime`: a site whose receivers the fast ones kept
         // leaving for), the name (an `Atom`) in `imm64`; `acc` boxed, or
         // (`_i`) an int32. Leave where they would throw or run code.
+        // target x86_64 get_named_rt_g{}: 23 now 36 own-slot hit falling through: cell (3), `mov rbx, [rdi]`, hash (8), table (1), two `cmp [rax+r10+d]; jne miss`, `cmp qword [..+0x38], 0; jne proto`, `movsxd; test; js oop; mov r12, [rdi+r11]`; the call out of line (judged 2026-10-26)
+        // target x86_64 get_named_rt_m: 24 now 41 as `_g{}` with the receiver from `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_named_rt_g{}: 29 now 41 own-slot hit falling through: cell (3), `ldr` shape, name (3), K (4), `eor lsl #32; mul; lsr`, table (3), `add lsl #5`, two `ldr; cmp; b.ne`, `ldr; cbnz proto`, `ldrsw; tbnz oop; ldr x20, [x24, x12]` (judged 2026-10-26)
+        // target aarch64 get_named_rt_m: 30 now 41 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_named_rt_", loc!($loc); |s| {
             let o = get!($loc, s);
             if let Some(v) = mega_load(s.tag, o) {
@@ -4851,6 +5240,10 @@ macro_rules! property_location {
             s.acc = Value::from_bits(r);
             next!(s)
         });
+        // target x86_64 set_named_rt_g{}: 42 fallthrough 19 the probe (way 1: 26), `mov [rdi+rbx], r12`, the barrier (16) (fall-through: runtime call, 19/24; the designated path runs 82: tag and slots spilled, r13/r15 borrowed; judged 2026-10-26)
+        // target x86_64 set_named_rt_m: 43 fallthrough 24 as `_g`, the slot loaded first (judged 2026-10-26)
+        // target aarch64 set_named_rt_g{}: 47 fallthrough 17 the probe (way 1: 31), `str x20, [x24, x10]`, the barrier (15) (fall-through: runtime call, 17; designated path 52; judged 2026-10-26)
+        // target aarch64 set_named_rt_m: 48 fallthrough 19 (fall-through 19; judged 2026-10-26)
         stencil!("set_named_rt_", loc!($loc); |s| {
             if mega_store(s.tag, get!($loc, s), s.acc) {
                 next!(s)
@@ -4862,6 +5255,10 @@ macro_rules! property_location {
             }
             next!(s)
         });
+        // target x86_64 set_named_rt_i_g{}: 27 fallthrough 26 the probe (26), `or r12, r14; mov [rdi+rbx], r12`: no barrier for an int (`_g` 27) (fall-through: runtime call, 26/31; designated path 58; judged 2026-10-26)
+        // target x86_64 set_named_rt_i_m: 28 fallthrough 31 as `_g`, the slot loaded first (judged 2026-10-26)
+        // target aarch64 set_named_rt_i_g{}: 34 fallthrough 19 the probe (31), `orr x20, x22, x20; str` (fall-through 19; designated path 38; judged 2026-10-26)
+        // target aarch64 set_named_rt_i_m: 35 fallthrough 21 (judged 2026-10-26)
         stencil!("set_named_rt_i_", loc!($loc); |s| {
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             if mega_store(s.tag, get!($loc, s), v) {
@@ -4875,9 +5272,18 @@ macro_rules! property_location {
             next!(s)
         });
         // target aarch64 get_keyed_i_nc_g{}: 7 the load into x8, moved to x20 after the hole check (docs/arm64-targets.md)
+        // target x86_64 get_keyed_i_nc_g{}: 8 `cmp [rdi+32], r12d; jbe exit; mov rax, [rdi+24]; mov r10d, r12d; mov rax, [rax+r10*8]; test rax, rax; jz exit; mov r12, rax` (judged 2026-10-26)
+        // target x86_64 get_keyed_i_nc_m: 9 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_nc_m: 8 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);
         // `get_keyed_i_nc_` at a site given up on (`Prop::Runtime`): a hole
         // or an index past the end through the runtime, not an exit.
+        // target x86_64 get_keyed_i_nc_rt_g{}: 8 as `get_keyed_i_nc_g{}` (judged 2026-10-26)
+        // target x86_64 get_keyed_i_nc_rt_m: 9 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target x86_64 get_keyed_i_nc_rt_g{}__slow,get_keyed_i_nc_rt_m__slow: 9 now 11 `mov r11, r12; or r11, r14; mov rax, rdi`, the call with `lea rsp, [rsp-136]`, no `push`/`pop` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_nc_rt_g{}: 7 as `get_keyed_i_nc_g{}` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_nc_rt_m: 8 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_nc_rt_g{}__slow,get_keyed_i_nc_rt_m__slow: 8 now 9 `orr x9, x22, x20` boxes without `mov w8, w20` (judged 2026-10-26)
         stencil_slow!("get_keyed_i_nc_rt_", loc!($loc); |s| {
             let p = get!($loc, s).to_bits() as *const u8;
             let i = int(s.acc) as u32;
@@ -4901,7 +5307,15 @@ macro_rules! property_location {
             next!(s)
         });
         keyed_load!($loc, "get_keyed_nc_", false, |s, o| true);
+        // target x86_64 get_keyed_i_sh_g{}: 14 now 15 `lea rax, [r14+2]; test rdi, rax; jnz exit`, shape (3), bounds (2), `mov rax, [rdi+24]; mov r10d, r12d; mov rax, [rax+r10*8]; test; jz exit; mov r12, rax` (judged 2026-10-26)
+        // target x86_64 get_keyed_i_sh_m: 15 now 16 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_sh_g{}: 16 cell (3), shape (6), bounds (3), `ldr; ldr [x8, w20, uxtw #3]; cbz; mov x20, x8` (judged 2026-10-26)
+        // target aarch64 get_keyed_i_sh_m: 17 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_i_sh_", true, |s, o| guard_shape(s.tag, o).is_some());
+        // target x86_64 get_keyed_sh_g{}: 16 now 18 cell (3), `cmp r12, r14; jb exit`, shape (3) with `cmp [rdi], rax`, bounds (2), element (6) (judged 2026-10-26)
+        // target x86_64 get_keyed_sh_m: 17 now 19 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target aarch64 get_keyed_sh_g{}: 18 cell (3), `cmp x20, x22; b.lo exit`, shape (6), bounds (3), element (4) (judged 2026-10-26)
+        // target aarch64 get_keyed_sh_m: 19 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_sh_", false, |s, o| guard_shape(s.tag, o).is_some());
     };
 }
@@ -4921,6 +5335,8 @@ with_gprs!(each_gpr! property_gpr);
 
 macro_rules! load_to_gpr_pair {
     ($d:tt, $k:tt) => {
+        // target x86_64 get_own_nc_g{}_to_g{}: 1 `mov rsi, [rdi+off]` (judged 2026-10-26)
+        // target aarch64 get_own_nc_g{}_to_g{}: 1 now 2 `ldr x25, [x24, #off]`; the d = k template is `ldr x8; mov x24, x8` (judged 2026-10-26)
         stencil!("get_own_nc_g", $k, "_to_g", $d; |s| {
             s.g[$d] = load_imm(s.g[$k].to_bits() as *mut u8);
             next!(s)
@@ -4929,6 +5345,8 @@ macro_rules! load_to_gpr_pair {
 }
 macro_rules! load_to_gpr {
     ($d:tt) => {
+        // target x86_64 get_own_nc_m_to_g{}: 2 `mov rax, [r13+k]; mov rsi, [rax+off]` (judged 2026-10-26)
+        // target aarch64 get_own_nc_m_to_g{}: 2 `ldr x8, [x21, #k]; ldr x24, [x8, #off]` (judged 2026-10-26)
         stencil!("get_own_nc_m_to_g", $d; |s| {
             s.g[$d] = load_imm(load_m(s.regs).to_bits() as *mut u8);
             next!(s)
@@ -5013,13 +5431,25 @@ fn nan() -> f64 {
 
 macro_rules! typed_load {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $set:expr) => {
+        // target x86_64 tget_f32_g{}: 8 `cmp; jbe; mov; mov r10d, r12d; movss; ucomiss; jp nan; cvtss2sd` (judged 2026-10-26)
+        // target x86_64 tget_f32_m: 9 (judged 2026-10-26)
+        // target x86_64 tget_i8_g{},tget_i16_g{}: 5 now 6 `…; movsx r12d, byte [rax+r10]`, not `movsx rax; mov r12d, eax` (judged 2026-10-26)
+        // target x86_64 tget_i8_m,tget_i16_m: 6 now 7 (judged 2026-10-26)
         // target x86_64 tget_u8_g{},tget_u16_g{},tget_i32_g{}: 5 `cmp [rsi+32], r12d; jbe exit; mov rax, [rsi+24]; mov r10d, r12d; movzx r12d, word [rax+r10*2]` (docs/opcode-targets.md, group 3)
+        // target aarch64 tget_f32_g{}: 8 now 10 `…; ldr s0, [x8, w20, uxtw #2]; fcvt d0, s0; fcmp d0, d0; b.vs nan`, not a `fcsel` of a built NaN (judged 2026-10-26)
+        // target aarch64 tget_f32_m: 9 now 11 (judged 2026-10-26)
+        // target aarch64 tget_i8_g{},tget_i16_g{}: 5 now 6 `…; ldrsb w20, [x8, w20, uxtw]`, not `ldrsb x8; mov w20, w8` (judged 2026-10-26)
+        // target aarch64 tget_i8_m,tget_i16_m: 6 now 7 (judged 2026-10-26)
         // target aarch64 tget_u16_g{},tget_i32_g{}: 5 `ldr w8, [x25,#32]; cmp w8, w20; b.ls exit; ldr x8, [x25,#24]; ldrh w20, [x8, w20, uxtw #1]` (docs/opcode-targets.md, group 3)
         stencil!("tget_", $w, "_", loc!($loc); |$s| {
             let Some($e) = typed_elem(get!($loc, $s), int($s.acc) as u32, $size) else { exit!($s) };
             $set;
             next!($s)
         });
+        // target x86_64 tget_u8_chk_g{}: 13 now 14 the kind as `and eax, 0xff00ff; cmp eax, imm32` (judged 2026-10-26)
+        // target x86_64 tget_u8_chk_m: 14 now 15 (judged 2026-10-26)
+        // target aarch64 tget_u8_chk_g{}: 14 cell (3), kind (`movz; movk; ldr; and; cmp; b.ne`), `ldr; cmp; b.ls; ldr; ldrb w20, [x8, w20, uxtw]` (judged 2026-10-26)
+        // target aarch64 tget_u8_chk_m: 15 (judged 2026-10-26)
         // target x86_64 tget_u16_chk_g{},tget_i32_chk_g{}: 13 now 14 the kind as a masked dword compare (`and eax, 0xff00ff; cmp eax, 7 | k<<16`) (docs/opcode-targets.md, group 3)
         stencil!("tget_", $w, "_chk_", loc!($loc); |$s| {
             let o = get!($loc, $s);
@@ -5035,13 +5465,24 @@ macro_rules! typed_load {
 
 macro_rules! typed_store {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $store:expr) => {
-        // target aarch64 tset_b32_i_g{}: 5 (docs/arm64-targets.md)
+        // target x86_64 tset_b8_i_g{},tset_b16_i_g{},tset_b32_i_g{}: 4 now 5 `cmp [rdi+32], r11d; jbe exit; mov rax, [rdi+24]; mov [rax+r11*2], r12w`: the key is zero-extended already (4 on 2026-10-09; judged 2026-10-26)
+        // target x86_64 tset_b8_i_m,tset_b16_i_m,tset_b32_i_m: 5 now 6 as `_g{}` plus the receiver's load (judged 2026-10-26)
+        // target aarch64 tset_b8_i_g{},tset_b16_i_g{},tset_b32_i_g{}: 5 `ldr w8, [x24,#32]; cmp w8, w15; b.ls exit; ldr x8, [x24,#24]; strh w20, [x8, w15, uxtw #1]` (replaces the `tset_b32_i_g{}: 5` line; judged 2026-10-26)
+        // target aarch64 tset_b8_i_m,tset_b16_i_m,tset_b32_i_m: 6 (judged 2026-10-26)
+        // target x86_64 tset_f32_f_g{}: 5 now 6 `…; cvtsd2ss xmm8, xmm0; movss [rax+r11*4], xmm8`: the key is zero-extended already (judged 2026-10-26)
+        // target x86_64 tset_f32_f_m: 6 now 7 (judged 2026-10-26)
+        // target aarch64 tset_f32_f_g{}: 6 `ldr; cmp w8, w15; b.ls; fcvt s8, d0; ldr; str s8, [x8, w15, uxtw #2]` (judged 2026-10-26)
+        // target aarch64 tset_f32_f_m: 7 (judged 2026-10-26)
         stencil!("tset_", $w, "_", loc!($loc); |$s| {
             let key = key_x();
             let Some($e) = typed_elem_x(get!($loc, $s), key, $size) else { exit!($s) };
             $store;
             next!($s)
         });
+        // target x86_64 tset_b8_i_chk_g{},tset_b32_i_chk_g{}: 12 now 14 cell (4); `mov eax, [rdi+8]; and eax, 0xff00ff; cmp eax, imm32; jne`; then as `tset_*_g{}` (4) (judged 2026-10-26)
+        // target x86_64 tset_b8_i_chk_m,tset_b32_i_chk_m: 13 now 15 (judged 2026-10-26)
+        // target aarch64 tset_b8_i_chk_g{},tset_b32_i_chk_g{}: 14 cell (3), kind (`movz; movk; ldr; and; cmp; b.ne`), then as `tset_*_g{}` (5) (judged 2026-10-26)
+        // target aarch64 tset_b8_i_chk_m,tset_b32_i_chk_m: 15 (judged 2026-10-26)
         stencil!("tset_", $w, "_chk_", loc!($loc); |$s| {
             let key = key_x();
             let o = get!($loc, $s);
@@ -5122,6 +5563,8 @@ macro_rules! exit_unless_int32 {
     }};
 }
 
+// target x86_64 key_m: 4 `mov rax, [r13+k]; cmp rax, r14; jb exit; mov r11d, eax` (judged 2026-10-26)
+// target aarch64 key_m: 4 `ldr x8, [x21, #k]; cmp x8, x22; b.lo exit; mov w15, w8` (judged 2026-10-26)
 stencil!("key_m"; |s| {
     let k = load_m(s.regs);
     exit_unless_int32!(s, k);
@@ -5130,12 +5573,15 @@ stencil!("key_m"; |s| {
 });
 macro_rules! key_gpr {
     ($k:tt) => {
+        // target x86_64 key_g{}: 3 `cmp rdi, r14; jb exit; mov r11d, edi` (judged 2026-10-26)
+        // target aarch64 key_g{}: 3 `cmp x24, x22; b.lo exit; mov w15, w24` (judged 2026-10-26)
         stencil!("key_g", $k; |s| {
             exit_unless_int32!(s, s.g[$k]);
             set_key_x(int(s.g[$k]));
             next!(s)
         });
         // target aarch64 key_u{}: 1 (docs/arm64-targets.md)
+        // target x86_64 key_u{}: 1 `mov r11d, edi` (judged 2026-10-26)
         stencil!("key_u", $k; |s| {
             set_key_x(raw(s.g[$k]));
             next!(s)
@@ -5223,6 +5669,8 @@ stencil!("set_frame_func"; |s| {
     next!(s)
 });
 // The same, of the function the callee register (at byte `imm64`) holds.
+// target x86_64 set_frame_func_r: 3 now 5 `movabs rax, imm64; mov rax, [r13+rax]; mov [r13+imm], rax`: the store at `at_imm`, not through `mov r10d; movsxd` (judged 2026-10-26)
+// target aarch64 set_frame_func_r: 5 now 7 offset (3), `ldr x8, [x21, x8]`, `str x8, [x21, #imm]` through `store_imm` (needs the JIT's range check; judged 2026-10-26)
 stencil!("set_frame_func_r"; |s| {
     *((s.regs as *mut u8).offset(imm() as isize) as *mut u64) = *((s.regs as *const u8).add(imm64() as usize) as *const u64);
     next!(s)
@@ -5233,6 +5681,8 @@ stencil!("lda_upvalue"; |s| {
     s.acc = *(*upvalue_cell(s.regs)).at;
     next!(s)
 });
+// target x86_64 sta_upvalue: 22 fallthrough 10 `mov; mov; mov; mov [rax], r12; lea; cmp; jne cont`, the barrier in place (15) (the open upvalue is the fall-through, 10; closed with a cell: 33; judged 2026-10-26)
+// target aarch64 sta_upvalue: 22 now 29 `ldur; ldr; ldr; str; add; cmp; b.ne`, the barrier (15), card mark cold (judged 2026-10-26)
 stencil!("sta_upvalue"; |s| {
     let u = upvalue_cell(s.regs);
     *(*u).at = s.acc;
@@ -5272,6 +5722,7 @@ stencil!("sta_upvalue_c"; |s| {
 });
 
 // target aarch64 lda_global: 10 global object (3), `ldr` shape, shape (3), `cmp`, `b.ne`, `ldr` (docs/arm64-targets.md)
+// target x86_64 lda_global: 5 `movabs rax, global; movabs r10, shape; cmp [rax], r10; jne exit; mov r12, [rax+off]` (judged 2026-10-26)
 stencil!("lda_global"; |s| {
     let g = imm64b() as *mut u8;
     if (*header(g)).shape != imm64() {
@@ -5280,6 +5731,8 @@ stencil!("lda_global"; |s| {
     s.acc = load_imm(g);
     next!(s)
 });
+// target x86_64 lda_global_oop: 6 as `lda_global` with `mov rax, [rax+16]; mov r12, [rax+off]` (judged 2026-10-26)
+// target aarch64 lda_global_oop: 11 global (3), `ldr` shape, shape (3), `cmp`, `b.ne`, `ldr x8, [x8, #16]; ldr x20, [x8, #off]` (judged 2026-10-26)
 stencil!("lda_global_oop"; |s| {
     let g = imm64b() as *mut u8;
     if (*header(g)).shape != imm64() {
@@ -5288,6 +5741,8 @@ stencil!("lda_global_oop"; |s| {
     s.acc = load_imm(props(g));
     next!(s)
 });
+// target x86_64 sta_global: 20 fallthrough 9 `movabs; movabs; cmp; jne; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 9; cell path 30; judged 2026-10-26)
+// target aarch64 sta_global: 25 now 31 global (3), `ldr`, shape (3), `cmp`, `b.ne`, `str`, the barrier (15) (judged 2026-10-26)
 stencil!("sta_global"; |s| {
     let g = imm64b() as *mut u8;
     if (*header(g)).shape != imm64() {
@@ -5297,6 +5752,8 @@ stencil!("sta_global"; |s| {
     barrier(s.tag, g, g, s.acc);
     next!(s)
 });
+// target x86_64 sta_global_oop: 21 fallthrough 10 the guard (4), `mov rax, [rax+16]; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 10; cell path 32; judged 2026-10-26)
+// target aarch64 sta_global_oop: 26 now 36 (judged 2026-10-26)
 stencil!("sta_global_oop"; |s| {
     let g = imm64b() as *mut u8;
     if (*header(g)).shape != imm64() {
@@ -5317,6 +5774,8 @@ stencil!("bail"; |s| { exit!(s) });
 // A store's value against its field's type (`object::FieldType`), when the
 // value's type doesn't prove it fits: exit before the store, so the
 // interpreter generalizes the field.
+// target x86_64 check_acc_int: 2 `cmp r12, r14; jb exit` (judged 2026-10-26)
+// target aarch64 check_acc_int: 2 `cmp x20, x22; b.lo exit` (judged 2026-10-26)
 stencil!("check_acc_int"; |s| {
     if !s.tag.is_int32(s.acc) {
         exit!(s)
@@ -5330,6 +5789,8 @@ stencil!("check_acc_num"; |s| {
     }
     next!(s)
 });
+// target x86_64 check_acc_shape: 6 now 7 `lea rax, [r14+2]; test r12, rax; jnz exit; movabs rax, shape; cmp [r12], rax; jne exit` (judged 2026-10-26)
+// target aarch64 check_acc_shape: 9 cell (3), `ldr x8, [x20]`, shape (3), `cmp`, `b.ne` (judged 2026-10-26)
 stencil!("check_acc_shape"; |s| {
     if !is_cell(s.tag, s.acc) || (*cell(s.acc)).shape != imm64() {
         exit!(s)
@@ -5339,6 +5800,8 @@ stencil!("check_acc_shape"; |s| {
 
 // A store's value into a field typed `Num`, which holds doubles only (see
 // `object::FieldType::Num`): exit if not a number, an int32 to a double.
+// target x86_64 check_acc_dbl: 8 `test r14, r12; jz exit; cmp r12, r14; jb next; xorps; cvtsi2sd xmm8, r12d; movq r12, xmm8; sub r12, r14` (judged 2026-10-26)
+// target aarch64 check_acc_dbl: 7 `tst x22, x20; b.eq exit; scvtf d8, w20; cmp x20, x22; fmov x8, d8; sub x8, x8, x22; csel` (judged 2026-10-26)
 stencil!("check_acc_dbl"; |s| {
     if s.acc.to_bits() & s.tag.to_bits() == 0 {
         exit!(s)
@@ -5351,6 +5814,8 @@ stencil!("check_acc_dbl"; |s| {
 
 // A number loaded from an object's own memory in a field typed `Num`: a
 // double (see `object::FieldType::Num`), into `facc`.
+// target x86_64 decode_num_acc: 2 `lea rax, [r14+r12]; movq xmm0, rax` (judged 2026-10-26)
+// target aarch64 decode_num_acc: 2 `add x8, x22, x20; fmov d0, x8` (judged 2026-10-26)
 stencil!("decode_num_acc"; |s| {
     s.facc = s.tag.decode_f64(s.acc);
     next!(s)
@@ -5358,6 +5823,8 @@ stencil!("decode_num_acc"; |s| {
 
 // A number loaded from a field typed `Num` out of line, which may be an
 // int32 stored before the field was, into `facc`.
+// target x86_64 unbox_num_acc: 4 `cmp r12, r14; jae int; lea rax, [r14+r12]; movq xmm0, rax`, the int32 `xorps; cvtsi2sd` out of line (judged 2026-10-26)
+// target aarch64 unbox_num_acc: 4 now 5 `cmp x20, x22; b.hs int; add x8, x22, x20; fmov d0, x8`, not `scvtf` on both paths and `fcsel` (judged 2026-10-26)
 stencil!("unbox_num_acc"; |s| {
     s.facc = if s.tag.is_int32(s.acc) {
         i2f(int(s.acc))
@@ -5374,6 +5841,8 @@ stencil!("unbox_num_acc"; |s| {
 // The runtime returns `EMPTY` on an error: leave, and the run ends. If the
 // VM's code epoch (at `imm64b`) isn't `imm` anymore, the callee changed
 // something the code assumes: leave too, after the call.
+// target x86_64 call: 13 now 14 `... call; lea; mov r12, rax; pop rax; test; je exit; movabs r10, epoch; cmp dword [r10], imm32; jne exit` (judged 2026-10-26)
+// target aarch64 call: 17 now 18 an epoch in 16 bits (`_k16`) saves one, as `call_done` (judged 2026-10-26)
 stencil!("call"; |s| {
     let regs = Value::from_bits(s.regs as u64);
     let r = Value::from_bits(rt_call!(s, cloison_rt_call, regs, Value::from_bits(imm64())));
@@ -5457,6 +5926,8 @@ stencil!("call_direct"; |s| {
 // the function making it. The callee register must hold a bytecode
 // function (`Class::Function`) of that code (`code`); its frame's
 // header gets it (`set_frame_func_r`).
+// target x86_64 call_direct_code: 32 now 50 the direct call as the fall-through (LLVM lays the runtime call there; 34 executed), the epoch by `cmp dword [r10], imm32` (judged 2026-10-26)
+// target aarch64 call_direct_code: 36 now 52 the direct call as the fall-through (39 executed), `tst; ccmp; b.eq` for null-or-not-a-cell, an epoch in 16 bits (judged 2026-10-26)
 stencil!("call_direct_code"; |s| {
     let regs = Value::from_bits(s.regs as u64);
     let site = imm64() as *const DirectSite;
@@ -5504,6 +5975,7 @@ stencil!("call_direct_nc"; |s| {
 // (`arch::direct_call` in `src/jit.rs`), its result in `acc`: leave as
 // `call_direct` does.
 // target aarch64 call_done: 8 now 9 an epoch in 16 bits (`_k16`) saves one (docs/arm64-targets.md)
+// target x86_64 call_done: 5 now 6 `test r12, r12; je exit; movabs rax, epoch; cmp dword [rax], imm32; jne exit` (judged 2026-10-26)
 stencil!("call_done"; |s| {
     if s.acc.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
         exit!(s)
@@ -5591,6 +6063,8 @@ stencil!("clear_m"; |s| {
 });
 // Jump if the words at `imm64` and `imm64b` differ (at an entry: whether
 // a collection ran since the code last zeroed its dead registers).
+// target x86_64 words_jne: 5 `movabs rax, a; mov rax, [rax]; movabs r10, b; cmp rax, [r10]; jne L` (judged 2026-10-26)
+// target aarch64 words_jne: 10 address (3), `ldr`, address (3), `ldr`, `cmp`, `b.ne L` (judged 2026-10-26)
 stencil!("words_jne"; |s| {
     if *(imm64() as *const u64) != *(imm64b() as *const u64) {
         jump!(s)
@@ -5626,6 +6100,7 @@ stencil!("tier_count"; |s| {
 });
 
 // target aarch64 guard_word: 10 address (3), `ldr`, word (4), `cmp`, `b.ne` (docs/arm64-targets.md)
+// target x86_64 guard_word: 4 `movabs rax, addr; movabs r10, word; cmp [rax], r10; jne exit` (judged 2026-10-26)
 stencil!("guard_word"; |s| {
     if *(imm64() as *const u64) != imm64b_full() {
         exit!(s)
@@ -5801,6 +6276,10 @@ unsafe fn pop_class_flags(a: Value) -> u16 {
 }
 macro_rules! array_methods {
     ($loc:tt, $nc:literal, $array:expr, $poppable:expr) => {
+        // target x86_64 array_push_nc_g{}: 36 now 43 the barrier's cell test `test r12, r14; jne; test r12b, 2; jne; test r12, r12; je` (not 9), `elems` not reloaded, no `push rbp` (judged 2026-10-26)
+        // target x86_64 array_push_nc_m: 38 now 48 as `_g{}`, the receiver loaded again for the length store (judged 2026-10-26)
+        // target aarch64 array_push_nc_g{}: 10 the count stops at the code-2 `b slow` (a dispatch prefix); executed, an object no mark 26 for 24 (`elems` reloaded, `add`+`str` for `str [x9, w8, uxtw #3]`), a number 13 for 12 (judged 2026-10-26)
+        // target aarch64 array_push_nc_m: 11 as `_g{}` (judged 2026-10-26)
         stencil_slow!("array_push_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
             let v = s.acc;
@@ -5844,6 +6323,9 @@ macro_rules! array_methods {
         });
         // An int32 fits elements of any type but objects of a shape
         // (codes 0 to 2; `NO_ELEMENTS` is 3, a shape's address more).
+        // target x86_64 array_push_i_nc_g{}: 11 now 12 `or r12, r14` alone boxes the int32 (not `mov r10d, r12d; or r10, r14`) (judged 2026-10-26)
+        // target x86_64 array_push_i_nc_m: 12 now 13 as `_g{}` plus the receiver's load (judged 2026-10-26)
+        // target aarch64 array_push_i_nc_m: 13 now 14 as `_g{}` plus the receiver's load (judged 2026-10-26)
         // target aarch64 array_push_i_nc_g{}: 12 now 13 `orr x10, x22, x20` alone boxes the int32 (docs/arm64-targets.md)
         stencil_slow!("array_push_i_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
@@ -5884,7 +6366,10 @@ macro_rules! array_methods {
         // `LENGTH_READ_ONLY`, `SPARSE`: it throws, or the elements aren't
         // all there is), and for a hole at the end, which a prototype may
         // fill.
-        // target aarch64 array_pop_nc_g{}: 10 now 14 `sub` first, then `ldr`/`str [x9, w8, uxtw #3]` (13 on 2026-10-10; docs/arm64-targets.md)
+        // target x86_64 array_pop_nc_g{}: 13 now 14 `…; mov eax, [rdi+32]; sub eax, 1; jb empty; …` (`sub; jb` for `test; je` + `dec`) (judged 2026-10-26)
+        // target x86_64 array_pop_nc_m: 14 now 15 (judged 2026-10-26)
+        // target aarch64 array_pop_nc_g{}: 12 now 14 flags (5: 0xf4ff isn't a logical immediate), `ldp x9, x10, [x24, #24]; cbz w10; sub; ldr x20, [x9, w10, uxtw #3]; cbz; str xzr, [same]; str w10` (replaces `10 now 14`, set before the flags check; judged 2026-10-26)
+        // target aarch64 array_pop_nc_m: 13 now 15 (judged 2026-10-26)
         stencil!("array_pop_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
             if !$poppable(s.tag, a) {
@@ -5925,6 +6410,10 @@ with_gprs!(each_gpr! array_methods_gpr);
 // where that is no unit (`NaN`) or the receiver no string.
 macro_rules! char_code_at {
     ($loc:tt, $i:literal, |$s:ident| $index:expr) => {
+        // target x86_64 char_code_at_i_g{}: 13 cell (4), `cmp byte [rdi+8], 4; jne`, `elems` not null (3), bounds (2), `mov r10d, r12d; movzx r12d, word [rax+r10*2]` (judged 2026-10-26)
+        // target x86_64 char_code_at_i_m: 14 (judged 2026-10-26)
+        // target aarch64 char_code_at_i_g{}: 12 cell (3), `ldrb; cmp #4; b.ne`, `ldr; cbz`, `ldr; cmp; b.ls`, `ldrh w20, [x8, w20, uxtw #1]` (judged 2026-10-26)
+        // target aarch64 char_code_at_i_m: 13 (judged 2026-10-26)
         stencil_slow!("char_code_at_", $i, loc!($loc); |s| {
             let a = get!($loc, s);
             let $s = &s;
@@ -5968,6 +6457,8 @@ with_gprs!(each_gpr! char_code_at_gpr);
 // else the runtime's, or leave where `c` isn't a number.
 macro_rules! from_char_code {
     ($name:literal, |$s:ident| $code:expr) => {
+        // target x86_64 from_char_code_i: 8 `test r12d, 0xffffff00; jne; movabs; movzx r10d, r12b; mov rax, [rax+r10*8]; test; je; mov r12, rax` (judged 2026-10-26)
+        // target aarch64 from_char_code_i: 8 now 9 `ldr x8, [x8, w20, uxtw #3]`, not `and x9, x20, #0xff` first (judged 2026-10-26)
         stencil_slow!($name; |s| {
             let $s = &s;
             if let Some(c) = $code
@@ -6083,6 +6574,8 @@ math_max!("math_min_m", false);
 macro_rules! check_callee {
     ($loc:tt) => {
         // target aarch64 check_callee_g{}: 5 callee (3), `cmp`, branch (docs/arm64-targets.md)
+        // target x86_64 check_callee_g{},check_callee_m: 3 `movabs rax, f; cmp rdi, rax; jne exit` (`_m`: `cmp [r13+k], rax`) (judged 2026-10-26)
+        // target aarch64 check_callee_m: 6 `ldr x8, [x21, #k]`, callee (3), `cmp`, `b.ne` (judged 2026-10-26)
         stencil!("check_callee_", loc!($loc); |s| {
             if get!($loc, s).to_bits() != imm64() {
                 exit!(s)
@@ -6106,6 +6599,8 @@ macro_rules! check_callee {
         // A case of a polymorphic inlined call: another callee takes the
         // branch, to the next case.
         // target aarch64 callee_jne_g{}: 5 callee (3), `cmp`, branch (docs/arm64-targets.md)
+        // target x86_64 callee_jne_g{},callee_jne_m: 3 `movabs rax, f; cmp rdi, rax; jne L` (`_m`: `cmp [r13+k], rax`) (judged 2026-10-26)
+        // target aarch64 callee_jne_m: 6 `ldr x8, [x21, #k]`, callee (3), `cmp`, `b.ne L` (judged 2026-10-26)
         stencil!("callee_jne_", loc!($loc); |s| {
             if get!($loc, s).to_bits() != imm64() {
                 jump!(s)

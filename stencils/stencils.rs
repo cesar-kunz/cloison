@@ -88,7 +88,7 @@ mod layout;
 use layout::{
     COLOR, DirectSite, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
-    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
+    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
 };
 
@@ -1031,10 +1031,19 @@ stencil!("jump"; |s| { jump!(s) });
 // target x86_64 return: 2 `mov rax, r12; ret` (judged 2026-10-26)
 stencil!("return"; |s| { s.acc });
 
-// Exit stub tail: record the bytecode offset (`imm`) and return to the driver.
+// Exit stub tail: record the bytecode offset (`imm`) and go to the code's
+// `exit_tail`.
 // target aarch64 exit: 4 now 5 the bytecode offset in one `movz` when it fits (docs/arm64-targets.md)
 stencil!("exit"; |s| {
     *s.ctx = imm() as u32;
+    exit!(s)
+});
+
+// The code's exits' tail, once in its code: write the code's address
+// (`imm64`) to the frame header (see `layout::EXIT_CODE_OFF`) and return to
+// the driver.
+stencil!("exit_tail"; |s| {
+    *s.regs.byte_sub(EXIT_CODE_OFF).cast::<u64>() = imm64();
     s.acc
 });
 

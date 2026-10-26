@@ -7594,6 +7594,10 @@ const HOISTED: i32 = BAD_RESULT;
 /// heat ran out: compile it hot and continue there (see [`Tier`]).
 const TIER_UP: i32 = 1 << 21;
 
+/// The key of the exit stub every exit ends in, which writes the code's
+/// address to the frame (`exit_tail`; see `layout::EXIT_CODE_OFF`).
+const EXIT_TAIL: usize = u32::MAX as usize;
+
 /// Rounds of type inference that predict direct calls' results (see
 /// [`JitCode::compile`]).
 const MAX_RESULT_ROUNDS: u32 = 3;
@@ -9155,6 +9159,8 @@ impl JitCode {
             }
         }
 
+        exits.push((EXIT_TAIL, vec![Piece::new("exit_tail", 0)]));
+
         // Positions. Hot pieces back to back; then cold code: edge stubs,
         // exit stubs, helpers; then runtime-call wrappers.
         let mut pos = 0;
@@ -9389,6 +9395,9 @@ impl JitCode {
             for r in s.stencil().relocs.iter().filter(|r| (r.0 as usize) < len) {
                 let value = match r.2 {
                     Sym::HoleImm => p.imm as u32 as u64,
+                    // The exits' tail's: the code's own address (see
+                    // `direct_exit`).
+                    Sym::HoleImm64 if s.stencil().name == "exit_tail" => base,
                     // A cell, or an address in one, that the code embeds
                     // (a folded constant, a callee it checks for, a
                     // prototype's slot): kept alive (see `gc`).
@@ -9410,7 +9419,8 @@ impl JitCode {
                     Sym::Continue => base + cont as u64,
                     Sym::JumpTarget => base + jump as u64,
                     Sym::Exit => {
-                        base + *exit_at.get(&(p.exit as usize)).unwrap_or_else(|| {
+                        let exit = if s.stencil().name == "exit" { EXIT_TAIL } else { p.exit as usize };
+                        base + *exit_at.get(&exit).unwrap_or_else(|| {
                             panic!("no exit {} for {}", p.exit, s.stencil().name)
                         }) as u64
                     }
@@ -16611,11 +16621,21 @@ unsafe fn direct_exit(
             }
         }
         let callee_regs = caller.add(site.frame);
-        // A call to the code itself: that code is running (it made the
-        // call), so it is alive.
+        // The version that ran, which the exit wrote (see
+        // `layout::EXIT_CODE_OFF`): the one bound, or one bound before
+        // that this call entered, rebound since from inside it (its code
+        // retired, kept alive). A call to the code itself: that code is
+        // running (it made the call), so it is alive.
+        let ran = interp::exit_code(callee_regs);
         let code: &JitCode = match &site.target {
-            Some(code) => code,
-            None => &*site.self_code,
+            Some(code) if code.mem.ptr as u64 == ran => code,
+            None if (*site.self_code).mem.ptr as u64 == ran => &*site.self_code,
+            _ => vm
+                .jit_caches
+                .retired
+                .iter()
+                .find(|c| c.mem.ptr as u64 == ran)
+                .expect("the code a direct call's exit left"),
         };
         let (frame, exit_pc) = {
             let mut slot = (*site.callee).jit.borrow_mut();

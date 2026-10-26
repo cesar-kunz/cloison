@@ -193,6 +193,7 @@ realm_fields! {
     shadow_roots: Vec<*mut Object> = Vec::new() => shadow_roots;
     temporal_protos: Vec<*mut Object> = Vec::new() => temporal.protos;
     temporal_ctors: Vec<*mut Object> = Vec::new() => temporal.ctors;
+    intl_roots: Vec<*mut Object> = Vec::new() => intl_roots;
     regexp_fns: [*mut Object; 6] = [NULL; 6] => regexp_fns;
     dispose_roots: Vec<Value> = Vec::new() => dispose_roots;
     abstract_source: Vec<Value> = Vec::new() => modules.abstract_source;

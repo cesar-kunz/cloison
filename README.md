@@ -175,6 +175,10 @@ Temporal has the ISO 8601 calendar alone (as without ECMA-402), and
 takes named time zones from the system's database (`TZDIR`, else
 `/usr/share/zoneinfo`).
 
+`Intl` (ECMA-402) is an optional feature, `cargo build --features
+intl`: `Intl.Collator` alone so far, on ICU4X, its locale data (English)
+a file read at runtime. See [docs/intl.md](docs/intl.md).
+
 Realms (`ShadowRealm`, `$262.createRealm`) share the one heap: each
 has its own global object and intrinsics, which a call of another
 realm's function swaps in for the call (`src/realm.rs`). Until a second
@@ -642,6 +646,7 @@ src/promise.rs   Promise;  src/generator.rs  generators;  src/module.rs  modules
 src/iterator.rs  iterator helpers;  src/collections.rs  Map, Set, weak ones;  src/dispose.rs  `using`
 src/typed.rs     ArrayBuffer, typed arrays;  src/shared.rs  SharedArrayBuffer, Atomics
 src/proxy.rs, src/reflect.rs, src/bigint.rs, src/date.rs, src/temporal/  as named
+src/intl/        `Intl` (the `intl` feature: ICU4X);  data/intl/  its locale data
 src/realm.rs     realms;  src/shadow.rs  ShadowRealm;  src/agent.rs  test262's agents
 tests/           differential tests;  tests/octane/  feature scripts per benchmark
 bench/micro/     one pattern per file;  bench/bytecode/  handwritten bytecode

@@ -13074,10 +13074,12 @@ impl Lowering<'_> {
                     let f = self.out.frames[frame];
                     let callee = unsafe { (&(*f.code).closures)[i.imm as usize] };
                     let local = unsafe { (&(*callee).upvalues).iter().any(|&(l, _)| l) };
-                    let prop = if local {
-                        // (Only in the function's own frame: one capturing
-                        // its registers isn't inlined.)
-                        debug_assert_eq!(frame, 0);
+                    // (Only in the function's own frame: one capturing
+                    // its registers isn't inlined, else the closure would
+                    // capture the compiled frame's: it exits there.)
+                    let prop = if local && frame != 0 {
+                        Prop::None
+                    } else if local {
                         Prop::ClosureLocal { callee: callee as u64 }
                     } else {
                         Prop::Closure {

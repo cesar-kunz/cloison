@@ -4666,8 +4666,9 @@ pub(crate) fn check_native_stack(vm: &Vm) -> crate::vm::Result<()> {
 /// `CallUndefined` or `Construct` with operands `f`, `w`, `argc` over the
 /// compiled frame `regs`, whose registers it reads from memory. A bytecode
 /// callee runs to completion in a new frame `frame` values past `regs`
-/// (beyond every register the compiled code uses), through [`drive`], so
-/// its loops can tier up too. Returns the result, or `EMPTY` on an error
+/// (past the calling frame's registers, over compiled registers beyond
+/// them that hold nothing across a call: see `jit::CallSite`), through
+/// [`drive`], so its loops can tier up too. Returns the result, or `EMPTY` on an error
 /// (left in `vm.error`), or `EMPTY` with `vm.redo_call` set if the native
 /// stack is low ([`native_stack_low`]): the compiled code then leaves, to
 /// make the call in the interpreter.

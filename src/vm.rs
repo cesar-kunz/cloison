@@ -2899,11 +2899,21 @@ impl Vm {
         }
     }
 
+    /// Whether global `name` exists (HasBinding): on the global object or
+    /// its prototypes, a proxy among them asked (its `has` trap).
+    fn has_global(&mut self, name: Atom) -> Result<bool> {
+        let g = self.global;
+        if crate::proxy::chain_has_proxy(self, g) {
+            return crate::proxy::generic_has(self, object_value(g), Key::Name(name));
+        }
+        Ok(self.lookup(g, name).is_some())
+    }
+
     /// `LdaGlobal` miss: a ReferenceError if the global doesn't exist.
     pub fn get_global_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
         let (_, name) = code.ic(ic);
         let g = self.global;
-        if self.lookup(g, name).is_none() {
+        if !self.has_global(name)? {
             // (A script's `var`s are made before it runs: see
             // `global_declarations`.)
             return Err(Error::reference_error(format!(
@@ -2919,7 +2929,7 @@ impl Vm {
     /// missing global.
     pub fn get_global_typeof_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
         let (_, name) = code.ic(ic);
-        if self.lookup(self.global, name).is_none() {
+        if !self.has_global(name)? {
             return Ok(Value::UNDEFINED);
         }
         unsafe { global_way(code, ic) };
@@ -2961,6 +2971,19 @@ impl Vm {
     pub fn set_global_miss(&mut self, code: &Code, ic: u16, value: Value) -> Result<()> {
         let (ic, name) = code.ic(ic);
         let g = self.global;
+        // Not the global's own, past a proxy on its prototype chain: the
+        // proxy's `has` says if it exists, the store is [[Set]] on the global
+        // (its `set` trap).
+        if unsafe { (*(*g).shape).lookup(name).is_none() } && crate::proxy::chain_has_proxy(self, g) {
+            if code.strict && !self.has_global(name)? {
+                return Err(Error::reference_error(format!("{} is not defined", self.atom_name(name))));
+            }
+            let gv = object_value(g);
+            if !crate::proxy::generic_set(self, gv, Key::Name(name), value, gv)? {
+                self.store_failed = true;
+            }
+            return Ok(());
+        }
         if self.read_only(g, name) {
             // (In strict code a TypeError: `interp::strict_store_check`.)
             self.store_failed = true;

@@ -31,6 +31,9 @@ const STORES_BEFORE_EXIT: &[(&str, &str)] = &[
     // Its exits come after the call returned, as `call`'s do: the
     // interpreter resumes past the `new`, not at it.
     ("construct_direct", "exits after its call, as `call`"),
+    // Recording the exit is the point: its exit is the code's exit tail,
+    // which returns to the driver, never an exit stub that resumes.
+    ("exit", "records the exit, then goes to the code's exit tail"),
 ];
 
 /// The violations in stencil `name` (code and relocations), on `arch`.

@@ -469,6 +469,12 @@ pub struct InstanceOfEntry {
 /// through it.
 pub const FUNC_OFF: usize = 80;
 
+/// The header slot an exit of compiled code writes its code's address to
+/// (`interp::OSR_PC`'s offset in bytes below a frame's registers, a slot
+/// read only where a tier-up request wrote it): an exit of a direct call
+/// is decoded with the version that ran, not the one its site binds now.
+pub const EXIT_CODE_OFF: usize = 16;
+
 /// `jit::CallSite`'s first fields, which `call_direct` and
 /// `construct_direct` read.
 #[repr(C)]

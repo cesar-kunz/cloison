@@ -4628,6 +4628,16 @@ pub(crate) unsafe fn set_frame_func(regs: *mut Value, f: *const Object) {
 /// reads a function's upvalues through it).
 pub(crate) const FUNC_OFF: usize = crate::layout::FUNC_OFF;
 const _: () = assert!(FUNC_OFF == 8 * FUNC);
+const _: () = assert!(crate::layout::EXIT_CODE_OFF == 8 * OSR_PC);
+
+/// The address of the compiled code whose exit left frame `regs` (see
+/// `layout::EXIT_CODE_OFF`).
+///
+/// # Safety
+/// `regs` must be a frame's registers.
+pub(crate) unsafe fn exit_code(regs: *mut Value) -> u64 {
+    unsafe { (*regs.sub(OSR_PC)).to_bits() }
+}
 
 /// Native stack a run lets calls from compiled code use (each runs its
 /// callee to completion on the native stack). Past it, the interpreter

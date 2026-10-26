@@ -10794,6 +10794,9 @@ struct Lowering<'a> {
     /// Parameters of the call being inlined already in the callee's
     /// registers (a setter's value, see [`Lowering::accessor`]).
     preset_args: usize,
+    /// The call being inlined is an accessor's, whose function the
+    /// receiver's shape proves (see [`Lowering::accessor`]).
+    accessor_call: bool,
 }
 
 /// The function's instructions as compiled, from its code and inline caches:
@@ -10944,6 +10947,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
         call_in_loop: false,
         mov_scratch: Vec::new(),
         preset_args: 0,
+        accessor_call: false,
     };
     cx.out.fbs.push(cx.feedback(root));
     if cx.accessor_sites(root) {
@@ -13115,8 +13119,12 @@ impl Lowering<'_> {
                     (call.op, call.reg2, call.imm) = (Op::Call, i.reg, 0);
                     let id = self.out.frames.len();
                     self.preset_args = usize::from(set);
+                    self.accessor_call = true;
                     let guard = self.inline(frame, &call, fo, depth);
-                    self.preset_args = 0;
+                    (self.preset_args, self.accessor_call) = (0, false);
+                    // (The function the shape proves: the frame's, not one
+                    // of its code's that a guard would write; see
+                    // `inline_case`.)
                     self.out.insns[guard].guard = 0;
                     self.out.frames[id].ret_pc = i.pc + i.op.size();
                 }
@@ -14702,7 +14710,16 @@ impl Lowering<'_> {
             extra = extra.max(ACCESSOR_EXTRA as u8);
         }
         crate::vm::pin(callee);
-        let by_code = !next_case && hoisted.is_none() && alloc == 0 && inline_by_code(fo, i);
+        // (Not an accessor's, whose guard isn't kept: the receiver's shape
+        // proves its function, which its frame takes upvalues of. A getter
+        // shared by many objects' accessors, inlined for any closure of
+        // its code, read them through a header nothing wrote: the URL
+        // constructor's, called before, in sass's importer.)
+        let by_code = !next_case
+            && hoisted.is_none()
+            && alloc == 0
+            && !std::mem::take(&mut self.accessor_call)
+            && inline_by_code(fo, i);
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,

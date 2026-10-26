@@ -9761,6 +9761,33 @@ pub(crate) struct Caches {
 }
 
 impl Caches {
+    /// Function `code`'s registers live into each instruction as the
+    /// interpreter runs it, by bytecode offset (see [`bytecode_live`]).
+    fn pc_live(&mut self, code: *const crate::vm::Code) -> Rc<PcLive> {
+        if let Some(l) = self.pc_live.get(&code) {
+            return l.clone();
+        }
+        let d = self.decoded(code);
+        let live = unsafe { bytecode_live(&(*code).bytecode, &d.0, &(*code).closures, &(*code).handlers) };
+        let l: Rc<PcLive> = Rc::new(d.0.iter().map(|i| i.pc).zip(live).collect());
+        self.pc_live.insert(code, l.clone());
+        l
+    }
+
+    /// The registers function `code` may read before writing them, when
+    /// called: those a direct call must set (`this`, the parameters, and
+    /// locals read as `undefined`).
+    fn entry_live(&mut self, code: *const crate::vm::Code) -> Rc<Vec<bool>> {
+        if let Some(l) = self.entry_live.get(&code) {
+            return l.clone();
+        }
+        let first = self.pc_live(code).get(&0).copied().unwrap_or([0; 4]);
+        let nregs = unsafe { (*code).nregs } as usize;
+        let l: Rc<Vec<bool>> = Rc::new((0..nregs).map(|r| rs_has(&first, r)).collect());
+        self.entry_live.insert(code, l.clone());
+        l
+    }
+
     /// Function `code` decoded, with accumulator liveness after each
     /// instruction.
     fn decoded(&mut self, code: *const crate::vm::Code) -> Decoded {
@@ -10088,6 +10115,12 @@ pub(crate) struct CallSite {
     /// run out (see [`Lowering::direct_target`]): binding waits till it
     /// has (calls meanwhile go through the runtime, counting it down).
     wait_hot: bool,
+    /// The callee frame's registers the call's setup writes: `this`, the
+    /// arguments, and the locals its callee reads before writing them,
+    /// `undefined` (see [`Lowering::direct_setup`]). Another callee is
+    /// entered from it only if it reads no other at entry (see
+    /// [`CallSite::dispatched`]).
+    sets: RegSet,
 }
 
 /// A direct call site whose callee varies (gbemu's `OPCODE[op](this)`,
@@ -10265,6 +10298,27 @@ impl CallSite {
         }
         let fo = crate::object::as_object(fv);
         let callee = unsafe { (*fo).code };
+        // Its frame set up for the callee bound: not for one reading
+        // another register at entry (a parameter past the arguments, a
+        // local read as `undefined`), which its compiled code would read
+        // as an earlier frame left it. (sass's async `call$0`s, one per
+        // closure class: their closures captured such locals, a frame
+        // header's word, and closing them crashed.) The runtime sets every
+        // register.
+        // (A stub isn't compiled yet: its registers aren't known. Nor
+        // `undefined` in a local an argument past its parameters lands
+        // in, nor the other `this` of a callee of other strictness.)
+        if unsafe { (*callee).lazy.is_some() } {
+            return self;
+        }
+        let live = unsafe { (*self.vm).jit_caches.entry_live(callee) };
+        let nparams = unsafe { (*callee).nparams } as usize;
+        let strict = |c: *const crate::vm::Code| unsafe { (*c).strict };
+        if live.iter().enumerate().any(|(r, &l)| l && (!rs_has(&self.sets, r) || (r > nparams && r <= self.argc)))
+            || (self.op == Op::CallUndefined && live.first() == Some(&true) && strict(callee) != strict(self.callee))
+        {
+            return self;
+        }
         // (By code, as the site is, or by closure.)
         let key = if self.by_code { callee as u64 } else { fv.to_bits() };
         let k = dispatch_slot(key);
@@ -12585,31 +12639,14 @@ impl Lowering<'_> {
         }
     }
 
-    /// Function `code`'s registers live into each instruction as the
-    /// interpreter runs it, by bytecode offset (see [`bytecode_live`]).
+    /// See [`Caches::pc_live`].
     fn pc_live(&mut self, code: *const crate::vm::Code) -> Rc<PcLive> {
-        if let Some(l) = self.caches().pc_live.get(&code) {
-            return l.clone();
-        }
-        let d = self.decoded(code);
-        let live = unsafe { bytecode_live(&(*code).bytecode, &d.0, &(*code).closures, &(*code).handlers) };
-        let l: Rc<PcLive> = Rc::new(d.0.iter().map(|i| i.pc).zip(live).collect());
-        self.caches().pc_live.insert(code, l.clone());
-        l
+        self.caches().pc_live(code)
     }
 
-    /// The registers function `code` may read before writing them, when
-    /// called: those a direct call must set (`this`, the parameters, and
-    /// locals read as `undefined`).
+    /// See [`Caches::entry_live`].
     fn entry_live(&mut self, code: *const crate::vm::Code) -> Rc<Vec<bool>> {
-        if let Some(l) = self.caches().entry_live.get(&code) {
-            return l.clone();
-        }
-        let first = self.pc_live(code).get(&0).copied().unwrap_or([0; 4]);
-        let nregs = unsafe { (*code).nregs } as usize;
-        let l: Rc<Vec<bool>> = Rc::new((0..nregs).map(|r| rs_has(&first, r)).collect());
-        self.caches().entry_live.insert(code, l.clone());
-        l
+        self.caches().entry_live(code)
     }
 
     /// The VM's [`Caches`].
@@ -13242,6 +13279,7 @@ impl Lowering<'_> {
             table: std::ptr::null_mut(),
             dispatch: None,
             wait_hot: false,
+            sets: [0; 4],
         }
     }
 
@@ -13922,6 +13960,14 @@ impl Lowering<'_> {
         for (r, &l) in live.iter().enumerate().skip(1 + argc) {
             if l {
                 store(self, None, r);
+            }
+        }
+        // (The registers written, for calls dispatched to other callees.)
+        if let Prop::Call { site, .. } = p {
+            let site = unsafe { &mut *self.out.sites[site as usize].get() };
+            site.sets = [0; 4];
+            for &k in &stores {
+                rs_add(&mut site.sets, self.out.insns[k].reg as usize);
             }
         }
         let window = i.reg2;

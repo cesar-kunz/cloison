@@ -20,6 +20,12 @@ written next to the stencil in stencils/stencils.rs as a comment:
   excludes (`tget_*_g{},!*_chk_*`).
 - <n> is the target. `now <m>` records a known gap: the stencil is <m>
   instructions and the target <n> is not reached yet.
+- `fallthrough <k>` says the target is for another path than the one the
+  count follows: LLVM laid out a different path (a number store, the
+  runtime call) as the fall-through, and that one is <k> instructions. The
+  note names the path the target is for. The stencil is reported `path`
+  while the count is <k>, and as changed (a failure) when it is not, to be
+  judged again.
 
 A count is the stencil's hot path, as docs/opcode-targets.md counts it:
 the instructions from its start, as the JIT copies it (after build.rs's
@@ -31,12 +37,14 @@ counts it. x86-64 is decoded with GNU objdump; on arm64 every instruction
 is 4 bytes and an unconditional `b` is recognized by its encoding.
 
 The report: each annotation's stencils against it (ok, gap, over target
-beyond a known gap, under the target, or matching nothing), then the
+beyond a known gap, under the target, `path` or `changed` for a
+`fallthrough`, or matching nothing), then the
 families with no target for that architecture. With `--counts` (the
 output of `CLOISON_COUNT=1 cloison FILE.js`, any number of files), the
 families are ranked by their share of the code executed, averaged over the
 files; otherwise by name. `--check` exits 1 when a stencil is over its
-target beyond a known gap or an annotation matches nothing.
+target beyond a known gap, a `fallthrough` count changed, or an
+annotation matches nothing.
 """
 import collections, fnmatch, glob, os, re, subprocess, sys, tempfile
 
@@ -130,10 +138,10 @@ def counts_arm64(ents):
 def annotations():
     anns = []
     for i, line in enumerate(open(SOURCE), 1):
-        m = re.match(r"\s*//[/!]?\s*target (x86_64|aarch64) (\S+): (\d+)(?: now (\d+))?\s*(.*)$", line)
+        m = re.match(r"\s*//[/!]?\s*target (x86_64|aarch64) (\S+): (\d+)(?: now (\d+))?(?: fallthrough (\d+))?\s*(.*)$", line)
         if m:
             anns.append(dict(arch=m.group(1), glob=m.group(2), target=int(m.group(3)),
-                             now=int(m.group(4)) if m.group(4) else None, note=m.group(5), line=i))
+                             now=int(m.group(4)) if m.group(4) else None, fall=int(m.group(5)) if m.group(5) else None, note=m.group(6), line=i))
     return anns
 
 def matches(k, pattern):
@@ -228,7 +236,10 @@ def main(argv):
                 lo, hi = min(cs), max(cs)
                 worst = [nm for _, v in hit for nm, n, _ in v if n == hi][:3]
                 rng = f"{lo}" if lo == hi else f"{lo}..{hi}"
-                if hi <= a["target"]:
+                if a["fall"] is not None:
+                    status = "path" if lo == hi == a["fall"] else "changed"
+                    failed |= status == "changed"
+                elif hi <= a["target"]:
                     status = "under" if hi < a["target"] else "ok"
                 elif a["now"] is not None and hi <= a["now"]:
                     status = "gap"
@@ -239,6 +250,7 @@ def main(argv):
             tally[status] += 1
             if show_all or status not in ("ok",):
                 now = f", known {a['now']}" if a["now"] is not None else ""
+                now += f", fall-through {a['fall']}" if a["fall"] is not None else ""
                 print(f"  {status:5} {a['glob']:28} target {a['target']}{now}; {detail}  [stencils.rs:{a['line']}]")
         print("  " + ", ".join(f"{k} {v}" for k, v in sorted(tally.items())))
         fams = collections.defaultdict(int)

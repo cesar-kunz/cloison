@@ -3774,6 +3774,28 @@ function c(a = 1) { try { throw 1; } catch (e) { var { e: q } = { e: 6 }; } retu
     assert_eq!(value(src), "5 13 7 2,3,,5 undefined,4 6");
 }
 
+/// An async function declared in the body of a function with parameter
+/// defaults: bound by the body's name for it, as a plain function is
+/// (pdf.js's evaluator read its `handleSetFont` as an undeclared global,
+/// and extracted no text). The expected value is V8's and SpiderMonkey's.
+#[test]
+fn async_function_declarations_in_bodies_with_parameter_defaults() {
+    let src = r#"
+var log = [];
+function g(a = 1) { async function h() { return 5; } return (() => h())(); }
+class C { async m({ s, seen = new Set() }) { async function hs(x) { return x + 1; } return new Promise(function body(res) { res(hs(s)); }); } }
+function w(h3 = 2) { async function h3() { return 9; } return [typeof h3, (() => typeof h3)()].join(); }
+async function* ag(a = 1) { async function* q() { yield 7; } for await (const x of (() => q())()) yield x; }
+Promise.all([g(), new C().m({ s: 1 })]).then(async v => { for await (const x of ag()) v.push(x); v.push(w()); globalThis.out = v.join(" "); });
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("out");
+    let g = cloison::object::object_value(vm.global);
+    assert_eq!(display(vm.get(g, a).unwrap()), "5 2 7 function,function");
+}
+
 /// An object keyed by flags, each twice the last (a TypeScript enum's
 /// reverse mapping, `F[F["B24"] = 1 << 24] = "B24"`): its elements kept no
 /// sparser than an array's, not doubled up to 2^30 (out of memory). The

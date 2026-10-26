@@ -668,6 +668,8 @@ impl<'a> Parser<'_, 'a, '_> {
                 let f = self.function(true, false, pos)?;
                 if !self.frames.last().unwrap().body {
                     self.block_function(f);
+                } else {
+                    self.body_function(f);
                 }
                 StmtKind::Function(f)
             }

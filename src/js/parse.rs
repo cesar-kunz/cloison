@@ -2496,7 +2496,7 @@ impl<'a> Parser<'_, 'a, '_> {
                     ExprKind::Member(base, self.private_ref(name)?)
                 };
                 e = Expr { kind, pos };
-            } else if matches!(self.peek(), Tok::Template(_)) && chain {
+            } else if matches!(self.peek(), Tok::Template(t) if t.head) && chain {
                 return self.err("a tagged template in an optional chain");
             } else if self.eat("(") {
                 let args = self.arguments()?;

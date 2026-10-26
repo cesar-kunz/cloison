@@ -834,3 +834,167 @@ load is `movq` + `sub` with no branch; (3) bounds checks hoisted for
 induction variables with known ranges; (4) loop-invariant conversions
 hoisted; (5) overflow checks dropped on increments bounded by a checked
 length.
+
+## Every hot stencil, ideal code pass (2026-10-26, at 496edba)
+
+The 155 families with no target that run at least 0.05% of the compiled
+code (mean of `CLOISON_COUNT` over Octane's 15 benchmarks), judged on both
+architectures. Together they account for most of the executed compiled code
+the earlier passes hadn't judged. The ideal is what a person would write under the same
+contract: the same value encoding, registers, frame, guards, exits and
+runtime calls. A different design that would do better is noted
+separately. Each judgement is a `// target` comment next to its stencil,
+with the ideal sequence (abbreviated when long). There are now 284 targets
+on x86-64 and 303 on arm64. `scripts/stencil-targets.py --check` passes:
+
+| | ok | known gap | `fallthrough` |
+|---|---:|---:|---:|
+| x86-64 | 153 | 114 | 19 |
+| arm64 | 188 | 101 | 14 |
+
+`fallthrough <k>` marks a target for a path that LLVM didn't lay out as the
+fall-through. It applies to stores whose number case or runtime call comes
+first, and to arm64 `get_keyed`. The count follows the other path, of `<k>`
+instructions, and the note names the path the target is for. The
+families left without a target (217 on x86-64) each run less than 0.05%.
+
+The weights below are share × gap in instructions. They rank the work and
+don't predict a gain: `CLOISON_COUNT` weighs an execution by the stencil's
+whole size, not by the path it took, and a layout gap costs taken branches
+more than it costs instructions.
+
+**Gaps, largest first:**
+
+1. **The write barrier**: about 80 on x86-64, a fifth of that on arm64.
+   The ideal is 15–16 instructions after the store, but about 21 are
+   emitted on x86-64 and 17 on arm64, with the card mark in the
+   fall-through.
+   - The not-a-cell test is 9 instructions (setcc/or merged) where 4 do,
+     given that every non-cell, non-number value is below 0x20; a `const`
+     assert should guard that.
+   - The young-host test has one instruction too many.
+   - On arm64, a `sub` comes before the shift: `(p-8)>>4 == p>>4`.
+   - The barrier's live values force a `push rbp`, red-zone spills, and
+     r9/r15/r12 taken in the `_m`, oop, keyed and named stores.
+
+   Writing it once as `asm goto`, with fixed scratch registers and the card
+   mark cold, covers set_own_nc, sta_upvalue, set_oop_nc, set_tr_nc, set_tr,
+   sta_global, set_tro_nc, set_own and sta_global_oop. It is about a day of
+   work, verified under `CLOISON_GC_VERIFY`. Separately, sta_upvalue reads
+   `u.at` twice; reading it once is a trivial fix.
+2. **Generic `==` (`teq_j?_g/m`, `test_eq_m/g`)**: 6–9 against 37–40
+   counted, about 39 on x86-64 and 33 on arm64.
+   - LLVM put the both-int32 path out of line, and on the object path
+     `loose_eq_fast` is branch-free where plain branches do better (40→27,
+     arm64 37→28).
+   - First measure which case TypeScript's `teq_jf_g2` takes. Then either
+     lay out the int path first, or keep the object tests first with the
+     equal-bits double case cold.
+   - `tseq_jt/jf_m` (25 against 17–18, arm64 17 against 12–13) and
+     `test_seq_m` (31 against 14) have the same problem. The fix: branch
+     out of line on equal bits, and once the tag test has passed, test bit
+     1 (`test r10b, 2` / `tbz #1`) instead of a mask.
+3. **`create_array_n`**: 85 against 42 on x86-64 (about 20), 51 against 43
+   on arm64. The causes: the bump check, r8/r9 spilled, `imm` loaded
+   twice, and an unrolled fill loop.
+   - **`create_object_<n>`** (n = 2: 21 against 17; about 7 per
+     architecture) and `create_array`: `bump` should test `p + size > end`
+     (`lea; cmp; ja`, not `mov; sub; cmp; jb; lea`), and zero with
+     16-byte stores.
+   - The earlier target of 13 for n = 2 predates the metadata byte.
+4. **The cell test on x86-64**: about 14, one instruction across 12
+   families (get_own, get_oop, get_proto, get_length, get_keyed*,
+   guard_cell, check_shape, check_acc_shape). `tag | 2` is built with
+   `mov rax, r14; or rax, 2`. Writing `tag + 2` gives `mov; add`, so the
+   fix is a one-line asm `lea rax, [r14 + 2]` in `is_cell`.
+5. **`get_named_rt` and `set_named_rt`**:
+   - **get_named_rt**: LLVM falls through into the runtime call. The fix
+     is to split it into a `__slow` piece as `get_keyed_rt_` does, and drop
+     the `push rbp`. That is about 13 per architecture as counted, and 11
+     (x86-64) and 3 (arm64) instructions actually executed.
+   - **set_named_rt**: on x86-64, `mega_store` runs 82 instructions where 42
+     do. The fix is the entry pointer computed once with early returns,
+     and no barrier for `_i` (about 16).
+6. **Keyed stores**:
+   - **The type dispatch**: it builds a setcc boolean (`fits_code`). Making
+     ANY the fall-through, with early exits, is worth about 15 on x86-64
+     across set_keyed_nc, set_keyed_rt and set_keyed.
+   - **`set_keyed_ap` / `_ap_i`**: they test again after the store. Bumping
+     `elems_len` first frees r15/r9/r8 (about 9.5).
+   - **`array_push_nc`**: 43 against 36 on x86-64. It pays the barrier's
+     cell test, reloads `elems`, and does a `push rbp`.
+7. **Boolean branches** (`jtofalse`, `jtotrue`, `jfalse`, `jtrue`): about 9
+   on x86-64, plus 5 on arm64. GVN replaces `acc` by the constant just
+   compared, giving a `mov r12d, 7` after `cmp r12, 7`. That `mov` blocks a
+   direct `je L`: `jfalse` is 4 instructions against 2. `jtofalse` also
+   merges its two boolean tests into `and -2; cmp 6`. A build.rs peephole
+   dropping the repeated `mov` fixes all four.
+8. **Calls**:
+   - **`call_direct_code`** (50 against 32): LLVM made the runtime call the
+     fall-through, which costs 2 taken branches per direct call. A cold
+     hint on the runtime arm fixes it. `call_direct` and `construct_direct`
+     probably share it.
+   - **The epoch compare** in `call`, `call_done` and `call_direct_code`
+     should be `cmp dword [m], imm32` (about 2.3).
+   - **`test_instanceof_m`** (28 against 25): it walks a pointer through the
+     cache, where fixed offsets, `imm_zext()` and `ldp` on arm64 do better.
+9. **Ints in place**: `add_ii` (4 against 2), `addi_g` (5 against 3) and
+   `inc_i` (4 against 2), about 6 together.
+   - They should add in place with an undo exit stub, as `add_smi_i`
+     does.
+   - `add_smi_wrap_i` should be `add r12d, k`.
+   - `add_smi_iif` needs a sign-extended imm32 (R_X86_64_32S, which
+     `HoleImm` doesn't take yet).
+   - `test_eq_ii` (5 against 4): writing `boolean()` as `FALSE + c` should
+     also close the known `test_lt_ii` gap.
+10. **Smaller, under 2 each**:
+    - **x86-64**:
+      - `tset_*` re-extends a key that's already zero-extended: 5
+        against 4, where 2026-10-09 measured 4. The fix is `i as usize` in
+        `typed_elem_x`.
+      - `_chk`'s kind immediate is held in a register.
+      - `spill_u` should be `lea rax, [rdi + r14]`.
+      - `mul_m`'s -0 test should go out of line.
+      - `bit_xor_m`, `bit_and_m` and `bit_or_smi` keep or rebuild a box
+        they already had.
+      - `_f` ToInt32 should use `cvttsd2si; cmp r, 1; jo`.
+    - **arm64**:
+      - a widened `tbz` (`tst; b.cond`) where the exit is in range;
+      - `star_g{}_i` should be `orr x24, x22, x20` alone;
+      - `unbox_num_acc`'s `fcsel`;
+      - `tget_f32`'s NaN select;
+      - `lda_smi_i` through a scratch register;
+      - `get_own_nc_g{}_to_g{}` into the same slot.
+    - **Both**:
+      - the `_k16` immediate forms;
+      - `acc | tag` boxing in the `_i`/`_ia` stores and pushes;
+      - `set_frame_func_r`'s offset as a displacement.
+
+**Earlier targets judged again:**
+- **arm64 `set_own_g{}` and `set_tr_g{}`**: 25 and 29 with the barrier,
+  replacing 10 and 14, which predate it.
+- **arm64 `array_pop_nc_g{}`**: 12, replacing 10, which predates the
+  flags check (`0xf4ff` isn't a logical immediate).
+- **arm64 `tset_b32_i_g{}: 5`**: now covers b8 and b16.
+
+**Beyond the stencils:**
+- **A `Bool` type in the JIT's `Ty`**: most `jtofalse` would become
+  `jfalse`, and a jump on a known object would be constant.
+- **One `array_push` variant per element kind** when a shape's
+  `elems_code` cannot change: it drops the 3–8 instruction dispatch.
+- **One bump for both cells of an array literal.**
+- **A `tbz` kept when the exit is within 32 KiB**: it would close every
+  widened branch on arm64.
+- **An encoder for arm64 imm12 and logical immediates**: it would close
+  the `_k16` gaps, including the older `jlt_smi_i_k16` and `andi_u{}_k16`.
+
+**Possible hazards, none reproduced:**
+- **`spill_u{}_v`**: it takes any value with a zero high half for an
+  int32, so undefined, null and booleans would be written back as 10, 2, 7
+  or 6. That happens only if the interpreter reads such a value after an
+  exit: `src/jit.rs` uses `star_u<k>_v` only for a value compiled code
+  doesn't read. A probe that stores undefined into an int home and reads it
+  after an exit printed undefined.
+- **The stencils' `is_cell`**: it accepts 0 (the hole) where
+  `Value::is_cell` does not. A hole reaching a generic `==` would read
+  address 8.

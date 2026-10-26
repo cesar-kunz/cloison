@@ -337,6 +337,27 @@ const SHARED_ICS: usize = 60000;
 /// The name of the register holding a function's scope object.
 const ENV: &str = "%env";
 
+/// The name an enclosing function's scope object is passed down under,
+/// by that function's depth (see [`depth`]), where a function between has
+/// a scope object of its own (an async function's, a generator's): the
+/// two can't share `ENV`.
+const OUTER_ENVS: [&str; 32] = [
+    "%env^0", "%env^1", "%env^2", "%env^3", "%env^4", "%env^5", "%env^6", "%env^7", "%env^8", "%env^9",
+    "%env^10", "%env^11", "%env^12", "%env^13", "%env^14", "%env^15", "%env^16", "%env^17", "%env^18",
+    "%env^19", "%env^20", "%env^21", "%env^22", "%env^23", "%env^24", "%env^25", "%env^26", "%env^27",
+    "%env^28", "%env^29", "%env^30", "%env^31",
+];
+
+/// How many functions enclose function `i`.
+fn depth(p: &Program, i: usize) -> usize {
+    let (mut d, mut j) = (0, p.functions[i].parent);
+    while let Some(k) = j {
+        d += 1;
+        j = p.functions[k].parent;
+    }
+    d
+}
+
 /// Per function, its block-scoped variables kept in boxes: a generator's
 /// (or an async function's) that nested functions use. Its other variables
 /// those use are in its scope object, one for the call, as its frame
@@ -451,10 +472,14 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
     };
     scopes.upvalues[i]
         .iter()
+        .map(|&n| {
+            // (The parent's own scope object, passed down under its depth.)
+            if OUTER_ENVS.get(depth(p, parent)) == Some(&n) { ENV } else { n }
+        })
         .map(|n| match decls[parent].position(n) {
             Some(k) if parent != 0 || script_local(p, n) => (true, k as u8 + 1),
             _ => {
-                let k = scopes.upvalues[parent].iter().position(|d| d == n);
+                let k = scopes.upvalues[parent].iter().position(|&d| d == n);
                 (false, k.expect("passed down by the parent") as u8)
             }
         })
@@ -638,12 +663,18 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
                     chain.push(m);
                     j = p.functions[m].parent;
                 }
-                if chain[1..].iter().any(|&m| decls[m].contains(&ENV)) {
-                    continue;
-                }
+                // (Under another name where a function between has its own.)
+                let env = if chain[1..].iter().any(|&m| decls[m].contains(&ENV)) {
+                    match OUTER_ENVS.get(depth(p, k)) {
+                        Some(&env) => env,
+                        None => continue,
+                    }
+                } else {
+                    ENV
+                };
                 for c in chain {
-                    if !upvalues[c].contains(&ENV) {
-                        upvalues[c].push(ENV);
+                    if !upvalues[c].contains(&env) {
+                        upvalues[c].push(env);
                     }
                 }
                 if !captured[k].contains(&ENV) {
@@ -3020,10 +3051,12 @@ impl<'a> Gen<'a> {
         while let Some(k) = f.filter(|&k| k != 0) {
             if self.decls[k].position(name).is_some() {
                 // (In its scope object: see `generate`.)
-                if self.overflows[k].contains(&name)
-                    && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == ENV)
-                {
-                    return Ok(Var::ScopeUpvalue(u as u8));
+                if self.overflows[k].contains(&name) {
+                    let ups = &self.scopes.upvalues[self.index];
+                    let outer = OUTER_ENVS.get(depth(self.p, k));
+                    if let Some(u) = ups.iter().position(|n| Some(n) == outer).or_else(|| ups.iter().position(|&n| n == ENV)) {
+                        return Ok(Var::ScopeUpvalue(u as u8));
+                    }
                 }
                 // (In its box, the upvalue.)
                 if self.boxed[k].contains(&name)

@@ -2872,6 +2872,9 @@ jump_to_boolean!("jtofalse", false);
 macro_rules! rel {
     (lt, $l:expr, $r:expr) => { $l < $r };
     (eq, $l:expr, $r:expr) => { $l == $r };
+    (gt, $l:expr, $r:expr) => { $l > $r };
+    (le, $l:expr, $r:expr) => { $l <= $r };
+    (ge, $l:expr, $r:expr) => { $l >= $r };
 }
 /// The relation on any values, through the runtime.
 macro_rules! rel_rt {
@@ -3215,6 +3218,68 @@ macro_rules! cmp_int {
         });
     };
 }
+
+/// `r > acc`, `r <= acc` and `r >= acc` on numbers, one a double (`ii`
+/// is `jlt`/`jge`/`tlt` with the operands either way round): compared as
+/// doubles, so a NaN makes each false and its `jf` jump. Not otherwise
+/// (`jrel`/`jnrel`, boxed, through memory).
+macro_rules! num_cmp_boxed {
+    ($loc:tt, $rel:ident, $act:ident, $name:literal) => {
+        stencil!($name, "_if_", loc!($loc); |s| {
+            act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), i2f(int(s.acc))))
+        });
+        stencil!($name, "_fi_", loc!($loc); |s| {
+            act!($act, s, rel!($rel, i2f(int(get!($loc, s))), s.facc))
+        });
+        stencil!($name, "_ff_", loc!($loc); |s| {
+            act!($act, s, rel!($rel, s.tag.decode_f64(get!($loc, s)), s.facc))
+        });
+    };
+}
+macro_rules! num_cmp_fp {
+    ($k:tt, $rel:ident, $act:ident, $name:literal) => {
+        stencil!($name, "_if_f", $k; |s| {
+            act!($act, s, rel!($rel, s.f[$k], i2f(int(s.acc))))
+        });
+        stencil!($name, "_ff_f", $k; |s| {
+            act!($act, s, rel!($rel, s.f[$k], s.facc))
+        });
+    };
+}
+macro_rules! num_cmp_int {
+    ($k:tt, $rel:ident, $act:ident, $name:literal) => {
+        stencil!($name, "_fi_u", $k; |s| {
+            act!($act, s, rel!($rel, i2f(raw(s.g[$k])), s.facc))
+        });
+    };
+}
+// target x86_64 tgt_j?_ff_g{},tle_j?_ff_g{},tge_j?_ff_g{}: 4 `lea rax, [rsi+r14]; movq xmm8, rax; ucomisd xmm8, xmm0; jbe L`, as `tlt_jf_ff_g{}` (judged 2026-10-28)
+// target x86_64 tgt_j?_ff_f{},tle_j?_ff_f{},tge_j?_ff_f{}: 2 `ucomisd xmm2, xmm0; jbe L`, as `tlt_jf_ff_f{}` (judged 2026-10-28)
+macro_rules! num_cmp_families {
+    ($m:ident, $loc:tt) => {
+        $m!($loc, gt, jt, "tgt_jt");
+        $m!($loc, gt, jf, "tgt_jf");
+        $m!($loc, le, jt, "tle_jt");
+        $m!($loc, le, jf, "tle_jf");
+        $m!($loc, ge, jt, "tge_jt");
+        $m!($loc, ge, jf, "tge_jf");
+    };
+}
+macro_rules! num_cmp_gpr {
+    ($k:tt) => {
+        num_cmp_families!(num_cmp_boxed, [g $k]);
+        num_cmp_families!(num_cmp_int, $k);
+    };
+}
+num_cmp_families!(num_cmp_boxed, [m]);
+with_gprs!(each_gpr! num_cmp_gpr);
+num_cmp_families!(num_cmp_fp, 0);
+num_cmp_families!(num_cmp_fp, 1);
+num_cmp_families!(num_cmp_fp, 2);
+num_cmp_families!(num_cmp_fp, 3);
+num_cmp_families!(num_cmp_fp, 4);
+num_cmp_families!(num_cmp_fp, 5);
+num_cmp_families!(num_cmp_fp, 6);
 
 /// All six comparison families at one location, through `$m`.
 macro_rules! cmp_families {

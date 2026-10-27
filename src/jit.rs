@@ -7425,6 +7425,15 @@ impl Fusion<'_> {
                         _ => "tlt_jt",
                     };
                     format!("{base}_ii_{loc}")
+                } else if let case @ ("if" | "fi" | "ff") = pair_case(st.acc, st.regs[r as usize]) {
+                    // Numbers, one a double: `r > acc` (`tgt`), … compared
+                    // as doubles, a NaN false (so `jf` jumps).
+                    let base = match insns[i].op {
+                        Op::TestGreaterThan => "tgt",
+                        Op::TestLessThanOrEqual => "tle",
+                        _ => "tge",
+                    };
+                    format!("{base}_{pol}_{case}_{loc}")
                 } else {
                     if let Some(b) = box_acc_piece(st.acc) {
                         steps.push(step(b.stencil.stencil().name.to_string(), 0, 0));

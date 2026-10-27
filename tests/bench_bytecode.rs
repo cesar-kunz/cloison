@@ -82,9 +82,10 @@ fn hot_property_loops_compile_without_repeated_guards() {
             .all(|n| !n.starts_with("get_own_") || n.starts_with("get_own_nc_")),
         "{s:?}"
     );
-    // `v.mark == r % 5` and `n += v.value` on int32 fields.
+    // `v.mark == r % 5` and `n += v.value` on int32 fields (the add in
+    // place on `n`'s slot).
     assert!(s.iter().any(|n| n.starts_with("teq_jt_ii_")), "{s:?}");
-    assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("add_ii_") || n.starts_with("add_into_")), "{s:?}");
 }
 
 #[test]

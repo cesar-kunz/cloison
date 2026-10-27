@@ -2264,7 +2264,7 @@ fn bytecode_live(
     let effects: Vec<(RegSet, Option<usize>)> = insns
         .iter()
         .map(|insn| {
-            let op = Op::from_u8(code[insn.pc]).unwrap();
+            let op = Op::from_u8(code[insn.pc]).unwrap().plain();
             let (mut at, mut regs, mut count) = (insn.pc + 1, Vec::new(), 0);
             for &k in op.operands() {
                 match k {

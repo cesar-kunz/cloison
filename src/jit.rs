@@ -4387,8 +4387,8 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             ("bit_not", if st.acc == I32 { "i" } else { "" })
         }
         // `lda_upvalue` finds the cell in the frame's function, at byte
-        // `imm`: after the in-object slots of the function shape, which
-        // every function object with upvalues has (`Vm::upvalues`); `_c`
+        // `imm`: after the in-object slots every closure has
+        // (`vm::UPVALUES_OFF`); `_c`
         // has the cell (`Prop::Upvalue`).
         // An upvalue folded to its value (`Lowering::constant_upvalue`): a
         // typed array keeps its kind (no `_chk` on its elements).
@@ -4415,9 +4415,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             return match spec.props.get(i).copied() {
                 Some(Prop::UpvalueAt { off }) => Sel {
                     ops: Some((
-                        (crate::object::INLINE_BASE as u32
-                            + 8 * unsafe { (*(*interp::current_vm()).function_shape).capacity.get() }
-                            + 8 * insn.imm as u32) as i32,
+                        (crate::vm::UPVALUES_OFF + 8 * insn.imm as usize) as i32,
                         off as i64 as u64,
                         0,
                     )),
@@ -4431,9 +4429,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 _ => Sel {
                     post,
                     ops: Some((
-                        (crate::object::INLINE_BASE as u32
-                            + 8 * unsafe { (*(*interp::current_vm()).function_shape).capacity.get() }
-                            + 8 * insn.imm as u32) as i32,
+                        (crate::vm::UPVALUES_OFF + 8 * insn.imm as usize) as i32,
                         0,
                         0,
                     )),

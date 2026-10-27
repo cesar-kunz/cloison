@@ -3056,6 +3056,26 @@ fn builtins_agree_with_node() {
     );
 }
 
+/// `toFixed`, `toPrecision` and `toExponential` round half up, Rust's
+/// formatting to even: values at a tie (binary fractions, and integers
+/// ending in 5 at `toPrecision`'s digit) and next to one, subnormals, the
+/// largest double; integers' `toString` around 2^53. The expected value is
+/// what V8, SpiderMonkey and JavaScriptCore print.
+#[test]
+fn number_formatting_rounds_ties_up() {
+    let src = r#"
+var out = [];
+var xs = [0.5, 1.5, 2.5, 0.125, 0.375, 1.25, 2.675, 1e-7, 5e-324, 25, 35, 125, 150, 2500, 9.5, 99.5, 999.5, 9.995, 4.35, -2.5, -0.125, 4503599627370495.5, 1.7976931348623157e308];
+for (var i = 0; i < xs.length; i++) {
+  var x = xs[i];
+  out.push(x.toFixed(0) + " " + x.toFixed(1) + " " + x.toFixed(2) + " " + x.toPrecision(1) + " " + x.toPrecision(2) + " " + x.toExponential(0) + " " + x.toExponential(1));
+}
+out.push((2 ** 53 - 1) + " " + (-(2 ** 53)) + " " + 2 ** 53 + " " + 2 ** 60 + " " + (-123456) + " " + (1e21 + 0).toString());
+out.join(";");
+"#;
+    assert_eq!(value(src), "1 0.5 0.50 0.5 0.50 5e-1 5.0e-1;2 1.5 1.50 2 1.5 2e+0 1.5e+0;3 2.5 2.50 3 2.5 3e+0 2.5e+0;0 0.1 0.13 0.1 0.13 1e-1 1.3e-1;0 0.4 0.38 0.4 0.38 4e-1 3.8e-1;1 1.3 1.25 1 1.3 1e+0 1.3e+0;3 2.7 2.67 3 2.7 3e+0 2.7e+0;0 0.0 0.00 1e-7 1.0e-7 1e-7 1.0e-7;0 0.0 0.00 5e-324 4.9e-324 5e-324 4.9e-324;25 25.0 25.00 3e+1 25 3e+1 2.5e+1;35 35.0 35.00 4e+1 35 4e+1 3.5e+1;125 125.0 125.00 1e+2 1.3e+2 1e+2 1.3e+2;150 150.0 150.00 2e+2 1.5e+2 2e+2 1.5e+2;2500 2500.0 2500.00 3e+3 2.5e+3 3e+3 2.5e+3;10 9.5 9.50 1e+1 9.5 1e+1 9.5e+0;100 99.5 99.50 1e+2 1.0e+2 1e+2 1.0e+2;1000 999.5 999.50 1e+3 1.0e+3 1e+3 1.0e+3;10 10.0 9.99 1e+1 10 1e+1 1.0e+1;4 4.3 4.35 4 4.3 4e+0 4.3e+0;-3 -2.5 -2.50 -3 -2.5 -3e+0 -2.5e+0;-0 -0.1 -0.13 -0.1 -0.13 -1e-1 -1.3e-1;4503599627370496 4503599627370495.5 4503599627370495.50 5e+15 4.5e+15 5e+15 4.5e+15;1.7976931348623157e+308 1.7976931348623157e+308 1.7976931348623157e+308 2e+308 1.8e+308 2e+308 1.8e+308;9007199254740991 -9007199254740992 9007199254740992 1152921504606847000 -123456 1e+21");
+}
+
 /// A local date past any time value (a year past 2^53 in the making) is
 /// an invalid date, not a search for its year that never ends; dates in
 /// range keep their fields, whatever the zone.

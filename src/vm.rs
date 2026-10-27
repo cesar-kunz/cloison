@@ -5646,10 +5646,12 @@ fn number_to_fixed(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = if !x.is_finite() || x.abs() >= 1e21 {
         number_to_string(x)
     } else {
-        // n: x × 10^f rounded, ties up (the spec's "larger n").
-        let (d, e) = exact_digits(x.abs());
-        let keep = e + 1 + f as i32;
-        let n = round_digits(&d, keep);
+        // n: x × 10^f rounded, ties up (the spec's "larger n"). `{:.*}` is
+        // exact but rounds ties to even: at a tie one digit more is exact,
+        // and rounds up here.
+        let tie = is_tie(x.abs(), -(f as i32));
+        let d = digit_values(&format!("{:.*}", f + tie as usize, x.abs()));
+        let n = round_digits(&d, d.len() as i32 - tie as i32);
         let digits = format!("{:0>width$}", n, width = f + 1);
         let (int, frac) = digits.split_at(digits.len() - f);
         // (The spec's sign: of x, even when it rounds to 0; -0 has none.)
@@ -5674,19 +5676,26 @@ fn to_integer_arg(vm: &mut Vm, v: Option<Value>) -> Result<f64> {
     Ok(if d.is_nan() { 0.0 } else { d.trunc() })
 }
 
-/// The exact decimal digits of finite `x` > 0 (`x` = 0.d1d2… × 10^(e+1),
-/// as `d1.d2… × 10^e`), and `e`.
-pub(crate) fn exact_digits(x: f64) -> (Vec<u8>, i32) {
-    if x == 0.0 {
-        return (vec![0], 0);
-    }
-    let s = format!("{:.1100e}", x);
-    let (m, e) = s.split_once('e').unwrap();
-    let mut d: Vec<u8> = m.bytes().filter(|c| c.is_ascii_digit()).map(|c| c - b'0').collect();
-    while d.len() > 1 && *d.last().unwrap() == 0 {
-        d.pop();
-    }
-    (d, e.parse().unwrap())
+/// Whether `x` (finite, > 0) is halfway between two multiples of 10^k
+/// (2x / 10^k an odd integer): there rounding half up, which `toFixed`,
+/// `toPrecision` and `toExponential` want, and Rust's `{:.*}` and `{:.*e}`,
+/// exact but ties to even, differ.
+pub(crate) fn is_tie(x: f64, k: i32) -> bool {
+    let bits = x.to_bits();
+    let (exp, frac) = ((bits >> 52) as i32 & 0x7ff, bits & ((1 << 52) - 1));
+    // x = m × 2^e
+    let (m, e) = if exp == 0 { (frac, -1074) } else { (frac | 1 << 52, exp - 1075) };
+    // 2x = odd × 2^b; 2x × 10^-k = odd × 5^-k × 2^(b - k), odd at b = k
+    // when k ≤ 0, and for k > 0 if also 5^k divides odd.
+    let t = m.trailing_zeros() as i32;
+    let (odd, b) = (m >> t, e + t + 1);
+    b == k && (k <= 0 || 5u64.checked_pow(k as u32).is_some_and(|q| odd % q == 0))
+}
+
+/// The digits of a formatted number, as values (signs, points and exponents
+/// left out: only for the mantissa).
+fn digit_values(s: &str) -> Vec<u8> {
+    s.bytes().filter(u8::is_ascii_digit).map(|c| c - b'0').collect()
 }
 
 /// The integer of `d`'s first `keep` digits, rounded at the next one
@@ -5721,14 +5730,29 @@ pub(crate) fn round_digits(d: &[u8], keep: i32) -> String {
 /// `x`'s `p` significant digits, rounded half up (`x` > 0): the digits and
 /// the exponent of the first.
 pub(crate) fn significant(x: f64, p: usize) -> (String, i32) {
-    let (d, mut e) = exact_digits(x);
-    let mut n = round_digits(&d, p as i32);
-    if n.len() > p {
-        // (A carry: 9.99… to 10.0….)
-        n.truncate(p);
-        e += 1;
+    let digits = |k: usize| {
+        let s = format!("{x:.*e}", k - 1);
+        let (m, e) = s.split_once('e').unwrap();
+        (m.replace('.', ""), e.parse::<i32>().unwrap())
+    };
+    let (n, e) = digits(p);
+    // A tie is at x's p-th digit, which is the 10^(e - p + 1)s, or the
+    // 10^(e - p)s if rounding carried (9.96 to 1.0e1).
+    let p32 = p as i32;
+    if is_tie(x, e - p32 + 1) || is_tie(x, e - p32) {
+        // `p + 1` digits are exact at a tie, and give its exponent.
+        let (d, e) = digits(p + 1);
+        if is_tie(x, e - p32 + 1) {
+            let mut n = round_digits(&digit_values(&d), p32);
+            let mut e = e;
+            if n.len() > p {
+                // (A carry: 9.99… to 10.0….)
+                n.truncate(p);
+                e += 1;
+            }
+            return (n, e);
+        }
     }
-    let n = format!("{:0<width$}", n, width = p);
     (n, e)
 }
 
@@ -6059,6 +6083,10 @@ pub fn number_to_string(d: f64) -> String {
     }
     if d.is_infinite() {
         return if d > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    // An integer below 2^53: its own digits are the shortest.
+    if d.fract() == 0.0 && d.abs() < 9007199254740992.0 {
+        return (d as i64).to_string();
     }
     if d < 0.0 {
         return format!("-{}", number_to_string(-d));

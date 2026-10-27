@@ -2067,6 +2067,12 @@ macro_rules! int_slot_pair {
                 next!(s)
             }
         });
+        // target x86_64 addr_wrap_ii_u{}_u{}: 1 `add esi, edi` (judged 2026-10-27)
+        // target aarch64 addr_wrap_ii_u{}_u{}: 1 `add w25, w25, w24` (judged 2026-10-27)
+        stencil!("addr_wrap_ii_u", $a, "_u", $b; |s| {
+            s.g[$a] = unboxed(raw(s.g[$a]).wrapping_add(raw(s.g[$b])));
+            next!(s)
+        });
         stencil!("undo_addr_u", $a, "_u", $b; |s| {
             s.g[$a] = unboxed(raw(s.g[$a]).wrapping_sub(raw(s.g[$b])));
             next!(s)
@@ -2157,6 +2163,17 @@ macro_rules! int_slot_from_acc {
             s.g[$k] = unboxed(raw(s.g[$k]).wrapping_add(int(s.acc)));
             next!(s)
         });
+        // Read only through ToInt32 (see `jit::truncated`): wrapping.
+        // target x86_64 add_wrap_into_u{},sub_wrap_into_u{}: 1 `add edi, r12d` (judged 2026-10-27)
+        // target aarch64 add_wrap_into_u{},sub_wrap_into_u{}: 1 `add w24, w24, w20` (judged 2026-10-27)
+        stencil!("add_wrap_into_u", $k; |s| {
+            s.g[$k] = unboxed(raw(s.g[$k]).wrapping_add(int(s.acc)));
+            next!(s)
+        });
+        stencil!("sub_wrap_into_u", $k; |s| {
+            s.g[$k] = unboxed(raw(s.g[$k]).wrapping_sub(int(s.acc)));
+            next!(s)
+        });
         // target x86_64 and_into_u{},or_into_u{},xor_into_u{}: 1 `and edi, r12d` (judged 2026-10-27)
         // target aarch64 and_into_u{},or_into_u{},xor_into_u{}: 1 `and w24, w24, w20` (judged 2026-10-27)
         stencil!("and_into_u", $k; |s| {
@@ -2210,8 +2227,41 @@ macro_rules! mul_into_fast {
     }};
 }
 
+/// `c = c * x` read only through ToInt32: as `mul_into_fast` without the
+/// zero test (-0 is 0 there).
+macro_rules! mul_trunc_into_fast {
+    ($s:ident, $c:tt, $x:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut v = raw($s.g[$c]);
+            core::arch::asm!(
+                "imul {v:e}, {x:e}",
+                "{{disp32}} jo {ovf}",
+                v = inout(reg) v,
+                x = in(reg) $x,
+                ovf = label { unsafe { exit!($s) } },
+                options(nomem, nostack),
+            );
+            $s.g[$c] = unboxed(v);
+            next!($s)
+        }
+        #[cfg(target_arch = "aarch64")]
+        match raw($s.g[$c]).checked_mul($x) {
+            Some(v) => {
+                $s.g[$c] = unboxed(v);
+                next!($s)
+            }
+            None => exit!($s),
+        }
+    }};
+}
+
 macro_rules! int_slot_mul_into {
     ($k:tt) => {
+        // target x86_64 mul_trunc_into_u{}_m: 5 `mov eax, edi; imul eax, [r13+k]; jo exit; mov edi, eax` with the load apart (judged 2026-10-27)
+        stencil!("mul_trunc_into_u", $k, "_m"; |s| {
+            mul_trunc_into_fast!(s, $k, int(load_m(s.regs)))
+        });
         // target x86_64 mul_into_u{}_m: 7 `mov eax, edi; imul eax, [r13+k]; jo exit; test eax, eax; je slow; mov edi, eax` with the load apart (judged 2026-10-27)
         stencil_slow!("mul_into_u", $k, "_m"; |s| {
             mul_into_fast!(s, $k, int(load_m(s.regs)))
@@ -2228,6 +2278,11 @@ macro_rules! int_slot_mul_into {
 
 macro_rules! int_slot_mul_pair {
     ($c:tt, $b:tt) => {
+        // target x86_64 mul_trunc_into_u{}_u{}: 4 `mov eax, edi; imul eax, esi; jo exit; mov edi, eax` (judged 2026-10-27)
+        // target aarch64 mul_trunc_into_u{}_u{}: 4 `smull x8, w24, w25; cmp x8, w8, sxtw; b.ne exit; mov w24, w8` (judged 2026-10-27)
+        stencil!("mul_trunc_into_u", $c, "_u", $b; |s| {
+            mul_trunc_into_fast!(s, $c, raw(s.g[$b]))
+        });
         // target x86_64 mul_into_u{}_u{}: 6 `mov eax, edi; imul eax, esi; jo exit; test eax, eax; je slow; mov edi, eax` (judged 2026-10-27)
         // target aarch64 mul_into_u{}_u{}: 5 `smull x8, w24, w25; cmp x8, w8, sxtw; b.ne exit; cbz w8, slow; mov w24, w8` (judged 2026-10-27)
         stencil_slow!("mul_into_u", $c, "_u", $b; |s| {
@@ -3343,6 +3398,36 @@ macro_rules! mul_ii_fast {
     }};
 }
 
+/// `acc * x` read only through ToInt32 (see `jit::truncated`): -0 is 0
+/// there, so no zero test; an overflow still exits (the product may pass
+/// 2^53, which a double rounds).
+macro_rules! mul_trunc_fast {
+    ($s:ident, $a:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut v = int($s.acc);
+            core::arch::asm!(
+                "imul {v:e}, {a:e}",
+                "{{disp32}} jo {ovf}",
+                v = inout(reg) v,
+                a = in(reg) $a,
+                ovf = label { unsafe { exit!($s) } },
+                options(nomem, nostack),
+            );
+            $s.acc = unboxed(v);
+            next!($s)
+        }
+        #[cfg(target_arch = "aarch64")]
+        match $a.checked_mul(int($s.acc)) {
+            Some(v) => {
+                $s.acc = unboxed(v);
+                next!($s)
+            }
+            None => exit!($s),
+        }
+    }};
+}
+
 /// An int32 product, or `None` on overflow or a -0 result (a zero product
 /// with a negative factor).
 #[inline(always)]
@@ -3543,6 +3628,10 @@ macro_rules! group2_generic {
             s.acc = unboxed(0);
             next!(s)
         });
+        // target x86_64 mul_trunc_ii_*: 5 `mov eax, r12d; imul eax, esi; jo exit; mov r12d, eax` (`_m`: and its load; 4 on a slot): an exit needs `acc` as it was, and a product can't be undone (judged 2026-10-27)
+        stencil!("mul_trunc_ii_", loc!($loc); |s| {
+            mul_trunc_fast!(s, int(get!($loc, s)))
+        });
         stencil!("mul_iif_", loc!($loc); |s| {
             s.facc = i2f(int(get!($loc, s))) * i2f(int(s.acc));
             next!(s)
@@ -3683,6 +3772,9 @@ macro_rules! group2_int_slot {
             s.acc = unboxed(0);
             next!(s)
         });
+        stencil!("mul_trunc_ii_u", $k; |s| {
+            mul_trunc_fast!(s, raw(s.g[$k]))
+        });
         stencil!("mul_iif_u", $k; |s| {
             s.facc = i2f(raw(s.g[$k])) * i2f(int(s.acc));
             next!(s)
@@ -3749,6 +3841,10 @@ macro_rules! group2_boxed_typed {
             }
             s.acc = unboxed(0);
             next!(s)
+        });
+        // target x86_64 mul_trunc_ii_*: 5 `mov eax, r12d; imul eax, esi; jo exit; mov r12d, eax` (`_m`: and its load; 4 on a slot): an exit needs `acc` as it was, and a product can't be undone (judged 2026-10-27)
+        stencil!("mul_trunc_ii_", loc!($loc); |s| {
+            mul_trunc_fast!(s, int(get!($loc, s)))
         });
         stencil!("mul_iif_", loc!($loc); |s| {
             s.facc = i2f(int(get!($loc, s))) * i2f(int(s.acc));

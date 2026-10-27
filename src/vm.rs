@@ -578,6 +578,12 @@ pub const MAX_INLINE_CAPACITY: u32 = 64;
 /// The global object's room for properties in itself (the builtins take
 /// about 70; Octane's emscripten benchmarks define thousands).
 const GLOBAL_CAPACITY: u32 = 1024;
+/// Every closure's room for properties in itself (`prototype` and one
+/// more; the rest out of line), its shapes' whatever its kind: its upvalues
+/// come after, at a fixed offset (see [`Vm::upvalues`]).
+pub(crate) const FUNCTION_CAPACITY: u32 = 2;
+/// The byte offset of a closure's upvalues.
+pub(crate) const UPVALUES_OFF: usize = crate::object::INLINE_BASE + 8 * FUNCTION_CAPACITY as usize;
 /// Stack size in values (frame headers included).
 const STACK_VALUES: usize = 1 << 18;
 
@@ -1217,7 +1223,7 @@ impl Vm {
         vm.global = vm.new_object_with(Class::Plain, op, GLOBAL_CAPACITY);
 
         let fp = object_value(vm.function_prototype);
-        let root = vm.root_shape(Class::Function, fp, 2);
+        let root = vm.root_shape(Class::Function, fp, FUNCTION_CAPACITY);
         // Functions' `prototype` isn't enumerable nor configurable;
         // prototypes' `constructor` isn't enumerable.
         vm.function_shape = vm.transition_with(root, vm.a_prototype, DONT_ENUM | DONT_DELETE);
@@ -4181,16 +4187,13 @@ impl Vm {
         object_value(f)
     }
 
-    /// A closure's upvalues: after its in-object slots (a function's shapes
-    /// keep the capacity they were created with).
+    /// A closure's upvalues: after its in-object slots, of which every
+    /// closure has [`FUNCTION_CAPACITY`] (a function's shapes keep the
+    /// capacity they were created with), at a fixed offset.
+    #[inline(always)]
     pub(crate) fn upvalues(f: *const Object) -> *mut *mut Upvalue {
-        unsafe {
-            let cap = (*(*f).shape).capacity.get() as usize;
-            f.cast::<u8>()
-                .add(crate::object::INLINE_BASE + 8 * cap)
-                .cast_mut()
-                .cast()
-        }
+        debug_assert_eq!(unsafe { Object::inline_cap(f) }, FUNCTION_CAPACITY as usize);
+        unsafe { f.cast::<u8>().add(UPVALUES_OFF).cast_mut().cast() }
     }
 
     /// The open upvalue of register `at`, made if there is none.

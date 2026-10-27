@@ -424,7 +424,7 @@ pub(crate) fn install(vm: &mut Vm) {
         let _ = vm.define_own_property(proto, crate::vm::Key::Name(a), &d);
         // (The same capacity as `function_shape`'s: upvalues where
         // compiled code reads them.)
-        let root = vm.root_shape(crate::object::Class::Function, object_value(proto), 2);
+        let root = vm.root_shape(crate::object::Class::Function, object_value(proto), crate::vm::FUNCTION_CAPACITY);
         if !generator {
             vm.async_function_shape = root;
         } else if instances == gp {

@@ -86,7 +86,7 @@ use value::{NumberTag, Value};
 mod layout;
 
 use layout::{
-    COLOR, CONS_MIN, DirectSite, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
+    CARD, COLOR, CONS_MIN, DirectSite, GRANULE, SLICE, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
     Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
@@ -726,19 +726,138 @@ unsafe fn meta_of(a: usize) -> u8 {
 /// at `host`; a reference from an old cell to one not marked with the
 /// heap's current color (young, `YOUNG`, or not marked yet during a
 /// marking cycle) marks the card of `a`.
+///
+/// On x86-64 it is [`barrier_asm`]; elsewhere, and as the reference the asm
+/// must keep doing, [`barrier_rust`].
 #[inline(always)]
 unsafe fn barrier<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
     unsafe {
-        if is_cell(tag, v)
-            && v.to_bits() != 0
-            && meta_of(v.to_bits() as usize) & (YOUNG | COLOR) != *color_byte(host as usize)
-            && meta_of(host as usize) != YOUNG
-        {
+        #[cfg(target_arch = "x86_64")]
+        barrier_asm(tag, host, a, v);
+        #[cfg(not(target_arch = "x86_64"))]
+        barrier_rust(tag, host, a, v);
+    }
+}
+
+/// The barrier in Rust: what [`barrier_asm`] does, and what it was before
+/// it (see there for the heap layout both rely on). Built from this, LLVM
+/// merges the cell test's two branches into `setne; setb; or; jne`, tests
+/// the host's byte as `xor; cmp; jo`, and leaves the card mark in the
+/// fall-through: 23 instructions after the store on x86-64's common path,
+/// where the asm runs 16.
+#[inline(always)]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+unsafe fn barrier_rust<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
+    unsafe {
+        let b = v.to_bits();
+        // A cell, not 0: every other value is a number or below `NOT_CELL`.
+        if b & tag.to_bits() != 0 || b < NOT_CELL {
+            return;
+        }
+        // A young host records nothing.
+        if meta_of(host as usize) == YOUNG {
+            return;
+        }
+        if meta_of(b as usize) & (YOUNG | COLOR) != *color_byte(host as usize) {
             core::hint::cold_path();
             card_mark(a);
         }
     }
 }
+
+/// [`barrier_rust`] written out, on x86-64: one `asm!` block with its own
+/// labels, falling through at its end (not `asm goto`, which in a stencil
+/// that calls the runtime can leave the stack misaligned: see
+/// `leave_after_call`). After the store, 9 instructions for a young host,
+/// 16 for an old one, 19 when the card is marked:
+///
+/// ```text
+/// test v, tag ; jnz 2f ; cmp v, NOT_CELL ; jb 2f    ; a cell, not 0
+/// movabs s, SIDE
+/// shr h, 4                                          ; h: the host, in place
+/// cmp byte [s+h], YOUNG ; je 2f                     ; a young host
+/// and h, -(SLICE/16)                                ; the slice's first granule
+/// mov m, v ; shr m, 4 ; movzx m, byte [s+m] ; and m, YOUNG|COLOR
+/// cmp m8, [s+h] ; je 2f                             ; the heap's color
+/// mov m, a ; shr m, 7 ; mov byte [s+m], 1           ; the card
+/// 2:
+/// ```
+///
+/// What it relies on, from `layout` (the constants are operands, so a new
+/// value of one is picked up; a new meaning is not):
+/// - every value neither a number nor a cell is below `NOT_CELL`, every
+///   cell above it (asserted below);
+/// - a granule's metadata byte is at `SIDE + addr / GRANULE`, a card's at
+///   `SIDE + addr / CARD` (`layout::meta`, `layout::card`), both powers of
+///   two;
+/// - a cell's first granule holds exactly `YOUNG` while young; old, its
+///   color in `COLOR`, maybe with `END` (`heap`): so `== YOUNG` is the age
+///   test and `& (YOUNG | COLOR)` the color to compare;
+/// - the heap's current color is the metadata of the first granule of the
+///   `SLICE`-aligned slice the host is in (`layout::color_byte`);
+/// - a dirty card is a byte 1 (`layout::card_mark`).
+///
+/// A change to the GC's metadata, colors, cards or the barrier's rule
+/// (`heap::barrier`) has to change this, [`barrier_rust`] and
+/// `heap::barrier` together. Check with `CLOISON_GC_CHECK_BARRIER`,
+/// `CLOISON_GC_STRESS` and `CLOISON_GC_VERIFY`, with and without
+/// `CLOISON_GC_STW`.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn barrier_asm<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value) {
+    unsafe {
+        core::arch::asm!(
+            "test {v}, {t}",
+            "jnz 2f",
+            "cmp {v}, {not_cell}",
+            "jb 2f",
+            "movabs {s}, {side}",
+            "shr {h}, {granule}",
+            "cmp byte ptr [{s} + {h}], {young}",
+            "je 2f",
+            "and {h}, {slice}",
+            "mov {m}, {v}",
+            "shr {m}, {granule}",
+            "movzx {m:e}, byte ptr [{s} + {m}]",
+            "and {m:e}, {mask}",
+            "cmp {m:l}, byte ptr [{s} + {h}]",
+            "je 2f",
+            "mov {m}, {a}",
+            "shr {m}, {card}",
+            "mov byte ptr [{s} + {m}], 1",
+            "2:",
+            v = in(reg) v.to_bits(),
+            t = in(reg) tag.to_bits(),
+            h = inout(reg) host => _,
+            a = in(reg) a,
+            s = out(reg) _,
+            m = out(reg) _,
+            not_cell = const NOT_CELL,
+            side = const layout::SIDE,
+            granule = const GRANULE.trailing_zeros(),
+            card = const CARD.trailing_zeros(),
+            young = const YOUNG,
+            slice = const -((SLICE / GRANULE) as i64),
+            mask = const YOUNG | COLOR,
+            options(nostack),
+        );
+    }
+}
+
+/// Above every value that is neither a number nor a cell (0, null, the
+/// booleans, undefined, the hole) and below every cell, a heap address.
+const NOT_CELL: u64 = 0x20;
+const _: () = assert!(
+    Value::NULL.to_bits() < NOT_CELL
+        && Value::FALSE.to_bits() < NOT_CELL
+        && Value::TRUE.to_bits() < NOT_CELL
+        && Value::UNDEFINED.to_bits() < NOT_CELL
+        && Value::HOLE.to_bits() < NOT_CELL
+);
+// `barrier_asm`'s immediates: the slice mask as a sign-extended imm32.
+const _: () = assert!(
+    SLICE.is_power_of_two() && GRANULE.is_power_of_two() && CARD.is_power_of_two() && SLICE / GRANULE <= 1 << 31
+);
 
 /// The barrier for a store of `v` to upvalue `u`'s variable (at `at`):
 /// only if it is closed, its variable then its own `closed` word, in the
@@ -4784,9 +4903,9 @@ macro_rules! property_location {
             s.acc = *(imm64b() as *const Value);
             next!(s)
         });
-        // target aarch64 set_own_g{}: 25 now 30 the guard (9), `str`, the barrier (15): cell test `tst; b.ne; cbz; tbnz #1`, young `ldrb; tbnz #7`, card mark cold (judged again 2026-10-26, with the write barrier; docs/arm64-targets.md)
-        // target x86_64 set_own_g{},set_own_m: 24 now 34 the guard (7), `mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 13; cell path 34; judged 2026-10-26)
-        // target aarch64 set_own_m: 26 now 32 (judged 2026-10-26)
+        // target aarch64 set_own_g{}: 25 now 26 the guard (9), `str`, the barrier (15): cell test `tst; b.ne; cbz; tbnz #1`, young `ldrb; tbnz #7`, card mark cold (judged again 2026-10-26, with the write barrier; docs/arm64-targets.md)
+        // target x86_64 set_own_g{},set_own_m: 24 now 27 the guard (7), `mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 13; cell path 34; judged 2026-10-26)
+        // target aarch64 set_own_m: 26 now 27 (judged 2026-10-26)
         stencil!("set_own_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             store_imm(o, s.acc);
@@ -4800,9 +4919,9 @@ macro_rules! property_location {
             barrier(s.tag, payload_cell(p), p.offset(imm() as isize), s.acc);
             next!(s)
         });
-        // target aarch64 set_tr_g{}: 29 now 34 the guard (9), the new shape (3), `str` it, `str` the value, the barrier (15) (judged again 2026-10-26, with the write barrier; docs/arm64-targets.md)
-        // target x86_64 set_tr_g{},set_tr_m: 26 now 36 the guard (7), new shape (2), `mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 15; cell path 36; judged 2026-10-26)
-        // target aarch64 set_tr_m: 30 now 36 (judged 2026-10-26)
+        // target aarch64 set_tr_g{}: 29 now 30 the guard (9), the new shape (3), `str` it, `str` the value, the barrier (15) (judged again 2026-10-26, with the write barrier; docs/arm64-targets.md)
+        // target x86_64 set_tr_g{},set_tr_m: 26 now 29 the guard (7), new shape (2), `mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 15; cell path 36; judged 2026-10-26)
+        // target aarch64 set_tr_m: 30 now 31 (judged 2026-10-26)
         stencil!("set_tr_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
             (*header(o)).shape = imm64b();
@@ -4899,7 +5018,7 @@ macro_rules! property_location {
         // `set_keyed_`, at the array's length too while it has room (one
         // more element); else through the runtime, leaving where that
         // can't store.
-        // target x86_64 set_keyed_ap_g{}: 37 fallthrough 23 the checks (18), `elems_len` bumped before the store, the store (2), the barrier in place (15) (fall-through: code 2 with a non-number, 23; designated path 67: r8/r9/rsi/rdx/rcx spilled, r15 borrowed; judged 2026-10-26)
+        // target x86_64 set_keyed_ap_g{}: 37 fallthrough 20 the checks (18), `elems_len` bumped before the store, the store (2), the barrier in place (15) (fall-through: code 2 with a non-number, 23; designated path 67: r8/r9/rsi/rdx/rcx spilled, r15 borrowed; judged 2026-10-26)
         // target x86_64 set_keyed_ap_m: 38 fallthrough 21 (fall-through 21; judged 2026-10-26)
         // target aarch64 set_keyed_ap_g{}: 38 fallthrough 19 the checks (21), `add; str` the length, `ldr; str`, the barrier (15) (fall-through 19; designated path 44; judged 2026-10-26)
         // target aarch64 set_keyed_ap_m: 39 fallthrough 19 (judged 2026-10-26)
@@ -4971,8 +5090,8 @@ macro_rules! property_location {
         set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= FIELD_NUM,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "o_", true, is_array, |s, v, code| code == FIELD_ANY || code == (*cell(v)).shape, |s| s.acc);
-        // target x86_64 set_keyed_nc_g{}: 22 fallthrough 18 `cmp [rdi+32], r11d; jbe; mov rax, [rdi]; cmp qword [rax], 0; jne; mov r10, [rdi+24]; mov [r10+r11*8], r12`, the barrier in place (15) (code 2 is the fall-through, 18; ANY-cell path 37; judged 2026-10-26)
-        // target x86_64 set_keyed_nc_m: 23 fallthrough 19 (fall-through 19; ANY-cell path 38; judged 2026-10-26)
+        // target x86_64 set_keyed_nc_g{}: 22 fallthrough 35 `cmp [rdi+32], r11d; jbe; mov rax, [rdi]; cmp qword [rax], 0; jne; mov r10, [rdi+24]; mov [r10+r11*8], r12`, the barrier in place (15) (code 2 is the fall-through, 18; ANY-cell path 37; judged 2026-10-26)
+        // target x86_64 set_keyed_nc_m: 23 fallthrough 36 (fall-through 19; ANY-cell path 38; judged 2026-10-26)
         // target aarch64 set_keyed_nc_g{}: 23 fallthrough 13 `ldr w8; cmp; b.ls; ldr; ldr; cbnz`, `ldr; str [x9, x15, lsl #3]`, the barrier (15) (fall-through: code 2 with a non-number, 13; ANY-cell path 28; judged 2026-10-26)
         // target aarch64 set_keyed_nc_m: 24 fallthrough 14 (fall-through 14; ANY-cell path 29; judged 2026-10-26)
         set_keyed!($loc, "nc_", true, |_, _| true, |s, v, code| fits_code(s.tag, code, v), |s| s.acc);
@@ -5111,18 +5230,18 @@ macro_rules! property_location {
             s.acc = *(imm64b() as *const Value);
             next!(s)
         });
-        // target x86_64 set_own_nc_g{},set_own_nc_m: 17 now 27 `mov [rdi+off], r12`, the barrier: `test r12, r14; jnz; cmp r12, 0x20; jb; movabs; ...`, card mark cold (`_m`: number store is the fall-through, 6; cell path 27; judged 2026-10-26)
+        // target x86_64 set_own_nc_g{},set_own_nc_m: 17 now 21 (the count follows `barrier_asm`'s card mark, 4: the path without it is 17) `mov [rdi+off], r12`, the barrier: `test r12, r14; jnz; cmp r12, 0x20; jb; movabs; ...`, card mark cold (`_m`: number store is the fall-through, 6; cell path 27; judged 2026-10-26)
         // target aarch64 set_own_nc_g{}: 16 now 21 `str`, the barrier (15): cell test `tst; b.ne; cbz; tbnz #1`, young `ldrb; tbnz #7`, card mark cold (judged 2026-10-26)
-        // target aarch64 set_own_nc_m: 17 now 23 `ldr x8, [x21, #k]`, then as `_g` (judged 2026-10-26)
+        // target aarch64 set_own_nc_m: 17 now 22 `ldr x8, [x21, #k]`, then as `_g` (judged 2026-10-26)
         stencil!("set_own_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             store_imm(o, s.acc);
             barrier(s.tag, o, o, s.acc);
             next!(s)
         });
-        // target x86_64 set_tr_nc_g{},set_tr_nc_m: 19 now 29 `movabs; mov [rdi], rax; mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 8; cell path 29; judged 2026-10-26)
+        // target x86_64 set_tr_nc_g{},set_tr_nc_m: 19 now 23 `movabs; mov [rdi], rax; mov [rdi+off], r12`, the barrier (16) (`_m`: number store is the fall-through, 8; cell path 29; judged 2026-10-26)
         // target aarch64 set_tr_nc_g{}: 20 now 25 shape (3), `str`, `str`, the barrier (15) (judged 2026-10-26)
-        // target aarch64 set_tr_nc_m: 21 now 27 (judged 2026-10-26)
+        // target aarch64 set_tr_nc_m: 21 now 26 (judged 2026-10-26)
         stencil!("set_tr_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
             (*header(o)).shape = imm64b();
@@ -5130,10 +5249,10 @@ macro_rules! property_location {
             barrier(s.tag, o, o, s.acc);
             next!(s)
         });
-        // target x86_64 set_oop_nc_g{}: 17 fallthrough 6 `mov rax, [rdi+16]; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 6; cell path 27; judged 2026-10-26)
-        // target x86_64 set_oop_nc_m: 18 fallthrough 7 (number store is the fall-through, 7; cell path 28; judged 2026-10-26)
-        // target aarch64 set_oop_nc_g{}: 17 now 27 `ldr x8, [x24, #16]; str`, the barrier on `x8>>4` (props is 8 mod 16: no `sub`), offset only in the cold card mark (judged 2026-10-26)
-        // target aarch64 set_oop_nc_m: 18 now 28 (judged 2026-10-26)
+        // target x86_64 set_oop_nc_g{}: 17 fallthrough 24 `mov rax, [rdi+16]; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 6; cell path 27; judged 2026-10-26)
+        // target x86_64 set_oop_nc_m: 18 fallthrough 25 (number store is the fall-through, 7; cell path 28; judged 2026-10-26)
+        // target aarch64 set_oop_nc_g{}: 17 now 26 `ldr x8, [x24, #16]; str`, the barrier on `x8>>4` (props is 8 mod 16: no `sub`), offset only in the cold card mark (judged 2026-10-26)
+        // target aarch64 set_oop_nc_m: 18 now 27 (judged 2026-10-26)
         stencil!("set_oop_nc_", loc!($loc); |s| {
             let p = props(get!($loc, s).to_bits() as *mut u8);
             store_imm(p, s.acc);
@@ -5184,10 +5303,10 @@ macro_rules! property_location {
             store_imm(props(get!($loc, s).to_bits() as *mut u8), s.acc);
             next!(s)
         });
-        // target x86_64 set_tro_nc_g{}: 23 fallthrough 12 room (4), shape (2), `mov rax, [rdi+16]; mov [rax+imm], r12`, the barrier in place (15) (number store is the fall-through, 12; cell path 33; judged 2026-10-26)
-        // target x86_64 set_tro_nc_m: 24 fallthrough 13 (fall-through 13; cell path 34; judged 2026-10-26)
-        // target aarch64 set_tro_nc_g{}: 26 now 34 room (5), shape (4), `ldr; str`, the barrier (15) (judged 2026-10-26)
-        // target aarch64 set_tro_nc_m: 27 now 35 (judged 2026-10-26)
+        // target x86_64 set_tro_nc_g{}: 23 fallthrough 30 room (4), shape (2), `mov rax, [rdi+16]; mov [rax+imm], r12`, the barrier in place (15) (number store is the fall-through, 12; cell path 33; judged 2026-10-26)
+        // target x86_64 set_tro_nc_m: 24 fallthrough 31 (fall-through 13; cell path 34; judged 2026-10-26)
+        // target aarch64 set_tro_nc_g{}: 26 now 28 room (5), shape (4), `ldr; str`, the barrier (15) (judged 2026-10-26)
+        // target aarch64 set_tro_nc_m: 27 now 29 (judged 2026-10-26)
         set_tro!("set_tro_nc_", $loc, false, true);
         set_tro!("set_tro_n_nc_", $loc, false, false);
         // Elements at `elems`, `elems_len` of them. A hole is `EMPTY` (0).
@@ -5217,8 +5336,8 @@ macro_rules! property_location {
         // `op_set_keyed` stores it: see `own_element_store`.)
         // target x86_64 set_keyed_rt_g{}: 29 fallthrough 18 the checks (12), `mov r10, [rdi+24]; mov [r10+rax*8], r12`, the barrier in place (15) (fall-through: code 2 with a non-number, 18; ANY-cell path 45; judged 2026-10-26)
         // target x86_64 set_keyed_rt_m: 30 fallthrough 19 (judged 2026-10-26)
-        // target aarch64 set_keyed_rt_g{}: 29 fallthrough 17 (fall-through 17; ANY-cell path 35; judged 2026-10-26)
-        // target aarch64 set_keyed_rt_m: 30 fallthrough 18 (judged 2026-10-26)
+        // target aarch64 set_keyed_rt_g{}: 29 fallthrough 16 (fall-through 17; ANY-cell path 35; judged 2026-10-26)
+        // target aarch64 set_keyed_rt_m: 30 fallthrough 17 (judged 2026-10-26)
         stencil_slow!("set_keyed_rt_", loc!($loc); |s| {
             if own_element_store(s.tag, get!($loc, s), load_imm(s.regs as *mut u8), s.acc, false) {
                 next!(s)
@@ -5362,7 +5481,7 @@ macro_rules! property_location {
             s.acc = Value::from_bits(r);
             next!(s)
         });
-        // target x86_64 set_named_rt_g{}: 42 fallthrough 19 the probe (way 1: 26), `mov [rdi+rbx], r12`, the barrier (16) (fall-through: runtime call, 19/24; the designated path runs 82: tag and slots spilled, r13/r15 borrowed; judged 2026-10-26)
+        // target x86_64 set_named_rt_g{}: 42 fallthrough 23 the probe (way 1: 26), `mov [rdi+rbx], r12`, the barrier (16) (fall-through: runtime call, 19/24; the designated path runs 82: tag and slots spilled, r13/r15 borrowed; judged 2026-10-26)
         // target x86_64 set_named_rt_m: 43 fallthrough 24 as `_g`, the slot loaded first (judged 2026-10-26)
         // target aarch64 set_named_rt_g{}: 47 fallthrough 17 the probe (way 1: 31), `str x20, [x24, x10]`, the barrier (15) (fall-through: runtime call, 17; designated path 52; judged 2026-10-26)
         // target aarch64 set_named_rt_m: 48 fallthrough 19 (fall-through 19; judged 2026-10-26)
@@ -5377,8 +5496,8 @@ macro_rules! property_location {
             }
             next!(s)
         });
-        // target x86_64 set_named_rt_i_g{}: 27 fallthrough 26 the probe (26), `or r12, r14; mov [rdi+rbx], r12`: no barrier for an int (`_g` 27) (fall-through: runtime call, 26/31; designated path 58; judged 2026-10-26)
-        // target x86_64 set_named_rt_i_m: 28 fallthrough 31 as `_g`, the slot loaded first (judged 2026-10-26)
+        // target x86_64 set_named_rt_i_g{}: 27 fallthrough 27 the probe (26), `or r12, r14; mov [rdi+rbx], r12`: no barrier for an int (`_g` 27) (fall-through: runtime call, 26/31; designated path 58; judged 2026-10-26)
+        // target x86_64 set_named_rt_i_m: 28 fallthrough 30 as `_g`, the slot loaded first (judged 2026-10-26)
         // target aarch64 set_named_rt_i_g{}: 34 fallthrough 19 the probe (31), `orr x20, x22, x20; str` (fall-through 19; designated path 38; judged 2026-10-26)
         // target aarch64 set_named_rt_i_m: 35 fallthrough 21 (judged 2026-10-26)
         stencil!("set_named_rt_i_", loc!($loc); |s| {
@@ -5803,8 +5922,8 @@ stencil!("lda_upvalue"; |s| {
     s.acc = *(*upvalue_cell(s.regs)).at;
     next!(s)
 });
-// target x86_64 sta_upvalue: 22 fallthrough 10 `mov; mov; mov; mov [rax], r12; lea; cmp; jne cont`, the barrier in place (15) (the open upvalue is the fall-through, 10; closed with a cell: 33; judged 2026-10-26)
-// target aarch64 sta_upvalue: 22 now 29 `ldur; ldr; ldr; str; add; cmp; b.ne`, the barrier (15), card mark cold (judged 2026-10-26)
+// target x86_64 sta_upvalue: 22 fallthrough 27 `mov; mov; mov; mov [rax], r12; lea; cmp; jne cont`, the barrier in place (15) (the open upvalue is the fall-through, 10; closed with a cell: 33; judged 2026-10-26)
+// target aarch64 sta_upvalue: 22 now 28 `ldur; ldr; ldr; str; add; cmp; b.ne`, the barrier (15), card mark cold (judged 2026-10-26)
 stencil!("sta_upvalue"; |s| {
     let u = upvalue_cell(s.regs);
     *(*u).at = s.acc;
@@ -5863,8 +5982,8 @@ stencil!("lda_global_oop"; |s| {
     s.acc = load_imm(props(g));
     next!(s)
 });
-// target x86_64 sta_global: 20 fallthrough 9 `movabs; movabs; cmp; jne; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 9; cell path 30; judged 2026-10-26)
-// target aarch64 sta_global: 25 now 31 global (3), `ldr`, shape (3), `cmp`, `b.ne`, `str`, the barrier (15) (judged 2026-10-26)
+// target x86_64 sta_global: 20 fallthrough 24 `movabs; movabs; cmp; jne; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 9; cell path 30; judged 2026-10-26)
+// target aarch64 sta_global: 25 now 26 global (3), `ldr`, shape (3), `cmp`, `b.ne`, `str`, the barrier (15) (judged 2026-10-26)
 stencil!("sta_global"; |s| {
     let g = imm64b() as *mut u8;
     if (*header(g)).shape != imm64() {
@@ -5874,8 +5993,8 @@ stencil!("sta_global"; |s| {
     barrier(s.tag, g, g, s.acc);
     next!(s)
 });
-// target x86_64 sta_global_oop: 21 fallthrough 10 the guard (4), `mov rax, [rax+16]; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 10; cell path 32; judged 2026-10-26)
-// target aarch64 sta_global_oop: 26 now 36 (judged 2026-10-26)
+// target x86_64 sta_global_oop: 21 fallthrough 28 the guard (4), `mov rax, [rax+16]; mov [rax+off], r12`, the barrier in place (15) (number store is the fall-through, 10; cell path 32; judged 2026-10-26)
+// target aarch64 sta_global_oop: 26 now 30 (judged 2026-10-26)
 stencil!("sta_global_oop"; |s| {
     let g = imm64b() as *mut u8;
     if (*header(g)).shape != imm64() {
@@ -6415,8 +6534,8 @@ unsafe fn pop_class_flags(a: Value) -> u16 {
 }
 macro_rules! array_methods {
     ($loc:tt, $nc:literal, $array:expr, $poppable:expr) => {
-        // target x86_64 array_push_nc_g{}: 36 now 43 the barrier's cell test `test r12, r14; jne; test r12b, 2; jne; test r12, r12; je` (not 9), `elems` not reloaded, no `push rbp` (judged 2026-10-26)
-        // target x86_64 array_push_nc_m: 38 now 48 as `_g{}`, the receiver loaded again for the length store (judged 2026-10-26)
+        // target x86_64 array_push_nc_g{}: 36 now 40 the barrier's cell test `test r12, r14; jne; test r12b, 2; jne; test r12, r12; je` (not 9), `elems` not reloaded, no `push rbp` (judged 2026-10-26)
+        // target x86_64 array_push_nc_m: 38 now 43 as `_g{}`, the receiver loaded again for the length store (judged 2026-10-26)
         // target aarch64 array_push_nc_g{}: 10 the count stops at the code-2 `b slow` (a dispatch prefix); executed, an object no mark 26 for 24 (`elems` reloaded, `add`+`str` for `str [x9, w8, uxtw #3]`), a number 13 for 12 (judged 2026-10-26)
         // target aarch64 array_push_nc_m: 11 as `_g{}` (judged 2026-10-26)
         stencil_slow!("array_push_", $nc, loc!($loc); |s| {

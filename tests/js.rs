@@ -3076,6 +3076,32 @@ out.join(";");
     assert_eq!(value(src), "1 0.5 0.50 0.5 0.50 5e-1 5.0e-1;2 1.5 1.50 2 1.5 2e+0 1.5e+0;3 2.5 2.50 3 2.5 3e+0 2.5e+0;0 0.1 0.13 0.1 0.13 1e-1 1.3e-1;0 0.4 0.38 0.4 0.38 4e-1 3.8e-1;1 1.3 1.25 1 1.3 1e+0 1.3e+0;3 2.7 2.67 3 2.7 3e+0 2.7e+0;0 0.0 0.00 1e-7 1.0e-7 1e-7 1.0e-7;0 0.0 0.00 5e-324 4.9e-324 5e-324 4.9e-324;25 25.0 25.00 3e+1 25 3e+1 2.5e+1;35 35.0 35.00 4e+1 35 4e+1 3.5e+1;125 125.0 125.00 1e+2 1.3e+2 1e+2 1.3e+2;150 150.0 150.00 2e+2 1.5e+2 2e+2 1.5e+2;2500 2500.0 2500.00 3e+3 2.5e+3 3e+3 2.5e+3;10 9.5 9.50 1e+1 9.5 1e+1 9.5e+0;100 99.5 99.50 1e+2 1.0e+2 1e+2 1.0e+2;1000 999.5 999.50 1e+3 1.0e+3 1e+3 1.0e+3;10 10.0 9.99 1e+1 10 1e+1 1.0e+1;4 4.3 4.35 4 4.3 4e+0 4.3e+0;-3 -2.5 -2.50 -3 -2.5 -3e+0 -2.5e+0;-0 -0.1 -0.13 -0.1 -0.13 -1e-1 -1.3e-1;4503599627370496 4503599627370495.5 4503599627370495.50 5e+15 4.5e+15 5e+15 4.5e+15;1.7976931348623157e+308 1.7976931348623157e+308 1.7976931348623157e+308 2e+308 1.8e+308 2e+308 1.8e+308;9007199254740991 -9007199254740992 9007199254740992 1152921504606847000 -123456 1e+21");
 }
 
+/// Int32 sums and products read only through ToInt32 within their block
+/// wrap (`jit::truncated`): sums past 2^31 and 2^32 into `| 0`, `>> 0`,
+/// `>>> 3`, `&` and `^`, products into a sum (`-0 * 0`'s -0 is 0 there); not
+/// a sum read exactly after its block or loop (`after`, `carried`), by a
+/// `catch`, by a closure or through `arguments`, nor one a double is added
+/// to. The expected value is what V8, SpiderMonkey and JavaScriptCore print.
+#[test]
+fn sums_read_through_to_int32_wrap() {
+    let src = r#"
+var big = 0x7ffffff0, N = 30000;
+function chains(a, b) { var r = 0; for (var i = 0; i < N; i++) { var t = a + b; var u = t + a; var v = u - b; var w = v + t; r = (r + (w | 0) + (u >> 0) + (v >>> 3) + (t & 0xffff) + (w ^ 0x55)) | 0; } return r; }
+function prods(a, b) { var r = 0; for (var i = 0; i < N; i++) { var p = a * b; var q = p + a; r = (r + (q | 0)) | 0; var y = ((-a) * 0) >> 0; r = (r + y) | 0; } return r; }
+function after(a, b) { var t = 0, r = 0; for (var i = 0; i < N; i++) { t = a + b; r = (r + (t & 7)) | 0; } return r + "/" + t; }
+function carried(d) { var x = 0; for (var i = 0; i < N; i++) { x += d; } return x | 0; }
+function catcher(a, b) { var r = 0, t = 0; for (var i = 0; i < N; i++) { try { t = a + b; if (i == N - 5) throw 1; r = (r + (t | 0)) | 0; } catch (e) { return r + "/" + t; } } }
+function closure(a, b) { var r = 0, t = 0; var g = function () { return t; }; for (var i = 0; i < N; i++) { t = a + b; r = (r + (t | 0)) | 0; } return r + "/" + g(); }
+function args(a, b) { var r = 0; for (var i = 0; i < N; i++) { a = a + b; r = (r + (a | 0)) | 0; a = a - b; } a = a + b; var x = a | 0; return x + "/" + arguments[0]; }
+function dbl(a, b) { var r = 0; for (var i = 0; i < N; i++) { var t = a + b; r = (r + ((t + 0.5) | 0)) | 0; } return r; }
+[chains(3, 4), chains(big, big), chains(-big, -big), prods(0x12345, 0x54321), prods(-0x7fff, 0x10001), after(big, big), carried(big), catcher(big, big), closure(big, big), args(big, big), dbl(big, big)].join(";");
+"#;
+    assert_eq!(
+        value(src),
+        "3540000;1958430000;5070000;-1142105632;60000;0/4294967264;-480000;-959840/4294967264;-960000/4294967264;-32/4294967264;-960000"
+    );
+}
+
 /// A local date past any time value (a year past 2^53 in the making) is
 /// an invalid date, not a search for its year that never ends; dates in
 /// range keep their fields, whatever the zone.

@@ -5905,6 +5905,190 @@ fn mod_magic(d: i32) -> (u32, u64) {
     (s, (1u64 << s).div_ceil(d as u64))
 }
 
+/// Per instruction: an int32 `Add`, `Sub`, `AddSmi`, `Inc` or `Mul` whose
+/// result is read only through ToInt32 (by a bitwise operation or a shift,
+/// directly or through `Star r` … `Ldar r` and other such sums), within its
+/// basic block. ToInt32 of a sum of int32s is their wrapping sum while the
+/// exact sum stays below 2^53, as within a block, where nothing loops; so
+/// such a sum is selected wrapping (`add_wrap_ii`), and a product without
+/// its -0 test (`mul_trunc_ii`; a product, which may pass 2^53, reads its
+/// operands exactly). What a block leaves live (`live`, `acc_live`: its
+/// successors' live-in), a closure's register (`captured`), a register an
+/// exit leaves to the interpreter that compiled code doesn't read
+/// (`exit_live` past `live`: what a `catch` reads in its `try`, say), an
+/// exit's allocated
+/// object's fields (`mats`) and everything at a bail are read exactly.
+/// Exits are safe: the interpreter resumes the same block, whose remaining
+/// reads of a wrapped value are through ToInt32 by construction. None in a
+/// function whose parameters `arguments` may alias, or a generator.
+#[allow(clippy::too_many_arguments)]
+fn truncated(
+    insns: &[Insn],
+    reach: &[bool],
+    ins: &[Option<TypeState>],
+    widened: &HashSet<usize>,
+    live: &[RegSet],
+    acc_live: &[bool],
+    captured: &[bool],
+    exit_live: Option<&[RegSet]>,
+    mats: Option<&HashMap<usize, Vec<Rc<Mat>>>>,
+) -> Vec<bool> {
+    let n = insns.len();
+    let mut trunc = vec![false; n];
+    // (A VM function's without the interpreter's liveness: none. Code with
+    // no VM has no handlers, no closures.)
+    if exit_live.is_some_and(|e| e.len() != n) || insns.iter().any(|i| {
+        matches!(
+            i.op,
+            Op::CreateArguments
+                | Op::CreateMappedArguments
+                | Op::CallApplyArguments
+                | Op::CreateRest
+                | Op::InitialYield
+                | Op::Yield
+                | Op::AsyncStart
+        )
+    }) {
+        return trunc;
+    }
+    let to_int32 = |op: Op| {
+        matches!(
+            op,
+            Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::ShiftLeft
+                | Op::ShiftRight
+                | Op::ShiftRightLogical
+                | Op::BitAndSmi
+                | Op::BitOrSmi
+                | Op::ShiftLeftSmi
+                | Op::ShiftRightSmi
+                | Op::ShiftRightLogicalSmi
+        )
+    };
+    // An int32 operation (selected `ii` or `i`, an int32 result).
+    let int = |i: usize| {
+        let insn = &insns[i];
+        !insn.bail
+            && !widened.contains(&i)
+            && ins[i].as_ref().is_some_and(|st| {
+                st.acc == Ty::I32
+                    && match insn.op {
+                        Op::AddSmi | Op::Inc => true,
+                        Op::Add | Op::Sub | Op::Mul => st.regs[insn.reg as usize] == Ty::I32,
+                        _ => false,
+                    }
+            })
+    };
+    let sum = |i: usize| matches!(insns[i].op, Op::Add | Op::Sub | Op::AddSmi | Op::Inc) && int(i);
+    let always = rs_of(captured);
+    let mut mat_reads: HashMap<usize, RegSet> = HashMap::default();
+    for (&at, ms) in mats.into_iter().flatten() {
+        let r = mat_reads.entry(at).or_insert([0; 4]);
+        for &f in ms.iter().flat_map(|m| &m.fields) {
+            rs_add(r, f as usize);
+        }
+    }
+    let kill = |r: &mut RegSet, x: usize| r[x / 64] &= !(1 << (x % 64));
+    let mut is_target = vec![false; n + 1];
+    for insn in insns.iter().filter(|i| i.jumps()) {
+        is_target[insn.target] = true;
+    }
+    // Per instruction, whether it ends its block; whether its block has a
+    // bitwise operation, without which nothing in it is truncated (and,
+    // since each block starts from its successors' liveness, nothing
+    // elsewhere depends on it).
+    let ends: Vec<bool> = (0..n)
+        .map(|i| !insns[i].falls_through() || insns[i].jumps() || is_target[i + 1])
+        .collect();
+    let mut bitwise = vec![false; n];
+    let (mut start, mut any) = (0, false);
+    for i in 0..n {
+        any |= to_int32(insns[i].op);
+        if ends[i] || i + 1 == n {
+            bitwise[start..=i].iter_mut().for_each(|b| *b = any);
+            (start, any) = (i + 1, false);
+        }
+    }
+    // Backward over each block: whether `acc`, and which registers, are
+    // read exactly after instruction `i + 1`'s start.
+    let (mut acc, mut regs) = (true, [!0u64; 4]);
+    for i in (0..n).rev() {
+        if !reach[i] {
+            (acc, regs) = (true, [!0; 4]);
+            continue;
+        }
+        if !bitwise[i] {
+            continue;
+        }
+        let insn = &insns[i];
+        if ends[i] {
+            (acc, regs) = (false, [0; 4]);
+            for k in succs(insns, i).filter(|&k| k < n) {
+                acc |= acc_live[k];
+                rs_or(&mut regs, &live[k]);
+            }
+        }
+        // `acc` after `i`, read exactly?
+        let after = acc;
+        rs_or(&mut regs, &always);
+        // (What the interpreter reads but compiled code doesn't: its reads
+        // of the rest of the block are the same as compiled code's.)
+        if let Some(e) = exit_live {
+            let only: RegSet = std::array::from_fn(|w| e[i][w] & !live[i][w]);
+            rs_or(&mut regs, &only);
+        }
+        if !mat_reads.is_empty()
+            && let Some(m) = mat_reads.get(&i)
+        {
+            rs_or(&mut regs, m);
+        }
+        let reg = insn.reg as usize;
+        acc = match insn.op {
+            _ if insn.bail => {
+                regs = [!0; 4];
+                true
+            }
+            Op::Star => {
+                let x = rs_has(&regs, reg);
+                kill(&mut regs, reg);
+                after || x
+            }
+            Op::Ldar => {
+                if after {
+                    rs_add(&mut regs, reg);
+                }
+                false
+            }
+            op if to_int32(op) && insn.guard == 0 && insn.assume == 0 => false,
+            _ if sum(i) => {
+                trunc[i] = !after;
+                if after && insn.reads_reg() {
+                    rs_add(&mut regs, reg);
+                }
+                after
+            }
+            _ => {
+                if insn.op == Op::Mul && int(i) {
+                    trunc[i] = !after;
+                }
+                if insn.reads_reg() || insn.op == Op::Mov {
+                    rs_add(&mut regs, reg);
+                }
+                if insn.is_call() {
+                    insn.call_reads().for_each(|x| rs_add(&mut regs, x));
+                }
+                if insn.op == Op::SetKeyed {
+                    rs_add(&mut regs, insn.reg2 as usize);
+                }
+                reads_acc(insn) || (writes_acc(insn).is_none() && after)
+            }
+        };
+    }
+    trunc
+}
+
 /// Per instruction, whether `acc` is never a negative int32 there: it
 /// holds a non-negative int32, or no int32 at all. From registers that
 /// never do (all their stores store such values), for registers whose
@@ -6955,6 +7139,8 @@ impl Fused {
 /// tail, a dead accumulator on both branches.
 struct Fusion<'a> {
     insns: &'a [Insn],
+    /// See [`truncated`]: sums that wrap, products without the -0 test.
+    trunc: &'a [bool],
     ins: &'a [Option<TypeState>],
     homes: &'a [Home],
     /// `None` when not specializing: no fusion.
@@ -7521,14 +7707,20 @@ impl Fusion<'_> {
             || st.acc != Ty::I32 || st.regs[r] != Ty::I32 || undoes && widened.contains(&i) {
             return None;
         }
+        // A sum read only through ToInt32 wraps: no exit.
+        let (name, undo) = if undoes && self.trunc[i] {
+            (format!("{base}_wrap_into_u{k}"), None)
+        } else {
+            (format!("{base}_into_u{k}"), undoes.then(|| (format!("undo_{base}_into_u{k}"), 0)))
+        };
         Some(Fused {
             len: 2,
             steps: vec![FusedStep {
-                name: format!("{base}_into_u{k}"),
+                name,
                 imm: 0,
                 reg: 0,
                 insn: i,
-                undo: undoes.then(|| (format!("undo_{base}_into_u{k}"), 0)),
+                undo,
                 exit_ldar: Some(String::new()),
             }],
             ldar: format!("ldar_u{k}"),
@@ -7604,17 +7796,23 @@ impl Fusion<'_> {
                     if st.acc != Ty::I32 || st.regs[b] != Ty::I32 || widened.contains(&k) {
                         return None;
                     }
+                    // (Wrapping, or without the -0 test, where `truncated`
+                    // says the result is read only through ToInt32.)
+                    let t = if self.trunc[k] { "_trunc" } else { "" };
                     match (insns[k].op, self.homes[b]) {
+                        (Op::Add, Home::Int(bs)) if self.trunc[k] => {
+                            steps.push(step(format!("addr_wrap_ii_u{cs}_u{bs}"), k, None));
+                        }
                         (Op::Add, Home::Int(bs)) => {
                             let undo = (format!("undo_addr_u{cs}_u{bs}"), 0);
                             steps.push(step(format!("addr_ii_u{cs}_u{bs}"), k, Some(undo)));
                         }
                         (Op::Mul, Home::Int(bs)) => {
-                            steps.push(step(format!("mul_into_u{cs}_u{bs}"), k, None));
+                            steps.push(step(format!("mul{t}_into_u{cs}_u{bs}"), k, None));
                         }
                         (Op::Mul, Home::Mem) => steps.push(FusedStep {
                             reg: b as u8,
-                            ..step(format!("mul_into_u{cs}_m"), k, None)
+                            ..step(format!("mul{t}_into_u{cs}_m"), k, None)
                         }),
                         _ => return None,
                     }
@@ -8376,6 +8574,23 @@ impl JitCode {
         // A `Star` into a register nothing reads after, compiled code or
         // the interpreter after an exit, writes nothing (but into a direct
         // call's frame, which the callee reads).
+        // Sums whose results are read only through ToInt32 wrap, products
+        // so read drop their -0 test (see `truncated`). Their types are an
+        // int32's either way.
+        let trunc = match widened {
+            Some(w) => truncated(insns, reach, &ins, w, live_sets, acc_live, &captured, exit_live, mats),
+            None => vec![false; n],
+        };
+        for (s, _) in sel.iter_mut().zip(&trunc).filter(|(_, t)| **t) {
+            if let Some(s) = s {
+                match (s.base, s.case) {
+                    ("add" | "sub", "ii") => s.case = "wrap_ii",
+                    ("add_smi" | "inc", "i") => (s.base, s.case) = ("add_smi", "wrap_i"),
+                    ("mul", "ii") => s.case = "trunc_ii",
+                    _ => {}
+                }
+            }
+        }
         let mut dead_star = vec![false; n];
         if let Some(l) = &share_live {
             for (i, s) in sel.iter_mut().enumerate() {
@@ -8637,6 +8852,7 @@ impl JitCode {
         }
         let fusion = Fusion {
             insns,
+            trunc: &trunc,
             ins: &ins,
             homes: &homes,
             widened: widened.filter(|_| opts.fusion),

@@ -397,6 +397,9 @@ define_ops! {
     LdarIncStar(Reg),
     /// `Ldar r; Dec; Star r`.
     LdarDecStar(Reg),
+    /// `Star r; Ldar s`: the `Star`'s handler goes straight on to the
+    /// `Ldar`'s, with no dispatch between them.
+    StarLdar(Reg),
 }
 
 impl Op {
@@ -461,6 +464,7 @@ impl Op {
             Op::TestEqualJumpIfTrue | Op::TestEqualJumpIfFalse => Op::TestEqual,
             Op::TestEqualSmiJumpIfTrue | Op::TestEqualSmiJumpIfFalse => Op::TestEqualSmi,
             Op::LdarIncStar | Op::LdarDecStar => Op::Ldar,
+            Op::StarLdar => Op::Star,
             op => op,
         }
     }
@@ -509,8 +513,8 @@ impl Op {
     }
 }
 
-/// Fuse comparison + conditional-jump pairs, and `Ldar r; Inc; Star r`
-/// and its `Dec`, into superinstructions, in place (see the
+/// Fuse comparison + conditional-jump pairs, `Ldar r; Inc; Star r` and
+/// its `Dec`, and `Star r; Ldar s` into superinstructions, in place (see the
 /// superinstruction opcodes). Only opcode bytes change, so
 /// the result is equivalent instruction by instruction; a pair whose jump
 /// is also a jump target still works, as the jump stays. Idempotent.
@@ -531,6 +535,14 @@ pub fn quicken(code: &mut [u8]) {
             && let Some(q) = in_place(code, pc)
         {
             code[pc] = q as u8;
+        } else if op == Op::Star
+            && next < code.len()
+            && code[next] == Op::Ldar as u8
+            && in_place(code, next).is_none()
+        {
+            // (Not an in-place `++`'s `Ldar`, which `StarLdar` would run
+            // as a plain one.)
+            code[pc] = Op::StarLdar as u8;
         }
         pc = next;
     }
@@ -777,20 +789,28 @@ mod tests {
         a.emit(Op::TestEqualSmi, &[Arg::Imm(3)]);
         a.emit(Op::Return, &[]);
         a.bind(out);
-        // In place: the same register only.
-        a.emit(Op::Ldar, &[Arg::Reg(2)]);
-        a.emit(Op::Inc, &[]);
-        a.emit(Op::Star, &[Arg::Reg(2)]);
-        a.emit(Op::Ldar, &[Arg::Reg(2)]);
-        a.emit(Op::Dec, &[]);
-        a.emit(Op::Star, &[Arg::Reg(3)]);
-        a.emit(Op::Return, &[]);
+        // In place: the same register only. `Star; Ldar`, but not before
+        // an in-place `++` (it'd run its `Ldar` as a plain one).
+        for (op, r) in [
+            (Op::Ldar, Some(2)), (Op::Dec, None), (Op::Star, Some(2)),
+            (Op::Star, Some(3)),
+            (Op::Ldar, Some(2)), (Op::Inc, None), (Op::Star, Some(2)),
+            (Op::Ldar, Some(3)), (Op::Dec, None), (Op::Star, Some(4)),
+            (Op::Return, None),
+        ] {
+            let args: Vec<Arg> = r.map(Arg::Reg).into_iter().collect();
+            a.emit(op, &args);
+        }
         let plain = a.finish();
         let mut q = plain.clone();
         super::quicken(&mut q);
-        let at = plain.len() - 11;
-        assert_eq!((q[0], q[at]), (Op::TestLessThanJumpIfFalse as u8, Op::LdarIncStar as u8));
-        assert_eq!((&q[2..at], &q[at + 1..]), (&plain[2..at], &plain[at + 1..]));
+        let at = plain.len() - 18;
+        let changed = [(0, Op::TestLessThanJumpIfFalse), (at, Op::LdarDecStar), (at + 7, Op::LdarIncStar), (at + 10, Op::StarLdar)];
+        let mut want = plain.clone();
+        for (k, op) in changed {
+            want[k] = op as u8;
+        }
+        assert_eq!(q, want);
         let again = q.clone();
         super::quicken(&mut q);
         assert_eq!(q, again);

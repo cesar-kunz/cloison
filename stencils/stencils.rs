@@ -2085,6 +2085,95 @@ macro_rules! int_slot_pair {
     };
 }
 
+/// `Add r; Star r` (`r += acc`), `Sub r; Star r` (`r -= acc`) and the
+/// bitwise ones on an int32 slot and an int32 `acc`, in place on the slot:
+/// `acc` stays as it was, so an overflow exits with it (the exit stub
+/// undoes the slot) and the group's `ldar_u` loads it only if it's read.
+macro_rules! int_slot_from_acc {
+    ($k:tt) => {
+        // target x86_64 add_into_u{},sub_into_u{}: 2 `add edi, r12d; jo exit` (judged 2026-10-27)
+        // target aarch64 add_into_u{},sub_into_u{}: 2 `adds w24, w24, w20; b.vs exit` (judged 2026-10-27)
+        stencil!("add_into_u", $k; |s| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut v = s.g[$k].to_bits();
+                core::arch::asm!(
+                    "add {v:e}, {a:e}",
+                    "{{disp32}} jo {ovf}",
+                    v = inout(reg) v,
+                    a = in(reg) s.acc.to_bits(),
+                    ovf = label { unsafe {
+                        s.g[$k] = Value::from_bits(v);
+                        exit!(s)
+                    } },
+                    options(nomem, nostack),
+                );
+                s.g[$k] = Value::from_bits(v);
+                next!(s)
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (v, overflow) = raw(s.g[$k]).overflowing_add(int(s.acc));
+                s.g[$k] = unboxed(v);
+                if overflow {
+                    exit!(s)
+                }
+                next!(s)
+            }
+        });
+        stencil!("undo_add_into_u", $k; |s| {
+            s.g[$k] = unboxed(raw(s.g[$k]).wrapping_sub(int(s.acc)));
+            next!(s)
+        });
+        stencil!("sub_into_u", $k; |s| {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut v = s.g[$k].to_bits();
+                core::arch::asm!(
+                    "sub {v:e}, {a:e}",
+                    "{{disp32}} jo {ovf}",
+                    v = inout(reg) v,
+                    a = in(reg) s.acc.to_bits(),
+                    ovf = label { unsafe {
+                        s.g[$k] = Value::from_bits(v);
+                        exit!(s)
+                    } },
+                    options(nomem, nostack),
+                );
+                s.g[$k] = Value::from_bits(v);
+                next!(s)
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                let (v, overflow) = raw(s.g[$k]).overflowing_sub(int(s.acc));
+                s.g[$k] = unboxed(v);
+                if overflow {
+                    exit!(s)
+                }
+                next!(s)
+            }
+        });
+        stencil!("undo_sub_into_u", $k; |s| {
+            s.g[$k] = unboxed(raw(s.g[$k]).wrapping_add(int(s.acc)));
+            next!(s)
+        });
+        // target x86_64 and_into_u{},or_into_u{},xor_into_u{}: 1 `and edi, r12d` (judged 2026-10-27)
+        // target aarch64 and_into_u{},or_into_u{},xor_into_u{}: 1 `and w24, w24, w20` (judged 2026-10-27)
+        stencil!("and_into_u", $k; |s| {
+            s.g[$k] = unboxed(raw(s.g[$k]) & int(s.acc));
+            next!(s)
+        });
+        stencil!("or_into_u", $k; |s| {
+            s.g[$k] = unboxed(raw(s.g[$k]) | int(s.acc));
+            next!(s)
+        });
+        stencil!("xor_into_u", $k; |s| {
+            s.g[$k] = unboxed(raw(s.g[$k]) ^ int(s.acc));
+            next!(s)
+        });
+    };
+}
+
 macro_rules! fp_int_slot_pair {
     ($a:tt, $b:tt) => {
         stencil!("addr_fi_f", $a, "_u", $b; |s| {
@@ -2095,6 +2184,7 @@ macro_rules! fp_int_slot_pair {
 }
 
 with_gprs!(each_gpr! int_slot);
+with_gprs!(each_gpr! int_slot_from_acc);
 with_gprs!(gpr_pairs! int_slot_pair);
 with_gprs!(fp_gpr_pairs! fp_int_slot_pair);
 

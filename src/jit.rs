@@ -6896,7 +6896,8 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
 /// One stencil of a fused group.
 struct FusedStep {
     /// The slot holding `acc` at an exit from this step, if it isn't the
-    /// group's `ldar` slot.
+    /// group's `ldar` slot; empty if it's `acc` itself, which the step
+    /// leaves as it was.
     exit_ldar: Option<String>,
     name: String,
     imm: i32,
@@ -6967,6 +6968,9 @@ impl Fusion<'_> {
     /// instructions name two registers sharing a slot (see
     /// `assign_homes`), which its patterns tell apart by register.
     fn at(&self, i: usize) -> Option<Fused> {
+        if let Some(f) = self.slot_from_acc(i) {
+            return Some(f);
+        }
         let f = self.at_any(i)?;
         let mut seen: Vec<((bool, u8), u8)> = Vec::new();
         for insn in &self.insns[i..i + f.len] {
@@ -7481,6 +7485,55 @@ impl Fusion<'_> {
             });
         }
         None
+    }
+
+    /// `Add r; Star r` (`r += acc`), `Sub r; Star r` (`r -= acc`) and
+    /// `BitAnd | BitOr | BitXor r; Star r` with `r` an int32 slot and `acc`
+    /// an int32: in place on the slot (`add_into_u<r>`, …), `acc` left as it
+    /// was. On overflow the exit stub undoes the slot and exits with `acc`.
+    /// The `Star` may name another register sharing `r`'s slot (`t = a * b;
+    /// m = c * d + t`): the slot is read, then written, the same either way.
+    fn slot_from_acc(&self, i: usize) -> Option<Fused> {
+        let widened = self.widened?;
+        let insns = self.insns;
+        if !self.group(i, 2)
+            || insns[i + 1].op != Op::Star
+            || insns[i].bail
+            || insns[i + 1].bail
+            || insns[i + 1].check_only
+        {
+            return None;
+        }
+        let (base, undoes) = match insns[i].op {
+            Op::Add => ("add", true),
+            Op::Sub => ("sub", true),
+            Op::BitAnd => ("and", false),
+            Op::BitOr => ("or", false),
+            Op::BitXor => ("xor", false),
+            _ => return None,
+        };
+        let r = insns[i].reg as usize;
+        let st = self.ins[i].as_ref()?;
+        let Home::Int(k) = self.homes[r] else {
+            return None;
+        };
+        if self.homes[insns[i + 1].reg as usize] != Home::Int(k)
+            || st.acc != Ty::I32 || st.regs[r] != Ty::I32 || undoes && widened.contains(&i) {
+            return None;
+        }
+        Some(Fused {
+            len: 2,
+            steps: vec![FusedStep {
+                name: format!("{base}_into_u{k}"),
+                imm: 0,
+                reg: 0,
+                insn: i,
+                undo: undoes.then(|| (format!("undo_{base}_into_u{k}"), 0)),
+                exit_ldar: Some(String::new()),
+            }],
+            ldar: format!("ldar_u{k}"),
+            acc_live_after: self.live_out[i + 1],
+        })
     }
 
     /// `ldar a; add b1; …; add bn; star c` (n ≥ 1) as `c = a` (a slot move,
@@ -8781,8 +8834,15 @@ impl JitCode {
                                 ..Piece::new(undo, 0)
                             });
                         }
-                        seq.push(Piece::new(step.exit_ldar.as_ref().unwrap_or(&f.ldar), 0));
-                        seq.push(Piece::new("box_iacc", 0));
+                        match step.exit_ldar.as_ref().unwrap_or(&f.ldar) {
+                            ldar if ldar.is_empty() => {
+                                seq.extend(ins[step.insn].as_ref().and_then(|st| box_acc_piece(st.acc)))
+                            }
+                            ldar => {
+                                seq.push(Piece::new(ldar, 0));
+                                seq.push(Piece::new("box_iacc", 0));
+                            }
+                        }
                         seq.extend(exit_spills(&homes, step.insn, &boxed));
                         seq.push(Piece {
                             imm: insns[step.insn].exit_record(),

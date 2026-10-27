@@ -1891,10 +1891,11 @@ fn direct_calls_into_compiled_callees() {
     let (v, s) = jit(&src);
     assert_eq!(v, expected.to_string());
     // The callee version returns int32s: the result is checked to be one,
-    // and `total += f(…)` adds int32s. (`f` and `g` are closures of one
-    // function: the call is bound to its code, `call_direct_code`.)
+    // and `total += f(…)` adds int32s, in place on `total`'s slot. (`f` and
+    // `g` are closures of one function: the call is bound to its code,
+    // `call_direct_code`.)
     assert!(s.iter().any(|n| n.replace("_code", "") == "call_direct+check_acc_int"), "{s:?}");
-    assert!(s.iter().any(|n| n.starts_with("add_ii_")), "{s:?}");
+    assert!(s.iter().any(|n| n.starts_with("add_ii_") || n.starts_with("add_into_")), "{s:?}");
 }
 
 /// The argument is a double, so the callee version returns doubles, and
@@ -2188,7 +2189,7 @@ fn runtime_call_results_are_predicted() {
     assert!(!s.iter().any(|n| n.contains("create_object")), "{s:?}");
     assert!(s.iter().any(|n| n.starts_with("array_push")), "{s:?}");
     assert!(
-        s.iter().filter(|n| n.starts_with("add_ii_")).count() >= 2,
+        s.iter().filter(|n| n.starts_with("add_ii_") || n.starts_with("add_into_")).count() >= 2,
         "{s:?}"
     );
     let two = src.replace(

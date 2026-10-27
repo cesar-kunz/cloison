@@ -4340,11 +4340,35 @@ fn is_cell(tag: NumberTag, v: Value) -> bool {
     v.to_bits() & tag.to_bits() == 0 && v.to_bits() & Value::OTHER_TAG == 0
 }
 
+/// [`is_cell`] for loads and guards: on x86-64 the tag's bits and
+/// `OTHER_TAG`'s (bit 1, clear in the tag) as one mask, `lea m, [r14 + 2]`,
+/// where LLVM makes `mov; or`. (Not in stores: the opaque mask made LLVM
+/// lay their barriers out otherwise, longer.)
+#[inline(always)]
+fn is_cell_g(tag: NumberTag, v: Value) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let m: u64;
+        unsafe {
+            core::arch::asm!(
+                "lea {m}, [{t} + {k}]",
+                m = lateout(reg) m,
+                t = in(reg) tag.to_bits(),
+                k = const Value::OTHER_TAG,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        v.to_bits() & m == 0
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    is_cell(tag, v)
+}
+
 /// The receiver `o`, if it is a cell whose shape is `imm64`.
 #[inline(always)]
 unsafe fn guard_shape(tag: NumberTag, o: Value) -> Option<*mut u8> {
     let p = o.to_bits() as *mut u8;
-    if is_cell(tag, o) && unsafe { (*header(p)).shape } == imm64() {
+    if is_cell_g(tag, o) && unsafe { (*header(p)).shape } == imm64() {
         Some(p)
     } else {
         None
@@ -4564,7 +4588,7 @@ macro_rules! array_length {
         // target aarch64 get_length_m: 12 now 13 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_length_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING | LENGTH_TYPED_ARRAY) {
+            if !is_cell_g(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING | LENGTH_TYPED_ARRAY) {
                 exit!(s)
             }
             s.acc = unboxed((*cell(o)).elems_len as i32);
@@ -4572,7 +4596,7 @@ macro_rules! array_length {
         });
         stencil!("get_length_nt_", loc!($loc); |s| {
             let o = get!($loc, s);
-            if !is_cell(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING) {
+            if !is_cell_g(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING) {
                 exit!(s)
             }
             s.acc = unboxed((*cell(o)).elems_len as i32);
@@ -4712,8 +4736,8 @@ macro_rules! property_location {
         set_tro!("set_tro_", $loc, true, true);
         set_tro!("set_tro_n_", $loc, true, false);
         // `_n`: `acc` is known to be a number, never a cell: no barrier.
-        // target x86_64 set_own_n_g{}: 8 `mov rax, r14; or rax, 2; test rdi, rax; jnz; movabs; cmp [rdi], rax; jne; mov [rdi+off], r12` (judged 2026-10-26)
-        // target x86_64 set_own_n_m: 9 (judged 2026-10-26)
+        // target x86_64 set_own_n_g{}: 7 `lea rax, [r14+2]; test rdi, rax; jnz; movabs; cmp [rdi], rax; jne; mov [rdi+off], r12` (8 with `mov; or` for the `lea`, judged 2026-10-26)
+        // target x86_64 set_own_n_m: 8 (judged 2026-10-26)
         // target aarch64 set_own_n_g{}: 10 the guard (9) and `str` (judged 2026-10-26)
         // target aarch64 set_own_n_m: 11 (judged 2026-10-26)
         stencil!("set_own_n_", loc!($loc); |s| {
@@ -4912,7 +4936,7 @@ macro_rules! property_location {
         // target x86_64 guard_cell_g{},guard_cell_m: 3 now 4 `lea rax, [r14+2]; test rdi, rax; jnz exit` (`_m`: `test [r13+k], rax`) (judged 2026-10-26)
         // target aarch64 guard_cell_m: 4 `ldr x8, [x21, #k]; orr; tst; b.ne` (judged 2026-10-26)
         stencil!("guard_cell_", loc!($loc); |s| {
-            if !is_cell(s.tag, get!($loc, s)) {
+            if !is_cell_g(s.tag, get!($loc, s)) {
                 exit!(s)
             }
             next!(s)
@@ -4922,7 +4946,7 @@ macro_rules! property_location {
         // string's, a symbol's, a BigInt's).
         stencil!("guard_object_", loc!($loc); |s| {
             let v = get!($loc, s);
-            if !is_cell(s.tag, v) || (imm() as u32 >> (*cell(v)).class) & 1 != 0 {
+            if !is_cell_g(s.tag, v) || (imm() as u32 >> (*cell(v)).class) & 1 != 0 {
                 exit!(s)
             }
             next!(s)
@@ -5091,17 +5115,17 @@ macro_rules! property_location {
         // elements' type comes with it).
         // An object whose elements are values: not a string (code units),
         // a buffer or a typed array (bytes).
-        // target x86_64 get_keyed_i_g{}: 14 now 17 cell (3), `movzx eax, byte [rdi+8]; cmp eax, 4; jae cold` (DATE out of line), bounds (2), element (6) (judged 2026-10-26)
-        // target x86_64 get_keyed_i_m: 15 now 18 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target x86_64 get_keyed_i_g{}: 14 now 16 cell (3), `movzx eax, byte [rdi+8]; cmp eax, 4; jae cold` (DATE out of line), bounds (2), element (6) (judged 2026-10-26)
+        // target x86_64 get_keyed_i_m: 15 now 17 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
         // target aarch64 get_keyed_i_g{}: 13 now 15 cell (3), `ldrb; cmp #4; b.hs cold` (DATE out of line), bounds (3), element (4) (judged 2026-10-26)
         // target aarch64 get_keyed_i_m: 14 now 15 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
-        keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell(s.tag, o)
+        keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell_g(s.tag, o)
             && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
         // target x86_64 get_keyed_g{}: 16 now 17 cell (3), `movzx; cmp al, 4; jae cold`, `cmp r12, r14; jb exit`, bounds (2), element (6) (judged 2026-10-26)
         // target x86_64 get_keyed_m: 17 now 18 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
         // target aarch64 get_keyed_g{}: 15 fallthrough 9 cell (3), `ldrb; cmp #4; b.hs cold`, `cmp x20, x22; b.lo exit`, bounds (3), element (4); counted 9 while the int test jumps over a `b exit` (judged 2026-10-26)
         // target aarch64 get_keyed_m: 16 fallthrough 10 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
-        keyed_load!($loc, "get_keyed_", false, |s, o| is_cell(s.tag, o)
+        keyed_load!($loc, "get_keyed_", false, |s, o| is_cell_g(s.tag, o)
             && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
         // `acc = o[acc]` through the runtime (`acc` boxed): a typed array's
         // element, or a site whose receivers the fast ones keep leaving
@@ -5329,8 +5353,8 @@ macro_rules! property_location {
         // target aarch64 get_keyed_i_sh_g{}: 16 cell (3), shape (6), bounds (3), `ldr; ldr [x8, w20, uxtw #3]; cbz; mov x20, x8` (judged 2026-10-26)
         // target aarch64 get_keyed_i_sh_m: 17 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_i_sh_", true, |s, o| guard_shape(s.tag, o).is_some());
-        // target x86_64 get_keyed_sh_g{}: 16 now 18 cell (3), `cmp r12, r14; jb exit`, shape (3) with `cmp [rdi], rax`, bounds (2), element (6) (judged 2026-10-26)
-        // target x86_64 get_keyed_sh_m: 17 now 19 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target x86_64 get_keyed_sh_g{}: 16 now 17 cell (3), `cmp r12, r14; jb exit`, shape (3) with `cmp [rdi], rax`, bounds (2), element (6) (judged 2026-10-26)
+        // target x86_64 get_keyed_sh_m: 17 now 18 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
         // target aarch64 get_keyed_sh_g{}: 18 cell (3), `cmp x20, x22; b.lo exit`, shape (6), bounds (3), element (4) (judged 2026-10-26)
         // target aarch64 get_keyed_sh_m: 19 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_sh_", false, |s, o| guard_shape(s.tag, o).is_some());
@@ -5809,7 +5833,7 @@ stencil!("check_acc_num"; |s| {
 // target x86_64 check_acc_shape: 6 now 7 `lea rax, [r14+2]; test r12, rax; jnz exit; movabs rax, shape; cmp [r12], rax; jne exit` (judged 2026-10-26)
 // target aarch64 check_acc_shape: 9 cell (3), `ldr x8, [x20]`, shape (3), `cmp`, `b.ne` (judged 2026-10-26)
 stencil!("check_acc_shape"; |s| {
-    if !is_cell(s.tag, s.acc) || (*cell(s.acc)).shape != imm64() {
+    if !is_cell_g(s.tag, s.acc) || (*cell(s.acc)).shape != imm64() {
         exit!(s)
     }
     next!(s)

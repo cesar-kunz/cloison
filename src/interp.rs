@@ -253,6 +253,11 @@ macro_rules! handlers {
             macro_rules! tail {
                 ($f:expr, $a:expr) => { become $f($pc, $a, $regs, $tag, tbl, ti32) };
             }
+            // Tail-call handler `f` on the instruction `$o` bytes on (the
+            // next one of a superinstruction, without a dispatch).
+            macro_rules! then {
+                ($f:expr, $o:expr, $a:expr) => { become $f($pc.add($o), $a, $regs, $tag, tbl, ti32) };
+            }
             // Dispatch to `p` in ANY with register file `r` (calls, returns).
             macro_rules! jump_to {
                 ($p:expr, $a:expr, $r:expr) => { dispatch!(tbl, $p, 0, $a, $r, $tag, tbl, ti32) };
@@ -358,6 +363,13 @@ handlers! {
     fn op_star(pc, acc, regs, tag) {
         *reg(pc, 1, regs) = acc;
         next!(any, Op::Star.size(), acc)
+    }
+
+    // `Star r; Ldar s`: the `Ldar`'s handler (also its I32 entry) called
+    // directly.
+    fn op_star_ldar(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = acc;
+        then!(op_ldar, Op::Star.size(), acc)
     }
 
     fn op_add(pc, acc, regs, tag) {
@@ -540,6 +552,11 @@ handlers! {
         acc = tag.rebox(acc);
         *reg(pc, 1, regs) = acc;
         next!(i32, Op::Star.size(), acc)
+    }
+
+    fn i32_star_ldar(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = tag.rebox(acc);
+        then!(op_ldar, Op::Star.size(), acc)
     }
 
     // On overflow, these recover the original `acc` as `wrapped - operand`
@@ -3531,6 +3548,7 @@ static TABLE: Table = {
     t[Op::LdarIncStar as usize] = op_ldar_inc_star;
     t[Op::LdarDecStar as usize] = op_ldar_dec_star;
     t[Op::Star as usize] = op_star;
+    t[Op::StarLdar as usize] = op_star_ldar;
     t[Op::Add as usize] = op_add;
     t[Op::Inc as usize] = op_inc;
     t[Op::Dec as usize] = op_dec;
@@ -3668,6 +3686,7 @@ static TABLE_I32: Table = {
     t[Op::LdarIncStar as usize] = op_ldar_inc_star;
     t[Op::LdarDecStar as usize] = op_ldar_dec_star;
     t[Op::Star as usize] = i32_star;
+    t[Op::StarLdar as usize] = i32_star_ldar;
     t[Op::Add as usize] = i32_add;
     t[Op::Inc as usize] = i32_inc;
     t[Op::Dec as usize] = i32_dec;

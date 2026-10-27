@@ -3954,6 +3954,7 @@ impl Vm {
             let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
             fill(data);
             // The room past the units zero, not what memory held.
+            debug_assert!(4 * words >= len);
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
             (*o).elems = data.cast();
             (*o).elems_len = u32::try_from(len).expect("string too long");

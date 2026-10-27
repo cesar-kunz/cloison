@@ -4078,8 +4078,9 @@ unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
     unsafe {
         let words = (words + 1) & !1;
         let p = (*heap).ptr;
-        // (Past `LARGE` the runtime makes it a large cell.)
-        if 8 * words > LARGE || ((*heap).end as usize - p as usize) < 8 * words {
+        // (Past `LARGE` the runtime makes it a large cell.) `p + size >
+        // end`: `lea; cmp; ja`, not `end - p < size`'s `mov; sub; cmp; jb`.
+        if 8 * words > LARGE || p as usize + 8 * words > (*heap).end as usize {
             return None;
         }
         (*heap).ptr = p.add(words);
@@ -4155,6 +4156,23 @@ unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
     }
 }
 
+/// Zero words `from` to `to` of cell `p` (both even: 16-byte aligned), 16
+/// bytes a store. (Volatile: LLVM would call `memset`, which a stencil
+/// can't, or store 8 bytes at a time.)
+#[inline(always)]
+unsafe fn zero_pairs(p: *mut u64, from: usize, to: usize) {
+    unsafe {
+        let (mut q, end) = (p.add(from), p.add(to));
+        while q < end {
+            #[cfg(target_arch = "x86_64")]
+            q.cast::<core::arch::x86_64::__m128i>().write_volatile(core::arch::x86_64::_mm_setzero_si128());
+            #[cfg(not(target_arch = "x86_64"))]
+            q.cast::<u128>().write_volatile(0);
+            q = q.add(2);
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn create_object(slots: usize) -> Option<*mut u64> {
     unsafe {
@@ -4162,24 +4180,22 @@ unsafe fn create_object(slots: usize) -> Option<*mut u64> {
         (*header(p)).shape = imm64();
         set_header_word(header(p), header_word(Class::Plain, EXTERNAL, slots as u64));
         // The rest of the header zero, and the slots (`Value::EMPTY`): a
-        // collection reads them (holes aren't zeroed).
-        // (Volatile: LLVM would call `memset`, which a stencil can't.)
-        for k in 2..HEADER_WORDS + slots {
-            p.add(k).write_volatile(0);
-        }
+        // collection reads them (holes aren't zeroed). The cell is whole
+        // granules (`bump`): its padding word too.
+        zero_pairs(p, 2, (HEADER_WORDS + slots + 1) & !1);
         Some(p)
     }
 }
-// target x86_64 create_object_0: 16 now 19 bump `lea; cmp [heap+8]; ja` (not `mov; sub; cmp; jb; lea`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
-// target x86_64 create_object_[12]: 17 now 21 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target x86_64 create_object_[34]: 18 now 23 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target x86_64 create_object_[56]: 19 now 25 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target x86_64 create_object_[78]: 20 now 27 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target aarch64 create_object_0: 19 now 22 heap (3), `ldp; add; cmp; b.hi; str`, meta (4), header (5), `stp xzr, xzr` ×2 (judged 2026-10-26)
-// target aarch64 create_object_[12]: 21 now 25 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
-// target aarch64 create_object_[34]: 22 now 27 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
-// target aarch64 create_object_[56]: 23 now 29 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
-// target aarch64 create_object_[78]: 24 now 31 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target x86_64 create_object_0: 16 bump `lea; cmp [heap+8]; ja` (not `mov; sub; cmp; jb; lea`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
+// target x86_64 create_object_[12]: 17 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target x86_64 create_object_[34]: 18 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target x86_64 create_object_[56]: 19 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target x86_64 create_object_[78]: 20 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
+// target aarch64 create_object_0: 19 heap (3), `ldp; add; cmp; b.hi; str`, meta (4), header (5), `stp xzr, xzr` ×2 (judged 2026-10-26)
+// target aarch64 create_object_[12]: 21 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target aarch64 create_object_[34]: 22 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target aarch64 create_object_[56]: 23 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target aarch64 create_object_[78]: 24 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
 macro_rules! create_object_n {
     ($($n:literal)*) => {$(
         stencil_slow!("create_object_", $n; |s| {
@@ -4195,8 +4211,8 @@ macro_rules! create_object_n {
     )*};
 }
 create_object_n!(0 1 2 3 4 5 6 7 8);
-// target x86_64 create_object: 28 now 60 `mov rax, imm32; movabs; lea; and; cmp; ja; …; L: movups [r11], xmm8; add r11, 16; cmp; jb L` (loop counted once; judged 2026-10-26)
-// target aarch64 create_object: 30 now 37 count by `imm_zext`, …, `L: stp xzr, xzr, [x12], #16; cmp; b.lo L` (judged 2026-10-26)
+// target x86_64 create_object: 28 now 33 `mov rax, imm32; movabs; lea; and; cmp; ja; …; L: movups [r11], xmm8; add r11, 16; cmp; jb L` (loop counted once; judged 2026-10-26)
+// target aarch64 create_object: 30 now 35 count by `imm_zext`, …, `L: stp xzr, xzr, [x12], #16; cmp; b.lo L` (judged 2026-10-26)
 stencil_slow!("create_object"; |s| {
     let Some(p) = create_object(imm() as usize) else { slow!(s) };
     s.acc = Value::from_bits(p as u64);
@@ -4208,8 +4224,8 @@ stencil_slow!("create_object"; |s| {
 
 // `CreateArray`: a new, empty array of shape `imm64`, as `create_object_0`
 // (no slots nor elements).
-// target x86_64 create_array: 16 now 18 bump `lea; cmp [heap+8]; ja; mov` (not `mov; sub; cmp; jb; lea; mov`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
-// target aarch64 create_array: 19 now 20 bump `ldp; add; cmp; b.hi; str` (not `sub; cmp; b.lo; add`) (judged 2026-10-26)
+// target x86_64 create_array: 16 bump `lea; cmp [heap+8]; ja; mov` (not `mov; sub; cmp; jb; lea; mov`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
+// target aarch64 create_array: 19 bump `ldp; add; cmp; b.hi; str` (not `sub; cmp; b.lo; add`) (judged 2026-10-26)
 stencil_slow!("create_array"; |s| {
     let Some(p) = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS) else { slow!(s) };
     (*header(p)).shape = imm64();
@@ -4229,8 +4245,8 @@ stencil_slow!("create_array"; |s| {
 // `CreateArray n` (a literal's, `imm` its count): as `create_array`, with
 // room for `n` elements (`undefined`) in a cell of their own, if the
 // heap's free space has it too (else none: `push` makes room).
-// target x86_64 create_array_n: 42 now 85 as `create_array` (16), then `mov ebx, imm; lea rax,[rbx*8+16]; and rax,-16; …; L: mov qword [r10+rbx*8], 10; dec rbx; jnz L` (loop counted once; judged 2026-10-26)
-// target aarch64 create_array_n: 43 now 51 as `create_array` (19), the count by `imm_zext`, SIDE and 0x80 kept, `L: str x10, [x13, x8, lsl #3]; subs; b.ne L` (judged 2026-10-26)
+// target x86_64 create_array_n: 42 now 49 as `create_array` (16), then `mov ebx, imm; lea rax,[rbx*8+16]; and rax,-16; …; L: mov qword [r10+rbx*8], 10; dec rbx; jnz L` (loop counted once; judged 2026-10-26)
+// target aarch64 create_array_n: 43 now 48 as `create_array` (19), the count by `imm_zext`, SIDE and 0x80 kept, `L: str x10, [x13, x8, lsl #3]; subs; b.ne L` (judged 2026-10-26)
 stencil_slow!("create_array_n"; |s| {
     let heap = imm64b() as *mut HeapPtrs;
     let Some(p) = bump(heap, HEADER_WORDS) else { slow!(s) };
@@ -4243,9 +4259,29 @@ stencil_slow!("create_array_n"; |s| {
     if let Some(e) = bump(heap, 1 + n) {
         // An array of values' header word: its capacity.
         *e = VALUES | (n as u64) << 32;
-        // Volatile: LLVM would call `memset`-like code from a constant pool.
-        for k in 1..=n {
-            e.add(k).write_volatile(Value::UNDEFINED.to_bits());
+        // A countdown loop. (Volatile: LLVM would call `memset`-like code
+        // from a constant pool; on x86-64 in asm, which LLVM unrolled
+        // eightfold.)
+        #[cfg(target_arch = "x86_64")]
+        if n > 0 {
+            core::arch::asm!(
+                "2:",
+                "mov qword ptr [{e} + {k} * 8], {u}",
+                "dec {k}",
+                "jnz 2b",
+                e = in(reg) e,
+                k = inout(reg) n => _,
+                u = const Value::UNDEFINED.to_bits(),
+                options(nostack),
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let mut k = n;
+            while k > 0 {
+                e.add(k).write_volatile(Value::UNDEFINED.to_bits());
+                k -= 1;
+            }
         }
         // (Its length 0, from the header's zero words.)
         (*header(p)).elems = e.add(1).cast();

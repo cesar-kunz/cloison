@@ -2891,8 +2891,13 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
     let words = |len: usize| len.div_ceil(4) + 1;
     // A long result is a cons string (see `Vm::new_cons`): the pieces not
     // copied, nor flattened. (A cons piece is that long itself, so a short
-    // result's pieces are flat.)
+    // result's pieces are flat.) An empty side leaves the other as it is
+    // (a string's identity can't be told from JS).
     match (raw_units(a), raw_units(b)) {
+        (Some(_), Some((_, 0))) => Some(a),
+        (Some((_, 0)), Some(_)) => Some(b),
+        (Some((_, 0)), None) if b.is_int32() => Some(int_string(vm(), b.as_i32_unchecked())),
+        (None, Some((_, 0))) if a.is_int32() => Some(int_string(vm(), a.as_i32_unchecked())),
         (Some((x, m)), Some((y, n))) => {
             let len = m + n;
             if len >= CONS_MIN {

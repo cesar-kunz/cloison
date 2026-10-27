@@ -4115,6 +4115,13 @@ unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
     unsafe {
         let (p, q) = (cell(a), cell(b));
         let (m, n) = ((*p).elems_len, (*q).elems_len);
+        // An empty side: the other (a cons string too).
+        if n == 0 {
+            return Some(a);
+        }
+        if m == 0 {
+            return Some(b);
+        }
         let (x, y) = ((*p).elems as *const u16, (*q).elems as *const u16);
         let len = m + n;
         if x.is_null() || y.is_null() || len > CONCAT_SHORT || imm64b() == 0 {

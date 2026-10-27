@@ -666,7 +666,8 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_numeric(pc, acc, regs, tag) {
-        let op = std::mem::transmute::<u8, Op>(*pc);
+        // (`plain`: a quickened opcode reaching here decodes as its own.)
+        let op = std::mem::transmute::<u8, Op>(*pc).plain();
         let v = match op {
             Op::Negate | Op::BitNot | Op::ToNumeric => conv!(generic_unary(op, acc)),
             _ => conv!(generic_bitwise(op, *reg(pc, 1, regs), acc)),
@@ -4006,7 +4007,7 @@ pub(crate) unsafe fn frame_args(
         let call = ret.sub(Op::Call.size());
         let (f, w, n) = (*call.add(1) as usize, *call.add(2) as usize, *call.add(3) as usize);
         let (fv, this) = (*caller.add(f), *caller.add(w));
-        match Op::from_u8(*call) {
+        match Op::from_u8(*call).map(Op::plain) {
             Some(Op::Call) if unwrap_call(vm, fv, this).is_some() => {
                 (caller.add(w + 2).cast_const(), n.saturating_sub(1))
             }

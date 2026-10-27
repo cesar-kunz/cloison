@@ -5679,7 +5679,7 @@ fn to_integer_arg(vm: &mut Vm, v: Option<Value>) -> Result<f64> {
     Ok(if d.is_nan() { 0.0 } else { d.trunc() })
 }
 
-/// Whether `x` (finite, > 0) is halfway between two multiples of 10^k
+/// Whether `x` (finite, ≥ 0) is halfway between two multiples of 10^k
 /// (2x / 10^k an odd integer): there rounding half up, which `toFixed`,
 /// `toPrecision` and `toExponential` want, and Rust's `{:.*}` and `{:.*e}`,
 /// exact but ties to even, differ.
@@ -5688,6 +5688,10 @@ pub(crate) fn is_tie(x: f64, k: i32) -> bool {
     let (exp, frac) = ((bits >> 52) as i32 & 0x7ff, bits & ((1 << 52) - 1));
     // x = m × 2^e
     let (m, e) = if exp == 0 { (frac, -1074) } else { (frac | 1 << 52, exp - 1075) };
+    if m == 0 {
+        // (0 is a multiple of every 10^k; and `m >> 64` would overflow.)
+        return false;
+    }
     // 2x = odd × 2^b; 2x × 10^-k = odd × 5^-k × 2^(b - k), odd at b = k
     // when k ≤ 0, and for k > 0 if also 5^k divides odd.
     let t = m.trailing_zeros() as i32;

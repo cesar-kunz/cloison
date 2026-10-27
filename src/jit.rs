@@ -11135,6 +11135,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
         cx.out.direct_base = cx.out.direct_base.min(spare_base);
     }
     fold_constant_tests(&mut cx.out.insns);
+    thread_constant_jumps(&mut cx.out.insns);
     if !captures {
         reuse_global_loads(&mut cx.out);
     }
@@ -12670,6 +12671,100 @@ fn fold_constant_tests(insns: &mut [Insn]) {
         if !insns[k].falls_through() {
             era += 1;
             acc = None;
+        }
+    }
+}
+
+/// Jumps to a test on a constant, threaded across the join where it is
+/// (where `fold_constant_tests` forgets what it knew): `a || b` and
+/// `x != 0` load `true` or `false` in each arm, then test it after they
+/// meet, and an inlined `return` jumps to its caller's test. A jump whose
+/// `acc` is a known constant where it lands on a test goes where the test
+/// would send it (`LdaK; Jump t`: K stays in `acc`), and a jump to `LdaK;
+/// t` goes there past the load when `acc` is dead where the test sends it.
+/// None of these instructions exits, so what an exit reads is unchanged.
+/// Forward jumps only, to forward destinations: no new loop for the passes
+/// after (`hoist_loads`) to find. A few rounds: an inlined return's join is threaded after the callee's
+/// own.
+fn thread_constant_jumps(insns: &mut [Insn]) {
+    let n = insns.len();
+    // An instruction's constant `acc`: its truth, and whether a boolean.
+    let constant = |i: &Insn| match i.op {
+        _ if i.bail => None,
+        Op::LdaTrue => Some((true, true)),
+        Op::LdaFalse => Some((false, true)),
+        Op::LdaUndefined | Op::LdaNull => Some((false, false)),
+        Op::LdaSmi => Some((i.imm != 0, false)),
+        _ => None,
+    };
+    // Where test `t` (at `j`) sends an `acc` of this truth.
+    let dest = |t: &Insn, j: usize, (truth, boolean): (bool, bool)| {
+        let on = match t.op {
+            _ if t.bail || t.guard != 0 => return None,
+            Op::JumpIfTrue | Op::JumpIfFalse if !boolean => return None,
+            Op::JumpIfTrue | Op::JumpIfToBooleanTrue => true,
+            Op::JumpIfFalse | Op::JumpIfToBooleanFalse => false,
+            _ => return None,
+        };
+        let d = if truth == on { t.target } else { j + 1 };
+        (d < n).then_some(d)
+    };
+    // (Most compilations have no jump to a test on a constant: no
+    // analysis for them.)
+    let is_test = |i: &Insn| {
+        !i.bail
+            && matches!(i.op, Op::JumpIfTrue | Op::JumpIfFalse | Op::JumpIfToBooleanTrue | Op::JumpIfToBooleanFalse)
+    };
+    let candidate = |k: usize| {
+        let j = insns[k].target;
+        insns[k].jumps()
+            && j > k
+            && j + 1 < n
+            && (is_test(&insns[j]) || constant(&insns[j]).is_some() && is_test(&insns[j + 1]))
+    };
+    if !(0..n).any(candidate) {
+        return;
+    }
+    for _ in 0..4 {
+        let reach = reachable(insns, 0);
+        let (acc_in, _) = acc_liveness(insns, &reach);
+        let mut is_target = vec![false; n];
+        for i in insns.iter().filter(|i| i.jumps() && i.target < n) {
+            is_target[i.target] = true;
+        }
+        let mut changed = false;
+        for i in 0..n {
+            let insn = insns[i];
+            if !reach[i] || !insn.jumps() || insn.guard != 0 || insn.target <= i || insn.target >= n {
+                continue;
+            }
+            let j = insn.target;
+            let d = if insn.op == Op::Jump
+                && i > 0
+                && !is_target[i]
+                && insns[i - 1].falls_through()
+                && let Some(k) = constant(&insns[i - 1])
+            {
+                dest(&insns[j], j, k)
+            } else if j + 1 < n
+                && let Some(k) = constant(&insns[j])
+                && let Some(d) = dest(&insns[j + 1], j + 1, k)
+                && !acc_in[d]
+            {
+                Some(d)
+            } else {
+                None
+            };
+            if let Some(d) = d
+                && d != j
+                && d > i
+            {
+                insns[i].target = d;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 }

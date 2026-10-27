@@ -387,6 +387,16 @@ define_ops! {
     /// `acc = ToNumeric(acc)`: a postfix `++`'s or `--`'s old value (a
     /// number, or a BigInt).
     ToNumeric(),
+
+    // ---- Superinstructions of the interpreter alone (see `quicken`) ----
+    // Laid out as their first instruction, the rest kept after them: the
+    // JIT reads them as their `plain` form, and a handler that can't do the
+    // whole goes on as the first instruction alone.
+    /// `Ldar r; Inc; Star r` (a statement's `r++`): `r += 1` in place for
+    /// an int32, the result in `acc`.
+    LdarIncStar(Reg),
+    /// `Ldar r; Dec; Star r`.
+    LdarDecStar(Reg),
 }
 
 impl Op {
@@ -450,6 +460,7 @@ impl Op {
             Op::TestLessThanJumpIfTrue | Op::TestLessThanJumpIfFalse => Op::TestLessThan,
             Op::TestEqualJumpIfTrue | Op::TestEqualJumpIfFalse => Op::TestEqual,
             Op::TestEqualSmiJumpIfTrue | Op::TestEqualSmiJumpIfFalse => Op::TestEqualSmi,
+            Op::LdarIncStar | Op::LdarDecStar => Op::Ldar,
             op => op,
         }
     }
@@ -498,8 +509,9 @@ impl Op {
     }
 }
 
-/// Fuse comparison + conditional-jump pairs into superinstructions, in
-/// place (see the superinstruction opcodes). Only opcode bytes change, so
+/// Fuse comparison + conditional-jump pairs, and `Ldar r; Inc; Star r`
+/// and its `Dec`, into superinstructions, in place (see the
+/// superinstruction opcodes). Only opcode bytes change, so
 /// the result is equivalent instruction by instruction; a pair whose jump
 /// is also a jump target still works, as the jump stays. Idempotent.
 ///
@@ -515,8 +527,31 @@ pub fn quicken(code: &mut [u8]) {
             && let Some(q) = op.fused_with(Op::from_u8(code[next]).expect("bad opcode"))
         {
             code[pc] = q as u8;
+        } else if op == Op::Ldar
+            && let Some(q) = in_place(code, pc)
+        {
+            code[pc] = q as u8;
         }
         pc = next;
+    }
+}
+
+/// The in-place form of `Ldar r; Inc; Star r` (or `Dec`) at `pc`, if that's
+/// what is there.
+pub fn in_place(code: &[u8], pc: usize) -> Option<Op> {
+    let (ldar, mid) = (Op::Ldar.size(), Op::Inc.size());
+    let star = pc + ldar + mid;
+    if Op::from_u8(code[pc])?.plain() != Op::Ldar
+        || star + Op::Star.size() > code.len()
+        || code[star] != Op::Star as u8
+        || code[star + 1] != code[pc + 1]
+    {
+        return None;
+    }
+    match Op::from_u8(code[pc + ldar])? {
+        Op::Inc => Some(Op::LdarIncStar),
+        Op::Dec => Some(Op::LdarDecStar),
+        _ => None,
     }
 }
 
@@ -742,12 +777,20 @@ mod tests {
         a.emit(Op::TestEqualSmi, &[Arg::Imm(3)]);
         a.emit(Op::Return, &[]);
         a.bind(out);
+        // In place: the same register only.
+        a.emit(Op::Ldar, &[Arg::Reg(2)]);
+        a.emit(Op::Inc, &[]);
+        a.emit(Op::Star, &[Arg::Reg(2)]);
+        a.emit(Op::Ldar, &[Arg::Reg(2)]);
+        a.emit(Op::Dec, &[]);
+        a.emit(Op::Star, &[Arg::Reg(3)]);
         a.emit(Op::Return, &[]);
         let plain = a.finish();
         let mut q = plain.clone();
         super::quicken(&mut q);
-        assert_eq!(q[0], Op::TestLessThanJumpIfFalse as u8);
-        assert_eq!(q[2..], plain[2..]);
+        let at = plain.len() - 11;
+        assert_eq!((q[0], q[at]), (Op::TestLessThanJumpIfFalse as u8, Op::LdarIncStar as u8));
+        assert_eq!((&q[2..at], &q[at + 1..]), (&plain[2..at], &plain[at + 1..]));
         let again = q.clone();
         super::quicken(&mut q);
         assert_eq!(q, again);

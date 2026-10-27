@@ -388,6 +388,31 @@ handlers! {
         tail!(slow_inc, acc)
     }
 
+    // `Ldar r; Inc; Star r` (or `Dec`) as `r += 1` in place: an int32
+    // stays one, the rest is the `Ldar`'s, whose dispatch goes on to the
+    // `Inc` and `Star` still after it. Also the I32 entries, as `Ldar`.
+    fn op_ldar_inc_star(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        if tag.is_int32(*r)
+            && let Some(n) = (*r).as_i32_unchecked().checked_add(1)
+        {
+            *r = tag.box_i32(n);
+            next_int!(Op::Ldar.size() + Op::Inc.size() + Op::Star.size(), n)
+        }
+        tail!(op_ldar, acc)
+    }
+
+    fn op_ldar_dec_star(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        if tag.is_int32(*r)
+            && let Some(n) = (*r).as_i32_unchecked().checked_sub(1)
+        {
+            *r = tag.box_i32(n);
+            next_int!(Op::Ldar.size() + Op::Dec.size() + Op::Star.size(), n)
+        }
+        tail!(op_ldar, acc)
+    }
+
     fn op_dec(pc, acc, regs, tag) {
         if tag.is_int32(acc)
             && let Some(n) = acc.as_i32_unchecked().checked_sub(1)
@@ -3503,6 +3528,8 @@ static TABLE: Table = {
     t[Op::Nop as usize] = op_nop;
     t[Op::LdaSmi as usize] = op_lda_smi;
     t[Op::Ldar as usize] = op_ldar;
+    t[Op::LdarIncStar as usize] = op_ldar_inc_star;
+    t[Op::LdarDecStar as usize] = op_ldar_dec_star;
     t[Op::Star as usize] = op_star;
     t[Op::Add as usize] = op_add;
     t[Op::Inc as usize] = op_inc;
@@ -3638,6 +3665,8 @@ static TABLE_I32: Table = {
     t[Op::Nop as usize] = i32_nop;
     t[Op::LdaSmi as usize] = op_lda_smi;
     t[Op::Ldar as usize] = op_ldar;
+    t[Op::LdarIncStar as usize] = op_ldar_inc_star;
+    t[Op::LdarDecStar as usize] = op_ldar_dec_star;
     t[Op::Star as usize] = i32_star;
     t[Op::Add as usize] = i32_add;
     t[Op::Inc as usize] = i32_inc;

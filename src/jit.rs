@@ -11425,6 +11425,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     thread_constant_jumps(&mut cx.out.insns);
     if !captures {
         reuse_global_loads(&mut cx.out);
+        reuse_field_loads(&mut cx.out);
     }
     fold_constant_loads(&mut cx.out, &cx.state.property_exits);
     if !captures {
@@ -12050,6 +12051,219 @@ fn reuse_global_loads(out: &mut Lowered) {
             }
         }
     }
+}
+
+/// A field loaded again from a register not written since, its earlier
+/// load still in a register on every path there: `Ldar` that register (a
+/// copy of it, typed as the loads made it). Forward, known fields meeting
+/// by intersection at joins; nothing known at a loop header (compiled code
+/// may be entered there) or the start. A field
+/// changes only by a store or by bytecode run meanwhile, and compiled code
+/// runs bytecode only in calls (a conversion needing a `valueOf`, a getter,
+/// a setter, a trap leave it for the interpreter: see `RT_REDO`). So the
+/// known fields are forgotten at a call but to an inlined native, a
+/// `delete`, a store but a field's (which forgets the fields at its offset),
+/// and any instruction not known to run none (`keeps_fields`).
+fn reuse_field_loads(out: &mut Lowered) {
+    type Field = (u64, i32, bool);
+    /// (receiver, field, register holding it), and the field `acc` holds.
+    #[derive(Clone, Default, PartialEq)]
+    struct Known {
+        fields: Vec<(u8, Field, u8)>,
+        acc: Option<(u8, Field)>,
+    }
+    let n = out.insns.len();
+    if n == 0 {
+        return;
+    }
+    let field = |p: &Prop| match *p {
+        Prop::Own { shape, off, .. } => Some((shape, off, false)),
+        Prop::Oop { shape, off, .. } => Some((shape, off, true)),
+        _ => None,
+    };
+    let reusable = |i: &Insn| !i.check_only && i.hoisted.is_none() && i.guard == 0 && i.assume == 0;
+    let insns = &out.insns;
+    let props = &out.props;
+    // The state after instruction `k`, from the state before it.
+    let step = |k: usize, s: &mut Known| {
+        let i = &insns[k];
+        if i.bail || i.delete != 0 {
+            *s = Known::default();
+            return;
+        }
+        match (i.op, field(&props[k])) {
+            (Op::GetNamed, Some(f)) if !i.check_only && i.hoisted.is_none() => s.acc = Some((i.reg, f)),
+            // (A code-less `Star`, `check_only`, writes nothing the register
+            // can be trusted to hold; a code-less `Ldar` loads nothing.)
+            (Op::Star, _) => {
+                s.fields.retain(|e| e.0 != i.reg && e.2 != i.reg);
+                if let Some((o, f)) = s.acc
+                    && o != i.reg
+                    && !i.check_only
+                {
+                    s.fields.push((o, f, i.reg));
+                }
+            }
+            (Op::Ldar, _) if i.check_only => s.acc = None,
+            (Op::Ldar, _) => s.acc = s.fields.iter().find(|e| e.2 == i.reg).map(|e| (e.0, e.1)),
+            (Op::Mov, _) => {
+                s.fields.retain(|e| e.0 != i.reg2 && e.2 != i.reg2);
+                s.acc = s.acc.filter(|a| a.0 != i.reg2);
+            }
+            // (Another object's field at that offset, or this one's.)
+            (Op::SetNamed, Some((_, off, oop))) => {
+                s.fields.retain(|e| (e.1.1, e.1.2) != (off, oop));
+                s.acc = s.acc.filter(|a| (a.1.1, a.1.2) != (off, oop));
+            }
+            (op, _) if i.is_call() && i.native != 0 || keeps_fields(op) => {
+                if writes_acc(i).is_some() {
+                    s.acc = None;
+                }
+            }
+            _ => *s = Known::default(),
+        }
+    };
+    // In order, one pass: a loop header starts with nothing known, so
+    // only forward jumps carry states (`pending`, met there).
+    let mut header = vec![false; n];
+    for (k, i) in insns.iter().enumerate() {
+        if i.jumps() && i.target <= k {
+            header[i.target] = true;
+        }
+    }
+    let meet = |d: &mut Known, s: &Known| {
+        d.fields.retain(|e| s.fields.contains(e));
+        if d.acc != s.acc {
+            d.acc = None;
+        }
+    };
+    let mut pending: HashMap<usize, Known> = HashMap::default();
+    // The state falling into instruction `k` (None: nothing falls in).
+    let mut cur: Option<Known> = Some(Known::default());
+    let mut reuse: Vec<(usize, u8)> = Vec::new();
+    for k in 0..n {
+        let jumped = pending.remove(&k);
+        let mut s = match (cur.take(), jumped) {
+            _ if header[k] => Known::default(),
+            (Some(mut a), Some(b)) => {
+                meet(&mut a, &b);
+                a
+            }
+            (Some(a), None) | (None, Some(a)) => a,
+            // Unreachable.
+            (None, None) => continue,
+        };
+        let i = &insns[k];
+        if i.op == Op::GetNamed
+            && reusable(i)
+            && let Some(f) = field(&props[k])
+            && let Some(&(.., r)) = s.fields.iter().find(|e| e.0 == i.reg && e.1 == f)
+        {
+            reuse.push((k, r));
+        }
+        step(k, &mut s);
+        if i.jumps() && i.target > k && i.target < n {
+            match pending.get_mut(&i.target) {
+                Some(d) => meet(d, &s),
+                None => {
+                    pending.insert(i.target, s.clone());
+                }
+            }
+        }
+        if i.falls_through() {
+            cur = Some(s);
+        }
+    }
+    // (An `Ldar` of the register holding the field leaves the same state as
+    // the load did.)
+    for (k, r) in reuse {
+        let i = out.insns[k];
+        out.insns[k] = synth(Op::Ldar, r, i.frame as usize, i.pc);
+        out.props[k] = Prop::None;
+    }
+}
+
+/// Whether an instruction stores no field and runs no bytecode in compiled
+/// code (see [`reuse_field_loads`]). (A conversion's `valueOf`, a getter,
+/// leave for the interpreter; an allocation's collection moves no field.)
+fn keeps_fields(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Nop
+            | Op::LdaSmi
+            | Op::LdaConstant
+            | Op::LdaUndefined
+            | Op::LdaNull
+            | Op::LdaTrue
+            | Op::LdaFalse
+            | Op::LdaHole
+            | Op::LdaGlobal
+            | Op::LdaGlobalInsideTypeof
+            | Op::LdaUpvalue
+            | Op::LdaCallee
+            | Op::LdaNewTarget
+            | Op::StaUpvalue
+            | Op::CloseUpvalue
+            | Op::CheckHole
+            | Op::GetNamed
+            | Op::GetKeyed
+            | Op::Add
+            | Op::AddSmi
+            | Op::Sub
+            | Op::SubSmi
+            | Op::Mul
+            | Op::MulSmi
+            | Op::Div
+            | Op::DivSmi
+            | Op::Mod
+            | Op::ModSmi
+            | Op::Inc
+            | Op::Dec
+            | Op::Negate
+            | Op::BitNot
+            | Op::BitAnd
+            | Op::BitAndSmi
+            | Op::BitOr
+            | Op::BitOrSmi
+            | Op::BitXor
+            | Op::ShiftLeft
+            | Op::ShiftLeftSmi
+            | Op::ShiftRight
+            | Op::ShiftRightSmi
+            | Op::ShiftRightLogical
+            | Op::ShiftRightLogicalSmi
+            | Op::ToNumber
+            | Op::ToNumeric
+            | Op::TypeOf
+            | Op::TestEqual
+            | Op::TestStrictEqual
+            | Op::TestEqualSmi
+            | Op::TestLessThan
+            | Op::TestGreaterThan
+            | Op::TestLessThanOrEqual
+            | Op::TestGreaterThanOrEqual
+            | Op::TestNull
+            | Op::TestUndefined
+            | Op::TestNullish
+            | Op::Jump
+            | Op::JumpIfTrue
+            | Op::JumpIfFalse
+            | Op::JumpIfToBooleanTrue
+            | Op::JumpIfToBooleanFalse
+            | Op::JumpIfLess
+            | Op::JumpIfLessEqual
+            | Op::JumpIfGreater
+            | Op::JumpIfGreaterEqual
+            | Op::JumpIfLessSmi
+            | Op::JumpIfLessEqualSmi
+            | Op::JumpIfGreaterSmi
+            | Op::JumpIfGreaterEqualSmi
+            | Op::JumpIfStrictEqualSmi
+            | Op::CreateObject
+            | Op::CreateArray
+            | Op::CreateClosure
+            | Op::CreateRegExp
+    )
 }
 
 /// Loads of objects that mostly stay what they are: a global's (a

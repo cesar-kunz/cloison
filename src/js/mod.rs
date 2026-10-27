@@ -163,8 +163,10 @@ pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
     let at = |pos: ast::Pos| (pos as usize).saturating_sub(prefix) as u32 + f.start;
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source(&text, &arena, skim)
-            .and_then(|p| codegen::generate_lazy(&p, 2, &f.source, &at, &f.upvalues))
+        parse::parse_source(&text, &arena, skim).and_then(|mut p| {
+            p.own_names = f.own_names.iter().map(|n| (**n).into()).collect();
+            codegen::generate_lazy(&p, 2, &f.source, &at, &f.upvalues)
+        })
     };
     match compile(true) {
         Err(e) if e.msg == codegen::SKIMMED_TOO_SOON => compile(false),

@@ -97,6 +97,9 @@ pub struct LazyFn {
     /// A named function expression's name, bound in its body.
     pub own_name: Option<std::rc::Rc<str>>,
     pub upvalues: Vec<std::rc::Rc<str>>,
+    /// Those of `upvalues` that are an enclosing named function
+    /// expression's own name: immutable (see `codegen::own_name_binding`).
+    pub own_names: Vec<std::rc::Rc<str>>,
     /// Nested in strict code.
     pub strict: bool,
 }

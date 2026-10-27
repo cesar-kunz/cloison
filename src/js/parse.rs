@@ -225,6 +225,7 @@ fn parse_pass<'a>(
             shadowed_params: std::mem::take(&mut p.shadowed_params),
             direct_eval: eval.is_some(),
             eval_locals: false,
+            own_names: Vec::new(),
             imports: std::mem::take(&mut p.imports),
             module: module.map(|_| std::mem::take(&mut p.info)),
         },

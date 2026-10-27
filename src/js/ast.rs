@@ -34,6 +34,10 @@ pub struct Program<'a> {
     /// Strict indirect `eval`'s code: its `var`s and functions are its
     /// own, not globals.
     pub eval_locals: bool,
+    /// A lazily compiled function's: the upvalues that are an enclosing
+    /// named function expression's own name (`asm::LazyFn::own_names`),
+    /// parameters of the wrapper `js::compile_lazy` makes, but immutable.
+    pub own_names: Vec<Name>,
     /// A module's imported bindings, by their new names (see
     /// [`Import`]).
     pub imports: std::collections::HashMap<Name, Import>,

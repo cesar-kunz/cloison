@@ -69,7 +69,7 @@
 //! to `acc`, boxed. Stencils reading an int32 `acc` use only its low 32
 //! bits, so a boxed int32 is a valid int32 `acc` too.
 
-#![feature(explicit_tail_calls, rust_preserve_none_cc)]
+#![feature(explicit_tail_calls, rust_preserve_none_cc, likely_unlikely)]
 #![cfg_attr(target_arch = "x86_64", feature(asm_goto_with_outputs))]
 #![allow(incomplete_features, non_snake_case, unused_unsafe, clippy::missing_safety_doc)]
 
@@ -5958,6 +5958,20 @@ stencil!("unbox_num_acc"; |s| {
 
 // ---- Calls ----
 
+/// After a call whose result is `$r`: leave if it is `EMPTY` (an error) or
+/// the VM's code epoch (at `imm64b`) isn't `imm` anymore (the callee
+/// changed something the code assumes), `acc` holding the result. (Not
+/// `cmp dword [m], imm32` by `asm goto`: in a stencil making a runtime
+/// call, it made LLVM move the `push` aligning the stack for the call into
+/// the exit's block, and the runtime ran on a misaligned stack.)
+macro_rules! leave_after_call {
+    ($s:ident, $r:expr) => {{
+        if $r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
+            exit!($s)
+        }
+    }};
+}
+
 // A call through the runtime (`cloison_rt_call`), described by the call site
 // at `imm64`; the callee's arguments are in memory (the JIT spills them).
 // The runtime returns `EMPTY` on an error: leave, and the run ends. If the
@@ -5970,9 +5984,7 @@ stencil!("call"; |s| {
     let r = Value::from_bits(rt_call!(s, cloison_rt_call, regs, Value::from_bits(imm64())));
     s.acc = r;
     // The exit is after the call: `acc` holds the result.
-    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-        exit!(s)
-    }
+    leave_after_call!(s, r);
     next!(s)
 });
 
@@ -6026,20 +6038,22 @@ stencil!("call_direct"; |s| {
     let site = imm64() as *const DirectSite;
     let base = s.regs as *const u8;
     let f = *(base.add((*site).f_off as usize) as *const u64);
-    let r = if (*site).entry != 0
-        && f == (*site).closure
-        && base as u64 + (*site).end_off <= (*site).stack_end
-    {
-        Value::from_bits(rt_call_enter!(s, cloison_rt_enter, regs, Value::from_bits(site as u64)))
-    } else if let Some(d) = dispatched(site, f, base) {
+    // The site to enter by (one call, the fall-through), else the runtime.
+    let d = if core::hint::likely(
+        (*site).entry != 0 && f == (*site).closure && base as u64 + (*site).end_off <= (*site).stack_end,
+    ) {
+        Some(site)
+    } else {
+        dispatched(site, f, base)
+    };
+    let r = if let Some(d) = d {
         Value::from_bits(rt_call_enter!(s, cloison_rt_enter, regs, Value::from_bits(d as u64)))
     } else {
+        core::hint::cold_path();
         Value::from_bits(rt_call!(s, cloison_rt_call, regs, Value::from_bits(site as u64)))
     };
     s.acc = r;
-    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-        exit!(s)
-    }
+    leave_after_call!(s, r);
     next!(s)
 });
 
@@ -6048,30 +6062,36 @@ stencil!("call_direct"; |s| {
 // the function making it. The callee register must hold a bytecode
 // function (`Class::Function`) of that code (`code`); its frame's
 // header gets it (`set_frame_func_r`).
-// target x86_64 call_direct_code: 32 now 50 the direct call as the fall-through (LLVM lays the runtime call there; 34 executed), the epoch by `cmp dword [r10], imm32` (judged 2026-10-26)
-// target aarch64 call_direct_code: 36 now 52 the direct call as the fall-through (39 executed), `tst; ccmp; b.eq` for null-or-not-a-cell, an epoch in 16 bits (judged 2026-10-26)
+// target x86_64 call_direct_code: 26 now 27 the direct call as the fall-through, to its `jmp` to the result's test (6 more there: `test; je exit; movabs; cmp dword [r10], imm32; jne exit; mov r12, rax`; now the epoch's immediate through a register); 32 judged 2026-10-26 counting those, when LLVM laid the runtime call first, 50
+// target aarch64 call_direct_code: 26 now 30 the direct call as the fall-through, to its `b` to the result's test, `tst; ccmp; b.eq` for null-or-not-a-cell (36 judged 2026-10-26 counting the test, an epoch in 16 bits saving one there, when LLVM laid the runtime call first, 52)
 stencil!("call_direct_code"; |s| {
     let regs = Value::from_bits(s.regs as u64);
     let site = imm64() as *const DirectSite;
     let base = s.regs as *const u8;
     let f = *(base.add((*site).f_off as usize) as *const u64);
-    let function = f != 0 && is_cell(s.tag, Value::from_bits(f)) && (*header(f as *const u8)).class == class::FUNCTION;
+    let function = f != 0 && is_cell_g(s.tag, Value::from_bits(f)) && (*header(f as *const u8)).class == class::FUNCTION;
     let code = if function { (*header(f as *const u8)).code } else { 0 };
-    let r = if (*site).entry != 0
-        && function
-        && code == (*site).closure
-        && base as u64 + (*site).end_off <= (*site).stack_end
-    {
-        Value::from_bits(rt_call_enter!(s, cloison_rt_enter, regs, Value::from_bits(site as u64)))
-    } else if function && let Some(d) = dispatched(site, code, base) {
+    // The site to enter by (one call, the fall-through), else the runtime.
+    let d = if core::hint::likely(
+        (*site).entry != 0
+            && function
+            && code == (*site).closure
+            && base as u64 + (*site).end_off <= (*site).stack_end,
+    ) {
+        Some(site)
+    } else if function {
+        dispatched(site, code, base)
+    } else {
+        None
+    };
+    let r = if let Some(d) = d {
         Value::from_bits(rt_call_enter!(s, cloison_rt_enter, regs, Value::from_bits(d as u64)))
     } else {
+        core::hint::cold_path();
         Value::from_bits(rt_call!(s, cloison_rt_call, regs, Value::from_bits(site as u64)))
     };
     s.acc = r;
-    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-        exit!(s)
-    }
+    leave_after_call!(s, r);
     next!(s)
 });
 
@@ -6084,12 +6104,11 @@ stencil!("call_direct_nc"; |s| {
     let r = if (*site).entry != 0 && base as u64 + (*site).end_off <= (*site).stack_end {
         Value::from_bits(rt_call_enter!(s, cloison_rt_enter, regs, Value::from_bits(site as u64)))
     } else {
+        core::hint::cold_path();
         Value::from_bits(rt_call!(s, cloison_rt_call, regs, Value::from_bits(site as u64)))
     };
     s.acc = r;
-    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-        exit!(s)
-    }
+    leave_after_call!(s, r);
     next!(s)
 });
 
@@ -6099,9 +6118,7 @@ stencil!("call_direct_nc"; |s| {
 // target aarch64 call_done: 8 now 9 an epoch in 16 bits (`_k16`) saves one (docs/arm64-targets.md)
 // target x86_64 call_done: 5 now 6 `test r12, r12; je exit; movabs rax, epoch; cmp dword [rax], imm32; jne exit` (judged 2026-10-26)
 stencil!("call_done"; |s| {
-    if s.acc.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-        exit!(s)
-    }
+    leave_after_call!(s, s.acc);
     next!(s)
 });
 
@@ -6146,15 +6163,15 @@ stencil!("construct_direct"; |s| {
                 Value::from_bits(p as u64)
             }
         } else {
+            core::hint::cold_path();
             Value::from_bits(rt_call!(s, cloison_rt_construct, regs, Value::from_bits(site as u64)))
         }
     } else {
+        core::hint::cold_path();
         Value::from_bits(rt_call!(s, cloison_rt_call, regs, Value::from_bits(site as u64)))
     };
     s.acc = r;
-    if r.to_bits() == 0 || *(imm64b() as *const u32) != imm() as u32 {
-        exit!(s)
-    }
+    leave_after_call!(s, r);
     next!(s)
 });
 

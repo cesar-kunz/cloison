@@ -2886,9 +2886,10 @@ use crate::layout::CONS_MIN;
 fn concat_fast(a: Value, b: Value) -> Option<Value> {
     // (Taken only for strings: a test may add other values with no VM.)
     let vm = || unsafe { &mut *current_vm() };
-    // A word more than the units need: the last word copied may run past
-    // the end.
-    let words = |len: usize| len.div_ceil(4) + 1;
+    // The words the copies write: `copy_words` whole words from where it
+    // starts (up to three units past its end), `write_int` its digits
+    // exactly.
+    let words = |units: usize| units.div_ceil(4);
     // A long result is a cons string (see `Vm::new_cons`): the pieces not
     // copied, nor flattened. (A cons piece is that long itself, so a short
     // result's pieces are flat.) An empty side leaves the other as it is
@@ -2903,7 +2904,7 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
             if len >= CONS_MIN {
                 return Some(vm().new_cons(a, b));
             }
-            Some(vm().new_string_raw(len, words(len), |out| unsafe {
+            Some(vm().new_string_raw(len, words(m + n.next_multiple_of(4)), |out| unsafe {
                 copy_words(out, x, m);
                 copy_words(out.add(m), y, n);
             }))
@@ -2916,7 +2917,7 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
                 return Some(vm().new_cons(a, d));
             }
             // The copy may run into the digits' units: they come after.
-            Some(vm().new_string_raw(len, words(len), |out| unsafe {
+            Some(vm().new_string_raw(len, words(m.next_multiple_of(4).max(len)), |out| unsafe {
                 copy_words(out, x, m);
                 write_int(out.add(m), i, n);
             }))
@@ -2928,7 +2929,7 @@ fn concat_fast(a: Value, b: Value) -> Option<Value> {
                 let d = int_string(vm(), i);
                 return Some(vm().new_cons(d, b));
             }
-            Some(vm().new_string_raw(len, words(len), |out| unsafe {
+            Some(vm().new_string_raw(len, words(n + m.next_multiple_of(4)), |out| unsafe {
                 write_int(out, i, n);
                 copy_words(out.add(n), y, m);
             }))
@@ -2951,7 +2952,7 @@ fn raw_units(v: Value) -> Option<(*const u16, usize)> {
 /// `i`'s decimal string.
 fn int_string(vm: &mut Vm, i: i32) -> Value {
     let n = int_len(i);
-    vm.new_string_raw(n, n.div_ceil(4) + 1, |out| unsafe { write_int(out, i, n) })
+    vm.new_string_raw(n, n.div_ceil(4), |out| unsafe { write_int(out, i, n) })
 }
 
 /// The units of `i`'s decimal form: its digits, and a sign.

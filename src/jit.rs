@@ -4635,7 +4635,22 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         Op::JumpIfToBooleanFalse => ("jtofalse", num_case(st.acc)),
         // Property accesses. A receiver known to be a number has no
         // properties the cache could describe, one no definition reaches
-        // may share an int32's slot: leave them to the interpreter.
+        // may share an int32's slot: leave them to the interpreter. But a
+        // load given up on goes through the runtime, which reads a
+        // number's prototype (TypeScript's `emit` exited at every entry
+        // there, its receiver typed int32 at some call).
+        Op::GetNamed
+            if matches!(reg, I32 | F64)
+                && spec.props.get(i) == Some(&Prop::Runtime)
+                && let Some(fbs) = spec.feedback =>
+        {
+            out.acc = Any;
+            let name = fbs[insn.ic_frame()].name(insn).0 as u64;
+            return Sel {
+                ops: Some((0, name, megas_addr())),
+                ..Sel::new("get_named_rt", "", out)
+            };
+        }
         Op::GetNamed | Op::SetNamed | Op::GetKeyed | Op::SetKeyed
             if matches!(reg, I32 | F64 | Ty::Bot) =>
         {
@@ -5195,6 +5210,32 @@ fn soften(insn: &Insn, st: &TypeState, spec: &Spec, mut sel: Sel) -> Sel {
 }
 
 /// [`select_property`] as the cache says, whatever it held before.
+/// `reg.name = acc` through the runtime (`set_named_rt`), `out` the state
+/// before it. The store may change the receiver's shape (only: it leaves
+/// where it would call a setter, or store to a prototype), so values that
+/// may be the receiver, exact, become lower bounds; others stay exact
+/// (TypeScript's scanner, stores to its tokens through the runtime made
+/// its `this` lower bound, and calls to `innerScan` from there took a
+/// version of their own it had no compilations left for: it ran
+/// interpreted).
+fn named_rt_store(mut out: TypeState, reg: Ty, acc: Ty, name: crate::object::Atom) -> Sel {
+    let may_be_receiver = |x: u64| match reg {
+        Ty::Obj(r) => r == x,
+        Ty::Ext(r) => unsafe { extends(x as *const Shape, r as *const Shape) },
+        _ => true,
+    };
+    let ext = |t: Ty| match t {
+        Ty::Obj(x) if may_be_receiver(x) => Ty::Ext(x),
+        t => t,
+    };
+    out.regs.map(|_, t| ext(t));
+    out.acc = ext(out.acc);
+    Sel {
+        ops: Some((0, name.0 as u64, mega_stores_addr())),
+        ..Sel::new("set_named_rt", if acc == Ty::I32 { "i" } else { "" }, out)
+    }
+}
+
 fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
     use Ty::{Any, F64, I32};
     let mut out = st.clone();
@@ -5333,20 +5374,22 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 .lookup(fb.name(insn))
                 .filter(|&k| shape.attrs()[k as usize] & crate::object::ACCESSOR == 0)
             {
-                // A store to a read-only property does nothing, one to a
-                // prototype's (a unique shape's) must bump the epoch, and one
-                // to a function's constant field may have to make it mutable
-                // (see `Vm::store_field`): left to the interpreter. (The
-                // global object isn't a register's.) Other objects' fields
-                // stores make mutable, as caching them does.
+                // A store to a read-only property does nothing: left to
+                // the interpreter. One to a prototype's (a unique shape's)
+                // must bump the epoch, and one to a function's constant
+                // field may have to make it mutable (see `Vm::store_field`):
+                // through the runtime, which leaves where an epoch moves
+                // (Box2D stored the `NaN` a function's field held at every
+                // call, and exited there). (The global object isn't a
+                // register's.) Other objects' fields stores make mutable, as
+                // caching them does.
                 let cell = shape.field_cell(slot);
                 let function = shape.class == crate::object::Class::Function;
-                if !load
-                    && (shape.attrs()[slot as usize] & crate::object::READ_ONLY != 0
-                        || shape.unique
-                        || (function && cell.is_constant()))
-                {
+                if !load && shape.attrs()[slot as usize] & crate::object::READ_ONLY != 0 {
                     return bail(out);
+                }
+                if !load && (shape.unique || function && cell.is_constant()) {
+                    return named_rt_store(out, reg, st.acc, fb.name(insn));
                 }
                 if !load && cell.is_constant() {
                     unsafe { (*crate::interp::current_vm()).field_made_mutable(cell) };
@@ -5389,38 +5432,20 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             _ => (prop, false),
         };
         // A site that gave up on the stencils: through the runtime, the name
-        // an operand. A store may change the receiver's shape (only: it
-        // leaves where it would call a setter, or store to a prototype),
-        // so values that may be the receiver, exact, become lower bounds;
-        // others stay exact (TypeScript's scanner, stores to its tokens
-        // through the runtime made its `this` lower bound, and calls to
-        // `innerScan` from there took a version of their own it had no
-        // compilations left for: it ran interpreted).
+        // an operand (a store: `named_rt_store`).
         if prop == Prop::Runtime
             && matches!(insn.op, Op::GetNamed | Op::SetNamed)
             && let Some(fbs) = spec.feedback
         {
-            let name = fbs[insn.ic_frame()].name(insn).0 as u64;
-            let sel = if load {
-                out.acc = Any;
-                Sel::new("get_named_rt", "", out)
-            } else {
-                let may_be_receiver = |x: u64| match reg {
-                    Ty::Obj(r) => r == x,
-                    Ty::Ext(r) => unsafe { extends(x as *const Shape, r as *const Shape) },
-                    _ => true,
-                };
-                let ext = |t: Ty| match t {
-                    Ty::Obj(x) if may_be_receiver(x) => Ty::Ext(x),
-                    t => t,
-                };
-                out.regs.map(|_, t| ext(t));
-                out.acc = ext(out.acc);
-                Sel::new("set_named_rt", if st.acc == I32 { "i" } else { "" }, out)
-            };
+            let name = fbs[insn.ic_frame()].name(insn);
+            if !load {
+                return named_rt_store(out, reg, st.acc, name);
+            }
+            let name = name.0 as u64;
+            out.acc = Any;
             return Sel {
-                ops: Some((0, name, if load { megas_addr() } else { mega_stores_addr() })),
-                ..sel
+                ops: Some((0, name, megas_addr())),
+                ..Sel::new("get_named_rt", "", out)
             };
         }
         // Several shapes: one of them if the receiver's is known, else a
@@ -6662,6 +6687,12 @@ fn stencil_for(
         ("get_keyed_rt", _) => {
             box_acc(&mut pre);
             cat!("get_keyed_rt_", loc)
+        }
+        // A number's receiver in an int32 or FP slot: boxed into its
+        // memory, which the interpreter would read as well.
+        ("get_named_rt", Home::Int(_) | Home::Fpr(_)) => {
+            pre.extend(spill_piece(home, insn.reg));
+            "get_named_rt_m".into()
         }
         ("get_named_rt", _) => cat!("get_named_rt_", loc),
         ("set_named_rt", _) => {

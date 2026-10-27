@@ -232,6 +232,11 @@ fn generate_from<'p>(
                         end: at(f.end),
                         own_name: f.name.clone().filter(|_| f.binds_name),
                         upvalues: scopes.upvalues[i].iter().map(|&n| n.into()).collect(),
+                        own_names: scopes.upvalues[i]
+                            .iter()
+                            .filter(|n| own_name_binding(p, i, n))
+                            .map(|&n| n.into())
+                            .collect(),
                         strict: f.strict,
                     }),
                     kind: function_kind(f),
@@ -1088,6 +1093,48 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
         stmt(s, p, &mut out);
     }
     out
+}
+
+/// Whether `name` in function `index` is a named function expression's
+/// own name: the function's, or an enclosing one's, with no parameter or
+/// `var` of that name in it or in the functions between. (The function by
+/// the name found first, by names alone: compiling stores it is on.) In a
+/// lazily compiled function, one of its wrapper's parameters may be (see
+/// `Program::own_names`).
+fn own_name_binding(p: &Program, index: usize, name: &str) -> bool {
+    let named = |g: usize| {
+        let f = &p.functions[g];
+        f.binds_name && f.name.as_deref() == Some(name)
+    };
+    let mut g = index;
+    let top = loop {
+        if g == 0 {
+            return false;
+        }
+        if named(g) {
+            break Some(g);
+        }
+        match p.functions[g].parent {
+            // `js::compile_lazy`'s wrapper, the upvalues its parameters.
+            Some(0) if p.own_names.iter().any(|n| &**n == name) => break None,
+            Some(q) => g = q,
+            None => return false,
+        }
+    };
+    let mut g = index;
+    loop {
+        let f = &p.functions[g];
+        if Some(g) == top {
+            return !f.params.iter().any(|p| &**p == name) && !explicit_declarations(p, g).contains(&name);
+        }
+        if top.is_none() && f.parent == Some(0) {
+            return true;
+        }
+        if f.params.iter().any(|p| &**p == name) || explicit_declarations(p, g).contains(&name) {
+            return false;
+        }
+        g = f.parent.unwrap();
+    }
 }
 
 /// The name a named function expression `f` binds in its body, if it or a
@@ -3420,39 +3467,8 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    /// Whether `name` here is a named function expression's own name: the
-    /// function's, or an enclosing one's, with no parameter or `var` of
-    /// that name in it or in the functions between. (The function by the
-    /// name found first, by names alone: compiling stores it is on.)
     fn own_name_binding(&self, name: &str) -> bool {
-        let named = |g: usize| {
-            let f = &self.p.functions[g];
-            f.binds_name && f.name.as_deref() == Some(name)
-        };
-        let mut g = self.index;
-        let top = loop {
-            if g == 0 {
-                return false;
-            }
-            if named(g) {
-                break g;
-            }
-            match self.p.functions[g].parent {
-                Some(q) => g = q,
-                None => return false,
-            }
-        };
-        let mut g = self.index;
-        loop {
-            let f = &self.p.functions[g];
-            if f.params.iter().any(|p| &**p == name) || explicit_declarations(self.p, g).contains(&name) {
-                return false;
-            }
-            if g == top {
-                return true;
-            }
-            g = f.parent.unwrap();
-        }
+        own_name_binding(self.p, self.index, name)
     }
 
     /// Store the accumulator in variable `name`: a `const` throws, a

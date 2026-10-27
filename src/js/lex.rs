@@ -772,31 +772,65 @@ fn string(s: &str) -> Option<(String, usize)> {
             return Some((t.to_string(), k + 2));
         }
     }
-    let mut out: Vec<u16> = Vec::new();
+    // With escapes: the runs between them copied at once, straight into
+    // the string `units_to_string` would make of the code units (a
+    // character at a time, through UTF-16, was a fifth of TypeScript's
+    // loading). An escaped high surrogate waits for an escaped low one.
+    let mut out = String::new();
+    let (mut units, mut high) = (Vec::with_capacity(2), None::<u16>);
+    let lone = |u: u16| char::from_u32(LONE_SURROGATES + (u as u32 - 0xD800)).unwrap();
     let mut i = 1;
-    while i < b.len() {
-        let c = b[i];
-        if c == quote {
-            return Some((units_to_string(&out), i + 1));
+    loop {
+        let k = b[i..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r')?;
+        if k > 0 {
+            if let Some(h) = high.take() {
+                out.push(lone(h));
+            }
+            let run = &s[i..i + k];
+            // (Characters to escape start with byte 0xEF or more: see `ESCAPE`.)
+            if run.bytes().any(|c| c >= 0xEF) {
+                run.chars().for_each(|c| push_source_char(&mut out, c));
+            } else {
+                out.push_str(run);
+            }
+            i += k;
         }
-        match c {
-            b'\n' | b'\r' => return None,
+        match b[i] {
+            c if c == quote => {
+                if let Some(h) = high.take() {
+                    out.push(lone(h));
+                }
+                return Some((out, i + 1));
+            }
             b'\\' => {
-                let (ok, n) = escape(s, i, &mut out);
+                units.clear();
+                let (ok, n) = escape(s, i, &mut units);
                 if !ok {
                     return None;
                 }
                 i += n;
+                for &u in &units {
+                    match (high.take(), u) {
+                        (Some(h), 0xDC00..=0xDFFF) => {
+                            let c = 0x10000 + ((h as u32 - 0xD800) << 10) + (u as u32 - 0xDC00);
+                            push_source_char(&mut out, char::from_u32(c).unwrap());
+                        }
+                        (h, _) => {
+                            if let Some(h) = h {
+                                out.push(lone(h));
+                            }
+                            match u {
+                                0xD800..=0xDBFF => high = Some(u),
+                                0xDC00..=0xDFFF => out.push(lone(u)),
+                                _ => push_source_char(&mut out, char::from_u32(u as u32).unwrap()),
+                            }
+                        }
+                    }
+                }
             }
-            _ => {
-                let ch = s[i..].chars().next()?;
-                let mut buf = [0; 2];
-                out.extend_from_slice(ch.encode_utf16(&mut buf));
-                i += ch.len_utf8();
-            }
+            _ => return None,
         }
     }
-    None
 }
 
 /// The escape sequence at `s[i..]` (at its `\`): its code units onto

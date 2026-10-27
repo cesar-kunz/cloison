@@ -6971,6 +6971,14 @@ impl Fusion<'_> {
         if let Some(f) = self.slot_from_acc(i) {
             return Some(f);
         }
+        // Not over a code-less `Ldar` (see `Lowering::drop_setup`).
+        let n = self.insns.len();
+        if (i..(i + 4).min(n)).any(|j| self.insns[j].check_only && self.insns[j].op == Op::Ldar) {
+            return None;
+        }
+        if let Some(f) = self.add_chain(i, self.widened?) {
+            return Some(f);
+        }
         let f = self.at_any(i)?;
         let mut seen: Vec<((bool, u8), u8)> = Vec::new();
         for insn in &self.insns[i..i + f.len] {
@@ -6993,14 +7001,6 @@ impl Fusion<'_> {
 
     fn at_any(&self, i: usize) -> Option<Fused> {
         let widened = self.widened?;
-        // Not over a code-less `Ldar` (see `Lowering::drop_setup`).
-        let n = self.insns.len();
-        if (i..(i + 4).min(n)).any(|j| self.insns[j].check_only && self.insns[j].op == Op::Ldar) {
-            return None;
-        }
-        if let Some(f) = self.add_chain(i, widened) {
-            return Some(f);
-        }
         if let Some(f) = self.compare_jump(i) {
             return Some(f);
         }
@@ -7537,11 +7537,14 @@ impl Fusion<'_> {
     }
 
     /// `ldar a; add b1; …; add bn; star c` (n ≥ 1) as `c = a` (a slot move,
-    /// skipped when `c == a`) followed by in-place `c += b_k` stencils.
+    /// skipped when `c` is `a` or shares its slot) followed by in-place `c +=
+    /// b_k` stencils. With `c` an int32 slot, any of the adds may be a `mul`
+    /// (`c = c * b_k`, `mul_into_u<c>_u<b_k>`, or `_m` with `b_k` in memory).
     ///
     /// If add k overflows, its stencil exits with the wrapped sum in `c`; the
     /// exit stub undoes it, so `c` holds `a + b1 + … + b(k-1)`, the
-    /// interpreter's `acc` before add k, and rematerializes `acc` from it.
+    /// interpreter's `acc` before add k, and rematerializes `acc` from it. A
+    /// `mul` writes `c` only with its product, so it needs no undo.
     /// `c` itself is dead there (the pending `star c` overwrites it), which
     /// requires that no `b_k` is `c`: that add would read `c`'s original
     /// value. With `c` in an FP slot the chain is computed in double from the
@@ -7554,7 +7557,7 @@ impl Fusion<'_> {
         }
         let mut j = i + 1;
         while j < insns.len()
-            && insns[j].op == Op::Add
+            && matches!(insns[j].op, Op::Add | Op::Mul)
             && !self.is_target[j]
             && self.ins[j].is_some()
         {
@@ -7571,7 +7574,10 @@ impl Fusion<'_> {
         }
         let (a, c) = (insns[i].reg as usize, insns[j].reg as usize);
         let adds = i + 1..j;
-        if adds.clone().any(|k| insns[k].reg as usize == c) {
+        // Matched by slot (before `Fusion::at`'s check of registers sharing
+        // one): `a` may share `c`'s, read before `c` is written, but no
+        // `b_k` may.
+        if adds.clone().any(|k| self.homes[insns[k].reg as usize] == self.homes[c]) {
             return None;
         }
         let reg_ty = |k: usize, r: usize| self.ins[k].as_ref().map(|st| st.regs[r]);
@@ -7586,7 +7592,7 @@ impl Fusion<'_> {
         };
         match self.homes[c] {
             Home::Int(cs) => {
-                if a != c {
+                if self.homes[a] != self.homes[c] {
                     let Home::Int(as_) = self.homes[a] else {
                         return None;
                     };
@@ -7595,21 +7601,30 @@ impl Fusion<'_> {
                 for k in adds {
                     let b = insns[k].reg as usize;
                     let st = self.ins[k].as_ref()?;
-                    let Home::Int(bs) = self.homes[b] else {
-                        return None;
-                    };
                     if st.acc != Ty::I32 || st.regs[b] != Ty::I32 || widened.contains(&k) {
                         return None;
                     }
-                    let undo = (format!("undo_addr_u{cs}_u{bs}"), 0);
-                    steps.push(step(format!("addr_ii_u{cs}_u{bs}"), k, Some(undo)));
+                    match (insns[k].op, self.homes[b]) {
+                        (Op::Add, Home::Int(bs)) => {
+                            let undo = (format!("undo_addr_u{cs}_u{bs}"), 0);
+                            steps.push(step(format!("addr_ii_u{cs}_u{bs}"), k, Some(undo)));
+                        }
+                        (Op::Mul, Home::Int(bs)) => {
+                            steps.push(step(format!("mul_into_u{cs}_u{bs}"), k, None));
+                        }
+                        (Op::Mul, Home::Mem) => steps.push(FusedStep {
+                            reg: b as u8,
+                            ..step(format!("mul_into_u{cs}_m"), k, None)
+                        }),
+                        _ => return None,
+                    }
                 }
             }
             Home::Fpr(cs) => {
-                if self.ins[j].as_ref()?.acc != Ty::F64 {
+                if self.ins[j].as_ref()?.acc != Ty::F64 || adds.clone().any(|k| insns[k].op != Op::Add) {
                     return None;
                 }
-                if a != c {
+                if self.homes[a] != self.homes[c] {
                     let name = match (self.homes[a], reg_ty(i, a)?) {
                         (Home::Fpr(as_), Ty::F64) => format!("mov_f{cs}_f{as_}"),
                         (Home::Int(as_), Ty::I32) => format!("mov_f{cs}_u{as_}"),

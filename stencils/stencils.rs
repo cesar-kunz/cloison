@@ -2174,6 +2174,75 @@ macro_rules! int_slot_from_acc {
     };
 }
 
+/// `c = c * x` on an int32 slot, `x` int32, in a scratch register (`mov eax,
+/// edi; imul eax, x; jo exit; test eax, eax; jz slow; mov edi, eax`): the
+/// slot is written only with the product, so an exit finds `acc` there still,
+/// the instruction's operand in a fused chain (`Fusion::add_chain`). A zero
+/// product is -0 if a factor is negative: the slow path exits then.
+macro_rules! mul_into_fast {
+    ($s:ident, $c:tt, $x:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut v = raw($s.g[$c]);
+            core::arch::asm!(
+                "imul {v:e}, {x:e}",
+                "{{disp32}} jo {ovf}",
+                "test {v:e}, {v:e}",
+                "{{disp32}} jz {zero}",
+                v = inout(reg) v,
+                x = in(reg) $x,
+                ovf = label { unsafe { exit!($s) } },
+                zero = label { unsafe { slow!($s) } },
+                options(nomem, nostack),
+            );
+            $s.g[$c] = unboxed(v);
+            next!($s)
+        }
+        #[cfg(target_arch = "aarch64")]
+        match raw($s.g[$c]).checked_mul($x) {
+            Some(0) => slow!($s),
+            Some(v) => {
+                $s.g[$c] = unboxed(v);
+                next!($s)
+            }
+            None => exit!($s),
+        }
+    }};
+}
+
+macro_rules! int_slot_mul_into {
+    ($k:tt) => {
+        // target x86_64 mul_into_u{}_m: 7 `mov eax, edi; imul eax, [r13+k]; jo exit; test eax, eax; je slow; mov edi, eax` with the load apart (judged 2026-10-27)
+        stencil_slow!("mul_into_u", $k, "_m"; |s| {
+            mul_into_fast!(s, $k, int(load_m(s.regs)))
+        }; |s| {
+            core::arch::asm!(concat!("/* mul_into_u", $k, "_m */"), options(nomem, nostack, preserves_flags));
+            if (raw(s.g[$k]) | int(load_m(s.regs))) < 0 {
+                exit!(s)
+            }
+            s.g[$k] = unboxed(0);
+            next!(s)
+        });
+    };
+}
+
+macro_rules! int_slot_mul_pair {
+    ($c:tt, $b:tt) => {
+        // target x86_64 mul_into_u{}_u{}: 6 `mov eax, edi; imul eax, esi; jo exit; test eax, eax; je slow; mov edi, eax` (judged 2026-10-27)
+        // target aarch64 mul_into_u{}_u{}: 5 `smull x8, w24, w25; cmp x8, w8, sxtw; b.ne exit; cbz w8, slow; mov w24, w8` (judged 2026-10-27)
+        stencil_slow!("mul_into_u", $c, "_u", $b; |s| {
+            mul_into_fast!(s, $c, raw(s.g[$b]))
+        }; |s| {
+            core::arch::asm!(concat!("/* mul_into_u", $c, "_u", $b, " */"), options(nomem, nostack, preserves_flags));
+            if (raw(s.g[$c]) | raw(s.g[$b])) < 0 {
+                exit!(s)
+            }
+            s.g[$c] = unboxed(0);
+            next!(s)
+        });
+    };
+}
+
 macro_rules! fp_int_slot_pair {
     ($a:tt, $b:tt) => {
         stencil!("addr_fi_f", $a, "_u", $b; |s| {
@@ -2185,6 +2254,8 @@ macro_rules! fp_int_slot_pair {
 
 with_gprs!(each_gpr! int_slot);
 with_gprs!(each_gpr! int_slot_from_acc);
+with_gprs!(each_gpr! int_slot_mul_into);
+with_gprs!(gpr_pairs! int_slot_mul_pair);
 with_gprs!(gpr_pairs! int_slot_pair);
 with_gprs!(fp_gpr_pairs! fp_int_slot_pair);
 

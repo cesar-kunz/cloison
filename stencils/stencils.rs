@@ -2803,16 +2803,27 @@ macro_rules! fast_rel {
 /// class byte, at 8, is 4 for a string).
 #[inline(always)]
 unsafe fn loose_eq_fast(tag: NumberTag, l: Value, r: Value) -> Option<bool> {
-    if l == r && !tag.is_double(l) {
-        return Some(true);
+    // Plain branches, each case decided where it is known (LLVM made the
+    // conditions branch-free and tested the cells' tags twice).
+    if l == r {
+        if !tag.is_double(l) {
+            return Some(true);
+        }
+        core::hint::cold_path();
+        return None;
     }
     if nullish(l) || nullish(r) {
         return Some(nullish(l) && nullish(r));
     }
-    // Two objects are equal only if the same; a primitive cell (a string,
-    // a symbol, a BigInt) may equal another value.
+    // A number, a boolean or undefined against another value may be equal
+    // after conversion.
+    if (l.to_bits() | r.to_bits()) & (tag.to_bits() | Value::OTHER_TAG) != 0 {
+        return None;
+    }
+    // Two cells. Two objects are equal only if the same; a primitive cell
+    // (a string, a symbol, a BigInt) may equal another value.
     let object = |v: Value| unsafe { !matches!((*cell(v)).class, class::STRING | class::SYMBOL | class::BIGINT) };
-    if is_cell(tag, l) && is_cell(tag, r) && object(l) && object(r) {
+    if object(l) && object(r) {
         return Some(false);
     }
     None
@@ -2874,18 +2885,22 @@ macro_rules! slow_rel {
 
 macro_rules! cmp_boxed {
     ($loc:tt, $rel:ident, $act:ident, $name:literal) => {
-        // target x86_64 teq_j?_g{}: 6 now 37 the int32 case falling through, `mov rax, rsi; and rax, r12; cmp rax, r14; jb other; cmp esi, r12d; je L`, the rest (`loose_eq_fast`) out of line (judged 2026-10-26)
-        // target x86_64 teq_j?_m: 6 now 38 as `teq_j?_g{}` with `mov rax, r12; and rax, [r13+k]` (judged 2026-10-26)
-        // target aarch64 teq_j?_g{}: 5 now 33 `and x8, x24, x20; cmp x8, x22; b.lo other; cmp w24, w20; b.eq L`, the rest out of line (judged 2026-10-26)
-        // target aarch64 teq_j?_m: 6 now 34 `ldr`, then as `teq_j?_g{}` (judged 2026-10-26)
+        // target x86_64 teq_jt_g{}: 6 fallthrough 13 the int32 case: `mov rax, rsi; and rax, r12; cmp rax, r14; jae int` then `int: cmp esi, r12d; je L`, laid out after equal bits (the fall-through, 13); two objects 30 (`loose_eq_fast` in plain branches; was 37, 2026-10-27)
+        // target x86_64 teq_jf_g{}: 6 fallthrough 12 as `teq_jt_g{}` (2026-10-27)
+        // target x86_64 teq_jt_m: 6 fallthrough 14 as `teq_jt_g{}` with `mov rax, r12; and rax, [r13+k]` (2026-10-27)
+        // target x86_64 teq_jf_m: 6 fallthrough 13 (2026-10-27)
+        // target aarch64 teq_jt_g{}: 5 fallthrough 9 `and x8, x24, x20; cmp x8, x22; b.lo other; cmp w24, w20; b.eq L`, the int32 case laid out after equal bits (the fall-through, 9) (2026-10-27)
+        // target aarch64 teq_jf_g{}: 5 fallthrough 8 (2026-10-27)
+        // target aarch64 teq_jt_m: 6 fallthrough 10 `ldr`, then as `teq_jt_g{}` (2026-10-27)
+        // target aarch64 teq_jf_m: 6 fallthrough 9 (2026-10-27)
         // target x86_64 tlt_jf_g{}: 6 `mov rax, rsi; and rax, r12; cmp rax, r14; jb slow; cmp esi, r12d; jge L` (judged 2026-10-26)
         // target x86_64 tlt_jf_m: 6 now 7 as `tlt_jf_g{}` with `mov rax, r12; and rax, [r13+k]` (a `mov` copy; judged 2026-10-26)
         // target aarch64 tlt_jf_g{}: 5 `and x8, x24, x20; cmp x8, x22; b.lo slow; cmp w24, w20; b.ge L` (judged 2026-10-26)
         // target aarch64 tlt_jf_m: 6 `ldr`, then as `tlt_jf_g{}` (judged 2026-10-26)
-        // target x86_64 test_eq_m: 9 now 40 `mov rax, [r13+k]; mov r10, rax; and r10, r12; cmp r10, r14; jb other; xor; cmp eax, r12d; sete; lea r12, [r10+6]`: the int32 path is out of line now, the counted one is objects' (27 by hand) (judged 2026-10-26)
-        // target x86_64 test_eq_g{}: 8 now 39 as test_eq_m without the load: the int32 path is out of line now (judged 2026-10-26)
-        // target aarch64 test_eq_m: 7 now 37 `ldr; and; cmp; b.lo other; cmp w8, w20; mov w9, #6; cinc x20, x9, eq`: the int32 path is out of line now, the counted one is objects' (28 by hand) (judged 2026-10-26)
-        // target aarch64 test_eq_g{}: 6 now 36 as test_eq_m without the load (judged 2026-10-26)
+        // target x86_64 test_eq_m: 9 fallthrough 15 `mov rax, [r13+k]; mov r10, rax; and r10, r12; cmp r10, r14; jb other; xor; cmp eax, r12d; sete; lea r12, [r10+6]`: the int32 path out of line, the fall-through is equal bits (15) (2026-10-27)
+        // target x86_64 test_eq_g{}: 8 fallthrough 14 as test_eq_m without the load (2026-10-27)
+        // target aarch64 test_eq_m: 7 fallthrough 11 `ldr; and; cmp; b.lo other; cmp w8, w20; mov w9, #6; cinc x20, x9, eq`: the int32 path out of line, the fall-through is equal bits (11) (2026-10-27)
+        // target aarch64 test_eq_g{}: 6 fallthrough 10 as test_eq_m without the load (2026-10-27)
         stencil_slow!($name, "_", loc!($loc); |s| {
             let l = get!($loc, s);
             if s.tag.both_int32(l, s.acc) {
@@ -3229,18 +3244,34 @@ fn is_number(tag: NumberTag, v: Value) -> bool {
 /// either side, equal bits.
 macro_rules! strict_generic {
     ($name:literal, $loc:expr, $act:ident, |$s:ident| $get:expr) => {
-        // target x86_64 test_seq_m: 14 now 31 `mov rax, [r13+k]; cmp rax, r12; je eqbits; mov r10, rax; and r10, r12; cmp r10, r14; jae F; mov r10, rax; or r10, r12; test r10, r14; jnz slow; test r10b, 2; jz slow; mov r12d, 6` (judged 2026-10-26)
-        // target aarch64 test_seq_m: 12 now 21 `ldr; cmp; b.eq eqbits; and; cmp; b.hs F; orr x9, x8, x20; tst x9, x22; b.ne slow; tst x9, #2; b.eq slow; mov w20, #6` (judged 2026-10-26)
+        // target x86_64 test_seq_m: 14 fallthrough 10 the unequal path by hand (`mov rax, [r13+k]; cmp rax, r12; je eqbits; …; mov r12d, 6`); the fall-through is equal bits (10); two objects 14, a number and anything else 8 (2026-10-27)
+        // target aarch64 test_seq_m: 12 fallthrough 7 the unequal path by hand; the fall-through is equal bits (7) (2026-10-27)
         stencil_slow!($name, $loc; |$s| {
             let x = $get;
-            // Equal bits are equal but for a NaN; two int32s, or a cell and
-            // a non-cell non-number, are unequal otherwise. Two numbers may
-            // be equal as numbers, two cells as strings.
+            // Equal bits are equal but for a NaN. Otherwise: a number and
+            // anything else unequal, as are two int32s; two other numbers
+            // may be equal as numbers. Neither a number: unequal unless
+            // both are cells, and then unless both are strings or BigInts
+            // (equal by content; anything else by identity).
             let num = |v: Value| is_number($s.tag, v);
-            if x == $s.acc && !$s.tag.is_double(x) {
-                act!($act, $s, true)
+            if x == $s.acc {
+                if !$s.tag.is_double(x) {
+                    act!($act, $s, true)
+                }
+                core::hint::cold_path();
+                slow!($s)
             }
-            if $s.tag.both_int32(x, $s.acc) || (!num(x) && !num($s.acc) && !(x.is_cell() && $s.acc.is_cell())) {
+            if num(x) || num($s.acc) {
+                if !(num(x) && num($s.acc)) || $s.tag.both_int32(x, $s.acc) {
+                    act!($act, $s, false)
+                }
+                slow!($s)
+            }
+            if (x.to_bits() | $s.acc.to_bits()) & Value::OTHER_TAG != 0 {
+                act!($act, $s, false)
+            }
+            let by_content = |v: Value| unsafe { matches!((*cell(v)).class, class::STRING | class::BIGINT) };
+            if !by_content(x) || !by_content($s.acc) {
                 act!($act, $s, false)
             }
             slow!($s)
@@ -3446,11 +3477,11 @@ macro_rules! group2_generic {
         rel_generic!("jrel_", loc!($loc), jt, |s| get!($loc, s));
         rel_generic!("jnrel_", loc!($loc), jf, |s| get!($loc, s));
         strict_generic!("test_seq_", loc!($loc), test, |s| get!($loc, s));
-        // target x86_64 tseq_jt_m: 17 now 25 `mov rax, [r13+k]; cmp rax, r12; je same; mov r10, rax; and r10, r12; cmp r10, r14; jae next; ...; test r10b, 2; jz slow`: equal bits out of line, bit 1 for the mask (judged 2026-10-26)
-        // target aarch64 tseq_jt_m: 12 now 17 `ldr; cmp; b.eq same; and; cmp; b.hs next; orr; tst; b.ne slow; cbz; cbz; tbz x9, #1, slow` (judged 2026-10-26)
+        // target x86_64 tseq_jt_m: 17 fallthrough 10 the unequal path by hand; the fall-through is equal bits (10); two objects 14 (2026-10-27)
+        // target aarch64 tseq_jt_m: 12 fallthrough 7 the unequal path by hand; the fall-through is equal bits (7) (2026-10-27)
         strict_generic!("tseq_jt_", loc!($loc), jt, |s| get!($loc, s));
-        // target x86_64 tseq_jf_m: 18 now 25 as `tseq_jt_m`, ending `test r10b, 2; jnz L; jmp slow` (judged 2026-10-26)
-        // target aarch64 tseq_jf_m: 13 now 18 as `tseq_jt_m`, ending `tbnz x9, #1, L; b slow` (judged 2026-10-26)
+        // target x86_64 tseq_jf_m: 18 fallthrough 9 as `tseq_jt_m` (2026-10-27)
+        // target aarch64 tseq_jf_m: 13 fallthrough 6 as `tseq_jt_m` (2026-10-27)
         strict_generic!("tseq_jf_", loc!($loc), jf, |s| get!($loc, s));
     };
 

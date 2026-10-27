@@ -550,8 +550,13 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 }
                 _ => {}
             }
-            // A fused comparison reads the jump after it (see `quicken`).
-            if op.plain() != op && !op.is_loop() {
+            // A fused comparison reads the jump after it, an in-place `++`
+            // its `Inc` and `Star` (see `quicken`).
+            if matches!(op, Op::LdarIncStar | Op::LdarDecStar) {
+                if crate::bytecode::in_place(code, at) != Some(op) {
+                    return err(at, format!("{op:?} not followed by its own"));
+                }
+            } else if op.plain() != op && !op.is_loop() {
                 let next = at + op.size();
                 if !matches!(code.get(next).and_then(|&b| Op::from_u8(b)), Some(Op::JumpIfTrue | Op::JumpIfFalse)) {
                     return err(at, format!("{op:?} not followed by its jump"));

@@ -2399,47 +2399,92 @@ stencil!("mod_smi_pow2_iif"; |s| {
     next!(s)
 });
 
+/// Jump if `acc` is the value `$v`. On x86-64 by `asm goto`: after a
+/// plain `if s.acc == v`, LLVM loaded `v` into `acc` again on the way to
+/// the jump (`mov r12d, 7`), which kept `je` from going there directly.
+macro_rules! jump_if_bits {
+    ($s:ident, $v:expr) => {
+        #[cfg(target_arch = "x86_64")]
+        core::arch::asm!(
+            "cmp {a}, {k}",
+            "{{disp32}} je {taken}",
+            a = in(reg) $s.acc.to_bits(),
+            k = const $v.to_bits(),
+            taken = label { unsafe { jump!($s) } },
+            options(nomem, nostack),
+        );
+        #[cfg(not(target_arch = "x86_64"))]
+        if $s.acc == $v {
+            jump!($s)
+        }
+    };
+}
+
 // `JumpIfTrue` / `JumpIfFalse`: acc is a boolean.
-// target x86_64 jtrue: 2 now 4 `cmp r12, 7; je L`, not `mov r12d, 7` again (judged 2026-10-26)
+// target x86_64 jtrue: 2 `cmp r12, 7; je L`, not `mov r12d, 7` again (judged 2026-10-26)
 // target aarch64 jtrue: 2 `cmp x20, #7; b.eq L` (judged 2026-10-26)
 stencil!("jtrue"; |s| {
-    if s.acc == Value::TRUE {
-        jump!(s)
-    }
+    jump_if_bits!(s, Value::TRUE);
     next!(s)
 });
-// target x86_64 jfalse: 2 now 4 `cmp r12, 6; je L`, not `mov r12d, 6` again (judged 2026-10-26)
+// target x86_64 jfalse: 2 `cmp r12, 6; je L`, not `mov r12d, 6` again (judged 2026-10-26)
 // target aarch64 jfalse: 2 `cmp x20, #6; b.eq L` (judged 2026-10-26)
 stencil!("jfalse"; |s| {
-    if s.acc == Value::FALSE {
-        jump!(s)
-    }
+    jump_if_bits!(s, Value::FALSE);
     next!(s)
 });
+
+/// `JumpIfToBoolean…`'s case of an `acc` not a boolean: an int32's test,
+/// else the `__slow` helper.
+macro_rules! jump_on_int {
+    ($s:ident, $want:literal) => {{
+        if $s.tag.is_int32($s.acc) {
+            if (int($s.acc) != 0) == $want {
+                jump!($s)
+            }
+            next!($s)
+        }
+        slow!($s)
+    }};
+}
 
 // `JumpIfToBooleanTrue` / `False`.
 macro_rules! jump_to_boolean {
     ($name:literal, $want:literal) => {
-        // target x86_64 jtofalse: 4 now 7 `cmp r12, 6; je L; cmp r12, 7; jne int` (judged 2026-10-26)
-        // target x86_64 jtotrue: 4 now 6 `cmp r12, 7; je L; cmp r12, 6; jne int`, not `mov r12d, 7` again (judged 2026-10-26)
+        // target x86_64 jtofalse: 4 `cmp r12, 6; je L; cmp r12, 7; jne int` (judged 2026-10-26)
+        // target x86_64 jtotrue: 4 `cmp r12, 7; je L; cmp r12, 6; jne int`, not `mov r12d, 7` again (judged 2026-10-26)
         // target x86_64 jtofalse__slow,jtotrue__slow: 4 now 7 `mov rax, r12; and rax, -9; cmp rax, 2; je L`: `push rax` belongs to the call path (judged 2026-10-26)
         // target aarch64 jtofalse: 4 now 6 `cmp x20, #6; b.eq L; cmp x20, #7; b.ne int` (judged 2026-10-26)
         // target aarch64 jtotrue: 4 now 8 `cmp x20, #7; b.eq L; cmp x20, #6; b.ne int`: the int path laid inline (judged 2026-10-26)
         // target aarch64 jtofalse__slow,jtotrue__slow: 10 now 11 `and; cmp #2; b.eq; tst; b.eq; add; fmov; fcmp; b.eq; b.vs` (judged 2026-10-26)
         stencil_slow!($name; |s| {
-            if s.acc == Value::TRUE || s.acc == Value::FALSE {
-                if (s.acc == Value::TRUE) == $want {
-                    jump!(s)
-                }
+            // The boolean it jumps on, then the other (on x86-64 by `asm
+            // goto`, the int32 test out of line: LLVM loaded the boolean
+            // into `acc` again on the way to the jump, and merged the two
+            // tests into `and -2; cmp 6`), else an int32.
+            #[cfg(target_arch = "x86_64")]
+            {
+                jump_if_bits!(s, (if $want { Value::TRUE } else { Value::FALSE }));
+                core::arch::asm!(
+                    "cmp {a}, {k}",
+                    "{{disp32}} jne {other}",
+                    a = in(reg) s.acc.to_bits(),
+                    k = const (if $want { Value::FALSE } else { Value::TRUE }).to_bits(),
+                    other = label { unsafe { jump_on_int!(s, $want) } },
+                    options(nomem, nostack),
+                );
                 next!(s)
             }
-            if s.tag.is_int32(s.acc) {
-                if (int(s.acc) != 0) == $want {
-                    jump!(s)
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                if s.acc == Value::TRUE || s.acc == Value::FALSE {
+                    if (s.acc == Value::TRUE) == $want {
+                        jump!(s)
+                    }
+                    next!(s)
                 }
-                next!(s)
+                jump_on_int!(s, $want)
             }
-            slow!(s)
         }; |s| {
             // Without the runtime: `undefined`, `null`, doubles and
             // objects (cells but strings: an empty one is false; and

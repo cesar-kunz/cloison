@@ -86,7 +86,7 @@ use value::{NumberTag, Value};
 mod layout;
 
 use layout::{
-    COLOR, DirectSite, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
+    COLOR, CONS_MIN, DirectSite, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
     Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
@@ -4088,8 +4088,9 @@ unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
     }
 }
 
-/// Units at most in a concatenation `concat_short` makes.
-const CONCAT_SHORT: u32 = 32;
+/// Units at most in a concatenation `concat_short` makes: below
+/// `CONS_MIN`, as the runtime's.
+const CONCAT_SHORT: u32 = CONS_MIN as u32 - 1;
 
 /// `a + b` for two flat strings (`elems` not null) of at most
 /// [`CONCAT_SHORT`] units together, a new young string made as

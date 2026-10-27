@@ -188,6 +188,13 @@ pub const INLINE_BASE: usize = size_of::<Header>();
 /// in-object slots.
 pub const HEADER_WORDS: usize = INLINE_BASE / 8;
 
+/// Concatenations at least this long make cons strings (`Vm::new_cons`);
+/// shorter ones are copied flat, compiled code's too (`concat_short`).
+/// V8 makes cons strings from 13 units: copying until 256 made `+=` a
+/// character at a time copy its string over and over (Crypto: 65% of its
+/// allocation), and Splay's keys flat.
+pub const CONS_MIN: usize = 24;
+
 /// The header of the cell at `p`.
 #[inline(always)]
 pub fn header<T>(p: *const T) -> *mut Header {

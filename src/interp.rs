@@ -2873,8 +2873,7 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     Value::number(to_number(a) + to_number(b))
 }
 
-/// Concatenations at least this long make cons strings.
-const CONS_MIN: usize = 256;
+use crate::layout::CONS_MIN;
 
 /// `a + b` for two strings, or a string and an int32 (`"v" + i`): the
 /// string copied straight into the new string, a word at a time, and the

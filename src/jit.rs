@@ -10080,6 +10080,11 @@ struct Budget {
     size: usize,
     versions: usize,
     reserve: u32,
+    /// A start refused for good gets `regrants` compilations more, one
+    /// each `regrant_calls` calls after (`CLOISON_JIT_REGRANTS`,
+    /// `CLOISON_JIT_REGRANT_CALLS`; see [`JitFunction::regrant`]).
+    regrants: u32,
+    regrant_calls: u32,
 }
 
 fn budget() -> &'static Budget {
@@ -10093,6 +10098,9 @@ fn budget() -> &'static Budget {
             size: var("CLOISON_JIT_COMPILE_SIZE", option_env!("CLOISON_JIT_COMPILE_SIZE"), 400).max(1) as usize,
             versions: var("CLOISON_JIT_VERSIONS", option_env!("CLOISON_JIT_VERSIONS"), 4).max(1) as usize,
             reserve: var("CLOISON_JIT_RESERVE_CALLS", option_env!("CLOISON_JIT_RESERVE_CALLS"), 1000),
+            regrants: var("CLOISON_JIT_REGRANTS", option_env!("CLOISON_JIT_REGRANTS"), 1),
+            regrant_calls: var("CLOISON_JIT_REGRANT_CALLS", option_env!("CLOISON_JIT_REGRANT_CALLS"), 10_000)
+                .clamp(1, i32::MAX as u32),
         }
     })
 }
@@ -10330,6 +10338,10 @@ struct VmState {
     /// failed, exiting or fitting no version (see `JitFunction::late_miss`).
     spent: bool,
     late: (u32, u32),
+    /// Compilations granted to a start refused for good (see
+    /// [`JitFunction::regrant`]), and the budget's cap raised so.
+    regrants: u32,
+    extra: u32,
     /// Exits at instructions compiled code doesn't run, other than calls
     /// (see `vm_finish`).
     bails: u32,
@@ -10367,6 +10379,11 @@ struct VmState {
 }
 
 impl VmState {
+    /// The compilations it gets: [`max_compiles`], and any granted after.
+    fn max_compiles(&self) -> u32 {
+        max_compiles(self.root_len) + self.extra
+    }
+
     /// For compiling warm code, its heat's address; 0 when hot.
     fn heat_addr(&self) -> u64 {
         match self.tier {
@@ -10432,6 +10449,12 @@ const SOFT_EXITS: u32 = 1;
 const MAX_BAIL_EXITS: u32 = 3;
 /// See `vm_finish`.
 const MAX_LATE_EXITS: u32 = 16;
+/// Calls a start refused for good waits before compiling again (see
+/// [`JitFunction::regrant`]).
+pub(crate) fn regrant_calls() -> i32 {
+    budget().regrant_calls as i32
+}
+
 /// The compilations a function lowered to `n` instructions gets, in VM
 /// frames over the program's run: up to [`Budget::compiles`] (32), fewer
 /// past [`Budget::size`] (400) instructions, as each
@@ -15833,6 +15856,8 @@ impl JitFunction {
             spent: false,
             late: (0, 0),
             bails: 0,
+            regrants: 0,
+            extra: 0,
             no_entry: HashSet::default(),
             bad_results: 0,
             cool: 0,
@@ -16037,7 +16062,7 @@ impl JitFunction {
         let Some(vm) = self.vm.as_ref() else {
             return false;
         };
-        let max = max_compiles(vm.root_len);
+        let max = vm.max_compiles();
         let started = || self.versions.keys().any(|&e| {
             let i = &self.insns[e];
             i.pc == 0 && i.frame == 0
@@ -16051,7 +16076,7 @@ impl JitFunction {
         let Some(vm) = self.vm.as_ref() else {
             return false;
         };
-        let max = max_compiles(vm.root_len);
+        let max = vm.max_compiles();
         self.stats.compiles > max
             || self.stats.compiles == max
                 && self.versions.keys().any(|&e| {
@@ -16068,7 +16093,7 @@ impl JitFunction {
         let Some(vm) = self.vm.as_ref() else {
             return false;
         };
-        let max = max_compiles(vm.root_len);
+        let max = vm.max_compiles();
         let started = self.versions.keys().any(|&e| {
             let i = &self.insns[e];
             i.pc == 0 && i.frame == 0
@@ -16243,10 +16268,36 @@ impl JitFunction {
     /// giving the entry up; at the check of a call's result, the call loses
     /// its prediction. Any exit makes the next entry lower the function
     /// again. Returns the exit's frame and bytecode offset.
+    /// Whether a start refused for good may compile again: once
+    /// ([`Budget::regrants`]), after [`Budget::regrant_calls`] calls
+    /// interpreted since (`run_new_frame` counts them).
+    pub(crate) fn can_regrant(&self) -> bool {
+        self.vm.as_ref().is_some_and(|vm| vm.regrants < budget().regrants)
+    }
+
+    /// One compilation more for a start refused for good: the calls since
+    /// have let its feedback settle. TypeScript's `preCollectTypes` spent
+    /// its 32 compilations in its first 50,000 calls, then ran its
+    /// 597,000 others interpreted.
+    pub(crate) fn regrant(&mut self) -> bool {
+        if !self.can_regrant() {
+            return false;
+        }
+        let compiles = self.stats.compiles;
+        let vm = self.vm.as_mut().unwrap();
+        vm.regrants += 1;
+        vm.extra = (compiles + 1).saturating_sub(max_compiles(vm.root_len));
+        vm.no_entry.remove(&0);
+        vm.late = (0, 0);
+        vm.dirty = true;
+        self.note_spent();
+        true
+    }
+
     /// Whether the function is out of compilations now (`VmState::spent`).
     fn note_spent(&mut self) {
         if let Some(vm) = self.vm.as_mut() {
-            vm.spent = self.stats.compiles >= max_compiles(vm.root_len);
+            vm.spent = self.stats.compiles >= vm.max_compiles();
         }
     }
 
@@ -16316,7 +16367,7 @@ impl JitFunction {
             return (call.frame as usize, call.pc);
         }
         let was_dirty = std::mem::replace(&mut vm.dirty, true);
-        let out_of_compiles = self.stats.compiles >= max_compiles(vm.root_len);
+        let out_of_compiles = self.stats.compiles >= vm.max_compiles();
         // The function may have been lowered differently since (a nested
         // entry recompiled it): then only resume. So, while it cools, for
         // code still running from before the exit that started it: what
@@ -16420,7 +16471,7 @@ impl JitFunction {
             self.widened.insert(k);
             // Out of compilations, the versions stay (see `vm_prepare`):
             // they exit here again, but run the rest.
-            if self.stats.compiles < max_compiles(vm.root_len) {
+            if self.stats.compiles < vm.max_compiles() {
                 self.versions.clear();
                 self.fits.get_mut().clear();
             }
@@ -16545,7 +16596,15 @@ impl JitFunction {
                     if unsafe { extends(x as *const Shape, y as *const Shape) })
         };
         // An entry that went megamorphic before: the types it took then.
+        // A start compiling again after it was refused for good: any types
+        // (one compilation, for the calls the versions it spent its
+        // compilations on didn't fit; see `regrant`).
         let pc = self.insns[entry].pc;
+        if pc == 0 && self.vm.as_ref().is_some_and(|vm| vm.regrants > 0) && !self.wide.contains_key(&0) {
+            let tys = (0..actual.regs.len()).map(|r| if actual.regs[r] == Ty::Bot { Ty::Bot } else { Ty::Any });
+            let any = TypeState { acc: Ty::Any, regs: Regs::from_dense(tys), same: Copies::new(), acc_same: None };
+            self.wide.insert(0, any);
+        }
         let mut actual = actual.clone();
         if let Some(w) = self.wide.get(&pc) {
             actual.join(w);
@@ -16844,7 +16903,7 @@ unsafe fn vm_run_(
             // `NotCompiled`, which would stop entering for good). Not out
             // of compilations: no lowering comes after it (TypeScript's
             // `innerScan` ran 889K calls interpreted, 1.6K compiled).
-            let spent = f.vm.as_ref().is_some_and(|v| f.stats.compiles >= max_compiles(v.root_len));
+            let spent = f.vm.as_ref().is_some_and(|v| f.stats.compiles >= v.max_compiles());
             if left.is_none()
                 && pc == 0
                 && !spent

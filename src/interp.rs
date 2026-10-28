@@ -4572,6 +4572,25 @@ const ENTER_RESUME: u64 = 2;
 const ENTER_ERROR: u64 = 3;
 const ENTER_UNWIND: u64 = 4;
 
+/// A call found no compiled code for `code`'s start: calls stop counting
+/// down, but for a start refused for good that may compile once more
+/// (`JitFunction::regrant`), which counts down the calls it waits for.
+fn not_compiled(code: &Code) {
+    let regrant = code.calls_interpret.get() && code.jit.borrow().as_ref().is_some_and(|f| f.can_regrant());
+    code.calls_left.set(if regrant { crate::jit::regrant_calls() } else { i32::MAX });
+}
+
+/// A call whose countdown ran out: a start refused for good compiles once
+/// more (see `not_compiled`).
+fn regrant(code: &Code) {
+    if code.calls_interpret.get()
+        && let Ok(mut slot) = code.jit.try_borrow_mut()
+        && slot.as_mut().is_some_and(|f| f.regrant())
+    {
+        code.calls_interpret.set(false);
+    }
+}
+
 /// A call to a hot function (its call countdown ran out): run its compiled
 /// code for the new frame `regs`. Returned: the result, for the caller
 /// (`construct_result` applied). Exited: where the interpreter resumes.
@@ -4606,9 +4625,10 @@ fn enter_compiled(regs: *mut Value) -> Entered {
             vm.pending_args = outer;
             return if v == Value::EMPTY { done(ENTER_ERROR, v) } else { done(ENTER_RETURNED, v) };
         }
+        regrant(code);
         match crate::jit::vm_run(vm, code, regs, 0, Value::UNDEFINED) {
             VmRun::NotCompiled => {
-                code.calls_left.set(i32::MAX);
+                not_compiled(code);
                 done(ENTER_INTERPRET, Value::UNDEFINED)
             }
             VmRun::Interpret => done(ENTER_INTERPRET, Value::UNDEFINED),
@@ -4872,9 +4892,12 @@ unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags
         // can't be entered anymore.
         let left = (*callee).calls_left.get() - 1;
         (*callee).calls_left.set(left);
+        if left < 0 {
+            regrant(&*callee);
+        }
         if left < 0 || !(*callee).calls_interpret.get() && (*callee).jit.borrow().is_some() {
             match crate::jit::vm_run(vm, &*callee, new, 0, Value::UNDEFINED) {
-                VmRun::NotCompiled => (*callee).calls_left.set(i32::MAX),
+                VmRun::NotCompiled => not_compiled(&*callee),
                 VmRun::Interpret => {}
                 VmRun::Returned(v) => {
                     return if flags == CONSTRUCT {

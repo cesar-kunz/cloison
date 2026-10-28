@@ -6365,32 +6365,18 @@ fn reg_live_in_mats(
     live_in_blocks(insns, reach, &effects, vec![[0; 4]; n])
 }
 
-/// Registers that may be pinned (kept unboxed in a slot). A pinned register
-/// can't hold an arbitrary value, so one that isn't live at entry (and so
-/// isn't loaded) must be written on every path before any point where the
-/// slots are spilled: a possible int32 overflow exit, or `return`.
-/// Otherwise the spill would overwrite its untouched value in memory.
-fn pinnable(
-    insns: &[Insn],
-    entry: usize,
-    reach: &[bool],
-    live_at_entry: &[bool],
-    ins: &[Option<TypeState>],
-    widened: &HashSet<usize>,
-) -> Vec<bool> {
+/// Per instruction, the registers definitely assigned on entry to it
+/// (forward, must): live at entry (`live_at_entry`) or stored by a `Star`
+/// on every path from `entry`. For [`pinnable`], once per compilation.
+fn assigned_regs(insns: &[Insn], entry: usize, live_at_entry: &[bool]) -> Vec<Option<RegSet>> {
     let n = insns.len();
-    let nregs = live_at_entry.len();
-    // Definitely assigned on entry to each instruction (forward, must).
     let mut assigned: Vec<Option<RegSet>> = vec![None; n];
     let mut queued = vec![false; n];
-    let mut at_entry = [0; 4];
-    for r in (0..nregs).filter(|&r| live_at_entry[r]) {
-        rs_add(&mut at_entry, r);
-    }
-    assigned[entry] = Some(at_entry);
-    let mut work = vec![entry];
+    assigned[entry] = Some(rs_of(live_at_entry));
+    // Lowest first, as `infer`: mostly after the predecessors.
+    let mut work = std::collections::BinaryHeap::from([std::cmp::Reverse(entry)]);
     queued[entry] = true;
-    while let Some(i) = work.pop() {
+    while let Some(std::cmp::Reverse(i)) = work.pop() {
         queued[i] = false;
         let mut out = assigned[i].unwrap();
         if insns[i].op == Op::Star {
@@ -6414,10 +6400,29 @@ fn pinnable(
             };
             if changed && !queued[s] {
                 queued[s] = true;
-                work.push(s);
+                work.push(std::cmp::Reverse(s));
             }
         }
     }
+    assigned
+}
+
+/// Registers that may be pinned (kept unboxed in a slot). A pinned register
+/// can't hold an arbitrary value, so one that isn't live at entry (and so
+/// isn't loaded) must be written on every path before any point where the
+/// slots are spilled: a possible int32 overflow exit, or `return`.
+/// Otherwise the spill would overwrite its untouched value in memory.
+/// (`assigned`: see [`assigned_regs`].)
+fn pinnable(
+    insns: &[Insn],
+    reach: &[bool],
+    live_at_entry: &[bool],
+    assigned: &[Option<RegSet>],
+    ins: &[Option<TypeState>],
+    widened: &HashSet<usize>,
+) -> Vec<bool> {
+    let n = insns.len();
+    let nregs = live_at_entry.len();
     let may_spill = |i: usize| {
         let Some(st) = &ins[i] else { return false };
         let reg = st.regs.get(insns[i].reg as usize).copied();
@@ -8420,6 +8425,7 @@ impl JitCode {
                     }
             });
         let captured = if feedback.is_some() { captured_regs(root) } else { Vec::new() };
+        let assigned = assigned_regs(insns, entry, &live_at_entry);
         let (homes, ins, mut sel) = loop {
             let spec1 = Spec {
                 widened,
@@ -8446,9 +8452,9 @@ impl JitCode {
             // nothing outside it: they may always be pinned.
             let pin_ok: Vec<bool> = pinnable(
                 insns,
-                entry,
                 reach,
                 &live_at_entry,
+                &assigned,
                 &ins1,
                 widened.unwrap_or(&no_widening),
             )

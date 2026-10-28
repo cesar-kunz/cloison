@@ -5571,6 +5571,9 @@ fn infer(
     ins[entry] = Some(entry_state);
     let mut work = std::collections::BinaryHeap::from([std::cmp::Reverse(entry)]);
     queued[entry] = true;
+    // The captured registers, if any (looked for at every edge, that was 3%
+    // of inferring TypeScript).
+    let captured = spec.captured.contains(&true).then(|| rs_of(spec.captured));
     while let Some(std::cmp::Reverse(i)) = work.pop() {
         queued[i] = false;
         let sel = select(&insns[i], i, ins[i].as_ref().unwrap(), spec);
@@ -5589,10 +5592,10 @@ fn infer(
                 leave_dead(&mut out, &spec.reg_live[s], spec.acc_live[s]);
             }
             // Captured registers: whatever a closure may have stored.
-            if spec.captured.contains(&true) {
+            if let Some(c) = &captured {
                 let mut kept = spec.reg_live[s];
-                for (r, _) in spec.captured.iter().enumerate().filter(|c| *c.1) {
-                    kept[r / 64] &= !(1u64 << (r % 64));
+                for (k, c) in kept.iter_mut().zip(c) {
+                    *k &= !c;
                 }
                 leave_dead(&mut out, &kept, spec.acc_live[s]);
                 let captured = spec.captured;
@@ -5722,9 +5725,15 @@ fn rs_iter(s: &RegSet) -> impl Iterator<Item = usize> + '_ {
 /// one, or one written where the other is live after.
 fn interference(insns: &[Insn], live: &[RegSet], nregs: usize) -> Vec<RegSet> {
     let mut m = vec![[0; 4]; nregs];
+    // (Most instructions have the live set of the one before: its registers
+    // interfere already.)
+    let mut last: Option<&RegSet> = None;
     for (i, here) in live.iter().enumerate() {
-        for r in rs_iter(here).take_while(|&r| r < nregs) {
-            rs_or(&mut m[r], here);
+        if last.is_none_or(|l| !rs_eq(l, here)) {
+            for r in rs_iter(here).take_while(|&r| r < nregs) {
+                rs_or(&mut m[r], here);
+            }
+            last = Some(here);
         }
         if insns[i].op == Op::Star {
             let mut after = [0; 4];
@@ -5828,9 +5837,10 @@ fn home_stats(insns: &[Insn], ins: &[Option<TypeState>], nregs: usize) -> HomeSt
     let mut uses = vec![0usize; nregs];
     // As far as homes care: no shapes joined.
     let mut join = vec![0u8; nregs];
-    // (States mostly share their registers' types with the one before:
-    // each list once.)
+    // (States mostly share their registers' types with the one before,
+    // and most of their chunks when not: each list and each chunk once.)
     let mut last: *const [Slot; CHUNKS] = std::ptr::null();
+    let mut last_chunk: [*const Chunk; CHUNKS] = [std::ptr::null(); CHUNKS];
     for ((insn, st), w) in insns.iter().zip(ins).zip(&weight) {
         let Some(st) = st else { continue };
         if insn.reads_reg() {
@@ -5840,15 +5850,22 @@ fn home_stats(insns: &[Insn], ins: &[Option<TypeState>], nregs: usize) -> HomeSt
             continue;
         }
         last = Rc::as_ptr(&st.regs.chunks);
-        for (r, t) in st.regs.iter() {
-            let j = &mut join[r];
-            let k = match t {
-                Ty::Bot => 0,
-                Ty::I32 => 1,
-                Ty::F64 => 2,
-                _ => 3,
-            };
-            *j = (*j).max(k);
+        for (k, slot) in st.regs.chunks.iter().enumerate() {
+            let Some(c) = &slot.tys else { continue };
+            if Rc::as_ptr(c) == last_chunk[k] {
+                continue;
+            }
+            last_chunk[k] = Rc::as_ptr(c);
+            for b in bits16(slot.occ) {
+                let j = &mut join[k * CHUNK_REGS + b];
+                let kind = match c[b] {
+                    Ty::Bot => 0,
+                    Ty::I32 => 1,
+                    Ty::F64 => 2,
+                    _ => 3,
+                };
+                *j = (*j).max(kind);
+            }
         }
     }
     HomeStats { uses, join }

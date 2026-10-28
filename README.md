@@ -5,7 +5,7 @@ interpreter, and a copy-and-patch JIT for x86-64 and arm64 (Linux, and macOS on 
 grows into a mid-tier optimizing compiler without an IR beyond bytecode.
 
 The whole engine is small: a 5.7 MB binary (stripped, static, x86-64) with
-4.1 MB of machine code, against 21 MB of code in a release build of V8's
+4.2 MB of machine code, against 21 MB of code in a release build of V8's
 `d8` shell (12.8, arm64).
 Yet on several Octane benchmarks it comes close to V8 14.6 capped at its
 Maglev tier: Richards at 0.87 of Maglev's score, DeltaBlue at 0.81, Crypto
@@ -25,13 +25,16 @@ target/release/cloison --module main.mjs                      # a module (a .mjs
 target/release/cloison --array-density 1/16,1/8,8k,16m f.js   # when arrays go sparse (see below)
 ```
 
-Status (2026-10-25): every Octane benchmark runs, with a generational
+Status (2026-10-28): every Octane benchmark runs, with a generational
 garbage collector that marks and sweeps its old generation concurrently
 and frees compiled code that is no longer reachable. The language is
 ES5 through ES2026 and most Stage 3 proposals, with gaps: 98.2% of
-test262 (see [Standards support](#standards-support)). A differential
-fuzzing campaign against V8, JavaScriptCore, SpiderMonkey and QuickJS has
-found 28 bugs so far, all fixed. See
+test262 (see [Standards support](#standards-support)). Eight real
+applications' bundles (TypeScript 6's compiler and language service,
+pdf.js, Excalidraw, Sass, SheetJS, ECharts, MathJax and JSNES) run and
+check their results; TypeScript's completions need the optional `Intl`.
+A differential fuzzing campaign against V8, JavaScriptCore, SpiderMonkey
+and QuickJS has found 29 bugs so far, all fixed. See
 [Where it falls short](#where-it-falls-short).
 
 ## How it works
@@ -43,7 +46,8 @@ found 28 bugs so far, all fixed. See
   state lives in `preserve_none` arguments, so in registers, and each
   handler ends in `become` to the next. A second handler table encodes
   "the accumulator is an int32" so hot arithmetic skips type checks.
-  Comparison-and-jump pairs are quickened into superinstructions.
+  Comparison-and-jump pairs, `Star r; Ldar s` and a statement's `r++`
+  are quickened into superinstructions.
 - **Objects** (`src/object.rs`, `src/vm.rs`) have shapes in transition
   trees, in-object slots, inline caches that record field types and
   element kinds, and a global prototype epoch that invalidates cached
@@ -64,7 +68,8 @@ found 28 bugs so far, all fixed. See
   one stencil per bytecode instruction and patches the holes. On top of
   that:
   - forward type inference over `I32 < F64 < Any`, with int32 arithmetic
-    that side-exits on overflow and widens;
+    that side-exits on overflow and widens, sums read only through
+    ToInt32 that wrap instead, and `r += x` on an int32 slot in place;
   - VM registers kept in machine registers for a whole region, as
     unboxed int32s or doubles (6 GPR slots on x86-64, 12 on arm64, 7 FP
     slots on both);
@@ -75,10 +80,18 @@ found 28 bugs so far, all fixed. See
     edges, with a version cache keyed by the live values' types;
   - inline caches, polymorphic calls, inlining with a budget, scalar
     replacement of inlined constructors, direct calls between compiled
-    functions, and guards and constant loads hoisted out of loops;
-  - on arm64, register fields are patched while copying, so 1,844
-    stencil variants collapse into 146 table entries, each verified
-    byte-for-byte against LLVM's own compile of every variant.
+    functions, guards and constant loads hoisted out of loops, field
+    loads reused across joins, and jumps on a known boolean threaded
+    past its test;
+  - a function's compilations are capped by its size (`max_compiles`),
+    and so are the type-keyed versions of an entry before it compiles
+    for any types (`max_versions`: 4 under 400 instructions, 2 under
+    1,600, then 1);
+  - register fields are patched while copying, so a stencil's per-slot
+    variants are one template (on x86-64, one per REX class): x86-64's
+    3,969 stencils (174 KB of code) are 1,656 table entries (84 KB),
+    each template checked byte for byte against LLVM's own compile of
+    every variant it stands for.
 
 - **Numbers print and compute as in V8.** `Math`'s transcendental
   functions (`src/math.rs`) are a port of fdlibm, which V8 ships, rather
@@ -102,7 +115,11 @@ the object model and its escape analysis, `docs/sparse-arrays.md` sparse
 arrays and how their defaults were chosen, `docs/direct-calls.md` the
 call convention, `docs/arm64-targets.md` the stencils against handwritten
 arm64 code, `docs/octane-tiers.md` Octane in cloison's and V8's tiers over
-time, and `docs/sandbox.md` surveys heap sandboxing and defers it.
+time, `docs/opcode-targets.md` the ideal handwritten code for each opcode
+against what the JIT emits (and `// target` comments next to the hot
+stencils, which `scripts/stencil-targets.py` checks), `docs/intl.md` the
+optional `Intl`, and `docs/sandbox.md` surveys heap sandboxing and defers
+it.
 
 ## Design choices
 
@@ -134,9 +151,11 @@ time, and `docs/sandbox.md` surveys heap sandboxing and defers it.
   the microbenchmarks, and its commit message records what it measured;
   code size (`bench/sizes.tsv`), Octane's memory (`bench/octane-memory.tsv`)
   and its code sizes (`bench/octane-sizes.tsv`) are tracked per commit.
-- **Small and self-contained.** One Rust crate whose only dependency is
-  `libc`; a static 5.7 MB binary whose empty script runs in about 1 ms
-  more than `/bin/true` (Linux x86-64).
+- **Small and self-contained.** One Rust crate whose only runtime
+  dependency is `libc` (ICU4X too with the optional `intl` feature;
+  `build.rs` reads the stencils with `object` and decodes them with
+  `iced-x86`); a static 5.7 MB binary whose empty script runs in about
+  1 ms more than `/bin/true` (Linux x86-64).
 
 ## Standards support
 
@@ -150,7 +169,7 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 
 | edition | passed | tests | ratio |
 |---|---:|---:|---:|
-| ES5 (untagged) | 16,823 | 17,067 | 98.6% |
+| ES5 (untagged) | 16,828 | 17,067 | 98.6% |
 | ES2015 | 8,982 | 9,197 | 97.7% |
 | ES2016 | 100 | 100 | 100.0% |
 | ES2017 | 699 | 741 | 94.3% |
@@ -164,7 +183,7 @@ untagged test counts as ES5 (`scripts/test262-editions.py`):
 | ES2025 | 980 | 998 | 98.2% |
 | ES2026 | 745 | 745 | 100.0% |
 | Stage 3 proposals | 5,628 | 5,650 | 99.6% |
-| **all** | **47,767** | **48,635** | **98.2%** |
+| **all** | **47,772** | **48,635** | **98.2%** |
 
 The `Atomics` tests that need several agents run them as test262's
 `$262.agent` has them: each agent a thread with a VM of its own, sharing
@@ -177,7 +196,9 @@ takes named time zones from the system's database (`TZDIR`, else
 
 `Intl` (ECMA-402) is an optional feature, `cargo build --features
 intl`: `Intl.Collator` alone so far, on ICU4X, its locale data (English)
-a file read at runtime. See [docs/intl.md](docs/intl.md).
+a file read at runtime (`CLOISON_INTL_DATA`). See [docs/intl.md](docs/intl.md).
+`String.prototype.normalize` has all four forms without it, from tables
+generated from Unicode 17 (`scripts/unicode-norm.py`).
 
 Realms (`ShadowRealm`, `$262.createRealm`) share the one heap: each
 has its own global object and intrinsics, which a call of another
@@ -306,8 +327,9 @@ Inside a long DeltaBlue run the JIT is about 7x the interpreter and about 2.3x
 behind V8's Maglev tier.
 
 Code size is tracked per commit in `bench/sizes.tsv`: the release
-binary's machine code is about 4.1 MB, stencil code about 170 KB (x86-64,
-at 52f4c0e).
+binary's machine code is about 4.2 MB, stencil code about 84 KB (x86-64,
+at 32e5e37, after the per-slot variants became templates; 174 KB
+before).
 
 ### Against other engines, besides peak speed
 
@@ -324,23 +346,29 @@ Octane is a single run of each `-score.js`, and the deterministic `-run.js`
 (the same fixed work for every engine) under `perf stat`, one run at a time,
 the host at a load of 3 to 4. Instruction counts don't vary with load, but
 they don't weigh a cache miss as time does. Geomeans are over the 15
-benchmarks (lower is better but for scores):
+benchmarks (lower is better but for scores). cloison's instructions and
+peak RSS are measured again at 9542c94 (2026-10-28; they don't depend on
+the host's load), its scores and times are 56dc4da's: since then its
+fixed work takes 7% fewer instructions with the JIT (Richards −28%,
+Crypto −17%, EarleyBoyer −11%, Box2D −10%, RayTrace −9%, DeltaBlue −8%)
+and 2% fewer without, and its peak RSS fell with objects' smaller header
+(Splay 674 → 511 MB with the JIT, TypeScript 429 → 380):
 
 | | cloison | V8 | JSC | SpiderMonkey | QuickJS |
 |---|---:|---:|---:|---:|---:|
 | empty script: wall ms | 1.9 | 12.3 | 16.2 | 11.1 | 1.4 |
-| empty script: million instructions | 6.7 | 30.2 | 79.1 | 49.5 | 3.8 |
+| empty script: million instructions | 6.5 | 30.2 | 79.1 | 49.5 | 3.8 |
 | empty script: RSS MB | 3.8 | 16.5 | 31.5 | 19.5 | 3.6 |
 | binary, stripped, MB | 5.7 | 35.6 | 36.8 | 44.7 | 1.8 |
 | other files it needs | — | 10.8 MB ICU data | 39 MB ICU libraries | 3 NSPR libraries | — |
 | shared libraries loaded | 0 (static) | 4 | 21 | 9 | 0 (static) |
 | Octane, JIT | 27,476 | 75,961 | 72,924 | 47,127 | — |
 | Octane, no JIT | **6,298** | 5,521 | 4,285 | 2,206 | 1,874 |
-| fixed work, JIT: G instructions | 29.9 | 12.6 | 12.0 | 15.6 | — |
+| fixed work, JIT: G instructions | 27.7 | 12.6 | 12.0 | 15.6 | — |
 | fixed work, JIT: CPU s | 2.23 | 1.29 | 1.30 | 1.42 | — |
-| fixed work, no JIT: G instructions | **104** | 157 | 151 | 361 | 315 |
-| peak RSS, JIT: MB | 78.8 | 68.9 | 216 | 83.3 | — |
-| peak RSS, no JIT: MB | 53.1 | 55.8 | 107 | 76.5 | 39.4 |
+| fixed work, no JIT: G instructions | **102** | 157 | 151 | 361 | 315 |
+| peak RSS, JIT: MB | 76.1 | 68.9 | 216 | 83.3 | — |
+| peak RSS, no JIT: MB | 48.9 | 55.8 | 107 | 76.5 | 39.4 |
 
 The binaries' sizes are what each engine needs to run: JavaScriptCore's is
 its 0.5 MB shell and its 36.3 MB library, SpiderMonkey carries ICU in its
@@ -372,15 +400,16 @@ LLInt on Splay:
 | TypeScript | 27,368 | 26,764 | 18,088 | 8,261 | 11,821 |
 | **geomean** | **6,298** | **5,521** | **4,285** | **2,206** | **1,874** |
 
-With the JIT, cloison runs 2.5 times the instructions of JavaScriptCore for
-the same work and takes 1.7 times its CPU time; its memory is second to V8's
+With the JIT, cloison runs 2.3 times the instructions of JavaScriptCore for
+the same work (2.5 at 56dc4da, when it took 1.7 times its CPU time); its memory is second to V8's
 (JavaScriptCore's heap is about 3 times the others'). Measuring this found
 two bugs of the interpreter, fixed since (the cloison rows without a JIT
 are after them): a call site turning between young callees logged the
 same few cache slots millions of times (Richards peaked at 256 MB, now 13.5;
 5b6d2c8), and a frame's tier-up slots, never cleared, kept a removed Splay
 node and every node removed after it reachable (1.85 GB, now 509 MB;
-47b57d1). `docs/weak-points.md` takes up where cloison does worse.
+47b57d1). Where cloison does worse is what the work since has taken up,
+step by step in the commit messages.
 
 The collectors, from each engine's own trace of the fixed work (cloison's
 `CLOISON_SIZES` and `CLOISON_GC_STATS`, V8's `--trace-gc-nvp`,
@@ -414,18 +443,21 @@ few collections.
 Bytes an object takes, from the RSS of a million of them kept alive less
 that of their holder alone, after full collections (the slope between 500
 thousand and a million; QuickJS's from its own count of what malloc holds,
-`-d`, slack included, its allocator reusing what RSS can't see):
+`-d`, slack included, its allocator reusing what RSS can't see; cloison at
+9542c94, where `{}` and the arrays vary from run to run, the samples
+catching the collector at different points: their cells are 32 bytes for
+`{}` and 64 for `[i, i, i]`, its array and elements' cells 32 each):
 
 | object | cloison | V8 | JSC | SpiderMonkey | QuickJS |
 |---|---:|---:|---:|---:|---:|
-| `{}` | 51 | 25 | 81 | 58 | 120 |
-| `{a, b, c}` | 99 | 42 | 71 | 58 | 136 |
-| `new P(x)`, 3 fields | 100 | 42 | 62 | 58 | 136 |
-| 10 properties | 161 | 51 | 133 | 126 | 304 |
-| `[i, i, i]` | 84 | 38 | 70 | 74 | 160 |
-| 3 doubles in an array | 98 | 51 | 61 | 74 | 160 |
-| a closure | 218 | 53 | 98 | 115 | 208 |
-| a 16-character string (8 + 8 concatenated) | 162 | 51 | 103 | 24 | 56 |
+| `{}` | 48 to 84 | 25 | 81 | 58 | 120 |
+| `{a, b, c}` | 83 | 42 | 71 | 58 | 136 |
+| `new P(x)`, 3 fields | 82 | 42 | 62 | 58 | 136 |
+| 10 properties | 150 | 51 | 133 | 126 | 304 |
+| `[i, i, i]` | 80 to 118 | 38 | 70 | 74 | 160 |
+| 3 doubles in an array | 114 | 51 | 61 | 74 | 160 |
+| a closure | 190 | 53 | 98 | 115 | 208 |
+| a 16-character string (8 + 8 concatenated) | 102 | 51 | 103 | 24 | 56 |
 | a double | 0 | 4 | 0 | 0 | 0 |
 | a `Map` entry | 110 | 15 | 110 | 28 | 96 |
 | an array element (pushed) | 17 | 12 | 33 | 8 | 11 |
@@ -434,8 +466,9 @@ cloison's objects are 2 to 4 times V8's (which compresses pointers to 4
 bytes): every object starts with a 32-byte header (shape, class, element
 count, property and element storage; a function's code and most other
 classes' state in a word after it), every value is 8 bytes, a
-string keeps its UTF-16 behind such a header (one of 16 characters is a
-96-byte cell, a concatenation under 256 characters a flat copy), and a
+string keeps its UTF-16 behind such a header (one of 16 characters is an
+80-byte cell, a concatenation under 24 characters a flat copy, a longer
+one a cons string), and a
 closure gets a `prototype` object made eagerly and its captured variables
 as cells of their own. RSS adds about 7% for the collector's side tables
 (a byte per 16-byte granule, one per 128-byte card). NaN-boxing (cloison, JavaScriptCore,
@@ -495,7 +528,7 @@ switching realms).
 The differential tests run each program in four engine configurations
 (the interpreter alone, and tiered up after 1, 2 and 1,000 loop back
 edges) and the results must agree: the JavaScript tests (`tests/js.rs`,
-294, which also verify the heap after each run), the bytecode ones
+314, which also verify the heap after each run), the bytecode ones
 (`tests/objects.rs`), the 112 programs of `bench/micro/` and the 33 of
 `tests/octane/`, which carry Node's value as the reference
 (`tests/interp.rs` tests the interpreter alone). Several tests are
@@ -506,7 +539,7 @@ checkout in `test262/`), which writes the table above.
 ```sh
 cargo test --release
 node bench/run.mjs --engine target/release/cloison        # every micro against `expect`
-cargo test --target aarch64-unknown-linux-musl         # arm64 under qemu-aarch64
+cargo test --release --target aarch64-unknown-linux-musl   # arm64 under qemu-aarch64
 ```
 
 Scripts in `scripts/`: `stencil-listing.py` lists every stencil as the
@@ -529,7 +562,10 @@ each of V8's tiers (`docs/octane-tiers.md`); `quiet.sh` runs a command
 pinned to the idlest core; `vs-v8.sh` times every micro against Node and
 `vs-maglev.sh` compares the machine code with Maglev's, function by
 function; `jit-profile.sh` profiles compiled code per stencil piece;
-`dispatch-asm.sh` disassembles the interpreter's handlers.
+`dispatch-asm.sh` disassembles the interpreter's handlers;
+`stencil-targets.py` counts each hot stencil family's instructions
+against the handwritten target in its `// target` comment (`--check`
+fails on a change).
 `bench/sparse/sweep.sh` and `pareto.py` choose the sparse-array settings
 (`bench/sparse/README.md`). `scripts/compare/` compares cloison with the
 jsvu engines, with and without their JITs: `startup.py` (an empty script's
@@ -609,8 +645,9 @@ diffed between targets.
   TypeScript and on Splay; a second thread marks and sweeps the old
   generation), Splay spends 18% of its time in pauses, and it never
   moves a cell, so randomly dying cells fragment its blocks (Splay peaks
-  at about 670 MB of RSS for 160 to 180 MB live). Measured on the Linux
-  host at 52f4c0e, deterministic runs.
+  at about 510 MB of RSS, 670 before objects' header shrank to 32 bytes
+  at db9cb04). Measured on the Linux host at 52f4c0e and 9542c94,
+  deterministic runs.
 - **Language gaps.** Strict mode, `let`/`const`, classes, arrows,
   templates, destructuring, spread, symbols, iterators, generators,
   async functions and generators, `Reflect`, `Proxy`, BigInt, class
@@ -624,13 +661,15 @@ diffed between targets.
 - **Safety.** Around 1,200 `unsafe` blocks and functions, a raw-pointer
   object model, and no heap sandbox (deferred by design). It is fuzzed
   differentially (against V8, JavaScriptCore, SpiderMonkey and QuickJS,
-  across its own tiers and collector settings): 28 bugs so far, each fixed
+  across its own tiers and collector settings): 29 bugs so far, each fixed
   with a regression test (wrong results, crashes, a collector bug that
   gave objects a dead shape).
-- **Compile-time churn** on large programs: TypeScript, pdfjs and
-  code-load slowed when more of their functions compiled, from
-  recompiling as feedback changes. A cheaper baseline tier is the
-  planned fix.
+- **Compiling costs about 1.2 µs a bytecode instruction**, and large
+  programs recompile as their feedback changes (TypeScript: 1,879
+  compilations of 664,416 instructions in all). Compiling has been made
+  cheaper (12 to 22% fewer instructions on Box2D, TypeScript, PdfJS,
+  Mandreel and zlib, 2026-10-28), but a function that has used up its
+  compilations runs interpreted from then on, however hot it gets.
 
 ## Layout
 

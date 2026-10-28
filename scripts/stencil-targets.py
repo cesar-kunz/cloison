@@ -65,7 +65,7 @@ def table_path(arch):
 def entries(path):
     src = open(path).read()
     out = []
-    for m in re.finditer(r'Stencil \{ name: "([^"]*)", slow: \w+, slow_at: \d+, code: &\[([^\]]*)\], relocs: &\[(.*?)\], template:', src):
+    for m in re.finditer(r'Stencil \{ name: "([^"]*)", code: &\[([^\]]*)\], relocs: &\[(.*?)\], template:', src):
         code = bytes(int(x) for x in m.group(2).split(",") if x.strip())
         cont = [int(r.group(1)) for r in re.finditer(r'R\((\d+), \d+, Sym::Continue, -?\d+\)', m.group(3))]
         out.append((m.group(1), code, cont))

@@ -2663,7 +2663,7 @@ impl Feedback {
             return Prop::None;
         }
         if insn.op == Op::GetKeyed {
-            if std::env::var_os("CLOISON_KEYED").is_some() {
+            if keyed_log() {
                 eprintln!("keyed pc{} shape {:p} elems {:?}", insn.pc, ic.shape, unsafe { (*ic.shape).elems });
             }
             return Prop::Keyed {
@@ -4774,7 +4774,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 (Ty::Ext(_), _) => (pick("nc", "i_nc"), FieldType::Any),
                 _ => (pick("", "i"), FieldType::Any),
             };
-            if std::env::var_os("CLOISON_KEYED").is_some() && matches!(elems, FieldType::Any) {
+            if keyed_log() && matches!(elems, FieldType::Any) {
                 eprintln!("anyload pc{} reg {:?} prop {:?}", insn.pc, reg, prop);
             }
             let (t, post) = Ty::of_field(elems);
@@ -10022,8 +10022,29 @@ struct Fit {
     regs: Box<[(u8, Ty)]>,
 }
 
+/// Debugging: with `CLOISON_KEYED` set, keyed loads print their feedback
+/// and the cases selection gives them (read once: at every selection, the
+/// environment's lock and search were 0.2% of compiling Box2D).
+fn keyed_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CLOISON_KEYED").is_some())
+}
+
 /// Versions kept per entry point before generalizing.
 const MAX_VERSIONS: usize = 4;
+
+/// Versions an entry of a function lowered to `n` instructions keeps
+/// before going wide: fewer for large functions, each compilation of which
+/// costs about their size (see [`max_compiles`]).
+fn max_versions(n: usize) -> usize {
+    if n >= 4 * COMPILE_SIZE {
+        1
+    } else if n >= COMPILE_SIZE {
+        2
+    } else {
+        MAX_VERSIONS
+    }
+}
 
 /// A bytecode function run through the JIT.
 ///
@@ -10040,8 +10061,9 @@ const MAX_VERSIONS: usize = 4;
 /// later entry if every live value's type is the same or narrower (an int32
 /// where it expects a double is converted, in the register file, before
 /// entering; JS numbers are just numbers). This check in the driver replaces
-/// entry guards. After [`MAX_VERSIONS`] versions at one entry point, it is
-/// megamorphic: one version for the join of all types seen replaces them.
+/// entry guards. After [`MAX_VERSIONS`] versions at one entry point (fewer
+/// in large functions: [`max_versions`]), it is megamorphic: one version
+/// for the join of all types seen replaces them.
 ///
 /// **Tiering** (the default; see [`Tiering`]). The function starts in the
 /// interpreter. Loop opcodes count back edges; when the budget runs out, the
@@ -16495,7 +16517,8 @@ impl JitFunction {
             None => {
                 self.fits.get_mut().clear();
                 let seen = self.versions.remove(&entry).unwrap_or_default();
-                let (state, keep) = if seen.len() >= MAX_VERSIONS {
+                let max = self.vm.as_ref().map_or(MAX_VERSIONS, |vm| max_versions(vm.root_len));
+                let (state, keep) = if seen.len() >= max {
                     // Megamorphic: one version for everything seen, and so
                     // this entry's versions from now on, after lowering
                     // again too. (Typed again after each lowering,

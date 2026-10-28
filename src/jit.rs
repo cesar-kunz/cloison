@@ -10053,20 +10053,48 @@ fn keyed_log() -> bool {
     *ON.get_or_init(|| std::env::var_os("CLOISON_KEYED").is_some())
 }
 
-/// Versions kept per entry point before generalizing.
-const MAX_VERSIONS: usize = 4;
-
 /// Versions an entry of a function lowered to `n` instructions keeps
 /// before going wide: fewer for large functions, each compilation of which
 /// costs about their size (see [`max_compiles`]).
 fn max_versions(n: usize) -> usize {
-    if n >= 4 * COMPILE_SIZE {
+    let b = budget();
+    if n >= 4 * b.size {
         1
-    } else if n >= COMPILE_SIZE {
-        2
+    } else if n >= b.size {
+        2.min(b.versions)
     } else {
-        MAX_VERSIONS
+        b.versions
     }
+}
+
+/// How much compiling a function gets: its compilations
+/// ([`max_compiles`]), the size past which it gets fewer, the versions an
+/// entry keeps ([`max_versions`]), and the calls a spent function's start
+/// waits for its reserved compilation ([`JitFunction::spent`]). Read once:
+/// from `CLOISON_JIT_COMPILES`, `CLOISON_JIT_COMPILE_SIZE`,
+/// `CLOISON_JIT_VERSIONS` and `CLOISON_JIT_RESERVE_CALLS` at run time,
+/// else as they were set when building, else the defaults.
+#[derive(Clone, Copy, Debug)]
+struct Budget {
+    compiles: u32,
+    size: usize,
+    versions: usize,
+    reserve: u32,
+}
+
+fn budget() -> &'static Budget {
+    static B: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let var = |name: &str, built: Option<&'static str>, default: u32| {
+            std::env::var(name).ok().or(built.map(str::to_string)).and_then(|s| s.trim().parse().ok()).unwrap_or(default)
+        };
+        Budget {
+            compiles: var("CLOISON_JIT_COMPILES", option_env!("CLOISON_JIT_COMPILES"), 32).max(1),
+            size: var("CLOISON_JIT_COMPILE_SIZE", option_env!("CLOISON_JIT_COMPILE_SIZE"), 400).max(1) as usize,
+            versions: var("CLOISON_JIT_VERSIONS", option_env!("CLOISON_JIT_VERSIONS"), 4).max(1) as usize,
+            reserve: var("CLOISON_JIT_RESERVE_CALLS", option_env!("CLOISON_JIT_RESERVE_CALLS"), 1000),
+        }
+    })
 }
 
 /// A bytecode function run through the JIT.
@@ -10084,7 +10112,7 @@ fn max_versions(n: usize) -> usize {
 /// later entry if every live value's type is the same or narrower (an int32
 /// where it expects a double is converted, in the register file, before
 /// entering; JS numbers are just numbers). This check in the driver replaces
-/// entry guards. After [`MAX_VERSIONS`] versions at one entry point (fewer
+/// entry guards. After [`Budget::versions`] (4) versions at one entry point (fewer
 /// in large functions: [`max_versions`]), it is megamorphic: one version
 /// for the join of all types seen replaces them.
 ///
@@ -10404,11 +10432,9 @@ const SOFT_EXITS: u32 = 1;
 const MAX_BAIL_EXITS: u32 = 3;
 /// See `vm_finish`.
 const MAX_LATE_EXITS: u32 = 16;
-/// Compilations per function in VM frames, over the program's run.
-const MAX_VM_COMPILES: u32 = 32;
-
-/// The compilations a function lowered to `n` instructions gets: up to
-/// [`MAX_VM_COMPILES`], fewer past [`COMPILE_SIZE`] instructions, as each
+/// The compilations a function lowered to `n` instructions gets, in VM
+/// frames over the program's run: up to [`Budget::compiles`] (32), fewer
+/// past [`Budget::size`] (400) instructions, as each
 /// costs about its size (at least 4). A large function whose feedback
 /// keeps changing (TypeScript's scanner and emitter, which compiling
 /// functions with upvalues made eligible) otherwise compiles 32 times.
@@ -10416,13 +10442,9 @@ const MAX_VM_COMPILES: u32 = 32;
 /// +21%, Mandreel +15%, DeltaBlue and GameBoy unchanged; with 200, zlib
 /// and GameBoy lost half.
 fn max_compiles(n: usize) -> u32 {
-    (MAX_VM_COMPILES as usize * COMPILE_SIZE / n.max(1)).clamp(4, MAX_VM_COMPILES as usize) as u32
+    let b = budget();
+    (b.compiles as usize * b.size / n.max(1)).clamp(4.min(b.compiles as usize), b.compiles as usize) as u32
 }
-
-/// See [`max_compiles`].
-const COMPILE_SIZE: usize = 400;
-/// See [`JitFunction::spent`].
-const RESERVE_CALLS: u32 = 1000;
 /// Inlining limits: nesting, and the callee's size in instructions.
 const MAX_INLINE_DEPTH: usize = 2;
 /// Registers past a frame's own for a getter or setter called, not
@@ -16005,8 +16027,8 @@ impl JitFunction {
 
     /// Whether the function is out of compilations for an entry at
     /// bytecode offset `pc`: past `max_compiles`, but for one more at its
-    /// start while no version is there, once called [`RESERVE_CALLS`]
-    /// times so. (Loops' entries had taken the last ones after a lowering
+    /// start while no version is there, once called
+    /// [`Budget::reserve`] (1,000) times so. (Loops' entries had taken the last ones after a lowering
     /// dropped the start's version: TypeScript's `innerScan`, called at
     /// each token, then ran interpreted for good. Without the calls,
     /// zlib's and Mandreel's large functions, entered a few times for
@@ -16021,7 +16043,7 @@ impl JitFunction {
             i.pc == 0 && i.frame == 0
         });
         self.stats.compiles >= max
-            && (pc != 0 || self.stats.compiles > max || vm.late.0 < RESERVE_CALLS || started())
+            && (pc != 0 || self.stats.compiles > max || vm.late.0 < budget().reserve || started())
     }
 
     /// Whether no compilation is left, not even the start's (see `spent`).
@@ -16239,7 +16261,7 @@ impl JitFunction {
     /// exits at half its calls, after its loops' work, +3% interpreted.)
     fn late_miss(&mut self, exit: bool) {
         let vm = self.vm.as_mut().unwrap();
-        if exit && vm.root_len >= COMPILE_SIZE {
+        if exit && vm.root_len >= budget().size {
             return;
         }
         vm.late.1 += 1;
@@ -16541,7 +16563,7 @@ impl JitFunction {
             None => {
                 self.fits.get_mut().clear();
                 let seen = self.versions.remove(&entry).unwrap_or_default();
-                let max = self.vm.as_ref().map_or(MAX_VERSIONS, |vm| max_versions(vm.root_len));
+                let max = self.vm.as_ref().map_or(budget().versions, |vm| max_versions(vm.root_len));
                 let (state, keep) = if seen.len() >= max {
                     // Megamorphic: one version for everything seen, and so
                     // this entry's versions from now on, after lowering

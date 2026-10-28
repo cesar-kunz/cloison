@@ -2126,10 +2126,19 @@ impl Vm {
                     let inline = crate::object::Object::inline_cap(o);
                     inline_unused += 8 * inline.saturating_sub(used);
                     if !(*o).props.is_null() {
-                        props_unused += 8 * ((*o).props_cap as usize).saturating_sub(used.saturating_sub(inline));
+                        props_unused += 8 * (crate::object::Object::props_cap(o) as usize).saturating_sub(used.saturating_sub(inline));
                     }
-                    if !(*o).elems.is_null() && (*o).class != crate::object::Class::String {
-                        elems_unused += 8 * ((*o).elems_cap as usize).saturating_sub((*o).elems_len as usize);
+                    if !(*o).elems.is_null() && !matches!(
+                            (*o).class,
+                            Class::String
+                                | Class::TypedArray
+                                | Class::DataView
+                                | Class::ArrayBuffer
+                                | Class::SharedArrayBuffer
+                                | Class::BigInt
+                                | Class::Temporal
+                        ) {
+                        elems_unused += 8 * (crate::object::Object::elems_cap(o) as usize).saturating_sub((*o).elems_len as usize);
                     }
                     format!("{:?}", (*o).class)
                 }

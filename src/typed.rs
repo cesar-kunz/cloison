@@ -4,15 +4,15 @@
 //! A buffer is an object of class `ArrayBuffer`: `elems` points to its
 //! bytes, `elems_len` is their count (0 once detached, flag `DETACHED`).
 //! A resizable one (flag [`RESIZABLE`]) has room for its maximum byte
-//! length (`elems_cap`) from the start, so its bytes never move, and
-//! `code` holds a hidden weak set of the views on it (typed arrays and
-//! `DataView`s; `collections::new_weak_set`), which a resize brings up to
-//! date.
+//! length (its `aux`, `Object::aux`) from the start, so its bytes never
+//! move, and `code` holds a hidden weak set of the views on it (typed
+//! arrays and `DataView`s; `collections::new_weak_set`), which a resize
+//! brings up to date.
 //!
 //! A typed array (class `TypedArray`) has `elems` pointing to its first
 //! element in its buffer's bytes, `elems_len` its length (what compiled
 //! code bounds element accesses by: 0 once out of bounds), `kind` its
-//! element type, `code` its buffer, and `elems_cap` the length it was
+//! element type, `code` its buffer, and its `aux` the length it was
 //! made with, or [`TRACKING`] if it follows its resizable buffer's length.
 //! A `DataView` is laid out the same way, in bytes.
 //!
@@ -34,7 +34,7 @@ use crate::vm::{Error, NativeFn, Result, Vm, string_units};
 
 /// A buffer's flag: resizable (`DETACHED`'s neighbour).
 pub(crate) const RESIZABLE: u8 = 128;
-/// A view's `elems_cap`: it tracks its buffer's length.
+/// A view's `aux`: it tracks its buffer's length.
 pub(crate) const TRACKING: u32 = u32::MAX;
 /// The most bytes a buffer may have (a resizable one at its maximum).
 pub(crate) const MAX_BYTES: usize = 1 << 31;
@@ -164,7 +164,7 @@ pub(crate) fn new_buffer_max(vm: &mut Vm, n: usize, max: Option<usize>) -> Resul
         (*o).elems_len = n as u32;
         if let Some(max) = max {
             (*o).flags |= RESIZABLE;
-            (*o).elems_cap = max as u32;
+            *Object::aux(o) = max as u32;
             let views = crate::collections::new_weak_set(vm)?;
             (*o).code = object_value(views).to_bits() as *const crate::vm::Code;
         }
@@ -249,7 +249,7 @@ pub(crate) fn ta_length(o: *mut Object) -> Option<usize> {
         return None;
     }
     let (len, off, size) = (unsafe { (*b).elems_len } as usize, offset_of(o), kind_of(o).size());
-    match unsafe { (*o).elems_cap } {
+    match unsafe { *Object::aux(o) } {
         TRACKING => (off <= len).then(|| (len - off) / size),
         n => (off + n as usize * size <= len).then_some(n as usize),
     }
@@ -263,7 +263,7 @@ pub(crate) fn view_byte_length(o: *mut Object) -> Option<usize> {
         return None;
     }
     let (len, off) = (unsafe { (*b).elems_len } as usize, offset_of(o));
-    match unsafe { (*o).elems_cap } {
+    match unsafe { *Object::aux(o) } {
         TRACKING => (off <= len).then(|| len - off),
         n => (off + n as usize <= len).then_some(n as usize),
     }
@@ -283,7 +283,7 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
         }
         (*o).elems = (*b).elems.cast::<u8>().add(offset).cast();
         (*o).code = b.cast();
-        (*o).elems_cap = len.map_or(TRACKING, |n| n as u32);
+        *Object::aux(o) = len.map_or(TRACKING, |n| n as u32);
         (*o).elems_len = if class == Class::TypedArray { ta_length(o) } else { view_byte_length(o) }.unwrap_or(0) as u32;
         if is_immutable(b) {
             (*o).flags |= IMMUTABLE_VIEW;
@@ -357,7 +357,7 @@ fn buffer_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value>
         if is_detached(b) {
             0
         } else if is_resizable(b) {
-            (*b).elems_cap
+            *Object::aux(b)
         } else {
             (*b).elems_len
         }
@@ -383,7 +383,7 @@ fn buffer_resize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if is_detached(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.resize: the buffer is detached"));
     }
-    if n > unsafe { (*b).elems_cap } as usize {
+    if n > unsafe { *Object::aux(b) } as usize {
         return Err(Error::range_error("ArrayBuffer.prototype.resize: beyond maxByteLength"));
     }
     unsafe {
@@ -451,7 +451,7 @@ fn transfer_with(vm: &mut Vm, this: Value, a: &[Value], fixed: bool) -> Result<V
     if is_detached(b) || is_immutable(b) {
         return Err(Error::type_error("ArrayBuffer.prototype.transfer: the buffer is detached or immutable"));
     }
-    let max = (!fixed && is_resizable(b)).then(|| unsafe { (*b).elems_cap } as usize);
+    let max = (!fixed && is_resizable(b)).then(|| unsafe { *Object::aux(b) } as usize);
     if max.is_some_and(|m| n > m) {
         return Err(Error::range_error("ArrayBuffer.prototype.transfer: beyond maxByteLength"));
     }
@@ -1333,7 +1333,7 @@ fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let k = kind_of(o);
     let begin = offset_of(o) + s * k.size();
     let end = arg(a, 1);
-    let n = if unsafe { (*o).elems_cap } == TRACKING && end.is_undefined() {
+    let n = if unsafe { *Object::aux(o) } == TRACKING && end.is_undefined() {
         None
     } else {
         let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };

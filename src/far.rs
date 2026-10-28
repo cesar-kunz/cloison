@@ -163,7 +163,7 @@ fn parse_bytes(s: &str) -> Option<usize> {
 /// bound, and `a[1024]`, `a[3072]`, `a[7168]`, … would double the elements
 /// each time).
 pub(crate) fn goes_far(vm: &Vm, o: *mut Object, n: usize, adding: usize) -> bool {
-    let (len, cap) = unsafe { ((*o).elems_len as usize, (*o).elems_cap as usize) };
+    let (len, cap) = unsafe { ((*o).elems_len as usize, Object::elems_cap(o) as usize) };
     let d = &vm.density;
     let store = adding > 0;
     if d.goes_far(len + adding, n, store) {
@@ -459,7 +459,7 @@ pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
             *(*o).elems.add(k) = Value::EMPTY;
         }
         (*o).elems_len = first_hole as u32;
-        if first_hole * 2 < (*o).elems_cap as usize {
+        if first_hole * 2 < Object::elems_cap(o) as usize {
             vm.shrink_elems(o);
         }
     }

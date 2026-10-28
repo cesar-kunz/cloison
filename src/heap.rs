@@ -1004,7 +1004,7 @@ pub unsafe fn cell_size(p: *const u8) -> usize {
             let o = p as *const Object;
             let mut words = Object::inline_cap(o);
             match (*o).class {
-                Class::String => words += (*o).elems_cap as usize,
+                Class::String => words += Object::string_words(o),
                 Class::Function => words += (&(*(*o).code).upvalues).len(),
                 _ => {}
             }

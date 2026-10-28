@@ -37,7 +37,7 @@ pub(crate) enum Proto {
     FinalizationRegistry,
 }
 
-/// What an iterator yields; `elems_cap`'s low two bits.
+/// What an iterator yields; its `aux`'s low two bits (`Object::aux`).
 #[derive(Clone, Copy)]
 #[repr(u32)]
 enum IterMode {
@@ -566,7 +566,7 @@ fn new_iterator(vm: &mut Vm, o: *mut Object, mode: IterMode) -> Value {
     let it = vm.new_object_with(Class::CollectionIterator, object_value(proto), 0);
     hold_entries(it, Value::from_bits(unsafe { (*o).code } as u64));
     unsafe {
-        (*it).elems_cap = mode as u32 | (s as u32) << 2;
+        *Object::aux(it) = mode as u32 | (s as u32) << 2;
         (*it).elems_len = BASE as u32;
     }
     object_value(it)
@@ -734,7 +734,7 @@ fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if unsafe { (*it).code }.is_null() {
         return Ok(iter_result(vm, Value::UNDEFINED, true));
     }
-    let (mode, s) = unsafe { ((*it).elems_cap & 3, ((*it).elems_cap >> 2) as usize) };
+    let (mode, s) = unsafe { (*Object::aux(it) & 3, (*Object::aux(it) >> 2) as usize) };
     let mut i = unsafe { (*it).elems_len } as usize;
     let e = current(entries(it), &mut i, s);
     hold_entries(it, object_value(e));

@@ -121,8 +121,11 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     unsafe {
         (*o).code = desc.to_bits() as *const crate::vm::Code;
         (*o).elems_len = atom.0;
+        // (Its class's root shape takes no element store: see
+        // `Vm::root_shape`. Not a unique shape of its own, which would
+        // never be freed.)
+        (*o).flags |= crate::object::NOT_EXTENSIBLE;
     }
-    vm.prevent_extensions(o);
     vm.symbols.insert(atom, o);
     object_value(o)
 }

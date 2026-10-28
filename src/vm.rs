@@ -1525,15 +1525,19 @@ impl Vm {
         if proto.is_cell() {
             self.make_prototype(as_object(proto));
         }
+        let primitive = matches!(class, Class::BigInt | Class::Symbol);
         let s = self.add_shape(Shape {
             class,
             proto,
             capacity: Cell::new(capacity),
             slots: Slots::empty(),
-            elems: FieldType::None,
+            // (BigInts and symbols are made not extensible, sharing this
+            // shape: elements of any type, so that no store generalizes
+            // them, as `Vm::unique_shape`'s with `no_elements`.)
+            elems: if primitive { FieldType::Any } else { FieldType::None },
             // (No value fits a typed array's or buffer's bytes, so stores'
             // fast paths never take them.)
-            elems_code: if matches!(class, Class::Array | Class::TypedArray) || class.no_elements() {
+            elems_code: if primitive || matches!(class, Class::Array | Class::TypedArray) || class.no_elements() {
                 NO_ELEMENTS
             } else {
                 0

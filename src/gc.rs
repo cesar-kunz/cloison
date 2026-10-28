@@ -61,6 +61,13 @@ const GROWTH: usize = 2;
 /// are: marking them costs every object traced a check (Splay, which makes
 /// few, spent 1.5% of its cycles on it in every marking).
 const SHAPE_SWEEP_MIN: usize = 256;
+/// A full collection also runs once the shapes made since the last that
+/// collected them are as many as the shapes it left, and at least this
+/// many (about 48 MB): shapes are outside the heap, so a program whose
+/// garbage is mostly shapes (objects' unique ones, prototypes') would
+/// otherwise rarely start one. (From 65,536, sass's 4.4M shapes cost it
+/// 2.5% more instructions, from 262,144 0.5%, for a peak a little lower.)
+const SHAPE_FULL_MIN: usize = 1 << 18;
 const FULL_MIN: usize = 64 << 20;
 
 /// The collector's state, in the heap.
@@ -1347,6 +1354,12 @@ impl Vm {
         self.heap.finish_sweep();
     }
 
+    /// Enough shapes made for a full collection (see [`SHAPE_FULL_MIN`]).
+    fn shapes_full(&self) -> bool {
+        let made = self.shapes_made();
+        made >= SHAPE_FULL_MIN && 2 * made >= self.shape_count()
+    }
+
     #[cold]
     #[inline(never)]
     fn collect(&mut self, regs: *mut Value) {
@@ -1375,6 +1388,7 @@ impl Vm {
             || self.heap.allocated() > gc.full_at
             || gc.promoted > gc.room.max(FULL_MIN)
             || gc.code_full()
+            || self.shapes_full()
         {
             if gc.stw || gc.always_full { Collection::Full } else { Collection::Start }
         } else {

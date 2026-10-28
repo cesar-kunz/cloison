@@ -11211,7 +11211,8 @@ struct Lowering<'a> {
     /// frames are laid out.
     mov_scratch: Vec<usize>,
     /// Parameters of the call being inlined already in the callee's
-    /// registers (a setter's value, see [`Lowering::accessor`]).
+    /// registers (a setter's value, see [`Lowering::accessor`]): for that
+    /// call's moves only (`arg_moves` takes it).
     preset_args: usize,
     /// The call being inlined is an accessor's, whose function the
     /// receiver's shape proves (see [`Lowering::accessor`]).
@@ -15376,7 +15377,11 @@ impl Lowering<'_> {
         } else if i.op != Op::Construct {
             arg(self, 0, this);
         }
-        for p in self.preset_args..nparams {
+        // (Taken: the calls inlined into this callee move all theirs. A
+        // setter calling `this.setAttribute("name", value)` passed it
+        // `value` but not `"name"`, which it then read from a register
+        // nothing wrote: excalidraw's linkedom inputs.)
+        for p in std::mem::take(&mut self.preset_args)..nparams {
             arg(self, 1 + p, (p < argc).then_some((args + p) as u8));
         }
         aliases

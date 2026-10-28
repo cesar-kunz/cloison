@@ -6192,6 +6192,84 @@ fn exit_live(frames: &[FrameRegs], frame: u8, nregs: usize) -> Vec<bool> {
     }
 }
 
+/// Backward liveness by basic block: per instruction, the registers live
+/// into it, from what each instruction reads and writes (`effects`, live
+/// in = live out without the writes, with the reads), over the reachable
+/// instructions; the others keep their `init`. The fixpoint runs over the
+/// blocks (their reads before any write and their writes, composed once),
+/// then one walk back through each block gives its instructions' sets: a
+/// pass per loop depth over every instruction was most of the cost.
+fn live_in_blocks(insns: &[Insn], reach: &[bool], effects: &[(RegSet, RegSet)], init: Vec<RegSet>) -> Vec<RegSet> {
+    let n = insns.len();
+    let mut leader = vec![false; n + 1];
+    leader[0] = true;
+    leader[n] = true;
+    for (i, insn) in insns.iter().enumerate() {
+        if insn.jumps() {
+            leader[insn.target.min(n)] = true;
+        }
+        if insn.jumps() || !insn.falls_through() || i + 1 < n && reach[i + 1] != reach[i] {
+            leader[i + 1] = true;
+        }
+    }
+    // Blocks `[start, end)`, the reachable ones' reads before a write
+    // (`gen`) and writes (`kill`).
+    let starts: Vec<usize> = (0..n).filter(|&i| leader[i]).collect();
+    let mut block_of = vec![0u32; n];
+    let mut blocks: Vec<(usize, usize, RegSet, RegSet)> = Vec::with_capacity(starts.len());
+    for (b, &s) in starts.iter().enumerate() {
+        let e = starts.get(b + 1).copied().unwrap_or(n);
+        let (mut g, mut k) = ([0u64; 4], [0u64; 4]);
+        for i in (s..e).rev() {
+            block_of[i] = b as u32;
+            let (r, w) = &effects[i];
+            for j in 0..4 {
+                g[j] = (g[j] & !w[j]) | r[j];
+                k[j] |= w[j];
+            }
+        }
+        blocks.push((s, e, g, k));
+    }
+    // Per block, what is live into it (the instructions' `init` for those
+    // not reached).
+    let mut block_in: Vec<RegSet> = blocks.iter().map(|b| init[b.0]).collect();
+    let live_out = |block_in: &[RegSet], b: usize| {
+        let mut out = [0; 4];
+        for s in succs(insns, blocks[b].1 - 1).filter(|&s| s < n) {
+            rs_or(&mut out, &block_in[block_of[s] as usize]);
+        }
+        out
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..blocks.len()).rev().filter(|&b| reach[blocks[b].0]) {
+            let out = live_out(&block_in, b);
+            let (_, _, g, k) = &blocks[b];
+            let mut l = [0; 4];
+            for j in 0..4 {
+                l[j] = (out[j] & !k[j]) | g[j];
+            }
+            if !rs_eq(&l, &block_in[b]) {
+                block_in[b] = l;
+                changed = true;
+            }
+        }
+    }
+    let mut live_in = init;
+    for b in (0..blocks.len()).filter(|&b| reach[blocks[b].0]) {
+        let mut l = live_out(&block_in, b);
+        for i in (blocks[b].0..blocks[b].1).rev() {
+            let (r, w) = &effects[i];
+            for j in 0..4 {
+                l[j] = (l[j] & !w[j]) | r[j];
+            }
+            live_in[i] = l;
+        }
+    }
+    live_in
+}
+
 /// Per instruction, the registers live into it (backward dataflow, over
 /// the reachable instructions): read before being written on some path,
 /// by an instruction or by the interpreter after a bail.
@@ -6267,26 +6345,7 @@ fn reg_live_in_mats(
             rs_add(&mut effects[at].0, f as usize);
         }
     }
-    let mut live_in: Vec<RegSet> = vec![[0; 4]; n];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for i in (0..n).rev().filter(|&i| reach[i]) {
-            let mut live: RegSet = [0; 4];
-            for s in succs(insns, i).filter(|&s| s < n) {
-                rs_or(&mut live, &live_in[s]);
-            }
-            let (reads, writes) = &effects[i];
-            for (l, (r, w)) in live.iter_mut().zip(reads.iter().zip(writes)) {
-                *l = (*l & !w) | r;
-            }
-            if !rs_eq(&live, &live_in[i]) {
-                live_in[i] = live;
-                changed = true;
-            }
-        }
-    }
-    live_in
+    live_in_blocks(insns, reach, &effects, vec![[0; 4]; n])
 }
 
 /// Registers that may be pinned (kept unboxed in a slot). A pinned register
@@ -8182,27 +8241,16 @@ impl JitCode {
                     }
                 }
                 // Those are uses: live back to where they were written.
-                let uses = l.clone();
-                let mut changed = true;
-                while changed {
-                    changed = false;
-                    for k in (0..n).rev().filter(|&k| reach[k]) {
-                        let mut out = [0; 4];
-                        for s in succs(insns, k).filter(|&s| s < n) {
-                            rs_or(&mut out, &l[s]);
+                let effects: Vec<(RegSet, RegSet)> = (l.iter().zip(insns))
+                    .map(|(u, i)| {
+                        let mut w = [0; 4];
+                        if i.op == Op::Star {
+                            rs_add(&mut w, i.reg as usize);
                         }
-                        if insns[k].op == Op::Star {
-                            let w = insns[k].reg as usize;
-                            out[w / 64] &= !(1 << (w % 64));
-                        }
-                        rs_or(&mut out, &uses[k]);
-                        if !rs_eq(&out, &l[k]) {
-                            l[k] = out;
-                            changed = true;
-                        }
-                    }
-                }
-                l
+                        (*u, w)
+                    })
+                    .collect();
+                live_in_blocks(insns, reach, &effects, l)
             });
         let interferes = share_live.as_ref().map(|l| interference(insns, l, nregs));
         // The homes an exit before instruction `i` writes back; for an exit

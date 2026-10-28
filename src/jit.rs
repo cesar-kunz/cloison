@@ -11710,50 +11710,45 @@ fn interp_live(
     for &(g, p, a) in &out.aliases {
         aliases[g as usize].push((p as usize, a as usize));
     }
-    // Per frame, the pcs asked about (sorted), and the registers restored
-    // at each: each restore marks the range of them it covers, which a
-    // sweep turns into sets. (Searching all restores at every instruction
-    // was 43% of lowering Mandreel.)
-    let mut has = vec![false; out.frames.len()];
-    for r in out.restores.iter().filter(|r| matches!(r.value, Restored::Reg(_))) {
-        has[r.frame as usize] = true;
+    // Per frame, its restores from registers. A frame with many gets the
+    // registers restored at each pc asked about, from a sweep over them
+    // sorted, each restore marking the range it covers; the others are
+    // searched. (Searching all restores at every instruction was 43% of
+    // lowering Mandreel.)
+    let mut restores: Vec<Vec<(usize, usize, u8)>> = vec![Vec::new(); out.frames.len()];
+    for r in &out.restores {
+        if let Restored::Reg(x) = r.value {
+            restores[r.frame as usize].push((r.after, r.upto, x));
+        }
     }
+    const SWEPT: usize = 16;
     let mut pcs: Vec<Vec<usize>> = vec![Vec::new(); out.frames.len()];
-    if has.contains(&true) {
-        for insn in out.insns.iter().filter(|i| has[i.frame as usize]) {
+    let mut restored: Vec<Vec<RegSet>> = vec![Vec::new(); out.frames.len()];
+    if restores.iter().any(|r| r.len() > SWEPT) {
+        for insn in out.insns.iter().filter(|i| restores[i.frame as usize].len() > SWEPT) {
             pcs[insn.frame as usize].push(insn.pc);
         }
-        for f in out.frames.iter().skip(1).filter(|f| has[f.parent]) {
+        for f in out.frames.iter().skip(1).filter(|f| restores[f.parent].len() > SWEPT) {
             pcs[f.parent].push(f.ret_pc);
         }
     }
-    let mut restored: Vec<Vec<RegSet>> = Vec::with_capacity(out.frames.len());
-    let mut events: Vec<Vec<(usize, u8, bool)>> = vec![Vec::new(); out.frames.len()];
-    for p in &mut pcs {
+    for (g, p) in pcs.iter_mut().enumerate().filter(|(g, _)| restores[*g].len() > SWEPT) {
         p.sort_unstable();
         p.dedup();
-    }
-    for r in &out.restores {
-        if let Restored::Reg(x) = r.value {
-            let p = &pcs[r.frame as usize];
-            let (lo, hi) = (p.partition_point(|&q| q <= r.after), p.partition_point(|&q| q <= r.upto));
+        let mut ev: Vec<(usize, u8, bool)> = Vec::with_capacity(2 * restores[g].len());
+        for &(after, upto, x) in &restores[g] {
+            let (lo, hi) = (p.partition_point(|&q| q <= after), p.partition_point(|&q| q <= upto));
             if lo < hi {
-                events[r.frame as usize].push((lo, x, true));
-                events[r.frame as usize].push((hi, x, false));
+                ev.push((lo, x, true));
+                ev.push((hi, x, false));
             }
-        }
-    }
-    for (g, ev) in events.iter_mut().enumerate() {
-        if ev.is_empty() {
-            restored.push(Vec::new());
-            continue;
         }
         ev.sort_unstable_by_key(|e| e.0);
         let mut count = [0u32; 256];
         let mut set = [0; 4];
-        let mut sets = Vec::with_capacity(pcs[g].len());
+        let mut sets = Vec::with_capacity(p.len());
         let mut e = 0;
-        for k in 0..pcs[g].len() {
+        for k in 0..p.len() {
             while e < ev.len() && ev[e].0 == k {
                 let (_, x, start) = ev[e];
                 let c = &mut count[x as usize];
@@ -11771,7 +11766,7 @@ fn interp_live(
             }
             sets.push(set);
         }
-        restored.push(sets);
+        restored[g] = sets;
     }
     // What frame `g` reads at `pc` (as its bytecode does, renamed), and
     // registers restored for it there.
@@ -11784,8 +11779,14 @@ fn interp_live(
         }
         // A restored register's source, then a parameter's argument (the
         // source may be a parameter: see `materialize`).
-        if !restored[g].is_empty() {
+        if restores[g].len() > SWEPT {
             rs_or(&mut set, &restored[g][pcs[g].binary_search(&pc).unwrap()]);
+        } else {
+            for &(after, upto, x) in &restores[g] {
+                if after < pc && pc <= upto {
+                    rs_add(&mut set, x as usize);
+                }
+            }
         }
         for &(p, a) in &aliases[g] {
             if rs_has(&set, p) {

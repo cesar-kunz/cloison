@@ -347,6 +347,77 @@ impl Object {
         }
     }
 
+    /// The capacity of `this`'s out-of-line slots: their cell's (see
+    /// `layout::props_cap`).
+    ///
+    /// # Safety
+    /// `this` must be an object, not a string (whose `props` is a cons
+    /// string's half).
+    #[inline(always)]
+    pub unsafe fn props_cap(this: *const Object) -> u32 {
+        unsafe {
+            let cap = crate::layout::props_cap(crate::layout::header(this));
+            debug_assert!((*this).class == Class::String || cap == (*this).props_cap);
+            cap
+        }
+    }
+
+    /// The capacity of `this`'s elements: their cell's (see
+    /// `layout::elems_cap`).
+    ///
+    /// # Safety
+    /// `this` must be an object whose `elems` are values (not a string, a
+    /// typed array, a buffer or another class whose `elems` are bytes).
+    #[inline(always)]
+    pub unsafe fn elems_cap(this: *const Object) -> u32 {
+        unsafe {
+            let cap = crate::layout::elems_cap(crate::layout::header(this));
+            debug_assert_eq!(cap, (*this).elems_cap);
+            cap
+        }
+    }
+
+    /// The `u32` of a class with one of its own (see `layout::Header`): a
+    /// buffer's maximum byte length, a view's length (or
+    /// `typed::TRACKING`), a collection iterator's `IterMode` and stride, a
+    /// BigInt's sign.
+    ///
+    /// # Safety
+    /// `this` must be an object of such a class.
+    #[inline(always)]
+    pub unsafe fn aux(this: *mut Object) -> *mut u32 {
+        unsafe { &raw mut (*this).elems_cap }
+    }
+
+    /// The words of units after a flat string's header (see
+    /// `heap::cell_size`).
+    ///
+    /// # Safety
+    /// `this` must be a string.
+    #[inline(always)]
+    pub unsafe fn string_words(this: *const Object) -> usize {
+        unsafe { (*this).elems_cap as usize }
+    }
+
+    /// Set [`Object::string_words`].
+    ///
+    /// # Safety
+    /// `this` must be a new string.
+    #[inline(always)]
+    pub unsafe fn set_string_words(this: *mut Object, words: usize) {
+        unsafe { (*this).elems_cap = u32::try_from(words).expect("string too long") }
+    }
+
+    /// A string's atom as a property key plus one, once found (0: none
+    /// yet; see `Vm::property_key`).
+    ///
+    /// # Safety
+    /// `this` must be a string.
+    #[inline(always)]
+    pub unsafe fn string_atom(this: *mut Object) -> *mut u32 {
+        unsafe { &raw mut (*this).props_cap }
+    }
+
     /// The slot at `loc` (see [`Shape::location`]).
     ///
     /// # Safety

@@ -13537,7 +13537,7 @@ impl Lowering<'_> {
                     let apply = self.loaded_value(frame, i.reg);
                     let g = self.loaded_value(frame, i.reg2);
                     let is_apply = apply.is_some_and(|v| {
-                        v.is_cell()
+                        crate::builtins::is_class(v, crate::object::Class::Native)
                             && unsafe { (*crate::object::as_object(v)).code == (*vm).function_apply }
                     });
                     let (a, n) = f.args;

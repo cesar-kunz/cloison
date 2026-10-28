@@ -88,7 +88,7 @@ mod layout;
 use layout::{
     CARD, COLOR, CONS_MIN, DirectSite, GRANULE, SLICE, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
-    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, header, header_word, meta, payload_cell, set_header_word, dispatch_slot,
+    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta, payload_cell, props_cap, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
 };
 
@@ -5078,7 +5078,7 @@ unsafe fn mega_store(tag: NumberTag, o: Value, v: Value, int: bool) -> bool {
         if core::hint::unlikely(new != 0) {
             // (Entry 0's `new_shape`: the prototype epoch's address.)
             let epoch = *((*t.sub(1)).new_shape as *const u32);
-            if (*e).epoch != epoch || loc < 0 && !loc as u32 >= (*header(p)).props_cap {
+            if (*e).epoch != epoch || loc < 0 && !loc as u32 >= props_cap(header(p)) {
                 return false;
             }
             (*header(p)).shape = new;
@@ -5142,10 +5142,10 @@ unsafe fn tro_store(tag: NumberTag, o: *mut u8, v: Value, barrier_needed: bool) 
 }
 
 /// Whether object `o`'s `props` have room for the slot at byte `imm`
-/// (`props_cap` counts their slots).
+/// (their cell's capacity, `props_cap`, counts slots).
 #[inline(always)]
 unsafe fn props_room(o: *mut u8) -> bool {
-    (imm() as u32 / 8) < unsafe { (*header(o)).props_cap }
+    (imm() as u32 / 8) < unsafe { props_cap(header(o)) }
 }
 
 /// A keyed load stencil: `$ok` vets the receiver `$o`; `$int_key` says the
@@ -5433,8 +5433,8 @@ macro_rules! property_location {
         // `set_keyed_`, at the array's length too while it has room (one
         // more element); else through the runtime, leaving where that
         // can't store.
-        // target x86_64 set_keyed_ap_g{}: 37 fallthrough 20 the checks (18), `elems_len` bumped before the store, the store (2), the barrier in place (15) (fall-through: code 2 with a non-number, 23; designated path 67: r8/r9/rsi/rdx/rcx spilled, r15 borrowed; judged 2026-10-26)
-        // target x86_64 set_keyed_ap_m: 38 fallthrough 21 (fall-through 21; judged 2026-10-26)
+        // target x86_64 set_keyed_ap_g{}: 37 fallthrough 22 the checks (18), `elems_len` bumped before the store, the store (2), the barrier in place (15) (fall-through: code 2 with a non-number, 25 with the append's `test r10, r10; je` for no elements and `cmp [r10-4]`, the capacity in their cell; designated path 67: r8/r9/rsi/rdx/rcx spilled, r15 borrowed; judged 2026-10-28)
+        // target x86_64 set_keyed_ap_m: 38 fallthrough 24 (fall-through 24; judged 2026-10-28)
         // target aarch64 set_keyed_ap_g{}: 38 fallthrough 19 the checks (21), `add; str` the length, `ldr; str`, the barrier (15) (fall-through 19; designated path 44; judged 2026-10-26)
         // target aarch64 set_keyed_ap_m: 39 fallthrough 19 (judged 2026-10-26)
         stencil_slow!("set_keyed_ap_", loc!($loc); |s| {
@@ -5446,7 +5446,7 @@ macro_rules! property_location {
                 let v = s.acc;
                 let fits = fits_code(s.tag, (*shape_of(p)).elems_code, v);
                 let len = (*header(p)).elems_len;
-                if fits && (i < len || i == len && len < (*header(p)).elems_cap) {
+                if fits && (i < len || i == len && len < elems_cap(header(p))) {
                     let at = ((*header(p)).elems.cast::<Value>()).add(i as usize);
                     *at = v;
                     barrier(s.tag, payload_cell((*header(p)).elems), at, v);
@@ -5470,10 +5470,10 @@ macro_rules! property_location {
         // `set_keyed_ap_` of an int32 `acc` (`_i`), the key in r11 / x15
         // (`key_x`) and in memory too, for the helper: no barrier, no
         // registers saved (PdfJS's `decrypt`, `decryptedString[i] = …`).
-        // target x86_64 set_keyed_ap_i_g{}: 20 now 26 the checks (15), `inc eax; mov [rdi+32], eax` before the store, `or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12` (judged 2026-10-26)
-        // target x86_64 set_keyed_ap_i_m: 21 now 32 (r9 and r12 borrowed as scratch; judged 2026-10-26)
-        // target aarch64 set_keyed_ap_i_g{}: 22 now 25 (judged 2026-10-26)
-        // target aarch64 set_keyed_ap_i_m: 23 now 26 (judged 2026-10-26)
+        // target x86_64 set_keyed_ap_i_g{}: 20 fallthrough 14 the checks (15), `inc eax; mov [rdi+32], eax` before the store, `or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12` (the count stops at `i < len`'s `jmp` to the store, which the append's `test r10, r10; je; cmp [r10-4], r11d` for the capacity in the elements' cell joins; judged 2026-10-28)
+        // target x86_64 set_keyed_ap_i_m: 21 fallthrough 19 (as `_g{}`; r9 and r12 borrowed as scratch; judged 2026-10-28)
+        // target aarch64 set_keyed_ap_i_g{}: 22 fallthrough 15 (the count stops at `i < len`'s `b` to the store, which the append's test of the capacity in the elements' cell joins; judged 2026-10-28)
+        // target aarch64 set_keyed_ap_i_m: 23 fallthrough 16 (as `_g{}`; judged 2026-10-28)
         stencil_slow!("set_keyed_ap_i_", loc!($loc); |s| {
             let key = key_x();
             let o = get!($loc, s);
@@ -5481,7 +5481,7 @@ macro_rules! property_location {
                 let p = o.to_bits() as *mut u8;
                 let i = key as u32;
                 let len = (*header(p)).elems_len;
-                if (*shape_of(p)).elems_code <= FIELD_NUM && (i < len || i == len && len < (*header(p)).elems_cap) {
+                if (*shape_of(p)).elems_code <= FIELD_NUM && (i < len || i == len && len < elems_cap(header(p))) {
                     *((*header(p)).elems.cast::<Value>()).add(i as usize) =
                         Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
                     if i == len {
@@ -5718,10 +5718,10 @@ macro_rules! property_location {
             store_imm(props(get!($loc, s).to_bits() as *mut u8), s.acc);
             next!(s)
         });
-        // target x86_64 set_tro_nc_g{}: 23 fallthrough 30 room (4), shape (2), `mov rax, [rdi+16]; mov [rax+imm], r12`, the barrier in place (15) (number store is the fall-through, 12; cell path 33; judged 2026-10-26)
-        // target x86_64 set_tro_nc_m: 24 fallthrough 31 (fall-through 13; cell path 34; judged 2026-10-26)
-        // target aarch64 set_tro_nc_g{}: 26 now 28 room (5), shape (4), `ldr; str`, the barrier (15) (judged 2026-10-26)
-        // target aarch64 set_tro_nc_m: 27 now 29 (judged 2026-10-26)
+        // target x86_64 set_tro_nc_g{}: 25 fallthrough 32 room (6: `props` null, its cell's capacity), shape (2), `mov rax, [rdi+16]; mov [rax+imm], r12`, the barrier in place (15) (number store is the fall-through, 12; cell path 35; judged 2026-10-28)
+        // target x86_64 set_tro_nc_m: 26 fallthrough 33 (fall-through 13; cell path 36; judged 2026-10-28)
+        // target aarch64 set_tro_nc_g{}: 28 now 29 room (7: `props` null, its cell's capacity), shape (4), `ldr; str`, the barrier (15) (judged 2026-10-28)
+        // target aarch64 set_tro_nc_m: 29 now 30 (judged 2026-10-28)
         set_tro!("set_tro_nc_", $loc, false, true);
         set_tro!("set_tro_n_nc_", $loc, false, false);
         // Elements at `elems`, `elems_len` of them. A hole is `EMPTY` (0).
@@ -5916,7 +5916,7 @@ macro_rules! property_location {
         // target x86_64 set_named_rt_g{}: 42 fallthrough 25 the probe (way 1 cold), `mov [rdi+r11], r12`, the barrier (16): an any-value field's 46 (the fall-through: an int32 field's store of a non-int32, to `__slow`; was 82 with tag and slots spilled, 2026-10-28)
         // target x86_64 set_named_rt_m: 43 now 54 as `_g`, the slot loaded first, with `push rbp` (2026-10-28)
         // target aarch64 set_named_rt_g{}: 47 the probe (way 1 cold), `str x20, [x24, x10]`, the barrier (15) (2026-10-28)
-        // target aarch64 set_named_rt_m: 48 (2026-10-28)
+        // target aarch64 set_named_rt_m: 48 fallthrough 43 (the fall-through stores a value no barrier needs, the barrier's test and a transition's capacity in `props`' cell cold; 2026-10-28)
         stencil_slow!("set_named_rt_", loc!($loc); |s| {
             if mega_store(s.tag, get!($loc, s), s.acc, false) {
                 next!(s)
@@ -6844,7 +6844,7 @@ const FIRST_ELEMENTS: usize = 4;
 #[inline(always)]
 unsafe fn first_elements(o: *mut u8) {
     unsafe {
-        if (*header(o)).elems_cap != 0 {
+        if elems_cap(header(o)) != 0 {
             return;
         }
         let heap = imm64() as *mut HeapPtrs;
@@ -6971,8 +6971,8 @@ unsafe fn pop_class_flags(a: Value) -> u16 {
 }
 macro_rules! array_methods {
     ($loc:tt, $nc:literal, $array:expr, $poppable:expr) => {
-        // target x86_64 array_push_nc_g{}: 36 now 40 the barrier's cell test `test r12, r14; jne; test r12b, 2; jne; test r12, r12; je` (not 9), `elems` not reloaded, no `push rbp` (judged 2026-10-26)
-        // target x86_64 array_push_nc_m: 38 now 43 as `_g{}`, the receiver loaded again for the length store (judged 2026-10-26)
+        // target x86_64 array_push_nc_g{}: 38 now 42 the capacity in the elements' cell (`test rax, rax; je` for none, `cmp r10d, [rax-4]`), the barrier's cell test `test r12, r14; jne; test r12b, 2; jne; test r12, r12; je` (not 9), `elems` not reloaded, no `push rbp` (judged 2026-10-28)
+        // target x86_64 array_push_nc_m: 40 now 45 as `_g{}`, the receiver loaded again for the length store (judged 2026-10-28)
         // target aarch64 array_push_nc_g{}: 10 the count stops at the code-2 `b slow` (a dispatch prefix); executed, an object no mark 26 for 24 (`elems` reloaded, `add`+`str` for `str [x9, w8, uxtw #3]`), a number 13 for 12 (judged 2026-10-26)
         // target aarch64 array_push_nc_m: 11 as `_g{}` (judged 2026-10-26)
         stencil_slow!("array_push_", $nc, loc!($loc); |s| {
@@ -6984,7 +6984,7 @@ macro_rules! array_methods {
             let o = a.to_bits() as *mut u8;
             let fits = fits_code(s.tag, (*shape_of(o)).elems_code, v);
             let len = (*header(o)).elems_len;
-            if !fits || len >= (*header(o)).elems_cap {
+            if !fits || len >= elems_cap(header(o)) {
                 slow!(s)
             }
             let at = ((*header(o)).elems.cast::<Value>()).add(len as usize);
@@ -7001,7 +7001,7 @@ macro_rules! array_methods {
             let o = a.to_bits() as *mut u8;
             let len = (*header(o)).elems_len;
             first_elements(o);
-            if len < (*header(o)).elems_cap {
+            if len < elems_cap(header(o)) {
                 let to = push_transition(s.tag, shape_of(o), v);
                 if to != 0 {
                     (*header(o)).shape = to;
@@ -7018,10 +7018,10 @@ macro_rules! array_methods {
         });
         // An int32 fits elements of any type but objects of a shape
         // (codes 0 to 2; `NO_ELEMENTS` is 3, a shape's address more).
-        // target x86_64 array_push_i_nc_g{}: 11 now 12 `or r12, r14` alone boxes the int32 (not `mov r10d, r12d; or r10, r14`) (judged 2026-10-26)
-        // target x86_64 array_push_i_nc_m: 12 now 13 as `_g{}` plus the receiver's load (judged 2026-10-26)
-        // target aarch64 array_push_i_nc_m: 13 now 14 as `_g{}` plus the receiver's load (judged 2026-10-26)
-        // target aarch64 array_push_i_nc_g{}: 12 now 13 `orr x10, x22, x20` alone boxes the int32 (docs/arm64-targets.md)
+        // target x86_64 array_push_i_nc_g{}: 13 now 14 `or r12, r14` alone boxes the int32 (not `mov r10d, r12d; or r10, r14`), the capacity in the elements' cell (`test rax, rax; je` for none) (judged 2026-10-28)
+        // target x86_64 array_push_i_nc_m: 14 now 15 as `_g{}` plus the receiver's load (judged 2026-10-28)
+        // target aarch64 array_push_i_nc_m: 15 now 16 as `_g{}` plus the receiver's load (judged 2026-10-28)
+        // target aarch64 array_push_i_nc_g{}: 14 now 15 `orr x10, x22, x20` alone boxes the int32 (docs/arm64-targets.md), the capacity in the elements' cell (`cbz` for none, `ldur w, [x, #-4]`; judged 2026-10-28)
         stencil_slow!("array_push_i_", $nc, loc!($loc); |s| {
             let a = get!($loc, s);
             if !$array(s.tag, a) {
@@ -7029,7 +7029,7 @@ macro_rules! array_methods {
             }
             let o = a.to_bits() as *mut u8;
             let len = (*header(o)).elems_len;
-            if (*shape_of(o)).elems_code > FIELD_NUM || len >= (*header(o)).elems_cap {
+            if (*shape_of(o)).elems_code > FIELD_NUM || len >= elems_cap(header(o)) {
                 slow!(s)
             }
             *((*header(o)).elems.cast::<u64>()).add(len as usize) = s.acc.to_bits() as u32 as u64 | s.tag.to_bits();
@@ -7043,7 +7043,7 @@ macro_rules! array_methods {
             let o = a.to_bits() as *mut u8;
             let len = (*header(o)).elems_len;
             first_elements(o);
-            if len < (*header(o)).elems_cap {
+            if len < elems_cap(header(o)) {
                 let to = push_transition(s.tag, shape_of(o), v);
                 if to != 0 {
                     (*header(o)).shape = to;

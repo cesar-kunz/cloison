@@ -3234,7 +3234,7 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
 /// path grows them).
 #[inline(always)]
 unsafe fn has_room(o: *mut Object, loc: i32) -> bool {
-    loc >= 0 || unsafe { (!loc as u32) < (*o).props_cap }
+    loc >= 0 || unsafe { (!loc as u32) < Object::props_cap(o) }
 }
 
 pub(crate) fn current_vm() -> *mut Vm {

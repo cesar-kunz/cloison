@@ -313,7 +313,7 @@ pub(crate) fn binding_accessor(vm: &mut Vm, setter: bool, data: &[Value]) -> Val
 
 /// Whether `v` is a direct `eval`'s binding's getter.
 pub(crate) fn is_binding_get(vm: &Vm, v: Value) -> bool {
-    crate::props::is_object(v) && unsafe { (*as_object(v)).code == (*root(vm, Root::BindingGet)).code }
+    crate::builtins::is_class(v, Class::Native) && unsafe { (*as_object(v)).code == (*root(vm, Root::BindingGet)).code }
 }
 
 pub(crate) fn slot(o: *mut Object, i: usize) -> Value {

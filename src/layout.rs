@@ -225,6 +225,36 @@ pub const fn header_word(class: Class, flags: u8, cap: u64) -> u64 {
     class as u64 | (flags as u64) << 8 | cap << 16
 }
 
+/// The capacity of the array of values whose payload `p` is, from its
+/// header word (`VALUES | cap << 32`: the 32 bits before `p`, as both
+/// targets are little-endian); 0 for none (`p` null).
+///
+/// # Safety
+/// `p` must be null or an array of values' payload.
+#[inline(always)]
+pub unsafe fn values_cap<T>(p: *const T) -> u32 {
+    const _: () = assert!(cfg!(target_endian = "little"));
+    if p.is_null() { 0 } else { unsafe { *(p as *const u32).sub(1) } }
+}
+
+/// The out-of-line slots' capacity of the object at `h`: their cell's.
+///
+/// # Safety
+/// `h` must be an object's header, its `props` null or out-of-line slots.
+#[inline(always)]
+pub unsafe fn props_cap(h: *const Header) -> u32 {
+    unsafe { values_cap((*h).props) }
+}
+
+/// The elements' capacity of the object at `h`: their cell's.
+///
+/// # Safety
+/// `h` must be an object's header, its `elems` null or an array of values.
+#[inline(always)]
+pub unsafe fn elems_cap(h: *const Header) -> u32 {
+    unsafe { values_cap((*h).elems) }
+}
+
 /// Write the header word of a new object at `h` ([`header_word`]).
 ///
 /// # Safety

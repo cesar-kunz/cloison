@@ -1,6 +1,6 @@
 //! BigInt (ECMA-262 §6.1.6.2, §21.2): arbitrary-precision integers, a
 //! primitive kept in an immutable cell of class `BigInt` (as a symbol is):
-//! its sign in `elems_cap` (1: negative), its magnitude's 32-bit limbs, least
+//! its sign in its `aux` (1: negative), its magnitude's 32-bit limbs, least
 //! significant first and none of them a leading zero (zero has none), in
 //! `elems` (a buffer of bytes), their count in `elems_len`. Its shape's
 //! prototype is `BigInt.prototype`, for its methods.
@@ -11,7 +11,7 @@
 
 use std::cmp::Ordering;
 
-use crate::object::{Class, as_object, object_value};
+use crate::object::{Class, Object, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Error, Result, Vm};
 
@@ -517,7 +517,7 @@ pub(crate) fn big_of(v: Value) -> Big {
         let o = as_object(v);
         let n = (*o).elems_len as usize;
         let limbs = if n == 0 { &[][..] } else { std::slice::from_raw_parts((*o).elems.cast::<u32>(), n) };
-        Big { neg: (*o).elems_cap == 1, mag: limbs.to_vec() }
+        Big { neg: *Object::aux(o) == 1, mag: limbs.to_vec() }
     }
 }
 
@@ -526,7 +526,7 @@ pub(crate) fn new_bigint(vm: &mut Vm, b: Big) -> Value {
     let proto = if vm.bigint_prototype.is_null() { Value::NULL } else { object_value(vm.bigint_prototype) };
     let o = vm.new_object_with(Class::BigInt, proto, 0);
     unsafe {
-        (*o).elems_cap = b.neg as u32;
+        *Object::aux(o) = b.neg as u32;
         if !b.mag.is_empty() {
             let p = vm.heap.alloc_bytes(4 * b.mag.len().next_multiple_of(2)).cast::<u32>();
             std::ptr::copy_nonoverlapping(b.mag.as_ptr(), p, b.mag.len());

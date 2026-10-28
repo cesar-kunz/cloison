@@ -1711,11 +1711,12 @@ impl Vm {
     #[inline]
     pub(crate) fn reserve_props(&mut self, o: *mut Object, i: u32) {
         unsafe {
-            if i >= (*o).props_cap {
-                let cap = ((*o).props_cap * 2).max(4).max(i + 1);
+            let old = Object::props_cap(o);
+            if i >= old {
+                let cap = (old * 2).max(4).max(i + 1);
                 let p = self.heap.alloc_values(cap as usize);
                 if !(*o).props.is_null() {
-                    std::ptr::copy_nonoverlapping((*o).props, p, (*o).props_cap as usize);
+                    std::ptr::copy_nonoverlapping((*o).props, p, old as usize);
                 }
                 (*o).props = p;
                 crate::heap::barrier_young(o.cast(), &raw const (*o).props);
@@ -3345,12 +3346,12 @@ impl Vm {
         {
             return Key::Index(d as u32);
         }
-        // A string's atom, once found, is kept in its `props_cap` (plus
-        // one), which a string doesn't use otherwise: a key looked up again
-        // isn't converted and hashed again (PdfJS's `map[command]`).
+        // A string's atom, once found, is kept in it (`Object::string_atom`):
+        // a key looked up again isn't converted and hashed again (PdfJS's
+        // `map[command]`).
         let string = string_len(key).is_some();
         if string {
-            let cached = unsafe { (*as_object(key)).props_cap };
+            let cached = unsafe { *Object::string_atom(as_object(key)) };
             if cached != 0 {
                 return Key::Name(Atom(cached - 1));
             }
@@ -3364,7 +3365,7 @@ impl Vm {
         let name = crate::js::lex::units_to_string(&units);
         let a = self.intern(&name);
         if string && a.0 < u32::MAX {
-            unsafe { (*as_object(key)).props_cap = a.0 + 1 };
+            unsafe { *Object::string_atom(as_object(key)) = a.0 + 1 };
         }
         Key::Name(a)
     }
@@ -3856,10 +3857,11 @@ impl Vm {
 
     pub(crate) fn reserve_elems(&mut self, o: *mut Object, n: usize) {
         unsafe {
-            if n <= (*o).elems_cap as usize {
+            let old = Object::elems_cap(o) as usize;
+            if n <= old {
                 return;
             }
-            let cap = n.max((*o).elems_cap as usize * 2).max(4);
+            let cap = n.max(old * 2).max(4);
             let cap = u32::try_from(cap).expect("array too large");
             let len = if (*o).elems.is_null() { 0 } else { (*o).elems_len as usize };
             let e = self.heap.alloc_values_from(cap as usize, len);
@@ -3972,7 +3974,7 @@ impl Vm {
     }
 
     /// A string cell with `words` words of units after its header, which
-    /// `elems_cap` records (see `heap::cell_size`).
+    /// it records (`Object::string_words`, see `heap::cell_size`).
     fn alloc_string(&mut self, words: usize) -> *mut Object {
         let o = self
             .heap
@@ -3981,7 +3983,7 @@ impl Vm {
         unsafe {
             o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
                 .write(crate::object::object_header(&*self.string_shape));
-            (*o).elems_cap = u32::try_from(words).expect("string too long");
+            Object::set_string_words(o, words);
         }
         o
     }
@@ -4466,11 +4468,12 @@ impl Vm {
             });
             // Out-of-line room for the slots past the object's capacity.
             let cap = (*new).capacity.get() as usize;
-            if n > cap && n - cap > (*o).props_cap as usize {
-                let want = (n - cap).max((*o).props_cap as usize * 2).max(4);
+            let old = Object::props_cap(o) as usize;
+            if n > cap && n - cap > old {
+                let want = (n - cap).max(old * 2).max(4);
                 let p = self.heap.alloc_values(want);
                 if !(*o).props.is_null() {
-                    std::ptr::copy_nonoverlapping((*o).props, p, (*o).props_cap as usize);
+                    std::ptr::copy_nonoverlapping((*o).props, p, old);
                 }
                 (*o).props = p;
                 crate::heap::barrier_young(o.cast(), &raw const (*o).props);

@@ -238,7 +238,7 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
         (*o).elems_len = (*b).len.load(SeqCst) as u32;
         if growable {
             (*o).flags |= RESIZABLE;
-            (*o).elems_cap = (*b).room as u32;
+            *Object::aux(o) = (*b).room as u32;
             let views = crate::collections::new_weak_set(vm)?;
             (*o).code = object_value(views).to_bits() as *const crate::vm::Code;
         }

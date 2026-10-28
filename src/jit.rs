@@ -8450,8 +8450,23 @@ impl JitCode {
                         entry_state.regs.set(r, Ty::F64);
                     }
                 }
+                // Pinning changes a type only where a register pinned enters
+                // other than a double or a `Star` into one stores an int32
+                // (or nothing yet, `Bot`; see `select_types`): where every
+                // one of them already is a double in the first run, that
+                // run's fixpoint is the pinned one's too. (The pinned run was
+                // 37% of Box2D's passes of `infer`; two thirds of those
+                // changed nothing.)
+                let changes = |pinned: &[bool]| {
+                    (0..nregs).any(|r| pinned[r] && live_at_entry[r] && actual_live.regs[r] != Ty::F64)
+                        || insns.iter().zip(&ins1).any(|(i, st)| {
+                            i.op == Op::Star
+                                && pinned[i.reg as usize]
+                                && st.as_ref().is_some_and(|st| st.acc < Ty::F64)
+                        })
+                };
                 // Nothing pinned: the types are those already inferred.
-                let run = pinned.contains(&true).then(|| {
+                let run = (pinned.contains(&true) && changes(&pinned)).then(|| {
                     infer(
                         insns,
                         entry,

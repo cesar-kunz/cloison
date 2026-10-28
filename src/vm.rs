@@ -5384,8 +5384,6 @@ impl Scan {
                 crate::bytecode::Op::LdaCallee
                     | crate::bytecode::Op::Intrinsic
                     | crate::bytecode::Op::CreateRest
-                    | crate::bytecode::Op::LdaHole
-                    | crate::bytecode::Op::CheckHole
                     | crate::bytecode::Op::CloseUpvalue
                     | crate::bytecode::Op::LdaNewTarget
                     | crate::bytecode::Op::InitialYield

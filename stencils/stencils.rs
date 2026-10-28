@@ -2477,6 +2477,22 @@ stencil!("lda_null"; |s| {
     s.acc = Value::NULL;
     next!(s)
 });
+// target x86_64 lda_hole: 1 `mov r12d, 0x12` (2026-10-28)
+// target aarch64 lda_hole: 1 `mov w20, #0x12` (2026-10-28)
+stencil!("lda_hole"; |s| {
+    s.acc = Value::HOLE;
+    next!(s)
+});
+// A `let` or `const` binding read before its initialization: the
+// interpreter, where the exit resumes, throws.
+// target x86_64 check_hole: 2 `cmp r12, 0x12; je exit` (2026-10-28)
+// target aarch64 check_hole: 2 `cmp x20, #0x12; b.eq exit` (2026-10-28)
+stencil!("check_hole"; |s| {
+    if s.acc == Value::HOLE {
+        exit!(s)
+    }
+    next!(s)
+});
 
 /// The boolean `c` as a value: `false` is 6, `true` 7.
 #[inline(always)]

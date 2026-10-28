@@ -2118,7 +2118,11 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 | Op::LdaTrue
                 | Op::LdaFalse
                 | Op::LdaUndefined
-                | Op::LdaNull => {}
+                | Op::LdaNull
+                | Op::LdaHole => {}
+                // (The binding's name, for the interpreter's error: an
+                // exit leaves the throw to it.)
+                Op::CheckHole => {}
                 op if op.plain() != op => unreachable!("decoded as plain jumps"),
                 // The inline-cache slot goes in `imm`.
                 Op::GetNamed | Op::SetNamed if vm => {
@@ -3493,6 +3497,7 @@ fn may_exit_between(insn: &Insn) -> bool {
                 | Op::LdaConstant
                 | Op::LdaUndefined
                 | Op::LdaNull
+                | Op::LdaHole
                 | Op::LdaTrue
                 | Op::LdaFalse
         )
@@ -3506,7 +3511,7 @@ fn writes_acc(insn: &Insn) -> Option<()> {
             && (insn.jumps()
             || matches!(
                 insn.op,
-                Op::Nop | Op::Jump | Op::Star | Op::SetNamed | Op::SetKeyed | Op::StaGlobal
+                Op::Nop | Op::Jump | Op::Star | Op::SetNamed | Op::SetKeyed | Op::StaGlobal | Op::CheckHole
             ));
     (!keeps).then_some(())
 }
@@ -3716,6 +3721,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 | Op::LdaSmi
                 | Op::LdaUndefined
                 | Op::LdaNull
+                | Op::LdaHole
                 | Op::LdaTrue
                 | Op::LdaFalse
                 | Op::LdaConstant
@@ -4530,16 +4536,21 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             };
             ("jlt_smi", case)
         }
-        Op::LdaTrue | Op::LdaFalse | Op::LdaUndefined | Op::LdaNull => {
+        Op::LdaTrue | Op::LdaFalse | Op::LdaUndefined | Op::LdaNull | Op::LdaHole => {
             out.acc = Any;
             let base = match insn.op {
                 Op::LdaTrue => "lda_true",
                 Op::LdaFalse => "lda_false",
                 Op::LdaUndefined => "lda_undefined",
+                Op::LdaHole => "lda_hole",
                 _ => "lda_null",
             };
             (base, "")
         }
+        // A binding read in its temporal dead zone throws: the exit leaves
+        // it to the interpreter. A number or an object is no hole.
+        Op::CheckHole if st.acc != Any => ("nop", ""),
+        Op::CheckHole => ("check_hole", ""),
         // A power-of-two modulus needs no division (`mod_smi_pow2`, whose
         // immediate is the mask; see `stencil_for`).
         Op::ModSmi => {
@@ -6978,6 +6989,7 @@ fn stencil_for(
                     | "lda_false"
                     | "lda_undefined"
                     | "lda_null"
+                    | "lda_hole"
                     | "lda_global"
                     | "lda_global_oop"
                     | "create_array"
@@ -7028,6 +7040,7 @@ fn acc_liveness(insns: &[Insn], reach: &[bool]) -> (Vec<bool>, Vec<bool>) {
                 | Op::LdaFalse
                 | Op::LdaUndefined
                 | Op::LdaNull
+                | Op::LdaHole
                 | Op::GetNamed
                 | Op::LdaGlobal
                 | Op::Call
@@ -8190,6 +8203,7 @@ impl JitCode {
                             | Op::LdaSmi
                             | Op::LdaUndefined
                             | Op::LdaNull
+                            | Op::LdaHole
                             | Op::LdaTrue
                             | Op::LdaFalse
                             | Op::LdaConstant
@@ -8623,7 +8637,7 @@ impl JitCode {
                 let pure = matches!(
                     sel[i - 1].as_ref().map(|s| s.base),
                     Some("ldar" | "lda_smi" | "lda_undefined" | "lda_null" | "lda_true")
-                        | Some("lda_false" | "lda_constant")
+                        | Some("lda_false" | "lda_hole" | "lda_constant")
                 ) && sel[i - 1].as_ref().is_some_and(|s| s.check.is_none());
                 if dead_star[i] && pure && !acc_live.get(i + 1).copied().unwrap_or(true) {
                     let s = sel[i - 1].as_mut().unwrap();
@@ -8909,6 +8923,7 @@ impl JitCode {
                         | Op::LdaSmi
                         | Op::LdaUndefined
                         | Op::LdaNull
+                        | Op::LdaHole
                         | Op::LdaTrue
                         | Op::LdaFalse => {}
                         Op::SetNamed => {
@@ -11932,6 +11947,7 @@ fn reads_acc(insn: &Insn) -> bool {
                 | Op::LdaSmi
                 | Op::LdaUndefined
                 | Op::LdaNull
+                | Op::LdaHole
                 | Op::LdaTrue
                 | Op::LdaFalse
                 | Op::LdaGlobal

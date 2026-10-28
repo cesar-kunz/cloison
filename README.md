@@ -584,6 +584,12 @@ first), `CLOISON_TIER=<back edges>`, `CLOISON_TIME`,
 compile time over the run; the collections: pauses, heap peak, live peak; and what the JIT keeps, by kind), `CLOISON_EXITS` (exits, entries and runtime calls by count),
 `CLOISON_JIT_DUMP` (`CLOISON_JIT_DUMP_FN=<name>` for one function),
 `CLOISON_JIT_LOG`, `CLOISON_KEYED` (keyed loads' shapes as compiled),
+`CLOISON_JIT_COMPILES` (a function's compilations, 32),
+`CLOISON_JIT_COMPILE_SIZE` (instructions past which it gets fewer, and
+its entries fewer versions, 400), `CLOISON_JIT_VERSIONS` (versions an
+entry keeps before compiling for any types, 4) and
+`CLOISON_JIT_RESERVE_CALLS` (calls a spent function's start waits for its
+last compilation, 1,000), also read when building,
 `CLOISON_PERF_MAP` (names JIT code for `perf`),
 `CLOISON_NO_QUICKEN`, `CLOISON_COUNT`, `CLOISON_CODE_SHIFT`; for the collector,
 `CLOISON_GC_STATS` (each collection), `CLOISON_GC_FRAG` (blocks by occupancy and what could not move, after stop-the-world full collections), `CLOISON_GC_NURSERY` (MiB, fixed; else 8 to 32, grown on minor collections' share of the time),

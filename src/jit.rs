@@ -8543,7 +8543,7 @@ impl JitCode {
                     break (homes, run);
                 }
             };
-            let (ins, sel) = pinned_run.unwrap_or((ins1, sels1));
+            let (ins, mut sel) = pinned_run.unwrap_or((ins1, sels1));
             // Calls to this function are predicted to give what its own
             // `Return`s do, which depends on the prediction. The first round
             // assumes they give what the other `Return`s do (ignoring those
@@ -8555,50 +8555,85 @@ impl JitCode {
             if !root.is_null() {
                 unsafe { (*root).ret_hint.set(own) };
             }
-            let want: Vec<Ty> = (0..n)
-                .map(|i| match (&ins[i], props.get(i), widened) {
-                    (
-                        Some(st),
-                        Some(Prop::Call {
-                            site, direct: true, ..
-                        }),
-                        Some(w),
-                    ) if !w.contains(&i) => {
-                        let site = vm_sites[*site as usize].get();
-                        if unsafe { (*site).self_call } {
-                            return own;
+            let predict = |ins: &[Option<TypeState>], own: Ty| -> Vec<Ty> {
+                (0..n)
+                    .map(|i| match (&ins[i], props.get(i), widened) {
+                        (
+                            Some(st),
+                            Some(Prop::Call {
+                                site, direct: true, ..
+                            }),
+                            Some(w),
+                        ) if !w.contains(&i) => {
+                            let site = vm_sites[*site as usize].get();
+                            if unsafe { (*site).self_call } {
+                                return own;
+                            }
+                            // `new` gives `this`, mostly: what the
+                            // constructor's objects have been.
+                            if insns[i].op == Op::Construct {
+                                return unsafe { runtime_result((*site).cached, Op::Construct) };
+                            }
+                            let (this, args) = call_types(i, st);
+                            match unsafe { direct_version(site, this, &args) } {
+                                Version::Ready(code, _) => Ty::of_result(code.ret),
+                                // Being compiled, further up: what its current
+                                // round predicts.
+                                Version::Busy => unsafe { (*(*site).callee).ret_hint.get() },
+                                Version::None => Ty::Any,
+                            }
                         }
-                        // `new` gives `this`, mostly: what the
-                        // constructor's objects have been.
-                        if insns[i].op == Op::Construct {
-                            return unsafe { runtime_result((*site).cached, Op::Construct) };
+                        (
+                            Some(_),
+                            Some(Prop::Call {
+                                site,
+                                direct: false,
+                                ..
+                            }),
+                            Some(w),
+                        ) if !w.contains(&i) => {
+                            let site = vm_sites[*site as usize].get();
+                            unsafe { runtime_result((*site).cached, insns[i].op) }
                         }
-                        let (this, args) = call_types(i, st);
-                        match unsafe { direct_version(site, this, &args) } {
-                            Version::Ready(code, _) => Ty::of_result(code.ret),
-                            // Being compiled, further up: what its current
-                            // round predicts.
-                            Version::Busy => unsafe { (*(*site).callee).ret_hint.get() },
-                            Version::None => Ty::Any,
-                        }
-                    }
-                    (
-                        Some(_),
-                        Some(Prop::Call {
-                            site,
-                            direct: false,
-                            ..
-                        }),
-                        Some(w),
-                    ) if !w.contains(&i) => {
-                        let site = vm_sites[*site as usize].get();
-                        unsafe { runtime_result((*site).cached, insns[i].op) }
-                    }
-                    _ => Ty::Any,
-                })
-                .collect();
+                        _ => Ty::Any,
+                    })
+                    .collect()
+            };
+            let mut want = predict(&ins, own);
             round += 1;
             if want == rets || round == MAX_RESULT_ROUNDS {
+                break (homes, ins, sel);
+            }
+            // Predictions that changed only for results nothing reads (`acc`
+            // dead after the call) change no state: the next round would
+            // infer the same states and homes, select those calls again with
+            // their new predictions (their result checks), and predict from
+            // the same states. So it does only that. (A sixth of
+            // TypeScript's rounds, two fifths of PdfJS's.)
+            let dead = |i: usize| insns[i].is_call() && i + 1 < n && !acc_live[i + 1];
+            let others = Spec { rets: &[], ..spec1 };
+            let mut prev = rets.clone();
+            while (0..n).all(|i| want[i] == prev[i] || dead(i)) {
+                let spec = Spec {
+                    rets: &want,
+                    ..others
+                };
+                for i in (0..n).filter(|&i| want[i] != prev[i]) {
+                    if let Some(st) = &ins[i] {
+                        sel[i] = Some(select(&insns[i], i, st, &spec));
+                    }
+                }
+                let own = Ty::of_result(returned(insns, &ins, false));
+                if !root.is_null() {
+                    unsafe { (*root).ret_hint.set(own) };
+                }
+                prev = std::mem::replace(&mut want, predict(&ins, own));
+                round += 1;
+                if want == prev || round == MAX_RESULT_ROUNDS {
+                    break;
+                }
+            }
+            if want == prev || round == MAX_RESULT_ROUNDS {
                 break (homes, ins, sel);
             }
             rets = want;

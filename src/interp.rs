@@ -4572,12 +4572,21 @@ const ENTER_RESUME: u64 = 2;
 const ENTER_ERROR: u64 = 3;
 const ENTER_UNWIND: u64 = 4;
 
-/// A call found no compiled code for `code`'s start: calls stop counting
-/// down, but for a start refused for good that may compile once more
-/// (`JitFunction::regrant`), which counts down the calls it waits for.
+/// A call found no compiled code for `code`'s start. Not refused for good:
+/// the next call tries again, as calls from compiled code do (`run_new_frame`;
+/// the start's last compilation waits for calls, see `JitFunction::spent`).
+/// Refused for good: calls stop counting down, but for a start that may
+/// compile once more (`JitFunction::regrant`), which counts down the calls
+/// it waits for.
 fn not_compiled(code: &Code) {
-    let regrant = code.calls_interpret.get() && code.jit.borrow().as_ref().is_some_and(|f| f.can_regrant());
-    code.calls_left.set(if regrant { crate::jit::regrant_calls() } else { i32::MAX });
+    let left = if !code.calls_interpret.get() {
+        0
+    } else if code.jit.borrow().as_ref().is_some_and(|f| f.can_regrant()) {
+        crate::jit::regrant_calls()
+    } else {
+        i32::MAX
+    };
+    code.calls_left.set(left);
 }
 
 /// A call whose countdown ran out: a start refused for good compiles once

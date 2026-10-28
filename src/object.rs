@@ -637,6 +637,10 @@ pub struct Shape {
     /// Owned by a single (prototype) object: transitions from it are not
     /// shared, so inline caches must not cache them.
     pub unique: bool,
+    /// Shared by objects that may not get properties (made not extensible:
+    /// `Vm::fix_shape`): a transition from it, for a property added
+    /// regardless (`Vm::transition_with`), is not shared either.
+    pub fixed: bool,
     /// By the property added and its attributes.
     pub(crate) transitions: RefCell<Vec<(Atom, u8, *const Shape)>>,
     /// The shapes this one moves to when its elements' type generalizes.
@@ -1053,6 +1057,7 @@ mod tests {
             family: std::ptr::null(),
             push: Cell::new(std::ptr::null_mut()),
             unique: false,
+            fixed: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),

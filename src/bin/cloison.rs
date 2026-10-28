@@ -152,6 +152,13 @@ fn main() -> ExitCode {
                     cloison::jit::LOWERS.load(std::sync::atomic::Ordering::Relaxed),
                     cloison::jit::COMPILES.load(std::sync::atomic::Ordering::Relaxed)
                 );
+                let n = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "compiled instructions {} infers {} us/instruction {:.3}",
+                    n(&cloison::jit::COMPILED_INSNS),
+                    n(&cloison::jit::INFERS),
+                    ms(&cloison::jit::COMPILE_NS) * 1e3 / n(&cloison::jit::COMPILED_INSNS).max(1) as f64
+                );
             }
             // `CLOISON_SIZES`: what the run compiled, one line of `name=value`
             // (`scripts/octane-sizes.sh` reads it), its collections and memory,

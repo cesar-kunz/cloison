@@ -5559,6 +5559,7 @@ fn infer(
     spec: &Spec,
 ) -> (Vec<Option<TypeState>>, Vec<Option<Sel>>) {
     let n = insns.len();
+    INFERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut ins: Vec<Option<TypeState>> = vec![None; n];
     let mut sels: Vec<Option<Sel>> = (0..n).map(|_| None).collect();
     // Instructions on `work`, which holds each once, taken lowest first:
@@ -8104,6 +8105,7 @@ impl JitCode {
             heat,
         } = vm;
         let n = insns.len();
+        COMPILED_INSNS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         let nregs = actual.regs.len();
         // The collector scans the VM stack that far past a frame.
         let cur = crate::interp::current_vm();
@@ -11256,6 +11258,10 @@ pub fn count_report() -> String {
 }
 
 pub static COMPILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Lowered instructions compiled (inlined frames' included), and passes of
+/// [`infer`] over them, over the process (`CLOISON_JIT_TIME`).
+pub static COMPILED_INSNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Machine code compiled over the process: hot paths, out-of-line code
 /// (see `JitCode::ool_len`), exits, and all of it; freed code included
 /// (`cloison` prints them with `CLOISON_SIZES` set).
@@ -11561,6 +11567,69 @@ fn interp_live(
     for &(g, p, a) in &out.aliases {
         aliases[g as usize].push((p as usize, a as usize));
     }
+    // Per frame, the pcs asked about (sorted), and the registers restored
+    // at each: each restore marks the range of them it covers, which a
+    // sweep turns into sets. (Searching all restores at every instruction
+    // was 43% of lowering Mandreel.)
+    let mut has = vec![false; out.frames.len()];
+    for r in out.restores.iter().filter(|r| matches!(r.value, Restored::Reg(_))) {
+        has[r.frame as usize] = true;
+    }
+    let mut pcs: Vec<Vec<usize>> = vec![Vec::new(); out.frames.len()];
+    if has.contains(&true) {
+        for insn in out.insns.iter().filter(|i| has[i.frame as usize]) {
+            pcs[insn.frame as usize].push(insn.pc);
+        }
+        for f in out.frames.iter().skip(1).filter(|f| has[f.parent]) {
+            pcs[f.parent].push(f.ret_pc);
+        }
+    }
+    let mut restored: Vec<Vec<RegSet>> = Vec::with_capacity(out.frames.len());
+    let mut events: Vec<Vec<(usize, u8, bool)>> = vec![Vec::new(); out.frames.len()];
+    for p in &mut pcs {
+        p.sort_unstable();
+        p.dedup();
+    }
+    for r in &out.restores {
+        if let Restored::Reg(x) = r.value {
+            let p = &pcs[r.frame as usize];
+            let (lo, hi) = (p.partition_point(|&q| q <= r.after), p.partition_point(|&q| q <= r.upto));
+            if lo < hi {
+                events[r.frame as usize].push((lo, x, true));
+                events[r.frame as usize].push((hi, x, false));
+            }
+        }
+    }
+    for (g, ev) in events.iter_mut().enumerate() {
+        if ev.is_empty() {
+            restored.push(Vec::new());
+            continue;
+        }
+        ev.sort_unstable_by_key(|e| e.0);
+        let mut count = [0u32; 256];
+        let mut set = [0; 4];
+        let mut sets = Vec::with_capacity(pcs[g].len());
+        let mut e = 0;
+        for k in 0..pcs[g].len() {
+            while e < ev.len() && ev[e].0 == k {
+                let (_, x, start) = ev[e];
+                let c = &mut count[x as usize];
+                if start {
+                    *c += 1;
+                } else {
+                    *c -= 1;
+                }
+                if *c == 0 {
+                    set[x as usize / 64] &= !(1 << (x % 64));
+                } else {
+                    rs_add(&mut set, x as usize);
+                }
+                e += 1;
+            }
+            sets.push(set);
+        }
+        restored.push(sets);
+    }
     // What frame `g` reads at `pc` (as its bytecode does, renamed), and
     // registers restored for it there.
     let local = |g: usize, pc: usize| {
@@ -11572,13 +11641,8 @@ fn interp_live(
         }
         // A restored register's source, then a parameter's argument (the
         // source may be a parameter: see `materialize`).
-        for r in out.restores.iter().filter(|r| r.frame as usize == g) {
-            if let Restored::Reg(x) = r.value
-                && r.after < pc
-                && pc <= r.upto
-            {
-                rs_add(&mut set, x as usize);
-            }
+        if !restored[g].is_empty() {
+            rs_or(&mut set, &restored[g][pcs[g].binary_search(&pc).unwrap()]);
         }
         for &(p, a) in &aliases[g] {
             if rs_has(&set, p) {

@@ -1545,6 +1545,7 @@ impl Vm {
             family: std::ptr::null(),
             push: Cell::new(std::ptr::null_mut()),
             unique: false,
+            fixed: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
@@ -1575,6 +1576,7 @@ impl Vm {
             family: std::ptr::null(),
             push: Cell::new(std::ptr::null_mut()),
             unique: false,
+            fixed: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
@@ -1599,6 +1601,7 @@ impl Vm {
     ) -> *const Shape {
         let s = unsafe { &*shape };
         if !s.unique
+            && !s.fixed
             && let Some(&(_, _, t)) = s
                 .transitions
                 .borrow()
@@ -1625,7 +1628,9 @@ impl Vm {
             elems_code: s.elems_code,
             family: std::ptr::null(),
             push: Cell::new(std::ptr::null_mut()),
-            unique: s.unique,
+            // (A fixed shape's successors are unique: see `Shape::fixed`.)
+            unique: s.unique || s.fixed,
+            fixed: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
@@ -1638,7 +1643,9 @@ impl Vm {
         });
         if !s.unique {
             self.shape_left_stable(s);
-            s.transitions.borrow_mut().push((name, attrs, t));
+            if !s.fixed {
+                s.transitions.borrow_mut().push((name, attrs, t));
+            }
         }
         t
     }
@@ -1665,6 +1672,7 @@ impl Vm {
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
+                fixed: false,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
             relied: Cell::new(false),
@@ -2040,6 +2048,7 @@ impl Vm {
     ) -> *const Shape {
         let s = unsafe { &*shape };
         if !s.unique
+            && !s.fixed
             && let Some(&(_, t)) = s
                 .elem_transitions
                 .borrow()
@@ -2057,7 +2066,9 @@ impl Vm {
             elems_code: elems.encode(),
             family: s.family,
             push: Cell::new(std::ptr::null_mut()),
-            unique: s.unique,
+            // (A fixed shape's successors are unique: see `Shape::fixed`.)
+            unique: s.unique || s.fixed,
+            fixed: false,
             transitions: RefCell::default(),
             elem_transitions: RefCell::default(),
             relied: Cell::new(false),
@@ -2070,7 +2081,9 @@ impl Vm {
         });
         if !s.unique {
             self.shape_left_stable(s);
-            s.elem_transitions.borrow_mut().push((elems, t));
+            if !s.fixed {
+                s.elem_transitions.borrow_mut().push((elems, t));
+            }
         }
         t
     }
@@ -2902,6 +2915,7 @@ impl Vm {
                     family: std::ptr::null(),
                     push: Cell::new(std::ptr::null_mut()),
                     unique: true,
+                    fixed: false,
                     transitions: RefCell::default(),
                     elem_transitions: RefCell::default(),
             relied: Cell::new(false),
@@ -3305,6 +3319,7 @@ impl Vm {
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
+                fixed: false,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),
@@ -4467,6 +4482,7 @@ impl Vm {
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),
                 unique: s.unique,
+                fixed: s.fixed,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),

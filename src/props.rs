@@ -25,6 +25,11 @@ use crate::object::{Slots,
 use crate::value::Value;
 use crate::vm::{Error, Key, NO_ELEMENTS, NativeFn, Result, Vm, string_units, wrapped};
 
+/// The key of a shape's transition to the shape objects of it share once
+/// made not extensible, sealed or frozen (its attributes byte: the level,
+/// see `Vm::fix_shape`). No property has it.
+pub(crate) const FIXED_KEY: Atom = Atom(u32::MAX);
+
 /// A property descriptor: each field `None` where the descriptor leaves
 /// it out. A property's own ([`Vm::own_property`]) has every field of its
 /// kind.
@@ -156,6 +161,7 @@ impl Vm {
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
+                fixed: false,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),
@@ -173,6 +179,62 @@ impl Vm {
             if (*o).flags & crate::object::PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
+        }
+    }
+
+    /// Give `o`, made not extensible (`level` 0), sealed (1) or frozen (2),
+    /// a shape with attributes `attrs` for its slots if given that no
+    /// element store's fast path fits: from a shared shape, its successor
+    /// for that level, which every such object of it shares (a transition
+    /// under [`FIXED_KEY`]: unique shapes, one each, would never be freed,
+    /// see `Vm::sweep_shapes`); else a unique one (`unique_shape`).
+    /// Compiled code relying on the old shape is dropped.
+    fn fix_shape(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, level: u8) {
+        unsafe {
+            let s = &*(*o).shape;
+            if s.unique {
+                return self.unique_shape(o, attrs, true);
+            }
+            if s.fixed && attrs.as_ref().is_none_or(|a| a == s.attrs()) {
+                return;
+            }
+            self.shape_left(s);
+            let found = (s.transitions.borrow().iter())
+                .find(|&&(k, l, _)| k == FIXED_KEY && l == level)
+                .map(|&(_, _, t)| t);
+            let t = match found {
+                Some(t) => t,
+                None => {
+                    let t = self.add_shape(Shape {
+                        class: s.class,
+                        proto: s.proto,
+                        capacity: Cell::new(s.capacity.get()),
+                        slots: match attrs {
+                            Some(a) if a != s.attrs() => Slots::new(s.keys(), &a, s.fields()),
+                            _ => s.slots.clone(),
+                        },
+                        elems: FieldType::Any,
+                        elems_code: NO_ELEMENTS,
+                        family: std::ptr::null(),
+                        push: Cell::new(std::ptr::null_mut()),
+                        unique: false,
+                        fixed: true,
+                        transitions: RefCell::default(),
+                        elem_transitions: RefCell::default(),
+                        relied: Cell::new(false),
+                        left: Cell::new(false),
+                        lineage_relied: Cell::new(false),
+                        parent: s,
+                        mark: Default::default(),
+                        traced: Cell::new(0),
+                        pinned: Cell::new(false),
+                    });
+                    s.transitions.borrow_mut().push((FIXED_KEY, level, t));
+                    t
+                }
+            };
+            crate::object::set_shape(o, t);
+            self.bump_code_epoch();
         }
     }
 
@@ -219,6 +281,7 @@ impl Vm {
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
+                fixed: false,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),
@@ -467,7 +530,7 @@ impl Vm {
             }
             (*o).flags |= NOT_EXTENSIBLE;
         }
-        self.unique_shape(o, None, true);
+        self.fix_shape(o, None, 0);
     }
 
     /// `Object.seal(o)` (`freeze`: `Object.freeze(o)`).
@@ -502,7 +565,7 @@ impl Vm {
                     (*o).flags |= LENGTH_READ_ONLY;
                 }
             }
-            self.unique_shape(o, Some(attrs), true);
+            self.fix_shape(o, Some(attrs), 1 + freeze as u8);
         }
     }
 
@@ -996,6 +1059,7 @@ impl Vm {
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
+                fixed: false,
                 transitions: RefCell::default(),
                 elem_transitions: RefCell::default(),
                 relied: Cell::new(false),

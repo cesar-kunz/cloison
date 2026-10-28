@@ -59,10 +59,10 @@ stencils test it under one mask (see "Compiled code").
 > its dense prefix: real elements, holes as `EMPTY`. The length, and the
 > elements past the prefix, live in the *far store*.
 
-The far store is a hidden array, which JS never sees, whose value is in the
-object's `code` bits. An array doesn't use `code` today. This is the same
-arrangement as a `Map`'s entries (`collections`), so the collector traces
-it the same way. Its layout:
+The far store is a hidden array, which JS never sees, in the last slot of
+the array's elements' cell, past their room (`Object::elems_cap` leaves it
+out): an array has no `code` word (see `object`'s module docs), and the
+collector traces the store with the elements. Its layout:
 
 ```text
  0  length      number (up to 2^32 - 1)
@@ -122,7 +122,7 @@ the bound it has at each decision point (`far::goes_far`):
   ArraySetLength, an array literal's trailing holes): the same test with
   `n`, and P for W.
 - **The elements reallocated.** Where the bound keeps the array dense but
-  the store or length outgrows `elems_cap`, and the array is large enough
+  the store or length outgrows the elements' capacity, and the array is large enough
   for its holes to pass W, the present elements are counted: that costs
   what the copy does. Without it, `a[i * 16] = v` stays dense with 15 holes
   in 16 (each store is within the bound), and `a[1024]`, `a[3072]`,

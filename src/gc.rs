@@ -32,7 +32,7 @@
 //! safepoint, the same way. `CLOISON_GC_STATS` prints each collection.
 
 use crate::heap::{BYTES, COLOR, END, GRANULE, Heap, UPVALUE, VALUES, WEAK_VALUES, YOUNG, cell_size};
-use crate::object::{Class, INLINE_BASE, Object};
+use crate::object::{Class, Object};
 use crate::value::Value;
 use crate::vm::Vm;
 
@@ -993,8 +993,9 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
         }
         let o = p as *mut Object;
         let cap = Object::inline_cap(o);
-        let mut a = (p + INLINE_BASE).max(lo).next_multiple_of(8);
-        let last = (p + INLINE_BASE + 8 * cap).min(hi);
+        let slots = p + crate::layout::slots_offset((*o).class);
+        let mut a = slots.max(lo).next_multiple_of(8);
+        let last = (slots + 8 * cap).min(hi);
         while a < last {
             v.value(*(a as *const Value));
             a += 8;
@@ -1012,7 +1013,7 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                     if within(code) {
                         v.value(Value::from_bits((*o).code as u64));
                     }
-                } else if (*o).elems as usize != p + INLINE_BASE && within(elems) {
+                } else if (*o).elems as usize != slots && within(elems) {
                     // Flattened: its units' buffer.
                     v.payload((*o).elems as usize);
                 }
@@ -1064,17 +1065,11 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 }
                 return;
             }
-            // A far array's store (see `far`).
-            Class::Array if (*o).flags & crate::far::FAR != 0 => {
-                if within(code) {
-                    v.value(Value::from_bits((*o).code as u64));
-                }
-            }
             Class::Function => {
                 // After the in-object slots it was allocated with, as
                 // `cell_size` has it: the marker thread reads no shape.
                 let ups = (&(*(*o).code).upvalues).len();
-                let up = (p + INLINE_BASE + 8 * cap) as *const usize;
+                let up = (slots + 8 * cap) as *const usize;
                 debug_assert_eq!(up as usize, crate::vm::Vm::upvalues(o) as usize);
                 for k in 0..ups {
                     if within(up.add(k) as usize) {

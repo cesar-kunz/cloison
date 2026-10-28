@@ -42,9 +42,11 @@ pub enum Class {
     Function,
     /// A function implemented in Rust: `code` is set, with `native`.
     Native,
-    /// A string: its UTF-16 code units follow the header; `elems` points
-    /// to them and `elems_len` is the length (as arrays', so `length` reads
-    /// the same field).
+    /// A string: its UTF-16 code units follow its `code` word; `elems`
+    /// points to them and `elems_len` is the length (as arrays', so
+    /// `length` reads the same field). `code` holds the units' words (and
+    /// the string's atom, once found: `object::Object::string_atom`); a
+    /// cons string's (`elems` null) are its halves, `props` and `code`.
     String,
     /// A `Date`: its time value (milliseconds since the epoch, an `f64`) is
     /// kept in `code`'s bits (see `vm::date_value`).
@@ -87,8 +89,8 @@ pub enum Class {
     /// `code` holds its buffer), with no element type.
     DataView,
     /// A `Map` or `Set` iterator: `code`'s bits are the entries array it
-    /// walks, `elems_len` its next position, `elems_cap` what it yields
-    /// (see `collections::IterMode`).
+    /// walks, `elems_len` its next position, its `aux` what it yields (see
+    /// `collections::IterMode`).
     CollectionIterator,
     /// A `Promise`: `code`'s bits are a hidden array holding its state,
     /// result and reactions. See `promise`.
@@ -103,7 +105,7 @@ pub enum Class {
     /// unregister tokens' registration counts, its cleanup callback in
     /// slot 0 (see `collections`).
     FinalizationRegistry,
-    /// A BigInt (a primitive: see `bigint`): its sign in `elems_cap`, its
+    /// A BigInt (a primitive: see `bigint`): its sign in its `aux`, its
     /// magnitude's 32-bit limbs in `elems` (a byte buffer), their count in
     /// `elems_len`.
     BigInt,
@@ -159,8 +161,11 @@ pub const LENGTH_READ_ONLY: u8 = 64;
 pub const FAR: u8 = 128;
 
 /// An object's header: `object::Object`'s fields, as compiled code sees
-/// them (the shape and the code as addresses). Its in-object slots follow
-/// ([`INLINE_BASE`]).
+/// them (the shape and the code as addresses), 32 bytes ([`HEADER_BYTES`]).
+/// A plain object's or an array's in-object slots follow it; the other
+/// classes' first have the words [`extra_words`] counts: `code`, and for a
+/// few a word of their own (`object::Object::aux`). So a slot's offset
+/// depends on the class ([`slots_offset`]).
 #[repr(C)]
 pub struct Header {
     pub shape: u64,
@@ -172,21 +177,57 @@ pub struct Header {
     /// its in-object capacity.
     pub kind: u8,
     pub cap_hi: u8,
-    /// The out-of-line slots' capacity.
-    pub props_cap: u32,
-    pub props: *mut Value,
-    /// Elements, a string's units, a typed array's first element.
-    pub elems: *mut u8,
     pub elems_len: u32,
-    pub elems_cap: u32,
+    /// The out-of-line slots: an array of values, its capacity in its
+    /// header word ([`props_cap`]).
+    pub props: *mut Value,
+    /// Elements (an array of values, as `props`: [`elems_cap`]), a
+    /// string's units, a typed array's first element.
+    pub elems: *mut u8,
+    /// The word after the header, of the classes with one (not of a plain
+    /// object nor an array, whose first slot is there): a function's code,
+    /// the bits of what other classes hold.
     pub code: u64,
 }
 
-/// Byte offset of an object's first in-object slot.
-pub const INLINE_BASE: usize = size_of::<Header>();
-/// An object's header in words: a cell for one has this many and its
-/// in-object slots.
-pub const HEADER_WORDS: usize = INLINE_BASE / 8;
+/// An object's header in bytes: where a plain object's or an array's
+/// in-object slots start.
+pub const HEADER_BYTES: usize = core::mem::offset_of!(Header, code);
+const _: () = assert!(HEADER_BYTES == 32);
+/// An object's header in words: a cell for a plain object or an array has
+/// this many and its in-object slots.
+pub const HEADER_WORDS: usize = HEADER_BYTES / 8;
+
+/// Words between an object's header and its in-object slots, by class:
+/// none for plain objects and arrays (most objects), else `code` (see
+/// [`Class`]), and an `aux` word too for buffers, views, collection
+/// iterators and BigInts (`object::Object::aux`). Indexed by the class's
+/// byte.
+pub const EXTRA_WORDS: [u8; 32] = {
+    let mut t = [1u8; 32];
+    t[Class::Plain as usize] = 0;
+    t[Class::Array as usize] = 0;
+    t[Class::ArrayBuffer as usize] = 2;
+    t[Class::SharedArrayBuffer as usize] = 2;
+    t[Class::TypedArray as usize] = 2;
+    t[Class::DataView as usize] = 2;
+    t[Class::CollectionIterator as usize] = 2;
+    t[Class::BigInt as usize] = 2;
+    t
+};
+const _: () = assert!((Class::Intl as usize) < 32);
+
+/// [`EXTRA_WORDS`] of `class`.
+#[inline(always)]
+pub const fn extra_words(class: Class) -> usize {
+    EXTRA_WORDS[class as usize] as usize
+}
+
+/// The byte offset of the first in-object slot of an object of `class`.
+#[inline(always)]
+pub const fn slots_offset(class: Class) -> usize {
+    HEADER_BYTES + 8 * extra_words(class)
+}
 
 /// Concatenations at least this long make cons strings (`Vm::new_cons`);
 /// shorter ones are copied flat, compiled code's too (`concat_short`).
@@ -217,9 +258,9 @@ pub unsafe fn payload_cell<T>(p: *const T) -> *const u8 {
     unsafe { (p as *const u8).sub(8) }
 }
 
-/// The header's second word, from `class` through `props_cap`: an object
+/// The header's second word, from `class` through `elems_len`: an object
 /// of class `class` with flags `flags` and `cap` in-object slots (below
-/// 65536), nothing out of line.
+/// 65536), no elements.
 #[inline(always)]
 pub const fn header_word(class: Class, flags: u8, cap: u64) -> u64 {
     class as u64 | (flags as u64) << 8 | cap << 16
@@ -572,7 +613,7 @@ pub struct CtorSite {
     /// constructor's objects end with it (see `cloison_rt_construct_done`).
     pub done_shape: u64,
     /// The header of `this`.
-    pub header: [u64; INLINE_BASE / 8],
+    pub header: [u64; HEADER_WORDS],
 }
 
 // ---- Compiled regular expressions ----

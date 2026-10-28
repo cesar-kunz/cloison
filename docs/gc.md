@@ -120,7 +120,8 @@ end. The minor collection pays for the first group; the old generation's
 headroom policy and the concurrent marker decide the second.
 
 Header cost: a DeltaBlue `Variable` has 7 fields, 56 bytes of slots after
-a 48-byte header. JSC's header is 8 bytes, Java's 12 (8 with
+a 32-byte header (48 until plan 23: the capacities now in the cells of
+`props` and `elems`, `code` only in the classes using it). JSC's header is 8 bytes, Java's 12 (8 with
 [JEP 519][lilliput], measured at 22% less heap). The header is the largest
 memory lever after the collector itself; see "Later".
 
@@ -317,7 +318,7 @@ Every cell says how big it is from its first words (`heap::cell_size`):
 
 | kind | first word | size from | references |
 |---|---|---|---|
-| object | its shape's address (8-aligned) | `inline_cap` (header bytes 10–11), plus a string's `elems_cap` units words or a function's upvalue count | inline slots; `props` and `elems` (arrays' payloads); a function's upvalues; a typed array's `code` (its buffer) and a cons string's `props` and `code` (its halves) |
+| object | its shape's address (8-aligned) | `inline_cap` (header bytes 10–11) and its class's words after the header (`layout::extra_words`: `code`, `aux`), plus a flat string's units words (in `code`) or a function's upvalue count | inline slots; `props` and `elems` (arrays' payloads); a function's upvalues; a typed array's `code` (its buffer) and a cons string's `props` and `code` (its halves) |
 | array of values | `VALUES \| capacity << 32` | its header | its values |
 | byte buffer | `BYTES \| length << 32` | its header | none |
 | upvalue | `UPVALUE` | fixed, 32 bytes | `closed` |

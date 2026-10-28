@@ -3,10 +3,10 @@
 //! An array with flag [`FAR`] keeps a dense prefix in its elements as any
 //! array does (`elems[0..elems_len)`, holes `EMPTY`), but its `length` is
 //! not `elems_len`: it, and the elements past the prefix, are in the *far
-//! store*, a hidden array (`Class::Array`, which JS never sees) whose value
-//! is in the array's `code` bits, traced by the collector as a
-//! collection's entries are. The store is a hash table, open addressing
-//! with linear probing:
+//! store*, a hidden array (`Class::Array`, which JS never sees) in the last
+//! slot of the array's elements' cell, past their room (`Object::elems_cap`
+//! leaves it out; an array has no `code`), traced as they are. The store is
+//! a hash table, open addressing with linear probing:
 //!
 //! ```text
 //!  0  length     number, up to 2^32 - 1
@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 
 use crate::object::{Class, FROZEN, LENGTH_READ_ONLY, NOT_EXTENSIBLE, Object, SEALED, as_object};
 use crate::value::Value;
-use crate::vm::{Code, MAX_ELEMENTS, Vm};
+use crate::vm::{MAX_ELEMENTS, Vm};
 
 pub use crate::layout::FAR;
 
@@ -188,8 +188,13 @@ pub(crate) fn array_length(o: *mut Object) -> u32 {
     if is_far(o) { length(o) } else { unsafe { (*o).elems_len } }
 }
 
+/// Where far array `o`'s store is: its elements' last slot.
+pub(crate) fn store_slot(o: *mut Object) -> *mut Value {
+    unsafe { (*o).elems.add(crate::layout::values_cap((*o).elems) as usize - 1) }
+}
+
 fn store(o: *mut Object) -> *mut Object {
-    unsafe { as_object(Value::from_bits((*o).code as u64)) }
+    unsafe { as_object(*store_slot(o)) }
 }
 
 fn slot(e: *mut Object, i: usize) -> Value {
@@ -406,11 +411,14 @@ fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> *mut Object {
     e
 }
 
+/// Make `e` far array `o`'s store (`o` has room for it past its
+/// elements: see `make_far`).
 fn hold(o: *mut Object, e: *mut Object) {
     let v = crate::object::object_value(e);
     unsafe {
-        (*o).code = v.to_bits() as *const Code;
-        crate::heap::barrier(o.cast(), &raw const (*o).code, v);
+        let at = store_slot(o);
+        *at = v;
+        crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, v);
     }
 }
 
@@ -451,6 +459,8 @@ pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
         .collect();
     let buckets = (rest.len() * 2).next_power_of_two().max(MIN_BUCKETS);
     let e = new_store(vm, buckets, len.max(n as u32));
+    // A slot for the store past the elements, whose room shrinks by it.
+    vm.reserve_elems(o, n + 1);
     hold(o, e);
     vm.far_elements(o);
     unsafe {
@@ -553,7 +563,8 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: *mut Object) {
         for (i, v) in all {
             vm.store_element(o, i as usize, v);
         }
-        (*o).code = std::ptr::null();
+        // The store's slot one of the elements' room again.
+        *store_slot(o) = Value::UNDEFINED;
         (*o).flags &= !FAR;
     }
     if flags & (NOT_EXTENSIBLE | SEALED | FROZEN | LENGTH_READ_ONLY) == 0 {

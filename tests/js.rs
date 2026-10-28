@@ -3260,6 +3260,66 @@ loads() + " " + transitions() + " " + ints() + " " + special();
     assert_eq!(value(src), "241758250 60000 last0 79960 0 499500 4 1 999");
 }
 
+/// Functions with `let` and `const` are compiled (`lda_hole`, and
+/// `check_hole`, which exits for the interpreter to throw where a binding is
+/// read in its dead zone: through a closure called early, in a `switch`'s
+/// other case, in a loop's body before its declaration), and their bindings
+/// keep their types (an int32 counter, an object, a double, a string).
+#[test]
+fn block_scoped_bindings_compile_and_keep_their_dead_zones() {
+    let src = r#"
+function sum(n) { let s = 0; for (let i = 0; i < n; i++) { const d = i * 2; s += d; } return s; }
+function late(k) {
+  // `x` read before its declaration when `k` is odd.
+  function peek() { return x; }
+  let r = 0;
+  if (k & 1) { try { r = peek(); } catch (e) { r = e.constructor.name; } }
+  let x = k;
+  return r === 0 ? peek() : r;
+}
+function swtch(k) {
+  switch (k & 3) {
+    case 0: let a = 1; return a;
+    case 1: try { return a; } catch (e) { return "TDZ"; }
+    default: return k;
+  }
+}
+function inner(n) {
+  let t = 0;
+  for (let i = 0; i < n; i++) {
+    if (i == n - 1) { try { t += y; } catch (e) { t += 1000; } }
+    let y = i;
+    t += y;
+  }
+  return t;
+}
+function typed(n) {
+  let o = null, f = 0.5, s = "";
+  for (let i = 0; i < n; i++) { o = { i }; f += o.i * 0.5; s = "" + (i & 7); }
+  return o.i + f + s;
+}
+function run() {
+  let out = [];
+  let a = 0, b = [], c = 0, d = 0, e = "";
+  for (let k = 0; k < 20000; k++) {
+    a += sum(k & 63);
+    if (k % 2000 < 4) b.push(late(k));
+    c += typeof swtch(k) == "string" ? 1 : swtch(k);
+    if (k % 100 == 0) d += inner(k & 31);
+    if (k == 19999) e = typed(k);
+  }
+  out.push(a, b.join(","), c, d, e);
+  return out.join(" ");
+}
+run();
+"#;
+    let expected = format!(
+        "26008256 {} 100015000 201600 1000049996",
+        (0..10).map(|k| format!("{},ReferenceError,{},ReferenceError", k * 2000, k * 2000 + 2)).collect::<Vec<_>>().join(",")
+    );
+    assert_eq!(value(src), expected);
+}
+
 /// A local date past any time value (a year past 2^53 in the making) is
 /// an invalid date, not a search for its year that never ends; dates in
 /// range keep their fields, whatever the zone.

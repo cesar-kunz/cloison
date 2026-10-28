@@ -4629,10 +4629,10 @@ const CONCAT_SHORT: u32 = CONS_MIN as u32 - 1;
 /// `a + b` for two flat strings (`elems` not null) of at most
 /// [`CONCAT_SHORT`] units together, a new young string made as
 /// `Vm::new_string_raw` makes one: the string shape at `imm64` (its
-/// in-object capacity 0), the units after the header (`HEADER_WORDS`),
-/// `elems` pointing at them, `elems_len` the count and `elems_cap` the
-/// words, the room past the units zero; in the hole at `imm64b`. Else (or
-/// no room there) `None`.
+/// in-object capacity 0), the units after the header and `code`
+/// (`HEADER_WORDS + 1`), `elems` pointing at them, `elems_len` the count and
+/// `code` the words, the room past the units zero; in the hole at `imm64b`.
+/// Else (or no room there) `None`.
 /// (Volatile stores: LLVM would call `memcpy` or `memset`, which a
 /// stencil can't.)
 /// Whether `v` is a string.
@@ -4662,8 +4662,8 @@ unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
             return None;
         }
         let words = (len as usize).div_ceil(4);
-        let o = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS + words)?;
-        let units = o.add(HEADER_WORDS);
+        let o = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS + 1 + words)?;
+        let units = o.add(HEADER_WORDS + 1);
         let h = header(o);
         (*h).shape = imm64();
         set_header_word(h, header_word(Class::String, EXTERNAL, 0));
@@ -4673,8 +4673,7 @@ unsafe fn concat_short(tag: NumberTag, a: Value, b: Value) -> Option<Value> {
         (&raw mut (*h).props).write_volatile(core::ptr::null_mut());
         (*h).elems = units.cast();
         (*h).elems_len = len;
-        (*h).elems_cap = words as u32;
-        (*h).code = 0;
+        (*h).code = words as u64;
         for k in 0..words {
             units.add(k).write_volatile(0);
         }
@@ -4719,16 +4718,16 @@ unsafe fn create_object(slots: usize) -> Option<*mut u64> {
         Some(p)
     }
 }
-// target x86_64 create_object_0: 16 bump `lea; cmp [heap+8]; ja` (not `mov; sub; cmp; jb; lea`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
-// target x86_64 create_object_[12]: 17 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target x86_64 create_object_[34]: 18 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target x86_64 create_object_[56]: 19 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target x86_64 create_object_[78]: 20 as `_0`, zeroing `xorps` + ceil((4+n)/2) `movups` (judged 2026-10-26)
-// target aarch64 create_object_0: 19 heap (3), `ldp; add; cmp; b.hi; str`, meta (4), header (5), `stp xzr, xzr` ×2 (judged 2026-10-26)
-// target aarch64 create_object_[12]: 21 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
-// target aarch64 create_object_[34]: 22 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
-// target aarch64 create_object_[56]: 23 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
-// target aarch64 create_object_[78]: 24 as `_0`, header word `mov; movk`, ceil((4+n)/2) `stp xzr, xzr` (judged 2026-10-26)
+// target x86_64 create_object_0: 15 bump `lea; cmp [heap+8]; ja` (not `mov; sub; cmp; jb; lea`), meta (4), header (3), `xorps; movups` (the 32-byte header's two zero words; judged 2026-10-28)
+// target x86_64 create_object_[12]: 16 as `_0`, zeroing `xorps` + ceil((2+n)/2) `movups` (judged 2026-10-28)
+// target x86_64 create_object_[34]: 17 as `_0`, zeroing `xorps` + ceil((2+n)/2) `movups` (judged 2026-10-28)
+// target x86_64 create_object_[56]: 18 as `_0`, zeroing `xorps` + ceil((2+n)/2) `movups` (judged 2026-10-28)
+// target x86_64 create_object_[78]: 19 as `_0`, zeroing `xorps` + ceil((2+n)/2) `movups` (judged 2026-10-28)
+// target aarch64 create_object_0: 18 heap (3), `ldp; add; cmp; b.hi; str`, meta (4), header (5), `stp xzr, xzr` (the 32-byte header's two zero words; judged 2026-10-28)
+// target aarch64 create_object_[12]: 20 as `_0`, header word `mov; movk`, ceil((2+n)/2) `stp xzr, xzr` (judged 2026-10-28)
+// target aarch64 create_object_[34]: 21 as `_0`, header word `mov; movk`, ceil((2+n)/2) `stp xzr, xzr` (judged 2026-10-28)
+// target aarch64 create_object_[56]: 22 as `_0`, header word `mov; movk`, ceil((2+n)/2) `stp xzr, xzr` (judged 2026-10-28)
+// target aarch64 create_object_[78]: 23 as `_0`, header word `mov; movk`, ceil((2+n)/2) `stp xzr, xzr` (judged 2026-10-28)
 macro_rules! create_object_n {
     ($($n:literal)*) => {$(
         stencil_slow!("create_object_", $n; |s| {
@@ -4757,8 +4756,8 @@ stencil_slow!("create_object"; |s| {
 
 // `CreateArray`: a new, empty array of shape `imm64`, as `create_object_0`
 // (no slots nor elements).
-// target x86_64 create_array: 16 bump `lea; cmp [heap+8]; ja; mov` (not `mov; sub; cmp; jb; lea; mov`), meta (4), header (3), `xorps; movups ×2` (judged 2026-10-26)
-// target aarch64 create_array: 19 bump `ldp; add; cmp; b.hi; str` (not `sub; cmp; b.lo; add`) (judged 2026-10-26)
+// target x86_64 create_array: 15 bump `lea; cmp [heap+8]; ja; mov` (not `mov; sub; cmp; jb; lea; mov`), meta (4), header (3), `xorps; movups` (judged 2026-10-28)
+// target aarch64 create_array: 18 bump `ldp; add; cmp; b.hi; str` (not `sub; cmp; b.lo; add`), one `stp xzr, xzr` for the header's zero words (judged 2026-10-28)
 stencil_slow!("create_array"; |s| {
     let Some(p) = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS) else { slow!(s) };
     (*header(p)).shape = imm64();
@@ -4778,7 +4777,7 @@ stencil_slow!("create_array"; |s| {
 // `CreateArray n` (a literal's, `imm` its count): as `create_array`, with
 // room for `n` elements (`undefined`) in a cell of their own, if the
 // heap's free space has it too (else none: `push` makes room).
-// target x86_64 create_array_n: 42 now 49 as `create_array` (16), then `mov ebx, imm; lea rax,[rbx*8+16]; and rax,-16; …; L: mov qword [r10+rbx*8], 10; dec rbx; jnz L` (loop counted once; judged 2026-10-26)
+// target x86_64 create_array_n: 42 now 47 as `create_array` (16), then `mov ebx, imm; lea rax,[rbx*8+16]; and rax,-16; …; L: mov qword [r10+rbx*8], 10; dec rbx; jnz L` (loop counted once; judged 2026-10-26)
 // target aarch64 create_array_n: 43 now 48 as `create_array` (19), the count by `imm_zext`, SIDE and 0x80 kept, `L: str x10, [x13, x8, lsl #3]; subs; b.ne L` (judged 2026-10-26)
 stencil_slow!("create_array_n"; |s| {
     let heap = imm64b() as *mut HeapPtrs;
@@ -4816,9 +4815,8 @@ stencil_slow!("create_array_n"; |s| {
                 k -= 1;
             }
         }
-        // (Its length 0, from the header's zero words.)
+        // (Its length 0, from the header word.)
         (*header(p)).elems = e.add(1).cast();
-        (*header(p)).elems_cap = n as u32;
     }
     s.acc = Value::from_bits(p as u64);
     next!(s)
@@ -5197,7 +5195,7 @@ macro_rules! keyed_load {
 /// been detached: see `Vm::views_detached`).
 macro_rules! array_length {
     ($loc:tt) => {
-        // target x86_64 get_length_g{}: 11 now 12 `lea; test; jnz`, `movzx eax, word [rdi+8]; and eax, 0x80ff; cmp eax, 7; ja exit; mov ebx, 0x92; bt ebx, eax; jnc exit; mov r12d, [rdi+32]` (judged 2026-10-26)
+        // target x86_64 get_length_g{}: 11 now 12 `lea; test; jnz`, `movzx eax, word [rdi+8]; and eax, 0x80ff; cmp eax, 7; ja exit; mov ebx, 0x92; bt ebx, eax; jnc exit; mov r12d, [rdi+12]` (judged 2026-10-26)
         // target x86_64 get_length_m: 12 now 13 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
         // target aarch64 get_length_g{}: 11 now 12 cell (3), `ldrh; and; cmp #7; b.hi; mov w9, #0x92; lsr; tbz w8, #0, exit; ldr w20`: `tbz` widened (judged 2026-10-26)
         // target aarch64 get_length_m: 12 now 13 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
@@ -5217,16 +5215,16 @@ macro_rules! array_length {
             s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
-        // target x86_64 get_length_nc_g{}: 1 `mov r12d, [rsi+32]` (docs/opcode-targets.md, group 2)
+        // target x86_64 get_length_nc_g{}: 1 `mov r12d, [rsi+12]` (docs/opcode-targets.md, group 2)
         // target aarch64 get_length_nc_g{}: 1 (docs/arm64-targets.md)
         stencil!("get_length_nc_", loc!($loc); |s| {
             let o = get!($loc, s);
             s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
-        // target x86_64 get_length_na_g{}: 3 `cmp byte [rdi+9], 0; js exit; mov r12d, [rdi+32]` (judged 2026-10-26)
+        // target x86_64 get_length_na_g{}: 3 `cmp byte [rdi+9], 0; js exit; mov r12d, [rdi+12]` (judged 2026-10-26)
         // target x86_64 get_length_na_m: 4 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
-        // target aarch64 get_length_na_g{}: 3 now 4 `ldrb w8, [x24, #9]; tbnz w8, #7, exit; ldr w20, [x24, #32]`: `tbnz` widened (judged 2026-10-26)
+        // target aarch64 get_length_na_g{}: 3 now 4 `ldrb w8, [x24, #9]; tbnz w8, #7, exit; ldr w20, [x24, #12]`: `tbnz` widened (judged 2026-10-26)
         // target aarch64 get_length_na_m: 4 now 5 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         stencil!("get_length_na_", loc!($loc); |s| {
             let o = get!($loc, s);
@@ -5470,7 +5468,7 @@ macro_rules! property_location {
         // `set_keyed_ap_` of an int32 `acc` (`_i`), the key in r11 / x15
         // (`key_x`) and in memory too, for the helper: no barrier, no
         // registers saved (PdfJS's `decrypt`, `decryptedString[i] = …`).
-        // target x86_64 set_keyed_ap_i_g{}: 20 fallthrough 14 the checks (15), `inc eax; mov [rdi+32], eax` before the store, `or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12` (the count stops at `i < len`'s `jmp` to the store, which the append's `test r10, r10; je; cmp [r10-4], r11d` for the capacity in the elements' cell joins; judged 2026-10-28)
+        // target x86_64 set_keyed_ap_i_g{}: 20 fallthrough 14 the checks (15), `inc eax; mov [rdi+12], eax` before the store, `or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12` (the count stops at `i < len`'s `jmp` to the store, which the append's `test r10, r10; je; cmp [r10-4], r11d` for the capacity in the elements' cell joins; judged 2026-10-28)
         // target x86_64 set_keyed_ap_i_m: 21 fallthrough 19 (as `_g{}`; r9 and r12 borrowed as scratch; judged 2026-10-28)
         // target aarch64 set_keyed_ap_i_g{}: 22 fallthrough 15 (the count stops at `i < len`'s `b` to the store, which the append's test of the capacity in the elements' cell joins; judged 2026-10-28)
         // target aarch64 set_keyed_ap_i_m: 23 fallthrough 16 (as `_g{}`; judged 2026-10-28)
@@ -5505,7 +5503,7 @@ macro_rules! property_location {
         set_keyed!($loc, "i_", false, is_array, |s, v, code| code <= FIELD_NUM,
             |s| Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()));
         set_keyed!($loc, "o_", true, is_array, |s, v, code| code == FIELD_ANY || code == (*cell(v)).shape, |s| s.acc);
-        // target x86_64 set_keyed_nc_g{}: 22 fallthrough 35 `cmp [rdi+32], r11d; jbe; mov rax, [rdi]; cmp qword [rax], 0; jne; mov r10, [rdi+24]; mov [r10+r11*8], r12`, the barrier in place (15) (code 2 is the fall-through, 18; ANY-cell path 37; judged 2026-10-26)
+        // target x86_64 set_keyed_nc_g{}: 22 fallthrough 35 `cmp [rdi+12], r11d; jbe; mov rax, [rdi]; cmp qword [rax], 0; jne; mov r10, [rdi+24]; mov [r10+r11*8], r12`, the barrier in place (15) (code 2 is the fall-through, 18; ANY-cell path 37; judged 2026-10-26)
         // target x86_64 set_keyed_nc_m: 23 fallthrough 36 (fall-through 19; ANY-cell path 38; judged 2026-10-26)
         // target aarch64 set_keyed_nc_g{}: 23 fallthrough 13 `ldr w8; cmp; b.ls; ldr; ldr; cbnz`, `ldr; str [x9, x15, lsl #3]`, the barrier (15) (fall-through: code 2 with a non-number, 13; ANY-cell path 28; judged 2026-10-26)
         // target aarch64 set_keyed_nc_m: 24 fallthrough 14 (fall-through 14; ANY-cell path 29; judged 2026-10-26)
@@ -5520,12 +5518,12 @@ macro_rules! property_location {
         // (`nc_a`), numbers (`nc_n`), or an int32 into int32s, numbers or
         // any (`nc_ia`): no dispatch on the code.
         set_keyed!($loc, "nc_a_", true, |_, _| true, |s, v, code| true, |s| s.acc);
-        // target x86_64 set_keyed_nc_n_g{}: 6 `test r12, r14; jz; cmp [rdi+32], r11d; jbe; mov rax, [rdi+24]; mov [rax+r11*8], r12` (judged 2026-10-26)
+        // target x86_64 set_keyed_nc_n_g{}: 6 `test r12, r14; jz; cmp [rdi+12], r11d; jbe; mov rax, [rdi+24]; mov [rax+r11*8], r12` (judged 2026-10-26)
         // target x86_64 set_keyed_nc_n_m: 7 (judged 2026-10-26)
         // target aarch64 set_keyed_nc_n_g{}: 7 (judged 2026-10-26)
         // target aarch64 set_keyed_nc_n_m: 8 (judged 2026-10-26)
         set_keyed!($loc, "nc_n_", false, |_, _| true, |s, v, code| v.to_bits() & s.tag.to_bits() != 0, |s| s.acc);
-        // target x86_64 set_keyed_nc_ia_g{}: 5 now 6 `cmp [rdi+32], r11d; jbe; or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12`: `acc | tag` boxes an int32 acc, no `mov eax, r12d` (judged 2026-10-26)
+        // target x86_64 set_keyed_nc_ia_g{}: 5 now 6 `cmp [rdi+12], r11d; jbe; or r12, r14; mov r10, [rdi+24]; mov [r10+r11*8], r12`: `acc | tag` boxes an int32 acc, no `mov eax, r12d` (judged 2026-10-26)
         // target x86_64 set_keyed_nc_ia_m: 6 now 7 (judged 2026-10-26)
         // target aarch64 set_keyed_nc_ia_g{}: 6 now 7 `orr x20, x22, x20` boxes it, no `mov w8, w20` (judged 2026-10-26)
         // target aarch64 set_keyed_nc_ia_m: 7 now 8 (judged 2026-10-26)
@@ -5950,7 +5948,7 @@ macro_rules! property_location {
             next!(s)
         });
         // target aarch64 get_keyed_i_nc_g{}: 7 the load into x8, moved to x20 after the hole check (docs/arm64-targets.md)
-        // target x86_64 get_keyed_i_nc_g{}: 8 `cmp [rdi+32], r12d; jbe exit; mov rax, [rdi+24]; mov r10d, r12d; mov rax, [rax+r10*8]; test rax, rax; jz exit; mov r12, rax` (judged 2026-10-26)
+        // target x86_64 get_keyed_i_nc_g{}: 8 `cmp [rdi+12], r12d; jbe exit; mov rax, [rdi+24]; mov r10d, r12d; mov rax, [rax+r10*8]; test rax, rax; jz exit; mov r12, rax` (judged 2026-10-26)
         // target x86_64 get_keyed_i_nc_m: 9 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
         // target aarch64 get_keyed_i_nc_m: 8 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
         keyed_load!($loc, "get_keyed_i_nc_", true, |s, o| true);
@@ -6113,12 +6111,12 @@ macro_rules! typed_load {
         // target x86_64 tget_f32_m: 9 (judged 2026-10-26)
         // target x86_64 tget_i8_g{},tget_i16_g{}: 5 now 6 `…; movsx r12d, byte [rax+r10]`, not `movsx rax; mov r12d, eax` (judged 2026-10-26)
         // target x86_64 tget_i8_m,tget_i16_m: 6 now 7 (judged 2026-10-26)
-        // target x86_64 tget_u8_g{},tget_u16_g{},tget_i32_g{}: 5 `cmp [rsi+32], r12d; jbe exit; mov rax, [rsi+24]; mov r10d, r12d; movzx r12d, word [rax+r10*2]` (docs/opcode-targets.md, group 3)
+        // target x86_64 tget_u8_g{},tget_u16_g{},tget_i32_g{}: 5 `cmp [rsi+12], r12d; jbe exit; mov rax, [rsi+24]; mov r10d, r12d; movzx r12d, word [rax+r10*2]` (docs/opcode-targets.md, group 3)
         // target aarch64 tget_f32_g{}: 8 now 10 `…; ldr s0, [x8, w20, uxtw #2]; fcvt d0, s0; fcmp d0, d0; b.vs nan`, not a `fcsel` of a built NaN (judged 2026-10-26)
         // target aarch64 tget_f32_m: 9 now 11 (judged 2026-10-26)
         // target aarch64 tget_i8_g{},tget_i16_g{}: 5 now 6 `…; ldrsb w20, [x8, w20, uxtw]`, not `ldrsb x8; mov w20, w8` (judged 2026-10-26)
         // target aarch64 tget_i8_m,tget_i16_m: 6 now 7 (judged 2026-10-26)
-        // target aarch64 tget_u16_g{},tget_i32_g{}: 5 `ldr w8, [x25,#32]; cmp w8, w20; b.ls exit; ldr x8, [x25,#24]; ldrh w20, [x8, w20, uxtw #1]` (docs/opcode-targets.md, group 3)
+        // target aarch64 tget_u16_g{},tget_i32_g{}: 5 `ldr w8, [x25,#12]; cmp w8, w20; b.ls exit; ldr x8, [x25,#24]; ldrh w20, [x8, w20, uxtw #1]` (docs/opcode-targets.md, group 3)
         stencil!("tget_", $w, "_", loc!($loc); |$s| {
             let Some($e) = typed_elem(get!($loc, $s), int($s.acc) as u32, $size) else { exit!($s) };
             $set;
@@ -6143,9 +6141,9 @@ macro_rules! typed_load {
 
 macro_rules! typed_store {
     ($loc:tt, $w:literal, $size:literal, |$s:ident, $e:ident| $store:expr) => {
-        // target x86_64 tset_b8_i_g{},tset_b16_i_g{},tset_b32_i_g{}: 4 now 5 `cmp [rdi+32], r11d; jbe exit; mov rax, [rdi+24]; mov [rax+r11*2], r12w`: the key is zero-extended already (4 on 2026-10-09; judged 2026-10-26)
+        // target x86_64 tset_b8_i_g{},tset_b16_i_g{},tset_b32_i_g{}: 4 now 5 `cmp [rdi+12], r11d; jbe exit; mov rax, [rdi+24]; mov [rax+r11*2], r12w`: the key is zero-extended already (4 on 2026-10-09; judged 2026-10-26)
         // target x86_64 tset_b8_i_m,tset_b16_i_m,tset_b32_i_m: 5 now 6 as `_g{}` plus the receiver's load (judged 2026-10-26)
-        // target aarch64 tset_b8_i_g{},tset_b16_i_g{},tset_b32_i_g{}: 5 `ldr w8, [x24,#32]; cmp w8, w15; b.ls exit; ldr x8, [x24,#24]; strh w20, [x8, w15, uxtw #1]` (replaces the `tset_b32_i_g{}: 5` line; judged 2026-10-26)
+        // target aarch64 tset_b8_i_g{},tset_b16_i_g{},tset_b32_i_g{}: 5 `ldr w8, [x24,#12]; cmp w8, w15; b.ls exit; ldr x8, [x24,#24]; strh w20, [x8, w15, uxtw #1]` (replaces the `tset_b32_i_g{}: 5` line; judged 2026-10-26)
         // target aarch64 tset_b8_i_m,tset_b16_i_m,tset_b32_i_m: 6 (judged 2026-10-26)
         // target x86_64 tset_f32_f_g{}: 5 now 6 `…; cvtsd2ss xmm8, xmm0; movss [rax+r11*4], xmm8`: the key is zero-extended already (judged 2026-10-26)
         // target x86_64 tset_f32_f_m: 6 now 7 (judged 2026-10-26)
@@ -6864,7 +6862,6 @@ unsafe fn first_elements(o: *mut u8) {
         if meta_of(o as usize) != YOUNG {
             card_mark(o);
         }
-        (*header(o)).elems_cap = FIRST_ELEMENTS as u32;
     }
 }
 
@@ -7061,7 +7058,7 @@ macro_rules! array_methods {
         // `LENGTH_READ_ONLY`, `SPARSE`: it throws, or the elements aren't
         // all there is), and for a hole at the end, which a prototype may
         // fill.
-        // target x86_64 array_pop_nc_g{}: 13 now 14 `…; mov eax, [rdi+32]; sub eax, 1; jb empty; …` (`sub; jb` for `test; je` + `dec`) (judged 2026-10-26)
+        // target x86_64 array_pop_nc_g{}: 13 now 14 `…; mov eax, [rdi+12]; sub eax, 1; jb empty; …` (`sub; jb` for `test; je` + `dec`) (judged 2026-10-26)
         // target x86_64 array_pop_nc_m: 14 now 15 (judged 2026-10-26)
         // target aarch64 array_pop_nc_g{}: 12 now 14 flags (5: 0xf4ff isn't a logical immediate), `ldp x9, x10, [x24, #24]; cbz w10; sub; ldr x20, [x9, w10, uxtw #3]; cbz; str xzr, [same]; str w10` (replaces `10 now 14`, set before the flags check; judged 2026-10-26)
         // target aarch64 array_pop_nc_m: 13 now 15 (judged 2026-10-26)

@@ -583,7 +583,10 @@ const GLOBAL_CAPACITY: u32 = 1024;
 /// come after, at a fixed offset (see [`Vm::upvalues`]).
 pub(crate) const FUNCTION_CAPACITY: u32 = 2;
 /// The byte offset of a closure's upvalues.
-pub(crate) const UPVALUES_OFF: usize = crate::object::INLINE_BASE + 8 * FUNCTION_CAPACITY as usize;
+pub(crate) const UPVALUES_OFF: usize = crate::layout::slots_offset(Class::Function) + 8 * FUNCTION_CAPACITY as usize;
+/// The byte offset of a flat string's units, after its `code` (see
+/// `layout::Class::String`).
+const STRING_UNITS: usize = crate::layout::slots_offset(Class::String);
 /// Stack size in values (frame headers included).
 const STACK_VALUES: usize = 1 << 18;
 
@@ -1720,7 +1723,6 @@ impl Vm {
                 }
                 (*o).props = p;
                 crate::heap::barrier_young(o.cast(), &raw const (*o).props);
-                (*o).props_cap = cap;
             }
         }
     }
@@ -1928,7 +1930,7 @@ impl Vm {
                     // hundreds of properties out of line made slow.)
                     let cap = s.capacity.get() as i64;
                     let slot = if w.loc >= 0 {
-                        (w.loc as i64 - crate::object::INLINE_BASE as i64) / 8
+                        (w.loc as i64 - crate::layout::slots_offset(s.class) as i64) / 8
                     } else {
                         cap + !w.loc as i64
                     };
@@ -2674,7 +2676,7 @@ impl Vm {
                     shape: (*o).shape,
                     holder: self.missing_holder,
                     new_shape: std::ptr::null(),
-                    loc: crate::object::INLINE_BASE as i32,
+                    loc: crate::object::HEADER_BYTES as i32,
                     epoch: self.proto_epoch,
                 };
                 if install(ic, e) {
@@ -3346,11 +3348,11 @@ impl Vm {
         {
             return Key::Index(d as u32);
         }
-        // A string's atom, once found, is kept in it (`Object::string_atom`):
-        // a key looked up again isn't converted and hashed again (PdfJS's
-        // `map[command]`).
-        let string = string_len(key).is_some();
-        if string {
+        // A string's atom, once found, is kept in it (`Object::string_atom`,
+        // a flat string's): a key looked up again isn't converted and hashed
+        // again (PdfJS's `map[command]`).
+        let flat = |key: Value| string_len(key).is_some() && unsafe { !(*as_object(key)).elems.is_null() };
+        if flat(key) {
             let cached = unsafe { *Object::string_atom(as_object(key)) };
             if cached != 0 {
                 return Key::Name(Atom(cached - 1));
@@ -3364,7 +3366,8 @@ impl Vm {
         // `js::lex::units_to_string`.)
         let name = crate::js::lex::units_to_string(&units);
         let a = self.intern(&name);
-        if string && a.0 < u32::MAX {
+        // (A cons string flattened by `to_string_units` too.)
+        if flat(key) && a.0 < u32::MAX {
             unsafe { *Object::string_atom(as_object(key)) = a.0 + 1 };
         }
         Key::Name(a)
@@ -3832,14 +3835,24 @@ impl Vm {
     pub(crate) fn shrink_elems(&mut self, o: *mut Object) {
         unsafe {
             let len = (*o).elems_len as usize;
-            let cap = len.max(4);
-            let e = self.heap.alloc_values_from(cap, len);
+            self.move_elems(o, len.max(4), len);
+        }
+    }
+
+    /// Move `o`'s first `len` elements to a new cell with room for `cap`
+    /// (and a far array's store, in the slot after: see `far`).
+    fn move_elems(&mut self, o: *mut Object, cap: usize, len: usize) {
+        unsafe {
+            let far = crate::far::is_far(o);
+            let e = self.heap.alloc_values_from(cap + far as usize, len);
             if len > 0 {
                 std::ptr::copy_nonoverlapping((*o).elems, e, len);
             }
+            if far {
+                *e.add(cap) = *crate::far::store_slot(o);
+            }
             (*o).elems = e;
             crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
-            (*o).elems_cap = cap as u32;
         }
     }
 
@@ -3862,15 +3875,9 @@ impl Vm {
                 return;
             }
             let cap = n.max(old * 2).max(4);
-            let cap = u32::try_from(cap).expect("array too large");
+            u32::try_from(cap + 1).expect("array too large");
             let len = if (*o).elems.is_null() { 0 } else { (*o).elems_len as usize };
-            let e = self.heap.alloc_values_from(cap as usize, len);
-            if len > 0 {
-                std::ptr::copy_nonoverlapping((*o).elems, e, len);
-            }
-            (*o).elems = e;
-            crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
-            (*o).elems_cap = cap;
+            self.move_elems(o, cap, len);
         }
     }
 
@@ -3962,7 +3969,7 @@ impl Vm {
     ) -> Value {
         unsafe {
             let o = self.alloc_string(words);
-            let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
+            let data = o.cast::<u8>().add(STRING_UNITS).cast::<u16>();
             fill(data);
             // The room past the units zero, not what memory held.
             debug_assert!(4 * words >= len);
@@ -3973,15 +3980,15 @@ impl Vm {
         }
     }
 
-    /// A string cell with `words` words of units after its header, which
-    /// it records (`Object::string_words`, see `heap::cell_size`).
+    /// A string cell with `words` words of units after its `code`, which
+    /// records them (`Object::string_words`, see `heap::cell_size`).
     fn alloc_string(&mut self, words: usize) -> *mut Object {
         let o = self
             .heap
-            .alloc(crate::heap::object_bytes(words))
+            .alloc(crate::heap::object_bytes(1 + words))
             .cast::<Object>();
         unsafe {
-            o.cast::<[u64; crate::object::INLINE_BASE / 8]>()
+            o.cast::<[u64; crate::layout::HEADER_WORDS]>()
                 .write(crate::object::object_header(&*self.string_shape));
             Object::set_string_words(o, words);
         }
@@ -3993,7 +4000,7 @@ impl Vm {
         unsafe {
             let words = len.div_ceil(4);
             let o = self.alloc_string(words);
-            let data = o.cast::<u8>().add(crate::object::INLINE_BASE).cast::<u16>();
+            let data = o.cast::<u8>().add(STRING_UNITS).cast::<u16>();
             fill(std::slice::from_raw_parts_mut(data, len));
             // The room past the units zero, not what memory held.
             std::ptr::write_bytes(data.add(len), 0, 4 * words - len);
@@ -4477,7 +4484,6 @@ impl Vm {
                 }
                 (*o).props = p;
                 crate::heap::barrier_young(o.cast(), &raw const (*o).props);
-                (*o).props_cap = want as u32;
             }
             crate::object::set_shape(o, new);
             let first = n - names.len();
@@ -4507,7 +4513,7 @@ impl Vm {
             debug_assert_eq!((*f).class, Class::Function);
             let code = &*(*f).code;
             // A bytecode function's slot 0 is always `prototype`.
-            let p = *Object::inline(f, 0);
+            let p = *f.cast::<u8>().add(crate::layout::slots_offset(Class::Function)).cast::<Value>();
             let proto = if p.is_cell() {
                 p
             } else if !self.realms.is_empty() && code.realm != self.realm {

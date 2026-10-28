@@ -4,13 +4,19 @@
 //!
 //! ```text
 //!  0  shape       *const Shape     names → slots, prototype, inline capacity
-//!  8  class u8, flags u8, inline_cap u16, props_cap u32
+//!  8  class u8, flags u8, inline_cap u16, elems_len u32
 //! 16  props       *mut Value       out-of-line slots beyond the inline ones
 //! 24  elems       *mut Value       indexed elements (arrays, mostly)
-//! 32  elems_len u32, elems_cap u32
-//! 40  code        *const Code      functions only
-//! 48  inline slots …
+//! 32  code        *const Code      not in plain objects and arrays
+//! 40  aux u32                      in buffers, views, a few more
+//! 32, 40 or 48  inline slots …
 //! ```
+//!
+//! The capacities of `props` and `elems` are their cells' (an array of
+//! values' header word, `VALUES | cap << 32`). Plain objects and arrays have
+//! no `code` (what most programs make most of: 16 bytes less each); every
+//! other class has it, and a few an `aux` word too, so where the slots
+//! start depends on the class (`layout::slots_offset`).
 //!
 //! The shape decides the layout: its first `capacity` slots are in-object,
 //! the rest are out of line. So an inline cache that has checked the shape
@@ -291,44 +297,30 @@ pub struct Object {
     /// object the low byte of its in-object capacity (see the module docs).
     pub kind: u8,
     cap_hi: u8,
-    pub props_cap: u32,
+    pub elems_len: u32,
     pub props: *mut Value,
     pub elems: *mut Value,
-    pub elems_len: u32,
-    pub elems_cap: u32,
+    /// Past the header (`HEADER_BYTES`): only for the classes with it
+    /// (`layout::extra_words`), a plain object's or an array's first slot
+    /// otherwise.
     pub code: *const Code,
 }
 
-/// Byte offset of the first in-object slot.
-pub const INLINE_BASE: usize = size_of::<Object>();
-const _: () = assert!(INLINE_BASE == 48 && INLINE_BASE == crate::layout::INLINE_BASE);
+/// An object's header in bytes: where a plain object's or an array's
+/// in-object slots start (see `layout::slots_offset`).
+pub const HEADER_BYTES: usize = crate::layout::HEADER_BYTES;
+const _: () = assert!(std::mem::offset_of!(Object, code) == HEADER_BYTES);
 crate::layout::same_layout!(Object, crate::layout::Header:
-    shape, class, flags, kind, cap_hi, props_cap, props, elems, elems_len, elems_cap, code);
+    shape, class, flags, kind, cap_hi, elems_len, props, elems, code);
 
 /// A new object's header, as words: `shape`, external, its in-object
-/// capacity the shape's, nothing out of line. (`Object` has no padding, so
-/// every byte is defined.)
-pub fn object_header(shape: &Shape) -> [u64; INLINE_BASE / 8] {
-    let mut h = [0u64; INLINE_BASE / 8];
+/// capacity the shape's, no elements, nothing out of line. (A class's
+/// words after it, `code` and `aux`, are the allocator's to zero.)
+pub fn object_header(shape: &Shape) -> [u64; crate::layout::HEADER_WORDS] {
     let cap = shape.capacity.get();
     let cap = u16::try_from(cap).expect("in-object capacity above 65535");
     assert!(cap == 0 || shape.class != Class::TypedArray, "a typed array with in-object slots");
-    unsafe {
-        h.as_mut_ptr().cast::<Object>().write(Object {
-            shape,
-            class: shape.class,
-            flags: EXTERNAL,
-            kind: cap as u8,
-            cap_hi: (cap >> 8) as u8,
-            props_cap: 0,
-            props: std::ptr::null_mut(),
-            elems: std::ptr::null_mut(),
-            elems_len: 0,
-            elems_cap: 0,
-            code: std::ptr::null(),
-        });
-    }
-    h
+    [shape as *const Shape as u64, crate::layout::header_word(shape.class, EXTERNAL, cap as u64), 0, 0]
 }
 
 impl Object {
@@ -355,30 +347,23 @@ impl Object {
     /// string's half).
     #[inline(always)]
     pub unsafe fn props_cap(this: *const Object) -> u32 {
-        unsafe {
-            let cap = crate::layout::props_cap(crate::layout::header(this));
-            debug_assert!((*this).class == Class::String || cap == (*this).props_cap);
-            cap
-        }
+        unsafe { crate::layout::props_cap(crate::layout::header(this)) }
     }
 
     /// The capacity of `this`'s elements: their cell's (see
-    /// `layout::elems_cap`).
+    /// `layout::elems_cap`), less the last slot of a far array's, which
+    /// holds its far store (see `far`).
     ///
     /// # Safety
     /// `this` must be an object whose `elems` are values (not a string, a
     /// typed array, a buffer or another class whose `elems` are bytes).
     #[inline(always)]
     pub unsafe fn elems_cap(this: *const Object) -> u32 {
-        unsafe {
-            let cap = crate::layout::elems_cap(crate::layout::header(this));
-            debug_assert_eq!(cap, (*this).elems_cap);
-            cap
-        }
+        unsafe { crate::layout::elems_cap(crate::layout::header(this)) - crate::far::is_far(this.cast_mut()) as u32 }
     }
 
-    /// The `u32` of a class with one of its own (see `layout::Header`): a
-    /// buffer's maximum byte length, a view's length (or
+    /// The `aux` word of a class with one (`layout::extra_words` 2), after
+    /// `code`: a buffer's maximum byte length, a view's length (or
     /// `typed::TRACKING`), a collection iterator's `IterMode` and stride, a
     /// BigInt's sign.
     ///
@@ -386,36 +371,44 @@ impl Object {
     /// `this` must be an object of such a class.
     #[inline(always)]
     pub unsafe fn aux(this: *mut Object) -> *mut u32 {
-        unsafe { &raw mut (*this).elems_cap }
+        unsafe {
+            debug_assert_eq!(crate::layout::extra_words((*this).class), 2);
+            this.cast::<u8>().add(HEADER_BYTES + 8).cast()
+        }
     }
 
-    /// The words of units after a flat string's header (see
-    /// `heap::cell_size`).
+    /// The words of units after a string's `code` (see `heap::cell_size`):
+    /// a flat one's, in `code`'s low half; a cons string's (`elems` null),
+    /// whose `code` is its right half, none.
     ///
     /// # Safety
     /// `this` must be a string.
     #[inline(always)]
     pub unsafe fn string_words(this: *const Object) -> usize {
-        unsafe { (*this).elems_cap as usize }
+        unsafe { if (*this).elems.is_null() { 0 } else { (*this).code as usize as u32 as usize } }
     }
 
-    /// Set [`Object::string_words`].
+    /// Set [`Object::string_words`] (and no atom).
     ///
     /// # Safety
-    /// `this` must be a new string.
+    /// `this` must be a new flat string.
     #[inline(always)]
     pub unsafe fn set_string_words(this: *mut Object, words: usize) {
-        unsafe { (*this).elems_cap = u32::try_from(words).expect("string too long") }
+        unsafe { (*this).code = u32::try_from(words).expect("string too long") as usize as *const Code }
     }
 
-    /// A string's atom as a property key plus one, once found (0: none
-    /// yet; see `Vm::property_key`).
+    /// A flat string's atom as a property key plus one, once found (0:
+    /// none yet; see `Vm::property_key`): `code`'s high half.
     ///
     /// # Safety
-    /// `this` must be a string.
+    /// `this` must be a flat string (`elems` not null: a cons string's
+    /// `code` is its right half).
     #[inline(always)]
     pub unsafe fn string_atom(this: *mut Object) -> *mut u32 {
-        unsafe { &raw mut (*this).props_cap }
+        unsafe {
+            debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
+            this.cast::<u8>().add(HEADER_BYTES + 4).cast()
+        }
     }
 
     /// The slot at `loc` (see [`Shape::location`]).
@@ -439,7 +432,7 @@ impl Object {
     /// `this` must be a live object with more than `i` inline slots.
     #[inline(always)]
     pub unsafe fn inline(this: *mut Object, i: usize) -> *mut Value {
-        unsafe { this.cast::<u8>().add(INLINE_BASE).cast::<Value>().add(i) }
+        unsafe { this.cast::<u8>().add(crate::layout::slots_offset((*this).class)).cast::<Value>().add(i) }
     }
 }
 
@@ -714,6 +707,8 @@ pub unsafe fn mark_shape(s: *const Shape) {
 #[inline]
 pub unsafe fn set_shape(o: *mut Object, s: *const Shape) {
     unsafe {
+        // (Where the slots are depends on the class: `layout::slots_offset`.)
+        debug_assert_eq!((*s).class, (*o).class);
         (*o).shape = s;
         mark_shape(s);
     }
@@ -1022,7 +1017,7 @@ impl Shape {
     /// of an in-object slot, or `!index` into the out-of-line slots.
     pub fn location(&self, i: u32) -> i32 {
         if i < self.capacity.get() {
-            (INLINE_BASE + 8 * i as usize) as i32
+            (crate::layout::slots_offset(self.class) + 8 * i as usize) as i32
         } else {
             !((i - self.capacity.get()) as i32)
         }
@@ -1068,8 +1063,8 @@ mod tests {
             traced: Cell::new(0),
             pinned: Cell::new(false),
         };
-        assert_eq!(s.location(0), 48);
-        assert_eq!(s.location(1), 56);
+        assert_eq!(s.location(0), 32);
+        assert_eq!(s.location(1), 40);
         assert_eq!(s.location(2), !0);
         assert_eq!(s.lookup(Atom(9)), Some(2));
         let mut heap = crate::heap::Heap::new();

@@ -431,8 +431,9 @@ thousand and a million; QuickJS's from its own count of what malloc holds,
 | an array element (pushed) | 17 | 12 | 33 | 8 | 11 |
 
 cloison's objects are 2 to 4 times V8's (which compresses pointers to 4
-bytes): every object starts with a 48-byte header (shape, class, property
-and element storage and their sizes, code), every value is 8 bytes, a
+bytes): every object starts with a 32-byte header (shape, class, element
+count, property and element storage; a function's code and most other
+classes' state in a word after it), every value is 8 bytes, a
 string keeps its UTF-16 behind such a header (one of 16 characters is a
 96-byte cell, a concatenation under 256 characters a flat copy), and a
 closure gets a `prototype` object made eagerly and its captured variables

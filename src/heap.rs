@@ -40,7 +40,7 @@
 //! and writing the metadata byte of the new cell: they come first, in that
 //! order (see [`Heap::bump`]).
 
-use crate::object::{Class, INLINE_BASE, Object, Shape, object_header};
+use crate::object::{Class, HEADER_BYTES, Object, Shape, object_header};
 use crate::value::Value;
 
 // What compiled code knows of the heap is defined with the other layouts
@@ -837,17 +837,30 @@ impl Heap {
     }
 
     /// A new object of `shape` with `extra` words after its in-object
-    /// slots (a closure's upvalues, a string's units), the slots
-    /// `undefined`, the extra words zero.
+    /// slots (a closure's upvalues), its class's words after the header
+    /// (`code`, `aux`) and the extra words zero, the slots `undefined`.
     pub fn alloc_object_extra(&mut self, shape: &Shape, extra: usize) -> *mut Object {
         let cap = shape.capacity.get() as usize;
-        let o = self.alloc(object_bytes(cap + extra)).cast::<Object>();
+        let words = crate::layout::extra_words(shape.class);
+        let o = self.alloc(object_bytes(words + cap + extra)).cast::<Object>();
         unsafe {
-            o.cast::<[u64; INLINE_BASE / 8]>().write(object_header(shape));
-            for i in 0..cap {
-                Object::inline(o, i).write(Value::UNDEFINED);
+            o.cast::<[u64; crate::layout::HEADER_WORDS]>().write(object_header(shape));
+            let after = o.cast::<u8>().add(HEADER_BYTES).cast::<u64>();
+            // (Not `write_bytes`: a call to `memset` for none, a plain
+            // object's.)
+            if words > 0 {
+                after.write(0);
+                if words > 1 {
+                    after.add(1).write(0);
+                }
             }
-            std::ptr::write_bytes(Object::inline(o, cap), 0, extra);
+            let slots = after.add(words).cast::<Value>();
+            for i in 0..cap {
+                slots.add(i).write(Value::UNDEFINED);
+            }
+            if extra > 0 {
+                std::ptr::write_bytes(slots.add(cap), 0, extra);
+            }
         }
         o
     }
@@ -987,10 +1000,11 @@ impl Heap {
     }
 }
 
-/// Bytes of an object with `words` words after its header.
+/// Bytes of an object with `words` words after its header (its class's
+/// `code` and `aux` among them).
 #[inline(always)]
 pub fn object_bytes(words: usize) -> usize {
-    (INLINE_BASE + 8 * words).next_multiple_of(GRANULE)
+    (HEADER_BYTES + 8 * words).next_multiple_of(GRANULE)
 }
 
 /// The size of the cell at `p`, from its first words.
@@ -1002,7 +1016,7 @@ pub unsafe fn cell_size(p: *const u8) -> usize {
         let w = *(p as *const u64);
         if w & 1 == 0 {
             let o = p as *const Object;
-            let mut words = Object::inline_cap(o);
+            let mut words = crate::layout::extra_words((*o).class) + Object::inline_cap(o);
             match (*o).class {
                 Class::String => words += Object::string_words(o),
                 Class::Function => words += (&(*(*o).code).upvalues).len(),

@@ -6,8 +6,8 @@
 Reads `stencils.rs` from the newest build directory (the host's, or the
 given target's), after build.rs's rewrites (stub folding, branch inversion,
 templates), and disassembles each stencil with capstone's `cstool`, marking
-the holes and continuations at their relocations and, for an arm64
-template, the slot-register fields. The instruction count excludes a
+the holes and continuations at their relocations and, for a template,
+the slot-register fields. The instruction count excludes a
 trailing `b cloison_continue`, which the JIT trims when the next piece follows.
 """
 import glob, os, re, subprocess, sys
@@ -25,8 +25,8 @@ src = open(path).read()
 SYM = {"HoleImm": "imm", "HoleImm64": "imm64", "HoleImm64b": "imm64b", "HoleReg": "reg",
        "Continue": "continue", "JumpTarget": "target", "Exit": "exit", "Slow": "slow"}
 entries = []
-for m in re.finditer(r'Stencil \{ name: "([^"]*)", slow: (\w+), slow_at: \d+, code: &\[([^\]]*)\], relocs: &\[(.*?)\], template: (None|Some\(&Template \{ fields: &\[(.*?)\], covers)', src):
-    name, code, relocs, fields = m.group(1), m.group(3), m.group(4), m.group(6)
+for m in re.finditer(r'Stencil \{ name: "([^"]*)", code: &\[([^\]]*)\], relocs: &\[(.*?)\], template: (None|Some\(&Template \{ fields: &\[(.*?)\] \}\))', src):
+    name, code, relocs, fields = m.group(1), m.group(2), m.group(3), m.group(5)
     code = bytes(int(x) for x in code.split(",") if x.strip())
     rl = []
     for r in re.finditer(r'R\((\d+), (\d+), Sym::(\w+)(?:\((\d+)\))?, (-?\d+)\)', relocs):
@@ -56,5 +56,6 @@ for name, code, relocs, fields in entries:
     print(f"== {name}: {n - (1 if trimmed else 0)} instructions{' (+ trimmed b continue)' if trimmed else ''}, {len(code)} bytes")
     for off, size, text in insns:
         notes = [r[2] + (f"{r[3]:+d}" if r[3] else "") for r in relocs if off <= r[0] < off + size]
-        notes += [f"g{p}@{bit}" for (foff, bit, p) in fields if foff == off]
+        # (A field: an arm64 instruction's bits, an x86-64 byte's within one.)
+        notes += [f"g{p}@{foff - off}:{bit}" if arch == "x86_64" else f"g{p}@{bit}" for (foff, bit, p) in fields if off <= foff < off + max(size, 1) and (arch == "x86_64" or foff == off)]
         print(f"  {off:4x}: {text:40} {'; ' + ', '.join(notes) if notes else ''}")

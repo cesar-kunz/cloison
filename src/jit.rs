@@ -41,10 +41,11 @@
 //! [      into compiled code itself, inline)                              ]
 //! ```
 //!
-//! On arm64 most stencils come from family templates: `build.rs` stores one
-//! template per family of slot variants plus the positions of its register
-//! fields, and [`Instance::copy_to`] writes the slot registers in while
-//! copying (see `compact_arm64` in `build.rs`).
+//! Most stencils come from family templates: `build.rs` stores one template
+//! per family of slot variants (on x86-64, per REX class) plus the
+//! positions of its register fields, and [`Instance::copy_to`] writes the
+//! slot registers in while copying (see `compact_arm64` and `compact_x86`
+//! in `build.rs`).
 //!
 //! A stencil whose last instruction jumps to `cloison_continue` falls through
 //! into the next piece with that jump trimmed. Calls to runtime functions
@@ -139,50 +140,25 @@ pub(crate) enum Sym {
 pub(crate) struct R(u16, u16, Sym, i32);
 
 pub(crate) struct Stencil {
-    /// The stencil's name, or for an arm64 family template its key, with
+    /// The stencil's name, or for a family template its key, with
     /// `{}` for each slot number (`addr_ii_u{}_u{}`).
     name: &'static str,
-    /// Whether `<name>__slow` exists.
-    slow: bool,
-    /// Its `STENCILS` index + 1 if that is the helper of every instance
-    /// (with the instance's registers), else 0.
-    slow_at: u16,
     code: &'static [u8],
     relocs: &'static [R],
-    /// For an arm64 family template, its register fields.
+    /// For a family template, its register fields.
     template: Option<&'static Template>,
 }
 
-/// What makes a stencil a family template (arm64; see `compact_arm64` in
-/// `build.rs`).
+/// What makes a stencil a family template (see `compact_arm64` and
+/// `compact_x86` in `build.rs`).
 pub(crate) struct Template {
-    /// (instruction offset, bit position, parameter): the JIT writes the
-    /// parameter's register into the 5-bit field.
+    /// (instruction or byte offset, bit position, parameter): the JIT
+    /// writes the parameter's register into the field, 5 bits on arm64, the
+    /// low 3 on x86-64 (`arch::patch_reg`).
     fields: &'static [(u16, u8, u8)],
-    /// The slot numbers of the family members this template covers (a
-    /// family may need several templates).
-    covers: &'static [[u8; 2]],
 }
 
 include!(concat!(env!("OUT_DIR"), "/stencils.rs"));
-
-/// The concrete stencil named `name`, in `BY_NAME` (a hash table
-/// `build.rs` emits, so there is none to build at startup).
-fn concrete(name: &str) -> Option<&'static Stencil> {
-    let mask = BY_NAME.len() - 1;
-    let mut h = name_hash(name.as_bytes()) as usize & mask;
-    loop {
-        let i = BY_NAME[h] as usize;
-        if i == 0 {
-            return None;
-        }
-        let s = &STENCILS[i - 1];
-        if s.name == name {
-            return Some(s);
-        }
-        h = (h + 1) & mask;
-    }
-}
 
 /// FNV-1a, 64-bit: `fnv1a` in `build.rs`, which hashes `BY_NAME`'s keys.
 fn name_hash(bytes: &[u8]) -> u64 {
@@ -191,44 +167,21 @@ fn name_hash(bytes: &[u8]) -> u64 {
     })
 }
 
-/// Family templates (arm64) by (family key, slot numbers), built at the
-/// first lookup of a stencil that isn't concrete.
-fn families() -> &'static HashMap<(&'static str, [u8; 2]), &'static Stencil> {
-    static FAMILIES: std::sync::OnceLock<HashMap<(&'static str, [u8; 2]), &'static Stencil>> =
-        std::sync::OnceLock::new();
-    FAMILIES.get_or_init(|| {
-        let mut m = HashMap::default();
-        for s in STENCILS {
-            if let Some(t) = s.template {
-                for &slots in t.covers {
-                    m.insert((s.name, slots), s);
-                }
-            }
+/// The `NAMES` index of the stencil named `name`, in `BY_NAME` (a hash
+/// table `build.rs` emits, so there is none to build at startup).
+fn named(name: &str) -> Option<usize> {
+    let mask = BY_NAME.len() - 1;
+    let mut h = name_hash(name.as_bytes()) as usize & mask;
+    loop {
+        let i = BY_NAME[h] as usize;
+        if i == 0 {
+            return None;
         }
-        m
-    })
-}
-
-/// Split a stencil name into its family key and slot parameters; see
-/// `slot_params` in `build.rs`, which this must match.
-fn slot_params(name: &str) -> (String, Vec<(char, u8)>) {
-    let mut key = String::with_capacity(name.len());
-    let mut params = Vec::new();
-    for (i, tok) in name.split('_').enumerate() {
-        if i > 0 {
-            key.push('_');
+        if NAMES[i - 1].0 == name {
+            return Some(i - 1);
         }
-        let mut cs = tok.chars();
-        match (cs.next(), cs.as_str().parse::<u8>()) {
-            (Some(c @ ('g' | 'u' | 'f')), Ok(k)) if i > 0 && !cs.as_str().is_empty() => {
-                key.push(c);
-                key.push_str("{}");
-                params.push((c, k));
-            }
-            _ => key.push_str(tok),
-        }
+        h = (h + 1) & mask;
     }
-    (key, params)
 }
 
 /// A stencil to copy, with the registers to patch into a family template's
@@ -241,33 +194,20 @@ struct Instance {
 }
 
 impl Instance {
-    fn of(stencil: &'static Stencil, regs: [u8; 2]) -> Instance {
-        let at = (stencil as *const Stencil as usize - STENCILS.as_ptr() as usize)
-            / size_of::<Stencil>();
-        Instance {
-            at: at as u16,
-            regs,
-        }
-    }
-
     fn stencil(self) -> &'static Stencil {
         &STENCILS[self.at as usize]
     }
 
     /// The stencil named `name`: a concrete stencil, or an instance of the
-    /// family template it belongs to (arm64).
+    /// family template it belongs to.
     fn find(name: &str) -> Option<Instance> {
-        if let Some(stencil) = concrete(name) {
-            return Some(Instance::of(stencil, [0; 2]));
-        }
-        let (key, params) = slot_params(name);
-        let (mut slots, mut regs) = ([0; 2], [0; 2]);
-        for (i, &p) in params.iter().enumerate().take(2) {
-            slots[i] = p.1;
-            regs[i] = arch::slot_reg(p);
-        }
-        let &stencil = families().get(&(key.as_str(), slots))?;
-        Some(Instance::of(stencil, regs))
+        named(name).map(|k| Instance::at(k).0)
+    }
+
+    /// `NAMES[k]`'s instance, and its `__slow` helper's `NAMES` index + 1.
+    fn at(k: usize) -> (Instance, usize) {
+        let (_, at, regs, slow) = NAMES[k];
+        (Instance { at, regs }, slow as usize)
     }
 
     fn get(name: &str) -> Instance {
@@ -282,10 +222,7 @@ impl Instance {
             return;
         };
         for &(at, shift, p) in template.fields {
-            let at = at as usize;
-            let w = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
-            let w = (w & !(31 << shift)) | (self.regs[p as usize] as u32) << shift;
-            buf[at..at + 4].copy_from_slice(&w.to_le_bytes());
+            arch::patch_reg(buf, at as usize, shift, self.regs[p as usize]);
         }
     }
 }
@@ -757,10 +694,12 @@ mod arch {
                 .any(|r| r.2 == super::Sym::Continue && r.0 as usize == n - 4)
     }
 
-    /// x86-64 stencils have no family templates (register fields aren't
-    /// patchable in place: encodings vary in length).
-    pub fn slot_reg(_: (char, u8)) -> u8 {
-        unreachable!("no register-patched stencils on x86-64")
+    /// Write register `reg` into a family template's field: the 3 bits at
+    /// `shift` of the ModRM, SIB or opcode byte at `at` (its REX bit is the
+    /// template's: templates are per REX class, see `compact_x86` in
+    /// `build.rs`).
+    pub fn patch_reg(buf: &mut [u8], at: usize, shift: u8, reg: u8) {
+        buf[at] = buf[at] & !(7 << shift) | (reg & 7) << shift;
     }
 
     /// The register number of GPR slot `k` (rdi rsi rdx rcx r8 r9), if the
@@ -770,7 +709,9 @@ mod arch {
         Some(slot_gpr(k))
     }
 
-    /// The register number of GPR slot `k`: rdi rsi rdx rcx r8 r9.
+    /// The register number of GPR slot `k`: rdi rsi rdx rcx r8 r9. Must
+    /// match `x86_slot_reg` in `build.rs`, which patches templates'
+    /// registers by it.
     pub fn slot_gpr(k: u8) -> u8 {
         [7, 6, 2, 1, 8, 9][k as usize]
     }
@@ -1157,15 +1098,23 @@ mod arch {
             })
     }
 
-    /// The register of a slot parameter, as `slot_params` names them: GPR
-    /// slots 0–4 are x24–x28, 5–11 are x0–x6; FP slot k is d(k+1). Must
-    /// match `arm64_slot_reg` in `build.rs`.
+    /// The register of a slot parameter: GPR slots 0–4 are x24–x28, 5–11
+    /// are x0–x6; FP slot k is d(k+1). Must match `arm64_slot_reg` in
+    /// `build.rs`, which patches templates' registers by it.
     pub fn slot_reg((class, k): (char, u8)) -> u8 {
         match class {
             'f' => k + 1,
             _ if k < 5 => 24 + k,
             _ => k - 5,
         }
+    }
+
+    /// Write register `reg` into a family template's field: the 5 bits at
+    /// `shift` of the instruction at `at`.
+    pub fn patch_reg(buf: &mut [u8], at: usize, shift: u8, reg: u8) {
+        let w = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+        let w = (w & !(31 << shift)) | (reg as u32) << shift;
+        buf[at..at + 4].copy_from_slice(&w.to_le_bytes());
     }
 
     /// The register number of GPR slot `k`, if the C ABI doesn't preserve
@@ -6477,14 +6426,9 @@ impl Piece {
     }
 
     fn new(name: &str, reg: u8) -> Piece {
-        let stencil = Instance::get(name);
-        let slow = (stencil.stencil().slow).then(|| match stencil.stencil().slow_at {
-            0 => Instance::get(&format!("{name}__slow")),
-            k => Instance {
-                at: k - 1,
-                regs: stencil.regs,
-            },
-        });
+        let k = named(name).unwrap_or_else(|| panic!("no stencil `{name}`"));
+        let (stencil, slow) = Instance::at(k);
+        let slow = (slow > 0).then(|| Instance::at(slow - 1).0);
         Piece {
             slow,
             ..Piece::of(stencil, reg)
@@ -6492,7 +6436,7 @@ impl Piece {
     }
 
     /// The instance `stencil`, without its `__slow` helper (spills have
-    /// none). On arm64, a family template's name isn't the instance's.
+    /// none). A family template's name isn't the instance's.
     fn of(stencil: Instance, reg: u8) -> Piece {
         Piece {
             stencil,
@@ -17836,16 +17780,31 @@ mod tests {
     }
 
     /// Every stencil variant LLVM compiled is reproduced exactly by the JIT's
-    /// lookup and copy, including (on arm64) those rebuilt from a family
-    /// template by patching register fields.
+    /// lookup and copy, including those rebuilt from a family template by
+    /// patching register fields; and so is its `__slow` helper, as a piece
+    /// finds it (an explicit stencil's may come from a template, a
+    /// template's may be explicit).
     #[test]
     fn every_stencil_instance_matches_its_compiled_bytes() {
-        for &(name, hash) in STENCIL_HASHES {
-            let inst = Instance::get(name);
+        let copy = |inst: Instance| {
             let len = inst.stencil().code.len();
             let mut buf = vec![0; len];
             inst.copy_to(&mut buf, len);
-            assert_eq!(fnv1a(&buf), hash, "{name} (from {})", inst.stencil().name);
+            fnv1a(&buf)
+        };
+        let hashes: HashMap<&str, u64> = STENCIL_HASHES.iter().copied().collect();
+        for &(name, hash) in STENCIL_HASHES {
+            let inst = Instance::get(name);
+            assert_eq!(copy(inst), hash, "{name} (from {})", inst.stencil().name);
+            if name.ends_with("__slow") {
+                continue;
+            }
+            let helper = hashes.get(format!("{name}__slow").as_str());
+            let piece = Piece::new(name, 0);
+            assert_eq!(piece.slow.is_some(), helper.is_some(), "{name}'s helper");
+            if let (Some(slow), Some(&h)) = (piece.slow, helper) {
+                assert_eq!(copy(slow), h, "{name}'s helper (from {})", slow.stencil().name);
+            }
         }
     }
 }

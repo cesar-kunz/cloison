@@ -2150,9 +2150,11 @@ impl Vm {
         &self.mega_stores[1..]
     }
 
-    /// The address of [`MegaStore`] table `Vm::mega_stores`.
+    /// The address of [`MegaStore`] table `Vm::mega_stores`'s entry 1,
+    /// past which `mega_index`'s entries are (the stencils add the hash's
+    /// entry to it in one instruction; entry 0 is just before).
     pub(crate) fn mega_stores_addr(&self) -> u64 {
-        self.mega_stores.as_ptr() as u64
+        self.mega_stores[1..].as_ptr() as u64
     }
 
     /// Note in `Vm::mega_stores` how `o.name` was just stored, `o` of
@@ -2209,9 +2211,10 @@ impl Vm {
         }
     }
 
-    /// The address of [`MegaEntry`] table `Vm::megas`.
+    /// The address of [`MegaEntry`] table `Vm::megas`'s entry 1, as
+    /// [`Vm::mega_stores_addr`].
     pub(crate) fn megas_addr(&self) -> u64 {
-        self.megas.as_ptr() as u64
+        self.megas[1..].as_ptr() as u64
     }
 
     /// Note in `Vm::megas` where `o.name` is, if a data property's slot

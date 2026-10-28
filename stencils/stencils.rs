@@ -4955,71 +4955,113 @@ unsafe fn props(o: *mut u8) -> *mut u8 {
     unsafe { (*header(o)).props.cast() }
 }
 
-/// `o.name` (the name an `Atom`, in `imm64`) as the runtime's megamorphic
-/// load table (at `imm64b`; see `vm::MegaEntry`) has it, if it does.
+/// Whether the `u32` `OFF` bytes into `e`, an entry of the megamorphic
+/// tables, is the name: compared against `imm` on x86-64, which leaves the
+/// probes of `mega_load` and `mega_store` a register (and `e` is in one
+/// already); elsewhere against `imm64`, which the hash has in a register.
+#[inline(always)]
+unsafe fn is_name_at<const OFF: usize, T>(e: *const T) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "cmp dword ptr [{e} + {off}], offset {imm}",
+            "jne {ne}",
+            e = in(reg) e,
+            off = const OFF,
+            imm = sym cloison_hole_imm,
+            ne = label { return false },
+            options(readonly, nostack),
+        );
+        true
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        *e.byte_add(OFF).cast::<u32>() == imm64() as u32
+    }
+}
+
+/// `o.name` (the name an `Atom`, in `imm64`, and in `imm` for x86-64's
+/// compare: see `is_name_at`) as the runtime's megamorphic load table (at `imm64b`;
+/// see `vm::MegaEntry`) has it, if it does: an own slot's laid out as the
+/// fall-through.
 #[inline(always)]
 unsafe fn mega_load(tag: NumberTag, o: Value) -> Option<Value> {
     unsafe {
-        if !is_cell(tag, o) {
+        if !is_cell_g(tag, o) {
             return None;
         }
         let p = o.to_bits() as *mut u8;
         let shape = (*header(p)).shape;
-        let name = imm64() as u32;
+        // (`imm64b`: entry 1's address.)
         let t = imm64b() as *const MegaEntry;
-        let e = t.add(mega_index(shape, name));
-        if (*e).shape != shape || (*e).name != name {
+        let e = t.add(mega_index(shape, imm64() as u32) - 1);
+        if (*e).shape != shape || !is_name_at::<{ core::mem::offset_of!(MegaEntry, name) }, _>(e) {
             return None;
         }
+        // (TypeScript's: 90% of the hits an own slot in the object, 4%
+        // out of it, 6% a prototype's.)
         let addr = (*e).addr as *const Value;
-        if addr.is_null() {
-            let off = (*e).off;
-            let base = if off >= 0 { p } else { props(p) };
-            return Some(*(base.add((off ^ (off >> 31)) as usize) as *const Value));
+        if core::hint::likely(addr.is_null()) {
+            let off = (*e).off as isize;
+            let at = if core::hint::likely(off >= 0) { p.offset(off) } else { props(p).offset(!off) };
+            return Some(*(at as *const Value));
         }
         // (Entry 0's `addr`: the prototype epoch's.)
-        let epoch = *((*t).addr as *const u32);
+        let epoch = *((*t.sub(1)).addr as *const u32);
         ((*e).epoch == epoch).then(|| *addr)
     }
 }
 
-/// `o.name = v` (the name an `Atom`, in `imm64`; `v` boxed) as the
-/// runtime's megamorphic store table (at `imm64b`; see `vm::MegaStore`) has
-/// it, if it does, as the interpreter's store cache does: whether it did.
+/// `o.name = v` (the name an `Atom`, in `imm64` and `imm`, as
+/// `mega_load`'s; `v` boxed) as the runtime's megamorphic store table
+/// (at `imm64b`; see `vm::MegaStore`) has it, if it does, as the
+/// interpreter's store cache does: whether it did. `int`: `v` is an int32,
+/// which fits only an any-value field or an int32's, and needs no barrier.
 /// (An int32 into a `Num` field, which takes it as a double, is left to
 /// the runtime.)
 #[inline(always)]
-unsafe fn mega_store(tag: NumberTag, o: Value, v: Value) -> bool {
+unsafe fn mega_store(tag: NumberTag, o: Value, v: Value, int: bool) -> bool {
     unsafe {
-        if !is_cell(tag, o) {
+        if !is_cell_g(tag, o) {
             return false;
         }
         let p = o.to_bits() as *mut u8;
         let shape = (*header(p)).shape;
-        let name = imm64() as u32;
+        // (`imm64b`: entry 1's address.)
         let t = imm64b() as *const MegaStore;
-        let k = mega_index(shape, name);
-        let mut e = t.add(k);
-        if (*e).shape != shape || (*e).name != name {
-            e = t.add(mega_pair(k));
-            if (*e).shape != shape || (*e).name != name {
+        let k = mega_index(shape, imm64() as u32);
+        let mut e = t.add(k - 1);
+        if (*e).shape != shape || !is_name_at::<{ core::mem::offset_of!(MegaStore, name) }, _>(e) {
+            core::hint::cold_path();
+            e = t.add(mega_pair(k) - 1);
+            if (*e).shape != shape || !is_name_at::<{ core::mem::offset_of!(MegaStore, name) }, _>(e) {
                 return false;
             }
         }
-        let fits = match (*e).ft {
-            FIELD_ANY => true,
-            FIELD_INT => tag.is_int32(v),
-            FIELD_NUM => is_number(tag, v) && !tag.is_int32(v),
-            s => is_cell(tag, v) && (*cell(v)).shape == s,
-        };
-        if !fits {
-            return false;
+        // (`FIELD_ANY` 0, `FIELD_INT` 1: TypeScript's stores, about half
+        // each.)
+        let ft = (*e).ft;
+        if core::hint::likely(ft <= FIELD_INT) {
+            if !int && ft == FIELD_INT && !tag.is_int32(v) {
+                return false;
+            }
+        } else {
+            let fits = !int
+                && if ft == FIELD_NUM {
+                    is_number(tag, v) && !tag.is_int32(v)
+                } else {
+                    is_cell(tag, v) && (*cell(v)).shape == ft
+                };
+            if !fits {
+                return false;
+            }
         }
         let loc = (*e).loc;
         let new = (*e).new_shape;
-        if new != 0 {
+        // (TypeScript's: 4% of the stores add the field.)
+        if core::hint::unlikely(new != 0) {
             // (Entry 0's `new_shape`: the prototype epoch's address.)
-            let epoch = *((*t).new_shape as *const u32);
+            let epoch = *((*t.sub(1)).new_shape as *const u32);
             if (*e).epoch != epoch || loc < 0 && !loc as u32 >= (*header(p)).props_cap {
                 return false;
             }
@@ -5028,12 +5070,16 @@ unsafe fn mega_store(tag: NumberTag, o: Value, v: Value) -> bool {
         if loc >= 0 {
             let at = p.add(loc as usize) as *mut Value;
             *at = v;
-            barrier(tag, p, at, v);
+            if !int {
+                barrier(tag, p, at, v);
+            }
         } else {
             let q = props(p);
             let at = (q as *mut Value).add(!loc as usize);
             *at = v;
-            barrier(tag, payload_cell(q), at, v);
+            if !int {
+                barrier(tag, payload_cell(q), at, v);
+            }
         }
         true
     }
@@ -5817,11 +5863,13 @@ macro_rules! property_location {
         // (`jit::Prop::Runtime`: a site whose receivers the fast ones kept
         // leaving for), the name (an `Atom`) in `imm64`; `acc` boxed, or
         // (`_i`) an int32. Leave where they would throw or run code.
-        // target x86_64 get_named_rt_g{}: 23 now 36 own-slot hit falling through: cell (3), `mov rbx, [rdi]`, hash (8), table (1), two `cmp [rax+r10+d]; jne miss`, `cmp qword [..+0x38], 0; jne proto`, `movsxd; test; js oop; mov r12, [rdi+r11]`; the call out of line (judged 2026-10-26)
-        // target x86_64 get_named_rt_m: 24 now 41 as `_g{}` with the receiver from `mov rax, [r13+k]` (judged 2026-10-26)
-        // target aarch64 get_named_rt_g{}: 29 now 41 own-slot hit falling through: cell (3), `ldr` shape, name (3), K (4), `eor lsl #32; mul; lsr`, table (3), `add lsl #5`, two `ldr; cmp; b.ne`, `ldr; cbnz proto`, `ldrsw; tbnz oop; ldr x20, [x24, x12]` (judged 2026-10-26)
-        // target aarch64 get_named_rt_m: 30 now 41 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
-        stencil!("get_named_rt_", loc!($loc); |s| {
+        // target x86_64 get_named_rt_g{}: 23 now 25 own-slot hit falling through: cell (2), `mov r10, [rdi]`, hash (8), `cmp [rax+r11], r10; jne miss`, `add`, `cmp dword [r11+8], name; jne miss` (the name an immediate: `is_name_at`), `mov; test; jne proto`, `movsxd; test; js oop; add; mov r12, [r10]`; the call in `__slow` (2026-10-28)
+        // target x86_64 get_named_rt_m: 24 now 28 as `_g{}` with the receiver from `mov rax, [r13+k]`, and `push rbp` (2026-10-28)
+        // target aarch64 get_named_rt_g{}: 29 now 30 own-slot hit falling through: cell (3), `ldr` shape, name (3), K (4), `eor lsl #32; mul; lsr`, table (3), `add lsl #5`, two `ldr; cmp; b.ne`, `ldr; cbnz proto`, `ldrsw; tbnz oop; ldr x20, [x24, x12]` (2026-10-28)
+        // target aarch64 get_named_rt_m: 30 now 31 as `_g{}` after `ldr x8, [x21, #k]` (2026-10-28)
+        // `get_named_rt_` in one piece, for a soft load's miss path (cold
+        // code, which has no `__slow` helpers: `soft_path`).
+        stencil!("get_named_rt_cold_", loc!($loc); |s| {
             let o = get!($loc, s);
             if let Some(v) = mega_load(s.tag, o) {
                 s.acc = v;
@@ -5834,14 +5882,31 @@ macro_rules! property_location {
             s.acc = Value::from_bits(r);
             next!(s)
         });
-        // target x86_64 set_named_rt_g{}: 42 fallthrough 23 the probe (way 1: 26), `mov [rdi+rbx], r12`, the barrier (16) (fall-through: runtime call, 19/24; the designated path runs 82: tag and slots spilled, r13/r15 borrowed; judged 2026-10-26)
-        // target x86_64 set_named_rt_m: 43 fallthrough 24 as `_g`, the slot loaded first (judged 2026-10-26)
-        // target aarch64 set_named_rt_g{}: 47 fallthrough 17 the probe (way 1: 31), `str x20, [x24, x10]`, the barrier (15) (fall-through: runtime call, 17; designated path 52; judged 2026-10-26)
-        // target aarch64 set_named_rt_m: 48 fallthrough 19 (fall-through 19; judged 2026-10-26)
-        stencil!("set_named_rt_", loc!($loc); |s| {
-            if mega_store(s.tag, get!($loc, s), s.acc) {
+        stencil_slow!("get_named_rt_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if let Some(v) = mega_load(s.tag, o) {
+                s.acc = v;
                 next!(s)
             }
+            slow!(s)
+        }; |s| {
+            let r = rt_call!(s, cloison_rt_get_named, get!($loc, s), Value::from_bits(imm64()));
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
+        // target x86_64 set_named_rt_g{}: 42 fallthrough 25 the probe (way 1 cold), `mov [rdi+r11], r12`, the barrier (16): an any-value field's 46 (the fall-through: an int32 field's store of a non-int32, to `__slow`; was 82 with tag and slots spilled, 2026-10-28)
+        // target x86_64 set_named_rt_m: 43 now 54 as `_g`, the slot loaded first, with `push rbp` (2026-10-28)
+        // target aarch64 set_named_rt_g{}: 47 the probe (way 1 cold), `str x20, [x24, x10]`, the barrier (15) (2026-10-28)
+        // target aarch64 set_named_rt_m: 48 (2026-10-28)
+        stencil_slow!("set_named_rt_", loc!($loc); |s| {
+            if mega_store(s.tag, get!($loc, s), s.acc, false) {
+                next!(s)
+            }
+            slow!(s)
+        }; |s| {
             let args = [get!($loc, s), Value::from_bits(imm64()), s.acc];
             let r = rt_call!(s, cloison_rt_set_named, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {
@@ -5849,15 +5914,18 @@ macro_rules! property_location {
             }
             next!(s)
         });
-        // target x86_64 set_named_rt_i_g{}: 27 fallthrough 27 the probe (26), `or r12, r14; mov [rdi+rbx], r12`: no barrier for an int (`_g` 27) (fall-through: runtime call, 26/31; designated path 58; judged 2026-10-26)
-        // target x86_64 set_named_rt_i_m: 28 fallthrough 30 as `_g`, the slot loaded first (judged 2026-10-26)
-        // target aarch64 set_named_rt_i_g{}: 34 fallthrough 19 the probe (31), `orr x20, x22, x20; str` (fall-through 19; designated path 38; judged 2026-10-26)
-        // target aarch64 set_named_rt_i_m: 35 fallthrough 21 (judged 2026-10-26)
-        stencil!("set_named_rt_i_", loc!($loc); |s| {
+        // target x86_64 set_named_rt_i_g{}: 27 now 28 the probe (way 1 cold), `cmp qword [r11+16], 2; jae`, `or rax, r14; mov [rdi+r10], rax`: no barrier for an int (was 58, 2026-10-28)
+        // target x86_64 set_named_rt_i_m: 28 now 32 as `_g`, the slot loaded first (2026-10-28)
+        // target aarch64 set_named_rt_i_g{}: 34 now 35 the probe, `orr x20, x22, x20; str` (was 38, 2026-10-28)
+        // target aarch64 set_named_rt_i_m: 35 now 36 (2026-10-28)
+        stencil_slow!("set_named_rt_i_", loc!($loc); |s| {
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
-            if mega_store(s.tag, get!($loc, s), v) {
+            if mega_store(s.tag, get!($loc, s), v, true) {
                 next!(s)
             }
+            slow!(s)
+        }; |s| {
+            let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             let args = [get!($loc, s), Value::from_bits(imm64()), v];
             let r = rt_call!(s, cloison_rt_set_named, Value::from_bits(args.as_ptr() as u64), Value::UNDEFINED);
             if r == 0 {

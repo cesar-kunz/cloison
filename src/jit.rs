@@ -4643,7 +4643,7 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = Any;
             let name = fbs[insn.ic_frame()].name(insn).0 as u64;
             return Sel {
-                ops: Some((0, name, megas_addr())),
+                ops: Some((name as i32, name, megas_addr())),
                 ..Sel::new("get_named_rt", "", out)
             };
         }
@@ -5227,7 +5227,7 @@ fn named_rt_store(mut out: TypeState, reg: Ty, acc: Ty, name: crate::object::Ato
     out.regs.map(|_, t| ext(t));
     out.acc = ext(out.acc);
     Sel {
-        ops: Some((0, name.0 as u64, mega_stores_addr())),
+        ops: Some((name.0 as i32, name.0 as u64, mega_stores_addr())),
         ..Sel::new("set_named_rt", if acc == Ty::I32 { "i" } else { "" }, out)
     }
 }
@@ -5315,7 +5315,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 let name = unsafe { (*crate::interp::current_vm()).a_length.0 } as u64;
                 out.acc = Any;
                 return Sel {
-                    ops: Some((0, name, megas_addr())),
+                    ops: Some((name as i32, name, megas_addr())),
                     ..Sel::new("get_named_rt", "", out)
                 };
             }
@@ -5440,7 +5440,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             let name = name.0 as u64;
             out.acc = Any;
             return Sel {
-                ops: Some((0, name, megas_addr())),
+                ops: Some((name as i32, name, megas_addr())),
                 ..Sel::new("get_named_rt", "", out)
             };
         }
@@ -11036,10 +11036,11 @@ fn soft_path(i: usize, insn: &Insn, soft: Soft, homes: &[Home], after: usize) ->
         .loc();
     let mut seq = vec![Piece {
         reg: insn.reg,
+        imm: soft.name as i32,
         imm64: soft.name,
         imm64b: megas_addr(),
         exit: i as u32,
-        ..Piece::new(&format!("get_named_rt_{loc}"), 0)
+        ..Piece::new(&format!("get_named_rt_cold_{loc}"), 0)
     }];
     seq.extend(soft.check.map(|(c, imm64, imm64b)| Piece {
         imm64,

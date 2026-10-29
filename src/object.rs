@@ -677,6 +677,88 @@ pub struct Shape {
     pub(crate) pinned: Cell<bool>,
 }
 
+/// A shape, owned like a box but in a slot of a chunk of shapes (each
+/// thread's [`SHAPE_SLAB`]): freed into the chunk, for the next shape
+/// made, rather than to the allocator. (Sass's 4.4M shapes that die, each
+/// freed to `malloc` on its own, cost its collections' pauses twice as
+/// long: cold memory, and `malloc_consolidate`.)
+pub struct ShapeBox(std::ptr::NonNull<Shape>);
+
+/// Shapes per chunk of [`SHAPE_SLAB`].
+const SLAB_SHAPES: usize = 256;
+
+/// Each thread's chunks of shapes (never returned to the allocator till
+/// the thread ends) and their free slots.
+#[derive(Default)]
+pub struct ShapeSlab {
+    chunks: Vec<*mut Shape>,
+    free: Vec<*mut Shape>,
+    /// The latest chunk's slots not used yet.
+    next: usize,
+}
+
+thread_local! {
+    static SHAPE_SLAB: RefCell<ShapeSlab> = RefCell::default();
+}
+
+impl ShapeSlab {
+    fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::array::<Shape>(SLAB_SHAPES).unwrap()
+    }
+}
+
+impl Drop for ShapeSlab {
+    fn drop(&mut self) {
+        for &c in &self.chunks {
+            unsafe { std::alloc::dealloc(c.cast(), ShapeSlab::layout()) };
+        }
+    }
+}
+
+impl ShapeBox {
+    pub fn new(s: Shape) -> ShapeBox {
+        let p = SHAPE_SLAB.with_borrow_mut(|slab| {
+            if let Some(p) = slab.free.pop() {
+                return p;
+            }
+            if slab.next == 0 {
+                let c = unsafe { std::alloc::alloc(ShapeSlab::layout()) }.cast::<Shape>();
+                if c.is_null() {
+                    std::alloc::handle_alloc_error(ShapeSlab::layout());
+                }
+                slab.chunks.push(c);
+                slab.next = SLAB_SHAPES;
+            }
+            slab.next -= 1;
+            unsafe { slab.chunks.last().unwrap().add(slab.next) }
+        });
+        unsafe { p.write(s) };
+        ShapeBox(unsafe { std::ptr::NonNull::new_unchecked(p) })
+    }
+}
+
+impl std::ops::Deref for ShapeBox {
+    type Target = Shape;
+    fn deref(&self) -> &Shape {
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl std::ops::DerefMut for ShapeBox {
+    fn deref_mut(&mut self) -> &mut Shape {
+        unsafe { self.0.as_mut() }
+    }
+}
+
+impl Drop for ShapeBox {
+    fn drop(&mut self) {
+        let p = self.0.as_ptr();
+        unsafe { std::ptr::drop_in_place(p) };
+        // (No VM outlives its thread's slab: none is a thread-local.)
+        SHAPE_SLAB.with_borrow_mut(|slab| slab.free.push(p));
+    }
+}
+
 /// Keep shape `s` live for good: compiled code gives it to objects.
 ///
 /// # Safety
@@ -760,22 +842,32 @@ pub struct SlotTable {
 const LINEAR_LOOKUP: u32 = 8;
 
 impl SlotTable {
+    /// One allocation for a table's arrays (one each took sass three
+    /// `malloc`s a shape): its field cells, keys and attributes, the
+    /// offsets of the last two.
+    fn layout(cap: u32) -> (std::alloc::Layout, usize, usize) {
+        use std::alloc::Layout;
+        let n = cap as usize;
+        let (l, keys) = Layout::array::<*const FieldCell>(n).unwrap().extend(Layout::array::<Atom>(n).unwrap()).unwrap();
+        let (l, attrs) = l.extend(Layout::array::<u8>(n).unwrap()).unwrap();
+        (l, keys, attrs)
+    }
+
     fn with_capacity(cap: u32) -> SlotTable {
-        fn array<T>(cap: u32) -> *mut T {
-            let layout = std::alloc::Layout::array::<T>(cap as usize).unwrap();
-            if layout.size() == 0 {
-                return std::ptr::NonNull::dangling().as_ptr();
-            }
+        let (layout, keys, attrs) = SlotTable::layout(cap);
+        let p = if layout.size() == 0 {
+            std::ptr::NonNull::<*const FieldCell>::dangling().as_ptr().cast::<u8>()
+        } else {
             let p = unsafe { std::alloc::alloc(layout) };
             if p.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            p.cast()
-        }
+            p
+        };
         SlotTable {
-            keys: array(cap),
-            attrs: array(cap),
-            fields: array(cap),
+            keys: unsafe { p.add(keys) }.cast(),
+            attrs: unsafe { p.add(attrs) },
+            fields: p.cast(),
             len: Cell::new(0),
             cap,
             index: RefCell::default(),
@@ -805,16 +897,9 @@ impl SlotTable {
 
 impl Drop for SlotTable {
     fn drop(&mut self) {
-        unsafe fn free<T>(p: *mut T, cap: u32) {
-            let layout = std::alloc::Layout::array::<T>(cap as usize).unwrap();
-            if layout.size() != 0 {
-                unsafe { std::alloc::dealloc(p.cast(), layout) };
-            }
-        }
-        unsafe {
-            free(self.keys, self.cap);
-            free(self.attrs, self.cap);
-            free(self.fields, self.cap);
+        let (layout, ..) = SlotTable::layout(self.cap);
+        if layout.size() != 0 {
+            unsafe { std::alloc::dealloc(self.fields.cast(), layout) };
         }
     }
 }

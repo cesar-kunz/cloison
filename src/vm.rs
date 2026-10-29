@@ -599,18 +599,18 @@ const STRING_UNITS: usize = crate::layout::slots_offset(Class::String);
 /// Stack size in values (frame headers included).
 const STACK_VALUES: usize = 1 << 18;
 
-// Shapes and code are boxed so their addresses stay put as the vectors grow.
+// Shapes (in slabs: `object::ShapeBox`) and code are boxed so their
+// addresses stay put as the vectors grow.
 #[allow(clippy::vec_box)]
 pub struct Vm {
     pub heap: Heap,
-    shapes: Vec<Box<Shape>>,
+    shapes: Vec<crate::object::ShapeBox>,
     /// The shapes' addresses (to tell a shape among compiled code's
     /// constants: see `jit`).
     pub(crate) shape_set: crate::jit::HashSet<usize>,
     /// Shapes a full marking found dead (see [`Vm::sweep_shapes`]): kept,
     /// so that their addresses aren't reused.
-    #[allow(clippy::vec_box)]
-    zombies: Vec<Box<Shape>>,
+    zombies: Vec<crate::object::ShapeBox>,
     /// Shapes made since a full marking last collected them.
     shapes_made: usize,
     field_cells: Vec<Box<FieldCell>>,
@@ -1516,7 +1516,7 @@ impl Vm {
     pub(crate) fn add_shape(&mut self, s: Shape) -> *const Shape {
         // (A Rust structure: its prototype is logged if young.)
         self.heap.note(s.proto);
-        let mut b = Box::new(s);
+        let mut b = crate::object::ShapeBox::new(s);
         let p: *const Shape = &*b;
         if b.family.is_null() {
             b.family = p;

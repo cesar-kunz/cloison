@@ -108,8 +108,13 @@ impl Hasher for FxHasher {
     fn write_usize(&mut self, x: usize) {
         self.add(x as u64);
     }
+    // (Rotated, as rustc-hash 2 does: the multiply leaves entropy in the
+    // high bits, and hashbrown picks a bucket by the low ones. Without
+    // it, names differing in a last few characters, as symbols' atoms,
+    // `\u{FDD0}` and a count, fell in a few buckets: a million symbols took
+    // 1.5 s, in `Vm::intern`.)
     fn finish(&self) -> u64 {
-        self.0
+        self.0.rotate_left(26)
     }
 }
 

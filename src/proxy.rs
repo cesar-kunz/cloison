@@ -533,7 +533,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
     if !is_proxy(vm, o) {
         let mut keys: Vec<Key> = vm.own_keys(o).into_iter().map(|(k, _)| k).collect();
         for s in crate::symbol::own_symbol_keys(vm, o) {
-            keys.push(Key::Name(crate::symbol::symbol_atom(s)));
+            keys.push(Key::Name(crate::symbol::symbol_atom(vm, s)));
         }
         return Ok(keys);
     }

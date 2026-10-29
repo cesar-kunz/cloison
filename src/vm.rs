@@ -3527,7 +3527,7 @@ impl Vm {
             return Key::Index(key.as_i32_unchecked() as u32);
         }
         if crate::symbol::is_symbol(key) {
-            return Key::Name(crate::symbol::symbol_atom(key));
+            return Key::Name(crate::symbol::symbol_atom(self, key));
         }
         if let Some(d) = key.as_number()
             && d >= 0.0

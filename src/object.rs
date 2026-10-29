@@ -460,6 +460,9 @@ pub struct FieldCell {
     /// It went from `Int` to `Num` and may still hold int32s in objects'
     /// own memory, until `Vm::int_fields_to_doubles` (see `FieldType::Num`).
     ints: Cell<bool>,
+    /// The slot tables that have it: none, and `Vm::free_field_cells`
+    /// frees it.
+    tables: Cell<u32>,
 }
 
 thread_local! {
@@ -476,7 +479,13 @@ impl FieldCell {
             folded: Cell::new(false),
             relied: Cell::new(false),
             ints: Cell::new(false),
+            tables: Cell::new(0),
         }
+    }
+
+    /// Whether no slot table has it any more.
+    pub(crate) fn unused(&self) -> bool {
+        self.tables.get() == 0
     }
 
     /// Whether objects may still hold int32s in the field (a `Num` one).
@@ -661,7 +670,10 @@ pub struct Shape {
     pub(crate) lineage_relied: Cell<bool>,
     /// The shape this one was made from (by a transition, or a copy of its
     /// own for an object), null for a root: objects that leave this one
-    /// leave it too.
+    /// leave it too. Null too for the copy an object leaving its shape gets
+    /// (a property deleted, attributes or the prototype changed): the
+    /// shape left, with those it was made from, has nothing more to learn,
+    /// and kept by its copy would keep an object's every delete's shape.
     pub(crate) parent: *const Shape,
     /// The latest full marking that found it live ([`crate::gc::code_epoch`],
     /// as `Code::mark`): an object of it was traced, it was made or given
@@ -834,7 +846,7 @@ pub struct SlotTable {
     cap: u32,
     /// Slot by property, over the first `indexed` slots: a long prefix is
     /// searched there (a table's keys are distinct, a lineage's slots).
-    index: RefCell<std::collections::HashMap<Atom, u32>>,
+    index: RefCell<crate::jit::HashMap<Atom, u32>>,
     indexed: Cell<u32>,
 }
 
@@ -883,6 +895,7 @@ impl SlotTable {
             self.keys.add(n as usize).write(key);
             self.attrs.add(n as usize).write(attrs);
             self.fields.add(n as usize).write(field);
+            (*field).tables.set((*field).tables.get() + 1);
         }
         self.len.set(n + 1);
     }
@@ -902,6 +915,10 @@ impl SlotTable {
 
 impl Drop for SlotTable {
     fn drop(&mut self) {
+        // (The VM drops its shapes before its cells.)
+        for &f in self.all_fields() {
+            unsafe { (*f).tables.set((*f).tables.get() - 1) };
+        }
         let (layout, ..) = SlotTable::layout(self.cap);
         if layout.size() != 0 {
             unsafe { std::alloc::dealloc(self.fields.cast(), layout) };
@@ -1137,11 +1154,12 @@ mod tests {
 
     #[test]
     fn locations() {
+        let cells = [FieldCell::new(), FieldCell::new(), FieldCell::new()];
         let s = Shape {
             class: Class::Plain,
             proto: Value::NULL,
             capacity: Cell::new(2),
-            slots: Slots::new(&[Atom(7), Atom(8), Atom(9)], &[0; 3], &[std::ptr::null(); 3]),
+            slots: Slots::new(&[Atom(7), Atom(8), Atom(9)], &[0; 3], &[&cells[0], &cells[1], &cells[2]]),
             elems: FieldType::None,
             elems_code: 0,
             family: std::ptr::null(),

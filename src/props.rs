@@ -236,6 +236,35 @@ impl Vm {
         }
     }
 
+    /// A shape as `s` (shared), but no element store's fast path fits it
+    /// (its elements typed `Any`, as `unique_shape`'s): for objects made
+    /// with it, which compiled code hasn't seen (see
+    /// `builtins::mapped_arguments_object`).
+    pub(crate) fn no_elements_copy(&mut self, s: *const Shape) -> *const Shape {
+        let s = unsafe { &*s };
+        self.add_shape(Shape {
+            class: s.class,
+            proto: s.proto,
+            capacity: Cell::new(s.capacity.get()),
+            slots: s.slots.clone(),
+            elems: FieldType::Any,
+            elems_code: NO_ELEMENTS,
+            family: std::ptr::null(),
+            push: Cell::new(std::ptr::null_mut()),
+            unique: false,
+            fixed: false,
+            transitions: RefCell::default(),
+            elem_transitions: RefCell::default(),
+            relied: Cell::new(false),
+            left: Cell::new(false),
+            lineage_relied: Cell::new(false),
+            parent: std::ptr::null(),
+            mark: Default::default(),
+            traced: Cell::new(0),
+            pinned: Cell::new(false),
+        })
+    }
+
     /// Every element store to `o` takes the runtime path from now on.
     pub(crate) fn slow_elements(&mut self, o: *mut Object) {
         self.unique_shape(o, None, true);

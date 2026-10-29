@@ -9855,6 +9855,55 @@ out.join(" ")
 }
 
 #[test]
+fn mapped_arguments_objects_share_a_shape() {
+    // A sloppy function's `arguments` with parameters, its elements mapped
+    // to them, has a shape all such objects share, every element store on
+    // the runtime path (each had a unique one, and dropped the compiled
+    // code relying on the shape it left): the mapping both ways, deletes,
+    // `defineProperty`, added properties, `length`, spreads and copies give
+    // what V8, SpiderMonkey, JavaScriptCore and QuickJS do, and calls make
+    // no shapes.
+    let src = r#"
+var out = [];
+function m1(a, b) { arguments[0] = 10; b = 20; return [a, arguments[1], arguments.length].join(); }
+out.push(m1(1, 2), m1(1));
+function m2(a) { a = 5; return arguments[0]; }
+out.push(m2(1));
+function m3(a) { delete arguments[0]; arguments[0] = 7; return a + "," + arguments[0]; }
+out.push(m3(1));
+function m4(a) { Object.defineProperty(arguments, "0", { value: 3 }); var r = a; a = 9; return r + "," + arguments[0]; }
+out.push(m4(1));
+function m5(a) { Object.defineProperty(arguments, "0", { writable: false }); a = 4; return arguments[0] + "," + a; }
+out.push(m5(1));
+function m6(a) { arguments.x = 1; arguments[5] = 6; return Object.keys(arguments).join() + ";" + arguments.length; }
+out.push(m6(1, 2));
+function m7(a, b) { return Array.prototype.slice.call(arguments).join() + ";" + [...arguments].join() + ";" + Object.prototype.toString.call(arguments); }
+out.push(m7(1, 2, 3));
+function m8(a) { "use strict"; arguments[0] = 2; return a; }
+out.push(m8(1));
+function m9(a) { var s = 0; for (var i = 0; i < 1000; i++) { arguments[0] = i; s += a; } return s; }
+var t = 0; for (var k = 0; k < 200; k++) t += m9(0); out.push(t);
+function n1(a) { return arguments; }
+var x1 = n1(1), x2 = n1(2); x1[0] = 5; out.push(x1[0], x2[0], Object.getPrototypeOf(x1) === Object.prototype, typeof x1.callee);
+out.push(n1(4)[0]);
+function n3(a, b) { arguments.length = 1; return Array.from(arguments).join() + ";" + a + b; }
+out.push(n3(1, 2));
+out.join(" ")
+"#;
+    assert_eq!(
+        value(src),
+        "10,20,2 10,,1 5 1,7 3,9 1,4 0,1,5,x;2 1,2,3;1,2,3;[object Arguments] 1 99900000 5 2 true function 4 1;12"
+    );
+    let mut vm = Vm::new();
+    let src = r#"function g(x) { return x[0]; } function f(a, b) { return g(arguments) + b; }
+var s = 0; for (var i = 0; i < 5000; i++) s += f(i, 1); s"#;
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("12502500"));
+    let shapes = vm.memory_stats()[0];
+    assert!(shapes < 2000, "{shapes} shapes");
+}
+
+#[test]
 fn global_evals_run_kept_code_anew() {
     // Indirect `eval`s' code, and the global code's direct ones', is kept
     // too: each run makes its `var`s and functions globals, its `let`s its

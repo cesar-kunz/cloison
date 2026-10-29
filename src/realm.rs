@@ -210,6 +210,7 @@ realm_fields! {
     array_shape: *const Shape = NO_SHAPE => array_shape;
     proto_object_shape: *const Shape = NO_SHAPE => proto_object_shape;
     arguments_shape: *const Shape = NO_SHAPE => arguments_shape;
+    mapped_arguments_shape: *const Shape = NO_SHAPE => mapped_arguments_shape;
     regexp_proto_shape: *const Shape = NO_SHAPE => regexp_proto_shape;
     regexp_slots: [i32; 6] = [0; 6] => regexp_slots;
     regexp_shapes: (*const Shape, *const Shape) = (NO_SHAPE, NO_SHAPE) => regexp_shapes;

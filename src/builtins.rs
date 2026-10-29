@@ -1228,6 +1228,26 @@ pub(crate) fn arguments_object(vm: &mut Vm, values: &[Value]) -> Value {
     arguments_object_of(vm, values, std::ptr::null_mut())
 }
 
+/// A sloppy function's `arguments` object, its elements mapped to its
+/// parameters (see `Vm::mapped_args`): as [`arguments_object_of`]'s, but
+/// every element store takes the runtime path. With a shape all of them
+/// share (`Vm::mapped_arguments_shape`): a unique one each, and the
+/// compiled code relying on the shape it left dropped, took 13% of a
+/// function's calls with a direct `eval` (eval.js).
+pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
+    let o = arguments_object_of(vm, values, callee);
+    let s = unsafe { (*as_object(o)).shape };
+    if s == vm.arguments_shape {
+        if vm.mapped_arguments_shape.is_null() {
+            vm.mapped_arguments_shape = vm.no_elements_copy(s);
+        }
+        unsafe { crate::object::set_shape(as_object(o), vm.mapped_arguments_shape) };
+    } else {
+        vm.slow_elements(as_object(o));
+    }
+    o
+}
+
 /// An `arguments` object of function `callee` (null: unknown, as strict
 /// code's): an ordinary object with the values as elements, `length`,
 /// `callee` (a strict function's throws), `@@iterator`, and the hidden

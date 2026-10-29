@@ -675,8 +675,9 @@ pub struct Vm {
     /// Field cells made since then.
     cells_made: usize,
     /// The field cells, each of the slot tables that have it (see
-    /// `free_field_cells`). (After the shapes: dropped after their tables.)
-    field_cells: Vec<Box<FieldCell>>,
+    /// `free_condemned_shapes`). (After the shapes: dropped after their
+    /// tables.)
+    field_cells: crate::object::CellSlab,
     roots: HashMap<(Class, u64, u32), *const Shape>,
     /// The transitions of shapes with [`WIDE_TRANSITIONS`] or more, by
     /// shape, property and attributes, as their `transitions` lists them
@@ -1101,7 +1102,7 @@ impl Vm {
             condemned_shapes: Vec::new(),
             shapes_made: 0,
             cells_made: 0,
-            field_cells: Vec::new(),
+            field_cells: Default::default(),
             roots: HashMap::default(),
             wide_transitions: Default::default(),
             atoms: Vec::new(),
@@ -1559,9 +1560,7 @@ impl Vm {
 
     /// A new field cell, for a slot table to have.
     fn new_field_cell(&mut self) -> *const FieldCell {
-        let cell = Box::new(FieldCell::new());
-        let p: *const FieldCell = &*cell;
-        self.field_cells.push(cell);
+        let p = self.field_cells.alloc();
         self.cells_made += 1;
         if self.cells_made % 4096 == 0 {
             self.shapes_made_check();
@@ -1887,9 +1886,10 @@ impl Vm {
 
     /// Drop the condemned shapes, and free the field cells no slot table
     /// has any more (a unique shape's, `delete`'s, and a direct `eval`'s
-    /// scopes' made a cell for each field): the tables of shapes no live
-    /// shape descends from. The functions whose code relied on a cell's
-    /// type are forgotten with it, its address then another's.
+    /// scopes' made a cell for each field): those of the tables of shapes
+    /// no live shape descends from, left unused as they drop. The
+    /// functions whose code relied on a cell's type are forgotten with it,
+    /// its address then another's.
     pub(crate) fn free_condemned_shapes(&mut self) {
         if self.condemned_shapes.is_empty() {
             return;
@@ -1897,28 +1897,25 @@ impl Vm {
         let mut t = std::time::Instant::now();
         let ph = &mut self.heap.gc.shape_phases;
         (ph.dropped, ph.any) = (self.condemned_shapes.len(), true);
-        self.condemned_shapes.clear();
+        let condemned = &mut self.condemned_shapes;
+        let freed = crate::object::cells_left_unused(|| condemned.clear());
         self.heap.gc.shape_phases.drop = crate::gc::lap(&mut t);
-        let mut freed = crate::jit::HashSet::<usize>::default();
-        self.field_cells.retain(|c| {
-            let unused = c.unused();
-            if unused {
-                freed.insert(&**c as *const FieldCell as usize);
-            }
-            !unused
-        });
-        let ph = &mut self.heap.gc.shape_phases;
-        (ph.cells_freed, ph.cells_left) = (freed.len(), self.field_cells.len());
         if !freed.is_empty() {
-            for c in &freed {
-                self.field_deps.remove(c);
-                self.through_deps.remove(c);
-            }
-            self.int_fields.retain(|&c| !freed.contains(&(c as usize)));
+            // (The cells these hold are not freed yet: those unused are
+            // being freed. Far fewer than those freed, not hashed.)
+            let unused = |c: usize| unsafe { (*(c as *const FieldCell)).unused() };
+            self.field_deps.retain(|&c, _| !unused(c));
+            self.through_deps.retain(|&c, _| !unused(c));
+            self.int_fields.retain(|&c| !unused(c as usize));
             for cells in self.relied_cells.values_mut() {
-                cells.retain(|c| !freed.contains(c));
+                cells.retain(|&c| !unused(c));
+            }
+            for &c in &freed {
+                unsafe { self.field_cells.free(c) };
             }
         }
+        let ph = &mut self.heap.gc.shape_phases;
+        (ph.cells_freed, ph.cells_left) = (freed.len(), self.field_cells.len());
         self.heap.gc.shape_phases.cells = crate::gc::lap(&mut t);
     }
 

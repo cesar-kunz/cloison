@@ -460,7 +460,7 @@ pub struct FieldCell {
     /// It went from `Int` to `Num` and may still hold int32s in objects'
     /// own memory, until `Vm::int_fields_to_doubles` (see `FieldType::Num`).
     ints: Cell<bool>,
-    /// The slot tables that have it: none, and `Vm::free_field_cells`
+    /// The slot tables that have it: none, and `Vm::free_condemned_shapes`
     /// frees it.
     tables: Cell<u32>,
 }
@@ -687,6 +687,84 @@ pub struct Shape {
     /// Live whatever the marking finds: compiled code gives it to objects
     /// (an allocation's or a transition's constant, a `new`'s `this`).
     pub(crate) pinned: Cell<bool>,
+}
+
+/// Field cells per chunk of a [`CellSlab`].
+const SLAB_CELLS: usize = 512;
+
+/// A VM's field cells, in chunks (returned to the allocator with the VM)
+/// and the free ones of them, for the next cells made. (Each one `malloc`ed
+/// on its own, and found unused by a walk of them all: del.js's million a
+/// collection took 4.8 s of its 7.5 s of pauses.)
+#[derive(Default)]
+pub struct CellSlab {
+    chunks: Vec<*mut FieldCell>,
+    free: Vec<*mut FieldCell>,
+    /// The latest chunk's cells not used yet.
+    next: usize,
+    live: usize,
+}
+
+impl CellSlab {
+    fn layout() -> std::alloc::Layout {
+        std::alloc::Layout::array::<FieldCell>(SLAB_CELLS).unwrap()
+    }
+
+    /// A new cell, for a slot table to have.
+    pub fn alloc(&mut self) -> *const FieldCell {
+        let p = self.free.pop().unwrap_or_else(|| {
+            if self.next == 0 {
+                let c = unsafe { std::alloc::alloc(CellSlab::layout()) }.cast::<FieldCell>();
+                if c.is_null() {
+                    std::alloc::handle_alloc_error(CellSlab::layout());
+                }
+                self.chunks.push(c);
+                self.next = SLAB_CELLS;
+            }
+            self.next -= 1;
+            unsafe { self.chunks.last().unwrap().add(self.next) }
+        });
+        unsafe { p.write(FieldCell::new()) };
+        self.live += 1;
+        p
+    }
+
+    /// Free `c`, for the next cell made.
+    ///
+    /// # Safety
+    /// `c` must be one of its cells, which no slot table has, nor anything
+    /// will read again.
+    pub unsafe fn free(&mut self, c: *const FieldCell) {
+        self.free.push(c.cast_mut());
+        self.live -= 1;
+    }
+
+    /// The cells in use.
+    pub fn len(&self) -> usize {
+        self.live
+    }
+}
+
+impl Drop for CellSlab {
+    fn drop(&mut self) {
+        for &c in &self.chunks {
+            unsafe { std::alloc::dealloc(c.cast(), CellSlab::layout()) };
+        }
+    }
+}
+
+thread_local! {
+    /// The field cells the slot tables dropped have left unused (their
+    /// `tables` reached 0), for `Vm::free_condemned_shapes` to free.
+    static UNUSED_CELLS: RefCell<Vec<*const FieldCell>> = RefCell::default();
+}
+
+/// Forget the cells slot tables have left unused, and return those that
+/// `drop` leaves unused (see [`UNUSED_CELLS`]).
+pub(crate) fn cells_left_unused(drop: impl FnOnce()) -> Vec<*const FieldCell> {
+    UNUSED_CELLS.with_borrow_mut(Vec::clear);
+    drop();
+    UNUSED_CELLS.take()
 }
 
 /// A shape, owned like a box but in a slot of a chunk of shapes (each
@@ -917,7 +995,11 @@ impl Drop for SlotTable {
     fn drop(&mut self) {
         // (The VM drops its shapes before its cells.)
         for &f in self.all_fields() {
-            unsafe { (*f).tables.set((*f).tables.get() - 1) };
+            let n = unsafe { (*f).tables.get() } - 1;
+            unsafe { (*f).tables.set(n) };
+            if n == 0 {
+                UNUSED_CELLS.with_borrow_mut(|u| u.push(f));
+            }
         }
         let (layout, ..) = SlotTable::layout(self.cap);
         if layout.size() != 0 {

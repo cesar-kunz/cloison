@@ -1606,11 +1606,15 @@ impl Vm {
     /// its slots: then freed (`free_zombies`).
     pub(crate) fn sweep_shapes(&mut self, from: u32) {
         use std::sync::atomic::Ordering::Relaxed;
+        let mut t = std::time::Instant::now();
         let live = |s: *const Shape| unsafe { (*s).pinned.get() || (*s).mark.load(Relaxed) >= from };
         let (keep, dead): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.shapes).into_iter().partition(|s| live(&**s));
         self.shapes = keep;
+        let ph = &mut self.heap.gc.shape_phases;
+        (ph.dead, ph.shapes_left, ph.any) = (dead.len(), self.shapes.len(), true);
         if dead.is_empty() {
+            self.heap.gc.shape_phases.sweep = crate::gc::lap(&mut t);
             self.free_zombies();
             return;
         }
@@ -1658,6 +1662,7 @@ impl Vm {
             }
             self.zombies.push(z);
         }
+        self.heap.gc.shape_phases.sweep = crate::gc::lap(&mut t);
         self.free_zombies();
     }
 
@@ -1673,6 +1678,7 @@ impl Vm {
         if self.zombies.len() < ZOMBIES_MIN {
             return;
         }
+        let mut t = std::time::Instant::now();
         /// The zombies found held, those whose own references are still to
         /// be followed, and the slot tables whose fields were (each once,
         /// all of them: a lineage's shapes share one).
@@ -1727,6 +1733,7 @@ impl Vm {
         };
         if !crate::jit::shape_words(self, &mut |w| h.hold(w)) {
             self.zombie_set = h.zombies;
+            self.heap.gc.shape_phases.zombies = crate::gc::lap(&mut t);
             return;
         }
         for z in &self.zombies {
@@ -1769,7 +1776,10 @@ impl Vm {
             std::mem::take(&mut self.zombies).into_iter().partition(|z| held.contains(&(&**z as *const Shape as usize)));
         self.zombies = keep;
         self.zombie_set = held;
+        let ph = &mut self.heap.gc.shape_phases;
+        (ph.condemned, ph.zombies_left) = (free.len(), self.zombies.len());
         self.condemned_shapes.extend(free);
+        self.heap.gc.shape_phases.zombies = crate::gc::lap(&mut t);
     }
 
     /// The hash of an `eval` of `source` in `place`, for [`Vm::cached_eval`]
@@ -1884,7 +1894,11 @@ impl Vm {
         if self.condemned_shapes.is_empty() {
             return;
         }
+        let mut t = std::time::Instant::now();
+        let ph = &mut self.heap.gc.shape_phases;
+        (ph.dropped, ph.any) = (self.condemned_shapes.len(), true);
         self.condemned_shapes.clear();
+        self.heap.gc.shape_phases.drop = crate::gc::lap(&mut t);
         let mut freed = crate::jit::HashSet::<usize>::default();
         self.field_cells.retain(|c| {
             let unused = c.unused();
@@ -1893,17 +1907,19 @@ impl Vm {
             }
             !unused
         });
-        if freed.is_empty() {
-            return;
+        let ph = &mut self.heap.gc.shape_phases;
+        (ph.cells_freed, ph.cells_left) = (freed.len(), self.field_cells.len());
+        if !freed.is_empty() {
+            for c in &freed {
+                self.field_deps.remove(c);
+                self.through_deps.remove(c);
+            }
+            self.int_fields.retain(|&c| !freed.contains(&(c as usize)));
+            for cells in self.relied_cells.values_mut() {
+                cells.retain(|c| !freed.contains(c));
+            }
         }
-        for c in &freed {
-            self.field_deps.remove(c);
-            self.through_deps.remove(c);
-        }
-        self.int_fields.retain(|&c| !freed.contains(&(c as usize)));
-        for cells in self.relied_cells.values_mut() {
-            cells.retain(|c| !freed.contains(c));
-        }
+        self.heap.gc.shape_phases.cells = crate::gc::lap(&mut t);
     }
 
     pub(crate) fn add_shape(&mut self, s: Shape) -> *const Shape {

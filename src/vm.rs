@@ -1508,6 +1508,29 @@ impl Vm {
         for s in &self.shapes {
             s.transitions.borrow_mut().retain(|&(_, _, t)| live(t));
             s.elem_transitions.borrow_mut().retain(|&(_, t)| live(t));
+            // Compiled code moves arrays to the shapes a push cache names
+            // (a zombie's prototype is null): those of the dead go, as do
+            // the entries of dead keys.
+            let p = s.push.get();
+            if !p.is_null() {
+                let c = unsafe { &mut *p };
+                for e in c.to.iter_mut() {
+                    let key_dead = e.0 > crate::layout::FIELD_NUM && !live(e.0 as *const Shape);
+                    if e.1 != 0 && (key_dead || !live(e.1 as *const Shape)) {
+                        *e = (0, 0);
+                    }
+                }
+                if c.any != 0 && !live(c.any as *const Shape) {
+                    c.any = 0;
+                }
+            }
+        }
+        // And the megamorphic store table's transitions (entry 0 holds the
+        // prototype epoch's address).
+        for e in self.mega_stores[1..].iter_mut() {
+            if e.shape != 0 && (!live(e.shape as *const Shape) || e.new_shape != 0 && !live(e.new_shape as *const Shape)) {
+                *e = MegaStore::EMPTY;
+            }
         }
         // (A dead shape is a zombie still: its address may be read.)
         self.wide_transitions.retain(|&(s, _, _), t| live(s as *const Shape) && live(*t));

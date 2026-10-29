@@ -1874,7 +1874,8 @@ impl Vm {
     /// caches' transitions through `object::set_shape`, compiled code
     /// those it embeds, pinned; `CreateObject`'s root shape, an inline
     /// cache's `shape`, is made again if it died, see `Vm::create_object`.)
-    /// Shapes these hold are live or zombies, whose memory stays.
+    /// A marking that doesn't mark them first (a full one, stopping the
+    /// world) may find them dead: `Vm::sweep_shapes` drops their entries.
     fn mark_cached_shapes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let epoch = code_epoch();

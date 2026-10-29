@@ -1773,10 +1773,15 @@ impl Vm {
     }
 
     /// The hash of an `eval` of `source` in `place`, for [`Vm::cached_eval`]
-    /// and [`Vm::keep_eval`] (`None`: a long source's, not kept).
+    /// and [`Vm::keep_eval`] (`None`: a long source's, not kept): of its
+    /// length and its first and last 64 units, as entries are told apart
+    /// by their whole source. (Hashing it all took 0.7% of code-load, whose
+    /// 1,700 sources of 9 KB are all distinct.)
     pub(crate) fn eval_hash(source: &[u16], place: EvalPlace) -> Option<u64> {
         use std::hash::{BuildHasher, BuildHasherDefault};
-        (source.len() <= EVAL_CACHE_TEXT_MAX).then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one((source, place)))
+        let n = source.len();
+        let ends = (&source[..n.min(64)], &source[n.saturating_sub(64)..]);
+        (n <= EVAL_CACHE_TEXT_MAX).then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one((n, ends, place)))
     }
 
     /// Push a direct `eval`'s scope objects on `eval_envs` (see

@@ -1563,9 +1563,12 @@ impl Vm {
 
     /// Shapes and cells are outside the heap: a program that makes them
     /// and little else would rarely collect. Once enough are made, a
-    /// collection at the next safepoint (see `gc::SHAPE_FULL_MIN`).
+    /// collection at the next safepoint (see `gc::SHAPE_FULL_MIN`); a
+    /// minor one, if the last full marking condemned shapes, which it frees
+    /// once the sweep is over (else they wait for the next marking, while
+    /// as many more are made: del.js's peak).
     fn shapes_made_check(&mut self) {
-        if self.shapes_full() {
+        if self.shapes_full() || !self.condemned_shapes.is_empty() && !self.heap.gc.marking {
             self.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }

@@ -174,7 +174,7 @@ pub struct Gc {
     /// buffers' blocks: see `shared`), whose dead owners only it finds.
     pub(crate) external_full: bool,
     /// A concurrent full collection is marking.
-    marking: bool,
+    pub(crate) marking: bool,
     /// The [`CODE_EPOCH`] the current or last full marking began in: the
     /// codes it found live are marked with it or later.
     codes_from: u32,
@@ -1487,8 +1487,15 @@ impl Vm {
             if kind == Collection::Start && self.heap.gc.shape_cycle {
                 self.mark_cached_shapes();
             }
-        } else if self.heap.gc.sweeping {
-            self.heap.absorb_sweep();
+        } else {
+            if self.heap.gc.sweeping {
+                self.heap.absorb_sweep();
+            }
+            // (The sweep after a final pause is over: the shapes it
+            // condemned go now, not at the next cycle's start.)
+            if !self.heap.gc.sweeping {
+                self.free_condemned_shapes();
+            }
         }
         if kind == Collection::Start {
             self.heap.gc.cycle_from = self.heap.allocated();
@@ -1594,6 +1601,13 @@ impl Vm {
             if full {
                 if self.heap.gc.shape_cycle {
                     self.sweep_shapes_after(color);
+                    // (A stop-the-world collection's sweep is done: the
+                    // shapes it condemned go now, not a collection later.
+                    // del.js's unique shapes, one a `delete`, were then
+                    // freed two full collections after they died.)
+                    if kind == Collection::Full {
+                        self.free_condemned_shapes();
+                    }
                 }
                 self.condemn_codes();
             }

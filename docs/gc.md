@@ -527,7 +527,11 @@ pauses.
   collection would have let it.
 
 `CLOISON_GC_STATS` prints each collection: kind, pause, bytes allocated
-since the last, marked, freed, and the heap's size.
+since the last, marked, freed, and the heap's size; and, for one that
+works on shapes, each shape phase's milliseconds and counts (`shapes:`):
+the condemned shapes dropped, the field cells left unused freed, the live
+shapes found, the constructor tracking swept, the shapes not found live
+made zombies, the zombies nothing holds condemned.
 
 ### Weak references, finalization
 

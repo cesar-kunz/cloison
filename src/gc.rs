@@ -76,6 +76,62 @@ const CELL_FULL_MIN: usize = 1 << 20;
 const FULL_MIN: usize = 64 << 20;
 
 /// The collector's state, in the heap.
+/// What a collection's shape phases took (`CLOISON_GC_STATS`), in
+/// milliseconds, and what they freed: the condemned shapes dropped and the
+/// field cells left unused freed (`Vm::free_condemned_shapes`), the live
+/// shapes found (`mark_live_codes_and_shapes`), the constructor tracking
+/// and shapes not found live swept (`Vm::sweep_shapes`) and the zombies
+/// nothing holds condemned (`Vm::free_zombies`).
+#[derive(Default)]
+pub(crate) struct ShapePhases {
+    pub(crate) drop: f64,
+    pub(crate) dropped: usize,
+    pub(crate) cells: f64,
+    pub(crate) cells_freed: usize,
+    pub(crate) cells_left: usize,
+    pub(crate) mark: f64,
+    pub(crate) ctor: f64,
+    pub(crate) sweep: f64,
+    pub(crate) dead: usize,
+    pub(crate) shapes_left: usize,
+    pub(crate) zombies: f64,
+    pub(crate) condemned: usize,
+    pub(crate) zombies_left: usize,
+    pub(crate) any: bool,
+}
+
+impl ShapePhases {
+    #[cold]
+    #[inline(never)]
+    fn report(&self) {
+        eprintln!(
+            "  shapes: drop {:.3} ({} shapes), cells {:.3} ({} freed, {} left), mark {:.3}, ctor {:.3}, \
+             sweep {:.3} ({} dead, {} left), zombies {:.3} ({} condemned, {} left)",
+            self.drop,
+            self.dropped,
+            self.cells,
+            self.cells_freed,
+            self.cells_left,
+            self.mark,
+            self.ctor,
+            self.sweep,
+            self.dead,
+            self.shapes_left,
+            self.zombies,
+            self.condemned,
+            self.zombies_left
+        );
+    }
+}
+
+/// Milliseconds since `t`, and `t` now.
+pub(crate) fn lap(t: &mut std::time::Instant) -> f64 {
+    let now = std::time::Instant::now();
+    let d = (now - *t).as_secs_f64() * 1e3;
+    *t = now;
+    d
+}
+
 #[derive(Default)]
 pub struct Gc {
     /// Cells marked and not yet traced.
@@ -86,7 +142,9 @@ pub struct Gc {
     /// Collect at every safepoint (`CLOISON_GC_STRESS`).
     stress: bool,
     /// Print each collection (`CLOISON_GC_STATS`).
-    stats: bool,
+    pub(crate) stats: bool,
+    /// What this collection's shape phases took, for `stats`.
+    pub(crate) shape_phases: ShapePhases,
     /// Collections so far.
     pub count: usize,
     /// The native stack's base: the highest address roots may be at
@@ -1512,7 +1570,10 @@ impl Vm {
             }
             if full {
                 if self.heap.gc.shape_cycle {
+                    let mut t = std::time::Instant::now();
                     self.mark_live_codes_and_shapes(&mut m, sp, regs);
+                    self.heap.gc.shape_phases.mark = crate::gc::lap(&mut t);
+                    self.heap.gc.shape_phases.any = true;
                 } else {
                     self.mark_live_codes(&mut m, sp, regs, &mut Vec::new());
                 }
@@ -1602,7 +1663,11 @@ impl Vm {
             if full {
                 self.heap.gc.report_room();
             }
+            if self.heap.gc.shape_phases.any {
+                self.heap.gc.shape_phases.report();
+            }
         }
+        self.heap.gc.shape_phases = ShapePhases::default();
         {
             use std::sync::atomic::Ordering::Relaxed;
             let end = std::time::Instant::now();
@@ -1914,7 +1979,9 @@ impl Vm {
     fn sweep_shapes_after(&mut self, color: u8) {
         self.reset_shapes_made();
         let range = self.heap.cells_range();
+        let mut t = std::time::Instant::now();
         self.sweep_ctor_protos(|p| is_cell_in(range, p) && unsafe { *crate::heap::meta(p) } & COLOR == color);
+        self.heap.gc.shape_phases.ctor = lap(&mut t);
         let from = self.heap.gc.codes_from;
         self.sweep_shapes(from);
     }

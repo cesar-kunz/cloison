@@ -2576,7 +2576,7 @@ fn exact_transition(s: u64, name: Atom) -> Option<Prop> {
     if shape.class != Class::Plain || shape.unique || vm.proxies_exist || shape.lookup(name).is_some() {
         return None;
     }
-    let new = (shape.transitions.borrow().iter()).find(|&&(a, attrs, _)| a == name && attrs == 0)?.2;
+    let new = vm.find_transition(shape, name, 0)?;
     let mut p = shape.proto;
     while p.is_cell() {
         let ps = unsafe { &*(*crate::object::as_object(p)).shape };

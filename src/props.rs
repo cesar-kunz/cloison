@@ -199,9 +199,7 @@ impl Vm {
                 return;
             }
             self.shape_left(s);
-            let found = (s.transitions.borrow().iter())
-                .find(|&&(k, l, _)| k == FIXED_KEY && l == level)
-                .map(|&(_, _, t)| t);
+            let found = self.find_transition(s, FIXED_KEY, level);
             let t = match found {
                 Some(t) => t,
                 None => {
@@ -229,7 +227,7 @@ impl Vm {
                         traced: Cell::new(0),
                         pinned: Cell::new(false),
                     });
-                    s.transitions.borrow_mut().push((FIXED_KEY, level, t));
+                    self.add_transition(s, FIXED_KEY, level, t);
                     t
                 }
             };

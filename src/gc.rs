@@ -68,6 +68,11 @@ const SHAPE_SWEEP_MIN: usize = 256;
 /// otherwise rarely start one. (From 65,536, sass's 4.4M shapes cost it
 /// 2.5% more instructions, from 262,144 0.5%, for a peak a little lower.)
 const SHAPE_FULL_MIN: usize = 1 << 18;
+/// And once the field cells made since are as many as those it left, and
+/// at least this many (with their slot tables', about 32 MB): a `delete`
+/// gives an object a unique shape with a cell for each field left (one
+/// of 32 properties made 32 cells, 1.2 KB, a delete).
+const CELL_FULL_MIN: usize = 1 << 20;
 const FULL_MIN: usize = 64 << 20;
 
 /// The collector's state, in the heap.
@@ -1354,10 +1359,13 @@ impl Vm {
         self.heap.finish_sweep();
     }
 
-    /// Enough shapes made for a full collection (see [`SHAPE_FULL_MIN`]).
-    fn shapes_full(&self) -> bool {
+    /// Enough shapes, or field cells, made for a full collection (see
+    /// [`SHAPE_FULL_MIN`], [`CELL_FULL_MIN`]).
+    pub(crate) fn shapes_full(&self) -> bool {
         let made = self.shapes_made();
+        let cells = self.cells_made();
         made >= SHAPE_FULL_MIN && 2 * made >= self.shape_count()
+            || cells >= CELL_FULL_MIN && 2 * cells >= self.cell_count()
     }
 
     #[cold]
@@ -1410,13 +1418,13 @@ impl Vm {
             self.heap.finish_sweep();
             // The cells that could still refer to them are swept.
             self.condemned.clear();
-            self.condemned_shapes.clear();
+            self.free_condemned_shapes();
             self.heap.gc.codes_from = CODE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             self.heap.gc.code_at_start = CODE_BYTES.with(|c| c.get());
             // Compiled code may give an object a shape a cache holds now,
             // and the cache drop it before the final pause: they are live.
             let made = self.shapes_made();
-            self.heap.gc.shape_cycle = made >= (self.shape_count() / 8).max(SHAPE_SWEEP_MIN);
+            self.heap.gc.shape_cycle = made >= (self.shape_count() / 8).max(SHAPE_SWEEP_MIN) || self.shapes_full();
             if kind == Collection::Start && self.heap.gc.shape_cycle {
                 self.mark_cached_shapes();
             }

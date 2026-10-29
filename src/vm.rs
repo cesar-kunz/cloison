@@ -623,6 +623,10 @@ pub struct Vm {
     pub(crate) condemned_shapes: Vec<crate::object::ShapeBox>,
     /// Shapes made since a full marking last collected them.
     shapes_made: usize,
+    /// Field cells made since then.
+    cells_made: usize,
+    /// The field cells, each of the slot tables that have it (see
+    /// `free_field_cells`). (After the shapes: dropped after their tables.)
     field_cells: Vec<Box<FieldCell>>,
     roots: HashMap<(Class, u64, u32), *const Shape>,
     /// The transitions of shapes with [`WIDE_TRANSITIONS`] or more, by
@@ -1029,6 +1033,7 @@ impl Vm {
             zombie_set: Default::default(),
             condemned_shapes: Vec::new(),
             shapes_made: 0,
+            cells_made: 0,
             field_cells: Vec::new(),
             roots: HashMap::default(),
             wide_transitions: Default::default(),
@@ -1467,6 +1472,37 @@ impl Vm {
 
     pub(crate) fn reset_shapes_made(&mut self) {
         self.shapes_made = 0;
+        self.cells_made = 0;
+    }
+
+    /// Field cells made since a full marking last collected shapes.
+    pub(crate) fn cells_made(&self) -> usize {
+        self.cells_made
+    }
+
+    pub(crate) fn cell_count(&self) -> usize {
+        self.field_cells.len()
+    }
+
+    /// A new field cell, for a slot table to have.
+    fn new_field_cell(&mut self) -> *const FieldCell {
+        let cell = Box::new(FieldCell::new());
+        let p: *const FieldCell = &*cell;
+        self.field_cells.push(cell);
+        self.cells_made += 1;
+        if self.cells_made % 4096 == 0 {
+            self.shapes_made_check();
+        }
+        p
+    }
+
+    /// Shapes and cells are outside the heap: a program that makes them
+    /// and little else would rarely collect. Once enough are made, a
+    /// collection at the next safepoint (see `gc::SHAPE_FULL_MIN`).
+    fn shapes_made_check(&mut self) {
+        if self.shapes_full() {
+            self.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// After a full marking: the constructor tracking for prototypes it
@@ -1663,6 +1699,37 @@ impl Vm {
         self.condemned_shapes.extend(free);
     }
 
+    /// Drop the condemned shapes, and free the field cells no slot table
+    /// has any more (a unique shape's, `delete`'s, and a direct `eval`'s
+    /// scopes' made a cell for each field): the tables of shapes no live
+    /// shape descends from. The functions whose code relied on a cell's
+    /// type are forgotten with it, its address then another's.
+    pub(crate) fn free_condemned_shapes(&mut self) {
+        if self.condemned_shapes.is_empty() {
+            return;
+        }
+        self.condemned_shapes.clear();
+        let mut freed = crate::jit::HashSet::<usize>::default();
+        self.field_cells.retain(|c| {
+            let unused = c.unused();
+            if unused {
+                freed.insert(&**c as *const FieldCell as usize);
+            }
+            !unused
+        });
+        if freed.is_empty() {
+            return;
+        }
+        for c in &freed {
+            self.field_deps.remove(c);
+            self.through_deps.remove(c);
+        }
+        self.int_fields.retain(|&c| !freed.contains(&(c as usize)));
+        for cells in self.relied_cells.values_mut() {
+            cells.retain(|c| !freed.contains(c));
+        }
+    }
+
     pub(crate) fn add_shape(&mut self, s: Shape) -> *const Shape {
         // (A Rust structure: its prototype is logged if young.)
         self.heap.note(s.proto);
@@ -1676,6 +1743,9 @@ impl Vm {
         self.shapes.push(b);
         self.shape_set.insert(p as usize);
         self.shapes_made += 1;
+        if self.shapes_made % 4096 == 0 {
+            self.shapes_made_check();
+        }
         p
     }
 
@@ -1779,9 +1849,8 @@ impl Vm {
         if name == self.a_sym_has_instance {
             self.has_instance_defined = true;
         }
-        let cell = Box::new(FieldCell::new());
-        let slots = s.slots.with(name, attrs, &*cell);
-        self.field_cells.push(cell);
+        let cell = self.new_field_cell();
+        let slots = s.slots.with(name, attrs, cell);
         let t = self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
@@ -3114,7 +3183,7 @@ impl Vm {
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
-            parent: s,
+            parent: std::ptr::null(),
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
@@ -3493,10 +3562,9 @@ impl Vm {
             }
             let mut fields = Vec::with_capacity(kept.len());
             for &k in &kept {
-                let cell = Box::new(FieldCell::new());
-                cell.set((*s.fields()[k as usize]).get());
-                fields.push(&*cell as *const FieldCell);
-                self.field_cells.push(cell);
+                let cell = self.new_field_cell();
+                (*cell).set((*s.fields()[k as usize]).get());
+                fields.push(cell);
             }
             let u = Shape {
                 class: s.class,
@@ -3518,7 +3586,7 @@ impl Vm {
                 relied: Cell::new(false),
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
-                parent: s,
+                parent: std::ptr::null(),
                 mark: Default::default(),
                 traced: Cell::new(0),
                 pinned: Cell::new(false),
@@ -4660,9 +4728,7 @@ impl Vm {
             let mut fields = Vec::with_capacity(n);
             fields.extend_from_slice(s.fields());
             for _ in names {
-                let cell = Box::new(FieldCell::new());
-                fields.push(&*cell as *const FieldCell);
-                self.field_cells.push(cell);
+                fields.push(self.new_field_cell());
             }
             self.shape_left_stable(s);
             let new = self.add_shape(Shape {

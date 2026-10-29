@@ -9690,6 +9690,34 @@ s
 }
 
 #[test]
+fn deletes_keep_no_history_of_shapes() {
+    // An object that gains and loses properties a hundred thousand times,
+    // frozen objects that lost one and direct `eval`s' scopes: full
+    // collections leave a few hundred shapes and their field cells (each
+    // delete's shape kept the one before, for good, and every cell was
+    // kept: 200K shapes, 185 MB), and the properties are what V8,
+    // SpiderMonkey, JavaScriptCore and QuickJS give.
+    let src = r#"
+var o = {}, s = 0;
+function f(p) { var l = p & 7; return eval("l * 2"); }
+for (var i = 0; i < 100000; i++) {
+  o["p" + (i & 31)] = i;
+  delete o["p" + ((i * 7) & 31)];
+  if ((i & 1023) == 0) { var q = { a: 1, b: 2, c: 3 }; delete q.b; Object.freeze(q); s += q.a + f(i); }
+}
+$262.gc(); $262.gc();
+s + " " + Object.keys(o).join(",") + " " + Object.values(o).reduce(function (a, b) { return a + b; }, 0)
+"#;
+    let want = "98 p7,p10,p13,p14,p17,p20,p21,p23,p24,p26,p27,p28,p29,p30,p31 1499840";
+    assert_eq!(value(src), want);
+    let mut vm = Vm::new();
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok(want));
+    let [shapes, shape_bytes, ..] = vm.memory_stats();
+    assert!(shapes < 5000 && shape_bytes < 10 << 20, "{shapes} shapes kept, {shape_bytes} bytes");
+}
+
+#[test]
 fn caches_compiled_code_reads_drop_dead_shapes() {
     // An empty array's push cache and the megamorphic store table name the
     // shapes compiled code moves objects to: a full collection that finds

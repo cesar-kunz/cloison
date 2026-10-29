@@ -16654,6 +16654,13 @@ impl JitFunction {
         let mut actual = actual.clone();
         if let Some(w) = self.wide.get(&pc) {
             actual.join(w);
+            // Only the function's own registers: an inlined frame's,
+            // never live at an entry (see `entry_types`), are numbered
+            // anew by each lowering, and may be past this one's.
+            let base = self.vm.as_ref().map_or(self.nregs, |vm| vm.inline_base.min(self.nregs));
+            if actual.regs.iter().any(|(r, _)| r >= base) {
+                actual.regs.map(|r, t| if r < base { t } else { Ty::Bot });
+            }
         }
         let actual = &actual;
         let fits_all = |v: &TypeState| {

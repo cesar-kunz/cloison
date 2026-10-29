@@ -10509,6 +10509,9 @@ struct InlineFrame {
     /// Registers past its own: for a function passing its arguments on,
     /// the window of that call, made an ordinary one (see `emit_frame`).
     extra: u8,
+    /// The last pc where it finds its arguments through its header, if
+    /// any ([`frame_args_upto`]).
+    frame_args: Option<usize>,
 }
 
 /// Where the registers of frames inlined into `f` start: past its own
@@ -11503,6 +11506,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
                 ret_pc: 0,
                 args: (0, 0),
                 extra: 0,
+                frame_args: None,
             }],
             fbs: Vec::new(),
             sites: Vec::new(),
@@ -11841,15 +11845,27 @@ fn interp_live(
         set
     };
     // Per frame, what its callers read past their calls (a frame's parent
-    // comes before it).
+    // comes before it); and for one that finds its arguments through its
+    // header (`interp::frame_args`: an exit before its last `arguments` or
+    // the like leaves that to the interpreter), what its parent reads into
+    // the call, which that reads in the parent's frame: the callee, the
+    // receiver and the arguments, restored too (see `materialize`). (Sass's
+    // `Function.prototype.call$2`, `this(a, b)`, whose `b` a `Mov` renamed
+    // away, called a function making `arguments` that exited at once: it
+    // found what the stack held there before.)
     let mut callers: Vec<RegSet> = Vec::with_capacity(out.frames.len());
+    let mut call_regs: Vec<RegSet> = Vec::with_capacity(out.frames.len());
     for (g, f) in out.frames.iter().enumerate() {
-        let mut set = [0; 4];
+        let (mut set, mut call) = ([0; 4], [0; 4]);
         if g != 0 {
             set = local(f.parent, f.ret_pc);
             rs_or(&mut set, &callers[f.parent]);
+            if f.frame_args.is_some() {
+                call = local(f.parent, f.ret_pc - Op::Call.size());
+            }
         }
         callers.push(set);
+        call_regs.push(call);
     }
     let mut memo: HashMap<(u8, usize), RegSet> = HashMap::default();
     memo.reserve(out.insns.len());
@@ -11860,10 +11876,39 @@ fn interp_live(
                 let g = insn.frame as usize;
                 let mut set = local(g, insn.pc);
                 rs_or(&mut set, &callers[g]);
+                // The frames on the way out that may still find their
+                // arguments through their header, resuming where they are.
+                let (mut k, mut pc) = (g, insn.pc);
+                while k != 0 {
+                    let f = out.frames[k];
+                    if f.frame_args.is_some_and(|upto| pc <= upto) {
+                        rs_or(&mut set, &call_regs[k]);
+                    }
+                    (k, pc) = (f.parent, f.ret_pc);
+                }
                 set
             })
         })
         .collect()
+}
+
+/// The last pc where `code` reads its arguments through its frame's
+/// header (`interp::frame_args`): it makes `arguments` or a rest
+/// parameter, or passes its arguments on.
+fn frame_args_upto(code: *const crate::vm::Code) -> Option<usize> {
+    let b = unsafe { &(*code).bytecode };
+    let (mut k, mut last) = (0, None);
+    while k < b.len() {
+        let Some(op) = Op::from_u8(b[k]) else { return Some(b.len()) };
+        if matches!(
+            op.plain(),
+            Op::CreateArguments | Op::CreateMappedArguments | Op::CreateRest | Op::CallApplyArguments
+        ) {
+            last = Some(k);
+        }
+        k += op.size();
+    }
+    last
 }
 
 /// An object [`scalar_replace`] didn't allocate, as an exit allocates it:
@@ -15669,6 +15714,7 @@ impl Lowering<'_> {
             ret_pc: i.pc + i.op.size(),
             args: (i.reg2 + u8::from(i.op == Op::Call), i.imm as u8),
             extra,
+            frame_args: frame_args_upto(callee),
         });
         self.out.fbs.push(self.feedback(callee));
         self.out.nregs = self.out.nregs.max(base + c.nregs as usize + extra as usize);
@@ -17053,17 +17099,22 @@ unsafe fn materialize(
     // a call's setup didn't write, for a frame resuming in it (which may
     // copy a parameter).
     let snap = code.snap.as_ref().unwrap();
-    let mut chain = vec![(frame, exit_pc)];
+    // (With, for a parent, the pc of its call if the frame it called may
+    // still find its arguments through its header: that reads them in its
+    // frame, as the call does, renamed or not; see `interp_live`.)
+    let mut chain = vec![(frame, exit_pc, exit_pc)];
     while chain.last().unwrap().0 != 0 {
-        let g = chain.last().unwrap().0;
-        chain.push((frames[g].parent, frames[g].ret_pc));
+        let (g, at, _) = *chain.last().unwrap();
+        let ret = frames[g].ret_pc;
+        let call = if frames[g].frame_args.is_some_and(|upto| at <= upto) { ret - Op::Call.size() } else { ret };
+        chain.push((frames[g].parent, ret, call));
     }
-    for &(g, pc) in chain.iter().rev() {
+    for &(g, pc, call) in chain.iter().rev() {
         for &(_, p, a) in snap.aliases.iter().filter(|a| a.0 as usize == g && g != 0) {
             unsafe { *regs.add(p as usize) = *regs.add(a as usize) };
         }
         for r in snap.restores.iter().filter(|r| r.frame as usize == g) {
-            if r.after < pc && pc <= r.upto {
+            if r.after < pc && pc <= r.upto || r.after < call && call <= r.upto {
                 let v = match r.value {
                     Restored::Reg(x) => unsafe { *regs.add(x as usize) },
                     Restored::Const(bits) => Value::from_bits(bits),

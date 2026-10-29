@@ -959,10 +959,19 @@ pub struct SlotTable {
     /// searched there (a table's keys are distinct, a lineage's slots).
     index: RefCell<crate::jit::HashMap<Atom, u32>>,
     indexed: Cell<u32>,
+    /// Slots the lookups of a long prefix searched linearly, before it was
+    /// indexed (see [`INDEX_AFTER`]).
+    scanned: Cell<u32>,
 }
 
 /// Prefixes up to this long are searched linearly (V8's limit too).
 const LINEAR_LOOKUP: u32 = 8;
+
+/// A table is indexed once its lookups searched that many times its slots
+/// linearly: as many as its index costs to build, about. (Indexed at their
+/// first lookup, the tables of del.js's unique shapes, 31 slots each looked
+/// up a few times, took 17% of it.)
+const INDEX_AFTER: u32 = 4;
 
 impl SlotTable {
     /// One allocation for a table's arrays (one each took sass three
@@ -995,6 +1004,7 @@ impl SlotTable {
             cap,
             index: RefCell::default(),
             indexed: Cell::new(0),
+            scanned: Cell::new(0),
         }
     }
 
@@ -1108,8 +1118,13 @@ impl Slots {
             return self.keys().iter().position(|&k| k == name).map(|i| i as u32);
         }
         let t = &self.table;
-        let mut index = t.index.borrow_mut();
         let all = t.len.get();
+        if t.indexed.get() == 0 && t.scanned.get() < INDEX_AFTER * all {
+            let i = self.keys().iter().position(|&k| k == name);
+            t.scanned.set(t.scanned.get() + i.map_or(self.len, |i| i as u32 + 1));
+            return i.map(|i| i as u32);
+        }
+        let mut index = t.index.borrow_mut();
         if t.indexed.get() < all {
             let keys = unsafe { std::slice::from_raw_parts(t.keys, all as usize) };
             for (i, &k) in keys.iter().enumerate().skip(t.indexed.get() as usize) {

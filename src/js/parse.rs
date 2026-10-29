@@ -190,10 +190,14 @@ fn parse_pass<'a>(
     p.functions[0].strict =
         p.directive_prologue() || eval.is_some_and(|(strict, _)| strict) || module.is_some() || STRICT.get();
     if let Some((_, withs)) = eval {
-        // The caller's scope object, the objects of the `with` statements
-        // around the `eval` (outermost first), then the eval's own (for
-        // strict code's `var`s): what `with`s would give.
-        let names: Vec<Name> = std::iter::once("%e0".into())
+        // The scope object of the function calling it (its parameters and
+        // `var`s, those `eval`s declared), the caller's scope object (the
+        // other bindings it sees: see `intrinsics::eval_scope`), the
+        // objects of the `with` statements around the `eval` (outermost
+        // first), then the eval's own (for strict code's `var`s): what
+        // `with`s would give.
+        let names: Vec<Name> = ["%e2".into(), "%e0".into()]
+            .into_iter()
             .chain((0..withs).map(|k| format!("%w{k}").into()))
             .chain(std::iter::once("%e1".into()))
             .collect();

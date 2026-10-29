@@ -9776,6 +9776,85 @@ out.join(" ")
 }
 
 #[test]
+fn direct_evals_see_the_functions_scope_after_their_own() {
+    // A direct `eval`'s scope object has no prototype: its code looks names
+    // up in the function's scope object after it (it was the prototype, a
+    // new one at each call: a root shape and a shape per binding each
+    // call). Stores, `delete`s, nested `eval`s, `with`, shadowed bindings,
+    // closures, constants and the TDZ give what V8, SpiderMonkey,
+    // JavaScriptCore and QuickJS do, and calls make no shapes.
+    let src = r#"
+var out = [];
+// var of the function assigned from eval'd code, read after.
+function a1() { var v = 1; eval("v = 2"); return v; }
+out.push(a1(), a1());
+// var declared by an eval, assigned by a later eval, read by the function.
+function a2() { eval("var w = 1"); eval("w = 5"); return w; }
+out.push(a2());
+// delete from eval'd code: a function's var (false), an eval's var (true).
+function a3(q) { var v = 1; eval("var e = 1"); return [eval("delete v"), eval("delete e"), typeof e, eval("delete q")].join(); }
+out.push(a3(1));
+// block let shadowing a var, seen by eval.
+function a4() { var x = "var"; { let x = "let"; return eval("x"); } }
+out.push(a4());
+function a5() { var x = "var"; { let x = "let"; eval("x = 'set'"); return x; } }
+out.push(a5());
+// nested evals: declarations go to the function, lookups see everything.
+function a6(n) { let l = n; eval("eval('var nv = l + 1')"); return nv; }
+out.push(a6(1), a6(2));
+function a7(n) { var v = n; return eval("eval('v * 10')"); }
+out.push(a7(3));
+function a8() { let l = 1; eval("var t = 1; eval('t = l + 7')"); return t; }
+out.push(a8());
+// with around eval, and an object property shadowing the function's var.
+function a9(o) { var k = "fn"; with (o) { return eval("k"); } }
+out.push(a9({}), a9({k: "obj"}));
+// enclosing function's variable shadowed by an eval'd var.
+function b1() { var y = "outer"; function inner() { eval("var y = 'inner'"); return y; } return [inner(), y].join(); }
+out.push(b1());
+function b2() { var y = "outer"; function inner() { var r1 = eval("y"); eval("var y = 'inner'"); return r1 + "," + eval("y"); } return inner() + "," + y; }
+out.push(b2());
+// toString etc. not found as names (null prototypes).
+function b3() { let z = 1; return eval("typeof toString + typeof hasOwnProperty"); }
+out.push(b3());
+// parameters seen and set.
+function b4(pp) { eval("pp = pp + 1"); return pp; }
+out.push(b4(4));
+// arguments mapping through eval.
+function b5(pp) { eval("arguments[0] = 9"); return pp; }
+out.push(b5(1));
+// closure made in eval'd code sees later changes.
+function b6() { let c = 1; var f = eval("(function () { return c; })"); c = 2; return f(); }
+out.push(b6());
+function b7() { var c = 1; var f = eval("(function () { return c; })"); c = 3; return f(); }
+out.push(b7());
+// const assignment, TDZ.
+function b8() { const k = 1; try { eval("k = 2"); return "no"; } catch (e) { return e.constructor.name; } }
+out.push(b8());
+function b9() { try { eval("tz"); return "no"; } catch (e) { return e.constructor.name; } let tz = 1; }
+out.push(b9());
+// strict caller: eval vars are its own.
+function c1() { "use strict"; eval("var sv = 1"); return typeof sv; }
+out.push(c1());
+// arrow functions.
+function c2() { var q = 3; return (() => eval("q + 1"))(); }
+out.push(c2());
+out.join(" ")
+"#;
+    assert_eq!(
+        value(src),
+        "2 2 5 false,true,undefined,false let set 2 3 30 8 fn obj inner,outer outer,inner,outer functionfunction 5 9 2 3 \
+         TypeError ReferenceError undefined 4"
+    );
+    let mut vm = Vm::new();
+    let src = r#"function f() { let l = 3; return eval("l * 2"); } var s = 0; for (var i = 0; i < 5000; i++) s += f(); s"#;
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("30000"));
+    let shapes = vm.memory_stats()[0];
+    assert!(shapes < 2000, "{shapes} shapes");
+}
+
+#[test]
 fn global_evals_run_kept_code_anew() {
     // Indirect `eval`s' code, and the global code's direct ones', is kept
     // too: each run makes its `var`s and functions globals, its `let`s its

@@ -836,7 +836,10 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
     }
     let env = if crate::props::is_object(env) { env } else { local };
-    vm.eval_envs.push([env, local].into_iter().chain(withs.iter().copied()).collect());
+    // (Its names looked up in the caller's scope object, then the
+    // function's: see `eval_scope`.)
+    let fenv = if crate::props::is_object(decl) { decl } else { env };
+    vm.eval_envs.push([env, local, fenv].into_iter().chain(withs.iter().copied()).collect());
     let r = crate::interp::run_script_with(vm, code, this, kept);
     vm.eval_envs.pop();
     r
@@ -1288,16 +1291,21 @@ fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     call_function(vm, m, it, &[])
 }
 
-/// A direct `eval`'s scope object: `[proto, block-scoped count, bindings'
-/// function, name, value, binding, …]`, its prototype the function's (or
-/// `null`), a property for each binding it sees: where `binding` tells
+/// A direct `eval`'s scope object: `[function's scope, block-scoped count,
+/// bindings' function, name, value, binding, …]`, a property for each
+/// binding it sees (but an enclosing function's a `var` of the function's
+/// shadows, in its scope object): where `binding` tells
 /// (`(k << 4) | kind`: the bindings' function's upvalue `k`, `kind` its
 /// `EVAL_CONST`… flags), an accessor of the variable itself (`value` its
 /// name, a box's property's: see `codegen::boxed_lexicals`), else a data
 /// property of its value (but a binding not initialized yet has none).
+/// Without a prototype: the eval'd code looks names up in the function's
+/// scope object after it (`%e2`, see `parse::parse_pass`). (It had the
+/// function's scope object as its prototype, one of each call's: a root
+/// shape and a shape for each binding per call, and their cells.)
 fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let proto = if crate::props::is_object(a[0]) { a[0] } else { Value::NULL };
-    let o = object_value(vm.new_object(proto));
+    let o = object_value(vm.new_object(Value::NULL));
     let nlex = a[1].as_number().unwrap_or(0.0) as usize;
     let bindings = a[2];
     for (i, t) in a[3..].chunks(3).enumerate() {

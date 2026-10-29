@@ -1840,13 +1840,14 @@ impl<'a> Gen<'a> {
         }
         // `new.target` first (see `Op::LdaNewTarget`).
         if self.index == 0 && self.p.direct_eval {
-            // (`%e0`, `%e1`, then the `with` objects `%w0`….)
+            // (`%e0`, `%e1`, `%e2`, then the `with` objects `%w0`….)
             let f = self.f;
             for e in &f.withs {
                 let k = match &**e {
                     "%e0" => 0,
                     "%e1" => 1,
-                    w => 2 + w[2..].parse::<i32>().unwrap_or(0),
+                    "%e2" => 2,
+                    w => 3 + w[2..].parse::<i32>().unwrap_or(0),
                 };
                 let mark = self.temp;
                 let t = self.alloc(self.f.pos)?;
@@ -4693,7 +4694,14 @@ impl<'a> Gen<'a> {
             self.emit(if restricted { Op::LdaTrue } else { Op::LdaFalse }, &[]);
             self.star(params);
             let decl = self.alloc(pos)?;
-            self.mov(env, decl);
+            if self.index == 0 && self.p.direct_eval {
+                // (Its declarations the function's scope object's, as the
+                // `eval`'s: see `intrinsics::direct_eval`.)
+                self.load_raw("%e2", pos)?;
+                self.star(decl);
+            } else {
+                self.mov(env, decl);
+            }
             // The objects of the `with` statements around it in the
             // function (or in the `eval`'s code, and those around that
             // `eval`), whose properties its names find first.

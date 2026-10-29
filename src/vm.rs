@@ -566,6 +566,15 @@ impl Code {
     }
 }
 
+/// Element transitions of a shape to elements of objects of one shape
+/// (`FieldType::Obj`) at most: one for each shape stored in arrays of
+/// it would make every store search them all, and keep each one.
+const MAX_ELEM_SHAPES: usize = 8;
+
+/// Transitions a shape has before they are also kept in a table (see
+/// `Vm::wide_transitions`).
+const WIDE_TRANSITIONS: usize = 16;
+
 const INITIAL_CTOR_CAPACITY: u32 = 4;
 /// `Code::ctor_result` when constructed objects have had several shapes.
 pub(crate) const MANY_SHAPES: *const Shape = std::ptr::dangling::<Shape>();
@@ -606,6 +615,11 @@ pub struct Vm {
     shapes_made: usize,
     field_cells: Vec<Box<FieldCell>>,
     roots: HashMap<(Class, u64, u32), *const Shape>,
+    /// The transitions of shapes with [`WIDE_TRANSITIONS`] or more, by
+    /// shape, property and attributes, as their `transitions` lists them
+    /// (see `Vm::find_transition`): an object given each of many names
+    /// in turn (`o["p" + i] = 1`) made adding one search them all.
+    wide_transitions: crate::jit::HashMap<(usize, u32, u8), *const Shape>,
     /// Each atom's name, once (the map's key shares it).
     atoms: Vec<std::rc::Rc<str>>,
     atom_ids: HashMap<std::rc::Rc<str>, Atom>,
@@ -1005,6 +1019,7 @@ impl Vm {
             shapes_made: 0,
             field_cells: Vec::new(),
             roots: HashMap::default(),
+            wide_transitions: Default::default(),
             atoms: Vec::new(),
             atom_ids: HashMap::default(),
             codes: Vec::new(),
@@ -1480,6 +1495,8 @@ impl Vm {
             s.transitions.borrow_mut().retain(|&(_, _, t)| live(t));
             s.elem_transitions.borrow_mut().retain(|&(_, t)| live(t));
         }
+        // (A dead shape is a zombie still: its address may be read.)
+        self.wide_transitions.retain(|&(s, _, _), t| live(s as *const Shape) && live(*t));
         self.roots.retain(|_, s| live(*s));
         for mut z in dead {
             self.shape_set.remove(&(&*z as *const Shape as usize));
@@ -1602,11 +1619,7 @@ impl Vm {
         let s = unsafe { &*shape };
         if !s.unique
             && !s.fixed
-            && let Some(&(_, _, t)) = s
-                .transitions
-                .borrow()
-                .iter()
-                .find(|&&(n, a, _)| n == name && a == attrs)
+            && let Some(t) = self.find_transition(s, name, attrs)
         {
             return t;
         }
@@ -1644,10 +1657,36 @@ impl Vm {
         if !s.unique {
             self.shape_left_stable(s);
             if !s.fixed {
-                s.transitions.borrow_mut().push((name, attrs, t));
+                self.add_transition(s, name, attrs, t);
             }
         }
         t
+    }
+
+    /// Shared shape `s`'s transition for property `name` with attributes
+    /// `attrs`, if it has one: from [`Vm::wide_transitions`] if it has
+    /// many.
+    pub(crate) fn find_transition(&self, s: &Shape, name: Atom, attrs: u8) -> Option<*const Shape> {
+        let ts = s.transitions.borrow();
+        if ts.len() < WIDE_TRANSITIONS {
+            ts.iter().find(|&&(n, a, _)| n == name && a == attrs).map(|&(_, _, t)| t)
+        } else {
+            self.wide_transitions.get(&(s as *const Shape as usize, name.0, attrs)).copied()
+        }
+    }
+
+    /// Record shared shape `s`'s transition to `t` (see `find_transition`).
+    pub(crate) fn add_transition(&mut self, s: &Shape, name: Atom, attrs: u8, t: *const Shape) {
+        let mut ts = s.transitions.borrow_mut();
+        ts.push((name, attrs, t));
+        let key = s as *const Shape as usize;
+        if ts.len() == WIDE_TRANSITIONS {
+            for &(n, a, t) in ts.iter() {
+                self.wide_transitions.insert((key, n.0, a), t);
+            }
+        } else if ts.len() > WIDE_TRANSITIONS {
+            self.wide_transitions.insert((key, name.0, attrs), t);
+        }
     }
 
     /// Flag `o` as a prototype and give it a unique shape, so that no
@@ -2040,22 +2079,26 @@ impl Vm {
     }
 
     /// `shape` with elements of type `elems`. Shared shapes share these
-    /// transitions; unique ones get a fresh unique successor.
+    /// transitions; unique ones get a fresh unique successor. Past
+    /// [`MAX_ELEM_SHAPES`] objects' shapes, elements of objects of another
+    /// are of any type.
     pub(crate) fn elements_transition(
         &mut self,
         shape: *const Shape,
         elems: FieldType,
     ) -> *const Shape {
         let s = unsafe { &*shape };
-        if !s.unique
-            && !s.fixed
-            && let Some(&(_, t)) = s
-                .elem_transitions
-                .borrow()
-                .iter()
-                .find(|(e, _)| *e == elems)
-        {
-            return t;
+        if !s.unique && !s.fixed {
+            let ts = s.elem_transitions.borrow();
+            if let Some(&(_, t)) = ts.iter().find(|(e, _)| *e == elems) {
+                return t;
+            }
+            if matches!(elems, FieldType::Obj(_))
+                && ts.iter().filter(|(e, _)| matches!(e, FieldType::Obj(_))).count() >= MAX_ELEM_SHAPES
+            {
+                drop(ts);
+                return self.elements_transition(shape, FieldType::Any);
+            }
         }
         let t = self.add_shape(Shape {
             class: s.class,

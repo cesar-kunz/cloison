@@ -887,6 +887,11 @@ impl SlotTable {
         self.len.set(n + 1);
     }
 
+    /// The field cells of all its slots (of the lineage's longest shape).
+    pub(crate) fn all_fields(&self) -> &[*const FieldCell] {
+        unsafe { std::slice::from_raw_parts(self.fields, self.len.get() as usize) }
+    }
+
     /// The bytes it takes (for `Vm::memory_stats`).
     pub(crate) fn bytes(&self) -> usize {
         size_of::<SlotTable>()

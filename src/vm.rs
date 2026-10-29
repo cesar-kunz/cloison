@@ -573,6 +573,11 @@ pub(crate) enum EvalPlace {
     /// A direct one's, in a function (see `intrinsics::direct_eval`):
     /// whether the caller is strict, and the `with` statements around it.
     Direct { strict: bool, withs: usize },
+    /// A direct one's compiled for its site's bindings (see
+    /// `intrinsics::direct_eval_bound`): as `Direct`, the site (a number
+    /// of its own: its bindings' names, kinds and upvalues are the code's)
+    /// and whether it is in parameters' defaults.
+    Bound { strict: bool, withs: usize, site: u64, params: bool },
     /// In the global scope (see `builtins::eval_fn`): an indirect one's,
     /// or a strict script's own direct one's (`strict`, see
     /// `intrinsics::strict_eval`).
@@ -581,6 +586,9 @@ pub(crate) enum EvalPlace {
 
 /// An `eval`'s code, kept to run again (see `Vm::eval_cache`).
 pub(crate) struct EvalCode {
+    /// Its source, and where it runs.
+    pub(crate) source: Box<[u16]>,
+    pub(crate) place: EvalPlace,
     pub(crate) code: *const Code,
     /// Its code is strict of its own (a `"use strict"` of its own, or the
     /// caller's): a direct one's `var`s are in a scope object of its own.
@@ -601,7 +609,7 @@ pub(crate) struct EvalCode {
 /// Direct `eval`s' code kept (see `Vm::eval_cache`).
 pub(crate) const EVAL_CACHE_MAX: usize = 64;
 
-/// The longest source of an `eval` whose code is kept (bytes).
+/// The longest source of an `eval` whose code is kept (UTF-16 units).
 pub(crate) const EVAL_CACHE_TEXT_MAX: usize = 1 << 16;
 
 /// `eval`s' keys remembered as compiled once (see `Vm::eval_seen`).
@@ -905,11 +913,13 @@ pub struct Vm {
     /// eval's own, then the `with` objects around it.
     pub(crate) eval_envs: Vec<Vec<Value>>,
     /// `eval`s' code, by their source and where they run: what it
-    /// compiles to depends on nothing else (see `Vm::cached_eval`). At
-    /// most `EVAL_CACHE_MAX`, the least recently used out; those unused
-    /// since the last full marking go at the next (see
-    /// `Vm::age_eval_cache`).
-    pub(crate) eval_cache: crate::jit::HashMap<(String, EvalPlace), EvalCode>,
+    /// compiles to depends on nothing else (see `Vm::cached_eval`). By
+    /// their hash ([`Vm::eval_hash`]: found from the source string's
+    /// units, with nothing made). At most `EVAL_CACHE_MAX` (`eval_kept`),
+    /// the least recently used out; those unused since the last full
+    /// marking go at the next (see `Vm::age_eval_cache`).
+    pub(crate) eval_cache: crate::jit::HashMap<u64, Vec<EvalCode>>,
+    pub(crate) eval_kept: usize,
     /// `eval`s run from the cache: its clock.
     pub(crate) eval_uses: u64,
     /// The keys of `eval`s compiled once, hashed: code is kept for one seen
@@ -1194,6 +1204,7 @@ impl Vm {
             native_new_target: (Value::EMPTY, Value::EMPTY),
             eval_envs: Vec::new(),
             eval_cache: Default::default(),
+            eval_kept: 0,
             eval_uses: 0,
             eval_seen: Default::default(),
             thrower: std::ptr::null_mut(),
@@ -1758,35 +1769,39 @@ impl Vm {
         self.condemned_shapes.extend(free);
     }
 
-    /// `key`'s hash, for [`Vm::cached_eval`] and [`Vm::keep_eval`]
-    /// (`None`: a long source's, not kept).
-    pub(crate) fn eval_hash(key: &(String, EvalPlace)) -> Option<u64> {
+    /// The hash of an `eval` of `source` in `place`, for [`Vm::cached_eval`]
+    /// and [`Vm::keep_eval`] (`None`: a long source's, not kept).
+    pub(crate) fn eval_hash(source: &[u16], place: EvalPlace) -> Option<u64> {
         use std::hash::{BuildHasher, BuildHasherDefault};
-        (key.0.len() <= EVAL_CACHE_TEXT_MAX).then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one(key))
+        (source.len() <= EVAL_CACHE_TEXT_MAX).then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one((source, place)))
     }
 
-    /// The kept code of an `eval` of `key` (`hash` its hash), now used.
-    /// (Not another realm's: code runs in the realm it was loaded in.)
-    pub(crate) fn cached_eval(&mut self, key: &(String, EvalPlace), hash: Option<u64>) -> Option<&EvalCode> {
+    /// The kept code of an `eval` of `source` in `place` (`hash` their
+    /// hash), now used. (Not another realm's: code runs in the realm it was
+    /// loaded in.)
+    pub(crate) fn cached_eval(&mut self, source: &[u16], place: EvalPlace, hash: Option<u64>) -> Option<&EvalCode> {
         // (One not seen is not kept: no lookup.)
         if !self.eval_seen.contains(&hash?) {
             return None;
         }
         self.eval_uses += 1;
         let (uses, realm) = (self.eval_uses, self.realm);
-        let e = self.eval_cache.get_mut(key).filter(|e| unsafe { (*e.code).realm } == realm)?;
+        let e = self.eval_cache.get_mut(&hash?)?.iter_mut().find(|e| {
+            e.place == place && *e.source == *source && unsafe { (*e.code).realm } == realm
+        })?;
         e.used = uses;
         e.recent = true;
         Some(e)
     }
 
-    /// Keep `code`, an `eval` of `key`'s, for it to run again: whether it
-    /// is kept. Not the first time (see `Vm::eval_seen`), nor a long
-    /// one's (run once, likely), nor one with a template, whose tagged
-    /// templates' strings arrays are each evaluation's own (a new parse of
-    /// it: `template_object`'s sites are the code's).
-    pub(crate) fn keep_eval(&mut self, key: (String, EvalPlace), hash: Option<u64>, code: EvalCode) -> bool {
-        let Some(hash) = hash.filter(|_| !key.0.contains('`')) else {
+    /// Keep `code` (`hash` its source's and place's hash), an `eval`'s, for
+    /// it to run again: whether it is kept. Not the first time (see
+    /// `Vm::eval_seen`), nor a long one's (run once, likely), nor one with
+    /// a template, whose tagged templates' strings arrays are each
+    /// evaluation's own (a new parse of it: `template_object`'s sites are
+    /// the code's).
+    pub(crate) fn keep_eval(&mut self, hash: Option<u64>, code: EvalCode) -> bool {
+        let Some(hash) = hash.filter(|_| !code.source.contains(&(b'`' as u16))) else {
             return false;
         };
         if self.eval_seen.len() >= EVAL_SEEN_MAX {
@@ -1795,13 +1810,30 @@ impl Vm {
         if self.eval_seen.insert(hash) {
             return false;
         }
-        if self.eval_cache.len() >= EVAL_CACHE_MAX
-            && let Some(old) = self.eval_cache.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone())
+        if self.eval_kept >= EVAL_CACHE_MAX
+            && let Some((h, i)) = self
+                .eval_cache
+                .iter()
+                .flat_map(|(&h, es)| es.iter().enumerate().map(move |(i, e)| (h, i, e.used)))
+                .min_by_key(|&(_, _, used)| used)
+                .map(|(h, i, _)| (h, i))
         {
-            self.eval_cache.remove(&old);
+            let es = self.eval_cache.get_mut(&h).unwrap();
+            es.swap_remove(i);
+            if es.is_empty() {
+                self.eval_cache.remove(&h);
+            }
+            self.eval_kept -= 1;
+        }
+        // (The same source and place of another realm's: replaced.)
+        let es = self.eval_cache.entry(hash).or_default();
+        if let Some(i) = es.iter().position(|e| e.place == code.place && e.source == code.source) {
+            es.swap_remove(i);
+            self.eval_kept -= 1;
         }
         let used = self.eval_uses;
-        self.eval_cache.insert(key, EvalCode { used, recent: true, ..code });
+        es.push(EvalCode { used, recent: true, ..code });
+        self.eval_kept += 1;
         true
     }
 
@@ -1809,8 +1841,12 @@ impl Vm {
     /// last one began is live (kept), the rest goes, to be freed if
     /// nothing else has it.
     pub(crate) fn age_eval_cache(&mut self) {
-        self.eval_cache.retain(|_, e| std::mem::take(&mut e.recent));
-        for e in self.eval_cache.values() {
+        for es in self.eval_cache.values_mut() {
+            es.retain_mut(|e| std::mem::take(&mut e.recent));
+        }
+        self.eval_cache.retain(|_, es| !es.is_empty());
+        self.eval_kept = self.eval_cache.values().map(Vec::len).sum();
+        for e in self.eval_cache.values().flatten() {
             crate::gc::mark_code(e.code);
         }
     }

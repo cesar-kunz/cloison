@@ -988,31 +988,32 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let Some(u) = string_units(x) else {
         return Ok(x);
     };
-    // (ASCII, as code mostly is: a byte per unit.)
-    let src = if u.iter().all(|&c| c < 0x80) {
-        String::from_utf8(u.iter().map(|&c| c as u8).collect()).unwrap()
-    } else {
-        crate::vm::source_text(u)
-    };
-    global_eval(vm, src, false)
+    global_eval(vm, u, false)
 }
 
-/// Run `src` as an `eval`'s code in the global scope (`strict`: a strict
-/// script's own direct `eval`'s), its `var`s and functions made globals
-/// first. The code is kept to run again for the same source (see
+/// Run `source` as an `eval`'s code in the global scope (`strict`: a
+/// strict script's own direct `eval`'s), its `var`s and functions made
+/// globals first. The code is kept to run again for the same source (see
 /// `Vm::eval_cache`).
-pub(crate) fn global_eval(vm: &mut Vm, src: String, strict: bool) -> Result<Value> {
-    let key = (src, crate::vm::EvalPlace::Global { strict });
-    let hash = Vm::eval_hash(&key);
-    let (code, kept) = match vm.cached_eval(&key, hash) {
+pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<Value> {
+    let place = crate::vm::EvalPlace::Global { strict };
+    let hash = Vm::eval_hash(source, place);
+    let (code, kept) = match vm.cached_eval(source, place, hash) {
         Some(e) => {
             let (code, globals) = (e.code, e.globals.clone().expect("a global eval's"));
             vm.global_declarations(&globals, true)?;
             (code, true)
         }
         None => {
+            let units: Box<[u16]> = source.into();
+            // (ASCII, as code mostly is: a byte per unit.)
+            let src = if units.iter().all(|&c| c < 0x80) {
+                String::from_utf8(units.iter().map(|&c| c as u8).collect()).unwrap()
+            } else {
+                crate::vm::source_text(&units)
+            };
             let compile = if strict { crate::js::compile_strict_eval } else { crate::js::compile_indirect_eval };
-            let module = compile(&key.0).map_err(crate::intrinsics::eval_error)?;
+            let module = compile(&src).map_err(crate::intrinsics::eval_error)?;
             vm.global_declarations(&module, true)?;
             let globals = crate::asm::Module {
                 functions: Vec::new(),
@@ -1023,6 +1024,8 @@ pub(crate) fn global_eval(vm: &mut Vm, src: String, strict: bool) -> Result<Valu
             };
             let code = vm.load(module);
             let e = crate::vm::EvalCode {
+                source: units,
+                place,
                 code,
                 own_strict: strict,
                 declared: std::rc::Rc::new([]),
@@ -1030,11 +1033,11 @@ pub(crate) fn global_eval(vm: &mut Vm, src: String, strict: bool) -> Result<Valu
                 used: 0,
                 recent: true,
             };
-            (code, vm.keep_eval(key, hash, e))
+            (code, vm.keep_eval(hash, e))
         }
     };
     let g = object_value(vm.global);
-    crate::interp::run_script_with(vm, code, g, kept)
+    crate::interp::run_script_with(vm, code, g, kept, std::ptr::null_mut())
 }
 
 /// `$262.evalScript(src)`: `src` run as a script of its own.

@@ -135,6 +135,9 @@ fn generate_from<'p>(
     }
     let decls: Vec<Decls> = decls.into_iter().map(Decls::new).collect();
     let mut scopes = upvalues(p, &decls, &overflow);
+    if !p.eval_upvalues.is_empty() {
+        scopes.upvalues[0] = p.eval_upvalues.iter().map(|(n, _)| &**n).collect();
+    }
     let names = Default::default();
     let root = lazy.map_or(0, |(r, ..)| r);
     // A stub's upvalues stand: they may be more than it uses, if it was
@@ -176,6 +179,9 @@ fn generate_from<'p>(
                     // (Block-scoped ones' new names can't be declared again.)
                     && !scopes.upvalues[i].iter().any(|n| n.contains('%'))
                     && scopes.upvalues[i].len() <= LAZY_UPVALUES
+                    // (A direct `eval`'s site's bindings are no parameters
+                    // to declare again: constants, and the TDZ.)
+                    && !scopes.upvalues[i].iter().any(|n| bound_kind(p, n).is_some())
                     && f.params.len() < LOCAL_REGS
                     && !in_held_params(p, i)
                 {
@@ -491,6 +497,12 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
         .collect()
 }
 
+/// The kind of direct `eval` site binding `name` (`EVAL_CONST`…) if its
+/// code is compiled for one (see `Program::eval_upvalues`).
+fn bound_kind(p: &Program, name: &str) -> Option<u8> {
+    p.eval_upvalues.iter().find(|(n, _)| &**n == name).map(|&(_, k)| k)
+}
+
 /// A variable's name as written (a block-scoped one is renamed `x%3`:
 /// see `ast::Program::lexicals`).
 fn original(name: &str) -> &str {
@@ -713,6 +725,14 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
                 }
                 if !captured[k].contains(&name) {
                     captured[k].push(name);
+                }
+            } else if bound_kind(p, name).is_some() {
+                // (A direct `eval`'s site's binding: an upvalue of its code's
+                // top level, passed down.)
+                for c in chain {
+                    if !upvalues[c].contains(&name) {
+                        upvalues[c].push(name);
+                    }
                 }
             }
         }
@@ -1491,6 +1511,10 @@ enum Var {
     ScopeUpvalue(u8),
     /// An enclosing function's variable: upvalue `k` of this one's.
     Upvalue(u8),
+    /// A direct `eval`'s site's binding (`Program::eval_upvalues`), upvalue
+    /// `k`: not initialized yet a ReferenceError, a constant's store a
+    /// TypeError (as `intrinsics::binding_get` and `binding_set`).
+    Bound(u8),
     Global,
     Undefined,
     /// A module's imported binding (see `ast::Import`).
@@ -3120,6 +3144,9 @@ impl<'a> Gen<'a> {
             .iter()
             .position(|&n| n == name)
         {
+            if bound_kind(self.p, name).is_some() {
+                return Ok(Var::Bound(k as u8));
+            }
             return Ok(Var::Upvalue(k as u8));
         }
         let mut f = Some(self.index);
@@ -3183,6 +3210,11 @@ impl<'a> Gen<'a> {
         self.star(k);
         let r = self.alloc(pos)?;
         for (i, w) in withs.iter().enumerate().rev().filter(|&(i, _)| i >= skip) {
+            // (A direct `eval`'s site's block-scoped binding is inside the
+            // function's scope: found before it.)
+            if &**w == "%e2" && bound_kind(self.p, name).is_some_and(|k| k & EVAL_BLOCK_SCOPED != 0) {
+                break;
+            }
             let next = self.label();
             self.value_inner(&Expr {
                 kind: ExprKind::Ident(w.clone()),
@@ -3535,6 +3567,24 @@ impl<'a> Gen<'a> {
             Var::Upvalue(k) => {
                 self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
             }
+            Var::Bound(k) => {
+                // (`acc` stays the value.)
+                let mark = self.temp;
+                let v = self.alloc(pos)?;
+                self.star(v);
+                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                let c = self.const_str(original(name));
+                self.emit(Op::CheckHole, &[Arg::Index(c)]);
+                if bound_kind(self.p, name).is_some_and(|k| k & EVAL_CONST != 0) {
+                    self.string(original(name));
+                    self.star(v);
+                    self.intrinsic("throw_const", v, 1);
+                } else {
+                    self.ldar(v);
+                    self.emit(Op::StaUpvalue, &[Arg::Count(k)]);
+                }
+                self.temp = mark;
+            }
             Var::Scope(env) => self.named(Op::SetNamed, env, &self.env_key(name)),
             Var::ScopeUpvalue(k) => {
                 // (`acc` stays the value.)
@@ -3789,6 +3839,11 @@ impl<'a> Gen<'a> {
                 Var::Reg(r) => self.ldar(r),
                 Var::Upvalue(k) => {
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                }
+                Var::Bound(k) => {
+                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                    let c = self.const_str(original(n));
+                    self.emit(Op::CheckHole, &[Arg::Index(c)]);
                 }
                 Var::Scope(env) => self.named(Op::GetNamed, env, &self.env_key(n)),
                 Var::ScopeUpvalue(k) => {
@@ -4770,6 +4825,35 @@ impl<'a> Gen<'a> {
             let nlex = nlex.min(kept.len() as i32);
             if kept.is_empty() {
                 self.intrinsic("direct_eval", fr, nargs);
+                self.temp = mark;
+                return Ok(());
+            }
+            // Each binding the bindings function's upvalue: its code is
+            // compiled for them, its upvalues theirs (see
+            // `intrinsics::direct_eval_bound`), no scope object made. Then
+            // the bindings function, what they are (the block-scoped
+            // count, the function's upvalues, and each binding's kind,
+            // upvalue and name) and the site's number.
+            if let Some(cf) = carrier.filter(|_| {
+                self.index != 0 && kept.iter().all(|b| b.3.is_some() && b.2 & EVAL_BOXED as i32 == 0)
+            }) {
+                let c = self.alloc(pos)?;
+                debug_assert_eq!(c as usize, fr as usize + nargs as usize);
+                self.closure(cf);
+                self.star(c);
+                let d = self.alloc(pos)?;
+                let mut desc = format!("{nlex} {}\n", self.scopes.upvalues[cf].len());
+                for &(o, _, kind, up) in &kept {
+                    desc.push_str(&format!("{kind} {} {o}\n", up.unwrap_or(0)));
+                }
+                self.string(&desc);
+                self.star(d);
+                // (Its number: the key its code is kept by, with its source.)
+                static SITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let n = self.alloc(pos)?;
+                self.constant(Constant::Number(SITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f64));
+                self.star(n);
+                self.intrinsic("direct_eval_bound", fr, nargs + 3);
                 self.temp = mark;
                 return Ok(());
             }

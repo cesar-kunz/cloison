@@ -47,6 +47,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("require_coercible", require_coercible),
     ("object_rest", object_rest),
     ("direct_eval", direct_eval),
+    ("direct_eval_bound", direct_eval_bound),
     ("eval_env", eval_env),
     ("null_object", null_object),
     ("to_object", to_object),
@@ -788,21 +789,31 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // (The objects of the `with` statements around it, outermost first.)
     let withs = a.get(7..).unwrap_or(&[]);
     let place = crate::vm::EvalPlace::Direct { strict, withs: withs.len() };
-    let key = (crate::vm::source_text(u), place);
-    let hash = Vm::eval_hash(&key);
+    let hash = Vm::eval_hash(u, place);
     // (`kept`: its caches stay when it has run.)
-    let (code, own_strict, declared, kept) = match vm.cached_eval(&key, hash) {
+    let (code, own_strict, declared, kept) = match vm.cached_eval(u, place, hash) {
         Some(e) => (e.code, e.own_strict, e.declared.clone(), true),
         None => {
-            let mut module = crate::js::compile_direct_eval(&key.0, strict, withs.len()).map_err(eval_error)?;
+            let source: Box<[u16]> = u.into();
+            let text = crate::vm::source_text(u);
+            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), &[]).map_err(eval_error)?;
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
                 std::mem::take(&mut module.declared).iter().map(|n| vm.intern(n)).collect();
             // (Its `var`s are the scope objects', not globals.)
             let code = vm.load(module);
-            let e = crate::vm::EvalCode { code, own_strict, declared: declared.clone(), globals: None, used: 0, recent: true };
-            let kept = vm.keep_eval(key, hash, e);
+            let e = crate::vm::EvalCode {
+                source,
+                place,
+                code,
+                own_strict,
+                declared: declared.clone(),
+                globals: None,
+                used: 0,
+                recent: true,
+            };
+            let kept = vm.keep_eval(hash, e);
             (code, own_strict, declared, kept)
         }
     };
@@ -840,9 +851,139 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // function's: see `eval_scope`.)
     let fenv = if crate::props::is_object(decl) { decl } else { env };
     vm.eval_envs.push([env, local, fenv].into_iter().chain(withs.iter().copied()).collect());
-    let r = crate::interp::run_script_with(vm, code, this, kept);
+    let r = crate::interp::run_script_with(vm, code, this, kept, std::ptr::null_mut());
     vm.eval_envs.pop();
     r
+}
+
+/// A direct `eval(source)` whose code sees the bindings around it as its
+/// own upvalues: `direct_eval`'s arguments, then the site's bindings
+/// function, its description (see `Gen::call`: the block-scoped count,
+/// the function's upvalue count, then each binding's kind, `EVAL_CONST`…,
+/// upvalue and name) and its number. As V8 compiles an `eval`'s code for
+/// the scopes around it (`DeserializeScopeChain`): no scope object of
+/// accessors for them at each call (`eval_scope`), the code runs with the
+/// bindings function as its frame's, and is kept by the site (see
+/// `Vm::eval_cache`). An `eval` in its code would not see them so: that
+/// code gets the scope object.
+fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let (carrier, site, number) = (a[a.len() - 3], a[a.len() - 2], a[a.len() - 1]);
+    let a = &a[..a.len() - 3];
+    let (f, src, env, this, strict) = (a[0], a[1], a[2], a[3], a[4] == Value::TRUE);
+    if !(f.is_cell() && as_object(f) == vm.eval_function) {
+        return call_function(vm, f, Value::UNDEFINED, &[src]);
+    }
+    let Some(u) = crate::vm::string_units(src) else {
+        return Ok(src);
+    };
+    let withs = a.get(7..).unwrap_or(&[]);
+    if u.windows(4).any(|w| w == [b'e' as u16, b'v' as u16, b'a' as u16, b'l' as u16]) {
+        let site = site_bindings(site);
+        let bindings: Vec<_> = site.2.iter().map(|(n, k, up)| (n.as_str(), *k, *up)).collect();
+        return eval_through_scope(vm, a, carrier, site.0, &bindings);
+    }
+    let params = a.get(5) == Some(&Value::TRUE);
+    let site_number = number.as_number().unwrap_or(0.0) as u64;
+    let place = crate::vm::EvalPlace::Bound { strict, withs: withs.len(), site: site_number, params };
+    let hash = Vm::eval_hash(u, place);
+    let (code, own_strict, declared, kept) = match vm.cached_eval(u, place, hash) {
+        Some(e) => (e.code, e.own_strict, e.declared.clone(), true),
+        None => {
+            let source: Box<[u16]> = u.into();
+            let text = crate::vm::source_text(u);
+            let (_, nups, bindings) = site_bindings(site);
+            let bound: Vec<(crate::js::ast::Name, u8)> = (0..nups)
+                .map(|k| match bindings.iter().find(|b| b.2 == k) {
+                    Some((name, kind, _)) => (name.as_str().into(), *kind as u8),
+                    None => ("%none".into(), 0),
+                })
+                .collect();
+            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), &bound).map_err(eval_error)?;
+            let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
+            let declared: std::rc::Rc<[crate::object::Atom]> =
+                std::mem::take(&mut module.declared).iter().map(|n| vm.intern(n)).collect();
+            // (In parameters' defaults, a `var arguments` is an error; a
+            // `var` by a block-scoped binding's name, but a catch
+            // parameter's, is.)
+            for &n in declared.iter().filter(|_| !own_strict) {
+                let name = vm.atom_name(n);
+                if params && name == "arguments" {
+                    return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
+                }
+                if bindings.iter().any(|(b, kind, _)| {
+                    b == name && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
+                }) {
+                    return Err(Error(format!("SyntaxError: Identifier '{name}' has already been declared"), None));
+                }
+            }
+            let code = vm.load(module);
+            let e = crate::vm::EvalCode {
+                source,
+                place,
+                code,
+                own_strict,
+                declared: declared.clone(),
+                globals: None,
+                used: 0,
+                recent: true,
+            };
+            let kept = vm.keep_eval(hash, e);
+            (code, own_strict, declared, kept)
+        }
+    };
+    let local = object_value(vm.new_object(Value::NULL));
+    let decl = a.get(6).copied().filter(|&d| crate::props::is_object(d)).unwrap_or(env);
+    let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
+    for &atom in declared.iter() {
+        if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
+            vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
+        }
+    }
+    let fenv = if crate::props::is_object(decl) { decl } else { local };
+    vm.eval_envs.push([Value::UNDEFINED, local, fenv].into_iter().chain(withs.iter().copied()).collect());
+    let r = crate::interp::run_script_with(vm, code, this, kept, as_object(carrier));
+    vm.eval_envs.pop();
+    r
+}
+
+/// A direct `eval` site's description (see [`direct_eval_bound`]): its
+/// block-scoped count, its bindings function's upvalue count, and each
+/// binding's name, kind and upvalue.
+fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize)>) {
+    let text = crate::vm::source_text(crate::vm::string_units(site).unwrap_or(&[]));
+    let mut lines = text.lines();
+    let mut counts = lines.next().unwrap_or("").split(' ').map(|n| n.parse::<usize>().unwrap_or(0));
+    let (nlex, nups) = (counts.next().unwrap_or(0), counts.next().unwrap_or(0));
+    let bindings = lines
+        .filter_map(|l| {
+            let mut w = l.splitn(3, ' ');
+            let (kind, up) = (w.next()?.parse().ok()?, w.next()?.parse().ok()?);
+            Some((w.next()?.to_string(), kind, up))
+        })
+        .collect();
+    (nlex, nups, bindings)
+}
+
+/// [`direct_eval_bound`]'s `eval` through a scope object of its bindings'
+/// accessors (`a` [`direct_eval`]'s arguments), as `Gen::call` makes
+/// otherwise: `eval_scope`, then `direct_eval`, then `eval_scope_flush`.
+fn eval_through_scope(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, bindings: &[(&str, i32, usize)]) -> Result<Value> {
+    let mut sa = vec![a[2], Value::from_i32(nlex as i32), carrier];
+    let mut names = Vec::with_capacity(bindings.len());
+    for &(name, kind, up) in bindings {
+        let n = crate::builtins::str_value(vm, name);
+        names.push(n);
+        sa.extend([n, n, Value::from_i32(((up as i32) << 4) | kind)]);
+    }
+    let scope = eval_scope(vm, &sa)?;
+    let mut da = a.to_vec();
+    da[2] = scope;
+    let r = direct_eval(vm, &da)?;
+    let decl = a.get(6).copied().unwrap_or(Value::UNDEFINED);
+    let mut fa = vec![scope, decl, Value::from_i32(nlex as i32)];
+    fa.extend(names);
+    eval_scope_flush(vm, &fa)?;
+    Ok(r)
 }
 
 /// A direct `eval(source)` of a strict script's own: `[eval, source]`.
@@ -855,7 +996,7 @@ fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
-    crate::builtins::global_eval(vm, crate::vm::source_text(u), true)
+    crate::builtins::global_eval(vm, u, true)
 }
 
 /// An `eval`'s compile error, thrown.

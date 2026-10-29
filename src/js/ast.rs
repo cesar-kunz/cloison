@@ -34,6 +34,13 @@ pub struct Program<'a> {
     /// Strict indirect `eval`'s code: its `var`s and functions are its
     /// own, not globals.
     pub eval_locals: bool,
+    /// Direct `eval`'s code compiled for a site's bindings (see
+    /// `intrinsics::direct_eval_bound`): its top level's upvalues, those of
+    /// the site's bindings function, by index: the name the `eval` sees
+    /// and its kind (`EVAL_CONST`…), or a name no code has (`%none`). Its
+    /// code reads and writes them as the scope object's accessors did
+    /// (see `codegen::Var::Bound`), and there is no `%e0`.
+    pub eval_upvalues: Vec<(Name, u8)>,
     /// A lazily compiled function's: the upvalues that are an enclosing
     /// named function expression's own name (`asm::LazyFn::own_names`),
     /// parameters of the wrapper `js::compile_lazy` makes, but immutable.

@@ -658,15 +658,10 @@ const STACK_VALUES: usize = 1 << 18;
 pub struct Vm {
     pub heap: Heap,
     shapes: Vec<crate::object::ShapeBox>,
-    /// The shapes' addresses (to tell a shape among compiled code's
-    /// constants: see `jit`).
-    pub(crate) shape_set: crate::jit::HashSet<usize>,
     /// Shapes a full marking found dead (see [`Vm::sweep_shapes`]) that a
     /// cache or the JIT may still compare with or read: kept, so that
     /// their addresses aren't reused (see [`Vm::free_zombies`]).
     zombies: Vec<crate::object::ShapeBox>,
-    /// Their addresses (for the JIT, which pins one compiled code holds).
-    pub(crate) zombie_set: crate::jit::HashSet<usize>,
     /// Zombies nothing held at a full marking's end, freed once the sweep
     /// that frees their objects is done (as `condemned` codes).
     pub(crate) condemned_shapes: Vec<crate::object::ShapeBox>,
@@ -1096,9 +1091,7 @@ impl Vm {
         let mut vm = Vm {
             heap: Heap::new(),
             shapes: Vec::new(),
-            shape_set: Default::default(),
             zombies: Vec::new(),
-            zombie_set: Default::default(),
             condemned_shapes: Vec::new(),
             shapes_made: 0,
             cells_made: 0,
@@ -1648,8 +1641,6 @@ impl Vm {
         self.wide_transitions.retain(|&(s, _, _), t| live(s as *const Shape) && live(*t));
         self.roots.retain(|_, s| live(*s));
         for mut z in dead {
-            self.shape_set.remove(&(&*z as *const Shape as usize));
-            self.zombie_set.insert(&*z as *const Shape as usize);
             z.proto = Value::NULL;
             // (`Shape::is_zombie`.)
             z.capacity.set(u32::MAX);
@@ -1682,7 +1673,6 @@ impl Vm {
         /// be followed, and the slot tables whose fields were (each once,
         /// all of them: a lineage's shapes share one).
         struct Held {
-            zombies: crate::jit::HashSet<usize>,
             held: crate::jit::HashSet<usize>,
             work: Vec<usize>,
             tables: crate::jit::HashSet<usize>,
@@ -1690,7 +1680,8 @@ impl Vm {
         impl Held {
             fn hold(&mut self, w: u64) {
                 let a = w as usize;
-                if self.zombies.contains(&a) && self.held.insert(a) {
+                let zombie = || crate::object::is_shape_address(a) && unsafe { (*(a as *const Shape)).is_zombie() };
+                if a != 0 && zombie() && self.held.insert(a) {
                     self.work.push(a);
                 }
             }
@@ -1725,13 +1716,11 @@ impl Vm {
             }
         }
         let mut h = Held {
-            zombies: std::mem::take(&mut self.zombie_set),
             held: Default::default(),
             work: Vec::new(),
             tables: Default::default(),
         };
         if !crate::jit::shape_words(self, &mut |w| h.hold(w)) {
-            self.zombie_set = h.zombies;
             self.heap.gc.shape_phases.zombies = crate::gc::lap(&mut t);
             return;
         }
@@ -1774,7 +1763,6 @@ impl Vm {
         let (keep, free): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.zombies).into_iter().partition(|z| held.contains(&(&**z as *const Shape as usize)));
         self.zombies = keep;
-        self.zombie_set = held;
         let ph = &mut self.heap.gc.shape_phases;
         (ph.condemned, ph.zombies_left) = (free.len(), self.zombies.len());
         self.condemned_shapes.extend(free);
@@ -1930,7 +1918,6 @@ impl Vm {
         // (Live in a full marking under way: no object it finds has it yet.)
         b.mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed);
         self.shapes.push(b);
-        self.shape_set.insert(p as usize);
         self.shapes_made += 1;
         if self.shapes_made % 4096 == 0 {
             self.shapes_made_check();

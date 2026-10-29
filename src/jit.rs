@@ -9824,7 +9824,7 @@ impl JitCode {
                         if !vm.is_null() {
                             unsafe {
                                 (*vm).heap.keep(v as usize);
-                                if (*vm).shape_set.contains(&(v as usize)) || (*vm).zombie_set.contains(&(v as usize)) {
+                                if crate::object::is_shape_address(v as usize) {
                                     crate::object::pin_shape(v as *const Shape);
                                 }
                             }

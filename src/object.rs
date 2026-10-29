@@ -777,12 +777,22 @@ pub struct ShapeBox(std::ptr::NonNull<Shape>);
 /// Shapes per chunk of [`SHAPE_SLAB`].
 const SLAB_SHAPES: usize = 256;
 
+/// A slot of a chunk of shapes: its shape (at its address), and whether
+/// one is there (see [`is_shape_address`]).
+#[repr(C)]
+struct ShapeSlot {
+    shape: std::mem::MaybeUninit<Shape>,
+    used: bool,
+}
+
 /// Each thread's chunks of shapes (never returned to the allocator till
 /// the thread ends) and their free slots.
 #[derive(Default)]
 pub struct ShapeSlab {
-    chunks: Vec<*mut Shape>,
-    free: Vec<*mut Shape>,
+    chunks: Vec<*mut ShapeSlot>,
+    /// Their addresses, in order.
+    sorted: Vec<usize>,
+    free: Vec<*mut ShapeSlot>,
     /// The latest chunk's slots not used yet.
     next: usize,
 }
@@ -793,7 +803,7 @@ thread_local! {
 
 impl ShapeSlab {
     fn layout() -> std::alloc::Layout {
-        std::alloc::Layout::array::<Shape>(SLAB_SHAPES).unwrap()
+        std::alloc::Layout::array::<ShapeSlot>(SLAB_SHAPES).unwrap()
     }
 }
 
@@ -805,6 +815,23 @@ impl Drop for ShapeSlab {
     }
 }
 
+/// Whether `a` is the address of a shape made on this thread and not yet
+/// freed (live, a zombie, or condemned; any VM's): to tell a shape among
+/// compiled code's constants, and the zombies among the words caches and
+/// the JIT hold. (A set of the shapes' addresses took each shape an insert
+/// and a remove: 9% of del.js, 130K shapes made and dropped a collection.)
+pub(crate) fn is_shape_address(a: usize) -> bool {
+    SHAPE_SLAB.with_borrow(|slab| {
+        let i = slab.sorted.partition_point(|&c| c <= a);
+        if i == 0 {
+            return false;
+        }
+        let off = a - slab.sorted[i - 1];
+        let size = size_of::<ShapeSlot>();
+        off < SLAB_SHAPES * size && off % size == 0 && unsafe { (*(a as *const ShapeSlot)).used }
+    })
+}
+
 impl ShapeBox {
     pub fn new(s: Shape) -> ShapeBox {
         let p = SHAPE_SLAB.with_borrow_mut(|slab| {
@@ -812,18 +839,22 @@ impl ShapeBox {
                 return p;
             }
             if slab.next == 0 {
-                let c = unsafe { std::alloc::alloc(ShapeSlab::layout()) }.cast::<Shape>();
+                let c = unsafe { std::alloc::alloc(ShapeSlab::layout()) }.cast::<ShapeSlot>();
                 if c.is_null() {
                     std::alloc::handle_alloc_error(ShapeSlab::layout());
                 }
                 slab.chunks.push(c);
+                let i = slab.sorted.partition_point(|&a| a < c as usize);
+                slab.sorted.insert(i, c as usize);
                 slab.next = SLAB_SHAPES;
             }
             slab.next -= 1;
             unsafe { slab.chunks.last().unwrap().add(slab.next) }
         });
-        unsafe { p.write(s) };
-        ShapeBox(unsafe { std::ptr::NonNull::new_unchecked(p) })
+        unsafe {
+            p.write(ShapeSlot { shape: std::mem::MaybeUninit::new(s), used: true });
+            ShapeBox(std::ptr::NonNull::new_unchecked(p.cast()))
+        }
     }
 }
 
@@ -844,8 +875,10 @@ impl Drop for ShapeBox {
     fn drop(&mut self) {
         let p = self.0.as_ptr();
         unsafe { std::ptr::drop_in_place(p) };
+        let slot = p.cast::<ShapeSlot>();
+        unsafe { (*slot).used = false };
         // (No VM outlives its thread's slab: none is a thread-local.)
-        SHAPE_SLAB.with_borrow_mut(|slab| slab.free.push(p));
+        SHAPE_SLAB.with_borrow_mut(|slab| slab.free.push(slot));
     }
 }
 

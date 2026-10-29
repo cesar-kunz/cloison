@@ -773,7 +773,9 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// the builtin `eval`: an ordinary call. Else `source` (a string) is
 /// compiled with the caller's scope object `scope` around it (see
 /// `js::compile_direct_eval`), its `var`s and functions (sloppy code's)
-/// made there first, and run with the caller's `this`.
+/// made there first, and run with the caller's `this`. The code is kept
+/// to run again for the same source in the same kind of place (see
+/// `Vm::eval_cache`): only its declarations are made at each run.
 fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (f, src, env, this, strict) = (a[0], a[1], a[2], a[3], a[4] == Value::TRUE);
     let builtin = f.is_cell() && as_object(f) == vm.eval_function;
@@ -783,20 +785,29 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
-    let text = crate::vm::source_text(u);
     // (The objects of the `with` statements around it, outermost first.)
     let withs = a.get(7..).unwrap_or(&[]);
-    let module = crate::js::compile_direct_eval(&text, strict, withs.len()).map_err(|e| {
-        if e.contains("unsupported") {
-            Error(format!("unsupported: in eval'd code: {e}"), None)
-        } else {
-            Error(format!("SyntaxError: {e}"), None)
+    let place = crate::vm::EvalPlace::Direct { strict, withs: withs.len() };
+    let key = (crate::vm::source_text(u), place);
+    let hash = Vm::eval_hash(&key);
+    // (`kept`: its caches stay when it has run.)
+    let (code, own_strict, declared, kept) = match vm.cached_eval(&key, hash) {
+        Some(e) => (e.code, e.own_strict, e.declared.clone(), true),
+        None => {
+            let mut module = crate::js::compile_direct_eval(&key.0, strict, withs.len()).map_err(eval_error)?;
+            // Strict code's `var`s are its own: in a scope object of its own.
+            let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
+            let declared: std::rc::Rc<[crate::object::Atom]> =
+                std::mem::take(&mut module.declared).iter().map(|n| vm.intern(n)).collect();
+            // (Its `var`s are the scope objects', not globals.)
+            let code = vm.load(module);
+            let e = crate::vm::EvalCode { code, own_strict, declared: declared.clone(), globals: None, used: 0, recent: true };
+            let kept = vm.keep_eval(key, hash, e);
+            (code, own_strict, declared, kept)
         }
-    })?;
-    // Strict code's `var`s are its own: in a scope object of its own.
-    let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
+    };
     // (In parameters' defaults, a `var arguments` is an error.)
-    if a.get(5) == Some(&Value::TRUE) && !own_strict && module.declared.iter().any(|n| n == "arguments") {
+    if a.get(5) == Some(&Value::TRUE) && !own_strict && declared.iter().any(|&n| vm.atom_name(n) == "arguments") {
         return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
     }
     let local = object_value(vm.new_object(Value::NULL));
@@ -807,15 +818,13 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let over = target == decl && env != decl && crate::props::is_object(env);
     // A `var` by a block-scoped binding's name (but a catch parameter's)
     // is an error.
-    for n in module.declared.iter().filter(|_| over) {
-        let key = Key::Name(vm.intern(n));
-        let kind = binding_kind(vm, env, key).unwrap_or(0);
+    for &n in declared.iter().filter(|_| over) {
+        let kind = binding_kind(vm, env, Key::Name(n)).unwrap_or(0);
         if kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0 {
-            return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+            return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));
         }
     }
-    for n in &module.declared {
-        let atom = vm.intern(n);
+    for &atom in declared.iter() {
         if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
         }
@@ -826,13 +835,9 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             vm.force_delete_named(as_object(env), atom);
         }
     }
-    // (Its `var`s are the scope objects', not globals.)
-    let mut module = module;
-    module.declared.clear();
-    let code = vm.load(module);
     let env = if crate::props::is_object(env) { env } else { local };
     vm.eval_envs.push([env, local].into_iter().chain(withs.iter().copied()).collect());
-    let r = crate::interp::run_script_with(vm, code, this);
+    let r = crate::interp::run_script_with(vm, code, this, kept);
     vm.eval_envs.pop();
     r
 }
@@ -847,17 +852,16 @@ fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
-    let text = crate::vm::source_text(u);
-    let module = crate::js::compile_strict_eval(&text).map_err(|e| {
-        if e.contains("unsupported") {
-            Error(format!("unsupported: in eval'd code: {e}"), None)
-        } else {
-            Error(format!("SyntaxError: {e}"), None)
-        }
-    })?;
-    vm.global_declarations(&module, true)?;
-    let code = vm.load(module);
-    crate::interp::run_script_at(vm, code)
+    crate::builtins::global_eval(vm, crate::vm::source_text(u), true)
+}
+
+/// An `eval`'s compile error, thrown.
+pub(crate) fn eval_error(e: String) -> Error {
+    if e.contains("unsupported") {
+        Error(format!("unsupported: in eval'd code: {e}"), None)
+    } else {
+        Error(format!("SyntaxError: {e}"), None)
+    }
 }
 
 /// Direct `eval`'s code's first instructions': `[k]` the caller's scope

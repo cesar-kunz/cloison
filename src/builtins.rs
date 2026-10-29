@@ -994,16 +994,47 @@ fn eval_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     } else {
         crate::vm::source_text(u)
     };
-    let module = crate::js::compile_indirect_eval(&src).map_err(|e| {
-        if e.contains("unsupported") {
-            Error(format!("unsupported: in eval'd code: {e}"), None)
-        } else {
-            Error(format!("SyntaxError: {e}"), None)
+    global_eval(vm, src, false)
+}
+
+/// Run `src` as an `eval`'s code in the global scope (`strict`: a strict
+/// script's own direct `eval`'s), its `var`s and functions made globals
+/// first. The code is kept to run again for the same source (see
+/// `Vm::eval_cache`).
+pub(crate) fn global_eval(vm: &mut Vm, src: String, strict: bool) -> Result<Value> {
+    let key = (src, crate::vm::EvalPlace::Global { strict });
+    let hash = Vm::eval_hash(&key);
+    let (code, kept) = match vm.cached_eval(&key, hash) {
+        Some(e) => {
+            let (code, globals) = (e.code, e.globals.clone().expect("a global eval's"));
+            vm.global_declarations(&globals, true)?;
+            (code, true)
         }
-    })?;
-    vm.global_declarations(&module, true)?;
-    let code = vm.load(module);
-    crate::interp::run_script_at(vm, code)
+        None => {
+            let compile = if strict { crate::js::compile_strict_eval } else { crate::js::compile_indirect_eval };
+            let module = compile(&key.0).map_err(crate::intrinsics::eval_error)?;
+            vm.global_declarations(&module, true)?;
+            let globals = crate::asm::Module {
+                functions: Vec::new(),
+                script: 0,
+                declared: module.declared.clone(),
+                function_names: module.function_names.clone(),
+                lexical: Vec::new(),
+            };
+            let code = vm.load(module);
+            let e = crate::vm::EvalCode {
+                code,
+                own_strict: strict,
+                declared: std::rc::Rc::new([]),
+                globals: Some(std::rc::Rc::new(globals)),
+                used: 0,
+                recent: true,
+            };
+            (code, vm.keep_eval(key, hash, e))
+        }
+    };
+    let g = object_value(vm.global);
+    crate::interp::run_script_with(vm, code, g, kept)
 }
 
 /// `$262.evalScript(src)`: `src` run as a script of its own.

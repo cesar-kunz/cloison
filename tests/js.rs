@@ -9718,6 +9718,114 @@ s + " " + Object.keys(o).join(",") + " " + Object.values(o).reduce(function (a, 
 }
 
 #[test]
+fn direct_evals_run_kept_code_anew() {
+    // A direct `eval`'s code is kept for the same text in the same kind of
+    // place (`Vm::eval_cache`), but each run is its own: its scope, `this`,
+    // `new.target` and `arguments`, the closures, classes and template
+    // objects it makes, its declarations and their errors, as V8,
+    // SpiderMonkey, JavaScriptCore and QuickJS give.
+    let src = r#"
+var out = [];
+function f(x) { return eval("x * 2"); }
+var s = 0; for (var i = 0; i < 1000; i++) s += f(i); out.push(s);
+function g() { return eval("(function () { return 1; })"); }
+out.push(g() === g());
+function tag(t) { return t; }
+function h() { return eval("tag`a${1}b`"); }
+function h2() { return eval("(function () { return tag`a`; })()"); }
+out.push(h() === h(), h2() === h2());
+function v(n) { eval("var w = n + 1"); return w; }
+out.push(v(1), v(2));
+function d() { eval("function q() { return 7; }"); return q; }
+out.push(d() === d(), d()());
+function sl() { eval("var z = 3"); return typeof z; }
+function st() { "use strict"; eval("var z = 3"); return typeof z; }
+out.push(sl(), st(), sl(), st());
+function w1(o) { with (o) { return eval("a + 1"); } }
+function w2(a) { return eval("a + 1"); }
+out.push(w1({a: 1}), w1({a: 10}), w2(5));
+function pd(a = eval("var arguments")) { }
+function np() { eval("var arguments"); return 1; }
+for (var k = 0; k < 2; k++) { try { pd(); out.push("no"); } catch (e) { out.push(e.constructor.name); } }
+out.push(np(), np());
+for (var k = 0; k < 2; k++) { try { eval("(("); } catch (e) { out.push(e.constructor.name); } }
+function lc() { let y = 1; { eval("var y = 2"); } }
+for (var k = 0; k < 2; k++) { try { lc(); out.push("no"); } catch (e) { out.push(e.constructor.name); } }
+function th() { return eval("this"); }
+var o1 = {th}, o2 = {th};
+out.push(o1.th() === o1, o2.th() === o2);
+function nt() { return eval("new.target"); }
+out.push(new nt() !== undefined, nt() === undefined);
+function ar() { return eval("arguments.length"); }
+out.push(ar(1, 2), ar(1, 2, 3));
+function lp(n) { return eval("var t = 0; for (var j = 0; j < n; j++) t += j; t"); }
+var u = 0; for (var i = 0; i < 300; i++) u += lp(i); out.push(u);
+function cl() { return eval("(class { #x = 1; static has(o) { return #x in o; } })"); }
+var C1 = cl(), C2 = cl(); out.push(C1 === C2, C1.has(new C1()), C1.has(new C2()));
+var x = "global";
+function ind() { var x = "local"; return [(0, eval)("x"), eval("x")]; }
+out.push(ind().join(), ind().join());
+out.join(" ")
+"#;
+    assert_eq!(
+        value(src),
+        "999000 false false false 2 3 false 7 number undefined number undefined 2 11 6 SyntaxError SyntaxError 1 1 \
+         SyntaxError SyntaxError SyntaxError SyntaxError true true true true 2 3 4455100 false true false \
+         global,local global,local"
+    );
+}
+
+#[test]
+fn global_evals_run_kept_code_anew() {
+    // Indirect `eval`s' code, and the global code's direct ones', is kept
+    // too: each run makes its `var`s and functions globals, its `let`s its
+    // own, its template objects (not kept), its errors, and runs in the
+    // realm of the `eval` called, as V8, SpiderMonkey, JavaScriptCore and
+    // QuickJS give.
+    let src = r#"
+var out = [];
+var geval = eval;
+for (var k = 0; k < 3; k++) geval("var gv" + (k & 1) + " = " + k + "; function gf() { return " + k + "; }");
+out.push(gv0, gv1, gf());
+for (var k = 0; k < 3; k++) { geval("var same = (typeof same == 'number' ? same : 0) + 1"); }
+out.push(same);
+geval("var dv = 1"); delete globalThis.dv; out.push(typeof dv); geval("var dv = 1"); out.push(typeof dv);
+function tag(t) { return t; }
+out.push(geval("tag`x`") === geval("tag`x`"));
+geval("'use strict'; var sv = 1"); out.push(typeof sv);
+out.push(geval("this") === globalThis);
+var s = 0; for (var i = 0; i < 1000; i++) s += eval("i * 2"); out.push(s);
+for (var k = 0; k < 2; k++) out.push(geval("let lx = k; lx"));
+for (var k = 0; k < 2; k++) { try { geval("let q = 1; let q = 2;"); } catch (e) { out.push(e.constructor.name); } }
+var r = $262.createRealm(), e2 = r.global.eval;
+out.push(e2("Array") === Array, geval("Array") === Array, e2("Array") === r.global.Array);
+out.join(" ")
+"#;
+    assert_eq!(value(src), "2 1 2 3 undefined number false undefined true 999000 0 1 SyntaxError SyntaxError false true true");
+}
+
+#[test]
+fn direct_evals_kept_code_is_freed() {
+    // Kept direct `eval`s' code unused since a full collection goes at the
+    // next: a thousand texts' (each run often, 64 kept at most) leave no
+    // more code after full collections than none.
+    let codes = |src: &str| {
+        let mut vm = Vm::new();
+        vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+        vm.memory_stats()[2]
+    };
+    let tail = "$262.gc(); $262.gc(); $262.gc();";
+    let evals = format!(
+        "function f(x, k) {{ return eval('(function (y) {{ return y + ' + k + '; }})(x)'); }}\n\
+         var s = 0; for (var k = 0; k < 1000; k++) for (var i = 0; i < 20; i++) s += f(i, k);\n{tail}"
+    );
+    let none = format!("function f(x, k) {{ return x + k; }}\n\
+         var s = 0; for (var k = 0; k < 1000; k++) for (var i = 0; i < 20; i++) s += f(i, k);\n{tail}");
+    let (kept, base) = (codes(&evals), codes(&none));
+    assert!(kept <= base + 8, "{kept} codes kept, {base} without the evals");
+}
+
+#[test]
 fn caches_compiled_code_reads_drop_dead_shapes() {
     // An empty array's push cache and the megamorphic store table name the
     // shapes compiled code moves objects to: a full collection that finds

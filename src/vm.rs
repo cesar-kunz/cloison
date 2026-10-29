@@ -566,6 +566,47 @@ impl Code {
     }
 }
 
+/// Where an `eval`'s code runs: what compiling it depends on but its
+/// source (see `Vm::eval_cache`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EvalPlace {
+    /// A direct one's, in a function (see `intrinsics::direct_eval`):
+    /// whether the caller is strict, and the `with` statements around it.
+    Direct { strict: bool, withs: usize },
+    /// In the global scope (see `builtins::eval_fn`): an indirect one's,
+    /// or a strict script's own direct one's (`strict`, see
+    /// `intrinsics::strict_eval`).
+    Global { strict: bool },
+}
+
+/// An `eval`'s code, kept to run again (see `Vm::eval_cache`).
+pub(crate) struct EvalCode {
+    pub(crate) code: *const Code,
+    /// Its code is strict of its own (a `"use strict"` of its own, or the
+    /// caller's): a direct one's `var`s are in a scope object of its own.
+    pub(crate) own_strict: bool,
+    /// Its `var`s and functions (sloppy code's): a direct one's made in
+    /// the caller's scope object at each run, as `Module::declared`.
+    pub(crate) declared: std::rc::Rc<[Atom]>,
+    /// A global one's declarations (`Module::declared`, `function_names`;
+    /// no functions): made globals at each run (see
+    /// `Vm::global_declarations`).
+    pub(crate) globals: Option<std::rc::Rc<Module>>,
+    /// `Vm::eval_uses` at its last run.
+    pub(crate) used: u64,
+    /// Run since the last full marking began.
+    pub(crate) recent: bool,
+}
+
+/// Direct `eval`s' code kept (see `Vm::eval_cache`).
+pub(crate) const EVAL_CACHE_MAX: usize = 64;
+
+/// The longest source of an `eval` whose code is kept (bytes).
+pub(crate) const EVAL_CACHE_TEXT_MAX: usize = 1 << 16;
+
+/// `eval`s' keys remembered as compiled once (see `Vm::eval_seen`).
+const EVAL_SEEN_MAX: usize = 1 << 12;
+
 /// Element transitions of a shape to elements of objects of one shape
 /// (`FieldType::Obj`) at most: one for each shape stored in arrays of
 /// it would make every store search them all, and keep each one.
@@ -863,6 +904,18 @@ pub struct Vm {
     /// `intrinsics::direct_eval`), innermost last: the caller's, the
     /// eval's own, then the `with` objects around it.
     pub(crate) eval_envs: Vec<Vec<Value>>,
+    /// `eval`s' code, by their source and where they run: what it
+    /// compiles to depends on nothing else (see `Vm::cached_eval`). At
+    /// most `EVAL_CACHE_MAX`, the least recently used out; those unused
+    /// since the last full marking go at the next (see
+    /// `Vm::age_eval_cache`).
+    pub(crate) eval_cache: crate::jit::HashMap<(String, EvalPlace), EvalCode>,
+    /// `eval`s run from the cache: its clock.
+    pub(crate) eval_uses: u64,
+    /// The keys of `eval`s compiled once, hashed: code is kept for one seen
+    /// again only (most texts run once; code-load's, made unique, all do).
+    /// Cleared past `EVAL_SEEN_MAX`.
+    pub(crate) eval_seen: crate::jit::HashSet<u64>,
     /// `%ThrowTypeError%`.
     pub(crate) thrower: *mut Object,
     /// The mapped `arguments` objects of the frames running, innermost
@@ -1138,6 +1191,9 @@ impl Vm {
             new_target: Value::EMPTY,
             native_new_target: (Value::EMPTY, Value::EMPTY),
             eval_envs: Vec::new(),
+            eval_cache: Default::default(),
+            eval_uses: 0,
+            eval_seen: Default::default(),
             thrower: std::ptr::null_mut(),
             mapped_args: Vec::new(),
             arguments_shape: std::ptr::null(),
@@ -1697,6 +1753,63 @@ impl Vm {
         self.zombies = keep;
         self.zombie_set = held;
         self.condemned_shapes.extend(free);
+    }
+
+    /// `key`'s hash, for [`Vm::cached_eval`] and [`Vm::keep_eval`]
+    /// (`None`: a long source's, not kept).
+    pub(crate) fn eval_hash(key: &(String, EvalPlace)) -> Option<u64> {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        (key.0.len() <= EVAL_CACHE_TEXT_MAX).then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one(key))
+    }
+
+    /// The kept code of an `eval` of `key` (`hash` its hash), now used.
+    /// (Not another realm's: code runs in the realm it was loaded in.)
+    pub(crate) fn cached_eval(&mut self, key: &(String, EvalPlace), hash: Option<u64>) -> Option<&EvalCode> {
+        // (One not seen is not kept: no lookup.)
+        if !self.eval_seen.contains(&hash?) {
+            return None;
+        }
+        self.eval_uses += 1;
+        let (uses, realm) = (self.eval_uses, self.realm);
+        let e = self.eval_cache.get_mut(key).filter(|e| unsafe { (*e.code).realm } == realm)?;
+        e.used = uses;
+        e.recent = true;
+        Some(e)
+    }
+
+    /// Keep `code`, an `eval` of `key`'s, for it to run again: whether it
+    /// is kept. Not the first time (see `Vm::eval_seen`), nor a long
+    /// one's (run once, likely), nor one with a template, whose tagged
+    /// templates' strings arrays are each evaluation's own (a new parse of
+    /// it: `template_object`'s sites are the code's).
+    pub(crate) fn keep_eval(&mut self, key: (String, EvalPlace), hash: Option<u64>, code: EvalCode) -> bool {
+        let Some(hash) = hash.filter(|_| !key.0.contains('`')) else {
+            return false;
+        };
+        if self.eval_seen.len() >= EVAL_SEEN_MAX {
+            self.eval_seen.clear();
+        }
+        if self.eval_seen.insert(hash) {
+            return false;
+        }
+        if self.eval_cache.len() >= EVAL_CACHE_MAX
+            && let Some(old) = self.eval_cache.iter().min_by_key(|(_, e)| e.used).map(|(k, _)| k.clone())
+        {
+            self.eval_cache.remove(&old);
+        }
+        let used = self.eval_uses;
+        self.eval_cache.insert(key, EvalCode { used, recent: true, ..code });
+        true
+    }
+
+    /// As a full marking begins: the `eval`s' code run since the
+    /// last one began is live (kept), the rest goes, to be freed if
+    /// nothing else has it.
+    pub(crate) fn age_eval_cache(&mut self) {
+        self.eval_cache.retain(|_, e| std::mem::take(&mut e.recent));
+        for e in self.eval_cache.values() {
+            crate::gc::mark_code(e.code);
+        }
     }
 
     /// Drop the condemned shapes, and free the field cells no slot table

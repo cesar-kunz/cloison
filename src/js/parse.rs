@@ -61,7 +61,7 @@ thread_local! {
 
 /// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, and
 /// in that many `with` statements).
-pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize)>) -> Result<Program<'a>, Error> {
+pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize, bool)>) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
@@ -102,7 +102,7 @@ fn parse_pass<'a>(
     keep: bool,
     table: Option<Table>,
     prev: Option<&Program<'a>>,
-    eval: Option<(bool, usize)>,
+    eval: Option<(bool, usize, bool)>,
     module: Option<i32>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
@@ -188,16 +188,17 @@ fn parse_pass<'a>(
         module: false,
     });
     p.functions[0].strict =
-        p.directive_prologue() || eval.is_some_and(|(strict, _)| strict) || module.is_some() || STRICT.get();
-    if let Some((_, withs)) = eval {
+        p.directive_prologue() || eval.is_some_and(|(strict, ..)| strict) || module.is_some() || STRICT.get();
+    if let Some((_, withs, bound)) = eval {
         // The scope object of the function calling it (its parameters and
         // `var`s, those `eval`s declared), the caller's scope object (the
         // other bindings it sees: see `intrinsics::eval_scope`), the
         // objects of the `with` statements around the `eval` (outermost
         // first), then the eval's own (for strict code's `var`s): what
-        // `with`s would give.
-        let names: Vec<Name> = ["%e2".into(), "%e0".into()]
-            .into_iter()
+        // `with`s would give. (`bound`: no scope object of the caller's,
+        // its bindings its upvalues: see `Program::eval_upvalues`.)
+        let names: Vec<Name> = std::iter::once("%e2".into())
+            .chain((!bound).then(|| "%e0".into()))
             .chain((0..withs).map(|k| format!("%w{k}").into()))
             .chain(std::iter::once("%e1".into()))
             .collect();
@@ -229,6 +230,7 @@ fn parse_pass<'a>(
             shadowed_params: std::mem::take(&mut p.shadowed_params),
             direct_eval: eval.is_some(),
             eval_locals: false,
+            eval_upvalues: Vec::new(),
             own_names: Vec::new(),
             imports: std::mem::take(&mut p.imports),
             module: module.map(|_| std::mem::take(&mut p.info)),

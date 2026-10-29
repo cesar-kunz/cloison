@@ -3931,12 +3931,21 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
 /// stack's free top (as [`call_function`]), `this` the global object.
 pub(crate) fn run_script_at(vm: &mut Vm, code: *const Code) -> crate::vm::Result<Value> {
     let g = object_value(vm.global);
-    run_script_with(vm, code, g, false)
+    run_script_with(vm, code, g, false, std::ptr::null_mut())
 }
 
 /// [`run_script_at`] with `this` (direct `eval`'s caller's); `again`: the
-/// code is kept to run again (a direct `eval`'s, cached), its caches too.
-pub(crate) fn run_script_with(vm: &mut Vm, code: *const Code, this: Value, again: bool) -> crate::vm::Result<Value> {
+/// code is kept to run again (a direct `eval`'s, cached), its caches too;
+/// `func` the frame's function, whose upvalues are the code's (a direct
+/// `eval`'s site's bindings function: see `intrinsics::direct_eval_bound`),
+/// or null.
+pub(crate) fn run_script_with(
+    vm: &mut Vm,
+    code: *const Code,
+    this: Value,
+    again: bool,
+    func: *mut Object,
+) -> crate::vm::Result<Value> {
     unsafe {
         let top = vm.native_top;
         if top.is_null() {
@@ -3948,7 +3957,7 @@ pub(crate) fn run_script_with(vm: &mut Vm, code: *const Code, this: Value, again
             return Err(Error::range_error("Maximum call stack size exceeded"));
         }
         write_frame_header(vm, new, code, std::ptr::null(), std::ptr::null_mut(), 0);
-        set_header(new, FUNC, std::ptr::null_mut::<Object>());
+        set_header(new, FUNC, func);
         *new = this;
         for i in 1..n {
             *new.add(i) = Value::UNDEFINED;

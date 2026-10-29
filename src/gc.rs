@@ -1410,6 +1410,7 @@ impl Vm {
             self.heap.finish_sweep();
             // The cells that could still refer to them are swept.
             self.condemned.clear();
+            self.condemned_shapes.clear();
             self.heap.gc.codes_from = CODE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             self.heap.gc.code_at_start = CODE_BYTES.with(|c| c.get());
             // Compiled code may give an object a shape a cache holds now,

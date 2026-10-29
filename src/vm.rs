@@ -575,6 +575,10 @@ const MAX_ELEM_SHAPES: usize = 8;
 /// `Vm::wide_transitions`).
 const WIDE_TRANSITIONS: usize = 16;
 
+/// Zombie shapes kept before a sweep looks for those it can free (see
+/// `Vm::free_zombies`): about 6 MB.
+const ZOMBIES_MIN: usize = 1 << 14;
+
 const INITIAL_CTOR_CAPACITY: u32 = 4;
 /// `Code::ctor_result` when constructed objects have had several shapes.
 pub(crate) const MANY_SHAPES: *const Shape = std::ptr::dangling::<Shape>();
@@ -608,9 +612,15 @@ pub struct Vm {
     /// The shapes' addresses (to tell a shape among compiled code's
     /// constants: see `jit`).
     pub(crate) shape_set: crate::jit::HashSet<usize>,
-    /// Shapes a full marking found dead (see [`Vm::sweep_shapes`]): kept,
-    /// so that their addresses aren't reused.
+    /// Shapes a full marking found dead (see [`Vm::sweep_shapes`]) that a
+    /// cache or the JIT may still compare with or read: kept, so that
+    /// their addresses aren't reused (see [`Vm::free_zombies`]).
     zombies: Vec<crate::object::ShapeBox>,
+    /// Their addresses (for the JIT, which pins one compiled code holds).
+    pub(crate) zombie_set: crate::jit::HashSet<usize>,
+    /// Zombies nothing held at a full marking's end, freed once the sweep
+    /// that frees their objects is done (as `condemned` codes).
+    pub(crate) condemned_shapes: Vec<crate::object::ShapeBox>,
     /// Shapes made since a full marking last collected them.
     shapes_made: usize,
     field_cells: Vec<Box<FieldCell>>,
@@ -1016,6 +1026,8 @@ impl Vm {
             shapes: Vec::new(),
             shape_set: Default::default(),
             zombies: Vec::new(),
+            zombie_set: Default::default(),
+            condemned_shapes: Vec::new(),
             shapes_made: 0,
             field_cells: Vec::new(),
             roots: HashMap::default(),
@@ -1480,8 +1492,9 @@ impl Vm {
     /// cache or table holds it, compiled code doesn't make it). Each becomes
     /// a zombie: its transitions, push cache and prototype dropped (the
     /// prototype may die), its capacity impossible, kept so that its
-    /// address isn't reused, for compiled code and the JIT's records may
-    /// still compare a shape with it (never equal now) or read its slots.
+    /// address isn't reused while compiled code, caches or the JIT's
+    /// records may still compare a shape with it (never equal now) or read
+    /// its slots: then freed (`free_zombies`).
     pub(crate) fn sweep_shapes(&mut self, from: u32) {
         use std::sync::atomic::Ordering::Relaxed;
         let live = |s: *const Shape| unsafe { (*s).pinned.get() || (*s).mark.load(Relaxed) >= from };
@@ -1489,6 +1502,7 @@ impl Vm {
             std::mem::take(&mut self.shapes).into_iter().partition(|s| live(&**s));
         self.shapes = keep;
         if dead.is_empty() {
+            self.free_zombies();
             return;
         }
         for s in &self.shapes {
@@ -1500,6 +1514,7 @@ impl Vm {
         self.roots.retain(|_, s| live(*s));
         for mut z in dead {
             self.shape_set.remove(&(&*z as *const Shape as usize));
+            self.zombie_set.insert(&*z as *const Shape as usize);
             z.proto = Value::NULL;
             // (`Shape::is_zombie`.)
             z.capacity.set(u32::MAX);
@@ -1511,6 +1526,118 @@ impl Vm {
             }
             self.zombies.push(z);
         }
+        self.free_zombies();
+    }
+
+    /// Condemn the zombies nothing may read or compare a shape with any
+    /// more (see `condemned_shapes`): those no inline cache, lookup table,
+    /// push cache, live shape's field or elements, constructor tracking or
+    /// state of the JIT holds (`jit::shape_words`), nor compiled code
+    /// (pinned: see `jit`'s relocations), nor a zombie kept (its parent,
+    /// family, fields: the JIT reads a kept one's).
+    fn free_zombies(&mut self) {
+        // (Its scan of the caches and the JIT's state, once for many: at
+        // every sweep, it took code-load 0.75% more instructions.)
+        if self.zombies.len() < ZOMBIES_MIN {
+            return;
+        }
+        /// The zombies found held, those whose own references are still to
+        /// be followed, and the slot tables whose fields were (each once,
+        /// all of them: a lineage's shapes share one).
+        struct Held {
+            zombies: crate::jit::HashSet<usize>,
+            held: crate::jit::HashSet<usize>,
+            work: Vec<usize>,
+            tables: crate::jit::HashSet<usize>,
+        }
+        impl Held {
+            fn hold(&mut self, w: u64) {
+                let a = w as usize;
+                if self.zombies.contains(&a) && self.held.insert(a) {
+                    self.work.push(a);
+                }
+            }
+            fn refs(&mut self, s: &Shape) {
+                self.hold(s.parent as u64);
+                self.hold(s.family as u64);
+                let t = s.slots.table();
+                if self.tables.insert(t as *const _ as usize) {
+                    for &c in t.all_fields() {
+                        if let FieldType::Obj(t) = unsafe { (*c).get() } {
+                            self.hold(t as u64);
+                        }
+                    }
+                }
+                if let FieldType::Obj(t) = s.elems {
+                    self.hold(t as u64);
+                }
+                for &(k, _) in s.elem_transitions.borrow().iter() {
+                    if let FieldType::Obj(t) = k {
+                        self.hold(t as u64);
+                    }
+                }
+                let p = s.push.get();
+                if !p.is_null() {
+                    let c = unsafe { &*p };
+                    for &(k, t) in &c.to {
+                        self.hold(k);
+                        self.hold(t);
+                    }
+                    self.hold(c.any);
+                }
+            }
+        }
+        let mut h = Held {
+            zombies: std::mem::take(&mut self.zombie_set),
+            held: Default::default(),
+            work: Vec::new(),
+            tables: Default::default(),
+        };
+        if !crate::jit::shape_words(self, &mut |w| h.hold(w)) {
+            self.zombie_set = h.zombies;
+            return;
+        }
+        for z in &self.zombies {
+            if z.pinned.get() {
+                h.hold(&**z as *const Shape as u64);
+            }
+        }
+        for c in self.codes.iter().chain(&self.condemned) {
+            for ways in c.made_ics() {
+                for ic in unsafe { &*ways.get() } {
+                    h.hold(ic.shape as u64);
+                    h.hold(ic.new_shape as u64);
+                }
+            }
+            h.hold(c.ctor_shape.get() as u64);
+            h.hold(c.ctor_result.get() as u64);
+        }
+        for e in self.lookups.iter() {
+            h.hold(e.get().shape as u64);
+        }
+        for e in self.megas.iter() {
+            h.hold(e.shape);
+        }
+        for e in self.mega_stores.iter() {
+            h.hold(e.shape);
+            h.hold(e.ft);
+            h.hold(e.new_shape);
+        }
+        for e in self.ctor_protos.values() {
+            h.hold(e.root.get() as u64);
+        }
+        for s in &self.shapes {
+            h.refs(s);
+        }
+        while let Some(a) = h.work.pop() {
+            h.refs(unsafe { &*(a as *const Shape) });
+        }
+        let held = h.held;
+        let (keep, free): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.zombies).into_iter().partition(|z| held.contains(&(&**z as *const Shape as usize)));
+        self.zombies = keep;
+        self.zombie_set = held;
+        self.condemned_shapes.extend(free);
     }
 
     pub(crate) fn add_shape(&mut self, s: Shape) -> *const Shape {

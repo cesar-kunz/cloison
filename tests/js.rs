@@ -9657,3 +9657,34 @@ drive(20000)
 "#;
     assert_eq!(value(src), "180021.5");
 }
+
+
+#[test]
+fn dead_shapes_are_freed() {
+    // Unique shapes (a property deleted), a new prototype's and frozen
+    // objects' made by the hundred thousand and dropped, read through
+    // inline caches that held them: full collections free them (zombies
+    // kept only while something may compare with them), and the shapes
+    // made in their place, at their addresses, give what V8 and
+    // JavaScriptCore do.
+    let src = r#"
+function readAll(o) { return (o.a | 0) + (o.b | 0) + (o.k | 0); }
+function make(i) { var o = { a: i, b: 1, c: 2 }; delete o.c; return o; }
+var keep = [], s = 0;
+for (var i = 0; i < 120000; i++) {
+  var o = make(i);
+  var q = Object.create({ m: i & 7, k: 3 }); q.b = 2;
+  var f = Object.freeze({ a: 1, k: i & 3 });
+  s += readAll(o) + readAll(q) + readAll(f) + q.m;
+  if (i % 50000 == 0) keep.push(o, q);
+}
+for (var j = 0; j < keep.length; j++) s += readAll(keep[j]) + (keep[j].m | 0);
+s
+"#;
+    assert_eq!(value(src), "7201530018");
+    let mut vm = Vm::new();
+    let r = vm.run(&cloison::js::compile(src).unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("7201530018"));
+    let zombies = vm.memory_stats()[5];
+    assert!(zombies < 1000, "{zombies} zombie shapes kept");
+}

@@ -140,7 +140,7 @@ pub(crate) fn to_string(vm: &mut Vm, v: Value) -> Result<Value> {
 /// ToPropertyKey, its errors thrown.
 pub(crate) fn to_property_key(vm: &mut Vm, v: Value) -> Result<Key> {
     if crate::symbol::is_symbol(v) {
-        return Ok(Key::Name(crate::symbol::symbol_atom(v)));
+        return Ok(Key::Name(crate::symbol::symbol_atom(vm, v)));
     }
     let v = if v.is_cell() && crate::vm::string_units(v).is_none() {
         let p = crate::interp::to_primitive_string(v);
@@ -148,7 +148,7 @@ pub(crate) fn to_property_key(vm: &mut Vm, v: Value) -> Result<Key> {
             return Err(vm.take_conv_error());
         }
         if crate::symbol::is_symbol(p) {
-            return Ok(Key::Name(crate::symbol::symbol_atom(p)));
+            return Ok(Key::Name(crate::symbol::symbol_atom(vm, p)));
         }
         to_string(vm, p)?
     } else {
@@ -1074,7 +1074,8 @@ fn private_property(vm: &mut Vm, o: Value, s: Value) -> Option<Desc> {
     if !crate::props::is_object(o) {
         return None;
     }
-    vm.own_property(as_object(o), Key::Name(crate::symbol::symbol_atom(s)))
+    let key = Key::Name(crate::symbol::symbol_atom(vm, s));
+    vm.own_property(as_object(o), key)
 }
 
 /// `o.#x`: `[o, symbol]`.
@@ -1105,7 +1106,7 @@ fn private_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `o.#x = v`: `[o, symbol, v]`, `v`.
 fn private_set(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (o, s, v) = (a[0], a[1], a[2]);
-    let key = Key::Name(crate::symbol::symbol_atom(s));
+    let key = Key::Name(crate::symbol::symbol_atom(vm, s));
     match private_property(vm, o, s) {
         Some(d) if d.get.is_some() || d.set.is_some() => {
             match d.set.filter(|f| !f.is_undefined()) {
@@ -1146,7 +1147,7 @@ fn private_add(vm: &mut Vm, o: Value, s: Value, d: &Desc) -> Result<()> {
             crate::symbol::description_string(s)
         )));
     }
-    let key = Key::Name(crate::symbol::symbol_atom(s));
+    let key = Key::Name(crate::symbol::symbol_atom(vm, s));
     if !vm.define_own_property(as_object(o), key, d)? {
         return Err(Error::type_error(format!(
             "Cannot define private member {} on a non-extensible object",
@@ -1177,7 +1178,7 @@ fn private_method(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         match (d.get, d.set) {
             (Some(g), Some(st)) if (kind == 1 && g.is_undefined()) || (kind == 2 && st.is_undefined()) => {
                 (get, set) = (g, st);
-                let key = Key::Name(crate::symbol::symbol_atom(s));
+                let key = Key::Name(crate::symbol::symbol_atom(vm, s));
                 vm.delete_key(o, key)?;
             }
             _ => {

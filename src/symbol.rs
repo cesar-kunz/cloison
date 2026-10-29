@@ -5,8 +5,9 @@
 //! As a property key it is an atom of its own, named `\u{FDD0}` and a
 //! number (or the well-known symbol's name), which string keys don't
 //! reach in practice; `own_keys` leaves those out (see
-//! [`is_symbol_atom`]). The cell keeps its atom in `elems_len` and its
-//! description in `code`'s bits (traced: see `gc`).
+//! [`is_symbol_atom`]). The cell keeps its atom in `elems_len` (made
+//! once it is a key: see [`symbol_atom`]) and its description in `code`'s
+//! bits (traced: see `gc`).
 
 use crate::interp::{call_function, to_boolean};
 use crate::object::{Atom, Class, DONT_ENUM, Object, as_object, object_value};
@@ -63,9 +64,24 @@ pub(crate) fn is_symbol(v: Value) -> bool {
     v.is_cell() && unsafe { (*as_object(v)).class } == Class::Symbol
 }
 
-/// Symbol `v`'s property key.
-pub(crate) fn symbol_atom(v: Value) -> Atom {
-    Atom(unsafe { (*as_object(v)).elems_len })
+/// A symbol's `elems_len` until it is a property key: no atom yet.
+const NO_ATOM: u32 = u32::MAX;
+
+/// Symbol `v`'s property key, made the first time it is one: then its
+/// atom's symbol (`Vm::symbols`, which keeps it), as `own_keys` gives it.
+/// (Most symbols never are: made for each, at a million `Symbol()`s
+/// atoms and symbols kept for good took 215 MB.)
+pub(crate) fn symbol_atom(vm: &mut Vm, v: Value) -> Atom {
+    let o = as_object(v);
+    let a = unsafe { (*o).elems_len };
+    if a != NO_ATOM {
+        return Atom(a);
+    }
+    vm.symbol_count += 1;
+    let atom = vm.intern(&format!("{SYMBOL_MARK}{}", vm.symbol_count));
+    unsafe { (*o).elems_len = atom.0 };
+    vm.symbols.insert(atom, o);
+    atom
 }
 
 /// Whether atom `a` is a symbol's.
@@ -111,22 +127,20 @@ fn make_symbol(vm: &mut Vm, desc: Value, name: Option<String>) -> Value {
     {
         return object_value(o);
     }
-    let name = name.unwrap_or_else(|| {
-        vm.symbol_count += 1;
-        format!("{SYMBOL_MARK}{}", vm.symbol_count)
-    });
-    let atom = vm.intern(&name);
+    let atom = name.map(|n| vm.intern(&n));
     let proto = object_value(root(vm, Root::SymbolPrototype));
     let o = vm.new_object_with(Class::Symbol, proto, 0);
     unsafe {
         (*o).code = desc.to_bits() as *const crate::vm::Code;
-        (*o).elems_len = atom.0;
+        (*o).elems_len = atom.map_or(NO_ATOM, |a| a.0);
         // (Its class's root shape takes no element store: see
         // `Vm::root_shape`. Not a unique shape of its own, which would
         // never be freed.)
         (*o).flags |= crate::object::NOT_EXTENSIBLE;
     }
-    vm.symbols.insert(atom, o);
+    if let Some(a) = atom {
+        vm.symbols.insert(a, o);
+    }
     object_value(o)
 }
 

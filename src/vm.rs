@@ -925,6 +925,8 @@ pub struct Vm {
     /// Sloppy functions' `arguments` objects' shape (see
     /// `builtins::arguments_object_of`).
     pub(crate) arguments_shape: *const Shape,
+    /// Their shape when mapped (see `builtins::mapped_arguments_object`).
+    pub(crate) mapped_arguments_shape: *const Shape,
     /// The object keys read-modify-writes' `GetKeyed`s converted, what to,
     /// in which frame (its registers) and for the `SetKeyed` at which offset
     /// (`Code::compound_keys`): that one takes its key instead of converting
@@ -1197,6 +1199,7 @@ impl Vm {
             thrower: std::ptr::null_mut(),
             mapped_args: Vec::new(),
             arguments_shape: std::ptr::null(),
+            mapped_arguments_shape: std::ptr::null(),
             key_cache: Vec::new(),
             eval_function: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),

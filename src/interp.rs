@@ -1043,10 +1043,13 @@ handlers! {
         let (args, argc) = frame_args(vm, regs, &mut spread);
         let values = std::slice::from_raw_parts(args, argc);
         let callee: *mut Object = header(regs, FUNC);
-        let o = crate::builtins::arguments_object_of(vm, values, callee);
         let n = argc.min((*frame_code(regs)).nparams as usize);
+        let o = if n > 0 {
+            crate::builtins::mapped_arguments_object(vm, values, callee)
+        } else {
+            crate::builtins::arguments_object_of(vm, values, callee)
+        };
         if n > 0 {
-            vm.slow_elements(as_object(o));
             vm.mapped_args.push(crate::vm::MappedArgs { o: as_object(o), regs, mapped: vec![true; n], scope: (std::ptr::null_mut(), Vec::new()) });
             // (Released where the frame ends: see `Vm::close_upvalues`.)
             *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);

@@ -912,6 +912,8 @@ pub struct Vm {
     /// `intrinsics::direct_eval`), innermost last: the caller's, the
     /// eval's own, then the `with` objects around it.
     pub(crate) eval_envs: Vec<Vec<Value>>,
+    /// Those of `eval_envs` in use (the rest kept for their room).
+    pub(crate) eval_depth: usize,
     /// `eval`s' code, by their source and where they run: what it
     /// compiles to depends on nothing else (see `Vm::cached_eval`). By
     /// their hash ([`Vm::eval_hash`]: found from the source string's
@@ -1203,6 +1205,7 @@ impl Vm {
             new_target: Value::EMPTY,
             native_new_target: (Value::EMPTY, Value::EMPTY),
             eval_envs: Vec::new(),
+            eval_depth: 0,
             eval_cache: Default::default(),
             eval_kept: 0,
             eval_uses: 0,
@@ -1774,6 +1777,22 @@ impl Vm {
     pub(crate) fn eval_hash(source: &[u16], place: EvalPlace) -> Option<u64> {
         use std::hash::{BuildHasher, BuildHasherDefault};
         (source.len() <= EVAL_CACHE_TEXT_MAX).then(|| BuildHasherDefault::<crate::jit::FxHasher>::default().hash_one((source, place)))
+    }
+
+    /// Push a direct `eval`'s scope objects on `eval_envs` (see
+    /// `intrinsics::eval_env`), into the room one before left.
+    pub(crate) fn push_eval_envs(&mut self, envs: impl IntoIterator<Item = Value>) {
+        if self.eval_depth == self.eval_envs.len() {
+            self.eval_envs.push(Vec::new());
+        }
+        let e = &mut self.eval_envs[self.eval_depth];
+        e.clear();
+        e.extend(envs);
+        self.eval_depth += 1;
+    }
+
+    pub(crate) fn pop_eval_envs(&mut self) {
+        self.eval_depth -= 1;
     }
 
     /// The kept code of an `eval` of `source` in `place` (`hash` their

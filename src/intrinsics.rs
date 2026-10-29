@@ -850,9 +850,9 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // (Its names looked up in the caller's scope object, then the
     // function's: see `eval_scope`.)
     let fenv = if crate::props::is_object(decl) { decl } else { env };
-    vm.eval_envs.push([env, local, fenv].into_iter().chain(withs.iter().copied()).collect());
+    vm.push_eval_envs([env, local, fenv].into_iter().chain(withs.iter().copied()));
     let r = crate::interp::run_script_with(vm, code, this, kept, std::ptr::null_mut());
-    vm.eval_envs.pop();
+    vm.pop_eval_envs();
     r
 }
 
@@ -931,8 +931,14 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             (code, own_strict, declared, kept)
         }
     };
-    let local = object_value(vm.new_object(Value::NULL));
+    // (Strict code's own scope object: sloppy code's has none, see
+    // `parse::parse_pass`.)
     let decl = a.get(6).copied().filter(|&d| crate::props::is_object(d)).unwrap_or(env);
+    let local = if own_strict || !crate::props::is_object(decl) {
+        object_value(vm.new_object(Value::NULL))
+    } else {
+        Value::UNDEFINED
+    };
     let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
     for &atom in declared.iter() {
         if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
@@ -940,9 +946,9 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
     }
     let fenv = if crate::props::is_object(decl) { decl } else { local };
-    vm.eval_envs.push([Value::UNDEFINED, local, fenv].into_iter().chain(withs.iter().copied()).collect());
+    vm.push_eval_envs([Value::UNDEFINED, local, fenv].into_iter().chain(withs.iter().copied()));
     let r = crate::interp::run_script_with(vm, code, this, kept, as_object(carrier));
-    vm.eval_envs.pop();
+    vm.pop_eval_envs();
     r
 }
 
@@ -1012,7 +1018,8 @@ pub(crate) fn eval_error(e: String) -> Error {
 /// object (0), the eval's own (1), a `with` object (2…).
 fn eval_env(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let k = a[0].as_number().unwrap_or(0.0) as usize;
-    Ok(vm.eval_envs.last().and_then(|e| e.get(k).copied()).unwrap_or(Value::UNDEFINED))
+    let envs = vm.eval_depth.checked_sub(1).and_then(|d| vm.eval_envs.get(d));
+    Ok(envs.and_then(|e| e.get(k).copied()).unwrap_or(Value::UNDEFINED))
 }
 
 /// A plain object without a prototype, with room for `[capacity]`

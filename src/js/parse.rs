@@ -196,11 +196,13 @@ fn parse_pass<'a>(
         // objects of the `with` statements around the `eval` (outermost
         // first), then the eval's own (for strict code's `var`s): what
         // `with`s would give. (`bound`: no scope object of the caller's,
-        // its bindings its upvalues: see `Program::eval_upvalues`.)
+        // its bindings its upvalues: see `Program::eval_upvalues`; nor, for
+        // sloppy code, of its own, which would stay empty: no `eval` in it
+        // to declare there.)
         let names: Vec<Name> = std::iter::once("%e2".into())
             .chain((!bound).then(|| "%e0".into()))
             .chain((0..withs).map(|k| format!("%w{k}").into()))
-            .chain(std::iter::once("%e1".into()))
+            .chain((!bound || p.functions[0].strict).then(|| "%e1".into()))
             .collect();
         for e in &names {
             p.hidden_var(e.clone());

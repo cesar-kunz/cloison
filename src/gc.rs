@@ -1421,6 +1421,7 @@ impl Vm {
             self.free_condemned_shapes();
             self.heap.gc.codes_from = CODE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             self.heap.gc.code_at_start = CODE_BYTES.with(|c| c.get());
+            self.age_eval_cache();
             // Compiled code may give an object a shape a cache holds now,
             // and the cache drop it before the final pause: they are live.
             let made = self.shapes_made();

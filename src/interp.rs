@@ -3928,11 +3928,12 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
 /// stack's free top (as [`call_function`]), `this` the global object.
 pub(crate) fn run_script_at(vm: &mut Vm, code: *const Code) -> crate::vm::Result<Value> {
     let g = object_value(vm.global);
-    run_script_with(vm, code, g)
+    run_script_with(vm, code, g, false)
 }
 
-/// [`run_script_at`] with `this` (direct `eval`'s caller's).
-pub(crate) fn run_script_with(vm: &mut Vm, code: *const Code, this: Value) -> crate::vm::Result<Value> {
+/// [`run_script_at`] with `this` (direct `eval`'s caller's); `again`: the
+/// code is kept to run again (a direct `eval`'s, cached), its caches too.
+pub(crate) fn run_script_with(vm: &mut Vm, code: *const Code, this: Value, again: bool) -> crate::vm::Result<Value> {
     unsafe {
         let top = vm.native_top;
         if top.is_null() {
@@ -3954,7 +3955,9 @@ pub(crate) fn run_script_with(vm: &mut Vm, code: *const Code, this: Value) -> cr
         let v = drive(vm, (*code).bytecode.as_ptr(), Value::UNDEFINED, new);
         vm.native_top = saved;
         // It has run, for good: its caches go (see `Code::release`).
-        (*code).release(&mut vm.heap);
+        if !again {
+            (*code).release(&mut vm.heap);
+        }
         if v == Value::EMPTY {
             return Err(vm.error.take().unwrap_or_else(|| Error::unsupported("eval")));
         }

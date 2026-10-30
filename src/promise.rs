@@ -56,9 +56,6 @@ enum Root {
     CatchFinally,
     ValueThunk,
     Thrower,
-    /// … and an async function's `await`'s.
-    AsyncFulfilled,
-    AsyncRejected,
     /// (Not a promise's: a direct `eval`'s binding's accessors.)
     BindingGet,
     BindingSet,
@@ -71,7 +68,10 @@ const REJECTED: i32 = 2;
 /// The tag of a `PromiseResolveThenableJob`.
 const THENABLE: i32 = 3;
 
-/// The hidden array's cells: the state, the result, then the reactions.
+/// A promise's state's cells (a buffer of values, its `code`): the state,
+/// the result, and its reactions' array (undefined till one is added).
+/// (An array for all of them: a pending `async` call's promise took 2
+/// cells and 80 bytes, now 1 and 32.)
 const STATE: usize = 0;
 const RESULT: usize = 1;
 const REACTIONS: usize = 2;
@@ -107,7 +107,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(aep, a_message, empty, DONT_ENUM);
 
     vm.promise_roots = vec![proto, c, jobs, aep, std::ptr::null_mut()];
-    let templates: [(NativeFn, u32); 15] = [
+    let templates: [(NativeFn, u32); 13] = [
         (resolve_fn, 1),
         (reject_fn, 1),
         (executor_fn, 2),
@@ -119,8 +119,6 @@ pub(crate) fn install(vm: &mut Vm) {
         (catch_finally, 1),
         (value_thunk, 0),
         (thrower, 0),
-        (async_fulfilled, 1),
-        (async_rejected, 1),
         (crate::intrinsics::binding_get, 0),
         (crate::intrinsics::binding_set, 1),
     ];
@@ -164,18 +162,37 @@ pub(crate) fn new_with_resolvers(vm: &mut Vm) -> (Value, Value, Value) {
     (p, resolve, reject)
 }
 
-/// An `await`'s reaction for coroutine `g`: going on with the value
-/// (`rejected`: with the reason thrown).
-pub(crate) fn async_closure(vm: &mut Vm, rejected: bool, g: Value) -> Value {
-    closure(vm, if rejected { Root::AsyncRejected } else { Root::AsyncFulfilled }, &[g])
-}
-
-/// `await v`: PromiseResolve(%Promise%, v), then the reactions.
+/// `await v`: PromiseResolve(%Promise%, v), then the reactions, with no
+/// capability (Await's PerformPromiseThen since ES2019: no promise made
+/// for the reactions' results, which nothing reads; with it, a pending
+/// `async` call kept two promises).
 pub(crate) fn await_then(vm: &mut Vm, v: Value, on_fulfilled: Value, on_rejected: Value) -> Result<()> {
     let c = object_value(root(vm, Root::Constructor));
     let p = promise_resolve_with(vm, c, v)?;
-    let cap = new_capability(vm, c)?;
-    perform_then(vm, as_object(p), on_fulfilled, on_rejected, &cap)
+    perform_then(vm, as_object(p), on_fulfilled, on_rejected, &Cap::NONE)
+}
+
+/// `await v` of coroutine `g` (an async function's or async generator's):
+/// as [`await_then`] with its reactions, which go on with it (fulfilled:
+/// with the value, rejected: the reason thrown). The reactions name `g`
+/// itself, not two closures over it: nothing else sees them, and `run_job`
+/// tells a coroutine from a handler (no handler is a generator object: it
+/// isn't callable).
+pub(crate) fn await_coroutine(vm: &mut Vm, v: Value, g: Value) -> Result<()> {
+    let c = object_value(root(vm, Root::Constructor));
+    let p = promise_resolve_with(vm, c, v)?;
+    perform_reaction(vm, as_object(p), g, g, &Cap::NONE)
+}
+
+/// Resolve `p`, %Promise%'s, with `v`, as its resolve function would (an
+/// async function's promise, which has none: nothing else can resolve it).
+pub(crate) fn resolve_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
+    resolve_promise(vm, as_object(p), v)
+}
+
+/// Reject `p`, %Promise%'s, with `v` (see [`resolve_own`]).
+pub(crate) fn reject_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
+    settle(vm, as_object(p), REJECTED, v)
 }
 
 /// AsyncFromSyncIterator's promise of a step's value `v`:
@@ -187,18 +204,6 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value) -> Result<Value> {
     let cap = new_capability(vm, c)?;
     perform_then(vm, as_object(wrapper), Value::UNDEFINED, Value::UNDEFINED, &cap)?;
     Ok(cap.promise)
-}
-
-fn async_fulfilled(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let g = slot(vm.callee, 0);
-    crate::generator::async_step(vm, g, crate::generator::NEXT, arg(a, 0))?;
-    Ok(Value::UNDEFINED)
-}
-
-fn async_rejected(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    let g = slot(vm.callee, 0);
-    crate::generator::async_step(vm, g, crate::generator::THROW, arg(a, 0))?;
-    Ok(Value::UNDEFINED)
 }
 
 // ---- Helpers ----
@@ -331,14 +336,14 @@ pub(crate) fn set_slot(o: *mut Object, i: usize, v: Value) {
 // ---- Promise objects ----
 
 /// A new pending promise (of `Promise.prototype`).
-fn new_promise(vm: &mut Vm) -> Value {
-    let cells = vm.new_array();
-    array_push(vm, cells, &[Value::from_i32(PENDING), Value::UNDEFINED]).expect("an array");
+pub(crate) fn new_promise(vm: &mut Vm) -> Value {
     let proto = object_value(root(vm, Root::Prototype));
     let o = vm.new_object_with(Class::Promise, proto, 0);
+    let st = vm.heap.alloc_values(3);
     unsafe {
-        (*o).code = cells.to_bits() as *const Code;
-        crate::heap::barrier(o.cast(), &raw const (*o).code, cells);
+        *st.add(STATE) = Value::from_i32(PENDING);
+        (*o).code = st as *const Code;
+        crate::heap::barrier_young(o.cast(), &raw const (*o).code);
     }
     object_value(o)
 }
@@ -346,12 +351,23 @@ fn new_promise(vm: &mut Vm) -> Value {
 /// Promise `p`'s state (pending 0, fulfilled 1, rejected 2) and result.
 pub(crate) fn state(p: Value) -> (i32, Value) {
     let e = cells(as_object(p));
-    (elem(e, STATE).as_i32_unchecked(), elem(e, RESULT))
+    (cell(e, STATE).as_i32_unchecked(), cell(e, RESULT))
 }
 
-/// Promise `p`'s hidden array.
-fn cells(p: *mut Object) -> *mut Object {
-    unsafe { as_object(Value::from_bits((*p).code as u64)) }
+/// Promise `p`'s state's cells (see [`STATE`]).
+fn cells(p: *mut Object) -> *mut Value {
+    unsafe { (*p).code as *mut Value }
+}
+
+fn cell(e: *mut Value, i: usize) -> Value {
+    unsafe { *e.add(i) }
+}
+
+fn put_cell(e: *mut Value, i: usize, v: Value) {
+    unsafe {
+        *e.add(i) = v;
+        crate::heap::barrier(e.cast::<u8>().sub(8), e.add(i), v);
+    }
 }
 
 fn this_promise(this: Value, what: &str) -> Result<*mut Object> {
@@ -366,19 +382,24 @@ fn this_promise(this: Value, what: &str) -> Result<*mut Object> {
 /// its reactions' jobs queue (the ones of the new state's kind run).
 fn settle(vm: &mut Vm, p: *mut Object, state: i32, value: Value) -> Result<()> {
     let e = cells(p);
-    if elem(e, STATE).as_i32_unchecked() != PENDING {
+    if cell(e, STATE).as_i32_unchecked() != PENDING {
         return Ok(());
     }
-    put(e, STATE, Value::from_i32(state));
-    put(e, RESULT, value);
-    let mut i = REACTIONS;
-    while i + REACTION <= len(e) {
-        let (promise, resolve, reject) = (elem(e, i), elem(e, i + 1), elem(e, i + 2));
-        let handler = elem(e, i + if state == FULFILLED { 3 } else { 4 });
+    put_cell(e, STATE, Value::from_i32(state));
+    put_cell(e, RESULT, value);
+    let list = cell(e, REACTIONS);
+    if list.is_undefined() {
+        return Ok(());
+    }
+    put_cell(e, REACTIONS, Value::UNDEFINED);
+    let r = as_object(list);
+    let mut i = 0;
+    while i + REACTION <= len(r) {
+        let (promise, resolve, reject) = (elem(r, i), elem(r, i + 1), elem(r, i + 2));
+        let handler = elem(r, i + if state == FULFILLED { 3 } else { 4 });
         enqueue(vm, [Value::from_i32(state), promise, resolve, reject, handler, value])?;
         i += REACTION;
     }
-    truncate(e, REACTIONS);
     Ok(())
 }
 
@@ -457,6 +478,11 @@ struct Cap {
     reject: Value,
 }
 
+impl Cap {
+    /// None: a reaction's result goes nowhere (`await`'s).
+    const NONE: Cap = Cap { promise: Value::UNDEFINED, resolve: Value::UNDEFINED, reject: Value::UNDEFINED };
+}
+
 /// NewPromiseCapability(C): `new C(executor)`, the executor keeping the
 /// resolving functions it is given.
 fn new_capability(vm: &mut Vm, c: Value) -> Result<Cap> {
@@ -517,16 +543,22 @@ fn materialize(vm: &mut Vm, cap: &mut Cap) {
     }
 }
 
-/// `Call(cap.[[Resolve]], undefined, « v »)`.
+/// `Call(cap.[[Resolve]], undefined, « v »)`; nothing without one.
 fn cap_resolve(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
+    if cap.promise.is_undefined() {
+        return Ok(());
+    }
     if cap.resolve.is_undefined() {
         return resolve_promise(vm, as_object(cap.promise), v);
     }
     call_function(vm, cap.resolve, Value::UNDEFINED, &[v]).map(drop)
 }
 
-/// `Call(cap.[[Reject]], undefined, « v »)`.
+/// `Call(cap.[[Reject]], undefined, « v »)`; nothing without one.
 fn cap_reject(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
+    if cap.promise.is_undefined() {
+        return Ok(());
+    }
     if cap.reject.is_undefined() {
         return settle(vm, as_object(cap.promise), REJECTED, v);
     }
@@ -590,6 +622,11 @@ fn run_job(vm: &mut Vm, job: &[Value; JOB]) -> Result<()> {
     }
     let cap = Cap { promise: job[1], resolve: job[2], reject: job[3] };
     let (handler, argument) = (job[4], job[5]);
+    // (An `await`'s coroutine: see `await_coroutine`.)
+    if handler.is_cell() && unsafe { (*as_object(handler)).class } == Class::Generator {
+        let mode = if tag == FULFILLED { crate::generator::NEXT } else { crate::generator::THROW };
+        return crate::generator::async_step(vm, handler, mode, argument);
+    }
     let outcome = if handler.is_undefined() {
         if tag == FULFILLED { Ok(argument) } else { Err(argument) }
     } else {
@@ -654,14 +691,25 @@ fn species_constructor(vm: &mut Vm, o: Value) -> Result<Value> {
 fn perform_then(vm: &mut Vm, p: *mut Object, on_fulfilled: Value, on_rejected: Value, cap: &Cap) -> Result<()> {
     let on_fulfilled = if is_callable(on_fulfilled) { on_fulfilled } else { Value::UNDEFINED };
     let on_rejected = if is_callable(on_rejected) { on_rejected } else { Value::UNDEFINED };
+    perform_reaction(vm, p, on_fulfilled, on_rejected, cap)
+}
+
+/// [`perform_then`] of handlers already checked (or a coroutine: see
+/// [`await_coroutine`]).
+fn perform_reaction(vm: &mut Vm, p: *mut Object, on_fulfilled: Value, on_rejected: Value, cap: &Cap) -> Result<()> {
     let e = cells(p);
-    match elem(e, STATE).as_i32_unchecked() {
+    match cell(e, STATE).as_i32_unchecked() {
         PENDING => {
-            array_push(vm, object_value(e), &[cap.promise, cap.resolve, cap.reject, on_fulfilled, on_rejected])?;
+            let mut list = cell(e, REACTIONS);
+            if list.is_undefined() {
+                list = vm.new_array();
+                put_cell(cells(p), REACTIONS, list);
+            }
+            array_push(vm, list, &[cap.promise, cap.resolve, cap.reject, on_fulfilled, on_rejected])?;
         }
         state => {
             let handler = if state == FULFILLED { on_fulfilled } else { on_rejected };
-            let result = elem(e, RESULT);
+            let result = cell(e, RESULT);
             enqueue(vm, [Value::from_i32(state), cap.promise, cap.resolve, cap.reject, handler, result])?;
         }
     }

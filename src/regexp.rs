@@ -853,6 +853,30 @@ fn in_class(ic: Case, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
     r != neg
 }
 
+/// The forms of the units of `ranges` that [`in_class`] folds (those of
+/// ranges shorter than 512 units), sorted; none if not folding case.
+fn class_folds(ic: Case, ranges: &[(u16, u16)]) -> Vec<u16> {
+    if ic == Case::Exact {
+        return Vec::new();
+    }
+    let mut f: Vec<u16> =
+        ranges.iter().filter(|&&(lo, hi)| (lo..=hi).len() < 512).flat_map(|&(lo, hi)| lo..=hi).map(|x| ic.canon(x)).collect();
+    f.sort_unstable();
+    f.dedup();
+    f
+}
+
+/// [`in_class`], with `folds` the class's [`class_folds`].
+fn in_class_folded(ic: Case, ranges: &[(u16, u16)], folds: &[u16], neg: bool, c: u16) -> bool {
+    let has = |c: u16| ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+    let mut r = has(c);
+    if !r && ic != Case::Exact {
+        let u = ic.canon(c);
+        r = has(u) || folds.binary_search(&u).is_ok();
+    }
+    r != neg
+}
+
 /// The first of `units` (none to four) in `s` at or after `from`.
 fn find_any(s: &[u16], units: &[u16], from: usize) -> Option<usize> {
     // A pattern that starts with an empty class (`/[]a/`) has no first unit
@@ -2073,6 +2097,11 @@ struct Program {
     /// Classes' ranges and negation, for units past ASCII.
     /// (Ranges, negated, and whether for `Insn::Alone`.)
     classes: Vec<(Vec<(u16, u16)>, bool, bool)>,
+    /// For each class, folding case: the forms (`Case::canon`) of the units
+    /// of its ranges [`in_class`] folds, sorted, so that a unit's is looked
+    /// up rather than each such range's units folded at every test. (Made at
+    /// the first test of a unit past ASCII: most classes never see one.)
+    folds: Vec<std::cell::OnceCell<Vec<u16>>>,
     /// `Str`'s code units.
     strs: Vec<Vec<u16>>,
     /// `Astral`'s ranges.
@@ -2408,6 +2437,7 @@ impl Program {
                 let alone = matches!(n, Node::Alone(..));
                 let ascii = (0..128u16).filter(|&x| in_class(ic, r, *neg, x)).fold(0u128, |m, x| m | 1 << x);
                 self.classes.push((r.clone(), *neg, alone));
+                self.folds.push(std::cell::OnceCell::new());
                 let k = (self.classes.len() - 1) as u32;
                 if alone { Insn::Alone { ascii, k } } else { Insn::Class { ascii, k } }
             }
@@ -2589,12 +2619,21 @@ impl Program {
                 if c < 128 {
                     ascii >> c & 1 != 0
                 } else {
-                    let (r, neg, _) = &self.classes[k as usize];
-                    in_class(self.ic, r, *neg, c)
+                    self.class_matches(k, c)
                 }
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Whether class `k` has `c`, past ASCII. (Out of the matching loop:
+    /// inlined there, it took Octane's RegExp 4% more instructions without
+    /// the JIT.)
+    #[inline(never)]
+    fn class_matches(&self, k: u32, c: u16) -> bool {
+        let (r, neg, _) = &self.classes[k as usize];
+        let folds = self.folds[k as usize].get_or_init(|| class_folds(self.ic, r));
+        in_class_folded(self.ic, r, folds, *neg, c)
     }
 
     /// Run from `start` over `s`: whether a match begins there, its

@@ -5902,6 +5902,7 @@ impl Vm {
         v.extend(self.agent.roots());
         v.extend(self.temporal.roots());
         v.extend_from_slice(&self.single_chars);
+        crate::realm::current_trace(self, &mut v);
         for r in &self.realms {
             r.trace(&mut v);
         }

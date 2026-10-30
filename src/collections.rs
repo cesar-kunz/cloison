@@ -777,7 +777,7 @@ fn weak_map_get(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn weak_map_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::WeakMap, "WeakMap.prototype.set")?;
     let (k, v) = (arg(a, 0), arg(a, 1));
-    if !can_be_held_weakly(vm, k) {
+    if !can_be_held_weakly(k) {
         return Err(Error::type_error("Invalid value used as weak map key"));
     }
     match find(o, k) {
@@ -796,7 +796,7 @@ fn weak_map_has(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `value` added for it first if it has none.
 fn get_or_insert<const WEAK: bool>(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of_map::<WEAK>(this, "getOrInsert")?;
-    let k = key_of::<WEAK>(vm, arg(a, 0))?;
+    let k = key_of::<WEAK>(arg(a, 0))?;
     if let Some(i) = find(o, k) {
         return Ok(slot(entries(o), i + 1));
     }
@@ -813,7 +813,7 @@ fn get_or_insert_computed<const WEAK: bool>(vm: &mut Vm, this: Value, a: &[Value
     if !is_callable(f) {
         return Err(Error::type_error("getOrInsertComputed: the callback is not a function"));
     }
-    let k = key_of::<WEAK>(vm, arg(a, 0))?;
+    let k = key_of::<WEAK>(arg(a, 0))?;
     if let Some(i) = find(o, k) {
         return Ok(slot(entries(o), i + 1));
     }
@@ -835,9 +835,9 @@ fn this_of_map<const WEAK: bool>(this: Value, method: &str) -> Result<*mut Objec
 
 /// A key as a map holds it: -0 as +0; for a `WeakMap`, only one that can
 /// be held weakly.
-fn key_of<const WEAK: bool>(vm: &Vm, k: Value) -> Result<Value> {
+fn key_of<const WEAK: bool>(k: Value) -> Result<Value> {
     if WEAK {
-        if !can_be_held_weakly(vm, k) {
+        if !can_be_held_weakly(k) {
             return Err(Error::type_error("Invalid value used as weak map key"));
         }
         Ok(k)
@@ -860,7 +860,7 @@ fn weak_set_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn weak_set_add(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::WeakSet, "WeakSet.prototype.add")?;
     let k = arg(a, 0);
-    if !can_be_held_weakly(vm, k) {
+    if !can_be_held_weakly(k) {
         return Err(Error::type_error("Invalid value used in weak set"));
     }
     if find(o, k).is_none() {
@@ -1282,11 +1282,11 @@ fn set_is_disjoint_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> 
 
 /// Whether `v` can be held weakly: an object, or a symbol not in the
 /// registry (`Symbol.for`'s).
-fn can_be_held_weakly(vm: &Vm, v: Value) -> bool {
+fn can_be_held_weakly(v: Value) -> bool {
     if is_object(v) {
         return true;
     }
-    crate::symbol::is_symbol(v) && !vm.symbol_registry.values().any(|&s| s == as_object(v))
+    crate::symbol::is_symbol(v) && !crate::symbol::is_registered(v)
 }
 
 /// `new WeakRef(target)`.
@@ -1295,7 +1295,7 @@ fn weak_ref_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Constructor WeakRef requires 'new'"));
     }
     let t = arg(a, 0);
-    if !can_be_held_weakly(vm, t) {
+    if !can_be_held_weakly(t) {
         return Err(Error::type_error("WeakRef: target must be an object or a non-registered symbol"));
     }
     let o = new_collection(vm, Class::WeakRef, Proto::WeakRef)?;
@@ -1339,14 +1339,14 @@ fn finalization_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn finalization_register(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::FinalizationRegistry, "FinalizationRegistry.prototype.register")?;
     let (target, held, token) = (arg(a, 0), arg(a, 1), arg(a, 2));
-    if !can_be_held_weakly(vm, target) {
+    if !can_be_held_weakly(target) {
         return Err(Error::type_error("FinalizationRegistry.prototype.register: invalid target"));
     }
     if same_value(target, held) {
         return Err(Error::type_error("FinalizationRegistry.prototype.register: target and holdings must not be same"));
     }
     if !token.is_undefined() {
-        if !can_be_held_weakly(vm, token) {
+        if !can_be_held_weakly(token) {
             return Err(Error::type_error("FinalizationRegistry.prototype.register: invalid unregister token"));
         }
         match find(o, token) {
@@ -1358,10 +1358,10 @@ fn finalization_register(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 }
 
 /// `registry.unregister(token)`: whether anything was registered with it.
-fn finalization_unregister(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+fn finalization_unregister(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::FinalizationRegistry, "FinalizationRegistry.prototype.unregister")?;
     let token = arg(a, 0);
-    if !can_be_held_weakly(vm, token) {
+    if !can_be_held_weakly(token) {
         return Err(Error::type_error("FinalizationRegistry.prototype.unregister: invalid unregister token"));
     }
     Ok(Value::from_bool(find(o, token).inspect(|&i| remove(o, i)).is_some()))

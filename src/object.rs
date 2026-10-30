@@ -284,6 +284,10 @@ pub const RAW_JSON: u8 = 64;
 /// false: see `builtins::note_legacy`); `LENGTH_READ_ONLY`'s bit, as
 /// regular expressions aren't arrays.
 pub const LEGACY_DISABLED: u8 = 64;
+/// A symbol in `Symbol.for`'s registry (`Vm::symbol_registry`), which
+/// `Symbol.keyFor` and `CanBeHeldWeakly` ask; `LENGTH_READ_ONLY`'s bit, as
+/// symbols aren't arrays.
+pub const REGISTERED_SYMBOL: u8 = 64;
 /// A plain object made by an `Error` constructor (`[object Error]`);
 /// `FN_NAME_DELETED`'s bit, as errors aren't functions.
 pub const ERROR: u8 = 128;

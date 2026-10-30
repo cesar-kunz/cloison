@@ -2299,7 +2299,10 @@ impl Vm {
             for v in self.string_constants() {
                 m.value(v);
             }
-            self.roots_report(m, "shapes, code, strings");
+            for v in self.registered_symbols() {
+                m.value(v);
+            }
+            self.roots_report(m, "shapes, code, strings, symbols");
         }
     }
 
@@ -2409,6 +2412,9 @@ impl Vm {
                 }
             }
             for v in self.string_constants() {
+                e.value(v);
+            }
+            for v in self.registered_symbols() {
                 e.value(v);
             }
             for i in 0..self.heap.gc.kept.len() {

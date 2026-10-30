@@ -375,12 +375,14 @@ measurement says the old generation fills with cells that die soon after.
    million cells and its heap at 640 MB.
 4. **References from Rust structures**: inline caches' holders
    (prototypes, cached callees), shapes' prototypes, call and
-   constructor sites, and cells compiled code embeds (each compiled
-   function records them). A major collection enumerates them. A minor
-   collection cannot afford to (there are hundreds of thousands of
-   inline-cache ways in TypeScript), so the store of a young cell into
-   one is logged (`Heap::note_external`) and the log is a root of the
-   next minor collection, after which the cell is old.
+   constructor sites, cells compiled code embeds (each compiled
+   function records them), the string constants and `Symbol.for`'s
+   registry (the agent's, every realm's; its symbols never die). A major
+   collection enumerates them. A minor collection cannot afford to
+   (there are hundreds of thousands of inline-cache ways in TypeScript),
+   so the store of a young cell into one is logged (`Heap::note`,
+   `Heap::note_slot`) and the log is a root of the next minor
+   collection, after which the cell is old.
 
 ### Safepoints
 

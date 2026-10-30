@@ -1235,18 +1235,26 @@ impl Vm {
             let blocked = match own {
                 Some(d) if d.is_data() => d.writable == Some(false),
                 Some(d) => d.set.is_some_and(|s| s.is_undefined()),
-                // (An array whose `length` is read-only doesn't grow.)
-                None if matches!(key, Key::Index(i) if unsafe {
-                    (*obj).class == Class::Array && i >= crate::far::array_length(obj) && (*obj).flags & LENGTH_READ_ONLY != 0
-                }) => true,
                 None => {
                     // An inherited read-only or a setter-less accessor
-                    // blocks too; else the object must be extensible.
+                    // blocks too, and an inherited setter is called whatever
+                    // the object's own state (OrdinarySet); else the property
+                    // is made on the object (one inherited writable or none),
+                    // which must be extensible, and an array whose `length`
+                    // is read-only doesn't grow.
                     let inherited = self.inherited_property(obj, key);
+                    let made = || {
+                        !Self::is_extensible(obj)
+                            || matches!(key, Key::Index(i) if unsafe {
+                                (*obj).class == Class::Array
+                                    && i >= crate::far::array_length(obj)
+                                    && (*obj).flags & LENGTH_READ_ONLY != 0
+                            })
+                    };
                     match inherited {
-                        Some(d) if d.is_data() => d.writable == Some(false),
+                        Some(d) if d.is_data() => d.writable == Some(false) || made(),
                         Some(d) => d.set.is_some_and(|s| s.is_undefined()),
-                        None => !Self::is_extensible(obj),
+                        None => made(),
                     }
                 }
             };

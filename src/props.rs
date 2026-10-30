@@ -138,6 +138,7 @@ impl Vm {
     /// `unique_shape`, dropping compiled code relying on the old shape only
     /// if `drop_code`.
     fn unique_shape_with(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, no_elements: bool, drop_code: bool) {
+        self.leave_dictionary(o);
         unsafe {
             let s = &*(*o).shape;
             let same_attrs = attrs.as_ref().is_none_or(|a| a == s.attrs());
@@ -171,6 +172,7 @@ impl Vm {
                 mark: Default::default(),
                 traced: Cell::new(0),
                 pinned: Cell::new(false),
+                dictionary: false,
             };
             crate::object::set_shape(o, self.add_shape(u));
             if drop_code {
@@ -190,6 +192,7 @@ impl Vm {
     /// see `Vm::sweep_shapes`); else a unique one (`unique_shape`).
     /// Compiled code relying on the old shape is dropped.
     fn fix_shape(&mut self, o: *mut Object, attrs: Option<Vec<u8>>, level: u8) {
+        self.leave_dictionary(o);
         unsafe {
             let s = &*(*o).shape;
             if s.unique {
@@ -226,6 +229,7 @@ impl Vm {
                         mark: Default::default(),
                         traced: Cell::new(0),
                         pinned: Cell::new(false),
+                        dictionary: false,
                     });
                     self.add_transition(s, FIXED_KEY, level, t);
                     t
@@ -241,6 +245,7 @@ impl Vm {
     /// with it, which compiled code hasn't seen (see
     /// `builtins::mapped_arguments_object`).
     pub(crate) fn no_elements_copy(&mut self, s: *const Shape) -> *const Shape {
+        debug_assert!(unsafe { !(*s).dictionary });
         let s = unsafe { &*s };
         self.add_shape(Shape {
             class: s.class,
@@ -262,6 +267,7 @@ impl Vm {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
         })
     }
 
@@ -282,6 +288,7 @@ impl Vm {
     /// stores' fast paths again: the array shape moved to its elements'
     /// type if it has no properties, else a unique shape of that type.
     pub(crate) fn dense_elements(&mut self, o: *mut Object) {
+        self.leave_dictionary(o);
         unsafe {
             let mut elems = FieldType::None;
             for k in 0..(*o).elems_len as usize {
@@ -318,6 +325,7 @@ impl Vm {
                 mark: Default::default(),
                 traced: Cell::new(0),
                 pinned: Cell::new(false),
+                dictionary: false,
             };
             crate::object::set_shape(o, self.add_shape(u));
             if (*o).flags & crate::object::PROTOTYPE != 0 {
@@ -1055,6 +1063,7 @@ impl Vm {
     /// Change `o`'s prototype to `proto` (an object or null): whether it
     /// could be (not when `o` isn't extensible, nor to a cycle).
     pub(crate) fn set_prototype_of(&mut self, o: *mut Object, proto: Value) -> bool {
+        self.leave_dictionary(o);
         unsafe {
             let s = &*(*o).shape;
             if s.proto == proto {
@@ -1097,6 +1106,7 @@ impl Vm {
                 mark: Default::default(),
                 traced: Cell::new(0),
                 pinned: Cell::new(false),
+                dictionary: false,
             };
             crate::object::set_shape(o, self.add_shape(u));
             self.bump_code_epoch();

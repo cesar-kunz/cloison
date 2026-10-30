@@ -286,6 +286,10 @@ pub(crate) fn as_field(ft: FieldType, v: Value) -> Value {
 /// (the site is megamorphic), `e` replaces way 0, and the result is true.
 unsafe fn install(ic: *mut Ic, e: Ic) -> bool {
     unsafe {
+        // (Nor a dictionary shape, changed in place: see `Shape::dictionary`.)
+        if !e.shape.is_null() && (*e.shape).dictionary {
+            return false;
+        }
         for k in 0..IC_WAYS {
             let w = &mut *ic.add(k);
             if w.shape.is_null() || w.shape == e.shape {
@@ -307,7 +311,7 @@ unsafe fn install(ic: *mut Ic, e: Ic) -> bool {
 unsafe fn note_accessor(ic: *mut Ic, shape: *const Shape, holder: *mut Object, epoch: u32) {
     unsafe {
         let ours = |w: &Ic| w.loc == ACCESSOR_LOC && w.epoch == epoch && w.holder == holder;
-        if !(*ic).shape.is_null() || ours(&*ic) && (*ic).new_shape.is_null() {
+        if (*shape).dictionary || !(*ic).shape.is_null() || ours(&*ic) && (*ic).new_shape.is_null() {
             return;
         }
         let e = Ic {
@@ -673,6 +677,9 @@ pub struct Vm {
     /// `free_condemned_shapes`). (After the shapes: dropped after their
     /// tables.)
     field_cells: crate::object::CellSlab,
+    /// The field cell of every dictionary shape's slots (`Any`, mutable,
+    /// held for good: see `Shape::dictionary`); null till the first.
+    dictionary_cell: *const FieldCell,
     roots: HashMap<(Class, u64, u32), *const Shape>,
     /// The transitions of shapes with [`WIDE_TRANSITIONS`] or more, by
     /// shape, property and attributes, as their `transitions` lists them
@@ -1096,6 +1103,7 @@ impl Vm {
             shapes_made: 0,
             cells_made: 0,
             field_cells: Default::default(),
+            dictionary_cell: std::ptr::null(),
             roots: HashMap::default(),
             wide_transitions: Default::default(),
             atoms: Vec::new(),
@@ -1971,6 +1979,7 @@ impl Vm {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
         });
         self.roots.insert(key, s);
         s
@@ -2002,6 +2011,7 @@ impl Vm {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
         })
     }
 
@@ -2028,6 +2038,13 @@ impl Vm {
         if name == self.a_sym_has_instance {
             self.has_instance_defined = true;
         }
+        // A dictionary shape gets the property in place.
+        if s.dictionary {
+            let cell = self.dictionary_cell();
+            let slots = s.slots.with(name, attrs, cell);
+            unsafe { Shape::dictionary_mut(shape).slots = slots };
+            return shape;
+        }
         let cell = self.new_field_cell();
         let slots = s.slots.with(name, attrs, cell);
         let t = self.add_shape(Shape {
@@ -2051,6 +2068,7 @@ impl Vm {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
         });
         if !s.unique {
             self.shape_left_stable(s);
@@ -2095,6 +2113,8 @@ impl Vm {
             if (*o).flags & PROTOTYPE != 0 {
                 return;
             }
+            // (V8 makes a prototype fast again: `ReoptimizeIfPrototype`.)
+            self.leave_dictionary(o);
             (*o).flags |= PROTOTYPE;
             let s = &*(*o).shape;
             // The object leaves `s` (for a copy of its own).
@@ -2119,6 +2139,7 @@ impl Vm {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
             };
             crate::object::set_shape(o, self.add_shape(u));
         }
@@ -2486,6 +2507,8 @@ impl Vm {
         elems: FieldType,
     ) -> *const Shape {
         let s = unsafe { &*shape };
+        // (A dictionary shape's elements are `Any`: none.)
+        debug_assert!(!s.dictionary);
         if !s.unique && !s.fixed {
             let ts = s.elem_transitions.borrow();
             if let Some(&(_, t)) = ts.iter().find(|(e, _)| *e == elems) {
@@ -2519,6 +2542,7 @@ impl Vm {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
         });
         if !s.unique {
             self.shape_left_stable(s);
@@ -2580,6 +2604,9 @@ impl Vm {
     /// and its slot there.
     pub(crate) fn lookup(&self, o: *mut Object, name: Atom) -> Option<(*mut Object, u32)> {
         let shape = unsafe { (*o).shape };
+        if unsafe { (*shape).dictionary } {
+            return self.lookup_uncached(o, name);
+        }
         let e = &self.lookups[lookup_index(shape, name)];
         let c = e.get();
         if c.shape == shape && c.name == name.0 {
@@ -2628,7 +2655,7 @@ impl Vm {
         }
         let o = as_object(o);
         unsafe {
-            if (*o).class != Class::Plain || (*o).flags & PROTOTYPE != 0 || o == self.global {
+            if (*o).class != Class::Plain || (*o).flags & PROTOTYPE != 0 || o == self.global || (*(*o).shape).dictionary {
                 return;
             }
             let new = (*o).shape;
@@ -2686,7 +2713,7 @@ impl Vm {
             return;
         }
         let o = as_object(o);
-        if unsafe { (*o).class } == Class::TypedArray {
+        if unsafe { (*o).class == Class::TypedArray || (*(*o).shape).dictionary } {
             return;
         }
         let Some((h, slot)) = self.lookup(o, name) else { return };
@@ -3366,6 +3393,7 @@ impl Vm {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
                 };
                 crate::object::set_shape(o, self.add_shape(u));
                 self.bump_code_epoch();
@@ -3729,6 +3757,22 @@ impl Vm {
             if !force && s.attrs()[slot as usize] & DONT_DELETE != 0 {
                 return false;
             }
+            // An ordinary object deleting again (its shape unique: a
+            // delete's copy, or a property added since) goes to dictionary
+            // mode, where its deletes and adds change its shape in place
+            // (V8 normalizes at the first: `LookupIterator::Delete`). At its
+            // first delete it gets a unique shape of its own, which caches
+            // still hold: objects that delete once and are read after keep
+            // their reads cached (100 such objects read 2M times took 5.6
+            // times as long in dictionary mode). Other objects get a unique
+            // shape for each delete.
+            if !s.dictionary && s.unique && self.may_be_dictionary(o) {
+                self.to_dictionary(o);
+            }
+            if (*(*o).shape).dictionary {
+                self.dict_remove(o, slot);
+                return true;
+            }
             let n = s.keys().len() as u32;
             let kept: Vec<u32> = (0..n).filter(|&k| k != slot).collect();
             let values: Vec<Value> = kept
@@ -3769,6 +3813,7 @@ impl Vm {
                 mark: Default::default(),
                 traced: Cell::new(0),
                 pinned: Cell::new(false),
+                dictionary: false,
             };
             let new = self.add_shape(u);
             crate::object::set_shape(o, new);
@@ -3784,6 +3829,129 @@ impl Vm {
                 self.bump_code_epoch();
             }
             true
+        }
+    }
+
+    /// Whether `o` may go to dictionary mode: a plain object, not a
+    /// prototype (lookups through prototypes cache their shapes, V8 keeps
+    /// them fast too), nor the global object, nor with flags (not
+    /// extensible, sealed, frozen, elements with attributes: rare, and
+    /// their shapes are made by `props`).
+    fn may_be_dictionary(&self, o: *mut Object) -> bool {
+        unsafe { (*o).class == Class::Plain && (*o).flags & !crate::object::EXTERNAL == 0 && o != self.global }
+    }
+
+    /// The field cell of dictionary shapes' slots.
+    fn dictionary_cell(&mut self) -> *const FieldCell {
+        if self.dictionary_cell.is_null() {
+            let c = self.field_cells.alloc();
+            unsafe {
+                (*c).set(FieldType::Any);
+                (*c).make_mutable();
+                (*c).hold();
+            }
+            self.dictionary_cell = c;
+        }
+        self.dictionary_cell
+    }
+
+    /// Give `o` a dictionary shape (see `Shape::dictionary`) with the slots
+    /// it has: its values stay where they are.
+    fn to_dictionary(&mut self, o: *mut Object) {
+        unsafe {
+            let s = &*(*o).shape;
+            self.shape_left(s);
+            for &cell in s.fields() {
+                self.field_made_mutable(&*cell);
+            }
+            let cell = self.dictionary_cell();
+            let fields = vec![cell; s.keys().len()];
+            let d = self.add_shape(Shape {
+                class: s.class,
+                proto: s.proto,
+                capacity: Cell::new(s.capacity.get()),
+                slots: Slots::new(s.keys(), s.attrs(), &fields),
+                // (Elements of any type: no transition, which would copy
+                // the shape.)
+                elems: FieldType::Any,
+                elems_code: FieldType::Any.encode(),
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: true,
+                fixed: false,
+                transitions: RefCell::default(),
+                elem_transitions: RefCell::default(),
+                relied: Cell::new(false),
+                left: Cell::new(true),
+                lineage_relied: Cell::new(false),
+                parent: std::ptr::null(),
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
+                dictionary: true,
+            });
+            crate::object::set_shape(o, d);
+        }
+    }
+
+    /// Remove slot `k` of `o`, of a dictionary shape, in place: the values
+    /// of the slots after it move down one.
+    fn dict_remove(&mut self, o: *mut Object, k: u32) {
+        unsafe {
+            let s = (*o).shape;
+            let n = (*s).keys().len() as u32;
+            for j in k + 1..n {
+                let v = *Object::slot(o, (*s).location(j));
+                let at = Object::slot(o, (*s).location(j - 1));
+                *at = v;
+                crate::heap::barrier(o.cast(), at, v);
+            }
+            *Object::slot(o, (*s).location(n - 1)) = Value::UNDEFINED;
+            Shape::dictionary_mut(s).slots.remove(k);
+        }
+    }
+
+    /// Before `o`'s shape is copied (attributes, the prototype, extensibility
+    /// change, it becomes a prototype): out of dictionary mode, to a unique
+    /// shape with a table and cells of its own (`Any`), so that the copies
+    /// don't share a table that changes.
+    pub(crate) fn leave_dictionary(&mut self, o: *mut Object) {
+        unsafe {
+            let s = &*(*o).shape;
+            if !s.dictionary {
+                return;
+            }
+            let fields: Vec<*const FieldCell> = (0..s.keys().len())
+                .map(|_| {
+                    let c = self.new_field_cell();
+                    (*c).set(FieldType::Any);
+                    (*c).make_mutable();
+                    c
+                })
+                .collect();
+            let u = self.add_shape(Shape {
+                class: s.class,
+                proto: s.proto,
+                capacity: Cell::new(s.capacity.get()),
+                slots: Slots::new(s.keys(), s.attrs(), &fields),
+                elems: s.elems,
+                elems_code: s.elems_code,
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: true,
+                fixed: false,
+                transitions: RefCell::default(),
+                elem_transitions: RefCell::default(),
+                relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: std::ptr::null(),
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
+                dictionary: false,
+            });
+            crate::object::set_shape(o, u);
         }
     }
 
@@ -4918,6 +5086,7 @@ impl Vm {
     /// through one new shape (no transition leads to it; startup made one
     /// shape per builtin, and copied its keys each time).
     pub(crate) fn add_properties(&mut self, o: *mut Object, names: &[Atom], values: &[Value], attrs: u8) {
+        self.leave_dictionary(o);
         unsafe {
             let s = &*(*o).shape;
             let n = s.keys().len() + names.len();
@@ -4959,6 +5128,7 @@ impl Vm {
                 mark: Default::default(),
                 traced: Cell::new(0),
                 pinned: Cell::new(false),
+                dictionary: false,
             });
             // Out-of-line room for the slots past the object's capacity.
             let cap = (*new).capacity.get() as usize;
@@ -5100,7 +5270,10 @@ impl Vm {
             cap.set(n.min(MAX_INLINE_CAPACITY));
         }
         let seen = code.ctor_result.get();
-        if seen.is_null() {
+        // (A dictionary shape changes in place: as many.)
+        if unsafe { (*shape).dictionary } {
+            code.ctor_result.set(MANY_SHAPES);
+        } else if seen.is_null() {
             code.ctor_result.set(shape);
         } else if seen != shape {
             code.ctor_result.set(MANY_SHAPES);

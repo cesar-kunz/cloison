@@ -305,6 +305,40 @@ These slots are the **type feedback** the JIT needs. With objects, the types
 of the values at entry say nothing about the shapes a loop will see, but
 the inline caches do. That's why tiering is the default.
 
+### Deletes and dictionary mode
+
+A `delete` gives the object a **unique** shape of its own: a copy without
+the property, with a table and field cells of its own (`Vm::remove_named`).
+Caches still hold it, so an object that deletes once and is read after
+keeps its reads cached. A plain object deleting **again** (not a
+prototype, nor the global object, nor one with flags) goes to **dictionary
+mode** (`Shape::dictionary`): its shape is its own and changes in place, a
+delete moving the slots after the property down one (`Vm::dict_remove`),
+an add appending one (`Vm::transition_with`), the fields all one cell
+typed `Any` (`Vm::dictionary_cell`). No new shape, table or cell per add
+or delete: one object's add/delete churn makes none (del.js, issue #6:
+14.5 s and 718 MB at c0dc14c, 1 s and 16 MB).
+
+Since its slots change without its address changing, nothing may rely on
+one: no inline cache holds one (`install`, `note_accessor`), nor the VM's
+lookup, megamorphic load and store tables (`Vm::lookup`, `mega_note`,
+`mega_store_note`), nor a constructor's result (`construct_done`), nor a
+field's or the elements' type (`FieldType::of`, `push_key`), nor the JIT's
+types (`Ty::of`); its elements are `Any`, so no elements transition copies
+it. Every access to it takes the miss path. Anything else that would copy
+its shape (attributes, extensibility, the prototype, becoming a prototype,
+elements with attributes) first leaves dictionary mode for a unique shape
+(`Vm::leave_dictionary`).
+
+V8 (`LookupIterator::Delete`, `Map::Normalize`) normalizes at the first
+delete instead, to a dictionary map that objects normalized alike share,
+their properties in each one's own hash table; its inline caches keep
+that map with handlers that look the name up there (`LoadNormal`,
+`StoreNormal`). Here the shape's slots stay what every generic path reads
+(keys, descriptors, `for-in`, JSON, freezing), and the miss path does the
+lookup; a handler of that kind is the next step if objects in dictionary
+mode turn out hot at cached sites.
+
 ## The JIT
 
 - **Property-access stencils** with the shape check and offset patched in as

@@ -2834,7 +2834,9 @@ impl Ty {
         } else if v.is_double() {
             Ty::F64
         } else if v.is_cell() {
-            Ty::Obj(unsafe { *(v.to_bits() as *const u64) })
+            // (Not a dictionary shape's object: its slots change in place.)
+            let w = unsafe { *(v.to_bits() as *const u64) };
+            if w & 1 == 0 && unsafe { (*(w as *const Shape)).dictionary } { Ty::Any } else { Ty::Obj(w) }
         } else {
             Ty::Any
         }

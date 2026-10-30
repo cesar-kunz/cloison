@@ -884,7 +884,8 @@ pub struct Vm {
     pub(crate) template_cache: crate::jit::HashMap<u64, *mut Object>,
     /// Symbols, by their key atoms (see `symbol`).
     pub(crate) symbols: crate::jit::HashMap<Atom, *mut Object>,
-    /// `Symbol.for`'s registry.
+    /// `Symbol.for`'s registry, the agent's (every realm's): its symbols
+    /// never die (see `registered_symbols`).
     pub(crate) symbol_registry: crate::jit::HashMap<Vec<u16>, *mut Object>,
     pub(crate) symbol_count: u64,
     /// `Symbol.prototype`, the iterator prototypes, … (see `symbol::Root`).
@@ -5926,6 +5927,12 @@ impl Vm {
     /// The string constants (see [`Vm::string_constant`]).
     pub(crate) fn string_constants(&self) -> Vec<Value> {
         self.strings.values().copied().collect()
+    }
+
+    /// `Symbol.for`'s symbols, roots for as long as the agent lives (a
+    /// young one is also in the log when registered: see `symbol_for`).
+    pub(crate) fn registered_symbols(&self) -> Vec<Value> {
+        self.symbol_registry.values().map(|&o| object_value(o)).collect()
     }
 
     /// Whether functions are compiled warm first, then hot, or hot from

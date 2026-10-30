@@ -10572,3 +10572,73 @@ Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then
     let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("a1:start|a2:start|a1:start|arrow|p1|a1:1|a2:caught x|a1:1|m true|p2|a1:2|a2 rejected TypeError|a1:2|fa 1|ag 1|p3|a1 done r1|a4|then called|fa 2|a3:7|ag 2|a4 done 7|n=1000"));
 }
+
+#[test]
+fn registered_symbols_survive_collections() {
+    // `Symbol.for`'s registry is the agent's, every realm's, and its
+    // symbols live as long as it (GlobalSymbolRegistry): roots of every
+    // collection, a young one logged when registered. It wasn't one: a
+    // symbol only it held was freed, and `Symbol.for` handed the dead cell
+    // out (`2 is not a symbol`). Symbols registered and dropped young and
+    // old, `keyFor` after collections, registered symbols rejected as weak
+    // keys, targets and tokens and others taken give what SpiderMonkey,
+    // JavaScriptCore and QuickJS do (another realm's part SpiderMonkey's
+    // and JavaScriptCore's with their own globals), with collections every
+    // 64 KB and freed memory poisoned too.
+    let src = r#"
+var out = [];
+function churn(n) { var junk; for (var r = 0; r < n; r++) { junk = []; for (var i = 0; i < 20000; i++) junk.push({ a: i, b: [i], c: String(i) }); } }
+// Registered and dropped: only the registry holds them, young or old.
+for (var i = 0; i < 2000; i++) Symbol.for("k" + i);
+churn(10);
+$262.gc();
+churn(5);
+var bad = 0;
+for (var i = 0; i < 2000; i++) if (Symbol.keyFor(Symbol.for("k" + i)) !== "k" + i) bad++;
+out.push(bad);
+// The same symbol before and after collections.
+var kept = Symbol.for("kept");
+var desc = Symbol.for("d" + 1).description;
+churn(5); $262.gc();
+out.push(Symbol.for("kept") === kept, Symbol.keyFor(kept), desc, Symbol.for("d1").toString());
+// Registered while the nursery fills, each one alone in the registry.
+var ok = 0;
+for (var i = 0; i < 300; i++) { Symbol.for("y" + i); churn(1); }
+for (var i = 0; i < 300; i++) if (Symbol.keyFor(Symbol.for("y" + i)) === "y" + i) ok++;
+out.push(ok);
+// keyFor: unregistered, well-known, empty key, non-string keys.
+out.push(Symbol.keyFor(Symbol("k1")), Symbol.keyFor(Symbol.iterator), Symbol.keyFor(Symbol.for("")) === "", Symbol.keyFor(Symbol.for(undefined)), Symbol.for(12) === Symbol.for("12"));
+try { Symbol.keyFor("k1"); } catch (e) { out.push(e.constructor.name); }
+// Registered symbols can't be held weakly; others can.
+function tryIt(f) { try { f(); return "ok"; } catch (e) { return e.constructor.name; } }
+var reg = Symbol.for("k7"), plain = Symbol("k7");
+var wm = new WeakMap(), ws = new WeakSet();
+out.push(tryIt(function () { wm.set(reg, 1); }), tryIt(function () { ws.add(reg); }),
+  tryIt(function () { new WeakRef(reg); }), tryIt(function () { new FinalizationRegistry(function () {}).register(reg, 1); }),
+  tryIt(function () { new FinalizationRegistry(function () {}).register({}, 1, reg); }),
+  tryIt(function () { new FinalizationRegistry(function () {}).unregister(reg); }),
+  wm.has(reg), ws.has(reg), wm.get(reg), wm.delete(reg));
+out.push(tryIt(function () { wm.set(plain, 2); }), wm.get(plain), tryIt(function () { ws.add(Symbol.iterator); }), ws.has(Symbol.iterator),
+  tryIt(function () { new WeakRef(plain); }));
+churn(3); $262.gc();
+out.push(wm.get(plain), ws.has(Symbol.iterator), tryIt(function () { wm.set(Symbol.for("k1999"), 1); }));
+// Another realm's registry is this one's.
+var g = $262.createRealm().global;
+var s = Symbol.for("rk");
+churn(2);
+out.push(g.Symbol.for("rk") === s, g.Symbol.keyFor(s), g.eval("Symbol.for('rk2')") === Symbol.for("rk2"), Symbol.keyFor(g.Symbol.for("rk3")));
+out.join(" ");
+"#;
+    let want = "0 true kept d1 Symbol(d1) 300   true undefined true TypeError TypeError TypeError TypeError TypeError \
+                TypeError TypeError false false  false ok 2 ok true ok 2 true TypeError true rk true rk3";
+    assert_eq!(value(src), want);
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_gc_verify(64 << 10);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
+        vm.heap.verify();
+    }
+}

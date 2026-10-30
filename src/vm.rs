@@ -4739,6 +4739,27 @@ impl Vm {
         }
     }
 
+    /// `o` frozen: if a mapped `arguments` object, each element still
+    /// mapped gets its parameter's value and is unmapped, as a non-writable
+    /// definition of it does (`define_own_property`; the arguments object's
+    /// [[DefineOwnProperty]]).
+    pub(crate) fn unmap_arguments(&mut self, o: *mut Object) {
+        let Some(m) = self.mapped_args.iter_mut().rev().find(|m| m.o == o) else {
+            return;
+        };
+        for i in 0..m.mapped.len() {
+            if m.mapped[i] && (i as u32) < unsafe { (*o).elems_len } {
+                unsafe {
+                    let v = m.value(i);
+                    let at = (*o).elems.add(i);
+                    *at = v;
+                    crate::heap::barrier(o.cast(), at, v);
+                }
+            }
+            m.mapped[i] = false;
+        }
+    }
+
     /// The mapped `arguments` objects of frames at or past `level`, ended:
     /// their elements get the parameters' values.
     fn release_mapped(&mut self, level: *mut Value) {

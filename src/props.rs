@@ -586,6 +586,7 @@ impl Vm {
                 self.protect_indices();
             }
             if freeze {
+                self.unmap_arguments(o);
                 (*o).flags |= FROZEN;
                 // (The bit is a function's `FN_LENGTH_DELETED`.)
                 if (*o).class == Class::Array {

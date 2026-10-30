@@ -859,12 +859,17 @@ fn macho_holes(name: &str, code: &mut [u8], relocs: &mut Vec<Reloc>) {
         if imm & 0xFF00 != 0xB000 || !(1..=4).contains(&hole) || part > 3 {
             continue;
         }
-        // `movz` or `movk`, 32- or 64-bit, shifted by the part.
-        let movw = matches!(i & 0x7F80_0000, 0x5280_0000 | 0x7280_0000);
+        // `movz` or `movk`, 32- or 64-bit, shifted by the part. (Another
+        // instruction's register fields can spell the pattern: `cmp x19,
+        // x22` is 0xeb16027f, bits 5..20 0xB013.)
+        if !matches!(i & 0x7F80_0000, 0x5280_0000 | 0x7280_0000) {
+            continue;
+        }
         assert!(
-            movw && (i >> 21) & 3 == part,
-            "stencil {name}: {i:#010x} at {off:#x} has a hole's magic immediate \
-             but isn't a movz/movk of part {part}"
+            (i >> 21) & 3 == part,
+            "stencil {name}: {i:#010x} at {off:#x} is a movz/movk of a hole's magic immediate \
+             but shifted as part {} and not {part}",
+            (i >> 21) & 3
         );
         relocs.push(Reloc {
             offset: off as u64,

@@ -7076,6 +7076,38 @@ Promise.resolve().then(() => {
     assert_eq!(vm.run(&second).map(display).unwrap(), "219990000 182280000 true 39 40 true");
 }
 
+/// A function the JIT took (compiled, its enclosing one pinned to fold
+/// its variables) that can't run again, no closure of it left, keeps
+/// neither its compiled code nor what that embeds: eval'd functions, each
+/// compiled for a loop over an array it closes over, then dropped, leave
+/// their arrays to be collected (none went: their codes are never freed,
+/// and were live for good).
+#[test]
+fn compiled_functions_no_longer_reachable_drop_their_code() {
+    let first = cloison::js::compile(
+        r#"
+var refs = [], sum = 0, out = [];
+for (var k = 0; k < 30; k++) {
+  var p = (0, eval)("(function () { var big = [" + k + ", 1, 2]; " +
+    "return [big, function (n) { var s = 0; for (var i = 0; i < n; i++) s += big[i % 3]; return s; }]; })()");
+  refs.push(new WeakRef(p[0]));
+  sum += p[1](20000);
+  p = null;
+}
+Promise.resolve().then(() => {
+  $262.gc();
+  $262.gc();
+  out.push(sum, refs.filter(r => r.deref() === undefined).length >= 25);
+});
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("out.join(' ')").unwrap();
+    let mut vm = Vm::new();
+    vm.run(&first).unwrap();
+    assert_eq!(vm.run(&second).map(display).unwrap(), "3500115 true");
+}
+
 /// `FinalizationRegistry`'s API: registering (argument checks, unregister
 /// tokens counted, held weakly) and unregistering.
 #[test]

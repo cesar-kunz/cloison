@@ -7021,6 +7021,61 @@ Promise.resolve().then(() => {
     );
 }
 
+/// The cells compiled code embeds go with it: a loop compiled again for
+/// each closure it calls (each of its own code, inlined, its array a
+/// constant upvalue) keeps the arrays of the versions it dropped no more
+/// (all but the last 4 compiled; with every cell compiled code ever
+/// embedded kept for good, only 4 went). And the converse: a compiled loop
+/// still calls the closure it checks for, and only that one, after the
+/// program drops it and makes others, collections in between.
+#[test]
+fn compiled_code_keeps_its_cells_while_it_lives() {
+    let first = cloison::js::compile(
+        r#"
+var refs = [], last;
+function make(k) {
+  var p = (0, eval)("(function () { var o = [" + k + "]; " +
+    "return [o, function (i) { return o[0] + i; }]; })()");
+  refs.push(new WeakRef(p[0]));
+  return p[1];
+}
+function run() {
+  var sum = 0;
+  for (var k = 0; k < 40; k++) {
+    var f = make(k);
+    for (var i = 0; i < 3000; i++) sum += f(i);
+    last = f;
+  }
+  return sum;
+}
+var s = run(), out = [];
+function loop(g, n) { var t = 0; for (var i = 0; i < n; i++) t += g(i); return t; }
+function mk(n) { return (0, eval)("(function (i) { return i + " + n + "; })"); }
+var a = mk(1000);
+out.push(loop(a, 20000));
+a = null;
+Promise.resolve().then(() => {
+  $262.gc();
+  $262.gc();
+  var dead = refs.filter(r => r.deref() === undefined).length;
+  out.push(s, dead >= 30, refs[39].deref()[0], last(1));
+  var ok = true;
+  for (var k = 0; k < 200; k++) {
+    var b = mk(k);
+    if (loop(b, 100) !== 4950 + 100 * k) ok = false;
+    if (k % 50 == 0) $262.gc();
+  }
+  out.push(ok);
+});
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("out.join(' ')").unwrap();
+    let mut vm = Vm::new();
+    vm.run(&first).unwrap();
+    assert_eq!(vm.run(&second).map(display).unwrap(), "219990000 182280000 true 39 40 true");
+}
+
 /// `FinalizationRegistry`'s API: registering (argument checks, unregister
 /// tokens counted, held weakly) and unregistering.
 #[test]

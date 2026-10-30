@@ -9830,7 +9830,11 @@ impl JitCode {
                     Sym::HoleImm64 if s.stencil().name == "exit_tail" => base,
                     // A cell, or an address in one, that the code embeds
                     // (a folded constant, a callee it checks for, a
-                    // prototype's slot): kept alive (see `gc`).
+                    // prototype's slot): kept alive while the code lives
+                    // (see `gc::KeptCells`). Not a number: a modulo's
+                    // magic multiplier (`mod_smi_iif`'s ⌈2^64 / k⌉ is
+                    // 0x7FFF_C000_7FFF for k = 131,073, where a heap may
+                    // well be).
                     // A shape it gives objects is pinned (see `Shape::pinned`),
                     // as a zombie it compares with is (never freed: see
                     // `Vm::free_zombies`).
@@ -9839,7 +9843,9 @@ impl JitCode {
                         let vm = crate::interp::current_vm();
                         if !vm.is_null() {
                             unsafe {
-                                (*vm).heap.keep(v as usize);
+                                if !s.stencil().name.starts_with("mod_smi") {
+                                    (*vm).heap.keep(v as usize);
+                                }
                                 if crate::object::is_shape_address(v as usize) {
                                     crate::object::pin_shape(v as *const Shape);
                                 }

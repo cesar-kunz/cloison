@@ -381,7 +381,9 @@ impl Heap {
     /// address `a`: compiled code embedding it, a call site caching it. A
     /// root until [`Heap::kept_since`] gives it to that structure.
     pub fn keep(&mut self, a: usize) {
-        if self.contains(a) && self.gc.pending_kept.last() != Some(&a) {
+        // (Only an address in a cell: what isn't one marks nothing, and
+        // needn't be listed.)
+        if self.contains(a) && self.gc.pending_kept.last() != Some(&a) && self.cell_containing(a).is_some() {
             self.gc.pending_kept.push(a);
             self.gc.log_kept.push(a);
         }
@@ -422,7 +424,7 @@ impl Heap {
 
     /// Add address `a` to what `k` keeps, at once.
     pub(crate) fn keep_in(&mut self, k: &mut KeptCells, a: usize) {
-        if !self.contains(a) || k.addrs.contains(&a) {
+        if k.addrs.contains(&a) || self.cell_containing(a).is_none() {
             return;
         }
         if k.table.is_none() {

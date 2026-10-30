@@ -17464,7 +17464,9 @@ extern "C" fn cloison_rt_materialize(regs: Value, mat: Value) -> u64 {
 
 /// `array_push` stencils, when the value doesn't fit the elements' type or
 /// the elements are full: `Array.prototype.push` of `v` onto `a` (an
-/// array), its new length.
+/// array), its new length. (Not for an array with flags, which the
+/// interpreter's push takes through the generic stores: they throw, or
+/// call an inherited setter. The stencils leave for it first.)
 /// Room in object `o`'s out-of-line slots for slot `i` (an int32), for a
 /// transition's store there (`set_tro` stencils): 1.
 extern "C" fn cloison_rt_props_room(o: Value, i: Value) -> u64 {

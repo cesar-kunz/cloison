@@ -6962,6 +6962,11 @@ fn is_array(tag: NumberTag, a: Value) -> bool {
 /// An array whose `pop` the interpreter's does (see `array_pop_`).
 const POP_EXIT_FLAGS: u8 = SPARSE | SEALED | FROZEN | LENGTH_READ_ONLY | FAR;
 
+/// An array whose `push` the interpreter's does: any flag but `EXTERNAL`
+/// and `object::PROTOTYPE` (2) sends `vm::array_push` through the generic
+/// stores, which throw, or call an inherited setter.
+const PUSH_EXIT_FLAGS: u8 = !(EXTERNAL | 2);
+
 /// Cell `a`'s class and, above it, those of its flags in
 /// [`POP_EXIT_FLAGS`], in one load: `class::ARRAY` for an array compiled
 /// code pops.
@@ -7000,6 +7005,10 @@ macro_rules! array_methods {
             let v = s.acc;
             let o = a.to_bits() as *mut u8;
             let len = (*header(o)).elems_len;
+            // (Before anything changes: the interpreter does it all.)
+            if (*cell(a)).flags & PUSH_EXIT_FLAGS != 0 {
+                exit!(s)
+            }
             first_elements(o);
             if len < elems_cap(header(o)) {
                 let to = push_transition(s.tag, shape_of(o), v);
@@ -7042,6 +7051,10 @@ macro_rules! array_methods {
             let v = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             let o = a.to_bits() as *mut u8;
             let len = (*header(o)).elems_len;
+            // (Before anything changes: the interpreter does it all.)
+            if (*cell(a)).flags & PUSH_EXIT_FLAGS != 0 {
+                exit!(s)
+            }
             first_elements(o);
             if len < elems_cap(header(o)) {
                 let to = push_transition(s.tag, shape_of(o), v);

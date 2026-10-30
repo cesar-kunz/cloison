@@ -10128,3 +10128,32 @@ out.join("|")
 "#;
     assert_eq!(value(src), "10586|falseNaN01.5D31234567890142nulltrue1e+210101,2,3o-7undefined|42123456789013D1.50NaNfalseundefined-7o1,2,31001e+21truenull|A2.5|2.5A|abba|xxxxxxxxxxxxxxxxxxxx0.25truenull0.25truenull0.25truenull0.25truenull0.25truenull|TypeError|TypeError");
 }
+
+#[test]
+fn case_folded_classes_test_units_past_ascii_as_before() {
+    // Classes folding case (`i`, `iu`, `iv`) look a unit's form up among
+    // their short ranges' folded units, kept sorted (made at the first unit
+    // past ASCII tested), rather than folding them all at each test: 300
+    // random classes of units that fold in special ways give what V8,
+    // SpiderMonkey, JavaScriptCore and QuickJS do.
+    let src = r#"
+var seed = 7, out = [];
+function rnd(n) { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed % n; }
+var pool = [0x41, 0x61, 0xb5, 0xc0, 0xdf, 0xe0, 0xff, 0x130, 0x131, 0x17f, 0x1c4, 0x1c5, 0x1c6, 0x370, 0x390, 0x3a3, 0x3c2, 0x3c3, 0x400, 0x430, 0x1e9e, 0x2126, 0x212a, 0x212b, 0x2c00, 0x2c30, 0xa640, 0xa641, 0xff21, 0xff41];
+function hex(c) { return "\\u" + ("000" + c.toString(16)).slice(-4); }
+for (var k = 0; k < 300; k++) {
+  var src = "[" + (rnd(3) == 0 ? "^" : "");
+  for (var j = rnd(3) + 1; j > 0; j--) { var lo = pool[rnd(pool.length)]; src += hex(lo); if (rnd(2)) src += "-" + hex(lo + rnd(40)); }
+  src += "]";
+  var bits = "";
+  for (var f of ["i", "iu", "iv"]) {
+    var re = new RegExp("^" + src + "$", f);
+    for (var t = 0; t < 40; t++) { var c = pool[rnd(pool.length)] + rnd(3) - 1; bits += re.test(String.fromCharCode(c)) ? "1" : "0"; }
+  }
+  out.push(bits);
+}
+var h = 0; var all = out.join(""); for (var i = 0; i < all.length; i++) h = (h * 31 + all.charCodeAt(i)) | 0;
+all.length + " " + h + " " + (all.split("1").length - 1)
+"#;
+    assert_eq!(value(src), "36000 -897298215 12115");
+}

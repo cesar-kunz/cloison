@@ -1943,11 +1943,17 @@ impl Vm {
         }
     }
 
-    /// A full marking's codes: live if pinned, on a stack (the native
-    /// one, or the VM's, as a frame's code), or marked since it began (a
-    /// closure of it traced or made, it loaded), and with them the
-    /// functions nested in them, which they make closures of. Mark what
-    /// the live ones refer to, and what that reaches, until no more are.
+    /// A full marking's codes: live if on a stack (the native one, or the
+    /// VM's, as a frame's code), or marked since it began (a closure of it
+    /// traced or made, it loaded), and with them the functions nested in
+    /// them, which they make closures of. Mark what the live ones refer
+    /// to, and what that reaches, until no more are. (A pinned one's
+    /// references are marked anyway, see `mark_structures`, but it isn't
+    /// live for that: one the JIT took stays for its address, and doesn't
+    /// keep the functions nested in it, nor its compiled code, see
+    /// `condemn_codes`. An eval'd function compiled, its enclosing one
+    /// pinned to fold its variables, kept them and what they held: 2,000
+    /// of them, each over a 160 KB array, took 376 MB.)
     /// `done`: the codes whose references are marked already, by index.
     unsafe fn mark_live_codes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value, done: &mut Vec<bool>) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1968,7 +1974,7 @@ impl Vm {
         loop {
             let mut more = false;
             for (k, code) in self.codes.iter().enumerate() {
-                if done[k] || !(code.pinned.get() || code.mark.load(Relaxed) >= from) {
+                if done[k] || code.mark.load(Relaxed) < from {
                     continue;
                 }
                 done[k] = true;
@@ -2088,13 +2094,26 @@ impl Vm {
 
     /// After a full marking, take the codes it didn't find live out of
     /// use: freed at the next collection that finishes the sweep first.
+    /// A pinned one not found live stays, for its address, but its compiled
+    /// code goes, and what that kept (see `gc::KeptCells`): it can't run
+    /// again, as an unpinned one would be freed (no closure of it, no
+    /// frame, no live function nesting it, which would make one).
     fn condemn_codes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
         let (live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
             .into_iter()
             .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
+        let mut gone = Vec::new();
+        for c in live.iter().filter(|c| c.mark.load(Relaxed) < from) {
+            if let Ok(mut j) = c.jit.try_borrow_mut()
+                && let Some(j) = j.take()
+            {
+                gone.push(j);
+            }
+        }
         self.codes = live;
+        drop(gone);
         let live: usize = self.codes.iter().map(|c| c.footprint()).sum();
         // (Less the code made while the marker ran, all found live: its
         // room grew with each marking a slow marker drew out.)

@@ -10319,3 +10319,48 @@ out.join("|")
 "#;
     assert_eq!(value(src), "1|5 7|5,2,7,8,true|9,4,9,4|2 {\"value\":2,\"writable\":false,\"enumerable\":true,\"configurable\":false}|1|1 1|2 10,20|5,2,7,8,true");
 }
+
+
+#[test]
+fn direct_evals_in_generators_read_their_boxed_bindings_bound() {
+    // A generator's (or an async function's) block-scoped variables a
+    // nested function uses are in boxes: a direct `eval`'s code there is
+    // compiled for its site's bindings too, reading and writing a boxed one
+    // through its box (`Var::BoundBox`), not through a scope object of
+    // accessors for every enclosing variable made at each call (40 of them:
+    // 711 ms for 20,000 calls, 35 now; a function's 25). Constants and the
+    // TDZ, each iteration's binding, closures, `yield` around, an `eval` in
+    // the eval'd code, `var`s, strict code and an async function give what
+    // V8, SpiderMonkey, JavaScriptCore and QuickJS do. (cloison-fuzz's C10.)
+    let src = r#"
+var out = [];
+function* g1() { let a = 1; const c = 5; let fs = [];
+  for (let j = 0; j < 3; j++) { eval("a += j; fs.push(() => j * 10 + a)"); yield eval("a + c + j"); }
+  try { eval("c = 1"); } catch (e) { out.push(e.constructor.name); }
+  try { eval("z; let q"); } catch (e) { out.push(e.constructor.name); }
+  try { (function () { eval("t"); })(); } catch (e) { out.push(e.constructor.name); }
+  let t = 2;
+  yield fs.map(f => f()).join();
+  yield eval("eval('a * 100 + t')");
+  yield eval("var vv = 7; vv + a");
+  yield typeof vv;
+}
+out.push([...g1()].join(";"));
+function* g2() { let x = 0; while (x < 5) { yield eval("x++"); } return eval("x"); }
+var it = g2(), r, s = []; while (!(r = it.next()).done) s.push(r.value); out.push(s.join() + "/" + r.value);
+function* g3() { "use strict"; let k = 3; yield eval("k * 2"); yield eval("var w = 1; typeof w"); yield typeof w; }
+out.push([...g3()].join());
+async function af() { let n = 1; await null; eval("n += 41"); let m = await eval("Promise.resolve(n)"); return eval("m + n"); }
+var sum = 0; for (var i = 0; i < 3000; i++) { var gi = g2(); gi.next(); gi.next(); sum += gi.next().value; }
+out.push(sum);
+(function () { var v0 = 0, v1 = 1, v2 = 2;
+  function* g4() { let l = 0; for (let j = 0; j < 4; j++) eval("l += v1 + v2 + j"); return l; }
+  var t = 0; for (var i = 0; i < 2000; i++) t += g4().next().value; out.push(t);
+})();
+af().then(v => { out.push(v); globalThis.result = out.join("|"); });
+"#;
+    let mut vm = Vm::new();
+    vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("TypeError|ReferenceError|ReferenceError|6;8;11;4,14,24;402;11;number|0,1,2,3,4/5|6,number,undefined|6000|36000|84"));
+}

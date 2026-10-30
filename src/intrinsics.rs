@@ -879,7 +879,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let withs = a.get(7..).unwrap_or(&[]);
     if u.windows(4).any(|w| w == [b'e' as u16, b'v' as u16, b'a' as u16, b'l' as u16]) {
         let site = site_bindings(site);
-        let bindings: Vec<_> = site.2.iter().map(|(n, k, up)| (n.as_str(), *k, *up)).collect();
+        let bindings: Vec<_> = site.2.iter().map(|(n, k, up, key)| (n.as_str(), *k, *up, key.as_str())).collect();
         return eval_through_scope(vm, a, carrier, site.0, &bindings);
     }
     let params = a.get(5) == Some(&Value::TRUE);
@@ -892,10 +892,10 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             let source: Box<[u16]> = u.into();
             let text = crate::vm::source_text(u);
             let (_, nups, bindings) = site_bindings(site);
-            let bound: Vec<(crate::js::ast::Name, u8)> = (0..nups)
+            let bound: Vec<(crate::js::ast::Name, u8, crate::js::ast::Name)> = (0..nups)
                 .map(|k| match bindings.iter().find(|b| b.2 == k) {
-                    Some((name, kind, _)) => (name.as_str().into(), *kind as u8),
-                    None => ("%none".into(), 0),
+                    Some((name, kind, _, key)) => (name.as_str().into(), *kind as u8, key.as_str().into()),
+                    None => ("%none".into(), 0, "".into()),
                 })
                 .collect();
             let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), &bound).map_err(eval_error)?;
@@ -910,7 +910,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                 if params && name == "arguments" {
                     return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
                 }
-                if bindings.iter().any(|(b, kind, _)| {
+                if bindings.iter().any(|(b, kind, ..)| {
                     b == name && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
                 }) {
                     return Err(Error(format!("SyntaxError: Identifier '{name}' has already been declared"), None));
@@ -955,7 +955,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// A direct `eval` site's description (see [`direct_eval_bound`]): its
 /// block-scoped count, its bindings function's upvalue count, and each
 /// binding's name, kind and upvalue.
-fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize)>) {
+fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize, String)>) {
     let text = crate::vm::source_text(crate::vm::string_units(site).unwrap_or(&[]));
     let mut lines = text.lines();
     let mut counts = lines.next().unwrap_or("").split(' ').map(|n| n.parse::<usize>().unwrap_or(0));
@@ -964,7 +964,10 @@ fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize)>) {
         .filter_map(|l| {
             let mut w = l.splitn(3, ' ');
             let (kind, up) = (w.next()?.parse().ok()?, w.next()?.parse().ok()?);
-            Some((w.next()?.to_string(), kind, up))
+            // (A boxed one's box's key after a tab: else its name.)
+            let rest = w.next()?;
+            let (name, key) = rest.split_once('\t').unwrap_or((rest, rest));
+            Some((name.to_string(), kind, up, key.to_string()))
         })
         .collect();
     (nlex, nups, bindings)
@@ -973,13 +976,15 @@ fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize)>) {
 /// [`direct_eval_bound`]'s `eval` through a scope object of its bindings'
 /// accessors (`a` [`direct_eval`]'s arguments), as `Gen::call` makes
 /// otherwise: `eval_scope`, then `direct_eval`, then `eval_scope_flush`.
-fn eval_through_scope(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, bindings: &[(&str, i32, usize)]) -> Result<Value> {
+fn eval_through_scope(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, bindings: &[(&str, i32, usize, &str)]) -> Result<Value> {
     let mut sa = vec![a[2], Value::from_i32(nlex as i32), carrier];
     let mut names = Vec::with_capacity(bindings.len());
-    for &(name, kind, up) in bindings {
+    for &(name, kind, up, key) in bindings {
         let n = crate::builtins::str_value(vm, name);
+        // (The variable: a boxed one's its box's key.)
+        let var = if key == name { n } else { crate::builtins::str_value(vm, key) };
         names.push(n);
-        sa.extend([n, n, Value::from_i32(((up as i32) << 4) | kind)]);
+        sa.extend([n, var, Value::from_i32(((up as i32) << 4) | kind)]);
     }
     let scope = eval_scope(vm, &sa)?;
     let mut da = a.to_vec();

@@ -134,7 +134,7 @@ pub fn compile_strict_eval(src: &str) -> Result<Module, String> {
 /// in the caller's scope object (see `intrinsics::direct_eval`). Or, with
 /// `bound` (`ast::Program::eval_upvalues`), in the caller's bindings, its
 /// upvalues (see `intrinsics::direct_eval_bound`).
-pub fn compile_direct_eval(src: &str, strict: bool, withs: usize, bound: &[(ast::Name, u8)]) -> Result<Module, String> {
+pub fn compile_direct_eval(src: &str, strict: bool, withs: usize, bound: &[(ast::Name, u8, ast::Name)]) -> Result<Module, String> {
     let source: Rc<str> = src.into();
     let compile = |skim| {
         let arena = ast::Arenas::default();

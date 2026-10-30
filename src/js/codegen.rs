@@ -136,7 +136,7 @@ fn generate_from<'p>(
     let decls: Vec<Decls> = decls.into_iter().map(Decls::new).collect();
     let mut scopes = upvalues(p, &decls, &overflow);
     if !p.eval_upvalues.is_empty() {
-        scopes.upvalues[0] = p.eval_upvalues.iter().map(|(n, _)| &**n).collect();
+        scopes.upvalues[0] = p.eval_upvalues.iter().map(|(n, ..)| &**n).collect();
     }
     let names = Default::default();
     let root = lazy.map_or(0, |(r, ..)| r);
@@ -500,7 +500,12 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
 /// The kind of direct `eval` site binding `name` (`EVAL_CONST`…) if its
 /// code is compiled for one (see `Program::eval_upvalues`).
 fn bound_kind(p: &Program, name: &str) -> Option<u8> {
-    p.eval_upvalues.iter().find(|(n, _)| &**n == name).map(|&(_, k)| k)
+    p.eval_upvalues.iter().find(|(n, ..)| &**n == name).map(|&(_, k, _)| k)
+}
+
+/// The key of a direct `eval`'s site's binding in its box (`EVAL_BOXED`).
+fn bound_box_key<'p>(p: &'p Program, name: &str) -> &'p str {
+    p.eval_upvalues.iter().find(|(n, ..)| &**n == name).map_or("", |(.., key)| &**key)
 }
 
 /// A variable's name as written (a block-scoped one is renamed `x%3`:
@@ -1515,6 +1520,10 @@ enum Var {
     /// `k`: not initialized yet a ReferenceError, a constant's store a
     /// TypeError (as `intrinsics::binding_get` and `binding_set`).
     Bound(u8),
+    /// As `Bound`, a binding in a box (a generator's block-scoped variable
+    /// a nested function uses: see `boxed_lexicals`), upvalue `k` the box:
+    /// the variable its property `bound_box_key`.
+    BoundBox(u8),
     Global,
     Undefined,
     /// A module's imported binding (see `ast::Import`).
@@ -3144,8 +3153,8 @@ impl<'a> Gen<'a> {
             .iter()
             .position(|&n| n == name)
         {
-            if bound_kind(self.p, name).is_some() {
-                return Ok(Var::Bound(k as u8));
+            if let Some(kind) = bound_kind(self.p, name) {
+                return Ok(if kind & EVAL_BOXED != 0 { Var::BoundBox(k as u8) } else { Var::Bound(k as u8) });
             }
             return Ok(Var::Upvalue(k as u8));
         }
@@ -3585,6 +3594,28 @@ impl<'a> Gen<'a> {
                 }
                 self.temp = mark;
             }
+            Var::BoundBox(k) => {
+                // (`acc` stays the value.)
+                let mark = self.temp;
+                let v = self.alloc(pos)?;
+                self.star(v);
+                let b = self.alloc(pos)?;
+                self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                self.star(b);
+                let key = bound_box_key(self.p, name);
+                self.named(Op::GetNamed, b, key);
+                let c = self.const_str(original(name));
+                self.emit(Op::CheckHole, &[Arg::Index(c)]);
+                if bound_kind(self.p, name).is_some_and(|k| k & EVAL_CONST != 0) {
+                    self.string(original(name));
+                    self.star(v);
+                    self.intrinsic("throw_const", v, 1);
+                } else {
+                    self.ldar(v);
+                    self.named(Op::SetNamed, b, key);
+                }
+                self.temp = mark;
+            }
             Var::Scope(env) => self.named(Op::SetNamed, env, &self.env_key(name)),
             Var::ScopeUpvalue(k) => {
                 // (`acc` stays the value.)
@@ -3844,6 +3875,16 @@ impl<'a> Gen<'a> {
                     self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
                     let c = self.const_str(original(n));
                     self.emit(Op::CheckHole, &[Arg::Index(c)]);
+                }
+                Var::BoundBox(k) => {
+                    let mark = self.temp;
+                    let b = self.alloc(e.pos)?;
+                    self.emit(Op::LdaUpvalue, &[Arg::Count(k)]);
+                    self.star(b);
+                    self.named(Op::GetNamed, b, bound_box_key(self.p, n));
+                    let c = self.const_str(original(n));
+                    self.emit(Op::CheckHole, &[Arg::Index(c)]);
+                    self.temp = mark;
                 }
                 Var::Scope(env) => self.named(Op::GetNamed, env, &self.env_key(n)),
                 Var::ScopeUpvalue(k) => {
@@ -4835,7 +4876,7 @@ impl<'a> Gen<'a> {
             // count, the function's upvalues, and each binding's kind,
             // upvalue and name) and the site's number.
             if let Some(cf) = carrier.filter(|_| {
-                self.index != 0 && kept.iter().all(|b| b.3.is_some() && b.2 & EVAL_BOXED as i32 == 0)
+                self.index != 0 && kept.iter().all(|b| b.3.is_some())
             }) {
                 let c = self.alloc(pos)?;
                 debug_assert_eq!(c as usize, fr as usize + nargs as usize);
@@ -4843,8 +4884,10 @@ impl<'a> Gen<'a> {
                 self.star(c);
                 let d = self.alloc(pos)?;
                 let mut desc = format!("{nlex} {}\n", self.scopes.upvalues[cf].len());
-                for &(o, _, kind, up) in &kept {
-                    desc.push_str(&format!("{kind} {} {o}\n", up.unwrap_or(0)));
+                for &(o, v, kind, up) in &kept {
+                    // (A boxed one's: its box's key after a tab.)
+                    let key = if kind & EVAL_BOXED as i32 != 0 { format!("\t{}", self.env_key(v)) } else { String::new() };
+                    desc.push_str(&format!("{kind} {} {o}{key}\n", up.unwrap_or(0)));
                 }
                 self.string(&desc);
                 self.star(d);

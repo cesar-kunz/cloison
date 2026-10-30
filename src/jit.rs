@@ -4886,14 +4886,17 @@ fn variable_assigned_uncached(vm: *mut crate::vm::Vm, code: *const crate::vm::Co
         return true;
     }
     // Down from it: each nested function's upvalues that are the variable.
+    // (A nested function freed is null: see `Vm::condemn_codes`.)
     let mut stack: Vec<(*const Code, Vec<usize>)> = unsafe { &(*decl).closures }
         .iter()
+        .filter(|n| !n.is_null())
         .map(|&n| {
             let s = unsafe { &(*n).upvalues }.iter().enumerate();
             (n, s.filter(|&(_, &(l, j))| l && j == reg).map(|(m, _)| m).collect())
         })
         .collect();
     while let Some((n, these)) = stack.pop() {
+        debug_assert!(unsafe { (*vm).code_set.contains(&(n as usize)) }, "a freed nested function");
         if !these.is_empty() {
             if unsafe { (*n).lazy.is_some() } {
                 // (Not compiled yet: compiled here, not installed.)
@@ -4906,7 +4909,7 @@ fn variable_assigned_uncached(vm: *mut crate::vm::Vm, code: *const crate::vm::Co
                 return true;
             }
         }
-        for &m in unsafe { &(*n).closures } {
+        for &m in unsafe { &(*n).closures }.iter().filter(|m| !m.is_null()) {
             let s = unsafe { &(*m).upvalues }.iter().enumerate();
             let theirs: Vec<usize> =
                 s.filter(|&(_, &(l, j))| !l && these.contains(&(j as usize))).map(|(q, _)| q).collect();

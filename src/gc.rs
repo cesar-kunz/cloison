@@ -1979,7 +1979,7 @@ impl Vm {
                 }
                 done[k] = true;
                 more = true;
-                for &c in &code.closures {
+                for &c in code.closures.iter().filter(|c| !c.is_null()) {
                     mark_code(c);
                 }
                 unsafe { self.mark_code_refs(m, code) };
@@ -2101,9 +2101,25 @@ impl Vm {
     fn condemn_codes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
-        let (live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
+        let (mut live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
             .into_iter()
             .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
+        // (A function freed is nested only in functions no marking found
+        // live, which can't make a closure of it again; but the JIT's
+        // analysis of a variable walks a pinned one's nested functions,
+        // `jit::variable_assigned`: their entries become null. A freed one
+        // can't assign the variable, so its answer stays right.)
+        if !dead.is_empty() {
+            let gone: crate::jit::HashSet<*const crate::vm::Code> =
+                dead.iter().map(|c| &**c as *const crate::vm::Code).collect();
+            for c in live.iter_mut() {
+                for n in c.closures.iter_mut() {
+                    if gone.contains(n) {
+                        *n = std::ptr::null();
+                    }
+                }
+            }
+        }
         let mut gone = Vec::new();
         for c in live.iter().filter(|c| c.mark.load(Relaxed) < from) {
             if let Ok(mut j) = c.jit.try_borrow_mut()

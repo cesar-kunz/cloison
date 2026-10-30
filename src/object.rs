@@ -483,6 +483,11 @@ impl FieldCell {
         }
     }
 
+    /// Kept for good, as if a table had it (`Vm::dictionary_cell`'s).
+    pub(crate) fn hold(&self) {
+        self.tables.set(self.tables.get() + 1);
+    }
+
     /// Whether no slot table has it any more.
     pub(crate) fn unused(&self) -> bool {
         self.tables.get() == 0
@@ -572,7 +577,10 @@ impl FieldType {
         } else if v.is_number() {
             FieldType::Num
         } else if v.is_cell() {
-            FieldType::Obj(unsafe { (*as_object(v)).shape })
+            // (Not a dictionary shape, changed in place: V8's field types
+            // are maps only of stable maps.)
+            let s = unsafe { (*as_object(v)).shape };
+            if unsafe { (*s).dictionary } { FieldType::Any } else { FieldType::Obj(s) }
         } else {
             FieldType::Any
         }
@@ -687,6 +695,13 @@ pub struct Shape {
     /// Live whatever the marking finds: compiled code gives it to objects
     /// (an allocation's or a transition's constant, a `new`'s `this`).
     pub(crate) pinned: Cell<bool>,
+    /// A dictionary shape (V8's dictionary-mode maps): one object's own,
+    /// unique, changed in place as the object gains and loses properties
+    /// (`dict`), its slots in a table of its own and its fields all
+    /// `Vm::dictionary_cell`'s (`Any`). No cache holds one, nor a field's
+    /// or elements' type, nor compiled code: what they would rely on
+    /// changes without the shape changing.
+    pub(crate) dictionary: bool,
 }
 
 /// Field cells per chunk of a [`CellSlab`].
@@ -1096,6 +1111,28 @@ impl Slots {
         self.len as usize
     }
 
+    /// A dictionary shape's slots (all of their table, its own): slot `k`
+    /// removed in place, those after it moved down one, as their values
+    /// are (`Vm::dict_remove`). Its index is made again as lookups come.
+    pub(crate) fn remove(&mut self, k: u32) {
+        let t = &self.table;
+        debug_assert!(std::rc::Rc::strong_count(t) == 1 && t.len.get() == self.len && k < self.len);
+        let n = self.len as usize;
+        let k = k as usize;
+        unsafe {
+            let f = *t.fields.add(k);
+            (*f).tables.set((*f).tables.get() - 1);
+            std::ptr::copy(t.keys.add(k + 1), t.keys.add(k), n - k - 1);
+            std::ptr::copy(t.attrs.add(k + 1), t.attrs.add(k), n - k - 1);
+            std::ptr::copy(t.fields.add(k + 1), t.fields.add(k), n - k - 1);
+        }
+        t.len.set(self.len - 1);
+        self.len -= 1;
+        t.index.borrow_mut().clear();
+        t.indexed.set(0);
+        t.scanned.set(0);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -1181,7 +1218,7 @@ pub fn push_key(v: Value) -> u64 {
         crate::layout::FIELD_INT
     } else if v.is_number() {
         crate::layout::FIELD_NUM
-    } else if v.is_cell() {
+    } else if v.is_cell() && unsafe { !(*(*as_object(v)).shape).dictionary } {
         unsafe { (*as_object(v)).shape as u64 }
     } else {
         crate::layout::FIELD_ANY
@@ -1189,6 +1226,19 @@ pub fn push_key(v: Value) -> u64 {
 }
 
 impl Shape {
+    /// Dictionary shape `s` (see [`Shape::dictionary`]), to change in place.
+    ///
+    /// # Safety
+    /// `s` must be a live dictionary shape, and nothing hold a reference
+    /// into it while the result is used.
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn dictionary_mut<'a>(s: *const Shape) -> &'a mut Shape {
+        unsafe {
+            debug_assert!((*s).dictionary);
+            &mut *s.cast_mut()
+        }
+    }
+
     pub fn lookup(&self, name: Atom) -> Option<u32> {
         self.slots.lookup(name)
     }
@@ -1305,6 +1355,7 @@ mod tests {
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
+            dictionary: false,
         };
         assert_eq!(s.location(0), 32);
         assert_eq!(s.location(1), 40);

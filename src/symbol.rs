@@ -113,6 +113,11 @@ pub(crate) fn atom_symbol(vm: &Vm, a: Atom) -> Option<Value> {
     vm.symbols.get(&a).map(|&o| object_value(o))
 }
 
+/// Whether symbol `v` is in `Symbol.for`'s registry.
+pub(crate) fn is_registered(v: Value) -> bool {
+    unsafe { (*as_object(v)).flags & crate::object::REGISTERED_SYMBOL != 0 }
+}
+
 /// A symbol's description (`undefined` or a string).
 fn description(v: Value) -> Value {
     Value::from_bits(unsafe { (*as_object(v)).code } as u64)
@@ -183,17 +188,22 @@ fn symbol_for(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Ok(object_value(s));
     }
     let s = make_symbol(vm, key, None);
+    // (A root of every collection from now on: the registry's symbols live
+    // as long as the agent, GlobalSymbolRegistry. Full collections
+    // enumerate it, `Vm::registered_symbols`; the log has it for the next
+    // minor one.)
+    unsafe { (*as_object(s)).flags |= crate::object::REGISTERED_SYMBOL };
+    vm.heap.note(s);
     vm.symbol_registry.insert(units, as_object(s));
     Ok(s)
 }
 
-fn symbol_key_for(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn symbol_key_for(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let s = arg(a, 0);
     if !is_symbol(s) {
         return Err(Error::type_error(format!("{} is not a symbol", crate::vm::display(s))));
     }
-    let o = as_object(s);
-    Ok(if vm.symbol_registry.values().any(|&r| r == o) { description(s) } else { Value::UNDEFINED })
+    Ok(if is_registered(s) { description(s) } else { Value::UNDEFINED })
 }
 
 fn symbol_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

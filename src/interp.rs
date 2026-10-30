@@ -2901,7 +2901,12 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
         return v;
     }
     // Strings and int32s, the common case, straight into the result.
-    if let (Some(p), Some(q)) = (Piece::of(a), Piece::of(b))
+    // (Only when both are: `Piece::of` flattens a cons string, which a
+    // number or an object on the other side would only waste.)
+    let piece = |v: Value| v.is_int32() || is_string(v);
+    if piece(a)
+        && piece(b)
+        && let (Some(p), Some(q)) = (Piece::of(a), Piece::of(b))
         && (p.is_string() || q.is_string())
     {
         return concat(p, q);
@@ -2909,9 +2914,21 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
     // ToPrimitive, hint "default" (a date's string).
     let (a, b) = (to_primitive_default(a), to_primitive_default(b));
     if is_string(a) || is_string(b) {
+        // The other side's string (short: a number's, a boolean's, ...),
+        // then the two joined as strings are, so that a long one isn't
+        // copied (`s = s + 1.5` in a loop was quadratic).
+        let vm = unsafe { &mut *current_vm() };
+        let a = if is_string(a) { a } else { vm.new_string(&to_string_units(a)) };
+        let b = if is_string(b) { b } else { vm.new_string(&to_string_units(b)) };
+        if let Some(v) = concat_fast(a, b) {
+            return v;
+        }
+        if let (Some(p), Some(q)) = (Piece::of(a), Piece::of(b)) {
+            return concat(p, q);
+        }
         let mut units = to_string_units(a);
         units.extend(to_string_units(b));
-        return unsafe { (*current_vm()).new_string(&units) };
+        return vm.new_string(&units);
     }
     if is_bigint(a) || is_bigint(b) {
         return crate::bigint::binary(BigOp::Add, a, b);

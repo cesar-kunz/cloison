@@ -63,6 +63,48 @@ use crate::object::{Atom, Class, FieldType, Object, PAGE, Shape};
 use crate::layout::InstanceOfEntry;
 use crate::value::{NumberTag, Value};
 
+/// At a full collection, free the versions call sites were bound to before
+/// (`Caches::retired`, see `CallSite::bind`) that nothing runs or names any
+/// more: kept for good, with their code and the cells they embed, as one
+/// might be running when its call site is bound to another (sass retired
+/// 2,483 of 2,701 versions, the TypeScript app 3,873 of 5,690). One is
+/// running while a word of the stacks `words` gives points into its code (a
+/// return address, a frame's exit code) or at it (a direct call's exit
+/// finishing it); it is named while another `Rc` holds it (a call site, its
+/// function's versions) or a call site of its snapshot calls it as its own
+/// (`CallSite::self_code`).
+pub(crate) fn free_retired(vm: &mut crate::vm::Vm, words: &[usize]) {
+    let retired = &mut vm.jit_caches.retired;
+    if retired.is_empty() {
+        return;
+    }
+    // (Each retired version's ranges, by start, to look the words up in.)
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(2 * retired.len());
+    for (k, c) in retired.iter().enumerate() {
+        ranges.push((c.mem.ptr as usize, c.mem.ptr as usize + c.len.max(1), k));
+        let at = Rc::as_ptr(c) as usize;
+        ranges.push((at, at + std::mem::size_of::<JitCode>(), k));
+    }
+    ranges.sort_unstable();
+    let mut used = vec![false; retired.len()];
+    for &w in words {
+        let i = ranges.partition_point(|r| r.0 <= w);
+        if i > 0 && w < ranges[i - 1].1 {
+            used[ranges[i - 1].2] = true;
+        }
+    }
+    let mut k = 0;
+    retired.retain(|c| {
+        let keep = used[k]
+            || Rc::strong_count(c) > 1
+            || c.snap.as_ref().is_some_and(|s| {
+                s.sites.iter().any(|site| std::ptr::eq(unsafe { (*site.get()).self_code }, Rc::as_ptr(c)))
+            });
+        k += 1;
+        keep
+    });
+}
+
 /// An `instanceof` site's cache (`Prop::InstanceOf`): two entries, the
 /// latest first.
 type InstanceOfCache = [std::cell::Cell<InstanceOfEntry>; 2];

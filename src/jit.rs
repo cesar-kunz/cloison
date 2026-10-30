@@ -8472,6 +8472,15 @@ impl JitCode {
             .map(|(r, (ok, &load))| ok && (!load || live_at_entry[r]))
             .collect();
             let (mut no_fp, mut no_int) = (vec![false; nregs], vec![!opts.unboxed_ints; nregs]);
+            // A register live at entry is pinned only if it enters as the
+            // slot holds it (see `entry_pieces`): one that enters `Bot`, a
+            // direct call's argument never observed, may be anything (types
+            // ignore `Bot`, so it looked int32 only).
+            for r in (0..nregs).filter(|&r| live_at_entry[r]) {
+                let t = actual_live.regs[r];
+                no_int[r] |= t != Ty::I32;
+                no_fp[r] |= !matches!(t, Ty::I32 | Ty::F64);
+            }
             let mut stats = home_stats(insns, &ins1, nregs);
             // Captured registers stay in memory, where closures' upvalues
             // point.

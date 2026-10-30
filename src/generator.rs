@@ -18,7 +18,6 @@ use crate::value::Value;
 use crate::vm::{Code, Error, Result, Vm};
 
 const STATE: i32 = 0;
-const REGS: i32 = 1;
 const PC: i32 = 2;
 const FUNCTION: i32 = 3;
 const MODE: i32 = 4;
@@ -45,20 +44,71 @@ pub(crate) const NEXT: i32 = 0;
 pub(crate) const THROW: i32 = 1;
 pub(crate) const RETURN: i32 = 2;
 
-fn state_of(g: Value) -> Option<Value> {
+/// Generator `g`'s state: a buffer of values (`Heap::alloc_values`, its
+/// `code`), its cells (`STATE`…, an async function's promise, an async
+/// generator's `AG_…`) then its frame's registers while suspended (see
+/// [`regs_at`]). (An array for the cells and another for the registers at
+/// each suspension took a pending `async` call 4 cells, of 9.)
+fn state_of(g: Value) -> Option<*mut Value> {
     if g.is_cell() && unsafe { (*as_object(g)).class } == Class::Generator {
-        Some(Value::from_bits(unsafe { (*as_object(g)).code } as u64))
+        Some(unsafe { (*as_object(g)).code } as *mut Value)
     } else {
         None
     }
 }
 
-fn get(vm: &mut Vm, st: Value, k: i32) -> Value {
-    vm.get_keyed(st, Value::from_i32(k)).unwrap_or(Value::UNDEFINED)
+/// Cells of a generator's state before its registers: an async
+/// generator's, else 6 (a generator's, and an async function's promise:
+/// also an async module's, whose code's kind is a module's).
+fn cells_for(kind: u8) -> usize {
+    if kind == 6 { AG_MARK as usize + 1 } else { 6 }
 }
 
-fn set(vm: &mut Vm, st: Value, k: i32, v: Value) {
-    let _ = vm.set_keyed(st, Value::from_i32(k), v);
+/// The state's capacity.
+fn cap(st: *mut Value) -> usize {
+    (unsafe { *st.cast::<u64>().sub(1) } >> 32) as usize
+}
+
+/// Where the state's registers start: its cells past, for `code`'s.
+fn regs_at(st: *mut Value, code: *const Code) -> *mut Value {
+    unsafe { st.add(cap(st) - (*code).nregs as usize) }
+}
+
+/// The function of state `st`'s generator (its `FUNCTION` cell).
+fn function_of(st: *mut Value) -> *mut Object {
+    as_object(unsafe { *st.add(FUNCTION as usize) })
+}
+
+/// Whether state `st` is an async generator's (its function's kind).
+fn is_async_generator(st: *mut Value) -> bool {
+    unsafe { (*(*function_of(st)).code).kind == 6 }
+}
+
+/// Cell `k` of state `st` (undefined past its cells: its registers follow).
+fn get(_: &mut Vm, st: *mut Value, k: i32) -> Value {
+    let cells = cells_for(unsafe { (*(*function_of(st)).code).kind });
+    if (k as usize) < cells { unsafe { *st.add(k as usize) } } else { Value::UNDEFINED }
+}
+
+fn set(_: &mut Vm, st: *mut Value, k: i32, v: Value) {
+    unsafe {
+        let at = st.add(k as usize);
+        *at = v;
+        crate::heap::barrier(st.cast::<u8>().sub(8), at, v);
+    }
+}
+
+/// Element `k` of an async generator's request queue (an array).
+fn qget(vm: &mut Vm, q: Value, k: i32) -> Value {
+    vm.get_keyed(q, Value::from_i32(k)).unwrap_or(Value::UNDEFINED)
+}
+
+/// Drop the registers kept in state `st` (of `code`'s frame): done.
+fn clear_regs(st: *mut Value, code: *const Code) {
+    let r = regs_at(st, code);
+    for i in 0..unsafe { (*code).nregs } as usize {
+        unsafe { *r.add(i) = Value::UNDEFINED };
+    }
 }
 
 /// A new generator object for function `f`: its prototype `f.prototype`
@@ -70,15 +120,22 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
     let is_async = unsafe { (*(*f).code).kind } == 6;
     let root = if is_async { crate::symbol::Root::AsyncGeneratorPrototype } else { crate::symbol::Root::GeneratorPrototype };
     let proto = if crate::props::is_object(p) { p } else { object_value(vm.symbol_roots[root as usize]) };
-    let mut cells =
-        vec![Value::from_i32(SUSPENDED_START), Value::UNDEFINED, Value::from_i32(0), object_value(f), Value::from_i32(NEXT)];
+    let code = unsafe { (*f).code };
+    let n = cells_for(unsafe { (*code).kind }) + unsafe { (*code).nregs } as usize;
+    let queue = if is_async { vm.new_array() } else { Value::UNDEFINED };
+    let g = vm.new_object_with(Class::Generator, proto, 0);
+    let st = vm.heap.alloc_values(n);
+    let mut cells = vec![Value::from_i32(SUSPENDED_START), Value::UNDEFINED, Value::from_i32(0), object_value(f), Value::from_i32(NEXT)];
     if is_async {
-        let queue = vm.new_array();
         cells.extend([queue, Value::FALSE, Value::FALSE, Value::TRUE]);
     }
-    let st = crate::array::new_array_of(vm, &cells)?;
-    let g = vm.new_object_with(Class::Generator, proto, 0);
-    unsafe { (*g).code = st.to_bits() as *const Code };
+    unsafe {
+        for (k, &v) in cells.iter().enumerate() {
+            *st.add(k) = v;
+        }
+        (*g).code = st as *const Code;
+        crate::heap::barrier_young(g.cast(), &raw const (*g).code);
+    }
     Ok(object_value(g))
 }
 
@@ -90,9 +147,14 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
 pub(crate) unsafe fn suspend(vm: &mut Vm, g: Value, regs: *mut Value, code: *const Code, pc: usize, started: bool) {
     let Some(st) = state_of(g) else { return };
     let n = unsafe { (*code).nregs } as usize;
-    let values: Vec<Value> = (0..n).map(|i| unsafe { *regs.add(i) }).collect();
-    let saved = crate::array::new_array_of(vm, &values).unwrap_or(Value::UNDEFINED);
-    set(vm, st, REGS, saved);
+    let to = regs_at(st, code);
+    for i in 0..n {
+        unsafe {
+            let v = *regs.add(i);
+            *to.add(i) = v;
+            crate::heap::barrier(st.cast::<u8>().sub(8), to.add(i), v);
+        }
+    }
     set(vm, st, PC, Value::from_i32(pc as i32));
     set(vm, st, STATE, Value::from_i32(if started { SUSPENDED_YIELD } else { SUSPENDED_START }));
 }
@@ -115,7 +177,7 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     }
     if state == SUSPENDED_START && mode != NEXT {
         set(vm, st, STATE, Value::from_i32(COMPLETED));
-        set(vm, st, REGS, Value::UNDEFINED);
+        clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
     }
     if get(vm, st, STATE).as_i32_unchecked() == COMPLETED {
         return match mode {
@@ -127,21 +189,20 @@ fn resume_raw(vm: &mut Vm, g: Value, v: Value, mode: i32, what: &str) -> Result<
     set(vm, st, STATE, Value::from_i32(EXECUTING));
     set(vm, st, MODE, Value::from_i32(mode));
     let f = get(vm, st, FUNCTION);
-    let saved = get(vm, st, REGS);
     let pc = get(vm, st, PC).as_i32_unchecked() as usize;
-    let r = unsafe { run(vm, as_object(f), saved, pc, v) };
+    let r = unsafe { run(vm, as_object(f), regs_at(st, (*as_object(f)).code), pc, v) };
     match r {
         Ok(out) => {
             let yielded = get(vm, st, STATE).as_i32_unchecked() == SUSPENDED_YIELD;
             if !yielded {
                 set(vm, st, STATE, Value::from_i32(COMPLETED));
-                set(vm, st, REGS, Value::UNDEFINED);
+                clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
             }
             Ok((out, !yielded))
         }
         Err(e) => {
             set(vm, st, STATE, Value::from_i32(COMPLETED));
-            set(vm, st, REGS, Value::UNDEFINED);
+            clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
             Err(e)
         }
     }
@@ -153,8 +214,8 @@ pub(crate) fn run_module(vm: &mut Vm, g: Value) -> Result<()> {
 }
 
 /// Run function `f`'s code from offset `pc` in a frame of registers
-/// `saved` (an array), `acc` `v`: what it returns or yields.
-unsafe fn run(vm: &mut Vm, f: *mut Object, saved: Value, pc: usize, v: Value) -> Result<Value> {
+/// `saved` (a generator state's), `acc` `v`: what it returns or yields.
+unsafe fn run(vm: &mut Vm, f: *mut Object, saved: *mut Value, pc: usize, v: Value) -> Result<Value> {
     unsafe {
         let top = vm.native_top;
         if top.is_null() {
@@ -169,9 +230,8 @@ unsafe fn run(vm: &mut Vm, f: *mut Object, saved: Value, pc: usize, v: Value) ->
         }
         write_frame_header(vm, new, code, std::ptr::null(), std::ptr::null_mut(), 0);
         crate::interp::set_frame_function(new, f);
-        let so = as_object(saved);
         for i in 0..n {
-            let r = if (i as u32) < (*so).elems_len { *(*so).elems.add(i) } else { Value::UNDEFINED };
+            let r = *saved.add(i);
             *new.add(i) = if r == Value::EMPTY { Value::UNDEFINED } else { r };
         }
         let saved_top = vm.native_top;
@@ -189,11 +249,10 @@ unsafe fn run(vm: &mut Vm, f: *mut Object, saved: Value, pc: usize, v: Value) ->
 /// An async function's coroutine `g` started: its promise, the
 /// coroutine run until it awaits or ends (see [`async_step`]).
 pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Value> {
-    let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
+    // (No resolving functions: only its end settles it, `async_step`.)
+    let p = crate::promise::new_promise(vm);
     let st = state_of(g).unwrap();
-    for (k, v) in [(5, p), (6, resolve), (7, reject)] {
-        set(vm, st, k, v);
-    }
+    set(vm, st, 5, p);
     async_step(vm, g, NEXT, Value::UNDEFINED)?;
     Ok(p)
 }
@@ -203,26 +262,24 @@ pub(crate) fn async_start(vm: &mut Vm, g: Value) -> Result<Value> {
 /// of the value awaited, whose reactions run this again.
 pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
     let st = state_of(g).unwrap();
-    if get(vm, st, AG_MARK) == Value::TRUE {
+    if is_async_generator(st) {
         return async_gen_step(vm, g, mode, v);
     }
     match resume_raw(vm, g, v, mode, "an async function") {
         Ok((out, true)) => {
-            let resolve = get(vm, st, 6);
-            crate::interp::call_function(vm, resolve, Value::UNDEFINED, &[out]).map(|_| ())
+            let p = get(vm, st, 5);
+            crate::promise::resolve_own(vm, p, out)
         }
         Ok((awaited, false)) => {
-            let on_fulfilled = crate::promise::async_closure(vm, false, g);
-            let on_rejected = crate::promise::async_closure(vm, true, g);
-            crate::promise::await_then(vm, awaited, on_fulfilled, on_rejected)
+            crate::promise::await_coroutine(vm, awaited, g)
         }
         Err(e) => {
             let reason = match e.1 {
                 Some(v) => v,
                 None => crate::builtins::caught(vm, &e),
             };
-            let reject = get(vm, st, 7);
-            crate::interp::call_function(vm, reject, Value::UNDEFINED, &[reason]).map(|_| ())
+            let p = get(vm, st, 5);
+            crate::promise::reject_own(vm, p, reason)
         }
     }
 }
@@ -241,7 +298,7 @@ pub(crate) fn async_gen_yield(vm: &mut Vm, g: Value) {
 fn async_gen_enqueue(vm: &mut Vm, g: Value, v: Value, mode: i32) -> Result<Value> {
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);
     let st = match state_of(g) {
-        Some(st) if get(vm, st, AG_MARK) == Value::TRUE => st,
+        Some(st) if is_async_generator(st) => st,
         _ => {
             let e = crate::builtins::caught(vm, &Error::type_error("not an async generator"));
             crate::interp::call_function(vm, reject, Value::UNDEFINED, &[e])?;
@@ -265,8 +322,8 @@ fn async_gen_run(vm: &mut Vm, g: Value) -> Result<()> {
         return Ok(());
     }
     set(vm, st, AG_BUSY, Value::TRUE);
-    let mode = get(vm, q, 0).as_i32_unchecked();
-    let v = get(vm, q, 1);
+    let mode = qget(vm, q, 0).as_i32_unchecked();
+    let v = qget(vm, q, 1);
     async_gen_step(vm, g, mode, v)
 }
 
@@ -282,9 +339,7 @@ fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
             Ok((out, false))
         }
         Ok((awaited, false)) => {
-            let on_fulfilled = crate::promise::async_closure(vm, false, g);
-            let on_rejected = crate::promise::async_closure(vm, true, g);
-            return crate::promise::await_then(vm, awaited, on_fulfilled, on_rejected);
+            return crate::promise::await_coroutine(vm, awaited, g);
         }
         Ok((out, true)) => Ok((out, true)),
         Err(e) => Err(match e.1 {
@@ -293,9 +348,9 @@ fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
         }),
     };
     let q = get(vm, st, AG_QUEUE);
-    let (resolve, reject) = (get(vm, q, 2), get(vm, q, 3));
+    let (resolve, reject) = (qget(vm, q, 2), qget(vm, q, 3));
     let len = vm.length_of(q)? as i32;
-    let rest: Vec<Value> = (REQUEST as i32..len).map(|i| get(vm, q, i)).collect();
+    let rest: Vec<Value> = (REQUEST as i32..len).map(|i| qget(vm, q, i)).collect();
     let rest = crate::array::new_array_of(vm, &rest)?;
     set(vm, st, AG_QUEUE, rest);
     match settled {

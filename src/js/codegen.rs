@@ -1908,9 +1908,11 @@ impl<'a> Gen<'a> {
             self.init_fields(v, 0, self.f.pos)?;
         }
         // The scope object, with each of its variables (`undefined`, in
-        // order: one shape).
+        // order: one shape). (A generator's or an async function's too only
+        // if it has some: one for each pending `async` call, cloison-fuzz's
+        // C09.)
         let has_eval = self.f.has_eval && self.index != 0;
-        if !self.overflow.is_empty() || has_eval || self.f.generator || self.f.is_async {
+        if !self.overflow.is_empty() || has_eval {
             let env = self.locals[ENV];
             if self.f.module {
                 // (A module's: its loader's, which other modules read.)

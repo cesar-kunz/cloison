@@ -10364,3 +10364,40 @@ af().then(v => { out.push(v); globalThis.result = out.join("|"); });
     let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("TypeError|ReferenceError|ReferenceError|6;8;11;4,14,24;402;11;number|0,1,2,3,4/5|6,number,undefined|6000|36000|84"));
 }
+
+
+#[test]
+fn awaits_keep_their_order_without_a_promise_or_closures_of_their_own() {
+    // An `await` makes no promise for its reactions' results (Await's
+    // PerformPromiseThen has no capability since ES2019) and no closures:
+    // its reactions name the coroutine (`promise::await_coroutine`); an
+    // async function's promise has no resolving functions, a generator
+    // without variables in it no scope object, a generator's state and
+    // registers are one buffer and a promise's state one more. A pending
+    // call kept 15 cells (784 bytes), now 4 (224; 400,000 of them: 473 MB,
+    // now 216; cloison-fuzz's C09). The order of awaits, `then`s, thenables,
+    // rejections caught and thrown, `for await`, async methods and
+    // generators is what V8, SpiderMonkey, JavaScriptCore and QuickJS give.
+    let src = r#"
+var log = [];
+async function a1() { log.push("a1:start"); await null; log.push("a1:1"); await Promise.resolve(); log.push("a1:2"); return "r1"; }
+async function a2() { log.push("a2:start"); try { await Promise.reject(new Error("x")); } catch (e) { log.push("a2:caught " + e.message); } throw new TypeError("t"); }
+async function a3() { var th = { then(r) { log.push("then called"); r(7); } }; var v = await th; log.push("a3:" + v); return v; }
+async function a4() { await a1(); log.push("a4"); return await a3(); }
+Promise.resolve().then(() => log.push("p1")).then(() => log.push("p2")).then(() => log.push("p3"));
+a1().then(v => log.push("a1 done " + v));
+a2().catch(e => log.push("a2 rejected " + e.constructor.name));
+a4().then(v => log.push("a4 done " + v));
+(async () => { log.push("arrow"); for await (const x of [1, Promise.resolve(2)]) log.push("fa " + x); })();
+var o = { async m() { return this === o; } }; o.m().then(v => log.push("m " + v));
+async function* ag() { yield 1; await null; yield 2; }
+(async () => { for await (const v of ag()) log.push("ag " + v); })();
+var n = 0; async function cnt() { await 0; n++; } for (var i = 0; i < 1000; i++) cnt();
+
+Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then(() => Promise.resolve().then(() => globalThis.result = log.join("|") + "|n=" + n)))))));
+"#;
+    let mut vm = Vm::new();
+    vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let r = vm.run(&cloison::js::compile("result").unwrap()).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("a1:start|a2:start|a1:start|arrow|p1|a1:1|a2:caught x|a1:1|m true|p2|a1:2|a2 rejected TypeError|a1:2|fa 1|ag 1|p3|a1 done r1|a4|then called|fa 2|a3:7|ag 2|a4 done 7|n=1000"));
+}

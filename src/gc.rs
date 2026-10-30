@@ -1097,16 +1097,21 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
             | Class::WeakRef
             | Class::FinalizationRegistry
             | Class::CollectionIterator
-            | Class::Promise
             | Class::Symbol
             | Class::ArrayIterator
             | Class::IteratorHelper
-            | Class::DisposableStack
-            | Class::Generator => {
+            | Class::DisposableStack => {
                 // The primitive it wraps (a string is a cell), or a
                 // collection's entries array, or a promise's state.
                 if within(code) {
                     v.value(Value::from_bits((*o).code as u64));
+                }
+            }
+            Class::Generator | Class::Promise => {
+                // Its state: a buffer of values (see `generator::state_of`,
+                // `promise::cells`).
+                if !(*o).code.is_null() && within(code) {
+                    v.payload((*o).code as usize);
                 }
             }
             Class::TypedArray | Class::DataView => {

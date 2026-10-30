@@ -138,6 +138,16 @@ macro_rules! realm_fields {
             }
         }
 
+        /// The cells the current realm's intrinsics hold, for the
+        /// collector: all of them (`Vm::named_roots` named some by hand
+        /// and missed others, `Math.sqrt` and `RegExp.prototype.exec`
+        /// among them, which compiled code and the builtins compare
+        /// callees with: once deleted, a cell freed and another made at
+        /// its address would have passed for it).
+        pub(crate) fn current_trace(vm: &Vm, out: &mut Vec<Value>) {
+            $(Field::trace(&vm.$($path).+, out);)*
+        }
+
         /// The shapes the current realm's intrinsics hold.
         pub(crate) fn current_shapes(vm: &Vm, out: &mut Vec<*const Shape>) {
             $(Field::shapes(&vm.$($path).+, out);)*
@@ -371,4 +381,23 @@ pub(crate) fn host_create_realm(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Va
     let a = vm.intern("$262");
     let g = intrinsic(vm, r, |vm| vm.global);
     vm.get(object_value(g), a)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every intrinsic of the current realm is a root of every collection.
+    #[test]
+    fn the_current_realms_intrinsics_are_roots() {
+        let vm = Vm::new();
+        let roots: std::collections::HashSet<u64> = vm.named_roots().iter().map(|v| v.to_bits()).collect();
+        let mut current = Vec::new();
+        current_trace(&vm, &mut current);
+        assert!(current.len() > 50);
+        for v in current {
+            assert!(roots.contains(&v.to_bits()), "{v:?} is no root");
+        }
+        assert!(roots.contains(&object_value(vm.math_sqrt_fn).to_bits()));
+    }
 }

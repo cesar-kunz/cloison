@@ -375,8 +375,19 @@ measurement says the old generation fills with cells that die soon after.
    million cells and its heap at 640 MB.
 4. **References from Rust structures**: inline caches' holders
    (prototypes, cached callees), shapes' prototypes, call and
-   constructor sites, and cells compiled code embeds (each compiled
-   function records them). A major collection enumerates them. A minor
+   constructor sites, and cells compiled code embeds. Those are counted
+   by owner (`gc::KeptCells`: a lowering's, for the constants, callees
+   and prototypes its call sites check; a compiled version's, for its
+   relocations' immediates that are cells; a call site's dispatch, for
+   its closures): roots while the owner lives, which Rust's ownership
+   already ties to anything that can still run the code (a version on a
+   stack holds its `Rc`, a direct call bound to it holds one, an exit's
+   snapshot one). They were kept for good, every cell compiled code ever
+   embedded: the web apps' echarts kept 170 MiB of 633 live only through
+   versions long dropped, pdfjs 115 of 360, sass 10.6 of 95. A function
+   the JIT took is never freed (its address keys the JIT's tables) but
+   once no full marking finds it live, its compiled code goes too
+   (`Vm::condemn_codes`). A major collection enumerates them. A minor
    collection cannot afford to (there are hundreds of thousands of
    inline-cache ways in TypeScript), so the store of a young cell into
    one is logged (`Heap::note_external`) and the log is a root of the
@@ -555,8 +566,9 @@ needs a finalizer.
   writes the new cell's metadata byte (`Heap`'s third word is the
   metadata's bias). The slow path is a runtime call, so a safepoint.
 - **Stores** get the card mark as part of the stencil, elided by type.
-- **Embedded cells** are recorded per compiled function and are roots;
-  nothing the collector does invalidates code.
+- **Embedded cells** are recorded per compiled version and lowering, and
+  are roots while those live (see Roots, 4); nothing the collector does
+  invalidates code.
 
 ### What `object-model.md` keeps
 

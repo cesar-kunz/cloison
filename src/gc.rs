@@ -1696,6 +1696,9 @@ impl Vm {
                     }
                 }
                 self.condemn_codes();
+                // (What the stacks hold, for the versions call sites left.)
+                let words = self.stack_words(sp, regs);
+                crate::jit::free_retired(self, &words);
             }
             if kind == Collection::Full && self.heap.gc.frag_report {
                 self.frag_report(sp);
@@ -2140,6 +2143,19 @@ impl Vm {
             self.code_set.remove(&(&**c as *const crate::vm::Code as usize));
         }
         self.condemned.extend(dead);
+    }
+
+    /// The words of the native stack, from `sp`, and of the VM stack, to
+    /// the end of the deepest frame there may be (as `mark_live_codes`
+    /// reads them).
+    unsafe fn stack_words(&self, sp: usize, regs: *mut Value) -> Vec<usize> {
+        unsafe {
+            let stack = self.stack.as_ptr() as usize;
+            let stack_end = self.stack_end as usize;
+            let top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+            let top = (top + 8 * self.max_frame).clamp(stack, stack_end);
+            (sp..self.heap.gc.stack_base).step_by(8).chain((stack..top).step_by(8)).map(|a| *(a as *const usize)).collect()
+        }
     }
 
     /// Mark the roots every collection has.

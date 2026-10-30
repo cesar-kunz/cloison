@@ -4636,6 +4636,14 @@ impl Vm {
         let code = unsafe { &*(*f).code };
         if made.get() == 2 && code.upvalues_folded.replace(false) {
             code.field_deps.set(code.field_deps.get().wrapping_add(1));
+            // And the calls bound to that code already: those to any
+            // closure of it (`jit::CallSite::by_code`) don't look at the
+            // epoch again. (An arrow capturing an object, called from a
+            // function compiled on its first call's loop: its next calls'
+            // arrows read the first one's object, cloison-fuzz's C02.)
+            for &c in &self.jitted {
+                unsafe { crate::jit::unbind_calls(c, code) };
+            }
         }
         // (An arrow's, a method's or an async function's: none.)
         if matches!(unsafe { (*(*f).code).kind }, 1 | 5) {

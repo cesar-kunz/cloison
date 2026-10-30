@@ -150,10 +150,14 @@ pub struct Gc {
     /// The native stack's base: the highest address roots may be at
     /// (`Vm::run` records it).
     pub stack_base: usize,
-    /// Cells Rust structures refer to for good (compiled code's constants,
-    /// call sites' closures), each an address in or at a cell.
-    kept: Vec<usize>,
-    kept_set: crate::jit::HashSet<usize>,
+    /// Cells Rust structures refer to (compiled code's constants, call
+    /// sites' closures), each an address in or at a cell, with how many
+    /// live owners refer to it (see [`KeptCells`]).
+    kept: KeptTable,
+    /// Addresses taken by [`Heap::keep`] for an owner not made yet (a
+    /// lowering, a compilation): roots until [`Heap::kept_since`] hands
+    /// them to it.
+    pending_kept: Vec<usize>,
     /// Cells stored into Rust structures since the last collection (their
     /// first granules), and addresses in or at cells taken for good since
     /// (see [`Heap::keep`]).
@@ -373,12 +377,87 @@ impl Heap {
         self.gc.log_slots.retain(|s| !(from..to).contains(s));
     }
 
-    /// A Rust structure refers to the cell at or around address `a` for
-    /// good: compiled code embedding it, a call site caching it.
+    /// A Rust structure about to be made refers to the cell at or around
+    /// address `a`: compiled code embedding it, a call site caching it. A
+    /// root until [`Heap::kept_since`] gives it to that structure.
     pub fn keep(&mut self, a: usize) {
-        if self.contains(a) && self.gc.kept_set.insert(a) {
-            self.gc.kept.push(a);
+        if self.contains(a) && self.gc.pending_kept.last() != Some(&a) {
+            self.gc.pending_kept.push(a);
             self.gc.log_kept.push(a);
+        }
+    }
+
+    /// The addresses Rust structures refer to (see [`KeptCells`]), and
+    /// those taken for structures not made yet.
+    pub(crate) fn kept_addrs(&self) -> Vec<usize> {
+        let t = self.gc.kept.borrow();
+        let mut v = Vec::with_capacity(t.len() + self.gc.pending_kept.len());
+        v.extend(t.keys().copied());
+        v.extend_from_slice(&self.gc.pending_kept);
+        v
+    }
+
+    /// Where the addresses kept from now on start (see `kept_since`).
+    pub(crate) fn kept_mark(&self) -> usize {
+        self.gc.pending_kept.len()
+    }
+
+    /// The addresses kept since mark `from`, for a structure that refers to
+    /// them while it lives.
+    pub(crate) fn kept_since(&mut self, from: usize) -> KeptCells {
+        let from = from.min(self.gc.pending_kept.len());
+        let mut addrs = self.gc.pending_kept.split_off(from);
+        addrs.sort_unstable();
+        addrs.dedup();
+        let mut k = KeptCells { addrs: Vec::new(), table: Some(self.gc.kept.clone()) };
+        {
+            let mut t = self.gc.kept.borrow_mut();
+            for &a in &addrs {
+                *t.entry(a).or_default() += 1;
+            }
+        }
+        k.addrs = addrs;
+        k
+    }
+
+    /// Add address `a` to what `k` keeps, at once.
+    pub(crate) fn keep_in(&mut self, k: &mut KeptCells, a: usize) {
+        if !self.contains(a) || k.addrs.contains(&a) {
+            return;
+        }
+        if k.table.is_none() {
+            k.table = Some(self.gc.kept.clone());
+        }
+        *self.gc.kept.borrow_mut().entry(a).or_default() += 1;
+        k.addrs.push(a);
+        self.gc.log_kept.push(a);
+    }
+}
+
+/// The cells Rust structures refer to by address, each with how many live
+/// owners (a [`KeptCells`]) refer to it: roots at every full collection.
+pub(crate) type KeptTable = std::rc::Rc<std::cell::RefCell<crate::jit::HashMap<usize, u32>>>;
+
+/// The cells a structure refers to by address (compiled code's constants,
+/// a lowering's call sites' closures): roots while it lives.
+#[derive(Default)]
+pub(crate) struct KeptCells {
+    addrs: Vec<usize>,
+    table: Option<KeptTable>,
+}
+
+impl Drop for KeptCells {
+    fn drop(&mut self) {
+        if let Some(t) = &self.table {
+            let mut t = t.borrow_mut();
+            for a in &self.addrs {
+                if let std::collections::hash_map::Entry::Occupied(mut e) = t.entry(*a) {
+                    *e.get_mut() -= 1;
+                    if *e.get() == 0 {
+                        e.remove();
+                    }
+                }
+            }
         }
     }
 }
@@ -2116,7 +2195,7 @@ impl Vm {
                 add(&mut pin, *(a as *const usize), STACK);
             }
         }
-        for &a in self.heap.gc.kept.iter().chain(&self.heap.gc.log_kept).chain(&self.relied_slots) {
+        for &a in self.heap.kept_addrs().iter().chain(&self.heap.gc.log_kept).chain(&self.relied_slots) {
             add(&mut pin, a, KEPT);
         }
         for &k in self.ctor_protos_keys().iter() {
@@ -2280,8 +2359,9 @@ impl Vm {
     /// found live: see `mark_live_codes_and_shapes`).
     unsafe fn mark_structures(&mut self, m: &mut Marking) {
         unsafe {
-            for i in 0..self.heap.gc.kept.len() {
-                let a = self.heap.gc.kept[i];
+            // (Only the live structures': what compiled code dropped
+            // embedded is not a root.)
+            for a in self.heap.kept_addrs() {
                 self.mark_interior(m, a);
             }
             self.roots_report(m, "kept");
@@ -2417,8 +2497,8 @@ impl Vm {
             for v in self.registered_symbols() {
                 e.value(v);
             }
-            for i in 0..self.heap.gc.kept.len() {
-                if let Some(p) = self.heap.cell_containing(self.heap.gc.kept[i]) {
+            for a in self.heap.kept_addrs() {
+                if let Some(p) = self.heap.cell_containing(a) {
                     e.cell(p);
                 }
             }

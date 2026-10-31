@@ -119,6 +119,13 @@ impl Drop for State {
 }
 
 impl State {
+    /// [`State::roots`] as slots (see `gc::Root`).
+    pub(crate) fn root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        if let Some(v) = &mut self.callback {
+            f(crate::gc::Root::Value(v));
+        }
+    }
+
     pub(crate) fn roots(&self) -> impl Iterator<Item = Value> + '_ {
         self.callback.iter().copied()
     }

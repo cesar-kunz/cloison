@@ -241,6 +241,10 @@ pub struct Gc {
     /// After each stop-the-world full collection, print the small blocks'
     /// occupancy and what in them could not move (`CLOISON_GC_FRAG`).
     frag_report: bool,
+    /// After each full collection stopping the world, that every cell it
+    /// marked is reached from the roots' slots (`CLOISON_GC_SLOTS`, see
+    /// `Vm::check_root_slots`).
+    slots_check: bool,
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
     /// (`CLOISON_GC_CHECK_BARRIER`, slow).
@@ -267,6 +271,7 @@ impl Gc {
             check_barriers: env("CLOISON_GC_CHECK_BARRIER"),
             roots_report: env("CLOISON_GC_ROOTS"),
             frag_report: env("CLOISON_GC_FRAG"),
+            slots_check: env("CLOISON_GC_SLOTS"),
             nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -608,6 +613,20 @@ unsafe fn trace_shape(m: &mut impl Visit, mut s: *const crate::object::Shape, ep
             s = (*s).parent;
         }
     }
+}
+
+/// A root as a collection that moves cells needs it (see
+/// `Vm::each_root_slot`): a slot it may update, of a value (any: those
+/// that aren't cells are skipped), an object pointer (null skipped) or an
+/// array's or upvalue's payload pointer (past its header word; null
+/// skipped), or a cell that must stay where it is, as a conservative word
+/// refers to it or an address compiled code embeds.
+#[derive(Clone, Copy)]
+pub(crate) enum Root {
+    Value(*mut Value),
+    Object(*mut *mut Object),
+    Payload(*mut usize),
+    Pinned(usize),
 }
 
 /// What tracing a cell does with each reference it finds.
@@ -1694,6 +1713,11 @@ impl Vm {
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
             }
+            // (Before anything is freed or condemned: compiled code dropped
+            // next takes the cells it kept out of the roots.)
+            if kind == Collection::Full && self.heap.gc.slots_check {
+                self.check_root_slots(sp, regs, color);
+            }
             times[2] = lap();
             freed = match kind {
                 // The young cells left unmarked are freed now, not by the
@@ -2508,15 +2532,239 @@ impl Vm {
         }
     }
 
-    /// Call `f` with every cell a root refers to (for `verify_marking`).
-    unsafe fn each_root(&mut self, sp: usize, regs: *mut Value, f: &mut dyn FnMut(usize)) {
-        struct Each<'a>(&'a mut dyn FnMut(usize));
-        impl Visit for Each<'_> {
+    /// `CLOISON_GC_SLOTS`, after a full collection stopping the world: mark
+    /// again from the roots' slots and pins alone ([`Vm::each_root_slot`]),
+    /// through the cells' slots ([`trace`]) and the live weak collections'
+    /// entries of live keys, and panic on a cell the collection marked
+    /// that this didn't reach: one a moving collection would find no slot
+    /// to update for (stage 2 of evacuating fragmented blocks).
+    #[cold]
+    #[inline(never)]
+    unsafe fn check_root_slots(&mut self, sp: usize, regs: *mut Value, color: u8) {
+        struct Reach {
+            range: (usize, usize),
+            color: u8,
+            seen: std::collections::HashSet<usize>,
+            work: Vec<usize>,
+        }
+        impl Reach {
+            fn reach(&mut self, p: usize) {
+                let marked = is_cell_in(self.range, p) && unsafe { *crate::heap::meta(p) } & (YOUNG | COLOR) == self.color;
+                if marked && self.seen.insert(p) {
+                    self.work.push(p);
+                }
+            }
+        }
+        impl Visit for Reach {
             unsafe fn cell(&mut self, p: usize) {
-                (self.0)(p)
+                self.reach(p)
             }
         }
         let range = self.heap.cells_range();
+        let mut r = Reach { range, color, seen: Default::default(), work: Vec::new() };
+        unsafe {
+            self.each_root_slot(sp, regs, &mut |root| match root {
+                Root::Value(a) => {
+                    if (*a).is_cell() {
+                        r.reach((*a).to_bits() as usize)
+                    }
+                }
+                Root::Object(a) => r.reach(*a as usize),
+                Root::Payload(a) => {
+                    if *a != 0 {
+                        r.reach(*a - 8)
+                    }
+                }
+                Root::Pinned(p) => r.reach(p),
+            });
+            loop {
+                while let Some(p) = r.work.pop() {
+                    trace(&mut r, p, 0, usize::MAX);
+                }
+                // The weak collections' entries of keys reached.
+                let mut more = false;
+                for &t in &self.weak_tables {
+                    if !r.seen.contains(&(t as usize)) || !matches!((*t).class, Class::WeakMap | Class::FinalizationRegistry) {
+                        continue;
+                    }
+                    let e = Value::from_bits((*t).code as u64);
+                    if !e.is_cell() {
+                        continue;
+                    }
+                    let e = crate::object::as_object(e);
+                    let (buf, len) = ((*e).elems, (*e).elems_len as usize);
+                    let mut i = crate::collections::BASE;
+                    while i + 1 < len {
+                        let (k, v) = (*buf.add(i), *buf.add(i + 1));
+                        if k.is_cell() && r.seen.contains(&(k.to_bits() as usize)) && v.is_cell() {
+                            let before = r.work.len();
+                            r.reach(v.to_bits() as usize);
+                            more |= r.work.len() > before;
+                        }
+                        i += 2;
+                    }
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+        // Every cell left (all marked, all old): reached?
+        let mut missed: Vec<(usize, String)> = Vec::new();
+        let mut n = 0;
+        for (start, end) in self.heap.block_ranges() {
+            let mut p = start;
+            while p < end {
+                let m = unsafe { *crate::heap::meta(p) };
+                if m & (YOUNG | COLOR) == 0 {
+                    p += GRANULE;
+                    continue;
+                }
+                let size = unsafe { cell_size(p as *const u8) };
+                n += 1;
+                if m & (YOUNG | COLOR) == color && !r.seen.contains(&p) {
+                    let w = unsafe { *(p as *const u64) };
+                    let kind = if w & 1 == 0 {
+                        format!("{:?}", unsafe { (*(p as *const Object)).class })
+                    } else {
+                        format!("header {:#x}", w & 7)
+                    };
+                    missed.push((p, kind));
+                }
+                p += size;
+            }
+        }
+        if self.heap.gc.stats || !missed.is_empty() {
+            eprintln!("slots: {} cells, {} reached from the roots' slots, {} not", n, r.seen.len(), missed.len());
+        }
+        if !missed.is_empty() {
+            for (p, k) in missed.iter().take(16) {
+                eprintln!("  not reached: {p:#x} {k}");
+            }
+            // What refers to the first, up through what isn't reached either.
+            struct Finds(usize, bool);
+            impl Visit for Finds {
+                unsafe fn cell(&mut self, p: usize) {
+                    self.1 |= p == self.0;
+                }
+            }
+            let mut target = missed[0].0;
+            for _ in 0..6 {
+                let mut by = None;
+                for (start, end) in self.heap.block_ranges() {
+                    let mut p = start;
+                    while p < end && by.is_none() {
+                        let m = unsafe { *crate::heap::meta(p) };
+                        if m & (YOUNG | COLOR) == 0 {
+                            p += GRANULE;
+                            continue;
+                        }
+                        let mut f = Finds(target, false);
+                        unsafe { trace(&mut f, p, 0, usize::MAX) };
+                        if f.1 && p != target {
+                            by = Some(p);
+                        }
+                        p += unsafe { cell_size(p as *const u8) };
+                    }
+                }
+                let Some(b) = by else {
+                    eprintln!("  {target:#x}: no cell refers to it (a Rust structure, then)");
+                    self.who_holds(target, &r.seen);
+                    break;
+                };
+                let w = unsafe { *(b as *const u64) };
+                let kind = if w & 1 == 0 { format!("{:?}", unsafe { (*(b as *const Object)).class }) } else { format!("header {:#x}", w & 7) };
+                eprintln!("  {target:#x} is referred to by {b:#x} {kind}, {}reached", if r.seen.contains(&b) { "" } else { "not " });
+                if r.seen.contains(&b) {
+                    break;
+                }
+                if b == missed[0].0 {
+                    self.who_holds(target, &r.seen);
+                    self.who_holds(b, &r.seen);
+                    break;
+                }
+                target = b;
+            }
+            panic!("CLOISON_GC_SLOTS: {} marked cells no root's slot reaches", missed.len());
+        }
+    }
+
+    /// `CLOISON_GC_SLOTS`' diagnosis: the Rust structures that hold `p`.
+    #[cold]
+    fn who_holds(&self, p: usize, _seen: &std::collections::HashSet<usize>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let from = self.heap.gc.codes_from;
+        let v = p as u64;
+        for s in self.shapes().chain(self.zombies.iter().map(|z| &**z)) {
+            if s.proto.to_bits() == v {
+                eprintln!("    the prototype of shape {:p}: mark {} (from {from}), pinned {}, unique {}, zombie {}", s, s.mark.load(Relaxed), s.pinned.get(), s.unique, s.is_zombie());
+            }
+        }
+        for (k, c) in self.codes().chain(self.condemned.iter().map(|c| &**c)).enumerate() {
+            if c.constants.iter().any(|x| x.to_bits() == v) {
+                eprintln!("    a constant of code {k} {}: mark {}, pinned {}", c.name, c.mark.load(Relaxed), c.pinned.get());
+            }
+            for ways in c.made_ics().iter() {
+                for ic in unsafe { (*ways.get()).iter() } {
+                    if ic.holder as u64 == v {
+                        eprintln!("    an inline cache's holder in code {k} {}: mark {}, pinned {}", c.name, c.mark.load(Relaxed), c.pinned.get());
+                    }
+                }
+            }
+        }
+        if self.heap.kept_addrs().iter().any(|&a| self.heap.cell_containing(a) == Some(p)) {
+            eprintln!("    kept");
+        }
+        if self.relied_slots.iter().any(|&a| self.heap.cell_containing(a) == Some(p)) {
+            eprintln!("    a relied slot");
+        }
+        if self.ctor_protos_keys().contains(&p) {
+            eprintln!("    a constructor-tracking key");
+        }
+        if self.named_roots().iter().any(|x| x.to_bits() == v) {
+            eprintln!("    a named root");
+        }
+    }
+
+    /// Every root of a full marking, as cells (`CLOISON_GC_VERIFY`): those of
+    /// [`Vm::each_root_slot`].
+    unsafe fn each_root(&mut self, sp: usize, regs: *mut Value, f: &mut dyn FnMut(usize)) {
+        let range = self.heap.cells_range();
+        let contains = |a: usize| a >= range.0 && a < range.1;
+        unsafe {
+            self.each_root_slot(sp, regs, &mut |r| match r {
+                Root::Value(a) => {
+                    let v = *a;
+                    if v.is_cell() && is_cell_in(range, v.to_bits() as usize) {
+                        f(v.to_bits() as usize)
+                    }
+                }
+                Root::Object(a) => {
+                    if !(*a).is_null() && contains(*a as usize) {
+                        f(*a as usize)
+                    }
+                }
+                Root::Payload(a) => {
+                    if *a != 0 {
+                        f(*a - 8)
+                    }
+                }
+                Root::Pinned(p) => f(p),
+            });
+        }
+    }
+
+    /// Every root of a full marking as a slot it could update, or a cell
+    /// that must stay (stage 2 of evacuating fragmented blocks): the VM
+    /// stack's words and the arguments the runtime passes (`pending_args`),
+    /// the VM's own references, field by field (`named_root_slots`), the
+    /// handles, `WeakRef` targets and open upvalues, what Rust structures
+    /// took since the last collection, the prototypes of the shapes it
+    /// keeps, the constants and inline caches' holders of the functions it
+    /// keeps, the string constants and `Symbol.for`'s symbols; pinned, what
+    /// a native stack word points into and what compiled code embeds.
+    unsafe fn each_root_slot(&mut self, sp: usize, regs: *mut Value, f: &mut dyn FnMut(Root)) {
+        use std::sync::atomic::Ordering::Relaxed;
         unsafe {
             let stack = self.stack.as_ptr() as usize;
             let stack_end = self.stack_end as usize;
@@ -2526,58 +2774,67 @@ impl Vm {
                 if (stack..stack_end).contains(&w) {
                     top = top.max(w);
                 } else if let Some(p) = self.heap.cell_containing(w) {
-                    f(p);
+                    f(Root::Pinned(p));
                 }
             }
             let top = (top + 8 * self.max_frame).clamp(stack, stack_end);
             for a in (stack..top).step_by(8) {
-                let w = *(a as *const usize);
-                if Value::from_bits(w as u64).is_cell() && is_cell_in(range, w) {
-                    f(w);
+                f(Root::Value(a as *mut Value));
+            }
+            let (args, n) = self.pending_args;
+            if !args.is_null() {
+                for i in 0..n {
+                    f(Root::Value(args.add(i).cast_mut()));
                 }
             }
-            let mut e = Each(f);
-            for v in self.named_roots() {
-                e.value(v);
+            self.named_root_slots(f);
+            for v in self.handles.iter_mut().chain(self.kept_alive.iter_mut()) {
+                f(Root::Value(v));
             }
-            for i in 0..self.handles.len() {
-                e.value(self.handles[i]);
+            for u in &mut self.open_upvalues {
+                f(Root::Payload((u as *mut *mut crate::vm::Upvalue).cast()));
             }
-            for i in 0..self.kept_alive.len() {
-                e.value(self.kept_alive[i]);
+            for &c in &self.heap.gc.log {
+                f(Root::Pinned(c));
             }
-            for i in 0..self.open_upvalues.len() {
-                e.payload(self.open_upvalues[i] as usize);
+            for &a in &self.heap.gc.log_kept {
+                if let Some(p) = self.heap.cell_containing(a) {
+                    f(Root::Pinned(p));
+                }
+            }
+            for &a in &self.heap.gc.log_slots {
+                f(Root::Object(a as *mut *mut Object));
             }
             let from = self.heap.gc.codes_from;
             let all = !self.heap.gc.shape_cycle;
             for s in self.shapes() {
-                if all || s.pinned.get() || s.mark.load(std::sync::atomic::Ordering::Relaxed) >= from {
-                    e.value(s.proto);
+                if all || s.pinned.get() || s.mark.load(Relaxed) >= from {
+                    f(Root::Value((&raw const s.proto).cast_mut()));
                 }
             }
-            for code in self.codes().filter(|c| c.pinned.get() || c.mark.load(std::sync::atomic::Ordering::Relaxed) >= from) {
-                for &c in code.constants.iter() {
-                    e.value(c);
+            let heap = &self.heap;
+            for code in self.codes().filter(|c| c.pinned.get() || c.mark.load(Relaxed) >= from) {
+                for c in code.constants.iter() {
+                    f(Root::Value((c as *const Value).cast_mut()));
                 }
                 for ways in code.made_ics().iter() {
-                    for ic in (*ways.get()).iter() {
-                        let h = ic.holder as usize;
-                        if self.heap.contains(h) {
-                            e.cell(h);
+                    for ic in (*ways.get()).iter_mut() {
+                        // (A store's holder is a field type.)
+                        if heap.contains(ic.holder as usize) {
+                            f(Root::Object(&mut ic.holder));
                         }
                     }
                 }
             }
-            for v in self.string_constants() {
-                e.value(v);
+            for v in self.string_constant_slots() {
+                f(Root::Value(v));
             }
-            for v in self.registered_symbols() {
-                e.value(v);
+            for o in self.symbol_registry.values_mut() {
+                f(Root::Object(o));
             }
             for a in self.heap.kept_addrs() {
                 if let Some(p) = self.heap.cell_containing(a) {
-                    e.cell(p);
+                    f(Root::Pinned(p));
                 }
             }
         }

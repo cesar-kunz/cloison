@@ -24,12 +24,17 @@ pub(crate) const NONE: u32 = u32::MAX;
 /// (for [`counterpart`]).
 trait Field {
     fn trace(&self, _: &mut Vec<Value>) {}
+    /// Its references as slots, for a collection that moves cells.
+    fn slots(&mut self, _: &mut dyn FnMut(crate::gc::Root)) {}
     fn pairs(&self, _: &Self, _: &mut dyn FnMut(Value, Value)) {}
     /// The shapes it holds, which a full marking keeps (see `Shape::mark`).
     fn shapes(&self, _: &mut Vec<*const Shape>) {}
 }
 
 impl Field for *mut Object {
+    fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        f(crate::gc::Root::Object(self))
+    }
     fn trace(&self, out: &mut Vec<Value>) {
         if !self.is_null() {
             out.push(object_value(*self));
@@ -43,6 +48,9 @@ impl Field for *mut Object {
 }
 
 impl Field for Value {
+    fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        f(crate::gc::Root::Value(self))
+    }
     fn trace(&self, out: &mut Vec<Value>) {
         if self.is_cell() {
             out.push(*self);
@@ -56,6 +64,9 @@ impl Field for Value {
 }
 
 impl<T: Field> Field for Vec<T> {
+    fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        self.iter_mut().for_each(|x| x.slots(f));
+    }
     fn shapes(&self, out: &mut Vec<*const Shape>) {
         self.iter().for_each(|x| x.shapes(out));
     }
@@ -68,6 +79,9 @@ impl<T: Field> Field for Vec<T> {
 }
 
 impl<T: Field, const N: usize> Field for [T; N] {
+    fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        self.iter_mut().for_each(|x| x.slots(f));
+    }
     fn shapes(&self, out: &mut Vec<*const Shape>) {
         self.iter().for_each(|x| x.shapes(out));
     }
@@ -80,6 +94,9 @@ impl<T: Field, const N: usize> Field for [T; N] {
 }
 
 impl Field for (Value, crate::regexp::Captures) {
+    fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        self.0.slots(f);
+    }
     fn trace(&self, out: &mut Vec<Value>) {
         self.0.trace(out);
     }
@@ -127,6 +144,11 @@ macro_rules! realm_fields {
                 $(Field::trace(&self.$name, out);)*
             }
 
+            /// The cells it holds, as slots (see `gc::Root`).
+            pub(crate) fn slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+                $(Field::slots(&mut self.$name, f);)*
+            }
+
             /// The shapes it holds.
             pub(crate) fn shapes(&self, out: &mut Vec<*const Shape>) {
                 $(Field::shapes(&self.$name, out);)*
@@ -146,6 +168,11 @@ macro_rules! realm_fields {
         /// its address would have passed for it).
         pub(crate) fn current_trace(vm: &Vm, out: &mut Vec<Value>) {
             $(Field::trace(&vm.$($path).+, out);)*
+        }
+
+        /// [`current_trace`]'s cells as slots (see `gc::Root`).
+        pub(crate) fn current_slots(vm: &mut Vm, f: &mut dyn FnMut(crate::gc::Root)) {
+            $(Field::slots(&mut vm.$($path).+, f);)*
         }
 
         /// The shapes the current realm's intrinsics hold.
@@ -399,5 +426,29 @@ mod tests {
             assert!(roots.contains(&v.to_bits()), "{v:?} is no root");
         }
         assert!(roots.contains(&object_value(vm.math_sqrt_fn).to_bits()));
+    }
+
+    /// The named roots as slots name the same cells as the named roots.
+    #[test]
+    fn the_named_roots_slots_are_the_named_roots() {
+        let mut vm = Vm::new();
+        // (Cells: `named_roots` has a few values that aren't, which marking
+        // skips.)
+        let roots: std::collections::BTreeSet<u64> =
+            vm.named_roots().iter().filter(|v| v.is_cell()).map(|v| v.to_bits()).collect();
+        let mut slots = std::collections::BTreeSet::new();
+        vm.named_root_slots(&mut |r| unsafe {
+            match r {
+                crate::gc::Root::Value(a) if (*a).is_cell() => {
+                    slots.insert((*a).to_bits());
+                }
+                crate::gc::Root::Object(a) if !(*a).is_null() => {
+                    slots.insert(object_value(*a).to_bits());
+                }
+                _ => {}
+            }
+        });
+        assert!(roots.len() > 100);
+        assert_eq!(roots, slots);
     }
 }

@@ -137,6 +137,18 @@ impl Default for State {
 }
 
 impl State {
+    /// [`State::roots`] as slots (see `gc::Root`).
+    pub(crate) fn root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        use crate::gc::Root;
+        for o in [&mut self.prototype, &mut self.constructor, &mut self.live] {
+            f(Root::Object(o));
+        }
+        for (_, p, resolve) in &mut self.waits {
+            f(Root::Value(p));
+            f(Root::Value(resolve));
+        }
+    }
+
     pub(crate) fn roots(&self) -> Vec<Value> {
         let mut v: Vec<Value> =
             [self.prototype, self.constructor, self.live].into_iter().filter(|o| !o.is_null()).map(object_value).collect();

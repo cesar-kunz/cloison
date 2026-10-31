@@ -152,6 +152,30 @@ fn re_exports_ok(vm: &Vm) -> Result<()> {
 
 impl Modules {
     /// The values the records hold (GC roots).
+    /// [`Modules::roots`] as slots (see `gc::Root`).
+    pub(crate) fn root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        use crate::gc::Root;
+        for r in &mut self.records {
+            for v in [&mut r.env, &mut r.namespace, &mut r.deferred, &mut r.source_object, &mut r.generator, &mut r.meta] {
+                f(Root::Value(v));
+            }
+            if let Some(e) = &mut r.error {
+                f(Root::Value(e));
+            }
+            for (p, g, h) in r.capability.iter_mut() {
+                for v in [p, g, h] {
+                    f(Root::Value(v));
+                }
+            }
+        }
+        for t in &mut self.templates {
+            f(Root::Object(t));
+        }
+        for v in &mut self.abstract_source {
+            f(Root::Value(v));
+        }
+    }
+
     pub(crate) fn roots(&self) -> Vec<Value> {
         let mut v: Vec<Value> = self.records.iter().flat_map(|r| r.values()).filter(|v| v.is_cell()).collect();
         v.extend(self.templates.iter().map(|&t| object_value(t)));

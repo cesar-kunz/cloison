@@ -665,7 +665,7 @@ pub struct Vm {
     /// Shapes a full marking found dead (see [`Vm::sweep_shapes`]) that a
     /// cache or the JIT may still compare with or read: kept, so that
     /// their addresses aren't reused (see [`Vm::free_zombies`]).
-    zombies: Vec<crate::object::ShapeBox>,
+    pub(crate) zombies: Vec<crate::object::ShapeBox>,
     /// Zombies nothing held at a full marking's end, freed once the sweep
     /// that frees their objects is done (as `condemned` codes).
     pub(crate) condemned_shapes: Vec<crate::object::ShapeBox>,
@@ -6001,6 +6001,75 @@ impl Vm {
         v
     }
 
+    /// [`Vm::named_roots`] as slots (see `gc::Root`), field by field.
+    pub(crate) fn named_root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        use crate::gc::Root;
+        for o in [
+            &mut self.global,
+            &mut self.object_prototype,
+            &mut self.function_prototype,
+            &mut self.array_prototype,
+            &mut self.string_prototype,
+            &mut self.missing_holder,
+            &mut self.function_call_fn,
+            &mut self.array_fn,
+            &mut self.date_prototype,
+            &mut self.number_prototype,
+            &mut self.bigint_prototype,
+            &mut self.regexp_prototype,
+            &mut self.boolean_prototype,
+            &mut self.array_buffer_prototype,
+            &mut self.shared_atomics,
+            &mut self.regexp_constructor,
+            &mut self.array_push_fn,
+            &mut self.array_pop_fn,
+            &mut self.thrower,
+            &mut self.eval_function,
+            &mut self.job_queue,
+        ] {
+            f(Root::Object(o));
+        }
+        for v in [
+            &mut self.typed_prototypes[..],
+            &mut self.typed_constructors[..],
+            &mut self.collection_prototypes[..],
+            &mut self.promise_roots[..],
+            &mut self.iterator_roots[..],
+            &mut self.symbol_roots[..],
+            &mut self.error_prototypes[..],
+            &mut self.shadow_roots[..],
+            &mut self.intl_roots[..],
+        ] {
+            for o in v {
+                f(Root::Object(o));
+            }
+        }
+        for o in self.template_cache.values_mut().chain(self.symbols.values_mut()) {
+            f(Root::Object(o));
+        }
+        for m in &mut self.mapped_args {
+            f(Root::Object(&mut m.o));
+            f(Root::Object(&mut m.scope.0));
+        }
+        for v in [&mut self.bind_helper, &mut self.from_async_helper, &mut self.legacy_match.0, &mut self.legacy_input] {
+            f(Root::Value(v));
+        }
+        for v in self.dispose_roots.iter_mut().chain(self.single_chars.iter_mut()) {
+            f(Root::Value(v));
+        }
+        self.modules.root_slots(f);
+        self.shared.root_slots(f);
+        self.agent.root_slots(f);
+        self.temporal.root_slots(f);
+        crate::realm::current_slots(self, f);
+        for r in &mut self.realms {
+            r.slots(f);
+        }
+        if let Some(Error(_, Some(e))) = &mut self.error {
+            f(Root::Value(e));
+        }
+    }
+
     /// Every shape.
     pub(crate) fn shapes(&self) -> impl Iterator<Item = &Shape> {
         self.shapes.iter().map(|s| &**s)
@@ -6009,6 +6078,11 @@ impl Vm {
     /// Every function's code.
     pub(crate) fn codes(&self) -> impl Iterator<Item = &Code> {
         self.codes.iter().map(|c| &**c)
+    }
+
+    /// The string constants' slots.
+    pub(crate) fn string_constant_slots(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.strings.values_mut()
     }
 
     /// The string constants (see [`Vm::string_constant`]).

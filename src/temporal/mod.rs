@@ -93,6 +93,13 @@ pub(crate) struct State {
 }
 
 impl State {
+    /// [`State::roots`] as slots (see `gc::Root`).
+    pub(crate) fn root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
+        for o in self.protos.iter_mut().chain(self.ctors.iter_mut()) {
+            f(crate::gc::Root::Object(o));
+        }
+    }
+
     pub(crate) fn roots(&self) -> impl Iterator<Item = Value> + '_ {
         self.protos.iter().chain(self.ctors.iter()).map(|&o| object_value(o))
     }

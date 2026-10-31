@@ -63,6 +63,48 @@ use crate::object::{Atom, Class, FieldType, Object, PAGE, Shape};
 use crate::layout::InstanceOfEntry;
 use crate::value::{NumberTag, Value};
 
+/// At a full collection, free the versions call sites were bound to before
+/// (`Caches::retired`, see `CallSite::bind`) that nothing runs or names any
+/// more: kept for good, with their code and the cells they embed, as one
+/// might be running when its call site is bound to another (sass retired
+/// 2,483 of 2,701 versions, the TypeScript app 3,873 of 5,690). One is
+/// running while a word of the stacks `words` gives points into its code (a
+/// return address, a frame's exit code) or at it (a direct call's exit
+/// finishing it); it is named while another `Rc` holds it (a call site, its
+/// function's versions) or a call site of its snapshot calls it as its own
+/// (`CallSite::self_code`).
+pub(crate) fn free_retired(vm: &mut crate::vm::Vm, words: &[usize]) {
+    let retired = &mut vm.jit_caches.retired;
+    if retired.is_empty() {
+        return;
+    }
+    // (Each retired version's ranges, by start, to look the words up in.)
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(2 * retired.len());
+    for (k, c) in retired.iter().enumerate() {
+        ranges.push((c.mem.ptr as usize, c.mem.ptr as usize + c.len.max(1), k));
+        let at = Rc::as_ptr(c) as usize;
+        ranges.push((at, at + std::mem::size_of::<JitCode>(), k));
+    }
+    ranges.sort_unstable();
+    let mut used = vec![false; retired.len()];
+    for &w in words {
+        let i = ranges.partition_point(|r| r.0 <= w);
+        if i > 0 && w < ranges[i - 1].1 {
+            used[ranges[i - 1].2] = true;
+        }
+    }
+    let mut k = 0;
+    retired.retain(|c| {
+        let keep = used[k]
+            || Rc::strong_count(c) > 1
+            || c.snap.as_ref().is_some_and(|s| {
+                s.sites.iter().any(|site| std::ptr::eq(unsafe { (*site.get()).self_code }, Rc::as_ptr(c)))
+            });
+        k += 1;
+        keep
+    });
+}
+
 /// An `instanceof` site's cache (`Prop::InstanceOf`): two entries, the
 /// latest first.
 type InstanceOfCache = [std::cell::Cell<InstanceOfEntry>; 2];
@@ -4886,14 +4928,17 @@ fn variable_assigned_uncached(vm: *mut crate::vm::Vm, code: *const crate::vm::Co
         return true;
     }
     // Down from it: each nested function's upvalues that are the variable.
+    // (A nested function freed is null: see `Vm::condemn_codes`.)
     let mut stack: Vec<(*const Code, Vec<usize>)> = unsafe { &(*decl).closures }
         .iter()
+        .filter(|n| !n.is_null())
         .map(|&n| {
             let s = unsafe { &(*n).upvalues }.iter().enumerate();
             (n, s.filter(|&(_, &(l, j))| l && j == reg).map(|(m, _)| m).collect())
         })
         .collect();
     while let Some((n, these)) = stack.pop() {
+        debug_assert!(unsafe { (*vm).code_set.contains(&(n as usize)) }, "a freed nested function");
         if !these.is_empty() {
             if unsafe { (*n).lazy.is_some() } {
                 // (Not compiled yet: compiled here, not installed.)
@@ -4906,7 +4951,7 @@ fn variable_assigned_uncached(vm: *mut crate::vm::Vm, code: *const crate::vm::Co
                 return true;
             }
         }
-        for &m in unsafe { &(*n).closures } {
+        for &m in unsafe { &(*n).closures }.iter().filter(|m| !m.is_null()) {
             let s = unsafe { &(*m).upvalues }.iter().enumerate();
             let theirs: Vec<usize> =
                 s.filter(|&(_, &(l, j))| !l && these.contains(&(j as usize))).map(|(q, _)| q).collect();
@@ -8096,6 +8141,10 @@ pub struct JitCode {
     /// For a VM function: the lowering compiled, which exits refer to and
     /// the code's call sites live in. Running code keeps it alive.
     snap: Option<Rc<Snapshot>>,
+    /// The cells the code embeds (its relocations'), kept while it lives
+    /// (see `gc::KeptCells`).
+    #[allow(dead_code)]
+    kept: crate::gc::KeptCells,
 }
 
 /// How a run of [`JitCode`] ended.
@@ -8197,6 +8246,7 @@ impl JitCode {
         let nregs = actual.regs.len();
         // The collector scans the VM stack that far past a frame.
         let cur = crate::interp::current_vm();
+        let kept_from = if cur.is_null() { 0 } else { unsafe { (*cur).heap.kept_mark() } };
         if !cur.is_null() {
             unsafe { (*cur).max_frame = (*cur).max_frame.max(nregs + interp::HEADER) };
         }
@@ -9825,7 +9875,11 @@ impl JitCode {
                     Sym::HoleImm64 if s.stencil().name == "exit_tail" => base,
                     // A cell, or an address in one, that the code embeds
                     // (a folded constant, a callee it checks for, a
-                    // prototype's slot): kept alive (see `gc`).
+                    // prototype's slot): kept alive while the code lives
+                    // (see `gc::KeptCells`). Not a number: a modulo's
+                    // magic multiplier (`mod_smi_iif`'s ⌈2^64 / k⌉ is
+                    // 0x7FFF_C000_7FFF for k = 131,073, where a heap may
+                    // well be).
                     // A shape it gives objects is pinned (see `Shape::pinned`),
                     // as a zombie it compares with is (never freed: see
                     // `Vm::free_zombies`).
@@ -9834,7 +9888,9 @@ impl JitCode {
                         let vm = crate::interp::current_vm();
                         if !vm.is_null() {
                             unsafe {
-                                (*vm).heap.keep(v as usize);
+                                if !s.stencil().name.starts_with("mod_smi") {
+                                    (*vm).heap.keep(v as usize);
+                                }
                                 if crate::object::is_shape_address(v as usize) {
                                     crate::object::pin_shape(v as *const Shape);
                                 }
@@ -9939,6 +9995,7 @@ impl JitCode {
             self_sites,
             forks,
             snap: None,
+            kept: if cur.is_null() { Default::default() } else { unsafe { (*cur).heap.kept_since(kept_from) } },
         };
         for &k in &code.self_sites {
             unsafe { (*vm_sites[k].get()).entry = code.entry_addr() };
@@ -10649,6 +10706,8 @@ struct Dispatch {
     /// The sites, by callee (one each: a slot two callees share points to
     /// the latest's).
     sites: HashMap<u64, Box<std::cell::UnsafeCell<CallSite>>>,
+    /// The closures the sites check for, kept while it lives.
+    kept: crate::gc::KeptCells,
 }
 
 // A dispatch table's slots (`dispatched` in the stencils too).
@@ -10805,6 +10864,7 @@ impl CallSite {
             let mut d = Box::new(Dispatch {
                 table: [0; DISPATCH],
                 sites: HashMap::default(),
+                kept: Default::default(),
             });
             self.table = d.table.as_mut_ptr();
             self.dispatch = Some(d);
@@ -10846,7 +10906,7 @@ impl CallSite {
         crate::vm::pin(callee);
         let site = d.sites.entry(key).or_insert_with(|| {
             if !by_code {
-                unsafe { (*vm).heap.keep(fo as usize) };
+                unsafe { (*vm).heap.keep_in(&mut d.kept, fo as usize) };
             }
             Box::new(std::cell::UnsafeCell::new(CallSite {
                 closure: key,
@@ -11053,6 +11113,10 @@ pub(crate) struct Snapshot {
     sites: Vec<Box<std::cell::UnsafeCell<CallSite>>>,
     #[allow(dead_code)]
     caches: Vec<Box<InstanceOfCache>>,
+    /// The cells the lowering took (constants, callees, prototypes its
+    /// call sites check), kept while it lives (see `gc::KeptCells`).
+    #[allow(dead_code)]
+    kept: crate::gc::KeptCells,
 }
 
 /// Emit polymorphic access `i` ([`Prop::Poly`]): a store's boxing and
@@ -11258,6 +11322,8 @@ struct Lowered {
     /// Per instruction, the registers an exit before it leaves the
     /// interpreter to read (see [`interp_live`]).
     exit_live: Vec<RegSet>,
+    /// The cells it took (see [`Snapshot::kept`]).
+    kept: crate::gc::KeptCells,
 }
 
 /// Register `reg` (renamed) of frame `frame` holds `value` for the
@@ -11499,7 +11565,11 @@ fn timed<T>(total: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> T) -> T {
 }
 
 fn lower(state: &mut VmState, epoch: u32) -> Lowered {
-    timed(&LOWER_NS, || lower_frames(state, epoch))
+    let vm = state.vm;
+    let from = unsafe { (*vm).heap.kept_mark() };
+    let mut low = timed(&LOWER_NS, || lower_frames(state, epoch));
+    low.kept = unsafe { (*vm).heap.kept_since(from) };
+    low
 }
 
 fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
@@ -11535,6 +11605,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             restores: Vec::new(),
             split: Vec::new(),
             exit_live: Vec::new(),
+            kept: Default::default(),
         },
         direct: Vec::new(),
         fwd: Vec::new(),
@@ -15907,6 +15978,7 @@ impl JitFunction {
                 exit_live: Vec::new(),
                 sites: Vec::new(),
                 caches: Vec::new(),
+                kept: Default::default(),
             }),
             inline_base: nregs,
             direct_base: usize::MAX,
@@ -16110,6 +16182,7 @@ impl JitFunction {
                 exit_live: low.exit_live,
                 sites: low.sites,
                 caches: low.caches,
+                kept: low.kept,
             });
         }
     }

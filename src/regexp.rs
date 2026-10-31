@@ -664,12 +664,16 @@ impl Regex {
                     None => clean = false,
                 }
             }
-            self.prog.run(s, at, run)
+            let matched = self.prog.run(s, at, run);
+            run.grew |= run.stack.capacity() * size_of::<Bt>() > RUN_KEPT;
+            matched
         };
         if self.search(s, start, |at| attempt(at, run)).is_none() {
+            run.trim();
             return false;
         }
         caps.extend_from_slice(&run.caps);
+        run.trim();
         true
     }
 
@@ -2144,6 +2148,39 @@ struct Run {
     /// Native code's registers and backtracking stack (see [`Native`]).
     slots: Vec<usize>,
     bt: Vec<usize>,
+    /// A stack grew past [`RUN_KEPT`] in this `exec` (see [`Run::trim`]).
+    grew: bool,
+}
+
+/// Bytes of a [`Run`]'s backtracking stacks kept from one `exec` to the
+/// next: past them, they shrink back once it ends.
+const RUN_KEPT: usize = 128 << 10;
+
+impl Run {
+    /// Its stacks back to their first sizes if an `exec` grew them past
+    /// [`RUN_KEPT`]: every regexp keeps its own, for good (compiled ones
+    /// aren't freed), and native code's doubles up to 8 MiB
+    /// (`NATIVE_STACK_MAX`) when it backtracks deep: CyberChef's patterns
+    /// held 360 MiB of them.
+    #[inline(always)]
+    fn trim(&mut self) {
+        if self.grew {
+            self.shrink();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn shrink(&mut self) {
+        self.grew = false;
+        if self.bt.capacity() * size_of::<usize>() > RUN_KEPT {
+            self.bt.truncate(NATIVE_STACK);
+            self.bt.shrink_to_fit();
+        }
+        if self.stack.capacity() * size_of::<Bt>() > RUN_KEPT {
+            self.stack = Vec::new();
+        }
+    }
 }
 
 /// The exec at which a pattern is compiled to native code: `CLOISON_NO_JIT`
@@ -2380,7 +2417,7 @@ impl Native {
     /// folding). That leaves registers changed.
     fn run(&self, re: &Regex, s: &[u16], at: usize, run: &mut Run) -> Option<bool> {
         use crate::jit::rx;
-        let Run { caps, slots, bt, .. } = run;
+        let Run { caps, slots, bt, grew, .. } = run;
         let ctx = rx::Ctx {
             limit: unsafe { bt.as_mut_ptr().add(bt.len() - 4) },
             classes: self.classes.as_ptr(),
@@ -2394,6 +2431,7 @@ impl Native {
             rx::BAIL => {
                 if bt.len() < NATIVE_STACK_MAX {
                     bt.resize(bt.len() * 2, 0);
+                    *grew |= bt.len() * size_of::<usize>() > RUN_KEPT;
                 }
                 None
             }
@@ -3091,6 +3129,25 @@ impl<'a> Matcher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `exec` that backtracked deep leaves its stacks no larger than
+    /// [`RUN_KEPT`], native code's or the interpreter's, and the next match
+    /// is still right.
+    #[test]
+    fn deep_backtracking_leaves_small_stacks() {
+        // (Sticky: one attempt, from 0; at every position it would take
+        // quadratic time.)
+        let re = Regex::new("(?:a|b)*c", "y").unwrap();
+        let long: Vec<u16> = "ab".repeat(200_000).encode_utf16().collect();
+        for _ in 0..native_after().min(64) + 2 {
+            assert!(re.exec(&long, 0).is_none());
+            let run = re.run.borrow();
+            assert!(run.bt.capacity() * size_of::<usize>() <= RUN_KEPT, "{}", run.bt.capacity());
+            assert!(run.stack.capacity() * size_of::<Bt>() <= RUN_KEPT, "{}", run.stack.capacity());
+        }
+        let hit: Vec<u16> = "ababc".encode_utf16().collect();
+        assert_eq!(re.exec(&hit, 0).map(|c| c[0]), Some(Some((0, 5))));
+    }
 
     fn find(p: &str, f: &str, s: &str) -> Option<Vec<Option<String>>> {
         let re = Regex::new(p, f).unwrap();

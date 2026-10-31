@@ -623,6 +623,50 @@ pub fn field_fits(want: u64, v: Value) -> bool {
     }
 }
 
+/// A shape's transitions of one kind: none until its first, a list then.
+/// Most shapes have none (MathJax's 805,000 of 830,000): two empty
+/// `RefCell<Vec>`s took 64 of a shape's 184 bytes, these take 32.
+pub(crate) struct Transitions<T>(RefCell<Option<Box<Vec<T>>>>);
+
+impl<T> Default for Transitions<T> {
+    fn default() -> Self {
+        Transitions(RefCell::new(None))
+    }
+}
+
+impl<T> Transitions<T> {
+    /// The transitions, borrowed.
+    pub(crate) fn borrow(&self) -> std::cell::Ref<'_, [T]> {
+        std::cell::Ref::map(self.0.borrow(), |l| l.as_deref().map_or(&[][..], |v| &v[..]))
+    }
+
+    /// The list, borrowed to change it (made if there is none).
+    pub(crate) fn borrow_mut(&self) -> std::cell::RefMut<'_, Vec<T>> {
+        std::cell::RefMut::map(self.0.borrow_mut(), |l| &mut **l.get_or_insert_with(Default::default))
+    }
+
+    /// Keep those `f` keeps (the list goes if none are).
+    pub(crate) fn retain(&self, f: impl FnMut(&T) -> bool) {
+        let mut l = self.0.borrow_mut();
+        if let Some(v) = l.as_mut() {
+            v.retain(f);
+            if v.is_empty() {
+                *l = None;
+            }
+        }
+    }
+
+    /// Forget them all.
+    pub(crate) fn clear(&self) {
+        self.0.take();
+    }
+
+    /// Bytes they take outside the shape.
+    pub(crate) fn bytes(&self) -> usize {
+        self.0.borrow().as_ref().map_or(0, |v| size_of::<Vec<T>>() + v.capacity() * size_of::<T>())
+    }
+}
+
 /// A hidden class. `repr(C)`: compiled code reads its first fields
 /// (`layout::ShapeHead`, checked against them below).
 #[repr(C)]
@@ -663,9 +707,9 @@ pub struct Shape {
     /// regardless (`Vm::transition_with`), is not shared either.
     pub fixed: bool,
     /// By the property added and its attributes.
-    pub(crate) transitions: RefCell<Vec<(Atom, u8, *const Shape)>>,
+    pub(crate) transitions: Transitions<(Atom, u8, *const Shape)>,
     /// The shapes this one moves to when its elements' type generalizes.
-    pub(crate) elem_transitions: RefCell<Vec<(FieldType, *const Shape)>>,
+    pub(crate) elem_transitions: Transitions<(FieldType, *const Shape)>,
     /// Compiled code takes an object that has at least this shape for one
     /// that has exactly it, as the shape is stable ([`Shape::is_stable`]):
     /// a transition from it drops the code (`Vm::shape_left_stable`).
@@ -1350,8 +1394,8 @@ mod tests {
             push: Cell::new(std::ptr::null_mut()),
             unique: false,
             fixed: false,
-            transitions: RefCell::default(),
-            elem_transitions: RefCell::default(),
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),

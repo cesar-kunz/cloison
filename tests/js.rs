@@ -7021,6 +7021,201 @@ Promise.resolve().then(() => {
     );
 }
 
+/// The cells compiled code embeds go with it: a loop compiled again for
+/// each closure it calls (each of its own code, inlined, its array a
+/// constant upvalue) keeps the arrays of the versions it dropped no more
+/// (all but the last 4 compiled; with every cell compiled code ever
+/// embedded kept for good, only 4 went). And the converse: a compiled loop
+/// still calls the closure it checks for, and only that one, after the
+/// program drops it and makes others, collections in between.
+#[test]
+fn compiled_code_keeps_its_cells_while_it_lives() {
+    let first = cloison::js::compile(
+        r#"
+var refs = [], last;
+function make(k) {
+  var p = (0, eval)("(function () { var o = [" + k + "]; " +
+    "return [o, function (i) { return o[0] + i; }]; })()");
+  refs.push(new WeakRef(p[0]));
+  return p[1];
+}
+function run() {
+  var sum = 0;
+  for (var k = 0; k < 40; k++) {
+    var f = make(k);
+    for (var i = 0; i < 3000; i++) sum += f(i);
+    last = f;
+  }
+  return sum;
+}
+var s = run(), out = [];
+function loop(g, n) { var t = 0; for (var i = 0; i < n; i++) t += g(i); return t; }
+function mk(n) { return (0, eval)("(function (i) { return i + " + n + "; })"); }
+var a = mk(1000);
+out.push(loop(a, 20000));
+a = null;
+Promise.resolve().then(() => {
+  $262.gc();
+  $262.gc();
+  var dead = refs.filter(r => r.deref() === undefined).length;
+  out.push(s, dead >= 30, refs[39].deref()[0], last(1));
+  var ok = true;
+  for (var k = 0; k < 200; k++) {
+    var b = mk(k);
+    if (loop(b, 100) !== 4950 + 100 * k) ok = false;
+    if (k % 50 == 0) $262.gc();
+  }
+  out.push(ok);
+});
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("out.join(' ')").unwrap();
+    let mut vm = Vm::new();
+    vm.run(&first).unwrap();
+    assert_eq!(vm.run(&second).map(display).unwrap(), "219990000 182280000 true 39 40 true");
+}
+
+/// A function the JIT took (compiled, its enclosing one pinned to fold
+/// its variables) that can't run again, no closure of it left, keeps
+/// neither its compiled code nor what that embeds: eval'd functions, each
+/// compiled for a loop over an array it closes over, then dropped, leave
+/// their arrays to be collected (none went: their codes are never freed,
+/// and were live for good).
+#[test]
+fn compiled_functions_no_longer_reachable_drop_their_code() {
+    let first = cloison::js::compile(
+        r#"
+var refs = [], sum = 0, out = [];
+for (var k = 0; k < 30; k++) {
+  var p = (0, eval)("(function () { var big = [" + k + ", 1, 2]; " +
+    "return [big, function (n) { var s = 0; for (var i = 0; i < n; i++) s += big[i % 3]; return s; }]; })()");
+  refs.push(new WeakRef(p[0]));
+  sum += p[1](20000);
+  p = null;
+}
+Promise.resolve().then(() => {
+  $262.gc();
+  $262.gc();
+  out.push(sum, refs.filter(r => r.deref() === undefined).length >= 25);
+});
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("out.join(' ')").unwrap();
+    let mut vm = Vm::new();
+    vm.run(&first).unwrap();
+    assert_eq!(vm.run(&second).map(display).unwrap(), "3500115 true");
+}
+
+/// The JIT's analysis of a variable walks the functions nested in the one
+/// declaring it, which the analysis pins; once that function is dead, the
+/// nested functions it didn't pin are freed, and its list of them must not
+/// lead the next analysis to them (Codex on #13: compiling `b` after `c`
+/// was freed read `c`'s freed code). Fifty such functions, each from its
+/// own eval, so that no stale word keeps all of them alive.
+#[test]
+fn variable_analysis_skips_freed_nested_functions() {
+    let src = r#"
+var keep = [];
+function hot(f) { var s = 0; for (var i = 0; i < 20000; i++) s += f(); return s; }
+function make(k) {
+  return (0, eval)("(function () {" +
+    "var outer = function () {" +
+    "  let o = {x: " + k + "};" +
+    "  function a() { return o.x; }" +
+    "  function b() { return o.x + 1; }" +
+    "  function c() { return " + k + "; }" +
+    "  return [a, b, c];" +
+    "};" +
+    "var fs = outer(); hot(fs[0]); return fs[1]; })()");
+}
+for (var k = 0; k < 50; k++) keep.push(make(k));
+function clobber(n) { var a = 0, b = 0, c = 0, d = 0; return n ? clobber(n - 1) + a + b + c + d : 0; }
+clobber(2000);
+for (var r = 0; r < 4; r++) { var junk = []; for (var i = 0; i < 100000; i++) junk.push({i}); $262.gc(); }
+var t = 0;
+for (var k = 0; k < 50; k++) t += hot(keep[k]);
+t
+"#;
+    assert_eq!(value(src), "25500000");
+}
+
+/// Deleting the property an object got last takes it back to the shape it
+/// had before, shared: bound functions (whose closure's `prototype` is
+/// deleted), objects adding then deleting, compiled reads after, and what
+/// may not (frozen, sealed, non-configurable, prototypes, accessors).
+#[test]
+fn deleting_the_last_property_takes_the_shape_before() {
+    let src = r#"
+var out = [];
+function F(a, b) { this.v = a; }
+var b = F.bind(null, 1);
+out.push(Object.getOwnPropertyNames(b).join(), b.name, b.length, 'prototype' in b, new b() instanceof F, new b().v);
+var o = {a: 1, b: 2}; delete o.b;
+out.push(Object.keys(o).join(), o.b, 'b' in o);
+o.b = 3; o.c = 4; out.push(JSON.stringify(o));
+var p = {x: 1, y: 2}; delete p.x; out.push(JSON.stringify(p));
+function get(r) { return r.y; }
+var n = 0;
+for (var i = 0; i < 100000; i++) { var r = {x: i, y: 2}; if (i & 1) delete r.y; if (get(r) === undefined) n++; }
+out.push(n);
+var fr = Object.freeze({a: 1, z: 2}); out.push(delete fr.z, fr.z);
+var se = Object.seal({a: 1, z: 2}); out.push(delete se.z, se.z);
+var pr = {k: 1, last: 2}; var child = Object.create(pr); child.k; out.push(delete pr.last, child.last, Object.keys(pr).join());
+var ac = {a: 1}; Object.defineProperty(ac, 'g', {get() { return 7; }, configurable: true}); out.push(ac.g, delete ac.g, ac.g, Object.keys(ac).join());
+var nc = {a: 1}; Object.defineProperty(nc, 'z', {value: 1, configurable: false}); out.push(delete nc.z, nc.z);
+var arr = [1, 2]; arr.extra = 1; delete arr.extra; arr.push(3); out.push(arr.join(), Object.keys(arr).join());
+var bs = []; for (var i = 0; i < 1000; i++) bs.push(function () { return this.q; }.bind({q: i}));
+var t = 0; for (var i = 0; i < 1000; i++) t += bs[i](); out.push(t, bs[5].name);
+var q = {a: 1, b: 2}; delete q.b; delete q.a; q.a = 9; out.push(JSON.stringify(q));
+out.join(' | ')
+"#;
+    assert_eq!(value(src), r#"length,name | bound F | 1 | false | true | 1 | a |  | false | {"a":1,"b":3,"c":4} | {"y":2} | 50000 | false | 2 | false | 2 | true |  | k | 7 | true |  | a | false | 1 | 1,2,3 | 0,1,2 | 499500 | bound  | {"a":9}"#);
+}
+
+/// Prototypes getting properties after their objects were read (each a
+/// unique shape, made from the one before, which is no longer kept as its
+/// parent): `Object.create` chains, a constructor's prototype getting a
+/// method and losing it, many properties then elements and a delete, class
+/// methods added late, an array made a prototype.
+#[test]
+fn prototypes_getting_properties_late() {
+    let src = r#"
+var out = [];
+// Attribute lists inheriting through Object.create chains, each one a prototype that gets properties after.
+var base = {a: 1};
+var chain = [base];
+for (var i = 1; i < 200; i++) { var o = Object.create(chain[i - 1]); o['k' + i] = i; o.a = i; chain.push(o); }
+function rd(o, k) { return o[k]; }
+var s = 0;
+for (var r = 0; r < 2000; r++) s += rd(chain[199], 'a') + rd(chain[199], 'k5') + (rd(chain[199], 'k150') | 0);
+out.push(s);
+// A prototype getting properties after its objects were read, compiled.
+function P() {} var p = P.prototype;
+var objs = []; for (var i = 0; i < 100; i++) objs.push(new P());
+function get(o) { return o.m === undefined ? 0 : o.m(); }
+var t = 0;
+for (var i = 0; i < 50000; i++) { t += get(objs[i % 100]); if (i === 20000) p.m = function () { return 1; }; if (i === 30000) p.n = 2; if (i === 40000) delete p.m; }
+out.push(t, Object.keys(p).join(), 'm' in objs[0]);
+// Many properties added to one prototype, then elements and a delete.
+var q = {}; var c = Object.create(q);
+for (var i = 0; i < 300; i++) q['p' + i] = i;
+q[0] = 'e'; delete q.p3;
+var u = 0; for (var i = 0; i < 300; i++) u += c['p' + i] | 0;
+out.push(u, c[0], 'p3' in c, Object.keys(q).length);
+// A class hierarchy with methods added late.
+class A { f() { return 1; } } class B extends A {} var b = new B();
+var w = 0; for (var i = 0; i < 30000; i++) { w += b.f(); if (i === 10000) A.prototype.g = () => 5; if (i === 15000) B.prototype.f = function () { return 2; }; }
+out.push(w, typeof b.g);
+// An object made a prototype, then its elements' type changing.
+var e = [1, 2, 3]; var ec = Object.create(e); e.push(1.5); e.push('x');
+out.push(ec.length, ec[3], ec[4]);
+out.join(' | ')
+"#;
+    assert_eq!(value(src), "708000 | 20000 | n | false | 44847 | e | false | 300 | 44999 | function | 5 | 1.5 | x");
+}
+
 /// `FinalizationRegistry`'s API: registering (argument checks, unregister
 /// tokens counted, held weakly) and unregistering.
 #[test]

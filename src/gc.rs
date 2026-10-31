@@ -150,10 +150,14 @@ pub struct Gc {
     /// The native stack's base: the highest address roots may be at
     /// (`Vm::run` records it).
     pub stack_base: usize,
-    /// Cells Rust structures refer to for good (compiled code's constants,
-    /// call sites' closures), each an address in or at a cell.
-    kept: Vec<usize>,
-    kept_set: crate::jit::HashSet<usize>,
+    /// Cells Rust structures refer to (compiled code's constants, call
+    /// sites' closures), each an address in or at a cell, with how many
+    /// live owners refer to it (see [`KeptCells`]).
+    kept: KeptTable,
+    /// Addresses taken by [`Heap::keep`] for an owner not made yet (a
+    /// lowering, a compilation): roots until [`Heap::kept_since`] hands
+    /// them to it.
+    pending_kept: Vec<usize>,
     /// Cells stored into Rust structures since the last collection (their
     /// first granules), and addresses in or at cells taken for good since
     /// (see [`Heap::keep`]).
@@ -373,12 +377,93 @@ impl Heap {
         self.gc.log_slots.retain(|s| !(from..to).contains(s));
     }
 
-    /// A Rust structure refers to the cell at or around address `a` for
-    /// good: compiled code embedding it, a call site caching it.
+    /// A Rust structure about to be made refers to the cell at or around
+    /// address `a`: compiled code embedding it, a call site caching it. A
+    /// root until [`Heap::kept_since`] gives it to that structure.
     pub fn keep(&mut self, a: usize) {
-        if self.contains(a) && self.gc.kept_set.insert(a) {
-            self.gc.kept.push(a);
+        // (Only an address in a cell: what isn't one marks nothing, and
+        // needn't be listed.)
+        if self.contains(a) && self.gc.pending_kept.last() != Some(&a) && self.cell_containing(a).is_some() {
+            self.gc.pending_kept.push(a);
             self.gc.log_kept.push(a);
+        }
+    }
+
+    /// The addresses Rust structures refer to (see [`KeptCells`]), and
+    /// those taken for structures not made yet.
+    pub(crate) fn kept_addrs(&self) -> Vec<usize> {
+        let t = self.gc.kept.borrow();
+        let mut v = Vec::with_capacity(t.len() + self.gc.pending_kept.len());
+        v.extend(t.keys().copied());
+        v.extend_from_slice(&self.gc.pending_kept);
+        v
+    }
+
+    /// Where the addresses kept from now on start (see `kept_since`).
+    pub(crate) fn kept_mark(&self) -> usize {
+        self.gc.pending_kept.len()
+    }
+
+    /// The addresses kept since mark `from`, for a structure that refers to
+    /// them while it lives.
+    pub(crate) fn kept_since(&mut self, from: usize) -> KeptCells {
+        let from = from.min(self.gc.pending_kept.len());
+        let mut addrs = self.gc.pending_kept.split_off(from);
+        addrs.sort_unstable();
+        addrs.dedup();
+        // (`split_off(0)` hands over the whole vector, its capacity too,
+        // and leaves one as large: every owner's list took the most
+        // `pending_kept` ever held, the TypeScript app's 24 MiB of them.)
+        addrs.shrink_to_fit();
+        let mut k = KeptCells { addrs: Vec::new(), table: Some(self.gc.kept.clone()) };
+        {
+            let mut t = self.gc.kept.borrow_mut();
+            for &a in &addrs {
+                *t.entry(a).or_default() += 1;
+            }
+        }
+        k.addrs = addrs;
+        k
+    }
+
+    /// Add address `a` to what `k` keeps, at once.
+    pub(crate) fn keep_in(&mut self, k: &mut KeptCells, a: usize) {
+        if k.addrs.contains(&a) || self.cell_containing(a).is_none() {
+            return;
+        }
+        if k.table.is_none() {
+            k.table = Some(self.gc.kept.clone());
+        }
+        *self.gc.kept.borrow_mut().entry(a).or_default() += 1;
+        k.addrs.push(a);
+        self.gc.log_kept.push(a);
+    }
+}
+
+/// The cells Rust structures refer to by address, each with how many live
+/// owners (a [`KeptCells`]) refer to it: roots at every full collection.
+pub(crate) type KeptTable = std::rc::Rc<std::cell::RefCell<crate::jit::HashMap<usize, u32>>>;
+
+/// The cells a structure refers to by address (compiled code's constants,
+/// a lowering's call sites' closures): roots while it lives.
+#[derive(Default)]
+pub(crate) struct KeptCells {
+    addrs: Vec<usize>,
+    table: Option<KeptTable>,
+}
+
+impl Drop for KeptCells {
+    fn drop(&mut self) {
+        if let Some(t) = &self.table {
+            let mut t = t.borrow_mut();
+            for a in &self.addrs {
+                if let std::collections::hash_map::Entry::Occupied(mut e) = t.entry(*a) {
+                    *e.get_mut() -= 1;
+                    if *e.get() == 0 {
+                        e.remove();
+                    }
+                }
+            }
         }
     }
 }
@@ -1615,6 +1700,9 @@ impl Vm {
                     }
                 }
                 self.condemn_codes();
+                // (What the stacks hold, for the versions call sites left.)
+                let words = self.stack_words(sp, regs);
+                crate::jit::free_retired(self, &words);
             }
             if kind == Collection::Full && self.heap.gc.frag_report {
                 self.frag_report(sp);
@@ -1862,11 +1950,17 @@ impl Vm {
         }
     }
 
-    /// A full marking's codes: live if pinned, on a stack (the native
-    /// one, or the VM's, as a frame's code), or marked since it began (a
-    /// closure of it traced or made, it loaded), and with them the
-    /// functions nested in them, which they make closures of. Mark what
-    /// the live ones refer to, and what that reaches, until no more are.
+    /// A full marking's codes: live if on a stack (the native one, or the
+    /// VM's, as a frame's code), or marked since it began (a closure of it
+    /// traced or made, it loaded), and with them the functions nested in
+    /// them, which they make closures of. Mark what the live ones refer
+    /// to, and what that reaches, until no more are. (A pinned one's
+    /// references are marked anyway, see `mark_structures`, but it isn't
+    /// live for that: one the JIT took stays for its address, and doesn't
+    /// keep the functions nested in it, nor its compiled code, see
+    /// `condemn_codes`. An eval'd function compiled, its enclosing one
+    /// pinned to fold its variables, kept them and what they held: 2,000
+    /// of them, each over a 160 KB array, took 376 MB.)
     /// `done`: the codes whose references are marked already, by index.
     unsafe fn mark_live_codes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value, done: &mut Vec<bool>) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -1887,12 +1981,12 @@ impl Vm {
         loop {
             let mut more = false;
             for (k, code) in self.codes.iter().enumerate() {
-                if done[k] || !(code.pinned.get() || code.mark.load(Relaxed) >= from) {
+                if done[k] || code.mark.load(Relaxed) < from {
                     continue;
                 }
                 done[k] = true;
                 more = true;
-                for &c in &code.closures {
+                for &c in code.closures.iter().filter(|c| !c.is_null()) {
                     mark_code(c);
                 }
                 unsafe { self.mark_code_refs(m, code) };
@@ -2007,13 +2101,42 @@ impl Vm {
 
     /// After a full marking, take the codes it didn't find live out of
     /// use: freed at the next collection that finishes the sweep first.
+    /// A pinned one not found live stays, for its address, but its compiled
+    /// code goes, and what that kept (see `gc::KeptCells`): it can't run
+    /// again, as an unpinned one would be freed (no closure of it, no
+    /// frame, no live function nesting it, which would make one).
     fn condemn_codes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
-        let (live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
+        let (mut live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
             .into_iter()
             .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
+        // (A function freed is nested only in functions no marking found
+        // live, which can't make a closure of it again; but the JIT's
+        // analysis of a variable walks a pinned one's nested functions,
+        // `jit::variable_assigned`: their entries become null. A freed one
+        // can't assign the variable, so its answer stays right.)
+        if !dead.is_empty() {
+            let gone: crate::jit::HashSet<*const crate::vm::Code> =
+                dead.iter().map(|c| &**c as *const crate::vm::Code).collect();
+            for c in live.iter_mut() {
+                for n in c.closures.iter_mut() {
+                    if gone.contains(n) {
+                        *n = std::ptr::null();
+                    }
+                }
+            }
+        }
+        let mut gone = Vec::new();
+        for c in live.iter().filter(|c| c.mark.load(Relaxed) < from) {
+            if let Ok(mut j) = c.jit.try_borrow_mut()
+                && let Some(j) = j.take()
+            {
+                gone.push(j);
+            }
+        }
         self.codes = live;
+        drop(gone);
         let live: usize = self.codes.iter().map(|c| c.footprint()).sum();
         // (Less the code made while the marker ran, all found live: its
         // room grew with each marking a slow marker drew out.)
@@ -2024,6 +2147,19 @@ impl Vm {
             self.code_set.remove(&(&**c as *const crate::vm::Code as usize));
         }
         self.condemned.extend(dead);
+    }
+
+    /// The words of the native stack, from `sp`, and of the VM stack, to
+    /// the end of the deepest frame there may be (as `mark_live_codes`
+    /// reads them).
+    unsafe fn stack_words(&self, sp: usize, regs: *mut Value) -> Vec<usize> {
+        unsafe {
+            let stack = self.stack.as_ptr() as usize;
+            let stack_end = self.stack_end as usize;
+            let top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+            let top = (top + 8 * self.max_frame).clamp(stack, stack_end);
+            (sp..self.heap.gc.stack_base).step_by(8).chain((stack..top).step_by(8)).map(|a| *(a as *const usize)).collect()
+        }
     }
 
     /// Mark the roots every collection has.
@@ -2116,7 +2252,7 @@ impl Vm {
                 add(&mut pin, *(a as *const usize), STACK);
             }
         }
-        for &a in self.heap.gc.kept.iter().chain(&self.heap.gc.log_kept).chain(&self.relied_slots) {
+        for &a in self.heap.kept_addrs().iter().chain(&self.heap.gc.log_kept).chain(&self.relied_slots) {
             add(&mut pin, a, KEPT);
         }
         for &k in self.ctor_protos_keys().iter() {
@@ -2280,8 +2416,9 @@ impl Vm {
     /// found live: see `mark_live_codes_and_shapes`).
     unsafe fn mark_structures(&mut self, m: &mut Marking) {
         unsafe {
-            for i in 0..self.heap.gc.kept.len() {
-                let a = self.heap.gc.kept[i];
+            // (Only the live structures': what compiled code dropped
+            // embedded is not a root.)
+            for a in self.heap.kept_addrs() {
                 self.mark_interior(m, a);
             }
             self.roots_report(m, "kept");
@@ -2417,8 +2554,8 @@ impl Vm {
             for v in self.registered_symbols() {
                 e.value(v);
             }
-            for i in 0..self.heap.gc.kept.len() {
-                if let Some(p) = self.heap.cell_containing(self.heap.gc.kept[i]) {
+            for a in self.heap.kept_addrs() {
+                if let Some(p) = self.heap.cell_containing(a) {
                     e.cell(p);
                 }
             }

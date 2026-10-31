@@ -521,6 +521,8 @@ pub static HEAP_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static LIVE_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ALLOCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PROMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Full collections that came while no cell could move (`Vm::unmovable`).
+pub static UNMOVABLE_FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The least code taken (see `Gc::code_room`) that starts a full
 /// collection.
@@ -1791,7 +1793,12 @@ impl Vm {
             }
             match kind {
                 Collection::Minor | Collection::MinorShade => MINORS.fetch_add(1, Relaxed),
-                Collection::Full | Collection::Final => FULLS.fetch_add(1, Relaxed),
+                Collection::Full | Collection::Final => {
+                    if self.unmovable > 0 {
+                        UNMOVABLE_FULLS.fetch_add(1, Relaxed);
+                    }
+                    FULLS.fetch_add(1, Relaxed)
+                }
                 Collection::Start => 0,
             };
         }

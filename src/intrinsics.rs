@@ -217,6 +217,13 @@ pub(crate) fn construct(vm: &mut Vm, f: Value, args: &[Value]) -> Result<Value> 
 /// `new f(…args)` with `new.target` `nt`: a bytecode function's `this`
 /// made from `nt.prototype` (a derived class's left to `super()`).
 pub(crate) fn construct_with(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result<Value> {
+    // (Its arguments on the VM stack before `new.target`'s `prototype` is
+    // read, which may run a getter: see `interp::with_args_on_stack`.)
+    crate::interp::with_args_on_stack(vm, args, |vm, args| construct_with_on(vm, f, args, nt))
+}
+
+/// [`construct_with`], `args` on the VM stack (or no cell moving).
+fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result<Value> {
     if f.is_cell() && unsafe { (*as_object(f)).class } == Class::Function {
         let o = as_object(f);
         let code = unsafe { &*(*o).code };

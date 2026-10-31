@@ -1510,8 +1510,8 @@ impl Vm {
                 let t = s.slots.table();
                 size_of::<Shape>()
                     + if tables.insert(t as *const _ as usize) { t.bytes() } else { 0 }
-                    + s.transitions.borrow().capacity() * size_of::<(Atom, u8, *const Shape)>()
-                    + s.elem_transitions.borrow().capacity() * size_of::<(FieldType, *const Shape)>()
+                    + s.transitions.bytes()
+                    + s.elem_transitions.bytes()
             })
             .sum::<usize>()
             + self.field_cells.len() * size_of::<FieldCell>();
@@ -1623,8 +1623,8 @@ impl Vm {
             return;
         }
         for s in &self.shapes {
-            s.transitions.borrow_mut().retain(|&(_, _, t)| live(t));
-            s.elem_transitions.borrow_mut().retain(|&(_, t)| live(t));
+            s.transitions.retain(|&(_, _, t)| live(t));
+            s.elem_transitions.retain(|&(_, t)| live(t));
             // Compiled code moves arrays to the shapes a push cache names
             // (a zombie's prototype is null): those of the dead go, as do
             // the entries of dead keys.
@@ -1656,8 +1656,8 @@ impl Vm {
             z.proto = Value::NULL;
             // (`Shape::is_zombie`.)
             z.capacity.set(u32::MAX);
-            z.transitions.take();
-            z.elem_transitions.take();
+            z.transitions.clear();
+            z.elem_transitions.clear();
             let p = z.push.replace(std::ptr::null_mut());
             if !p.is_null() {
                 drop(unsafe { Box::from_raw(p) });
@@ -1971,8 +1971,8 @@ impl Vm {
             push: Cell::new(std::ptr::null_mut()),
             unique: false,
             fixed: false,
-            transitions: RefCell::default(),
-            elem_transitions: RefCell::default(),
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
@@ -2003,8 +2003,8 @@ impl Vm {
             push: Cell::new(std::ptr::null_mut()),
             unique: false,
             fixed: false,
-            transitions: RefCell::default(),
-            elem_transitions: RefCell::default(),
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
@@ -2060,8 +2060,8 @@ impl Vm {
             // (A fixed shape's successors are unique: see `Shape::fixed`.)
             unique: s.unique || s.fixed,
             fixed: false,
-            transitions: RefCell::default(),
-            elem_transitions: RefCell::default(),
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
@@ -2131,8 +2131,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 fixed: false,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
@@ -2534,8 +2534,8 @@ impl Vm {
             // (A fixed shape's successors are unique: see `Shape::fixed`.)
             unique: s.unique || s.fixed,
             fixed: false,
-            transitions: RefCell::default(),
-            elem_transitions: RefCell::default(),
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
@@ -3385,8 +3385,8 @@ impl Vm {
                     push: Cell::new(std::ptr::null_mut()),
                     unique: true,
                     fixed: false,
-                    transitions: RefCell::default(),
-                    elem_transitions: RefCell::default(),
+                    transitions: Default::default(),
+                    elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
@@ -3819,8 +3819,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 fixed: false,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
                 relied: Cell::new(false),
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
@@ -3921,8 +3921,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 fixed: false,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
                 relied: Cell::new(false),
                 left: Cell::new(true),
                 lineage_relied: Cell::new(false),
@@ -3982,8 +3982,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 fixed: false,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
                 relied: Cell::new(false),
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
@@ -5161,8 +5161,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: s.unique,
                 fixed: s.fixed,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
                 relied: Cell::new(false),
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),

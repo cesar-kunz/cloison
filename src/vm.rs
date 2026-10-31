@@ -2065,7 +2065,7 @@ impl Vm {
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
-            parent: s,
+            parent: Self::lineage_parent(s),
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
@@ -2136,7 +2136,7 @@ impl Vm {
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
-            parent: s,
+            parent: Self::lineage_parent(s),
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),
@@ -2144,6 +2144,19 @@ impl Vm {
             };
             crate::object::set_shape(o, self.add_shape(u));
         }
+    }
+
+    /// The parent of a shape made from `s`: `s`, or if it is unique (an
+    /// object's own, a prototype's say) the shared shape it descends from. A
+    /// unique shape is left for good by the object that had it when it moves
+    /// to the next (a property added, its elements' type generalized), and kept
+    /// as that one's parent, every live shape keeping its parents, it kept a
+    /// chain of every shape a prototype had: MathJax's 123,000 shapes of live
+    /// objects (84,000 unique) kept 657,000. The chain is for objects that
+    /// share shapes (`Vm::shape_left`); the slot table it shares is kept by
+    /// its own count.
+    fn lineage_parent(s: &Shape) -> *const Shape {
+        if s.unique { s.parent } else { s }
     }
 
     // ---- Objects ----
@@ -2529,7 +2542,9 @@ impl Vm {
             slots: s.slots.clone(),
             elems,
             elems_code: elems.encode(),
-            family: s.family,
+            // (A unique shape's own family: no object has the one it
+            // leaves, see `lineage_parent`.)
+            family: if s.unique { std::ptr::null() } else { s.family },
             push: Cell::new(std::ptr::null_mut()),
             // (A fixed shape's successors are unique: see `Shape::fixed`.)
             unique: s.unique || s.fixed,
@@ -2539,7 +2554,7 @@ impl Vm {
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
-            parent: s,
+            parent: Self::lineage_parent(s),
             mark: Default::default(),
             traced: Cell::new(0),
             pinned: Cell::new(false),

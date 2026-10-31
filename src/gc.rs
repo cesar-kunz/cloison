@@ -411,6 +411,10 @@ impl Heap {
         let mut addrs = self.gc.pending_kept.split_off(from);
         addrs.sort_unstable();
         addrs.dedup();
+        // (`split_off(0)` hands over the whole vector, its capacity too,
+        // and leaves one as large: every owner's list took the most
+        // `pending_kept` ever held, the TypeScript app's 24 MiB of them.)
+        addrs.shrink_to_fit();
         let mut k = KeptCells { addrs: Vec::new(), table: Some(self.gc.kept.clone()) };
         {
             let mut t = self.gc.kept.borrow_mut();

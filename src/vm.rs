@@ -816,6 +816,11 @@ pub struct Vm {
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
+    /// Scopes open in which Rust code holds values in copies of its own (a
+    /// handle scope's `Vec`s), which a collection can neither find nor
+    /// update: no cell may move while there are any (see
+    /// `interp::with_args_on_stack`).
+    pub(crate) unmovable: u32,
     /// The most values a frame spans from its registers: its own and, for
     /// compiled code, its inlined frames' (the collector scans the VM stack
     /// that far past the deepest frame's registers).
@@ -1166,6 +1171,7 @@ impl Vm {
             open_upvalues: Vec::new(),
             type_names: [None; 8],
             handles: Vec::new(),
+            unmovable: 0,
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
             method_shape: std::ptr::null(),
@@ -5924,7 +5930,9 @@ impl Vm {
     /// into JS pushes them there.
     pub(crate) fn handle_scope<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> T {
         let depth = self.handles.len();
+        self.unmovable += 1;
         let r = f(self);
+        self.unmovable -= 1;
         self.handles.truncate(depth);
         r
     }

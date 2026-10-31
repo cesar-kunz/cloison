@@ -59,10 +59,10 @@ fn reflect_apply(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(f) {
         return Err(Error::type_error("Reflect.apply target is not a function"));
     }
-    vm.handle_scope(|vm| {
-        let args = list(vm, arg(a, 2))?;
-        call_function(vm, f, arg(a, 1), &args)
-    })
+    // (The list rooted while it is made, a getter maybe running; the call
+    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
+    let args = vm.handle_scope(|vm| list(vm, arg(a, 2)))?;
+    call_function(vm, f, arg(a, 1), &args)
 }
 
 fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -74,10 +74,10 @@ fn reflect_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if !is_constructor(nt) {
         return Err(Error::type_error("Reflect.construct newTarget is not a constructor"));
     }
-    vm.handle_scope(|vm| {
-        let args = list(vm, arg(a, 1))?;
-        construct_with(vm, f, &args, nt)
-    })
+    // (The list rooted while it is made, a getter maybe running; the call
+    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
+    let args = vm.handle_scope(|vm| list(vm, arg(a, 1)))?;
+    construct_with(vm, f, &args, nt)
 }
 
 pub(crate) fn reflect_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {

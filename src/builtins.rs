@@ -932,10 +932,10 @@ fn function_apply(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(this) {
         return Err(Error::type_error("Function.prototype.apply called on a non-function"));
     }
-    vm.handle_scope(|vm| {
-        let list = crate::array::apply_list(vm, arg(a, 1))?;
-        crate::interp::call_function(vm, this, arg(a, 0), &list)
-    })
+    // (The list rooted while it is made, a getter maybe running; the call
+    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
+    let list = vm.handle_scope(|vm| crate::array::apply_list(vm, arg(a, 1)))?;
+    crate::interp::call_function(vm, this, arg(a, 0), &list)
 }
 
 /// `Function(p1, …, body)` / `new Function(…)`: the function
@@ -1184,20 +1184,26 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// A bound function's call: `[f, that, bound args, args]`.
 fn bound_call(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    vm.handle_scope(|vm| {
+    // (The list rooted while it is made, a getter maybe running; the call
+    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
+    let all = vm.handle_scope(|vm| {
         let mut all = crate::array::apply_list(vm, a[2])?;
         all.extend(crate::array::apply_list(vm, a[3])?);
-        crate::interp::call_function(vm, a[0], a[1], &all)
-    })
+        Ok::<_, crate::vm::Error>(all)
+    })?;
+    crate::interp::call_function(vm, a[0], a[1], &all)
 }
 
 /// A bound function's construction: `[f, bound args, args, new.target]`.
 fn bound_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    vm.handle_scope(|vm| {
+    // (The list rooted while it is made, a getter maybe running; the call
+    // takes it onto the VM stack first: see `interp::with_args_on_stack`.)
+    let all = vm.handle_scope(|vm| {
         let mut all = crate::array::apply_list(vm, a[1])?;
         all.extend(crate::array::apply_list(vm, a[2])?);
-        crate::intrinsics::construct_with(vm, a[0], &all, a[3])
-    })
+        Ok::<_, crate::vm::Error>(all)
+    })?;
+    crate::intrinsics::construct_with(vm, a[0], &all, a[3])
 }
 
 /// `Function.prototype.toString`: a function's source text, or (a native,

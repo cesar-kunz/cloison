@@ -3898,6 +3898,62 @@ pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) 
         if !f.is_cell() || !matches!((*as_object(f)).class, Class::Function | Class::Native) {
             return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
         }
+        with_args_on_stack(vm, args, |vm, args| call_function_on(vm, f, this, args))
+    }
+}
+
+/// Whether `args` lie in the VM stack.
+fn on_vm_stack(vm: &Vm, args: &[Value]) -> bool {
+    let a = args.as_ptr() as usize;
+    (vm.stack.as_ptr() as usize..vm.stack_end as usize).contains(&a)
+}
+
+/// Run `f` with `args` where a collection finds them as roots and could
+/// update them, the VM stack: copied to its free top (`Vm::native_top`,
+/// moved past them meanwhile, so what `f` calls goes above) unless they
+/// are there already. A native reads its arguments again after calling into
+/// JS (`map` its callback), and a function's `arguments` and rest are made
+/// from them after its entry's safepoint (`Vm::pending_args`): from a Rust
+/// `Vec` (`apply`'s list, a bound function's), they would be copies no
+/// collection updates. Without a free top (compiled code's runtime calls),
+/// as they are, and no cell may move meanwhile (`Vm::unmovable`). No
+/// safepoint comes before the copy.
+#[inline(always)]
+pub(crate) fn with_args_on_stack(
+    vm: &mut Vm,
+    args: &[Value],
+    f: impl FnOnce(&mut Vm, &[Value]) -> crate::vm::Result<Value>,
+) -> crate::vm::Result<Value> {
+    let top = vm.native_top;
+    if args.is_empty() || on_vm_stack(vm, args) {
+        return f(vm, args);
+    }
+    if top.is_null() {
+        vm.unmovable += 1;
+        let r = f(vm, args);
+        vm.unmovable -= 1;
+        return r;
+    }
+    unsafe {
+        let n = args.len();
+        if top.add(n + HEADER) > vm.stack_end {
+            return Err(Error::range_error("Maximum call stack size exceeded"));
+        }
+        std::ptr::copy_nonoverlapping(args.as_ptr(), top, n);
+        vm.native_top = top.add(n);
+        let r = f(vm, std::slice::from_raw_parts(top, n));
+        vm.native_top = top;
+        // (Not left for the VM stack's scan to keep alive.)
+        std::slice::from_raw_parts_mut(top, n).fill(Value::UNDEFINED);
+        r
+    }
+}
+
+/// [`call_function`], `f` a function, `args` on the VM stack (or no cell
+/// moving).
+#[inline(always)]
+fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate::vm::Result<Value> {
+    unsafe {
         if (*as_object(f)).class == Class::Native {
             let r = vm.call_other(f, this, args);
             // (Its conversion's exception thrown to its caller, a native

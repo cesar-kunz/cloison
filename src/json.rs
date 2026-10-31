@@ -42,7 +42,16 @@ struct Stringify {
 }
 
 /// `JSON.stringify(value, replacer, space)`.
-fn json_stringify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn json_stringify(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    // (No cell moves meanwhile: what it serializes or revives is held in
+    // Rust structures, objects by address, see `Vm::unmovable`.)
+    vm.unmovable += 1;
+    let r = json_stringify_(vm, this, a);
+    vm.unmovable -= 1;
+    r
+}
+
+fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let replacer = arg(a, 1);
     let mut st = Stringify {
         replacer: None,
@@ -303,7 +312,16 @@ fn quote(u: &[u16], out: &mut Vec<u16>) {
 }
 
 /// `JSON.parse(text, reviver)`.
-fn json_parse(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+fn json_parse(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    // (No cell moves meanwhile: what it serializes or revives is held in
+    // Rust structures, objects by address, see `Vm::unmovable`.)
+    vm.unmovable += 1;
+    let r = json_parse_(vm, this, a);
+    vm.unmovable -= 1;
+    r
+}
+
+fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let u = to_string_units(arg(a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());

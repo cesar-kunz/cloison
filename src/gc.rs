@@ -632,6 +632,20 @@ trait Visit {
         }
     }
 
+    /// The value in slot `a`, a cell's word (see [`trace`]): [`Visit::value`]
+    /// of it. A visitor that moves cells overrides it to update the slot.
+    #[inline(always)]
+    unsafe fn slot(&mut self, a: *mut Value) {
+        unsafe { self.value(*a) }
+    }
+
+    /// The array's or upvalue's payload pointer in slot `a`, a cell's word:
+    /// [`Visit::payload`] of it, overridden as [`Visit::slot`].
+    #[inline(always)]
+    unsafe fn payload_slot(&mut self, a: *mut usize) {
+        unsafe { self.payload(*a) }
+    }
+
 }
 
 /// Marking: the color and kind, the cells marked and not yet traced, the
@@ -1124,13 +1138,13 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                     let mut a = (p + 8).max(lo).next_multiple_of(8);
                     let last = (p + 8 + 8 * n).min(hi);
                     while a < last {
-                        v.value(*(a as *const Value));
+                        v.slot(a as *mut Value);
                         a += 8;
                     }
                 }
                 UPVALUE => {
                     if within(p + 16) {
-                        v.value(*((p + 16) as *const Value));
+                        v.slot((p + 16) as *mut Value);
                     }
                 }
                 // (Its header only: see `heap::WEAK_VALUES`.)
@@ -1139,7 +1153,7 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                     let mut a = (p + 8).max(lo).next_multiple_of(8);
                     let last = (p + 8 + 8 * n).min(hi);
                     while a < last {
-                        v.value(*(a as *const Value));
+                        v.slot(a as *mut Value);
                         a += 8;
                     }
                 }
@@ -1154,7 +1168,7 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
         let mut a = slots.max(lo).next_multiple_of(8);
         let last = (slots + 8 * cap).min(hi);
         while a < last {
-            v.value(*(a as *const Value));
+            v.slot(a as *mut Value);
             a += 8;
         }
         let props = &raw const (*o).props as usize;
@@ -1165,14 +1179,14 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 if (*o).elems.is_null() {
                     // A cons string: its halves.
                     if within(props) {
-                        v.value(Value::from_bits((*o).props as u64));
+                        v.slot(&raw mut (*o).props as *mut Value);
                     }
                     if within(code) {
-                        v.value(Value::from_bits((*o).code as u64));
+                        v.slot(&raw mut (*o).code as *mut Value);
                     }
                 } else if (*o).elems as usize != slots && within(elems) {
                     // Flattened: its units' buffer.
-                    v.payload((*o).elems as usize);
+                    v.payload_slot(&raw mut (*o).elems as *mut usize);
                 }
                 return;
             }
@@ -1191,39 +1205,39 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 // The primitive it wraps (a string is a cell), or a
                 // collection's entries array, or a promise's state.
                 if within(code) {
-                    v.value(Value::from_bits((*o).code as u64));
+                    v.slot(&raw mut (*o).code as *mut Value);
                 }
             }
             Class::Generator | Class::Promise => {
                 // Its state: a buffer of values (see `generator::state_of`,
                 // `promise::cells`).
                 if !(*o).code.is_null() && within(code) {
-                    v.payload((*o).code as usize);
+                    v.payload_slot(&raw mut (*o).code as *mut usize);
                 }
             }
             Class::TypedArray | Class::DataView => {
                 // `elems` points into the buffer's bytes.
                 if within(code) {
-                    v.value(Value::from_bits((*o).code as u64));
+                    v.slot(&raw mut (*o).code as *mut Value);
                 }
                 if within(props) {
-                    v.payload((*o).props as usize);
+                    v.payload_slot(&raw mut (*o).props as *mut usize);
                 }
                 return;
             }
             Class::ArrayBuffer => {
                 // A resizable one's views (see `typed`).
                 if !(*o).code.is_null() && within(code) {
-                    v.value(Value::from_bits((*o).code as u64));
+                    v.slot(&raw mut (*o).code as *mut Value);
                 }
             }
             Class::SharedArrayBuffer => {
                 // A growable one's views; its bytes are no cell.
                 if !(*o).code.is_null() && within(code) {
-                    v.value(Value::from_bits((*o).code as u64));
+                    v.slot(&raw mut (*o).code as *mut Value);
                 }
                 if within(props) {
-                    v.payload((*o).props as usize);
+                    v.payload_slot(&raw mut (*o).props as *mut usize);
                 }
                 return;
             }
@@ -1235,17 +1249,17 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                 debug_assert_eq!(up as usize, crate::vm::Vm::upvalues(o) as usize);
                 for k in 0..ups {
                     if within(up.add(k) as usize) {
-                        v.payload(*up.add(k));
+                        v.payload_slot(up.add(k) as *mut usize);
                     }
                 }
             }
             _ => {}
         }
         if within(props) {
-            v.payload((*o).props as usize);
+            v.payload_slot(&raw mut (*o).props as *mut usize);
         }
         if within(elems) {
-            v.payload((*o).elems as usize);
+            v.payload_slot(&raw mut (*o).elems as *mut usize);
         }
     }
 }

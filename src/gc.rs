@@ -245,6 +245,9 @@ pub struct Gc {
     /// marked is reached from the roots' slots (`CLOISON_GC_SLOTS`, see
     /// `Vm::check_root_slots`).
     slots_check: bool,
+    /// Every full collection stopping the world moves every cell it may
+    /// (`CLOISON_GC_EVACUATE`: the stress mode of [`Vm::evacuate`]).
+    evacuate: bool,
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
     /// (`CLOISON_GC_CHECK_BARRIER`, slow).
@@ -272,6 +275,7 @@ impl Gc {
             roots_report: env("CLOISON_GC_ROOTS"),
             frag_report: env("CLOISON_GC_FRAG"),
             slots_check: env("CLOISON_GC_SLOTS"),
+            evacuate: env("CLOISON_GC_EVACUATE"),
             nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -1718,6 +1722,9 @@ impl Vm {
             if kind == Collection::Full && self.heap.gc.slots_check {
                 self.check_root_slots(sp, regs, color);
             }
+            if kind == Collection::Full && self.heap.gc.evacuate {
+                self.evacuate(sp, regs, color);
+            }
             times[2] = lap();
             freed = match kind {
                 // The young cells left unmarked are freed now, not by the
@@ -2530,6 +2537,265 @@ impl Vm {
                 trace(&mut r, p, 0, usize::MAX);
             }
         }
+    }
+
+    /// Stage 3 of evacuating fragmented blocks, as a stress mode for now
+    /// (`CLOISON_GC_EVACUATE`): after a full collection stopping the world
+    /// has marked, move every cell it marked in small blocks that nothing
+    /// pins into blocks of their own, and update every reference to them.
+    /// No cell moves while Rust code holds copies of values (`Vm::unmovable`)
+    /// or a function's JIT state is borrowed.
+    ///
+    /// Pinned: what a native stack word points into, what Rust structures
+    /// took since the last collection and what compiled code embeds (the
+    /// roots' `Root::Pinned`), the cells holding the prototype slots
+    /// compiled code relies on, constructor tracking's prototypes, the
+    /// cells the JIT compares or reads by address without keeping them
+    /// (`jit::shape_words`), those the VM's tables key by address
+    /// (`Vm::address_keyed_cells`), the keys collections hash by address,
+    /// and the bytes typed views point into. Updated: the roots' slots
+    /// (`Vm::each_root_slot`), every slot of every cell left (`trace`), the
+    /// weak collections and their entries, a moved string's or upvalue's
+    /// pointer to itself, the VM's state of a call being made. Dropped: the
+    /// lookups and megamorphic tables (a new prototype epoch), the far
+    /// keys' cache. The cells moved from are freed and filled with
+    /// [`POISON`], so a reference left reads it.
+    #[cold]
+    #[inline(never)]
+    unsafe fn evacuate(&mut self, sp: usize, regs: *mut Value, color: u8) {
+        use crate::heap::{BLOCK, LARGE};
+        if self.unmovable > 0 {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        let range = self.heap.cells_range();
+        let marked = |p: usize| unsafe { *crate::heap::meta(p) } & (YOUNG | COLOR) == color;
+        // The live cells, by block kind.
+        let mut live: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in self.heap.block_ranges() {
+            let small = matches!(self.heap.block_kind(start), Some(true));
+            let mut p = start;
+            while p < end {
+                let m = unsafe { *crate::heap::meta(p) };
+                if m & (YOUNG | COLOR) == 0 {
+                    p += GRANULE;
+                    continue;
+                }
+                let n = unsafe { cell_size(p as *const u8) };
+                if m & (YOUNG | COLOR) == color {
+                    live.push((p, if small { n } else { 0 }));
+                }
+                p += n;
+            }
+        }
+        // Pins.
+        let mut pins: std::collections::HashSet<usize> = Default::default();
+        unsafe {
+            self.each_root_slot(sp, regs, &mut |r| {
+                if let Root::Pinned(p) = r {
+                    pins.insert(p);
+                }
+            })
+        };
+        // The VM's own cells, the global object and the intrinsics, a few
+        // hundred: their addresses are copied around (the JIT's feedback
+        // keeps the global object's).
+        {
+            let mut own: Vec<usize> = Vec::new();
+            self.named_root_slots(&mut |r| unsafe {
+                match r {
+                    Root::Object(a) if !(*a).is_null() => own.push(*a as usize),
+                    Root::Value(a) if (*a).is_cell() => own.push((*a).to_bits() as usize),
+                    _ => {}
+                }
+            });
+            let heap = &self.heap;
+            pins.extend(own.into_iter().filter(|&a| heap.cell_containing(a) == Some(a)));
+        }
+        {
+            let heap = &self.heap;
+            let pin_word = |w: u64, pins: &mut std::collections::HashSet<usize>| {
+                if let Some(p) = heap.cell_containing(w as usize) {
+                    pins.insert(p);
+                }
+            };
+            for &a in &self.relied_slots {
+                pin_word(a as u64, &mut pins);
+            }
+            for k in self.ctor_protos_keys() {
+                pin_word(k as u64, &mut pins);
+            }
+            if !crate::jit::shape_words(self, &mut |w| pin_word(w, &mut pins)) {
+                return;
+            }
+            self.address_keyed_cells(&mut |w| pin_word(w, &mut pins));
+            for &(p, _) in &live {
+                if unsafe { *(p as *const u64) } & 1 != 0 {
+                    continue;
+                }
+                let o = p as *mut Object;
+                crate::collections::address_keys(o, &mut |k| {
+                    pins.insert(k);
+                });
+                if matches!(unsafe { (*o).class }, Class::TypedArray | Class::DataView) {
+                    pin_word(unsafe { (*o).elems } as u64, &mut pins);
+                }
+            }
+        }
+        // Copy.
+        let mut to: std::collections::HashMap<usize, usize> = Default::default();
+        let (mut at, mut end) = (0usize, 0usize);
+        let mut moved = 0usize;
+        for &(p, n) in &live {
+            if n == 0 || n > LARGE || pins.contains(&p) {
+                continue;
+            }
+            if at + n > end {
+                at = self.heap.evacuation_block();
+                end = at + BLOCK;
+            }
+            let q = at;
+            at += n;
+            unsafe {
+                std::ptr::copy_nonoverlapping(p as *const u8, q as *mut u8, n);
+                let first = *crate::heap::meta(p) & (COLOR | END);
+                *crate::heap::meta(q) = first;
+                *crate::heap::meta(q + n - GRANULE) |= END;
+                let w = *(p as *const u64);
+                if w & 1 == 0 {
+                    // A flat string's units are in it.
+                    let o = q as *mut Object;
+                    let old_units = p + crate::layout::slots_offset((*o).class);
+                    if (*o).class == Class::String && (*o).elems as usize == old_units {
+                        (*o).elems = (q + crate::layout::slots_offset((*o).class)) as *mut Value;
+                    }
+                } else if w & 7 == UPVALUE && *((p + 8) as *const usize) == p + 16 {
+                    // A closed upvalue's variable is its own.
+                    *((q + 8) as *mut usize) = q + 16;
+                }
+            }
+            to.insert(p, q);
+            moved += n;
+        }
+        if to.is_empty() {
+            return;
+        }
+        // Update.
+        struct Forward<'a> {
+            to: &'a std::collections::HashMap<usize, usize>,
+        }
+        impl Forward<'_> {
+            #[inline]
+            unsafe fn value(&self, a: *mut Value) {
+                unsafe {
+                    let v = *a;
+                    if v.is_cell()
+                        && let Some(&q) = self.to.get(&(v.to_bits() as usize))
+                    {
+                        *a = Value::from_bits(q as u64);
+                    }
+                }
+            }
+            #[inline]
+            unsafe fn object(&self, a: *mut *mut Object) {
+                unsafe {
+                    if let Some(&q) = self.to.get(&(*a as usize)) {
+                        *a = q as *mut Object;
+                    }
+                }
+            }
+            #[inline]
+            unsafe fn payload(&self, a: *mut usize) {
+                unsafe {
+                    let q = *a;
+                    if q != 0
+                        && let Some(&n) = self.to.get(&(q - 8))
+                    {
+                        *a = n + 8;
+                    }
+                }
+            }
+        }
+        impl Visit for Forward<'_> {
+            unsafe fn cell(&mut self, _: usize) {}
+            unsafe fn slot(&mut self, a: *mut Value) {
+                unsafe { Forward::value(self, a) }
+            }
+            unsafe fn payload_slot(&mut self, a: *mut usize) {
+                unsafe { Forward::payload(self, a) }
+            }
+        }
+        let mut fw = Forward { to: &to };
+        unsafe {
+            (*(self as *mut Vm)).each_root_slot(sp, regs, &mut |r| match r {
+                Root::Value(a) => fw.value(a),
+                Root::Object(a) => fw.object(a),
+                Root::Payload(a) => fw.payload(a),
+                Root::Pinned(_) => {}
+            });
+            for &(p, _) in &live {
+                let p = to.get(&p).copied().unwrap_or(p);
+                trace(&mut fw, p, 0, usize::MAX);
+            }
+            // The weak collections, and their entries (traced only to their
+            // header).
+            for t in self.weak_tables.iter_mut() {
+                fw.object(t);
+            }
+            for &t in &self.weak_tables {
+                let e = Value::from_bits((*t).code as u64);
+                if !e.is_cell() {
+                    continue;
+                }
+                let e = crate::object::as_object(e);
+                let (buf, len) = ((*e).elems, (*e).elems_len as usize);
+                for i in crate::collections::BASE..len {
+                    fw.value(buf.add(i));
+                }
+            }
+            // A call being made.
+            fw.object(&mut self.callee);
+            for v in [&mut self.new_target, &mut self.native_new_target.0, &mut self.native_new_target.1, &mut self.derived_construct] {
+                fw.value(v);
+            }
+            for env in self.eval_envs.iter_mut() {
+                for v in env.iter_mut() {
+                    fw.value(v);
+                }
+            }
+            if let Some(crate::vm::Error(_, Some(e))) = &mut self.conv_error {
+                fw.value(e);
+            }
+            // (Copies of string constants, which the table's slots have.)
+            for v in self.type_names.iter_mut().flatten() {
+                fw.value(v);
+            }
+        }
+        // Caches of addresses.
+        // (With the code's epoch, as every prototype epoch: compiled code
+        // and its lowerings take the two to change together.)
+        self.proto_epoch = self.proto_epoch.wrapping_add(1);
+        self.bump_code_epoch();
+        self.far_keys.invalidate();
+        // The cells moved from: free, and poisoned.
+        for (&p, _) in &to {
+            unsafe {
+                let n = cell_size(p as *const u8);
+                *crate::heap::meta(p) = 0;
+                *crate::heap::meta(p + n - GRANULE) = 0;
+                std::ptr::write_bytes(p as *mut u8, POISON, n);
+            }
+        }
+        if self.heap.gc.stats {
+            eprintln!(
+                "evacuated {} cells ({} KiB), {} pinned, in {:.1} ms",
+                to.len(),
+                moved >> 10,
+                pins.len(),
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        let _ = (range, marked);
     }
 
     /// `CLOISON_GC_SLOTS`, after a full collection stopping the world: mark

@@ -243,6 +243,15 @@ pub(crate) struct SortedKeys {
     keys: Vec<u32>,
 }
 
+impl SortedKeys {
+    /// Forget the keys: the store they are of, compared by address, may
+    /// have moved (`gc::Evacuation`).
+    pub(crate) fn invalidate(&mut self) {
+        self.store = 0;
+        self.keys.clear();
+    }
+}
+
 fn sorted(vm: &mut Vm, o: *mut Object) -> &[u32] {
     let e = store(o);
     let (at, m) = (e as usize, int(e, MUTATIONS));

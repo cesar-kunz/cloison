@@ -14,7 +14,7 @@
 //! are the object's flags (`SEALED`, `FROZEN`, from `Object.seal` and
 //! `Object.freeze`), as is an array's read-only `length`.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number};
 use crate::object::{Slots, 
@@ -163,8 +163,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 fixed: false,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
                 relied: Cell::new(false),
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
@@ -220,8 +220,8 @@ impl Vm {
                         push: Cell::new(std::ptr::null_mut()),
                         unique: false,
                         fixed: true,
-                        transitions: RefCell::default(),
-                        elem_transitions: RefCell::default(),
+                        transitions: Default::default(),
+                        elem_transitions: Default::default(),
                         relied: Cell::new(false),
                         left: Cell::new(false),
                         lineage_relied: Cell::new(false),
@@ -258,8 +258,8 @@ impl Vm {
             push: Cell::new(std::ptr::null_mut()),
             unique: false,
             fixed: false,
-            transitions: RefCell::default(),
-            elem_transitions: RefCell::default(),
+            transitions: Default::default(),
+            elem_transitions: Default::default(),
             relied: Cell::new(false),
             left: Cell::new(false),
             lineage_relied: Cell::new(false),
@@ -316,8 +316,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 fixed: false,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
                 relied: Cell::new(false),
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),
@@ -1097,8 +1097,8 @@ impl Vm {
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
                 fixed: false,
-                transitions: RefCell::default(),
-                elem_transitions: RefCell::default(),
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
                 relied: Cell::new(false),
                 left: Cell::new(false),
                 lineage_relied: Cell::new(false),

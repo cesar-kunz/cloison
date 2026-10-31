@@ -260,7 +260,7 @@ pub(crate) fn hashed_by_address(k: Value) -> bool {
 /// The keys of collection `o` that are hashed by their address (for
 /// `CLOISON_GC_FRAG`: they could not move).
 pub(crate) fn address_keys(o: *mut Object, f: &mut dyn FnMut(usize)) {
-    if !matches!(unsafe { (*o).class }, Class::Map | Class::Set | Class::WeakMap | Class::WeakSet) {
+    if !matches!(unsafe { (*o).class }, Class::Map | Class::Set | Class::WeakMap | Class::WeakSet | Class::FinalizationRegistry) {
         return;
     }
     let e = Value::from_bits(unsafe { (*o).code } as u64);

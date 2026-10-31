@@ -808,6 +808,23 @@ impl Heap {
         unsafe { std::ptr::write_bytes(meta(a as usize), 0, n * BLOCK / GRANULE) };
     }
 
+    /// A block to copy cells into while evacuating (`gc::Evacuation`): an
+    /// empty one, a free one or a fresh one, its metadata clear, in use.
+    pub(crate) fn evacuation_block(&mut self) -> usize {
+        let b = if let Some(b) = self.empty.pop() {
+            self.clean(b as usize, 1);
+            b as usize
+        } else if let Some(b) = self.free.pop() {
+            unsafe { std::ptr::write_bytes(meta(self.block_addr(b as usize) as usize), 0, BLOCK / GRANULE) };
+            b as usize
+        } else {
+            self.fresh_blocks(1)
+        };
+        self.blocks[b] = Block::Small;
+        self.used += BLOCK;
+        self.block_addr(b) as usize
+    }
+
     /// `n` contiguous blocks never used before: the first's index.
     fn fresh_blocks(&mut self, n: usize) -> usize {
         let b = self.top;

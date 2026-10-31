@@ -3775,6 +3775,20 @@ impl Vm {
                 return true;
             }
             let n = s.keys().len() as u32;
+            // The property added last: back to the shape it was added to,
+            // shared, as V8 rolls a map back to its parent
+            // (`DeleteObjectPropertyFast`). A bound function's `prototype`,
+            // its closure's last, made each of MathJax's 430,000 bound
+            // functions two shapes of their own.
+            if slot + 1 == n
+                && let Some(parent) = self.parent_without_last(o, s)
+            {
+                self.shape_left(s);
+                let at = Object::slot(o, s.location(slot));
+                *at = Value::EMPTY;
+                crate::object::set_shape(o, parent);
+                return true;
+            }
             let kept: Vec<u32> = (0..n).filter(|&k| k != slot).collect();
             let values: Vec<Value> = kept
                 .iter()
@@ -3830,6 +3844,33 @@ impl Vm {
                 self.bump_code_epoch();
             }
             true
+        }
+    }
+
+    /// The shape `s` (`o`'s) was made from by adding its last property, if
+    /// `o` can take it back for that property's delete: `s` shared (not a
+    /// prototype's, a delete's copy, a dictionary's, nor fixed), `o` with
+    /// no flags, and the parent the same but for that slot (its slot
+    /// table a prefix of `s`'s, as a transition makes it).
+    fn parent_without_last(&self, o: *mut Object, s: &Shape) -> Option<*const Shape> {
+        unsafe {
+            if s.unique || s.dictionary || s.fixed || (*o).flags & !crate::object::EXTERNAL != 0 || s.parent.is_null() {
+                return None;
+            }
+            let p = &*s.parent;
+            let n = s.keys().len();
+            (p.keys().len() + 1 == n
+                && !p.unique
+                && !p.dictionary
+                && !p.fixed
+                && p.class == s.class
+                && p.proto.to_bits() == s.proto.to_bits()
+                && p.elems == s.elems
+                && p.capacity.get() == s.capacity.get()
+                && p.keys() == &s.keys()[..n - 1]
+                && p.attrs() == &s.attrs()[..n - 1]
+                && p.fields() == &s.fields()[..n - 1])
+                .then_some(s.parent)
         }
     }
 

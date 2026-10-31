@@ -6855,11 +6855,19 @@ fn stencil_for(
             if sel.base == "char_code_at" && sel.case.is_empty() {
                 box_acc(&mut pre);
             }
-            let at = homes
-                .get(slot_reg(insn, sel, homes) as usize)
-                .copied()
-                .unwrap_or(Home::Mem)
-                .loc();
+            let r = slot_reg(insn, sel, homes);
+            let home = homes.get(r as usize).copied().unwrap_or(Home::Mem);
+            // (A receiver in an int32 or FP slot, no array then, comes from
+            // memory, boxed: these stencils exist for general registers and
+            // memory only, and take it to the runtime. A function lowered
+            // again after a prototype changed got one: `no stencil
+            // array_push_u0`.)
+            let at = if matches!(home, Home::Int(_) | Home::Fpr(_)) {
+                pre.extend(spill_piece(home, r));
+                Home::Mem.loc()
+            } else {
+                home.loc()
+            };
             if sel.base == "array_push" && !sel.case.starts_with('i') {
                 box_acc(&mut pre);
             }

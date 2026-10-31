@@ -812,7 +812,7 @@ pub struct Vm {
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
     /// `typeof`'s results, once made (see [`Vm::type_of`]).
-    type_names: [Option<Value>; 8],
+    pub(crate) type_names: [Option<Value>; 8],
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
@@ -6078,6 +6078,23 @@ impl Vm {
     /// Every function's code.
     pub(crate) fn codes(&self) -> impl Iterator<Item = &Code> {
         self.codes.iter().map(|c| &**c)
+    }
+
+    /// Cells the VM's tables key by address (the root shapes' prototypes,
+    /// regexp literals' sources and flags, the key cache's objects and
+    /// keys), which a collection moving cells pins (`gc::Evacuation`).
+    pub(crate) fn address_keyed_cells(&self, f: &mut dyn FnMut(u64)) {
+        for &(_, p, _) in self.roots.keys() {
+            f(p);
+        }
+        for &(a, b) in self.regexp_literals.keys() {
+            f(a);
+            f(b);
+        }
+        for &(k, c, _, _) in &self.key_cache {
+            f(k.to_bits());
+            f(c.to_bits());
+        }
     }
 
     /// The string constants' slots.

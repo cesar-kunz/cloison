@@ -18264,8 +18264,11 @@ mod tests {
 /// types and those they widened to; per compiled version its return type
 /// and its snapshot's, whatever version still refers to it (a call site
 /// bound to it, the retired): scalar-replaced objects, call sites (`this`
-/// shapes, claimed types, dispatch tables), `instanceof` caches. False if
-/// a function's state is borrowed (being compiled): none is freed then.
+/// shapes, claimed types, dispatch tables), `instanceof` caches. And the
+/// cells it compares or reads by address that it doesn't keep
+/// (`instanceof` caches' prototypes, `VmState::root_func`), which a
+/// collection moving cells pins (`gc::Evacuation`). False if a function's
+/// state is borrowed (being compiled): none is freed then.
 pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool {
     fn ty(t: Ty, out: &mut dyn FnMut(u64)) {
         if let Ty::Obj(s) | Ty::Ext(s) = t {
@@ -18369,6 +18372,8 @@ pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool 
             for c in &s.caches {
                 for e in c.iter() {
                     (self.out)(e.get().shape);
+                    // (A cell: compared by address, so it must not move.)
+                    (self.out)(e.get().proto);
                 }
             }
         }
@@ -18422,6 +18427,8 @@ pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool 
             w.code(&fit.code);
         }
         if let Some(v) = f.vm.as_ref() {
+            // (A cell, read by address: it must not move.)
+            (w.out)(v.root_func as u64);
             for p in &v.props {
                 prop(p, w.out);
             }

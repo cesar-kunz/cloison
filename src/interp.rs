@@ -945,23 +945,25 @@ handlers! {
 
     fn op_intrinsic(pc, acc, regs, tag) {
         let (id, first, n) = (*pc.add(1) as usize, *pc.add(2) as usize, *pc.add(3) as usize);
-        let args: Vec<Value> = (0..n).map(|i| *regs.add(first + i)).collect();
+        // (Its arguments where they are, in the frame's registers: a copy
+        // taken before `with_top`'s safepoint, or before the intrinsic calls
+        // into JS, is one no collection updates when it moves cells.)
+        let args = std::slice::from_raw_parts(regs.add(first), n);
         let f = crate::intrinsics::INTRINSICS[id].1;
-        let r = with_top(regs, None, |vm| f(vm, &args));
+        let r = with_top(regs, None, |vm| f(vm, args));
         next_or_throw!(Op::Intrinsic.size(), r)
     }
 
     fn op_create_rest(pc, acc, regs, tag) {
-        let vm = &mut *frame_vm(regs);
-        let mut spread = Vec::new();
-        let (args, argc) = frame_args(vm, regs, &mut spread);
         let k = *pc.add(1) as usize;
-        let values: Vec<Value> = if argc > k {
-            std::slice::from_raw_parts(args.add(k), argc - k).to_vec()
-        } else {
-            Vec::new()
-        };
-        let r = with_top(regs, None, |vm| crate::array::new_array_of(vm, &values));
+        // (The arguments found after `with_top`'s safepoint: copies taken
+        // before it are ones no collection moving cells updates.)
+        let r = with_top(regs, None, |vm| {
+            let mut spread = Vec::new();
+            let (args, argc) = frame_args(vm, regs, &mut spread);
+            let values: &[Value] = if argc > k { std::slice::from_raw_parts(args.add(k), argc - k) } else { &[] };
+            crate::array::new_array_of(vm, values)
+        });
         next_or_throw!(Op::CreateRest.size(), r)
     }
 

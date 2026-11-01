@@ -453,6 +453,9 @@ fn new_collection(vm: &mut Vm, class: Class, proto: Proto) -> Result<*mut Object
     let p = object_value(vm.collection_prototypes[proto as usize]);
     let o = vm.new_object_with(class, p, 0);
     hold_entries(o, object_value(e));
+    if class != Class::WeakRef {
+        vm.collections.push(o);
+    }
     // (The collector's to find: see `Vm::ephemerons`.)
     if matches!(class, Class::WeakMap | Class::WeakSet | Class::WeakRef | Class::FinalizationRegistry) {
         vm.weak_tables.push(o);

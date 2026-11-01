@@ -768,6 +768,11 @@ pub struct Vm {
     /// The `WeakMap`s and `WeakSet`s, live or not yet found dead by a
     /// collection (not roots: see `Vm::ephemerons`).
     pub(crate) weak_tables: Vec<*mut Object>,
+    /// The collections whose keys are hashed by address, maybe (`Map`,
+    /// `Set`, the weak ones, `FinalizationRegistry`): a collection that
+    /// moves cells pins their keys (`gc::Evacuation`). Not roots: those
+    /// not live go at each collection.
+    pub(crate) collections: Vec<*mut Object>,
     /// The targets of the `WeakRef`s made or dereferenced in the current
     /// job, kept alive until it ends (the spec's KeepDuringJob).
     pub(crate) kept_alive: Vec<Value>,
@@ -1147,6 +1152,7 @@ impl Vm {
             proxies_exist: false,
             proxy_codes: [std::ptr::null(); 3],
             weak_tables: Vec::new(),
+            collections: Vec::new(),
             kept_alive: Vec::new(),
             error: None,
             stack,
@@ -6078,6 +6084,21 @@ impl Vm {
     /// Every function's code.
     pub(crate) fn codes(&self) -> impl Iterator<Item = &Code> {
         self.codes.iter().map(|c| &**c)
+    }
+
+    /// Forget what the lookup and megamorphic tables hold: prototypes,
+    /// and their slots' addresses, which a collection moving cells may
+    /// have moved (`gc::Evacuation`). (Not by a new prototype epoch: that
+    /// drops every compiled version, the CPU time to compile them again
+    /// sass's 49% more.) The megamorphic table's first entry is the
+    /// prototype epoch's address, which compiled code reads.
+    pub(crate) fn forget_lookups(&mut self) {
+        for e in self.lookups.iter() {
+            e.set(LookupEntry::EMPTY);
+        }
+        for e in self.megas[1..].iter_mut() {
+            *e = MegaEntry::EMPTY;
+        }
     }
 
     /// Cells the VM's tables key by address (the root shapes' prototypes,

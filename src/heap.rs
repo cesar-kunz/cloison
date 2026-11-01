@@ -277,6 +277,11 @@ pub struct Heap {
     /// and blocks it emptied (`CLOISON_GC_STATS`).
     pub(crate) swept: [usize; 4],
     pub(crate) gc: crate::gc::Gc,
+    /// The small blocks the next full collection evacuates, a byte per
+    /// block (see `Vm::evacuate`). Allocation still takes their room (kept
+    /// from it for a cycle, they grew MathJax's peak 66%): what it puts
+    /// there moves too, up to the budget.
+    pub(crate) candidates: Vec<u8>,
 }
 
 impl Default for Heap {
@@ -313,6 +318,7 @@ impl Heap {
             requested: std::sync::atomic::AtomicBool::new(false),
             color: 1,
             gc,
+            candidates: Vec::new(),
             ptr: std::ptr::null_mut(),
             end: std::ptr::null_mut(),
             hole: std::ptr::null_mut(),
@@ -823,6 +829,24 @@ impl Heap {
         self.blocks[b] = Block::Small;
         self.used += BLOCK;
         self.block_addr(b) as usize
+    }
+
+    /// Make the blocks at `blocks` the next full collection's evacuation
+    /// candidates (none if empty).
+    pub(crate) fn set_candidates(&mut self, blocks: &[usize]) {
+        self.candidates.clear();
+        if blocks.is_empty() {
+            return;
+        }
+        self.candidates.resize(self.blocks.len(), 0);
+        for &a in blocks {
+            self.candidates[(a - self.base) / BLOCK] = 1;
+        }
+    }
+
+    /// The slice's start (block 0's address).
+    pub(crate) fn base(&self) -> usize {
+        self.base
     }
 
     /// `n` contiguous blocks never used before: the first's index.

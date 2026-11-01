@@ -11102,6 +11102,55 @@ folded + " | " + s + " " + r.join(",");
     }
 }
 
+/// A concurrent cycle's final pause moves cells out of fragmented blocks:
+/// old objects kept one in eight among garbage, stored into each other,
+/// keys of a `Map` and a `WeakMap`, while cycles run back to back, each
+/// moving what it can of every other block, and checking that no
+/// reference to a cell moved is left (`Vm::set_gc_evacuate_cycles`). What
+/// the program reads after is what V8, SpiderMonkey, JavaScriptCore and
+/// QuickJS give, compiled early or not.
+#[test]
+fn concurrent_cycles_evacuate_fragmented_blocks() {
+    let src = r#"
+var map = new Map(), wm = new WeakMap();
+function mk(i) { return { i: i, s: "s" + i, a: [i, i + 1], f: function () { return i; } }; }
+var old = [];
+for (var r = 0; r < 60; r++) {
+  var batch = [];
+  for (var i = 0; i < 4000; i++) batch.push(mk(r * 4000 + i));
+  for (var i = 0; i < batch.length; i += 8) old.push(batch[i]);
+  for (var k = r % 97; k < old.length; k += 97) {
+    var o = old[k];
+    o.next = old[(k * 31 + r) % old.length];
+    map.set(o, k);
+    wm.set(o, o.s);
+  }
+  var g = "";
+  for (var j = 0; j < 200; j++) g += j;
+}
+var sum = 0;
+for (var k = 0; k < old.length; k++) {
+  var o = old[k];
+  sum += o.i + o.a[1] - o.f();
+  if (o.s !== "s" + o.i) throw new Error("s " + k);
+  if (o.next && o.next.s !== "s" + o.next.i) throw new Error("next " + k);
+}
+var n = 0;
+map.forEach(function (v, o) { if (old[v] !== o || wm.get(o) !== o.s) throw new Error("map " + v); n++; });
+sum + " " + n;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let before = cloison::gc::EVACUATED.load(std::sync::atomic::Ordering::Relaxed);
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_gc_evacuate_cycles();
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("3599910000 9446"), "tier at {budget}");
+        assert!(cloison::gc::EVACUATED.load(std::sync::atomic::Ordering::Relaxed) > before, "nothing moved");
+    }
+}
+
 /// A direct `eval` in code an `eval` runs (its bindings through a scope
 /// object of accessors, `intrinsics::eval_through_scope`) while every
 /// collection moves cells: the names and the scope object it holds in Rust

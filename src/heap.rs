@@ -46,7 +46,7 @@ use crate::value::Value;
 // What compiled code knows of the heap is defined with the other layouts
 // it shares: the granule, card and large-cell sizes, the metadata bytes,
 // the side tables' place, the address space of a heap.
-pub use crate::layout::{CARD, COLOR, GRANULE, LARGE, SIDE, SLICE, VALUES, YOUNG, card, card_mark, color_byte, meta};
+pub use crate::layout::{CARD, COLOR, EVAC, GRANULE, LARGE, SIDE, SLICE, VALUES, YOUNG, card, card_mark, color_byte, meta};
 /// Block size: allocation's unit of memory.
 pub const BLOCK: usize = 32 << 10;
 const GRANULES_PER_BLOCK: usize = BLOCK / GRANULE;
@@ -199,13 +199,14 @@ fn release(a: usize, len: usize) {
 /// current color is recorded, by marking the card of `a`: outside a
 /// marking cycle, a young cell (the next minor collection must find it);
 /// during one, also an old cell not marked yet (the marker may have traced
-/// `host` already). The current color is the metadata byte of the heap's
-/// slice's first granule ([`color_byte`]).
+/// `host` already), and one in an evacuation candidate (`EVAC`: the final
+/// pause must find every slot that holds it). The current color is the
+/// metadata byte of the heap's slice's first granule ([`color_byte`]).
 #[inline(always)]
 pub fn barrier<T>(host: *const u8, a: *const T, v: Value) {
     unsafe {
         if v.is_cell()
-            && *meta(v.to_bits() as usize) & (YOUNG | COLOR) != *color_byte(host as usize)
+            && *meta(v.to_bits() as usize) & (YOUNG | COLOR | EVAC) != *color_byte(host as usize)
             && *meta(host as usize) != YOUNG
         {
             card_mark(a);
@@ -277,10 +278,11 @@ pub struct Heap {
     /// and blocks it emptied (`CLOISON_GC_STATS`).
     pub(crate) swept: [usize; 4],
     pub(crate) gc: crate::gc::Gc,
-    /// The small blocks the next full collection evacuates, a byte per
-    /// block (see `Vm::evacuate`). Allocation still takes their room (kept
-    /// from it for a cycle, they grew MathJax's peak 66%): what it puts
-    /// there moves too, up to the budget.
+    /// The small blocks the next full collection stopping the world, or
+    /// the cycle under way, evacuates, a byte per block (see
+    /// `Vm::evacuate`). Allocation still takes their room (kept from it
+    /// until the next full collection, they grew MathJax's peak 66%): what
+    /// it puts there moves too, up to the budget.
     pub(crate) candidates: Vec<u8>,
     /// The blocks the last full collection's sweep left in use, with their
     /// free bytes (those swept so far, if it runs), which evacuation's
@@ -821,25 +823,28 @@ impl Heap {
         unsafe { std::ptr::write_bytes(meta(a as usize), 0, n * BLOCK / GRANULE) };
     }
 
-    /// A block to copy cells into while evacuating (`gc::Evacuation`): an
-    /// empty one, a free one or a fresh one, its metadata clear, in use.
-    pub(crate) fn evacuation_block(&mut self) -> usize {
+    /// A block to copy cells into while evacuating (`Vm::evacuate`): an
+    /// empty one or a free one, its metadata clear, in use; with `fresh`,
+    /// a fresh one if there is neither.
+    pub(crate) fn evacuation_block(&mut self, fresh: bool) -> Option<usize> {
         let b = if let Some(b) = self.empty.pop() {
             self.clean(b as usize, 1);
             b as usize
         } else if let Some(b) = self.free.pop() {
             unsafe { std::ptr::write_bytes(meta(self.block_addr(b as usize) as usize), 0, BLOCK / GRANULE) };
             b as usize
-        } else {
+        } else if fresh {
             self.fresh_blocks(1)
+        } else {
+            return None;
         };
         self.blocks[b] = Block::Small;
         self.used += BLOCK;
-        self.block_addr(b) as usize
+        Some(self.block_addr(b) as usize)
     }
 
-    /// Make the blocks at `blocks` the next full collection's evacuation
-    /// candidates (none if empty).
+    /// Make the blocks at `blocks` the evacuation candidates (none if
+    /// empty).
     pub(crate) fn set_candidates(&mut self, blocks: &[usize]) {
         self.candidates.clear();
         if blocks.is_empty() {

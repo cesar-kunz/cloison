@@ -89,7 +89,7 @@ use value::{NumberTag, Value};
 mod layout;
 
 use layout::{
-    CARD, COLOR, CONS_MIN, DirectSite, GRANULE, SLICE, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
+    CARD, COLOR, CONS_MIN, EVAC, DirectSite, GRANULE, SLICE, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
     Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta, payload_cell, props_cap, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
@@ -761,7 +761,7 @@ unsafe fn barrier_rust<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value
         if meta_of(host as usize) == YOUNG {
             return;
         }
-        if meta_of(b as usize) & (YOUNG | COLOR) != *color_byte(host as usize) {
+        if meta_of(b as usize) & (YOUNG | COLOR | EVAC) != *color_byte(host as usize) {
             core::hint::cold_path();
             card_mark(a);
         }
@@ -780,7 +780,7 @@ unsafe fn barrier_rust<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value
 /// shr h, 4                                          ; h: the host, in place
 /// cmp byte [s+h], YOUNG ; je 2f                     ; a young host
 /// and h, -(SLICE/16)                                ; the slice's first granule
-/// mov m, v ; shr m, 4 ; movzx m, byte [s+m] ; and m, YOUNG|COLOR
+/// mov m, v ; shr m, 4 ; movzx m, byte [s+m] ; and m, YOUNG|COLOR|EVAC
 /// cmp m8, [s+h] ; je 2f                             ; the heap's color
 /// mov m, a ; shr m, 7 ; mov byte [s+m], 1           ; the card
 /// 2:
@@ -794,8 +794,9 @@ unsafe fn barrier_rust<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value
 ///   `SIDE + addr / CARD` (`layout::meta`, `layout::card`), both powers of
 ///   two;
 /// - a cell's first granule holds exactly `YOUNG` while young; old, its
-///   color in `COLOR`, maybe with `END` (`heap`): so `== YOUNG` is the age
-///   test and `& (YOUNG | COLOR)` the color to compare;
+///   color in `COLOR`, maybe with `END` and `EVAC` (`heap`): so `== YOUNG`
+///   is the age test and `& (YOUNG | COLOR | EVAC)` the color to compare
+///   (an evacuation candidate's never the heap's color);
 /// - the heap's current color is the metadata of the first granule of the
 ///   `SLICE`-aligned slice the host is in (`layout::color_byte`);
 /// - a dirty card is a byte 1 (`layout::card_mark`).
@@ -841,7 +842,7 @@ unsafe fn barrier_asm<T>(tag: NumberTag, host: *const u8, a: *const T, v: Value)
             card = const CARD.trailing_zeros(),
             young = const YOUNG,
             slice = const -((SLICE / GRANULE) as i64),
-            mask = const YOUNG | COLOR,
+            mask = const YOUNG | COLOR | EVAC,
             options(nostack),
         );
     }

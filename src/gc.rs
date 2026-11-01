@@ -742,6 +742,9 @@ pub(crate) enum Evacuate {
 /// collection evacuates (and at least [`EVACUATE_MIN`] bytes past).
 const EVACUATE_RATIO: usize = 2;
 const EVACUATE_MIN: usize = 32 << 20;
+/// What a concurrent cycle gives up its turn for a full collection that
+/// evacuates for (`Vm::evacuate_now`).
+const EVACUATE_CYCLE_MIN: usize = 64 << 20;
 /// A block is a candidate under this many hundredths full.
 const EVACUATE_FULL: usize = 50;
 /// Bytes a collection moves at most (`CLOISON_GC_EVACUATE_MIB`).
@@ -1756,7 +1759,7 @@ impl Vm {
             || gc.code_full()
             || self.shapes_full()
         {
-            if gc.stw || gc.always_full { Collection::Full } else { Collection::Start }
+            if gc.stw || gc.always_full || self.evacuate_now() { Collection::Full } else { Collection::Start }
         } else {
             Collection::Minor
         };
@@ -3045,52 +3048,26 @@ impl Vm {
     /// bytes by block from the metadata alone (a cell's color at its first
     /// granule, `END` at its last).
     fn choose_candidates(&mut self, color: u8) {
+        self.choose_candidates_for(color, EVACUATE_MIN, 10);
+    }
+
+    /// [`Vm::choose_candidates`], giving back at least `min` bytes and a
+    /// `share`th of the blocks in use.
+    fn choose_candidates_for(&mut self, _color: u8, min: usize, share: usize) {
         use crate::heap::BLOCK;
-        const ENDS: u64 = 0x0404_0404_0404_0404;
-        let mut live: Vec<(usize, usize)> = Vec::new();
-        for (start, end) in self.heap.block_ranges() {
-            if !matches!(self.heap.block_kind(start), Some(true)) {
-                continue;
-            }
-            let (mut p, mut n) = (start, 0);
-            unsafe {
-                while p < end {
-                    if p + 8 * GRANULE <= end && (crate::heap::meta(p) as *const u64).read_unaligned() == 0 {
-                        p += 8 * GRANULE;
-                        continue;
-                    }
-                    let m = *crate::heap::meta(p);
-                    if m & COLOR != color {
-                        p += GRANULE;
-                        continue;
-                    }
-                    let s = p;
-                    while *crate::heap::meta(p) & END == 0 {
-                        if p + 8 * GRANULE <= end {
-                            let w = (crate::heap::meta(p) as *const u64).read_unaligned() & ENDS;
-                            if w != 0 {
-                                p += w.trailing_zeros() as usize / 8 * GRANULE;
-                                continue;
-                            }
-                            p += 8 * GRANULE;
-                            continue;
-                        }
-                        p += GRANULE;
-                    }
-                    p += GRANULE;
-                    n += p - s;
-                }
-            }
-            live.push((n, start));
-        }
+        // (Live bytes by block: what the sweep didn't free.)
+        let mut live: Vec<(usize, usize)> = self.heap.swept_free.iter().map(|&(b, free)| (BLOCK - free.min(BLOCK), b)).collect();
         let chosen: Vec<usize> = if self.heap.gc.evacuate == Evacuate::All {
             self.heap.gc.evacuate_parity ^= true;
             let parity = self.heap.gc.evacuate_parity as usize;
             live.iter().filter(|&&(n, b)| n > 0 && (b / BLOCK) % 2 == parity).map(|&(_, b)| b).collect()
         } else {
-            let in_use = live.len() * BLOCK;
-            let total: usize = live.iter().map(|l| l.0).sum();
+            // (Blocks the sweep found full aren't listed: the room's those
+            // listed, against the small blocks in use.)
+            let in_use = self.heap.small_blocks() * BLOCK;
+            let total: usize = in_use - live.iter().map(|l| BLOCK - l.0).sum::<usize>();
             if in_use < EVACUATE_RATIO * total {
+                self.heap.set_candidates(&[]);
                 return;
             }
             live.sort_unstable();
@@ -3103,7 +3080,8 @@ impl Vm {
                 gain += BLOCK - n;
                 chosen.push(b);
             }
-            if gain < EVACUATE_MIN.max(in_use / 10) {
+            if gain < min.max(in_use / share) {
+                self.heap.set_candidates(&[]);
                 return;
             }
             chosen
@@ -3111,16 +3089,44 @@ impl Vm {
         self.heap.set_candidates(&chosen);
     }
 
-    /// The collections not live go from `Vm::collections`.
+    /// Whether the full collection due, a concurrent cycle otherwise, stops
+    /// the world to evacuate instead (as V8's memory reducer starts a
+    /// compacting one): the last sweep left at least [`EVACUATE_CYCLE_MIN`]
+    /// free in blocks it left in use (`Heap::swept_free`), the heap is over [`EVACUATE_RATIO`]
+    /// times what the last cycle found live, and the candidates the
+    /// metadata gives (`choose_candidates`, the sweep finished first, as the
+    /// cycle's start would) would give back at least that much and a sixth
+    /// of the blocks in use. Rare: its pause is a full marking's and the
+    /// move's.
+    fn evacuate_now(&mut self) -> bool {
+        let gc = &self.heap.gc;
+        let free: usize = self.heap.swept_free.iter().map(|&(_, f)| f).sum();
+        if gc.evacuate != Evacuate::Fragmented
+            || free < EVACUATE_CYCLE_MIN
+            || self.heap.allocated() < EVACUATE_RATIO * gc.live + EVACUATE_CYCLE_MIN
+        {
+            return false;
+        }
+        let color = self.heap.color;
+        self.choose_candidates_for(color, EVACUATE_CYCLE_MIN, 6);
+        !self.heap.candidates.is_empty()
+    }
+
+    /// The collections not live go from `Vm::collections`: a minor
+    /// collection's, of those made since the last collection (it frees no
+    /// other: going over all of them at each one doubled the TypeScript
+    /// app's minor pauses).
     fn prune_collections(&mut self, mode: Mode) {
+        let minor = matches!(mode.kind, Kind::Minor | Kind::MinorShade);
         let live = |p: usize| unsafe {
             let b = *crate::heap::meta(p);
-            match mode.kind {
-                Kind::Minor | Kind::MinorShade => b != YOUNG,
-                _ => b & COLOR == mode.color,
-            }
+            if minor { b != YOUNG } else { b & COLOR == mode.color }
         };
-        self.collections.retain(|&o| live(o as usize));
+        let from = if minor { self.collections_young.min(self.collections.len()) } else { 0 };
+        let mut young = self.collections.split_off(from);
+        young.retain(|&o| live(o as usize));
+        self.collections.append(&mut young);
+        self.collections_young = self.collections.len();
     }
 
     /// `CLOISON_GC_SLOTS`, after a full collection stopping the world: mark
@@ -3726,6 +3732,7 @@ impl Heap {
     /// new blocks, and the swept ones as they come ([`Heap::absorb_sweep`]).
     /// Returns the bytes freed now.
     unsafe fn start_sweep(&mut self, color: u8, poison: bool) -> usize {
+        self.swept_free.clear();
         let mut freed = 0;
         let mut small = Vec::new();
         unsafe {

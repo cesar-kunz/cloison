@@ -245,9 +245,10 @@ pub struct Gc {
     /// marked is reached from the roots' slots (`CLOISON_GC_SLOTS`, see
     /// `Vm::check_root_slots`).
     slots_check: bool,
-    /// Every full collection stopping the world moves every cell it may
-    /// (`CLOISON_GC_EVACUATE`: the stress mode of [`Vm::evacuate`]).
-    evacuate: bool,
+    /// What full collections stopping the world move ([`Vm::evacuate`]).
+    evacuate: Evacuate,
+    /// The stress mode's blocks this time: odd or even ones.
+    evacuate_parity: bool,
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
     /// (`CLOISON_GC_CHECK_BARRIER`, slow).
@@ -275,7 +276,11 @@ impl Gc {
             roots_report: env("CLOISON_GC_ROOTS"),
             frag_report: env("CLOISON_GC_FRAG"),
             slots_check: env("CLOISON_GC_SLOTS"),
-            evacuate: env("CLOISON_GC_EVACUATE"),
+            evacuate: match std::env::var("CLOISON_GC_EVACUATE").as_deref() {
+                Ok("0" | "off") => Evacuate::Off,
+                Ok("1" | "all") => Evacuate::All,
+                _ => Evacuate::Fragmented,
+            },
             nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -294,7 +299,7 @@ impl Gc {
     /// See `Vm::set_gc_evacuate_all`.
     pub(crate) fn set_evacuate_all(&mut self) {
         self.always_full = true;
-        self.evacuate = true;
+        self.evacuate = Evacuate::All;
     }
 
     #[cold]
@@ -516,6 +521,96 @@ struct Mode {
     shapes: bool,
 }
 
+/// A marking's visitor, recording the slots into evacuation candidates it
+/// traces (see [`Candidates::note`]): only the loops of a full marking
+/// with candidates trace through it, so the others' are as before (a check
+/// at every slot cost Splay 3% of its instructions).
+trait Records: Visit {
+    fn cand(&self) -> Candidates;
+    fn rec(&mut self) -> &mut Vec<usize>;
+}
+
+struct Rec<'x, V: Records>(&'x mut V);
+
+impl<V: Records> Visit for Rec<'_, V> {
+    #[inline(always)]
+    unsafe fn cell(&mut self, p: usize) {
+        unsafe { self.0.cell(p) }
+    }
+
+    #[inline(always)]
+    unsafe fn slot(&mut self, a: *mut Value) {
+        unsafe {
+            let v = *a;
+            if v.is_cell() {
+                let c = self.0.cand();
+                c.note(self.0.rec(), a as usize, v.to_bits() as usize, false);
+            }
+            self.0.value(v)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn payload_slot(&mut self, a: *mut usize) {
+        unsafe {
+            let q = *a;
+            if q != 0 {
+                let c = self.0.cand();
+                c.note(self.0.rec(), a as usize, q - 8, true);
+            }
+            self.0.payload(q)
+        }
+    }
+}
+
+impl Records for Marking<'_> {
+    fn cand(&self) -> Candidates {
+        self.cand
+    }
+    fn rec(&mut self) -> &mut Vec<usize> {
+        &mut self.rec
+    }
+}
+
+impl Records for CardMarking {
+    fn cand(&self) -> Candidates {
+        self.cand
+    }
+    fn rec(&mut self) -> &mut Vec<usize> {
+        &mut self.rec
+    }
+}
+
+/// The evacuation candidates a marking records slots into: a block's
+/// byte nonzero in `map` (an address, 0 for none: shared by the threads
+/// tracing, so plain integers), from `base`.
+#[derive(Clone, Copy, Default)]
+struct Candidates {
+    map: usize,
+    len: usize,
+    base: usize,
+}
+
+impl Candidates {
+    /// Whether `a` (any address) is in a candidate block.
+    #[inline(always)]
+    fn has(&self, a: usize) -> bool {
+        let b = a.wrapping_sub(self.base) / crate::heap::BLOCK;
+        b < self.len && unsafe { *((self.map + b) as *const u8) } != 0
+    }
+
+    /// Record slot `a`, of a value referring to `to` (or, `payload` set, of
+    /// a payload pointer: bit 0 then set), if `to` is in a candidate block
+    /// and `a` isn't: a candidate's own cells are traced again when
+    /// evacuated.
+    #[inline(always)]
+    fn note(&self, rec: &mut Vec<usize>, a: usize, to: usize, payload: bool) {
+        if self.has(to) && !self.has(a) {
+            rec.push(a | payload as usize);
+        }
+    }
+}
+
 /// Full markings so far, over every VM: a code found live is marked with
 /// the epoch then (see `vm::Code::mark`).
 static CODE_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -536,6 +631,8 @@ pub static HEAP_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static LIVE_PEAK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ALLOCATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PROMOTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes evacuation moved (`Vm::evacuate`).
+pub static EVACUATED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Full collections that came while no cell could move (`Vm::unmovable`).
 pub static UNMOVABLE_FULLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -625,6 +722,40 @@ unsafe fn trace_shape(m: &mut impl Visit, mut s: *const crate::object::Shape, ep
     }
 }
 
+/// What a full collection stopping the world moves (`CLOISON_GC_EVACUATE`,
+/// see `Vm::evacuate`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Evacuate {
+    /// Nothing (`0`, `off`).
+    Off,
+    /// The cells of the sparsest blocks, up to a budget, when the small
+    /// blocks hold more than [`EVACUATE_RATIO`] times what is live in them
+    /// (the default).
+    #[default]
+    Fragmented,
+    /// Every cell it may (`1`, `all`): the stress mode, which a reference
+    /// no update reaches fails, reading [`POISON`].
+    All,
+}
+
+/// Small blocks in use past this many times the bytes live in them, a
+/// collection evacuates (and at least [`EVACUATE_MIN`] bytes past).
+const EVACUATE_RATIO: usize = 2;
+const EVACUATE_MIN: usize = 32 << 20;
+/// A block is a candidate under this many hundredths full.
+const EVACUATE_FULL: usize = 50;
+/// Bytes a collection moves at most (`CLOISON_GC_EVACUATE_MIB`).
+fn evacuate_budget() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("CLOISON_GC_EVACUATE_MIB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(64) << 20
+    })
+}
+
+/// A moved cell's first granule's metadata while it is evacuated: its new
+/// address in its second word (`Vm::evacuate`).
+const FORWARDED: u8 = 0x40;
+
 /// A root as a collection that moves cells needs it (see
 /// `Vm::each_root_slot`): a slot it may update, of a value (any: those
 /// that aren't cells are skipped), an object pointer (null skipped) or an
@@ -687,6 +818,10 @@ struct Marking<'a> {
     heap: (usize, usize),
     /// Bytes traced.
     marked: usize,
+    /// The blocks evacuation candidates in a full marking stopping the
+    /// world (see [`Candidates`]), and the slots into them it traced.
+    cand: Candidates,
+    rec: Vec<usize>,
 }
 
 impl Visit for Marking<'_> {
@@ -792,6 +927,9 @@ struct CardMarking {
     heap: (usize, usize),
     stack: Vec<usize>,
     shade: Vec<usize>,
+    /// As `Marking::cand` and `Marking::rec`.
+    cand: Candidates,
+    rec: Vec<usize>,
 }
 
 impl Visit for CardMarking {
@@ -861,6 +999,15 @@ impl Marking<'_> {
     /// stack's size: tracing a tree depth first keeps the stack about as
     /// deep as the tree.
     unsafe fn drain_to(&mut self, stop: &dyn Fn() -> bool, after: usize) -> usize {
+        unsafe {
+            if self.cand.map != 0 { self.drain_to_in::<true>(stop, after) } else { self.drain_to_in::<false>(stop, after) }
+        }
+    }
+
+    /// [`drain_to`](Self::drain_to), recording the slots into evacuation
+    /// candidates if `R`.
+    #[inline(always)]
+    unsafe fn drain_to_in<const R: bool>(&mut self, stop: &dyn Fn() -> bool, after: usize) -> usize {
         let mut n = 0;
         // Work since `stop` was last asked, in cells (a slice counts as
         // one per 32 slots).
@@ -909,14 +1056,14 @@ impl Marking<'_> {
                 }
                 if slots > SLICE_SLOTS {
                     let to = (from + SLICE_SLOTS).min(slots);
-                    trace(self, p, p + 8 + 8 * from, p + 8 + 8 * to);
+                    if R { trace(&mut Rec(self), p, p + 8 + 8 * from, p + 8 + 8 * to) } else { trace(self, p, p + 8 + 8 * from, p + 8 + 8 * to) };
                     if to < slots {
                         self.stack.push(to);
                         self.stack.push(p | 1);
                     }
                     work += SLICE_SLOTS / 32;
                 } else {
-                    trace(self, p, 0, usize::MAX);
+                    if R { trace(&mut Rec(self), p, 0, usize::MAX) } else { trace(self, p, 0, usize::MAX) };
                     work += 1;
                 }
                 if work >= 256 {
@@ -969,23 +1116,38 @@ impl Marking<'_> {
         let per = cells.len().div_ceil(threads).max(1);
         let mut deal: Vec<Vec<usize>> = cells.chunks(per).map(<[usize]>::to_vec).collect();
         deal.resize_with(threads, Vec::new);
-        let (mode, heap) = (self.mode, self.heap);
+        let (mode, heap, cand) = (self.mode, self.heap, self.cand);
         let pool = &pool;
-        let results: Vec<(usize, usize, Vec<usize>)> = std::thread::scope(|sc| {
+        let results: Vec<(usize, usize, Vec<usize>, Vec<usize>)> = std::thread::scope(|sc| {
             let mut deal = deal.into_iter();
             let first = (deal.next().unwrap(), slices);
             let helpers: Vec<_> = deal
-                .map(|stack| sc.spawn(move || unsafe { trace_shared(pool, mode, heap, stack, Vec::new()) }))
+                .map(|stack| {
+                    sc.spawn(move || unsafe {
+                        if cand.map != 0 {
+                            trace_shared::<true>(pool, mode, heap, cand, stack, Vec::new())
+                        } else {
+                            trace_shared::<false>(pool, mode, heap, cand, stack, Vec::new())
+                        }
+                    })
+                })
                 .collect();
-            let mut r = vec![unsafe { trace_shared(pool, mode, heap, first.0, first.1) }];
+            let mut r = vec![unsafe {
+                if cand.map != 0 {
+                    trace_shared::<true>(pool, mode, heap, cand, first.0, first.1)
+                } else {
+                    trace_shared::<false>(pool, mode, heap, cand, first.0, first.1)
+                }
+            }];
             r.extend(helpers.into_iter().map(|h| h.join().unwrap()));
             r
         });
         let mut n = 0;
-        for (cells, bytes, shade) in results {
+        for (cells, bytes, shade, rec) in results {
             n += cells;
             self.marked += bytes;
             self.shade.extend(shade);
+            self.rec.extend(rec);
         }
         n
     }
@@ -1043,15 +1205,16 @@ impl TracePool {
 /// One of [`Marking::drain_parallel`]'s threads: trace from `stack` and
 /// `slices`, then from what the others hand over, until all are out of
 /// work. Returns the cells and bytes traced, and the old cells shaded.
-unsafe fn trace_shared(
+unsafe fn trace_shared<const R: bool>(
     pool: &TracePool,
     mode: Mode,
     heap: (usize, usize),
+    cand: Candidates,
     stack: Vec<usize>,
     mut slices: Vec<(usize, usize)>,
-) -> (usize, usize, Vec<usize>) {
+) -> (usize, usize, Vec<usize>, Vec<usize>) {
     use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
-    let mut cm = CardMarking { mode, heap, stack, shade: Vec::new() };
+    let mut cm = CardMarking { mode, heap, stack, shade: Vec::new(), cand, rec: Vec::new() };
     let (mut n, mut bytes) = (0, 0);
     // As `drain`'s ring: cells prefetched `RING - 1` cells ahead.
     const RING: usize = 8;
@@ -1082,15 +1245,15 @@ unsafe fn trace_shared(
                     }
                     let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                     if slots > SLICE_SLOTS {
-                        trace(&mut cm, p, p + 8, p + 8 + 8 * SLICE_SLOTS);
+                        if R { trace(&mut Rec(&mut cm), p, p + 8, p + 8 + 8 * SLICE_SLOTS) } else { trace(&mut cm, p, p + 8, p + 8 + 8 * SLICE_SLOTS) };
                         slices.push((p, SLICE_SLOTS));
                     } else {
-                        trace(&mut cm, p, 0, usize::MAX);
+                        if R { trace(&mut Rec(&mut cm), p, 0, usize::MAX) } else { trace(&mut cm, p, 0, usize::MAX) };
                     }
                 } else if let Some((p, from)) = slices.pop() {
                     let slots = (*(p as *const u64) >> 32) as usize;
                     let to = (from + SLICE_SLOTS).min(slots);
-                    trace(&mut cm, p, p + 8 + 8 * from, p + 8 + 8 * to);
+                    if R { trace(&mut Rec(&mut cm), p, p + 8 + 8 * from, p + 8 + 8 * to) } else { trace(&mut cm, p, p + 8 + 8 * from, p + 8 + 8 * to) };
                     if to < slots {
                         slices.push((p, to));
                     }
@@ -1110,7 +1273,7 @@ unsafe fn trace_shared(
             }
         }
     }
-    (n, bytes, cm.shade)
+    (n, bytes, cm.shade, cm.rec)
 }
 
 /// A pause traces on several threads once it has traced this many cells
@@ -1505,6 +1668,8 @@ fn marker_loop(sh: &Shared) {
             shade: &mut shade,
             heap,
             marked: 0,
+            cand: Candidates::default(),
+            rec: Vec::new(),
         };
         unsafe { m.drain(&|| sh.pause.load(Relaxed)) };
         let marked = m.marked;
@@ -1680,6 +1845,8 @@ impl Vm {
             shade: &mut shade,
             heap: range,
             marked: 0,
+            cand: if kind == Collection::Full { self.heap.candidates_map() } else { Candidates::default() },
+            rec: Vec::new(),
         };
         unsafe {
             self.mark_roots(&mut m, sp, regs);
@@ -1707,6 +1874,7 @@ impl Vm {
             };
             // (The weak collections' entries, once what is live is known.)
             self.ephemerons(&mut m);
+            self.prune_collections(m.mode);
             if kind == Collection::Minor && self.heap.gc.check_barriers {
                 self.heap.check_barriers();
             }
@@ -1728,8 +1896,14 @@ impl Vm {
             if kind == Collection::Full && self.heap.gc.slots_check {
                 self.check_root_slots(sp, regs, color);
             }
-            if kind == Collection::Full && self.heap.gc.evacuate {
-                self.evacuate(sp, regs, color);
+            if kind == Collection::Full && self.heap.gc.evacuate != Evacuate::Off {
+                let rec = std::mem::take(&mut m.rec);
+                self.evacuate(sp, regs, color, rec);
+            }
+            // (Only a full collection stopping the world evacuates: a
+            // concurrent cycle gives the candidates back to allocation.)
+            if kind != Collection::Full && !self.heap.candidates.is_empty() && full {
+                self.heap.set_candidates(&[]);
             }
             times[2] = lap();
             freed = match kind {
@@ -1738,7 +1912,13 @@ impl Vm {
                 // would take a stale word to one for a live young cell and
                 // keep it, with what it refers to swept from under it.
                 Collection::Final => self.heap.free_young(check) + self.heap.start_sweep(color, check),
-                Collection::Full => self.heap.free_unmarked(color, check),
+                Collection::Full => {
+                    let f = self.heap.free_unmarked(color, check);
+                    if self.heap.gc.evacuate != Evacuate::Off {
+                        self.choose_candidates(color);
+                    }
+                    f
+                }
                 _ => self.heap.free_young(check),
             };
             if full {
@@ -2545,43 +2725,56 @@ impl Vm {
         }
     }
 
-    /// Stage 3 of evacuating fragmented blocks, as a stress mode for now
-    /// (`CLOISON_GC_EVACUATE`): after a full collection stopping the world
-    /// has marked, move every cell it marked in small blocks that nothing
-    /// pins into blocks of their own, and update every reference to them.
-    /// No cell moves while Rust code holds copies of values (`Vm::unmovable`)
-    /// or a function's JIT state is borrowed.
+    /// Move cells out of fragmented blocks, in a full collection stopping
+    /// the world, after it has marked and before anything is freed, and
+    /// update every reference to them (stages 3 and 4 of evacuating
+    /// fragmented blocks). What moves are the cells of the blocks the last
+    /// such collection chose (`Vm::choose_candidates`, `Heap::candidates`:
+    /// no allocation took them since), but those pinned; the marking
+    /// recorded the slots into them its cells hold (`Mode::cand`), so the
+    /// update reads those, the roots' and the candidates' own cells, not the
+    /// heap. No cell moves while Rust code holds copies of values
+    /// (`Vm::unmovable`) or a function's JIT state is borrowed.
     ///
-    /// Pinned: what a native stack word points into, what Rust structures
-    /// took since the last collection and what compiled code embeds (the
-    /// roots' `Root::Pinned`), the cells holding the prototype slots
-    /// compiled code relies on, constructor tracking's prototypes, the
-    /// cells the JIT compares or reads by address without keeping them
-    /// (`jit::shape_words`), those the VM's tables key by address
-    /// (`Vm::address_keyed_cells`), the keys collections hash by address,
-    /// and the bytes typed views point into. Updated: the roots' slots
-    /// (`Vm::each_root_slot`), every slot of every cell left (`trace`), the
-    /// weak collections and their entries, a moved string's or upvalue's
-    /// pointer to itself, the VM's state of a call being made. Dropped: the
-    /// lookups and megamorphic tables (a new prototype epoch), the far
-    /// keys' cache. The cells moved from are freed and filled with
-    /// [`POISON`], so a reference left reads it.
+    /// Pinned: what the roots pin (native stack words, what Rust structures
+    /// logged, what compiled code embeds), the VM's own cells, the cells
+    /// holding prototype slots compiled code relies on, constructor
+    /// tracking's prototypes, what the JIT compares or reads by address
+    /// without keeping it (`jit::shape_words`), what the VM's tables key by
+    /// address (`Vm::address_keyed_cells`), the keys collections hash by
+    /// address (`Vm::collections`), and byte buffers (typed views point
+    /// into them). A moved cell is forwarded in place ([`FORWARDED`] in its
+    /// metadata, its new address in its second word) until every reference
+    /// is updated: the roots' slots (`each_root_slot`), the recorded ones,
+    /// the candidates' cells' (`trace`), the weak collections and their
+    /// entries, the collections' list, the state of a call being made,
+    /// `typeof`'s strings, a conversion's pending error. Dropped: the lookup
+    /// and megamorphic tables, the far keys' cache. The cells moved from are
+    /// freed (and, stressed or verified, filled with [`POISON`], so a
+    /// reference left reads that).
     #[cold]
     #[inline(never)]
-    unsafe fn evacuate(&mut self, sp: usize, regs: *mut Value, color: u8) {
-        use crate::heap::{BLOCK, LARGE};
+    unsafe fn evacuate(&mut self, sp: usize, regs: *mut Value, color: u8, rec: Vec<usize>) {
+        use crate::heap::{BLOCK, BYTES, LARGE};
+        if self.heap.candidates.is_empty() {
+            return;
+        }
+        let candidates: Vec<usize> = (self.heap.candidates.iter().enumerate())
+            .filter(|&(_, &c)| c != 0)
+            .map(|(b, _)| self.heap.base() + b * BLOCK)
+            .collect();
+        // (Whatever happens, they are blocks as any other after.)
+        self.heap.set_candidates(&[]);
         if self.unmovable > 0 {
             return;
         }
         let t0 = std::time::Instant::now();
-        let range = self.heap.cells_range();
-        let marked = |p: usize| unsafe { *crate::heap::meta(p) } & (YOUNG | COLOR) == color;
-        // The live cells, by block kind.
-        let mut live: Vec<(usize, usize)> = Vec::new();
-        for (start, end) in self.heap.block_ranges() {
-            let small = matches!(self.heap.block_kind(start), Some(true));
+        let mode = self.heap.gc.evacuate;
+        // The candidates' cells marked.
+        let mut cells_in: Vec<(usize, usize)> = Vec::new();
+        for &start in &candidates {
             let mut p = start;
-            while p < end {
+            while p < start + BLOCK {
                 let m = unsafe { *crate::heap::meta(p) };
                 if m & (YOUNG | COLOR) == 0 {
                     p += GRANULE;
@@ -2589,11 +2782,12 @@ impl Vm {
                 }
                 let n = unsafe { cell_size(p as *const u8) };
                 if m & (YOUNG | COLOR) == color {
-                    live.push((p, if small { n } else { 0 }));
+                    cells_in.push((p, n));
                 }
                 p += n;
             }
         }
+        let t_live = t0.elapsed().as_secs_f64() * 1e3;
         // Pins.
         let mut pins: std::collections::HashSet<usize> = Default::default();
         unsafe {
@@ -2635,26 +2829,26 @@ impl Vm {
                 return;
             }
             self.address_keyed_cells(&mut |w| pin_word(w, &mut pins));
-            for &(p, _) in &live {
-                if unsafe { *(p as *const u64) } & 1 != 0 {
-                    continue;
-                }
-                let o = p as *mut Object;
+            // The keys collections hash by address.
+            for &o in &self.collections {
                 crate::collections::address_keys(o, &mut |k| {
                     pins.insert(k);
                 });
-                if matches!(unsafe { (*o).class }, Class::TypedArray | Class::DataView) {
-                    pin_word(unsafe { (*o).elems } as u64, &mut pins);
-                }
             }
         }
-        // Copy.
-        let mut to: std::collections::HashMap<usize, usize> = Default::default();
+        let t_pins = t0.elapsed().as_secs_f64() * 1e3;
+        // Copy, each cell moved forwarded in place.
         let (mut at, mut end) = (0usize, 0usize);
-        let mut moved = 0usize;
-        for &(p, n) in &live {
-            if n == 0 || n > LARGE || pins.contains(&p) {
+        let (mut moved, mut cells) = (0usize, 0usize);
+        let mut from: Vec<(usize, usize)> = Vec::new();
+        // (Up to the budget: allocation may have filled the candidates.)
+        let budget = if mode == Evacuate::All { usize::MAX } else { evacuate_budget() };
+        for &(p, n) in &cells_in {
+            if n > LARGE || pins.contains(&p) || unsafe { *(p as *const u64) } & 7 == BYTES {
                 continue;
+            }
+            if moved + n > budget {
+                break;
             }
             if at + n > end {
                 at = self.heap.evacuation_block();
@@ -2679,24 +2873,42 @@ impl Vm {
                     // A closed upvalue's variable is its own.
                     *((q + 8) as *mut usize) = q + 16;
                 }
+                // (Its second word read above: now its new address.)
+                *((p + 8) as *mut usize) = q;
+                *crate::heap::meta(p) |= FORWARDED;
             }
-            to.insert(p, q);
+            from.push((p, n));
             moved += n;
+            cells += 1;
         }
-        if to.is_empty() {
+        if from.is_empty() {
             return;
         }
+        let t_copy = t0.elapsed().as_secs_f64() * 1e3;
         // Update.
-        struct Forward<'a> {
-            to: &'a std::collections::HashMap<usize, usize>,
-        }
-        impl Forward<'_> {
+        /// The heap's cells' range: a word outside it (a frame header's Rust
+        /// address on the VM stack) has no metadata to read.
+        struct Forward(usize, usize);
+        impl Forward {
+            /// Where the cell at `p` went, if it moved (`p` in the range).
+            #[inline(always)]
+            unsafe fn at(p: usize) -> Option<usize> {
+                unsafe { (*crate::heap::meta(p) & FORWARDED != 0).then(|| *((p + 8) as *const usize)) }
+            }
+            /// Where the cell at `p` went, if it is in the heap and moved.
+            #[inline(always)]
+            fn to(&self, p: usize) -> Option<usize> {
+                if p < self.0 || p >= self.1 || p % GRANULE != 0 {
+                    return None;
+                }
+                unsafe { Forward::at(p) }
+            }
             #[inline]
             unsafe fn value(&self, a: *mut Value) {
                 unsafe {
                     let v = *a;
                     if v.is_cell()
-                        && let Some(&q) = self.to.get(&(v.to_bits() as usize))
+                        && let Some(q) = self.to(v.to_bits() as usize)
                     {
                         *a = Value::from_bits(q as u64);
                     }
@@ -2705,7 +2917,9 @@ impl Vm {
             #[inline]
             unsafe fn object(&self, a: *mut *mut Object) {
                 unsafe {
-                    if let Some(&q) = self.to.get(&(*a as usize)) {
+                    if !(*a).is_null()
+                        && let Some(q) = self.to(*a as usize)
+                    {
                         *a = q as *mut Object;
                     }
                 }
@@ -2715,14 +2929,14 @@ impl Vm {
                 unsafe {
                     let q = *a;
                     if q != 0
-                        && let Some(&n) = self.to.get(&(q - 8))
+                        && let Some(n) = self.to(q - 8)
                     {
                         *a = n + 8;
                     }
                 }
             }
         }
-        impl Visit for Forward<'_> {
+        impl Visit for Forward {
             unsafe fn cell(&mut self, _: usize) {}
             unsafe fn slot(&mut self, a: *mut Value) {
                 unsafe { Forward::value(self, a) }
@@ -2731,7 +2945,8 @@ impl Vm {
                 unsafe { Forward::payload(self, a) }
             }
         }
-        let mut fw = Forward { to: &to };
+        let range = self.heap.cells_range();
+        let mut fw = Forward(range.0, range.1);
         unsafe {
             (*(self as *mut Vm)).each_root_slot(sp, regs, &mut |r| match r {
                 Root::Value(a) => fw.value(a),
@@ -2739,9 +2954,21 @@ impl Vm {
                 Root::Payload(a) => fw.payload(a),
                 Root::Pinned(_) => {}
             });
-            for &(p, _) in &live {
-                let p = to.get(&p).copied().unwrap_or(p);
+            // The slots into the candidates marking recorded, and the
+            // candidates' own cells (moved, or left: pinned).
+            for &a in &rec {
+                if a & 1 != 0 {
+                    fw.payload((a & !1) as *mut usize);
+                } else {
+                    fw.value(a as *mut Value);
+                }
+            }
+            for &(p, _) in &cells_in {
+                let p = Forward::at(p).unwrap_or(p);
                 trace(&mut fw, p, 0, usize::MAX);
+            }
+            for c in self.collections.iter_mut() {
+                fw.object(c);
             }
             // The weak collections, and their entries (traced only to their
             // header).
@@ -2777,31 +3004,123 @@ impl Vm {
                 fw.value(v);
             }
         }
+        let t_fix = t0.elapsed().as_secs_f64() * 1e3;
         // Caches of addresses.
-        // (With the code's epoch, as every prototype epoch: compiled code
-        // and its lowerings take the two to change together.)
-        self.proto_epoch = self.proto_epoch.wrapping_add(1);
-        self.bump_code_epoch();
+        self.forget_lookups();
         self.far_keys.invalidate();
-        // The cells moved from: free, and poisoned.
-        for (&p, _) in &to {
+        // The cells moved from: free (and poisoned, stressed or verified).
+        let poison = mode == Evacuate::All || self.heap.gc.checking();
+        for &(p, n) in &from {
             unsafe {
-                let n = cell_size(p as *const u8);
                 *crate::heap::meta(p) = 0;
                 *crate::heap::meta(p + n - GRANULE) = 0;
-                std::ptr::write_bytes(p as *mut u8, POISON, n);
+                if poison {
+                    std::ptr::write_bytes(p as *mut u8, POISON, n);
+                }
             }
         }
+        EVACUATED.fetch_add(moved as u64, std::sync::atomic::Ordering::Relaxed);
         if self.heap.gc.stats {
             eprintln!(
-                "evacuated {} cells ({} KiB), {} pinned, in {:.1} ms",
-                to.len(),
+                "evacuated {cells} cells ({} KiB) from {} blocks, {} slots recorded, {} pinned, in {:.1} ms (cells {t_live:.1}, pins {:.1}, copy {:.1}, update {:.1})",
                 moved >> 10,
+                candidates.len(),
+                rec.len(),
                 pins.len(),
-                t0.elapsed().as_secs_f64() * 1e3
+                t0.elapsed().as_secs_f64() * 1e3,
+                t_pins - t_live,
+                t_copy - t_pins,
+                t_fix - t_copy
             );
         }
-        let _ = (range, marked);
+    }
+
+    /// After a full collection stopping the world has swept (every cell
+    /// left is live), the blocks the next one evacuates (`Heap::candidates`):
+    /// when the small blocks in use are over
+    /// [`EVACUATE_RATIO`] times the bytes live in them, the sparsest under
+    /// [`EVACUATE_FULL`]%, up to a budget of bytes, if they would give back
+    /// at least a tenth of the blocks in use (and [`EVACUATE_MIN`]);
+    /// stressed (`Evacuate::All`), every other block, alternately. Live
+    /// bytes by block from the metadata alone (a cell's color at its first
+    /// granule, `END` at its last).
+    fn choose_candidates(&mut self, color: u8) {
+        use crate::heap::BLOCK;
+        const ENDS: u64 = 0x0404_0404_0404_0404;
+        let mut live: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in self.heap.block_ranges() {
+            if !matches!(self.heap.block_kind(start), Some(true)) {
+                continue;
+            }
+            let (mut p, mut n) = (start, 0);
+            unsafe {
+                while p < end {
+                    if p + 8 * GRANULE <= end && (crate::heap::meta(p) as *const u64).read_unaligned() == 0 {
+                        p += 8 * GRANULE;
+                        continue;
+                    }
+                    let m = *crate::heap::meta(p);
+                    if m & COLOR != color {
+                        p += GRANULE;
+                        continue;
+                    }
+                    let s = p;
+                    while *crate::heap::meta(p) & END == 0 {
+                        if p + 8 * GRANULE <= end {
+                            let w = (crate::heap::meta(p) as *const u64).read_unaligned() & ENDS;
+                            if w != 0 {
+                                p += w.trailing_zeros() as usize / 8 * GRANULE;
+                                continue;
+                            }
+                            p += 8 * GRANULE;
+                            continue;
+                        }
+                        p += GRANULE;
+                    }
+                    p += GRANULE;
+                    n += p - s;
+                }
+            }
+            live.push((n, start));
+        }
+        let chosen: Vec<usize> = if self.heap.gc.evacuate == Evacuate::All {
+            self.heap.gc.evacuate_parity ^= true;
+            let parity = self.heap.gc.evacuate_parity as usize;
+            live.iter().filter(|&&(n, b)| n > 0 && (b / BLOCK) % 2 == parity).map(|&(_, b)| b).collect()
+        } else {
+            let in_use = live.len() * BLOCK;
+            let total: usize = live.iter().map(|l| l.0).sum();
+            if in_use < EVACUATE_RATIO * total {
+                return;
+            }
+            live.sort_unstable();
+            let (mut budget, mut gain, mut chosen) = (evacuate_budget(), 0, Vec::new());
+            for &(n, b) in live.iter().filter(|&&(n, _)| n > 0 && n * 100 < BLOCK * EVACUATE_FULL) {
+                if n > budget {
+                    break;
+                }
+                budget -= n;
+                gain += BLOCK - n;
+                chosen.push(b);
+            }
+            if gain < EVACUATE_MIN.max(in_use / 10) {
+                return;
+            }
+            chosen
+        };
+        self.heap.set_candidates(&chosen);
+    }
+
+    /// The collections not live go from `Vm::collections`.
+    fn prune_collections(&mut self, mode: Mode) {
+        let live = |p: usize| unsafe {
+            let b = *crate::heap::meta(p);
+            match mode.kind {
+                Kind::Minor | Kind::MinorShade => b != YOUNG,
+                _ => b & COLOR == mode.color,
+            }
+        };
+        self.collections.retain(|&o| live(o as usize));
     }
 
     /// `CLOISON_GC_SLOTS`, after a full collection stopping the world: mark
@@ -3128,6 +3447,14 @@ enum Collection {
 }
 
 impl Heap {
+    /// The evacuation candidates for a marking ([`Mode::cand`]).
+    fn candidates_map(&self) -> Candidates {
+        if self.candidates.is_empty() {
+            return Candidates::default();
+        }
+        Candidates { map: self.candidates.as_ptr() as usize, len: self.candidates.len(), base: self.base() }
+    }
+
     /// The color the next full collection marks with (1, 2, 3, 1, …).
     fn next_color(&mut self) -> u8 {
         self.set_color(self.color % 3 + 1);
@@ -3191,7 +3518,7 @@ impl Heap {
                 let (mode, range) = (m.mode, m.heap);
                 let work = move || {
                     let heap = heap;
-                    let mut cm = CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new() };
+                    let mut cm = CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new(), cand: Candidates::default(), rec: Vec::new() };
                     let mut refs = CardRefs::new(&mut cm);
                     loop {
                         let i = next.fetch_add(RUNS_PER_TAKE, std::sync::atomic::Ordering::Relaxed);

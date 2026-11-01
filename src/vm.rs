@@ -773,6 +773,9 @@ pub struct Vm {
     /// moves cells pins their keys (`gc::Evacuation`). Not roots: those
     /// not live go at each collection.
     pub(crate) collections: Vec<*mut Object>,
+    /// Where the collections made since the last collection start in
+    /// [`Vm::collections`]: a minor collection frees no other.
+    pub(crate) collections_young: usize,
     /// The targets of the `WeakRef`s made or dereferenced in the current
     /// job, kept alive until it ends (the spec's KeepDuringJob).
     pub(crate) kept_alive: Vec<Value>,
@@ -1153,6 +1156,7 @@ impl Vm {
             proxy_codes: [std::ptr::null(); 3],
             weak_tables: Vec::new(),
             collections: Vec::new(),
+            collections_young: 0,
             kept_alive: Vec::new(),
             error: None,
             stack,

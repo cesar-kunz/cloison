@@ -282,6 +282,10 @@ pub struct Heap {
     /// from it for a cycle, they grew MathJax's peak 66%): what it puts
     /// there moves too, up to the budget.
     pub(crate) candidates: Vec<u8>,
+    /// The blocks the last full collection's sweep left in use, with their
+    /// free bytes (those swept so far, if it runs), which evacuation's
+    /// candidates are chosen from.
+    pub(crate) swept_free: Vec<(usize, usize)>,
 }
 
 impl Default for Heap {
@@ -319,6 +323,7 @@ impl Heap {
             color: 1,
             gc,
             candidates: Vec::new(),
+            swept_free: Vec::new(),
             ptr: std::ptr::null_mut(),
             end: std::ptr::null_mut(),
             hole: std::ptr::null_mut(),
@@ -590,6 +595,7 @@ impl Heap {
     /// those at `empty`, giving their memory back to the system.
     pub(crate) fn reset_blocks(&mut self, partly: &[(usize, usize)], empty: &[usize]) {
         self.recycle.clear();
+        self.swept_free.clear();
         self.add_swept(partly, empty);
     }
 
@@ -605,6 +611,7 @@ impl Heap {
         self.swept[1] += partly.iter().map(|&(_, free)| free).sum::<usize>();
         self.swept[2] += partly.iter().filter(|&&(_, free)| free >= RECYCLE).count();
         self.swept[3] += empty.len();
+        self.swept_free.extend_from_slice(partly);
         self.recycle.extend(
             (partly.iter().rev())
                 .filter(|&&(_, free)| free >= RECYCLE)
@@ -842,6 +849,11 @@ impl Heap {
         for &a in blocks {
             self.candidates[(a - self.base) / BLOCK] = 1;
         }
+    }
+
+    /// How many small blocks are in use.
+    pub(crate) fn small_blocks(&self) -> usize {
+        self.blocks.iter().filter(|&&b| b == Block::Small).count()
     }
 
     /// The slice's start (block 0's address).

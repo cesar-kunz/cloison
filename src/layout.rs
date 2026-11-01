@@ -387,6 +387,11 @@ pub const YOUNG: u8 = 0x80;
 /// Metadata bits of an old cell's first granule: the color it was marked
 /// with (never 0).
 pub const COLOR: u8 = 0x03;
+/// Metadata bit of an old cell's first granule: in an evacuation candidate
+/// block during a marking cycle that moves it (`gc::Vm::evacuate`). In the
+/// barrier's mask, so a store of one into an old cell marks the card: the
+/// final pause must find every slot holding it.
+pub const EVAC: u8 = 0x08;
 
 /// Header word of an array of values: `VALUES | capacity << 32`.
 pub const VALUES: u64 = 1;

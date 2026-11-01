@@ -6166,6 +6166,14 @@ impl Vm {
         self.heap.budget = self.heap.gc.budget();
     }
 
+    /// Every full collection due a concurrent cycle, each moving what it
+    /// can of every other small block in use, and checking that no
+    /// reference to a cell moved is left, as `CLOISON_GC_CYCLES`,
+    /// `CLOISON_GC_EVACUATE=all` and `CLOISON_GC_SLOTS` do (for tests).
+    pub fn set_gc_evacuate_cycles(&mut self) {
+        self.heap.gc.set_evacuate_cycles();
+    }
+
     /// The functions' codes loaded and not freed (for tests).
     pub fn code_count(&self) -> usize {
         self.codes.len() + self.condemned.len()

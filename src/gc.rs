@@ -31,7 +31,7 @@
 //! poisoned value on first use; `CLOISON_GC_STRESS` collects at every
 //! safepoint, the same way. `CLOISON_GC_STATS` prints each collection.
 
-use crate::heap::{BYTES, COLOR, END, GRANULE, Heap, UPVALUE, VALUES, WEAK_VALUES, YOUNG, cell_size};
+use crate::heap::{BYTES, COLOR, END, EVAC, GRANULE, Heap, UPVALUE, VALUES, WEAK_VALUES, YOUNG, cell_size};
 use crate::object::{Class, Object};
 use crate::value::Value;
 use crate::vm::Vm;
@@ -245,10 +245,18 @@ pub struct Gc {
     /// marked is reached from the roots' slots (`CLOISON_GC_SLOTS`, see
     /// `Vm::check_root_slots`).
     slots_check: bool,
-    /// What full collections stopping the world move ([`Vm::evacuate`]).
+    /// What full collections move ([`Vm::evacuate`]).
     evacuate: Evacuate,
     /// The stress mode's blocks this time: odd or even ones.
     evacuate_parity: bool,
+    /// The slots into the cycle's evacuation candidates its start pause
+    /// and minor collections traced (the marker's are its own).
+    evac_rec: Vec<usize>,
+    /// Cycles to start without candidates, and how many the next
+    /// fruitless evacuation makes it (see `Vm::evacuate_from`).
+    evac_wait: u32,
+    evac_backoff: u32,
+
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
     /// (`CLOISON_GC_CHECK_BARRIER`, slow).
@@ -300,6 +308,23 @@ impl Gc {
     pub(crate) fn set_evacuate_all(&mut self) {
         self.always_full = true;
         self.evacuate = Evacuate::All;
+    }
+
+    /// An evacuation not worth it (`why`): the next cycles choose no
+    /// candidates, twice as many each time, up to 16.
+    fn fruitless(&mut self, why: &str) {
+        self.evac_backoff = (2 * self.evac_backoff).clamp(1, 16);
+        self.evac_wait = self.evac_backoff;
+        if self.stats {
+            eprintln!("  evacuation skipped: {why}, next {} cycles choose none", self.evac_wait);
+        }
+    }
+
+    /// See `Vm::set_gc_evacuate_cycles`.
+    pub(crate) fn set_evacuate_cycles(&mut self) {
+        self.cycles = true;
+        self.evacuate = Evacuate::All;
+        self.slots_check = true;
     }
 
     #[cold]
@@ -522,9 +547,10 @@ struct Mode {
 }
 
 /// A marking's visitor, recording the slots into evacuation candidates it
-/// traces (see [`Candidates::note`]): only the loops of a full marking
-/// with candidates trace through it, so the others' are as before (a check
-/// at every slot cost Splay 3% of its instructions).
+/// traces (see [`Candidates::note`]): only the loops of a marking with
+/// candidates (a full one stopping the world, or a cycle's pauses, cards
+/// and marker) trace through it, so the others' are as before (a check at
+/// every slot cost Splay 3% of its instructions).
 trait Records: Visit {
     fn cand(&self) -> Candidates;
     fn rec(&mut self) -> &mut Vec<usize>;
@@ -569,6 +595,15 @@ impl Records for Marking<'_> {
     }
     fn rec(&mut self) -> &mut Vec<usize> {
         &mut self.rec
+    }
+}
+
+impl<V: Records> Records for CardRefs<'_, V> {
+    fn cand(&self) -> Candidates {
+        self.m.cand()
+    }
+    fn rec(&mut self) -> &mut Vec<usize> {
+        self.m.rec()
     }
 }
 
@@ -722,8 +757,8 @@ unsafe fn trace_shape(m: &mut impl Visit, mut s: *const crate::object::Shape, ep
     }
 }
 
-/// What a full collection stopping the world moves (`CLOISON_GC_EVACUATE`,
-/// see `Vm::evacuate`).
+/// What a full collection stopping the world, or a cycle's final pause,
+/// moves (`CLOISON_GC_EVACUATE`, see `Vm::evacuate`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum Evacuate {
     /// Nothing (`0`, `off`).
@@ -742,22 +777,119 @@ pub(crate) enum Evacuate {
 /// collection evacuates (and at least [`EVACUATE_MIN`] bytes past).
 const EVACUATE_RATIO: usize = 2;
 const EVACUATE_MIN: usize = 32 << 20;
-/// What a concurrent cycle gives up its turn for a full collection that
-/// evacuates for (`Vm::evacuate_now`).
-const EVACUATE_CYCLE_MIN: usize = 64 << 20;
+/// The percent of the small blocks in use a cycle's start chooses candidates
+/// to give back at least (35). Splay's would give back 23-33% (its cycles
+/// a fifth of a second apart, evacuating at each took 5% off its peak and
+/// added 22% to its time; spaced out, its peak grew 6%, the copies taking
+/// blocks at the final pause, the heap's peak), MathJax's 37-75%, snap's
+/// 33-40% while it grows.
+/// (`CLOISON_GC_EVACUATE_SHARE`: at 10, as a full collection stopping the
+/// world, the TypeScript and echarts apps evacuate too, 11% and 15% off
+/// their peaks, and Splay at each cycle.)
+fn evacuate_cycle_share() -> usize {
+    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var("CLOISON_GC_EVACUATE_SHARE").ok().and_then(|s| s.parse().ok()).unwrap_or(35))
+}
+/// What the final pause's move must give back at least (`Vm::evacuate_from`).
+const EVACUATE_GAIN_MIN: usize = 8 << 20;
 /// A block is a candidate under this many hundredths full.
 const EVACUATE_FULL: usize = 50;
 /// Bytes a collection moves at most (`CLOISON_GC_EVACUATE_MIB`).
 fn evacuate_budget() -> usize {
     static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *B.get_or_init(|| {
-        std::env::var("CLOISON_GC_EVACUATE_MIB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(64) << 20
+        std::env::var("CLOISON_GC_EVACUATE_MIB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(32) << 20
     })
 }
 
 /// A moved cell's first granule's metadata while it is evacuated: its new
 /// address in its second word (`Vm::evacuate`).
 const FORWARDED: u8 = 0x40;
+/// A candidate's cell's first granule's metadata while it is evacuated: it
+/// stays (`Vm::evacuate`).
+const PINNED: u8 = 0x10;
+
+/// `f` of `items` in `threads` runs, each on its own thread but the first
+/// (on this one), in order: on this thread alone if fewer than `min`.
+fn in_parallel<I: Sync, T: Send>(threads: usize, items: &[I], min: usize, f: impl Fn(&[I]) -> T + Sync) -> Vec<T> {
+    if threads < 2 || items.len() < min {
+        return vec![f(items)];
+    }
+    let per = items.len().div_ceil(threads);
+    let f = &f;
+    std::thread::scope(|sc| {
+        let rest: Vec<_> = items.chunks(per).skip(1).map(|c| sc.spawn(move || f(c))).collect();
+        let mut r = vec![f(&items[..per])];
+        r.extend(rest.into_iter().map(|h| h.join().unwrap()));
+        r
+    })
+}
+
+/// The cells marked with `color` in the small block at `start`, and their
+/// sizes, from the metadata alone: a granule that isn't a marked cell's
+/// first is skipped, eight at a time where they are zero, and a cell's
+/// size is up to its `END` (set when it was traced: its header may not be
+/// in cache).
+unsafe fn marked_cells(start: usize, color: u8) -> Vec<(usize, usize)> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let mut cells = Vec::new();
+    let mut p = start;
+    while p < start + crate::heap::BLOCK {
+        // (The bytes `color` in their `YOUNG | COLOR` bits: the lowest's top
+        // bit is the lowest set in `z`.)
+        let w = unsafe { (crate::heap::meta(p) as *const u64).read_unaligned() };
+        let x = (w & ((YOUNG | COLOR) as u64 * ONES)) ^ (color as u64 * ONES);
+        let z = x.wrapping_sub(ONES) & !x & (0x80 * ONES);
+        if z == 0 {
+            p += 8 * GRANULE;
+            continue;
+        }
+        p += (z.trailing_zeros() / 8) as usize * GRANULE;
+        if p >= start + crate::heap::BLOCK {
+            break;
+        }
+        let mut q = p;
+        loop {
+            let e = unsafe { (crate::heap::meta(q) as *const u64).read_unaligned() } & (END as u64 * ONES);
+            if e != 0 {
+                q += (e.trailing_zeros() / 8) as usize * GRANULE;
+                break;
+            }
+            q += 8 * GRANULE;
+        }
+        let n = q + GRANULE - p;
+        debug_assert_eq!(n, unsafe { cell_size(p as *const u8) });
+        cells.push((p, n));
+        p += n;
+    }
+    cells
+}
+
+/// Copy the cell at `p`, of `n` bytes, to `q`, and forward it there
+/// ([`FORWARDED`] in its metadata, `q` in its second word).
+unsafe fn copy_cell(p: usize, n: usize, q: usize) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(p as *const u8, q as *mut u8, n);
+        let first = *crate::heap::meta(p) & (COLOR | END);
+        *crate::heap::meta(q) = first;
+        *crate::heap::meta(q + n - GRANULE) |= END;
+        let w = *(p as *const u64);
+        if w & 1 == 0 {
+            // A flat string's units are in it.
+            let o = q as *mut Object;
+            let old_units = p + crate::layout::slots_offset((*o).class);
+            if (*o).class == Class::String && (*o).elems as usize == old_units {
+                (*o).elems = (q + crate::layout::slots_offset((*o).class)) as *mut Value;
+            }
+        } else if w & 7 == UPVALUE && *((p + 8) as *const usize) == p + 16 {
+            // A closed upvalue's variable is its own.
+            *((q + 8) as *mut usize) = q + 16;
+        }
+        // (Its second word read above: now its new address.)
+        *((p + 8) as *mut usize) = q;
+        *crate::heap::meta(p) |= FORWARDED;
+    }
+}
 
 /// A root as a collection that moves cells needs it (see
 /// `Vm::each_root_slot`): a slot it may update, of a value (any: those
@@ -821,8 +953,9 @@ struct Marking<'a> {
     heap: (usize, usize),
     /// Bytes traced.
     marked: usize,
-    /// The blocks evacuation candidates in a full marking stopping the
-    /// world (see [`Candidates`]), and the slots into them it traced.
+    /// The blocks evacuation candidates (see [`Candidates`]: those of a
+    /// full collection stopping the world, or of the cycle under way), and
+    /// the slots into them it traced.
     cand: Candidates,
     rec: Vec<usize>,
 }
@@ -853,7 +986,7 @@ impl Visit for Marking<'_> {
                         *m = mode.color;
                         self.stack.push(p);
                     } else if b & COLOR != 0 && b & COLOR != mode.color {
-                        *m = (b & END) | mode.color;
+                        *m = (b & (END | EVAC)) | mode.color;
                         self.shade.push(p);
                     }
                 }
@@ -863,14 +996,14 @@ impl Visit for Marking<'_> {
                     }
                     // (A byte store: the mutator never writes an old cell's
                     // metadata while the marker runs.)
-                    *m = (b & END) | mode.color;
+                    *m = (b & (END | EVAC)) | mode.color;
                     self.stack.push(p);
                 }
                 Kind::Full => {
                     if b & COLOR == mode.color {
                         return;
                     }
-                    *m = (b & END) | mode.color;
+                    *m = (b & (END | EVAC)) | mode.color;
                     self.stack.push(p);
                 }
             }
@@ -949,8 +1082,8 @@ impl Visit for CardMarking {
             let (new, shade) = match mode.kind {
                 Kind::Minor if b == YOUNG => (mode.color, false),
                 Kind::MinorShade if b == YOUNG => (mode.color, false),
-                Kind::MinorShade if b & COLOR != 0 && b & COLOR != mode.color => ((b & END) | mode.color, true),
-                Kind::Full if b & COLOR != mode.color => ((b & END) | mode.color, false),
+                Kind::MinorShade if b & COLOR != 0 && b & COLOR != mode.color => ((b & (END | EVAC)) | mode.color, true),
+                Kind::Full if b & COLOR != mode.color => ((b & (END | EVAC)) | mode.color, false),
                 _ => return,
             };
             if m.compare_exchange(b, new, Relaxed, Relaxed).is_ok() {
@@ -1048,6 +1181,13 @@ impl Marking<'_> {
                 let w = *(p as *const u64);
                 let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                 if from == 0 {
+                    // (A candidate's cell traced in a pause may move: a
+                    // young one promoted, which only then gets `EVAC`. Not
+                    // the marker's: the mutator may have stored one marked
+                    // and without it into a cell traced already.)
+                    if R && self.mode.kind != Kind::Old && self.cand.has(p) {
+                        *crate::heap::meta(p) |= EVAC;
+                    }
                     mark_function_code(p, w);
                     if self.mode.shapes {
                         mark_object_shape(self, w, epoch);
@@ -1239,6 +1379,9 @@ unsafe fn trace_shared<const R: bool>(
                     len -= 1;
                     let size = cell_size(p as *const u8);
                     (*(crate::heap::meta(p + size - GRANULE) as *const AtomicU8)).fetch_or(END, Relaxed);
+                    if R && cand.has(p) {
+                        (*(crate::heap::meta(p) as *const AtomicU8)).fetch_or(EVAC, Relaxed);
+                    }
                     bytes += size;
                     n += 1;
                     let w = *(p as *const u64);
@@ -1523,6 +1666,10 @@ struct MarkerState {
     heap: (usize, usize),
     /// The marking collects shapes (see `Mode::shapes`).
     shapes: bool,
+    /// The cycle's evacuation candidates, and the slots into them traced
+    /// (see [`Candidates`]), for the final pause.
+    cand: Candidates,
+    rec: Vec<usize>,
     /// Marking (the mutator handed it work and hasn't paused it).
     run: bool,
     /// Tracing right now (with work of its own, off `work`).
@@ -1621,7 +1768,7 @@ fn marker_loop(sh: &Shared) {
     let mut stack = Vec::new();
     let mut shade = Vec::new();
     loop {
-        let (color, heap, shapes) = {
+        let (color, heap, shapes, cand) = {
             let mut st = sh.state.lock().unwrap();
             loop {
                 if st.quit {
@@ -1658,7 +1805,7 @@ fn marker_loop(sh: &Shared) {
             }
             std::mem::swap(&mut stack, &mut st.work);
             st.busy = true;
-            (st.color, st.heap, st.shapes)
+            (st.color, st.heap, st.shapes, st.cand)
         };
         let mut m = Marking {
             mode: Mode {
@@ -1671,13 +1818,15 @@ fn marker_loop(sh: &Shared) {
             shade: &mut shade,
             heap,
             marked: 0,
-            cand: Candidates::default(),
+            cand,
             rec: Vec::new(),
         };
         unsafe { m.drain(&|| sh.pause.load(Relaxed)) };
         let marked = m.marked;
+        let mut rec = std::mem::take(&mut m.rec);
         let mut st = sh.state.lock().unwrap();
         st.marked += marked;
+        st.rec.append(&mut rec);
         st.work.append(&mut stack);
         st.busy = false;
         if st.work.is_empty() && !sh.pause.load(Relaxed) {
@@ -1759,7 +1908,7 @@ impl Vm {
             || gc.code_full()
             || self.shapes_full()
         {
-            if gc.stw || gc.always_full || self.evacuate_now() { Collection::Full } else { Collection::Start }
+            if gc.stw || gc.always_full { Collection::Full } else { Collection::Start }
         } else {
             Collection::Minor
         };
@@ -1802,6 +1951,19 @@ impl Vm {
         }
         if kind == Collection::Start {
             self.heap.gc.cycle_from = self.heap.allocated();
+            // (The colors of the last cycle's: its sweep is over.)
+            if self.heap.gc.evacuate != Evacuate::Off {
+                if self.heap.gc.evac_wait > 0 {
+                    self.heap.gc.evac_wait -= 1;
+                    self.heap.set_candidates(&[]);
+                } else {
+                    // (What is live: the last cycle's marking, not what the
+                    // sweep left, as allocation has filled blocks since.)
+                    let live = self.heap.gc.live;
+                    self.choose_candidates_for(EVACUATE_MIN, evacuate_cycle_share(), Some(live));
+                    self.heap.mark_evacuated();
+                }
+            }
             self.heap.next_color();
             self.heap.gc.marking = true;
         }
@@ -1848,7 +2010,9 @@ impl Vm {
             shade: &mut shade,
             heap: range,
             marked: 0,
-            cand: if kind == Collection::Full { self.heap.candidates_map() } else { Candidates::default() },
+            // (The cycle's candidates: none outside one, but a full
+            // collection's stopping the world.)
+            cand: if kind == Collection::Minor { Candidates::default() } else { self.heap.candidates_map() },
             rec: Vec::new(),
         };
         unsafe {
@@ -1902,14 +2066,17 @@ impl Vm {
             if kind == Collection::Full && self.heap.gc.slots_check {
                 self.check_root_slots(sp, regs, color);
             }
-            if kind == Collection::Full && self.heap.gc.evacuate != Evacuate::Off {
-                let rec = std::mem::take(&mut m.rec);
+            let mut rec = std::mem::take(&mut m.rec);
+            if full {
+                if kind == Collection::Final {
+                    rec.append(&mut self.heap.gc.evac_rec);
+                    if let Some(mk) = &self.heap.gc.marker {
+                        rec.append(&mut mk.shared.state.lock().unwrap().rec);
+                    }
+                }
                 self.evacuate(sp, regs, color, rec);
-            }
-            // (Only a full collection stopping the world evacuates: a
-            // concurrent cycle gives the candidates back to allocation.)
-            if kind != Collection::Full && !self.heap.candidates.is_empty() && full {
-                self.heap.set_candidates(&[]);
+            } else {
+                self.heap.gc.evac_rec.append(&mut rec);
             }
             times[2] = lap();
             freed = match kind {
@@ -1921,7 +2088,7 @@ impl Vm {
                 Collection::Full => {
                     let f = self.heap.free_unmarked(color, check);
                     if self.heap.gc.evacuate != Evacuate::Off {
-                        self.choose_candidates(color);
+                        self.choose_candidates();
                     }
                     f
                 }
@@ -2054,6 +2221,7 @@ impl Vm {
                 st.color = color;
                 st.heap = range;
                 st.shapes = self.heap.gc.shape_cycle;
+                st.cand = self.heap.candidates_map();
             }
             mk.resume(&mut shade, request);
         } else if self.heap.gc.sweeping
@@ -2732,12 +2900,16 @@ impl Vm {
     }
 
     /// Move cells out of fragmented blocks, in a full collection stopping
-    /// the world, after it has marked and before anything is freed, and
-    /// update every reference to them (stages 3 and 4 of evacuating
-    /// fragmented blocks). What moves are the cells of the blocks the last
-    /// such collection chose (`Vm::choose_candidates`, `Heap::candidates`:
-    /// no allocation took them since), but those pinned; the marking
-    /// recorded the slots into them its cells hold (`Mode::cand`), so the
+    /// the world or a cycle's final pause, after it has marked and before
+    /// anything is freed, and update every reference to them (stages 3 to
+    /// 5 of evacuating fragmented blocks). What moves are the cells of the
+    /// candidates (`Vm::choose_candidates`, `Heap::candidates`: chosen by
+    /// the last full collection stopping the world, or at the cycle's
+    /// start) marked [`EVAC`], but those pinned. The marking recorded the
+    /// slots into them its cells hold (`Marking::cand`): a cycle's, those
+    /// its start pause, its minor collections and the marker traced, cards
+    /// included (a store of one into a cell traced already marks the card,
+    /// [`EVAC`] being in the barrier's mask), and the final pause. So the
     /// update reads those, the roots' and the candidates' own cells, not the
     /// heap. No cell moves while Rust code holds copies of values
     /// (`Vm::unmovable`) or a function's JIT state is borrowed.
@@ -2749,7 +2921,7 @@ impl Vm {
     /// without keeping it (`jit::shape_words`), what the VM's tables key by
     /// address (`Vm::address_keyed_cells`), the keys collections hash by
     /// address (`Vm::collections`), and byte buffers (typed views point
-    /// into them). A moved cell is forwarded in place ([`FORWARDED`] in its
+    /// into them): [`PINNED`] while it runs. A moved cell is forwarded in place ([`FORWARDED`] in its
     /// metadata, its new address in its second word) until every reference
     /// is updated: the roots' slots (`each_root_slot`), the recorded ones,
     /// the candidates' cells' (`trace`), the weak collections and their
@@ -2761,45 +2933,72 @@ impl Vm {
     #[cold]
     #[inline(never)]
     unsafe fn evacuate(&mut self, sp: usize, regs: *mut Value, color: u8, rec: Vec<usize>) {
-        use crate::heap::{BLOCK, BYTES, LARGE};
         if self.heap.candidates.is_empty() {
             return;
         }
         let candidates: Vec<usize> = (self.heap.candidates.iter().enumerate())
             .filter(|&(_, &c)| c != 0)
-            .map(|(b, _)| self.heap.base() + b * BLOCK)
+            .map(|(b, _)| self.heap.base() + b * crate::heap::BLOCK)
             .collect();
-        // (Whatever happens, they are blocks as any other after.)
-        self.heap.set_candidates(&[]);
-        if self.unmovable > 0 {
-            return;
+        if self.unmovable == 0 {
+            unsafe { self.evacuate_from(sp, regs, color, rec, &candidates) };
         }
+        // (Whatever happened, they are blocks as any other now.)
+        self.heap.set_candidates(&[]);
+        self.heap.unmark_evacuated(&candidates);
+    }
+
+    /// [`Vm::evacuate`]'s move, from the blocks at `candidates`: of the
+    /// cells marked [`EVAC`] (all those a full collection stopping the world
+    /// marked there; those a cycle's start found there or its pauses
+    /// promoted, whose every slot a cycle recorded).
+    #[cold]
+    #[inline(never)]
+    unsafe fn evacuate_from(&mut self, sp: usize, regs: *mut Value, color: u8, rec: Vec<usize>, candidates: &[usize]) {
+        use crate::heap::{BLOCK, BYTES, LARGE};
         let t0 = std::time::Instant::now();
         let mode = self.heap.gc.evacuate;
         // The candidates' cells marked.
-        let mut cells_in: Vec<(usize, usize)> = Vec::new();
-        for &start in &candidates {
-            let mut p = start;
-            while p < start + BLOCK {
-                let m = unsafe { *crate::heap::meta(p) };
-                if m & (YOUNG | COLOR) == 0 {
-                    p += GRANULE;
-                    continue;
+        let threads = self.heap.gc.threads;
+        let cells_in: Vec<(usize, usize)> =
+            in_parallel(threads, candidates, 64, |bs| bs.iter().flat_map(|&b| unsafe { marked_cells(b, color) }).collect::<Vec<_>>())
+                .concat();
+        let t_live = t0.elapsed().as_secs_f64() * 1e3;
+        // What moving them all would give back: the blocks they are in,
+        // but their bytes. Little (the candidates' cells died since the
+        // cycle chose them, as CyberChef's do), and the next cycles choose
+        // none, for twice as many each time.
+        if mode != Evacuate::All {
+            let mut blocks = 0;
+            let mut last = usize::MAX;
+            for &(p, _) in &cells_in {
+                if p / BLOCK != last {
+                    last = p / BLOCK;
+                    blocks += 1;
                 }
-                let n = unsafe { cell_size(p as *const u8) };
-                if m & (YOUNG | COLOR) == color {
-                    cells_in.push((p, n));
-                }
-                p += n;
+            }
+            let live: usize = cells_in.iter().map(|c| c.1).sum();
+            if (blocks * BLOCK).saturating_sub(live) < EVACUATE_GAIN_MIN {
+                self.heap.gc.fruitless(&format!("{} KiB live in {blocks} blocks", live >> 10));
+                return;
             }
         }
-        let t_live = t0.elapsed().as_secs_f64() * 1e3;
-        // Pins.
-        let mut pins: std::collections::HashSet<usize> = Default::default();
+        // Pins (those in the candidates): [`PINNED`] in their metadata.
+        let cand = self.heap.candidates_map();
+        let mut pins = 0usize;
+        let mut pin = |p: usize| unsafe {
+            let m = crate::heap::meta(p);
+            if *m & PINNED == 0 {
+                *m |= PINNED;
+                pins += 1;
+            }
+        };
         unsafe {
             self.each_root_slot(sp, regs, &mut |r| {
-                if let Root::Pinned(p) = r {
-                    pins.insert(p);
+                if let Root::Pinned(p) = r
+                    && cand.has(p)
+                {
+                    pin(p);
                 }
             })
         };
@@ -2815,96 +3014,136 @@ impl Vm {
                     _ => {}
                 }
             });
-            let heap = &self.heap;
-            pins.extend(own.into_iter().filter(|&a| heap.cell_containing(a) == Some(a)));
+            for a in own {
+                if cand.has(a) && self.heap.cell_containing(a) == Some(a) {
+                    pin(a);
+                }
+            }
         }
         {
             let heap = &self.heap;
-            let pin_word = |w: u64, pins: &mut std::collections::HashSet<usize>| {
-                if let Some(p) = heap.cell_containing(w as usize) {
-                    pins.insert(p);
+            // (A small cell is in one block. A word to a cell's start, as
+            // most are, is found from its metadata alone.)
+            let mut pin_word = |w: u64| {
+                let w = w as usize;
+                if !cand.has(w) {
+                    return;
+                }
+                if w.is_multiple_of(GRANULE) && unsafe { *crate::heap::meta(w) } & (YOUNG | COLOR) != 0 {
+                    pin(w);
+                } else if let Some(p) = heap.cell_containing(w) {
+                    pin(p);
                 }
             };
             for &a in &self.relied_slots {
-                pin_word(a as u64, &mut pins);
+                pin_word(a as u64);
             }
             for k in self.ctor_protos_keys() {
-                pin_word(k as u64, &mut pins);
+                pin_word(k as u64);
             }
-            if !crate::jit::shape_words(self, &mut |w| pin_word(w, &mut pins)) {
+            if !crate::jit::shape_words(self, &mut pin_word) {
                 return;
             }
-            self.address_keyed_cells(&mut |w| pin_word(w, &mut pins));
+            self.address_keyed_cells(&mut pin_word);
             // The keys collections hash by address.
-            for &o in &self.collections {
-                crate::collections::address_keys(o, &mut |k| {
-                    pins.insert(k);
-                });
+            let cols: Vec<usize> = self.collections.iter().map(|&o| o as usize).collect();
+            for keys in in_parallel(threads, &cols, 16, |cs| {
+                let mut keys = Vec::new();
+                for &o in cs {
+                    crate::collections::address_keys(o as *mut Object, &mut |k| {
+                        if cand.has(k) {
+                            keys.push(k);
+                        }
+                    });
+                }
+                keys
+            }) {
+                for k in keys {
+                    pin_word(k as u64);
+                }
             }
         }
         let t_pins = t0.elapsed().as_secs_f64() * 1e3;
-        // Copy, each cell moved forwarded in place.
-        let (mut at, mut end) = (0usize, 0usize);
-        let (mut moved, mut cells) = (0usize, 0usize);
-        let mut from: Vec<(usize, usize)> = Vec::new();
-        // (Up to the budget: allocation may have filled the candidates.)
+        // Copy, each cell moved forwarded in place: those that may move
+        // (on several threads: their headers are read), up to the budget
+        // (allocation may have filled the candidates), their new
+        // addresses, then the copies (on several threads).
         let budget = if mode == Evacuate::All { usize::MAX } else { evacuate_budget() };
-        for &(p, n) in &cells_in {
-            if n > LARGE || pins.contains(&p) || unsafe { *(p as *const u64) } & 7 == BYTES {
-                continue;
+        let mut skip = [0usize; 4];
+        let mut from: Vec<(usize, usize)> = Vec::with_capacity(cells_in.len());
+        for (f, k) in in_parallel(threads, &cells_in, 4096, |cs| {
+            let (mut f, mut k) = (Vec::with_capacity(cs.len()), [0usize; 4]);
+            for &(p, n) in cs {
+                let m = unsafe { *crate::heap::meta(p) };
+                let why = if n > LARGE {
+                    0
+                } else if m & EVAC == 0 {
+                    1
+                } else if m & PINNED != 0 {
+                    2
+                } else if unsafe { *(p as *const u64) } & 7 == BYTES {
+                    3
+                } else {
+                    f.push((p, n));
+                    continue;
+                };
+                k[why] += n;
             }
-            if moved + n > budget {
-                break;
+            (f, k)
+        }) {
+            from.extend(f);
+            for i in 0..4 {
+                skip[i] += k[i];
             }
+        }
+        let mut moved = 0;
+        let fits = from.iter().take_while(|&&(_, n)| {
+            moved += n;
+            moved <= budget
+        });
+        let fits = fits.count();
+        from.truncate(fits);
+        // (Into blocks the heap has, stressed into fresh ones too.)
+        let mut to: Vec<(usize, usize, usize)> = Vec::with_capacity(from.len());
+        let (mut at, mut end) = (0usize, 0usize);
+        for &(p, n) in &from {
             if at + n > end {
-                at = self.heap.evacuation_block();
+                let Some(b) = self.heap.evacuation_block(true) else { break };
+                at = b;
                 end = at + BLOCK;
             }
-            let q = at;
+            to.push((p, n, at));
             at += n;
-            unsafe {
-                std::ptr::copy_nonoverlapping(p as *const u8, q as *mut u8, n);
-                let first = *crate::heap::meta(p) & (COLOR | END);
-                *crate::heap::meta(q) = first;
-                *crate::heap::meta(q + n - GRANULE) |= END;
-                let w = *(p as *const u64);
-                if w & 1 == 0 {
-                    // A flat string's units are in it.
-                    let o = q as *mut Object;
-                    let old_units = p + crate::layout::slots_offset((*o).class);
-                    if (*o).class == Class::String && (*o).elems as usize == old_units {
-                        (*o).elems = (q + crate::layout::slots_offset((*o).class)) as *mut Value;
-                    }
-                } else if w & 7 == UPVALUE && *((p + 8) as *const usize) == p + 16 {
-                    // A closed upvalue's variable is its own.
-                    *((q + 8) as *mut usize) = q + 16;
-                }
-                // (Its second word read above: now its new address.)
-                *((p + 8) as *mut usize) = q;
-                *crate::heap::meta(p) |= FORWARDED;
-            }
-            from.push((p, n));
-            moved += n;
-            cells += 1;
         }
+        from.truncate(to.len());
+        moved = from.iter().map(|c| c.1).sum();
+        let cells = from.len();
         if from.is_empty() {
             return;
         }
+        self.heap.gc.evac_backoff = 0;
+        in_parallel(threads, &to, 4096, |cs| {
+            for &(p, n, q) in cs {
+                unsafe { copy_cell(p, n, q) };
+            }
+        });
         let t_copy = t0.elapsed().as_secs_f64() * 1e3;
         // Update.
-        /// The heap's cells' range: a word outside it (a frame header's Rust
-        /// address on the VM stack) has no metadata to read.
-        struct Forward(usize, usize);
+        /// The candidates: a word outside them (a frame header's Rust
+        /// address on the VM stack) is no cell moved, and has maybe no
+        /// metadata to read (and those of cells not moved, most, aren't
+        /// read: they miss the cache).
+        struct Forward(Candidates);
         impl Forward {
             /// Where the cell at `p` went, if it moved (`p` in the range).
             #[inline(always)]
             unsafe fn at(p: usize) -> Option<usize> {
                 unsafe { (*crate::heap::meta(p) & FORWARDED != 0).then(|| *((p + 8) as *const usize)) }
             }
-            /// Where the cell at `p` went, if it is in the heap and moved.
+            /// Where the cell at `p` went, if it is a candidate's and moved.
             #[inline(always)]
             fn to(&self, p: usize) -> Option<usize> {
-                if p < self.0 || p >= self.1 || p % GRANULE != 0 {
+                if !self.0.has(p) || p % GRANULE != 0 {
                     return None;
                 }
                 unsafe { Forward::at(p) }
@@ -2952,7 +3191,7 @@ impl Vm {
             }
         }
         let range = self.heap.cells_range();
-        let mut fw = Forward(range.0, range.1);
+        let fw = Forward(cand);
         unsafe {
             (*(self as *mut Vm)).each_root_slot(sp, regs, &mut |r| match r {
                 Root::Value(a) => fw.value(a),
@@ -2961,18 +3200,25 @@ impl Vm {
                 Root::Pinned(_) => {}
             });
             // The slots into the candidates marking recorded, and the
-            // candidates' own cells (moved, or left: pinned).
-            for &a in &rec {
-                if a & 1 != 0 {
-                    fw.payload((a & !1) as *mut usize);
-                } else {
-                    fw.value(a as *mut Value);
+            // candidates' own cells (moved, or left: pinned), on several
+            // threads. (A slot recorded twice is written twice, the same.)
+            let fw = &fw;
+            in_parallel(threads, &rec, 4096, |rs| {
+                for &a in rs {
+                    if a & 1 != 0 {
+                        fw.payload((a & !1) as *mut usize);
+                    } else {
+                        fw.value(a as *mut Value);
+                    }
                 }
-            }
-            for &(p, _) in &cells_in {
-                let p = Forward::at(p).unwrap_or(p);
-                trace(&mut fw, p, 0, usize::MAX);
-            }
+            });
+            in_parallel(threads, &cells_in, 4096, |cs| {
+                let mut fw = Forward(fw.0);
+                for &(p, _) in cs {
+                    let p = Forward::at(p).unwrap_or(p);
+                    trace(&mut fw, p, 0, usize::MAX);
+                }
+            });
             for c in self.collections.iter_mut() {
                 fw.object(c);
             }
@@ -3011,6 +3257,9 @@ impl Vm {
             }
         }
         let t_fix = t0.elapsed().as_secs_f64() * 1e3;
+        if self.heap.gc.slots_check {
+            unsafe { self.check_forwarded(sp, regs, color, range) };
+        }
         // Caches of addresses.
         self.forget_lookups();
         self.far_keys.invalidate();
@@ -3028,35 +3277,94 @@ impl Vm {
         EVACUATED.fetch_add(moved as u64, std::sync::atomic::Ordering::Relaxed);
         if self.heap.gc.stats {
             eprintln!(
-                "evacuated {cells} cells ({} KiB) from {} blocks, {} slots recorded, {} pinned, in {:.1} ms (cells {t_live:.1}, pins {:.1}, copy {:.1}, update {:.1})",
+                "evacuated {cells} cells ({} KiB) from {} blocks, {} slots recorded, {} pinned, in {:.1} ms (cells {t_live:.1}, pins {:.1}, copy {:.1}, update {:.1}); left KiB: large {}, no EVAC {}, pinned {}, bytes {}",
                 moved >> 10,
                 candidates.len(),
                 rec.len(),
-                pins.len(),
+                pins,
                 t0.elapsed().as_secs_f64() * 1e3,
                 t_pins - t_live,
                 t_copy - t_pins,
-                t_fix - t_copy
+                t_fix - t_copy,
+                skip[0] >> 10,
+                skip[1] >> 10,
+                skip[2] >> 10,
+                skip[3] >> 10
             );
         }
     }
 
+    /// `CLOISON_GC_SLOTS`, once an evacuation has updated what it found:
+    /// panic on a slot of a root or of a live cell that still refers to a
+    /// cell moved (a slot the cycle didn't record: a store without a
+    /// barrier, say).
+    #[cold]
+    unsafe fn check_forwarded(&mut self, sp: usize, regs: *mut Value, color: u8, range: (usize, usize)) {
+        struct Check(usize, usize, usize);
+        impl Check {
+            fn moved(&self, q: usize) -> bool {
+                q >= self.0 && q < self.1 && q.is_multiple_of(GRANULE) && unsafe { *crate::heap::meta(q) } & FORWARDED != 0
+            }
+        }
+        impl Visit for Check {
+            unsafe fn cell(&mut self, _: usize) {}
+            unsafe fn slot(&mut self, a: *mut Value) {
+                let v = unsafe { *a };
+                if v.is_cell() && self.moved(v.to_bits() as usize) {
+                    panic!("slot {a:?} of {:#x} still refers to {:#x}, moved", self.2, v.to_bits());
+                }
+            }
+            unsafe fn payload_slot(&mut self, a: *mut usize) {
+                let q = unsafe { *a };
+                if q != 0 && self.moved(q - 8) {
+                    panic!("payload slot {a:?} of {:#x} still refers to {:#x}, moved", self.2, q - 8);
+                }
+            }
+        }
+        let mut c = Check(range.0, range.1, 0);
+        unsafe {
+            (*(self as *mut Vm)).each_root_slot(sp, regs, &mut |r| match r {
+                Root::Value(a) => c.slot(a),
+                Root::Object(a) => c.slot(a.cast()),
+                Root::Payload(a) => c.payload_slot(a),
+                Root::Pinned(_) => {}
+            });
+            for (start, end) in self.heap.block_ranges() {
+                let mut p = start;
+                while p < end {
+                    let m = *crate::heap::meta(p);
+                    if m & (YOUNG | COLOR) == 0 {
+                        p += GRANULE;
+                        continue;
+                    }
+                    let n = cell_size(p as *const u8);
+                    if m & (YOUNG | COLOR) == color && m & FORWARDED == 0 {
+                        c.2 = p;
+                        trace(&mut c, p, 0, usize::MAX);
+                    }
+                    p += n;
+                }
+            }
+        }
+    }
+
     /// After a full collection stopping the world has swept (every cell
-    /// left is live), the blocks the next one evacuates (`Heap::candidates`):
+    /// left is live), or at a cycle's start (the last one's sweep over),
+    /// the blocks the next final marking evacuates (`Heap::candidates`):
     /// when the small blocks in use are over
     /// [`EVACUATE_RATIO`] times the bytes live in them, the sparsest under
     /// [`EVACUATE_FULL`]%, up to a budget of bytes, if they would give back
     /// at least a tenth of the blocks in use (and [`EVACUATE_MIN`]);
     /// stressed (`Evacuate::All`), every other block, alternately. Live
-    /// bytes by block from the metadata alone (a cell's color at its first
-    /// granule, `END` at its last).
-    fn choose_candidates(&mut self, color: u8) {
-        self.choose_candidates_for(color, EVACUATE_MIN, 10);
+    /// bytes by block from what the sweep left (`Heap::swept_free`).
+    fn choose_candidates(&mut self) {
+        self.choose_candidates_for(EVACUATE_MIN, 10, None);
     }
 
-    /// [`Vm::choose_candidates`], giving back at least `min` bytes and a
-    /// `share`th of the blocks in use.
-    fn choose_candidates_for(&mut self, _color: u8, min: usize, share: usize) {
+    /// [`Vm::choose_candidates`], giving back at least `min` bytes and
+    /// `share` percent of the blocks in use; `live`, the bytes live, if not what
+    /// the sweep left in the small blocks.
+    fn choose_candidates_for(&mut self, min: usize, share: usize, live_bytes: Option<usize>) {
         use crate::heap::BLOCK;
         // (Live bytes by block: what the sweep didn't free.)
         let mut live: Vec<(usize, usize)> = self.heap.swept_free.iter().map(|&(b, free)| (BLOCK - free.min(BLOCK), b)).collect();
@@ -3068,7 +3376,7 @@ impl Vm {
             // (Blocks the sweep found full aren't listed: the room's those
             // listed, against the small blocks in use.)
             let in_use = self.heap.small_blocks() * BLOCK;
-            let total: usize = in_use - live.iter().map(|l| BLOCK - l.0).sum::<usize>();
+            let total: usize = live_bytes.unwrap_or_else(|| in_use - live.iter().map(|l| BLOCK - l.0).sum::<usize>());
             if in_use < EVACUATE_RATIO * total {
                 self.heap.set_candidates(&[]);
                 return;
@@ -3083,36 +3391,13 @@ impl Vm {
                 gain += BLOCK - n;
                 chosen.push(b);
             }
-            if gain < min.max(in_use / share) {
+            if gain < min.max(in_use * share / 100) {
                 self.heap.set_candidates(&[]);
                 return;
             }
             chosen
         };
         self.heap.set_candidates(&chosen);
-    }
-
-    /// Whether the full collection due, a concurrent cycle otherwise, stops
-    /// the world to evacuate instead (as V8's memory reducer starts a
-    /// compacting one): the last sweep left at least [`EVACUATE_CYCLE_MIN`]
-    /// free in blocks it left in use (`Heap::swept_free`), the heap is over [`EVACUATE_RATIO`]
-    /// times what the last cycle found live, and the candidates the
-    /// metadata gives (`choose_candidates`, the sweep finished first, as the
-    /// cycle's start would) would give back at least that much and a sixth
-    /// of the blocks in use. Rare: its pause is a full marking's and the
-    /// move's.
-    fn evacuate_now(&mut self) -> bool {
-        let gc = &self.heap.gc;
-        let free: usize = self.heap.swept_free.iter().map(|&(_, f)| f).sum();
-        if gc.evacuate != Evacuate::Fragmented
-            || free < EVACUATE_CYCLE_MIN
-            || self.heap.allocated() < EVACUATE_RATIO * gc.live + EVACUATE_CYCLE_MIN
-        {
-            return false;
-        }
-        let color = self.heap.color;
-        self.choose_candidates_for(color, EVACUATE_CYCLE_MIN, 6);
-        !self.heap.candidates.is_empty()
     }
 
     /// The collections not live go from `Vm::collections`: a minor
@@ -3464,6 +3749,53 @@ impl Heap {
         Candidates { map: self.candidates.as_ptr() as usize, len: self.candidates.len(), base: self.base() }
     }
 
+    /// At a cycle's start: [`EVAC`] on the old cells of the evacuation
+    /// candidates, the cells the final pause may move (with the young ones
+    /// the cycle's pauses promote there, see `Marking::drain_to_in`).
+    fn mark_evacuated(&mut self) {
+        self.each_candidate(|b| if b & COLOR != 0 && b & YOUNG == 0 { b | EVAC } else { b });
+    }
+
+    /// Once the final pause has moved what it could: no cell keeps [`EVAC`]
+    /// (nor [`PINNED`]).
+    fn unmark_evacuated(&mut self, blocks: &[usize]) {
+        for &a in blocks {
+            Self::each_meta(a, |b| b & !(EVAC | PINNED));
+        }
+    }
+
+    /// `f` of each first granule's metadata byte of the candidates'.
+    fn each_candidate(&mut self, f: impl Fn(u8) -> u8 + Copy) {
+        let base = self.base();
+        for (b, &c) in self.candidates.iter().enumerate() {
+            if c != 0 {
+                Self::each_meta(base + b * crate::heap::BLOCK, f);
+            }
+        }
+    }
+
+    /// Each nonzero metadata byte of the block at `a` replaced by `f` of it,
+    /// eight at a time where they are zero.
+    fn each_meta(a: usize, f: impl Fn(u8) -> u8) {
+        let (lo, hi) = (crate::heap::meta(a) as usize, crate::heap::meta(a + crate::heap::BLOCK) as usize);
+        let mut m = lo;
+        unsafe {
+            while m < hi {
+                if (m as *const u64).read_unaligned() == 0 {
+                    m += 8;
+                    continue;
+                }
+                for k in m..m + 8 {
+                    let b = *(k as *const u8);
+                    if b != 0 {
+                        *(k as *mut u8) = f(b);
+                    }
+                }
+                m += 8;
+            }
+        }
+    }
+
     /// The color the next full collection marks with (1, 2, 3, 1, …).
     fn next_color(&mut self) -> u8 {
         self.set_color(self.color % 3 + 1);
@@ -3513,10 +3845,17 @@ impl Heap {
                 c += 1;
             }
             let threads = self.gc.threads;
+            // (The slots into evacuation candidates recorded, through
+            // `Rec`, only while a cycle has some.)
+            let cand = m.cand;
             if threads < 2 || cards < PARALLEL_CARDS {
                 let mut refs = CardRefs::new(m);
                 for &(lo, hi) in &runs {
-                    self.scan_card(lo, hi, &mut refs);
+                    if cand.map != 0 {
+                        self.scan_card(lo, hi, &mut Rec(&mut refs));
+                    } else {
+                        self.scan_card(lo, hi, &mut refs);
+                    }
                 }
                 refs.flush();
             } else {
@@ -3527,7 +3866,7 @@ impl Heap {
                 let (mode, range) = (m.mode, m.heap);
                 let work = move || {
                     let heap = heap;
-                    let mut cm = CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new(), cand: Candidates::default(), rec: Vec::new() };
+                    let mut cm = CardMarking { mode, heap: range, stack: Vec::new(), shade: Vec::new(), cand, rec: Vec::new() };
                     let mut refs = CardRefs::new(&mut cm);
                     loop {
                         let i = next.fetch_add(RUNS_PER_TAKE, std::sync::atomic::Ordering::Relaxed);
@@ -3535,17 +3874,22 @@ impl Heap {
                             break;
                         }
                         for &(lo, hi) in &runs[i..(i + RUNS_PER_TAKE).min(runs.len())] {
-                            (*heap.0).scan_card(lo, hi, &mut refs);
+                            if cand.map != 0 {
+                                (*heap.0).scan_card(lo, hi, &mut Rec(&mut refs));
+                            } else {
+                                (*heap.0).scan_card(lo, hi, &mut refs);
+                            }
                         }
                     }
                     refs.flush();
-                    (cm.stack, cm.shade)
+                    (cm.stack, cm.shade, cm.rec)
                 };
                 std::thread::scope(|sc| {
                     let helpers: Vec<_> = (1..threads).map(|_| sc.spawn(work)).collect();
-                    let mut take = |(stack, shade): (Vec<usize>, Vec<usize>)| {
+                    let mut take = |(stack, shade, rec): (Vec<usize>, Vec<usize>, Vec<usize>)| {
                         m.stack.extend(stack);
                         m.shade.extend(shade);
+                        m.rec.extend(rec);
                     };
                     take(work());
                     for h in helpers {

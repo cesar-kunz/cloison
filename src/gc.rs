@@ -256,6 +256,11 @@ pub struct Gc {
     /// fruitless evacuation makes it (see `Vm::evacuate_from`).
     evac_wait: u32,
     evac_backoff: u32,
+    /// When the last cycle started, when the last evacuation ended and how
+    /// long it took (see `Policy::interval`, `Policy::spacing`).
+    cycle_start: Option<std::time::Instant>,
+    evac_end: Option<std::time::Instant>,
+    evac_took: std::time::Duration,
 
     /// After each minor collection's marking, look for an old cell that
     /// refers to an unmarked young one, a missed barrier
@@ -764,7 +769,7 @@ pub(crate) enum Evacuate {
     /// Nothing (`0`, `off`).
     Off,
     /// The cells of the sparsest blocks, up to a budget, when the small
-    /// blocks hold more than [`EVACUATE_RATIO`] times what is live in them
+    /// blocks hold more than `Policy::ratio` times what is live in them
     /// (the default).
     #[default]
     Fragmented,
@@ -773,32 +778,64 @@ pub(crate) enum Evacuate {
     All,
 }
 
-/// Small blocks in use past this many times the bytes live in them, a
-/// collection evacuates (and at least [`EVACUATE_MIN`] bytes past).
-const EVACUATE_RATIO: usize = 2;
-const EVACUATE_MIN: usize = 32 << 20;
-/// The percent of the small blocks in use a cycle's start chooses candidates
-/// to give back at least (35). Splay's would give back 23-33% (its cycles
-/// a fifth of a second apart, evacuating at each took 5% off its peak and
-/// added 22% to its time; spaced out, its peak grew 6%, the copies taking
-/// blocks at the final pause, the heap's peak), MathJax's 37-75%, snap's
-/// 33-40% while it grows.
-/// (`CLOISON_GC_EVACUATE_SHARE`: at 10, as a full collection stopping the
-/// world, the TypeScript and echarts apps evacuate too, 11% and 15% off
-/// their peaks, and Splay at each cycle.)
-fn evacuate_cycle_share() -> usize {
-    static S: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *S.get_or_init(|| std::env::var("CLOISON_GC_EVACUATE_SHARE").ok().and_then(|s| s.parse().ok()).unwrap_or(35))
+/// When collections evacuate, and how much (`Vm::choose_candidates_for`,
+/// `Vm::evacuate_from`), each from its environment variable, for trying
+/// policies out.
+pub(crate) struct Policy {
+    /// Small blocks in use past this many times the bytes live in them
+    /// (`CLOISON_GC_EVACUATE_RATIO`, 2).
+    pub ratio: usize,
+    /// The candidates give back at least these bytes
+    /// (`CLOISON_GC_EVACUATE_MIN_MIB`, 32)...
+    pub min: usize,
+    /// ...and this percent of the small blocks in use, after a full
+    /// collection stopping the world (`CLOISON_GC_EVACUATE_FULL_SHARE`, 10)
+    /// or at a cycle's start (`CLOISON_GC_EVACUATE_SHARE`, 10). (At 35, as
+    /// Splay's would give back 23-33%, Splay evacuates no more, nor the
+    /// TypeScript and echarts apps, which then lose 11% and 15% off their
+    /// peaks: see `interval`.)
+    pub full_share: usize,
+    pub share: usize,
+    /// A block is a candidate under this percent full
+    /// (`CLOISON_GC_EVACUATE_FULL`, 50).
+    pub full: usize,
+    /// Bytes a collection moves at most (`CLOISON_GC_EVACUATE_MIB`, 32).
+    pub budget: usize,
+    /// What the final pause's move must give back at least, or the next
+    /// cycles choose none (`CLOISON_GC_EVACUATE_GAIN_MIB`, 8).
+    pub gain: usize,
+    /// A cycle chooses candidates only this long after the last cycle
+    /// started (`CLOISON_GC_EVACUATE_INTERVAL_MS`, 500; 0: always), as V8's
+    /// memory reducer compacts when allocation slows. Splay's cycles come a
+    /// fifth of a second apart: evacuating at each took 5% off its peak and
+    /// added 22% to its time (spaced out by their cost, `spacing`, its peak
+    /// grew 6%: the copies take blocks at the final pause, the heap's peak).
+    /// The web apps' come seconds apart.
+    pub interval: std::time::Duration,
+    /// ...and this many times as long after the last evacuation as it took
+    /// (`CLOISON_GC_EVACUATE_SPACING`, 0: always).
+    pub spacing: u32,
+    /// Copies may take fresh blocks, not only those the heap has
+    /// (`CLOISON_GC_EVACUATE_FRESH`, 1).
+    pub fresh: bool,
 }
-/// What the final pause's move must give back at least (`Vm::evacuate_from`).
-const EVACUATE_GAIN_MIN: usize = 8 << 20;
-/// A block is a candidate under this many hundredths full.
-const EVACUATE_FULL: usize = 50;
-/// Bytes a collection moves at most (`CLOISON_GC_EVACUATE_MIB`).
-fn evacuate_budget() -> usize {
-    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *B.get_or_init(|| {
-        std::env::var("CLOISON_GC_EVACUATE_MIB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(32) << 20
+
+pub(crate) fn policy() -> &'static Policy {
+    static P: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
+        Policy {
+            ratio: n("CLOISON_GC_EVACUATE_RATIO", 2),
+            min: n("CLOISON_GC_EVACUATE_MIN_MIB", 32) << 20,
+            full_share: n("CLOISON_GC_EVACUATE_FULL_SHARE", 10),
+            share: n("CLOISON_GC_EVACUATE_SHARE", 10),
+            full: n("CLOISON_GC_EVACUATE_FULL", 50),
+            budget: n("CLOISON_GC_EVACUATE_MIB", 32) << 20,
+            gain: n("CLOISON_GC_EVACUATE_GAIN_MIB", 8) << 20,
+            interval: std::time::Duration::from_millis(n("CLOISON_GC_EVACUATE_INTERVAL_MS", 500) as u64),
+            spacing: n("CLOISON_GC_EVACUATE_SPACING", 0) as u32,
+            fresh: n("CLOISON_GC_EVACUATE_FRESH", 1) != 0,
+        }
     })
 }
 
@@ -1968,14 +2005,20 @@ impl Vm {
             self.heap.gc.cycle_from = self.heap.allocated();
             // (The colors of the last cycle's: its sweep is over.)
             if self.heap.gc.evacuate != Evacuate::Off {
-                if self.heap.gc.evac_wait > 0 {
-                    self.heap.gc.evac_wait -= 1;
+                let gc = &self.heap.gc;
+                let p = policy();
+                let early = gc.evacuate != Evacuate::All
+                    && (gc.cycle_start.is_some_and(|t| t.elapsed() < p.interval)
+                        || gc.evac_end.is_some_and(|t| t.elapsed() < p.spacing * gc.evac_took));
+                self.heap.gc.cycle_start = Some(std::time::Instant::now());
+                if self.heap.gc.evac_wait > 0 || early {
+                    self.heap.gc.evac_wait = self.heap.gc.evac_wait.saturating_sub(1);
                     self.heap.set_candidates(&[]);
                 } else {
                     // (What is live: the last cycle's marking, not what the
                     // sweep left, as allocation has filled blocks since.)
                     let live = self.heap.gc.live;
-                    self.choose_candidates_for(EVACUATE_MIN, evacuate_cycle_share(), Some(live));
+                    self.choose_candidates_for(policy().share, Some(live));
                     self.heap.mark_evacuated();
                 }
             }
@@ -2993,7 +3036,7 @@ impl Vm {
                 }
             }
             let live: usize = cells_in.iter().map(|c| c.1).sum();
-            if (blocks * BLOCK).saturating_sub(live) < EVACUATE_GAIN_MIN {
+            if (blocks * BLOCK).saturating_sub(live) < policy().gain {
                 self.heap.gc.fruitless(&format!("{} KiB live in {blocks} blocks", live >> 10));
                 return;
             }
@@ -3083,7 +3126,7 @@ impl Vm {
         // (on several threads: their headers are read), up to the budget
         // (allocation may have filled the candidates), their new
         // addresses, then the copies (on several threads).
-        let budget = if mode == Evacuate::All { usize::MAX } else { evacuate_budget() };
+        let budget = if mode == Evacuate::All { usize::MAX } else { policy().budget };
         let mut skip = [0usize; 4];
         let mut from: Vec<(usize, usize)> = Vec::with_capacity(cells_in.len());
         for (f, k) in in_parallel(threads, &cells_in, 4096, |cs| {
@@ -3123,7 +3166,7 @@ impl Vm {
         let (mut at, mut end) = (0usize, 0usize);
         for &(p, n) in &from {
             if at + n > end {
-                let Some(b) = self.heap.evacuation_block(true) else { break };
+                let Some(b) = self.heap.evacuation_block(policy().fresh || mode == Evacuate::All) else { break };
                 at = b;
                 end = at + BLOCK;
             }
@@ -3298,6 +3341,8 @@ impl Vm {
             }
         }
         EVACUATED.fetch_add(moved as u64, std::sync::atomic::Ordering::Relaxed);
+        self.heap.gc.evac_took = t0.elapsed();
+        self.heap.gc.evac_end = Some(std::time::Instant::now());
         if self.heap.gc.stats {
             eprintln!(
                 "evacuated {cells} cells ({} KiB) from {} blocks, {} slots recorded, {} pinned, in {:.1} ms (cells {t_live:.1}, pins {:.1}, copy {:.1}, update {:.1}); left KiB: large {}, no EVAC {}, pinned {}, bytes {}",
@@ -3381,13 +3426,13 @@ impl Vm {
     /// stressed (`Evacuate::All`), every other block, alternately. Live
     /// bytes by block from what the sweep left (`Heap::swept_free`).
     fn choose_candidates(&mut self) {
-        self.choose_candidates_for(EVACUATE_MIN, 10, None);
+        self.choose_candidates_for(policy().full_share, None);
     }
 
-    /// [`Vm::choose_candidates`], giving back at least `min` bytes and
-    /// `share` percent of the blocks in use; `live`, the bytes live, if not what
-    /// the sweep left in the small blocks.
-    fn choose_candidates_for(&mut self, min: usize, share: usize, live_bytes: Option<usize>) {
+    /// [`Vm::choose_candidates`], giving back at least `Policy::min` bytes
+    /// and `share` percent of the blocks in use; `live_bytes`, the bytes
+    /// live, if not what the sweep left in the small blocks.
+    fn choose_candidates_for(&mut self, share: usize, live_bytes: Option<usize>) {
         use crate::heap::BLOCK;
         // (Live bytes by block: what the sweep didn't free.)
         let mut live: Vec<(usize, usize)> = self.heap.swept_free.iter().map(|&(b, free)| (BLOCK - free.min(BLOCK), b)).collect();
@@ -3400,13 +3445,13 @@ impl Vm {
             // listed, against the small blocks in use.)
             let in_use = self.heap.small_blocks() * BLOCK;
             let total: usize = live_bytes.unwrap_or_else(|| in_use - live.iter().map(|l| BLOCK - l.0).sum::<usize>());
-            if in_use < EVACUATE_RATIO * total {
+            if in_use < policy().ratio * total {
                 self.heap.set_candidates(&[]);
                 return;
             }
             live.sort_unstable();
-            let (mut budget, mut gain, mut chosen) = (evacuate_budget(), 0, Vec::new());
-            for &(n, b) in live.iter().filter(|&&(n, _)| n > 0 && n * 100 < BLOCK * EVACUATE_FULL) {
+            let (mut budget, mut gain, mut chosen) = (policy().budget, 0, Vec::new());
+            for &(n, b) in live.iter().filter(|&&(n, _)| n > 0 && n * 100 < BLOCK * policy().full) {
                 if n > budget {
                     break;
                 }
@@ -3414,7 +3459,7 @@ impl Vm {
                 gain += BLOCK - n;
                 chosen.push(b);
             }
-            if gain < min.max(in_use * share / 100) {
+            if gain < policy().min.max(in_use * share / 100) {
                 self.heap.set_candidates(&[]);
                 return;
             }

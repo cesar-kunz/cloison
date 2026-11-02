@@ -11639,14 +11639,14 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             break;
         }
     }
-    split_temps(&mut cx.out, temps_base, temps);
-    if cx.state.tier == Tier::Warm {
-        return cx.out;
-    }
     for k in 0..cx.out.frames.len() {
         cx.pc_live(cx.out.frames[k].code);
     }
     let pc_live = unsafe { &(*cx.state.vm).jit_caches.pc_live };
+    split_temps(&mut cx.out, temps_base, temps, pc_live);
+    if cx.state.tier == Tier::Warm {
+        return cx.out;
+    }
     cx.out.exit_live = interp_live(&cx.out, pc_live);
     cx.out
 }
@@ -11660,8 +11660,16 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
 /// and a double in turn, joined to `Any` and stayed boxed, each partial sum
 /// of Navier-Stokes's `lin_solve` boxed and unboxed again. An exit within
 /// one's reads restores the original register from it for the
-/// interpreter (`Restore`). Returns how many were found.
-fn split_temps(out: &mut Lowered, base: usize, limit: usize) -> usize {
+/// interpreter (`Restore`); not one the interpreter reads after its last
+/// read here (`pc_live`: a read the lowering dropped, such as an inlined
+/// `f.call`'s of `f`), which an exit past that read would leave unwritten.
+/// Returns how many were found.
+fn split_temps(
+    out: &mut Lowered,
+    base: usize,
+    limit: usize,
+    pc_live: &HashMap<*const crate::vm::Code, Rc<PcLive>>,
+) -> usize {
     let n = out.insns.len();
     let mut target = vec![false; n + 1];
     for i in out.insns.iter().filter(|i| i.jumps()) {
@@ -11671,6 +11679,24 @@ fn split_temps(out: &mut Lowered, base: usize, limit: usize) -> usize {
         .map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent))
         .collect();
     let captured: Vec<Vec<bool>> = out.frames.iter().map(|f| captured_regs(f.code)).collect();
+    // Per frame, its bytecode's offsets in order and the registers live
+    // into each.
+    let bytecode: Vec<(Vec<usize>, Option<Rc<PcLive>>)> = (out.frames.iter())
+        .map(|f| {
+            let l = pc_live.get(&f.code).cloned();
+            let mut pcs: Vec<usize> = l.iter().flat_map(|l| l.keys().copied()).collect();
+            pcs.sort_unstable();
+            (pcs, l)
+        })
+        .collect();
+    // Whether the interpreter reads frame `g`'s register `r` (renamed)
+    // after the instruction at `pc` before writing it.
+    let read_after = |g: usize, pc: usize, r: usize| {
+        let (pcs, l) = &bytecode[g];
+        let Some(l) = l else { return true };
+        let next = pcs[pcs.partition_point(|&p| p <= pc)..].first();
+        next.is_some_and(|p| l.get(p).is_some_and(|set| rs_has(set, r - frame_regs[g].0)))
+    };
     let reach = reachable(&out.insns, 0);
     let live = reg_live_in_mats(&out.insns, &reach, out.nregs, &frame_regs, Some(&out.mats), true);
     // Registers some restore or alias involves already.
@@ -11736,6 +11762,9 @@ fn split_temps(out: &mut Lowered, base: usize, limit: usize) -> usize {
             }
         }
         let Some(last) = end else { continue };
+        if read_after(g, out.insns[last].pc, r) {
+            continue;
+        }
         if found < limit {
             let w = (base + found) as u8;
             out.insns[s].reg = w;

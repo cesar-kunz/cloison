@@ -10729,3 +10729,62 @@ out.join("");
         assert_eq!(r.as_deref(), Ok("1111111111"), "tier at {budget}");
     }
 }
+
+/// A constant load folded into the lowered code keeps its cell alive: the
+/// versions compiled from that lowering read it (`Ty::of` in
+/// `select_cached`), whether or not an earlier one embedded it. `f3` reads
+/// the global `a2`, which `f0` sets to a new array at each call; the
+/// lowering folded an array a collection had freed since, and compiling
+/// `f3` again at tier 2 read its header as a shape and crashed (issue #26).
+/// The issue's program, compiled at once or not: what V8, JavaScriptCore
+/// and SpiderMonkey give.
+#[test]
+fn folded_constants_outlive_the_versions_embedding_them() {
+    let src = r#"
+function __mix(h, v) {
+}
+var __fuel = 1e9;
+var __itb = { [Symbol.iterator]() { let k = 0; return { next() { return { done: k++ >= 8 }; }, }; } };
+var g0 = -3;
+var s1 = "abc";
+var a1 = [];
+var t1 = [];
+var t2 = [];
+
+o0 = Object.create(null);
+function f0(d, p0) {
+  a2 = [0];
+  for (const v17 of __itb) {
+  }
+}
+function f3(d, p0) {
+  for (let k36 = 0; k36 < 6; k36++) {
+    s1 = (s1 + { x: a1[94 & 15] / t2[k36 & 15], y: (0) }.y).slice(0);
+    g0 = Math.max(f0(0), (0));
+  }
+  t1[Math.min(o0.z, p0 << t1[p0]) & 15] = 0;
+  {
+    a2[0];
+    for (let k47 = 0; k47 < 4 && __fuel-- > 0; k47++) {
+    }
+    g0 = (0) | 0;
+  }
+}
+
+for (var i = 0; i < 1000; i++) {
+  var x = i * 7 + 3 | 0;
+  try { f3(0); __acc = __mix(0); if (0) __samples.push(0); }
+  catch (e) { __acc = __mix(0); if (0) __samples.push(0); }
+  try { f3(1, i); __acc = __mix(0); if (0) __samples.push(0); }
+  catch (e) { __acc = __mix(0); if (0) __samples.push(0); }
+}
+g0 + " " + a2.length;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 1, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("0 1"), "tier at {budget}");
+    }
+}

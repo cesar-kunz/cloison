@@ -291,6 +291,12 @@ impl Gc {
         }
     }
 
+    /// See `Vm::set_gc_evacuate_all`.
+    pub(crate) fn set_evacuate_all(&mut self) {
+        self.always_full = true;
+        self.evacuate = true;
+    }
+
     #[cold]
     #[inline(never)]
     fn report_room(&self) {

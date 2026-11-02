@@ -832,12 +832,26 @@ fn in_parallel<I: Sync, T: Send>(threads: usize, items: &[I], min: usize, f: imp
 /// in cache).
 unsafe fn marked_cells(start: usize, color: u8) -> Vec<(usize, usize)> {
     const ONES: u64 = 0x0101_0101_0101_0101;
+    let end = start + crate::heap::BLOCK;
+    // The metadata of the eight granules from `p`, those past the block's
+    // zero (the next block's may not be mapped).
+    let word = |p: usize| unsafe {
+        if p + 8 * GRANULE <= end {
+            (crate::heap::meta(p) as *const u64).read_unaligned()
+        } else {
+            let mut w = 0;
+            for k in 0..(end - p) / GRANULE {
+                w |= (*crate::heap::meta(p + k * GRANULE) as u64) << (8 * k);
+            }
+            w
+        }
+    };
     let mut cells = Vec::new();
     let mut p = start;
-    while p < start + crate::heap::BLOCK {
+    while p < end {
         // (The bytes `color` in their `YOUNG | COLOR` bits: the lowest's top
-        // bit is the lowest set in `z`.)
-        let w = unsafe { (crate::heap::meta(p) as *const u64).read_unaligned() };
+        // bit is the lowest set in `z`. A zero byte isn't: colors aren't 0.)
+        let w = word(p);
         let x = (w & ((YOUNG | COLOR) as u64 * ONES)) ^ (color as u64 * ONES);
         let z = x.wrapping_sub(ONES) & !x & (0x80 * ONES);
         if z == 0 {
@@ -848,9 +862,10 @@ unsafe fn marked_cells(start: usize, color: u8) -> Vec<(usize, usize)> {
         if p >= start + crate::heap::BLOCK {
             break;
         }
+        // (A cell ends in its block.)
         let mut q = p;
         loop {
-            let e = unsafe { (crate::heap::meta(q) as *const u64).read_unaligned() } & (END as u64 * ONES);
+            let e = word(q) & (END as u64 * ONES);
             if e != 0 {
                 q += (e.trailing_zeros() / 8) as usize * GRANULE;
                 break;
@@ -3202,9 +3217,17 @@ impl Vm {
             // The slots into the candidates marking recorded, and the
             // candidates' own cells (moved, or left: pinned), on several
             // threads. (A slot recorded twice is written twice, the same.)
+            // (Each slot by one thread: a slot may be recorded more than once,
+            // by the marker and card scans, so the records go to a thread by
+            // address.)
             let fw = &fw;
-            in_parallel(threads, &rec, 4096, |rs| {
-                for &a in rs {
+            let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); if rec.len() >= 4096 { threads } else { 1 }];
+            let k = buckets.len();
+            for &a in &rec {
+                buckets[(a >> 4) % k].push(a);
+            }
+            in_parallel(threads, &buckets, 2, |bs| {
+                for &a in bs.iter().flatten() {
                     if a & 1 != 0 {
                         fw.payload((a & !1) as *mut usize);
                     } else {

@@ -1877,7 +1877,6 @@ impl Vm {
             };
             // (The weak collections' entries, once what is live is known.)
             self.ephemerons(&mut m);
-            self.prune_collections(m.mode);
             if kind == Collection::Minor && self.heap.gc.check_barriers {
                 self.heap.check_barriers();
             }
@@ -1891,6 +1890,10 @@ impl Vm {
                     self.mark_live_codes(&mut m, sp, regs, &mut Vec::new());
                 }
             }
+            // (Once marking is over: a full one's codes and shapes mark the
+            // cells they refer to, a collection only a shape's prototype
+            // holds say, whose keys must be pinned if it moves.)
+            self.prune_collections(m.mode);
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
             }

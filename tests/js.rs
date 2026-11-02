@@ -11101,3 +11101,30 @@ folded + " | " + s + " " + r.join(",");
         assert_eq!(r.as_deref(), Ok("3500000 10000 100000000 | 2800000 7,7,7,7,7,34"), "tier at {budget}");
     }
 }
+
+/// A direct `eval` in code an `eval` runs (its bindings through a scope
+/// object of accessors, `intrinsics::eval_through_scope`) while every
+/// collection moves cells: the names and the scope object it holds in Rust
+/// across the eval stay put (`Vm::unmovable`), so the flush after reads
+/// them, not old copies (poisoned). What V8, SpiderMonkey, JavaScriptCore
+/// and QuickJS give.
+#[test]
+fn evals_through_scope_objects_hold_still_while_cells_move() {
+    let src = r#"
+function f() {
+  let a = 1, b = "two";
+  var c = [3];
+  eval("var junk = []; for (var i = 0; i < 20000; i++) junk.push({ i: i, s: 'x' + i }); eval('a += 10'); b += '!'; c.push(4); junk = null;");
+  return a + " " + b + " " + c.join(",");
+}
+var r = [];
+for (var k = 0; k < 3; k++) r.push(f());
+r.join(" | ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_gc_evacuate_all();
+    vm.set_gc_verify(256 << 10);
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("11 two! 3,4 | 11 two! 3,4 | 11 two! 3,4"));
+}

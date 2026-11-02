@@ -6127,6 +6127,13 @@ impl Vm {
         self.heap.gc.code_room = bytes;
     }
 
+    /// Every collection full, stopping the world, and moving what it can
+    /// of every other small block in use, the old copies poisoned, as
+    /// `CLOISON_GC_FULL` and `CLOISON_GC_EVACUATE=all` do (for tests).
+    pub fn set_gc_evacuate_all(&mut self) {
+        self.heap.gc.set_evacuate_all();
+    }
+
     /// Collect every `bytes` allocated, checking references and poisoning
     /// what is freed, as `CLOISON_GC_VERIFY` does (for tests).
     pub fn set_gc_verify(&mut self, bytes: usize) {

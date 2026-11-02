@@ -11245,3 +11245,36 @@ out.join(" | ");
     }
 }
 
+/// An arrow function is a whole AssignmentExpression, not a
+/// MemberExpression: nothing continues it without parentheses, neither a
+/// call, a member, a tagged template, an update nor an operator (`() =>
+/// {}()` was called, issue #28). After a line break, a semicolon is
+/// inserted instead. What V8, JavaScriptCore and SpiderMonkey do.
+#[test]
+fn arrow_functions_are_not_continued() {
+    for src in [
+        "var r = () => { return 1; }();",
+        "var r = async () => {}();",
+        "var r = () => {}.x;",
+        "var r = () => {}[0];",
+        "var r = () => {}?.x;",
+        "var r = x => {}`t`;",
+        "var r = () => {} + 1;",
+        "var r = () => {} || 1;",
+        "var r = () => {} ? 1 : 2;",
+        "var r = () => {}\n.x;",
+    ] {
+        assert!(cloison::js::compile(src).is_err(), "{src}");
+    }
+    let src = r#"
+var x = 0, out = [];
+var f = () => {}
+(1)
+var g = async y => {}
+++x
+out.push(typeof f, typeof g, x);
+out.push((() => 1)(), (() => { return 2; })(), (a => b => a + b)(1)(2));
+out.push((true ? () => 3 : () => 4)(), (y => y ? 5 : 6)(0), [() => 1, y => {}].length);
+out.join(" ");"#;
+    assert_eq!(value(src), "function function 1 1 2 3 3 6 2");
+}

@@ -984,6 +984,16 @@ fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize, String)
 /// accessors (`a` [`direct_eval`]'s arguments), as `Gen::call` makes
 /// otherwise: `eval_scope`, then `direct_eval`, then `eval_scope_flush`.
 fn eval_through_scope(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, bindings: &[(&str, i32, usize, &str)]) -> Result<Value> {
+    // (The names, the scope object and the eval's arguments are held in
+    // Rust across the eval, which runs JS: no cell moves meanwhile, see
+    // `Vm::unmovable`. Rare: an eval in code an eval runs.)
+    vm.unmovable += 1;
+    let r = eval_through_scope_in(vm, a, carrier, nlex, bindings);
+    vm.unmovable -= 1;
+    r
+}
+
+fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, bindings: &[(&str, i32, usize, &str)]) -> Result<Value> {
     let mut sa = vec![a[2], Value::from_i32(nlex as i32), carrier];
     let mut names = Vec::with_capacity(bindings.len());
     for &(name, kind, up, key) in bindings {

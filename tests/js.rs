@@ -10837,3 +10837,45 @@ out.join(" ");
         vm.heap.verify();
     }
 }
+
+/// Compiled code that relied on a shape stays right when an object leaves
+/// it: deleting the last property added (back to the shared shape it was
+/// added to) makes its field mutable, dropping loads that folded its value,
+/// and a unique shape's successors, whose chain of parents skips it, drop
+/// the code that typed objects as having at least its slots when its
+/// object leaves it. (Neither failed before: the folds and types here
+/// weren't taken; the programs are the reviews' scenarios.) What V8,
+/// SpiderMonkey, JavaScriptCore and QuickJS give, compiled early or not.
+#[test]
+fn deletes_drop_code_relying_on_the_shape_left() {
+    let src = r#"
+var o = { a: 1 };
+o.last = { x: 7 };
+function loop(n) { var s = 0; for (var i = 0; i < n; i++) { var v = o.last; s += v === undefined ? 1000 : v.x; } return s; }
+var a = 0;
+for (var k = 0; k < 50; k++) a += loop(10000);
+delete o.last;
+var folded = [a, loop(10), loop(100000)].join(" ");
+function mk() { var u = { a: 1, b: 2, c: 3, d: 4 }; delete u.b; return u; }
+var u = mk();
+var h = { f: u };
+function rd(x) { return x.f.c + x.f.d; }
+var s = 0;
+for (var i = 0; i < 200000; i++) s += rd(h);
+u.e = 5;
+for (var i = 0; i < 200000; i++) s += rd(h);
+delete u.a;
+var r = [];
+for (var i = 0; i < 5; i++) r.push(rd(h));
+u.c = 30;
+r.push(rd(h));
+folded + " | " + s + " " + r.join(",");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("3500000 10000 100000000 | 2800000 7,7,7,7,7,34"), "tier at {budget}");
+    }
+}

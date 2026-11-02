@@ -2048,6 +2048,7 @@ impl Vm {
         }
         let cell = self.new_field_cell();
         let slots = s.slots.with(name, attrs, cell);
+        self.unique_left(s);
         let t = self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
@@ -2120,6 +2121,7 @@ impl Vm {
             let s = &*(*o).shape;
             // The object leaves `s` (for a copy of its own).
             self.shape_left_stable(s);
+            self.unique_left(s);
             let u = Shape {
                 class: s.class,
                 proto: s.proto,
@@ -2157,6 +2159,22 @@ impl Vm {
     /// its own count.
     fn lineage_parent(s: &Shape) -> *const Shape {
         if s.unique { s.parent } else { s }
+    }
+
+    /// The object of `s` leaves it for a shape made from it: if `s` is
+    /// unique, that shape's chain of parents skips it (`lineage_parent`),
+    /// so no later `shape_left` of its successors reaches it. Compiled code
+    /// that took an object of at least `s` to have its slots (`Ty::Ext`,
+    /// `Shape::lineage_relied`) would then run on it after it lost some:
+    /// dropped now, and `s` left (none relies on it again).
+    fn unique_left(&mut self, s: &Shape) {
+        if s.unique {
+            s.left.set(true);
+            if s.lineage_relied.replace(false) {
+                self.field_epoch = self.field_epoch.wrapping_add(1);
+                self.bump_code_epoch();
+            }
+        }
     }
 
     // ---- Objects ----
@@ -2535,6 +2553,7 @@ impl Vm {
                 return self.elements_transition(shape, FieldType::Any);
             }
         }
+        self.unique_left(s);
         let t = self.add_shape(Shape {
             class: s.class,
             proto: s.proto,
@@ -3799,6 +3818,9 @@ impl Vm {
                 && let Some(parent) = self.parent_without_last(o, s)
             {
                 self.shape_left(s);
+                // (Compiled code may have folded its value: the field's
+                // cell is only `s`'s.)
+                self.field_made_mutable(&*s.fields()[slot as usize]);
                 let at = Object::slot(o, s.location(slot));
                 *at = Value::EMPTY;
                 crate::object::set_shape(o, parent);

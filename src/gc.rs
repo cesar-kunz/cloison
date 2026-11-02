@@ -820,6 +820,22 @@ pub(crate) struct Policy {
     pub fresh: bool,
 }
 
+/// Whether a cycle starting at `now` is too soon to choose candidates: the
+/// last cycle started (`last_start`) less than `Policy::interval` before,
+/// or the last evacuation ended (`last_end`, taking `took`) less than
+/// `Policy::spacing` times as long as it took. (Every cycle's start counts,
+/// one that chose none too: cycles a fifth of a second apart never
+/// evacuate, however long they go on.)
+fn too_soon(
+    p: &Policy,
+    now: std::time::Instant,
+    last_start: Option<std::time::Instant>,
+    last_end: Option<std::time::Instant>,
+    took: std::time::Duration,
+) -> bool {
+    last_start.is_some_and(|t| now.duration_since(t) < p.interval) || last_end.is_some_and(|t| now.duration_since(t) < p.spacing * took)
+}
+
 pub(crate) fn policy() -> &'static Policy {
     static P: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
     P.get_or_init(|| {
@@ -2006,11 +2022,10 @@ impl Vm {
             // (The colors of the last cycle's: its sweep is over.)
             if self.heap.gc.evacuate != Evacuate::Off {
                 let gc = &self.heap.gc;
-                let p = policy();
+                let now = std::time::Instant::now();
                 let early = gc.evacuate != Evacuate::All
-                    && (gc.cycle_start.is_some_and(|t| t.elapsed() < p.interval)
-                        || gc.evac_end.is_some_and(|t| t.elapsed() < p.spacing * gc.evac_took));
-                self.heap.gc.cycle_start = Some(std::time::Instant::now());
+                    && too_soon(policy(), now, gc.cycle_start, gc.evac_end, gc.evac_took);
+                self.heap.gc.cycle_start = Some(now);
                 if self.heap.gc.evac_wait > 0 || early {
                     self.heap.gc.evac_wait = self.heap.gc.evac_wait.saturating_sub(1);
                     self.heap.set_candidates(&[]);
@@ -3420,9 +3435,10 @@ impl Vm {
     /// left is live), or at a cycle's start (the last one's sweep over),
     /// the blocks the next final marking evacuates (`Heap::candidates`):
     /// when the small blocks in use are over
-    /// [`EVACUATE_RATIO`] times the bytes live in them, the sparsest under
-    /// [`EVACUATE_FULL`]%, up to a budget of bytes, if they would give back
-    /// at least a tenth of the blocks in use (and [`EVACUATE_MIN`]);
+    /// `Policy::ratio` times the bytes live in them, the sparsest under
+    /// `Policy::full`%, up to `Policy::budget` bytes, if they would give
+    /// back at least `Policy::full_share`% of the blocks in use (and
+    /// `Policy::min` bytes);
     /// stressed (`Evacuate::All`), every other block, alternately. Live
     /// bytes by block from what the sweep left (`Heap::swept_free`).
     fn choose_candidates(&mut self) {
@@ -4376,5 +4392,51 @@ impl Heap {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn policy_with(interval_ms: u64, spacing: u32) -> Policy {
+        Policy {
+            ratio: 2,
+            min: 32 << 20,
+            full_share: 10,
+            share: 10,
+            full: 50,
+            budget: 32 << 20,
+            gain: 8 << 20,
+            interval: Duration::from_millis(interval_ms),
+            spacing,
+            fresh: true,
+        }
+    }
+
+    /// The first cycle, cycles too close, one far enough after, no
+    /// interval, and the spacing after an evacuation.
+    #[test]
+    fn cycles_choose_candidates_only_far_enough_apart() {
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+        let p = policy_with(500, 0);
+        let none = Duration::ZERO;
+        assert!(!too_soon(&p, at(0), None, None, none), "the first cycle");
+        assert!(too_soon(&p, at(200), Some(at(0)), None, none), "200 ms after the last");
+        assert!(!too_soon(&p, at(600), Some(at(100)), None, none), "500 ms after");
+        // Each start counts: cycles 200 ms apart never get there.
+        let mut last = at(0);
+        for k in 1..50 {
+            assert!(too_soon(&p, at(200 * k), Some(last), None, none));
+            last = at(200 * k);
+        }
+        let p = policy_with(0, 0);
+        assert!(!too_soon(&p, at(1), Some(at(0)), None, none), "no interval");
+        let p = policy_with(0, 20);
+        let took = Duration::from_millis(40);
+        assert!(too_soon(&p, at(700), Some(at(0)), Some(at(0)), took), "within 20 times 40 ms");
+        assert!(!too_soon(&p, at(900), Some(at(0)), Some(at(0)), took), "past it");
     }
 }

@@ -12715,6 +12715,15 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
                 let int = Value::from_bits(value).is_int32() && ft == FieldType::Int;
                 (object(value).is_some() || int) && !exited()
             })
+            .map(|(value, at, expect, ft, obj)| {
+                // The lowered code (versions compile from it) refers to the
+                // cell from now on, whether or not a version embeds it.
+                let vm = crate::interp::current_vm();
+                if Value::from_bits(value).is_cell() && !vm.is_null() {
+                    unsafe { (*vm).heap.keep(value as usize) };
+                }
+                (value, at, expect, ft, obj)
+            })
             .map(|(value, at, expect, ft, obj)| Prop::Const {
                 value,
                 at,

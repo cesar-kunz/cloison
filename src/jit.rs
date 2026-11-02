@@ -11671,6 +11671,13 @@ fn split_temps(out: &mut Lowered, base: usize, limit: usize) -> usize {
         .map(|f| (f.base, unsafe { (*f.code).nregs } as usize, f.parent))
         .collect();
     let captured: Vec<Vec<bool>> = out.frames.iter().map(|f| captured_regs(f.code)).collect();
+    // Per frame, whether a `try` of its code ends past bytecode offset `pc`.
+    let try_after: Vec<Box<dyn Fn(usize) -> bool>> = (out.frames.iter())
+        .map(|f| {
+            let handlers = unsafe { &(*f.code).handlers };
+            Box::new(move |pc: usize| handlers.iter().any(|&(_, end, _)| pc < end as usize)) as Box<dyn Fn(usize) -> bool>
+        })
+        .collect();
     let reach = reachable(&out.insns, 0);
     let live = reg_live_in_mats(&out.insns, &reach, out.nregs, &frame_regs, Some(&out.mats), true);
     // Registers some restore or alias involves already.
@@ -11700,6 +11707,15 @@ fn split_temps(out: &mut Lowered, base: usize, limit: usize) -> usize {
         let (g, r) = (i.frame as usize, i.reg as usize);
         let (fbase, fregs, _) = frame_regs[g];
         if r < fbase || r >= fbase + fregs || captured[g].get(r - fbase) == Some(&true) || rs_has(&involved, r) {
+            continue;
+        }
+        // Not with a `try` after it in its frame: a call there that throws
+        // exits to the interpreter, whose handler may read the register
+        // (dead after its reads to compiled code, which doesn't run the
+        // handler) from its own slot, which only the split register was
+        // written for. (Split, a `catch`'s read of a `let` set before the
+        // `try` and read in it read the `let`'s hole: issue #22.)
+        if try_after[g](i.pc) {
             continue;
         }
         // Its reads, up to the one after which it is dead (on every

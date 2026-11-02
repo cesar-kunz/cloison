@@ -10642,3 +10642,45 @@ out.join(" ");
         vm.heap.verify();
     }
 }
+
+/// A register a `catch` reads keeps its slot when compiled code runs the
+/// `try`: a `let` set before it, read in it, wasn't split off into a
+/// register of its own (`jit::split_temps`), whose value no exit wrote back
+/// once its reads in compiled code were done, so a call throwing there left
+/// the handler reading the `let`'s hole: `l3 + 1` panicked (issue #22).
+/// The issue's program, compiled at once or not: what V8, JavaScriptCore
+/// and SpiderMonkey give.
+#[test]
+fn catches_read_registers_split_off_in_their_try() {
+    let src = r#"
+var t0 = [];
+function P0() {}
+function f1() {
+  try {
+  } finally {
+    nope;
+  }
+}
+var out = [];
+function f3() {
+  let l3 = 0;
+  try {
+    t0[/a/.test(String(typeof l3)) ? 1 : 0] = [new P0(0).x, String(0).replace(0).length][f1(0) | 0];
+  } catch (e4) {
+    l3 = l3 + 1;
+    out.push(l3);
+  }
+}
+for (var i = 0; i < 10; i++) {
+  f3();
+}
+out.join("");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 1, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("1111111111"), "tier at {budget}");
+    }
+}

@@ -119,6 +119,7 @@ fn parse_pass<'a>(
         classes: 0,
         pending_generator: false,
         pending_async: false,
+        arrow_end: usize::MAX,
         pending_head: Vec::new(),
         sub: false,
         pending_pattern: None,
@@ -308,6 +309,11 @@ struct Parser<'t, 'a, 'p> {
     pending_generator: bool,
     /// The function about to be parsed is async.
     pending_async: bool,
+    /// The token after the last arrow function parsed as a primary
+    /// expression, not in parentheses: an arrow is a whole
+    /// AssignmentExpression, so no call, member, update or operator may
+    /// continue it there (`() => {}()` is a SyntaxError).
+    arrow_end: usize,
     /// A `for` head pattern's names (see `head_tdz`).
     pending_head: Vec<Name>,
     /// The statement about to be parsed is another's body.
@@ -2362,7 +2368,7 @@ impl<'a> Parser<'_, 'a, '_> {
 
     fn conditional(&mut self, no_in: bool) -> R<Expr<'a>> {
         let c = self.binary(0, no_in)?;
-        if !self.is("?") {
+        if !self.is("?") || self.arrow_end == self.i {
             return Ok(c);
         }
         let pos = self.pos();
@@ -2383,6 +2389,9 @@ impl<'a> Parser<'_, 'a, '_> {
             let Some((prec, op)) = binary_op(self.peek()) else {
                 return Ok(l);
             };
+            if self.arrow_end == self.i {
+                return Ok(l);
+            }
             if prec <= min || (no_in && matches!(op, Bin::Op(BinOp::In))) {
                 return Ok(l);
             }
@@ -2484,6 +2493,7 @@ impl<'a> Parser<'_, 'a, '_> {
         let e = self.call()?;
         if let Tok::Punct(p @ ("++" | "--")) = self.peek()
             && !self.toks[self.i].newline_before
+            && self.arrow_end != self.i
         {
             let d = if *p == "++" { 1 } else { -1 };
             let pos = self.pos();
@@ -2504,6 +2514,9 @@ impl<'a> Parser<'_, 'a, '_> {
         } else {
             self.primary()?
         };
+        if self.arrow_end == self.i {
+            return Ok(e);
+        }
         // In an optional chain (`a?.b`): the whole of it, made `Chain`.
         let mut chain = false;
         loop {
@@ -2977,6 +2990,11 @@ impl<'a> Parser<'_, 'a, '_> {
                 return self.unexpected();
             }
         };
+        if let ExprKind::Function(f) = kind
+            && self.functions[f].arrow
+        {
+            self.arrow_end = self.i;
+        }
         Ok(Expr { kind, pos })
     }
 }

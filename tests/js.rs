@@ -10642,3 +10642,46 @@ out.join(" ");
         vm.heap.verify();
     }
 }
+
+/// A register split off for its reads in compiled code (`split_temps`)
+/// stays in its slot when the interpreter reads it later: `f0.call(…)`
+/// inlined calls `f0` without reading the register holding `f0`, so its
+/// split ended at `.call`'s load, and an exit at `a3[p0 & 15]` (a hole
+/// past the end, in the recursive call) left the slot unwritten for the
+/// interpreter's `Call`, which threw "called on a non-function" (issue
+/// #24). The issue's program, compiled at once or not: what V8,
+/// JavaScriptCore and SpiderMonkey give.
+#[test]
+fn split_registers_the_interpreter_reads_after_an_exit_stay() {
+    let src = r#"
+var fuel = 300000;
+var s1 = "aab";
+var a3 = [1, , 3, , 5];
+var t1 = new Int32Array(0);
+function f0(d, p0, p1) {
+}
+function f1(d, p0) {
+  if (fuel-- <= 0 || d <= 0) return p0;
+  const l3 = t1[f0(3, 0, f0.call(null, 2, a3[p0 & 15], p0)) & 15];
+  var l4 = 0;
+  s1 = s1 + f1(d - 1, (q5 => 51)(0));
+  {
+    for (let k15 = 0; k15 < 13 && fuel-- > 0; k15++) {
+    }
+  }
+}
+var errors = [];
+for (var i = 0; i < 200; i++) {
+  try { f1(4, 0); }
+  catch (e) { errors.push(i + " " + e); }
+}
+errors.length + " " + errors[0];
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 1, 2, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("0 undefined"), "tier at {budget}");
+    }
+}

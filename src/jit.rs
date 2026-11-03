@@ -105,6 +105,121 @@ pub(crate) fn free_retired(vm: &mut crate::vm::Vm, words: &[usize]) {
     });
 }
 
+thread_local! {
+    /// The snapshots and versions made and not dropped (see
+    /// [`mark_referenced_codes`]): a version may be held by a frame running
+    /// it alone, its function's versions changed since. (Their addresses,
+    /// each taken out as it drops: a `Weak` would keep a dropped one's
+    /// memory, which moved what `malloc` gave the shapes after, and how
+    /// the caches hashing their addresses collided: RayTrace +0.85%.)
+    static ALIVE: std::cell::RefCell<(HashSet<*const Snapshot>, HashSet<*const JitCode>)> =
+        Default::default();
+    /// Lowerings under way (see [`compiling`]).
+    static LOWERING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn note_snapshot(s: &Rc<Snapshot>) {
+    ALIVE.with(|a| a.borrow_mut().0.insert(Rc::as_ptr(s)));
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        let _ = ALIVE.try_with(|a| a.borrow_mut().0.remove(&(self as *const Snapshot)));
+    }
+}
+
+impl Drop for JitCode {
+    fn drop(&mut self) {
+        let _ = ALIVE.try_with(|a| a.borrow_mut().1.remove(&(self as *const JitCode)));
+    }
+}
+
+/// At a full marking: mark (`mark`, which says whether the code wasn't
+/// yet) each code that compiled code alive refers to, which it may run or
+/// read (inlined, a frame its exits make; called directly, bound to a call
+/// site; a call site's caller and the function its inline cache names):
+/// the codes it took, found live with it (#35: they were kept for good).
+/// Compiled code counts while its function (its frame 0) is `live`, or a
+/// frame runs it: a word of the stacks `words` points into its code or at
+/// it (as for `free_retired`; its function's versions may have changed
+/// since). Whether a code was marked: the caller repeats until none is.
+pub(crate) fn mark_referenced_codes(
+    words: &mut dyn FnMut() -> Vec<usize>,
+    live: &dyn Fn(*const crate::vm::Code) -> bool,
+    mark: &mut dyn FnMut(*const crate::vm::Code) -> bool,
+) -> bool {
+    ALIVE.with(|a| {
+        let (snaps, codes) = &*a.borrow();
+        let counts = |s: &Snapshot| s.frames.first().is_some_and(|f| live(f.code));
+        let mut more = false;
+        for s in snaps.iter().map(|&s| unsafe { &*s }) {
+            if counts(s) {
+                more |= mark_codes_of(&s.frames, &s.sites, mark);
+            }
+        }
+        // The versions of functions not live: counted if a frame runs one.
+        let mut others: Vec<&JitCode> = Vec::new();
+        for c in codes.iter().map(|&c| unsafe { &*c }) {
+            let Some(s) = &c.snap else { continue };
+            if counts(s) {
+                more |= mark_codes_of(&s.frames, &s.sites, mark);
+                more |= mark_codes_of(&[], &c.forks, mark);
+            } else {
+                others.push(c);
+            }
+        }
+        if others.is_empty() {
+            return more;
+        }
+        // (Each one's ranges, by start, to look the words up in.)
+        let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(2 * others.len());
+        for (k, &c) in others.iter().enumerate() {
+            ranges.push((c.mem.ptr as usize, c.mem.ptr as usize + c.len.max(1), k));
+            let at = c as *const JitCode as usize;
+            ranges.push((at, at + std::mem::size_of::<JitCode>(), k));
+        }
+        ranges.sort_unstable();
+        let mut running = vec![false; others.len()];
+        for w in words() {
+            let i = ranges.partition_point(|r| r.0 <= w);
+            if i > 0 && w < ranges[i - 1].1 {
+                running[ranges[i - 1].2] = true;
+            }
+        }
+        for (c, run) in others.iter().zip(running) {
+            if run {
+                let s = c.snap.as_ref().unwrap();
+                more |= mark_codes_of(&s.frames, &s.sites, mark);
+                more |= mark_codes_of(&[], &c.forks, mark);
+            }
+        }
+        more
+    })
+}
+
+/// [`mark_referenced_codes`] for the frames and call sites of a snapshot
+/// or a version.
+fn mark_codes_of(
+    frames: &[InlineFrame],
+    sites: &[Box<std::cell::UnsafeCell<CallSite>>],
+    mark: &mut dyn FnMut(*const crate::vm::Code) -> bool,
+) -> bool {
+    let mut more = false;
+    for fr in frames {
+        more |= mark(fr.code);
+    }
+    for site in sites {
+        unsafe { (*site.get()).each_code(&mut |c| more |= mark(c)) };
+    }
+    more
+}
+
+/// A lowering is under way: the codes it took (inlined, bound) are in no
+/// snapshot yet, which a collection then must not free.
+pub(crate) fn compiling() -> bool {
+    LOWERING.with(|l| l.get() > 0)
+}
+
 /// An `instanceof` site's cache (`Prop::InstanceOf`): two entries, the
 /// latest first.
 type InstanceOfCache = [std::cell::Cell<InstanceOfEntry>; 2];
@@ -4916,7 +5031,6 @@ fn variable_assigned(vm: *mut crate::vm::Vm, code: *const crate::vm::Code, k: us
         return a;
     }
     let a = variable_assigned_uncached(vm, code, k);
-    crate::vm::pin(code);
     unsafe { (*vm).jit_caches.assigned.insert((code, k), a) };
     a
 }
@@ -4988,7 +5102,6 @@ fn bytecode_facts(vm: *mut crate::vm::Vm, code: *const crate::vm::Code) -> Rc<(b
     let mapped = insns.iter().any(|i| i.op == Op::CreateMappedArguments);
     let sta = insns.iter().filter(|i| i.op == Op::StaUpvalue).map(|i| i.imm as usize).collect();
     let f = Rc::new((mapped, sta));
-    crate::vm::pin(code);
     caches.facts.insert(code, f.clone());
     f
 }
@@ -5013,7 +5126,6 @@ fn lazy_writes(vm: *mut crate::vm::Vm, code: *const crate::vm::Code) -> Option<R
         }
         Some(Rc::new(sta(f0)))
     })();
-    crate::vm::pin(code);
     unsafe { (*vm).jit_caches.lazy_writes.insert(code, w.clone()) };
     w
 }
@@ -5078,7 +5190,6 @@ fn smi_registers(
     }
     let out: Vec<Option<i32>> = if ok { val.into_iter().map(Option::flatten).collect() } else { vec![None; n] };
     let out = Rc::new(out);
-    crate::vm::pin(code);
     unsafe { (*vm).jit_caches.smis.insert(code, out.clone()) };
     out
 }
@@ -10077,6 +10188,7 @@ impl JitCode {
     /// Share the code, telling the call sites bound to it where it is.
     fn into_rc(self) -> Rc<JitCode> {
         let code = Rc::new(self);
+        ALIVE.with(|a| a.borrow_mut().1.insert(Rc::as_ptr(&code)));
         if let Some(snap) = &code.snap {
             for &k in &code.self_sites {
                 unsafe { (*snap.sites[k].get()).self_code = Rc::as_ptr(&code) };
@@ -10337,6 +10449,25 @@ pub(crate) struct Caches {
 }
 
 impl Caches {
+    /// Forget what was found of the codes `gone`, freed (their addresses
+    /// then others').
+    pub(crate) fn forget(&mut self, gone: &HashSet<*const crate::vm::Code>) {
+        self.decoded.retain(|c, _| !gone.contains(c));
+        self.entry_live.retain(|c, _| !gone.contains(c));
+        self.pc_live.retain(|c, _| !gone.contains(c));
+        self.reg_live.retain(|c, _| !gone.contains(c));
+        self.assigned.retain(|(c, _), _| !gone.contains(c));
+        self.facts.retain(|c, _| !gone.contains(c));
+        self.lazy_writes.retain(|c, _| !gone.contains(c));
+        self.smis.retain(|c, _| !gone.contains(c));
+    }
+
+    /// The JIT found something of `code` (decoded it): during a lowering,
+    /// one it may have taken (see [`compiling`]).
+    pub(crate) fn has(&self, code: *const crate::vm::Code) -> bool {
+        self.decoded.contains_key(&code)
+    }
+
     /// Function `code`'s registers live into each instruction as the
     /// interpreter runs it, by bytecode offset (see [`bytecode_live`]).
     fn pc_live(&mut self, code: *const crate::vm::Code) -> Rc<PcLive> {
@@ -10367,7 +10498,6 @@ impl Caches {
     /// Function `code` decoded, with accumulator liveness after each
     /// instruction.
     fn decoded(&mut self, code: *const crate::vm::Code) -> Decoded {
-        crate::vm::pin(code);
         self.decoded
             .entry(code)
             .or_insert_with(|| {
@@ -10739,6 +10869,9 @@ use crate::layout::{DISPATCH, dispatch_slot};
 crate::layout::same_layout!(CallSite, crate::layout::DirectSite:
     entry, closure, f_off, end_off, stack_end, native_limit, this_shape, ctor, table);
 const DISPATCH_AFTER: u32 = 8;
+/// The callees a dispatching call site binds at most (see
+/// `CallSite::dispatched`).
+const MAX_DISPATCH_SITES: usize = DISPATCH / 4;
 
 use crate::layout::CtorSite;
 
@@ -10856,6 +10989,33 @@ unsafe fn bind_direct(site: *mut CallSite, this: Ty, args: &[Ty]) -> bool {
 }
 
 impl CallSite {
+    /// Drop the versions the site and its dispatch table's sites are bound
+    /// to (see `JitFunction::unbind_targets`).
+    fn drop_targets(&mut self) {
+        self.target = None;
+        if let Some(d) = &mut self.dispatch {
+            for s in d.sites.values_mut() {
+                s.get_mut().drop_targets();
+            }
+        }
+    }
+
+    /// The codes the site names: its callee, its caller and the function
+    /// its inline cache names, and its dispatch table's sites' (see
+    /// [`mark_referenced_codes`]).
+    fn each_code(&self, f: &mut dyn FnMut(*const crate::vm::Code)) {
+        for c in [self.callee, self.caller, self.cached] {
+            if !c.is_null() {
+                f(c);
+            }
+        }
+        if let Some(d) = &self.dispatch {
+            for s in d.sites.values() {
+                unsafe { (*s.get()).each_code(f) };
+            }
+        }
+    }
+
     /// The site unbound and unclaimed, for a caller version passing other
     /// types than the one that claimed it (see `JitCode::forks`).
     fn fork(&self) -> CallSite {
@@ -10923,11 +11083,18 @@ impl CallSite {
         if !at.is_null() && unsafe { (*at).closure } == key {
             return unsafe { &mut *at };
         }
+        // Past as many callees, the others go through the runtime: each
+        // one's site keeps it, its closure and its versions, for good (a
+        // call of a function made at run time each time kept them all:
+        // #35).
+        let d = self.dispatch.as_ref().unwrap();
+        if d.sites.len() >= MAX_DISPATCH_SITES && !d.sites.contains_key(&key) {
+            return self;
+        }
         let fork = self.fork();
         let claim = self.claim.clone();
         let (vm, by_code) = (self.vm, self.by_code);
         let d = self.dispatch.as_mut().unwrap();
-        crate::vm::pin(callee);
         let site = d.sites.entry(key).or_insert_with(|| {
             if !by_code {
                 unsafe { (*vm).heap.keep_in(&mut d.kept, fo as usize) };
@@ -11590,6 +11757,14 @@ fn timed<T>(total: &std::sync::atomic::AtomicU64, f: impl FnOnce() -> T) -> T {
 }
 
 fn lower(state: &mut VmState, epoch: u32) -> Lowered {
+    LOWERING.with(|l| l.set(l.get() + 1));
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            LOWERING.with(|l| l.set(l.get() - 1));
+        }
+    }
+    let _done = Done;
     let vm = state.vm;
     let from = unsafe { (*vm).heap.kept_mark() };
     let mut low = timed(&LOWER_NS, || lower_frames(state, epoch));
@@ -14523,7 +14698,6 @@ impl Lowering<'_> {
         }
         site.nparams = unsafe { (*callee).nparams };
         site.callee = callee;
-        crate::vm::pin(callee);
         true
     }
 
@@ -15157,7 +15331,6 @@ impl Lowering<'_> {
         site.closure = fo as u64;
         unsafe { (*self.state.vm).heap.keep(fo as usize) };
         site.callee = unsafe { (*fo).code };
-        crate::vm::pin(site.callee);
         let site = Box::new(std::cell::UnsafeCell::new(site));
         let alloc = site.get() as u64;
         self.out.sites.push(site);
@@ -15846,7 +16019,6 @@ impl Lowering<'_> {
         if self.accessor_sites(callee) {
             extra = extra.max(ACCESSOR_EXTRA as u8);
         }
-        crate::vm::pin(callee);
         // (Not an accessor's, whose guard isn't kept: the receiver's shape
         // proves its function, which its frame takes upvalues of. A getter
         // shared by many objects' accessors, inlined for any closure of
@@ -15968,6 +16140,28 @@ fn fits_stack(
 }
 
 impl JitFunction {
+    /// Its function freed: drop the versions its call sites are bound to,
+    /// which versions calling each other would keep, with what they refer
+    /// to, after both functions are freed.
+    pub(crate) fn unbind_targets(&mut self) {
+        let sites = |s: &Snapshot| {
+            for site in &s.sites {
+                unsafe { (*site.get()).drop_targets() };
+            }
+        };
+        if let Some(v) = &self.vm {
+            sites(&v.snap);
+        }
+        for (_, c) in self.versions.values().flatten() {
+            if let Some(s) = &c.snap {
+                sites(s);
+            }
+            for site in &c.forks {
+                unsafe { (*site.get()).drop_targets() };
+            }
+        }
+    }
+
     /// Prepare `code`, to start in the interpreter and tier up with the
     /// default [`Tiering`]. Panics on malformed bytecode.
     pub fn new(code: &[u8]) -> JitFunction {
@@ -16015,7 +16209,6 @@ impl JitFunction {
     pub(crate) fn for_vm(code: *const crate::vm::Code, vm: *mut crate::vm::Vm) -> JitFunction {
         // (Its own epoch moves with the VM's from now on: see
         // `Vm::bump_code_epoch`.)
-        crate::vm::pin(code);
         unsafe { (*vm).jitted.push(code) };
         let root_insns = unsafe { (*vm).jit_caches.decoded(code) }.0.clone();
         let nregs = unsafe { (*code).nregs } as usize;
@@ -16247,6 +16440,7 @@ impl JitFunction {
                 caches: low.caches,
                 kept: low.kept,
             });
+            note_snapshot(&vm.snap);
         }
     }
 

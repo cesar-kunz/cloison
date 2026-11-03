@@ -2147,7 +2147,8 @@ impl Vm {
             // holds say, whose keys must be pinned if it moves.)
             self.prune_collections(m.mode);
             if full {
-                self.prune_regexps(m.mode);
+                let words = self.stack_words(sp, regs);
+                self.prune_regexps(m.mode, &words);
             }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
@@ -3520,16 +3521,38 @@ impl Vm {
     }
 
     /// After a full marking, before anything is freed or moved: drop the
-    /// compiled patterns no live `RegExp` uses and nothing used during it
-    /// (#34: a pattern made from each new source stayed for good), and the
-    /// literals' entries keyed by a dead string (a freed code's constants:
-    /// a new string at the address would find another's pattern) or naming
-    /// a pattern dropped.
-    fn prune_regexps(&mut self, mode: Mode) {
+    /// compiled patterns no live `RegExp` uses, nothing used during it and
+    /// no frame holds (#34: a pattern made from each new source stayed for
+    /// good), and the literals' entries keyed by a dead string (a freed
+    /// code's constants: a new string at the address would find another's
+    /// pattern) or naming a pattern dropped. `words` are the stacks' (see
+    /// `stack_words`): a builtin holds its object's pattern across user
+    /// code, which may `compile` the object another and collect (`exec`
+    /// converting its input, `replace` calling back), the object then
+    /// marking only the new one.
+    fn prune_regexps(&mut self, mode: Mode, words: &[usize]) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
         let live = |v: u64| !Value::from_bits(v).is_cell() || unsafe { *crate::heap::meta(v as usize) } & COLOR == mode.color;
-        self.regexps.retain(|_, re| re.mark.load(Relaxed) >= from);
+        let size = std::mem::size_of::<crate::regexp::Regex>();
+        let mut unmarked: Vec<usize> = self
+            .regexps
+            .values()
+            .filter(|re| re.mark.load(Relaxed) < from)
+            .map(|re| &**re as *const crate::regexp::Regex as usize)
+            .collect();
+        unmarked.sort_unstable();
+        // (Addresses in a pattern, as `free_retired` finds the versions a
+        // frame runs.)
+        let held: crate::jit::HashSet<usize> = words
+            .iter()
+            .filter_map(|&w| {
+                let i = unmarked.partition_point(|&p| p <= w).checked_sub(1)?;
+                (w < unmarked[i] + size).then_some(unmarked[i])
+            })
+            .collect();
+        self.regexps
+            .retain(|_, re| re.mark.load(Relaxed) >= from || held.contains(&(&**re as *const crate::regexp::Regex as usize)));
         let kept: crate::jit::HashSet<*const crate::regexp::Regex> =
             self.regexps.values().map(|re| &**re as *const crate::regexp::Regex).collect();
         self.regexp_literals.retain(|&(p, f), re| live(p) && live(f) && kept.contains(re));

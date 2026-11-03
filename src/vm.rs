@@ -6171,6 +6171,18 @@ impl Vm {
         self.heap.gc.set_evacuate_cycles();
     }
 
+    /// The codes the VM's tables name by address, the JIT's and the field
+    /// types' (`jitted`, `field_deps`, `relied_cells`, `through_deps`), that
+    /// aren't loaded, or are taken out of use (for tests: what a freed
+    /// code left them to read, see `Vm::condemn_codes`).
+    pub fn codes_named_but_not_live(&self) -> usize {
+        let live = |c: usize| self.code_set.contains(&c);
+        self.jitted.iter().filter(|&&c| !live(c as usize)).count()
+            + self.field_deps.values().flatten().filter(|&&c| !live(c)).count()
+            + self.relied_cells.keys().filter(|&&c| !live(c)).count()
+            + self.through_deps.values().flatten().filter(|&&(a, b)| !live(a) || !live(b)).count()
+    }
+
     /// The functions' codes loaded and not freed (for tests).
     pub fn code_count(&self) -> usize {
         self.codes.len() + self.condemned.len()

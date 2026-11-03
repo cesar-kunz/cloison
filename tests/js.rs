@@ -11535,3 +11535,57 @@ total;
     }
 }
 
+/// Property names and symbols go with the last thing naming them (issue
+/// #33): an atom was kept for good, a symbol used as a key too, and each
+/// key's string `for-in` made (`Vm::strings`). Objects of names and symbols
+/// never seen before, made, enumerated and dropped, leave a bounded number
+/// of atoms; what stays live keeps its names: a long-lived object's keys
+/// and symbols (one reachable through the object alone), a string keeping
+/// its atom (`Object::string_atom`) used as a key after the objects having
+/// it are gone, a property added through it, `for-in` over them. With
+/// freed atoms never reused, and read panicking (`set_atoms_poison`), as
+/// without. What V8, SpiderMonkey and JavaScriptCore give.
+#[test]
+fn property_names_and_symbols_are_freed_with_their_objects() {
+    let src = r#"
+var keep = { a: 1 };
+keep[Symbol("kept")] = 2;
+var kept = Symbol("named"), key = "cached_" + 7;
+keep[kept] = 3;
+var probe = {};
+probe[key] = 4;
+probe = null;
+var sum = 0;
+for (var r = 0; r < 30; r++) {
+  for (var k = 0; k < 300; k++) {
+    var o = {};
+    o["n" + r + "_" + k] = k;
+    o[Symbol("s" + k)] = k;
+    for (var p in o) sum += p.length;
+  }
+  $262.gc();
+}
+var again = {};
+again[key] = 5;
+var names = [];
+for (var p in keep) names.push(p);
+var syms = Object.getOwnPropertySymbols(keep).map(function (s) { return s.toString() + "=" + keep[s]; });
+[sum, names.join(","), syms.join(","), again[key], again.cached_7, keep[kept]].join(" ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let base = Vm::new().atom_count();
+    for (budget, poison) in [(i64::MAX, false), (2, false), (i64::MAX, true), (2, true)] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.set_atoms_poison(poison);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(
+            r.as_deref(),
+            Ok("56700 a Symbol(kept)=2,Symbol(named)=3 5 5 3"),
+            "tier at {budget}, poison {poison}"
+        );
+        let atoms = vm.atom_count() - base;
+        assert!(atoms < 2000, "{atoms} atoms kept (tier at {budget}, poison {poison})");
+    }
+}
+

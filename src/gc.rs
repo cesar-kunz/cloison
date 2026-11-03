@@ -715,14 +715,29 @@ pub(crate) fn mark_code(c: *const crate::vm::Code) {
 }
 
 /// If the cell at `p` (header word `w`), marked, is a closure: its code
-/// found live. (Not in [`trace`]: card scanning traces dead cells too.)
+/// found live; a regular expression: its compiled pattern (see
+/// `Vm::prune_regexps`). (Not in [`trace`]: card scanning traces dead
+/// cells too.)
 #[inline(always)]
 unsafe fn mark_function_code(p: usize, w: u64) {
     unsafe {
-        if w & 1 == 0 && (*(p as *const Object)).class == Class::Function {
-            mark_code((*(p as *const Object)).code);
+        if w & 1 != 0 {
+            return;
+        }
+        let o = p as *const Object;
+        match (*o).class {
+            Class::Function => mark_code((*o).code),
+            Class::RegExp if !(*o).code.is_null() => mark_regexp((*o).code as *const crate::regexp::Regex),
+            _ => {}
         }
     }
+}
+
+/// Compiled pattern `re` found live in the marking under way, or used
+/// during it.
+#[inline(always)]
+pub(crate) fn mark_regexp(re: *const crate::regexp::Regex) {
+    unsafe { (*re).mark.store(code_epoch(), std::sync::atomic::Ordering::Relaxed) }
 }
 
 /// If the cell at `p` (header word `w`), marked, is an object: its shape
@@ -2131,6 +2146,9 @@ impl Vm {
             // cells they refer to, a collection only a shape's prototype
             // holds say, whose keys must be pinned if it moves.)
             self.prune_collections(m.mode);
+            if full {
+                self.prune_regexps(m.mode);
+            }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
             }
@@ -3499,6 +3517,22 @@ impl Vm {
         young.retain(|&o| live(o as usize));
         self.collections.append(&mut young);
         self.collections_young = self.collections.len();
+    }
+
+    /// After a full marking, before anything is freed or moved: drop the
+    /// compiled patterns no live `RegExp` uses and nothing used during it
+    /// (#34: a pattern made from each new source stayed for good), and the
+    /// literals' entries keyed by a dead string (a freed code's constants:
+    /// a new string at the address would find another's pattern) or naming
+    /// a pattern dropped.
+    fn prune_regexps(&mut self, mode: Mode) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let from = self.heap.gc.codes_from;
+        let live = |v: u64| !Value::from_bits(v).is_cell() || unsafe { *crate::heap::meta(v as usize) } & COLOR == mode.color;
+        self.regexps.retain(|_, re| re.mark.load(Relaxed) >= from);
+        let kept: crate::jit::HashSet<*const crate::regexp::Regex> =
+            self.regexps.values().map(|re| &**re as *const crate::regexp::Regex).collect();
+        self.regexp_literals.retain(|&(p, f), re| live(p) && live(f) && kept.contains(re));
     }
 
     /// `CLOISON_GC_SLOTS`, after a full collection stopping the world: mark

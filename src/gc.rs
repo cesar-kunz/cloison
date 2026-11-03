@@ -2481,9 +2481,27 @@ impl Vm {
                 }
             }
         }
+        // (For the versions frames run, read once if any is asked for: see
+        // `jit::mark_referenced_codes`.)
+        let mut words: Option<Vec<usize>> = None;
         done.resize(self.codes.len(), false);
         loop {
-            let mut more = false;
+            // The codes compiled code of live ones refers to, or of a frame.
+            // (Only this VM's codes not freed: a version may outlive its
+            // function, another VM's too.)
+            let set = &self.code_set;
+            let mut more = crate::jit::mark_referenced_codes(
+                &mut || words.get_or_insert_with(|| unsafe { self.stack_words(sp, regs) }).clone(),
+                &|c| set.contains(&(c as usize)) && unsafe { (*c).mark.load(Relaxed) } >= from,
+                &mut |c| {
+                    if !set.contains(&(c as usize)) {
+                        return false;
+                    }
+                    let new = unsafe { (*c).mark.load(Relaxed) } < from;
+                    mark_code(c);
+                    new
+                },
+            );
             for (k, code) in self.codes.iter().enumerate() {
                 if done[k] || code.mark.load(Relaxed) < from {
                     continue;
@@ -2604,34 +2622,52 @@ impl Vm {
     }
 
     /// After a full marking, take the codes it didn't find live out of
-    /// use: freed at the next collection that finishes the sweep first.
-    /// A pinned one not found live stays, for its address, but its compiled
-    /// code goes, and what that kept (see `gc::KeptCells`): it can't run
-    /// again, as an unpinned one would be freed (no closure of it, no
-    /// frame, no live function nesting it, which would make one).
+    /// use: freed at the next collection that finishes the sweep first,
+    /// their compiled code now, and what that kept (see `gc::KeptCells`);
+    /// what the JIT found of them is forgotten (their addresses then
+    /// others'). One the JIT took is live while compiled code alive refers
+    /// to it (see `jit::mark_referenced_codes`): it was kept for good (#35).
+    /// A native's stays; and, while a lowering is under way, one the JIT
+    /// took, which it may be inlining. A pinned one not found live has no
+    /// compiled code to drop.
     fn condemn_codes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
-        let (mut live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
-            .into_iter()
-            .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
+        let compiling = crate::jit::compiling();
+        let caches = &self.jit_caches;
+        let (mut live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes).into_iter().partition(|c| {
+            c.pinned.get()
+                || c.mark.load(Relaxed) >= from
+                || compiling && (caches.has(&**c) || c.jit.try_borrow().map_or(true, |j| j.is_some()))
+        });
         // (A function freed is nested only in functions no marking found
         // live, which can't make a closure of it again; but the JIT's
         // analysis of a variable walks a pinned one's nested functions,
         // `jit::variable_assigned`: their entries become null. A freed one
         // can't assign the variable, so its answer stays right.)
+        let mut gone = Vec::new();
         if !dead.is_empty() {
-            let gone: crate::jit::HashSet<*const crate::vm::Code> =
+            let codes: crate::jit::HashSet<*const crate::vm::Code> =
                 dead.iter().map(|c| &**c as *const crate::vm::Code).collect();
             for c in live.iter_mut() {
                 for n in c.closures.iter_mut() {
-                    if gone.contains(n) {
+                    if codes.contains(n) {
                         *n = std::ptr::null();
                     }
                 }
             }
+            self.jit_caches.forget(&codes);
+            self.jitted.retain(|c| !codes.contains(c));
+            for c in &dead {
+                if let Ok(mut j) = c.jit.try_borrow_mut()
+                    && let Some(mut j) = j.take()
+                {
+                    // (Versions calling each other hold each other.)
+                    j.unbind_targets();
+                    gone.push(j);
+                }
+            }
         }
-        let mut gone = Vec::new();
         for c in live.iter().filter(|c| c.mark.load(Relaxed) < from) {
             if let Ok(mut j) = c.jit.try_borrow_mut()
                 && let Some(j) = j.take()

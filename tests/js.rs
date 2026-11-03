@@ -11372,3 +11372,90 @@ out.join(" | ");
         assert_eq!(r.as_deref(), Ok("null | null | false | 4 c c | 1 0 | efg,f,g | true | TypeError | TypeError | false | undefined | true | null"), "tier at {budget}");
     }
 }
+
+/// Code made at run time goes with its last closure, though the JIT took
+/// it (issue #35): a code the JIT compiled, inlined or bound a call to was
+/// kept for good, with its compiled code, the JIT's tables of it and what
+/// those kept. Functions of fresh sources (`new Function`), compiled hot
+/// and dropped, leave a bounded number of codes; a long-lived function
+/// calling functions made at run time, inlining them, each replaced by
+/// another between collections, still runs them right. The sums are what
+/// V8 and SpiderMonkey give.
+#[test]
+fn code_made_at_run_time_is_freed_though_compiled() {
+    let src = r#"
+var out = [];
+var refs = [], sum = 0;
+function round(r) {
+  for (var k = 0; k < 40; k++) {
+    var big = [r, k, 1, 2];
+    var f = new Function("big", "return function (n) { var s = 0; for (var i = 0; i < n; i++) s = (s + big[i & 3] + " + k + ") | 0; return s; };")(big);
+    sum = (sum + f(3000)) | 0;
+    if (k % 10 == 0) refs.push(new WeakRef(big));
+  }
+}
+var g = null, gsum = 0;
+function caller(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + g(i)) | 0; return s; }
+async function main() {
+  for (var r = 0; r < 12; r++) {
+    round(r);
+    g = new Function("x", "return (x * " + (r + 2) + ") & 1023;");
+    gsum = (gsum + caller(5000)) | 0;
+    await null;
+    $262.gc();
+    gsum = (gsum + caller(100)) | 0;
+  }
+  $262.gc();
+  out.push(sum, gsum, refs.filter(function (w) { return w.deref() === undefined; }).length >= 40);
+}
+main();
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let report = cloison::js::compile("out.join(' ')").unwrap();
+    // (The natives' codes, for good.)
+    let natives = Vm::new().code_count();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.run(&module).unwrap();
+        let r = vm.run(&report).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("38160000 30835860 true"), "tier at {budget}");
+        vm.heap.verify();
+        let kept = vm.code_count() - natives;
+        assert!(kept < 100, "{kept} codes kept (tier at {budget})");
+    }
+}
+
+
+/// Versions calling each other, bound to each other's (`CallSite::target`),
+/// hold each other: freeing their functions dropped their compiled state
+/// but not those versions, whose snapshots still named the functions'
+/// codes, freed; the next marking read them (#35, a segfault with every
+/// collection full, of a VM after another's in the same thread). Each
+/// VM's functions compile calling each other, a collection after.
+#[test]
+fn versions_calling_each_other_outlive_no_freed_code() {
+    let src = r#"
+var total = 0;
+function round(r) {
+  var pair = new Function("k", "function even(n) { return n === 0 ? k : odd(n - 1) + 1; }" +
+    "function odd(n) { return n === 0 ? 2 * k : even(n - 1) + 2; }" +
+    "return [even, odd];")(r);
+  for (var i = 0; i < 2000; i++) total = (total + pair[0](i & 31) + pair[1](i & 15)) | 0;
+}
+for (var r = 0; r < 20; r++) {
+  round(r);
+  $262.gc();
+  for (var j = 0; j < 300; j++) new Function("x", "return x + " + j + ";")(j);
+}
+$262.gc();
+total;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [2, 1000, 2, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("2516160"), "tier at {budget}");
+    }
+}

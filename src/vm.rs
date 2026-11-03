@@ -361,11 +361,6 @@ impl Ic {
     };
 }
 
-/// Keep `code` for good (see `Code::pinned`).
-pub(crate) fn pin(code: *const Code) {
-    unsafe { (*code).pinned.set(true) }
-}
-
 /// Over the process: functions loaded with bytecode (compiled up front or
 /// at their first call), their bytecode's bytes, and functions loaded as
 /// stubs not compiled yet (`cloison` prints them with `CLOISON_SIZES` set).
@@ -497,9 +492,9 @@ pub struct Code {
     /// marking is freed (see `Vm::sweep_codes`); the marker thread writes
     /// it too.
     pub(crate) mark: std::sync::atomic::AtomicU32,
-    /// Never freed: a native's, or one the JIT took (compiled, inlined,
-    /// bound to a call site), which compiled code and its tables refer to
-    /// by address.
+    /// Never freed: a native's. (One the JIT took, compiled, inlined or
+    /// bound to a call site, is live while compiled code alive refers to
+    /// it: `jit::mark_referenced_codes`.)
     pub(crate) pinned: Cell<bool>,
     /// Not compiled yet: its bytecode is `CompileLazy`, which compiles
     /// it from this (see `Vm::compile_lazy`).

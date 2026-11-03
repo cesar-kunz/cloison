@@ -11327,3 +11327,44 @@ g2 + " " + a1.length;
         assert_eq!(r.as_deref(), Ok("0 1"), "tier at {budget}");
     }
 }
+
+/// `exec`, `test` and `match` match with the pattern the regexp has once
+/// the input is converted and `lastIndex` read (issue #37: RegExpBuiltinExec
+/// reads the flags and the matcher after `lastIndex`, which may `compile` it
+/// another, as the input's `toString` may): its flags decide where to
+/// look, and its groups the array's. What V8, SpiderMonkey and
+/// JavaScriptCore give.
+#[test]
+fn regexp_exec_matches_with_the_pattern_compiled_by_its_conversions() {
+    let src = r#"
+var out = [];
+var r = /a(b)c/;
+out.push(String(r.exec({ toString() { r.compile("x"); return "abc"; } })));
+var s = /k(\w)/g;
+s.lastIndex = { valueOf() { s.compile("zz", "g"); return 0; } };
+out.push(String(s.exec("xkyk")));
+var t = /q/;
+out.push(t.test({ toString() { t.compile("w"); return "q"; } }));
+var u = /(a)/;
+var m = u.exec({ toString() { u.compile("(a)(b)(?<n>c)"); return "abc"; } });
+out.push(m.length + " " + m[3] + " " + m.groups.n);
+var v = /o/g;
+v.lastIndex = { valueOf() { v.compile("o"); return 5; } };
+var mv = v.exec("foo");
+out.push(mv.index + " " + v.lastIndex);
+var w = /e(f)/;
+w.lastIndex = { valueOf() { w.compile("e(f)(g)"); return 0; } };
+out.push(String("efg".match(w)));
+var f = /b/y;
+f.lastIndex = { valueOf() { f.compile("a", "y"); return 0; } };
+out.push(f.test("ab"));
+out.join(" | ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("null | null | false | 4 c c | 1 0 | efg,f,g | true"), "tier at {budget}");
+    }
+}

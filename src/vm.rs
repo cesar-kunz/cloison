@@ -995,10 +995,12 @@ pub struct Vm {
     /// The modules loaded (see `module`).
     pub(crate) modules: crate::module::Modules,
     /// Compiled regular expressions, by pattern and flags (a literal makes
-    /// a new object each time it runs, sharing one).
+    /// a new object each time it runs, sharing one), while a `RegExp` uses
+    /// one: a full marking drops the others (`Vm::prune_regexps`).
     pub(crate) regexps: HashMap<(String, String), Box<crate::regexp::Regex>>,
     /// The same, by a literal's pattern and flags constants (a `Value`'s
-    /// bits each, kept by its `Code::constants`).
+    /// bits each, kept by its `Code::constants`), while both are live and
+    /// the pattern is in `regexps`.
     pub(crate) regexp_literals: HashMap<(u64, u64), *const crate::regexp::Regex>,
     /// Captures for `exec`, `test`, `match` and `replace` to match into
     /// (taken while in use).
@@ -6177,6 +6179,12 @@ impl Vm {
     /// The functions' codes loaded and not freed (for tests).
     pub fn code_count(&self) -> usize {
         self.codes.len() + self.condemned.len()
+    }
+
+    /// The compiled regular expressions kept (for tests: see
+    /// `Vm::prune_regexps`).
+    pub fn regexp_count(&self) -> usize {
+        self.regexps.len()
     }
 
     /// The entries the weak collections (`WeakMap`s, `WeakSet`s) not yet

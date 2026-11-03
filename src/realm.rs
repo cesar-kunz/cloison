@@ -154,6 +154,13 @@ macro_rules! realm_fields {
                 $(Field::shapes(&self.$name, out);)*
             }
 
+            /// The names it declares (see `Vm::prune_atoms`).
+            pub(crate) fn declared_atoms(&self, f: &mut dyn FnMut(Atom)) {
+                for set in [&self.declared, &self.lexical_declared, &self.script_declared] {
+                    set.iter().for_each(|&a| f(a));
+                }
+            }
+
             /// Each of its intrinsics with `other`'s same one.
             fn pairs(&self, other: &Realm, f: &mut dyn FnMut(Value, Value)) {
                 $(Field::pairs(&self.$name, &other.$name, f);)*

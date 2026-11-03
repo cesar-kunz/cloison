@@ -2142,6 +2142,9 @@ impl Vm {
                     self.mark_live_codes(&mut m, sp, regs, &mut Vec::new());
                 }
             }
+            if full {
+                self.mark_symbol_keys(&mut m);
+            }
             // (Once marking is over: a full one's codes and shapes mark the
             // cells they refer to, a collection only a shape's prototype
             // holds say, whose keys must be pinned if it moves.)
@@ -2149,6 +2152,9 @@ impl Vm {
             if full {
                 let words = self.stack_words(sp, regs);
                 self.prune_regexps(m.mode, &words);
+                self.prune_symbols(m.mode);
+                let color = m.mode.color;
+                self.prune_strings(|v| !v.is_cell() || *crate::heap::meta(v.to_bits() as usize) & COLOR == color);
             }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
@@ -2198,6 +2204,7 @@ impl Vm {
                     }
                 }
                 self.condemn_codes();
+                self.prune_atoms(self.heap.gc.codes_from);
                 // (What the stacks hold, for the versions call sites left.)
                 let words = self.stack_words(sp, regs);
                 crate::jit::free_retired(self, &words);
@@ -2756,6 +2763,22 @@ impl Vm {
             for v in self.named_roots() {
                 m.value(v);
             }
+            // Symbols, by their key atoms (`Vm::symbols`): a full marking
+            // keeps those live shapes have as keys (see `mark_symbol_keys`);
+            // a minor collection all, while a marking runs the young ones
+            // (an old one shaded would be live for the cycle).
+            match m.mode.kind {
+                Kind::Minor => self.symbols.values().for_each(|&o| m.value(crate::object::object_value(o))),
+                Kind::MinorShade => {
+                    for &o in self.symbols.values() {
+                        let v = crate::object::object_value(o);
+                        if self.heap.is_young(v) {
+                            m.value(v);
+                        }
+                    }
+                }
+                _ => {}
+            }
             self.roots_report(m, "named");
             for i in 0..self.handles.len() {
                 m.value(self.handles[i]);
@@ -2993,9 +3016,6 @@ impl Vm {
             for code in self.codes().filter(|c| c.pinned.get()) {
                 self.mark_code_refs(m, code);
             }
-            for v in self.string_constants() {
-                m.value(v);
-            }
             for v in self.registered_symbols() {
                 m.value(v);
             }
@@ -3154,7 +3174,7 @@ impl Vm {
         // hundred: their addresses are copied around (the JIT's feedback
         // keeps the global object's).
         {
-            let mut own: Vec<usize> = Vec::new();
+            let mut own: Vec<usize> = self.symbols.values().map(|&o| o as usize).collect();
             self.named_root_slots(&mut |r| unsafe {
                 match r {
                     Root::Object(a) if !(*a).is_null() => own.push(*a as usize),
@@ -3375,7 +3395,7 @@ impl Vm {
                     trace(&mut fw, p, 0, usize::MAX);
                 }
             });
-            for c in self.collections.iter_mut() {
+            for c in self.collections.iter_mut().chain(self.keyed_strings.iter_mut()) {
                 fw.object(c);
             }
             // The weak collections, and their entries (traced only to their
@@ -3574,6 +3594,61 @@ impl Vm {
         young.retain(|&o| live(o as usize));
         self.collections.append(&mut young);
         self.collections_young = self.collections.len();
+        // The strings keeping their atom: a full marking's live ones' are
+        // used (`Vm::prune_atoms` keeps them; a string asks no more).
+        let from = if minor { self.keyed_young.min(self.keyed_strings.len()) } else { 0 };
+        let mut young = self.keyed_strings.split_off(from);
+        young.retain(|&o| live(o as usize));
+        if !minor {
+            let epoch = self.heap.gc.codes_from;
+            for &o in &young {
+                let a = unsafe { *Object::string_atom(o) } as usize;
+                if let Some(u) = a.checked_sub(1).and_then(|a| self.atom_used.get_mut(a)) {
+                    *u = epoch;
+                }
+            }
+        }
+        self.keyed_strings.append(&mut young);
+        self.keyed_young = self.keyed_strings.len();
+    }
+
+    /// A full marking's shapes found (all, if it doesn't collect them):
+    /// the symbols they have as keys are live (`Vm::symbols` holds them
+    /// weakly: #33), what those refer to too.
+    unsafe fn mark_symbol_keys(&mut self, m: &mut Marking) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.symbols.is_empty() {
+            return;
+        }
+        let from = self.heap.gc.codes_from;
+        let all = !self.heap.gc.shape_cycle;
+        // (Which atoms are symbols', by index: a lookup per key took 11 ms
+        // of each of PdfJS's full collections.)
+        let mut symbol = vec![false; self.atoms.len()];
+        for a in self.symbols.keys() {
+            symbol[a.0 as usize] = true;
+        }
+        let mut found = Vec::new();
+        self.shape_keys(
+            |s| all || s.pinned.get() || s.mark.load(Relaxed) >= from,
+            |a| {
+                if symbol.get(a.0 as usize) == Some(&true) {
+                    found.push(a);
+                }
+            },
+        );
+        for a in found {
+            if let Some(&o) = self.symbols.get(&a) {
+                unsafe { m.value(crate::object::object_value(o)) };
+            }
+        }
+        unsafe { m.drain(&|| false) };
+    }
+
+    /// After a full marking: forget the symbols it didn't find (their
+    /// atoms then freed, see `Vm::prune_atoms`).
+    fn prune_symbols(&mut self, mode: Mode) {
+        self.symbols.retain(|_, &mut o| unsafe { *crate::heap::meta(o as usize) } & COLOR == mode.color);
     }
 
     /// After a full marking, before anything is freed or moved: drop the
@@ -3870,6 +3945,10 @@ impl Vm {
                 }
             }
             self.named_root_slots(f);
+            // (The symbols a full marking found: see `mark_symbol_keys`.)
+            for o in self.symbols.values_mut() {
+                f(Root::Object(o));
+            }
             for v in self.handles.iter_mut().chain(self.kept_alive.iter_mut()) {
                 f(Root::Value(v));
             }

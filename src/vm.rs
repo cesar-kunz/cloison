@@ -681,9 +681,27 @@ pub struct Vm {
     /// (see `Vm::find_transition`): an object given each of many names
     /// in turn (`o["p" + i] = 1`) made adding one search them all.
     wide_transitions: crate::jit::HashMap<(usize, u32, u8), *const Shape>,
-    /// Each atom's name, once (the map's key shares it).
-    atoms: Vec<std::rc::Rc<str>>,
-    atom_ids: HashMap<std::rc::Rc<str>, Atom>,
+    /// Each atom's name, once (the map's key shares it); `None` once freed
+    /// (see `Vm::prune_atoms`), its index then on `atoms_free`.
+    pub(crate) atoms: Vec<Option<std::rc::Rc<str>>>,
+    pub(crate) atom_ids: HashMap<std::rc::Rc<str>, Atom>,
+    /// Each atom's last use (`intern`), by the code epoch then: one a full
+    /// marking finds no table naming, unused since the marking before, is
+    /// freed (Rust code holds an atom across a collection: see
+    /// `Vm::prune_atoms`).
+    pub(crate) atom_used: Vec<u32>,
+    pub(crate) atoms_free: Vec<u32>,
+    /// The strings that keep their atom (`Object::string_atom`), the young
+    /// ones from `keyed_young` on: a full marking keeps the live ones'
+    /// atoms (see `gc::prune_collections`).
+    pub(crate) keyed_strings: Vec<*mut Object>,
+    pub(crate) keyed_young: usize,
+    /// The atoms made with the VM (its builtins' names, its fields'): for
+    /// good.
+    pub(crate) atoms_fixed: usize,
+    /// `CLOISON_GC_ATOMS_POISON`: a freed atom's index isn't used again, and
+    /// its name read panics (for finding what still names one).
+    pub(crate) atoms_poison: bool,
     pub(crate) codes: Vec<Box<Code>>,
     /// Fields that went from `Int` to `Num` whose int32s haven't become
     /// doubles yet (see `int_fields_to_doubles`).
@@ -702,7 +720,9 @@ pub struct Vm {
     /// (a property found nowhere on the chain) is a prototype load from it.
     missing_holder: *mut Object,
     pub(crate) string_shape: *const Shape,
-    /// String constants by contents, so equal literals are one string.
+    /// String constants by contents, so equal literals are one string,
+    /// and keys' strings (`key_string`): while live (see
+    /// `Vm::prune_strings`), a code's kept by its constants.
     strings: HashMap<Vec<u16>, Value>,
     /// Bumped whenever a prototype changes shape; see [`Ic`].
     pub proto_epoch: u32,
@@ -1119,6 +1139,12 @@ impl Vm {
             wide_transitions: Default::default(),
             atoms: Vec::new(),
             atom_ids: HashMap::default(),
+            atom_used: Vec::new(),
+            atoms_free: Vec::new(),
+            keyed_strings: Vec::new(),
+            keyed_young: 0,
+            atoms_fixed: usize::MAX,
+            atoms_poison: std::env::var_os("CLOISON_GC_ATOMS_POISON").is_some(),
             codes: Vec::new(),
             int_fields: Vec::new(),
             code_set: Default::default(),
@@ -1323,6 +1349,7 @@ impl Vm {
         vm.a_input = vm.intern("input");
         vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
         vm.init_realm();
+        vm.atoms_fixed = vm.atoms.len();
         vm
     }
 
@@ -1494,18 +1521,30 @@ impl Vm {
     // ---- Names ----
 
     pub fn intern(&mut self, s: &str) -> Atom {
+        let epoch = crate::gc::code_epoch();
         if let Some(&a) = self.atom_ids.get(s) {
+            self.atom_used[a.0 as usize] = epoch;
             return a;
         }
-        let a = Atom(self.atoms.len() as u32);
         let name: std::rc::Rc<str> = s.into();
-        self.atoms.push(name.clone());
+        let a = match self.atoms_free.pop() {
+            Some(i) => {
+                self.atoms[i as usize] = Some(name.clone());
+                self.atom_used[i as usize] = epoch;
+                Atom(i)
+            }
+            None => {
+                self.atoms.push(Some(name.clone()));
+                self.atom_used.push(epoch);
+                Atom(self.atoms.len() as u32 - 1)
+            }
+        };
         self.atom_ids.insert(name, a);
         a
     }
 
     pub fn atom_name(&self, a: Atom) -> &str {
-        &self.atoms[a.0 as usize]
+        self.atoms[a.0 as usize].as_deref().expect("the name of an atom freed")
     }
 
     // ---- Shapes ----
@@ -1542,6 +1581,88 @@ impl Vm {
         }
         out.retain(|s| !s.is_null());
         out
+    }
+
+    /// The keys of the shapes `which` takes, each table once: a unique
+    /// shape's successors share its keys' table, each its longer prefix
+    /// (an object given 5,000 properties made 5,000 shapes, whose keys
+    /// walked one by one were 12 million).
+    pub(crate) fn shape_keys(&self, which: impl Fn(&Shape) -> bool, mut f: impl FnMut(Atom)) {
+        let mut tables: crate::jit::HashMap<*const Atom, &[Atom]> = Default::default();
+        for s in self.shapes.iter().filter(|s| which(s)) {
+            let keys = s.keys();
+            let t = tables.entry(keys.as_ptr()).or_insert(keys);
+            if keys.len() > t.len() {
+                *t = keys;
+            }
+        }
+        for keys in tables.values() {
+            keys.iter().for_each(|&a| f(a));
+        }
+    }
+
+    /// After a full marking, its codes condemned: free the atoms nothing
+    /// names any more (#33: a property name, a symbol, was kept for good).
+    /// One is named by a live shape's keys or transitions, a code's inline caches' names (which the JIT's code
+    /// takes its names from), a live symbol (`symbols`, its cell's atom),
+    /// a registered symbol, a realm's declarations or a cached `eval`'s;
+    /// one used since the marking before (`intern`) stays, as Rust code
+    /// may hold it, and the VM's own. The tables keyed by atoms forget.
+    /// `from`: the marking's code epoch.
+    pub(crate) fn prune_atoms(&mut self, from: u32) {
+        let n = self.atoms.len();
+        let fixed = self.atoms_fixed.min(n);
+        let since = from.saturating_sub(1);
+        let mut live = vec![false; n];
+        live[..fixed].fill(true);
+        for i in fixed..n {
+            live[i] = self.atoms[i].is_none() || self.atom_used[i] >= since;
+        }
+        let mut keep = |a: Atom| {
+            if let Some(l) = live.get_mut(a.0 as usize) {
+                *l = true;
+            }
+        };
+        // (A dead shape's keys aren't read: no object has it.)
+        self.shape_keys(|_| true, &mut keep);
+        for s in self.shapes.iter() {
+            s.transitions.borrow().iter().for_each(|&(a, _, _)| keep(a));
+        }
+        self.wide_transitions.keys().for_each(|&(_, a, _)| keep(Atom(a)));
+        for c in self.codes.iter().chain(self.condemned.iter()) {
+            c.ic_names.iter().for_each(|&a| keep(a));
+        }
+        self.symbols.keys().for_each(|&a| keep(a));
+        for &o in self.symbol_registry.values() {
+            let a = unsafe { (*o).elems_len };
+            if a != crate::symbol::NO_ATOM {
+                keep(Atom(a));
+            }
+        }
+        for set in [&self.declared, &self.lexical_declared, &self.script_declared] {
+            set.iter().for_each(|&a| keep(a));
+        }
+        for r in &self.realms {
+            r.declared_atoms(&mut keep);
+        }
+        self.eval_cache.values().flatten().for_each(|e| e.declared.iter().for_each(|&a| keep(a)));
+        let mut freed = 0;
+        for (i, &l) in live.iter().enumerate().skip(fixed) {
+            if !l && let Some(name) = self.atoms[i].take() {
+                self.atom_ids.remove(&*name);
+                if !self.atoms_poison {
+                    self.atoms_free.push(i as u32);
+                }
+                freed += 1;
+            }
+        }
+        if freed > 0 {
+            self.forget_lookups();
+            for e in self.mega_stores[1..].iter_mut() {
+                *e = MegaStore::EMPTY;
+            }
+            self.key_cache.clear();
+        }
     }
 
     /// The shapes made, by index (for the collector).
@@ -4088,6 +4209,7 @@ impl Vm {
         // (A cons string flattened by `to_string_units` too.)
         if flat(key) && a.0 < u32::MAX {
             unsafe { *Object::string_atom(as_object(key)) = a.0 + 1 };
+            self.keyed_strings.push(as_object(key));
         }
         Key::Name(a)
     }
@@ -5974,7 +6096,6 @@ impl Vm {
         .chain(self.promise_roots.iter().copied())
         .chain(self.iterator_roots.iter().copied())
         .chain(self.template_cache.values().copied())
-        .chain(self.symbols.values().copied())
         .chain(self.symbol_roots.iter().copied())
         .chain(std::iter::once(self.thrower))
         .chain(self.mapped_args.iter().map(|m| m.o))
@@ -6051,7 +6172,7 @@ impl Vm {
                 f(Root::Object(o));
             }
         }
-        for o in self.template_cache.values_mut().chain(self.symbols.values_mut()) {
+        for o in self.template_cache.values_mut() {
             f(Root::Object(o));
         }
         for m in &mut self.mapped_args {
@@ -6120,13 +6241,15 @@ impl Vm {
     }
 
     /// The string constants' slots.
-    pub(crate) fn string_constant_slots(&mut self) -> impl Iterator<Item = &mut Value> {
-        self.strings.values_mut()
+    /// After a full marking: forget the strings it didn't find (#33: each
+    /// key `for-in`, `Object.keys` and the like made a string of stayed,
+    /// a root of every marking). `live`: a cell found.
+    pub(crate) fn prune_strings(&mut self, live: impl Fn(Value) -> bool) {
+        self.strings.retain(|_, v| live(*v));
     }
 
-    /// The string constants (see [`Vm::string_constant`]).
-    pub(crate) fn string_constants(&self) -> Vec<Value> {
-        self.strings.values().copied().collect()
+    pub(crate) fn string_constant_slots(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.strings.values_mut()
     }
 
     /// `Symbol.for`'s symbols, roots for as long as the agent lives (a
@@ -6195,6 +6318,16 @@ impl Vm {
             + self.field_deps.values().flatten().filter(|&&c| !live(c)).count()
             + self.relied_cells.keys().filter(|&&c| !live(c)).count()
             + self.through_deps.values().flatten().filter(|&&(a, b)| !live(a) || !live(b)).count()
+    }
+
+    /// The atoms not freed (for tests: see `Vm::prune_atoms`).
+    pub fn atom_count(&self) -> usize {
+        self.atoms.iter().filter(|a| a.is_some()).count()
+    }
+
+    /// `CLOISON_GC_ATOMS_POISON` for this VM (for tests).
+    pub fn set_atoms_poison(&mut self, on: bool) {
+        self.atoms_poison = on;
     }
 
     /// The functions' codes loaded and not freed (for tests).

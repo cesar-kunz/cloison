@@ -11211,3 +11211,37 @@ var m = keep[0].exec("xabbbc");
         assert!(vm.regexp_count() < 100, "{} regexps kept", vm.regexp_count());
     }
 }
+
+/// A pattern a builtin holds across user code stays while it does, though
+/// no `RegExp` uses it any more (Codex on #36): `exec` takes its object's
+/// before converting the input, `replace` across its callbacks and `exec`
+/// reading `lastIndex`, and the user code there `compile`s the object
+/// another pattern and collects; that collection dropped the old one
+/// (`Vm::prune_regexps`), the regexps made after took its memory, and the
+/// builtin matched with a freed pattern (a segfault). The new patterns
+/// match as the old ones, so the order the spec reads the matcher in
+/// doesn't change the results: what V8, SpiderMonkey, JavaScriptCore and
+/// QuickJS give.
+#[test]
+fn regexp_patterns_held_by_builtins_survive_a_compile_and_collection() {
+    let src = r#"
+var out = [];
+function churn() { for (var i = 0; i < 3000; i++) new RegExp("z" + i + "(q+)\\d{" + (i % 7) + "}").exec("zq"); }
+var r = /a(b)c/;
+out.push(String(r.exec({ toString() { r.compile("a(b)(?:c)"); $262.gc(); churn(); $262.gc(); return "abc"; } })));
+var g = /(\d)/g, n = 0;
+out.push("1a2b3".replace(g, function (m) { g.compile("(\\d)" + "(?:)".repeat(++n), "g"); $262.gc(); churn(); $262.gc(); return "<" + m + ">"; }));
+var s = /k(\w)/g;
+s.lastIndex = { valueOf() { s.compile("k(\\w)(?:)", "g"); $262.gc(); churn(); $262.gc(); return 0; } };
+out.push(String(s.exec("xkyk")));
+out.join(" | ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("abc,b | <1>a<2>b<3> | ky,y"), "tier at {budget}");
+    }
+}
+

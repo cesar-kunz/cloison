@@ -65,7 +65,7 @@ pub(crate) fn is_symbol(v: Value) -> bool {
 }
 
 /// A symbol's `elems_len` until it is a property key: no atom yet.
-const NO_ATOM: u32 = u32::MAX;
+pub(crate) const NO_ATOM: u32 = u32::MAX;
 
 /// Symbol `v`'s property key, made the first time it is one: then its
 /// atom's symbol (`Vm::symbols`, which keeps it), as `own_keys` gives it.

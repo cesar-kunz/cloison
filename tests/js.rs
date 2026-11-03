@@ -11358,6 +11358,10 @@ out.push(String("efg".match(w)));
 var f = /b/y;
 f.lastIndex = { valueOf() { f.compile("a", "y"); return 0; } };
 out.push(f.test("ab"));
+// (ToString: a symbol throws, as `String(symbol)` doesn't.)
+for (var g of [function () { return /Symbol/.test(Symbol("x")); }, function () { return /Symbol/.exec(Symbol("x")); }])
+  try { out.push(String(g())); } catch (e) { out.push(e.constructor.name); }
+out.push(/a/.test(), String(/undefined/.exec()), /1/.test(1), String(/null/.exec(null)));
 out.join(" | ");
 "#;
     let module = cloison::js::compile(src).unwrap();
@@ -11365,6 +11369,6 @@ out.join(" | ");
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         let r = vm.run(&module).map(display).map_err(|e| e.to_string());
-        assert_eq!(r.as_deref(), Ok("null | null | false | 4 c c | 1 0 | efg,f,g | true"), "tier at {budget}");
+        assert_eq!(r.as_deref(), Ok("null | null | false | 4 c c | 1 0 | efg,f,g | true | TypeError | TypeError | false | undefined | true | null"), "tier at {budget}");
     }
 }

@@ -2658,6 +2658,18 @@ impl Vm {
             }
             self.jit_caches.forget(&codes);
             self.jitted.retain(|c| !codes.contains(c));
+            // (And the field types they took: a field generalizing marks
+            // its dependents' codes, and unbinds the calls into them.)
+            let freed = |c: &usize| codes.contains(&(*c as *const crate::vm::Code));
+            self.relied_cells.retain(|c, _| !freed(c));
+            self.field_deps.retain(|_, deps| {
+                deps.retain(|c| !freed(c));
+                !deps.is_empty()
+            });
+            self.through_deps.retain(|_, calls| {
+                calls.retain(|(caller, callee)| !freed(caller) && !freed(callee));
+                !calls.is_empty()
+            });
             for c in &dead {
                 if let Ok(mut j) = c.jit.try_borrow_mut()
                     && let Some(mut j) = j.take()

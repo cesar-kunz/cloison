@@ -11177,3 +11177,37 @@ r.join(" | ");
     let r = vm.run(&module).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("11 two! 3,4 | 11 two! 3,4 | 11 two! 3,4"));
 }
+
+/// A regular expression's compiled pattern goes with the last `RegExp`
+/// using it (issue #34): `Vm::regexps` kept the pattern of every new
+/// source for good, 10 KiB each. Regexps of 20,000 sources made, run and
+/// dropped leave a handful; the ones still live match after the
+/// collections, as a literal in a function run again does, and a
+/// pattern `compile` gave. What V8, SpiderMonkey and JavaScriptCore give.
+#[test]
+fn regexps_of_new_sources_are_freed_with_their_objects() {
+    let src = r#"
+var keep = [/a(b+)c/g, new RegExp("x(y)z", "i")];
+function lit(s) { return /q(\d+)/.exec(s)[1]; }
+var sum = 0;
+for (var i = 0; i < 20000; i++) {
+  var re = new RegExp("w" + i + "(\\d*)", i & 1 ? "g" : "");
+  sum += re.exec("w" + i + "42")[1].length;
+  if (i % 1000 == 0) { $262.gc(); sum += lit("q" + i).length; }
+}
+var c = /m(n)/;
+c.compile("o(p+)", "g");
+$262.gc();
+keep[0].lastIndex = 1;
+var m = keep[0].exec("xabbbc");
+[sum, m[1], keep[0].lastIndex, keep[1].test("XYZ"), lit("q77"), c.exec("ooppp")[1], c.global].join(" ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("40087 bbb 6 true 77 ppp true"), "tier at {budget}");
+        assert!(vm.regexp_count() < 100, "{} regexps kept", vm.regexp_count());
+    }
+}

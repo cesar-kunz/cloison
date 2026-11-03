@@ -11459,3 +11459,43 @@ total;
         assert_eq!(r.as_deref(), Ok("2516160"), "tier at {budget}");
     }
 }
+
+/// A function the JIT took and freed leaves no table naming it (Codex on
+/// #39): compiled code reading a field records its code as relying on the
+/// field's type (`Vm::field_deps`, `relied_cells`), which the field's
+/// generalizing reads and changes, and the JIT's list of its functions
+/// (`Vm::jitted`); a freed code left there was written to then. Functions
+/// of fresh sources read a long-lived object's field compiled, are freed,
+/// and then the field changes type: what V8 gives.
+#[test]
+fn freed_codes_leave_no_field_dependencies() {
+    let src = r#"
+var obj = { x: 1, y: 2 }, total = 0;
+function round(r) {
+  for (var k = 0; k < 30; k++) {
+    var f = new Function("o", "var s = 0; for (var i = 0; i < 3000; i++) s = (s + o.x + " + k + ") | 0; return s;");
+    total = (total + f(obj)) | 0;
+  }
+}
+for (var r = 0; r < 6; r++) {
+  round(r);
+  $262.gc();
+  $262.gc();
+  for (var j = 0; j < 3000; j++) new Function("a", "return a + " + j + ";")(j);
+  $262.gc();
+}
+obj.x = 1.5;
+obj.x = "s";
+obj.y = {};
+total + " " + obj.x;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("8370000 s"), "tier at {budget}");
+        assert_eq!(vm.codes_named_but_not_live(), 0, "tier at {budget}");
+    }
+}
+

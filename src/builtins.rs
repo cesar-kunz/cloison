@@ -2429,17 +2429,20 @@ fn this_regexp<'a>(this: Value) -> Result<&'a crate::regexp::Regex> {
 /// `lastIndex` if global (then set past the match, or to 0 on none).
 fn regexp_match(vm: &mut Vm, this: Value, re: &crate::regexp::Regex, s: &[u16]) -> Result<Option<crate::regexp::Captures>> {
     let mut caps = Vec::new();
-    Ok(regexp_match_into(vm, this, re, s, &mut caps)?.then_some(caps))
+    Ok(regexp_match_into(vm, this, re, s, &mut caps)?.map(|_| caps))
 }
 
-/// [`regexp_match`] into `caps`: whether it matched.
-fn regexp_match_into(
+/// [`regexp_match`] into `caps`: the pattern that matched, if one did:
+/// `re`, `this`'s pattern, or the one it has after `lastIndex` is read if
+/// that ran user code, which may `compile` it another (RegExpBuiltinExec
+/// reads the flags and the matcher after `lastIndex`: #37).
+fn regexp_match_into<'a>(
     vm: &mut Vm,
     this: Value,
-    re: &crate::regexp::Regex,
+    re: &'a crate::regexp::Regex,
     s: &[u16],
     caps: &mut crate::regexp::Captures,
-) -> Result<bool> {
+) -> Result<Option<&'a crate::regexp::Regex>> {
     let a_last = vm.a_last_index;
     let plain = plain_last_index(vm, this);
     // (`lastIndex` read and converted even when not used.)
@@ -2447,10 +2450,14 @@ fn regexp_match_into(
         Some(o) => unsafe { *Object::slot(o, (*(*o).shape).location(0)) },
         None => vm.get(this, a_last)?,
     };
+    // (Read and converted with no user code run: a data property holding
+    // a number.)
+    let quiet = plain.is_some() && li.is_number();
     let li = if li.is_int32() { li.as_i32_unchecked() as f64 } else { to_number(li) };
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
+    let re = if quiet { re } else { this_regexp(this)? };
     let start = if re.global || re.sticky {
         if li.is_nan() || li < 0.0 { 0 } else { li as usize }
     } else {
@@ -2459,7 +2466,7 @@ fn regexp_match_into(
     // (Stores that throw where `lastIndex` is read-only.)
     if start > s.len() {
         vm.put_key(this, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
-        return Ok(false);
+        return Ok(None);
     }
     let found = re.exec_into(s, start, caps);
     if re.global || re.sticky {
@@ -2469,7 +2476,7 @@ fn regexp_match_into(
             None => vm.put_key(this, crate::vm::Key::Name(a_last), next)?,
         }
     }
-    Ok(found)
+    Ok(found.then_some(re))
 }
 
 /// `this`, a `RegExp`, if its `lastIndex` is still the writable data
@@ -2709,13 +2716,18 @@ fn named_groups(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, u
 }
 
 fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    // (A `RegExp` before the input is converted; its pattern once it is,
+    // if that ran user code.)
     let re = this_regexp(this)?;
+    let x = arg(a, 0);
+    let quiet = string_units(x).is_some();
     // (No argument: "undefined".)
-    let input = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
+    let input = if quiet { x } else { string_fn(vm, Value::UNDEFINED, &[x])? };
+    let re = if quiet { re } else { this_regexp(this)? };
     // Borrowed: strings don't change, and the stack scan keeps `input`.
     let s = units(input);
     with_caps(vm, |vm, caps| {
-        if regexp_match_into(vm, this, re, &s, caps)? {
+        if let Some(re) = regexp_match_into(vm, this, re, &s, caps)? {
             note_legacy(vm, this, input, caps);
             match_array(vm, re, caps, &s, input)
         } else {
@@ -2731,10 +2743,14 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Ok(Value::from_bool(!rx_exec(vm, this, s)?.is_null()));
     }
     let re = this_regexp(this)?;
-    let input = arg(a, 0);
+    let x = arg(a, 0);
+    let quiet = string_units(x).is_some();
+    // (Its pattern once the input is converted, if that ran user code.)
+    let input = if quiet { x } else { string_fn(vm, Value::UNDEFINED, &[x])? };
+    let re = if quiet { re } else { this_regexp(this)? };
     let s = units(input);
     with_caps(vm, |vm, caps| {
-        let found = regexp_match_into(vm, this, re, &s, caps)?;
+        let found = regexp_match_into(vm, this, re, &s, caps)?.is_some();
         if found {
             let input = if string_units(input).is_some() { input } else { string(vm, &s) };
             note_legacy(vm, this, input, caps);
@@ -2884,7 +2900,7 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let input = this_string(vm, this, &s);
     if !re.global {
         return with_caps(vm, |vm, caps| {
-            if regexp_match_into(vm, rv, re, &s, caps)? {
+            if let Some(re) = regexp_match_into(vm, rv, re, &s, caps)? {
                 note_legacy(vm, rv, input, caps);
                 match_array(vm, re, caps, &s, input)
             } else {

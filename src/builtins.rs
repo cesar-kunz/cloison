@@ -2181,6 +2181,9 @@ pub(crate) fn new_regexp(vm: &mut Vm, pattern: &str, flags: &str) -> Result<Valu
             p
         }
     };
+    // (Live in the marking under way: the object made next may be found
+    // only by the next marking, the pattern dropped before.)
+    crate::gc::mark_regexp(re);
     let source = if pattern.is_empty() { "(?:)".to_string() } else { escape_pattern(pattern) };
     let source = str_value(vm, &source);
     Ok(regexp_object(vm, re, source))
@@ -2232,7 +2235,10 @@ fn escape_pattern(pattern: &str) -> String {
 pub(crate) fn regexp_literal(vm: &mut Vm, pattern: Value, flags: Value) -> Result<Value> {
     let key = (pattern.to_bits(), flags.to_bits());
     let re = match vm.regexp_literals.get(&key) {
-        Some(&re) => re,
+        Some(&re) => {
+            crate::gc::mark_regexp(re);
+            re
+        }
         None => {
             let (p, f) = (crate::vm::source_text(&units(pattern)), String::from_utf16_lossy(&units(flags)));
             let made = new_regexp(vm, &p, &f)?;

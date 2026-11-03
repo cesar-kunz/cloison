@@ -49,6 +49,10 @@ pub struct Regex {
     /// (`None` inside: it has instructions that don't compile).
     native: std::cell::OnceCell<Option<Native>>,
     execs: std::cell::Cell<u32>,
+    /// The marking it was last found live in, by a `RegExp` object using
+    /// it or made with it (as a code's `mark`): `Vm::regexps` drops it
+    /// after a full marking that didn't (see `Vm::prune_regexps`).
+    pub(crate) mark: std::sync::atomic::AtomicU32,
 }
 
 /// A run of characters in the pattern's top-level sequence, so in every
@@ -531,6 +535,7 @@ impl Regex {
             literal: None,
             native: Default::default(),
             execs: Default::default(),
+            mark: Default::default(),
         };
         re.prog = Program::compile(&re);
         re.literal = match &re.node {

@@ -2721,8 +2721,8 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = this_regexp(this)?;
     let x = arg(a, 0);
     let quiet = string_units(x).is_some();
-    // (No argument: "undefined".)
-    let input = if quiet { x } else { string_fn(vm, Value::UNDEFINED, &[x])? };
+    // (ToString: no argument is "undefined", a symbol throws.)
+    let input = if quiet { x } else { crate::intrinsics::to_string(vm, x)? };
     let re = if quiet { re } else { this_regexp(this)? };
     // Borrowed: strings don't change, and the stack scan keeps `input`.
     let s = units(input);
@@ -2745,8 +2745,9 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = this_regexp(this)?;
     let x = arg(a, 0);
     let quiet = string_units(x).is_some();
-    // (Its pattern once the input is converted, if that ran user code.)
-    let input = if quiet { x } else { string_fn(vm, Value::UNDEFINED, &[x])? };
+    // (Its pattern once the input is converted, if that ran user code;
+    // ToString: a symbol throws, Codex on #38.)
+    let input = if quiet { x } else { crate::intrinsics::to_string(vm, x)? };
     let re = if quiet { re } else { this_regexp(this)? };
     let s = units(input);
     with_caps(vm, |vm, caps| {

@@ -2711,9 +2711,13 @@ impl Vm {
             }
             self.jit_caches.forget(&codes);
             self.jit_caches.drop_retired_of(&codes);
-            // Their tagged templates' strings arrays: no code makes them
-            // again (#35), freed at the next collection.
-            self.template_cache.retain(|_, (_, c)| !codes.contains(c));
+            // Their tagged templates' strings arrays, once no code whose
+            // site it is lives: none makes them again (#35), freed at the
+            // next collection.
+            self.template_cache.retain(|_, (_, owners)| {
+                owners.retain(|c| !codes.contains(c));
+                !owners.is_empty()
+            });
             self.jitted.retain(|c| !codes.contains(c));
             // (And the field types they took: a field generalizing marks
             // its dependents' codes, and unbinds the calls into them.)

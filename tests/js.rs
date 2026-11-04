@@ -11942,3 +11942,31 @@ out.join(" | ");
     let r = Vm::new().run(&module).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(want), "tier by default");
 }
+
+/// A module run again in a VM loads its codes again, with the same
+/// template sites: a site's strings array is the same for all of them (one
+/// cache entry), and stays while any of them lives. Freeing the code that
+/// made it forgot the entry another still used, whose next call then made
+/// another array (Codex on #46). Three runs, the first two's functions
+/// dropped and their codes freed.
+#[test]
+fn tagged_templates_shared_by_a_module_run_again_stay() {
+    let module = cloison::js::compile(
+        "var fs = globalThis.fs || (globalThis.fs = []); fs.push(function () { return (s => s)`x`; }); fs[fs.length - 1]();",
+    )
+    .unwrap();
+    let drop = cloison::js::compile("var saved = fs[2](); var same = fs[0]() === saved && fs[1]() === saved; fs[0] = fs[1] = null;").unwrap();
+    let gc = cloison::js::compile("$262.gc(); $262.gc();").unwrap();
+    let check = cloison::js::compile("same + ' ' + (fs[2]() === saved)").unwrap();
+    let mut vm = Vm::new();
+    for _ in 0..3 {
+        vm.run(&module).unwrap();
+    }
+    vm.run(&drop).unwrap();
+    let codes = vm.code_count();
+    vm.run(&gc).unwrap();
+    vm.run(&gc).unwrap();
+    assert!(vm.code_count() < codes, "the first run's codes freed ({codes} before)");
+    let r = vm.run(&check).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("true true"));
+}

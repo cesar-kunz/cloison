@@ -950,6 +950,7 @@ handlers! {
         // into JS, is one no collection updates when it moves cells.)
         let args = std::slice::from_raw_parts(regs.add(first), n);
         let f = crate::intrinsics::INTRINSICS[id].1;
+        (*frame_vm(regs)).intrinsic_code = frame_code(regs);
         let r = with_top(regs, None, |vm| f(vm, args));
         next_or_throw!(Op::Intrinsic.size(), r)
     }

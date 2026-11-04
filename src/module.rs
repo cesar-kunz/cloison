@@ -321,7 +321,7 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
             }
             _ => crate::typed::immutable_bytes(vm, &bytes)?,
         };
-        let a = vm.intern("default");
+        let a = vm.intern_name("default");
         vm.set(env, a, v)?;
         info.local_exports.push(("default".into(), "default".into()));
     }
@@ -519,7 +519,7 @@ fn namespace_of(vm: &mut Vm, m: usize, deferred: bool) -> Result<Value> {
     let trap_names = ["get", "set", "has", "deleteProperty", "defineProperty", "getOwnPropertyDescriptor", "ownKeys"];
     for (t, n) in traps.into_iter().zip(trap_names) {
         let f = closure(vm, t, &[Value::from_i32(m as i32), Value::from_bool(deferred)]);
-        let a = vm.intern(n);
+        let a = vm.intern_name(n);
         vm.set(object_value(handler), a, f)?;
     }
     let ns = crate::proxy::create(vm, object_value(target), object_value(handler))?;
@@ -573,7 +573,7 @@ fn binding_value(vm: &mut Vm, res: &Resolution, name: &[u16]) -> Result<Value> {
         Resolution::Ambiguous => return Ok(Value::UNDEFINED),
     };
     let env = rec(vm, k).env;
-    let a = vm.intern(local);
+    let a = vm.intern_name(local);
     let v = vm.get(env, a)?;
     if v == Value::HOLE {
         let n = String::from_utf16_lossy(name);
@@ -1192,7 +1192,7 @@ fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Valu
         if !crate::props::is_object(options) {
             return Err(Error::type_error("The second argument of import() must be an object"));
         }
-        let a_with = vm.intern("with");
+        let a_with = vm.intern_name("with");
         let attrs = vm.get(options, a_with)?;
         if !attrs.is_undefined() {
             if !crate::props::is_object(attrs) {
@@ -1305,7 +1305,7 @@ pub(crate) fn install(vm: &mut Vm, host: *mut Object) {
     let proto = vm.new_object(op);
     let c = vm.native_function("AbstractModuleSource", abstract_source_ctor, 0, any, true);
     crate::builtins::link_constructor(vm, c, proto);
-    let a = vm.intern("AbstractModuleSource");
+    let a = vm.intern_name("AbstractModuleSource");
     vm.add_property_with(host, a, object_value(c), crate::object::DONT_ENUM);
     vm.modules.abstract_source = vec![object_value(c), object_value(proto)];
 }

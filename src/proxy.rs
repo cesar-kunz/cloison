@@ -108,7 +108,7 @@ fn trap(vm: &mut Vm, h: Value, name: &str) -> Result<Option<Value>> {
     if crate::stack::low() {
         return Err(Error::range_error("Maximum call stack size exceeded"));
     }
-    let a = vm.intern(name);
+    let a = vm.intern_name(name);
     let m = vm.get(h, a)?;
     if m.is_undefined() || m.is_null() {
         return Ok(None);
@@ -192,7 +192,7 @@ fn proxy_revocable(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     set_slot(r, 0, p);
     let out = object_value(vm.new_object(object_value(vm.object_prototype)));
-    let (a_proxy, a_revoke) = (vm.intern("proxy"), vm.intern("revoke"));
+    let (a_proxy, a_revoke) = (vm.intern_name("proxy"), vm.intern_name("revoke"));
     vm.create_data_property(out, Key::Name(a_proxy), p)?;
     vm.create_data_property(out, Key::Name(a_revoke), object_value(r))?;
     Ok(out)
@@ -521,7 +521,7 @@ fn from_partial_descriptor(vm: &mut Vm, d: &Desc) -> Value {
     ];
     for (name, v) in fields {
         if let Some(v) = v {
-            let a = vm.intern(name);
+            let a = vm.intern_name(name);
             let _ = vm.create_data_property(o, Key::Name(a), v);
         }
     }

@@ -79,7 +79,7 @@ fn options(v: Value) -> Result<Option<Value>> {
 /// if undefined), or a TypeError for anything else.
 fn choice(vm: &mut Vm, opts: Option<Value>, name: &str, allowed: &[&str]) -> Result<usize> {
     let Some(o) = opts else { return Ok(0) };
-    let a = vm.intern(name);
+    let a = vm.intern_name(name);
     let v = vm.get(o, a)?;
     if v.is_undefined() {
         return Ok(0);
@@ -275,7 +275,7 @@ fn written(vm: &mut Vm, o: *mut Object, d: Decoded) -> Result<Value> {
         return Err(e);
     }
     let r = object_value(vm.new_object(object_value(vm.object_prototype)));
-    let (a_read, a_written) = (vm.intern("read"), vm.intern("written"));
+    let (a_read, a_written) = (vm.intern_name("read"), vm.intern_name("written"));
     vm.create_data_property(r, Key::Name(a_read), Value::number(d.read as f64))?;
     vm.create_data_property(r, Key::Name(a_written), Value::number(d.bytes.len() as f64))?;
     Ok(r)
@@ -308,7 +308,7 @@ fn to_base64(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let alphabet = if url_alphabet(vm, opts)? { URL } else { STANDARD };
     let omit_padding = match opts {
         Some(o) => {
-            let a = vm.intern("omitPadding");
+            let a = vm.intern_name("omitPadding");
             to_boolean(vm.get(o, a)?)
         }
         None => false,

@@ -649,7 +649,7 @@ extern "C" fn cloison_rt_delete(a: Value, b: Value) -> u64 {
 extern "C" fn cloison_rt_delete_global(_: Value, b: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = crate::js::lex::units_to_string(crate::vm::string_units(b).unwrap_or(&[]));
-    let a = vm.intern(&name);
+    let a = vm.intern_name(&name);
     Value::from_bool(vm.delete_global(a)).to_bits()
 }
 

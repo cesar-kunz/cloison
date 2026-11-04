@@ -2127,26 +2127,12 @@ impl Vm {
             } else {
                 m.drain(&|| false)
             };
-            // (The weak collections' entries, once what is live is known.)
-            self.ephemerons(&mut m);
+            // (The weak collections' entries, once what is live is known:
+            // in a full marking, with its live codes and shapes.)
+            self.ephemerons(&mut m, sp, regs);
             if kind == Collection::Minor && self.heap.gc.check_barriers {
                 self.heap.check_barriers();
             }
-            if full {
-                if self.heap.gc.shape_cycle {
-                    let mut t = std::time::Instant::now();
-                    self.mark_live_codes_and_shapes(&mut m, sp, regs);
-                    self.heap.gc.shape_phases.mark = crate::gc::lap(&mut t);
-                    self.heap.gc.shape_phases.any = true;
-                } else {
-                    self.mark_live_codes(&mut m, sp, regs, &mut Vec::new());
-                }
-            }
-            if full {
-                self.mark_symbol_keys(&mut m);
-            }
-            // (Their weak collections' entries were judged with the
-            // symbols the shapes traced had: see `ephemerons`.)
             // (Once marking is over: a full one's codes and shapes mark the
             // cells they refer to, a collection only a shape's prototype
             // holds say, whose keys must be pinned if it moves.)
@@ -2340,28 +2326,59 @@ impl Vm {
     /// roots reach: the value of each entry whose key is live marked (and
     /// what that reaches, which may make other keys live, until none
     /// does), then the entries of keys not live cleared; collections not
-    /// live leave `weak_tables`. A minor collection keeps old cells, and
-    /// the keys an old collection's entries refer to were marked from its
-    /// dirty cards: it clears young collections' entries only.
-    unsafe fn ephemerons(&mut self, m: &mut Marking) {
-        if self.weak_tables.is_empty() {
-            return;
-        }
-        let mode = m.mode;
-        let live = |p: usize| unsafe {
-            let b = *crate::heap::meta(p);
-            match mode.kind {
-                Kind::Minor | Kind::MinorShade => b != YOUNG,
-                _ => b & COLOR == mode.color,
-            }
-        };
+    /// live leave `weak_tables`. A full marking finds its live codes and
+    /// shapes with them, before any entry is cleared: those mark cells
+    /// (shapes' prototypes, what an inline cache's holder refers to), one
+    /// a key or a collection (a typed array of a resizable buffer's views,
+    /// a collection only a shape's prototype holds), and entries' values
+    /// make codes live, until neither marks more (the review of #40). A
+    /// minor collection keeps old cells, and the keys an old collection's
+    /// entries refer to were marked from its dirty cards: it clears young
+    /// collections' entries only.
+    unsafe fn ephemerons(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
+        let full = m.mode.kind == Kind::Full;
         // The live collections, found as they become live: one may be
         // reached only through another's value (`m.set(k, new WeakMap)`).
         let mut tables: Vec<*mut Object> = Vec::new();
         let mut found = vec![false; self.weak_tables.len()];
-        // The entries of each live collection: its buffer, its length, and
-        // its entries' width.
-        let entries = |t: *mut Object| unsafe {
+        loop {
+            if full {
+                unsafe { self.mark_codes_and_shapes(m, sp, regs) };
+            }
+            if !unsafe { self.ephemeron_values(m, &mut found, &mut tables) } || !full {
+                break;
+            }
+        }
+        unsafe { self.ephemeron_clear(m.mode, &tables) };
+        self.weak_tables = tables;
+    }
+
+    /// A full marking's live codes, and shapes if it collects them (see
+    /// `mark_live_codes_and_shapes`).
+    unsafe fn mark_codes_and_shapes(&mut self, m: &mut Marking, sp: usize, regs: *mut Value) {
+        if self.heap.gc.shape_cycle {
+            let mut t = std::time::Instant::now();
+            unsafe { self.mark_live_codes_and_shapes(m, sp, regs) };
+            self.heap.gc.shape_phases.mark += crate::gc::lap(&mut t);
+            self.heap.gc.shape_phases.any = true;
+        } else {
+            unsafe { self.mark_live_codes(m, sp, regs, &mut Vec::new()) };
+        }
+    }
+
+    /// Whether a cell at `p` is live for marking mode `mode`.
+    fn ephemeron_live(mode: Mode, p: usize) -> bool {
+        let b = unsafe { *crate::heap::meta(p) };
+        match mode.kind {
+            Kind::Minor | Kind::MinorShade => b != YOUNG,
+            _ => b & COLOR == mode.color,
+        }
+    }
+
+    /// The entries of weak collection `t`: its buffer, its length, and its
+    /// entries' width.
+    unsafe fn ephemeron_entries(t: *mut Object) -> Option<(*mut Value, usize, usize)> {
+        unsafe {
             let e = Value::from_bits((*t).code as u64);
             if !e.is_cell() {
                 return None;
@@ -2369,7 +2386,18 @@ impl Vm {
             let e = crate::object::as_object(e);
             let s = if matches!((*t).class, Class::WeakMap | Class::FinalizationRegistry) { 2 } else { 1 };
             Some(((*e).elems, (*e).elems_len as usize, s))
-        };
+        }
+    }
+
+    /// [`ephemerons`]' marking: the collections that became live (`found`,
+    /// by index in `weak_tables`) joined `tables`, the values of live keys
+    /// marked, and in a full marking the symbols live shapes have as keys
+    /// (which may be keys here, or lead to more: Codex on #40), until none
+    /// is. Whether it marked one.
+    unsafe fn ephemeron_values(&mut self, m: &mut Marking, found: &mut [bool], tables: &mut Vec<*mut Object>) -> bool {
+        let mode = m.mode;
+        let live = |p: usize| Self::ephemeron_live(mode, p);
+        let mut any = false;
         unsafe {
             loop {
                 let mut more = false;
@@ -2379,8 +2407,8 @@ impl Vm {
                         tables.push(t);
                     }
                 }
-                for &t in &tables {
-                    let Some((buf, len, 2)) = entries(t) else { continue };
+                for &t in tables.iter() {
+                    let Some((buf, len, 2)) = Self::ephemeron_entries(t) else { continue };
                     let mut i = crate::collections::BASE;
                     while i + 1 < len {
                         let (k, v) = (*buf.add(i), *buf.add(i + 1));
@@ -2391,22 +2419,29 @@ impl Vm {
                         i += 2;
                     }
                 }
-                // (And the symbols the live shapes have as keys, which may
-                // be keys here, or lead to more: Codex on #40.)
                 if mode.kind == Kind::Full && self.mark_symbol_keys(m) {
                     more = true;
                 }
                 if !more {
                     break;
                 }
+                any = true;
                 m.drain(&|| false);
             }
-            for &t in &tables {
-                let Some((buf, len, s)) = entries(t) else { continue };
+        }
+        any
+    }
+
+    /// [`ephemerons`]' clearing: the entries of `tables` whose key isn't
+    /// live.
+    unsafe fn ephemeron_clear(&mut self, mode: Mode, tables: &[*mut Object]) {
+        unsafe {
+            for &t in tables {
+                let Some((buf, len, s)) = Self::ephemeron_entries(t) else { continue };
                 let mut i = crate::collections::BASE;
                 while i + s <= len {
                     let k = *buf.add(i);
-                    if k.is_cell() && !live(k.to_bits() as usize) {
+                    if k.is_cell() && !Self::ephemeron_live(mode, k.to_bits() as usize) {
                         for j in 0..s {
                             *buf.add(i + j) = Value::EMPTY;
                         }
@@ -2417,7 +2452,6 @@ impl Vm {
                 }
             }
         }
-        self.weak_tables = tables;
     }
 
     /// Debugging (`CLOISON_GC_ROOTS`): trace what the roots marked so far

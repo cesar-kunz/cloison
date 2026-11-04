@@ -2519,9 +2519,7 @@ impl Vm {
         let from = self.heap.gc.codes_from;
         unsafe {
             let stack = self.stack.as_ptr() as usize;
-            let stack_end = self.stack_end as usize;
-            let top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
-            let top = (top + 8 * self.max_frame).clamp(stack, stack_end);
+            let top = self.vm_stack_top(sp, regs);
             for a in (sp..self.heap.gc.stack_base).step_by(8).chain((stack..top).step_by(8)) {
                 let w = *(a as *const usize);
                 if self.code_set.contains(&w) {
@@ -2757,15 +2755,30 @@ impl Vm {
         self.condemned.extend(dead);
     }
 
+    /// The end of the deepest frame there may be on the VM stack, as
+    /// `mark_roots` finds it: past `regs`, `osr_regs`, `native_top` and
+    /// any VM stack address a native stack word holds (with `regs` null, a
+    /// runtime call from compiled code, the frames are known only there).
+    unsafe fn vm_stack_top(&self, sp: usize, regs: *mut Value) -> usize {
+        let stack = self.stack.as_ptr() as usize;
+        let stack_end = self.stack_end as usize;
+        let mut top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
+        for a in (sp..self.heap.gc.stack_base).step_by(8) {
+            let w = unsafe { *(a as *const usize) };
+            if (stack..stack_end).contains(&w) {
+                top = top.max(w);
+            }
+        }
+        (top + 8 * self.max_frame).clamp(stack, stack_end)
+    }
+
     /// The words of the native stack, from `sp`, and of the VM stack, to
     /// the end of the deepest frame there may be (as `mark_live_codes`
     /// reads them).
     unsafe fn stack_words(&self, sp: usize, regs: *mut Value) -> Vec<usize> {
         unsafe {
             let stack = self.stack.as_ptr() as usize;
-            let stack_end = self.stack_end as usize;
-            let top = (regs as usize).max(self.osr_regs as usize).max(self.native_top as usize);
-            let top = (top + 8 * self.max_frame).clamp(stack, stack_end);
+            let top = self.vm_stack_top(sp, regs);
             (sp..self.heap.gc.stack_base).step_by(8).chain((stack..top).step_by(8)).map(|a| *(a as *const usize)).collect()
         }
     }

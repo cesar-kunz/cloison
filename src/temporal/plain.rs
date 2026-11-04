@@ -86,7 +86,7 @@ fn round_options(vm: &mut Vm, v: Value) -> Result<Value> {
     }
     if string_units(v).is_some() {
         let o = object_value(vm.new_object(Value::NULL));
-        let a = vm.intern("smallestUnit");
+        let a = vm.intern_name("smallestUnit");
         vm.add_property(as_object(o), a, v);
         return Ok(o);
     }

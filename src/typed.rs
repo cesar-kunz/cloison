@@ -331,7 +331,7 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let options = arg(a, 1);
     let mut max = None;
     if is_object(options) {
-        let a_max = vm.intern("maxByteLength");
+        let a_max = vm.intern_name("maxByteLength");
         let m = vm.get(options, a_max)?;
         if !m.is_undefined() {
             max = Some(to_index(vm, m)?);
@@ -750,7 +750,7 @@ fn iterate_with(vm: &mut Vm, v: Value, m: Value) -> Result<Vec<Value>> {
         return Err(Error::type_error("Result of the Symbol.iterator method is not an object"));
     }
     vm.handles.push(it);
-    let a_next = vm.intern("next");
+    let a_next = vm.intern_name("next");
     let next = vm.get(it, a_next)?;
     vm.handles.push(next);
     let mut out = Vec::new();
@@ -1357,7 +1357,7 @@ fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn typed_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let (o, len) = validate(this)?;
     let mut out = Vec::new();
-    let a_tls = vm.intern("toLocaleString");
+    let a_tls = vm.intern_name("toLocaleString");
     for i in 0..len {
         if i > 0 {
             out.push(b',' as u16);
@@ -1448,7 +1448,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
     vm.define_native(shared, "values", typed_iterator::<1>, 0, any, false);
     // (`toString` is `Array.prototype.toString` itself.)
-    let a_to_string = vm.intern("toString");
+    let a_to_string = vm.intern_name("toString");
     let to_string = vm.get(object_value(vm.array_prototype), a_to_string).unwrap_or(Value::UNDEFINED);
     vm.add_property_with(shared, a_to_string, to_string, DONT_ENUM);
     getter(vm, shared, "buffer", typed_buffer);
@@ -1469,7 +1469,7 @@ pub(crate) fn install(vm: &mut Vm) {
         typed_ctor::<10>,
         typed_ctor::<11>,
     ];
-    let a_bpe = vm.intern("BYTES_PER_ELEMENT");
+    let a_bpe = vm.intern_name("BYTES_PER_ELEMENT");
     for (k, kind) in TypedKind::ALL.iter().enumerate() {
         let proto = vm.new_object(object_value(shared));
         let c = vm.define_native(g, kind.name(), CTORS[k], 3, any, true);
@@ -1491,7 +1491,7 @@ pub(crate) fn install(vm: &mut Vm) {
 /// `[@@toStringTag]`, `ArrayBuffer.prototype[@@toStringTag]`.
 pub(crate) fn install_symbols(vm: &mut Vm) {
     let shared = as_object(unsafe { (*(*vm.typed_prototypes[0]).shape).proto });
-    let a_values = vm.intern("values");
+    let a_values = vm.intern_name("values");
     let values = vm.get(object_value(shared), a_values).unwrap_or(Value::UNDEFINED);
     let a_iter = vm.a_sym_iterator;
     vm.add_property_with(shared, a_iter, values, DONT_ENUM);

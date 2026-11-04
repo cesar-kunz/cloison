@@ -48,7 +48,7 @@ pub(crate) fn install(vm: &mut Vm) {
             ("with", array_with, 2),
         ],
     );
-    let a_array = vm.intern("Array");
+    let a_array = vm.intern_name("Array");
     let array = as_object(vm.get(object_value(vm.global), a_array).unwrap());
     vm.define_natives(
         array,
@@ -137,7 +137,7 @@ fn key(i: f64) -> Key {
         Key::Index(i as u32)
     } else {
         let vm = unsafe { &mut *crate::interp::current_vm() };
-        Key::Name(vm.intern(&format!("{i}")))
+        Key::Name(vm.intern_name(&format!("{i}")))
     }
 }
 
@@ -228,7 +228,7 @@ fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
         }
     }
     if crate::props::is_object(c) {
-        let a_species = vm.intern(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
+        let a_species = vm.intern_name(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
         c = vm.get(c, a_species)?;
         if c.is_null() {
             c = Value::UNDEFINED;
@@ -254,7 +254,7 @@ fn spreadable(vm: &mut Vm, v: Value) -> Result<bool> {
     if !crate::props::is_object(v) {
         return Ok(false);
     }
-    let a = vm.intern(&format!("{}Symbol.isConcatSpreadable", crate::symbol::SYMBOL_MARK));
+    let a = vm.intern_name(&format!("{}Symbol.isConcatSpreadable", crate::symbol::SYMBOL_MARK));
     let s = vm.get(v, a)?;
     if !s.is_undefined() {
         return Ok(to_boolean(s));
@@ -378,12 +378,12 @@ fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// where there is no callable `join`.
 fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = object_value(vm.to_object(this)?);
-    let a_join = vm.intern("join");
+    let a_join = vm.intern_name("join");
     let f = vm.get(o, a_join)?;
     if is_callable(f) {
         return call_function(vm, f, o, &[]);
     }
-    let a = vm.intern("toString");
+    let a = vm.intern_name("toString");
     let op = object_value(vm.object_prototype);
     let f = vm.get(op, a)?;
     call_function(vm, f, o, &[])
@@ -398,7 +398,7 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> R
     }
     vm.handle_scope(|vm| {
         vm.handles.extend([Value::HOLE, o]);
-        let a_tls = vm.intern("toLocaleString");
+        let a_tls = vm.intern_name("toLocaleString");
         let mut out: Vec<u16> = Vec::new();
         let mut i = 0.0;
         while i < len {
@@ -1240,7 +1240,7 @@ fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 vm.handles.push(f);
                 natives.push(f);
             }
-            let a_async = vm.intern(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
+            let a_async = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
             natives.push(crate::symbol::atom_symbol(vm, a_async).expect("Symbol.asyncIterator"));
             natives.push(crate::symbol::atom_symbol(vm, vm.a_sym_iterator).expect("Symbol.iterator"));
             call_function(vm, make, Value::UNDEFINED, &natives)

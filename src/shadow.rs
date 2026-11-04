@@ -32,7 +32,7 @@ fn arg(a: &[Value], i: usize) -> Value {
 }
 
 fn hidden_key(vm: &mut Vm) -> Key {
-    Key::Name(vm.intern("\u{FDD0}ShadowRealm"))
+    Key::Name(vm.intern_name("\u{FDD0}ShadowRealm"))
 }
 
 pub(crate) fn install(vm: &mut Vm) {

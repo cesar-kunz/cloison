@@ -55,18 +55,18 @@ pub(crate) fn install(vm: &mut Vm) -> Result<()> {
     let sc = vm.define_native(g, "SuppressedError", suppressed_error_ctor, 3, any, true);
     link_constructor(vm, sc, sep);
     // (Its prototype is `Error`, as the other kinds'.)
-    let a_error = vm.intern("Error");
+    let a_error = vm.intern_name("Error");
     let error = vm.get(object_value(g), a_error)?;
     vm.set_prototype_of(sc, error);
-    let (a_name, a_message) = (vm.intern("name"), vm.intern("message"));
+    let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = str_value(vm, "SuppressedError");
     vm.add_property_with(sep, a_name, name, DONT_ENUM);
     let empty = str_value(vm, "");
     vm.add_property_with(sep, a_message, empty, DONT_ENUM);
 
     // `DisposableStack` and `AsyncDisposableStack`.
-    let a_dispose = vm.intern(&format!("{mark}Symbol.dispose"));
-    let a_async_dispose = vm.intern(&format!("{mark}Symbol.asyncDispose"));
+    let a_dispose = vm.intern_name(&format!("{mark}Symbol.dispose"));
+    let a_async_dispose = vm.intern_name(&format!("{mark}Symbol.asyncDispose"));
     let a_tag = vm.a_sym_to_string_tag;
     let dsp = vm.new_object(op);
     let dc = vm.define_native(g, "DisposableStack", stack_ctor::<false>, 0, any, true);
@@ -174,7 +174,7 @@ pub(crate) fn is_empty(state: Value) -> bool {
 
 /// GetMethod(v, `key`): undefined if absent, a TypeError if not callable.
 fn get_method(vm: &mut Vm, v: Value, key: &str) -> Result<Value> {
-    let a = vm.intern(&format!("{}Symbol.{key}", crate::symbol::SYMBOL_MARK));
+    let a = vm.intern_name(&format!("{}Symbol.{key}", crate::symbol::SYMBOL_MARK));
     let m = vm.get(v, a)?;
     if m.is_undefined() || m.is_null() {
         return Ok(Value::UNDEFINED);
@@ -231,7 +231,7 @@ fn suppressed_error(vm: &mut Vm, error: Value, suppressed: Value) -> Value {
     let proto = root(vm, Root::SuppressedErrorPrototype);
     let o = vm.new_object(proto);
     unsafe { (*o).flags |= crate::object::ERROR };
-    let (a_error, a_suppressed) = (vm.intern("error"), vm.intern("suppressed"));
+    let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
     vm.add_property_with(o, a_error, error, DONT_ENUM);
     vm.add_property_with(o, a_suppressed, suppressed, DONT_ENUM);
     object_value(o)
@@ -356,10 +356,10 @@ fn suppressed_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let o = vm.new_object(proto);
     unsafe { (*o).flags |= crate::object::ERROR };
     if let Some(m) = message {
-        let a_message = vm.intern("message");
+        let a_message = vm.intern_name("message");
         vm.add_property_with(o, a_message, m, DONT_ENUM);
     }
-    let (a_error, a_suppressed) = (vm.intern("error"), vm.intern("suppressed"));
+    let (a_error, a_suppressed) = (vm.intern_name("error"), vm.intern_name("suppressed"));
     vm.add_property_with(o, a_error, arg(a, 0), DONT_ENUM);
     vm.add_property_with(o, a_suppressed, arg(a, 1), DONT_ENUM);
     Ok(object_value(o))
@@ -488,7 +488,7 @@ fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
 /// `%IteratorPrototype%[Symbol.dispose]()`: `this.return()`, if it has
 /// one.
 fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let a = vm.intern("return");
+    let a = vm.intern_name("return");
     let m = vm.get(this, a)?;
     if !m.is_undefined() && !m.is_null() {
         call_function(vm, m, this, &[])?;
@@ -500,7 +500,7 @@ fn iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `this.return()` settling (to undefined), if it has one.
 fn async_iterator_dispose(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let r = (|| -> Result<Value> {
-        let a = vm.intern("return");
+        let a = vm.intern_name("return");
         let m = vm.get(this, a)?;
         if m.is_undefined() || m.is_null() {
             return Ok(Value::UNDEFINED);

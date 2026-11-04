@@ -418,7 +418,7 @@ impl Vm {
                         return Some(Desc::data(v, flags & FROZEN == 0, true, flags & SEALED == 0));
                     }
                     if flags & SPARSE != 0 {
-                        let a = self.intern(&i.to_string());
+                        let a = self.intern_name(&i.to_string());
                         return self.own_named(o, a);
                     }
                     None
@@ -781,13 +781,13 @@ impl Vm {
                     }
                     let plain = full.attrs() == 0 && (*o).flags & (SEALED | FROZEN) == 0;
                     let named = (*o).flags & SPARSE != 0 && {
-                        let a = self.intern(&i.to_string());
+                        let a = self.intern_name(&i.to_string());
                         (*(*o).shape).lookup(a).is_some()
                     };
                     let far = class != Class::Array && self.sparse_key(o, i);
                     if plain && !far {
                         if named {
-                            let a = self.intern(&i.to_string());
+                            let a = self.intern_name(&i.to_string());
                             self.delete_named(o, a);
                         }
                         self.set_element(o, i, full.value.unwrap());
@@ -812,7 +812,7 @@ impl Vm {
                     if !far {
                         self.slow_elements(o);
                     }
-                    let a = self.intern(&i.to_string());
+                    let a = self.intern_name(&i.to_string());
                     self.store_named(o, a, full);
                     Ok(true)
                 }
@@ -1019,7 +1019,7 @@ impl Vm {
                         return true;
                     }
                     if (*o).flags & SPARSE != 0 {
-                        let a = self.intern(&i.to_string());
+                        let a = self.intern_name(&i.to_string());
                         return self.delete_named(o, a);
                     }
                     true
@@ -1335,7 +1335,7 @@ impl Vm {
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = vm.object_prototype;
-    let a_object = vm.intern("Object");
+    let a_object = vm.intern_name("Object");
     let object = as_object(vm.get(object_value(g), a_object).unwrap());
     vm.define_natives(
         object,
@@ -1379,7 +1379,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
     let get = vm.native_function("get __proto__", object_get_proto, 0, crate::jit::Ty::Any, false);
     let set = vm.native_function("set __proto__", object_set_proto, 1, crate::jit::Ty::Any, false);
-    let a = vm.intern("__proto__");
+    let a = vm.intern_name("__proto__");
     vm.define_accessor(op, a, Some(object_value(get)), Some(object_value(set)), DONT_ENUM);
 }
 

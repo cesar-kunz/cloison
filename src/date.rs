@@ -81,7 +81,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
     // `toGMTString` is the very function `toUTCString` is (Annex B).
     let f = vm.define_native(dp, "toUTCString", to_utc_string, 0, any, false);
-    let a = vm.intern("toGMTString");
+    let a = vm.intern_name("toGMTString");
     vm.add_property_with(dp, a, object_value(f), DONT_ENUM);
 }
 
@@ -333,7 +333,7 @@ pub(crate) fn date_to_primitive(vm: &mut Vm, this: Value, a: &[Value]) -> Result
         _ => return Err(Error::type_error("Invalid hint")),
     };
     for name in order {
-        let a = vm.intern(name);
+        let a = vm.intern_name(name);
         let m = vm.get(this, a)?;
         if crate::props::is_callable(m) {
             let r = crate::interp::call_function(vm, m, this, &[])?;
@@ -722,7 +722,7 @@ fn to_json(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if tv.is_number() && !tv.as_number().unwrap().is_finite() {
         return Ok(Value::NULL);
     }
-    let a = vm.intern("toISOString");
+    let a = vm.intern_name("toISOString");
     let f = vm.get(this, a)?;
     call_function(vm, f, this, &[])
 }

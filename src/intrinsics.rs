@@ -361,7 +361,7 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         crate::vm::array_push(vm, raw, &[pair[1]])?;
     }
     vm.seal(as_object(raw), true);
-    let a_raw = vm.intern("raw");
+    let a_raw = vm.intern_name("raw");
     let d = Desc {
         value: Some(raw),
         writable: Some(false),
@@ -475,7 +475,7 @@ fn class_setup(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         (p, h)
     };
     let proto = object_value(vm.new_object(proto_parent));
-    let a_constructor = vm.intern("constructor");
+    let a_constructor = vm.intern_name("constructor");
     let d = Desc::data(f, true, false, true);
     vm.define_own_property(as_object(proto), Key::Name(a_constructor), &d)?;
     let a_prototype = vm.a_prototype;
@@ -807,7 +807,7 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
-                std::mem::take(&mut module.declared).iter().map(|n| vm.intern(n)).collect();
+                std::mem::take(&mut module.declared).iter().map(|n| vm.intern_name(n)).collect();
             // (Its `var`s are the scope objects', not globals.)
             let code = vm.load(module);
             let e = crate::vm::EvalCode {
@@ -908,7 +908,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), &bound).map_err(eval_error)?;
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
-                std::mem::take(&mut module.declared).iter().map(|n| vm.intern(n)).collect();
+                std::mem::take(&mut module.declared).iter().map(|n| vm.intern_name(n)).collect();
             // (In parameters' defaults, a `var arguments` is an error; a
             // `var` by a block-scoped binding's name, but a catch
             // parameter's, is.)
@@ -1076,7 +1076,7 @@ fn with_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !vm.has_property(o, k)? {
         return Ok(Value::FALSE);
     }
-    let au = vm.intern(&format!("{}Symbol.unscopables", crate::symbol::SYMBOL_MARK));
+    let au = vm.intern_name(&format!("{}Symbol.unscopables", crate::symbol::SYMBOL_MARK));
     let u = vm.get(o, au)?;
     if crate::props::is_object(u) {
         let blocked = vm.get_keyed(u, k)?;
@@ -1162,7 +1162,7 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Resu
     let (it, next) = crate::symbol::record_parts(record);
     let m = match mode {
         crate::generator::THROW | crate::generator::RETURN => {
-            let atom = vm.intern(if mode == crate::generator::THROW { "throw" } else { "return" });
+            let atom = vm.intern_name(if mode == crate::generator::THROW { "throw" } else { "return" });
             vm.get(it, atom)?
         }
         _ => next,
@@ -1186,7 +1186,7 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Resu
 
 /// Whether iterator result `[r]` is done.
 fn delegate_done(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let a_done = vm.intern("done");
+    let a_done = vm.intern_name("done");
     let d = vm.get(a[0], a_done)?;
     Ok(Value::from_bool(crate::interp::to_boolean(d)))
 }
@@ -1397,7 +1397,7 @@ fn async_gen_yield(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// `[v]`'s `Symbol.asyncIterator` method, if it has one.
 fn async_iterator_method(vm: &mut Vm, v: Value) -> Result<Option<Value>> {
-    let a = vm.intern(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
+    let a = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     let o = object_value(vm.to_object(v)?);
     let m = vm.get(o, a)?;
     Ok((!m.is_undefined() && !m.is_null()).then_some(m))
@@ -1441,7 +1441,7 @@ fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !crate::props::is_object(r) {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
     }
-    let a_done = vm.intern("done");
+    let a_done = vm.intern_name("done");
     if crate::interp::to_boolean(vm.get(r, a_done)?) {
         return Ok(Value::HOLE);
     }
@@ -1453,7 +1453,7 @@ fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// gives (awaited after), or `undefined` without one.
 fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let it = iterator_of(a[0]);
-    let a_return = vm.intern("return");
+    let a_return = vm.intern_name("return");
     let m = vm.get(it, a_return)?;
     if m.is_undefined() || m.is_null() {
         return Ok(Value::UNDEFINED);

@@ -109,7 +109,7 @@ fn round_options(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     }
     if string_units(v).is_some() {
         let o = object_value(vm.new_object(Value::NULL));
-        let a = vm.intern(name);
+        let a = vm.intern_name(name);
         vm.add_property(as_object(o), a, v);
         return Ok(o);
     }
@@ -663,7 +663,7 @@ fn to_temporal_instant(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 pub(crate) fn install_now(vm: &mut Vm, temporal: *mut Object) {
     let op = object_value(vm.object_prototype);
     let now = vm.new_object(op);
-    let a = vm.intern("Now");
+    let a = vm.intern_name("Now");
     vm.add_property_with(temporal, a, object_value(now), crate::object::DONT_ENUM);
     vm.define_natives(
         now,

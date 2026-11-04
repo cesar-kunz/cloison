@@ -187,6 +187,9 @@ pub const LENGTH_LOC: i32 = i32::MIN;
 /// `far`).
 pub(crate) const MAX_ELEMENTS: usize = 1 << 28;
 
+/// An atom's `Vm::atom_used` once `Vm::intern` gave it: kept for good.
+const PINNED_ATOM: u32 = u32::MAX;
+
 /// The most object keys `Vm::key_cache` holds.
 pub(crate) const KEY_CACHE: usize = 32;
 
@@ -685,7 +688,8 @@ pub struct Vm {
     /// (see `Vm::prune_atoms`), its index then on `atoms_free`.
     pub(crate) atoms: Vec<Option<std::rc::Rc<str>>>,
     pub(crate) atom_ids: HashMap<std::rc::Rc<str>, Atom>,
-    /// Each atom's last use (`intern`), by the code epoch then: one a full
+    /// Each atom's last use (`intern_name`), by the code epoch then, or
+    /// `PINNED_ATOM` once `intern` gave it: one a full
     /// marking finds no table naming, unused since the marking before, is
     /// freed (Rust code holds an atom across a collection: see
     /// `Vm::prune_atoms`).
@@ -1327,26 +1331,26 @@ impl Vm {
         };
         let budget = vm.frame_budget;
         vm.set_tier_back_edges(budget);
-        vm.a_prototype = vm.intern("prototype");
-        vm.a_constructor = vm.intern("constructor");
-        vm.a_length = vm.intern("length");
-        vm.a_name = vm.intern("name");
-        vm.a_value = vm.intern("value");
-        vm.a_writable = vm.intern("writable");
-        vm.a_enumerable = vm.intern("enumerable");
-        vm.a_configurable = vm.intern("configurable");
-        vm.a_get = vm.intern("get");
-        vm.a_set = vm.intern("set");
-        vm.a_to_string = vm.intern("toString");
-        vm.a_value_of = vm.intern("valueOf");
-        vm.a_last_index = vm.intern("lastIndex");
-        vm.a_bound_target = vm.intern("\u{FDD0}BoundTarget");
-        vm.a_source = vm.intern("source");
-        vm.a_global = vm.intern("global");
-        vm.a_ignore_case = vm.intern("ignoreCase");
-        vm.a_multiline = vm.intern("multiline");
-        vm.a_index = vm.intern("index");
-        vm.a_input = vm.intern("input");
+        vm.a_prototype = vm.intern_name("prototype");
+        vm.a_constructor = vm.intern_name("constructor");
+        vm.a_length = vm.intern_name("length");
+        vm.a_name = vm.intern_name("name");
+        vm.a_value = vm.intern_name("value");
+        vm.a_writable = vm.intern_name("writable");
+        vm.a_enumerable = vm.intern_name("enumerable");
+        vm.a_configurable = vm.intern_name("configurable");
+        vm.a_get = vm.intern_name("get");
+        vm.a_set = vm.intern_name("set");
+        vm.a_to_string = vm.intern_name("toString");
+        vm.a_value_of = vm.intern_name("valueOf");
+        vm.a_last_index = vm.intern_name("lastIndex");
+        vm.a_bound_target = vm.intern_name("\u{FDD0}BoundTarget");
+        vm.a_source = vm.intern_name("source");
+        vm.a_global = vm.intern_name("global");
+        vm.a_ignore_case = vm.intern_name("ignoreCase");
+        vm.a_multiline = vm.intern_name("multiline");
+        vm.a_index = vm.intern_name("index");
+        vm.a_input = vm.intern_name("input");
         vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
         vm.init_realm();
         vm.atoms_fixed = vm.atoms.len();
@@ -1405,7 +1409,7 @@ impl Vm {
         // The constructors, with `prototype` and `constructor` links.
         let g = vm.global;
         for (name, v) in [("NaN", Value::from_f64(f64::NAN)), ("Infinity", Value::from_f64(f64::INFINITY)), ("undefined", Value::UNDEFINED)] {
-            let a = vm.intern(name);
+            let a = vm.intern_name(name);
             vm.add_property_with(
                 g,
                 a,
@@ -1442,7 +1446,7 @@ impl Vm {
         );
         vm.define_native(ap, "indexOf", crate::array::array_index_of, 1, crate::jit::Ty::I32, false);
         let math = vm.new_object_with(Class::Plain, op, 16);
-        let a = vm.intern("Math");
+        let a = vm.intern_name("Math");
         vm.add_property_with(g, a, object_value(math), DONT_ENUM);
         for (name, v) in [
             ("E", std::f64::consts::E),
@@ -1453,7 +1457,7 @@ impl Vm {
             ("LOG10E", std::f64::consts::LOG10_E),
             ("SQRT2", std::f64::consts::SQRT_2),
         ] {
-            let a = vm.intern(name);
+            let a = vm.intern_name(name);
             vm.add_property_with(
                 math,
                 a,
@@ -1520,10 +1524,24 @@ impl Vm {
 
     // ---- Names ----
 
+    /// The atom of name `s`, for good: a caller outside the VM may hold it
+    /// across any collection (Codex on #40; the VM's own use `intern_name`,
+    /// which the collector frees once nothing names: see `prune_atoms`).
     pub fn intern(&mut self, s: &str) -> Atom {
+        let a = self.intern_name(s);
+        self.atom_used[a.0 as usize] = PINNED_ATOM;
+        a
+    }
+
+    /// The atom of name `s`, used now: freed once nothing names it and it
+    /// went unused since the marking before (see `prune_atoms`).
+    pub(crate) fn intern_name(&mut self, s: &str) -> Atom {
         let epoch = crate::gc::code_epoch();
         if let Some(&a) = self.atom_ids.get(s) {
-            self.atom_used[a.0 as usize] = epoch;
+            let used = &mut self.atom_used[a.0 as usize];
+            if *used != PINNED_ATOM {
+                *used = epoch;
+            }
             return a;
         }
         let name: std::rc::Rc<str> = s.into();
@@ -1606,8 +1624,8 @@ impl Vm {
     /// One is named by a live shape's keys or transitions, a code's inline caches' names (which the JIT's code
     /// takes its names from), a live symbol (`symbols`, its cell's atom),
     /// a registered symbol, a realm's declarations or a cached `eval`'s;
-    /// one used since the marking before (`intern`) stays, as Rust code
-    /// may hold it, and the VM's own. The tables keyed by atoms forget.
+    /// one used since the marking before (`intern_name`) stays, as Rust
+    /// code may hold it, and the VM's own, and one `intern` gave (for good). The tables keyed by atoms forget.
     /// `from`: the marking's code epoch.
     pub(crate) fn prune_atoms(&mut self, from: u32) {
         let n = self.atoms.len();
@@ -3807,7 +3825,7 @@ impl Vm {
     /// `object::SPARSE`), if it has it: a getter's gets `receiver` (`o`, or
     /// an object `o` is a prototype of).
     fn sparse_get(&mut self, o: *mut Object, i: u32, receiver: Value) -> Result<Option<Value>> {
-        let a = self.intern(&i.to_string());
+        let a = self.intern_name(&i.to_string());
         unsafe {
             let Some(slot) = (*(*o).shape).lookup(a) else {
                 return Ok(None);
@@ -3827,7 +3845,7 @@ impl Vm {
                 && string_units(wrapped(object_value(o)).unwrap()).is_some_and(|u| (i as usize) < u.len())
             || crate::far::is_far(o) && crate::far::has(o, i)
             || unsafe { (*o).flags & crate::object::SPARSE != 0 && {
-                let a = self.intern(&i.to_string());
+                let a = self.intern_name(&i.to_string());
                 (*(*o).shape).lookup(a).is_some()
             } }
     }
@@ -4205,7 +4223,7 @@ impl Vm {
         // (A lone surrogate kept, as the front end keeps it in a literal:
         // `js::lex::units_to_string`.)
         let name = crate::js::lex::units_to_string(&units);
-        let a = self.intern(&name);
+        let a = self.intern_name(&name);
         // (A cons string flattened by `to_string_units` too.)
         if flat(key) && a.0 < u32::MAX {
             unsafe { *Object::string_atom(as_object(key)) = a.0 + 1 };
@@ -4481,7 +4499,7 @@ impl Vm {
             // map keyed by numbers): a named property, not as many holes.
             if (*o).class != Class::Array && self.sparse_key(o, i) {
                 (*o).flags |= crate::object::SPARSE;
-                let a = self.intern(&i.to_string());
+                let a = self.intern_name(&i.to_string());
                 return self.set(obj, a, value);
             }
             // (A new element: a prototype's setter or read-only one may
@@ -4555,7 +4573,7 @@ impl Vm {
         unsafe {
             let flags = (*o).flags;
             if flags & SPARSE != 0 {
-                let a = self.intern(&i.to_string());
+                let a = self.intern_name(&i.to_string());
                 if (*(*o).shape).lookup(a).is_some() {
                     return self.set(obj, a, value);
                 }
@@ -4597,7 +4615,7 @@ impl Vm {
                 return Ok(());
             }
             if flags & SPARSE != 0 {
-                let a = self.intern(&i.to_string());
+                let a = self.intern_name(&i.to_string());
                 if (*(*o).shape).lookup(a).is_some() {
                     return self.set(obj, a, value);
                 }
@@ -5205,7 +5223,7 @@ impl Vm {
         constructs: bool,
     ) -> *mut Object {
         let fo = self.native_function(name, f, nparams, ret, constructs);
-        let a = self.intern(name);
+        let a = self.intern_name(name);
         // Builtins' methods aren't enumerable.
         self.add_property_with(obj, a, object_value(fo), DONT_ENUM);
         fo
@@ -5219,7 +5237,7 @@ impl Vm {
         let mut values = Vec::with_capacity(fs.len());
         for &(name, f, n) in fs {
             let fo = self.native_function(name, f, n, crate::jit::Ty::Any, false);
-            names.push(self.intern(name));
+            names.push(self.intern_name(name));
             values.push(object_value(fo));
         }
         self.add_properties(obj, &names, &values, DONT_ENUM);
@@ -5627,7 +5645,7 @@ impl Vm {
     /// block-scoped one (a SyntaxError, before it runs).
     pub(crate) fn declare_script(&mut self, module: &Module) -> Result<()> {
         for n in &module.lexical {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             if self.declared.contains(&a) || self.lexical_declared.contains(&a) {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
             }
@@ -5638,18 +5656,18 @@ impl Vm {
             }
         }
         for n in &module.declared {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             if self.lexical_declared.contains(&a) {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
             }
         }
         self.global_declarations(module, false)?;
         for n in &module.lexical {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             self.lexical_declared.insert(a);
         }
         for n in &module.declared {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             self.script_declared.insert(a);
         }
         Ok(())
@@ -5666,7 +5684,7 @@ impl Vm {
         let g = self.global;
         let extensible = Self::is_extensible(g);
         for n in &module.declared {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             let function = module.function_names.contains(n);
             let ok = match self.own_property(g, Key::Name(a)) {
                 None => extensible,
@@ -5685,7 +5703,7 @@ impl Vm {
         // read-only property): its own property now, for stores not to
         // reach theirs.
         for n in &module.declared {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             if !module.function_names.contains(n)
                 && unsafe { (*(*g).shape).lookup(a).is_none() }
                 && self.lookup(g, a).is_some()
@@ -5696,7 +5714,7 @@ impl Vm {
             }
         }
         for n in &module.function_names {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             if let Some(d) = self.own_property(g, Key::Name(a))
                 && d.configurable == Some(true)
             {
@@ -5710,7 +5728,7 @@ impl Vm {
             let functions = module.function_names.iter();
             let vars = module.declared.iter().filter(|n| !module.function_names.contains(n));
             for n in functions.chain(vars) {
-                let a = self.intern(n);
+                let a = self.intern_name(n);
                 if unsafe { (*(*g).shape).lookup(a).is_none() } {
                     self.declare_global(a, attrs);
                 }
@@ -5750,7 +5768,7 @@ impl Vm {
     /// Load `module`'s functions; returns its top-level code.
     pub fn load(&mut self, module: Module) -> *const Code {
         for n in &module.declared {
-            let a = self.intern(n);
+            let a = self.intern_name(n);
             self.declared.insert(a);
         }
         let script = module.script;
@@ -5803,7 +5821,7 @@ impl Vm {
                 // at each run.)
                 let interpreted = !f.handlers.is_empty() || scan.callee || f.lazy.is_some();
                 let only_interpreted = scan.callee || f.lazy.is_some();
-                let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern(n)).collect();
+                let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern_name(n)).collect();
                 let constants: Box<[Value]> = f
                     .constants
                     .iter()

@@ -3637,7 +3637,11 @@ impl Vm {
         for a in self.symbols.keys() {
             symbol[a.0 as usize] = true;
         }
-        let mut found = Vec::new();
+        // (A running native's atoms too: its key list may name a symbol no
+        // live object has any more, which it then reads, see
+        // `Vm::held_atoms`.)
+        let mut found: Vec<crate::object::Atom> =
+            self.held_atoms.iter().copied().filter(|a| symbol.get(a.0 as usize) == Some(&true)).collect();
         self.shape_keys(
             |s| all || s.pinned.get() || s.mark.load(Relaxed) >= from,
             |a| {

@@ -11624,6 +11624,49 @@ var h = wm.get(s);
     }
 }
 
+/// An atom a native took stays while the native runs (Codex on #40): it
+/// may hold it across user code that collects again and again, while
+/// nothing else names it, which freed it (its name then read panicking, or
+/// its index another name's). `defineProperty` converts its key before
+/// its descriptor's getters run, `JSON.parse` takes an object's keys
+/// before its reviver deletes one. Both give what V8 and SpiderMonkey do,
+/// with freed atoms poisoned too; the previous commit named the property
+/// another name (`q3_2998`), or panicked poisoned. (The reviver's key it
+/// got right by chance: a string of the name stayed reachable, which kept
+/// its atom.)
+#[test]
+fn atoms_a_native_holds_outlive_its_callbacks() {
+    let src = r#"
+function churn() {
+  for (var i = 0; i < 4; i++) {
+    for (var j = 0; j < 3000; j++) { var t = {}; t["q" + i + "_" + j] = j; }
+    $262.gc();
+  }
+}
+var out = [];
+var o = {};
+var key = { toString() { return "fresh" + (1e6 + 7); } };
+Object.defineProperty(o, key, { get value() { churn(); return 7; }, enumerable: true });
+var k = Object.keys(o);
+out.push(k.length + " " + k[0] + " " + o[k[0]]);
+var seen = [];
+JSON.parse('{"a":1,"zq' + (1e6 + 8) + '":2}', function (k, v) {
+  if (k === "a") { delete this[Object.keys(this)[1]]; churn(); }
+  seen.push(k);
+  return v;
+});
+out.push(seen.join(","));
+out.join(" | ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for poison in [false, true] {
+        let mut vm = Vm::new();
+        vm.set_atoms_poison(poison);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("1 fresh1000007 7 | a,zq1000008,"), "poison {poison}");
+    }
+}
+
 /// An atom `Vm::intern` gave stays its name for good (Codex on #40): a
 /// caller outside the VM may hold it across any collection, which freed it
 /// once a marking found nothing naming it and it had gone unused (its name

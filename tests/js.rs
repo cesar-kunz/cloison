@@ -12044,3 +12044,128 @@ fn tagged_templates_held_outlive_their_codes() {
     let r = vm.run(&check).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("true"));
 }
+
+
+/// `Object.freeze(arguments)` edge cases (#14's follow-ups to #8):
+/// duplicate parameters, parameters written after the freeze, deleted and
+/// recreated indices, accessors on mapped and unmapped indices, an index
+/// unmapped by a non-writable definition, an object escaped and frozen
+/// from outside while its frame runs, freezing twice and after sealing,
+/// writes in sloppy and strict code, and a hot function freezing its
+/// `arguments` across collections. What SpiderMonkey and JavaScriptCore
+/// give (V8 leaves an accessor at index 3 out of
+/// `getOwnPropertyNames`), compiled at once or not.
+#[test]
+fn frozen_arguments_edge_cases() {
+    let src = r#"
+var out = [];
+function j(o) { try { return JSON.stringify(Object.getOwnPropertyNames(o).map(function (k) { var d = Object.getOwnPropertyDescriptor(o, k); return k + ":" + ("value" in d ? (typeof d.value === "function" ? "fn" : String(d.value)) : "acc") + (d.writable ? "w" : "") + (d.configurable ? "c" : "") + (d.enumerable ? "e" : ""); })); } catch (e) { return "E:" + e.constructor.name; } }
+// Duplicate parameter names (sloppy): the last one is mapped.
+function dup(a, a) { Object.freeze(arguments); a = 9; return [arguments[0], arguments[1], a, Object.isFrozen(arguments)].join(); }
+out.push(dup(1, 2));
+// Frozen, then parameters written: the elements keep their values.
+function wr(a, b) { Object.freeze(arguments); a = 5; b = 6; return [arguments[0], arguments[1], a, b].join(); }
+out.push(wr(1, 2));
+// Deleted and recreated indices, then frozen.
+function del(a, b) { delete arguments[0]; arguments[0] = 7; a = 8; Object.freeze(arguments); return [arguments[0], a, arguments[1], j(arguments)].join("|"); }
+out.push(del(1, 2));
+// An accessor on a mapped index, and on one past the parameters.
+function acc(a) { Object.defineProperty(arguments, "0", { get: function () { return "g"; }, configurable: true }); Object.defineProperty(arguments, "3", { get: function () { return "h"; }, configurable: true }); Object.freeze(arguments); a = 4; return [arguments[0], arguments[3], a, j(arguments)].join("|"); }
+out.push(acc(1, 2));
+// Unmapped by a non-writable definition, then frozen.
+function unm(a, b) { Object.defineProperty(arguments, "1", { writable: false }); b = 3; Object.freeze(arguments); return [arguments[1], b].join(); }
+out.push(unm(1, 2));
+// Escaped while its frame runs, frozen from outside, then written inside.
+var esc;
+function outer(a) { esc = arguments; inner(); a = 10; return [esc[0], a, Object.isFrozen(esc)].join(); }
+function inner() { Object.freeze(esc); }
+out.push(outer(1));
+// Frozen twice, and frozen after sealed.
+function twice(a) { Object.freeze(arguments); Object.freeze(arguments); a = 2; return [arguments[0], a].join(); }
+out.push(twice(1));
+function sealed(a) { Object.seal(arguments); a = 2; var x = arguments[0]; Object.freeze(arguments); a = 3; return [x, arguments[0], a, Object.isSealed(arguments), Object.isFrozen(arguments)].join(); }
+out.push(sealed(1));
+// Writes to a frozen arguments object: ignored in sloppy, throwing in strict.
+function sw(a) { Object.freeze(arguments); arguments[0] = 5; arguments[5] = 1; return [arguments[0], arguments.length, 5 in arguments].join(); }
+out.push(sw(1));
+function st(a) { "use strict"; Object.freeze(arguments); try { arguments[0] = 5; return "no"; } catch (e) { return e.constructor.name + arguments[0]; } }
+out.push(st(1));
+// Hot, many calls, with collections between: old-to-young references.
+function hot(a, b) { Object.freeze(arguments); a = { v: b }; return arguments[0] + arguments[1].v; }
+var s = 0;
+for (var k = 0; k < 20000; k++) { s += hot(k % 7, { v: k % 3 }); if (k % 5000 == 0 && typeof $262 != "undefined") $262.gc(); }
+out.push(s);
+out.join(" ; ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let want = r#"1,2,9,true ; 1,2,5,6 ; 7|8|2|["0:7e","1:2e","length:2","callee:fn"] ; g|h|4|["0:acce","1:2e","3:acc","length:2","callee:fn"] ; 2,3 ; 1,10,true ; 1,2 ; 2,2,3,true,true ; 1,1,false ; TypeError1 ; 79996"#;
+    for budget in [i64::MAX, 1, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
+    }
+}
+
+
+/// `+` converts its operands left to right, each once (ToPrimitive with
+/// hint "default": `Symbol.toPrimitive`, else `valueOf` then `toString`),
+/// a failed left conversion running nothing of the right's; then a string
+/// or a number (or a BigInt) sum. Conversions that throw, return symbols,
+/// objects or BigInts, allocate, reenter `+`, or split a surrogate pair;
+/// each case interpreted, then hot, the same. Then whole concatenations
+/// (appending and prepending, of strings, pairs, lone surrogates and
+/// primitives) against `join`'s, not just their lengths (#14's follow-ups
+/// to #9). What V8, SpiderMonkey and JavaScriptCore give.
+#[test]
+fn addition_converts_left_to_right_and_concatenates_whole() {
+    let src = r#"
+var out = [], log = [];
+function P(name, v) { var o = {}; o[Symbol.toPrimitive] = function (h) { log.push(name + ":" + h); return v; }; return o; }
+function V(name, v) { return { valueOf: function () { log.push(name + ".valueOf"); return v; }, toString: function () { log.push(name + ".toString"); return "s" + v; } }; }
+function T(name) { return { valueOf: function () { log.push(name + ".throws"); throw new Error(name); } }; }
+function run(f) { log = []; var r; try { r = String(f()); } catch (e) { r = "E:" + (e instanceof TypeError ? "TypeError" : e.message); } return r + "[" + log.join(",") + "]"; }
+var cases = [
+  function () { return P("a", 1) + P("b", 2); },
+  function () { return P("a", "x") + 1; },
+  function () { return 1 + P("b", "y"); },
+  function () { return V("a", 3) + V("b", 4); },
+  function () { return V("a", 3) + "z"; },
+  function () { return T("a") + P("b", 2); },
+  function () { return P("a", 1) + T("b"); },
+  function () { var o = { get x() { log.push("get"); throw new Error("g"); } }; return o.x + P("b", 1); },
+  function () { return new Date(0) + 1 === new Date(0).toString() + "1"; },
+  function () { return P("a", Symbol.iterator) + ""; },
+  function () { return P("a", {}) + 1; },
+  function () { var big = P("a", 1n); return big + 2n; },
+  function () { return P("a", 1n) + 2; },
+  function () { var i = 0; var o = { valueOf: function () { log.push("v" + i); return i++; } }; return o + o + o; },
+  function () { var s = ""; var o = { toString: function () { log.push("ts"); return "\ud83d"; } }; s = o + "\ude00"; return s.length + ":" + s.codePointAt(0).toString(16); },
+  function () { var o = { valueOf: function () { log.push("alloc"); return new Array(1000).fill("q").join(""); } }; return (o + o).length; },
+  function () { var o = { valueOf: function () { log.push("reenter"); return [1, 2] + [3]; } }; return o + 1; },
+];
+// Each case interpreted, then hot (compiled), and the same answers.
+for (var c of cases) {
+  var first = run(c), hot = first;
+  for (var k = 0; k < 3000; k++) { var r = run(c); if (r !== first) hot = "DIFF " + r; }
+  out.push(first + (hot === first ? "" : " " + hot));
+}
+// Whole concatenations, not just their lengths: ropes of both orders.
+var a = "", b = "", parts = ["x", "😀", "é", "\ud800", "\udc00", "z", 7, true, null, undefined, 1.5];
+for (var k = 0; k < 4000; k++) { var p = parts[k % parts.length]; a = a + p; b = p + b; }
+var ea = [], eb = [];
+for (var k = 0; k < 4000; k++) ea.push(String(parts[k % parts.length]));
+for (var k = 3999; k >= 0; k--) eb.push(String(parts[k % parts.length]));
+out.push(a === ea.join("") && b === eb.join("") ? "concat ok " + a.length : "concat BAD");
+out.push([a.indexOf("😀"), a.lastIndexOf("\udc00"), a.charCodeAt(4000), b.slice(-20), (a + b).length].join(","));
+out.join(" ; ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let want = "3[a:default,b:default] ; x1[a:default] ; 1y[b:default] ; 7[a.valueOf,b.valueOf] ; 3z[a.valueOf] ; E:a[a.throws] ; E:b[a:default,b.throws] ; E:g[get] ; true[] ; E:TypeError[a:default] ; E:TypeError[a:default] ; 3[a:default] ; E:TypeError[a:default] ; 3[v0,v1,v2] ; 2:1f600[ts] ; 2000[alloc,alloc] ; 1,231[reenter] ; concat ok 10172 ; 1,10169,100,inednulltrue7z��é😀x,20344";
+    for budget in [i64::MAX, 1, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
+    }
+}

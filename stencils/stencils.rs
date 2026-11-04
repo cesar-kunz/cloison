@@ -179,6 +179,7 @@ unsafe extern "C" {
     fn cloison_rt_create_closure();
     fn cloison_rt_delete();
     fn cloison_rt_create_arguments();
+    fn cloison_rt_arguments_of();
     fn cloison_rt_create_closure_local();
     fn cloison_rt_close_upvalues();
     fn cloison_rt_delete_global();
@@ -2433,6 +2434,19 @@ stencil!("close_upvalues"; |s| {
 // from its call's arguments: see `jit::Lowering::emit_frame`.)
 stencil!("create_arguments"; |s| {
     s.acc = Value::from_bits(rt_call!(s, cloison_rt_create_arguments, Value::from_bits(s.regs as u64), Value::UNDEFINED));
+    next!(s)
+});
+
+// An inlined frame's `arguments`, from the array of its call's arguments
+// in `acc`: the runtime's, its function the 64-bit immediate, or (0) the
+// one in the frame's header, `imm64b` bytes from the registers (written
+// by the guard of a function inlined by its code).
+stencil!("arguments_of"; |s| {
+    let f = match imm64() {
+        0 => *((s.regs as *const u8).offset(imm64b() as i64 as isize) as *const u64),
+        f => f,
+    };
+    s.acc = Value::from_bits(rt_call!(s, cloison_rt_arguments_of, s.acc, Value::from_bits(f)));
     next!(s)
 });
 

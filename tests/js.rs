@@ -11793,3 +11793,48 @@ bad.length + " " + bad.join(" ");
 "#;
     assert_eq!(value(src), "0 ");
 }
+
+/// An inlined function's `arguments` is an arguments object (#41): the
+/// JIT made it an array of the call's arguments, with no `callee` and
+/// `Array.isArray`, so a function calling itself through
+/// `arguments.callee` threw once compiled. Its function is the frame's,
+/// known or (inlined by its code) the one its guard checked; a strict
+/// one's `callee` throws. Interpreted, compiled at once or not, and by
+/// default: what V8 and SpiderMonkey give.
+#[test]
+fn inlined_frames_arguments_are_arguments_objects() {
+    let src = r#"
+var out = [];
+function f(n) { var s = 0; for (var i = 0; i < 200; i++) s += i; return n <= 0 ? s : arguments.callee(n - 1) + 1; }
+var t = 0;
+for (var k = 0; k < 3000; k++) t += f(3);
+out.push(t);
+var fs = [];
+for (var j = 0; j < 4; j++) fs.push((function (j) { return function (a) { return arguments.callee; }; })(j));
+function run(f, k) { return f(k) === f; }
+var seen = {};
+for (var k = 0; k < 20000; k++) seen[run(fs[k % 4], k)] = 1;
+out.push(Object.keys(seen).join());
+function s(a) { "use strict"; return Object.getOwnPropertyNames(arguments).join(); }
+function st(a) { "use strict"; try { arguments.callee; } catch (e) { return e instanceof TypeError; } }
+function sl(a) { return Object.prototype.toString.call(arguments); }
+function g(a) { return Array.isArray(arguments) + typeof arguments.push + arguments.length + arguments[1]; }
+function h() {
+  var o = {};
+  for (var k = 0; k < 20000; k++) { o[s(1, 2)] = 1; o[st()] = 1; o[sl(k)] = 1; o[g(k, "x")] = 1; }
+  return Object.keys(o).join(" ");
+}
+out.push(h());
+out.join(" | ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let want = "59709000 | true | 0,1,length,callee true [object Arguments] falseundefined2x";
+    for budget in [i64::MAX, 1, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
+    }
+    let r = Vm::new().run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok(want), "tier by default");
+}

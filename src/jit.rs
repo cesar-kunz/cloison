@@ -643,7 +643,8 @@ extern "C" fn cloison_rt_arguments_of(array: Value, func: Value) -> u64 {
     unsafe {
         let vm = &mut *crate::interp::current_vm();
         let a = crate::object::as_object(array);
-        let values = std::slice::from_raw_parts((*a).elems, (*a).elems_len as usize);
+        let values =
+            if (*a).elems_len == 0 { &[][..] } else { std::slice::from_raw_parts((*a).elems, (*a).elems_len as usize) };
         crate::builtins::arguments_object_of(vm, values, func.to_bits() as *mut Object).to_bits()
     }
 }
@@ -10824,6 +10825,24 @@ struct InlineFrame {
     /// The last pc where it finds its arguments through its header, if
     /// any ([`frame_args_upto`]).
     frame_args: Option<usize>,
+    /// Its `arguments` kept the array of its call's arguments: the
+    /// registers holding it (see [`Lowering::array_arguments`]).
+    array_args: Option<ArgsRegs>,
+}
+
+/// The registers of an inlined frame (its own numbering) that hold its
+/// `arguments`, kept an array: an exit makes it an arguments object in
+/// those the interpreter reads ([`materialize`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ArgsRegs {
+    regs: [u8; 4],
+    n: u8,
+}
+
+impl ArgsRegs {
+    fn has(&self, r: usize) -> bool {
+        self.regs[..self.n as usize].iter().any(|&x| x as usize == r)
+    }
 }
 
 /// Where the registers of frames inlined into `f` start: past its own
@@ -11878,6 +11897,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
                 args: (0, 0),
                 extra: 0,
                 frame_args: None,
+                array_args: None,
             }],
             fbs: Vec::new(),
             sites: Vec::new(),
@@ -14339,9 +14359,11 @@ impl Lowering<'_> {
                 // (an exit in it does it again in the interpreter, from the
                 // frame's call), then made the frame's `arguments` by the
                 // runtime (`arguments_of`): an array is not one, it has no
-                // `callee` (#41) and is `Array.isArray`; in the compiled
-                // function's own, from the runtime (`create_arguments`).
-                // (Not where `acc` lives on.)
+                // `callee` (#41) and is `Array.isArray`; kept the array
+                // where only its length and elements are read (see
+                // `array_arguments`). In the compiled function's own, from
+                // the runtime (`create_arguments`). (Not where `acc` lives
+                // on.)
                 Op::CreateArguments if acc_out[k] => {
                     i.bail = true;
                     self.push(i, Prop::None);
@@ -14359,6 +14381,9 @@ impl Lowering<'_> {
                             let mut push = synth(Op::Call, r, frame, i.pc);
                             (push.reg2, push.imm, push.native, push.own_push) = (r, 0, 1, true);
                             self.push(push, Prop::None);
+                        }
+                        if self.out.frames[frame].array_args.is_some() {
+                            continue;
                         }
                         self.push(synth(Op::Ldar, r, frame, i.pc), Prop::None);
                         let f = self.out.frames[frame];
@@ -14530,6 +14555,18 @@ impl Lowering<'_> {
                         && self.forwards(f.code)
                         && let Some(prop) = self.this_proto_load(f.func, &i, frame) =>
                 {
+                    self.push(i, prop);
+                }
+                // The length and elements of an inlined frame's `arguments`
+                // kept an array: the array's, its elements' stencils
+                // leaving for anything but an element it has (the
+                // interpreter reads the arguments object then).
+                Op::GetNamed | Op::GetKeyed
+                    if (i.reg as usize).checked_sub(base).is_some_and(|r| {
+                        self.out.frames[frame].array_args.is_some_and(|a| a.has(r))
+                    }) =>
+                {
+                    let prop = if i.op == Op::GetNamed { Prop::Length } else { Prop::None };
                     self.push(i, prop);
                 }
                 _ => {
@@ -15039,6 +15076,113 @@ impl Lowering<'_> {
         }
         let code = unsafe { (*fo).code };
         self.forwards(code) && self.forwards_this_method(code)
+    }
+
+    /// Whether an inlined frame of `code` may keep its `arguments` the
+    /// array of its call's arguments: nothing tells them apart. Its one
+    /// `CreateArguments`'s register, and those it is copied to (`Ldar`
+    /// then `Star`, `acc` dead after), are read by `GetNamed` of `length`
+    /// and `GetKeyed` only (an element in the array is the object's; the
+    /// stencils leave for any other key, see `get_keyed`), written by
+    /// nothing else, and aren't parameters (which the frame's `arguments`
+    /// may alias). Every instruction is one the JIT decodes (a bail's
+    /// operands aren't known). At most four such registers.
+    fn array_arguments(&mut self, code: *const crate::vm::Code) -> Option<ArgsRegs> {
+        let d = self.decoded(code);
+        let insns = &d.0;
+        let n = insns.len();
+        let mut creates = insns.iter().filter(|j| j.op == Op::CreateArguments);
+        let a = creates.next()?.reg;
+        if creates.next().is_some() || insns.iter().any(|j| j.bail) {
+            return None;
+        }
+        let nparams = unsafe { (*code).nparams } as usize;
+        let mut target = vec![false; n + 1];
+        for j in insns.iter().filter(|j| j.jumps()) {
+            target[j.target] = true;
+        }
+        let acc_out = acc_liveness(insns, &vec![true; n]).1;
+        let copy = |k: usize| {
+            insns[k].op == Op::Ldar
+                && k + 1 < n
+                && insns[k + 1].op == Op::Star
+                && !target[k + 1]
+                && !acc_out[k + 1]
+        };
+        let mut regs = vec![a];
+        loop {
+            let more: Vec<u8> = (0..n)
+                .filter(|&k| copy(k) && regs.contains(&insns[k].reg) && !regs.contains(&insns[k + 1].reg))
+                .map(|k| insns[k + 1].reg)
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            regs.extend(more);
+            regs.sort_unstable();
+            regs.dedup();
+        }
+        if regs.len() > 4 || regs.iter().any(|&r| (r as usize) <= nparams) {
+            return None;
+        }
+        let length = unsafe { (*self.state.vm).a_length };
+        for (k, j) in insns.iter().enumerate() {
+            let mut named: Vec<u8> = match j.op {
+                Op::Mov | Op::SetKeyed => vec![j.reg, j.reg2],
+                Op::Call | Op::CallUndefined | Op::Construct => {
+                    let w = j.reg2 as usize..=j.reg2 as usize + j.imm.max(0) as usize + 1;
+                    w.map(|r| r as u8).chain([j.reg]).collect()
+                }
+                Op::Ldar
+                | Op::Star
+                | Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::ShiftLeft
+                | Op::ShiftRight
+                | Op::ShiftRightLogical
+                | Op::JumpIfLess
+                | Op::JumpIfLessEqual
+                | Op::JumpIfGreater
+                | Op::JumpIfGreaterEqual
+                | Op::TestLessThan
+                | Op::TestGreaterThan
+                | Op::TestLessThanOrEqual
+                | Op::TestGreaterThanOrEqual
+                | Op::TestEqual
+                | Op::TestStrictEqual
+                | Op::TestInstanceOf
+                | Op::TestIn
+                | Op::GetNamed
+                | Op::SetNamed
+                | Op::GetKeyed
+                | Op::CreateArguments => vec![j.reg],
+                _ => Vec::new(),
+            };
+            named.retain(|r| regs.contains(r));
+            if named.is_empty() {
+                continue;
+            }
+            let ok = match j.op {
+                Op::CreateArguments => true,
+                Op::GetNamed => unsafe { (*code).ic(j.imm as u16).1 == length },
+                Op::GetKeyed => true,
+                Op::Ldar => copy(k),
+                Op::Star => k > 0 && copy(k - 1) && regs.contains(&insns[k - 1].reg),
+                _ => false,
+            };
+            if !ok {
+                return None;
+            }
+        }
+        let mut out = ArgsRegs { regs: [0; 4], n: regs.len() as u8 };
+        out.regs[..regs.len()].copy_from_slice(&regs);
+        Some(out)
     }
 
     /// Whether `code` finds its arguments through its frame's header:
@@ -16122,6 +16266,7 @@ impl Lowering<'_> {
             && alloc == 0
             && !std::mem::take(&mut self.accessor_call)
             && inline_by_code(fo, i);
+        let array_args = self.array_arguments(callee);
         self.out.frames.push(InlineFrame {
             construct: i.op == Op::Construct,
             code: callee,
@@ -16132,6 +16277,7 @@ impl Lowering<'_> {
             args: (i.reg2 + u8::from(i.op == Op::Call), i.imm as u8),
             extra,
             frame_args: frame_args_upto(callee),
+            array_args,
         });
         self.out.fbs.push(self.feedback(callee));
         self.out.nregs = self.out.nregs.max(base + c.nregs as usize + extra as usize);
@@ -17508,7 +17654,7 @@ unsafe fn materialize(
     code: &JitCode,
     frame: usize,
     exit_pc: usize,
-    acc: Value,
+    mut acc: Value,
 ) -> interp::Resume {
     let frames = &code.snap.as_ref().unwrap().frames;
     // Headers for the inlined frames from the exit's outwards.
@@ -17559,6 +17705,42 @@ unsafe fn materialize(
                 };
                 unsafe { *regs.add(r.reg as usize) = v };
             }
+        }
+    }
+    // An inlined frame's `arguments` kept an array (`InlineFrame::array_args`):
+    // an arguments object for the interpreter, in the registers it reads
+    // there (the others may hold anything) and `acc`. (Nothing collects
+    // here; its function is in the frame's header, written above.)
+    for &(g, pc, _) in &chain {
+        let fr = frames[g];
+        let Some(a) = fr.array_args else { continue };
+        let lives = unsafe { (*crate::interp::current_vm()).jit_caches.pc_live(fr.code) };
+        let Some(live) = lives.get(&pc) else { continue };
+        let at = unsafe { regs.add(fr.base) };
+        let regs_of = || a.regs[..a.n as usize].iter().map(|&r| r as usize);
+        let Some(array) = regs_of().filter(|&r| rs_has(live, r)).map(|r| unsafe { *at.add(r) }).find(|v| {
+            v.is_cell() && unsafe { (*crate::object::as_object(*v)).class } == crate::object::Class::Array
+        }) else {
+            continue;
+        };
+        let object = unsafe {
+            let o = crate::object::as_object(array);
+            let values = if (*o).elems_len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts((*o).elems, (*o).elems_len as usize)
+            };
+            crate::builtins::arguments_object_of(&mut *crate::interp::current_vm(), values, interp::frame_callee(at))
+        };
+        for r in regs_of() {
+            unsafe {
+                if *at.add(r) == array {
+                    *at.add(r) = object;
+                }
+            }
+        }
+        if g == frame && acc == array {
+            acc = object;
         }
     }
     let fr = frames[frame];

@@ -854,25 +854,39 @@ fn in_class(ic: Case, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
     let mut r = has(c);
     if !r && ic != Case::Exact {
         let u = ic.canon(c);
-        r = has(u)
-            || ranges
-                .iter()
-                .any(|&(lo, hi)| (lo..=hi).len() < 512 && (lo..=hi).any(|x| ic.canon(x) == u));
+        r = has(u) || if long_class(ranges) {
+            let groups = case_groups(ic);
+            let from = groups.partition_point(|p| p.0 < u);
+            groups[from..].iter().take_while(|p| p.0 == u).any(|p| has(p.1))
+        } else {
+            ranges.iter().any(|&(lo, hi)| (lo..=hi).any(|x| ic.canon(x) == u))
+        };
     }
     r != neg
 }
 
-/// The forms of the units of `ranges` that [`in_class`] folds (those of
-/// ranges shorter than 512 units), sorted; none if not folding case.
-fn class_folds(ic: Case, ranges: &[(u16, u16)]) -> Vec<u16> {
+/// Whether `ranges` have 512 units or more: [`in_class`] finds a unit's
+/// equivalents in them through [`case_groups`] (made once, at the cost of
+/// folding every unit) rather than by folding each of theirs.
+fn long_class(ranges: &[(u16, u16)]) -> bool {
+    ranges.iter().map(|&(lo, hi)| (lo..=hi).len()).sum::<usize>() >= 512
+}
+
+/// The forms of the units of `ranges`, sorted, for [`in_class_folded`];
+/// none if not folding case, and `None` for a [`long_class`], which
+/// [`in_class`] tests through the units' equivalents instead (folding each
+/// unit of a long class costs more than most of its tests).
+fn class_folds(ic: Case, ranges: &[(u16, u16)]) -> Option<Vec<u16>> {
     if ic == Case::Exact {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    let mut f: Vec<u16> =
-        ranges.iter().filter(|&&(lo, hi)| (lo..=hi).len() < 512).flat_map(|&(lo, hi)| lo..=hi).map(|x| ic.canon(x)).collect();
+    if long_class(ranges) {
+        return None;
+    }
+    let mut f: Vec<u16> = ranges.iter().flat_map(|&(lo, hi)| lo..=hi).map(|x| ic.canon(x)).collect();
     f.sort_unstable();
     f.dedup();
-    f
+    Some(f)
 }
 
 /// [`in_class`], with `folds` the class's [`class_folds`].
@@ -1065,6 +1079,22 @@ fn case_members(case: Case) -> &'static std::collections::HashMap<u16, Vec<u16>>
             }
         }
         m
+    })
+}
+
+/// The canonical forms of [`case_members`] with each of their units,
+/// sorted: a form's equivalents are a slice.
+fn case_groups(case: Case) -> &'static [(u16, u16)] {
+    use std::sync::OnceLock;
+    static FOLD: OnceLock<Vec<(u16, u16)>> = OnceLock::new();
+    static UNICODE: OnceLock<Vec<(u16, u16)>> = OnceLock::new();
+    let cell = if case == Case::Unicode { &UNICODE } else { &FOLD };
+    cell.get_or_init(|| {
+        let mut v: Vec<(u16, u16)> =
+            case_members(case).iter().flat_map(|(&k, ms)| ms.iter().map(move |&x| (k, x))).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     })
 }
 
@@ -2107,10 +2137,11 @@ struct Program {
     /// (Ranges, negated, and whether for `Insn::Alone`.)
     classes: Vec<(Vec<(u16, u16)>, bool, bool)>,
     /// For each class, folding case: the forms (`Case::canon`) of the units
-    /// of its ranges [`in_class`] folds, sorted, so that a unit's is looked
-    /// up rather than each such range's units folded at every test. (Made at
+    /// of its ranges, sorted, so that a unit's is looked up rather than each
+    /// range's units folded at every test; `None` for a long class (see
+    /// [`class_folds`]). (Made at
     /// the first test of a unit past ASCII: most classes never see one.)
-    folds: Vec<std::cell::OnceCell<Vec<u16>>>,
+    folds: Vec<std::cell::OnceCell<Option<Vec<u16>>>>,
     /// `Str`'s code units.
     strs: Vec<Vec<u16>>,
     /// `Astral`'s ranges.
@@ -2675,8 +2706,10 @@ impl Program {
     #[inline(never)]
     fn class_matches(&self, k: u32, c: u16) -> bool {
         let (r, neg, _) = &self.classes[k as usize];
-        let folds = self.folds[k as usize].get_or_init(|| class_folds(self.ic, r));
-        in_class_folded(self.ic, r, folds, *neg, c)
+        match self.folds[k as usize].get_or_init(|| class_folds(self.ic, r)) {
+            Some(folds) => in_class_folded(self.ic, r, folds, *neg, c),
+            None => in_class(self.ic, r, *neg, c),
+        }
     }
 
     /// Run from `start` over `s`: whether a match begins there, its

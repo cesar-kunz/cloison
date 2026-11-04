@@ -46,7 +46,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let intl = vm.new_object(op);
-    let a = vm.intern("Intl");
+    let a = vm.intern_name("Intl");
     vm.add_property_with(g, a, object_value(intl), DONT_ENUM);
     crate::symbol::to_string_tag(vm, intl, "Intl");
     vm.intl_roots = vec![std::ptr::null_mut(); 2];
@@ -270,7 +270,7 @@ fn coerce_options(vm: &mut Vm, v: Value) -> Result<Value> {
 
 /// GetOption of a string: undefined, or one of `allowed` (any, if empty).
 fn string_option(vm: &mut Vm, options: Value, name: &str, allowed: &[&str]) -> Result<Option<String>> {
-    let a = vm.intern(name);
+    let a = vm.intern_name(name);
     let v = vm.get(options, a)?;
     if v.is_undefined() {
         return Ok(None);
@@ -284,7 +284,7 @@ fn string_option(vm: &mut Vm, options: Value, name: &str, allowed: &[&str]) -> R
 
 /// GetOption of a boolean.
 fn bool_option(vm: &mut Vm, options: Value, name: &str) -> Result<Option<bool>> {
-    let a = vm.intern(name);
+    let a = vm.intern_name(name);
     let v = vm.get(options, a)?;
     Ok((!v.is_undefined()).then(|| crate::interp::to_boolean(v)))
 }

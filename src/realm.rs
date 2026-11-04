@@ -412,7 +412,7 @@ pub(crate) fn default_proto(vm: &mut Vm, c: Value, default: Value) -> Result<Val
 /// `$262.createRealm()`: a new realm's `$262`.
 pub(crate) fn host_create_realm(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let r = create(vm);
-    let a = vm.intern("$262");
+    let a = vm.intern_name("$262");
     let g = intrinsic(vm, r, |vm| vm.global);
     vm.get(object_value(g), a)
 }

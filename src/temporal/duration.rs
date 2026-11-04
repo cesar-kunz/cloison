@@ -937,7 +937,7 @@ fn options_or_string(vm: &mut Vm, v: Value, name: &str) -> Result<Value> {
     }
     if string_units(v).is_some() {
         let o = object_value(vm.new_object(Value::NULL));
-        let a = vm.intern(name);
+        let a = vm.intern_name(name);
         vm.add_property(as_object(o), a, v);
         return Ok(o);
     }

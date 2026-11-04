@@ -11624,3 +11624,32 @@ var h = wm.get(s);
     }
 }
 
+/// An atom `Vm::intern` gave stays its name for good (Codex on #40): a
+/// caller outside the VM may hold it across any collection, which freed it
+/// once a marking found nothing naming it and it had gone unused (its name
+/// then read panicking, or its index another name's). A name interned
+/// before a program that makes and drops names never seen before, and
+/// collects, is still its own, and a global property set through it after
+/// is read by name.
+#[test]
+fn atoms_interned_outside_the_vm_stay() {
+    let src = r#"
+for (var r = 0; r < 4; r++) {
+  for (var k = 0; k < 500; k++) { var o = {}; o["fresh" + r + "_" + k] = k; }
+  $262.gc();
+}
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let read = cloison::js::compile("held_outside_the_vm").unwrap();
+    for poison in [false, true] {
+        let mut vm = Vm::new();
+        vm.set_atoms_poison(poison);
+        let a = vm.intern("held_outside_the_vm");
+        vm.run(&module).unwrap();
+        assert_eq!(vm.atom_name(a), "held_outside_the_vm", "poison {poison}");
+        let g = cloison::object::object_value(vm.global);
+        vm.set(g, a, cloison::value::Value::from_i32(7)).unwrap();
+        assert_eq!(vm.run(&read).map(display).map_err(|e| e.to_string()).as_deref(), Ok("7"), "poison {poison}");
+    }
+}
+

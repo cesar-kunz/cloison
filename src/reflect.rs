@@ -50,7 +50,7 @@ pub(crate) fn install(vm: &mut Vm) {
         ],
     );
     let g = vm.global;
-    let a = vm.intern("Reflect");
+    let a = vm.intern_name("Reflect");
     vm.add_property_with(g, a, object_value(r), DONT_ENUM);
 }
 

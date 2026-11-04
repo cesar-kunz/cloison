@@ -411,7 +411,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // `%AsyncGeneratorPrototype%`.
     let op = object_value(vm.object_prototype);
     let aip = vm.new_object(op);
-    let a_async_iterator = vm.intern(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
+    let a_async_iterator = vm.intern_name(&format!("{}Symbol.asyncIterator", crate::symbol::SYMBOL_MARK));
     let f = vm.native_function("[Symbol.asyncIterator]", return_this, 0, crate::jit::Ty::Any, false);
     vm.add_property_with(aip, a_async_iterator, object_value(f), DONT_ENUM);
     let agp = vm.new_object(object_value(aip));
@@ -448,7 +448,7 @@ pub(crate) fn install(vm: &mut Vm) {
     // prototype`'s, the functions' prototypes.
     let fp = object_value(vm.function_prototype);
     let function = {
-        let a = vm.intern("Function");
+        let a = vm.intern_name("Function");
         vm.get(object_value(vm.global), a).unwrap_or(Value::UNDEFINED)
     };
     let (a_p, a_c) = (vm.a_prototype, vm.a_constructor);

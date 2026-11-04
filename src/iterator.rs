@@ -67,7 +67,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let ip = vm.symbol_roots[crate::symbol::Root::IteratorPrototype as usize];
     let g = vm.global;
     let c = vm.define_native(g, "Iterator", iterator_ctor, 0, crate::jit::Ty::Any, true);
-    let a_p = vm.intern("prototype");
+    let a_p = vm.intern_name("prototype");
     vm.add_property_with(c, a_p, object_value(ip), READ_ONLY | DONT_ENUM | DONT_DELETE);
     vm.define_natives(
         c,
@@ -95,7 +95,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
     // `constructor` and `@@toStringTag`: accessors whose setters set the
     // property on the receiver, unless it is `Iterator.prototype` itself.
-    let a_c = Key::Name(vm.intern("constructor"));
+    let a_c = Key::Name(vm.intern_name("constructor"));
     let a_tag = Key::Name(vm.a_sym_to_string_tag);
     for (key, name, get, set) in [
         (a_c, "constructor", get_constructor as NativeFn, set_constructor as NativeFn),
@@ -138,7 +138,7 @@ fn get_tag(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 }
 
 fn set_constructor(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let key = Key::Name(vm.intern("constructor"));
+    let key = Key::Name(vm.intern_name("constructor"));
     ignoring_prototype(vm, this, key, arg(a, 0))
 }
 
@@ -168,7 +168,7 @@ fn ignoring_prototype(vm: &mut Vm, this: Value, key: Key, v: Value) -> Result<Va
 
 /// `it.next` (GetIteratorDirect's).
 fn next_method(vm: &mut Vm, it: Value) -> Result<Value> {
-    let a = vm.intern("next");
+    let a = vm.intern_name("next");
     vm.get(it, a)
 }
 
@@ -190,7 +190,7 @@ fn step_result(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
     if !is_object(r) {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
     }
-    let a_done = vm.intern("done");
+    let a_done = vm.intern_name("done");
     if to_boolean(vm.get(r, a_done)?) {
         return Ok(None);
     }
@@ -496,7 +496,7 @@ fn wrap_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn wrap_return(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let state = state_of(this, true, "%WrapForValidIteratorPrototype%.return")?;
     let it = get(vm, state, ITER)?;
-    let a_return = vm.intern("return");
+    let a_return = vm.intern_name("return");
     let m = vm.get(it, a_return)?;
     if m.is_undefined() || m.is_null() {
         return iter_result(vm, Value::UNDEFINED, true);
@@ -823,7 +823,7 @@ fn zip_options(vm: &mut Vm, options: Value) -> Result<(i32, Value)> {
     if !is_object(options) {
         return Err(Error::type_error("options must be an object"));
     }
-    let a_mode = vm.intern("mode");
+    let a_mode = vm.intern_name("mode");
     let m = vm.get(options, a_mode)?;
     let mode = if m.is_undefined() || is_string(m, "shortest") {
         SHORTEST
@@ -836,7 +836,7 @@ fn zip_options(vm: &mut Vm, options: Value) -> Result<(i32, Value)> {
     };
     let mut padding = Value::UNDEFINED;
     if mode == LONGEST {
-        let a_padding = vm.intern("padding");
+        let a_padding = vm.intern_name("padding");
         padding = vm.get(options, a_padding)?;
         if !padding.is_undefined() && !is_object(padding) {
             return Err(Error::type_error("padding must be an object"));

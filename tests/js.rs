@@ -11278,3 +11278,52 @@ out.push((true ? () => 3 : () => 4)(), (y => y ? 5 : 6)(0), [() => 1, y => {}].l
 out.join(" ");"#;
     assert_eq!(value(src), "function function 1 1 2 3 3 6 2");
 }
+
+/// An array literal's `PushLiteral` reads its array's register and `acc`
+/// only: lowered as a `push` call (`Insn::native` 1) whose window was the
+/// array's register and the one after, it counted that next register as
+/// read, so a variable written only later (`r13`, `__shp`'s) seemed live
+/// and read at an entry at `f0`'s first loop, and `entry_types` typed the
+/// stale word in its slot as an object and crashed in `Ty::join_shapes`
+/// (issue #27). The issue's program, compiled at once or not: what V8,
+/// JavaScriptCore and SpiderMonkey give.
+#[test]
+fn array_literal_pushes_read_no_argument_register() {
+    let src = r#"
+function __mix() {}
+var __fuel = 300000;
+var g1 = 8;
+var g2 = 0x7fffffff;
+var s0 = "a1b2c3";
+var s2 = "0x1f";
+var a0 = [1, , 3, , 5];
+var a1 = new Array(0);
+var a2 = Array.from(0);
+o2 = { x: 42, };
+var __shp = [{ x: 1 }, { y: 2, x: 3 }, { x: 4, y: 5, z: 6 }];
+function f0(d, p0, p1, p2) {
+  if (__fuel-- <= 0 || d <= 0) return a1.length;
+  for (let k1 = 0; k1 < 2 && __fuel-- > 0; k1++) {
+    g2 = g2 + a2.map(v => v | 0).sort((u, v) => u - v)[f0(d - 1) & 7] | 0;
+    o2["p" + (0)] = 0;
+  }
+  for (let k4 = 0; k4 < 1 && __fuel-- > 0; k4++) {
+    a1[s2.substring(a0[k4 & 15] / g1 & 7, [p1, g1][__shp[0].w & 1] & 15).length & 15] = s0.lastIndexOf(0);
+  }
+  if (0) throw { x: 1 };
+  return (() => { const o = { _v: 1, get v() { return this._v; } }; return o.v; })();
+}
+
+for (var i = 0; i < 1000; i++) {
+  f0(4, 0);
+}
+g2 + " " + a1.length;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 1, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("0 1"), "tier at {budget}");
+    }
+}

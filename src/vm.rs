@@ -6171,6 +6171,20 @@ impl Vm {
         self.heap.gc.set_evacuate_cycles();
     }
 
+    /// Unbind every compiled version's call sites, the retired ones' too:
+    /// versions calling each other would outlive the VM, in the JIT's
+    /// registry of them, naming its codes' addresses (see `Vm::drop`).
+    fn unbind_versions(&mut self) {
+        for c in self.codes.iter().chain(self.condemned.iter()) {
+            if let Ok(mut j) = c.jit.try_borrow_mut()
+                && let Some(j) = j.as_mut()
+            {
+                j.unbind_targets();
+            }
+        }
+        self.jit_caches.drop_all_retired();
+    }
+
     /// The codes the VM's tables name by address, the JIT's and the field
     /// types' (`jitted`, `field_deps`, `relied_cells`, `through_deps`), that
     /// aren't loaded, or are taken out of use (for tests: what a freed
@@ -7040,5 +7054,11 @@ pub fn number_to_string(d: f64) -> String {
             String::new()
         };
         format!("{}{rest}e{sign}{}", &digits[..1], (n - 1).abs())
+    }
+}
+
+impl Drop for Vm {
+    fn drop(&mut self) {
+        self.unbind_versions();
     }
 }

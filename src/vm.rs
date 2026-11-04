@@ -928,8 +928,11 @@ pub struct Vm {
     /// `intrinsics::construct_with`); `undefined` otherwise.
     pub(crate) derived_construct: Value,
     /// Tagged templates' strings arrays, by site (see
-    /// `intrinsics::template_object`).
-    pub(crate) template_cache: crate::jit::HashMap<u64, *mut Object>,
+    /// `intrinsics::template_object`), with the code whose site it is:
+    /// forgotten when that code is freed (`gc::condemn_codes`).
+    pub(crate) template_cache: crate::jit::HashMap<u64, (*mut Object, *const Code)>,
+    /// The code of the frame running an intrinsic (`interp::op_intrinsic`).
+    pub(crate) intrinsic_code: *const Code,
     /// Symbols, by their key atoms (see `symbol`).
     pub(crate) symbols: crate::jit::HashMap<Atom, *mut Object>,
     /// `Symbol.for`'s registry, the agent's (every realm's): its symbols
@@ -1257,6 +1260,7 @@ impl Vm {
             iterator_roots: Vec::new(),
             derived_construct: Value::UNDEFINED,
             template_cache: Default::default(),
+            intrinsic_code: std::ptr::null(),
             symbols: Default::default(),
             symbol_registry: Default::default(),
             symbol_count: 0,
@@ -6178,7 +6182,7 @@ impl Vm {
         .chain(self.collection_prototypes.iter().copied())
         .chain(self.promise_roots.iter().copied())
         .chain(self.iterator_roots.iter().copied())
-        .chain(self.template_cache.values().copied())
+        .chain(self.template_cache.values().map(|t| t.0))
         .chain(self.symbol_roots.iter().copied())
         .chain(std::iter::once(self.thrower))
         .chain(self.mapped_args.iter().map(|m| m.o))
@@ -6255,7 +6259,7 @@ impl Vm {
                 f(Root::Object(o));
             }
         }
-        for o in self.template_cache.values_mut() {
+        for (o, _) in self.template_cache.values_mut() {
             f(Root::Object(o));
         }
         for m in &mut self.mapped_args {

@@ -695,6 +695,21 @@ pub struct Vm {
     /// `Vm::prune_atoms`).
     pub(crate) atom_used: Vec<u32>,
     pub(crate) atoms_free: Vec<u32>,
+    /// The atoms the natives running took (`intern_name`, a key list, a
+    /// string's or symbol's atom: `hold_atom`), each kept until the native
+    /// that took it returns (`run_native`): it may hold one across user
+    /// code that collects more than once, which `atom_used`'s grace doesn't
+    /// cover (Codex on #40: `JSON.parse`'s keys across its reviver,
+    /// `defineProperty`'s key across its descriptor's getters). Taken only
+    /// while a native is the innermost activation (`holding`, false in
+    /// what it calls back: `run_js`), so a callback's own names aren't.
+    pub(crate) held_atoms: Vec<Atom>,
+    pub(crate) holding: bool,
+    /// The running native's activation, and each atom's last to take it
+    /// (one takes it once).
+    held_serial: u64,
+    held_next: u64,
+    held_by: Vec<u64>,
     /// The strings that keep their atom (`Object::string_atom`), the young
     /// ones from `keyed_young` on: a full marking keeps the live ones'
     /// atoms (see `gc::prune_collections`).
@@ -1145,6 +1160,11 @@ impl Vm {
             atom_ids: HashMap::default(),
             atom_used: Vec::new(),
             atoms_free: Vec::new(),
+            held_atoms: Vec::new(),
+            holding: false,
+            held_serial: 0,
+            held_next: 0,
+            held_by: Vec::new(),
             keyed_strings: Vec::new(),
             keyed_young: 0,
             atoms_fixed: usize::MAX,
@@ -1542,6 +1562,7 @@ impl Vm {
             if *used != PINNED_ATOM {
                 *used = epoch;
             }
+            self.hold_atom(a);
             return a;
         }
         let name: std::rc::Rc<str> = s.into();
@@ -1549,16 +1570,55 @@ impl Vm {
             Some(i) => {
                 self.atoms[i as usize] = Some(name.clone());
                 self.atom_used[i as usize] = epoch;
+                self.held_by[i as usize] = 0;
                 Atom(i)
             }
             None => {
                 self.atoms.push(Some(name.clone()));
                 self.atom_used.push(epoch);
+                self.held_by.push(0);
                 Atom(self.atoms.len() as u32 - 1)
             }
         };
+        self.hold_atom(a);
         self.atom_ids.insert(name, a);
         a
+    }
+
+    /// `a`, which a native took: kept while that native runs (see
+    /// `held_atoms`).
+    #[inline]
+    pub(crate) fn hold_atom(&mut self, a: Atom) {
+        if self.holding
+            && let Some(by) = self.held_by.get_mut(a.0 as usize)
+            && *by != self.held_serial
+        {
+            *by = self.held_serial;
+            self.held_atoms.push(a);
+        }
+    }
+
+    /// Run a native (`f`): the atoms it takes are kept until it returns
+    /// (see `held_atoms`).
+    #[inline(always)]
+    pub(crate) fn run_native<R>(&mut self, f: impl FnOnce(&mut Vm) -> R) -> R {
+        let saved = (self.held_atoms.len(), self.holding, self.held_serial);
+        self.held_next += 1;
+        (self.holding, self.held_serial) = (true, self.held_next);
+        let r = f(self);
+        self.held_atoms.truncate(saved.0);
+        (self.holding, self.held_serial) = (saved.1, saved.2);
+        r
+    }
+
+    /// Run JS from the runtime (`f`): what it takes isn't the native's
+    /// calling it (see `held_atoms`).
+    #[inline(always)]
+    pub(crate) fn run_js<R>(&mut self, f: impl FnOnce(&mut Vm) -> R) -> R {
+        let was = std::mem::replace(&mut self.holding, false);
+        let r = f(self);
+        self.holding = was;
+        r
     }
 
     pub fn atom_name(&self, a: Atom) -> &str {
@@ -1623,8 +1683,8 @@ impl Vm {
     /// names any more (#33: a property name, a symbol, was kept for good).
     /// One is named by a live shape's keys or transitions, a code's inline caches' names (which the JIT's code
     /// takes its names from), a live symbol (`symbols`, its cell's atom),
-    /// a registered symbol, a realm's declarations or a cached `eval`'s;
-    /// one used since the marking before (`intern_name`) stays, as Rust
+    /// a registered symbol, a realm's declarations or a cached `eval`'s,
+    /// a running native (`held_atoms`); one used since the marking before (`intern_name`) stays, as Rust
     /// code may hold it, and the VM's own, and one `intern` gave (for good). The tables keyed by atoms forget.
     /// `from`: the marking's code epoch.
     pub(crate) fn prune_atoms(&mut self, from: u32) {
@@ -1664,6 +1724,7 @@ impl Vm {
             r.declared_atoms(&mut keep);
         }
         self.eval_cache.values().flatten().for_each(|e| e.declared.iter().for_each(|&a| keep(a)));
+        self.held_atoms.iter().for_each(|&a| keep(a));
         let mut freed = 0;
         for (i, &l) in live.iter().enumerate().skip(fixed) {
             if !l && let Some(name) = self.atoms[i].take() {
@@ -4196,7 +4257,9 @@ impl Vm {
             return Key::Index(key.as_i32_unchecked() as u32);
         }
         if crate::symbol::is_symbol(key) {
-            return Key::Name(crate::symbol::symbol_atom(self, key));
+            let a = crate::symbol::symbol_atom(self, key);
+            self.hold_atom(a);
+            return Key::Name(a);
         }
         if let Some(d) = key.as_number()
             && d >= 0.0
@@ -4213,6 +4276,7 @@ impl Vm {
         if flat(key) {
             let cached = unsafe { *Object::string_atom(as_object(key)) };
             if cached != 0 {
+                self.hold_atom(Atom(cached - 1));
                 return Key::Name(Atom(cached - 1));
             }
         }
@@ -5579,12 +5643,12 @@ impl Vm {
                         return crate::realm::run_in(self, (*(*o).code).realm, |vm| {
                             vm.constructing = false;
                             vm.callee = o;
-                            native(vm, this, args)
+                            vm.run_native(|vm| native(vm, this, args))
                         });
                     }
                     self.constructing = false;
                     self.callee = o;
-                    return native(self, this, args);
+                    return self.run_native(|vm| native(vm, this, args));
                 }
             }
         }
@@ -5604,14 +5668,14 @@ impl Vm {
                         return crate::realm::run_in(self, (*(*o).code).realm, |vm| {
                             vm.constructing = true;
                             vm.callee = o;
-                            let r = native(vm, Value::UNDEFINED, args);
+                            let r = vm.run_native(|vm| native(vm, Value::UNDEFINED, args));
                             vm.constructing = false;
                             r
                         });
                     }
                     self.constructing = true;
                     self.callee = o;
-                    let r = native(self, Value::UNDEFINED, args);
+                    let r = self.run_native(|vm| native(vm, Value::UNDEFINED, args));
                     self.constructing = false;
                     return r;
                 }

@@ -11667,6 +11667,59 @@ out.join(" | ");
     }
 }
 
+/// Natives and JS nested, each native holding an atom it took while the
+/// JS it calls makes names and collects (the review of #40):
+/// `defineProperty`'s key across its descriptor's getter, which runs
+/// `JSON.parse`, whose reviver deletes a key it took and calls
+/// `defineProperty` again, whose getter calls `map`, whose callback
+/// collects. What V8 and SpiderMonkey give, at every tier, with freed
+/// atoms poisoned too.
+#[test]
+fn atoms_held_by_nested_natives_survive_their_callbacks() {
+    let src = r#"
+function churn(tag) {
+  for (var i = 0; i < 3; i++) {
+    for (var j = 0; j < 2000; j++) { var t = {}; t["c" + tag + i + "_" + j] = j; }
+    $262.gc();
+  }
+}
+var out = [];
+var o = {}, inner = {};
+Object.defineProperty(o, { toString() { return "outer" + (1e6 + 1); } }, {
+  get value() {
+    JSON.parse('{"a":1,"jk' + (1e6 + 2) + '":2,"b":3}', function (k, v) {
+      if (k === "a") {
+        delete this[Object.keys(this)[1]];
+        Object.defineProperty(inner, { toString() { return "inner" + (1e6 + 3); } },
+          { get value() { churn("x"); return [3].map(function (n) { churn("m"); return n; })[0]; }, enumerable: true });
+        churn("y");
+      }
+      out.push(k);
+      return v;
+    });
+    churn("z");
+    out.push(Object.keys(inner) + "=" + inner[Object.keys(inner)[0]]);
+    return 1;
+  },
+  enumerable: true,
+});
+out.push(Object.keys(o) + "=" + o[Object.keys(o)[0]]);
+out.join(" | ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for (budget, poison) in [(i64::MAX, false), (i64::MAX, true), (1, true), (2, true)] {
+        let mut vm = Vm::new();
+        vm.set_atoms_poison(poison);
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(
+            r.as_deref(),
+            Ok("a | jk1000002 | b |  | inner1000003=3 | outer1000001=1"),
+            "tier at {budget}, poison {poison}"
+        );
+    }
+}
+
 /// An atom `Vm::intern` gave stays its name for good (Codex on #40): a
 /// caller outside the VM may hold it across any collection, which freed it
 /// once a marking found nothing naming it and it had gone unused (its name

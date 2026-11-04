@@ -11589,3 +11589,38 @@ var syms = Object.getOwnPropertySymbols(keep).map(function (s) { return s.toStri
     }
 }
 
+/// A symbol only a live object's key names keeps its weak collections'
+/// entries (Codex on #40): a full marking found such a symbol after the
+/// weak collections' dead entries went (`gc::ephemerons`, now marking the
+/// live shapes' symbol keys as it goes), so `WeakMap`s and `WeakSet`s
+/// keyed by it lost them, and so did a chain of them (an entry's value an
+/// object whose symbol key keys another's). What V8 and SpiderMonkey give.
+#[test]
+fn symbol_keys_keep_their_weak_entries() {
+    let src = r#"
+var obj = {}, wm = new WeakMap(), ws = new WeakSet(), wm2 = new WeakMap();
+function setup() {
+  var s = Symbol("s"), t = Symbol("t"), holder = {};
+  obj[s] = 1;
+  holder[t] = 2;
+  wm.set(s, holder);
+  ws.add(s);
+  wm2.set(t, "deep");
+}
+function churn(n) { var a = []; for (var i = 0; i < n; i++) a.push({ i: i, s: "x" + i }); return a.length; }
+setup();
+churn(20000);
+for (var i = 0; i < 3; i++) { churn(5000); $262.gc(); }
+var s = Object.getOwnPropertySymbols(obj)[0];
+var h = wm.get(s);
+[String(s), ws.has(s), h && h[Object.getOwnPropertySymbols(h)[0]], h && wm2.get(Object.getOwnPropertySymbols(h)[0])].join(" ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("Symbol(s) true 2 deep"), "tier at {budget}");
+    }
+}
+

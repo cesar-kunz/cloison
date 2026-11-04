@@ -2145,6 +2145,8 @@ impl Vm {
             if full {
                 self.mark_symbol_keys(&mut m);
             }
+            // (Their weak collections' entries were judged with the
+            // symbols the shapes traced had: see `ephemerons`.)
             // (Once marking is over: a full one's codes and shapes mark the
             // cells they refer to, a collection only a shape's prototype
             // holds say, whose keys must be pinned if it moves.)
@@ -2388,6 +2390,11 @@ impl Vm {
                         }
                         i += 2;
                     }
+                }
+                // (And the symbols the live shapes have as keys, which may
+                // be keys here, or lead to more: Codex on #40.)
+                if mode.kind == Kind::Full && self.mark_symbol_keys(m) {
+                    more = true;
                 }
                 if !more {
                     break;
@@ -3614,11 +3621,13 @@ impl Vm {
 
     /// A full marking's shapes found (all, if it doesn't collect them):
     /// the symbols they have as keys are live (`Vm::symbols` holds them
-    /// weakly: #33), what those refer to too.
-    unsafe fn mark_symbol_keys(&mut self, m: &mut Marking) {
+    /// weakly: #33), what those refer to too; before the weak collections'
+    /// dead entries go (see `ephemerons`), and once its codes and shapes
+    /// are. Whether it marked one not marked yet.
+    unsafe fn mark_symbol_keys(&mut self, m: &mut Marking) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if self.symbols.is_empty() {
-            return;
+            return false;
         }
         let from = self.heap.gc.codes_from;
         let all = !self.heap.gc.shape_cycle;
@@ -3637,12 +3646,18 @@ impl Vm {
                 }
             },
         );
+        let color = m.mode.color;
+        let mut more = false;
         for a in found {
-            if let Some(&o) = self.symbols.get(&a) {
+            if let Some(&o) = self.symbols.get(&a)
+                && unsafe { *crate::heap::meta(o as usize) } & COLOR != color
+            {
                 unsafe { m.value(crate::object::object_value(o)) };
+                more = true;
             }
         }
         unsafe { m.drain(&|| false) };
+        more
     }
 
     /// After a full marking: forget the symbols it didn't find (their

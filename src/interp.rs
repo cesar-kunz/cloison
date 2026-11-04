@@ -3375,7 +3375,8 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 Class::Native if !vm.realms.is_empty() => vm.call_other(m, v, &[]),
                 Class::Native => {
                     vm.callee = as_object(m);
-                    ((*(*as_object(m)).code).native.unwrap())(vm, v, &[])
+                    let native = (*(*as_object(m)).code).native.unwrap();
+                    vm.run_native(|vm| native(vm, v, &[]))
                 }
                 Class::Function if vm.native_top.is_null() => {
                     vm.conv_redo = true;
@@ -4584,6 +4585,13 @@ pub(crate) unsafe fn drive(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Va
 /// again), and it resumes past the call: unwinding starts inside it, as
 /// `op_unwind` does in callers' frames (a call last in a `try` is in it).
 pub(crate) unsafe fn drive_from(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value, unwinding: bool) -> Value {
+    // (JS the runtime runs, a generator resumed, a script: not the atoms of
+    // a native calling it, see `Vm::held_atoms`.)
+    vm.run_js(|vm| unsafe { drive_js(vm, pc, acc, regs, unwinding) })
+}
+
+/// [`drive_from`]'s body.
+unsafe fn drive_js(vm: &mut Vm, pc: *const u8, acc: Value, regs: *mut Value, unwinding: bool) -> Value {
     unsafe {
         let mut v = if unwinding { unwind_at(pc.sub(1), regs) } else { dispatch_at(pc, acc, regs) };
         loop {
@@ -4974,6 +4982,13 @@ pub(crate) unsafe fn call_from_jit(
 /// # Safety
 /// `new` must be a frame of `callee` with its header and registers set.
 unsafe fn run_new_frame(vm: &mut Vm, callee: *const Code, new: *mut Value, flags: u64) -> Value {
+    // (JS the runtime runs: not the atoms of a native calling it, see
+    // `Vm::held_atoms`.)
+    vm.run_js(|vm| unsafe { run_new_frame_js(vm, callee, new, flags) })
+}
+
+/// [`run_new_frame`]'s body.
+unsafe fn run_new_frame_js(vm: &mut Vm, callee: *const Code, new: *mut Value, flags: u64) -> Value {
     unsafe {
         let mut start = Resume {
             regs: new,

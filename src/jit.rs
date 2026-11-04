@@ -635,6 +635,19 @@ extern "C" fn cloison_rt_create_arguments(regs: Value, _: Value) -> u64 {
     }
 }
 
+/// The `arguments` of an inlined frame running function `func`, its
+/// call's arguments the elements of `array`, which the compiled code made
+/// for them (`arguments_of` stencils). (Nothing collects here: `array`'s
+/// elements stay where they are while the object is made.)
+extern "C" fn cloison_rt_arguments_of(array: Value, func: Value) -> u64 {
+    unsafe {
+        let vm = &mut *crate::interp::current_vm();
+        let a = crate::object::as_object(array);
+        let values = std::slice::from_raw_parts((*a).elems, (*a).elems_len as usize);
+        crate::builtins::arguments_object_of(vm, values, func.to_bits() as *mut Object).to_bits()
+    }
+}
+
 /// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws or
 /// would call a function (an object key's ToPropertyKey).
 extern "C" fn cloison_rt_delete(a: Value, b: Value) -> u64 {
@@ -824,6 +837,7 @@ fn runtime_function(name: &str) -> usize {
         "cloison_rt_create_closure" => cloison_rt_create_closure as *const () as usize,
         "cloison_rt_delete" => cloison_rt_delete as *const () as usize,
         "cloison_rt_create_arguments" => cloison_rt_create_arguments as *const () as usize,
+        "cloison_rt_arguments_of" => cloison_rt_arguments_of as *const () as usize,
         "cloison_rt_create_closure_local" => cloison_rt_create_closure_local as *const () as usize,
         "cloison_rt_close_upvalues" => cloison_rt_close_upvalues as *const () as usize,
         "cloison_rt_delete_global" => cloison_rt_delete_global as *const () as usize,
@@ -1941,7 +1955,9 @@ struct Insn {
     /// (2) of its receiver, `String.prototype.charCodeAt` (4) or
     /// `String.fromCharCode` (5), `Math.sqrt` (6), `Math.pow` (7),
     /// `Math.max` (8) or `Math.min` (9) of two, after a guard on the callee.
-    /// (3: see `scalar_replace`.)
+    /// (3: see `scalar_replace`.) A `CreateArguments` of an inlined frame
+    /// (10) makes the frame's `arguments` from the array of its call's
+    /// arguments in `acc` (see `Prop::ArgumentsOf`).
     native: u8,
     /// For a `push` (`native` 1): onto an array this code made, not a
     /// call in the program. An array literal's element (`PushLiteral`,
@@ -2023,9 +2039,10 @@ impl Insn {
 
     /// An inlined native taking its argument in `acc` (`push`,
     /// `charCodeAt`, `fromCharCode`, `Math.sqrt`, `Math.pow`'s exponent;
-    /// see [`Insn::native`]).
+    /// see [`Insn::native`]), or an inlined frame's `arguments` made from
+    /// an array.
     fn takes_acc(&self) -> bool {
-        matches!(self.native, 1 | 4 | 5 | 6 | 7 | 8 | 9) || self.store_check
+        matches!(self.native, 1 | 4 | 5 | 6 | 7 | 8 | 9 | 10) || self.store_check
     }
 
     fn reads_reg(&self) -> bool {
@@ -2550,6 +2567,10 @@ pub(crate) enum Prop {
     /// A `CreateClosure` capturing registers of the compiled function's
     /// own frame: the callee's code (see `create_closure_local`).
     ClosureLocal { callee: u64 },
+    /// An inlined frame's `arguments` (`Insn::native` 10): its function,
+    /// or (0) the one its guard wrote to the frame's header, `off` bytes
+    /// from the compiled frame's registers (see `arguments_of`).
+    ArgumentsOf { func: u64, off: i32 },
     /// A `CreateClosure`: the callee's code, and the function whose
     /// upvalues it takes (an inlined frame's; 0: the frame's own).
     Closure { callee: u64, func: u64 },
@@ -4383,6 +4404,12 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // `CreateArguments`): an array.
         Op::CreateArguments => {
             out.acc = Any;
+            if let Some(&Prop::ArgumentsOf { func, off }) = spec.props.get(i) {
+                return Sel {
+                    ops: Some((0, func, off as i64 as u64)),
+                    ..Sel::new("arguments_of", "", out)
+                };
+            }
             return Sel::new("create_arguments", "", out);
         }
         // A closure, through the runtime (see `Prop::Closure`).
@@ -6125,8 +6152,10 @@ fn truncated(
     let mut trunc = vec![false; n];
     // (A VM function's without the interpreter's liveness: none. Code with
     // no VM has no handlers, no closures.)
+    // (An inlined frame's `arguments`, made from an array, is unmapped.)
     if exit_live.is_some_and(|e| e.len() != n) || insns.iter().any(|i| {
-        matches!(
+        i.native != 10
+            && matches!(
             i.op,
             Op::CreateArguments
                 | Op::CreateMappedArguments
@@ -7243,6 +7272,7 @@ fn stencil_for(
                     | "create_closure"
                     | "create_closure_local"
                     | "create_arguments"
+                    | "arguments_of"
                     | "lda_constant"
                     | "lda_upvalue"
                     | "lda_upvalue_c"
@@ -14307,8 +14337,11 @@ impl Lowering<'_> {
                 // `arguments`, into `acc` and then its register. In an
                 // inlined frame, an array of the call's arguments, pushed
                 // (an exit in it does it again in the interpreter, from the
-                // frame's call); in the compiled function's own, from the
-                // runtime (`create_arguments`). (Not where `acc` lives on.)
+                // frame's call), then made the frame's `arguments` by the
+                // runtime (`arguments_of`): an array is not one, it has no
+                // `callee` (#41) and is `Array.isArray`; in the compiled
+                // function's own, from the runtime (`create_arguments`).
+                // (Not where `acc` lives on.)
                 Op::CreateArguments if acc_out[k] => {
                     i.bail = true;
                     self.push(i, Prop::None);
@@ -14327,6 +14360,13 @@ impl Lowering<'_> {
                             (push.reg2, push.imm, push.native, push.own_push) = (r, 0, 1, true);
                             self.push(push, Prop::None);
                         }
+                        self.push(synth(Op::Ldar, r, frame, i.pc), Prop::None);
+                        let f = self.out.frames[frame];
+                        let mut of = synth(Op::CreateArguments, r, frame, i.pc);
+                        of.native = 10;
+                        let off = (8 * f.base) as i32 - interp::FUNC_OFF as i32;
+                        self.push(of, Prop::ArgumentsOf { func: f.func as u64, off });
+                        self.push(synth(Op::Star, r, frame, i.pc), Prop::None);
                         continue;
                     }
                     self.push(synth(Op::Star, r, frame, i.pc), Prop::None);
@@ -18614,6 +18654,7 @@ pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool 
             | Prop::UpvalueAt { .. }
             | Prop::Delete { .. }
             | Prop::ClosureLocal { .. }
+            | Prop::ArgumentsOf { .. }
             | Prop::Closure { .. }
             | Prop::Typed { .. }
             | Prop::Length

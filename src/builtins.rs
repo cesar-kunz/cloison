@@ -1284,11 +1284,17 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         vm.store_field(o, 1, values_fn.map_or(Value::UNDEFINED, object_value));
         vm.store_field(o, 2, Value::TRUE);
         vm.store_field(o, 3, object_value(callee));
-        vm.reserve_elems(o, values.len());
-        for (i, &v) in values.iter().enumerate() {
-            vm.store_element(o, i, v);
+        // Its elements, of any type, copied in at once (the object is
+        // young: no barrier for them).
+        if !values.is_empty() {
+            unsafe {
+                let e = vm.heap.alloc_values_from(values.len(), values.len());
+                std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
+                (*o).elems = e;
+                crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
+                (*o).elems_len = values.len() as u32;
+            }
         }
-        unsafe { (*o).elems_len = values.len() as u32 };
         return object_value(o);
     }
     let op = object_value(vm.object_prototype);

@@ -100,7 +100,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let aep = vm.new_object(ep);
     let ac = vm.define_native(g, "AggregateError", aggregate_error_ctor, 2, any, true);
     link_constructor(vm, ac, aep);
-    let (a_name, a_message) = (vm.intern("name"), vm.intern("message"));
+    let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = string(vm, "AggregateError");
     vm.add_property_with(aep, a_name, name, DONT_ENUM);
     let empty = string(vm, "");
@@ -414,7 +414,7 @@ fn resolve_promise(vm: &mut Vm, p: *mut Object, resolution: Value) -> Result<()>
     if !is_object(resolution) {
         return settle(vm, p, FULFILLED, resolution);
     }
-    let a_then = vm.intern("then");
+    let a_then = vm.intern_name("then");
     let then = match vm.get(resolution, a_then) {
         Ok(t) => t,
         Err(e) => {
@@ -665,7 +665,7 @@ fn promise_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// SpeciesConstructor(o, %Promise%): `o.constructor[Symbol.species]`, or
 /// `Promise` if either is undefined (or the species null).
 fn species_constructor(vm: &mut Vm, o: Value) -> Result<Value> {
-    let a_constructor = vm.intern("constructor");
+    let a_constructor = vm.intern_name("constructor");
     let c = vm.get(o, a_constructor)?;
     let intrinsic = object_value(root(vm, Root::Constructor));
     if c.is_undefined() {
@@ -728,7 +728,7 @@ fn promise_then(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `promise.catch(onRejected)`: `promise.then(undefined, onRejected)`.
 fn promise_catch(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let a_then = vm.intern("then");
+    let a_then = vm.intern_name("then");
     let then = vm.get(this, a_then)?;
     call_function(vm, then, this, &[Value::UNDEFINED, arg(a, 0)])
 }
@@ -748,7 +748,7 @@ fn promise_finally(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     } else {
         (on_finally, on_finally)
     };
-    let a_then = vm.intern("then");
+    let a_then = vm.intern_name("then");
     let then = vm.get(this, a_then)?;
     call_function(vm, then, this, &[then_fn, catch_fn])
 }
@@ -761,7 +761,7 @@ fn then_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
     let p = promise_resolve_with(vm, c, result)?;
     let thunk = closure(vm, Root::ValueThunk, &[arg(a, 0)]);
-    let a_then = vm.intern("then");
+    let a_then = vm.intern_name("then");
     let then = vm.get(p, a_then)?;
     call_function(vm, then, p, &[thunk])
 }
@@ -774,7 +774,7 @@ fn catch_finally(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let result = call_function(vm, on_finally, Value::UNDEFINED, &[])?;
     let p = promise_resolve_with(vm, c, result)?;
     let thrower = closure(vm, Root::Thrower, &[arg(a, 0)]);
-    let a_then = vm.intern("then");
+    let a_then = vm.intern_name("then");
     let then = vm.get(p, a_then)?;
     call_function(vm, then, p, &[thrower])
 }
@@ -793,7 +793,7 @@ fn thrower(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 /// a new promise of `C` resolved with it.
 fn promise_resolve_with(vm: &mut Vm, c: Value, x: Value) -> Result<Value> {
     if is_class(x, Class::Promise) {
-        let a_constructor = vm.intern("constructor");
+        let a_constructor = vm.intern_name("constructor");
         if vm.get(x, a_constructor)? == c {
             return Ok(x);
         }
@@ -828,7 +828,7 @@ fn promise_with_resolvers(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
     materialize(vm, &mut cap);
     let op = object_value(vm.object_prototype);
     let o = vm.new_object(op);
-    let names = [vm.intern("promise"), vm.intern("resolve"), vm.intern("reject")];
+    let names = [vm.intern_name("promise"), vm.intern_name("resolve"), vm.intern_name("reject")];
     vm.add_properties(o, &names, &[cap.promise, cap.resolve, cap.reject], 0);
     Ok(object_value(o))
 }
@@ -840,7 +840,7 @@ fn promise_try(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let cap = new_capability(vm, c)?;
     match call_function(vm, arg(a, 0), Value::UNDEFINED, a.get(1..).unwrap_or(&[])) {
         Ok(v) if is_class(v, Class::Promise) && {
-            let a_constructor = vm.intern("constructor");
+            let a_constructor = vm.intern_name("constructor");
             vm.get(v, a_constructor)? == c
         } =>
         {
@@ -879,12 +879,12 @@ fn combine(vm: &mut Vm, this: Value, a: &[Value], kind: Combinator) -> Result<Va
 /// `C.resolve`, gets a `then` whose handlers settle the capability: at
 /// the first for `race`, at the last for the others, which collect.
 fn perform_combine(vm: &mut Vm, c: Value, cap: &Cap, iterable: Value, kind: Combinator) -> Result<()> {
-    let a_resolve = vm.intern("resolve");
+    let a_resolve = vm.intern_name("resolve");
     let promise_resolve = vm.get(c, a_resolve)?;
     if !is_callable(promise_resolve) {
         return Err(Error::type_error("Promise resolve is not a function"));
     }
-    let a_then = vm.intern("then");
+    let a_then = vm.intern_name("then");
     let values = vm.new_array();
     // `[remaining]`: the elements not settled yet, plus one until the
     // iteration is done (shared by the element functions).
@@ -972,7 +972,7 @@ fn combine_keyed(vm: &mut Vm, this: Value, a: &[Value], settled: bool) -> Result
 
 /// PerformPromiseAllKeyed.
 fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: bool) -> Result<()> {
-    let a_resolve = vm.intern("resolve");
+    let a_resolve = vm.intern_name("resolve");
     let promise_resolve = vm.get(c, a_resolve)?;
     if !is_callable(promise_resolve) {
         return Err(Error::type_error("Promise resolve is not a function"));
@@ -981,7 +981,7 @@ fn perform_keyed(vm: &mut Vm, c: Value, cap: &Cap, promises: Value, settled: boo
         return Err(Error::type_error("Promise.allKeyed: the argument is not an object"));
     }
     let o = as_object(promises);
-    let a_then = vm.intern("then");
+    let a_then = vm.intern_name("then");
     let keys = vm.new_array();
     let values = vm.new_array();
     let state = vm.new_array();
@@ -1125,7 +1125,7 @@ fn settled_reject(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn settled_result(vm: &mut Vm, status: &str, key: &str, v: Value) -> Value {
     let op = object_value(vm.object_prototype);
     let o = vm.new_object(op);
-    let names = [vm.intern("status"), vm.intern(key)];
+    let names = [vm.intern_name("status"), vm.intern_name(key)];
     let status = string(vm, status);
     vm.add_properties(o, &names, &[status, v], 0);
     object_value(o)
@@ -1147,11 +1147,11 @@ fn new_aggregate_error(vm: &mut Vm, errors: Value, message: Option<&[u16]>) -> V
     let o = vm.new_object(proto);
     unsafe { (*o).flags |= crate::object::ERROR };
     if let Some(m) = message {
-        let a = vm.intern("message");
+        let a = vm.intern_name("message");
         let m = vm.new_string(m);
         vm.add_property_with(o, a, m, DONT_ENUM);
     }
-    let a = vm.intern("errors");
+    let a = vm.intern_name("errors");
     vm.add_property_with(o, a, errors, DONT_ENUM);
     object_value(o)
 }
@@ -1179,7 +1179,7 @@ fn aggregate_error_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // (`{ cause }` in the options read before the errors are, as
     // InstallErrorCause comes first.)
     let options = arg(a, 2);
-    let a_cause = vm.intern("cause");
+    let a_cause = vm.intern_name("cause");
     let cause = if crate::props::is_object(options) && vm.has_key(options, crate::vm::Key::Name(a_cause))? {
         Some(vm.get(options, a_cause)?)
     } else {

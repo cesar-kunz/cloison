@@ -212,7 +212,7 @@ fn to_primitive_string(vm: &mut Vm, v: Value) -> Result<Value> {
 }
 
 fn get(vm: &mut Vm, o: Value, name: &str) -> Result<Value> {
-    let a = vm.intern(name);
+    let a = vm.intern_name(name);
     vm.get(o, a)
 }
 
@@ -760,7 +760,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let op = object_value(vm.object_prototype);
     let any = crate::jit::Ty::Any;
     let temporal = vm.new_object(op);
-    let a = vm.intern("Temporal");
+    let a = vm.intern_name("Temporal");
     vm.add_property_with(g, a, object_value(temporal), crate::object::DONT_ENUM);
     crate::symbol::to_string_tag(vm, temporal, "Temporal");
     vm.temporal.protos = vec![std::ptr::null_mut(); 8];

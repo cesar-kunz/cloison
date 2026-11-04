@@ -308,7 +308,7 @@ pub(crate) fn install(vm: &mut Vm, host: *mut Object) {
     EPOCH.get_or_init(Instant::now);
     let op = object_value(vm.object_prototype);
     let agent = vm.new_object(op);
-    let a_agent = vm.intern("agent");
+    let a_agent = vm.intern_name("agent");
     vm.add_property_with(host, a_agent, object_value(agent), crate::object::DONT_ENUM);
     vm.define_natives(
         agent,

@@ -176,7 +176,7 @@ fn resolved_options(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             (_, Some(s)) => crate::temporal::string(vm, s),
             _ => unreachable!(),
         };
-        let a = vm.intern(name);
+        let a = vm.intern_name(name);
         vm.add_property(r, a, v);
     }
     Ok(object_value(r))

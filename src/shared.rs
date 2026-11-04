@@ -294,7 +294,7 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let options = arg(a, 1);
     let mut max = None;
     if is_object(options) {
-        let a_max = vm.intern("maxByteLength");
+        let a_max = vm.intern_name("maxByteLength");
         let m = vm.get(options, a_max)?;
         if !m.is_undefined() {
             max = Some(to_index(vm, m)?);
@@ -674,8 +674,8 @@ fn access_shared(vm: &mut Vm, ta: Value, index: Value) -> Result<(*mut Object, T
 fn wait_result(vm: &mut Vm, async_: bool, value: Value) -> Result<Value> {
     let op = object_value(vm.object_prototype);
     let r = vm.new_object(op);
-    let a_async = vm.intern("async");
-    let a_value = vm.intern("value");
+    let a_async = vm.intern_name("async");
+    let a_value = vm.intern_name("value");
     vm.add_property(r, a_async, Value::from_bool(async_));
     vm.add_property(r, a_value, value);
     Ok(object_value(r))
@@ -787,7 +787,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.define_natives(sp, &[("grow", shared_grow as NativeFn, 1), ("slice", shared_slice, 2)]);
 
     let atomics = vm.new_object(op);
-    let a_atomics = vm.intern("Atomics");
+    let a_atomics = vm.intern_name("Atomics");
     vm.add_property_with(g, a_atomics, object_value(atomics), crate::object::DONT_ENUM);
     vm.define_natives(
         atomics,

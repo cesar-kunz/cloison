@@ -13,7 +13,7 @@ pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
     let op = object_value(vm.object_prototype);
     let json = vm.new_object(op);
-    let a_json = vm.intern("JSON");
+    let a_json = vm.intern_name("JSON");
     vm.add_property_with(g, a_json, object_value(json), DONT_ENUM);
     vm.define_natives(
         json,
@@ -59,7 +59,7 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         gap: Vec::new(),
         indent: Vec::new(),
         stack: Vec::new(),
-        a_to_json: vm.intern("toJSON"),
+        a_to_json: vm.intern_name("toJSON"),
     };
     if is_callable(replacer) {
         st.replacer = Some(replacer);
@@ -119,7 +119,7 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let op = object_value(vm.object_prototype);
         let wrapper = object_value(vm.new_object(op));
         let empty = vm.new_string(&[]);
-        let a_empty = vm.intern("");
+        let a_empty = vm.intern_name("");
         vm.create_data_property(wrapper, Key::Name(a_empty), arg(a, 0))?;
         let mut out = Vec::new();
         Ok(match property(vm, &mut st, empty, wrapper, &mut out)? {
@@ -160,7 +160,7 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         }
     }
     if is_raw_json(v) {
-        let a_raw = vm.intern("rawJSON");
+        let a_raw = vm.intern_name("rawJSON");
         let raw = vm.get(v, a_raw)?;
         out.extend_from_slice(&to_string_units(raw));
         return Ok(true);
@@ -335,10 +335,10 @@ fn json_parse_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let op = object_value(vm.object_prototype);
         let root = object_value(vm.new_object(op));
         vm.handles.push(root);
-        let empty = vm.intern("");
+        let empty = vm.intern_name("");
         vm.create_data_property(root, Key::Name(empty), v)?;
         let key = vm.new_string(&[]);
-        let a_source = vm.intern("source");
+        let a_source = vm.intern_name("source");
         internalize(vm, reviver, root, key, Some(&record), &u, a_source)
     })
 }
@@ -456,7 +456,7 @@ fn json_raw_json(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     parse_text(vm, &u, false)?;
     let o = vm.new_object(Value::NULL);
     let s = vm.new_string(&u);
-    let a_raw = vm.intern("rawJSON");
+    let a_raw = vm.intern_name("rawJSON");
     vm.create_data_property(object_value(o), Key::Name(a_raw), s)?;
     unsafe { (*o).flags |= RAW_JSON };
     vm.seal(o, true);

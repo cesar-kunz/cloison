@@ -102,7 +102,7 @@ pub(crate) fn install(vm: &mut Vm) {
     );
     // `keys` is the very function `values` is.
     let values = vm.define_native(sp, "values", set_values, 0, any, false);
-    let a_keys = vm.intern("keys");
+    let a_keys = vm.intern_name("keys");
     vm.add_property_with(sp, a_keys, object_value(values), DONT_ENUM);
     getter(vm, sp, "size", set_size);
     vm.define_natives(
@@ -531,7 +531,7 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
         return Ok(o);
     }
     let pairs = matches!(class, Class::Map | Class::WeakMap);
-    let a_adder = vm.intern(if pairs { "set" } else { "add" });
+    let a_adder = vm.intern_name(if pairs { "set" } else { "add" });
     let adder = vm.get(o, a_adder)?;
     if !is_callable(adder) {
         return Err(Error::type_error(format!("'{}' returned for property '{}' of object '#<{name}>' is not a function", crate::vm::display(adder), if pairs { "set" } else { "add" })));
@@ -556,7 +556,7 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
 fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Value {
     let op = object_value(vm.object_prototype);
     let r = vm.new_object(op);
-    let (a_value, a_done) = (vm.intern("value"), vm.intern("done"));
+    let (a_value, a_done) = (vm.intern_name("value"), vm.intern_name("done"));
     vm.add_property(r, a_value, value);
     vm.add_property(r, a_done, Value::from_bool(done));
     object_value(r)
@@ -1076,7 +1076,7 @@ fn set_record(vm: &mut Vm, other: Value) -> Result<SetRecord> {
     if !is_object(other) {
         return Err(Error::type_error("The argument must be a set-like object"));
     }
-    let a_size = vm.intern("size");
+    let a_size = vm.intern_name("size");
     let raw = vm.get(other, a_size)?;
     let n = to_number(raw);
     if vm.conv_failed() {
@@ -1089,7 +1089,7 @@ fn set_record(vm: &mut Vm, other: Value) -> Result<SetRecord> {
     if size < 0.0 {
         return Err(Error::range_error("The set-like's size is negative"));
     }
-    let (a_has, a_keys) = (vm.intern("has"), vm.intern("keys"));
+    let (a_has, a_keys) = (vm.intern_name("has"), vm.intern_name("keys"));
     let has = vm.get(other, a_has)?;
     if !is_callable(has) {
         return Err(Error::type_error("The set-like's has is not a function"));
@@ -1112,7 +1112,7 @@ fn record_iterator(vm: &mut Vm, rec: &SetRecord) -> Result<(Value, Value)> {
     if !is_object(it) {
         return Err(Error::type_error("The set-like's keys() is not an iterator"));
     }
-    let a_next = vm.intern("next");
+    let a_next = vm.intern_name("next");
     let next = vm.get(it, a_next)?;
     Ok((it, next))
 }
@@ -1126,7 +1126,7 @@ fn record_keys(vm: &mut Vm, rec: &SetRecord, f: impl FnMut(&mut Vm, Value) -> Re
 
 /// [`record_keys`] of an iterator already got (`record_iterator`).
 fn each_key(vm: &mut Vm, (it, next): (Value, Value), mut f: impl FnMut(&mut Vm, Value) -> Result<bool>) -> Result<bool> {
-    let (a_done, a_value) = (vm.intern("done"), vm.a_value);
+    let (a_done, a_value) = (vm.intern_name("done"), vm.a_value);
     loop {
         let r = call_function(vm, next, it, &[])?;
         if !is_object(r) {

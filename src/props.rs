@@ -524,6 +524,12 @@ impl Vm {
                 out.push((Key::Name(name), s.attrs()[k] & DONT_ENUM == 0));
             }
         }
+        // (A native may hold them across user code: see `Vm::held_atoms`.)
+        for &(k, _) in &out {
+            if let Key::Name(a) = k {
+                self.hold_atom(a);
+            }
+        }
         out
     }
 

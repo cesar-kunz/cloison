@@ -11449,6 +11449,51 @@ main();
 }
 
 
+/// A tagged template's strings array goes with the code whose site it is
+/// (#35): `Vm::template_cache` kept every one for good, a root of every
+/// collection, so code made at run time with a template grew the heap at
+/// each copy. Templates of functions made at run time and dropped are
+/// freed; each site's array stays the same frozen one while its code
+/// lives, and a live code's is kept.
+#[test]
+fn tagged_templates_go_with_their_code() {
+    let src = r#"
+var out = [];
+function tag(s) { return s; }
+var refs = [], same = true;
+async function main() {
+  for (var r = 0; r < 8; r++) {
+    for (var k = 0; k < 30; k++) {
+      var f = new Function("tag", "return tag`a${1}b" + (r * 100 + k) + "`;");
+      var a = f(tag);
+      if (a !== f(tag) || !Object.isFrozen(a) || a.raw[1] !== "b" + (r * 100 + k)) same = false;
+      refs.push(new WeakRef(a));
+    }
+    await null;
+    $262.gc();
+  }
+  var keep = new Function("tag", "return tag`kept`;");
+  var k1 = keep(tag);
+  await null;
+  $262.gc(); $262.gc();
+  await null;
+  $262.gc();
+  out.push(same, keep(tag) === k1, refs.filter(function (w) { return w.deref() === undefined; }).length >= 200);
+}
+main();
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let report = cloison::js::compile("out.join(' ')").unwrap();
+    for budget in [i64::MAX, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.run(&module).unwrap();
+        let r = vm.run(&report).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("true true true"), "tier at {budget}");
+        vm.heap.verify();
+    }
+}
+
 /// Versions calling each other, bound to each other's (`CallSite::target`),
 /// hold each other: freeing their functions dropped their compiled state
 /// but not those versions, whose snapshots still named the functions'

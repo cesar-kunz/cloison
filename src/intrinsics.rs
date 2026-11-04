@@ -351,9 +351,10 @@ fn template_string(vm: &mut Vm, v: Value) -> Result<Value> {
 /// `raw` array.
 fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let site = a[0].as_number().unwrap_or(0.0) as u64;
-    if let Some(&o) = vm.template_cache.get(&site) {
+    if let Some(&(o, _)) = vm.template_cache.get(&site) {
         return Ok(object_value(o));
     }
+    let code = vm.intrinsic_code;
     let strings = vm.new_array();
     let raw = vm.new_array();
     for pair in a[1..].chunks(2) {
@@ -371,7 +372,7 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     };
     vm.define_own_property(as_object(strings), Key::Name(a_raw), &d)?;
     vm.seal(as_object(strings), true);
-    vm.template_cache.insert(site, as_object(strings));
+    vm.template_cache.insert(site, (as_object(strings), code));
     Ok(strings)
 }
 

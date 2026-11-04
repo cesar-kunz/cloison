@@ -853,7 +853,8 @@ pub struct Vm {
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
-    /// `typeof`'s results, once made (see [`Vm::type_of`]).
+    /// `typeof`'s results, once made (see [`Vm::type_of`]): string
+    /// constants, forgotten with them (`Vm::prune_strings`).
     pub(crate) type_names: [Option<Value>; 8],
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
@@ -6328,6 +6329,13 @@ impl Vm {
     /// a root of every marking). `live`: a cell found.
     pub(crate) fn prune_strings(&mut self, live: impl Fn(Value) -> bool) {
         self.strings.retain(|_, v| live(*v));
+        // `typeof`'s copies of them too: a name freed would be given again
+        // (its cell another string's by then).
+        for t in &mut self.type_names {
+            if t.is_some_and(|v| !live(v)) {
+                *t = None;
+            }
+        }
     }
 
     pub(crate) fn string_constant_slots(&mut self) -> impl Iterator<Item = &mut Value> {

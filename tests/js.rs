@@ -11838,3 +11838,62 @@ out.join(" | ");
     let r = Vm::new().run(&module).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok(want), "tier by default");
 }
+
+/// An inlined frame's `arguments` read only for its length and elements
+/// stays the array of its call's arguments (`Lowering::array_arguments`),
+/// and answers as the arguments object: a key that isn't an element it
+/// has (`callee`, `push`, `-1`, past the end, a symbol, one an element of
+/// `Array.prototype` names) leaves the compiled code, and the interpreter
+/// reads an arguments object made at the exit (`materialize`), also
+/// through a copy (`var a = arguments`). Interpreted, compiled at once or
+/// not, and by default: what V8 and SpiderMonkey give.
+#[test]
+fn inlined_arguments_kept_arrays_answer_as_arguments_objects() {
+    let src = r#"
+var out = [];
+function get() { var a = arguments; return a[a[0]]; }
+var keys = [0, "callee", "push", "length", -1, 3, 1.5, "0", Symbol.iterator, "constructor", "toString", 1];
+function len() { return arguments.length; }
+function sum() { var s = 0; for (var i = 0; i < arguments.length; i++) s += arguments[i]; return s; }
+function far() { return arguments[arguments[0] + 5]; }
+var r = {};
+for (var k = 0; k < 30000; k++) {
+  var key = keys[k % keys.length];
+  var v = get(key, "x");
+  r[(typeof key === "symbol" ? "sym" : String(key)) + ":" + (typeof v === "function" ? "fn:" + (v === get) : String(v))] = 1;
+  r["len" + len(1, 2, 3)] = 1;
+  r["sum" + sum(1, 2, 3, k % 3)] = 1;
+  r["far" + far(k % 2)] = 1;
+}
+out.push(Object.keys(r).sort().join(" "));
+Array.prototype[7] = "a7";
+Object.prototype[8] = "o8";
+function at7() { return arguments[7]; }
+function at8() { return arguments[8]; }
+r = {};
+for (var k = 0; k < 30000; k++) r[at7(1) + "/" + at8(1)] = 1;
+out.push(Object.keys(r).join(" "));
+delete Array.prototype[7];
+delete Object.prototype[8];
+function inner(a, b) { return a + b; }
+function outer() { var a = arguments; return inner(a[0], a[1]) + a.length; }
+var t = 0;
+for (var k = 0; k < 30000; k++) t += outer(k, 1);
+out.push(t);
+function late() { return typeof arguments[arguments[0]]; }
+r = {};
+for (var k = 0; k < 30000; k++) r[late(k < 25000 ? 1 : "callee", 2)] = 1;
+out.push(Object.keys(r).join());
+out.join(" | ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let want = "-1:undefined 0:0 1.5:undefined 1:x 3:undefined callee:fn:true constructor:fn:false farundefined len3 length:2 push:undefined sum6 sum7 sum8 sym:fn:false toString:fn:false | undefined/o8 | 450075000 | number,function";
+    for budget in [i64::MAX, 1, 2] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
+    }
+    let r = Vm::new().run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok(want), "tier by default");
+}

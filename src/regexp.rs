@@ -219,11 +219,11 @@ impl Parser<'_> {
                 0 => Node::Empty,
                 // (A lone surrogate as its code unit, matching alone: see
                 // `code_points`.)
-                _ => Node::Seq(s.into_iter().map(|c| char::from_u32(c).map_or(Node::Char(c as u16), char_node)).collect()),
+                _ => Node::Seq(s.into_iter().map(|c| char::from_u32(c).map_or(Node::Char(c as u16), |c| self.char_here(c))).collect()),
             })
             .collect();
         if !set.cps.is_empty() || alts.is_empty() {
-            alts.push(cp_class(set.cps, false));
+            alts.push(self.cp_class_here(set.cps, false));
         }
         if alts.len() == 1 { alts.pop().unwrap() } else { Node::Alt(alts) }
     }
@@ -332,6 +332,24 @@ impl Parser<'_> {
 
     fn at(&self, s: &str) -> bool {
         s.chars().enumerate().all(|(k, c)| self.c.get(self.i + k) == Some(&c))
+    }
+
+    /// [`cp_class`] of `ranges` where the parser is: with `i` (and `u` or
+    /// `v`), with the code points folding together with an astral one of
+    /// them ([`fold_closure`]).
+    fn cp_class_here(&self, ranges: Vec<(u32, u32)>, neg: bool) -> Node {
+        cp_class(if self.case() == Case::Unicode { fold_closure(ranges) } else { ranges }, neg)
+    }
+
+    /// Character `c` as an atom where the parser is: with `i` (and `u` or
+    /// `v`), one folding together with an astral character is a class of
+    /// them ([`astral_folds`]); the others' case the matcher folds.
+    fn char_here(&self, c: char) -> Node {
+        if self.case() == Case::Unicode && astral_folds().iter().any(|m| m.binary_search(&(c as u32)).is_ok()) {
+            cp_class(fold_closure(vec![(c as u32, c as u32)]), false)
+        } else {
+            char_node(c)
+        }
     }
 
     /// `s` folded if `i` holds here.
@@ -784,6 +802,55 @@ impl Regex {
     }
 }
 
+/// Where a match of group text `s[a..b]` at `at` ends, compared as `case`
+/// says, if it matches. With `u`'s Unicode folding, by code point
+/// (BackreferenceMatcher's Canonicalize of each character): a surrogate
+/// pair is one, and may fold to a unit (U+1DF95 to `ß`).
+fn backref_at(case: Case, s: &[u16], a: usize, b: usize, at: usize) -> Option<usize> {
+    if case != Case::Unicode {
+        let n = b - a;
+        return (at + n <= s.len() && (0..n).all(|d| eq(case, s[at + d], s[a + d]))).then_some(at + n);
+    }
+    let cp = |i: usize| astral_at(s, i).map_or((s[i] as u32, 1), |c| (c, 2));
+    let (mut i, mut j) = (a, at);
+    while i < b {
+        if j >= s.len() {
+            return None;
+        }
+        let ((x, m), (y, n)) = (cp(i), cp(j));
+        if x != y && fold_point(x) != fold_point(y) {
+            return None;
+        }
+        (i, j) = (i + m, j + n);
+    }
+    Some(j)
+}
+
+/// [`backref_at`] backwards (in a lookbehind): where a match of group
+/// text `s[a..b]` ending at `at` starts, if it matches.
+fn backref_before(case: Case, s: &[u16], a: usize, b: usize, at: usize) -> Option<usize> {
+    if case != Case::Unicode {
+        let n = b - a;
+        return (n <= at && (0..n).all(|d| eq(case, s[at - n + d], s[a + d]))).then_some(at - n);
+    }
+    let cp = |i: usize| match i.checked_sub(2).and_then(|k| astral_at(s, k)) {
+        Some(c) => (c, 2),
+        None => (s[i - 1] as u32, 1),
+    };
+    let (mut i, mut j) = (b, at);
+    while i > a {
+        if j == 0 {
+            return None;
+        }
+        let ((x, m), (y, n)) = (cp(i), cp(j));
+        if x != y && fold_point(x) != fold_point(y) {
+            return None;
+        }
+        (i, j) = (i - m, j - n);
+    }
+    Some(j)
+}
+
 /// Whether `a` matches `b`, folding case if `ic`.
 fn eq(ic: Case, a: u16, b: u16) -> bool {
     a == b || (ic != Case::Exact && ic.canon(a) == ic.canon(b))
@@ -825,26 +892,13 @@ impl Case {
     }
 }
 
-/// `c`'s simple case folding (CaseFolding.txt's C and S, a unit's): its
-/// upper case's lower case, where each is one character (the same for the
-/// units that fold together); `ı` folds to itself.
+/// `c`'s simple case folding (CaseFolding.txt's C and S, a unit's; see
+/// [`fold_point`]). A unit of the BMP folds to one too.
 fn simple_fold(c: u16) -> u16 {
-    let Some(ch) = char::from_u32(c as u32) else {
-        return c;
-    };
     if c < 0x80 {
         return (c as u8).to_ascii_lowercase() as u16;
     }
-    if c == 0x0131 {
-        return c;
-    }
-    let one = |s: &mut dyn Iterator<Item = char>| match (s.next(), s.next()) {
-        (Some(x), None) => Some(x),
-        _ => None,
-    };
-    let up = one(&mut ch.to_uppercase()).unwrap_or(ch);
-    let low = one(&mut up.to_lowercase()).unwrap_or(up);
-    if (low as u32) < 0x10000 { low as u16 } else { c }
+    fold_point(c as u32) as u16
 }
 
 /// Whether `c` is in the class of `ranges` (negated if `neg`), folding
@@ -1412,7 +1466,7 @@ impl Parser<'_> {
             '{' if self.braces_at_atom() => return Err(self.error("Nothing to repeat")),
             '{' | '}' | ']' if self.unicode => return Err(self.error("Lone quantifier brackets")),
             '*' | '+' | '?' => return Err(self.error("Nothing to repeat")),
-            c => char_node(c),
+            c => self.char_here(c),
         })
     }
 
@@ -1470,7 +1524,7 @@ impl Parser<'_> {
             }
             'p' | 'P' if self.unicode => {
                 let set = self.property(e == 'P')?;
-                cp_class(set, false)
+                self.cp_class_here(set, false)
             }
             'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
                 let (ranges, neg) = self.class_escape(e);
@@ -1492,7 +1546,7 @@ impl Parser<'_> {
                     return Err(self.error("Invalid Unicode escape"));
                 };
                 self.i = s + end + 1;
-                char_node(c)
+                self.char_here(c)
             }
             '1'..='9' => {
                 let s = self.i - 1;
@@ -1676,7 +1730,7 @@ impl Parser<'_> {
             return Err(m);
         }
         if self.unicode {
-            return Ok(cp_class(ranges, neg));
+            return Ok(self.cp_class_here(ranges, neg));
         }
         let mut units: Vec<(u16, u16)> = ranges.into_iter().map(|(lo, hi)| (lo as u16, hi as u16)).collect();
         units.sort();
@@ -1860,19 +1914,60 @@ fn intersect_points(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
     out
 }
 
-/// Code point `c`'s simple case folding (as [`simple_fold`] for a unit,
-/// any code point's).
+/// Code point `c`'s simple case folding (scf: CaseFolding.txt's C and S
+/// mappings, `unicode_casefold::SIMPLE`, of the Unicode version of the
+/// `char` tables `toUpperCase` uses), or `c`.
 fn fold_point(c: u32) -> u32 {
-    if c < 0x10000 {
-        return simple_fold(c as u16) as u32;
+    let t = &crate::unicode_casefold::SIMPLE;
+    match t.binary_search_by_key(&c, |&(from, _)| from) {
+        Ok(k) => t[k].1,
+        Err(_) => c,
     }
-    let Some(ch) = char::from_u32(c) else { return c };
-    let one = |s: &mut dyn Iterator<Item = char>| match (s.next(), s.next()) {
-        (Some(x), None) => Some(x),
-        _ => None,
-    };
-    let up = one(&mut ch.to_uppercase()).unwrap_or(ch);
-    one(&mut up.to_lowercase()).unwrap_or(up) as u32
+}
+
+/// The code points that fold together with an astral one (scf), each
+/// such set sorted: the matcher compares an astral character, a surrogate
+/// pair, exactly, so `u` mode's `i` adds them to a set it is in (see
+/// [`fold_closure`]). (One has a BMP member: U+1DF95 folds to `ß`.)
+fn astral_folds() -> &'static [Vec<u32>] {
+    use std::sync::OnceLock;
+    static SETS: OnceLock<Vec<Vec<u32>>> = OnceLock::new();
+    SETS.get_or_init(|| {
+        let mut by: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+        for &(from, to) in crate::unicode_casefold::SIMPLE.iter() {
+            by.entry(to).or_insert_with(|| vec![to]).push(from);
+        }
+        by.into_values()
+            .filter(|m| m.iter().any(|&c| c > 0xFFFF))
+            .map(|mut m| {
+                m.sort_unstable();
+                m
+            })
+            .collect()
+    })
+}
+
+/// Code points `ranges` with every code point that folds together with an
+/// astral one of them, or with an astral one folding together with one of
+/// them (CharacterSetMatcher with `i` and `u` or `v`: a set matches a
+/// character if one of its members folds as it does). The BMP's others
+/// the matcher finds by folding units.
+fn fold_closure(ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    let mut r = merge(ranges);
+    let mut more = Vec::new();
+    // (Without astral members, only the sets with a BMP one can be in: a
+    // class made of BMP ranges alone costs a check of those.)
+    let astral = r.last().is_some_and(|&(_, hi)| hi > 0xFFFF);
+    for m in astral_folds().iter().filter(|m| astral || m[0] <= 0xFFFF) {
+        if m.iter().any(|&c| in_points(&r, c)) {
+            more.extend(m.iter().map(|&c| (c, c)));
+        }
+    }
+    if !more.is_empty() {
+        r.extend(more);
+        r = merge(r);
+    }
+    r
 }
 
 /// The code points simple case folding changes (made once): with `i` and
@@ -2767,12 +2862,13 @@ impl Program {
                     pc += 1;
                     match caps[g as usize] {
                         None => true,
-                        Some((a, b)) => {
-                            let n = b - a;
-                            let ok = pos + n <= s.len() && (0..n).all(|d| eq(case, s[pos + d], s[a + d]));
-                            pos += n;
-                            ok
-                        }
+                        Some((a, b)) => match backref_at(case, s, a, b, pos) {
+                            Some(end) => {
+                                pos = end;
+                                true
+                            }
+                            None => false,
+                        },
                     }
                 }
                 Insn::Split(to) => {
@@ -2894,12 +2990,13 @@ impl Program {
                     pc += 1;
                     match caps[g as usize] {
                         None => true,
-                        Some((a, b)) => {
-                            let n = b - a;
-                            let ok = n <= pos && (0..n).all(|d| eq(case, s[pos - n + d], s[a + d]));
-                            pos = pos.saturating_sub(n);
-                            ok
-                        }
+                        Some((a, b)) => match backref_before(case, s, a, b, pos) {
+                            Some(start) => {
+                                pos = start;
+                                true
+                            }
+                            None => false,
+                        },
                     }
                 }
                 Insn::LookEnd | Insn::BehindEnd => {
@@ -3068,10 +3165,7 @@ impl<'a> Matcher<'a> {
                 let Some((a, b)) = self.caps.get(*g).copied().flatten() else {
                     return k(self, i);
                 };
-                let n = b - a;
-                i + n <= s.len()
-                    && (0..n).all(|d| eq(*case, s[i + d], s[a + d]))
-                    && k(self, i + n)
+                backref_at(*case, s, a, b, i).is_some_and(|end| k(self, end))
             }
             // A failed match leaves the captures as they were (a group
             // restores its own when `k` fails), so nothing is saved here.

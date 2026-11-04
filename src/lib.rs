@@ -76,6 +76,7 @@ pub mod props;
 pub mod regexp;
 mod normalize;
 mod unicode_norm;
+mod unicode_casefold;
 mod unicode_props;
 mod unicode_strings;
 mod stack;

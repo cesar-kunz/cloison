@@ -2481,6 +2481,17 @@ impl Vm {
                 }
             }
         }
+        // While a lowering is under way, the codes the JIT has state or
+        // decodings of are live: it may be inlining one, which no snapshot
+        // names yet (and their constants, nested functions and compiled
+        // code stay with them; the review of #39).
+        if crate::jit::compiling() {
+            for c in self.codes.iter() {
+                if self.jit_caches.has(&**c) || c.jit.try_borrow().map_or(true, |j| j.is_some()) {
+                    mark_code(&**c);
+                }
+            }
+        }
         // (For the versions frames run, read once if any is asked for: see
         // `jit::mark_referenced_codes`.)
         let mut words: Option<Vec<usize>> = None;
@@ -2627,19 +2638,15 @@ impl Vm {
     /// what the JIT found of them is forgotten (their addresses then
     /// others'). One the JIT took is live while compiled code alive refers
     /// to it (see `jit::mark_referenced_codes`): it was kept for good (#35).
-    /// A native's stays; and, while a lowering is under way, one the JIT
-    /// took, which it may be inlining. A pinned one not found live has no
-    /// compiled code to drop.
+    /// A native's stays (and, while a lowering is under way, one the JIT
+    /// took is found live: see `mark_live_codes`). A pinned one not found
+    /// live has no compiled code to drop.
     fn condemn_codes(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         let from = self.heap.gc.codes_from;
-        let compiling = crate::jit::compiling();
-        let caches = &self.jit_caches;
-        let (mut live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes).into_iter().partition(|c| {
-            c.pinned.get()
-                || c.mark.load(Relaxed) >= from
-                || compiling && (caches.has(&**c) || c.jit.try_borrow().map_or(true, |j| j.is_some()))
-        });
+        let (mut live, dead): (Vec<_>, Vec<_>) = std::mem::take(&mut self.codes)
+            .into_iter()
+            .partition(|c| c.pinned.get() || c.mark.load(Relaxed) >= from);
         // (A function freed is nested only in functions no marking found
         // live, which can't make a closure of it again; but the JIT's
         // analysis of a variable walks a pinned one's nested functions,
@@ -2657,6 +2664,7 @@ impl Vm {
                 }
             }
             self.jit_caches.forget(&codes);
+            self.jit_caches.drop_retired_of(&codes);
             self.jitted.retain(|c| !codes.contains(c));
             // (And the field types they took: a field generalizing marks
             // its dependents' codes, and unbinds the calls into them.)

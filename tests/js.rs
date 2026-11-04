@@ -11499,3 +11499,39 @@ total + " " + obj.x;
     }
 }
 
+/// A VM dropped leaves none of its compiled versions (the review of #39):
+/// versions calling each other, bound to each other's, and retired ones
+/// whose own call sites were bound to them, held each other after their
+/// functions were freed or their VM dropped, in the JIT's registry of
+/// them (`jit::alive`), which then named codes' addresses other VMs' got.
+/// Functions calling each other, compiled, some made at run time, then
+/// the VM dropped.
+#[test]
+fn a_dropped_vm_leaves_no_compiled_versions() {
+    let src = r#"
+var total = 0;
+function even(n) { return n === 0 ? 1 : odd(n - 1) + 1; }
+function odd(n) { return n === 0 ? 2 : even(n - 1) + 2; }
+for (var i = 0; i < 3000; i++) total = (total + even(i & 31) + odd(i & 15)) | 0;
+for (var r = 0; r < 5; r++) {
+  var pair = new Function("k", "function a(n) { return n === 0 ? k : b(n - 1) + 1; }" +
+    "function b(n) { return n === 0 ? 2 * k : a(n - 1) + 2; }" +
+    "return [a, b];")(r);
+  for (var i = 0; i < 2000; i++) total = (total + pair[0](i & 31) + pair[1](i & 15)) | 0;
+  $262.gc();
+}
+total;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    assert_eq!(cloison::jit::alive(), (0, 0));
+    for budget in [2, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("516348"), "tier at {budget}");
+        assert!(cloison::jit::alive().1 > 0, "tier at {budget}: compiled");
+        drop(vm);
+        assert_eq!(cloison::jit::alive(), (0, 0), "tier at {budget}: versions left");
+    }
+}
+

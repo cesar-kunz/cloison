@@ -118,6 +118,28 @@ thread_local! {
     static LOWERING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+impl Snapshot {
+    /// Its call sites unbound from their versions (see
+    /// `JitFunction::unbind_targets`).
+    fn drop_targets(&self) {
+        for site in &self.sites {
+            unsafe { (*site.get()).drop_targets() };
+        }
+    }
+}
+
+impl JitCode {
+    /// Its snapshot's call sites and its own unbound from their versions.
+    fn drop_targets(&self) {
+        if let Some(s) = &self.snap {
+            s.drop_targets();
+        }
+        for site in &self.forks {
+            unsafe { (*site.get()).drop_targets() };
+        }
+    }
+}
+
 fn note_snapshot(s: &Rc<Snapshot>) {
     ALIVE.with(|a| a.borrow_mut().0.insert(Rc::as_ptr(s)));
 }
@@ -212,6 +234,15 @@ fn mark_codes_of(
         unsafe { (*site.get()).each_code(&mut |c| more |= mark(c)) };
     }
     more
+}
+
+/// The snapshots and versions alive on this thread (for tests: a VM's
+/// dropped leave none, see `Vm::drop`).
+pub fn alive() -> (usize, usize) {
+    ALIVE.with(|a| {
+        let (s, c) = &*a.borrow();
+        (s.len(), c.len())
+    })
 }
 
 /// A lowering is under way: the codes it took (inlined, bound) are in no
@@ -10462,6 +10493,28 @@ impl Caches {
         self.smis.retain(|c, _| !gone.contains(c));
     }
 
+    /// The versions retired of the functions `gone`, freed: none runs (a
+    /// frame running one keeps its function, see `mark_referenced_codes`),
+    /// but versions calling each other, or one its own snapshot's call site
+    /// is bound to, would hold each other for good (see `free_retired`;
+    /// the review of #39). Their call sites unbound, they go.
+    pub(crate) fn drop_retired_of(&mut self, gone: &HashSet<*const crate::vm::Code>) {
+        let of = |c: &Rc<JitCode>| c.snap.as_ref().is_some_and(|s| s.frames.first().is_some_and(|f| gone.contains(&f.code)));
+        for c in self.retired.iter().filter(|c| of(c)) {
+            c.drop_targets();
+        }
+        self.retired.retain(|c| !of(c));
+    }
+
+    /// Every version retired, its call sites unbound (the VM dropped: see
+    /// `Vm::drop`).
+    pub(crate) fn drop_all_retired(&mut self) {
+        for c in &self.retired {
+            c.drop_targets();
+        }
+        self.retired.clear();
+    }
+
     /// The JIT found something of `code` (decoded it): during a lowering,
     /// one it may have taken (see [`compiling`]).
     pub(crate) fn has(&self, code: *const crate::vm::Code) -> bool {
@@ -16144,21 +16197,11 @@ impl JitFunction {
     /// which versions calling each other would keep, with what they refer
     /// to, after both functions are freed.
     pub(crate) fn unbind_targets(&mut self) {
-        let sites = |s: &Snapshot| {
-            for site in &s.sites {
-                unsafe { (*site.get()).drop_targets() };
-            }
-        };
         if let Some(v) = &self.vm {
-            sites(&v.snap);
+            v.snap.drop_targets();
         }
         for (_, c) in self.versions.values().flatten() {
-            if let Some(s) = &c.snap {
-                sites(s);
-            }
-            for site in &c.forks {
-                unsafe { (*site.get()).drop_targets() };
-            }
+            c.drop_targets();
         }
     }
 

@@ -928,9 +928,11 @@ pub struct Vm {
     /// `intrinsics::construct_with`); `undefined` otherwise.
     pub(crate) derived_construct: Value,
     /// Tagged templates' strings arrays, by site (see
-    /// `intrinsics::template_object`), with the code whose site it is:
-    /// forgotten when that code is freed (`gc::condemn_codes`).
-    pub(crate) template_cache: crate::jit::HashMap<u64, (*mut Object, *const Code)>,
+    /// `intrinsics::template_object`), with the codes whose site it is
+    /// (more than one when a module runs again: its codes are loaded
+    /// again, with the same sites): forgotten when they are all freed
+    /// (`gc::condemn_codes`).
+    pub(crate) template_cache: crate::jit::HashMap<u64, (*mut Object, Vec<*const Code>)>,
     /// The code of the frame running an intrinsic (`interp::op_intrinsic`).
     pub(crate) intrinsic_code: *const Code,
     /// Symbols, by their key atoms (see `symbol`).

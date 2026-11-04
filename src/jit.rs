@@ -1797,6 +1797,18 @@ struct Insn {
     /// `Math.max` (8) or `Math.min` (9) of two, after a guard on the callee.
     /// (3: see `scalar_replace`.)
     native: u8,
+    /// For a `push` (`native` 1): onto an array this code made, not a
+    /// call in the program. An array literal's element (`PushLiteral`,
+    /// which `decode` makes a `Call`) or an inlined frame's `arguments`
+    /// object's (`CreateArguments` in `lower`). Its callee and receiver
+    /// are both the array's register (there is no callee to guard and no
+    /// inline cache), and its element is in `acc`, never in its window: it
+    /// reads the array's register alone (`call_reads`). This flag, not
+    /// `reg == reg2`, tells it from a real `a.push(v)` inlined (the
+    /// method's register then a register of its own, its window the
+    /// receiver and the argument), which nothing guarantees never to share
+    /// a register.
+    own_push: bool,
     /// For a `GetNamed`: only its receiver's shape check, the value unused
     /// (a proven callee's load; see `Lowering::drop_callee_load`). For the
     /// `Star` of that value: no code (analyses still see the register
@@ -1915,9 +1927,12 @@ impl Insn {
     }
 
     /// The registers a call reads: the callee and the argument window
-    /// (receiver first, for `Call`).
+    /// (receiver first, for `Call`). A `push` onto an array this code made
+    /// ([`Insn::own_push`]) reads the array's register alone: its element
+    /// is in `acc`, and the register after it is no argument (it may be a
+    /// variable not written yet, whose stale value nothing may look at).
     fn call_reads(&self) -> impl Iterator<Item = usize> {
-        let n = self.imm as usize + usize::from(self.op == Op::Call);
+        let n = if self.own_push { 0 } else { self.imm as usize + usize::from(self.op == Op::Call) };
         let (f, w) = (self.reg as usize, self.reg2 as usize);
         std::iter::once(f).chain(w..w + n)
     }
@@ -2009,7 +2024,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
             let mut forward = false;
             let mut delete = 0;
             // `PushLiteral`: a `push` onto the literal's array (see
-            // `Insn::native`).
+            // `Insn::native`, `Insn::own_push`).
             let mut native = 0;
             let op = match op {
                 Op::PushLiteral if vm => {
@@ -2197,6 +2212,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 on_shape: false,
                 alloc: 0,
                 native,
+                own_push: native == 1,
                 check_only: false,
                 store_check: false,
                 exit_const: 0,
@@ -11381,6 +11397,7 @@ fn synth(op: Op, reg: u8, frame: usize, pc: usize) -> Insn {
         on_shape: false,
         alloc: 0,
         native: 0,
+        own_push: false,
         check_only: false,
         store_check: false,
         exit_const: 0,
@@ -13828,7 +13845,7 @@ impl Lowering<'_> {
                     !strict && (i.reg2 == this || self.fwd.iter().any(|&(w, x)| w == i.reg2 && x == this));
             }
             // An array literal's element: its `push`, nothing to guard.
-            if i.native == 1 && !i.bail {
+            if i.own_push && !i.bail {
                 self.push(i, Prop::None);
                 continue;
             }
@@ -14079,7 +14096,7 @@ impl Lowering<'_> {
                         for a in 0..n {
                             self.push(synth(Op::Ldar, first + a, frame, i.pc), Prop::None);
                             let mut push = synth(Op::Call, r, frame, i.pc);
-                            (push.reg2, push.imm, push.native) = (r, 0, 1);
+                            (push.reg2, push.imm, push.native, push.own_push) = (r, 0, 1, true);
                             self.push(push, Prop::None);
                         }
                         continue;
@@ -17936,6 +17953,27 @@ mod tests {
         bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
         })
+    }
+
+    /// A `push` onto an array literal's array ([`Insn::own_push`]) reads
+    /// that register alone, its element in `acc`; a call reads its callee
+    /// and its window, the receiver and the arguments, though its callee
+    /// and receiver share a register (as a literal's push's do: that is
+    /// not what tells them apart).
+    #[test]
+    fn a_literals_push_reads_its_array_alone() {
+        let mut code = vec![Op::PushLiteral as u8, 5];
+        code.extend([Op::Call as u8, 5, 5, 1, 0, 0]);
+        code.extend([Op::Call as u8, 3, 7, 1, 0, 0]);
+        assert_eq!(code.len(), Op::PushLiteral.size() + 2 * Op::Call.size());
+        let insns = decode(&code, true);
+        let reads = |i: &Insn| i.call_reads().collect::<Vec<_>>();
+        let (lit, call, other) = (&insns[0], &insns[1], &insns[2]);
+        assert!(lit.op == Op::Call && lit.native == 1 && lit.own_push && lit.takes_acc());
+        assert_eq!(reads(lit), [5]);
+        assert!(call.op == Op::Call && !call.own_push && call.native == 0);
+        assert_eq!(reads(call), [5, 5, 6]);
+        assert_eq!(reads(other), [3, 7, 8]);
     }
 
     /// `mod_magic`'s quotients are exact for every dividend below 2^31:

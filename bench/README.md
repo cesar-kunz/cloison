@@ -61,6 +61,13 @@ node bench/run.mjs --engine "target/release/cloison" bench/micro/0*.js
 - [sparse/](sparse/) holds the sparse-array workloads and the sweep
   that chose the density settings (docs/sparse-arrays.md).
 
+- [strings/](strings/): `concat.sh [ENGINE ...]` runs `concat.js`, strings
+  built by `+=` and by prepending (constant, numeric, mixed operands) at
+  100K to 800K pieces, timing the build apart from the first
+  materialization and later reads (medians of 5), with cloison's
+  allocations, collections and peak RSS. Each configuration's build time
+  for 8x the pieces is checked: past 24x is flagged as quadratic (#14).
+
 - `scripts/sizes.sh` reports the size of the runtime, of the stencils,
   and of the code the JIT generates for each listing in
   [bytecode/](bytecode/); `--record` appends them to

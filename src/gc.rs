@@ -2143,6 +2143,7 @@ impl Vm {
                 self.prune_symbols(m.mode);
                 let color = m.mode.color;
                 self.prune_strings(|v| !v.is_cell() || *crate::heap::meta(v.to_bits() as usize) & COLOR == color);
+                self.prune_templates(|o| *crate::heap::meta(o as usize) & COLOR == color);
             }
             if kind == Collection::Final && check {
                 self.verify_marking(sp, regs, color);
@@ -2711,13 +2712,12 @@ impl Vm {
             }
             self.jit_caches.forget(&codes);
             self.jit_caches.drop_retired_of(&codes);
-            // Their tagged templates' strings arrays, once no code whose
-            // site it is lives: none makes them again (#35), freed at the
-            // next collection.
-            self.template_cache.retain(|_, (_, owners)| {
+            // Their tagged templates' strings arrays: once no code whose site
+            // it is lives, no longer roots of a full marking, forgotten after
+            // one that doesn't find them (#35; `Vm::prune_templates`).
+            for (_, owners) in self.template_cache.values_mut() {
                 owners.retain(|c| !codes.contains(c));
-                !owners.is_empty()
-            });
+            }
             self.jitted.retain(|c| !codes.contains(c));
             // (And the field types they took: a field generalizing marks
             // its dependents' codes, and unbinds the calls into them.)
@@ -2823,6 +2823,14 @@ impl Vm {
             // The VM's own references.
             for v in self.named_roots() {
                 m.value(v);
+            }
+            // Tagged templates' strings arrays (`Vm::template_cache`): a full
+            // marking keeps those a live code's site has, the others if
+            // something else holds them; a minor collection all.
+            for (o, codes) in self.template_cache.values() {
+                if m.mode.kind != Kind::Full || !codes.is_empty() {
+                    m.value(crate::object::object_value(*o));
+                }
             }
             // Symbols, by their key atoms (`Vm::symbols`): a full marking
             // keeps those live shapes have as keys (see `mark_symbol_keys`);
@@ -3236,6 +3244,7 @@ impl Vm {
         // keeps the global object's).
         {
             let mut own: Vec<usize> = self.symbols.values().map(|&o| o as usize).collect();
+            own.extend(self.template_cache.values().map(|t| t.0 as usize));
             self.named_root_slots(&mut |r| unsafe {
                 match r {
                     Root::Object(a) if !(*a).is_null() => own.push(*a as usize),
@@ -4018,6 +4027,10 @@ impl Vm {
                 }
             }
             self.named_root_slots(f);
+            // (The tagged templates' arrays: see `mark_roots`.)
+            for (o, _) in self.template_cache.values_mut() {
+                f(Root::Object(o));
+            }
             // (The symbols a full marking found: see `mark_symbol_keys`.)
             for o in self.symbols.values_mut() {
                 f(Root::Object(o));

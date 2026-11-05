@@ -10,7 +10,7 @@ The whole engine is small: a 5.7 MB binary (stripped, static, x86-64) with
 Yet on several Octane benchmarks it comes close to V8 14.6 capped at its
 Maglev tier: Richards at 0.87 of Maglev's score, DeltaBlue at 0.81, Crypto
 at 0.66 and NavierStokes at 0.57 on an Apple silicon Mac (geomean 0.32
-over all of Octane there, 0.43 on Linux x86-64; see [Results](#results)).
+over all of Octane there, 0.51 on Linux x86-64; see [Results](#results)).
 
 The name: in cloisonné enamel, *cloisons* are thin metal walls that
 make fixed cells, which are then filled with enamel. The JIT's stencils
@@ -281,7 +281,7 @@ geomean for it.
 
 The numbers that follow are from an Ubuntu Linux x86-64 host.
 
-Octane there at 957e562, cloison's JIT against V8 14.6 (Node 26) capped at
+Octane there at 0fbcab6, cloison's JIT against V8 14.6 (Node 26) capped at
 Maglev and at Sparkplug (medians of three runs, from
 `scripts/octane-tiers.sh`, which also has cloison's interpreter and V8's other
 tiers). At c842d29, above, a function calling `eval` directly dropped
@@ -290,22 +290,22 @@ before the fix) and PdfJS (9,094) were the benchmarks it hit:
 
 | benchmark | V8 Maglev | cloison | V8 Sparkplug | cloison / Maglev |
 |---|---:|---:|---:|---:|
-| DeltaBlue | 57,146 | 58,514 | 2,863 | 1.02 |
-| Richards | 40,813 | 34,282 | 2,768 | 0.84 |
-| Crypto | 36,112 | 21,635 | 2,477 | 0.60 |
-| CodeLoad | 45,145 | 26,644 | 44,877 | 0.59 |
-| Mandreel | 55,386 | 31,711 | 4,879 | 0.57 |
-| NavierStokes | 38,063 | 21,200 | 3,121 | 0.56 |
-| RayTrace | 83,101 | 38,997 | 7,370 | 0.47 |
-| GameBoy | 119,967 | 55,879 | 14,378 | 0.47 |
-| RegExp | 11,649 | 4,312 | 6,675 | 0.37 |
-| EarleyBoyer | 63,367 | 22,606 | 13,590 | 0.36 |
-| TypeScript | 82,688 | 28,379 | 34,377 | 0.34 |
-| Splay | 31,343 | 10,130 | 7,167 | 0.32 |
-| Box2D | 115,372 | 27,137 | 8,231 | 0.24 |
-| zlib | 109,310 | 23,320 | 109,702 | 0.21 |
-| PdfJS | 67,232 | 13,297 | 16,362 | 0.20 |
-| **geomean** | **55,061** | **23,628** | **9,508** | **0.43** |
+| DeltaBlue | 57,146 | 62,224 | 2,863 | 1.09 |
+| Richards | 40,813 | 43,178 | 2,768 | 1.06 |
+| Crypto | 36,112 | 25,443 | 2,477 | 0.70 |
+| CodeLoad | 45,145 | 29,856 | 44,877 | 0.66 |
+| Mandreel | 55,386 | 33,612 | 4,879 | 0.61 |
+| NavierStokes | 38,063 | 21,179 | 3,121 | 0.56 |
+| GameBoy | 119,967 | 66,748 | 14,378 | 0.56 |
+| RayTrace | 83,101 | 43,215 | 7,370 | 0.52 |
+| TypeScript | 82,688 | 42,816 | 34,377 | 0.52 |
+| EarleyBoyer | 63,367 | 28,085 | 13,590 | 0.44 |
+| Splay | 31,343 | 10,783 | 7,167 | 0.34 |
+| zlib | 109,310 | 37,427 | 109,702 | 0.34 |
+| RegExp | 11,649 | 3,988 | 6,675 | 0.34 |
+| Box2D | 115,372 | 37,300 | 8,231 | 0.32 |
+| PdfJS | 67,232 | 16,891 | 16,362 | 0.25 |
+| **geomean** | **55,061** | **28,005** | **9,508** | **0.51** |
 
 ARKTS there, where its build has the asm interpreter and its JIT, on the
 six benchmarks it runs, at f2c093c (median of three runs; `ark_js_vm` at

@@ -831,7 +831,7 @@ fn backref_at(case: Case, s: &[u16], a: usize, b: usize, at: usize) -> Option<us
 fn backref_before(case: Case, s: &[u16], a: usize, b: usize, at: usize) -> Option<usize> {
     if case != Case::Unicode {
         let n = b - a;
-        return (n <= at && (0..n).all(|d| eq(case, s[at - n + d], s[a + d]))).then_some(at - n);
+        return (n <= at && (0..n).all(|d| eq(case, s[at - n + d], s[a + d]))).then(|| at - n);
     }
     let cp = |i: usize| match i.checked_sub(2).and_then(|k| astral_at(s, k)) {
         Some(c) => (c, 2),

@@ -599,11 +599,12 @@ var r = [
   /\u{1E900}/iu.test("\u{1E922}"), /^[\u{1E900}-\u{1E921}]+$/iu.test("\u{1E922}\u{1E943}"),
   "x\u{10400}y\u{10428}".replace(/\u{10428}/giu, "_"), /^\u{FB05}$/iu.test("\u{FB06}"), /^[\u{390}]$/iu.test("\u{1FD3}"),
   /^\u{1FD3}$/i.test("\u{390}"), /^(\u{FB05})\1$/iu.test("\u{FB05}\u{FB06}"),
+  String(/(?<=\1(a))/.exec("a")), String(/(?<=\1(a))/iu.exec("a")), String(/(?<=\1(\u{10400}))/iu.exec("\u{10428}")),
 ];
 r.join(" ");
 "#
         ),
-        "true true false true true true false true true true false true false false true false false true false true true x_y_ true true false true"
+        "true true false true true true false true true true false true false false true false false true false true true x_y_ true true false true null null null"
     );
     assert_eq!(
         value(

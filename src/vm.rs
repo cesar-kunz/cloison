@@ -796,6 +796,8 @@ pub struct Vm {
     /// A proxy has been made: property operations look for them on
     /// prototype chains (see `proxy`).
     pub(crate) proxies_exist: bool,
+    /// Where `function_shape` keeps `prototype`.
+    pub(crate) function_prototype_loc: i32,
     /// The codes of callable proxies (a non-constructor's, a
     /// constructor's) and of a revocable proxy's `revoke`.
     pub(crate) proxy_codes: [*const Code; 3],
@@ -1210,6 +1212,7 @@ impl Vm {
             views_detached: false,
             typed_protos_crossed: false,
             proxies_exist: false,
+            function_prototype_loc: 0,
             proxy_codes: [std::ptr::null(); 3],
             weak_tables: Vec::new(),
             collections: Vec::new(),
@@ -1413,6 +1416,10 @@ impl Vm {
         // Functions' `prototype` isn't enumerable nor configurable;
         // prototypes' `constructor` isn't enumerable.
         vm.function_shape = vm.transition_with(root, vm.a_prototype, DONT_ENUM | DONT_DELETE);
+        unsafe {
+            let s = &*vm.function_shape;
+            vm.function_prototype_loc = s.location(s.lookup(vm.a_prototype).expect("functions' prototype"));
+        }
         // (Arrows' and methods': no `prototype`, the same capacity, so
         // upvalues are where compiled code reads them.)
         vm.method_shape = root;

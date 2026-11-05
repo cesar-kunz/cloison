@@ -2921,8 +2921,14 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
         // then the two joined as strings are, so that a long one isn't
         // copied (`s = s + 1.5` in a loop was quadratic).
         let vm = unsafe { &mut *current_vm() };
-        let a = if is_string(a) { a } else { vm.new_string(&to_string_units(a)) };
-        let b = if is_string(b) { b } else { vm.new_string(&to_string_units(b)) };
+        let string_of = |vm: &mut crate::vm::Vm, v: Value| {
+            if is_string(v) {
+                v
+            } else {
+                vm.primitive_string(v).unwrap_or_else(|| vm.new_string(&to_string_units(v)))
+            }
+        };
+        let (a, b) = (string_of(vm, a), string_of(vm, b));
         if let Some(v) = concat_fast(a, b) {
             return v;
         }

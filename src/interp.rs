@@ -2925,7 +2925,19 @@ pub(crate) fn generic_add(a: Value, b: Value) -> Value {
             if is_string(v) {
                 v
             } else {
-                vm.primitive_string(v).unwrap_or_else(|| vm.new_string(&to_string_units(v)))
+                vm.primitive_string(v).unwrap_or_else(|| match v.as_number() {
+                    // (A number's digits written straight into the string.)
+                    Some(d) => {
+                        let digits = crate::vm::number_ascii(d);
+                        let b = digits.as_str().as_bytes();
+                        vm.new_string_with(b.len(), |out| {
+                            for (o, &c) in out.iter_mut().zip(b) {
+                                *o = c as u16;
+                            }
+                        })
+                    }
+                    None => vm.new_string(&to_string_units(v)),
+                })
             }
         };
         let (a, b) = (string_of(vm, a), string_of(vm, b));

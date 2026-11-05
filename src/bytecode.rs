@@ -400,6 +400,34 @@ define_ops! {
     /// `Star r; Ldar s`: the `Star`'s handler goes straight on to the
     /// `Ldar`'s, with no dispatch between them.
     StarLdar(Reg),
+    /// `Star r; Ldar s; Inc; Star s`: the `Star`, then `LdarIncStar`'s
+    /// handler directly.
+    StarLdarIncStar(Reg),
+    /// `Star r; Ldar s; Dec; Star s`.
+    StarLdarDecStar(Reg),
+    /// `Ldar r; Inc; Star r; Ldar r` (a loop's `i++` before its test).
+    LdarIncStarLdar(Reg),
+    /// `Ldar r; Dec; Star r; Ldar r`.
+    LdarDecStarLdar(Reg),
+    /// `Ldar r; ToNumeric; Star t; Inc; Star r` (`r++`'s value kept in
+    /// `t`): an int32 `r` incremented in place, `t` the old value, `acc`
+    /// the new one.
+    PostIncStar(Reg),
+    /// `Ldar r; ToNumeric; Star t; Dec; Star r`.
+    PostDecStar(Reg),
+    /// `PostIncStar`'s sequence and `Ldar t` (`a[i++]`): `acc` the old value.
+    PostIncLdar(Reg),
+    /// `PostDecStar`'s sequence and `Ldar t`.
+    PostDecLdar(Reg),
+    /// `GetNamed o, n; Star r`: a cache hit writes `r` too, past the `Star`.
+    GetNamedStar(Reg, Ic),
+    /// `GetNamed o, n; Star r; GetNamed …` (`a.b.c`): a hit goes straight
+    /// on to the second `GetNamed`'s handler.
+    GetNamedStarGetNamed(Reg, Ic),
+    /// `Star r; GetNamed …`: the `Star`, then the `GetNamed`'s handler.
+    StarGetNamed(Reg),
+    /// `Star r; GetNamed …; Star s`: the `Star`, then `GetNamedStar`'s.
+    StarGetNamedStar(Reg),
 }
 
 impl Op {
@@ -463,8 +491,11 @@ impl Op {
             Op::TestLessThanJumpIfTrue | Op::TestLessThanJumpIfFalse => Op::TestLessThan,
             Op::TestEqualJumpIfTrue | Op::TestEqualJumpIfFalse => Op::TestEqual,
             Op::TestEqualSmiJumpIfTrue | Op::TestEqualSmiJumpIfFalse => Op::TestEqualSmi,
-            Op::LdarIncStar | Op::LdarDecStar => Op::Ldar,
-            Op::StarLdar => Op::Star,
+            Op::LdarIncStar | Op::LdarDecStar | Op::LdarIncStarLdar | Op::LdarDecStarLdar => Op::Ldar,
+            Op::PostIncStar | Op::PostDecStar | Op::PostIncLdar | Op::PostDecLdar => Op::Ldar,
+            Op::StarLdar | Op::StarLdarIncStar | Op::StarLdarDecStar => Op::Star,
+            Op::StarGetNamed | Op::StarGetNamedStar => Op::Star,
+            Op::GetNamedStar | Op::GetNamedStarGetNamed => Op::GetNamed,
             op => op,
         }
     }
@@ -534,18 +565,86 @@ pub fn quicken(code: &mut [u8]) {
         } else if op == Op::Ldar
             && let Some(q) = in_place(code, pc)
         {
+            code[pc] = (if reloads(code, pc) {
+                if q == Op::LdarIncStar { Op::LdarIncStarLdar } else { Op::LdarDecStarLdar }
+            } else {
+                q
+            }) as u8;
+        } else if op == Op::Ldar
+            && let Some(q) = post_inc(code, pc)
+        {
             code[pc] = q as u8;
+        } else if op == Op::GetNamed
+            && next + Op::Star.size() <= code.len()
+            && Op::from_u8(code[next]).map(Op::plain) == Some(Op::Star)
+        {
+            let after = next + Op::Star.size();
+            let chain = after < code.len() && Op::from_u8(code[after]).map(Op::plain) == Some(Op::GetNamed);
+            code[pc] = if chain { Op::GetNamedStarGetNamed } else { Op::GetNamedStar } as u8;
+        } else if op == Op::Star
+            && next < code.len()
+            && code[next] == Op::GetNamed as u8
+        {
+            let after = next + Op::GetNamed.size();
+            let star = after < code.len() && Op::from_u8(code[after]).map(Op::plain) == Some(Op::Star);
+            code[pc] = if star { Op::StarGetNamedStar } else { Op::StarGetNamed } as u8;
+        } else if op == Op::Star
+            && next < code.len()
+            && code[next] == Op::Ldar as u8
+            && let Some(q) = in_place(code, next)
+        {
+            code[pc] = if q == Op::LdarIncStar { Op::StarLdarIncStar } else { Op::StarLdarDecStar } as u8;
         } else if op == Op::Star
             && next < code.len()
             && code[next] == Op::Ldar as u8
             && in_place(code, next).is_none()
+            && post_inc(code, next).is_none()
         {
-            // (Not an in-place `++`'s `Ldar`, which `StarLdar` would run
-            // as a plain one.)
+            // (Not an in-place `++`'s `Ldar`, nor a postfix `++`'s, which
+            // `StarLdar` would run as a plain one.)
             code[pc] = Op::StarLdar as u8;
         }
         pc = next;
     }
+}
+
+/// The fused form of a postfix `r++` (or `--`) whose old value is kept in
+/// a register, `Ldar r; ToNumeric; Star t; Inc; Star r` and maybe `Ldar t`,
+/// at `pc`, if that's what is there.
+pub fn post_inc(code: &[u8], pc: usize) -> Option<Op> {
+    let plain = |k: usize| code.get(k).and_then(|&b| Op::from_u8(b)).map(Op::plain);
+    let r = *code.get(pc + 1)?;
+    let tn = pc + Op::Ldar.size();
+    let st = tn + Op::ToNumeric.size();
+    let inc = st + Op::Star.size();
+    let sr = inc + Op::Inc.size();
+    let after = sr + Op::Star.size();
+    if plain(pc) != Some(Op::Ldar)
+        || plain(tn) != Some(Op::ToNumeric)
+        || plain(st) != Some(Op::Star)
+        || plain(sr) != Some(Op::Star)
+        || code.get(sr + 1) != Some(&r)
+        || code.get(st + 1) == Some(&r)
+    {
+        return None;
+    }
+    let t = code[st + 1];
+    let ldar_t = plain(after) == Some(Op::Ldar) && code.get(after + 1) == Some(&t);
+    match (Op::from_u8(code[inc])?, ldar_t) {
+        (Op::Inc, false) => Some(Op::PostIncStar),
+        (Op::Dec, false) => Some(Op::PostDecStar),
+        (Op::Inc, true) => Some(Op::PostIncLdar),
+        (Op::Dec, true) => Some(Op::PostDecLdar),
+        _ => None,
+    }
+}
+
+/// Whether the in-place `++` at `pc` is followed by an `Ldar` of its own
+/// register.
+pub fn reloads(code: &[u8], pc: usize) -> bool {
+    let next = pc + Op::Ldar.size() + Op::Inc.size() + Op::Star.size();
+    code.get(next).and_then(|&b| Op::from_u8(b)).map(Op::plain) == Some(Op::Ldar)
+        && code.get(next + 1) == code.get(pc + 1)
 }
 
 /// The in-place form of `Ldar r; Inc; Star r` (or `Dec`) at `pc`, if that's
@@ -805,7 +904,7 @@ mod tests {
         let mut q = plain.clone();
         super::quicken(&mut q);
         let at = plain.len() - 18;
-        let changed = [(0, Op::TestLessThanJumpIfFalse), (at, Op::LdarDecStar), (at + 7, Op::LdarIncStar), (at + 10, Op::StarLdar)];
+        let changed = [(0, Op::TestLessThanJumpIfFalse), (at, Op::LdarDecStar), (at + 5, Op::StarLdarIncStar), (at + 7, Op::LdarIncStar), (at + 10, Op::StarLdar)];
         let mut want = plain.clone();
         for (k, op) in changed {
             want[k] = op as u8;

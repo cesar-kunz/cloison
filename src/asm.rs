@@ -552,8 +552,38 @@ pub fn verify(m: &Module) -> Result<(), String> {
             }
             // A fused comparison reads the jump after it, an in-place `++`
             // its `Inc` and `Star`, `StarLdar` its `Ldar` (see `quicken`).
-            if matches!(op, Op::LdarIncStar | Op::LdarDecStar) {
+            if matches!(op, Op::LdarIncStarLdar | Op::LdarDecStarLdar) {
+                let want = if op == Op::LdarIncStarLdar { Op::LdarIncStar } else { Op::LdarDecStar };
+                if crate::bytecode::in_place(code, at) != Some(want) || !crate::bytecode::reloads(code, at) {
+                    return err(at, format!("{op:?} not followed by its own"));
+                }
+            } else if matches!(op, Op::LdarIncStar | Op::LdarDecStar) {
                 if crate::bytecode::in_place(code, at) != Some(op) {
+                    return err(at, format!("{op:?} not followed by its own"));
+                }
+            } else if matches!(op, Op::GetNamedStar | Op::GetNamedStarGetNamed | Op::StarGetNamed | Op::StarGetNamedStar) {
+                let plain_at = |k: usize| code.get(k).and_then(|&b| Op::from_u8(b)).map(Op::plain);
+                let next = at + op.size();
+                let want: &[Op] = match op {
+                    Op::GetNamedStar => &[Op::Star],
+                    Op::GetNamedStarGetNamed => &[Op::Star, Op::GetNamed],
+                    Op::StarGetNamed => &[Op::GetNamed],
+                    _ => &[Op::GetNamed, Op::Star],
+                };
+                let mut k = next;
+                for &w in want {
+                    if plain_at(k) != Some(w) {
+                        return err(at, format!("{op:?} not followed by its own"));
+                    }
+                    k += w.size();
+                }
+            } else if matches!(op, Op::PostIncStar | Op::PostDecStar | Op::PostIncLdar | Op::PostDecLdar) {
+                if crate::bytecode::post_inc(code, at) != Some(op) {
+                    return err(at, format!("{op:?} not followed by its own"));
+                }
+            } else if matches!(op, Op::StarLdarIncStar | Op::StarLdarDecStar) {
+                let want = if op == Op::StarLdarIncStar { Op::LdarIncStar } else { Op::LdarDecStar };
+                if crate::bytecode::in_place(code, at + op.size()) != Some(want) {
                     return err(at, format!("{op:?} not followed by its own"));
                 }
             } else if op == Op::StarLdar {

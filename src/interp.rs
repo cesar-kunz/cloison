@@ -372,6 +372,17 @@ handlers! {
         then!(op_ldar, Op::Star.size(), acc)
     }
 
+    fn op_star_ldar_inc_star(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = acc;
+        then!(op_ldar_inc_star, Op::Star.size(), acc)
+    }
+
+    fn op_star_ldar_dec_star(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = acc;
+        then!(op_ldar_dec_star, Op::Star.size(), acc)
+    }
+
+
     fn op_add(pc, acc, regs, tag) {
         let rhs = *reg(pc, 1, regs);
         if tag.both_int32(acc, rhs)
@@ -410,6 +421,82 @@ handlers! {
         {
             *r = tag.box_i32(n);
             next_int!(Op::Ldar.size() + Op::Inc.size() + Op::Star.size(), n)
+        }
+        tail!(op_ldar, acc)
+    }
+
+    // `Ldar r; ToNumeric; Star t; Inc; Star r` (and maybe `Ldar t`): an
+    // int32 `r` in place, `t` its old value; the rest is the `Ldar`'s, whose
+    // dispatch goes on through the sequence. Also the I32 entries.
+    fn op_post_inc_star(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        if tag.is_int32(*r)
+            && let Some(n) = (*r).as_i32_unchecked().checked_add(1)
+        {
+            *reg(pc, 4, regs) = *r;
+            *r = tag.box_i32(n);
+            next_int!(8, n)
+        }
+        tail!(op_ldar, acc)
+    }
+
+    fn op_post_dec_star(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        if tag.is_int32(*r)
+            && let Some(n) = (*r).as_i32_unchecked().checked_sub(1)
+        {
+            *reg(pc, 4, regs) = *r;
+            *r = tag.box_i32(n);
+            next_int!(8, n)
+        }
+        tail!(op_ldar, acc)
+    }
+
+    fn op_post_inc_ldar(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        let old = *r;
+        if tag.is_int32(old)
+            && let Some(n) = old.as_i32_unchecked().checked_add(1)
+        {
+            *reg(pc, 4, regs) = old;
+            *r = tag.box_i32(n);
+            next_int!(10, old.as_i32_unchecked())
+        }
+        tail!(op_ldar, acc)
+    }
+
+    fn op_post_dec_ldar(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        let old = *r;
+        if tag.is_int32(old)
+            && let Some(n) = old.as_i32_unchecked().checked_sub(1)
+        {
+            *reg(pc, 4, regs) = old;
+            *r = tag.box_i32(n);
+            next_int!(10, old.as_i32_unchecked())
+        }
+        tail!(op_ldar, acc)
+    }
+
+    // As `op_ldar_inc_star`, past the `Ldar r` after it too (`acc` is `r`).
+    fn op_ldar_inc_star_ldar(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        if tag.is_int32(*r)
+            && let Some(n) = (*r).as_i32_unchecked().checked_add(1)
+        {
+            *r = tag.box_i32(n);
+            next_int!(Op::Ldar.size() * 2 + Op::Inc.size() + Op::Star.size(), n)
+        }
+        tail!(op_ldar, acc)
+    }
+
+    fn op_ldar_dec_star_ldar(pc, acc, regs, tag) {
+        let r = reg(pc, 1, regs);
+        if tag.is_int32(*r)
+            && let Some(n) = (*r).as_i32_unchecked().checked_sub(1)
+        {
+            *r = tag.box_i32(n);
+            next_int!(Op::Ldar.size() * 2 + Op::Dec.size() + Op::Star.size(), n)
         }
         tail!(op_ldar, acc)
     }
@@ -558,6 +645,17 @@ handlers! {
         *reg(pc, 1, regs) = tag.rebox(acc);
         then!(op_ldar, Op::Star.size(), acc)
     }
+
+    fn i32_star_ldar_inc_star(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = tag.rebox(acc);
+        then!(op_ldar_inc_star, Op::Star.size(), acc)
+    }
+
+    fn i32_star_ldar_dec_star(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = tag.rebox(acc);
+        then!(op_ldar_dec_star, Op::Star.size(), acc)
+    }
+
 
     // On overflow, these recover the original `acc` as `wrapped - operand`
     // (cold) instead of keeping it live, so the add can happen in place
@@ -889,6 +987,32 @@ handlers! {
     }
 
     fn op_test_instance_of(pc, acc, regs, tag) {
+        // A plain function (`function_shape`: no own `Symbol.hasInstance`,
+        // not bound, `prototype` where the shape has it) and no proxies:
+        // the prototype walk alone.
+        let vm = frame_vm(regs);
+        if is_cell(tag, acc) && (*as_object(acc)).shape == (*vm).function_shape && !(*vm).proxies_exist {
+            let p = *Object::slot(as_object(acc), (*vm).function_prototype_loc);
+            if crate::props::is_object(p) {
+                let v = *reg(pc, 1, regs);
+                let mut r = false;
+                if crate::props::is_object(v) {
+                    let mut o = as_object(v);
+                    loop {
+                        let proto = (*(*o).shape).proto;
+                        if !proto.is_cell() {
+                            break;
+                        }
+                        if proto == p {
+                            r = true;
+                            break;
+                        }
+                        o = as_object(proto);
+                    }
+                }
+                next!(any, Op::TestInstanceOf.size(), Value::from_bool(r))
+            }
+        }
         // (Where a `prototype` getter can be called.)
         let r = with_top(regs, None, |vm| vm.instance_of(*reg(pc, 1, regs), acc));
         next_or_throw!(Op::TestInstanceOf.size(), r.map(Value::from_bool))
@@ -1411,6 +1535,78 @@ handlers! {
         tail!(slow_get_named, acc)
     }
 
+    // `GetNamed o, n; Star r`: way 0's hit writes `r` and skips the `Star`;
+    // anything else goes on as the `GetNamed` past its way-0 test, whose
+    // dispatch reaches the `Star`. Loads ignore `acc`: also the I32 entries.
+    fn op_get_named_star(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) {
+            let o = as_object(obj);
+            let ic = ic_at(regs, pc, 2);
+            if (*o).shape == (*ic).shape {
+                let holder = (*ic).holder;
+                if holder.is_null() {
+                    let v = *Object::slot(o, (*ic).loc);
+                    *reg(pc, Op::GetNamed.size() + 1, regs) = v;
+                    next!(any, Op::GetNamed.size() + Op::Star.size(), v)
+                }
+                if (*ic).epoch == (*frame_vm(regs)).proto_epoch {
+                    let v = *Object::slot(holder, (*ic).loc);
+                    *reg(pc, Op::GetNamed.size() + 1, regs) = v;
+                    next!(any, Op::GetNamed.size() + Op::Star.size(), v)
+                }
+            }
+            tail!(poly_get_named, acc)
+        }
+        tail!(slow_get_named, acc)
+    }
+
+    // `a.b.c`: as `op_get_named_star`, then the next `GetNamed` directly.
+    fn op_get_named_star_get_named(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) {
+            let o = as_object(obj);
+            let ic = ic_at(regs, pc, 2);
+            if (*o).shape == (*ic).shape {
+                let holder = (*ic).holder;
+                if holder.is_null() {
+                    let v = *Object::slot(o, (*ic).loc);
+                    *reg(pc, Op::GetNamed.size() + 1, regs) = v;
+                    then!(op_get_named, Op::GetNamed.size() + Op::Star.size(), v)
+                }
+                if (*ic).epoch == (*frame_vm(regs)).proto_epoch {
+                    let v = *Object::slot(holder, (*ic).loc);
+                    *reg(pc, Op::GetNamed.size() + 1, regs) = v;
+                    then!(op_get_named, Op::GetNamed.size() + Op::Star.size(), v)
+                }
+            }
+            tail!(poly_get_named, acc)
+        }
+        tail!(slow_get_named, acc)
+    }
+
+    fn op_star_get_named(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = acc;
+        then!(op_get_named, Op::Star.size(), acc)
+    }
+
+    fn op_star_get_named_star(pc, acc, regs, tag) {
+        *reg(pc, 1, regs) = acc;
+        then!(op_get_named_star, Op::Star.size(), acc)
+    }
+
+    fn i32_star_get_named(pc, acc, regs, tag) {
+        let acc = tag.rebox(acc);
+        *reg(pc, 1, regs) = acc;
+        then!(op_get_named, Op::Star.size(), acc)
+    }
+
+    fn i32_star_get_named_star(pc, acc, regs, tag) {
+        let acc = tag.rebox(acc);
+        *reg(pc, 1, regs) = acc;
+        then!(op_get_named_star, Op::Star.size(), acc)
+    }
+
     // Way 0 missed: `length`, or the other ways (the receiver is a cell).
     // The ways stay in place: moving a hit to way 0 (64 bytes swapped) cost
     // a site alternating between shapes more than it saved one whose
@@ -1590,6 +1786,20 @@ handlers! {
 
     fn op_push_literal(pc, acc, regs, tag) {
         let a = *reg(pc, 1, regs);
+        // Room reserved by `CreateArray`, plain elements, and a value of
+        // their type: stored in place, no call.
+        let o = as_object(a);
+        let len = (*o).elems_len;
+        if len < Object::elems_cap(o) && (*o).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) == 0 {
+            let s = &*(*o).shape;
+            if s.elems.join(crate::object::FieldType::of(acc)) == s.elems {
+                let at = (*o).elems.add(len as usize);
+                *at = acc;
+                crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, acc);
+                (*o).elems_len = len + 1;
+                next!(any, Op::PushLiteral.size(), Value::from_i32(len as i32 + 1))
+            }
+        }
         let n = crate::vm::array_push(&mut *frame_vm(regs), a, &[acc]).expect("an array literal");
         next!(any, Op::PushLiteral.size(), n)
     }
@@ -3588,9 +3798,21 @@ static TABLE: Table = {
     t[Op::LdaSmi as usize] = op_lda_smi;
     t[Op::Ldar as usize] = op_ldar;
     t[Op::LdarIncStar as usize] = op_ldar_inc_star;
+    t[Op::PostIncStar as usize] = op_post_inc_star;
+    t[Op::PostDecStar as usize] = op_post_dec_star;
+    t[Op::PostIncLdar as usize] = op_post_inc_ldar;
+    t[Op::PostDecLdar as usize] = op_post_dec_ldar;
+    t[Op::LdarIncStarLdar as usize] = op_ldar_inc_star_ldar;
+    t[Op::LdarDecStarLdar as usize] = op_ldar_dec_star_ldar;
     t[Op::LdarDecStar as usize] = op_ldar_dec_star;
     t[Op::Star as usize] = op_star;
     t[Op::StarLdar as usize] = op_star_ldar;
+    t[Op::StarLdarIncStar as usize] = op_star_ldar_inc_star;
+    t[Op::GetNamedStar as usize] = op_get_named_star;
+    t[Op::GetNamedStarGetNamed as usize] = op_get_named_star_get_named;
+    t[Op::StarGetNamed as usize] = op_star_get_named;
+    t[Op::StarGetNamedStar as usize] = op_star_get_named_star;
+    t[Op::StarLdarDecStar as usize] = op_star_ldar_dec_star;
     t[Op::Add as usize] = op_add;
     t[Op::Inc as usize] = op_inc;
     t[Op::Dec as usize] = op_dec;
@@ -3726,9 +3948,21 @@ static TABLE_I32: Table = {
     t[Op::LdaSmi as usize] = op_lda_smi;
     t[Op::Ldar as usize] = op_ldar;
     t[Op::LdarIncStar as usize] = op_ldar_inc_star;
+    t[Op::PostIncStar as usize] = op_post_inc_star;
+    t[Op::PostDecStar as usize] = op_post_dec_star;
+    t[Op::PostIncLdar as usize] = op_post_inc_ldar;
+    t[Op::PostDecLdar as usize] = op_post_dec_ldar;
+    t[Op::LdarIncStarLdar as usize] = op_ldar_inc_star_ldar;
+    t[Op::LdarDecStarLdar as usize] = op_ldar_dec_star_ldar;
     t[Op::LdarDecStar as usize] = op_ldar_dec_star;
     t[Op::Star as usize] = i32_star;
     t[Op::StarLdar as usize] = i32_star_ldar;
+    t[Op::StarLdarIncStar as usize] = i32_star_ldar_inc_star;
+    t[Op::GetNamedStar as usize] = op_get_named_star;
+    t[Op::GetNamedStarGetNamed as usize] = op_get_named_star_get_named;
+    t[Op::StarGetNamed as usize] = i32_star_get_named;
+    t[Op::StarGetNamedStar as usize] = i32_star_get_named_star;
+    t[Op::StarLdarDecStar as usize] = i32_star_ldar_dec_star;
     t[Op::Add as usize] = i32_add;
     t[Op::Inc as usize] = i32_inc;
     t[Op::Dec as usize] = i32_dec;

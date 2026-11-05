@@ -7261,24 +7261,76 @@ pub(crate) fn source_text(u: &[u16]) -> String {
     s
 }
 
+/// A number's string being made: ASCII, at most 64 bytes (the longest is
+/// 26), on the stack.
+pub(crate) struct NumBuf {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl NumBuf {
+    fn new() -> NumBuf {
+        NumBuf { bytes: [0; 64], len: 0 }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // (Only ASCII is written.)
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+
+    fn push(&mut self, s: &str) {
+        let n = s.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+    }
+
+    fn zeros(&mut self, n: usize) {
+        for _ in 0..n {
+            self.push("0");
+        }
+    }
+}
+
+impl std::fmt::Write for NumBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.push(s);
+        Ok(())
+    }
+}
+
 /// Number::toString(10): the shortest digits that round-trip, laid out as
 /// ECMA-262 says (no exponent from 1e-6 up to 1e21).
 pub fn number_to_string(d: f64) -> String {
+    number_ascii(d).as_str().to_owned()
+}
+
+/// [`number_to_string`] on the stack: no allocation (`"" + 1.5` made five
+/// strings, then its UTF-16).
+pub(crate) fn number_ascii(d: f64) -> NumBuf {
+    use std::fmt::Write;
+    let mut out = NumBuf::new();
     if d.is_nan() {
-        return "NaN".into();
+        out.push("NaN");
+        return out;
     }
     if d == 0.0 {
-        return "0".into();
+        out.push("0");
+        return out;
     }
     if d.is_infinite() {
-        return if d > 0.0 { "Infinity" } else { "-Infinity" }.into();
+        out.push(if d > 0.0 { "Infinity" } else { "-Infinity" });
+        return out;
     }
     // An integer below 2^53: its own digits are the shortest.
     if d.fract() == 0.0 && d.abs() < 9007199254740992.0 {
-        return (d as i64).to_string();
+        let _ = write!(out, "{}", d as i64);
+        return out;
     }
     if d < 0.0 {
-        return format!("-{}", number_to_string(-d));
+        out.push("-");
+        let rest = number_ascii(-d);
+        out.push(rest.as_str());
+        return out;
     }
     // `{:e}` gives the shortest round-trip digits, `d1.d2…dke<x>`, but
     // where two k-digit strings are equally close to `d` (2^-25 is
@@ -7288,31 +7340,46 @@ pub fn number_to_string(d: f64) -> String {
     // it may not (2^-24 is 5.9604644775390625e-8, and only ...063e-8 reads
     // back as it: the interval of a power of two is narrower below), and
     // then the shortest string is the closest that does.
-    let shortest = format!("{d:e}");
-    let k = shortest.split_once('e').unwrap().0.chars().filter(|c| c.is_ascii_digit()).count();
-    let closest = format!("{d:.*e}", k - 1);
-    let e = if closest != shortest && closest.parse::<f64>() == Ok(d) { closest } else { shortest };
+    let mut shortest = NumBuf::new();
+    let _ = write!(shortest, "{d:e}");
+    let k = shortest.as_str().split_once('e').unwrap().0.bytes().filter(u8::is_ascii_digit).count();
+    let mut closest = NumBuf::new();
+    let _ = write!(closest, "{d:.*e}", k - 1);
+    let e = if closest.as_str() != shortest.as_str() && closest.as_str().parse::<f64>() == Ok(d) {
+        closest.as_str()
+    } else {
+        shortest.as_str()
+    };
     let (mantissa, exp) = e.split_once('e').unwrap();
-    let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
-    let digits = digits.trim_end_matches('0').to_owned();
+    let mut digits = NumBuf::new();
+    for c in mantissa.bytes().filter(u8::is_ascii_digit) {
+        digits.bytes[digits.len] = c;
+        digits.len += 1;
+    }
+    let digits = digits.as_str().trim_end_matches('0');
     let k = digits.len() as i32;
     // d = 0.d1…dk × 10^n
     let n = exp.parse::<i32>().unwrap() + 1;
     if k <= n && n <= 21 {
-        format!("{digits}{}", "0".repeat((n - k) as usize))
+        out.push(digits);
+        out.zeros((n - k) as usize);
     } else if 0 < n && n <= 21 {
-        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+        out.push(&digits[..n as usize]);
+        out.push(".");
+        out.push(&digits[n as usize..]);
     } else if -6 < n && n <= 0 {
-        format!("0.{}{digits}", "0".repeat((-n) as usize))
+        out.push("0.");
+        out.zeros((-n) as usize);
+        out.push(digits);
     } else {
-        let sign = if n - 1 < 0 { '-' } else { '+' };
-        let rest = if k > 1 {
-            format!(".{}", &digits[1..])
-        } else {
-            String::new()
-        };
-        format!("{}{rest}e{sign}{}", &digits[..1], (n - 1).abs())
+        out.push(&digits[..1]);
+        if k > 1 {
+            out.push(".");
+            out.push(&digits[1..]);
+        }
+        let _ = write!(out, "e{}{}", if n - 1 < 0 { '-' } else { '+' }, (n - 1).abs());
     }
+    out
 }
 
 impl Drop for Vm {

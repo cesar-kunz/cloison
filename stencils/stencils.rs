@@ -7382,8 +7382,10 @@ with_gprs!(each_gpr! check_tail_callee_gpr);
 // which pops entries: one tagged `rx::TAG | r` restores register `r`; any
 // other is a code address to resume at, with its position. The bottom
 // entry resumes at `rx_nomatch`. Code returns the match's end, or
-// `rx::NOMATCH`, or `rx::BAIL` (the stack is full, or a unit past ASCII
-// needs case folding): the attempt is then the interpreter's.
+// `rx::NOMATCH`, or `rx::BAIL` (the stack is full): the attempt is then
+// the interpreter's. A unit past ASCII folding case, or an astral code
+// point, is tested by the runtime (`rx::Ctx`'s `wide`, `fold` and
+// `astral`, as the interpreter tests them).
 
 use layout::rx;
 
@@ -7460,6 +7462,7 @@ fn rx_word(c: u16) -> bool {
 #[inline(always)]
 unsafe fn rx_wide(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
     unsafe {
+        // Case folded: the interpreter's attempt (see `rx_wide_u`).
         if (*ctx).ic != 0 {
             return 2;
         }
@@ -7469,6 +7472,15 @@ unsafe fn rx_wide(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
         if cl.neg & 2 != 0 && c & 0xF800 == 0xD800 {
             return 2;
         }
+        rx_wide_of(ctx, k, c)
+    }
+}
+
+/// [`rx_wide`] past its checks, without folding case: 0 or 1.
+#[inline(always)]
+unsafe fn rx_wide_of(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
+    unsafe {
+        let cl = &*(*ctx).classes.add(k);
         let mut i = 0;
         let mut has = false;
         while i < cl.n {
@@ -7483,6 +7495,32 @@ unsafe fn rx_wide(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
     }
 }
 
+/// [`rx_wide`] for a program folding case by Unicode's simple case
+/// folding (`u` or `v` with `i`), its own pieces' (`_u`): the runtime's
+/// test, the interpreter's, rather than a bail. (Pieces with a call keep
+/// their state across it, which cost the others: Octane's RegExp 1.6%.)
+#[cold]
+#[inline(always)]
+unsafe fn rx_wide_u(ctx: *const rx::Ctx, k: usize, c: u16) -> u64 {
+    unsafe {
+        let cl = &*(*ctx).classes.add(k);
+        if cl.neg & 2 != 0 && c & 0xF800 == 0xD800 {
+            return 2;
+        }
+        ((*ctx).wide)(ctx, k, c as u64)
+    }
+}
+
+/// [`rx_class_has`] with [`rx_wide_u`].
+#[inline(always)]
+unsafe fn rx_class_has_u(ctx: *const rx::Ctx, lo: u64, hi: u64, k: usize, c: u16) -> u64 {
+    if c < 128 {
+        (if c < 64 { lo } else { hi }) >> (c & 63) & 1
+    } else {
+        unsafe { rx_wide_u(ctx, k, c) }
+    }
+}
+
 /// Whether `c` is in the class of ASCII bits `lo`, `hi` and index `k`: 0
 /// or 1, or 2 to bail.
 #[inline(always)]
@@ -7494,18 +7532,29 @@ unsafe fn rx_class_has(ctx: *const rx::Ctx, lo: u64, hi: u64, k: usize, c: u16) 
     }
 }
 
-/// Whether `c` matches character `x` folded to `canon`: 0 or 1, or 2 to
-/// bail.
+/// Whether `c` matches character `x`, case folded: an ASCII `c` if its
+/// upper case is `upper` (the upper case of the ASCII unit `x` folds as,
+/// if any: see `regexp::Native::compile`). 0 or 1, or 2 to bail.
 #[inline(always)]
-fn rx_fold_has(x: u32, canon: u32, c: u16) -> u64 {
+fn rx_fold_has(x: u32, upper: u32, c: u16) -> u64 {
     let c = c as u32;
     if c == x {
         1
     } else if c < 128 {
-        ((c as u8).to_ascii_uppercase() as u32 == canon) as u64
+        ((c as u8).to_ascii_uppercase() as u32 == upper) as u64
     } else {
         core::hint::cold_path();
         2
+    }
+}
+
+/// [`rx_fold_has`] with `u` or `v` (`_u` pieces): a unit past ASCII by
+/// the runtime's test.
+#[inline(always)]
+unsafe fn rx_fold_has_u(ctx: *const rx::Ctx, x: u32, upper: u32, c: u16) -> u64 {
+    match rx_fold_has(x, upper, c) {
+        2 => unsafe { ((*ctx).fold)(ctx, x as u64, c as u64) },
+        r => r,
     }
 }
 
@@ -7546,6 +7595,16 @@ rx!(rx_fold; |s, end, pos, bt, regs, ctx| {
     rx_fail!(s, end, pos, bt, regs, ctx)
 });
 
+rx!(rx_fold_u; |s, end, pos, bt, regs, ctx| {
+    if pos < end {
+        let k = imm() as u32;
+        if rx_fold_has_u(ctx, k & 0xFFFF, k >> 16, *s.add(pos)) == 1 {
+            rx_next!(s, end, pos + 1, bt, regs, ctx)
+        }
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
 rx!(rx_any; |s, end, pos, bt, regs, ctx| {
     if pos < end && !rx_line_terminator(*s.add(pos)) {
         rx_next!(s, end, pos + 1, bt, regs, ctx)
@@ -7559,6 +7618,60 @@ rx!(rx_class; |s, end, pos, bt, regs, ctx| {
             1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
             0 => {}
             _ => return rx::BAIL,
+        }
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+rx!(rx_class_u; |s, end, pos, bt, regs, ctx| {
+    if pos < end {
+        match rx_class_has_u(ctx, imm64_full(), imm64b_full(), imm() as u32 as usize, *s.add(pos)) {
+            1 => rx_next!(s, end, pos + 1, bt, regs, ctx),
+            0 => {}
+            _ => return rx::BAIL,
+        }
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+// A surrogate pair whose astral code point is in the program's astral
+// ranges `imm` (the runtime's test).
+rx!(rx_astral; |s, end, pos, bt, regs, ctx| {
+    if pos + 1 < end {
+        let (a, b) = (*s.add(pos), *s.add(pos + 1));
+        if a & 0xFC00 == 0xD800 && b & 0xFC00 == 0xDC00 {
+            let c = 0x10000 + (((a - 0xD800) as u64) << 10) + (b - 0xDC00) as u64;
+            if ((*ctx).astral)(ctx, imm() as u32 as usize, c) == 1 {
+                rx_next!(s, end, pos + 2, bt, regs, ctx)
+            }
+        }
+    }
+    rx_fail!(s, end, pos, bt, regs, ctx)
+});
+
+// `rx_class` for a unit that must be no surrogate pair's half
+// (`regexp::Insn::Alone`): a lead followed by a trail, or a trail after a
+// lead, fails; the others are tested as `rx_class`'s, the class's
+// surrogates too.
+rx!(rx_alone; |s, end, pos, bt, regs, ctx| {
+    if pos < end {
+        let c = *s.add(pos);
+        let half = if c & 0xFC00 == 0xD800 {
+            pos + 1 < end && *s.add(pos + 1) & 0xFC00 == 0xDC00
+        } else {
+            c & 0xFC00 == 0xDC00 && pos > 0 && *s.add(pos - 1) & 0xFC00 == 0xD800
+        };
+        if !half {
+            let has = if c < 128 {
+                (if c < 64 { imm64_full() } else { imm64b_full() }) >> (c & 63) & 1
+            } else if (*ctx).ic == 2 {
+                ((*ctx).wide)(ctx, imm() as u32 as usize, c as u64)
+            } else {
+                rx_wide_of(ctx, imm() as u32 as usize, c)
+            };
+            if has == 1 {
+                rx_next!(s, end, pos + 1, bt, regs, ctx)
+            }
         }
     }
     rx_fail!(s, end, pos, bt, regs, ctx)
@@ -7813,5 +7926,9 @@ rx_runs!(rx_run_char, rx_lazy_char, rx_lazyback_char, |ctx, r, c| (c as usize ==
 rx_runs!(rx_run_fold, rx_lazy_fold, rx_lazyback_fold, |ctx, r, c| {
     rx_fold_has(r.k as u32 & 0xFFFF, r.k as u32 >> 16, c)
 });
+rx_runs!(rx_run_fold_u, rx_lazy_fold_u, rx_lazyback_fold_u, |ctx, r, c| {
+    rx_fold_has_u(ctx, r.k as u32 & 0xFFFF, r.k as u32 >> 16, c)
+});
 rx_runs!(rx_run_any, rx_lazy_any, rx_lazyback_any, |ctx, r, c| (!rx_line_terminator(c)) as u64);
 rx_runs!(rx_run_class, rx_lazy_class, rx_lazyback_class, |ctx, r, c| rx_class_has(ctx, r.lo, r.hi, r.k, c));
+rx_runs!(rx_run_class_u, rx_lazy_class_u, rx_lazyback_class_u, |ctx, r, c| rx_class_has_u(ctx, r.lo, r.hi, r.k, c));

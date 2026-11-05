@@ -633,9 +633,20 @@ pub mod rx {
         pub limit: *mut usize,
         /// Classes past ASCII, by `Class`'s `k`.
         pub classes: *const Class,
-        /// Whether case is folded: a unit past ASCII in a class or a
-        /// folded character bails.
+        /// How case is folded: 0 not, 1 as without `u`, 2 by Unicode simple
+        /// case folding (`u` or `v`). A unit past ASCII in a class or a
+        /// folded character goes to `wide` or `fold` then (2), or bails (1).
         pub ic: usize,
+        /// The program (`regexp::Program`) the runtime's tests below read.
+        pub prog: *const u8,
+        /// Whether unit `c`, past ASCII, is in class `k`, case folded (as
+        /// the interpreter's `Program::class_matches`): 0 or 1.
+        pub wide: unsafe extern "C" fn(*const Ctx, usize, u64) -> u64,
+        /// Whether unit `c`, past ASCII, folds as character `x`: 0 or 1.
+        pub fold: unsafe extern "C" fn(*const Ctx, u64, u64) -> u64,
+        /// Whether astral code point `c` is in the program's astral ranges
+        /// `k` (`regexp::Insn::Astral`): 0 or 1.
+        pub astral: unsafe extern "C" fn(*const Ctx, usize, u64) -> u64,
     }
 
     /// A class's ranges, for units past ASCII.

@@ -853,9 +853,11 @@ pub struct Vm {
     /// The open upvalues (see [`Upvalue`]), by the address of the register
     /// they point to, lowest first.
     pub(crate) open_upvalues: Vec<*mut Upvalue>,
-    /// `typeof`'s results, once made (see [`Vm::type_of`]): string
-    /// constants, forgotten with them (`Vm::prune_strings`).
-    pub(crate) type_names: [Option<Value>; 8],
+    /// `typeof`'s results, once made (see [`Vm::type_of`]), then the
+    /// strings of `true`, `false` and `null` (`undefined`'s is `typeof`'s;
+    /// see [`Vm::primitive_string`]): string constants, forgotten with
+    /// them (`Vm::prune_strings`).
+    pub(crate) type_names: [Option<Value>; 11],
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
@@ -1234,7 +1236,7 @@ impl Vm {
             conv_thrown: false,
             store_failed: false,
             open_upvalues: Vec::new(),
-            type_names: [None; 8],
+            type_names: [None; 11],
             handles: Vec::new(),
             unmovable: 0,
             max_frame: crate::interp::HEADER,
@@ -3699,6 +3701,29 @@ impl Vm {
         }
         unsafe { global_way(code, ic) };
         self.get_named_miss(code, ic, object_value(self.global))
+    }
+
+    /// The string of `v` if it is `true`, `false`, `null` or `undefined`: a
+    /// string constant, made once (`"" + true` made one at each `+`).
+    pub(crate) fn primitive_string(&mut self, v: Value) -> Option<Value> {
+        let (k, name) = if v.is_undefined() {
+            (1, "undefined")
+        } else if v == Value::TRUE {
+            (8, "true")
+        } else if v == Value::FALSE {
+            (9, "false")
+        } else if v.is_null() {
+            (10, "null")
+        } else {
+            return None;
+        };
+        if let Some(s) = self.type_names[k] {
+            return Some(s);
+        }
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let s = self.string_constant(&units);
+        self.type_names[k] = Some(s);
+        Some(s)
     }
 
     /// `typeof v`, a string constant (each made once: EarleyBoyer's

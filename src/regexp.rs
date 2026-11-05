@@ -904,11 +904,33 @@ fn simple_fold(c: u16) -> u16 {
 /// Whether `c` is in the class of `ranges` (negated if `neg`), folding
 /// case if `ic`.
 fn in_class(ic: Case, ranges: &[(u16, u16)], neg: bool, c: u16) -> bool {
-    let has = |c: u16| ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+    in_class_of(ic, ranges, false, None, neg, c)
+}
+
+/// Whether unit `c` is in `ranges`: sorted inclusive ranges, `merged`
+/// (none overlapping or adjacent: a program's classes, see
+/// `Program::classes`) looked up by bisection when there are many (a
+/// complement with `i` and `v`, of the code points folding to themselves,
+/// has hundreds: #10's pattern spent 72% of its time scanning them).
+#[inline]
+fn has_unit(ranges: &[(u16, u16)], merged: bool, c: u16) -> bool {
+    if !merged || ranges.len() < 16 {
+        return ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+    }
+    let k = ranges.partition_point(|&(lo, _)| lo <= c);
+    k > 0 && c <= ranges[k - 1].1
+}
+
+/// [`in_class`], with `ranges` `merged` (see [`has_unit`]), and whether
+/// they are a [`long_class`] if known (a program's class without folds:
+/// summing hundreds of ranges' lengths at each test was most of what was
+/// left of #10's pattern).
+fn in_class_of(ic: Case, ranges: &[(u16, u16)], merged: bool, long: Option<bool>, neg: bool, c: u16) -> bool {
+    let has = |c: u16| has_unit(ranges, merged, c);
     let mut r = has(c);
     if !r && ic != Case::Exact {
         let u = ic.canon(c);
-        r = has(u) || if long_class(ranges) {
+        r = has(u) || if long.unwrap_or_else(|| long_class(ranges)) {
             let groups = case_groups(ic);
             let from = groups.partition_point(|p| p.0 < u);
             groups[from..].iter().take_while(|p| p.0 == u).any(|p| has(p.1))
@@ -945,13 +967,18 @@ fn class_folds(ic: Case, ranges: &[(u16, u16)]) -> Option<Vec<u16>> {
 
 /// [`in_class`], with `folds` the class's [`class_folds`].
 fn in_class_folded(ic: Case, ranges: &[(u16, u16)], folds: &[u16], neg: bool, c: u16) -> bool {
-    let has = |c: u16| ranges.iter().any(|&(lo, hi)| lo <= c && c <= hi);
+    let has = |c: u16| has_unit(ranges, true, c);
     let mut r = has(c);
     if !r && ic != Case::Exact {
         let u = ic.canon(c);
         r = has(u) || folds.binary_search(&u).is_ok();
     }
     r != neg
+}
+
+/// Sorted inclusive ranges `r`, overlapping and adjacent ones merged.
+fn merge_units(r: &[(u16, u16)]) -> Vec<(u16, u16)> {
+    merge(r.iter().map(|&(lo, hi)| (lo as u32, hi as u32)).collect()).into_iter().map(|(lo, hi)| (lo as u16, hi as u16)).collect()
 }
 
 /// The first of `units` (none to four) in `s` at or after `from`.
@@ -2605,7 +2632,7 @@ impl Program {
             Node::Class(r, neg) | Node::Alone(r, neg) => {
                 let alone = matches!(n, Node::Alone(..));
                 let ascii = (0..128u16).filter(|&x| in_class(ic, r, *neg, x)).fold(0u128, |m, x| m | 1 << x);
-                self.classes.push((r.clone(), *neg, alone));
+                self.classes.push((merge_units(r), *neg, alone));
                 self.folds.push(std::cell::OnceCell::new());
                 let k = (self.classes.len() - 1) as u32;
                 if alone { Insn::Alone { ascii, k } } else { Insn::Class { ascii, k } }
@@ -2801,9 +2828,14 @@ impl Program {
     #[inline(never)]
     fn class_matches(&self, k: u32, c: u16) -> bool {
         let (r, neg, _) = &self.classes[k as usize];
+        // (A unit in the ranges needs no folds: they are made only for a
+        // class one isn't in, if any.)
+        if has_unit(r, true, c) {
+            return !*neg;
+        }
         match self.folds[k as usize].get_or_init(|| class_folds(self.ic, r)) {
             Some(folds) => in_class_folded(self.ic, r, folds, *neg, c),
-            None => in_class(self.ic, r, *neg, c),
+            None => in_class_of(self.ic, r, true, Some(true), *neg, c),
         }
     }
 

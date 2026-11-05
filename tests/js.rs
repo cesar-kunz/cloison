@@ -11970,3 +11970,31 @@ fn tagged_templates_shared_by_a_module_run_again_stay() {
     let r = vm.run(&check).map(display).map_err(|e| e.to_string());
     assert_eq!(r.as_deref(), Ok("true true"));
 }
+
+/// A tagged template's array stays its site's while it is reachable, even
+/// once every code of the site is freed: the same module run again gives
+/// it again (a reviewer's case on #47: the entry went with the last code,
+/// so the next run made another array). Its codes freed, the array held by
+/// a global only; the module run again.
+#[test]
+fn tagged_templates_held_outlive_their_codes() {
+    let module = cloison::js::compile("globalThis.f = function (tag) { return tag`hello`; };").unwrap();
+    let save = cloison::js::compile("var saved = f(s => s); f = undefined;").unwrap();
+    let gc = cloison::js::compile("$262.gc(); $262.gc();").unwrap();
+    let check = cloison::js::compile("f(s => s) === saved && Object.isFrozen(saved) && saved.raw[0] === 'hello'").unwrap();
+    let other = cloison::js::compile("var g = function () { return 1; }; g();").unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    vm.run(&save).unwrap();
+    // (Other scripts run after it, so that its own is freed too.)
+    for _ in 0..3 {
+        vm.run(&other).unwrap();
+    }
+    let codes = vm.code_count();
+    vm.run(&gc).unwrap();
+    vm.run(&gc).unwrap();
+    assert!(vm.code_count() < codes, "the first run's codes freed ({codes} before)");
+    vm.run(&module).unwrap();
+    let r = vm.run(&check).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("true"));
+}

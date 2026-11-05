@@ -930,8 +930,10 @@ pub struct Vm {
     /// Tagged templates' strings arrays, by site (see
     /// `intrinsics::template_object`), with the codes whose site it is
     /// (more than one when a module runs again: its codes are loaded
-    /// again, with the same sites): forgotten when they are all freed
-    /// (`gc::condemn_codes`).
+    /// again, with the same sites). Roots while one of those codes lives;
+    /// once all are freed (`gc::condemn_codes`), kept while the array is
+    /// (a full marking finds it), so that the module run again gives it
+    /// again, then forgotten (`Vm::prune_templates`).
     pub(crate) template_cache: crate::jit::HashMap<u64, (*mut Object, Vec<*const Code>)>,
     /// The code of the frame running an intrinsic (`interp::op_intrinsic`).
     pub(crate) intrinsic_code: *const Code,
@@ -6184,7 +6186,6 @@ impl Vm {
         .chain(self.collection_prototypes.iter().copied())
         .chain(self.promise_roots.iter().copied())
         .chain(self.iterator_roots.iter().copied())
-        .chain(self.template_cache.values().map(|t| t.0))
         .chain(self.symbol_roots.iter().copied())
         .chain(std::iter::once(self.thrower))
         .chain(self.mapped_args.iter().map(|m| m.o))
@@ -6261,9 +6262,6 @@ impl Vm {
                 f(Root::Object(o));
             }
         }
-        for (o, _) in self.template_cache.values_mut() {
-            f(Root::Object(o));
-        }
         for m in &mut self.mapped_args {
             f(Root::Object(&mut m.o));
             f(Root::Object(&mut m.scope.0));
@@ -6327,6 +6325,12 @@ impl Vm {
             f(k.to_bits());
             f(c.to_bits());
         }
+    }
+
+    /// After a full marking: forget the tagged templates whose codes are all
+    /// freed and whose arrays it didn't find (`live`: a cell found).
+    pub(crate) fn prune_templates(&mut self, live: impl Fn(*mut Object) -> bool) {
+        self.template_cache.retain(|_, (o, codes)| !codes.is_empty() || live(*o));
     }
 
     /// The string constants' slots.

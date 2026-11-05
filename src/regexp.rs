@@ -128,9 +128,11 @@ enum Node {
 fn code_points(n: Node) -> Node {
     let rec = |b: Box<Node>| Box::new(code_points(*b));
     match n {
-        Node::Char(c @ 0xD800..=0xDBFF) => Node::Seq(vec![Node::Char(c), not_followed_by_trail()]),
-        Node::Char(c @ 0xDC00..=0xDFFF) => Node::Seq(vec![not_preceded_by_lead(), Node::Char(c)]),
-        Node::Class(r, false) if r.iter().any(|&(a, b)| a <= TRAILS.1 && b >= LEADS.0) => unit_class(&r),
+        // (`Alone`: as a lookahead for no trail after a lead, a lookbehind
+        // for no lead before a trail would, but one instruction, which
+        // compiles to native code.)
+        Node::Char(c @ 0xD800..=0xDFFF) => Node::Alone(vec![(c, c)], false),
+        Node::Class(r, false) if r.iter().any(|&(a, b)| a <= TRAILS.1 && b >= LEADS.0) => Node::Alone(r, false),
         Node::Group(b, g) => Node::Group(rec(b), g),
         Node::Look(b, pos, behind) => Node::Look(rec(b), pos, behind),
         Node::Alt(v) => Node::Alt(v.into_iter().map(code_points).collect()),
@@ -166,39 +168,6 @@ fn code_points(n: Node) -> Node {
 
 const LEADS: (u16, u16) = (0xD800, 0xDBFF);
 const TRAILS: (u16, u16) = (0xDC00, 0xDFFF);
-
-fn not_followed_by_trail() -> Node {
-    Node::Look(Box::new(Node::Class(vec![TRAILS], false)), false, false)
-}
-
-fn not_preceded_by_lead() -> Node {
-    Node::Look(Box::new(Node::Class(vec![LEADS], false)), false, true)
-}
-
-/// A class of the units in `r` in `u` mode: its surrogates alone only (see
-/// [`code_points`]).
-fn unit_class(r: &[(u16, u16)]) -> Node {
-    let part = |(lo, hi): (u16, u16)| -> Vec<(u16, u16)> {
-        r.iter().filter(|&&(a, b)| a.max(lo) <= b.min(hi)).map(|&(a, b)| (a.max(lo), b.min(hi))).collect()
-    };
-    let (leads, trails) = (part(LEADS), part(TRAILS));
-    let others: Vec<(u16, u16)> = r
-        .iter()
-        .flat_map(|&(a, b)| [(a, b.min(LEADS.0 - 1)), (a.max(TRAILS.1 + 1), b)])
-        .filter(|&(x, y)| x <= y && (y < LEADS.0 || x > TRAILS.1))
-        .collect();
-    let mut alts = Vec::new();
-    if !others.is_empty() {
-        alts.push(Node::Class(others, false));
-    }
-    if !leads.is_empty() {
-        alts.push(Node::Seq(vec![Node::Class(leads, false), not_followed_by_trail()]));
-    }
-    if !trails.is_empty() {
-        alts.push(Node::Seq(vec![not_preceded_by_lead(), Node::Class(trails, false)]));
-    }
-    Node::Alt(alts)
-}
 
 impl Parser<'_> {
     /// `[…]` in `v` mode (past the `[`): a set of code points and strings,
@@ -1155,7 +1124,7 @@ fn case_members(case: Case) -> &'static std::collections::HashMap<u16, Vec<u16>>
         let mut m: std::collections::HashMap<u16, Vec<u16>> = std::collections::HashMap::new();
         for c in 0..=0xFFFFu16 {
             let k = case.canon(c);
-            if k != c || m.contains_key(&k) {
+            if k != c {
                 m.entry(k).or_insert_with(|| vec![k]).push(c);
             }
         }
@@ -1999,9 +1968,10 @@ fn fold_closure(ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 
 /// The code points simple case folding changes (made once): with `i` and
 /// `v`, a complement has only the others (CharacterComplement).
+// (The table's keys: folding each code point to find them took 7 ms.)
 fn unfolded_points() -> &'static [(u32, u32)] {
     static SET: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
-    SET.get_or_init(|| merge((0..=0x10FFFF).filter(|&c| fold_point(c) != c).map(|c| (c, c)).collect()))
+    SET.get_or_init(|| merge(crate::unicode_casefold::SIMPLE.iter().map(|&(c, _)| (c, c)).collect()))
 }
 
 /// Each property of strings' set (`unicode_strings`; `RGI_Emoji` their
@@ -2341,6 +2311,38 @@ impl Run {
     }
 }
 
+/// `rx::Ctx::wide`: whether unit `c`, past ASCII, is in class `k` of the
+/// program, case folded, as the interpreter tests it.
+unsafe extern "C" fn rx_wide_rt(ctx: *const crate::jit::rx::Ctx, k: usize, c: u64) -> u64 {
+    let p = unsafe { &*((*ctx).prog as *const Program) };
+    p.class_matches(k as u32, c as u16) as u64
+}
+
+/// `rx::Ctx::fold`: whether unit `c`, past ASCII, folds as character `x`.
+unsafe extern "C" fn rx_fold_rt(ctx: *const crate::jit::rx::Ctx, x: u64, c: u64) -> u64 {
+    let p = unsafe { &*((*ctx).prog as *const Program) };
+    (p.ic.canon(c as u16) == p.ic.canon(x as u16)) as u64
+}
+
+/// For the native `rx_fold` of character `c` of canonical form `canon`:
+/// the upper case of the ASCII units folding as `c` (an ASCII unit `a`
+/// matches if its upper case is it; without `u` that is `canon`; with,
+/// `ſ` and the Kelvin sign fold to ASCII too), or none (0xFFFF).
+fn ascii_upper(ic: Case, canon: u16) -> u32 {
+    match ic {
+        Case::Unicode if canon < 128 => (canon as u8).to_ascii_uppercase() as u32,
+        Case::Unicode => 0xFFFF,
+        _ => canon as u32,
+    }
+}
+
+/// `rx::Ctx::astral`: whether astral code point `c` is in the program's
+/// astral ranges `k`.
+unsafe extern "C" fn rx_astral_rt(ctx: *const crate::jit::rx::Ctx, k: usize, c: u64) -> u64 {
+    let p = unsafe { &*((*ctx).prog as *const Program) };
+    in_points(&p.astral[k], c as u32) as u64
+}
+
 /// The exec at which a pattern is compiled to native code: `CLOISON_NO_JIT`
 /// or `CLOISON_NO_RX_JIT` set, never.
 fn native_after() -> u32 {
@@ -2371,13 +2373,17 @@ struct Native {
     /// The records pieces point at.
     _runs: Box<[crate::jit::rx::Run]>,
     _heads: Box<[crate::jit::rx::Head]>,
-    classes: Box<[crate::jit::rx::Class]>,
+    /// The classes `ctx` points at.
+    _classes: Box<[crate::jit::rx::Class]>,
     _ranges: Vec<Vec<[u16; 2]>>,
     /// `rx_nomatch`'s address.
     nomatch: usize,
     /// The first group's register, and the number of registers.
     caps_at: usize,
     slots: usize,
+    /// The context its code runs with: made once, an attempt setting its
+    /// stack's limit and the program (see [`Native::run`]).
+    ctx: std::cell::UnsafeCell<crate::jit::rx::Ctx>,
 }
 
 impl Native {
@@ -2386,10 +2392,6 @@ impl Native {
     #[cold]
     fn compile(re: &Regex) -> Option<Native> {
         use crate::jit::rx::{self, Imm64, Piece, To};
-        // (`rx_fold` folds as without `u`.)
-        if re.fold == Case::Unicode {
-            return None;
-        }
         let code = &re.prog.code;
         // (Nor `\b` where `i` and `u` widen the word characters.)
         if code.iter().any(|i| matches!(i, Insn::Boundary(_, Case::Unicode))) {
@@ -2410,8 +2412,7 @@ impl Native {
                 | Insn::BehindEnd
                 | Insn::Back
                 | Insn::SaveBack { .. }
-                | Insn::BackRefBack(..)
-                | Insn::Astral(_) => return None,
+                | Insn::BackRefBack(..) => return None,
                 Insn::Run { .. } | Insn::LazyRun { .. } => {
                     idx[i + 1] = idx[i];
                     nruns += 1;
@@ -2443,6 +2444,9 @@ impl Native {
         let reg = |r: u32| 1 + r as usize;
         let group = |g: u32| caps_at + 2 * g as usize;
         let piece = |name| Piece::new(name, To::Piece(fail));
+        // (`u` or `v` with `i`: the pieces testing a unit past ASCII by the
+        // runtime, rather than bailing; the others make no call.)
+        let u = re.fold == Case::Unicode;
         let mut pieces = Vec::with_capacity(n + 2 + nruns);
         let mut backs = Vec::with_capacity(nruns);
         // (head, its exit's piece, its body's piece)
@@ -2452,14 +2456,22 @@ impl Native {
         while i < code.len() {
             let p = match code[i] {
                 Insn::Char(c) => Piece { imm: c as u32, ..piece("rx_char") },
-                Insn::CharFold { c, canon } => Piece { imm: c as u32 | (canon as u32) << 16, ..piece("rx_fold") },
+                Insn::CharFold { c, canon } => {
+                    Piece { imm: c as u32 | ascii_upper(re.fold, canon) << 16, ..piece(if u { "rx_fold_u" } else { "rx_fold" }) }
+                }
                 Insn::Any => piece("rx_any"),
-                // (An `Alone` class's surrogates bail: see `rx::Class::neg`.)
-                Insn::Class { ascii, k } | Insn::Alone { ascii, k } => Piece {
+                Insn::Class { ascii, k } => Piece {
                     imm: k,
                     imm64: Imm64::Value(ascii as u64),
                     imm64b: (ascii >> 64) as u64,
-                    ..piece("rx_class")
+                    ..piece(if u { "rx_class_u" } else { "rx_class" })
+                },
+                // (A surrogate pair's half fails: see `rx_alone`.)
+                Insn::Alone { ascii, k } => Piece {
+                    imm: k,
+                    imm64: Imm64::Value(ascii as u64),
+                    imm64b: (ascii >> 64) as u64,
+                    ..piece("rx_alone")
                 },
                 Insn::Str(k) => {
                     let u = &re.prog.strs[k as usize];
@@ -2501,13 +2513,21 @@ impl Native {
                             ["rx_run_char", "rx_lazy_char", "rx_lazyback_char"]
                         }
                         Insn::CharFold { c, canon } => {
-                            r.k = c as usize | (canon as usize) << 16;
-                            ["rx_run_fold", "rx_lazy_fold", "rx_lazyback_fold"]
+                            r.k = c as usize | (ascii_upper(re.fold, canon) as usize) << 16;
+                            if u {
+                                ["rx_run_fold_u", "rx_lazy_fold_u", "rx_lazyback_fold_u"]
+                            } else {
+                                ["rx_run_fold", "rx_lazy_fold", "rx_lazyback_fold"]
+                            }
                         }
                         Insn::Any => ["rx_run_any", "rx_lazy_any", "rx_lazyback_any"],
                         Insn::Class { ascii, k } => {
                             (r.lo, r.hi, r.k) = (ascii as u64, (ascii >> 64) as u64, k as usize);
-                            ["rx_run_class", "rx_lazy_class", "rx_lazyback_class"]
+                            if u {
+                                ["rx_run_class_u", "rx_lazy_class_u", "rx_lazyback_class_u"]
+                            } else {
+                                ["rx_run_class", "rx_lazy_class", "rx_lazyback_class"]
+                            }
                         }
                         i => unreachable!("a run of {i:?}"),
                     };
@@ -2518,6 +2538,7 @@ impl Native {
                     i += 2;
                     continue;
                 }
+                Insn::Astral(k) => Piece { imm: k, ..piece("rx_astral") },
                 Insn::Match => piece("rx_match"),
                 Insn::BackRef(..)
                 | Insn::Look { .. }
@@ -2526,8 +2547,7 @@ impl Native {
                 | Insn::BehindEnd
                 | Insn::Back
                 | Insn::SaveBack { .. }
-                | Insn::BackRefBack(..)
-                | Insn::Astral(_) => unreachable!(),
+                | Insn::BackRefBack(..) => unreachable!(),
             };
             pieces.push(p);
             i += 1;
@@ -2543,12 +2563,26 @@ impl Native {
         for (k, exit, body) in head_at {
             (heads[k].exit, heads[k].body) = (native.at[exit], native.at[body]);
         }
+        let ctx = std::cell::UnsafeCell::new(rx::Ctx {
+            limit: std::ptr::null_mut(),
+            classes: classes.as_ptr(),
+            ic: match re.fold {
+                Case::Exact => 0,
+                Case::Fold => 1,
+                Case::Unicode => 2,
+            },
+            prog: std::ptr::null(),
+            wide: rx_wide_rt,
+            fold: rx_fold_rt,
+            astral: rx_astral_rt,
+        });
         Some(Native {
+            ctx,
             nomatch: native.at[nomatch],
             code: native,
             _runs: runs,
             _heads: heads,
-            classes,
+            _classes: classes,
             _ranges: ranges,
             caps_at,
             slots,
@@ -2576,13 +2610,16 @@ impl Native {
     fn run(&self, re: &Regex, s: &[u16], at: usize, run: &mut Run) -> Option<bool> {
         use crate::jit::rx;
         let Run { caps, slots, bt, grew, .. } = run;
-        let ctx = rx::Ctx {
-            limit: unsafe { bt.as_mut_ptr().add(bt.len() - 4) },
-            classes: self.classes.as_ptr(),
-            ic: (re.fold != Case::Exact) as usize,
-        };
+        // (The context made with the code, its fields that change set: an
+        // attempt is made at each start, and making all seven cost
+        // Octane's RegExp 0.25% more instructions.)
+        let ctx = self.ctx.get();
+        unsafe {
+            (*ctx).limit = bt.as_mut_ptr().add(bt.len() - 4);
+            (*ctx).prog = &re.prog as *const Program as *const u8;
+        }
         let end = unsafe {
-            (self.code.entry())(s.as_ptr(), s.len(), at, bt.as_mut_ptr().add(2), slots.as_mut_ptr(), &ctx)
+            (self.code.entry())(s.as_ptr(), s.len(), at, bt.as_mut_ptr().add(2), slots.as_mut_ptr(), ctx)
         };
         match end {
             rx::NOMATCH => Some(false),

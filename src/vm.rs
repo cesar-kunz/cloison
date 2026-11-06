@@ -4975,15 +4975,20 @@ impl Vm {
 
     /// `v`'s code units if it is a string, borrowed from the VM: the
     /// collector may move the string at the next allocation, which needs
-    /// `&mut self`, and dropping the VM frees it.
+    /// `&mut self`, and dropping the VM frees it. A cons string's units
+    /// (a concatenation's, see `Vm::new_cons`) are copied out of its
+    /// pieces, not made flat:
+    /// that would allocate, which a shared borrow mustn't (it would move
+    /// the string another call's slice reads), and outside a run, in no
+    /// VM's heap (#70).
     ///
     /// ```
     /// let mut vm = cloison::vm::Vm::new();
     /// let s = vm.new_string(&[0x61; 3]);
-    /// assert_eq!(vm.string_units(s), Some(&[0x61; 3][..]));
+    /// assert_eq!(vm.string_units(s).as_deref(), Some(&[0x61; 3][..]));
     /// ```
     ///
-    /// The slice can't outlive the VM (#69):
+    /// The units can't outlive the VM (#69):
     ///
     /// ```compile_fail,E0597
     /// let units = {
@@ -4992,8 +4997,28 @@ impl Vm {
     ///     vm.string_units(s).unwrap()
     /// };
     /// ```
-    pub fn string_units(&self, v: Value) -> Option<&[u16]> {
-        string_units(v)
+    ///
+    /// Nor live across an allocation:
+    ///
+    /// ```compile_fail,E0502
+    /// let mut vm = cloison::vm::Vm::new();
+    /// let s = vm.new_string(&[0x61; 64]);
+    /// let units = vm.string_units(s).unwrap();
+    /// vm.new_string(&[0x62; 64]);
+    /// assert_eq!(units[0], 0x61);
+    /// ```
+    pub fn string_units(&self, v: Value) -> Option<std::borrow::Cow<'_, [u16]>> {
+        let n = string_len(v)?;
+        let o = as_object(v);
+        unsafe {
+            if (*o).elems.is_null() {
+                let mut units = vec![0u16; n];
+                copy_units(o, units.as_mut_ptr());
+                Some(std::borrow::Cow::Owned(units))
+            } else {
+                Some(std::borrow::Cow::Borrowed(std::slice::from_raw_parts((*o).elems.cast::<u16>(), n)))
+            }
+        }
     }
 
     /// A new string of `len` code units, with `words` words after its
@@ -7452,8 +7477,7 @@ pub(crate) fn push_string(out: &mut Vec<u16>, s: Value) -> Result<()> {
 }
 
 /// Make the cons string `o` (see [`Vm::new_cons`]) flat: its units copied
-/// out of its pieces (iteratively: `s += c` makes a chain as long as the
-/// string), the pieces dropped.
+/// out of its pieces, the pieces dropped.
 #[cold]
 #[inline(never)]
 unsafe fn flatten(o: *mut Object) {
@@ -7462,6 +7486,19 @@ unsafe fn flatten(o: *mut Object) {
         let len = (*o).elems_len as usize;
         // Padded to whole words, and one more (copies read past the end).
         let buf = vm.heap.alloc_bytes(8 * (len.div_ceil(4) + 1)).cast::<u16>();
+        copy_units(o, buf);
+        (*o).elems = buf.cast();
+        crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
+        (*o).props = std::ptr::null_mut();
+        (*o).code = std::ptr::null();
+    }
+}
+
+/// Copy the units of the cons string `o` to `buf`, out of its pieces
+/// (iteratively: `s += c` makes a chain as long as the string).
+unsafe fn copy_units(o: *mut Object, buf: *mut u16) {
+    unsafe {
+        let len = (*o).elems_len as usize;
         let mut at = 0;
         let mut stack: Vec<*mut Object> = vec![(*o).code as *mut Object, (*o).props.cast::<Object>()];
         while let Some(s) = stack.pop() {
@@ -7475,10 +7512,6 @@ unsafe fn flatten(o: *mut Object) {
             }
         }
         debug_assert_eq!(at, len);
-        (*o).elems = buf.cast();
-        crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
-        (*o).props = std::ptr::null_mut();
-        (*o).code = std::ptr::null();
     }
 }
 

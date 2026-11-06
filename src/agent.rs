@@ -13,7 +13,9 @@
 //! Agents belong to the VM that starts them: its broadcasts reach those
 //! only, and their reports only it; dropping it closes their mailboxes
 //! (one waiting for a broadcast ends) and joins their threads, those that
-//! end within [`JOIN_WAIT`]. At most [`MAX_AGENTS`] run at once per VM.
+//! end within [`JOIN_WAIT`]. At most [`MAX_AGENTS`] run at once per VM,
+//! and a start that finds no heap free (`heap::HEAPS` in a process,
+//! agents' agents among them) throws.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
@@ -153,10 +155,20 @@ fn agent_start(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     let mailbox = Arc::new(Mailbox { slot: Mutex::new(Slot::default()), cv: Condvar::new() });
     let (agent, reports) = (mailbox.clone(), vm.agent.reports.clone());
+    // (Agents start agents too: past the heaps a process has, the start
+    // that finds none throws, here rather than in the agent's thread.)
+    let Some(slice) = crate::heap::reserve() else {
+        return Err(Error::type_error(format!(
+            "$262.agent.start: more than {} heaps alive at once",
+            crate::heap::HEAPS
+        )));
+    };
+    // (If the thread can't be spawned, the closure is dropped and the
+    // slice with it: free again.)
     let spawned = std::thread::Builder::new()
         .name("agent".into())
         .stack_size(64 << 20)
-        .spawn(move || run_agent(&src, &agent, reports));
+        .spawn(move || run_agent(&src, slice, &agent, reports));
     match spawned {
         Ok(thread) => vm.agent.started.push(Started { mailbox, thread }),
         Err(e) => return Err(Error::type_error(format!("$262.agent.start: {e}"))),
@@ -165,16 +177,16 @@ fn agent_start(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// An agent's thread: its script, then each broadcast's callback, until
-/// it leaves (or throws, or its starter is dropped).
-fn run_agent(src: &str, mailbox: &Arc<Mailbox>, reports: Reports) {
-    run_agent_vm(src, mailbox, reports);
+/// it leaves (or throws, or its starter is dropped). Its heap goes in
+/// `slice`, which its starter reserved.
+fn run_agent(src: &str, slice: crate::heap::Slice, mailbox: &Arc<Mailbox>, reports: Reports) {
+    run_agent_vm(Vm::with_heap(crate::heap::Heap::with_slice(slice)), src, mailbox, reports);
     // (A broadcaster may be posting to it: closed, under the lock it
     // posts and waits under, it takes nothing.)
     mailbox.close();
 }
 
-fn run_agent_vm(src: &str, mailbox: &Mailbox, reports: Reports) {
-    let mut vm = Vm::new();
+fn run_agent_vm(mut vm: Vm, src: &str, mailbox: &Mailbox, reports: Reports) {
     vm.agent.report_to = Some(reports);
     let module = match crate::js::compile(src) {
         Ok(m) => m,

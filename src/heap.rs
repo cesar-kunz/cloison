@@ -205,7 +205,7 @@ fn release(a: usize, len: usize) {
 /// pause must find every slot that holds it). The current color is the
 /// metadata byte of the heap's slice's first granule ([`color_byte`]).
 #[inline(always)]
-pub fn barrier<T>(host: *const u8, a: *const T, v: Value) {
+pub(crate) fn barrier<T>(host: *const u8, a: *const T, v: Value) {
     unsafe {
         if v.is_cell()
             && *meta(v.to_bits() as usize) & (YOUNG | COLOR | EVAC) != *color_byte(host as usize)
@@ -219,7 +219,7 @@ pub fn barrier<T>(host: *const u8, a: *const T, v: Value) {
 /// The write barrier for a store at `a`, in the cell at `host`, of a
 /// pointer to a young array (an object's new `props` or `elems`).
 #[inline(always)]
-pub fn barrier_young<T>(host: *const u8, a: *const T) {
+pub(crate) fn barrier_young<T>(host: *const u8, a: *const T) {
     if unsafe { *meta(host as usize) } != YOUNG {
         card_mark(a);
     }

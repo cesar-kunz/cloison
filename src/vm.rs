@@ -661,7 +661,7 @@ const STACK_VALUES: usize = 1 << 18;
 // addresses stay put as the vectors grow.
 #[allow(clippy::vec_box)]
 pub struct Vm {
-    pub heap: Heap,
+    pub(crate) heap: Heap,
     shapes: Vec<crate::object::ShapeBox>,
     /// Shapes a full marking found dead (see [`Vm::sweep_shapes`]) that a
     /// cache or the JIT may still compare with or read: kept, so that
@@ -733,11 +733,11 @@ pub struct Vm {
     /// Codes found dead, freed once the sweep that frees their closures
     /// (which `heap::cell_size` reads them for) is done.
     pub(crate) condemned: Vec<Box<Code>>,
-    pub global: *mut Object,
-    pub object_prototype: *mut Object,
-    pub function_prototype: *mut Object,
-    pub array_prototype: *mut Object,
-    pub string_prototype: *mut Object,
+    pub(crate) global: *mut Object,
+    pub(crate) object_prototype: *mut Object,
+    pub(crate) function_prototype: *mut Object,
+    pub(crate) array_prototype: *mut Object,
+    pub(crate) string_prototype: *mut Object,
     /// An object whose one slot always holds `undefined`: a cached miss
     /// (a property found nowhere on the chain) is a prototype load from it.
     missing_holder: *mut Object,
@@ -747,7 +747,7 @@ pub struct Vm {
     /// `Vm::prune_strings`), a code's kept by its constants.
     strings: HashMap<Vec<u16>, Value>,
     /// Bumped whenever a prototype changes shape; see [`Ic`].
-    pub proto_epoch: u32,
+    pub(crate) proto_epoch: u32,
     /// [`Vm::lookup`]'s results, by the receiver's shape and the name (see
     /// [`LookupEntry`]).
     lookups: Box<[std::cell::Cell<LookupEntry>]>,
@@ -776,12 +776,12 @@ pub struct Vm {
     /// [`Vm::rely_through`]).
     pub(crate) through_deps: HashMap<usize, Vec<(usize, usize)>>,
     /// Bumped whenever a field's type generalizes (see [`FieldType`]).
-    pub field_epoch: u32,
+    pub(crate) field_epoch: u32,
     /// Bumped with anything compiled code may rely on changing (see
     /// `bump_code_epoch`), and with a field type it took generalizing
     /// (`field_generalized`): stores through the runtime check it, as one
     /// may have invalidated what the code storing assumes.
-    pub code_epoch: u32,
+    pub(crate) code_epoch: u32,
     /// Some object has had an indexed accessor or a read-only element
     /// (see `protect_indices`).
     pub(crate) indices_protected: bool,
@@ -1584,6 +1584,49 @@ impl Vm {
     }
 
     // ---- Names ----
+
+    /// The global object.
+    ///
+    /// Safe code can't make a cell `Value` out of a pointer (#71), nor
+    /// point the VM's own at another place:
+    ///
+    /// ```compile_fail,E0603
+    /// let v = cloison::object::object_value(0x1000 as *mut _);
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// let mut vm = cloison::vm::Vm::new();
+    /// vm.global = 0x1000 as *mut _;
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// let mut vm = cloison::vm::Vm::new();
+    /// vm.proto_epoch = 0;
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// let mut a = cloison::vm::Vm::new();
+    /// let mut b = cloison::vm::Vm::new();
+    /// std::mem::swap(&mut a.heap, &mut b.heap);
+    /// ```
+    ///
+    /// ```compile_fail,E0603
+    /// cloison::heap::barrier_young(0x1000 as *const u8, 0x1008 as *const u64);
+    /// ```
+    pub fn global_object(&self) -> Value {
+        object_value(self.global)
+    }
+
+    /// Bytes of heap blocks in use (see `Heap::allocated`).
+    pub fn heap_allocated(&self) -> usize {
+        self.heap.allocated()
+    }
+
+    /// Check every cell of the heap (see `Heap::verify`), for tests: the
+    /// cells walked.
+    pub fn verify_heap(&mut self) -> usize {
+        self.heap.verify()
+    }
 
     /// The atom of name `s`, for good: a caller outside the VM may hold it
     /// across any collection (Codex on #40; the VM's own use `intern_name`,

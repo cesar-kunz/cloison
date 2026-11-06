@@ -3476,10 +3476,15 @@ impl<'a> Gen<'a> {
     fn with_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> R<()> {
         let n = u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"));
         let spread = self.args_array_needed(args);
+        // (Only a `with`'s object is the call's `this`: with none, only
+        // `eval`s' scope objects, an ordinary call.)
+        let objects = self.withs[self.with_skip(name)..].iter().any(|w| w.starts_with("%w"));
         let mark = self.temp;
-        let method = self.alloc(pos)?;
+        // Whether it's a method call (unless `this` goes in the array).
+        let method = if objects && !spread { Some(self.alloc(pos)?) } else { None };
         let c = self.alloc(pos)?;
-        let w = self.alloc(pos)?;
+        // `this` (if any).
+        let w = if objects || spread { Some(self.alloc(pos)?) } else { None };
         let end = self.with_lookup(
             name,
             pos,
@@ -3489,16 +3494,14 @@ impl<'a> Gen<'a> {
                 // (An `eval`'s scope object's binding: a plain call's, no
                 // `this`.)
                 if !g.found_scope {
-                    g.mov(r, w);
-                    g.emit(Op::LdaTrue, &[]);
-                } else if spread {
-                    g.emit(Op::LdaUndefined, &[]);
-                    g.star(w);
-                    g.emit(Op::LdaFalse, &[]);
+                    g.mov(r, w.unwrap());
+                    if let Some(m) = method {
+                        g.emit(Op::LdaTrue, &[]);
+                        g.star(m);
+                    }
                 } else {
-                    g.emit(Op::LdaFalse, &[]);
+                    g.plain_with_call(spread, method, w);
                 }
-                g.star(method);
                 Ok(())
             },
             &mut |g| {
@@ -3507,12 +3510,7 @@ impl<'a> Gen<'a> {
                     pos,
                 })?;
                 g.star(c);
-                if spread {
-                    g.emit(Op::LdaUndefined, &[]);
-                    g.star(w);
-                }
-                g.emit(Op::LdaFalse, &[]);
-                g.star(method);
+                g.plain_with_call(spread, method, w);
                 Ok(())
             },
         )?;
@@ -3526,23 +3524,42 @@ impl<'a> Gen<'a> {
             return Ok(());
         }
         let n = n?;
+        let first = self.temp as u8;
         for _ in 0..n {
             self.alloc(pos)?;
         }
         for (i, a) in args.iter().enumerate() {
-            self.into(a, w + 1 + i as u8)?;
+            self.into(a, first + i as u8)?;
         }
+        let Some(m) = method else {
+            let ic = self.auto_ic(Op::CallUndefined.name());
+            self.emit(Op::CallUndefined, &[Arg::Reg(c), Arg::Reg(first), Arg::Count(n), ic]);
+            return Ok(());
+        };
         let (plain, done) = (self.label(), self.label());
-        self.ldar(method);
+        self.ldar(m);
         self.jump_if(Jmp::False, plain);
         let ic = self.auto_ic(Op::Call.name());
-        self.emit(Op::Call, &[Arg::Reg(c), Arg::Reg(w), Arg::Count(n), ic]);
+        self.emit(Op::Call, &[Arg::Reg(c), Arg::Reg(w.unwrap()), Arg::Count(n), ic]);
         self.jump(done);
         self.bind(plain);
         let ic = self.auto_ic(Op::CallUndefined.name());
-        self.emit(Op::CallUndefined, &[Arg::Reg(c), Arg::Reg(w + 1), Arg::Count(n), ic]);
+        self.emit(Op::CallUndefined, &[Arg::Reg(c), Arg::Reg(first), Arg::Count(n), ic]);
         self.bind(done);
         Ok(())
+    }
+
+    /// For `with_call`: the callee found outside the `with` objects, or
+    /// in an `eval`'s scope object, called with no `this`.
+    fn plain_with_call(&mut self, spread: bool, method: Option<u8>, w: Option<u8>) {
+        if spread {
+            self.emit(Op::LdaUndefined, &[]);
+            self.star(w.unwrap());
+        }
+        if let Some(m) = method {
+            self.emit(Op::LdaFalse, &[]);
+            self.star(m);
+        }
     }
 
     fn own_name_binding(&self, name: &str) -> bool {

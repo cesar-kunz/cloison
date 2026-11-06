@@ -6049,13 +6049,12 @@ impl Vm {
         codes
     }
 
-    /// Load and run `module`; returns its completion value. The module
-    /// is `js::compile`'s or `asm::parse`'s, or one `asm::verify` accepts:
-    /// its bytecode is run unchecked.
-    pub fn run(&mut self, module: &Module) -> Result<Value> {
+    /// Load and run `module`; returns its completion value. Its bytecode
+    /// is run unchecked, which [`Checked`](crate::asm::Checked) makes safe.
+    pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
         crate::interp::CURRENT_VM.with(|v| v.set(self));
         self.declare_script(module)?;
-        let code = self.load(module.clone());
+        let code = self.load(Module::clone(module));
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
         // Roots on the native stack are below here (see `gc`).

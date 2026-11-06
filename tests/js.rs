@@ -5720,6 +5720,21 @@ var src = [
         value(skimmed),
         "8,2,3:0,pq0,1:9:9,4,4,outer,55,3,1234,2:1,6,2:1,6,3,3"
     );
+    // A direct `eval` in a body sees the variables around it, though
+    // nothing else there names them: reads, writes (not a global's), in
+    // a nested function or an accessor, `(eval)`. SpiderMonkey's values.
+    let evals = r#"
+var src = [
+  "function e1() { var z = 1; return function () { return eval('z'); }; }",
+  "function e2() { var z = 1; var f = function () { eval('z = 2'); }; f(); return z + ':' + typeof globalThis.z; }",
+  "function e3() { var a = 1; return function () { var b = 2; return function () { return eval('a + b'); }(); }; }",
+  "function e4(p) { var o = { get v() { return eval('p'); } }; return function () { return o.v + (eval)('p'); }; }",
+  "function e5() { function h() { return 5; } return function () { function k() { return eval('h()'); } return k(); }; }",
+  "[e1()(), e2(), e3()(), e4(2)(), e5()()].join(',');"
+].join("\n");
+(0, eval)(src);
+"#;
+    assert_eq!(value(evals), "1,2:undefined,3,4,5");
     // A skimmed body's syntax error is thrown at its first call (Node
     // throws at the `eval`).
     assert_eq!(

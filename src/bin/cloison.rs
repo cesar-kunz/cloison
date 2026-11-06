@@ -18,6 +18,17 @@
 use std::io::Write;
 use std::process::ExitCode;
 
+// Standard error failing (full, closed) drops what is written to it:
+// std's `eprintln!`/`eprint!`, which this shadows in the file, panic,
+// and under `panic = "abort"` an uncaught exception's message to a full
+// standard error ended the process with SIGABRT.
+macro_rules! eprintln {
+    ($($t:tt)*) => {{ let _ = writeln!(std::io::stderr(), $($t)*); }};
+}
+macro_rules! eprint {
+    ($($t:tt)*) => {{ let _ = write!(std::io::stderr(), $($t)*); }};
+}
+
 extern "C" fn on_segv(_: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     unsafe {
         #[cfg(target_os = "macos")]

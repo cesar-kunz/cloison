@@ -4973,6 +4973,29 @@ impl Vm {
         Ok(self.new_string_with(len, fill))
     }
 
+    /// `v`'s code units if it is a string, borrowed from the VM: the
+    /// collector may move the string at the next allocation, which needs
+    /// `&mut self`, and dropping the VM frees it.
+    ///
+    /// ```
+    /// let mut vm = cloison::vm::Vm::new();
+    /// let s = vm.new_string(&[0x61; 3]);
+    /// assert_eq!(vm.string_units(s), Some(&[0x61; 3][..]));
+    /// ```
+    ///
+    /// The slice can't outlive the VM (#69):
+    ///
+    /// ```compile_fail,E0597
+    /// let units = {
+    ///     let mut vm = cloison::vm::Vm::new();
+    ///     let s = vm.new_string(&[0x61; 64]);
+    ///     vm.string_units(s).unwrap()
+    /// };
+    /// ```
+    pub fn string_units(&self, v: Value) -> Option<&[u16]> {
+        string_units(v)
+    }
+
     /// A new string of `len` code units, with `words` words after its
     /// header (at least the units'), which `fill` writes from their start.
     pub(crate) fn new_string_raw(
@@ -7341,8 +7364,10 @@ pub(crate) fn string_prefix(v: Value, n: usize) -> Vec<u16> {
     out
 }
 
-/// `v`'s code units if it is a string.
-pub fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
+/// `v`'s code units if it is a string. The slice is bound to no borrow:
+/// it is only valid until the next allocation can move the string (see
+/// [`Vm::string_units`] for the public, borrowed form).
+pub(crate) fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
     if !v.is_cell() {
         return None;
     }

@@ -1034,6 +1034,12 @@ pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
         s if s.is_undefined() => vec![b',' as u16],
         s => {
             let s = crate::intrinsics::to_string(vm, s)?;
+            // (Its separators alone past the longest string: thrown before
+            // a long one is read, as `Array.prototype.join` does.)
+            let n = crate::vm::string_len(s).unwrap_or(0);
+            if len > 1 && (len - 1) as f64 * n as f64 > crate::vm::MAX_STRING_LEN as f64 {
+                return Err(Error::range_error("Invalid string length"));
+            }
             string_units(s).unwrap_or(&[]).to_vec()
         }
     };
@@ -1048,7 +1054,7 @@ pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
         }
         crate::vm::check_string_len(out.len())?;
     }
-    Ok(vm.new_string(&out))
+    vm.try_new_string(&out)
 }
 
 fn typed_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

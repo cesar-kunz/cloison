@@ -747,6 +747,8 @@ fn join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     each(vm, it, None, "join", |vm, v, _| {
         if !first {
             out.extend_from_slice(&sep);
+            // (Separators alone, between `undefined`s, grow it too.)
+            crate::vm::check_string_len(out.len())?;
         }
         first = false;
         if !v.is_undefined() && !v.is_null() {
@@ -755,7 +757,7 @@ fn join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         Ok(None)
     })?;
-    Ok(vm.new_string(&out))
+    vm.try_new_string(&out)
 }
 
 /// `chunks(size)`'s and `windows(size, undersized)`'s size: an integral

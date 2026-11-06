@@ -159,6 +159,14 @@ pub(crate) fn symbol_string(v: Value) -> Vec<u16> {
     u
 }
 
+/// [`symbol_string`] as a string value: a RangeError past the longest
+/// string, thrown before a long description is read.
+pub(crate) fn symbol_string_value(vm: &mut Vm, v: Value) -> Result<Value> {
+    crate::vm::check_string_len(crate::vm::string_len(description(v)).unwrap_or(0) + 8)?;
+    let u = symbol_string(v);
+    Ok(vm.new_string(&u))
+}
+
 /// The symbol `this` is (a symbol, or a `Symbol` wrapper).
 fn this_symbol(this: Value, what: &str) -> Result<Value> {
     if is_symbol(this) {
@@ -208,8 +216,7 @@ fn symbol_key_for(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 pub(crate) fn symbol_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let s = this_symbol(this, "Symbol.prototype.toString")?;
-    let u = symbol_string(s);
-    Ok(vm.new_string(&u))
+    symbol_string_value(vm, s)
 }
 
 pub(crate) fn symbol_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

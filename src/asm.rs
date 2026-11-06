@@ -484,7 +484,7 @@ pub fn verify(m: &Module) -> Result<(), String> {
     if upvalues[m.script] != 0 {
         return Err("the script has upvalues".into());
     }
-    for f in &m.functions {
+    for (i, f) in m.functions.iter().enumerate() {
         let err = |at: usize, what: String| Err(format!("{}: at {at}: {what}", f.name));
         if f.lazy.is_some() || f.kind > 1 {
             return Err(format!("{}: a stub, class constructor, generator or async function", f.name));
@@ -578,6 +578,10 @@ pub fn verify(m: &Module) -> Result<(), String> {
             match plain {
                 Op::CompileLazy | Op::InitialYield | Op::Yield | Op::AsyncStart | Op::PushLiteral | Op::DefineAccessor => {
                     return err(at, format!("{op:?} is the front end's only"));
+                }
+                // The script's frame has no callee, nor arguments.
+                Op::LdaCallee | Op::CreateArguments | Op::CreateMappedArguments | Op::CallApplyArguments if i == m.script => {
+                    return err(at, format!("{op:?} outside a function"));
                 }
                 Op::LdaUpvalue | Op::StaUpvalue if vals[0] as usize >= f.upvalues.len() => {
                     return err(at, format!("{op:?}: upvalue {} out of range", vals[0]));
@@ -897,6 +901,20 @@ mod tests {
         .contains("upvalue 0 out of range"));
         assert!(bad(&|f| f.kind = 4).contains("generator"));
         assert!(bad(&|f| f.handlers.push((0, 6, 3))).contains("handler"));
+        // What only a function's frame has.
+        for code in [
+            vec![Op::LdaCallee as u8, Op::Return as u8],
+            vec![Op::CreateArguments as u8, 0, Op::Return as u8],
+            vec![Op::CreateMappedArguments as u8, 0, Op::Return as u8],
+        ] {
+            assert!(bad(&|f| f.code = code.clone()).contains("outside a function"));
+        }
+        assert!(bad(&|f| {
+            f.nregs = 4;
+            f.code = vec![Op::CallApplyArguments as u8, 1, 1, 0, 0, 0, Op::Return as u8];
+            f.ics.push("".into());
+        })
+        .contains("outside a function"));
         // Calls fill `nparams` registers: not wrapped around to fit one.
         assert!(bad(&|f| {
             f.nparams = u32::MAX;

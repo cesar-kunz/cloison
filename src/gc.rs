@@ -4717,4 +4717,81 @@ mod tests {
         assert!(too_soon(&p, at(700), Some(at(0)), Some(at(0)), took), "within 20 times 40 ms");
         assert!(!too_soon(&p, at(900), Some(at(0)), Some(at(0)), took), "past it");
     }
+
+    /// `stop_after_final()`: a concurrent cycle's start and final pauses,
+    /// the sweep held after the final where the marker left it, and then
+    /// `Vm::int_fields_to_doubles`. Whether the sweep and a shape cycle
+    /// were still on for it.
+    fn stop_after_final(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+        let p: *mut Vm = vm;
+        vm.heap.finish_sweep();
+        for kind in [Collection::Start, Collection::Final] {
+            with_registers_spilled(&mut |sp| unsafe { (*p).collect_from(sp, std::ptr::null_mut(), kind) });
+        }
+        let mut on = vm.heap.gc.shape_cycle && vm.heap.gc.sweeping;
+        if let Some(mk) = &vm.heap.gc.marker {
+            mk.pause();
+            on &= !mk.shared.state.lock().unwrap().sweep.is_empty();
+        }
+        vm.int_fields_to_doubles();
+        if let Some(mk) = &vm.heap.gc.marker {
+            mk.unpause();
+        }
+        Ok(Value::from_bool(on))
+    }
+
+    /// `int32s(o)`: whether every number in `o`'s own memory is an int32.
+    fn int32s(_: &mut Vm, _: Value, a: &[Value]) -> crate::vm::Result<Value> {
+        let o = crate::object::as_object(a[0]);
+        unsafe {
+            let s = &*(*o).shape;
+            let ok = (0..s.fields().len() as u32)
+                .map(|i| s.location(i))
+                .filter(|&l| l >= 0)
+                .all(|l| !(*Object::slot(o, l)).is_number() || (*Object::slot(o, l)).is_int32());
+            Ok(Value::from_bool(ok))
+        }
+    }
+
+    /// The heap walk that turns a generalized field's int32s into doubles
+    /// keeps to dead objects' own memory while they are swept: their
+    /// shapes are zombies then (#54), whose `location` takes every field
+    /// for in-object, and a dead object with all of its fields out of line
+    /// had the int32s of the cells after it turned into doubles.
+    #[test]
+    fn int_fields_to_doubles_keeps_to_dead_objects_in_the_sweep() {
+        let src = r#"
+            var Q = 24, mk = new Function('return {};');
+            var P = new Function('m', 'for (var j = 0; j < 16; j++) this["v" + j] = m + j;');
+            var held = 0, bad = 0;
+            for (var k = 0; k < 20 && held < 3; k++) {
+                var src = 'o.r' + k + ' = m; ';
+                for (var j = 0; j < Q; j++) src += 'o.q' + j + ' = m; ';
+                var fill = new Function('o', 'm', src + 'return o;');
+                // Objects to die, each followed by one with int32s in its
+                // own memory, both old; then the first get their fields,
+                // all out of line, and a shape each.
+                var cells = [];
+                for (var m = 0; m < 4000; m++) cells.push(mk(), new P(m));
+                $262.gc();
+                var live = fill(mk(), 0);
+                for (var m = 0; m < 4000; m++) fill(cells[2 * m], m)['x' + m] = 1;
+                for (var m = 0; m < 4000; m++) cells[2 * m] = null;
+                // Its fields from Int to Num.
+                for (var j = 0; j < Q; j++) live['q' + j] = 0.5;
+                if (stop_after_final()) held++;
+                for (var m = 0; m < 4000; m++) if (!int32s(cells[2 * m + 1])) bad++;
+            }
+            [held > 0, bad].join()
+        "#;
+        let module = crate::js::compile(src).unwrap();
+        let mut vm = Vm::new();
+        let g = vm.global;
+        vm.define_natives(
+            g,
+            &[("stop_after_final", stop_after_final as crate::vm::NativeFn, 0), ("int32s", int32s, 1)],
+        );
+        let r = vm.run(&module).map(crate::vm::display).map_err(|e| e.to_string());
+        assert_eq!(r, Ok("true,0".to_string()));
+    }
 }

@@ -3765,6 +3765,11 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 return match call_function(vm, m, v, &[h]) {
                     Ok(r) if !crate::props::is_object(r) => r,
                     Ok(_) => fail(vm, Error::type_error("Cannot convert object to primitive value")),
+                    // (A native that calls a bytecode function: again.)
+                    Err(e) if is_no_top(vm, &e) => {
+                        vm.conv_redo = true;
+                        Value::UNDEFINED
+                    }
                     Err(e) => fail(vm, e),
                 };
             }
@@ -3809,6 +3814,12 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
             match r {
                 Ok(r) if !crate::props::is_object(r) => return r,
                 Ok(_) => {}
+                // (A native that calls a bytecode function, an array's
+                // own `join`: again where it can.)
+                Err(e) if is_no_top(vm, &e) => {
+                    vm.conv_redo = true;
+                    return Value::UNDEFINED;
+                }
                 Err(e) => {
                     vm.conv_error.get_or_insert(e);
                     vm.conv_thrown = true;

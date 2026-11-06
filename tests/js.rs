@@ -4496,8 +4496,9 @@ r.join(",");
 /// Such a conversion, redone, doesn't run again a native that wrote before
 /// it got to the bytecode call: an array-like's `shift` as its `toString`
 /// (or its `join`, or `Symbol.toPrimitive`) shifts once, a getter that
-/// `pop`s pops once. The expected value is SpiderMonkey's, JSC's and
-/// QuickJS's.
+/// `pop`s pops once. Nor does it go on to the next method, which may throw:
+/// `pop` as `valueOf` before a `toString` that throws for objects. The
+/// expected value is SpiderMonkey's, JSC's and QuickJS's.
 #[test]
 fn redone_conversions_run_no_writing_native_twice() {
     assert_eq!(
@@ -4520,12 +4521,39 @@ r.push(s + "", s.length);
 var q = [5, 6], e = new Error("x");
 Object.defineProperty(e, "message", { get: Array.prototype.pop.bind(q) });
 r.push(e + "", q.length);
+var p = { 0: 7, length: 1, valueOf: Array.prototype.pop, toString: Number.prototype.toString };
+r.push(+p, p.length);
 function f(n) { var t = 0; for (var i = 0; i < n; i++) { var x = mk("toString", Array.prototype.shift); t += +(x + "") + x.length; } return t; }
 r.push(f(5000));
 r.join(",");
 "#
         ),
-        "1,2,1,2,1,2,Error: 6,1,15000"
+        "1,2,1,2,1,2,Error: 6,1,7,0,15000"
+    );
+}
+
+/// `Object.prototype.toString` reads `Symbol.toStringTag` through its
+/// getter wherever it runs (a bytecode one, a native that writes: an
+/// operator's conversion redone), and throws what the getter throws. The
+/// expected value is SpiderMonkey's, JSC's and QuickJS's.
+#[test]
+fn object_to_string_reads_to_string_tag_getters() {
+    assert_eq!(
+        value(
+            r#"
+var r = [], q = ["Custom"], p = {}, t = {}, th = {};
+Object.defineProperty(p, Symbol.toStringTag, { get: Array.prototype.pop.bind(q) });
+Object.defineProperty(t, Symbol.toStringTag, { get: function () { return "T"; } });
+Object.defineProperty(th, Symbol.toStringTag, { get: function () { throw new Error("tag"); } });
+r.push(p + "", q.length, t + "", String(t));
+try { r.push(th + ""); } catch (e) { r.push(e.message); }
+try { r.push(Object.prototype.toString.call(th)); } catch (e) { r.push(e.message); }
+function g(n) { var s = 0; for (var i = 0; i < n; i++) s += (t + "").length; return s; }
+r.push(g(5000));
+r.join(",");
+"#
+        ),
+        "[object Custom],0,[object T],[object T],tag,tag,50000"
     );
 }
 

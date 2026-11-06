@@ -4623,8 +4623,11 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
                 }
                 q += 8 * GRANULE;
             }
-            while *meta(q) & END == 0 {
+            while q < end && *meta(q) & END == 0 {
                 q += GRANULE;
+            }
+            if q == end {
+                crate::heap::no_end(p);
             }
             let n = q + GRANULE - p;
             if m & COLOR == color {
@@ -4703,6 +4706,19 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As `Heap::next_hole`: the sweeper looks for an old cell's `END`
+    /// within its block only (clearing the next block's first, it would
+    /// make the same of a cell there in the next sweep).
+    #[test]
+    fn sweep_aborts_on_a_cell_without_end() {
+        use crate::heap::tests::{aborts, block_with_a_cell_without_end};
+        aborts("gc::tests::sweep_aborts_on_a_cell_without_end", "has no END in its block", || {
+            let mut heap = Heap::new();
+            let start = block_with_a_cell_without_end(&mut heap);
+            unsafe { sweep_block(start, 1, false) };
+        });
+    }
     use std::time::{Duration, Instant};
 
     fn policy_with(interval_ms: u64, spacing: u32) -> Policy {

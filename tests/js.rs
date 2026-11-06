@@ -5812,6 +5812,51 @@ out.join();"#;
     );
 }
 
+/// More builders throw past the longest string before they read a long
+/// piece (#65): `replace`'s, `replaceAll`'s and `RegExp`'s
+/// `Symbol.replace`'s function results, `%TypedArray%` `join`'s
+/// separators, JSON's object members, a symbol's string; and JSON's
+/// gap: its separators' indentation counted before it is written. Each
+/// error caught where it is thrown, nothing left pending past the `try`.
+/// Cons strings of 2^30 units (2 MiB), never flattened.
+#[test]
+fn more_builders_throw_past_the_longest_string() {
+    let src = r#"
+var s = "x".repeat(2 ** 20);
+for (var i = 0; i < 10; i++) s = s + s;
+var h = "x".repeat(2 ** 19);
+for (var i = 0; i < 10; i++) h = h + h;
+h = h + "x";
+var deep = Array(107400).fill(0);
+for (var i = 0; i < 1000; i++) deep = [deep];
+var out = [];
+function t(name, f) { var r; try { r = f(); } catch (e) { r = e.name; } out.push(name + ":" + r); }
+t("replace", () => "xa".replace("a", () => s));
+t("replace fits", () => "xa".replace("a", () => "yz"));
+t("replaceAll", () => "xaa".replaceAll("a", () => s));
+t("Symbol.replace", () => /a/[Symbol.replace]("xa", () => s));
+t("Symbol.replace fits", () => /a/g[Symbol.replace]("xaa", () => "yz"));
+t("typed join", () => new Uint8Array(3).join(h));
+t("typed join fits", () => new Uint8Array(3).join("-"));
+t("object member", () => JSON.stringify({ a: s }));
+t("raw", () => JSON.stringify([JSON.rawJSON("1"), JSON.rawJSON("2")]));
+t("gap", () => JSON.stringify(deep, null, 10));
+t("gap fits", () => JSON.stringify([[0, 0]], null, 1).length);
+t("symbol toString", () => Symbol(s).toString());
+t("String(symbol)", () => String(Symbol(s)));
+t("symbol fits", () => String(Symbol("d")));
+out.push("after");
+out.push([1, 2].join("+"));
+out.join();"#;
+    assert_eq!(
+        light_value(src),
+        "replace:RangeError,replace fits:xyz,replaceAll:RangeError,Symbol.replace:RangeError,\
+         Symbol.replace fits:xyzyz,typed join:RangeError,typed join fits:0-0-0,\
+         object member:RangeError,raw:[1,2],gap:RangeError,gap fits:18,symbol toString:RangeError,\
+         String(symbol):RangeError,symbol fits:Symbol(d),after,1+2"
+    );
+}
+
 /// Maps and sets find keys through a hash index, by SameValueZero (1 and
 /// 1.0, -0 and +0, NaNs alike); iterations in progress go on past a
 /// compaction or a `clear`, seeing entries added after (`collections`).

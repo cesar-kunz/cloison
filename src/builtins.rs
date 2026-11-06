@@ -413,8 +413,7 @@ fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         Some(&v) if string_units(v).is_some() => v,
         // (`String(symbol)` is its description; `new String(symbol)` throws.)
         Some(&v) if crate::symbol::is_symbol(v) && !construct => {
-            let u = crate::symbol::symbol_string(v);
-            return Ok(vm.new_string(&u));
+            return crate::symbol::symbol_string_value(vm, v);
         }
         Some(&v) => {
             let u = to_string_units(v);
@@ -530,12 +529,12 @@ fn string_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn string_to_lower_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let u = map_case(&this_units(this)?, str::to_lowercase);
-    Ok(vm.new_string(&u))
+    vm.try_new_string(&u)
 }
 
 fn string_to_upper_case(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let u = map_case(&this_units(this)?, str::to_uppercase);
-    Ok(vm.new_string(&u))
+    vm.try_new_string(&u)
 }
 
 /// `u` with `f` (`to_lowercase`, `to_uppercase`) applied to its runs of
@@ -762,7 +761,7 @@ fn string_normalize(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         };
     }
     match crate::normalize::normalize(&u, form) {
-        Some(n) => Ok(vm.new_string(&n)),
+        Some(n) => vm.try_new_string(&n),
         None => Ok(this_string(vm, this, &u)),
     }
 }
@@ -1881,9 +1880,11 @@ fn escape_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             for k in (0..4).rev() {
                 out.push(HEX[((c >> (4 * k)) & 15) as usize] as u16);
             }
+            // (An escape is up to 6 units of one: checked as it grows.)
+            check_string_len(out.len())?;
         }
     }
-    Ok(vm.new_string(&out))
+    vm.try_new_string(&out)
 }
 
 fn hex_digits(u: &[u16]) -> Option<u16> {
@@ -1931,8 +1932,10 @@ fn encode(vm: &mut Vm, a: &[Value], keep: &[u8]) -> Result<Value> {
         for &byte in c.encode_utf8(&mut b).as_bytes() {
             out.extend([b'%' as u16, HEX[(byte >> 4) as usize] as u16, HEX[(byte & 15) as usize] as u16]);
         }
+        // (Up to 9 units of one: checked as it grows.)
+        check_string_len(out.len())?;
     }
-    Ok(vm.new_string(&out))
+    vm.try_new_string(&out)
 }
 
 fn encode_uri_component(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -2772,7 +2775,11 @@ pub(crate) fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
     let re = this_regexp(this)?;
     let a_source = vm.intern_name("source");
     let src = String::from_utf16_lossy(&units(vm.get(this, a_source)?));
-    Ok(str_value(vm, &format!("/{src}/{}", regexp_flags(re))))
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    let u: Vec<u16> = format!("/{src}/{}", regexp_flags(re)).encode_utf16().collect();
+    vm.try_new_string(&u)
 }
 
 /// The `RegExp` a String method's argument stands for (a string is a
@@ -3086,20 +3093,28 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
                 vm.handles.extend_from_slice(&args);
                 crate::interp::call_function(vm, replacement, Value::UNDEFINED, &args)
             })?;
+            // (A string's length checked before its units are read.)
+            check_string_len(out.len() + string_len(r).unwrap_or(0))?;
             out.extend_from_slice(&units(r));
+            if vm.conv_failed() {
+                return Err(vm.take_conv_error());
+            }
         } else {
             let names = regexp_of(pattern).map_or(&[][..], |re| &re.names[..]);
-            expand(&template, &s, caps, names, &mut out);
+            expand(&template, &s, caps, names, &mut out)?;
         }
         last = y;
         check_string_len(out.len())?;
     }
     out.extend_from_slice(&s[last..]);
-    Ok(vm.new_string(&out))
+    vm.try_new_string(&out)
 }
 
 /// A replacement template's `$` patterns expanded for one match.
-fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(String, usize)], out: &mut Vec<u16>) {
+///
+/// Past the longest string, a RangeError: checked at each `$` pattern, as
+/// one copies up to the whole string.
+fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(String, usize)], out: &mut Vec<u16>) -> Result<()> {
     let (x, y) = caps[0].unwrap();
     let mut i = 0;
     while i < t.len() {
@@ -3109,6 +3124,7 @@ fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(Strin
             i += 1;
             continue;
         }
+        check_string_len(out.len())?;
         let n = t[i + 1];
         match n as u8 {
             b'$' => {
@@ -3169,6 +3185,7 @@ fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(Strin
             }
         }
     }
+    Ok(())
 }
 
 /// `split` by a regular expression: the pieces between matches (not
@@ -3714,6 +3731,9 @@ fn substitution(
             i += 1;
             continue;
         }
+        // (Past the longest string: checked at each `$` pattern, as one
+        // copies up to the whole string.)
+        check_string_len(out.len())?;
         let n = t[i + 1];
         match n {
             0x24 => {
@@ -3756,7 +3776,7 @@ fn substitution(
                     let v = vm.get_key(named, key)?;
                     if !v.is_undefined() {
                         let sv = crate::intrinsics::to_string(vm, v)?;
-                        out.extend_from_slice(string_units(sv).unwrap_or(&[]));
+                        push_string(&mut out, sv)?;
                     }
                     i += k + 3;
                 }
@@ -3852,6 +3872,11 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
                 crate::interp::call_function(vm, replace, Value::UNDEFINED, &args)
             })?;
             let sv = crate::intrinsics::to_string(vm, v)?;
+            // (Past the longest string, if it is used: thrown before a long
+            // string's units are read.)
+            if position >= next {
+                check_string_len(out.len() + (position - next) + string_len(sv).unwrap_or(0))?;
+            }
             string_units(sv).unwrap_or(&[]).to_vec()
         } else {
             let named = if named.is_undefined() { named } else { object_value(vm.to_object(named)?) };
@@ -3865,7 +3890,7 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
         }
     }
     out.extend_from_slice(&su[next.min(su.len())..]);
-    Ok(vm.new_string(&out))
+    vm.try_new_string(&out)
 }
 
 /// SpeciesConstructor(r, %RegExp%).

@@ -196,6 +196,14 @@ fn release(a: usize, len: usize) {
     unsafe { libc::madvise(a as *mut libc::c_void, len, advice) };
 }
 
+/// The VM running with the heap the cell at `a` is in, null if none runs:
+/// the first word of its slice's header block, set while `Vm::run` and its
+/// like run (`interp::Running`). A value can reach another VM's run (a host
+/// keeps it), which mustn't allocate for it in its own heap.
+pub(crate) fn owner(a: usize) -> *mut crate::vm::Vm {
+    unsafe { *((a & !(SLICE - 1)) as *const *mut crate::vm::Vm) }
+}
+
 /// The write barrier: `v` was stored at `a`, in the cell at `host`. A
 /// reference from an old cell to one that isn't marked with the heap's
 /// current color is recorded, by marking the card of `a`: outside a
@@ -891,6 +899,12 @@ impl Heap {
     /// The slice's start (block 0's address).
     pub(crate) fn base(&self) -> usize {
         self.base
+    }
+
+    /// Make `vm` the VM running with this heap (see [`owner`]); returns
+    /// the one before.
+    pub(crate) fn set_owner(&mut self, vm: *mut crate::vm::Vm) -> *mut crate::vm::Vm {
+        unsafe { std::ptr::replace(self.base as *mut *mut crate::vm::Vm, vm) }
     }
 
     /// `n` contiguous blocks never used before: the first's index.

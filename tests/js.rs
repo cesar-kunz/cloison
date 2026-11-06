@@ -13306,3 +13306,27 @@ fn string_units_reads_cons_strings_in_place() {
     assert_eq!((w.len(), w[0], w[50]), (51, b'z' as u16, b'w' as u16));
     assert!(b.string_units(cloison::value::Value::from_i32(1)).is_none());
 }
+
+/// A VM is the running one only while it runs (issue #70): a string of
+/// one kept by the host is made flat by none other, even after another VM
+/// ran and was dropped (it was flattened into that VM's freed heap).
+#[test]
+fn values_outlive_another_vm_run() {
+    let mut b = Vm::new();
+    let s = b.run(&cloison::js::compile("var s = 'x'.repeat(100) + 'y'.repeat(100); s").unwrap()).unwrap();
+    {
+        let mut a = Vm::new();
+        a.run(&cloison::js::compile("0").unwrap()).unwrap();
+    }
+    assert_eq!(display(s).len(), 200);
+    let mut a = Vm::new();
+    a.run(&cloison::js::compile("0").unwrap()).unwrap();
+    let m = cloison::js::compile("s.slice(99, 101) + s.length").unwrap();
+    assert_eq!(display(b.run(&m).unwrap()), "xy200");
+    drop(a);
+    assert_eq!(display(b.run(&m).unwrap()), "xy200");
+    assert_eq!(display(s), "x".repeat(100) + &"y".repeat(100));
+    // The message of what a run threw is made after it, as one.
+    let e = b.run(&cloison::js::compile("throw new Error('m' + s)").unwrap()).unwrap_err();
+    assert_eq!(b.uncaught_message(&e), format!("Error: m{}", display(s)));
+}

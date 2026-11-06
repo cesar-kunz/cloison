@@ -2827,7 +2827,8 @@ g();
 
 /// A captured boolean set to a constant and tested after int arithmetic,
 /// which runs nothing, so `fold_captured_tests` folds the test: the
-/// result is still the interpreter's (#64).
+/// result is still the interpreter's, and the compiled loop tests nothing
+/// but `i < n` (#64).
 #[test]
 fn tests_of_captured_registers_fold_across_typed_arithmetic() {
     let src = r#"
@@ -2862,6 +2863,11 @@ t;
         t.to_string()
     };
     assert_eq!(value(src), expected);
+    let (v, stencils) = compiled(src, "run");
+    assert_eq!(v, expected);
+    // The one ToBoolean test left is `peek() ? 1 : 0`'s, after the loop.
+    let tests = stencils.iter().filter(|s| s.starts_with("jto")).count();
+    assert_eq!(tests, 1, "{stencils:?}");
 }
 
 /// Polymorphic calls on a local receiver (copied into the call's `this`):

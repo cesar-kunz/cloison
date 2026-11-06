@@ -2752,6 +2752,118 @@ fn tests_of_known_values_agree_with_node() {
     assert_eq!(value(&format!("{KNOWN_TESTS}\nmain();")), "4887999");
 }
 
+/// A register set to `true`, then cleared by an inlined closure (made by
+/// a nested function, so inlined) through its upvalue before it is tested
+/// (#64): the test isn't folded on the value stored.
+#[test]
+fn tests_of_registers_closures_write_are_not_folded() {
+    let src = r#"
+function g() {
+  var b, c = 0;
+  var clr = (() => () => { b = false; })();
+  for (var i = 0; i < 3000; i++) {
+    b = true;
+    clr();
+    if (b) c++;
+  }
+  return c;
+}
+g();
+"#;
+    assert_eq!(value(src), "0");
+}
+
+/// As above, with the write elsewhere between the store and the test: a
+/// getter's, a `valueOf`'s an untyped `+` calls, and an inlined
+/// closure's after int arithmetic (whose stencils keep what the test
+/// knows) (#64).
+#[test]
+fn tests_of_registers_closures_write_are_not_folded_past_code_run() {
+    let getter = r#"
+function g() {
+  var b, c = 0, t = 0;
+  var o = (() => ({ get x() { b = false; return 1; } }))();
+  for (var i = 0; i < 3000; i++) {
+    b = true;
+    t += o.x;
+    if (b) c++;
+  }
+  return c * 10000 + t;
+}
+g();
+"#;
+    assert_eq!(value(getter), "3000");
+    let value_of = r#"
+function g() {
+  var b, c = 0, s = 0;
+  var v = (() => ({ valueOf() { b = false; return 1; } }))();
+  for (var i = 0; i < 3000; i++) {
+    b = true;
+    s = s + v;
+    if (b) c++;
+  }
+  return c * 10000 + s;
+}
+g();
+"#;
+    assert_eq!(value(value_of), "3000");
+    let after_arithmetic = r#"
+function g() {
+  var b, c = 0, s = 0;
+  var clr = (() => () => { b = false; })();
+  for (var i = 0; i < 3000; i++) {
+    b = true;
+    s = (s + i) | 0;
+    clr();
+    s = s ^ 1;
+    if (b) c++;
+  }
+  return c * 100000000 + s;
+}
+g();
+"#;
+    assert_eq!(value(after_arithmetic), "4498500");
+}
+
+/// A captured boolean set to a constant and tested after int arithmetic,
+/// which runs nothing, so `fold_captured_tests` folds the test: the
+/// result is still the interpreter's (#64).
+#[test]
+fn tests_of_captured_registers_fold_across_typed_arithmetic() {
+    let src = r#"
+function run(n) {
+  var flag = false, s = 0;
+  var peek = function () { return flag; };
+  for (var i = 0; i < n; i++) {
+    flag = true;
+    s += i & 7;
+    if (flag) s += 1; else s -= 1;
+    flag = false;
+    s ^= i;
+    if (!flag) s += 2;
+  }
+  return s + (peek() ? 1 : 0);
+}
+var t = 0;
+for (var k = 0; k < 20; k++) t += run(3000);
+t;
+"#;
+    let expected = {
+        let mut t: i64 = 0;
+        for _ in 0..20 {
+            let mut s: i32 = 0;
+            for i in 0..3000 {
+                s += (i & 7) + 1;
+                s ^= i;
+                s += 2;
+            }
+            t += s as i64;
+        }
+        t.to_string()
+    };
+    assert_eq!(value(src), expected);
+}
+
 /// Polymorphic calls on a local receiver (copied into the call's `this`):
 /// `get` is one function for `A` and `B`, another for `C`, and `D` comes
 /// after `run` is compiled. The expected value is Node's.

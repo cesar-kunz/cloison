@@ -18868,8 +18868,15 @@ pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool 
             | Prop::InstanceOf { .. }
             | Prop::Poly { .. }
             | Prop::Call { .. } => {}
-            Prop::Own { shape, ft: f, .. } | Prop::Oop { shape, ft: f, .. } | Prop::Proto { shape, ft: f, .. } => {
+            Prop::Own { shape, ft: f, .. } | Prop::Oop { shape, ft: f, .. } => {
                 out(shape);
+                ft(f, out);
+            }
+            Prop::Proto { shape, addr, ft: f } => {
+                out(shape);
+                // (A prototype's slot: its cell must not move while a
+                // version compiled later may embed it.)
+                out(addr);
                 ft(f, out);
             }
             Prop::Transition { shape, new_shape, ft: f, .. } => {
@@ -18894,8 +18901,11 @@ pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool 
     }
     fn case(c: &Case, out: &mut dyn FnMut(u64)) {
         out(c.shape & !FAMILY);
-        if let CaseLoc::Transition { new_shape, .. } = c.loc {
-            out(new_shape);
+        match c.loc {
+            CaseLoc::Transition { new_shape, .. } => out(new_shape),
+            // (A prototype's slot, as `Prop::Proto`'s.)
+            CaseLoc::Proto(addr) => out(addr),
+            CaseLoc::Own(_) | CaseLoc::Oop(_) => {}
         }
         ft(c.ft, out);
     }

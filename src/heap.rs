@@ -499,6 +499,7 @@ impl Heap {
                 if m != 0 {
                     // A cell: on to the granule after its `END`.
                     debug_assert!(m & COLOR != 0, "a young cell where allocation comes back");
+                    let cell = p;
                     // (Eight bytes at a time within the block: the
                     // metadata past the heap's end may not be mapped.)
                     while p + 8 * GRANULE <= end {
@@ -509,8 +510,11 @@ impl Heap {
                         }
                         p += 8 * GRANULE;
                     }
-                    while *meta(p) & END == 0 {
+                    while p < end && *meta(p) & END == 0 {
                         p += GRANULE;
+                    }
+                    if p == end {
+                        no_end(cell);
                     }
                     p += GRANULE;
                     continue;
@@ -1099,6 +1103,16 @@ impl Heap {
     }
 }
 
+/// An old cell at `p` with no `END` in its block (a cell never spans a
+/// small block): heap corruption, whatever the next block's metadata
+/// would make of it. An abort, not a panic: the marker thread sweeps.
+#[cold]
+#[inline(never)]
+pub(crate) fn no_end(p: usize) -> ! {
+    eprintln!("old cell at {p:#x} has no END in its block");
+    std::process::abort();
+}
+
 /// Bytes of an object with `words` words after its header (its class's
 /// `code` and `aux` among them).
 #[inline(always)]
@@ -1136,7 +1150,7 @@ pub unsafe fn cell_size(p: *const u8) -> usize {
 const _: () = assert!(BLOCK.is_multiple_of(CARD) && GRANULES_PER_BLOCK == 2048);
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// More heaps alive at once than tests running in parallel on a large
@@ -1181,5 +1195,55 @@ mod tests {
         assert_eq!(heap.verify(), seen.len() + 2);
         assert!(seen.iter().all(|&c| heap.contains(c)));
         assert!(!heap.contains(&heap as *const Heap as usize));
+    }
+
+    /// Run `f` in a child process of this test binary (test `name`),
+    /// which must abort printing `message`.
+    pub(crate) fn aborts(name: &str, message: &str, f: impl FnOnce()) {
+        use std::os::unix::process::ExitStatusExt;
+        if std::env::var_os("CLOISON_TEST_ABORTS").is_some() {
+            f();
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env("CLOISON_TEST_ABORTS", "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.signal(), Some(libc::SIGABRT), "{err}");
+        assert!(err.contains(message), "{err}");
+    }
+
+    /// A heap of a few blocks of small cells, the second's metadata
+    /// cleared but for an old cell near its end without its `END`, and an
+    /// `END` at the third's first granule: the second block's start.
+    pub(crate) fn block_with_a_cell_without_end(heap: &mut Heap) -> usize {
+        let first = heap.alloc_bytes(8) as usize - 8;
+        for _ in 0..8000 {
+            heap.alloc_bytes(8);
+        }
+        let start = (first & !(BLOCK - 1)) + BLOCK;
+        unsafe {
+            assert!(*meta(start + BLOCK) != 0, "no cell in the next block");
+            std::ptr::write_bytes(meta(start), 0, GRANULES_PER_BLOCK);
+            *meta(start + BLOCK - 4 * GRANULE) = 1;
+            *meta(start + BLOCK) |= END;
+        }
+        start
+    }
+
+    /// An old cell whose `END` is missing is heap corruption: allocation
+    /// looking for holes past it stops at its block's end, not at the
+    /// next block's first `END`.
+    #[test]
+    fn next_hole_aborts_on_a_cell_without_end() {
+        aborts("heap::tests::next_hole_aborts_on_a_cell_without_end", "has no END in its block", || {
+            let mut heap = Heap::new();
+            let start = block_with_a_cell_without_end(&mut heap);
+            heap.cursor = start + BLOCK - 4 * GRANULE;
+            heap.cursor_end = start + BLOCK;
+            heap.next_hole(GRANULE);
+        });
     }
 }

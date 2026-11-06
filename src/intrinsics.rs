@@ -349,6 +349,8 @@ fn template_string(vm: &mut Vm, v: Value) -> Result<Value> {
 /// A tagged template's strings array: `[site, cooked0, raw0, …]` (or for
 /// a long one, `[site, cooked, raw]` arrays of them), one array per site
 /// (`site` a number unique to it), frozen, with its frozen `raw` array.
+/// `[site]` alone: the site's array if made already, else `undefined` (a
+/// long one's arrays made only then).
 fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let site = a[0].as_number().unwrap_or(0.0) as u64;
     let code = vm.intrinsic_code;
@@ -357,6 +359,9 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             codes.push(code);
         }
         return Ok(object_value(*o));
+    }
+    if a.len() == 1 {
+        return Ok(Value::UNDEFINED);
     }
     let (strings, raw) = if a.len() == 3 && crate::props::is_object(a[1]) {
         (a[1], a[2])

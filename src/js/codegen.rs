@@ -4016,8 +4016,14 @@ impl<'a> Gen<'a> {
                 let first = self.alloc(e.pos)?;
                 self.constant(Constant::Number(site as f64));
                 self.star(first);
-                if self.temp + 2 * parts.len() + SPARE_REGS > 256 {
-                    // (A long one's strings in arrays: `[site, cooked, raw]`.)
+                let long = self.temp + 2 * parts.len() + SPARE_REGS > 256;
+                let done = long.then(|| self.label());
+                if let Some(done) = done {
+                    // (A long one's strings in arrays, `[site, cooked, raw]`,
+                    // made only the first time: `[site]` gets the cached
+                    // array, else `undefined`.)
+                    self.intrinsic("template_object", first, 1);
+                    self.jump_if(Jmp::ToBooleanTrue, done);
                     let (c, r) = (self.alloc(e.pos)?, self.alloc(e.pos)?);
                     for a in [c, r] {
                         self.emit(Op::CreateArray, &[Arg::Count(parts.len().min(255) as u8)]);
@@ -4047,6 +4053,9 @@ impl<'a> Gen<'a> {
                 }
                 let n = (self.temp - mark) as u8;
                 self.intrinsic("template_object", first, n);
+                if let Some(done) = done {
+                    self.bind(done);
+                }
                 self.temp = mark;
             }
             Class(c) => self.class(c, e.pos)?,

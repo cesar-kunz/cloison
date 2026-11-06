@@ -648,8 +648,8 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let out = species_create(vm, o, count)?;
     // (The arguments' conversions and the species lookup may have run
     // code that changed the length: the fast path only over the one
-    // measured.)
-    if dense(vm, as_object(o)) && dense(vm, as_object(out)) && unsafe { (*as_object(o)).elems_len } as f64 == len {
+    // measured. A species may return `o` itself: the copy then overlaps.)
+    if out != o && dense(vm, as_object(o)) && dense(vm, as_object(out)) && unsafe { (*as_object(o)).elems_len } as f64 == len {
         let obj = as_object(o);
         let oo = as_object(out);
         unsafe {
@@ -711,8 +711,10 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let removed = species_create(vm, o, del)?;
     // (As in `slice`: `start` and `deleteCount`'s conversions may have
     // changed the length. The fast path writes `removed`'s elements: an
-    // array's of its own.)
-    if dense(vm, as_object(o))
+    // array's of its own, not `o`, which a species may return and whose
+    // `length` set would then truncate it before the shift.)
+    if removed != o
+        && dense(vm, as_object(o))
         && unsafe { (*as_object(o)).elems_len } as f64 == len
         && is_object(removed)
         && dense(vm, as_object(removed))

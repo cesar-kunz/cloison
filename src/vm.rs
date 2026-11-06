@@ -3988,11 +3988,11 @@ impl Vm {
     /// `key in obj`: whether `obj` or its prototypes have the property or
     /// element `key`.
     pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
-        if !obj.is_cell() || string_units(obj).is_some() {
+        if !obj.is_cell() || string_len(obj).is_some() {
             return Err(Error::type_error(format!(
                 "Cannot use 'in' operator to search for '{}' in {}",
-                display(key),
-                display(obj)
+                shown(key),
+                shown(obj)
             )));
         }
         let mut o = as_object(obj);
@@ -4030,7 +4030,7 @@ impl Vm {
             if obj.is_undefined() || obj.is_null() {
                 return Err(Error::type_error(format!(
                     "Cannot convert {} to object",
-                    display(obj)
+                    shown(obj)
                 )));
             }
             return Ok(true);
@@ -5752,7 +5752,7 @@ impl Vm {
                 }
             }
         }
-        Err(Error::type_error(format!("{} is not a function", display(f))))
+        Err(Error::type_error(format!("{} is not a function", shown(f))))
     }
 
     /// `new f(…args)` when `f` isn't a bytecode function: a native that
@@ -5781,7 +5781,7 @@ impl Vm {
                 }
             }
         }
-        Err(Error::type_error(format!("{} is not a constructor", display(f))))
+        Err(Error::type_error(format!("{} is not a constructor", shown(f))))
     }
 
     // ---- Loading and running ----
@@ -7234,6 +7234,62 @@ pub fn display(v: Value) -> String {
     } else {
         format!("{v:?}")
     }
+}
+
+/// The most code units of a string, or of a symbol's description, that
+/// an error message shows (see [`shown`]).
+pub(crate) const SHOWN_UNITS: usize = 1000;
+
+/// [`display`] for an error message: a string, or a symbol's description,
+/// past [`SHOWN_UNITS`] code units cut there and `...` after (its units
+/// read without flattening it). So a message stays short (V8 shows a long
+/// string whole, and one past its longest as `<error>`).
+pub(crate) fn shown(v: Value) -> String {
+    let cut = |s: Value| {
+        let mut t = String::from_utf16_lossy(&string_prefix(s, SHOWN_UNITS));
+        t.push_str("...");
+        t
+    };
+    if string_len(v).is_some_and(|n| n > SHOWN_UNITS) {
+        return cut(v);
+    }
+    if crate::symbol::is_symbol(v) {
+        let d = crate::symbol::description(v);
+        if string_len(d).is_some_and(|n| n > SHOWN_UNITS) {
+            return format!("Symbol({})", cut(d));
+        }
+    }
+    display(v)
+}
+
+/// String `v`'s first `n` code units (all of them if it has fewer), read
+/// from its pieces if it is a cons string (see [`Vm::new_cons`]): not
+/// flattened.
+pub(crate) fn string_prefix(v: Value, n: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(n.min(string_len(v).unwrap_or(0)));
+    let mut stack = vec![as_object(v)];
+    unsafe {
+        while let Some(s) = stack.pop() {
+            let left = n - out.len();
+            if left == 0 {
+                break;
+            }
+            if (*s).elems.is_null() {
+                // (The second piece only if the first is short: so the
+                // stack stays as deep as `n`, not as the chain `s += c`
+                // makes.)
+                let (a, b) = ((*s).props.cast::<Object>(), (*s).code as *mut Object);
+                if ((*a).elems_len as usize) < left {
+                    stack.push(b);
+                }
+                stack.push(a);
+            } else {
+                let k = ((*s).elems_len as usize).min(left);
+                out.extend_from_slice(std::slice::from_raw_parts((*s).elems.cast::<u16>(), k));
+            }
+        }
+    }
+    out
 }
 
 /// `v`'s code units if it is a string.

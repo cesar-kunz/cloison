@@ -534,12 +534,12 @@ fn collection_ctor(vm: &mut Vm, a: &[Value], class: Class, proto: Proto, name: &
     let a_adder = vm.intern_name(if pairs { "set" } else { "add" });
     let adder = vm.get(o, a_adder)?;
     if !is_callable(adder) {
-        return Err(Error::type_error(format!("'{}' returned for property '{}' of object '#<{name}>' is not a function", crate::vm::display(adder), if pairs { "set" } else { "add" })));
+        return Err(Error::type_error(format!("'{}' returned for property '{}' of object '#<{name}>' is not a function", crate::vm::shown(adder), if pairs { "set" } else { "add" })));
     }
     iterate(vm, iterable, |vm, item| {
         if pairs {
             if !is_object(item) {
-                return Err(Error::type_error(format!("Iterator value {} is not an entry object", crate::vm::display(item))));
+                return Err(Error::type_error(format!("Iterator value {} is not an entry object", crate::vm::shown(item))));
             }
             let k = vm.get_keyed(item, Value::from_i32(0))?;
             let v = vm.get_keyed(item, Value::from_i32(1))?;
@@ -634,7 +634,7 @@ fn map_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn for_each(vm: &mut Vm, o: *mut Object, a: &[Value], this: Value) -> Result<Value> {
     let f = arg(a, 0);
     if !is_callable(f) {
-        return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
+        return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(f))));
     }
     let t = arg(a, 1);
     let s = stride(o);

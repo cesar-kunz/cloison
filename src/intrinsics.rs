@@ -228,7 +228,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         let o = as_object(f);
         let code = unsafe { &*(*o).code };
         if !code.constructor() {
-            return Err(Error::type_error(format!("{} is not a constructor", crate::vm::display(f))));
+            return Err(Error::type_error(format!("{} is not a constructor", crate::vm::shown(f))));
         }
         let this = if code.kind == 3 {
             Value::HOLE
@@ -247,7 +247,7 @@ fn construct_with_on(vm: &mut Vm, f: Value, args: &[Value], nt: Value) -> Result
         return Ok(if crate::props::is_object(r) { r } else { this });
     }
     if !is_constructor(f) {
-        return Err(Error::type_error(format!("{} is not a constructor", crate::vm::display(f))));
+        return Err(Error::type_error(format!("{} is not a constructor", crate::vm::shown(f))));
     }
     // (A proxy's trampoline takes `new.target`.)
     if vm.proxies_exist && crate::proxy::is_proxy(vm, as_object(f)) {
@@ -475,7 +475,7 @@ fn class_setup(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     } else if !is_constructor(h) {
         return Err(Error::type_error(format!(
             "Class extends value {} is not a constructor or null",
-            crate::vm::display(h)
+            crate::vm::shown(h)
         )));
     } else {
         let a_prototype = vm.a_prototype;
@@ -483,7 +483,7 @@ fn class_setup(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         if !(p.is_null() || crate::props::is_object(p)) {
             return Err(Error::type_error(format!(
                 "Class extends value does not have valid prototype property {}",
-                crate::vm::display(p)
+                crate::vm::shown(p)
             )));
         }
         (p, h)
@@ -658,7 +658,7 @@ fn super_call(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !is_constructor(parent) {
         return Err(Error::type_error(format!(
             "Super constructor {} of anonymous class is not a constructor",
-            crate::vm::display(parent)
+            crate::vm::shown(parent)
         )));
     }
     let args = elements(vm, a[2])?;
@@ -762,7 +762,7 @@ fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// An object pattern's source: `[v]`, not `null` or `undefined`.
 fn require_coercible(_: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[0].is_undefined() || a[0].is_null() {
-        return Err(Error::type_error(format!("Cannot destructure '{}' as it is {}.", crate::vm::display(a[0]), crate::vm::display(a[0]))));
+        return Err(Error::type_error(format!("Cannot destructure '{}' as it is {}.", crate::vm::shown(a[0]), crate::vm::shown(a[0]))));
     }
     Ok(a[0])
 }
@@ -1139,7 +1139,7 @@ fn scope_delete(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn with_set_strict(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
     if !vm.has_key(a[0], key)? {
-        return Err(Error::reference_error(format!("{} is not defined", crate::vm::display(a[1]))));
+        return Err(Error::reference_error(format!("{} is not defined", crate::vm::shown(a[1]))));
     }
     vm.put_key(a[0], key, a[2])?;
     Ok(a[2])
@@ -1193,7 +1193,7 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Resu
     }
     let r = call_function(vm, m, it, &[received])?;
     if !crate::props::is_object(r) {
-        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
     }
     Ok(r)
 }
@@ -1396,7 +1396,7 @@ fn private_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error(format!(
             "Cannot use 'in' operator to search for '{}' in {}",
             crate::symbol::description_string(s),
-            crate::vm::display(o)
+            crate::vm::shown(o)
         )));
     }
     Ok(Value::from_bool(private_property(vm, o, s).is_some()))
@@ -1453,7 +1453,7 @@ fn async_iterator_next(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let r = a[0];
     if !crate::props::is_object(r) {
-        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
     }
     let a_done = vm.intern_name("done");
     if crate::interp::to_boolean(vm.get(r, a_done)?) {
@@ -1526,7 +1526,7 @@ fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Optio
 }
 
 fn uninitialized(name: Value) -> Error {
-    Error::reference_error(format!("Cannot access '{}' before initialization", crate::vm::display(name)))
+    Error::reference_error(format!("Cannot access '{}' before initialization", crate::vm::shown(name)))
 }
 
 /// A direct `eval`'s binding's getter: its variable's value (a

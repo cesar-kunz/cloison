@@ -119,7 +119,7 @@ pub(crate) fn is_registered(v: Value) -> bool {
 }
 
 /// A symbol's description (`undefined` or a string).
-fn description(v: Value) -> Value {
+pub(crate) fn description(v: Value) -> Value {
     Value::from_bits(unsafe { (*as_object(v)).code } as u64)
 }
 
@@ -201,7 +201,7 @@ fn symbol_for(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 fn symbol_key_for(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let s = arg(a, 0);
     if !is_symbol(s) {
-        return Err(Error::type_error(format!("{} is not a symbol", crate::vm::display(s))));
+        return Err(Error::type_error(format!("{} is not a symbol", crate::vm::shown(s))));
     }
     Ok(if is_registered(s) { description(s) } else { Value::UNDEFINED })
 }
@@ -546,12 +546,12 @@ fn string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
 /// GetIterator(v): `v[Symbol.iterator]()`, an object.
 pub(crate) fn get_iterator(vm: &mut Vm, v: Value) -> Result<Value> {
     if v.is_undefined() || v.is_null() {
-        return Err(Error::type_error(format!("{} is not iterable", crate::vm::display(v))));
+        return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(v))));
     }
     let a = vm.a_sym_iterator;
     let m = vm.get(v, a)?;
     if !is_callable(m) {
-        return Err(Error::type_error(format!("{} is not iterable", crate::vm::display(v))));
+        return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(v))));
     }
     let it = call_function(vm, m, v, &[])?;
     if !is_object(it) {
@@ -592,7 +592,7 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     }
     let r = call_function(vm, next, it, &[])?;
     if !is_object(r) {
-        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
     }
     let a_done = vm.intern_name("done");
     if to_boolean(vm.get(r, a_done)?) {

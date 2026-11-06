@@ -18414,6 +18414,37 @@ mod tests {
         })
     }
 
+    /// `build.rs` reruns, and recompiles the stencils, when any runtime
+    /// source they take with `#[path]` changes: else they keep a layout's
+    /// old offsets (#74). Cargo keeps the script's output next to `OUT_DIR`:
+    /// `run/stdout` in its newer build directory layout, `output` before.
+    #[test]
+    fn stencils_rebuild_when_their_sources_change() {
+        use std::path::Path;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let resolve = |p: &Path| root.join(p).canonicalize().unwrap();
+        let build = Path::new(env!("OUT_DIR")).parent().unwrap();
+        let output = ["run/stdout", "output"]
+            .iter()
+            .find_map(|p| std::fs::read_to_string(build.join(p)).ok())
+            .expect("no build script output next to OUT_DIR");
+        let watched: Vec<_> = output
+            .lines()
+            .filter_map(|l| l.strip_prefix("cargo:rerun-if-changed="))
+            .map(|p| resolve(Path::new(p)))
+            .collect();
+        let source = std::fs::read_to_string(root.join("stencils/stencils.rs")).unwrap();
+        let included: Vec<_> = source
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("#[path = \"")?.strip_suffix("\"]"))
+            .map(|p| resolve(&Path::new("stencils").join(p)))
+            .collect();
+        assert!(included.len() >= 2, "no #[path] modules found in stencils/stencils.rs");
+        for path in included {
+            assert!(watched.contains(&path), "build.rs doesn't rerun when {} changes", path.display());
+        }
+    }
+
     /// A `push` onto an array literal's array ([`Insn::own_push`]) reads
     /// that register alone, its element in `acc`; a call reads its callee
     /// and its window, the receiver and the arguments, though its callee

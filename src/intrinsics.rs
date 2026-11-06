@@ -522,14 +522,16 @@ fn set_function_name(vm: &mut Vm, f: Value, key: Key, prefix: &str) -> Result<()
     }
     if crate::symbol::is_symbol(k) {
         // `[description]`.
-        let d = Value::from_bits(unsafe { (*as_object(k)).code } as u64);
-        if let Some(d) = crate::vm::string_units(d) {
+        let d = crate::symbol::description(k);
+        if let Some(n) = crate::vm::string_len(d) {
+            crate::vm::check_string_len(units.len() + n + 2)?;
             units.push(b'[' as u16);
-            units.extend_from_slice(d);
+            crate::vm::push_string(&mut units, d)?;
             units.push(b']' as u16);
         }
     } else {
-        units.extend_from_slice(crate::vm::string_units(to_string(vm, k)?).unwrap_or(&[]));
+        let s = to_string(vm, k)?;
+        crate::vm::push_string(&mut units, s)?;
     }
     let name = vm.new_string(&units);
     let a_name = vm.a_name;

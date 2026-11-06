@@ -346,9 +346,9 @@ fn template_string(vm: &mut Vm, v: Value) -> Result<Value> {
     to_string(vm, v)
 }
 
-/// A tagged template's strings array: `[site, cooked0, raw0, …]`, one
-/// array per site (`site` a number unique to it), frozen, with its frozen
-/// `raw` array.
+/// A tagged template's strings array: `[site, cooked0, raw0, …]` (or for
+/// a long one, `[site, cooked, raw]` arrays of them), one array per site
+/// (`site` a number unique to it), frozen, with its frozen `raw` array.
 fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let site = a[0].as_number().unwrap_or(0.0) as u64;
     let code = vm.intrinsic_code;
@@ -358,12 +358,17 @@ fn template_object(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
         return Ok(object_value(*o));
     }
-    let strings = vm.new_array();
-    let raw = vm.new_array();
-    for pair in a[1..].chunks(2) {
-        crate::vm::array_push(vm, strings, &[pair[0]])?;
-        crate::vm::array_push(vm, raw, &[pair[1]])?;
-    }
+    let (strings, raw) = if a.len() == 3 && crate::props::is_object(a[1]) {
+        (a[1], a[2])
+    } else {
+        let strings = vm.new_array();
+        let raw = vm.new_array();
+        for pair in a[1..].chunks(2) {
+            crate::vm::array_push(vm, strings, &[pair[0]])?;
+            crate::vm::array_push(vm, raw, &[pair[1]])?;
+        }
+        (strings, raw)
+    };
     vm.seal(as_object(raw), true);
     let a_raw = vm.intern_name("raw");
     let d = Desc {

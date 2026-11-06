@@ -2644,9 +2644,11 @@ impl Vm {
     /// The fields in `int_fields`, which went from `Int` to `Num`, hold
     /// doubles only from here on in objects' own memory (see
     /// `FieldType::Num`): their int32s there become doubles, in every
-    /// object in the heap, live or not (but for the dead a sweep has yet to
-    /// free), in one walk of it. Out of line they stay: a dead object's
-    /// `props` may be some other cell's by now.
+    /// object in the heap, live or not, in one walk of it. Out of line they
+    /// stay: a dead object's `props` may be some other cell's by now.
+    /// A sweep under way is finished first: the dead old cells it has yet
+    /// to free may have zombie shapes (#54), whose `location` takes every
+    /// field for in-object, and the sweeper may be poisoning them.
     /// The JIT calls this before it compiles a load that takes a double
     /// from one of them.
     #[cold]
@@ -2693,7 +2695,9 @@ impl Vm {
         // (Objects of a shape mostly come together: the last one's first.)
         let mut slots: HashMap<*const Shape, std::rc::Rc<[i32]>> = HashMap::default();
         let mut last: (*const Shape, std::rc::Rc<[i32]>) = (std::ptr::null(), std::rc::Rc::from([]));
-        let (sweeping, color) = (self.heap.gc.sweeping, self.heap.color);
+        // (Metadata only, so cheaper than the walk; and blocks the walk
+        // would have read the dead of are swept here instead.)
+        self.heap.finish_sweep();
         for (start, end) in self.heap.block_ranges() {
             let mut p = start;
             while p < end {
@@ -2708,16 +2712,6 @@ impl Vm {
                     if p < end && unsafe { *meta(p) } & (YOUNG | COLOR) == 0 {
                         p += GRANULE;
                     }
-                    continue;
-                }
-                // A dead old cell the sweep after a final pause hasn't
-                // reached (an old color): its shape may be a zombie, whose
-                // `location` takes every field for in-object, and the
-                // sweeper may be poisoning it. Past its first granule, its
-                // metadata has no color.
-                let m = unsafe { *meta(p) } & COLOR;
-                if sweeping && m != 0 && m != color {
-                    p += GRANULE;
                     continue;
                 }
                 unsafe {
@@ -2736,6 +2730,10 @@ impl Vm {
                             last = (shape, at.clone());
                         }
                         for &l in last.1.iter() {
+                            debug_assert!(
+                                (l as usize) < crate::layout::slots_offset((*o).class) + 8 * Object::inline_cap(o),
+                                "slot {l} past the object at {p:#x}"
+                            );
                             let v = Object::slot(o, l);
                             if (*v).is_int32() {
                                 *v = Value::from_f64((*v).as_i32_unchecked() as f64);

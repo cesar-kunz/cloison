@@ -12591,3 +12591,58 @@ out.join(" ");
 "#;
     assert_eq!(value(src), r#"2 1 3 4 TypeError 2 1 3 4 TypeError 2 1 3 4 TypeError 2 9 3 4 TypeError TypeError 0,1,2,3,2 2147483646,2147483647,2147483648,2147483649,2147483648 -2147483647,-2147483646,-2147483645,-2147483644,-2147483645 -2147483648,-2147483647,-2147483646,-2147483645,-2147483646 1.5,2.5,3.5,4.5,3.5 3,4,5,6,5 NaN,NaN,NaN,NaN,NaN 0,1,2,3,2 NaN,NaN,NaN,NaN,NaN 1,2,3,4,3 5n,6n,7n,8n,7n 1,2,3,4,3 10 75:9 0:0 2147483645 2147483646 2147483647 2147483648 2147483645 2147483646 2147483647 2147483648 [[1,2,3],[1,2.5,3],[1,"a",{}],[1,null,3],[1,2,3],[null,null],[[1],[2]]] 3,3,3,3,3,2,2 [[1,2,3],[1,2.5,3],[1,"a",{}],[1,null,3],[1,2,3],[null,null],[[1],[2]]] 3,3,3,3,3,2,2 [[1,2,3],[1,2.5,3],[1,"a",{}],[1,null,3],[1,2,3],[null,null],[[1],[2]]] 3,3,3,3,3,2,2 false 3 true true false false false false true true false true false true true true true true false false false false true true false true false true true true true true false false false false true true false true false true true true TypeError false true"#);
 }
+
+/// Calls with more arguments than registers (a callee's, `new`'s, a
+/// method's, `super`'s, one in `with`), templates with more pieces, and
+/// tagged ones: their lists in arrays or in parts (#73). (252 to 255
+/// arguments overflowed `Gen::alloc` in debug builds, more were refused;
+/// a script's 256th variable in a register overflowed too.)
+/// The expected value is JavaScriptCore's (V8's, SpiderMonkey's up to
+/// their limits on arguments).
+#[test]
+fn calls_and_templates_past_the_registers() {
+    let src = r#"
+var out = [];
+function zeros(n) { var a = []; for (var i = 0; i < n; i++) a.push(i); return a.join(","); }
+function f() { return arguments.length + ":" + arguments[arguments.length - 1] + ":" + (this === o); }
+function C() { this.n = arguments.length; this.l = arguments[arguments.length - 1]; }
+var o = { f: f };
+class A { m() { return arguments.length; } }
+var g = Function("f", "o", "C", "A",
+    "var r = [];" +
+    "for (var i = 0; i < 3; i++) {" +
+    [252, 255, 256, 300, 70000].map(function (n) {
+        var a = zeros(n);
+        return "r.push(Math.max(" + a + "), f(" + a + "), o.f(" + a + "), o['f'](" + a + "), o?.f(" + a + "), new C(" + a + ").n, new C(" + a + ").l," +
+            " f(...[1, 2], " + a + "), new (class extends A { m() { return super.m(" + a + "); } })().m());" +
+            "with (o) r.push(f(" + a + "), f(...[1], " + a + "));";
+    }).join("") +
+    "} return r.join(' ');");
+out.push(g(f, o, C, A));
+var log = [];
+var v = { toString: function () { log.push("s"); return "x"; } };
+function sub() { log.push("e"); return v; }
+var t = Function("sub", "return `<" + "${sub()}-".repeat(300) + ">`;")(sub);
+out.push(t.length, log.slice(0, 6).join(""), log.length);
+try { Function("var s = 0; return `${s++}${Symbol()}" + "${s++}".repeat(300) + "`;")(); } catch (e) { out.push(e.name); }
+function tag(s) { return s; }
+var k = Function("tag", "return function () { return tag`\\unicode" + "${0}a".repeat(300) + "`; };")(tag);
+var s1 = k(), s2 = k();
+out.push(s1 === s2, Object.isFrozen(s1), Object.isFrozen(s1.raw), s1.length, s1[0], s1.raw[0], s1[300]);
+out.join(" ");
+"#;
+    let calls: Vec<String> = [252, 255, 256, 300, 70000]
+        .iter()
+        .map(|&n| {
+            let l = n - 1;
+            format!("{l} {n}:{l}:false {n}:{l}:true {n}:{l}:true {n}:{l}:true {n} {l} {}:{l}:false {n} {n}:{l}:true {}:{l}:true", n + 2, n + 1)
+        })
+        .collect();
+    let calls = calls.join(" ");
+    let calls = [calls.as_str(); 3].join(" ");
+    // (A script with more variables in registers than there are: refused,
+    // not overflowing in debug builds.)
+    let lets: String = (0..300).map(|i| format!("let s{i} = {i};")).collect();
+    assert!(compile_error(&format!("{lets} eval('s299');")).contains("more variables than registers"));
+    assert_eq!(value(src), format!("{calls} 602 eseses 600 TypeError true true true 301  \\unicode a"));
+}

@@ -341,6 +341,11 @@ impl<'a> std::ops::Deref for Decls<'a> {
 /// go in a scope object (see [`generate`]), leaving room for temporaries.
 const LOCAL_REGS: usize = 160;
 
+/// Registers an expression keeps free, past those of a list it puts in
+/// consecutive ones (a call's arguments, a template's pieces), for
+/// evaluating the elements: a longer list goes in an array, or in parts.
+const SPARE_REGS: usize = 16;
+
 /// Inline-cache slots past which instructions share them (see `Gen::ic`):
 /// below 2^16, with room for the shared ones.
 const SHARED_ICS: usize = 60000;
@@ -1737,15 +1742,16 @@ impl<'a> Gen<'a> {
         eval: bool,
     ) -> Self {
         let f = &p.functions[index];
-        // The script's names are globals.
+        // The script's names are globals. (A register past 255 wraps: such
+        // a function is refused, see `Gen::function`.)
         let locals: HashMap<&str, u8> = if index == 0 {
-            decls[0].iter().enumerate().map(|(i, &n)| (n, i as u8 + 1)).collect()
+            decls[0].iter().enumerate().map(|(i, &n)| (n, (i + 1) as u8)).collect()
         } else {
             decls[index]
                 .iter()
                 .enumerate()
                 .filter(|(_, n)| !overflow.contains(n))
-                .map(|(i, &n)| (n, i as u8 + 1))
+                .map(|(i, &n)| (n, (i + 1) as u8))
                 .collect()
         };
         // (Past the registers of the variables: some of the scope object's
@@ -1870,6 +1876,9 @@ impl<'a> Gen<'a> {
     fn function(mut self) -> R<FunctionDef> {
         if self.f.params.len() + 1 > LOCAL_REGS {
             return unsupported(self.f.pos, "more parameters than registers");
+        }
+        if self.temp > 256 {
+            return unsupported(self.f.pos, "more variables than registers");
         }
         // `new.target` first (see `Op::LdaNewTarget`).
         if self.index == 0 && self.p.direct_eval {
@@ -2818,7 +2827,7 @@ impl<'a> Gen<'a> {
         }
         self.temp += 1;
         self.nregs = self.nregs.max(self.temp);
-        Ok(self.temp as u8 - 1)
+        Ok((self.temp - 1) as u8)
     }
 
     // ---- Labels and jumps ----
@@ -3465,10 +3474,12 @@ impl<'a> Gen<'a> {
     /// `name(args)` inside `with` statements: a method call on the object
     /// that has `name`, else an ordinary call.
     fn with_call(&mut self, name: &str, args: &[Expr], pos: Pos) -> R<()> {
-        let n = u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
+        let n = u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"));
+        let spread = self.args_array_needed(args);
+        let mark = self.temp;
+        let method = self.alloc(pos)?;
         let c = self.alloc(pos)?;
         let w = self.alloc(pos)?;
-        let method = self.alloc(pos)?;
         let end = self.with_lookup(
             name,
             pos,
@@ -3486,12 +3497,25 @@ impl<'a> Gen<'a> {
                     pos,
                 })?;
                 g.star(c);
+                if spread {
+                    g.emit(Op::LdaUndefined, &[]);
+                    g.star(w);
+                }
                 g.emit(Op::LdaFalse, &[]);
                 g.star(method);
                 Ok(())
             },
         )?;
         self.bind(end);
+        if spread {
+            // (`[f, this, args]`, `this` the object or `undefined`.)
+            let a = self.alloc(pos)?;
+            self.args_array(args, a, pos)?;
+            self.intrinsic("call_spread", c, 3);
+            self.temp = mark;
+            return Ok(());
+        }
+        let n = n?;
         for _ in 0..n {
             self.alloc(pos)?;
         }
@@ -3731,6 +3755,13 @@ impl<'a> Gen<'a> {
                     let r = self.alloc(e.pos)?;
                     self.string(s);
                     self.star(r);
+                    // A long one in parts: those so far joined into the
+                    // first (after a string, keeping them alternate).
+                    if self.temp + 2 + SPARE_REGS > 256 {
+                        self.intrinsic("template", first, (self.temp - mark) as u8);
+                        self.star(first);
+                        self.temp = mark + 1;
+                    }
                     if let Some(x) = subs.get(i) {
                         let r = self.alloc(e.pos)?;
                         self.into(x, r)?;
@@ -3956,16 +3987,34 @@ impl<'a> Gen<'a> {
                 let first = self.alloc(e.pos)?;
                 self.constant(Constant::Number(site as f64));
                 self.star(first);
-                for (cooked, raw) in parts {
-                    let r = self.alloc(e.pos)?;
-                    match cooked {
-                        Some(c) => self.string(c),
-                        None => self.emit(Op::LdaUndefined, &[]),
+                if self.temp + 2 * parts.len() + SPARE_REGS > 256 {
+                    // (A long one's strings in arrays: `[site, cooked, raw]`.)
+                    let (c, r) = (self.alloc(e.pos)?, self.alloc(e.pos)?);
+                    for a in [c, r] {
+                        self.emit(Op::CreateArray, &[Arg::Count(parts.len().min(255) as u8)]);
+                        self.star(a);
                     }
-                    self.star(r);
-                    let r = self.alloc(e.pos)?;
-                    self.string(raw);
-                    self.star(r);
+                    for (cooked, raw) in parts {
+                        match cooked {
+                            Some(c) => self.string(c),
+                            None => self.emit(Op::LdaUndefined, &[]),
+                        }
+                        self.emit(Op::PushLiteral, &[Arg::Reg(c)]);
+                        self.string(raw);
+                        self.emit(Op::PushLiteral, &[Arg::Reg(r)]);
+                    }
+                } else {
+                    for (cooked, raw) in parts {
+                        let r = self.alloc(e.pos)?;
+                        match cooked {
+                            Some(c) => self.string(c),
+                            None => self.emit(Op::LdaUndefined, &[]),
+                        }
+                        self.star(r);
+                        let r = self.alloc(e.pos)?;
+                        self.string(raw);
+                        self.star(r);
+                    }
                 }
                 let n = (self.temp - mark) as u8;
                 self.intrinsic("template_object", first, n);
@@ -5001,7 +5050,7 @@ impl<'a> Gen<'a> {
             let c = self.alloc(pos)?;
             self.value(f)?;
             self.star(c);
-            if args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
+            if self.args_array_needed(args) {
                 let w = self.alloc(pos)?;
                 self.into(this, w)?;
                 let a = self.alloc(pos)?;
@@ -5024,14 +5073,14 @@ impl<'a> Gen<'a> {
             self.temp = mark;
             return Ok(());
         }
-        if args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
-            return self.call_spread(f, args, new, optional, pos);
-        }
         if let ExprKind::Ident(n) = &f.kind
             && !new
             && self.in_with(n)
         {
             return self.with_call(n, args, pos);
+        }
+        if self.args_array_needed(args) {
+            return self.call_spread(f, args, new, optional, pos);
         }
         let n =
             u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
@@ -5142,6 +5191,13 @@ impl<'a> Gen<'a> {
         }
         self.temp = mark;
         Ok(())
+    }
+
+    /// Whether a call's arguments go in an array: with a spread, or too
+    /// many for consecutive registers (the callee's and receiver's too)
+    /// with [`SPARE_REGS`] left.
+    fn args_array_needed(&self, args: &[Expr]) -> bool {
+        args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) || self.temp + 3 + args.len() + SPARE_REGS > 256
     }
 
     /// Arguments (some spread) into a new array in register `a`.

@@ -310,6 +310,12 @@ pub struct Object {
     pub code: *const Code,
 }
 
+/// Set in a string's cached atom ([`Object::string_atom`]): `code`'s bit
+/// 63 then, in a value's number tag, so the word never reads as a cell.
+/// Untagged, `(atom + 1) << 32` read as one, an address in the heaps'
+/// reservation (from `0x1000 << 32`) for atoms of 4095 up.
+pub const ATOM_TAG: u32 = 1 << 31;
+
 /// An object's header in bytes: where a plain object's or an array's
 /// in-object slots start (see `layout::slots_offset`).
 pub const HEADER_BYTES: usize = crate::layout::HEADER_BYTES;
@@ -445,24 +451,26 @@ impl Object {
     }
 
     /// A flat string's atom as a property key plus one, once found (0:
-    /// none yet; see `Vm::property_key`): `code`'s high half.
+    /// none yet; see `Vm::property_key`): `code`'s high half, but for its
+    /// [`ATOM_TAG`].
     ///
     /// # Safety
     /// `this` must be a flat string (`elems` not null: a cons string's
     /// `code` is its right half).
     #[inline(always)]
-    pub unsafe fn string_atom(this: *mut Object) -> *const u32 {
+    pub unsafe fn string_atom(this: *const Object) -> u32 {
         unsafe {
             debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
-            this.cast::<u8>().add(HEADER_BYTES + 4).cast()
+            ((*this).code as usize >> 32) as u32 & !ATOM_TAG
         }
     }
 
-    /// Set [`Object::string_atom`] to `a`: `code` as a whole, with Release.
-    /// The marker thread may still take the string for the cons string it
-    /// was before `vm::flatten` (see `gc::trace`), and read `code` as its
-    /// right half: the Release, and its fence, make it see the string
-    /// flat by then.
+    /// Set [`Object::string_atom`] to `a` (below [`ATOM_TAG`]): `code` as a
+    /// whole, atomically, tagged so that it is no cell as a value. The
+    /// word was the right half while the string was a cons string, so the
+    /// marker thread may still read it as one (see `gc::trace`), and a
+    /// marking may have recorded it as a slot into an evacuation candidate
+    /// then, which the final pause rewrites if it holds a cell moved.
     ///
     /// # Safety
     /// As [`Object::string_atom`].
@@ -471,8 +479,11 @@ impl Object {
         use std::sync::atomic::{AtomicU64, Ordering::Release};
         unsafe {
             debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
+            debug_assert!(a < ATOM_TAG);
             let words = (*this).code as usize as u32 as u64;
-            (*(&raw const (*this).code as *const AtomicU64)).store(words | (a as u64) << 32, Release);
+            let code = words | ((a | ATOM_TAG) as u64) << 32;
+            debug_assert!(!Value::from_bits(code).is_cell());
+            (*(&raw const (*this).code as *const AtomicU64)).store(code, Release);
         }
     }
 

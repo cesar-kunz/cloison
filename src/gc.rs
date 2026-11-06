@@ -3734,7 +3734,7 @@ impl Vm {
         if !minor {
             let epoch = self.heap.gc.codes_from;
             for &o in &young {
-                let a = unsafe { *Object::string_atom(o) } as usize;
+                let a = unsafe { Object::string_atom(o) } as usize;
                 if let Some(u) = a.checked_sub(1).and_then(|a| self.atom_used.get_mut(a)) {
                     *u = epoch;
                 }

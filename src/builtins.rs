@@ -877,7 +877,7 @@ fn string_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(vm.new_string(&u))
 }
 
-fn string_to_string(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn string_to_string(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if string_units(this).is_some() {
         return Ok(this);
     }
@@ -1209,7 +1209,7 @@ fn bound_construct(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// `Function.prototype.toString`: a function's source text, or (a native,
 /// a bound function) `function name() { [native code] }`.
-fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if !crate::props::is_callable(this) {
         return Err(Error::type_error("Function.prototype.toString requires that 'this' be a Function"));
     }
@@ -1371,12 +1371,12 @@ fn this_boolean(this: Value) -> Result<bool> {
     }
 }
 
-fn boolean_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn boolean_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let b = this_boolean(this)?;
     Ok(str_value(vm, if b { "true" } else { "false" }))
 }
 
-fn boolean_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn boolean_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(this_boolean(this)?))
 }
 
@@ -1440,7 +1440,7 @@ fn number_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Valu
 // ---- What ToPrimitive calls ----
 
 /// `Object.prototype.toString`: `[object Array]`, `[object Object]`, ….
-fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let primitive_tag = |v: Value| {
         if v.is_bool() {
             "Boolean"
@@ -1497,11 +1497,11 @@ fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(str_value(vm, &format!("[object {tag}]")))
 }
 
-fn object_value_of(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn object_value_of(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(object_value(vm.to_object(this)?))
 }
 
-fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let n = wrapped(this).filter(|v| v.is_number()).unwrap_or(this);
     if n.is_number() {
         Ok(n)
@@ -2143,7 +2143,7 @@ fn install_regexps(vm: &mut Vm) {
 /// `RegExp.prototype`'s getters: `source` (0), `flags` (1) and the flags
 /// (2…); `undefined` (`source`: `(?:)`, `flags`: `""`) on the prototype
 /// itself, a `TypeError` on anything but a `RegExp`.
-fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     // (`flags`: generic, any object's.)
     if K == 1 {
         return regexp_flags_getter(vm, this);
@@ -2767,7 +2767,7 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let re = this_regexp(this)?;
     let a_source = vm.intern_name("source");
     let src = String::from_utf16_lossy(&units(vm.get(this, a_source)?));
@@ -3348,7 +3348,7 @@ pub(crate) fn caught(vm: &mut Vm, e: &Error) -> Value {
 
 /// `Error.prototype.toString`: `name: message`, or either alone if the
 /// other is empty.
-fn error_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn error_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     if !crate::props::is_object(this) {
         return Err(Error::type_error("Error.prototype.toString called on a non-object"));
     }

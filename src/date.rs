@@ -445,7 +445,7 @@ fn date_utc(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 // ---- Getters ----
 
 /// `Date.prototype.getTime()` and `valueOf()`.
-fn date_get_time(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn date_get_time(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(num(this_time(this)?))
 }
 
@@ -639,7 +639,7 @@ fn date_string(tv: f64) -> String {
 }
 
 /// `Date.prototype.toString()` (and `toLocaleString`).
-fn to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let s = date_string(this_time(this)?);
     Ok(str_value(vm, &s))
 }

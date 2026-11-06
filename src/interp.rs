@@ -3723,8 +3723,10 @@ const DEFAULT: u8 = 2;
 /// A bytecode one is called where something can call it (`native_top`
 /// set: a native, an interpreter slow path in `conv!`); elsewhere (compiled
 /// code's runtime calls) it is skipped and `Vm::conv_redo` set, for the
-/// operation to be redone where it can. Conversions can't fail: what one
-/// throws is left in `Vm::conv_error` for the operation to throw.
+/// operation to be redone where it can. There, it runs only natives that
+/// read (`Vm::conv_replays`): what it ran is run again. Conversions can't
+/// fail: what one throws is left in `Vm::conv_error` for the operation to
+/// throw.
 fn to_primitive_hint(v: Value, hint: u8) -> Value {
     if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) || is_bigint(v) {
         return v;
@@ -3737,6 +3739,16 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
         if vm.conv_failed() {
             return Value::UNDEFINED;
         }
+        let replays = std::mem::replace(&mut vm.conv_replays, vm.native_top.is_null());
+        let r = to_primitive_on(vm, v, hint);
+        vm.conv_replays = replays;
+        r
+    }
+}
+
+/// [`to_primitive_hint`] of an object.
+unsafe fn to_primitive_on(vm: &mut Vm, v: Value, hint: u8) -> Value {
+    unsafe {
         if vm.to_primitive_defined {
             let fail = |vm: &mut Vm, e: Error| {
                 vm.conv_error.get_or_insert(e);
@@ -3756,7 +3768,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 if !crate::props::is_callable(m) {
                     return fail(vm, Error::type_error("Symbol.toPrimitive is not a function"));
                 }
-                if vm.native_top.is_null() && (*as_object(m)).class != Class::Native {
+                if vm.native_top.is_null() && !replays(m) {
                     vm.conv_redo = true;
                     return Value::UNDEFINED;
                 }
@@ -3797,16 +3809,16 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 continue;
             }
             let r = match (*as_object(m)).class {
+                Class::Native | Class::Function if vm.native_top.is_null() && !replays(m) => {
+                    vm.conv_redo = true;
+                    continue;
+                }
                 // (Another realm's: run there.)
                 Class::Native if !vm.realms.is_empty() => vm.call_other(m, v, &[]),
                 Class::Native => {
                     vm.callee = as_object(m);
                     let native = (*(*as_object(m)).code).native.unwrap();
                     vm.run_native(|vm| native(vm, v, &[]))
-                }
-                Class::Function if vm.native_top.is_null() => {
-                    vm.conv_redo = true;
-                    continue;
                 }
                 Class::Function => call_function(vm, m, v, &[]),
                 _ => continue,
@@ -4377,7 +4389,47 @@ unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
 
 /// What [`call_function`] says when it can't call a bytecode function: no
 /// frame top recorded (compiled code's runtime calls, see [`with_top`]).
+/// Or a native that writes, in a conversion that may be redone
+/// (`Vm::conv_replays`).
 const NO_TOP: &str = "calling a function from here (compiled code)";
+
+/// Whether `f` is a native a conversion may run and then run again, when
+/// it is redone (see [`to_primitive_hint`]): one that only reads.
+#[inline(always)]
+fn replays(f: Value) -> bool {
+    let o = as_object(f);
+    unsafe { (*o).class == Class::Native && (*(*o).code).reads_only }
+}
+
+/// Whether `native` only reads: one of the built-ins' `toString` and
+/// `valueOf` methods (what they call checked again, see [`replays`]).
+pub(crate) fn reads_only(native: crate::vm::NativeFn) -> bool {
+    use crate::{builtins as b, vm::NativeFn};
+    [
+        b::object_to_string as NativeFn,
+        b::object_value_of,
+        b::function_to_string,
+        b::boolean_to_string,
+        b::boolean_value_of,
+        b::number_value_of,
+        crate::vm::number_to_string_method,
+        b::string_to_string,
+        b::error_to_string,
+        b::regexp_to_string,
+        b::regexp_get::<0>,
+        crate::array::array_to_string,
+        crate::array::array_join,
+        crate::date::to_string,
+        crate::date::date_get_time,
+        crate::date::date_to_primitive,
+        crate::symbol::symbol_to_string,
+        crate::symbol::symbol_value_of,
+        crate::bigint::bigint_to_string,
+        crate::bigint::bigint_value_of,
+    ]
+    .iter()
+    .any(|&g| g as usize == native as usize)
+}
 
 /// Whether `e` is [`call_function`]'s error for a call it couldn't make
 /// without a frame top: before the function ran, so the operation can be
@@ -4456,6 +4508,9 @@ pub(crate) fn with_args_on_stack(
 fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate::vm::Result<Value> {
     unsafe {
         if (*as_object(f)).class == Class::Native {
+            if vm.conv_replays && !replays(f) {
+                return Err(Error::unsupported(NO_TOP));
+            }
             let r = vm.call_other(f, this, args);
             // (Its conversion's exception thrown to its caller, a native
             // maybe: not left for it to go on. The interpreter's calls

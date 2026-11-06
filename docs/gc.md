@@ -527,10 +527,10 @@ the references a store overwrites: a cell still reachable once one is
 gone is reached another way, through the roots or a dirty card in the
 final pause, or a cell not traced yet. So the marker may miss the halves
 `flatten` drops while it traces the string; it reads them atomically,
-then `elems` again behind an Acquire fence, and follows them only if
-the string is still a cons string (the atom later cached in `code`'s
-high half is stored with Release, so a half read as an atom comes with
-`elems` published).
+and each is then a half, null, or the atom later cached in `code`,
+tagged so that it reads as no cell (`object::ATOM_TAG`; untagged, a
+slot recorded into an evacuation candidate while it held the right
+half could be rewritten as that address's cell moved).
 The marker reads cells and `Code::upvalues` (immutable once loaded) and
 writes only old cells' metadata, which the mutator writes only in
 pauses.

@@ -1634,32 +1634,26 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
         let code = &raw const (*o).code as usize;
         match (*o).class {
             Class::String => {
-                use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed}, fence};
+                use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed}};
                 // The mutator may be making it flat (`vm::flatten`): it
-                // drops the halves, then publishes `elems` (Release), and
-                // may then cache the string's atom in `code`'s high half
-                // (Release too, `Object::set_string_atom`). So `elems` is
-                // read first (Acquire, as `Object::string_words` reads
-                // it), and the halves, which may be null or no longer
-                // halves, atomically.
+                // drops the halves (null), then publishes `elems`
+                // (Release), and may then cache the string's atom in
+                // `code` (`Object::set_string_atom`, tagged as no cell).
+                // So `elems` is read first (Acquire, as
+                // `Object::string_words` reads it), and the halves
+                // atomically: each is a half, null or no cell. (One
+                // followed though dropped is marked for nothing; one
+                // dropped unseen needs no mark: still reachable, it is
+                // found where it is, as any reference a store overwrote,
+                // see "The major collection" in docs/gc.md.)
                 let e = (*(elems as *const AtomicPtr<Value>)).load(Acquire);
                 if e.is_null() {
-                    // A cons string: its halves, if it still was one after
-                    // they were read. (A half seen as an atom came with
-                    // `elems` published: the fence pairs with the atom's
-                    // Release. One dropped needs no mark: still reachable,
-                    // it is found where it is, as any reference a store
-                    // overwrote; see "The major collection" in docs/gc.md.)
-                    let l = Value::from_bits((*(props as *const AtomicU64)).load(Relaxed));
-                    let r = Value::from_bits((*(code as *const AtomicU64)).load(Relaxed));
-                    fence(Acquire);
-                    if (*(elems as *const AtomicPtr<Value>)).load(Relaxed).is_null() {
-                        if within(props) {
-                            v.slot_read(props as *mut Value, l);
-                        }
-                        if within(code) {
-                            v.slot_read(code as *mut Value, r);
-                        }
+                    // A cons string: its halves.
+                    if within(props) {
+                        v.slot_read(props as *mut Value, Value::from_bits((*(props as *const AtomicU64)).load(Relaxed)));
+                    }
+                    if within(code) {
+                        v.slot_read(code as *mut Value, Value::from_bits((*(code as *const AtomicU64)).load(Relaxed)));
                     }
                 } else if e as usize != slots && within(elems) {
                     // Flattened: its units' buffer.

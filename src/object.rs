@@ -421,16 +421,17 @@ impl Object {
     ///
     /// The marker thread sizes old strings while `vm::flatten` may be
     /// making one flat: it publishes `elems` last (Release), `code` null by
-    /// then, so `elems` is read first (Acquire), `code` after it.
+    /// then, so `elems` is read first (Acquire), `code` after it (atomic:
+    /// the mutator may be caching the atom, [`Object::set_string_atom`]).
     ///
     /// # Safety
     /// `this` must be a string.
     #[inline(always)]
     pub unsafe fn string_words(this: *const Object) -> usize {
-        use std::sync::atomic::{AtomicPtr, Ordering::Acquire};
+        use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed}};
         unsafe {
             let elems = (*(&raw const (*this).elems as *const AtomicPtr<Value>)).load(Acquire);
-            if elems.is_null() { 0 } else { (*this).code as usize as u32 as usize }
+            if elems.is_null() { 0 } else { (*(&raw const (*this).code as *const AtomicU64)).load(Relaxed) as u32 as usize }
         }
     }
 
@@ -450,10 +451,28 @@ impl Object {
     /// `this` must be a flat string (`elems` not null: a cons string's
     /// `code` is its right half).
     #[inline(always)]
-    pub unsafe fn string_atom(this: *mut Object) -> *mut u32 {
+    pub unsafe fn string_atom(this: *mut Object) -> *const u32 {
         unsafe {
             debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
             this.cast::<u8>().add(HEADER_BYTES + 4).cast()
+        }
+    }
+
+    /// Set [`Object::string_atom`] to `a`: `code` as a whole, with Release.
+    /// The marker thread may still take the string for the cons string it
+    /// was before `vm::flatten` (see `gc::trace`), and read `code` as its
+    /// right half: the Release, and its fence, make it see the string
+    /// flat by then.
+    ///
+    /// # Safety
+    /// As [`Object::string_atom`].
+    #[inline(always)]
+    pub unsafe fn set_string_atom(this: *mut Object, a: u32) {
+        use std::sync::atomic::{AtomicU64, Ordering::Release};
+        unsafe {
+            debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
+            let words = (*this).code as usize as u32 as u64;
+            (*(&raw const (*this).code as *const AtomicU64)).store(words | (a as u64) << 32, Release);
         }
     }
 

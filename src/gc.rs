@@ -571,14 +571,7 @@ impl<V: Records> Visit for Rec<'_, V> {
 
     #[inline(always)]
     unsafe fn slot(&mut self, a: *mut Value) {
-        unsafe {
-            let v = *a;
-            if v.is_cell() {
-                let c = self.0.cand();
-                c.note(self.0.rec(), a as usize, v.to_bits() as usize, false);
-            }
-            self.0.value(v)
-        }
+        unsafe { self.slot_read(a, *a) }
     }
 
     #[inline(always)]
@@ -590,6 +583,17 @@ impl<V: Records> Visit for Rec<'_, V> {
                 c.note(self.0.rec(), a as usize, q - 8, true);
             }
             self.0.payload(q)
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn slot_read(&mut self, a: *mut Value, v: Value) {
+        unsafe {
+            if v.is_cell() {
+                let c = self.0.cand();
+                c.note(self.0.rec(), a as usize, v.to_bits() as usize, false);
+            }
+            self.0.value(v)
         }
     }
 }
@@ -1024,6 +1028,16 @@ trait Visit {
         unsafe { self.payload(*a) }
     }
 
+    /// Slot `a`, whose value the caller read as `v` (with an atomic load:
+    /// a word the mutator may be rewriting while the marker reads it, see
+    /// [`trace`]'s strings). [`Visit::value`] of `v`; a visitor that
+    /// records or rewrites slots overrides it as [`Visit::slot`] (those
+    /// that rewrite run with the world stopped, and read the slot again).
+    #[inline(always)]
+    unsafe fn slot_read(&mut self, a: *mut Value, v: Value) {
+        let _ = a;
+        unsafe { self.value(v) }
+    }
 }
 
 /// Marking: the color and kind, the cells marked and not yet traced, the
@@ -1620,17 +1634,32 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
         let code = &raw const (*o).code as usize;
         match (*o).class {
             Class::String => {
-                // (Read once, as `Object::string_words` reads it: the
-                // mutator may be flattening it, its halves null by the time
-                // `elems` is not.)
-                let e = (*(elems as *const std::sync::atomic::AtomicPtr<Value>)).load(std::sync::atomic::Ordering::Acquire);
+                use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Acquire, Relaxed}, fence};
+                // The mutator may be making it flat (`vm::flatten`): it
+                // drops the halves, then publishes `elems` (Release), and
+                // may then cache the string's atom in `code`'s high half
+                // (Release too, `Object::set_string_atom`). So `elems` is
+                // read first (Acquire, as `Object::string_words` reads
+                // it), and the halves, which may be null or no longer
+                // halves, atomically.
+                let e = (*(elems as *const AtomicPtr<Value>)).load(Acquire);
                 if e.is_null() {
-                    // A cons string: its halves.
-                    if within(props) {
-                        v.slot(&raw mut (*o).props as *mut Value);
-                    }
-                    if within(code) {
-                        v.slot(&raw mut (*o).code as *mut Value);
+                    // A cons string: its halves, if it still was one after
+                    // they were read. (A half seen as an atom came with
+                    // `elems` published: the fence pairs with the atom's
+                    // Release. One dropped needs no mark: still reachable,
+                    // it is found where it is, as any reference a store
+                    // overwrote; see "The major collection" in docs/gc.md.)
+                    let l = Value::from_bits((*(props as *const AtomicU64)).load(Relaxed));
+                    let r = Value::from_bits((*(code as *const AtomicU64)).load(Relaxed));
+                    fence(Acquire);
+                    if (*(elems as *const AtomicPtr<Value>)).load(Relaxed).is_null() {
+                        if within(props) {
+                            v.slot_read(props as *mut Value, l);
+                        }
+                        if within(code) {
+                            v.slot_read(code as *mut Value, r);
+                        }
                     }
                 } else if e as usize != slots && within(elems) {
                     // Flattened: its units' buffer.
@@ -3454,6 +3483,9 @@ impl Vm {
             unsafe fn payload_slot(&mut self, a: *mut usize) {
                 unsafe { Forward::payload(self, a) }
             }
+            unsafe fn slot_read(&mut self, a: *mut Value, _: Value) {
+                unsafe { Forward::value(self, a) }
+            }
         }
         let range = self.heap.cells_range();
         let fw = Forward(cand);
@@ -3594,6 +3626,9 @@ impl Vm {
                 if q != 0 && self.moved(q - 8) {
                     panic!("payload slot {a:?} of {:#x} still refers to {:#x}, moved", self.2, q - 8);
                 }
+            }
+            unsafe fn slot_read(&mut self, a: *mut Value, _: Value) {
+                unsafe { self.slot(a) }
             }
         }
         let mut c = Check(range.0, range.1, 0);

@@ -12072,6 +12072,76 @@ sum;
     assert_eq!(r.as_deref(), Ok("472625600"));
 }
 
+/// Old cons strings made flat while cycles run back to back, their halves
+/// still reachable elsewhere: from an old array, from another cons string,
+/// from a local only. The marker may read a string as the cons string it
+/// was and find its halves dropped, or read them and then find it flat
+/// (strings flattened in the order it traces them, so that it happens):
+/// it follows no half then, and needs none, the halves being found where
+/// they are kept (the final pause's verification panics on one left
+/// unmarked, evacuation on a reference left to a cell moved). Half of the
+/// strings are used as keys, caching their atom in the word the right half
+/// was in.
+#[test]
+fn cons_halves_kept_elsewhere_survive_flattening_while_marking() {
+    let src = r#"
+var N = 10000, ROUNDS = 40, LAG = 2, box = { x: 1 };
+var parts = [];
+for (var i = 0; i < 64; i++) parts.push("piece-" + i + "-abcdefghijklmnopqrstuvwxyz");
+function check(s, i, r) {
+  // Each half is (parts[a] + parts[b]): its units must still read so.
+  var a = parts[i & 63], b = parts[(i * 7 + r) & 63];
+  if (s !== a + b) throw new Error("bad half " + i + " " + r);
+}
+function run() {
+var rounds = [], sum = 0, h0 = null, h1 = null, h2 = null;
+for (var r = 0; r < ROUNDS + LAG; r++) {
+  if (r < ROUNDS) {
+    var lefts = new Array(N), others = new Array(N), cons = new Array(N);
+    for (var i = 0; i < N; i++) {
+      var l = parts[i & 63] + parts[(i * 7 + r) & 63];   // a cons half
+      var rt = parts[(i * 3) & 63] + parts[(i * 7 + r) & 63];
+      lefts[i] = l;                                       // kept in an old array
+      others[i] = rt + "!";                               // kept in another cons string
+      cons[i] = l + rt;
+      if (i === (N >> 1)) { h2 = h1; h1 = h0; h0 = rt; }   // a half only there and in a local
+    }
+    rounds.push([lefts, others, cons]);
+  } else { h2 = h1; h1 = h0; h0 = null; }
+  for (var j = 0, junk = []; j < 60000; j++) junk.push({ x: j });
+  if (r >= LAG) {
+    var k = rounds[r - LAG], lefts = k[0], others = k[1], cons = k[2], rr = r - LAG;
+    for (var i = N - 1; i >= 0; i--) {
+      var c = cons[i];
+      // Flattened, its halves dropped (as a key, its atom cached then).
+      if (i & 1) sum += c.charCodeAt(30); else sum += (box[c] | 0) + c.length;
+      cons[i] = null;
+      if ((i & 1023) === 0) for (var g = 0, t = []; g < 2000; g++) t.push([g]);
+    }
+    for (var j = 0, junk = []; j < 60000; j++) junk.push({ x: j });
+    for (var i = 0; i < N; i++) {
+      check(lefts[i], i, rr);
+      var o = others[i];
+      if (o !== parts[(i * 3) & 63] + parts[(i * 7 + rr) & 63] + "!") throw new Error("bad other " + i);
+      sum += o.charCodeAt(o.length - 2) + lefts[i].charCodeAt(lefts[i].length - 1);
+    }
+    var h = h2, m = N >> 1, a = parts[(m * 3) & 63], b = parts[(m * 7 + rr) & 63];
+    if (h !== a + b) throw new Error("bad local half " + rr);
+    rounds[r - LAG] = null;
+  }
+}
+return sum;
+}
+run();
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_gc_evacuate_cycles();
+    vm.set_gc_verify(4 << 20);
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("149106224"));
+}
+
 /// A direct `eval` in code an `eval` runs (its bindings through a scope
 /// object of accessors, `intrinsics::eval_through_scope`) while every
 /// collection moves cells: the names and the scope object it holds in Rust

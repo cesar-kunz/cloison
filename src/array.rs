@@ -337,7 +337,7 @@ fn joining(vm: &Vm, o: Value) -> bool {
     vm.handles.windows(2).any(|w| w[0] == Value::HOLE && w[1] == o)
 }
 
-fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = this_object(vm, this)?;
     let sep: Vec<u16> = match a.first() {
         Some(v) if !v.is_undefined() => to_string_units(*v),
@@ -376,7 +376,7 @@ fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `Array.prototype.toString()`: `join()`, or `Object.prototype.toString`
 /// where there is no callable `join`.
-fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = object_value(vm.to_object(this)?);
     let a_join = vm.intern_name("join");
     let f = vm.get(o, a_join)?;

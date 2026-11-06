@@ -893,7 +893,7 @@ fn this_bigint(this: Value, what: &str) -> Result<Big> {
     Err(Error::type_error(format!("BigInt.prototype.{what} requires that 'this' be a BigInt")))
 }
 
-fn bigint_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn bigint_to_string(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let b = this_bigint(this, "toString")?;
     let r = arg(a, 0);
     let radix = if r.is_undefined() {
@@ -918,7 +918,7 @@ fn bigint_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Valu
     Ok(crate::builtins::str_value(vm, &s))
 }
 
-fn bigint_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn bigint_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     this_bigint(this, "valueOf")?;
     Ok(crate::vm::wrapped(this).unwrap_or(this))
 }

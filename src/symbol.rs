@@ -206,13 +206,13 @@ fn symbol_key_for(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(if is_registered(s) { description(s) } else { Value::UNDEFINED })
 }
 
-fn symbol_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn symbol_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let s = this_symbol(this, "Symbol.prototype.toString")?;
     let u = symbol_string(s);
     Ok(vm.new_string(&u))
 }
 
-fn symbol_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn symbol_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     this_symbol(this, "Symbol.prototype.valueOf")
 }
 

@@ -4952,8 +4952,25 @@ impl Vm {
     // ---- Strings ----
 
     /// A new string of `units` (UTF-16 code units), stored after its header.
+    ///
+    /// For a string known to fit: past [`MAX_STRING_LEN`] units, see
+    /// [`Vm::new_string_with`]. [`Vm::try_new_string`] throws instead.
     pub fn new_string(&mut self, units: &[u16]) -> Value {
         self.new_string_with(units.len(), |out| out.copy_from_slice(units))
+    }
+
+    /// [`Vm::new_string`], or a RangeError past [`MAX_STRING_LEN`] units
+    /// (2^30, the longest string): for a string of any length.
+    pub fn try_new_string(&mut self, units: &[u16]) -> Result<Value> {
+        check_string_len(units.len())?;
+        Ok(self.new_string(units))
+    }
+
+    /// [`Vm::new_string_with`], or a RangeError past [`MAX_STRING_LEN`]
+    /// units (`fill` not called).
+    pub fn try_new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Result<Value> {
+        check_string_len(len)?;
+        Ok(self.new_string_with(len, fill))
     }
 
     /// A new string of `len` code units, with `words` words after its
@@ -4995,6 +5012,15 @@ impl Vm {
     }
 
     /// A new string of `len` code units, which `fill` writes.
+    ///
+    /// For a string known to fit. Past [`MAX_STRING_LEN`] units (a
+    /// builder of the runtime's that doesn't check first), `fill` isn't
+    /// called: from a native function, the string is empty and the
+    /// RangeError is left pending, as a conversion's, for the native's
+    /// caller to throw once it returns (so the native must return
+    /// without running JS: see `Vm::conv_failed`); outside a run (no
+    /// script, no conversion running), it panics. [`Vm::try_new_string_with`]
+    /// throws instead.
     pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
         if len > MAX_STRING_LEN {
             return self.string_too_long();
@@ -5018,6 +5044,12 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn string_too_long(&mut self) -> Value {
+        // (Nothing would throw it: an embedder's string, made before a
+        // run or after.)
+        assert!(
+            self.heap.gc.stack_base != 0 || !self.native_top.is_null(),
+            "a string past the longest ({MAX_STRING_LEN} code units) made outside a run: see Vm::try_new_string"
+        );
         self.conv_error.get_or_insert_with(|| Error::range_error("Invalid string length"));
         self.conv_thrown = true;
         self.new_string(&[])
@@ -6126,12 +6158,24 @@ impl Vm {
         // The script done, the promise jobs it queued run (and theirs),
         // and the outermost's event loop until no async waiter is left.
         let r = r.and_then(|v| if outer { self.run_event_loop() } else { self.run_jobs() }.map(|()| v));
+        let r = self.no_pending_error(r);
         self.kept_alive.clear();
         if outer {
             self.heap.gc.stack_base = 0;
             self.pause_marker();
         }
         r
+    }
+
+    /// `r`, or the error a conversion or a string past the longest left
+    /// pending if nothing threw it (which would be a bug: see
+    /// `conv_error`), so it doesn't go off in the next run.
+    fn no_pending_error<T>(&mut self, r: Result<T>) -> Result<T> {
+        if !self.conv_thrown {
+            return r;
+        }
+        let e = self.take_conv_error();
+        r.and(Err(e))
     }
 
     /// Run `f` from the host, as `run` runs a script (then the event
@@ -6152,6 +6196,7 @@ impl Vm {
             r
         });
         let r = r.and_then(|v| self.run_event_loop().map(|()| v));
+        let r = self.no_pending_error(r);
         self.kept_alive.clear();
         if outer {
             self.heap.gc.stack_base = 0;
@@ -6200,6 +6245,10 @@ impl Vm {
                 Err(Err(e)) => Err(ModuleError::Thrown(e)),
             }
         });
+        let r = match self.no_pending_error(Ok(())) {
+            Ok(()) => r,
+            Err(e) => r.and(Err(ModuleError::Thrown(e))),
+        };
         self.kept_alive.clear();
         if outer {
             self.heap.gc.stack_base = 0;
@@ -7336,7 +7385,7 @@ pub(crate) fn string_len(v: Value) -> Option<usize> {
 
 /// The most code units a string has: past it, what makes one throws a
 /// RangeError (see `check_string_len`).
-pub(crate) const MAX_STRING_LEN: usize = 1 << 30;
+pub const MAX_STRING_LEN: usize = 1 << 30;
 
 /// A RangeError if a string of `len` code units is past the longest: for
 /// what builds one to check as it grows, before it holds gigabytes (and,
@@ -7547,5 +7596,49 @@ pub(crate) fn number_ascii(d: f64) -> NumBuf {
 impl Drop for Vm {
     fn drop(&mut self) {
         self.unbind_versions();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A native making a string past the longest through `new_string_with`
+    /// (a builder that didn't check), which leaves the RangeError for its
+    /// caller to throw: `fill` isn't called.
+    fn too_long(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        Ok(vm.new_string_with(MAX_STRING_LEN + 1, |_| unreachable!()))
+    }
+
+    /// `new_string_with`'s backstop (#65): from a native, a RangeError its
+    /// caller throws, caught by the `try` around the call, nothing left
+    /// pending past it; `try_new_string_with` throws it itself.
+    #[test]
+    fn strings_past_the_longest_throw() {
+        let mut vm = Vm::new();
+        let g = vm.global;
+        vm.define_native(g, "tooLong", too_long, 0, crate::jit::Ty::Any, false);
+        let src = r#"
+var out = [];
+try { tooLong(); out.push("none"); } catch (e) { out.push(e.name); }
+try { [1].map(tooLong); out.push("none"); } catch (e) { out.push(e.name); }
+out.push("after");
+out.join();"#;
+        let m = crate::js::compile(src).unwrap();
+        let r = vm.run(&m).map(display);
+        assert_eq!(r.as_deref(), Ok("RangeError,RangeError,after"));
+        assert!(!vm.conv_failed());
+        let r = vm.try_new_string_with(MAX_STRING_LEN + 1, |_| unreachable!());
+        assert_eq!(r.map(display).map_err(|e| e.0), Err("RangeError: Invalid string length".to_string()));
+        assert_eq!(vm.try_new_string(&[b'x' as u16]).map(display).ok().as_deref(), Some("x"));
+    }
+
+    /// Outside a run nothing would throw what the backstop leaves: a
+    /// panic (an embedder's string; see `Vm::try_new_string`).
+    #[test]
+    #[should_panic(expected = "outside a run")]
+    fn strings_past_the_longest_panic_outside_a_run() {
+        let mut vm = Vm::new();
+        vm.new_string_with(MAX_STRING_LEN + 1, |_| unreachable!());
     }
 }

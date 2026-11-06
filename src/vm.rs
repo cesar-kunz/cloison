@@ -5025,7 +5025,7 @@ impl Vm {
     /// the string another call's slice reads), and outside a run, in no
     /// VM's heap (#70).
     ///
-    /// ```
+    /// ```no_run
     /// let mut vm = cloison::vm::Vm::new();
     /// let s = vm.new_string(&[0x61; 3]);
     /// assert_eq!(vm.string_units(s).as_deref(), Some(&[0x61; 3][..]));

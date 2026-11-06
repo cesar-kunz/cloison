@@ -4468,7 +4468,7 @@ impl Vm {
         let a = self.intern_name(&name);
         // (A cons string flattened by `to_string_units` too.)
         if flat(key) && a.0 < u32::MAX {
-            unsafe { *Object::string_atom(as_object(key)) = a.0 + 1 };
+            unsafe { Object::set_string_atom(as_object(key), a.0 + 1) };
             self.keyed_strings.push(as_object(key));
         }
         Key::Name(a)
@@ -7632,10 +7632,15 @@ unsafe fn flatten(o: *mut Object) {
         // The halves dropped first, `elems` published last (Release): the
         // marker thread may be sizing `o` (`Object::string_words`), and a
         // non-null `elems` with the right half still in `code` would read
-        // as the low half of its address in words of units.
-        (*o).props = std::ptr::null_mut();
-        (*o).code = std::ptr::null();
-        (*(&raw mut (*o).elems as *const std::sync::atomic::AtomicPtr<Value>)).store(buf.cast(), std::sync::atomic::Ordering::Release);
+        // as the low half of its address in words of units. It may be
+        // tracing `o` too, reading the halves (atomically, as they are
+        // written here: `gc::trace`). They need no shading: the marking's
+        // barrier is on stores, not deletions, a half still reachable is
+        // marked where it is.
+        use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering::{Relaxed, Release}};
+        (*(&raw mut (*o).props as *const AtomicU64)).store(0, Relaxed);
+        (*(&raw mut (*o).code as *const AtomicU64)).store(0, Relaxed);
+        (*(&raw mut (*o).elems as *const AtomicPtr<Value>)).store(buf.cast(), Release);
         crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
     }
 }

@@ -3486,8 +3486,18 @@ impl<'a> Gen<'a> {
             &mut |g, r| {
                 g.with_get(r, name);
                 g.star(c);
-                g.mov(r, w);
-                g.emit(Op::LdaTrue, &[]);
+                // (An `eval`'s scope object's binding: a plain call's, no
+                // `this`.)
+                if !g.found_scope {
+                    g.mov(r, w);
+                    g.emit(Op::LdaTrue, &[]);
+                } else if spread {
+                    g.emit(Op::LdaUndefined, &[]);
+                    g.star(w);
+                    g.emit(Op::LdaFalse, &[]);
+                } else {
+                    g.emit(Op::LdaFalse, &[]);
+                }
                 g.star(method);
                 Ok(())
             },

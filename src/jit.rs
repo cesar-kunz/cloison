@@ -8979,11 +8979,22 @@ impl JitCode {
         let folded_insns;
         let insns = match fold_captured_tests(insns, &sel, &captured) {
             Some(f) => {
-                for (k, insn) in f.iter().enumerate() {
-                    if insn.op != insns[k].op
-                        && let Some(s) = sel[k].as_mut()
+                for (k, insn) in f.iter().enumerate().filter(|(k, insn)| insn.op != insns[*k].op) {
+                    let jump = insn.op == Op::Jump;
+                    if let Some(s) = sel[k].as_mut() {
+                        (s.base, s.case) = if jump { ("jump", "") } else { ("nop", "") };
+                    }
+                    // The load the test read, if nothing reads it after (as
+                    // `select` drops a load into a dead `acc`).
+                    let after = if jump { insn.target } else { k + 1 };
+                    if k > 0
+                        && f[k - 1].op == Op::Ldar
+                        && !acc_live.get(after).copied().unwrap_or(true)
+                        && let Some(s) = sel[k - 1].as_mut()
+                        && s.base == "ldar"
+                        && s.check.is_none()
                     {
-                        (s.base, s.case) = if insn.op == Op::Jump { ("jump", "") } else { ("nop", "") };
+                        (s.base, s.case) = ("nop", "");
                     }
                 }
                 folded_insns = f;

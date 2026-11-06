@@ -2868,6 +2868,52 @@ t;
     // The one ToBoolean test left is `peek() ? 1 : 0`'s, after the loop.
     let tests = stencils.iter().filter(|s| s.starts_with("jto")).count();
     assert_eq!(tests, 1, "{stencils:?}");
+    // Nor does it load `flag` (in memory, as captured) for them.
+    assert!(!stencils.iter().any(|s| s == "ldar_m"), "{stencils:?}");
+}
+
+/// `x = b || k` and `x = b && k` on a captured `b` known there: the folded
+/// test's jump passes `b` on in `acc`, so the load it read stays (#64).
+#[test]
+fn folded_captured_tests_keep_the_value_they_pass_on() {
+    let src = r#"
+function run(n) {
+  var b = false, s = 0, x;
+  var peek = function () { return b; };
+  for (var i = 0; i < n; i++) {
+    b = 3;
+    s = (s + i) | 0;
+    x = b || 5;
+    s = (s + x) | 0;
+    b = 0;
+    s = (s ^ i) | 0;
+    x = b && 7;
+    s = (s + x + 1) | 0;
+  }
+  return s + (peek() ? 1 : 0);
+}
+var t = 0;
+for (var k = 0; k < 20; k++) t += run(3000);
+t;
+"#;
+    let expected = {
+        let mut t: i64 = 0;
+        for _ in 0..20 {
+            let mut s: i32 = 0;
+            for i in 0..3000 {
+                s = s.wrapping_add(i).wrapping_add(3);
+                s = (s ^ i).wrapping_add(1);
+            }
+            t += s as i64;
+        }
+        t.to_string()
+    };
+    assert_eq!(value(src), expected);
+    let (v, stencils) = compiled(src, "run");
+    assert_eq!(v, expected);
+    // Both tests folded (the one left is `peek() ? 1 : 0`'s).
+    let tests = stencils.iter().filter(|s| s.starts_with("jto")).count();
+    assert_eq!(tests, 1, "{stencils:?}");
 }
 
 /// Polymorphic calls on a local receiver (copied into the call's `this`):

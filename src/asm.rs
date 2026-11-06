@@ -591,6 +591,11 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 if next != Some(Op::Ldar) {
                     return err(at, format!("{op:?} not followed by an Ldar"));
                 }
+            } else if let Some((_, second)) = crate::bytecode::pair(op) {
+                let next = code.get(at + op.size()).and_then(|&b| Op::from_u8(b)).map(Op::plain);
+                if next != Some(second) {
+                    return err(at, format!("{op:?} not followed by a {second:?}"));
+                }
             } else if op.plain() != op && !op.is_loop() {
                 let next = at + op.size();
                 if !matches!(code.get(next).and_then(|&b| Op::from_u8(b)), Some(Op::JumpIfTrue | Op::JumpIfFalse)) {

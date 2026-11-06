@@ -202,7 +202,9 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     let o = as_object(v);
     let array = crate::proxy::is_array(vm, v)?;
     let mut parts: Vec<Vec<u16>> = Vec::new();
-    // The units of `parts` and their separators, which `out` gets.
+    // The units `out` gets: its brackets, `parts` and a separator between
+    // each two (with a gap, at least: its newlines and indentation are
+    // checked once they are written).
     let mut held = out.len() + 2;
     if array {
         let len = vm.length_of(v)?;
@@ -214,7 +216,7 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
             if !property(vm, st, ks, v, &mut part)? {
                 part = "null".encode_utf16().collect();
             }
-            held += part.len() + 1;
+            held += part.len() + usize::from(!parts.is_empty());
             check_string_len(held)?;
             parts.push(part);
             i += 1.0;
@@ -251,7 +253,7 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
                 part.push(b' ' as u16);
             }
             if property(vm, st, k, v, &mut part)? {
-                held += part.len() + 1;
+                held += part.len() + usize::from(!parts.is_empty());
                 check_string_len(held)?;
                 parts.push(part);
             }

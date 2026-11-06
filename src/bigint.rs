@@ -824,7 +824,7 @@ pub(crate) fn to_bigint(vm: &mut Vm, v: Value) -> Result<Big> {
         return Big::parse(&String::from_utf16_lossy(u))
             .ok_or_else(|| Error::new_syntax(format!("Cannot convert {} to a BigInt", String::from_utf16_lossy(u))));
     }
-    Err(Error::type_error(format!("Cannot convert {} to a BigInt", crate::vm::display(p))))
+    Err(Error::type_error(format!("Cannot convert {} to a BigInt", crate::vm::shown(p))))
 }
 
 /// `BigInt(v)`: a number (an integer) or what ToBigInt takes; not a
@@ -841,7 +841,7 @@ fn bigint_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         if d.fract() != 0.0 || !d.is_finite() {
             return Err(Error::range_error(format!(
                 "The number {} cannot be converted to a BigInt because it is not an integer",
-                crate::vm::display(p)
+                crate::vm::shown(p)
             )));
         }
         return Ok(new_bigint(vm, Big::from_f64(d)));

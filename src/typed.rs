@@ -680,7 +680,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
             let m = vm.get(first, a_iter)?;
             if !m.is_undefined() && !m.is_null() {
                 if !is_callable(m) {
-                    return Err(Error::type_error(format!("{} is not a function", crate::vm::display(m))));
+                    return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m))));
                 }
                 return vm.handle_scope(|vm| {
                     let values = iterate_with(vm, first, m)?;
@@ -780,7 +780,7 @@ fn typed_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     vm.handle_scope(|vm| {
         let (values, src) = if !m.is_undefined() && !m.is_null() {
             if !is_callable(m) {
-                return Err(Error::type_error(format!("{} is not a function", crate::vm::display(m))));
+                return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m))));
             }
             (Some(iterate_with(vm, source, m)?), Value::UNDEFINED)
         } else {
@@ -846,7 +846,7 @@ pub(crate) fn typed_to_string_tag(vm: &mut Vm, this: Value, _: &[Value]) -> Resu
 fn callback(a: &[Value], what: &str) -> Result<Value> {
     let f = arg(a, 0);
     if !is_callable(f) {
-        return Err(Error::type_error(format!("{} is not a function (%TypedArray%.prototype.{what})", crate::vm::display(f))));
+        return Err(Error::type_error(format!("{} is not a function (%TypedArray%.prototype.{what})", crate::vm::shown(f))));
     }
     Ok(f)
 }

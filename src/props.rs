@@ -1196,7 +1196,7 @@ impl Vm {
         if v.is_undefined() || v.is_null() {
             return Err(Error::type_error(format!(
                 "Cannot convert {} to object",
-                crate::vm::display(v)
+                crate::vm::shown(v)
             )));
         }
         Ok(as_object(self.new_wrapper(v)))
@@ -1242,7 +1242,7 @@ impl Vm {
         if is_object(o) && crate::proxy::chain_has_proxy(self, as_object(o)) {
             if !crate::proxy::generic_set(self, o, key, v, o)? {
                 let k = self.key_string(key);
-                return Err(Error::type_error(format!("Cannot assign to property '{}' of object", crate::vm::display(k))));
+                return Err(Error::type_error(format!("Cannot assign to property '{}' of object", crate::vm::shown(k))));
             }
             return Ok(());
         }
@@ -1279,7 +1279,7 @@ impl Vm {
                 let k = self.key_string(key);
                 return Err(Error::type_error(format!(
                     "Cannot assign to read only property '{}' of object",
-                    crate::vm::display(k)
+                    crate::vm::shown(k)
                 )));
             }
         }
@@ -1305,7 +1305,7 @@ impl Vm {
             let k = self.key_string(key);
             return Err(Error::type_error(format!(
                 "Cannot delete property '{}' of object",
-                crate::vm::display(k)
+                crate::vm::shown(k)
             )));
         }
         Ok(())
@@ -1319,7 +1319,7 @@ impl Vm {
             let k = self.key_string(key);
             return Err(Error::type_error(format!(
                 "Cannot define property '{}'",
-                crate::vm::display(k)
+                crate::vm::shown(k)
             )));
         }
         Ok(())
@@ -1410,7 +1410,7 @@ fn object_define_property(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let k = vm.key_string(key);
         return Err(Error::type_error(format!(
             "Cannot redefine property: {}",
-            crate::vm::display(k)
+            crate::vm::shown(k)
         )));
     }
     Ok(arg(a, 0))
@@ -1446,7 +1446,7 @@ fn define_all(vm: &mut Vm, o: *mut Object, descs: &[(Key, Desc)]) -> Result<()> 
             let k = vm.key_string(key);
             return Err(Error::type_error(format!(
                 "Cannot redefine property: {}",
-                crate::vm::display(k)
+                crate::vm::shown(k)
             )));
         }
     }
@@ -1725,7 +1725,7 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: &[Value]) -> Re
 fn object_from_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let it = arg(a, 0);
     if it.is_undefined() || it.is_null() {
-        return Err(Error::type_error(format!("{} is not iterable", crate::vm::display(it))));
+        return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(it))));
     }
     let op = object_value(vm.object_prototype);
     let out = object_value(vm.new_object(op));
@@ -1733,7 +1733,7 @@ fn object_from_entries(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         if !is_object(entry) {
             return Err(Error::type_error(format!(
                 "Iterator value {} is not an entry object",
-                crate::vm::display(entry)
+                crate::vm::shown(entry)
             )));
         }
         let k = vm.get_key(entry, Key::Index(0))?;
@@ -1760,10 +1760,10 @@ pub(crate) fn group_by(
 ) -> Result<()> {
     let (items, f) = (arg(a, 0), arg(a, 1));
     if items.is_undefined() || items.is_null() {
-        return Err(Error::type_error(format!("{} is not iterable", crate::vm::display(items))));
+        return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(items))));
     }
     if !is_callable(f) {
-        return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
+        return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(f))));
     }
     let mut k = 0.0;
     crate::symbol::iterate(vm, items, |vm, v| {

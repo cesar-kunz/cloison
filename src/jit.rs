@@ -462,7 +462,11 @@ fn converting(f: impl FnOnce() -> u64) -> u64 {
     let vm = unsafe { &mut *vm };
     vm.conv_redo = false;
     let r = f();
-    if std::mem::take(&mut vm.conv_redo) { RT_REDO } else { r }
+    if std::mem::take(&mut vm.conv_redo) {
+        vm.drop_conv_error();
+        return RT_REDO;
+    }
+    r
 }
 
 extern "C" fn cloison_rt_inc(a: Value) -> u64 {

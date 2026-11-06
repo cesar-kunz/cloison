@@ -7629,10 +7629,14 @@ unsafe fn flatten(o: *mut Object) {
         // Padded to whole words, and one more (copies read past the end).
         let buf = vm.heap.alloc_bytes(8 * (len.div_ceil(4) + 1)).cast::<u16>();
         copy_units(o, buf);
-        (*o).elems = buf.cast();
-        crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
+        // The halves dropped first, `elems` published last (Release): the
+        // marker thread may be sizing `o` (`Object::string_words`), and a
+        // non-null `elems` with the right half still in `code` would read
+        // as the low half of its address in words of units.
         (*o).props = std::ptr::null_mut();
         (*o).code = std::ptr::null();
+        (*(&raw mut (*o).elems as *const std::sync::atomic::AtomicPtr<Value>)).store(buf.cast(), std::sync::atomic::Ordering::Release);
+        crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
     }
 }
 

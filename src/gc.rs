@@ -1276,7 +1276,7 @@ impl Marking<'_> {
                         mark_object_shape(self, w, epoch);
                     }
                     let size = cell_size(p as *const u8);
-                    *crate::heap::meta(p + size - GRANULE) |= END;
+                    *crate::heap::meta(last_granule(p, size)) |= END;
                     self.marked += size;
                     n += 1;
                 }
@@ -1461,7 +1461,7 @@ unsafe fn trace_shared<const R: bool>(
                     head = (head + 1) % RING;
                     len -= 1;
                     let size = cell_size(p as *const u8);
-                    (*(crate::heap::meta(p + size - GRANULE) as *const AtomicU8)).fetch_or(END, Relaxed);
+                    (*(crate::heap::meta(last_granule(p, size)) as *const AtomicU8)).fetch_or(END, Relaxed);
                     if R && cand.has(p) {
                         (*(crate::heap::meta(p) as *const AtomicU8)).fetch_or(EVAC, Relaxed);
                     }
@@ -1543,6 +1543,29 @@ fn bad_reference(p: usize) -> ! {
     panic!("reference to {p:#x}, which is no cell");
 }
 
+/// The last granule of the cell at `p`, of `size` bytes, where marking
+/// sets `END`: in the cell's block, unless it is a large cell, its blocks
+/// its own from the first. Anything else is a size read from words the
+/// mutator was rewriting (see `Object::string_words`), whose `END` would
+/// land in another cell.
+#[inline(always)]
+fn last_granule(p: usize, size: usize) -> usize {
+    let last = p + size - GRANULE;
+    if (p ^ last) >= crate::heap::BLOCK && !(size > crate::heap::LARGE && p.is_multiple_of(crate::heap::BLOCK)) {
+        bad_size(p, size);
+    }
+    last
+}
+
+#[cold]
+#[inline(never)]
+fn bad_size(p: usize, size: usize) -> ! {
+    // (Not a panic: on the marker thread one would leave the mutator
+    // waiting for it.)
+    eprintln!("cell at {p:#x} sized {size} bytes, past its block");
+    std::process::abort();
+}
+
 /// Visit what the cell at `p` refers to from its words in `lo..hi` (see
 /// "Cells" in `docs/gc.md`).
 ///
@@ -1597,7 +1620,11 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
         let code = &raw const (*o).code as usize;
         match (*o).class {
             Class::String => {
-                if (*o).elems.is_null() {
+                // (Read once, as `Object::string_words` reads it: the
+                // mutator may be flattening it, its halves null by the time
+                // `elems` is not.)
+                let e = (*(elems as *const std::sync::atomic::AtomicPtr<Value>)).load(std::sync::atomic::Ordering::Acquire);
+                if e.is_null() {
                     // A cons string: its halves.
                     if within(props) {
                         v.slot(&raw mut (*o).props as *mut Value);
@@ -1605,7 +1632,7 @@ unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
                     if within(code) {
                         v.slot(&raw mut (*o).code as *mut Value);
                     }
-                } else if (*o).elems as usize != slots && within(elems) {
+                } else if e as usize != slots && within(elems) {
                     // Flattened: its units' buffer.
                     v.payload_slot(&raw mut (*o).elems as *mut usize);
                 }

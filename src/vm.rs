@@ -5128,17 +5128,7 @@ impl Vm {
     /// assert_eq!(units[0], 0x61);
     /// ```
     pub fn string_units(&self, v: Value) -> Option<std::borrow::Cow<'_, [u16]>> {
-        let n = string_len(v)?;
-        let o = as_object(v);
-        unsafe {
-            if (*o).elems.is_null() {
-                let mut units = vec![0u16; n];
-                copy_units(o, units.as_mut_ptr());
-                Some(std::borrow::Cow::Owned(units))
-            } else {
-                Some(std::borrow::Cow::Borrowed(std::slice::from_raw_parts((*o).elems.cast::<u16>(), n)))
-            }
-        }
+        units_in_place(v)
     }
 
     /// A new string of `len` code units, with `words` words after its
@@ -7446,19 +7436,10 @@ pub fn display(v: Value) -> String {
         "null".into()
     } else if v.is_bool() {
         (v == Value::TRUE).to_string()
-    } else if let Some(n) = string_len(v) {
+    } else if let Some(s) = units_in_place(v) {
         // (A cons string's units copied out, not made flat: no VM may run
         // to allocate for it.)
-        let o = as_object(v);
-        let mut units = vec![0u16; n];
-        unsafe {
-            if (*o).elems.is_null() {
-                copy_units(o, units.as_mut_ptr());
-            } else {
-                units.copy_from_slice(std::slice::from_raw_parts((*o).elems.cast::<u16>(), n));
-            }
-        }
-        String::from_utf16_lossy(&units)
+        String::from_utf16_lossy(&s)
     } else if crate::symbol::is_symbol(v) {
         String::from_utf16_lossy(&crate::symbol::symbol_string(v))
     } else if crate::bigint::is_bigint(v) {
@@ -7542,6 +7523,23 @@ pub(crate) fn string_units<'a>(v: Value) -> Option<&'a [u16]> {
             flatten(o);
         }
         Some(std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize))
+    }
+}
+
+/// `v`'s code units if it is a string, without making it flat: a cons
+/// string's copied out of its pieces. (Bound to no borrow, as
+/// [`string_units`].)
+fn units_in_place<'a>(v: Value) -> Option<std::borrow::Cow<'a, [u16]>> {
+    let n = string_len(v)?;
+    let o = as_object(v);
+    unsafe {
+        if (*o).elems.is_null() {
+            let mut units = vec![0u16; n];
+            copy_units(o, units.as_mut_ptr());
+            Some(std::borrow::Cow::Owned(units))
+        } else {
+            Some(std::borrow::Cow::Borrowed(std::slice::from_raw_parts((*o).elems.cast::<u16>(), n)))
+        }
     }
 }
 

@@ -12142,6 +12142,32 @@ run();
     assert_eq!(r.as_deref(), Ok("149106224"));
 }
 
+/// A cons string made flat, then used as a key, caches its atom in the
+/// word its right half was in. A marking that recorded that word as a
+/// slot into an evacuation candidate (the half was in one) rewrites it in
+/// the final pause if it holds a moved cell's address, and the marker may
+/// still read it as the half: tagged, the atom never reads as a cell.
+/// (Untagged, atom 4096's was the address 4 GiB into the first heap.)
+#[test]
+fn a_flattened_strings_cached_atom_is_no_cell() {
+    let src = r#"
+var box = {}, s = "abcdefghijklmnopqrstuvwxyz" + Math.random();
+box[s] = 1;
+box[s] + box[s];
+s;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    let s = vm.run(&module).unwrap();
+    let o = cloison::object::as_object(s);
+    unsafe {
+        assert!(!(*o).elems.is_null(), "not flat");
+        let code = cloison::value::Value::from_bits_unchecked((*o).code as u64);
+        assert_ne!(code.to_bits() >> 32, 0, "no atom cached");
+        assert!(!code.is_cell(), "code word {:#x} reads as a cell", code.to_bits());
+    }
+}
+
 /// A direct `eval` in code an `eval` runs (its bindings through a scope
 /// object of accessors, `intrinsics::eval_through_scope`) while every
 /// collection moves cells: the names and the scope object it holds in Rust

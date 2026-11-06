@@ -489,7 +489,8 @@ pub fn verify(m: &Module) -> Result<(), String> {
         if f.lazy.is_some() || f.kind > 1 {
             return Err(format!("{}: a stub, class constructor, generator or async function", f.name));
         }
-        if f.nregs > 256 || f.nregs < f.nparams + 1 {
+        // (`this` and the parameters, without `nparams + 1` overflowing.)
+        if f.nregs > 256 || f.nparams >= f.nregs {
             return Err(format!("{}: {} registers for {} parameters", f.name, f.nregs, f.nparams));
         }
         if let Some(&c) = f.closures.iter().find(|&&c| c >= n) {
@@ -896,6 +897,12 @@ mod tests {
         .contains("upvalue 0 out of range"));
         assert!(bad(&|f| f.kind = 4).contains("generator"));
         assert!(bad(&|f| f.handlers.push((0, 6, 3))).contains("handler"));
+        // Calls fill `nparams` registers: not wrapped around to fit one.
+        assert!(bad(&|f| {
+            f.nparams = u32::MAX;
+            f.nregs = 1;
+        })
+        .contains("registers for"));
     }
     /// A compiled module edited is checked again before it can be run
     /// (it couldn't be edited in place: [`Checked`] derefs read-only).

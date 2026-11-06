@@ -11315,6 +11315,49 @@ r.join(" | ");
     assert_eq!(r.as_deref(), Ok("11 two! 3,4 | 11 two! 3,4 | 11 two! 3,4"));
 }
 
+/// A prototype load a lowering holds (`Prop::Proto`, and a polymorphic
+/// one's `CaseLoc::Proto`) while only its loop entry is compiled, then the
+/// call entry compiled after collections that move cells (issue #60): the
+/// holder's slot wasn't pinned on the lowering's account, so the
+/// prototype moved and the later version read its old copy (poisoned).
+/// What V8, SpiderMonkey, JavaScriptCore and QuickJS give.
+#[test]
+fn prototype_loads_a_lowering_holds_keep_their_holder_still() {
+    let src = r#"
+var A = { m: 7 }, B = { m: 8 };
+var o = {}, p = {}, q = { x: 1 };
+Object.setPrototypeOf(o, A);
+Object.setPrototypeOf(p, B);
+Object.setPrototypeOf(q, B);
+function f(n) {
+  var s = 0;
+  if (n < 0) s = this.m;
+  for (var i = 0; i < n; i++) s++;
+  return s;
+}
+function g(n) {
+  var s = 0;
+  if (n < 0) s = this.m;
+  for (var i = 0; i < n; i++) s++;
+  return s;
+}
+f.call(o, -1);
+f.call(o, 100000);
+g.call(p, -1);
+g.call(q, -1);
+g.call(p, 100000);
+$262.gc(); $262.gc();
+var a = new Array(5000).fill(-1);
+[a.map(f, o)[4999], a.map(g, p)[4999], a.map(g, q)[4999]].join(" ");
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_gc_evacuate_all();
+    vm.set_gc_verify(1 << 10);
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("7 8 8"));
+}
+
 /// A regular expression's compiled pattern goes with the last `RegExp`
 /// using it (issue #34): `Vm::regexps` kept the pattern of every new
 /// source for good, 10 KiB each. Regexps of 20,000 sources made, run and

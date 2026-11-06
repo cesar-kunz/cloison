@@ -3641,7 +3641,10 @@ impl Vm {
                         p += GRANULE;
                         continue;
                     }
-                    let n = cell_size(p as *const u8);
+                    // (A cell moved has its new address in its second
+                    // word, a header's: sized from its copy.)
+                    let at = if m & FORWARDED != 0 { *((p + 8) as *const usize) } else { p };
+                    let n = cell_size(at as *const u8);
                     if m & (YOUNG | COLOR) == color && m & FORWARDED == 0 {
                         c.2 = p;
                         trace(&mut c, p, 0, usize::MAX);

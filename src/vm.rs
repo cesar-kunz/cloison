@@ -845,9 +845,12 @@ pub struct Vm {
     /// operation is redone where something can (see
     /// `interp::to_primitive_hint`).
     pub(crate) conv_redo: bool,
-    /// Such a conversion is running: what it may have to redo runs only
-    /// natives that read (see `interp::replays`), else a redo would run
-    /// what one wrote before again.
+    /// An operation that is redone when a conversion sets `conv_redo` is
+    /// on its first try, with no frame top (the interpreter's `conv!`,
+    /// `jit::converting`): its conversions run only natives that read (see
+    /// `interp::replays`), else the redo would run again what one wrote.
+    /// Not where nothing redoes (a native getter compiled code calls): a
+    /// native there that converts runs a writing `valueOf`, as it can.
     pub(crate) conv_replays: bool,
     /// What a `valueOf` or `toString` a conversion called threw, for the
     /// operation converting to throw (conversions can't fail themselves);

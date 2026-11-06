@@ -4537,6 +4537,32 @@ r.join(",");
     );
 }
 
+/// A native that compiled code calls outside an operation (a getter, as
+/// `String.prototype.trim`) and that converts runs a `valueOf` or
+/// `toString` that writes: nothing redoes the getter for one it refused
+/// (#75). The expected value is SpiderMonkey's, JSC's and QuickJS's.
+#[test]
+fn native_getters_convert_through_writing_natives() {
+    assert_eq!(
+        value(
+            r#"
+function mk(k) { var o = { 0: " ab ", length: 1 }; o[k] = Array.prototype.pop; return o; }
+function f(n, k) {
+  var r = "";
+  for (var i = 0; i < n; i++) {
+    var o = mk(k);
+    Object.defineProperty(o, "t", { get: String.prototype.trim });
+    r = o.t + "/" + o.length;
+  }
+  return r;
+}
+[f(1, "toString"), f(5000, "toString"), f(5000, Symbol.toPrimitive)].join(",");
+"#
+        ),
+        "ab/0,ab/0,ab/0"
+    );
+}
+
 /// `Object.prototype.toString` reads `Symbol.toStringTag` through its
 /// getter wherever it runs (a bytecode one, a native that writes: an
 /// operator's conversion redone), and throws what the getter throws. The

@@ -428,6 +428,96 @@ define_ops! {
     StarGetNamed(Reg),
     /// `Star r; GetNamed …; Star s`: the `Star`, then `GetNamedStar`'s.
     StarGetNamedStar(Reg),
+    // The pairs of `PAIRS`: an instruction and the `Star` of its result,
+    // whose fast path writes the register too, past the `Star` (a slow
+    // path dispatches to it); a `Star`, `Ldar` or `LdaUndefined` and the
+    // instruction after it, whose handler it calls directly.
+    /// `Add r; Star s`.
+    AddStar(Reg),
+    /// `Sub r; Star s`.
+    SubStar(Reg),
+    /// `Mul r; Star s`.
+    MulStar(Reg),
+    /// `BitOrSmi k; Star s`.
+    BitOrSmiStar(Imm),
+    /// `ShiftRightSmi k; Star s`.
+    ShiftRightSmiStar(Imm),
+    /// `GetKeyed o; Star s`.
+    GetKeyedStar(Reg, AutoIc),
+    /// `LdaGlobal n; Star s`.
+    LdaGlobalStar(Ic),
+    /// `LdaUpvalue u; Star s`.
+    LdaUpvalueStar(Count),
+    /// `Star r; LdaUpvalue u`.
+    StarLdaUpvalue(Reg),
+    /// `Star r; LdaGlobal n`.
+    StarLdaGlobal(Reg),
+    /// `Star r; LdaSmi k`.
+    StarLdaSmi(Reg),
+    /// `Star r; Mov s, t`.
+    StarMov(Reg),
+    /// `Star r; Call …`.
+    StarCall(Reg),
+    /// `Ldar r; GetKeyed o`.
+    LdarGetKeyed(Reg),
+    /// `Ldar r; SetNamed o, n`.
+    LdarSetNamed(Reg),
+    /// `Ldar r; Add s`.
+    LdarAdd(Reg),
+    /// `Ldar r; Mul s`.
+    LdarMul(Reg),
+    /// `Ldar r; AddSmi k`.
+    LdarAddSmi(Reg),
+    /// `Ldar r; ShiftRightSmi k`.
+    LdarShiftRightSmi(Reg),
+    /// `Ldar r; Return`.
+    LdarReturn(Reg),
+    /// `LdaUndefined; Return`.
+    LdaUndefinedReturn(),
+}
+
+/// Superinstructions of two instructions that `quicken` makes wherever
+/// they meet, unless a fusion of its own applies first: `(fused, first,
+/// second)`. Each has its first instruction's operands.
+const PAIRS: [(Op, Op, Op); 21] = [
+    (Op::AddStar, Op::Add, Op::Star),
+    (Op::SubStar, Op::Sub, Op::Star),
+    (Op::MulStar, Op::Mul, Op::Star),
+    (Op::BitOrSmiStar, Op::BitOrSmi, Op::Star),
+    (Op::ShiftRightSmiStar, Op::ShiftRightSmi, Op::Star),
+    (Op::GetKeyedStar, Op::GetKeyed, Op::Star),
+    (Op::LdaGlobalStar, Op::LdaGlobal, Op::Star),
+    (Op::LdaUpvalueStar, Op::LdaUpvalue, Op::Star),
+    (Op::StarLdaUpvalue, Op::Star, Op::LdaUpvalue),
+    (Op::StarLdaGlobal, Op::Star, Op::LdaGlobal),
+    (Op::StarLdaSmi, Op::Star, Op::LdaSmi),
+    (Op::StarMov, Op::Star, Op::Mov),
+    (Op::StarCall, Op::Star, Op::Call),
+    (Op::LdarGetKeyed, Op::Ldar, Op::GetKeyed),
+    (Op::LdarSetNamed, Op::Ldar, Op::SetNamed),
+    (Op::LdarAdd, Op::Ldar, Op::Add),
+    (Op::LdarMul, Op::Ldar, Op::Mul),
+    (Op::LdarAddSmi, Op::Ldar, Op::AddSmi),
+    (Op::LdarShiftRightSmi, Op::Ldar, Op::ShiftRightSmi),
+    (Op::LdarReturn, Op::Ldar, Op::Return),
+    (Op::LdaUndefinedReturn, Op::LdaUndefined, Op::Return),
+];
+
+/// The first and second instructions of `PAIRS` superinstruction `op`.
+pub const fn pair(op: Op) -> Option<(Op, Op)> {
+    let mut i = 0;
+    while i < PAIRS.len() {
+        if PAIRS[i].0 as u8 == op as u8 {
+            return Some((PAIRS[i].1, PAIRS[i].2));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The `PAIRS` superinstruction of `first` followed by `second`.
+fn paired(first: Op, second: Op) -> Option<Op> {
+    PAIRS.iter().find(|p| p.1 == first && p.2 == second).map(|p| p.0)
 }
 
 impl Op {
@@ -496,7 +586,10 @@ impl Op {
             Op::StarLdar | Op::StarLdarIncStar | Op::StarLdarDecStar => Op::Star,
             Op::StarGetNamed | Op::StarGetNamedStar => Op::Star,
             Op::GetNamedStar | Op::GetNamedStarGetNamed => Op::GetNamed,
-            op => op,
+            op => match pair(op) {
+                Some((first, _)) => first,
+                None => op,
+            },
         }
     }
 
@@ -603,6 +696,11 @@ pub fn quicken(code: &mut [u8]) {
             // (Not an in-place `++`'s `Ldar`, nor a postfix `++`'s, which
             // `StarLdar` would run as a plain one.)
             code[pc] = Op::StarLdar as u8;
+        } else if next < code.len()
+            && code[pc] == op as u8
+            && let Some(q) = paired(op, Op::from_u8(code[next]).expect("bad opcode").plain())
+        {
+            code[pc] = q as u8;
         }
         pc = next;
     }
@@ -877,6 +975,25 @@ mod tests {
         assert_eq!(Op::JumpIfLessSmi.size(), 9);
         assert_eq!(Op::GetNamed.size(), 4);
         assert_eq!(Op::Call.size(), 6);
+    }
+
+    #[test]
+    fn pairs_quicken_and_decode_as_their_parts() {
+        for &(fused, first, second) in &super::PAIRS {
+            assert_eq!(fused.operands(), first.operands(), "{fused:?}");
+            assert_eq!((fused.plain(), super::pair(fused)), (first, Some((first, second))));
+            // Operand bytes that start no other fusion.
+            let mut code = vec![first as u8];
+            code.resize(first.size(), 0);
+            code.push(second as u8);
+            code.resize(first.size() + second.size(), 0);
+            let plain = code.clone();
+            super::quicken(&mut code);
+            assert_eq!(code[0], fused as u8, "{first:?} {second:?}");
+            assert_eq!(code[1..], plain[1..]);
+            super::quicken(&mut code);
+            assert_eq!(code[0], fused as u8, "idempotent");
+        }
     }
 
     #[test]

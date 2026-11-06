@@ -374,7 +374,7 @@ fn this_promise(this: Value, what: &str) -> Result<*mut Object> {
     if is_class(this, Class::Promise) {
         Ok(as_object(this))
     } else {
-        Err(Error::type_error(format!("{what} called on incompatible receiver {}", crate::vm::display(this))))
+        Err(Error::type_error(format!("{what} called on incompatible receiver {}", crate::vm::shown(this))))
     }
 }
 
@@ -491,7 +491,7 @@ fn new_capability(vm: &mut Vm, c: Value) -> Result<Cap> {
         return Ok(Cap { promise, resolve: Value::UNDEFINED, reject: Value::UNDEFINED });
     }
     if !is_constructor(c) {
-        return Err(Error::type_error(format!("{} is not a constructor", crate::vm::display(c))));
+        return Err(Error::type_error(format!("{} is not a constructor", crate::vm::shown(c))));
     }
     let executor = closure(vm, Root::Executor, &[Value::UNDEFINED, Value::UNDEFINED]);
     let promise = construct(vm, c, executor)?;
@@ -651,7 +651,7 @@ fn promise_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     let executor = arg(a, 0);
     if !is_callable(executor) {
-        return Err(Error::type_error(format!("Promise resolver {} is not a function", crate::vm::display(executor))));
+        return Err(Error::type_error(format!("Promise resolver {} is not a function", crate::vm::shown(executor))));
     }
     let p = new_promise(vm);
     let (resolve, reject) = resolving_functions(vm, p);

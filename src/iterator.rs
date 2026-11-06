@@ -188,7 +188,7 @@ fn step_value(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
 fn step_result(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Value>> {
     let r = call_function(vm, next, it, &[])?;
     if !is_object(r) {
-        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::display(r))));
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
     }
     let a_done = vm.intern_name("done");
     if to_boolean(vm.get(r, a_done)?) {
@@ -212,7 +212,7 @@ fn iterator_method(vm: &mut Vm, v: Value) -> Result<Value> {
         return Ok(Value::UNDEFINED);
     }
     if !is_callable(m) {
-        return Err(Error::type_error(format!("{} is not a function", crate::vm::display(m))));
+        return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(m))));
     }
     Ok(m)
 }
@@ -222,12 +222,12 @@ fn iterator_method(vm: &mut Vm, v: Value) -> Result<Value> {
 /// (but a string, with `strings`).
 fn flattenable(vm: &mut Vm, v: Value, strings: bool) -> Result<(Value, Value)> {
     if !is_object(v) && !(strings && crate::vm::string_units(v).is_some()) {
-        return Err(Error::type_error(format!("{} is not an object", crate::vm::display(v))));
+        return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(v))));
     }
     let m = iterator_method(vm, v)?;
     let it = if m.is_undefined() { v } else { call_function(vm, m, v, &[])? };
     if !is_object(it) {
-        return Err(Error::type_error(format!("{} is not an object", crate::vm::display(it))));
+        return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(it))));
     }
     let next = next_method(vm, it)?;
     Ok((it, next))
@@ -433,7 +433,7 @@ fn step(vm: &mut Vm, state: Value) -> Result<Option<Value>> {
                 set(vm, state, COUNT, Value::number(i))?;
                 let inner = call_function(vm, m, iterable, &[])?;
                 if !is_object(inner) {
-                    return Err(Error::type_error(format!("{} is not an object", crate::vm::display(inner))));
+                    return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(inner))));
                 }
                 let inner_next = next_method(vm, inner)?;
                 set(vm, state, INNER, inner)?;
@@ -523,11 +523,11 @@ fn concat(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let list = vm.new_array();
     for &item in a {
         if !is_object(item) {
-            return Err(Error::type_error(format!("{} is not an object", crate::vm::display(item))));
+            return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(item))));
         }
         let m = iterator_method(vm, item)?;
         if m.is_undefined() {
-            return Err(Error::type_error(format!("{} is not iterable", crate::vm::display(item))));
+            return Err(Error::type_error(format!("{} is not iterable", crate::vm::shown(item))));
         }
         crate::vm::array_push(vm, list, &[m, item])?;
     }
@@ -547,7 +547,7 @@ fn this_object(this: Value, what: &str) -> Result<Value> {
 /// `f`, callable, else a TypeError (iterator `it` closed).
 fn callable_arg(vm: &mut Vm, it: Value, f: Value) -> Result<Value> {
     if !is_callable(f) {
-        let e = Error::type_error(format!("{} is not a function", crate::vm::display(f)));
+        let e = Error::type_error(format!("{} is not a function", crate::vm::shown(f)));
         return close_throw(vm, it, e);
     }
     Ok(f)
@@ -581,7 +581,7 @@ fn limited(vm: &mut Vm, this: Value, a: &[Value], kind: i32, what: &str) -> Resu
         return close_throw(vm, it, e);
     }
     if d.is_nan() {
-        return close_throw(vm, it, Error::range_error(format!("{} must be a number", crate::vm::display(arg(a, 0)))));
+        return close_throw(vm, it, Error::range_error(format!("{} must be a number", crate::vm::shown(arg(a, 0)))));
     }
     // (Infinity, or a safe integer.)
     let limit = d.trunc();
@@ -768,7 +768,7 @@ fn size_arg(vm: &mut Vm, it: Value, v: Value) -> Result<f64> {
             }
             Ok(d)
         }
-        _ => close_throw(vm, it, Error::type_error(format!("{} is not an integral number", crate::vm::display(v)))),
+        _ => close_throw(vm, it, Error::type_error(format!("{} is not an integral number", crate::vm::shown(v)))),
     }
 }
 

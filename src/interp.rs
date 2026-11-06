@@ -2095,7 +2095,7 @@ handlers! {
             vm.store_failed = false;
             let r = vm.set_keyed(*reg(pc, 1, regs), key, acc);
             let r = if vm.conv_thrown { Err(vm.take_conv_error()) } else { r };
-            strict_store_check(vm, &*frame_code(regs), r, |_| crate::vm::display(key))
+            strict_store_check(vm, &*frame_code(regs), r, |_| crate::vm::shown(key))
         });
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
     }
@@ -4453,7 +4453,7 @@ fn is_no_top(vm: &Vm, e: &Error) -> bool {
 pub(crate) fn call_function(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate::vm::Result<Value> {
     unsafe {
         if !f.is_cell() || !matches!((*as_object(f)).class, Class::Function | Class::Native) {
-            return Err(Error::type_error(format!("{} is not a function", crate::vm::display(f))));
+            return Err(Error::type_error(format!("{} is not a function", crate::vm::shown(f))));
         }
         with_args_on_stack(vm, args, |vm, args| call_function_on(vm, f, this, args))
     }

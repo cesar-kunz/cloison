@@ -193,7 +193,7 @@ fn callback(a: &[Value], what: &str) -> Result<Value> {
     if !is_callable(f) {
         return Err(Error::type_error(format!(
             "{} is not a function (Array.prototype.{what})",
-            crate::vm::display(f)
+            crate::vm::shown(f)
         )));
     }
     Ok(f)

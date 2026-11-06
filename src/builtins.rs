@@ -773,7 +773,7 @@ fn string_from_code_point(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     for &v in a {
         let d = to_number(v);
         if d.fract() != 0.0 || !(0.0..=0x10FFFF as f64).contains(&d) {
-            return Err(Error::range_error(format!("Invalid code point {}", crate::vm::display(v))));
+            return Err(Error::range_error(format!("Invalid code point {}", crate::vm::shown(v))));
         }
         let cp = d as u32;
         if cp >= 0x10000 {
@@ -3323,14 +3323,16 @@ fn error_stack_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::UNDEFINED)
 }
 
-/// A new error object of kind `k`, with its own `message` if given.
+/// A new error object of kind `k`, with its own `message` if given (cut
+/// to the longest string: making the error throws nothing, and leaves
+/// nothing pending, see `Vm::new_string_with`).
 pub(crate) fn make_error(vm: &mut Vm, k: usize, message: Option<&[u16]>) -> Value {
     let proto = vm.error_prototypes[k];
     let o = vm.new_object(object_value(proto));
     unsafe { (*o).flags |= crate::object::ERROR };
     if let Some(m) = message {
         let a = vm.intern_name("message");
-        let m = vm.new_string(m);
+        let m = vm.new_string(&m[..m.len().min(crate::vm::MAX_STRING_LEN)]);
         vm.add_property_with(o, a, m, DONT_ENUM);
     }
     object_value(o)
@@ -3346,7 +3348,9 @@ pub(crate) fn caught(vm: &mut Vm, e: &Error) -> Value {
         let m: Vec<u16> = message.encode_utf16().collect();
         return make_error(vm, k, Some(&m));
     }
-    str_value(vm, &e.0)
+    let mut u: Vec<u16> = e.0.encode_utf16().collect();
+    u.truncate(crate::vm::MAX_STRING_LEN);
+    vm.new_string(&u)
 }
 
 /// `Error.prototype.toString`: `name: message`, or either alone if the

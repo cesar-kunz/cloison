@@ -196,7 +196,7 @@ pub(crate) fn add_resource(vm: &mut Vm, state: Value, v: Value, async_: bool) ->
         return Ok(());
     }
     if !is_object(v) {
-        return Err(Error::type_error(format!("{} is not disposable", crate::vm::display(v))));
+        return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
     }
     let (method, kind) = if async_ {
         match get_method(vm, v, "asyncDispose")? {
@@ -207,7 +207,7 @@ pub(crate) fn add_resource(vm: &mut Vm, state: Value, v: Value, async_: bool) ->
         (get_method(vm, v, "dispose")?, SYNC)
     };
     if method.is_undefined() {
-        return Err(Error::type_error(format!("{} is not disposable", crate::vm::display(v))));
+        return Err(Error::type_error(format!("{} is not disposable", crate::vm::shown(v))));
     }
     push(vm, state, v, method, kind)
 }

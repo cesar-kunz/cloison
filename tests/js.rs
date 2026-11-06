@@ -49,6 +49,26 @@ fn big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     })
 }
 
+/// [`value`] of a script whose long strings are cons strings of shared
+/// pieces: the heap stays under 256 MB at its end (none was flattened).
+fn light_value(src: &str) -> String {
+    let module = cloison::js::compile(src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+    let mut result = None;
+    for budget in [i64::MAX, 1, 2, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        let r = vm.run(&module).map(display).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        vm.heap.verify();
+        let used = vm.heap.allocated();
+        assert!(used < 256 << 20, "{used} bytes of heap at the end, tier at {budget}:\n{src}");
+        match &result {
+            None => result = Some(r),
+            Some(first) => assert_eq!(first, &r, "tier at {budget}:\n{src}"),
+        }
+    }
+    result.unwrap()
+}
+
 fn compile_error(src: &str) -> String {
     cloison::js::compile(src).expect_err(src)
 }
@@ -5715,6 +5735,45 @@ out.join();"#;
         value(src),
         "plus:RangeError,join:RangeError,toLocaleString:RangeError,template:RangeError,\
          concat:RangeError,raw:RangeError,stringify:RangeError,quoted:RangeError,iterator:RangeError,longest:1073741824"
+    );
+}
+
+/// An error message shows a long string cut (#65): a TypeError for
+/// calling a string of 2^30 units is caught as one, its message short,
+/// and leaves nothing pending to throw later (the message, made whole,
+/// was past the longest string). The cons string (2 MiB, its pieces
+/// shared) isn't flattened.
+#[test]
+fn error_messages_cut_long_strings() {
+    let src = r#"
+var s = "x".repeat(2 ** 20);
+for (var i = 0; i < 10; i++) s = s + s;
+var sym = Symbol(s);
+var out = [];
+function t(name, f) {
+    try { f(); out.push(name + ":none"); }
+    catch (e) { out.push(name + ":" + e.name + ":" + e.message.length + ":" + e.message.slice(-20)); }
+}
+t("call", () => s());
+t("new", () => new s());
+t("forEach", () => [].forEach(s));
+t("promise", () => new Promise(s));
+t("keyFor", () => Symbol.keyFor(s));
+t("in", () => "a" in s);
+t("iterable", () => { for (var x of sym) {} });
+t("symbol call", () => sym());
+out.push("after");
+var p = Promise.reject(s).then(undefined, s);
+p.then(undefined, (e) => out.push("job:" + e.name + ":" + e.message.length));
+out.push(String(1.5) + [2].join());
+out.join();"#;
+    assert_eq!(
+        light_value(src),
+        "call:TypeError:1021:.. is not a function,new:TypeError:1024:is not a constructor,\
+         forEach:TypeError:1047:y.prototype.forEach),promise:TypeError:1038:.. is not a function,\
+         keyFor:TypeError:1019:x... is not a symbol,in:TypeError:1049:xxxxxxxxxxxxxxxxx...,\
+         iterable:TypeError:1027:...) is not iterable,symbol call:TypeError:1029:.) is not a function,\
+         after,1.52"
     );
 }
 

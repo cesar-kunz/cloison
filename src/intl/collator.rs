@@ -124,7 +124,7 @@ fn this_collator(this: Value, what: &str) -> Result<*mut Object> {
     if is_class(this, Class::Intl) {
         Ok(as_object(this))
     } else {
-        Err(Error::type_error(format!("Method Intl.Collator.prototype.{what} called on incompatible receiver {}", crate::vm::display(this))))
+        Err(Error::type_error(format!("Method Intl.Collator.prototype.{what} called on incompatible receiver {}", crate::vm::shown(this))))
     }
 }
 

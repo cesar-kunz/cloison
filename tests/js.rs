@@ -12747,6 +12747,22 @@ fn calls_with_only_eval_scopes_are_plain() {
 }
 
 #[test]
+fn long_tagged_templates_make_their_arrays_once() {
+    // A long tagged template's strings go to `template_object` in two
+    // arrays: made only when the site has no strings array yet, after
+    // `[site]` alone found none.
+    let src = format!("function tag(s) {{ return s; }} function k() {{ return tag`{}`; }} var a = k(); a === k() && a.length + a.raw[1]", "${0}\\x".repeat(300));
+    assert_eq!(value(&src), "301\\x");
+    let text = cloison::asm::disassemble(&cloison::js::compile(&src).unwrap());
+    // (`tag`'s argument array before: `[site]`, a jump past the arrays.)
+    let k = &text[text.find("function k").unwrap()..];
+    let lines: Vec<&str> = k.lines().map(str::trim).collect();
+    let jump = lines.iter().position(|l| l.starts_with("JumpIfToBooleanTrue")).expect(k);
+    assert!(lines[jump - 1].starts_with("Intrinsic") && lines[jump - 1].ends_with(", 1"), "{k}");
+    assert_eq!(lines[jump..].iter().filter(|l| l.starts_with("CreateArray")).count(), 2, "{k}");
+}
+
+#[test]
 fn forwarded_arguments_under_register_pressure() {
     // `g.apply(x, arguments)` in a function that makes no `arguments`
     // object (it only passes them on), with few registers left: still

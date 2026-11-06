@@ -1151,14 +1151,26 @@ impl Default for Vm {
 }
 
 impl Vm {
+    /// A VM; panics if no heap is free (see [`Vm::try_new`]).
     pub fn new() -> Vm {
+        Self::try_new().unwrap_or_else(|| panic!("more than {} heaps alive at once", crate::heap::HEAPS))
+    }
+
+    /// A VM, or `None` if no heap is free: [`crate::heap::HEAPS`] can be
+    /// alive at once in a process.
+    pub fn try_new() -> Option<Vm> {
+        Heap::try_new().map(Vm::with_heap)
+    }
+
+    /// A VM on `heap`.
+    pub fn with_heap(heap: Heap) -> Vm {
         // Zeroed, so fresh pages from the kernel, touched only as frames
         // reach them (a frame sets its registers when pushed); filling it
         // faulted in all 2 MiB at startup.
         let mut stack = vec![Value::from_bits(0); STACK_VALUES].into_boxed_slice();
         let stack_end = unsafe { stack.as_mut_ptr().add(stack.len()) };
         let mut vm = Vm {
-            heap: Heap::new(),
+            heap,
             shapes: Vec::new(),
             zombies: Vec::new(),
             condemned_shapes: Vec::new(),

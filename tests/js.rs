@@ -12037,6 +12037,41 @@ sum + " " + n;
     }
 }
 
+/// Old cons strings made flat while cycles run back to back, the marker
+/// sizing them meanwhile: `flatten` publishes the units' buffer only once
+/// the halves are dropped, or the marker reads the right half's address
+/// as the string's length and sets `END` past its block (it aborts on one
+/// now). Batches kept three rounds are old by the cycle before the one
+/// that flattens them.
+#[test]
+fn strings_flattened_while_marking_keep_their_size() {
+    let src = r#"
+var N = 50000, ROUNDS = 80, LAG = 3;
+var parts = [];
+for (var i = 0; i < 64; i++) parts.push("piece-" + i + "-abcdefghijklmnopqrstuvwxyz");
+var batches = [], sum = 0;
+for (var r = 0; r < ROUNDS + LAG; r++) {
+  if (r < ROUNDS) {
+    var a = new Array(N);
+    for (var i = 0; i < N; i++) a[i] = parts[i & 63] + parts[(i * 7 + r) & 63];
+    batches.push(a);
+  }
+  for (var j = 0, junk = []; j < 100000; j++) junk.push({ x: j });
+  if (r >= LAG) {
+    var old = batches[r - LAG];
+    for (var i = 0; i < N; i++) sum += old[i].charCodeAt(30);
+    batches[r - LAG] = null;
+  }
+}
+sum;
+"#;
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_gc_evacuate_cycles();
+    let r = vm.run(&module).map(display).map_err(|e| e.to_string());
+    assert_eq!(r.as_deref(), Ok("472625600"));
+}
+
 /// A direct `eval` in code an `eval` runs (its bindings through a scope
 /// object of accessors, `intrinsics::eval_through_scope`) while every
 /// collection moves cells: the names and the scope object it holds in Rust

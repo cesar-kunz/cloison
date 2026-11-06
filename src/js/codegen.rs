@@ -5089,14 +5089,15 @@ impl<'a> Gen<'a> {
         {
             return self.with_call(n, args, pos);
         }
-        if self.args_array_needed(args) {
+        let method = !new && matches!(f.kind, ExprKind::Member(..) | ExprKind::Index(..));
+        // `g.apply(x, arguments)` passing the frame's arguments on. (Never
+        // in an array: the function has no `arguments` to put there.)
+        let forward = method && apply_arguments(f, args) && forwards_arguments(self.p, self.index);
+        if !forward && self.args_array_needed(args) {
             return self.call_spread(f, args, new, optional, pos);
         }
         let n =
             u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
-        let method = !new && matches!(f.kind, ExprKind::Member(..) | ExprKind::Index(..));
-        // `g.apply(x, arguments)` passing the frame's arguments on.
-        let forward = method && apply_arguments(f, args) && forwards_arguments(self.p, self.index);
         let c = self.alloc(pos)?;
         let w;
         if method {

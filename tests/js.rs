@@ -40,6 +40,15 @@ fn value(src: &str) -> String {
     run(src).unwrap_or_else(|e| panic!("{e}\n{src}"))
 }
 
+/// `f` on a thread with a 64 MiB stack: for an expression nested deeper
+/// than the front end can go on a test thread's in debug builds.
+fn big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        let t = std::thread::Builder::new().stack_size(64 << 20).spawn_scoped(s, f).unwrap();
+        t.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
+}
+
 fn compile_error(src: &str) -> String {
     cloison::js::compile(src).expect_err(src)
 }
@@ -12647,4 +12656,29 @@ out.join(" ");
     let lets: String = (0..300).map(|i| format!("let s{i} = {i};")).collect();
     assert!(compile_error(&format!("{lets} eval('s299');")).contains("more variables than registers"));
     assert_eq!(value(src), format!("{calls} 602 eseses 600 TypeError true true true 301  \\unicode a true/true/true"));
+}
+
+#[test]
+fn forwarded_arguments_under_register_pressure() {
+    // `g.apply(x, arguments)` in a function that makes no `arguments`
+    // object (it only passes them on), with few registers left: still
+    // `CallApplyArguments`, not a call with its arguments in an array.
+    let src = r#"
+var out = [];
+function g(a) { return a; }
+var o = { x: 0 };
+var vars = "";
+for (var i = 0; i < 150; i++) vars += "var v" + i + " = " + i + ";";
+var e = "g.apply(this, arguments)";
+for (var j = 0; j < 90; j++) e = "(o.x + " + e + ")";
+out.push(Function("g", "o", "return function () { " + vars + " return " + e + "; };")(g, o)(42));
+function sink() { return arguments[arguments.length - 1]; }
+for (var k = 230; k < 240; k++) {
+    var h = Function("sink", "g", "return function () { return sink(" + "0,".repeat(k) + " g.apply(null, arguments)); };")(sink, g);
+    out.push(h(k));
+}
+out.join(" ");
+"#;
+    let ks: Vec<String> = (230..240).map(|k| k.to_string()).collect();
+    assert_eq!(big_stack(|| value(src)), format!("42 {}", ks.join(" ")));
 }

@@ -7615,13 +7615,17 @@ pub(crate) fn push_string(out: &mut Vec<u16>, s: Value) -> Result<()> {
 
 /// Make the cons string `o` (see [`Vm::new_cons`]) flat: its units copied
 /// out of its pieces, the pieces dropped. Its own VM allocates them, which
-/// must be running (see `heap::owner`).
+/// must be the one running (see `heap::owner`): not one a run of which
+/// encloses another VM's, which a value of it reached.
 #[cold]
 #[inline(never)]
 unsafe fn flatten(o: *mut Object) {
     unsafe {
         let vm = crate::heap::owner(o as usize);
-        assert!(!vm.is_null(), "a string made flat outside its VM's run");
+        assert!(
+            !vm.is_null() && std::ptr::eq(vm, crate::interp::current_vm()),
+            "a string made flat outside its VM's run"
+        );
         let vm = &mut *vm;
         let len = (*o).elems_len as usize;
         // Padded to whole words, and one more (copies read past the end).
@@ -7842,6 +7846,13 @@ out.join();"#;
 
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    fn cons(vm: &mut Vm) -> Value {
+        let src = "'x'.repeat(40) + 'y'.repeat(40)";
+        let s = vm.run(&crate::js::compile(src).unwrap()).unwrap();
+        assert!(unsafe { (*as_object(s)).elems.is_null() });
+        s
+    }
+
     /// A run, or a host's operation, that unwinds leaves the VM running
     /// before it running again, and its heap's owner as before (#70).
     #[test]
@@ -7878,5 +7889,21 @@ out.join();"#;
         assert!(r.is_err());
         assert!(c.native_top.is_null() && c.unmovable == 0 && !c.conv_thrown && c.handles.is_empty());
         assert!(crate::interp::current_vm().is_null());
+    }
+
+    /// A cons string isn't made flat by its VM while another VM's run is
+    /// nested in its own: that one is running, not its owner (#70).
+    #[test]
+    fn a_string_is_made_flat_only_by_the_vm_running() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        let s = cons(&mut a);
+        let r = a.enter(|_| {
+            let r = catch_unwind(AssertUnwindSafe(|| b.enter(|_| Ok(Value::from_i32(string_units(s).unwrap().len() as i32)))));
+            Ok(Value::from_bool(r.is_err()))
+        });
+        assert_eq!(r.unwrap(), Value::TRUE);
+        let n = a.enter(|_| Ok(Value::from_i32(string_units(s).unwrap().len() as i32))).unwrap();
+        assert_eq!(n, Value::from_i32(80));
     }
 }

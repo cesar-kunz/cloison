@@ -10546,7 +10546,8 @@ pub(crate) struct Caches {
     /// the interpreter runs it, by bytecode offset (see [`interp_live`]).
     pc_live: HashMap<*const crate::vm::Code, Rc<PcLive>>,
     /// Per function, the registers live into each of its instructions, in
-    /// its own frame (see [`Lowering::dead_after`]).
+    /// its own frame, its handlers' reads included (see
+    /// [`Lowering::dead_after`]).
     reg_live: HashMap<*const crate::vm::Code, Rc<Vec<RegSet>>>,
     /// Per (function, upvalue), whether code may assign the variable (see
     /// [`variable_assigned`]); per function, what that reads of its
@@ -12465,10 +12466,17 @@ fn handler_live(
     pc: usize,
 ) -> Option<RegSet> {
     let f = &out.frames[g];
+    let h = handler_at(unsafe { &(*f.code).handlers }, pc)?;
+    Some(rs_shl(pc_live[&f.code].get(&h)?, f.base))
+}
+
+/// Where an exception at bytecode offset `pc` goes, of `handlers` (as
+/// `Code::handlers`): the first covering it, inner `try`s coming first, as
+/// the interpreter unwinds.
+fn handler_at(handlers: &[(u32, u32, u32)], pc: usize) -> Option<usize> {
     let pc = pc as u32;
-    let handlers = unsafe { &(*f.code).handlers };
     let &(_, _, h) = handlers.iter().find(|&&(start, end, _)| start <= pc && pc < end)?;
-    Some(rs_shl(pc_live[&f.code].get(&(h as usize))?, f.base))
+    Some(h as usize)
 }
 
 /// Per instruction of `out`, the registers the handlers an exception there
@@ -16135,21 +16143,47 @@ impl Lowering<'_> {
 
     /// Whether register `r` of `code`'s frame is dead after its instruction
     /// `k` (no path reads it before writing it; an exit to the interpreter
-    /// later reads only what it would).
+    /// later reads only what it would). What a `catch` or `finally` reads
+    /// is read where an exception goes there, at `k` too (an exception in
+    /// an inlined call there): the instructions have no edges to them, and
+    /// an exit before one leaves the interpreter to run it (a variable
+    /// copied into the call's window that only the `catch` read after it,
+    /// its `Star` dropped, was never written for it). And the code they
+    /// run is live too, though no edge reaches it: a loop there is entered
+    /// from the interpreter (one in a `catch`, its reads past such a call
+    /// all left unseen, read what the dropped `Star` didn't write).
     fn dead_after(&mut self, code: *const crate::vm::Code, k: usize, r: u8) -> bool {
         let d = self.decoded(code);
-        let live = self
-            .caches()
-            .reg_live
-            .entry(code)
-            .or_insert_with(|| {
+        let handlers = unsafe { &(*code).handlers };
+        let pc_live = (!handlers.is_empty()).then(|| self.pc_live(code));
+        let caught = |pc: usize| {
+            let l = pc_live.as_ref()?;
+            l.get(&handler_at(handlers, pc)?).copied()
+        };
+        let live = match self.caches().reg_live.get(&code) {
+            Some(l) => l.clone(),
+            None => {
                 let insns = &d.0;
                 let nregs = unsafe { (*code).nregs } as usize;
-                Rc::new(reg_live_in(insns, &reachable(insns, 0), nregs, &[]))
-            })
-            .clone();
+                let extra: Option<Vec<RegSet>> = pc_live
+                    .is_some()
+                    .then(|| insns.iter().map(|i| caught(i.pc).unwrap_or([0; 4])).collect());
+                let l = Rc::new(reg_live_in_reads(
+                    insns,
+                    &vec![true; insns.len()],
+                    nregs,
+                    &[],
+                    None,
+                    true,
+                    extra.as_deref(),
+                ));
+                self.caches().reg_live.insert(code, l.clone());
+                l
+            }
+        };
         // (A closure may read a captured register any time.)
         live.get(k + 1).is_some_and(|l| !rs_has(l, r as usize))
+            && !caught(d.0[k].pc).is_some_and(|l| rs_has(&l, r as usize))
             && captured_regs(code).get(r as usize) != Some(&true)
     }
 

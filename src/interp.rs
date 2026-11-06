@@ -4422,6 +4422,7 @@ pub(crate) fn reads_only(native: crate::vm::NativeFn) -> bool {
         b::regexp_get::<0>,
         crate::array::array_to_string,
         crate::array::array_join,
+        crate::typed::typed_join,
         crate::date::to_string,
         crate::date::date_get_time,
         crate::date::date_to_primitive,
@@ -5627,4 +5628,41 @@ unsafe fn dispatch_at(pc: *const u8, acc: Value, regs: *mut Value) -> Value {
     let ti32: &'static Table = std::hint::black_box(&TABLE_I32);
     let tag = NumberTag::new();
     unsafe { (tbl.0[*pc as usize])(pc, acc, regs, tag, tbl, ti32) }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::value::Value;
+
+    /// The natives the built-ins' own conversions run (each prototype's
+    /// `toString`, `valueOf`, `join` and `Symbol.toPrimitive`, the RegExp
+    /// `source` getter) are marked as reading only: compiled code's
+    /// conversion through one not marked is redone in the interpreter
+    /// (`Vm::conv_replays`), which took a typed array's `+ ""` 1.8x as
+    /// long.
+    #[test]
+    fn the_built_ins_conversions_run_natives_that_replay() {
+        let mut vm = crate::vm::Vm::new();
+        let src = r#"
+var T = Object.getPrototypeOf(Uint8Array.prototype);
+var fs = [Object.prototype.toString, Object.prototype.valueOf, Function.prototype.toString,
+  Array.prototype.toString, Array.prototype.join, T.toString, T.join,
+  String.prototype.toString, String.prototype.valueOf, Number.prototype.toString,
+  Number.prototype.valueOf, Boolean.prototype.toString, Boolean.prototype.valueOf,
+  Symbol.prototype.toString, Symbol.prototype.valueOf, Symbol.prototype[Symbol.toPrimitive],
+  BigInt.prototype.toString, BigInt.prototype.valueOf, Date.prototype.toString,
+  Date.prototype.valueOf, Date.prototype[Symbol.toPrimitive], RegExp.prototype.toString,
+  Object.getOwnPropertyDescriptor(RegExp.prototype, "source").get, Error.prototype.toString];
+fs.push(fs.length);
+fs;
+"#;
+        let fs = vm.run(&crate::js::compile(src).unwrap()).unwrap();
+        let n = vm.get_keyed(fs, Value::from_i32(24)).unwrap();
+        assert_eq!(n, Value::from_i32(24));
+        for i in 0..24 {
+            let f = vm.get_keyed(fs, Value::from_i32(i)).unwrap();
+            assert!(f.is_cell(), "{i}");
+            assert!(super::replays(f), "function {i} doesn't replay");
+        }
+    }
 }

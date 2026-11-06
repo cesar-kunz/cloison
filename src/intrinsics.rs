@@ -128,7 +128,7 @@ fn arg(a: &[Value], i: usize) -> Value {
 
 /// ToString, its errors thrown.
 pub(crate) fn to_string(vm: &mut Vm, v: Value) -> Result<Value> {
-    if crate::vm::string_units(v).is_some() {
+    if crate::vm::string_len(v).is_some() {
         return Ok(v);
     }
     let units = to_string_units(v);
@@ -320,10 +320,10 @@ fn template(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let mut units: Vec<u16> = Vec::new();
     for (i, &v) in a.iter().enumerate() {
         if i % 2 == 0 {
-            units.extend_from_slice(crate::vm::string_units(v).unwrap_or(&[]));
+            crate::vm::push_string(&mut units, v)?;
         } else {
             let s = template_string(vm, v)?;
-            units.extend_from_slice(crate::vm::string_units(s).unwrap_or(&[]));
+            crate::vm::push_string(&mut units, s)?;
         }
     }
     Ok(vm.new_string(&units))
@@ -336,7 +336,7 @@ fn template_part(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 fn template_string(vm: &mut Vm, v: Value) -> Result<Value> {
-    if !v.is_cell() || crate::vm::string_units(v).is_some() {
+    if !v.is_cell() || crate::vm::string_len(v).is_some() {
         if v.is_cell() || v.is_number() || v.is_bool() || v.is_undefined() || v.is_null() {
         } else {
             // (A symbol.)

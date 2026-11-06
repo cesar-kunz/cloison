@@ -9,7 +9,7 @@ use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, as_object, object_value};
 use crate::value::Value;
-use crate::vm::{Error, NativeFn, Result, Vm, number_to_string, string_len, string_units, wrapped};
+use crate::vm::{Error, NativeFn, Result, Vm, check_string_len, number_to_string, push_string, string_len, string_units, wrapped};
 
 /// The kinds of error objects, in `Vm::error_prototypes` order. The
 /// runtime's own errors (`Error::type_error`, …) are caught as objects of
@@ -872,7 +872,9 @@ fn this_string(vm: &mut Vm, this: Value, u: &[u16]) -> Value {
 fn string_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let mut u = this_units(this)?.into_owned();
     for &v in a {
+        check_string_len(u.len() + string_len(v).unwrap_or(0))?;
         u.extend_from_slice(&units(v));
+        check_string_len(u.len())?;
     }
     Ok(vm.new_string(&u))
 }
@@ -1089,11 +1091,11 @@ fn string_raw(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     while i < n {
         let piece = vm.get_keyed(raw, Value::number(i))?;
         let s = crate::intrinsics::to_string(vm, piece)?;
-        out.extend_from_slice(string_units(s).unwrap_or(&[]));
+        push_string(&mut out, s)?;
         i += 1.0;
         if i < n && (i as usize) < a.len() {
             let s = crate::intrinsics::to_string(vm, a[i as usize])?;
-            out.extend_from_slice(string_units(s).unwrap_or(&[]));
+            push_string(&mut out, s)?;
         }
     }
     Ok(vm.new_string(&out))
@@ -3091,6 +3093,7 @@ fn replace(vm: &mut Vm, this: Value, a: &[Value], all: bool) -> Result<Value> {
             expand(&template, &s, caps, names, &mut out);
         }
         last = y;
+        check_string_len(out.len())?;
     }
     out.extend_from_slice(&s[last..]);
     Ok(vm.new_string(&out))
@@ -3846,6 +3849,7 @@ fn rx_replace(vm: &mut Vm, r: Value, s: Value, replace: Value) -> Result<Value> 
             out.extend_from_slice(&su[next..position]);
             out.extend_from_slice(&replacement);
             next = (position + matched.len()).min(su.len());
+            check_string_len(out.len())?;
         }
     }
     out.extend_from_slice(&su[next.min(su.len())..]);

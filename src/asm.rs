@@ -474,8 +474,10 @@ pub fn parse(src: &str) -> Result<Checked, String> {
 /// instructions whose operands must hold what the front end put there
 /// (generators' `InitialYield`, `Yield` and `AsyncStart`, `PushLiteral`'s
 /// array, `DefineAccessor`'s object, `Intrinsic`'s arguments), nor the
-/// script's use of a callee or arguments; nor lazily compiled stubs, class
-/// constructors, generators or async functions (`kind` over 1).
+/// hole `LdaHole` loads, which only the front end's code keeps from
+/// reaching other instructions; nor the script's use of a callee or
+/// arguments; nor lazily compiled stubs, class constructors, generators
+/// or async functions (`kind` over 1).
 pub fn verify(m: &Module) -> Result<(), String> {
     let n = m.functions.len();
     if m.script >= n {
@@ -589,7 +591,8 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 | Op::AsyncStart
                 | Op::PushLiteral
                 | Op::DefineAccessor
-                | Op::Intrinsic => {
+                | Op::Intrinsic
+                | Op::LdaHole => {
                     return err(at, format!("{op:?} is the front end's only"));
                 }
                 // The script's frame has no callee, nor arguments.
@@ -934,12 +937,13 @@ mod tests {
         })
         .contains("another instruction's"));
         // Intrinsics take what the front end passes them (`define_field`
-        // an object).
+        // an object), and the hole is no value for other instructions.
         assert!(bad(&|f| {
             f.nregs = 4;
             f.code = vec![Op::Intrinsic as u8, 7, 1, 3, Op::Return as u8];
         })
         .contains("front end's only"));
+        assert!(bad(&|f| f.code = vec![Op::LdaHole as u8, Op::ToNumber as u8, Op::Return as u8]).contains("front end's only"));
         // Calls fill `nparams` registers: not wrapped around to fit one.
         assert!(bad(&|f| {
             f.nparams = u32::MAX;

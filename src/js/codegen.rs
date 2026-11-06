@@ -3767,7 +3767,9 @@ impl<'a> Gen<'a> {
                     self.star(r);
                     // A long one in parts: those so far joined into the
                     // first (after a string, keeping them alternate).
-                    if self.temp + 2 + SPARE_REGS > 256 {
+                    // (Not the first string alone, nor all of them, which
+                    // the last `template` joins.)
+                    if i > 0 && i < subs.len() && self.temp + 2 + SPARE_REGS > 256 {
                         self.intrinsic("template", first, (self.temp - mark) as u8);
                         self.star(first);
                         self.temp = mark + 1;

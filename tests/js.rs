@@ -12706,6 +12706,24 @@ out.join(" ");
 }
 
 #[test]
+fn short_templates_under_register_pressure() {
+    big_stack(short_templates_under_pressure);
+}
+
+fn short_templates_under_pressure() {
+    // A template of one substitution, with few registers left: one
+    // `template` intrinsic joining its pieces, as with registers to
+    // spare, not one per piece.
+    let vars: String = (0..150).map(|i| format!("var v{i} = {i};")).collect();
+    let e = (0..96).fold("`a${o.x}b`".to_string(), |e, _| format!("(o.x + {e})"));
+    let src = format!("function h(o) {{ {vars} return {e}; }}");
+    let text = cloison::asm::disassemble(&cloison::js::compile(&src).unwrap());
+    // (The only intrinsic there.)
+    assert_eq!(text.matches("Intrinsic ").count(), 1, "{text}");
+    assert_eq!(value(&format!("{src} h({{ x: 1 }})")), format!("{}a1b", "1".repeat(96)));
+}
+
+#[test]
 fn forwarded_arguments_under_register_pressure() {
     // `g.apply(x, arguments)` in a function that makes no `arguments`
     // object (it only passes them on), with few registers left: still

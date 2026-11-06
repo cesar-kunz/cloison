@@ -6552,6 +6552,21 @@ fn reg_live_in_mats(
     mats: Option<&HashMap<usize, Vec<Rc<Mat>>>>,
     bail_reads: bool,
 ) -> Vec<RegSet> {
+    reg_live_in_reads(insns, reach, nregs, frames, mats, bail_reads, None)
+}
+
+/// [`reg_live_in_mats`], with `extra[i]` read by instruction `i` too (the
+/// registers the handlers an exception there goes to read: see
+/// [`caught_regs`]).
+fn reg_live_in_reads(
+    insns: &[Insn],
+    reach: &[bool],
+    nregs: usize,
+    frames: &[FrameRegs],
+    mats: Option<&HashMap<usize, Vec<Rc<Mat>>>>,
+    bail_reads: bool,
+    extra: Option<&[RegSet]>,
+) -> Vec<RegSet> {
     let n = insns.len();
     // Per instruction, the registers it reads and those it writes, and
     // whether it bails (leaving every register of its frames live: see
@@ -6599,6 +6614,9 @@ fn reg_live_in_mats(
         for &f in ms.iter().flat_map(|m| &m.fields) {
             rs_add(&mut effects[at].0, f as usize);
         }
+    }
+    for (e, x) in effects.iter_mut().zip(extra.into_iter().flatten()) {
+        rs_or(&mut e.0, x);
     }
     live_in_blocks(insns, reach, &effects, vec![[0; 4]; n])
 }
@@ -12034,8 +12052,12 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             (i.op, i.imm, *p) = (Op::LdaSmi, k, Prop::None);
         }
     }
+    for k in 0..cx.out.frames.len() {
+        cx.pc_live(cx.out.frames[k].code);
+    }
+    let pc_live = unsafe { &(*cx.state.vm).jit_caches.pc_live };
     if !captures {
-        scalar_replace(&mut cx.out);
+        scalar_replace(&mut cx.out, pc_live);
     }
     // After scalar replacement: loads from objects it removed are no loads.
     // Innermost loops first, then out of the loops around them (`0`: no
@@ -12045,10 +12067,6 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
             break;
         }
     }
-    for k in 0..cx.out.frames.len() {
-        cx.pc_live(cx.out.frames[k].code);
-    }
-    let pc_live = unsafe { &(*cx.state.vm).jit_caches.pc_live };
     split_temps(&mut cx.out, temps_base, temps, pc_live);
     if cx.state.tier == Tier::Warm {
         return cx.out;
@@ -12312,6 +12330,11 @@ fn interp_live(
         let (mut set, mut call) = ([0; 4], [0; 4]);
         if g != 0 {
             set = local(f.parent, f.ret_pc);
+            // And an exception in the call goes to the handler around it,
+            // which `ret_pc` may be past (a call ending a `try`).
+            if let Some(h) = handler_live(out, pc_live, f.parent, f.ret_pc - 1) {
+                rs_or(&mut set, &h);
+            }
             rs_or(&mut set, &callers[f.parent]);
             if f.frame_args.is_some() {
                 call = local(f.parent, f.ret_pc - Op::Call.size());
@@ -12382,11 +12405,17 @@ pub(crate) struct Mat {
 /// register: a store `Star`s it, a load `Ldar`s it. Where it is live, an
 /// exit allocates it first (`Lowered::mats`, `materialize`), with the shape
 /// it has there, storing its fields through `Vm::store_field`, so their
-/// types stay right.
-fn scalar_replace(out: &mut Lowered) {
+/// types stay right. What a `catch` or `finally` may read counts as read
+/// where an exception goes there (`pc_live`: see [`caught_regs`]), the
+/// lowered code having no edges to them: an exit there allocates it too.
+fn scalar_replace(out: &mut Lowered, pc_live: &HashMap<*const crate::vm::Code, Rc<PcLive>>) {
     let allocs: Vec<usize> = (0..out.insns.len())
         .filter(|&a| out.insns[a].alloc != 0 && !out.insns[a].bail)
         .collect();
+    if allocs.is_empty() {
+        return;
+    }
+    let caught = caught_regs(out, pc_live);
     let mut live = None;
     for a in allocs {
         let l = live.get_or_insert_with(|| {
@@ -12397,14 +12426,18 @@ fn scalar_replace(out: &mut Lowered) {
                 .collect();
             // An object replaced already is a use of the registers of
             // its fields where an exit allocates it: one of them may hold
-            // the object this allocation makes.
-            reg_live_in_mats(
+            // the object this allocation makes. And what a handler may
+            // read is read where an exception goes there: an exit there
+            // (or before, the interpreter running into the `try`)
+            // allocates the object for it.
+            reg_live_in_reads(
                 &out.insns,
                 &reachable(&out.insns, 0),
                 out.nregs,
                 &frames,
                 Some(&out.mats),
                 true,
+                Some(&caught),
             )
         });
         if let Some(plan) = replacement(out, a, l) {
@@ -12421,6 +12454,45 @@ struct Replacement {
     rewrites: Vec<(usize, usize, bool)>,
     slots: usize,
     live: Vec<(usize, *const Shape, Vec<u8>)>,
+}
+
+/// The registers live into the handler an exception at `pc` in frame `g`
+/// of `out` goes to, if any (the innermost `try` around it), renamed.
+fn handler_live(
+    out: &Lowered,
+    pc_live: &HashMap<*const crate::vm::Code, Rc<PcLive>>,
+    g: usize,
+    pc: usize,
+) -> Option<RegSet> {
+    let f = &out.frames[g];
+    let pc = pc as u32;
+    let handlers = unsafe { &(*f.code).handlers };
+    let &(_, _, h) = handlers.iter().find(|&&(start, end, _)| start <= pc && pc < end)?;
+    Some(rs_shl(pc_live[&f.code].get(&(h as usize))?, f.base))
+}
+
+/// Per instruction of `out`, the registers the handlers an exception there
+/// goes to may read (its frame's, and its callers' around their calls), as
+/// the interpreter runs them (`pc_live`), renamed. The lowered code has no
+/// edges to them: they run after an exit.
+fn caught_regs(out: &Lowered, pc_live: &HashMap<*const crate::vm::Code, Rc<PcLive>>) -> Vec<RegSet> {
+    out.insns
+        .iter()
+        .map(|insn| {
+            let mut set = [0; 4];
+            // (In a caller: at its call's last byte, `ret_pc` being past it.)
+            let (mut g, mut pc) = (insn.frame as usize, insn.pc);
+            loop {
+                if let Some(c) = handler_live(out, pc_live, g, pc) {
+                    rs_or(&mut set, &c);
+                }
+                if g == 0 {
+                    break set;
+                }
+                (g, pc) = (out.frames[g].parent, out.frames[g].ret_pc - 1);
+            }
+        })
+        .collect()
 }
 
 fn replacement(out: &Lowered, a: usize, live: &[RegSet]) -> Option<Replacement> {

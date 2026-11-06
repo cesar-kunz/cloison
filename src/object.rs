@@ -419,11 +419,19 @@ impl Object {
     /// a flat one's, in `code`'s low half; a cons string's (`elems` null),
     /// whose `code` is its right half, none.
     ///
+    /// The marker thread sizes old strings while `vm::flatten` may be
+    /// making one flat: it publishes `elems` last (Release), `code` null by
+    /// then, so `elems` is read first (Acquire), `code` after it.
+    ///
     /// # Safety
     /// `this` must be a string.
     #[inline(always)]
     pub unsafe fn string_words(this: *const Object) -> usize {
-        unsafe { if (*this).elems.is_null() { 0 } else { (*this).code as usize as u32 as usize } }
+        use std::sync::atomic::{AtomicPtr, Ordering::Acquire};
+        unsafe {
+            let elems = (*(&raw const (*this).elems as *const AtomicPtr<Value>)).load(Acquire);
+            if elems.is_null() { 0 } else { (*this).code as usize as u32 as usize }
+        }
     }
 
     /// Set [`Object::string_words`] (and no atom).

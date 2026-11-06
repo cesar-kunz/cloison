@@ -515,8 +515,13 @@ every word of a cell is a valid value or a header at every instant (the
 mutator writes whole words, and growth writes the new array before the
 pointer to it, the pointer's store dirtying the card); an array's
 capacity is in the array, so a marker never pairs an old pointer with a
-new capacity; and every store of a cell not marked with the current
-color into an old cell dirties its card, which the final pause rescans.
+new capacity, nor a cell's size with words of another state (a cons
+string made flat drops its halves before it publishes its units' buffer
+in `elems`, with Release, which the marker reads first, with Acquire:
+the right half's address read as a length would put `END` in another
+cell; the marker aborts on an `END` past the cell's block); and every
+store of a cell not marked with the current color into an old cell
+dirties its card, which the final pause rescans.
 The marker reads cells and `Code::upvalues` (immutable once loaded) and
 writes only old cells' metadata, which the mutator writes only in
 pauses.

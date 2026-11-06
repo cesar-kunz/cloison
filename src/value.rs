@@ -56,8 +56,31 @@ impl Value {
     /// The canonical NaN, as JSC's `PNaN`.
     const CANONICAL_NAN: u64 = 0x7FF8_0000_0000_0000;
 
+    /// The value `bits` encode. Crate-internal: bits with the
+    /// [`NOT_CELL_MASK`](Self::NOT_CELL_MASK) bits clear are a heap pointer,
+    /// which the runtime dereferences unchecked.
     #[inline(always)]
-    pub const fn from_bits(bits: u64) -> Self {
+    pub(crate) const fn from_bits(bits: u64) -> Self {
+        Value(bits)
+    }
+
+    /// The value `bits` encode, for embedders round-tripping
+    /// [`to_bits`](Self::to_bits) (#71).
+    ///
+    /// # Safety
+    ///
+    /// `bits` must be the bits of a value, and if a cell, of one still
+    /// alive in the VM it is passed to.
+    ///
+    /// ```compile_fail,E0133
+    /// let v = cloison::value::Value::from_bits_unchecked(0x1000);
+    /// ```
+    ///
+    /// ```compile_fail,E0624
+    /// let v = cloison::value::Value::from_bits(0x1000);
+    /// ```
+    #[inline(always)]
+    pub const unsafe fn from_bits_unchecked(bits: u64) -> Self {
         Value(bits)
     }
 
@@ -86,9 +109,10 @@ impl Value {
     /// NaN canonicalisation. Sound because such arithmetic can only yield a
     /// NaN propagated from an input (already canonical) or the hardware
     /// default NaN (`0x7FF8…` / `0xFFF8…`), both of which encode as doubles.
-    /// Use [`from_f64`](Self::from_f64) for doubles from anywhere else.
+    /// Use [`from_f64`](Self::from_f64) for doubles from anywhere else
+    /// (crate-internal, as an impure NaN would wrap into a pointer).
     #[inline(always)]
-    pub fn from_f64_arith(d: f64) -> Self {
+    pub(crate) fn from_f64_arith(d: f64) -> Self {
         Value(d.to_bits().wrapping_add(Self::DOUBLE_ENCODE_OFFSET))
     }
 
@@ -283,8 +307,10 @@ impl NumberTag {
 
     /// Box the result of float arithmetic on boxed numbers (see
     /// [`Value::from_f64_arith`]), subtracting the tag register.
+    /// Crate-internal like `from_f64_arith`; only the stencils use it.
+    #[allow(dead_code)]
     #[inline(always)]
-    pub fn encode_f64(self, d: f64) -> Value {
+    pub(crate) fn encode_f64(self, d: f64) -> Value {
         Value::from_bits(d.to_bits().wrapping_sub(self.0))
     }
 }

@@ -8739,6 +8739,26 @@ fn a_failed_module_graph_is_loaded_again() {
     assert_eq!(run_module(&dir, "main.mjs").unwrap(), "TypeError,TypeError");
 }
 
+/// Importing what is not a regular file (a device, a FIFO, a directory)
+/// throws a TypeError (issue #67: `/dev/zero` was read until memory ran
+/// out, a FIFO without a writer blocked forever).
+#[test]
+fn modules_that_are_not_regular_files_throw() {
+    let dir = module_dir(
+        "special",
+        &[(
+            "main.mjs",
+            "var log = [];\n\
+             for (const [s, o] of [['/dev/zero', { with: { type: 'bytes' } }], ['/dev/zero'], ['./fifo'], ['.']])\n\
+               try { await import(s, o); log.push('loaded'); } catch (e) { log.push(e.name + ': ' + e.message.split(': ').pop()); }\n\
+             globalThis.result = log.join();",
+        )],
+    );
+    let fifo = std::ffi::CString::new(dir.join("fifo").to_str().unwrap()).unwrap();
+    unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+    assert_eq!(run_module(&dir, "main.mjs").unwrap(), ["TypeError: not a regular file"; 4].join(","));
+}
+
 /// An import graph deeper than the stack allows fails with a RangeError
 /// that can be caught (no native stack overflow); a deep one that fits
 /// loads.

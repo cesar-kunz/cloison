@@ -273,6 +273,26 @@ fn resolve_path(referrer: &str, specifier: &str) -> String {
     }
 }
 
+/// The bytes of the regular file at `path`, at most a string's length
+/// of them: a device or a pipe is refused (`/dev/zero` read until memory
+/// ran out, a FIFO blocked), opened without blocking, and a file growing
+/// as it is read is cut off.
+fn read_file(path: &str) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    let max = crate::vm::MAX_STRING_LEN as u64;
+    let mut bytes = Vec::new();
+    f.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(Error::new(ErrorKind::FileTooLarge, "file too large"));
+    }
+    Ok(bytes)
+}
+
 /// A RangeError if the thread's stack is nearly out: a module graph's
 /// walks recurse as deep as its imports go. (The thread's own end, not
 /// the run's budget for compiled calls, `Vm::native_limit`: a graph a few
@@ -298,7 +318,7 @@ fn load(vm: &mut Vm, path: &str, kind: Kind) -> Result<usize> {
     let bytes = if kind == Kind::HostSource {
         Vec::new()
     } else {
-        std::fs::read(path).map_err(|e| Error::type_error(format!("Cannot load module '{path}': {e}")))?
+        read_file(path).map_err(|e| Error::type_error(format!("Cannot load module '{path}': {e}")))?
     };
     let m = vm.modules.records.len();
     let mut info = ModuleInfo::default();

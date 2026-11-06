@@ -13,7 +13,7 @@ pub mod parse;
 
 use std::rc::Rc;
 
-use crate::asm::{LazyFn, Module};
+use crate::asm::{Checked, LazyFn, Module};
 
 /// An error at a byte offset of the source.
 #[derive(Debug)]
@@ -53,11 +53,13 @@ pub fn is_one_function(src: &str) -> bool {
 }
 
 /// Compile `src`, a script, to a module; errors are `line:column: message`.
-pub fn compile(src: &str) -> Result<Module, String> {
+pub fn compile(src: &str) -> Result<Checked, String> {
     let arena = ast::Arenas::default();
     parse::parse_source(src, &arena, false)
         .and_then(|p| codegen::generate(&p, src))
         .map_err(|e| e.display(src))
+        // SAFETY: the front end's code is right by construction.
+        .map(|m| unsafe { Checked::new_unchecked(m) })
 }
 
 /// Module `src`'s requests, imports and exports (module `id`'s); errors

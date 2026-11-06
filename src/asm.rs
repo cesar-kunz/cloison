@@ -188,8 +188,49 @@ pub struct Module {
     pub lexical: Vec<String>,
 }
 
+/// A module safe to run, which [`crate::vm::Vm::run`] takes:
+/// `js::compile`'s (right by construction), `asm::parse`'s, or one
+/// [`verify`] accepted. It derefs to the module read-only, so code
+/// edited after the check can't be run without checking it again.
+///
+/// ```compile_fail,E0596
+/// let mut m = cloison::js::compile("'a' + 'b'").unwrap();
+/// m.functions[m.script].constants.clear();
+/// ```
+#[derive(Clone, Debug)]
+pub struct Checked(Module);
+
+impl Checked {
+    /// `m`, if [`verify`] accepts it.
+    pub fn new(m: Module) -> Result<Checked, String> {
+        verify(&m)?;
+        Ok(Checked(m))
+    }
+
+    /// `m`, unchecked.
+    ///
+    /// # Safety
+    /// `m` must be safe to run as `verify` describes, as `js::compile`'s
+    /// modules are.
+    pub unsafe fn new_unchecked(m: Module) -> Checked {
+        Checked(m)
+    }
+
+    /// The module, to edit (and check again).
+    pub fn into_inner(self) -> Module {
+        self.0
+    }
+}
+
+impl std::ops::Deref for Checked {
+    type Target = Module;
+    fn deref(&self) -> &Module {
+        &self.0
+    }
+}
+
 /// Assemble a module from its text form.
-pub fn parse(src: &str) -> Result<Module, String> {
+pub fn parse(src: &str) -> Result<Checked, String> {
     // Pass 1: find the blocks, so `CreateClosure` can name functions
     // defined further down.
     struct Block<'a> {
@@ -416,8 +457,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
         declared: Vec::new(),
         function_names: Vec::new(),
     };
-    verify(&module)?;
-    Ok(module)
+    Checked::new(module)
 }
 
 /// Check that `m` is bytecode the interpreter can run safely, which it
@@ -427,7 +467,7 @@ pub fn parse(src: &str) -> Result<Module, String> {
 /// windows too) within the frame, and table indices within their tables.
 /// A module from `js::compile` is right by construction; one made any
 /// other way (the text format, or [`Module`] built directly) must pass
-/// this before `Vm::run`.
+/// this to be run (see [`Checked`]).
 ///
 /// Only bytecode whose safety this can see is accepted: not the
 /// instructions whose operands must hold what the front end put there
@@ -826,7 +866,7 @@ mod tests {
     /// of its frame or its tables with.
     #[test]
     fn verify_rejects_unsafe_bytecode() {
-        let ok = parse("script\n  LdaSmi 1\n  Return\nend\n").unwrap();
+        let ok = parse("script\n  LdaSmi 1\n  Return\nend\n").unwrap().into_inner();
         let bad = |edit: &dyn Fn(&mut FunctionDef)| {
             let mut m = ok.clone();
             edit(&mut m.functions[0]);
@@ -856,5 +896,15 @@ mod tests {
         .contains("upvalue 0 out of range"));
         assert!(bad(&|f| f.kind = 4).contains("generator"));
         assert!(bad(&|f| f.handlers.push((0, 6, 3))).contains("handler"));
+    }
+    /// A compiled module edited is checked again before it can be run
+    /// (it couldn't be edited in place: [`Checked`] derefs read-only).
+    #[test]
+    fn edited_modules_are_checked_again() {
+        let mut m = crate::js::compile("'a' + 'b'").unwrap().into_inner();
+        let s = m.script;
+        assert!(Checked::new(m.clone()).is_ok());
+        m.functions[s].constants.clear();
+        assert!(Checked::new(m).unwrap_err().contains("constant 0 out of range"));
     }
 }

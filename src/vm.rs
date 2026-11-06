@@ -5691,6 +5691,15 @@ impl Vm {
         unsafe { std::ptr::read_volatile(&raw const self.conv_thrown) }
     }
 
+    /// What a conversion threw, dropped: its operation is redone (see
+    /// `conv_redo`), whose conversions run again in order. (What one after
+    /// the conversion asking for the redo threw may not be thrown: the
+    /// redone one may throw first, or write what the other reads.)
+    pub(crate) fn drop_conv_error(&mut self) {
+        self.conv_thrown = false;
+        self.conv_error = None;
+    }
+
     /// What a conversion threw (see `conv_error`), taken.
     #[cold]
     #[inline(never)]

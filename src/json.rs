@@ -162,7 +162,13 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     if is_raw_json(v) {
         let a_raw = vm.intern_name("rawJSON");
         let raw = vm.get(v, a_raw)?;
+        // (Past the longest string: thrown before a long text is read.)
+        check_string_len(out.len() + string_len(raw).unwrap_or(0))?;
         out.extend_from_slice(&to_string_units(raw));
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
+        check_string_len(out.len())?;
         return Ok(true);
     }
     let push = |out: &mut Vec<u16>, s: &str| out.extend(s.encode_utf16());
@@ -176,10 +182,9 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     }
     if let Some(n) = string_len(v) {
         // (Past the longest string: thrown before a long string's units are
-        // read, or once its escapes are.)
+        // read.)
         check_string_len(out.len() + n + 2)?;
-        quote(string_units(v).unwrap(), out);
-        check_string_len(out.len())?;
+        quote(string_units(v).unwrap(), out)?;
         return Ok(true);
     }
     if let Some(d) = v.as_number() {
@@ -203,9 +208,12 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     let array = crate::proxy::is_array(vm, v)?;
     let mut parts: Vec<Vec<u16>> = Vec::new();
     // The units `out` gets: its brackets, `parts` and a separator between
-    // each two (with a gap, at least: its newlines and indentation are
-    // checked once they are written).
-    let mut held = out.len() + 2;
+    // each two (with a gap, `,` a newline and the indentation), and with a
+    // gap and parts, a newline and indentation after `[` and before `]`:
+    // checked before they are written.
+    let sep_len = if st.gap.is_empty() { 1 } else { 2 + st.indent.len() };
+    let wrap = if st.gap.is_empty() { 0 } else { 2 + st.indent.len() + stepback.len() };
+    let mut held = out.len() + 2 + wrap;
     if array {
         let len = vm.length_of(v)?;
         let mut i = 0.0;
@@ -216,7 +224,7 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
             if !property(vm, st, ks, v, &mut part)? {
                 part = "null".encode_utf16().collect();
             }
-            held += part.len() + usize::from(!parts.is_empty());
+            held += part.len() + if parts.is_empty() { 0 } else { sep_len };
             check_string_len(held)?;
             parts.push(part);
             i += 1.0;
@@ -247,13 +255,13 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         };
         for k in keys {
             let mut part = Vec::new();
-            quote(string_units(k).unwrap(), &mut part);
+            quote(string_units(k).unwrap(), &mut part)?;
             part.push(b':' as u16);
             if !st.gap.is_empty() {
                 part.push(b' ' as u16);
             }
             if property(vm, st, k, v, &mut part)? {
-                held += part.len() + usize::from(!parts.is_empty());
+                held += part.len() + if parts.is_empty() { 0 } else { sep_len };
                 check_string_len(held)?;
                 parts.push(part);
             }
@@ -285,15 +293,19 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         }
     }
     out.push(close as u16);
-    // (With a gap, each separator's indentation too.)
-    check_string_len(out.len())?;
+    debug_assert!(out.len() <= held && out.len() <= crate::vm::MAX_STRING_LEN);
     st.stack.pop();
     st.indent = stepback;
     Ok(true)
 }
 
-/// QuoteJSONString.
-fn quote(u: &[u16], out: &mut Vec<u16>) {
+/// QuoteJSONString; a RangeError past the longest string (an escape is
+/// up to 6 units of one: the escaped length counted first if it could
+/// be past, before anything is written).
+fn quote(u: &[u16], out: &mut Vec<u16>) -> Result<()> {
+    if out.len() + 6 * u.len() + 2 > crate::vm::MAX_STRING_LEN {
+        check_string_len(out.len() + quoted_len(u))?;
+    }
     out.push(b'"' as u16);
     let mut i = 0;
     while i < u.len() {
@@ -323,6 +335,28 @@ fn quote(u: &[u16], out: &mut Vec<u16>) {
         i += 1;
     }
     out.push(b'"' as u16);
+    Ok(())
+}
+
+/// The units [`quote`] writes for `u`.
+fn quoted_len(u: &[u16]) -> usize {
+    let mut n = 2;
+    let mut i = 0;
+    while i < u.len() {
+        let c = u[i];
+        n += match c {
+            0x22 | 0x5C | 0x08 | 0x0C | 0x0A | 0x0D | 0x09 => 2,
+            _ if c < 0x20 => 6,
+            0xD800..0xDC00 if i + 1 < u.len() && (0xDC00..0xE000).contains(&u[i + 1]) => {
+                i += 1;
+                2
+            }
+            0xD800..0xE000 => 6,
+            _ => 1,
+        };
+        i += 1;
+    }
+    n
 }
 
 /// `JSON.parse(text, reviver)`.

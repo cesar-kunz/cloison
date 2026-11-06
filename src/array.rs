@@ -374,7 +374,9 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
             }
             i += 1.0;
         }
-        Ok(vm.new_string(&out))
+        // (Past the longest string by the separators after the last
+        // element: holes, `undefined`s.)
+        vm.try_new_string(&out)
     })
 }
 
@@ -425,7 +427,7 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> R
             }
             i += 1.0;
         }
-        Ok(vm.new_string(&out))
+        vm.try_new_string(&out)
     })
 }
 

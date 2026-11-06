@@ -133,13 +133,13 @@ fn main() -> ExitCode {
     let uncaught = result.as_ref().err().map(|e| vm.uncaught_message(e));
     // `CLOISON_GC_VERIFY`: walk the heap, checking every cell (see `heap`).
     if std::env::var_os("CLOISON_GC_VERIFY").is_some() {
-        let cells = vm.heap.verify();
-        eprintln!("heap: {cells} cells, {} MiB of blocks", vm.heap.allocated() >> 20);
+        let cells = vm.verify_heap();
+        eprintln!("heap: {cells} cells, {} MiB of blocks", vm.heap_allocated() >> 20);
     }
     let mem = vm.memory_stats();
     let jit = if std::env::var_os("CLOISON_SIZES").is_some() { cloison::jit::census(&vm) } else { Default::default() };
     // (What the heap holds at the end counts for its peak too.)
-    cloison::gc::HEAP_PEAK.fetch_max(vm.heap.allocated() as u64, std::sync::atomic::Ordering::Relaxed);
+    cloison::gc::HEAP_PEAK.fetch_max(vm.heap_allocated() as u64, std::sync::atomic::Ordering::Relaxed);
     // The process exits next: freeing the VM's shapes and code one by one
     // would only cost time (about 100k instructions).
     std::mem::forget(vm);

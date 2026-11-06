@@ -27,7 +27,7 @@ fn run(src: &str) -> Result<String, String> {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         let r = vm.run(&module).map(display).map_err(|e| e.to_string());
-        vm.heap.verify();
+        vm.verify_heap();
         match &result {
             None => result = Some(r),
             Some(first) => assert_eq!(first, &r, "tier at {budget}:\n{src}"),
@@ -58,8 +58,8 @@ fn light_value(src: &str) -> String {
         let mut vm = Vm::new();
         vm.set_tier_back_edges(budget);
         let r = vm.run(&module).map(display).unwrap_or_else(|e| panic!("{e}\n{src}"));
-        vm.heap.verify();
-        let used = vm.heap.allocated();
+        vm.verify_heap();
+        let used = vm.heap_allocated();
         assert!(used < 256 << 20, "{used} bytes of heap at the end, tier at {budget}:\n{src}");
         match &result {
             None => result = Some(r),
@@ -308,7 +308,7 @@ p.then(() => { globalThis.out = log.join(" "); });
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
     let a = vm.intern("out");
-    let g = cloison::object::object_value(vm.global);
+    let g = vm.global_object();
     assert_eq!(display(vm.get(g, a).unwrap()), "0 s1 caught 1 2 3 T 4 5 end 6 7");
 }
 
@@ -4652,7 +4652,7 @@ var log = [];
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
     let a = vm.intern("out");
-    let g = cloison::object::object_value(vm.global);
+    let g = vm.global_object();
     assert_eq!(display(vm.get(g, a).unwrap()), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
 }
 
@@ -4723,7 +4723,7 @@ Promise.all([g(), new C().m({ s: 1 })]).then(async v => { for await (const x of 
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
     let a = vm.intern("out");
-    let g = cloison::object::object_value(vm.global);
+    let g = vm.global_object();
     assert_eq!(display(vm.get(g, a).unwrap()), "5 2 7 function,function");
 }
 
@@ -6545,7 +6545,7 @@ log.push("sync");
         vm.set_tier_back_edges(budget);
         vm.run(&first).unwrap();
         let r = vm.run(&second).map(display).unwrap();
-        vm.heap.verify();
+        vm.verify_heap();
         assert_eq!(
             r,
             "exec true sync a1 bx d3 thenable 1 2 selftrue c7 eboom g9 racer \
@@ -6586,7 +6586,7 @@ sum;
         vm.set_code_room(64 << 10);
         let r = vm.run(&module).map(display).map_err(|e| e.to_string());
         assert_eq!(r, Ok("13626000".to_string()), "tier at {budget}");
-        vm.heap.verify();
+        vm.verify_heap();
         if budget == i64::MAX {
             assert!(vm.code_count() < 2000, "{} codes", vm.code_count());
         }
@@ -6621,7 +6621,7 @@ ok;
         vm.set_gc_verify(64 << 10);
         let r = vm.run(&module).map(display).map_err(|e| e.to_string());
         assert_eq!(r, Ok("47616".to_string()), "tier at {budget}");
-        vm.heap.verify();
+        vm.verify_heap();
     }
 }
 
@@ -7754,7 +7754,7 @@ ok + ":" + steps;
     let mut vm = Vm::new();
     let r = vm.run(&module).map(display).map_err(|e| e.to_string());
     assert_eq!(r, Ok("true:49".to_string()));
-    vm.heap.verify();
+    vm.verify_heap();
     assert!(vm.weak_entry_count() < 100000, "{} weak entries", vm.weak_entry_count());
 }
 
@@ -7788,7 +7788,7 @@ outer.get(key).get(k2).payload + " " + bad;
     let mut vm = Vm::new();
     let r = vm.run(&module).map(display).map_err(|e| e.to_string());
     assert_eq!(r, Ok("mine 0".to_string()));
-    vm.heap.verify();
+    vm.verify_heap();
 }
 
 /// A `WeakRef`'s target stays through the job that made (or dereferenced)
@@ -8688,7 +8688,7 @@ function C() {}
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
     let a = vm.intern("out");
-    let g = cloison::object::object_value(vm.global);
+    let g = vm.global_object();
     assert_eq!(display(vm.get(g, a).unwrap()), "1,2 10,21 a,b true 1 SyntaxError 1 TypeError");
 }
 
@@ -8938,7 +8938,7 @@ out.push([...g()].join("/"));
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
     let a = vm.intern("result");
-    let g = cloison::object::object_value(vm.global);
+    let g = vm.global_object();
     assert_eq!(display(vm.get(g, a).unwrap()), "5/6,2,2");
 }
 
@@ -8975,7 +8975,7 @@ log.push(e.error, e.suppressed, e.message, e instanceof Error);
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
     let a = vm.intern("result");
-    let g = cloison::object::object_value(vm.global);
+    let g = vm.global_object();
     assert_eq!(
         display(vm.get(g, a).unwrap()),
         "true,false,defer,adopt 7,use,true,SuppressedError,TypeError,RangeError,0,TypeError,ReferenceError,async,1,2,m,true,sync in async,true"
@@ -9041,7 +9041,7 @@ log.push(eval("4; { using c = null; }"));
     let mut vm = Vm::new();
     vm.run(&module).unwrap();
     let a = vm.intern("result");
-    let g = cloison::object::object_value(vm.global);
+    let g = vm.global_object();
     assert_eq!(
         display(vm.get(g, a).unwrap()),
         "body | dispose b | dispose a | dispose x | ret | dispose y | SuppressedError:y/TypeError | iter | dispose z1 | \
@@ -9065,11 +9065,11 @@ fn module_dir(test: &str, files: &[(&str, &str)]) -> PathBuf {
 fn run_module(dir: &Path, main: &str) -> Result<String, String> {
     let mut vm = Vm::new();
     let r = vm.run_module(dir.join(main).to_str().unwrap());
-    vm.heap.verify();
+    vm.verify_heap();
     match r {
         Ok(()) => {
             let a = vm.intern("result");
-            let g = cloison::object::object_value(vm.global);
+            let g = vm.global_object();
             Ok(display(vm.get(g, a).unwrap()))
         }
         Err(cloison::vm::ModuleError::Early(m)) => Err(format!("early: {m}")),
@@ -11796,7 +11796,7 @@ out.join(" ");
         vm.set_gc_verify(64 << 10);
         let r = vm.run(&module).map(display).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok(want), "tier at {budget}");
-        vm.heap.verify();
+        vm.verify_heap();
     }
 }
 
@@ -12349,7 +12349,7 @@ main();
         vm.run(&module).unwrap();
         let r = vm.run(&report).map(display).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("38160000 30835860 true"), "tier at {budget}");
-        vm.heap.verify();
+        vm.verify_heap();
         let kept = vm.code_count() - natives;
         assert!(kept < 100, "{kept} codes kept (tier at {budget})");
     }
@@ -12397,7 +12397,7 @@ main();
         vm.run(&module).unwrap();
         let r = vm.run(&report).map(display).map_err(|e| e.to_string());
         assert_eq!(r.as_deref(), Ok("true true true"), "tier at {budget}");
-        vm.heap.verify();
+        vm.verify_heap();
     }
 }
 
@@ -12717,7 +12717,7 @@ for (var r = 0; r < 4; r++) {
         let a = vm.intern("held_outside_the_vm");
         vm.run(&module).unwrap();
         assert_eq!(vm.atom_name(a), "held_outside_the_vm", "poison {poison}");
-        let g = cloison::object::object_value(vm.global);
+        let g = vm.global_object();
         vm.set(g, a, cloison::value::Value::from_i32(7)).unwrap();
         assert_eq!(vm.run(&read).map(display).map_err(|e| e.to_string()).as_deref(), Ok("7"), "poison {poison}");
     }

@@ -1405,8 +1405,10 @@ pub fn as_object(v: Value) -> *mut Object {
     v.to_bits() as *mut Object
 }
 
+/// The object `o` as a value. Crate-internal: a cell value is trusted to
+/// be one (#71); a host gets the VM's objects as values (`Vm::global_object`).
 #[inline(always)]
-pub fn object_value(o: *mut Object) -> Value {
+pub(crate) fn object_value(o: *mut Object) -> Value {
     Value::from_bits(o as u64)
 }
 

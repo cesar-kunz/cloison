@@ -521,8 +521,7 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
         let obj = as_object(o);
         unsafe {
             let n = (*obj).elems_len as usize;
-            let e = std::slice::from_raw_parts_mut((*obj).elems, n);
-            e.reverse();
+            Object::elems_mut(obj).reverse();
             // (Every slot may now hold what was elsewhere: barriered.)
             for i in 0..n {
                 let v = *(*obj).elems.add(i);

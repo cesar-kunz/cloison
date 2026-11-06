@@ -4388,8 +4388,15 @@ impl Heap {
                     continue;
                 }
                 if poison {
+                    // (From the metadata to the cells: one the final pause
+                    // moved out of the region is gone, its bytes poisoned,
+                    // which read as a cell of another size.)
                     let mut p = s;
                     while p < e {
+                        if *self.meta(p) & (YOUNG | COLOR) == 0 {
+                            p += GRANULE;
+                            continue;
+                        }
                         let n = cell_size(p as *const u8);
                         if *self.meta(p) == YOUNG {
                             *self.meta(p) = 0;

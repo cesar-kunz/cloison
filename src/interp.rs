@@ -258,6 +258,23 @@ macro_rules! handlers {
             macro_rules! then {
                 ($f:expr, $o:expr, $a:expr) => { become $f($pc.add($o), $a, $regs, $tag, tbl, ti32) };
             }
+            // The fast path of a `bytecode::PAIRS` superinstruction whose
+            // first instruction is `$o` bytes long and second a `Star r`:
+            // `r` written too, and the `Star` skipped.
+            macro_rules! star {
+                ($o:expr, $v:expr) => {{
+                    let v: Value = $v;
+                    *reg($pc, $o + 1, $regs) = v;
+                    next!(any, $o + Op::Star.size(), v)
+                }};
+            }
+            macro_rules! star_int {
+                ($o:expr, $i:expr) => {{
+                    let i: i32 = $i;
+                    *reg($pc, $o + 1, $regs) = $tag.box_i32(i);
+                    next_int!($o + Op::Star.size(), i)
+                }};
+            }
             // Dispatch to `p` in ANY with register file `r` (calls, returns).
             macro_rules! jump_to {
                 ($p:expr, $a:expr, $r:expr) => { dispatch!(tbl, $p, 0, $a, $r, $tag, tbl, ti32) };
@@ -2613,6 +2630,181 @@ shift_smi!(
     |a, k| { i32::try_from(a as u32 >> k).ok() }
 );
 
+// ---- `bytecode::PAIRS` ----
+
+/// `Op r; Star s` for an `arith_reg` operator: its fast paths with `star!`.
+macro_rules! arith_reg_star {
+    ($op:ident, $any:ident, $i32:ident, $slow:ident, $int:path) => {
+        handlers! {
+            fn $any(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if tag.both_int32(lhs, acc)
+                    && let Some(v) = $int(lhs.as_i32_unchecked(), acc.as_i32_unchecked())
+                {
+                    star_int!(Op::$op.size(), v)
+                }
+                tail!($slow, acc)
+            }
+
+            fn $i32(pc, acc, regs, tag) {
+                let lhs = *reg(pc, 1, regs);
+                if tag.is_int32(lhs)
+                    && let Some(v) = $int(lhs.as_i32_unchecked(), raw_i32(acc))
+                {
+                    star_int!(Op::$op.size(), v)
+                }
+                tail!($slow, tag.rebox(acc))
+            }
+        }
+    };
+}
+
+arith_reg_star!(Sub, op_sub_star, i32_sub_star, slow_sub, i32::checked_sub);
+arith_reg_star!(Mul, op_mul_star, i32_mul_star, slow_mul, int_mul);
+
+/// `Star r; Op …`: the `Star`, then `Op`'s handler (`$then`, an ANY one).
+macro_rules! star_then {
+    ($any:ident, $i32:ident, $then:ident) => {
+        handlers! {
+            fn $any(pc, acc, regs, tag) {
+                *reg(pc, 1, regs) = acc;
+                then!($then, Op::Star.size(), acc)
+            }
+
+            fn $i32(pc, acc, regs, tag) {
+                let acc = tag.rebox(acc);
+                *reg(pc, 1, regs) = acc;
+                then!($then, Op::Star.size(), acc)
+            }
+        }
+    };
+}
+
+star_then!(op_star_lda_upvalue, i32_star_lda_upvalue, op_lda_upvalue);
+star_then!(op_star_lda_global, i32_star_lda_global, op_lda_global);
+star_then!(op_star_lda_smi, i32_star_lda_smi, op_lda_smi);
+star_then!(op_star_mov, i32_star_mov, op_mov);
+star_then!(op_star_call, i32_star_call, op_call);
+
+/// `Ldar r; Op …`: the `Ldar`, then `Op`'s handler (`$then`, an ANY one).
+/// In both states: the `Ldar` replaces `acc`.
+macro_rules! ldar_then {
+    ($name:ident, $then:ident) => {
+        handlers! {
+            fn $name(pc, acc, regs, tag) {
+                acc = *reg(pc, 1, regs);
+                then!($then, Op::Ldar.size(), acc)
+            }
+        }
+    };
+}
+
+ldar_then!(op_ldar_get_keyed, op_get_keyed);
+ldar_then!(op_ldar_set_named, op_set_named);
+ldar_then!(op_ldar_add, op_add);
+ldar_then!(op_ldar_mul, op_mul);
+ldar_then!(op_ldar_add_smi, op_add_smi);
+ldar_then!(op_ldar_sar_smi, op_sar_smi);
+ldar_then!(op_ldar_return, op_return);
+
+handlers! {
+    fn op_lda_undefined_return(pc, acc, regs, tag) {
+        then!(op_return, Op::LdaUndefined.size(), Value::UNDEFINED)
+    }
+
+    fn op_add_star(pc, acc, regs, tag) {
+        let rhs = *reg(pc, 1, regs);
+        if tag.both_int32(acc, rhs)
+            && let Some(sum) = acc.as_i32_unchecked().checked_add(rhs.as_i32_unchecked())
+        {
+            star_int!(Op::Add.size(), sum)
+        }
+        tail!(slow_add, acc)
+    }
+
+    // As `i32_add`: on overflow, `acc` recovered as `wrapped - operand`.
+    fn i32_add_star(pc, acc, regs, tag) {
+        let rhs = *reg(pc, 1, regs);
+        if !tag.is_int32(rhs) {
+            tail!(slow_add, tag.rebox(acc))
+        }
+        let (sum, overflow) = raw_i32(acc).overflowing_add(rhs.as_i32_unchecked());
+        if overflow {
+            let acc = unboxed(sum.wrapping_sub(rhs.as_i32_unchecked()));
+            tail!(slow_add, tag.rebox(acc))
+        }
+        star_int!(Op::Add.size(), sum)
+    }
+
+    fn op_bit_or_smi_star(pc, acc, regs, tag) {
+        if tag.is_int32(acc) {
+            star_int!(Op::BitOrSmi.size(), acc.as_i32_unchecked() | imm32(pc, 1))
+        }
+        tail!(slow_bit_or_smi, acc)
+    }
+
+    fn i32_bit_or_smi_star(pc, acc, regs, tag) {
+        star_int!(Op::BitOrSmi.size(), raw_i32(acc) | imm32(pc, 1))
+    }
+
+    fn op_sar_smi_star(pc, acc, regs, tag) {
+        if tag.is_int32(acc) {
+            star_int!(Op::ShiftRightSmi.size(), acc.as_i32_unchecked() >> (imm32(pc, 1) as u32 & 31))
+        }
+        tail!(slow_sar_smi, acc)
+    }
+
+    fn i32_sar_smi_star(pc, acc, regs, tag) {
+        star_int!(Op::ShiftRightSmi.size(), raw_i32(acc) >> (imm32(pc, 1) as u32 & 31))
+    }
+
+    fn op_get_keyed_star(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) && tag.is_int32(acc) {
+            let o = as_object(obj);
+            let i = acc.as_i32_unchecked() as u32;
+            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
+                let v = *(*o).elems.add(i as usize);
+                if v != Value::EMPTY {
+                    star!(Op::GetKeyed.size(), v)
+                }
+            }
+        }
+        tail!(slow_get_keyed, acc)
+    }
+
+    fn i32_get_keyed_star(pc, acc, regs, tag) {
+        let obj = *reg(pc, 1, regs);
+        if is_cell(tag, obj) {
+            let o = as_object(obj);
+            let i = raw_i32(acc) as u32;
+            if (*o).shape == (*ic_at(regs, pc, 2)).shape && i < (*o).elems_len {
+                let v = *(*o).elems.add(i as usize);
+                if v != Value::EMPTY {
+                    star!(Op::GetKeyed.size(), v)
+                }
+            }
+        }
+        tail!(slow_get_keyed, tag.rebox(acc))
+    }
+
+    // Loads ignore `acc`: also the I32 entries.
+    fn op_lda_global_star(pc, acc, regs, tag) {
+        let g = (*frame_vm(regs)).global;
+        let ic = ic_at(regs, pc, 1);
+        if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
+            star!(Op::LdaGlobal.size(), *Object::slot(g, (*ic).loc))
+        }
+        tail!(slow_lda_global, acc)
+    }
+
+    fn op_lda_upvalue_star(pc, acc, regs, tag) {
+        let f: *const crate::object::Object = header(regs, FUNC);
+        let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
+        star!(Op::LdaUpvalue.size(), *(*u).at)
+    }
+}
+
 /// A relational test `r OP acc` (`$le` picks `<=`; `$swap` compares `acc OP
 /// r`, so `>` is `acc < r` and `>=` is `acc <= r`), its fused forms with
 /// the following `JumpIfTrue` / `JumpIfFalse`, all in both states.
@@ -3813,6 +4005,27 @@ static TABLE: Table = {
     t[Op::StarGetNamed as usize] = op_star_get_named;
     t[Op::StarGetNamedStar as usize] = op_star_get_named_star;
     t[Op::StarLdarDecStar as usize] = op_star_ldar_dec_star;
+    t[Op::AddStar as usize] = op_add_star;
+    t[Op::SubStar as usize] = op_sub_star;
+    t[Op::MulStar as usize] = op_mul_star;
+    t[Op::BitOrSmiStar as usize] = op_bit_or_smi_star;
+    t[Op::ShiftRightSmiStar as usize] = op_sar_smi_star;
+    t[Op::GetKeyedStar as usize] = op_get_keyed_star;
+    t[Op::LdaGlobalStar as usize] = op_lda_global_star;
+    t[Op::LdaUpvalueStar as usize] = op_lda_upvalue_star;
+    t[Op::StarLdaUpvalue as usize] = op_star_lda_upvalue;
+    t[Op::StarLdaGlobal as usize] = op_star_lda_global;
+    t[Op::StarLdaSmi as usize] = op_star_lda_smi;
+    t[Op::StarMov as usize] = op_star_mov;
+    t[Op::StarCall as usize] = op_star_call;
+    t[Op::LdarGetKeyed as usize] = op_ldar_get_keyed;
+    t[Op::LdarSetNamed as usize] = op_ldar_set_named;
+    t[Op::LdarAdd as usize] = op_ldar_add;
+    t[Op::LdarMul as usize] = op_ldar_mul;
+    t[Op::LdarAddSmi as usize] = op_ldar_add_smi;
+    t[Op::LdarShiftRightSmi as usize] = op_ldar_sar_smi;
+    t[Op::LdarReturn as usize] = op_ldar_return;
+    t[Op::LdaUndefinedReturn as usize] = op_lda_undefined_return;
     t[Op::Add as usize] = op_add;
     t[Op::Inc as usize] = op_inc;
     t[Op::Dec as usize] = op_dec;
@@ -3963,6 +4176,27 @@ static TABLE_I32: Table = {
     t[Op::StarGetNamed as usize] = i32_star_get_named;
     t[Op::StarGetNamedStar as usize] = i32_star_get_named_star;
     t[Op::StarLdarDecStar as usize] = i32_star_ldar_dec_star;
+    t[Op::AddStar as usize] = i32_add_star;
+    t[Op::SubStar as usize] = i32_sub_star;
+    t[Op::MulStar as usize] = i32_mul_star;
+    t[Op::BitOrSmiStar as usize] = i32_bit_or_smi_star;
+    t[Op::ShiftRightSmiStar as usize] = i32_sar_smi_star;
+    t[Op::GetKeyedStar as usize] = i32_get_keyed_star;
+    t[Op::LdaGlobalStar as usize] = op_lda_global_star;
+    t[Op::LdaUpvalueStar as usize] = op_lda_upvalue_star;
+    t[Op::StarLdaUpvalue as usize] = i32_star_lda_upvalue;
+    t[Op::StarLdaGlobal as usize] = i32_star_lda_global;
+    t[Op::StarLdaSmi as usize] = i32_star_lda_smi;
+    t[Op::StarMov as usize] = i32_star_mov;
+    t[Op::StarCall as usize] = i32_star_call;
+    t[Op::LdarGetKeyed as usize] = op_ldar_get_keyed;
+    t[Op::LdarSetNamed as usize] = op_ldar_set_named;
+    t[Op::LdarAdd as usize] = op_ldar_add;
+    t[Op::LdarMul as usize] = op_ldar_mul;
+    t[Op::LdarAddSmi as usize] = op_ldar_add_smi;
+    t[Op::LdarShiftRightSmi as usize] = op_ldar_sar_smi;
+    t[Op::LdarReturn as usize] = op_ldar_return;
+    t[Op::LdaUndefinedReturn as usize] = op_lda_undefined_return;
     t[Op::Add as usize] = i32_add;
     t[Op::Inc as usize] = i32_inc;
     t[Op::Dec as usize] = i32_dec;

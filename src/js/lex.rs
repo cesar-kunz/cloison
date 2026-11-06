@@ -229,6 +229,13 @@ fn puncts(c: u8) -> &'static [(u32, u32, &'static str)] {
     by_first.get(c as usize).map_or(&[], |v| v.as_slice())
 }
 
+/// Whether string `s` (a literal's value, a template's) is past the
+/// longest string's code units: only a source past them has one (not
+/// `eval`'s, a string's), so its string constant can't be made.
+fn too_long(s: &str) -> bool {
+    s.len() > crate::vm::MAX_STRING_LEN && s.encode_utf16().count() > crate::vm::MAX_STRING_LEN
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
     lex_as(src, false)
 }
@@ -329,12 +336,18 @@ pub fn lex_as(src: &str, module: bool) -> Result<Vec<Token>, Error> {
                 // (Escapes in it: then not a directive, `"use strict"`.)
                 escaped = src[i..i + n].contains('\\');
                 i += n;
+                if too_long(&s) {
+                    return Err(err("Invalid string length"));
+                }
                 Tok::Str(s.into())
             } else if c == b'`' || (c == b'}' && braces.last() == Some(&2)) {
                 if c == b'}' {
                     braces.pop();
                 }
                 let (mut part, n) = template(&src[i + 1..]).ok_or_else(|| err("unterminated template literal"))?;
+                if part.cooked.as_deref().is_some_and(too_long) || too_long(&part.raw) {
+                    return Err(err("Invalid string length"));
+                }
                 part.head = c == b'`';
                 i += 1 + n;
                 if !part.tail {

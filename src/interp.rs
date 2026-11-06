@@ -317,7 +317,11 @@ macro_rules! handlers {
                         $e
                     } else {
                     (*vm).conv_redo = false;
+                    // (Redone if a conversion asks: what it runs, run
+                    // again, only reads. See `Vm::conv_replays`.)
+                    let outer = std::mem::replace(&mut (*vm).conv_replays, (*vm).native_top.is_null());
                     let mut v = $e;
+                    (*vm).conv_replays = outer;
                     if (*vm).conv_redo {
                         (*vm).conv_redo = false;
                         (*vm).drop_conv_error();
@@ -3724,10 +3728,10 @@ const DEFAULT: u8 = 2;
 /// A bytecode one is called where something can call it (`native_top`
 /// set: a native, an interpreter slow path in `conv!`); elsewhere (compiled
 /// code's runtime calls) it is skipped and `Vm::conv_redo` set, for the
-/// operation to be redone where it can. There, it runs only natives that
-/// read (`Vm::conv_replays`): what it ran is run again. Conversions can't
-/// fail: what one throws is left in `Vm::conv_error` for the operation to
-/// throw.
+/// operation to be redone where it can. In an operation that is redone
+/// then (`Vm::conv_replays`), it runs only natives that read: what it ran
+/// is run again. Conversions can't fail: what one throws is left in
+/// `Vm::conv_error` for the operation to throw.
 fn to_primitive_hint(v: Value, hint: u8) -> Value {
     if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) || is_bigint(v) {
         return v;
@@ -3740,16 +3744,6 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
         if vm.conv_failed() {
             return Value::UNDEFINED;
         }
-        let replays = std::mem::replace(&mut vm.conv_replays, vm.native_top.is_null());
-        let r = to_primitive_on(vm, v, hint);
-        vm.conv_replays = replays;
-        r
-    }
-}
-
-/// [`to_primitive_hint`] of an object.
-unsafe fn to_primitive_on(vm: &mut Vm, v: Value, hint: u8) -> Value {
-    unsafe {
         if vm.to_primitive_defined {
             let fail = |vm: &mut Vm, e: Error| {
                 vm.conv_error.get_or_insert(e);
@@ -3769,7 +3763,9 @@ unsafe fn to_primitive_on(vm: &mut Vm, v: Value, hint: u8) -> Value {
                 if !crate::props::is_callable(m) {
                     return fail(vm, Error::type_error("Symbol.toPrimitive is not a function"));
                 }
-                if vm.native_top.is_null() && !replays(m) {
+                if (vm.native_top.is_null() && (*as_object(m)).class != Class::Native)
+                    || (vm.conv_replays && !replays(m))
+                {
                     vm.conv_redo = true;
                     return Value::UNDEFINED;
                 }
@@ -3812,7 +3808,11 @@ unsafe fn to_primitive_on(vm: &mut Vm, v: Value, hint: u8) -> Value {
             let r = match (*as_object(m)).class {
                 // (Not the next method either: it may throw, and the redo
                 // would throw that.)
-                Class::Native | Class::Function if vm.native_top.is_null() && !replays(m) => {
+                Class::Function if vm.native_top.is_null() => {
+                    vm.conv_redo = true;
+                    return Value::UNDEFINED;
+                }
+                Class::Native if vm.conv_replays && !replays(m) => {
                     vm.conv_redo = true;
                     return Value::UNDEFINED;
                 }
@@ -4512,6 +4512,8 @@ fn call_function_on(vm: &mut Vm, f: Value, this: Value, args: &[Value]) -> crate
     unsafe {
         if (*as_object(f)).class == Class::Native {
             if vm.conv_replays && !replays(f) {
+                // (Recognized as such only there: see `is_no_top`.)
+                debug_assert!(vm.native_top.is_null());
                 return Err(Error::unsupported(NO_TOP));
             }
             let r = vm.call_other(f, this, args);

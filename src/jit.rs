@@ -461,7 +461,10 @@ fn converting(f: impl FnOnce() -> u64) -> u64 {
     }
     let vm = unsafe { &mut *vm };
     vm.conv_redo = false;
+    // (Redone if a conversion asks: see `Vm::conv_replays`.)
+    let outer = std::mem::replace(&mut vm.conv_replays, vm.native_top.is_null());
     let r = f();
+    vm.conv_replays = outer;
     if std::mem::take(&mut vm.conv_redo) {
         vm.drop_conv_error();
         return RT_REDO;

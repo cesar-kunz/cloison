@@ -13329,4 +13329,8 @@ fn values_outlive_another_vm_run() {
     // The message of what a run threw is made after it, as one.
     let e = b.run(&cloison::js::compile("throw new Error('m' + s)").unwrap()).unwrap_err();
     assert_eq!(b.uncaught_message(&e), format!("Error: m{}", display(s)));
+    // A host's property access between runs makes a cons string key flat.
+    let o = b.run(&cloison::js::compile("var o = {}; o[s + 'z'] = 7; o").unwrap()).unwrap();
+    let k = b.run(&cloison::js::compile("s + 'z'").unwrap()).unwrap();
+    assert_eq!(display(b.get_keyed(o, k).unwrap()), "7");
 }

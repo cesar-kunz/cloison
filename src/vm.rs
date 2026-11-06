@@ -3095,8 +3095,27 @@ impl Vm {
         }
     }
 
+    /// Whether this VM is the one running (see `interp::Running`).
+    #[inline(always)]
+    fn running(&self) -> bool {
+        std::ptr::eq(crate::interp::current_vm(), self)
+    }
+
+    /// `f` run with this VM made the one running: the public operations a
+    /// host may call between runs (`get_keyed` with a cons string key, a
+    /// native getter) reach it through `interp::current_vm` too.
+    #[cold]
+    #[inline(never)]
+    fn host<R>(&mut self, f: impl FnOnce(&mut Vm) -> R) -> R {
+        let _running = crate::interp::Running::new(self);
+        f(self)
+    }
+
     /// `obj[name]`.
     pub fn get(&mut self, obj: Value, name: Atom) -> Result<Value> {
+        if !self.running() {
+            return self.host(|vm| vm.get(obj, name));
+        }
         if !obj.is_cell() {
             return self.get_primitive(obj, name);
         }
@@ -3378,6 +3397,9 @@ impl Vm {
 
     /// `obj[name] = value`.
     pub fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
+        if !self.running() {
+            return self.host(|vm| vm.set(obj, name, value));
+        }
         if !obj.is_cell() {
             return self.set_primitive(obj, name, value);
         }
@@ -3909,6 +3931,9 @@ impl Vm {
     /// there: not looked up for a plain function, of `function_shape`, nor
     /// until some other object has had one), OrdinaryHasInstance.
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
+        if !self.running() {
+            return self.host(|vm| vm.instance_of(v, f));
+        }
         let function = f.is_cell() && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
         if !function || self.has_instance_defined && unsafe { (*as_object(f)).shape } != self.function_shape {
             return self.instance_of_generic(v, f);
@@ -4032,6 +4057,9 @@ impl Vm {
     /// `key in obj`: whether `obj` or its prototypes have the property or
     /// element `key`.
     pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+        if !self.running() {
+            return self.host(|vm| vm.has_property(obj, key));
+        }
         if !obj.is_cell() || string_len(obj).is_some() {
             return Err(Error::type_error(format!(
                 "Cannot use 'in' operator to search for '{}' in {}",
@@ -4070,6 +4098,9 @@ impl Vm {
     /// removed, the object getting a shape of its own without it (see
     /// [`Vm::delete_named`]). False for what can't be deleted.
     pub fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+        if !self.running() {
+            return self.host(|vm| vm.delete_property(obj, key));
+        }
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
                 return Err(Error::type_error(format!(
@@ -4455,6 +4486,9 @@ impl Vm {
 
     /// `obj[key]`.
     pub fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
+        if !self.running() {
+            return self.host(|vm| vm.get_keyed(obj, key));
+        }
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
                 return Err(Error::type_error(format!(
@@ -4618,6 +4652,9 @@ impl Vm {
     }
 
     pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
+        if !self.running() {
+            return self.host(|vm| vm.set_keyed(obj, key, value));
+        }
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
                 return Err(Error::type_error(format!(
@@ -4945,6 +4982,9 @@ impl Vm {
     /// prototype chain. A name seen once (even not enumerable) hides it
     /// further up. Null and undefined have none.
     pub fn for_in_keys(&mut self, v: Value) -> Value {
+        if !self.running() {
+            return self.host(|vm| vm.for_in_keys(v));
+        }
         let mut names: Vec<Vec<u16>> = Vec::new();
         // (Through a proxy's traps: what they throw, a conversion's error.)
         if v.is_cell() && crate::proxy::chain_has_proxy(self, as_object(v)) {
@@ -5855,6 +5895,9 @@ impl Vm {
     /// enters itself).
     #[inline]
     pub fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
+        if !self.running() {
+            return self.host(|vm| vm.call_other(f, this, args));
+        }
         if f.is_cell() {
             let o = as_object(f);
             unsafe {
@@ -5882,6 +5925,9 @@ impl Vm {
     /// `new f(…args)` when `f` isn't a bytecode function: a native that
     /// constructs (`Array`, `Object`) makes its object.
     pub fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
+        if !self.running() {
+            return self.host(|vm| vm.construct_other(f, args));
+        }
         if f.is_cell() {
             let o = as_object(f);
             unsafe {

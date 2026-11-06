@@ -33,3 +33,21 @@ fn stdout_failing_does_not_abort() {
     let s = child.wait().unwrap();
     assert_eq!(s.signal(), Some(libc::SIGPIPE), "{s}");
 }
+
+/// Standard error failing doesn't abort the process either (#68: an
+/// uncaught exception's message and an agent's went out by `eprintln!`,
+/// which panics): the message is dropped and the status stays that of
+/// the exception, 1, or of the script, 0, for an agent's.
+#[test]
+fn stderr_failing_does_not_abort() {
+    let full = || std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+    let s = cloison("err-full", "throw new Error('x')").stderr(full()).status().unwrap();
+    assert_eq!(s.code(), Some(1), "{s}");
+
+    let src = "$262.agent.start('throw new Error(1)');\n\
+               while ($262.agent.getReport() == null && Date.now() < start + 500) $262.agent.sleep(10);\n\
+               print('done')";
+    let out = cloison("agent-err-full", &format!("var start = Date.now();\n{src}")).stderr(full()).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "done\nundefined\n");
+}

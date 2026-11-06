@@ -186,17 +186,24 @@ fn run_agent(src: &str, slice: crate::heap::Slice, mailbox: &Arc<Mailbox>, repor
     mailbox.close();
 }
 
+/// `line` on standard error, dropped if that fails (`eprintln!` panics,
+/// and `panic = "abort"` ended the process).
+fn report_error(line: std::fmt::Arguments) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "agent: {line}");
+}
+
 fn run_agent_vm(mut vm: Vm, src: &str, mailbox: &Mailbox, reports: Reports) {
     vm.agent.report_to = Some(reports);
     let module = match crate::js::compile(src) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("agent: SyntaxError: {e}");
+            report_error(format_args!("SyntaxError: {e}"));
             return;
         }
     };
     if let Err(e) = vm.run(&module) {
-        eprintln!("agent: uncaught {}", vm.uncaught_message(&e));
+        report_error(format_args!("uncaught {}", vm.uncaught_message(&e)));
         return;
     }
     loop {
@@ -223,7 +230,7 @@ fn run_agent_vm(mut vm: Vm, src: &str, mailbox: &Mailbox, reports: Reports) {
             crate::interp::call_function(vm, callback, Value::UNDEFINED, &[sab, m.id])
         });
         if let Err(e) = r {
-            eprintln!("agent: uncaught {}", vm.uncaught_message(&e));
+            report_error(format_args!("uncaught {}", vm.uncaught_message(&e)));
             return;
         }
         if vm.agent.leaving {

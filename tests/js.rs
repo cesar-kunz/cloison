@@ -5777,6 +5777,41 @@ out.join();"#;
     );
 }
 
+/// A function's name past the longest string throws a RangeError where
+/// it is made (#65): a method named after a symbol (`[description]`,
+/// made by an intrinsic, which left the error pending: it went off past
+/// the `try`), a bound function's (`bound name`), and so does an error's
+/// `toString`. Cons strings of about 2^30 units (2 MiB), never flattened.
+#[test]
+fn function_names_throw_past_the_longest_string() {
+    let src = r#"
+var p = "x".repeat(2 ** 20 - 1);
+for (var i = 0; i < 10; i++) p = p + p;
+var s = p + "x".repeat(2 ** 10 - 1);
+var t = s + "x";
+var sym = Symbol(s);
+var out = [];
+function t_(name, f) { try { out.push(name + ":" + f()); } catch (e) { out.push(name + ":" + e.name); } }
+// (No call in these `try`s: one would throw what was left pending.)
+var o, e1, e2, e3;
+try { o = { [sym]() { return 1; } }; } catch (e) { e1 = e; }
+try { class C { [sym]() {} } } catch (e) { e2 = e; }
+try { class C { static [sym]() {} } } catch (e) { e3 = e; }
+out.push("method:" + typeof o + ":" + e1.name, "class:" + e2.name, "static:" + e3.name);
+t_("short", () => { var o = { [Symbol("d")]() {} }; return o[Object.getOwnPropertySymbols(o)[0]].name; });
+t_("bound", () => { function f() {} Object.defineProperty(f, "name", { value: t }); return f.bind().name.length; });
+t_("bound fits", () => { function f() {} Object.defineProperty(f, "name", { value: "x" }); return f.bind().name; });
+t_("toString", () => Error.prototype.toString.call({ name: "E", message: t }).length);
+out.push("after");
+out.push([1, 2].join("+"));
+out.join();"#;
+    assert_eq!(
+        light_value(src),
+        "method:undefined:RangeError,class:RangeError,static:RangeError,short:[d],bound:RangeError,\
+         bound fits:bound x,toString:RangeError,after,1+2"
+    );
+}
+
 /// Maps and sets find keys through a hash index, by SameValueZero (1 and
 /// 1.0, -0 and +0, NaNs alike); iterations in progress go on past a
 /// compaction or a `clear`, seeing entries added after (`collections`).

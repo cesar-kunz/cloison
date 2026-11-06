@@ -8678,7 +8678,7 @@ impl JitCode {
             });
         let captured = if feedback.is_some() { captured_regs(root) } else { Vec::new() };
         let assigned = assigned_regs(insns, entry, &live_at_entry);
-        let (homes, ins, mut sel) = loop {
+        let (homes, mut ins, mut sel) = loop {
             let spec1 = Spec {
                 widened,
                 pinned: &unpinned,
@@ -8996,6 +8996,12 @@ impl JitCode {
                     {
                         (s.base, s.case) = ("nop", "");
                     }
+                }
+                // What only a folded test's other edge reached (an arm never
+                // taken): no code, as for what `infer` found unreachable.
+                let (was, now) = (reachable(insns, entry), reachable(&f, entry));
+                for j in (0..n).filter(|&j| was[j] && !now[j]) {
+                    (sel[j], ins[j]) = (None, None);
                 }
                 folded_insns = f;
                 &folded_insns[..]

@@ -2828,7 +2828,7 @@ g();
 /// A captured boolean set to a constant and tested after int arithmetic,
 /// which runs nothing, so `fold_captured_tests` folds the test: the
 /// result is still the interpreter's, and the compiled loop tests nothing
-/// but `i < n` (#64).
+/// but `i < n`, with no `else` arm (#64).
 #[test]
 fn tests_of_captured_registers_fold_across_typed_arithmetic() {
     let src = r#"
@@ -2838,7 +2838,7 @@ function run(n) {
   for (var i = 0; i < n; i++) {
     flag = true;
     s += i & 7;
-    if (flag) s += 1; else s -= 1;
+    if (flag) s += 1; else s = (s * 3) | 0;
     flag = false;
     s ^= i;
     if (!flag) s += 2;
@@ -2868,8 +2868,10 @@ t;
     // The one ToBoolean test left is `peek() ? 1 : 0`'s, after the loop.
     let tests = stencils.iter().filter(|s| s.starts_with("jto")).count();
     assert_eq!(tests, 1, "{stencils:?}");
-    // Nor does it load `flag` (in memory, as captured) for them.
+    // Nor does it load `flag` (in memory, as captured) for them, nor
+    // compile the arm never taken.
     assert!(!stencils.iter().any(|s| s == "ldar_m"), "{stencils:?}");
+    assert!(!stencils.iter().any(|s| s.starts_with("mul")), "{stencils:?}");
 }
 
 /// `x = b || k` and `x = b && k` on a captured `b` known there: the folded

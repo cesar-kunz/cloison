@@ -936,7 +936,9 @@ impl ShapeBox {
                 return p;
             }
             if slab.next == 0 {
-                let c = unsafe { std::alloc::alloc(ShapeSlab::layout()) }.cast::<ShapeSlot>();
+                // (Zeroed: `is_shape_address` reads the `used` of slots not
+                // handed out yet.)
+                let c = unsafe { std::alloc::alloc_zeroed(ShapeSlab::layout()) }.cast::<ShapeSlot>();
                 if c.is_null() {
                     std::alloc::handle_alloc_error(ShapeSlab::layout());
                 }
@@ -1451,5 +1453,50 @@ mod tests {
             assert_eq!(*Object::inline(o, 1), Value::from_i32(5));
             assert_eq!((*o).flags & EXTERNAL, EXTERNAL);
         }
+    }
+
+    /// The slots of a chunk of shapes not handed out yet are no shape's,
+    /// even in memory the allocator had filled (#56).
+    #[test]
+    fn slots_not_handed_out_are_no_shapes() {
+        std::thread::spawn(|| {
+            let s = Shape {
+                class: Class::Plain,
+                proto: Value::NULL,
+                capacity: Cell::new(0),
+                slots: Slots::empty(),
+                elems: FieldType::None,
+                elems_code: 0,
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: false,
+                fixed: false,
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
+                relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: std::ptr::null(),
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
+                dictionary: false,
+            };
+            // (Memory the thread's first chunk takes, `used` and all set.)
+            unsafe {
+                let m = std::alloc::alloc(ShapeSlab::layout());
+                std::ptr::write_bytes(m, 1, ShapeSlab::layout().size());
+                std::alloc::dealloc(std::hint::black_box(m), ShapeSlab::layout());
+            }
+            let s = ShapeBox::new(s);
+            let a = &*s as *const Shape as usize;
+            let chunk = SHAPE_SLAB.with_borrow(|slab| slab.chunks[0] as usize);
+            let size = size_of::<ShapeSlot>();
+            let shapes = (0..SLAB_SHAPES).map(|i| chunk + i * size).filter(|&p| is_shape_address(p));
+            assert_eq!(shapes.count(), 1);
+            assert!(is_shape_address(a));
+        })
+        .join()
+        .unwrap();
     }
 }

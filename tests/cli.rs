@@ -16,13 +16,15 @@ fn cloison(test: &str, src: &str) -> Command {
 /// `print`'s `println!` panicked, and `panic = "abort"`): full, `print`
 /// and the completion value are dropped and it exits 0; closed by its
 /// reader (`| head`), it ends of SIGPIPE, as SpiderMonkey's and
-/// QuickJS's shells.
+/// QuickJS's shells. (Full: Linux's `/dev/full`, which macOS hasn't.)
 #[test]
 fn stdout_failing_does_not_abort() {
     use std::os::unix::process::ExitStatusExt;
-    let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
-    let s = cloison("full", "print(1); 2").stdout(full).status().unwrap();
-    assert_eq!(s.code(), Some(0), "{s}");
+    if cfg!(target_os = "linux") {
+        let full = std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let s = cloison("full", "print(1); 2").stdout(full).status().unwrap();
+        assert_eq!(s.code(), Some(0), "{s}");
+    }
 
     let mut child = cloison("pipe", "for (var i = 0; ; i++) print(i);").stdout(Stdio::piped()).spawn().unwrap();
     let mut out = child.stdout.take().unwrap();
@@ -37,8 +39,10 @@ fn stdout_failing_does_not_abort() {
 /// Standard error failing doesn't abort the process either (#68: an
 /// uncaught exception's message and an agent's went out by `eprintln!`,
 /// which panics): the message is dropped and the status stays that of
-/// the exception, 1, or of the script, 0, for an agent's.
+/// the exception, 1, or of the script, 0, for an agent's. (Linux's
+/// `/dev/full`.)
 #[test]
+#[cfg(target_os = "linux")]
 fn stderr_failing_does_not_abort() {
     let full = || std::fs::OpenOptions::new().write(true).open("/dev/full").unwrap();
     let s = cloison("err-full", "throw new Error('x')").stderr(full()).status().unwrap();
@@ -55,8 +59,9 @@ fn stderr_failing_does_not_abort() {
 /// An agent whose thread can't be spawned gives its heap back (#66: the
 /// start reserves it first): with threads refused (`RLIMIT_NPROC`), 600
 /// starts, more than the process has heaps, all fail to spawn, none
-/// finds the heaps gone.
+/// finds the heaps gone. (Linux's `RLIMIT_NPROC`, and its `EAGAIN`.)
 #[test]
+#[cfg(target_os = "linux")]
 fn agents_not_spawned_free_their_heaps() {
     use std::os::unix::process::CommandExt;
     if unsafe { libc::geteuid() } == 0 {

@@ -1067,10 +1067,12 @@ fn host_detach_array_buffer(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
 }
 
 /// `print(…)`: the arguments' strings, separated by spaces, on a line of
-/// standard output.
+/// standard output. If that fails (full, closed), the line is dropped, as
+/// V8's and JavaScriptCore's: `println!` panicked, aborting the process.
 fn print_fn(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    use std::io::Write;
     let parts: Vec<String> = a.iter().map(|&v| String::from_utf16_lossy(&units(v))).collect();
-    println!("{}", parts.join(" "));
+    let _ = writeln!(std::io::stdout(), "{}", parts.join(" "));
     Ok(Value::UNDEFINED)
 }
 

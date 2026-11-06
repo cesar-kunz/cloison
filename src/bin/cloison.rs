@@ -15,6 +15,7 @@
 //! to completion (wall clock; process startup excluded, as V8's in-process
 //! timings exclude Node's: see `scripts/tiers.sh`).
 
+use std::io::Write;
 use std::process::ExitCode;
 
 extern "C" fn on_segv(_: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
@@ -34,6 +35,10 @@ extern "C" fn on_segv(_: i32, info: *mut libc::siginfo_t, ctx: *mut libc::c_void
 }
 
 fn main() -> ExitCode {
+    // Output piped into a reader that has gone (`| head`) ends the
+    // process, as SpiderMonkey's and QuickJS's shells (Rust ignores
+    // SIGPIPE: `print` would go on failing to write).
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     if std::env::var_os("CLOISON_SEGV").is_some() {
         unsafe {
             let stack = vec![0u8; 1 << 20].leak();
@@ -110,7 +115,7 @@ fn main() -> ExitCode {
         }
     };
     if dump {
-        print!("{}", cloison::asm::disassemble(&module));
+        let _ = write!(std::io::stdout(), "{}", cloison::asm::disassemble(&module));
         return ExitCode::SUCCESS;
     }
     let result = vm.run(&module);
@@ -136,7 +141,8 @@ fn main() -> ExitCode {
             if std::env::var_os("CLOISON_TIME").is_some() {
                 eprintln!("time {:.3}", start.elapsed().as_secs_f64() * 1e3);
             }
-            println!("{}", cloison::vm::display(v));
+            // (Not `println!`: it panics if standard output fails.)
+            let _ = writeln!(std::io::stdout(), "{}", cloison::vm::display(v));
             // `CLOISON_JIT_TIME`: the JIT's lowering and compiling time.
             if std::env::var_os("CLOISON_JIT_TIME").is_some() {
                 let ms = |a: &std::sync::atomic::AtomicU64| {

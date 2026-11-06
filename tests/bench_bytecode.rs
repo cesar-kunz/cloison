@@ -46,7 +46,7 @@ fn listings_match_their_benchmarks() {
     }
 }
 
-fn listing(name: &str) -> cloison::asm::Module {
+fn listing(name: &str) -> cloison::asm::Checked {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("bench/bytecode")
         .join(name);

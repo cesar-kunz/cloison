@@ -437,6 +437,9 @@ pub struct Code {
     /// A native that `new` may call (`Array`, `Object`): it makes its own
     /// object.
     pub constructs: bool,
+    /// A native that only reads, which a conversion may run twice (see
+    /// `interp::reads_only`).
+    pub(crate) reads_only: bool,
     /// Strict mode code: its `this` is the receiver as is, `undefined`
     /// for a plain call (see `interp::push_frame`).
     pub strict: bool,
@@ -842,6 +845,10 @@ pub struct Vm {
     /// operation is redone where something can (see
     /// `interp::to_primitive_hint`).
     pub(crate) conv_redo: bool,
+    /// Such a conversion is running: what it may have to redo runs only
+    /// natives that read (see `interp::replays`), else a redo would run
+    /// what one wrote before again.
+    pub(crate) conv_replays: bool,
     /// What a `valueOf` or `toString` a conversion called threw, for the
     /// operation converting to throw (conversions can't fail themselves);
     /// `conv_thrown` says there is one (a flag: cheaper to test).
@@ -1247,6 +1254,7 @@ impl Vm {
             native_limit: 0,
             redo_call: false,
             conv_redo: false,
+            conv_replays: false,
             conv_error: None,
             conv_thrown: false,
             store_failed: false,
@@ -5419,6 +5427,7 @@ impl Vm {
             ic_misses: Cell::new(0),
             native: Some(f),
             constructs,
+            reads_only: crate::interp::reads_only(f),
             strict: false,
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
@@ -6044,6 +6053,7 @@ impl Vm {
                     ic_misses: Cell::new(0),
                     native: None,
                     constructs: false,
+                    reads_only: false,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
                     ctor_settled: Cell::new(false),
@@ -7019,7 +7029,7 @@ fn number_to_precision(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Number.prototype.toString(radix)` (2 to 36, 10 by default).
-fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn number_to_string_method(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let radix = match a.first() {
         Some(r) if !r.is_undefined() => crate::interp::to_number(*r).trunc(),
         _ => 10.0,

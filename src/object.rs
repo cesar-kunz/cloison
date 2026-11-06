@@ -1483,14 +1483,20 @@ mod tests {
                 dictionary: false,
             };
             // (Memory the thread's first chunk takes, `used` and all set.)
-            unsafe {
+            let m = unsafe {
                 let m = std::alloc::alloc(ShapeSlab::layout());
                 std::ptr::write_bytes(m, 1, ShapeSlab::layout().size());
                 std::alloc::dealloc(std::hint::black_box(m), ShapeSlab::layout());
-            }
+                m as usize
+            };
             let s = ShapeBox::new(s);
             let a = &*s as *const Shape as usize;
             let chunk = SHAPE_SLAB.with_borrow(|slab| slab.chunks[0] as usize);
+            // Glibc gives the block just freed back (on another allocator
+            // the chunk may be fresh memory, and the test proves less).
+            if cfg!(all(target_os = "linux", target_env = "gnu")) {
+                assert_eq!(chunk, m, "the chunk is not in the memory filled");
+            }
             let size = size_of::<ShapeSlot>();
             let shapes = (0..SLAB_SHAPES).map(|i| chunk + i * size).filter(|&p| is_shape_address(p));
             assert_eq!(shapes.count(), 1);

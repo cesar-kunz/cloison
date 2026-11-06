@@ -4964,6 +4964,8 @@ impl Vm {
         words: usize,
         fill: impl FnOnce(*mut u16),
     ) -> Value {
+        // (Its callers' strings are short: a long one is a cons string.)
+        debug_assert!(len <= MAX_STRING_LEN);
         unsafe {
             let o = self.alloc_string(words);
             let data = o.cast::<u8>().add(STRING_UNITS).cast::<u16>();
@@ -4994,6 +4996,9 @@ impl Vm {
 
     /// A new string of `len` code units, which `fill` writes.
     pub fn new_string_with(&mut self, len: usize, fill: impl FnOnce(&mut [u16])) -> Value {
+        if len > MAX_STRING_LEN {
+            return self.string_too_long();
+        }
         unsafe {
             let words = len.div_ceil(4);
             let o = self.alloc_string(words);
@@ -5005,6 +5010,17 @@ impl Vm {
             (*o).elems_len = u32::try_from(len).expect("string too long");
             object_value(o)
         }
+    }
+
+    /// A string past the longest, from a builder that didn't check (see
+    /// [`check_string_len`]): an empty one, the RangeError left for the
+    /// operation to throw as a conversion's (as `new_cons`'s).
+    #[cold]
+    #[inline(never)]
+    fn string_too_long(&mut self) -> Value {
+        self.conv_error.get_or_insert_with(|| Error::range_error("Invalid string length"));
+        self.conv_thrown = true;
+        self.new_string(&[])
     }
 
     /// A string of `units`: one made from equal units since the last
@@ -7262,8 +7278,48 @@ pub(crate) fn string_len(v: Value) -> Option<usize> {
     unsafe { ((*o).class == Class::String).then(|| (*o).elems_len as usize) }
 }
 
-/// The most code units a string made by concatenation has.
+/// The most code units a string has: past it, what makes one throws a
+/// RangeError (see `check_string_len`).
 pub(crate) const MAX_STRING_LEN: usize = 1 << 30;
+
+/// A RangeError if a string of `len` code units is past the longest: for
+/// what builds one to check as it grows, before it holds gigabytes (and,
+/// given a piece's `string_len`, before a long cons string is flattened).
+#[inline]
+pub(crate) fn check_string_len(len: usize) -> Result<()> {
+    if len > MAX_STRING_LEN {
+        return Err(string_len_error());
+    }
+    Ok(())
+}
+
+/// [`check_string_len`]'s RangeError, out of the builders' loops.
+#[cold]
+#[inline(never)]
+fn string_len_error() -> Error {
+    Error::range_error("Invalid string length")
+}
+
+/// Append string `s`'s units to `out` (none if it isn't one), checked as
+/// [`check_string_len`] before they are read.
+#[inline]
+pub(crate) fn push_string(out: &mut Vec<u16>, s: Value) -> Result<()> {
+    if !s.is_cell() {
+        return Ok(());
+    }
+    let o = as_object(s);
+    unsafe {
+        if (*o).class != Class::String {
+            return Ok(());
+        }
+        check_string_len(out.len() + (*o).elems_len as usize)?;
+        if (*o).elems.is_null() {
+            flatten(o);
+        }
+        out.extend_from_slice(std::slice::from_raw_parts((*o).elems.cast::<u16>(), (*o).elems_len as usize));
+    }
+    Ok(())
+}
 
 /// Make the cons string `o` (see [`Vm::new_cons`]) flat: its units copied
 /// out of its pieces (iteratively: `s += c` makes a chain as long as the

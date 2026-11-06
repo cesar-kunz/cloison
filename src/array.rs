@@ -7,7 +7,7 @@ use crate::interp::{call_function, strict_equals, to_boolean, to_number, to_stri
 use crate::object::{Class, EXTERNAL, Object, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
-use crate::vm::{Error, Key, NativeFn, Result, Vm, array_push, string_units};
+use crate::vm::{Error, Key, NativeFn, Result, Vm, array_push, check_string_len, push_string, string_len, string_units};
 
 pub(crate) fn install(vm: &mut Vm) {
     let ap = vm.array_prototype;
@@ -361,12 +361,16 @@ pub(crate) fn array_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
                 out.extend_from_slice(&sep);
             }
             let v = get(vm, o, i)?;
-            if !v.is_undefined() && !v.is_null() {
+            if string_len(v).is_some() {
+                // (Past the longest string: thrown before its units are read.)
+                push_string(&mut out, v)?;
+            } else if !v.is_undefined() && !v.is_null() {
                 out.extend(to_string_units(v));
                 // (Its exception stops the join: no next element read.)
                 if vm.conv_failed() {
                     return Err(vm.take_conv_error());
                 }
+                check_string_len(out.len())?;
             }
             i += 1.0;
         }
@@ -412,10 +416,12 @@ pub(crate) fn array_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> R
                     return Err(Error::type_error("toLocaleString is not a function"));
                 }
                 let s = call_function(vm, f, v, &[])?;
+                check_string_len(out.len() + string_len(s).unwrap_or(0))?;
                 out.extend(to_string_units(s));
                 if vm.conv_failed() {
                     return Err(vm.take_conv_error());
                 }
+                check_string_len(out.len())?;
             }
             i += 1.0;
         }

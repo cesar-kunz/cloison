@@ -464,7 +464,8 @@ pub fn parse(src: &str) -> Result<Checked, String> {
 /// assumes without checking (see `interp::run_frame`): every instruction
 /// a known one and complete, every path ending in a `Return`, `Throw` or
 /// jump, jumps and handlers landing on instructions, registers (calls'
-/// windows too) within the frame, and table indices within their tables.
+/// windows too) within the frame, table indices within their tables, and
+/// each cache slot one instruction's.
 /// A module from `js::compile` is right by construction; one made any
 /// other way (the text format, or [`Module`] built directly) must pass
 /// this to be run (see [`Checked`]).
@@ -472,7 +473,8 @@ pub fn parse(src: &str) -> Result<Checked, String> {
 /// Only bytecode whose safety this can see is accepted: not the
 /// instructions whose operands must hold what the front end put there
 /// (generators' `InitialYield`, `Yield` and `AsyncStart`, `PushLiteral`'s
-/// array, `DefineAccessor`'s object), lazily compiled stubs, nor class
+/// array, `DefineAccessor`'s object, `Intrinsic`'s arguments), nor the
+/// script's use of a callee or arguments; nor lazily compiled stubs, class
 /// constructors, generators or async functions (`kind` over 1).
 pub fn verify(m: &Module) -> Result<(), String> {
     let n = m.functions.len();
@@ -574,7 +576,6 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 Op::Call => Some(vals[1] + vals[2] + 1),
                 Op::CallUndefined | Op::Construct => Some(vals[1] + vals[2]),
                 Op::CallApplyArguments => Some(vals[1] + 3),
-                Op::Intrinsic => Some(vals[1] + vals[2]),
                 _ => None,
             };
             if regs.iter().any(|&r| r >= f.nregs as usize) || end.is_some_and(|e| e > f.nregs as i64) {
@@ -582,7 +583,13 @@ pub fn verify(m: &Module) -> Result<(), String> {
             }
             let string = |k: i64| matches!(f.constants[k as usize], Constant::String(_));
             match plain {
-                Op::CompileLazy | Op::InitialYield | Op::Yield | Op::AsyncStart | Op::PushLiteral | Op::DefineAccessor => {
+                Op::CompileLazy
+                | Op::InitialYield
+                | Op::Yield
+                | Op::AsyncStart
+                | Op::PushLiteral
+                | Op::DefineAccessor
+                | Op::Intrinsic => {
                     return err(at, format!("{op:?} is the front end's only"));
                 }
                 // The script's frame has no callee, nor arguments.
@@ -591,9 +598,6 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 }
                 Op::LdaUpvalue | Op::StaUpvalue if vals[0] as usize >= f.upvalues.len() => {
                     return err(at, format!("{op:?}: upvalue {} out of range", vals[0]));
-                }
-                Op::Intrinsic if vals[0] as usize >= crate::intrinsics::INTRINSICS.len() => {
-                    return err(at, format!("intrinsic {} unknown", vals[0]));
                 }
                 Op::CreateRegExp if !string(vals[0]) || !string(vals[1]) => {
                     return err(at, "CreateRegExp of a constant that isn't a string".into());
@@ -929,6 +933,13 @@ mod tests {
             f.ics.push("x".into());
         })
         .contains("another instruction's"));
+        // Intrinsics take what the front end passes them (`define_field`
+        // an object).
+        assert!(bad(&|f| {
+            f.nregs = 4;
+            f.code = vec![Op::Intrinsic as u8, 7, 1, 3, Op::Return as u8];
+        })
+        .contains("front end's only"));
         // Calls fill `nparams` registers: not wrapped around to fit one.
         assert!(bad(&|f| {
             f.nparams = u32::MAX;

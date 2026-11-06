@@ -526,6 +526,9 @@ pub fn verify(m: &Module) -> Result<(), String> {
         if !matches!(last, Op::Return | Op::Throw | Op::Jump | Op::JumpLoop) {
             return Err(format!("{}: its last instruction ({last:?}) falls off its end", f.name));
         }
+        // Each cache slot is one instruction's: what a slot caches is
+        // read as that instruction's kind of entry.
+        let mut cached = vec![false; f.ics.len()];
         let mut at = 0;
         while at < code.len() {
             let op = Op::from_u8(code[at]).unwrap();
@@ -550,6 +553,9 @@ pub fn verify(m: &Module) -> Result<(), String> {
                     }
                     Operand::Ic | Operand::AutoIc if v as usize >= f.ics.len() => {
                         return err(at, format!("{op:?}: cache slot {v} out of range"));
+                    }
+                    Operand::Ic | Operand::AutoIc if std::mem::replace(&mut cached[v as usize], true) => {
+                        return err(at, format!("{op:?}: cache slot {v} another instruction's too"));
                     }
                     Operand::Fn if v as usize >= f.closures.len() => {
                         return err(at, format!("{op:?}: nested function {v} out of range"));
@@ -915,6 +921,14 @@ mod tests {
             f.ics.push("".into());
         })
         .contains("outside a function"));
+        // Two instructions of one cache slot: a store reading a literal's
+        // cached shape as a transition.
+        assert!(bad(&|f| {
+            f.nregs = 2;
+            f.code = vec![Op::CreateObject as u8, 0, 0, 0, Op::Star as u8, 1, Op::SetNamed as u8, 1, 0, 0, Op::Return as u8];
+            f.ics.push("x".into());
+        })
+        .contains("another instruction's"));
         // Calls fill `nparams` registers: not wrapped around to fit one.
         assert!(bad(&|f| {
             f.nparams = u32::MAX;

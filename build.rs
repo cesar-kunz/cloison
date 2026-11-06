@@ -34,8 +34,6 @@ const SOURCE: &str = "stencils/stencils.rs";
 const PREFIX: &str = "cloison_stencil_";
 
 fn main() {
-    println!("cargo:rerun-if-changed={SOURCE}");
-    println!("cargo:rerun-if-changed=src/value.rs");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build/verify.rs");
 
@@ -46,6 +44,7 @@ fn main() {
 
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let mut extracted = extract(&compile(&rustc, &target, &obj_path, &[]), &arch);
+    rerun_if_deps_changed(&obj_path.with_extension("d"));
     // x86-64: LLVM jumps to an exit or a helper with a short `jcc` to a
     // stub after the hot path's final `jmp cloison_continue`, which then can't
     // be trimmed. Assembled with every branch long (`-mc-relax-all`), the
@@ -106,6 +105,20 @@ fn main() {
 }
 
 
+/// Rerun this script when a file the stencils' compile read changes:
+/// `SOURCE` and the runtime's sources it takes with `#[path]` (`value.rs`,
+/// `layout.rs`), as rustc's dep-info file `dep_info` lists them. Listed by
+/// hand, one was missed, and the stencils kept the offsets of a layout the
+/// runtime had changed (#74).
+fn rerun_if_deps_changed(dep_info: &std::path::Path) {
+    // Each dependency has a line of its own, `path:`; a space in a path is
+    // escaped.
+    let deps = fs::read_to_string(dep_info).unwrap();
+    for path in deps.lines().filter_map(|l| l.strip_suffix(':')) {
+        println!("cargo:rerun-if-changed={}", path.replace("\\ ", " "));
+    }
+}
+
 /// Compile the stencils into the object file `obj_path`, with `extra`
 /// codegen options; returns its bytes.
 fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]) -> Vec<u8> {
@@ -131,7 +144,11 @@ fn compile(rustc: &str, target: &str, obj_path: &std::path::Path, extra: &[&str]
     let status = cmd
         .args(extra)
         .args(["--target", target])
-        .arg(format!("--emit=obj={}", obj_path.display()))
+        .arg(format!(
+            "--emit=obj={},dep-info={}",
+            obj_path.display(),
+            obj_path.with_extension("d").display()
+        ))
         .arg(SOURCE)
         .status()
         .expect("failed to run rustc for the stencils");

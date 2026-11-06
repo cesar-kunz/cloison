@@ -1176,9 +1176,8 @@ fn function_bind(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let a_name = vm.a_name;
     let name = vm.get(this, a_name)?;
     let mut units: Vec<u16> = "bound ".encode_utf16().collect();
-    if let Some(u) = string_units(name) {
-        units.extend_from_slice(u);
-    }
+    // (Past the longest string: thrown before a long name is read.)
+    push_string(&mut units, name)?;
     let name = vm.new_string(&units);
     let d = crate::props::Desc::data(name, false, false, true);
     vm.define_own_property(as_object(bound), crate::vm::Key::Name(a_name), &d)?;
@@ -3363,13 +3362,22 @@ pub(crate) fn error_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
     let name = vm.get(this, a_name)?;
     let message = vm.get(this, a_message)?;
     let name = if name.is_undefined() { "Error".encode_utf16().collect() } else { units(name).into_owned() };
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
+    // (Its length checked before a long message is read.)
+    let n = if message.is_undefined() { 0 } else { string_len(message).unwrap_or(0) };
+    check_string_len(name.len() + n + if name.is_empty() || n == 0 { 0 } else { 2 })?;
     let message = if message.is_undefined() { Vec::new() } else { units(message).into_owned() };
+    if vm.conv_failed() {
+        return Err(vm.take_conv_error());
+    }
     let mut out = name;
     if !out.is_empty() && !message.is_empty() {
         out.extend(": ".encode_utf16());
     }
     out.extend_from_slice(&message);
-    Ok(vm.new_string(&out))
+    vm.try_new_string(&out)
 }
 
 // ---- Number.prototype.toString(radix) ----

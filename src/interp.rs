@@ -1097,7 +1097,12 @@ handlers! {
         let args = std::slice::from_raw_parts(regs.add(first), n);
         let f = crate::intrinsics::INTRINSICS[id].1;
         (*frame_vm(regs)).intrinsic_code = frame_code(regs);
-        let r = with_top(regs, None, |vm| f(vm, args));
+        // (What a conversion or a string past the longest left pending,
+        // thrown as a native's caller throws it: see `call_function_on`.)
+        let r = with_top(regs, None, |vm| {
+            let r = f(vm, args);
+            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+        });
         next_or_throw!(Op::Intrinsic.size(), r)
     }
 

@@ -3101,14 +3101,52 @@ impl Vm {
         std::ptr::eq(crate::interp::current_vm(), self)
     }
 
-    /// `f` run with this VM made the one running: the public operations a
-    /// host may call between runs (`get_keyed` with a cons string key, a
-    /// native getter) reach it through `interp::current_vm` too.
+    /// `f` run from the host between runs, with this VM entered as a run
+    /// enters it: the one running (the public operations reach it through
+    /// `interp::current_vm` too: a cons string key made flat, a native
+    /// getter), its native stack's limit from here, the VM stack free from
+    /// its base for the JS functions it calls (getters, traps, a key's
+    /// `toString`), and the values pushed to `handles` rooted. What a
+    /// conversion threw is `f`'s error, none left pending for the next
+    /// operation. (No collection runs: the host's values aren't on the
+    /// stack the collector scans, which starts at a run's frame.)
     #[cold]
     #[inline(never)]
-    fn host<R>(&mut self, f: impl FnOnce(&mut Vm) -> R) -> R {
+    fn host<R>(&mut self, f: impl FnOnce(&mut Vm) -> Result<R>) -> Result<R> {
+        /// What `host` changed, back on return or unwinding.
+        struct Entered {
+            vm: *mut Vm,
+            top: *mut Value,
+            limit: usize,
+            handles: usize,
+        }
+        impl Drop for Entered {
+            fn drop(&mut self) {
+                unsafe {
+                    let vm = &mut *self.vm;
+                    vm.native_top = self.top;
+                    vm.native_limit = self.limit;
+                    vm.unmovable -= 1;
+                    vm.handles.truncate(self.handles);
+                    vm.conv_redo = false;
+                    vm.conv_thrown = false;
+                    vm.conv_error = None;
+                }
+            }
+        }
         let _running = crate::interp::Running::new(self);
-        f(self)
+        let here = 0u8;
+        // (Stores through a pointer: what `f` runs reaches the VM through
+        // `interp::current_vm`, not `self`, and mustn't miss them.)
+        let vm: *mut Vm = self;
+        unsafe {
+            let _entered = Entered { vm, top: (*vm).native_top, limit: (*vm).native_limit, handles: (*vm).handles.len() };
+            (*vm).unmovable += 1;
+            std::ptr::write_volatile(&raw mut (*vm).native_limit, (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK));
+            std::ptr::write_volatile(&raw mut (*vm).native_top, (*vm).stack.as_mut_ptr());
+            let r = f(&mut *vm);
+            if (*vm).conv_failed() { Err((*vm).take_conv_error()) } else { r }
+        }
     }
 
     /// `obj[name]`.
@@ -3248,18 +3286,9 @@ impl Vm {
         if let Some(v) = e.1
             && crate::props::is_object(v)
         {
-            // The run is over: its `toString` can run at the stack's base.
-            // (The conversion reaches the VM through `interp::current_vm`,
-            // not `self`: the stores must not move across it.)
-            let _running = crate::interp::Running::new(self);
-            let vm: *mut Vm = self;
-            unsafe {
-                let saved = (*vm).native_top;
-                std::ptr::write_volatile(&raw mut (*vm).native_top, (*vm).stack.as_mut_ptr());
-                let s = crate::interp::to_string_units(v);
-                std::ptr::write_volatile(&raw mut (*vm).native_top, saved);
-                std::ptr::write_volatile(&raw mut (*vm).conv_error, None);
-                std::ptr::write_volatile(&raw mut (*vm).conv_thrown, false);
+            // The run is over: its `toString` runs as a host's operation
+            // (a throwing one leaves the error's own message).
+            if let Ok(s) = self.host(|_| Ok(crate::interp::to_string_units(v))) {
                 return String::from_utf16_lossy(&s);
             }
         }
@@ -4981,10 +5010,17 @@ impl Vm {
     /// object's enumerable properties in insertion order, from `v` up its
     /// prototype chain. A name seen once (even not enumerable) hides it
     /// further up. Null and undefined have none.
-    pub fn for_in_keys(&mut self, v: Value) -> Value {
+    pub fn for_in_keys(&mut self, v: Value) -> Result<Value> {
         if !self.running() {
-            return self.host(|vm| vm.for_in_keys(v));
+            return self.host(|vm| Ok(vm.for_in_key_array(v)));
         }
+        let keys = self.for_in_key_array(v);
+        if self.conv_failed() { Err(self.take_conv_error()) } else { Ok(keys) }
+    }
+
+    /// [`Vm::for_in_keys`] in a run: what a proxy's trap throws left as a
+    /// conversion's error (see `conv_error`).
+    pub(crate) fn for_in_key_array(&mut self, v: Value) -> Value {
         let mut names: Vec<Vec<u16>> = Vec::new();
         // (Through a proxy's traps: what they throw, a conversion's error.)
         if v.is_cell() && crate::proxy::chain_has_proxy(self, as_object(v)) {
@@ -7802,5 +7838,45 @@ out.join();"#;
     fn strings_past_the_longest_panic_outside_a_run() {
         let mut vm = Vm::new();
         vm.new_string_with(MAX_STRING_LEN + 1, |_| unreachable!());
+    }
+
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    /// A run, or a host's operation, that unwinds leaves the VM running
+    /// before it running again, and its heap's owner as before (#70).
+    #[test]
+    fn unwinding_restores_the_running_vm() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        let r = catch_unwind(AssertUnwindSafe(|| b.enter(|_| panic!("unwinding"))));
+        assert!(r.is_err());
+        assert!(crate::interp::current_vm().is_null());
+        assert!(crate::heap::owner(b.global as usize).is_null());
+        let pa: *mut Vm = &mut a;
+        a.enter(|a| {
+            let r = catch_unwind(AssertUnwindSafe(|| b.enter(|_| panic!("unwinding"))));
+            assert!(r.is_err());
+            assert!(std::ptr::eq(crate::interp::current_vm(), pa));
+            let r = catch_unwind(AssertUnwindSafe(|| b.host(|_| -> Result<()> { panic!("unwinding") })));
+            assert!(r.is_err());
+            assert!(std::ptr::eq(crate::interp::current_vm(), pa));
+            assert!(std::ptr::eq(crate::heap::owner(a.global as usize), pa));
+            assert!(crate::heap::owner(b.global as usize).is_null());
+            Ok(Value::UNDEFINED)
+        })
+        .unwrap();
+        assert!(crate::interp::current_vm().is_null());
+        // And what `host` entered, it left. (Not `enter`, which a panic
+        // leaves with `native_top` and `stack_base` set.)
+        let mut c = Vm::new();
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            c.host(|c| -> Result<()> {
+                c.conv_thrown = true;
+                panic!("unwinding")
+            })
+        }));
+        assert!(r.is_err());
+        assert!(c.native_top.is_null() && c.unmovable == 0 && !c.conv_thrown && c.handles.is_empty());
+        assert!(crate::interp::current_vm().is_null());
     }
 }

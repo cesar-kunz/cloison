@@ -496,7 +496,7 @@ extern "C" fn cloison_rt_for_in_keys(vm: Value, v: Value) -> u64 {
             return 0;
         }
         vm.safepoint(std::ptr::null_mut());
-        vm.for_in_keys(v).to_bits()
+        vm.for_in_key_array(v).to_bits()
     }
 }
 

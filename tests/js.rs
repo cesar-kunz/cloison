@@ -13334,3 +13334,77 @@ fn values_outlive_another_vm_run() {
     let k = b.run(&cloison::js::compile("s + 'z'").unwrap()).unwrap();
     assert_eq!(display(b.get_keyed(o, k).unwrap()), "7");
 }
+
+/// A host's operations between runs enter the VM as a run does (#70): a
+/// JS getter, setter or trap runs, a key's `toString` too, what they throw
+/// is the operation's error (and none is left pending for the next), and
+/// a native called from the host calls JS.
+#[test]
+fn host_operations_between_runs_run_js() {
+    let mut vm = Vm::new();
+    let src = r#"
+var log = [];
+var o = { k: 1, a: 5, get g() { return "G" + this.k; }, set s(v) { log.push("set " + v); } };
+var key = { toString() { return "a"; } };
+var bad = { toString() { throw new Error("boom"); } };
+var p = new Proxy({}, { get(t, k) { return "P" + String(k); }, has(t, k) { return k === "yes"; },
+  ownKeys() { throw new TypeError("no keys"); } });
+var map = Array.prototype.map, xs = [1, 2, 3], twice = x => x * 2;
+var C = function () {}; Object.defineProperty(C, Symbol.hasInstance, { value: v => v === 7 });
+0"#;
+    vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let g = vm.global_object();
+    let get = |vm: &mut Vm, name: &str| {
+        let a = vm.intern(name);
+        vm.get(g, a).unwrap()
+    };
+    let o = get(&mut vm, "o");
+    let gname = vm.intern("g");
+    assert_eq!(display(vm.get(o, gname).unwrap()), "G1");
+    let sname = vm.intern("s");
+    vm.set(o, sname, cloison::value::Value::from_i32(3)).unwrap();
+    let key = get(&mut vm, "key");
+    assert_eq!(display(vm.get_keyed(o, key).unwrap()), "5");
+    let bad = get(&mut vm, "bad");
+    let e = vm.get_keyed(o, bad).unwrap_err();
+    assert_eq!(vm.uncaught_message(&e), "Error: boom");
+    let e = vm.set_keyed(o, bad, cloison::value::Value::from_i32(1)).unwrap_err();
+    assert_eq!(vm.uncaught_message(&e), "Error: boom");
+    // Nothing left pending: the next conversion runs.
+    assert_eq!(display(vm.get_keyed(o, key).unwrap()), "5");
+    let p = get(&mut vm, "p");
+    let x = vm.intern("x");
+    assert_eq!(display(vm.get(p, x).unwrap()), "Px");
+    let yes = vm.new_string(&"yes".encode_utf16().collect::<Vec<u16>>());
+    assert!(vm.has_property(p, yes).unwrap());
+    let e = vm.for_in_keys(p).unwrap_err();
+    assert_eq!(vm.uncaught_message(&e), "TypeError: no keys");
+    let (map, xs, twice) = (get(&mut vm, "map"), get(&mut vm, "xs"), get(&mut vm, "twice"));
+    let r = vm.call_other(map, xs, &[twice]).unwrap();
+    let join = vm.intern("join");
+    let join = vm.get(r, join).unwrap();
+    assert_eq!(display(vm.call_other(join, r, &[]).unwrap()), "2,4,6");
+    let c = get(&mut vm, "C");
+    assert!(vm.instance_of(cloison::value::Value::from_i32(7), c).unwrap());
+    assert!(!vm.instance_of(cloison::value::Value::from_i32(8), c).unwrap());
+    let r = vm.run(&cloison::js::compile("log.join()").unwrap()).unwrap();
+    assert_eq!(display(r), "set 3");
+}
+
+/// A value of one VM given to another's operation (#70): a cons string key
+/// can't be made flat by a VM that doesn't own it, which panics, and both
+/// VMs work after.
+#[test]
+fn another_vms_cons_key_panics_cleanly() {
+    let mut a = Vm::new();
+    let mut b = Vm::new();
+    let xy = "var xy = 'x'.repeat(40) + 'y'.repeat(40);";
+    let o = a.run(&cloison::js::compile(&format!("{xy} var o = {{ [xy]: 1 }}; o")).unwrap()).unwrap();
+    let k = b.run(&cloison::js::compile(&format!("{xy} xy")).unwrap()).unwrap();
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.get_keyed(o, k)));
+    assert!(r.is_err());
+    assert_eq!(display(b.get_keyed(b.global_object(), k).unwrap()), "undefined");
+    let ka = a.run(&cloison::js::compile("'x'.repeat(40) + 'y'.repeat(40)").unwrap()).unwrap();
+    assert_eq!(display(a.get_keyed(o, ka).unwrap()), "1");
+    assert_eq!(display(b.run(&cloison::js::compile("xy.length").unwrap()).unwrap()), "80");
+}

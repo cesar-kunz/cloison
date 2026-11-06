@@ -51,3 +51,34 @@ fn stderr_failing_does_not_abort() {
     assert_eq!(out.status.code(), Some(0), "{}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "done\nundefined\n");
 }
+
+/// An agent whose thread can't be spawned gives its heap back (#66: the
+/// start reserves it first): with threads refused (`RLIMIT_NPROC`), 600
+/// starts, more than the process has heaps, all fail to spawn, none
+/// finds the heaps gone.
+#[test]
+fn agents_not_spawned_free_their_heaps() {
+    use std::os::unix::process::CommandExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return; // (Root isn't held to RLIMIT_NPROC.)
+    }
+    let src = "var errors = new Set;\n\
+               for (var i = 0; i < 600; i++) try { $262.agent.start(''); errors.add('started'); } catch (e) { errors.add(e.message); }\n\
+               print([...errors].join('|'))";
+    let mut c = cloison("no-threads", src);
+    c.env("CLOISON_GC_STW", "1");
+    unsafe {
+        c.pre_exec(|| {
+            let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            libc::getrlimit(libc::RLIMIT_NPROC, &mut l);
+            l.rlim_cur = 1;
+            if libc::setrlimit(libc::RLIMIT_NPROC, &l) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = c.output().unwrap();
+    assert!(out.status.success(), "{}", out.status);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "$262.agent.start: Resource temporarily unavailable (os error 11)\nundefined\n");
+}

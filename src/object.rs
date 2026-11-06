@@ -366,6 +366,40 @@ impl Object {
         unsafe { crate::layout::elems_cap(crate::layout::header(this)) - crate::far::is_far(this.cast_mut()) as u32 }
     }
 
+    /// `this`'s elements, the first `elems_len`: none if `elems` is null,
+    /// as an array without elements' is (a slice's pointer may not be,
+    /// even an empty one's).
+    ///
+    /// # Safety
+    /// As [`Object::elems_cap`]'s; and nothing may reallocate the elements
+    /// or (for the mutable one) read or write them otherwise while the
+    /// slice is used.
+    #[inline(always)]
+    pub unsafe fn elems<'a>(this: *const Object) -> &'a [Value] {
+        unsafe {
+            if (*this).elems.is_null() {
+                &[]
+            } else {
+                std::slice::from_raw_parts((*this).elems, (*this).elems_len as usize)
+            }
+        }
+    }
+
+    /// [`Object::elems`], mutable.
+    ///
+    /// # Safety
+    /// As [`Object::elems`]'s.
+    #[inline(always)]
+    pub unsafe fn elems_mut<'a>(this: *mut Object) -> &'a mut [Value] {
+        unsafe {
+            if (*this).elems.is_null() {
+                &mut []
+            } else {
+                std::slice::from_raw_parts_mut((*this).elems, (*this).elems_len as usize)
+            }
+        }
+    }
+
     /// The `aux` word of a class with one (`layout::extra_words` 2), after
     /// `code`: a buffer's maximum byte length, a view's length (or
     /// `typed::TRACKING`), a collection iterator's `IterMode` and stride, a

@@ -7730,6 +7730,13 @@ run(function (a) { a.shift(); }) + " " + run(function (a) { a.reverse(); });
     );
 }
 
+/// An array literal without elements has none allocated (`elems` null),
+/// which `reverse` must not make a slice of (the debug build aborted).
+#[test]
+fn reverse_of_an_array_without_elements() {
+    assert_eq!(value("var a = []; a.reverse() === a && a.length"), "0");
+}
+
 /// `slice` and `splice` convert their arguments, which may change the
 /// array's length, after reading it: their fast paths must not use
 /// indices measured against the old one (before, `splice` copied past

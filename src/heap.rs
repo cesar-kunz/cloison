@@ -55,6 +55,8 @@ const GRANULES_PER_BLOCK: usize = BLOCK / GRANULE;
 /// [`BASES`] it ends below 128 TiB, and its side tables stay between
 /// [`SIDE`] and the first base.
 const SPACE: usize = 16 << 40;
+/// Heaps alive at once, at most (one per [`SLICE`] of [`SPACE`]).
+pub const HEAPS: usize = SPACE / SLICE;
 /// Memory is committed this much at a time (its metadata and cards are
 /// then whole pages).
 const CHUNK: usize = 8 << 20;
@@ -305,17 +307,42 @@ impl Drop for Heap {
     }
 }
 
+/// A slice of the space reserved for a heap ([`Heap::with_slice`]):
+/// one taken where a failure can be thrown, the heap made elsewhere (an
+/// agent's, on its thread). Dropped unused, it is free again.
+pub struct Slice(usize);
+
+impl Drop for Slice {
+    fn drop(&mut self) {
+        space().free.lock().unwrap().push(self.0);
+    }
+}
+
+/// A slice for a heap, or `None` if [`HEAPS`] are alive.
+pub fn reserve() -> Option<Slice> {
+    space().free.lock().unwrap().pop().map(Slice)
+}
+
 impl Heap {
+    /// A heap; panics if [`HEAPS`] are alive (see [`Heap::try_new`]).
     pub fn new() -> Heap {
+        Self::try_new().unwrap_or_else(|| panic!("more than {HEAPS} heaps alive at once"))
+    }
+
+    /// A heap, or `None` if [`HEAPS`] are alive.
+    pub fn try_new() -> Option<Heap> {
+        reserve().map(Heap::with_slice)
+    }
+
+    /// A heap in the slice `slice` reserved (see [`reserve`]).
+    pub fn with_slice(slice: Slice) -> Heap {
         let limit = std::env::var("CLOISON_HEAP_LIMIT")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .map_or(SLICE, |mb| (mb << 20).clamp(CHUNK, SLICE));
         let s = space();
-        // (The lock is released before the check: a panic holding it would
-        // poison it for every heap made or dropped after.)
-        let slice = s.free.lock().unwrap().pop();
-        let slice = slice.unwrap_or_else(|| panic!("more than {} heaps alive at once", SPACE / SLICE));
+        // (The heap gives it back when dropped.)
+        let slice = std::mem::ManuallyDrop::new(slice).0;
         let gc = crate::gc::Gc::new();
         let mut heap = Heap {
             budget: gc.budget(),

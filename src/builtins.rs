@@ -917,8 +917,7 @@ fn plain_list(list: Value, holes: bool) -> Option<Vec<Value>> {
             return None;
         }
     }
-    let n = unsafe { (*o).elems_len } as usize;
-    let elems = unsafe { std::slice::from_raw_parts((*o).elems, n) };
+    let elems = unsafe { Object::elems(o) };
     if !elems.contains(&Value::EMPTY) {
         return Some(elems.to_vec());
     }

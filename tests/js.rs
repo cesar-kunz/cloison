@@ -3799,6 +3799,24 @@ fn arguments_and_apply_agree_with_node() {
     assert_eq!(value(&format!("{ARGUMENTS}\nargsAndApply();")), "33128045");
 }
 
+/// `f.apply(that, [])`: the literal has no elements allocated (`elems`
+/// null), which the list of the call must not make a slice of (the debug
+/// build aborted), from interpreted and compiled callers.
+#[test]
+fn apply_with_an_array_without_elements() {
+    assert_eq!(
+        value(
+            r#"
+function count() { return arguments.length; }
+var t = 0;
+for (var i = 0; i < 4000; i++) t += count.apply(null, []) + count.apply(null, [i]);
+t;
+"#
+        ),
+        "4000"
+    );
+}
+
 /// `instanceof` and `in` in compiled code (through the runtime), over
 /// prototype chains, arrays and elements, and the errors they throw (the
 /// compiled code leaves for the interpreter to throw them). The expected

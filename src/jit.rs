@@ -643,9 +643,7 @@ extern "C" fn cloison_rt_arguments_of(array: Value, func: Value) -> u64 {
     unsafe {
         let vm = &mut *crate::interp::current_vm();
         let a = crate::object::as_object(array);
-        let values =
-            if (*a).elems_len == 0 { &[][..] } else { std::slice::from_raw_parts((*a).elems, (*a).elems_len as usize) };
-        crate::builtins::arguments_object_of(vm, values, func.to_bits() as *mut Object).to_bits()
+        crate::builtins::arguments_object_of(vm, Object::elems(a), func.to_bits() as *mut Object).to_bits()
     }
 }
 
@@ -17725,12 +17723,7 @@ unsafe fn materialize(
         };
         let object = unsafe {
             let o = crate::object::as_object(array);
-            let values = if (*o).elems_len == 0 {
-                &[][..]
-            } else {
-                std::slice::from_raw_parts((*o).elems, (*o).elems_len as usize)
-            };
-            crate::builtins::arguments_object_of(&mut *crate::interp::current_vm(), values, interp::frame_callee(at))
+            crate::builtins::arguments_object_of(&mut *crate::interp::current_vm(), Object::elems(o), interp::frame_callee(at))
         };
         for r in regs_of() {
             unsafe {

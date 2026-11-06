@@ -4497,8 +4497,10 @@ r.join(",");
 /// it got to the bytecode call: an array-like's `shift` as its `toString`
 /// (or its `join`, or `Symbol.toPrimitive`) shifts once, a getter that
 /// `pop`s pops once. Nor does it go on to the next method, which may throw:
-/// `pop` as `valueOf` before a `toString` that throws for objects. The
-/// expected value is SpiderMonkey's, JSC's and QuickJS's.
+/// `pop` as `valueOf` before a `toString` that throws for objects; and
+/// what the other operand's conversion throws meanwhile is thrown only if
+/// it throws again after the redo. The expected value is SpiderMonkey's,
+/// JSC's and QuickJS's.
 #[test]
 fn redone_conversions_run_no_writing_native_twice() {
     assert_eq!(
@@ -4523,12 +4525,15 @@ Object.defineProperty(e, "message", { get: Array.prototype.pop.bind(q) });
 r.push(e + "", q.length);
 var p = { 0: 7, length: 1, valueOf: Array.prototype.pop, toString: Number.prototype.toString };
 r.push(+p, p.length);
+var b = { valueOf: Number.prototype.toString };
+p[0] = 8, p.length = 1;
+try { r.push(p + b); } catch (x) { r.push(x.constructor.name, p.length); }
 function f(n) { var t = 0; for (var i = 0; i < n; i++) { var x = mk("toString", Array.prototype.shift); t += +(x + "") + x.length; } return t; }
 r.push(f(5000));
 r.join(",");
 "#
         ),
-        "1,2,1,2,1,2,Error: 6,1,7,0,15000"
+        "1,2,1,2,1,2,Error: 6,1,7,0,TypeError,0,15000"
     );
 }
 

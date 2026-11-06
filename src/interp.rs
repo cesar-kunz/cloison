@@ -320,6 +320,7 @@ macro_rules! handlers {
                     let mut v = $e;
                     if (*vm).conv_redo {
                         (*vm).conv_redo = false;
+                        (*vm).drop_conv_error();
                         v = with_top($regs, None, |_| $e);
                     }
                     if (*vm).conv_thrown {

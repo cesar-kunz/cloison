@@ -12724,6 +12724,29 @@ fn short_templates_under_pressure() {
 }
 
 #[test]
+fn calls_with_only_eval_scopes_are_plain() {
+    // A call of a name a direct `eval` may declare, in no `with`: looked
+    // up in the eval's scope object, but never a method call, so one
+    // `CallUndefined` and no `Call` checking a flag.
+    let src = "function f() { eval(''); return h(1); } \
+        function k(o) { with (o) return h(1); } \
+        function h(a) { 'use strict'; return [this, a].join(); } \
+        function m(o) { eval(''); return h(...[1]); } \
+        [f(), k({}), k({ h: h, toString: () => 'o' }), m(), \
+         (function () { eval('var h = function (a) { return this === globalThis; }'); return h(2); })()].join(' ')";
+    assert_eq!(value(src), ",1 ,1 o,1 ,1 true");
+    let text = cloison::asm::disassemble(&cloison::js::compile(src).unwrap());
+    let body = |name: &str| {
+        let start = text.find(&format!("function {name}")).unwrap_or_else(|| panic!("{text}"));
+        let rest = &text[start..];
+        rest[..rest[1..].find("function ").map_or(rest.len(), |i| i + 1)].to_string()
+    };
+    let calls = |b: &str| (b.matches("\n        Call ").count(), b.matches("CallUndefined ").count());
+    assert_eq!(calls(&body("f")), (0, 1), "{}", body("f"));
+    assert_eq!(calls(&body("k")), (1, 1), "{}", body("k"));
+}
+
+#[test]
 fn forwarded_arguments_under_register_pressure() {
     // `g.apply(x, arguments)` in a function that makes no `arguments`
     // object (it only passes them on), with few registers left: still

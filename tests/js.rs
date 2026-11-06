@@ -13288,3 +13288,21 @@ out.join(" ");
     let ks: Vec<String> = (230..240).map(|k| k.to_string()).collect();
     assert_eq!(big_stack(|| value(src)), format!("42 {}", ks.join(" ")));
 }
+
+/// `Vm::string_units` reads a cons string without allocating (#69): with
+/// another VM run and dropped since, making it flat would have allocated
+/// through the stale current VM, and two of its slices are read at once.
+#[test]
+fn string_units_reads_cons_strings_in_place() {
+    let mut b = Vm::new();
+    let s = b.run(&cloison::js::compile("'x'.repeat(100) + 'y'").unwrap()).unwrap();
+    let t = b.run(&cloison::js::compile("'z' + 'w'.repeat(50)").unwrap()).unwrap();
+    {
+        let mut a = Vm::new();
+        a.run(&cloison::js::compile("0").unwrap()).unwrap();
+    }
+    let (u, w) = (b.string_units(s).unwrap(), b.string_units(t).unwrap());
+    assert_eq!((u.len(), u[0], u[100]), (101, b'x' as u16, b'y' as u16));
+    assert_eq!((w.len(), w[0], w[50]), (51, b'z' as u16, b'w' as u16));
+    assert!(b.string_units(cloison::value::Value::from_i32(1)).is_none());
+}

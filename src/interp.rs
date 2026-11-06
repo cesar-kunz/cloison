@@ -3680,8 +3680,6 @@ pub(crate) fn loose_equals(a: Value, b: Value) -> Result<bool, Error> {
     Ok(false)
 }
 
-/// The VM running (stencils' runtime calls and slow paths reach it this
-/// way to allocate strings).
 /// Whether a cached transition's store to location `loc` fits `o`: in
 /// the object, or out of line within its `props`' room (else the slow
 /// path grows them).
@@ -3690,12 +3688,40 @@ unsafe fn has_room(o: *mut Object, loc: i32) -> bool {
     loc >= 0 || unsafe { (!loc as u32) < Object::props_cap(o) }
 }
 
+/// The VM running (stencils' runtime calls and slow paths reach it this
+/// way to allocate strings): null outside `Vm::run` and its like (see
+/// [`Running`]).
 pub(crate) fn current_vm() -> *mut Vm {
     CURRENT_VM.with(|v| v.get())
 }
 
 thread_local! {
-    pub(crate) static CURRENT_VM: std::cell::Cell<*mut Vm> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+    static CURRENT_VM: std::cell::Cell<*mut Vm> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// A VM made the one running, as the current VM and its heap's owner
+/// (`heap::owner`), until dropped (on return, an early one, or unwinding):
+/// then those before are back, so that neither is left pointing at a VM
+/// that may move or be dropped once its run is over.
+pub(crate) struct Running {
+    vm: *mut Vm,
+    current: *mut Vm,
+    owner: *mut Vm,
+}
+
+impl Running {
+    pub(crate) fn new(vm: &mut Vm) -> Running {
+        let p: *mut Vm = vm;
+        let owner = vm.heap.set_owner(p);
+        Running { vm: p, current: CURRENT_VM.with(|v| v.replace(p)), owner }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        CURRENT_VM.with(|v| v.set(self.current));
+        unsafe { (*self.vm).heap.set_owner(self.owner) };
+    }
 }
 
 fn is_string(v: Value) -> bool {

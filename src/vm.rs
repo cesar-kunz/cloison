@@ -3232,6 +3232,7 @@ impl Vm {
             // The run is over: its `toString` can run at the stack's base.
             // (The conversion reaches the VM through `interp::current_vm`,
             // not `self`: the stores must not move across it.)
+            let _running = crate::interp::Running::new(self);
             let vm: *mut Vm = self;
             unsafe {
                 let saved = (*vm).native_top;
@@ -6235,7 +6236,7 @@ impl Vm {
     /// Load and run `module`; returns its completion value. Its bytecode
     /// is run unchecked, which [`Checked`](crate::asm::Checked) makes safe.
     pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
-        crate::interp::CURRENT_VM.with(|v| v.set(self));
+        let _running = crate::interp::Running::new(self);
         self.declare_script(module)?;
         let code = self.load(Module::clone(module));
         let here = 0u8;
@@ -6272,7 +6273,7 @@ impl Vm {
     /// Run `f` from the host, as `run` runs a script (then the event
     /// loop): an agent's broadcast callback (see `agent`).
     pub(crate) fn enter(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value>) -> Result<Value> {
-        crate::interp::CURRENT_VM.with(|v| v.set(self));
+        let _running = crate::interp::Running::new(self);
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
         let outer = self.heap.gc.stack_base == 0;
@@ -6311,7 +6312,7 @@ impl Vm {
     /// the promise jobs queued. Fails with an early error (a syntax error,
     /// an import that can't be resolved), or what its evaluation threw.
     pub fn run_module(&mut self, path: &str) -> std::result::Result<(), ModuleError> {
-        crate::interp::CURRENT_VM.with(|v| v.set(self));
+        let _running = crate::interp::Running::new(self);
         let here = 0u8;
         self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
         let outer = self.heap.gc.stack_base == 0;
@@ -7363,8 +7364,19 @@ pub fn display(v: Value) -> String {
         "null".into()
     } else if v.is_bool() {
         (v == Value::TRUE).to_string()
-    } else if let Some(s) = string_units(v) {
-        String::from_utf16_lossy(s)
+    } else if let Some(n) = string_len(v) {
+        // (A cons string's units copied out, not made flat: no VM may run
+        // to allocate for it.)
+        let o = as_object(v);
+        let mut units = vec![0u16; n];
+        unsafe {
+            if (*o).elems.is_null() {
+                copy_units(o, units.as_mut_ptr());
+            } else {
+                units.copy_from_slice(std::slice::from_raw_parts((*o).elems.cast::<u16>(), n));
+            }
+        }
+        String::from_utf16_lossy(&units)
     } else if crate::symbol::is_symbol(v) {
         String::from_utf16_lossy(&crate::symbol::symbol_string(v))
     } else if crate::bigint::is_bigint(v) {
@@ -7520,12 +7532,15 @@ pub(crate) fn push_string(out: &mut Vec<u16>, s: Value) -> Result<()> {
 }
 
 /// Make the cons string `o` (see [`Vm::new_cons`]) flat: its units copied
-/// out of its pieces, the pieces dropped.
+/// out of its pieces, the pieces dropped. Its own VM allocates them, which
+/// must be running (see `heap::owner`).
 #[cold]
 #[inline(never)]
 unsafe fn flatten(o: *mut Object) {
     unsafe {
-        let vm = &mut *crate::interp::current_vm();
+        let vm = crate::heap::owner(o as usize);
+        assert!(!vm.is_null(), "a string made flat outside its VM's run");
+        let vm = &mut *vm;
         let len = (*o).elems_len as usize;
         // Padded to whole words, and one more (copies read past the end).
         let buf = vm.heap.alloc_bytes(8 * (len.div_ceil(4) + 1)).cast::<u16>();

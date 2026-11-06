@@ -12659,6 +12659,53 @@ out.join(" ");
 }
 
 #[test]
+fn small_calls_under_register_pressure() {
+    big_stack(small_calls_under_pressure);
+}
+
+fn small_calls_under_pressure() {
+    // A function whose 150 variables leave about 100 registers: an
+    // expression `d` deep holds `d` of them. A call of 0 to 2 arguments
+    // holds its callee, its receiver and its arguments, as many as an
+    // array of them would need, so it keeps them in registers to the
+    // last one: as deep as `o.x` would go, less those it holds past one.
+    let src = r#"
+var vars = "";
+for (var i = 0; i < 150; i++) vars += "var v" + i + " = " + i + ";";
+function g() { return arguments.length; }
+function C() { this.n = arguments.length; }
+var o = { x: 1, g: g };
+function deepest(s, n, w) {
+    for (var d = 60; ; d++) {
+        var e = s;
+        for (var j = 0; j < d; j++) e = "(o.x + " + e + ")";
+        var body = w ? "with (o) return " + e + ";" : "return " + e + ";";
+        // (The inner function compiled when first called.)
+        try { var r = Function("g", "o", "C", "return function () { " + vars + body + " };")(g, o, C)(1, 2, 3); }
+        catch (x) { return d - 1; }
+        if (r !== d + n) return "wrong at " + d;
+    }
+}
+var base = deepest("o.x", 1), wbase = deepest("o.x", 1, true);
+var calls = [["g()", 0, 0], ["g(1)", 1, 1], ["g(1, 2)", 2, 2], ["o.g()", 0, 1], ["o.g(1, 2)", 2, 3],
+    ["new C().n", 0, 0], ["new C(1, 2).n", 2, 2], ["g.apply(o, arguments)", 3, 3],
+    // (Past `SPARE_REGS`: in an array, which needs 3 registers.)
+    ["g(" + "1,".repeat(30) + ")", 30, 2]];
+var out = calls.map(function (c) { return base - deepest(c[0], c[1]) === c[2] ? "ok" : c[0] + ": " + (base - deepest(c[0], c[1])); });
+// (Inside `with`: the lookup's registers, more than the arguments'.)
+out.push(deepest("g()", 0, true) === deepest("g(1, 2)", 2, true) ? "ok" : "with");
+out.join(" ");
+"#;
+    assert_eq!(value(src), ["ok"; 10].join(" "));
+    // Not in an array either, just short of the registers.
+    let vars: String = (0..150).map(|i| format!("var v{i} = {i};")).collect();
+    let e = (0..95).fold("o.g(1, 2)".to_string(), |e, _| format!("(o.x + {e})"));
+    let code = cloison::js::compile(&format!("function h(o) {{ {vars} return {e}; }}")).unwrap();
+    let text = cloison::asm::disassemble(&code);
+    assert!(!text.contains("call_spread") && !text.contains("CreateArray"), "{text}");
+}
+
+#[test]
 fn forwarded_arguments_under_register_pressure() {
     // `g.apply(x, arguments)` in a function that makes no `arguments`
     // object (it only passes them on), with few registers left: still

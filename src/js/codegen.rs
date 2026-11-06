@@ -5206,9 +5206,13 @@ impl<'a> Gen<'a> {
 
     /// Whether a call's arguments go in an array: with a spread, or too
     /// many for consecutive registers (the callee's and receiver's too)
-    /// with [`SPARE_REGS`] left.
+    /// with [`SPARE_REGS`] left. (Not a few, which the array's register
+    /// and `call_spread` wouldn't save registers for, only time.)
     fn args_array_needed(&self, args: &[Expr]) -> bool {
-        args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) || self.temp + 3 + args.len() + SPARE_REGS > 256
+        let n = args.len();
+        args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)))
+            || n > 255
+            || (n > SPARE_REGS && self.temp + 3 + n + SPARE_REGS > 256)
     }
 
     /// Arguments (some spread) into a new array in register `a`.

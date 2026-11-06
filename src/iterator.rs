@@ -751,7 +751,7 @@ fn join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         first = false;
         if !v.is_undefined() && !v.is_null() {
             let s = crate::intrinsics::to_string(vm, v)?;
-            out.extend_from_slice(crate::vm::string_units(s).unwrap_or(&[]));
+            crate::vm::push_string(&mut out, s)?;
         }
         Ok(None)
     })?;

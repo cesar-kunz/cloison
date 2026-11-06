@@ -7,7 +7,7 @@ use crate::interp::{call_function, check_native_stack, to_number, to_string_unit
 use crate::object::{Class, DONT_ENUM, RAW_JSON, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
-use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units, wrapped};
+use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, string_len, string_units, wrapped};
 
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
@@ -174,8 +174,12 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         push(out, if v == Value::TRUE { "true" } else { "false" });
         return Ok(true);
     }
-    if let Some(u) = string_units(v) {
-        quote(u, out);
+    if let Some(n) = string_len(v) {
+        // (Past the longest string: thrown before a long string's units are
+        // read, or once its escapes are.)
+        check_string_len(out.len() + n + 2)?;
+        quote(string_units(v).unwrap(), out);
+        check_string_len(out.len())?;
         return Ok(true);
     }
     if let Some(d) = v.as_number() {
@@ -198,6 +202,8 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     let o = as_object(v);
     let array = crate::proxy::is_array(vm, v)?;
     let mut parts: Vec<Vec<u16>> = Vec::new();
+    // The units of `parts` and their separators, which `out` gets.
+    let mut held = out.len() + 2;
     if array {
         let len = vm.length_of(v)?;
         let mut i = 0.0;
@@ -208,6 +214,8 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
             if !property(vm, st, ks, v, &mut part)? {
                 part = "null".encode_utf16().collect();
             }
+            held += part.len() + 1;
+            check_string_len(held)?;
             parts.push(part);
             i += 1.0;
         }
@@ -243,6 +251,8 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
                 part.push(b' ' as u16);
             }
             if property(vm, st, k, v, &mut part)? {
+                held += part.len() + 1;
+                check_string_len(held)?;
                 parts.push(part);
             }
         }
@@ -273,6 +283,8 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
         }
     }
     out.push(close as u16);
+    // (With a gap, each separator's indentation too.)
+    check_string_len(out.len())?;
     st.stack.pop();
     st.indent = stepback;
     Ok(true)

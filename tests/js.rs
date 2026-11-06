@@ -12629,6 +12629,8 @@ function tag(s) { return s; }
 var k = Function("tag", "return function () { return tag`\\unicode" + "${0}a".repeat(300) + "`; };")(tag);
 var s1 = k(), s2 = k();
 out.push(s1 === s2, Object.isFrozen(s1), Object.isFrozen(s1.raw), s1.length, s1[0], s1.raw[0], s1[300]);
+// (A function a direct `eval` declared: called with no `this`, spread or not.)
+out.push((function () { eval("var h = function () { 'use strict'; return this === undefined; }"); return [h(...[]), h(), h(0)].join("/"); })());
 out.join(" ");
 "#;
     let calls: Vec<String> = [252, 255, 256, 300, 70000]
@@ -12644,5 +12646,5 @@ out.join(" ");
     // not overflowing in debug builds.)
     let lets: String = (0..300).map(|i| format!("let s{i} = {i};")).collect();
     assert!(compile_error(&format!("{lets} eval('s299');")).contains("more variables than registers"));
-    assert_eq!(value(src), format!("{calls} 602 eseses 600 TypeError true true true 301  \\unicode a"));
+    assert_eq!(value(src), format!("{calls} 602 eseses 600 TypeError true true true 301  \\unicode a true/true/true"));
 }

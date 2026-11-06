@@ -2109,7 +2109,7 @@ impl<'a> Parser<'_, 'a, '_> {
     /// and those after a comma at its level on the same line). Names it
     /// doesn't use (an object literal's keys, a label, a variable declared
     /// otherwise) only capture variables needlessly. None on what parsing
-    /// it in full may reject (the end of the input, `let`).
+    /// it in full may reject (the end of the input, `let`), or on `eval`.
     fn skim_body(&mut self, params: &[Name]) -> Option<Vec<Name>> {
         // At `(`: a function's parameters, and where its body starts.
         let header = |toks: &[Token], mut j: usize| -> Option<(Vec<Name>, usize)> {
@@ -2218,8 +2218,15 @@ impl<'a> Parser<'_, 'a, '_> {
                         self.i = body;
                         continue;
                     }
-                    if &**n != "arguments" && self.toks[self.i - 1].tok != Tok::Punct(".") {
-                        frames.last_mut().unwrap().refs.push(n.clone());
+                    if self.toks[self.i - 1].tok != Tok::Punct(".") {
+                        // (A direct `eval` sees every variable around it:
+                        // parsed in full, see `Function::has_eval`.)
+                        if &**n == "eval" {
+                            return None;
+                        }
+                        if &**n != "arguments" {
+                            frames.last_mut().unwrap().refs.push(n.clone());
+                        }
                     }
                 }
                 _ => {}

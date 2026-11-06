@@ -4452,7 +4452,7 @@ impl Vm {
         // again (PdfJS's `map[command]`).
         let flat = |key: Value| string_len(key).is_some() && unsafe { !(*as_object(key)).elems.is_null() };
         if flat(key) {
-            let cached = unsafe { *Object::string_atom(as_object(key)) };
+            let cached = unsafe { Object::string_atom(as_object(key)) };
             if cached != 0 {
                 self.hold_atom(Atom(cached - 1));
                 return Key::Name(Atom(cached - 1));
@@ -4467,7 +4467,7 @@ impl Vm {
         let name = crate::js::lex::units_to_string(&units);
         let a = self.intern_name(&name);
         // (A cons string flattened by `to_string_units` too.)
-        if flat(key) && a.0 < u32::MAX {
+        if flat(key) && a.0 < crate::object::ATOM_TAG - 1 {
             unsafe { Object::set_string_atom(as_object(key), a.0 + 1) };
             self.keyed_strings.push(as_object(key));
         }

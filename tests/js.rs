@@ -8759,6 +8759,37 @@ fn modules_that_are_not_regular_files_throw() {
     assert_eq!(run_module(&dir, "main.mjs").unwrap(), ["TypeError: not a regular file"; 4].join(","));
 }
 
+/// Importing a FIFO doesn't open it: a writer waiting for a reader is
+/// left waiting (#67: it was opened, releasing the writer into a pipe
+/// closed at once, before the check that it is no regular file).
+#[test]
+fn modules_that_are_fifos_are_not_opened() {
+    let dir = module_dir("fifo-writer", &[("main.mjs", "try { await import('./fifo'); } catch (e) { globalThis.result = e.message; }")]);
+    let fifo = dir.join("fifo");
+    let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    let (opened, wait) = std::sync::mpsc::channel();
+    let writer = {
+        let fifo = fifo.clone();
+        std::thread::spawn(move || {
+            let f = std::fs::OpenOptions::new().write(true).open(&fifo);
+            opened.send(()).unwrap();
+            f
+        })
+    };
+    // (Time for the writer to reach its open.)
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let r = run_module(&dir, "main.mjs").unwrap();
+    assert!(r.ends_with("not a regular file"), "{r}");
+    let released = wait.recv_timeout(std::time::Duration::from_millis(300)).is_ok();
+    // (A reader of ours lets the writer go.)
+    use std::os::unix::fs::OpenOptionsExt;
+    let reader = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(&fifo).unwrap();
+    writer.join().unwrap().unwrap();
+    drop(reader);
+    assert!(!released, "the import opened the FIFO");
+}
+
 /// An import graph deeper than the stack allows fails with a RangeError
 /// that can be caught (no native stack overflow); a deep one that fits
 /// loads.

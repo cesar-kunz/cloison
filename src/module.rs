@@ -275,14 +275,21 @@ fn resolve_path(referrer: &str, specifier: &str) -> String {
 
 /// The bytes of the regular file at `path`, at most a string's length
 /// of them: a device or a pipe is refused (`/dev/zero` read until memory
-/// ran out, a FIFO blocked), opened without blocking, and a file growing
-/// as it is read is cut off.
+/// ran out, a FIFO blocked), and a file growing as it is read is cut off.
+/// It is checked before it is opened, as opening one can do something
+/// (release a FIFO's writer waiting for a reader, take a terminal as the
+/// process's own), and again once open, where nothing can replace it.
 fn read_file(path: &str) -> std::io::Result<Vec<u8>> {
     use std::io::{Error, ErrorKind, Read};
     use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+    let not_regular = || Error::new(ErrorKind::InvalidInput, "not a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_regular());
+    }
+    // (Replaced by a FIFO meanwhile, it doesn't block the open.)
+    let f = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
     if !f.metadata()?.is_file() {
-        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+        return Err(not_regular());
     }
     let max = crate::vm::MAX_STRING_LEN as u64;
     let mut bytes = Vec::new();

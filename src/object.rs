@@ -476,14 +476,14 @@ impl Object {
     /// As [`Object::string_atom`].
     #[inline(always)]
     pub unsafe fn set_string_atom(this: *mut Object, a: u32) {
-        use std::sync::atomic::{AtomicU64, Ordering::Release};
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         unsafe {
             debug_assert!((*this).class == Class::String && !(*this).elems.is_null());
             debug_assert!(a < ATOM_TAG);
             let words = (*this).code as usize as u32 as u64;
             let code = words | ((a | ATOM_TAG) as u64) << 32;
             debug_assert!(!Value::from_bits(code).is_cell());
-            (*(&raw const (*this).code as *const AtomicU64)).store(code, Release);
+            (*(&raw const (*this).code as *const AtomicU64)).store(code, Relaxed);
         }
     }
 

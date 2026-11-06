@@ -10416,6 +10416,27 @@ out.join(" ")
 }
 
 #[test]
+fn shadow_realm_throws_run_no_code_crossing() {
+    // What crosses a `ShadowRealm`'s boundary thrown is a `TypeError`, its
+    // message made without running the realm's code (no `toString`, as
+    // V8): the caller's frames, live, stay so and its `catch` catches.
+    let src = r#"
+var out = [], r = new ShadowRealm();
+function f(s) { try { r.evaluate(s); } catch (e) { out.push(e.constructor === TypeError, e.message); } return 42; }
+out.push(f("throw { toString() { globalThis.called = 1; return 'x'; } }"));
+out.push(f("throw new RangeError('boom')"), f("throw 'str'"));
+try { r.evaluate("(function () { throw { toString() {} }; })")(); } catch (e) { out.push(e.constructor === TypeError); }
+out.push(r.evaluate("typeof called"));
+out.join()
+"#;
+    assert_eq!(
+        value(src),
+        "true,ShadowRealm evaluation threw: [object Object],42,true,ShadowRealm evaluation threw: RangeError: boom,\
+         true,ShadowRealm evaluation threw: str,42,42,true,undefined"
+    );
+}
+
+#[test]
 fn direct_evals_kept_code_is_freed() {
     // Kept direct `eval`s' code unused since a full collection goes at the
     // next: a thousand texts' (each run often, 64 kept at most) leave no

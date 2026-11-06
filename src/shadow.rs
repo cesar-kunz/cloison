@@ -104,7 +104,35 @@ fn evaluate(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     match out {
         Ok(v) => wrap(vm, v),
         Err(e) if e.0.starts_with("unsupported") => Err(e),
-        Err(e) => Err(Error::type_error(format!("ShadowRealm evaluation threw: {}", vm.uncaught_message(&e)))),
+        Err(e) => Err(Error::type_error(format!("ShadowRealm evaluation threw: {}", thrown_message(vm, &e)))),
+    }
+}
+
+/// What `e` threw, for the `TypeError` a crossing turns it into, found
+/// without running code (no `toString`, no getter): an error object's
+/// `name` and `message` if data properties (its own, or its prototype's
+/// `name`), else the error's own message. (The caller's frames are live:
+/// `Vm::uncaught_message` would run over them.)
+fn thrown_message(vm: &mut Vm, e: &Error) -> String {
+    let Some(v) = e.1.filter(|&v| is_object(v)) else {
+        return e.0.clone();
+    };
+    let o = as_object(v);
+    if unsafe { (*o).flags } & crate::object::ERROR == 0 {
+        return e.0.clone();
+    }
+    let data = |vm: &mut Vm, o: *mut Object, name| match vm.own_property(o, Key::Name(name)) {
+        Some(Desc { value: Some(s), .. }) => string_units(s).map(String::from_utf16_lossy),
+        _ => None,
+    };
+    let (a_name, a_message) = (vm.a_name, vm.intern_name("message"));
+    let proto = unsafe { (*(*o).shape).proto };
+    let name = data(vm, o, a_name)
+        .or_else(|| is_object(proto).then(|| data(vm, as_object(proto), a_name)).flatten())
+        .unwrap_or_else(|| "Error".into());
+    match data(vm, o, a_message) {
+        Some(m) if !m.is_empty() => format!("{name}: {m}"),
+        _ => name,
     }
 }
 
@@ -120,7 +148,7 @@ fn wrap(vm: &mut Vm, v: Value) -> Result<Value> {
     let template = root(vm, Root::Wrapped);
     let f = native_closure(vm, template, &[v]);
     copy_name_and_length(vm, f, v)
-        .map_err(|e| Error::type_error(format!("wrapping a function: {}", vm.uncaught_message(&e))))?;
+        .map_err(|e| Error::type_error(format!("wrapping a function: {}", thrown_message(vm, &e))))?;
     Ok(f)
 }
 
@@ -180,7 +208,7 @@ fn wrapped_call(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     match r {
         Err(e) if e.0.starts_with("unsupported") => Err(e),
         Err(e) => {
-            let m = vm.uncaught_message(&e);
+            let m = thrown_message(vm, &e);
             Err(Error::type_error(format!("a wrapped function threw: {m}")))
         }
         ok => ok,
@@ -206,7 +234,7 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         Err(e) if e.0.starts_with("unsupported") => return Err(e),
         Err(e) => {
-            let m = vm.uncaught_message(&e);
+            let m = thrown_message(vm, &e);
             let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));
             call_function(vm, reject, Value::UNDEFINED, &[v])?;
         }
@@ -233,7 +261,7 @@ fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
         Ok(v) => call_function(vm, resolve, Value::UNDEFINED, &[v]),
         Err(e) if e.0.starts_with("unsupported") => Err(e),
         Err(e) => {
-            let m = vm.uncaught_message(&e);
+            let m = thrown_message(vm, &e);
             let v = crate::builtins::caught(vm, &Error::type_error(m));
             call_function(vm, reject, Value::UNDEFINED, &[v])
         }
@@ -244,7 +272,7 @@ fn imported(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 fn import_failed(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let reject = slot(vm.callee, 0);
     let e = Error::thrown(arg(a, 0));
-    let m = vm.uncaught_message(&e);
+    let m = thrown_message(vm, &e);
     let v = crate::builtins::caught(vm, &Error::type_error(format!("importValue failed: {m}")));
     call_function(vm, reject, Value::UNDEFINED, &[v])
 }

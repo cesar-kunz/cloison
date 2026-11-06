@@ -1487,7 +1487,7 @@ pub(crate) fn object_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<
     };
     // `@@toStringTag`, if a string.
     if this.is_cell()
-        && let Some(t) = crate::symbol::tag_of(vm, this)
+        && let Some(t) = crate::symbol::tag_of(vm, this)?
     {
         let mut u: Vec<u16> = "[object ".encode_utf16().collect();
         u.extend_from_slice(&t);

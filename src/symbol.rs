@@ -639,9 +639,9 @@ pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -
 }
 
 /// `Object.prototype.toString`'s tag for `o` from `@@toStringTag`, if a
-/// string.
-pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Option<Vec<u16>> {
+/// string (what its getter throws thrown).
+pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Result<Option<Vec<u16>>> {
     let a = vm.a_sym_to_string_tag;
-    let t = vm.get(o, a).ok()?;
-    string_units(t).map(|u| u.to_vec())
+    let t = vm.get(o, a)?;
+    Ok(string_units(t).map(|u| u.to_vec()))
 }

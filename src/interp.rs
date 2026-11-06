@@ -3809,9 +3809,11 @@ unsafe fn to_primitive_on(vm: &mut Vm, v: Value, hint: u8) -> Value {
                 continue;
             }
             let r = match (*as_object(m)).class {
+                // (Not the next method either: it may throw, and the redo
+                // would throw that.)
                 Class::Native | Class::Function if vm.native_top.is_null() && !replays(m) => {
                     vm.conv_redo = true;
-                    continue;
+                    return Value::UNDEFINED;
                 }
                 // (Another realm's: run there.)
                 Class::Native if !vm.realms.is_empty() => vm.call_other(m, v, &[]),

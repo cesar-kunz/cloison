@@ -520,8 +520,10 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 }
                 operand += k.width();
             }
+            // (A superinstruction's operands are its first instruction's.)
+            let plain = op.plain();
             // Registers past the operands': calls' argument windows.
-            let end = match op {
+            let end = match plain {
                 Op::Call => Some(vals[1] + vals[2] + 1),
                 Op::CallUndefined | Op::Construct => Some(vals[1] + vals[2]),
                 Op::CallApplyArguments => Some(vals[1] + 3),
@@ -532,7 +534,7 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 return err(at, format!("{op:?}: a register out of the frame's {}", f.nregs));
             }
             let string = |k: i64| matches!(f.constants[k as usize], Constant::String(_));
-            match op {
+            match plain {
                 Op::CompileLazy | Op::InitialYield | Op::Yield | Op::AsyncStart | Op::PushLiteral | Op::DefineAccessor => {
                     return err(at, format!("{op:?} is the front end's only"));
                 }
@@ -845,6 +847,13 @@ mod tests {
         .contains("register"));
         assert!(bad(&|f| f.code = vec![Op::LdaConstant as u8, 0, 0, Op::Return as u8]).contains("constant"));
         assert!(bad(&|f| f.code = vec![Op::TestNullJumpIfTrue as u8, Op::Return as u8]).contains("its jump"));
+        // A superinstruction's operands are checked as its first
+        // instruction's: no upvalue 0 here.
+        assert!(bad(&|f| {
+            f.nregs = 1;
+            f.code = vec![Op::LdaUpvalueStar as u8, 0, Op::Star as u8, 0, Op::Return as u8];
+        })
+        .contains("upvalue 0 out of range"));
         assert!(bad(&|f| f.kind = 4).contains("generator"));
         assert!(bad(&|f| f.handlers.push((0, 6, 3))).contains("handler"));
     }

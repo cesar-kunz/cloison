@@ -8974,6 +8974,23 @@ impl JitCode {
                 }
             }
         }
+        // Tests of captured registers, which `fold_constant_tests` leaves:
+        // folded here, where the stencils chosen show what runs between.
+        let folded_insns;
+        let insns = match fold_captured_tests(insns, &sel, &captured) {
+            Some(f) => {
+                for (k, insn) in f.iter().enumerate() {
+                    if insn.op != insns[k].op
+                        && let Some(s) = sel[k].as_mut()
+                    {
+                        (s.base, s.case) = if insn.op == Op::Jump { ("jump", "") } else { ("nop", "") };
+                    }
+                }
+                folded_insns = f;
+                &folded_insns[..]
+            }
+            None => insns,
+        };
         // Registers whose int32 slot a `Star` gives a boxed value
         // (`star_u<k>_v`): exits write them back with `spill_u<k>_v`.
         let mut boxed = vec![false; nregs];
@@ -11979,7 +11996,7 @@ fn lower_frames(state: &mut VmState, epoch: u32) -> Lowered {
     if spare > 0 {
         cx.out.direct_base = cx.out.direct_base.min(spare_base);
     }
-    fold_constant_tests(&mut cx.out.insns);
+    fold_constant_tests(&mut cx.out.insns, &captured_regs(root));
     thread_constant_jumps(&mut cx.out.insns);
     if !captures {
         reuse_global_loads(&mut cx.out);
@@ -13810,8 +13827,11 @@ fn hoist_loads(
 /// caller, or a parameter an inlined call leaves `undefined`
 /// (05-logical-or-default's `initial || 0`). Not past where control also
 /// arrives from elsewhere (a jump target, which loop entries are), a bail,
-/// or a call. `JumpIfTrue` and `JumpIfFalse` fold on booleans only.
-fn fold_constant_tests(insns: &mut [Insn]) {
+/// or a call. `JumpIfTrue` and `JumpIfFalse` fold on booleans only. Never
+/// in the registers closures capture (`captured`): an inlined closure's
+/// `StaUpvalue`, or code any instruction may run (a getter, `valueOf`),
+/// writes them; `fold_captured_tests` folds those once stencils are chosen.
+fn fold_constant_tests(insns: &mut [Insn], captured: &[bool]) {
     // A value's truth, and whether it's a boolean.
     #[derive(Clone, Copy)]
     struct Known {
@@ -13830,7 +13850,7 @@ fn fold_constant_tests(insns: &mut [Insn]) {
     let mut era = 1;
     let get = |regs: &[(u32, Option<Known>)], era, r: u8| {
         let (g, v) = regs[r as usize];
-        if g == era { v } else { None }
+        if g == era && captured.get(r as usize) != Some(&true) { v } else { None }
     };
     let mut acc: Option<Known> = None;
     let constant = |truth, boolean| Some(Known { truth, boolean });
@@ -13871,6 +13891,128 @@ fn fold_constant_tests(insns: &mut [Insn]) {
             acc = None;
         }
     }
+}
+
+/// `fold_constant_tests` again, once `select` has chosen the stencils
+/// (`sel`), for the tests it leaves: of registers closures capture
+/// (`captured`). What a captured register holds is known only across
+/// instructions whose stencils provably run no JS and write no upvalue:
+/// register moves, constant loads, `Nop`s with no code, tests (ToBoolean
+/// runs nothing), and arithmetic and compares on int32s and doubles (an
+/// empty `case` is the generic stencil, through the runtime, which may
+/// call `valueOf`; the typed ones compute inline, or exit, after which
+/// this code doesn't go on). Anything else, an inlined `StaUpvalue` among
+/// them, forgets the captured registers; the others are known as in
+/// `fold_constant_tests`. The instructions with tests folded (`Jump` if
+/// taken, else `Nop`), if any. Control flow only loses edges, so the
+/// types, liveness and homes found with them still hold.
+fn fold_captured_tests(insns: &[Insn], sel: &[Option<Sel>], captured: &[bool]) -> Option<Vec<Insn>> {
+    if !captured.contains(&true) {
+        return None;
+    }
+    let keeps = |i: &Insn, s: &Sel| {
+        i.guard == 0
+            && !i.next_case
+            && match i.op {
+                Op::Ldar
+                | Op::Star
+                | Op::Mov
+                | Op::LdaTrue
+                | Op::LdaFalse
+                | Op::LdaUndefined
+                | Op::LdaNull
+                | Op::LdaSmi
+                | Op::Jump
+                | Op::JumpIfTrue
+                | Op::JumpIfFalse
+                | Op::JumpIfToBooleanTrue
+                | Op::JumpIfToBooleanFalse => true,
+                Op::Nop => s.base == "nop",
+                Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::AddSmi
+                | Op::Inc
+                | Op::BitAnd
+                | Op::BitOr
+                | Op::BitXor
+                | Op::ShiftLeft
+                | Op::ShiftRight
+                | Op::ShiftRightLogical
+                | Op::BitAndSmi
+                | Op::BitOrSmi => s.base == "nop" || !s.case.is_empty(),
+                op => is_compare_jump(op) && !s.case.is_empty(),
+            }
+    };
+    #[derive(Clone, Copy)]
+    struct Known {
+        truth: bool,
+        boolean: bool,
+    }
+    let n = insns.len();
+    let mut target = vec![false; n];
+    for i in insns.iter().filter(|i| i.jumps()) {
+        if let Some(t) = target.get_mut(i.target) {
+            *t = true;
+        }
+    }
+    // Each register's value, if set in generation `era` and, for a
+    // captured one, `cap` (forgetting them all is starting the next era;
+    // the captured ones, the next `cap`).
+    let mut regs: Vec<(u32, u32, Option<Known>)> = vec![(0, 0, None); 256];
+    let (mut era, mut cap) = (1, 1);
+    let is_captured = |r: u8| captured.get(r as usize) == Some(&true);
+    let get = |regs: &[(u32, u32, Option<Known>)], era, cap, r: u8| {
+        let (g, c, v) = regs[r as usize];
+        if g == era && (c == cap || !is_captured(r)) { v } else { None }
+    };
+    let mut acc: Option<Known> = None;
+    let constant = |truth, boolean| Some(Known { truth, boolean });
+    let mut out: Option<Vec<Insn>> = None;
+    for k in 0..n {
+        let i = insns[k];
+        if target[k] || i.bail || i.is_call() {
+            era += 1;
+            acc = None;
+        }
+        if i.bail {
+            continue;
+        }
+        let Some(s) = &sel[k] else {
+            era += 1;
+            acc = None;
+            continue;
+        };
+        if !keeps(&i, s) {
+            cap += 1;
+        }
+        match i.op {
+            Op::LdaTrue => acc = constant(true, true),
+            Op::LdaFalse => acc = constant(false, true),
+            Op::LdaUndefined | Op::LdaNull => acc = constant(false, false),
+            Op::LdaSmi => acc = constant(i.imm != 0, false),
+            Op::Ldar => acc = get(&regs, era, cap, i.reg),
+            Op::Star => regs[i.reg as usize] = (era, cap, acc),
+            Op::Mov => regs[i.reg2 as usize] = (era, cap, get(&regs, era, cap, i.reg)),
+            Op::Nop if i.alloc == 0 => {}
+            Op::JumpIfToBooleanTrue | Op::JumpIfToBooleanFalse | Op::JumpIfTrue | Op::JumpIfFalse => {
+                let on = matches!(i.op, Op::JumpIfToBooleanTrue | Op::JumpIfTrue);
+                let to_boolean = matches!(i.op, Op::JumpIfToBooleanTrue | Op::JumpIfToBooleanFalse);
+                if let Some(v) = acc
+                    && (to_boolean || v.boolean)
+                {
+                    let f = out.get_or_insert_with(|| insns.to_vec());
+                    f[k].op = if v.truth == on { Op::Jump } else { Op::Nop };
+                }
+            }
+            _ => acc = None,
+        }
+        if !i.falls_through() {
+            era += 1;
+            acc = None;
+        }
+    }
+    out
 }
 
 /// Jumps to a test on a constant, threaded across the join where it is

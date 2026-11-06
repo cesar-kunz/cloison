@@ -1028,7 +1028,7 @@ fn typed_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::number(found.map_or(-1.0, |i| i as f64)))
 }
 
-fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let (o, len) = validate(this)?;
     let sep: Vec<u16> = match arg(a, 0) {
         s if s.is_undefined() => vec![b',' as u16],

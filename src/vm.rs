@@ -963,11 +963,13 @@ pub struct Vm {
     pub(crate) a_sym_species: Atom,
     pub(crate) a_sym_to_string_tag: Atom,
     pub(crate) a_sym_to_primitive: Atom,
-    /// Some object has had a `Symbol.toPrimitive` property, which
-    /// conversions then look for (see `interp::to_primitive_hint`).
+    /// Some object has had a `Symbol.toPrimitive` property, or a proxy
+    /// became a prototype, which conversions then look for (see
+    /// `interp::to_primitive_hint`).
     pub(crate) to_primitive_defined: bool,
     /// Some object but `Function.prototype` has had a `Symbol.hasInstance`
-    /// property, which `instance_of` then looks for.
+    /// property, or a proxy became a prototype, which `instance_of` then
+    /// looks for.
     pub(crate) has_instance_defined: bool,
     pub(crate) a_sym_has_instance: Atom,
     /// `Function.prototype[Symbol.hasInstance]` (see `instance_of`).
@@ -2415,9 +2417,12 @@ impl Vm {
             // (V8 makes a prototype fast again: `ReoptimizeIfPrototype`.)
             self.leave_dictionary(o);
             (*o).flags |= PROTOTYPE;
-            // (A proxy's `set` trap may take any new element's store.)
+            // (A proxy's traps may take any new element's store, and give
+            // any symbol's method.)
             if self.proxies_exist && crate::proxy::is_proxy(self, o) {
                 self.protect_indices();
+                self.to_primitive_defined = true;
+                self.has_instance_defined = true;
             }
             let s = &*(*o).shape;
             // The object leaves `s` (for a copy of its own).
@@ -3962,13 +3967,17 @@ impl Vm {
     /// `v instanceof f` (InstanceofOperator): `f[Symbol.hasInstance](v)`,
     /// which for a function is `Function.prototype`'s (it can't be changed
     /// there: not looked up for a plain function, of `function_shape`, nor
-    /// until some other object has had one), OrdinaryHasInstance.
+    /// but in a proxy until some other object has had one, or a proxy
+    /// became a prototype), OrdinaryHasInstance.
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
         if !self.running() {
             return self.host(|vm| vm.instance_of(v, f));
         }
         let function = f.is_cell() && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
-        if !function || self.has_instance_defined && unsafe { (*as_object(f)).shape } != self.function_shape {
+        if !function
+            || unsafe { (*as_object(f)).shape } != self.function_shape
+                && (self.has_instance_defined || self.proxies_exist && crate::proxy::is_proxy(self, as_object(f)))
+        {
             return self.instance_of_generic(v, f);
         }
         self.ordinary_has_instance(v, f)

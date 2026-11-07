@@ -494,7 +494,8 @@ pub fn lex_as(src: &str, module: bool) -> Result<Vec<Token>, Error> {
 }
 
 /// Whether a `/` after the tokens `toks` divides, else starts a regular
-/// expression: after what ends an expression, but a block's `}` (not
+/// expression: after what ends an expression (a property name too: `o.if
+/// / 2`), but a block's `}` (not
 /// `closed_expression`), a statement's head (`if (x) /a/.test(s)`, its
 /// `(` at `closed_paren`), a prefix `++` or `--` (not after an operand on
 /// its line), `yield` and `await` (as keywords: `yield /a/`), `of` after
@@ -503,19 +504,37 @@ fn divides(toks: &[Token], closed_expression: bool, closed_paren: usize) -> bool
     let Some(t) = toks.last() else {
         return false;
     };
+    if property_name(toks, toks.len() - 1) {
+        return true;
+    }
     match &t.tok {
         Tok::Punct("}") => closed_expression,
         Tok::Punct(")") => !(closed_paren != usize::MAX
             && closed_paren > 0
-            && matches!(toks[closed_paren - 1].tok, Tok::Keyword("if" | "while" | "for" | "with"))),
+            && matches!(toks[closed_paren - 1].tok, Tok::Keyword("if" | "while" | "for" | "with"))
+            && !property_name(toks, closed_paren - 1)),
         Tok::Punct("++" | "--") => {
-            !t.newline_before && toks.len() >= 2 && ends_expression(&toks[toks.len() - 2].tok)
+            !t.newline_before && toks.len() >= 2 && ends_operand(toks, toks.len() - 2)
         }
         Tok::Ident(n) if matches!(&**n, "yield" | "await") => false,
         // `for (x of /a/g…)`: `of` after an operand is the keyword.
-        Tok::Ident(n) if &**n == "of" && toks.len() >= 2 && ends_expression(&toks[toks.len() - 2].tok) => false,
+        Tok::Ident(n) if &**n == "of" && toks.len() >= 2 && ends_operand(toks, toks.len() - 2) => false,
         t => ends_expression(t),
     }
+}
+
+/// Whether `toks[j]` is a word after `.` or `?.` (`o.if`, `o?.yield`): a
+/// property name, which ends an expression whatever the word.
+fn property_name(toks: &[Token], j: usize) -> bool {
+    j > 0
+        && matches!(toks[j].tok, Tok::Ident(_) | Tok::Keyword(_))
+        && matches!(toks[j - 1].tok, Tok::Punct("." | "?."))
+}
+
+/// Whether `toks[j]` ends an expression (a property name or as
+/// `ends_expression`).
+fn ends_operand(toks: &[Token], j: usize) -> bool {
+    property_name(toks, j) || ends_expression(&toks[j].tok)
 }
 
 /// Whether a `/` after `t` divides (`t` ends an expression).

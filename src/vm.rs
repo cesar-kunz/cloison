@@ -782,8 +782,8 @@ pub struct Vm {
     /// (`field_generalized`): stores through the runtime check it, as one
     /// may have invalidated what the code storing assumes.
     pub(crate) code_epoch: u32,
-    /// Some object has had an indexed accessor or a read-only element
-    /// (see `protect_indices`).
+    /// Some object has had an indexed accessor or a read-only element, or
+    /// a proxy became a prototype (see `protect_indices`).
     pub(crate) indices_protected: bool,
     /// When arrays go far, and back (see `far::Density`).
     pub(crate) density: crate::far::Density,
@@ -2415,6 +2415,10 @@ impl Vm {
             // (V8 makes a prototype fast again: `ReoptimizeIfPrototype`.)
             self.leave_dictionary(o);
             (*o).flags |= PROTOTYPE;
+            // (A proxy's `set` trap may take any new element's store.)
+            if self.proxies_exist && crate::proxy::is_proxy(self, o) {
+                self.protect_indices();
+            }
             let s = &*(*o).shape;
             // The object leaves `s` (for a copy of its own).
             self.shape_left_stable(s);

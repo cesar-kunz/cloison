@@ -611,8 +611,9 @@ impl Vm {
         }
     }
 
-    /// An object has an indexed accessor or a read-only element: from now
-    /// on a store adding an element looks for one on the prototype chain
+    /// An object has an indexed accessor or a read-only element, or a
+    /// proxy became a prototype: from now on a store adding an element
+    /// looks for one (or the proxy) on the prototype chain
     /// (see `Vm::set_new_element`), and compiled code (which stores
     /// elements without looking) is dropped and compiles them through the
     /// interpreter.

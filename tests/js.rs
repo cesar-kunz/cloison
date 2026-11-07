@@ -365,6 +365,32 @@ q.then(() => { globalThis.out = log.join(" "); });
     assert_eq!(out_after_jobs(src), "2 1 TypeError");
 }
 
+/// A sync iterator used asynchronously (`yield*`, `for await`,
+/// `Array.fromAsync`) is closed in the job a rejected value's promise
+/// rejects in, unless done (AsyncFromSyncIteratorContinuation's
+/// `closeOnRejection`; #112).
+#[test]
+fn async_from_sync_closes_the_iterator_on_rejection() {
+    let src = r#"
+var log = [];
+var p = Promise.resolve(); for (let i = 0; i < 6; i++) p = p.then(() => log.push("t" + i));
+function S(k, done) { return { [Symbol.iterator]() { return this },
+  next() { return { value: Promise.reject(k), done } },
+  return() { log.push("closed " + k); return {}; } }; }
+async function* f() { yield* S("y", false); }
+f().next().catch(e => log.push("rejected " + e));
+(async () => { try { for await (var x of S("f", false)); } catch (e) { log.push("caught " + e); } })();
+Array.fromAsync(S("a", false)).catch(e => log.push("fromAsync " + e));
+(async () => { try { for await (var x of S("d", true)); } catch (e) { log.push("done " + e); } })();
+var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        "t0, closed y, closed f, closed a, t1, caught f, done d, t2, rejected y, fromAsync a, t3, t4, t5"
+    );
+}
+
 /// A direct `eval` in an arrow sees the enclosing function's `arguments`
 /// and `new.target`, as the arrow does.
 #[test]

@@ -212,7 +212,7 @@ fn parse_pass<'a>(
             p.functions[0].withs.push(e.clone());
         }
     }
-    p.push_scope(usize::MAX, false, true);
+    p.push_scope(SCRIPT_SCOPE, false, true);
     let mut body = Vec::new();
     if module.is_some() {
         body.push(p.module_body()?);
@@ -233,6 +233,7 @@ fn parse_pass<'a>(
             shadowed_params: std::mem::take(&mut p.shadowed_params),
             direct_eval: eval.is_some(),
             eval_locals: false,
+            script: eval.is_none() && module.is_none(),
             eval_upvalues: Vec::new(),
             own_names: Vec::new(),
             imports: std::mem::take(&mut p.imports),
@@ -270,6 +271,8 @@ const IMPORT: u8 = 5;
 
 /// The key of a module's own scope (see [`Parser::module_body`]).
 const MODULE_SCOPE: usize = usize::MAX - 2;
+/// The key of a script's own scope (its top level's).
+const SCRIPT_SCOPE: usize = usize::MAX;
 
 /// A scope being parsed: its names, renamed (the same for a function's
 /// `var`s, which shadow outer bindings).
@@ -3258,6 +3261,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 switch,
                 withs: self.withs.len(),
                 module_top: frame_key == MODULE_SCOPE,
+                script_top: frame_key == SCRIPT_SCOPE,
             },
         );
         r
@@ -4406,6 +4410,7 @@ impl<'a> Parser<'_, 'a, '_> {
                 switch: false,
                 withs: 0,
                 module_top: false,
+                script_top: false,
             },
         );
     }

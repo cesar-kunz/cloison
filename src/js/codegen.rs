@@ -261,18 +261,23 @@ fn generate_from<'p>(
     } else {
         Vec::new()
     };
-    let lexical = if root == 0 {
+    let top_lexicals: Vec<&str> = if root == 0 {
         p.functions[0]
             .body
             .iter()
             .flat_map(|s| match &s.kind {
-                StmtKind::Lexical(_, ds) => ds.iter().map(|(n, _)| original(n).to_string()).collect(),
+                StmtKind::Lexical(_, ds) => ds.iter().map(|(n, _)| &**n).filter(|n| !n.is_empty()).collect(),
                 _ => Vec::new(),
             })
             .collect()
     } else {
         Vec::new()
     };
+    let lexical = top_lexicals.iter().map(|n| original(n).to_string()).collect();
+    let constants = (top_lexicals.iter())
+        .filter(|n| p.lexicals.get(**n).is_some_and(|l| l.constant))
+        .map(|n| original(n).to_string())
+        .collect();
     let function_names = if root == 0 && !p.eval_locals {
         p.functions[0]
             .body
@@ -287,6 +292,7 @@ fn generate_from<'p>(
     };
     let module = Module {
         lexical,
+        constants,
         functions,
         script: 0,
         declared,
@@ -474,10 +480,20 @@ fn function_name(p: &Program, i: usize) -> String {
 }
 
 /// A variable of the script's own, a register, not a global: one of its
-/// block-scoped ones, any of strict `eval` code's, or its `this` for the
-/// arrows in it (`%this`).
+/// block-scoped ones (but the global scope's), any of strict `eval`
+/// code's, or its `this` for the arrows in it (`%this`).
 fn script_local(p: &Program, n: &str) -> bool {
-    p.eval_locals || p.lexicals.contains_key(n) || n == "%this"
+    p.eval_locals || p.lexicals.contains_key(n) && !global_lexical(p, n) || n == "%this"
+}
+
+/// A script's block-scoped variable at its top level (not in a block): a
+/// binding of the global scope, which every script and `eval` of the
+/// realm sees. A global by its name as written: the realm's (in
+/// `Vm::global_lexicals`, made before the script runs by
+/// `Vm::declare_script`), which global names find before the global
+/// object's properties; initialized by `InitGlobal`.
+fn global_lexical(p: &Program, n: &str) -> bool {
+    p.script && p.lexicals.get(n).is_some_and(|l| l.script_top)
 }
 
 /// Where each of function `i`'s upvalues comes from, in its parent: a
@@ -1020,9 +1036,9 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
     // too: a register, not a global).
     let this = p.functions[f].uses_this.then_some("%this");
     // The script's variables are globals, but for its block-scoped ones
-    // (and strict `eval` code's).
+    // not the global scope's (and strict `eval` code's).
     if f == 0 && !p.eval_locals {
-        out.retain(|n| p.lexicals.contains_key(*n));
+        out.retain(|n| p.lexicals.contains_key(*n) && !global_lexical(p, n));
         out.extend(this);
         return out;
     }
@@ -2409,7 +2425,9 @@ impl<'a> Gen<'a> {
     }
 
     fn global(&mut self, op: Op, name: &str) {
-        let ic = self.ic(op.name(), name);
+        // (The global scope's binding by its name as written: see
+        // `global_lexical`.)
+        let ic = self.ic(op.name(), original(name));
         self.emit(op, &[ic]);
     }
 
@@ -2632,6 +2650,10 @@ impl<'a> Gen<'a> {
 
     /// Initialize variable `n` with the accumulator (no `with` object's).
     fn init_var(&mut self, n: &str, pos: Pos) -> R<()> {
+        if global_lexical(self.p, n) {
+            self.global(Op::InitGlobal, n);
+            return Ok(());
+        }
         let withs = std::mem::take(&mut self.withs);
         let r = self.store_raw(n, pos);
         self.withs = withs;
@@ -2664,7 +2686,7 @@ impl<'a> Gen<'a> {
             Ident(n) if self.in_with(n) => self.with_delete(n, x.pos)?,
             Ident(n) => match self.resolve(n, x.pos)? {
                 Var::Global => {
-                    self.string(n);
+                    self.string(original(n));
                     self.emit(Op::DeleteGlobal, &[]);
                 }
                 _ => self.emit(Op::LdaFalse, &[]),
@@ -3459,7 +3481,7 @@ impl<'a> Gen<'a> {
             &mut |g| {
                 match g.resolve(name, pos)? {
                     Var::Global => {
-                        g.string(name);
+                        g.string(original(name));
                         g.emit(Op::DeleteGlobal, &[]);
                     }
                     _ => g.emit(Op::LdaFalse, &[]),
@@ -3587,7 +3609,9 @@ impl<'a> Gen<'a> {
         }
         if !self.p.lexicals.is_empty() && let Some(l) = self.p.lexicals.get(name) {
             if l.constant {
-                if self.needs_check(name, pos) {
+                // (The global scope's checks at its load: see
+                // `needs_check`.)
+                if self.needs_check(name, pos) || global_lexical(self.p, name) {
                     self.load_var(name, pos)?;
                 }
                 let mark = self.temp;
@@ -3894,7 +3918,9 @@ impl<'a> Gen<'a> {
         let Some(l) = self.p.lexicals.get(name) else {
             return false;
         };
-        if l.hoisted {
+        // (The global scope's: its global's accesses check, see
+        // `Vm::get_global_lexical`.)
+        if l.hoisted || global_lexical(self.p, name) {
             return false;
         }
         if l.switch {
@@ -4800,9 +4826,22 @@ impl<'a> Gen<'a> {
         };
         // (A script's: where it sees lexical bindings, its own `let`s and
         // the like, which an ordinary call of the global `eval` wouldn't.)
+        // (Not its top level's, the global scope's, which an indirect one
+        // sees too.)
+        let p = self.p;
         let script_lexicals = || {
             matches!(args.last(), Some(Expr { kind: ExprKind::Intrinsic("%eval_scope", v), .. })
-                if v.iter().any(|e| matches!(e.kind, ExprKind::Str(_))))
+                if v.iter().any(|e| matches!(&e.kind, ExprKind::Ident(n) if !global_lexical(p, n))))
+        };
+        // (A sloppy script's own seeing none but those: an ordinary call,
+        // without what the parser passes for them.)
+        let args = match args.split_last() {
+            Some((Expr { kind: ExprKind::Intrinsic("%eval_scope", _), .. }, rest))
+                if self.index == 0 && !self.p.direct_eval && !self.f.strict && !script_lexicals() =>
+            {
+                rest
+            }
+            _ => args,
         };
         if let ExprKind::Ident(n) = &f.kind
             && &**n == "eval"

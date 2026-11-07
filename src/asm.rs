@@ -186,6 +186,8 @@ pub struct Module {
     /// Its own block-scoped names (`let`, `const`, `class`): a script's
     /// may not be declared by another script (see `Vm::declare_script`).
     pub lexical: Vec<String>,
+    /// Which of `lexical` are `const`s.
+    pub constants: Vec<String>,
 }
 
 /// A module safe to run, which [`crate::vm::Vm::run`] takes:
@@ -452,6 +454,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
     }
     let module = Module {
         lexical: Vec::new(),
+        constants: Vec::new(),
         functions,
         script,
         declared: Vec::new(),
@@ -475,7 +478,8 @@ pub fn parse(src: &str) -> Result<Checked, String> {
 /// (generators' `InitialYield`, `Yield` and `AsyncStart`, `PushLiteral`'s
 /// array, `DefineAccessor`'s object, `Intrinsic`'s arguments), nor the
 /// hole `LdaHole` loads, which only the front end's code keeps from
-/// reaching other instructions; nor the script's use of a callee or
+/// reaching other instructions, nor `InitGlobal`, of a binding only
+/// the front end's script declares; nor the script's use of a callee or
 /// arguments; nor lazily compiled stubs, class constructors, generators
 /// or async functions (`kind` over 1).
 pub fn verify(m: &Module) -> Result<(), String> {
@@ -592,6 +596,7 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 | Op::PushLiteral
                 | Op::DefineAccessor
                 | Op::Intrinsic
+                | Op::InitGlobal
                 | Op::LdaHole => {
                     return err(at, format!("{op:?} is the front end's only"));
                 }
@@ -944,6 +949,12 @@ mod tests {
         })
         .contains("front end's only"));
         assert!(bad(&|f| f.code = vec![Op::LdaHole as u8, Op::ToNumber as u8, Op::Return as u8]).contains("front end's only"));
+        // (A global scope's binding the module doesn't declare.)
+        assert!(bad(&|f| {
+            f.code = vec![Op::LdaUndefined as u8, Op::InitGlobal as u8, 0, 0, Op::Return as u8];
+            f.ics.push("x".into());
+        })
+        .contains("front end's only"));
         // Calls fill `nparams` registers: not wrapped around to fit one.
         assert!(bad(&|f| {
             f.nparams = u32::MAX;

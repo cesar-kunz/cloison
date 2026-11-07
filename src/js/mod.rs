@@ -104,14 +104,15 @@ pub fn compile_script_lazy(src: &str) -> Result<Module, String> {
     .map_err(|e| e.display(src))
 }
 
-/// Compile `src` as indirect `eval`'s code: as a script's, but strict
-/// code's `var`s and functions its own.
+/// Compile `src` as indirect `eval`'s code: as a script's, but its
+/// block-scoped bindings its own, and strict code's `var`s and functions.
 pub fn compile_indirect_eval(src: &str) -> Result<Module, String> {
     let source: Rc<str> = src.into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
         parse::parse_source(src, &arena, skim).and_then(|mut p| {
             p.eval_locals = p.functions[0].strict;
+            p.script = false;
             codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
         })
     };

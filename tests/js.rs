@@ -312,6 +312,34 @@ p.then(() => { globalThis.out = log.join(" "); });
     assert_eq!(display(vm.get(g, a).unwrap()), "0 s1 caught 1 2 3 T 4 5 end 6 7");
 }
 
+/// `globalThis.out` once `src` and its jobs have run.
+fn out_after_jobs(src: &str) -> String {
+    let module = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.run(&module).unwrap();
+    let a = vm.intern("out");
+    let g = vm.global_object();
+    display(vm.get(g, a).unwrap())
+}
+
+/// What a `for await` step throws (`next()` throwing, rejecting or giving
+/// a non-object) doesn't close the iterator (#111).
+#[test]
+fn for_await_step_errors_leave_the_iterator_open() {
+    let src = r#"
+var log = [];
+for (const next of [() => Promise.reject(1), () => { throw 2; }, () => 3])
+  (async () => {
+    try {
+      for await (var x of { [Symbol.asyncIterator]() { return { next, return() { log.push("closed"); return {}; } }; } });
+    } catch (e) { log.push(typeof e == "object" ? e.name : e); }
+  })();
+var q = Promise.resolve(); for (let i = 0; i < 6; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(" "); });
+"#;
+    assert_eq!(out_after_jobs(src), "2 1 TypeError");
+}
+
 /// A direct `eval` in an arrow sees the enclosing function's `arguments`
 /// and `new.target`, as the arrow does.
 #[test]

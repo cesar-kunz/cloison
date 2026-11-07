@@ -6439,48 +6439,55 @@ impl<'a> Gen<'a> {
         self.in_try += 1;
         self.bind(top);
         // (What the step throws, `next()`, a result's `done` or `value`,
-        // doesn't close the iterator: outside the loop's `try`.)
+        // doesn't close the iterator: outside the loop's `try`, its awaits
+        // too, whose returns would leave it.)
         self.pause_try();
-        match sync {
+        let paused = self.trys.pop().expect("the loop's try");
+        let step = |g: &mut Self| -> R<()> {
+            let Some(sync) = sync else {
+                g.intrinsic("iterator_step", it, 1);
+                return Ok(());
+            };
             // `await it.next()` (a sync iterator's result as it is), then
             // its value (a sync iterator's awaited).
-            Some(sync) => {
-                let (result_ready, value_ready) = (self.label(), self.label());
-                self.intrinsic("async_iterator_next", it, 1);
-                self.star(v);
-                self.ldar(sync);
-                self.jump_if(Jmp::True, result_ready);
-                self.ldar(v);
-                self.yield_acc(pos)?;
-                self.star(v);
-                self.bind(result_ready);
-                self.intrinsic("async_iterator_value", v, 1);
-                self.star(v);
-                self.ldar(sync);
-                self.jump_if(Jmp::False, value_ready);
-                // A sync iterator's step, as AsyncFromSyncIterator's: a
-                // promise of its value (`undefined` once done) settling a
-                // job after it, awaited.
-                let not_done = self.label();
-                let finished = self.alloc(pos)?;
-                self.ldar(v);
-                self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
-                self.star(finished);
-                self.jump_if(Jmp::False, not_done);
-                self.emit(Op::LdaUndefined, &[]);
-                self.star(v);
-                self.bind(not_done);
-                self.intrinsic("async_from_sync", v, 1);
-                self.yield_acc(pos)?;
-                self.star(v);
-                self.ldar(finished);
-                self.temp -= 1;
-                self.jump_if(Jmp::True, done);
-                self.bind(value_ready);
-                self.ldar(v);
-            }
-            None => self.intrinsic("iterator_step", it, 1),
-        }
+            let (result_ready, value_ready) = (g.label(), g.label());
+            g.intrinsic("async_iterator_next", it, 1);
+            g.star(v);
+            g.ldar(sync);
+            g.jump_if(Jmp::True, result_ready);
+            g.ldar(v);
+            g.yield_acc(pos)?;
+            g.star(v);
+            g.bind(result_ready);
+            g.intrinsic("async_iterator_value", v, 1);
+            g.star(v);
+            g.ldar(sync);
+            g.jump_if(Jmp::False, value_ready);
+            // A sync iterator's step, as AsyncFromSyncIterator's: a
+            // promise of its value (`undefined` once done) settling a job
+            // after it, awaited.
+            let not_done = g.label();
+            let finished = g.alloc(pos)?;
+            g.ldar(v);
+            g.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+            g.star(finished);
+            g.jump_if(Jmp::False, not_done);
+            g.emit(Op::LdaUndefined, &[]);
+            g.star(v);
+            g.bind(not_done);
+            g.intrinsic("async_from_sync", v, 1);
+            g.yield_acc(pos)?;
+            g.star(v);
+            g.ldar(finished);
+            g.temp -= 1;
+            g.jump_if(Jmp::True, done);
+            g.bind(value_ready);
+            g.ldar(v);
+            Ok(())
+        };
+        let r = step(self);
+        self.trys.push(paused);
+        r?;
         self.star(v);
         self.resume_try();
         self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);

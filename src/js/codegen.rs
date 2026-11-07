@@ -1725,8 +1725,9 @@ struct TryCtx<'a> {
     /// A `for (… of …)` loop's: the register of the iterator to close when
     /// a jump leaves it (its "finally").
     close: Option<u8>,
-    /// A `for await` loop's: the close awaited.
-    close_async: bool,
+    /// A `for await` loop's: the close awaited, and the register of
+    /// whether its iterator is a sync one.
+    close_async: Option<u8>,
 }
 
 impl<'a> Gen<'a> {
@@ -3033,7 +3034,7 @@ impl<'a> Gen<'a> {
             finally,
             targets: self.targets.len(),
             close: None,
-            close_async: false,
+            close_async: None,
         });
     }
 
@@ -3076,11 +3077,10 @@ impl<'a> Gen<'a> {
             t.start = end;
             let (close, finally, close_async) = (t.close, t.finally, t.close_async);
             if let Some(r) = close {
-                if close_async {
+                if let Some(sync) = close_async {
                     // (Compiled as outside the loop: the `await` may return.)
                     let inner = self.trys.split_off(i);
-                    self.intrinsic("async_iterator_close", r, 1);
-                    let r = self.yield_acc(self.f.pos);
+                    let r = self.async_close(r, sync);
                     self.trys.extend(inner);
                     r?;
                 } else {
@@ -3103,6 +3103,31 @@ impl<'a> Gen<'a> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A `for await` left early: its iterator `r`'s `return()` called
+    /// (`sync` telling a sync one's) and what it gives awaited, which must
+    /// be an object (nothing awaited without a `return()`).
+    fn async_close(&mut self, r: u8, sync: u8) -> R<()> {
+        let pos = self.f.pos;
+        let mark = self.temp;
+        let (t, s, hole) = (self.alloc(pos)?, self.alloc(pos)?, self.alloc(pos)?);
+        let closed = self.label();
+        self.emit(Op::LdaHole, &[]);
+        self.star(hole);
+        self.mov(r, t);
+        self.mov(sync, s);
+        self.intrinsic("async_iterator_close", t, 2);
+        self.star(t);
+        self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+        self.jump_if(Jmp::True, closed);
+        self.ldar(t);
+        self.yield_acc(pos)?;
+        self.star(t);
+        self.intrinsic("async_iterator_closed", t, 2);
+        self.bind(closed);
+        self.temp = mark;
         Ok(())
     }
 
@@ -6372,7 +6397,7 @@ impl<'a> Gen<'a> {
         });
         self.open_try(None);
         self.trys.last_mut().unwrap().close = Some(it);
-        self.trys.last_mut().unwrap().close_async = is_await;
+        self.trys.last_mut().unwrap().close_async = sync;
         self.in_try += 1;
         self.bind(top);
         // (What the step throws, `next()`, a result's `done` or `value`,
@@ -6475,8 +6500,9 @@ impl<'a> Gen<'a> {
         if self.reachable {
             self.jump(brk);
         }
-        // An exception: the iterator closed (its own errors lost), then
-        // thrown on.
+        // An exception: the iterator closed (its own errors lost, and
+        // with `for await`, how what `return()` gives settles, but awaited
+        // all the same), then thrown on.
         let handler = self.label();
         self.labels[handler.0].used = true;
         self.reachable = false;
@@ -6485,7 +6511,26 @@ impl<'a> Gen<'a> {
         self.handlers.extend(ranges.iter().map(|&(s, e)| (s, e, at)));
         let e = self.alloc(pos)?;
         self.star(e);
-        self.intrinsic("iterator_close_quiet", it, 1);
+        if is_await {
+            let Var::Reg(g) = self.resolve(GEN, pos)? else {
+                return unsupported(pos, "a generator with this many variables");
+            };
+            let closed = self.label();
+            let (t, s) = (self.alloc(pos)?, self.alloc(pos)?);
+            self.mov(it, t);
+            self.mov(sync.expect("a for await"), s);
+            self.intrinsic("async_iterator_close_quiet", t, 2);
+            self.star(t);
+            self.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
+            self.jump_if(Jmp::True, closed);
+            self.ldar(t);
+            self.emit(Op::Yield, &[Arg::Reg(g)]);
+            self.acc = Acc::default();
+            self.reachable = true;
+            self.bind(closed);
+        } else {
+            self.intrinsic("iterator_close_quiet", it, 1);
+        }
         self.ldar(e);
         self.emit(Op::Throw, &[]);
         self.bind(brk);

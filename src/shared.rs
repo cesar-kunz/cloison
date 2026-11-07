@@ -572,7 +572,8 @@ fn atomics_pause(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 // ---- Waiting ----
 
-/// A waiter, on element `index` (a byte index) of a block: notified or
+/// A waiter, on element `index` (a byte index) of a block (a reference
+/// to it: freed, another block at its address would match): notified or
 /// not, and the condition variable to signal (a blocked agent's own, or
 /// an async waiter's VM's `State::signal`).
 pub(crate) struct Waiter {
@@ -581,6 +582,19 @@ pub(crate) struct Waiter {
     notified: AtomicBool,
     deadline: Option<Instant>,
     wake: Arc<Condvar>,
+}
+
+impl Waiter {
+    fn new(block: *mut Block, index: usize, deadline: Option<Instant>, wake: Arc<Condvar>) -> Arc<Waiter> {
+        retain(block);
+        Arc::new(Waiter { block: block as usize, index, notified: AtomicBool::new(false), deadline, wake })
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        release(self.block as *mut Block);
+    }
 }
 
 /// Every waiter in the process, in the order they came.
@@ -612,7 +626,7 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
         return Err(Error::type_error("Atomics.wait: this agent can't block"));
     }
     let b = crate::typed::buffer_of(o);
-    let block = block_of(b) as usize;
+    let block = block_of(b);
     let index = i * k.size() + crate::typed::offset_of(o);
     let deadline = (t.is_finite()).then(|| Instant::now() + Duration::from_secs_f64(t / 1000.0));
     let mut list = waiters();
@@ -629,14 +643,14 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
             let s = str_value(vm, "timed-out");
             return wait_result(vm, false, s);
         }
-        let waiter = Arc::new(Waiter { block, index, notified: AtomicBool::new(false), deadline, wake: vm.shared.signal.clone() });
+        let waiter = Waiter::new(block, index, deadline, vm.shared.signal.clone());
         list.push(waiter.clone());
         drop(list);
         let (p, resolve, _) = crate::promise::new_with_resolvers(vm);
         vm.shared.waits.push((waiter, p, resolve));
         return wait_result(vm, true, p);
     }
-    let waiter = Arc::new(Waiter { block, index, notified: AtomicBool::new(false), deadline, wake: Arc::new(Condvar::new()) });
+    let waiter = Waiter::new(block, index, deadline, Arc::new(Condvar::new()));
     list.push(waiter.clone());
     loop {
         if waiter.notified.load(SeqCst) {

@@ -5895,7 +5895,7 @@ impl<'a> Gen<'a> {
             return unsupported(pos, "a generator with this many variables");
         };
         let mark = self.temp;
-        // `[iterator, received, mode]` for `async_delegate_step`.
+        // `[iterator, received, mode, sync]` for `async_delegate_step`.
         let it = self.alloc(pos)?;
         let received = self.alloc(pos)?;
         let mode = self.alloc(pos)?;
@@ -5915,48 +5915,26 @@ impl<'a> Gen<'a> {
         self.star(mode);
         let (top, done) = (self.loop_label(), self.label());
         self.bind(top);
-        // The result awaited (a sync iterator's as it is), …
-        let result_ready = self.label();
-        self.intrinsic("async_delegate_step", it, 3);
-        self.star(result);
-        self.ldar(sync);
-        self.jump_if(Jmp::True, result_ready);
-        self.ldar(result);
+        // The result awaited, its value into `v` (a sync iterator's step
+        // AsyncFromSyncIterator's: a promise of the value, `done` kept in
+        // the record), whether done in `acc`.
+        let (inner, stepped) = (self.label(), self.label());
+        self.intrinsic("async_delegate_step", it, 4);
         self.yield_acc(pos)?;
         self.star(result);
-        self.bind(result_ready);
-        // … its value into `v` (a sync iterator's awaited, as
-        // AsyncFromSyncIterator's step: its rejection closes the iterator
-        // unless done, or a `return()`'s).
-        let value = |g: &mut Self, done: bool| -> R<()> {
-            let ready = g.label();
-            g.named(Op::GetNamed, result, "value");
-            g.star(v);
-            g.ldar(sync);
-            g.jump_if(Jmp::False, ready);
-            let mark = g.temp;
-            let w = g.alloc(pos)?;
-            let close = g.alloc(pos)?;
-            g.mov(v, w);
-            g.emit(Op::LdaUndefined, &[]);
-            g.star(close);
-            if !done {
-                let returning = g.label();
-                g.ldar(mode);
-                g.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), returning);
-                g.mov(it, close);
-                g.bind(returning);
-            }
-            g.intrinsic("async_from_sync", w, 2);
-            g.temp = mark;
-            g.yield_acc(pos)?;
-            g.star(v);
-            g.bind(ready);
-            Ok(())
-        };
+        self.ldar(sync);
+        self.jump_if(Jmp::False, inner);
+        self.mov(result, v);
+        self.intrinsic("async_from_sync_done", it, 1);
+        self.jump(stepped);
+        self.bind(inner);
         self.intrinsic("delegate_done", result, 1);
+        self.star(gr);
+        self.named(Op::GetNamed, result, "value");
+        self.star(v);
+        self.ldar(gr);
+        self.bind(stepped);
         self.jump_if(Jmp::True, done);
-        value(self, false)?;
         // Yielded as it is; what the generator resumes with (and how) sent
         // on, a `return(v)`'s `v` awaited first (its rejection a `throw`).
         self.mov(g, gr);
@@ -5987,7 +5965,6 @@ impl<'a> Gen<'a> {
         self.jump(top);
         self.bind(done);
         // (A `return()` passed on: the generator returns the value.)
-        value(self, true)?;
         let (ret, end) = (self.label(), self.label());
         self.ldar(mode);
         self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), ret);
@@ -6480,11 +6457,11 @@ impl<'a> Gen<'a> {
         pos: Pos,
     ) -> R<()> {
         let it = self.alloc(pos)?;
-        let hole = self.alloc(pos)?;
-        let v = self.alloc(pos)?;
-        // (`for await`: whether over a sync iterator, whose values are
-        // awaited instead of its results.)
+        // (`for await`: whether over a sync iterator, stepped as
+        // AsyncFromSyncIterator; `[record, sync, v]` for the intrinsics.)
         let sync = if is_await { Some(self.alloc(pos)?) } else { None };
+        let v = self.alloc(pos)?;
+        let hole = self.alloc(pos)?;
         // (`let`/`const`: not initialized while the iterable is evaluated.)
         if kind >= 2 {
             let mut ns = Vec::new();
@@ -6502,7 +6479,13 @@ impl<'a> Gen<'a> {
             Some(sync) => {
                 self.intrinsic("async_iterator_kind", v, 1);
                 self.star(sync);
-                self.intrinsic("get_async_iterator", v, 2);
+                // (`[iterable, sync]`.)
+                let mark = self.temp;
+                let (t, s) = (self.alloc(pos)?, self.alloc(pos)?);
+                self.star(s);
+                self.mov(v, t);
+                self.intrinsic("get_async_iterator", t, 2);
+                self.temp = mark;
             }
             None => self.intrinsic("get_iterator", v, 1),
         }
@@ -6528,55 +6511,15 @@ impl<'a> Gen<'a> {
         self.pause_try();
         let paused = self.trys.pop().expect("the loop's try");
         let step = |g: &mut Self| -> R<()> {
-            let Some(sync) = sync else {
+            if sync.is_none() {
                 g.intrinsic("iterator_step", it, 1);
                 return Ok(());
-            };
-            // `await it.next()` (a sync iterator's result as it is), then
-            // its value (a sync iterator's awaited).
-            let (result_ready, value_ready) = (g.label(), g.label());
-            g.intrinsic("async_iterator_next", it, 1);
-            g.star(v);
-            g.ldar(sync);
-            g.jump_if(Jmp::True, result_ready);
-            g.ldar(v);
+            }
+            // `await it.next()`, then its value.
+            g.intrinsic("async_iterator_next", it, 2);
             g.yield_acc(pos)?;
             g.star(v);
-            g.bind(result_ready);
-            let mark = g.temp;
-            let result = g.alloc(pos)?;
-            g.mov(v, result);
-            g.intrinsic("async_iterator_value", v, 1);
-            g.star(v);
-            g.ldar(sync);
-            g.jump_if(Jmp::False, value_ready);
-            // A sync iterator's step, as AsyncFromSyncIterator's: a
-            // promise of its value (once done too) settling a job after
-            // it, awaited; its rejection closes the iterator unless done
-            // (`[value, iterator]`, `undefined` the iterator once done).
-            let not_done = g.label();
-            let finished = g.alloc(pos)?;
-            let w = g.alloc(pos)?;
-            let close = g.alloc(pos)?;
-            g.mov(v, w);
-            g.mov(it, close);
-            g.ldar(v);
-            g.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
-            g.star(finished);
-            g.jump_if(Jmp::False, not_done);
-            g.named(Op::GetNamed, result, "value");
-            g.star(w);
-            g.emit(Op::LdaUndefined, &[]);
-            g.star(close);
-            g.bind(not_done);
-            g.intrinsic("async_from_sync", w, 2);
-            g.yield_acc(pos)?;
-            g.star(v);
-            g.ldar(finished);
-            g.temp = mark;
-            g.jump_if(Jmp::True, done);
-            g.bind(value_ready);
-            g.ldar(v);
+            g.intrinsic("async_iterator_value", it, 3);
             Ok(())
         };
         let r = step(self);

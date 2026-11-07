@@ -387,6 +387,8 @@ struct SkimFrame {
     decls: Vec<Name>,
     refs: Vec<Name>,
     level: usize,
+    /// The levels of the `(`s open that may be a method's.
+    calls: Vec<usize>,
 }
 
 type R<T> = Result<T, Error>;
@@ -2112,22 +2114,43 @@ impl<'a> Parser<'_, 'a, '_> {
     /// it in full may reject (the end of the input, `let`), or on `eval`.
     fn skim_body(&mut self, params: &[Name]) -> Option<Vec<Name>> {
         // At `(`: a function's parameters, and where its body starts.
-        let header = |toks: &[Token], mut j: usize| -> Option<(Vec<Name>, usize)> {
-            let mut params = Vec::new();
-            if toks[j].tok != Tok::Punct("(") {
+        // (The `{` checked first: a call's names not copied.)
+        let header = |toks: &[Token], j: usize| -> Option<(Vec<Name>, usize)> {
+            if !matches!(toks[j].tok, Tok::Punct("(")) {
                 return None;
             }
-            j += 1;
+            let mut k = j + 1;
             loop {
-                match &toks[j].tok {
+                match &toks[k].tok {
                     Tok::Punct(")") => break,
-                    Tok::Punct(",") => {}
-                    Tok::Ident(n) => params.push(n.clone()),
+                    Tok::Punct(",") | Tok::Ident(_) => {}
                     _ => return None,
                 }
-                j += 1;
+                k += 1;
             }
-            (toks[j + 1].tok == Tok::Punct("{")).then_some((params, j + 2))
+            if !matches!(toks[k + 1].tok, Tok::Punct("{")) {
+                return None;
+            }
+            let params = toks[j + 1..k]
+                .iter()
+                .filter_map(|t| match &t.tok {
+                    Tok::Ident(n) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            Some((params, k + 2))
+        };
+        // Whether `toks[j]` is where an object literal's method may be
+        // named: after a `,`, `*`, `async`, or an object literal's `{`
+        // (not a block's).
+        let method_name = |toks: &[Token], j: usize| match &toks[j - 1].tok {
+            Tok::Punct(",") | Tok::Punct("*") => true,
+            Tok::Ident(n) => &**n == "async",
+            Tok::Punct("{") => !matches!(
+                toks[j - 2].tok,
+                Tok::Punct(")" | "{" | "}" | ";") | Tok::Keyword("else" | "do" | "try" | "catch" | "finally")
+            ),
+            _ => false,
         };
         // (Frames' vectors kept for the next function's, emptied.)
         let mut spare = std::mem::take(&mut self.skim_spare);
@@ -2151,11 +2174,48 @@ impl<'a> Parser<'_, 'a, '_> {
                 Tok::Eof | Tok::Punct("=>" | "...") | Tok::Keyword("const" | "class" | "with" | "import" | "export" | "super") => return None,
                 Tok::Ident(n) if &**n == "let" || n.starts_with('#') => return None,
                 Tok::Keyword("new") if self.toks[self.i + 1].tok == Tok::Punct(".") => return None,
-                Tok::Punct("{" | "(" | "[") => level += 1,
+                Tok::Punct("(") => {
+                    // A method (`m() { … }`, `*m`, `async m`, `'m'`, `[k]`,
+                    // `if`), a function too.
+                    let name = &self.toks[self.i - 1].tok;
+                    let named = match name {
+                        Tok::Punct("]") => true,
+                        Tok::Keyword("function") => false,
+                        Tok::Ident(_) | Tok::Keyword(_) | Tok::Str(_) | Tok::Num(_) | Tok::BigInt(_) => method_name(self.toks, self.i - 1),
+                        _ => false,
+                    };
+                    if named {
+                        if let Some((params, body)) = header(self.toks, self.i) {
+                            // (Perhaps a call and a block after it, or an
+                            // `if`: its names referred to here too.)
+                            if self.toks[body - 1].newline_before || matches!(name, Tok::Keyword("if" | "while" | "switch")) {
+                                frames.last_mut().unwrap().refs.extend_from_slice(&params);
+                            }
+                            level += 1;
+                            frames.push(frame(&mut spare, &params, level));
+                            self.i = body;
+                            continue;
+                        }
+                        // (Its parameters more than names, if a `{` follows
+                        // the `)`: see below.)
+                        frames.last_mut().unwrap().calls.push(level);
+                    }
+                    level += 1;
+                }
+                Tok::Punct("{" | "[") => level += 1,
                 Tok::Punct(p @ ("}" | ")" | "]")) => {
                     level -= 1;
                     if var_level.is_some_and(|v| level < v) {
                         var_level = None;
+                    }
+                    if *p == ")" {
+                        let calls = &mut frames.last_mut().unwrap().calls;
+                        if calls.last() == Some(&level) {
+                            calls.pop();
+                            if matches!(self.toks[self.i + 1].tok, Tok::Punct("{")) {
+                                return None;
+                            }
+                        }
                     }
                     if *p == "}" && level + 1 == frames.last().unwrap().level {
                         let mut f = frames.pop().unwrap();
@@ -2174,6 +2234,7 @@ impl<'a> Parser<'_, 'a, '_> {
                             }
                         };
                         f.decls.clear();
+                        f.calls.clear();
                         spare.push(f);
                         if done.is_some() {
                             self.i += 1;

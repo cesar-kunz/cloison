@@ -6458,6 +6458,20 @@ var src = [
 (0, eval)(src);
 "#;
     assert_eq!(value(evals), "1,2:undefined,3,4,5");
+    // A method's `var`s are its own (#94), however it's written; a call
+    // and a block after it, or an `if`, read as one, still refer to their
+    // names. SpiderMonkey's values.
+    let methods = r#"
+var src = [
+  "function m1() { var x = 1; return function () { ({ m() { var x }, *g() { var x }, async a() { var x } }); return x; }; }",
+  "function m2() { var x = 2; return function () { ({ 'm'(p, q) { var x }, 1() { var x }, [x]() { var x }, if() { var x } }); return x; }; }",
+  "function m3() { var x = 3; return function () { ({ var() { var x }, get() { var x }, m()\n{ var x }, n({ p }) { var x } }); return x; }; }",
+  "function m4() { var a = 4; return function () { var f = function () {}; f(a)\n{ var y } l: { if (a) { var z } } return a; }; }",
+  "[m1()(), m2()(), m3()(), m4()()].join(',');"
+].join("\n");
+(0, eval)(src);
+"#;
+    assert_eq!(value(methods), "1,2,3,4");
     // A skimmed body's syntax error is thrown at its first call (Node
     // throws at the `eval`).
     assert_eq!(
@@ -9116,6 +9130,31 @@ globalThis.result = out.join();
         "1,2,TypeError,default,fn,default,42,count/default/inc/later/ns/renamed,Module,2,2,function,\
          ,false,false,false,{\"value\":2,\"writable\":true,\"enumerable\":true,\"configurable\":false},\
          ReferenceError,,undefined,true,"
+    );
+}
+
+/// A module whose own code calls `eval` exports its `let`, `const` and
+/// `class` bindings still (#96): its scope object, which importers read,
+/// holds them; the `eval`'s code sees them there, uninitialized ones
+/// throwing, a `const` not assignable. SpiderMonkey's values.
+#[test]
+fn modules_with_eval_export_lexicals() {
+    let dir = module_dir(
+        "eval",
+        &[
+            ("main.mjs", "import { a, b, C, d, v, setA, out } from './m.mjs';\nconst r = [a, b, typeof C, d, v];\nsetA();\nglobalThis.result = r.concat(a, d, out).join();"),
+            (
+                "m.mjs",
+                "const out = [];\nconst f = (s) => { try { return eval(s); } catch (e) { return e.name; } };\nout.push(f('typeof a'));\n\
+                 try { eval('a'); } catch (e) { out.push(e.name); }\nexport let a = 1; export const b = 2; export class C {} let d = 4; export { d, out };\n\
+                 export var v = 5; export function setA() { a = 10; d = 40; }\ntry { eval('b = 3'); } catch (e) { out.push(e.name); }\n\
+                 out.push(f('b = 3'), eval('a + b'), f('d'), eval('let a = 9; a'), eval('a = 6'), a);",
+            ),
+        ],
+    );
+    assert_eq!(
+        run_module(&dir, "main.mjs").unwrap(),
+        "6,2,function,4,5,10,40,ReferenceError,ReferenceError,TypeError,TypeError,3,4,9,6,6"
     );
 }
 

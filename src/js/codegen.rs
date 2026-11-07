@@ -92,7 +92,8 @@ fn generate_from<'p>(
         if p.functions[i].has_eval || p.functions[i].generator || p.functions[i].is_async {
             // Its parameters and `var`s in its scope object, where direct
             // `eval`'s code finds them (block-scoped ones, and the parser's,
-            // stay in registers). A generator's, all of them: its frame
+            // stay in registers; but a module's own, which other modules
+            // import from it). A generator's, all of them: its frame
             // leaves the stack at each `yield`, its closures can't point
             // into it.
             let f = &p.functions[i];
@@ -107,7 +108,7 @@ fn generate_from<'p>(
                 if generator {
                     return n != GEN && n != EVAL_SCOPE && n != MODULE_ENV && Some(n) != own && !boxed[i].contains(&n);
                 }
-                !n.starts_with('%') && !p.lexicals.contains_key(n) && Some(n) != own
+                !n.starts_with('%') && p.lexicals.get(n).is_none_or(|l| l.module_top) && Some(n) != own
             };
             d.extend(rest.iter().copied().filter(|&n| !in_env(n)));
             let env_vars: Vec<&str> = rest.iter().copied().filter(|&n| in_env(n)).collect();
@@ -4939,14 +4940,27 @@ impl<'a> Gen<'a> {
             let mut kept = Vec::new();
             let mut nlex = 0;
             for (i, b) in bindings.into_iter().enumerate() {
-                if !matches!(self.resolve(b.1, pos)?, Var::Global) {
-                    let up = carrier.and_then(|f| self.scopes.upvalues[f].iter().position(|&u| u == b.1));
+                let var = self.resolve(b.1, pos)?;
+                if !matches!(var, Var::Global) {
+                    let mut up = carrier.and_then(|f| self.scopes.upvalues[f].iter().position(|&u| u == b.1));
                     // (One in a box: see `boxed_lexicals`.)
                     let mut k = Some(self.index);
                     while let Some(j) = k.filter(|&j| !self.decls[j].contains(&b.1)) {
                         k = self.p.functions[j].parent;
                     }
-                    let boxed = k.is_some_and(|j| self.boxed[j].contains(&b.1));
+                    let mut boxed = k.is_some_and(|j| self.boxed[j].contains(&b.1));
+                    // (A module's own, in its scope object: that its box.)
+                    if self.p.lexicals.get(b.1).is_some_and(|l| l.module_top) {
+                        let env = match var {
+                            Var::Scope(_) => Some(ENV),
+                            Var::ScopeUpvalue(u) => Some(self.scopes.upvalues[self.index][u as usize]),
+                            _ => None,
+                        };
+                        if let Some(env) = env {
+                            up = carrier.and_then(|f| self.scopes.upvalues[f].iter().position(|&u| u == env));
+                            boxed = true;
+                        }
+                    }
                     kept.push((b.0, b.1, b.2 | if boxed { EVAL_BOXED as i32 } else { 0 }, up));
                     nlex += (i < lexical) as i32;
                 }
@@ -4963,9 +4977,10 @@ impl<'a> Gen<'a> {
             // `intrinsics::direct_eval_bound`), no scope object made. Then
             // the bindings function, what they are (the block-scoped
             // count, the function's upvalues, and each binding's kind,
-            // upvalue and name) and the site's number.
+            // upvalue and name) and the site's number. (Not with bindings
+            // in one box, a module's scope object: one upvalue each.)
             if let Some(cf) = carrier.filter(|_| {
-                self.index != 0 && kept.iter().all(|b| b.3.is_some())
+                self.index != 0 && kept.iter().enumerate().all(|(i, b)| b.3.is_some() && kept[..i].iter().all(|c| c.3 != b.3))
             }) {
                 let c = self.alloc(pos)?;
                 debug_assert_eq!(c as usize, fr as usize + nargs as usize);

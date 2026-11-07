@@ -919,6 +919,12 @@ fn using_try(s: &Stmt) -> bool {
     matches!(&s.kind, StmtKind::Try(_, Some((c, _)), _) if c.starts_with(crate::js::ast::USING_CATCH))
 }
 
+/// Whether callee `f` is a method (`o.m` or `o[k]`), called with `o` as
+/// `this`.
+fn is_method(f: &Expr) -> bool {
+    matches!(f.kind, ExprKind::Member(..) | ExprKind::Index(..))
+}
+
 /// Whether call `f(args)` is `g.apply(x, arguments)`.
 fn apply_arguments(f: &Expr, args: &[Expr]) -> bool {
     matches!(&f.kind, ExprKind::Member(_, m) if &**m == "apply")
@@ -2716,6 +2722,29 @@ impl<'a> Gen<'a> {
         self.ldar(t);
         self.temp = mark;
         Ok(())
+    }
+
+    /// `o`'s value into register `r`; in a callee's `(o?.m)`, `o` the
+    /// part of the chain ending at `nil`.
+    fn chain_into(&mut self, o: &Expr, r: u8, nil: Option<L>) -> R<()> {
+        let Some(nil) = nil else {
+            return self.into(o, r);
+        };
+        self.chains.push(nil);
+        let res = self.into(o, r);
+        self.chains.pop();
+        res
+    }
+
+    /// After a callee's `(o?.m)`, the method in `acc`, or if its chain
+    /// ended early (at `nil`), `undefined` in `acc` and in register `this`.
+    fn chain_end(&mut self, nil: L, this: u8) {
+        let end = self.label();
+        self.jump(end);
+        self.bind(nil);
+        self.emit(Op::LdaUndefined, &[]);
+        self.star(this);
+        self.bind(end);
     }
 
     /// `t &&= v` (`kind` 0), `t ||= v` (1) or `t ??= v` (2): `v` assigned
@@ -4793,9 +4822,17 @@ impl<'a> Gen<'a> {
     fn call(&mut self, f: &Expr, args: &[Expr], new: bool, pos: Pos) -> R<()> {
         // `o.m?.()`: the method (with `o` its `this`) checked.
         let (f, optional) = match &f.kind {
-            ExprKind::Optional(m) if !new && matches!(m.kind, ExprKind::Member(..) | ExprKind::Index(..)) => {
+            ExprKind::Optional(m)
+                if !new && (is_method(m) || matches!(&m.kind, ExprKind::Chain(m) if is_method(m))) =>
+            {
                 (&**m, true)
             }
+            _ => (f, false),
+        };
+        // `(o?.m)()`: the method (with `o` its `this` too), undefined if
+        // the chain ends early.
+        let (f, chain) = match &f.kind {
+            ExprKind::Chain(m) if !new && is_method(m) => (&**m, true),
             _ => (f, false),
         };
         // (A script's: where it sees lexical bindings, its own `let`s and
@@ -5117,12 +5154,12 @@ impl<'a> Gen<'a> {
         {
             return self.with_call(n, args, pos);
         }
-        let method = !new && matches!(f.kind, ExprKind::Member(..) | ExprKind::Index(..));
+        let method = !new && is_method(f);
         // `g.apply(x, arguments)` passing the frame's arguments on. (Never
         // in an array: the function has no `arguments` to put there.)
-        let forward = method && apply_arguments(f, args) && forwards_arguments(self.p, self.index);
+        let forward = method && !chain && apply_arguments(f, args) && forwards_arguments(self.p, self.index);
         if !forward && self.args_array_needed(args) {
-            return self.call_spread(f, args, new, optional, pos);
+            return self.call_spread(f, args, new, optional, chain, pos);
         }
         let n =
             u8::try_from(args.len()).or_else(|_| unsupported(pos, "more than 255 arguments"))?;
@@ -5135,11 +5172,12 @@ impl<'a> Gen<'a> {
                 ExprKind::Index(o, k) => (o, Err(k)),
                 _ => unreachable!(),
             };
+            // (In `(o?.m)()`, `o`'s chain ending at `nil`.)
+            let nil = chain.then(|| self.label());
             let ro = match self.local(o) {
                 Some(r) => r,
                 None => {
-                    self.value(o)?;
-                    self.star(w);
+                    self.chain_into(o, w, nil)?;
                     w
                 }
             };
@@ -5150,6 +5188,9 @@ impl<'a> Gen<'a> {
                     let ic = self.auto_ic("[]keyed");
                     self.emit(Op::GetKeyed, &[Arg::Reg(ro), ic]);
                 }
+            }
+            if let Some(nil) = nil {
+                self.chain_end(nil, w);
             }
             self.star(c);
             if optional {
@@ -5192,21 +5233,28 @@ impl<'a> Gen<'a> {
 
     /// A call or `new` with a spread argument: the arguments into an
     /// array, for the runtime (`[f, this, args]` or `[f, args]`).
-    fn call_spread(&mut self, f: &Expr, args: &[Expr], new: bool, optional: bool, pos: Pos) -> R<()> {
+    fn call_spread(&mut self, f: &Expr, args: &[Expr], new: bool, optional: bool, chain: bool, pos: Pos) -> R<()> {
         let mark = self.temp;
         let c = self.alloc(pos)?;
         let w = if new { c } else { self.alloc(pos)? };
+        let nil = chain.then(|| self.label());
         match &f.kind {
             ExprKind::Member(o, name) if !new => {
-                self.into(o, w)?;
+                self.chain_into(o, w, nil)?;
                 self.member(Op::GetNamed, w, name)?;
+                if let Some(nil) = nil {
+                    self.chain_end(nil, w);
+                }
                 self.star(c);
             }
             ExprKind::Index(o, k) if !new => {
-                self.into(o, w)?;
+                self.chain_into(o, w, nil)?;
                 self.value(k)?;
                 let ic = self.auto_ic("[]keyed");
                 self.emit(Op::GetKeyed, &[Arg::Reg(w), ic]);
+                if let Some(nil) = nil {
+                    self.chain_end(nil, w);
+                }
                 self.star(c);
             }
             _ => {

@@ -462,6 +462,7 @@ impl Regex {
             explicit,
             depth: 0,
             pending: None,
+            half: None,
         };
         let node = p.alternation()?;
         if p.i != chars.len() {
@@ -1171,6 +1172,10 @@ struct Parser<'a> {
     depth: usize,
     /// An error a class's member found (see `Parser::class_atom`).
     pending: Option<String>,
+    /// Outside `u` mode, the trail of the astral character at `i`, whose
+    /// lead was the last atom or class member: the next one (see
+    /// `Parser::lead_unit`).
+    half: Option<u16>,
 }
 
 /// The deepest groups may nest: the parser, and the passes over the tree
@@ -1360,6 +1365,10 @@ impl Parser<'_> {
     }
 
     fn atom_node(&mut self) -> Result<Node, String> {
+        if let Some(t) = self.half.take() {
+            self.i += 1;
+            return Ok(Node::Char(t));
+        }
         let c = self.peek().unwrap();
         self.i += 1;
         Ok(match c {
@@ -1436,6 +1445,7 @@ impl Parser<'_> {
             '{' if self.braces_at_atom() => return Err(self.error("Nothing to repeat")),
             '{' | '}' | ']' if self.unicode => return Err(self.error("Lone quantifier brackets")),
             '*' | '+' | '?' => return Err(self.error("Nothing to repeat")),
+            c if !self.unicode => Node::Char(self.lead_unit(c)),
             c => self.char_here(c),
         })
     }
@@ -1650,10 +1660,8 @@ impl Parser<'_> {
                     b'\\' as u16
                 }
             },
-            c => {
-                let mut b = [0u16; 2];
-                c.encode_utf16(&mut b)[0]
-            }
+            c if self.unicode => c as u16,
+            c => self.lead_unit(c),
         } as u32;
         // (`u` mode: `\uD83D\uDE00`, a surrogate pair's escapes, is the one
         // code point.)
@@ -1669,6 +1677,19 @@ impl Parser<'_> {
             return 0x10000 + ((u - 0xD800) << 10) + (t - 0xDC00);
         }
         u
+    }
+
+    /// Outside `u` mode, the unit that character `c`, just consumed, is
+    /// first: of an astral one, its lead, its trail left at `self.i` as
+    /// the next atom or class member (the pattern is code units).
+    fn lead_unit(&mut self, c: char) -> u16 {
+        let mut b = [0u16; 2];
+        let units = c.encode_utf16(&mut b);
+        if let [_, t] = units {
+            self.half = Some(*t);
+            self.i -= 1;
+        }
+        units[0]
     }
 
     fn class(&mut self) -> Result<Node, String> {
@@ -1729,14 +1750,17 @@ impl Parser<'_> {
     /// A class member: a code point (a code unit but in `u` mode), or
     /// (`Err`) a class escape's ranges.
     fn class_atom(&mut self) -> Result<u32, Vec<(u32, u32)>> {
+        if let Some(t) = self.half.take() {
+            self.i += 1;
+            return Ok(t as u32);
+        }
         let c = self.c[self.i];
         self.i += 1;
         if c != '\\' {
             if self.unicode {
                 return Ok(c as u32);
             }
-            let mut b = [0u16; 2];
-            return Ok(c.encode_utf16(&mut b)[0] as u32);
+            return Ok(self.lead_unit(c) as u32);
         }
         let Some(e) = self.peek() else { return Ok(b'\\' as u32) };
         let wide = |r: Vec<(u16, u16)>| r.into_iter().map(|(lo, hi)| (lo as u32, hi as u32)).collect::<Vec<_>>();

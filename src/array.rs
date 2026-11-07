@@ -1243,7 +1243,7 @@ fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 ("call", from_async_call, 2),
                 ("define", from_async_define, 3),
                 ("typeError", from_async_type_error, 1),
-                ("fromSync", from_async_from_sync, 1),
+                ("fromSync", from_async_from_sync, 2),
             ] {
                 let f = object_value(vm.native_function(name, f, n, crate::jit::Ty::Any, false));
                 vm.handles.push(f);
@@ -1260,8 +1260,9 @@ fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Array.fromAsync`'s algorithm (ECMA-262 §23.1.2.2), its steps as the
-/// spec orders them. `fromSync(v)` is a sync iterator's step as
-/// AsyncFromSyncIterator takes it (the promise `for await` awaits).
+/// spec orders them. `fromSync(v, it)` is a sync iterator's step as
+/// AsyncFromSyncIterator takes it (the promise `for await` awaits; its
+/// rejection closes `it`, if given).
 const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, fromSync, asyncIterator, iterator) {
   "use strict";
   function isObject(x) { return (typeof x === "object" && x !== null) || typeof x === "function"; }
@@ -1305,18 +1306,7 @@ const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, f
         if (sync) {
           // (AsyncFromSyncIterator: the value awaited even when done; a
           // rejection closes the iterator if it isn't.)
-          v = r.value;
-          try {
-            v = await fromSync(v);
-          } catch (e) {
-            if (!done) {
-              try {
-                const ret = getMethod(it, "return");
-                if (ret !== void 0) call(ret, it);
-              } catch (_) {}
-            }
-            throw e;
-          }
+          v = await fromSync(r.value, done ? void 0 : it);
         }
         if (done) {
           A.length = k;
@@ -1380,7 +1370,7 @@ fn from_async_type_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn from_async_from_sync(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    crate::promise::async_from_sync(vm, arg(a, 0))
+    crate::promise::async_from_sync(vm, arg(a, 0), arg(a, 1))
 }
 
 fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

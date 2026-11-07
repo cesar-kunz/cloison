@@ -219,12 +219,17 @@ impl Parser<'_> {
         if may {
             return Err(self.error("Negated character class may contain strings"));
         }
-        // (Folding case, of the code points folding leaves as they are.)
-        let mut cps = complement_points(&set.cps);
+        Ok((ClassSet::of_ranges(self.set_complement(&set.cps)), false))
+    }
+
+    /// The code points not in `cps` (folded if `i` holds here): folding
+    /// case, of the code points folding leaves as they are.
+    fn set_complement(&self, cps: &[(u32, u32)]) -> Vec<(u32, u32)> {
+        let mut cps = complement_points(cps);
         if self.ignore_case {
             cps = intersect_points(&cps, &complement_points(unfolded_points()));
         }
-        Ok((ClassSet::of_ranges(cps), false))
+        cps
     }
 
     /// A union (with ranges), an intersection (`&&`) or a subtraction
@@ -431,7 +436,13 @@ impl Parser<'_> {
             self.i += name.chars().count() + 2;
             return Ok((ClassSet { cps: set.cps.clone(), strs: set.strs.clone() }, true));
         }
-        Ok((ClassSet::of_ranges(self.property(neg)?), false))
+        // (`\P`: the complement of the property folded, as a negated
+        // class's.)
+        let set = ClassSet::of_ranges(self.property(false)?);
+        if neg {
+            return Ok((ClassSet::of_ranges(self.set_complement(&self.maybe_fold(set).cps)), false));
+        }
+        Ok((set, false))
     }
 }
 

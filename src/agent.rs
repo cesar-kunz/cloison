@@ -225,6 +225,7 @@ fn run_agent_vm(mut vm: Vm, src: &str, mailbox: &Mailbox, reports: Reports) {
             continue;
         };
         let r = vm.enter(|vm| {
+            crate::shared::catch_up(vm);
             let sab = crate::shared::new_shared(vm, m.block as *mut crate::shared::Block, m.growable)?;
             vm.handles.push(sab);
             crate::interp::call_function(vm, callback, Value::UNDEFINED, &[sab, m.id])
@@ -280,6 +281,7 @@ fn agent_get_report(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     let r = lock(&vm.agent.reports).pop_front();
     Ok(match r {
         Some(s) => {
+            crate::shared::catch_up(vm);
             let u: Vec<u16> = s.encode_utf16().collect();
             vm.new_string(&u)
         }

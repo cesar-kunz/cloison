@@ -6458,6 +6458,20 @@ var src = [
 (0, eval)(src);
 "#;
     assert_eq!(value(evals), "1,2:undefined,3,4,5");
+    // A method's `var`s are its own (#94), however it's written; a call
+    // and a block after it, or an `if`, read as one, still refer to their
+    // names. SpiderMonkey's values.
+    let methods = r#"
+var src = [
+  "function m1() { var x = 1; return function () { ({ m() { var x }, *g() { var x }, async a() { var x } }); return x; }; }",
+  "function m2() { var x = 2; return function () { ({ 'm'(p, q) { var x }, 1() { var x }, [x]() { var x }, if() { var x } }); return x; }; }",
+  "function m3() { var x = 3; return function () { ({ var() { var x }, get() { var x }, m()\n{ var x }, n({ p }) { var x } }); return x; }; }",
+  "function m4() { var a = 4; return function () { var f = function () {}; f(a)\n{ var y } l: { if (a) { var z } } return a; }; }",
+  "[m1()(), m2()(), m3()(), m4()()].join(',');"
+].join("\n");
+(0, eval)(src);
+"#;
+    assert_eq!(value(methods), "1,2,3,4");
     // A skimmed body's syntax error is thrown at its first call (Node
     // throws at the `eval`).
     assert_eq!(

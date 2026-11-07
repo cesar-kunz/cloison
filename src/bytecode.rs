@@ -328,6 +328,10 @@ define_ops! {
     DeleteProperty(Reg),
     /// `acc = delete <global named acc>`
     DeleteGlobal(),
+    /// Initialize the global scope's block-scoped binding the
+    /// inline-cache slot names (a script's top-level `let`, `const` or
+    /// class) to `acc`.
+    InitGlobal(Ic),
     /// Define the getter (`k` 0) or setter (1) `acc` of `r[a]`'s property
     /// named by constant `c` (an object literal's `get`/`set`).
     DefineAccessor(Reg, Const, Count),

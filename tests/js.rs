@@ -421,6 +421,34 @@ q.then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// What a sync iterator's step throws in `for await` or `yield*` (its
+/// `next()`, a non-object result, a `done` or `value` getter) rejects
+/// the AsyncFromSyncIterator step's promise, awaited: seen a job later,
+/// the iterator not closed (IfAbruptRejectPromise).
+#[test]
+fn async_from_sync_step_errors_are_awaited_rejections() {
+    let src = r#"
+var log = [];
+var p = Promise.resolve(); for (let i = 0; i < 3; i++) p = p.then(() => log.push("t" + i));
+function S(tag, kind) { return { [Symbol.iterator]() { return this; },
+  next() { if (kind == "next") throw tag; if (kind == "obj") return 5;
+    return { get done() { if (kind == "done") throw tag; return false; }, get value() { if (kind == "value") throw tag; return 1; } }; },
+  return() { log.push("closed " + tag); return {}; } }; }
+for (const k of ["next", "obj", "done", "value"]) {
+  (async () => { try { for await (var x of S("f" + k, k)); } catch (e) { log.push(typeof e == "string" ? e : "f" + e.name); } })();
+  async function* g() { try { yield* S("y" + k, k); } catch (e) { log.push(typeof e == "string" ? e : "y" + e.name); } }
+  g().next();
+  log.push(k);
+}
+var q = Promise.resolve(); for (let i = 0; i < 6; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        "next, obj, done, value, t0, fnext, ynext, fTypeError, yTypeError, fdone, ydone, fvalue, yvalue, t1, t2"
+    );
+}
+
 /// An `await` whose PromiseResolve throws (a promise's `constructor`
 /// getter) throws at the `await`, there and then: in a `for await`'s
 /// close on an exception, the loop's exception goes on.

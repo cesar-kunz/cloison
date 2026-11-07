@@ -224,6 +224,13 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, close: Value) -> Result<Val
     Ok(cap.promise)
 }
 
+/// A promise fulfilled with `v` as it is (a thenable too).
+pub(crate) fn fulfilled(vm: &mut Vm, v: Value) -> Result<Value> {
+    let p = new_promise(vm);
+    settle(vm, as_object(p), FULFILLED, v)?;
+    Ok(p)
+}
+
 /// A promise rejected with what `e` throws.
 pub(crate) fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
     let reason = thrown(vm, e)?;

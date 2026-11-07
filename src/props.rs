@@ -611,8 +611,9 @@ impl Vm {
         }
     }
 
-    /// An object has an indexed accessor or a read-only element: from now
-    /// on a store adding an element looks for one on the prototype chain
+    /// An object has an indexed accessor or a read-only element, or a
+    /// proxy became a prototype: from now on a store adding an element
+    /// looks for one (or the proxy) on the prototype chain
     /// (see `Vm::set_new_element`), and compiled code (which stores
     /// elements without looking) is dropped and compiles them through the
     /// interpreter.
@@ -1422,9 +1423,10 @@ fn descriptors(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
     let po = vm.to_object(props)?;
     let mut out = Vec::new();
     vm.handle_scope(|vm| {
-        for (key, _) in vm.own_keys(po) {
+        // (A proxy's through its traps; symbols too.)
+        for key in crate::proxy::own_keys(vm, po)? {
             // (Enumerability as of now: a getter may have changed it.)
-            let Some(d) = vm.own_property(po, key) else { continue };
+            let Some(d) = crate::proxy::get_own_property(vm, po, key)? else { continue };
             if d.enumerable != Some(true) {
                 continue;
             }
@@ -1711,8 +1713,8 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: &[Value]) -> Re
     let o = vm.to_object(arg(a, 0))?;
     let op = object_value(vm.object_prototype);
     let out = object_value(vm.new_object(op));
-    for (key, _) in vm.own_keys(o) {
-        if let Some(d) = vm.own_property(o, key) {
+    for key in crate::proxy::own_keys(vm, o)? {
+        if let Some(d) = crate::proxy::get_own_property(vm, o, key)? {
             let dv = vm.from_descriptor(&d);
             vm.create_data_property(out, key, dv)?;
         }
@@ -1905,16 +1907,17 @@ fn lookup_accessor_half(vm: &mut Vm, this: Value, a: &[Value], setter: bool) -> 
     let o = vm.to_object(this)?;
     let key = vm.to_key(arg(a, 0));
     let mut p = object_value(o);
+    // (A proxy's through its traps.)
     while p.is_cell() {
         let po = as_object(p);
-        if let Some(d) = vm.own_property(po, key) {
+        if let Some(d) = crate::proxy::get_own_property(vm, po, key)? {
             return Ok(if d.is_accessor() {
                 if setter { d.set.unwrap() } else { d.get.unwrap() }
             } else {
                 Value::UNDEFINED
             });
         }
-        p = unsafe { (*(*po).shape).proto };
+        p = crate::proxy::get_prototype_of(vm, po)?;
     }
     Ok(Value::UNDEFINED)
 }

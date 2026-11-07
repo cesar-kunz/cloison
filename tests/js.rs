@@ -1189,6 +1189,101 @@ r.join(" ");
     );
 }
 
+/// `Object.getOwnPropertyDescriptors`, `Object.defineProperties` and
+/// `Object.create`'s second argument read their argument's own properties
+/// through its internal methods: a proxy's traps (a revoked one throws),
+/// and symbol keys too.
+#[test]
+fn descriptor_builtins_read_proxies_and_symbols() {
+    assert_eq!(
+        value(
+            r#"
+var log = [];
+var h = { ownKeys(t) { log.push("keys"); return Reflect.ownKeys(t); },
+  getOwnPropertyDescriptor(t, k) { log.push("gopd:" + String(k)); return Reflect.getOwnPropertyDescriptor(t, k); } };
+var r = [JSON.stringify(Object.getOwnPropertyDescriptors(new Proxy({ a: 1 }, h)))];
+r.push(JSON.stringify(Object.defineProperties({}, new Proxy({ a: { value: 1, enumerable: true } }, h))));
+r.push(JSON.stringify(Object.create(null, new Proxy({ a: { value: 2, enumerable: true } }, {}))));
+var s = Symbol();
+r.push(Object.defineProperties({}, { [s]: { value: 1 } })[s], Object.create(null, { [s]: { value: 3 } })[s]);
+r.push(Object.getOwnPropertyDescriptors({ [s]: 1 })[s].value);
+var rev = Proxy.revocable({}, {}); rev.revoke();
+for (var f of [() => Object.defineProperties({}, rev.proxy), () => Object.getOwnPropertyDescriptors(rev.proxy)])
+  try { f(); r.push("no throw"); } catch (e) { r.push(e.constructor.name); }
+r.push(log.join());
+r.join(" ");
+"#
+        ),
+        "{\"a\":{\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}} {\"a\":1} {\"a\":2} 1 3 1 \
+         TypeError TypeError keys,gopd:a,keys,gopd:a"
+    );
+}
+
+/// `__lookupGetter__` and `__lookupSetter__` walk the prototype chain
+/// through its internal methods: a proxy's traps (a revoked one throws).
+#[test]
+fn lookup_accessor_walks_proxies_through_their_traps() {
+    assert_eq!(
+        value(
+            r#"
+var g = function () { return 1; };
+var p = new Proxy({}, { getOwnPropertyDescriptor(t, k) { return k === "x" ? { get: g, configurable: true } : undefined; } });
+var q = Object.create(new Proxy({}, { getPrototypeOf() { return { set y(v) {} }; } }));
+var r = [p.__lookupGetter__("x") === g, Object.create(p).__lookupGetter__("x") === g, typeof q.__lookupSetter__("y")];
+var rev = Proxy.revocable({}, {}); rev.revoke();
+try { Object.prototype.__lookupSetter__.call(rev.proxy, "x"); r.push("no throw"); } catch (e) { r.push(e.constructor.name); }
+r.join(" ");
+"#
+        ),
+        "true true function TypeError"
+    );
+}
+
+/// ToPrimitive asks a proxy (or an object inheriting from one) for
+/// `Symbol.toPrimitive`, and `instanceof` a proxy for `Symbol.hasInstance`,
+/// though no object has had either.
+#[test]
+fn conversions_ask_proxies_for_symbol_methods() {
+    assert_eq!(
+        value(
+            r#"
+var log = [];
+var p = new Proxy({}, { get(t, k) { log.push(String(k)); return k === Symbol.toPrimitive ? h => h === "string" ? "s" : 5 : Reflect.get(t, k); } });
+var r = [+p, p + 1, `${p}`, p == 5, Object.create(p) * 2, { [p]: 1 }.s, log.length];
+var q = new Proxy({}, { get: (t, k) => k === Symbol.toPrimitive ? 1 : Reflect.get(t, k) });
+try { r.push(q + ""); } catch (e) { r.push(e.constructor.name); }
+var F = new Proxy(function () {}, { get: (t, k) => k === Symbol.hasInstance ? () => true : Reflect.get(t, k) });
+r.push(1 instanceof F);
+r.join(" ");
+"#
+        ),
+        "5 6 s true 10 1 6 TypeError true"
+    );
+}
+
+/// `push` stores through `[[Set]]`: a proxy on the prototype chain has its
+/// `set` trap take a new element, also in compiled code made before it
+/// became a prototype.
+#[test]
+fn push_stores_through_a_proxy_prototype() {
+    assert_eq!(
+        value(
+            r#"
+function f(a, v) { a.push(v); return a.length; }
+for (var i = 0; i < 3000; i++) f([], i);
+var log = [];
+var a = [];
+Object.setPrototypeOf(a, new Proxy([], { set(t, k, v, r) { log.push(k); return true; } }));
+var r = [f(a, 1), f(a, 2)];
+a[5] = 3;
+r.push(a.length, log.join(), a.hasOwnProperty(0));
+r.join(" ");
+"#
+        ),
+        "1 2 2 0,1,5 false"
+    );
+}
+
 /// `x op= v` reads `x` before `v`, also when `v` changes `x` through a call
 /// (a closure capturing it, a getter, `valueOf`): `out += render(child)`
 /// keeps what `render` appended.

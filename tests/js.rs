@@ -7424,6 +7424,32 @@ out.join(" | ");"##;
     );
 }
 
+/// A name may repeat in different alternatives (ES2025), where its groups
+/// can't both participate (#106): `groups` (and `indices.groups`) has it
+/// once, where first named, with the match of the group that matched, and
+/// `\k<name>` and `$<name>` are that group's. Groups that may both
+/// participate (in sequence, or nested) still can't share a name.
+#[test]
+fn regexp_duplicate_named_groups_in_alternatives() {
+    assert_eq!(
+        value(
+            r#"
+var r = [/(?<a>x)|(?<a>y)/.exec("y").groups.a, new RegExp("(?<a>x)|(?<a>y)").exec("x").groups.a,
+  /(?:(?<a>x)|(?<a>y))\k<a>/.exec("yy")[0], /(?:(?<a>x)|(?<a>y))\k<a>/.test("y"),
+  /(?<=(?:(?<a>x)|(?<a>y))\k<a>)z/.test("yyz"), Object.keys(/(?<a>x)|(?<b>z)|(?<a>y)/.exec("y").groups).join(""),
+  JSON.stringify(/(?<b>.)(?:(?<a>x)|(?<a>y))/d.exec("qy").indices.groups), "y".replace(/(?<a>x)|(?<a>y)/, "[$<a>]"),
+  "y".replace(/(?<a>x)|(?<a>y)/, (...a) => a.at(-1).a), /(?:(?<a>x)|(?<a>y))+/.exec("xy").groups.a,
+  /((?<a>x)|(?<b>y))|(?<a>z)/.exec("z").groups.a];
+for (var src of ["(?<a>x)(?<a>y)", "(?<a>x)(?:(?<a>y)|z)", "(?:(?<a>x)|(?<a>y))(?<a>z)", "(?<a>(?<a>x))", "(?<a>x)|(?<a>(?<a>y))"]) {
+  try { new RegExp(src); r.push("ok"); } catch (e) { r.push(e.name); }
+}
+r.join(" ");
+"#
+        ),
+        "y x yy false true ab {\"b\":[0,1],\"a\":[1,2]} [y] y y z SyntaxError SyntaxError SyntaxError SyntaxError SyntaxError"
+    );
+}
+
 /// A name declared twice where one is block-scoped is an early error;
 /// what may share a name (`var`s, a catch parameter's `var`, sloppy
 /// block functions, the same name in sibling blocks) still compiles.

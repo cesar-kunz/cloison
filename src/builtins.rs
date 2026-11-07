@@ -2699,8 +2699,11 @@ fn match_indices(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, 
         Value::UNDEFINED
     } else {
         let groups = object_value(vm.new_object(Value::NULL));
-        for (name, g) in &re.names {
-            let p = pair(vm, caps.get(*g).copied().flatten())?;
+        for (k, (name, _)) in re.names.iter().enumerate() {
+            if re.names[..k].iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let p = pair(vm, group_match(&re.names, name, caps))?;
             let key = vm.intern_name(name);
             vm.create_data_property(groups, crate::vm::Key::Name(key), p)?;
         }
@@ -2711,12 +2714,21 @@ fn match_indices(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, 
     Ok(indices)
 }
 
+/// The match of the group named `name` (of those of that name, in
+/// different alternatives, the one that matched).
+fn group_match(names: &[(String, usize)], name: &str, caps: &[Option<(usize, usize)>]) -> Option<(usize, usize)> {
+    names.iter().filter(|(n, _)| n == name).find_map(|&(_, g)| caps.get(g).copied().flatten())
+}
+
 /// A match's named groups: a null-prototype object of their matches
-/// (`undefined` where a group didn't match).
+/// (`undefined` where a group didn't match), in their names' first order.
 fn named_groups(vm: &mut Vm, re: &crate::regexp::Regex, caps: &[Option<(usize, usize)>], s: &[u16]) -> Result<Value> {
     let groups = object_value(vm.new_object(Value::NULL));
-    for (name, g) in &re.names {
-        let v = match caps.get(*g).copied().flatten() {
+    for (k, (name, _)) in re.names.iter().enumerate() {
+        if re.names[..k].iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        let v = match group_match(&re.names, name, caps) {
             Some((a, b)) => string(vm, &s[a..b]),
             None => Value::UNDEFINED,
         };
@@ -3147,9 +3159,7 @@ fn expand(t: &[u16], s: &[u16], caps: &[Option<(usize, usize)>], names: &[(Strin
             b'<' if !names.is_empty() => match t[i + 2..].iter().position(|&c| c == b'>' as u16) {
                 Some(k) => {
                     let name = String::from_utf16_lossy(&t[i + 2..i + 2 + k]);
-                    if let Some(&(_, g)) = names.iter().find(|(n, _)| *n == name)
-                        && let Some((p, q)) = caps[g]
-                    {
+                    if let Some((p, q)) = group_match(names, &name, caps) {
                         out.extend_from_slice(&s[p..q]);
                     }
                     i += k + 3;

@@ -572,10 +572,21 @@ pub(crate) fn get_iterator(vm: &mut Vm, v: Value) -> Result<Value> {
 /// in-object slots of an object no JS code ever sees (no properties, the
 /// collector tracing the slots by its capacity).
 pub(crate) fn record(vm: &mut Vm, it: Value) -> Result<Value> {
+    record_with(vm, it, None)
+}
+
+/// A [`record`] of sync iterator `it` stepped as AsyncFromSyncIterator
+/// (`for await`, `yield*`): a third slot, whether its last step was done
+/// ([`set_sync_done`]).
+pub(crate) fn sync_record(vm: &mut Vm, it: Value) -> Result<Value> {
+    record_with(vm, it, Some(Value::FALSE))
+}
+
+fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     let a_next = vm.intern_name("next");
     let next = vm.get(it, a_next)?;
-    let o = vm.new_object_with(crate::object::Class::Plain, Value::NULL, 2);
-    for (i, v) in [it, next].into_iter().enumerate() {
+    let o = vm.new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32);
+    for (i, v) in [it, next].into_iter().chain(done).enumerate() {
         unsafe {
             let at = crate::object::Object::inline(o, i);
             *at = v;
@@ -583,6 +594,16 @@ pub(crate) fn record(vm: &mut Vm, it: Value) -> Result<Value> {
         }
     }
     Ok(crate::object::object_value(o))
+}
+
+/// Whether a [`sync_record`]'s last step was done.
+pub(crate) fn sync_done(r: Value) -> bool {
+    unsafe { *crate::object::Object::inline(crate::object::as_object(r), 2) == Value::TRUE }
+}
+
+pub(crate) fn set_sync_done(r: Value, done: bool) {
+    // (Not a cell: no barrier.)
+    unsafe { *crate::object::Object::inline(crate::object::as_object(r), 2) = Value::from_bool(done) }
 }
 
 /// A [`record`]'s iterator and `next`.

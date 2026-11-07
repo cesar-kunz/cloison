@@ -717,6 +717,36 @@ r.join(" ");
     );
 }
 
+/// In `u` mode an escaped surrogate pair, `\ud83d\ude00`, is one atom, its
+/// code point, which a quantifier repeats whole; any other surrogate, a
+/// class's member, `\u{d83d}`, is a lone one, not half of a pair (#108).
+#[test]
+fn unicode_regexps_keep_lone_surrogates_apart() {
+    let src = r#"
+var e = "\u{1F600}", J = JSON.stringify;
+[/^[\ud83d]\ude00$/u.test(e), /^\ud83d\ude00?$/u.test(""), /^\ud83d\ude00{2}$/u.test(e + e), J(/x\ud83d\ude00?/u.exec("x")),
+ /^[\ud800-\udbff][\udc00-\udfff]$/u.test(e), /^\ud83d[\udc00-\udfff]$/u.test(e), /^(?:\ud83d)\ude00$/u.test(e),
+ /^\ud83d\ude00$/u.test(e), /^[\ud83d\ude00]$/u.test(e), /^\ud801\udc00+$/iu.test("\u{10428}\u{10400}"),
+ /^\u{d83d}\u{de00}$/u.test(e), /^\u{d83d}$/u.test("\ud83d"), /^[\ud83d]\ude00$/v.test(e), /^\ud83d\ude00?$/v.test("")].join();
+"#;
+    assert_eq!(value(src), "false,true,true,[\"x\"],false,false,false,true,true,true,false,true,false,true");
+}
+
+/// Outside `u` mode a pattern is code units: a literal astral character
+/// is two atoms, its lead and trail, a quantifier repeating the trail,
+/// and two class members (#109).
+#[test]
+fn regexps_split_astral_characters_into_units() {
+    let src = r#"
+var J = JSON.stringify;
+[/^😀?$/.test("\ud83d"), /^[😀]$/.test("\ude00"), /^😀{2}$/.test("😀\ude00"), J(/😀?/.exec("\ud83d")[0]), /^😀$/.test("😀"),
+ /^\😀$/.test("😀"), /^\😀?$/.test("\ud83d"), /^[\😀]$/.test("\ude00"), /^[😀]{2}$/.test("😀"), /^[a-😀]$/.test("\ude00"),
+ /^[^😀]$/.test("\ud83d"), /(?<=\ude00)x/.test("😀x"), /^😀+$/u.test("😀😀")].join()
+ + (() => { try { new RegExp("[😀-😂]"); } catch (e) { return " " + e.name; } })();
+"#;
+    assert_eq!(value(src), r#"true,true,true,"\ud83d",true,true,true,true,true,true,false,true,true SyntaxError"#);
+}
+
 /// String methods' RegExp fast paths step aside where the spec's paths
 /// differ: a sticky separator splits as any, a RegExp whose `Symbol.<m>`
 /// is undefined is its string, redefined flags are what it has, and

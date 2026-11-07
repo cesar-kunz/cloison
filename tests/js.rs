@@ -750,6 +750,21 @@ var e = "\u{1F600}", J = JSON.stringify;
     assert_eq!(value(src), "false,true,true,[\"x\"],false,false,false,true,true,true,false,true,false,true");
 }
 
+/// Outside `u` mode a pattern is code units: a literal astral character
+/// is two atoms, its lead and trail, a quantifier repeating the trail,
+/// and two class members (#109).
+#[test]
+fn regexps_split_astral_characters_into_units() {
+    let src = r#"
+var J = JSON.stringify;
+[/^😀?$/.test("\ud83d"), /^[😀]$/.test("\ude00"), /^😀{2}$/.test("😀\ude00"), J(/😀?/.exec("\ud83d")[0]), /^😀$/.test("😀"),
+ /^\😀$/.test("😀"), /^\😀?$/.test("\ud83d"), /^[\😀]$/.test("\ude00"), /^[😀]{2}$/.test("😀"), /^[a-😀]$/.test("\ude00"),
+ /^[^😀]$/.test("\ud83d"), /(?<=\ude00)x/.test("😀x"), /^😀+$/u.test("😀😀")].join()
+ + (() => { try { new RegExp("[😀-😂]"); } catch (e) { return " " + e.name; } })();
+"#;
+    assert_eq!(value(src), r#"true,true,true,"\ud83d",true,true,true,true,true,true,false,true,true SyntaxError"#);
+}
+
 /// String methods' RegExp fast paths step aside where the spec's paths
 /// differ: a sticky separator splits as any, a RegExp whose `Symbol.<m>`
 /// is undefined is its string, redefined flags are what it has, and

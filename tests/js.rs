@@ -609,6 +609,24 @@ r.join(" ");
     );
 }
 
+/// With `i` and `v`, `\P{…}` is the complement of the property folded,
+/// among the code points folding leaves as they are, as a negated class
+/// is (#107): for a cased property, neither case of a letter in it.
+/// With `u` alone, the complement of the property among all code points.
+#[test]
+fn case_insensitive_v_mode_complements_folded_properties() {
+    assert_eq!(
+        value(
+            r#"
+[/\P{Lu}/iv.test("a"), /[^\P{Lu}]/iv.test("a"), /\P{Ll}/iv.test("A"), /\P{Lu}/iu.test("a"),
+  /[\P{Lu}]/iv.test("a"), /[\P{Lu}--x]/iv.test("a"), /\P{Lu}/iv.test("1"), /\P{Lu}/v.test("a"),
+  /\P{Lowercase}/iv.test("K"), /\P{Cased}/iv.test("\u017f"), /[\P{Ll}&&\P{Lu}]/iv.test("1")].join(" ");
+"#
+        ),
+        "false true false true false false true true false false true"
+    );
+}
+
 /// With `i`, a class matches a unit whose case-equivalent is in it, however
 /// long its ranges (#43): one of 512 units or more matched only the unit
 /// itself or its canonical form, not a member folding to that form (`ſ`
@@ -7421,6 +7439,32 @@ out.join(" | ");"##;
     assert_eq!(
         value(src),
         "groups 2020,01,31,,y,m,d | noGroups has | unmatched {} | backref \"hi\" | fwdNameRef true | replaceTpl 31/01/2020 | | replaceFn 1a2b | matchAll k1:v1,k2:v2 | dupName !SyntaxError | badName !SyntaxError | kWithoutNames true | behind 5,7 | negBehind 6 | behindVar 123,456 | behindAlt 1,3 | behindStart true,false | behindCapture [\"b\",\"a\"] | behindReplace price: 10, cost: X | lookahead a1_2 | behindSticky true | behindNested b | hot 2000"
+    );
+}
+
+/// A name may repeat in different alternatives (ES2025), where its groups
+/// can't both participate (#106): `groups` (and `indices.groups`) has it
+/// once, where first named, with the match of the group that matched, and
+/// `\k<name>` and `$<name>` are that group's. Groups that may both
+/// participate (in sequence, or nested) still can't share a name.
+#[test]
+fn regexp_duplicate_named_groups_in_alternatives() {
+    assert_eq!(
+        value(
+            r#"
+var r = [/(?<a>x)|(?<a>y)/.exec("y").groups.a, new RegExp("(?<a>x)|(?<a>y)").exec("x").groups.a,
+  /(?:(?<a>x)|(?<a>y))\k<a>/.exec("yy")[0], /(?:(?<a>x)|(?<a>y))\k<a>/.test("y"),
+  /(?<=(?:(?<a>x)|(?<a>y))\k<a>)z/.test("yyz"), Object.keys(/(?<a>x)|(?<b>z)|(?<a>y)/.exec("y").groups).join(""),
+  JSON.stringify(/(?<b>.)(?:(?<a>x)|(?<a>y))/d.exec("qy").indices.groups), "y".replace(/(?<a>x)|(?<a>y)/, "[$<a>]"),
+  "y".replace(/(?<a>x)|(?<a>y)/, (...a) => a.at(-1).a), /(?:(?<a>x)|(?<a>y))+/.exec("xy").groups.a,
+  /((?<a>x)|(?<b>y))|(?<a>z)/.exec("z").groups.a];
+for (var src of ["(?<a>x)(?<a>y)", "(?<a>x)(?:(?<a>y)|z)", "(?:(?<a>x)|(?<a>y))(?<a>z)", "(?<a>(?<a>x))", "(?<a>x)|(?<a>(?<a>y))"]) {
+  try { new RegExp(src); r.push("ok"); } catch (e) { r.push(e.name); }
+}
+r.join(" ");
+"#
+        ),
+        "y x yy false true ab {\"b\":[0,1],\"a\":[1,2]} [y] y y z SyntaxError SyntaxError SyntaxError SyntaxError SyntaxError"
     );
 }
 

@@ -3019,7 +3019,12 @@ impl Feedback {
             Op::StaGlobal if !ic.new_shape.is_null() => Prop::None,
             _ => Prop::Global {
                 shape,
-                global: self.global as u64,
+                // (Or the global scope's block-scoped binding: see
+                // `Vm::get_global_lexical`.)
+                global: match unsafe { (*self.vm).global_lexicals } {
+                    l if unsafe { (*l).shape } == ic.shape => l,
+                    _ => self.global,
+                } as u64,
                 off,
                 oop,
                 ft: field(ic.shape),
@@ -13149,13 +13154,16 @@ fn fold_constant_loads(out: &mut Lowered, exits: &HashMap<(usize, usize), u32>) 
             (
                 Op::LdaGlobal,
                 Prop::Global {
+                    shape,
                     global,
                     off,
                     oop,
                     ft,
-                    ..
                 },
-            ) => {
+            // (Not a global the global scope's block-scoped binding has
+            // shadowed since: the global object's shape changed then, see
+            // `Vm::declare_lexical`.)
+            ) if word(global) == shape => {
                 let at = global + off as u64;
                 let name = out.fbs[i.ic_frame()].name(&i);
                 // An out-of-line slot moves when the slots grow: only

@@ -186,6 +186,8 @@ pub struct Module {
     /// Its own block-scoped names (`let`, `const`, `class`): a script's
     /// may not be declared by another script (see `Vm::declare_script`).
     pub lexical: Vec<String>,
+    /// Which of `lexical` are `const`s.
+    pub constants: Vec<String>,
 }
 
 /// A module safe to run, which [`crate::vm::Vm::run`] takes:
@@ -452,6 +454,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
     }
     let module = Module {
         lexical: Vec::new(),
+        constants: Vec::new(),
         functions,
         script,
         declared: Vec::new(),

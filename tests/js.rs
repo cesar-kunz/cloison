@@ -9133,6 +9133,31 @@ globalThis.result = out.join();
     );
 }
 
+/// A module whose own code calls `eval` exports its `let`, `const` and
+/// `class` bindings still (#96): its scope object, which importers read,
+/// holds them; the `eval`'s code sees them there, uninitialized ones
+/// throwing, a `const` not assignable. SpiderMonkey's values.
+#[test]
+fn modules_with_eval_export_lexicals() {
+    let dir = module_dir(
+        "eval",
+        &[
+            ("main.mjs", "import { a, b, C, d, v, setA, out } from './m.mjs';\nconst r = [a, b, typeof C, d, v];\nsetA();\nglobalThis.result = r.concat(a, d, out).join();"),
+            (
+                "m.mjs",
+                "const out = [];\nconst f = (s) => { try { return eval(s); } catch (e) { return e.name; } };\nout.push(f('typeof a'));\n\
+                 try { eval('a'); } catch (e) { out.push(e.name); }\nexport let a = 1; export const b = 2; export class C {} let d = 4; export { d, out };\n\
+                 export var v = 5; export function setA() { a = 10; d = 40; }\ntry { eval('b = 3'); } catch (e) { out.push(e.name); }\n\
+                 out.push(f('b = 3'), eval('a + b'), f('d'), eval('let a = 9; a'), eval('a = 6'), a);",
+            ),
+        ],
+    );
+    assert_eq!(
+        run_module(&dir, "main.mjs").unwrap(),
+        "6,2,function,4,5,10,40,ReferenceError,ReferenceError,TypeError,TypeError,3,4,9,6,6"
+    );
+}
+
 /// Top-level `await`: a module waits for its async dependencies, which
 /// run in order; `import()` evaluates a module once and resolves to its
 /// namespace; a JSON module's default export is its value.

@@ -322,6 +322,31 @@ fn out_after_jobs(src: &str) -> String {
     display(vm.get(g, a).unwrap())
 }
 
+/// A `for await` left early awaits what `return()` gives, which must be
+/// an object, and left by an exception awaits it too (however it
+/// settles), before the exception goes on (AsyncIteratorClose; #110).
+#[test]
+fn for_await_close_awaits_return_and_checks_its_result() {
+    let src = r#"
+var log = [];
+var p = Promise.resolve(); for (let i = 0; i < 6; i++) p = p.then(() => log.push("t" + i));
+var A = (ret) => ({ [Symbol.asyncIterator]() { return { next() { return { value: 1, done: false } }, return: ret } } });
+(async () => { try { for await (var x of A(() => 1)) break; log.push("a ok"); } catch (e) { log.push("a " + e.name); } })();
+(async () => { try { for await (var x of A(() => ({}))) throw "boom"; } catch (e) { log.push("b " + e); } })();
+(async () => { try { for await (var x of A(() => Promise.reject(3))) throw 4; } catch (e) { log.push("c " + e); } })();
+(async () => { try { for await (var x of A(() => { throw 5; })) throw 4; } catch (e) { log.push("d " + e); } })();
+(async () => { try { for await (var x of A(() => Promise.resolve(2))) break; } catch (e) { log.push("e " + e.name); } })();
+(async () => { for await (var x of A(undefined)) break; log.push("f ok"); })();
+(async () => { try { for await (var x of [1]) break; log.push("g ok"); } catch (e) { log.push("g " + e.name); } })();
+var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        "t0, d 4, f ok, t1, a TypeError, b boom, c 4, e TypeError, t2, g ok, t3, t4, t5"
+    );
+}
+
 /// What a `for await` step throws (`next()` throwing, rejecting or giving
 /// a non-object) doesn't close the iterator (#111).
 #[test]

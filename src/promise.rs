@@ -206,6 +206,14 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value) -> Result<Value> {
     Ok(cap.promise)
 }
 
+/// A promise rejected with what `e` throws.
+pub(crate) fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
+    let reason = thrown(vm, e)?;
+    let p = new_promise(vm);
+    settle(vm, as_object(p), REJECTED, reason)?;
+    Ok(p)
+}
+
 // ---- Helpers ----
 
 fn arg(a: &[Value], i: usize) -> Value {

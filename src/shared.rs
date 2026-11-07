@@ -7,7 +7,8 @@
 //! [`State`]). A growable one (flag `RESIZABLE`) has room for its maximum
 //! from the start, so its bytes never move; the block holds its length,
 //! which each agent's buffer caches (and brings its views up to date to,
-//! as a resizable `ArrayBuffer`'s) when it reads it.
+//! as a resizable `ArrayBuffer`'s) when it reads it, and after what may
+//! make another agent's grow happen before what follows ([`catch_up`]).
 //!
 //! `Atomics` reads and writes elements with the processor's atomic
 //! operations, sequentially consistent. Waiters (`Atomics.wait`, and
@@ -114,6 +115,9 @@ pub(crate) struct State {
     external: usize,
     external_at: usize,
     waits: Vec<(Arc<Waiter>, Value, Value)>,
+    /// The grows in the process (`GROWS`) the buffers' lengths are up to
+    /// date to (see [`catch_up`]).
+    grows: usize,
     /// What wakes this VM's event loop: a notify of one of its async
     /// waiters (its `Waiter::wake`).
     signal: Arc<Condvar>,
@@ -131,6 +135,7 @@ impl Default for State {
             external: 0,
             external_at: EXTERNAL_MIN,
             waits: Vec::new(),
+            grows: 0,
             signal: Arc::new(Condvar::new()),
         }
     }
@@ -271,6 +276,26 @@ pub(crate) fn sync_length(o: *mut Object) -> usize {
     n
 }
 
+/// The grows of shared buffers in the process so far.
+static GROWS: AtomicUsize = AtomicUsize::new(0);
+
+/// The VM's growable buffers' lengths (their views') brought up to date,
+/// if one has grown since: after what may make another agent's grows
+/// happen before what follows (an `Atomics` operation, a wakeup, a
+/// message), as the views' cached lengths are read without the block's.
+pub(crate) fn catch_up(vm: &mut Vm) {
+    let n = GROWS.load(SeqCst);
+    if n == vm.shared.grows || vm.shared.live.is_null() {
+        return;
+    }
+    vm.shared.grows = n;
+    for v in crate::collections::weak_set_values(vm.shared.live) {
+        if is_resizable(as_object(v)) {
+            sync_length(as_object(v));
+        }
+    }
+}
+
 pub(crate) fn is_shared(o: *mut Object) -> bool {
     unsafe { (*o).class == Class::SharedArrayBuffer }
 }
@@ -353,6 +378,8 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             Err(now) => current = now,
         }
     }
+    // (After the length: who sees this one sees it.)
+    GROWS.fetch_add(1, SeqCst);
     sync_length(o);
     Ok(Value::UNDEFINED)
 }
@@ -497,7 +524,9 @@ fn read_modify_write(vm: &mut Vm, a: &[Value], op: Op) -> Result<Value> {
     let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), false, true)?;
     let (v, _) = operand(vm, k, arg(a, 2))?;
     revalidate(o, i)?;
-    Ok(element(k, apply(o, k, i, op, v)))
+    let r = element(k, apply(o, k, i, op, v));
+    catch_up(vm);
+    Ok(r)
 }
 
 fn atomics_add(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -529,13 +558,17 @@ fn atomics_compare_exchange(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value>
     let (expected, _) = operand(vm, k, arg(a, 2))?;
     let (replacement, _) = operand(vm, k, arg(a, 3))?;
     revalidate(o, i)?;
-    Ok(element(k, apply(o, k, i, Op::CompareExchange(expected), replacement)))
+    let r = element(k, apply(o, k, i, Op::CompareExchange(expected), replacement));
+    catch_up(vm);
+    Ok(r)
 }
 
 fn atomics_load(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let (o, k, i) = access(vm, arg(a, 0), arg(a, 1), false, false)?;
     revalidate(o, i)?;
-    Ok(element(k, apply(o, k, i, Op::Load, 0)))
+    let r = element(k, apply(o, k, i, Op::Load, 0));
+    catch_up(vm);
+    Ok(r)
 }
 
 /// `Atomics.store(ta, index, value)`: the value converted (not wrapped
@@ -545,6 +578,7 @@ fn atomics_store(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let (v, out) = operand(vm, k, arg(a, 2))?;
     revalidate(o, i)?;
     apply(o, k, i, Op::Store, v);
+    catch_up(vm);
     Ok(out)
 }
 
@@ -572,7 +606,8 @@ fn atomics_pause(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 // ---- Waiting ----
 
-/// A waiter, on element `index` (a byte index) of a block: notified or
+/// A waiter, on element `index` (a byte index) of a block (a reference
+/// to it: freed, another block at its address would match): notified or
 /// not, and the condition variable to signal (a blocked agent's own, or
 /// an async waiter's VM's `State::signal`).
 pub(crate) struct Waiter {
@@ -581,6 +616,19 @@ pub(crate) struct Waiter {
     notified: AtomicBool,
     deadline: Option<Instant>,
     wake: Arc<Condvar>,
+}
+
+impl Waiter {
+    fn new(block: *mut Block, index: usize, deadline: Option<Instant>, wake: Arc<Condvar>) -> Arc<Waiter> {
+        retain(block);
+        Arc::new(Waiter { block: block as usize, index, notified: AtomicBool::new(false), deadline, wake })
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        release(self.block as *mut Block);
+    }
 }
 
 /// Every waiter in the process, in the order they came.
@@ -612,7 +660,7 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
         return Err(Error::type_error("Atomics.wait: this agent can't block"));
     }
     let b = crate::typed::buffer_of(o);
-    let block = block_of(b) as usize;
+    let block = block_of(b);
     let index = i * k.size() + crate::typed::offset_of(o);
     let deadline = (t.is_finite()).then(|| Instant::now() + Duration::from_secs_f64(t / 1000.0));
     let mut list = waiters();
@@ -620,6 +668,7 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
     let mask = if k.size() == 8 { u64::MAX } else { u32::MAX as u64 };
     if w & mask != v & mask {
         drop(list);
+        catch_up(vm);
         let s = str_value(vm, "not-equal");
         return if async_ { wait_result(vm, false, s) } else { Ok(s) };
     }
@@ -629,17 +678,19 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
             let s = str_value(vm, "timed-out");
             return wait_result(vm, false, s);
         }
-        let waiter = Arc::new(Waiter { block, index, notified: AtomicBool::new(false), deadline, wake: vm.shared.signal.clone() });
+        let waiter = Waiter::new(block, index, deadline, vm.shared.signal.clone());
         list.push(waiter.clone());
         drop(list);
         let (p, resolve, _) = crate::promise::new_with_resolvers(vm);
         vm.shared.waits.push((waiter, p, resolve));
         return wait_result(vm, true, p);
     }
-    let waiter = Arc::new(Waiter { block, index, notified: AtomicBool::new(false), deadline, wake: Arc::new(Condvar::new()) });
+    let waiter = Waiter::new(block, index, deadline, Arc::new(Condvar::new()));
     list.push(waiter.clone());
     loop {
         if waiter.notified.load(SeqCst) {
+            drop(list);
+            catch_up(vm);
             return Ok(str_value(vm, "ok"));
         }
         let now = Instant::now();
@@ -736,6 +787,9 @@ pub(crate) fn poll(vm: &mut Vm) -> Result<bool> {
             done.push((w.deadline, *p, *resolve, outcome));
             false
         });
+    }
+    if done.iter().any(|&(.., outcome)| outcome == "ok") {
+        catch_up(vm);
     }
     // (Those timed out in the order of their deadlines.)
     done.sort_by_key(|&(d, _, _, outcome)| (outcome == "timed-out", d));

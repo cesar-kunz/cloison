@@ -9237,6 +9237,53 @@ fn agents_wait_and_are_notified() {
     assert_eq!(value(src), "ok,ok,2,2");
 }
 
+/// A waiter on a buffer found dead keeps its block: a new buffer (whose
+/// block malloc would give the freed one's address) has no waiters
+/// (issue #99: `notify` on it woke the old ones).
+#[test]
+fn notify_on_a_new_buffer_wakes_no_dead_buffers_waiter() {
+    let src = r#"
+        var out = [];
+        for (var k = 0; k < 10; k++)
+            Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(4096)), 0, 0, 10).value.then(v => out.push(v));
+        $262.gc();
+        var n = 0;
+        for (var i = 0; i < 10; i++) n += Atomics.notify(new Int32Array(new SharedArrayBuffer(4096)), 0);
+        out.push(n);
+        globalThis.out = out;
+    "#;
+    let mut vm = Vm::new();
+    vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let r = vm.run(&cloison::js::compile("out.join()").unwrap()).map(display).unwrap();
+    assert_eq!(r, format!("0{}", ",timed-out".repeat(10)));
+}
+
+/// Another agent's grow, seen by length-tracking views once it happens
+/// before (an `Atomics.load` reading what the agent stored after it, a
+/// report it sent after it) (issue #103: they kept the old length).
+#[test]
+fn views_see_another_agents_grow() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let src = r#"
+        $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {
+            sab.grow(32);
+            Atomics.store(new Int32Array(sab), 0, 1);
+            sab.grow(64);
+            $262.agent.report("grown");
+            $262.agent.leaving();
+        });`);
+        var sab = new SharedArrayBuffer(16, { maxByteLength: 64 });
+        var ia = new Int32Array(sab), dv = new DataView(sab, 4);
+        $262.agent.broadcast(sab);
+        while (Atomics.load(ia, 0) === 0);
+        var out = [ia.length >= 8, ia[7], dv.byteLength >= 28];
+        while ($262.agent.getReport() === null);
+        out.push(ia.length, ia[15], dv.byteLength, dv.getInt32(56));
+        out.join()
+    "#;
+    assert_eq!(value(src), "true,0,true,16,0,60,0");
+}
+
 /// `Promise.allKeyed` and `allSettledKeyed`: an object's own enumerable
 /// properties' values awaited, by the same keys.
 #[test]

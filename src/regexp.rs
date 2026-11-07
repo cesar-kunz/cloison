@@ -121,47 +121,21 @@ enum Node {
     Repeat(Box<Node>, u32, u32, bool, std::ops::Range<usize>),
 }
 
-/// `u` mode's lone surrogates in `n`, where the input is code points: one,
-/// as a character or a class's member, matches only alone, not half of a
-/// pair (a lead not followed by a trail, a trail not preceded by a lead).
-/// (`.` and negated classes match a pair whole already: see `atom`.)
+/// `u` mode's lone surrogates in atom `n`, where the input is code points:
+/// one, as a character or a class's member, matches only alone, not half
+/// of a pair (a lead not followed by a trail, a trail not preceded by a
+/// lead). (`.` and negated classes match a pair whole already, and an
+/// astral character, `\ud83d\ude00` too, is one atom: see `atom`.)
 fn code_points(n: Node) -> Node {
-    let rec = |b: Box<Node>| Box::new(code_points(*b));
     match n {
         // (`Alone`: as a lookahead for no trail after a lead, a lookbehind
         // for no lead before a trail would, but one instruction, which
         // compiles to native code.)
         Node::Char(c @ 0xD800..=0xDFFF) => Node::Alone(vec![(c, c)], false),
         Node::Class(r, false) if r.iter().any(|&(a, b)| a <= TRAILS.1 && b >= LEADS.0) => Node::Alone(r, false),
-        Node::Group(b, g) => Node::Group(rec(b), g),
-        Node::Look(b, pos, behind) => Node::Look(rec(b), pos, behind),
+        // (A class's alternatives; a sequence is an astral character's or a
+        // string's, and groups' atoms are done as they are parsed.)
         Node::Alt(v) => Node::Alt(v.into_iter().map(code_points).collect()),
-        // (A lead then a trail, `\ud83d\ude00`, a surrogate pair's classes,
-        // is a pair's code point.)
-        Node::Seq(v) => {
-            let mut out = Vec::with_capacity(v.len());
-            let mut it = v.into_iter().peekable();
-            while let Some(n) = it.next() {
-                let lead = |n: &Node| match n {
-                    Node::Char(c) => (LEADS.0..=LEADS.1).contains(c),
-                    Node::Class(r, false) => r.iter().all(|&(a, b)| a >= LEADS.0 && b <= LEADS.1),
-                    _ => false,
-                };
-                let trail = |n: &Node| match n {
-                    Node::Char(c) => (TRAILS.0..=TRAILS.1).contains(c),
-                    Node::Class(r, false) => r.iter().all(|&(a, b)| a >= TRAILS.0 && b <= TRAILS.1),
-                    _ => false,
-                };
-                if lead(&n) && it.peek().is_some_and(trail) {
-                    out.push(n);
-                    out.push(it.next().unwrap());
-                    continue;
-                }
-                out.push(code_points(n));
-            }
-            Node::Seq(out)
-        }
-        Node::Repeat(b, min, max, greedy, gs) => Node::Repeat(rec(b), min, max, greedy, gs),
         n => n,
     }
 }
@@ -188,7 +162,7 @@ impl Parser<'_> {
                 0 => Node::Empty,
                 // (A lone surrogate as its code unit, matching alone: see
                 // `code_points`.)
-                _ => Node::Seq(s.into_iter().map(|c| char::from_u32(c).map_or(Node::Char(c as u16), |c| self.char_here(c))).collect()),
+                _ => Node::Seq(s.into_iter().map(|c| char::from_u32(c).map_or(code_points(Node::Char(c as u16)), |c| self.char_here(c))).collect()),
             })
             .collect();
         if !set.cps.is_empty() || alts.is_empty() {
@@ -501,7 +475,6 @@ impl Regex {
         let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, unicode_sets], explicit) =
             Regex::parse(pattern, flags)?;
         let fold = Case::of(ignore_case && !explicit, unicode);
-        let node = if unicode { code_points(node) } else { node };
         let mut re = Regex {
             node,
             groups,
@@ -1346,7 +1319,8 @@ impl Parser<'_> {
 
     fn atom(&mut self) -> Result<Node, String> {
         let n = self.atom_node()?;
-        Ok(self.fold(n))
+        let n = self.fold(n);
+        Ok(if self.unicode { code_points(n) } else { n })
     }
 
     /// `(?ims-ims:` past `(`: the flags it sets and clears, consumed, if
@@ -1537,12 +1511,13 @@ impl Parser<'_> {
                     return Err(self.error("Invalid Unicode escape"));
                 };
                 let hex: String = self.c[s..s + end].iter().collect();
-                let cp = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32);
-                let Some(c) = cp.filter(|_| !hex.is_empty()) else {
+                let cp = u32::from_str_radix(&hex, 16).ok().filter(|&v| v <= 0x10FFFF && !hex.is_empty());
+                let Some(cp) = cp else {
                     return Err(self.error("Invalid Unicode escape"));
                 };
                 self.i = s + end + 1;
-                self.char_here(c)
+                // (A lone surrogate, `\u{d83d}`: its unit.)
+                char::from_u32(cp).map_or(Node::Char(cp as u16), |c| self.char_here(c))
             }
             '1'..='9' => {
                 let s = self.i - 1;
@@ -1578,7 +1553,10 @@ impl Parser<'_> {
                 if self.unicode {
                     self.check_unicode_escape()?;
                 }
-                Node::Char(self.char_escape())
+                match self.char_escape() {
+                    u @ 0x10000.. => self.char_here(char::from_u32(u).unwrap()),
+                    u => Node::Char(u as u16),
+                }
             }
         })
     }
@@ -1626,8 +1604,9 @@ impl Parser<'_> {
         if ok { Ok(()) } else { Err(self.error("Invalid escape")) }
     }
 
-    /// The code unit of a character escape at `self.i` (after the `\`).
-    fn char_escape(&mut self) -> u16 {
+    /// The code unit of a character escape at `self.i` (after the `\`), or
+    /// in `u` mode the code point of a surrogate pair's, `\ud83d\ude00`.
+    fn char_escape(&mut self) -> u32 {
         let e = self.c[self.i];
         self.i += 1;
         let hex = |p: &mut Self, n: usize| {
@@ -1636,7 +1615,7 @@ impl Parser<'_> {
             p.i += n;
             Some(v)
         };
-        match e {
+        let u = match e {
             'n' => 10,
             'r' => 13,
             't' => 9,
@@ -1675,7 +1654,21 @@ impl Parser<'_> {
                 let mut b = [0u16; 2];
                 c.encode_utf16(&mut b)[0]
             }
+        } as u32;
+        // (`u` mode: `\uD83D\uDE00`, a surrogate pair's escapes, is the one
+        // code point.)
+        if self.unicode
+            && (0xD800..0xDC00).contains(&u)
+            && self.c.get(self.i..self.i + 2) == Some(&['\\', 'u'])
+            && let Some(t) = self.c.get(self.i + 2..self.i + 6).and_then(|h| {
+                u32::from_str_radix(&h.iter().collect::<String>(), 16).ok()
+            })
+            && (0xDC00..0xE000).contains(&t)
+        {
+            self.i += 6;
+            return 0x10000 + ((u - 0xD800) << 10) + (t - 0xDC00);
         }
+        u
     }
 
     fn class(&mut self) -> Result<Node, String> {
@@ -1789,23 +1782,7 @@ impl Parser<'_> {
                 self.i = s + end + 1;
                 Ok(u32::from_str_radix(&hex, 16).map_or(0, |v| v.min(0x10FFFF)))
             }
-            _ => {
-                let u = self.char_escape() as u32;
-                // (`u` mode: `\uD83D\uDE00`, a surrogate pair's escapes, is
-                // the one code point.)
-                if self.unicode
-                    && (0xD800..0xDC00).contains(&u)
-                    && self.c.get(self.i..self.i + 2) == Some(&['\\', 'u'])
-                    && let Some(t) = self.c.get(self.i + 2..self.i + 6).and_then(|h| {
-                        u32::from_str_radix(&h.iter().collect::<String>(), 16).ok()
-                    })
-                    && (0xDC00..0xE000).contains(&t)
-                {
-                    self.i += 6;
-                    return Ok(0x10000 + ((u - 0xD800) << 10) + (t - 0xDC00));
-                }
-                Ok(u)
-            }
+            _ => Ok(self.char_escape()),
         }
     }
 

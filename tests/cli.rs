@@ -87,3 +87,32 @@ fn agents_not_spawned_free_their_heaps() {
     assert!(out.status.success(), "{}", out.status);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "$262.agent.start: Resource temporarily unavailable (os error 11)\nundefined\n");
 }
+
+/// A local time a zone skips (spring forward) takes the offset from before
+/// the transition, and one it repeats (fall back) is its earlier instant
+/// (UTC(t), ES2025 21.4.1.26; #105), by the constructor and by `setHours`:
+/// a gap and an overlap in four zones, `TZ` set for each run. (The values
+/// are SpiderMonkey's and JSC's; named zones need the system's database.)
+#[test]
+fn local_times_in_zone_transitions() {
+    let cases = [
+        ("America/New_York", "2020, 2, 8, 2, 30", "2020, 10, 1, 1, 30", "1583652600000 3 1604208600000 1"),
+        ("Europe/Berlin", "2021, 2, 28, 2, 30", "2021, 9, 31, 2, 30", "1616895000000 3 1635640200000 2"),
+        ("Australia/Lord_Howe", "2020, 9, 4, 2, 15", "2020, 3, 5, 1, 45", "1601739900000 2 1586011500000 1"),
+        ("America/Santiago", "2020, 8, 6, 0, 30", "2020, 3, 4, 23, 30", "1599366600000 1 1586053800000 23"),
+    ];
+    for (zone, gap, overlap, expected) in cases {
+        if !std::path::Path::new("/usr/share/zoneinfo").join(zone).exists() {
+            continue;
+        }
+        let src = format!(
+            "var g = new Date({gap}), o = new Date({overlap});\n\
+             var h = new Date(o.getTime() - 864e5); h.setHours(o.getHours(), o.getMinutes() + 1440);\n\
+             if (h.getTime() !== o.getTime()) throw new Error('setHours: ' + h.getTime());\n\
+             print([g.getTime(), g.getHours(), o.getTime(), o.getHours()].join(' '))"
+        );
+        let out = cloison(&format!("tz-{}", zone.replace('/', "-")), &src).env("TZ", zone).output().unwrap();
+        assert!(out.status.success(), "{zone}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{expected}\nundefined\n"), "{zone}");
+    }
+}

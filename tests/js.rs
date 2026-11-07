@@ -9497,6 +9497,27 @@ fn agents_wait_and_are_notified() {
     assert_eq!(value(src), "ok,ok,2,2");
 }
 
+/// A waiter on a buffer found dead keeps its block: a new buffer (whose
+/// block malloc would give the freed one's address) has no waiters
+/// (issue #99: `notify` on it woke the old ones).
+#[test]
+fn notify_on_a_new_buffer_wakes_no_dead_buffers_waiter() {
+    let src = r#"
+        var out = [];
+        for (var k = 0; k < 10; k++)
+            Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(4096)), 0, 0, 10).value.then(v => out.push(v));
+        $262.gc();
+        var n = 0;
+        for (var i = 0; i < 10; i++) n += Atomics.notify(new Int32Array(new SharedArrayBuffer(4096)), 0);
+        out.push(n);
+        globalThis.out = out;
+    "#;
+    let mut vm = Vm::new();
+    vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let r = vm.run(&cloison::js::compile("out.join()").unwrap()).map(display).unwrap();
+    assert_eq!(r, format!("0{}", ",timed-out".repeat(10)));
+}
+
 /// `Promise.allKeyed` and `allSettledKeyed`: an object's own enumerable
 /// properties' values awaited, by the same keys.
 #[test]

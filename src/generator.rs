@@ -268,22 +268,32 @@ pub(crate) fn async_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<(
     if is_async_generator(st) {
         return async_gen_step(vm, g, mode, v);
     }
-    match resume_raw(vm, g, v, mode, "an async function") {
-        Ok((out, true)) => {
-            let p = get(vm, st, 5);
-            crate::promise::resolve_own(vm, p, out)
+    let (mut mode, mut v) = (mode, v);
+    loop {
+        match resume_raw(vm, g, v, mode, "an async function") {
+            Ok((out, true)) => {
+                let p = get(vm, st, 5);
+                return crate::promise::resolve_own(vm, p, out);
+            }
+            Ok((awaited, false)) => match crate::promise::await_coroutine(vm, awaited, g) {
+                Ok(()) => return Ok(()),
+                // (PromiseResolve threw: the `await` throws it, now.)
+                Err(e) => (mode, v) = (THROW, thrown(vm, e)),
+            },
+            Err(e) => {
+                let reason = thrown(vm, e);
+                let p = get(vm, st, 5);
+                return crate::promise::reject_own(vm, p, reason);
+            }
         }
-        Ok((awaited, false)) => {
-            crate::promise::await_coroutine(vm, awaited, g)
-        }
-        Err(e) => {
-            let reason = match e.1 {
-                Some(v) => v,
-                None => crate::builtins::caught(vm, &e),
-            };
-            let p = get(vm, st, 5);
-            crate::promise::reject_own(vm, p, reason)
-        }
+    }
+}
+
+/// What error `e` throws, as a value.
+fn thrown(vm: &mut Vm, e: Error) -> Value {
+    match e.1 {
+        Some(v) => v,
+        None => crate::builtins::caught(vm, &e),
     }
 }
 
@@ -353,26 +363,25 @@ fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 set(vm, st, AG_YIELD, Value::FALSE);
-                Err(match e.1 {
-                    Some(v) => v,
-                    None => crate::builtins::caught(vm, &e),
-                })
+                Err(thrown(vm, e))
             }
         }
     } else {
-        match resume_raw(vm, g, v, mode, "an async generator") {
-            Ok((out, false)) if get(vm, st, AG_YIELD) == Value::TRUE => {
-                set(vm, st, AG_YIELD, Value::FALSE);
-                Ok((out, false))
+        let (mut mode, mut v) = (mode, v);
+        loop {
+            match resume_raw(vm, g, v, mode, "an async generator") {
+                Ok((out, false)) if get(vm, st, AG_YIELD) == Value::TRUE => {
+                    set(vm, st, AG_YIELD, Value::FALSE);
+                    break Ok((out, false));
+                }
+                Ok((awaited, false)) => match crate::promise::await_coroutine(vm, awaited, g) {
+                    Ok(()) => return Ok(()),
+                    // (PromiseResolve threw: the `await` throws it, now.)
+                    Err(e) => (mode, v) = (THROW, thrown(vm, e)),
+                },
+                Ok((out, true)) => break Ok((out, true)),
+                Err(e) => break Err(thrown(vm, e)),
             }
-            Ok((awaited, false)) => {
-                return crate::promise::await_coroutine(vm, awaited, g);
-            }
-            Ok((out, true)) => Ok((out, true)),
-            Err(e) => Err(match e.1 {
-                Some(v) => v,
-                None => crate::builtins::caught(vm, &e),
-            }),
         }
     };
     let q = get(vm, st, AG_QUEUE);

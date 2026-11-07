@@ -421,6 +421,28 @@ q.then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// An `await` whose PromiseResolve throws (a promise's `constructor`
+/// getter) throws at the `await`, there and then: in a `for await`'s
+/// close on an exception, the loop's exception goes on.
+#[test]
+fn awaits_whose_promise_resolve_throws_throw_there() {
+    let src = r#"
+var log = [];
+function bad() { var p = Promise.resolve(1); Object.defineProperty(p, "constructor", { get() { throw "ctor"; } }); return p; }
+var A = { [Symbol.asyncIterator]() { return { next() { return { value: 1, done: false }; }, return() { return bad(); } }; } };
+(async () => { try { await bad(); } catch (e) { log.push("await " + e); } })();
+(async () => { try { for await (var x of A) throw "body"; } catch (e) { log.push("throw " + e); } })();
+(async () => { try { for await (var x of A) break; } catch (e) { log.push("break " + e); } })();
+async function* h() {}
+h().return(bad()).then(() => log.push("return fulfilled"), e => log.push("return " + e));
+async function* g() { yield 1; }
+var it = g(); it.next().then(() => it.return(bad())).then(() => log.push("yield fulfilled"), e => log.push("yield " + e));
+var q = Promise.resolve(); for (let i = 0; i < 6; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(out_after_jobs(src), "await ctor, throw body, break ctor, return ctor, yield ctor");
+}
+
 /// A direct `eval` in an arrow sees the enclosing function's `arguments`
 /// and `new.target`, as the arrow does.
 #[test]

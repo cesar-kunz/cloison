@@ -1906,16 +1906,17 @@ fn lookup_accessor_half(vm: &mut Vm, this: Value, a: &[Value], setter: bool) -> 
     let o = vm.to_object(this)?;
     let key = vm.to_key(arg(a, 0));
     let mut p = object_value(o);
+    // (A proxy's through its traps.)
     while p.is_cell() {
         let po = as_object(p);
-        if let Some(d) = vm.own_property(po, key) {
+        if let Some(d) = crate::proxy::get_own_property(vm, po, key)? {
             return Ok(if d.is_accessor() {
                 if setter { d.set.unwrap() } else { d.get.unwrap() }
             } else {
                 Value::UNDEFINED
             });
         }
-        p = unsafe { (*(*po).shape).proto };
+        p = crate::proxy::get_prototype_of(vm, po)?;
     }
     Ok(Value::UNDEFINED)
 }

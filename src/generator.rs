@@ -36,6 +36,9 @@ const AG_QUEUE: i32 = 5;
 const AG_YIELD: i32 = 6;
 const AG_BUSY: i32 = 7;
 const AG_MARK: i32 = 8;
+/// `AG_YIELD` while a `return(v)` of a generator not started or done
+/// awaits `v`.
+const AWAITING_RETURN: Value = Value::from_i32(RETURN);
 /// A request's width.
 const REQUEST: usize = 4;
 
@@ -333,19 +336,44 @@ fn async_gen_run(vm: &mut Vm, g: Value) -> Result<()> {
 /// then.
 fn async_gen_step(vm: &mut Vm, g: Value, mode: i32, v: Value) -> Result<()> {
     let st = state_of(g).unwrap();
-    let settled = match resume_raw(vm, g, v, mode, "an async generator") {
-        Ok((out, false)) if get(vm, st, AG_YIELD) == Value::TRUE => {
-            set(vm, st, AG_YIELD, Value::FALSE);
-            Ok((out, false))
+    let state = get(vm, st, STATE).as_i32_unchecked();
+    let settled = if get(vm, st, AG_YIELD) == AWAITING_RETURN {
+        // A `return(v)`'s `v` settled.
+        set(vm, st, AG_YIELD, Value::FALSE);
+        if mode == THROW { Err(v) } else { Ok((v, true)) }
+    } else if mode == RETURN && (state == SUSPENDED_START || state == COMPLETED) {
+        // `return(v)` of a generator not started or done: `v` awaited
+        // (AsyncGeneratorAwaitReturn), what it settles to the result.
+        if state == SUSPENDED_START {
+            set(vm, st, STATE, Value::from_i32(COMPLETED));
+            clear_regs(st, unsafe { (*as_object(get(vm, st, FUNCTION))).code });
         }
-        Ok((awaited, false)) => {
-            return crate::promise::await_coroutine(vm, awaited, g);
+        set(vm, st, AG_YIELD, AWAITING_RETURN);
+        match crate::promise::await_coroutine(vm, v, g) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                set(vm, st, AG_YIELD, Value::FALSE);
+                Err(match e.1 {
+                    Some(v) => v,
+                    None => crate::builtins::caught(vm, &e),
+                })
+            }
         }
-        Ok((out, true)) => Ok((out, true)),
-        Err(e) => Err(match e.1 {
-            Some(v) => v,
-            None => crate::builtins::caught(vm, &e),
-        }),
+    } else {
+        match resume_raw(vm, g, v, mode, "an async generator") {
+            Ok((out, false)) if get(vm, st, AG_YIELD) == Value::TRUE => {
+                set(vm, st, AG_YIELD, Value::FALSE);
+                Ok((out, false))
+            }
+            Ok((awaited, false)) => {
+                return crate::promise::await_coroutine(vm, awaited, g);
+            }
+            Ok((out, true)) => Ok((out, true)),
+            Err(e) => Err(match e.1 {
+                Some(v) => v,
+                None => crate::builtins::caught(vm, &e),
+            }),
+        }
     };
     let q = get(vm, st, AG_QUEUE);
     let (resolve, reject) = (qget(vm, q, 2), qget(vm, q, 3));

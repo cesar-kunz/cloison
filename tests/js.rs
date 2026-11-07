@@ -391,6 +391,36 @@ q.then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// An async generator's `return(v)` awaits `v`: done or not started,
+/// the result's value is what it settles to (a rejection rejects); at a
+/// `yield`, a rejection is thrown there, and through `yield*` it's a
+/// `throw()` (#102).
+#[test]
+fn async_generator_return_awaits_its_value() {
+    let src = r#"
+var log = [];
+async function* h() {}
+h().return(Promise.resolve("Y")).then(r => log.push("a " + r.value));
+h().return(Promise.reject("Z")).then(() => log.push("b fulfilled"), e => log.push("b " + e));
+h().return({ get then() { throw "T"; } }).then(() => log.push("c fulfilled"), e => log.push("c " + e));
+async function* g() { try { yield 1; } catch (e) { log.push("d caught " + e); yield 2; } }
+var it = g(); it.next().then(() => it.return(Promise.reject("W"))).then(r => log.push("d " + JSON.stringify(r)));
+var inner = { [Symbol.asyncIterator]() { return this; },
+  next() { return { value: 1, done: false }; },
+  throw(e) { return { value: "thrown " + e, done: true }; },
+  return(v) { return { value: "returned " + v, done: true }; } };
+async function* k() { return yield* inner; }
+var i1 = k(); i1.next().then(() => i1.return(Promise.resolve("R"))).then(r => log.push("e " + r.value));
+var i2 = k(); i2.next().then(() => i2.return(Promise.reject("X"))).then(r => log.push("f " + r.value));
+var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        "a Y, b Z, c T, d caught W, d {\"value\":2,\"done\":false}, e returned R, f thrown X"
+    );
+}
+
 /// A direct `eval` in an arrow sees the enclosing function's `arguments`
 /// and `new.target`, as the arrow does.
 #[test]

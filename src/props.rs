@@ -1422,9 +1422,10 @@ fn descriptors(vm: &mut Vm, props: Value) -> Result<Vec<(Key, Desc)>> {
     let po = vm.to_object(props)?;
     let mut out = Vec::new();
     vm.handle_scope(|vm| {
-        for (key, _) in vm.own_keys(po) {
+        // (A proxy's through its traps; symbols too.)
+        for key in crate::proxy::own_keys(vm, po)? {
             // (Enumerability as of now: a getter may have changed it.)
-            let Some(d) = vm.own_property(po, key) else { continue };
+            let Some(d) = crate::proxy::get_own_property(vm, po, key)? else { continue };
             if d.enumerable != Some(true) {
                 continue;
             }
@@ -1711,8 +1712,8 @@ fn object_get_own_property_descriptors(vm: &mut Vm, _: Value, a: &[Value]) -> Re
     let o = vm.to_object(arg(a, 0))?;
     let op = object_value(vm.object_prototype);
     let out = object_value(vm.new_object(op));
-    for (key, _) in vm.own_keys(o) {
-        if let Some(d) = vm.own_property(o, key) {
+    for key in crate::proxy::own_keys(vm, o)? {
+        if let Some(d) = crate::proxy::get_own_property(vm, o, key)? {
             let dv = vm.from_descriptor(&d);
             vm.create_data_property(out, key, dv)?;
         }

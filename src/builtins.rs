@@ -1021,6 +1021,7 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
                 declared: module.declared.clone(),
                 function_names: module.function_names.clone(),
                 lexical: Vec::new(),
+                constants: Vec::new(),
             };
             let code = vm.load(module);
             let e = crate::vm::EvalCode {

@@ -1056,6 +1056,13 @@ handlers! {
         next_or_throw!(Op::DeleteProperty.size(), r.map(Value::from_bool))
     }
 
+    fn op_init_global(pc, acc, regs, tag) {
+        let vm = &mut *frame_vm(regs);
+        let (_, name) = (*frame_code(regs)).ic(u16_at(pc, 1));
+        vm.init_global_lexical(name, acc);
+        next!(any, Op::InitGlobal.size(), acc)
+    }
+
     fn op_delete_global(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
         let name = crate::js::lex::units_to_string(string_units(acc).unwrap_or(&[]));
@@ -1404,6 +1411,10 @@ handlers! {
         let ic = ic_at(regs, pc, 1);
         if (*g).shape == (*ic).shape && (*ic).holder.is_null() {
             next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(g, (*ic).loc))
+        }
+        let l = (*frame_vm(regs)).global_lexicals;
+        if (*l).shape == (*ic).shape {
+            next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(l, (*ic).loc))
         }
         let r = with_top(regs, None, |vm| vm.get_global_typeof_miss(&*frame_code(regs), u16_at(pc, 1)));
         next_or_throw!(Op::LdaGlobalInsideTypeof.size(), r)
@@ -1971,6 +1982,13 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_lda_global(pc, acc, regs, tag) {
+        // (The global scope's block-scoped binding, cached: see
+        // `Vm::get_global_lexical`.)
+        let l = (*frame_vm(regs)).global_lexicals;
+        let ic = ic_at(regs, pc, 1);
+        if (*l).shape == (*ic).shape {
+            next!(any, Op::LdaGlobal.size(), *Object::slot(l, (*ic).loc))
+        }
         let r = with_top(regs, None, |vm| vm.get_global_miss(&*frame_code(regs), u16_at(pc, 1)));
         next_or_throw!(Op::LdaGlobal.size(), r)
     }
@@ -1978,6 +1996,15 @@ handlers! {
     #[cold]
     #[inline(never)]
     fn slow_sta_global(pc, acc, regs, tag) {
+        let l = (*frame_vm(regs)).global_lexicals;
+        let ic = ic_at(regs, pc, 1);
+        if (*l).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
+            let at = Object::slot(l, (*ic).loc);
+            let v = as_named(tag, (*ic).holder as u64, acc);
+            *at = v;
+            crate::heap::barrier(l.cast(), at, v);
+            next!(any, Op::StaGlobal.size(), acc)
+        }
         let r = with_top(regs, None, |vm| {
             vm.store_failed = false;
             let code = &*frame_code(regs);
@@ -4134,6 +4161,7 @@ static TABLE: Table = {
     t[Op::TestIn as usize] = op_test_in;
     t[Op::DeleteProperty as usize] = op_delete_property;
     t[Op::DeleteGlobal as usize] = op_delete_global;
+    t[Op::InitGlobal as usize] = op_init_global;
     t[Op::LdaCallee as usize] = op_lda_callee;
     t[Op::DefineAccessor as usize] = op_define_accessor;
     t[Op::CreateRegExp as usize] = op_create_regexp;

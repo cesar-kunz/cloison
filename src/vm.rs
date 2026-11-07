@@ -645,6 +645,8 @@ pub const MAX_INLINE_CAPACITY: u32 = 64;
 /// The global object's room for properties in itself (the builtins take
 /// about 70; Octane's emscripten benchmarks define thousands).
 const GLOBAL_CAPACITY: u32 = 1024;
+/// [`Vm::global_lexicals`]' room in itself, for the same reasons.
+const LEXICAL_CAPACITY: u32 = 256;
 /// Every closure's room for properties in itself (`prototype` and one
 /// more; the rest out of line), its shapes' whatever its kind: its upvalues
 /// come after, at a fixed offset (see [`Vm::upvalues`]).
@@ -734,6 +736,12 @@ pub struct Vm {
     /// (which `heap::cell_size` reads them for) is done.
     pub(crate) condemned: Vec<Box<Code>>,
     pub(crate) global: *mut Object,
+    /// The global scope's block-scoped bindings (scripts' top-level
+    /// `let`s, `const`s and classes: see `codegen::global_lexical`), which
+    /// global names find before the global object's properties: an object
+    /// no code sees, with a property of each (read-only for a `const`),
+    /// `HOLE` until initialized (see [`Vm::get_global_lexical`]).
+    pub(crate) global_lexicals: *mut Object,
     pub(crate) object_prototype: *mut Object,
     pub(crate) function_prototype: *mut Object,
     pub(crate) array_prototype: *mut Object,
@@ -1211,6 +1219,7 @@ impl Vm {
             condemned: Vec::new(),
             jit_caches: Default::default(),
             global: std::ptr::null_mut(),
+            global_lexicals: std::ptr::null_mut(),
             object_prototype: std::ptr::null_mut(),
             function_prototype: std::ptr::null_mut(),
             array_prototype: std::ptr::null_mut(),
@@ -1435,6 +1444,7 @@ impl Vm {
         // aren't folded as constants. (64 slots, the builtins took them
         // all: DeltaBlue +20% instructions.)
         vm.global = vm.new_object_with(Class::Plain, op, GLOBAL_CAPACITY);
+        vm.global_lexicals = vm.new_object_with(Class::Plain, Value::NULL, LEXICAL_CAPACITY);
 
         let fp = object_value(vm.function_prototype);
         let root = vm.root_shape(Class::Function, fp, FUNCTION_CAPACITY);
@@ -2563,7 +2573,7 @@ impl Vm {
         if !cell.is_constant() {
             return true;
         }
-        if o == self.global || unsafe { (*o).class } == Class::Function {
+        if o == self.global || o == self.global_lexicals || unsafe { (*o).class } == Class::Function {
             return false;
         }
         self.field_made_mutable(cell);
@@ -3810,6 +3820,82 @@ impl Vm {
         }
     }
 
+    /// The slot of the global scope's block-scoped binding `name` in
+    /// `global_lexicals`, if a script declared one.
+    fn global_lexical_slot(&self, name: Atom) -> Option<u32> {
+        unsafe { (*(*self.global_lexicals).shape).lookup(name) }
+    }
+
+    /// A global name's load (GetBindingValue) finding the global scope's
+    /// block-scoped binding, which comes before the global object: its
+    /// value (or a ReferenceError, not initialized yet), cached in `ic`'s
+    /// first way as the global object's are (see `global_way`), once
+    /// initialized: it never is uninitialized again. `None` if there is no
+    /// such binding.
+    fn get_global_lexical(&mut self, code: &Code, ic: u16) -> Option<Result<Value>> {
+        let (ic, name) = code.ic(ic);
+        let slot = self.global_lexical_slot(name)?;
+        let l = self.global_lexicals;
+        unsafe {
+            let shape = (*l).shape;
+            let loc = (*shape).location(slot);
+            let v = *Object::slot(l, loc);
+            if v == Value::HOLE {
+                return Some(Err(Error::reference_error(format!(
+                    "Cannot access '{}' before initialization",
+                    self.atom_name(name)
+                ))));
+            }
+            *ic = Ic { shape, loc, ..Ic::EMPTY };
+            Some(Ok(v))
+        }
+    }
+
+    /// A global name's store (SetMutableBinding) finding the global
+    /// scope's block-scoped binding: a ReferenceError if not initialized
+    /// yet, a TypeError for a `const`; cached as the global object's are
+    /// (see `set_global_miss`). `None` if there is no such binding.
+    fn set_global_lexical(&mut self, code: &Code, ic: u16, value: Value) -> Option<Result<()>> {
+        let (ic, name) = code.ic(ic);
+        let slot = self.global_lexical_slot(name)?;
+        let l = self.global_lexicals;
+        unsafe {
+            let shape = (*l).shape;
+            if *Object::slot(l, (*shape).location(slot)) == Value::HOLE {
+                return Some(Err(Error::reference_error(format!(
+                    "Cannot access '{}' before initialization",
+                    self.atom_name(name)
+                ))));
+            }
+            if (*shape).attrs()[slot as usize] & READ_ONLY != 0 {
+                let n = self.atom_name(name);
+                return Some(Err(Error::type_error(format!("Assignment to constant variable '{n}'."))));
+            }
+            self.store_field(l, slot, value);
+            if self.may_cache_store(l, slot) {
+                *ic = Ic {
+                    shape,
+                    holder: (*shape).field_type(slot).encode() as *mut Object,
+                    loc: (*shape).location(slot),
+                    ..Ic::EMPTY
+                };
+            }
+        }
+        Some(Ok(()))
+    }
+
+    /// Initialize the global scope's block-scoped binding `name` (see
+    /// `codegen::global_lexical`) to `value`: its field filled as though
+    /// nothing were stored yet (as `declare_global`'s).
+    pub(crate) fn init_global_lexical(&mut self, name: Atom, value: Value) {
+        let l = self.global_lexicals;
+        let slot = self.global_lexical_slot(name).expect("declared by its script");
+        unsafe {
+            *Object::slot(l, (*(*l).shape).location(slot)) = Value::UNDEFINED;
+        }
+        self.store_field(l, slot, value);
+    }
+
     /// Whether global `name` exists (HasBinding): on the global object or
     /// its prototypes, a proxy among them asked (its `has` trap).
     fn has_global(&mut self, name: Atom) -> Result<bool> {
@@ -3822,6 +3908,9 @@ impl Vm {
 
     /// `LdaGlobal` miss: a ReferenceError if the global doesn't exist.
     pub fn get_global_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
+        if let Some(r) = self.get_global_lexical(code, ic) {
+            return r;
+        }
         let (_, name) = code.ic(ic);
         let g = self.global;
         if !self.has_global(name)? {
@@ -3839,6 +3928,9 @@ impl Vm {
     /// `LdaGlobalInsideTypeof` miss: as `LdaGlobal`'s, but `undefined` for a
     /// missing global.
     pub fn get_global_typeof_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
+        if let Some(r) = self.get_global_lexical(code, ic) {
+            return r;
+        }
         let (_, name) = code.ic(ic);
         if !self.has_global(name)? {
             return Ok(Value::UNDEFINED);
@@ -3903,6 +3995,9 @@ impl Vm {
     /// `StaGlobal` miss (sloppy mode: creates the global if missing). Only
     /// stores to existing globals are cached.
     pub fn set_global_miss(&mut self, code: &Code, ic: u16, value: Value) -> Result<()> {
+        if let Some(r) = self.set_global_lexical(code, ic, value) {
+            return r;
+        }
         let (ic, name) = code.ic(ic);
         let g = self.global;
         // Not the global's own, past a proxy on its prototype chain: the
@@ -4169,6 +4264,10 @@ impl Vm {
     /// `delete name` of a global: false for a script's `var` or function
     /// (made before it runs, not deletable: see `global_declarations`).
     pub(crate) fn delete_global(&mut self, name: Atom) -> bool {
+        // (The global scope's block-scoped binding: not deletable.)
+        if self.global_lexical_slot(name).is_some() {
+            return false;
+        }
         let g = self.global;
         if unsafe { (*(*g).shape).lookup(name).is_none() } && self.script_declared.contains(&name) {
             return false;
@@ -4321,7 +4420,12 @@ impl Vm {
     /// extensible, sealed, frozen, elements with attributes: rare, and
     /// their shapes are made by `props`).
     fn may_be_dictionary(&self, o: *mut Object) -> bool {
-        unsafe { (*o).class == Class::Plain && (*o).flags & !crate::object::EXTERNAL == 0 && o != self.global }
+        unsafe {
+            (*o).class == Class::Plain
+                && (*o).flags & !crate::object::EXTERNAL == 0
+                && o != self.global
+                && o != self.global_lexicals
+        }
     }
 
     /// The field cell of dictionary shapes' slots.
@@ -6013,13 +6117,15 @@ impl Vm {
         object_value(self.thrower)
     }
 
-    /// A script's global declarations: a block-scoped name may not be
-    /// another script's (any kind), nor a `var` an earlier script's
+    /// A script's global declarations (GlobalDeclarationInstantiation): a
+    /// block-scoped name may not be another script's block-scoped one, nor
+    /// a global the global object can't lose (a script's `var`; an
+    /// `eval`'s can be shadowed), nor a `var` an earlier script's
     /// block-scoped one (a SyntaxError, before it runs).
     pub(crate) fn declare_script(&mut self, module: &Module) -> Result<()> {
         for n in &module.lexical {
             let a = self.intern_name(n);
-            if self.declared.contains(&a) || self.lexical_declared.contains(&a) {
+            if self.lexical_declared.contains(&a) {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
             }
             if let Some(d) = self.own_property(self.global, Key::Name(a))
@@ -6038,6 +6144,7 @@ impl Vm {
         for n in &module.lexical {
             let a = self.intern_name(n);
             self.lexical_declared.insert(a);
+            self.declare_lexical(a, module.constants.contains(n));
         }
         for n in &module.declared {
             let a = self.intern_name(n);
@@ -6054,6 +6161,15 @@ impl Vm {
     /// that don't exist yet made, functions' then `var`s' (see
     /// [`Vm::declare_global`]).
     pub(crate) fn global_declarations(&mut self, module: &Module, eval: bool) -> Result<()> {
+        // (An `eval`'s `var` of a script's block-scoped name: a SyntaxError,
+        // as a script's, see `declare_script`.)
+        let lexical = eval && !self.lexical_declared.is_empty();
+        for n in module.declared.iter().filter(|_| lexical) {
+            let a = self.intern_name(n);
+            if self.lexical_declared.contains(&a) {
+                return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
+            }
+        }
         let g = self.global;
         let extensible = Self::is_extensible(g);
         for n in &module.declared {
@@ -6134,6 +6250,66 @@ impl Vm {
             if (*g).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
                 self.bump_code_epoch();
+            }
+        }
+    }
+
+    /// The global scope's block-scoped binding `name` made (read-only for
+    /// a `const`), not initialized, before the script declaring it runs
+    /// (see `global_lexicals`). If the global object has a property of the
+    /// name, which global names found so far, its shape is copied and the
+    /// property's field made mutable: the inline caches and compiled code
+    /// that found it there (or folded its value) miss, and find the
+    /// binding.
+    fn declare_lexical(&mut self, name: Atom, constant: bool) {
+        let l = self.global_lexicals;
+        let attrs = DONT_DELETE | if constant { READ_ONLY } else { 0 };
+        unsafe {
+            let new = self.transition_with((*l).shape, name, attrs);
+            let ns = &*new;
+            let slot = ns.keys().len() as u32 - 1;
+            if slot >= ns.capacity.get() {
+                self.reserve_props(l, slot - ns.capacity.get());
+            }
+            crate::object::set_shape(l, new);
+            // (Its field as though nothing were stored yet: see
+            // `init_global_lexical`.)
+            *Object::slot(l, ns.location(slot)) = Value::HOLE;
+        }
+        let g = self.global;
+        unsafe {
+            let s = &*(*g).shape;
+            let Some(slot) = s.lookup(name) else {
+                return;
+            };
+            self.field_made_mutable(s.field_cell(slot));
+            self.shape_left(s);
+            let u = Shape {
+                class: s.class,
+                proto: s.proto,
+                capacity: Cell::new(s.capacity.get()),
+                slots: Slots::new(s.keys(), s.attrs(), s.fields()),
+                elems: s.elems,
+                elems_code: s.elems_code,
+                family: std::ptr::null(),
+                push: Cell::new(std::ptr::null_mut()),
+                unique: true,
+                fixed: false,
+                transitions: Default::default(),
+                elem_transitions: Default::default(),
+                relied: Cell::new(false),
+                left: Cell::new(false),
+                lineage_relied: Cell::new(false),
+                parent: std::ptr::null(),
+                mark: Default::default(),
+                traced: Cell::new(0),
+                pinned: Cell::new(false),
+                dictionary: false,
+            };
+            crate::object::set_shape(g, self.add_shape(u));
+            self.bump_code_epoch();
+            if (*g).flags & PROTOTYPE != 0 {
+                self.proto_epoch = self.proto_epoch.wrapping_add(1);
             }
         }
     }

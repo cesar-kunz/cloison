@@ -34,6 +34,10 @@ pub struct Program<'a> {
     /// Strict indirect `eval`'s code: its `var`s and functions are its
     /// own, not globals.
     pub eval_locals: bool,
+    /// A script's code (not an `eval`'s, nor a module's): its top-level
+    /// `let`s, `const`s and classes are the global scope's (see
+    /// `codegen::global_lexical`).
+    pub script: bool,
     /// Direct `eval`'s code compiled for a site's bindings (see
     /// `intrinsics::direct_eval_bound`): its top level's upvalues, those of
     /// the site's bindings function, by index: the name the `eval` sees,
@@ -145,6 +149,10 @@ pub struct Lexical {
     /// of its scope object, which other modules may import (never in a
     /// box: see `codegen::boxed_lexicals`).
     pub module_top: bool,
+    /// Declared at a script's top level (not in a block): a binding of
+    /// the global scope (see `codegen::global_lexical`), unless the script
+    /// is an `eval`'s code.
+    pub script_top: bool,
 }
 
 /// Where a program's nodes live (see [`Arena`]).

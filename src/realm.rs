@@ -200,6 +200,7 @@ const NO_CODE: *const Code = std::ptr::null();
 
 realm_fields! {
     global: *mut Object = NULL => global;
+    global_lexicals: *mut Object = NULL => global_lexicals;
     object_prototype: *mut Object = NULL => object_prototype;
     function_prototype: *mut Object = NULL => function_prototype;
     array_prototype: *mut Object = NULL => array_prototype;

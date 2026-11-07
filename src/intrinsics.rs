@@ -860,6 +860,13 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));
         }
     }
+    // (One of the global scope's, a script's top-level `let` and the
+    // like, too: see `Vm::global_declarations`.)
+    for &n in declared.iter().filter(|_| target == object_value(vm.global)) {
+        if vm.lexical_declared.contains(&n) {
+            return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));
+        }
+    }
     for &atom in declared.iter() {
         if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;

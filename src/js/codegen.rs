@@ -4141,7 +4141,7 @@ impl<'a> Gen<'a> {
                     self.ldar(t);
                     self.temp = mark;
                 }
-                self.yield_acc(e.pos)?;
+                self.suspend(e.pos, self.f.is_async)?;
             }
             Bound => unreachable!("a declaration's marker"),
             Destructure(p, v, mode) => {
@@ -5787,6 +5787,13 @@ impl<'a> Gen<'a> {
     /// in `acc`, or its exception thrown (`throw(e)`), or a return
     /// (`return(v)`) made, through the `finally` blocks.
     fn yield_acc(&mut self, pos: Pos) -> R<()> {
+        self.suspend(pos, false)
+    }
+
+    /// [`Self::yield_acc`], or an async generator's `yield` with `unwrap`:
+    /// a `return(v)`'s `v` awaited first, its rejection thrown at the
+    /// `yield` (AsyncGeneratorUnwrapYieldResumption).
+    fn suspend(&mut self, pos: Pos, unwrap: bool) -> R<()> {
         let Var::Reg(g) = self.resolve(GEN, pos)? else {
             return unsupported(pos, "a generator with this many variables");
         };
@@ -5806,7 +5813,21 @@ impl<'a> Gen<'a> {
         self.emit(Op::Throw, &[]);
         self.bind(returned);
         self.ldar(v);
-        self.return_acc(pos)?;
+        if unwrap {
+            let rejected = self.label();
+            self.emit(Op::Yield, &[Arg::Reg(g)]);
+            self.acc = Acc::default();
+            self.star(v);
+            self.intrinsic("generator_mode", g, 1);
+            self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(1), rejected);
+            self.ldar(v);
+            self.return_acc(pos)?;
+            self.bind(rejected);
+            self.ldar(v);
+            self.emit(Op::Throw, &[]);
+        } else {
+            self.return_acc(pos)?;
+        }
         self.bind(done);
         self.ldar(v);
         self.temp = mark;
@@ -5937,7 +5958,7 @@ impl<'a> Gen<'a> {
         self.jump_if(Jmp::True, done);
         value(self, false)?;
         // Yielded as it is; what the generator resumes with (and how) sent
-        // on.
+        // on, a `return(v)`'s `v` awaited first (its rejection a `throw`).
         self.mov(g, gr);
         self.intrinsic("async_gen_yield", gr, 1);
         self.ldar(v);
@@ -5947,6 +5968,21 @@ impl<'a> Gen<'a> {
         self.star(received);
         self.mov(g, gr);
         self.intrinsic("generator_mode", gr, 1);
+        self.star(mode);
+        let unwrap = self.label();
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), unwrap);
+        self.jump(top);
+        self.bind(unwrap);
+        self.ldar(received);
+        self.emit(Op::Yield, &[Arg::Reg(g)]);
+        self.acc = Acc::default();
+        self.star(received);
+        self.mov(g, gr);
+        self.intrinsic("generator_mode", gr, 1);
+        let thrown = self.label();
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(1), thrown);
+        self.lda_smi(2);
+        self.bind(thrown);
         self.star(mode);
         self.jump(top);
         self.bind(done);

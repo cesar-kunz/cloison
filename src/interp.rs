@@ -3753,8 +3753,9 @@ const STRING: u8 = 1;
 const DEFAULT: u8 = 2;
 
 /// ToPrimitive with `hint`: the object's `Symbol.toPrimitive` method's
-/// result, if it has one (looked for once some object has had one), else
-/// the first of `valueOf` and `toString` (`toString` first for hint
+/// result, if it has one (looked for once some object has had one or a
+/// proxy became a prototype, and always in a proxy, whose `get` trap may
+/// give one), else the first of `valueOf` and `toString` (`toString` first for hint
 /// "string") giving a primitive.
 /// A bytecode one is called where something can call it (`native_top`
 /// set: a native, an interpreter slow path in `conv!`); elsewhere (compiled
@@ -3775,7 +3776,7 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
         if vm.conv_failed() {
             return Value::UNDEFINED;
         }
-        if vm.to_primitive_defined {
+        if vm.to_primitive_defined || vm.proxies_exist && crate::proxy::is_proxy(vm, as_object(v)) {
             let fail = |vm: &mut Vm, e: Error| {
                 vm.conv_error.get_or_insert(e);
                 vm.conv_thrown = true;

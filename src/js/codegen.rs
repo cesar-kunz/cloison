@@ -5894,17 +5894,40 @@ impl<'a> Gen<'a> {
         self.star(mode);
         let (top, done) = (self.loop_label(), self.label());
         self.bind(top);
+        // The result awaited (a sync iterator's as it is), …
+        let result_ready = self.label();
         self.intrinsic("async_delegate_step", it, 3);
+        self.star(result);
+        self.ldar(sync);
+        self.jump_if(Jmp::True, result_ready);
+        self.ldar(result);
         self.yield_acc(pos)?;
         self.star(result);
-        // The result's value into `v` (a sync iterator's awaited).
-        let value = |g: &mut Self| -> R<()> {
+        self.bind(result_ready);
+        // … its value into `v` (a sync iterator's awaited, as
+        // AsyncFromSyncIterator's step: its rejection closes the iterator
+        // unless done, or a `return()`'s).
+        let value = |g: &mut Self, done: bool| -> R<()> {
             let ready = g.label();
             g.named(Op::GetNamed, result, "value");
             g.star(v);
             g.ldar(sync);
             g.jump_if(Jmp::False, ready);
-            g.ldar(v);
+            let mark = g.temp;
+            let w = g.alloc(pos)?;
+            let close = g.alloc(pos)?;
+            g.mov(v, w);
+            g.emit(Op::LdaUndefined, &[]);
+            g.star(close);
+            if !done {
+                let returning = g.label();
+                g.ldar(mode);
+                g.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), returning);
+                g.mov(it, close);
+                g.bind(returning);
+            }
+            g.intrinsic("async_from_sync", w, 2);
+            g.temp = mark;
             g.yield_acc(pos)?;
             g.star(v);
             g.bind(ready);
@@ -5912,7 +5935,7 @@ impl<'a> Gen<'a> {
         };
         self.intrinsic("delegate_done", result, 1);
         self.jump_if(Jmp::True, done);
-        value(self)?;
+        value(self, false)?;
         // Yielded as it is; what the generator resumes with (and how) sent
         // on.
         self.mov(g, gr);
@@ -5928,7 +5951,7 @@ impl<'a> Gen<'a> {
         self.jump(top);
         self.bind(done);
         // (A `return()` passed on: the generator returns the value.)
-        value(self)?;
+        value(self, true)?;
         let (ret, end) = (self.label(), self.label());
         self.ldar(mode);
         self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), ret);
@@ -6484,27 +6507,37 @@ impl<'a> Gen<'a> {
             g.yield_acc(pos)?;
             g.star(v);
             g.bind(result_ready);
+            let mark = g.temp;
+            let result = g.alloc(pos)?;
+            g.mov(v, result);
             g.intrinsic("async_iterator_value", v, 1);
             g.star(v);
             g.ldar(sync);
             g.jump_if(Jmp::False, value_ready);
             // A sync iterator's step, as AsyncFromSyncIterator's: a
-            // promise of its value (`undefined` once done) settling a job
-            // after it, awaited.
+            // promise of its value (once done too) settling a job after
+            // it, awaited; its rejection closes the iterator unless done
+            // (`[value, iterator]`, `undefined` the iterator once done).
             let not_done = g.label();
             let finished = g.alloc(pos)?;
+            let w = g.alloc(pos)?;
+            let close = g.alloc(pos)?;
+            g.mov(v, w);
+            g.mov(it, close);
             g.ldar(v);
             g.emit(Op::TestStrictEqual, &[Arg::Reg(hole)]);
             g.star(finished);
             g.jump_if(Jmp::False, not_done);
+            g.named(Op::GetNamed, result, "value");
+            g.star(w);
             g.emit(Op::LdaUndefined, &[]);
-            g.star(v);
+            g.star(close);
             g.bind(not_done);
-            g.intrinsic("async_from_sync", v, 1);
+            g.intrinsic("async_from_sync", w, 2);
             g.yield_acc(pos)?;
             g.star(v);
             g.ldar(finished);
-            g.temp -= 1;
+            g.temp = mark;
             g.jump_if(Jmp::True, done);
             g.bind(value_ready);
             g.ldar(v);

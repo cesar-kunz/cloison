@@ -56,7 +56,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("scope_delete", scope_delete),
     ("map_arguments_to_scope", map_arguments_to_scope),
     ("scope_var", scope_var),
-    ("async_from_sync", |vm, a| crate::promise::async_from_sync(vm, a[0])),
+    ("async_from_sync", |vm, a| crate::promise::async_from_sync(vm, a[0], iterator_of(a[1]))),
     ("generator_mode", generator_mode),
     ("delegate_step", delegate_step),
     ("delegate_done", delegate_done),
@@ -1502,7 +1502,7 @@ fn async_from_sync_return(vm: &mut Vm, it: Value) -> Result<Value> {
         vm.get(r, a_done)?;
         let a_value = vm.a_value;
         let v = vm.get(r, a_value)?;
-        crate::promise::async_from_sync(vm, v)
+        crate::promise::async_from_sync(vm, v, Value::UNDEFINED)
     };
     match step(vm) {
         Ok(v) => Ok(v),

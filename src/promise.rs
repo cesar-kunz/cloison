@@ -56,6 +56,8 @@ enum Root {
     CatchFinally,
     ValueThunk,
     Thrower,
+    /// … AsyncFromSyncIterator's rejection handler.
+    CloseOnRejection,
     /// (Not a promise's: a direct `eval`'s binding's accessors.)
     BindingGet,
     BindingSet,
@@ -107,7 +109,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(aep, a_message, empty, DONT_ENUM);
 
     vm.promise_roots = vec![proto, c, jobs, aep, std::ptr::null_mut()];
-    let templates: [(NativeFn, u32); 13] = [
+    let templates: [(NativeFn, u32); 14] = [
         (resolve_fn, 1),
         (reject_fn, 1),
         (executor_fn, 2),
@@ -119,6 +121,7 @@ pub(crate) fn install(vm: &mut Vm) {
         (catch_finally, 1),
         (value_thunk, 0),
         (thrower, 0),
+        (close_on_rejection, 1),
         (crate::intrinsics::binding_get, 0),
         (crate::intrinsics::binding_set, 1),
     ];
@@ -197,12 +200,27 @@ pub(crate) fn reject_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
 
 /// AsyncFromSyncIterator's promise of a step's value `v`:
 /// `PromiseResolve(%Promise%, v).then()`, settling as `v` does, a job
-/// after.
-pub(crate) fn async_from_sync(vm: &mut Vm, v: Value) -> Result<Value> {
+/// after; rejected, sync iterator `close` closed first (unless
+/// undefined: the iterator done, or a `return()`'s value).
+/// (AsyncFromSyncIteratorContinuation, `closeOnRejection`.)
+pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, close: Value) -> Result<Value> {
     let c = object_value(root(vm, Root::Constructor));
-    let wrapper = promise_resolve_with(vm, c, v)?;
+    let wrapper = match promise_resolve_with(vm, c, v) {
+        Ok(w) => w,
+        Err(e) => {
+            // (A rejected promise, the iterator closed first.)
+            let _ = crate::symbol::close(vm, close);
+            return rejected(vm, e);
+        }
+    };
+    // (No handler for a promise already fulfilled, as a plain value's.)
+    let on_rejected = if close.is_undefined() || state(wrapper).0 == FULFILLED {
+        Value::UNDEFINED
+    } else {
+        closure(vm, Root::CloseOnRejection, &[close])
+    };
     let cap = new_capability(vm, c)?;
-    perform_then(vm, as_object(wrapper), Value::UNDEFINED, Value::UNDEFINED, &cap)?;
+    perform_then(vm, as_object(wrapper), Value::UNDEFINED, on_rejected, &cap)?;
     Ok(cap.promise)
 }
 
@@ -212,6 +230,13 @@ pub(crate) fn rejected(vm: &mut Vm, e: Error) -> Result<Value> {
     let p = new_promise(vm);
     settle(vm, as_object(p), REJECTED, reason)?;
     Ok(p)
+}
+
+/// [`async_from_sync`]'s rejection handler: the iterator in slot 0
+/// closed (its own errors lost), the reason thrown on.
+fn close_on_rejection(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let _ = crate::symbol::close(vm, slot(vm.callee, 0));
+    Err(Error::thrown(arg(a, 0)))
 }
 
 // ---- Helpers ----

@@ -293,8 +293,10 @@ fn local_time(t: f64) -> f64 {
     t + local_tza(t).0
 }
 
-/// `UTC(t)`: local time value `t` as a UTC one (the offset at `t` taken
-/// as if UTC, then refined once: right except at a zone transition).
+/// `UTC(t)`: local time value `t` as a UTC one. The offsets a day before
+/// and after `t` (taken as if UTC) bracket any transition near it (one at
+/// most is assumed): a local time that happens twice is its earlier
+/// instant, and one skipped takes the offset from before the transition.
 /// NaN for a `t` no offset (less than a day) brings into TimeClip's range,
 /// as what it gives goes through TimeClip: `year_from_time` of a year past
 /// 2^53 would never end.
@@ -302,8 +304,18 @@ fn utc(t: f64) -> f64 {
     if !t.is_finite() || t.abs() > MAX_TIME + MS_PER_DAY {
         return f64::NAN;
     }
-    let guess = t - local_tza(t).0;
-    t - local_tza(guess).0
+    let before = local_tza(t - MS_PER_DAY).0;
+    let after = local_tza(t + MS_PER_DAY).0;
+    if before == after {
+        return t - before;
+    }
+    // Whether each offset gives back `t`: both in an overlap, neither in
+    // a gap.
+    match (local_tza(t - before).0 == before, local_tza(t - after).0 == after) {
+        (true, true) => (t - before).min(t - after),
+        (false, true) => t - after,
+        _ => t - before,
+    }
 }
 
 // ---- Helpers ----

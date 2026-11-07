@@ -76,6 +76,8 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("async_iterator_next", async_iterator_next),
     ("async_iterator_value", async_iterator_value),
     ("async_iterator_close", async_iterator_close),
+    ("async_iterator_closed", async_iterator_closed),
+    ("async_iterator_close_quiet", async_iterator_close_quiet),
     ("async_delegate_step", async_delegate_step),
     ("eval_scope", eval_scope),
     ("eval_scope_get", eval_scope_get),
@@ -1465,16 +1467,62 @@ fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     vm.get(r, a_value)
 }
 
-/// A `for await` left early: `[iterator]`'s `return()` called, what it
-/// gives (awaited after), or `undefined` without one.
+/// A `for await` left early: `[record, sync]`'s iterator's `return()`
+/// called, what it gives (awaited after), or `HOLE` without one (nothing
+/// to await). (A sync iterator's: as AsyncFromSyncIterator's.)
 fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let it = iterator_of(a[0]);
+    if a[1] == Value::TRUE {
+        return async_from_sync_return(vm, it);
+    }
     let a_return = vm.intern_name("return");
     let m = vm.get(it, a_return)?;
     if m.is_undefined() || m.is_null() {
-        return Ok(Value::UNDEFINED);
+        return Ok(Value::HOLE);
     }
     call_function(vm, m, it, &[])
+}
+
+/// `%AsyncFromSyncIteratorPrototype%.return()` of sync iterator `it`:
+/// what to await for its iterator result (a rejection for what throws),
+/// its value's promise, or `undefined` without a `return()` (its result
+/// then a settled promise's, awaited a job after).
+fn async_from_sync_return(vm: &mut Vm, it: Value) -> Result<Value> {
+    let step = |vm: &mut Vm| -> Result<Value> {
+        let a_return = vm.intern_name("return");
+        let m = vm.get(it, a_return)?;
+        if m.is_undefined() || m.is_null() {
+            return Ok(Value::UNDEFINED);
+        }
+        let r = call_function(vm, m, it, &[])?;
+        if !crate::props::is_object(r) {
+            return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
+        }
+        let a_done = vm.intern_name("done");
+        vm.get(r, a_done)?;
+        let a_value = vm.a_value;
+        let v = vm.get(r, a_value)?;
+        crate::promise::async_from_sync(vm, v)
+    };
+    match step(vm) {
+        Ok(v) => Ok(v),
+        Err(e) => crate::promise::rejected(vm, e),
+    }
+}
+
+/// What `[r, sync]`, a `for await`'s iterator's `return()` gave, settled
+/// to: an object. (A sync iterator's always is: its iterator result.)
+fn async_iterator_closed(_: &mut Vm, a: &[Value]) -> Result<Value> {
+    if a[1] != Value::TRUE && !crate::props::is_object(a[0]) {
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(a[0]))));
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// A `for await` left by an exception: as [`async_iterator_close`], its
+/// errors ignored (`HOLE` then: the exception goes on, nothing awaited).
+fn async_iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    Ok(async_iterator_close(vm, a).unwrap_or(Value::HOLE))
 }
 
 /// A direct `eval`'s scope object: `[function's scope, block-scoped count,

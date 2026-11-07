@@ -480,6 +480,7 @@ impl Regex {
             groups: 1,
             total,
             names,
+            declared: Vec::new(),
             unicode,
             sets,
             dot_all,
@@ -1181,6 +1182,9 @@ struct Parser<'a> {
     total: usize,
     /// The named groups (all of them, found first).
     names: Vec<(String, usize)>,
+    /// The names of the groups so far that may participate in a match
+    /// together with one here (not those in another alternative).
+    declared: Vec<String>,
     unicode: bool,
     /// `v` mode: classes are sets (see `Parser::class_set`).
     sets: bool,
@@ -1253,11 +1257,17 @@ impl Parser<'_> {
     }
 
     fn alternation(&mut self) -> Result<Node, String> {
+        // (A name may repeat in another alternative: its groups' names are
+        // out of the others', and all of them past it.)
+        let base = self.declared.len();
         let mut alts = vec![self.sequence()?];
+        let mut names = self.declared.split_off(base);
         while self.peek() == Some('|') {
             self.i += 1;
             alts.push(self.sequence()?);
+            names.append(&mut self.declared.split_off(base));
         }
+        self.declared.append(&mut names);
         Ok(if alts.len() == 1 { alts.pop().unwrap() } else { Node::Alt(alts) })
     }
 
@@ -1430,9 +1440,10 @@ impl Parser<'_> {
                     let name = self.group_name()?;
                     let g = self.groups;
                     self.groups += 1;
-                    if self.names.iter().filter(|(n, _)| *n == name).count() > 1 {
+                    if self.declared.contains(&name) {
                         return Err(self.error("Duplicate capture group name"));
                     }
+                    self.declared.push(name);
                     (0, Some(g))
                 } else {
                     let g = self.groups;
@@ -1506,9 +1517,14 @@ impl Parser<'_> {
                 }
                 self.i += 1;
                 let name = self.group_name()?;
-                match self.names.iter().find(|(n, _)| *n == name) {
-                    Some(&(_, g)) => Node::BackRef(g, self.case()),
-                    None => return Err(self.error("Invalid named capture referenced")),
+                // (Of a name's groups in different alternatives, the one
+                // that matched: the others match empty.)
+                let refs: Vec<Node> =
+                    self.names.iter().filter(|(n, _)| *n == name).map(|&(_, g)| Node::BackRef(g, self.case())).collect();
+                match refs.len() {
+                    0 => return Err(self.error("Invalid named capture referenced")),
+                    1 => refs.into_iter().next().unwrap(),
+                    _ => Node::Seq(refs),
                 }
             }
             'b' => Node::Boundary(true, self.case()),

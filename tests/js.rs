@@ -449,6 +449,32 @@ q.then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// `Array.fromAsync` steps a sync iterator as `for await` does: what the
+/// step throws is a rejection, awaited, and doesn't close it; a mapper's
+/// exception closes it by AsyncFromSyncIterator's `return()`, whose
+/// promise is awaited (without a `return()` too).
+#[test]
+fn array_from_async_steps_a_sync_iterator_as_for_await() {
+    let src = r#"
+var log = [];
+var p = Promise.resolve(); for (let i = 0; i < 6; i++) p = p.then(() => log.push("t" + i));
+function S(tag, kind, ret) { var o = { [Symbol.iterator]() { return this; },
+  next() { if (kind == "next") throw tag; if (kind == "obj") return 5;
+    return { get done() { if (kind == "done") throw tag; return false; }, get value() { if (kind == "value") throw tag; return 1; } }; } };
+  if (ret) o.return = function () { log.push("closed " + tag); return {}; };
+  return o; }
+for (const k of ["next", "obj", "done", "value"]) Array.fromAsync(S(k, k, true)).catch(e => log.push(typeof e == "string" ? e : e.name));
+Array.fromAsync(S("m", "", true), () => { throw "m"; }).catch(e => log.push("mapper " + e));
+Array.fromAsync(S("n", "", false), () => { throw "n"; }).catch(e => log.push("mapper " + e));
+var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        "t0, t1, next, TypeError, done, value, closed m, t2, t3, mapper n, t4, mapper m, t5"
+    );
+}
+
 /// An `await` whose PromiseResolve throws (a promise's `constructor`
 /// getter) throws at the `await`, there and then: in a `for await`'s
 /// close on an exception, the loop's exception goes on.

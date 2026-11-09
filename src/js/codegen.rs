@@ -4993,8 +4993,17 @@ impl<'a> Gen<'a> {
                 self.ldar(0);
             }
             self.star(this);
+            // Whether the caller is strict (`EVAL_STRICT`), and has a
+            // `new.target` (`EVAL_NEW_TARGET`): a function's, not one of
+            // a script's or a module's top level, for an arrow there.
+            let mut k = self.index;
+            while self.p.functions[k].arrow {
+                k = self.p.functions[k].parent.unwrap();
+            }
+            let new_target = if k == 0 { self.p.direct_eval && self.p.eval_new_target } else { !self.p.functions[k].module };
             let strict = self.alloc(pos)?;
-            self.emit(if self.f.strict { Op::LdaTrue } else { Op::LdaFalse }, &[]);
+            let flags = if self.f.strict { EVAL_STRICT } else { 0 } | if new_target { EVAL_NEW_TARGET } else { 0 };
+            self.emit(Op::LdaSmi, &[Arg::Imm(flags as i32)]);
             self.star(strict);
             let params = self.alloc(pos)?;
             // (An arrow has no `arguments` of its own: unless a parameter
@@ -5088,8 +5097,18 @@ impl<'a> Gen<'a> {
                     nlex += (i < lexical) as i32;
                 }
             }
-            kept.truncate(80);
+            // (Past the most there is room for, an arrow's function's
+            // `arguments` and `new.target` still: a module's many
+            // top-level variables come first.)
+            let own: Vec<_> = kept
+                .iter()
+                .skip(80)
+                .filter(|b| matches!(b.0, "arguments" | "%newtarget") && b.2 & EVAL_BLOCK_SCOPED as i32 == 0)
+                .copied()
+                .collect();
+            kept.truncate(80 - own.len());
             let nlex = nlex.min(kept.len() as i32);
+            kept.extend(own);
             if kept.is_empty() {
                 self.intrinsic("direct_eval", fr, nargs);
                 self.temp = mark;

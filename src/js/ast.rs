@@ -49,6 +49,9 @@ pub struct Program<'a> {
     /// Direct `eval`'s code of a script's, its function's scope object
     /// the global object (see `parse::parse_pass`).
     pub eval_global: bool,
+    /// Direct `eval`'s code whose caller has a `new.target` (see
+    /// `parse::parse_source_as`), which an `eval` in it passes on.
+    pub eval_new_target: bool,
     /// A lazily compiled function's: the upvalues that are an enclosing
     /// named function expression's own name (`asm::LazyFn::own_names`),
     /// parameters of the wrapper `js::compile_lazy` makes, but immutable.
@@ -317,6 +320,13 @@ pub const EVAL_BOXED: u8 = 8;
 /// An enclosing function's (past the `eval`'s function's own scope): a
 /// `var` the `eval` declares shadows it, as a variable of the function's.
 pub const EVAL_OUTER: u8 = 16;
+
+/// What a direct `eval`'s caller is (see `intrinsics::direct_eval`):
+/// strict code, and code with a `new.target` (a function's, not an arrow
+/// of a script's or a module's top level, whose `eval`'s code may not
+/// have one).
+pub const EVAL_STRICT: u8 = 1;
+pub const EVAL_NEW_TARGET: u8 = 2;
 
 /// The start of the name of the exception a statement list with `using`
 /// declarations catches (see `Parser::lower_using`): its `try` statement

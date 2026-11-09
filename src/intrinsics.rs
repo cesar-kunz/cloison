@@ -4,7 +4,7 @@
 //! paths all: the JIT leaves them to the interpreter.
 
 use crate::interp::{call_function, to_string_units};
-use crate::js::ast::{EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST};
+use crate::js::ast::{EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_NEW_TARGET, EVAL_STRICT};
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::Desc;
 use crate::value::Value;
@@ -794,16 +794,18 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(out)
 }
 
-/// A direct `eval(source)`: `[eval, source, scope, this, strict, in
-/// parameters, scope for its declarations, with objects…]`. Not
-/// the builtin `eval`: an ordinary call. Else `source` (a string) is
+/// A direct `eval(source)`: `[eval, source, scope, this, flags
+/// (`EVAL_STRICT`…), in parameters, scope for its declarations, with
+/// objects…]`. Not the builtin `eval`: an ordinary call. Else `source` (a string) is
 /// compiled with the caller's scope object `scope` around it (see
 /// `js::compile_direct_eval`), its `var`s and functions (sloppy code's)
 /// made there first, and run with the caller's `this`. The code is kept
 /// to run again for the same source in the same kind of place (see
 /// `Vm::eval_cache`): only its declarations are made at each run.
 fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let (f, src, env, this, strict) = (a[0], a[1], a[2], a[3], a[4] == Value::TRUE);
+    let (f, src, env, this) = (a[0], a[1], a[2], a[3]);
+    let flags = a[4].as_number().unwrap_or(0.0) as u8;
+    let (strict, new_target) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0);
     let builtin = f.is_cell() && as_object(f) == vm.eval_function;
     if !builtin {
         return call_function(vm, f, Value::UNDEFINED, &[src]);
@@ -818,7 +820,7 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     // block-scoped bindings, not as a `with`'s: see `parse_pass`.)
     let decl = a.get(6).copied().filter(|&d| crate::props::is_object(d)).unwrap_or(env);
     let global = decl == object_value(vm.global);
-    let place = crate::vm::EvalPlace::Direct { strict, withs: withs.len(), global };
+    let place = crate::vm::EvalPlace::Direct { strict, new_target, withs: withs.len(), global };
     let hash = Vm::eval_hash(u, place);
     // (`kept`: its caches stay when it has run.)
     let (code, own_strict, declared, annex_b, kept) = match vm.cached_eval(u, place, hash) {
@@ -826,7 +828,7 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         None => {
             let source: Box<[u16]> = u.into();
             let text = crate::vm::source_text(u);
-            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), global, &[]).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, withs.len(), global, &[]).map_err(eval_error)?;
             let annex_b: std::rc::Rc<[crate::object::Atom]> = module.annex_b.iter().map(|n| vm.intern_name(n)).collect();
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
@@ -912,7 +914,9 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (carrier, site, number) = (a[a.len() - 3], a[a.len() - 2], a[a.len() - 1]);
     let a = &a[..a.len() - 3];
-    let (f, src, env, this, strict) = (a[0], a[1], a[2], a[3], a[4] == Value::TRUE);
+    let (f, src, env, this) = (a[0], a[1], a[2], a[3]);
+    let flags = a[4].as_number().unwrap_or(0.0) as u8;
+    let (strict, new_target) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0);
     if !(f.is_cell() && as_object(f) == vm.eval_function) {
         return call_function(vm, f, Value::UNDEFINED, &[src]);
     }
@@ -941,7 +945,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                     None => ("%none".into(), 0, "".into()),
                 })
                 .collect();
-            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), false, &bound).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, withs.len(), false, &bound).map_err(eval_error)?;
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
                 std::mem::take(&mut module.declared).iter().map(|n| vm.intern_name(n)).collect();

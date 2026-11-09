@@ -515,6 +515,27 @@ r.join(" ");
     );
 }
 
+/// A direct `eval` in an arrow of a script's top level has no `new.target`
+/// to see: `new.target` in its code is an early SyntaxError (#124), its
+/// code not run, an `eval` in it or an arrow too; a function's, in an arrow
+/// in its code, is the function's. SpiderMonkey's values.
+#[test]
+fn eval_in_top_level_arrows_has_no_new_target() {
+    assert_eq!(
+        value(
+            r#"
+var r = [], t = f => { try { return String(f()); } catch (e) { return e.name; } };
+r.push(t(() => eval("new.target")), t(() => (() => eval("r.push('ran'); new.target"))()));
+r.push(t(() => eval("eval('new.target')")), t(() => eval("(() => new.target)()")), t(() => eval("arguments")));
+function F() { return [(() => eval("eval('new.target')"))(), (() => eval("(() => new.target)()"))()]; }
+r.push(new F().every(x => x === F), F().join("/"), t(() => eval("this === globalThis")));
+r.join(" ");
+"#
+        ),
+        "SyntaxError SyntaxError SyntaxError SyntaxError ReferenceError true / true"
+    );
+}
+
 /// A script's direct `eval` sees the script's lexical bindings (its
 /// `let`s, `const`s, classes, a block's), reads and writes them, and its
 /// `var`s are still the global object's.
@@ -9798,6 +9819,43 @@ fn modules_with_eval_export_lexicals() {
         run_module(&dir, "main.mjs").unwrap(),
         "6,2,function,4,5,10,40,ReferenceError,ReferenceError,TypeError,TypeError,3,4,9,6,6"
     );
+}
+
+/// An arrow of a module's calls `eval`, the module's own code not (#124):
+/// the module has no `new.target`, nor `arguments` (a global's by the
+/// name, then), for the `eval`'s code to see, its `this` undefined; in a
+/// function, the function's, past more top-level variables than the
+/// `eval`'s code sees. In the interpreter and tiered up. SpiderMonkey's
+/// values.
+#[test]
+fn modules_eval_in_arrows() {
+    let vars: String = (0..100).map(|i| format!("let l{i} = {i}; var v{i} = {i};\n")).collect();
+    let main = format!(
+        "{vars}const r = [], t = f => {{ try {{ return String(f()); }} catch (e) {{ return e.name; }} }};\n\
+         r.push(t(() => eval('l9 + l70')), t(() => eval('new.target')), t(() => (() => eval('r.push(0); new.target'))()));\n\
+         r.push(t(() => eval(\"eval('new.target')\")), t(() => eval('(() => new.target)()')), t(() => eval('this')));\n\
+         r.push(t(() => (() => eval('this'))()), t(() => eval('arguments')), t(() => eval('typeof arguments')));\n\
+         function F() {{ return [(() => eval('new.target'))(), (() => (() => eval(\"eval('new.target')\"))())(), (() => eval('arguments.length'))()]; }}\n\
+         r.push(new F(1, 2).map(x => x === F ? 'F' : x).join('/'), F().join('/'));\n\
+         class C {{ x = (() => eval('String(new.target)'))(); }}\n\
+         r.push(new C().x);\n\
+         globalThis.arguments = 'global';\n\
+         r.push(t(() => eval('arguments')), t(() => eval('new.target')));\n\
+         globalThis.result = r.join();"
+    );
+    let dir = module_dir("eval-arrows", &[("main.mjs", &main), ("top.mjs", "eval('');\ntry { (() => eval('new.target'))(); } catch (e) { globalThis.result = e.name; }")]);
+    let want = "79,SyntaxError,SyntaxError,SyntaxError,SyntaxError,undefined,undefined,ReferenceError,undefined,\
+                F/F/2,//0,undefined,global,SyntaxError";
+    for budget in [i64::MAX, 1, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.run_module(dir.join("main.mjs").to_str().unwrap()).unwrap_or_else(|_| panic!("at {budget}"));
+        vm.verify_heap();
+        let (a, g) = (vm.intern("result"), vm.global_object());
+        assert_eq!(display(vm.get(g, a).unwrap()), want, "tier at {budget}");
+    }
+    // (With an `eval` of its own too.)
+    assert_eq!(run_module(&dir, "top.mjs").unwrap(), "SyntaxError");
 }
 
 /// Top-level `await`: a module waits for its async dependencies, which

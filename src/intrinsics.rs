@@ -1185,7 +1185,7 @@ fn async_delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// record (see [`async_from_sync_done`]); a rejection for what throws
 /// (IfAbruptRejectPromise). (Not of an iterator result: none is made,
 /// nothing sees it.)
-fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<Value>, mode: i32) -> Result<Value> {
+pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<Value>, mode: i32) -> Result<Value> {
     let step = |vm: &mut Vm| -> Result<Value> {
         let (it, next) = crate::symbol::record_parts(record);
         let args = received.as_slice();

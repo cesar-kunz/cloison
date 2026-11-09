@@ -8209,6 +8209,21 @@ out.join(" | ");"##;
     );
 }
 
+/// Annex B lets a lookahead be quantified outside `u` mode, never a
+/// lookbehind (#148).
+#[test]
+fn regexp_quantified_lookbehind_is_a_syntax_error() {
+    assert_eq!(
+        value(
+            r#"
+function t(p, f) { try { new RegExp(p, f); return "ok"; } catch (e) { return e.name; } }
+[t("(?<=a){2}"), t("(?<!a)*"), t("(?<=a)?", "u"), t("(?=a){2}"), t("(?!a)*"), t("(?=a)+", "u"), /(?=a)*a/.test("a")].join(" ");
+"#
+        ),
+        "SyntaxError SyntaxError SyntaxError ok ok SyntaxError true"
+    );
+}
+
 /// A name may repeat in different alternatives (ES2025), where its groups
 /// can't both participate (#106): `groups` (and `indices.groups`) has it
 /// once, where first named, with the match of the group that matched, and

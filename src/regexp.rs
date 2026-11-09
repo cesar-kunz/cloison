@@ -1548,7 +1548,7 @@ impl Parser<'_> {
                     return Err(self.error("Invalid Unicode escape"));
                 };
                 let hex: String = self.c[s..s + end].iter().collect();
-                let cp = u32::from_str_radix(&hex, 16).ok().filter(|&v| v <= 0x10FFFF && !hex.is_empty());
+                let cp = u32::from_str_radix(&hex, 16).ok().filter(|&v| v <= 0x10FFFF && !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()));
                 let Some(cp) = cp else {
                     return Err(self.error("Invalid Unicode escape"));
                 };
@@ -1648,6 +1648,10 @@ impl Parser<'_> {
         self.i += 1;
         let hex = |p: &mut Self, n: usize| {
             let s: String = p.c.get(p.i..p.i + n)?.iter().collect();
+            // (Not `from_str_radix` alone: it takes a sign, `\x+1`.)
+            if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
             let v = u16::from_str_radix(&s, 16).ok()?;
             p.i += n;
             Some(v)

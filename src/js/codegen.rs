@@ -5033,9 +5033,12 @@ impl<'a> Gen<'a> {
         // (Not its top level's, the global scope's, which an indirect one
         // sees too.)
         let p = self.p;
+        let in_with = self.withs.iter().any(|w| w.starts_with("%w"));
         let script_lexicals = || {
             matches!(args.last(), Some(Expr { kind: ExprKind::Intrinsic("%eval_scope", v), .. })
                 if v.iter().any(|e| matches!(&e.kind, ExprKind::Ident(n) if !global_lexical(p, n))))
+                // (Or in a `with`, whose object it sees.)
+                || in_with
         };
         // (A sloppy script's own seeing none but those: an ordinary call,
         // without what the parser passes for them.)
@@ -5149,7 +5152,8 @@ impl<'a> Gen<'a> {
                     .chain(&self.withs[at + 1..])
                     .cloned()
                     .collect(),
-                None => Vec::new(),
+                // (A script's: all of them.)
+                None => self.withs.iter().filter(|w| w.starts_with("%w")).cloned().collect(),
             };
             for w in &withs {
                 let r = self.alloc(pos)?;

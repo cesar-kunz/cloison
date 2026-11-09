@@ -9865,6 +9865,66 @@ fn modules_await_and_import() {
     assert_eq!(run_module(&dir, "main.mjs").unwrap(), "a start,b,a end,main,true,A,3,SyntaxError");
 }
 
+/// A module importing more names than a function has registers (#139):
+/// past `IMPORT_PARAMS`, its imports' holders are in an array, and they
+/// stay live bindings — named, default and namespace imports, re-exports
+/// of them, closures' references, an uninitialized one in a cycle — in
+/// the interpreter and through the JIT, imported with `import()` too.
+/// SpiderMonkey's values.
+#[test]
+fn modules_import_many_names() {
+    for n in [160, 1000, 5000] {
+        let mut big = String::new();
+        let mut cyc = String::new();
+        for k in 0..n {
+            big.push_str(&format!("import {{ v as v{k} }} from './m.mjs';\n"));
+            cyc.push_str(&format!("import {{ a as a{k} }} from './cyc_a.mjs';\n"));
+        }
+        let (last, mid) = (n - 1, n / 2);
+        big.push_str(&format!(
+            "import d, {{ bump }} from './m.mjs';\nimport * as ns from './m.mjs';\nimport {{ rv, rns }} from './re.mjs';\n\
+             export const out = [v0 + v{last}, d, ns.v, rv, rns.v];\nbump();\nconst f = () => v{last} + v{mid};\n\
+             out.push(v{last}, f(), ns.v, rv, rns.v);\ntry {{ v{last} = 0; }} catch (e) {{ out.push(e.name); }}\n\
+             let s = 0;\nfor (let i = 0; i < 3000; i++) s += v{last} + v{mid};\nout.push(s);\nexport {{ v{last} as last }};\n\
+             export function read() {{ return v0 + v{last}; }}\n"
+        ));
+        cyc.push_str(&format!(
+            "export const early = [];\ntry {{ a{last}; }} catch (e) {{ early.push(e.name); }}\n\
+             try {{ (() => a{mid})(); }} catch (e) {{ early.push(e.name); }}\nexport function touch() {{ return a0 + a{last}; }}\n"
+        ));
+        let dir = module_dir(
+            &format!("imports{n}"),
+            &[
+                (
+                    "main.mjs",
+                    "import { bump } from './m.mjs';\nimport { seen } from './cyc_a.mjs';\nimport { early } from './cyc_b.mjs';\n\
+                     const ns = await import('./big.mjs');\nconst r = [...ns.out, ns.last, ns.read()];\nbump();\n\
+                     r.push(ns.last, ns.read(), seen, ...early);\nglobalThis.result = r.join();",
+                ),
+                ("m.mjs", "export let v = 1;\nexport function bump() { v++; }\nexport default 7;"),
+                ("re.mjs", "export { v as rv } from './m.mjs';\nexport * as rns from './m.mjs';"),
+                ("big.mjs", &big),
+                ("cyc_a.mjs", "import { touch } from './cyc_b.mjs';\nexport let a = 2;\nexport const seen = touch();"),
+                ("cyc_b.mjs", &cyc),
+            ],
+        );
+        for budget in [i64::MAX, 1] {
+            let mut vm = Vm::new();
+            vm.set_tier_back_edges(budget);
+            let r = vm.run_module(dir.join("main.mjs").to_str().unwrap());
+            vm.verify_heap();
+            assert!(r.is_ok(), "{n} imports, tier at {budget}");
+            let a = vm.intern("result");
+            let g = vm.global_object();
+            assert_eq!(
+                display(vm.get(g, a).unwrap()),
+                "2,7,1,1,1,2,4,2,2,2,TypeError,12000,2,4,3,6,4,ReferenceError,ReferenceError",
+                "{n} imports, tier at {budget}"
+            );
+        }
+    }
+}
+
 /// A module's early errors: before any of the graph runs.
 #[test]
 fn module_early_errors() {

@@ -646,6 +646,9 @@ const WIDE_TRANSITIONS: usize = 16;
 const ZOMBIES_MIN: usize = 1 << 14;
 
 const INITIAL_CTOR_CAPACITY: u32 = 4;
+/// `Vm::regexp_fns`: `exec`, the five `Symbol` methods, the getters of
+/// `flags` and of the eight flags.
+pub(crate) const REGEXP_FNS: usize = 15;
 /// `Code::ctor_result` when constructed objects have had several shapes.
 pub(crate) const MANY_SHAPES: *const Shape = std::ptr::dangling::<Shape>();
 /// Loop back edges before a frame tiers up, and calls before a function's
@@ -1054,16 +1057,17 @@ pub struct Vm {
     pub(crate) eval_function: *mut Object,
     pub(crate) regexp_prototype: *mut Object,
     /// `RegExp.prototype.exec` and `[Symbol.match]`, `[Symbol.matchAll]`,
-    /// `[Symbol.replace]`, `[Symbol.search]`, `[Symbol.split]` as made
-    /// (see `builtins::pristine`).
-    pub(crate) regexp_fns: [*mut Object; 6],
+    /// `[Symbol.replace]`, `[Symbol.search]`, `[Symbol.split]` as made,
+    /// then the getters of `flags` and of the flags it reads (see
+    /// `builtins::pristine`).
+    pub(crate) regexp_fns: [*mut Object; REGEXP_FNS],
     /// Their keys: `exec`, `Symbol.match`, … (as `regexp_fns`).
-    pub(crate) regexp_atoms: [Atom; 6],
+    pub(crate) regexp_atoms: [Atom; REGEXP_FNS],
     /// `RegExp.prototype`'s shape when `regexp_fns` were last found its
     /// properties, and their slots' locations there (see
     /// `builtins::pristine`).
     pub(crate) regexp_proto_shape: *const crate::object::Shape,
-    pub(crate) regexp_slots: [i32; 6],
+    pub(crate) regexp_slots: [i32; REGEXP_FNS],
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
     pub(crate) declared: crate::jit::HashSet<Atom>,
@@ -1095,7 +1099,7 @@ pub struct Vm {
     /// array's with elements of it, then with `index` and with `input`
     /// added.
     pub(crate) match_shapes: Vec<(FieldType, *const Shape, *const Shape, *const Shape, *const Shape)>,
-    /// A `RegExp` object's shape when made, and with its five properties
+    /// A `RegExp` object's shape when made, and with its two properties
     /// (see `builtins::regexp_object`).
     pub(crate) regexp_shapes: (*const Shape, *const Shape),
     /// Names of `RegExp` objects' and `exec` results' properties.
@@ -1103,9 +1107,9 @@ pub struct Vm {
     /// A bound function's target, a hidden key (see `function_bind`).
     pub(crate) a_bound_target: Atom,
     pub(crate) a_source: Atom,
-    pub(crate) a_global: Atom,
-    pub(crate) a_ignore_case: Atom,
-    pub(crate) a_multiline: Atom,
+    /// A `RegExp`'s source, a hidden key (its `source` is the prototype's
+    /// accessor).
+    pub(crate) a_regexp_source: Atom,
     pub(crate) a_index: Atom,
     pub(crate) a_input: Atom,
     pub(crate) array_buffer_prototype: *mut Object,
@@ -1353,10 +1357,10 @@ impl Vm {
             key_cache: Vec::new(),
             eval_function: std::ptr::null_mut(),
             regexp_prototype: std::ptr::null_mut(),
-            regexp_fns: [std::ptr::null_mut(); 6],
-            regexp_atoms: [Atom(0); 6],
+            regexp_fns: [std::ptr::null_mut(); REGEXP_FNS],
+            regexp_atoms: [Atom(0); REGEXP_FNS],
             regexp_proto_shape: std::ptr::null(),
-            regexp_slots: [0; 6],
+            regexp_slots: [0; REGEXP_FNS],
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
             from_async_helper: Value::UNDEFINED,
@@ -1373,9 +1377,7 @@ impl Vm {
             a_last_index: Atom(0),
             a_bound_target: Atom(0),
             a_source: Atom(0),
-            a_global: Atom(0),
-            a_ignore_case: Atom(0),
-            a_multiline: Atom(0),
+            a_regexp_source: Atom(0),
             a_index: Atom(0),
             a_input: Atom(0),
             array_buffer_prototype: std::ptr::null_mut(),
@@ -1436,9 +1438,7 @@ impl Vm {
         vm.a_last_index = vm.intern_name("lastIndex");
         vm.a_bound_target = vm.intern_name("\u{FDD0}BoundTarget");
         vm.a_source = vm.intern_name("source");
-        vm.a_global = vm.intern_name("global");
-        vm.a_ignore_case = vm.intern_name("ignoreCase");
-        vm.a_multiline = vm.intern_name("multiline");
+        vm.a_regexp_source = vm.intern_name("\u{FDD0}Source");
         vm.a_index = vm.intern_name("index");
         vm.a_input = vm.intern_name("input");
         vm.missing_holder = vm.new_object_with(Class::Plain, Value::NULL, 1);
@@ -3343,7 +3343,7 @@ impl Vm {
         e.0.clone()
     }
 
-    fn is_accessor(&self, h: *mut Object, slot: u32) -> bool {
+    pub(crate) fn is_accessor(&self, h: *mut Object, slot: u32) -> bool {
         unsafe { (&(*(*h).shape).attrs())[slot as usize] & ACCESSOR != 0 }
     }
 

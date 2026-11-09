@@ -2575,11 +2575,16 @@ impl<'a> Gen<'a> {
             // the function: those inside it may shadow it. (From its
             // parameter list, its eval scope object too, the body's, where
             // its own variable is found as the body's: see `in_param_list`.)
+            // (A function's inside a direct `eval`'s function, outside the
+            // scope object too: the `eval`'s code declares none of its.)
             let (mut child, mut k) = (self.index, Some(self.index));
+            let eval = eval_scope(self.p, self.index);
             while let Some(j) = k.filter(|&j| j != 0) {
                 if self.decls[j].contains(&name) {
                     let f = &self.p.functions[j];
-                    return f.withs.len() + usize::from(f.has_eval && child != j && in_param_list(self.p, child, j));
+                    let inner = eval.is_some_and(|e| e != j && eval_scope(self.p, j) == Some(e));
+                    return f.withs.len()
+                        + usize::from(inner || (f.has_eval && child != j && in_param_list(self.p, child, j)));
                 }
                 (child, k) = (j, self.p.functions[j].parent);
             }

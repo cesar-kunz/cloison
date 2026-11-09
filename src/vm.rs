@@ -885,6 +885,8 @@ pub struct Vm {
     /// Values Rust code holds in heap containers across a call into JS
     /// (see [`Vm::handle_scope`]): roots.
     pub(crate) handles: Vec<Value>,
+    /// The values the host keeps as [`Global`]s: roots.
+    pub(crate) globals: std::rc::Rc<Globals>,
     /// Scopes open in which Rust code holds values in copies of its own (a
     /// handle scope's `Vec`s), which a collection can neither find nor
     /// update: no cell may move while there are any (see
@@ -1279,6 +1281,7 @@ impl Vm {
             open_upvalues: Vec::new(),
             type_names: [None; 11],
             handles: Vec::new(),
+            globals: Default::default(),
             unmovable: 0,
             max_frame: crate::interp::HEADER,
             function_shape: std::ptr::null(),
@@ -6520,6 +6523,14 @@ impl Vm {
     /// Load and run `module`; returns its completion value. Its bytecode
     /// is run unchecked, which [`Checked`](crate::asm::Checked) makes safe.
     ///
+    /// The [`Value`]s it returns, and those the host has from the VM
+    /// otherwise, are valid only until the next run (or
+    /// [`Vm::run_module`]) begins: no collection runs between runs, but
+    /// one in a run frees the cells nothing in the VM refers to and moves
+    /// others, the host's copies left pointing at memory reused. A value
+    /// kept past it is held as a [`Global`], which the collector keeps and
+    /// updates.
+    ///
     /// A panic unwinding out of the run (the heap limit's, `CLOISON_HEAP_
     /// LIMIT`, under an embedder's `catch_unwind`) leaves the VM as between
     /// runs (see `RunState`), to run again, unless it unwound out of a
@@ -8026,6 +8037,101 @@ pub(crate) fn number_ascii(d: f64) -> NumBuf {
         let _ = write!(out, "e{}{}", if n - 1 < 0 { '-' } else { '+' }, (n - 1).abs());
     }
     out
+}
+
+/// The slots of a VM's [`Global`]s: roots, which a collection marks and,
+/// moving their cells, updates (`Vm::each_root_slot`); a slot freed holds
+/// `undefined` until a new `Global` takes it. Shared with the `Global`s,
+/// which free their slots as they drop, the VM or not still there; and
+/// the `Global`s' tag of their VM.
+#[derive(Default)]
+pub(crate) struct Globals {
+    pub(crate) slots: RefCell<Vec<Value>>,
+    free: RefCell<Vec<u32>>,
+}
+
+/// A value the host keeps from a VM across its runs: a root of the VM's
+/// while it lasts, where a collection finds it and updates it as it
+/// moves the cell (#142). (A raw [`Value`] is a cell only until the next
+/// run: see [`Vm::run`].) Of the VM that made it only: [`Global::get`]
+/// panics given another, and [`Global::new`] given another's cell.
+/// Dropped, its slot is free, its value no longer kept.
+///
+/// ```
+/// use cloison::vm::{Global, Vm, display};
+/// let mut vm = Vm::new();
+/// let o = vm.run(&cloison::js::compile("({k: 'v'.repeat(3)})").unwrap()).unwrap();
+/// let o = Global::new(&vm, o);
+/// vm.run(&cloison::js::compile("for (var i = 0; i < 1e6; i++) var x = {i: [i]};").unwrap()).unwrap();
+/// let k = vm.intern("k");
+/// assert_eq!(display(vm.get(o.get(&vm), k).unwrap()), "vvv");
+/// ```
+pub struct Global {
+    globals: std::rc::Rc<Globals>,
+    slot: u32,
+}
+
+impl Global {
+    /// `v`, of `vm`, kept: valid as a raw `Value` is, from the last run or
+    /// operation of `vm`'s, or from within one of its runs (a native's).
+    /// Panics if `v` is a cell of another VM's heap.
+    pub fn new(vm: &Vm, v: Value) -> Global {
+        assert!(
+            !v.is_cell() || vm.heap.contains(v.to_bits() as usize),
+            "Global::new: a value not of this VM's heap"
+        );
+        Global::hold(&vm.globals, v)
+    }
+
+    /// `v` in a slot of `globals`'s.
+    fn hold(globals: &std::rc::Rc<Globals>, v: Value) -> Global {
+        let mut slots = globals.slots.borrow_mut();
+        let slot = match globals.free.borrow_mut().pop() {
+            Some(i) => {
+                slots[i as usize] = v;
+                i
+            }
+            None => {
+                slots.push(v);
+                slots.len() as u32 - 1
+            }
+        };
+        Global { globals: globals.clone(), slot }
+    }
+
+    /// The value, where it is now (a collection may have moved it), for
+    /// `vm`'s operations until its next run; panics if `vm` isn't the VM
+    /// that made it.
+    pub fn get(&self, vm: &Vm) -> Value {
+        assert!(self.is_of(vm), "Global::get: a global of another VM");
+        self.globals.slots.borrow()[self.slot as usize]
+    }
+
+    /// Whether `vm` is the VM that made it.
+    pub fn is_of(&self, vm: &Vm) -> bool {
+        std::rc::Rc::ptr_eq(&self.globals, &vm.globals)
+    }
+}
+
+impl Clone for Global {
+    /// Another slot holding the value.
+    fn clone(&self) -> Global {
+        let v = self.globals.slots.borrow()[self.slot as usize];
+        Global::hold(&self.globals, v)
+    }
+}
+
+impl Drop for Global {
+    fn drop(&mut self) {
+        self.globals.slots.borrow_mut()[self.slot as usize] = Value::UNDEFINED;
+        self.globals.free.borrow_mut().push(self.slot);
+    }
+}
+
+impl fmt::Debug for Global {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Global({})", self.slot)
+    }
 }
 
 /// What a run ([`Vm::run`], `Vm::enter`, [`Vm::run_module`]) found as it

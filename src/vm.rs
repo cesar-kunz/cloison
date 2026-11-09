@@ -6702,7 +6702,8 @@ impl Vm {
     }
 
     /// The cells the VM refers to itself: the global object, the builtins'
-    /// prototypes and functions, `single_chars`, a pending error's value.
+    /// prototypes and functions, `single_chars`, a pending error's value,
+    /// the key cache's objects and converted keys.
     pub(crate) fn named_roots(&self) -> Vec<Value> {
         let mut v: Vec<Value> = [
             self.global,
@@ -6759,6 +6760,9 @@ impl Vm {
         }
         if let Some(Error(_, Some(e))) = &self.error {
             v.push(*e);
+        }
+        for &(k, c, _, _) in &self.key_cache {
+            v.extend([k, c].into_iter().filter(|v| v.is_cell()));
         }
         v
     }
@@ -6826,6 +6830,10 @@ impl Vm {
         }
         if let Some(Error(_, Some(e))) = &mut self.error {
             f(Root::Value(e));
+        }
+        for (k, c, _, _) in &mut self.key_cache {
+            f(Root::Value(k));
+            f(Root::Value(c));
         }
     }
 

@@ -6216,7 +6216,7 @@ impl<'a> Gen<'a> {
                 if f.annex_b {
                     let b = f.binding.as_deref().unwrap();
                     self.load_raw(b, s.pos)?;
-                    if self.p.direct_eval && self.index == 0 {
+                    if self.p.direct_eval && self.index == 0 && !self.p.eval_global {
                         // (Its `var` is the caller's: in the scope object.)
                         self.store_var(f.name.as_deref().unwrap(), s.pos)?;
                     } else if self.index == 0 {

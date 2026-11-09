@@ -2039,10 +2039,11 @@ fn is_finite(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// An accessor `name` on `o` whose getter is the native `f` (named `get
 /// name`, as the spec has it).
-pub(crate) fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) {
+pub(crate) fn getter(vm: &mut Vm, o: *mut Object, name: &str, f: NativeFn) -> *mut Object {
     let fo = vm.native_function(&format!("get {name}"), f, 0, Ty::Any, false);
     let a = vm.intern_name(name);
     vm.define_accessor(o, a, Some(object_value(fo)), None, DONT_ENUM);
+    fo
 }
 
 pub(crate) fn is_class(v: Value, c: Class) -> bool {
@@ -2136,18 +2137,25 @@ fn install_regexps(vm: &mut Vm) {
         vm.regexp_atoms[1 + k] = a;
     }
     // The flags and the source are accessors of the prototype (an
-    // instance's own data properties shadow them: `regexp_object`).
+    // instance has only `lastIndex`: `regexp_object`); `flags`' getter and
+    // those it calls noted after the methods, for `pristine`.
     vm.define_native(rp, "compile", regexp_compile, 2, Ty::Any, false);
     getter(vm, rp, "source", regexp_get::<0>);
-    getter(vm, rp, "flags", regexp_get::<1>);
-    getter(vm, rp, "global", regexp_get::<2>);
-    getter(vm, rp, "ignoreCase", regexp_get::<3>);
-    getter(vm, rp, "multiline", regexp_get::<4>);
-    getter(vm, rp, "sticky", regexp_get::<5>);
-    getter(vm, rp, "unicode", regexp_get::<6>);
-    getter(vm, rp, "dotAll", regexp_get::<7>);
-    getter(vm, rp, "hasIndices", regexp_get::<8>);
-    getter(vm, rp, "unicodeSets", regexp_get::<9>);
+    let flag_getters: [(&str, NativeFn); 9] = [
+        ("flags", regexp_get::<1>),
+        ("global", regexp_get::<2>),
+        ("ignoreCase", regexp_get::<3>),
+        ("multiline", regexp_get::<4>),
+        ("sticky", regexp_get::<5>),
+        ("unicode", regexp_get::<6>),
+        ("dotAll", regexp_get::<7>),
+        ("hasIndices", regexp_get::<8>),
+        ("unicodeSets", regexp_get::<9>),
+    ];
+    for (k, (name, f)) in flag_getters.into_iter().enumerate() {
+        vm.regexp_fns[6 + k] = getter(vm, rp, name, f);
+        vm.regexp_atoms[6 + k] = vm.intern_name(name);
+    }
 }
 
 /// `RegExp.prototype`'s getters: `source` (0), `flags` (1) and the flags
@@ -2168,7 +2176,7 @@ pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) 
     let re = this_regexp(this)?;
     Ok(match K {
         0 => {
-            let a = vm.a_source;
+            let a = vm.a_regexp_source;
             vm.get(this, a)?
         }
         1 => str_value(vm, &regexp_flags(re)),
@@ -2185,7 +2193,7 @@ pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) 
 }
 
 /// A new `RegExp` of `pattern` and `flags` (compiled once per pair): its
-/// own `lastIndex`, `source`, `global`, `ignoreCase`, `multiline`.
+/// own `lastIndex`, and its source.
 pub(crate) fn new_regexp(vm: &mut Vm, pattern: &str, flags: &str) -> Result<Value> {
     let key = (pattern.to_string(), flags.to_string());
     let re: *const crate::regexp::Regex = match vm.regexps.get(&key) {
@@ -2266,20 +2274,14 @@ pub(crate) fn regexp_literal(vm: &mut Vm, pattern: Value, flags: Value) -> Resul
     Ok(regexp_object(vm, re, pattern))
 }
 
-/// A `RegExp` object for `re`, with `source`.
+/// A `RegExp` object for `re`, with `source` (under a hidden key, which
+/// `RegExp.prototype.source` reads).
 fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) -> Value {
     let proto = object_value(vm.regexp_prototype);
-    let o = vm.new_object_with(Class::RegExp, proto, 6);
+    let o = vm.new_object_with(Class::RegExp, proto, 3);
     unsafe { (*o).code = re.cast() };
-    let r = unsafe { &*re };
-    let props = [
-        (vm.a_last_index, Value::from_i32(0)),
-        (vm.a_source, source),
-        (vm.a_global, Value::from_bool(r.global)),
-        (vm.a_ignore_case, Value::from_bool(r.ignore_case)),
-        (vm.a_multiline, Value::from_bool(r.multiline)),
-    ];
-    // The shape with all five found once: then only their stores.
+    let props = [(vm.a_last_index, Value::from_i32(0)), (vm.a_regexp_source, source)];
+    // The shape with both found once: then only their stores.
     let root = unsafe { (*o).shape };
     if vm.regexp_shapes.0 == root {
         unsafe { crate::object::set_shape(o, vm.regexp_shapes.1) };
@@ -2290,7 +2292,7 @@ fn regexp_object(vm: &mut Vm, re: *const crate::regexp::Regex, source: Value) ->
         return object_value(o);
     }
     for (a, v) in props {
-        let attrs = if a == vm.a_last_index { DONT_ENUM | DONT_DELETE } else { DONT_ENUM | READ_ONLY };
+        let attrs = if a == vm.a_last_index { DONT_ENUM | DONT_DELETE } else { DONT_ENUM | READ_ONLY | DONT_DELETE };
         vm.add_property_with(o, a, v, attrs);
     }
     if unsafe { !(*root).unique && !(*(*o).shape).unique } {
@@ -2361,17 +2363,12 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let re = regexp_of(made).unwrap() as *const crate::regexp::Regex;
     let o = as_object(this);
     unsafe { (*o).code = re.cast() };
-    let r = unsafe { &*re };
-    let source = if p.is_empty() { "(?:)".to_string() } else { p };
-    let source = str_value(vm, &source);
-    for (k, v) in [
-        (vm.a_source, source),
-        (vm.a_global, Value::from_bool(r.global)),
-        (vm.a_ignore_case, Value::from_bool(r.ignore_case)),
-        (vm.a_multiline, Value::from_bool(r.multiline)),
-    ] {
-        let d = crate::props::Desc::data(v, false, false, true);
-        let _ = vm.define_own_property(o, crate::vm::Key::Name(k), &d);
+    // (Its hidden source, the new one's (escaped), read-only to
+    // `defineProperty` and `freeze`.)
+    let a = vm.a_regexp_source;
+    let source = vm.get(made, a)?;
+    if let Some(k) = unsafe { (*(*o).shape).lookup(a) } {
+        vm.store_field(o, k, source);
     }
     let a_last = vm.a_last_index;
     vm.put_key(this, crate::vm::Key::Name(a_last), Value::from_i32(0))?;
@@ -2896,6 +2893,10 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
 }
 
 fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+    if this.is_undefined() || this.is_null() {
+        return Err(Error::type_error("String.prototype.matchAll called on null or undefined"));
+    }
+    require_global(vm, arg(a, 0), "matchAll")?;
     if let Some(r) = delegate(vm, "matchAll", this, a, string_match_all)? {
         return Ok(r);
     }
@@ -3007,13 +3008,28 @@ fn string_replace_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype.replaceAll called on null or undefined"));
     }
-    // A RegExp (IsRegExp) whose `flags` have no "g": first.
-    let pattern = arg(a, 0);
-    if is_regexp(vm, pattern)? {
+    require_global(vm, arg(a, 0), "replaceAll")?;
+    if let Some(r) = delegate(vm, "replace", this, a, string_replace_all)? {
+        return Ok(r);
+    }
+    replace(vm, this, a, true)
+}
+
+/// `replaceAll`'s and `matchAll`'s first step: a TypeError for a RegExp
+/// (IsRegExp) whose `flags` have no "g".
+fn require_global(vm: &mut Vm, pattern: Value, method: &str) -> Result<()> {
+    // (Its own flags, unless a getter or `Symbol.match` may say otherwise.)
+    let fast = pristine_for(vm, pattern, Some(0))?;
+    if fast && !regexp_of(pattern).unwrap().global {
+        return Err(Error::type_error(format!("{method} must be called with a global RegExp")));
+    }
+    if !fast && is_regexp(vm, pattern)? {
         let a_flags = vm.intern_name("flags");
         let flags = vm.get(pattern, a_flags)?;
         if flags.is_undefined() || flags.is_null() {
-            return Err(Error::type_error("String.prototype.replaceAll called with a RegExp whose flags are undefined"));
+            return Err(Error::type_error(format!(
+                "String.prototype.{method} called with a RegExp whose flags are undefined"
+            )));
         }
         let f = crate::interp::to_string_units(flags);
         if vm.conv_thrown {
@@ -3022,13 +3038,10 @@ fn string_replace_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         // (Not `[u16]::contains`: another caller of it slows RegExp's
         // searches, which then call it out of line.)
         if !f.contains(&(b'g' as u16)) {
-            return Err(Error::type_error("replaceAll must be called with a global RegExp"));
+            return Err(Error::type_error(format!("{method} must be called with a global RegExp")));
         }
     }
-    if let Some(r) = delegate(vm, "replace", this, a, string_replace_all)? {
-        return Ok(r);
-    }
-    replace(vm, this, a, true)
+    Ok(())
 }
 
 /// IsRegExp(v): an object whose `Symbol.match` says so, else a RegExp.
@@ -3508,8 +3521,10 @@ pub(crate) fn radix_string(d: f64, radix: u32) -> String {
 
 // ---- RegExp's generic algorithms (through `exec`) ----
 
-/// Whether `rx` is a RegExp whose `exec` is the builtin one: its methods'
-/// fast paths then do what the generic algorithms would.
+/// Whether `rx` is a RegExp whose `exec` is the builtin one, as are the
+/// getters of `flags` and of the flags it reads: its methods' fast paths
+/// (which take the flags it was made with) then do what the generic
+/// algorithms would.
 pub(crate) fn pristine(vm: &mut Vm, rx: Value) -> Result<bool> {
     pristine_for(vm, rx, None)
 }
@@ -3525,22 +3540,12 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
     }
     unsafe {
         let rp = vm.regexp_prototype;
-        // (Its `global`, `ignoreCase` and `multiline`, slots 2 to 4, as it
-        // was made: redefined, they may not be.)
-        let s = vm.regexp_shapes.1;
-        let flags_kept = |re: &crate::regexp::Regex| {
-            let flag = |i: u32| *Object::slot(as_object(rx), (*s).location(i));
-            flag(2) == Value::from_bool(re.global)
-                && flag(3) == Value::from_bool(re.ignore_case)
-                && flag(4) == Value::from_bool(re.multiline)
-        };
-        if (*as_object(rx)).shape == s
-            && (*rp).shape == vm.regexp_proto_shape
-            && regexp_of(rx).is_some_and(flags_kept)
-        {
+        if (*as_object(rx)).shape == vm.regexp_shapes.1 && (*rp).shape == vm.regexp_proto_shape {
             let at = |i: usize| *Object::slot(rp, vm.regexp_slots[i]);
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
-            return Ok(ok(0) && k.is_none_or(|k| ok(1 + k)));
+            // (An accessor's slot holds its getter-setter pair.)
+            let getter_ok = |i: usize| *(*as_object(at(i))).elems == object_value(vm.regexp_fns[i]);
+            return Ok(ok(0) && k.is_none_or(|k| ok(1 + k)) && (6..crate::vm::REGEXP_FNS).all(getter_ok));
         }
     }
     pristine_slow(vm, rx, k)
@@ -3551,49 +3556,35 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
 #[cold]
 #[inline(never)]
 fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
-    // (Not with own flags other than it was made with, which the
-    // algorithms read: the fast paths take the ones it has. Its own
-    // `global`, `ignoreCase` and `multiline` are data properties; an own
-    // `flags` is left alone, as V8 does: the generic paths would loop on
-    // a "g" the RegExp hasn't.)
-    if let Some(re) = regexp_of(rx) {
-        let flags = [
-            ("global", re.global),
-            ("ignoreCase", re.ignore_case),
-            ("multiline", re.multiline),
-            ("sticky", re.sticky),
-            ("unicode", re.unicode && !re.unicode_sets),
-            ("unicodeSets", re.unicode_sets),
-            ("dotAll", re.dot_all),
-        ];
-        for (name, has) in flags {
-            let a = vm.intern_name(name);
-            if let Some(d) = vm.own_property(as_object(rx), crate::vm::Key::Name(a))
-                && d.value != Some(Value::from_bool(has))
-            {
-                return Ok(false);
-            }
-        }
-    }
-    let a = vm.regexp_atoms[0];
-    let e = vm.get(rx, a)?;
-    if !(e.is_cell() && as_object(e) == vm.regexp_fns[0]) {
+    // (Without calling a getter: the generic algorithms will. Not through
+    // a proxy, whose traps they call.)
+    let o = as_object(rx);
+    if crate::proxy::chain_has_proxy(vm, o) {
         return Ok(false);
     }
-    if let Some(k) = k {
-        let m = vm.get(rx, vm.regexp_atoms[1 + k])?;
-        if !(m.is_cell() && as_object(m) == vm.regexp_fns[1 + k]) {
-            return Ok(false);
-        }
+    // Whether slot `slot` of `h` holds `regexp_fns[i]` (a getter's from 6
+    // on).
+    let builtin = |vm: &Vm, h: *mut Object, slot: u32, i: usize| unsafe {
+        let v = *Object::slot(h, (*(*h).shape).location(slot));
+        let v = match (vm.is_accessor(h, slot), i >= 6) {
+            (true, true) => *(*as_object(v)).elems,
+            (false, false) => v,
+            _ => return false,
+        };
+        v == object_value(vm.regexp_fns[i])
+    };
+    let found = |vm: &Vm, i: usize| vm.lookup(o, vm.regexp_atoms[i]).is_some_and(|(h, slot)| builtin(vm, h, slot, i));
+    if !(found(vm, 0) && k.is_none_or(|k| found(vm, 1 + k)) && (6..crate::vm::REGEXP_FNS).all(|i| found(vm, i))) {
+        return Ok(false);
     }
-    // (Where the prototype's methods are, for the next time.)
+    // (Where the prototype's are, for the next time.)
     unsafe {
         let rp = vm.regexp_prototype;
         let s = &*(*rp).shape;
-        let mut slots = [0; 6];
+        let mut slots = [0; crate::vm::REGEXP_FNS];
         for (i, slot) in slots.iter_mut().enumerate() {
             match s.lookup(vm.regexp_atoms[i]) {
-                Some(j) if *Object::slot(rp, s.location(j)) == object_value(vm.regexp_fns[i]) => *slot = s.location(j),
+                Some(j) if builtin(vm, rp, j, i) => *slot = s.location(j),
                 _ => return Ok(true),
             }
         }

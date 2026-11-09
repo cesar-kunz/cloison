@@ -239,7 +239,7 @@ realm_fields! {
     temporal_protos: Vec<*mut Object> = Vec::new() => temporal.protos;
     temporal_ctors: Vec<*mut Object> = Vec::new() => temporal.ctors;
     intl_roots: Vec<*mut Object> = Vec::new() => intl_roots;
-    regexp_fns: [*mut Object; 6] = [NULL; 6] => regexp_fns;
+    regexp_fns: [*mut Object; crate::vm::REGEXP_FNS] = [NULL; crate::vm::REGEXP_FNS] => regexp_fns;
     dispose_roots: Vec<Value> = Vec::new() => dispose_roots;
     abstract_source: Vec<Value> = Vec::new() => modules.abstract_source;
     bind_helper: Value = Value::UNDEFINED => bind_helper;
@@ -257,7 +257,7 @@ realm_fields! {
     arguments_shape: *const Shape = NO_SHAPE => arguments_shape;
     mapped_arguments_shape: *const Shape = NO_SHAPE => mapped_arguments_shape;
     regexp_proto_shape: *const Shape = NO_SHAPE => regexp_proto_shape;
-    regexp_slots: [i32; 6] = [0; 6] => regexp_slots;
+    regexp_slots: [i32; crate::vm::REGEXP_FNS] = [0; crate::vm::REGEXP_FNS] => regexp_slots;
     regexp_shapes: (*const Shape, *const Shape) = (NO_SHAPE, NO_SHAPE) => regexp_shapes;
     match_shapes: Vec<MatchShape> = Vec::new() => match_shapes;
     function_call: *const Code = NO_CODE => function_call;

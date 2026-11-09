@@ -14937,3 +14937,28 @@ out.join(" ")
 "#;
     assert_eq!(value(src), "5 6 5 7 5 8 5 9 5 10 5 11 5 12 5 13 3 5 14 2 1 true 5");
 }
+
+/// A compound assignment's converted object key outlives a collection in
+/// its right side: `Vm::key_cache` kept the key string `GetKeyed` made for
+/// the `SetKeyed` to reuse, but no collection marked it, so the store went
+/// to whatever string took its freed cell ("s396"), or crashed.
+#[test]
+fn compound_keyed_assignment_key_outlives_a_collection() {
+    let src = r#"
+var o = {}, n = 0, junk;
+function rhs() {
+  $262.gc(); $262.gc();
+  for (var i = 0; i < 20000; i++) junk = "s" + i;
+  return 1;
+}
+function f() {
+  var k = { toString() { return "key" + (n++); } };
+  o[k] += rhs();
+}
+for (var r = 0; r < 20; r++) f();
+var ks = Object.keys(o), bad = [];
+for (var i = 0; i < 20; i++) if (ks[i] !== "key" + i) bad.push(ks[i]);
+ks.length + " " + bad.join(" ");
+"#;
+    assert_eq!(value(src), "20 ");
+}

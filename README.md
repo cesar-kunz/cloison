@@ -199,7 +199,7 @@ takes named time zones from the system's database (`TZDIR`, else
 intl`: `Intl.Collator` alone so far, on ICU4X, its locale data (English)
 a file read at runtime (`CLOISON_INTL_DATA`). See [docs/intl.md](docs/intl.md).
 `String.prototype.normalize` has all four forms without it, from tables
-generated from Unicode 17 (`scripts/unicode-norm.py`).
+generated from Unicode 18 (`scripts/unicode-norm.py`).
 
 Realms (`ShadowRealm`, `$262.createRealm`) share the one heap: each
 has its own global object and intrinsics, which a call of another

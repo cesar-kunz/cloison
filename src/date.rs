@@ -6,7 +6,7 @@
 
 use std::ffi::CStr;
 
-use crate::interp::{call_function, to_number, to_primitive, to_string_units};
+use crate::interp::{call_function, to_number, to_primitive, to_primitive_default, to_string_units};
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, READ_ONLY, as_object, object_value};
 use crate::value::Value;
 use crate::vm::{Code, Error, NativeFn, Result, Vm, string_units};
@@ -409,7 +409,7 @@ fn date_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
         [v] => match date_value(*v) {
             Some(t) => t,
             None => {
-                let p = to_primitive(*v);
+                let p = to_primitive_default(*v);
                 if vm.conv_thrown {
                     return Err(vm.take_conv_error());
                 }

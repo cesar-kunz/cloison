@@ -66,12 +66,18 @@ pub const MODULE_FUNCTION: &str = "%module";
 /// Its first parameter: the module's scope object, which its loader
 /// makes (see `module`) and the function fills (see `codegen`).
 pub const MODULE_ENV: &str = "%modenv";
+/// The imports whose holders are parameters of their own (after
+/// `MODULE_ENV`); the rest's are elements of an array, parameter
+/// `IMPORTS_ARRAY` (a module may import more names than a function has
+/// registers).
+pub const IMPORT_PARAMS: usize = 128;
+pub const IMPORTS_ARRAY: &str = "%imps";
 
 /// An imported binding (`import { x as y } from "m"`): a reference to it
 /// reads the variable it resolves to in the module exporting it, live, in
 /// that module's scope object, which the module function gets as its
-/// parameter `holder`; or with no `prop`, the parameter's value itself
-/// (a namespace object). Assigning it throws.
+/// parameter `holder` (or as its element `slot`); or with no `prop`,
+/// that value itself (a namespace object). Assigning it throws.
 #[derive(Debug, Clone)]
 pub struct Import {
     /// Its name as written.
@@ -81,6 +87,9 @@ pub struct Import {
     /// The module function's parameter holding the scope object (or the
     /// namespace).
     pub holder: Name,
+    /// Its index in `holder` when that is the array of the imports past
+    /// `IMPORT_PARAMS`; none for a parameter of its own.
+    pub slot: Option<usize>,
     /// The variable's name in that object, once linked (see
     /// `module::link`).
     pub prop: Option<String>,

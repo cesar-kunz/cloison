@@ -61,7 +61,7 @@ thread_local! {
 
 /// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, and
 /// in that many `with` statements).
-pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize, bool)>) -> Result<Program<'a>, Error> {
+pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize, bool, bool)>) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
@@ -102,7 +102,7 @@ fn parse_pass<'a>(
     keep: bool,
     table: Option<Table>,
     prev: Option<&Program<'a>>,
-    eval: Option<(bool, usize, bool)>,
+    eval: Option<(bool, usize, bool, bool)>,
     module: Option<i32>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
@@ -190,7 +190,7 @@ fn parse_pass<'a>(
     });
     p.functions[0].strict =
         p.directive_prologue() || eval.is_some_and(|(strict, ..)| strict) || module.is_some() || STRICT.get();
-    if let Some((_, withs, bound)) = eval {
+    if let Some((_, withs, bound, global)) = eval {
         // The scope object of the function calling it (its parameters and
         // `var`s, those `eval`s declared), the caller's scope object (the
         // other bindings it sees: see `intrinsics::eval_scope`), the
@@ -205,9 +205,16 @@ fn parse_pass<'a>(
             .chain((0..withs).map(|k| format!("%w{k}").into()))
             .chain((!bound || p.functions[0].strict).then(|| "%e1".into()))
             .collect();
+        // (`global`: the function's scope object is the global object, of
+        // a script's `eval`: not looked in, its names are the global ones,
+        // the global scope's block-scoped bindings first.)
+        let searched = names.len() - global as usize;
         for e in &names {
             p.hidden_var(e.clone());
-            p.lexicals.get_mut(e).unwrap().withs = names.len();
+            p.lexicals.get_mut(e).unwrap().withs = searched;
+            if global && &**e == "%e2" {
+                continue;
+            }
             p.withs.push(e.clone());
             p.functions[0].withs.push(e.clone());
         }

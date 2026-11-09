@@ -576,8 +576,9 @@ impl Code {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EvalPlace {
     /// A direct one's, in a function (see `intrinsics::direct_eval`):
-    /// whether the caller is strict, and the `with` statements around it.
-    Direct { strict: bool, withs: usize },
+    /// whether the caller is strict, the `with` statements around it, and
+    /// whether it is a script's (its scope object the global object).
+    Direct { strict: bool, withs: usize, global: bool },
     /// A direct one's compiled for its site's bindings (see
     /// `intrinsics::direct_eval_bound`): as `Direct`, the site (a number
     /// of its own: its bindings' names, kinds and upvalues are the code's)

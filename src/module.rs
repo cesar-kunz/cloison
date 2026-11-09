@@ -33,7 +33,7 @@
 //! of the host's that has one, an `%AbstractModuleSource%` (test262's).
 
 use crate::interp::call_function;
-use crate::js::ast::{ImportName, ModuleInfo, Phase};
+use crate::js::ast::{IMPORT_PARAMS, ImportName, ModuleInfo, Phase};
 use crate::object::{Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, same_value};
@@ -811,6 +811,14 @@ fn initialize(vm: &mut Vm, m: usize) -> Result<()> {
     let code = vm.load(module);
     vm.handle_scope(|vm| {
         vm.handles.extend_from_slice(&holders);
+        // (Past `IMPORT_PARAMS`, the holders in one array: see
+        // `ast::Import`.)
+        if imports.len() > IMPORT_PARAMS {
+            let rest = crate::array::new_array_of(vm, &holders[1 + IMPORT_PARAMS..])?;
+            vm.handles.push(rest);
+            holders.truncate(1 + IMPORT_PARAMS);
+            holders.push(rest);
+        }
         let f = crate::interp::run_script_at(vm, code)?;
         vm.handles.push(f);
         let g = call_function(vm, f, Value::UNDEFINED, &holders)?;

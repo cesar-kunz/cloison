@@ -3946,7 +3946,8 @@ impl<'a> Parser<'_, 'a, '_> {
     /// make the module's bindings (its functions, its other variables
     /// uninitialized) and resumes to run it, async if it has a top-level
     /// `await` (see `module`). Its parameters: the scope object, then the
-    /// holders of its imports (see `ast::Import`). The script's statement:
+    /// holders of its imports (see `ast::Import`), past `IMPORT_PARAMS` in
+    /// one array. The script's statement:
     /// an expression of the function.
     fn module_body(&mut self) -> R<Stmt<'a>> {
         let pos = self.pos();
@@ -4021,7 +4022,10 @@ impl<'a> Parser<'_, 'a, '_> {
         let f = &mut self.functions[index];
         f.body = body;
         f.end = self.toks[self.i].pos;
-        f.params = std::iter::once(MODULE_ENV.into()).chain((0..imports).map(|k| format!("%imp{k}").into())).collect();
+        f.params = std::iter::once(MODULE_ENV.into())
+            .chain((0..imports.min(IMPORT_PARAMS)).map(|k| format!("%imp{k}").into()))
+            .chain((imports > IMPORT_PARAMS).then(|| IMPORTS_ARRAY.into()))
+            .collect();
         f.generator = true;
         f.is_async = self.info.has_await;
         Ok(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Function(index), pos }), pos })
@@ -4221,7 +4225,11 @@ impl<'a> Parser<'_, 'a, '_> {
         let k = self.info.imports.len();
         self.info.imports.push((request, name, local.clone()));
         let original = self.lexicals.get(&local).map_or(local.clone(), |l| l.original.clone());
-        self.imports.insert(local, Import { original, index: k, holder: format!("%imp{k}").into(), prop: None });
+        let (holder, slot) = match k.checked_sub(IMPORT_PARAMS) {
+            None => (format!("%imp{k}").into(), None),
+            Some(j) => (IMPORTS_ARRAY.into(), Some(j)),
+        };
+        self.imports.insert(local, Import { original, index: k, holder, slot, prop: None });
     }
 
     /// Identifier `n` (just read) as a binding: not a reserved word (in

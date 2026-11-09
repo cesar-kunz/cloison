@@ -4069,11 +4069,21 @@ impl<'a> Gen<'a> {
                 Var::Global => self.global(Op::LdaGlobal, n),
                 // Its holder's property, live (a hole until its module
                 // sets it: `load_var` checks), or the holder itself (a
-                // namespace).
+                // namespace). (Past `IMPORT_PARAMS`, the holder is an
+                // element of the array that parameter is.)
                 Var::Import => {
                     let imp = &self.p.imports[n];
-                    let (holder, prop) = (imp.holder.clone(), imp.prop.clone());
+                    let (holder, slot, prop) = (imp.holder.clone(), imp.slot, imp.prop.clone());
                     self.load_raw(&holder, pos)?;
+                    if let Some(slot) = slot {
+                        let mark = self.temp;
+                        let a = self.alloc(pos)?;
+                        self.star(a);
+                        self.lda_smi(slot as i32);
+                        let ic = self.auto_ic("[]keyed");
+                        self.emit(Op::GetKeyed, &[Arg::Reg(a), ic]);
+                        self.temp = mark;
+                    }
                     if let Some(prop) = prop {
                         let mark = self.temp;
                         let env = self.alloc(pos)?;

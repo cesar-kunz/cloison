@@ -14883,7 +14883,8 @@ bad + " " + keep.length
 /// time is kept mapped: through a prototype's getter or setter that gets
 /// it as `this` (for an index past it, a name as a key, `__proto__` made
 /// a proxy whose traps get it), a method of it called (plainly or in an
-/// optional chain), an arrow reading it, a conversion of it. What
+/// optional chain), an arrow reading it, a conversion of it, an `apply`
+/// that isn't the builtin. What
 /// SpiderMonkey and JavaScriptCore give.
 #[test]
 fn mapped_arguments_let_out_at_run_time_stay_mapped() {
@@ -14917,10 +14918,22 @@ k6(5); out.push(leaked[0]); leaked[0] = 11; out.push(k6());
 // Its prototype made a proxy through a key: the proxy's traps get it.
 function g7(a) { var k = function (v) { if (v !== undefined) a = v; return a; }; arguments["__proto__"] = new Proxy({}, { get: function (t, key, r) { leaked = r; return 1; } }); arguments["bar"]; return k; }
 var k7 = g7(1); k7(5); out.push(leaked[0]); leaked[0] = 12; out.push(k7());
+// An `apply` of a function's own, which keeps it (not the builtin's
+// copy); and the builtin's, forwarding it.
+function t9() {}
+t9.apply = function (_, args) { leaked = args; };
+function g9(a) { var k = function (v) { if (v !== undefined) a = v; return a; }; t9.apply(null, arguments); return k; }
+var k9 = g9(1); k9(5); out.push(leaked[0]); leaked[0] = 13; out.push(k9());
+function g10(a) { var k = function (v) { if (v !== undefined) a = v; return a; }; return [k, Math.max.apply(null, arguments)]; }
+var r10 = g10(3); r10[0](5); out.push(r10[1], r10[0]());
+// While it runs, too: what that `apply` writes is the parameter's.
+t9.apply = function (_, args) { args[0] = 14; };
+function g11(a) { t9.apply(null, arguments); return a; }
+out.push(g11(1));
 // Read only: nothing to see after the return, the closure as before.
 function g8(a, b) { var k = function (v) { if (v !== undefined) a = v; return a; }; return [k, arguments.length, arguments[0], arguments.callee === g8]; }
 var r8 = g8(1, 2); r8[0](5); out.push(r8[1], r8[2], r8[3], r8[0]());
 out.join(" ")
 "#;
-    assert_eq!(value(src), "5 6 5 7 5 8 5 9 5 10 5 11 5 12 2 1 true 5");
+    assert_eq!(value(src), "5 6 5 7 5 8 5 9 5 10 5 11 5 12 5 13 3 5 14 2 1 true 5");
 }

@@ -3822,7 +3822,7 @@ impl Vm {
 
     /// The slot of the global scope's block-scoped binding `name` in
     /// `global_lexicals`, if a script declared one.
-    fn global_lexical_slot(&self, name: Atom) -> Option<u32> {
+    pub(crate) fn global_lexical_slot(&self, name: Atom) -> Option<u32> {
         unsafe { (*(*self.global_lexicals).shape).lookup(name) }
     }
 
@@ -6136,7 +6136,7 @@ impl Vm {
         }
         for n in &module.declared {
             let a = self.intern_name(n);
-            if self.lexical_declared.contains(&a) {
+            if self.lexical_declared.contains(&a) && !self.annex_b_skipped(module, n) {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
             }
         }
@@ -6147,10 +6147,25 @@ impl Vm {
             self.declare_lexical(a, module.constants.contains(n));
         }
         for n in &module.declared {
-            let a = self.intern_name(n);
-            self.script_declared.insert(a);
+            if !self.annex_b_skipped(module, n) {
+                let a = self.intern_name(n);
+                self.script_declared.insert(a);
+            }
         }
         Ok(())
+    }
+
+    /// Whether `module`'s `var` `n` is one only Annex B's functions in
+    /// blocks declare, of a name the global scope has a block-scoped
+    /// binding of (HasLexicalDeclaration): no `var` is made, nor is it an
+    /// error, and the function stays its block's (B.3.2.2, B.3.2.3; see
+    /// `interp::op_sta_global_annex_b`).
+    pub(crate) fn annex_b_skipped(&mut self, module: &Module, n: &str) -> bool {
+        if self.lexical_declared.is_empty() || !module.annex_b.iter().any(|b| b == n) {
+            return false;
+        }
+        let a = self.intern_name(n);
+        self.lexical_declared.contains(&a)
     }
 
     /// GlobalDeclarationInstantiation's (or an eval's, `eval`) checks for
@@ -6161,10 +6176,13 @@ impl Vm {
     /// that don't exist yet made, functions' then `var`s' (see
     /// [`Vm::declare_global`]).
     pub(crate) fn global_declarations(&mut self, module: &Module, eval: bool) -> Result<()> {
+        // (Not Annex B's `var`s that a block-scoped binding stops.)
+        let all = &module.declared;
+        let declared: Vec<&String> = all.iter().filter(|n| !self.annex_b_skipped(module, n)).collect();
         // (An `eval`'s `var` of a script's block-scoped name: a SyntaxError,
         // as a script's, see `declare_script`.)
         let lexical = eval && !self.lexical_declared.is_empty();
-        for n in module.declared.iter().filter(|_| lexical) {
+        for &n in declared.iter().filter(|_| lexical) {
             let a = self.intern_name(n);
             if self.lexical_declared.contains(&a) {
                 return Err(Error(format!("SyntaxError: Identifier '{n}' has already been declared"), None));
@@ -6172,7 +6190,7 @@ impl Vm {
         }
         let g = self.global;
         let extensible = Self::is_extensible(g);
-        for n in &module.declared {
+        for &n in &declared {
             let a = self.intern_name(n);
             let function = module.function_names.contains(n);
             let ok = match self.own_property(g, Key::Name(a)) {
@@ -6191,7 +6209,7 @@ impl Vm {
         // A `var` the global's prototypes have (`__proto__`'s accessor, a
         // read-only property): its own property now, for stores not to
         // reach theirs.
-        for n in &module.declared {
+        for &n in &declared {
             let a = self.intern_name(n);
             if !module.function_names.contains(n)
                 && unsafe { (*(*g).shape).lookup(a).is_none() }
@@ -6215,7 +6233,7 @@ impl Vm {
         if extensible {
             let attrs = if eval { 0 } else { DONT_DELETE };
             let functions = module.function_names.iter();
-            let vars = module.declared.iter().filter(|n| !module.function_names.contains(n));
+            let vars = declared.iter().copied().filter(|n| !module.function_names.contains(n));
             for n in functions.chain(vars) {
                 let a = self.intern_name(n);
                 if unsafe { (*(*g).shape).lookup(a).is_none() } {

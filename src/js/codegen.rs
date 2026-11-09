@@ -291,9 +291,17 @@ fn generate_from<'p>(
     } else {
         Vec::new()
     };
+    // (Annex B's `var`s alone: see `Module::annex_b`.)
+    let annex_b = if root == 0 && !p.eval_locals {
+        let plain = declarations_with(p, 0, false);
+        declared.iter().filter(|n| !plain.contains(&n.as_str())).cloned().collect()
+    } else {
+        Vec::new()
+    };
     let module = Module {
         lexical,
         constants,
+        annex_b,
         functions,
         script: 0,
         declared,
@@ -1066,7 +1074,13 @@ fn declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
 
 /// The parameters and the variables and functions a function declares.
 fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
-    fn stmt<'a>(s: &'a Stmt, p: &'a Program, out: &mut Vec<&'a str>) {
+    declarations_with(p, f, true)
+}
+
+/// `explicit_declarations`, the `var`s of Annex B's functions in blocks
+/// among them if `annex_b`.
+fn declarations_with<'a>(p: &'a Program<'_>, f: usize, annex_b: bool) -> Vec<&'a str> {
+    fn stmt<'a>(s: &'a Stmt, p: &'a Program, annex_b: bool, out: &mut Vec<&'a str>) {
         let add = |n: &'a str, out: &mut Vec<&'a str>| {
             if !out.contains(&n) {
                 out.push(n)
@@ -1100,7 +1114,7 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
                 if let Some(b) = &f.binding {
                     add(b, out);
                 }
-                if f.binding.is_none() || f.annex_b {
+                if f.binding.is_none() || annex_b && f.annex_b {
                     add(f.name.as_deref().unwrap(), out)
                 }
             }
@@ -1118,32 +1132,32 @@ fn explicit_declarations<'a>(p: &'a Program<'_>, f: usize) -> Vec<&'a str> {
         }
         match &s.kind {
             StmtKind::If(_, a, b) => {
-                stmt(a, p, out);
+                stmt(a, p, annex_b, out);
                 if let Some(b) = b {
-                    stmt(b, p, out);
+                    stmt(b, p, annex_b, out);
                 }
             }
             // (Its object's variable: `Function::hidden`.)
-            StmtKind::With(_, _, body) => stmt(body, p, out),
+            StmtKind::With(_, _, body) => stmt(body, p, annex_b, out),
             StmtKind::For { body, .. }
             | StmtKind::ForIn { body, .. }
             | StmtKind::ForOf { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
-            | StmtKind::Labeled(_, body) => stmt(body, p, out),
-            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, out)),
+            | StmtKind::Labeled(_, body) => stmt(body, p, annex_b, out),
+            StmtKind::Block(b) => b.iter().for_each(|s| stmt(s, p, annex_b, out)),
             StmtKind::Switch(_, cases) => cases
                 .iter()
                 .flat_map(|(_, b)| b)
-                .for_each(|s| stmt(s, p, out)),
-            StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, p, out)),
+                .for_each(|s| stmt(s, p, annex_b, out)),
+            StmtKind::Try(b, c, f) => try_blocks(b, c, f).for_each(|s| stmt(s, p, annex_b, out)),
             _ => {}
         }
     }
     let f = &p.functions[f];
     let mut out: Vec<&str> = f.params.iter().map(|p| &**p).collect();
     for s in &f.body {
-        stmt(s, p, &mut out);
+        stmt(s, p, annex_b, &mut out);
     }
     out
 }
@@ -2071,7 +2085,15 @@ impl<'a> Gen<'a> {
             // Declared before the script runs, `undefined` unless a global
             // of that name exists (`var performance = performance || {}`).
             // (Strict `eval` code's are its own: registers, `undefined`.)
-            for name in self.script_vars().into_iter().filter(|_| !self.p.direct_eval && !self.p.eval_locals) {
+            let vars = self.script_vars();
+            let plain = if vars.is_empty() { Vec::new() } else { declarations_with(self.p, 0, false) };
+            for name in vars.into_iter().filter(|_| !self.p.direct_eval && !self.p.eval_locals) {
+                // (Annex B's alone: not if a block-scoped binding stopped
+                // it, see `Module::annex_b`.)
+                if !plain.contains(&name) {
+                    self.global(Op::InitGlobalAnnexB, name);
+                    continue;
+                }
                 self.global(Op::LdaGlobalInsideTypeof, name);
                 self.global(Op::StaGlobal, name);
             }
@@ -6197,6 +6219,9 @@ impl<'a> Gen<'a> {
                     if self.p.direct_eval && self.index == 0 {
                         // (Its `var` is the caller's: in the scope object.)
                         self.store_var(f.name.as_deref().unwrap(), s.pos)?;
+                    } else if self.index == 0 {
+                        // (A global, unless a block-scoped binding stopped it.)
+                        self.global(Op::StaGlobalAnnexB, f.name.as_deref().unwrap());
                     } else {
                         self.init_var(f.name.as_deref().unwrap(), s.pos)?;
                     }

@@ -6399,8 +6399,9 @@ impl Vm {
                 // handlers included (`interp::drive_from`). (GameBoy's
                 // `fromTypedArray`, a copy loop in a `try`, ran interpreted
                 // at each run.)
-                let interpreted = !f.handlers.is_empty() || scan.callee || f.lazy.is_some();
+                let interpreted = !f.handlers.is_empty() || scan.callee || scan.intrinsic || f.lazy.is_some();
                 let only_interpreted = scan.callee || f.lazy.is_some();
+                let huge = scan.ops > COMPILE_SIZE_MAX;
                 let ic_names: Vec<Atom> = f.ics.iter().map(|n| self.intern_name(n)).collect();
                 let constants: Box<[Value]> = f
                     .constants
@@ -6431,7 +6432,7 @@ impl Vm {
                 let calls_left = match (scan.has_loop, recursive || scan.ops >= ENTRY_COMPILE_SIZE) {
                     // (Several realms: every call checks the callee's.)
                     _ if !self.realms.is_empty() => 0,
-                    _ if only_interpreted => i32::MAX,
+                    _ if only_interpreted || scan.intrinsic || huge => i32::MAX,
                     _ if f.captures && scan.ops > CAPTURING_ENTRY_SIZE => i32::MAX,
                     (true, _) => self.tier_calls,
                     (false, true) => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
@@ -6443,7 +6444,7 @@ impl Vm {
                     (false, false) if f.captures => self.tier_calls.saturating_mul(LOOP_FREE_CALLS),
                     (false, false) => i32::MAX,
                 };
-                let loop_budget = if !only_interpreted { self.frame_budget } else { i64::MAX };
+                let loop_budget = if !only_interpreted && !huge { self.frame_budget } else { i64::MAX };
                 if let Some(into) = into.filter(|_| i == 0) {
                     // The stub's runtime state stays (its constructor's
                     // slack tracking, its liveness): it has never run.
@@ -7068,6 +7069,15 @@ struct Scan {
     /// three and two times; DeltaBlue's methods).
     has_loop: bool,
     callee: bool,
+    /// Whether it has an `Intrinsic`, which compiled code exits at for the
+    /// interpreter to run: the function's calls run interpreted (it isn't
+    /// entered compiled, inlined nor called directly), but its loops tier
+    /// up. (#125: as [`Scan::callee`], a script with a class or a
+    /// destructuring at its top level ran its loops, and the functions
+    /// only they call, interpreted. Entered compiled, Octane CodeLoad's
+    /// `extend` and `each`, at each load another copy whose `for … in`
+    /// exits at `for_in_has` each turn, were compiled at each: -22%.)
+    intrinsic: bool,
     ops: usize,
 }
 
@@ -7076,6 +7086,7 @@ impl Scan {
         let mut s = Scan {
             has_loop: false,
             callee: false,
+            intrinsic: false,
             ops: 0,
         };
         for op in ops(f) {
@@ -7084,7 +7095,6 @@ impl Scan {
             s.callee |= matches!(
                 op,
                 crate::bytecode::Op::LdaCallee
-                    | crate::bytecode::Op::Intrinsic
                     | crate::bytecode::Op::CreateRest
                     | crate::bytecode::Op::CloseUpvalue
                     | crate::bytecode::Op::LdaNewTarget
@@ -7093,6 +7103,7 @@ impl Scan {
                     | crate::bytecode::Op::AsyncStart
                     | crate::bytecode::Op::Yield
             );
+            s.intrinsic |= op == crate::bytecode::Op::Intrinsic;
             s.ops += 1;
         }
         s
@@ -7128,6 +7139,15 @@ const ENTRY_COMPILE_SIZE: usize = 64;
 /// hardly at all; EarleyBoyer's hot ones (`loop2`, `deriv_trees`) have
 /// fewer than 100.
 const CAPTURING_ENTRY_SIZE: usize = 100;
+
+/// Instructions past which a function never tiers up, neither at its
+/// calls nor at its loops: the JIT lowers the whole function to compile
+/// any part of it, and one this big is a bundle's module body, run once.
+/// (Univer's, 330,000 instructions with a loop near its end, compiled
+/// at it once its intrinsics no longer kept it interpreted (#125):
+/// +30%, ~0.25 s a lowering. PdfJS's 104,000 and Mandreel's biggest
+/// function, 19,000, compile.)
+const COMPILE_SIZE_MAX: usize = 200_000;
 
 /// Which of `module`'s functions look recursive: they reach themselves
 /// through the names their inline caches look up (`LdaGlobal fib` in

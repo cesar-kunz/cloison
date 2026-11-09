@@ -1243,7 +1243,9 @@ fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 ("call", from_async_call, 2),
                 ("define", from_async_define, 3),
                 ("typeError", from_async_type_error, 1),
-                ("fromSync", from_async_from_sync, 2),
+                ("syncRecord", from_async_sync_record, 1),
+                ("syncStep", from_async_sync_step, 2),
+                ("syncDone", from_async_sync_done, 1),
             ] {
                 let f = object_value(vm.native_function(name, f, n, crate::jit::Ty::Any, false));
                 vm.handles.push(f);
@@ -1260,10 +1262,12 @@ fn array_from_async(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `Array.fromAsync`'s algorithm (ECMA-262 §23.1.2.2), its steps as the
-/// spec orders them. `fromSync(v, it)` is a sync iterator's step as
-/// AsyncFromSyncIterator takes it (the promise `for await` awaits; its
-/// rejection closes `it`, if given).
-const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, fromSync, asyncIterator, iterator) {
+/// spec orders them. A sync iterator is stepped as AsyncFromSyncIterator,
+/// as `for await` steps it: `syncRecord(it)` its record, `syncStep(record,
+/// close)` its `next()` (or `return()`), a promise of the value (see
+/// `intrinsics::async_from_sync_call`), and `syncDone(record)` whether
+/// that step was done.
+const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, syncRecord, syncStep, syncDone, asyncIterator, iterator) {
   "use strict";
   function isObject(x) { return (typeof x === "object" && x !== null) || typeof x === "function"; }
   function getMethod(o, key) {
@@ -1272,19 +1276,14 @@ const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, f
     if (typeof m !== "function") typeError("Array.fromAsync: an iterator method is not a function");
     return m;
   }
-  async function closeAsync(it, sync, e) {
-    try {
-      const ret = getMethod(it, "return");
-      if (ret !== void 0) {
-        const r = call(ret, it);
-        if (sync) {
-          if (isObject(r)) { r.done; await fromSync(r.value); }
-        } else {
-          await r;
-        }
-      }
-    } catch (_) {}
-    throw e;
+  // (AsyncIteratorClose on a throw completion: `return()`'s result, a
+  // sync iterator's AsyncFromSyncIterator's, awaited however it settles;
+  // `none` without one, nothing awaited.)
+  const none = {};
+  function close(it, record) {
+    if (record !== void 0) return syncStep(record, true);
+    const ret = getMethod(it, "return");
+    return ret === void 0 ? none : call(ret, it);
   }
   return async function (C, items, mapfn, thisArg) {
     const mapping = mapfn !== void 0;
@@ -1295,35 +1294,46 @@ const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, f
       const sync = usingAsync === void 0;
       const it = call(sync ? usingSync : usingAsync, items);
       if (!isObject(it)) typeError("Array.fromAsync: the iterator is not an object");
-      const next = it.next;
+      const record = sync ? syncRecord(it) : void 0;
+      const next = sync ? void 0 : it.next;
       const A = isConstructor(C) ? new C() : [];
       for (let k = 0; ; k++) {
-        let r = call(next, it);
-        if (!sync) r = await r;
-        if (!isObject(r)) typeError("Array.fromAsync: an iterator result is not an object");
-        const done = !!r.done;
-        let v;
+        let done, v;
         if (sync) {
           // (AsyncFromSyncIterator: the value awaited even when done; a
-          // rejection closes the iterator if it isn't.)
-          v = await fromSync(r.value, done ? void 0 : it);
+          // rejection closes the iterator if it isn't; what the step
+          // throws a rejection.)
+          v = await syncStep(record, false);
+          done = syncDone(record);
+        } else {
+          const r = await call(next, it);
+          if (!isObject(r)) typeError("Array.fromAsync: an iterator result is not an object");
+          done = !!r.done;
+          if (!done) v = r.value;
         }
         if (done) {
           A.length = k;
           return A;
         }
-        if (!sync) v = r.value;
-        if (mapping) {
-          try {
-            v = await call(mapfn, thisArg, v, k);
-          } catch (e) {
-            return closeAsync(it, sync, e);
-          }
-        }
+        let failed = false, error;
         try {
+          if (mapping) v = await call(mapfn, thisArg, v, k);
           define(A, k, v);
         } catch (e) {
-          return closeAsync(it, sync, e);
+          failed = true;
+          error = e;
+        }
+        if (failed) {
+          let p = none;
+          try {
+            p = close(it, record);
+          } catch (_) {}
+          if (p !== none) {
+            try {
+              await p;
+            } catch (_) {}
+          }
+          throw error;
         }
       }
     }
@@ -1369,8 +1379,18 @@ fn from_async_type_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Err(Error::type_error(String::from_utf16_lossy(&m)))
 }
 
-fn from_async_from_sync(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
-    crate::promise::async_from_sync(vm, arg(a, 0), arg(a, 1))
+fn from_async_sync_record(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    crate::symbol::sync_record(vm, arg(a, 0))
+}
+
+/// `syncStep(record, close)`: `next()`, or `return()` if `close`.
+fn from_async_sync_step(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let mode = if arg(a, 1) == Value::TRUE { crate::generator::RETURN } else { crate::generator::NEXT };
+    crate::intrinsics::async_from_sync_call(vm, arg(a, 0), None, mode)
+}
+
+fn from_async_sync_done(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    Ok(Value::from_bool(crate::symbol::sync_done(arg(a, 0))))
 }
 
 fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {

@@ -8,8 +8,8 @@ DerivedNormalizationProps.txt, the code points excluded from composition
 (Full_Composition_Exclusion): the pairs a canonical decomposition of two
 composes back from are the others'.
 
-    curl -O https://www.unicode.org/Public/17.0.0/ucd/UnicodeData.txt
-    curl -O https://www.unicode.org/Public/17.0.0/ucd/DerivedNormalizationProps.txt
+    curl -O https://www.unicode.org/Public/18.0.0/ucd/UnicodeData.txt
+    curl -O https://www.unicode.org/Public/18.0.0/ucd/DerivedNormalizationProps.txt
     python3 -I scripts/unicode-norm.py <the directory they're in>
 """
 import os, re, sys

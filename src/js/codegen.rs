@@ -6121,6 +6121,17 @@ impl<'a> Gen<'a> {
         self.intrinsic("async_from_sync_done", it, 1);
         self.jump(stepped);
         self.bind(inner);
+        // (A `return` to an iterator without `return()`: `received` was
+        // awaited, the record marked done.)
+        let (returned, stepped_async) = (self.label(), self.label());
+        self.ldar(mode);
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), returned);
+        self.jump(stepped_async);
+        self.bind(returned);
+        self.mov(result, v);
+        self.intrinsic("async_from_sync_done", it, 1);
+        self.jump_if(Jmp::True, done);
+        self.bind(stepped_async);
         self.intrinsic("delegate_done", result, 1);
         self.star(gr);
         self.named(Op::GetNamed, result, "value");

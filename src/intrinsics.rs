@@ -1196,11 +1196,24 @@ fn delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// An async generator's `yield*` step: `[iterator, received, mode,
 /// sync]`, the mode the generator last resumed in at the `yield` (a sync
-/// iterator's step AsyncFromSyncIterator's, a promise).
+/// iterator's step AsyncFromSyncIterator's, a promise). A `return` to an
+/// iterator without `return()` is `received` itself, to be awaited, the
+/// record marked done (`Await(received.[[Value]])`, ECMA-262 §15.5.5
+/// step 7.c.iii, not of an iterator result).
 fn async_delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let mode = a[2].as_number().unwrap_or(0.0) as i32;
     if a[3] == Value::TRUE {
         return async_from_sync_call(vm, a[0], Some(a[1]), mode);
+    }
+    if mode == crate::generator::RETURN {
+        let (it, _) = crate::symbol::record_parts(a[0]);
+        let a_return = vm.intern_name("return");
+        let m = vm.get(it, a_return)?;
+        if m.is_undefined() || m.is_null() {
+            crate::symbol::set_sync_done(a[0], true);
+            return Ok(a[1]);
+        }
+        return delegate_result(vm, m, it, a[1]);
     }
     delegate_call(vm, a[0], a[1], mode)
 }
@@ -1277,6 +1290,11 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Resu
             _ => {}
         }
     }
+    delegate_result(vm, m, it, received)
+}
+
+/// `m.call(it, received)`, an iterator result.
+fn delegate_result(vm: &mut Vm, m: Value, it: Value, received: Value) -> Result<Value> {
     let r = call_function(vm, m, it, &[received])?;
     if !crate::props::is_object(r) {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
@@ -1509,7 +1527,8 @@ fn async_iterator_kind(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(Value::from_bool(async_iterator_method(vm, a[0])?.is_none()))
 }
 
-/// `[v, sync]`: `v`'s async iterator (with `sync`, its iterator).
+/// `[v, sync]`: `v`'s async iterator (with `sync`, its iterator), in a
+/// [`crate::symbol::sync_record`] either way (see [`async_delegate_step`]).
 fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[1] == Value::TRUE {
         let it = crate::symbol::get_iterator(vm, a[0])?;
@@ -1523,7 +1542,7 @@ fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !crate::props::is_object(it) {
         return Err(Error::type_error("Result of the Symbol.asyncIterator method is not an object"));
     }
-    crate::symbol::record(vm, it)
+    crate::symbol::sync_record(vm, it)
 }
 
 /// `[record, sync]`: `iterator.next()`, by the `next` the record read (a

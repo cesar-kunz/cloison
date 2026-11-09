@@ -475,6 +475,31 @@ q.then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// An async `yield*`'s `return(v)` to an async iterator without
+/// `return()` awaits `v` itself (not an iterator result of it) and
+/// returns it (test262's yield-star-return-then-getter-ticks); a
+/// rejected `v` is thrown into the iterator, which has no `throw()`.
+#[test]
+fn async_yield_star_return_without_return_awaits_the_value() {
+    let src = r#"
+var log = [];
+var inner = { [Symbol.asyncIterator]() { return this; }, next() { return { done: false, value: "n" }; },
+  get return() { log.push("get return"); } };
+async function* f() { log.push("start"); try { yield* inner; } catch (e) { log.push("caught " + e.name); } }
+var p = Promise.resolve(); for (let i = 1; i < 4; i++) p = p.then(() => log.push("tick " + i));
+var it = f(); it.next();
+it.return({ get then() { log.push("get then"); } }).then(r => log.push("done " + r.done));
+var g = f(); g.next().then(() => g.return(Promise.reject("x"))).then(r => log.push("after " + r.done));
+var h = f(); h.next().then(() => h.return(Promise.resolve(7))).then(r => log.push("value " + r.value));
+var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        "start, start, start, tick 1, get then, tick 2, get return, get then, tick 3, get return, caught TypeError, get return, done true, after true, value 7"
+    );
+}
+
 /// An `await` whose PromiseResolve throws (a promise's `constructor`
 /// getter) throws at the `await`, there and then: in a `for await`'s
 /// close on an exception, the loop's exception goes on.

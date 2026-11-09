@@ -577,7 +577,8 @@ pub(crate) fn record(vm: &mut Vm, it: Value) -> Result<Value> {
 
 /// A [`record`] of sync iterator `it` stepped as AsyncFromSyncIterator
 /// (`for await`, `yield*`): a third slot, whether its last step was done
-/// ([`set_sync_done`]).
+/// ([`set_sync_done`]). (An async iterator's too: an async `yield*`'s
+/// `return` to it without `return()` is done.)
 pub(crate) fn sync_record(vm: &mut Vm, it: Value) -> Result<Value> {
     record_with(vm, it, Some(Value::FALSE))
 }

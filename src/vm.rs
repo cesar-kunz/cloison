@@ -861,16 +861,10 @@ pub struct Vm {
     /// on its first try, with no frame top (the interpreter's `conv!`,
     /// `jit::converting`): its conversions run only natives that read (see
     /// `interp::replays`), else the redo would run again what one wrote.
-    /// Not around a runtime call compiled code makes that runs a native
-    /// (a getter, a proxy's trap) and is redone (`conv_redone`): the
-    /// native's own calls of natives would all leave. Its conversions are
-    /// (see `interp::to_primitive_hint`).
+    /// So is a runtime call compiled code makes that may run a native (a
+    /// getter, a proxy's trap: `jit::reading`): it runs only natives that
+    /// read, the others left to the redo before they write (#129).
     pub(crate) conv_replays: bool,
-    /// In a runtime call compiled code makes that may run a native
-    /// converting what it is given (`String.prototype.trim` as a getter)
-    /// and is redone if a conversion sets `conv_redo` (`jit::reading`):
-    /// each conversion there is replay-checked (`conv_replays` set for it).
-    pub(crate) conv_redone: bool,
     /// What a `valueOf` or `toString` a conversion called threw, for the
     /// operation converting to throw (conversions can't fail themselves);
     /// `conv_thrown` says there is one (a flag: cheaper to test).
@@ -1282,7 +1276,6 @@ impl Vm {
             redo_call: false,
             conv_redo: false,
             conv_replays: false,
-            conv_redone: false,
             conv_error: None,
             conv_thrown: false,
             store_failed: false,
@@ -5769,7 +5762,9 @@ impl Vm {
             ic_misses: Cell::new(0),
             native: Some(f),
             constructs,
-            reads_only: crate::interp::reads_only(f),
+            // (The built-ins' accessors' getters, named so, only read: an
+            // Intl collator's `compare` makes its function once.)
+            reads_only: crate::interp::reads_only(f) || name.starts_with("get "),
             strict: false,
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),

@@ -1256,7 +1256,7 @@ fn async_from_sync_done(_: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// `iterator.next(received)` (or with `mode`, `throw` or `return`): the
-/// result.
+/// result, unchecked (see [`delegate_done`]).
 /// (`record`'s `next`, read once; `throw` and `return` as they are then.)
 fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Result<Value> {
     let (it, next) = crate::symbol::record_parts(record);
@@ -1277,15 +1277,15 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Resu
             _ => {}
         }
     }
-    let r = call_function(vm, m, it, &[received])?;
-    if !crate::props::is_object(r) {
-        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
-    }
-    Ok(r)
+    call_function(vm, m, it, &[received])
 }
 
-/// Whether iterator result `[r]` is done.
+/// Whether iterator result `[r]` is done (a TypeError if not an object,
+/// checked here so an async delegate's result is awaited first).
 fn delegate_done(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if !crate::props::is_object(a[0]) {
+        return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(a[0]))));
+    }
     let a_done = vm.intern_name("done");
     let d = vm.get(a[0], a_done)?;
     Ok(Value::from_bool(crate::interp::to_boolean(d)))

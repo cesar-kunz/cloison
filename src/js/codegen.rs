@@ -5218,6 +5218,11 @@ impl<'a> Gen<'a> {
             self.temp = mark;
             return Ok(());
         }
+        // (`super.m?.()`: the method checked, `this` still the receiver.)
+        let (f, super_optional) = match &f.kind {
+            ExprKind::Optional(m) if !new && matches!(m.kind, ExprKind::SuperMember(..)) => (&**m, true),
+            _ => (f, false),
+        };
         if let ExprKind::SuperMember(_, _, this) = &f.kind
             && !new
         {
@@ -5225,6 +5230,9 @@ impl<'a> Gen<'a> {
             let mark = self.temp;
             let c = self.alloc(pos)?;
             self.value(f)?;
+            if super_optional {
+                self.chain_check(pos)?;
+            }
             self.star(c);
             if self.args_array_needed(args) {
                 let w = self.alloc(pos)?;

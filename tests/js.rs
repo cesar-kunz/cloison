@@ -6740,6 +6740,35 @@ out.join();"#;
     );
 }
 
+/// `throw` of a long string doesn't copy its units out for its error's
+/// message (#145; see the next test): caught, it is the same string, a
+/// cons string of 2^30 units (2 MiB, its pieces shared), not flattened.
+#[test]
+fn throwing_a_long_string_keeps_it_whole() {
+    let src = r#"
+var s = "x".repeat(2 ** 20);
+for (var i = 0; i < 10; i++) s = s + s;
+var out = [];
+try { throw s; } catch (e) { out.push(e === s, e.length); }
+function* g() { yield 1; }
+var it = g();
+it.next();
+try { it.throw(s); } catch (e) { out.push(e === s); }
+out.join();"#;
+    assert_eq!(light_value(src), "true,1073741824,true");
+}
+
+/// An uncaught `throw` of a string shows it whole, though its error's
+/// message is cut past 1000 code units (#145).
+#[test]
+fn an_uncaught_long_string_is_shown_whole() {
+    let module = cloison::js::compile(r#"throw "x".repeat(1500) + "end";"#).unwrap();
+    let mut vm = Vm::new();
+    let e = vm.run(&module).unwrap_err();
+    assert!(e.to_string().ends_with("x..."), "{e}");
+    assert_eq!(vm.uncaught_message(&e), "x".repeat(1500) + "end");
+}
+
 /// A function's name past the longest string throws a RangeError where
 /// it is made (#65): a method named after a symbol (`[description]`,
 /// made by an intrinsic, which left the error pending: it went off past

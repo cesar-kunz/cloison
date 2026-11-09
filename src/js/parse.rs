@@ -2650,17 +2650,15 @@ impl<'a> Parser<'_, 'a, '_> {
                     // write.
                     // (A script's too where it sees any: its `let`s and
                     // the like, which aren't the global object's.)
-                    if !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_))) {
-                        let mut visible = self.eval_visible(pos);
-                        if self.current != 0 || !visible.is_empty() {
-                            let end = self.toks[self.i - 1].pos;
-                            // (In an arrow, the function's `arguments` and
-                            // `new.target` it sees too.)
-                            let extra: &[&str] = if k != self.current && function { &["arguments", "%newtarget"] } else { &[] };
-                            let f = self.eval_bindings(&visible, extra, end);
-                            visible.push(Expr { kind: ExprKind::Function(f), pos });
-                            args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
-                        }
+                    let mut visible = self.eval_visible(pos);
+                    if self.current != 0 || !visible.is_empty() {
+                        let end = self.toks[self.i - 1].pos;
+                        // (In an arrow, the function's `arguments` and
+                        // `new.target` it sees too.)
+                        let extra: &[&str] = if k != self.current && function { &["arguments", "%newtarget"] } else { &[] };
+                        let f = self.eval_bindings(&visible, extra, end);
+                        visible.push(Expr { kind: ExprKind::Function(f), pos });
+                        args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });
                     }
                 }
                 e = Expr {

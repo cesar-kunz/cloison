@@ -242,6 +242,7 @@ fn parse_pass<'a>(
             eval_locals: false,
             script: eval.is_none() && module.is_none(),
             eval_upvalues: Vec::new(),
+            eval_global: eval.is_some_and(|(.., global)| global),
             own_names: Vec::new(),
             imports: std::mem::take(&mut p.imports),
             module: module.map(|_| std::mem::take(&mut p.info)),

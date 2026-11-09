@@ -602,6 +602,9 @@ pub(crate) struct EvalCode {
     /// Its `var`s and functions (sloppy code's): a direct one's made in
     /// the caller's scope object at each run, as `Module::declared`.
     pub(crate) declared: std::rc::Rc<[Atom]>,
+    /// Which of those only Annex B's functions in blocks declare (see
+    /// `Module::annex_b`).
+    pub(crate) annex_b: std::rc::Rc<[Atom]>,
     /// A global one's declarations (`Module::declared`, `function_names`;
     /// no functions): made globals at each run (see
     /// `Vm::global_declarations`).

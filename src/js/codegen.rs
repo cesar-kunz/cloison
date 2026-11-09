@@ -2033,9 +2033,18 @@ impl<'a> Gen<'a> {
                 self.init_var(e, self.f.pos)?;
             }
         }
+        // (In a register until the scope object is made, if it's one of
+        // its variables: a generator's, or past the registers.)
+        let mut new_target = None;
         if self.f.uses_new_target {
-            let Var::Reg(r) = self.resolve("%newtarget", self.f.pos)? else {
-                return unsupported(self.f.pos, "`new.target` with this many variables");
+            let r = match self.resolve("%newtarget", self.f.pos)? {
+                Var::Reg(r) => r,
+                _ => {
+                    let mark = self.temp;
+                    let t = self.alloc(self.f.pos)?;
+                    new_target = Some((t, mark));
+                    t
+                }
             };
             self.emit(Op::LdaNewTarget, &[]);
             self.star(r);
@@ -2097,6 +2106,11 @@ impl<'a> Gen<'a> {
                     self.named(Op::SetNamed, env, &self.env_key(n));
                 }
             }
+        }
+        if let Some((t, mark)) = new_target {
+            self.ldar(t);
+            self.init_var("%newtarget", self.f.pos)?;
+            self.temp = mark;
         }
         // Each boxed variable's first box (see `boxed_lexicals`).
         let boxed = self.boxed;

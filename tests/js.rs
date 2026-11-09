@@ -14211,6 +14211,68 @@ fn another_vms_cons_key_panics_cleanly() {
     assert_eq!(display(b.run(&cloison::js::compile("xy.length").unwrap()).unwrap()), "80");
 }
 
+/// `Global`s made, cloned and dropped over many runs (the review of
+/// #162): of young cells nothing else holds, through minor collections,
+/// full ones and concurrent cycles moving cells (the last checking no
+/// reference to a moved cell is left), each still reading its object;
+/// slots freed and taken again; and past their VM, which drops with them
+/// alive: they clone and drop then, and are no later VM's.
+#[test]
+fn globals_survive_clones_drops_and_moving_collections() {
+    use cloison::vm::Global;
+    let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    for config in 0..3 {
+        let mut vm = Vm::new();
+        match config {
+            0 => {}
+            1 => vm.set_gc_evacuate_all(),
+            _ => vm.set_gc_evacuate_cycles(),
+        }
+        let (n, s) = (vm.intern("n"), vm.intern("s"));
+        let mut held: Vec<(Global, i32)> = Vec::new();
+        let mut seed = 12345u32;
+        let mut next = |m: usize| {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            (seed >> 16) as usize % m
+        };
+        for round in 0..30 {
+            let a = run(
+                &mut vm,
+                &format!("(function () {{ var a = []; for (var i = 0; i < 40; i++) a.push({{n: {round} * 100 + i, s: 'v' + i}}); return a; }})()"),
+            );
+            for i in 0..40 {
+                let v = vm.get_keyed(a, cloison::value::Value::from_i32(i)).unwrap();
+                held.push((Global::new(&vm, v), round * 100 + i));
+            }
+            for _ in 0..15 {
+                let k = next(held.len());
+                let (g, id) = (held[k].0.clone(), held[k].1);
+                held.push((g, id));
+            }
+            for _ in 0..30 {
+                let k = next(held.len());
+                held.swap_remove(k);
+            }
+            let full = if round % 3 == 0 { "$262.gc();" } else { "" };
+            run(&mut vm, &format!("for (var i = 0; i < 3e4; i++) var x = {{i: [i]}}; {full}"));
+            for (g, id) in &held {
+                let o = g.get(&vm);
+                assert_eq!(display(vm.get(o, n).unwrap()), id.to_string(), "config {config}, round {round}");
+                assert_eq!(display(vm.get(o, s).unwrap()), format!("v{}", id % 100));
+            }
+        }
+        vm.verify_heap();
+        let left: Vec<Global> = held.into_iter().map(|(g, _)| g).collect();
+        assert!(left.len() > 300);
+        drop(vm);
+        let copies: Vec<Global> = left.iter().map(Global::clone).collect();
+        let later = Vm::new();
+        assert!(!copies.iter().chain(&left).any(|g| g.is_of(&later)));
+        drop(left);
+        drop(copies);
+    }
+}
+
 /// A value the host keeps across runs as a `Global` (#142): a root, kept
 /// through collections that free what nothing else holds and updated
 /// as they move its cell; of its own VM only; its slot free once

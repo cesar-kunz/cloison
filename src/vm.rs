@@ -8146,9 +8146,10 @@ impl fmt::Debug for Global {
 /// they root, the direct `eval`s' scopes in use, the realm current (its
 /// fields swapped back), the atoms natives hold, a call's pending
 /// arguments, `new.target` and callee, the error pending and a
-/// conversion's; and the outermost's frames' open upvalues and mapped
-/// `arguments`, which they leave as a return would, with their registers'
-/// values (the next run's frames reuse the registers). JS state the panic
+/// conversion's; and its frames' open upvalues and mapped `arguments`
+/// (from the VM stack's top it found), which they leave as a return
+/// would, with their registers' values (the next run's frames reuse the
+/// registers). JS state the panic
 /// left half done stays so: a generator running for good, a module
 /// evaluating, the promise jobs queued (the next run's to run). Out of a
 /// collection, its heap half collected, the VM is poisoned instead (see
@@ -8217,10 +8218,10 @@ impl RunState {
         if vm.realm != self.realm {
             crate::realm::enter(vm, self.realm);
         }
-        if self.outer {
-            let base = vm.stack.as_mut_ptr();
-            vm.close_upvalues(base);
-        }
+        // (A nested run's frames are from the VM stack's free top it
+        // found: `Vm::enter`'s, the stack's base. The review of #162.)
+        let level = if self.native_top.is_null() { vm.stack.as_mut_ptr() } else { self.native_top };
+        vm.close_upvalues(level);
     }
 }
 
@@ -8413,6 +8414,88 @@ out.join();"#;
         let (o, k) = (vm.global_object(), vm.intern("a"));
         assert!(poisoned(vm.get(o, k)));
         assert!(matches!(vm.run_module("nowhere.mjs"), Err(ModuleError::Thrown(e)) if e.0.contains("poisoned")));
+    }
+
+    /// `boom(panics)`: if `panics`, a conversion's state left pending (a
+    /// redo asked, replays checked, an error), then a panic.
+    fn boom(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+        if a.first() == Some(&Value::TRUE) {
+            (vm.conv_redo, vm.conv_replays, vm.conv_thrown) = (true, true, true);
+            vm.conv_error = Some(Error::type_error("stale"));
+            panic!("boom");
+        }
+        Ok(Value::UNDEFINED)
+    }
+
+    /// A run unwinding with frames of its own and of a script it runs
+    /// (`$262.evalScript`) holding open upvalues and mapped `arguments`,
+    /// a conversion's state pending, leaves them as returns would (the
+    /// review of #162): the closures and `arguments` objects kept read and
+    /// write their variables, collections moving cells, as after the same
+    /// run returning. The outermost run, and one nested in `Vm::enter`
+    /// (its frames from `enter`'s VM stack top).
+    #[test]
+    fn unwinding_closes_frames_as_returns() {
+        let setup = |panics: bool| {
+            let inner = format!(
+                "function f(c) {{ keep.push(function (v) {{ if (v !== undefined) c = v; return c; }}, arguments); \
+                 arguments[0] = 'c1'; boom({panics}); }} f('c0');"
+            );
+            let src = format!(
+                "var keep = []; \
+                 function outer(a, b) {{ keep.push(function () {{ return a + b; }}, arguments); b = 'b1'; \
+                 $262.evalScript({inner:?}); }} \
+                 outer('a0', 'b0');"
+            );
+            crate::js::compile(&src).unwrap()
+        };
+        let observe = crate::js::compile(
+            "for (var i = 0; i < 3; i++) { var junk = []; for (var j = 0; j < 1e4; j++) junk.push({j: j}); $262.gc(); } \
+             var r = [keep[0](), keep[1][0], keep[1][1], keep[1].length]; \
+             keep[1][0] = 'A'; r.push(keep[0](), keep[2](), keep[3][0]); \
+             keep[2]('c2'); r.push(keep[2](), keep[3][0]); keep[3][0] = 'c3'; r.push(keep[2](), keep[3][0]); \
+             r.join()",
+        )
+        .unwrap();
+        let fresh = || {
+            let mut vm = Vm::new();
+            vm.set_tier_back_edges(i64::MAX);
+            let g = vm.global;
+            vm.define_native(g, "boom", boom, 1, crate::jit::Ty::Any, false);
+            vm
+        };
+        let between = |vm: &Vm| {
+            assert!(!vm.conv_redo && !vm.conv_replays && !vm.conv_thrown && vm.conv_error.is_none());
+            assert!(vm.open_upvalues.is_empty() && vm.mapped_args.is_empty() && vm.native_top.is_null());
+        };
+        let mut reference = fresh();
+        reference.run(&setup(false)).unwrap();
+        reference.set_gc_evacuate_all();
+        let expected = reference.run(&observe).map(display).unwrap();
+        // (After the frames returned: the variables' last values, the
+        // closures writing theirs. Whether `arguments` still aliases them
+        // is the returns', whatever it is.)
+        assert!(expected.starts_with("a0b1,a0,b1,2,") && expected.contains(",c1,c1,c2,"), "{expected}");
+
+        let mut vm = fresh();
+        assert!(catch_unwind(AssertUnwindSafe(|| vm.run(&setup(true)))).is_err());
+        between(&vm);
+        vm.set_gc_evacuate_all();
+        assert_eq!(vm.run(&observe).map(display).as_deref(), Ok(&*expected));
+        vm.verify_heap();
+
+        let mut vm = fresh();
+        let r = vm.enter(|vm| {
+            assert!(catch_unwind(AssertUnwindSafe(|| vm.run(&setup(true)))).is_err());
+            assert!(vm.heap.gc.stack_base != 0 && vm.open_upvalues.is_empty() && vm.mapped_args.is_empty());
+            assert!(!vm.conv_failed() && !vm.conv_redo && !vm.conv_replays);
+            vm.set_gc_evacuate_all();
+            vm.run(&observe)
+        });
+        assert_eq!(r.map(display).as_deref(), Ok(&*expected));
+        between(&vm);
+        assert_eq!(vm.heap.gc.stack_base, 0);
+        vm.verify_heap();
     }
 
     /// A cons string isn't made flat by its VM while another VM's run is

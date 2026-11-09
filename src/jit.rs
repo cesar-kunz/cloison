@@ -425,6 +425,16 @@ fn has_stencil(name: &str) -> bool {
 }
 
 // ---- Runtime functions called from stencil slow paths (C ABI) ----
+//
+// A panic in one (the heap limit's, `Heap::fresh_blocks`) aborts the
+// process: it can't unwind out of an `extern "C"` function, and as
+// `extern "C-unwind"` it would have the stencils' frames to unwind
+// through, copied code with no unwind tables registered (compiled with
+// `-Cpanic=abort`, jumping from one to the next), where the unwinder
+// finds none and gives up. A run unwinds only interpreted (see `Vm::run`,
+// #143); to unwind from here, a runtime function would catch the panic,
+// keep it in the VM and leave the compiled code as an error no handler
+// catches, for `vm_run` to resume the unwinding from Rust.
 
 /// Stencils call it as `(acc, rhs)`. `Add r` computes `r + acc`, so the
 /// operands go to the generic runtime in that order. `AddSmi` (`acc + imm`)

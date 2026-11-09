@@ -3136,6 +3136,7 @@ impl Vm {
     #[cold]
     #[inline(never)]
     fn host<R>(&mut self, f: impl FnOnce(&mut Vm) -> Result<R>) -> Result<R> {
+        self.usable()?;
         /// What `host` changed, back on return or unwinding.
         struct Entered {
             vm: *mut Vm,
@@ -6518,28 +6519,46 @@ impl Vm {
 
     /// Load and run `module`; returns its completion value. Its bytecode
     /// is run unchecked, which [`Checked`](crate::asm::Checked) makes safe.
+    ///
+    /// A panic unwinding out of the run (the heap limit's, `CLOISON_HEAP_
+    /// LIMIT`, under an embedder's `catch_unwind`) leaves the VM as between
+    /// runs (see `RunState`), to run again, unless it unwound out of a
+    /// collection: the VM is then [`poisoned`](Vm::poisoned), its runs and
+    /// operations failing. (With the JIT on, a panic in compiled code's
+    /// call of the runtime aborts the process instead: the copied stencils
+    /// have no unwind tables; `CLOISON_NO_JIT` runs nothing compiled.)
     pub fn run(&mut self, module: &crate::asm::Checked) -> Result<Value> {
+        self.usable()?;
         let _running = crate::interp::Running::new(self);
         self.declare_script(module)?;
         let code = self.load(Module::clone(module));
         let here = 0u8;
-        self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
-        // Roots on the native stack are below here (see `gc`).
-        let outer = self.heap.gc.stack_base == 0;
-        if outer {
-            self.heap.gc.stack_base = &raw const here as usize & !7;
-        }
-        let r = unsafe { crate::interp::run_script(self, code) };
+        let entered = RunState::new(self, &raw const here as usize);
+        let outer = entered.outer;
+        // (Through `entered`'s pointer from here: its drop writes through
+        // it.)
+        let vm = unsafe { &mut *entered.vm };
+        let r = unsafe { crate::interp::run_script(vm, code) };
         // The script done, the promise jobs it queued run (and theirs),
         // and the outermost's event loop until no async waiter is left.
-        let r = r.and_then(|v| if outer { self.run_event_loop() } else { self.run_jobs() }.map(|()| v));
-        let r = self.no_pending_error(r);
-        self.kept_alive.clear();
-        if outer {
-            self.heap.gc.stack_base = 0;
-            self.pause_marker();
+        let r = r.and_then(|v| if outer { vm.run_event_loop() } else { vm.run_jobs() }.map(|()| v));
+        vm.no_pending_error(r)
+    }
+
+    /// Whether a panic unwound out of a collection (see [`Vm::run`]): the
+    /// heap is half collected (marked, or evacuated and its references not
+    /// all brought up to date), and the VM's runs and the host operations
+    /// that enter it fail. Dropping it is all that is left.
+    pub fn poisoned(&self) -> bool {
+        self.heap.gc.unfinished
+    }
+
+    /// An error if the VM is [`poisoned`](Vm::poisoned).
+    fn usable(&self) -> Result<()> {
+        if self.poisoned() {
+            return Err(Error("Error: the VM is poisoned: a panic unwound out of a collection".into(), None));
         }
-        r
+        Ok(())
     }
 
     /// `r`, or the error a conversion or a string past the longest left
@@ -6556,28 +6575,20 @@ impl Vm {
     /// Run `f` from the host, as `run` runs a script (then the event
     /// loop): an agent's broadcast callback (see `agent`).
     pub(crate) fn enter(&mut self, f: impl FnOnce(&mut Vm) -> Result<Value>) -> Result<Value> {
+        self.usable()?;
         let _running = crate::interp::Running::new(self);
         let here = 0u8;
-        self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
-        let outer = self.heap.gc.stack_base == 0;
-        if outer {
-            self.heap.gc.stack_base = &raw const here as usize & !7;
-        }
-        let r = self.handle_scope(|vm| {
+        let entered = RunState::new(self, &raw const here as usize);
+        let vm = unsafe { &mut *entered.vm };
+        let r = vm.handle_scope(|vm| {
             let saved = vm.native_top;
             vm.native_top = vm.stack.as_mut_ptr();
             let r = f(vm);
             vm.native_top = saved;
             r
         });
-        let r = r.and_then(|v| self.run_event_loop().map(|()| v));
-        let r = self.no_pending_error(r);
-        self.kept_alive.clear();
-        if outer {
-            self.heap.gc.stack_base = 0;
-            self.pause_marker();
-        }
-        r
+        let r = r.and_then(|v| vm.run_event_loop().map(|()| v));
+        vm.no_pending_error(r)
     }
 
     /// Whether `Atomics.wait` may block (test262's `CanBlockIsTrue`, the
@@ -6595,14 +6606,13 @@ impl Vm {
     /// the promise jobs queued. Fails with an early error (a syntax error,
     /// an import that can't be resolved), or what its evaluation threw.
     pub fn run_module(&mut self, path: &str) -> std::result::Result<(), ModuleError> {
+        self.usable().map_err(ModuleError::Thrown)?;
         let _running = crate::interp::Running::new(self);
         let here = 0u8;
-        self.native_limit = (&raw const here as usize).saturating_sub(crate::interp::NATIVE_STACK);
-        let outer = self.heap.gc.stack_base == 0;
-        if outer {
-            self.heap.gc.stack_base = &raw const here as usize & !7;
-        }
-        let r = self.handle_scope(|vm| {
+        let entered = RunState::new(self, &raw const here as usize);
+        let outer = entered.outer;
+        let vm = unsafe { &mut *entered.vm };
+        let r = vm.handle_scope(|vm| {
             let saved = vm.native_top;
             vm.native_top = vm.stack.as_mut_ptr();
             let r = crate::module::run_main(vm, path);
@@ -6620,16 +6630,10 @@ impl Vm {
                 Err(Err(e)) => Err(ModuleError::Thrown(e)),
             }
         });
-        let r = match self.no_pending_error(Ok(())) {
+        match vm.no_pending_error(Ok(())) {
             Ok(()) => r,
             Err(e) => r.and(Err(ModuleError::Thrown(e))),
-        };
-        self.kept_alive.clear();
-        if outer {
-            self.heap.gc.stack_base = 0;
-            self.pause_marker();
         }
-        r
     }
 
     /// Run the promise jobs queued (see `promise::run_jobs`): the VM stack
@@ -6662,14 +6666,25 @@ impl Vm {
 
     /// Run `f` with the values `vm.handles` gets meanwhile rooted: Rust
     /// code that keeps values in a heap container (a `Vec`) across a call
-    /// into JS pushes them there.
+    /// into JS pushes them there. (Left on return or unwinding: a native's
+    /// `catch_unwind` may catch a panic in `f`, and its run go on.)
     pub(crate) fn handle_scope<T>(&mut self, f: impl FnOnce(&mut Vm) -> T) -> T {
-        let depth = self.handles.len();
-        self.unmovable += 1;
-        let r = f(self);
-        self.unmovable -= 1;
-        self.handles.truncate(depth);
-        r
+        /// The scope, closed as it drops.
+        struct Scope {
+            vm: *mut Vm,
+            depth: usize,
+        }
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                let vm = unsafe { &mut *self.vm };
+                vm.unmovable -= 1;
+                vm.handles.truncate(self.depth);
+            }
+        }
+        let scope = Scope { vm: self, depth: self.handles.len() };
+        let vm = unsafe { &mut *scope.vm };
+        vm.unmovable += 1;
+        f(vm)
     }
 
     /// The cells the VM refers to itself: the global object, the builtins'
@@ -8013,6 +8028,115 @@ pub(crate) fn number_ascii(d: f64) -> NumBuf {
     out
 }
 
+/// What a run ([`Vm::run`], `Vm::enter`, [`Vm::run_module`]) found as it
+/// entered, back as it leaves, on return or unwinding (#143): the native
+/// stack's limit; the outermost's base (the collector's roots are below
+/// it), then none and the marker paused, as between runs; the `WeakRef`
+/// targets kept for the job, dropped. A panic (the heap limit's) skips
+/// what the code it ran puts back as it returns, which unwinding puts
+/// back too: the VM stack's free top (`native_top`: a later run would
+/// take itself for nested), the scopes keeping cells from moving
+/// (`unmovable`: evacuation would stay off for good) and the handles
+/// they root, the direct `eval`s' scopes in use, the realm current (its
+/// fields swapped back), the atoms natives hold, a call's pending
+/// arguments, `new.target` and callee, the error pending and a
+/// conversion's; and the outermost's frames' open upvalues and mapped
+/// `arguments`, which they leave as a return would, with their registers'
+/// values (the next run's frames reuse the registers). JS state the panic
+/// left half done stays so: a generator running for good, a module
+/// evaluating, the promise jobs queued (the next run's to run). Out of a
+/// collection, its heap half collected, the VM is poisoned instead (see
+/// [`Vm::poisoned`]) and only the fields are put back, no cell touched.
+struct RunState {
+    vm: *mut Vm,
+    outer: bool,
+    native_top: *mut Value,
+    native_limit: usize,
+    unmovable: u32,
+    handles: usize,
+    eval_depth: usize,
+    realm: u32,
+    held: (usize, bool, u64),
+    pending_args: (*const Value, usize),
+    new_target: Value,
+    native_new_target: (Value, Value),
+    constructing: bool,
+    callee: *mut Object,
+}
+
+impl RunState {
+    /// `vm` entered for a run whose frame `here` is in: its native stack's
+    /// limit from there, and if it is the outermost, its base.
+    fn new(vm: &mut Vm, here: usize) -> RunState {
+        let outer = vm.heap.gc.stack_base == 0;
+        let saved = (vm.native_top, vm.native_limit, vm.unmovable, vm.handles.len(), vm.eval_depth, vm.realm);
+        let held = (vm.held_atoms.len(), vm.holding, vm.held_serial);
+        let call = (vm.pending_args, vm.new_target, vm.native_new_target, vm.constructing, vm.callee);
+        vm.native_limit = here.saturating_sub(crate::interp::NATIVE_STACK);
+        if outer {
+            vm.heap.gc.stack_base = here & !7;
+        }
+        RunState {
+            vm,
+            outer,
+            native_top: saved.0,
+            native_limit: saved.1,
+            unmovable: saved.2,
+            handles: saved.3,
+            eval_depth: saved.4,
+            realm: saved.5,
+            held,
+            pending_args: call.0,
+            new_target: call.1,
+            native_new_target: call.2,
+            constructing: call.3,
+            callee: call.4,
+        }
+    }
+
+    /// What the run's code would have put back as it returned, the run
+    /// unwinding (see [`RunState`]).
+    fn unwound(&self, vm: &mut Vm) {
+        vm.eval_depth = self.eval_depth;
+        (vm.pending_args, vm.new_target, vm.native_new_target) = (self.pending_args, self.new_target, self.native_new_target);
+        (vm.constructing, vm.callee) = (self.constructing, self.callee);
+        vm.held_atoms.truncate(self.held.0);
+        (vm.holding, vm.held_serial) = (self.held.1, self.held.2);
+        (vm.osr_regs, vm.redo_call, vm.store_failed) = (std::ptr::null_mut(), false, false);
+        (vm.conv_redo, vm.conv_replays, vm.conv_thrown, vm.conv_error) = (false, false, false, None);
+        vm.error = None;
+        if vm.heap.gc.unfinished {
+            return;
+        }
+        if vm.realm != self.realm {
+            crate::realm::enter(vm, self.realm);
+        }
+        if self.outer {
+            let base = vm.stack.as_mut_ptr();
+            vm.close_upvalues(base);
+        }
+    }
+}
+
+impl Drop for RunState {
+    fn drop(&mut self) {
+        let vm = unsafe { &mut *self.vm };
+        if std::thread::panicking() {
+            self.unwound(vm);
+        }
+        debug_assert!(std::thread::panicking() || (vm.unmovable == self.unmovable && vm.native_top == self.native_top));
+        vm.native_top = self.native_top;
+        vm.unmovable = self.unmovable;
+        vm.handles.truncate(self.handles);
+        vm.kept_alive.clear();
+        vm.native_limit = self.native_limit;
+        if self.outer {
+            vm.heap.gc.stack_base = 0;
+            vm.pause_marker();
+        }
+    }
+}
+
 impl Drop for Vm {
     fn drop(&mut self) {
         self.unbind_versions();
@@ -8095,8 +8219,9 @@ out.join();"#;
         })
         .unwrap();
         assert!(crate::interp::current_vm().is_null());
-        // And what `host` entered, it left. (Not `enter`, which a panic
-        // leaves with `native_top` and `stack_base` set.)
+        // What `enter` entered, it left (#143).
+        assert!(b.heap.gc.stack_base == 0 && b.native_top.is_null() && b.unmovable == 0);
+        // And what `host` entered.
         let mut c = Vm::new();
         let r = catch_unwind(AssertUnwindSafe(|| {
             c.host(|c| -> Result<()> {
@@ -8107,6 +8232,81 @@ out.join();"#;
         assert!(r.is_err());
         assert!(c.native_top.is_null() && c.unmovable == 0 && !c.conv_thrown && c.handles.is_empty());
         assert!(crate::interp::current_vm().is_null());
+    }
+
+    /// `addr(o)`: where object `o` is.
+    fn addr(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+        Ok(Value::number(as_object(a[0]) as usize as f64))
+    }
+
+    /// A run a panic unwinds out of, the heap limit reached in a handle
+    /// scope (`JSON.parse`'s) with an upvalue open, under the embedder's
+    /// `catch_unwind`, leaves the VM as between runs: no native stack base
+    /// or VM stack top, no scope keeping cells still nor handles, the
+    /// upvalue closed, nothing pending; the next run is the outermost, and
+    /// its collections move cells (#143). (Interpreted: under the JIT, a
+    /// panic in a runtime call aborts. Evacuation off for the first run:
+    /// the limit is reached by the script, not by a collection's copies.)
+    #[test]
+    fn a_run_unwinding_leaves_the_vm_between_runs() {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(i64::MAX);
+        vm.heap.gc.set_evacuate(false);
+        vm.heap.limit_growth(32 << 20);
+        let src = r#"
+            var a = [];
+            globalThis.count = function () { return a.length; };
+            for (;;) a.push(JSON.parse('[[1, 2, 3], {"x": [4, 5]}, "six"]'));"#;
+        let m = crate::js::compile(src).unwrap();
+        let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+        let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
+        assert!(msg.is_some_and(|m| m.contains("out of memory")));
+        assert!(!vm.poisoned() && crate::interp::current_vm().is_null());
+        assert_eq!((vm.heap.gc.stack_base, vm.unmovable, vm.handles.len(), vm.open_upvalues.len()), (0, 0, 0, 0));
+        assert!(vm.native_top.is_null() && vm.native_limit == 0 && vm.error.is_none() && !vm.conv_thrown);
+        assert!(vm.kept_alive.is_empty() && vm.mapped_args.is_empty() && vm.eval_depth == 0);
+        vm.heap.limit_growth(usize::MAX);
+        vm.set_gc_evacuate_all();
+        let g = vm.global;
+        vm.define_native(g, "addr", addr, 1, crate::jit::Ty::Any, false);
+        let src = r#"
+            var o = {k: 'v'.repeat(3)}, at = addr(o), moved = false;
+            for (var i = 0; i < 4; i++) { $262.gc(); moved = moved || addr(o) != at; }
+            [count() > 1000, moved, o.k].join()"#;
+        let r = vm.run(&crate::js::compile(src).unwrap()).map(display);
+        assert_eq!(r.as_deref(), Ok("true,true,vvv"));
+        assert_eq!((vm.heap.gc.stack_base, vm.unmovable), (0, 0));
+    }
+
+    /// `squeeze()`: no more fresh blocks.
+    fn squeeze(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+        vm.heap.limit_growth(0);
+        Ok(Value::UNDEFINED)
+    }
+
+    /// A panic out of a collection (the heap limit reached copying cells
+    /// out) poisons the VM: its heap half collected, its runs and the
+    /// host's operations fail, and it drops (#143).
+    #[test]
+    fn a_collection_unwinding_poisons_the_vm() {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(i64::MAX);
+        vm.set_gc_evacuate_all();
+        let g = vm.global;
+        vm.define_native(g, "squeeze", squeeze, 0, crate::jit::Ty::Any, false);
+        let src = "var a = []; for (var i = 0; i < 200000; i++) a.push({i: i}); squeeze(); $262.gc();";
+        let m = crate::js::compile(src).unwrap();
+        let r = catch_unwind(AssertUnwindSafe(|| vm.run(&m)));
+        let msg = r.err().and_then(|p| p.downcast_ref::<String>().cloned());
+        assert!(msg.is_some_and(|m| m.contains("out of memory")));
+        assert!(vm.poisoned());
+        assert_eq!((vm.heap.gc.stack_base, vm.unmovable), (0, 0));
+        assert!(vm.native_top.is_null() && crate::interp::current_vm().is_null());
+        let poisoned = |r: Result<Value>| r.is_err_and(|e| e.0.contains("poisoned"));
+        assert!(poisoned(vm.run(&crate::js::compile("1").unwrap())));
+        let (o, k) = (vm.global_object(), vm.intern("a"));
+        assert!(poisoned(vm.get(o, k)));
+        assert!(matches!(vm.run_module("nowhere.mjs"), Err(ModuleError::Thrown(e)) if e.0.contains("poisoned")));
     }
 
     /// A cons string isn't made flat by its VM while another VM's run is

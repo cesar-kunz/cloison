@@ -389,10 +389,8 @@ pub(crate) fn array_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
     if is_callable(f) {
         return call_function(vm, f, o, &[]);
     }
-    let a = vm.intern_name("toString");
-    let op = object_value(vm.object_prototype);
-    let f = vm.get(op, a)?;
-    call_function(vm, f, o, &[])
+    // (The intrinsic, not whatever `Object.prototype.toString` is now.)
+    crate::builtins::object_to_string(vm, o, &[])
 }
 
 /// `Array.prototype.toLocaleString()`: each element's `toLocaleString()`,

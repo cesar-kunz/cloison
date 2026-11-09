@@ -3390,11 +3390,12 @@ pub(crate) fn error_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<V
     }
     let (a_name, a_message) = (vm.intern_name("name"), vm.intern_name("message"));
     let name = vm.get(this, a_name)?;
-    let message = vm.get(this, a_message)?;
     let name = if name.is_undefined() { "Error".encode_utf16().collect() } else { units(name).into_owned() };
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
+    // (`name` converted before `message` is read.)
+    let message = vm.get(this, a_message)?;
     // (Its length checked before a long message is read.)
     let n = if message.is_undefined() { 0 } else { string_len(message).unwrap_or(0) };
     check_string_len(name.len() + n + if name.is_empty() || n == 0 { 0 } else { 2 })?;

@@ -421,6 +421,28 @@ q.then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// An async generator's `yield*` awaits an async iterator's `next`,
+/// `throw` or `return` result before checking it is an object: a
+/// non-object is a TypeError jobs later, a promise of one too (#153).
+#[test]
+fn async_yield_star_awaits_results_before_checking_them() {
+    let src = r#"
+var log = [];
+var p = Promise.resolve(); for (let i = 0; i < 6; i++) p = p.then(() => log.push("t" + i));
+var inner = { [Symbol.asyncIterator]() { return { next() { return { value: 1, done: false } }, return() { return 5 } } } };
+async function* g() { yield* inner; }
+var it = g();
+it.next().then(() => { it.return().then(() => log.push("a ok"), e => log.push("a " + e.name)); });
+function A(res) { return { [Symbol.asyncIterator]() { return { next() { return res; } }; } }; }
+async function* k(i) { yield* i; }
+k(A(Promise.resolve(4))).next().then(() => log.push("b ok"), e => log.push("b " + e.name));
+k(A({ then(r) { r({ value: 8, done: false }); } })).next().then(r => log.push("c " + r.value), e => log.push("c " + e.name));
+var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(out_after_jobs(src), "t0, t1, b TypeError, t2, c 8, t3, t4, a TypeError, t5");
+}
+
 /// What a sync iterator's step throws in `for await` or `yield*` (its
 /// `next()`, a non-object result, a `done` or `value` getter) rejects
 /// the AsyncFromSyncIterator step's promise, awaited: seen a job later,

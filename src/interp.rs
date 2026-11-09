@@ -3926,14 +3926,14 @@ fn to_primitive_hint(v: Value, hint: u8) -> Value {
                 }
             }
         }
-        if !vm.conv_redo && !vm.native_top.is_null() {
+        // (Neither gave a primitive: a TypeError, frame top or not, as a
+        // redo would find the same; unless one is pending, to throw it.)
+        if !vm.conv_redo {
             vm.conv_error
                 .get_or_insert_with(|| Error::type_error("Cannot convert object to primitive value"));
             vm.conv_thrown = true;
-            return Value::UNDEFINED;
         }
-        let units = default_string(v);
-        vm.new_string(&units)
+        Value::UNDEFINED
     }
 }
 
@@ -3964,40 +3964,6 @@ pub(crate) fn to_string_units(v: Value) -> Vec<u16> {
         return to_string_units(to_primitive_hint(v, STRING));
     }
     crate::vm::display(v).encode_utf16().collect()
-}
-
-/// An object's string without its methods: an array's elements joined by
-/// commas, else `[object Object]`.
-fn default_string(v: Value) -> Vec<u16> {
-    let s = if v.is_cell() {
-        let o = as_object(v);
-        // An array: its elements' strings, joined by commas (holes,
-        // undefined and null as empty strings).
-        if unsafe { (*o).class } == Class::Array {
-            // (A far array's far elements too, as long as a string can be.)
-            let n = (crate::far::array_length(o) as usize).min(crate::vm::MAX_STRING_LEN);
-            let dense = unsafe { (*o).elems_len } as usize;
-            let mut out = Vec::new();
-            for i in 0..n {
-                if i > 0 {
-                    out.push(b',' as u16);
-                }
-                let e = if i < dense {
-                    unsafe { *(*o).elems.add(i) }
-                } else {
-                    crate::far::get(o, i as u32).unwrap_or(Value::EMPTY)
-                };
-                if e != Value::EMPTY && !e.is_undefined() && !e.is_null() {
-                    out.extend(to_string_units(e));
-                }
-            }
-            return out;
-        }
-        "[object Object]".to_string()
-    } else {
-        crate::vm::display(v)
-    };
-    s.encode_utf16().collect()
 }
 
 /// ToNumber: a string is parsed (StringToNumber), an object goes through

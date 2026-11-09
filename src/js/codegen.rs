@@ -228,7 +228,7 @@ fn generate_from<'p>(
                     constants: Vec::new(),
                     handlers: Vec::new(),
                     compound_keys: Vec::new(),
-                    upvalues: upvalue_sources(p, &decls, &scopes, i),
+                    upvalues: upvalue_sources(p, &decls, &scopes, i)?,
                     captures: false,
                     strict: f.strict,
                     line: position(f.params_pos).0,
@@ -507,10 +507,11 @@ fn global_lexical(p: &Program, n: &str) -> bool {
 
 /// Where each of function `i`'s upvalues comes from, in its parent: a
 /// register of the parent's (`true`), or an upvalue of its own.
-fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> Vec<(bool, u8)> {
+fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> R<Vec<(bool, u8)>> {
     let Some(parent) = p.functions[i].parent else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    let pos = p.functions[i].pos;
     scopes.upvalues[i]
         .iter()
         .map(|&n| {
@@ -518,13 +519,22 @@ fn upvalue_sources(p: &Program, decls: &[Decls], scopes: &Scopes, i: usize) -> V
             if OUTER_ENVS.get(depth(p, parent)) == Some(&n) { ENV } else { n }
         })
         .map(|n| match decls[parent].position(n) {
-            Some(k) if parent != 0 || script_local(p, n) => (true, k as u8 + 1),
+            Some(k) if parent != 0 || script_local(p, n) => match u8::try_from(k + 1) {
+                Ok(r) => Ok((true, r)),
+                Err(_) => unsupported(pos, "more variables than registers"),
+            },
             _ => {
                 let k = scopes.upvalues[parent].iter().position(|&d| d == n);
-                (false, k.expect("passed down by the parent") as u8)
+                Ok((false, upvalue(k.expect("passed down by the parent"), pos)?))
             }
         })
         .collect()
+}
+
+/// Upvalue `k`'s operand (`LdaUpvalue k`): a byte, so a function with more
+/// than 256 upvalues is refused (see `Gen::function`).
+fn upvalue(k: usize, pos: Pos) -> R<u8> {
+    u8::try_from(k).or_else(|_| unsupported(pos, "more than 256 upvalues"))
 }
 
 /// The kind of direct `eval` site binding `name` (`EVAL_CONST`…) if its
@@ -1918,6 +1928,9 @@ impl<'a> Gen<'a> {
         if self.temp > 256 {
             return unsupported(self.f.pos, "more variables than registers");
         }
+        if self.scopes.upvalues[self.index].len() > 256 {
+            return unsupported(self.f.pos, "more than 256 upvalues");
+        }
         // `new.target` first (see `Op::LdaNewTarget`).
         if self.index == 0 && self.p.direct_eval {
             // (`%e0`, `%e1`, `%e2`, then the `with` objects `%w0`….)
@@ -2189,7 +2202,7 @@ impl<'a> Gen<'a> {
             return unsupported(self.f.pos, "more than 256 registers");
         }
         let name = function_name(self.p, self.index);
-        let upvalues = upvalue_sources(self.p, self.decls, self.scopes, self.index);
+        let upvalues = upvalue_sources(self.p, self.decls, self.scopes, self.index)?;
         let captures = !self.scopes.captured[self.index].is_empty();
         Ok(FunctionDef {
             name,
@@ -3251,14 +3264,14 @@ impl<'a> Gen<'a> {
                     let ups = &self.scopes.upvalues[self.index];
                     let outer = OUTER_ENVS.get(depth(self.p, k));
                     if let Some(u) = ups.iter().position(|n| Some(n) == outer).or_else(|| ups.iter().position(|&n| n == ENV)) {
-                        return Ok(Var::ScopeUpvalue(u as u8));
+                        return Ok(Var::ScopeUpvalue(upvalue(u, pos)?));
                     }
                 }
                 // (In its box, the upvalue.)
                 if self.boxed[k].contains(&name)
                     && let Some(u) = self.scopes.upvalues[self.index].iter().position(|&n| n == name)
                 {
-                    return Ok(Var::ScopeUpvalue(u as u8));
+                    return Ok(Var::ScopeUpvalue(upvalue(u, pos)?));
                 }
                 break;
             }
@@ -3268,10 +3281,11 @@ impl<'a> Gen<'a> {
             .iter()
             .position(|&n| n == name)
         {
+            let k = upvalue(k, pos)?;
             if let Some(kind) = bound_kind(self.p, name) {
-                return Ok(if kind & EVAL_BOXED != 0 { Var::BoundBox(k as u8) } else { Var::Bound(k as u8) });
+                return Ok(if kind & EVAL_BOXED != 0 { Var::BoundBox(k) } else { Var::Bound(k) });
             }
-            return Ok(Var::Upvalue(k as u8));
+            return Ok(Var::Upvalue(k));
         }
         let mut f = Some(self.index);
         while let Some(i) = f {

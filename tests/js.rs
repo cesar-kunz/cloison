@@ -15085,3 +15085,13 @@ Error.prototype.toString.call(o) + " " + log.join(",");
 "#;
     assert_eq!(value(src), "E: msg n,N,m");
 }
+
+#[test]
+fn array_to_string_falls_back_to_the_intrinsic_object_to_string() {
+    let src = r#"
+var a = [1,2]; a.join = 1;
+Object.prototype.toString = () => "X";
+String(a);
+"#;
+    assert_eq!(value(src), "[object Array]");
+}

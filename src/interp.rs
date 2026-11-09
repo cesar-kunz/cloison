@@ -3813,27 +3813,12 @@ const DEFAULT: u8 = 2;
 /// code's runtime calls) it is skipped and `Vm::conv_redo` set, for the
 /// operation to be redone where it can. In an operation that is redone
 /// then (`Vm::conv_replays`), it runs only natives that read: what it ran
-/// is run again; so is one a native in a redone runtime call converts
-/// with (`Vm::conv_redone`), for that conversion. Conversions can't fail:
-/// what one throws is left in `Vm::conv_error` for the operation to throw.
+/// is run again. Conversions can't fail: what one throws is left in
+/// `Vm::conv_error` for the operation to throw.
 fn to_primitive_hint(v: Value, hint: u8) -> Value {
     if !v.is_cell() || is_string(v) || crate::symbol::is_symbol(v) || is_bigint(v) {
         return v;
     }
-    unsafe {
-        let vm = &mut *current_vm();
-        if vm.conv_redone && !vm.conv_replays && vm.native_top.is_null() {
-            vm.conv_replays = true;
-            let r = to_primitive_object(v, hint);
-            (*current_vm()).conv_replays = false;
-            return r;
-        }
-    }
-    to_primitive_object(v, hint)
-}
-
-/// [`to_primitive_hint`] of an object.
-fn to_primitive_object(v: Value, hint: u8) -> Value {
     unsafe {
         let vm = &mut *current_vm();
         // An earlier conversion threw, its error not taken yet: no more of
@@ -4506,7 +4491,8 @@ fn replays(f: Value) -> bool {
 }
 
 /// Whether `native` only reads: one of the built-ins' `toString` and
-/// `valueOf` methods (what they call checked again, see [`replays`]).
+/// `valueOf` methods (what they call checked again, see [`replays`]), or
+/// an accessor's getter (see `Vm::native_code`).
 pub(crate) fn reads_only(native: crate::vm::NativeFn) -> bool {
     use crate::{builtins as b, vm::NativeFn};
     [

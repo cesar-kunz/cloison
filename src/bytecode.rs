@@ -332,6 +332,16 @@ define_ops! {
     /// inline-cache slot names (a script's top-level `let`, `const` or
     /// class) to `acc`.
     InitGlobal(Ic),
+    /// `StaGlobal` of the `var` of Annex B's function in a block of a
+    /// script or `eval` (B.3.2.2, B.3.2.3), but nothing if the global
+    /// scope has a block-scoped binding of the name: then no such `var`
+    /// was made (see `Vm::annex_b_skipped`).
+    StaGlobalAnnexB(Ic),
+    /// That `var`'s value at the start of the code, `undefined` unless a
+    /// global of the name exists (`LdaGlobalInsideTypeof` then
+    /// `StaGlobal`), but nothing if the global scope has a block-scoped
+    /// binding of the name, as `StaGlobalAnnexB`.
+    InitGlobalAnnexB(Ic),
     /// Define the getter (`k` 0) or setter (1) `acc` of `r[a]`'s property
     /// named by constant `c` (an object literal's `get`/`set`).
     DefineAccessor(Reg, Const, Count),

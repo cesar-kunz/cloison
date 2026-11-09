@@ -188,6 +188,10 @@ pub struct Module {
     pub lexical: Vec<String>,
     /// Which of `lexical` are `const`s.
     pub constants: Vec<String>,
+    /// Which of `declared` only Annex B's functions in blocks declare
+    /// (B.3.2.2, B.3.2.3): no `var` where the global scope has a
+    /// block-scoped binding of the name (see `Vm::annex_b_skipped`).
+    pub annex_b: Vec<String>,
 }
 
 /// A module safe to run, which [`crate::vm::Vm::run`] takes:
@@ -455,6 +459,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
     let module = Module {
         lexical: Vec::new(),
         constants: Vec::new(),
+        annex_b: Vec::new(),
         functions,
         script,
         declared: Vec::new(),

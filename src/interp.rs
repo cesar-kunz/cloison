@@ -1063,6 +1063,30 @@ handlers! {
         next!(any, Op::InitGlobal.size(), acc)
     }
 
+    fn op_sta_global_annex_b(pc, acc, regs, tag) {
+        let (_, name) = (*frame_code(regs)).ic(u16_at(pc, 1));
+        // (Approximately: such a binding made after the `var` would take
+        // the function in the specification, a rare case.)
+        if (*frame_vm(regs)).global_lexical_slot(name).is_some() {
+            next!(any, Op::StaGlobalAnnexB.size(), acc)
+        }
+        let r = with_top(regs, None, |vm| vm.set_global_miss(&*frame_code(regs), u16_at(pc, 1), acc));
+        next_or_throw!(Op::StaGlobalAnnexB.size(), r.map(|()| acc))
+    }
+
+    fn op_init_global_annex_b(pc, acc, regs, tag) {
+        let (_, name) = (*frame_code(regs)).ic(u16_at(pc, 1));
+        if (*frame_vm(regs)).global_lexical_slot(name).is_some() {
+            next!(any, Op::InitGlobalAnnexB.size(), acc)
+        }
+        let r = with_top(regs, None, |vm| {
+            let (code, ic) = (&*frame_code(regs), u16_at(pc, 1));
+            let v = vm.get_global_typeof_miss(code, ic)?;
+            vm.set_global_miss(code, ic, v)
+        });
+        next_or_throw!(Op::InitGlobalAnnexB.size(), r.map(|()| acc))
+    }
+
     fn op_delete_global(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
         let name = crate::js::lex::units_to_string(string_units(acc).unwrap_or(&[]));
@@ -4161,6 +4185,8 @@ static TABLE: Table = {
     t[Op::DeleteProperty as usize] = op_delete_property;
     t[Op::DeleteGlobal as usize] = op_delete_global;
     t[Op::InitGlobal as usize] = op_init_global;
+    t[Op::StaGlobalAnnexB as usize] = op_sta_global_annex_b;
+    t[Op::InitGlobalAnnexB as usize] = op_init_global_annex_b;
     t[Op::LdaCallee as usize] = op_lda_callee;
     t[Op::DefineAccessor as usize] = op_define_accessor;
     t[Op::CreateRegExp as usize] = op_create_regexp;

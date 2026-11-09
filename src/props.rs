@@ -663,6 +663,11 @@ impl Vm {
                         self.unmap_argument(o, i);
                     }
                 }
+                // (Made an element again, of an object whose frame ended:
+                // hidden again, see `Vm::hide_element`.)
+                if self.released_mark.is_some() && !self.mapped_args.iter().any(|m| m.o == o) && self.mapped_get(o, i).is_some() {
+                    self.hide_element(o, i);
+                }
             }
             return Ok(ok);
         }

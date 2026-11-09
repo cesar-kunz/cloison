@@ -230,6 +230,7 @@ fn generate_from<'p>(
                     compound_keys: Vec::new(),
                     upvalues: upvalue_sources(p, &decls, &scopes, i),
                     captures: false,
+                    arguments_escape: true,
                     strict: f.strict,
                     line: position(f.params_pos).0,
                     col: position(f.params_pos).1,
@@ -1267,6 +1268,74 @@ fn aliases_arguments(p: &Program, f: &Function) -> bool {
     found
 }
 
+/// Whether function `f`'s `arguments` object may be reachable once it
+/// has returned: it lets the object go anywhere but to a read of its
+/// `length` or `callee` (its own data properties), a read, store, update
+/// or delete of an element (not a call of one, which gets it as `this`),
+/// or `apply` (which copies it); or an arrow in it reads `arguments`, or a
+/// direct `eval` in either may. Else its parameters a closure captured
+/// can't be seen through it after the return (see `Vm::release_mapped`).
+/// (A prototype's getter or setter for an element, which gets it as
+/// `this`, is the runtime's to see: `Vm::call_getter`.)
+fn arguments_escape(p: &Program, f: &Function) -> bool {
+    fn is_args(e: &Expr) -> bool {
+        matches!(&e.kind, ExprKind::Ident(n) if &**n == "arguments")
+    }
+    fn element_of_args<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+        match &e.kind {
+            ExprKind::Index(o, k) if is_args(o) => Some(k),
+            _ => None,
+        }
+    }
+    // (An arrow's, or one's in it: the enclosing function's.)
+    fn arrow_reads(p: &Program, a: &Function) -> bool {
+        let mut found = a.has_eval;
+        for_each_expr(&a.body, &mut |e| found |= reads(e, p));
+        found
+    }
+    fn reads(e: &Expr, p: &Program) -> bool {
+        match &e.kind {
+            ExprKind::Ident(n) => &**n == "arguments",
+            ExprKind::Function(i) if p.functions[*i].arrow => arrow_reads(p, &p.functions[*i]),
+            // (Patterns and class bodies aren't children: taken to.)
+            ExprKind::Destructure(..) | ExprKind::Class(_) => true,
+            _ => {
+                let mut sub = Vec::new();
+                children(e, &mut sub);
+                sub.into_iter().any(|x| reads(x, p))
+            }
+        }
+    }
+    fn expr(e: &Expr, p: &Program) -> bool {
+        use ExprKind::*;
+        match &e.kind {
+            Ident(n) => &**n == "arguments",
+            Member(o, m) if is_args(o) => !matches!(&**m, "length" | "callee"),
+            Index(o, k) if is_args(o) => expr(k, p),
+            Assign(_, t, v) | LogicalAssign(_, t, v) if element_of_args(t).is_some() => {
+                expr(element_of_args(t).unwrap(), p) || expr(v, p)
+            }
+            Update(t, ..) | Unary(UnOp::Delete, t) if element_of_args(t).is_some() => expr(element_of_args(t).unwrap(), p),
+            Call(c, args) if matches!(&c.kind, Member(_, m) if &**m == "apply") && args.len() == 2 && is_args(&args[1]) => {
+                expr(c, p) || expr(&args[0], p)
+            }
+            // (A method of it, a tagged template's tag: `this` is it.)
+            Call(c, _) | New(c, _) if matches!(&c.kind, Member(o, _) | Index(o, _) if is_args(o)) => true,
+            Function(i) if p.functions[*i].arrow => arrow_reads(p, &p.functions[*i]),
+            // (An optional chain may call a method of it: `arguments?.[0]()`.)
+            Destructure(..) | Class(_) | Chain(_) | Optional(_) => reads(e, p),
+            _ => {
+                let mut sub = Vec::new();
+                children(e, &mut sub);
+                sub.into_iter().any(|x| expr(x, p))
+            }
+        }
+    }
+    let mut found = f.has_eval;
+    for_each_expr(&f.body, &mut |e| found |= expr(e, p));
+    found
+}
+
 /// Whether running `body` may delete a property: a `delete` in it, or code
 /// it calls (a getter's or a setter's aside).
 fn may_delete(body: &Stmt) -> bool {
@@ -2205,6 +2274,7 @@ impl<'a> Gen<'a> {
             compound_keys: self.compound_keys,
             upvalues,
             captures,
+            arguments_escape: self.index != 0 && arguments_escape(self.p, self.f),
             line: 0,
             col: 0,
             lazy: None,

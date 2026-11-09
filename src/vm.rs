@@ -440,6 +440,9 @@ pub struct Code {
     /// A native that only reads, which a conversion may run twice (see
     /// `interp::reads_only`).
     pub(crate) reads_only: bool,
+    /// Its `arguments` object may be reachable once it has returned (see
+    /// `asm::FunctionDef::arguments_escape`, `Vm::release_mapped`).
+    pub(crate) arguments_escape: bool,
     /// Strict mode code: its `this` is the receiver as is, `undefined`
     /// for a plain call (see `interp::push_frame`).
     pub strict: bool,
@@ -1024,6 +1027,11 @@ pub struct Vm {
     /// last: each index mapped to its parameter's register (see
     /// `Vm::mapped_get`), until the frame ends.
     pub(crate) mapped_args: Vec<MappedArgs>,
+    /// The atom of `builtins::ARGUMENTS_MARK` (pinned), once a mapped
+    /// `arguments` object that may outlive its frame got a mark other
+    /// than `true` at its end (see `Vm::keep_mapped`): until then none
+    /// has, and `Vm::mapped_get` looks no further than `mapped_args`.
+    pub(crate) released_mark: Option<Atom>,
     /// Sloppy functions' `arguments` objects' shape (see
     /// `builtins::arguments_object_of`).
     pub(crate) arguments_shape: *const Shape,
@@ -1334,6 +1342,7 @@ impl Vm {
             eval_seen: Default::default(),
             thrower: std::ptr::null_mut(),
             mapped_args: Vec::new(),
+            released_mark: None,
             arguments_shape: std::ptr::null(),
             mapped_arguments_shape: std::ptr::null(),
             key_cache: Vec::new(),
@@ -3342,6 +3351,7 @@ impl Vm {
         if g.is_undefined() {
             return Ok(Value::UNDEFINED);
         }
+        self.may_keep(this);
         crate::interp::call_function(self, g, this, &[])
     }
 
@@ -3353,7 +3363,20 @@ impl Vm {
             self.store_failed = true;
             return Ok(());
         }
+        self.may_keep(this);
         crate::interp::call_function(self, s, this, &[value]).map(|_| ())
+    }
+
+    /// `this` of a getter or setter about to run: if a mapped `arguments`
+    /// object whose frame runs, the code may keep it (see
+    /// `MappedArgs::escapes`).
+    #[inline]
+    fn may_keep(&mut self, this: Value) {
+        if !self.mapped_args.is_empty()
+            && let Some(m) = self.mapped_args.iter_mut().rev().find(|m| object_value(m.o) == this)
+        {
+            m.escapes = true;
+        }
     }
 
     /// `Object.defineProperty(o, name, {get, set, …})`: an accessor
@@ -4468,9 +4491,14 @@ impl Vm {
                 capacity: Cell::new(s.capacity.get()),
                 slots: Slots::new(s.keys(), s.attrs(), &fields),
                 // (Elements of any type: no transition, which would copy
-                // the shape.)
+                // the shape. A plain object's that no store's fast path
+                // fits still fits none: a mapped `arguments`'s, say.)
                 elems: FieldType::Any,
-                elems_code: FieldType::Any.encode(),
+                elems_code: if s.class == Class::Plain && s.elems_code == NO_ELEMENTS {
+                    NO_ELEMENTS
+                } else {
+                    FieldType::Any.encode()
+                },
                 family: std::ptr::null(),
                 push: Cell::new(std::ptr::null_mut()),
                 unique: true,
@@ -4623,7 +4651,7 @@ impl Vm {
         } else if obj.is_cell()
             // (Not a mapped `arguments` object's: its elements' values are
             // the parameters', see `mapped_get`.)
-            && !self.mapped_args.iter().any(|m| m.o == as_object(obj))
+            && !self.maps_elements(as_object(obj))
         {
             let (ic, _) = code.ic(ic);
             unsafe {
@@ -4695,6 +4723,13 @@ impl Vm {
     /// receiver `obj`.
     fn get_index_from(&mut self, mut o: *mut Object, i: u32, obj: Value) -> Result<Value> {
         loop {
+            // (A mapped `arguments` prototype's: its parameter. The
+            // receiver's `get_keyed` read.)
+            if object_value(o) != obj
+                && let Some(v) = self.mapped_get(o, i)
+            {
+                return Ok(v);
+            }
             unsafe {
                 // A string wrapper's code units, as its own elements.
                 if let Some(u) = wrapped(object_value(o)).and_then(string_units)
@@ -5577,18 +5612,42 @@ impl Vm {
 
     /// The value of parameter `i` of mapped `arguments` object `o`, if
     /// mapped: in its register, or in its function's scope object (see
-    /// [`MappedArgs::scope`]).
+    /// [`MappedArgs::scope`]); once the frame ended, where a closure keeps
+    /// it (see [`Vm::release_mapped`]).
+    #[inline]
     pub(crate) fn mapped_get(&self, o: *mut Object, i: u32) -> Option<Value> {
-        if self.mapped_args.is_empty() {
+        if self.mapped_args.is_empty() && self.released_mark.is_none() {
             return None;
         }
-        let m = self.mapped_args.iter().rev().find(|m| m.o == o)?;
-        (m.mapped.get(i as usize) == Some(&true)).then(|| unsafe { m.value(i as usize) })
+        if let Some(m) = self.mapped_args.iter().rev().find(|m| m.o == o) {
+            return (m.mapped.get(i as usize) == Some(&true)).then(|| unsafe { m.value(i as usize) });
+        }
+        // (No record made yet: none to look for.)
+        self.released_mark?;
+        self.released_get(o, i)
+    }
+
+    /// [`Vm::mapped_get`] once the frame ended.
+    #[cold]
+    #[inline(never)]
+    fn released_get(&self, o: *mut Object, i: u32) -> Option<Value> {
+        match self.released_binding(o, i)? {
+            Binding::Upvalue(u) => Some(unsafe { *(*u).at }),
+            Binding::Scope(env, slot) => Some(unsafe { *Object::slot(env, (*(*env).shape).location(slot)) }),
+        }
     }
 
     /// Set parameter `i` of mapped `arguments` object `o`, if mapped.
     pub(crate) fn mapped_set(&mut self, o: *mut Object, i: u32, v: Value) {
         let Some(m) = self.mapped_args.iter().rev().find(|m| m.o == o) else {
+            match self.released_binding(o, i) {
+                Some(Binding::Upvalue(u)) => unsafe {
+                    *(*u).at = v;
+                    crate::heap::barrier(crate::layout::payload_cell(u), (*u).at, v);
+                },
+                Some(Binding::Scope(env, slot)) => self.store_field(env, slot, v),
+                None => {}
+            }
             return;
         };
         if m.mapped.get(i as usize) != Some(&true) {
@@ -5602,10 +5661,14 @@ impl Vm {
 
     /// Index `i` of `o` no longer mapped: its element keeps the value.
     pub(crate) fn unmap_argument(&mut self, o: *mut Object, i: u32) {
-        if let Some(m) = self.mapped_args.iter_mut().rev().find(|m| m.o == o)
-            && let Some(on) = m.mapped.get_mut(i as usize)
+        if let Some(m) = self.mapped_args.iter_mut().rev().find(|m| m.o == o) {
+            if let Some(on) = m.mapped.get_mut(i as usize) {
+                *on = false;
+            }
+        } else if let Some(r) = self.released_record(o)
+            && 1 + i < unsafe { (*r).elems_len }
         {
-            *on = false;
+            unsafe { *(*r).elems.add(1 + i as usize) = Value::EMPTY };
         }
     }
 
@@ -5614,40 +5677,213 @@ impl Vm {
     /// definition of it does (`define_own_property`; the arguments object's
     /// [[DefineOwnProperty]]).
     pub(crate) fn unmap_arguments(&mut self, o: *mut Object) {
-        let Some(m) = self.mapped_args.iter_mut().rev().find(|m| m.o == o) else {
-            return;
+        let n = match self.mapped_args.iter().rev().find(|m| m.o == o) {
+            Some(m) => m.mapped.len() as u32,
+            None => match self.released_record(o) {
+                Some(r) => unsafe { (*r).elems_len - 1 },
+                None => return,
+            },
         };
-        for i in 0..m.mapped.len() {
-            if m.mapped[i] && (i as u32) < unsafe { (*o).elems_len } {
-                unsafe {
-                    let v = m.value(i);
-                    let at = (*o).elems.add(i);
-                    *at = v;
-                    crate::heap::barrier(o.cast(), at, v);
+        for i in 0..n {
+            if let Some(v) = self.mapped_get(o, i) {
+                if Self::has_element(o, i) {
+                    unsafe {
+                        let at = (*o).elems.add(i as usize);
+                        *at = v;
+                        crate::heap::barrier(o.cast(), at, v);
+                    }
+                } else if unsafe { (*o).flags } & crate::object::SPARSE != 0 {
+                    // (Kept as a named property: see `hide_element`.)
+                    let a = self.intern_name(&i.to_string());
+                    if let Some(slot) = unsafe { (*(*o).shape).lookup(a) }
+                        && unsafe { (*(*o).shape).attrs()[slot as usize] } & crate::object::ACCESSOR == 0
+                    {
+                        self.store_field(o, slot, v);
+                    }
                 }
             }
-            m.mapped[i] = false;
+            self.unmap_argument(o, i);
         }
     }
 
+    /// The value of `o`'s `builtins::ARGUMENTS_MARK`, if `o` may be a
+    /// mapped `arguments` object whose frame ended (a plain object no
+    /// element store's fast path fits; see [`Vm::release_mapped`]).
+    fn released_mark_value(&self, o: *mut Object) -> Option<Value> {
+        let mark = self.released_mark?;
+        unsafe {
+            let s = &*(*o).shape;
+            if (*o).class != Class::Plain || s.elems_code != NO_ELEMENTS {
+                return None;
+            }
+            Some(*Object::slot(o, s.location(s.lookup(mark)?)))
+        }
+    }
+
+    /// The record of mapped `arguments` object `o`, whose frame ended with
+    /// indices still mapped (see [`Vm::release_mapped`]), if it is one.
+    fn released_record(&self, o: *mut Object) -> Option<*mut Object> {
+        let v = self.released_mark_value(o)?;
+        v.is_cell().then(|| as_object(v))
+    }
+
+    /// Where parameter `i` of mapped `arguments` object `o` is, if its
+    /// frame ended with index `i` mapped and it still is.
+    fn released_binding(&self, o: *mut Object, i: u32) -> Option<Binding> {
+        let r = self.released_record(o)?;
+        unsafe {
+            if 1 + i >= (*r).elems_len {
+                return None;
+            }
+            let e = *(*r).elems.add(1 + i as usize);
+            if e == Value::EMPTY {
+                return None;
+            }
+            let env = *(*r).elems;
+            if env.is_cell() {
+                let env = as_object(env);
+                let slot = (*(*env).shape).lookup(Atom(e.as_i32_unchecked() as u32))?;
+                Some(Binding::Scope(env, slot))
+            } else {
+                Some(Binding::Upvalue((e.to_bits() + 8) as *mut Upvalue))
+            }
+        }
+    }
+
+    /// Whether `o`'s elements may not be its indices' values: a mapped
+    /// `arguments` object's, while its frame runs or after it (see
+    /// [`Vm::release_mapped`]). No inline cache reads them.
+    pub(crate) fn maps_elements(&self, o: *mut Object) -> bool {
+        self.mapped_args.iter().any(|m| m.o == o) || self.released_mark_value(o).is_some_and(|v| v != Value::TRUE)
+    }
+
     /// The mapped `arguments` objects of frames at or past `level`, ended:
-    /// their elements get the parameters' values.
+    /// each element still mapped gets its parameter's value. One that may
+    /// outlive its frame (`MappedArgs::escapes`) keeps the indices whose
+    /// parameter does too mapped to it (see [`Vm::keep_mapped`]).
     fn release_mapped(&mut self, level: *mut Value) {
         while let Some(m) = self.mapped_args.last()
             && m.regs >= level
         {
             let m = self.mapped_args.pop().unwrap();
+            let o = m.o;
             for (i, &on) in m.mapped.iter().enumerate() {
-                if on && (i as u32) < unsafe { (*m.o).elems_len } {
+                if on && (i as u32) < unsafe { (*o).elems_len } {
                     unsafe {
                         let v = m.value(i);
-                        let at = (*m.o).elems.add(i);
+                        let at = (*o).elems.add(i);
                         *at = v;
-                        crate::heap::barrier(m.o.cast(), at, v);
+                        crate::heap::barrier(o.cast(), at, v);
                     }
                 }
             }
+            if m.escapes {
+                self.keep_mapped(&m);
+            }
         }
+    }
+
+    /// Mapped `arguments` object `m.o`, its frame ending and its elements
+    /// given their parameters' values, which may outlive the frame: the
+    /// indices whose parameter does too, captured by a closure (an open
+    /// upvalue has it) or in a scope object (`MappedArgs::scope`), stay
+    /// mapped to it, as the closure may still read or assign it
+    /// (ECMA-262's MakeArgGetter and MakeArgSetter close over the
+    /// function's environment, #163). Those go in a record, the object's
+    /// `ARGUMENTS_MARK` value: an object whose elements are the scope
+    /// object (or `undefined`), then per index the upvalue's cell or the
+    /// name's atom (a hole once unmapped), traced as any object's; their
+    /// elements are hidden (see [`Vm::hide_element`]).
+    ///
+    /// An object of the mapped shape with no index left mapped takes the
+    /// unmapped one, whose elements inline caches read. One of a shape
+    /// made from it (a property added) keeps that, its mark `false` (see
+    /// [`Vm::maps_elements`]): only mapped objects have such shapes, so
+    /// no cache of one reads stale elements.
+    #[cold]
+    #[inline(never)]
+    fn keep_mapped(&mut self, m: &MappedArgs) {
+        let (o, env) = (m.o, m.scope.0);
+        let mut kept = Vec::new();
+        for (i, &on) in m.mapped.iter().enumerate() {
+            if !on {
+                continue;
+            }
+            if !env.is_null() {
+                if m.scope_slot(i).is_some() {
+                    kept.push((i, Value::from_i32(m.scope.1[i].0 as i32)));
+                }
+            } else if let Some(u) = self.open_upvalue_of(unsafe { m.regs.add(1 + i) }) {
+                kept.push((i, Value::from_bits(unsafe { crate::layout::payload_cell(u) } as u64)));
+            }
+        }
+        let record = if !kept.is_empty() {
+            let n = 1 + m.mapped.len();
+            let r = self.new_object_with(Class::Plain, Value::NULL, 0);
+            unsafe {
+                let e = self.heap.alloc_values_from(n, n);
+                *e = if env.is_null() { Value::UNDEFINED } else { object_value(env) };
+                for k in 1..n {
+                    *e.add(k) = Value::EMPTY;
+                }
+                for &(i, b) in &kept {
+                    *e.add(1 + i) = b;
+                }
+                (*r).elems = e;
+                crate::heap::barrier_young(r.cast(), &raw const (*r).elems);
+                (*r).elems_len = n as u32;
+            }
+            for &(i, _) in &kept {
+                self.hide_element(o, i as u32);
+            }
+            object_value(r)
+        } else if unsafe { (*o).shape } == self.mapped_arguments_shape {
+            unsafe { crate::object::set_shape(o, self.arguments_shape) };
+            return;
+        } else {
+            Value::FALSE
+        };
+        let mark = match self.released_mark {
+            Some(a) => a,
+            None => {
+                let a = self.intern(crate::builtins::ARGUMENTS_MARK);
+                self.released_mark = Some(a);
+                a
+            }
+        };
+        if let Some(slot) = unsafe { (*(*o).shape).lookup(mark) } {
+            self.store_field(o, slot, record);
+        }
+    }
+
+    /// Element `i` of `o`, a mapped `arguments` object whose frame ended
+    /// with the index mapped (see [`Vm::release_mapped`]), kept as a named
+    /// property under its decimal string, its slot a hole, as an element
+    /// with attributes is (see `props`): compiled code reading elements
+    /// in place (`get_keyed` stencils, which check no shape) finds none,
+    /// and asks the runtime, which reads the parameter.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn hide_element(&mut self, o: *mut Object, i: u32) {
+        if !Self::has_element(o, i) {
+            return;
+        }
+        unsafe {
+            let at = (*o).elems.add(i as usize);
+            let v = *at;
+            *at = Value::EMPTY;
+            (*o).flags |= crate::object::SPARSE;
+            let a = self.intern_name(&i.to_string());
+            let attrs = if (*o).flags & crate::object::SEALED != 0 { DONT_DELETE } else { 0 };
+            self.add_property_with(o, a, v, attrs);
+        }
+    }
+
+    /// The open upvalue of register `at`, if there is one.
+    fn open_upvalue_of(&self, at: *mut Value) -> Option<*mut Upvalue> {
+        let ups = &self.open_upvalues;
+        let k = ups.partition_point(|&u| unsafe { (*u).at } < at);
+        ups.get(k).copied().filter(|&u| unsafe { (*u).at } == at)
     }
 
     /// Close the open upvalue of register `at`, if there is one.
@@ -5765,6 +6001,7 @@ impl Vm {
             // (The built-ins' accessors' getters, named so, only read: an
             // Intl collator's `compare` makes its function once.)
             reads_only: crate::interp::reads_only(f) || name.starts_with("get "),
+            arguments_escape: false,
             strict: false,
             ctor_capacity: Cell::new(0),
             ctor_shape: Cell::new(std::ptr::null()),
@@ -6463,6 +6700,7 @@ impl Vm {
                     c.constants = constants;
                     c.handlers = f.handlers.into_boxed_slice();
                     c.compound_keys = f.compound_keys.into_boxed_slice();
+                    c.arguments_escape = f.arguments_escape;
                     c.interpreted = interpreted;
                     c.calls_left.set(calls_left);
                     c.loop_budget.set(loop_budget);
@@ -6496,6 +6734,7 @@ impl Vm {
                     native: None,
                     constructs: false,
                     reads_only: false,
+                    arguments_escape: f.arguments_escape,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
                     ctor_settled: Cell::new(false),
@@ -7555,10 +7794,22 @@ pub(crate) struct MappedArgs {
     /// Its frame's registers (`r1…` its parameters).
     pub(crate) regs: *mut Value,
     pub(crate) mapped: Vec<bool>,
+    /// It may be reachable once its frame has ended: its function's code
+    /// may let it go (`Code::arguments_escape`), or a getter or setter
+    /// got it as `this` (`Vm::call_getter`). Else its parameters' values
+    /// are copied in then, as nothing can see the difference.
+    pub(crate) escapes: bool,
     /// A function with a direct `eval` keeps its parameters in its scope
     /// object, by name: that object (null if they are in registers) and
     /// the parameters' names.
     pub(crate) scope: (*mut Object, Vec<Atom>),
+}
+
+/// Where a parameter a mapped `arguments` object outlived its frame with
+/// is (see `Vm::release_mapped`): an upvalue, or a scope object's slot.
+enum Binding {
+    Upvalue(*mut Upvalue),
+    Scope(*mut Object, u32),
 }
 
 impl MappedArgs {
@@ -8479,10 +8730,10 @@ out.join();"#;
         reference.run(&setup(false)).unwrap();
         reference.set_gc_evacuate_all();
         let expected = reference.run(&observe).map(display).unwrap();
-        // (After the frames returned: the variables' last values, the
-        // closures writing theirs. Whether `arguments` still aliases them
-        // is the returns', whatever it is.)
-        assert!(expected.starts_with("a0b1,a0,b1,2,") && expected.contains(",c1,c1,c2,"), "{expected}");
+        // (After the frames returned: the variables' last values, and
+        // `arguments` still aliasing those the closures captured, #163;
+        // SpiderMonkey's and JSC's.)
+        assert_eq!(expected, "a0b1,a0,b1,2,Ab1,c1,c1,c2,c2,c3,c3");
 
         let mut vm = fresh();
         assert!(catch_unwind(AssertUnwindSafe(|| vm.run(&setup(true)))).is_err());

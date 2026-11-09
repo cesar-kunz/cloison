@@ -5504,6 +5504,33 @@ var log = [];
     assert_eq!(display(vm.get(g, a).unwrap()), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
 }
 
+/// `new.target` in a function whose variables don't all fit in registers,
+/// a generator's (all in its scope object) and a class constructor's too,
+/// read directly, by an arrow and by a direct `eval` (#175: "unsupported").
+/// The expected value is SpiderMonkey's and QuickJS's.
+#[test]
+fn new_target_in_scope_objects() {
+    let vars: String = (0..450).map(|i| format!("var v{i} = {i};")).collect();
+    let src = format!(
+        r#"
+var r = [];
+function F() {{ {vars} r.push(new.target === F, (() => new.target)() === F, v449); }}
+new F(); F();
+function E() {{ {vars} r.push(eval("new.target") === E); }}
+new E();
+function* g() {{ yield new.target; yield (() => new.target)(); }}
+r.push([...g()].join("/"));
+function* h() {{ {vars} yield new.target; yield v449; }}
+r.push([...h()].join("/"));
+class C {{ constructor() {{ {vars} this.x = new.target === C; }} }}
+try {{ C(); }} catch (e) {{ r.push(e.name); }}
+r.push(new C().x);
+r.join();
+"#
+    );
+    assert_eq!(value(&src), "true,true,449,false,false,449,true,/,/449,TypeError,true");
+}
+
 /// A function using `a` variables of one enclosing function and `b` of
 /// another (each with no more variables than registers, so none is in a
 /// scope object): `a + b` upvalues.

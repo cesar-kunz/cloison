@@ -8377,9 +8377,13 @@ out.join();"#;
         let g = vm.global;
         vm.define_native(g, "addr", addr, 1, crate::jit::Ty::Any, false);
         let src = r#"
-            var o = {k: 'v'.repeat(3)}, at = addr(o), moved = false;
-            for (var i = 0; i < 4; i++) { $262.gc(); moved = moved || addr(o) != at; }
-            [count() > 1000, moved, o.k].join()"#;
+            var os = [], at = [], moved = false;
+            for (var i = 0; i < 200; i++) { os.push({k: 'v'.repeat(3)}); at.push(addr(os[i])); }
+            for (var i = 0; i < 4; i++) {
+              $262.gc();
+              for (var j = 0; j < os.length; j++) moved = moved || addr(os[j]) != at[j];
+            }
+            [count() > 1000, moved, os[199].k].join()"#;
         let r = vm.run(&crate::js::compile(src).unwrap()).map(display);
         assert_eq!(r.as_deref(), Ok("true,true,vvv"));
         assert_eq!((vm.heap.gc.stack_base, vm.unmovable), (0, 0));

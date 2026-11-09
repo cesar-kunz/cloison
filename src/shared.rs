@@ -106,6 +106,9 @@ pub(crate) struct State {
     pub(crate) prototype: *mut Object,
     pub(crate) constructor: *mut Object,
     live: *mut Object,
+    /// The growable ones among them (a weak set too, null until there is
+    /// one): what [`catch_up`] brings up to date.
+    growing: *mut Object,
     blocks: Vec<*mut Block>,
     prune_at: usize,
     /// The collections there had been at the last pruning.
@@ -129,6 +132,7 @@ impl Default for State {
             prototype: std::ptr::null_mut(),
             constructor: std::ptr::null_mut(),
             live: std::ptr::null_mut(),
+            growing: std::ptr::null_mut(),
             blocks: Vec::new(),
             prune_at: 64,
             pruned: 0,
@@ -145,7 +149,7 @@ impl State {
     /// [`State::roots`] as slots (see `gc::Root`).
     pub(crate) fn root_slots(&mut self, f: &mut dyn FnMut(crate::gc::Root)) {
         use crate::gc::Root;
-        for o in [&mut self.prototype, &mut self.constructor, &mut self.live] {
+        for o in [&mut self.prototype, &mut self.constructor, &mut self.live, &mut self.growing] {
             f(Root::Object(o));
         }
         for (_, p, resolve) in &mut self.waits {
@@ -155,8 +159,11 @@ impl State {
     }
 
     pub(crate) fn roots(&self) -> Vec<Value> {
-        let mut v: Vec<Value> =
-            [self.prototype, self.constructor, self.live].into_iter().filter(|o| !o.is_null()).map(object_value).collect();
+        let mut v: Vec<Value> = [self.prototype, self.constructor, self.live, self.growing]
+            .into_iter()
+            .filter(|o| !o.is_null())
+            .map(object_value)
+            .collect();
         for (_, p, resolve) in &self.waits {
             v.push(*p);
             v.push(*resolve);
@@ -224,8 +231,15 @@ fn prune(vm: &mut Vm) -> Result<()> {
         vm.handles.extend_from_slice(&values);
         let set = crate::collections::new_weak_set(vm)?;
         vm.shared.live = set;
-        for v in values {
+        for &v in &values {
             crate::collections::weak_set_insert(vm, set, v)?;
+        }
+        if !vm.shared.growing.is_null() {
+            let set = crate::collections::new_weak_set(vm)?;
+            vm.shared.growing = set;
+            for v in values.into_iter().filter(|&v| is_resizable(as_object(v))) {
+                crate::collections::weak_set_insert(vm, set, v)?;
+            }
         }
         Ok(())
     })
@@ -262,6 +276,13 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
     }
     let live = vm.shared.live;
     crate::collections::weak_set_insert(vm, live, object_value(o))?;
+    if growable {
+        if vm.shared.growing.is_null() {
+            vm.shared.growing = crate::collections::new_weak_set(vm)?;
+        }
+        let growing = vm.shared.growing;
+        crate::collections::weak_set_insert(vm, growing, object_value(o))?;
+    }
     Ok(object_value(o))
 }
 
@@ -286,14 +307,12 @@ static GROWS: AtomicUsize = AtomicUsize::new(0);
 /// cached lengths are read without the block's.
 pub(crate) fn catch_up(vm: &mut Vm) {
     let n = GROWS.load(SeqCst);
-    if n == vm.shared.grows || vm.shared.live.is_null() {
+    if n == vm.shared.grows || vm.shared.growing.is_null() {
         return;
     }
     vm.shared.grows = n;
-    for v in crate::collections::weak_set_values(vm.shared.live) {
-        if is_resizable(as_object(v)) {
-            sync_length(as_object(v));
-        }
+    for v in crate::collections::weak_set_values(vm.shared.growing) {
+        sync_length(as_object(v));
     }
 }
 
@@ -372,6 +391,11 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     loop {
         if n < current {
             return Err(Error::range_error("SharedArrayBuffer.prototype.grow: a buffer can't shrink"));
+        }
+        if n == current {
+            // (No grow: none to catch up with.)
+            sync_length(o);
+            return Ok(Value::UNDEFINED);
         }
         // (Its bytes past its length are zero: it never shrinks.)
         match len.compare_exchange(current, n, SeqCst, SeqCst) {

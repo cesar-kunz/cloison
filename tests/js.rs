@@ -5269,6 +5269,32 @@ var log = [];
     assert_eq!(display(vm.get(g, a).unwrap()), "gen 309 | gen 319 | a 30 20 301 | inner 621,622 | fs 21,22,23");
 }
 
+/// A function using `a` variables of one enclosing function and `b` of
+/// another (each with no more variables than registers, so none is in a
+/// scope object): `a + b` upvalues.
+fn upvalues_of_two_functions(a: usize, b: usize) -> String {
+    let a_vars: String = (0..a).map(|i| format!("var a{i} = {i};")).collect();
+    let b_vars: String = (0..b).map(|i| format!("var b{i} = {};", 1000 + i)).collect();
+    let names: Vec<String> = (0..a).map(|i| format!("a{i}")).chain((0..b).map(|i| format!("b{i}"))).collect();
+    format!(
+        "function outer() {{ {a_vars} function mid() {{ {b_vars} function inner() {{ return [{}]; }} return inner; }} return mid(); }}\n\
+         var p = outer()(); [p.length, p[255], p[p.length - 1]].join();",
+        names.join(",")
+    )
+}
+
+/// An upvalue's index is a byte: 256 upvalues compile, more are refused
+/// (#136: they read the wrong variables). The expected values are
+/// SpiderMonkey's, JSC's and QuickJS's.
+#[test]
+fn more_than_256_upvalues_are_refused() {
+    assert_eq!(value(&upvalues_of_two_functions(128, 128)), "256,1127,1127");
+    for (a, b) in [(150, 107), (150, 150)] {
+        let e = compile_error(&upvalues_of_two_functions(a, b));
+        assert!(e.contains("unsupported: more than 256 upvalues"), "{a} + {b}: {e}");
+    }
+}
+
 /// Cons strings (long strings built by `+`, flattened when read) and
 /// sparse integer keys (an object used as a map by numbers), `push` on an
 /// array-like. The expected value is Node's.

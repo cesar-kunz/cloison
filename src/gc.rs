@@ -302,7 +302,7 @@ impl Gc {
             nursery: std::env::var("CLOISON_GC_NURSERY")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .map_or(NURSERY_MIN, |mb| mb << 20),
+                .map_or(NURSERY_MIN, crate::heap::mib),
             nursery_fixed: env("CLOISON_GC_NURSERY"),
             full_at: FULL_MIN,
             threads: std::env::var("CLOISON_GC_THREADS")
@@ -873,12 +873,12 @@ pub(crate) fn policy() -> &'static Policy {
         let n = |k: &str, d: usize| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(d);
         Policy {
             ratio: n("CLOISON_GC_EVACUATE_RATIO", 2),
-            min: n("CLOISON_GC_EVACUATE_MIN_MIB", 32) << 20,
+            min: crate::heap::mib(n("CLOISON_GC_EVACUATE_MIN_MIB", 32)),
             full_share: n("CLOISON_GC_EVACUATE_FULL_SHARE", 10),
             share: n("CLOISON_GC_EVACUATE_SHARE", 10),
             full: n("CLOISON_GC_EVACUATE_FULL", 50),
-            budget: n("CLOISON_GC_EVACUATE_MIB", 32) << 20,
-            gain: n("CLOISON_GC_EVACUATE_GAIN_MIB", 8) << 20,
+            budget: crate::heap::mib(n("CLOISON_GC_EVACUATE_MIB", 32)),
+            gain: crate::heap::mib(n("CLOISON_GC_EVACUATE_GAIN_MIB", 8)),
             interval: std::time::Duration::from_millis(n("CLOISON_GC_EVACUATE_INTERVAL_MS", 500) as u64),
             spacing: n("CLOISON_GC_EVACUATE_SPACING", 0) as u32,
             fresh: n("CLOISON_GC_EVACUATE_FRESH", 1) != 0,

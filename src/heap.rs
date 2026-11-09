@@ -331,6 +331,17 @@ pub fn reserve() -> Option<Slice> {
     space().free.lock().unwrap().pop().map(Slice)
 }
 
+/// The heap limit for `CLOISON_HEAP_LIMIT=mb`, in bytes: `mb` MiB, not
+/// wrapping when that overflows, clamped to `[CHUNK, SLICE]`.
+fn limit(mb: usize) -> usize {
+    mib(mb).clamp(CHUNK, SLICE)
+}
+
+/// `mb` MiB in bytes, saturating rather than wrapping.
+pub(crate) fn mib(mb: usize) -> usize {
+    mb.saturating_mul(1 << 20)
+}
+
 impl Heap {
     /// A heap; panics if [`HEAPS`] are alive (see [`Heap::try_new`]).
     pub fn new() -> Heap {
@@ -347,7 +358,7 @@ impl Heap {
         let limit = std::env::var("CLOISON_HEAP_LIMIT")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .map_or(SLICE, |mb| (mb << 20).clamp(CHUNK, SLICE));
+            .map_or(SLICE, limit);
         let s = space();
         // (The heap gives it back when dropped.)
         let slice = std::mem::ManuallyDrop::new(slice).0;
@@ -1159,6 +1170,16 @@ const _: () = assert!(BLOCK.is_multiple_of(CARD) && GRANULES_PER_BLOCK == 2048);
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// MiB limits too large for a `usize` of bytes mean no limit, not a
+    /// wrapped one (#144).
+    #[test]
+    fn heap_limit_does_not_wrap() {
+        assert_eq!(limit(0), CHUNK);
+        assert_eq!(limit(100), 100 << 20);
+        assert_eq!(limit(1 << 44), SLICE);
+        assert_eq!(limit(usize::MAX), SLICE);
+    }
 
     /// More heaps alive at once than tests running in parallel on a large
     /// machine, each with a slice of its own and a cell in it.

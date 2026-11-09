@@ -137,11 +137,17 @@ pub fn compile_strict_eval(src: &str) -> Result<Module, String> {
 /// in the caller's scope object (see `intrinsics::direct_eval`). Or, with
 /// `bound` (`ast::Program::eval_upvalues`), in the caller's bindings, its
 /// upvalues (see `intrinsics::direct_eval_bound`).
-pub fn compile_direct_eval(src: &str, strict: bool, withs: usize, bound: &[(ast::Name, u8, ast::Name)]) -> Result<Module, String> {
+pub fn compile_direct_eval(
+    src: &str,
+    strict: bool,
+    withs: usize,
+    global: bool,
+    bound: &[(ast::Name, u8, ast::Name)],
+) -> Result<Module, String> {
     let source: Rc<str> = src.into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source_as(src, &arena, skim, Some((strict, withs, !bound.is_empty()))).and_then(|mut p| {
+        parse::parse_source_as(src, &arena, skim, Some((strict, withs, !bound.is_empty(), global))).and_then(|mut p| {
             p.eval_upvalues = bound.to_vec();
             codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
         })

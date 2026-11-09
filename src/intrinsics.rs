@@ -811,7 +811,12 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     };
     // (The objects of the `with` statements around it, outermost first.)
     let withs = a.get(7..).unwrap_or(&[]);
-    let place = crate::vm::EvalPlace::Direct { strict, withs: withs.len() };
+    // (A script's: the global object its function's scope object, whose
+    // properties its code finds as globals, after the global scope's
+    // block-scoped bindings, not as a `with`'s: see `parse_pass`.)
+    let decl = a.get(6).copied().filter(|&d| crate::props::is_object(d)).unwrap_or(env);
+    let global = decl == object_value(vm.global);
+    let place = crate::vm::EvalPlace::Direct { strict, withs: withs.len(), global };
     let hash = Vm::eval_hash(u, place);
     // (`kept`: its caches stay when it has run.)
     let (code, own_strict, declared, kept) = match vm.cached_eval(u, place, hash) {
@@ -819,7 +824,7 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         None => {
             let source: Box<[u16]> = u.into();
             let text = crate::vm::source_text(u);
-            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), &[]).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), global, &[]).map_err(eval_error)?;
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
@@ -847,7 +852,6 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let local = object_value(vm.new_object(Value::NULL));
     // (Declared in the function's scope object, under the one of the
     // other bindings it sees: see `Gen::call`.)
-    let decl = a.get(6).copied().filter(|&d| crate::props::is_object(d)).unwrap_or(env);
     let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
     let over = target == decl && env != decl && crate::props::is_object(env);
     // A `var` by a block-scoped binding's name (but a catch parameter's)
@@ -928,7 +932,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                     None => ("%none".into(), 0, "".into()),
                 })
                 .collect();
-            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), &bound).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), false, &bound).map_err(eval_error)?;
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
                 std::mem::take(&mut module.declared).iter().map(|n| vm.intern_name(n)).collect();

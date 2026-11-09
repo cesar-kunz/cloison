@@ -14210,3 +14210,35 @@ fn another_vms_cons_key_panics_cleanly() {
     assert_eq!(display(a.get_keyed(o, ka).unwrap()), "1");
     assert_eq!(display(b.run(&cloison::js::compile("xy.length").unwrap()).unwrap()), "80");
 }
+
+/// A value the host keeps across runs as a `Global` (#142): a root, kept
+/// through collections that free what nothing else holds and updated
+/// as they move its cell; of its own VM only; its slot free once
+/// dropped. (The raw `Value` of the issue's reproducer read `undefined`
+/// after the second run.)
+#[test]
+fn globals_keep_host_values_across_runs() {
+    use cloison::vm::Global;
+    let mut vm = Vm::new();
+    vm.set_gc_evacuate_all();
+    let run = |vm: &mut Vm, src: &str| vm.run(&cloison::js::compile(src).unwrap()).unwrap();
+    let o = run(&mut vm, "({k: 'v'.repeat(3), a: [1, 2, 3]})");
+    let (at, o) = (o.to_bits(), Global::new(&vm, o));
+    let copy = o.clone();
+    let e = run(&mut vm, "({})");
+    let gone = Global::new(&vm, e);
+    drop(gone);
+    for _ in 0..3 {
+        run(&mut vm, "for (var i = 0; i < 2e5; i++) var x = {i: [i]}; $262.gc(); $262.gc();");
+    }
+    let k = vm.intern("k");
+    assert_eq!(display(vm.get(o.get(&vm), k).unwrap()), "vvv");
+    assert_eq!(o.get(&vm), copy.get(&vm));
+    assert_ne!(o.get(&vm).to_bits(), at, "evacuation moved it, and its Global with it");
+    let other = Vm::new();
+    assert!(o.is_of(&vm) && !o.is_of(&other));
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| o.get(&other)));
+    assert!(r.is_err());
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Global::new(&other, o.get(&vm))));
+    assert!(r.is_err());
+}

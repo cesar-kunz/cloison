@@ -30,6 +30,11 @@
 
 use std::fmt;
 
+/// A JS value. A cell's (an object, a string, ...) is its address, which
+/// the host may hold from a run (its completion value, a native's
+/// arguments) only until the VM's next run: a collection then frees or
+/// moves the cells nothing in the VM refers to. Kept past it, it is held
+/// as a [`Global`](crate::vm::Global) (#142).
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Value(u64);

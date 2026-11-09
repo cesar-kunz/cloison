@@ -42,7 +42,7 @@ of text); the default build changes by a class and an empty list.
 
 `data/intl/icu4x.postcard` (454 KB), an ICU4X blob of what the
 collator needs, for `en` and `en-US`, from CLDR 49 and ICU 79.1's
-export (Unicode 17, the version of cloison's other tables).
+export (Unicode 17).
 `scripts/intl-data.sh [locale …]` makes it with `icu4x-datagen` (the
 ICU4X version `Cargo.lock` has).
 

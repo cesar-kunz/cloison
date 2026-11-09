@@ -14962,3 +14962,14 @@ ks.length + " " + bad.join(" ");
 "#;
     assert_eq!(value(src), "20 ");
 }
+
+#[test]
+fn error_to_string_converts_name_before_reading_message() {
+    let src = r#"
+var log = [];
+var o = { get name(){ log.push("n"); return {toString(){ log.push("N"); return "E"; }}; },
+          get message(){ log.push("m"); return "msg"; } };
+Error.prototype.toString.call(o) + " " + log.join(",");
+"#;
+    assert_eq!(value(src), "E: msg n,N,m");
+}

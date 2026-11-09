@@ -11825,7 +11825,15 @@ fn window_sources(insns: &[Insn], is_target: &[bool], k: usize) -> Vec<(u8, u8)>
     };
     let mut out = Vec::new();
     for w in (call.reg2 as usize..call.reg2 as usize + n).map(|w| w as u8) {
-        let Some(s) = (0..k).rev().find(|&s| writes(&insns[s]) == Some(w)) else {
+        // (Back to the write, or to what rules out any write before: a
+        // jump target, a call or an exit. Searched back to the start,
+        // lowering Univer's module function, 330,000 instructions, spent
+        // 0.2 s here: #125.)
+        let found = (0..k).rev().find(|&s| {
+            let j = &insns[s];
+            writes(j) == Some(w) || is_target[s] || j.bail || j.is_call()
+        });
+        let Some(s) = found.filter(|&s| writes(&insns[s]) == Some(w)) else {
             continue;
         };
         let x = match insns[s].op {
@@ -14342,6 +14350,12 @@ impl Lowering<'_> {
             is_target[j.target] = true;
         }
         let smis = smi_registers(self.state.vm, f.code, insns, &is_target);
+        // The root's captured registers, found once: each of its calls
+        // and returns asks, and finding them goes over all its closures'
+        // upvalues. (Lowering Univer's module function, 330,000
+        // instructions, took 8 s, most of it here: #125.)
+        let captured = if frame == 0 { captured_regs(self.state.root) } else { Vec::new() };
+        let captures = captured.iter().any(|&c| c);
         for (k, orig) in insns.iter().enumerate() {
             start[k] = self.out.insns.len();
             let mut i = *orig;
@@ -14396,7 +14410,6 @@ impl Lowering<'_> {
                 // (Not from a captured register, which a closure may write
                 // between the copy and the call.)
                 Op::Call | Op::CallUndefined | Op::Construct if !i.bail => {
-                    let captured = if frame == 0 { captured_regs(self.state.root) } else { Vec::new() };
                     window_sources(insns, &is_target, k)
                         .into_iter()
                         .filter(|&(_, x)| captured.get(x as usize) != Some(&true))
@@ -14571,7 +14584,7 @@ impl Lowering<'_> {
                 // The function returns from its compiled code: the caller of
                 // the code (`vm_run`) finishes the return.
                 Op::Return if frame == 0 => {
-                    if self.captures(self.state.root) {
+                    if captures {
                         let mut close = synth(Op::Nop, 0, frame, i.pc);
                         close.close = true;
                         self.push(close, Prop::None);
@@ -14606,7 +14619,7 @@ impl Lowering<'_> {
                     if frame == 0
                         && self.tail_call(&i, insns.get(k + 1)).is_some()
                         && !self.frame_args(self.state.root)
-                        && !self.captures(self.state.root) =>
+                        && !captures =>
                 {
                     let fo = self.tail_call(&i, insns.get(k + 1)).unwrap();
                     let jump = self.emit_tail_call(&i, fo);

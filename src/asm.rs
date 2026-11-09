@@ -65,6 +65,10 @@ pub struct FunctionDef {
     /// Nested functions use some of its variables (they stay in its
     /// registers, which its closures' upvalues point to until it returns).
     pub captures: bool,
+    /// Its `arguments` object may be reachable once it has returned (see
+    /// `codegen::arguments_escape`): what a mapped one's parameters a
+    /// closure captured then are matters (`Vm::release_mapped`).
+    pub arguments_escape: bool,
     /// Strict mode code: `this` is passed as is (see `ast::Function::strict`).
     pub strict: bool,
     /// Where it starts in its source (its parameter list's `(`), 1-based
@@ -447,6 +451,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
             compound_keys: Vec::new(),
             upvalues: Vec::new(),
             captures: false,
+            arguments_escape: true,
             strict: false,
             line: 0,
             col: 0,

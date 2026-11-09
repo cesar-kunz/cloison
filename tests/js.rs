@@ -443,6 +443,46 @@ q.then(() => { globalThis.out = log.join(", "); });
     assert_eq!(out_after_jobs(src), "t0, t1, b TypeError, t2, c 8, t3, t4, a TypeError, t5");
 }
 
+/// `yield*`'s `throw()` to an iterator with no `throw` closes it as
+/// IteratorClose does, what its `return()` throws (a rejection, async)
+/// replacing the TypeError; an async generator awaits that `return()`'s
+/// result first (AsyncIteratorClose) (#154).
+#[test]
+fn yield_star_throw_without_method_closes_with_errors() {
+    let src = r#"
+var log = [];
+function show(e) { return typeof e == "string" ? e : e.name; }
+function* g(ret) { yield* { [Symbol.iterator]() { return { next() { return { done: false }; }, return: ret }; } }; }
+for (const [name, ret] of [["throws", function () { throw "rt"; }], ["prim", () => 1], ["plain", () => ({})], ["none", undefined]]) {
+  var it = g(ret); it.next();
+  try { it.throw(1); } catch (e) { log.push(name + " " + show(e)); }
+}
+async function* ag(ret) { yield* { [Symbol.asyncIterator]() { return { next() { return { done: false }; }, return: ret }; } }; }
+function run(name, ret, how) {
+  var it = ag(ret);
+  it.next().then(() => how(it)).then(() => log.push(name + " ok"), e => log.push(name + " " + show(e)));
+}
+var thr = it => it.throw(1);
+run("throws", function () { throw "rt"; }, thr);
+run("rejects", () => Promise.reject("rj"), thr);
+run("plain", () => { log.push("closing"); return {}; }, thr);
+run("prim", () => 1, thr);
+run("none", undefined, thr);
+run("noncallable", 5, thr);
+run("thenable", () => ({ then(r) { log.push("then"); r({}); } }), thr);
+run("returned", () => Promise.reject("rr"), it => it.return(Promise.reject("x")));
+var t = 0; (function tick() { log.push("t" + ++t); if (t < 7) Promise.resolve().then(tick); })();
+var q = Promise.resolve(); for (let i = 0; i < 10; i++) q = q.then(() => 0);
+q.then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        "throws rt, prim TypeError, plain TypeError, none TypeError, t1, t2, closing, t3, then, t4, t5, \
+         throws rt, rejects rj, plain TypeError, prim TypeError, none TypeError, noncallable TypeError, \
+         t6, thenable TypeError, returned rr, t7"
+    );
+}
+
 /// What a sync iterator's step throws in `for await` or `yield*` (its
 /// `next()`, a non-object result, a `done` or `value` getter) rejects
 /// the AsyncFromSyncIterator step's promise, awaited: seen a job later,

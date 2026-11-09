@@ -6135,6 +6135,11 @@ impl<'a> Gen<'a> {
         self.intrinsic("async_from_sync_done", it, 1);
         self.jump(stepped);
         self.bind(inner);
+        // (A `throw` step may have closed the iterator instead.)
+        let (closing, checked) = (self.label(), self.loop_label());
+        self.ldar(mode);
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(1), closing);
+        self.bind(checked);
         self.intrinsic("delegate_done", result, 1);
         self.star(gr);
         self.named(Op::GetNamed, result, "value");
@@ -6170,6 +6175,9 @@ impl<'a> Gen<'a> {
         self.bind(thrown);
         self.star(mode);
         self.jump(top);
+        self.bind(closing);
+        self.intrinsic("async_delegate_closed", it, 1);
+        self.jump(checked);
         self.bind(done);
         // (A `return()` passed on: the generator returns the value.)
         let (ret, end) = (self.label(), self.label());

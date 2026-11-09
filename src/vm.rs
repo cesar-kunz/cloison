@@ -49,9 +49,12 @@ impl Error {
     pub fn unsupported(m: impl fmt::Display) -> Error {
         Error(format!("unsupported: {m}"), None)
     }
-    /// `throw v`. (No heap object moves or is freed while it's held.)
+    /// `throw v`. (No heap object moves or is freed while it's held.) Its
+    /// message is [`shown`]: a long string thrown isn't flattened nor
+    /// copied whole for a `catch` that needs only the value
+    /// ([`Vm::uncaught_message`] shows it whole).
     pub fn thrown(v: Value) -> Error {
-        Error(display(v), Some(v))
+        Error(shown(v), Some(v))
     }
 }
 
@@ -3330,6 +3333,12 @@ impl Vm {
             if let Ok(s) = self.host(|_| Ok(crate::interp::to_string_units(v))) {
                 return String::from_utf16_lossy(&s);
             }
+        }
+        // (A primitive's message is cut: see `Error::thrown`.)
+        if let Some(v) = e.1
+            && !crate::props::is_object(v)
+        {
+            return display(v);
         }
         e.0.clone()
     }

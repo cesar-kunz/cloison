@@ -4,11 +4,12 @@
 //! paths all: the JIT leaves them to the interpreter.
 
 use crate::interp::{call_function, to_string_units};
-use crate::js::ast::{EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_NEW_TARGET, EVAL_STRICT};
+use crate::js::ast::{EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_NEW_TARGET, EVAL_STRICT};
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::Desc;
 use crate::value::Value;
 use crate::vm::{Error, Key, Result, Vm};
+use std::ops::ControlFlow;
 
 pub(crate) type Intrinsic = fn(&mut Vm, &[Value]) -> Result<Value>;
 
@@ -808,13 +809,13 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// to run again for the same source in the same kind of place (see
 /// `Vm::eval_cache`): only its declarations are made at each run.
 fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let (f, src, env, this) = (a[0], a[1], a[2], a[3]);
+    let (env, this) = (a[2], a[3]);
     let flags = a[4].as_number().unwrap_or(0.0) as u8;
     let (strict, new_target) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0);
-    let builtin = f.is_cell() && as_object(f) == vm.eval_function;
-    if !builtin {
-        return call_function(vm, f, Value::UNDEFINED, &[src]);
-    }
+    let src = match eval_source(vm, a[0], a[1], flags)? {
+        ControlFlow::Break(r) => return Ok(r),
+        ControlFlow::Continue(src) => src,
+    };
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
@@ -919,12 +920,13 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (carrier, site, number) = (a[a.len() - 3], a[a.len() - 2], a[a.len() - 1]);
     let a = &a[..a.len() - 3];
-    let (f, src, env, this) = (a[0], a[1], a[2], a[3]);
+    let (env, this) = (a[2], a[3]);
     let flags = a[4].as_number().unwrap_or(0.0) as u8;
     let (strict, new_target) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0);
-    if !(f.is_cell() && as_object(f) == vm.eval_function) {
-        return call_function(vm, f, Value::UNDEFINED, &[src]);
-    }
+    let src = match eval_source(vm, a[0], a[1], flags)? {
+        ControlFlow::Break(r) => return Ok(r),
+        ControlFlow::Continue(src) => src,
+    };
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
@@ -1060,13 +1062,27 @@ fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, 
     Ok(r)
 }
 
-/// A direct `eval(source)` of a strict script's own: `[eval, source]`.
-/// As the builtin `eval`'s (indirect) of strict code.
-fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let (f, src) = (a[0], a[1]);
-    if !(f.is_cell() && as_object(f) == vm.eval_function) {
-        return call_function(vm, f, Value::UNDEFINED, &[src]);
+/// A direct `eval`'s source (`src`, or with `EVAL_ARGS` the first of
+/// the arguments in that array); or, its callee not the builtin `eval`,
+/// what an ordinary call of it with the arguments returns.
+fn eval_source(vm: &mut Vm, f: Value, src: Value, flags: u8) -> Result<ControlFlow<Value, Value>> {
+    let builtin = f.is_cell() && as_object(f) == vm.eval_function;
+    let args = if flags & EVAL_ARGS != 0 { elements(vm, src)? } else { vec![src] };
+    if !builtin {
+        return call_function(vm, f, Value::UNDEFINED, &args).map(ControlFlow::Break);
     }
+    Ok(ControlFlow::Continue(args.first().copied().unwrap_or(Value::UNDEFINED)))
+}
+
+/// A direct `eval(source)` of a strict script's own: `[eval, source,
+/// flags]` (`EVAL_ARGS`). As the builtin `eval`'s (indirect) of strict
+/// code.
+fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let flags = a[2].as_number().unwrap_or(0.0) as u8;
+    let src = match eval_source(vm, a[0], a[1], flags)? {
+        ControlFlow::Break(r) => return Ok(r),
+        ControlFlow::Continue(src) => src,
+    };
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };

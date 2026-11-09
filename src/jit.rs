@@ -762,7 +762,7 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
             // anything is stored here.
             Class::TypedArray
                 if v.is_cell()
-                    && crate::vm::string_units(v).is_none()
+                    && !crate::vm::is_string(v)
                     && !(crate::bigint::is_bigint(v)
                         && crate::object::TypedKind::from_u8((*p).kind).is_big()) =>
             {

@@ -38,7 +38,7 @@ use crate::object::{Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, same_value};
 use crate::value::Value;
-use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units};
+use crate::vm::{Error, Key, NativeFn, Result, Vm, is_string, string_units};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Status {
@@ -1243,7 +1243,7 @@ fn import_request(vm: &mut Vm, specifier: Value, options: Value) -> Result<(Valu
                     continue;
                 }
                 let v = vm.get_key(attrs, key)?;
-                if string_units(v).is_none() {
+                if !is_string(v) {
                     return Err(Error::type_error("Import attribute values must be strings"));
                 }
                 let k = vm.key_string(key);

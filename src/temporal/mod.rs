@@ -27,7 +27,7 @@ use crate::builtins::is_class;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::is_object;
 use crate::value::Value;
-use crate::vm::{Error, NativeFn, Result, Vm, string_units};
+use crate::vm::{Error, NativeFn, Result, Vm, is_string, string_units};
 use iso::{DateTime, IsoDate, NS_PER_DAY, RoundingMode, Time, Unit};
 
 pub(crate) use duration::Dur;

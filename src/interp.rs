@@ -88,7 +88,7 @@ use crate::bytecode::Op;
 use crate::jit::VmRun;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::value::{NumberTag, Value};
-use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, string_len, string_units};
+use crate::vm::{Code, Error, IC_WAYS, Ic, LENGTH_LOC, VIA_CALL, Vm, is_string, string_len, string_units};
 
 pub type Handler = extern "rust-preserve-none" fn(
     *const u8,
@@ -3774,10 +3774,6 @@ impl Drop for Running {
         CURRENT_VM.with(|v| v.set(self.current));
         unsafe { (*self.vm).heap.set_owner(self.owner) };
     }
-}
-
-fn is_string(v: Value) -> bool {
-    string_len(v).is_some()
 }
 
 /// ToPrimitive (hint "default", as "number"): an object's `valueOf`, else

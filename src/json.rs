@@ -7,7 +7,7 @@ use crate::interp::{call_function, check_native_stack, to_number, to_string_unit
 use crate::object::{Class, DONT_ENUM, RAW_JSON, as_object, object_value};
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
-use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, string_len, string_units, wrapped};
+use crate::vm::{Error, Key, NativeFn, Result, Vm, check_string_len, is_string, string_len, string_units, wrapped};
 
 pub(crate) fn install(vm: &mut Vm) {
     let g = vm.global;
@@ -69,13 +69,13 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         let mut i = 0.0;
         while i < len {
             let v = vm.get_keyed(replacer, Value::number(i))?;
-            let item = if string_units(v).is_some() {
+            let item = if is_string(v) {
                 Some(v)
             } else if v.is_number() {
                 let u = to_string_units(v);
                 Some(vm.new_string(&u))
             } else if let Some(p) = wrapped(v)
-                && (p.is_number() || string_units(p).is_some())
+                && (p.is_number() || is_string(p))
             {
                 // (Its exception stops the operation: no next entry read.)
                 let u = to_string_units(v);
@@ -100,7 +100,7 @@ fn json_stringify_(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if let Some(p) = wrapped(space) {
         if p.is_number() {
             space = Value::number(to_number(space));
-        } else if string_units(p).is_some() {
+        } else if is_string(p) {
             let u = to_string_units(space);
             space = vm.new_string(&u);
         }
@@ -148,7 +148,7 @@ fn property(vm: &mut Vm, st: &mut Stringify, key: Value, holder: Value, out: &mu
     if let Some(p) = wrapped(v) {
         if p.is_number() {
             v = Value::number(to_number(v));
-        } else if string_units(p).is_some() {
+        } else if is_string(p) {
             let u = to_string_units(v);
             v = vm.new_string(&u);
         } else if !crate::symbol::is_symbol(p) {

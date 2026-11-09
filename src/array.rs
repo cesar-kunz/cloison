@@ -7,7 +7,7 @@ use crate::interp::{call_function, strict_equals, to_boolean, to_number, to_stri
 use crate::object::{Class, EXTERNAL, Object, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
-use crate::vm::{Error, Key, NativeFn, Result, Vm, array_push, check_string_len, push_string, string_len, string_units};
+use crate::vm::{Error, Key, NativeFn, Result, Vm, array_push, check_string_len, is_string, push_string, string_len, string_units};
 
 pub(crate) fn install(vm: &mut Vm) {
     let ap = vm.array_prototype;
@@ -1403,7 +1403,7 @@ fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if !items.is_undefined() && !items.is_null() {
         let a_iter = vm.a_sym_iterator;
         let m = vm.get(items, a_iter)?;
-        if !m.is_undefined() && !m.is_null() && (custom || string_units(items).is_none()) {
+        if !m.is_undefined() && !m.is_null() && (custom || !is_string(items)) {
             let out = if custom { crate::intrinsics::construct(vm, this, &[])? } else { vm.new_array() };
             let mut n = 0.0;
             crate::symbol::iterate(vm, items, |vm, v| {

@@ -9,7 +9,7 @@ use crate::object::{Class, Object, as_object, object_value};
 use crate::promise::{native_closure, slot};
 use crate::props::{Desc, is_callable, is_object};
 use crate::value::Value;
-use crate::vm::{Error, Key, NativeFn, Result, Vm, string_units};
+use crate::vm::{Error, Key, NativeFn, Result, Vm, is_string, string_units};
 
 /// `Vm::shadow_roots`, a realm's.
 enum Root {
@@ -180,7 +180,7 @@ fn copy_name_and_length(vm: &mut Vm, f: Value, target: Value) -> Result<()> {
     let d = Desc::data(Value::number(len), false, false, true);
     vm.define_own_property(as_object(f), Key::Name(a_length), &d)?;
     let name = vm.get(target, a_name)?;
-    let name = if string_units(name).is_some() { name } else { vm.new_string(&[]) };
+    let name = if is_string(name) { name } else { vm.new_string(&[]) };
     let d = Desc::data(name, false, false, true);
     vm.define_own_property(as_object(f), Key::Name(a_name), &d)?;
     Ok(())
@@ -221,7 +221,7 @@ fn import_value(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let r = realm_of(vm, this, "importValue")?;
     let spec = crate::intrinsics::to_string(vm, arg(a, 0))?;
     let name = arg(a, 1);
-    if string_units(name).is_none() {
+    if !is_string(name) {
         return Err(Error::type_error("ShadowRealm.prototype.importValue requires a string export name"));
     }
     let (p, resolve, reject) = crate::promise::new_with_resolvers(vm);

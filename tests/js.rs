@@ -6849,6 +6849,22 @@ out.join();"#;
     );
 }
 
+/// Checks of whether a value is a string don't flatten it (#146):
+/// `String`, `String.prototype.toString`, the `stack` setter,
+/// `Iterator.from`. Cons strings of 2^30 units (2 MiB), never flattened.
+#[test]
+fn string_checks_dont_flatten() {
+    let src = r#"
+var s = "x".repeat(2 ** 20);
+for (var i = 0; i < 10; i++) s = s + s;
+var e = new Error();
+e.stack = s;
+[String(s) === s, String(s).length, typeof new String(s), s.toString() === s,
+ Object(s).toString() === s, String.prototype.toString.call(s) === s, e.stack === s,
+ typeof Iterator.from(s).next].join();"#;
+    assert_eq!(light_value(src), "true,1073741824,object,true,true,true,true,function");
+}
+
 /// Maps and sets find keys through a hash index, by SameValueZero (1 and
 /// 1.0, -0 and +0, NaNs alike); iterations in progress go on past a
 /// compaction or a `clear`, seeing entries added after (`collections`).

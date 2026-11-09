@@ -20,7 +20,7 @@ use crate::jit::Ty;
 use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
-use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push, string_units};
+use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push, is_string, string_units};
 
 /// Indices into `Vm::collection_prototypes`.
 #[derive(Clone, Copy)]
@@ -254,7 +254,7 @@ fn hash(k: Value) -> u32 {
 /// Whether `k` is hashed by its address (see [`hash`]): a cell that isn't
 /// a string or a BigInt.
 pub(crate) fn hashed_by_address(k: Value) -> bool {
-    k.is_cell() && k.as_number().is_none() && string_units(k).is_none() && !crate::bigint::is_bigint(k)
+    k.is_cell() && k.as_number().is_none() && !is_string(k) && !crate::bigint::is_bigint(k)
 }
 
 /// The keys of collection `o` that are hashed by their address (for

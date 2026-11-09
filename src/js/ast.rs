@@ -46,6 +46,9 @@ pub struct Program<'a> {
     /// writes them as the scope object's accessors did (see
     /// `codegen::Var::Bound`), and there is no `%e0`.
     pub eval_upvalues: Vec<(Name, u8, Name)>,
+    /// Direct `eval`'s code of a script's, its function's scope object
+    /// the global object (see `parse::parse_pass`).
+    pub eval_global: bool,
     /// A lazily compiled function's: the upvalues that are an enclosing
     /// named function expression's own name (`asm::LazyFn::own_names`),
     /// parameters of the wrapper `js::compile_lazy` makes, but immutable.

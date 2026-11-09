@@ -1031,6 +1031,7 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
                 code,
                 own_strict: strict,
                 declared: std::rc::Rc::new([]),
+                annex_b: std::rc::Rc::new([]),
                 globals: Some(std::rc::Rc::new(globals)),
                 used: 0,
                 recent: true,

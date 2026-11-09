@@ -821,12 +821,13 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let place = crate::vm::EvalPlace::Direct { strict, withs: withs.len(), global };
     let hash = Vm::eval_hash(u, place);
     // (`kept`: its caches stay when it has run.)
-    let (code, own_strict, declared, kept) = match vm.cached_eval(u, place, hash) {
-        Some(e) => (e.code, e.own_strict, e.declared.clone(), true),
+    let (code, own_strict, declared, annex_b, kept) = match vm.cached_eval(u, place, hash) {
+        Some(e) => (e.code, e.own_strict, e.declared.clone(), e.annex_b.clone(), true),
         None => {
             let source: Box<[u16]> = u.into();
             let text = crate::vm::source_text(u);
             let mut module = crate::js::compile_direct_eval(&text, strict, withs.len(), global, &[]).map_err(eval_error)?;
+            let annex_b: std::rc::Rc<[crate::object::Atom]> = module.annex_b.iter().map(|n| vm.intern_name(n)).collect();
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             let declared: std::rc::Rc<[crate::object::Atom]> =
@@ -839,12 +840,13 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                 code,
                 own_strict,
                 declared: declared.clone(),
+                annex_b: annex_b.clone(),
                 globals: None,
                 used: 0,
                 recent: true,
             };
             let kept = vm.keep_eval(hash, e);
-            (code, own_strict, declared, kept)
+            (code, own_strict, declared, annex_b, kept)
         }
     };
     // (In parameters' defaults, a `var arguments` is an error.)
@@ -865,13 +867,18 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         }
     }
     // (One of the global scope's, a script's top-level `let` and the
-    // like, too: see `Vm::global_declarations`.)
-    for &n in declared.iter().filter(|_| target == object_value(vm.global)) {
-        if vm.lexical_declared.contains(&n) {
+    // like, too: see `Vm::global_declarations`. But no `var` of Annex
+    // B's function in a block by such a name, nor an error: see
+    // `Vm::annex_b_skipped`.)
+    let global_target = target == object_value(vm.global);
+    let skipped = |vm: &Vm, n| global_target && vm.lexical_declared.contains(&n) && annex_b.contains(&n);
+    for &n in declared.iter().filter(|_| global_target) {
+        if vm.lexical_declared.contains(&n) && !skipped(vm, n) {
             return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));
         }
     }
-    for &atom in declared.iter() {
+    let made: Vec<_> = declared.iter().copied().filter(|&n| !skipped(vm, n)).collect();
+    for atom in made {
         if vm.own_property(as_object(target), Key::Name(atom)).is_none() {
             vm.create_data_property(target, Key::Name(atom), Value::UNDEFINED)?;
         }
@@ -959,6 +966,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                 code,
                 own_strict,
                 declared: declared.clone(),
+                annex_b: std::rc::Rc::new([]),
                 globals: None,
                 used: 0,
                 recent: true,

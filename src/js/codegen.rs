@@ -1238,8 +1238,9 @@ fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
 /// Whether function `f`'s code may see its `arguments` and parameters
 /// aliased (a mapped `arguments` object is slower): it assigns a
 /// parameter, or an element of `arguments` (or deletes or defines one),
-/// or lets `arguments` go anywhere but to `apply` (which copies it): to a
-/// variable, a call, a return. Arrows in it too, whose `arguments` is its.
+/// or lets `arguments` go anywhere: to a variable, a call (`apply`'s too,
+/// which may be any function's own), a return. Arrows in it too, whose
+/// `arguments` is its.
 fn aliases_arguments(p: &Program, f: &Function) -> bool {
     fn is_args(e: &Expr) -> bool {
         matches!(&e.kind, ExprKind::Ident(n) if &**n == "arguments")
@@ -1254,12 +1255,9 @@ fn aliases_arguments(p: &Program, f: &Function) -> bool {
             Unary(UnOp::Delete, t) if element(t) => true,
             Call(c, args) if args.first().is_some_and(is_args) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) => true,
             Destructure(..) => true,
-            // (Reading it, or its elements, aliases nothing; `apply` copies.)
+            // (Reading it, or its elements, aliases nothing.)
             Index(o, k) if is_args(o) => expr(k, p, f),
             Member(o, _) if is_args(o) => false,
-            Call(c, args) if matches!(&c.kind, Member(_, m) if &**m == "apply") && args.len() == 2 && is_args(&args[1]) => {
-                expr(c, p, f) || expr(&args[0], p, f)
-            }
             Ident(n) if &**n == "arguments" => true,
             Function(i) if p.functions[*i].arrow => {
                 let mut found = false;
@@ -1281,9 +1279,10 @@ fn aliases_arguments(p: &Program, f: &Function) -> bool {
 /// Whether function `f`'s `arguments` object may be reachable once it
 /// has returned: it lets the object go anywhere but to a read of its
 /// `length` or `callee` (its own data properties), a read, store, update
-/// or delete of an element (not a call of one, which gets it as `this`),
-/// or `apply` (which copies it); or an arrow in it reads `arguments`, or a
-/// direct `eval` in either may. Else its parameters a closure captured
+/// or delete of an element (not a call of one, which gets it as `this`);
+/// or an arrow in it reads `arguments`, or a direct `eval` in either may.
+/// (Passing it to `apply` lets it go too: `apply` may be any function's
+/// own, which keeps it.) Else its parameters a closure captured
 /// can't be seen through it after the return (see `Vm::release_mapped`).
 /// (A prototype's getter or setter for an element, which gets it as
 /// `this`, is the runtime's to see: `Vm::call_getter`.)
@@ -1326,9 +1325,6 @@ fn arguments_escape(p: &Program, f: &Function) -> bool {
                 expr(element_of_args(t).unwrap(), p) || expr(v, p)
             }
             Update(t, ..) | Unary(UnOp::Delete, t) if element_of_args(t).is_some() => expr(element_of_args(t).unwrap(), p),
-            Call(c, args) if matches!(&c.kind, Member(_, m) if &**m == "apply") && args.len() == 2 && is_args(&args[1]) => {
-                expr(c, p) || expr(&args[0], p)
-            }
             // (A method of it, a tagged template's tag: `this` is it.)
             Call(c, _) | New(c, _) if matches!(&c.kind, Member(o, _) | Index(o, _) if is_args(o)) => true,
             Function(i) if p.functions[*i].arrow => arrow_reads(p, &p.functions[*i]),
@@ -1465,6 +1461,20 @@ fn arguments_object(p: &Program, f: usize) -> bool {
         && !forwards_arguments(p, f)
 }
 
+/// Whether function `f`'s `arguments` object would be mapped to its
+/// parameters if aliasing could show (see `Gen::maps_arguments`): a
+/// sloppy function's with simple parameters.
+fn may_map_arguments(f: &Function) -> bool {
+    !f.strict
+        && !f.arrow
+        && !f.rest
+        && f.param_stmts == 0
+        && !f.generator
+        && !f.is_async
+        && !f.params.is_empty()
+        && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
+}
+
 /// Whether function `f` reads `arguments` only to pass them on, as
 /// `g.apply(x, arguments)` (a class's constructor calling its
 /// `initialize`, in Prototype's style), and declares no variable of the
@@ -1479,6 +1489,9 @@ fn forwards_arguments(p: &Program, f: usize) -> bool {
         && !explicit_declarations(p, f).contains(&"arguments")
         // (None of its own: an arrow in it reads them.)
         && count(false) > 0
+        // (Nor mapped: `apply` may be any function's own, which keeps the
+        // object, or writes its elements.)
+        && !may_map_arguments(func)
         && count(true) == count(false)
 }
 
@@ -4018,14 +4031,7 @@ impl<'a> Gen<'a> {
     fn maps_arguments(&self) -> bool {
         let f = self.f;
         arguments_object(self.p, self.index)
-            && !f.strict
-            && !f.arrow
-            && !f.rest
-            && f.param_stmts == 0
-            && !f.generator
-            && !f.is_async
-            && !f.params.is_empty()
-            && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
+            && may_map_arguments(f)
             // (A closure may assign a parameter it captures, a direct
             // `eval`'s code any: the function keeps them in its scope
             // object then.)

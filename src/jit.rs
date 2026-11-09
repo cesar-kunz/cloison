@@ -6327,22 +6327,32 @@ fn truncated(
 /// a bitwise operation), remainders of such, masks with a non-negative
 /// constant, booleans and the other non-numbers. Within straight-line
 /// code: unknown at jump targets. For `ModSmi`, whose `_u` forms need no
-/// sign handling; empty work if there is none.
+/// sign handling; empty work if there is none. Live at the start: also
+/// what is live into a handler (`handlers`, its instruction, `None` for
+/// one not lowered), which the paths from the start may reach through an
+/// exception, not a jump (#141).
 fn nonneg_acc(
     insns: &[Insn],
     is_target: &[bool],
     nregs: usize,
     frames: &[FrameRegs],
     live_at_start: Option<&RegSet>,
+    handlers: &[Option<usize>],
 ) -> Vec<bool> {
     let n = insns.len();
     if !insns.iter().any(|i| i.op == Op::ModSmi && !i.bail) {
         return vec![false; n];
     }
-    let start = match live_at_start {
+    let mut start = match live_at_start {
         Some(l) => *l,
         None => reg_live_in(insns, &reachable(insns, 0), nregs, frames).swap_remove(0),
     };
+    for &h in handlers {
+        match h {
+            Some(h) => rs_or(&mut start, &reg_live_in(insns, &reachable(insns, h), nregs, frames)[h]),
+            None => start = [!0; 4],
+        }
+    }
     let mut ok: Vec<bool> = (0..nregs).map(|r| !rs_has(&start, r)).collect();
     loop {
         let mut acc = vec![false; n];
@@ -6400,6 +6410,19 @@ fn nonneg_acc(
             return acc;
         }
     }
+}
+
+/// The instructions of the exception handlers of `root` (null: none), as
+/// [`nonneg_acc`] takes them: `None` for a handler not lowered.
+fn handler_insns(insns: &[Insn], root: *const crate::vm::Code) -> Vec<Option<usize>> {
+    if root.is_null() {
+        return Vec::new();
+    }
+    let handlers = unsafe { &(*root).handlers };
+    handlers
+        .iter()
+        .map(|&(_, _, h)| insns.iter().position(|i| i.frame == 0 && i.pc == h as usize))
+        .collect()
 }
 
 /// Instructions reachable from `entry`.
@@ -8661,6 +8684,7 @@ impl JitCode {
             nregs,
             frames,
             (entry == 0).then(|| &live_sets[0]),
+            &handler_insns(insns, root),
         );
         // `this` and the arguments' types at call `i`, in state `st`.
         let call_types = |i: usize, st: &TypeState| {

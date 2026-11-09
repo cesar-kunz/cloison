@@ -606,6 +606,27 @@ r.join(" ");
     );
 }
 
+/// A script's top-level destructuring declares its BoundNames, nested,
+/// defaulted and rest ones too, and no name `""` (16.1.7: #126).
+#[test]
+fn a_scripts_destructuring_declares_its_bound_names() {
+    assert_eq!(
+        value(
+            r#"
+let {a, x: [b, {c = 1}, ...d], ...e} = {a: 1, x: [2, {}, 3]};
+$262.evalScript("let {f} = {f: 2}; const [q] = [4];");
+var [h, {i}] = [5, {i: 6}];
+var r = [a, b, c, d, f, q, h, i, "i" in globalThis, "a" in globalThis];
+for (const s of ["var a", "let a", "var e", "let d", "var c", "const {b} = {}", "let f", "var q", "let h", "let i"])
+  try { $262.evalScript(s); r.push("ok"); } catch (x) { r.push(x.name); }
+r.join(" ");
+"#
+        ),
+        "1 2 1 3 2 4 5 6 true false SyntaxError SyntaxError SyntaxError SyntaxError SyntaxError \
+         SyntaxError SyntaxError SyntaxError SyntaxError SyntaxError"
+    );
+}
+
 /// Annex B's function in a block of an indirect `eval` or another
 /// script, by the name of the global scope's block-scoped binding, makes
 /// no `var` and is no error (B.3.2.2, B.3.2.3: HasLexicalDeclaration);

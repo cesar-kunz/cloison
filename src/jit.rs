@@ -460,9 +460,11 @@ extern "C" fn cloison_rt_add(acc: Value, r: Value) -> u64 {
 /// then calls. No value, order or int32 is all ones.
 pub(crate) const RT_REDO: u64 = u64::MAX;
 
-/// `f`, a runtime call's conversions: [`RT_REDO`] if one needed a call.
-/// (Called only where a value is a cell: numbers' calls, the most, skip
-/// the VM's flag.)
+/// `f`, a runtime call's conversions: [`RT_REDO`] if one needed a call
+/// or threw (a `conv_thrown` left pending, which compiled code doesn't
+/// check), what one threw dropped with it, thrown by the interpreter's
+/// redo (see [`reading`]). (Called only where a value is a cell: numbers'
+/// calls, the most, skip the VM's flag.)
 fn converting(f: impl FnOnce() -> u64) -> u64 {
     let vm = crate::interp::current_vm();
     // (No VM: code compiled for bytecode run by itself, without objects.)
@@ -475,7 +477,7 @@ fn converting(f: impl FnOnce() -> u64) -> u64 {
     let outer = std::mem::replace(&mut vm.conv_replays, vm.native_top.is_null());
     let r = f();
     vm.conv_replays = outer;
-    if std::mem::take(&mut vm.conv_redo) {
+    if std::mem::take(&mut vm.conv_redo) || vm.conv_failed() {
         vm.drop_conv_error();
         return RT_REDO;
     }

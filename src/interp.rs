@@ -1235,7 +1235,8 @@ handlers! {
             crate::builtins::arguments_object_of(vm, values, callee)
         };
         if n > 0 {
-            vm.mapped_args.push(crate::vm::MappedArgs { o: as_object(o), regs, mapped: vec![true; n], scope: (std::ptr::null_mut(), Vec::new()) });
+            let escapes = (*frame_code(regs)).arguments_escape;
+            vm.mapped_args.push(crate::vm::MappedArgs { o: as_object(o), regs, mapped: vec![true; n], escapes, scope: (std::ptr::null_mut(), Vec::new()) });
             // (Released where the frame ends: see `Vm::close_upvalues`.)
             *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
         }

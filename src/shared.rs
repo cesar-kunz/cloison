@@ -281,8 +281,9 @@ static GROWS: AtomicUsize = AtomicUsize::new(0);
 
 /// The VM's growable buffers' lengths (their views') brought up to date,
 /// if one has grown since: after what may make another agent's grows
-/// happen before what follows (an `Atomics` operation, a wakeup, a
-/// message), as the views' cached lengths are read without the block's.
+/// happen before what follows (an `Atomics` operation, a waiter list's
+/// critical section, whatever its outcome, a message), as the views'
+/// cached lengths are read without the block's.
 pub(crate) fn catch_up(vm: &mut Vm) {
     let n = GROWS.load(SeqCst);
     if n == vm.shared.grows || vm.shared.live.is_null() {
@@ -675,6 +676,7 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
     if async_ {
         if t == 0.0 {
             drop(list);
+            catch_up(vm);
             let s = str_value(vm, "timed-out");
             return wait_result(vm, false, s);
         }
@@ -698,6 +700,7 @@ fn do_wait(vm: &mut Vm, a: &[Value], async_: bool) -> Result<Value> {
             Some(d) if now >= d => {
                 list.retain(|x| !Arc::ptr_eq(x, &waiter));
                 drop(list);
+                catch_up(vm);
                 return Ok(str_value(vm, "timed-out"));
             }
             Some(d) => list = waiter.wake.wait_timeout(list, d - now).unwrap_or_else(|e| e.into_inner()).0,
@@ -764,6 +767,8 @@ fn atomics_notify(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             true
         }
     });
+    drop(list);
+    catch_up(vm);
     Ok(Value::number(n as f64))
 }
 
@@ -788,7 +793,7 @@ pub(crate) fn poll(vm: &mut Vm) -> Result<bool> {
             false
         });
     }
-    if done.iter().any(|&(.., outcome)| outcome == "ok") {
+    if !done.is_empty() {
         catch_up(vm);
     }
     // (Those timed out in the order of their deadlines.)

@@ -2787,13 +2787,26 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 pub(crate) fn regexp_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let re = this_regexp(this)?;
-    let a_source = vm.intern_name("source");
-    let src = String::from_utf16_lossy(&units(vm.get(this, a_source)?));
-    if vm.conv_failed() {
-        return Err(vm.take_conv_error());
+    // (Generic: any object's `source` and `flags`.)
+    if !crate::props::is_object(this) {
+        return Err(Error::type_error("RegExp.prototype.toString called on non-object"));
     }
-    let u: Vec<u16> = format!("/{src}/{}", regexp_flags(re)).encode_utf16().collect();
+    let mut u = vec![b'/' as u16];
+    for (i, name) in ["source", "flags"].into_iter().enumerate() {
+        let a = vm.intern_name(name);
+        let v = vm.get(this, a)?;
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
+        let v = crate::intrinsics::to_string(vm, v)?;
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
+        }
+        u.extend_from_slice(string_units(v).unwrap_or(&[]));
+        if i == 0 {
+            u.push(b'/' as u16);
+        }
+    }
     vm.try_new_string(&u)
 }
 

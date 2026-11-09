@@ -605,22 +605,21 @@ extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
     reading(vm, |vm| vm.get_keyed(a, b).map_or(0, |v| v.to_bits()))
 }
 
-/// `f`, a runtime call that may run a native converting what it is given
-/// (`String.prototype.trim` as `o.t`'s getter, a proxy's `has` trap, a
-/// `Symbol.hasInstance` method): 0, for the interpreter to redo the
-/// instruction, if a conversion needed a bytecode `valueOf` or `toString`
-/// (`Vm::conv_redo`: the native went on with the `undefined` it was given,
-/// #129) or threw (a `conv_thrown` left pending), what one threw dropped
-/// with it, thrown by the redo. Not replay-checked (`Vm::conv_replays`: a
-/// getter's own calls of natives would all leave), but its conversions
-/// are (`Vm::conv_redone`): one doesn't run a writing native the redo
-/// would run again.
+/// `f`, a runtime call that may run a native (`String.prototype.trim` as
+/// `o.t`'s getter, a proxy's `has` trap, a `Symbol.hasInstance` method):
+/// 0, for the interpreter to redo the instruction, if a conversion needed
+/// a bytecode `valueOf` or `toString` (`Vm::conv_redo`: the native went on
+/// with the `undefined` it was given, #129) or threw (a `conv_thrown` left
+/// pending), what one threw dropped with it, thrown by the redo. Replay-
+/// checked (`Vm::conv_replays`): of the natives, only those that read run
+/// here (the built-ins' getters), the others left to the redo before they
+/// write what it would write again (`Object.assign` as a `get` trap).
 #[inline(always)]
 fn reading(vm: &mut crate::vm::Vm, f: impl FnOnce(&mut crate::vm::Vm) -> u64) -> u64 {
     vm.conv_redo = false;
-    let outer = std::mem::replace(&mut vm.conv_redone, true);
+    let outer = std::mem::replace(&mut vm.conv_replays, vm.native_top.is_null());
     let r = f(vm);
-    vm.conv_redone = outer;
+    vm.conv_replays = outer;
     if std::mem::take(&mut vm.conv_redo) || vm.conv_failed() {
         vm.drop_conv_error();
         return 0;

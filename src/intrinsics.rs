@@ -1270,7 +1270,9 @@ fn async_from_sync_done(_: &mut Vm, a: &[Value]) -> Result<Value> {
 /// result, unchecked (see [`delegate_done`]). A `throw` with no method
 /// closes the iterator, its errors thrown (IteratorClose); an
 /// `asynchronous` one's `return()` result is the step's, to await, the
-/// record marked closed ([`async_delegate_closed`]).
+/// record marked closed ([`async_delegate_closed`]); so is an
+/// `asynchronous` `return` with no method's `received`, the record marked
+/// done.
 /// (`record`'s `next`, read once; `throw` and `return` as they are then.)
 fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchronous: bool) -> Result<Value> {
     let (it, next) = crate::symbol::record_parts(record);
@@ -1283,6 +1285,12 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchr
     };
     if m.is_undefined() || m.is_null() {
         match mode {
+            // (`Await(received)`, not of an iterator result: ECMA-262
+            // 15.5.5 step 7.c.iii.)
+            crate::generator::RETURN if asynchronous => {
+                crate::symbol::set_sync_done(record, true);
+                return Ok(received);
+            }
             crate::generator::RETURN => return crate::symbol::iter_result(vm, received, true),
             crate::generator::THROW if asynchronous => {
                 let a_return = vm.intern_name("return");

@@ -9544,6 +9544,42 @@ fn views_see_another_agents_grow() {
     assert_eq!(value(src), "true,0,true,16,0,60,0");
 }
 
+/// Another agent's grow, seen once it happens before through a waiter
+/// list's critical section: the agent's `notify` and, later, this one's
+/// `wait` that times out, `waitAsync` with no time, `notify`, an async
+/// waiter that times out (they kept the old length). (The agent's plain
+/// store, after its `notify`, only orders them in time.)
+#[test]
+fn views_see_a_grow_through_a_critical_section() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    for (i, what) in ["Atomics.wait(ia, 0, 0, 0)", "Atomics.waitAsync(ia, 0, 0, 0).value", "Atomics.notify(ia, 0)", "await Atomics.waitAsync(ia, 0, 0, 1).value"]
+        .iter()
+        .enumerate()
+    {
+        let src = format!(
+            r#"
+            $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {{
+                sab.grow(64);
+                new Int32Array(sab)[15] = 7;
+                Atomics.notify(new Int32Array(sab), 0);
+                new Int32Array(sab)[1] = 1;
+                $262.agent.leaving();
+            }});`);
+            var sab = new SharedArrayBuffer(16, {{ maxByteLength: 64 }});
+            var ia = new Int32Array(sab);
+            $262.agent.broadcast(sab);
+            while (ia[1] === 0) $262.agent.sleep(1);
+            (async function () {{ globalThis.out = [{what}, ia.length, ia[15]].join(); }})();
+        "#
+        );
+        let mut vm = Vm::new();
+        vm.run(&cloison::js::compile(&src).unwrap()).unwrap();
+        let r = vm.run(&cloison::js::compile("out").unwrap()).map(display).unwrap();
+        let outcome = if i == 2 { "0" } else { "timed-out" };
+        assert_eq!(r, format!("{outcome},16,7"), "{what}");
+    }
+}
+
 /// `Promise.allKeyed` and `allSettledKeyed`: an object's own enumerable
 /// properties' values awaited, by the same keys.
 #[test]

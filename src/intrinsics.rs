@@ -415,6 +415,10 @@ fn define_named_field(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn define_accessor(vm: &mut Vm, a: &[Value], set: bool) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
     let f = arg(a, 2);
+    // (A literal's are all computed; a class's only with the flag.)
+    if arg(a, 3).is_undefined() || a[3] == Value::TRUE {
+        set_function_name(vm, f, key, if set { "set" } else { "get" })?;
+    }
     let d = Desc {
         get: (!set).then_some(f),
         set: set.then_some(f),

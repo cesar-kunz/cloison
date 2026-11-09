@@ -2187,8 +2187,8 @@ impl<'a> Parser<'_, 'a, '_> {
                     if named {
                         if let Some((params, body)) = header(self.toks, self.i) {
                             // (Perhaps a call and a block after it, or an
-                            // `if`: its names referred to here too.)
-                            if self.toks[body - 1].newline_before || matches!(name, Tok::Keyword("if" | "while" | "switch")) {
+                            // `if` or `for`: its names referred to here too.)
+                            if self.toks[body - 1].newline_before || matches!(name, Tok::Keyword("if" | "for" | "while" | "switch")) {
                                 frames.last_mut().unwrap().refs.extend_from_slice(&params);
                             }
                             level += 1;

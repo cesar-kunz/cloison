@@ -582,6 +582,13 @@ pub(crate) fn sync_record(vm: &mut Vm, it: Value) -> Result<Value> {
     record_with(vm, it, Some(Value::FALSE))
 }
 
+/// A [`record`] of async iterator `it`: a third slot, whether `yield*`
+/// closed it for a `throw()` it has no method for (kept as a
+/// [`sync_record`]'s `done`: [`set_sync_done`]).
+pub(crate) fn async_record(vm: &mut Vm, it: Value) -> Result<Value> {
+    record_with(vm, it, Some(Value::FALSE))
+}
+
 fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     let a_next = vm.intern_name("next");
     let next = vm.get(it, a_next)?;

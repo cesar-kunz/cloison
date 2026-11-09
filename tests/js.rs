@@ -5854,6 +5854,68 @@ t;";
     assert!(st.exits <= 5, "{st:?}");
 }
 
+#[test]
+fn an_intrinsic_leaves_a_script_s_loops_compiled() {
+    // `class {}` and the destructuring are intrinsics: the script's loop
+    // is compiled all the same, and `g`, which it calls (#125: neither
+    // was; nothing logged with `CLOISON_JIT_LOG`).
+    let src = "var C = class {};
+var [p, q] = [1, 2];
+function g(i) { return i + p; }
+var s = 0;
+for (var i = 0; i < 100000; i++) s += g(i);
+s + q;";
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(1000);
+    assert_eq!(display(vm.run(&m).unwrap()), "5000050002");
+    let st = vm.jit_stats("<script>").expect("the script compiled");
+    assert!(st.compiles >= 1, "{st:?}");
+}
+
+#[test]
+fn intrinsics_in_compiled_loops_throw_and_return_as_interpreted() {
+    // Each loop compiled, with intrinsics (spread, templates, `**`,
+    // destructuring, classes, private names) in it, some of them throwing
+    // at times; the same values as interpreted.
+    let src = "class A { #p = 1; constructor(x) { this.x = x; } get d() { return this.x * 2; } pget(o) { return o.#p; } }
+class B extends A { constructor(x) { super(x); this.y = x + 1; } m() { return super.d + this.y; } }
+function h(a, b, c) { return a + b + c; }
+function f(n) {
+  var s = 0, t = '', errs = 0;
+  for (var i = 0; i < n; i++) {
+    var [x, y = 2] = [i];
+    var { a, ...rest } = { a: i, b: 1 };
+    s += x + y + a + rest.b + i ** 2 % 3 + h(...[i, 1, 2]);
+    t = `${x}-${y}`;
+    try { if (i % 100 == 50) { var [w] = {}; } } catch (e) { errs++; }
+    try { if (i % 100 == 60) A(); } catch (e) { errs++; }
+  }
+  return s + t + errs;
+}
+var r = '';
+for (var k = 0; k < 20; k++) r = f(1000 + k);
+var acc = 0, errs = 0;
+for (var i = 0; i < 5000; i++) {
+  var b = new B(i);
+  var [u, v] = [i, b.m()];
+  acc += u + v + b.d;
+  try { b.pget({}); } catch (e) { errs++; }
+  try { var { z } = null; } catch (e) { errs++; }
+}
+function thrower(n) { for (var i = 0; i < n; i++) { var [x] = i < n - 1 ? [i] : 0; } return 'no'; }
+var caught = 0;
+for (var k = 0; k < 20; k++) { try { thrower(2000); } catch (e) { if (e instanceof TypeError) caught++; } }
+[r, acc, errs, caught].join();";
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(100);
+    let v = display(vm.run(&m).unwrap());
+    assert_eq!(v, "15628061018-220,74990000,10000,20");
+    assert!(vm.jit_stats("f").is_some_and(|s| s.compiles >= 1));
+    assert!(vm.jit_stats("thrower").is_some_and(|s| s.compiles >= 1));
+}
+
 /// Runs `src` tiering up after 1000 back edges (the default, whatever
 /// `CLOISON_TIER` says); returns its value and `function`'s stencils.
 fn compiled(src: &str, function: &str) -> (String, Vec<String>) {

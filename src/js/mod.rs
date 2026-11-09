@@ -132,7 +132,8 @@ pub fn compile_strict_eval(src: &str) -> Result<Module, String> {
     r
 }
 
-/// Compile `src` as direct `eval`'s code (`strict`: the caller is), in
+/// Compile `src` as direct `eval`'s code (`strict`: the caller is;
+/// `new_target`: it has a `new.target`, see `parse::parse_source_as`), in
 /// `withs` `with` statements: its names looked up in their objects, then
 /// in the caller's scope object (see `intrinsics::direct_eval`). Or, with
 /// `bound` (`ast::Program::eval_upvalues`), in the caller's bindings, its
@@ -140,6 +141,7 @@ pub fn compile_strict_eval(src: &str) -> Result<Module, String> {
 pub fn compile_direct_eval(
     src: &str,
     strict: bool,
+    new_target: bool,
     withs: usize,
     global: bool,
     bound: &[(ast::Name, u8, ast::Name)],
@@ -147,7 +149,7 @@ pub fn compile_direct_eval(
     let source: Rc<str> = src.into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source_as(src, &arena, skim, Some((strict, withs, !bound.is_empty(), global))).and_then(|mut p| {
+        parse::parse_source_as(src, &arena, skim, Some((strict, withs, !bound.is_empty(), global, new_target))).and_then(|mut p| {
             p.eval_upvalues = bound.to_vec();
             codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
         })

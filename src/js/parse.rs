@@ -60,8 +60,9 @@ thread_local! {
 }
 
 /// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, and
-/// in that many `with` statements).
-pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize, bool, bool)>) -> Result<Program<'a>, Error> {
+/// in that many `with` statements; last, whether its caller has a
+/// `new.target`).
+pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize, bool, bool, bool)>) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
@@ -102,7 +103,7 @@ fn parse_pass<'a>(
     keep: bool,
     table: Option<Table>,
     prev: Option<&Program<'a>>,
-    eval: Option<(bool, usize, bool, bool)>,
+    eval: Option<(bool, usize, bool, bool, bool)>,
     module: Option<i32>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
@@ -127,7 +128,7 @@ fn parse_pass<'a>(
         privates: Vec::new(),
         super_fns: Vec::new(),
         redeclared: None,
-        in_eval: eval.is_some(),
+        in_eval: eval.is_some_and(|(.., new_target)| new_target),
         using_scopes: Vec::new(),
         param_refs: Vec::new(),
         static_blocks: Vec::new(),
@@ -190,7 +191,7 @@ fn parse_pass<'a>(
     });
     p.functions[0].strict =
         p.directive_prologue() || eval.is_some_and(|(strict, ..)| strict) || module.is_some() || STRICT.get();
-    if let Some((_, withs, bound, global)) = eval {
+    if let Some((_, withs, bound, global, _)) = eval {
         // The scope object of the function calling it (its parameters and
         // `var`s, those `eval`s declared), the caller's scope object (the
         // other bindings it sees: see `intrinsics::eval_scope`), the
@@ -242,7 +243,8 @@ fn parse_pass<'a>(
             eval_locals: false,
             script: eval.is_none() && module.is_none(),
             eval_upvalues: Vec::new(),
-            eval_global: eval.is_some_and(|(.., global)| global),
+            eval_global: eval.is_some_and(|(.., global, _)| global),
+            eval_new_target: eval.is_some_and(|(.., new_target)| new_target),
             own_names: Vec::new(),
             imports: std::mem::take(&mut p.imports),
             module: module.map(|_| std::mem::take(&mut p.info)),
@@ -341,7 +343,9 @@ struct Parser<'t, 'a, 'p> {
     super_fns: Vec<(Name, usize)>,
     /// Each function's parameters' names (destructured ones' too).
     param_names: Vec<(usize, Vec<Name>)>,
-    /// Direct `eval`'s code (whose `new.target` is its caller's).
+    /// Direct `eval`'s code whose caller has a `new.target` (in a
+    /// function, not an arrow of a script's or a module's top level): its
+    /// `new.target` the caller's.
     in_eval: bool,
     /// The statement lists being parsed that may have `using` declarations
     /// (a block's, a function body's: not a `case`'s, nor the script's,
@@ -2624,9 +2628,13 @@ impl<'a> Parser<'_, 'a, '_> {
                     // read `arguments`.
                     self.functions[self.current].has_eval = true;
                     let k = self.non_arrow();
-                    self.functions[k].uses_arguments = true;
-                    // (Its code may read `new.target`.)
-                    if k != 0 {
+                    // (Its code may read `new.target`, and `arguments`:
+                    // a function's, not a module's, which has neither.)
+                    let function = k != 0 && !self.functions[k].module;
+                    if k == 0 || function {
+                        self.functions[k].uses_arguments = true;
+                    }
+                    if function {
                         self.functions[k].uses_new_target = true;
                     }
                     if self.functions[self.current].arrow {
@@ -2648,7 +2656,7 @@ impl<'a> Parser<'_, 'a, '_> {
                             let end = self.toks[self.i - 1].pos;
                             // (In an arrow, the function's `arguments` and
                             // `new.target` it sees too.)
-                            let extra: &[&str] = if k != self.current && k != 0 { &["arguments", "%newtarget"] } else { &[] };
+                            let extra: &[&str] = if k != self.current && function { &["arguments", "%newtarget"] } else { &[] };
                             let f = self.eval_bindings(&visible, extra, end);
                             visible.push(Expr { kind: ExprKind::Function(f), pos });
                             args.push(Expr { kind: ExprKind::Intrinsic("%eval_scope", visible), pos });

@@ -911,6 +911,13 @@ impl Heap {
         unsafe { std::ptr::replace(self.base as *mut *mut crate::vm::Vm, vm) }
     }
 
+    /// No more than `bytes` more of fresh blocks (`usize::MAX`: the whole
+    /// slice), for tests (`CLOISON_HEAP_LIMIT` is the process's).
+    #[cfg(test)]
+    pub(crate) fn limit_growth(&mut self, bytes: usize) {
+        self.limit = (self.top * BLOCK).saturating_add(bytes).min(SLICE);
+    }
+
     /// `n` contiguous blocks never used before: the first's index.
     fn fresh_blocks(&mut self, n: usize) -> usize {
         let b = self.top;

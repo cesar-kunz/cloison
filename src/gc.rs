@@ -179,6 +179,11 @@ pub struct Gc {
     pub(crate) external_full: bool,
     /// A concurrent full collection is marking.
     pub(crate) marking: bool,
+    /// A collection (`Vm::collect_from`) began and hasn't ended: while one
+    /// runs, and for good once a panic unwound out of one (the heap limit
+    /// reached copying a cell out while evacuating), whose heap is half
+    /// collected, in no state to run again (see `Vm::poisoned`; #143).
+    pub(crate) unfinished: bool,
     /// The [`CODE_EPOCH`] the current or last full marking began in: the
     /// codes it found live are marked with it or later.
     codes_from: u32,
@@ -307,6 +312,13 @@ impl Gc {
                 .max(1),
             ..Default::default()
         }
+    }
+
+    /// Whether full collections move cells (as `CLOISON_GC_EVACUATE=0`
+    /// does, off; for tests).
+    #[cfg(test)]
+    pub(crate) fn set_evacuate(&mut self, on: bool) {
+        self.evacuate = if on { Evacuate::Fragmented } else { Evacuate::Off };
     }
 
     /// See `Vm::set_gc_evacuate_all`.
@@ -2050,6 +2062,7 @@ impl Vm {
 
     /// A collection, the native stack's live part starting at `sp`.
     fn collect_from(&mut self, sp: usize, regs: *mut Value, kind: Collection) {
+        self.heap.gc.unfinished = true;
         let start = std::time::Instant::now();
         let check = self.heap.gc.checking();
         HEAP_PEAK.fetch_max(self.heap.allocated() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2371,6 +2384,7 @@ impl Vm {
         if self.heap.gc.stress {
             self.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        self.heap.gc.unfinished = false;
     }
 
     /// The weak collections' ephemerons, once marking has found what the

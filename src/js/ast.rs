@@ -336,6 +336,9 @@ pub const EVAL_OUTER: u8 = 16;
 /// have one).
 pub const EVAL_STRICT: u8 = 1;
 pub const EVAL_NEW_TARGET: u8 = 2;
+/// (And the call's arguments in an array, for a spread or more than one:
+/// the source its first.)
+pub const EVAL_ARGS: u8 = 4;
 
 /// The start of the name of the exception a statement list with `using`
 /// declarations catches (see `Parser::lower_using`): its `try` statement

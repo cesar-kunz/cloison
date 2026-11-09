@@ -5057,7 +5057,6 @@ impl<'a> Gen<'a> {
             // (A sloppy script's own, with no block-scoped names, an
             // indirect one's; a strict script's has its own `var`s.)
             && (self.index != 0 || self.p.direct_eval || self.f.strict || script_lexicals())
-            && !args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)))
         {
             // Direct `eval`: `[eval, source, scope object, this, strict,
             // in parameters, scope for its declarations, with objects…]`.
@@ -5079,21 +5078,27 @@ impl<'a> Gen<'a> {
             let mark = self.temp;
             let fr = self.alloc(pos)?;
             self.into(f, fr)?;
+            // (With a spread, or more than one: all of them in an array,
+            // `EVAL_ARGS`, the source its first, or for an `eval` not the
+            // builtin the call's arguments.)
             let src = self.alloc(pos)?;
+            let packed = args.len() > 1 || args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)));
             match args.first() {
+                _ if packed => self.args_array(args, src, pos)?,
                 Some(a) => self.into(a, src)?,
                 None => {
                     self.emit(Op::LdaUndefined, &[]);
                     self.star(src);
                 }
             }
-            for a in args.iter().skip(1) {
-                self.effect(a)?;
-            }
+            let packed = if packed { EVAL_ARGS } else { 0 };
             // A strict script's own: an indirect one's, strict (its
             // `var`s its own, no `new.target`, the global names).
             if self.index == 0 && !self.p.direct_eval && !script_lexicals() {
-                self.intrinsic("strict_eval", fr, 2);
+                let flags = self.alloc(pos)?;
+                self.emit(Op::LdaSmi, &[Arg::Imm(packed as i32)]);
+                self.star(flags);
+                self.intrinsic("strict_eval", fr, 3);
                 self.temp = mark;
                 return Ok(());
             }
@@ -5124,7 +5129,7 @@ impl<'a> Gen<'a> {
             }
             let new_target = if k == 0 { self.p.direct_eval && self.p.eval_new_target } else { !self.p.functions[k].module };
             let strict = self.alloc(pos)?;
-            let flags = if self.f.strict { EVAL_STRICT } else { 0 } | if new_target { EVAL_NEW_TARGET } else { 0 };
+            let flags = if self.f.strict { EVAL_STRICT } else { 0 } | if new_target { EVAL_NEW_TARGET } else { 0 } | packed;
             self.emit(Op::LdaSmi, &[Arg::Imm(flags as i32)]);
             self.star(strict);
             let params = self.alloc(pos)?;

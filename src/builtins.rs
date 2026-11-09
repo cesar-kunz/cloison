@@ -9,7 +9,7 @@ use crate::interp::{to_number, to_string_units};
 use crate::jit::Ty;
 use crate::object::{Class, DONT_DELETE, DONT_ENUM, Object, READ_ONLY, as_object, object_value};
 use crate::value::Value;
-use crate::vm::{Error, NativeFn, Result, Vm, check_string_len, number_to_string, push_string, string_len, string_units, wrapped};
+use crate::vm::{Error, NativeFn, Result, Vm, check_string_len, is_string, number_to_string, push_string, string_len, string_units, wrapped};
 
 /// The kinds of error objects, in `Vm::error_prototypes` order. The
 /// runtime's own errors (`Error::type_error`, …) are caught as objects of
@@ -410,7 +410,7 @@ fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let construct = vm.is_construct();
     let s = match a.first() {
         None => vm.new_string(&[]),
-        Some(&v) if string_units(v).is_some() => v,
+        Some(&v) if is_string(v) => v,
         // (`String(symbol)` is its description; `new String(symbol)` throws.)
         Some(&v) if crate::symbol::is_symbol(v) && !construct => {
             return crate::symbol::symbol_string_value(vm, v);
@@ -865,7 +865,7 @@ fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `this` as a string value (itself if one).
 fn this_string(vm: &mut Vm, this: Value, u: &[u16]) -> Value {
-    if string_units(this).is_some() { this } else { vm.new_string(u) }
+    if is_string(this) { this } else { vm.new_string(u) }
 }
 
 fn string_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
@@ -879,11 +879,11 @@ fn string_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 pub(crate) fn string_to_string(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    if string_units(this).is_some() {
+    if is_string(this) {
         return Ok(this);
     }
     match wrapped(this) {
-        Some(s) if string_units(s).is_some() => Ok(s),
+        Some(s) if is_string(s) => Ok(s),
         _ => Err(Error::type_error("String.prototype.toString called on a non-string")),
     }
 }
@@ -2749,7 +2749,7 @@ fn regexp_exec(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // if that ran user code.)
     let re = this_regexp(this)?;
     let x = arg(a, 0);
-    let quiet = string_units(x).is_some();
+    let quiet = is_string(x);
     // (ToString: no argument is "undefined", a symbol throws.)
     let input = if quiet { x } else { crate::intrinsics::to_string(vm, x)? };
     let re = if quiet { re } else { this_regexp(this)? };
@@ -2773,7 +2773,7 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     }
     let re = this_regexp(this)?;
     let x = arg(a, 0);
-    let quiet = string_units(x).is_some();
+    let quiet = is_string(x);
     // (Its pattern once the input is converted, if that ran user code;
     // ToString: a symbol throws, Codex on #38.)
     let input = if quiet { x } else { crate::intrinsics::to_string(vm, x)? };
@@ -2782,7 +2782,7 @@ fn regexp_test(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     with_caps(vm, |vm, caps| {
         let found = regexp_match_into(vm, this, re, &s, caps)?.is_some();
         if found {
-            let input = if string_units(input).is_some() { input } else { string(vm, &s) };
+            let input = if is_string(input) { input } else { string(vm, &s) };
             note_legacy(vm, this, input, caps);
         }
         Ok(Value::from_bool(found))
@@ -3349,7 +3349,7 @@ fn error_stack_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Error.prototype.stack setter called on a non-object"));
     }
     let v = arg(a, 0);
-    if string_units(v).is_none() {
+    if !is_string(v) {
         return Err(Error::type_error("Error.prototype.stack must be set to a string"));
     }
     let o = as_object(this);

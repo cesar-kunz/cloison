@@ -16,7 +16,7 @@ use crate::object::{DONT_ENUM, Object, object_value};
 use crate::props::is_object;
 use crate::temporal::to_rust_string;
 use crate::value::Value;
-use crate::vm::{Error, Result, Vm, string_units};
+use crate::vm::{Error, Result, Vm, is_string};
 
 /// The locale `Intl` takes when none asked for is available
 /// (DefaultLocale), one the data must have.
@@ -84,7 +84,7 @@ fn canonicalize_locale_list(vm: &mut Vm, locales: Value) -> Result<Vec<String>> 
         return Ok(Vec::new());
     }
     let mut seen = Vec::new();
-    if string_units(locales).is_some() {
+    if is_string(locales) {
         seen.push(canonical_tag(&to_rust_string(vm, locales)?)?);
         return Ok(seen);
     }
@@ -98,7 +98,7 @@ fn canonicalize_locale_list(vm: &mut Vm, locales: Value) -> Result<Vec<String>> 
         let key = Value::number(k);
         if vm.has_property(o, key)? {
             let v = vm.get_keyed(o, key)?;
-            if string_units(v).is_none() && !is_object(v) {
+            if !is_string(v) && !is_object(v) {
                 return Err(Error::type_error("a locale must be a string or an object"));
             }
             let tag = canonical_tag(&to_rust_string(vm, v)?)?;

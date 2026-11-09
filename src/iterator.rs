@@ -221,7 +221,7 @@ fn iterator_method(vm: &mut Vm, v: Value) -> Result<Value> {
 /// `@@iterator`), and that iterator's `next`. A primitive is a TypeError
 /// (but a string, with `strings`).
 fn flattenable(vm: &mut Vm, v: Value, strings: bool) -> Result<(Value, Value)> {
-    if !is_object(v) && !(strings && crate::vm::string_units(v).is_some()) {
+    if !is_object(v) && !(strings && crate::vm::is_string(v)) {
         return Err(Error::type_error(format!("{} is not an object", crate::vm::shown(v))));
     }
     let m = iterator_method(vm, v)?;

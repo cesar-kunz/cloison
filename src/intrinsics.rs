@@ -145,7 +145,7 @@ pub(crate) fn to_property_key(vm: &mut Vm, v: Value) -> Result<Key> {
     if crate::symbol::is_symbol(v) {
         return Ok(Key::Name(crate::symbol::symbol_atom(vm, v)));
     }
-    let v = if v.is_cell() && crate::vm::string_units(v).is_none() {
+    let v = if v.is_cell() && !crate::vm::is_string(v) {
         let p = crate::interp::to_primitive_string(v);
         if vm.conv_thrown {
             return Err(vm.take_conv_error());

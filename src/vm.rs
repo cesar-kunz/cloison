@@ -8080,6 +8080,12 @@ fn canonical_index(units: &[u16]) -> Option<u32> {
     (n < u32::MAX as u64).then_some(n as u32)
 }
 
+/// Whether `v` is a string, without flattening it (as `string_units`
+/// would a cons string).
+pub(crate) fn is_string(v: Value) -> bool {
+    string_len(v).is_some()
+}
+
 /// A string's length without flattening it (see [`Vm::new_cons`]).
 pub(crate) fn string_len(v: Value) -> Option<usize> {
     if !v.is_cell() {

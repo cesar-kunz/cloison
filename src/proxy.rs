@@ -550,7 +550,7 @@ pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
     let mut i = 0.0;
     while i < n {
         let k = vm.get_keyed(r, Value::number(i))?;
-        if crate::vm::string_units(k).is_none() && !crate::symbol::is_symbol(k) {
+        if !crate::vm::is_string(k) && !crate::symbol::is_symbol(k) {
             return Err(Error::type_error("The proxy's 'ownKeys' trap gave a key neither a string nor a symbol"));
         }
         let key = crate::intrinsics::to_property_key(vm, k)?;

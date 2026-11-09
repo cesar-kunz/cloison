@@ -1297,9 +1297,9 @@ impl Parser<'_> {
         if min > max {
             return Err(self.error("numbers out of order in {} quantifier"));
         }
-        // (A lookahead may be, outside `u` mode: Annex B.)
+        // (A lookahead may be, outside `u` mode: Annex B; a lookbehind never.)
         if matches!(atom, Node::Start(_) | Node::End(_) | Node::Boundary(..))
-            || matches!(atom, Node::Look(..)) && self.unicode
+            || matches!(atom, Node::Look(_, _, behind) if self.unicode || behind)
         {
             return Err(self.error("Nothing to repeat"));
         }

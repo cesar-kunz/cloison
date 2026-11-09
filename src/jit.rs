@@ -595,13 +595,37 @@ extern "C" fn cloison_rt_loose_eq(a: Value, b: Value) -> u64 {
 
 /// `a[b]` for any `a` (a string, a typed array, …: what `get_keyed`
 /// stencils don't read themselves), or 0 where it would throw or call a
-/// function (the interpreter does), as an object key's ToPropertyKey may.
+/// function (the interpreter does), as an object key's ToPropertyKey may,
+/// or a native getter's conversion (see [`reading`]).
 extern "C" fn cloison_rt_get_keyed(a: Value, b: Value) -> u64 {
     if crate::props::is_object(b) {
         return 0;
     }
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.get_keyed(a, b).map_or(0, |v| v.to_bits())
+    reading(vm, |vm| vm.get_keyed(a, b).map_or(0, |v| v.to_bits()))
+}
+
+/// `f`, a runtime call that may run a native converting what it is given
+/// (`String.prototype.trim` as `o.t`'s getter, a proxy's `has` trap, a
+/// `Symbol.hasInstance` method): 0, for the interpreter to redo the
+/// instruction, if a conversion needed a bytecode `valueOf` or `toString`
+/// (`Vm::conv_redo`: the native went on with the `undefined` it was given,
+/// #129) or threw (a `conv_thrown` left pending), what one threw dropped
+/// with it, thrown by the redo. Not replay-checked (`Vm::conv_replays`: a
+/// getter's own calls of natives would all leave), but its conversions
+/// are (`Vm::conv_redone`): one doesn't run a writing native the redo
+/// would run again.
+#[inline(always)]
+fn reading(vm: &mut crate::vm::Vm, f: impl FnOnce(&mut crate::vm::Vm) -> u64) -> u64 {
+    vm.conv_redo = false;
+    let outer = std::mem::replace(&mut vm.conv_redone, true);
+    let r = f(vm);
+    vm.conv_redone = outer;
+    if std::mem::take(&mut vm.conv_redo) || vm.conv_failed() {
+        vm.drop_conv_error();
+        return 0;
+    }
+    r
 }
 
 /// A new closure of `callee` (a `Code`) taking its upvalues from function
@@ -665,13 +689,14 @@ extern "C" fn cloison_rt_arguments_of(array: Value, func: Value) -> u64 {
 }
 
 /// `delete a[b]` (`delete_m` stencils): a boolean; 0 where it throws or
-/// would call a function (an object key's ToPropertyKey).
+/// would call a function (an object key's ToPropertyKey), or a proxy's
+/// native trap's conversion would (see [`reading`]).
 extern "C" fn cloison_rt_delete(a: Value, b: Value) -> u64 {
     if crate::props::is_object(b) {
         return 0;
     }
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.delete_property(a, b).map_or(0, |r| Value::from_bool(r).to_bits())
+    reading(vm, |vm| vm.delete_property(a, b).map_or(0, |r| Value::from_bool(r).to_bits()))
 }
 
 /// `delete g`, `b` the global's name (`delete_global_m` stencils).
@@ -768,11 +793,12 @@ extern "C" fn cloison_rt_set_keyed(args: Value, _: Value) -> u64 {
 }
 
 /// `o.name` (`name` an `Atom`), or 0 where it would throw or call a
-/// bytecode getter (`get_named_rt` stencils).
+/// bytecode getter, or a native one's conversion would (`get_named_rt`
+/// stencils; see [`reading`]).
 extern "C" fn cloison_rt_get_named(o: Value, name: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let name = crate::object::Atom(name.to_bits() as u32);
-    let v = vm.get_named_rt(o, name).map_or(0, |v| v.to_bits());
+    let v = reading(vm, |vm| vm.get_named_rt(o, name).map_or(0, |v| v.to_bits()));
     if v != 0 {
         vm.mega_note(o, name);
     }
@@ -799,13 +825,18 @@ extern "C" fn cloison_rt_set_named(args: Value, _: Value) -> u64 {
     u64::from(ok)
 }
 
-/// `a instanceof b`, or 0 where it would throw (the interpreter does).
+/// `a instanceof b`, or 0 where it would throw (the interpreter does), or
+/// a native `Symbol.hasInstance`'s conversion would call a function (see
+/// [`reading`]).
 extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
     let a = unsafe { std::slice::from_raw_parts(args.to_bits() as *const Value, 3) };
     let (v, f, cache) = (a[0], a[1], a[2].to_bits() as *const InstanceOfCache);
-    let Ok(r) = vm.instance_of(v, f) else { return 0 };
-    let r = Value::from_bool(r);
+    let r = reading(vm, |vm| vm.instance_of(v, f).map_or(0, |r| Value::from_bool(r).to_bits()));
+    if r == 0 {
+        return 0;
+    }
+    let r = Value::from_bits(r);
     // The site's cache: the receiver's shape and the prototype, read as the
     // stencil reads them (see `test_instanceof_m`).
     if !cache.is_null() && v.is_cell() {
@@ -828,13 +859,14 @@ extern "C" fn cloison_rt_instance_of(args: Value, _: Value) -> u64 {
 }
 
 /// `a in b`, or 0 where it would throw or call a function, as an object
-/// key's ToPropertyKey may (the interpreter does).
+/// key's ToPropertyKey may, or a proxy's native `has` trap's conversion
+/// (the interpreter does; see [`reading`]).
 extern "C" fn cloison_rt_in(a: Value, b: Value) -> u64 {
     if crate::props::is_object(a) {
         return 0;
     }
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.has_property(b, a).map_or(0, |r| Value::from_bool(r).to_bits())
+    reading(vm, |vm| vm.has_property(b, a).map_or(0, |r| Value::from_bool(r).to_bits()))
 }
 
 extern "C" fn cloison_rt_to_boolean(a: Value, _: Value) -> bool {

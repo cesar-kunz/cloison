@@ -78,6 +78,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("async_iterator_closed", async_iterator_closed),
     ("async_iterator_close_quiet", async_iterator_close_quiet),
     ("async_delegate_step", async_delegate_step),
+    ("async_delegate_closed", async_delegate_closed),
     ("async_from_sync_done", async_from_sync_done),
     ("eval_scope", eval_scope),
     ("eval_scope_get", eval_scope_get),
@@ -1191,7 +1192,7 @@ fn generator_mode(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// whose mode is read only here (no call per step to fetch it).
 fn delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let mode = generator_mode(vm, &a[2..])?;
-    delegate_call(vm, a[0], a[1], mode.as_number().unwrap_or(0.0) as i32)
+    delegate_call(vm, a[0], a[1], mode.as_number().unwrap_or(0.0) as i32, false)
 }
 
 /// An async generator's `yield*` step: `[iterator, received, mode,
@@ -1202,7 +1203,17 @@ fn async_delegate_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if a[3] == Value::TRUE {
         return async_from_sync_call(vm, a[0], Some(a[1]), mode);
     }
-    delegate_call(vm, a[0], a[1], mode)
+    delegate_call(vm, a[0], a[1], mode, true)
+}
+
+/// `[record]`, an async iterator's, after a `yield*`'s `throw` step: the
+/// TypeError for the `throw` it has no method for if that step closed it
+/// instead (its `return()`'s result awaited first: AsyncIteratorClose).
+fn async_delegate_closed(_: &mut Vm, a: &[Value]) -> Result<Value> {
+    if crate::symbol::sync_done(a[0]) {
+        return Err(Error::type_error("The iterator does not provide a 'throw' method"));
+    }
+    Ok(Value::UNDEFINED)
 }
 
 /// `%AsyncFromSyncIteratorPrototype%`'s `next`, `throw` or `return`
@@ -1256,9 +1267,11 @@ fn async_from_sync_done(_: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// `iterator.next(received)` (or with `mode`, `throw` or `return`): the
-/// result.
+/// result. A `throw` with no method closes the iterator, its errors thrown
+/// (IteratorClose); an `asynchronous` one's `return()` result is the
+/// step's, to await, the record marked closed ([`async_delegate_closed`]).
 /// (`record`'s `next`, read once; `throw` and `return` as they are then.)
-fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Result<Value> {
+fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32, asynchronous: bool) -> Result<Value> {
     let (it, next) = crate::symbol::record_parts(record);
     let m = match mode {
         crate::generator::THROW | crate::generator::RETURN => {
@@ -1270,8 +1283,21 @@ fn delegate_call(vm: &mut Vm, record: Value, received: Value, mode: i32) -> Resu
     if m.is_undefined() || m.is_null() {
         match mode {
             crate::generator::RETURN => return crate::symbol::iter_result(vm, received, true),
+            crate::generator::THROW if asynchronous => {
+                let a_return = vm.intern_name("return");
+                let close = vm.get(it, a_return)?;
+                if !close.is_undefined() && !close.is_null() {
+                    if !crate::props::is_callable(close) {
+                        return Err(Error::type_error("iterator.return is not a function"));
+                    }
+                    let r = call_function(vm, close, it, &[])?;
+                    crate::symbol::set_sync_done(record, true);
+                    return Ok(r);
+                }
+                return Err(Error::type_error("The iterator does not provide a 'throw' method"));
+            }
             crate::generator::THROW => {
-                let _ = crate::symbol::close(vm, it);
+                crate::symbol::close(vm, it)?;
                 return Err(Error::type_error("The iterator does not provide a 'throw' method"));
             }
             _ => {}
@@ -1523,7 +1549,7 @@ fn get_async_iterator(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if !crate::props::is_object(it) {
         return Err(Error::type_error("Result of the Symbol.asyncIterator method is not an object"));
     }
-    crate::symbol::record(vm, it)
+    crate::symbol::async_record(vm, it)
 }
 
 /// `[record, sync]`: `iterator.next()`, by the `next` the record read (a

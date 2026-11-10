@@ -85,8 +85,24 @@ pub struct FunctionDef {
     /// Its `length` property.
     pub length: u32,
     /// Its source text: the source and the span in it, for
-    /// `Function.prototype.toString`.
-    pub text: Option<(std::rc::Rc<str>, u32, u32)>,
+    /// `Function.prototype.toString`; the source as
+    /// `js::lex::units_to_string` has its code units (see
+    /// [`FunctionDef::text_units`]).
+    pub(crate) text: Option<(std::rc::Rc<str>, u32, u32)>,
+}
+
+impl FunctionDef {
+    /// Its source text's code units (`Function.prototype.toString`'s), if
+    /// it has one.
+    pub fn text_units(&self) -> Option<Vec<u16>> {
+        text_units(&self.text)
+    }
+}
+
+/// The code units of source text `text` (see [`FunctionDef::text`]).
+pub(crate) fn text_units(text: &Option<(std::rc::Rc<str>, u32, u32)>) -> Option<Vec<u16>> {
+    let (src, a, b) = text.as_ref()?;
+    Some(crate::js::lex::to_units(src.get(*a as usize..*b as usize)?))
 }
 
 /// A function to compile when it is first called: its text in the source
@@ -94,10 +110,12 @@ pub struct FunctionDef {
 /// `js::compile_lazy`).
 #[derive(Clone, Debug)]
 pub struct LazyFn {
-    pub source: std::rc::Rc<str>,
-    /// The parameter list's `(`, and past the body's `}`.
-    pub start: u32,
-    pub end: u32,
+    /// The source, as `js::lex::units_to_string` has its code units (see
+    /// [`LazyFn::text_units`]).
+    pub(crate) source: std::rc::Rc<str>,
+    /// The parameter list's `(`, and past the body's `}`: offsets in `source`.
+    pub(crate) start: u32,
+    pub(crate) end: u32,
     /// A named function expression's name, bound in its body.
     pub own_name: Option<std::rc::Rc<str>>,
     pub upvalues: Vec<std::rc::Rc<str>>,
@@ -106,6 +124,14 @@ pub struct LazyFn {
     pub own_names: Vec<std::rc::Rc<str>>,
     /// Nested in strict code.
     pub strict: bool,
+}
+
+impl LazyFn {
+    /// The code units of its text: from its parameter list's `(` to past
+    /// its body's `}`.
+    pub fn text_units(&self) -> Vec<u16> {
+        crate::js::lex::to_units(&self.source[self.start as usize..self.end as usize])
+    }
 }
 
 /// A constant: a string or a number (one that isn't an int32).

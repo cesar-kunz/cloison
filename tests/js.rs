@@ -1456,6 +1456,30 @@ fn public_parsers_give_offsets_in_the_text() {
     }
 }
 
+/// `codegen::generate_lazy` takes a script's text, as `parse_source` does:
+/// a function it leaves to compile later, with a U+F0000, U+F0800 or
+/// U+FDD0 in its strings, regular expression and template, has them, and
+/// its `toString` and `LazyFn::text_units` are its text.
+#[test]
+fn generate_lazy_takes_text() {
+    use cloison::js::{ast::Arenas, codegen, parse};
+    for ch in ['\u{F0000}', '\u{F0800}', '\u{FDD0}'] {
+        let f = format!("function f() {{ return ['{ch}', /{ch}/u.source, `{ch}`, String.raw`{ch}`].map(s => s.codePointAt(0)).join() }}");
+        let text = format!("var a = '{ch}'; {f}\n[f(), f.toString() === {f:?}, a.codePointAt(0)].join(' ')");
+        let arena = Arenas::default();
+        let p = parse::parse_source(&text, &arena, true).unwrap();
+        let source: std::rc::Rc<str> = text.as_str().into();
+        let m = codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[]).unwrap();
+        let lazy = m.functions.iter().find_map(|g| g.lazy.as_ref()).expect("a function left for later");
+        assert_eq!(String::from_utf16(&lazy.text_units()).unwrap(), &f["function f".len()..]);
+        let mut vm = Vm::new();
+        // SAFETY: the front end's code, as `js::compile`'s.
+        let r = vm.run(&unsafe { cloison::asm::Checked::new_unchecked(m) }).unwrap();
+        let c = ch as u32;
+        assert_eq!(display(r), format!("{c},{c},{c},{c} true {c}"));
+    }
+}
+
 /// String methods' RegExp fast paths step aside where the spec's paths
 /// differ: a sticky separator splits as any, a RegExp whose `Symbol.<m>`
 /// is undefined is its string, redefined flags are what it has, and

@@ -16389,6 +16389,29 @@ log.join(" ");"#;
     );
 }
 
+/// A function declared in a block of a direct `eval`'s code sets the
+/// function's `var` by its name, not a `with` object's property by it
+/// around the `eval` (B.3.2.3: the VariableEnvironment's
+/// SetMutableBinding), nor through a nested `eval`, a function of the
+/// code, or many bindings. SpiderMonkey's and JSC's values.
+#[test]
+fn direct_eval_block_function_sets_the_var_in_a_with() {
+    let lets: String = (0..100).map(|i| format!("let z{i} = {i};")).collect();
+    let src = format!(
+        r#"
+var log = [];
+function t(f) {{ try {{ log.push(String(f())); }} catch (e) {{ log.push(e.name); }} }}
+var o = {{ f: 1 }};
+t(() => (function () {{ with (o) {{ eval('{{ function f() {{}} }}'); }} return typeof f + typeof o.f; }})());
+t(() => (function () {{ with (o) {{ eval('eval("{{ function f() {{}} }}")'); }} return typeof f + typeof o.f; }})());
+t(() => (function () {{ var f = 0; with (o) {{ eval('(function () {{ {{ function f() {{}} }} return typeof f; }})()'); }} return typeof f + typeof o.f; }})());
+t(() => (function () {{ {lets} with (o) {{ eval('{{ function f() {{}} }}'); }} return typeof f + typeof o.f + z99; }})());
+t(() => (function () {{ var s = ""; for (var i = 0; i < 3000; i++) with ({{ f: 1 }}) {{ eval('{{ function f() {{}} }}'); s = typeof f; }} return s; }})());
+log.join(" ");"#
+    );
+    assert_eq!(value(&src), "functionnumber functionnumber numbernumber functionnumber99 number");
+}
+
 /// `delete super.x` is a ReferenceError (13.5.1.2, a super reference),
 /// in strict code or not, in an arrow, in a direct `eval`'s code; after
 /// the key's expression is evaluated, but not made a property key, and

@@ -1902,8 +1902,9 @@ fn annex_b_blocked(vm: &mut Vm, scope: Value, key: Key) -> bool {
 /// which step 11 passes over), and `kind` that of the site's binding by
 /// the name, of code compiled for them (see `direct_eval_bound`). Not
 /// made where a block-scoped binding not a catch parameter has the name
-/// (`annex_b_blocked`); past a catch parameter of the name only, the
-/// function's `var` set, not the parameter.
+/// (`annex_b_blocked`); else the function's `var` set, in its scope
+/// object, not a catch parameter by the name nor a `with`'s object's
+/// property (B.3.2.3: the VariableEnvironment's SetMutableBinding).
 fn eval_annex_b(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let key = to_property_key(vm, a[1])?;
     let mut kinds = vec![a[3].as_number().unwrap_or(0.0) as i32];
@@ -1914,7 +1915,7 @@ fn eval_annex_b(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     if kinds.iter().any(|k| scoped(k) && k & EVAL_CATCH as i32 == 0) {
         return Ok(Value::TRUE);
     }
-    if !kinds.iter().any(scoped) || !crate::props::is_object(a[0]) {
+    if !crate::props::is_object(a[0]) {
         return Ok(Value::FALSE);
     }
     vm.set_key(a[0], key, a[2])?;

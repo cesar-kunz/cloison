@@ -3974,7 +3974,7 @@ fn select(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         sel.base = "nop";
         sel.case = "";
     } else if insn.check_only && sel.base.starts_with("get_") {
-        if matches!(sel.case, "nc" | "na") {
+        if matches!(sel.case, "nc" | "na" | "np") {
             sel.base = "nop";
         } else if let Some(c) = spec.props.get(i).and_then(|&p| Case::of(p)) {
             sel.base = "check_shape";
@@ -5051,10 +5051,18 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             // `get_keyed_i_nc` exited there: PdfJS's `this.widths[charcode]`,
             // 1,270 times a run.)
             let known = ix && matches!(reg, Ty::Obj(_) | Ty::Ext(_));
+            // A plain object's elements may be a mapped `arguments`
+            // object's, stale copies of its parameters while its frame
+            // runs (`object::MAPPED`): such an object may pass for any
+            // plain one (`extends`), so `np`, not `nc`, checks it isn't.
+            let plain = reg.shape().is_some_and(|s| unsafe {
+                (*(s as *const Shape)).class == crate::object::Class::Plain
+            });
             if prop == Prop::Runtime && known && !bytes {
                 out.acc = Any;
-                return Sel::new("get_keyed", "i_nc_rt", out);
+                return Sel::new("get_keyed", if plain { "i_np_rt" } else { "i_nc_rt" }, out);
             }
+            let (nc, i_nc) = if plain { ("np", "i_np") } else { ("nc", "i_nc") };
             if bytes || matches!(prop, Prop::Typed { .. } | Prop::Runtime) {
                 out.acc = Any;
                 let table = unsafe { (*crate::interp::current_vm()).single_chars_at() };
@@ -5064,14 +5072,14 @@ fn select_types(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
                 };
             }
             let (case, elems) = match (reg, prop) {
-                (Ty::Obj(s), _) => (pick("nc", "i_nc"), unsafe { (*(s as *const Shape)).elems }),
+                (Ty::Obj(s), _) => (pick(nc, i_nc), unsafe { (*(s as *const Shape)).elems }),
                 (_, Prop::Keyed { shape, elems })
                     if !matches!(elems, FieldType::None | FieldType::Any) =>
                 {
                     out.regs.set(insn.reg as usize, Ty::Obj(shape));
                     (pick("sh", "i_sh"), elems)
                 }
-                (Ty::Ext(_), _) => (pick("nc", "i_nc"), FieldType::Any),
+                (Ty::Ext(_), _) => (pick(nc, i_nc), FieldType::Any),
                 _ => (pick("", "i"), FieldType::Any),
             };
             if keyed_log() && matches!(elems, FieldType::Any) {

@@ -155,6 +155,13 @@ pub const FROZEN: u8 = 32;
 /// Flag: an array's `length` is read-only (`Object.freeze`, or
 /// `Object.defineProperty` with `writable: false`).
 pub const LENGTH_READ_ONLY: u8 = 64;
+/// Flag: a plain object is a mapped `arguments` object whose frame runs
+/// (`object::MAPPED`): its elements may be stale copies of its
+/// parameters, so compiled code reading elements in place leaves it to
+/// the runtime (`Vm::mapped_get`). The bit is `LENGTH_READ_ONLY` in
+/// arrays and `RAW_JSON` in other plain objects, which are frozen (a
+/// frozen `arguments` object maps nothing).
+pub const MAPPED: u8 = 64;
 /// Flag: an array's `length` isn't `elems_len`, which counts its dense
 /// prefix only: it and the elements past the prefix are in the far store
 /// (`far::FAR`). The bit is another flag in functions, errors and buffers.

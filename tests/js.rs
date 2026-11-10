@@ -15579,3 +15579,71 @@ fn a_function_indexes_more_than_65536_caches_constants_and_closures() {
     let src = format!("var s = 0;\n{}s;", each(&|i| format!("s += {i}.5;\n")));
     assert_eq!(value(&src), "2450000000");
 }
+
+/// The JIT reads the 4-byte operands as well (#176). Three functions each
+/// fill one table past 2^16 with code that never runs, then run a loop
+/// whose operations index it past 65535: property loads and stores, a
+/// global's load and store and a call (caches); a number that isn't an
+/// int32, strings, a regular expression literal's pattern and flags, an
+/// object literal's getter name (constants); and a function expression
+/// (nested functions). Each loop compiles, enters its compiled code, and
+/// runs 3000 times, past the caches' first misses. (With the JIT reading
+/// 2 bytes of them, all three come out wrong.)
+#[test]
+fn compiled_loops_read_indexes_past_65535() {
+    let n = 66000;
+    let fill = |f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<String>();
+    let src = format!(
+        "var G = 3;
+function id(v) {{ return v; }}
+function hic(n) {{
+  var o = {{}};
+  if (n < 0) {{ {} }}
+  var s = 0;
+  for (var i = 0; i < n; i++) {{ o.r = i; s += o.r + G + id(1); G = G ^ 1; }}
+  return s + ':' + o.r;
+}}
+function hconst(n) {{
+  var x;
+  if (n < 0) {{ {} }}
+  var s = 0, t = '', c = 0;
+  for (var i = 0; i < n; i++) {{
+    s += 1.25;
+    t = 'zq' + (i & 3);
+    var re = /z+q/gy;
+    c += re.source.length + re.flags.length;
+    var a = {{ get kk() {{ return 2; }} }};
+    c += a.kk;
+  }}
+  return s + ':' + t + ':' + c;
+}}
+function hfn(n) {{
+  var x;
+  if (n < 0) {{ {} }}
+  var s = 0;
+  for (var i = 0; i < n; i++) {{ var f = function(k) {{ return k * 2; }}; s += f(i); }}
+  return s;
+}}
+[hic(3000), hconst(3000), hfn(3000)].join();",
+        fill(&|i| format!("o.p{i};")),
+        fill(&|i| format!("x = 's{i}';")),
+        fill(&|_| "x = function(){};".to_string()),
+    );
+    // (SpiderMonkey's.)
+    let want = "4509000:2999,3750:zq3:21000,8997000";
+    let m = cloison::js::compile(&src).unwrap();
+    for budget in [i64::MAX, 100] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        assert_eq!(display(vm.run(&m).unwrap()), want, "tier at {budget}");
+        if budget == 100 {
+            for f in ["hic", "hconst", "hfn"] {
+                let st = vm.jit_stats(f).unwrap_or_else(|| panic!("{f} not compiled"));
+                // Compiled code entered at the loop, and left at few of its
+                // 3000 iterations (`hconst` at the regular expression's
+                // `source` and `flags`, about 30 times).
+                assert!(st.compiles >= 1 && st.osr_entries >= 1 && st.exits <= 100, "{f}: {st:?}");
+            }
+        }
+    }
+}

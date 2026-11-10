@@ -10412,7 +10412,8 @@ impl JitCode {
 pub struct JitStats {
     pub compiles: u32,
     pub exits: u32,
-    /// Interpreter runs that tiered up into JIT code at a loop header.
+    /// Interpreter runs that tiered up into JIT code at a loop header (in
+    /// a VM: entries into compiled code at one, for tests).
     pub osr_entries: u32,
     /// Runs (or parts of runs) spent in the interpreter.
     pub interp_runs: u32,
@@ -17945,6 +17946,9 @@ unsafe fn vm_run_(
             {
                 let path = path.replace("%n", &f.stats.compiles.to_string());
                 std::fs::write(path, c.main_code()).expect("writing CLOISON_JIT_DUMP");
+            }
+            if pc != 0 && prepared.is_some() {
+                f.stats.osr_entries += 1;
             }
             prepared
         };

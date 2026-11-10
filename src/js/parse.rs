@@ -49,10 +49,9 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
 }
 
 /// [`parse_with`] of a script's text `text`, lexed again for a second pass
-/// (the first takes the strings out of its tokens). Its positions are
-/// those of its source code (`Source::from_text`, which
-/// `codegen::generate` makes of the same text again); an error's offset
-/// is the text's.
+/// (the first takes the strings out of its tokens). Its offsets (the
+/// nodes', the functions' text's, an error's) are the text's, as
+/// `codegen::generate` takes them.
 pub fn parse_source<'a>(text: &str, arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
     parse_source_as(text, arena, skim, None)
 }
@@ -64,20 +63,12 @@ pub fn parse_source_as<'a>(
     skim: bool,
     eval: Option<(bool, &str, bool, bool, bool, bool, bool)>,
 ) -> Result<Program<'a>, Error> {
-    let src = Source::from_text(text);
-    parse_source_code_as(&src, arena, skim, eval).map_err(|e| in_text(e, &src))
+    parse_source_code_as(&Source::from_text(text), arena, skim, eval)
 }
 
 /// [`parse_module_source`] of a module's text (see [`parse_source`]).
 pub fn parse_module<'a>(text: &str, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
-    let src = Source::from_text(text);
-    parse_module_source(&src, arena, id).map_err(|e| in_text(e, &src))
-}
-
-/// Error `e`, at an offset of `src`, at the offset of its text.
-fn in_text(mut e: Error, src: &Source) -> Error {
-    e.pos = src.text_offset(e.pos);
-    e
+    parse_module_source(&Source::from_text(text), arena, id)
 }
 
 /// [`parse_source`] of source code `src` (positions and errors at its

@@ -1410,6 +1410,52 @@ fn text_entry_points_keep_their_signatures() {
     assert!(cloison::js::codegen::generate(&p, "var s = '\u{F0000}';").is_ok());
 }
 
+/// The public parsers' offsets (statements', functions' and their text's)
+/// are the text's, after a private use character a lone surrogate's
+/// mapping uses (U+F0000, the `ESCAPE` U+F0800) or U+FDD0 too; functions'
+/// `toString` (a file's, `eval`'s, lazily compiled or not) is their text.
+#[test]
+fn public_parsers_give_offsets_in_the_text() {
+    use cloison::js::{ast::Arenas, parse};
+    for ch in ['\u{F0000}', '\u{F0800}', '\u{FDD0}'] {
+        let text = format!(
+            "var a = '{ch}'; var r = /{ch}/u; var t = `{ch}${{a}}{ch}`;\nfunction f(x) {{ return '{ch}' + x }}\nclass C {{ m() {{ return /{ch}/ }} }}\nf(a);"
+        );
+        let check = |p: &cloison::js::ast::Program, top: bool| {
+            let f = p.functions.iter().find(|g| g.name.as_deref() == Some("f")).expect("f");
+            assert_eq!(&text[f.pos as usize..f.end as usize], format!("function f(x) {{ return '{ch}' + x }}"), "{text}");
+            assert_eq!(&text[f.params_pos as usize..f.end as usize], format!("(x) {{ return '{ch}' + x }}"));
+            let m = p.functions.iter().find(|g| g.name.as_deref() == Some("m")).expect("m");
+            assert_eq!(&text[m.params_pos as usize..m.end as usize], format!("() {{ return /{ch}/ }}"));
+            if top {
+                let starts: Vec<&str> = p.functions[0].body.iter().map(|s| &text[s.pos as usize..]).collect();
+                for want in ["var a", "var r", "var t", "f(a);"] {
+                    assert!(starts.iter().any(|s| s.starts_with(want)), "{want} in {text}");
+                }
+            }
+        };
+        let arena = Arenas::default();
+        check(&parse::parse_source(&text, &arena, false).unwrap(), true);
+        let arena = Arenas::default();
+        check(&parse::parse_source(&text, &arena, true).unwrap(), true);
+        let arena = Arenas::default();
+        check(&parse::parse_source_as(&text, &arena, false, Some((false, "", false, true, false, false, false))).unwrap(), true);
+        let arena = Arenas::default();
+        check(&parse::parse_module(&text, &arena, 0).unwrap(), false);
+        // And the code made of it: `toString` the text, compiled now or
+        // lazily (from `eval`).
+        let fs = format!("function f(x) {{ return '{ch}' + x }}");
+        let js = format!("{text}\n[f.toString() === {fs:?}, C.prototype.m.toString() === {:?}, f(1).length].join()", format!("m() {{ return /{ch}/ }}"));
+        assert_eq!(value(&js), format!("true,true,{}", ch.len_utf16() + 1));
+        let e = format!(
+            "var g = eval({:?}); [g.toString() === {fs:?}, g(1).length, eval({:?}).toString() === {fs:?}].join()",
+            format!("(function () {{ var z = '{ch}'; return {fs}; }})()"),
+            format!("({fs})")
+        );
+        assert_eq!(value(&e), format!("true,{},true", ch.len_utf16() + 1));
+    }
+}
+
 /// String methods' RegExp fast paths step aside where the spec's paths
 /// differ: a sticky separator splits as any, a RegExp whose `Symbol.<m>`
 /// is undefined is its string, redefined flags are what it has, and

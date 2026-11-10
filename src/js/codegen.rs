@@ -1291,26 +1291,37 @@ fn aliases_arguments(p: &Program, f: &Function) -> bool {
         use ExprKind::*;
         let param = |t: &Expr| matches!(&t.kind, Ident(n) if f.params.contains(n));
         let element = |t: &Expr| matches!(&t.kind, Index(o, _) | Member(o, _) if is_args(o));
+        let sub = || {
+            let mut sub = Vec::new();
+            children(e, &mut sub);
+            sub.into_iter().any(|x| expr(x, p, f))
+        };
+        // (Every form named: a new one that stores must be seen here.)
         match &e.kind {
-            Assign(_, t, v) => param(t) || element(t) || expr(t, p, f) || expr(v, p, f),
+            // (`=`, compound `op=`, `||=`, `&&=`, `??=`.)
+            Assign(_, t, v) | LogicalAssign(_, t, v) => param(t) || element(t) || expr(t, p, f) || expr(v, p, f),
             Update(t, ..) => param(t) || element(t) || expr(t, p, f),
             Unary(UnOp::Delete, t) if element(t) => true,
             Call(c, args) if args.first().is_some_and(is_args) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) => true,
-            Destructure(..) => true,
+            // (Patterns, and class bodies, whose computed keys aren't
+            // children: taken to store.)
+            Destructure(..) | Class(_) => true,
             // (Reading it, or its elements, aliases nothing.)
             Index(o, k) if is_args(o) => expr(k, p, f),
             Member(o, _) if is_args(o) => false,
-            Ident(n) if &**n == "arguments" => true,
+            Ident(n) => &**n == "arguments",
             Function(i) if p.functions[*i].arrow => {
                 let mut found = false;
                 for_each_expr(&p.functions[*i].body, &mut |e| found |= expr(e, p, f));
-                found
+                found || stores_parameter_in(p, &p.functions[*i].body, f)
             }
-            _ => {
-                let mut sub = Vec::new();
-                children(e, &mut sub);
-                sub.into_iter().any(|x| expr(x, p, f))
-            }
+            // (Another function's code: a closure's stores are seen as
+            // captures, `Gen::maps_arguments`.)
+            Function(_) | Accessor(..) => false,
+            Num(_) | Str(_) | Bool(_) | Null | This | Hole | TemplateObject(_) | RegExp(_) | Bound => false,
+            Array(_) | Object(..) | Spread(_) | Template(..) | Await(_) | Yield(..) | SuperCall(..) | SuperMember(..)
+            | Intrinsic(..) | Member(..) | Index(..) | Call(..) | New(..) | Unary(..) | Binary(..) | Logical(..)
+            | Nullish(..) | Cond(..) | Chain(_) | Optional(_) | Comma(..) => sub(),
         }
     }
     let mut found = false;
@@ -1327,6 +1338,15 @@ fn aliases_arguments(p: &Program, f: &Function) -> bool {
 /// environment). (One in a block isn't Annex B's for a parameter's name,
 /// B.3.2.1.)
 fn stores_parameter(p: &Program, f: &Function) -> bool {
+    let mut fns = Vec::new();
+    f.body.iter().for_each(|s| hoisted(s, &mut fns));
+    fns.iter().any(|&i| p.functions[i].name.as_deref().is_some_and(|n| f.params.iter().any(|q| &**q == n)))
+        || stores_parameter_in(p, &f.body, f)
+}
+
+/// [`stores_parameter`]'s statements of `body` (`f`'s, or an arrow's in
+/// it), function declarations aside. Every statement form named.
+fn stores_parameter_in(_p: &Program, body: &[Stmt], f: &Function) -> bool {
     fn stmt(s: &Stmt, f: &Function) -> bool {
         let param = |n: &str| f.params.iter().any(|p| &**p == n);
         match &s.kind {
@@ -1336,7 +1356,8 @@ fn stores_parameter(p: &Program, f: &Function) -> bool {
                 ..
             } if ds.iter().any(|(n, e)| e.is_some() && param(n)) => return true,
             StmtKind::ForIn { fresh: false, name, .. } if param(name) => return true,
-            StmtKind::ForOf { kind: 0 | 1, pattern: Some(_), .. } => return true,
+            // (A pattern's defaults may store one too.)
+            StmtKind::ForOf { pattern: Some(_), .. } => return true,
             StmtKind::ForOf {
                 kind: 0 | 1,
                 target: Expr { kind: ExprKind::Ident(n), .. },
@@ -1356,13 +1377,19 @@ fn stores_parameter(p: &Program, f: &Function) -> bool {
             StmtKind::Block(b) => b.iter().any(|s| stmt(s, f)),
             StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).any(|s| stmt(s, f)),
             StmtKind::Try(b, c, fin) => try_blocks(b, c, fin).any(|s| stmt(s, f)),
-            _ => false,
+            // (Their expressions are `aliases_arguments`'s.)
+            StmtKind::Var(_)
+            | StmtKind::Lexical(..)
+            | StmtKind::Function(_)
+            | StmtKind::Expr(_)
+            | StmtKind::Return(_)
+            | StmtKind::Break(_)
+            | StmtKind::Continue(_)
+            | StmtKind::Throw(_)
+            | StmtKind::Empty => false,
         }
     }
-    let mut fns = Vec::new();
-    f.body.iter().for_each(|s| hoisted(s, &mut fns));
-    fns.iter().any(|&i| p.functions[i].name.as_deref().is_some_and(|n| f.params.iter().any(|q| &**q == n)))
-        || f.body.iter().any(|s| stmt(s, f))
+    body.iter().any(|s| stmt(s, f))
 }
 
 /// Whether function `f`'s `arguments` object may be reachable once it
@@ -1464,7 +1491,7 @@ fn children<'a>(e: &'a Expr<'a>, out: &mut Vec<&'a Expr<'a>>) {
                 out.push(v);
             }
         }
-        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) | Chain(o) | Optional(o) => out.push(o),
+        Member(o, _) | Unary(_, o) | Update(o, ..) | Spread(o) | Chain(o) | Optional(o) | Await(o) => out.push(o),
         Index(a, b)
         | Binary(_, a, b)
         | Logical(_, a, b)

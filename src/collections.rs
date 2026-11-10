@@ -973,12 +973,19 @@ fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(object_value(unsafe { (*this_view(this)?).code } as *mut Object))
 }
 
-fn view_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::number(this_live_view(this)?.1 as f64))
+/// `this` as by [`this_live_view`], its record made seq-cst (the getters,
+/// 25.3.4): a growable shared buffer's length read from its block.
+fn this_live_view_seq_cst(vm: &mut Vm, this: Value) -> Result<(*mut Object, usize)> {
+    crate::typed::read_view_length(vm, this_view(this)?);
+    this_live_view(this)
 }
 
-fn view_byte_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let (o, _) = this_live_view(this)?;
+fn view_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    Ok(Value::number(this_live_view_seq_cst(vm, this)?.1 as f64))
+}
+
+fn view_byte_offset(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let (o, _) = this_live_view_seq_cst(vm, this)?;
     Ok(Value::number(crate::typed::offset_of(o) as f64))
 }
 

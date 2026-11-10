@@ -118,7 +118,7 @@ fn thrown_message(vm: &mut Vm, e: &Error) -> String {
         return e.0.clone();
     };
     let o = as_object(v);
-    if unsafe { (*o).flags } & crate::object::ERROR == 0 {
+    if !crate::object::is_error(o) {
         return e.0.clone();
     }
     let data = |vm: &mut Vm, o: *mut Object, name| match vm.own_property(o, Key::Name(name)) {

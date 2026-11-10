@@ -15700,8 +15700,8 @@ var d = Function("return function* (" + ps.join(",") + ",p0) { arguments[130] = 
 /// overwritten with itself. Both ways across `yield` and `await`: in
 /// generators, async functions and async generators, with a direct
 /// `eval`, duplicate parameters, a computed method name. What
-/// SpiderMonkey and QuickJS give (JavaScriptCore keeps the function
-/// declaration's value in the case `t8`).
+/// SpiderMonkey and V8 give (JavaScriptCore and QuickJS keep the
+/// function declaration's value over the write in `g8`).
 #[test]
 fn a_parameter_shadowing_a_function_expressions_name_stays_mapped() {
     let src = r#"
@@ -15742,6 +15742,48 @@ Promise.all([h(1), i.next().then(function () { return i.next(); }), j.next().the
   .then(function (v) { globalThis.out = [v[0], v[1].value, v[2].value].join(" "); });
 "#;
     assert_eq!(out_after_jobs(src), "3 9 6");
+}
+
+/// What stores a parameter as no expression does maps `arguments` too: a
+/// function declaration of its name in the body (FunctionDeclaration-
+/// Instantiation stores it in the parameter's binding, ECMA-262 10.2.11
+/// steps 28 and 36), a `var` of it with an initializer, a `for`-`in` or
+/// `for`-`of` target of it, `var` or not. The object was left unmapped,
+/// its elements the arguments. One in a block isn't Annex B's for a
+/// parameter's name (B.3.2.1); a `catch` binding's `var` stores the
+/// binding. In plain functions, generators, async functions and async
+/// generators, with `eval` and duplicates. What SpiderMonkey and V8 give
+/// (JavaScriptCore and QuickJS keep the argument for a declaration).
+#[test]
+fn declarations_storing_a_parameter_map_arguments() {
+    let src = r#"
+var out = [];
+function a1(f) { function f() {} return typeof arguments[0]; } out.push(a1(1));
+function a2(f) { var f = 2; return arguments[0]; } out.push(a2(1));
+function a3(f) { for (f in { x: 1 }); return arguments[0]; } out.push(a3(1));
+function a4(f) { for (var f in { y: 1 }); return arguments[0]; } out.push(a4(1));
+function a5(f) { for (f of [5]); return arguments[0]; } out.push(a5(1));
+function a6(f) { for (var f of [6]); return arguments[0]; } out.push(a6(1));
+function a7(f) { { function f() {} } return typeof arguments[0]; } out.push(a7(1));
+function a8(f) { for (var f = 8; false;); return arguments[0]; } out.push(a8(1));
+function a9(f, f) { function f() {} return typeof arguments[0] + typeof arguments[1]; } out.push(a9(1, 2));
+function a10(f) { eval(""); function f() {} return typeof arguments[0]; } out.push(a10(1));
+function a11(f) { try { throw 3 } catch (f) { var f = 11; } return arguments[0]; } out.push(a11(1));
+function* g1(f) { function f() {} yield typeof arguments[0]; } out.push(g1(1).next().value);
+function* g2(f) { var f = 2; yield 0; yield arguments[0]; } var i2 = g2(1); i2.next(); out.push(i2.next().value);
+var fe = function* f(f) { function f() {} yield typeof arguments[0]; }; out.push(fe(1).next().value);
+function a12(f) { function f() {} arguments[0] = 11; return typeof f; } out.push(a12(1));
+out.join(" ")
+"#;
+    assert_eq!(value(src), "function 2 x y 5 6 number 8 numberfunction function 1 function 2 function number");
+    let src = r#"
+async function h1(f) { function f() {} await 0; return typeof arguments[0]; }
+async function* h2(f) { function f() {} yield 0; yield typeof arguments[0]; }
+var i = h2(1);
+Promise.all([h1(1), i.next().then(function () { return i.next(); })])
+  .then(function (v) { globalThis.out = v[0] + " " + v[1].value; });
+"#;
+    assert_eq!(out_after_jobs(src), "function function");
 }
 
 /// A compound assignment's converted object key outlives a collection in

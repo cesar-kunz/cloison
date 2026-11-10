@@ -1158,14 +1158,22 @@ fn with_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(Value::TRUE)
 }
 
-/// A mapped `arguments` object of a function with a direct `eval`
-/// (`[arguments, scope, parameter names…]`): its elements mapped to the
-/// scope object's properties of those names, where the function keeps its
-/// parameters (see `Gen::function`), not to the registers.
+/// A mapped `arguments` object of a function with a direct `eval`, a
+/// generator or an async function (`[arguments, scope, parameter
+/// names…]`): its elements mapped to the scope object's properties of
+/// those names, where the function keeps its parameters (see
+/// `Gen::function`), not to the registers; `null` for a parameter a later
+/// one of its name shadows, whose index is not mapped.
 fn map_arguments_to_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (o, env) = (as_object(a[0]), as_object(a[1]));
     let mut names = Vec::new();
-    for &n in &a[2..] {
+    let mut shadowed = Vec::new();
+    for (i, &n) in a[2..].iter().enumerate() {
+        if n.is_null() {
+            shadowed.push(i);
+            names.push(crate::object::Atom(0));
+            continue;
+        }
         match to_property_key(vm, n)? {
             Key::Name(atom) => names.push(atom),
             Key::Index(_) => return Ok(Value::UNDEFINED),
@@ -1173,6 +1181,11 @@ fn map_arguments_to_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     }
     if let Some(m) = vm.mapped_args.iter_mut().rev().find(|m| m.o == o) {
         m.scope = (env, names);
+        for i in shadowed {
+            if let Some(on) = m.mapped.get_mut(i) {
+                *on = false;
+            }
+        }
     }
     Ok(Value::UNDEFINED)
 }

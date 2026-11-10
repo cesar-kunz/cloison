@@ -134,7 +134,11 @@ fn generate_from<'p>(
             decls[i] = d;
         }
     }
-    let decls: Vec<Decls> = decls.into_iter().map(Decls::new).collect();
+    let decls: Vec<Decls> = decls
+        .into_iter()
+        .enumerate()
+        .map(|(i, d)| Decls::new(d, if i == 0 { 0 } else { p.functions[i].params.len() }))
+        .collect();
     let mut scopes = upvalues(p, &decls, &overflow);
     if !p.eval_upvalues.is_empty() {
         scopes.upvalues[0] = p.eval_upvalues.iter().map(|(n, ..)| &**n).collect();
@@ -313,30 +317,42 @@ fn generate_from<'p>(
 
 type R<T> = Result<T, Error>;
 
-/// A function's declarations (see [`declarations`]), in order, and past a
-/// few, where each is (the first of its name), for lookups by name: every
-/// global's reference looks in each enclosing function's.
+/// A function's declarations (see [`declarations`]), in order, its
+/// `params` parameters first, and past a few, where each is, for lookups
+/// by name: every global's reference looks in each enclosing function's.
+/// A name is found at its first place, a parameter's at its last among
+/// the parameters: a sloppy function's may repeat, and the last binds
+/// the name (ECMA-262 FunctionDeclarationInstantiation), as in
+/// `Gen::locals`.
 struct Decls<'a> {
     list: Vec<&'a str>,
+    params: usize,
     index: Option<HashMap<&'a str, usize>>,
 }
 
 impl<'a> Decls<'a> {
-    fn new(list: Vec<&'a str>) -> Self {
+    fn new(list: Vec<&'a str>, params: usize) -> Self {
         let index = (list.len() > 8).then(|| {
             let mut m = HashMap::default();
             for (i, &n) in list.iter().enumerate() {
-                m.entry(n).or_insert(i);
+                if i < params {
+                    m.insert(n, i);
+                } else {
+                    m.entry(n).or_insert(i);
+                }
             }
             m
         });
-        Decls { list, index }
+        Decls { list, params, index }
     }
 
     fn position(&self, name: &str) -> Option<usize> {
         match &self.index {
             Some(m) => m.get(name).copied(),
-            None => self.list.iter().position(|&n| n == name),
+            None => match self.list[..self.params].iter().rposition(|&n| n == name) {
+                Some(k) => Some(k),
+                None => self.list.iter().position(|&n| n == name),
+            },
         }
     }
 
@@ -1481,7 +1497,7 @@ fn may_map_arguments(f: &Function) -> bool {
         && !f.rest
         && f.param_stmts == 0
         && !f.params.is_empty()
-        && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
+        && f.params.iter().all(|p| !p.starts_with('%'))
 }
 
 /// Whether function `f` reads `arguments` only to pass them on, as
@@ -2113,8 +2129,9 @@ impl<'a> Gen<'a> {
                 }
             }
             for &n in self.overflow {
-                // A parameter's value is in its register.
-                match self.f.params.iter().position(|p| &**p == n) {
+                // A parameter's value is in its register (the last's of
+                // its name: see `Decls`).
+                match self.f.params.iter().rposition(|p| &**p == n) {
                     Some(k) => self.ldar(k as u8 + 1),
                     None => self.emit(Op::LdaUndefined, &[]),
                 }
@@ -2158,9 +2175,16 @@ impl<'a> Gen<'a> {
                 self.mov(t, a);
                 let e = self.alloc(self.f.pos)?;
                 self.mov(self.locals[ENV], e);
-                for p in &f.params {
+                // (`null` for a parameter a later one of its name
+                // shadows, which is not mapped: ECMA-262
+                // CreateMappedArgumentsObject.)
+                for (j, p) in f.params.iter().enumerate() {
                     let k = self.alloc(self.f.pos)?;
-                    self.string(&self.env_key(p));
+                    if f.params[j + 1..].contains(p) {
+                        self.emit(Op::LdaNull, &[]);
+                    } else {
+                        self.string(&self.env_key(p));
+                    }
                     self.star(k);
                 }
                 self.intrinsic("map_arguments_to_scope", a, 2 + f.params.len() as u8);

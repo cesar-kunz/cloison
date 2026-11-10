@@ -4,7 +4,9 @@
 //! paths all: the JIT leaves them to the interpreter.
 
 use crate::interp::{call_function, to_string_units};
-use crate::js::ast::{EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS};
+use crate::js::ast::{
+    EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_IMPORT, EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS,
+};
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::Desc;
 use crate::value::Value;
@@ -1647,9 +1649,11 @@ fn async_iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// in the description (see [`site_bindings`]) an accessor of the variable
 /// itself, the bindings' function's upvalue (its variable a box's
 /// property: see `codegen::boxed_lexicals`); the others' in the quadruples
-/// after, where `binding` is `(EVAL_DATA << 4) | kind`, `kind` its
-/// `EVAL_CONST`… flags: a data property of its value (but a binding not
-/// initialized yet has none). Added to `scope object` if one (in parts, for
+/// after, where `binding` (`(tag << 4) | kind`, `kind` its `EVAL_CONST`…
+/// flags) tells: `EVAL_IMPORT` an imported binding's accessor (`value` the
+/// object holding it, `variable` its property, none for a namespace),
+/// `EVAL_DATA` a data property of its value (but a binding not initialized
+/// yet has none). Added to `scope object` if one (in parts, for
 /// registers' sake: see `Gen::call`), else to a new one, returned.
 /// Without a prototype: the eval'd code looks names up in the function's
 /// scope object after it (`%e2`, see `parse::parse_pass`). (It had the
@@ -1681,7 +1685,12 @@ fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         if !visible(vm, b & 15, key) {
             continue;
         }
-        if t[1] != Value::HOLE {
+        if b >> 4 == EVAL_IMPORT {
+            let data = [t[1], Value::from_i32(b), t[0], t[2]];
+            let get = crate::promise::binding_accessor(vm, false, &data);
+            let set = crate::promise::binding_accessor(vm, true, &data);
+            vm.define_own_property(as_object(o), key, &Desc::accessor(get, set, true, false))?;
+        } else if t[1] != Value::HOLE {
             vm.create_data_property(o, key, t[1])?;
         }
     }
@@ -1692,6 +1701,7 @@ fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// A direct `eval`'s binding accessor's binding (the callee's `[function,
 /// binding, name, variable]`: see `eval_scope`): its variable's upvalue,
 /// its kind, its name, and (in a box) the box and its property's key.
+/// (An imported binding's: see [`import_of`].)
 fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Option<(Value, Key)>)> {
     let me = vm.callee;
     let slot = |i| crate::promise::slot(me, i);
@@ -1702,6 +1712,32 @@ fn binding_of(vm: &mut Vm) -> Result<(*mut crate::vm::Upvalue, i32, Value, Optio
     Ok((u, b & 15, name, boxed))
 }
 
+/// A direct `eval`'s imported binding's accessor's binding (`[holder,
+/// binding, name, property]`, see `eval_scope`): its name, the object
+/// holding it, and its property there (none for a namespace, the holder
+/// itself); none if not an imported binding's.
+fn import_of(vm: &mut Vm) -> Result<Option<(Value, Value, Option<Key>)>> {
+    let me = vm.callee;
+    let slot = |i| crate::promise::slot(me, i);
+    if slot(1).as_number().unwrap_or(0.0) as i32 >> 4 != EVAL_IMPORT {
+        return Ok(None);
+    }
+    let prop = slot(3);
+    let key = if prop == Value::UNDEFINED { None } else { Some(to_property_key(vm, prop)?) };
+    Ok(Some((slot(2), slot(0), key)))
+}
+
+/// An imported binding's value, live (a ReferenceError before its module
+/// sets it).
+fn import_value(vm: &mut Vm, name: Value, holder: Value, key: Option<Key>) -> Result<Value> {
+    let Some(key) = key else { return Ok(holder) };
+    let v = vm.get_key(holder, key)?;
+    if v == Value::HOLE {
+        return Err(uninitialized(name));
+    }
+    Ok(v)
+}
+
 fn uninitialized(name: Value) -> Error {
     Error::reference_error(format!("Cannot access '{}' before initialization", crate::vm::shown(name)))
 }
@@ -1709,6 +1745,9 @@ fn uninitialized(name: Value) -> Error {
 /// A direct `eval`'s binding's getter: its variable's value (a
 /// ReferenceError before it is initialized).
 pub(crate) fn binding_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
+    if let Some((name, holder, key)) = import_of(vm)? {
+        return import_value(vm, name, holder, key);
+    }
     let (u, _, name, boxed) = binding_of(vm)?;
     let v = match boxed {
         Some((b, key)) => vm.get_key(b, key)?,
@@ -1721,8 +1760,13 @@ pub(crate) fn binding_get(vm: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
 }
 
 /// A direct `eval`'s binding's setter: its variable set (a TypeError for a
-/// `const`'s).
+/// `const`'s; an imported one's always, its target initialized or not:
+/// an immutable binding CreateImportBinding records as initialized, the
+/// code strict, see ECMA-262 9.1.1.1.5 SetMutableBinding, step 5).
 pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    if import_of(vm)?.is_some() {
+        return Err(Error::type_error("Assignment to constant variable."));
+    }
     let (u, kind, name, boxed) = binding_of(vm)?;
     let old = match boxed {
         Some((b, key)) => vm.get_key(b, key)?,

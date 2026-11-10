@@ -5327,12 +5327,34 @@ impl<'a> Gen<'a> {
                     let k = self.alloc(pos)?;
                     self.string(o);
                     self.star(k);
+                    // (An imported binding's the object holding it, read
+                    // by its accessor: live, and not assignable, #151.)
                     let r = self.alloc(pos)?;
                     let var = self.alloc(pos)?;
-                    self.emit(Op::LdaUndefined, &[]);
-                    self.star(var);
-                    self.load_raw(v, pos)?;
-                    let tag = EVAL_DATA;
+                    let tag = match self.p.imports.get(v) {
+                        Some(imp) => {
+                            let (holder, slot, prop) = (imp.holder.clone(), imp.slot, imp.prop.clone());
+                            match prop {
+                                Some(p) => self.string(&p),
+                                None => self.emit(Op::LdaUndefined, &[]),
+                            }
+                            self.star(var);
+                            self.load_raw(&holder, pos)?;
+                            if let Some(slot) = slot {
+                                self.star(r);
+                                self.lda_smi(slot as i32);
+                                let ic = self.auto_ic("[]keyed");
+                                self.emit(Op::GetKeyed, &[Arg::Reg(r), ic]);
+                            }
+                            EVAL_IMPORT
+                        }
+                        None => {
+                            self.emit(Op::LdaUndefined, &[]);
+                            self.star(var);
+                            self.load_raw(v, pos)?;
+                            EVAL_DATA
+                        }
+                    };
                     self.star(r);
                     let b = self.alloc(pos)?;
                     self.emit(Op::LdaSmi, &[Arg::Imm((tag << 4) | kind)]);

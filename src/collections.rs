@@ -929,14 +929,11 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     let b = as_object(buffer);
     let offset = to_index(vm, arg(a, 1))?;
-    // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
-    if crate::shared::is_shared(b) {
-        crate::shared::read_length(vm, b);
-    }
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }
-    let bytes = unsafe { (*b).elems_len } as usize;
+    // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
+    let bytes = crate::shared::read_length(vm, b);
     if offset > bytes {
         return Err(Error::range_error(format!("Start offset {offset} is outside the bounds of the buffer")));
     }
@@ -956,10 +953,7 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
     }
-    if crate::shared::is_shared(b) {
-        crate::shared::read_length(vm, b);
-    }
-    let bytes = unsafe { (*b).elems_len } as usize;
+    let bytes = crate::shared::read_length(vm, b);
     if offset > bytes || len.is_some_and(|n| offset + n > bytes) {
         return Err(Error::range_error(format!("Invalid DataView length {}", len.unwrap_or(0))));
     }
@@ -971,14 +965,20 @@ fn this_view(this: Value) -> Result<*mut Object> {
     this_of(this, Class::DataView, "DataView.prototype method")
 }
 
+/// `DataView` `o` and its byte length if in bounds (`n`, its buffer
+/// attached), else a TypeError.
+fn live_view(o: *mut Object, n: Option<usize>) -> Result<(*mut Object, usize)> {
+    match n {
+        Some(n) => Ok((o, n)),
+        None => Err(Error::type_error("Cannot perform DataView operation on a detached or out of bounds ArrayBuffer")),
+    }
+}
+
 /// `this` as a `DataView` in bounds (its buffer attached), and its byte
 /// length.
 fn this_live_view(this: Value) -> Result<(*mut Object, usize)> {
     let o = this_view(this)?;
-    match crate::typed::view_byte_length(o) {
-        Some(n) => Ok((o, n)),
-        None => Err(Error::type_error("Cannot perform DataView operation on a detached or out of bounds ArrayBuffer")),
-    }
+    live_view(o, crate::typed::view_byte_length(o))
 }
 
 fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -988,8 +988,8 @@ fn view_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// `this` as by [`this_live_view`], its record made seq-cst (the getters,
 /// 25.3.4): a growable shared buffer's length read from its block.
 fn this_live_view_seq_cst(vm: &mut Vm, this: Value) -> Result<(*mut Object, usize)> {
-    crate::typed::read_view_length(vm, this_view(this)?);
-    this_live_view(this)
+    let o = this_view(this)?;
+    live_view(o, crate::typed::view_byte_length_seq_cst(vm, o))
 }
 
 fn view_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

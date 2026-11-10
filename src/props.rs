@@ -474,10 +474,7 @@ impl Vm {
             }
             match class {
                 // (Its record made seq-cst: 10.4.5.7.)
-                Class::TypedArray => {
-                    crate::typed::read_view_length(self, o);
-                    indices.extend(0..crate::typed::ta_length(o).unwrap_or(0) as u32)
-                }
+                Class::TypedArray => indices.extend(0..crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32),
                 Class::String => {}
                 c if c.no_elements() => {}
                 _ => {

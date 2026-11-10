@@ -306,11 +306,15 @@ fn sync_length(o: *mut Object) -> usize {
     n
 }
 
-/// Shared buffer `o`'s length read seq-cst, ArrayBufferByteLength(o,
-/// seq-cst): as its block has it now, its views brought up to date to it,
-/// then the other buffers caught up, as the read may have synchronized
-/// with another agent's grow (#155, #219).
+/// Buffer `o`'s length read seq-cst, ArrayBufferByteLength(o, seq-cst):
+/// a shared one's as its block has it now, its views brought up to date
+/// to it, then the other buffers caught up, as the read may have
+/// synchronized with another agent's grow (#155, #219); another's as it
+/// is (0 if detached).
 pub(crate) fn read_length(vm: &mut Vm, o: *mut Object) -> usize {
+    if !is_shared(o) {
+        return unsafe { (*o).elems_len } as usize;
+    }
     let n = sync_length(o);
     // (After the length: the grows before the one it read are counted.)
     catch_up(vm);
@@ -330,14 +334,16 @@ pub(crate) fn read_length(vm: &mut Vm, o: *mut Object) -> usize {
 // message). It counts the grows (`GROWS`), and skips when the count is
 // the one it last recorded.
 //
-// A view of a growable buffer (flag `SHARED_GROWABLE`) reads its length
-// from the block wherever the spec reads it seq-cst (its `length`,
-// `byteLength` and `byteOffset`, ValidateTypedArray, the array
+// A view tracking a growable buffer's length (flag `SHARED_GROWABLE`)
+// reads it from the block wherever the spec reads it seq-cst (its
+// `length`, `byteLength` and `byteOffset`, ValidateTypedArray, the array
 // iterator's `next`: MakeTypedArrayWithBufferWitnessRecord(o, seq-cst),
-// 23.2.3, 25.3.4), so a loop polling it sees another agent's grow
-// (#156); compiled code's length reads leave it to the runtime. Element
-// accesses keep reading the cached length: the spec reads it unordered
-// (IsValidIntegerIndex), and a cache is never longer than its block.
+// 23.2.3, 25.3.4; `typed::ta_length_seq_cst`), so a loop polling it sees
+// another agent's grow (#156); compiled code's length reads leave it to
+// the runtime. (A fixed-length view's length doesn't change: the buffer
+// never shrinks.) Element accesses keep reading the cached length: the
+// spec reads it unordered (IsValidIntegerIndex), and a cache is never
+// longer than its block.
 //
 // Invariant: a VM records a count only once every grow it counts has
 // its length written before the VM's lengths are read again. So, all

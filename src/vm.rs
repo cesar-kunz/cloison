@@ -1897,11 +1897,11 @@ impl Vm {
     /// a registered symbol, a realm's declarations or a cached `eval`'s,
     /// a running native (`held_atoms`); one used since the marking before (`intern_name`) stays, as Rust
     /// code may hold it, and the VM's own, and one `intern` gave (for good). The tables keyed by atoms forget.
-    /// `from`: the marking's code epoch.
-    pub(crate) fn prune_atoms(&mut self, from: u32) {
+    /// `since`: the code epoch this heap's marking before began in (not
+    /// the marking's own less one: other heaps' markings bump it too, #222).
+    pub(crate) fn prune_atoms(&mut self, since: u32) {
         let n = self.atoms.len();
         let fixed = self.atoms_fixed.min(n);
-        let since = from.saturating_sub(1);
         let mut live = vec![false; n];
         live[..fixed].fill(true);
         for i in fixed..n {
@@ -8965,5 +8965,25 @@ out.join();"#;
         assert_eq!(r.unwrap(), Value::TRUE);
         let n = a.enter(|_| Ok(Value::from_i32(string_units(s).unwrap().len() as i32))).unwrap();
         assert_eq!(n, Value::from_i32(80));
+    }
+
+    /// An atom used since its heap's marking before is kept by the next,
+    /// however many markings other heaps made between, which advance the
+    /// process's code epoch too (#222).
+    #[test]
+    fn an_atom_used_since_the_marking_before_is_kept() {
+        let mut a = Vm::new();
+        let mut b = Vm::new();
+        let gc = crate::js::compile("$262.gc()").unwrap();
+        a.run(&gc).unwrap();
+        let x = a.intern_name("usedSinceTheMarkingBefore");
+        b.run(&gc).unwrap();
+        b.run(&gc).unwrap();
+        a.run(&gc).unwrap();
+        assert_eq!(a.atoms[x.0 as usize].as_deref(), Some("usedSinceTheMarkingBefore"));
+        // Unused since, the marking after frees it.
+        a.run(&gc).unwrap();
+        a.run(&gc).unwrap();
+        assert!(a.atoms[x.0 as usize].as_deref() != Some("usedSinceTheMarkingBefore"));
     }
 }

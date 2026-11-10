@@ -1352,16 +1352,19 @@ pub fn push_key(v: Value) -> u64 {
 }
 
 impl Shape {
-    /// Dictionary shape `s` (see [`Shape::dictionary`]), to change in place.
+    /// The slots of dictionary shape `s` (see [`Shape::dictionary`]), to
+    /// change in place. (Not a `&mut Shape`: the marker thread may be
+    /// reading the shape's `mark`, `proto` and `parent` meanwhile, see
+    /// `gc::mark_object_shape`.)
     ///
     /// # Safety
     /// `s` must be a live dictionary shape, and nothing hold a reference
-    /// into it while the result is used.
+    /// into its slots while the result is used.
     #[allow(clippy::mut_from_ref)]
-    pub(crate) unsafe fn dictionary_mut<'a>(s: *const Shape) -> &'a mut Shape {
+    pub(crate) unsafe fn dictionary_slots<'a>(s: *const Shape) -> &'a mut Slots {
         unsafe {
             debug_assert!((*s).dictionary);
-            &mut *s.cast_mut()
+            &mut (*s.cast_mut()).slots
         }
     }
 

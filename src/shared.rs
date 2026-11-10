@@ -360,8 +360,15 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(o)
 }
 
-fn shared_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::number(sync_length(this_shared(this, "byteLength")?) as f64))
+/// `get buffer.byteLength`: its length read seq-cst (25.2.5.1), which
+/// synchronizes with the grow that wrote it, another agent's maybe: what
+/// that agent did before (other buffers' grows too) happens before what
+/// follows here (#155).
+fn shared_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let n = sync_length(this_shared(this, "byteLength")?);
+    // (After the length: the grows before the one it read are counted.)
+    catch_up(vm);
+    Ok(Value::number(n as f64))
 }
 
 fn shared_growable(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -383,19 +390,21 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let n = to_index(vm, arg(a, 0))?;
     let b = block_of(o);
     let room = unsafe { (*b).room };
-    if n > room {
-        return Err(Error::range_error("SharedArrayBuffer.prototype.grow: beyond maxByteLength"));
-    }
+    // The length's seq-cst read and compare-exchanges (25.2.5.3), whatever
+    // the outcome (an error, no grow), synchronize with the grow that
+    // wrote what they read: the other buffers caught up after them, as by
+    // `byteLength` (#155). (The bound's checked after the read too.)
     let len = unsafe { &(*b).len };
     let mut current = len.load(SeqCst);
     loop {
-        if n < current {
-            return Err(Error::range_error("SharedArrayBuffer.prototype.grow: a buffer can't shrink"));
-        }
-        if n == current {
-            // (No grow: none to catch up with.)
+        if n <= current || n > room {
             sync_length(o);
-            return Ok(Value::UNDEFINED);
+            catch_up(vm);
+            if n == current {
+                return Ok(Value::UNDEFINED);
+            }
+            let why = if n > room { "beyond maxByteLength" } else { "a buffer can't shrink" };
+            return Err(Error::range_error(format!("SharedArrayBuffer.prototype.grow: {why}")));
         }
         // (Its bytes past its length are zero: it never shrinks.)
         match len.compare_exchange(current, n, SeqCst, SeqCst) {
@@ -404,8 +413,15 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
     }
     // (After the length: who sees this one sees it.)
-    GROWS.fetch_add(1, SeqCst);
+    let before = GROWS.fetch_add(1, SeqCst);
     sync_length(o);
+    if before == vm.shared.grows {
+        // (No other grow counted since this agent's last catch-up: none to
+        // catch up with but this one, which its views have.)
+        vm.shared.grows = before + 1;
+    } else {
+        catch_up(vm);
+    }
     Ok(Value::UNDEFINED)
 }
 
@@ -413,7 +429,9 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// of the species.
 fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_shared(this, "slice")?;
+    // (Its length read seq-cst, 25.2.5.6: as by `byteLength`.)
     let len = sync_length(o);
+    catch_up(vm);
     let first = relative(integer(vm, arg(a, 0))?, len);
     let end = arg(a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };

@@ -42,7 +42,7 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
     // are any, a second renames them apart (see `Parser::reference`).
     let lexical = has_lexical(toks);
     let (first, table) = parse_pass(toks, arena, skim && !lexical, true, None, None, None, None)?;
-    if table.trivial() {
+    if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
         return Ok(first);
     }
     parse_pass(toks, arena, skim, false, Some(table), Some(&first), None, None).map(|(p, _)| p)
@@ -71,7 +71,7 @@ pub fn parse_source_as<'a>(
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
-    if table.trivial() {
+    if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
         return Ok(first);
     }
     let mut toks = super::lex::lex(src)?;
@@ -85,7 +85,7 @@ pub fn parse_source_as<'a>(
 pub fn parse_module<'a>(src: &str, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex_as(src, true)?;
     let (first, table) = parse_pass(&mut toks, arena, false, false, None, None, None, Some(id))?;
-    if table.trivial() {
+    if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
         return Ok(first);
     }
     let mut toks = super::lex::lex_as(src, true)?;
@@ -281,7 +281,8 @@ struct Table {
 
 impl Table {
     /// Nothing to rename but catch parameters (renamed only along with
-    /// other names).
+    /// other names, or for a direct `eval`, which sees a catch parameter
+    /// apart from its function's `var` by the name: see `parse_with`).
     fn trivial(&self) -> bool {
         !self.defaults && self.decls.values().flatten().all(|&(_, kind)| kind == CATCH)
     }

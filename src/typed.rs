@@ -23,10 +23,12 @@
 //! runtime, as it does once a buffer has been detached
 //! (`Vm::views_detached`).
 //!
-//! A view of a growable shared buffer has flag `SHARED_GROWABLE`: where
-//! the spec reads its length seq-cst, it is read from the buffer's block
-//! first ([`read_view_length`]), as another agent may have grown it, and
-//! compiled code leaves its `length` to the runtime (see `shared`).
+//! A length-tracking view of a growable shared buffer has flag
+//! `SHARED_GROWABLE`: where the spec reads its length seq-cst
+//! ([`ta_length_seq_cst`], [`view_byte_length_seq_cst`]), it is read
+//! from the buffer's block first, as another agent may have grown it,
+//! and compiled code leaves its `length` to the runtime (see `shared`).
+//! (Another view's length is fixed: a shared buffer never shrinks.)
 
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_number};
@@ -295,7 +297,9 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
             (*o).flags |= IMMUTABLE_VIEW;
         }
     }
-    if is_resizable(b) && crate::shared::is_shared(b) {
+    // (A fixed-length view's length can't change: its buffer never
+    // shrinks, so it stays in bounds.)
+    if len.is_none() && is_resizable(b) && crate::shared::is_shared(b) {
         unsafe { (*o).flags |= SHARED_GROWABLE };
         // (Compiled code that read a known typed array's length unchecked
         // dropped: see `jit`'s `Prop::Length`.)
@@ -308,15 +312,39 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
     Ok(object_value(o))
 }
 
-/// View `o`'s buffer's length read from its block, if it's a growable
-/// shared one's (flag `SHARED_GROWABLE`), before the spec's seq-cst read
-/// of it (MakeTypedArrayWithBufferWitnessRecord(o, seq-cst)): another
-/// agent may have grown it (#156; see `shared`).
+/// View `o`'s buffer's length read from its block if it tracks a
+/// growable shared one's (flag `SHARED_GROWABLE`): another agent may have
+/// grown it (#156; see `shared`).
 #[inline]
-pub(crate) fn read_view_length(vm: &mut Vm, o: *mut Object) {
-    if unsafe { (*o).flags } & SHARED_GROWABLE != 0 {
+fn read_view_length(vm: &mut Vm, o: *mut Object) {
+    // (Out of line: inlined, its catch-up's loop made each caller save
+    // every register, 5% on an interpreted `ta.length`.)
+    #[cold]
+    #[inline(never)]
+    fn read(vm: &mut Vm, o: *mut Object) {
         crate::shared::read_length(vm, buffer_of(o));
     }
+    if unsafe { (*o).flags } & SHARED_GROWABLE != 0 {
+        read(vm, o);
+    }
+}
+
+/// Typed array `o`'s length as by [`ta_length`], of its record made
+/// seq-cst (MakeTypedArrayWithBufferWitnessRecord(o, seq-cst)): where the
+/// spec makes one so, the getters, ValidateTypedArray and the like.
+#[inline]
+pub(crate) fn ta_length_seq_cst(vm: &mut Vm, o: *mut Object) -> Option<usize> {
+    read_view_length(vm, o);
+    ta_length(o)
+}
+
+/// `DataView` `o`'s byte length as by [`view_byte_length`], of its record
+/// made seq-cst (GetViewByteLength of
+/// MakeDataViewWithBufferWitnessRecord(o, seq-cst)).
+#[inline]
+pub(crate) fn view_byte_length_seq_cst(vm: &mut Vm, o: *mut Object) -> Option<usize> {
+    read_view_length(vm, o);
+    view_byte_length(o)
 }
 
 /// A typed array of kind `k` gets prototype `proto`. Compiled code takes
@@ -564,12 +592,18 @@ fn this_typed(this: Value) -> Result<*mut Object> {
     }
 }
 
+/// `this` as a typed array, and its length of a record made seq-cst
+/// (`None` if out of bounds): the getters', 23.2.3.
+fn this_typed_seq_cst(vm: &mut Vm, this: Value) -> Result<(*mut Object, Option<usize>)> {
+    let o = this_typed(this)?;
+    Ok((o, ta_length_seq_cst(vm, o)))
+}
+
 /// ValidateTypedArray(v, seq-cst): `v` a typed array in bounds, and its
 /// length.
 fn validate(vm: &mut Vm, v: Value) -> Result<(*mut Object, usize)> {
     let o = this_typed(v)?;
-    read_view_length(vm, o);
-    match ta_length(o) {
+    match ta_length_seq_cst(vm, o) {
         Some(n) => Ok((o, n)),
         None => Err(Error::type_error("Cannot perform this operation on a detached or out of bounds typed array")),
     }
@@ -676,9 +710,7 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
     let fo = as_object(first);
     match unsafe { (*fo).class } {
         Class::TypedArray => {
-            // (Its record made seq-cst.)
-            read_view_length(vm, fo);
-            let Some(n) = ta_length(fo) else {
+            let Some(n) = ta_length_seq_cst(vm, fo) else {
                 return Err(Error::type_error("Cannot construct from a detached or out of bounds typed array"));
             };
             let sk = kind_of(fo);
@@ -746,10 +778,7 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, n: Option
         return Err(Error::type_error("Cannot construct a typed array on a detached ArrayBuffer"));
     }
     // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
-    if crate::shared::is_shared(b) {
-        crate::shared::read_length(vm, b);
-    }
-    let bytes = unsafe { (*b).elems_len } as usize;
+    let bytes = crate::shared::read_length(vm, b);
     let len = match n {
         None if is_resizable(b) => {
             if offset > bytes {
@@ -851,24 +880,18 @@ fn typed_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(object_value(buffer_of(this_typed(this)?)))
 }
 
-// (The getters' records are made seq-cst: 23.2.3.)
-
 fn typed_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = this_typed(this)?;
-    read_view_length(vm, o);
-    Ok(Value::number((ta_length(o).unwrap_or(0) * kind_of(o).size()) as f64))
+    let (o, len) = this_typed_seq_cst(vm, this)?;
+    Ok(Value::number((len.unwrap_or(0) * kind_of(o).size()) as f64))
 }
 
 fn typed_byte_offset(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = this_typed(this)?;
-    read_view_length(vm, o);
-    Ok(Value::number(if ta_length(o).is_some() { offset_of(o) as f64 } else { 0.0 }))
+    let (o, len) = this_typed_seq_cst(vm, this)?;
+    Ok(Value::number(if len.is_some() { offset_of(o) as f64 } else { 0.0 }))
 }
 
 fn typed_length_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let o = this_typed(this)?;
-    read_view_length(vm, o);
-    Ok(Value::number(ta_length(o).unwrap_or(0) as f64))
+    Ok(Value::number(this_typed_seq_cst(vm, this)?.1.unwrap_or(0) as f64))
 }
 
 /// `get %TypedArray%.prototype[Symbol.toStringTag]`: the kind's name.
@@ -1158,17 +1181,14 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if offset < 0.0 {
         return Err(Error::range_error("offset is out of bounds"));
     }
-    // (The target's and a typed array source's records made seq-cst.)
-    read_view_length(vm, o);
-    let Some(len) = ta_length(o) else {
+    let Some(len) = ta_length_seq_cst(vm, o) else {
         return Err(Error::type_error("Cannot perform set on a detached or out of bounds typed array"));
     };
     let src = arg(a, 0);
     let k = kind_of(o);
     if is_class(src, Class::TypedArray) {
         let s = as_object(src);
-        read_view_length(vm, s);
-        let Some(n) = ta_length(s) else {
+        let Some(n) = ta_length_seq_cst(vm, s) else {
             return Err(Error::type_error("Cannot set from a detached or out of bounds typed array"));
         };
         if offset == f64::INFINITY || n as f64 + offset > len as f64 {
@@ -1375,9 +1395,7 @@ fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
     let b = buffer_of(o);
-    // (Its record made seq-cst.)
-    read_view_length(vm, o);
-    let len = ta_length(o).unwrap_or(0);
+    let len = ta_length_seq_cst(vm, o).unwrap_or(0);
     let s = relative(integer(vm, arg(a, 0))?, len);
     let k = kind_of(o);
     let begin = offset_of(o) + s * k.size();

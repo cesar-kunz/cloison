@@ -903,8 +903,8 @@ pub struct Vm {
     /// A fixed-length buffer has been detached (see `typed::detach`): its
     /// views' lengths, which nothing brought up to date, may be stale.
     pub(crate) views_detached: bool,
-    /// Some typed array or `DataView` is of a growable shared buffer
-    /// (`object::SHARED_GROWABLE`): compiled code reads no typed array's
+    /// Some typed array or `DataView` tracks a growable shared buffer's
+    /// length (`object::SHARED_GROWABLE`): compiled code reads no typed array's
     /// length unchecked.
     pub(crate) shared_growable_views: bool,
     /// Some typed array has had another kind's prototype (see
@@ -3355,12 +3355,11 @@ impl Vm {
     /// An array's, a string's or a typed array's `length` (a typed array's
     /// 0 once its buffer is detached: see `typed::ta_length`; a far array's
     /// its store's: see `far`; a growable shared buffer's view's read from
-    /// its block, as the getter would: see `typed::read_view_length`).
+    /// its block, as the getter would: see `typed::ta_length_seq_cst`).
     fn length_field(&mut self, o: *mut Object) -> u32 {
         unsafe {
             if (*o).class == Class::TypedArray {
-                crate::typed::read_view_length(self, o);
-                return crate::typed::ta_length(o).unwrap_or(0) as u32;
+                return crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32;
             }
             crate::far::array_length(o)
         }

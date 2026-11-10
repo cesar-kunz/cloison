@@ -277,7 +277,7 @@ pub const DETACHED: u8 = 64;
 /// A typed array or `DataView` of an immutable buffer (see `typed`):
 /// stores into it fail; `LENGTH_READ_ONLY`'s bit, as views aren't arrays.
 pub const IMMUTABLE_VIEW: u8 = 64;
-/// A typed array or `DataView` of a growable shared buffer: its length
+/// A typed array or `DataView` tracking a growable shared buffer's length:
 /// read from the block where the spec reads it seq-cst (see `shared`);
 /// `FAR`'s bit, as views aren't arrays, so compiled code's length reads,
 /// which check `FAR`, leave it to the runtime.

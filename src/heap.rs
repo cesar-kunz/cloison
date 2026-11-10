@@ -61,13 +61,21 @@ pub const HEAPS: usize = SPACE / SLICE;
 /// then whole pages).
 const CHUNK: usize = 8 << 20;
 
-/// The system's page size: what `mmap`, `mprotect` and `munmap` round to
-/// (16 KiB on Apple silicon, 4 KiB elsewhere).
-pub(crate) const PAGE: usize = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-    16 << 10
-} else {
-    4 << 10
-};
+/// The system's page size: what `mmap`, `mprotect` and `munmap` round to.
+/// Read at run time (`sysconf`): 16 KiB on Apple silicon, 4 KiB on most
+/// Linux, but a Linux arm64 kernel may be built with 16 or 64 KiB pages
+/// (#55).
+pub(crate) fn page_size() -> usize {
+    static PAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let page = PAGE.load(std::sync::atomic::Ordering::Relaxed);
+    if page != 0 {
+        return page;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    assert!(page.is_power_of_two(), "sysconf(_SC_PAGESIZE) gave {page}");
+    PAGE.store(page, std::sync::atomic::Ordering::Relaxed);
+    page
+}
 
 /// Metadata bit of an old cell's last granule.
 pub const END: u8 = 0x04;
@@ -138,6 +146,10 @@ const BASES: [usize; 4] = [0x1000 << 32, 0x2000 << 32, 0x3000 << 32, 0x4000 << 3
 
 fn space() -> &'static Space {
     SPACE_.get_or_init(|| {
+        // Committed a chunk at a time, the cards (the smallest side table)
+        // must be whole pages.
+        let page = page_size();
+        assert!((CHUNK / CARD).is_multiple_of(page), "{page}-byte pages");
         for base in BASES {
             if !reserve_at(base, SPACE) {
                 continue;

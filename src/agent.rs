@@ -133,9 +133,9 @@ impl State {
     }
 }
 
-fn source_of(v: Value) -> Result<String> {
+fn source_of(v: Value) -> Result<Vec<u16>> {
     match string_units(v) {
-        Some(u) => Ok(crate::js::lex::units_to_string(u)),
+        Some(u) => Ok(u.to_vec()),
         None => Err(Error::type_error("$262.agent.start: the source is not a string")),
     }
 }
@@ -179,7 +179,7 @@ fn agent_start(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// An agent's thread: its script, then each broadcast's callback, until
 /// it leaves (or throws, or its starter is dropped). Its heap goes in
 /// `slice`, which its starter reserved.
-fn run_agent(src: &str, slice: crate::heap::Slice, mailbox: &Arc<Mailbox>, reports: Reports) {
+fn run_agent(src: &[u16], slice: crate::heap::Slice, mailbox: &Arc<Mailbox>, reports: Reports) {
     run_agent_vm(Vm::with_heap(crate::heap::Heap::with_slice(slice)), src, mailbox, reports);
     // (A broadcaster may be posting to it: closed, under the lock it
     // posts and waits under, it takes nothing.)
@@ -193,9 +193,9 @@ fn report_error(line: std::fmt::Arguments) {
     let _ = writeln!(std::io::stderr(), "agent: {line}");
 }
 
-fn run_agent_vm(mut vm: Vm, src: &str, mailbox: &Mailbox, reports: Reports) {
+fn run_agent_vm(mut vm: Vm, src: &[u16], mailbox: &Mailbox, reports: Reports) {
     vm.agent.report_to = Some(reports);
-    let module = match crate::js::compile_source(src) {
+    let module = match crate::js::compile_source(&crate::js::lex::Source::from_units(src)) {
         Ok(m) => m,
         Err(e) => {
             report_error(format_args!("SyntaxError: {e}"));

@@ -533,7 +533,10 @@ slot recorded into an evacuation candidate while it held the right
 half could be rewritten as that address's cell moved).
 The marker reads cells and `Code::upvalues` (immutable once loaded) and
 writes only old cells' metadata, which the mutator writes only in
-pauses.
+pauses. It reads each cell's header word once, with Acquire, and works
+from that value: the mutator may give an old object a new shape
+meanwhile, published by `Vm::add_shape`'s Release fence (the contract
+is "The header word" at `layout::Header`).
 
 ### Pacing
 

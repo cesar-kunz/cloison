@@ -4981,6 +4981,17 @@ unsafe fn store_imm(base: *mut u8, v: Value) {
 }
 ldst_imm!(load_imm, store_imm, cloison_hole_imm, "#:lo12:{s}", "{s}@PAGEOFF");
 
+/// Give the object at `o`, which may be old, shape `s`: a transition's,
+/// an address the JIT patched in or a cache holds, so made by
+/// `Vm::add_shape` before, on this thread. Relaxed atomic, so LLVM keeps
+/// it one 64-bit store of its own, neither split nor merged with a
+/// neighbour's: a `mov` on x86-64, a `str` on arm64, as a plain store
+/// (see "The header word" at `layout::Header`).
+#[inline(always)]
+unsafe fn set_shape(o: *mut u8, s: u64) {
+    unsafe { (*(&raw mut (*header(o)).shape).cast::<core::sync::atomic::AtomicU64>()).store(s, core::sync::atomic::Ordering::Relaxed) }
+}
+
 /// The object's out-of-line slots.
 #[inline(always)]
 unsafe fn props(o: *mut u8) -> *mut u8 {
@@ -5097,7 +5108,7 @@ unsafe fn mega_store(tag: NumberTag, o: Value, v: Value, int: bool) -> bool {
             if (*e).epoch != epoch || loc < 0 && !loc as u32 >= props_cap(header(p)) {
                 return false;
             }
-            (*header(p)).shape = new;
+            set_shape(p, new);
         }
         if loc >= 0 {
             let at = p.add(loc as usize) as *mut Value;
@@ -5148,7 +5159,7 @@ macro_rules! set_tro {
 #[inline(always)]
 unsafe fn tro_store(tag: NumberTag, o: *mut u8, v: Value, barrier_needed: bool) {
     unsafe {
-        (*header(o)).shape = imm64b();
+        set_shape(o, imm64b());
         let p = props(o);
         store_imm(p, v);
         if barrier_needed {
@@ -5355,7 +5366,7 @@ macro_rules! property_location {
         // target aarch64 set_tr_m: 30 now 31 (judged 2026-10-26)
         stencil!("set_tr_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            (*header(o)).shape = imm64b();
+            set_shape(o, imm64b());
             store_imm(o, s.acc);
             barrier(s.tag, o, o, s.acc);
             next!(s)
@@ -5383,7 +5394,7 @@ macro_rules! property_location {
         });
         stencil!("set_tr_n_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            (*header(o)).shape = imm64b();
+            set_shape(o, imm64b());
             store_imm(o, s.acc);
             next!(s)
         });
@@ -5397,7 +5408,7 @@ macro_rules! property_location {
         });
         stencil!("set_tr_d_", loc!($loc); |s| {
             let Some(o) = guard_shape(s.tag, get!($loc, s)) else { exit!(s) };
-            (*header(o)).shape = imm64b();
+            set_shape(o, imm64b());
             store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
             next!(s)
         });
@@ -5675,7 +5686,7 @@ macro_rules! property_location {
         // target aarch64 set_tr_nc_m: 21 now 26 (judged 2026-10-26)
         stencil!("set_tr_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
-            (*header(o)).shape = imm64b();
+            set_shape(o, imm64b());
             store_imm(o, s.acc);
             barrier(s.tag, o, o, s.acc);
             next!(s)
@@ -5704,7 +5715,7 @@ macro_rules! property_location {
         // target aarch64 set_tr_n_nc_m: 6 (judged 2026-10-26)
         stencil!("set_tr_n_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
-            (*header(o)).shape = imm64b();
+            set_shape(o, imm64b());
             store_imm(o, s.acc);
             next!(s)
         });
@@ -5722,7 +5733,7 @@ macro_rules! property_location {
         // target aarch64 set_tr_d_nc_m: 9 (judged 2026-10-26)
         stencil!("set_tr_d_nc_", loc!($loc); |s| {
             let o = get!($loc, s).to_bits() as *mut u8;
-            (*header(o)).shape = imm64b();
+            set_shape(o, imm64b());
             store_imm(o, s.tag.encode_f64(i2f(int(s.acc))));
             next!(s)
         });
@@ -7028,7 +7039,7 @@ macro_rules! array_methods {
             if len < elems_cap(header(o)) {
                 let to = push_transition(s.tag, shape_of(o), v);
                 if to != 0 {
-                    (*header(o)).shape = to;
+                    set_shape(o, to);
                     let at = ((*header(o)).elems.cast::<Value>()).add(len as usize);
                     *at = v;
                     barrier(s.tag, payload_cell((*header(o)).elems), at, v);
@@ -7074,7 +7085,7 @@ macro_rules! array_methods {
             if len < elems_cap(header(o)) {
                 let to = push_transition(s.tag, shape_of(o), v);
                 if to != 0 {
-                    (*header(o)).shape = to;
+                    set_shape(o, to);
                     *((*header(o)).elems.cast::<Value>()).add(len as usize) = v;
                     (*header(o)).elems_len = len + 1;
                     s.acc = unboxed(len as i32 + 1);

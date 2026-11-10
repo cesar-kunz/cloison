@@ -3426,7 +3426,23 @@ impl<'a> Parser<'_, 'a, '_> {
                 continue;
             }
             for (orig, renamed) in &frame.names {
-                if orig == renamed || orig.contains('%') || seen.contains(orig) {
+                if orig == renamed || orig.contains('%') {
+                    continue;
+                }
+                // (One a binding inside it shadows: not seen, but a catch
+                // parameter's of the name, simple, is no exception to the
+                // `eval`'s declarations' checks then, which see every
+                // binding between it and its function's scope: 19.2.1.3
+                // steps 3.d and 11, B.3.4.)
+                if seen.contains(orig) {
+                    if !outer && !frame.catch {
+                        let at = out.chunks(3).position(|t: &[Expr<'a>]| matches!(&t[0].kind, ExprKind::Str(o) if o == &**orig));
+                        if let Some(e) = at.and_then(|i| out.get_mut(3 * i + 2))
+                            && let ExprKind::Num(k) = e.kind
+                        {
+                            e.kind = ExprKind::Num((k as u8 & !EVAL_CATCH) as f64);
+                        }
+                    }
                     continue;
                 }
                 seen.push(orig.clone());

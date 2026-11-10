@@ -10596,6 +10596,31 @@ fn modules_eval_sees_imports_live() {
     );
 }
 
+/// A module's direct `eval` sees any number of its imports: given in
+/// parts of the registers left (52 of them past the room there was for
+/// one part of 48, 300 past any one part), live and not assignable.
+/// SpiderMonkey's values.
+#[test]
+fn modules_eval_sees_many_imports() {
+    for n in [52, 300] {
+        let lib: String = (0..n).map(|i| format!("export let x{i} = {i};\n")).collect();
+        let names: Vec<String> = (0..n).map(|i| format!("x{i}")).collect();
+        let main = format!(
+            "import {{ {} }} from './lib.mjs';\nimport {{ bump }} from './bump.mjs';\n\
+             let e; try {{ eval('x0 = 1'); }} catch (err) {{ e = err.name; }}\n\
+             globalThis.result = [eval('x0 + x{}'), e, eval('bump(), x1')].join();",
+            names.join(", "),
+            n - 1
+        );
+        let lib = format!("{lib}export function bump2() {{ x1 = 10; }}");
+        let dir = module_dir(
+            &format!("eval-imports-{n}"),
+            &[("main.mjs", &main), ("lib.mjs", &lib), ("bump.mjs", "import { bump2 } from './lib.mjs';\nexport const bump = bump2;")],
+        );
+        assert_eq!(run_module(&dir, "main.mjs").unwrap(), format!("{},TypeError,10", n - 1), "{n} imports");
+    }
+}
+
 /// Top-level `await`: a module waits for its async dependencies, which
 /// run in order; `import()` evaluates a module once and resolves to its
 /// namespace; a JSON module's default export is its value.

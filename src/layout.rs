@@ -214,6 +214,45 @@ pub const FAR: u8 = 128;
 /// - Code with the mutator stopped (pauses, `drain_parallel`, card
 ///   scanning, the verifier) reads the word plainly; the mutator's own
 ///   reads are plain too (it is the only writer).
+///
+/// # The other words, and what the marker relies on
+///
+/// The marker thread reads a cell's other words while the mutator
+/// writes them too: an object's slots, `props`, `elems` and `code`, an
+/// array's values, a function's upvalue pointers, an upvalue's `closed`.
+/// Each store to one of a cell that may be old, and each of the marker's
+/// loads, is a Relaxed atomic access ([`Word`]); the metadata bytes,
+/// which both threads write, are accessed as [`meta_load`] says. Two
+/// invariants make Relaxed enough, and the marker's reads of memory no
+/// atomic orders safe:
+/// - **The marker never follows a pointer to a young cell.** A cell is
+///   allocated young (`YOUNG` in its metadata), and only a pause makes it
+///   old: the marker reads a young cell's metadata byte (`YOUNG`, or the
+///   0 it had before, either of which it stops at) and nothing else of
+///   it. So every cell it traces was initialized before a pause handed
+///   the marking over to it, under a mutex (`gc::Marker`): that is the
+///   happens-before its plain reads of the cell's class and capacity
+///   need, and of the Rust data the cell pointed to then (a shape given
+///   since is published as the header word's contract above says).
+/// - **Nothing the marker may reach is freed while it marks.** Cells
+///   die only in pauses (large cells, `free_large`; young ones, in a
+///   minor collection) or once marking ended (the sweep, its blocks
+///   given back to allocation in `absorb_sweep`); shapes, codes,
+///   compiled patterns and compiled code only in pauses
+///   (`free_condemned_shapes`, `free_zombies`, `condemn_codes`,
+///   `prune_regexps`, `jit::free_retired`).
+///
+/// Of the Rust data cells point to, the marker reads: of a `Shape`,
+/// `mark` (atomic, which it stores), `proto` and `parent`
+/// (`gc::mark_object_shape`, only in a marking that collects shapes);
+/// of a function's `vm::Code`, `upvalues`' length (sizing and tracing
+/// the closure, never changed once loaded) and `mark` (atomic, stored);
+/// of a RegExp's `regexp::Regex`, `mark` (atomic, stored), reached
+/// through `code` loaded with Acquire, which `RegExp.prototype.compile`
+/// stores with Release. The mutator never takes a `&mut` to a whole
+/// `Code` or `Shape` the marker may be reading: it writes the fields it
+/// changes through raw places (`Vm::load_functions`,
+/// `Shape::dictionary_slots`).
 #[repr(C)]
 pub struct Header {
     pub shape: u64,
@@ -383,9 +422,9 @@ pub unsafe fn class_kind(h: *const Header) -> u32 {
 ///
 /// Relaxed is enough for a word that is a value or a payload pointer:
 /// the marker follows it only to an old cell, which a pause handed over
-/// to it. A word the marker follows into
-/// Rust data, a RegExp's `code`, is stored with Release and loaded with
-/// Acquire instead.
+/// to it (see "The other words" at [`Header`]). A word the marker
+/// follows into Rust data, a RegExp's `code`, is stored with Release and
+/// loaded with Acquire instead.
 pub trait Word: Copy {
     /// The word at `p`, with a Relaxed atomic load.
     ///

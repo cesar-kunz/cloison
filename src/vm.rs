@@ -2618,6 +2618,7 @@ impl Vm {
 
     /// A plain object with prototype `proto`.
     pub fn new_object(&mut self, proto: Value) -> *mut Object {
+        self.check_own(proto, "new_object");
         self.new_object_with(Class::Plain, proto, 4)
     }
 
@@ -3236,6 +3237,16 @@ impl Vm {
         std::ptr::eq(crate::interp::current_vm(), self)
     }
 
+    /// Panics if `v` is a cell of another VM's heap: stored here, this
+    /// heap's collector would mark it in the other's metadata (issue #223).
+    /// A tag test alone for a value not a cell.
+    #[inline(always)]
+    fn check_own(&self, v: Value, what: &str) {
+        if v.is_cell() && !self.heap.contains(v.to_bits() as usize) {
+            foreign_cell(what)
+        }
+    }
+
     /// `f` run from the host between runs, with this VM entered as a run
     /// enters it: the one running (the public operations reach it through
     /// `interp::current_vm` too: a cons string key made flat, a native
@@ -3287,6 +3298,7 @@ impl Vm {
 
     /// `obj[name]`.
     pub fn get(&mut self, obj: Value, name: Atom) -> Result<Value> {
+        self.check_own(obj, "get");
         if !self.running() {
             return self.host(|vm| vm.get(obj, name));
         }
@@ -3582,6 +3594,8 @@ impl Vm {
 
     /// `obj[name] = value`.
     pub fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
+        self.check_own(obj, "set");
+        self.check_own(value, "set");
         if !self.running() {
             return self.host(|vm| vm.set(obj, name, value));
         }
@@ -4202,6 +4216,8 @@ impl Vm {
     /// but in a proxy until some other object has had one, or a proxy
     /// became a prototype), OrdinaryHasInstance.
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
+        self.check_own(v, "instance_of");
+        self.check_own(f, "instance_of");
         if !self.running() {
             return self.host(|vm| vm.instance_of(v, f));
         }
@@ -4331,6 +4347,8 @@ impl Vm {
     /// `key in obj`: whether `obj` or its prototypes have the property or
     /// element `key`.
     pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+        self.check_own(obj, "has_property");
+        self.check_own(key, "has_property");
         if !self.running() {
             return self.host(|vm| vm.has_property(obj, key));
         }
@@ -4372,6 +4390,8 @@ impl Vm {
     /// removed, the object getting a shape of its own without it (see
     /// [`Vm::delete_named`]). False for what can't be deleted.
     pub fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
+        self.check_own(obj, "delete_property");
+        self.check_own(key, "delete_property");
         if !self.running() {
             return self.host(|vm| vm.delete_property(obj, key));
         }
@@ -4774,6 +4794,8 @@ impl Vm {
 
     /// `obj[key]`.
     pub fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
+        self.check_own(obj, "get_keyed");
+        self.check_own(key, "get_keyed");
         if !self.running() {
             return self.host(|vm| vm.get_keyed(obj, key));
         }
@@ -4947,6 +4969,9 @@ impl Vm {
     }
 
     pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
+        self.check_own(obj, "set_keyed");
+        self.check_own(key, "set_keyed");
+        self.check_own(value, "set_keyed");
         if !self.running() {
             return self.host(|vm| vm.set_keyed(obj, key, value));
         }
@@ -5277,6 +5302,7 @@ impl Vm {
     /// prototype chain. A name seen once (even not enumerable) hides it
     /// further up. Null and undefined have none.
     pub fn for_in_keys(&mut self, v: Value) -> Result<Value> {
+        self.check_own(v, "for_in_keys");
         if !self.running() {
             return self.host(|vm| Ok(vm.for_in_key_array(v)));
         }
@@ -6399,6 +6425,9 @@ impl Vm {
     /// enters itself).
     #[inline]
     pub fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
+        self.check_own(f, "call_other");
+        self.check_own(this, "call_other");
+        args.iter().for_each(|&a| self.check_own(a, "call_other"));
         if !self.running() {
             return self.host(|vm| vm.call_other(f, this, args));
         }
@@ -6429,6 +6458,8 @@ impl Vm {
     /// `new f(…args)` when `f` isn't a bytecode function: a native that
     /// constructs (`Array`, `Object`) makes its object.
     pub fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
+        self.check_own(f, "construct_other");
+        args.iter().for_each(|&a| self.check_own(a, "construct_other"));
         if !self.running() {
             return self.host(|vm| vm.construct_other(f, args));
         }
@@ -8055,6 +8086,12 @@ fn array_push_flagged(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value>
 }
 
 /// `String(v)` for the values that exist so far.
+#[cold]
+#[inline(never)]
+fn foreign_cell(what: &str) -> ! {
+    panic!("Vm::{what}: a value not of this VM's heap")
+}
+
 pub fn display(v: Value) -> String {
     if v.is_int32() {
         return v.as_i32_unchecked().to_string();

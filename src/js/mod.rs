@@ -11,7 +11,6 @@ pub mod codegen;
 pub mod lex;
 pub mod parse;
 
-use std::rc::Rc;
 
 use crate::asm::{Checked, LazyFn, Module};
 use lex::Source;
@@ -37,9 +36,13 @@ impl Error {
         format!("{line}:{col}: {}", self.msg)
     }
 
-    /// [`Error::display`], the offset one of source code `src`: its
-    /// column counts the characters of the text, not the `ESCAPE`s.
+    /// [`Error::display`], the offset one of source code `src`: a
+    /// string's code units' column counts their characters, not the
+    /// `ESCAPE`s (see `lex::Source`).
     pub fn display_source(&self, src: &Source) -> String {
+        if !src.is_units() {
+            return self.display(src.as_str());
+        }
         let s = src.as_str();
         let before = &s[..self.pos.min(s.len())];
         let line = before.matches('\n').count() + 1;
@@ -47,24 +50,17 @@ impl Error {
         let col = last.chars().count() - lex::escapes_before(last, last.len()) + 1;
         format!("{line}:{col}: {}", self.msg)
     }
-
-    /// The error, at an offset of source code `src`, at the offset of the
-    /// text it was made of (see `lex::Source::from_text`).
-    fn in_text(mut self, src: &Source) -> Error {
-        self.pos = src.text_offset(self.pos);
-        self
-    }
 }
 
-// The entry points taking a `&str` take a file's text; the others, source
-// code (`lex::Source`): `eval`'s and `Function`'s a string's code units,
-// lone surrogates their own (see `lex::Source::from_units`).
+// The entry points taking a `&str` take a file's text, their offsets (an
+// AST's, a token's, an error's) the text's; the others, source code
+// (`lex::Source`), their offsets its: `eval`'s and `Function`'s a string's
+// code units, lone surrogates their own (see `lex::Source::from_units`).
 
 /// Parse `text`, a script's text: its syntax error, if any (at an offset
 /// of `text`).
 pub fn parse(text: &str) -> Result<(), Error> {
-    let src = Source::from_text(text);
-    check_source(&src).map_err(|e| e.in_text(&src))
+    check_source(&Source::from_text(text))
 }
 
 /// [`parse`] of source code `src` (its error at an offset of `src`).
@@ -87,7 +83,7 @@ pub fn is_one_function_source(src: &Source) -> bool {
 /// `line:column: message`.
 pub fn compile(text: &str) -> Result<Checked, String> {
     let src = Source::from_text(text);
-    compile_checked(&src).map_err(|e| e.in_text(&src).display(text))
+    compile_checked(&src).map_err(|e| e.display(text))
 }
 
 /// [`compile`] of source code `src`.
@@ -108,7 +104,7 @@ fn compile_checked(src: &Source) -> Result<Checked, Error> {
 pub fn module_info(text: &str, id: i32) -> Result<ast::ModuleInfo, String> {
     let src = Source::from_text(text);
     let arena = ast::Arenas::default();
-    let p = parse::parse_module_source(&src, &arena, id).map_err(|e| e.in_text(&src).display(text))?;
+    let p = parse::parse_module_source(&src, &arena, id).map_err(|e| e.display(text))?;
     Ok(p.module.unwrap_or_default())
 }
 
@@ -126,7 +122,7 @@ pub fn compile_module(text: &str, id: i32, links: &[Option<String>]) -> Result<M
             }
             codegen::generate_source(&p, &src)
         })
-        .map_err(|e| e.in_text(&src).display(text))
+        .map_err(|e| e.display(text))
 }
 
 /// Compile `src`, a script run by `eval` or made by `Function`, leaving
@@ -134,11 +130,11 @@ pub fn compile_module(text: &str, id: i32, links: &[Option<String>]) -> Result<M
 /// [`codegen::generate_lazy`]), their bodies only skimmed (see
 /// [`parse::parse_with`]).
 pub fn compile_script_lazy_source(src: &Source) -> Result<Module, String> {
-    let source: Rc<str> = src.as_str().into();
+    let (source, at) = src.unit_string();
     let compile = |skim| {
         let arena = ast::Arenas::default();
         parse::parse_source_code(src, &arena, skim)
-            .and_then(|p| codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[]))
+            .and_then(|p| codegen::generate_lazy(&p, 0, &source, &*at, &[]))
     };
     match compile(true) {
         Err(e) if e.msg == codegen::SKIMMED_TOO_SOON => compile(false),
@@ -150,13 +146,13 @@ pub fn compile_script_lazy_source(src: &Source) -> Result<Module, String> {
 /// Compile `src` as indirect `eval`'s code: as a script's, but its
 /// block-scoped bindings its own, and strict code's `var`s and functions.
 pub fn compile_indirect_eval_source(src: &Source) -> Result<Module, String> {
-    let source: Rc<str> = src.as_str().into();
+    let (source, at) = src.unit_string();
     let compile = |skim| {
         let arena = ast::Arenas::default();
         parse::parse_source_code(src, &arena, skim).and_then(|mut p| {
             p.eval_locals = p.functions[0].strict;
             p.script = false;
-            codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
+            codegen::generate_lazy(&p, 0, &source, &*at, &[])
         })
     };
     match compile(true) {
@@ -193,12 +189,12 @@ pub fn compile_direct_eval_source(
     global: bool,
     bound: &[(ast::Name, u8, ast::Name, usize)],
 ) -> Result<Module, String> {
-    let source: Rc<str> = src.as_str().into();
+    let (source, at) = src.unit_string();
     let compile = |skim| {
         let arena = ast::Arenas::default();
         parse::parse_source_code_as(src, &arena, skim, Some((strict, chain, !bound.is_empty(), global, new_target, home, live_this))).and_then(|mut p| {
             p.eval_upvalues = bound.to_vec();
-            codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
+            codegen::generate_lazy(&p, 0, &source, &*at, &[])
         })
     };
     match compile(true) {
@@ -262,7 +258,7 @@ pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
     let at = |pos: ast::Pos| (pos as usize).saturating_sub(prefix) as u32 + f.start;
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source_code(&Source::encoded(&text), &arena, skim).and_then(|mut p| {
+        parse::parse_source_code(&Source::of_unit_string(&text), &arena, skim).and_then(|mut p| {
             p.own_names = f.own_names.iter().map(|n| (**n).into()).collect();
             codegen::generate_lazy(&p, 2, &f.source, &at, &f.upvalues)
         })
@@ -271,7 +267,7 @@ pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
         Err(e) if e.msg == codegen::SKIMMED_TOO_SOON => compile(false),
         r => r,
     }
-    .map_err(|e| Error::new(at(e.pos as ast::Pos) as usize, e.msg).display_source(&Source::encoded(&f.source)))
+    .map_err(|e| Error::new(at(e.pos as ast::Pos) as usize, e.msg).display_source(&Source::of_unit_string(&f.source)))
 }
 
 /// `String(v)` for a number, as a property key.

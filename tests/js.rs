@@ -10764,6 +10764,35 @@ fn views_see_a_grow_through_a_critical_section() {
     }
 }
 
+/// Another agent's grow of one buffer, seen by the views of another it
+/// grew before, once this agent reads the second's grown length through
+/// `byteLength`, `slice`, `grow` (a shrink it refuses) (issue #155: only
+/// the second buffer's views were brought up to date).
+#[test]
+fn views_see_grows_before_a_grown_length_read() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    for seen in ["sab2.byteLength !== 16", "sab2.slice(0).byteLength !== 16", "(() => { try { sab2.grow(16); } catch (e) { return true; } })()"] {
+        let src = format!(
+            r#"
+            $262.agent.start(`var first; $262.agent.receiveBroadcast(function (sab) {{
+                if (!first) {{ first = sab; return; }}
+                first.grow(64);
+                sab.grow(64);
+                $262.agent.leaving();
+            }});`);
+            var sab1 = new SharedArrayBuffer(16, {{ maxByteLength: 64 }});
+            var sab2 = new SharedArrayBuffer(16, {{ maxByteLength: 64 }});
+            var ia = new Int32Array(sab1), dv = new DataView(sab1, 8);
+            $262.agent.broadcast(sab1);
+            $262.agent.broadcast(sab2);
+            while (!({seen}));
+            [ia.length, dv.byteLength, sab1.byteLength, ia.length].join()
+        "#
+        );
+        assert_eq!(value(&src), "16,56,64,16", "{seen}");
+    }
+}
+
 /// `Promise.allKeyed` and `allSettledKeyed`: an object's own enumerable
 /// properties' values awaited, by the same keys.
 #[test]

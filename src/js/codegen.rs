@@ -5172,7 +5172,9 @@ impl<'a> Gen<'a> {
             }
             let this = self.alloc(pos)?;
             if self.f.arrow {
-                self.load_var("%this", pos)?;
+                // (Not checked: in a derived class's constructor before
+                // `super()`, its code's `this` is, see `Gen::eval_this`.)
+                self.load_raw("%this", pos)?;
             } else {
                 self.ldar(0);
             }

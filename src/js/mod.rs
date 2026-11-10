@@ -75,9 +75,9 @@ pub fn check_source(src: &Source) -> Result<(), Error> {
 /// Whether `src` is a script of one function expression alone, as what
 /// `Function` makes of its parameters and body must be: text of either
 /// can't end the function and go on after it (`"}); f(); (function(){"`).
-pub fn is_one_function(src: &Source) -> bool {
+pub fn is_one_function_source(src: &Source) -> bool {
     let arena = ast::Arenas::default();
-    parse::parse_source(src, &arena, true).is_ok_and(|p| {
+    parse::parse_source_code(src, &arena, true).is_ok_and(|p| {
         matches!(&p.functions[0].body[..], [ast::Stmt { kind: ast::StmtKind::Expr(e), .. }]
             if matches!(e.kind, ast::ExprKind::Function(_)))
     })
@@ -97,8 +97,8 @@ pub fn compile_source(src: &Source) -> Result<Checked, String> {
 
 fn compile_checked(src: &Source) -> Result<Checked, Error> {
     let arena = ast::Arenas::default();
-    parse::parse_source(src, &arena, false)
-        .and_then(|p| codegen::generate(&p, src))
+    parse::parse_source_code(src, &arena, false)
+        .and_then(|p| codegen::generate_source(&p, src))
         // SAFETY: the front end's code is right by construction.
         .map(|m| unsafe { Checked::new_unchecked(m) })
 }
@@ -108,7 +108,7 @@ fn compile_checked(src: &Source) -> Result<Checked, Error> {
 pub fn module_info(text: &str, id: i32) -> Result<ast::ModuleInfo, String> {
     let src = Source::from_text(text);
     let arena = ast::Arenas::default();
-    let p = parse::parse_module(&src, &arena, id).map_err(|e| e.in_text(&src).display(text))?;
+    let p = parse::parse_module_source(&src, &arena, id).map_err(|e| e.in_text(&src).display(text))?;
     Ok(p.module.unwrap_or_default())
 }
 
@@ -119,12 +119,12 @@ pub fn module_info(text: &str, id: i32) -> Result<ast::ModuleInfo, String> {
 pub fn compile_module(text: &str, id: i32, links: &[Option<String>]) -> Result<Module, String> {
     let src = Source::from_text(text);
     let arena = ast::Arenas::default();
-    parse::parse_module(&src, &arena, id)
+    parse::parse_module_source(&src, &arena, id)
         .and_then(|mut p| {
             for imp in p.imports.values_mut() {
                 imp.prop = links[imp.index].clone();
             }
-            codegen::generate(&p, &src)
+            codegen::generate_source(&p, &src)
         })
         .map_err(|e| e.in_text(&src).display(text))
 }
@@ -133,11 +133,11 @@ pub fn compile_module(text: &str, id: i32, links: &[Option<String>]) -> Result<M
 /// its functions to compile at their first calls (see
 /// [`codegen::generate_lazy`]), their bodies only skimmed (see
 /// [`parse::parse_with`]).
-pub fn compile_script_lazy(src: &Source) -> Result<Module, String> {
+pub fn compile_script_lazy_source(src: &Source) -> Result<Module, String> {
     let source: Rc<str> = src.as_str().into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source(src, &arena, skim)
+        parse::parse_source_code(src, &arena, skim)
             .and_then(|p| codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[]))
     };
     match compile(true) {
@@ -149,11 +149,11 @@ pub fn compile_script_lazy(src: &Source) -> Result<Module, String> {
 
 /// Compile `src` as indirect `eval`'s code: as a script's, but its
 /// block-scoped bindings its own, and strict code's `var`s and functions.
-pub fn compile_indirect_eval(src: &Source) -> Result<Module, String> {
+pub fn compile_indirect_eval_source(src: &Source) -> Result<Module, String> {
     let source: Rc<str> = src.as_str().into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source(src, &arena, skim).and_then(|mut p| {
+        parse::parse_source_code(src, &arena, skim).and_then(|mut p| {
             p.eval_locals = p.functions[0].strict;
             p.script = false;
             codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
@@ -168,9 +168,9 @@ pub fn compile_indirect_eval(src: &Source) -> Result<Module, String> {
 
 /// [`compile_indirect_eval`] of strict code: a strict script's own direct
 /// `eval`'s (as an indirect one's, but strict).
-pub fn compile_strict_eval(src: &Source) -> Result<Module, String> {
+pub fn compile_strict_eval_source(src: &Source) -> Result<Module, String> {
     parse::STRICT.set(true);
-    let r = compile_indirect_eval(src);
+    let r = compile_indirect_eval_source(src);
     parse::STRICT.set(false);
     r
 }
@@ -183,7 +183,7 @@ pub fn compile_strict_eval(src: &Source) -> Result<Module, String> {
 /// objects (see `intrinsics::direct_eval`). Or, with `bound`
 /// (`ast::Program::eval_upvalues`), also in the caller's bindings, its
 /// upvalues (see `intrinsics::direct_eval_bound`).
-pub fn compile_direct_eval(
+pub fn compile_direct_eval_source(
     src: &Source,
     strict: bool,
     new_target: bool,
@@ -196,7 +196,7 @@ pub fn compile_direct_eval(
     let source: Rc<str> = src.as_str().into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source_as(src, &arena, skim, Some((strict, chain, !bound.is_empty(), global, new_target, home, live_this))).and_then(|mut p| {
+        parse::parse_source_code_as(src, &arena, skim, Some((strict, chain, !bound.is_empty(), global, new_target, home, live_this))).and_then(|mut p| {
             p.eval_upvalues = bound.to_vec();
             codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
         })
@@ -206,6 +206,43 @@ pub fn compile_direct_eval(
         r => r,
     }
     .map_err(|e| e.display_source(src))
+}
+
+// The same of a script's text (`line:column`s the text's: see
+// `Error::display_source`).
+
+/// [`is_one_function_source`] of a script's text.
+pub fn is_one_function(text: &str) -> bool {
+    is_one_function_source(&Source::from_text(text))
+}
+
+/// [`compile_script_lazy_source`] of a script's text.
+pub fn compile_script_lazy(text: &str) -> Result<Module, String> {
+    compile_script_lazy_source(&Source::from_text(text))
+}
+
+/// [`compile_indirect_eval_source`] of a script's text.
+pub fn compile_indirect_eval(text: &str) -> Result<Module, String> {
+    compile_indirect_eval_source(&Source::from_text(text))
+}
+
+/// [`compile_strict_eval_source`] of a script's text.
+pub fn compile_strict_eval(text: &str) -> Result<Module, String> {
+    compile_strict_eval_source(&Source::from_text(text))
+}
+
+/// [`compile_direct_eval_source`] of a script's text.
+pub fn compile_direct_eval(
+    text: &str,
+    strict: bool,
+    new_target: bool,
+    home: bool,
+    live_this: bool,
+    chain: &str,
+    global: bool,
+    bound: &[(ast::Name, u8, ast::Name, usize)],
+) -> Result<Module, String> {
+    compile_direct_eval_source(&Source::from_text(text), strict, new_target, home, live_this, chain, global, bound)
 }
 
 /// Compile the function `f` stands for: its text, parsed again inside a
@@ -225,7 +262,7 @@ pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
     let at = |pos: ast::Pos| (pos as usize).saturating_sub(prefix) as u32 + f.start;
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source(&Source::encoded(&text), &arena, skim).and_then(|mut p| {
+        parse::parse_source_code(&Source::encoded(&text), &arena, skim).and_then(|mut p| {
             p.own_names = f.own_names.iter().map(|n| (**n).into()).collect();
             codegen::generate_lazy(&p, 2, &f.source, &at, &f.upvalues)
         })

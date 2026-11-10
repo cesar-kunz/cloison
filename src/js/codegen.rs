@@ -25,16 +25,30 @@ use std::rc::Rc;
 use crate::asm::{Constant, FunctionDef, LazyFn, Module};
 use crate::bytecode::{Arg, Assembler, Label, Op};
 
-pub fn generate(p: &Program, src: &super::lex::Source) -> Result<Module, Error> {
+/// Compile `p`, parsed from a script's or module's text `text` (with
+/// `parse::parse_source` or `parse::parse_module`); an error's offset is
+/// the text's.
+pub fn generate(p: &Program, text: &str) -> Result<Module, Error> {
+    let src = super::lex::Source::from_text(text);
+    generate_source(p, &src).map_err(|mut e| {
+        e.pos = src.text_offset(e.pos);
+        e
+    })
+}
+
+/// [`generate`] of `p`, parsed from source code `src` (an error at its
+/// offset).
+pub fn generate_source(p: &Program, src: &super::lex::Source) -> Result<Module, Error> {
     generate_from(p, None, src.as_str()).map(|(m, _)| m)
 }
 
 /// Compile only function `root` of `p` and leave the functions nested in
 /// it for later: each a stub ([`LazyFn`]) that compiles at its first call
-/// from its text in `source` (at the offsets `at` maps `p`'s to). Also
+/// from its text in `source` (at the offsets `at` maps `p`'s to; source
+/// code's, `lex::Source::as_str`, as `p` was parsed from). Also
 /// `root`'s upvalues, by name. (`eval`'s and `Function`'s code; their
 /// functions mostly are never called: CodeLoad's.)
-pub(crate) fn generate_lazy<'p>(
+pub fn generate_lazy<'p>(
     p: &'p Program,
     root: usize,
     source: &Rc<str>,

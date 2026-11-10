@@ -91,7 +91,7 @@ mod layout;
 use layout::{
     CARD, COLOR, CONS_MIN, EVAC, DirectSite, GRANULE, SLICE, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
-    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, MAPPED, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta_load, meta_store, payload_cell, props_cap, set_header_word, dispatch_slot,
+    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, MAPPED, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta_load, meta_store, payload_cell, store_word, props_cap, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
 };
 
@@ -4989,7 +4989,7 @@ unsafe fn load_imm(base: *mut u8) -> Value {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn store_imm(base: *mut u8, v: Value) {
-    unsafe { *at_imm(base) = v }
+    unsafe { store_word(at_imm(base), v) }
 }
 ldst_imm!(load_imm, store_imm, cloison_hole_imm, "#:lo12:{s}", "{s}@PAGEOFF");
 
@@ -5124,14 +5124,14 @@ unsafe fn mega_store(tag: NumberTag, o: Value, v: Value, int: bool) -> bool {
         }
         if loc >= 0 {
             let at = p.add(loc as usize) as *mut Value;
-            *at = v;
+            store_word(at, v);
             if !int {
                 barrier(tag, p, at, v);
             }
         } else {
             let q = props(p);
             let at = (q as *mut Value).add(!loc as usize);
-            *at = v;
+            store_word(at, v);
             if !int {
                 barrier(tag, payload_cell(q), at, v);
             }
@@ -5339,7 +5339,7 @@ macro_rules! set_keyed {
                 exit!($s)
             }
             let at = ((*header(p)).elems.cast::<Value>()).add(key as usize);
-            *at = $v;
+            store_word(at, $v);
             if $card {
                 barrier($s.tag, payload_cell((*header(p)).elems), at, $v);
             }
@@ -5478,7 +5478,7 @@ macro_rules! property_location {
                 exit!(s)
             }
             let at = ((*header(p)).elems.cast::<Value>()).add(i as usize);
-            *at = v;
+            store_word(at, v);
             barrier(s.tag, payload_cell((*header(p)).elems), at, v);
             next!(s)
         }; |s| {
@@ -5509,7 +5509,7 @@ macro_rules! property_location {
                 let len = (*header(p)).elems_len;
                 if fits && (i < len || i == len && len < elems_cap(header(p))) {
                     let at = ((*header(p)).elems.cast::<Value>()).add(i as usize);
-                    *at = v;
+                    store_word(at, v);
                     barrier(s.tag, payload_cell((*header(p)).elems), at, v);
                     if i == len {
                         (*header(p)).elems_len = len + 1;
@@ -6453,7 +6453,7 @@ stencil!("lda_upvalue"; |s| {
 // target aarch64 sta_upvalue: 22 now 28 `ldur; ldr; ldr; str; add; cmp; b.ne`, the barrier (15), card mark cold (judged 2026-10-26)
 stencil!("sta_upvalue"; |s| {
     let u = upvalue_cell(s.regs);
-    *(*u).at = s.acc;
+    store_word((*u).at, s.acc);
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
@@ -6472,7 +6472,7 @@ stencil!("lda_upvalue_fr"; |s| {
 });
 stencil!("sta_upvalue_fr"; |s| {
     let u = upvalue_cell_at(s.regs);
-    *(*u).at = s.acc;
+    store_word((*u).at, s.acc);
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
@@ -6484,7 +6484,7 @@ stencil!("lda_upvalue_c"; |s| {
 });
 stencil!("sta_upvalue_c"; |s| {
     let u = imm64() as *const Upvalue;
-    *(*u).at = s.acc;
+    store_word((*u).at, s.acc);
     upvalue_barrier(s.tag, u, s.acc);
     next!(s)
 });
@@ -6949,7 +6949,7 @@ unsafe fn first_elements(o: *mut u8) {
         for k in 0..FIRST_ELEMENTS {
             p.add(k).write_volatile(Value::UNDEFINED.to_bits());
         }
-        (*header(o)).elems = p.cast();
+        store_word(&raw mut (*header(o)).elems, p.cast());
         // (A young array: only an old array needs the card.)
         if meta_of(o as usize) != YOUNG {
             card_mark(o);
@@ -7024,7 +7024,7 @@ unsafe fn own_element_store(tag: NumberTag, o: Value, key: Value, v: Value, int3
             return false;
         }
         let at = ((*header(p)).elems.cast::<Value>()).add(i as usize);
-        *at = v;
+        store_word(at, v);
         if !int32 {
             barrier(tag, payload_cell((*header(p)).elems), at, v);
         }
@@ -7082,7 +7082,7 @@ macro_rules! array_methods {
                 slow!(s)
             }
             let at = ((*header(o)).elems.cast::<Value>()).add(len as usize);
-            *at = v;
+            store_word(at, v);
             barrier(s.tag, payload_cell((*header(o)).elems), at, v);
             (*header(o)).elems_len = len + 1;
             s.acc = unboxed(len as i32 + 1);
@@ -7104,7 +7104,7 @@ macro_rules! array_methods {
                 if to != 0 {
                     set_shape(o, to);
                     let at = ((*header(o)).elems.cast::<Value>()).add(len as usize);
-                    *at = v;
+                    store_word(at, v);
                     barrier(s.tag, payload_cell((*header(o)).elems), at, v);
                     (*header(o)).elems_len = len + 1;
                     s.acc = unboxed(len as i32 + 1);
@@ -7130,7 +7130,7 @@ macro_rules! array_methods {
             if (*shape_of(o)).elems_code > FIELD_NUM || len >= elems_cap(header(o)) {
                 slow!(s)
             }
-            *((*header(o)).elems.cast::<u64>()).add(len as usize) = s.acc.to_bits() as u32 as u64 | s.tag.to_bits();
+            store_word(((*header(o)).elems.cast::<u64>()).add(len as usize), s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
             (*header(o)).elems_len = len + 1;
             s.acc = unboxed(len as i32 + 1);
             next!(s)
@@ -7149,7 +7149,7 @@ macro_rules! array_methods {
                 let to = push_transition(s.tag, shape_of(o), v);
                 if to != 0 {
                     set_shape(o, to);
-                    *((*header(o)).elems.cast::<Value>()).add(len as usize) = v;
+                    store_word(((*header(o)).elems.cast::<Value>()).add(len as usize), v);
                     (*header(o)).elems_len = len + 1;
                     s.acc = unboxed(len as i32 + 1);
                     next!(s)
@@ -7181,7 +7181,7 @@ macro_rules! array_methods {
                 if v == Value::EMPTY {
                     exit!(s)
                 }
-                *at = Value::EMPTY;
+                store_word(at, Value::EMPTY);
                 (*header(o)).elems_len = len - 1;
                 s.acc = v;
             }

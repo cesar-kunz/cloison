@@ -465,7 +465,7 @@ fn array_concat(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 for i in 0..m {
                     let v = *(*obj).elems.add(i);
                     if v == Value::EMPTY {
-                        *(*oo).elems.add(at + i) = Value::EMPTY;
+                        crate::layout::store_word((*oo).elems.add(at + i), Value::EMPTY);
                     } else {
                         vm.store_element(oo, at + i, v);
                     }
@@ -505,7 +505,7 @@ pub(crate) fn array_pop(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> 
                 return Ok(Value::UNDEFINED);
             }
             let v = *(*o).elems.add(len - 1);
-            *(*o).elems.add(len - 1) = Value::EMPTY;
+            crate::layout::store_word((*o).elems.add(len - 1), Value::EMPTY);
             (*o).elems_len = (len - 1) as u32;
             return Ok(if v == Value::EMPTY { Value::UNDEFINED } else { v });
         }

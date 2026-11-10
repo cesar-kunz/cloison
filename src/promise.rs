@@ -306,8 +306,7 @@ fn elem(e: *mut Object, i: usize) -> Value {
 fn put(e: *mut Object, i: usize, v: Value) {
     unsafe {
         let at = (*e).elems.add(i);
-        *at = v;
-        crate::heap::barrier((*e).elems.cast::<u8>().sub(8), at, v);
+        crate::heap::store((*e).elems.cast::<u8>().sub(8), at, v);
     }
 }
 
@@ -368,8 +367,7 @@ pub(crate) fn slot(o: *mut Object, i: usize) -> Value {
 pub(crate) fn set_slot(o: *mut Object, i: usize, v: Value) {
     unsafe {
         let at = Object::inline(o, i);
-        *at = v;
-        crate::heap::barrier(o.cast(), at, v);
+        crate::heap::store(o.cast(), at, v);
     }
 }
 
@@ -382,8 +380,7 @@ pub(crate) fn new_promise(vm: &mut Vm) -> Value {
     let st = vm.heap.alloc_values(3);
     unsafe {
         *st.add(STATE) = Value::from_i32(PENDING);
-        (*o).code = st as *const Code;
-        crate::heap::barrier_young(o.cast(), &raw const (*o).code);
+        crate::heap::store_young(o.cast(), &raw mut (*o).code, st as *const Code);
     }
     object_value(o)
 }
@@ -405,8 +402,7 @@ fn cell(e: *mut Value, i: usize) -> Value {
 
 fn put_cell(e: *mut Value, i: usize, v: Value) {
     unsafe {
-        *e.add(i) = v;
-        crate::heap::barrier(e.cast::<u8>().sub(8), e.add(i), v);
+        crate::heap::store(e.cast::<u8>().sub(8), e.add(i), v);
     }
 }
 

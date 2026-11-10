@@ -2661,8 +2661,7 @@ impl Vm {
                 if !(*o).props.is_null() {
                     std::ptr::copy_nonoverlapping((*o).props, p, old as usize);
                 }
-                (*o).props = p;
-                crate::heap::barrier_young(o.cast(), &raw const (*o).props);
+                crate::heap::store_young(o.cast(), &raw mut (*o).props, p);
             }
         }
     }
@@ -2766,8 +2765,7 @@ impl Vm {
                 && (unchanged || !cell.is_constant() || *at == Value::UNDEFINED)
                 && (unchanged || (*o).flags & PROTOTYPE == 0)
             {
-                *at = value;
-                crate::heap::barrier(o.cast(), at, value);
+                crate::heap::store(o.cast(), at, value);
                 return;
             }
             self.store_field_slow(o, slot, value);
@@ -2807,8 +2805,7 @@ impl Vm {
             if (*o).flags & PROTOTYPE != 0 && *at != value {
                 self.prototype_slot_changed(at);
             }
-            *at = value;
-            crate::heap::barrier(o.cast(), at, value);
+            crate::heap::store(o.cast(), at, value);
         }
     }
 
@@ -2929,7 +2926,8 @@ impl Vm {
                             );
                             let v = Object::slot(o, l);
                             if (*v).is_int32() {
-                                *v = Value::from_f64((*v).as_i32_unchecked() as f64);
+                                // (The marker may be reading it.)
+                                crate::layout::store_word(v, Value::from_f64((*v).as_i32_unchecked() as f64));
                             }
                         }
                     }
@@ -3055,8 +3053,7 @@ impl Vm {
                 }
                 crate::object::set_shape(o, t);
             }
-            *(*o).elems.add(i) = value;
-            crate::heap::barrier((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), value);
+            crate::heap::store((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), value);
         }
     }
 
@@ -3072,8 +3069,7 @@ impl Vm {
                 let v = *from.add(i);
                 let s = &*(*o).shape;
                 if v == Value::EMPTY || s.elems.join(FieldType::of(v)) == s.elems {
-                    *e.add(at + i) = v;
-                    crate::heap::barrier(e.cast::<u8>().sub(8), e.add(at + i), v);
+                    crate::heap::store(e.cast::<u8>().sub(8), e.add(at + i), v);
                 } else {
                     self.store_element(o, at + i, v);
                 }
@@ -4049,7 +4045,7 @@ impl Vm {
         let l = self.global_lexicals;
         let slot = self.global_lexical_slot(name).expect("declared by its script");
         unsafe {
-            *Object::slot(l, (*(*l).shape).location(slot)) = Value::UNDEFINED;
+            crate::layout::store_word(Object::slot(l, (*(*l).shape).location(slot)), Value::UNDEFINED);
         }
         self.store_field(l, slot, value);
     }
@@ -4546,8 +4542,7 @@ impl Vm {
                 let at = Object::slot(o, (*new).location(k as u32));
                 // (Out of line, a `Num` field may still hold an int32.)
                 let v = as_field((*new).field_type(k as u32), v);
-                *at = v;
-                crate::heap::barrier(o.cast(), at, v);
+                crate::heap::store(o.cast(), at, v);
             }
             if (*o).flags & PROTOTYPE != 0 {
                 self.proto_epoch = self.proto_epoch.wrapping_add(1);
@@ -4665,10 +4660,9 @@ impl Vm {
             for j in k + 1..n {
                 let v = *Object::slot(o, (*s).location(j));
                 let at = Object::slot(o, (*s).location(j - 1));
-                *at = v;
-                crate::heap::barrier(o.cast(), at, v);
+                crate::heap::store(o.cast(), at, v);
             }
-            *Object::slot(o, (*s).location(n - 1)) = Value::UNDEFINED;
+            crate::layout::store_word(Object::slot(o, (*s).location(n - 1)), Value::UNDEFINED);
             Shape::dictionary_mut(s).slots.remove(k);
         }
     }
@@ -5073,7 +5067,7 @@ impl Vm {
             if i >= (*o).elems_len {
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
-                    *(*o).elems.add(j as usize) = Value::EMPTY;
+                    crate::layout::store_word((*o).elems.add(j as usize), Value::EMPTY);
                 }
                 (*o).elems_len = i + 1;
             }
@@ -5191,7 +5185,7 @@ impl Vm {
                 }
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
-                    *(*o).elems.add(j as usize) = Value::EMPTY;
+                    crate::layout::store_word((*o).elems.add(j as usize), Value::EMPTY);
                 }
                 (*o).elems_len = i + 1;
             }
@@ -5234,7 +5228,7 @@ impl Vm {
                 self.reserve_elems(o, n);
             }
             for i in n.min(len)..n.max(len) {
-                *(*o).elems.add(i) = Value::EMPTY;
+                crate::layout::store_word((*o).elems.add(i), Value::EMPTY);
             }
             (*o).elems_len = n as u32;
         }
@@ -5262,8 +5256,7 @@ impl Vm {
             if far {
                 *e.add(cap) = *crate::far::store_slot(o);
             }
-            (*o).elems = e;
-            crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
+            crate::heap::store_young(o.cast(), &raw mut (*o).elems, e);
         }
     }
 
@@ -5782,8 +5775,7 @@ impl Vm {
         let Some(m) = self.mapped_args.iter().rev().find(|m| m.o == o) else {
             match self.released_binding(o, i) {
                 Some(Binding::Upvalue(u)) => unsafe {
-                    *(*u).at = v;
-                    crate::heap::barrier(crate::layout::payload_cell(u), (*u).at, v);
+                    crate::heap::store(crate::layout::payload_cell(u), (*u).at, v);
                 },
                 Some(Binding::Scope(env, slot)) => self.store_field(env, slot, v),
                 None => {}
@@ -5808,7 +5800,7 @@ impl Vm {
         } else if let Some(r) = self.released_record(o)
             && 1 + i < unsafe { (*r).elems_len }
         {
-            unsafe { *(*r).elems.add(1 + i as usize) = Value::EMPTY };
+            unsafe { crate::layout::store_word((*r).elems.add(1 + i as usize), Value::EMPTY) };
         }
     }
 
@@ -5834,8 +5826,7 @@ impl Vm {
                 if Self::has_element(o, i) {
                     unsafe {
                         let at = (*o).elems.add(i as usize);
-                        *at = v;
-                        crate::heap::barrier(o.cast(), at, v);
+                        crate::heap::store(o.cast(), at, v);
                     }
                 } else if unsafe { (*o).flags } & crate::object::SPARSE != 0 {
                     // (Kept as a named property: see `hide_element`.)
@@ -5920,8 +5911,7 @@ impl Vm {
                     unsafe {
                         let v = m.value(i);
                         let at = (*o).elems.add(i);
-                        *at = v;
-                        crate::heap::barrier(o.cast(), at, v);
+                        crate::heap::store(o.cast(), at, v);
                     }
                 }
             }
@@ -5977,8 +5967,7 @@ impl Vm {
                 for &(i, b) in &kept {
                     *e.add(1 + i) = b;
                 }
-                (*r).elems = e;
-                crate::heap::barrier_young(r.cast(), &raw const (*r).elems);
+                crate::heap::store_young(r.cast(), &raw mut (*r).elems, e);
                 (*r).elems_len = n as u32;
             }
             for &(i, _) in &kept {
@@ -6039,7 +6028,7 @@ impl Vm {
         if let Some(k) = self.open_upvalues.iter().rposition(|&u| unsafe { (*u).at } == at) {
             let u = self.open_upvalues.remove(k);
             unsafe {
-                (*u).closed = *(*u).at;
+                crate::layout::store_word(&raw mut (*u).closed, *(*u).at);
                 (*u).at = &raw mut (*u).closed;
                 crate::heap::barrier(u.cast::<u8>().sub(8), &raw const (*u).closed, (*u).closed);
             }
@@ -6057,7 +6046,7 @@ impl Vm {
             && unsafe { (*u).at } >= level
         {
             unsafe {
-                (*u).closed = *(*u).at;
+                crate::layout::store_word(&raw mut (*u).closed, *(*u).at);
                 (*u).at = &raw mut (*u).closed;
                 crate::heap::barrier(u.cast::<u8>().sub(8), &raw const (*u).closed, (*u).closed);
             }
@@ -6229,8 +6218,7 @@ impl Vm {
                 if !(*o).props.is_null() {
                     std::ptr::copy_nonoverlapping((*o).props, p, old);
                 }
-                (*o).props = p;
-                crate::heap::barrier_young(o.cast(), &raw const (*o).props);
+                crate::heap::store_young(o.cast(), &raw mut (*o).props, p);
             }
             crate::object::set_shape(o, new);
             let first = n - names.len();
@@ -6661,7 +6649,7 @@ impl Vm {
             }
             crate::object::set_shape(g, new);
             if (*ns.fields()[slot as usize]).get() == FieldType::None {
-                *Object::slot(g, ns.location(slot)) = Value::UNDEFINED;
+                crate::layout::store_word(Object::slot(g, ns.location(slot)), Value::UNDEFINED);
             } else {
                 // (A field another global's shape typed: a realm's.)
                 self.store_field(g, slot, Value::UNDEFINED);
@@ -6693,7 +6681,7 @@ impl Vm {
             crate::object::set_shape(l, new);
             // (Its field as though nothing were stored yet: see
             // `init_global_lexical`.)
-            *Object::slot(l, ns.location(slot)) = Value::HOLE;
+            crate::layout::store_word(Object::slot(l, ns.location(slot)), Value::HOLE);
         }
         let g = self.global;
         unsafe {
@@ -7639,7 +7627,7 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
         for (i, &v) in elems.iter().enumerate() {
             // Holes don't type the elements.
             if v == Value::EMPTY {
-                *(*o).elems.add(i) = v;
+                crate::layout::store_word((*o).elems.add(i), v);
             } else {
                 vm.store_element(o, i, v);
             }

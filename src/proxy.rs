@@ -75,8 +75,7 @@ fn slot(o: *mut Object, i: usize) -> Value {
 fn set_slot(o: *mut Object, i: usize, v: Value) {
     unsafe {
         let at = Object::inline(o, i);
-        *at = v;
-        crate::heap::barrier(o.cast(), at, v);
+        crate::heap::store(o.cast(), at, v);
     }
 }
 

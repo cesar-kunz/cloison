@@ -1880,7 +1880,7 @@ pub(crate) fn binding_set(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         return Ok(Value::UNDEFINED);
     }
     unsafe {
-        *(*u).at = v;
+        crate::layout::store_word((*u).at, v);
         // (A closed upvalue's variable is its own `closed`, in the heap.)
         if (*u).at == &raw mut (*u).closed {
             crate::heap::barrier(u.cast::<u8>().sub(8), (*u).at, v);

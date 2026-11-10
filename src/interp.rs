@@ -1457,7 +1457,7 @@ handlers! {
     fn op_sta_upvalue(pc, acc, regs, tag) {
         let f: *const crate::object::Object = header(regs, FUNC);
         let u = *Vm::upvalues(f).add(*pc.add(1) as usize);
-        *(*u).at = acc;
+        crate::layout::store_word((*u).at, acc);
         // (A closed upvalue's variable is its own `closed`, in the heap.)
         if (*u).at == &raw mut (*u).closed {
             crate::heap::barrier(u.cast::<u8>().sub(8), (*u).at, acc);
@@ -1574,8 +1574,7 @@ handlers! {
         if (*g).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
             let at = Object::slot(g, (*ic).loc);
             let v = as_named(tag, (*ic).holder as u64, acc);
-            *at = v;
-            crate::heap::barrier(g.cast(), at, v);
+            crate::heap::store(g.cast(), at, v);
             next!(any, Op::StaGlobal.size(), acc)
         }
         tail!(slow_sta_global, acc)
@@ -1719,8 +1718,7 @@ handlers! {
                 }
                 let at = Object::slot(o, (*ic).loc);
                 let v = as_named(tag, (*ic).holder as u64, acc);
-                *at = v;
-                crate::heap::barrier(o.cast(), at, v);
+                crate::heap::store(o.cast(), at, v);
                 next!(any, Op::SetNamed.size(), acc)
             }
             tail!(poly_set_named, acc)
@@ -1747,8 +1745,7 @@ handlers! {
                     }
                     let at = Object::slot(o, (*w).loc);
                     let v = as_named(tag, (*w).holder as u64, acc);
-                    *at = v;
-                    crate::heap::barrier(o.cast(), at, v);
+                    crate::heap::store(o.cast(), at, v);
                     next!(any, Op::SetNamed.size(), acc)
                 }
                 break;
@@ -1775,7 +1772,7 @@ handlers! {
                     }
                     crate::object::set_shape(o, new);
                 }
-                *Object::slot(o, (*ic).loc) = as_named(tag, (*ic).holder as u64, acc);
+                crate::layout::store_word(Object::slot(o, (*ic).loc), as_named(tag, (*ic).holder as u64, acc));
                 next!(any, Op::SetNamed.size(), acc)
             }
             tail!(poly_set_named, acc)
@@ -1826,8 +1823,7 @@ handlers! {
                 && (*(*o).elems.add(i as usize) != Value::EMPTY || !(*frame_vm(regs)).indices_protected)
             {
                 let at = (*o).elems.add(i as usize);
-                *at = acc;
-                crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, acc);
+                crate::heap::store((*o).elems.cast::<u8>().sub(8), at, acc);
                 next!(any, Op::SetKeyed.size(), acc)
             }
         }
@@ -1860,8 +1856,7 @@ handlers! {
             let s = &*(*o).shape;
             if s.elems.join(crate::object::FieldType::of(acc)) == s.elems {
                 let at = (*o).elems.add(len as usize);
-                *at = acc;
-                crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, acc);
+                crate::heap::store((*o).elems.cast::<u8>().sub(8), at, acc);
                 (*o).elems_len = len + 1;
                 next!(any, Op::PushLiteral.size(), Value::from_i32(len as i32 + 1))
             }
@@ -2029,8 +2024,7 @@ handlers! {
         if (*l).shape == (*ic).shape && fits_field(tag, (*ic).holder as u64, acc) {
             let at = Object::slot(l, (*ic).loc);
             let v = as_named(tag, (*ic).holder as u64, acc);
-            *at = v;
-            crate::heap::barrier(l.cast(), at, v);
+            crate::heap::store(l.cast(), at, v);
             next!(any, Op::StaGlobal.size(), acc)
         }
         let r = with_top(regs, None, |vm| {

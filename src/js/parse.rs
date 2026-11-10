@@ -48,10 +48,42 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
     parse_pass(toks, arena, skim, false, Some(table), Some(&first), None, None).map(|(p, _)| p)
 }
 
-/// [`parse_with`] of source `src`, lexed again for a second pass (the
-/// first takes the strings out of its tokens).
-pub fn parse_source<'a>(src: &Source, arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
-    parse_source_as(src, arena, skim, None)
+/// [`parse_with`] of a script's text `text`, lexed again for a second pass
+/// (the first takes the strings out of its tokens). Its positions are
+/// those of its source code (`Source::from_text`, which
+/// `codegen::generate` makes of the same text again); an error's offset
+/// is the text's.
+pub fn parse_source<'a>(text: &str, arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
+    parse_source_as(text, arena, skim, None)
+}
+
+/// [`parse_source_code_as`] of a script's text (see [`parse_source`]).
+pub fn parse_source_as<'a>(
+    text: &str,
+    arena: &'a Arenas<'a>,
+    skim: bool,
+    eval: Option<(bool, &str, bool, bool, bool, bool, bool)>,
+) -> Result<Program<'a>, Error> {
+    let src = Source::from_text(text);
+    parse_source_code_as(&src, arena, skim, eval).map_err(|e| in_text(e, &src))
+}
+
+/// [`parse_module_source`] of a module's text (see [`parse_source`]).
+pub fn parse_module<'a>(text: &str, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
+    let src = Source::from_text(text);
+    parse_module_source(&src, arena, id).map_err(|e| in_text(e, &src))
+}
+
+/// Error `e`, at an offset of `src`, at the offset of its text.
+fn in_text(mut e: Error, src: &Source) -> Error {
+    e.pos = src.text_offset(e.pos);
+    e
+}
+
+/// [`parse_source`] of source code `src` (positions and errors at its
+/// offsets).
+pub fn parse_source_code<'a>(src: &Source, arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
+    parse_source_code_as(src, arena, skim, None)
 }
 
 thread_local! {
@@ -59,10 +91,10 @@ thread_local! {
     pub(crate) static STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, in
+/// [`parse_source_code`]; `eval`: as direct `eval`'s code (strict or not, in
 /// the scopes of that shape, see `parse_pass`; then whether its caller
 /// has a `new.target`, and a home object, `EVAL_HOME`).
-pub fn parse_source_as<'a>(
+pub fn parse_source_code_as<'a>(
     src: &Source,
     arena: &'a Arenas<'a>,
     skim: bool,
@@ -78,11 +110,11 @@ pub fn parse_source_as<'a>(
     parse_pass(&mut toks, arena, skim, false, Some(table), Some(&first), eval, None).map(|(p, _)| p)
 }
 
-/// Module `src`: a script of one function expression, the module's (see
+/// Module source code `src`: a script of one function expression, the module's (see
 /// [`Parser::module_body`]), with the module's entries
 /// ([`Program::module`]). `id`: the module's (see `module`), which its
 /// `import()`s and `import.meta` name.
-pub fn parse_module<'a>(src: &Source, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
+pub fn parse_module_source<'a>(src: &Source, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex_source(src, true)?;
     let (first, table) = parse_pass(&mut toks, arena, false, false, None, None, None, Some(id))?;
     if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
@@ -3123,7 +3155,7 @@ impl<'a> Parser<'_, 'a, '_> {
             Tok::RegExp(r) => {
                 // (An invalid pattern or flags are an early error.)
                 // (The pattern's code units: a lone surrogate's its own.)
-                if let Err(m) = crate::regexp::Regex::check(&super::lex::to_units(&r.0), &r.1) {
+                if let Err(m) = crate::regexp::Regex::check_units(&super::lex::to_units(&r.0), &r.1) {
                     return Err(Error::new(pos as usize, m));
                 }
                 ExprKind::RegExp(r)

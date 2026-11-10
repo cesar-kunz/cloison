@@ -1374,6 +1374,42 @@ fn front_end_entry_points_take_text_as_it_is() {
     }
 }
 
+/// `Regex::check` and `Regex::new` take a pattern's text (`&str`),
+/// `check_units` and `of_units` its code units (a lone surrogate's its
+/// own); the front end's entry points that took a `&str` still do, their
+/// source code forms (`lex::Source`) under names of their own.
+#[test]
+fn text_entry_points_keep_their_signatures() {
+    use cloison::regexp::Regex;
+    assert!(Regex::check("a", "u").is_ok());
+    assert!(Regex::check("[\\p{L}--[a-z]]", "v").is_ok());
+    assert!(Regex::check("\u{1F600}{2}", "u").is_ok());
+    assert!(Regex::check("(", "u").is_err());
+    assert!(Regex::check("\\-", "u").is_err());
+    assert!(Regex::check("\\-", "").is_ok());
+    assert!(Regex::check("[a&&b]", "v").is_ok());
+    assert!(Regex::check("[(]", "v").is_err());
+    assert!(Regex::check("a", "uv").is_err());
+    assert!(Regex::new("^\u{1F600}$", "u").unwrap().exec(&"\u{1F600}".encode_utf16().collect::<Vec<_>>(), 0).is_some());
+    assert!(Regex::check_units(&[b'\\' as u16, 0xD83D], "u").is_err());
+    assert!(Regex::check_units(&[b'\\' as u16, 0xD83D], "").is_ok());
+    assert!(Regex::of_units(&[0xD83D], "").unwrap().exec(&[0xD83D], 0).is_some());
+    // The front end's: a file's text in, its offsets out.
+    let text = "var s = '\u{F0000}'; s s";
+    assert!(cloison::js::is_one_function("(function () { return '\u{F0000}' })"));
+    assert!(cloison::js::compile_script_lazy(text).unwrap_err().starts_with("1:16:"));
+    assert!(cloison::js::compile_indirect_eval(text).unwrap_err().starts_with("1:16:"));
+    assert!(cloison::js::compile_strict_eval("'\u{FDD0}'; x x").unwrap_err().starts_with("1:8:"));
+    assert!(cloison::js::compile_direct_eval(text, false, false, false, false, "", true, &[]).unwrap_err().starts_with("1:16:"));
+    let arena = cloison::js::ast::Arenas::default();
+    let e = cloison::js::parse::parse_source(text, &arena, false).err().unwrap();
+    assert_eq!(e.pos, text.rfind('s').unwrap());
+    let e = cloison::js::parse::parse_module("export var s = '\u{F0800}'; s s", &arena, 0).err().unwrap();
+    assert_eq!(e.pos, "export var s = '\u{F0800}'; s s".rfind('s').unwrap());
+    let p = cloison::js::parse::parse_source("var s = '\u{F0000}';", &arena, false).unwrap();
+    assert!(cloison::js::codegen::generate(&p, "var s = '\u{F0000}';").is_ok());
+}
+
 /// String methods' RegExp fast paths step aside where the spec's paths
 /// differ: a sticky separator splits as any, a RegExp whose `Symbol.<m>`
 /// is undefined is its string, redefined flags are what it has, and

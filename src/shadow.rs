@@ -95,7 +95,7 @@ fn evaluate(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // caller's.
     let syntax = |e: String| Error(format!("SyntaxError: {e}"), None);
     crate::js::check_source(&src).map_err(|e| syntax(e.display_source(&src)))?;
-    let module = crate::js::compile_indirect_eval(&src).map_err(syntax)?;
+    let module = crate::js::compile_indirect_eval_source(&src).map_err(syntax)?;
     let out = crate::realm::run_in(vm, r, |vm| {
         vm.global_declarations(&module, true)?;
         let code = vm.load(module);

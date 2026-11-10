@@ -482,6 +482,18 @@ pub(crate) fn weak_set_values(o: *mut Object) -> Vec<Value> {
     (BASE..len(e)).map(|i| slot(e, i)).filter(|&v| v != Value::EMPTY).collect()
 }
 
+/// `f` called with each value of weak set `o` not collected, with no
+/// allocation (`f` mustn't change the set, nor allocate in the heap).
+pub(crate) fn weak_set_each(o: *mut Object, mut f: impl FnMut(Value)) {
+    let e = entries(o);
+    for i in BASE..len(e) {
+        let v = slot(e, i);
+        if v != Value::EMPTY {
+            f(v);
+        }
+    }
+}
+
 /// A weak collection `o`'s entries buffer (new, or grown) tagged so the
 /// collector leaves its keys and values to the ephemeron pass (see
 /// `heap::WEAK_VALUES`).

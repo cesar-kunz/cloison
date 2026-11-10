@@ -428,9 +428,12 @@ pub(crate) fn catch_up(vm: &mut Vm) {
     // (Before the lengths, and `n` recorded only if no grow was in
     // flight: see above.)
     let settled = IN_FLIGHT.load(SeqCst) == 0;
-    for v in crate::collections::weak_set_values(vm.shared.growing) {
+    // (With no allocation, and a buffer's views refreshed only if its
+    // length changed: while a grow is in flight, every catch-up comes
+    // here.)
+    crate::collections::weak_set_each(vm.shared.growing, |v| {
         sync_length(as_object(v));
-    }
+    });
     if settled {
         vm.shared.grows = n;
     }

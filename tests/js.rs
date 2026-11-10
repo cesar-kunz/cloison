@@ -1287,6 +1287,47 @@ r.join();
     );
 }
 
+/// `eval`'s and `Function`'s source is the string's code units: a raw
+/// lone surrogate in a regular expression literal is a pattern character,
+/// not the escape `\uD83D` (#122); in a string or template literal a code
+/// unit, which joins an escaped one into a pair, raw in `String.raw` and
+/// `toString`; in a comment nothing; in an identifier a SyntaxError.
+#[test]
+fn eval_source_keeps_raw_lone_surrogates() {
+    let src = r#"
+var H = "\ud83d", L = "\ude00", P = "\u{1F600}", J = JSON.stringify;
+function E(src) { var n; try { return eval(src); } catch (e) { n = e.name; } return n; }
+function F(body) { var n; try { return Function(body)(); } catch (e) { n = e.name; } return n; }
+[E("/" + H + "\\uDE00/u").test(P), E("/" + H + "\\uDE00/").test(P), E("/^\\" + H + "$/").test(H), E("/\\" + H + "/u"),
+  J(E("/" + H + "/").source), E("/[" + H + "]/u").test(P), E("/" + H + L + "/u").test(P),
+  E("'" + H + "'").length, E("'\\uD83D" + L + "'") === P, E("'" + H + "\\uDE00'") === P, E("'\\" + H + "'") === H,
+  E("`" + H + "`").length, E("`" + H + "\\uDE00`") === P, E("String.raw`" + H + "\\uDE00`").length, E("(x=>x)`" + H + "`[0]") === H,
+  E("String.raw`\\" + H + "`").length, E("1 /* " + H + " */ + 1"), E("1 // " + H + "\n + 1"), E("var a" + H + " = 1"), E(H),
+  E("'\u{F0000}'").codePointAt(0) === 0xF0000, E("'\u{F0800}\u{FDD0}'").length, E("`\u{F0000}`").length,
+  F("return /" + H + "\\uDE00/u.test('" + P + "')"), F("return '" + H + "'.length"),
+  F("return (function(){ '" + H + "' }).toString().length"), (0, eval)("/" + H + "\\uDE00/u").test(P),
+  E("({ '" + H + "': 1 })")[H], E("({ '\\uD83D" + L + "': 1 })")[P], E("/[\u{F0000}-\u{F0001}]/u").test("\u{F0001}")].join();
+"#;
+    assert_eq!(
+        value(src),
+        r#"false,true,true,SyntaxError,"\ud83d",false,true,1,true,true,true,1,true,7,true,2,2,2,SyntaxError,SyntaxError,true,3,2,false,1,17,false,1,1,true"#
+    );
+}
+
+/// A source's private use characters a lone surrogate's mapping uses
+/// (U+F0000 to U+F0800) and U+FDD0, written as they are, are themselves in
+/// strings, templates, patterns and `toString`, and don't shift a syntax
+/// error's column.
+#[test]
+fn source_private_use_characters_stay_themselves() {
+    let src = "var s = \"\u{F0000}|\u{FDD0}|\u{F0800}\"; function f() { return \"\u{F0000}\" }
+[s.length, s.codePointAt(0).toString(16), s.codePointAt(3).toString(16), s.codePointAt(5).toString(16),
+ f.toString() === 'function f() { return \"\\u{F0000}\" }', `\u{F0000}`.length, String.raw`\u{F0000}\u{FDD0}`.length,
+ /\u{F0000}/u.test('\\u{F0000}'), /\u{F0800}/u.source.length].join();";
+    assert_eq!(value(src), "7,f0000,fdd0,f0800,true,2,3,true,2");
+    assert!(compile_error("var x = \"\u{F0000}\"; x x").starts_with("1:16:"), "{}", compile_error("var x = \"\u{F0000}\"; x x"));
+}
+
 /// String methods' RegExp fast paths step aside where the spec's paths
 /// differ: a sticky separator splits as any, a RegExp whose `Symbol.<m>`
 /// is undefined is its string, redefined flags are what it has, and

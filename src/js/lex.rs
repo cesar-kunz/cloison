@@ -147,6 +147,51 @@ pub fn has_lone_surrogate(s: &str) -> bool {
     false
 }
 
+/// Source text `s` (a file's) as the lexer takes it: as
+/// [`units_to_string`] would have its code units, the characters an
+/// [`ESCAPE`] precedes given theirs. (A string's source, `eval`'s, is
+/// [`units_to_string`]'s, its lone surrogates code units of their own:
+/// in a string, template or regular expression literal, as they are.)
+pub fn text_to_source(s: &str) -> std::borrow::Cow<'_, str> {
+    // (Characters to escape start with byte 0xEF or more.)
+    if !s.bytes().any(|c| c >= 0xEF) || !s.chars().any(|c| escaped(c as u32)) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    s.chars().for_each(|c| push_source_char(&mut out, c));
+    std::borrow::Cow::Owned(out)
+}
+
+/// The source character at the start of `s` (as [`text_to_source`] has
+/// it, `s` not empty): its code units onto `out`, and its length (an
+/// [`ESCAPE`]'s and its character's).
+fn source_char(s: &str, out: &mut Vec<u16>) -> usize {
+    let ch = s.chars().next().unwrap();
+    let u = ch as u32;
+    if u == ESCAPE
+        && let Some(next) = s[ch.len_utf8()..].chars().next()
+    {
+        let mut b = [0; 2];
+        out.extend_from_slice(next.encode_utf16(&mut b));
+        return ch.len_utf8() + next.len_utf8();
+    }
+    if mapped(u) {
+        out.push((u - LONE_SURROGATES + 0xD800) as u16);
+    } else {
+        let mut b = [0; 2];
+        out.extend_from_slice(ch.encode_utf16(&mut b));
+    }
+    ch.len_utf8()
+}
+
+/// The source character at the start of `s`, for a message: a lone
+/// surrogate's as `\uXXXX`.
+fn shown_char(s: &str) -> String {
+    let mut u = Vec::new();
+    source_char(s, &mut u);
+    crate::vm::source_text(&u)
+}
+
 #[derive(Clone, Debug)]
 pub struct Token {
     pub tok: Tok,
@@ -471,7 +516,7 @@ pub fn lex_as(src: &str, module: bool) -> Result<Vec<Token>, Error> {
                 }
                 Tok::Punct(p)
             } else {
-                let ch = src[i..].chars().next().unwrap();
+                let ch = shown_char(&src[i..]);
                 return Err(err(&format!("unexpected character `{ch}`")));
             };
         toks.push(Token {
@@ -575,9 +620,8 @@ fn regexp(s: &str) -> Option<(String, String, usize)> {
         .find(|&(_, c)| !is_ident_part(c))
         .map_or(s.len() - end - 1, |(n, _)| n);
     let flags = s[end + 1..end + 1 + flags_len].to_string();
-    let mut body = String::with_capacity(end);
-    s[1..end].chars().for_each(|c| push_source_char(&mut body, c));
-    Some((body, flags, end + 1 + flags_len))
+    // (The source's text as it is: as `units_to_string` has it.)
+    Some((s[1..end].to_string(), flags, end + 1 + flags_len))
 }
 
 /// The word of `n` bytes at `b[i..]` as the [`KEYWORDS`] entry it is,
@@ -795,34 +839,34 @@ fn separated(s: &str) -> bool {
 fn string(s: &str) -> Option<(String, usize)> {
     let b = s.as_bytes();
     let quote = b[0];
-    // Mostly no escapes: the text as is.
-    if let Some(k) = b[1..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r') {
-        // (Unless it has a character to escape: see `ESCAPE`. Theirs and
-        // U+FDD0's UTF-8 start with byte 0xEF or more.)
-        let t = &s[1..1 + k];
-        if b[1 + k] == quote && !(t.bytes().any(|c| c >= 0xEF) && t.chars().any(|c| escaped(c as u32))) {
-            return Some((t.to_string(), k + 2));
-        }
+    // Mostly no escapes: the text as is (as `units_to_string` has it, as
+    // the source is: see `text_to_source`).
+    if let Some(k) = b[1..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r')
+        && b[1 + k] == quote
+    {
+        return Some((s[1..1 + k].to_string(), k + 2));
     }
     // With escapes: the runs between them copied at once, straight into
     // the string `units_to_string` would make of the code units (a
     // character at a time, through UTF-16, was a fifth of TypeScript's
-    // loading). An escaped high surrogate waits for an escaped low one.
+    // loading). A high surrogate waits for a low one, escaped or not.
     let mut out = String::new();
     let (mut units, mut high) = (Vec::with_capacity(2), None::<u16>);
-    let lone = |u: u16| char::from_u32(LONE_SURROGATES + (u as u32 - 0xD800)).unwrap();
     let mut i = 1;
     loop {
         let k = b[i..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r')?;
         if k > 0 {
-            if let Some(h) = high.take() {
-                out.push(lone(h));
-            }
             let run = &s[i..i + k];
-            // (Characters to escape start with byte 0xEF or more: see `ESCAPE`.)
-            if run.bytes().any(|c| c >= 0xEF) {
-                run.chars().for_each(|c| push_source_char(&mut out, c));
+            // (A lone surrogate's, or an `ESCAPE`d character's, UTF-8
+            // starts with byte 0xEF or more: then a unit at a time.)
+            if run.bytes().any(|c| c >= 0xEF) && run.chars().any(|c| escaped(c as u32)) {
+                units.clear();
+                string_units(run, &mut units);
+                units.iter().for_each(|&u| push_unit(&mut out, &mut high, u));
             } else {
+                if let Some(h) = high.take() {
+                    out.push(lone(h));
+                }
                 out.push_str(run);
             }
             i += k;
@@ -841,26 +885,35 @@ fn string(s: &str) -> Option<(String, usize)> {
                     return None;
                 }
                 i += n;
-                for &u in &units {
-                    match (high.take(), u) {
-                        (Some(h), 0xDC00..=0xDFFF) => {
-                            let c = 0x10000 + ((h as u32 - 0xD800) << 10) + (u as u32 - 0xDC00);
-                            push_source_char(&mut out, char::from_u32(c).unwrap());
-                        }
-                        (h, _) => {
-                            if let Some(h) = h {
-                                out.push(lone(h));
-                            }
-                            match u {
-                                0xD800..=0xDBFF => high = Some(u),
-                                0xDC00..=0xDFFF => out.push(lone(u)),
-                                _ => push_source_char(&mut out, char::from_u32(u as u32).unwrap()),
-                            }
-                        }
-                    }
-                }
+                units.iter().for_each(|&u| push_unit(&mut out, &mut high, u));
             }
             _ => return None,
+        }
+    }
+}
+
+/// A lone surrogate's character in a string (see [`LONE_SURROGATES`]).
+fn lone(u: u16) -> char {
+    char::from_u32(LONE_SURROGATES + (u as u32 - 0xD800)).unwrap()
+}
+
+/// Code unit `u` of a string onto `out` (as [`units_to_string`] has it),
+/// a high surrogate waiting in `high` for a low one.
+fn push_unit(out: &mut String, high: &mut Option<u16>, u: u16) {
+    match (high.take(), u) {
+        (Some(h), 0xDC00..=0xDFFF) => {
+            let c = 0x10000 + ((h as u32 - 0xD800) << 10) + (u as u32 - 0xDC00);
+            push_source_char(out, char::from_u32(c).unwrap());
+        }
+        (h, _) => {
+            if let Some(h) = h {
+                out.push(lone(h));
+            }
+            match u {
+                0xD800..=0xDBFF => *high = Some(u),
+                0xDC00..=0xDFFF => out.push(lone(u)),
+                _ => push_source_char(out, char::from_u32(u as u32).unwrap()),
+            }
         }
     }
 }
@@ -942,9 +995,9 @@ fn escape(s: &str, i: usize, out: &mut Vec<u16>) -> (bool, usize) {
             if ch == '\u{2028}' || ch == '\u{2029}' {
                 return (true, 1 + ch.len_utf8());
             }
-            let mut buf = [0; 2];
-            out.extend_from_slice(ch.encode_utf16(&mut buf));
-            return (true, 1 + ch.len_utf8());
+            // (A source character: a lone surrogate's unit, or an
+            // `ESCAPE`d one's.)
+            return (true, 1 + source_char(&s[i + 1..], out));
         }
     }
     (true, 2)
@@ -982,9 +1035,8 @@ fn template(s: &str) -> Option<(TemplatePart, usize)> {
                 }
                 let n = n.max(2).min(s.len() - i);
                 // (An escaped line break is raw `\` and `\n`.)
-                for ch in s[i..i + n].replace("\r\n", "\n").replace('\r', "\n").chars() {
-                    push_source_char(&mut raw, ch);
-                }
+                // (The source's text as it is: as `units_to_string` has it.)
+                raw.push_str(&s[i..i + n].replace("\r\n", "\n").replace('\r', "\n"));
                 i += n;
             }
             b'\r' => {
@@ -996,13 +1048,14 @@ fn template(s: &str) -> Option<(TemplatePart, usize)> {
                 i += n;
             }
             _ => {
-                let ch = s[i..].chars().next()?;
-                push_source_char(&mut raw, ch);
-                if let Some(c) = &mut cooked {
-                    let mut buf = [0; 2];
-                    c.extend_from_slice(ch.encode_utf16(&mut buf));
-                }
-                i += ch.len_utf8();
+                // (A source character: a lone surrogate's unit, or an
+                // `ESCAPE`d one's, raw as it is.)
+                let n = match &mut cooked {
+                    Some(c) => source_char(&s[i..], c),
+                    None => source_char(&s[i..], &mut Vec::new()),
+                };
+                raw.push_str(&s[i..i + n]);
+                i += n;
             }
         }
     }

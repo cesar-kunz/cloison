@@ -2194,12 +2194,12 @@ pub(crate) fn regexp_get<const K: usize>(vm: &mut Vm, this: Value, _: &[Value]) 
 
 /// A new `RegExp` of `pattern` and `flags` (compiled once per pair): its
 /// own `lastIndex`, and its source.
-pub(crate) fn new_regexp(vm: &mut Vm, pattern: &str, flags: &str) -> Result<Value> {
-    let key = (pattern.to_string(), flags.to_string());
+pub(crate) fn new_regexp(vm: &mut Vm, pattern: &[u16], flags: &str) -> Result<Value> {
+    let key = (pattern.to_vec(), flags.to_string());
     let re: *const crate::regexp::Regex = match vm.regexps.get(&key) {
         Some(r) => &**r,
         None => {
-            let r = crate::regexp::Regex::new(pattern, flags).map_err(Error::new_syntax)?;
+            let r = crate::regexp::Regex::of_units(pattern, flags).map_err(Error::new_syntax)?;
             let b = Box::new(r);
             let p: *const crate::regexp::Regex = &*b;
             vm.regexps.insert(key, b);
@@ -2209,25 +2209,30 @@ pub(crate) fn new_regexp(vm: &mut Vm, pattern: &str, flags: &str) -> Result<Valu
     // (Live in the marking under way: the object made next may be found
     // only by the next marking, the pattern dropped before.)
     crate::gc::mark_regexp(re);
-    let source = if pattern.is_empty() { "(?:)".to_string() } else { escape_pattern(pattern) };
-    let source = str_value(vm, &source);
+    let source = if pattern.is_empty() { str_value(vm, "(?:)") } else { vm.try_new_string(&escape_pattern(pattern))? };
     Ok(regexp_object(vm, re, source))
 }
 
+/// The `source` of an empty pattern's `RegExp`, `(?:)`.
+const EMPTY_SOURCE: [u16; 4] = [b'(' as u16, b'?' as u16, b':' as u16, b')' as u16];
+
 /// EscapeRegExpPattern: `pattern` as a literal's (`/…/`) would be: a `/`
-/// outside a class escaped, line terminators as escapes.
-fn escape_pattern(pattern: &str) -> String {
-    if !pattern.contains(['/', '\n', '\r', '\u{2028}', '\u{2029}']) {
-        return pattern.to_string();
+/// outside a class escaped, line terminators as escapes (a lone surrogate
+/// as it is).
+fn escape_pattern(pattern: &[u16]) -> Vec<u16> {
+    let special = |u: u16| matches!(u, 0x2F | 0x0A | 0x0D | 0x2028 | 0x2029);
+    if !pattern.iter().any(|&u| special(u)) {
+        return pattern.to_vec();
     }
-    let mut out = String::with_capacity(pattern.len() + 2);
+    let mut out = Vec::with_capacity(pattern.len() + 2);
     let (mut class, mut escaped) = (false, false);
-    for c in pattern.chars() {
-        let terminator = match c {
-            '\n' => Some("\\n"),
-            '\r' => Some("\\r"),
-            '\u{2028}' => Some("\\u2028"),
-            '\u{2029}' => Some("\\u2029"),
+    // (By unit: all it looks for are in the BMP.)
+    for &u in pattern {
+        let terminator = match u {
+            0x0A => Some("\\n"),
+            0x0D => Some("\\r"),
+            0x2028 => Some("\\u2028"),
+            0x2029 => Some("\\u2029"),
             _ => None,
         };
         if let Some(t) = terminator {
@@ -2235,22 +2240,22 @@ fn escape_pattern(pattern: &str) -> String {
             if escaped {
                 out.pop();
             }
-            out.push_str(t);
+            out.extend(t.encode_utf16());
             escaped = false;
             continue;
         }
-        if c == '/' && !escaped && !class {
-            out.push('\\');
+        if u == b'/' as u16 && !escaped && !class {
+            out.push(b'\\' as u16);
         }
-        out.push(c);
+        out.push(u);
         if !escaped {
-            match c {
-                '[' => class = true,
-                ']' => class = false,
+            match u {
+                0x5B => class = true,
+                0x5D => class = false,
                 _ => {}
             }
         }
-        escaped = !escaped && c == '\\';
+        escaped = !escaped && u == b'\\' as u16;
     }
     out
 }
@@ -2265,7 +2270,7 @@ pub(crate) fn regexp_literal(vm: &mut Vm, pattern: Value, flags: Value) -> Resul
             re
         }
         None => {
-            let (p, f) = (crate::vm::source_text(&units(pattern)), String::from_utf16_lossy(&units(flags)));
+            let (p, f) = (units(pattern).into_owned(), String::from_utf16_lossy(&units(flags)));
             let made = new_regexp(vm, &p, &f)?;
             vm.regexp_literals.insert(key, regexp_of(made).unwrap());
             return Ok(made);
@@ -2345,13 +2350,13 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         // (Its [[OriginalSource]], not the observable `source`.)
         let a_source = vm.a_regexp_source;
         let src = vm.get(pattern, a_source)?;
-        let src = crate::vm::source_text(string_units(src).unwrap_or(&[]));
-        (if src == "(?:)" { String::new() } else { src }, regexp_flags(re))
+        let src = string_units(src).unwrap_or(&[]).to_vec();
+        (if src == EMPTY_SOURCE { Vec::new() } else { src }, regexp_flags(re))
     } else {
         let p = if pattern.is_undefined() {
-            String::new()
+            Vec::new()
         } else {
-            crate::vm::source_text(string_units(crate::intrinsics::to_string(vm, pattern)?).unwrap_or(&[]))
+            string_units(crate::intrinsics::to_string(vm, pattern)?).unwrap_or(&[]).to_vec()
         };
         let f = if flags.is_undefined() {
             String::new()
@@ -2392,26 +2397,26 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             return Ok(p);
         }
     }
-    let (mut pattern, mut flags) = (String::new(), String::new());
+    let (mut pattern, mut flags) = (Vec::new(), String::new());
     if let Some(re) = regexp_of(p) {
         // (Its [[OriginalSource]] and [[OriginalFlags]], not the
         // observable `source` and `flags`.)
         let a_source = vm.a_regexp_source;
-        pattern = crate::vm::source_text(&units(vm.get(p, a_source)?));
+        pattern = units(vm.get(p, a_source)?).into_owned();
         flags = regexp_flags(re);
     } else if is_re {
         let a_source = vm.a_source;
         // (A RegExp-like object: its `source`, and its `flags` unless
         // given.)
-        pattern = crate::vm::source_text(&units(vm.get(p, a_source)?));
+        pattern = units(vm.get(p, a_source)?).into_owned();
         if arg(a, 1).is_undefined() {
             let a_flags = vm.intern_name("flags");
             flags = String::from_utf16_lossy(&units(vm.get(p, a_flags)?));
         }
     } else if !p.is_undefined() {
-        pattern = crate::vm::source_text(&units(p));
+        pattern = units(p).into_owned();
     }
-    if pattern == "(?:)" {
+    if pattern == EMPTY_SOURCE {
         pattern.clear();
     }
     if !arg(a, 1).is_undefined() {
@@ -2820,7 +2825,7 @@ fn as_regexp(vm: &mut Vm, v: Value) -> Result<Value> {
     if regexp_of(v).is_some() {
         return Ok(v);
     }
-    let p = if v.is_undefined() { String::new() } else { crate::vm::source_text(&units(v)) };
+    let p = if v.is_undefined() { Vec::new() } else { units(v).into_owned() };
     new_regexp(vm, &p, "")
 }
 
@@ -2913,7 +2918,7 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let rv = if regexp_of(pattern).is_some() {
         pattern
     } else {
-        let p = if pattern.is_undefined() { String::new() } else { crate::vm::source_text(&units(pattern)) };
+        let p = if pattern.is_undefined() { Vec::new() } else { units(pattern).into_owned() };
         if vm.conv_failed() {
             return Err(vm.take_conv_error());
         }

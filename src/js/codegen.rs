@@ -3024,6 +3024,17 @@ impl<'a> Gen<'a> {
                 self.strict_delete_check(pos)?;
                 self.temp = mark;
             }
+            // `delete super.x`: a ReferenceError (13.5.1.2), once `this`
+            // (which may not be bound yet) and the key's expression are
+            // evaluated (13.3.7.1), the key not made a property key.
+            SuperMember(_, k, this) => {
+                let mark = self.temp;
+                let t = self.alloc(pos)?;
+                self.into(this, t)?;
+                self.effect(k)?;
+                self.intrinsic("throw_super_delete", t, 0);
+                self.temp = mark;
+            }
             Ident(n) if self.in_with(n) => self.with_delete(n, x.pos)?,
             Ident(n) => match self.resolve(n, x.pos)? {
                 Var::Global => {

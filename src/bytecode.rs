@@ -11,17 +11,17 @@ pub enum Operand {
     Imm,
     /// A jump offset relative to the start of the instruction (4 bytes).
     Off,
-    /// An inline-cache slot of the function (2 bytes). Each slot also
+    /// An inline-cache slot of the function (4 bytes). Each slot also
     /// records the property name it is for.
     Ic,
-    /// An index into the function's table of nested functions (2 bytes).
+    /// An index into the function's table of nested functions (4 bytes).
     Fn,
     /// An inline-cache slot of the function, not written in the text
-    /// format, which gives each such instruction its own (2 bytes).
+    /// format, which gives each such instruction its own (4 bytes).
     AutoIc,
     /// An argument count (1 byte).
     Count,
-    /// An index into the function's constants (2 bytes): a string, or a
+    /// An index into the function's constants (4 bytes): a string, or a
     /// number that isn't an int32.
     Const,
 }
@@ -30,7 +30,7 @@ impl Operand {
     pub const fn width(self) -> usize {
         match self {
             Operand::Reg | Operand::Count => 1,
-            Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const => 2,
+            Operand::Ic | Operand::Fn | Operand::AutoIc | Operand::Const => 4,
             Operand::Imm | Operand::Off => 4,
         }
     }
@@ -784,7 +784,7 @@ pub enum Arg {
     Reg(u8),
     Imm(i32),
     Label(Label),
-    Index(u16),
+    Index(u32),
     Count(u8),
 }
 
@@ -987,8 +987,8 @@ mod tests {
         assert_eq!(Op::LdaSmi.size(), 5);
         assert_eq!(Op::JumpIfLess.size(), 6);
         assert_eq!(Op::JumpIfLessSmi.size(), 9);
-        assert_eq!(Op::GetNamed.size(), 4);
-        assert_eq!(Op::Call.size(), 6);
+        assert_eq!(Op::GetNamed.size(), 6);
+        assert_eq!(Op::Call.size(), 8);
     }
 
     #[test]

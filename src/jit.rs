@@ -140,6 +140,12 @@ impl JitCode {
     }
 }
 
+/// The 4-byte index operand (an inline-cache slot, a constant, a nested
+/// function) of the bytecode at `at`.
+fn index_at(code: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(code[at..at + 4].try_into().unwrap())
+}
+
 fn note_snapshot(s: &Rc<Snapshot>) {
     ALIVE.with(|a| a.borrow_mut().0.insert(Rc::as_ptr(s)));
 }
@@ -1976,7 +1982,7 @@ struct Insn {
     /// compiled. See [`lower`].
     frame: u8,
     /// A call's inline-cache slot.
-    ic: u16,
+    ic: u32,
     /// For a guard [`lower`] adds before an inlined call: the function the
     /// callee register must hold (and `op` is `Nop`).
     guard: u64,
@@ -2351,11 +2357,11 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::GetNamed | Op::SetNamed if vm => {
                     (reg, imm) = (
                         code[pc + 1],
-                        u16::from_le_bytes([code[pc + 2], code[pc + 3]]) as i32,
+                        index_at(code, pc + 2) as i32,
                     )
                 }
                 Op::LdaGlobal | Op::StaGlobal if vm => {
-                    imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                    imm = index_at(code, pc + 1) as i32
                 }
                 Op::Mov if vm => (reg, reg2) = (code[pc + 1], code[pc + 2]),
                 // The capacity in `imm`.
@@ -2364,26 +2370,26 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 // The capacity in `imm`, the shape's cache slot in `ic`.
                 Op::CreateObject if vm => {
                     imm = code[pc + 1] as i32;
-                    ic = u16::from_le_bytes([code[pc + 2], code[pc + 3]]);
+                    ic = index_at(code, pc + 2);
                 }
                 Op::LdaConstant if vm => {
-                    imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32
+                    imm = index_at(code, pc + 1) as i32
                 }
                 // Its register: where the `arguments` go.
                 Op::CreateArguments if vm => reg = code[pc + 1],
                 // The nested function's index in `imm`.
-                Op::CreateClosure if vm => imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32,
+                Op::CreateClosure if vm => imm = index_at(code, pc + 1) as i32,
                 // The pattern's constant in `imm`, the flags' in `ic`.
                 Op::CreateRegExp if vm => {
-                    imm = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as i32;
-                    ic = u16::from_le_bytes([code[pc + 3], code[pc + 4]]);
+                    imm = index_at(code, pc + 1) as i32;
+                    ic = index_at(code, pc + 5);
                 }
                 // The array the callee too (the callee's register a guard
                 // would check: there is none), the value in `acc`.
                 Op::Call if native == 1 => (reg, reg2, imm) = (code[pc + 1], code[pc + 1], 1),
                 Op::Call | Op::CallUndefined | Op::Construct if vm => {
                     (reg, reg2, imm) = (code[pc + 1], code[pc + 2], code[pc + 3] as i32);
-                    ic = u16::from_le_bytes([code[pc + 4], code[pc + 5]]);
+                    ic = index_at(code, pc + 4);
                     // `g` and `x`: the runtime passes the arguments.
                     if forward {
                         imm = 1;
@@ -2392,7 +2398,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                 Op::GetKeyed if vm => {
                     (reg, imm) = (
                         code[pc + 1],
-                        u16::from_le_bytes([code[pc + 2], code[pc + 3]]) as i32,
+                        index_at(code, pc + 2) as i32,
                     )
                 }
                 // The object in `reg`, the key in `reg2`.
@@ -2401,7 +2407,7 @@ fn decode(code: &[u8], vm: bool) -> Vec<Insn> {
                     (reg, reg2, imm) = (
                         code[pc + 1],
                         code[pc + 2],
-                        u16::from_le_bytes([code[pc + 3], code[pc + 4]]) as i32,
+                        index_at(code, pc + 3) as i32,
                     )
                 }
                 _ if vm => bail = true,
@@ -2520,7 +2526,7 @@ fn bytecode_live(
                 // only if it is live: `(() => p)()` captured the previous
                 // call's argument.)
                 Op::CreateClosure => {
-                    let k = u16::from_le_bytes([code[insn.pc + 1], code[insn.pc + 2]]) as usize;
+                    let k = index_at(code, insn.pc + 1) as usize;
                     for &(local, r) in unsafe { (*closures[k]).upvalues.iter() } {
                         if local {
                             rs_add(&mut reads, r as usize);
@@ -15502,7 +15508,7 @@ impl Lowering<'_> {
             }
             let ok = match j.op {
                 Op::CreateArguments => true,
-                Op::GetNamed => unsafe { (*code).ic(j.imm as u16).1 == length },
+                Op::GetNamed => unsafe { (*code).ic(j.imm as u32).1 == length },
                 Op::GetKeyed => true,
                 Op::Ldar => copy(k),
                 Op::Star => k > 0 && copy(k - 1) && regs.contains(&insns[k - 1].reg),
@@ -18806,8 +18812,8 @@ mod tests {
     #[test]
     fn a_literals_push_reads_its_array_alone() {
         let mut code = vec![Op::PushLiteral as u8, 5];
-        code.extend([Op::Call as u8, 5, 5, 1, 0, 0]);
-        code.extend([Op::Call as u8, 3, 7, 1, 0, 0]);
+        code.extend([Op::Call as u8, 5, 5, 1, 0, 0, 0, 0]);
+        code.extend([Op::Call as u8, 3, 7, 1, 0, 0, 0, 0]);
         assert_eq!(code.len(), Op::PushLiteral.size() + 2 * Op::Call.size());
         let insns = decode(&code, true);
         let reads = |i: &Insn| i.call_reads().collect::<Vec<_>>();

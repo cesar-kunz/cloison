@@ -198,10 +198,11 @@ unsafe fn imm32(pc: *const u8, off: usize) -> i32 {
     unsafe { i32::from_le(pc.add(off).cast::<i32>().read_unaligned()) }
 }
 
-/// Read an unaligned little-endian `u16` operand at `pc + off`.
+/// Read an unaligned little-endian `u32` index operand (an inline-cache
+/// slot, a constant, a nested function) at `pc + off`.
 #[inline(always)]
-unsafe fn u16_at(pc: *const u8, off: usize) -> u16 {
-    unsafe { u16::from_le(pc.add(off).cast::<u16>().read_unaligned()) }
+unsafe fn index_at(pc: *const u8, off: usize) -> u32 {
+    unsafe { u32::from_le(pc.add(off).cast::<u32>().read_unaligned()) }
 }
 
 /// Read a register operand at `pc + off` and return a pointer to that register.
@@ -1058,29 +1059,29 @@ handlers! {
 
     fn op_init_global(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
-        let (_, name) = (*frame_code(regs)).ic(u16_at(pc, 1));
+        let (_, name) = (*frame_code(regs)).ic(index_at(pc, 1));
         vm.init_global_lexical(name, acc);
         next!(any, Op::InitGlobal.size(), acc)
     }
 
     fn op_sta_global_annex_b(pc, acc, regs, tag) {
-        let (_, name) = (*frame_code(regs)).ic(u16_at(pc, 1));
+        let (_, name) = (*frame_code(regs)).ic(index_at(pc, 1));
         // (Approximately: such a binding made after the `var` would take
         // the function in the specification, a rare case.)
         if (*frame_vm(regs)).global_lexical_slot(name).is_some() {
             next!(any, Op::StaGlobalAnnexB.size(), acc)
         }
-        let r = with_top(regs, None, |vm| vm.set_global_miss(&*frame_code(regs), u16_at(pc, 1), acc));
+        let r = with_top(regs, None, |vm| vm.set_global_miss(&*frame_code(regs), index_at(pc, 1), acc));
         next_or_throw!(Op::StaGlobalAnnexB.size(), r.map(|()| acc))
     }
 
     fn op_init_global_annex_b(pc, acc, regs, tag) {
-        let (_, name) = (*frame_code(regs)).ic(u16_at(pc, 1));
+        let (_, name) = (*frame_code(regs)).ic(index_at(pc, 1));
         if (*frame_vm(regs)).global_lexical_slot(name).is_some() {
             next!(any, Op::InitGlobalAnnexB.size(), acc)
         }
         let r = with_top(regs, None, |vm| {
-            let (code, ic) = (&*frame_code(regs), u16_at(pc, 1));
+            let (code, ic) = (&*frame_code(regs), index_at(pc, 1));
             let v = vm.get_global_typeof_miss(code, ic)?;
             vm.set_global_miss(code, ic, v)
         });
@@ -1103,12 +1104,12 @@ handlers! {
     fn op_define_accessor(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
         let o = as_object(*reg(pc, 1, regs));
-        let k = u16::from_le_bytes([*pc.add(2), *pc.add(3)]) as usize;
+        let k = index_at(pc, 2) as usize;
         let name = (&(*frame_code(regs)).constants)[k];
         // (An index key's accessor goes where elements with attributes
         // do: see `props`.)
         let key = vm.property_key(name);
-        let (g, s) = if *pc.add(4) == 0 { (Some(acc), None) } else { (None, Some(acc)) };
+        let (g, s) = if *pc.add(6) == 0 { (Some(acc), None) } else { (None, Some(acc)) };
         let d = crate::props::Desc {
             get: g,
             set: s,
@@ -1156,7 +1157,7 @@ handlers! {
 
     fn op_check_hole(pc, acc, regs, tag) {
         if acc == Value::HOLE {
-            let name = (&(*frame_code(regs)).constants)[u16_at(pc, 1) as usize];
+            let name = (&(*frame_code(regs)).constants)[index_at(pc, 1) as usize];
             let n = String::from_utf16_lossy(string_units(name).unwrap_or(&[]));
             (*frame_vm(regs)).error = Some(Error::reference_error(format!("Cannot access '{n}' before initialization")));
             tail!(op_unwind, Value::EMPTY)
@@ -1251,8 +1252,8 @@ handlers! {
 
     fn op_create_regexp(pc, acc, regs, tag) {
         let vm = &mut *frame_vm(regs);
-        let k = |at: usize| (&(*frame_code(regs)).constants)[u16::from_le_bytes([*pc.add(at), *pc.add(at + 1)]) as usize];
-        let r = crate::builtins::regexp_literal(vm, k(1), k(3));
+        let k = |at: usize| (&(*frame_code(regs)).constants)[index_at(pc, at) as usize];
+        let r = crate::builtins::regexp_literal(vm, k(1), k(5));
         next_or_throw!(Op::CreateRegExp.size(), r)
     }
 
@@ -1441,7 +1442,7 @@ handlers! {
         if (*l).shape == (*ic).shape {
             next!(any, Op::LdaGlobalInsideTypeof.size(), *Object::slot(l, (*ic).loc))
         }
-        let r = with_top(regs, None, |vm| vm.get_global_typeof_miss(&*frame_code(regs), u16_at(pc, 1)));
+        let r = with_top(regs, None, |vm| vm.get_global_typeof_miss(&*frame_code(regs), index_at(pc, 1)));
         next_or_throw!(Op::LdaGlobalInsideTypeof.size(), r)
     }
 
@@ -1834,7 +1835,7 @@ handlers! {
     // ---- Allocation (ignore `acc`: also I32 entries) ----
 
     fn op_create_closure(pc, acc, regs, tag) {
-        let f = create_closure(regs, u16_at(pc, 1));
+        let f = create_closure(regs, index_at(pc, 1));
         next!(any, Op::CreateClosure.size(), f)
     }
 
@@ -1869,7 +1870,7 @@ handlers! {
 
     // Ignores `acc`: also the I32 entry.
     fn op_create_object(pc, acc, regs, tag) {
-        let o = create_object(regs, u16_at(pc, 2), *pc.add(1) as u32);
+        let o = create_object(regs, index_at(pc, 2), *pc.add(1) as u32);
         next!(any, Op::CreateObject.size(), o)
     }
 
@@ -1886,7 +1887,7 @@ handlers! {
     // Ignores `acc`: also the I32 entry.
     fn op_lda_constant(pc, acc, regs, tag) {
         let code = &*frame_code(regs);
-        let c = *code.constants.get_unchecked(u16_at(pc, 1) as usize);
+        let c = *code.constants.get_unchecked(index_at(pc, 1) as usize);
         next!(any, Op::LdaConstant.size(), c)
     }
 
@@ -2014,7 +2015,7 @@ handlers! {
         if (*l).shape == (*ic).shape {
             next!(any, Op::LdaGlobal.size(), *Object::slot(l, (*ic).loc))
         }
-        let r = with_top(regs, None, |vm| vm.get_global_miss(&*frame_code(regs), u16_at(pc, 1)));
+        let r = with_top(regs, None, |vm| vm.get_global_miss(&*frame_code(regs), index_at(pc, 1)));
         next_or_throw!(Op::LdaGlobal.size(), r)
     }
 
@@ -2033,8 +2034,8 @@ handlers! {
         let r = with_top(regs, None, |vm| {
             vm.store_failed = false;
             let code = &*frame_code(regs);
-            let r = vm.set_global_miss(code, u16_at(pc, 1), acc);
-            strict_store_check(vm, code, r, |vm| vm.atom_name(code.ic(u16_at(pc, 1)).1).to_string())
+            let r = vm.set_global_miss(code, index_at(pc, 1), acc);
+            strict_store_check(vm, code, r, |vm| vm.atom_name(code.ic(index_at(pc, 1)).1).to_string())
         });
         next_or_throw!(Op::StaGlobal.size(), r.map(|()| acc))
     }
@@ -2043,7 +2044,7 @@ handlers! {
     #[inline(never)]
     fn slow_get_named(pc, acc, regs, tag) {
         let obj = *reg(pc, 1, regs);
-        let r = with_top(regs, None, |vm| vm.get_named_miss(&*frame_code(regs), u16_at(pc, 2), obj));
+        let r = with_top(regs, None, |vm| vm.get_named_miss(&*frame_code(regs), index_at(pc, 2), obj));
         next_or_throw!(Op::GetNamed.size(), r)
     }
 
@@ -2054,8 +2055,8 @@ handlers! {
         let r = with_top(regs, None, |vm| {
             vm.store_failed = false;
             let code = &*frame_code(regs);
-            let r = vm.set_named_miss(code, u16_at(pc, 2), obj, acc);
-            strict_store_check(vm, code, r, |vm| vm.atom_name(code.ic(u16_at(pc, 2)).1).to_string())
+            let r = vm.set_named_miss(code, index_at(pc, 2), obj, acc);
+            strict_store_check(vm, code, r, |vm| vm.atom_name(code.ic(index_at(pc, 2)).1).to_string())
         });
         next_or_throw!(Op::SetNamed.size(), r.map(|()| acc))
     }
@@ -2099,7 +2100,7 @@ handlers! {
             } else {
                 acc
             };
-            let r = vm.get_keyed_miss(&*frame_code(regs), u16_at(pc, 2), obj, key);
+            let r = vm.get_keyed_miss(&*frame_code(regs), index_at(pc, 2), obj, key);
             // (A key's conversion may have thrown.)
             if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
         });
@@ -3321,7 +3322,7 @@ compare_jump!(
 );
 
 #[inline(never)]
-pub(crate) fn create_closure(regs: *mut Value, i: u16) -> Value {
+pub(crate) fn create_closure(regs: *mut Value, i: u32) -> Value {
     unsafe {
         (*frame_vm(regs)).safepoint(regs);
         let code = &*frame_code(regs);
@@ -3339,7 +3340,7 @@ pub(crate) fn create_closure(regs: *mut Value, i: u16) -> Value {
 }
 
 #[inline(never)]
-fn create_object(regs: *mut Value, ic: u16, n: u32) -> Value {
+fn create_object(regs: *mut Value, ic: u32, n: u32) -> Value {
     unsafe {
         (*frame_vm(regs)).safepoint(regs);
         (*frame_vm(regs)).create_object(&*frame_code(regs), ic, n)
@@ -4432,11 +4433,11 @@ unsafe fn frame_code(regs: *mut Value) -> *const Code {
     unsafe { header(regs, CODE) }
 }
 
-/// The inline-cache slot named by the `u16` operand at `pc + off`: its
+/// The inline-cache slot named by the `u32` operand at `pc + off`: its
 /// way 0, the others following.
 #[inline(always)]
 unsafe fn ic_at(regs: *mut Value, pc: *const u8, off: usize) -> *mut Ic {
-    unsafe { header::<Ic>(regs, ICS).add(u16_at(pc, off) as usize * IC_WAYS) }
+    unsafe { header::<Ic>(regs, ICS).add(index_at(pc, off) as usize * IC_WAYS) }
 }
 
 /// What [`call_function`] says when it can't call a bytecode function: no

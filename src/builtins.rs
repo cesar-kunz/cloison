@@ -1301,8 +1301,7 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
             unsafe {
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
-                (*o).elems = e;
-                crate::heap::barrier_young(o.cast(), &raw const (*o).elems);
+                crate::heap::store_young(o.cast(), &raw mut (*o).elems, e);
                 (*o).elems_len = values.len() as u32;
             }
         }
@@ -2670,8 +2669,7 @@ fn match_array(vm: &mut Vm, re: &crate::regexp::Regex, caps: &crate::regexp::Cap
         };
         ty = ty.join(crate::object::FieldType::of(v));
         unsafe {
-            *(*o).elems.add(i) = v;
-            crate::heap::barrier((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), v);
+            crate::heap::store((*o).elems.cast::<u8>().sub(8), (*o).elems.add(i), v);
             (*o).elems_len = i as u32 + 1;
         }
     }

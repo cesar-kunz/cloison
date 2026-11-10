@@ -204,8 +204,7 @@ fn slot(e: *mut Object, i: usize) -> Value {
 fn put(e: *mut Object, i: usize, v: Value) {
     unsafe {
         let at = (*e).elems.add(i);
-        *at = v;
-        crate::heap::barrier(e.cast(), at, v);
+        crate::heap::store(e.cast(), at, v);
     }
 }
 
@@ -408,7 +407,7 @@ fn new_store(vm: &mut Vm, buckets: usize, len: u32) -> *mut Object {
     vm.reserve_elems(e, n);
     unsafe {
         for k in 0..n {
-            *(*e).elems.add(k) = Value::EMPTY;
+            crate::layout::store_word((*e).elems.add(k), Value::EMPTY);
         }
         (*e).elems_len = n as u32;
     }
@@ -426,8 +425,7 @@ fn hold(o: *mut Object, e: *mut Object) {
     let v = crate::object::object_value(e);
     unsafe {
         let at = store_slot(o);
-        *at = v;
-        crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, v);
+        crate::heap::store((*o).elems.cast::<u8>().sub(8), at, v);
     }
 }
 
@@ -475,7 +473,7 @@ pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
     unsafe {
         (*o).flags |= FAR;
         for k in first_hole..n {
-            *(*o).elems.add(k) = Value::EMPTY;
+            crate::layout::store_word((*o).elems.add(k), Value::EMPTY);
         }
         (*o).elems_len = first_hole as u32;
         if first_hole * 2 < Object::elems_cap(o) as usize {
@@ -537,7 +535,7 @@ pub(crate) fn truncate(o: *mut Object, n: u32) {
         let len = (*o).elems_len;
         if n < len {
             for k in n..len {
-                *(*o).elems.add(k as usize) = Value::EMPTY;
+                crate::layout::store_word((*o).elems.add(k as usize), Value::EMPTY);
             }
             (*o).elems_len = n;
         }
@@ -566,7 +564,7 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: *mut Object) {
         let n = (*o).elems_len as usize;
         vm.reserve_elems(o, len);
         for k in n..len {
-            *(*o).elems.add(k) = Value::EMPTY;
+            crate::layout::store_word((*o).elems.add(k), Value::EMPTY);
         }
         (*o).elems_len = len as u32;
         for (i, v) in all {

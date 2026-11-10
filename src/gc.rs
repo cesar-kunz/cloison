@@ -32,6 +32,7 @@
 //! safepoint, the same way. `CLOISON_GC_STATS` prints each collection.
 
 use crate::heap::{BYTES, COLOR, END, EVAC, GRANULE, Heap, UPVALUE, VALUES, WEAK_VALUES, YOUNG, cell_size};
+use crate::layout::load_word;
 use crate::object::{Class, Object};
 use crate::value::Value;
 use crate::vm::Vm;
@@ -587,13 +588,13 @@ impl<V: Records> Visit for Rec<'_, V> {
 
     #[inline(always)]
     unsafe fn slot(&mut self, a: *mut Value) {
-        unsafe { self.slot_read(a, *a) }
+        unsafe { self.slot_read(a, load_word(a)) }
     }
 
     #[inline(always)]
     unsafe fn payload_slot(&mut self, a: *mut usize) {
         unsafe {
-            let q = *a;
+            let q = load_word(a);
             if q != 0 {
                 let c = self.0.cand();
                 c.note(self.0.rec(), a as usize, q - 8, true);
@@ -1040,17 +1041,19 @@ trait Visit {
     }
 
     /// The value in slot `a`, a cell's word (see [`trace`]): [`Visit::value`]
-    /// of it. A visitor that moves cells overrides it to update the slot.
+    /// of it, read atomically (the mutator may be writing it while the
+    /// marker reads it: `layout::Word`). A visitor that moves cells
+    /// overrides it to update the slot.
     #[inline(always)]
     unsafe fn slot(&mut self, a: *mut Value) {
-        unsafe { self.value(*a) }
+        unsafe { self.value(load_word(a)) }
     }
 
     /// The array's or upvalue's payload pointer in slot `a`, a cell's word:
-    /// [`Visit::payload`] of it, overridden as [`Visit::slot`].
+    /// [`Visit::payload`] of it, read as [`Visit::slot`], overridden as it.
     #[inline(always)]
     unsafe fn payload_slot(&mut self, a: *mut usize) {
-        unsafe { self.payload(*a) }
+        unsafe { self.payload(load_word(a)) }
     }
 
     /// Slot `a`, whose value the caller read as `v` (with an atomic load:
@@ -1727,7 +1730,7 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
             Class::Generator | Class::Promise => {
                 // Its state: a buffer of values (see `generator::state_of`,
                 // `promise::cells`).
-                if !(*o).code.is_null() && within(code) {
+                if within(code) {
                     v.payload_slot(&raw mut (*o).code as *mut usize);
                 }
             }
@@ -1742,14 +1745,14 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
                 return;
             }
             Class::ArrayBuffer => {
-                // A resizable one's views (see `typed`).
-                if !(*o).code.is_null() && within(code) {
+                // A resizable one's views (see `typed`), or null.
+                if within(code) {
                     v.slot(&raw mut (*o).code as *mut Value);
                 }
             }
             Class::SharedArrayBuffer => {
-                // A growable one's views; its bytes are no cell.
-                if !(*o).code.is_null() && within(code) {
+                // A growable one's views, or null; its bytes are no cell.
+                if within(code) {
                     v.slot(&raw mut (*o).code as *mut Value);
                 }
                 if within(props) {

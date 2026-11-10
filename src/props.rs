@@ -816,7 +816,7 @@ impl Vm {
                         self.grow_elements(o, i as usize + 1)?;
                     }
                     if i < (*o).elems_len && Self::has_element(o, i) {
-                        *(*o).elems.add(i as usize) = Value::EMPTY;
+                        crate::layout::store_word((*o).elems.add(i as usize), Value::EMPTY);
                     }
                     if crate::far::is_far(o) {
                         crate::far::remove(o, i);
@@ -880,7 +880,7 @@ impl Vm {
             if i >= (*o).elems_len {
                 self.reserve_elems(o, i as usize + 1);
                 for j in (*o).elems_len..i {
-                    *(*o).elems.add(j as usize) = Value::EMPTY;
+                    crate::layout::store_word((*o).elems.add(j as usize), Value::EMPTY);
                 }
                 (*o).elems_len = i + 1;
             }
@@ -905,7 +905,7 @@ impl Vm {
             let len = (*o).elems_len as usize;
             self.reserve_elems(o, n);
             for j in len..n {
-                *(*o).elems.add(j) = Value::EMPTY;
+                crate::layout::store_word((*o).elems.add(j), Value::EMPTY);
             }
             (*o).elems_len = n as u32;
         }
@@ -973,7 +973,7 @@ impl Vm {
                         crate::far::maybe_dense(self, o);
                     } else {
                         for i in stop..old_len {
-                            *(*o).elems.add(i as usize) = Value::EMPTY;
+                            crate::layout::store_word((*o).elems.add(i as usize), Value::EMPTY);
                         }
                         (*o).elems_len = stop;
                     }
@@ -1021,7 +1021,7 @@ impl Vm {
                         if (*o).flags & SEALED != 0 {
                             return false;
                         }
-                        *(*o).elems.add(i as usize) = Value::EMPTY;
+                        crate::layout::store_word((*o).elems.add(i as usize), Value::EMPTY);
                         return true;
                     }
                     if crate::far::is_far(o) && crate::far::has(o, i) {

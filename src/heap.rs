@@ -246,6 +246,29 @@ pub(crate) fn barrier_young<T>(host: *const u8, a: *const T) {
     }
 }
 
+/// Store `v` at `a`, in the cell at `host`, which may be old: a word the
+/// marker may be reading (`layout::Word`), then the [`barrier`].
+///
+/// # Safety
+/// `a` must be a value slot of the cell at `host`.
+#[inline(always)]
+pub(crate) unsafe fn store(host: *const u8, a: *mut Value, v: Value) {
+    unsafe { crate::layout::store_word(a, v) };
+    barrier(host, a, v);
+}
+
+/// Store `p`, a young array's or upvalue's payload pointer, at `a`, in the
+/// cell at `host` (an object's new `props`, `elems` or state), which may
+/// be old: as [`store`], with [`barrier_young`].
+///
+/// # Safety
+/// `a` must be a payload pointer's word of the cell at `host`.
+#[inline(always)]
+pub(crate) unsafe fn store_young<T: crate::layout::Word>(host: *const u8, a: *mut T, p: T) {
+    unsafe { crate::layout::store_word(a, p) };
+    barrier_young(host, a);
+}
+
 crate::layout::same_layout!(Heap, crate::layout::HeapPtrs: ptr, end);
 
 #[repr(C)]

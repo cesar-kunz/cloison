@@ -146,8 +146,7 @@ fn put(o: Value, i: usize, v: Value) {
     let o = as_object(o);
     unsafe {
         let at = (*o).elems.add(i);
-        *at = v;
-        crate::heap::barrier((*o).elems.cast::<u8>().sub(8), at, v);
+        crate::heap::store((*o).elems.cast::<u8>().sub(8), at, v);
     }
 }
 

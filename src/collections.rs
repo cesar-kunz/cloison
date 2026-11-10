@@ -20,7 +20,7 @@ use crate::jit::Ty;
 use crate::object::{Class, DONT_ENUM, Object, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
-use crate::vm::{Code, Error, NativeFn, Result, Vm, array_push, is_string, string_units};
+use crate::vm::{Error, NativeFn, Result, Vm, array_push, is_string, string_units};
 
 /// Indices into `Vm::collection_prototypes`.
 #[derive(Clone, Copy)]
@@ -284,8 +284,7 @@ fn entries(o: *mut Object) -> *mut Object {
 /// Set `o`'s entries array to `e`.
 fn hold_entries(o: *mut Object, e: Value) {
     unsafe {
-        (*o).code = e.to_bits() as *const Code;
-        crate::heap::barrier(o.cast(), &raw const (*o).code, e);
+        crate::heap::store(o.cast(), (&raw mut (*o).code).cast(), e);
     }
 }
 
@@ -298,8 +297,7 @@ fn slot(e: *mut Object, i: usize) -> Value {
 fn put(e: *mut Object, i: usize, v: Value) {
     unsafe {
         let at = (*e).elems.add(i);
-        *at = v;
-        crate::heap::barrier(e.cast(), at, v);
+        crate::heap::store(e.cast(), at, v);
     }
 }
 
@@ -441,7 +439,7 @@ fn append(vm: &mut Vm, o: *mut Object, entry: &[Value]) -> Result<()> {
 fn remove(o: *mut Object, i: usize) {
     let e = entries(o);
     for j in 0..stride(o) {
-        unsafe { *(*e).elems.add(i + j) = Value::EMPTY };
+        unsafe { crate::layout::store_word((*e).elems.add(i + j), Value::EMPTY) };
     }
     put(e, COUNT, Value::from_i32(int(e, COUNT) - 1));
 }
@@ -636,7 +634,7 @@ fn map_clear(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 fn clear(vm: &mut Vm, o: *mut Object) -> Result<()> {
     let e = entries(o);
     for i in BASE..len(e) {
-        unsafe { *(*e).elems.add(i) = Value::EMPTY };
+        unsafe { crate::layout::store_word((*e).elems.add(i), Value::EMPTY) };
     }
     move_entries(vm, o)
 }
@@ -777,7 +775,8 @@ fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         };
         return Ok(iter_result(vm, value, false));
     }
-    unsafe { (*it).code = std::ptr::null() };
+    // (`it` may be old: the marker may be reading `code`.)
+    unsafe { crate::layout::store_word(&raw mut (*it).code, std::ptr::null()) };
     Ok(iter_result(vm, Value::UNDEFINED, true))
 }
 

@@ -15846,6 +15846,59 @@ Promise.all([h1(0), h2(null), i3.next().then(() => i3.next())]).then(v => { glob
     assert_eq!(out_after_jobs(src), "33 34 35");
 }
 
+/// Every assignment target position classified by one function
+/// (`codegen::target_aliases`), from expressions and statements alike: a
+/// member of `arguments` as a `for`-`of` or `for`-`in` head, in array and
+/// object patterns at any depth, with defaults, rest and computed keys,
+/// parenthesized, with a computed key, updated; a parameter in `for`
+/// heads' patterns. A `for (arguments[0] of …)` head was taken for a
+/// read and the object left unmapped (#215's review). Both ways, in plain
+/// functions, generators, async functions and async generators. What
+/// SpiderMonkey and V8 give.
+#[test]
+fn every_target_position_maps_arguments() {
+    let src = r#"
+var out = [];
+function t1(a) { for (arguments[0] of [7]) {} return a; } out.push(t1(0));
+function t2(a) { for (arguments[0] in { k: 1 }) {} return a; } out.push(t2(0));
+function t3(a) { for ([arguments[0]] of [[8]]) {} return a; } out.push(t3(0));
+function t4(a) { for ({ x: arguments[0] } of [{ x: 9 }]) {} return a; } out.push(t4(0));
+function t5(a) { [arguments[0]] = [10]; return a; } out.push(t5(0));
+function t6(a) { ({ a: arguments[0] } = { a: 11 }); return a; } out.push(t6(0));
+function t7(a) { [...arguments[0]] = [12]; return a.join(); } out.push(t7(0));
+function t8(a) { [[{ y: [arguments[0] = 13] }]] = [[{ y: [] }]]; return a; } out.push(t8(0));
+function t9(a, i) { arguments[i] = 14; return a; } out.push(t9(0, 0));
+function t10(a, i) { arguments[i + 0]++; return a; } out.push(t10(14, 0));
+function t11(a) { (arguments[0]) = 16; return a; } out.push(t11(0));
+function t12(a) { ++(arguments[0]); return a; } out.push(t12(16));
+function t13(a) { ({ ...arguments[0] } = { q: 18 }); return a.q; } out.push(t13(0));
+function t14(a) { ({ [(a = 19, "z")]: arguments[1] } = {}); return arguments[0]; } out.push(t14(0, 0));
+function t15(a) { for ([a] of [[20]]); return arguments[0]; } out.push(t15(0));
+function t16(a) { for ({ a = 21 } of [{}]); return arguments[0]; } out.push(t16(0));
+function t17(a) { for (a in { z: 1 }); return arguments[0]; } out.push(t17(0));
+function t18(a) { for (let [x = (arguments[0] = 22)] of [[]]); return a; } out.push(t18(0));
+function t19(a) { arguments.length = 0; return a + "," + arguments.length; } out.push(t19(23));
+function t20(a) { [arguments[0], a] = [24, 25]; return arguments[0] + "," + a; } out.push(t20(0));
+function t21(a) { ((a)) &&= 26; return arguments[0]; } out.push(t21(1));
+function t22(a) { for (arguments[0] of [27]) {} return typeof arguments[0] + a; } out.push(t22(0));
+function* g1(a) { yield 0; for (arguments[0] of [28]); yield a; } var i1 = g1(0); i1.next(); out.push(i1.next().value);
+function* g2(a) { yield 0; [arguments[0]] = [29]; yield a; } var i2 = g2(0); i2.next(); out.push(i2.next().value);
+function* g3(a) { yield 0; for ([a] of [[30]]); yield arguments[0]; } var i3 = g3(0); i3.next(); out.push(i3.next().value);
+out.join(" ")
+"#;
+    assert_eq!(
+        value(src),
+        "7 k 8 9 10 11 12 13 14 15 16 17 18 19 20 21 z 22 23,0 25,25 26 number27 28 29 30"
+    );
+    let src = r#"async function h1(a) { await 0; for (arguments[0] of [31]); return a; }
+async function h2(a) { await 0; ({ a } = { a: 32 }); return arguments[0]; }
+async function* h3(a) { yield 0; for (arguments[0] in { w: 1 }); yield a; }
+var i4 = h3(0);
+Promise.all([h1(0), h2(0), i4.next().then(() => i4.next())]).then(v => { globalThis.out = [v[0], v[1], v[2].value].join(" "); });
+"#;
+    assert_eq!(out_after_jobs(src), "31 32 w");
+}
+
 /// A compound assignment's converted object key outlives a collection in
 /// its right side: `Vm::key_cache` kept the key string `GetKeyed` made for
 /// the `SetKeyed` to reuse, but no collection marked it, so the store went

@@ -42,10 +42,11 @@ pub struct Program<'a> {
     /// `intrinsics::direct_eval_bound`): its top level's upvalues, those of
     /// the site's bindings function, by index: the name the `eval` sees,
     /// its kind (`EVAL_CONST`…) and, in a box (`EVAL_BOXED`), the box's
-    /// property's key, or a name no code has (`%none`). Its code reads and
-    /// writes them as the scope object's accessors did (see
-    /// `codegen::Var::Bound`), and there is no `%e0`.
-    pub eval_upvalues: Vec<(Name, u8, Name)>,
+    /// property's key, or a name no code has (`%none`), and where it is in
+    /// the scopes around the `eval` (the entries of its chain outside it:
+    /// see `parse::parse_pass`). Its code reads and writes them as the
+    /// scope object's accessors did (see `codegen::Var::Bound`).
+    pub eval_upvalues: Vec<(Name, u8, Name, usize)>,
     /// Direct `eval`'s code of a script's, its function's scope object
     /// the global object (see `parse::parse_pass`).
     pub eval_global: bool,

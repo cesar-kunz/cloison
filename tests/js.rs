@@ -9438,6 +9438,77 @@ fn direct_eval_sees_past_80_bindings() {
     assert_eq!(value(&src), "3/2/10/11/5/103 99 true 100 100 100");
 }
 
+/// A direct `eval`'s code looks a name up in the scopes around the call
+/// in their order: a `with`'s object outside the function, or outside a
+/// block-scoped binding's declaration, doesn't shadow the function's own
+/// `let`, `const`, `var`, parameter, catch parameter, nor the binding;
+/// one inside does (ECMA-262 9.1.2.1 GetIdentifierReference, through the
+/// running context's LexicalEnvironment, 19.2.1.1 PerformEval). The
+/// `var` it declares inside one is the function's, its initializer
+/// setting the object's property (14.3.2.1). SpiderMonkey's values.
+#[test]
+fn direct_eval_finds_bindings_inside_withs_first() {
+    let src = r#"
+var out = [];
+function t(f) { try { out.push(String(f())); } catch (e) { out.push("!" + e.name); } }
+with ({z1: 'w'}) t(() => (function() { let z1 = 1; return eval('z1'); })());
+with ({z2: 'w'}) t(() => (function() { var z2 = 2; return eval('z2'); })());
+with ({z3: 'w'}) t(() => (function(z3) { return eval('z3'); })(3));
+with ({z4: 'w'}) t(() => (function() { const z4 = 4; return eval('typeof z4'); })());
+with ({z5: 'w'}) t(() => (function() { try { throw 5; } catch (z5) { return eval('z5'); } })());
+with ({z6: 'w'}) t(() => (() => { let z6 = 6; return eval('z6'); })());
+with ({z7: 'w'}) t(() => (function() { return eval('z7'); })());
+with ({z8: 'w'}) t(() => (function() { let z8 = 1; eval('z8 = 8'); return z8; })());
+t(() => (function() { let a = 1; with ({a: 2}) { return eval('a'); } })());
+t(() => (function() { with ({a: 2}) { let a = 3; return eval('a'); } })());
+t(() => (function() { let a = 1; with ({a: 2}) { let b = 3; return eval('[a, b].join()'); } })());
+t(() => (function() { var x = 1; with ({x: 4}) { return (function() { return eval('x'); })(); } })());
+t(() => (function() { var x = 5; with ({}) { return (function() { return eval('x'); })(); } })());
+var o = {v: 1};
+t(() => (function() { with (o) { eval('var v = 2'); } return [v, o.v].join(); })());
+t(() => (function() { let a = 1; with ({}) { try { eval('var a = 2'); } catch (e) { return e.name; } } })());
+out.join(" ");"#;
+    assert_eq!(value(src), "1 2 3 number 5 6 w 8 2 3 2,3 4 5 ,2 SyntaxError");
+}
+
+/// A direct `eval` in a function (or arrow) of an `eval`'s code, or after
+/// a binding of that code's, sees the bindings around the outer `eval`
+/// too: the scopes of the outer call stay around the inner one's (ECMA-262
+/// 19.2.1.1 PerformEval, step 16: the eval code's environment is inside
+/// the caller's). Its assignments are theirs, a `const`'s a TypeError, a
+/// `var` it declares by a block-scoped binding's name between the
+/// function's scope and it a SyntaxError (19.2.1.3
+/// EvalDeclarationInstantiation), one it declares the inner function's,
+/// whose own `var`s shadow them. SpiderMonkey's values.
+#[test]
+fn direct_eval_in_eval_code_functions_sees_the_callers_bindings() {
+    let src = r#"
+var out = [];
+function t(f) { try { out.push(String(f())); } catch (e) { out.push("!" + e.name); } }
+t(() => (function() { let q = 1; return eval('(() => eval("q"))()'); })());
+t(() => (function() { let q = 2; return eval('(function() { return eval("q"); })()'); })());
+t(() => (function() { var q = 3; return eval('(function() { return eval("q"); })()'); })());
+t(() => (function(a) { return eval('(function() { return eval("a"); })()'); })(4));
+t(() => (function() { let q = 1; eval('(() => eval("q = 5"))()'); return q; })());
+t(() => (function() { let q = 6; return eval('let r = 1; (() => eval("q + r"))()'); })());
+t(() => (function() { let q = 1; return eval('let r = 6; eval("q + r")'); })());
+t(() => (function() { let q = 1; return eval('(function() { var q = 8; return eval("q"); })()'); })());
+t(() => (function() { let q = 9; return eval('eval("(() => eval(\'q\'))()")'); })());
+t(() => (function() { let q = 10; with ({}) { return eval('(() => eval("q"))()'); } })());
+t(() => (function() { let a = 1; return eval('with ({a: 11}) { (() => eval("a")); }')(); })());
+t(() => (function() { "use strict"; let a = 12; return eval('(() => eval("a"))()'); })());
+t(() => (function() { const c = 1; try { eval('(() => eval("c = 2"))()'); } catch (e) { return e.name; } })());
+t(() => (function() { let a = 1; return eval('(function() { eval("var a = 2"); return a; })()'); })());
+t(() => (function() { let a = 1; try { return eval('eval("var a = 2")'); } catch (e) { return e.name; } })());
+t(() => (function() { var a = 1; eval('(() => eval("var a = 13"))()'); return a; })());
+t(() => (function() { var a = 14; eval('(function() { eval("var a = 2"); })()'); return a; })());
+t(() => (function(x) { return eval('(() => { x = 7; return eval("x"); })()') + x; })(1));
+let gq = 15;
+t(() => eval('(() => eval("gq"))()'));
+out.join(" ");"#;
+    assert_eq!(value(src), "1 2 3 4 5 7 7 8 9 10 11 12 TypeError 2 SyntaxError 1 14 14 15");
+}
+
 /// RegExp's methods and String's through them go through a user's `exec`
 /// (or a pattern's own `Symbol.replace`…), as the spec's generic
 /// algorithms do; `flags` asks each flag's getter.

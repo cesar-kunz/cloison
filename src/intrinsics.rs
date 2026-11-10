@@ -4,7 +4,7 @@
 //! paths all: the JIT leaves them to the interpreter.
 
 use crate::interp::{call_function, to_string_units};
-use crate::js::ast::{EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_NEW_TARGET, EVAL_STRICT};
+use crate::js::ast::{EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_NEW_TARGET, EVAL_STRICT, EVAL_THIS};
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::Desc;
 use crate::value::Value;
@@ -801,8 +801,10 @@ fn object_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// A direct `eval(source)`: `[eval, source, scope, this, flags
-/// (`EVAL_STRICT`…), in parameters, scope for its declarations, with
-/// objects…]`. Not the builtin `eval`: an ordinary call. Else `source` (a string) is
+/// (`EVAL_STRICT`…), in parameters, scope for its declarations, (with
+/// `EVAL_THIS`) the receiver, with objects…]`. Not the builtin `eval`: an
+/// ordinary call, of the receiver (in a `with`, the object `eval` was
+/// found on), with the arguments. Else `source` (a string) is
 /// compiled with the caller's scope object `scope` around it (see
 /// `js::compile_direct_eval`), its `var`s and functions (sloppy code's)
 /// made there first, and run with the caller's `this`. The code is kept
@@ -812,7 +814,7 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (env, this) = (a[2], a[3]);
     let flags = a[4].as_number().unwrap_or(0.0) as u8;
     let (strict, new_target) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0);
-    let src = match eval_source(vm, a[0], a[1], flags)? {
+    let src = match eval_source(vm, a, flags)? {
         ControlFlow::Break(r) => return Ok(r),
         ControlFlow::Continue(src) => src,
     };
@@ -820,7 +822,7 @@ fn direct_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         return Ok(src);
     };
     // (The objects of the `with` statements around it, outermost first.)
-    let withs = a.get(7..).unwrap_or(&[]);
+    let withs = a.get(eval_withs(flags)..).unwrap_or(&[]);
     // (A script's: the global object its function's scope object, whose
     // properties its code finds as globals, after the global scope's
     // block-scoped bindings, not as a `with`'s: see `parse_pass`.)
@@ -923,14 +925,14 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (env, this) = (a[2], a[3]);
     let flags = a[4].as_number().unwrap_or(0.0) as u8;
     let (strict, new_target) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0);
-    let src = match eval_source(vm, a[0], a[1], flags)? {
+    let src = match eval_source(vm, a, flags)? {
         ControlFlow::Break(r) => return Ok(r),
         ControlFlow::Continue(src) => src,
     };
     let Some(u) = crate::vm::string_units(src) else {
         return Ok(src);
     };
-    let withs = a.get(7..).unwrap_or(&[]);
+    let withs = a.get(eval_withs(flags)..).unwrap_or(&[]);
     if u.windows(4).any(|w| w == [b'e' as u16, b'v' as u16, b'a' as u16, b'l' as u16]) {
         let site = site_bindings(site);
         let bindings: Vec<_> = site.2.iter().map(|(n, k, up, key)| (n.as_str(), *k, *up, key.as_str())).collect();
@@ -1062,14 +1064,23 @@ fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, 
     Ok(r)
 }
 
-/// A direct `eval`'s source (`src`, or with `EVAL_ARGS` the first of
-/// the arguments in that array); or, its callee not the builtin `eval`,
-/// what an ordinary call of it with the arguments returns.
-fn eval_source(vm: &mut Vm, f: Value, src: Value, flags: u8) -> Result<ControlFlow<Value, Value>> {
+/// Where a direct `eval`'s with objects start in its arguments: past
+/// the receiver, if any.
+fn eval_withs(flags: u8) -> usize {
+    7 + (flags & EVAL_THIS != 0) as usize
+}
+
+/// A direct `eval`'s source (`a[1]`, or with `EVAL_ARGS` the first of
+/// the arguments in that array); or, its callee `a[0]` not the builtin
+/// `eval`, what an ordinary call of it with the arguments returns, of the
+/// receiver with `EVAL_THIS` (`a[7]`), else undefined.
+fn eval_source(vm: &mut Vm, a: &[Value], flags: u8) -> Result<ControlFlow<Value, Value>> {
+    let (f, src) = (a[0], a[1]);
     let builtin = f.is_cell() && as_object(f) == vm.eval_function;
     let args = if flags & EVAL_ARGS != 0 { elements(vm, src)? } else { vec![src] };
     if !builtin {
-        return call_function(vm, f, Value::UNDEFINED, &args).map(ControlFlow::Break);
+        let this = if flags & EVAL_THIS != 0 { a[7] } else { Value::UNDEFINED };
+        return call_function(vm, f, this, &args).map(ControlFlow::Break);
     }
     Ok(ControlFlow::Continue(args.first().copied().unwrap_or(Value::UNDEFINED)))
 }
@@ -1078,8 +1089,8 @@ fn eval_source(vm: &mut Vm, f: Value, src: Value, flags: u8) -> Result<ControlFl
 /// flags]` (`EVAL_ARGS`). As the builtin `eval`'s (indirect) of strict
 /// code.
 fn strict_eval(vm: &mut Vm, a: &[Value]) -> Result<Value> {
-    let flags = a[2].as_number().unwrap_or(0.0) as u8;
-    let src = match eval_source(vm, a[0], a[1], flags)? {
+    let flags = a[2].as_number().unwrap_or(0.0) as u8 & EVAL_ARGS;
+    let src = match eval_source(vm, a, flags)? {
         ControlFlow::Break(r) => return Ok(r),
         ControlFlow::Continue(src) => src,
     };

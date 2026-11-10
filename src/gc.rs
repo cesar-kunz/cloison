@@ -187,6 +187,9 @@ pub struct Gc {
     /// The [`CODE_EPOCH`] the current or last full marking began in: the
     /// codes it found live are marked with it or later.
     codes_from: u32,
+    /// The `codes_from` of this heap's marking before: the atoms' grace
+    /// (`Vm::prune_atoms`; other heaps' markings advance the epoch too).
+    codes_before: u32,
     /// What code may take (see [`code_bytes`]) before a full collection
     /// looks for dead code: what the last found live, at least `code_min`
     /// ([`CODE_MIN`]; less for tests).
@@ -281,6 +284,7 @@ impl Gc {
             .map_or(0, |s| s.parse::<usize>().unwrap_or(256).max(1) << 10);
         Gc {
             codes_from: 0,
+            codes_before: 0,
             code_room: CODE_MIN,
             code_at_start: 0,
             code_min: CODE_MIN,
@@ -2094,6 +2098,7 @@ impl Vm {
             // The cells that could still refer to them are swept.
             self.condemned.clear();
             self.free_condemned_shapes();
+            self.heap.gc.codes_before = self.heap.gc.codes_from;
             self.heap.gc.codes_from = CODE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             self.heap.gc.code_at_start = CODE_BYTES.with(|c| c.get());
             self.age_eval_cache();
@@ -2275,7 +2280,7 @@ impl Vm {
                     }
                 }
                 self.condemn_codes();
-                self.prune_atoms(self.heap.gc.codes_from);
+                self.prune_atoms(self.heap.gc.codes_before);
                 // (What the stacks hold, for the versions call sites left.)
                 let words = self.stack_words(sp, regs);
                 crate::jit::free_retired(self, &words);

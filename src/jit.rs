@@ -3804,6 +3804,10 @@ struct Spec<'a> {
     /// A fixed-length buffer has been detached (see `Vm::views_detached`):
     /// a typed array's `length` through the runtime.
     views_detached: bool,
+    /// Some view is of a growable shared buffer (see
+    /// `Vm::shared_growable_views`): a known typed array's `length`
+    /// checked.
+    shared_growable_views: bool,
     /// Registers from here keep their types: what an instruction learns
     /// about a copy of one isn't given to it (see [`copies`]). The values
     /// of loads moved out of loops (`hoist_loads`): a loop learning their
@@ -5574,7 +5578,8 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // An array's or string's length: no check if the receiver's shape
         // is one's. Once a typed array's may be stale (`views_detached`),
         // a typed array's through the runtime, and the check takes arrays
-        // and strings only (`nt`).
+        // and strings only (`nt`). (The general check exits on a view's
+        // `SHARED_GROWABLE`, with the class.)
         if prop == Prop::Length {
             use crate::object::Class;
             let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
@@ -5592,9 +5597,12 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             out.acc = I32;
             // (A known array may have gone far in a call, its shape still
             // extending the known one: `na` checks; a string's or a typed
-            // array's length is where `nc` reads it.)
+            // array's length is where `nc` reads it, but a growable shared
+            // buffer's view's is read from its block, by the runtime:
+            // `na`'s check of `FAR` is of `SHARED_GROWABLE` in a view.)
             let case = match (known, spec.views_detached) {
                 (true, _) if class == Some(Class::Array) => "na",
+                (true, _) if class == Some(Class::TypedArray) && spec.shared_growable_views => "na",
                 (true, _) => "nc",
                 (false, true) => "nt",
                 (false, false) => "",
@@ -8807,6 +8815,7 @@ impl JitCode {
                 stable_ok,
                 indices_protected: !cur.is_null() && unsafe { (*cur).indices_protected },
                 views_detached: !cur.is_null() && unsafe { (*cur).views_detached },
+                shared_growable_views: !cur.is_null() && unsafe { (*cur).shared_growable_views },
                 fixed_from: direct_base,
                 captured: &captured,
             };

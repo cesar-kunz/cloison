@@ -505,6 +505,8 @@ fn array_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let kind = vm.get_keyed(state, Value::from_i32(2))?.as_number().unwrap_or(1.0) as i32;
     let o = as_object(target);
     let len = if unsafe { (*o).class } == Class::TypedArray {
+        // (Its record made seq-cst: 23.1.5.1.)
+        crate::typed::read_view_length(vm, o);
         match crate::typed::ta_length(o) {
             Some(n) => n as f64,
             None => return Err(Error::type_error("Cannot perform %ArrayIteratorPrototype%.next on a detached or out of bounds typed array")),

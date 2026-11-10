@@ -123,7 +123,9 @@ fn local_times_in_zone_transitions() {
 /// whose view of the buffer has the grown length, though the grow's
 /// bookkeeping may not be done yet (#155: it skipped its catch-up, the
 /// grow counted only after its length was written). The grows sleep in
-/// that window (`CLOISON_TEST_GROW_DELAY`) for most runs to hit it.
+/// that window (`CLOISON_TEST_GROW_DELAY`) for most runs to hit it. (An
+/// element past the old length: bounded by the cached length, which the
+/// catch-up brings up to date, where `length` reads the block, #156.)
 #[test]
 fn a_grow_seen_through_a_third_agent_reaches_its_views() {
     let src = r#"
@@ -155,7 +157,7 @@ fn a_grow_seen_through_a_third_agent_reaches_its_views() {
         var stale = 0;
         for (var i = 0; i < N; i++) {
             while (Atomics.load(flag, 0) <= i);
-            if (views[i].length !== 16) stale++;
+            if (views[i][15] === undefined) stale++;
         }
         print("stale " + stale);
     "#;
@@ -168,5 +170,160 @@ fn a_grow_seen_through_a_third_agent_reaches_its_views() {
         let out = c.output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(String::from_utf8_lossy(&out.stdout), "stale 0\nundefined\n", "delay {delay}, no JIT {no_jit}");
+    }
+}
+
+/// `src` run under the JIT and by the interpreter alone, with environment
+/// `env`: it prints `expected`.
+fn prints_in_both_modes(test: &str, src: &str, env: &[(&str, &str)], expected: &str) {
+    for no_jit in [false, true] {
+        let mut c = cloison(test, src);
+        c.envs(env.iter().copied());
+        if no_jit {
+            c.env("CLOISON_NO_JIT", "1");
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{expected}\nundefined\n"), "{env:?}, no JIT {no_jit}");
+    }
+}
+
+/// A view's constructor reads its buffer's length seq-cst: once it has
+/// seen another agent's grow of `sab2`, that agent's grow of `sab1` before
+/// reaches `sab1`'s views too, an element past the old length included
+/// (#219: the constructors read the block without a catch-up).
+#[test]
+fn a_view_constructor_seeing_a_grow_catches_up() {
+    for read in ["new Int8Array(sab2).length", "new DataView(sab2).byteLength", "new Int8Array(sab2, 0).length"] {
+        let src = format!(
+            "$262.agent.start(`
+               var first, calls = 0;
+               $262.agent.receiveBroadcast(function (sab) {{
+                 if (++calls === 1) {{ first = sab; return; }}
+                 $262.agent.sleep(50);
+                 first.grow(64); sab.grow(64); $262.agent.leaving();
+               }});`);
+             var sab1 = new SharedArrayBuffer(16, {{ maxByteLength: 64 }});
+             var sab2 = new SharedArrayBuffer(16, {{ maxByteLength: 64 }});
+             var ta1 = new Int32Array(sab1);
+             $262.agent.broadcast(sab1, 1);
+             $262.agent.broadcast(sab2, 2);
+             var t0 = $262.agent.monotonicNow(), seen = 0;
+             while ((seen = {read}) !== 64 && $262.agent.monotonicNow() - t0 < 5000) ;
+             var e = ta1[15];
+             print(seen, e === 0 ? 'OK' : 'STALE', ta1.length);"
+        );
+        prints_in_both_modes("ctor-catch-up", &src, &[], "64 OK 16");
+    }
+}
+
+/// An agent sent one buffer twice has two buffer objects on its block: a
+/// view made on one after another agent's grow, the other's views see the
+/// grow too (#219).
+#[test]
+fn a_view_constructor_catches_up_a_blocks_aliases() {
+    let src = r#"
+        $262.agent.start(`
+          var s = [];
+          $262.agent.receiveBroadcast(function (sab) {
+            s.push(sab);
+            if (s.length < 2) return;
+            var tb = new Int8Array(s[1]);
+            $262.agent.report("ready");
+            var t0 = $262.agent.monotonicNow(), n = 0;
+            while ((n = new Int8Array(s[0]).length) !== 64 && $262.agent.monotonicNow() - t0 < 5000) ;
+            var e = tb[63];
+            $262.agent.report(n + " " + (e === 0 ? "OK" : "INCOHERENT") + " " + tb.length);
+            $262.agent.leaving();
+          });`);
+        var sab = new SharedArrayBuffer(16, { maxByteLength: 64 });
+        $262.agent.broadcast(sab); $262.agent.broadcast(sab);
+        var r; while ((r = $262.agent.getReport()) === null) ;
+        sab.grow(64);
+        while ((r = $262.agent.getReport()) === null) ;
+        print(r);
+    "#;
+    prints_in_both_modes("ctor-aliases", src, &[], "64 OK 64");
+}
+
+/// A loop polling a growable shared buffer's view's length (or another
+/// read the spec makes seq-cst: the getters, 23.2.3 and 25.3.4, the array
+/// iterator's, ValidateTypedArray's, OwnPropertyKeys') sees another
+/// agent's grow (#156: the cached length, never read again), at the top
+/// level and in a function compiled on a plain typed array first.
+#[test]
+fn polling_a_shared_views_length_sees_a_grow() {
+    let reads = [
+        "ia.length === 4",
+        "len(ia) === 4",
+        "ia.byteLength === 16",
+        "dv.byteLength === 16",
+        "[...ia].length === 4",
+        "ia.slice().length === 4",
+        "Object.keys(ia).length === 4",
+    ];
+    for read in reads {
+        let src = format!(
+            "function len(ta) {{ return ta.length; }}
+             var plain = new Int32Array(4);
+             for (var i = 0; i < 20000; i++) len(plain);
+             $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {{ sab.grow(64); $262.agent.leaving(); }});`);
+             var sab = new SharedArrayBuffer(16, {{ maxByteLength: 64 }});
+             var ia = new Int32Array(sab), dv = new DataView(sab);
+             $262.agent.broadcast(sab);
+             var t0 = Date.now();
+             while ({read} && Date.now() - t0 < 5000) ;
+             print(ia.length, dv.byteLength);"
+        );
+        prints_in_both_modes("poll-length", &src, &[], "16 64");
+    }
+}
+
+/// #155's and #219's sequences under stress, three agents: one grows each
+/// buffer in turn; a second sees each grow through its view's `length`,
+/// checks that it and the grows before reached its views (an element past
+/// the old length, bounded by the cached length), and stores `i + 1` to a
+/// flag; the main agent, once it loads that, checks its view. The grows
+/// sleep in their windows (`CLOISON_TEST_GROW_DELAY`).
+#[test]
+fn three_agents_see_grows_coherently() {
+    let src = r#"
+        var N = 30;
+        $262.agent.start(`var bufs = []; $262.agent.receiveBroadcast(function (sab) {
+            bufs.push(sab);
+            if (bufs.length <= ${N}) return;
+            for (var i = 0; i < ${N}; i++) bufs[i].grow(64);
+            $262.agent.leaving();
+        });`);
+        $262.agent.start(`var views = []; $262.agent.receiveBroadcast(function (sab) {
+            views.push(new Int32Array(sab));
+            if (views.length <= ${N}) return;
+            var flag = views[${N}], bad = 0, t0 = Date.now();
+            for (var i = 0; i < ${N}; i++) {
+                while (views[i].length === 4 && Date.now() - t0 < 5000);
+                for (var j = 0; j <= i; j++) if (views[j][15] === undefined) bad++;
+                Atomics.store(flag, 0, i + 1);
+            }
+            Atomics.store(flag, 1, bad + 1);
+            $262.agent.leaving();
+        });`);
+        var views = [];
+        for (var i = 0; i < N; i++) {
+            var sab = new SharedArrayBuffer(16, { maxByteLength: 64 });
+            views.push(new Int32Array(sab));
+            $262.agent.broadcast(sab);
+        }
+        var flag = new Int32Array(new SharedArrayBuffer(8));
+        $262.agent.broadcast(flag.buffer);
+        var stale = 0;
+        for (var i = 0; i < N; i++) {
+            while (Atomics.load(flag, 0) <= i);
+            if (views[i][15] === undefined) stale++;
+        }
+        while (Atomics.load(flag, 1) === 0);
+        print("stale " + stale + ", poller " + (Atomics.load(flag, 1) - 1));
+    "#;
+    for delay in ["2000", "0"] {
+        prints_in_both_modes("grow-three", src, &[("CLOISON_TEST_GROW_DELAY", delay)], "stale 0, poller 0");
     }
 }

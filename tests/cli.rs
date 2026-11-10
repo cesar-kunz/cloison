@@ -238,10 +238,14 @@ fn a_view_constructor_catches_up_a_blocks_aliases() {
           });`);
         var sab = new SharedArrayBuffer(16, { maxByteLength: 64 });
         $262.agent.broadcast(sab); $262.agent.broadcast(sab);
-        var r; while ((r = $262.agent.getReport()) === null) ;
+        function report() {
+            var r, t0 = Date.now();
+            while ((r = $262.agent.getReport()) === null) if (Date.now() - t0 > 10000) throw new Error("no report");
+            return r;
+        }
+        report();
         sab.grow(64);
-        while ((r = $262.agent.getReport()) === null) ;
-        print(r);
+        print(report());
     "#;
     prints_in_both_modes("ctor-aliases", src, &[], "64 OK 64");
 }
@@ -250,7 +254,9 @@ fn a_view_constructor_catches_up_a_blocks_aliases() {
 /// read the spec makes seq-cst: the getters, 23.2.3 and 25.3.4, the array
 /// iterator's, ValidateTypedArray's, OwnPropertyKeys') sees another
 /// agent's grow (#156: the cached length, never read again), at the top
-/// level and in a function compiled on a plain typed array first.
+/// level and in a function compiled on a plain typed array first. (The
+/// grow waits for `broadcast`, which catches up, to have returned.)
+/// Fixed-length views keep their lengths.
 #[test]
 fn polling_a_shared_views_length_sees_a_grow() {
     let reads = [
@@ -261,21 +267,26 @@ fn polling_a_shared_views_length_sees_a_grow() {
         "[...ia].length === 4",
         "ia.slice().length === 4",
         "Object.keys(ia).length === 4",
+        "u8.toHex().length === 32",
+        "u8.toBase64().length === 24",
+        "u8.setFromHex('00'.repeat(64)).written === 16",
+        "u8.setFromBase64('A'.repeat(88)).written === 15",
     ];
     for read in reads {
         let src = format!(
             "function len(ta) {{ return ta.length; }}
              var plain = new Int32Array(4);
              for (var i = 0; i < 20000; i++) len(plain);
-             $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {{ sab.grow(64); $262.agent.leaving(); }});`);
+             $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {{ $262.agent.sleep(20); sab.grow(64); $262.agent.leaving(); }});`);
              var sab = new SharedArrayBuffer(16, {{ maxByteLength: 64 }});
-             var ia = new Int32Array(sab), dv = new DataView(sab);
+             var ia = new Int32Array(sab), dv = new DataView(sab), u8 = new Uint8Array(sab);
+             var fixed = new Int32Array(sab, 4, 2), fixed_dv = new DataView(sab, 0, 8);
              $262.agent.broadcast(sab);
              var t0 = Date.now();
              while ({read} && Date.now() - t0 < 5000) ;
-             print(ia.length, dv.byteLength);"
+             print(ia.length, dv.byteLength, u8.length, fixed.length, fixed.byteOffset, fixed_dv.byteLength);"
         );
-        prints_in_both_modes("poll-length", &src, &[], "16 64");
+        prints_in_both_modes("poll-length", &src, &[], "16 64 64 2 4 8");
     }
 }
 
@@ -315,12 +326,17 @@ fn three_agents_see_grows_coherently() {
         }
         var flag = new Int32Array(new SharedArrayBuffer(8));
         $262.agent.broadcast(flag.buffer);
+        // (Bounded: an agent that died fails the test, not hangs it.)
+        var t0 = Date.now();
+        function wait(until) {
+            while (!until()) if (Date.now() - t0 > 10000) throw new Error("timed out at flag " + Atomics.load(flag, 0));
+        }
         var stale = 0;
         for (var i = 0; i < N; i++) {
-            while (Atomics.load(flag, 0) <= i);
+            wait(function () { return Atomics.load(flag, 0) > i; });
             if (views[i][15] === undefined) stale++;
         }
-        while (Atomics.load(flag, 1) === 0);
+        wait(function () { return Atomics.load(flag, 1) !== 0; });
         print("stale " + stale + ", poller " + (Atomics.load(flag, 1) - 1));
     "#;
     for delay in ["2000", "0"] {

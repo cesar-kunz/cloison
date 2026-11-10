@@ -421,10 +421,16 @@ impl Parser<'_> {
 }
 
 impl Regex {
-    /// Whether `pattern` (code units) with `flags` is a valid regular
-    /// expression (a literal's early error), as [`Regex::new`] would find, without
+    /// Whether `pattern` with `flags` is a valid regular expression (a
+    /// literal's early error), as [`Regex::new`] would find, without
     /// compiling it.
-    pub fn check(pattern: &[u16], flags: &str) -> Result<(), String> {
+    pub fn check(pattern: &str, flags: &str) -> Result<(), String> {
+        Regex::check_units(&pattern.encode_utf16().collect::<Vec<_>>(), flags)
+    }
+
+    /// [`Regex::check`] of a pattern's code units (a lone surrogate in it
+    /// a pattern character), as [`Regex::of_units`] would find.
+    pub fn check_units(pattern: &[u16], flags: &str) -> Result<(), String> {
         Regex::parse(pattern, flags).map(|_| ())
     }
 

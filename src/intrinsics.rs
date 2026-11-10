@@ -850,7 +850,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
         None => {
             let source: Box<[u16]> = u.into();
             let text = crate::js::lex::Source::from_units(u);
-            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, live_this, &chain.text(), global, &[]).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval_source(&text, strict, new_target, home, live_this, &chain.text(), global, &[]).map_err(eval_error)?;
             let annex_b: std::rc::Rc<[crate::object::Atom]> = module.annex_b.iter().map(|n| vm.intern_name(n)).collect();
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
@@ -987,7 +987,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                     None => ("%none".into(), 0, "".into(), 0),
                 })
                 .collect();
-            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, live_this, &chain.text(), false, &bound).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval_source(&text, strict, new_target, home, live_this, &chain.text(), false, &bound).map_err(eval_error)?;
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             // (Not Annex B's `var` of a function in a block by a
             // block-scoped binding's name, but a catch parameter's: see

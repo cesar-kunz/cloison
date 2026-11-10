@@ -2473,7 +2473,7 @@ impl Vm {
         if s.dictionary {
             let cell = self.dictionary_cell();
             let slots = s.slots.with(name, attrs, cell);
-            unsafe { Shape::dictionary_mut(shape).slots = slots };
+            unsafe { *Shape::dictionary_slots(shape) = slots };
             return shape;
         }
         let cell = self.new_field_cell();
@@ -4663,7 +4663,7 @@ impl Vm {
                 crate::heap::store(o.cast(), at, v);
             }
             crate::layout::store_word(Object::slot(o, (*s).location(n - 1)), Value::UNDEFINED);
-            Shape::dictionary_mut(s).slots.remove(k);
+            Shape::dictionary_slots(s).remove(k);
         }
     }
 
@@ -6824,30 +6824,36 @@ impl Vm {
                 if let Some(into) = into.filter(|_| i == 0) {
                     // The stub's runtime state stays (its constructor's
                     // slack tracking, its liveness): it has never run.
-                    let c = unsafe { &mut *into.cast_mut() };
-                    debug_assert_eq!(c.nparams, f.nparams);
-                    // Its upvalues in the stub's order: the names its
-                    // closures captured, declared again in that order (see
-                    // `js::compile_lazy`). The stub's sources, where they
-                    // are in its parent, stay; the new ones are where they
-                    // are in the wrapper declaring them.
-                    debug_assert_eq!(c.upvalues.len(), f.upvalues.len());
-                    debug_assert_eq!(c.lazy.as_ref().map(|l| l.upvalues.len()), Some(f.upvalues.len()));
-                    let before = c.footprint();
-                    c.bytecode = bytecode;
-                    c.nregs = f.nregs;
-                    c.ics = Default::default();
-                    c.ic_names = ic_names.into_boxed_slice();
-                    c.define_ics = f.defines.into_boxed_slice();
-                    c.constants = constants;
-                    c.handlers = f.handlers.into_boxed_slice();
-                    c.compound_keys = f.compound_keys.into_boxed_slice();
-                    c.arguments_escape = f.arguments_escape;
-                    c.interpreted = interpreted;
-                    c.calls_left.set(calls_left);
-                    c.loop_budget.set(loop_budget);
-                    c.lazy = None;
-                    crate::gc::code_bytes(c.footprint().saturating_sub(before));
+                    // Written field by field through the pointer, never as a
+                    // `&mut Code`: an old closure of the stub may be traced
+                    // meanwhile, the marker thread reading its `upvalues`
+                    // (unchanged) and storing to `mark`.
+                    let c = into.cast_mut();
+                    unsafe {
+                        debug_assert_eq!((*c).nparams, f.nparams);
+                        // Its upvalues in the stub's order: the names its
+                        // closures captured, declared again in that order (see
+                        // `js::compile_lazy`). The stub's sources, where they
+                        // are in its parent, stay; the new ones are where they
+                        // are in the wrapper declaring them.
+                        debug_assert_eq!((&(*c).upvalues).len(), f.upvalues.len());
+                        debug_assert_eq!((*c).lazy.as_ref().map(|l| l.upvalues.len()), Some(f.upvalues.len()));
+                        let before = (*c).footprint();
+                        (*c).bytecode = bytecode;
+                        (*c).nregs = f.nregs;
+                        (*c).ics = Default::default();
+                        (*c).ic_names = ic_names.into_boxed_slice();
+                        (*c).define_ics = f.defines.into_boxed_slice();
+                        (*c).constants = constants;
+                        (*c).handlers = f.handlers.into_boxed_slice();
+                        (*c).compound_keys = f.compound_keys.into_boxed_slice();
+                        (*c).arguments_escape = f.arguments_escape;
+                        (*c).interpreted = interpreted;
+                        (*c).calls_left.set(calls_left);
+                        (*c).loop_budget.set(loop_budget);
+                        (*c).lazy = None;
+                        crate::gc::code_bytes((*c).footprint().saturating_sub(before));
+                    }
                     return into;
                 }
                 self.add_code(Code {

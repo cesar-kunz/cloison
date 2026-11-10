@@ -9409,6 +9409,35 @@ out.join(' ');"##;
     assert_eq!(value(src), "let=1 const=3 block=3 catch=4 loopLet=0,1,2 assignLet=5 outer=7 outerUnused=8 closureLet=10 varDecl=11 fnDecl=12 letInEval=undefined shadow=inner param=14 arguments=2 this=15 newTarget=[object Object] classField=2 nested=16 strictVar=undefined tdz=!ReferenceError ownVarAssign=2 ownVarAssign2=2 mixed=11,20 newVar=2 outerAssign=5 deep=3 shadowVar=var typeofMissing=undefined loopAssign=3 withCompound=11");
 }
 
+/// A direct `eval` sees every binding where it is, not only the first 80
+/// (#173): a function's 100 `let`s and its `var`s after them, which it
+/// assigns and declares; in a generator (its bindings in boxes), in an
+/// arrow (its function's `arguments`, `new.target`), an `eval` in the
+/// `eval`'s code, a closure it makes; in a script's block. SpiderMonkey's
+/// values.
+#[test]
+fn direct_eval_sees_past_80_bindings() {
+    let lets: String = (0..100).map(|i| format!("let z{i} = {i};")).collect();
+    let src = format!(
+        "var out = [];\n\
+         function f(a) {{ {lets} var v = 1; eval('var w = 2; v = 3; z0 = 10; z99 = 11');\n\
+           return [v, w, z0, z99, eval('arguments[0]'), (() => eval('arguments[0] + z98'))()].join('/'); }}\n\
+         out.push(f(5));\n\
+         function* g() {{ {lets} yield eval('z99 + z0'); }}\n\
+         out.push(g().next().value);\n\
+         function N() {{ {lets} this.r = (() => eval('new.target === N'))(); }}\n\
+         out.push(new N().r);\n\
+         function nested() {{ {lets} return eval('eval(\"z99 + z1\")'); }}\n\
+         out.push(nested());\n\
+         function clos() {{ {lets} eval('var h = () => z99++'); h(); return z99; }}\n\
+         out.push(clos());\n\
+         var gl = 1;\n\
+         {{ {lets} out.push(eval('z99 + gl')); }}\n\
+         out.join(' ');"
+    );
+    assert_eq!(value(&src), "3/2/10/11/5/103 99 true 100 100 100");
+}
+
 /// RegExp's methods and String's through them go through a user's `exec`
 /// (or a pattern's own `Symbol.replace`…), as the spec's generic
 /// algorithms do; `flags` asks each flag's getter.
@@ -10501,6 +10530,29 @@ fn modules_eval_in_arrows() {
     }
     // (With an `eval` of its own too.)
     assert_eq!(run_module(&dir, "top.mjs").unwrap(), "SyntaxError");
+}
+
+/// A module's direct `eval` sees all its top-level bindings (#173), 300
+/// `let`s and a `var` after them, which it assigns: in the module's own
+/// code (no longer more registers than there are), in an arrow and in a
+/// function. In the interpreter and tiered up. SpiderMonkey's values.
+#[test]
+fn modules_eval_sees_many_top_level_bindings() {
+    let lets: String = (0..300).map(|i| format!("let z{i} = {i};\n")).collect();
+    let main = format!(
+        "{lets}var v = 5;\nconst r = [eval('z299 + v')];\neval('z299 = 1; v = 2; z0 = 7');\nr.push(z299, v, z0);\n\
+         const k = () => eval('z0 + z298 + v');\nfunction inner() {{ return eval('z1 + v'); }}\n\
+         r.push(k(), inner());\nglobalThis.result = r.join();"
+    );
+    let dir = module_dir("eval-many", &[("main.mjs", &main)]);
+    for budget in [i64::MAX, 1, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.run_module(dir.join("main.mjs").to_str().unwrap()).unwrap_or_else(|_| panic!("at {budget}"));
+        vm.verify_heap();
+        let (a, g) = (vm.intern("result"), vm.global_object());
+        assert_eq!(display(vm.get(g, a).unwrap()), "304,1,2,7,307,3", "tier at {budget}");
+    }
 }
 
 /// Top-level `await`: a module waits for its async dependencies, which

@@ -1564,7 +1564,7 @@ handlers! {
     }
 
     fn op_type_of(pc, acc, regs, tag) {
-        let v = (*frame_vm(regs)).type_of(acc);
+        let v = (*frame_vm(regs)).type_of_own(acc);
         next!(any, Op::TypeOf.size(), v)
     }
 

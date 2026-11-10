@@ -6912,16 +6912,22 @@ impl Vm {
         vm.no_pending_error(r)
     }
 
-    /// Whether a panic unwound out of a collection (see [`Vm::run`]): the
-    /// heap is half collected (marked, or evacuated and its references not
-    /// all brought up to date), and the VM's runs and the host operations
-    /// that enter it fail. Dropping it is all that is left.
+    /// Whether a panic unwound out of a collection (see [`Vm::run`]), or
+    /// the collector's marker thread panicked (#224): the heap is half
+    /// collected (marked, or evacuated and its references not all brought
+    /// up to date), and the VM's runs and the host operations that enter
+    /// it fail. Dropping it is all that is left. (The run the marker
+    /// panicked in runs on, collecting no more, and fails as it ends:
+    /// compiled code has no way out for it, see `jit`'s runtime calls.)
     pub fn poisoned(&self) -> bool {
-        self.heap.gc.unfinished
+        self.heap.gc.unfinished || self.marker_panic().is_some()
     }
 
     /// An error if the VM is [`poisoned`](Vm::poisoned).
     fn usable(&self) -> Result<()> {
+        if let Some(e) = self.marker_panic() {
+            return Err(Error(format!("Error: the VM is poisoned: the collector's marker thread panicked: {e}"), None));
+        }
         if self.poisoned() {
             return Err(Error("Error: the VM is poisoned: a panic unwound out of a collection".into(), None));
         }
@@ -6932,11 +6938,14 @@ impl Vm {
     /// pending if nothing threw it (which would be a bug: see
     /// `conv_error`), so it doesn't go off in the next run.
     fn no_pending_error<T>(&mut self, r: Result<T>) -> Result<T> {
-        if !self.conv_thrown {
-            return r;
-        }
-        let e = self.take_conv_error();
-        r.and(Err(e))
+        let r = if self.conv_thrown {
+            let e = self.take_conv_error();
+            r.and(Err(e))
+        } else {
+            r
+        };
+        // (The marker panicked during the run: see `poisoned`.)
+        self.usable().and(r)
     }
 
     /// Run `f` from the host, as `run` runs a script (then the event

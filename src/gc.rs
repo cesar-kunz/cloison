@@ -1862,8 +1862,8 @@ struct MarkerState {
     emptied: Vec<usize>,
     /// Sweeping right now.
     sweeping: bool,
-    /// What the marker thread panicked with: it is gone, the mutator's
-    /// next pause panics with it (#224).
+    /// What the marker thread panicked with: it is gone for good, the VM
+    /// poisoned (see `marker_loop`; #224).
     panicked: Option<String>,
 }
 
@@ -1891,24 +1891,21 @@ impl Marker {
     fn pause(&self) {
         let sh = &self.shared;
         sh.pause.store(true, std::sync::atomic::Ordering::Relaxed);
-        let mut st = sh.state.lock().unwrap();
+        let mut st = sh.state();
         while st.busy || st.sweeping {
-            st = sh.wake.wait(st).unwrap();
+            st = sh.wake.wait(st).unwrap_or_else(|e| e.into_inner());
         }
-        // (Not again while unwinding from it: a run's end pauses too. The
-        // lock let go first, not to poison it.)
-        if let Some(e) = st.panicked.clone()
-            && !std::thread::panicking()
-        {
-            drop(st);
-            panic!("the marker thread panicked: {e}");
-        }
+    }
+
+    /// What the marker thread panicked with, if it did (see `marker_loop`).
+    fn panicked(&self) -> Option<String> {
+        self.shared.state().panicked.clone()
     }
 
     /// Let it go on (sweeping, say) after a pause that gave it no work.
     fn unpause(&self) {
         let sh = &self.shared;
-        let _st = sh.state.lock().unwrap();
+        let _st = sh.state();
         sh.pause.store(false, std::sync::atomic::Ordering::Relaxed);
         sh.wake.notify_all();
     }
@@ -1916,17 +1913,17 @@ impl Marker {
     /// Hand it `more` work and let it run.
     fn resume(&self, more: &mut Vec<usize>, request: usize) {
         let sh = &self.shared;
-        let mut st = sh.state.lock().unwrap();
+        let mut st = sh.state();
         st.work.append(more);
         st.request = request;
         // Nothing to trace (a start pause that shaded nothing): done, and
         // the next safepoint is the final pause, which the marker, waiting
         // for work, would never ask for.
-        let done = st.work.is_empty() && !st.busy;
-        st.run = !done;
-        st.done = done;
-        if done {
-            unsafe { (*(request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed) };
+        debug_assert!(st.panicked.is_none(), "work for a marker that panicked");
+        if st.work.is_empty() && !st.busy {
+            ask_final(&mut st);
+        } else {
+            (st.run, st.done) = (true, false);
         }
         sh.pause.store(false, std::sync::atomic::Ordering::Relaxed);
         sh.wake.notify_all();
@@ -1936,7 +1933,7 @@ impl Marker {
 impl Drop for Marker {
     fn drop(&mut self) {
         {
-            let mut st = self.shared.state.lock().unwrap();
+            let mut st = self.shared.state();
             st.quit = true;
             self.shared.pause.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1947,22 +1944,34 @@ impl Drop for Marker {
     }
 }
 
-/// The marker thread: a panic in it (a bug) is recorded, and the mutator
-/// woken, which then panics with it, rather than left waiting for good
-/// for a marker that was busy (release builds abort: #224).
+impl Shared {
+    /// The marker's state, the lock taken: one a panic poisoned too (the
+    /// marker's is then recorded, see `marker_loop`).
+    fn state(&self) -> std::sync::MutexGuard<'_, MarkerState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Out of work: the mutator's next safepoint is the final pause.
+fn ask_final(st: &mut MarkerState) {
+    (st.run, st.done) = (false, true);
+    unsafe { (*(st.request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed) };
+}
+
+/// The marker thread. A panic in it (a bug) is recorded and the mutator
+/// woken, rather than left waiting for good for a marker that was busy
+/// (#224): the marking, or the blocks it was sweeping, left half done,
+/// the VM collects no more and is poisoned (see `Vm::collect_from`,
+/// `Vm::poisoned`). (Release builds abort.)
 fn marker_loop(sh: &Shared) {
     let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| marker_work(sh))) else { return };
     let e = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned());
-    let mut st = sh.state.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = sh.state();
     let marking = st.busy;
-    st.busy = false;
-    st.sweeping = false;
+    (st.busy, st.sweeping) = (false, false);
     st.panicked = Some(e.unwrap_or_else(|| "a panic".into()));
     if marking && !sh.pause.load(std::sync::atomic::Ordering::Relaxed) {
-        // As when out of work: the mutator's next safepoint pauses it.
-        st.run = false;
-        st.done = true;
-        unsafe { (*(st.request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed) };
+        ask_final(&mut st);
     }
     sh.wake.notify_all();
 }
@@ -1973,7 +1982,7 @@ fn marker_work(sh: &Shared) {
     let mut shade = Vec::new();
     loop {
         let (color, heap, shapes, cand) = {
-            let mut st = sh.state.lock().unwrap();
+            let mut st = sh.state();
             loop {
                 if st.quit {
                     return;
@@ -1997,7 +2006,7 @@ fn marker_work(sh: &Shared) {
                                 live => swept.push((b, crate::heap::BLOCK - live)),
                             }
                         }
-                        st = sh.state.lock().unwrap();
+                        st = sh.state();
                         st.swept.append(&mut swept);
                         st.emptied.append(&mut emptied);
                         st.sweeping = false;
@@ -2005,7 +2014,7 @@ fn marker_work(sh: &Shared) {
                         continue;
                     }
                 }
-                st = sh.wake.wait(st).unwrap();
+                st = sh.wake.wait(st).unwrap_or_else(|e| e.into_inner());
             }
             std::mem::swap(&mut stack, &mut st.work);
             st.busy = true;
@@ -2032,16 +2041,13 @@ fn marker_work(sh: &Shared) {
         unsafe { m.drain(&|| sh.pause.load(Relaxed)) };
         let marked = m.marked;
         let mut rec = std::mem::take(&mut m.rec);
-        let mut st = sh.state.lock().unwrap();
+        let mut st = sh.state();
         st.marked += marked;
         st.rec.append(&mut rec);
         st.work.append(&mut stack);
         st.busy = false;
         if st.work.is_empty() && !sh.pause.load(Relaxed) {
-            // Out of work: the mutator's next safepoint is the final pause.
-            st.run = false;
-            st.done = true;
-            unsafe { (*(st.request as *const std::sync::atomic::AtomicBool)).store(true, Relaxed) };
+            ask_final(&mut st);
         }
         sh.wake.notify_all();
     }
@@ -2055,6 +2061,12 @@ impl Vm {
         if self.heap.requested.load(std::sync::atomic::Ordering::Relaxed) && self.heap.gc.stack_base != 0 {
             self.collect(regs);
         }
+    }
+
+    /// What the marker thread panicked with, if it did: the VM collects no
+    /// more, poisoned (#224).
+    pub(crate) fn marker_panic(&self) -> Option<String> {
+        self.heap.gc.marker.as_ref()?.panicked()
     }
 
     /// A full collection now (`$262.gc()`): a concurrent cycle under way
@@ -2096,7 +2108,7 @@ impl Vm {
             // Cleared before `done` is read: a request the marker makes
             // after this is kept for the next safepoint.
             self.heap.requested.store(false, std::sync::atomic::Ordering::Relaxed);
-            let done = gc.marker.as_ref().is_some_and(|m| m.shared.state.lock().unwrap().done);
+            let done = gc.marker.as_ref().is_some_and(|m| m.shared.state().done);
             // The final pause: the marker is done, or the heap or code has
             // outgrown the cycle (the mutator then finishes the marking: a
             // marker short of time left code dead `eval`s made to pile up).
@@ -2125,6 +2137,14 @@ impl Vm {
 
     /// A collection, the native stack's live part starting at `sp`.
     fn collect_from(&mut self, sp: usize, regs: *mut Value, kind: Collection) {
+        if let Some(m) = &self.heap.gc.marker {
+            m.pause();
+            // Its marking or sweep half done, none runs again (#224).
+            if m.panicked().is_some() {
+                self.heap.requested.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
         self.heap.gc.unfinished = true;
         let start = std::time::Instant::now();
         let check = self.heap.gc.checking();
@@ -2213,7 +2233,7 @@ impl Vm {
         if kind == Collection::Final
             && let Some(mk) = &self.heap.gc.marker
         {
-            let mut st = mk.shared.state.lock().unwrap();
+            let mut st = mk.shared.state();
             stack.append(&mut st.work);
             st.run = false;
             st.done = false;
@@ -2285,7 +2305,7 @@ impl Vm {
                 if kind == Collection::Final {
                     rec.append(&mut self.heap.gc.evac_rec);
                     if let Some(mk) = &self.heap.gc.marker {
-                        rec.append(&mut mk.shared.state.lock().unwrap().rec);
+                        rec.append(&mut mk.shared.state().rec);
                     }
                 }
                 self.evacuate(sp, regs, color, rec);
@@ -2347,7 +2367,7 @@ impl Vm {
         if full {
             self.heap.gc.marking = false;
             let concurrent = self.heap.gc.marker.as_ref().map_or(0, |mk| {
-                std::mem::take(&mut mk.shared.state.lock().unwrap().marked)
+                std::mem::take(&mut mk.shared.state().marked)
             });
             // The blocks the sweep left in use (partly free ones too),
             // and room to grow by what was live, times `GROWTH - 1`: what
@@ -2386,7 +2406,7 @@ impl Vm {
                 freed >> 10,
                 self.heap.allocated() >> 20,
                 self.heap.holes,
-                self.heap.gc.marker.as_ref().map_or(0, |mk| mk.shared.state.lock().unwrap().sweep.len())
+                self.heap.gc.marker.as_ref().map_or(0, |mk| mk.shared.state().sweep.len())
             );
             if full {
                 self.heap.gc.report_room();
@@ -2432,7 +2452,7 @@ impl Vm {
             }
             let mk = self.heap.gc.marker.as_ref().unwrap();
             {
-                let mut st = mk.shared.state.lock().unwrap();
+                let mut st = mk.shared.state();
                 st.color = color;
                 st.heap = range;
                 st.shapes = self.heap.gc.shape_cycle;
@@ -4611,7 +4631,7 @@ impl Heap {
             self.gc.marker = Some(Marker::start());
         }
         let mk = self.gc.marker.as_ref().unwrap();
-        let mut st = mk.shared.state.lock().unwrap();
+        let mut st = mk.shared.state();
         st.sweep = small;
         st.sweep_color = color;
         st.poison = poison;
@@ -4625,7 +4645,7 @@ impl Heap {
     pub(crate) fn absorb_sweep(&mut self) -> bool {
         let Some(mk) = &self.gc.marker else { return true };
         let (partly, empty, over) = {
-            let mut st = mk.shared.state.lock().unwrap();
+            let mut st = mk.shared.state();
             let over = st.sweep.is_empty() && !st.sweeping;
             (std::mem::take(&mut st.swept), std::mem::take(&mut st.emptied), over)
         };
@@ -4655,7 +4675,7 @@ impl Heap {
     pub(crate) fn help_sweep(&mut self) -> bool {
         let Some(mk) = &self.gc.marker else { return false };
         let (blocks, color, poison) = {
-            let mut st = mk.shared.state.lock().unwrap();
+            let mut st = mk.shared.state();
             let k = st.sweep.len().saturating_sub(16);
             (st.sweep.split_off(k), st.sweep_color, st.poison)
         };
@@ -4683,7 +4703,7 @@ impl Heap {
         let Some(mk) = &self.gc.marker else { return };
         mk.pause();
         let (rest, color, poison) = {
-            let mut st = mk.shared.state.lock().unwrap();
+            let mut st = mk.shared.state();
             (std::mem::take(&mut st.sweep), st.sweep_color, st.poison)
         };
         let mut partly = Vec::new();
@@ -4843,23 +4863,69 @@ mod tests {
         });
     }
 
-    /// A panic on the marker thread, tracing, wakes the mutator, which
-    /// panics with it at its next pause rather than wait for good (#224).
+    /// A panic on the marker thread, tracing, is recorded and wakes the
+    /// mutator, whose pause returns rather than wait for good (#224).
     #[test]
-    fn a_marker_panic_panics_the_mutator() {
+    fn a_marker_panic_is_recorded() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let requested = AtomicBool::new(false);
         let mk = Marker::start();
         mk.shared.fail.store(true, Relaxed);
-        let requested = AtomicBool::new(false);
         mk.resume(&mut vec![0], &requested as *const AtomicBool as usize);
         let t0 = Instant::now();
         while !requested.load(Relaxed) {
             assert!(t0.elapsed() < Duration::from_secs(60), "the marker never asked for a pause");
             std::thread::yield_now();
         }
-        let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mk.pause())).unwrap_err();
-        let e = e.downcast_ref::<String>().unwrap();
-        assert_eq!(e, "the marker thread panicked: a marker panic for the tests");
+        mk.pause();
+        assert_eq!(mk.panicked().as_deref(), Some("a marker panic for the tests"));
+        let st = mk.shared.state();
+        assert!(!st.busy && !st.sweeping && st.done);
+    }
+
+    /// `fail_marker()`: the marker to panic as it next traces, a
+    /// concurrent cycle asked for at the next safepoint.
+    fn fail_marker(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+        use std::sync::atomic::Ordering::Relaxed;
+        vm.heap.gc.marker.get_or_insert_with(Marker::start).shared.fail.store(true, Relaxed);
+        vm.heap.gc.external_full = true;
+        vm.heap.requested.store(true, Relaxed);
+        Ok(Value::UNDEFINED)
+    }
+
+    /// The marker panicking in a run, compiled code allocating at the
+    /// safepoints that would pause it, or the interpreter: the run goes on
+    /// collecting no more and fails as it ends, the VM poisoned, rather
+    /// than hang or unwind through compiled code (#224).
+    #[test]
+    fn a_marker_panic_poisons_the_vm() {
+        let src = r#"
+            function f(n) { var a; for (var i = 0; i < n; i++) a = {i: i, j: [i]}; return a.i; }
+            f(1000);
+            var keep = [];
+            for (var i = 0; i < 300000; i++) keep.push({i: i});
+            fail_marker();
+            var r = 0;
+            for (var k = 0; k < 50; k++) r += f(20000);
+            r
+        "#;
+        let module = crate::js::compile(src).unwrap();
+        for jit in [true, false] {
+            let mut vm = Vm::new();
+            if vm.heap.gc.stw || vm.heap.gc.always_full {
+                return;
+            }
+            if !jit {
+                vm.set_tier_back_edges(i64::MAX);
+            }
+            let g = vm.global;
+            vm.define_native(g, "fail_marker", fail_marker, 0, crate::jit::Ty::Any, false);
+            let e = vm.run(&module).unwrap_err().0;
+            let expected = "Error: the VM is poisoned: the collector's marker thread panicked: a marker panic for the tests";
+            assert_eq!(e, expected, "jit: {jit}");
+            assert!(vm.poisoned());
+            assert_eq!(vm.run(&crate::js::compile("1").unwrap()).unwrap_err().0, expected);
+        }
     }
 
     use std::time::{Duration, Instant};
@@ -4917,7 +4983,7 @@ mod tests {
         let mut on = vm.heap.gc.shape_cycle && vm.heap.gc.sweeping;
         if let Some(mk) = &vm.heap.gc.marker {
             mk.pause();
-            on &= !mk.shared.state.lock().unwrap().sweep.is_empty();
+            on &= !mk.shared.state().sweep.is_empty();
         }
         vm.int_fields_to_doubles();
         if let Some(mk) = &vm.heap.gc.marker {

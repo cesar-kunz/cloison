@@ -91,7 +91,7 @@ mod layout;
 use layout::{
     CARD, COLOR, CONS_MIN, EVAC, DirectSite, GRANULE, SLICE, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
-    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta, payload_cell, props_cap, set_header_word, dispatch_slot,
+    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, MAPPED, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta, payload_cell, props_cap, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
 };
 
@@ -5272,6 +5272,24 @@ macro_rules! array_length {
 unsafe fn length_class(o: Value) -> u16 {
     unsafe { (&raw const (*cell(o)).class).cast::<u16>().read() & (0xff | (FAR as u16) << 8) }
 }
+/// Whether cell `o`'s elements are its values, in place, for a keyed
+/// load: an object from a plain one to a native, or a date, not a mapped
+/// `arguments` object whose frame runs (`MAPPED`, whose elements may be
+/// stale copies of its parameters). The class and the flag in one load:
+/// the bit is another flag in arrays and functions, seen past the first
+/// test.
+#[inline(always)]
+unsafe fn values_in_place(o: Value) -> bool {
+    let ck = unsafe { (&raw const (*cell(o)).class).cast::<u16>().read() } & (0xff | (MAPPED as u16) << 8);
+    // (`MAPPED` set: an array or a function, not a plain object.)
+    ck <= class::NATIVE as u16 || values_in_place_cold(ck as u8)
+}
+
+#[cold]
+#[inline(always)]
+fn values_in_place_cold(c: u8) -> bool {
+    matches!(c, class::ARRAY..=class::NATIVE | class::DATE)
+}
 const LENGTH_ARRAY: u16 = class::ARRAY as u16;
 const LENGTH_STRING: u16 = class::STRING as u16;
 const LENGTH_TYPED_ARRAY: u16 = class::TYPED_ARRAY as u16;
@@ -5757,18 +5775,16 @@ macro_rules! property_location {
         // elements' type comes with it).
         // An object whose elements are values: not a string (code units),
         // a buffer or a typed array (bytes).
-        // target x86_64 get_keyed_i_g{}: 14 now 16 cell (3), `movzx eax, byte [rdi+8]; cmp eax, 4; jae cold` (DATE out of line), bounds (2), element (6) (judged 2026-10-26)
-        // target x86_64 get_keyed_i_m: 15 now 17 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
+        // target x86_64 get_keyed_i_g{}: 14 fallthrough 20 cell (3), `movzx eax, word [rdi+8]; test eax, 0x40fc; je` (`MAPPED` with the class; the rarer classes laid out inline, jumped over: 15 run), bounds (2), element (6) (2026-11-10)
+        // target x86_64 get_keyed_i_m: 15 fallthrough 21 as `_g{}` after `mov rax, [r13+k]` (2026-11-10)
         // target aarch64 get_keyed_i_g{}: 13 now 15 cell (3), `ldrb; cmp #4; b.hs cold` (DATE out of line), bounds (3), element (4) (judged 2026-10-26)
         // target aarch64 get_keyed_i_m: 14 now 15 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
-        keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell_g(s.tag, o)
-            && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
+        keyed_load!($loc, "get_keyed_i_", true, |s, o| is_cell_g(s.tag, o) && values_in_place(o));
         // target x86_64 get_keyed_g{}: 16 now 17 cell (3), `movzx; cmp al, 4; jae cold`, `cmp r12, r14; jb exit`, bounds (2), element (6) (judged 2026-10-26)
         // target x86_64 get_keyed_m: 17 now 18 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
-        // target aarch64 get_keyed_g{}: 15 fallthrough 9 cell (3), `ldrb; cmp #4; b.hs cold`, `cmp x20, x22; b.lo exit`, bounds (3), element (4); counted 9 while the int test jumps over a `b exit` (judged 2026-10-26)
-        // target aarch64 get_keyed_m: 16 fallthrough 10 as `_g{}` after `ldr x8, [x21, #k]` (judged 2026-10-26)
-        keyed_load!($loc, "get_keyed_", false, |s, o| is_cell_g(s.tag, o)
-            && matches!((*cell(o)).class, class::PLAIN..=class::NATIVE | class::DATE));
+        // target aarch64 get_keyed_g{}: 15 now 16 cell (3), `ldrh; mov w9, #0x40fc; tst; b.ne cold` (`MAPPED` with the class), `cmp x20, x22; b.lo exit`, bounds (3), element (4) (2026-11-10)
+        // target aarch64 get_keyed_m: 16 now 17 as `_g{}` after `ldr x8, [x21, #k]` (2026-11-10)
+        keyed_load!($loc, "get_keyed_", false, |s, o| is_cell_g(s.tag, o) && values_in_place(o));
         // `acc = o[acc]` through the runtime (`acc` boxed): a typed array's
         // element, or a site whose receivers the fast ones keep leaving
         // for. Leaves only where it would throw or call a function.
@@ -5859,8 +5875,8 @@ macro_rules! property_location {
         // (An object's own element first, as `get_keyed_`; a flat
         // string's unit below 256, the VM's string of it from the table at
         // `imm64`, as `from_char_code`.)
-        // target x86_64 get_keyed_rt_g{}: 16 now 19 `cmp r12, r14; jb slow`, cell (3), bounds (2), `movzx; cmp eax, 4; jae cold`, element (6) with the hit falling through (judged 2026-10-26)
-        // target x86_64 get_keyed_rt_m: 17 now 20 as `_g{}` with `mov rax, [r13+k]` (judged 2026-10-26)
+        // target x86_64 get_keyed_rt_g{}: 16 now 17 `cmp r12, r14; jb slow`, cell (3), bounds (2), `movzx; cmp eax, 4; jae cold`, element (6) with the hit falling through (judged 2026-10-26)
+        // target x86_64 get_keyed_rt_m: 17 now 18 as `_g{}` with `mov rax, [r13+k]` (judged 2026-10-26)
         // target x86_64 get_keyed_rt_g{}__slow,get_keyed_rt_m__slow: 8 now 10 the call with `lea rsp, [rsp-136]`, no `push`/`pop` (judged 2026-10-26)
         // target aarch64 get_keyed_rt_g{}: 15 now 17 `cmp x20, x22; b.lo slow`, cell (3), bounds (3), `ldrb; cmp #4; b.hs cold`, element (4) (judged 2026-10-26)
         // target aarch64 get_keyed_rt_m: 16 now 19 as `_g{}` with `ldr x8, [x21, #k]` (judged 2026-10-26)
@@ -5872,7 +5888,7 @@ macro_rules! property_location {
                 let i = int(s.acc) as u32;
                 let cls = (*header(p)).class;
                 if i < (*header(p)).elems_len {
-                    if matches!(cls, class::PLAIN..=class::NATIVE | class::DATE) {
+                    if values_in_place(o) {
                         let v = *((*header(p)).elems.cast::<Value>()).add(i as usize);
                         if v.to_bits() != 0 {
                             s.acc = v;
@@ -6012,6 +6028,37 @@ macro_rules! property_location {
             next!(s)
         });
         keyed_load!($loc, "get_keyed_nc_", false, |s, o| true);
+        // `get_keyed_[i_]nc_` of a plain object (its shape known, or one
+        // extending it): not a mapped `arguments` object whose frame runs
+        // (`MAPPED`, see `values_in_place`), which may pass for any.
+        // target x86_64 get_keyed_i_np_g{}: 10 `test byte [rdi+9], 0x40; jnz exit`, then as `get_keyed_i_nc_g{}` (2026-11-10)
+        // target x86_64 get_keyed_i_np_m: 11 as `_g{}` after `mov rax, [r13+k]` (2026-11-10)
+        // target aarch64 get_keyed_i_np_g{}: 9 now 10 `ldrb; tbnz`, then as `get_keyed_i_nc_g{}` (2026-11-10)
+        // target aarch64 get_keyed_i_np_m: 10 now 11 as `_g{}` after `ldr x8, [x21, #k]` (2026-11-10)
+        keyed_load!($loc, "get_keyed_i_np_", true, |s, o| (*cell(o)).flags & MAPPED == 0);
+        keyed_load!($loc, "get_keyed_np_", false, |s, o| (*cell(o)).flags & MAPPED == 0);
+        // `get_keyed_i_nc_rt_` of a plain object, as `get_keyed_i_np_`.
+        stencil_slow!("get_keyed_i_np_rt_", loc!($loc); |s| {
+            let p = get!($loc, s).to_bits() as *const u8;
+            let i = int(s.acc) as u32;
+            if i < (*header(p)).elems_len && (*header(p)).flags & MAPPED == 0 {
+                let v = *((*header(p)).elems.cast::<Value>()).add(i as usize);
+                if v.to_bits() != 0 {
+                    s.acc = v;
+                    next!(s)
+                }
+            }
+            slow!(s)
+        }; |s| {
+            core::arch::asm!(concat!("/* get_keyed_i_np_rt_", loc!($loc), " */"), options(nomem, nostack, preserves_flags));
+            let key = Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+            let r = rt_call!(s, cloison_rt_get_keyed, get!($loc, s), key);
+            if r == 0 {
+                exit!(s)
+            }
+            s.acc = Value::from_bits(r);
+            next!(s)
+        });
         // target x86_64 get_keyed_i_sh_g{}: 14 now 15 `lea rax, [r14+2]; test rdi, rax; jnz exit`, shape (3), bounds (2), `mov rax, [rdi+24]; mov r10d, r12d; mov rax, [rax+r10*8]; test; jz exit; mov r12, rax` (judged 2026-10-26)
         // target x86_64 get_keyed_i_sh_m: 15 now 16 as `_g{}` after `mov rax, [r13+k]` (judged 2026-10-26)
         // target aarch64 get_keyed_i_sh_g{}: 16 cell (3), shape (6), bounds (3), `ldr; ldr [x8, w20, uxtw #3]; cbz; mov x20, x8` (judged 2026-10-26)

@@ -486,7 +486,10 @@ fn internalize(
 
 /// Whether `v` is a `JSON.rawJSON` object.
 fn is_raw_json(v: Value) -> bool {
-    is_object(v) && unsafe { (*as_object(v)).class == Class::Plain && (*as_object(v)).flags & RAW_JSON != 0 }
+    // (A mapped `arguments` object's `MAPPED` is the bit too: it is never
+    // frozen.)
+    let both = RAW_JSON | crate::object::FROZEN;
+    is_object(v) && unsafe { (*as_object(v)).class == Class::Plain && (*as_object(v)).flags & both == both }
 }
 
 /// `JSON.rawJSON(text)`: a frozen null-prototype object whose `rawJSON`

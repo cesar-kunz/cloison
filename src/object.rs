@@ -263,7 +263,7 @@ pub const PROTOTYPE: u8 = 2;
 /// The object has integer keys too far past its elements, its elements
 /// are sealed or frozen, an array's `length` is read-only. (Compiled code
 /// reads them.)
-pub use crate::layout::{FROZEN, LENGTH_READ_ONLY, SEALED, SPARSE};
+pub use crate::layout::{FROZEN, LENGTH_READ_ONLY, MAPPED, SEALED, SPARSE};
 /// The object takes no new properties (`Object.preventExtensions`).
 pub const NOT_EXTENSIBLE: u8 = 8;
 /// A function's `length` was deleted (it has no slot: see
@@ -277,8 +277,9 @@ pub const DETACHED: u8 = 64;
 /// A typed array or `DataView` of an immutable buffer (see `typed`):
 /// stores into it fail; `LENGTH_READ_ONLY`'s bit, as views aren't arrays.
 pub const IMMUTABLE_VIEW: u8 = 64;
-/// A plain object made by `JSON.rawJSON` ([[IsRawJSON]]);
-/// `LENGTH_READ_ONLY`'s bit, as plain objects aren't arrays.
+/// A plain object made by `JSON.rawJSON` ([[IsRawJSON]]), frozen;
+/// `LENGTH_READ_ONLY`'s bit, as plain objects aren't arrays, and
+/// `MAPPED`'s, which no frozen object has.
 pub const RAW_JSON: u8 = 64;
 /// A `RegExp` made by a subclass's constructor ([[LegacyFeaturesEnabled]]
 /// false: see `builtins::note_legacy`); `LENGTH_READ_ONLY`'s bit, as

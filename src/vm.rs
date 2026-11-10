@@ -8919,6 +8919,21 @@ out.join();"#;
         assert_eq!(n, Value::from_i32(80));
     }
 
+    /// With one VM, as before #222: an atom used before a VM's first
+    /// marking is kept by it (the grace then reached back to the VM's
+    /// start, `from - 1` the epoch it began in, nothing else marking), and
+    /// freed by the next.
+    #[test]
+    fn an_atom_unused_since_the_marking_before_is_freed() {
+        let mut a = Vm::new();
+        let gc = crate::js::compile("$262.gc()").unwrap();
+        let x = a.intern_name("unusedSinceTheMarkingBefore");
+        a.run(&gc).unwrap();
+        assert_eq!(a.atoms[x.0 as usize].as_deref(), Some("unusedSinceTheMarkingBefore"));
+        a.run(&gc).unwrap();
+        assert!(a.atoms[x.0 as usize].as_deref() != Some("unusedSinceTheMarkingBefore"));
+    }
+
     /// An atom used since its heap's marking before is kept by the next,
     /// however many markings other heaps made between, which advance the
     /// process's code epoch too (#222).

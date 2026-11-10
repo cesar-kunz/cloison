@@ -4116,6 +4116,12 @@ impl Vm {
     /// `typeof v`, a string constant (each made once: EarleyBoyer's
     /// `sc_isNumber` and others spent 3% encoding and looking them up).
     pub fn type_of(&mut self, v: Value) -> Value {
+        self.check_own(v, "type_of");
+        self.type_of_own(v)
+    }
+
+    /// [`Vm::type_of`] of a value known to be this VM's (`typeof`'s).
+    pub(crate) fn type_of_own(&mut self, v: Value) -> Value {
         const NAMES: [&str; 8] = ["number", "undefined", "boolean", "string", "function", "object", "symbol", "bigint"];
         let k = if v.is_number() {
             0
@@ -5420,6 +5426,8 @@ impl Vm {
     /// assert_eq!(units[0], 0x61);
     /// ```
     pub fn string_units(&self, v: Value) -> Option<std::borrow::Cow<'_, [u16]>> {
+        // (The borrow is this VM's: another's string could be freed under it.)
+        self.check_own(v, "string_units");
         units_in_place(v)
     }
 
@@ -7434,6 +7442,7 @@ impl Vm {
 
     /// Words of in-object storage in `o` (for tests).
     pub fn inline_capacity(&self, o: Value) -> u32 {
+        self.check_own(o, "inline_capacity");
         unsafe { (*(*as_object(o)).shape).capacity.get() }
     }
 }

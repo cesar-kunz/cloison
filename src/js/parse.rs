@@ -59,10 +59,10 @@ thread_local! {
     pub(crate) static STRICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, and
-/// in that many `with` statements; last, whether its caller has a
-/// `new.target`).
-pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, usize, bool, bool, bool)>) -> Result<Program<'a>, Error> {
+/// [`parse_source`]; `eval`: as direct `eval`'s code (strict or not, in
+/// the scopes of that shape, see `parse_pass`; last, whether its caller
+/// has a `new.target`).
+pub fn parse_source_as<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool, eval: Option<(bool, &str, bool, bool, bool)>) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
@@ -103,7 +103,7 @@ fn parse_pass<'a>(
     keep: bool,
     table: Option<Table>,
     prev: Option<&Program<'a>>,
-    eval: Option<(bool, usize, bool, bool, bool)>,
+    eval: Option<(bool, &str, bool, bool, bool)>,
     module: Option<i32>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
@@ -191,19 +191,26 @@ fn parse_pass<'a>(
     });
     p.functions[0].strict =
         p.directive_prologue() || eval.is_some_and(|(strict, ..)| strict) || module.is_some() || STRICT.get();
-    if let Some((_, withs, bound, global, _)) = eval {
-        // The scope object of the function calling it (its parameters and
-        // `var`s, those `eval`s declared), the caller's scope object (the
-        // other bindings it sees: see `intrinsics::eval_scope`), the
-        // objects of the `with` statements around the `eval` (outermost
-        // first), then the eval's own (for strict code's `var`s): what
-        // `with`s would give. (`bound`: no scope object of the caller's,
-        // its bindings its upvalues: see `Program::eval_upvalues`; nor, for
-        // sloppy code, of its own, which would stay empty: no `eval` in it
-        // to declare there.)
-        let names: Vec<Name> = std::iter::once("%e2".into())
-            .chain((!bound).then(|| "%e0".into()))
-            .chain((0..withs).map(|k| format!("%w{k}").into()))
+    if let Some((_, chain, bound, global, _)) = eval {
+        // The scopes around the call, outermost first, as `with`s would
+        // give (see `Gen::call`): for each of `chain`, `w` the object of
+        // a `with` statement (`%wK`, `K` its index), `s` a scope object of
+        // bindings (`%sK`: see `intrinsics::eval_scope`, or one of an
+        // enclosing eval's code), `d` the scope object of the function
+        // calling it (`%e2`: its parameters and `var`s, those `eval`s
+        // declared); then the eval's own (`%e1`, for strict code's
+        // `var`s). (`bound`: the site's bindings its upvalues instead, see
+        // `Program::eval_upvalues`; nor, for sloppy code, a scope object of
+        // its own, which would stay empty: no `eval` in it to declare
+        // there.)
+        let names: Vec<Name> = chain
+            .chars()
+            .enumerate()
+            .map(|(k, c)| match c {
+                'w' => format!("%w{k}").into(),
+                's' => format!("%s{k}").into(),
+                _ => "%e2".into(),
+            })
             .chain((!bound || p.functions[0].strict).then(|| "%e1".into()))
             .collect();
         // (`global`: the function's scope object is the global object, of

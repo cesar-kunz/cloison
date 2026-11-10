@@ -582,20 +582,77 @@ impl Code {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EvalPlace {
     /// A direct one's, in a function (see `intrinsics::direct_eval`):
-    /// whether the caller is strict and has a `new.target`, the `with`
-    /// statements around it, and whether it is a script's (its scope
-    /// object the global object).
-    Direct { strict: bool, new_target: bool, withs: usize, global: bool },
+    /// whether the caller is strict and has a `new.target`, the scopes
+    /// around it, and whether it is a script's (its scope object the
+    /// global object).
+    Direct { strict: bool, new_target: bool, chain: EvalChain, global: bool },
     /// A direct one's compiled for its site's bindings (see
     /// `intrinsics::direct_eval_bound`): as `Direct`, the site (a number
     /// of its own: its bindings' names, kinds and upvalues are the code's,
     /// and whether it has a `new.target`)
     /// and whether it is in parameters' defaults.
-    Bound { strict: bool, withs: usize, site: u64, params: bool },
+    Bound { strict: bool, chain: EvalChain, site: u64, params: bool },
     /// In the global scope (see `builtins::eval_fn`): an indirect one's,
     /// or a strict script's own direct one's (`strict`, see
     /// `intrinsics::strict_eval`).
     Global { strict: bool },
+}
+
+/// The scopes around a direct `eval`, outermost first, as its code is
+/// compiled for them (see `parse::parse_pass`): how many, and which are
+/// `with`s' objects (`w`) and scope objects (`s`), by bit (the other one,
+/// `d`, the function's scope object).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct EvalChain {
+    pub(crate) len: u8,
+    pub(crate) withs: u128,
+    pub(crate) scopes: u128,
+}
+
+impl EvalChain {
+    /// The chain `shape` describes (`wsd…`), if not past 128 scopes.
+    pub(crate) fn of(shape: &[u16]) -> Option<EvalChain> {
+        let mut c = EvalChain { len: u8::try_from(shape.len()).ok().filter(|&n| n <= 128)?, withs: 0, scopes: 0 };
+        for (i, &k) in shape.iter().enumerate() {
+            match k {
+                0x77 => c.withs |= 1 << i,
+                0x73 => c.scopes |= 1 << i,
+                _ => {}
+            }
+        }
+        Some(c)
+    }
+
+    /// Scope `i`'s kind: `w`, `s` or `d`.
+    pub(crate) fn kind(&self, i: usize) -> char {
+        if self.withs >> i & 1 != 0 {
+            'w'
+        } else if self.scopes >> i & 1 != 0 {
+            's'
+        } else {
+            'd'
+        }
+    }
+
+    /// Its shape (`wsd…`).
+    pub(crate) fn text(&self) -> String {
+        (0..self.len as usize).map(|i| self.kind(i)).collect()
+    }
+
+    /// It with a scope object of bindings (`s`) before each of `places`
+    /// (sorted, distinct; `len` the place after all).
+    pub(crate) fn with_scopes(&self, places: &[usize]) -> Option<EvalChain> {
+        let mut shape = Vec::new();
+        for i in 0..=self.len as usize {
+            if places.contains(&i) {
+                shape.push(0x73);
+            }
+            if i < self.len as usize {
+                shape.push(self.kind(i) as u16);
+            }
+        }
+        EvalChain::of(&shape)
+    }
 }
 
 /// An `eval`'s code, kept to run again (see `Vm::eval_cache`).

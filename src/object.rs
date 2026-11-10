@@ -1055,7 +1055,11 @@ pub unsafe fn set_shape(o: *mut Object, s: *const Shape) {
     unsafe {
         // (Where the slots are depends on the class: `layout::slots_offset`.)
         debug_assert_eq!((*s).class, (*o).class);
-        (*o).shape = s;
+        // (Atomic: the marker thread reads an old object's header while
+        // the mutator gives it a shape; `Vm::add_shape`'s fence orders a
+        // new shape's fields before this store.)
+        use std::sync::atomic::{AtomicPtr, Ordering::Relaxed};
+        (*(&raw mut (*o).shape as *mut AtomicPtr<Shape>)).store(s.cast_mut(), Relaxed);
         mark_shape(s);
     }
 }

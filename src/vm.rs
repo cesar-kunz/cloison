@@ -2260,6 +2260,12 @@ impl Vm {
         }
         // (Live in a full marking under way: no object it finds has it yet.)
         b.mark.store(crate::gc::code_epoch(), std::sync::atomic::Ordering::Relaxed);
+        // The slot's initialization, `family` and `mark` before any later
+        // store of `p` by this thread (`set_shape`'s, compiled code's): the
+        // marker reads an old object's header (Acquire) and follows the
+        // shape's `mark`, `proto` and `parent`. (A `dmb ish` on arm64, a
+        // compiler barrier on x86-64.)
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         self.shapes.push(b);
         self.shapes_made += 1;
         if self.shapes_made % 4096 == 0 {

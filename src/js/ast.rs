@@ -53,6 +53,10 @@ pub struct Program<'a> {
     /// Direct `eval`'s code whose caller has a `new.target` (see
     /// `parse::parse_source_as`), which an `eval` in it passes on.
     pub eval_new_target: bool,
+    /// Direct `eval`'s code reading its caller's `this` binding, `%this`,
+    /// among the bindings it sees (see `ast::EVAL_LIVE_THIS`), which an
+    /// `eval` in it passes on.
+    pub eval_live_this: bool,
     /// A lazily compiled function's: the upvalues that are an enclosing
     /// named function expression's own name (`asm::LazyFn::own_names`),
     /// parameters of the wrapper `js::compile_lazy` makes, but immutable.
@@ -351,6 +355,11 @@ pub const EVAL_THIS: u8 = 8;
 /// (And the caller is a method, or an arrow in one: its code may use
 /// `super.x`, of the home object it sees as [`EVAL_HOME_BINDING`].)
 pub const EVAL_HOME: u8 = 16;
+/// (And the caller is a derived class's constructor, or an arrow in one,
+/// or such code: its `this` may be bound after the call, by `super()`, so
+/// the `eval`'s code reads the binding, `%this`, among those it sees,
+/// not the value it had at the call: its arrows see it bound later.)
+pub const EVAL_LIVE_THIS: u8 = 32;
 /// The binding a direct `eval` in a method sees the method's home object
 /// by (see `Parser::super_expr`).
 pub const EVAL_HOME_BINDING: &str = "%home";

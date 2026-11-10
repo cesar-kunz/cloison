@@ -134,7 +134,8 @@ pub fn compile_strict_eval(src: &str) -> Result<Module, String> {
 
 /// Compile `src` as direct `eval`'s code (`strict`: the caller is;
 /// `new_target`: it has a `new.target`, see `parse::parse_source_as`;
-/// `home`: a home object, a method's, see `ast::EVAL_HOME`), in the
+/// `home`: a home object, a method's, see `ast::EVAL_HOME`; `live_this`:
+/// its `this` the caller's binding, see `ast::EVAL_LIVE_THIS`), in the
 /// scopes `chain` (see `parse::parse_pass`): its names looked up in their
 /// objects (see `intrinsics::direct_eval`). Or, with `bound`
 /// (`ast::Program::eval_upvalues`), also in the caller's bindings, its
@@ -144,6 +145,7 @@ pub fn compile_direct_eval(
     strict: bool,
     new_target: bool,
     home: bool,
+    live_this: bool,
     chain: &str,
     global: bool,
     bound: &[(ast::Name, u8, ast::Name, usize)],
@@ -151,7 +153,7 @@ pub fn compile_direct_eval(
     let source: Rc<str> = src.into();
     let compile = |skim| {
         let arena = ast::Arenas::default();
-        parse::parse_source_as(src, &arena, skim, Some((strict, chain, !bound.is_empty(), global, new_target, home))).and_then(|mut p| {
+        parse::parse_source_as(src, &arena, skim, Some((strict, chain, !bound.is_empty(), global, new_target, home, live_this))).and_then(|mut p| {
             p.eval_upvalues = bound.to_vec();
             codegen::generate_lazy(&p, 0, &source, &|pos| pos, &[])
         })

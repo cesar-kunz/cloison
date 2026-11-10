@@ -3142,3 +3142,53 @@ s;";
     assert_eq!(display(vm.run(&m).unwrap()), "1000");
     assert_eq!(vm.ic_misses("get"), 2);
 }
+
+/// Two VMs, and a cell (an object) of the first's heap.
+fn two_vms() -> (Vm, Vm, Value) {
+    let mut a = Vm::new();
+    let b = Vm::new();
+    let o = a.run(&cloison::js::compile("({x: 1})").unwrap()).unwrap();
+    (a, b, o)
+}
+
+// A cell of one VM's heap handed to another's API panics rather than being
+// stored there, for the other heap's collector to mark (issue #223); a
+// VM's own cells, and values not cells, pass.
+
+#[test]
+fn own_cells_pass_the_api() {
+    let (mut a, mut b, o) = two_vms();
+    let x = a.intern("x");
+    a.set(o, x, Value::from_i32(2)).unwrap();
+    assert_eq!(display(a.get(o, x).unwrap()), "2");
+    let p = a.new_array();
+    a.set_keyed(p, Value::from_i32(0), o).unwrap();
+    let g = b.global_object();
+    let y = b.intern("y");
+    b.set(g, y, Value::from_i32(3)).unwrap();
+    assert_eq!(display(b.get(g, y).unwrap()), "3");
+}
+
+#[test]
+#[should_panic(expected = "Vm::set: a value not of this VM's heap")]
+fn another_heaps_value_set_panics() {
+    let (_a, mut b, o) = two_vms();
+    let g = b.global_object();
+    let y = b.intern("y");
+    let _ = b.set(g, y, o);
+}
+
+#[test]
+#[should_panic(expected = "Vm::set_keyed: a value not of this VM's heap")]
+fn another_heaps_object_set_keyed_panics() {
+    let (_a, mut b, o) = two_vms();
+    let _ = b.set_keyed(o, Value::from_i32(0), Value::from_i32(1));
+}
+
+#[test]
+#[should_panic(expected = "Vm::call_other: a value not of this VM's heap")]
+fn another_heaps_argument_call_other_panics() {
+    let (_a, mut b, o) = two_vms();
+    let f = b.run(&cloison::js::compile("Object.keys").unwrap()).unwrap();
+    let _ = b.call_other(f, Value::UNDEFINED, &[o]);
+}

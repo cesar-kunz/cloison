@@ -10818,6 +10818,35 @@ fn a_grow_reaches_the_views_of_the_same_blocks_other_buffers() {
     assert_eq!(value(src), "16");
 }
 
+/// Grows only, through three agents: one grows sab1; a second, once it
+/// sees that (sab1's `byteLength`), grows sab2; the main one, once it
+/// sees sab2 grown, has its views of sab1 up to date: the first grow
+/// happens before (#155).
+#[test]
+fn a_grow_reaches_views_through_another_agents_grow() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let src = r#"
+        $262.agent.start(`$262.agent.receiveBroadcast(function (sab) {
+            sab.grow(64);
+            $262.agent.leaving();
+        });`);
+        $262.agent.start(`var first; $262.agent.receiveBroadcast(function (sab) {
+            if (!first) { first = sab; return; }
+            while (first.byteLength === 16);
+            sab.grow(64);
+            $262.agent.leaving();
+        });`);
+        var sab1 = new SharedArrayBuffer(16, { maxByteLength: 64 });
+        var sab2 = new SharedArrayBuffer(16, { maxByteLength: 64 });
+        var ia = new Int32Array(sab1), dv = new DataView(sab1, 8);
+        $262.agent.broadcast(sab1);
+        $262.agent.broadcast(sab2);
+        while (sab2.byteLength === 16);
+        [ia.length, dv.byteLength].join()
+    "#;
+    assert_eq!(value(src), "16,56");
+}
+
 /// `Promise.allKeyed` and `allSettledKeyed`: an object's own enumerable
 /// properties' values awaited, by the same keys.
 #[test]

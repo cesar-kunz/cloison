@@ -275,8 +275,17 @@ does not.
   only the mutator reads frames, the native stack and Rust structures).
 - **A collector thread** (later a small pool) marks and sweeps the old
   generation while the mutator runs. It reads cells and writes the
-  metadata, the mark queues and the block lists, nothing else: it never
-  reads a shape, a `Code`, a `Vm` field or an inline cache.
+  metadata, the mark queues and the block lists; of the Rust data cells
+  point to it reads only a shape's `mark`, `proto` and `parent` (in a
+  marking that collects shapes), a function's `Code::upvalues` length
+  and `mark`, and a `Regex`'s `mark`, storing the `mark`s (atomics). It
+  never reads a `Vm` field or an inline cache. What it reads while the
+  mutator writes is accessed atomically on both sides (Relaxed: the
+  plain instructions on x86-64 and arm64), as "The header word" and "The
+  other words" at `layout::Header` lay down, with the two invariants
+  that make that enough: the marker never follows a pointer to a young
+  cell, and nothing it may reach is freed but in a pause or once
+  marking ended.
 
 ### The heap
 
@@ -512,8 +521,11 @@ reachable cell the concurrent marking left unmarked.
 
 Correctness of concurrent marking rests on four facts: nothing moves;
 every word of a cell is a valid value or a header at every instant (the
-mutator writes whole words, and growth writes the new array before the
-pointer to it, the pointer's store dirtying the card); an array's
+mutator stores whole words, each an atomic store the marker loads
+atomically, `layout::Word`, and moves an old array's values a word at a
+time, `layout::copy_words`, never with `memmove`, whose pieces may be
+smaller; growth writes the new array before the pointer to it, the
+pointer's store dirtying the card); an array's
 capacity is in the array, so a marker never pairs an old pointer with a
 new capacity, nor a cell's size with words of another state (a cons
 string made flat drops its halves before it publishes its units' buffer
@@ -531,9 +543,9 @@ and each is then a half, null, or the atom later cached in `code`,
 tagged so that it reads as no cell (`object::ATOM_TAG`; untagged, a
 slot recorded into an evacuation candidate while it held the right
 half could be rewritten as that address's cell moved).
-The marker reads cells and `Code::upvalues` (immutable once loaded) and
-writes only old cells' metadata, which the mutator writes only in
-pauses. It reads each cell's header word once, with Acquire, and works
+The marker reads cells and `Code::upvalues` (immutable once loaded, and
+never written through a `&mut Code` while it may read it) and writes
+only old cells' metadata, which the mutator writes only in pauses. It reads each cell's header word once, with Acquire, and works
 from that value: the mutator may give an old object a new shape
 meanwhile, published by `Vm::add_shape`'s Release fence (the contract
 is "The header word" at `layout::Header`).
@@ -576,8 +588,10 @@ minor collection counts old cells live, so it clears young keys' entries
 only; entries stored while the marker runs are no different (the
 barrier's card marks don't make them strong). `WeakRef` and
 `FinalizationRegistry` don't exist yet. Rust-side resources reachable from cells
-(`Regex` boxes) are freed by the sweeper when the cell dies; nothing else
-needs a finalizer.
+(`Regex` boxes) are freed after a full marking, in its final pause
+(`Vm::prune_regexps`), once no live `RegExp` uses them, none was used
+during the marking and no frame holds one; nothing else needs a
+finalizer.
 
 ### Interaction with the JIT
 

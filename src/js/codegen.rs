@@ -6719,6 +6719,44 @@ impl<'a> Gen<'a> {
                 let f = &self.p.functions[*i];
                 if f.annex_b {
                     let b = f.binding.as_deref().unwrap();
+                    // (A direct `eval`'s: none if a block-scoped binding
+                    // around the `eval` in its function has the name, a
+                    // catch parameter's the function's `var` past it: see
+                    // `intrinsics::eval_annex_b`.)
+                    let end = self.label();
+                    if self.p.direct_eval && self.index == 0 {
+                        let name = f.name.as_deref().unwrap();
+                        let mark = self.temp;
+                        let fenv = self.alloc(s.pos)?;
+                        if self.p.eval_global {
+                            self.emit(Op::LdaUndefined, &[]);
+                        } else {
+                            self.load_raw("%e2", s.pos)?;
+                        }
+                        self.star(fenv);
+                        let n = self.alloc(s.pos)?;
+                        self.string(name);
+                        self.star(n);
+                        let v = self.alloc(s.pos)?;
+                        self.load_raw(b, s.pos)?;
+                        self.star(v);
+                        let k = self.alloc(s.pos)?;
+                        self.lda_smi(bound_kind(self.p, name).unwrap_or(0) as i32);
+                        self.star(k);
+                        // (The scope objects of bindings inside the
+                        // function's, `%e2`: see `parse::parse_pass`.)
+                        let chain = &self.p.functions[0].withs;
+                        let d = chain.iter().position(|w| &**w == "%e2").map_or(0, |d| d + 1);
+                        let inner: Vec<Name> = chain[d..].iter().filter(|w| w.starts_with("%s")).cloned().collect();
+                        for w in &inner {
+                            let r = self.alloc(s.pos)?;
+                            self.load_raw(w, s.pos)?;
+                            self.star(r);
+                        }
+                        self.intrinsic("eval_annex_b", fenv, (4 + inner.len()) as u8);
+                        self.temp = mark;
+                        self.jump_if(Jmp::True, end);
+                    }
                     self.load_raw(b, s.pos)?;
                     if self.p.direct_eval && self.index == 0 && !self.p.eval_global {
                         // (Its `var` is the caller's: in the scope object.)
@@ -6729,6 +6767,7 @@ impl<'a> Gen<'a> {
                     } else {
                         self.init_var(f.name.as_deref().unwrap(), s.pos)?;
                     }
+                    self.bind(end);
                 }
             }
             StmtKind::Function(i) if self.depth > 1 => {

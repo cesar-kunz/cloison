@@ -5502,8 +5502,19 @@ impl<'a> Gen<'a> {
                 }
             }
             let shape: String = chain.iter().map(|e| e.map_or('s', |i| entries[i].0)).collect();
+            // (A short one as a number, two bits a scope after a leading
+            // one: see `vm::EvalChain::of_number`.)
             let s = self.alloc(pos)?;
-            self.string(&shape);
+            if shape.len() <= 14 {
+                let code = |k| match k {
+                    'w' => 1,
+                    's' => 2,
+                    _ => 3,
+                };
+                self.lda_smi(shape.chars().fold(1, |n, k| n << 2 | code(k)));
+            } else {
+                self.string(&shape);
+            }
             self.star(s);
             let this = self.alloc(pos)?;
             let mut method = self.index;

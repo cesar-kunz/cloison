@@ -604,11 +604,19 @@ pub(crate) enum EvalPlace {
 /// compiled for them (see `parse::parse_pass`): how many, and which are
 /// `with`s' objects (`w`) and scope objects (`s`), by bit (the other one,
 /// `d`, the function's scope object).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EvalChain {
     pub(crate) len: u8,
     pub(crate) withs: u128,
     pub(crate) scopes: u128,
+}
+
+impl std::hash::Hash for EvalChain {
+    /// (One word: its bits folded, at each `eval`'s cache lookup.)
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let fold = |b: u128| b as u64 ^ ((b >> 64) as u64).rotate_left(32);
+        state.write_u64(fold(self.withs) ^ fold(self.scopes).rotate_left(16) ^ self.len as u64);
+    }
 }
 
 impl EvalChain {
@@ -623,6 +631,21 @@ impl EvalChain {
             }
         }
         Some(c)
+    }
+
+    /// The chain a short shape's number describes: after a leading 1, two
+    /// bits a scope, outermost first (1 `w`, 2 `s`, 3 `d`).
+    pub(crate) fn of_number(n: u32) -> EvalChain {
+        let len = (31 - n.leading_zeros()) / 2;
+        let mut c = EvalChain { len: len as u8, withs: 0, scopes: 0 };
+        for i in 0..len {
+            match n >> (2 * (len - 1 - i)) & 3 {
+                1 => c.withs |= 1 << i,
+                2 => c.scopes |= 1 << i,
+                _ => {}
+            }
+        }
+        c
     }
 
     /// Scope `i`'s kind: `w`, `s` or `d`.

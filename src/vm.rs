@@ -2618,7 +2618,7 @@ impl Vm {
 
     /// A plain object with prototype `proto`.
     pub fn new_object(&mut self, proto: Value) -> *mut Object {
-        self.check_own(proto, "new_object");
+        self.check_own(proto, "Vm::new_object");
         self.new_object_with(Class::Plain, proto, 4)
     }
 
@@ -3239,7 +3239,10 @@ impl Vm {
 
     /// Panics if `v` is a cell of another VM's heap: stored here, this
     /// heap's collector would mark it in the other's metadata (issue #223).
-    /// A tag test alone for a value not a cell.
+    /// A tag test alone for a value not a cell. (Only another live heap's:
+    /// a raw `Value` kept past its VM, or past a collection that freed its
+    /// cell, is dangling, and the heap a later VM takes may be where it
+    /// pointed: [`Global`] is the handle that keeps one alive.)
     #[inline(always)]
     fn check_own(&self, v: Value, what: &str) {
         if v.is_cell() && !self.heap.contains(v.to_bits() as usize) {
@@ -3298,10 +3301,10 @@ impl Vm {
 
     /// `obj[name]`.
     pub fn get(&mut self, obj: Value, name: Atom) -> Result<Value> {
-        self.check_own(obj, "get");
         if !self.running() {
             return self.host(|vm| vm.get(obj, name));
         }
+        self.check_own(obj, "Vm::get");
         if !obj.is_cell() {
             return self.get_primitive(obj, name);
         }
@@ -3594,11 +3597,11 @@ impl Vm {
 
     /// `obj[name] = value`.
     pub fn set(&mut self, obj: Value, name: Atom, value: Value) -> Result<()> {
-        self.check_own(obj, "set");
-        self.check_own(value, "set");
         if !self.running() {
             return self.host(|vm| vm.set(obj, name, value));
         }
+        self.check_own(obj, "Vm::set");
+        self.check_own(value, "Vm::set");
         if !obj.is_cell() {
             return self.set_primitive(obj, name, value);
         }
@@ -4058,7 +4061,7 @@ impl Vm {
     }
 
     /// `LdaGlobal` miss: a ReferenceError if the global doesn't exist.
-    pub fn get_global_miss(&mut self, code: &Code, ic: u32) -> Result<Value> {
+    pub(crate) fn get_global_miss(&mut self, code: &Code, ic: u32) -> Result<Value> {
         if let Some(r) = self.get_global_lexical(code, ic) {
             return r;
         }
@@ -4078,7 +4081,7 @@ impl Vm {
 
     /// `LdaGlobalInsideTypeof` miss: as `LdaGlobal`'s, but `undefined` for a
     /// missing global.
-    pub fn get_global_typeof_miss(&mut self, code: &Code, ic: u32) -> Result<Value> {
+    pub(crate) fn get_global_typeof_miss(&mut self, code: &Code, ic: u32) -> Result<Value> {
         if let Some(r) = self.get_global_lexical(code, ic) {
             return r;
         }
@@ -4116,7 +4119,7 @@ impl Vm {
     /// `typeof v`, a string constant (each made once: EarleyBoyer's
     /// `sc_isNumber` and others spent 3% encoding and looking them up).
     pub fn type_of(&mut self, v: Value) -> Value {
-        self.check_own(v, "type_of");
+        self.check_own(v, "Vm::type_of");
         self.type_of_own(v)
     }
 
@@ -4222,11 +4225,11 @@ impl Vm {
     /// but in a proxy until some other object has had one, or a proxy
     /// became a prototype), OrdinaryHasInstance.
     pub fn instance_of(&mut self, v: Value, f: Value) -> Result<bool> {
-        self.check_own(v, "instance_of");
-        self.check_own(f, "instance_of");
         if !self.running() {
             return self.host(|vm| vm.instance_of(v, f));
         }
+        self.check_own(v, "Vm::instance_of");
+        self.check_own(f, "Vm::instance_of");
         let function = f.is_cell() && matches!(unsafe { (*as_object(f)).class }, Class::Function | Class::Native);
         if !function
             || unsafe { (*as_object(f)).shape } != self.function_shape
@@ -4353,11 +4356,11 @@ impl Vm {
     /// `key in obj`: whether `obj` or its prototypes have the property or
     /// element `key`.
     pub fn has_property(&mut self, obj: Value, key: Value) -> Result<bool> {
-        self.check_own(obj, "has_property");
-        self.check_own(key, "has_property");
         if !self.running() {
             return self.host(|vm| vm.has_property(obj, key));
         }
+        self.check_own(obj, "Vm::has_property");
+        self.check_own(key, "Vm::has_property");
         if !obj.is_cell() || string_len(obj).is_some() {
             return Err(Error::type_error(format!(
                 "Cannot use 'in' operator to search for '{}' in {}",
@@ -4396,11 +4399,11 @@ impl Vm {
     /// removed, the object getting a shape of its own without it (see
     /// [`Vm::delete_named`]). False for what can't be deleted.
     pub fn delete_property(&mut self, obj: Value, key: Value) -> Result<bool> {
-        self.check_own(obj, "delete_property");
-        self.check_own(key, "delete_property");
         if !self.running() {
             return self.host(|vm| vm.delete_property(obj, key));
         }
+        self.check_own(obj, "Vm::delete_property");
+        self.check_own(key, "Vm::delete_property");
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
                 return Err(Error::type_error(format!(
@@ -4761,7 +4764,7 @@ impl Vm {
 
     /// `GetKeyed` miss: remember the receiver's shape (for the JIT: its
     /// elements' type), then `obj[key]`.
-    pub fn get_keyed_miss(
+    pub(crate) fn get_keyed_miss(
         &mut self,
         code: &Code,
         ic: u32,
@@ -4800,11 +4803,11 @@ impl Vm {
 
     /// `obj[key]`.
     pub fn get_keyed(&mut self, obj: Value, key: Value) -> Result<Value> {
-        self.check_own(obj, "get_keyed");
-        self.check_own(key, "get_keyed");
         if !self.running() {
             return self.host(|vm| vm.get_keyed(obj, key));
         }
+        self.check_own(obj, "Vm::get_keyed");
+        self.check_own(key, "Vm::get_keyed");
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
                 return Err(Error::type_error(format!(
@@ -4975,12 +4978,12 @@ impl Vm {
     }
 
     pub fn set_keyed(&mut self, obj: Value, key: Value, value: Value) -> Result<()> {
-        self.check_own(obj, "set_keyed");
-        self.check_own(key, "set_keyed");
-        self.check_own(value, "set_keyed");
         if !self.running() {
             return self.host(|vm| vm.set_keyed(obj, key, value));
         }
+        self.check_own(obj, "Vm::set_keyed");
+        self.check_own(key, "Vm::set_keyed");
+        self.check_own(value, "Vm::set_keyed");
         if !obj.is_cell() {
             if obj.is_undefined() || obj.is_null() {
                 return Err(Error::type_error(format!(
@@ -5287,7 +5290,7 @@ impl Vm {
 
     /// `CreateObject n`: a plain object with room for `n` properties in
     /// itself, its root shape cached in inline-cache slot `ic`.
-    pub fn create_object(&mut self, code: &Code, ic: u32, n: u32) -> Value {
+    pub(crate) fn create_object(&mut self, code: &Code, ic: u32, n: u32) -> Value {
         let (ic, _) = code.ic(ic);
         unsafe {
             // (Or made again if no object had it at a full collection:
@@ -5308,10 +5311,10 @@ impl Vm {
     /// prototype chain. A name seen once (even not enumerable) hides it
     /// further up. Null and undefined have none.
     pub fn for_in_keys(&mut self, v: Value) -> Result<Value> {
-        self.check_own(v, "for_in_keys");
         if !self.running() {
             return self.host(|vm| Ok(vm.for_in_key_array(v)));
         }
+        self.check_own(v, "Vm::for_in_keys");
         let keys = self.for_in_key_array(v);
         if self.conv_failed() { Err(self.take_conv_error()) } else { Ok(keys) }
     }
@@ -5427,7 +5430,7 @@ impl Vm {
     /// ```
     pub fn string_units(&self, v: Value) -> Option<std::borrow::Cow<'_, [u16]>> {
         // (The borrow is this VM's: another's string could be freed under it.)
-        self.check_own(v, "string_units");
+        self.check_own(v, "Vm::string_units");
         units_in_place(v)
     }
 
@@ -5582,7 +5585,7 @@ impl Vm {
     }
 
     /// The string constant with `units`, shared by equal ones.
-    pub fn string_constant(&mut self, units: &[u16]) -> Value {
+    pub(crate) fn string_constant(&mut self, units: &[u16]) -> Value {
         if let Some(&v) = self.strings.get(units) {
             return v;
         }
@@ -5593,12 +5596,6 @@ impl Vm {
     }
 
     // ---- Functions ----
-
-    /// A new closure of `code`'s nested function `i`, with a fresh
-    /// `prototype` object.
-    pub fn create_closure(&mut self, code: &Code, i: u32) -> Value {
-        self.new_closure(code.closures[i as usize])
-    }
 
     /// A closure of `callee`, which has no upvalues.
     pub(crate) fn new_closure(&mut self, callee: *const Code) -> Value {
@@ -6433,12 +6430,12 @@ impl Vm {
     /// enters itself).
     #[inline]
     pub fn call_other(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
-        self.check_own(f, "call_other");
-        self.check_own(this, "call_other");
-        args.iter().for_each(|&a| self.check_own(a, "call_other"));
         if !self.running() {
             return self.host(|vm| vm.call_other(f, this, args));
         }
+        self.check_own(f, "Vm::call_other");
+        self.check_own(this, "Vm::call_other");
+        args.iter().for_each(|&a| self.check_own(a, "Vm::call_other"));
         if f.is_cell() {
             let o = as_object(f);
             unsafe {
@@ -6466,11 +6463,11 @@ impl Vm {
     /// `new f(…args)` when `f` isn't a bytecode function: a native that
     /// constructs (`Array`, `Object`) makes its object.
     pub fn construct_other(&mut self, f: Value, args: &[Value]) -> Result<Value> {
-        self.check_own(f, "construct_other");
-        args.iter().for_each(|&a| self.check_own(a, "construct_other"));
         if !self.running() {
             return self.host(|vm| vm.construct_other(f, args));
         }
+        self.check_own(f, "Vm::construct_other");
+        args.iter().for_each(|&a| self.check_own(a, "Vm::construct_other"));
         if f.is_cell() {
             let o = as_object(f);
             unsafe {
@@ -7442,7 +7439,7 @@ impl Vm {
 
     /// Words of in-object storage in `o` (for tests).
     pub fn inline_capacity(&self, o: Value) -> u32 {
-        self.check_own(o, "inline_capacity");
+        self.check_own(o, "Vm::inline_capacity");
         unsafe { (*(*as_object(o)).shape).capacity.get() }
     }
 }
@@ -8094,13 +8091,15 @@ fn array_push_flagged(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value>
     Ok(len)
 }
 
-/// `String(v)` for the values that exist so far.
 #[cold]
 #[inline(never)]
 fn foreign_cell(what: &str) -> ! {
-    panic!("Vm::{what}: a value not of this VM's heap")
+    panic!("{what}: a value not of this VM's heap")
 }
 
+/// `String(v)` for the values that exist so far. A cell's must be of a
+/// VM alive, with no run of it on another thread, and not freed since:
+/// there is no VM here to check it against.
 pub fn display(v: Value) -> String {
     if v.is_int32() {
         return v.as_i32_unchecked().to_string();
@@ -8523,10 +8522,7 @@ impl Global {
     /// operation of `vm`'s, or from within one of its runs (a native's).
     /// Panics if `v` is a cell of another VM's heap.
     pub fn new(vm: &Vm, v: Value) -> Global {
-        assert!(
-            !v.is_cell() || vm.heap.contains(v.to_bits() as usize),
-            "Global::new: a value not of this VM's heap"
-        );
+        vm.check_own(v, "Global::new");
         Global::hold(&vm.globals, v)
     }
 

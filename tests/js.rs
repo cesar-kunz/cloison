@@ -15786,6 +15786,66 @@ Promise.all([h1(1), i.next().then(function () { return i.next(); })])
     assert_eq!(out_after_jobs(src), "function function");
 }
 
+/// Every form that stores a parameter, or an element of `arguments`, maps
+/// the object (`aliases_arguments`, `stores_parameter`, which now name
+/// each expression and statement form): `||=`, `&&=` and `??=` were
+/// taken for reads (#215's review), and the operand of `await` wasn't
+/// looked at. Also compound assignments, destructuring targets (nested,
+/// defaults, rest), `for`-`of` heads with patterns, parenthesized targets,
+/// `catch` patterns, `switch`, `with`, computed keys, optional chains;
+/// `delete` and `typeof` of a parameter store nothing, a `catch` binding
+/// is its own. Both ways, in plain functions, generators, async functions
+/// and async generators. What SpiderMonkey and V8 give.
+#[test]
+fn every_store_form_maps_arguments() {
+    let src = r#"
+var out = [];
+function* g1(a) { a ||= 7; yield arguments[0]; } out.push(g1(0).next().value);
+function* g2(a) { arguments[0] ||= 7; yield a; } out.push(g2(0).next().value);
+function l1(a) { a &&= 8; return arguments[0]; } out.push(l1(1));
+function l2(a) { a ??= 9; return arguments[0]; } out.push(l2(null));
+function l3(a) { arguments[0] ??= 9; return a; } out.push(l3(undefined));
+function c1(a) { a += 1; return arguments[0]; } out.push(c1(1));
+function c2(a) { a **= 3; return arguments[0]; } out.push(c2(2));
+function c3(a) { arguments[0] <<= 2; return a; } out.push(c3(1));
+function d1(a) { [a] = [11]; return arguments[0]; } out.push(d1(1));
+function d2(a, b) { ({ x: { y: a = 12 } } = { x: {} }); return arguments[0]; } out.push(d2(1));
+function d3(a) { [, ...a] = [0, 13]; return arguments[0].join(); } out.push(d3(1));
+function d4(a) { for ([a] of [[14]]); return arguments[0]; } out.push(d4(1));
+function d5(a) { for ({ a } of [{ a: 15 }]); return arguments[0]; } out.push(d5(1));
+function d6(a) { for (var [a] of [[16]]); return arguments[0]; } out.push(d6(1));
+function d7(a) { for (let [x = (a = 17)] of [[]]); return arguments[0]; } out.push(d7(1));
+function u1(a) { (a)++; return arguments[0]; } out.push(u1(1));
+function u2(a) { ((a)) = 19; return arguments[0]; } out.push(u2(1));
+function t1(a) { delete a; typeof a; return arguments[0]; } out.push(t1(20));
+function k1(a) { try { throw [21] } catch ([a]) { a = 0; } return arguments[0]; } out.push(k1(1));
+function k2(a) { try { throw {} } catch ({ x = (a = 22) }) {} return arguments[0]; } out.push(k2(1));
+function s1(a) { lbl: switch (1) { case 1: a = 23; break lbl; } return arguments[0]; } out.push(s1(1));
+function w1(a) { with ({}) { a = 24; } return arguments[0]; } out.push(w1(1));
+function w2(a) { with ({ a: 0 }) { a = 25; } return arguments[0]; } out.push(w2(1));
+function cl(a) { class C { [a = 26]() {} } return arguments[0]; } out.push(cl(1));
+function cf(a) { var o = { [a = 27]: 1 }; return arguments[0]; } out.push(cf(1));
+function aw1(a) { return (async () => { await (a = 28); })().then(() => 0), arguments[0]; } out.push(aw1(1));
+function y1(a) { var it = (function* () {})(); return `${a = 29}` && arguments[0]; } out.push(y1(1));
+function ch(a) { var o = null; o?.[a = 30]; return arguments[0]; } out.push(ch(1));
+function ch2(a) { var o = {}; o?.[a = 31]; return arguments[0]; } out.push(ch2(1));
+function cm(a) { a ||= (arguments[0] = 32); return arguments[0] + "," + a; } out.push(cm(0));
+out.join(" ")
+"#;
+    assert_eq!(
+        value(src),
+        "7 7 8 9 9 2 8 4 11 12 13 14 15 16 17 2 19 20 1 22 23 24 1 26 27 28 29 1 31 32,32"
+    );
+    let src = r#"var log = [];
+async function h1(a) { await 0; a ||= 33; return arguments[0]; }
+async function h2(a) { await 0; arguments[0] ??= 34; await 0; return a; }
+async function* h3(a) { yield 0; a &&= 35; yield arguments[0]; }
+var i3 = h3(1);
+Promise.all([h1(0), h2(null), i3.next().then(() => i3.next())]).then(v => { globalThis.out = [v[0], v[1], v[2].value].join(" "); });
+"#;
+    assert_eq!(out_after_jobs(src), "33 34 35");
+}
+
 /// A compound assignment's converted object key outlives a collection in
 /// its right side: `Vm::key_cache` kept the key string `GetKeyed` made for
 /// the `SetKeyed` to reuse, but no collection marked it, so the store went

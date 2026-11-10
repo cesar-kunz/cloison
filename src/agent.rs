@@ -226,9 +226,11 @@ fn run_agent_vm(mut vm: Vm, src: &[u16], mailbox: &Mailbox, reports: Reports) {
         };
         let r = vm.enter(|vm| {
             // (The new buffer's length is read seq-cst, after the message:
-            // a catch-up for both, after the read, as by `read_length`.)
-            let sab = crate::shared::new_shared(vm, m.block as *mut crate::shared::Block, m.growable)?;
+            // a catch-up for both, after the read, as by `read_length`; for
+            // the message alone if no buffer was made.)
+            let sab = crate::shared::new_shared(vm, m.block as *mut crate::shared::Block, m.growable);
             crate::shared::catch_up(vm);
+            let sab = sab?;
             vm.handles.push(sab);
             crate::interp::call_function(vm, callback, Value::UNDEFINED, &[sab, m.id])
         });

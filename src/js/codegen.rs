@@ -5059,7 +5059,8 @@ impl<'a> Gen<'a> {
             && (self.index != 0 || self.p.direct_eval || self.f.strict || script_lexicals())
         {
             // Direct `eval`: `[eval, source, scope object, this, strict,
-            // in parameters, scope for its declarations, with objects…]`.
+            // in parameters, scope for its declarations, (`EVAL_THIS`) the
+            // receiver, with objects…]`.
             // The scope object it looks names up in: the function's (with
             // its parameters and `var`s), under one of the other bindings
             // it sees (block-scoped ones, enclosing functions' variables),
@@ -5076,20 +5077,49 @@ impl<'a> Gen<'a> {
                 _ => (None, visible),
             };
             let mark = self.temp;
+            // (In a `with`, the object `eval` is found on, else undefined:
+            // the `this` of an `eval` not the builtin, `EVAL_THIS`, as for
+            // `with_call`. Not an `eval`'s scope object's.)
+            let receiver = if self.in_with("eval") && self.withs[self.with_skip("eval")..].iter().any(|w| w.starts_with("%w")) {
+                Some(self.alloc(pos)?)
+            } else {
+                None
+            };
             let fr = self.alloc(pos)?;
-            self.into(f, fr)?;
-            // (With a spread, or more than one: all of them in an array,
-            // `EVAL_ARGS`, the source its first, or for an `eval` not the
-            // builtin the call's arguments.)
-            let src = self.alloc(pos)?;
-            let packed = args.len() > 1 || args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)));
-            match args.first() {
-                _ if packed => self.args_array(args, src, pos)?,
-                Some(a) => self.into(a, src)?,
-                None => {
+            match receiver {
+                Some(rr) => {
                     self.emit(Op::LdaUndefined, &[]);
-                    self.star(src);
+                    self.star(rr);
+                    let end = self.with_lookup(
+                        "eval",
+                        pos,
+                        &mut |g, r| {
+                            g.with_get(r, "eval");
+                            g.star(fr);
+                            if !g.found_scope {
+                                g.mov(r, rr);
+                            }
+                            Ok(())
+                        },
+                        &mut |g| {
+                            g.value_inner(f)?;
+                            g.star(fr);
+                            Ok(())
+                        },
+                    )?;
+                    self.bind(end);
                 }
+                None => self.into(f, fr)?,
+            }
+            // (With a spread, or other than one: all of them in an array,
+            // `EVAL_ARGS`, the source its first (undefined if none), or for
+            // an `eval` not the builtin the call's arguments.)
+            let src = self.alloc(pos)?;
+            let packed = args.len() != 1 || args.iter().any(|a| matches!(a.kind, ExprKind::Spread(_)));
+            if packed {
+                self.args_array(args, src, pos)?;
+            } else {
+                self.into(&args[0], src)?;
             }
             let packed = if packed { EVAL_ARGS } else { 0 };
             // A strict script's own: an indirect one's, strict (its
@@ -5129,7 +5159,10 @@ impl<'a> Gen<'a> {
             }
             let new_target = if k == 0 { self.p.direct_eval && self.p.eval_new_target } else { !self.p.functions[k].module };
             let strict = self.alloc(pos)?;
-            let flags = if self.f.strict { EVAL_STRICT } else { 0 } | if new_target { EVAL_NEW_TARGET } else { 0 } | packed;
+            let flags = if self.f.strict { EVAL_STRICT } else { 0 }
+                | if new_target { EVAL_NEW_TARGET } else { 0 }
+                | packed
+                | if receiver.is_some() { EVAL_THIS } else { 0 };
             self.emit(Op::LdaSmi, &[Arg::Imm(flags as i32)]);
             self.star(strict);
             let params = self.alloc(pos)?;
@@ -5160,12 +5193,16 @@ impl<'a> Gen<'a> {
                 // (A script's: all of them.)
                 None => self.withs.iter().filter(|w| w.starts_with("%w")).cloned().collect(),
             };
+            if let Some(rr) = receiver {
+                let r = self.alloc(pos)?;
+                self.mov(rr, r);
+            }
             for w in &withs {
                 let r = self.alloc(pos)?;
                 self.load_raw(w, pos)?;
                 self.star(r);
             }
-            let nargs = (7 + withs.len()) as u8;
+            let nargs = (7 + receiver.is_some() as usize + withs.len()) as u8;
             // The bindings: the parser's, then the enclosing functions'
             // variables none of those shadows (none with no variable here).
             // (Block-scoped ones first, then the enclosing functions':

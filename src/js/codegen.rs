@@ -3414,7 +3414,7 @@ impl<'a> Gen<'a> {
     /// The register of a local variable, or of `this`.
     fn local(&self, e: &Expr) -> Option<u8> {
         match &e.kind {
-            ExprKind::This if self.f.class_kind != 3 => Some(0),
+            ExprKind::This if self.f.class_kind != 3 && !self.eval_this() => Some(0),
             // (In a `with`, a name may be the object's.)
             ExprKind::Ident(n) if !self.in_with(n) && !self.needs_check(n, e.pos) && !self.boxed[self.index].contains(&&**n) => {
                 self.locals.get(&**n).copied()
@@ -3920,7 +3920,7 @@ impl<'a> Gen<'a> {
     /// temporary, which the caller frees.
     fn reg(&mut self, e: &Expr, later: &[&Expr]) -> R<u8> {
         match &e.kind {
-            ExprKind::This if self.f.class_kind != 3 => return Ok(0),
+            ExprKind::This if self.f.class_kind != 3 && !self.eval_this() => return Ok(0),
             ExprKind::Ident(n) => {
                 // (A captured one may change in any call, through a closure.)
                 if let Some(&r) = self.locals.get(&**n)
@@ -3984,6 +3984,13 @@ impl<'a> Gen<'a> {
             Null => self.emit(Op::LdaNull, &[]),
             This if self.f.class_kind == 3 && self.f.uses_this => self.load_var("%this", e.pos)?,
             This if self.f.class_kind == 3 => {
+                self.ldar(0);
+                let k = self.const_str("this");
+                self.emit(Op::CheckHole, &[Arg::Index(k)]);
+            }
+            // (A direct `eval`'s in a function: maybe a derived class's
+            // constructor's before `super()`, its `this` not yet bound.)
+            This if self.eval_this() => {
                 self.ldar(0);
                 let k = self.const_str("this");
                 self.emit(Op::CheckHole, &[Arg::Index(k)]);
@@ -4088,6 +4095,15 @@ impl<'a> Gen<'a> {
             self.emit(Op::CheckHole, &[Arg::Index(k)]);
         }
         Ok(())
+    }
+
+    /// `super`'s home object, variable `home`: in a direct `eval`'s code,
+    /// the caller's (`EVAL_HOME_BINDING`), found as its names are.
+    fn load_home(&mut self, home: &str, pos: Pos) -> R<()> {
+        if home == EVAL_HOME_BINDING && self.in_with(home) {
+            return self.with_load(home, pos, false);
+        }
+        self.load_var(home, pos)
     }
 
     /// Whether a reference to `name` at `pos` may find it not initialized:
@@ -4349,7 +4365,7 @@ impl<'a> Gen<'a> {
             SuperMember(home, k, this) => {
                 let mark = self.temp;
                 let h = self.alloc(e.pos)?;
-                self.load_var(home, e.pos)?;
+                self.load_home(home, e.pos)?;
                 self.star(h);
                 let kr = self.alloc(e.pos)?;
                 let t = self.alloc(e.pos)?;
@@ -4817,7 +4833,7 @@ impl<'a> Gen<'a> {
             ExprKind::SuperMember(home, k, this) => {
                 let mark = self.temp;
                 let h = self.alloc(pos)?;
-                self.load_var(home, pos)?;
+                self.load_home(home, pos)?;
                 self.star(h);
                 let kr = self.alloc(pos)?;
                 let vr = self.alloc(pos)?;
@@ -4979,7 +4995,7 @@ impl<'a> Gen<'a> {
             ExprKind::SuperMember(home, k, this) => {
                 // `[home, key, this]` read, then `[home, key, v, this]` set.
                 let h = self.alloc(pos)?;
-                self.load_var(home, pos)?;
+                self.load_home(home, pos)?;
                 self.star(h);
                 let kr = self.alloc(pos)?;
                 let tr = self.alloc(pos)?;
@@ -5162,7 +5178,8 @@ impl<'a> Gen<'a> {
             let flags = if self.f.strict { EVAL_STRICT } else { 0 }
                 | if new_target { EVAL_NEW_TARGET } else { 0 }
                 | packed
-                | if receiver.is_some() { EVAL_THIS } else { 0 };
+                | if receiver.is_some() { EVAL_THIS } else { 0 }
+                | if self.p.functions[k].home.is_some() { EVAL_HOME } else { 0 };
             self.emit(Op::LdaSmi, &[Arg::Imm(flags as i32)]);
             self.star(strict);
             let params = self.alloc(pos)?;
@@ -6277,7 +6294,14 @@ impl<'a> Gen<'a> {
                 None => return false,
             }
         }
-        self.p.functions[k].class_kind == 3
+        self.p.functions[k].class_kind == 3 || (k == 0 && self.p.direct_eval && self.p.eval_new_target)
+    }
+
+    /// Whether this is a direct `eval`'s code run by a function, maybe a
+    /// derived class's constructor before `super()`: its `this` (register
+    /// 0) checked, as such a constructor's.
+    fn eval_this(&self) -> bool {
+        self.index == 0 && self.p.direct_eval && self.p.eval_new_target
     }
 
     // ---- Tests ----

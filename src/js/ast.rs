@@ -342,6 +342,12 @@ pub const EVAL_ARGS: u8 = 4;
 /// (And, in a `with`, the object the name `eval` was found on after the
 /// declarations' scope, the `this` of an `eval` not the builtin.)
 pub const EVAL_THIS: u8 = 8;
+/// (And the caller is a method, or an arrow in one: its code may use
+/// `super.x`, of the home object it sees as [`EVAL_HOME_BINDING`].)
+pub const EVAL_HOME: u8 = 16;
+/// The binding a direct `eval` in a method sees the method's home object
+/// by (see `Parser::super_expr`).
+pub const EVAL_HOME_BINDING: &str = "%home";
 
 /// The start of the name of the exception a statement list with `using`
 /// declarations catches (see `Parser::lower_using`): its `try` statement

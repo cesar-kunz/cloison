@@ -584,8 +584,9 @@ pub(crate) enum EvalPlace {
     /// A direct one's, in a function (see `intrinsics::direct_eval`):
     /// whether the caller is strict and has a `new.target`, the `with`
     /// statements around it, and whether it is a script's (its scope
-    /// object the global object).
-    Direct { strict: bool, new_target: bool, withs: usize, global: bool },
+    /// object the global object), and whether the caller has a home
+    /// object (a method's, for `super.x`).
+    Direct { strict: bool, new_target: bool, withs: usize, global: bool, home: bool },
     /// A direct one's compiled for its site's bindings (see
     /// `intrinsics::direct_eval_bound`): as `Direct`, the site (a number
     /// of its own: its bindings' names, kinds and upvalues are the code's,

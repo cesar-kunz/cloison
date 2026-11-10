@@ -1732,8 +1732,9 @@ fn async_iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// flags) tells: `EVAL_IMPORT` an imported binding's accessor (`value` the
 /// object holding it, `variable` its property, none for a namespace),
 /// `EVAL_DATA` a data property of its value (but a binding not initialized
-/// yet has none). Added to `scope object` if one (in parts, for
-/// registers' sake: see `Gen::call`), else to a new one, returned.
+/// yet has none). Made by the first part (`scope object` undefined), with
+/// the accessors; the later ones, for registers' sake (see `Gen::call`),
+/// only add their quadruples' to it. It is returned.
 /// Without a prototype: the eval'd code looks names up in the scopes
 /// outside it after it (see `parse::parse_pass`), the function's scope
 /// object among them, whose `var`s shadow the enclosing functions'
@@ -1743,8 +1744,13 @@ fn async_iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let place = a[0].as_number().unwrap_or(0.0) as usize;
     let bindings = a[1];
-    let o = if crate::props::is_object(a[3]) { a[3] } else { object_value(vm.new_object(Value::NULL)) };
-    bound_accessors(vm, o, bindings, &site_bindings(a[2]).2, place)?;
+    let o = if crate::props::is_object(a[3]) {
+        a[3]
+    } else {
+        let o = object_value(vm.new_object(Value::NULL));
+        bound_accessors(vm, o, bindings, &site_bindings(a[2]).2, place)?;
+        o
+    };
     for t in a[4..].chunks(4) {
         let key = to_property_key(vm, t[0])?;
         let b = t[3].as_number().unwrap_or(0.0) as i32;

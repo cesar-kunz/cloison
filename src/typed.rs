@@ -715,8 +715,9 @@ fn on_buffer(vm: &mut Vm, k: TypedKind, b: *mut Object, offset: usize, n: Option
     if is_detached(b) {
         return Err(Error::type_error("Cannot construct a typed array on a detached ArrayBuffer"));
     }
+    // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
     if crate::shared::is_shared(b) {
-        crate::shared::sync_length(b);
+        crate::shared::read_length(vm, b);
     }
     let bytes = unsafe { (*b).elems_len } as usize;
     let len = match n {

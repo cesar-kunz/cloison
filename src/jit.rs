@@ -3804,7 +3804,7 @@ struct Spec<'a> {
     /// A fixed-length buffer has been detached (see `Vm::views_detached`):
     /// a typed array's `length` through the runtime.
     views_detached: bool,
-    /// Some view is of a growable shared buffer (see
+    /// Some view tracks a growable shared buffer's length (see
     /// `Vm::shared_growable_views`): a known typed array's `length`
     /// checked.
     shared_growable_views: bool,

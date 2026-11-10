@@ -1315,7 +1315,54 @@ fn aliases_arguments(p: &Program, f: &Function) -> bool {
     }
     let mut found = false;
     for_each_expr(&f.body, &mut |e| found |= expr(e, p, f));
-    found
+    found || stores_parameter(p, f)
+}
+
+/// Whether a statement of function `f` (not of one nested in it) stores
+/// a parameter as no expression does: a `var` of its name with an
+/// initializer, a `for`-`in` or `for`-`of` target of it (a pattern, maybe:
+/// taken to), or a function declaration in its body by that name, which
+/// FunctionDeclarationInstantiation stores in the parameter's binding
+/// (ECMA-262 10.2.11 steps 28 and 36: no parameter expressions, so one
+/// environment). (One in a block isn't Annex B's for a parameter's name,
+/// B.3.2.1.)
+fn stores_parameter(p: &Program, f: &Function) -> bool {
+    fn stmt(s: &Stmt, f: &Function) -> bool {
+        let param = |n: &str| f.params.iter().any(|p| &**p == n);
+        match &s.kind {
+            StmtKind::Var(ds)
+            | StmtKind::For {
+                init: Some(ForInit::Var(ds)),
+                ..
+            } if ds.iter().any(|(n, e)| e.is_some() && param(n)) => return true,
+            StmtKind::ForIn { fresh: false, name, .. } if param(name) => return true,
+            StmtKind::ForOf { kind: 0 | 1, pattern: Some(_), .. } => return true,
+            StmtKind::ForOf {
+                kind: 0 | 1,
+                target: Expr { kind: ExprKind::Ident(n), .. },
+                ..
+            } if param(n) => return true,
+            _ => {}
+        }
+        match &s.kind {
+            StmtKind::If(_, a, b) => stmt(a, f) || b.is_some_and(|b| stmt(b, f)),
+            StmtKind::For { body, .. }
+            | StmtKind::ForIn { body, .. }
+            | StmtKind::ForOf { body, .. }
+            | StmtKind::While(_, body)
+            | StmtKind::DoWhile(body, _)
+            | StmtKind::With(_, _, body)
+            | StmtKind::Labeled(_, body) => stmt(body, f),
+            StmtKind::Block(b) => b.iter().any(|s| stmt(s, f)),
+            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).any(|s| stmt(s, f)),
+            StmtKind::Try(b, c, fin) => try_blocks(b, c, fin).any(|s| stmt(s, f)),
+            _ => false,
+        }
+    }
+    let mut fns = Vec::new();
+    f.body.iter().for_each(|s| hoisted(s, &mut fns));
+    fns.iter().any(|&i| p.functions[i].name.as_deref().is_some_and(|n| f.params.iter().any(|q| &**q == n)))
+        || f.body.iter().any(|s| stmt(s, f))
 }
 
 /// Whether function `f`'s `arguments` object may be reachable once it

@@ -727,7 +727,13 @@ fn upvalues<'a>(p: &'a Program, decls: &[Decls<'a>], overflow: &[Vec<&'a str>]) 
         if eval_scope(p, i).is_some_and(|k| k != i) {
             refs.push(EVAL_SCOPE);
         }
-        if p.functions[i].has_eval && p.functions[i].arrow {
+        // (Not one in an `eval`'s code reading its caller's `this` binding:
+        // see `ast::EVAL_LIVE_THIS`.)
+        let mut k = i;
+        while p.functions[k].arrow && k != 0 {
+            k = p.functions[k].parent.unwrap_or(0);
+        }
+        if p.functions[i].has_eval && p.functions[i].arrow && !(k == 0 && p.eval_live_this) {
             refs.push("%this");
         }
         for name in refs {
@@ -5500,7 +5506,15 @@ impl<'a> Gen<'a> {
             self.string(&shape);
             self.star(s);
             let this = self.alloc(pos)?;
-            if self.f.arrow {
+            let mut method = self.index;
+            while self.p.functions[method].arrow {
+                method = self.p.functions[method].parent.unwrap();
+            }
+            if self.f.arrow && method == 0 && self.p.eval_live_this {
+                // (An arrow's of an `eval`'s code reading its caller's
+                // `this` binding, which the `eval`'s code reads too.)
+                self.emit(Op::LdaUndefined, &[]);
+            } else if self.f.arrow {
                 // (Not checked: in a derived class's constructor before
                 // `super()`, its code's `this` is, see `Gen::eval_this`.)
                 self.load_raw("%this", pos)?;
@@ -5521,7 +5535,8 @@ impl<'a> Gen<'a> {
                 | if new_target { EVAL_NEW_TARGET } else { 0 }
                 | packed
                 | if receiver.is_some() { EVAL_THIS } else { 0 }
-                | if self.p.functions[k].home.is_some() { EVAL_HOME } else { 0 };
+                | if self.p.functions[k].home.is_some() { EVAL_HOME } else { 0 }
+                | if self.p.functions[k].class_kind == 3 || (k == 0 && self.p.eval_live_this) { EVAL_LIVE_THIS } else { 0 };
             self.emit(Op::LdaSmi, &[Arg::Imm(flags as i32)]);
             self.star(strict);
             let params = self.alloc(pos)?;

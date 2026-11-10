@@ -66,7 +66,7 @@ pub fn parse_source_as<'a>(
     src: &str,
     arena: &'a Arenas<'a>,
     skim: bool,
-    eval: Option<(bool, &str, bool, bool, bool, bool)>,
+    eval: Option<(bool, &str, bool, bool, bool, bool, bool)>,
 ) -> Result<Program<'a>, Error> {
     let mut toks = super::lex::lex(src)?;
     let lexical = has_lexical(&toks);
@@ -108,7 +108,7 @@ fn parse_pass<'a>(
     keep: bool,
     table: Option<Table>,
     prev: Option<&Program<'a>>,
-    eval: Option<(bool, &str, bool, bool, bool, bool)>,
+    eval: Option<(bool, &str, bool, bool, bool, bool, bool)>,
     module: Option<i32>,
 ) -> Result<(Program<'a>, Table), Error> {
     let first = table.is_none();
@@ -133,7 +133,8 @@ fn parse_pass<'a>(
         privates: Vec::new(),
         super_fns: Vec::new(),
         redeclared: None,
-        in_eval: eval.is_some_and(|(.., new_target, _)| new_target),
+        in_eval: eval.is_some_and(|(.., new_target, _, _)| new_target),
+        live_this: eval.is_some_and(|(.., live)| live),
         using_scopes: Vec::new(),
         param_refs: Vec::new(),
         static_blocks: Vec::new(),
@@ -196,7 +197,7 @@ fn parse_pass<'a>(
     });
     p.functions[0].strict =
         p.directive_prologue() || eval.is_some_and(|(strict, ..)| strict) || module.is_some() || STRICT.get();
-    if let Some((_, chain, bound, global, _, home)) = eval {
+    if let Some((_, chain, bound, global, _, home, _)) = eval {
         // (In a method, or an arrow in one: its `super` the method's
         // home object, the binding `EVAL_HOME_BINDING` it sees.)
         if home {
@@ -260,8 +261,9 @@ fn parse_pass<'a>(
             eval_locals: false,
             script: eval.is_none() && module.is_none(),
             eval_upvalues: Vec::new(),
-            eval_global: eval.is_some_and(|(.., global, _, _)| global),
-            eval_new_target: eval.is_some_and(|(.., new_target, _)| new_target),
+            eval_global: eval.is_some_and(|(.., global, _, _, _)| global),
+            eval_new_target: eval.is_some_and(|(.., new_target, _, _)| new_target),
+            eval_live_this: eval.is_some_and(|(.., live)| live),
             own_names: Vec::new(),
             imports: std::mem::take(&mut p.imports),
             module: module.map(|_| std::mem::take(&mut p.info)),
@@ -365,6 +367,10 @@ struct Parser<'t, 'a, 'p> {
     /// function, not an arrow of a script's or a module's top level): its
     /// `new.target` the caller's.
     in_eval: bool,
+    /// Direct `eval`'s code whose caller's `this` may be bound later (a
+    /// derived class's constructor's, see `ast::EVAL_LIVE_THIS`): its
+    /// top level's `this` is the caller's binding (`%this`), not a value.
+    live_this: bool,
     /// The statement lists being parsed that may have `using` declarations
     /// (a block's, a function body's: not a `case`'s, nor the script's,
     /// which have none here), and what their disposal needs.
@@ -1979,6 +1985,12 @@ impl<'a> Parser<'_, 'a, '_> {
 
     /// The nearest enclosing function that isn't an arrow (the one whose
     /// `this` and `arguments` an arrow uses).
+    /// Whether `this` here is a direct `eval`'s caller's binding: at its
+    /// code's top level, with `EVAL_LIVE_THIS` (see `Parser::live_this`).
+    fn live_this(&self) -> bool {
+        self.live_this && self.current == 0
+    }
+
     fn non_arrow(&self) -> usize {
         let mut k = self.current;
         while self.functions[k].arrow {
@@ -2655,7 +2667,9 @@ impl<'a> Parser<'_, 'a, '_> {
                     if function {
                         self.functions[k].uses_new_target = true;
                     }
-                    if self.functions[self.current].arrow {
+                    // (Not an `eval`'s code's own `this` read through its
+                    // caller's binding: the `eval`'s finds that one too.)
+                    if self.functions[self.current].arrow && !(k == 0 && self.live_this) {
                         self.functions[k].uses_this = true;
                     }
                     // The block-scoped bindings it sees, for its scope
@@ -2678,6 +2692,17 @@ impl<'a> Parser<'_, 'a, '_> {
                             Expr { kind: ExprKind::Str(EVAL_HOME_BINDING.into()), pos },
                             Expr { kind: ExprKind::Ident(h), pos },
                             Expr { kind: ExprKind::Num(EVAL_CONST as f64), pos },
+                        ]);
+                    }
+                    // (In a derived class's constructor, or an arrow in
+                    // one, its `this` binding too, which `super()` may
+                    // bind after the call: see `ast::EVAL_LIVE_THIS`.)
+                    if self.functions[k].class_kind == 3 {
+                        self.functions[k].uses_this = true;
+                        visible.extend([
+                            Expr { kind: ExprKind::Str("%this".into()), pos },
+                            Expr { kind: ExprKind::Ident("%this".into()), pos },
+                            Expr { kind: ExprKind::Num(0.0), pos },
                         ]);
                     }
                     if self.current != 0 || !visible.is_empty() {
@@ -2924,9 +2949,12 @@ impl<'a> Parser<'_, 'a, '_> {
                 }
                 ExprKind::Template(strings.into(), subs)
             }
-            Tok::Keyword("this") if self.functions[self.current].arrow => {
+            Tok::Keyword("this") if self.functions[self.current].arrow || self.live_this() => {
                 let k = self.non_arrow();
-                self.functions[k].uses_this = true;
+                // (Not the `eval`'s code's own: its caller's binding.)
+                if !(k == 0 && self.live_this) {
+                    self.functions[k].uses_this = true;
+                }
                 ExprKind::Ident("%this".into())
             }
             Tok::Keyword("this") => ExprKind::This,
@@ -4649,8 +4677,10 @@ impl<'a> Parser<'_, 'a, '_> {
         } else {
             return self.err("expected `.`, `[` or `(` after `super`");
         };
-        let this = if self.functions[self.current].arrow {
-            self.functions[k].uses_this = true;
+        let this = if self.functions[self.current].arrow || self.live_this() {
+            if !(k == 0 && self.live_this) {
+                self.functions[k].uses_this = true;
+            }
             ExprKind::Ident("%this".into())
         } else {
             ExprKind::This

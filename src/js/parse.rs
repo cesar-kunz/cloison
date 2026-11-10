@@ -3122,7 +3122,8 @@ impl<'a> Parser<'_, 'a, '_> {
             }
             Tok::RegExp(r) => {
                 // (An invalid pattern or flags are an early error.)
-                if let Err(m) = crate::regexp::Regex::check(&r.0, &r.1) {
+                // (The pattern's code units: a lone surrogate's its own.)
+                if let Err(m) = crate::regexp::Regex::check(&super::lex::to_units(&r.0), &r.1) {
                     return Err(Error::new(pos as usize, m));
                 }
                 ExprKind::RegExp(r)

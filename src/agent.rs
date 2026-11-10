@@ -135,7 +135,7 @@ impl State {
 
 fn source_of(v: Value) -> Result<String> {
     match string_units(v) {
-        Some(u) => Ok(crate::vm::source_text(u)),
+        Some(u) => Ok(crate::js::lex::units_to_string(u)),
         None => Err(Error::type_error("$262.agent.start: the source is not a string")),
     }
 }
@@ -195,7 +195,7 @@ fn report_error(line: std::fmt::Arguments) {
 
 fn run_agent_vm(mut vm: Vm, src: &str, mailbox: &Mailbox, reports: Reports) {
     vm.agent.report_to = Some(reports);
-    let module = match crate::js::compile(src) {
+    let module = match crate::js::compile_source(src) {
         Ok(m) => m,
         Err(e) => {
             report_error(format_args!("SyntaxError: {e}"));

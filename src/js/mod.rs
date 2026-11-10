@@ -31,13 +31,43 @@ impl Error {
     pub fn display(&self, src: &str) -> String {
         let before = &src[..self.pos.min(src.len())];
         let line = before.matches('\n').count() + 1;
-        let col = before.rsplit('\n').next().unwrap().chars().count() + 1;
+        // (Characters of the text: not the `ESCAPE`s source text puts
+        // before some, see `lex::text_to_source`.)
+        let (mut col, mut after) = (1, false);
+        for c in before.rsplit('\n').next().unwrap().chars() {
+            after = !after && c as u32 == lex::ESCAPE;
+            col += !after as usize;
+        }
         format!("{line}:{col}: {}", self.msg)
     }
 }
 
-/// Parse `src`, a script: its syntax error, if any.
+// The front end takes source text as `lex::text_to_source` has it: a
+// string's (`eval`'s, `Function`'s) as `lex::units_to_string` has its code
+// units, its lone surrogates code units of their own. `parse`, `compile`,
+// `module_info` and `compile_module` take a file's text, and make it that.
+
+/// Parse `src`, a script's text: its syntax error, if any (at an offset of
+/// `src`).
 pub fn parse(src: &str) -> Result<(), Error> {
+    let source = lex::text_to_source(src);
+    check_source(&source).map_err(|mut e| {
+        // (Back to an offset of `src`: less the `ESCAPE`s put before it,
+        // each before a character.)
+        if matches!(source, std::borrow::Cow::Owned(_)) {
+            let (mut escapes, mut after) = (0, false);
+            for c in source[..e.pos.min(source.len())].chars() {
+                after = !after && c as u32 == lex::ESCAPE;
+                escapes += after as usize;
+            }
+            e.pos -= escapes * char::from_u32(lex::ESCAPE).unwrap().len_utf8();
+        }
+        e
+    })
+}
+
+/// [`parse`] of source text (see `lex::text_to_source`).
+pub fn check_source(src: &str) -> Result<(), Error> {
     parse::parse(&mut lex::lex(src)?, &ast::Arenas::default()).map(|_| ())
 }
 
@@ -54,6 +84,11 @@ pub fn is_one_function(src: &str) -> bool {
 
 /// Compile `src`, a script, to a module; errors are `line:column: message`.
 pub fn compile(src: &str) -> Result<Checked, String> {
+    compile_source(&lex::text_to_source(src))
+}
+
+/// [`compile`] of source text (see `lex::text_to_source`).
+pub fn compile_source(src: &str) -> Result<Checked, String> {
     let arena = ast::Arenas::default();
     parse::parse_source(src, &arena, false)
         .and_then(|p| codegen::generate(&p, src))
@@ -65,6 +100,7 @@ pub fn compile(src: &str) -> Result<Checked, String> {
 /// Module `src`'s requests, imports and exports (module `id`'s); errors
 /// are `line:column: message`.
 pub fn module_info(src: &str, id: i32) -> Result<ast::ModuleInfo, String> {
+    let src = &*lex::text_to_source(src);
     let arena = ast::Arenas::default();
     let p = parse::parse_module(src, &arena, id).map_err(|e| e.display(src))?;
     Ok(p.module.unwrap_or_default())
@@ -75,6 +111,7 @@ pub fn module_info(src: &str, id: i32) -> Result<ast::ModuleInfo, String> {
 /// import (see `ast::ModuleInfo::imports`), the variable of the scope
 /// object its holder is, or none (the holder is the value).
 pub fn compile_module(src: &str, id: i32, links: &[Option<String>]) -> Result<Module, String> {
+    let src = &*lex::text_to_source(src);
     let arena = ast::Arenas::default();
     parse::parse_module(src, &arena, id)
         .and_then(|mut p| {

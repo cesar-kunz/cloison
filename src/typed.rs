@@ -208,7 +208,7 @@ pub(crate) fn refresh_views(b: *mut Object) {
         return;
     }
     let views = as_object(Value::from_bits(unsafe { (*b).code } as u64));
-    for v in crate::collections::weak_set_values(views) {
+    crate::collections::weak_set_each(views, |v| {
         let v = as_object(v);
         unsafe {
             (*v).elems_len = if (*v).class == Class::TypedArray {
@@ -217,7 +217,7 @@ pub(crate) fn refresh_views(b: *mut Object) {
                 view_byte_length(v).unwrap_or(0) as u32
             };
         }
-    }
+    });
 }
 
 /// DetachArrayBuffer. A fixed-length buffer doesn't keep its views, whose

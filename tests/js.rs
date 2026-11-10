@@ -10555,6 +10555,47 @@ fn modules_eval_sees_many_top_level_bindings() {
     }
 }
 
+/// A module's direct `eval` sees its imports as the live, immutable
+/// bindings they are (#151): an assignment to one (named, renamed, a
+/// namespace; in the module's code, an arrow, a function) a TypeError,
+/// whatever the other bindings are; a read after a call changing it the
+/// new value, in an `eval` in the `eval`'s code and a closure it makes
+/// too; one whose target is not initialized yet, in a cycle, a
+/// ReferenceError read, a TypeError assigned (ECMA-262 9.1.1.5.1
+/// GetBindingValue; 9.1.1.1.5 SetMutableBinding, step 5: the import
+/// binding itself is initialized, 9.1.1.5.5). SpiderMonkey's values.
+#[test]
+fn modules_eval_sees_imports_live() {
+    let dir = module_dir(
+        "eval-imports",
+        &[
+            (
+                "main.mjs",
+                "import { live, bump } from './lib.mjs';\nimport * as ns from './lib.mjs';\nimport { live as l2 } from './lib.mjs';\n\
+                 import { early } from './cycle.mjs';\n\
+                 const r = [], t = f => { try { return String(f()); } catch (e) { return e.name; } };\n\
+                 let x = 1;\n\
+                 r.push(t(() => eval('live = 3')), t(() => eval('l2++')), t(() => eval('ns = 1')), live);\n\
+                 r.push(t(() => (function () { return eval('bump(), [live, l2, ns.live].join(\"/\")'); })()));\n\
+                 try { eval('x = 2; live = 3'); } catch (e) { r.push(e.name, x); }\n\
+                 r.push(eval('bump(), live'), eval('eval(\"bump(), live\")'), eval('() => live')(), early);\n\
+                 bump();\nr.push(live, l2, t(() => (() => eval('live'))()));\n\
+                 export let late = 1;\nglobalThis.result = r.join();",
+            ),
+            ("lib.mjs", "export let live = 1; export function bump() { live++; }"),
+            (
+                "cycle.mjs",
+                "import { late } from './main.mjs';\n\
+                 export let early = [() => eval('late'), () => eval('late = 2')].map(f => { try { return f(); } catch (e) { return e.name; } }).join('/');",
+            ),
+        ],
+    );
+    assert_eq!(
+        run_module(&dir, "main.mjs").unwrap(),
+        "TypeError,TypeError,TypeError,1,2/2/2,TypeError,2,3,4,4,ReferenceError/TypeError,5,5,5"
+    );
+}
+
 /// Top-level `await`: a module waits for its async dependencies, which
 /// run in order; `import()` evaluates a module once and resolves to its
 /// namespace; a JSON module's default export is its value.

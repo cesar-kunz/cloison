@@ -294,6 +294,8 @@ pub const ERROR: u8 = 128;
 
 #[repr(C)]
 pub struct Object {
+    /// Read concurrently by the marker thread: changed only through
+    /// [`set_shape`] (see "The header word" at `layout::Header`).
     pub shape: *const Shape,
     pub class: Class,
     pub flags: u8,

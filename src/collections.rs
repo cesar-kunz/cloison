@@ -495,9 +495,14 @@ fn weaken(o: *mut Object) {
         if elems.is_null() {
             return;
         }
-        let w = elems.cast::<u64>().sub(1);
-        if *w & 7 == crate::heap::VALUES {
-            *w = (*w & !7) | crate::heap::WEAK_VALUES;
+        // (Atomic: a buffer promoted since it was made may be traced by
+        // the marker thread meanwhile, which reads its header word once,
+        // either kind, and the same capacity: see "The header word" at
+        // `layout::Header`.)
+        let w = &*elems.cast::<u64>().sub(1).cast::<std::sync::atomic::AtomicU64>();
+        let h = w.load(std::sync::atomic::Ordering::Relaxed);
+        if h & 7 == crate::heap::VALUES {
+            w.store((h & !7) | crate::heap::WEAK_VALUES, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

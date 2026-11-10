@@ -166,6 +166,45 @@ pub const FAR: u8 = 128;
 /// classes' first have the words [`extra_words`] counts: `code`, and for a
 /// few a word of their own (`object::Object::aux`). So a slot's offset
 /// depends on the class ([`slots_offset`]).
+///
+/// # The header word
+///
+/// A cell's first word is its header word: an object's shape (bit 0
+/// clear), or another cell's kind and length (`heap::VALUES` and the
+/// others). It is the one word of a cell's header that changes while the
+/// marker thread may read it concurrently, so every access to it follows
+/// this contract:
+/// - **Writers** are the mutator thread alone. An old object's shape
+///   changes through `object::set_shape` (a Relaxed atomic store) and the
+///   stencils' `set_shape` (`set_tr*`, `set_tro*`, the megamorphic store,
+///   `array_push`'s transition: the same store). A weak collection's
+///   entries buffer turns from `VALUES` to `WEAK_VALUES`
+///   (`collections::weaken`, Relaxed, length kept). Every other write is
+///   to a young cell, which the marker skips, or in a pause.
+/// - **A shape stored is published:** it was made by `Vm::add_shape`,
+///   whose `fence(Release)` comes after the shape's initialization and
+///   before any store of its address, on the same thread. Compiled code
+///   stores only shapes that already existed (patched in, or read from a
+///   cache Rust filled after making them). Each store is one aligned
+///   64-bit store, never split or merged (atomic, Relaxed), so an
+///   aligned `mov` on x86-64 or `str` on arm64, both single-copy atomic.
+///   In hardware terms: on arm64 the fence is a `dmb ish`, which orders
+///   every store before it ahead of every store after it, compiled
+///   code's plain `str` included; on x86-64 it is a compiler barrier
+///   only, stores becoming visible in program order (TSO).
+/// - **The concurrent reader** is the marker thread's `drain_to_in`. It
+///   loads the word once, with Acquire (`ldar`, or `ldapr` with RCpc, on
+///   arm64, which orders the loads through the shape after it; a `mov`
+///   on x86-64), and passes it down (`trace_with`, `heap::cell_size_with`,
+///   `mark_object_shape`, `mark_function_code`): nothing on that path
+///   reads the word again, so the shape it follows is the one it
+///   acquired. The class and the in-object capacity it reads too (the
+///   next word's `class`, `kind`, `cap_hi`) never change once a cell is
+///   allocated; the mutator writes that word's `flags` and `elems_len`
+///   bytes, which the marker doesn't read.
+/// - Code with the mutator stopped (pauses, `drain_parallel`, card
+///   scanning, the verifier) reads the word plainly; the mutator's own
+///   reads are plain too (it is the only writer).
 #[repr(C)]
 pub struct Header {
     pub shape: u64,

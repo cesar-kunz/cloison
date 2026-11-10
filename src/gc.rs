@@ -1287,9 +1287,11 @@ impl Marking<'_> {
                 let (p, from) = ring[head];
                 head = (head + 1) % RING;
                 len -= 1;
-                // (Acquire: an old object's shape may be new, the mutator
-                // storing it after `Vm::add_shape`'s fence; its fields are
-                // read through `w` by `mark_object_shape`.)
+                // The header word, read once (Acquire) and passed down:
+                // the mutator may be giving an old object a shape, a new
+                // one maybe, while the marker thread runs this (see "The
+                // header word" at `layout::Header`). What follows works
+                // from `w` alone, never reading the word again.
                 let w = (*(p as *const std::sync::atomic::AtomicU64)).load(std::sync::atomic::Ordering::Acquire);
                 let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                 if from == 0 {
@@ -1304,21 +1306,21 @@ impl Marking<'_> {
                     if self.mode.shapes {
                         mark_object_shape(self, w, epoch);
                     }
-                    let size = cell_size(p as *const u8);
+                    let size = crate::heap::cell_size_with(p as *const u8, w);
                     *crate::heap::meta(last_granule(p, size)) |= END;
                     self.marked += size;
                     n += 1;
                 }
                 if slots > SLICE_SLOTS {
                     let to = (from + SLICE_SLOTS).min(slots);
-                    if R { trace(&mut Rec(self), p, p + 8 + 8 * from, p + 8 + 8 * to) } else { trace(self, p, p + 8 + 8 * from, p + 8 + 8 * to) };
+                    if R { trace_with(&mut Rec(self), p, w, p + 8 + 8 * from, p + 8 + 8 * to) } else { trace_with(self, p, w, p + 8 + 8 * from, p + 8 + 8 * to) };
                     if to < slots {
                         self.stack.push(to);
                         self.stack.push(p | 1);
                     }
                     work += SLICE_SLOTS / 32;
                 } else {
-                    if R { trace(&mut Rec(self), p, 0, usize::MAX) } else { trace(self, p, 0, usize::MAX) };
+                    if R { trace_with(&mut Rec(self), p, w, 0, usize::MAX) } else { trace_with(self, p, w, 0, usize::MAX) };
                     work += 1;
                 }
                 if work >= 256 {
@@ -1596,14 +1598,28 @@ fn bad_size(p: usize, size: usize) -> ! {
 }
 
 /// Visit what the cell at `p` refers to from its words in `lo..hi` (see
-/// "Cells" in `docs/gc.md`).
+/// "Cells" in `docs/gc.md`), reading its header word: for the loops that
+/// run with the mutator stopped. The marker thread's loop reads the word
+/// once and calls [`trace_with`].
 ///
 /// # Safety
 /// `p` must be a cell.
+#[inline(always)]
 unsafe fn trace(v: &mut impl Visit, p: usize, lo: usize, hi: usize) {
+    unsafe { trace_with(v, p, *(p as *const u64), lo, hi) }
+}
+
+/// [`trace`] of the cell at `p` whose header word the caller read as `w`,
+/// which it doesn't read again: on the marker thread, the mutator may
+/// change it meanwhile (see "The header word" at `layout::Header`). Of an
+/// object it reads the class and the in-object capacity, which nothing
+/// changes once it is allocated.
+///
+/// # Safety
+/// `p` must be a cell, `w` its header word.
+unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize) {
     let within = |a: usize| (lo..hi).contains(&a);
     unsafe {
-        let w = *(p as *const u64);
         if w & 1 != 0 {
             match w & 7 {
                 VALUES => {

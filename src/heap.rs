@@ -1155,8 +1155,25 @@ pub fn object_bytes(words: usize) -> usize {
 /// # Safety
 /// `p` must be a cell, its header written.
 pub unsafe fn cell_size(p: *const u8) -> usize {
+    unsafe { size_from(p, *(p as *const u64)) }
+}
+
+/// [`cell_size`] of the cell at `p` whose header word the caller read as
+/// `w`, which it doesn't read again: the marker thread's (see "The header
+/// word" at `layout::Header`). Of an object it reads the class, the
+/// in-object capacity, a string's words and a function's code, which a
+/// change of shape leaves alone.
+///
+/// # Safety
+/// `p` must be a cell, `w` its header word.
+pub unsafe fn cell_size_with(p: *const u8, w: u64) -> usize {
+    unsafe { size_from(p, w) }
+}
+
+/// [`cell_size_with`]'s body, which [`cell_size`] has its own copy of.
+#[inline(always)]
+unsafe fn size_from(p: *const u8, w: u64) -> usize {
     unsafe {
-        let w = *(p as *const u64);
         if w & 1 == 0 {
             let o = p as *const Object;
             let mut words = crate::layout::extra_words((*o).class) + Object::inline_cap(o);

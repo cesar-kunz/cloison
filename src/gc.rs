@@ -1287,7 +1287,10 @@ impl Marking<'_> {
                 let (p, from) = ring[head];
                 head = (head + 1) % RING;
                 len -= 1;
-                let w = *(p as *const u64);
+                // (Acquire: an old object's shape may be new, the mutator
+                // storing it after `Vm::add_shape`'s fence; its fields are
+                // read through `w` by `mark_object_shape`.)
+                let w = (*(p as *const std::sync::atomic::AtomicU64)).load(std::sync::atomic::Ordering::Acquire);
                 let slots = if w & 7 == VALUES { (w >> 32) as usize } else { 0 };
                 if from == 0 {
                     // (A candidate's cell traced in a pause may move: a

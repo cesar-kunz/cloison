@@ -44,7 +44,7 @@ pub struct FunctionDef {
     pub ics: Vec<std::rc::Rc<str>>,
     /// The `SetNamed` slots of object literals' properties, which define
     /// them (see `vm::Code::define_ics`).
-    pub defines: Vec<u16>,
+    pub defines: Vec<u32>,
     /// Module function index of each nested function (`CreateClosure`'s
     /// operand indexes this).
     pub closures: Vec<usize>,
@@ -360,7 +360,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                     // Keyed accesses' caches are named after no property.
                     ics.push("[]".into());
                     args.push(Arg::Index(
-                        u16::try_from(ics.len() - 1)
+                        u32::try_from(ics.len() - 1)
                             .map_err(|_| err("too many inline caches".into()))?,
                     ));
                     continue;
@@ -395,7 +395,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                         }
                         ics.push(t.into());
                         Arg::Index(
-                            u16::try_from(ics.len() - 1)
+                            u32::try_from(ics.len() - 1)
                                 .map_err(|_| err("too many inline caches".into()))?,
                         )
                     }
@@ -410,7 +410,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                                 constants.len() - 1
                             }
                         };
-                        Arg::Index(u16::try_from(i).map_err(|_| err("too many constants".into()))?)
+                        Arg::Index(u32::try_from(i).map_err(|_| err("too many constants".into()))?)
                     }
                     Operand::Fn => {
                         let f = *index
@@ -420,7 +420,7 @@ pub fn parse(src: &str) -> Result<Checked, String> {
                             closures.push(f);
                             closures.len() - 1
                         });
-                        Arg::Index(i as u16)
+                        Arg::Index(u32::try_from(i).map_err(|_| err("too many functions".into()))?)
                     }
                 };
                 args.push(arg);
@@ -555,10 +555,10 @@ pub fn verify(m: &Module) -> Result<(), String> {
             let mut vals: Vec<i64> = Vec::new();
             for &k in op.operands() {
                 let b = &code[operand..operand + k.width()];
-                let v = match k.width() {
-                    1 => b[0] as i64,
-                    2 => u16::from_le_bytes([b[0], b[1]]) as i64,
-                    _ => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
+                let v = match k {
+                    _ if k.width() == 1 => b[0] as i64,
+                    Operand::Imm | Operand::Off => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
+                    _ => u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
                 };
                 vals.push(v);
                 match k {
@@ -764,7 +764,7 @@ pub fn disassemble(m: &Module) -> String {
             let mut args = Vec::new();
             let mut at = pc + 1;
             for &k in op.operands() {
-                let u16_at = || u16::from_le_bytes([code[at], code[at + 1]]) as usize;
+                let index = || u32::from_le_bytes(code[at..at + 4].try_into().unwrap()) as usize;
                 match k {
                     Operand::Reg => args.push(format!("r{}", code[at])),
                     Operand::Count => args.push(code[at].to_string()),
@@ -774,9 +774,9 @@ pub fn disassemble(m: &Module) -> String {
                         let off = i32::from_le_bytes(code[at..at + 4].try_into().unwrap());
                         args.push(label((pc as i64 + off as i64) as usize));
                     }
-                    Operand::Ic => args.push(f.ics[u16_at()].to_string()),
-                    Operand::Fn => args.push(names[f.closures[u16_at()]].clone()),
-                    Operand::Const => args.push(f.constants[u16_at()].text()),
+                    Operand::Ic => args.push(f.ics[index()].to_string()),
+                    Operand::Fn => args.push(names[f.closures[index()]].clone()),
+                    Operand::Const => args.push(f.constants[index()].text()),
                     Operand::AutoIc => {}
                 }
                 at += k.width();
@@ -836,7 +836,7 @@ mod tests {
         // The call has an implicit cache slot.
         assert_eq!(f.ics, ["x".into(), "[]".into()]);
         assert_eq!(m.functions[m.script].closures, [1]);
-        assert_eq!(f.code[6], Op::JumpIfLessSmiLoop as u8);
+        assert_eq!(f.code[8], Op::JumpIfLessSmiLoop as u8);
     }
 
     #[test]
@@ -914,11 +914,11 @@ mod tests {
         assert!(bad(&|f| f.code = vec![Op::Ldar as u8, 9, Op::Return as u8]).contains("register"));
         // `Call r0, r0, 5`'s window past the frame.
         assert!(bad(&|f| {
-            f.code = vec![Op::Call as u8, 0, 0, 5, 0, 0, Op::Return as u8];
+            f.code = vec![Op::Call as u8, 0, 0, 5, 0, 0, 0, 0, Op::Return as u8];
             f.ics.push("".into());
         })
         .contains("register"));
-        assert!(bad(&|f| f.code = vec![Op::LdaConstant as u8, 0, 0, Op::Return as u8]).contains("constant"));
+        assert!(bad(&|f| f.code = vec![Op::LdaConstant as u8, 0, 0, 0, 0, Op::Return as u8]).contains("constant"));
         assert!(bad(&|f| f.code = vec![Op::TestNullJumpIfTrue as u8, Op::Return as u8]).contains("its jump"));
         // A superinstruction's operands are checked as its first
         // instruction's: no upvalue 0 here.
@@ -939,7 +939,7 @@ mod tests {
         }
         assert!(bad(&|f| {
             f.nregs = 4;
-            f.code = vec![Op::CallApplyArguments as u8, 1, 1, 0, 0, 0, Op::Return as u8];
+            f.code = vec![Op::CallApplyArguments as u8, 1, 1, 0, 0, 0, 0, 0, Op::Return as u8];
             f.ics.push("".into());
         })
         .contains("outside a function"));
@@ -947,7 +947,7 @@ mod tests {
         // cached shape as a transition.
         assert!(bad(&|f| {
             f.nregs = 2;
-            f.code = vec![Op::CreateObject as u8, 0, 0, 0, Op::Star as u8, 1, Op::SetNamed as u8, 1, 0, 0, Op::Return as u8];
+            f.code = vec![Op::CreateObject as u8, 0, 0, 0, 0, 0, Op::Star as u8, 1, Op::SetNamed as u8, 1, 0, 0, 0, 0, Op::Return as u8];
             f.ics.push("x".into());
         })
         .contains("another instruction's"));
@@ -961,7 +961,7 @@ mod tests {
         assert!(bad(&|f| f.code = vec![Op::LdaHole as u8, Op::ToNumber as u8, Op::Return as u8]).contains("front end's only"));
         // (A global scope's binding the module doesn't declare.)
         assert!(bad(&|f| {
-            f.code = vec![Op::LdaUndefined as u8, Op::InitGlobal as u8, 0, 0, Op::Return as u8];
+            f.code = vec![Op::LdaUndefined as u8, Op::InitGlobal as u8, 0, 0, 0, 0, Op::Return as u8];
             f.ics.push("x".into());
         })
         .contains("front end's only"));

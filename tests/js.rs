@@ -15690,6 +15690,60 @@ var d = Function("return function* (" + ps.join(",") + ",p0) { arguments[130] = 
     assert_eq!(value(src), "xyz xw q");
 }
 
+/// A named function expression's own name, shadowed by a parameter, a
+/// `var`, a function declaration or (named `arguments`) the `arguments`
+/// object, is not the binding: those are the function's own (ECMA-262
+/// InstantiateOrdinaryFunctionExpression puts the name in an environment
+/// around them). Its scope object's layout left a generator's parameter
+/// of the name out by its spelling, so the mapping to it was lost at the
+/// first `yield`; and a function named `arguments` had its `arguments`
+/// overwritten with itself. Both ways across `yield` and `await`: in
+/// generators, async functions and async generators, with a direct
+/// `eval`, duplicate parameters, a computed method name. What
+/// SpiderMonkey and QuickJS give (JavaScriptCore keeps the function
+/// declaration's value in the case `t8`).
+#[test]
+fn a_parameter_shadowing_a_function_expressions_name_stays_mapped() {
+    let src = r#"
+var out = [];
+var g1 = function* f(f) { var a = arguments; yield a; yield f; };
+var i1 = g1(1); i1.next().value[0] = 2; out.push(i1.next().value);
+var g2 = function* f(f) { var a = arguments; yield a; f = 5; yield a[0]; };
+var i2 = g2(1); i2.next(); out.push(i2.next().value);
+var g5 = function* f(f) { eval(""); var a = arguments; yield a; yield f; };
+var i5 = g5(1); i5.next().value[0] = 6; out.push(i5.next().value);
+var g6 = function* f(f, f) { var a = arguments; yield a; yield f; };
+var i6 = g6(1, 2); var a6 = i6.next().value; a6[1] = 7; a6[0] = 8; out.push(i6.next().value);
+var g7 = function* f(f) { var f; var a = arguments; yield a; yield f; };
+var i7 = g7(1); i7.next().value[0] = 10; out.push(i7.next().value);
+var g8 = function* f(f) { function f() {} var a = arguments; yield a; yield typeof f; };
+var i8 = g8(1); i8.next().value[0] = 11; out.push(i8.next().value);
+var g9 = function* arguments(x) { yield arguments; yield x; };
+var i9 = g9(1); i9.next().value[0] = 12; out.push(i9.next().value);
+var o = { *["m" + 1](m1) { var a = arguments; yield a; yield m1; } };
+var i10 = o.m1(1); i10.next().value[0] = 13; out.push(i10.next().value);
+var g11 = function* f(x) { yield typeof f; f = 1; yield typeof f; };
+var i11 = g11(1); out.push(i11.next().value, i11.next().value);
+out.push((function arguments(x) { return typeof arguments; })(1));
+out.push((function arguments(x) { arguments[0] = 2; var k = () => x; return k(); })(1));
+out.push((function f(f) { var k = () => f; function f() {} arguments[0] = 11; return typeof k(); })(1));
+out.push((function f(f) { eval("f = 4"); return arguments[0]; })(1));
+out.join(" ")
+"#;
+    assert_eq!(value(src), "2 5 6 7 10 number 12 13 function function object 2 number 4");
+    let src = r#"
+var log = [];
+var h = async function f(f) { var a = arguments; await 0; a[0] = 3; await 0; return f; };
+var h2 = async function* f(f) { var a = arguments; yield 0; f = 9; yield a[0]; };
+var i = h2(1);
+var o = { async *["c" + "m"](cm) { var a = arguments; yield 0; cm = 6; yield a[0]; } };
+var j = o.cm(1);
+Promise.all([h(1), i.next().then(function () { return i.next(); }), j.next().then(function () { return j.next(); })])
+  .then(function (v) { globalThis.out = [v[0], v[1].value, v[2].value].join(" "); });
+"#;
+    assert_eq!(out_after_jobs(src), "3 9 6");
+}
+
 /// A compound assignment's converted object key outlives a collection in
 /// its right side: `Vm::key_cache` kept the key string `GetKeyed` made for
 /// the `SetKeyed` to reuse, but no collection marked it, so the store went

@@ -1824,6 +1824,9 @@ struct Shared {
     wake: std::sync::Condvar,
     /// Asked to stop at the next check (the mutator wants a pause).
     pause: std::sync::atomic::AtomicBool,
+    /// Panic before tracing the next work (for the tests: #224).
+    #[cfg(test)]
+    fail: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -1859,6 +1862,9 @@ struct MarkerState {
     emptied: Vec<usize>,
     /// Sweeping right now.
     sweeping: bool,
+    /// What the marker thread panicked with: it is gone, the mutator's
+    /// next pause panics with it (#224).
+    panicked: Option<String>,
 }
 
 impl Marker {
@@ -1867,6 +1873,8 @@ impl Marker {
             state: Default::default(),
             wake: std::sync::Condvar::new(),
             pause: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail: Default::default(),
         });
         let s = shared.clone();
         let thread = std::thread::Builder::new()
@@ -1886,6 +1894,14 @@ impl Marker {
         let mut st = sh.state.lock().unwrap();
         while st.busy || st.sweeping {
             st = sh.wake.wait(st).unwrap();
+        }
+        // (Not again while unwinding from it: a run's end pauses too. The
+        // lock let go first, not to poison it.)
+        if let Some(e) = st.panicked.clone()
+            && !std::thread::panicking()
+        {
+            drop(st);
+            panic!("the marker thread panicked: {e}");
         }
     }
 
@@ -1931,7 +1947,27 @@ impl Drop for Marker {
     }
 }
 
+/// The marker thread: a panic in it (a bug) is recorded, and the mutator
+/// woken, which then panics with it, rather than left waiting for good
+/// for a marker that was busy (release builds abort: #224).
 fn marker_loop(sh: &Shared) {
+    let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| marker_work(sh))) else { return };
+    let e = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned());
+    let mut st = sh.state.lock().unwrap_or_else(|e| e.into_inner());
+    let marking = st.busy;
+    st.busy = false;
+    st.sweeping = false;
+    st.panicked = Some(e.unwrap_or_else(|| "a panic".into()));
+    if marking && !sh.pause.load(std::sync::atomic::Ordering::Relaxed) {
+        // As when out of work: the mutator's next safepoint pauses it.
+        st.run = false;
+        st.done = true;
+        unsafe { (*(st.request as *const std::sync::atomic::AtomicBool)).store(true, std::sync::atomic::Ordering::Relaxed) };
+    }
+    sh.wake.notify_all();
+}
+
+fn marker_work(sh: &Shared) {
     use std::sync::atomic::Ordering::Relaxed;
     let mut stack = Vec::new();
     let mut shade = Vec::new();
@@ -1989,6 +2025,10 @@ fn marker_loop(sh: &Shared) {
             cand,
             rec: Vec::new(),
         };
+        #[cfg(test)]
+        if sh.fail.load(Relaxed) {
+            panic!("a marker panic for the tests");
+        }
         unsafe { m.drain(&|| sh.pause.load(Relaxed)) };
         let marked = m.marked;
         let mut rec = std::mem::take(&mut m.rec);
@@ -4802,6 +4842,26 @@ mod tests {
             unsafe { sweep_block(start, 1, false) };
         });
     }
+
+    /// A panic on the marker thread, tracing, wakes the mutator, which
+    /// panics with it at its next pause rather than wait for good (#224).
+    #[test]
+    fn a_marker_panic_panics_the_mutator() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let mk = Marker::start();
+        mk.shared.fail.store(true, Relaxed);
+        let requested = AtomicBool::new(false);
+        mk.resume(&mut vec![0], &requested as *const AtomicBool as usize);
+        let t0 = Instant::now();
+        while !requested.load(Relaxed) {
+            assert!(t0.elapsed() < Duration::from_secs(60), "the marker never asked for a pause");
+            std::thread::yield_now();
+        }
+        let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| mk.pause())).unwrap_err();
+        let e = e.downcast_ref::<String>().unwrap();
+        assert_eq!(e, "the marker thread panicked: a marker panic for the tests");
+    }
+
     use std::time::{Duration, Instant};
 
     fn policy_with(interval_ms: u64, spacing: u32) -> Policy {

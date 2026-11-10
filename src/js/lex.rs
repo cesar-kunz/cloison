@@ -147,55 +147,75 @@ pub fn has_lone_surrogate(s: &str) -> bool {
     false
 }
 
-/// Source code as the front end lexes it: its code units as
-/// [`units_to_string`] has them, so a lone surrogate (`eval`'s source is
-/// a string's) is a code unit of its own, in a string, template or
-/// regular expression literal as it is (see [`LONE_SURROGATES`]). A
-/// file's text is made one with [`Source::from_text`] (its characters an
-/// [`ESCAPE`] precedes given theirs), a string's with
-/// [`Source::from_units`]; the entry points taking a `&str` take text.
+/// Source code as the front end lexes it: a file's text as it is
+/// ([`Source::from_text`], its offsets the text's), or a string's code
+/// units ([`Source::from_units`]: `eval`'s, `Function`'s) as
+/// [`units_to_string`] has them, so that a lone surrogate is a code unit
+/// of its own, in a string, template or regular expression literal as it
+/// is (see [`LONE_SURROGATES`]). The entry points taking a `&str` take
+/// text.
 #[derive(Clone, Debug)]
-pub struct Source<'a>(std::borrow::Cow<'a, str>);
+pub struct Source<'a> {
+    s: std::borrow::Cow<'a, str>,
+    /// A string's code units (else a file's text).
+    units: bool,
+}
 
 impl<'a> Source<'a> {
-    /// A file's text `s` as source code.
+    /// A file's text `s` as source code (at its offsets).
     pub fn from_text(s: &'a str) -> Source<'a> {
-        // (Characters to escape start with byte 0xEF or more.)
-        if !s.bytes().any(|c| c >= 0xEF) || !s.chars().any(|c| escaped(c as u32)) {
-            return Source(std::borrow::Cow::Borrowed(s));
-        }
-        let mut out = String::with_capacity(s.len() + 16);
-        s.chars().for_each(|c| push_source_char(&mut out, c));
-        Source(std::borrow::Cow::Owned(out))
+        Source { s: std::borrow::Cow::Borrowed(s), units: false }
     }
 
     /// A string's code units as source code.
     pub fn from_units(units: &[u16]) -> Source<'static> {
-        Source(std::borrow::Cow::Owned(units_to_string(units)))
+        Source { s: std::borrow::Cow::Owned(units_to_string(units)), units: true }
     }
 
-    /// Text already in the form (a piece of a `Source`'s, or ASCII).
-    pub(crate) fn encoded(s: &'a str) -> Source<'a> {
-        Source(std::borrow::Cow::Borrowed(s))
+    /// Code units as [`units_to_string`] has them (a piece of a string's
+    /// source code, as `asm::LazyFn::source` keeps it), as source code.
+    pub(crate) fn of_unit_string(s: &'a str) -> Source<'a> {
+        Source { s: std::borrow::Cow::Borrowed(s), units: true }
     }
 
-    /// The source code in its form (not a file's text: see [`Source`]).
+    /// The source code: a file's text, or a string's code units as
+    /// [`units_to_string`] has them (see [`Source::is_units`]).
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.s
     }
 
-    /// Offset `pos` of the source code in the text it was made of (with
-    /// [`Source::from_text`]): less the [`ESCAPE`]s put before it.
-    pub fn text_offset(&self, pos: usize) -> usize {
-        pos - escapes_before(&self.0, pos) * ESCAPE_LEN
+    /// Whether it is a string's code units (not a file's text).
+    pub fn is_units(&self) -> bool {
+        self.units
+    }
+
+    /// Its code units as [`units_to_string`] has them, as functions keep
+    /// their source text (`asm::FunctionDef::text`, `asm::LazyFn`), and
+    /// the offset there of each of its offsets: a file's text made so if
+    /// it has characters to escape (see [`ESCAPE`]).
+    pub(crate) fn unit_string(&self) -> (std::rc::Rc<str>, Box<dyn Fn(u32) -> u32>) {
+        let s = &*self.s;
+        if self.units || !s.bytes().any(|c| c >= 0xEF) || !s.chars().any(|c| escaped(c as u32)) {
+            return (s.into(), Box::new(|pos| pos));
+        }
+        // (An `ESCAPE` before each character to escape: the offsets past
+        // one that many `ESCAPE`s on.)
+        let mut out = String::with_capacity(s.len() + 16);
+        let mut at = Vec::new();
+        for (k, c) in s.char_indices() {
+            if escaped(c as u32) {
+                at.push(k as u32);
+            }
+            push_source_char(&mut out, c);
+        }
+        let len = char::from_u32(ESCAPE).unwrap().len_utf8() as u32;
+        (out.into(), Box::new(move |pos| pos + at.partition_point(|&k| k < pos) as u32 * len))
     }
 }
 
-/// The UTF-8 length of an [`ESCAPE`].
-const ESCAPE_LEN: usize = 4;
-
-/// The [`ESCAPE`]s source code `s` puts before characters up to byte
-/// `pos` (an escaped character is not one, an `ESCAPE` of the text too).
+/// The [`ESCAPE`]s string `s` (as [`units_to_string`] has it) puts before
+/// characters up to byte `pos` (an escaped character is not one, an
+/// `ESCAPE` of the string too).
 pub(crate) fn escapes_before(s: &str, pos: usize) -> usize {
     if !s.as_bytes()[..pos.min(s.len())].iter().any(|&c| c >= 0xEF) {
         return 0;
@@ -208,20 +228,22 @@ pub(crate) fn escapes_before(s: &str, pos: usize) -> usize {
     n
 }
 
-/// The source character at the start of `s` (as [`text_to_source`] has
-/// it, `s` not empty): its code units onto `out`, and its length (an
-/// [`ESCAPE`]'s and its character's).
-fn source_char(s: &str, out: &mut Vec<u16>) -> usize {
+/// The source character at the start of `s` (not empty; a string's code
+/// units as [`units_to_string`] has them if `units`, else a file's text):
+/// its code units onto `out`, and its length (an [`ESCAPE`]'s and its
+/// character's).
+fn source_char(s: &str, out: &mut Vec<u16>, units: bool) -> usize {
     let ch = s.chars().next().unwrap();
     let u = ch as u32;
-    if u == ESCAPE
+    if units
+        && u == ESCAPE
         && let Some(next) = s[ch.len_utf8()..].chars().next()
     {
         let mut b = [0; 2];
         out.extend_from_slice(next.encode_utf16(&mut b));
         return ch.len_utf8() + next.len_utf8();
     }
-    if mapped(u) {
+    if units && mapped(u) {
         out.push((u - LONE_SURROGATES + 0xD800) as u16);
     } else {
         let mut b = [0; 2];
@@ -230,11 +252,21 @@ fn source_char(s: &str, out: &mut Vec<u16>) -> usize {
     ch.len_utf8()
 }
 
+/// Text `s` of source code (a string's code units if `units`, see
+/// [`source_char`]) as [`units_to_string`] has it, onto `out`.
+fn push_source_text(out: &mut String, s: &str, units: bool) {
+    if units || !s.bytes().any(|c| c >= 0xEF) {
+        out.push_str(s);
+    } else {
+        s.chars().for_each(|c| push_source_char(out, c));
+    }
+}
+
 /// The source character at the start of `s`, for a message: a lone
 /// surrogate's as `\uXXXX`.
-fn shown_char(s: &str) -> String {
+fn shown_char(s: &str, units: bool) -> String {
     let mut u = Vec::new();
-    source_char(s, &mut u);
+    source_char(s, &mut u, units);
     crate::vm::source_text(&u)
 }
 
@@ -335,36 +367,14 @@ pub fn lex(text: &str) -> Result<Vec<Token>, Error> {
 /// [`lex`]; `module`: as a module's text, where HTML-like comments are
 /// none (Annex B's are scripts' only).
 pub fn lex_as(text: &str, module: bool) -> Result<Vec<Token>, Error> {
-    let src = Source::from_text(text);
-    match lex_source(&src, module) {
-        // (Its offsets the text's: the `ESCAPE`s before each counted in
-        // one walk, the tokens in order.)
-        Ok(mut toks) if src.as_str().len() != text.len() => {
-            let s = src.as_str();
-            let (mut chars, mut n, mut after) = (s.char_indices().peekable(), 0, false);
-            for t in &mut toks {
-                while let Some(&(k, c)) = chars.peek()
-                    && k < t.pos as usize
-                {
-                    after = !after && c as u32 == ESCAPE;
-                    n += after as usize;
-                    chars.next();
-                }
-                t.pos -= (n * ESCAPE_LEN) as u32;
-            }
-            Ok(toks)
-        }
-        Ok(toks) => Ok(toks),
-        Err(mut e) => {
-            e.pos = src.text_offset(e.pos);
-            Err(e)
-        }
-    }
+    lex_source(&Source::from_text(text), module)
 }
 
 /// The tokens of source code `src` (at its offsets); `module`: as
-/// [`lex_as`]'s.
+/// [`lex_as`]'s. Strings' values (and templates', regular expressions'
+/// patterns) are as [`units_to_string`] has their code units.
 pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
+    let units = src.is_units();
     let src = src.as_str();
     let b = src.as_bytes();
     // Minified code has a token per 2 bytes or so (jQuery's 2.2), others
@@ -455,7 +465,7 @@ pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
                     Tok::Num(v)
                 }
             } else if c == b'"' || c == b'\'' {
-                let (s, n) = string(&src[i..]).ok_or_else(|| err("unterminated string"))?;
+                let (s, n) = string(&src[i..], units).ok_or_else(|| err("unterminated string"))?;
                 // (Escapes in it: then not a directive, `"use strict"`.)
                 escaped = src[i..i + n].contains('\\');
                 i += n;
@@ -467,7 +477,7 @@ pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
                 if c == b'}' {
                     braces.pop();
                 }
-                let (mut part, n) = template(&src[i + 1..]).ok_or_else(|| err("unterminated template literal"))?;
+                let (mut part, n) = template(&src[i + 1..], units).ok_or_else(|| err("unterminated template literal"))?;
                 if part.cooked.as_deref().is_some_and(too_long) || too_long(&part.raw) {
                     return Err(err("Invalid string length"));
                 }
@@ -478,7 +488,7 @@ pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
                 }
                 Tok::Template(Box::new(part))
             } else if c == b'/' && !divides(&toks, closed_expression, closed_paren) {
-                let (pattern, flags, n) = regexp(&src[i..]).ok_or_else(|| err("unterminated regular expression"))?;
+                let (pattern, flags, n) = regexp(&src[i..], units).ok_or_else(|| err("unterminated regular expression"))?;
                 i += n;
                 Tok::RegExp(Box::new((pattern, flags)))
             } else if c == b'#'
@@ -594,7 +604,7 @@ pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
                 }
                 Tok::Punct(p)
             } else {
-                let ch = shown_char(&src[i..]);
+                let ch = shown_char(&src[i..], units);
                 return Err(err(&format!("unexpected character `{ch}`")));
             };
         toks.push(Token {
@@ -674,7 +684,7 @@ fn ends_expression(t: &Tok) -> bool {
 /// A regular expression literal at the start of `s` (at its `/`): its
 /// pattern (escapes kept for the regular expression compiler), flags and
 /// length. A `/` in a class (`[/]`) doesn't end it.
-fn regexp(s: &str) -> Option<(String, String, usize)> {
+fn regexp(s: &str, units: bool) -> Option<(String, String, usize)> {
     let mut class = false;
     let mut it = s.char_indices().skip(1);
     let end = loop {
@@ -698,8 +708,10 @@ fn regexp(s: &str) -> Option<(String, String, usize)> {
         .find(|&(_, c)| !is_ident_part(c))
         .map_or(s.len() - end - 1, |(n, _)| n);
     let flags = s[end + 1..end + 1 + flags_len].to_string();
-    // (The source's text as it is: as `units_to_string` has it.)
-    Some((s[1..end].to_string(), flags, end + 1 + flags_len))
+    // (As `units_to_string` has its code units.)
+    let mut body = String::with_capacity(end);
+    push_source_text(&mut body, &s[1..end], units);
+    Some((body, flags, end + 1 + flags_len))
 }
 
 /// The word of `n` bytes at `b[i..]` as the [`KEYWORDS`] entry it is,
@@ -913,16 +925,21 @@ fn separated(s: &str) -> bool {
     !s.starts_with('_') && !s.ends_with('_') && !s.contains("__")
 }
 
-/// A string literal at the start of `s`: its value and length.
-fn string(s: &str) -> Option<(String, usize)> {
+/// A string literal at the start of `s` (source code, a string's code
+/// units if `units`: see [`Source`]): its value and length.
+fn string(s: &str, units_source: bool) -> Option<(String, usize)> {
     let b = s.as_bytes();
     let quote = b[0];
-    // Mostly no escapes: the text as is (as `units_to_string` has it, as
-    // the source is: see `text_to_source`).
+    // Mostly no escapes: the text as is (unless a file's has a character
+    // to escape, see `ESCAPE`: theirs and U+FDD0's UTF-8 start with byte
+    // 0xEF or more).
     if let Some(k) = b[1..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r')
         && b[1 + k] == quote
     {
-        return Some((s[1..1 + k].to_string(), k + 2));
+        let t = &s[1..1 + k];
+        if units_source || !(t.bytes().any(|c| c >= 0xEF) && t.chars().any(|c| escaped(c as u32))) {
+            return Some((t.to_string(), k + 2));
+        }
     }
     // With escapes: the runs between them copied at once, straight into
     // the string `units_to_string` would make of the code units (a
@@ -935,11 +952,15 @@ fn string(s: &str) -> Option<(String, usize)> {
         let k = b[i..].iter().position(|&c| c == quote || c == b'\\' || c == b'\n' || c == b'\r')?;
         if k > 0 {
             let run = &s[i..i + k];
-            // (A lone surrogate's, or an `ESCAPE`d character's, UTF-8
+            // (A lone surrogate's, or a character to escape's, UTF-8
             // starts with byte 0xEF or more: then a unit at a time.)
             if run.bytes().any(|c| c >= 0xEF) && run.chars().any(|c| escaped(c as u32)) {
                 units.clear();
-                string_units(run, &mut units);
+                if units_source {
+                    string_units(run, &mut units);
+                } else {
+                    units.extend(run.encode_utf16());
+                }
                 units.iter().for_each(|&u| push_unit(&mut out, &mut high, u));
             } else {
                 if let Some(h) = high.take() {
@@ -958,7 +979,7 @@ fn string(s: &str) -> Option<(String, usize)> {
             }
             b'\\' => {
                 units.clear();
-                let (ok, n) = escape(s, i, &mut units);
+                let (ok, n) = escape(s, i, &mut units, units_source);
                 if !ok {
                     return None;
                 }
@@ -998,8 +1019,9 @@ fn push_unit(out: &mut String, high: &mut Option<u16>, u: u16) {
 
 /// The escape sequence at `s[i..]` (at its `\`): its code units onto
 /// `out`, whether it's valid, and its length (an invalid one's up to
-/// where it goes wrong, at least 2).
-fn escape(s: &str, i: usize, out: &mut Vec<u16>) -> (bool, usize) {
+/// where it goes wrong, at least 2). `units`: `s` is a string's code
+/// units (see [`Source`]).
+fn escape(s: &str, i: usize, out: &mut Vec<u16>, units: bool) -> (bool, usize) {
     let b = s.as_bytes();
     let Some(&e) = b.get(i + 1) else {
         return (false, 1);
@@ -1075,7 +1097,7 @@ fn escape(s: &str, i: usize, out: &mut Vec<u16>) -> (bool, usize) {
             }
             // (A source character: a lone surrogate's unit, or an
             // `ESCAPE`d one's.)
-            return (true, 1 + source_char(&s[i + 1..], out));
+            return (true, 1 + source_char(&s[i + 1..], out, units));
         }
     }
     (true, 2)
@@ -1084,7 +1106,7 @@ fn escape(s: &str, i: usize, out: &mut Vec<u16>) -> (bool, usize) {
 /// A template literal's piece at the start of `s` (past its `` ` `` or
 /// `}`): the piece and its length, up to and including its `` ` `` or
 /// `${`.
-fn template(s: &str) -> Option<(TemplatePart, usize)> {
+fn template(s: &str, units_source: bool) -> Option<(TemplatePart, usize)> {
     let b = s.as_bytes();
     let mut cooked: Option<Vec<u16>> = Some(Vec::new());
     let mut raw = String::new();
@@ -1102,7 +1124,7 @@ fn template(s: &str) -> Option<(TemplatePart, usize)> {
             }
             b'\\' => {
                 let mut units = Vec::new();
-                let (ok, n) = escape(s, i, &mut units);
+                let (ok, n) = escape(s, i, &mut units, units_source);
                 // (`\0` followed by a digit, or an octal escape: invalid.)
                 let octal = b.get(i + 1).is_some_and(|d| d.is_ascii_digit())
                     && !(b[i + 1] == b'0' && !b.get(i + 2).is_some_and(|d| d.is_ascii_digit()));
@@ -1113,8 +1135,7 @@ fn template(s: &str) -> Option<(TemplatePart, usize)> {
                 }
                 let n = n.max(2).min(s.len() - i);
                 // (An escaped line break is raw `\` and `\n`.)
-                // (The source's text as it is: as `units_to_string` has it.)
-                raw.push_str(&s[i..i + n].replace("\r\n", "\n").replace('\r', "\n"));
+                push_source_text(&mut raw, &s[i..i + n].replace("\r\n", "\n").replace('\r', "\n"), units_source);
                 i += n;
             }
             b'\r' => {
@@ -1127,12 +1148,12 @@ fn template(s: &str) -> Option<(TemplatePart, usize)> {
             }
             _ => {
                 // (A source character: a lone surrogate's unit, or an
-                // `ESCAPE`d one's, raw as it is.)
+                // `ESCAPE`d one's.)
                 let n = match &mut cooked {
-                    Some(c) => source_char(&s[i..], c),
-                    None => source_char(&s[i..], &mut Vec::new()),
+                    Some(c) => source_char(&s[i..], c, units_source),
+                    None => source_char(&s[i..], &mut Vec::new(), units_source),
                 };
-                raw.push_str(&s[i..i + n]);
+                push_source_text(&mut raw, &s[i..i + n], units_source);
                 i += n;
             }
         }

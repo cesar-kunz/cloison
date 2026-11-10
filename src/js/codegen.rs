@@ -26,26 +26,23 @@ use crate::asm::{Constant, FunctionDef, LazyFn, Module};
 use crate::bytecode::{Arg, Assembler, Label, Op};
 
 /// Compile `p`, parsed from a script's or module's text `text` (with
-/// `parse::parse_source` or `parse::parse_module`); an error's offset is
-/// the text's.
+/// `parse::parse_source` or `parse::parse_module`: its offsets, and an
+/// error's, the text's).
 pub fn generate(p: &Program, text: &str) -> Result<Module, Error> {
-    let src = super::lex::Source::from_text(text);
-    generate_source(p, &src).map_err(|mut e| {
-        e.pos = src.text_offset(e.pos);
-        e
-    })
+    generate_source(p, &super::lex::Source::from_text(text))
 }
 
-/// [`generate`] of `p`, parsed from source code `src` (an error at its
-/// offset).
+/// [`generate`] of `p`, parsed from source code `src` (its offsets, and
+/// an error's, `src`'s).
 pub fn generate_source(p: &Program, src: &super::lex::Source) -> Result<Module, Error> {
-    generate_from(p, None, src.as_str()).map(|(m, _)| m)
+    generate_from(p, None, src).map(|(m, _)| m)
 }
 
 /// Compile only function `root` of `p` and leave the functions nested in
 /// it for later: each a stub ([`LazyFn`]) that compiles at its first call
-/// from its text in `source` (at the offsets `at` maps `p`'s to; source
-/// code's, `lex::Source::as_str`, as `p` was parsed from). Also
+/// from its text in `source` (at the offsets `at` maps `p`'s to), as
+/// `lex::units_to_string` has its code units (see
+/// `lex::Source::unit_string`). Also
 /// `root`'s upvalues, by name. (`eval`'s and `Function`'s code; their
 /// functions mostly are never called: CodeLoad's.)
 pub fn generate_lazy<'p>(
@@ -55,7 +52,8 @@ pub fn generate_lazy<'p>(
     at: &dyn Fn(Pos) -> Pos,
     upvalues: &'p [Rc<str>],
 ) -> Result<Module, Error> {
-    generate_from(p, Some((root, source, at, upvalues)), source).map(|(m, _)| m)
+    // (`p`'s offsets, for lines, in `source` at `at`'s: as code units.)
+    generate_from(p, Some((root, source, at, upvalues)), &super::lex::Source::of_unit_string(source)).map(|(m, _)| m)
 }
 
 /// What [`generate_lazy`] fails with when a skimmed function (see
@@ -83,15 +81,24 @@ enum Emit {
 fn generate_from<'p>(
     p: &'p Program,
     lazy: Option<(usize, &Rc<str>, &dyn Fn(Pos) -> Pos, &'p [Rc<str>])>,
-    src: &str,
+    src: &super::lex::Source,
 ) -> Result<(Module, Vec<&'p str>), Error> {
-    let position = positions(src, lazy.map(|(_, _, at, _)| at));
-    // Functions' source text (`Function.prototype.toString`).
-    let text_source: Rc<str> = match lazy {
-        Some((_, s, ..)) => s.clone(),
-        None => src.into(),
+    let position = positions(src.as_str(), lazy.map(|(_, _, at, _)| at));
+    // Functions' source text (`Function.prototype.toString`), as
+    // `lex::units_to_string` has its code units (see
+    // `lex::Source::unit_string`), and where `p`'s offsets are there.
+    let (text_source, own_at): (Rc<str>, Option<Box<dyn Fn(Pos) -> Pos>>) = match lazy {
+        Some((_, s, ..)) => (s.clone(), None),
+        None => {
+            let (s, at) = src.unit_string();
+            (s, Some(at))
+        }
     };
-    let text_at = |pos: Pos| lazy.map_or(pos, |(_, _, at, _)| at(pos));
+    let text_at = |pos: Pos| match (&own_at, lazy) {
+        (Some(at), _) => at(pos),
+        (None, Some((_, _, at, _))) => at(pos),
+        (None, None) => pos,
+    };
     let text_of = |f: &Function| {
         let (a, b) = f.text.unwrap_or((f.pos, f.end));
         Some((text_source.clone(), text_at(a), text_at(b)))

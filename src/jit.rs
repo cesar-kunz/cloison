@@ -717,7 +717,7 @@ extern "C" fn cloison_rt_delete_global(_: Value, b: Value) -> u64 {
 /// `typeof a`: a string constant (`type_of` stencils).
 extern "C" fn cloison_rt_type_of(a: Value, _: Value) -> u64 {
     let vm = unsafe { &mut *crate::interp::current_vm() };
-    vm.type_of(a).to_bits()
+    vm.type_of_own(a).to_bits()
 }
 
 /// A regular expression literal's new `RegExp`, of pattern `p` and flags

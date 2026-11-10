@@ -3192,3 +3192,19 @@ fn another_heaps_argument_call_other_panics() {
     let f = b.run(&cloison::js::compile("Object.keys").unwrap()).unwrap();
     let _ = b.call_other(f, Value::UNDEFINED, &[o]);
 }
+
+#[test]
+#[should_panic(expected = "Vm::string_units: a value not of this VM's heap")]
+fn another_heaps_string_string_units_panics() {
+    let mut a = Vm::new();
+    let b = Vm::new();
+    let s = a.new_string(&[65; 64]);
+    let _ = b.string_units(s);
+}
+
+#[test]
+#[should_panic(expected = "Vm::type_of: a value not of this VM's heap")]
+fn another_heaps_value_type_of_panics() {
+    let (_a, mut b, o) = two_vms();
+    let _ = b.type_of(o);
+}

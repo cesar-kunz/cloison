@@ -6,7 +6,7 @@
 
 use super::Error;
 use super::ast::*;
-use super::lex::{Tok, Token};
+use super::lex::{Source, Tok, Token};
 
 /// `toks`' program, its nodes in `arena` (the text of string and regular
 /// expression tokens moves to the tree).
@@ -50,7 +50,7 @@ pub fn parse_with<'a>(toks: &mut [Token], arena: &'a Arenas<'a>, skim: bool) -> 
 
 /// [`parse_with`] of source `src`, lexed again for a second pass (the
 /// first takes the strings out of its tokens).
-pub fn parse_source<'a>(src: &str, arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
+pub fn parse_source<'a>(src: &Source, arena: &'a Arenas<'a>, skim: bool) -> Result<Program<'a>, Error> {
     parse_source_as(src, arena, skim, None)
 }
 
@@ -63,18 +63,18 @@ thread_local! {
 /// the scopes of that shape, see `parse_pass`; then whether its caller
 /// has a `new.target`, and a home object, `EVAL_HOME`).
 pub fn parse_source_as<'a>(
-    src: &str,
+    src: &Source,
     arena: &'a Arenas<'a>,
     skim: bool,
     eval: Option<(bool, &str, bool, bool, bool, bool, bool)>,
 ) -> Result<Program<'a>, Error> {
-    let mut toks = super::lex::lex(src)?;
+    let mut toks = super::lex::lex_source(src, false)?;
     let lexical = has_lexical(&toks);
     let (first, table) = parse_pass(&mut toks, arena, skim && !lexical, false, None, None, eval, None)?;
     if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
         return Ok(first);
     }
-    let mut toks = super::lex::lex(src)?;
+    let mut toks = super::lex::lex_source(src, false)?;
     parse_pass(&mut toks, arena, skim, false, Some(table), Some(&first), eval, None).map(|(p, _)| p)
 }
 
@@ -82,13 +82,13 @@ pub fn parse_source_as<'a>(
 /// [`Parser::module_body`]), with the module's entries
 /// ([`Program::module`]). `id`: the module's (see `module`), which its
 /// `import()`s and `import.meta` name.
-pub fn parse_module<'a>(src: &str, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
-    let mut toks = super::lex::lex_as(src, true)?;
+pub fn parse_module<'a>(src: &Source, arena: &'a Arenas<'a>, id: i32) -> Result<Program<'a>, Error> {
+    let mut toks = super::lex::lex_source(src, true)?;
     let (first, table) = parse_pass(&mut toks, arena, false, false, None, None, None, Some(id))?;
     if table.trivial() && !first.functions.iter().any(|f| f.has_eval) {
         return Ok(first);
     }
-    let mut toks = super::lex::lex_as(src, true)?;
+    let mut toks = super::lex::lex_source(src, true)?;
     parse_pass(&mut toks, arena, false, false, Some(table), Some(&first), None, Some(id)).map(|(p, _)| p)
 }
 

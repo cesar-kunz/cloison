@@ -5,8 +5,8 @@
 
 use crate::interp::{call_function, to_string_units};
 use crate::js::ast::{
-    EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_NEW_TARGET, EVAL_STRICT,
-    EVAL_THIS,
+    EVAL_ARGS, EVAL_BLOCK_SCOPED, EVAL_BOXED, EVAL_CATCH, EVAL_CONST, EVAL_HOME, EVAL_IMPORT, EVAL_LIVE_THIS, EVAL_NEW_TARGET,
+    EVAL_STRICT, EVAL_THIS,
 };
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::Desc;
@@ -827,6 +827,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     let this = a[3];
     let flags = a[4].as_number().unwrap_or(0.0) as u8;
     let (strict, new_target, home) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0, flags & EVAL_HOME != 0);
+    let live_this = flags & EVAL_LIVE_THIS != 0;
     let src = match eval_source(vm, a, flags)? {
         ControlFlow::Break(r) => return Ok(r),
         ControlFlow::Continue(src) => src,
@@ -841,7 +842,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     // block-scoped bindings, not as a `with`'s: see `parse_pass`.)
     let decl = a[6];
     let global = decl == object_value(vm.global);
-    let place = crate::vm::EvalPlace::Direct { strict, new_target, chain, global, home };
+    let place = crate::vm::EvalPlace::Direct { strict, new_target, chain, global, home, live_this };
     let hash = Vm::eval_hash(u, place);
     // (`kept`: its caches stay when it has run.)
     let (code, own_strict, declared, annex_b, kept) = match vm.cached_eval(u, place, hash) {
@@ -849,7 +850,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
         None => {
             let source: Box<[u16]> = u.into();
             let text = crate::vm::source_text(u);
-            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, &chain.text(), global, &[]).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, live_this, &chain.text(), global, &[]).map_err(eval_error)?;
             let annex_b: std::rc::Rc<[crate::object::Atom]> = module.annex_b.iter().map(|n| vm.intern_name(n)).collect();
             // Strict code's `var`s are its own: in a scope object of its own.
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
@@ -954,6 +955,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let this = a[3];
     let flags = a[4].as_number().unwrap_or(0.0) as u8;
     let (strict, new_target, home) = (flags & EVAL_STRICT != 0, flags & EVAL_NEW_TARGET != 0, flags & EVAL_HOME != 0);
+    let live_this = flags & EVAL_LIVE_THIS != 0;
     let src = match eval_source(vm, a, flags)? {
         ControlFlow::Break(r) => return Ok(r),
         ControlFlow::Continue(src) => src,
@@ -982,7 +984,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                     None => ("%none".into(), 0, "".into(), 0),
                 })
                 .collect();
-            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, &chain.text(), false, &bound).map_err(eval_error)?;
+            let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, live_this, &chain.text(), false, &bound).map_err(eval_error)?;
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
             // (Not Annex B's `var` of a function in a block by a
             // block-scoped binding's name, but a catch parameter's: see
@@ -1827,7 +1829,10 @@ fn import_value(vm: &mut Vm, name: Value, holder: Value, key: Option<Key>) -> Re
 }
 
 fn uninitialized(name: Value) -> Error {
-    Error::reference_error(format!("Cannot access '{}' before initialization", crate::vm::shown(name)))
+    // (A derived class's constructor's `this` binding, before `super()`.)
+    let name = crate::vm::shown(name);
+    let name = if name == "%this" { "this".to_string() } else { name };
+    Error::reference_error(format!("Cannot access '{name}' before initialization"))
 }
 
 /// A direct `eval`'s binding's getter: its variable's value (a

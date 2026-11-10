@@ -249,8 +249,18 @@ fn prune(vm: &mut Vm) -> Result<()> {
 /// to it the VM takes over, even if this fails (#225).
 pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<Value> {
     // (Before `b` is among the blocks: no buffer on it is in the set yet.
-    // Once it is, a failure leaves it to the next pruning.)
-    if let Err(e) = prune(vm) {
+    // The sets made first too: once `b` is among the blocks, a failure
+    // leaves it to the next pruning, which needs `live`.)
+    let made = prune(vm).and_then(|()| {
+        if vm.shared.live.is_null() {
+            vm.shared.live = crate::collections::new_weak_set(vm)?;
+        }
+        if growable && vm.shared.growing.is_null() {
+            vm.shared.growing = crate::collections::new_weak_set(vm)?;
+        }
+        Ok(())
+    });
+    if let Err(e) = made {
         release(b);
         return Err(e);
     }
@@ -262,9 +272,6 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
         s.external_at = (2 * s.external).max(EXTERNAL_MIN);
         vm.heap.gc.external_full = true;
         vm.heap.requested.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-    if vm.shared.live.is_null() {
-        vm.shared.live = crate::collections::new_weak_set(vm)?;
     }
     let proto = object_value(vm.shared.prototype);
     let o = vm.new_object_with(Class::SharedArrayBuffer, proto, 0);
@@ -281,9 +288,6 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
     let live = vm.shared.live;
     crate::collections::weak_set_insert(vm, live, object_value(o))?;
     if growable {
-        if vm.shared.growing.is_null() {
-            vm.shared.growing = crate::collections::new_weak_set(vm)?;
-        }
         let growing = vm.shared.growing;
         crate::collections::weak_set_insert(vm, growing, object_value(o))?;
     }

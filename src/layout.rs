@@ -14,7 +14,7 @@
 //! `unsafe`, its contract that the pointer is to a live cell (or table)
 //! of the kind it names.
 
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use crate::value::Value;
 
@@ -602,6 +602,70 @@ pub const SLICE: usize = 32 << 30;
 #[inline(always)]
 pub fn meta(a: usize) -> *mut u8 {
     (SIDE + a / GRANULE) as *mut u8
+}
+
+// The metadata is written by both threads while both read it: the
+// mutator writes `YOUNG` into the bytes of the cells it allocates, the
+// marker an old cell's color and `END`, and the sweeper clears the dead
+// cells'; the barrier, allocation and the walks of the blocks read them
+// meanwhile. So outside a pause each access of a byte is a Relaxed
+// atomic one, a plain byte load or store on both targets ([`meta_load`],
+// [`meta_store`]), and the scans that read eight granules' bytes at a
+// time read each of them whole ([`meta_word`]).
+
+/// The metadata byte of the granule at `a`, with a Relaxed atomic load.
+///
+/// # Safety
+/// The granule's metadata must be mapped (`a` in a heap).
+#[inline(always)]
+pub unsafe fn meta_load(a: usize) -> u8 {
+    unsafe { AtomicU8::from_ptr(meta(a)).load(Relaxed) }
+}
+
+/// Store `b` as the metadata byte of the granule at `a`, with a Relaxed
+/// atomic store.
+///
+/// # Safety
+/// The granule's metadata must be mapped (`a` in a heap).
+#[inline(always)]
+pub unsafe fn meta_store(a: usize, b: u8) {
+    unsafe { AtomicU8::from_ptr(meta(a)).store(b, Relaxed) }
+}
+
+/// The metadata bytes of the eight granules from `a`, the first's the
+/// lowest, each read whole: one unaligned 64-bit load, in asm. Its effect
+/// is that of eight Relaxed byte loads, each byte of a load being
+/// single-copy atomic on both processors, aligned or not, and a scan
+/// needs no more (the bytes are independent). Rust has no unaligned
+/// atomic load, and an aligned one (or two making up an unaligned one)
+/// puts a few cycles more on a scan's path from a cell to the next: Splay
+/// swept 70% slower, and allocation's `next_hole` likewise.
+///
+/// # Safety
+/// The eight granules' metadata must be mapped (in one block, say).
+#[inline(always)]
+pub unsafe fn meta_word(a: usize) -> u64 {
+    let p = meta(a);
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let w: u64;
+        core::arch::asm!("mov {w}, qword ptr [{p}]", w = out(reg) w, p = in(reg) p, options(pure, readonly, nostack, preserves_flags));
+        w
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let w: u64;
+        core::arch::asm!("ldr {w}, [{p}]", w = out(reg) w, p = in(reg) p, options(pure, readonly, nostack, preserves_flags));
+        w
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe {
+        let mut w = 0;
+        for k in 0..8 {
+            w |= (AtomicU8::from_ptr(p.add(k)).load(Relaxed) as u64) << (8 * k);
+        }
+        w
+    }
 }
 
 /// The card byte of address `a` (in a heap).

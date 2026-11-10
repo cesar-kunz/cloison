@@ -2849,7 +2849,7 @@ impl Vm {
     #[cold]
     #[inline(never)]
     pub(crate) fn int_fields_to_doubles(&mut self) {
-        use crate::heap::{cell_size, meta, COLOR, GRANULE, YOUNG};
+        use crate::heap::{cell_size, meta_load, meta_word, COLOR, GRANULE, YOUNG};
         if self.int_fields.is_empty() {
             return;
         }
@@ -2896,15 +2896,13 @@ impl Vm {
         for (start, end) in self.heap.block_ranges() {
             let mut p = start;
             while p < end {
-                if unsafe { *meta(p) } & (YOUNG | COLOR) == 0 {
+                if unsafe { meta_load(p) } & (YOUNG | COLOR) == 0 {
                     // Free space: eight granules at a time while their
-                    // metadata is all 0.
-                    while p + 8 * GRANULE <= end
-                        && unsafe { (meta(p) as *const u64).read_unaligned() } == 0
-                    {
+                    // metadata is all 0. (The marker may be marking.)
+                    while p + 8 * GRANULE <= end && unsafe { meta_word(p) } == 0 {
                         p += 8 * GRANULE;
                     }
-                    if p < end && unsafe { *meta(p) } & (YOUNG | COLOR) == 0 {
+                    if p < end && unsafe { meta_load(p) } & (YOUNG | COLOR) == 0 {
                         p += GRANULE;
                     }
                     continue;

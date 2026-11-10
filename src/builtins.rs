@@ -963,9 +963,9 @@ pub(crate) fn async_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<
 fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
     let mut params = Vec::new();
     for &p in a.iter().take(a.len().saturating_sub(1)) {
-        params.push(crate::vm::source_text(&units(p)));
+        params.push(crate::js::lex::units_to_string(&units(p)));
     }
-    let body = a.last().map_or(String::new(), |&b| crate::vm::source_text(&units(b)));
+    let body = a.last().map_or(String::new(), |&b| crate::js::lex::units_to_string(&units(b)));
     let params = params.join(",");
     // The parameters and the body each as such (CreateDynamicFunction
     // parses them apart), not ending the function early.
@@ -1010,7 +1010,7 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
             let src = if units.iter().all(|&c| c < 0x80) {
                 String::from_utf8(units.iter().map(|&c| c as u8).collect()).unwrap()
             } else {
-                crate::vm::source_text(&units)
+                crate::js::lex::units_to_string(&units)
             };
             let compile = if strict { crate::js::compile_strict_eval } else { crate::js::compile_indirect_eval };
             let module = compile(&src).map_err(crate::intrinsics::eval_error)?;
@@ -1046,7 +1046,7 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
 /// `$262.evalScript(src)`: `src` run as a script of its own.
 fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = arg(a, 0);
-    let src = crate::vm::source_text(string_units(x).unwrap_or(&[]));
+    let src = crate::js::lex::units_to_string(string_units(x).unwrap_or(&[]));
     let module = crate::js::compile_script_lazy(&src).map_err(|e| Error(format!("SyntaxError: {e}"), None))?;
     vm.declare_script(&module)?;
     let code = vm.load(module);

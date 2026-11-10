@@ -89,12 +89,12 @@ fn evaluate(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let Some(units) = string_units(arg(a, 0)) else {
         return Err(Error::type_error("ShadowRealm.prototype.evaluate requires a string"));
     };
-    let src = crate::vm::source_text(units);
+    let src = crate::js::lex::units_to_string(units);
     // An indirect `eval`'s code (its lexical declarations its own). A
     // syntax error, any (the functions' bodies parsed too), is the
     // caller's.
     let syntax = |e: String| Error(format!("SyntaxError: {e}"), None);
-    crate::js::parse(&src).map_err(|e| syntax(e.display(&src)))?;
+    crate::js::check_source(&src).map_err(|e| syntax(e.display(&src)))?;
     let module = crate::js::compile_indirect_eval(&src).map_err(syntax)?;
     let out = crate::realm::run_in(vm, r, |vm| {
         vm.global_declarations(&module, true)?;

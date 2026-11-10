@@ -3679,7 +3679,7 @@ impl Vm {
     // ---- Inline-cache misses ----
 
     /// `GetNamed` miss: look `obj.name` up and cache how, if possible.
-    pub fn get_named_miss(&mut self, code: &Code, ic: u32, obj: Value) -> Result<Value> {
+    pub(crate) fn get_named_miss(&mut self, code: &Code, ic: u32, obj: Value) -> Result<Value> {
         code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         let (ic, name) = code.ic(ic);
         if !obj.is_cell() {
@@ -3758,7 +3758,7 @@ impl Vm {
     }
 
     /// `SetNamed` miss: store `obj.name = value` and cache how, if possible.
-    pub fn set_named_miss(&mut self, code: &Code, k: u32, obj: Value, value: Value) -> Result<()> {
+    pub(crate) fn set_named_miss(&mut self, code: &Code, k: u32, obj: Value, value: Value) -> Result<()> {
         let (ic, name) = code.ic(k);
         // (Not a miss where the cache has the transition, out of line, and
         // only the object's `props` had no room: the store grows them. As
@@ -4151,7 +4151,7 @@ impl Vm {
 
     /// `StaGlobal` miss (sloppy mode: creates the global if missing). Only
     /// stores to existing globals are cached.
-    pub fn set_global_miss(&mut self, code: &Code, ic: u32, value: Value) -> Result<()> {
+    pub(crate) fn set_global_miss(&mut self, code: &Code, ic: u32, value: Value) -> Result<()> {
         if let Some(r) = self.set_global_lexical(code, ic, value) {
             return r;
         }

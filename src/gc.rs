@@ -397,7 +397,7 @@ impl Gc {
 impl Heap {
     /// Whether the cell `v` is young.
     #[inline(always)]
-    pub fn is_young(&self, v: Value) -> bool {
+    pub(crate) fn is_young(&self, v: Value) -> bool {
         v.is_cell() && unsafe { *self.meta(v.to_bits() as usize) } == YOUNG
     }
 
@@ -406,7 +406,7 @@ impl Heap {
     /// is a root of the next collection (minor ones don't enumerate those
     /// structures).
     #[inline(always)]
-    pub fn note(&mut self, v: Value) {
+    pub(crate) fn note(&mut self, v: Value) {
         // (Prototype caches note the same holder over and over: TypeScript
         // logged 386,000 cells for 31,000 between two collections.)
         let a = v.to_bits() as usize;
@@ -419,7 +419,7 @@ impl Heap {
     /// full collections enumerate (a call cache): what it holds at the
     /// next collection is a root of it.
     #[inline]
-    pub fn note_slot(&mut self, slot: *const *mut Object) {
+    pub(crate) fn note_slot(&mut self, slot: *const *mut Object) {
         let s = &mut self.gc.log_slots;
         // Full: without its repeats before it grows. (A call site turning
         // between young callees logs its ways at every turn: interpreted,
@@ -442,7 +442,7 @@ impl Heap {
     /// A Rust structure about to be made refers to the cell at or around
     /// address `a`: compiled code embedding it, a call site caching it. A
     /// root until [`Heap::kept_since`] gives it to that structure.
-    pub fn keep(&mut self, a: usize) {
+    pub(crate) fn keep(&mut self, a: usize) {
         // (Only an address in a cell: what isn't one marks nothing, and
         // needn't be listed.)
         if self.contains(a) && self.gc.pending_kept.last() != Some(&a) && self.cell_containing(a).is_some() {

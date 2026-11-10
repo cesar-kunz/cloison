@@ -1278,65 +1278,120 @@ fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
 }
 
 /// Whether function `f`'s code may see its `arguments` and parameters
-/// aliased (a mapped `arguments` object is slower): it assigns a
+/// aliased (a mapped `arguments` object is slower): it stores a
 /// parameter, or an element of `arguments` (or deletes or defines one),
 /// or lets `arguments` go anywhere: to a variable, a call (`apply`'s too,
 /// which may be any function's own), a return. Arrows in it too, whose
-/// `arguments` is its.
+/// `arguments` is its. Every place a target is goes through
+/// [`target_aliases`].
 fn aliases_arguments(p: &Program, f: &Function) -> bool {
-    fn is_args(e: &Expr) -> bool {
-        matches!(&e.kind, ExprKind::Ident(n) if &**n == "arguments")
-    }
-    fn expr(e: &Expr, p: &Program, f: &Function) -> bool {
-        use ExprKind::*;
-        let param = |t: &Expr| matches!(&t.kind, Ident(n) if f.params.contains(n));
-        let element = |t: &Expr| matches!(&t.kind, Index(o, _) | Member(o, _) if is_args(o));
-        let sub = || {
-            let mut sub = Vec::new();
-            children(e, &mut sub);
-            sub.into_iter().any(|x| expr(x, p, f))
-        };
-        // (Every form named: a new one that stores must be seen here.)
-        match &e.kind {
-            // (`=`, compound `op=`, `||=`, `&&=`, `??=`.)
-            Assign(_, t, v) | LogicalAssign(_, t, v) => param(t) || element(t) || expr(t, p, f) || expr(v, p, f),
-            Update(t, ..) => param(t) || element(t) || expr(t, p, f),
-            Unary(UnOp::Delete, t) if element(t) => true,
-            Call(c, args) if args.first().is_some_and(is_args) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) => true,
-            // (Patterns, and class bodies, whose computed keys aren't
-            // children: taken to store.)
-            Destructure(..) | Class(_) => true,
-            // (Reading it, or its elements, aliases nothing.)
-            Index(o, k) if is_args(o) => expr(k, p, f),
-            Member(o, _) if is_args(o) => false,
-            Ident(n) => &**n == "arguments",
-            Function(i) if p.functions[*i].arrow => {
-                let mut found = false;
-                for_each_expr(&p.functions[*i].body, &mut |e| found |= expr(e, p, f));
-                found || stores_parameter_in(p, &p.functions[*i].body, f)
-            }
-            // (Another function's code: a closure's stores are seen as
-            // captures, `Gen::maps_arguments`.)
-            Function(_) | Accessor(..) => false,
-            Num(_) | Str(_) | Bool(_) | Null | This | Hole | TemplateObject(_) | RegExp(_) | Bound => false,
-            Array(_) | Object(..) | Spread(_) | Template(..) | Await(_) | Yield(..) | SuperCall(..) | SuperMember(..)
-            | Intrinsic(..) | Member(..) | Index(..) | Call(..) | New(..) | Unary(..) | Binary(..) | Logical(..)
-            | Nullish(..) | Cond(..) | Chain(_) | Optional(_) | Comma(..) => sub(),
-        }
-    }
     let mut found = false;
-    for_each_expr(&f.body, &mut |e| found |= expr(e, p, f));
+    for_each_expr(&f.body, &mut |e| found |= alias_expr(e, p, f));
     found || stores_parameter(p, f)
 }
 
+fn is_arguments(e: &Expr) -> bool {
+    matches!(&e.kind, ExprKind::Ident(n) if &**n == "arguments")
+}
+
+/// An assignment's (or a binding's) target, for [`target_aliases`].
+#[derive(Clone, Copy)]
+enum StoreTarget<'e, 'a> {
+    /// A name bound or assigned.
+    Name(&'e str),
+    /// An expression assigned: a name, a member.
+    Expr(&'e Expr<'a>),
+    /// A pattern: its targets, defaults and computed keys.
+    Pattern(&'e Pattern<'a>),
+}
+
+/// Whether storing to target `t` in function `f` (or an arrow in it) may
+/// alias its `arguments` and parameters: a parameter's name, a member of
+/// `arguments` (any key: an element, maybe), a pattern with one of those
+/// at any depth; or an expression in the target that does
+/// ([`alias_expr`]: a key, a default, a member's object).
+fn target_aliases(t: StoreTarget, p: &Program, f: &Function) -> bool {
+    let param = |n: &str| f.params.iter().any(|q| &**q == n);
+    match t {
+        StoreTarget::Name(n) => param(n),
+        StoreTarget::Expr(e) => {
+            let direct = match &e.kind {
+                ExprKind::Ident(n) => param(n),
+                ExprKind::Member(o, _) | ExprKind::Index(o, _) => is_arguments(o),
+                // (A member of `arguments` in parentheses or a chain is
+                // the parser's member still; anything else assigns no
+                // binding, an error at run time.)
+                _ => false,
+            };
+            direct || alias_expr(e, p, f)
+        }
+        StoreTarget::Pattern(pat) => match pat {
+            Pattern::Name(n) => param(n),
+            Pattern::Target(e) => target_aliases(StoreTarget::Expr(e), p, f),
+            Pattern::Array(es, rest) => {
+                es.iter().flatten().any(|(q, d)| {
+                    target_aliases(StoreTarget::Pattern(q), p, f) || d.is_some_and(|d| alias_expr(d, p, f))
+                }) || rest.as_ref().is_some_and(|r| target_aliases(StoreTarget::Pattern(r), p, f))
+            }
+            Pattern::Object(ps, rest) => {
+                ps.iter().any(|(k, q, d)| {
+                    matches!(k, PatKey::Computed(k) if alias_expr(k, p, f))
+                        || target_aliases(StoreTarget::Pattern(q), p, f)
+                        || d.is_some_and(|d| alias_expr(d, p, f))
+                }) || rest.as_ref().is_some_and(|r| target_aliases(StoreTarget::Pattern(r), p, f))
+            }
+        },
+    }
+}
+
+/// [`aliases_arguments`] of expression `e`: its targets through
+/// [`target_aliases`], the rest read.
+fn alias_expr(e: &Expr, p: &Program, f: &Function) -> bool {
+    use ExprKind::*;
+    let element = |t: &Expr| matches!(&t.kind, Index(o, _) | Member(o, _) if is_arguments(o));
+    let sub = || {
+        let mut sub = Vec::new();
+        children(e, &mut sub);
+        sub.into_iter().any(|x| alias_expr(x, p, f))
+    };
+    // (Every form named: a new one that stores must be seen here.)
+    match &e.kind {
+        // (`=`, compound `op=`, `||=`, `&&=`, `??=`; `++`, `--`.)
+        Assign(_, t, v) | LogicalAssign(_, t, v) => target_aliases(StoreTarget::Expr(t), p, f) || alias_expr(v, p, f),
+        Update(t, ..) => target_aliases(StoreTarget::Expr(t), p, f),
+        Destructure(pat, v, _) => target_aliases(StoreTarget::Pattern(pat), p, f) || alias_expr(v, p, f),
+        Unary(UnOp::Delete, t) if element(t) => true,
+        Call(c, args) if args.first().is_some_and(is_arguments) && matches!(&c.kind, Member(_, m) if m.starts_with("define")) => true,
+        // (Class bodies, whose computed keys aren't children: taken to
+        // store.)
+        Class(_) => true,
+        // (Reading it, or its elements, aliases nothing.)
+        Index(o, k) if is_arguments(o) => alias_expr(k, p, f),
+        Member(o, _) if is_arguments(o) => false,
+        Ident(n) => &**n == "arguments",
+        Function(i) if p.functions[*i].arrow => {
+            let mut found = false;
+            for_each_expr(&p.functions[*i].body, &mut |e| found |= alias_expr(e, p, f));
+            found || stores_parameter_in(p, &p.functions[*i].body, f)
+        }
+        // (Another function's code: a closure's stores are seen as
+        // captures, `Gen::maps_arguments`.)
+        Function(_) | Accessor(..) => false,
+        Num(_) | Str(_) | Bool(_) | Null | This | Hole | TemplateObject(_) | RegExp(_) | Bound => false,
+        Array(_) | Object(..) | Spread(_) | Template(..) | Await(_) | Yield(..) | SuperCall(..) | SuperMember(..)
+        | Intrinsic(..) | Member(..) | Index(..) | Call(..) | New(..) | Unary(..) | Binary(..) | Logical(..)
+        | Nullish(..) | Cond(..) | Chain(_) | Optional(_) | Comma(..) => sub(),
+    }
+}
+
 /// Whether a statement of function `f` (not of one nested in it) stores
-/// a parameter as no expression does: a `var` of its name with an
-/// initializer, a `for`-`in` or `for`-`of` target of it (a pattern, maybe:
-/// taken to), or a function declaration in its body by that name, which
-/// FunctionDeclarationInstantiation stores in the parameter's binding
-/// (ECMA-262 10.2.11 steps 28 and 36: no parameter expressions, so one
-/// environment). (One in a block isn't Annex B's for a parameter's name,
-/// B.3.2.1.)
+/// a parameter or an element of `arguments` as no expression does: a
+/// `var` of its name with an initializer, a `for`-`in` or `for`-`of`
+/// target (through [`target_aliases`]), or a function declaration in its
+/// body by that name, which FunctionDeclarationInstantiation stores in
+/// the parameter's binding (ECMA-262 10.2.11 steps 28 and 36: no
+/// parameter expressions, so one environment). (One in a block isn't
+/// Annex B's for a parameter's name, B.3.2.1.)
 fn stores_parameter(p: &Program, f: &Function) -> bool {
     let mut fns = Vec::new();
     f.body.iter().for_each(|s| hoisted(s, &mut fns));
@@ -1346,38 +1401,34 @@ fn stores_parameter(p: &Program, f: &Function) -> bool {
 
 /// [`stores_parameter`]'s statements of `body` (`f`'s, or an arrow's in
 /// it), function declarations aside. Every statement form named.
-fn stores_parameter_in(_p: &Program, body: &[Stmt], f: &Function) -> bool {
-    fn stmt(s: &Stmt, f: &Function) -> bool {
-        let param = |n: &str| f.params.iter().any(|p| &**p == n);
-        match &s.kind {
+fn stores_parameter_in(p: &Program, body: &[Stmt], f: &Function) -> bool {
+    fn stmt(s: &Stmt, p: &Program, f: &Function) -> bool {
+        let here = match &s.kind {
             StmtKind::Var(ds)
             | StmtKind::For {
                 init: Some(ForInit::Var(ds)),
                 ..
-            } if ds.iter().any(|(n, e)| e.is_some() && param(n)) => return true,
-            StmtKind::ForIn { fresh: false, name, .. } if param(name) => return true,
-            // (A pattern's defaults may store one too.)
-            StmtKind::ForOf { pattern: Some(_), .. } => return true,
-            StmtKind::ForOf {
-                kind: 0 | 1,
-                target: Expr { kind: ExprKind::Ident(n), .. },
-                ..
-            } if param(n) => return true,
-            _ => {}
-        }
-        match &s.kind {
-            StmtKind::If(_, a, b) => stmt(a, f) || b.is_some_and(|b| stmt(b, f)),
+            } => ds.iter().any(|(n, e)| e.is_some() && target_aliases(StoreTarget::Name(n), p, f)),
+            // (A target other than a name is an assignment in the body:
+            // `Parser::for_in_target`.)
+            StmtKind::ForIn { fresh: false, name, .. } => target_aliases(StoreTarget::Name(name), p, f),
+            StmtKind::ForOf { pattern: Some(pat), .. } => target_aliases(StoreTarget::Pattern(pat), p, f),
+            StmtKind::ForOf { kind: 0 | 1, target, .. } => target_aliases(StoreTarget::Expr(target), p, f),
+            _ => false,
+        };
+        here || match &s.kind {
+            StmtKind::If(_, a, b) => stmt(a, p, f) || b.is_some_and(|b| stmt(b, p, f)),
             StmtKind::For { body, .. }
             | StmtKind::ForIn { body, .. }
             | StmtKind::ForOf { body, .. }
             | StmtKind::While(_, body)
             | StmtKind::DoWhile(body, _)
             | StmtKind::With(_, _, body)
-            | StmtKind::Labeled(_, body) => stmt(body, f),
-            StmtKind::Block(b) => b.iter().any(|s| stmt(s, f)),
-            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).any(|s| stmt(s, f)),
-            StmtKind::Try(b, c, fin) => try_blocks(b, c, fin).any(|s| stmt(s, f)),
-            // (Their expressions are `aliases_arguments`'s.)
+            | StmtKind::Labeled(_, body) => stmt(body, p, f),
+            StmtKind::Block(b) => b.iter().any(|s| stmt(s, p, f)),
+            StmtKind::Switch(_, cases) => cases.iter().flat_map(|(_, b)| b).any(|s| stmt(s, p, f)),
+            StmtKind::Try(b, c, fin) => try_blocks(b, c, fin).any(|s| stmt(s, p, f)),
+            // (Their expressions are `alias_expr`'s.)
             StmtKind::Var(_)
             | StmtKind::Lexical(..)
             | StmtKind::Function(_)
@@ -1389,7 +1440,7 @@ fn stores_parameter_in(_p: &Program, body: &[Stmt], f: &Function) -> bool {
             | StmtKind::Empty => false,
         }
     }
-    body.iter().any(|s| stmt(s, f))
+    body.iter().any(|s| stmt(s, p, f))
 }
 
 /// Whether function `f`'s `arguments` object may be reachable once it

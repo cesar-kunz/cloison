@@ -295,8 +295,15 @@ pub const LEGACY_DISABLED: u8 = 64;
 /// symbols aren't arrays.
 pub const REGISTERED_SYMBOL: u8 = 64;
 /// A plain object made by an `Error` constructor (`[object Error]`);
-/// `FN_NAME_DELETED`'s bit, as errors aren't functions.
+/// `FN_NAME_DELETED`'s bit, as errors aren't functions, and `FAR`'s,
+/// `RESIZABLE`'s, `SHARED_GROWABLE`'s: asked through [`is_error`].
 pub const ERROR: u8 = 128;
+
+/// Whether `o` is an error object ([[ErrorData]]): a plain object with
+/// flag `ERROR` (the bit is other flags in other classes).
+pub(crate) fn is_error(o: *mut Object) -> bool {
+    unsafe { (*o).class == Class::Plain && (*o).flags & ERROR != 0 }
+}
 
 #[repr(C)]
 pub struct Object {

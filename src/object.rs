@@ -393,8 +393,8 @@ impl Object {
     ///
     /// # Safety
     /// As [`Object::elems_cap`]'s; and nothing may reallocate the elements
-    /// or (for the mutable one) read or write them otherwise while the
-    /// slice is used.
+    /// or write them while the slice is used. (No mutable one: the marker
+    /// may be reading them, see `layout::Word`.)
     #[inline(always)]
     pub unsafe fn elems<'a>(this: *const Object) -> &'a [Value] {
         unsafe {
@@ -402,21 +402,6 @@ impl Object {
                 &[]
             } else {
                 std::slice::from_raw_parts((*this).elems, (*this).elems_len as usize)
-            }
-        }
-    }
-
-    /// [`Object::elems`], mutable.
-    ///
-    /// # Safety
-    /// As [`Object::elems`]'s.
-    #[inline(always)]
-    pub unsafe fn elems_mut<'a>(this: *mut Object) -> &'a mut [Value] {
-        unsafe {
-            if (*this).elems.is_null() {
-                &mut []
-            } else {
-                std::slice::from_raw_parts_mut((*this).elems, (*this).elems_len as usize)
             }
         }
     }

@@ -14,6 +14,8 @@
 //! `unsafe`, its contract that the pointer is to a live cell (or table)
 //! of the kind it names.
 
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering::Relaxed};
+
 use crate::value::Value;
 
 /// Check at compile time that runtime type `$t` has `$m`'s fields at the
@@ -363,6 +365,149 @@ pub const CLASS_KIND: u32 = 0x00ff_00ff;
 #[inline(always)]
 pub unsafe fn class_kind(h: *const Header) -> u32 {
     unsafe { *(&raw const (*h).class).cast::<u32>() & CLASS_KIND }
+}
+
+// ---- Words the marker reads ----
+
+/// A word of a cell, other than its header word, that the marker thread
+/// may read while the mutator writes it: an object's slots, `props`,
+/// `elems` and `code`, an array's values, a function's upvalue pointers,
+/// an upvalue's `closed`. A plain access racing any other access is
+/// undefined behavior in Rust's memory model, so the stores to such a
+/// word of a cell that may be old, and the marker's loads, are Relaxed
+/// atomic accesses ([`load_word`], [`store_word`], [`copy_words`]): each
+/// one aligned 64-bit access, never split or merged, a plain `mov` on
+/// x86-64 and `ldr`/`str` on arm64, both single-copy atomic. The
+/// mutator's own loads may stay plain (it is the only writer), and so
+/// may stores to a young cell (the marker skips it) or made in a pause.
+///
+/// Relaxed is enough for a word that is a value or a payload pointer:
+/// the marker follows it only to an old cell, which a pause handed over
+/// to it. A word the marker follows into
+/// Rust data, a RegExp's `code`, is stored with Release and loaded with
+/// Acquire instead.
+pub trait Word: Copy {
+    /// The word at `p`, with a Relaxed atomic load.
+    ///
+    /// # Safety
+    /// `p` must be aligned and point to a readable word.
+    unsafe fn load(p: *const Self) -> Self;
+
+    /// `v` stored at `p`, with a Relaxed atomic store.
+    ///
+    /// # Safety
+    /// `p` must be aligned and point to a writable word.
+    unsafe fn store(p: *mut Self, v: Self);
+}
+
+impl Word for Value {
+    #[inline(always)]
+    unsafe fn load(p: *const Self) -> Self {
+        unsafe { Value::from_bits(AtomicU64::from_ptr(p as *mut u64).load(Relaxed)) }
+    }
+    #[inline(always)]
+    unsafe fn store(p: *mut Self, v: Self) {
+        unsafe { AtomicU64::from_ptr(p.cast()).store(v.to_bits(), Relaxed) }
+    }
+}
+
+impl Word for u64 {
+    #[inline(always)]
+    unsafe fn load(p: *const Self) -> Self {
+        unsafe { AtomicU64::from_ptr(p.cast_mut()).load(Relaxed) }
+    }
+    #[inline(always)]
+    unsafe fn store(p: *mut Self, v: Self) {
+        unsafe { AtomicU64::from_ptr(p).store(v, Relaxed) }
+    }
+}
+
+impl Word for usize {
+    #[inline(always)]
+    unsafe fn load(p: *const Self) -> Self {
+        unsafe { AtomicUsize::from_ptr(p.cast_mut()).load(Relaxed) }
+    }
+    #[inline(always)]
+    unsafe fn store(p: *mut Self, v: Self) {
+        unsafe { AtomicUsize::from_ptr(p).store(v, Relaxed) }
+    }
+}
+
+impl<T> Word for *mut T {
+    #[inline(always)]
+    unsafe fn load(p: *const Self) -> Self {
+        unsafe { AtomicPtr::from_ptr(p.cast_mut()).load(Relaxed) }
+    }
+    #[inline(always)]
+    unsafe fn store(p: *mut Self, v: Self) {
+        unsafe { AtomicPtr::from_ptr(p).store(v, Relaxed) }
+    }
+}
+
+impl<T> Word for *const T {
+    #[inline(always)]
+    unsafe fn load(p: *const Self) -> Self {
+        unsafe { AtomicPtr::<T>::from_ptr(p.cast_mut().cast()).load(Relaxed).cast_const() }
+    }
+    #[inline(always)]
+    unsafe fn store(p: *mut Self, v: Self) {
+        unsafe { AtomicPtr::from_ptr(p.cast()).store(v.cast_mut(), Relaxed) }
+    }
+}
+
+/// The word at `p`, which the mutator may be writing (see [`Word`]).
+///
+/// # Safety
+/// As [`Word::load`].
+#[inline(always)]
+pub unsafe fn load_word<T: Word>(p: *const T) -> T {
+    unsafe { T::load(p) }
+}
+
+/// Store `v` at `p`, a word the marker may be reading (see [`Word`]).
+///
+/// # Safety
+/// As [`Word::store`].
+#[inline(always)]
+pub unsafe fn store_word<T: Word>(p: *mut T, v: T) {
+    unsafe { T::store(p, v) }
+}
+
+/// `memmove` of `n` values from `src` to `dst`, either in a cell the
+/// marker may be reading: word by word ([`store_word`]), first to last
+/// unless `dst` overlaps the end of `src`. (Not `ptr::copy`: `memmove`
+/// may copy in pieces smaller than a word, `rep movsb` on x86-64, and the
+/// marker would follow a torn value as a cell.)
+///
+/// # Safety
+/// `src` must point to `n` readable values and `dst` to `n` writable ones.
+#[inline]
+pub unsafe fn copy_words(src: *const Value, dst: *mut Value, n: usize) {
+    unsafe {
+        if dst.cast_const() <= src || dst.cast_const() >= src.add(n) {
+            for k in 0..n {
+                store_word(dst.add(k), *src.add(k));
+            }
+        } else {
+            for k in (0..n).rev() {
+                store_word(dst.add(k), *src.add(k));
+            }
+        }
+    }
+}
+
+/// Swap the values at `a` and `b`, in a cell the marker may be reading
+/// ([`store_word`]).
+///
+/// # Safety
+/// `a` and `b` must point to writable values.
+#[inline(always)]
+pub unsafe fn swap_words(a: *mut Value, b: *mut Value) {
+    unsafe {
+        let (x, y) = (*a, *b);
+        store_word(a, y);
+        store_word(b, x);
+    }
 }
 
 // ---- Shapes ----
@@ -746,4 +891,27 @@ pub mod rx {
     /// Compiled code's entry: `(s, end, pos, bt, regs, ctx)`.
     pub type Entry =
         unsafe extern "rust-preserve-none" fn(*const u16, usize, usize, *mut usize, *mut usize, *const Ctx) -> usize;
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::value::Value;
+
+    /// [`super::copy_words`] as `ptr::copy`, at every overlap.
+    #[test]
+    fn copy_words_is_memmove() {
+        for n in [0, 1, 2, 7, 16] {
+            for src in 0..9 {
+                for dst in 0..9 {
+                    let init: Vec<Value> = (0..32).map(Value::from_i32).collect();
+                    let (mut a, mut b) = (init.clone(), init.clone());
+                    unsafe {
+                        std::ptr::copy(a.as_ptr().add(src), a.as_mut_ptr().add(dst), n);
+                        super::copy_words(b.as_ptr().add(src), b.as_mut_ptr().add(dst), n);
+                    }
+                    assert!(a == b, "n {n} src {src} dst {dst}");
+                }
+            }
+        }
+    }
 }

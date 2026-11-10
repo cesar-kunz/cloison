@@ -329,6 +329,9 @@ pub const EVAL_BOXED: u8 = 8;
 /// An enclosing function's (past the `eval`'s function's own scope): a
 /// `var` the `eval` declares shadows it, as a variable of the function's.
 pub const EVAL_OUTER: u8 = 16;
+/// What a binding `intrinsics::eval_scope` is given the value of (in
+/// place of an upvalue: `(tag << 4) | kind`) is: a binding by its value.
+pub const EVAL_DATA: i32 = -2;
 
 /// What a direct `eval`'s caller is (see `intrinsics::direct_eval`):
 /// strict code, and code with a `new.target` (a function's, not an arrow

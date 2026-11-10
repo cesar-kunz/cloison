@@ -5234,7 +5234,7 @@ impl<'a> Gen<'a> {
                     bindings.push((n, v, 0));
                 }
             }
-            let mut kept = Vec::new();
+            let mut kept: Vec<(&str, &str, i32, Option<usize>)> = Vec::new();
             let mut nlex = 0;
             for (i, b) in bindings.into_iter().enumerate() {
                 let var = self.resolve(b.1, pos)?;
@@ -5262,30 +5262,27 @@ impl<'a> Gen<'a> {
                     nlex += (i < lexical) as i32;
                 }
             }
-            // (Past the most there is room for, an arrow's function's
-            // `arguments` and `new.target` still: a module's many
-            // top-level variables come first.)
-            let own: Vec<_> = kept
-                .iter()
-                .skip(80)
-                .filter(|b| matches!(b.0, "arguments" | "%newtarget") && b.2 & EVAL_BLOCK_SCOPED as i32 == 0)
-                .copied()
-                .collect();
-            kept.truncate(80 - own.len());
-            let nlex = nlex.min(kept.len() as i32);
-            kept.extend(own);
             if kept.is_empty() {
                 self.intrinsic("direct_eval", fr, nargs);
                 self.temp = mark;
                 return Ok(());
             }
+            // What the bindings are: the block-scoped count, the bindings
+            // function's upvalues, and each binding's kind, upvalue (`-`
+            // if none: its value in registers, see `intrinsics::eval_scope`)
+            // and name (a boxed one's box's key after a tab).
+            let mut desc = format!("{nlex} {}\n", carrier.map_or(0, |cf| self.scopes.upvalues[cf].len()));
+            for &(o, v, kind, up) in &kept {
+                let key = if kind & EVAL_BOXED as i32 != 0 { format!("\t{}", self.env_key(v)) } else { String::new() };
+                let up = up.map_or("-".to_string(), |u| u.to_string());
+                desc.push_str(&format!("{kind} {up} {o}{key}\n"));
+            }
             // Each binding the bindings function's upvalue: its code is
             // compiled for them, its upvalues theirs (see
             // `intrinsics::direct_eval_bound`), no scope object made. Then
-            // the bindings function, what they are (the block-scoped
-            // count, the function's upvalues, and each binding's kind,
-            // upvalue and name) and the site's number. (Not with bindings
-            // in one box, a module's scope object: one upvalue each.)
+            // the bindings function, the description and the site's
+            // number. (Not with bindings in one box, a module's scope
+            // object: one upvalue each.)
             if let Some(cf) = carrier.filter(|_| {
                 self.index != 0 && kept.iter().enumerate().all(|(i, b)| b.3.is_some() && kept[..i].iter().all(|c| c.3 != b.3))
             }) {
@@ -5294,12 +5291,6 @@ impl<'a> Gen<'a> {
                 self.closure(cf);
                 self.star(c);
                 let d = self.alloc(pos)?;
-                let mut desc = format!("{nlex} {}\n", self.scopes.upvalues[cf].len());
-                for &(o, v, kind, up) in &kept {
-                    // (A boxed one's: its box's key after a tab.)
-                    let key = if kind & EVAL_BOXED as i32 != 0 { format!("\t{}", self.env_key(v)) } else { String::new() };
-                    desc.push_str(&format!("{kind} {} {o}{key}\n", up.unwrap_or(0)));
-                }
                 self.string(&desc);
                 self.star(d);
                 // (Its number: the key its code is kept by, with its source.)
@@ -5311,39 +5302,47 @@ impl<'a> Gen<'a> {
                 self.temp = mark;
                 return Ok(());
             }
+            // Else a scope object of them: the bindings with an upvalue
+            // by the description, the others by their values, in parts
+            // of so many registers. (Any number of bindings: #173.)
             let scope = self.alloc(pos)?;
             let m2 = self.temp;
             self.mov(env, scope);
-            let n = self.alloc(pos)?;
-            self.emit(Op::LdaSmi, &[Arg::Imm(nlex)]);
-            self.star(n);
             let c = self.alloc(pos)?;
             match carrier {
                 Some(f) if kept.iter().any(|b| b.3.is_some()) => self.closure(f),
                 _ => self.emit(Op::LdaUndefined, &[]),
             }
             self.star(c);
-            for &(o, v, kind, up) in &kept {
-                let k = self.alloc(pos)?;
-                self.string(o);
-                self.star(k);
-                // (The value of one with no accessor; else the variable's
-                // name, a box's property's.)
-                let r = self.alloc(pos)?;
-                match up {
-                    Some(_) => self.string(v),
-                    None => self.load_raw(v, pos)?,
+            let d = self.alloc(pos)?;
+            self.string(&desc);
+            self.star(d);
+            let made = self.alloc(pos)?;
+            self.emit(Op::LdaUndefined, &[]);
+            self.star(made);
+            let m4 = self.temp;
+            let valued: Vec<_> = kept.iter().filter(|b| b.3.is_none()).copied().collect();
+            for part in valued.chunks(48).chain(valued.is_empty().then_some(&[][..])) {
+                for &(o, v, kind, _) in part {
+                    let k = self.alloc(pos)?;
+                    self.string(o);
+                    self.star(k);
+                    let r = self.alloc(pos)?;
+                    let var = self.alloc(pos)?;
+                    self.emit(Op::LdaUndefined, &[]);
+                    self.star(var);
+                    self.load_raw(v, pos)?;
+                    let tag = EVAL_DATA;
+                    self.star(r);
+                    let b = self.alloc(pos)?;
+                    self.emit(Op::LdaSmi, &[Arg::Imm((tag << 4) | kind)]);
+                    self.star(b);
                 }
-                self.star(r);
-                let b = self.alloc(pos)?;
-                match up {
-                    Some(u) => self.emit(Op::LdaSmi, &[Arg::Imm(((u as i32) << 4) | kind)]),
-                    None => self.emit(Op::LdaUndefined, &[]),
-                }
-                self.star(b);
+                self.intrinsic("eval_scope", scope, (4 + 4 * part.len()) as u8);
+                self.star(made);
+                self.temp = m4;
             }
-            self.intrinsic("eval_scope", scope, (3 + 3 * kept.len()) as u8);
-            self.star(scope);
+            self.mov(made, scope);
             self.temp = m2;
             self.mov(scope, env);
             self.intrinsic("direct_eval", fr, nargs);
@@ -5358,15 +5357,10 @@ impl<'a> Gen<'a> {
                 self.mov(scope, s);
                 let d = self.alloc(pos)?;
                 self.mov(decl, d);
-                let n = self.alloc(pos)?;
-                self.emit(Op::LdaSmi, &[Arg::Imm(nlex)]);
-                self.star(n);
-                for (o, ..) in &kept {
-                    let k = self.alloc(pos)?;
-                    self.string(o);
-                    self.star(k);
-                }
-                self.intrinsic("eval_scope_flush", s, (3 + kept.len()) as u8);
+                let k = self.alloc(pos)?;
+                self.string(&desc);
+                self.star(k);
+                self.intrinsic("eval_scope_flush", s, 3);
                 self.temp = m3;
             }
             for (i, &(o, v, kind, up)) in kept.iter().enumerate() {

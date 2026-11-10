@@ -5695,7 +5695,12 @@ impl Vm {
     /// [[DefineOwnProperty]]).
     pub(crate) fn unmap_arguments(&mut self, o: *mut Object) {
         let n = match self.mapped_args.iter().rev().find(|m| m.o == o) {
-            Some(m) => m.mapped.len() as u32,
+            // (Its elements their values from here on: and frozen, which
+            // `MAPPED`'s bit means too, see `object::RAW_JSON`.)
+            Some(m) => {
+                unsafe { (*o).flags &= !crate::object::MAPPED };
+                m.mapped.len() as u32
+            }
             None => match self.released_record(o) {
                 Some(r) => unsafe { (*r).elems_len - 1 },
                 None => return,
@@ -5784,6 +5789,9 @@ impl Vm {
         {
             let m = self.mapped_args.pop().unwrap();
             let o = m.o;
+            // (Its elements its parameters' values again, or hidden: see
+            // `keep_mapped`.)
+            unsafe { (*o).flags &= !crate::object::MAPPED };
             for (i, &on) in m.mapped.iter().enumerate() {
                 if on && (i as u32) < unsafe { (*o).elems_len } {
                     unsafe {

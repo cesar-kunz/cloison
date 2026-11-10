@@ -1238,6 +1238,8 @@ handlers! {
         if n > 0 {
             let escapes = (*frame_code(regs)).arguments_escape;
             vm.mapped_args.push(crate::vm::MappedArgs { o: as_object(o), regs, mapped: vec![true; n], escapes, scope: (std::ptr::null_mut(), Vec::new()) });
+            // (Compiled code reads none of its elements in place.)
+            (*as_object(o)).flags |= crate::object::MAPPED;
             // (Released where the frame ends: see `Vm::close_upvalues`.)
             *regs.sub(FLAGS) = Value::from_bits((*regs.sub(FLAGS)).to_bits() | CAPTURED);
         }

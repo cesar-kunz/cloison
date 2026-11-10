@@ -2375,7 +2375,13 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let made = new_regexp(vm, &p, &f)?;
     let re = regexp_of(made).unwrap() as *const crate::regexp::Regex;
     let o = as_object(this);
-    unsafe { (*o).code = re.cast() };
+    // (`this` may be old, its `code` read by the marker thread, which
+    // follows it into the `Regex` (`gc::mark_function_code`): published
+    // with Release, after the `Regex`'s initialization.)
+    unsafe {
+        let code = std::sync::atomic::AtomicPtr::from_ptr((&raw mut (*o).code).cast::<*mut crate::regexp::Regex>());
+        code.store(re.cast_mut(), std::sync::atomic::Ordering::Release);
+    }
     // (Its hidden source, the new one's (escaped), read-only to
     // `defineProperty` and `freeze`.)
     let a = vm.a_regexp_source;

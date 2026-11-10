@@ -920,8 +920,11 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
 }
 
 /// The scopes a direct `eval`'s `shape` (`a[2]`, see [`direct_eval`])
-/// describes.
+/// describes: a short one's a number (see `Gen::call`).
 fn eval_shape(shape: Value) -> Result<crate::vm::EvalChain> {
+    if let Some(n) = shape.as_number() {
+        return Ok(crate::vm::EvalChain::of_number(n as u32));
+    }
     crate::vm::EvalChain::of(crate::vm::string_units(shape).unwrap_or(&[])).ok_or_else(too_many_scopes)
 }
 

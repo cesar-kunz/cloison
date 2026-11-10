@@ -4,6 +4,7 @@
 //! [`install`] (`push` is `vm::array_push`, which compiled code calls).
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number, to_string_units};
+use crate::layout::{copy_words, store_word, swap_words};
 use crate::object::{Class, EXTERNAL, Object, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
@@ -527,7 +528,12 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
         let obj = as_object(o);
         unsafe {
             let n = (*obj).elems_len as usize;
-            Object::elems_mut(obj).reverse();
+            // (Word by word, not a slice's `reverse`: the marker may be
+            // reading the slots, see `layout::Word`.)
+            let e = (*obj).elems;
+            for i in 0..n / 2 {
+                swap_words(e.add(i), e.add(n - 1 - i));
+            }
             // (Every slot may now hold what was elsewhere: barriered.)
             for i in 0..n {
                 let v = *(*obj).elems.add(i);
@@ -573,8 +579,8 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         unsafe {
             let n = (*obj).elems_len as usize;
             let first = *(*obj).elems;
-            std::ptr::copy((*obj).elems.add(1), (*obj).elems, n - 1);
-            *(*obj).elems.add(n - 1) = Value::EMPTY;
+            copy_words((*obj).elems.add(1), (*obj).elems, n - 1);
+            store_word((*obj).elems.add(n - 1), Value::EMPTY);
             (*obj).elems_len = (n - 1) as u32;
             for i in 0..n - 1 {
                 let v = *(*obj).elems.add(i);
@@ -612,9 +618,9 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             unsafe {
                 let m = (*obj).elems_len as usize;
                 vm.reserve_elems(obj, m + a.len());
-                std::ptr::copy((*obj).elems, (*obj).elems.add(a.len()), m);
+                copy_words((*obj).elems, (*obj).elems.add(a.len()), m);
                 for (i, &v) in a.iter().enumerate() {
-                    *(*obj).elems.add(i) = Value::EMPTY;
+                    store_word((*obj).elems.add(i), Value::EMPTY);
                     vm.store_element(obj, i, v);
                 }
                 (*obj).elems_len = (m + a.len()) as u32;
@@ -670,7 +676,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             }
             // (Numbers alone, no cells: nothing for the barrier to note.)
             if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
-                std::ptr::copy_nonoverlapping((*obj).elems.add(k), (*oo).elems, count);
+                copy_words((*obj).elems.add(k), (*oo).elems, count);
             } else {
                 vm.store_elements(oo, 0, (*obj).elems.add(k), count);
             }
@@ -733,7 +739,7 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             for i in 0..del {
                 let v = *(*obj).elems.add(start + i);
                 if v == Value::EMPTY {
-                    *(*ro).elems.add(i) = Value::EMPTY;
+                    store_word((*ro).elems.add(i), Value::EMPTY);
                 } else {
                     vm.store_element(ro, i, v);
                 }
@@ -741,13 +747,13 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             (*ro).elems_len = del as u32;
             let new_len = m - del + items.len();
             vm.reserve_elems(obj, new_len);
-            std::ptr::copy((*obj).elems.add(start + del), (*obj).elems.add(start + items.len()), m - start - del);
+            copy_words((*obj).elems.add(start + del), (*obj).elems.add(start + items.len()), m - start - del);
             for (i, &v) in items.iter().enumerate() {
-                *(*obj).elems.add(start + i) = Value::EMPTY;
+                store_word((*obj).elems.add(start + i), Value::EMPTY);
                 vm.store_element(obj, start + i, v);
             }
             for i in new_len..m {
-                *(*obj).elems.add(i) = Value::EMPTY;
+                store_word((*obj).elems.add(i), Value::EMPTY);
             }
             (*obj).elems_len = new_len as u32;
             for i in start + items.len()..new_len {

@@ -15578,6 +15578,64 @@ out.join(" ")
     assert_eq!(value(src), r#"0 0 0 0 0 {"a":12} {"0":3}3"#);
 }
 
+/// A sloppy generator's or async function's `arguments` is mapped to its
+/// simple parameters, as any sloppy function's (#177; ECMA-262
+/// FunctionDeclarationInstantiation step 22): both ways, before and after
+/// a `yield` or an `await` (the frame gone, the parameters in the scope
+/// object), from a closure, after a delete, let out of the generator,
+/// with an index past the arguments, with a direct `eval`, frozen, many
+/// at once; a strict one isn't. What SpiderMonkey and JavaScriptCore give.
+#[test]
+fn generators_and_async_functions_map_arguments() {
+    let src = r#"
+var out = [];
+function* g(a, b) {
+  out.push(arguments[0] + "," + b);
+  a = 5;
+  out.push(arguments[0]);
+  var x = yield a;
+  out.push(arguments[0] + "," + arguments[1] + "," + x);
+  arguments[1] = "B";
+  out.push(b);
+  yield* [1];
+  var k = function () { a = "c"; };
+  k();
+  out.push(arguments[0]);
+  delete arguments[0];
+  a = "d";
+  out.push(String(arguments[0]));
+  return arguments.length;
+}
+var it = g(1, 2);
+out.push(JSON.stringify(it.next()), JSON.stringify(it.next("X")), JSON.stringify(it.next()), JSON.stringify(it.next()));
+function* esc(a) { yield arguments; yield a; }
+var e = esc(1); e.next().value[0] = 42; out.push(e.next().value);
+function* one(a, b) { b = 3; yield arguments.length + ":" + arguments[1]; } out.push(one(1).next().value);
+function* ge(a) { eval("arguments[0] = 8"); yield a; eval("a = 11"); yield arguments[0]; }
+var gi = ge(1); out.push(gi.next().value, gi.next().value);
+function* fr(a) { Object.freeze(arguments); a = 2; yield arguments[0]; } out.push(fr(1).next().value);
+function* st(a) { "use strict"; arguments[0] = 2; yield a; } out.push(st(1).next().value);
+var gens = [];
+for (var i = 0; i < 100; i++) gens.push((function* (a) { while (true) { a++; yield arguments[0]; } })(i));
+var sum = 0;
+for (var r = 0; r < 3; r++) for (var i = 0; i < 100; i++) sum += gens[i].next().value;
+out.push(sum);
+out.join(" ")
+"#;
+    assert_eq!(
+        value(src),
+        r#"1,2 5 5,2,X B c undefined {"value":5,"done":false} {"value":1,"done":false} {"value":2,"done":true} {"done":true} 42 1:undefined 8 11 1 1 15450"#
+    );
+    let src = r#"
+var log = [];
+async function h(a, b) { arguments[0] = 3; log.push(a); await null; a = 4; log.push(arguments[0]); await null; arguments[1] = 9; log.push(b); return arguments[0]; }
+async function he(a) { eval("a = 7"); await 0; return arguments[0]; }
+async function hs(a) { "use strict"; arguments[0] = 2; await 0; return a; }
+Promise.all([h(1, 2), he(1), hs(1)]).then(function (v) { globalThis.out = log.join(",") + " " + v.join(","); });
+"#;
+    assert_eq!(out_after_jobs(src), "3,4,9 4,7,1");
+}
+
 /// A compound assignment's converted object key outlives a collection in
 /// its right side: `Vm::key_cache` kept the key string `GetKeyed` made for
 /// the `SetKeyed` to reuse, but no collection marked it, so the store went

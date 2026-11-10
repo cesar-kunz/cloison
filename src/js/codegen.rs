@@ -1480,8 +1480,6 @@ fn may_map_arguments(f: &Function) -> bool {
         && !f.arrow
         && !f.rest
         && f.param_stmts == 0
-        && !f.generator
-        && !f.is_async
         && !f.params.is_empty()
         && f.params.iter().enumerate().all(|(k, p)| !p.starts_with('%') && !f.params[..k].contains(p))
 }
@@ -2151,10 +2149,11 @@ impl<'a> Gen<'a> {
                 None => self.alloc(self.f.pos)?,
             };
             self.emit(if mapped { Op::CreateMappedArguments } else { Op::CreateArguments }, &[Arg::Reg(t)]);
-            // (With a direct `eval`, mapped to the scope object's
-            // properties: `[arguments, scope, names…]`, see
+            // (With a direct `eval`, or in a generator or an async
+            // function, mapped to the scope object's properties:
+            // `[arguments, scope, names…]`, see
             // `intrinsics::map_arguments_to_scope`.)
-            if mapped && self.eval_keeps_params() {
+            if mapped && self.scope_keeps_params() {
                 let a = self.alloc(self.f.pos)?;
                 self.mov(t, a);
                 let e = self.alloc(self.f.pos)?;
@@ -2334,7 +2333,10 @@ impl<'a> Gen<'a> {
             compound_keys: self.compound_keys,
             upvalues,
             captures,
-            arguments_escape: self.index != 0 && arguments_escape(self.p, self.f),
+            // (A generator's or an async function's frame ends at each
+            // `yield` or `await`, its `arguments` kept.)
+            arguments_escape: self.index != 0
+                && (self.f.generator || self.f.is_async || arguments_escape(self.p, self.f)),
             line: 0,
             col: 0,
             lazy: None,
@@ -4054,6 +4056,13 @@ impl<'a> Gen<'a> {
     /// its scope object (`%env`), by name.
     fn eval_keeps_params(&self) -> bool {
         self.f.has_eval && self.index != 0
+    }
+
+    /// Whether the function keeps its parameters in its scope object:
+    /// with a direct `eval`, or a generator's or an async function's,
+    /// whose frame leaves the stack (see `generate_from`'s `overflow`).
+    fn scope_keeps_params(&self) -> bool {
+        self.index != 0 && (self.f.has_eval || self.f.generator || self.f.is_async)
     }
 
     /// Whether the function's `arguments` object is mapped to its

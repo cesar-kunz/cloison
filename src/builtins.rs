@@ -3351,7 +3351,7 @@ fn error_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
 fn error_is_error(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let v = arg(a, 0);
     Ok(Value::from_bool(
-        crate::props::is_object(v) && unsafe { (*as_object(v)).flags } & crate::object::ERROR != 0,
+        crate::props::is_object(v) && crate::object::is_error(as_object(v)),
     ))
 }
 
@@ -3363,7 +3363,7 @@ fn error_stack_get(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         return Err(Error::type_error("Error.prototype.stack getter called on a non-object"));
     }
     let o = as_object(this);
-    if unsafe { (*o).flags } & crate::object::ERROR == 0 {
+    if !crate::object::is_error(o) {
         return Ok(Value::UNDEFINED);
     }
     // (Without running code: the kind by the prototype the error was made

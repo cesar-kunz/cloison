@@ -2853,7 +2853,10 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
     match K {
         0 => string_match(vm, s, &args),
-        1 => match_all(vm, s, this),
+        1 => {
+            let u = this_units(s)?;
+            match_all(vm, s, &u, this)
+        }
         2 => string_replace(vm, s, &args),
         3 => string_search(vm, s, &args),
         _ => string_split(vm, s, &args),
@@ -2904,6 +2907,8 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if let Some(r) = delegate(vm, "matchAll", this, a, string_match_all)? {
         return Ok(r);
     }
+    // (The receiver's ToString before the pattern's.)
+    let s = this_units(this)?;
     let pattern = arg(a, 0);
     let rv = if regexp_of(pattern).is_some() {
         pattern
@@ -2914,33 +2919,33 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
         new_regexp(vm, &p, "g")?
     };
-    match_all(vm, this, rv)
+    match_all(vm, this, &s, rv)
 }
 
-/// `RegExp.prototype[Symbol.matchAll]` of string `this` with pristine
-/// RegExp `rv` (no IsRegExp or "g" check: those are `matchAll`'s).
-fn match_all(vm: &mut Vm, this: Value, rv: Value) -> Result<Value> {
+/// `RegExp.prototype[Symbol.matchAll]` of `this` (as string `s`) with
+/// pristine RegExp `rv` (no IsRegExp or "g" check: those are
+/// `matchAll`'s).
+fn match_all(vm: &mut Vm, this: Value, s: &[u16], rv: Value) -> Result<Value> {
     let re = regexp_of(rv).unwrap();
+    let input = this_string(vm, this, s);
     // (Not global: one match, as `exec` finds it.)
     if !re.global {
-        return rx_match_all(vm, rv, this);
+        return rx_match_all(vm, rv, input);
     }
-    let s = this_units(this)?;
     let a_last = vm.a_last_index;
     let li = vm.get(rv, a_last)?;
     let li = to_number(li);
     if vm.conv_failed() {
         return Err(vm.take_conv_error());
     }
-    let input = this_string(vm, this, &s);
     let out = vm.new_array();
     let mut at = if li.is_nan() || li < 0.0 { 0 } else { li.min(s.len() as f64 + 1.0) as usize };
     let mut caps = Vec::new();
-    while at <= s.len() && re.exec_into(&s, at, &mut caps) {
+    while at <= s.len() && re.exec_into(s, at, &mut caps) {
         let (x, y) = caps[0].unwrap();
-        at = if y == x { advance(&s, y as f64, re.unicode) as usize } else { y };
+        at = if y == x { advance(s, y as f64, re.unicode) as usize } else { y };
         note_legacy(vm, rv, input, &caps);
-        let m = match_array(vm, re, &caps, &s, input)?;
+        let m = match_array(vm, re, &caps, s, input)?;
         crate::vm::array_push(vm, out, &[m])?;
     }
     crate::symbol::array_values(vm, out, &[])

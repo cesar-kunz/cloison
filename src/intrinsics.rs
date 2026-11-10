@@ -934,9 +934,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     };
     let withs = a.get(eval_withs(flags)..).unwrap_or(&[]);
     if u.windows(4).any(|w| w == [b'e' as u16, b'v' as u16, b'a' as u16, b'l' as u16]) {
-        let site = site_bindings(site);
-        let bindings: Vec<_> = site.2.iter().map(|(n, k, up, key)| (n.as_str(), *k, *up, key.as_str())).collect();
-        return eval_through_scope(vm, a, carrier, site.0, &bindings);
+        return eval_through_scope(vm, a, carrier, site);
     }
     let params = a.get(5) == Some(&Value::TRUE);
     let site_number = number.as_number().unwrap_or(0.0) as u64;
@@ -949,7 +947,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
             let text = crate::vm::source_text(u);
             let (_, nups, bindings) = site_bindings(site);
             let bound: Vec<(crate::js::ast::Name, u8, crate::js::ast::Name)> = (0..nups)
-                .map(|k| match bindings.iter().find(|b| b.2 == k) {
+                .map(|k| match bindings.iter().find(|b| b.2 == Some(k)) {
                     Some((name, kind, _, key)) => (name.as_str().into(), *kind as u8, key.as_str().into()),
                     None => ("%none".into(), 0, "".into()),
                 })
@@ -1011,8 +1009,9 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 
 /// A direct `eval` site's description (see [`direct_eval_bound`]): its
 /// block-scoped count, its bindings function's upvalue count, and each
-/// binding's name, kind and upvalue.
-fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize, String)>) {
+/// binding's name, kind, upvalue (none, `-` written, for one whose value
+/// `eval_scope` is given in registers) and variable (a box's key).
+fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, Option<usize>, String)>) {
     let text = crate::vm::source_text(crate::vm::string_units(site).unwrap_or(&[]));
     let mut lines = text.lines();
     let mut counts = lines.next().unwrap_or("").split(' ').map(|n| n.parse::<usize>().unwrap_or(0));
@@ -1020,7 +1019,7 @@ fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize, String)
     let bindings = lines
         .filter_map(|l| {
             let mut w = l.splitn(3, ' ');
-            let (kind, up) = (w.next()?.parse().ok()?, w.next()?.parse().ok()?);
+            let (kind, up) = (w.next()?.parse().ok()?, w.next()?.parse().ok());
             // (A boxed one's box's key after a tab: else its name.)
             let rest = w.next()?;
             let (name, key) = rest.split_once('\t').unwrap_or((rest, rest));
@@ -1031,36 +1030,26 @@ fn site_bindings(site: Value) -> (usize, usize, Vec<(String, i32, usize, String)
 }
 
 /// [`direct_eval_bound`]'s `eval` through a scope object of its bindings'
-/// accessors (`a` [`direct_eval`]'s arguments), as `Gen::call` makes
-/// otherwise: `eval_scope`, then `direct_eval`, then `eval_scope_flush`.
-fn eval_through_scope(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, bindings: &[(&str, i32, usize, &str)]) -> Result<Value> {
-    // (The names, the scope object and the eval's arguments are held in
-    // Rust across the eval, which runs JS: no cell moves meanwhile, see
+/// accessors (`a` [`direct_eval`]'s arguments, `site` the description),
+/// as `Gen::call` makes otherwise: `eval_scope`, then `direct_eval`, then
+/// `eval_scope_flush`.
+fn eval_through_scope(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) -> Result<Value> {
+    // (The scope object and the eval's arguments are held in Rust across
+    // the eval, which runs JS: no cell moves meanwhile, see
     // `Vm::unmovable`. Rare: an eval in code an eval runs.)
     vm.unmovable += 1;
-    let r = eval_through_scope_in(vm, a, carrier, nlex, bindings);
+    let r = eval_through_scope_in(vm, a, carrier, site);
     vm.unmovable -= 1;
     r
 }
 
-fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, nlex: usize, bindings: &[(&str, i32, usize, &str)]) -> Result<Value> {
-    let mut sa = vec![a[2], Value::from_i32(nlex as i32), carrier];
-    let mut names = Vec::with_capacity(bindings.len());
-    for &(name, kind, up, key) in bindings {
-        let n = crate::builtins::str_value(vm, name);
-        // (The variable: a boxed one's its box's key.)
-        let var = if key == name { n } else { crate::builtins::str_value(vm, key) };
-        names.push(n);
-        sa.extend([n, var, Value::from_i32(((up as i32) << 4) | kind)]);
-    }
-    let scope = eval_scope(vm, &sa)?;
+fn eval_through_scope_in(vm: &mut Vm, a: &[Value], carrier: Value, site: Value) -> Result<Value> {
+    let scope = eval_scope(vm, &[a[2], carrier, site, Value::UNDEFINED])?;
     let mut da = a.to_vec();
     da[2] = scope;
     let r = direct_eval(vm, &da)?;
     let decl = a.get(6).copied().unwrap_or(Value::UNDEFINED);
-    let mut fa = vec![scope, decl, Value::from_i32(nlex as i32)];
-    fa.extend(names);
-    eval_scope_flush(vm, &fa)?;
+    eval_scope_flush(vm, &[scope, decl, site])?;
     Ok(r)
 }
 
@@ -1663,36 +1652,48 @@ fn async_iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(async_iterator_close(vm, a).unwrap_or(Value::HOLE))
 }
 
-/// A direct `eval`'s scope object: `[function's scope, block-scoped count,
-/// bindings' function, name, value, binding, …]`, a property for each
-/// binding it sees (but an enclosing function's a `var` of the function's
-/// shadows, in its scope object): where `binding` tells
-/// (`(k << 4) | kind`: the bindings' function's upvalue `k`, `kind` its
-/// `EVAL_CONST`… flags), an accessor of the variable itself (`value` its
-/// name, a box's property's: see `codegen::boxed_lexicals`), else a data
-/// property of its value (but a binding not initialized yet has none).
+/// A direct `eval`'s scope object: `[function's scope, bindings' function,
+/// description, scope object, name, value, variable, binding, …]`, a
+/// property for each binding it sees (but an enclosing function's a `var`
+/// of the function's shadows, in its scope object). Those with an upvalue
+/// in the description (see [`site_bindings`]) an accessor of the variable
+/// itself, the bindings' function's upvalue (its variable a box's
+/// property: see `codegen::boxed_lexicals`); the others' in the quadruples
+/// after, where `binding` is `(EVAL_DATA << 4) | kind`, `kind` its
+/// `EVAL_CONST`… flags: a data property of its value (but a binding not
+/// initialized yet has none). Added to `scope object` if one (in parts, for
+/// registers' sake: see `Gen::call`), else to a new one, returned.
 /// Without a prototype: the eval'd code looks names up in the function's
 /// scope object after it (`%e2`, see `parse::parse_pass`). (It had the
 /// function's scope object as its prototype, one of each call's: a root
 /// shape and a shape for each binding per call, and their cells.)
 fn eval_scope(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let proto = if crate::props::is_object(a[0]) { a[0] } else { Value::NULL };
-    let o = object_value(vm.new_object(Value::NULL));
-    let nlex = a[1].as_number().unwrap_or(0.0) as usize;
-    let bindings = a[2];
-    for (i, t) in a[3..].chunks(3).enumerate() {
-        let key = to_property_key(vm, t[0])?;
-        if i >= nlex && shadowed(vm, proto, key) {
-            continue;
-        }
-        if let Some(b) = t[2].as_number()
-            && crate::props::is_object(bindings)
-        {
-            let data = [bindings, Value::from_i32(b as i32), t[0], t[1]];
+    let bindings = a[1];
+    let o = if crate::props::is_object(a[3]) { a[3] } else { object_value(vm.new_object(Value::NULL)) };
+    let visible = |vm: &mut Vm, kind: i32, key| kind & EVAL_BLOCK_SCOPED as i32 != 0 || !shadowed(vm, proto, key);
+    if crate::props::is_object(bindings) {
+        for (name, kind, up, var) in site_bindings(a[2]).2 {
+            let Some(up) = up else { continue };
+            let key = Key::Name(vm.intern_name(&name));
+            if !visible(vm, kind, key) {
+                continue;
+            }
+            let n = crate::builtins::str_value(vm, &name);
+            let v = if var == name { n } else { crate::builtins::str_value(vm, &var) };
+            let data = [bindings, Value::from_i32(((up as i32) << 4) | kind), n, v];
             let get = crate::promise::binding_accessor(vm, false, &data);
             let set = crate::promise::binding_accessor(vm, true, &data);
             vm.define_own_property(as_object(o), key, &Desc::accessor(get, set, true, false))?;
-        } else if t[1] != Value::HOLE {
+        }
+    }
+    for t in a[4..].chunks(4) {
+        let key = to_property_key(vm, t[0])?;
+        let b = t[3].as_number().unwrap_or(0.0) as i32;
+        if !visible(vm, b & 15, key) {
+            continue;
+        }
+        if t[1] != Value::HOLE {
             vm.create_data_property(o, key, t[1])?;
         }
     }
@@ -1789,20 +1790,20 @@ fn eval_scope_get(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     })
 }
 
-/// After a direct `eval`: `[scope, function's scope, block-scoped count,
-/// binding names…]`, the scope object's own properties but the bindings'
-/// set on the function's scope object (the `var`s it assigned or declared
-/// there, those by an enclosing function's binding's name too).
+/// After a direct `eval`: `[scope, function's scope, description]` (see
+/// [`site_bindings`]), the scope object's own properties but the
+/// bindings' set on the function's scope object (the `var`s it assigned
+/// or declared there, those by an enclosing function's binding's name
+/// too).
 fn eval_scope_flush(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let (scope, target) = (a[0], a[1]);
     if !crate::props::is_object(target) {
         return Ok(Value::UNDEFINED);
     }
-    let nlex = a[2].as_number().unwrap_or(0.0) as usize;
     let mut bindings = Vec::new();
-    for (i, &n) in a[3..].iter().enumerate() {
-        let key = to_property_key(vm, n)?;
-        if i < nlex || !shadowed(vm, target, key) {
+    for (name, kind, ..) in site_bindings(a[2]).2 {
+        let key = Key::Name(vm.intern_name(&name));
+        if kind & EVAL_BLOCK_SCOPED as i32 != 0 || !shadowed(vm, target, key) {
             bindings.push(key);
         }
     }

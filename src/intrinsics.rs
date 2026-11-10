@@ -64,6 +64,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("delegate_step", delegate_step),
     ("delegate_done", delegate_done),
     ("throw_delete", throw_delete),
+    ("throw_super_delete", throw_super_delete),
     ("for_in_has", for_in_has),
     ("exp", exp),
     ("copy_data_properties", copy_data_properties),
@@ -1420,6 +1421,11 @@ fn delegate_done(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// Strict code's failed `delete`.
 fn throw_delete(_: &mut Vm, _: &[Value]) -> Result<Value> {
     Err(Error::type_error("Cannot delete a non-configurable property"))
+}
+
+/// `delete super.x` (13.5.1.2: a super reference).
+fn throw_super_delete(_: &mut Vm, _: &[Value]) -> Result<Value> {
+    Err(Error::reference_error("Unsupported reference to 'super'"))
 }
 
 #[allow(dead_code)]

@@ -2175,19 +2175,22 @@ impl<'a> Gen<'a> {
                 self.mov(t, a);
                 let e = self.alloc(self.f.pos)?;
                 self.mov(self.locals[ENV], e);
-                // (`null` for a parameter a later one of its name
+                // (The names in one string, each ended by a NUL, which no
+                // name has: three registers however many parameters. An
+                // empty one for a parameter a later one of its name
                 // shadows, which is not mapped: ECMA-262
                 // CreateMappedArgumentsObject.)
+                let mut names = String::new();
                 for (j, p) in f.params.iter().enumerate() {
-                    let k = self.alloc(self.f.pos)?;
-                    if f.params[j + 1..].contains(p) {
-                        self.emit(Op::LdaNull, &[]);
-                    } else {
-                        self.string(&self.env_key(p));
+                    if !f.params[j + 1..].contains(p) {
+                        names.push_str(&self.env_key(p));
                     }
-                    self.star(k);
+                    names.push('\0');
                 }
-                self.intrinsic("map_arguments_to_scope", a, 2 + f.params.len() as u8);
+                let k = self.alloc(self.f.pos)?;
+                self.string(&names);
+                self.star(k);
+                self.intrinsic("map_arguments_to_scope", a, 3);
             }
             if !self.locals.contains_key("arguments") {
                 self.ldar(t);

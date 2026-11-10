@@ -59,7 +59,7 @@
 
 use crate::bytecode::Op;
 use crate::interp::{self, Frame, Run};
-use crate::object::{Atom, Class, FieldType, Object, PAGE, Shape};
+use crate::object::{Atom, Class, FieldType, Object, Shape, page_size};
 use crate::layout::InstanceOfEntry;
 use crate::value::{NumberTag, Value};
 
@@ -1901,7 +1901,8 @@ impl ExecMem {
         let len = len.max(1);
         let mut range = EXEC_RANGE.lock().unwrap();
         let offset = range.2 + code_shift();
-        let pages = (offset + len).next_multiple_of(PAGE);
+        let page = page_size();
+        let pages = (offset + len).next_multiple_of(page);
         if range.1 - range.0 < pages {
             let size = EXEC_RESERVE.max(pages);
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
@@ -1912,7 +1913,7 @@ impl ExecMem {
         }
         let start = range.0 as *mut u8;
         range.0 += pages;
-        range.2 = (offset + len).next_multiple_of(64) % 4096;
+        range.2 = (offset + len).next_multiple_of(64) % page;
         let r = unsafe { libc::mprotect(start.cast(), pages, libc::PROT_READ | libc::PROT_WRITE) };
         assert_eq!(r, 0, "mprotect failed");
         ExecMem {
@@ -1929,7 +1930,8 @@ impl ExecMem {
     /// The pages: their start and length.
     fn pages(&self) -> (*mut u8, usize) {
         let start = unsafe { self.ptr.sub(self.offset) };
-        (start, (self.offset + self.len).next_multiple_of(PAGE))
+        let len = (self.offset + self.len).next_multiple_of(page_size());
+        (start, len)
     }
 
     fn seal(&mut self) {

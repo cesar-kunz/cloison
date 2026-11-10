@@ -1450,7 +1450,7 @@ pub(crate) fn object_value(o: *mut Object) -> Value {
     Value::from_bits(o as u64)
 }
 
-pub(crate) use crate::heap::PAGE;
+pub(crate) use crate::heap::page_size;
 
 #[cfg(test)]
 mod tests {

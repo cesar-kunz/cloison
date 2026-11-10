@@ -47,6 +47,7 @@ use crate::value::Value;
 // it shares: the granule, card and large-cell sizes, the metadata bytes,
 // the side tables' place, the address space of a heap.
 pub use crate::layout::{CARD, COLOR, EVAC, GRANULE, LARGE, SIDE, SLICE, VALUES, YOUNG, card, card_mark, color_byte, meta};
+pub(crate) use crate::layout::{meta_load, meta_store, meta_word};
 /// Block size: allocation's unit of memory.
 pub const BLOCK: usize = 32 << 10;
 const GRANULES_PER_BLOCK: usize = BLOCK / GRANULE;
@@ -228,8 +229,8 @@ pub(crate) fn owner(a: usize) -> *mut crate::vm::Vm {
 pub(crate) fn barrier<T>(host: *const u8, a: *const T, v: Value) {
     unsafe {
         if v.is_cell()
-            && *meta(v.to_bits() as usize) & (YOUNG | COLOR | EVAC) != *color_byte(host as usize)
-            && *meta(host as usize) != YOUNG
+            && meta_load(v.to_bits() as usize) & (YOUNG | COLOR | EVAC) != *color_byte(host as usize)
+            && meta_load(host as usize) != YOUNG
         {
             card_mark(a);
         }
@@ -240,7 +241,7 @@ pub(crate) fn barrier<T>(host: *const u8, a: *const T, v: Value) {
 /// pointer to a young array (an object's new `props` or `elems`).
 #[inline(always)]
 pub(crate) fn barrier_young<T>(host: *const u8, a: *const T) {
-    if unsafe { *meta(host as usize) } != YOUNG {
+    if unsafe { meta_load(host as usize) } != YOUNG {
         card_mark(a);
     }
 }
@@ -449,7 +450,7 @@ impl Heap {
             return self.alloc_slow(bytes);
         }
         self.ptr = unsafe { p.add(bytes) };
-        unsafe { *meta(p as usize) = YOUNG };
+        unsafe { meta_store(p as usize, YOUNG) };
         p
     }
 
@@ -518,7 +519,7 @@ impl Heap {
         let from = p;
         unsafe {
             while p < end {
-                let m = *meta(p);
+                let m = meta_load(p);
                 if m != 0 {
                     // A cell: on to the granule after its `END`.
                     debug_assert!(m & COLOR != 0, "a young cell where allocation comes back");
@@ -526,14 +527,14 @@ impl Heap {
                     // (Eight bytes at a time within the block: the
                     // metadata past the heap's end may not be mapped.)
                     while p + 8 * GRANULE <= end {
-                        let w = (meta(p) as *const u64).read_unaligned() & ENDS;
+                        let w = meta_word(p) & ENDS;
                         if w != 0 {
                             p += w.trailing_zeros() as usize / 8 * GRANULE;
                             break;
                         }
                         p += 8 * GRANULE;
                     }
-                    while p < end && *meta(p) & END == 0 {
+                    while p < end && meta_load(p) & END == 0 {
                         p += GRANULE;
                     }
                     if p == end {
@@ -546,7 +547,7 @@ impl Heap {
                 // Free granules: the bytes up to the next nonzero one.
                 loop {
                     if p + 8 * GRANULE <= end {
-                        let w = (meta(p) as *const u64).read_unaligned();
+                        let w = meta_word(p);
                         if w == 0 {
                             p += 8 * GRANULE;
                             continue;
@@ -554,7 +555,7 @@ impl Heap {
                         p += w.trailing_zeros() as usize / 8 * GRANULE;
                         break;
                     }
-                    if p == end || *meta(p) != 0 {
+                    if p == end || meta_load(p) != 0 {
                         break;
                     }
                     p += GRANULE;
@@ -797,7 +798,7 @@ impl Heap {
                 let g = a & !(GRANULE - 1);
                 let mut p = g;
                 loop {
-                    let m = unsafe { *meta(p) };
+                    let m = unsafe { meta_load(p) };
                     if m & (YOUNG | COLOR) != 0 {
                         return Some(p);
                     }
@@ -812,7 +813,7 @@ impl Heap {
                     b -= 1;
                 }
                 let p = self.base + b * BLOCK;
-                (unsafe { *meta(p) } & (YOUNG | COLOR) != 0).then_some(p)
+                (unsafe { meta_load(p) } & (YOUNG | COLOR) != 0).then_some(p)
             }
         }
     }
@@ -843,7 +844,7 @@ impl Heap {
         if self.since >= self.budget {
             self.requested.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        unsafe { *meta(p as usize) = YOUNG };
+        unsafe { meta_store(p as usize, YOUNG) };
         p
     }
 

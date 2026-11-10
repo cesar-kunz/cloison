@@ -402,7 +402,7 @@ impl Heap {
     /// Whether the cell `v` is young.
     #[inline(always)]
     pub(crate) fn is_young(&self, v: Value) -> bool {
-        v.is_cell() && unsafe { *self.meta(v.to_bits() as usize) } == YOUNG
+        v.is_cell() && unsafe { crate::heap::meta_load(v.to_bits() as usize) } == YOUNG
     }
 
     /// A Rust structure that full collections enumerate (an inline cache,
@@ -1090,8 +1090,7 @@ impl Visit for Marking<'_> {
             if mode.check && !is_cell_in(self.heap, p) {
                 bad_reference(p);
             }
-            let m = crate::heap::meta(p);
-            let b = *m;
+            let b = crate::heap::meta_load(p);
             // An old cell keeps its `END` (one granule's has it here too);
             // the rest is written when the cell is traced (its header is in
             // cache then).
@@ -1100,15 +1099,15 @@ impl Visit for Marking<'_> {
                     if b != YOUNG {
                         return;
                     }
-                    *m = mode.color;
+                    crate::heap::meta_store(p, mode.color);
                     self.stack.push(p);
                 }
                 Kind::MinorShade => {
                     if b == YOUNG {
-                        *m = mode.color;
+                        crate::heap::meta_store(p, mode.color);
                         self.stack.push(p);
                     } else if b & COLOR != 0 && b & COLOR != mode.color {
-                        *m = (b & (END | EVAC)) | mode.color;
+                        crate::heap::meta_store(p, (b & (END | EVAC)) | mode.color);
                         self.shade.push(p);
                     }
                 }
@@ -1118,14 +1117,14 @@ impl Visit for Marking<'_> {
                     }
                     // (A byte store: the mutator never writes an old cell's
                     // metadata while the marker runs.)
-                    *m = (b & (END | EVAC)) | mode.color;
+                    crate::heap::meta_store(p, (b & (END | EVAC)) | mode.color);
                     self.stack.push(p);
                 }
                 Kind::Full => {
                     if b & COLOR == mode.color {
                         return;
                     }
-                    *m = (b & (END | EVAC)) | mode.color;
+                    crate::heap::meta_store(p, (b & (END | EVAC)) | mode.color);
                     self.stack.push(p);
                 }
             }
@@ -1313,14 +1312,16 @@ impl Marking<'_> {
                     // the marker's: the mutator may have stored one marked
                     // and without it into a cell traced already.)
                     if R && self.mode.kind != Kind::Old && self.cand.has(p) {
-                        *crate::heap::meta(p) |= EVAC;
+                        crate::heap::meta_store(p, crate::heap::meta_load(p) | EVAC);
                     }
                     mark_function_code(p, w);
                     if self.mode.shapes {
                         mark_object_shape(self, w, epoch);
                     }
                     let size = crate::heap::cell_size_with(p as *const u8, w);
-                    *crate::heap::meta(last_granule(p, size)) |= END;
+                    // (Only the marking writes an old cell's bytes.)
+                    let last = last_granule(p, size);
+                    crate::heap::meta_store(last, crate::heap::meta_load(last) | END);
                     self.marked += size;
                     n += 1;
                 }
@@ -1578,7 +1579,7 @@ fn prefetch(p: usize) {
 fn is_cell_in(heap: (usize, usize), p: usize) -> bool {
     (heap.0..heap.1).contains(&p)
         && p.is_multiple_of(GRANULE)
-        && unsafe { *crate::heap::meta(p) } & (YOUNG | COLOR) != 0
+        && unsafe { crate::heap::meta_load(p) } & (YOUNG | COLOR) != 0
 }
 
 #[cold]
@@ -4740,17 +4741,17 @@ impl Heap {
 /// the block's metadata, which nothing else writes while it is swept.
 unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
     const ENDS: u64 = 0x0404_0404_0404_0404;
-    let meta = crate::heap::meta;
+    use crate::heap::{meta_load, meta_store, meta_word};
     let end = start + crate::heap::BLOCK;
     let mut live = 0;
     let mut p = start;
     unsafe {
         while p < end {
-            if p + 8 * GRANULE <= end && (meta(p) as *const u64).read_unaligned() == 0 {
+            if p + 8 * GRANULE <= end && meta_word(p) == 0 {
                 p += 8 * GRANULE;
                 continue;
             }
-            let m = *meta(p);
+            let m = meta_load(p);
             if m & (YOUNG | COLOR) == 0 {
                 p += GRANULE;
                 continue;
@@ -4758,7 +4759,7 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
             if m == YOUNG {
                 // Young and unmarked: free (the granules after its first
                 // are zero anyway).
-                *meta(p) = 0;
+                meta_store(p, 0);
                 if poison {
                     std::ptr::write_bytes(p as *mut u8, POISON, cell_size(p as *const u8));
                 }
@@ -4768,14 +4769,14 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
             // Old: up to its `END`.
             let mut q = p;
             while q + 8 * GRANULE <= end {
-                let w = (meta(q) as *const u64).read_unaligned() & ENDS;
+                let w = meta_word(q) & ENDS;
                 if w != 0 {
                     q += w.trailing_zeros() as usize / 8 * GRANULE;
                     break;
                 }
                 q += 8 * GRANULE;
             }
-            while q < end && *meta(q) & END == 0 {
+            while q < end && meta_load(q) & END == 0 {
                 q += GRANULE;
             }
             if q == end {
@@ -4785,8 +4786,8 @@ unsafe fn sweep_block(start: usize, color: u8, poison: bool) -> usize {
             if m & COLOR == color {
                 live += n;
             } else {
-                *meta(p) = 0;
-                *meta(q) = 0;
+                meta_store(p, 0);
+                meta_store(q, 0);
                 if poison {
                     std::ptr::write_bytes(p as *mut u8, POISON, n);
                 }

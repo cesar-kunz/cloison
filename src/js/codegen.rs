@@ -5322,7 +5322,10 @@ impl<'a> Gen<'a> {
             self.star(made);
             let m4 = self.temp;
             let valued: Vec<_> = kept.iter().filter(|b| b.3.is_none()).copied().collect();
-            for part in valued.chunks(48).chain(valued.is_empty().then_some(&[][..])) {
+            // (Four registers each, in the room left past those in use,
+            // with some for loading an import's holder or a value.)
+            let part_size = (256usize.saturating_sub(self.temp as usize + 8) / 4).clamp(1, 48);
+            for part in valued.chunks(part_size).chain(valued.is_empty().then_some(&[][..])) {
                 for &(o, v, kind, _) in part {
                     let k = self.alloc(pos)?;
                     self.string(o);

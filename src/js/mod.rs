@@ -134,7 +134,7 @@ pub fn compile_script_lazy_source(src: &Source) -> Result<Module, String> {
     let compile = |skim| {
         let arena = ast::Arenas::default();
         parse::parse_source_code(src, &arena, skim)
-            .and_then(|p| codegen::generate_lazy(&p, 0, &source, &*at, &[]))
+            .and_then(|p| codegen::generate_lazy_units(&p, 0, &source, &*at, &[]))
     };
     match compile(true) {
         Err(e) if e.msg == codegen::SKIMMED_TOO_SOON => compile(false),
@@ -152,7 +152,7 @@ pub fn compile_indirect_eval_source(src: &Source) -> Result<Module, String> {
         parse::parse_source_code(src, &arena, skim).and_then(|mut p| {
             p.eval_locals = p.functions[0].strict;
             p.script = false;
-            codegen::generate_lazy(&p, 0, &source, &*at, &[])
+            codegen::generate_lazy_units(&p, 0, &source, &*at, &[])
         })
     };
     match compile(true) {
@@ -194,7 +194,7 @@ pub fn compile_direct_eval_source(
         let arena = ast::Arenas::default();
         parse::parse_source_code_as(src, &arena, skim, Some((strict, chain, !bound.is_empty(), global, new_target, home, live_this))).and_then(|mut p| {
             p.eval_upvalues = bound.to_vec();
-            codegen::generate_lazy(&p, 0, &source, &*at, &[])
+            codegen::generate_lazy_units(&p, 0, &source, &*at, &[])
         })
     };
     match compile(true) {
@@ -260,7 +260,7 @@ pub fn compile_lazy(f: &LazyFn) -> Result<Module, String> {
         let arena = ast::Arenas::default();
         parse::parse_source_code(&Source::of_unit_string(&text), &arena, skim).and_then(|mut p| {
             p.own_names = f.own_names.iter().map(|n| (**n).into()).collect();
-            codegen::generate_lazy(&p, 2, &f.source, &at, &f.upvalues)
+            codegen::generate_lazy_units(&p, 2, &f.source, &at, &f.upvalues)
         })
     };
     match compile(true) {

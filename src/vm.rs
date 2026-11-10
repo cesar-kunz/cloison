@@ -396,8 +396,8 @@ pub struct Code {
     pub kind: u8,
     /// Its code starts with `LdaNewTarget`.
     pub uses_new_target: bool,
-    /// Its source text (see `asm::FunctionDef::text`).
-    pub text: Option<(std::rc::Rc<str>, u32, u32)>,
+    /// Its source text (see `asm::FunctionDef::text`, [`Code::text_units`]).
+    pub(crate) text: Option<(std::rc::Rc<str>, u32, u32)>,
     /// Register count, `r0` (`this`) and the parameters included.
     pub nregs: u32,
     /// Its inline caches, one slot per `ic_names` entry, made when first
@@ -517,6 +517,12 @@ pub struct Code {
 }
 
 impl Code {
+    /// Its source text's code units (`Function.prototype.toString`'s), if
+    /// it has one.
+    pub fn text_units(&self) -> Option<Vec<u16>> {
+        crate::asm::text_units(&self.text)
+    }
+
     /// Whether `new` may call it.
     pub fn constructor(&self) -> bool {
         !matches!(self.kind, 1 | 4 | 5 | 6)

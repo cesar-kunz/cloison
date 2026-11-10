@@ -40,12 +40,26 @@ pub fn generate_source(p: &Program, src: &super::lex::Source) -> Result<Module, 
 
 /// Compile only function `root` of `p` and leave the functions nested in
 /// it for later: each a stub ([`LazyFn`]) that compiles at its first call
-/// from its text in `source` (at the offsets `at` maps `p`'s to), as
-/// `lex::units_to_string` has its code units (see
-/// `lex::Source::unit_string`). Also
-/// `root`'s upvalues, by name. (`eval`'s and `Function`'s code; their
-/// functions mostly are never called: CodeLoad's.)
+/// from its text in `source` (at the offsets `at` maps `p`'s to), a
+/// script's text. Also `root`'s upvalues, by name. (`eval`'s and
+/// `Function`'s code; their functions mostly are never called:
+/// CodeLoad's.)
 pub fn generate_lazy<'p>(
+    p: &'p Program,
+    root: usize,
+    source: &Rc<str>,
+    at: &dyn Fn(Pos) -> Pos,
+    upvalues: &'p [Rc<str>],
+) -> Result<Module, Error> {
+    // (The text as functions keep it: see `lex::Source::unit_string`.)
+    let (units, map) = super::lex::Source::from_text(source).unit_string();
+    generate_lazy_units(p, root, &units, &|pos| map(at(pos)), upvalues)
+}
+
+/// [`generate_lazy`] of `source` as `lex::units_to_string` has code units
+/// (a string's source code, or `lex::Source::unit_string`'s), as
+/// functions keep their text.
+pub(crate) fn generate_lazy_units<'p>(
     p: &'p Program,
     root: usize,
     source: &Rc<str>,

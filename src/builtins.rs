@@ -1235,11 +1235,8 @@ pub(crate) fn function_to_string(vm: &mut Vm, this: Value, _: &[Value]) -> Resul
     };
     if unsafe { (*o).class } == Class::Function
         && !bound
-        && let Some((src, a, b)) = &code.text
-        && let Some(t) = src.get(*a as usize..*b as usize)
+        && let Some(u) = code.text_units()
     {
-        let mut u = Vec::new();
-        crate::js::lex::string_units(t, &mut u);
         return Ok(vm.new_string(&u));
     }
     let name = if bound { String::new() } else { code.name.clone() };

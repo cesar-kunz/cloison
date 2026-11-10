@@ -362,9 +362,20 @@ const LOCAL_REGS: usize = 160;
 /// evaluating the elements: a longer list goes in an array, or in parts.
 const SPARE_REGS: usize = 16;
 
-/// Inline-cache slots past which instructions share them (see `Gen::ic`):
-/// below 2^16, with room for the shared ones.
+/// Inline-cache slots past which instructions share them (see `Gen::ic`),
+/// which bounds the caches of a huge function (a big generated script's).
 const SHARED_ICS: usize = 60000;
+
+/// An index into one of a function's tables (inline caches, constants,
+/// nested functions) as its 4-byte operand. The JIT keeps them in `i32`s;
+/// a function can't have 2^31 of anything, but if it did, it fails here
+/// rather than wrapping around to another entry.
+fn index(i: usize) -> u32 {
+    match u32::try_from(i) {
+        Ok(k) if k <= i32::MAX as u32 => k,
+        _ => panic!("a function with more than 2^31 table entries"),
+    }
+}
 
 /// The name of the register holding a function's scope object.
 const ENV: &str = "%env";
@@ -1773,7 +1784,7 @@ struct Gen<'a> {
     labels: Vec<LabelInfo>,
     ics: Vec<Name>,
     /// The slots of `ics` that define properties (see `FunctionDef::defines`).
-    defines: Vec<u16>,
+    defines: Vec<u32>,
     /// The optional chains being compiled: where each one's evaluation
     /// goes once a part of it is null or undefined.
     chains: Vec<L>,
@@ -1784,7 +1795,13 @@ struct Gen<'a> {
     nregs: usize,
     locals: HashMap<&'a str, u8>,
     /// Shared inline-cache slots (see [`Gen::ic`]), by kind and name.
-    shared_ics: HashMap<String, u16>,
+    shared_ics: HashMap<String, u32>,
+    /// The indexes of `constants`, by string and by number's bits (a
+    /// generated script may have tens of thousands).
+    string_ids: HashMap<String, u32>,
+    number_ids: HashMap<u64, u32>,
+    /// The indexes of `closures`, by module function index.
+    closure_ids: HashMap<usize, u32>,
     /// Variables in the scope object (see [`generate`]).
     overflow: &'a [&'a str],
     /// Every function's.
@@ -1916,6 +1933,9 @@ impl<'a> Gen<'a> {
             overflows,
             boxed,
             shared_ics: HashMap::default(),
+            string_ids: HashMap::default(),
+            number_ids: HashMap::default(),
+            closure_ids: HashMap::default(),
             temp,
             acc: Acc::default(),
             reachable: true,
@@ -2514,15 +2534,15 @@ impl<'a> Gen<'a> {
     }
 
     /// An inline-cache slot for property `name`: one per instruction, but
-    /// past [`SHARED_ICS`] slots (2-byte operands) instructions of the same
-    /// `kind` (opcode, and what else their caches depend on) share one.
+    /// past [`SHARED_ICS`] slots instructions of the same `kind` (opcode,
+    /// and what else their caches depend on) share one.
     fn ic(&mut self, kind: &str, name: &str) -> Arg {
         if self.ics.len() >= SHARED_ICS {
             let key = format!("{kind}\0{name}");
             if let Some(&k) = self.shared_ics.get(&key) {
                 return Arg::Index(k);
             }
-            self.shared_ics.insert(key, self.ics.len() as u16);
+            self.shared_ics.insert(key, index(self.ics.len()));
         }
         let name = {
             let mut names = self.names.borrow_mut();
@@ -2536,7 +2556,7 @@ impl<'a> Gen<'a> {
             }
         };
         self.ics.push(name);
-        Arg::Index(self.ics.len() as u16 - 1)
+        Arg::Index(index(self.ics.len() - 1))
     }
 
     /// The `GetKeyed` of `ro[acc]` that a read-modify-write's `SetKeyed`
@@ -2644,27 +2664,28 @@ impl<'a> Gen<'a> {
     }
 
     /// The index of string constant `s` (made only if new).
-    fn const_str(&mut self, s: &str) -> u16 {
-        let i = (self.constants.iter())
-            .position(|c| matches!(c, Constant::String(x) if x == s))
-            .unwrap_or_else(|| {
-                self.constants.push(Constant::String(s.to_string()));
-                self.constants.len() - 1
-            });
-        i as u16
+    fn const_str(&mut self, s: &str) -> u32 {
+        if let Some(&i) = self.string_ids.get(s) {
+            return i;
+        }
+        let i = index(self.constants.len());
+        self.constants.push(Constant::String(s.to_string()));
+        self.string_ids.insert(s.to_string(), i);
+        i
     }
 
     /// The index of constant `c` (equal ones shared).
-    fn const_index(&mut self, c: Constant) -> u16 {
-        let same = |x: &Constant| match (x, &c) {
-            (Constant::Number(a), Constant::Number(b)) => a.to_bits() == b.to_bits(),
-            (a, b) => a == b,
+    fn const_index(&mut self, c: Constant) -> u32 {
+        let d = match c {
+            Constant::String(s) => return self.const_str(&s),
+            Constant::Number(d) => d,
         };
-        let i = self.constants.iter().position(same).unwrap_or_else(|| {
-            self.constants.push(c);
-            self.constants.len() - 1
-        });
-        i as u16
+        let i = index(self.constants.len());
+        let i = *self.number_ids.entry(d.to_bits()).or_insert(i);
+        if i as usize == self.constants.len() {
+            self.constants.push(Constant::Number(d));
+        }
+        i
     }
 
     /// Whether `name` is looked up in `with` objects first: some enclose
@@ -2982,15 +3003,12 @@ impl<'a> Gen<'a> {
     }
 
     fn closure(&mut self, f: usize) {
-        let i = self
-            .closures
-            .iter()
-            .position(|&c| c == f)
-            .unwrap_or_else(|| {
-                self.closures.push(f);
-                self.closures.len() - 1
-            });
-        self.emit(Op::CreateClosure, &[Arg::Index(i as u16)]);
+        let i = index(self.closures.len());
+        let i = *self.closure_ids.entry(f).or_insert(i);
+        if i as usize == self.closures.len() {
+            self.closures.push(f);
+        }
+        self.emit(Op::CreateClosure, &[Arg::Index(i)]);
     }
 
     /// The accumulator stored to variable `name` of scope object `env`, a

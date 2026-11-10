@@ -15533,3 +15533,49 @@ out.join(" ") + " " + seen.join(",");
          [object Null] [object Undefined] object,object,object,object,object"
     );
 }
+
+/// More than 2^16 entries in one function's tables: inline caches (a
+/// script's `var`s, its properties), constants (strings, numbers that
+/// aren't int32s) and nested functions. Their operands were 2 bytes, and
+/// an index past 65535 wrapped to another entry's: 18,000 `var`s
+/// initialized from calls called a number literal (#176).
+#[test]
+fn a_function_indexes_more_than_65536_caches_constants_and_closures() {
+    let n = 18000;
+    let mut src = String::from("function f(n){return n}\n");
+    for i in 0..n {
+        src += &format!("var v{i} = f({i}); var g{i} = function(){{return {i}}};\n");
+    }
+    src += &format!("v{} + g{}();", n - 1, n - 1);
+    assert_eq!(value(&src), "35998");
+
+    let n = 70000;
+    let last = n - 1;
+    let each = |f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<String>();
+    let cases = [
+        // Globals, each its own cache.
+        (each(&|i| format!("var v{i} = {i};\n")), format!("v{last} + v100"), last + 100),
+        // Nested functions.
+        (each(&|i| format!("a.push(function(){{return {i}}});\n")), format!("a[{last}]() + a[100]()"), last + 100),
+        // String constants.
+        (each(&|i| format!("a.push('{i}');\n")), format!("+a[{last}] + +a[100]"), last + 100),
+        // An object literal's properties (caches that define them).
+        (
+            format!("var o = {{{}}};\n", each(&|i| format!("k{i}:{i},"))),
+            format!("o.k{last} + o.k100 + Object.keys(o).length"),
+            last + 100 + n,
+        ),
+        // Property stores, in a function.
+        (
+            format!("function h(){{var o = {{}};\n{}return o;}}\nvar o = h();\n", each(&|i| format!("o.p{i} = {i};\n"))),
+            format!("o.p{last} + o.p100"),
+            last + 100,
+        ),
+    ];
+    for (body, expr, want) in cases {
+        assert_eq!(value(&format!("var a = [];\n{body}{expr};")), want.to_string(), "{expr}");
+    }
+    // Numbers that aren't int32s: each its own constant.
+    let src = format!("var s = 0;\n{}s;", each(&|i| format!("s += {i}.5;\n")));
+    assert_eq!(value(&src), "2450000000");
+}

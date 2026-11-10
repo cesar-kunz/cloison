@@ -353,7 +353,7 @@ unsafe fn note_accessor(ic: *mut Ic, shape: *const Shape, holder: *mut Object, e
 /// hit path and the JIT read only that way (there is one global object);
 /// left holding a shape the global had before, it sent the shape it has now
 /// to the second way, and every load after that missed.
-unsafe fn global_way(code: &Code, ic: u16) {
+unsafe fn global_way(code: &Code, ic: u32) {
     unsafe { (*code.ic(ic).0).shape = std::ptr::null() }
 }
 
@@ -409,7 +409,7 @@ pub struct Code {
     /// The `SetNamed` slots that define their property, an object
     /// literal's: what a prototype's setter or read-only property of the
     /// name doesn't change (see `Vm::set_named_miss`).
-    pub define_ics: Box<[u16]>,
+    pub define_ics: Box<[u32]>,
     /// The nested functions, by `CreateClosure` operand.
     pub closures: Vec<*const Code>,
     /// `LdaConstant`'s values.
@@ -524,7 +524,7 @@ impl Code {
 
     /// The inline-cache slot `i` (its way 0, the others following), and
     /// the name it looks up.
-    pub fn ic(&self, i: u16) -> (*mut Ic, Atom) {
+    pub fn ic(&self, i: u32) -> (*mut Ic, Atom) {
         (self.ics()[i as usize].get().cast(), self.ic_names[i as usize])
     }
 
@@ -3571,7 +3571,7 @@ impl Vm {
     // ---- Inline-cache misses ----
 
     /// `GetNamed` miss: look `obj.name` up and cache how, if possible.
-    pub fn get_named_miss(&mut self, code: &Code, ic: u16, obj: Value) -> Result<Value> {
+    pub fn get_named_miss(&mut self, code: &Code, ic: u32, obj: Value) -> Result<Value> {
         code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
         let (ic, name) = code.ic(ic);
         if !obj.is_cell() {
@@ -3650,7 +3650,7 @@ impl Vm {
     }
 
     /// `SetNamed` miss: store `obj.name = value` and cache how, if possible.
-    pub fn set_named_miss(&mut self, code: &Code, k: u16, obj: Value, value: Value) -> Result<()> {
+    pub fn set_named_miss(&mut self, code: &Code, k: u32, obj: Value, value: Value) -> Result<()> {
         let (ic, name) = code.ic(k);
         // (Not a miss where the cache has the transition, out of line, and
         // only the object's `props` had no room: the store grows them. As
@@ -3875,7 +3875,7 @@ impl Vm {
     /// first way as the global object's are (see `global_way`), once
     /// initialized: it never is uninitialized again. `None` if there is no
     /// such binding.
-    fn get_global_lexical(&mut self, code: &Code, ic: u16) -> Option<Result<Value>> {
+    fn get_global_lexical(&mut self, code: &Code, ic: u32) -> Option<Result<Value>> {
         let (ic, name) = code.ic(ic);
         let slot = self.global_lexical_slot(name)?;
         let l = self.global_lexicals;
@@ -3898,7 +3898,7 @@ impl Vm {
     /// scope's block-scoped binding: a ReferenceError if not initialized
     /// yet, a TypeError for a `const`; cached as the global object's are
     /// (see `set_global_miss`). `None` if there is no such binding.
-    fn set_global_lexical(&mut self, code: &Code, ic: u16, value: Value) -> Option<Result<()>> {
+    fn set_global_lexical(&mut self, code: &Code, ic: u32, value: Value) -> Option<Result<()>> {
         let (ic, name) = code.ic(ic);
         let slot = self.global_lexical_slot(name)?;
         let l = self.global_lexicals;
@@ -3950,7 +3950,7 @@ impl Vm {
     }
 
     /// `LdaGlobal` miss: a ReferenceError if the global doesn't exist.
-    pub fn get_global_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
+    pub fn get_global_miss(&mut self, code: &Code, ic: u32) -> Result<Value> {
         if let Some(r) = self.get_global_lexical(code, ic) {
             return r;
         }
@@ -3970,7 +3970,7 @@ impl Vm {
 
     /// `LdaGlobalInsideTypeof` miss: as `LdaGlobal`'s, but `undefined` for a
     /// missing global.
-    pub fn get_global_typeof_miss(&mut self, code: &Code, ic: u16) -> Result<Value> {
+    pub fn get_global_typeof_miss(&mut self, code: &Code, ic: u32) -> Result<Value> {
         if let Some(r) = self.get_global_lexical(code, ic) {
             return r;
         }
@@ -4037,7 +4037,7 @@ impl Vm {
 
     /// `StaGlobal` miss (sloppy mode: creates the global if missing). Only
     /// stores to existing globals are cached.
-    pub fn set_global_miss(&mut self, code: &Code, ic: u16, value: Value) -> Result<()> {
+    pub fn set_global_miss(&mut self, code: &Code, ic: u32, value: Value) -> Result<()> {
         if let Some(r) = self.set_global_lexical(code, ic, value) {
             return r;
         }
@@ -4644,7 +4644,7 @@ impl Vm {
     pub fn get_keyed_miss(
         &mut self,
         code: &Code,
-        ic: u16,
+        ic: u32,
         obj: Value,
         key: Value,
     ) -> Result<Value> {
@@ -5162,7 +5162,7 @@ impl Vm {
 
     /// `CreateObject n`: a plain object with room for `n` properties in
     /// itself, its root shape cached in inline-cache slot `ic`.
-    pub fn create_object(&mut self, code: &Code, ic: u16, n: u32) -> Value {
+    pub fn create_object(&mut self, code: &Code, ic: u32, n: u32) -> Value {
         let (ic, _) = code.ic(ic);
         unsafe {
             // (Or made again if no object had it at a full collection:
@@ -5468,7 +5468,7 @@ impl Vm {
 
     /// A new closure of `code`'s nested function `i`, with a fresh
     /// `prototype` object.
-    pub fn create_closure(&mut self, code: &Code, i: u16) -> Value {
+    pub fn create_closure(&mut self, code: &Code, i: u32) -> Value {
         self.new_closure(code.closures[i as usize])
     }
 
@@ -5487,7 +5487,7 @@ impl Vm {
     pub(crate) fn create_closure_in(
         &mut self,
         code: &Code,
-        i: u16,
+        i: u32,
         regs: *mut Value,
         current: *const Object,
     ) -> Value {
@@ -7430,7 +7430,7 @@ fn recursive_functions(module: &Module) -> Vec<bool> {
                 && op_at(star + Op::Star.size()) == Some(Op::GetNamed)
                 && code[star + 1] == code[star + Op::Star.size() + 1]
             {
-                bases.push(u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize);
+                bases.push(u32::from_le_bytes(code[pc + 1..pc + 5].try_into().unwrap()) as usize);
             }
             pc = star;
         }

@@ -2342,7 +2342,8 @@ fn regexp_compile(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         if !flags.is_undefined() {
             return Err(Error::type_error("Cannot supply flags when constructing one RegExp from another"));
         }
-        let a_source = vm.a_source;
+        // (Its [[OriginalSource]], not the observable `source`.)
+        let a_source = vm.a_regexp_source;
         let src = vm.get(pattern, a_source)?;
         let src = crate::vm::source_text(string_units(src).unwrap_or(&[]));
         (if src == "(?:)" { String::new() } else { src }, regexp_flags(re))
@@ -2392,11 +2393,14 @@ fn regexp_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
         }
     }
     let (mut pattern, mut flags) = (String::new(), String::new());
-    let a_source = vm.intern_name("source");
     if let Some(re) = regexp_of(p) {
+        // (Its [[OriginalSource]] and [[OriginalFlags]], not the
+        // observable `source` and `flags`.)
+        let a_source = vm.a_regexp_source;
         pattern = crate::vm::source_text(&units(vm.get(p, a_source)?));
         flags = regexp_flags(re);
     } else if is_re {
+        let a_source = vm.a_source;
         // (A RegExp-like object: its `source`, and its `flags` unless
         // given.)
         pattern = crate::vm::source_text(&units(vm.get(p, a_source)?));
@@ -2849,7 +2853,7 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
     match K {
         0 => string_match(vm, s, &args),
-        1 => string_match_all(vm, s, &args),
+        1 => match_all(vm, s, this),
         2 => string_replace(vm, s, &args),
         3 => string_search(vm, s, &args),
         _ => string_split(vm, s, &args),
@@ -2900,22 +2904,28 @@ fn string_match_all(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if let Some(r) = delegate(vm, "matchAll", this, a, string_match_all)? {
         return Ok(r);
     }
-    let s = this_units(this)?;
     let pattern = arg(a, 0);
-    let rv = match regexp_of(pattern) {
-        Some(re) if !re.global => {
-            return Err(Error::type_error("String.prototype.matchAll called with a non-global RegExp argument"));
+    let rv = if regexp_of(pattern).is_some() {
+        pattern
+    } else {
+        let p = if pattern.is_undefined() { String::new() } else { crate::vm::source_text(&units(pattern)) };
+        if vm.conv_failed() {
+            return Err(vm.take_conv_error());
         }
-        Some(_) => pattern,
-        None => {
-            let p = if pattern.is_undefined() { String::new() } else { crate::vm::source_text(&units(pattern)) };
-            if vm.conv_failed() {
-                return Err(vm.take_conv_error());
-            }
-            new_regexp(vm, &p, "g")?
-        }
+        new_regexp(vm, &p, "g")?
     };
+    match_all(vm, this, rv)
+}
+
+/// `RegExp.prototype[Symbol.matchAll]` of string `this` with pristine
+/// RegExp `rv` (no IsRegExp or "g" check: those are `matchAll`'s).
+fn match_all(vm: &mut Vm, this: Value, rv: Value) -> Result<Value> {
     let re = regexp_of(rv).unwrap();
+    // (Not global: one match, as `exec` finds it.)
+    if !re.global {
+        return rx_match_all(vm, rv, this);
+    }
+    let s = this_units(this)?;
     let a_last = vm.a_last_index;
     let li = vm.get(rv, a_last)?;
     let li = to_number(li);

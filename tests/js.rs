@@ -1314,6 +1314,33 @@ r.join(" ");
     );
 }
 
+/// `RegExp` and `compile` copy a RegExp's internal source, not what a
+/// redefined `source` getter says (nor do the species copies of
+/// `matchAll` and `split`); `RegExp.prototype[Symbol.matchAll]` takes a
+/// non-global RegExp (the "g" check is `String.prototype.matchAll`'s).
+#[test]
+fn regexp_copies_take_the_internal_source() {
+    assert_eq!(
+        value(
+            r#"
+var r = [];
+function t(f) { try { return String(f()); } catch (e) { return e.name; } }
+var ma = RegExp.prototype[Symbol.matchAll];
+r.push([...ma.call(/a/, "aa")].length, [.../a/g[Symbol.matchAll]("aa")].length, t(() => "aa".matchAll(/a/)));
+var y = /a/y; y.lastIndex = 1;
+r.push(JSON.stringify([...ma.call(y, "aab")]), y.lastIndex);
+Object.defineProperty(RegExp.prototype, "source", { get() { return "b"; } });
+r.push(new RegExp(/a/).test("a"), new RegExp(/a/, "i").test("A"), RegExp(/a/, "g").test("a"), /x/.compile(/a/).test("a"));
+class S extends RegExp {}
+r.push(new S(/a/).test("a"), [..."aa".matchAll(new S("a", "g"))].length, "cac".split(new S("a")).join("|"));
+r.push(new RegExp({ [Symbol.match]: true, source: "c", flags: "" }).test("c"));
+r.join(" ");
+"#
+        ),
+        "1 2 TypeError [[\"a\"]] 1 true true true true true 2 c|c true"
+    );
+}
+
 /// Array destructuring closes its iterator where a default, a nested
 /// pattern or a target throws, and evaluates a target's object and key
 /// before its step (a rest's before draining the iterator).

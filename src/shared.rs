@@ -246,10 +246,14 @@ fn prune(vm: &mut Vm) -> Result<()> {
 }
 
 /// A shared buffer on block `b` (growable if `growable`), whose reference
-/// to it the VM takes over.
+/// to it the VM takes over, even if this fails (#225).
 pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<Value> {
-    // (Before `b` is among the blocks: no buffer on it is in the set yet.)
-    prune(vm)?;
+    // (Before `b` is among the blocks: no buffer on it is in the set yet.
+    // Once it is, a failure leaves it to the next pruning.)
+    if let Err(e) = prune(vm) {
+        release(b);
+        return Err(e);
+    }
     let s = &mut vm.shared;
     s.blocks.push(b);
     // A full collection once the blocks have doubled since the last.

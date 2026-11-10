@@ -22,11 +22,17 @@
 //! the first one on, compiled code leaves typed arrays' elements to the
 //! runtime, as it does once a buffer has been detached
 //! (`Vm::views_detached`).
+//!
+//! A view of a growable shared buffer has flag `SHARED_GROWABLE`: where
+//! the spec reads its length seq-cst, it is read from the buffer's block
+//! first ([`read_view_length`]), as another agent may have grown it, and
+//! compiled code leaves its `length` to the runtime (see `shared`).
 
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_number};
 use crate::object::{
-    Class, DETACHED, DONT_DELETE, DONT_ENUM, IMMUTABLE_VIEW, Object, READ_ONLY, TypedKind, as_object, object_value,
+    Class, DETACHED, DONT_DELETE, DONT_ENUM, IMMUTABLE_VIEW, Object, READ_ONLY, SHARED_GROWABLE, TypedKind, as_object,
+    object_value,
 };
 use crate::props::{is_callable, is_object};
 use crate::value::Value;
@@ -289,8 +295,28 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
             (*o).flags |= IMMUTABLE_VIEW;
         }
     }
+    if is_resizable(b) && crate::shared::is_shared(b) {
+        unsafe { (*o).flags |= SHARED_GROWABLE };
+        // (Compiled code that read a known typed array's length unchecked
+        // dropped: see `jit`'s `Prop::Length`.)
+        if !vm.shared_growable_views {
+            vm.shared_growable_views = true;
+            vm.bump_code_epoch();
+        }
+    }
     register(vm, b, object_value(o))?;
     Ok(object_value(o))
+}
+
+/// View `o`'s buffer's length read from its block, if it's a growable
+/// shared one's (flag `SHARED_GROWABLE`), before the spec's seq-cst read
+/// of it (MakeTypedArrayWithBufferWitnessRecord(o, seq-cst)): another
+/// agent may have grown it (#156; see `shared`).
+#[inline]
+pub(crate) fn read_view_length(vm: &mut Vm, o: *mut Object) {
+    if unsafe { (*o).flags } & SHARED_GROWABLE != 0 {
+        crate::shared::read_length(vm, buffer_of(o));
+    }
 }
 
 /// A typed array of kind `k` gets prototype `proto`. Compiled code takes
@@ -538,9 +564,11 @@ fn this_typed(this: Value) -> Result<*mut Object> {
     }
 }
 
-/// ValidateTypedArray: `v` a typed array in bounds, and its length.
-fn validate(v: Value) -> Result<(*mut Object, usize)> {
+/// ValidateTypedArray(v, seq-cst): `v` a typed array in bounds, and its
+/// length.
+fn validate(vm: &mut Vm, v: Value) -> Result<(*mut Object, usize)> {
     let o = this_typed(v)?;
+    read_view_length(vm, o);
     match ta_length(o) {
         Some(n) => Ok((o, n)),
         None => Err(Error::type_error("Cannot perform this operation on a detached or out of bounds typed array")),
@@ -595,7 +623,7 @@ fn constructor_of(vm: &mut Vm, k: TypedKind) -> Result<Value> {
 /// (with `n`, at least that long).
 fn create_from(vm: &mut Vm, c: Value, args: &[Value], n: Option<usize>) -> Result<*mut Object> {
     let out = crate::intrinsics::construct(vm, c, args)?;
-    let (o, len) = validate(out)?;
+    let (o, len) = validate(vm, out)?;
     // (With `n`, the caller writes into it.)
     if n.is_some() {
         writable_view(o)?;
@@ -648,6 +676,8 @@ fn typed_ctor<const K: usize>(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Valu
     let fo = as_object(first);
     match unsafe { (*fo).class } {
         Class::TypedArray => {
+            // (Its record made seq-cst.)
+            read_view_length(vm, fo);
             let Some(n) = ta_length(fo) else {
                 return Err(Error::type_error("Cannot construct from a detached or out of bounds typed array"));
             };
@@ -821,18 +851,24 @@ fn typed_buffer(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(object_value(buffer_of(this_typed(this)?)))
 }
 
-fn typed_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+// (The getters' records are made seq-cst: 23.2.3.)
+
+fn typed_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
+    read_view_length(vm, o);
     Ok(Value::number((ta_length(o).unwrap_or(0) * kind_of(o).size()) as f64))
 }
 
-fn typed_byte_offset(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+fn typed_byte_offset(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
+    read_view_length(vm, o);
     Ok(Value::number(if ta_length(o).is_some() { offset_of(o) as f64 } else { 0.0 }))
 }
 
-fn typed_length_getter(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::number(ta_length(this_typed(this)?).unwrap_or(0) as f64))
+fn typed_length_getter(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let o = this_typed(this)?;
+    read_view_length(vm, o);
+    Ok(Value::number(ta_length(o).unwrap_or(0) as f64))
 }
 
 /// `get %TypedArray%.prototype[Symbol.toStringTag]`: the kind's name.
@@ -853,7 +889,7 @@ fn callback(a: &[Value], what: &str) -> Result<Value> {
 }
 
 fn typed_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let r = integer(vm, arg(a, 0))?;
     let k = if r >= 0.0 { r } else { len as f64 + r };
     if k < 0.0 || k >= len as f64 {
@@ -863,7 +899,7 @@ fn typed_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     let to = relative(integer(vm, arg(a, 0))?, len);
     let from = relative(integer(vm, arg(a, 1))?, len);
@@ -891,7 +927,7 @@ fn typed_copy_within(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 /// `every`'s, `some`'s and the `find`s' loop: `f(value, index, o)` for each
 /// index from the start (`back`: the end), until `stop` of its result.
 fn search(vm: &mut Vm, this: Value, a: &[Value], what: &str, back: bool, stop: bool) -> Result<Option<(usize, Value)>> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let f = callback(a, what)?;
     let this_arg = arg(a, 1);
     for j in 0..len {
@@ -930,7 +966,7 @@ fn typed_find_last_index(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 }
 
 fn typed_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let f = callback(a, "forEach")?;
     let this_arg = arg(a, 1);
     for i in 0..len {
@@ -941,7 +977,7 @@ fn typed_for_each(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     let v = to_element(vm, kind_of(o), arg(a, 0))?;
     let s = relative(integer(vm, arg(a, 1))?, len);
@@ -957,7 +993,7 @@ fn typed_fill(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_filter(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let f = callback(a, "filter")?;
     let this_arg = arg(a, 1);
     vm.handle_scope(|vm| {
@@ -989,7 +1025,7 @@ fn from_index(vm: &mut Vm, v: Value, len: usize) -> Result<Option<usize>> {
 }
 
 fn typed_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     if len == 0 {
         return Ok(Value::FALSE);
     }
@@ -999,7 +1035,7 @@ fn typed_includes(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     if len == 0 {
         return Ok(Value::from_i32(-1));
     }
@@ -1011,7 +1047,7 @@ fn typed_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     if len == 0 {
         return Ok(Value::from_i32(-1));
     }
@@ -1030,7 +1066,7 @@ fn typed_last_index_of(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let sep: Vec<u16> = match arg(a, 0) {
         s if s.is_undefined() => vec![b',' as u16],
         s => {
@@ -1059,7 +1095,7 @@ pub(crate) fn typed_join(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value>
 }
 
 fn typed_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let f = callback(a, "map")?;
     let this_arg = arg(a, 1);
     let out = species_create(vm, o, &[Value::number(len as f64)], Some(len))?;
@@ -1076,7 +1112,7 @@ fn typed_map(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 /// `reduce` (`back`: `reduceRight`).
 fn reduce(vm: &mut Vm, this: Value, a: &[Value], back: bool) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let f = callback(a, if back { "reduceRight" } else { "reduce" })?;
     let mut order: Box<dyn Iterator<Item = usize>> = if back { Box::new((0..len).rev()) } else { Box::new(0..len) };
     let mut acc = if a.len() >= 2 {
@@ -1102,8 +1138,8 @@ fn typed_reduce_right(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     reduce(vm, this, a, true)
 }
 
-fn typed_reverse(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+fn typed_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     for i in 0..len / 2 {
         let (x, y) = (get(o, i), get(o, len - 1 - i));
@@ -1122,6 +1158,8 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if offset < 0.0 {
         return Err(Error::range_error("offset is out of bounds"));
     }
+    // (The target's and a typed array source's records made seq-cst.)
+    read_view_length(vm, o);
     let Some(len) = ta_length(o) else {
         return Err(Error::type_error("Cannot perform set on a detached or out of bounds typed array"));
     };
@@ -1129,6 +1167,7 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let k = kind_of(o);
     if is_class(src, Class::TypedArray) {
         let s = as_object(src);
+        read_view_length(vm, s);
         let Some(n) = ta_length(s) else {
             return Err(Error::type_error("Cannot set from a detached or out of bounds typed array"));
         };
@@ -1171,7 +1210,7 @@ fn typed_set(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let s = relative(integer(vm, arg(a, 0))?, len);
     let end = arg(a, 1);
     let e = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
@@ -1279,7 +1318,7 @@ fn values(vm: &mut Vm, o: *mut Object, len: usize) -> Vec<Value> {
 
 fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let cmp = comparator(a)?;
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     writable_view(o)?;
     vm.handle_scope(|vm| {
         let mut values = values(vm, o, len);
@@ -1293,7 +1332,7 @@ fn typed_sort(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 
 fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let cmp = comparator(a)?;
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let out = create_same(vm, o, len)?;
     vm.handle_scope(|vm| {
         vm.handles.push(object_value(out));
@@ -1307,7 +1346,7 @@ fn typed_to_sorted(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let out = create_same(vm, o, len)?;
     for i in 0..len {
         put(out, i, get(o, len - 1 - i));
@@ -1316,7 +1355,7 @@ fn typed_to_reversed(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 }
 
 fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let r = integer(vm, arg(a, 0))?;
     let i = if r >= 0.0 { r } else { len as f64 + r };
     let v = to_element(vm, kind_of(o), arg(a, 1))?;
@@ -1336,6 +1375,8 @@ fn typed_with(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_typed(this)?;
     let b = buffer_of(o);
+    // (Its record made seq-cst.)
+    read_view_length(vm, o);
     let len = ta_length(o).unwrap_or(0);
     let s = relative(integer(vm, arg(a, 0))?, len);
     let k = kind_of(o);
@@ -1363,7 +1404,7 @@ fn typed_subarray(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn typed_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let (o, len) = validate(this)?;
+    let (o, len) = validate(vm, this)?;
     let mut out = Vec::new();
     let a_tls = vm.intern_name("toLocaleString");
     for i in 0..len {
@@ -1385,7 +1426,7 @@ fn typed_to_locale_string(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value
 /// `keys()`, `values()` and `entries()` (`K`: 0, 1, 2): an array iterator
 /// over a typed array in bounds.
 fn typed_iterator<const K: i32>(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    validate(this)?;
+    validate(vm, this)?;
     crate::symbol::array_iterator(vm, this, K)
 }
 

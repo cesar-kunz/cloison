@@ -903,6 +903,10 @@ pub struct Vm {
     /// A fixed-length buffer has been detached (see `typed::detach`): its
     /// views' lengths, which nothing brought up to date, may be stale.
     pub(crate) views_detached: bool,
+    /// Some typed array or `DataView` is of a growable shared buffer
+    /// (`object::SHARED_GROWABLE`): compiled code reads no typed array's
+    /// length unchecked.
+    pub(crate) shared_growable_views: bool,
     /// Some typed array has had another kind's prototype (see
     /// `typed::note_proto`): a shape no longer says the kind of its typed
     /// arrays' elements.
@@ -1355,6 +1359,7 @@ impl Vm {
             density: crate::far::Density::from_env(),
             far_keys: Default::default(),
             views_detached: false,
+            shared_growable_views: false,
             typed_protos_crossed: false,
             proxies_exist: false,
             function_prototype_loc: 0,
@@ -3322,7 +3327,7 @@ impl Vm {
             if name == self.a_length
                 && matches!((*o).class, Class::Array | Class::String | Class::TypedArray)
             {
-                return Ok(Value::number(Self::length_field(o) as f64));
+                return Ok(Value::number(self.length_field(o) as f64));
             }
             if self.typed_numeric(o, name) {
                 return Ok(Value::UNDEFINED);
@@ -3349,10 +3354,12 @@ impl Vm {
 
     /// An array's, a string's or a typed array's `length` (a typed array's
     /// 0 once its buffer is detached: see `typed::ta_length`; a far array's
-    /// its store's: see `far`).
-    fn length_field(o: *mut Object) -> u32 {
+    /// its store's: see `far`; a growable shared buffer's view's read from
+    /// its block, as the getter would: see `typed::read_view_length`).
+    fn length_field(&mut self, o: *mut Object) -> u32 {
         unsafe {
             if (*o).class == Class::TypedArray {
+                crate::typed::read_view_length(self, o);
                 return crate::typed::ta_length(o).unwrap_or(0) as u32;
             }
             crate::far::array_length(o)
@@ -3369,7 +3376,7 @@ impl Vm {
             unsafe {
                 let class = (*p).class;
                 if name == self.a_length && matches!(class, Class::Array | Class::String | Class::TypedArray) {
-                    return Value::number(Self::length_field(p) as f64);
+                    return Value::number(self.length_field(p) as f64);
                 }
                 if matches!(class, Class::Function | Class::Native | Class::Wrapper)
                     && let Some(d) = self.own_property(p, Key::Name(name))
@@ -3710,7 +3717,7 @@ impl Vm {
                     loc: LENGTH_LOC,
                     ..Ic::EMPTY
                 };
-                return Ok(Value::number(Self::length_field(o) as f64));
+                return Ok(Value::number(self.length_field(o) as f64));
             }
             // Absent: cached as a load from `missing_holder`'s `undefined`
             // slot, valid (like a prototype's property) while no prototype

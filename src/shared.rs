@@ -321,8 +321,19 @@ pub(crate) fn read_length(vm: &mut Vm, o: *mut Object) -> usize {
 // (the memory model, clause 29: a seq-cst read synchronizes with the
 // seq-cst write it reads; an `Atomics` operation's, a buffer length's
 // read by `byteLength`, `grow` or `slice` (25.2.5.1, 25.2.5.3,
-// 25.2.5.6), a waiter list's critical section, a message). It counts the
-// grows (`GROWS`), and skips when the count is the one it last recorded.
+// 25.2.5.6) or a view's (`read_length`: a view's constructor, its
+// getters and methods, below), a waiter list's critical section, a
+// message). It counts the grows (`GROWS`), and skips when the count is
+// the one it last recorded.
+//
+// A view of a growable buffer (flag `SHARED_GROWABLE`) reads its length
+// from the block wherever the spec reads it seq-cst (its `length`,
+// `byteLength` and `byteOffset`, ValidateTypedArray, the array
+// iterator's `next`: MakeTypedArrayWithBufferWitnessRecord(o, seq-cst),
+// 23.2.3, 25.3.4), so a loop polling it sees another agent's grow
+// (#156); compiled code's length reads leave it to the runtime. Element
+// accesses keep reading the cached length: the spec reads it unordered
+// (IsValidIntegerIndex), and a cache is never longer than its block.
 //
 // Invariant: a VM records a count only once every grow it counts has
 // its length written before the VM's lengths are read again. So, all

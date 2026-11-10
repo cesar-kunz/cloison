@@ -849,7 +849,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
         Some(e) => (e.code, e.own_strict, e.declared.clone(), e.annex_b.clone(), true),
         None => {
             let source: Box<[u16]> = u.into();
-            let text = crate::js::lex::units_to_string(u);
+            let text = crate::js::lex::Source::from_units(u);
             let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, live_this, &chain.text(), global, &[]).map_err(eval_error)?;
             let annex_b: std::rc::Rc<[crate::object::Atom]> = module.annex_b.iter().map(|n| vm.intern_name(n)).collect();
             // Strict code's `var`s are its own: in a scope object of its own.
@@ -979,7 +979,7 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
         Some(e) => (e.code, e.own_strict, e.declared.clone(), true),
         None => {
             let source: Box<[u16]> = u.into();
-            let text = crate::js::lex::units_to_string(u);
+            let text = crate::js::lex::Source::from_units(u);
             let (_, nups, bindings) = site_bindings(site);
             let bound: Vec<(crate::js::ast::Name, u8, crate::js::ast::Name, usize)> = (0..nups)
                 .map(|k| match bindings.iter().find(|b| b.2 == Some(k)) {

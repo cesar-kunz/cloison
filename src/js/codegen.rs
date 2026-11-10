@@ -25,8 +25,8 @@ use std::rc::Rc;
 use crate::asm::{Constant, FunctionDef, LazyFn, Module};
 use crate::bytecode::{Arg, Assembler, Label, Op};
 
-pub fn generate(p: &Program, src: &str) -> Result<Module, Error> {
-    generate_from(p, None, src).map(|(m, _)| m)
+pub fn generate(p: &Program, src: &super::lex::Source) -> Result<Module, Error> {
+    generate_from(p, None, src.as_str()).map(|(m, _)| m)
 }
 
 /// Compile only function `root` of `p` and leave the functions nested in
@@ -34,7 +34,7 @@ pub fn generate(p: &Program, src: &str) -> Result<Module, Error> {
 /// from its text in `source` (at the offsets `at` maps `p`'s to). Also
 /// `root`'s upvalues, by name. (`eval`'s and `Function`'s code; their
 /// functions mostly are never called: CodeLoad's.)
-pub fn generate_lazy<'p>(
+pub(crate) fn generate_lazy<'p>(
     p: &'p Program,
     root: usize,
     source: &Rc<str>,

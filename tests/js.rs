@@ -1328,6 +1328,52 @@ fn source_private_use_characters_stay_themselves() {
     assert!(compile_error("var x = \"\u{F0000}\"; x x").starts_with("1:16:"), "{}", compile_error("var x = \"\u{F0000}\"; x x"));
 }
 
+/// The front end's public entry points take a file's text as it is: a
+/// private use character a lone surrogate's mapping uses (U+F0000, the
+/// `ESCAPE` U+F0800) or U+FDD0 in a string, template or regular
+/// expression literal that `lex` and `lex_as` give is itself (its code
+/// units in the value, the mapping's form), the tokens at the text's
+/// offsets; `parse`'s error offsets and `compile`'s and a module's
+/// columns count the text's characters, and so do `eval`'s.
+#[test]
+fn front_end_entry_points_take_text_as_it_is() {
+    use cloison::js::lex::{Tok, lex, lex_as, to_units};
+    for ch in ['\u{F0000}', '\u{F0800}', '\u{FDD0}'] {
+        let c = ch.to_string();
+        let units: Vec<u16> = c.encode_utf16().collect();
+        for module in [false, true] {
+            let src = format!("x = '{ch}'; y = `{ch}${{1}}{ch}`; z = /{ch}/u; w = \"a{ch}\\n\"");
+            let toks = lex_as(&src, module).unwrap();
+            let strs: Vec<Vec<u16>> = toks
+                .iter()
+                .filter_map(|t| match &t.tok {
+                    Tok::Str(s) => Some(to_units(s)),
+                    Tok::Template(p) => Some(to_units(p.cooked.as_deref().unwrap())),
+                    Tok::RegExp(r) => Some(to_units(&r.0)),
+                    _ => None,
+                })
+                .collect();
+            let nl: Vec<u16> = units.iter().copied().chain([10]).collect();
+            let a: Vec<u16> = [97].into_iter().chain(nl).collect();
+            assert_eq!(strs, [units.clone(), units.clone(), units.clone(), units.clone(), a], "{src}");
+            // (Each token at its offset in the text: `w` after the last.)
+            let w = toks.iter().find(|t| t.tok == Tok::Ident("w".into())).unwrap();
+            assert_eq!(w.pos as usize, src.find("w =").unwrap());
+            assert_eq!(lex(&src).unwrap().len(), toks.len());
+        }
+        let bad = format!("var x = \"{ch}\"; x x");
+        let e = cloison::js::parse(&bad).unwrap_err();
+        assert_eq!(e.pos, bad.rfind('x').unwrap(), "{bad}");
+        assert!(e.display(&bad).starts_with("1:16:"), "{}", e.display(&bad));
+        assert!(compile_error(&bad).starts_with("1:16:"), "{}", compile_error(&bad));
+        let dir = module_dir(&format!("text-columns-{}", ch as u32), &[("main.mjs", &bad)]);
+        let m = run_module(&dir, "main.mjs").unwrap_err();
+        assert!(m.contains(":1:16:"), "{m}");
+        let js = format!("var m; try {{ eval('var x = \"{ch}\"; x x'); }} catch (e) {{ m = e.message; }} m");
+        assert!(value(&js).starts_with("1:16:"), "{}", value(&js));
+    }
+}
+
 /// String methods' RegExp fast paths step aside where the spec's paths
 /// differ: a sticky separator splits as any, a RegExp whose `Symbol.<m>`
 /// is undefined is its string, redefined flags are what it has, and

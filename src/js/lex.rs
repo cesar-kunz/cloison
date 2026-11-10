@@ -147,19 +147,65 @@ pub fn has_lone_surrogate(s: &str) -> bool {
     false
 }
 
-/// Source text `s` (a file's) as the lexer takes it: as
-/// [`units_to_string`] would have its code units, the characters an
-/// [`ESCAPE`] precedes given theirs. (A string's source, `eval`'s, is
-/// [`units_to_string`]'s, its lone surrogates code units of their own:
-/// in a string, template or regular expression literal, as they are.)
-pub fn text_to_source(s: &str) -> std::borrow::Cow<'_, str> {
-    // (Characters to escape start with byte 0xEF or more.)
-    if !s.bytes().any(|c| c >= 0xEF) || !s.chars().any(|c| escaped(c as u32)) {
-        return std::borrow::Cow::Borrowed(s);
+/// Source code as the front end lexes it: its code units as
+/// [`units_to_string`] has them, so a lone surrogate (`eval`'s source is
+/// a string's) is a code unit of its own, in a string, template or
+/// regular expression literal as it is (see [`LONE_SURROGATES`]). A
+/// file's text is made one with [`Source::from_text`] (its characters an
+/// [`ESCAPE`] precedes given theirs), a string's with
+/// [`Source::from_units`]; the entry points taking a `&str` take text.
+#[derive(Clone, Debug)]
+pub struct Source<'a>(std::borrow::Cow<'a, str>);
+
+impl<'a> Source<'a> {
+    /// A file's text `s` as source code.
+    pub fn from_text(s: &'a str) -> Source<'a> {
+        // (Characters to escape start with byte 0xEF or more.)
+        if !s.bytes().any(|c| c >= 0xEF) || !s.chars().any(|c| escaped(c as u32)) {
+            return Source(std::borrow::Cow::Borrowed(s));
+        }
+        let mut out = String::with_capacity(s.len() + 16);
+        s.chars().for_each(|c| push_source_char(&mut out, c));
+        Source(std::borrow::Cow::Owned(out))
     }
-    let mut out = String::with_capacity(s.len() + 16);
-    s.chars().for_each(|c| push_source_char(&mut out, c));
-    std::borrow::Cow::Owned(out)
+
+    /// A string's code units as source code.
+    pub fn from_units(units: &[u16]) -> Source<'static> {
+        Source(std::borrow::Cow::Owned(units_to_string(units)))
+    }
+
+    /// Text already in the form (a piece of a `Source`'s, or ASCII).
+    pub(crate) fn encoded(s: &'a str) -> Source<'a> {
+        Source(std::borrow::Cow::Borrowed(s))
+    }
+
+    /// The source code in its form (not a file's text: see [`Source`]).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Offset `pos` of the source code in the text it was made of (with
+    /// [`Source::from_text`]): less the [`ESCAPE`]s put before it.
+    pub fn text_offset(&self, pos: usize) -> usize {
+        pos - escapes_before(&self.0, pos) * ESCAPE_LEN
+    }
+}
+
+/// The UTF-8 length of an [`ESCAPE`].
+const ESCAPE_LEN: usize = 4;
+
+/// The [`ESCAPE`]s source code `s` puts before characters up to byte
+/// `pos` (an escaped character is not one, an `ESCAPE` of the text too).
+pub(crate) fn escapes_before(s: &str, pos: usize) -> usize {
+    if !s.as_bytes()[..pos.min(s.len())].iter().any(|&c| c >= 0xEF) {
+        return 0;
+    }
+    let (mut n, mut after) = (0, false);
+    for c in s[..pos.min(s.len())].chars() {
+        after = !after && c as u32 == ESCAPE;
+        n += after as usize;
+    }
+    n
 }
 
 /// The source character at the start of `s` (as [`text_to_source`] has
@@ -281,13 +327,45 @@ fn too_long(s: &str) -> bool {
     s.len() > crate::vm::MAX_STRING_LEN && s.encode_utf16().count() > crate::vm::MAX_STRING_LEN
 }
 
-pub fn lex(src: &str) -> Result<Vec<Token>, Error> {
-    lex_as(src, false)
+/// The tokens of a script's text `text` (at its offsets).
+pub fn lex(text: &str) -> Result<Vec<Token>, Error> {
+    lex_as(text, false)
 }
 
-/// [`lex`]; `module`: as a module's source, where HTML-like comments are
+/// [`lex`]; `module`: as a module's text, where HTML-like comments are
 /// none (Annex B's are scripts' only).
-pub fn lex_as(src: &str, module: bool) -> Result<Vec<Token>, Error> {
+pub fn lex_as(text: &str, module: bool) -> Result<Vec<Token>, Error> {
+    let src = Source::from_text(text);
+    match lex_source(&src, module) {
+        // (Its offsets the text's: the `ESCAPE`s before each counted in
+        // one walk, the tokens in order.)
+        Ok(mut toks) if src.as_str().len() != text.len() => {
+            let s = src.as_str();
+            let (mut chars, mut n, mut after) = (s.char_indices().peekable(), 0, false);
+            for t in &mut toks {
+                while let Some(&(k, c)) = chars.peek()
+                    && k < t.pos as usize
+                {
+                    after = !after && c as u32 == ESCAPE;
+                    n += after as usize;
+                    chars.next();
+                }
+                t.pos -= (n * ESCAPE_LEN) as u32;
+            }
+            Ok(toks)
+        }
+        Ok(toks) => Ok(toks),
+        Err(mut e) => {
+            e.pos = src.text_offset(e.pos);
+            Err(e)
+        }
+    }
+}
+
+/// The tokens of source code `src` (at its offsets); `module`: as
+/// [`lex_as`]'s.
+pub fn lex_source(src: &Source, module: bool) -> Result<Vec<Token>, Error> {
+    let src = src.as_str();
     let b = src.as_bytes();
     // Minified code has a token per 2 bytes or so (jQuery's 2.2), others
     // fewer: room no token takes costs no memory, a vector grown copies.

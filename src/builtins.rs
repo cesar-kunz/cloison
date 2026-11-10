@@ -961,23 +961,33 @@ pub(crate) fn async_function_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<
 
 /// The function `(<kind> anonymous(p1, …) { body })` evaluates to.
 fn dynamic_function(vm: &mut Vm, a: &[Value], kind: &str) -> Result<Value> {
-    let mut params = Vec::new();
-    for &p in a.iter().take(a.len().saturating_sub(1)) {
-        params.push(crate::js::lex::units_to_string(&units(p)));
+    // (Code units: the source code of a string's, see `lex::Source`.)
+    let mut params: Vec<u16> = Vec::new();
+    for (k, &p) in a.iter().take(a.len().saturating_sub(1)).enumerate() {
+        if k > 0 {
+            params.push(b',' as u16);
+        }
+        params.extend_from_slice(&units(p));
     }
-    let body = a.last().map_or(String::new(), |&b| crate::js::lex::units_to_string(&units(b)));
-    let params = params.join(",");
+    let body = a.last().map_or(Vec::new(), |&b| units(b).into_owned());
     // The parameters and the body each as such (CreateDynamicFunction
     // parses them apart), not ending the function early.
-    let whole = |p: &str, b: &str| format!("({kind} anonymous({p}\n) {{\n{b}\n}})");
-    for (p, b) in [(&*params, ""), ("", &*body)] {
+    let whole = |p: &[u16], b: &[u16]| {
+        let mut u: Vec<u16> = format!("({kind} anonymous(").encode_utf16().collect();
+        u.extend_from_slice(p);
+        u.extend("\n) {\n".encode_utf16());
+        u.extend_from_slice(b);
+        u.extend("\n})".encode_utf16());
+        crate::js::lex::Source::from_units(&u)
+    };
+    for (p, b) in [(&*params, &[][..]), (&[][..], &*body)] {
         if !crate::js::is_one_function(&whole(p, b)) {
             let what = if b.is_empty() { "parameter list" } else { "function body" };
             let e = crate::js::compile_script_lazy(&whole(p, b)).err().unwrap_or_else(|| format!("invalid {what}"));
             return Err(Error(format!("SyntaxError: {e}"), None));
         }
     }
-    run_source(vm, &whole(&params, &body))
+    run_source_code(vm, &whole(&params, &body))
 }
 
 /// `eval(x)`: `x` itself unless a string, else the value of the script it
@@ -1006,12 +1016,7 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
         }
         None => {
             let units: Box<[u16]> = source.into();
-            // (ASCII, as code mostly is: a byte per unit.)
-            let src = if units.iter().all(|&c| c < 0x80) {
-                String::from_utf8(units.iter().map(|&c| c as u8).collect()).unwrap()
-            } else {
-                crate::js::lex::units_to_string(&units)
-            };
+            let src = crate::js::lex::Source::from_units(&units);
             let compile = if strict { crate::js::compile_strict_eval } else { crate::js::compile_indirect_eval };
             let module = compile(&src).map_err(crate::intrinsics::eval_error)?;
             vm.global_declarations(&module, true)?;
@@ -1046,7 +1051,7 @@ pub(crate) fn global_eval(vm: &mut Vm, source: &[u16], strict: bool) -> Result<V
 /// `$262.evalScript(src)`: `src` run as a script of its own.
 fn eval_script(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = arg(a, 0);
-    let src = crate::js::lex::units_to_string(string_units(x).unwrap_or(&[]));
+    let src = crate::js::lex::Source::from_units(string_units(x).unwrap_or(&[]));
     let module = crate::js::compile_script_lazy(&src).map_err(|e| Error(format!("SyntaxError: {e}"), None))?;
     vm.declare_script(&module)?;
     let code = vm.load(module);
@@ -1108,9 +1113,14 @@ fn read_fn(_: &mut Vm, _: Value, _: &[Value]) -> Result<Value> {
     Err(Error::unsupported("read()"))
 }
 
-/// Compile `src` as a script and run it (see `interp::run_script_at`): its
-/// completion value. A syntax error is a `SyntaxError`.
-pub(crate) fn run_source(vm: &mut Vm, src: &str) -> Result<Value> {
+/// Compile script text `text` (the runtime's own) and run it (see
+/// `interp::run_script_at`): its completion value.
+pub(crate) fn run_source(vm: &mut Vm, text: &str) -> Result<Value> {
+    run_source_code(vm, &crate::js::lex::Source::from_text(text))
+}
+
+/// [`run_source`] of source code `src`. A syntax error is a `SyntaxError`.
+fn run_source_code(vm: &mut Vm, src: &crate::js::lex::Source) -> Result<Value> {
     let module = crate::js::compile_script_lazy(src).map_err(|e| {
         if e.contains("unsupported") {
             Error(format!("unsupported: in eval'd code: {e}"), None)

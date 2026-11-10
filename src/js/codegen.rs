@@ -101,8 +101,9 @@ fn generate_from<'p>(
             let mut d: Vec<&str> = decls[i][..params].to_vec();
             d.push(ENV);
             let rest: Vec<&str> = decls[i][params..].iter().copied().filter(|&n| n != ENV).collect();
-            // (A function expression's own name, immutable, stays apart.)
-            let own = f.name.as_deref().filter(|_| f.binds_name);
+            // (A function expression's own name, immutable, stays apart:
+            // not a parameter, `var` or `arguments` that shadows it.)
+            let own = own_name(p, i);
             let generator = (f.generator || f.is_async) && !f.has_eval;
             let in_env = |n: &str| {
                 if generator {
@@ -1226,16 +1227,23 @@ fn own_name_binding(p: &Program, index: usize, name: &str) -> bool {
             None => return false,
         }
     };
+    // (A function's `arguments` object shadows the name too.)
+    let shadows = |g: usize| {
+        let f = &p.functions[g];
+        f.params.iter().any(|p| &**p == name)
+            || explicit_declarations(p, g).contains(&name)
+            || name == "arguments" && !f.arrow && arguments_object(p, g)
+    };
     let mut g = index;
     loop {
         let f = &p.functions[g];
         if Some(g) == top {
-            return !f.params.iter().any(|p| &**p == name) && !explicit_declarations(p, g).contains(&name);
+            return !shadows(g);
         }
         if top.is_none() && f.parent == Some(0) {
             return true;
         }
-        if f.params.iter().any(|p| &**p == name) || explicit_declarations(p, g).contains(&name) {
+        if shadows(g) {
             return false;
         }
         g = f.parent.unwrap();
@@ -1248,6 +1256,13 @@ fn own_name_binding(p: &Program, index: usize, name: &str) -> bool {
 fn own_name<'a>(p: &'a Program<'_>, f: usize) -> Option<&'a str> {
     let func = &p.functions[f];
     let name = func.name.as_deref().filter(|_| func.binds_name)?;
+    // (Shadowed by a parameter, a `var` or a function declaration of the
+    // name, or the `arguments` object, which are the function's own
+    // bindings: the name's is in an environment around them, ECMA-262
+    // InstantiateOrdinaryFunctionExpression's funcEnv.)
+    if explicit_declarations(p, f).contains(&name) || name == "arguments" && arguments_object(p, f) {
+        return None;
+    }
     let within = |mut g: usize| loop {
         if g == f {
             return true;

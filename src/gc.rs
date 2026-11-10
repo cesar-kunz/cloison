@@ -746,8 +746,17 @@ unsafe fn mark_function_code(p: usize, w: u64) {
         }
         let o = p as *const Object;
         match (*o).class {
+            // (A function's code is never replaced.)
             Class::Function => mark_code((*o).code),
-            Class::RegExp if !(*o).code.is_null() => mark_regexp((*o).code as *const crate::regexp::Regex),
+            Class::RegExp => {
+                // `RegExp.prototype.compile` may be replacing it, with
+                // Release (`builtins::regexp_compile`).
+                let code = std::sync::atomic::AtomicPtr::from_ptr((&raw const (*o).code).cast_mut().cast::<*mut crate::regexp::Regex>());
+                let re = code.load(std::sync::atomic::Ordering::Acquire);
+                if !re.is_null() {
+                    mark_regexp(re);
+                }
+            }
             _ => {}
         }
     }

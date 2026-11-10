@@ -917,8 +917,9 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     }
     let b = as_object(buffer);
     let offset = to_index(vm, arg(a, 1))?;
+    // (ArrayBufferByteLength(b, seq-cst): a shared one's from its block.)
     if crate::shared::is_shared(b) {
-        crate::shared::sync_length(b);
+        crate::shared::read_length(vm, b);
     }
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
@@ -942,6 +943,9 @@ fn data_view_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     // (Again: `byteLength`'s conversion may have detached or shrunk it.)
     if crate::typed::is_detached(b) {
         return Err(Error::type_error("Cannot construct a DataView on a detached ArrayBuffer"));
+    }
+    if crate::shared::is_shared(b) {
+        crate::shared::read_length(vm, b);
     }
     let bytes = unsafe { (*b).elems_len } as usize;
     if offset > bytes || len.is_some_and(|n| offset + n > bytes) {

@@ -225,8 +225,10 @@ fn run_agent_vm(mut vm: Vm, src: &[u16], mailbox: &Mailbox, reports: Reports) {
             continue;
         };
         let r = vm.enter(|vm| {
-            crate::shared::catch_up(vm);
+            // (The new buffer's length is read seq-cst, after the message:
+            // a catch-up for both, after the read, as by `read_length`.)
             let sab = crate::shared::new_shared(vm, m.block as *mut crate::shared::Block, m.growable)?;
+            crate::shared::catch_up(vm);
             vm.handles.push(sab);
             crate::interp::call_function(vm, callback, Value::UNDEFINED, &[sab, m.id])
         });
@@ -273,6 +275,9 @@ fn agent_broadcast(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
             slot = m.cv.wait(slot).unwrap_or_else(|e| e.into_inner());
         }
     }
+    // (Each agent's taking the message, after what it had done, happens
+    // before this: as a report's.)
+    crate::shared::catch_up(vm);
     Ok(Value::UNDEFINED)
 }
 

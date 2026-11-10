@@ -413,15 +413,11 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         }
     }
     // (After the length: who sees this one sees it.)
-    let before = GROWS.fetch_add(1, SeqCst);
+    GROWS.fetch_add(1, SeqCst);
+    // (The agent's other buffers on this block too, one per broadcast that
+    // brought it: `sync_length(o)` refreshes `o`'s views only.)
+    catch_up(vm);
     sync_length(o);
-    if before == vm.shared.grows {
-        // (No other grow counted since this agent's last catch-up: none to
-        // catch up with but this one, which its views have.)
-        vm.shared.grows = before + 1;
-    } else {
-        catch_up(vm);
-    }
     Ok(Value::UNDEFINED)
 }
 

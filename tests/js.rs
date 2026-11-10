@@ -10793,6 +10793,31 @@ fn views_see_grows_before_a_grown_length_read() {
     }
 }
 
+/// A grow through one of an agent's buffers on a block (one per
+/// broadcast) seen by the views of the others on it, once caught up (an
+/// `Atomics.load`): the grow doesn't mark them up to date.
+#[test]
+fn a_grow_reaches_the_views_of_the_same_blocks_other_buffers() {
+    let _one = AGENT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let src = r#"
+        $262.agent.start(`var first; $262.agent.receiveBroadcast(function (sab) {
+            if (!first) { first = sab; return; }
+            var ia = new Int32Array(first);
+            sab.grow(64);
+            Atomics.load(ia, 0);
+            $262.agent.report(ia.length);
+            $262.agent.leaving();
+        });`);
+        var sab = new SharedArrayBuffer(16, { maxByteLength: 64 });
+        $262.agent.broadcast(sab);
+        $262.agent.broadcast(sab);
+        var r;
+        while ((r = $262.agent.getReport()) === null);
+        r
+    "#;
+    assert_eq!(value(src), "16");
+}
+
 /// `Promise.allKeyed` and `allSettledKeyed`: an object's own enumerable
 /// properties' values awaited, by the same keys.
 #[test]

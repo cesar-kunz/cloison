@@ -96,8 +96,7 @@ fn get(_: &mut Vm, st: *mut Value, k: i32) -> Value {
 fn set(_: &mut Vm, st: *mut Value, k: i32, v: Value) {
     unsafe {
         let at = st.add(k as usize);
-        *at = v;
-        crate::heap::barrier(st.cast::<u8>().sub(8), at, v);
+        crate::heap::store(st.cast::<u8>().sub(8), at, v);
     }
 }
 
@@ -110,7 +109,7 @@ fn qget(vm: &mut Vm, q: Value, k: i32) -> Value {
 fn clear_regs(st: *mut Value, code: *const Code) {
     let r = regs_at(st, code);
     for i in 0..unsafe { (*code).nregs } as usize {
-        unsafe { *r.add(i) = Value::UNDEFINED };
+        unsafe { crate::layout::store_word(r.add(i), Value::UNDEFINED) };
     }
 }
 
@@ -136,8 +135,7 @@ pub(crate) fn create(vm: &mut Vm, f: *mut Object) -> Result<Value> {
         for (k, &v) in cells.iter().enumerate() {
             *st.add(k) = v;
         }
-        (*g).code = st as *const Code;
-        crate::heap::barrier_young(g.cast(), &raw const (*g).code);
+        crate::heap::store_young(g.cast(), &raw mut (*g).code, st as *const Code);
     }
     Ok(object_value(g))
 }
@@ -154,8 +152,7 @@ pub(crate) unsafe fn suspend(vm: &mut Vm, g: Value, regs: *mut Value, code: *con
     for i in 0..n {
         unsafe {
             let v = *regs.add(i);
-            *to.add(i) = v;
-            crate::heap::barrier(st.cast::<u8>().sub(8), to.add(i), v);
+            crate::heap::store(st.cast::<u8>().sub(8), to.add(i), v);
         }
     }
     set(vm, st, PC, Value::from_i32(pc as i32));

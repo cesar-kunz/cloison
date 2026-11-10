@@ -597,8 +597,7 @@ fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     for (i, v) in [it, next].into_iter().chain(done).enumerate() {
         unsafe {
             let at = crate::object::Object::inline(o, i);
-            *at = v;
-            crate::heap::barrier(o.cast(), at, v);
+            crate::heap::store(o.cast(), at, v);
         }
     }
     Ok(crate::object::object_value(o))

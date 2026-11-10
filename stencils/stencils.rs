@@ -91,7 +91,7 @@ mod layout;
 use layout::{
     CARD, COLOR, CONS_MIN, EVAC, DirectSite, GRANULE, SLICE, FIELD_ANY, FIELD_INT, FIELD_NUM, HEADER_WORDS, HeapPtrs, InstanceOfEntry,
     LARGE, MegaEntry, MegaStore, NO_ELEMENTS, PUSH_WAYS, PushCache, ShapeHead, VALUES, YOUNG, card_mark, cell,
-    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, MAPPED, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta, payload_cell, props_cap, set_header_word, dispatch_slot,
+    Class, EXTERNAL, FAR, FROZEN, LENGTH_READ_ONLY, MAPPED, SEALED, SPARSE, FUNC_OFF, EXIT_CODE_OFF, Upvalue, class, color_byte, elems_cap, header, header_word, meta_load, meta_store, payload_cell, props_cap, set_header_word, dispatch_slot,
     mega_index, mega_pair, shape_of, class_kind,
 };
 
@@ -720,10 +720,11 @@ fn imm64b() -> u64 {
     imm64_of!(cloison_hole_imm64b)
 }
 
-/// The metadata byte of the granule at `a` (`layout::meta`).
+/// The metadata byte of the granule at `a` (`layout::meta_load`: the
+/// marker thread may be writing it).
 #[inline(always)]
 unsafe fn meta_of(a: usize) -> u8 {
-    unsafe { *meta(a) }
+    unsafe { meta_load(a) }
 }
 
 /// The write barrier (`heap::barrier`): `v` was stored at `a`, in the cell
@@ -4626,17 +4627,28 @@ stencil!("lda_constant_f"; |s| {
 /// `layout::GRANULE`), if its hole has room, and write its metadata byte.
 #[inline(always)]
 unsafe fn bump(heap: *mut HeapPtrs, words: usize) -> Option<*mut u64> {
+    unsafe { bump_to(heap, words).map(|(p, _)| p) }
+}
+
+/// [`bump`], and the cell's end. (Checked as the pointer the hole moves
+/// to, the slow path cold: across the atomic metadata store, LLVM no
+/// longer computed the end once for the check and `create_object`'s
+/// zeroing, nor kept `construct_direct`'s slow path off its fall-through.)
+#[inline(always)]
+unsafe fn bump_to(heap: *mut HeapPtrs, words: usize) -> Option<(*mut u64, *mut u64)> {
     unsafe {
         let words = (words + 1) & !1;
         let p = (*heap).ptr;
+        let end = p.add(words);
         // (Past `LARGE` the runtime makes it a large cell.) `p + size >
         // end`: `lea; cmp; ja`, not `end - p < size`'s `mov; sub; cmp; jb`.
-        if 8 * words > LARGE || p as usize + 8 * words > (*heap).end as usize {
+        if 8 * words > LARGE || end as usize > (*heap).end as usize {
+            core::hint::cold_path();
             return None;
         }
-        (*heap).ptr = p.add(words);
-        *meta(p as usize) = YOUNG;
-        Some(p)
+        (*heap).ptr = end;
+        meta_store(p as usize, YOUNG);
+        Some((p, end))
     }
 }
 
@@ -4726,13 +4738,13 @@ unsafe fn zero_pairs(p: *mut u64, from: usize, to: usize) {
 #[inline(always)]
 unsafe fn create_object(slots: usize) -> Option<*mut u64> {
     unsafe {
-        let p = bump(imm64b() as *mut HeapPtrs, HEADER_WORDS + slots)?;
+        let (p, end) = bump_to(imm64b() as *mut HeapPtrs, HEADER_WORDS + slots)?;
         (*header(p)).shape = imm64();
         set_header_word(header(p), header_word(Class::Plain, EXTERNAL, slots as u64));
         // The rest of the header zero, and the slots (`Value::EMPTY`): a
         // collection reads them (holes aren't zeroed). The cell is whole
         // granules (`bump`): its padding word too.
-        zero_pairs(p, 2, (HEADER_WORDS + slots + 1) & !1);
+        zero_pairs(p, 2, end.offset_from(p) as usize);
         Some(p)
     }
 }
@@ -4762,7 +4774,7 @@ macro_rules! create_object_n {
 }
 create_object_n!(0 1 2 3 4 5 6 7 8);
 // target x86_64 create_object: 28 now 33 `mov rax, imm32; movabs; lea; and; cmp; ja; …; L: movups [r11], xmm8; add r11, 16; cmp; jb L` (loop counted once; judged 2026-10-26)
-// target aarch64 create_object: 30 now 35 count by `imm_zext`, …, `L: stp xzr, xzr, [x12], #16; cmp; b.lo L` (judged 2026-10-26)
+// target aarch64 create_object: 30 now 34 count by `imm_zext`, …, `L: stp xzr, xzr, [x12], #16; cmp; b.lo L` (judged 2026-10-26)
 stencil_slow!("create_object"; |s| {
     let Some(p) = create_object(imm() as usize) else { slow!(s) };
     s.acc = Value::from_bits(p as u64);
@@ -4795,8 +4807,8 @@ stencil_slow!("create_array"; |s| {
 // `CreateArray n` (a literal's, `imm` its count): as `create_array`, with
 // room for `n` elements (`undefined`) in a cell of their own, if the
 // heap's free space has it too (else none: `push` makes room).
-// target x86_64 create_array_n: 42 now 47 as `create_array` (16), then `mov ebx, imm; lea rax,[rbx*8+16]; and rax,-16; …; L: mov qword [r10+rbx*8], 10; dec rbx; jnz L` (loop counted once; judged 2026-10-26)
-// target aarch64 create_array_n: 43 now 48 as `create_array` (19), the count by `imm_zext`, SIDE and 0x80 kept, `L: str x10, [x13, x8, lsl #3]; subs; b.ne L` (judged 2026-10-26)
+// target x86_64 create_array_n: 42 now 45 as `create_array` (16), then `mov ebx, imm; lea rax,[rbx*8+16]; and rax,-16; …; L: mov qword [r10+rbx*8], 10; dec rbx; jnz L` (loop counted once; judged 2026-10-26)
+// target aarch64 create_array_n: 43 now 45 as `create_array` (19), the count by `imm_zext`, SIDE and 0x80 kept, `L: str x10, [x13, x8, lsl #3]; subs; b.ne L` (judged 2026-10-26)
 stencil_slow!("create_array_n"; |s| {
     let heap = imm64b() as *mut HeapPtrs;
     let Some(p) = bump(heap, HEADER_WORDS) else { slow!(s) };

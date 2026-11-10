@@ -391,7 +391,7 @@ impl Parser<'_> {
             }
             _ => {
                 self.i += 1;
-                Ok(Operand::Char(c as u32))
+                Ok(Operand::Char(self.point(c)))
             }
         }
     }
@@ -425,14 +425,14 @@ impl Regex {
     /// literal's early error), as [`Regex::new`] would find, without
     /// compiling it.
     pub fn check(pattern: &str, flags: &str) -> Result<(), String> {
-        Regex::parse(pattern, flags).map(|_| ())
+        Regex::parse(&pattern.encode_utf16().collect::<Vec<_>>(), flags).map(|_| ())
     }
 
     /// `pattern`'s tree, group count and names, `flags` (`g`, `i`, `m`,
     /// `y`, `u` (or `v`), `s`, `d`, `v`, in that order), and whether its
     /// case is explicit in its nodes (an `i` modifier: see `Parser::fold`).
     #[allow(clippy::type_complexity)]
-    fn parse(pattern: &str, flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 8], bool), String> {
+    fn parse(pattern: &[u16], flags: &str) -> Result<(Node, usize, Vec<(String, usize)>, [bool; 8], bool), String> {
         let (mut global, mut ignore_case, mut multiline) = (false, false, false);
         let (mut sticky, mut unicode, mut dot_all, mut has_indices) = (false, false, false, false);
         let mut sets = false;
@@ -456,11 +456,20 @@ impl Regex {
             return Err(format!("Invalid flags supplied to RegExp constructor '{flags}'"));
         }
         let unicode = unicode || sets;
-        let chars: Vec<char> = pattern.chars().collect();
+        // (The pattern's code points, a lone surrogate's unit noted apart:
+        // a pattern character, never the escape `\uD83D` its text would be.)
+        let (mut chars, mut lone) = (Vec::with_capacity(pattern.len()), Vec::new());
+        for c in char::decode_utf16(pattern.iter().copied()) {
+            chars.push(c.unwrap_or_else(|e| {
+                lone.push((chars.len(), e.unpaired_surrogate()));
+                LONE
+            }));
+        }
         let (total, names) = count_groups(&chars);
         let explicit = has_case_modifier(&chars);
         let mut p = Parser {
             c: &chars,
+            lone: &lone,
             i: 0,
             groups: 1,
             total,
@@ -478,13 +487,19 @@ impl Regex {
         };
         let node = p.alternation()?;
         if p.i != chars.len() {
-            return Err(format!("Invalid regular expression: /{pattern}/: Unmatched ')'"));
+            return Err(p.error("Unmatched ')'"));
         }
         Ok((node, p.groups, p.names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, sets], explicit))
     }
 
     /// Compile `pattern` with `flags` (`g`, `i`, `m`, `y`, `u`, `s`).
     pub fn new(pattern: &str, flags: &str) -> Result<Regex, String> {
+        Regex::of_units(&pattern.encode_utf16().collect::<Vec<_>>(), flags)
+    }
+
+    /// [`Regex::new`] of a pattern's code units (a lone surrogate in it a
+    /// pattern character).
+    pub fn of_units(pattern: &[u16], flags: &str) -> Result<Regex, String> {
         let (node, groups, names, [global, ignore_case, multiline, sticky, unicode, dot_all, has_indices, unicode_sets], explicit) =
             Regex::parse(pattern, flags)?;
         let fold = Case::of(ignore_case && !explicit, unicode);
@@ -1160,7 +1175,10 @@ fn fold_ranges(ranges: &[(u16, u16)], case: Case) -> Vec<(u16, u16)> {
 }
 
 struct Parser<'a> {
+    /// The pattern's code points, [`LONE`] for a lone surrogate.
     c: &'a [char],
+    /// The lone surrogates' positions in `c` and units, in order.
+    lone: &'a [(usize, u16)],
     i: usize,
     /// The next capturing group's index.
     groups: usize,
@@ -1192,6 +1210,11 @@ struct Parser<'a> {
     /// `Parser::lead_unit`).
     half: Option<u16>,
 }
+
+/// A lone surrogate's place in a pattern's code points (`Parser::c`), its
+/// unit in `Parser::lone`: no syntax character, so parsed as a pattern
+/// character (a real U+FFFD told apart by its position).
+const LONE: char = '\u{FFFD}';
 
 /// The deepest groups may nest: the parser, and the passes over the tree
 /// after it, recurse once per level, on the native stack.
@@ -1240,8 +1263,28 @@ impl Parser<'_> {
         self.c.get(self.i).copied()
     }
 
+    /// The unit of the lone surrogate at `k`, if one is there.
+    fn lone_at(&self, k: usize) -> Option<u16> {
+        if self.lone.is_empty() || self.c.get(k) != Some(&LONE) {
+            return None;
+        }
+        self.lone.binary_search_by_key(&k, |&(at, _)| at).ok().map(|n| self.lone[n].1)
+    }
+
+    /// Character `c`, just consumed, as a code point (a lone surrogate's
+    /// unit).
+    fn point(&self, c: char) -> u32 {
+        self.lone_at(self.i - 1).map_or(c as u32, |u| u as u32)
+    }
+
     fn error(&self, m: &str) -> String {
-        let src: String = self.c.iter().collect();
+        let mut src = String::new();
+        for (k, &c) in self.c.iter().enumerate() {
+            match self.lone_at(k) {
+                Some(u) => src.push_str(&format!("\\u{u:04X}")),
+                None => src.push(c),
+            }
+        }
         format!("Invalid regular expression: /{src}/: {m}")
     }
 
@@ -1468,7 +1511,10 @@ impl Parser<'_> {
             '{' | '}' | ']' if self.unicode => return Err(self.error("Lone quantifier brackets")),
             '*' | '+' | '?' => return Err(self.error("Nothing to repeat")),
             c if !self.unicode => Node::Char(self.lead_unit(c)),
-            c => self.char_here(c),
+            c => match self.lone_at(self.i - 1) {
+                Some(u) => Node::Char(u),
+                None => self.char_here(c),
+            },
         })
     }
 
@@ -1691,7 +1737,7 @@ impl Parser<'_> {
                     b'\\' as u16
                 }
             },
-            c if self.unicode => c as u16,
+            c if self.unicode => self.point(c) as u16,
             c => self.lead_unit(c),
         } as u32;
         // (`u` mode: `\uD83D\uDE00`, a surrogate pair's escapes, is the one
@@ -1714,6 +1760,9 @@ impl Parser<'_> {
     /// first: of an astral one, its lead, its trail left at `self.i` as
     /// the next atom or class member (the pattern is code units).
     fn lead_unit(&mut self, c: char) -> u16 {
+        if let Some(u) = self.lone_at(self.i - 1) {
+            return u;
+        }
         let mut b = [0u16; 2];
         let units = c.encode_utf16(&mut b);
         if let [_, t] = units {
@@ -1789,7 +1838,7 @@ impl Parser<'_> {
         self.i += 1;
         if c != '\\' {
             if self.unicode {
-                return Ok(c as u32);
+                return Ok(self.point(c));
             }
             return Ok(self.lead_unit(c) as u32);
         }

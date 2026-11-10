@@ -1169,7 +1169,7 @@ pub struct Vm {
     /// Compiled regular expressions, by pattern and flags (a literal makes
     /// a new object each time it runs, sharing one), while a `RegExp` uses
     /// one: a full marking drops the others (`Vm::prune_regexps`).
-    pub(crate) regexps: HashMap<(String, String), Box<crate::regexp::Regex>>,
+    pub(crate) regexps: HashMap<(Vec<u16>, String), Box<crate::regexp::Regex>>,
     /// The same, by a literal's pattern and flags constants (a `Value`'s
     /// bits each, kept by its `Code::constants`), while both are live and
     /// the pattern is in `regexps`.

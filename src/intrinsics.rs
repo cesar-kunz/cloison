@@ -87,6 +87,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("eval_scope", eval_scope),
     ("eval_scope_get", eval_scope_get),
     ("eval_scope_flush", eval_scope_flush),
+    ("eval_annex_b", eval_annex_b),
     ("bigint", crate::bigint::literal),
     ("dispose_new", |vm, _| crate::dispose::new_state(vm, false)),
     ("dispose_add", dispose_add),
@@ -879,9 +880,12 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     // of the other bindings it sees: see `Gen::call`.)
     let target = if own_strict || !crate::props::is_object(decl) { local } else { decl };
     // A `var` by a block-scoped binding's name (but a catch parameter's)
-    // between the function's scope and the `eval` is an error.
+    // between the function's scope and the `eval` is an error. (Not Annex
+    // B's of a function in a block, not made then: see `eval_annex_b`.)
     let inner: Vec<Value> = if target == decl && !declared.is_empty() { inner_scopes(chain, scopes) } else { Vec::new() };
-    for &n in declared.iter() {
+    let blocked: Vec<_> =
+        annex_b.iter().copied().filter(|&n| inner.iter().any(|&s| annex_b_blocked(vm, s, Key::Name(n)))).collect();
+    for &n in declared.iter().filter(|n| !annex_b.contains(n)) {
         for &s in &inner {
             let kind = binding_kind(vm, s, Key::Name(n)).unwrap_or(0);
             if kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0 {
@@ -894,7 +898,7 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     // B's function in a block by such a name, nor an error: see
     // `Vm::annex_b_skipped`.)
     let global_target = target == object_value(vm.global);
-    let skipped = |vm: &Vm, n| global_target && vm.lexical_declared.contains(&n) && annex_b.contains(&n);
+    let skipped = |vm: &Vm, n| blocked.contains(&n) || global_target && vm.lexical_declared.contains(&n) && annex_b.contains(&n);
     for &n in declared.iter().filter(|_| global_target) {
         if vm.lexical_declared.contains(&n) && !skipped(vm, n) {
             return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));
@@ -979,17 +983,25 @@ fn direct_eval_bound(vm: &mut Vm, a: &[Value]) -> Result<Value> {
                 .collect();
             let mut module = crate::js::compile_direct_eval(&text, strict, new_target, home, &chain.text(), false, &bound).map_err(eval_error)?;
             let own_strict = module.functions.get(module.script).is_some_and(|f| f.strict);
+            // (Not Annex B's `var` of a function in a block by a
+            // block-scoped binding's name, but a catch parameter's: see
+            // `eval_annex_b`.)
+            let blocked = |n: &str| {
+                module.annex_b.iter().any(|b| b == n)
+                    && bindings.iter().any(|(b, kind, ..)| b == n && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0)
+            };
             let declared: std::rc::Rc<[crate::object::Atom]> =
-                std::mem::take(&mut module.declared).iter().map(|n| vm.intern_name(n)).collect();
+                module.declared.iter().filter(|n| !blocked(n)).map(|n| vm.intern_name(n)).collect();
+            module.declared.clear();
             // (In parameters' defaults, a `var arguments` is an error; a
             // `var` by a block-scoped binding's name, but a catch
-            // parameter's, is.)
+            // parameter's, is: not Annex B's.)
             for &n in declared.iter().filter(|_| !own_strict) {
                 let name = vm.atom_name(n);
                 if params && name == "arguments" {
                     return Err(Error("SyntaxError: 'arguments' declared by eval in a parameter expression".into(), None));
                 }
-                if bindings.iter().any(|(b, kind, ..)| {
+                if !module.annex_b.iter().any(|b| *b == name) && bindings.iter().any(|(b, kind, ..)| {
                     b == name && kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
                 }) {
                     return Err(Error(format!("SyntaxError: Identifier '{name}' has already been declared"), None));
@@ -1863,6 +1875,44 @@ fn binding_kind(vm: &mut Vm, scope: Value, key: Key) -> Option<i32> {
     let d = vm.own_property(as_object(scope), key)?;
     let get = d.get.filter(|&g| crate::promise::is_binding_get(vm, g))?;
     crate::promise::slot(as_object(get), 1).as_number().map(|b| b as i32 & 15)
+}
+
+/// Whether Annex B's `var` of a function declared in a block of a direct
+/// `eval`'s code (`key`) is not made: a binding between the `eval` and
+/// its function's scope, in `scope`, has the name, but a catch
+/// parameter's (EvalDeclarationInstantiation's `bindingExists`, ES2026
+/// 19.2.1.3 step 11 with B.3.4). (Not a `with`'s object's either: such a
+/// binding is no accessor.)
+fn annex_b_blocked(vm: &mut Vm, scope: Value, key: Key) -> bool {
+    let kind = if crate::props::is_object(scope) { binding_kind(vm, scope, key).unwrap_or(0) } else { 0 };
+    kind & EVAL_BLOCK_SCOPED as i32 != 0 && kind & EVAL_CATCH as i32 == 0
+}
+
+/// A direct `eval`'s code's function `[function's scope, name, value,
+/// kind, scope objects…]` declared in a block, as Annex B's `var` too
+/// (see `Gen::stmt`): whether that is done, `true`, or left to the code.
+/// The scope objects are those of the bindings between the `eval` and
+/// its function's scope (no `with`'s object: an object environment,
+/// which step 11 passes over), and `kind` that of the site's binding by
+/// the name, of code compiled for them (see `direct_eval_bound`). Not
+/// made where a block-scoped binding not a catch parameter has the name
+/// (`annex_b_blocked`); past a catch parameter of the name only, the
+/// function's `var` set, not the parameter.
+fn eval_annex_b(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let key = to_property_key(vm, a[1])?;
+    let mut kinds = vec![a[3].as_number().unwrap_or(0.0) as i32];
+    for &s in a[4..].iter().filter(|&&s| crate::props::is_object(s)) {
+        kinds.push(binding_kind(vm, s, key).unwrap_or(0));
+    }
+    let scoped = |k: &i32| k & EVAL_BLOCK_SCOPED as i32 != 0;
+    if kinds.iter().any(|k| scoped(k) && k & EVAL_CATCH as i32 == 0) {
+        return Ok(Value::TRUE);
+    }
+    if !kinds.iter().any(scoped) || !crate::props::is_object(a[0]) {
+        return Ok(Value::FALSE);
+    }
+    vm.set_key(a[0], key, a[2])?;
+    Ok(Value::TRUE)
 }
 
 /// Whether an enclosing function's binding by `key` is shadowed by a `var`

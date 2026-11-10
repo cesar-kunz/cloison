@@ -291,13 +291,25 @@ pub(crate) fn new_shared(vm: &mut Vm, b: *mut Block, growable: bool) -> Result<V
 }
 
 /// Shared buffer `o`'s length, as its block has it now (another agent
-/// may have grown it): its views brought up to date to it.
-pub(crate) fn sync_length(o: *mut Object) -> usize {
+/// may have grown it): its views brought up to date to it, not the other
+/// buffers' (see [`read_length`]).
+fn sync_length(o: *mut Object) -> usize {
     let n = unsafe { (*block_of(o)).len.load(SeqCst) };
     if n != unsafe { (*o).elems_len } as usize {
         unsafe { (*o).elems_len = n as u32 };
         refresh_views(o);
     }
+    n
+}
+
+/// Shared buffer `o`'s length read seq-cst, ArrayBufferByteLength(o,
+/// seq-cst): as its block has it now, its views brought up to date to it,
+/// then the other buffers caught up, as the read may have synchronized
+/// with another agent's grow (#155, #219).
+pub(crate) fn read_length(vm: &mut Vm, o: *mut Object) -> usize {
+    let n = sync_length(o);
+    // (After the length: the grows before the one it read are counted.)
+    catch_up(vm);
     n
 }
 
@@ -458,9 +470,7 @@ fn shared_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 /// that agent did before (other buffers' grows too) happens before what
 /// follows here (#155).
 fn shared_byte_length(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    let n = sync_length(this_shared(this, "byteLength")?);
-    // (After the length: the grows before the one it read are counted.)
-    catch_up(vm);
+    let n = read_length(vm, this_shared(this, "byteLength")?);
     Ok(Value::number(n as f64))
 }
 
@@ -498,8 +508,7 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
                 // (A count of no grow: only catch-ups for nothing.)
                 IN_FLIGHT.fetch_sub(1, SeqCst);
             }
-            sync_length(o);
-            catch_up(vm);
+            read_length(vm, o);
             if n == current {
                 return Ok(Value::UNDEFINED);
             }
@@ -532,8 +541,7 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
 fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let o = this_shared(this, "slice")?;
     // (Its length read seq-cst, 25.2.5.6: as by `byteLength`.)
-    let len = sync_length(o);
-    catch_up(vm);
+    let len = read_length(vm, o);
     let first = relative(integer(vm, arg(a, 0))?, len);
     let end = arg(a, 1);
     let last = if end.is_undefined() { len } else { relative(integer(vm, end)?, len) };
@@ -548,7 +556,8 @@ fn shared_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if p == o {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the species returned the same buffer"));
     }
-    if sync_length(p) < n {
+    // (The new buffer's read seq-cst too.)
+    if read_length(vm, p) < n {
         return Err(Error::type_error("SharedArrayBuffer.prototype.slice: the new buffer is too small"));
     }
     unsafe { crate::racy::copy((*o).elems.cast::<u8>().add(first), (*p).elems.cast::<u8>(), n) };

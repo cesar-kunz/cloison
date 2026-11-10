@@ -549,6 +549,13 @@ fn bound_box_key<'p>(p: &'p Program, name: &str) -> &'p str {
     p.eval_upvalues.iter().find(|(n, ..)| &**n == name).map_or("", |(.., key)| &**key)
 }
 
+/// Whether variable `name` is one the front end makes (`%newtarget`, a
+/// home object, a private name's `#x%p0`…): never a property of the
+/// program's own objects, such as a `with` statement's.
+fn internal_name(name: &str) -> bool {
+    name.starts_with('%') || name.starts_with('#')
+}
+
 /// A variable's name as written (a block-scoped one is renamed `x%3`:
 /// see `ast::Program::lexicals`).
 fn original(name: &str) -> &str {
@@ -2673,7 +2680,11 @@ impl<'a> Gen<'a> {
         if self.withs.is_empty() {
             return false;
         }
-        self.withs.len() > self.with_skip(name)
+        let skip = self.with_skip(name);
+        if internal_name(name) {
+            return self.withs[skip.min(self.withs.len())..].iter().any(|w| !w.starts_with("%w"));
+        }
+        self.withs.len() > skip
     }
 
     /// The enclosing `with`s that don't shadow `name`: those outside its
@@ -3455,7 +3466,11 @@ impl<'a> Gen<'a> {
         self.string(original(name));
         self.star(k);
         let r = self.alloc(pos)?;
-        for (i, w) in withs.iter().enumerate().rev().filter(|&(i, _)| i >= skip) {
+        // (Not a `with` statement's object for a name of the front end's
+        // own, which the program's objects can't have or see: only a
+        // direct `eval`'s scopes.)
+        let internal = internal_name(name);
+        for (i, w) in withs.iter().enumerate().rev().filter(|&(i, w)| i >= skip && !(internal && w.starts_with("%w"))) {
             // (A direct `eval`'s site's block-scoped binding is inside the
             // function's scope: found before it.)
             if &**w == "%e2" && bound_kind(self.p, name).is_some_and(|k| k & EVAL_BLOCK_SCOPED != 0) {
@@ -4111,6 +4126,7 @@ impl<'a> Gen<'a> {
     /// `super`'s home object, variable `home`: in a direct `eval`'s code,
     /// the caller's (`EVAL_HOME_BINDING`), found as its names are.
     fn load_home(&mut self, home: &str, pos: Pos) -> R<()> {
+        // (Not in a `with` statement's object: see `with_lookup`.)
         if home == EVAL_HOME_BINDING && self.in_with(home) {
             return self.with_load(home, pos, false);
         }

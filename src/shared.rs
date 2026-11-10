@@ -297,22 +297,111 @@ pub(crate) fn sync_length(o: *mut Object) -> usize {
     n
 }
 
-/// The grows of shared buffers in the process so far.
+// ---- Catching up with other agents' grows ----
+//
+// A view's length is cached (`elems_len`), read without its block's, so
+// each VM brings its growable buffers' lengths up to date (`catch_up`)
+// wherever another agent's grow may come to happen before what follows
+// (the memory model, clause 29: a seq-cst read synchronizes with the
+// seq-cst write it reads; an `Atomics` operation's, a buffer length's
+// read by `byteLength`, `grow` or `slice` (25.2.5.1, 25.2.5.3,
+// 25.2.5.6), a waiter list's critical section, a message). It counts the
+// grows (`GROWS`), and skips when the count is the one it last recorded.
+//
+// Invariant: a VM records a count only once every grow it counts has
+// its length written before the VM's lengths are read again. So, all
+// seq-cst, in this order:
+//
+//   grow G:    IN_FLIGHT += 1;  GROWS += 1;  length CAS;  IN_FLIGHT -= 1
+//   catch-up:  n = GROWS;  (n recorded? done);  f = IN_FLIGHT;
+//              every growable buffer's length read;  f == 0? record n
+//
+// Moving G's `GROWS += 1` after its CAS, or its `IN_FLIGHT += 1` after
+// its `GROWS += 1`, or the catch-up's `IN_FLIGHT` read after its length
+// reads, or weakening any of these from `SeqCst`, breaks it silently:
+// the views then keep stale lengths now and then, no test sure to see it
+// (`CLOISON_TEST_GROW_DELAY` widens the windows: tests/cli.rs).
+//
+// It relies on these sequences (S: the total order of seq-cst operations,
+// consistent with happens-before):
+//
+// - Direct (#155): agent C grows sab1 then sab2; agent A reads sab2's
+//   grown length, then catches up. C's increments for both are before
+//   A's `GROWS` read in S (each before its CAS, sab1's CAS before sab2's,
+//   before A's read of it), so A's `n` counts them.
+// - Transitive: A, after seeing sab1's grown length, `Atomics.store`s a
+//   flag (or grows sab2) that agent B then reads; G's CAS happens before
+//   B's catch-up, so does G's `GROWS += 1`, sequenced before it: B's `n`
+//   counts G, though G may not be done (`IN_FLIGHT -= 1` pending) and A
+//   may have recorded a count without G (A synced sab1 directly).
+// - Either `n` differs from B's recorded count and B reads every length
+//   after G's CAS, or it is that count (`GROWS` only goes up: the same
+//   increments, G's among them), recorded by an earlier catch-up whose
+//   `IN_FLIGHT` read gave 0 after G's `IN_FLIGHT += 1` (before its
+//   `GROWS += 1`, which that `n` read): so after G's `IN_FLIGHT -= 1`
+//   (every decrement follows its own increment), after G's CAS, and its
+//   length reads, after that, read G's length or a longer one.
+// - Same-block aliases: an agent sent one buffer twice has two buffer
+//   objects on one block; the catch-up reads every buffer's length, so a
+//   grow through one reaches the other's views.
+//
+// (Counting G after its CAS, an agent could see the length, record a
+// count without G, and one reading what it then stores see that count,
+// skip and keep its stale views. Counting before with no `IN_FLIGHT`, an
+// agent could read the count between G's increment and its CAS, record
+// it, its lengths read before the CAS.)
+//
+// Cost: one atomic read when nothing grew; after a grow, every growable
+// buffer of the VM read again (about 3 ns each), by each VM that catches
+// up; while a grow is in flight, at each catch-up. Under another agent
+// growing in a tight loop, an `Atomics` operation or `byteLength` then
+// costs about 0.6 µs with 100 growable buffers, 30 µs with 10000. (A log
+// of the grown blocks, each VM syncing only its buffers on those, would
+// make it the grows' count instead, at the price of a bounded lock-free
+// log and a per-VM block-to-buffers map; not worth it while grows are
+// rare.)
+
+/// The grows of shared buffers in the process so far, each counted before
+/// its length is written (see above).
 static GROWS: AtomicUsize = AtomicUsize::new(0);
+
+/// The grows counted in `GROWS` not yet done: their lengths may not be
+/// written yet (see above).
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// For the tests: `CLOISON_TEST_GROW_DELAY` microseconds slept by a grow
+/// between its count and its length's write, and between that and the
+/// end of its bookkeeping: the windows where another agent may see the
+/// count of a grow whose length it can't yet, or the length of a grow
+/// not yet finished (see `catch_up`).
+fn grow_delay() {
+    static DELAY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let us = *DELAY.get_or_init(|| std::env::var("CLOISON_TEST_GROW_DELAY").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    if us > 0 {
+        std::thread::sleep(std::time::Duration::from_micros(us));
+    }
+}
 
 /// The VM's growable buffers' lengths (their views') brought up to date,
 /// if one has grown since: after what may make another agent's grows
 /// happen before what follows (an `Atomics` operation, a waiter list's
-/// critical section, whatever its outcome, a message), as the views'
-/// cached lengths are read without the block's.
+/// critical section, whatever its outcome, a message, a seq-cst read of
+/// a buffer's length: 25.2.5.1, 25.2.5.3, 25.2.5.6), as the views' cached
+/// lengths are read without the block's. Its order of operations is the
+/// invariant's above.
 pub(crate) fn catch_up(vm: &mut Vm) {
     let n = GROWS.load(SeqCst);
     if n == vm.shared.grows || vm.shared.growing.is_null() {
         return;
     }
-    vm.shared.grows = n;
+    // (Before the lengths, and `n` recorded only if no grow was in
+    // flight: see above.)
+    let settled = IN_FLIGHT.load(SeqCst) == 0;
     for v in crate::collections::weak_set_values(vm.shared.growing) {
         sync_length(as_object(v));
+    }
+    if settled {
+        vm.shared.grows = n;
     }
 }
 
@@ -396,8 +485,15 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     // `byteLength` (#155). (The bound's checked after the read too.)
     let len = unsafe { &(*b).len };
     let mut current = len.load(SeqCst);
+    // (Counted, in flight, before its length is written: the invariant
+    // above `GROWS`.)
+    let mut counted = false;
     loop {
         if n <= current || n > room {
+            if counted {
+                // (A count of no grow: only catch-ups for nothing.)
+                IN_FLIGHT.fetch_sub(1, SeqCst);
+            }
             sync_length(o);
             catch_up(vm);
             if n == current {
@@ -406,14 +502,20 @@ fn shared_grow(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             let why = if n > room { "beyond maxByteLength" } else { "a buffer can't shrink" };
             return Err(Error::range_error(format!("SharedArrayBuffer.prototype.grow: {why}")));
         }
+        if !counted {
+            counted = true;
+            IN_FLIGHT.fetch_add(1, SeqCst);
+            GROWS.fetch_add(1, SeqCst);
+            grow_delay();
+        }
         // (Its bytes past its length are zero: it never shrinks.)
         match len.compare_exchange(current, n, SeqCst, SeqCst) {
             Ok(_) => break,
             Err(now) => current = now,
         }
     }
-    // (After the length: who sees this one sees it.)
-    GROWS.fetch_add(1, SeqCst);
+    grow_delay();
+    IN_FLIGHT.fetch_sub(1, SeqCst);
     // (The agent's other buffers on this block too, one per broadcast that
     // brought it: `sync_length(o)` refreshes `o`'s views only.)
     catch_up(vm);

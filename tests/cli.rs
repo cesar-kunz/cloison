@@ -116,3 +116,57 @@ fn local_times_in_zone_transitions() {
         assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{expected}\nundefined\n"), "{zone}");
     }
 }
+
+/// A grow of buffer `i` by one agent, seen through its length by a second
+/// (`byteLength`), which then stores `i + 1` to a flag a third (the main
+/// agent) loads: the grow happens before what follows the load there,
+/// whose view of the buffer has the grown length, though the grow's
+/// bookkeeping may not be done yet (#155: it skipped its catch-up, the
+/// grow counted only after its length was written). The grows sleep in
+/// that window (`CLOISON_TEST_GROW_DELAY`) for most runs to hit it.
+#[test]
+fn a_grow_seen_through_a_third_agent_reaches_its_views() {
+    let src = r#"
+        var N = 30;
+        $262.agent.start(`var bufs = []; $262.agent.receiveBroadcast(function (sab) {
+            bufs.push(sab);
+            if (bufs.length <= ${N}) return;
+            for (var i = 0; i < ${N}; i++) bufs[i].grow(64);
+            $262.agent.leaving();
+        });`);
+        $262.agent.start(`var bufs = []; $262.agent.receiveBroadcast(function (sab) {
+            bufs.push(sab);
+            if (bufs.length <= ${N}) return;
+            var flag = new Int32Array(sab);
+            for (var i = 0; i < ${N}; i++) {
+                while (bufs[i].byteLength === 16);
+                Atomics.store(flag, 0, i + 1);
+            }
+            $262.agent.leaving();
+        });`);
+        var views = [];
+        for (var i = 0; i < N; i++) {
+            var sab = new SharedArrayBuffer(16, { maxByteLength: 64 });
+            views.push(new Int32Array(sab));
+            $262.agent.broadcast(sab);
+        }
+        var flag = new Int32Array(new SharedArrayBuffer(4));
+        $262.agent.broadcast(flag.buffer);
+        var stale = 0;
+        for (var i = 0; i < N; i++) {
+            while (Atomics.load(flag, 0) <= i);
+            if (views[i].length !== 16) stale++;
+        }
+        print("stale " + stale);
+    "#;
+    for (delay, no_jit) in [("2000", false), ("2000", true), ("0", false)] {
+        let mut c = cloison("grow-hb", src);
+        c.env("CLOISON_TEST_GROW_DELAY", delay);
+        if no_jit {
+            c.env("CLOISON_NO_JIT", "1");
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "stale 0\nundefined\n", "delay {delay}, no JIT {no_jit}");
+    }
+}

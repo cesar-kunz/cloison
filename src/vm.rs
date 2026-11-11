@@ -464,6 +464,10 @@ pub struct Code {
     /// A native that only reads, which a conversion may run twice (see
     /// `interp::reads_only`).
     pub(crate) reads_only: bool,
+    /// A native that, given arguments none of which is a cell (and, if 2,
+    /// a string `this`), runs no JS, throws nothing and doesn't recurse:
+    /// the interpreter calls it directly (see `interp::slow_call`). 0: no.
+    pub(crate) leaf: u8,
     /// Its `arguments` object may be reachable once it has returned (see
     /// `asm::FunctionDef::arguments_escape`, `Vm::release_mapped`).
     pub(crate) arguments_escape: bool,
@@ -6265,6 +6269,7 @@ impl Vm {
             // (The built-ins' accessors' getters, named so, only read: an
             // Intl collator's `compare` makes its function once.)
             reads_only: crate::interp::reads_only(f) || name.starts_with("get "),
+            leaf: leaf_kind(f),
             arguments_escape: false,
             strict: false,
             simple_parameters: true,
@@ -7021,6 +7026,7 @@ impl Vm {
                     native: None,
                     constructs: false,
                     reads_only: false,
+                    leaf: 0,
                     arguments_escape: f.arguments_escape,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
@@ -7791,6 +7797,27 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
 /// `Object(…)` and `new Object(…)`: an object argument itself, else a new
 /// plain object (there are no wrapper objects yet).
 /// Argument `i` as a number (ToNumber), `NaN` if missing.
+/// [`Code::leaf`] of native `f`: 1 for `Math`'s functions of numbers, 2
+/// for the string methods reading a unit.
+fn leaf_kind(f: NativeFn) -> u8 {
+    use crate::builtins as b;
+    let math: [NativeFn; 35] = [
+        math_log, math_exp, math_sqrt, math_abs, math_floor, math_ceil, math_round, math_sin, math_cos, math_pow,
+        math_min, math_max, math_random, b::math_tan, b::math_atan, b::math_atan2, b::math_asin, b::math_acos,
+        b::math_imul, b::math_cbrt, b::math_clz32, b::math_cosh, b::math_sinh, b::math_tanh, b::math_acosh,
+        b::math_asinh, b::math_atanh, b::math_expm1, b::math_log1p, b::math_log2, b::math_log10, b::math_sign,
+        b::math_trunc, b::math_fround, b::math_hypot,
+    ];
+    if math.iter().any(|&g| g as usize == f as usize) || f as usize == b::string_from_char_code as NativeFn as usize {
+        return 1;
+    }
+    let strings: [NativeFn; 3] = [b::string_char_code_at, b::string_code_point_at, b::string_char_at];
+    if strings.iter().any(|&g| g as usize == f as usize) {
+        return 2;
+    }
+    0
+}
+
 fn num_arg(args: &[Value], i: usize) -> f64 {
     args.get(i)
         .map_or(f64::NAN, |&v| crate::interp::to_number(v))

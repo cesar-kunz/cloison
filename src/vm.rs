@@ -1161,6 +1161,13 @@ pub struct Vm {
     /// `builtins::pristine`).
     pub(crate) regexp_proto_shape: *const crate::object::Shape,
     pub(crate) regexp_slots: [i32; REGEXP_FNS],
+    /// `RegExp.prototype`'s and `RegExp`'s shapes when the first's
+    /// `constructor` and the second's `@@species` were last found the
+    /// builtin ones, their slots' locations there and that getter (see
+    /// `builtins::species_pristine`).
+    pub(crate) regexp_species_shapes: (*const crate::object::Shape, *const crate::object::Shape),
+    pub(crate) regexp_species_slots: [i32; 2],
+    pub(crate) regexp_species_getter: Value,
     pub(crate) boolean_prototype: *mut Object,
     /// Loaded scripts' `var` and function names (see `Module::declared`).
     pub(crate) declared: crate::jit::HashSet<Atom>,
@@ -1455,6 +1462,9 @@ impl Vm {
             regexp_atoms: [Atom(0); REGEXP_FNS],
             regexp_proto_shape: std::ptr::null(),
             regexp_slots: [0; REGEXP_FNS],
+            regexp_species_shapes: (std::ptr::null(), std::ptr::null()),
+            regexp_species_slots: [0; 2],
+            regexp_species_getter: Value::UNDEFINED,
             boolean_prototype: std::ptr::null_mut(),
             bind_helper: Value::UNDEFINED,
             from_async_helper: Value::UNDEFINED,

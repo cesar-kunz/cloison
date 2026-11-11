@@ -143,6 +143,27 @@ const _: () = assert!(size_of::<Ic>() == 32);
 /// is a shift.
 pub const IC_WAYS: usize = 4;
 
+/// An entry of [`Vm::interp_megas`]: receivers of `shape` have own data
+/// property `name` at `loc`.
+#[derive(Clone, Copy)]
+pub(crate) struct InterpMega {
+    pub(crate) shape: *const Shape,
+    pub(crate) name: u32,
+    pub(crate) loc: i32,
+}
+
+impl InterpMega {
+    const EMPTY: InterpMega = InterpMega { shape: std::ptr::null(), name: 0, loc: 0 };
+}
+
+pub(crate) const INTERP_MEGAS: usize = 4096;
+
+/// [`Vm::interp_megas`]' entry for `shape` and `name`.
+#[inline(always)]
+pub(crate) fn interp_mega_index(shape: *const Shape, name: u32) -> usize {
+    ((shape as u64 ^ (name as u64) << 32).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - INTERP_MEGAS.trailing_zeros())) as usize
+}
+
 /// An elements' type code (`Shape::elems_code`) that no value fits.
 pub use crate::layout::NO_ELEMENTS;
 
@@ -870,6 +891,11 @@ pub struct Vm {
     /// shapes than they have ways: compiled through `megas`, not a
     /// dispatch on the shapes the ways hold at the time.
     pub(crate) megamorphic: crate::jit::HashSet<usize>,
+    /// The interpreter's megamorphic named-load cache: where receivers of
+    /// a shape have an own data property, by (shape, name), for loads
+    /// whose four ways are taken (`interp::poly_get_named`). Cleared when
+    /// shapes are freed (their addresses then others').
+    pub(crate) interp_megas: Box<[InterpMega]>,
     /// Prototype slots whose values compiled code folded (`jit::rely_on_slot`):
     /// a store of another value to one bumps `proto_epoch`; to another
     /// prototype slot, nothing (compiled code reads those when it runs).
@@ -1368,6 +1394,7 @@ impl Vm {
             megas: vec![MegaEntry::EMPTY; 1 + MEGAS].into_boxed_slice(),
             mega_stores: vec![MegaStore::EMPTY; 1 + MEGAS].into_boxed_slice(),
             megamorphic: Default::default(),
+            interp_megas: vec![InterpMega::EMPTY; INTERP_MEGAS].into_boxed_slice(),
             relied_slots: Default::default(),
             jitted: Vec::new(),
             field_deps: HashMap::default(),
@@ -2072,6 +2099,9 @@ impl Vm {
         let (keep, dead): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.shapes).into_iter().partition(|s| live(&**s));
         self.shapes = keep;
+        if !dead.is_empty() {
+            self.interp_megas.fill(InterpMega::EMPTY);
+        }
         let ph = &mut self.heap.gc.shape_phases;
         (ph.dead, ph.shapes_left, ph.any) = (dead.len(), self.shapes.len(), true);
         if dead.is_empty() {
@@ -3788,6 +3818,12 @@ impl Vm {
             };
             if install(ic, e) {
                 self.megamorphic.insert(ic as usize);
+                // (An own data property: in the interpreter's megamorphic
+                // cache, for the next receivers of this shape.)
+                if h == o && !(*(*o).shape).dictionary {
+                    let sh = (*o).shape;
+                    self.interp_megas[interp_mega_index(sh, name.0)] = InterpMega { shape: sh, name: name.0, loc };
+                }
             }
             Ok(*Object::slot(h, loc))
         }

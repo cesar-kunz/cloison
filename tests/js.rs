@@ -746,8 +746,9 @@ r.join(" ");
 /// `fnDefinable` false, CanDeclareGlobalVar); it stays its block's, and
 /// no setter of the global's prototypes is called. By the name of a
 /// property the global has, the property gets it. A sloppy store to an
-/// undeclared name makes no global there either (10.1.9.2). JSC's
-/// values, but for the setter (#157).
+/// undeclared name makes no global there either, nor one to a name of an
+/// inherited data property, writable or not (10.1.9.2). JSC's values,
+/// but for the setter (#157).
 #[test]
 fn annex_b_functions_on_a_non_extensible_global() {
     assert_eq!(
@@ -763,10 +764,12 @@ $262.evalScript("{ function ns() {} } r.push(typeof ns);");
 (0, eval)("{ function had() {} }"); r.push(typeof had);
 zz = 1; r.push(typeof zz, Object.getOwnPropertyNames(globalThis).some(n => n[0] == "n"));
 try { (0, eval)("var nv; { function nv() {} }"); } catch (e) { r.push(e.name); }
+Object.prototype.inh = 1; Object.defineProperty(Object.prototype, "ro", { value: 1 });
+inh = 2; ro = 2; r.push(inh, ro, Object.hasOwn(globalThis, "inh"), Object.hasOwn(globalThis, "ro"));
 r.join(" ");
 "#
         ),
-        "function undefined undefined undefined undefined function undefined false TypeError"
+        "function undefined undefined undefined undefined function undefined false TypeError 1 1 false false"
     );
 }
 

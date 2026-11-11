@@ -28,12 +28,14 @@
 //! ([`ta_length_seq_cst`], [`view_byte_length_seq_cst`]), it is read
 //! from the buffer's block first, as another agent may have grown it,
 //! and compiled code leaves its `length` to the runtime (see `shared`).
-//! (Another view's length is fixed: a shared buffer never shrinks.)
+//! (Another view's length is fixed: a shared buffer never shrinks.) A
+//! typed array longer than `i32::MAX` has flag `LONG_VIEW`, the same bit:
+//! its length is no int32, which compiled code would box it as (#226).
 
 use crate::builtins::{getter, is_class, link_constructor};
 use crate::interp::{call_function, to_boolean, to_number};
 use crate::object::{
-    Class, DETACHED, DONT_DELETE, DONT_ENUM, IMMUTABLE_VIEW, Object, READ_ONLY, SHARED_GROWABLE, TypedKind, as_object,
+    Class, DETACHED, DONT_DELETE, DONT_ENUM, IMMUTABLE_VIEW, LONG_VIEW, Object, READ_ONLY, SHARED_GROWABLE, TypedKind, as_object,
     object_value,
 };
 use crate::props::{is_callable, is_object};
@@ -298,13 +300,16 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
         }
     }
     // (A fixed-length view's length can't change: its buffer never
-    // shrinks, so it stays in bounds.)
-    if len.is_none() && is_resizable(b) && crate::shared::is_shared(b) {
-        unsafe { (*o).flags |= SHARED_GROWABLE };
+    // shrinks, so it stays in bounds. One longer than `i32::MAX` is
+    // fixed-length, no resizable buffer being that long: its length stays
+    // one compiled code can't box, or 0 once detached.)
+    let long = class == Class::TypedArray && unsafe { (*o).elems_len } > i32::MAX as u32;
+    if long || len.is_none() && is_resizable(b) && crate::shared::is_shared(b) {
+        unsafe { (*o).flags |= if long { LONG_VIEW } else { SHARED_GROWABLE } };
         // (Compiled code that read a known typed array's length unchecked
         // dropped: see `jit`'s `Prop::Length`.)
-        if !vm.shared_growable_views {
-            vm.shared_growable_views = true;
+        if !vm.checked_length_views {
+            vm.checked_length_views = true;
             vm.bump_code_epoch();
         }
     }
@@ -314,7 +319,8 @@ pub(crate) fn make_view(vm: &mut Vm, class: Class, proto: Value, k: TypedKind, b
 
 /// View `o`'s buffer's length read from its block if it tracks a
 /// growable shared one's (flag `SHARED_GROWABLE`): another agent may have
-/// grown it (#156; see `shared`).
+/// grown it (#156; see `shared`). (A `LONG_VIEW`'s, the same bit, reads
+/// the length its fixed-length buffer has.)
 #[inline]
 fn read_view_length(vm: &mut Vm, o: *mut Object) {
     // (Out of line: inlined, its catch-up's loop made each caller save
@@ -402,7 +408,8 @@ fn array_buffer_ctor(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 fn buffer_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
-    Ok(Value::from_i32(unsafe { (*this_buffer(this, "byteLength")?).elems_len } as i32))
+    // (A number: 2^31 bytes is no int32.)
+    Ok(Value::number(unsafe { (*this_buffer(this, "byteLength")?).elems_len } as f64))
 }
 
 fn buffer_max_byte_length(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {

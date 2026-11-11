@@ -282,6 +282,12 @@ pub const IMMUTABLE_VIEW: u8 = 64;
 /// `FAR`'s bit, as views aren't arrays, so compiled code's length reads,
 /// which check `FAR`, leave it to the runtime.
 pub const SHARED_GROWABLE: u8 = 128;
+/// A typed array longer than `i32::MAX` (a byte view of a whole 2 GiB
+/// buffer): compiled code boxes a length as an int32, so `FAR`'s bit, as
+/// for `SHARED_GROWABLE`, leaves its `length` to the runtime. (It is
+/// `SHARED_GROWABLE`'s bit too: the runtime then reads its buffer's
+/// length seq-cst, which for a fixed-length buffer is the one it has.)
+pub const LONG_VIEW: u8 = 128;
 /// A plain object made by `JSON.rawJSON` ([[IsRawJSON]]), frozen;
 /// `LENGTH_READ_ONLY`'s bit, as plain objects aren't arrays, and
 /// `MAPPED`'s, which no frozen object has.

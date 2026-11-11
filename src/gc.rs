@@ -2671,9 +2671,7 @@ impl Vm {
     /// request flag would go stale if the VM moved); the next collection
     /// resumes it.
     pub(crate) fn pause_marker(&mut self) {
-        if let Some(m) = &self.heap.gc.marker {
-            m.pause();
-        }
+        self.heap.pause_marker();
     }
 
     /// Mark the cell that word `w` points into, if any (a native stack
@@ -4774,6 +4772,15 @@ impl Heap {
         self.add_swept(&partly, &empty);
         let over = self.absorb_sweep();
         debug_assert!(over);
+    }
+
+    /// Stop the marker thread, marking or sweeping, until the next
+    /// collection resumes it: its metadata writes are then over, and those
+    /// of the heap's can be read plainly.
+    pub(crate) fn pause_marker(&self) {
+        if let Some(m) = &self.gc.marker {
+            m.pause();
+        }
     }
 }
 

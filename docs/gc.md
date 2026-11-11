@@ -545,7 +545,16 @@ slot recorded into an evacuation candidate while it held the right
 half could be rewritten as that address's cell moved).
 The marker reads cells and `Code::upvalues` (immutable once loaded, and
 never written through a `&mut Code` while it may read it) and writes
-only old cells' metadata, which the mutator writes only in pauses. It
+only old cells' metadata. Outside pauses the mutator writes metadata
+where no old cell is: the `YOUNG` byte of a cell it allocates, and the
+blocks it takes to allocate in, cleared (`Heap::clear_meta`); while the
+marker sweeps, the blocks the mutator sweeps itself (`help_sweep`),
+which the sweeper doesn't. Both sides access the metadata atomically
+(`layout::meta_load`/`meta_store`, and `meta_word`/`meta_clear` in asm
+for eight bytes at a time). The plain accesses left are made with the
+marker thread paused: in a collection (`Vm::collect_from` pauses it
+first and resumes it last, its helper threads joined before the next
+step, writing bytes of their own cells) and in `Heap::verify`. It
 reads each cell's header word once, with Acquire, and works from that
 value: the mutator may give an old object a new shape
 meanwhile, published by `Vm::add_shape`'s Release fence (the contract

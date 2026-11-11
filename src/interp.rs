@@ -1128,6 +1128,26 @@ handlers! {
         next_or_throw!(Op::Intrinsic.size(), r)
     }
 
+    fn op_iterator_open(pc, acc, regs, tag) {
+        let r = *pc.add(1) as usize;
+        // (The iterable read from its register inside: see `op_intrinsic`.)
+        // (What a conversion left pending, thrown: see `op_intrinsic`.)
+        let res = with_top(regs, None, |vm| {
+            let r = crate::symbol::iterator_open(vm, regs.add(r));
+            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+        });
+        next_or_throw!(Op::IteratorOpen.size(), res.map(|()| Value::UNDEFINED))
+    }
+
+    fn op_iterator_next(pc, acc, regs, tag) {
+        let r = *pc.add(1) as usize;
+        let res = with_top(regs, None, |vm| {
+            let r = crate::symbol::iterator_next(vm, regs.add(r));
+            if vm.conv_thrown { Err(vm.take_conv_error()) } else { r }
+        });
+        next_or_throw!(Op::IteratorNext.size(), res)
+    }
+
     fn op_create_rest(pc, acc, regs, tag) {
         let k = *pc.add(1) as usize;
         // (The arguments found after `with_top`'s safepoint: copies taken
@@ -4141,6 +4161,8 @@ static TABLE: Table = {
     t[Op::DefineAccessor as usize] = op_define_accessor;
     t[Op::CreateRegExp as usize] = op_create_regexp;
     t[Op::Intrinsic as usize] = op_intrinsic;
+    t[Op::IteratorOpen as usize] = op_iterator_open;
+    t[Op::IteratorNext as usize] = op_iterator_next;
     t[Op::LdaHole as usize] = op_lda_hole;
     t[Op::CheckHole as usize] = op_check_hole;
     t[Op::CloseUpvalue as usize] = op_close_upvalue;

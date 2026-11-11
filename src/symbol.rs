@@ -496,10 +496,19 @@ fn iterator_state(this: Value, what: &str) -> Result<Value> {
 }
 
 fn array_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+    match array_step(vm, this)? {
+        Some(v) => iter_result(vm, v, false),
+        None => iter_result(vm, Value::UNDEFINED, true),
+    }
+}
+
+/// `%ArrayIteratorPrototype%.next` on `this`, without its result object:
+/// the value, or `None` when done.
+fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     let state = iterator_state(this, "%ArrayIteratorPrototype%.next")?;
     let target = vm.get_keyed(state, Value::from_i32(0))?;
     if target.is_undefined() {
-        return iter_result(vm, Value::UNDEFINED, true);
+        return Ok(None);
     }
     let i = vm.get_keyed(state, Value::from_i32(1))?.as_number().unwrap_or(0.0);
     let kind = vm.get_keyed(state, Value::from_i32(2))?.as_number().unwrap_or(1.0) as i32;
@@ -515,7 +524,7 @@ fn array_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     };
     if i >= len {
         vm.set_keyed(state, Value::from_i32(0), Value::UNDEFINED)?;
-        return iter_result(vm, Value::UNDEFINED, true);
+        return Ok(None);
     }
     vm.set_keyed(state, Value::from_i32(1), Value::number(i + 1.0))?;
     let k = Value::number(i);
@@ -527,7 +536,7 @@ fn array_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
             crate::array::new_array_of(vm, &[k, e])?
         }
     };
-    iter_result(vm, v, false)
+    Ok(Some(v))
 }
 
 fn string_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
@@ -591,7 +600,7 @@ pub(crate) fn async_record(vm: &mut Vm, it: Value) -> Result<Value> {
 }
 
 fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
-    let a_next = vm.intern_name("next");
+    let a_next = vm.a_next;
     let next = vm.get(it, a_next)?;
     let o = vm.new_object_with(crate::object::Class::Plain, Value::NULL, 2 + done.is_some() as u32);
     for (i, v) in [it, next].into_iter().chain(done).enumerate() {
@@ -640,11 +649,16 @@ pub(crate) fn step_with(vm: &mut Vm, it: Value, next: Value) -> Result<Option<Va
     if !is_callable(next) {
         return Err(Error::type_error("iterator.next is not a function"));
     }
+    // (The builtin array iterator's step, its result object unobservable:
+    // fresh, its own data properties read back at once.)
+    if is_native(vm, next, array_iterator_next) && it.is_cell() && unsafe { (*as_object(it)).class } == Class::ArrayIterator {
+        return array_step(vm, it);
+    }
     let r = call_function(vm, next, it, &[])?;
     if !is_object(r) {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
     }
-    let a_done = vm.intern_name("done");
+    let a_done = vm.a_done;
     if to_boolean(vm.get(r, a_done)?) {
         return Ok(None);
     }
@@ -657,7 +671,7 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
     if !is_object(it) {
         return Ok(());
     }
-    let a_return = vm.intern_name("return");
+    let a_return = vm.a_return;
     let m = vm.get(it, a_return)?;
     if m.is_undefined() || m.is_null() {
         return Ok(());
@@ -677,7 +691,7 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
 pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
     // (`it` and `next` are rooted on the native stack.)
     let it = get_iterator(vm, v)?;
-    let a_next = vm.intern_name("next");
+    let a_next = vm.a_next;
     let next = vm.get(it, a_next)?;
     while let Some(x) = step_with(vm, it, next)? {
         if let Err(e) = f(vm, x) {
@@ -694,4 +708,163 @@ pub(crate) fn tag_of(vm: &mut Vm, o: Value) -> Result<Option<Vec<u16>>> {
     let a = vm.a_sym_to_string_tag;
     let t = vm.get(o, a)?;
     Ok(string_units(t).map(|u| u.to_vec()))
+}
+
+
+/// Whether `f` is the current realm's native `n` (by its code's
+/// function pointer, and its code's realm). What a fast path stands in
+/// for must be: a builtin runs in its own realm (§10.3.1), and what it
+/// makes (an iterator, an entry's array) has that realm's prototypes.
+fn is_native(vm: &Vm, f: Value, n: NativeFn) -> bool {
+    f.is_cell()
+        && unsafe { (*as_object(f)).class } == Class::Native
+        && unsafe {
+            let c = (*as_object(f)).code;
+            !c.is_null() && (*c).native.is_some_and(|g| g as usize == n as usize) && (*c).realm == vm.realm
+        }
+}
+
+/// What a data property `name` of `o` or its prototypes holds, if a data
+/// property (`None`: absent or an accessor, `Some(None)`: absent).
+fn data_of(vm: &Vm, o: *mut Object, name: Atom) -> Option<Option<Value>> {
+    match vm.lookup(o, name) {
+        None => Some(None),
+        Some((h, slot)) if vm.is_accessor(h, slot) => None,
+        Some((h, slot)) => Some(Some(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })),
+    }
+}
+
+/// Whether `v` iterates as an array by the builtins: an array (not a
+/// proxy) with `Array.prototype` for its prototype and no own
+/// `@@iterator`, whose `@@iterator` is the builtin `values` and
+/// `%ArrayIteratorPrototype%.next` the builtin `next`, both data
+/// properties. Nothing of its iteration is observable then but the
+/// reads of its length and its elements, which `IteratorNext` does as
+/// `next()` would.
+fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
+    if !v.is_cell() || unsafe { (*as_object(v)).class } != Class::Array {
+        return false;
+    }
+    let o = as_object(v);
+    if unsafe { (*(*o).shape).proto } != object_value(vm.array_prototype) {
+        return false;
+    }
+    if unsafe { (*(*o).shape).lookup(vm.a_sym_iterator).is_some() } {
+        return false;
+    }
+    let aip = root(vm, Root::ArrayIteratorPrototype);
+    let values = object_value(root(vm, Root::ArrayValues));
+    data_of(vm, vm.array_prototype, vm.a_sym_iterator) == Some(Some(values))
+        && matches!(data_of(vm, aip, vm.a_next), Some(Some(n)) if is_native(vm, n, array_iterator_next))
+}
+
+/// `IteratorOpen`: the iterable in `slots[0]`, then the iteration's
+/// state in `slots[0..2]`: the array and its next index for an array
+/// iterated by the builtins ([`iterates_as_array`]), else a [`record`]
+/// of its iterator. (The slots are the frame's registers, read after
+/// any safepoint: a collection moving cells updates them.)
+pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()> {
+    unsafe {
+        if iterates_as_array(vm, *slots) {
+            *slots.add(1) = Value::from_i32(0);
+            return Ok(());
+        }
+        let it = get_iterator(vm, *slots)?;
+        let r = record(vm, it)?;
+        *slots = r;
+        *slots.add(1) = Value::UNDEFINED;
+        Ok(())
+    }
+}
+
+/// Whether `IteratorOpen`'s state starting at `v` is an array's (a
+/// record is a plain object).
+pub(crate) fn is_open_array(v: Value) -> bool {
+    v.is_cell() && unsafe { (*as_object(v)).class } == Class::Array
+}
+
+/// Element `i` of array `a` as `%ArrayIteratorPrototype%.next` gives it,
+/// `None` past its length.
+pub(crate) fn open_array_element(vm: &mut Vm, a: Value, i: u32) -> Result<Option<Value>> {
+    let o = as_object(a);
+    if i >= vm.length_field(o) {
+        return Ok(None);
+    }
+    unsafe {
+        if i < (*o).elems_len {
+            let v = *(*o).elems.add(i as usize);
+            if v != Value::EMPTY {
+                return Ok(Some(v));
+            }
+        }
+    }
+    vm.get_keyed(a, Value::number(i as f64)).map(Some)
+}
+
+/// The next index in an array's `IteratorOpen` state (under 2^32: an
+/// array's indices are).
+pub(crate) fn open_index(v: Value) -> u32 {
+    v.as_number().expect("an index") as u32
+}
+
+/// `IteratorNext`: the next value of the iteration in `slots[0..2]`, or
+/// `HOLE` when done (an array's state then `undefined`, as its
+/// iterator's target is once done).
+pub(crate) unsafe fn iterator_next(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
+    unsafe {
+        let s = *slots;
+        if s.is_undefined() {
+            return Ok(Value::HOLE);
+        }
+        if is_open_array(s) {
+            // (A number: a far array's indices go past an int32's.)
+            let i = open_index(*slots.add(1));
+            *slots.add(1) = Value::number(i as f64 + 1.0);
+            return Ok(match open_array_element(vm, s, i)? {
+                Some(v) => v,
+                None => {
+                    *slots = Value::UNDEFINED;
+                    Value::HOLE
+                }
+            });
+        }
+        let (it, next) = record_parts(s);
+        Ok(step_with(vm, it, next)?.unwrap_or(Value::HOLE))
+    }
+}
+
+/// IteratorClose of `IteratorOpen`'s array state `[array, index]`: its
+/// iterator's `return`, which `%ArrayIteratorPrototype%` and what it
+/// inherits from don't have unless a script gave them one; then called
+/// on an iterator made for it, at that index.
+pub(crate) fn open_array_close(vm: &mut Vm, a: &[Value]) -> Result<()> {
+    let aip = root(vm, Root::ArrayIteratorPrototype);
+    if vm.lookup(aip, vm.a_return).is_none() {
+        return Ok(());
+    }
+    let it = new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?;
+    let state = Value::from_bits(unsafe { (*as_object(it)).code } as u64);
+    vm.set_keyed(state, Value::from_i32(1), a[1])?;
+    close(vm, it)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An array's `IteratorOpen` state steps past index 2^31 - 1 (a far
+    /// array's): its index a number, not an int32 that wraps to -2^31.
+    #[test]
+    fn array_states_step_past_int32_indices() {
+        let mut vm = Vm::new();
+        let a = vm.new_array();
+        let top = 2f64.powi(31);
+        for (k, x) in [(top - 1.0, 1), (top, 2)] {
+            vm.set_keyed(a, Value::number(k), Value::from_i32(x)).unwrap();
+        }
+        let mut st = [a, Value::number(top - 1.0)];
+        let got: Vec<u64> = (0..3).map(|_| unsafe { iterator_next(&mut vm, st.as_mut_ptr()).unwrap() }.to_bits()).collect();
+        assert_eq!(got, [Value::from_i32(1).to_bits(), Value::from_i32(2).to_bits(), Value::HOLE.to_bits()]);
+        assert!(st[0].is_undefined(), "done");
+    }
 }

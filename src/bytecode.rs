@@ -363,6 +363,19 @@ define_ops! {
     CompileLazy(),
     /// `acc = INTRINSICS[k](r[f..f + n])` (see `crate::intrinsics`).
     Intrinsic(Count, Reg, Count),
+    /// GetIterator for `for … of` and an array pattern: the iterable in
+    /// `r`, then `r` and `r + 1` its iteration's state. An array iterated
+    /// by the builtins (see `symbol::iterator_open`) leaves itself in `r`
+    /// and the next index in `r + 1`, with no iterator object, as
+    /// JavaScriptCore's `op_iterator_open` does; anything else an
+    /// iterator record in `r` (and `undefined` in `r + 1`). `acc` is
+    /// `undefined` after: a copy of what it held, kept across the open's
+    /// safepoint, is one a collection moving cells wouldn't update.
+    IteratorOpen(Reg),
+    /// The step of `IteratorOpen r`'s iteration: `acc` = the next value,
+    /// or `HOLE` when done (or when `r` is `undefined`: a pattern's
+    /// iteration done).
+    IteratorNext(Reg),
     /// `acc` = an array of the frame's arguments from the `k`th on (a
     /// rest parameter's).
     CreateRest(Count),

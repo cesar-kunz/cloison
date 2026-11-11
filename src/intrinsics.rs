@@ -734,6 +734,9 @@ fn iterator_of(r: Value) -> Value {
 
 /// A `for … of` left early: `[record]`'s iterator closed.
 fn iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if crate::symbol::is_open_array(a[0]) {
+        return crate::symbol::open_array_close(vm, a).map(|()| Value::UNDEFINED);
+    }
     crate::symbol::close(vm, iterator_of(a[0])).map(|()| Value::UNDEFINED)
 }
 
@@ -750,6 +753,10 @@ fn for_in_has(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// A `for … of` left by an exception: `[iterator]` closed, its own errors
 /// ignored (the exception goes on).
 fn iterator_close_quiet(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    if crate::symbol::is_open_array(a[0]) {
+        let _ = crate::symbol::open_array_close(vm, a);
+        return Ok(Value::UNDEFINED);
+    }
     let _ = crate::symbol::close(vm, iterator_of(a[0]));
     Ok(Value::UNDEFINED)
 }
@@ -767,6 +774,16 @@ fn pattern_step(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 fn iterator_rest(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let out = vm.new_array();
     if a[0].is_undefined() {
+        return Ok(out);
+    }
+    // (`IteratorOpen`'s state, `[array, index]`: what is left of the
+    // array, as its steps would give it.)
+    if crate::symbol::is_open_array(a[0]) {
+        let mut i = crate::symbol::open_index(a[1]);
+        while let Some(v) = crate::symbol::open_array_element(vm, a[0], i)? {
+            crate::vm::array_push(vm, out, &[v])?;
+            i += 1;
+        }
         return Ok(out);
     }
     let (it, next) = crate::symbol::record_parts(a[0]);

@@ -3552,7 +3552,8 @@ impl<'a> Gen<'a> {
                     self.trys.extend(inner);
                     r?;
                 } else {
-                    self.intrinsic("iterator_close", r, 1);
+                    // (`IteratorOpen`'s state, two registers.)
+                    self.intrinsic("iterator_close", r, 2);
                 }
             }
             if let Some(f) = finally {
@@ -6185,10 +6186,11 @@ impl<'a> Gen<'a> {
             },
             Pattern::Array(es, rest) => {
                 let mark = self.temp;
+                // (`it` and the register after it: `IteratorOpen`'s state.)
                 let it = self.alloc(pos)?;
+                self.alloc(pos)?;
                 self.mov(r, it);
-                self.intrinsic("get_iterator", it, 1);
-                self.star(it);
+                self.emit(Op::IteratorOpen, &[Arg::Reg(it)]);
                 let hole = self.alloc(pos)?;
                 self.emit(Op::LdaHole, &[]);
                 self.star(hole);
@@ -6215,7 +6217,7 @@ impl<'a> Gen<'a> {
                     if close {
                         self.pause_try();
                     }
-                    self.intrinsic("pattern_step", it, 1);
+                    self.emit(Op::IteratorNext, &[Arg::Reg(it)]);
                     self.star(v);
                     if close {
                         self.resume_try();
@@ -6243,7 +6245,7 @@ impl<'a> Gen<'a> {
                     if close {
                         self.pause_try();
                     }
-                    self.intrinsic("iterator_rest", it, 1);
+                    self.intrinsic("iterator_rest", it, 2);
                     self.star(v);
                     self.emit(Op::LdaUndefined, &[]);
                     self.star(it);
@@ -6270,13 +6272,13 @@ impl<'a> Gen<'a> {
                     self.handlers.extend(ranges.iter().map(|&(s, e)| (s, e, at)));
                     let e = self.alloc(pos)?;
                     self.star(e);
-                    self.intrinsic("iterator_close_quiet", it, 1);
+                    self.intrinsic("iterator_close_quiet", it, 2);
                     self.ldar(e);
                     self.emit(Op::Throw, &[]);
                     self.bind(end);
                 }
                 if rest.is_none() {
-                    self.intrinsic("iterator_close", it, 1);
+                    self.intrinsic("iterator_close", it, 2);
                 }
                 self.temp = mark;
             }
@@ -7210,8 +7212,13 @@ impl<'a> Gen<'a> {
     ) -> R<()> {
         let it = self.alloc(pos)?;
         // (`for await`: whether over a sync iterator, stepped as
-        // AsyncFromSyncIterator; `[record, sync, v]` for the intrinsics.)
+        // AsyncFromSyncIterator; `[record, sync, v]` for the intrinsics.
+        // Else the register after `it` is the rest of `IteratorOpen`'s
+        // state.)
         let sync = if is_await { Some(self.alloc(pos)?) } else { None };
+        if !is_await {
+            self.alloc(pos)?;
+        }
         let v = self.alloc(pos)?;
         let hole = self.alloc(pos)?;
         // (`let`/`const`: not initialized while the iterable is evaluated.)
@@ -7238,10 +7245,13 @@ impl<'a> Gen<'a> {
                 self.mov(v, t);
                 self.intrinsic("get_async_iterator", t, 2);
                 self.temp = mark;
+                self.star(it);
             }
-            None => self.intrinsic("get_iterator", v, 1),
+            None => {
+                self.mov(v, it);
+                self.emit(Op::IteratorOpen, &[Arg::Reg(it)]);
+            }
         }
-        self.star(it);
         self.emit(Op::LdaHole, &[]);
         self.star(hole);
         let (top, cont, done, brk) = (self.loop_label(), self.label(), self.label(), self.label());
@@ -7264,7 +7274,7 @@ impl<'a> Gen<'a> {
         let paused = self.trys.pop().expect("the loop's try");
         let step = |g: &mut Self| -> R<()> {
             if sync.is_none() {
-                g.intrinsic("iterator_step", it, 1);
+                g.emit(Op::IteratorNext, &[Arg::Reg(it)]);
                 return Ok(());
             }
             // `await it.next()`, then its value.
@@ -7356,7 +7366,7 @@ impl<'a> Gen<'a> {
             self.reachable = true;
             self.bind(closed);
         } else {
-            self.intrinsic("iterator_close_quiet", it, 1);
+            self.intrinsic("iterator_close_quiet", it, 2);
         }
         self.ldar(e);
         self.emit(Op::Throw, &[]);

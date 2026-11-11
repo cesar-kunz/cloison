@@ -56,8 +56,11 @@ enum Root {
     CatchFinally,
     ValueThunk,
     Thrower,
-    /// … AsyncFromSyncIterator's rejection handler.
+    /// … AsyncFromSyncIterator's rejection handler, and its handlers of
+    /// a thenable iterator result's.
     CloseOnRejection,
+    IterResultValue,
+    IterResultReject,
     /// (Not a promise's: a direct `eval`'s binding's accessors.)
     BindingGet,
     BindingSet,
@@ -109,7 +112,7 @@ pub(crate) fn install(vm: &mut Vm) {
     vm.add_property_with(aep, a_message, empty, DONT_ENUM);
 
     vm.promise_roots = vec![proto, c, jobs, aep, std::ptr::null_mut()];
-    let templates: [(NativeFn, u32); 14] = [
+    let templates: [(NativeFn, u32); 16] = [
         (resolve_fn, 1),
         (reject_fn, 1),
         (executor_fn, 2),
@@ -122,6 +125,8 @@ pub(crate) fn install(vm: &mut Vm) {
         (value_thunk, 0),
         (thrower, 0),
         (close_on_rejection, 1),
+        (iter_result_value, 1),
+        (iter_result_reject, 1),
         (crate::intrinsics::binding_get, 0),
         (crate::intrinsics::binding_set, 1),
     ];
@@ -200,10 +205,11 @@ pub(crate) fn reject_own(vm: &mut Vm, p: Value, v: Value) -> Result<()> {
 
 /// AsyncFromSyncIterator's promise of a step's value `v`:
 /// `PromiseResolve(%Promise%, v).then()`, settling as `v` does, a job
-/// after; rejected, sync iterator `close` closed first (unless
-/// undefined: the iterator done, or a `return()`'s value).
+/// after, by an iterator result of `done` ([`resolve_iter_result`]);
+/// rejected, sync iterator `close` closed first (unless undefined: the
+/// iterator done, or a `return()`'s value).
 /// (AsyncFromSyncIteratorContinuation, `closeOnRejection`.)
-pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, close: Value) -> Result<Value> {
+pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, done: bool, close: Value) -> Result<Value> {
     let c = object_value(root(vm, Root::Constructor));
     let wrapper = match promise_resolve_with(vm, c, v) {
         Ok(w) => w,
@@ -219,15 +225,80 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, close: Value) -> Result<Val
     } else {
         closure(vm, Root::CloseOnRejection, &[close])
     };
-    let cap = new_capability(vm, c)?;
+    // (Its `onFulfilled`'s iterator result: `done` for `resolve`, see
+    // `cap_resolve`.)
+    let cap = Cap { promise: new_promise(vm), resolve: Value::from_bool(done), reject: Value::UNDEFINED };
     perform_then(vm, as_object(wrapper), Value::UNDEFINED, on_rejected, &cap)?;
     Ok(cap.promise)
 }
 
-/// A promise fulfilled with `v` as it is (a thenable too).
-pub(crate) fn fulfilled(vm: &mut Vm, v: Value) -> Result<Value> {
+/// `Call(cap.[[Resolve]], undefined, « CreateIteratorResultObject(v,
+/// done) »)` of %Promise%'s capability `p`, as AsyncFromSyncIterator
+/// does (ES2025 27.1.6.2.2 step 6.b, 27.1.6.4 steps 6-9), but `p`
+/// fulfilled with `v` itself: its consumers read `done` from the sync
+/// record (`symbol::sync_done`), and no iterator result is made while
+/// `Object.prototype` has no `then` to find on it. (With a callable one,
+/// the iterator result is adopted as a thenable, `p` fulfilled with the
+/// `value` of what that settles with.)
+pub(crate) fn resolve_iter_result(vm: &mut Vm, p: *mut Object, v: Value, done: bool) -> Result<()> {
+    let a_then = vm.intern_name("then");
+    if vm.lookup(vm.object_prototype, a_then).is_none() {
+        return settle(vm, p, FULFILLED, v);
+    }
+    let r = crate::symbol::iter_result(vm, v, done)?;
+    let then = match vm.get(r, a_then) {
+        Ok(t) => t,
+        Err(e) => {
+            let e = thrown(vm, e)?;
+            return settle(vm, p, REJECTED, e);
+        }
+    };
+    if !is_callable(then) {
+        return settle(vm, p, FULFILLED, v);
+    }
+    // (The spec's consumers read its `value`, ours `p`'s: that settles
+    // `p`, a job later.)
+    let q = new_promise(vm);
+    enqueue(vm, [Value::from_i32(THENABLE), q, r, then, Value::UNDEFINED, Value::UNDEFINED])?;
+    let on_fulfilled = closure(vm, Root::IterResultValue, &[object_value(p)]);
+    let on_rejected = closure(vm, Root::IterResultReject, &[object_value(p)]);
+    perform_reaction(vm, as_object(q), on_fulfilled, on_rejected, &Cap::NONE)
+}
+
+/// [`resolve_iter_result`]'s fulfillment handler: the promise in slot 0
+/// fulfilled with the `value` of iterator result `a[0]` (rejected if
+/// not an object, or what reading it throws).
+fn iter_result_value(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    let p = as_object(slot(vm.callee, 0));
+    let r = arg(a, 0);
+    let v = if is_object(r) {
+        let a_value = vm.a_value;
+        vm.get(r, a_value)
+    } else {
+        Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))))
+    };
+    match v {
+        Ok(v) => settle(vm, p, FULFILLED, v)?,
+        Err(e) => {
+            let e = thrown(vm, e)?;
+            settle(vm, p, REJECTED, e)?;
+        }
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// [`resolve_iter_result`]'s rejection handler: the promise in slot 0
+/// rejected with the reason.
+fn iter_result_reject(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    settle(vm, as_object(slot(vm.callee, 0)), REJECTED, arg(a, 0))?;
+    Ok(Value::UNDEFINED)
+}
+
+/// A promise resolved as [`resolve_iter_result`] of `v` and `done`
+/// resolves it.
+pub(crate) fn iter_result_promise(vm: &mut Vm, v: Value, done: bool) -> Result<Value> {
     let p = new_promise(vm);
-    settle(vm, as_object(p), FULFILLED, v)?;
+    resolve_iter_result(vm, as_object(p), v, done)?;
     Ok(p)
 }
 
@@ -506,7 +577,8 @@ fn reject_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 
 /// A PromiseCapability record. For `Promise` itself, `resolve` and
 /// `reject` are made only when JS must see them ([`materialize`]):
-/// `undefined` before, and the promise is resolved directly.
+/// `undefined` before, and the promise is resolved directly (or a
+/// boolean `resolve`, by an iterator result: see [`cap_resolve`]).
 #[derive(Clone, Copy)]
 struct Cap {
     promise: Value,
@@ -579,13 +651,17 @@ fn materialize(vm: &mut Vm, cap: &mut Cap) {
     }
 }
 
-/// `Call(cap.[[Resolve]], undefined, « v »)`; nothing without one.
+/// `Call(cap.[[Resolve]], undefined, « v »)`; nothing without one. (A
+/// boolean `resolve`: [`async_from_sync`]'s, of an iterator result.)
 fn cap_resolve(vm: &mut Vm, cap: &Cap, v: Value) -> Result<()> {
     if cap.promise.is_undefined() {
         return Ok(());
     }
     if cap.resolve.is_undefined() {
         return resolve_promise(vm, as_object(cap.promise), v);
+    }
+    if cap.resolve.is_bool() {
+        return resolve_iter_result(vm, as_object(cap.promise), v, cap.resolve == Value::TRUE);
     }
     call_function(vm, cap.resolve, Value::UNDEFINED, &[v]).map(drop)
 }

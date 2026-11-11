@@ -680,6 +680,10 @@ pub unsafe fn meta_store(a: usize, b: u8) {
 /// puts a few cycles more on a scan's path from a cell to the next: Splay
 /// swept 70% slower, and allocation's `next_hole` likewise.
 ///
+/// It is `pure, readonly` asm: LLVM may merge two of these at one address
+/// with no write it sees between them, as it may two Relaxed loads. Fine
+/// for a scan, not for a loop waiting for a byte to change.
+///
 /// # Safety
 /// The eight granules' metadata must be mapped (in one block, say).
 #[inline(always)]

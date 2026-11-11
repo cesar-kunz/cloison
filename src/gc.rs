@@ -400,6 +400,37 @@ impl Gc {
 }
 
 impl Heap {
+    /// [`copy_words`](crate::layout::copy_words) of `n` values from `src`
+    /// to `dst`, or, while no marking runs, `ptr::copy`: only a marking's
+    /// marker reads slots while the mutator runs, and `marking` is set and
+    /// cleared in pauses, which order this copy before or after it. (A
+    /// queue's `shift` of a million elements took 30% longer word by word.)
+    #[inline]
+    pub(crate) unsafe fn move_values(&self, src: *const Value, dst: *mut Value, n: usize) {
+        unsafe {
+            if self.gc.marking {
+                crate::layout::copy_words(src, dst, n);
+            } else {
+                std::ptr::copy(src, dst, n);
+            }
+        }
+    }
+
+    /// `v` stored in the `n` values at `p`: as [`Heap::move_values`], word by
+    /// word only while a marking runs.
+    #[inline]
+    pub(crate) unsafe fn fill_values(&self, p: *mut Value, n: usize, v: Value) {
+        unsafe {
+            if self.gc.marking {
+                for k in 0..n {
+                    crate::layout::store_word(p.add(k), v);
+                }
+            } else {
+                std::slice::from_raw_parts_mut(p, n).fill(v);
+            }
+        }
+    }
+
     /// Whether the cell `v` is young.
     #[inline(always)]
     pub(crate) fn is_young(&self, v: Value) -> bool {

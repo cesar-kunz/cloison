@@ -1425,6 +1425,10 @@ fn array_from(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
         let m = vm.get(items, a_iter)?;
         if !m.is_undefined() && !m.is_null() && (custom || !is_string(items)) {
             let out = if custom { crate::intrinsics::construct(vm, this, &[])? } else { vm.new_array() };
+            // (A dense array copied at once: see `symbol::append_dense`.)
+            if !custom && mapfn.is_undefined() && crate::symbol::append_dense(vm, out, items) {
+                return Ok(out);
+            }
             let mut n = 0.0;
             crate::symbol::iterate(vm, items, |vm, v| {
                 let v = if mapfn.is_undefined() { v } else { call_function(vm, mapfn, that, &[v, Value::number(n)])? };

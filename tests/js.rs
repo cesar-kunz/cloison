@@ -17293,3 +17293,75 @@ log.join(" ");"#;
          4501500 4498500 4498500 101 50"
     );
 }
+
+#[test]
+fn closing_an_array_state_resumes_at_its_index() {
+    // With a `return` added to `%ArrayIteratorPrototype%`, closing an
+    // array's `IteratorOpen` state (a `break`, a pattern shorter than the
+    // array) makes an iterator at the state's index for it: its
+    // `this.next()` goes on from there (V8 and SpiderMonkey agree).
+    let src = r#"
+var AIP = Object.getPrototypeOf([].values()), out = [];
+AIP.return = function () { var r = this.next(); out.push("ret:" + r.value + ":" + r.done); return {}; };
+for (var x of [1, 2, 3]) { out.push(x); if (x === 1) break; }
+var [a, b] = [4, 5, 6, 7]; out.push(a, b);
+var [c] = [8]; out.push(c);
+var [d, , e] = [10, 11, 12, 13]; out.push(d, e);
+delete AIP.return;
+out.join()
+"#;
+    assert_eq!(value(src), "1,ret:2:false,ret:6:false,4,5,ret:undefined:true,8,ret:13:false,10,12");
+}
+
+#[test]
+fn array_iteration_meets_a_return_and_getters_added_mid_loop() {
+    // A `return` added to `%ArrayIteratorPrototype%` while a for-of runs,
+    // which reads what is left with `this.next()`; a `return` getter on
+    // `%IteratorPrototype%` added mid-loop (read at each close); getters on
+    // `Array.prototype` indices met at holes, one defined mid-loop. As V8
+    // and SpiderMonkey.
+    let src = r#"
+var AIP = Object.getPrototypeOf([].values()), IP = Object.getPrototypeOf(AIP), out = [];
+// return added mid-loop, reading what is left from within it
+for (var x of [1, 2, 3, 4]) {
+  out.push(x);
+  if (x === 2) AIP.return = function () { var rest = []; for (var r; !(r = this.next()).done;) rest.push(r.value); out.push("rest:" + rest.join("/")); return {}; };
+  if (x === 3) break;
+}
+delete AIP.return;
+// return as a getter on %IteratorPrototype%, added mid-loop
+for (var x of [5, 6, 7]) {
+  out.push(x);
+  if (x === 5) Object.defineProperty(IP, "return", { get() { out.push("get"); var it = this; return function () { out.push("ret:" + it.next().value); return {}; }; }, configurable: true });
+  if (x === 6) break;
+}
+var [p] = [8, 9]; out.push(p);
+delete IP.return;
+// getters on Array.prototype indices read during the loop
+var h = [10, , 12, , 14];
+Object.defineProperty(Array.prototype, 3, { get() { out.push("i3"); return 13; }, configurable: true });
+for (var x of h) { out.push(x); if (x === 10) Object.defineProperty(Array.prototype, 1, { get() { return 11; }, configurable: true }); }
+delete Array.prototype[1]; delete Array.prototype[3];
+out.join()
+"#;
+    assert_eq!(value(src), "1,2,3,rest:4,5,6,get,ret:7,get,ret:9,8,10,11,12,i3,13,14");
+}
+
+#[test]
+fn far_arrays_iterate_by_index() {
+    // A far array (`far.rs`) iterated by for-of and spread: every index up
+    // to its length, the holes `undefined`. (Past 2^31 an iteration takes
+    // 2^31 steps: `symbol::tests::array_states_step_past_int32_indices`
+    // steps there directly.)
+    let src = r#"
+// A far array: elements high up, its length short enough to walk.
+var a = []; a[0] = "first"; a[3000000] = "mid"; a[3999999] = "last";
+var n = 0, seen = [];
+for (var x of a) { n++; if (x !== undefined) seen.push(x); }
+var s = [...a];
+var b = []; b[2147483646] = "below"; b[2147483647] = "above"; b.length = 2147483649;
+var r = b.slice(2147483646);
+[n, seen.join("/"), s.length, s[3000000], s[3999999], b.length, r.length, r.join("/")].join()
+"#;
+    assert_eq!(value(src), "4000000,first/mid/last,4000000,mid,last,2147483649,3,below/above/");
+}

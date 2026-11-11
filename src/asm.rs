@@ -632,6 +632,8 @@ pub fn verify(m: &Module) -> Result<(), String> {
                 | Op::PushLiteral
                 | Op::DefineAccessor
                 | Op::Intrinsic
+                | Op::IteratorOpen
+                | Op::IteratorNext
                 | Op::InitGlobal
                 | Op::LdaHole => {
                     return err(at, format!("{op:?} is the front end's only"));

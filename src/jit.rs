@@ -2497,7 +2497,9 @@ fn bytecode_live(
 ) -> Vec<RegSet> {
     use crate::bytecode::Operand;
     // Per instruction: registers read, and the register written.
-    let effects: Vec<(RegSet, Option<usize>)> = insns
+    // Per instruction: registers read, and those written (all of them,
+    // whatever the path: a register written only sometimes is not).
+    let effects: Vec<(RegSet, RegSet)> = insns
         .iter()
         .map(|insn| {
             let op = Op::from_u8(code[insn.pc]).unwrap().plain();
@@ -2511,8 +2513,31 @@ fn bytecode_live(
                 at += k.width();
             }
             let mut reads = [0; 4];
+            let mut writes = [0; 4];
             let write = match op {
                 Op::Star => Some(regs[0]),
+                // (The iterable in `r`, then its state in `r` and `r + 1`,
+                // both written once it opened.)
+                Op::IteratorOpen => {
+                    rs_add(&mut reads, regs[0]);
+                    rs_add(&mut writes, regs[0]);
+                    rs_add(&mut writes, regs[0] + 1);
+                    None
+                }
+                // (It reads its state, and writes it but for a record's.)
+                Op::IteratorNext => {
+                    rs_add(&mut reads, regs[0]);
+                    rs_add(&mut reads, regs[0] + 1);
+                    None
+                }
+                // (Its arguments are `n` registers: `IteratorOpen`'s state
+                // for the closes and the rest.)
+                Op::Intrinsic => {
+                    for r in regs[0]..regs[0] + count {
+                        rs_add(&mut reads, r);
+                    }
+                    None
+                }
                 Op::Mov => {
                     rs_add(&mut reads, regs[0]);
                     Some(regs[1])
@@ -2541,7 +2566,10 @@ fn bytecode_live(
                     None
                 }
             };
-            (reads, write)
+            if let Some(w) = write {
+                rs_add(&mut writes, w);
+            }
+            (reads, writes)
         })
         .collect();
     let n = insns.len();
@@ -2580,9 +2608,16 @@ fn bytecode_live(
             for s in succs.into_iter().flatten().filter(|&s| s < n) {
                 rs_or(&mut live, &live_in[s]);
             }
-            let (reads, write) = &effects[k];
-            if let Some(w) = write {
-                live[w / 64] &= !(1 << (w % 64));
+            let (reads, writes) = &effects[k];
+            for (l, w) in live.iter_mut().zip(writes) {
+                *l &= !w;
+            }
+            // (`IteratorOpen` may throw before it writes: what its handler
+            // reads stays live.)
+            if insn.op == Op::IteratorOpen
+                && let Some(h) = handler[k]
+            {
+                rs_or(&mut live, &live_in[h]);
             }
             rs_or(&mut live, reads);
             if !rs_eq(&live, &live_in[k]) {
@@ -12852,6 +12887,8 @@ fn reads_acc(insn: &Insn) -> bool {
                 | Op::Call
                 | Op::CallUndefined
                 | Op::Construct
+                | Op::IteratorOpen
+                | Op::IteratorNext
         )
 }
 

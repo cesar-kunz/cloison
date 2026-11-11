@@ -1272,6 +1272,9 @@ pub struct Vm {
     /// `done` and `then`, for iterator results and promises.
     pub(crate) a_done: Atom,
     pub(crate) a_then: Atom,
+    /// `next` and `return`, for iterators (pinned: see `Vm::intern`).
+    pub(crate) a_next: Atom,
+    pub(crate) a_return: Atom,
     pub(crate) a_writable: Atom,
     pub(crate) a_enumerable: Atom,
     pub(crate) a_configurable: Atom,
@@ -1520,6 +1523,8 @@ impl Vm {
             a_value: Atom(0),
             a_done: Atom(0),
             a_then: Atom(0),
+            a_next: Atom(0),
+            a_return: Atom(0),
             a_writable: Atom(0),
             a_enumerable: Atom(0),
             a_configurable: Atom(0),
@@ -1539,6 +1544,8 @@ impl Vm {
         vm.a_value = vm.intern_name("value");
         vm.a_done = vm.intern_name("done");
         vm.a_then = vm.intern_name("then");
+        vm.a_next = vm.intern("next");
+        vm.a_return = vm.intern("return");
         vm.a_writable = vm.intern_name("writable");
         vm.a_enumerable = vm.intern_name("enumerable");
         vm.a_configurable = vm.intern_name("configurable");
@@ -3368,7 +3375,7 @@ impl Vm {
     /// 0 once its buffer is detached: see `typed::ta_length`; a far array's
     /// its store's: see `far`; a growable shared buffer's view's read from
     /// its block, as the getter would: see `typed::ta_length_seq_cst`).
-    fn length_field(&mut self, o: *mut Object) -> u32 {
+    pub(crate) fn length_field(&mut self, o: *mut Object) -> u32 {
         unsafe {
             if (*o).class == Class::TypedArray {
                 return crate::typed::ta_length_seq_cst(self, o).unwrap_or(0) as u32;
@@ -7539,7 +7546,12 @@ impl Scan {
                     | crate::bytecode::Op::AsyncStart
                     | crate::bytecode::Op::Yield
             );
-            s.intrinsic |= op == crate::bytecode::Op::Intrinsic;
+            // (`IteratorOpen` and `IteratorNext` as intrinsics: compiled
+            // code exits at them.)
+            s.intrinsic |= matches!(
+                op,
+                crate::bytecode::Op::Intrinsic | crate::bytecode::Op::IteratorOpen | crate::bytecode::Op::IteratorNext
+            );
             s.ops += 1;
         }
         s

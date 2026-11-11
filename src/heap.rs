@@ -367,10 +367,17 @@ pub fn reserve() -> Option<Slice> {
     space().free.lock().unwrap().pop().map(Slice)
 }
 
+/// The most of its slice a heap uses: all but its last block, so that
+/// compiled code's `ptr + size`, for a size up to [`LARGE`] checked
+/// against the hole's end after it is made, is an address in the space
+/// even in the last slice (see `bump_to` in the stencils).
+const ROOM: usize = SLICE - BLOCK;
+const _: () = assert!(LARGE <= BLOCK);
+
 /// The heap limit for `CLOISON_HEAP_LIMIT=mb`, in bytes: `mb` MiB, not
-/// wrapping when that overflows, clamped to `[CHUNK, SLICE]`.
+/// wrapping when that overflows, clamped to `[CHUNK, ROOM]`.
 fn limit(mb: usize) -> usize {
-    mib(mb).clamp(CHUNK, SLICE)
+    mib(mb).clamp(CHUNK, ROOM)
 }
 
 /// `mb` MiB in bytes, saturating rather than wrapping.
@@ -394,7 +401,7 @@ impl Heap {
         let limit = std::env::var("CLOISON_HEAP_LIMIT")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .map_or(SLICE, limit);
+            .map_or(ROOM, limit);
         let s = space();
         // (The heap gives it back when dropped.)
         let slice = std::mem::ManuallyDrop::new(slice).0;
@@ -961,11 +968,11 @@ impl Heap {
         unsafe { std::ptr::replace(self.base as *mut *mut crate::vm::Vm, vm) }
     }
 
-    /// No more than `bytes` more of fresh blocks (`usize::MAX`: the whole
-    /// slice), for tests (`CLOISON_HEAP_LIMIT` is the process's).
+    /// No more than `bytes` more of fresh blocks (`usize::MAX`: as many
+    /// as the slice has room for), for tests (`CLOISON_HEAP_LIMIT` is the process's).
     #[cfg(test)]
     pub(crate) fn limit_growth(&mut self, bytes: usize) {
-        self.limit = (self.top * BLOCK).saturating_add(bytes).min(SLICE);
+        self.limit = (self.top * BLOCK).saturating_add(bytes).min(ROOM);
     }
 
     /// `n` contiguous blocks never used before: the first's index.
@@ -1233,8 +1240,8 @@ pub(crate) mod tests {
     fn heap_limit_does_not_wrap() {
         assert_eq!(limit(0), CHUNK);
         assert_eq!(limit(100), 100 << 20);
-        assert_eq!(limit(1 << 44), SLICE);
-        assert_eq!(limit(usize::MAX), SLICE);
+        assert_eq!(limit(1 << 44), ROOM);
+        assert_eq!(limit(usize::MAX), ROOM);
     }
 
     /// More heaps alive at once than tests running in parallel on a large

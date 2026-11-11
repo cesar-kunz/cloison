@@ -4639,12 +4639,17 @@ unsafe fn bump_to(heap: *mut HeapPtrs, words: usize) -> Option<(*mut u64, *mut u
     unsafe {
         let words = (words + 1) & !1;
         let p = (*heap).ptr;
-        // (In bounds even past the hole: the heap's cursor is always in its
-        // slice, at its base when it has none.)
-        let end = p.add(words);
-        // (Past `LARGE` the runtime makes it a large cell.) `p + size >
+        // (Past `LARGE` the runtime makes it a large cell.)
+        if 8 * words > LARGE {
+            core::hint::cold_path();
+            return None;
+        }
+        // (In bounds even past the hole: the heap's cursor is in its slice,
+        // at its base when it has none, and no heap uses its slice's last
+        // block, `LARGE` bytes and more: see the heap's `ROOM`.) `p + size >
         // end`: `lea; cmp; ja`, not `end - p < size`'s `mov; sub; cmp; jb`.
-        if 8 * words > LARGE || end as usize > (*heap).end as usize {
+        let end = p.add(words);
+        if end as usize > (*heap).end as usize {
             core::hint::cold_path();
             return None;
         }

@@ -233,10 +233,12 @@ pub(crate) fn async_from_sync(vm: &mut Vm, v: Value, record: Value, close: Value
 /// 6.b, 27.1.6.4 steps 6-9), but `p` fulfilled with `v` itself: its
 /// consumers read `done` from the record (`symbol::sync_done`), and no
 /// iterator result is made while `Object.prototype` has no `then` to
-/// find on it. With a callable one the iterator result is adopted as a
-/// thenable, as the spec has it: `p` settles with what that gives, the
-/// record marked for the consumers to read it as an iterator result
-/// (`symbol::set_sync_result`).
+/// find on it. Once one was looked up on the iterator result, `p` is
+/// resolved with that result, as the spec has it (fulfilled with it, or
+/// adopting it as a thenable if the `then` is callable), the record
+/// marked for the consumers to read what `p` gives as an iterator result
+/// (`symbol::set_sync_result`): a `then` getter may have changed it, or
+/// keep it.
 pub(crate) fn resolve_iter_result(vm: &mut Vm, p: *mut Object, v: Value, record: Value) -> Result<()> {
     let a_then = vm.a_then;
     if vm.lookup(vm.object_prototype, a_then).is_none() {
@@ -250,10 +252,10 @@ pub(crate) fn resolve_iter_result(vm: &mut Vm, p: *mut Object, v: Value, record:
             return settle(vm, p, REJECTED, e);
         }
     };
-    if !is_callable(then) {
-        return settle(vm, p, FULFILLED, v);
-    }
     crate::symbol::set_sync_result(record);
+    if !is_callable(then) {
+        return settle(vm, p, FULFILLED, r);
+    }
     enqueue(vm, [Value::from_i32(THENABLE), object_value(p), r, then, Value::UNDEFINED, Value::UNDEFINED])
 }
 

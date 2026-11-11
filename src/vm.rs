@@ -1167,6 +1167,12 @@ pub struct Vm {
     /// The shape of this realm's `{value, done}` iterator results, once
     /// one is made (see `symbol::iter_result`).
     pub(crate) iter_result_shape: *const Shape,
+    /// The first strict function's `arguments` object made:
+    /// the others get its shape (with elements of any type,
+    /// `strict_arguments_shape`) and its slots (see
+    /// `builtins::arguments_object_of`).
+    pub(crate) strict_arguments: Value,
+    pub(crate) strict_arguments_shape: *const Shape,
     /// Their shape when mapped (see `builtins::mapped_arguments_object`).
     pub(crate) mapped_arguments_shape: *const Shape,
     /// The object keys read-modify-writes' `GetKeyed`s converted, what to,
@@ -1499,6 +1505,8 @@ impl Vm {
             released_mark: None,
             arguments_shape: std::ptr::null(),
             iter_result_shape: std::ptr::null(),
+            strict_arguments: Value::UNDEFINED,
+            strict_arguments_shape: std::ptr::null(),
             mapped_arguments_shape: std::ptr::null(),
             key_cache: Vec::new(),
             eval_function: std::ptr::null_mut(),

@@ -1321,6 +1321,30 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         }
         return object_value(o);
     }
+    // A strict function's: the shape and slots of the first one with no
+    // arguments, which has the `callee` accessor of every one (its
+    // getter-setter pair shared, as it can't change: not configurable).
+    if vm.strict_arguments.is_cell() {
+        unsafe {
+            let t = as_object(vm.strict_arguments);
+            let s = vm.strict_arguments_shape;
+            crate::object::mark_shape(s);
+            let o = vm.heap.alloc_object(&*s);
+            let n = (*s).keys().len() as u32;
+            vm.store_field(o, 0, Value::from_i32(values.len() as i32));
+            for k in 1..n {
+                let v = *Object::slot(t, (*s).location(k));
+                vm.store_field(o, k, v);
+            }
+            if !values.is_empty() {
+                let e = vm.heap.alloc_values_from(values.len(), values.len());
+                std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());
+                crate::heap::store_young(o.cast(), &raw mut (*o).elems, e);
+                (*o).elems_len = values.len() as u32;
+            }
+            return object_value(o);
+        }
+    }
     let op = object_value(vm.object_prototype);
     let o = vm.new_object(op);
     let a_length = vm.a_length;
@@ -1346,6 +1370,26 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
     // Defined, not set: a prototype's setter for an index isn't called.
     for (i, &v) in values.iter().enumerate() {
         let _ = vm.create_data_property(ov, crate::vm::Key::Index(i as u32), v);
+    }
+    // The first strict one is the template of the next ones (its elements
+    // kept alive with it, which nothing reads). Its own shape is unique,
+    // `callee` defined on it: the next ones get one of transitions, with
+    // the same keys and attributes, shared.
+    unsafe {
+        let t = &*(*o).shape;
+        if !t.dictionary && t.keys() == [a_length, a_iter, mark, a_callee] {
+            let mut s = vm.root_shape(Class::Plain, op, 4);
+            for k in 0..4 {
+                s = vm.transition_with(s, t.keys()[k], t.attrs()[k]);
+            }
+            let e = vm.elements_transition(s, crate::object::FieldType::Any);
+            // (Both realm fields: the template a root, the shape kept by
+            // `Vm::fixed_shapes`.)
+            if (0..4).all(|k| (*e).location(k) == t.location(k)) {
+                vm.strict_arguments_shape = e;
+                vm.strict_arguments = ov;
+            }
+        }
     }
     ov
 }

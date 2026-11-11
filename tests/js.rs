@@ -18073,3 +18073,57 @@ out.join(' ; ')
         r#"{"value":1,"done":false}value|done ; 3 ;  ; "{\"value\":2,\"done\":false}""#
     );
 }
+
+/// Strict functions' `arguments` objects after the first get its shape
+/// (transitions of the same keys and attributes) and its `callee` pair
+/// (`Vm::strict_arguments`): own keys in order, the descriptors of
+/// `length`, `callee` (one thrower as getter and setter, not
+/// configurable), the elements and `@@iterator`; changing, freezing and
+/// deleting one leaves the others as they were; they are unmapped.
+/// Expected values from V8 and SpiderMonkey.
+#[test]
+fn strict_arguments_objects_share_a_shape_and_keep_their_properties() {
+    let src = r#"
+'use strict';
+var out = [];
+function d(o, k) { var x = Object.getOwnPropertyDescriptor(o, k); return x ? (x.get ? 'acc:' + x.enumerable + '/' + x.configurable + '/' + (x.get === x.set) : [x.writable, x.enumerable, x.configurable].join('/')) : 'none'; }
+function f() { return arguments; }
+var a = f(), b = f(1, 'x', { o: 1 }), c = f(undefined), e = f(1.5, 2.5);
+out.push(a.length, b.length, b[1], c.length, 0 in c, e[0] + e[1]);
+out.push(Reflect.ownKeys(b).map(String).join('|'), Object.keys(b).join(), d(b, 'length'), d(b, 'callee'), d(b, 0), d(b, Symbol.iterator));
+out.push(Object.getOwnPropertyDescriptor(a, 'callee').get === Object.getOwnPropertyDescriptor(b, 'callee').get, Object.prototype.toString.call(b), [...b].length, Array.isArray(b));
+try { b.callee; } catch (x) { out.push(x.constructor.name); }
+try { b.callee = 1; } catch (x) { out.push('set ' + x.constructor.name); }
+try { Object.defineProperty(b, 'callee', { value: 1 }); } catch (x) { out.push('def ' + x.constructor.name); }
+b.length = 7; b[9] = 'n'; delete b[0]; out.push(b.length, Object.keys(b).join(), a.length, f(4).length);
+function g(x) { x = 2; return arguments[0]; } out.push(g(1));
+function h() { arguments[0] = 'w'; return arguments.length + ':' + arguments[0]; } out.push(h(), h(1, 2));
+var o = f(1, 2); Object.freeze(o); out.push(Object.isFrozen(f(1)), Object.isFrozen(o));
+out.push(JSON.stringify(f(1, [2])), Reflect.ownKeys(f()).length);
+out.join(' ; ')
+"#;
+    assert_eq!(
+        value(src),
+        r#"0 ; 3 ; x ; 1 ; true ; 4 ; 0|1|2|length|callee|Symbol(Symbol.iterator) ; 0,1,2 ; true/false/true ; acc:false/false/true ; true/true/true ; true/false/true ; true ; [object Arguments] ; 3 ; false ; TypeError ; set TypeError ; def TypeError ; 7 ; 1,2,9 ; 0 ; 1 ; 1 ; 0:w ; 2:w ; false ; true ; {"0":1,"1":[2]} ; 3"#
+    );
+}
+
+/// A realm's strict `arguments` objects are of its own prototype and
+/// shape. Expected values from V8 (SpiderMonkey's shell has no
+/// `ShadowRealm`).
+#[test]
+fn strict_arguments_objects_are_their_realms() {
+    let src = r#"
+'use strict';
+var out = [];
+function f() { return arguments; }
+var r = new ShadowRealm();
+out.push(r.evaluate('"use strict"; function f() { return arguments; } var a = f(1), b = f(2, 3); Reflect.ownKeys(b).map(String).join("|") + ":" + (Object.getPrototypeOf(b) === Object.prototype) + ":" + Object.keys(b)'));
+out.push(r.evaluate('"use strict"; Object.prototype.z = 1; (function () { return arguments.z; })()'), f().z);
+out.join(' ; ')
+"#;
+    assert_eq!(
+        value(src),
+        r#"0|1|length|callee|Symbol(Symbol.iterator):true:0,1 ; 1 ; "#
+    );
+}

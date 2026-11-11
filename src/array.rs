@@ -1311,6 +1311,13 @@ const FROM_ASYNC: &str = r#"(function (isConstructor, call, define, typeError, s
           // throws a rejection.)
           v = await syncStep(record, false);
           done = syncDone(record);
+          // (Unless the step's promise gave an iterator result, from a
+          // callable Object.prototype.then: read as an async one's.)
+          if (done === void 0) {
+            if (!isObject(v)) typeError("Array.fromAsync: an iterator result is not an object");
+            done = !!v.done;
+            if (!done) v = v.value;
+          }
         } else {
           const r = await call(next, it);
           if (!isObject(r)) typeError("Array.fromAsync: an iterator result is not an object");
@@ -1395,7 +1402,12 @@ fn from_async_sync_step(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     crate::intrinsics::async_from_sync_call(vm, arg(a, 0), None, mode)
 }
 
+/// `syncDone(record)`: whether its step was done, undefined if its
+/// promise gave an iterator result to read instead.
 fn from_async_sync_done(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+    if crate::symbol::sync_result(arg(a, 0)) {
+        return Ok(Value::UNDEFINED);
+    }
     Ok(Value::from_bool(crate::symbol::sync_done(arg(a, 0))))
 }
 

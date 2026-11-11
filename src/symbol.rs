@@ -724,21 +724,68 @@ fn is_native(vm: &Vm, f: Value, n: NativeFn) -> bool {
         }
 }
 
-/// What a data property `name` of `o` or its prototypes holds, if a data
-/// property (`None`: absent or an accessor, `Some(None)`: absent).
-fn data_of(vm: &Vm, o: *mut Object, name: Atom) -> Option<Option<Value>> {
-    match vm.lookup(o, name) {
-        None => Some(None),
-        Some((h, slot)) if vm.is_accessor(h, slot) => None,
-        Some((h, slot)) => Some(Some(unsafe { *Object::slot(h, (*(*h).shape).location(slot)) })),
+/// The iteration protector's bits: arrays iterate by the builtins
+/// (`Array.prototype[@@iterator]` the builtin `values`,
+/// `%ArrayIteratorPrototype%.next` the builtin `next`, data properties
+/// both)...
+pub(crate) const ITER_ARRAY: u8 = 1;
+/// ...and nothing `%ArrayIteratorPrototype%` inherits from has `return`.
+pub(crate) const ITER_NO_RETURN: u8 = 2;
+
+/// The iteration protector, V8's `ArrayIteratorLookupChain` (or
+/// JavaScriptCore's array iterator protocol watchpoint): bits that hold
+/// while the prototype epoch does. What they rest on is on prototypes,
+/// which `make_prototype` gives unique shapes, so adding or deleting a
+/// property of one bumps the epoch; the slots they read are in
+/// `relied_slots`, so storing another value in one bumps it too.
+pub(crate) fn protector(vm: &mut Vm) -> u8 {
+    if vm.iter_epoch == Some(vm.proto_epoch) {
+        return vm.iter_bits;
     }
+    let aip = root(vm, Root::ArrayIteratorPrototype);
+    // (Each of the chains, prototypes: a change to any bumps the epoch.
+    // A proxy on one may run code for any lookup, which `Vm::lookup`
+    // doesn't: then no bits.)
+    let mut proxied = false;
+    for start in [vm.array_prototype, aip] {
+        let mut o = start;
+        while !o.is_null() {
+            proxied |= crate::proxy::is_proxy(vm, o);
+            vm.make_prototype(o);
+            let p = unsafe { (*(*o).shape).proto };
+            o = if p.is_cell() { as_object(p) } else { std::ptr::null_mut() };
+        }
+    }
+    let rely = |vm: &mut Vm, o: *mut Object, name: Atom| -> Option<Value> {
+        let (h, slot) = vm.lookup(o, name)?;
+        if vm.is_accessor(h, slot) {
+            return None;
+        }
+        let at = unsafe { Object::slot(h, (*(*h).shape).location(slot)) };
+        vm.relied_slots.insert(at as usize);
+        Some(unsafe { *at })
+    };
+    let values = object_value(root(vm, Root::ArrayValues));
+    let mut bits = 0;
+    if rely(vm, vm.array_prototype, vm.a_sym_iterator) == Some(values)
+        && rely(vm, aip, vm.a_next).is_some_and(|n| is_native(vm, n, array_iterator_next))
+    {
+        bits |= ITER_ARRAY;
+    }
+    if vm.lookup(aip, vm.a_return).is_none() {
+        bits |= ITER_NO_RETURN;
+    }
+    if proxied {
+        bits = 0;
+    }
+    vm.iter_bits = bits;
+    vm.iter_epoch = Some(vm.proto_epoch);
+    bits
 }
 
 /// Whether `v` iterates as an array by the builtins: an array (not a
 /// proxy) with `Array.prototype` for its prototype and no own
-/// `@@iterator`, whose `@@iterator` is the builtin `values` and
-/// `%ArrayIteratorPrototype%.next` the builtin `next`, both data
-/// properties. Nothing of its iteration is observable then but the
+/// `@@iterator`, while the [`protector`] has [`ITER_ARRAY`]. Nothing of its iteration is observable then but the
 /// reads of its length and its elements, which `IteratorNext` does as
 /// `next()` would.
 fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
@@ -752,10 +799,7 @@ fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
     if unsafe { (*(*o).shape).lookup(vm.a_sym_iterator).is_some() } {
         return false;
     }
-    let aip = root(vm, Root::ArrayIteratorPrototype);
-    let values = object_value(root(vm, Root::ArrayValues));
-    data_of(vm, vm.array_prototype, vm.a_sym_iterator) == Some(Some(values))
-        && matches!(data_of(vm, aip, vm.a_next), Some(Some(n)) if is_native(vm, n, array_iterator_next))
+    protector(vm) & ITER_ARRAY != 0
 }
 
 /// `IteratorOpen`: the iterable in `slots[0]`, then the iteration's
@@ -838,8 +882,7 @@ pub(crate) unsafe fn iterator_next(vm: &mut Vm, slots: *mut Value) -> Result<Val
 /// inherits from don't have unless a script gave them one; then called
 /// on an iterator made for it, at that index.
 pub(crate) fn open_array_close(vm: &mut Vm, a: &[Value]) -> Result<()> {
-    let aip = root(vm, Root::ArrayIteratorPrototype);
-    if vm.lookup(aip, vm.a_return).is_none() {
+    if protector(vm) & ITER_NO_RETURN != 0 {
         return Ok(());
     }
     let it = new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?;

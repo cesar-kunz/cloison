@@ -113,6 +113,8 @@ impl Field for *const Shape {
 impl Field for *const Code {}
 impl Field for i32 {}
 impl Field for bool {}
+impl Field for u8 {}
+impl Field for Option<u32> {}
 impl Field for (*const Shape, *const Shape) {
     fn shapes(&self, out: &mut Vec<*const Shape>) {
         self.0.shapes(out);
@@ -235,6 +237,8 @@ realm_fields! {
     promise_roots: Vec<*mut Object> = Vec::new() => promise_roots;
     iterator_roots: Vec<*mut Object> = Vec::new() => iterator_roots;
     symbol_roots: Vec<*mut Object> = Vec::new() => symbol_roots;
+    iter_bits: u8 = 0 => iter_bits;
+    iter_epoch: Option<u32> = None => iter_epoch;
     shadow_roots: Vec<*mut Object> = Vec::new() => shadow_roots;
     temporal_protos: Vec<*mut Object> = Vec::new() => temporal.protos;
     temporal_ctors: Vec<*mut Object> = Vec::new() => temporal.ctors;

@@ -16849,9 +16849,30 @@ try { throw 4; } catch (e) { var top = () => e; }
 function n() { try { throw 5; } catch (e) { function q() { return (() => e)(); } return q; } }
 var o = { m() { try { throw 6; } catch (e) { return [0].map(() => e)[0]; } } };
 function m() { var r = []; for (var i = 0; i < 3; i++) { try { throw i; } catch (e) { r.push(() => e); } } return r.map(x => x()).join(""); }
-log.push(f()(), g()(), h(7)(), top(), n()(), o.m(), m());
+function a() { var e = 0; try { throw 7; } catch (e) { return { get p() { return e; } }.p; } }
+function b() { try { throw 8; } catch (e) { return (function* () { yield e; })().next().value; } }
+function c() { try { throw 9; } catch (e) { return ((x = e) => x)(); } }
+log.push(f()(), g()(), h(7)(), top(), n()(), o.m(), m(), a(), b(), c());
 log.join(" ");"#;
-    assert_eq!(value(src), "1 2 3 4 5 6 012");
+    assert_eq!(value(src), "1 2 3 4 5 6 012 7 8 9");
+}
+
+/// A class's field initializers, static blocks, computed keys and methods
+/// in a catch clause see its parameter (14.15.3), as other functions do.
+/// (A class is a block-scoped declaration: the script's catch parameters
+/// are renamed apart anyway.)
+#[test]
+fn class_members_in_a_catch_see_its_parameter() {
+    let src = r#"
+var log = [];
+function a() { try { throw 1; } catch (e) { class C { x = e; } return new C().x; } }
+function b() { try { throw 2; } catch (e) { class C { static x = e; } return C.x; } }
+function c() { var r; try { throw 3; } catch (e) { class C { static { r = e; } } } return r; }
+function d() { try { throw "k"; } catch (e) { class C { [e] = 4; } return new C().k; } }
+function f() { var e = 0; try { throw 5; } catch (e) { class C { m() { return e; } } return new C().m(); } }
+log.push(a(), b(), c(), d(), f());
+log.join(" ");"#;
+    assert_eq!(value(src), "1 2 3 4 5");
 }
 
 /// A direct `eval`'s declarations are checked against every binding of

@@ -258,6 +258,9 @@ realm_fields! {
     mapped_arguments_shape: *const Shape = NO_SHAPE => mapped_arguments_shape;
     regexp_proto_shape: *const Shape = NO_SHAPE => regexp_proto_shape;
     regexp_slots: [i32; crate::vm::REGEXP_FNS] = [0; crate::vm::REGEXP_FNS] => regexp_slots;
+    regexp_species_shapes: (*const Shape, *const Shape) = (NO_SHAPE, NO_SHAPE) => regexp_species_shapes;
+    regexp_species_slots: [i32; 2] = [0; 2] => regexp_species_slots;
+    regexp_species_getter: Value = Value::UNDEFINED => regexp_species_getter;
     regexp_shapes: (*const Shape, *const Shape) = (NO_SHAPE, NO_SHAPE) => regexp_shapes;
     match_shapes: Vec<MatchShape> = Vec::new() => match_shapes;
     function_call: *const Code = NO_CODE => function_call;

@@ -3981,6 +3981,12 @@ impl Vm {
         unsafe { (*(*self.global_lexicals).shape).lookup(name) }
     }
 
+    /// How many block-scoped bindings the global scope has: those made
+    /// later get the slots past it (see `declare_lexical`).
+    pub(crate) fn global_lexical_count(&self) -> u32 {
+        unsafe { (*(*self.global_lexicals).shape).keys().len() as u32 }
+    }
+
     /// A global name's load (GetBindingValue) finding the global scope's
     /// block-scoped binding, which comes before the global object: its
     /// value (or a ReferenceError, not initialized yet), cached in `ic`'s
@@ -6556,7 +6562,7 @@ impl Vm {
     /// binding of (HasLexicalDeclaration), or the global object can't
     /// take (`annex_b_undefinable`): no `var` is made, nor is it an
     /// error, and the function stays its block's (B.3.2.2, B.3.2.3; see
-    /// `interp::op_sta_global_annex_b`).
+    /// `intrinsics::annex_b_skipped`).
     pub(crate) fn annex_b_skipped(&mut self, module: &Module, n: &str) -> bool {
         if !module.annex_b.iter().any(|b| b == n) {
             return false;

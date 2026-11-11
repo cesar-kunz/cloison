@@ -2195,6 +2195,10 @@ handlers! {
     #[inline(never)]
     fn slow_call(pc, acc, regs, tag) {
         let w = reg(pc, 2, regs);
+        if let Some(r) = leaf_call(regs, *reg(pc, 1, regs), *w, w.add(1), *pc.add(3) as usize) {
+            record_callee(pc, regs, tag);
+            next!(any, Op::Call.size(), r)
+        }
         // `f.call(that, …args)` with `f` a bytecode function: call `f`,
         // with the window one register on. The cache records `f`, for the
         // JIT to call (`VIA_CALL`).
@@ -2228,6 +2232,9 @@ handlers! {
     #[inline(never)]
     fn slow_call_undefined(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
+        if let Some(r) = leaf_call(regs, *reg(pc, 1, regs), Value::UNDEFINED, reg(pc, 2, regs), *pc.add(3) as usize) {
+            next!(any, Op::CallUndefined.size(), r)
+        }
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
         let r = with_top(regs, None, |vm| { let r = vm.call_other(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::CallUndefined.size(), r)
@@ -4933,6 +4940,39 @@ unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
         if is_cell(tag, f) {
             note_callee(regs, ic_at(regs, pc, 4), as_object(f));
         }
+    }
+}
+
+/// A call of a leaf native (`Code::leaf`) whose arguments let it run as
+/// one: its result, called directly, without `Vm::call_other`'s entry
+/// (no frame top, safepoint or held atoms: it runs no JS, interns nothing
+/// and can't fail). Else `None`, for the general path.
+#[inline(always)]
+unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value, argc: usize) -> Option<Value> {
+    unsafe {
+        if !f.is_cell() {
+            return None;
+        }
+        let o = as_object(f);
+        if (*o).class != Class::Native {
+            return None;
+        }
+        let code = (*o).code;
+        let leaf = (*code).leaf;
+        if leaf == 0 || (leaf == 2 && !(this.is_cell() && (*as_object(this)).class == Class::String)) {
+            return None;
+        }
+        let args = std::slice::from_raw_parts(args, argc);
+        if args.iter().any(|a| a.is_cell()) {
+            return None;
+        }
+        let vm = &mut *frame_vm(regs);
+        if !vm.realms.is_empty() && (*code).realm != vm.realm {
+            return None;
+        }
+        vm.constructing = false;
+        vm.callee = o;
+        (*code).native.unwrap()(vm, this, args).ok()
     }
 }
 

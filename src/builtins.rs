@@ -430,7 +430,7 @@ fn string_fn(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 
 /// `String.fromCharCode(…codes)`: each ToUint16.
-fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     if let [v] = a
         && v.is_int32()
     {
@@ -449,7 +449,7 @@ fn string_from_char_code(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(string(vm, &u))
 }
 
-fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(a, 0);
     Ok(if i >= 0.0 && (i as usize) < u.len() {
@@ -459,7 +459,7 @@ fn string_char_code_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     })
 }
 
-fn string_char_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn string_char_at(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(a, 0);
     Ok(if i >= 0.0 && (i as usize) < u.len() {
@@ -683,7 +683,7 @@ fn string_pad_end(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     pad(vm, this, a, false)
 }
 
-fn string_code_point_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn string_code_point_at(_: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?;
     let i = int_arg(a, 0);
     if i < 0.0 || i >= u.len() as f64 {
@@ -1581,69 +1581,69 @@ pub(crate) fn number_value_of(_: &mut Vm, this: Value, _: &[Value]) -> Result<Va
 fn math_arg(a: &[Value], i: usize) -> f64 {
     a.get(i).map_or(f64::NAN, |&v| to_number(v))
 }
-fn math_tan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_tan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(crate::math::tan(math_arg(a, 0))))
 }
-fn math_atan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_atan(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(crate::math::atan(math_arg(a, 0))))
 }
-fn math_atan2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_atan2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(crate::math::atan2(math_arg(a, 0), math_arg(a, 1))))
 }
-fn math_asin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_asin(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(crate::math::asin(math_arg(a, 0))))
 }
-fn math_acos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_acos(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(crate::math::acos(math_arg(a, 0))))
 }
-fn math_cbrt(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_cbrt(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).cbrt()))
 }
-fn math_clz32(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_clz32(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(Value::from_i32((crate::interp::to_int32(math_arg(a, 0)) as u32).leading_zeros() as i32))
 }
-fn math_cosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_cosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).cosh()))
 }
-fn math_sinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_sinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).sinh()))
 }
-fn math_tanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_tanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).tanh()))
 }
-fn math_acosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_acosh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).acosh()))
 }
-fn math_asinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_asinh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = math_arg(a, 0);
     Ok(num(if x == 0.0 { x } else { x.asinh() }))
 }
-fn math_atanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_atanh(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = math_arg(a, 0);
     Ok(num(if x == 0.0 { x } else { x.atanh() }))
 }
-fn math_expm1(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_expm1(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = math_arg(a, 0);
     Ok(num(if x == 0.0 { x } else { x.exp_m1() }))
 }
-fn math_log1p(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_log1p(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = math_arg(a, 0);
     Ok(num(if x == 0.0 { x } else { x.ln_1p() }))
 }
-fn math_log2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_log2(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).log2()))
 }
-fn math_log10(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_log10(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).log10()))
 }
-fn math_sign(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_sign(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = math_arg(a, 0);
     Ok(num(if x.is_nan() || x == 0.0 { x } else { x.signum() }))
 }
-fn math_trunc(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_trunc(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0).trunc()))
 }
-fn math_fround(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_fround(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     Ok(num(math_arg(a, 0) as f32 as f64))
 }
 fn math_f16round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
@@ -1651,7 +1651,7 @@ fn math_f16round(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
 }
 /// `Math.hypot(…values)`: every argument coerced first; infinity wins
 /// over NaN.
-fn math_hypot(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_hypot(vm: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let mut xs: Vec<f64> = Vec::with_capacity(a.len());
     for i in 0..a.len() {
         xs.push(math_arg(a, i));
@@ -1800,7 +1800,7 @@ impl ExactSum {
     }
 }
 
-fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
+pub(crate) fn math_imul(_: &mut Vm, _: Value, a: &[Value]) -> Result<Value> {
     let x = crate::interp::to_int32(math_arg(a, 0));
     let y = crate::interp::to_int32(math_arg(a, 1));
     Ok(Value::from_i32(x.wrapping_mul(y)))

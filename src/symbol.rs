@@ -689,18 +689,21 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
 /// Each value `v` iterates over, to `f` (the iterator closed if `f`
 /// fails).
 pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
-    // An array iterated by the builtins: its elements as `next()` gives
-    // them, with no iterator (see `IteratorOpen`).
-    if iterates_as_array(vm, v) {
-        let mut i = 0;
-        while let Some(x) = open_array_element(vm, v, i)? {
-            i += 1;
+    // An iteration by the builtins: its values as `next()` gives them,
+    // with no result objects (see `IteratorOpen`). (The state on the
+    // native stack, which pins what it holds.)
+    let mut st = [v, Value::UNDEFINED];
+    if unsafe { fast_open(vm, st.as_mut_ptr()) } {
+        loop {
+            let x = unsafe { iterator_next(vm, st.as_mut_ptr())? };
+            if x == Value::HOLE {
+                return Ok(());
+            }
             if let Err(e) = f(vm, x) {
-                let _ = open_array_close(vm, &[v, Value::number(i as f64)]);
+                let _ = open_state_close(vm, &st);
                 return Err(e);
             }
         }
-        return Ok(());
     }
     // (`it` and `next` are rooted on the native stack.)
     let it = get_iterator(vm, v)?;
@@ -742,8 +745,17 @@ fn is_native(vm: &Vm, f: Value, n: NativeFn) -> bool {
 /// `%ArrayIteratorPrototype%.next` the builtin `next`, data properties
 /// both)...
 pub(crate) const ITER_ARRAY: u8 = 1;
-/// ...and nothing `%ArrayIteratorPrototype%` inherits from has `return`.
+/// ...and no iterator prototype [`fast_open`] uses has `return`, nor
+/// what they inherit from...
 pub(crate) const ITER_NO_RETURN: u8 = 2;
+/// ...maps iterate by the builtins (`Map.prototype[@@iterator]` the
+/// builtin `entries`, `%MapIteratorPrototype%.next` the builtin)...
+pub(crate) const ITER_MAP: u8 = 4;
+/// ...sets (`values` and `%SetIteratorPrototype%.next`)...
+pub(crate) const ITER_SET: u8 = 8;
+/// ...and strings (`String.prototype[@@iterator]` and
+/// `%StringIteratorPrototype%.next`).
+pub(crate) const ITER_STRING: u8 = 16;
 
 /// The iteration protector, V8's `ArrayIteratorLookupChain` (or
 /// JavaScriptCore's array iterator protocol watchpoint): bits that hold
@@ -751,16 +763,29 @@ pub(crate) const ITER_NO_RETURN: u8 = 2;
 /// which `make_prototype` gives unique shapes, so adding or deleting a
 /// property of one bumps the epoch; the slots they read are in
 /// `relied_slots`, so storing another value in one bumps it too.
+#[inline]
 pub(crate) fn protector(vm: &mut Vm) -> u8 {
     if vm.iter_epoch == Some(vm.proto_epoch) {
         return vm.iter_bits;
     }
+    protector_again(vm)
+}
+
+/// [`protector`]'s bits computed again, the epoch having moved.
+#[cold]
+#[inline(never)]
+fn protector_again(vm: &mut Vm) -> u8 {
+    use crate::collections::Proto;
     let aip = root(vm, Root::ArrayIteratorPrototype);
+    let sip = root(vm, Root::StringIteratorPrototype);
+    let cp = |p: Proto| vm.collection_prototypes[p as usize];
+    let (mp, sp, mip, setip) = (cp(Proto::Map), cp(Proto::Set), cp(Proto::MapIterator), cp(Proto::SetIterator));
+    let iterators = [aip, sip, mip, setip];
     // (Each of the chains, prototypes: a change to any bumps the epoch.
     // A proxy on one may run code for any lookup, which `Vm::lookup`
     // doesn't: then no bits.)
     let mut proxied = false;
-    for start in [vm.array_prototype, aip] {
+    for start in [vm.array_prototype, vm.string_prototype, mp, sp].into_iter().chain(iterators) {
         let mut o = start;
         while !o.is_null() {
             proxied |= crate::proxy::is_proxy(vm, o);
@@ -780,12 +805,29 @@ pub(crate) fn protector(vm: &mut Vm) -> u8 {
     };
     let values = object_value(root(vm, Root::ArrayValues));
     let mut bits = 0;
-    if rely(vm, vm.array_prototype, vm.a_sym_iterator) == Some(values)
-        && rely(vm, aip, vm.a_next).is_some_and(|n| is_native(vm, n, array_iterator_next))
-    {
+    // (`is_native`: the current realm's own builtins, factories and
+    // `next`s alike.)
+    let builtins = |vm: &mut Vm, proto: *mut Object, method: Option<NativeFn>, it_proto: *mut Object, next: NativeFn| {
+        let m = rely(vm, proto, vm.a_sym_iterator);
+        let ok = match method {
+            Some(f) => m.is_some_and(|m| is_native(vm, m, f)),
+            None => m == Some(values),
+        };
+        ok && rely(vm, it_proto, vm.a_next).is_some_and(|n| is_native(vm, n, next))
+    };
+    if builtins(vm, vm.array_prototype, None, aip, array_iterator_next) {
         bits |= ITER_ARRAY;
     }
-    if vm.lookup(aip, vm.a_return).is_none() {
+    if builtins(vm, mp, Some(crate::collections::map_entries), mip, crate::collections::iterator_next) {
+        bits |= ITER_MAP;
+    }
+    if builtins(vm, sp, Some(crate::collections::set_values), setip, crate::collections::iterator_next) {
+        bits |= ITER_SET;
+    }
+    if builtins(vm, vm.string_prototype, Some(string_iterator), sip, string_iterator_next) {
+        bits |= ITER_STRING;
+    }
+    if iterators.iter().all(|&p| vm.lookup(p, vm.a_return).is_none()) {
         bits |= ITER_NO_RETURN;
     }
     if proxied {
@@ -801,6 +843,7 @@ pub(crate) fn protector(vm: &mut Vm) -> u8 {
 /// `@@iterator`, while the [`protector`] has [`ITER_ARRAY`]. Nothing of its iteration is observable then but the
 /// reads of its length and its elements, which `IteratorNext` does as
 /// `next()` would.
+#[inline]
 fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
     if !v.is_cell() || unsafe { (*as_object(v)).class } != Class::Array {
         return false;
@@ -815,15 +858,63 @@ fn iterates_as_array(vm: &mut Vm, v: Value) -> bool {
     protector(vm) & ITER_ARRAY != 0
 }
 
-/// `IteratorOpen`: the iterable in `slots[0]`, then the iteration's
-/// state in `slots[0..2]`: the array and its next index for an array
-/// iterated by the builtins ([`iterates_as_array`]), else a [`record`]
-/// of its iterator. (The slots are the frame's registers, read after
-/// any safepoint: a collection moving cells updates them.)
-pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()> {
+/// `IteratorOpen`'s states with no iterator record, tried in
+/// `slots[0..2]` (the iterable in `slots[0]`): an array iterated by the
+/// builtins ([`iterates_as_array`]) and its next index; a string and its
+/// next index; a map's or a set's iterator, made as its builtin
+/// `@@iterator` makes it (stepped without result objects); whether one
+/// was. Nothing observable is skipped: the protector stands for the
+/// lookups, and the iterator objects made are never seen.
+#[inline]
+pub(crate) unsafe fn fast_open(vm: &mut Vm, slots: *mut Value) -> bool {
     unsafe {
         if iterates_as_array(vm, *slots) {
             *slots.add(1) = Value::from_i32(0);
+            return true;
+        }
+        fast_open_other(vm, slots)
+    }
+}
+
+/// [`fast_open`]'s strings, maps and sets.
+#[inline(never)]
+unsafe fn fast_open_other(vm: &mut Vm, slots: *mut Value) -> bool {
+    unsafe {
+        let v = *slots;
+        if !v.is_cell() {
+            return false;
+        }
+        let o = as_object(v);
+        let (bit, proto) = match (*o).class {
+            Class::String => {
+                if protector(vm) & ITER_STRING == 0 {
+                    return false;
+                }
+                *slots.add(1) = Value::from_i32(0);
+                return true;
+            }
+            Class::Map => (ITER_MAP, crate::collections::Proto::Map),
+            Class::Set => (ITER_SET, crate::collections::Proto::Set),
+            _ => return false,
+        };
+        if (*(*o).shape).proto != object_value(vm.collection_prototypes[proto as usize])
+            || (*(*o).shape).lookup(vm.a_sym_iterator).is_some()
+            || protector(vm) & bit == 0
+        {
+            return false;
+        }
+        *slots = crate::collections::default_iterator(vm, o);
+        true
+    }
+}
+
+/// `IteratorOpen`: the iterable in `slots[0]`, then the iteration's
+/// state in `slots[0..2]`: one of [`fast_open`]'s, else a [`record`] of
+/// its iterator. (The slots are the frame's registers, read after any
+/// safepoint: a collection moving cells updates them.)
+pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()> {
+    unsafe {
+        if fast_open(vm, slots) {
             return Ok(());
         }
         let it = get_iterator(vm, *slots)?;
@@ -832,6 +923,12 @@ pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()>
         *slots.add(1) = Value::UNDEFINED;
         Ok(())
     }
+}
+
+/// Whether `IteratorOpen`'s state starting at `v` is one of
+/// [`fast_open`]'s (a record is a plain object).
+pub(crate) fn is_open_state(v: Value) -> bool {
+    v.is_cell() && matches!(unsafe { (*as_object(v)).class }, Class::Array | Class::String | Class::CollectionIterator)
 }
 
 /// `src`'s elements appended to array `dst`, as iterating `src` would
@@ -860,8 +957,8 @@ pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
     true
 }
 
-/// Whether `IteratorOpen`'s state starting at `v` is an array's (a
-/// record is a plain object).
+/// Whether `v`, the first register of an `IteratorOpen` state, makes it
+/// an array's (`[array, index]`).
 pub(crate) fn is_open_array(v: Value) -> bool {
     v.is_cell() && unsafe { (*as_object(v)).class } == Class::Array
 }
@@ -893,6 +990,7 @@ pub(crate) fn open_index(v: Value) -> u32 {
 /// `IteratorNext`: the next value of the iteration in `slots[0..2]`, or
 /// `HOLE` when done (an array's state then `undefined`, as its
 /// iterator's target is once done).
+#[inline]
 pub(crate) unsafe fn iterator_next(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
     unsafe {
         let s = *slots;
@@ -911,22 +1009,68 @@ pub(crate) unsafe fn iterator_next(vm: &mut Vm, slots: *mut Value) -> Result<Val
                 }
             });
         }
+        iterator_next_other(vm, slots)
+    }
+}
+
+/// [`iterator_next`] of a string's, a map's or a set's state, or a
+/// record's.
+#[inline(never)]
+unsafe fn iterator_next_other(vm: &mut Vm, slots: *mut Value) -> Result<Value> {
+    unsafe {
+        let s = *slots;
+        match (*as_object(s)).class {
+            Class::String => {
+                let i = (*slots.add(1)).as_i32_unchecked() as usize;
+                let u = string_units(s).expect("a string");
+                if i >= u.len() {
+                    *slots = Value::UNDEFINED;
+                    return Ok(Value::HOLE);
+                }
+                let c = u[i];
+                let pair = (0xD800..0xDC00).contains(&c) && u.get(i + 1).is_some_and(|d| (0xDC00..0xE000).contains(d));
+                *slots.add(1) = Value::from_i32((i + 1 + pair as usize) as i32);
+                return Ok(if pair {
+                    let piece = [c, u[i + 1]];
+                    vm.new_string(&piece)
+                } else {
+                    vm.single_char(c)
+                });
+            }
+            Class::CollectionIterator => {
+                return Ok(match crate::collections::step(vm, as_object(s))? {
+                    Some(v) => v,
+                    None => {
+                        *slots = Value::UNDEFINED;
+                        Value::HOLE
+                    }
+                });
+            }
+            _ => {}
+        }
         let (it, next) = record_parts(s);
         Ok(step_with(vm, it, next)?.unwrap_or(Value::HOLE))
     }
 }
 
-/// IteratorClose of `IteratorOpen`'s array state `[array, index]`: its
-/// iterator's `return`, which `%ArrayIteratorPrototype%` and what it
-/// inherits from don't have unless a script gave them one; then called
-/// on an iterator made for it, at that index.
-pub(crate) fn open_array_close(vm: &mut Vm, a: &[Value]) -> Result<()> {
+/// IteratorClose of one of [`fast_open`]'s states `[v, index]`: its
+/// iterator's `return`, which the iterator prototypes and what they
+/// inherit from don't have unless a script gave them one; then called
+/// on its iterator (an array's or a string's made for it, at that
+/// index).
+pub(crate) fn open_state_close(vm: &mut Vm, a: &[Value]) -> Result<()> {
     if protector(vm) & ITER_NO_RETURN != 0 {
         return Ok(());
     }
-    let it = new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?;
-    let state = Value::from_bits(unsafe { (*as_object(it)).code } as u64);
-    vm.set_keyed(state, Value::from_i32(1), a[1])?;
+    let it = match unsafe { (*as_object(a[0])).class } {
+        Class::CollectionIterator => a[0],
+        Class::String => new_iterator(vm, a[0], 3, Root::StringIteratorPrototype)?,
+        _ => new_iterator(vm, a[0], 1, Root::ArrayIteratorPrototype)?,
+    };
+    if unsafe { (*as_object(it)).class } == Class::ArrayIterator {
+        let state = Value::from_bits(unsafe { (*as_object(it)).code } as u64);
+        vm.set_keyed(state, Value::from_i32(1), a[1])?;
+    }
     close(vm, it)
 }
 

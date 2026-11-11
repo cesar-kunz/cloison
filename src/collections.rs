@@ -685,7 +685,7 @@ fn map_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(new_iterator(vm, o, IterMode::Values))
 }
 
-fn map_entries(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn map_entries(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Map, "Map.prototype.entries")?;
     Ok(new_iterator(vm, o, IterMode::Entries))
 }
@@ -733,7 +733,7 @@ fn set_size(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(Value::from_i32(live(o) as i32))
 }
 
-fn set_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn set_values(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let o = this_of(this, Class::Set, "Set.prototype.values")?;
     Ok(new_iterator(vm, o, IterMode::Values))
 }
@@ -747,10 +747,25 @@ fn set_entries(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// `%MapIteratorPrototype%.next()` and the set one's: the next entry not
 /// deleted, as the iterator's mode has it; exhausted for good at the end.
-fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     let it = this_of(this, Class::CollectionIterator, "Iterator.prototype.next")?;
+    Ok(match step(vm, it)? {
+        Some(v) => iter_result(vm, v, false),
+        None => iter_result(vm, Value::UNDEFINED, true),
+    })
+}
+
+/// A map's or a set's iterator as its `@@iterator` makes it (`entries`,
+/// `values`): for `IteratorOpen`.
+pub(crate) fn default_iterator(vm: &mut Vm, o: *mut Object) -> Value {
+    new_iterator(vm, o, if stride(o) == 2 { IterMode::Entries } else { IterMode::Values })
+}
+
+/// [`iterator_next`]'s value, without its result object: `None` once
+/// exhausted (for good).
+pub(crate) fn step(vm: &mut Vm, it: *mut Object) -> Result<Option<Value>> {
     if unsafe { (*it).code }.is_null() {
-        return Ok(iter_result(vm, Value::UNDEFINED, true));
+        return Ok(None);
     }
     let (mode, s) = unsafe { (*Object::aux(it) & 3, (*Object::aux(it) >> 2) as usize) };
     let mut i = unsafe { (*it).elems_len } as usize;
@@ -773,11 +788,11 @@ fn iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
                 pair
             }
         };
-        return Ok(iter_result(vm, value, false));
+        return Ok(Some(value));
     }
     // (`it` may be old: the marker may be reading `code`.)
     unsafe { crate::layout::store_word(&raw mut (*it).code, std::ptr::null()) };
-    Ok(iter_result(vm, Value::UNDEFINED, true))
+    Ok(None)
 }
 
 // ---- WeakMap and WeakSet ----

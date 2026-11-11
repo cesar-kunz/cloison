@@ -1962,6 +1962,19 @@ impl Marker {
         sh.wake.notify_all();
     }
 
+    /// Let it go on after a pause that gave it no work (`Heap::verify`'s),
+    /// as it was: marking, then asking for the final pause if its work ran
+    /// out while it was paused (it doesn't ask paused), or sweeping.
+    fn go_on(&self) {
+        let sh = &self.shared;
+        let mut st = sh.state();
+        if st.run && st.work.is_empty() && !st.busy {
+            ask_final(&mut st);
+        }
+        sh.pause.store(false, std::sync::atomic::Ordering::Relaxed);
+        sh.wake.notify_all();
+    }
+
     /// Hand it `more` work and let it run.
     fn resume(&self, more: &mut Vec<usize>, request: usize) {
         let sh = &self.shared;
@@ -2670,7 +2683,7 @@ impl Vm {
     /// The run is ending: pause the marker (its pointer to the heap's
     /// request flag would go stale if the VM moved); the next collection
     /// resumes it.
-    pub(crate) fn pause_marker(&mut self) {
+    pub(crate) fn pause_marker(&self) {
         self.heap.pause_marker();
     }
 
@@ -4775,11 +4788,22 @@ impl Heap {
     }
 
     /// Stop the marker thread, marking or sweeping, until the next
-    /// collection resumes it: its metadata writes are then over, and those
-    /// of the heap's can be read plainly.
-    pub(crate) fn pause_marker(&self) {
+    /// collection or [`Heap::resume_marker`] resumes it: its metadata
+    /// writes are then over, and the heap's metadata can be read plainly.
+    /// Whether it was running (not paused already).
+    pub(crate) fn pause_marker(&self) -> bool {
+        let Some(m) = &self.gc.marker else { return false };
+        // (Only the mutator stores the flag.)
+        let running = !m.shared.pause.load(std::sync::atomic::Ordering::Relaxed);
+        m.pause();
+        running
+    }
+
+    /// Let the marker [`Heap::pause_marker`] paused go on (see
+    /// `Marker::go_on`).
+    pub(crate) fn resume_marker(&self) {
         if let Some(m) = &self.gc.marker {
-            m.pause();
+            m.go_on();
         }
     }
 }
@@ -4990,6 +5014,81 @@ mod tests {
             assert!(vm.poisoned());
             assert_eq!(vm.run(&crate::js::compile("1").unwrap()).unwrap_err().0, expected);
         }
+    }
+
+    /// A marker that ran out of work while paused (it asks for the final
+    /// pause only unpaused) asks for it as it goes on.
+    #[test]
+    fn a_marker_out_of_work_asks_as_it_goes_on() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let requested = AtomicBool::new(false);
+        let mk = Marker::start();
+        mk.pause();
+        {
+            let mut st = mk.shared.state();
+            (st.run, st.done) = (true, false);
+            st.request = &requested as *const AtomicBool as usize;
+        }
+        mk.go_on();
+        assert!(requested.load(Relaxed));
+        let st = mk.shared.state();
+        assert!(!st.run && st.done);
+    }
+
+    /// `verify()`: `Heap::verify` in a run, and whether the marker was
+    /// marking then (it must be marking again after).
+    fn verify_now(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let busy = vm.heap.gc.marker.as_ref().is_some_and(|m| m.shared.state().busy);
+        vm.verify_heap();
+        if busy {
+            assert!(!vm.heap.gc.marker.as_ref().unwrap().shared.pause.load(Relaxed), "verify left the marker paused");
+        }
+        Ok(Value::from_bool(busy))
+    }
+
+    fn marking(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+        Ok(Value::from_bool(vm.heap.gc.marking))
+    }
+
+    fn stop_cycles(vm: &mut Vm, _: Value, _: &[Value]) -> crate::vm::Result<Value> {
+        vm.heap.gc.cycles = false;
+        Ok(Value::UNDEFINED)
+    }
+
+    /// `Heap::verify` while the marker marks (#220): it pauses the marker
+    /// for its plain reads of the metadata, finds every cell sound, and
+    /// lets the marker go on; the cycle still ends. (Up to three calls
+    /// with the marker busy, at least one: a fast marking may be over
+    /// between most of them.)
+    #[test]
+    fn verify_during_a_cycle() {
+        let src = r#"
+            var keep = [];
+            for (var i = 0; i < 200000; i++) keep.push({i: i, a: [i]});
+            var busy = 0;
+            for (var n = 0; n < 4000000 && busy < 3; n++) {
+                keep[n % 200000] = {n: n, a: [n]};
+                if (n % 512 == 0 && marking() && verify()) busy++;
+            }
+            // (The cycle under way still ends. A marker left paused is
+            // caught by `verify_now`: the next collection would resume it.)
+            stop_cycles();
+            var m = 0;
+            while (marking() && m < 1000000) { keep[m % 200000] = {m: m}; m++; }
+            (busy > 0) + "," + marking()
+        "#;
+        let module = crate::js::compile(src).unwrap();
+        let mut vm = Vm::new();
+        if vm.heap.gc.stw || vm.heap.gc.always_full {
+            return;
+        }
+        vm.heap.gc.cycles = true;
+        let g = vm.global;
+        vm.define_native(g, "verify", verify_now, 0, crate::jit::Ty::Any, false);
+        vm.define_native(g, "marking", marking, 0, crate::jit::Ty::Any, false);
+        vm.define_native(g, "stop_cycles", stop_cycles, 0, crate::jit::Ty::Any, false);
+        assert_eq!(vm.run(&module).map(crate::vm::display).as_deref(), Ok("true,false"));
     }
 
     use std::time::{Duration, Instant};

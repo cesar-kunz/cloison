@@ -1323,8 +1323,8 @@ fn async_delegate_closed(_: &mut Vm, a: &[Value]) -> Result<Value> {
 /// promise of the result's value (closing the iterator if it rejects,
 /// but for a done result or a `return()`'s), its `done` kept in the
 /// record (see [`async_from_sync_done`]); a rejection for what throws
-/// (IfAbruptRejectPromise). (Not of an iterator result: none is made,
-/// nothing sees it.)
+/// (IfAbruptRejectPromise). (Not of an iterator result, though resolved
+/// as by one: see `promise::resolve_iter_result`.)
 pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<Value>, mode: i32) -> Result<Value> {
     let step = |vm: &mut Vm| -> Result<Value> {
         let (it, next) = crate::symbol::record_parts(record);
@@ -1336,7 +1336,7 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
                 if m.is_undefined() || m.is_null() {
                     if mode == crate::generator::RETURN {
                         crate::symbol::set_sync_done(record, true);
-                        return crate::promise::fulfilled(vm, received.unwrap_or(Value::UNDEFINED));
+                        return crate::promise::iter_result_promise(vm, received.unwrap_or(Value::UNDEFINED), true);
                     }
                     crate::symbol::close(vm, it)?;
                     return Err(Error::type_error("The iterator does not provide a 'throw' method"));
@@ -1354,7 +1354,7 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
         let v = vm.get(r, a_value)?;
         crate::symbol::set_sync_done(record, done);
         let close = if done || mode == crate::generator::RETURN { Value::UNDEFINED } else { it };
-        crate::promise::async_from_sync(vm, v, close)
+        crate::promise::async_from_sync(vm, v, done, close)
     };
     match step(vm) {
         Ok(p) => Ok(p),

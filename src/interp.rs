@@ -1118,6 +1118,12 @@ handlers! {
         // into JS, is one no collection updates when it moves cells.)
         let args = std::slice::from_raw_parts(regs.add(first), n);
         let f = crate::intrinsics::INTRINSICS[id].1;
+        // `a ** b` of numbers: no conversion, nothing to call.
+        if f as usize == crate::intrinsics::exp as *const () as usize
+            && let (Some(a), Some(b)) = (args[0].as_number(), args[1].as_number())
+        {
+            next!(any, Op::Intrinsic.size(), Value::number(crate::math::pow(a, b)))
+        }
         (*frame_vm(regs)).intrinsic_code = frame_code(regs);
         // (What a conversion or a string past the longest left pending,
         // thrown as a native's caller throws it: see `call_function_on`.)

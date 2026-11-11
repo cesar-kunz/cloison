@@ -343,3 +343,31 @@ fn three_agents_see_grows_coherently() {
         prints_in_both_modes("grow-three", src, &[("CLOISON_TEST_GROW_DELAY", delay)], "stale 0, poller 0");
     }
 }
+
+/// Collecting at every safepoint (`CLOISON_GC_STRESS`) promotes what is
+/// live at each, and a loop of async iteration left the old space to grow
+/// with that garbage until `FULL_MIN`, every minor collection scanning
+/// its cards: time grew with the square of the loop's length (#127; 3
+/// MiB of blocks at 2,500 rounds). Full collections now keep it small.
+#[test]
+fn stress_collections_keep_an_async_loop_small() {
+    let src = "var n = 0;
+        async function* ag() { yield 1; }
+        async function main() { for (var k = 0; k < 2500; k++) { for await (var z of ag()) n++; } print(n); }
+        main();";
+    for no_jit in [false, true] {
+        let mut c = cloison("stress-async", src);
+        c.env("CLOISON_GC_STRESS", "1").env("CLOISON_GC_STATS", "1");
+        if no_jit {
+            c.env("CLOISON_NO_JIT", "1");
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{}", out.status);
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("2500\n"));
+        let most = String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter_map(|l| l.split_once(" MiB of blocks")?.0.rsplit(' ').next()?.parse::<usize>().ok())
+            .max();
+        assert!(most.is_some_and(|m| m <= 1), "{most:?} MiB of blocks, no JIT {no_jit}");
+    }
+}

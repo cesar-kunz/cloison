@@ -7059,11 +7059,12 @@ impl Vm {
 
     /// Run the promise jobs queued, then wait for the async waiters
     /// (`Atomics.waitAsync`'s) to be notified or time out, running the
-    /// jobs their promises queue, until none is left (see `shared`).
+    /// jobs their promises queue, until none is left that may still be
+    /// (see `shared::settling`).
     pub(crate) fn run_event_loop(&mut self) -> Result<()> {
         loop {
             self.run_jobs()?;
-            if !self.shared.waiting() {
+            if !crate::shared::settling(self) {
                 return Ok(());
             }
             crate::shared::idle(self);

@@ -1269,6 +1269,9 @@ pub struct Vm {
     pub(crate) a_length: Atom,
     pub(crate) a_name: Atom,
     pub(crate) a_value: Atom,
+    /// `done` and `then`, for iterator results and promises.
+    pub(crate) a_done: Atom,
+    pub(crate) a_then: Atom,
     pub(crate) a_writable: Atom,
     pub(crate) a_enumerable: Atom,
     pub(crate) a_configurable: Atom,
@@ -1515,6 +1518,8 @@ impl Vm {
             a_length: Atom(0),
             a_name: Atom(0),
             a_value: Atom(0),
+            a_done: Atom(0),
+            a_then: Atom(0),
             a_writable: Atom(0),
             a_enumerable: Atom(0),
             a_configurable: Atom(0),
@@ -1532,6 +1537,8 @@ impl Vm {
         vm.a_length = vm.intern_name("length");
         vm.a_name = vm.intern_name("name");
         vm.a_value = vm.intern_name("value");
+        vm.a_done = vm.intern_name("done");
+        vm.a_then = vm.intern_name("then");
         vm.a_writable = vm.intern_name("writable");
         vm.a_enumerable = vm.intern_name("enumerable");
         vm.a_configurable = vm.intern_name("configurable");

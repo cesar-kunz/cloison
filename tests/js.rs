@@ -571,6 +571,53 @@ main().then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// With a callable `Object.prototype.then`, AsyncFromSyncIterator's
+/// iterator result is adopted as a thenable (ES2025 27.1.6.4, the
+/// promise resolve functions of 27.2.1.3.2), what that gives read as an
+/// iterator result by `for await` (ForIn/OfBodyEvaluation, 14.7.5.7),
+/// `yield*` (15.5.5) and `Array.fromAsync`: its `done`, not the sync
+/// iterator's, in the job it settles in (V8, SpiderMonkey and JSC
+/// agree).
+#[test]
+fn async_from_sync_thenable_results_are_read() {
+    let src = r#"
+var log = [];
+// `Object.prototype.then`, callable for the next `n` iterator results it
+// is looked up on: each handed on as `make` remakes it.
+function thenable(n, make) {
+  Object.defineProperty(Object.prototype, "then", { configurable: true, get() {
+    if (!("done" in this) || this.made || n-- <= 0) return undefined;
+    var r = this;
+    return function (res) { log.push("then " + JSON.stringify(r)); res(make(r)); };
+  } });
+}
+function ticks(tag) { var p = Promise.resolve(); for (let i = 0; i < 4; i++) p = p.then(() => log.push(tag + i)); }
+var stop = r => ({ made: true, get done() { log.push("done"); return r.value == 2; }, get value() { log.push("value"); return r.value * 10; } });
+async function main() {
+  thenable(2, stop); ticks("a");
+  for await (var x of [1, 2, 3]) log.push("for " + x);
+  thenable(2, stop); ticks("b");
+  async function* g() { log.push("yield* gave " + (yield* [1, 2, 3])); }
+  var it = g();
+  log.push("gen " + JSON.stringify(await it.next()));
+  log.push("gen " + JSON.stringify(await it.next()));
+  thenable(2, stop); ticks("c");
+  log.push("fromAsync " + (await Array.fromAsync([1, 2, 3])));
+  thenable(1, r => 5);
+  try { for await (var z of [1]) log.push("no"); } catch (e) { log.push("for " + e.constructor.name); }
+  var closing = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { return { done: true }; } }; } };
+  thenable(2, r => r.done ? 7 : { made: true, value: r.value });
+  try { for await (var w of closing) { log.push("body " + w); break; } } catch (e) { log.push("break " + e.constructor.name); }
+  delete Object.prototype.then;
+}
+main().then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        r#"a0, a1, then {"value":1,"done":false}, a2, done, value, for 10, a3, then {"value":2,"done":false}, done, b0, b1, then {"value":1,"done":false}, b2, done, value, b3, then {"value":10,"done":false}, done, value, gen {"made":true,"done":false,"value":100}, gen {"value":2,"done":false}, c0, c1, then {"value":1,"done":false}, c2, done, value, c3, then {"value":2,"done":false}, done, fromAsync 10, then {"value":1,"done":false}, for TypeError, then {"value":1,"done":false}, body 1, then {"done":true}, break TypeError"#
+    );
+}
+
 /// `Array.fromAsync` steps a sync iterator as `for await` does: what the
 /// step throws is a rejection, awaited, and doesn't close it; a mapper's
 /// exception closes it by AsyncFromSyncIterator's `return()`, whose

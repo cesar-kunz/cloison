@@ -3603,7 +3603,8 @@ impl<'a> Gen<'a> {
         self.ldar(t);
         self.yield_acc(pos)?;
         self.star(t);
-        self.intrinsic("async_iterator_closed", t, 2);
+        self.mov(r, hole);
+        self.intrinsic("async_iterator_closed", t, 3);
         self.bind(closed);
         self.temp = mark;
         Ok(())
@@ -6583,7 +6584,8 @@ impl<'a> Gen<'a> {
         self.bind(top);
         // The result awaited, its value into `v` (a sync iterator's step
         // AsyncFromSyncIterator's: a promise of the value, `done` kept in
-        // the record), whether done in `acc`.
+        // the record, or 0 there if an iterator result to read as an
+        // async one's), whether done in `acc`.
         let (inner, stepped) = (self.label(), self.label());
         self.intrinsic("async_delegate_step", it, 4);
         self.yield_acc(pos)?;
@@ -6592,6 +6594,8 @@ impl<'a> Gen<'a> {
         self.jump_if(Jmp::False, inner);
         self.mov(result, v);
         self.intrinsic("async_from_sync_done", it, 1);
+        let read = self.label();
+        self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(0), read);
         self.jump(stepped);
         self.bind(inner);
         // (A `throw` or `return` step to an iterator without the method
@@ -6601,6 +6605,7 @@ impl<'a> Gen<'a> {
         self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(1), closing);
         self.compare_jump(Op::JumpIfStrictEqualSmi, Arg::Imm(2), returned);
         self.bind(checked);
+        self.bind(read);
         self.intrinsic("delegate_done", result, 1);
         self.star(gr);
         self.named(Op::GetNamed, result, "value");

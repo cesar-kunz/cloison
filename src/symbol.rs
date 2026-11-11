@@ -482,7 +482,7 @@ fn string_iterator(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// An iterator result object `{value, done}`.
 pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value> {
     let o = object_value(vm.new_object(object_value(vm.object_prototype)));
-    let (a_value, a_done) = (vm.a_value, vm.intern_name("done"));
+    let (a_value, a_done) = (vm.a_value, vm.a_done);
     vm.create_data_property(o, Key::Name(a_value), value)?;
     vm.create_data_property(o, Key::Name(a_done), Value::from_bool(done))?;
     Ok(o)
@@ -603,7 +603,8 @@ fn record_with(vm: &mut Vm, it: Value, done: Option<Value>) -> Result<Value> {
     Ok(crate::object::object_value(o))
 }
 
-/// Whether a [`sync_record`]'s last step was done.
+/// Whether a [`sync_record`]'s last step was done (false once
+/// [`set_sync_result`]).
 pub(crate) fn sync_done(r: Value) -> bool {
     unsafe { *crate::object::Object::inline(crate::object::as_object(r), 2) == Value::TRUE }
 }
@@ -611,6 +612,20 @@ pub(crate) fn sync_done(r: Value) -> bool {
 pub(crate) fn set_sync_done(r: Value, done: bool) {
     // (Not a cell: no barrier.)
     unsafe { crate::layout::store_word(crate::object::Object::inline(crate::object::as_object(r), 2), Value::from_bool(done)) }
+}
+
+/// Mark a [`sync_record`]'s last step's promise one of an iterator
+/// result, not of its value: what a callable `Object.prototype.then`
+/// gave for the one AsyncFromSyncIterator resolved it with
+/// (`promise::resolve_iter_result`), for its consumer to read as the
+/// spec's do. (Null in the `done` slot, till the next step's.)
+pub(crate) fn set_sync_result(r: Value) {
+    unsafe { crate::layout::store_word(crate::object::Object::inline(crate::object::as_object(r), 2), Value::NULL) }
+}
+
+/// Whether a [`sync_record`]'s last step was [`set_sync_result`].
+pub(crate) fn sync_result(r: Value) -> bool {
+    unsafe { *crate::object::Object::inline(crate::object::as_object(r), 2) == Value::NULL }
 }
 
 /// A [`record`]'s iterator and `next`.

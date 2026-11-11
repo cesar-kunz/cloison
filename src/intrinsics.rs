@@ -1336,7 +1336,7 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
                 if m.is_undefined() || m.is_null() {
                     if mode == crate::generator::RETURN {
                         crate::symbol::set_sync_done(record, true);
-                        return crate::promise::iter_result_promise(vm, received.unwrap_or(Value::UNDEFINED), true);
+                        return crate::promise::iter_result_promise(vm, received.unwrap_or(Value::UNDEFINED), record);
                     }
                     crate::symbol::close(vm, it)?;
                     return Err(Error::type_error("The iterator does not provide a 'throw' method"));
@@ -1348,13 +1348,13 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
         if !crate::props::is_object(r) {
             return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(r))));
         }
-        let a_done = vm.intern_name("done");
+        let a_done = vm.a_done;
         let done = crate::interp::to_boolean(vm.get(r, a_done)?);
         let a_value = vm.a_value;
         let v = vm.get(r, a_value)?;
         crate::symbol::set_sync_done(record, done);
         let close = if done || mode == crate::generator::RETURN { Value::UNDEFINED } else { it };
-        crate::promise::async_from_sync(vm, v, done, close)
+        crate::promise::async_from_sync(vm, v, record, close)
     };
     match step(vm) {
         Ok(p) => Ok(p),
@@ -1363,8 +1363,12 @@ pub(crate) fn async_from_sync_call(vm: &mut Vm, record: Value, received: Option<
 }
 
 /// `[record]`, a sync iterator's: whether its last step
-/// ([`async_from_sync_call`]) was done.
+/// ([`async_from_sync_call`]) was done, or 0 if its promise gave an
+/// iterator result to read instead (`symbol::sync_result`).
 fn async_from_sync_done(_: &mut Vm, a: &[Value]) -> Result<Value> {
+    if crate::symbol::sync_result(a[0]) {
+        return Ok(Value::from_i32(0));
+    }
     Ok(Value::from_bool(crate::symbol::sync_done(a[0])))
 }
 
@@ -1682,10 +1686,11 @@ fn async_iterator_next(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 }
 
 /// A `for await`'s step `[record, sync, r]`, `r` what it awaited: the
-/// value, or `HOLE` if done (a sync iterator's `r` its value).
+/// value, or `HOLE` if done (a sync iterator's `r` its value, unless an
+/// iterator result: `symbol::sync_result`).
 fn async_iterator_value(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let r = a[2];
-    if a[1] == Value::TRUE {
+    if a[1] == Value::TRUE && !crate::symbol::sync_result(a[0]) {
         return Ok(if crate::symbol::sync_done(a[0]) { Value::HOLE } else { r });
     }
     if !crate::props::is_object(r) {
@@ -1715,11 +1720,11 @@ fn async_iterator_close(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     call_function(vm, m, it, &[])
 }
 
-/// What `[r, sync]`, a `for await`'s iterator's `return()` gave, settled
-/// to: an object. (A sync iterator's an iterator result's value: its
-/// result was one.)
+/// What `[r, sync, record]`, a `for await`'s iterator's `return()` gave,
+/// settled to: an object. (A sync iterator's an iterator result's value:
+/// its result was one, unless read as one: `symbol::sync_result`.)
 fn async_iterator_closed(_: &mut Vm, a: &[Value]) -> Result<Value> {
-    if a[1] != Value::TRUE && !crate::props::is_object(a[0]) {
+    if (a[1] != Value::TRUE || crate::symbol::sync_result(a[2])) && !crate::props::is_object(a[0]) {
         return Err(Error::type_error(format!("Iterator result {} is not an object", crate::vm::shown(a[0]))));
     }
     Ok(Value::UNDEFINED)

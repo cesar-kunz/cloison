@@ -879,9 +879,8 @@ impl Vm {
             }
             if i >= (*o).elems_len {
                 self.reserve_elems(o, i as usize + 1);
-                for j in (*o).elems_len..i {
-                    crate::layout::store_word((*o).elems.add(j as usize), Value::EMPTY);
-                }
+                let at = (*o).elems.add((*o).elems_len as usize);
+                self.heap.fill_values(at, i.saturating_sub((*o).elems_len) as usize, Value::EMPTY);
                 (*o).elems_len = i + 1;
             }
             self.store_element(o, i as usize, v);
@@ -904,9 +903,7 @@ impl Vm {
         unsafe {
             let len = (*o).elems_len as usize;
             self.reserve_elems(o, n);
-            for j in len..n {
-                crate::layout::store_word((*o).elems.add(j), Value::EMPTY);
-            }
+            self.heap.fill_values((*o).elems.add(len), n.saturating_sub(len), Value::EMPTY);
             (*o).elems_len = n as u32;
         }
         Ok(())
@@ -972,9 +969,8 @@ impl Vm {
                         crate::far::truncate(o, stop);
                         crate::far::maybe_dense(self, o);
                     } else {
-                        for i in stop..old_len {
-                            crate::layout::store_word((*o).elems.add(i as usize), Value::EMPTY);
-                        }
+                        let at = (*o).elems.add(stop as usize);
+                        self.heap.fill_values(at, old_len.saturating_sub(stop) as usize, Value::EMPTY);
                         (*o).elems_len = stop;
                     }
                     if stop != n {

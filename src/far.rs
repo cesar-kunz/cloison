@@ -472,9 +472,7 @@ pub(crate) fn make_far(vm: &mut Vm, o: *mut Object, len: u32) {
     vm.far_elements(o);
     unsafe {
         (*o).flags |= FAR;
-        for k in first_hole..n {
-            crate::layout::store_word((*o).elems.add(k), Value::EMPTY);
-        }
+        vm.heap.fill_values((*o).elems.add(first_hole), n.saturating_sub(first_hole), Value::EMPTY);
         (*o).elems_len = first_hole as u32;
         if first_hole * 2 < Object::elems_cap(o) as usize {
             vm.shrink_elems(o);
@@ -563,9 +561,7 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: *mut Object) {
     unsafe {
         let n = (*o).elems_len as usize;
         vm.reserve_elems(o, len);
-        for k in n..len {
-            crate::layout::store_word((*o).elems.add(k), Value::EMPTY);
-        }
+        vm.heap.fill_values((*o).elems.add(n), len.saturating_sub(n), Value::EMPTY);
         (*o).elems_len = len as u32;
         for (i, v) in all {
             vm.store_element(o, i as usize, v);

@@ -1125,11 +1125,21 @@ impl Heap {
     ///
     /// It reads the metadata with plain loads, outside a collection: the
     /// marker thread, which writes it while it marks or sweeps, is paused
-    /// first. (Its callers run once a run has ended, which pauses it too,
-    /// but a call during a cycle would race it, and see a cell the marker
-    /// colored before its `END`.)
+    /// meanwhile, and goes on after if it was running. (Its callers run
+    /// once a run has ended, which pauses it too, but a call during a
+    /// cycle would race it. Between pauses every colored cell has its
+    /// `END`: the marker colors only old cells, which keep theirs, and a
+    /// young one gets it as it is traced, in the pause that colors it.)
     pub fn verify(&mut self) -> usize {
-        self.pause_marker();
+        let running = self.pause_marker();
+        let cells = self.verify_cells();
+        if running {
+            self.resume_marker();
+        }
+        cells
+    }
+
+    fn verify_cells(&mut self) -> usize {
         self.end_region();
         let mut cells = 0;
         let mut hist: std::collections::BTreeMap<String, (usize, usize)> = Default::default();

@@ -536,6 +536,41 @@ q.then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// AsyncFromSyncIterator resolves each step's promise with an iterator
+/// result (ES2025 27.1.6.2.2 step 6.b, 27.1.6.4 steps 6-9), whose `then`
+/// an `Object.prototype.then` getter sees (not the bare value), a
+/// throwing one rejecting the step, a callable one adopting it: `return`
+/// without a `return()` too.
+#[test]
+fn async_from_sync_resolves_by_iterator_results() {
+    let src = r#"
+var log = [];
+function patch(f) { Object.defineProperty(Object.prototype, "then", { get: f, configurable: true }); }
+var noRet = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; } }; } };
+async function* g() { yield* noRet; }
+var it = g();
+async function main() {
+  await it.next();
+  patch(function () { log.push("ret " + JSON.stringify(this)); });
+  var r = await it.return(3);
+  delete Object.prototype.then;
+  log.push("result " + JSON.stringify(r));
+  patch(function () { log.push("for " + JSON.stringify(this)); });
+  for await (var x of [{ k: 1 }]) log.push("got " + JSON.stringify(x));
+  patch(function () { if (this.done === false) throw "boom"; });
+  try { for await (var y of [5]) log.push("no"); } catch (e) { log.push("caught " + e); }
+  delete Object.prototype.then;
+  Object.prototype.then = function (res) { delete Object.prototype.then; log.push("thenable"); res(this); };
+  for await (var z of [7]) log.push("got " + z);
+}
+main().then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        r#"ret {"value":3,"done":true}, ret {"value":3,"done":true}, result {"value":3,"done":true}, for {"k":1}, for {"value":{"k":1},"done":false}, got {"k":1}, for {"done":true}, caught boom, thenable, got 7"#
+    );
+}
+
 /// `Array.fromAsync` steps a sync iterator as `for await` does: what the
 /// step throws is a rejection, awaited, and doesn't close it; a mapper's
 /// exception closes it by AsyncFromSyncIterator's `return()`, whose

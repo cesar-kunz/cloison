@@ -371,3 +371,60 @@ fn stress_collections_keep_an_async_loop_small() {
         assert!(most.is_some_and(|m| m <= 1), "{most:?} MiB of blocks, no JIT {no_jit}");
     }
 }
+
+/// The output of `cloison` running `src` (JIT off if `no_jit`), killed if
+/// it hasn't ended within 10 seconds (then `None`).
+fn output_within(test: &str, src: &str, no_jit: bool) -> Option<std::process::Output> {
+    let mut c = cloison(test, src);
+    if no_jit {
+        c.env("CLOISON_NO_JIT", "1");
+    }
+    let mut child = c.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Some(child.wait_with_output().unwrap())
+}
+
+/// An async waiter no agent can notify doesn't keep the process alive
+/// (#152, as SpiderMonkey's and V8's shells): one on a buffer no other
+/// agent has, or one an agent had and left, the event loop stops waiting
+/// for; one an agent notifies, it waits for, and one with a time too.
+#[test]
+fn a_waiter_no_one_can_notify_ends_the_event_loop() {
+    let cases = [
+        ("Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(64)), 0, 0); print(1)", "1"),
+        (
+            "var ia = new Int32Array(new SharedArrayBuffer(64));
+             $262.agent.start('$262.agent.receiveBroadcast(function (sab) { $262.agent.sleep(200); $262.agent.leaving(); });');
+             $262.agent.broadcast(ia.buffer);
+             Atomics.waitAsync(ia, 0, 0).value.then(function (v) { print('left', v); });
+             print('end')",
+            "end",
+        ),
+        (
+            "var ia = new Int32Array(new SharedArrayBuffer(64));
+             $262.agent.start('$262.agent.receiveBroadcast(function (sab) { $262.agent.sleep(200); Atomics.notify(new Int32Array(sab), 0); $262.agent.leaving(); });');
+             $262.agent.broadcast(ia.buffer);
+             Atomics.waitAsync(ia, 0, 0).value.then(function (v) { print('notified', v); });
+             Atomics.waitAsync(ia, 4, 0, 100).value.then(function (v) { print('timed', v); });
+             Atomics.waitAsync(new Int32Array(new SharedArrayBuffer(8)), 0, 0).value.then(function (v) { print('alone', v); });
+             void 0",
+            "timed timed-out\nnotified ok",
+        ),
+    ];
+    for (i, (src, expected)) in cases.into_iter().enumerate() {
+        for no_jit in [false, true] {
+            let out = output_within(&format!("wait-async-{i}"), src, no_jit).expect("didn't end");
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            let want = format!("{expected}\nundefined\n");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), want, "case {i}, no JIT {no_jit}");
+        }
+    }
+}

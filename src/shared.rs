@@ -989,7 +989,32 @@ pub(crate) fn poll(vm: &mut Vm) -> Result<bool> {
     Ok(vm.shared.waiting())
 }
 
-/// Block until one of the VM's async waiters is notified or times out.
+/// How often an idle VM whose async waiters have no time looks again
+/// whether another agent still refers to their blocks (see [`settling`]):
+/// one that ends drops its references without waking it.
+const RECHECK: Duration = Duration::from_millis(100);
+
+/// Whether one of the VM's async waiters may still settle, its jobs run
+/// out: notified, or timing out, or on a block another agent (or a
+/// broadcast not taken yet) refers to, which may notify it. The others'
+/// blocks only this VM refers to (its buffers and waiters), and it runs
+/// no code until one settles: nothing can notify them, and the event
+/// loop stops waiting (#152; SpiderMonkey's and V8's shells exit even
+/// with timed waiters, JSC's waits, as this did; the spec leaves it to
+/// the host). (The references read first: a notify, before another
+/// agent's last reference was dropped, seen by the `notified` after.)
+pub(crate) fn settling(vm: &Vm) -> bool {
+    let s = &vm.shared;
+    s.waits.iter().any(|(w, _, _)| {
+        let b = w.block as *mut Block;
+        let refs = unsafe { (*b).refs.load(SeqCst) };
+        let own = s.blocks.iter().filter(|&&x| x == b).count() + s.waits.iter().filter(|(x, _, _)| x.block == w.block).count();
+        refs > own || w.deadline.is_some() || w.notified.load(SeqCst)
+    })
+}
+
+/// Block until one of the VM's async waiters is notified or times out
+/// (or, those having no time, [`RECHECK`] has passed).
 pub(crate) fn idle(vm: &mut Vm) {
     let list = waiters();
     if vm.shared.waits.iter().any(|(w, _, _)| w.notified.load(SeqCst)) {
@@ -997,14 +1022,10 @@ pub(crate) fn idle(vm: &mut Vm) {
     }
     let first = vm.shared.waits.iter().filter_map(|(w, _, _)| w.deadline).min();
     let signal = vm.shared.signal.clone();
-    match first {
-        Some(d) => {
-            let now = Instant::now();
-            if d > now {
-                drop(signal.wait_timeout(list, d - now));
-            }
-        }
-        None => drop(signal.wait(list)),
+    let d = first.unwrap_or_else(|| Instant::now() + RECHECK);
+    let now = Instant::now();
+    if d > now {
+        drop(signal.wait_timeout(list, d - now));
     }
 }
 

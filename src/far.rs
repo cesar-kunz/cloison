@@ -571,7 +571,7 @@ pub(crate) fn maybe_dense(vm: &mut Vm, o: *mut Object) {
             vm.store_element(o, i as usize, v);
         }
         // The store's slot one of the elements' room again.
-        *store_slot(o) = Value::UNDEFINED;
+        crate::layout::store_word(store_slot(o), Value::UNDEFINED);
         (*o).flags &= !FAR;
     }
     if flags & (NOT_EXTENSIBLE | SEALED | FROZEN | LENGTH_READ_ONLY) == 0 {

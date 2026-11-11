@@ -4491,7 +4491,7 @@ impl Vm {
                 // cell is only `s`'s.)
                 self.field_made_mutable(&*s.fields()[slot as usize]);
                 let at = Object::slot(o, s.location(slot));
-                *at = Value::EMPTY;
+                crate::layout::store_word(at, Value::EMPTY);
                 crate::object::set_shape(o, parent);
                 return true;
             }
@@ -6008,7 +6008,7 @@ impl Vm {
         unsafe {
             let at = (*o).elems.add(i as usize);
             let v = *at;
-            *at = Value::EMPTY;
+            crate::layout::store_word(at, Value::EMPTY);
             (*o).flags |= crate::object::SPARSE;
             let a = self.intern_name(&i.to_string());
             let attrs = if (*o).flags & crate::object::SEALED != 0 { DONT_DELETE } else { 0 };

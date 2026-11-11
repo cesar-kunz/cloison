@@ -1068,7 +1068,8 @@ handlers! {
         let (_, name) = (*frame_code(regs)).ic(index_at(pc, 1));
         // (Approximately: such a binding made after the `var` would take
         // the function in the specification, a rare case.)
-        if (*frame_vm(regs)).global_lexical_slot(name).is_some() {
+        let vm = &mut *frame_vm(regs);
+        if vm.global_lexical_slot(name).is_some() || vm.annex_b_undefinable(name) {
             next!(any, Op::StaGlobalAnnexB.size(), acc)
         }
         let r = with_top(regs, None, |vm| vm.set_global_miss(&*frame_code(regs), index_at(pc, 1), acc));
@@ -1077,7 +1078,8 @@ handlers! {
 
     fn op_init_global_annex_b(pc, acc, regs, tag) {
         let (_, name) = (*frame_code(regs)).ic(index_at(pc, 1));
-        if (*frame_vm(regs)).global_lexical_slot(name).is_some() {
+        let vm = &mut *frame_vm(regs);
+        if vm.global_lexical_slot(name).is_some() || vm.annex_b_undefinable(name) {
             next!(any, Op::InitGlobalAnnexB.size(), acc)
         }
         let r = with_top(regs, None, |vm| {

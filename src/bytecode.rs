@@ -334,8 +334,9 @@ define_ops! {
     InitGlobal(Ic),
     /// `StaGlobal` of the `var` of Annex B's function in a block of a
     /// script or `eval` (B.3.2.2, B.3.2.3), but nothing if the global
-    /// scope has a block-scoped binding of the name: then no such `var`
-    /// was made (see `Vm::annex_b_skipped`).
+    /// scope has a block-scoped binding of the name, or the global object
+    /// can't take it: then no such `var` was made (see
+    /// `Vm::annex_b_skipped`).
     StaGlobalAnnexB(Ic),
     /// That `var`'s value at the start of the code, `undefined` unless a
     /// global of the name exists (`LdaGlobalInsideTypeof` then

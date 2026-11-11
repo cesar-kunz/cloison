@@ -4213,6 +4213,12 @@ impl Vm {
                     if code.strict {
                         return Err(Error::reference_error(format!("{} is not defined", self.atom_name(name))));
                     }
+                    // (Not on a non-extensible global object: OrdinarySet's
+                    // CreateDataProperty fails, 10.1.9.2.)
+                    if !Self::is_extensible(g) {
+                        self.store_failed = true;
+                        return Ok(());
+                    }
                     self.add_property(g, name, value);
                 }
             }
@@ -6547,15 +6553,24 @@ impl Vm {
 
     /// Whether `module`'s `var` `n` is one only Annex B's functions in
     /// blocks declare, of a name the global scope has a block-scoped
-    /// binding of (HasLexicalDeclaration): no `var` is made, nor is it an
+    /// binding of (HasLexicalDeclaration), or the global object can't
+    /// take (`annex_b_undefinable`): no `var` is made, nor is it an
     /// error, and the function stays its block's (B.3.2.2, B.3.2.3; see
     /// `interp::op_sta_global_annex_b`).
     pub(crate) fn annex_b_skipped(&mut self, module: &Module, n: &str) -> bool {
-        if self.lexical_declared.is_empty() || !module.annex_b.iter().any(|b| b == n) {
+        if !module.annex_b.iter().any(|b| b == n) {
             return false;
         }
         let a = self.intern_name(n);
-        self.lexical_declared.contains(&a)
+        self.lexical_declared.contains(&a) || self.annex_b_undefinable(a)
+    }
+
+    /// Whether the global object can't take Annex B's `var` `a` of a
+    /// function in a block: CanDeclareGlobalVar (9.1.1.4.15) false, a
+    /// non-extensible global object without the property (`fnDefinable`
+    /// false, B.3.2.2 and B.3.2.3: the function stays its block's).
+    pub(crate) fn annex_b_undefinable(&mut self, a: Atom) -> bool {
+        !Self::is_extensible(self.global) && self.own_property(self.global, Key::Name(a)).is_none()
     }
 
     /// GlobalDeclarationInstantiation's (or an eval's, `eval`) checks for

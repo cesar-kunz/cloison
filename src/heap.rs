@@ -525,7 +525,7 @@ impl Heap {
                 self.clean(b as usize, 1);
                 b as usize
             } else if let Some(b) = self.free.pop() {
-                unsafe { std::ptr::write_bytes(meta(self.block_addr(b as usize) as usize), 0, BLOCK / GRANULE) };
+                self.clear_meta(self.block_addr(b as usize) as usize, 1);
                 b as usize
             } else {
                 self.fresh_blocks(1)
@@ -910,7 +910,7 @@ impl Heap {
             kept.push(k);
             false
         });
-        unsafe { std::ptr::write_bytes(meta(self.block_addr(b) as usize), 0, n * BLOCK / GRANULE) };
+        self.clear_meta(self.block_addr(b) as usize, n);
         if RELEASED_ZERO {
             for k in kept {
                 unsafe { std::ptr::write_bytes(self.block_addr(k as usize), 0, BLOCK) };
@@ -924,7 +924,28 @@ impl Heap {
     /// Zero `n` blocks from `b` that held cells, with their metadata.
     fn clean(&mut self, b: usize, n: usize) {
         let a = self.block_addr(b);
-        unsafe { std::ptr::write_bytes(meta(a as usize), 0, n * BLOCK / GRANULE) };
+        self.clear_meta(a as usize, n);
+    }
+
+    /// Zero the metadata of the `n` blocks from `a`, which no cell lives
+    /// in: byte by byte with [`meta_store`] while a marking runs, else
+    /// `write_bytes`. The marker may read the metadata of the cells
+    /// allocated there next (`Marking::cell`, by a reference it finds),
+    /// as it reads the [`YOUNG`] [`Heap::alloc`] stores, and `marking` is
+    /// set and cleared in pauses (see `Heap::move_values`). (Bytes, not
+    /// words: the marker's loads are bytes, and Rust's atomics may not
+    /// race at different sizes.)
+    fn clear_meta(&self, a: usize, n: usize) {
+        let len = n * BLOCK / GRANULE;
+        unsafe {
+            if self.gc.marking {
+                for k in 0..len {
+                    meta_store(a + k * GRANULE, 0);
+                }
+            } else {
+                std::ptr::write_bytes(meta(a), 0, len);
+            }
+        }
     }
 
     /// A block to copy cells into while evacuating (`Vm::evacuate`): an
@@ -935,7 +956,7 @@ impl Heap {
             self.clean(b as usize, 1);
             b as usize
         } else if let Some(b) = self.free.pop() {
-            unsafe { std::ptr::write_bytes(meta(self.block_addr(b as usize) as usize), 0, BLOCK / GRANULE) };
+            self.clear_meta(self.block_addr(b as usize) as usize, 1);
             b as usize
         } else if fresh {
             self.fresh_blocks(1)

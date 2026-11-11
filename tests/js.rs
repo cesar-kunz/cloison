@@ -17427,3 +17427,196 @@ out
 "#;
     assert_eq!(value(src), r#"[1,"g",3,9] 4 [1,"g",3,9] 4 [0,null,2,4] 2"#);
 }
+
+#[test]
+fn map_set_and_string_iteration_protectors_are_per_realm_and_see_proxies() {
+    // As for arrays (see `array_iteration_protector_is_per_realm` and
+    // `array_iteration_protector_sees_proxies`): a map's, a set's and a
+    // string's iteration by the builtins, under the protector's bits.
+    let src = r#"
+var r = new ShadowRealm(), out = [], c = 0;
+r.evaluate(`for (const x of new Map([[1, 1]])) {}; for (const x of new Set([1])) {}; for (const x of "a") {}; 0`);
+var MIP = Object.getPrototypeOf(new Map().entries()), mn = MIP.next;
+MIP.next = function () { c++; return mn.call(this); };
+for (const x of new Map([[1, 1], [2, 2]])) {}
+MIP.next = mn;
+var SIP = Object.getPrototypeOf(""[Symbol.iterator]()), sn = SIP.next;
+SIP.next = function () { c += 10; return sn.call(this); };
+for (const x of "ab") {}
+SIP.next = sn;
+out.push(c);
+var IP = Object.getPrototypeOf(MIP), old = Object.getPrototypeOf(IP), seen = [];
+Object.setPrototypeOf(IP, new Proxy({}, { get(t, k) { seen.push(String(k)); } }));
+for (const x of "ab") break;
+var [m] = new Map([[1, 1], [2, 2]]);
+var [s] = new Set([1, 2]);
+Object.setPrototypeOf(IP, old);
+out.push(seen.join());
+out.join()
+"#;
+    assert_eq!(value(src), "33,return,return,return");
+}
+
+#[test]
+fn iteration_fast_paths_take_only_the_current_realms_factories() {
+    // Another realm's `values`, `entries` or string `@@iterator` installed
+    // here makes iterators with that realm's prototypes (a builtin runs in
+    // its realm): their `next`, patched there, runs; the protector, which
+    // reads this realm's, mustn't take them for the builtins. (An array's
+    // `values` from there makes an iterator of that realm's too, whose
+    // `next` isn't the one patched here.)
+    let src = r#"
+var g = $262.createRealm().global, out = [];
+g.Object.getPrototypeOf(new g.Set().values()).next = function () { return { done: true }; };
+var sv = Set.prototype[Symbol.iterator];
+Set.prototype[Symbol.iterator] = g.Set.prototype.values;
+out.push(JSON.stringify([...new Set([1, 2])]));
+Set.prototype[Symbol.iterator] = sv;
+var m = new Map([[1, 2]]);
+g.Object.getPrototypeOf(new g.Map().entries()).next = function () { return { done: true }; };
+var me = Map.prototype[Symbol.iterator];
+Map.prototype[Symbol.iterator] = g.Map.prototype.entries;
+var n = 0; for (var x of m) n++; out.push(n);
+Map.prototype[Symbol.iterator] = me;
+var si = String.prototype[Symbol.iterator];
+String.prototype[Symbol.iterator] = g.String.prototype[Symbol.iterator];
+g.Object.getPrototypeOf(""[Symbol.iterator]()).next = function () { return { done: true }; };
+out.push(JSON.stringify([..."xy"]));
+var [c] = "zw"; out.push(c);
+String.prototype[Symbol.iterator] = si;
+var av = Array.prototype[Symbol.iterator], AIP = Object.getPrototypeOf([].values()), an = AIP.next;
+AIP.next = function () { return { done: true }; };
+Array.prototype[Symbol.iterator] = g.Array.prototype.values;
+out.push(JSON.stringify([...[1, 2]]));
+var [a] = [7]; out.push(a);
+AIP.next = an; Array.prototype[Symbol.iterator] = av;
+out.push(JSON.stringify([...new Set([3])]), JSON.stringify([..."q"]), [...[4]][0]);
+out.join(" ")
+"#;
+    // (`[c]` from a string done at once: `undefined`, which `join` leaves
+    // empty.)
+    assert_eq!(value(src), r#"[] 0 []  [1,2] 7 [3] ["q"] 4"#);
+}
+
+#[test]
+fn iteration_fast_paths_take_only_the_current_realms_next() {
+    // A `next` borrowed from another realm's iterator prototype runs in
+    // that realm (§10.3.1), so the entries it makes have that realm's
+    // `Array.prototype`: neither the protector's fast paths nor
+    // `step_with`'s shortcut may stand in for it (`symbol::is_native`
+    // checks the realm). Restored, the fast paths come back.
+    let src = r#"
+var g = $262.createRealm().global, out = [];
+var MIP = Object.getPrototypeOf(new Map().entries()), mn = MIP.next;
+MIP.next = Object.getPrototypeOf(new g.Map().entries()).next;
+for (var e of new Map([[1, 2]])) out.push(Object.getPrototypeOf(e) === g.Array.prototype, Object.getPrototypeOf(e) === Array.prototype);
+var [p] = new Map([[3, 4]]); out.push(Object.getPrototypeOf(p) === g.Array.prototype);
+out.push(Object.getPrototypeOf([...new Map([[5, 6]])][0]) === g.Array.prototype);
+MIP.next = mn;
+var SIP = Object.getPrototypeOf(new Set().entries()), sn = SIP.next;
+SIP.next = Object.getPrototypeOf(new g.Set().entries()).next;
+for (var e of new Set([1]).entries()) out.push(Object.getPrototypeOf(e) === g.Array.prototype);
+SIP.next = sn;
+var AIP = Object.getPrototypeOf([].values()), an = AIP.next;
+AIP.next = Object.getPrototypeOf(g.Array.prototype.values.call([])).next;
+for (var e of [7].entries()) out.push(Object.getPrototypeOf(e) === g.Array.prototype);
+out.push(Object.getPrototypeOf(Array.from([8].entries())[0]) === g.Array.prototype);
+for (var x of [9]) out.push(x);
+AIP.next = an;
+for (var e of new Map([[1, 2]])) out.push(Object.getPrototypeOf(e) === Array.prototype);
+out.join(" ")
+"#;
+    assert_eq!(value(src), "true false true true true true true 9 true");
+}
+
+#[test]
+fn closing_a_string_state_resumes_after_an_astral_pair() {
+    // Closing a string's `IteratorOpen` state (a `break`, a short pattern)
+    // with a `return` added on `%StringIteratorPrototype%` makes an
+    // iterator at the state's index: past an astral pair, its two units. (As V8 and SpiderMonkey.)
+    let src = r#"
+var SIP = Object.getPrototypeOf(""[Symbol.iterator]()), out = [];
+SIP.return = function () { var r = this.next(); out.push("ret:" + r.value + ":" + r.done); return {}; };
+for (var ch of "a\u{1F600}bc") { out.push(ch.length); if (ch.length === 2) break; }
+var [p, q] = "\u{1F600}xy"; out.push(p.length, q);
+var [r1] = "\u{1F600}\u{1F601}"; out.push(r1.codePointAt(0));
+delete SIP.return;
+out.join()
+"#;
+    assert_eq!(value(src), r#"1,2,ret:b:false,ret:y:false,2,x,ret:😁:false,128512"#);
+}
+
+#[test]
+fn maps_and_sets_compacted_while_iterated() {
+    // Deletions past half a map's or a set's entries then insertions
+    // compact its entries (`collections.rs`): an iteration in progress
+    // goes on from the same entry in the new array. (As V8 and SpiderMonkey.)
+    let src = r#"
+var m = new Map(), out = [];
+for (var i = 0; i < 20; i++) m.set(i, i * 10);
+for (var [k, v] of m) { out.push(k + "=" + v); if (k === 2) { for (var j = 3; j < 18; j++) m.delete(j); m.set(100, 1); m.set(101, 2); m.delete(18); } }
+var s = new Set([1, 2, 3, 4, 5, 6, 7, 8]);
+for (var x of s) { out.push("s" + x); if (x === 1) { [2, 3, 4, 5, 6, 7].forEach(y => s.delete(y)); s.add(9); s.add(10); } }
+out.join()
+"#;
+    assert_eq!(value(src), r#"0=0,1=10,2=20,19=190,100=1,101=2,s1,s8,s9,s10"#);
+}
+
+#[test]
+fn strings_iterate_by_code_point_with_lone_surrogates() {
+    // Strings iterate by code point; a lone surrogate, leading, trailing or
+    // high at the end, is one unit. (As V8 and SpiderMonkey.)
+    let src = r#"
+var out = [];
+for (var c of "ab\ud800") out.push(c.length + ":" + c.charCodeAt(0));
+for (var c of "\udc00𐀀\ud800") out.push(c.length + ":" + c.charCodeAt(0));
+out.push([..."x\udbff"].map(c => c.charCodeAt(0)).join("/"));
+var [h, t] = "\ud83d"; out.push(h.charCodeAt(0), t);
+out.join()
+"#;
+    assert_eq!(value(src), r#"1:97,1:98,1:55296,1:56320,2:55296,1:55296,120/56319,55357,"#);
+}
+
+#[test]
+fn maps_and_sets_changed_while_iterated_then_left_and_iterated_again() {
+    // Repeated deletions and insertions in a map and a set while they are
+    // iterated, the iterations left by `break`, a throw and short patterns,
+    // and iterated again after (cleared too). (As V8 and SpiderMonkey.)
+    let src = r#"
+var out = [], m = new Map(), s = new Set();
+for (var i = 0; i < 12; i++) { m.set(i, i); s.add(i); }
+for (var r = 0; r < 3; r++) {
+  for (var [k] of m) { if (k % 3 === r) { m.delete(k); m.set(k + 100, r); } if (k > 105) break; }
+  out.push([...m.keys()].join("."));
+}
+try { for (var x of s) { s.delete(x + 1); s.add(x + 50); if (x > 30) throw "t" + x; } } catch (e) { out.push(e); }
+var [a, b] = s; out.push(a, b, s.size);
+for (var x of s) { if (x % 2) s.delete(x); }
+out.push([...s].join("."));
+var [[k1, v1], [k2]] = m; out.push(k1, v1, k2);
+m.clear(); for (var e of m) out.push("never"); m.set("z", 1); out.push([...m].join());
+out.join(" ")
+"#;
+    assert_eq!(value(src), r#"1.2.4.5.7.8.10.11.100.103.106.109 2.5.8.11.109.101.104.107.110.200.203.206 109.101.104.107.110.200.203.206.102.105.108.111 t50 0 2 13 0.2.4.6.8.10.50.52.54.56.58.60.100 109 0 101 z,1"#);
+}
+
+#[test]
+fn string_iteration_meets_a_return_added_mid_loop() {
+    // A `return` added to `%StringIteratorPrototype%` while a for-of runs,
+    // which reads what is left with `this.next()`; then a pattern's close;
+    // then a `return` getter giving `undefined` (called, nothing closed). (As V8 and SpiderMonkey.)
+    let src = r#"
+var SIP = Object.getPrototypeOf(""[Symbol.iterator]()), out = [];
+for (var c of "ab\u{1F600}cd") {
+  out.push(c);
+  if (c === "b") SIP.return = function () { var rest = ""; for (var r; !(r = this.next()).done;) rest += r.value; out.push("rest:" + rest); return {}; };
+  if (c === "\u{1F600}") break;
+}
+var [x, y] = "\u{1F600}pq"; out.push(x.length, y);
+Object.defineProperty(SIP, "return", { get() { out.push("get"); return undefined; }, configurable: true });
+for (var c of "uv") break;
+delete SIP.return;
+out.join()
+"#;
+    assert_eq!(value(src), r#"a,b,😀,rest:cd,rest:q,2,p,get"#);
+}

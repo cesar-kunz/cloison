@@ -1463,7 +1463,7 @@ fn object(o: *mut Object) -> Value {
 }
 
 /// `a ** b` (Number::exponentiate, as `Math.pow`).
-fn exp(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+pub(crate) fn exp(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let x = crate::interp::to_numeric(arg(a, 0));
     if vm.conv_failed() {
         return Err(vm.take_conv_error());

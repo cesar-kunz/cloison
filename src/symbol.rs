@@ -426,7 +426,7 @@ pub(crate) fn install(vm: &mut Vm) {
     }
 }
 
-fn return_this(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
+pub(crate) fn return_this(_: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
     Ok(this)
 }
 

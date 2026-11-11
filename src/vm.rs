@@ -3981,12 +3981,6 @@ impl Vm {
         unsafe { (*(*self.global_lexicals).shape).lookup(name) }
     }
 
-    /// How many block-scoped bindings the global scope has: those made
-    /// later get the slots past it (see `declare_lexical`).
-    pub(crate) fn global_lexical_count(&self) -> u32 {
-        unsafe { (*(*self.global_lexicals).shape).keys().len() as u32 }
-    }
-
     /// A global name's load (GetBindingValue) finding the global scope's
     /// block-scoped binding, which comes before the global object: its
     /// value (or a ReferenceError, not initialized yet), cached in `ic`'s

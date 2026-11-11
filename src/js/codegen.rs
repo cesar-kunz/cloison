@@ -2042,10 +2042,10 @@ struct Gen<'a> {
     /// The script's completion value (`eval`'s result): a register,
     /// in the script only.
     completion: Option<u8>,
-    /// How many block-scoped bindings the global scope had where the
-    /// script began (`global_lexical_count`): a register, in a script
-    /// whose Annex B functions in blocks set globals (see `Gen::stmt`).
-    annex_b_count: Option<u8>,
+    /// The Annex B `var`s the script's declarations didn't make
+    /// (`intrinsics::annex_b_start`): a register, in a script whose
+    /// functions in blocks set globals (see `Gen::stmt`).
+    annex_b_skipped: Option<u8>,
     /// The statement that has cleared the completion value (so its own
     /// match arm doesn't again; nested ones do, each completing as
     /// `undefined` unless something in it says otherwise).
@@ -2164,7 +2164,7 @@ impl<'a> Gen<'a> {
             found_scope: false,
             eval,
             completion: None,
-            annex_b_count: None,
+            annex_b_skipped: None,
             cleared: std::ptr::null(),
             depth: 0,
             fresh: Vec::new(),
@@ -2449,14 +2449,23 @@ impl<'a> Gen<'a> {
                 self.global(Op::LdaGlobalInsideTypeof, name);
                 self.global(Op::StaGlobal, name);
             }
-            // (Which Annex B `var`s were made, for the functions' stores
-            // to know: see `intrinsics::annex_b_skipped`.)
+            // (Which Annex B `var`s the declarations didn't make, for the
+            // functions' stores to know: see `intrinsics::annex_b_start`.)
             let global_annex_b = !self.p.direct_eval || self.p.eval_global;
-            if global_annex_b && self.p.functions.iter().any(|f| f.annex_b && f.parent == Some(0)) {
+            let mut names: Vec<&str> = Vec::new();
+            for f in self.p.functions.iter().filter(|f| global_annex_b && f.annex_b && f.parent == Some(0)) {
+                let n = original(f.name.as_deref().unwrap());
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+            if !names.is_empty() {
                 let r = self.alloc(self.f.pos)?;
-                self.intrinsic("global_lexical_count", r, 0);
+                self.string(&names.join(" "));
                 self.star(r);
-                self.annex_b_count = Some(r);
+                self.intrinsic("annex_b_start", r, 1);
+                self.star(r);
+                self.annex_b_skipped = Some(r);
             }
             if self.eval {
                 // `eval`'s result is the script's completion value: each
@@ -6877,24 +6886,23 @@ impl<'a> Gen<'a> {
                         self.store_var(f.name.as_deref().unwrap(), s.pos)?;
                     } else if self.index == 0 {
                         // (A global, unless a block-scoped binding or the
-                        // global object stopped it where the script began;
-                        // else stored as any, a block-scoped binding made
-                        // since first.)
+                        // global object stopped it when the script's
+                        // declarations were made; else stored as any, a
+                        // block-scoped binding made since first.)
                         let name = f.name.as_deref().unwrap();
-                        if let Some(c) = self.annex_b_count {
-                            let mark = self.temp;
-                            let v = self.alloc(s.pos)?;
-                            self.star(v);
-                            let n = self.alloc(s.pos)?;
-                            self.string(original(name));
-                            self.star(n);
-                            let count = self.alloc(s.pos)?;
-                            self.mov(c, count);
-                            self.intrinsic("annex_b_skipped", n, 2);
-                            self.jump_if(Jmp::True, end);
-                            self.ldar(v);
-                            self.temp = mark;
-                        }
+                        let record = self.annex_b_skipped.expect("Annex B functions recorded where the script begins");
+                        let mark = self.temp;
+                        let v = self.alloc(s.pos)?;
+                        self.star(v);
+                        let n = self.alloc(s.pos)?;
+                        self.string(original(name));
+                        self.star(n);
+                        let r = self.alloc(s.pos)?;
+                        self.mov(record, r);
+                        self.intrinsic("annex_b_skipped", n, 2);
+                        self.jump_if(Jmp::True, end);
+                        self.ldar(v);
+                        self.temp = mark;
                         self.global(Op::StaGlobal, name);
                     } else {
                         self.init_var(f.name.as_deref().unwrap(), s.pos)?;

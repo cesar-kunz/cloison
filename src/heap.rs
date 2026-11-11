@@ -1122,7 +1122,14 @@ impl Heap {
     /// the metadata agrees: a first granule `YOUNG` or colored, an old
     /// cell's last granule `END`, nothing else (for tests). With
     /// `CLOISON_HEAP_HIST` set, print the cells by kind and size.
+    ///
+    /// It reads the metadata with plain loads, outside a collection: the
+    /// marker thread, which writes it while it marks or sweeps, is paused
+    /// first. (Its callers run once a run has ended, which pauses it too,
+    /// but a call during a cycle would race it, and see a cell the marker
+    /// colored before its `END`.)
     pub fn verify(&mut self) -> usize {
+        self.pause_marker();
         self.end_region();
         let mut cells = 0;
         let mut hist: std::collections::BTreeMap<String, (usize, usize)> = Default::default();

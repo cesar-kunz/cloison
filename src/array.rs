@@ -4,7 +4,7 @@
 //! [`install`] (`push` is `vm::array_push`, which compiled code calls).
 
 use crate::interp::{call_function, strict_equals, to_boolean, to_number, to_string_units};
-use crate::layout::{copy_words, store_word, swap_words};
+use crate::layout::{store_word, swap_words};
 use crate::object::{Class, EXTERNAL, Object, PROTOTYPE, as_object, object_value};
 use crate::props::{is_callable, is_object, same_value};
 use crate::value::Value;
@@ -528,11 +528,15 @@ pub(crate) fn array_reverse(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Val
         let obj = as_object(o);
         unsafe {
             let n = (*obj).elems_len as usize;
-            // (Word by word, not a slice's `reverse`: the marker may be
-            // reading the slots, see `layout::Word`.)
+            // (Word by word while a marking runs, not a slice's `reverse`:
+            // the marker may be reading the slots, see `Heap::move_values`.)
             let e = (*obj).elems;
-            for i in 0..n / 2 {
-                swap_words(e.add(i), e.add(n - 1 - i));
+            if vm.heap.gc.marking {
+                for i in 0..n / 2 {
+                    swap_words(e.add(i), e.add(n - 1 - i));
+                }
+            } else {
+                std::slice::from_raw_parts_mut(e, n).reverse();
             }
             // (Every slot may now hold what was elsewhere: barriered.)
             for i in 0..n {
@@ -579,7 +583,7 @@ fn array_shift(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
         unsafe {
             let n = (*obj).elems_len as usize;
             let first = *(*obj).elems;
-            copy_words((*obj).elems.add(1), (*obj).elems, n - 1);
+            vm.heap.move_values((*obj).elems.add(1), (*obj).elems, n - 1);
             store_word((*obj).elems.add(n - 1), Value::EMPTY);
             (*obj).elems_len = (n - 1) as u32;
             for i in 0..n - 1 {
@@ -618,7 +622,7 @@ fn array_unshift(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             unsafe {
                 let m = (*obj).elems_len as usize;
                 vm.reserve_elems(obj, m + a.len());
-                copy_words((*obj).elems, (*obj).elems.add(a.len()), m);
+                vm.heap.move_values((*obj).elems, (*obj).elems.add(a.len()), m);
                 for (i, &v) in a.iter().enumerate() {
                     store_word((*obj).elems.add(i), Value::EMPTY);
                     vm.store_element(obj, i, v);
@@ -676,7 +680,7 @@ fn array_slice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             }
             // (Numbers alone, no cells: nothing for the barrier to note.)
             if matches!(want, crate::object::FieldType::Int | crate::object::FieldType::Num) {
-                copy_words((*obj).elems.add(k), (*oo).elems, count);
+                vm.heap.move_values((*obj).elems.add(k), (*oo).elems, count);
             } else {
                 vm.store_elements(oo, 0, (*obj).elems.add(k), count);
             }
@@ -747,14 +751,12 @@ fn array_splice(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
             (*ro).elems_len = del as u32;
             let new_len = m - del + items.len();
             vm.reserve_elems(obj, new_len);
-            copy_words((*obj).elems.add(start + del), (*obj).elems.add(start + items.len()), m - start - del);
+            vm.heap.move_values((*obj).elems.add(start + del), (*obj).elems.add(start + items.len()), m - start - del);
             for (i, &v) in items.iter().enumerate() {
                 store_word((*obj).elems.add(start + i), Value::EMPTY);
                 vm.store_element(obj, start + i, v);
             }
-            for i in new_len..m {
-                store_word((*obj).elems.add(i), Value::EMPTY);
-            }
+            vm.heap.fill_values((*obj).elems.add(new_len), m.saturating_sub(new_len), Value::EMPTY);
             (*obj).elems_len = new_len as u32;
             for i in start + items.len()..new_len {
                 let v = *(*obj).elems.add(i);

@@ -12349,6 +12349,57 @@ function* h() { for (let v = 0; v < 3; v++) { try { for (const w of [1, 2]) if (
     assert_eq!(value(src), "-39 -27 -27 0 9");
 }
 
+/// A jump out of a `finally`'s `try` whose copy of the `finally` block
+/// ends unreachable (the jump itself dead code, or the copy throwing)
+/// left the `try`s further out without the range up to it: an exception
+/// there escaped their `catch` (#230).
+#[test]
+fn a_dead_jump_out_of_a_finally_keeps_the_outer_catch() {
+    let src = r#"
+var fs = [
+  function () { try { nope; try { if (false) return 1; } finally {} } catch (e) { return "c"; } },
+  function () { try { throw 5; try { return 1; } finally {} } catch (e) { return "c" + e; } },
+  function () { for (;;) { try { nope; try { if (false) break; } finally {} } catch (e) { return "c"; } } },
+  function () { for (;;) { try { nope; try { if (false) continue; } finally {} } catch (e) { return "c"; } } },
+  function () { L: for (;;) for (;;) { try { nope; try { if (false) break L; } finally {} } catch (e) { return "c"; } } },
+  function () { try { nope; try { L: { try { if (false) break L; } finally {} } } finally {} } catch (e) { return "c"; } },
+  function () { try { nope; try { try { if (false) return 1; } finally {} } finally {} } catch (e) { return "c"; } },
+  function () { try { try { return 1; } finally { throw 2; } } catch (e) { return "c" + e; } },
+  function () { try { nope; try { return 1; } finally { throw 2; } } catch (e) { return "c" + (e instanceof ReferenceError); } },
+  function () { for (;;) { try { try { break; } finally { throw 4; } } catch (e) { return "c" + e; } } },
+  function () { try { for (const x of [1]) { try { return 1; } finally { throw 3; } } } catch (e) { return "c" + e; } },
+];
+function* g() { try { nope; try { yield 1; if (false) return 2; } finally {} } catch (e) { yield "c"; } }
+function* h() { try { try { yield 1; } finally { throw 2; } } catch (e) { yield "c" + e; } }
+var r;
+for (var k = 0; k < 20; k++) {
+  r = fs.map((f) => { try { return f(); } catch (e) { return "escaped"; } });
+  var it = h(); it.next();
+  r.push(g().next().value, it.return(9).value);
+}
+r.join(" ");
+"#;
+    assert_eq!(value(src), "c c5 c c c c c c2 ctrue c4 c3 c c2");
+    let first = cloison::js::compile(
+        r#"
+var r = [];
+async function a1() { try { nope; try { await 1; if (false) return 2; } finally {} } catch (e) { return "c"; } }
+async function a2() { try { try { await 0; return 1; } finally { throw 2; } } catch (e) { return "c" + e; } }
+async function a3() { try { nope; for await (const x of [1]) { try { if (false) return 1; } finally {} } } catch (e) { return "c"; } }
+for (const a of [a1, a2, a3]) a().then((v) => r.push(v), () => r.push("escaped"));
+"#,
+    )
+    .unwrap();
+    let second = cloison::js::compile("r.join(' ')").unwrap();
+    for budget in [i64::MAX, 1, 1000] {
+        let mut vm = Vm::new();
+        vm.set_tier_back_edges(budget);
+        vm.run(&first).unwrap();
+        let r = vm.run(&second).map(display).map_err(|e| e.to_string());
+        assert_eq!(r.as_deref(), Ok("c c c2"), "tier at {budget}");
+    }
+}
+
 /// Calling or constructing an object that can't be names it as `display`
 /// does, not by its heap address (cloison-fuzz BUGS.md #23).
 #[test]

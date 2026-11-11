@@ -3544,6 +3544,16 @@ impl<'a> Gen<'a> {
                 self.trys.extend(inner);
                 r?;
                 if !self.reachable {
+                    // (Nothing more to copy, but the `try`s further out
+                    // still cover the code up to here: `reenter_trys`
+                    // moves their starts past it.)
+                    let end = self.asm.offset() as u32;
+                    for t in &mut self.trys[depth..i] {
+                        if end > t.start {
+                            t.ranges.push((t.start, end));
+                        }
+                        t.start = end;
+                    }
                     break;
                 }
             }

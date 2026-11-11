@@ -89,7 +89,7 @@ pub(crate) const INTRINSICS: &[(&str, Intrinsic)] = &[
     ("eval_scope_get", eval_scope_get),
     ("eval_scope_flush", eval_scope_flush),
     ("eval_annex_b", eval_annex_b),
-    ("global_lexical_count", |vm, _| Ok(Value::from_i32(vm.global_lexical_count() as i32))),
+    ("annex_b_start", annex_b_start),
     ("annex_b_skipped", annex_b_skipped),
     ("bigint", crate::bigint::literal),
     ("dispose_new", |vm, _| crate::dispose::new_state(vm, false)),
@@ -1941,23 +1941,39 @@ fn eval_annex_b(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     Ok(Value::TRUE)
 }
 
-/// Whether Annex B's global `var` `[name, count]` of a script's or an
-/// `eval`'s function in a block was not made where the code began, its
-/// global scope then of `count` block-scoped bindings (see
-/// `Vm::global_lexical_count`): one of them had the name, or the global
-/// object couldn't take it (see `Vm::annex_b_skipped`). Then evaluating
-/// the function stores nothing; else it is SetMutableBinding (B.3.2.2,
-/// B.3.2.3), a block-scoped binding made since found first (9.1.1.4.5).
+/// Whether Annex B's global `var` `[name, record]` of a script's or an
+/// `eval`'s function in a block was not made by the code's declarations
+/// (`fnDefinable` false, or a block-scoped binding of the name: see
+/// `Vm::annex_b_skipped`), as `annex_b_start` recorded them. Then
+/// evaluating the function stores nothing; else it is SetMutableBinding
+/// (B.3.2.2, B.3.2.3), a block-scoped binding made since found first
+/// (9.1.1.4.5), whatever has become of the global object since.
 fn annex_b_skipped(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let Key::Name(name) = to_property_key(vm, a[0])? else {
         return Ok(Value::FALSE);
     };
-    let count = a[1].as_number().unwrap_or(0.0) as u32;
-    let skipped = match vm.global_lexical_slot(name) {
-        Some(slot) => slot < count,
-        None => vm.annex_b_undefinable(name),
-    };
+    let skipped = crate::props::is_object(a[1]) && vm.own_property(as_object(a[1]), Key::Name(name)).is_some();
     Ok(Value::from_bool(skipped))
+}
+
+/// Which of Annex B's global `var`s `[names]` (separated by spaces) of a
+/// script's or an `eval`'s functions in blocks were not made, where the
+/// code begins, right after its declarations: an object of those names,
+/// or `undefined` if none (see `annex_b_skipped`).
+fn annex_b_start(vm: &mut Vm, a: &[Value]) -> Result<Value> {
+    let names = vm.string_units(a[0]).map(|u| String::from_utf16_lossy(&u)).unwrap_or_default();
+    let mut record = Value::UNDEFINED;
+    for n in names.split(' ').filter(|n| !n.is_empty()) {
+        let name = vm.intern_name(n);
+        if vm.global_lexical_slot(name).is_none() && !vm.annex_b_undefinable(name) {
+            continue;
+        }
+        if record.is_undefined() {
+            record = object_value(vm.new_object(Value::NULL));
+        }
+        vm.create_data_property(record, Key::Name(name), Value::TRUE)?;
+    }
+    Ok(record)
 }
 
 /// Whether an enclosing function's binding by `key` is shadowed by a `var`

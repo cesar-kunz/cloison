@@ -1275,6 +1275,12 @@ pub struct Vm {
     /// `next` and `return`, for iterators (pinned: see `Vm::intern`).
     pub(crate) a_next: Atom,
     pub(crate) a_return: Atom,
+    /// The iteration protector (see `symbol::protector`): its bits, as
+    /// of prototype epoch `iter_epoch` (`None`: not computed yet). The
+    /// current realm's: each realm has its own (`realm::Realm`), as its
+    /// prototypes, which entering it swaps in without bumping the epoch.
+    pub(crate) iter_bits: u8,
+    pub(crate) iter_epoch: Option<u32>,
     pub(crate) a_writable: Atom,
     pub(crate) a_enumerable: Atom,
     pub(crate) a_configurable: Atom,
@@ -1525,6 +1531,8 @@ impl Vm {
             a_then: Atom(0),
             a_next: Atom(0),
             a_return: Atom(0),
+            iter_bits: 0,
+            iter_epoch: None,
             a_writable: Atom(0),
             a_enumerable: Atom(0),
             a_configurable: Atom(0),

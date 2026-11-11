@@ -17365,3 +17365,46 @@ var r = b.slice(2147483646);
 "#;
     assert_eq!(value(src), "4000000,first/mid/last,4000000,mid,last,2147483649,3,below/above/");
 }
+
+#[test]
+fn array_iteration_protector_is_per_realm() {
+    // The iteration protector's bits (`symbol::protector`) are a realm's:
+    // a realm's prototypes are swapped in on entering it, the epoch not
+    // bumped. After a `ShadowRealm` iterated, the main realm's patched
+    // `next` and `@@iterator` run; and a patched one in the main realm
+    // leaves the other realm's arrays to its builtins.
+    let src = r#"
+var r = new ShadowRealm(), out = [];
+r.evaluate(`for (const x of [1]) {}; 0`);
+var AIP = Object.getPrototypeOf([].values()), on = AIP.next, c = 0;
+AIP.next = function () { c++; return on.call(this); };
+for (const x of [1, 2]) {}
+var [p] = [3, 4];
+out.push(c, r.evaluate(`var n = 0; for (const x of [1, 2, 3]) n += x; n`));
+AIP.next = on;
+var vi = Array.prototype[Symbol.iterator];
+Array.prototype[Symbol.iterator] = function () { c += 10; return vi.call(this); };
+for (const x of [1]) {}
+out.push(c, r.evaluate(`var [a, b] = [5, 6]; a + b`));
+Array.prototype[Symbol.iterator] = vi;
+out.join()
+"#;
+    assert_eq!(value(src), "4,6,14,11");
+}
+
+#[test]
+fn array_iteration_protector_sees_proxies() {
+    // A proxy on a chain the protector reads (here `%IteratorPrototype%`'s
+    // prototype) runs its traps for `return` as IteratorClose's GetMethod
+    // looks it up (§7.4.11): no bits while it is there.
+    let src = r#"
+var IP = Object.getPrototypeOf(Object.getPrototypeOf([].values())), old = Object.getPrototypeOf(IP), seen = [];
+Object.setPrototypeOf(IP, new Proxy({}, { get(t, k) { seen.push(String(k)); } }));
+for (const x of [1, 2]) break;
+var [a] = [1, 2];
+Object.setPrototypeOf(IP, old);
+for (const x of [1, 2]) break;
+seen.join()
+"#;
+    assert_eq!(value(src), "return,return");
+}

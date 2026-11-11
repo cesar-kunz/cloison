@@ -2042,6 +2042,10 @@ struct Gen<'a> {
     /// The script's completion value (`eval`'s result): a register,
     /// in the script only.
     completion: Option<u8>,
+    /// How many block-scoped bindings the global scope had where the
+    /// script began (`global_lexical_count`): a register, in a script
+    /// whose Annex B functions in blocks set globals (see `Gen::stmt`).
+    annex_b_count: Option<u8>,
     /// The statement that has cleared the completion value (so its own
     /// match arm doesn't again; nested ones do, each completing as
     /// `undefined` unless something in it says otherwise).
@@ -2160,6 +2164,7 @@ impl<'a> Gen<'a> {
             found_scope: false,
             eval,
             completion: None,
+            annex_b_count: None,
             cleared: std::ptr::null(),
             depth: 0,
             fresh: Vec::new(),
@@ -2443,6 +2448,15 @@ impl<'a> Gen<'a> {
                 }
                 self.global(Op::LdaGlobalInsideTypeof, name);
                 self.global(Op::StaGlobal, name);
+            }
+            // (Which Annex B `var`s were made, for the functions' stores
+            // to know: see `intrinsics::annex_b_skipped`.)
+            let global_annex_b = !self.p.direct_eval || self.p.eval_global;
+            if global_annex_b && self.p.functions.iter().any(|f| f.annex_b && f.parent == Some(0)) {
+                let r = self.alloc(self.f.pos)?;
+                self.intrinsic("global_lexical_count", r, 0);
+                self.star(r);
+                self.annex_b_count = Some(r);
             }
             if self.eval {
                 // `eval`'s result is the script's completion value: each
@@ -6862,8 +6876,26 @@ impl<'a> Gen<'a> {
                         // (Its `var` is the caller's: in the scope object.)
                         self.store_var(f.name.as_deref().unwrap(), s.pos)?;
                     } else if self.index == 0 {
-                        // (A global, unless a block-scoped binding stopped it.)
-                        self.global(Op::StaGlobalAnnexB, f.name.as_deref().unwrap());
+                        // (A global, unless a block-scoped binding or the
+                        // global object stopped it where the script began;
+                        // else stored as any, a block-scoped binding made
+                        // since first.)
+                        let name = f.name.as_deref().unwrap();
+                        if let Some(c) = self.annex_b_count {
+                            let mark = self.temp;
+                            let v = self.alloc(s.pos)?;
+                            self.star(v);
+                            let n = self.alloc(s.pos)?;
+                            self.string(original(name));
+                            self.star(n);
+                            let count = self.alloc(s.pos)?;
+                            self.mov(c, count);
+                            self.intrinsic("annex_b_skipped", n, 2);
+                            self.jump_if(Jmp::True, end);
+                            self.ldar(v);
+                            self.temp = mark;
+                        }
+                        self.global(Op::StaGlobal, name);
                     } else {
                         self.init_var(f.name.as_deref().unwrap(), s.pos)?;
                     }

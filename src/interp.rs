@@ -1064,18 +1064,6 @@ handlers! {
         next!(any, Op::InitGlobal.size(), acc)
     }
 
-    fn op_sta_global_annex_b(pc, acc, regs, tag) {
-        let (_, name) = (*frame_code(regs)).ic(index_at(pc, 1));
-        // (Approximately: such a binding made after the `var` would take
-        // the function in the specification, a rare case.)
-        let vm = &mut *frame_vm(regs);
-        if vm.global_lexical_slot(name).is_some() || vm.annex_b_undefinable(name) {
-            next!(any, Op::StaGlobalAnnexB.size(), acc)
-        }
-        let r = with_top(regs, None, |vm| vm.set_global_miss(&*frame_code(regs), index_at(pc, 1), acc));
-        next_or_throw!(Op::StaGlobalAnnexB.size(), r.map(|()| acc))
-    }
-
     fn op_init_global_annex_b(pc, acc, regs, tag) {
         let (_, name) = (*frame_code(regs)).ic(index_at(pc, 1));
         let vm = &mut *frame_vm(regs);
@@ -4148,7 +4136,6 @@ static TABLE: Table = {
     t[Op::DeleteProperty as usize] = op_delete_property;
     t[Op::DeleteGlobal as usize] = op_delete_global;
     t[Op::InitGlobal as usize] = op_init_global;
-    t[Op::StaGlobalAnnexB as usize] = op_sta_global_annex_b;
     t[Op::InitGlobalAnnexB as usize] = op_init_global_annex_b;
     t[Op::LdaCallee as usize] = op_lda_callee;
     t[Op::DefineAccessor as usize] = op_define_accessor;

@@ -4489,13 +4489,16 @@ impl Heap {
     /// nothing.
     unsafe fn scan_card(&self, lo: usize, hi: usize, m: &mut impl Visit) {
         unsafe {
+            // (The metadata is read whole, `meta_load` and `meta_word`:
+            // on several threads, the others mark young cells' bytes
+            // meanwhile, `CardMarking::cell`.)
             // An old cell from before the card reaching into it.
             // (While blocks are swept, a dead old cell keeps an old color:
             // only cells of the current color are live.)
             let live = |b: u8| b & COLOR != 0 && (!self.gc.sweeping || b & COLOR == self.color);
             if let Some(p) = self.cell_start_before(lo)
                 && p < lo
-                && live(*self.meta(p))
+                && live(crate::heap::meta_load(p))
                 && p + cell_size(p as *const u8) > lo
             {
                 trace(m, p, lo, hi);
@@ -4503,14 +4506,14 @@ impl Heap {
             // Old cells starting on it: eight granules' bytes at a time.
             let mut g = lo;
             while g < hi {
-                let w = (self.meta(g) as *const u64).read_unaligned();
+                let w = crate::heap::meta_word(g);
                 if w & 0x0303_0303_0303_0303 == 0 {
                     g += 8 * GRANULE;
                     continue;
                 }
                 for k in 0..8 {
                     let p = g + k * GRANULE;
-                    if live(*self.meta(p)) {
+                    if live(crate::heap::meta_load(p)) {
                         if *(p as *const u64) & 1 == 0 {
                             trace(m, p, 0, usize::MAX);
                         } else {

@@ -408,9 +408,11 @@ impl Heap {
             gc,
             candidates: Vec::new(),
             swept_free: Vec::new(),
-            ptr: std::ptr::null_mut(),
-            end: std::ptr::null_mut(),
-            hole: std::ptr::null_mut(),
+            // (No hole yet: the slice's base, not null, so that compiled
+            // code's `ptr + size` is an address in the slice. See `bump_to`.)
+            ptr: (s.base + slice * SLICE) as *mut u8,
+            end: (s.base + slice * SLICE) as *mut u8,
+            hole: (s.base + slice * SLICE) as *mut u8,
             base: s.base + slice * SLICE,
             slice,
             limit,
@@ -640,10 +642,11 @@ impl Heap {
         }
         self.regions.clear();
         self.room.clear();
-        // The block being allocated in is among them: start afresh.
-        self.ptr = std::ptr::null_mut();
-        self.end = std::ptr::null_mut();
-        self.hole = std::ptr::null_mut();
+        // The block being allocated in is among them: start afresh (at the
+        // base, not null: see `Heap::with_slice`).
+        self.ptr = self.base as *mut u8;
+        self.end = self.base as *mut u8;
+        self.hole = self.base as *mut u8;
         self.cursor = 0;
         self.cursor_end = 0;
         self.since = 0;

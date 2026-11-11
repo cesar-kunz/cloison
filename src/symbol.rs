@@ -610,7 +610,7 @@ pub(crate) fn sync_done(r: Value) -> bool {
 
 pub(crate) fn set_sync_done(r: Value, done: bool) {
     // (Not a cell: no barrier.)
-    unsafe { *crate::object::Object::inline(crate::object::as_object(r), 2) = Value::from_bool(done) }
+    unsafe { crate::layout::store_word(crate::object::Object::inline(crate::object::as_object(r), 2), Value::from_bool(done)) }
 }
 
 /// A [`record`]'s iterator and `next`.

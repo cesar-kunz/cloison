@@ -5239,9 +5239,10 @@ macro_rules! keyed_load {
 /// [`length_class`]); no check where its shape is known to be a string's or
 /// a typed array's (`_nc`), only `FAR` where an array's (`_na`: it may go
 /// far in a call, its shape still extending the known one) or a typed
-/// array's once some view is of a growable shared buffer (the bit is
-/// `SHARED_GROWABLE` there: its length is read from the block by the
-/// runtime, and the class check exits on it too); `_nt` takes no
+/// array's once some view is of a growable shared buffer or longer than
+/// `i32::MAX` (the bit is `SHARED_GROWABLE` or `LONG_VIEW` there: its
+/// length is read from the block by the runtime, or is no int32, and the
+/// class check exits on it too); `_nt` takes no
 /// typed array (whose length may be stale once a fixed-length buffer has
 /// been detached: see `Vm::views_detached`).
 macro_rules! array_length {
@@ -5290,7 +5291,7 @@ macro_rules! array_length {
 
 /// Cell `o`'s class and, above it, its `FAR` flag, in one load (a
 /// string's bit is clear, a typed array's but on a growable shared
-/// buffer: `SHARED_GROWABLE`).
+/// buffer, `SHARED_GROWABLE`, or past `i32::MAX`, `LONG_VIEW`).
 #[inline(always)]
 unsafe fn length_class(o: Value) -> u16 {
     unsafe { (&raw const (*cell(o)).class).cast::<u16>().read() & (0xff | (FAR as u16) << 8) }

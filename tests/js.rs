@@ -618,6 +618,63 @@ main().then(() => { globalThis.out = log.join(", "); });
     );
 }
 
+/// With a `then` on `Object.prototype` that isn't callable, the step's
+/// promise is fulfilled with the iterator result it was looked up on
+/// (ES2025 27.1.6.4, 27.2.1.3.2): what its getter changes on it, then or
+/// later (before the consumer reads it, a job after), is what `for
+/// await`, `yield*`, `Array.fromAsync` and `return` without a `return()`
+/// see (V8, SpiderMonkey and JSC agree).
+#[test]
+fn async_from_sync_results_a_then_getter_changes() {
+    let src = r#"
+var log = [];
+// A `then` getter that changes the iterator results it is looked up on
+// (`value` 99 while not done) and keeps them, to change them later.
+var kept = [];
+function patch() {
+  Object.defineProperty(Object.prototype, "then", { configurable: true, get() {
+    if (Object.hasOwn(this, "done")) {
+      log.push("then " + JSON.stringify(this));
+      if (this.done === false) this.value = 99;
+      kept.push(this);
+    }
+    return undefined;
+  } });
+}
+function later() { for (const r of kept) { r.value = -1; r.done = true; } kept = []; }
+function ticks(tag) { var p = Promise.resolve(); for (let i = 0; i < 3; i++) p = p.then(() => { log.push(tag + i); later(); }); }
+async function main() {
+  // (The case of the review: `[99,99]`.)
+  Object.defineProperty(Object.prototype, "then", { configurable: true, get() { if (Object.hasOwn(this, "done") && this.done === false) this.value = 99; return undefined; } });
+  const seen = []; for await (const v of [1, 2]) seen.push(v);
+  log.push(JSON.stringify(seen));
+  patch(); ticks("a");
+  for await (var x of [1, 2]) log.push("for " + x);
+  patch(); ticks("b");
+  async function* g() { log.push("yield* gave " + (yield* [1, 2])); }
+  for await (var y of g()) log.push("gen " + y);
+  patch(); ticks("c");
+  log.push("fromAsync " + JSON.stringify(await Array.fromAsync([1, 2])));
+  // return() without a return(): yield*'s, and for await's break.
+  var bare = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; } }; } };
+  async function* h() { log.push("h gave " + (yield* bare)); }
+  var it = h();
+  log.push("h " + JSON.stringify(await it.next()));
+  patch(); ticks("d");
+  log.push("h " + JSON.stringify(await it.return(5)));
+  patch(); ticks("e");
+  for await (var z of bare) { log.push("body " + z); break; }
+  log.push("broke");
+  delete Object.prototype.then;
+}
+main().then(() => { globalThis.out = log.join(", "); });
+"#;
+    assert_eq!(
+        out_after_jobs(src),
+        r#"[99,99], a0, then {"value":1,"done":false}, a1, a2, b0, then {"value":1,"done":false}, b1, yield* gave -1, then {"done":true}, b2, c0, then {"value":1,"done":false}, c1, c2, fromAsync [], then {"value":1,"done":false}, then {"value":99,"done":false}, h {"value":99,"done":false}, d0, then {"value":5,"done":true}, d1, then {"value":-1,"done":true}, d2, h {"value":-1,"done":true}, e0, then {"value":1,"done":false}, e1, broke, e2"#
+    );
+}
+
 /// `Array.fromAsync` steps a sync iterator as `for await` does: what the
 /// step throws is a rejection, awaited, and doesn't close it; a mapper's
 /// exception closes it by AsyncFromSyncIterator's `return()`, whose

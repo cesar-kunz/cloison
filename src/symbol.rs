@@ -481,10 +481,30 @@ fn string_iterator(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 
 /// An iterator result object `{value, done}`.
 pub(crate) fn iter_result(vm: &mut Vm, value: Value, done: bool) -> Result<Value> {
+    // The shape the realm's first one got: given at once, the two slots
+    // stored (V8's iterator result map, JSC's iteratorResultObjectStructure).
+    let s = vm.iter_result_shape;
+    if !s.is_null() {
+        unsafe {
+            crate::object::mark_shape(s);
+            let o = vm.heap.alloc_object(&*s);
+            vm.store_field(o, 0, value);
+            vm.store_field(o, 1, Value::from_bool(done));
+            return Ok(object_value(o));
+        }
+    }
     let o = object_value(vm.new_object(object_value(vm.object_prototype)));
     let (a_value, a_done) = (vm.a_value, vm.a_done);
     vm.create_data_property(o, Key::Name(a_value), value)?;
     vm.create_data_property(o, Key::Name(a_done), Value::from_bool(done))?;
+    unsafe {
+        let s = (*as_object(o)).shape;
+        if !(*s).dictionary && (*s).keys() == [a_value, a_done] && (*s).attrs().iter().all(|&a| a == 0) {
+            // (A realm's field: `Vm::fixed_shapes` keeps it, and the
+            // collector its ancestors.)
+            vm.iter_result_shape = s;
+        }
+    }
     Ok(o)
 }
 
@@ -506,6 +526,30 @@ fn array_iterator_next(vm: &mut Vm, this: Value, _: &[Value]) -> Result<Value> {
 /// the value, or `None` when done.
 fn array_step(vm: &mut Vm, this: Value) -> Result<Option<Value>> {
     let state = iterator_state(this, "%ArrayIteratorPrototype%.next")?;
+    // Values of a dense array (`[target, index, kind]` itself one, plain):
+    // its element read directly, unless a hole (a prototype's then).
+    unsafe {
+        let st = as_object(state);
+        if (*st).class == Class::Array && (*st).flags & crate::far::FAR == 0 && (*st).elems_len == 3 {
+            let e = (*st).elems;
+            let (target, i, kind) = (*e, *e.add(1), *e.add(2));
+            if target.is_cell() && i.is_int32() && kind == Value::from_i32(1) {
+                let t = as_object(target);
+                let n = i.as_i32_unchecked();
+                if (*t).class == Class::Array && (*t).flags & crate::far::FAR == 0 && n >= 0 && n < i32::MAX {
+                    if n as u32 >= (*t).elems_len {
+                        vm.store_element(st, 0, Value::UNDEFINED);
+                        return Ok(None);
+                    }
+                    let v = *(*t).elems.add(n as usize);
+                    if v != Value::EMPTY && v != Value::HOLE {
+                        vm.store_element(st, 1, Value::from_i32(n + 1));
+                        return Ok(Some(v));
+                    }
+                }
+            }
+        }
+    }
     let target = vm.get_keyed(state, Value::from_i32(0))?;
     if target.is_undefined() {
         return Ok(None);

@@ -334,7 +334,7 @@ pub(crate) fn read_length(vm: &mut Vm, o: *mut Object) -> usize {
 // message). It counts the grows (`GROWS`), and skips when the count is
 // the one it last recorded.
 //
-// A view tracking a growable buffer's length (flag `SHARED_GROWABLE`)
+// A view tracking a growable buffer's length (flag `RUNTIME_LENGTH`)
 // reads it from the block wherever the spec reads it seq-cst (its
 // `length`, `byteLength` and `byteOffset`, ValidateTypedArray, the array
 // iterator's `next`: MakeTypedArrayWithBufferWitnessRecord(o, seq-cst),

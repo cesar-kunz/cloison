@@ -381,6 +381,9 @@ fn part(vm: &mut Vm, this: Value, u: &[u16], s: usize, e: usize) -> Value {
     if s == 0 && e == u.len() && string_len(this).is_some() {
         return this;
     }
+    if let Some(v) = vm.slice_string(this, s, e) {
+        return v;
+    }
     match &u[s..e] {
         [c] => vm.single_char(*c),
         part => vm.short_string(part),

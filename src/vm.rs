@@ -5660,6 +5660,42 @@ impl Vm {
         }
     }
 
+    /// Units `s..e` of flat string `parent` as a slice (V8's sliced
+    /// string, JSC's substring): no units of its own, `elems` pointing
+    /// into its parent's, the parent (a flat string, not a slice) in
+    /// `props`, which keeps it alive. Only of a parent whose units are in
+    /// a large cell, which never moves, and for a long part: else `None`,
+    /// and the caller copies. So `s = s.substr(64)` over a long string,
+    /// repeated, costs no copy of the rest each time (cyberchef's hashes).
+    pub(crate) fn slice_string(&mut self, parent: Value, s: usize, e: usize) -> Option<Value> {
+        const MIN: usize = 1024;
+        if e - s < MIN || !parent.is_cell() {
+            return None;
+        }
+        unsafe {
+            let p = as_object(parent);
+            if (*p).class != Class::String || (*p).elems.is_null() {
+                return None;
+            }
+            let units = (*p).elems as usize;
+            // A slice's parent is its root's: one level only.
+            let root = if !(*p).props.is_null() { (*p).props.cast::<Object>() } else { p };
+            let ru = (*root).elems as usize;
+            // The cell holding the root's units: itself, or the buffer a
+            // flattening made (past its header word).
+            let cell = if ru == root as usize + STRING_UNITS { root as usize } else { ru - 8 };
+            let (lo, hi) = self.heap.space_range();
+            if !(lo..hi).contains(&cell) || !self.heap.is_large_start(cell) {
+                return None;
+            }
+            let o = self.alloc_string(0);
+            (*o).elems = (units + 2 * s) as *mut Value;
+            (*o).elems_len = (e - s) as u32;
+            (*o).props = root.cast();
+            Some(object_value(o))
+        }
+    }
+
     /// The string constant with `units`, shared by equal ones.
     pub(crate) fn string_constant(&mut self, units: &[u16]) -> Value {
         if let Some(&v) = self.strings.get(units) {

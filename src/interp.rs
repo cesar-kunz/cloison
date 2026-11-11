@@ -1707,6 +1707,33 @@ handlers! {
                 break;
             }
         }
+        // Megamorphic: see `mega_get_named` (out of line, for the hit
+        // paths above to stay as they were).
+        if !(*ic.add(IC_WAYS - 1)).shape.is_null() {
+            tail!(mega_get_named, acc)
+        }
+        tail!(slow_get_named, acc)
+    }
+
+    // A load whose four ways are taken, at a site `Vm::get_named_miss`
+    // found megamorphic: an own data property the receiver's shape was
+    // last found with (`Vm::interp_megas`). Left as a miss would leave it,
+    // for the JIT, which reads the cache: way 0 the receiver's shape, the
+    // miss counted (`Code::ic_misses`).
+    #[inline(never)]
+    fn mega_get_named(pc, acc, regs, tag) {
+        let o = as_object(*reg(pc, 1, regs));
+        let ic = ic_at(regs, pc, 2);
+        let vm = &mut *frame_vm(regs);
+        let code = &*frame_code(regs);
+        let name = *(&code.ic_names).get_unchecked(index_at(pc, 2) as usize);
+        let sh = (*o).shape;
+        let e = *(&vm.interp_megas).get_unchecked(crate::vm::interp_mega_index(sh, name.0));
+        if e.shape == sh && e.name == name.0 && vm.megamorphic.contains(&(ic as usize)) {
+            code.ic_misses.set(code.ic_misses.get().wrapping_add(1));
+            *ic = Ic { shape: sh, holder: std::ptr::null_mut(), new_shape: std::ptr::null(), loc: e.loc, epoch: vm.proto_epoch };
+            next!(any, Op::GetNamed.size(), *Object::slot(o, e.loc))
+        }
         tail!(slow_get_named, acc)
     }
 

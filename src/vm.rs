@@ -1164,6 +1164,9 @@ pub struct Vm {
     /// Sloppy functions' `arguments` objects' shape (see
     /// `builtins::arguments_object_of`).
     pub(crate) arguments_shape: *const Shape,
+    /// The shape of this realm's `{value, done}` iterator results, once
+    /// one is made (see `symbol::iter_result`).
+    pub(crate) iter_result_shape: *const Shape,
     /// Their shape when mapped (see `builtins::mapped_arguments_object`).
     pub(crate) mapped_arguments_shape: *const Shape,
     /// The object keys read-modify-writes' `GetKeyed`s converted, what to,
@@ -1495,6 +1498,7 @@ impl Vm {
             mapped_args: Vec::new(),
             released_mark: None,
             arguments_shape: std::ptr::null(),
+            iter_result_shape: std::ptr::null(),
             mapped_arguments_shape: std::ptr::null(),
             key_cache: Vec::new(),
             eval_function: std::ptr::null_mut(),

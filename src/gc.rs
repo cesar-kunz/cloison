@@ -75,6 +75,14 @@ const SHAPE_FULL_MIN: usize = 1 << 18;
 /// of 32 properties made 32 cells, 1.2 KB, a delete).
 const CELL_FULL_MIN: usize = 1 << 20;
 const FULL_MIN: usize = 64 << 20;
+/// Under `CLOISON_GC_STRESS`, a full collection also runs once minor ones
+/// have promoted this many bytes since the last: collecting at every
+/// safepoint promotes whatever is live at each, garbage soon after, and
+/// every minor collection scans the cards of the whole space, so below
+/// `FULL_MIN` a loop's time grew with the square of its length (#127).
+/// It stops the world: a cycle's marker, paused at every safepoint, took
+/// thousands of them to finish, each a slower minor collection.
+const STRESS_PROMOTED: usize = 1 << 20;
 
 /// The collector's state, in the heap.
 /// What a collection's shape phases took (`CLOISON_GC_STATS`), in
@@ -2164,6 +2172,8 @@ impl Vm {
                 // (The marker's request of the final pause came early.)
                 return;
             }
+        } else if gc.stress && gc.promoted > STRESS_PROMOTED {
+            Collection::Full
         } else if gc.always_full
             || external
             || gc.cycles

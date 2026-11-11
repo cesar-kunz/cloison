@@ -6558,7 +6558,7 @@ impl Vm {
     /// error, and the function stays its block's (B.3.2.2, B.3.2.3; see
     /// `intrinsics::annex_b_skipped`).
     pub(crate) fn annex_b_skipped(&mut self, module: &Module, n: &str) -> bool {
-        if !module.annex_b.iter().any(|b| b == n) {
+        if self.lexical_declared.is_empty() && Self::is_extensible(self.global) || !module.annex_b.iter().any(|b| b == n) {
             return false;
         }
         let a = self.intern_name(n);

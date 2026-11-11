@@ -45,6 +45,10 @@ pub struct Regex {
     /// The pattern, if it is just characters (case-sensitive): found by
     /// searching for them, without the interpreter.
     literal: Option<Vec<u16>>,
+    /// It begins with `.*` (or `.*?`): a failed attempt at `p` means all
+    /// fail up to the next line terminator, which `.*` could have
+    /// crossed to (a match at `q` there would be one at `p`).
+    dot_star: bool,
     /// `prog` as native code, compiled at the `native_after()`th exec
     /// (`None` inside: it has instructions that don't compile).
     native: std::cell::OnceCell<Option<Native>>,
@@ -527,6 +531,7 @@ impl Regex {
             prog: Program::default(),
             run: Default::default(),
             literal: None,
+            dot_star: false,
             native: Default::default(),
             execs: Default::default(),
             mark: Default::default(),
@@ -546,6 +551,11 @@ impl Regex {
         };
         re.starts = re.starts();
         re.needle = re.needle();
+        let dot_star = |n: &Node| matches!(n, Node::Repeat(inner, 0, u32::MAX, _, _) if matches!(**inner, Node::Any));
+        re.dot_star = match &re.node {
+            Node::Seq(ns) => ns.first().is_some_and(dot_star),
+            n => dot_star(n),
+        };
         Ok(re)
     }
 
@@ -725,6 +735,10 @@ impl Regex {
             }
             if attempt(at) {
                 return Some(at);
+            }
+            if self.dot_star {
+                at += s[at..].iter().position(|&c| is_line_terminator(c))? + 1;
+                continue;
             }
             at += 1;
         }

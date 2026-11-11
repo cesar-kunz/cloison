@@ -4639,6 +4639,8 @@ unsafe fn bump_to(heap: *mut HeapPtrs, words: usize) -> Option<(*mut u64, *mut u
     unsafe {
         let words = (words + 1) & !1;
         let p = (*heap).ptr;
+        // (In bounds even past the hole: the heap's cursor is always in its
+        // slice, at its base when it has none.)
         let end = p.add(words);
         // (Past `LARGE` the runtime makes it a large cell.) `p + size >
         // end`: `lea; cmp; ja`, not `end - p < size`'s `mov; sub; cmp; jb`.
@@ -5543,8 +5545,10 @@ macro_rules! property_location {
                 let i = key as u32;
                 let len = (*header(p)).elems_len;
                 if (*shape_of(p)).elems_code <= FIELD_NUM && (i < len || i == len && len < elems_cap(header(p))) {
-                    *((*header(p)).elems.cast::<Value>()).add(i as usize) =
-                        Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits());
+                    store_word(
+                        ((*header(p)).elems.cast::<Value>()).add(i as usize),
+                        Value::from_bits(s.acc.to_bits() as u32 as u64 | s.tag.to_bits()),
+                    );
                     if i == len {
                         (*header(p)).elems_len = len + 1;
                     }

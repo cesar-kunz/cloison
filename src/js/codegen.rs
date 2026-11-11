@@ -1744,33 +1744,40 @@ fn try_blocks<'a>(
 /// and integer operators makes (`(1 << 16) - 1`: folded, not computed at
 /// each run, as PdfJS's `decrypt` did in its loop).
 fn smi(e: &Expr) -> Option<i32> {
-    if let ExprKind::Binary(op, l, r) = &e.kind {
-        let (a, b) = (smi(l)?, smi(r)?);
-        let k = b as u32 & 31;
-        return match op {
-            BinOp::Add => a.checked_add(b),
-            BinOp::Sub => a.checked_sub(b),
-            // (Not -0: `0 * -1`.)
-            BinOp::Mul => a.checked_mul(b).filter(|&p| p != 0 || (a >= 0 && b >= 0)),
-            BinOp::Shl => Some(a.wrapping_shl(k)),
-            BinOp::Sar => Some(a >> k),
-            BinOp::Shr => i32::try_from((a as u32) >> k).ok(),
-            BinOp::BitAnd => Some(a & b),
-            BinOp::BitOr => Some(a | b),
-            BinOp::BitXor => Some(a ^ b),
-            _ => None,
-        };
-    }
-    let v = match &e.kind {
-        ExprKind::Num(v) => *v,
-        ExprKind::Unary(UnOp::Neg, x) => match x.kind {
-            ExprKind::Num(v) => -v,
-            _ => return None,
-        },
-        _ => return None,
-    };
+    let v = num_const(e)?;
     let i = v as i32;
     (i as f64 == v && !(v == 0.0 && v.is_sign_negative())).then_some(i)
+}
+
+/// The number `e` is, if it is made of number literals and arithmetic
+/// operators alone (`2 ** 31 - 1`, `-0.5`, `1 << 20`), computed as the
+/// operators compute it at run time: folded.
+fn num_const(e: &Expr) -> Option<f64> {
+    use crate::interp::to_int32;
+    match &e.kind {
+        ExprKind::Num(v) => Some(*v),
+        ExprKind::Unary(UnOp::Neg, x) => Some(-num_const(x)?),
+        ExprKind::Binary(op, l, r) => {
+            let (a, b) = (num_const(l)?, num_const(r)?);
+            let k = to_int32(b) as u32 & 31;
+            Some(match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                BinOp::Mod => a % b,
+                BinOp::Exp => crate::math::pow(a, b),
+                BinOp::Shl => to_int32(a).wrapping_shl(k) as f64,
+                BinOp::Sar => (to_int32(a) >> k) as f64,
+                BinOp::Shr => ((to_int32(a) as u32) >> k) as f64,
+                BinOp::BitAnd => (to_int32(a) & to_int32(b)) as f64,
+                BinOp::BitOr => (to_int32(a) | to_int32(b)) as f64,
+                BinOp::BitXor => (to_int32(a) ^ to_int32(b)) as f64,
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Whether evaluating `e` may assign the variable `name`.
@@ -4265,12 +4272,13 @@ impl<'a> Gen<'a> {
         deep(e.pos)?;
         use ExprKind::*;
         match &e.kind {
-            Num(_) | Unary(UnOp::Neg, _) if smi(e).is_some() => self.lda_smi(smi(e).unwrap()),
+            Num(_) | Unary(UnOp::Neg, _) | Binary(..) if smi(e).is_some() => self.lda_smi(smi(e).unwrap()),
             Num(v) => self.constant(Constant::Number(*v)),
             Unary(UnOp::Neg, x) if matches!(x.kind, Num(_)) => {
                 let Num(v) = x.kind else { unreachable!() };
                 self.constant(Constant::Number(-v))
             }
+            Binary(..) if let Some(v) = num_const(e) => self.constant(Constant::Number(v)),
             Str(s) => self.string(s),
             Bool(true) => self.emit(Op::LdaTrue, &[]),
             Bool(false) => self.emit(Op::LdaFalse, &[]),

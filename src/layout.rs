@@ -631,11 +631,24 @@ pub const VALUES: u64 = 1;
 /// `SIDE + addr / 128` (see [`meta`], [`card`]). One constant, which arm64
 /// builds in one instruction, so the barrier needs no operand. (macOS
 /// grants addresses asked for only from 8 TiB up.)
+#[cfg(not(cloison_tsan))]
 pub const SIDE: usize = 1 << 43;
+/// Under ThreadSanitizer (`scripts/tsan.sh`), whose shadow and metadata
+/// take 16 to 64 TiB on x86-64 Linux and which maps nothing for us
+/// outside its application ranges, in the lowest of those (below 2 TiB),
+/// with a smaller reservation (`heap::SPACE`): the tables from 1.3 TiB,
+/// past the reservation's 256 GiB to 1.25 TiB.
+#[cfg(cloison_tsan)]
+pub const SIDE: usize = 0x150 << 32;
 /// Address space one heap may use (`CLOISON_HEAP_LIMIT`, in MiB, lowers
 /// it), aligned to it: the metadata of its first granule is the heap's
 /// current color ([`color_byte`]).
+#[cfg(not(cloison_tsan))]
 pub const SLICE: usize = 32 << 30;
+/// Under ThreadSanitizer, 8 GiB: its smaller reservation still has room
+/// for more heaps than tests/js.rs has agents and test threads.
+#[cfg(cloison_tsan)]
+pub const SLICE: usize = 8 << 30;
 
 /// The metadata byte of the granule at `a` (in a heap).
 #[inline(always)]

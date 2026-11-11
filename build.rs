@@ -42,8 +42,20 @@ fn main() {
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let obj_path = out_dir.join("stencils.o");
 
+    // Under ThreadSanitizer (`scripts/tsan.sh`) the heap's reservation and
+    // side tables move out of its shadow memory (`layout::SIDE`,
+    // `heap::SPACE`): the runtime and the stencils both build with
+    // `cloison_tsan`.
+    println!("cargo::rustc-check-cfg=cfg(cloison_tsan)");
+    let tsan = env::var("CARGO_CFG_SANITIZE").is_ok_and(|s| s.split(',').any(|s| s == "thread"));
+    if tsan {
+        assert!(target == "x86_64-unknown-linux-gnu", "ThreadSanitizer builds are laid out for x86-64 Linux only");
+        println!("cargo::rustc-cfg=cloison_tsan");
+    }
+    let tsan: &[&str] = if tsan { &["--cfg=cloison_tsan"] } else { &[] };
+
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-    let mut extracted = extract(&compile(&rustc, &target, &obj_path, &[]), &arch);
+    let mut extracted = extract(&compile(&rustc, &target, &obj_path, tsan), &arch);
     rerun_if_deps_changed(&obj_path.with_extension("d"));
     // x86-64: LLVM jumps to an exit or a helper with a short `jcc` to a
     // stub after the hot path's final `jmp cloison_continue`, which then can't
@@ -55,7 +67,7 @@ fn main() {
     if arch == "x86_64" {
         let relaxed_path = out_dir.join("stencils-relaxed.o");
         let relaxed = extract(
-            &compile(&rustc, &target, &relaxed_path, &["-Cllvm-args=-mc-relax-all"]),
+            &compile(&rustc, &target, &relaxed_path, &[tsan, &["-Cllvm-args=-mc-relax-all"]].concat()),
             &arch,
         );
         let mut relaxed: std::collections::HashMap<String, Extracted> =

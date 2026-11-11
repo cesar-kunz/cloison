@@ -1,0 +1,8 @@
+# ThreadSanitizer suppressions for scripts/tsan.sh: races known benign,
+# each with why.
+
+# glibc's tzset() and localtime_r() run tzset_internal under glibc's own
+# tzset_lock, which TSan, not instrumenting libc, doesn't see: each
+# realm's `Date` setup (date::install) calls tzset() in its agent's
+# thread, and two agents' free and strdup of the zone's name look racy.
+race:tzset_internal

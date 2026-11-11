@@ -55,7 +55,12 @@ const GRANULES_PER_BLOCK: usize = BLOCK / GRANULE;
 /// Only reserved (no page is touched until committed); from any of
 /// [`BASES`] it ends below 128 TiB, and its side tables stay between
 /// [`SIDE`] and the first base.
+#[cfg(not(cloison_tsan))]
 const SPACE: usize = 16 << 40;
+/// Under ThreadSanitizer, 1 TiB (128 heaps) from 256 GiB, in application
+/// memory as TSan lays it out, as are its side tables (see [`SIDE`]).
+#[cfg(cloison_tsan)]
+const SPACE: usize = 1 << 40;
 /// Heaps alive at once, at most (one per [`SLICE`] of [`SPACE`]).
 pub const HEAPS: usize = SPACE / SLICE;
 /// Memory is committed this much at a time (its metadata and cards are
@@ -143,7 +148,10 @@ fn reserve_at(at: usize, len: usize) -> bool {
 
 /// Candidate addresses for the reservation (16, 32, 48, 64 TiB): above
 /// [`SIDE`] plus their side tables, all where Linux and macOS leave room.
+#[cfg(not(cloison_tsan))]
 const BASES: [usize; 4] = [0x1000 << 32, 0x2000 << 32, 0x3000 << 32, 0x4000 << 32];
+#[cfg(cloison_tsan)]
+const BASES: [usize; 1] = [0x40 << 32];
 
 fn space() -> &'static Space {
     SPACE_.get_or_init(|| {

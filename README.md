@@ -545,7 +545,20 @@ checkout in `test262/`), which writes the table above.
 cargo test --release
 node bench/run.mjs --engine target/release/cloison        # every micro against `expect`
 cargo test --release --target aarch64-unknown-linux-musl   # arm64 under qemu-aarch64
+scripts/tsan.sh                                            # under ThreadSanitizer
 ```
+
+`scripts/tsan.sh` runs tests (the unit tests, `tests/heaps.rs` and
+`tests/js.rs` by default, or cargo test's arguments) under
+ThreadSanitizer on x86-64 Linux, with `-Zbuild-std` (`rustup component
+add rust-src`): it finds races between the mutator, the concurrent
+marker and agents in the Rust code, not in compiled code or asm, which
+TSan doesn't see (the JIT is
+off but where a test sets the tier, as `tests/js.rs`'s do). `CYCLES=1`
+adds `CLOISON_GC_CYCLES`. Such a build moves the heap's reservation and
+side tables below 2 TiB, out of TSan's shadow memory, with room for 128
+heaps of 8 GiB (`cloison_tsan` in `build.rs`); `scripts/tsan.supp` lists
+the reports known benign, each with why.
 
 Scripts in `scripts/`: `stencil-listing.py` lists every stencil as the
 JIT emits it, with instruction counts (`docs/arm64-targets.md` holds

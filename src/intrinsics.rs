@@ -900,7 +900,10 @@ fn direct_eval_in(vm: &mut Vm, a: &[Value], chain: crate::vm::EvalChain) -> Resu
     // B's function in a block by such a name, nor an error: see
     // `Vm::annex_b_skipped`.)
     let global_target = target == object_value(vm.global);
-    let skipped = |vm: &Vm, n| blocked.contains(&n) || global_target && vm.lexical_declared.contains(&n) && annex_b.contains(&n);
+    let skipped = |vm: &mut Vm, n| {
+        blocked.contains(&n)
+            || global_target && annex_b.contains(&n) && (vm.lexical_declared.contains(&n) || vm.annex_b_undefinable(n))
+    };
     for &n in declared.iter().filter(|_| global_target) {
         if vm.lexical_declared.contains(&n) && !skipped(vm, n) {
             return Err(Error(format!("SyntaxError: Identifier '{}' has already been declared", vm.atom_name(n)), None));

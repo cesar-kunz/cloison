@@ -16760,6 +16760,30 @@ log.join(" ");"#;
     assert_eq!(value(src), "number function 2 undefined");
 }
 
+/// In a script with no block-scoped declarations but catch parameters, a
+/// function in a catch clause closes over the parameter (14.15.3: a
+/// declarative environment of the clause's), not the enclosing function's
+/// binding of its name: none, a `var`, a parameter; at the top level, in
+/// a method, in a loop (an environment each). Its catch parameters were
+/// left unrenamed, the function's own variables, so these read the
+/// enclosing binding (or threw a ReferenceError). SpiderMonkey's and V8's
+/// values.
+#[test]
+fn closures_over_a_catch_parameter_in_a_script_without_lets() {
+    let src = r#"
+var log = [];
+function f() { try { throw 1; } catch (e) { return () => e; } }
+function g() { var e = 9; try { throw 2; } catch (e) { return () => e; } }
+function h(e) { try { throw 3; } catch (e) { return function () { return e; }; } }
+try { throw 4; } catch (e) { var top = () => e; }
+function n() { try { throw 5; } catch (e) { function q() { return (() => e)(); } return q; } }
+var o = { m() { try { throw 6; } catch (e) { return [0].map(() => e)[0]; } } };
+function m() { var r = []; for (var i = 0; i < 3; i++) { try { throw i; } catch (e) { r.push(() => e); } } return r.map(x => x()).join(""); }
+log.push(f()(), g()(), h(7)(), top(), n()(), o.m(), m());
+log.join(" ");"#;
+    assert_eq!(value(src), "1 2 3 4 5 6 012");
+}
+
 /// A direct `eval`'s declarations are checked against every binding of
 /// their names between it and its function's scope, not only the
 /// innermost one, which its code's names find: a simple catch

@@ -302,14 +302,18 @@ struct Table {
     decls: crate::jit::HashMap<usize, Vec<(Name, u8)>>,
     /// A function has parameter defaults (see `Parser::push_body_vars`).
     defaults: bool,
+    /// A function is in a catch clause, which may close over its
+    /// parameter (see `Parser::push_vars`).
+    catch_closure: bool,
 }
 
 impl Table {
     /// Nothing to rename but catch parameters (renamed only along with
     /// other names, or for a direct `eval`, which sees a catch parameter
-    /// apart from its function's `var` by the name: see `parse_with`).
+    /// apart from its function's `var` by the name: see `parse_with`), no
+    /// function closing over one.
     fn trivial(&self) -> bool {
-        !self.defaults && self.decls.values().flatten().all(|&(_, kind)| kind == CATCH)
+        !self.defaults && !self.catch_closure && self.decls.values().flatten().all(|&(_, kind)| kind == CATCH)
     }
 }
 
@@ -3349,6 +3353,12 @@ impl<'a> Parser<'_, 'a, '_> {
     /// before its parameters), which shadow outer block-scoped bindings.
     /// (The names come from the first pass's function starting there.)
     fn push_vars(&mut self, key: usize) {
+        // (A function in a catch clause sees its parameter only renamed
+        // apart from the enclosing function's variables: see
+        // `Table::trivial`.)
+        if self.collect && self.frames.iter().any(|f| f.catch) {
+            self.table.catch_closure = true;
+        }
         let names = match self.prev {
             Some(prev) => {
                 let pos = self.toks[key].pos;

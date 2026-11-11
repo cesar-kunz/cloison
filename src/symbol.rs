@@ -689,6 +689,19 @@ pub(crate) fn close(vm: &mut Vm, it: Value) -> Result<()> {
 /// Each value `v` iterates over, to `f` (the iterator closed if `f`
 /// fails).
 pub(crate) fn iterate(vm: &mut Vm, v: Value, mut f: impl FnMut(&mut Vm, Value) -> Result<()>) -> Result<()> {
+    // An array iterated by the builtins: its elements as `next()` gives
+    // them, with no iterator (see `IteratorOpen`).
+    if iterates_as_array(vm, v) {
+        let mut i = 0;
+        while let Some(x) = open_array_element(vm, v, i)? {
+            i += 1;
+            if let Err(e) = f(vm, x) {
+                let _ = open_array_close(vm, &[v, Value::number(i as f64)]);
+                return Err(e);
+            }
+        }
+        return Ok(());
+    }
     // (`it` and `next` are rooted on the native stack.)
     let it = get_iterator(vm, v)?;
     let a_next = vm.a_next;
@@ -819,6 +832,32 @@ pub(crate) unsafe fn iterator_open(vm: &mut Vm, slots: *mut Value) -> Result<()>
         *slots.add(1) = Value::UNDEFINED;
         Ok(())
     }
+}
+
+/// `src`'s elements appended to array `dst`, as iterating `src` would
+/// give them, copied at once when `src` is an array iterated by the
+/// builtins with no holes and `dst` a plain array (V8's
+/// `CloneFastJSArray`): whether it was. Nothing collects meanwhile
+/// (allocation never does), so the elements are read in place.
+pub(crate) fn append_dense(vm: &mut Vm, dst: Value, src: Value) -> bool {
+    if !iterates_as_array(vm, src) || !is_open_array(dst) {
+        return false;
+    }
+    let (d, s) = (as_object(dst), as_object(src));
+    unsafe {
+        if (*d).flags & !(crate::object::EXTERNAL | crate::object::PROTOTYPE) != 0 || crate::far::is_far(d) || crate::far::is_far(s) {
+            return false;
+        }
+        let n = (*s).elems_len as usize;
+        if vm.length_field(s) as usize != n || (0..n).any(|i| *(*s).elems.add(i) == Value::EMPTY) {
+            return false;
+        }
+        let len = (*d).elems_len as usize;
+        vm.reserve_elems(d, len + n);
+        vm.store_elements(d, len, (*s).elems, n);
+        (*d).elems_len = (len + n) as u32;
+    }
+    true
 }
 
 /// Whether `IteratorOpen`'s state starting at `v` is an array's (a

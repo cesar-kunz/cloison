@@ -181,6 +181,9 @@ fn hole(vm: &mut Vm, a: &[Value]) -> Result<Value> {
 /// `…x` into array `a[0]`: each value `a[1]` iterates over appended.
 fn spread(vm: &mut Vm, a: &[Value]) -> Result<Value> {
     let arr = a[0];
+    if crate::symbol::append_dense(vm, arr, a[1]) {
+        return Ok(arr);
+    }
     crate::collections::iterate(vm, a[1], |vm, v| {
         crate::vm::array_push(vm, arr, &[v]).map(|_| ())
     })?;

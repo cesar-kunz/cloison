@@ -904,9 +904,9 @@ pub struct Vm {
     /// views' lengths, which nothing brought up to date, may be stale.
     pub(crate) views_detached: bool,
     /// Some typed array or `DataView` tracks a growable shared buffer's
-    /// length (`object::SHARED_GROWABLE`), or some typed array is longer
-    /// than `i32::MAX` (`object::LONG_VIEW`): compiled code reads no typed
-    /// array's length unchecked.
+    /// length, or some typed array is longer than `i32::MAX`
+    /// (`object::RUNTIME_LENGTH`): compiled code reads no typed array's
+    /// length unchecked.
     pub(crate) checked_length_views: bool,
     /// Some typed array has had another kind's prototype (see
     /// `typed::note_proto`): a shape no longer says the kind of its typed

@@ -5579,7 +5579,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         // is one's. Once a typed array's may be stale (`views_detached`),
         // a typed array's through the runtime, and the check takes arrays
         // and strings only (`nt`). (The general check exits on a view's
-        // `SHARED_GROWABLE` or `LONG_VIEW`, with the class.)
+        // `RUNTIME_LENGTH`, with the class.)
         if prop == Prop::Length {
             use crate::object::Class;
             let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
@@ -5600,7 +5600,7 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
             // array's length is where `nc` reads it, but a growable shared
             // buffer's view's is read from its block, by the runtime, and
             // one past `i32::MAX` is no int32: `na`'s check of `FAR` is of
-            // `SHARED_GROWABLE` or `LONG_VIEW` in a view.)
+            // `RUNTIME_LENGTH` in a view.)
             let case = match (known, spec.views_detached) {
                 (true, _) if class == Some(Class::Array) => "na",
                 (true, _) if class == Some(Class::TypedArray) && spec.checked_length_views => "na",

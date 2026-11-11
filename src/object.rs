@@ -277,17 +277,16 @@ pub const DETACHED: u8 = 64;
 /// A typed array or `DataView` of an immutable buffer (see `typed`):
 /// stores into it fail; `LENGTH_READ_ONLY`'s bit, as views aren't arrays.
 pub const IMMUTABLE_VIEW: u8 = 64;
-/// A typed array or `DataView` tracking a growable shared buffer's length:
-/// read from the block where the spec reads it seq-cst (see `shared`);
-/// `FAR`'s bit, as views aren't arrays, so compiled code's length reads,
-/// which check `FAR`, leave it to the runtime.
-pub const SHARED_GROWABLE: u8 = 128;
-/// A typed array longer than `i32::MAX` (a byte view of a whole 2 GiB
-/// buffer): compiled code boxes a length as an int32, so `FAR`'s bit, as
-/// for `SHARED_GROWABLE`, leaves its `length` to the runtime. (It is
-/// `SHARED_GROWABLE`'s bit too: the runtime then reads its buffer's
-/// length seq-cst, which for a fixed-length buffer is the one it has.)
-pub const LONG_VIEW: u8 = 128;
+/// A typed array or `DataView` whose length compiled code leaves to the
+/// runtime: one tracking a growable shared buffer's length, which the
+/// runtime reads from the block where the spec reads it seq-cst (see
+/// `shared`), or a typed array longer than `i32::MAX` (a byte view of a
+/// whole 2 GiB buffer), whose length is no int32, as compiled code boxes
+/// it (#226). The runtime tells neither apart: it reads either's buffer's
+/// length seq-cst, a fixed-length buffer's being the one it has. `FAR`'s
+/// bit, as views aren't arrays, so compiled code's length reads, which
+/// check `FAR`, leave it to the runtime.
+pub const RUNTIME_LENGTH: u8 = 128;
 /// A plain object made by `JSON.rawJSON` ([[IsRawJSON]]), frozen;
 /// `LENGTH_READ_ONLY`'s bit, as plain objects aren't arrays, and
 /// `MAPPED`'s, which no frozen object has.
@@ -302,7 +301,7 @@ pub const LEGACY_DISABLED: u8 = 64;
 pub const REGISTERED_SYMBOL: u8 = 64;
 /// A plain object made by an `Error` constructor (`[object Error]`);
 /// `FN_NAME_DELETED`'s bit, as errors aren't functions, and `FAR`'s,
-/// `RESIZABLE`'s, `SHARED_GROWABLE`'s: asked through [`is_error`].
+/// `RESIZABLE`'s, `RUNTIME_LENGTH`'s: asked through [`is_error`].
 pub const ERROR: u8 = 128;
 
 /// Whether `o` is an error object ([[ErrorData]]): a plain object with

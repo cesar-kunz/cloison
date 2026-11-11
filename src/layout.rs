@@ -724,6 +724,44 @@ pub unsafe fn meta_word(a: usize) -> u64 {
     }
 }
 
+/// Zero the metadata bytes of the `n` granules from `a` (`n` a multiple
+/// of 64), in asm: `rep stosb` on x86-64, 32-byte `stp`s of a zero vector
+/// on arm64. As [`meta_word`]'s loads, its effect is that of `n` Relaxed
+/// byte stores, each byte of a store being single-copy atomic, and the
+/// marker, which may read those bytes meanwhile, needs no more: the 2048
+/// [`meta_store`]s of a block, which LLVM doesn't merge, made a block
+/// taken while a marking runs cost 4% of a constructor-bound micro's
+/// instructions. Under ThreadSanitizer, which sees no asm, they are
+/// [`meta_store`]s still, so that it checks them.
+///
+/// # Safety
+/// The granules' metadata must be mapped (in one block, say).
+#[inline]
+pub unsafe fn meta_clear(a: usize, n: usize) {
+    let p = meta(a);
+    debug_assert!(n.is_multiple_of(64));
+    #[cfg(all(target_arch = "x86_64", not(cloison_tsan)))]
+    unsafe {
+        core::arch::asm!("rep stosb", inout("rdi") p => _, inout("rcx") n => _, in("al") 0u8, options(nostack, preserves_flags));
+    }
+    #[cfg(all(target_arch = "aarch64", not(cloison_tsan)))]
+    unsafe {
+        core::arch::asm!(
+            "movi {z:v}.16b, #0",
+            "2:",
+            "stp {z:q}, {z:q}, [{p}], #32",
+            "subs {n}, {n}, #32",
+            "b.ne 2b",
+            z = out(vreg) _, p = inout(reg) p => _, n = inout(reg) n => _,
+            options(nostack),
+        );
+    }
+    #[cfg(any(cloison_tsan, not(any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    for k in 0..n {
+        unsafe { AtomicU8::from_ptr(p.add(k)).store(0, Relaxed) };
+    }
+}
+
 /// The card byte of address `a` (in a heap).
 #[inline(always)]
 pub fn card(a: usize) -> *mut u8 {

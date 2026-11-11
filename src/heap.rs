@@ -47,7 +47,7 @@ use crate::value::Value;
 // it shares: the granule, card and large-cell sizes, the metadata bytes,
 // the side tables' place, the address space of a heap.
 pub use crate::layout::{CARD, COLOR, EVAC, GRANULE, LARGE, SIDE, SLICE, VALUES, YOUNG, card, card_mark, color_byte, meta};
-pub(crate) use crate::layout::{meta_load, meta_store, meta_word};
+pub(crate) use crate::layout::{meta_clear, meta_load, meta_store, meta_word};
 /// Block size: allocation's unit of memory.
 pub const BLOCK: usize = 32 << 10;
 const GRANULES_PER_BLOCK: usize = BLOCK / GRANULE;
@@ -928,20 +928,16 @@ impl Heap {
     }
 
     /// Zero the metadata of the `n` blocks from `a`, which no cell lives
-    /// in: byte by byte with [`meta_store`] while a marking runs, else
+    /// in: with [`meta_clear`]'s byte stores while a marking runs, else
     /// `write_bytes`. The marker may read the metadata of the cells
     /// allocated there next (`Marking::cell`, by a reference it finds),
     /// as it reads the [`YOUNG`] [`Heap::alloc`] stores, and `marking` is
-    /// set and cleared in pauses (see `Heap::move_values`). (Bytes, not
-    /// words: the marker's loads are bytes, and Rust's atomics may not
-    /// race at different sizes.)
+    /// set and cleared in pauses (see `Heap::move_values`).
     fn clear_meta(&self, a: usize, n: usize) {
         let len = n * BLOCK / GRANULE;
         unsafe {
             if self.gc.marking {
-                for k in 0..len {
-                    meta_store(a + k * GRANULE, 0);
-                }
+                meta_clear(a, len);
             } else {
                 std::ptr::write_bytes(meta(a), 0, len);
             }
@@ -1271,6 +1267,25 @@ pub(crate) mod tests {
         assert_eq!(limit(100), 100 << 20);
         assert_eq!(limit(1 << 44), ROOM);
         assert_eq!(limit(usize::MAX), ROOM);
+    }
+
+    /// [`meta_clear`] zeroes the metadata of the granules it is given,
+    /// and no byte around them.
+    #[test]
+    fn meta_clear_zeroes_its_granules() {
+        let mut heap = Heap::new();
+        let block = heap.alloc_bytes(8) as usize & !(BLOCK - 1);
+        for n in [64, 128, GRANULES_PER_BLOCK - 128] {
+            for k in 0..GRANULES_PER_BLOCK {
+                unsafe { *meta(block + k * GRANULE) = 0xA5 };
+            }
+            let from = 64;
+            unsafe { meta_clear(block + from * GRANULE, n) };
+            for k in 0..GRANULES_PER_BLOCK {
+                let want = if (from..from + n).contains(&k) { 0 } else { 0xA5 };
+                assert_eq!(unsafe { *meta(block + k * GRANULE) }, want, "n {n}, granule {k}");
+            }
+        }
     }
 
     /// More heaps alive at once than tests running in parallel on a large

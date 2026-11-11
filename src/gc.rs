@@ -1020,6 +1020,9 @@ unsafe fn marked_cells(start: usize, color: u8) -> Vec<(usize, usize)> {
 /// Copy the cell at `p`, of `n` bytes, to `q`, and forward it there
 /// ([`FORWARDED`] in its metadata, `q` in its second word).
 unsafe fn copy_cell(p: usize, n: usize, q: usize) {
+    // Large cells never move: string slices point into their units (see
+    // `Vm::slice_string`), and the evacuation leaves them (`why` 0).
+    assert!(n <= crate::heap::LARGE, "a large cell moved");
     unsafe {
         std::ptr::copy_nonoverlapping(p as *const u8, q as *mut u8, n);
         let first = *crate::heap::meta(p) & (COLOR | END);
@@ -1742,9 +1745,18 @@ unsafe fn trace_with(v: &mut impl Visit, p: usize, w: u64, lo: usize, hi: usize)
                     if within(code) {
                         v.slot_read(code as *mut Value, Value::from_bits((*(code as *const AtomicU64)).load(Relaxed)));
                     }
-                } else if e as usize != slots && within(elems) {
-                    // Flattened: its units' buffer.
-                    v.payload_slot(&raw mut (*o).elems as *mut usize);
+                } else if e as usize != slots {
+                    // A slice (`Vm::slice_string`): its parent, whose units
+                    // (in a large cell, which never moves) it points into.
+                    let parent = (*(props as *const AtomicU64)).load(Relaxed);
+                    if parent != 0 {
+                        if within(props) {
+                            v.slot_read(props as *mut Value, Value::from_bits(parent));
+                        }
+                    } else if within(elems) {
+                        // Flattened: its units' buffer.
+                        v.payload_slot(&raw mut (*o).elems as *mut usize);
+                    }
                 }
                 return;
             }

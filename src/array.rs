@@ -216,6 +216,9 @@ fn new_array_len(vm: &mut Vm, n: f64) -> Result<Value> {
 /// ArraySpeciesCreate(original, n): a new array, or (an array whose
 /// `constructor[@@species]` says so) that constructor's object.
 fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
+    if species_pristine(vm, original) {
+        return new_array_len(vm, n);
+    }
     if !crate::proxy::is_array(vm, original)? {
         return new_array_len(vm, n);
     }
@@ -242,6 +245,42 @@ fn species_create(vm: &mut Vm, original: Value, n: f64) -> Result<Value> {
         return Err(Error::type_error("object.constructor[Symbol.species] is not a constructor"));
     }
     crate::intrinsics::construct(vm, c, &[Value::number(n)])
+}
+
+/// Whether ArraySpeciesCreate of `original` is ArrayCreate, found without
+/// calling anything (V8's array species protector): an array of this
+/// realm whose prototype is `Array.prototype`, no `constructor` of its
+/// own, `Array.prototype.constructor` the data property holding `Array`,
+/// and `Array[@@species]` the builtin getter (which returns `this`).
+fn species_pristine(vm: &Vm, original: Value) -> bool {
+    if !original.is_cell() || !vm.realms.is_empty() {
+        return false;
+    }
+    unsafe {
+        let o = as_object(original);
+        let ap = vm.array_prototype;
+        let s = &*(*o).shape;
+        if (*o).class != Class::Array || s.proto != object_value(ap) || s.lookup(vm.a_constructor).is_some() {
+            return false;
+        }
+        let ps = &*(*ap).shape;
+        let Some(k) = ps.lookup(vm.a_constructor) else { return false };
+        if ps.attrs()[k as usize] & crate::object::ACCESSOR != 0 || *Object::slot(ap, ps.location(k)) != object_value(vm.array_fn) {
+            return false;
+        }
+        let a = vm.array_fn;
+        let cs = &*(*a).shape;
+        let Some(k) = cs.lookup(vm.a_sym_species) else { return false };
+        if cs.attrs()[k as usize] & crate::object::ACCESSOR == 0 {
+            return false;
+        }
+        let pair = as_object(*Object::slot(a, cs.location(k)));
+        let g = *(*pair).elems;
+        g.is_cell() && {
+            let g = as_object(g);
+            (*g).class == Class::Native && (*(*g).code).native.map(|f| f as usize) == Some(crate::symbol::return_this as *const () as usize)
+        }
+    }
 }
 
 /// `Set(o, "length", n, true)`: a failure throws.

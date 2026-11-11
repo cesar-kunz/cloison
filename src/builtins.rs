@@ -823,6 +823,12 @@ fn string_split(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if let Some(r) = delegate(vm, "split", this, a, string_split)? {
         return Ok(r);
     }
+    split_fast(vm, this, a)
+}
+
+/// [`string_split`] without a pattern's own `Symbol.split`.
+#[inline(always)]
+fn split_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let u = this_units(this)?.into_owned();
     if let Some(re) = regexp_of(arg(a, 0)) {
         return regexp_split(vm, re, &u, a.get(1).copied());
@@ -2855,8 +2861,11 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     let s = string_fn(vm, Value::UNDEFINED, &[arg(a, 0)])?;
     // (One whose `exec` isn't the builtin one, or no RegExp: as the spec
     // has it, through `exec`.)
-    // (`matchAll` and `split` make a copy by SpeciesConstructor.)
-    if !pristine_for(vm, this, Some(K))? || copies(K) && !species_pristine(vm, this) {
+    // (`matchAll` and `split` make a copy by SpeciesConstructor, whose
+    // IsRegExp reads `Symbol.match`: `Some(0)`'s method. This method
+    // itself isn't read: this is it, whatever `this` has now.)
+    let fast = if copies(K) { pristine_for(vm, this, Some(0))? && species_pristine(vm, this) } else { pristine(vm, this)? };
+    if !fast {
         return match K {
             0 => rx_match(vm, this, s),
             1 => rx_match_all(vm, this, s),
@@ -2865,17 +2874,19 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
             _ => rx_split(vm, this, s, arg(a, 1)),
         };
     }
+    // (The String methods' fast paths, not the methods: they would find
+    // `this`'s `Symbol.<K>`, which may not be this one.)
     let mut args = vec![this];
     args.extend_from_slice(a.get(1..).unwrap_or(&[]));
     match K {
-        0 => string_match(vm, s, &args),
+        0 => match_fast(vm, s, &args),
         1 => {
             let u = this_units(s)?;
             match_all(vm, s, &u, this)
         }
-        2 => string_replace(vm, s, &args),
-        3 => string_search(vm, s, &args),
-        _ => string_split(vm, s, &args),
+        2 => replace(vm, s, &args, false),
+        3 => search_fast(vm, s, &args),
+        _ => split_fast(vm, s, &args),
     }
 }
 
@@ -2974,6 +2985,12 @@ fn string_match(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if let Some(r) = delegate(vm, "match", this, a, string_match)? {
         return Ok(r);
     }
+    match_fast(vm, this, a)
+}
+
+/// [`string_match`] without a pattern's own `Symbol.match`.
+#[inline(always)]
+fn match_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = this_units(this)?;
     let rv = as_regexp(vm, arg(a, 0))?;
     let re = regexp_of(rv).unwrap();
@@ -3014,6 +3031,12 @@ fn string_search(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     if let Some(r) = delegate(vm, "search", this, a, string_search)? {
         return Ok(r);
     }
+    search_fast(vm, this, a)
+}
+
+/// [`string_search`] without a pattern's own `Symbol.search`.
+#[inline(always)]
+fn search_fast(vm: &mut Vm, this: Value, a: &[Value]) -> Result<Value> {
     let s = this_units(this)?;
     let rv = as_regexp(vm, arg(a, 0))?;
     let re = regexp_of(rv).unwrap();

@@ -1598,3 +1598,24 @@ pub(crate) fn canonical_numeric(s: &str) -> bool {
         Err(_) => false,
     }
 }
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod tests {
+    use super::*;
+
+    /// A view of `i32::MAX` elements keeps compiled code's unchecked
+    /// length reads; one of an element more is left to the runtime (#226).
+    /// (One test: each buffer reserves 2 GiB, never touched.)
+    #[test]
+    fn only_views_past_i32_max_leave_their_length_to_the_runtime() {
+        for (src, long) in [
+            ("new Uint8Array(new ArrayBuffer(2 ** 31), 1)", false),
+            ("new Uint8Array(new ArrayBuffer(2 ** 31))", true),
+        ] {
+            let mut vm = Vm::new();
+            let v = vm.run(&crate::js::compile(src).unwrap()).unwrap();
+            let flagged = unsafe { (*as_object(v)).flags } & RUNTIME_LENGTH != 0;
+            assert_eq!((flagged, vm.checked_length_views), (long, long), "{src}");
+        }
+    }
+}

@@ -10314,7 +10314,11 @@ os.map(o => Error.isError(o) + (stack ? "/" + (stack.get.call(o) === undefined) 
 /// touched, so never committed) are numbers, not int32s wrapped negative:
 /// a buffer's `byteLength`, a view's `length`, `byteLength` and
 /// `byteOffset`, and compiled code's `length`, at a site compiled before
-/// such a view was made (its shape known) and at one after (#226).
+/// such a view was made (its shape known) and at one after; an
+/// `ArrayBuffer`'s, then a `SharedArrayBuffer`'s, then a view one byte
+/// shorter, which compiled code reads as an int32 (#226). One test, its
+/// scripts one after the other: each VM reserves 2 GiB, freed with it.
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn lengths_past_i32_max_stay_positive() {
     let src = r#"
@@ -10329,18 +10333,21 @@ for (var i = 0; i < 2000; i++) q = f(t) + 1;
  e.byteOffset, new DataView(a).byteLength, new DataView(a, 2 ** 31).byteOffset, g(small)].join();"#;
     let n = "2147483648";
     assert_eq!(value(src), format!("160080,{n},{n},{n},{n},{n},{n},2147483649,0,{n},{n},{n},8"));
-}
-
-/// The same of a `SharedArrayBuffer`'s (#226).
-#[test]
-fn shared_lengths_past_i32_max_stay_positive() {
     let src = r#"
 var s = new SharedArrayBuffer(2 ** 31), t = new Int8Array(s);
 function f(x) { return x.length; }
 var r = 0;
 for (var i = 0; i < 2000; i++) r = f(t);
 [s.byteLength, s.maxByteLength, t.length, t.byteLength, r, new DataView(s).byteLength].join();"#;
-    assert_eq!(value(src), ["2147483648"; 6].join(","));
+    assert_eq!(value(src), [n; 6].join(","));
+    let src = r#"
+var t = new Uint8Array(new ArrayBuffer(2 ** 31), 1);
+function g(u) { var n = 0; for (var i = 0; i < 2000; i++) n = u.length; return n; }
+function f(x) { return x.length; }
+var r = 0, q = 0;
+for (var i = 0; i < 2000; i++) { r = f(t); q = f(t) + 1; }
+[t.length, t.byteOffset, r, q, g(t)].join();"#;
+    assert_eq!(value(src), "2147483647,1,2147483647,2147483648,2147483647");
 }
 
 /// A symbol's or a bigint's index is its prototype's; a sloppy function

@@ -770,6 +770,34 @@ r.join(" ");
     );
 }
 
+/// Annex B's function in a block of an indirect `eval` or a script's
+/// direct one, by the name of a global `let` made after the code began
+/// (so its `var` was made), is stored to the `let` (B.3.2.3's
+/// SetMutableBinding, the global scope's block-scoped binding first,
+/// 9.1.1.4.5): a `const`'s a TypeError, one in its TDZ a ReferenceError.
+/// Such a binding made before the code began still stops it (#159).
+#[test]
+fn annex_b_functions_set_a_global_let_made_since() {
+    assert_eq!(
+        value(
+            r#"
+var r = [];
+(0, eval)("$262.evalScript('let q = 1'); { function q() {} }"); r.push(typeof q, typeof globalThis.q);
+eval("$262.evalScript('let q2 = 1'); { function q2() {} }"); r.push(typeof q2, typeof globalThis.q2);
+try { (0, eval)("$262.evalScript('const c = 1'); { function c() {} }"); } catch (e) { r.push(e.name, c); }
+try { $262.evalScript("let t = (() => { throw 0; })()"); } catch (e) {}
+try { (0, eval)("{ function t() {} }"); } catch (e) { r.push(e.name); }
+try { (0, eval)("try { $262.evalScript('let u = (() => { throw 0; })()'); } catch (e) {} { function u() {} }"); } catch (e) { r.push(e.name); }
+q = 5; (0, eval)("{ function q() {} }"); r.push(q);
+(0, eval)("let z; { function q() {} }"); r.push(q);
+(0, eval)("let z; $262.evalScript('let q5 = 1'); { function q5() {} }"); r.push(typeof q5);
+r.join(" ");
+"#
+        ),
+        "function undefined function undefined TypeError 1 ReferenceError 5 5 function"
+    );
+}
+
 /// A script's direct `eval` in a block finds the global scope's
 /// block-scoped bindings before the global object's properties, as the
 /// script does (#95): it doesn't look in the global object as in a

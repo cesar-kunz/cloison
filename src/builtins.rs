@@ -2856,7 +2856,7 @@ fn regexp_symbol<const K: usize>(vm: &mut Vm, this: Value, a: &[Value]) -> Resul
     // (One whose `exec` isn't the builtin one, or no RegExp: as the spec
     // has it, through `exec`.)
     // (`matchAll` and `split` make a copy by SpeciesConstructor.)
-    if !pristine(vm, this)? || matches!(K, 1 | 4) && !species_pristine(vm, this) {
+    if !pristine_for(vm, this, Some(K))? || copies(K) && !species_pristine(vm, this) {
         return match K {
             0 => rx_match(vm, this, s),
             1 => rx_match_all(vm, this, s),
@@ -2892,8 +2892,9 @@ fn delegate(vm: &mut Vm, name: &str, this: Value, a: &[Value], f: NativeFn) -> R
     if this.is_undefined() || this.is_null() {
         return Err(Error::type_error("String.prototype method called on null or undefined"));
     }
-    // (A RegExp's builtin method with the builtin `exec`: the fast path.)
-    if pristine_for(vm, pattern, Some(k))? {
+    // (A RegExp's builtin method with the builtin `exec`: the fast path,
+    // which for `matchAll` and `split` makes no copy by SpeciesConstructor.)
+    if pristine_for(vm, pattern, Some(k))? && (!copies(k) || species_pristine(vm, pattern)) {
         return Ok(None);
     }
     let atom = vm.regexp_atoms[1 + k];
@@ -3576,10 +3577,19 @@ fn pristine_for(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
             let ok = |i: usize| at(i) == object_value(vm.regexp_fns[i]);
             // (An accessor's slot holds its getter-setter pair.)
             let getter_ok = |i: usize| *(*as_object(at(i))).elems == object_value(vm.regexp_fns[i]);
-            return Ok(ok(0) && k.is_none_or(|k| ok(1 + k)) && (6..crate::vm::REGEXP_FNS).all(getter_ok));
+            return Ok(ok(0) && k.is_none_or(|k| ok(1 + k) && (!copies(k) || ok(1))) && (6..crate::vm::REGEXP_FNS).all(getter_ok));
         }
     }
     pristine_slow(vm, rx, k)
+}
+
+/// Whether `Symbol.<k>` (`matchAll`, `split`) makes a copy of the
+/// RegExp: `Construct(C, « R, flags »)`, whose IsRegExp reads its
+/// `Symbol.match` (ES2025 22.2.4.1 step 1, 7.2.8 step 2), so that one
+/// must be the builtin too for the fast path.
+#[inline(always)]
+const fn copies(k: usize) -> bool {
+    matches!(k, 1 | 4)
 }
 
 /// [`pristine_for`] by lookups (the prototype's slots noted, for its
@@ -3605,7 +3615,8 @@ fn pristine_slow(vm: &mut Vm, rx: Value, k: Option<usize>) -> Result<bool> {
         v == object_value(vm.regexp_fns[i])
     };
     let found = |vm: &Vm, i: usize| vm.lookup(o, vm.regexp_atoms[i]).is_some_and(|(h, slot)| builtin(vm, h, slot, i));
-    if !(found(vm, 0) && k.is_none_or(|k| found(vm, 1 + k)) && (6..crate::vm::REGEXP_FNS).all(|i| found(vm, i))) {
+    let method = |vm: &Vm, k: usize| found(vm, 1 + k) && (!copies(k) || found(vm, 1));
+    if !(found(vm, 0) && k.is_none_or(|k| method(vm, k)) && (6..crate::vm::REGEXP_FNS).all(|i| found(vm, i))) {
         return Ok(false);
     }
     // (Where the prototype's are, for the next time.)
@@ -3973,8 +3984,37 @@ fn rx_species(vm: &mut Vm, r: Value) -> Result<Value> {
 
 /// Whether `r`'s SpeciesConstructor is `%RegExp%`, found without
 /// calling anything: its `constructor` a data property, `RegExp`'s
-/// `@@species` the builtin getter.
+/// `@@species` the builtin getter. Quick for a RegExp of the usual shape
+/// while `RegExp.prototype` and `RegExp` keep the shapes they had when
+/// last found so (the slots then read where they were).
+#[inline(always)]
 fn species_pristine(vm: &mut Vm, r: Value) -> bool {
+    unsafe {
+        let (rp, rc) = (vm.regexp_prototype, vm.regexp_constructor);
+        let (ps, cs) = vm.regexp_species_shapes;
+        if (*as_object(r)).shape == vm.regexp_shapes.1 && (*rp).shape == ps && (*rc).shape == cs {
+            let [pl, cl] = vm.regexp_species_slots;
+            // (An accessor's slot holds its getter-setter pair.)
+            return *Object::slot(rp, pl) == object_value(rc) && *(*as_object(*Object::slot(rc, cl))).elems == vm.regexp_species_getter;
+        }
+    }
+    species_pristine_slow(vm, r)
+}
+
+/// Whether `g` is `RegExp`'s builtin `@@species` getter.
+fn builtin_species(g: Value) -> bool {
+    g.is_cell()
+        && unsafe {
+            let g = as_object(g);
+            (*g).class == Class::Native && (*(*g).code).name == "get [Symbol.species]"
+        }
+}
+
+/// [`species_pristine`] by lookups (the slots noted, for its quick
+/// check).
+#[cold]
+#[inline(never)]
+fn species_pristine_slow(vm: &mut Vm, r: Value) -> bool {
     let o = as_object(r);
     if crate::proxy::chain_has_proxy(vm, o) {
         return false;
@@ -3994,15 +4034,26 @@ fn species_pristine(vm: &mut Vm, r: Value) -> bool {
     if d.is_accessor() || d.value != Some(object_value(vm.regexp_constructor)) {
         return false;
     }
-    let a_s = vm.intern_name(&format!("{}Symbol.species", crate::symbol::SYMBOL_MARK));
+    let a_s = vm.a_sym_species;
     let rc = vm.regexp_constructor;
-    match vm.own_property(rc, crate::vm::Key::Name(a_s)).and_then(|d| d.get) {
-        Some(g) if g.is_cell() => unsafe {
-            let g = as_object(g);
-            (*g).class == Class::Native && (*(*g).code).name == "get [Symbol.species]"
-        },
-        _ => false,
+    let Some(g) = vm.own_property(rc, crate::vm::Key::Name(a_s)).and_then(|d| d.get).filter(|&g| builtin_species(g)) else {
+        return false;
+    };
+    // (Where they are, for the next time: `constructor` a data property
+    // of the prototype, `@@species` an accessor of `RegExp`.)
+    unsafe {
+        let rp = vm.regexp_prototype;
+        let (ps, cs) = (&*(*rp).shape, &*(*rc).shape);
+        if let (Some(i), Some(j)) = (ps.lookup(a_c), cs.lookup(a_s))
+            && !vm.is_accessor(rp, i)
+            && vm.is_accessor(rc, j)
+        {
+            vm.regexp_species_shapes = ((*rp).shape, (*rc).shape);
+            vm.regexp_species_slots = [ps.location(i), cs.location(j)];
+            vm.regexp_species_getter = g;
+        }
     }
+    true
 }
 
 /// `RegExp.prototype[Symbol.split]` generically: a sticky copy (of the

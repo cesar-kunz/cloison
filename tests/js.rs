@@ -9830,6 +9830,37 @@ out.join(" ");"##;
     assert_eq!(value(src), "replaceCustomExec=aXcX exec@0,exec@2,exec@4 matchCustomExec=b,b 3 testCustom=true searchCustom=7 splitCustom=a|b|c fakeObj=abc flagsGeneric=gy flagsReal=gimsuy replaceFnGroups=[1]x[2] namedTemplate=y<2020> execBadResult=!TypeError symReplaceOverride=custom:axb! species=a|b matchAllCustom=1,2 fastStill=a#b#|x/y|1");
 }
 
+/// `matchAll` and `split` copy the RegExp by its SpeciesConstructor, a
+/// construction whose IsRegExp reads its `Symbol.match` (ES2025
+/// 22.2.6.9 steps 4–6, 22.2.6.14 steps 4–10): their fast paths are only
+/// for a builtin `constructor`, `Symbol.species` and `Symbol.match`.
+#[test]
+fn regexp_match_all_and_split_copy_by_species() {
+    let src = r##"
+var n = 0, reads = 0, out = [];
+class S extends RegExp { constructor(...a) { n++; super(...a); } }
+var re = /a/g; re.constructor = { [Symbol.species]: S };
+[..."aa".matchAll(re)];
+var re2 = /a/; re2.constructor = { [Symbol.species]: S };
+"bab".split(re2);
+function counted(r) { Object.defineProperty(r, Symbol.match, { get() { reads++; return RegExp.prototype[Symbol.match]; } }); return r; }
+[..."aa".matchAll(counted(/a/g))];
+"bab".split(counted(/a/));
+RegExp.prototype[Symbol.matchAll].call(counted(/a/g), "aa");
+RegExp.prototype[Symbol.split].call(counted(/a/), "bab");
+out.push(n, reads);
+RegExp.prototype.constructor = { [Symbol.species]: S };
+out.push("bab".split(/a/).join(), [..."aa".matchAll(/a/g)].length, n);
+RegExp.prototype.constructor = RegExp;
+var d = Object.getOwnPropertyDescriptor(RegExp, Symbol.species);
+Object.defineProperty(RegExp, Symbol.species, { get() { return S; }, configurable: true });
+out.push("bab".split(/a/).join(), [..."aa".matchAll(/a/g)].length, n);
+Object.defineProperty(RegExp, Symbol.species, d);
+out.push("bab".split(/a/).join(), [..."aa".matchAll(/a/g)].length, n);
+out.join(" ");"##;
+    assert_eq!(value(src), "2 5 b,b 2 4 b,b 2 6 b,b 2 6");
+}
+
 /// A direct `eval`'s scope object leaves the function's own scope alone
 /// when nothing else is in sight (its `var`s deletable there), and a
 /// binding takes back its value, not a `var` the `eval` declared by its

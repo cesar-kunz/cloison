@@ -599,8 +599,12 @@ impl Vm {
                 })
                 .collect();
             (*o).flags |= NOT_EXTENSIBLE | SEALED;
-            // (Read-only elements: see `protect_indices`.)
-            if freeze && ((*o).elems_len > 0 || (*o).flags & SPARSE != 0 || crate::far::is_far(o)) {
+            // Read-only elements only affect other objects' stores when
+            // this object is on their prototype chain.
+            if freeze
+                && (*o).flags & crate::object::PROTOTYPE != 0
+                && ((*o).elems_len > 0 || (*o).flags & SPARSE != 0 || crate::far::is_far(o))
+            {
                 self.protect_indices();
             }
             if freeze {
@@ -615,8 +619,8 @@ impl Vm {
         }
     }
 
-    /// An object has an indexed accessor or a read-only element, or a
-    /// proxy became a prototype: from now on a store adding an element
+    /// A prototype has an indexed accessor or a read-only element, or is a
+    /// proxy: from now on a store adding an element
     /// looks for one (or the proxy) on the prototype chain
     /// (see `Vm::set_new_element`), and compiled code (which stores
     /// elements without looking) is dropped and compiles them through the
@@ -625,6 +629,21 @@ impl Vm {
         if !self.indices_protected {
             self.indices_protected = true;
             self.bump_code_epoch();
+        }
+    }
+
+    /// `o` has become a prototype. If it already has an indexed accessor or
+    /// read-only element, stores through objects inheriting from it must use
+    /// [`Vm::set_new_element`].
+    pub(crate) fn protect_prototype_indices(&mut self, o: *mut Object) {
+        debug_assert!(unsafe { (*o).flags & crate::object::PROTOTYPE != 0 });
+        if self.own_keys(o).into_iter().any(|(key, _)| {
+            matches!(key, Key::Index(_))
+                && self
+                    .own_property(o, key)
+                    .is_some_and(|d| d.is_accessor() || d.writable == Some(false))
+        }) {
+            self.protect_indices();
         }
     }
 
@@ -809,10 +828,12 @@ impl Vm {
                         self.set_element(o, i, full.value.unwrap());
                         return Ok(true);
                     }
-                    // A named property, its element slot a hole. (An
-                    // accessor or a read-only one: stores of elements
-                    // check prototypes from now on.)
-                    if full.is_accessor() || full.writable == Some(false) {
+                    // A named property, its element slot a hole. An accessor
+                    // or read-only one matters to other objects only when it
+                    // is on their prototype chain.
+                    if (*o).flags & crate::object::PROTOTYPE != 0
+                        && (full.is_accessor() || full.writable == Some(false))
+                    {
                         self.protect_indices();
                     }
                     if class == Class::Array && i >= crate::far::array_length(o) {

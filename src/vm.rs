@@ -7797,8 +7797,9 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
 /// `Object(…)` and `new Object(…)`: an object argument itself, else a new
 /// plain object (there are no wrapper objects yet).
 /// Argument `i` as a number (ToNumber), `NaN` if missing.
-/// [`Code::leaf`] of native `f`: 1 for `Math`'s functions of numbers, 2
-/// for the string methods reading a unit.
+/// [`Code::leaf`] of native `f`: 1 for `Math`'s functions of numbers.
+/// String methods may flatten a cons string or allocate their result, so
+/// they retain the normal native-call safepoint and roots.
 fn leaf_kind(f: NativeFn) -> u8 {
     use crate::builtins as b;
     let math: [NativeFn; 35] = [
@@ -7808,12 +7809,8 @@ fn leaf_kind(f: NativeFn) -> u8 {
         b::math_asinh, b::math_atanh, b::math_expm1, b::math_log1p, b::math_log2, b::math_log10, b::math_sign,
         b::math_trunc, b::math_fround, b::math_hypot,
     ];
-    if math.iter().any(|&g| g as usize == f as usize) || f as usize == b::string_from_char_code as NativeFn as usize {
+    if math.iter().any(|&g| g as usize == f as usize) {
         return 1;
-    }
-    let strings: [NativeFn; 3] = [b::string_char_code_at, b::string_code_point_at, b::string_char_at];
-    if strings.iter().any(|&g| g as usize == f as usize) {
-        return 2;
     }
     0
 }

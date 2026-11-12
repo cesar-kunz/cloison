@@ -9392,6 +9392,105 @@ t;
     assert!(!stencils.iter().any(|s| s.starts_with("get_keyed_rt")), "{stencils:?}");
 }
 
+/// Once a fixed-length buffer has been detached (`Vm::views_detached`),
+/// typed arrays' elements stay on the stencils, which check the view's
+/// buffer (`tget_*_d*`, `tset_*_d*`): a detached view's stale length lets
+/// nothing through, an immutable one takes no store, and resizable and
+/// out-of-bounds views keep their lengths (#240: pdf.js, which detaches
+/// a buffer, ran its typed array loops through the runtime).
+#[test]
+fn typed_arrays_stay_compiled_once_a_buffer_is_detached() {
+    let src = r#"
+// detached and immutable views through compiled typed loads and stores
+var out = [];
+var b0 = new ArrayBuffer(4); b0.transfer(); // a detach: views_detached
+function rd(a, n) { var s = 0; for (var i = 0; i < n; i++) { var v = a[i]; s += v === undefined ? 1000 : v; } return s; }
+function wr(a, n, v) { for (var i = 0; i < n; i++) a[i] = v + i; return a[0]; }
+function rdf(a, idx) { var s = 0; for (var i = 0; i < idx.length; i++) { var v = a[idx[i] + 0.5 - 0.5]; s += v === undefined ? 1000 : v; } return s; }
+var kinds = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, Int32Array, Uint32Array, Float32Array, Float64Array];
+for (var K of kinds) {
+  var a = new K(8);
+  for (var r = 0; r < 2000; r++) { wr(a, 8, r & 15); rd(a, 8); rdf(a, new Uint32Array([1, 2, 3])); }
+  var buf = a.buffer, s1 = rd(a, 8), f1 = rdf(a, new Uint32Array([1, 2, 3]));
+  var c = buf.transfer(); // a's buffer detached
+  var s2 = rd(a, 8), f2 = rdf(a, new Uint32Array([1, 2, 3]));
+  var w = wr(a, 8, 5);
+  var n = new K(c); var s3 = rd(n, 8);
+  out.push(K.name + " " + [s1, f1, s2, f2, w, a.length, s3].join(","));
+}
+// immutable views
+if (ArrayBuffer.prototype.transferToImmutable) {
+  var im = new Uint8Array(new Uint8Array([1, 2, 3, 4]).buffer.transferToImmutable());
+  var m = new Uint8Array(4);
+  for (var r = 0; r < 2000; r++) wr(m, 4, r & 7);
+  var e = 0; try { wr(im, 4, 9); } catch (x) { e = x.constructor.name; }
+  (function () { "use strict"; try { wr(im, 4, 9); } catch (x) { e += "/" + x.constructor.name; } })();
+  out.push("imm " + Array.from(im).join() + " " + rd(im, 4) + " " + e);
+}
+// resizable, length-tracking and out-of-bounds views
+var rb = new ArrayBuffer(8, { maxByteLength: 16 });
+var tr = new Uint8Array(rb), fx = new Uint8Array(rb, 4, 4);
+for (var r = 0; r < 2000; r++) { wr(tr, tr.length, 1); rd(fx, 4); }
+rb.resize(6);
+out.push("rs " + [rd(tr, 8), rd(fx, 4), fx.length, tr.length, wr(fx, 4, 3), rd(fx, 4)].join());
+rb.resize(16);
+out.push("rs2 " + [rd(tr, 16), rd(fx, 4), fx.length, tr.length].join());
+out.join("\n");
+"#;
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(
+        display(vm.run(&m).unwrap()),
+        "Int8Array 148,51,8000,3000,,0,148\n\
+         Uint8Array 148,51,8000,3000,,0,148\n\
+         Uint8ClampedArray 148,51,8000,3000,,0,148\n\
+         Int16Array 148,51,8000,3000,,0,148\n\
+         Uint16Array 148,51,8000,3000,,0,148\n\
+         Int32Array 148,51,8000,3000,,0,148\n\
+         Uint32Array 148,51,8000,3000,,0,148\n\
+         Float32Array 148,51,8000,3000,,0,148\n\
+         Float64Array 148,51,8000,3000,,0,148\n\
+         imm 1,2,3,4 10 0\n\
+         rs 2021,4000,0,6,,4000\n\
+         rs2 21,11,4,16"
+    );
+    let src = r#"
+new ArrayBuffer(4).transfer();
+function rdu(a, n) { var s = 0; for (var i = 0; i < n; i++) { var v = a[i]; s += v === undefined ? 1000 : v; } return s; }
+function wru(a, n) { for (var i = 0; i < n; i++) a[i] = i; }
+var a = new Uint16Array(8), s = 0;
+for (var r = 0; r < 3000; r++) { wru(a, 8); s += rdu(a, 8); }
+a.buffer.transfer(); wru(a, 8);
+s + " " + rdu(a, 8);
+"#;
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(display(vm.run(&m).unwrap()), "84000 8000");
+    for f in ["rdu", "wru"] {
+        let stencils = vm.jit_stencils(f).expect("compiled");
+        assert!(stencils.iter().any(|s| s.starts_with("tget_u16_d") || s.starts_with("tset_b16_i_d")), "{f}: {stencils:?}");
+    }
+    // Lengths: 0 once the buffer is detached, a resizable buffer's views'
+    // as it resizes.
+    let src = r#"
+new ArrayBuffer(4).transfer();
+function len(a) { var s = 0; for (var r = 0; r < 10; r++) s += a.length; return s; }
+function lenAny(a) { var s = 0; for (var r = 0; r < 10; r++) s += a.length; return s; }
+var t = new Int32Array(5), arr = [1, 2], str = "abc";
+var x = 0; for (var i = 0; i < 3000; i++) { x += len(t); x += lenAny(i % 3 == 0 ? t : i % 3 == 1 ? arr : str); }
+t.buffer.transfer();
+var rb = new ArrayBuffer(8, { maxByteLength: 16 }), tr = new Uint8Array(rb), fx = new Uint8Array(rb, 4, 4);
+for (var i = 0; i < 3000; i++) { lenAny(tr); lenAny(fx); }
+rb.resize(6);
+[x, len(t), lenAny(t), lenAny(arr), lenAny(tr), lenAny(fx)].join();
+"#;
+    let m = cloison::js::compile(src).unwrap();
+    let mut vm = Vm::new();
+    assert_eq!(display(vm.run(&m).unwrap()), "250000,0,0,20,60,0");
+    let stencils = vm.jit_stencils("len").expect("len compiled");
+    assert!(stencils.iter().any(|s| s.starts_with("get_length_td")), "{stencils:?}");
+}
+
 /// A recursion through compiled code and a native's callback, deeper than
 /// the native stack compiled calls may use, still calls natives: the
 /// interpreter makes the calls past that limit, and natives have stack of

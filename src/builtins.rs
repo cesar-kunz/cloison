@@ -1321,21 +1321,21 @@ pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Ob
         }
         return object_value(o);
     }
-    // A strict function's: the shape and slots of the first one with no
-    // arguments, which has the `callee` accessor of every one (its
-    // getter-setter pair shared, as it can't change: not configurable).
+    // A strict function's: the shape and immutable `callee` accessor of
+    // the first one. Its other slots stay independent: the first object
+    // is visible to user code, which may change its `length` or iterator.
     if vm.strict_arguments.is_cell() {
         unsafe {
             let t = as_object(vm.strict_arguments);
             let s = vm.strict_arguments_shape;
             crate::object::mark_shape(s);
             let o = vm.heap.alloc_object(&*s);
-            let n = (*s).keys().len() as u32;
             vm.store_field(o, 0, Value::from_i32(values.len() as i32));
-            for k in 1..n {
-                let v = *Object::slot(t, (*s).location(k));
-                vm.store_field(o, k, v);
-            }
+            let values_fn = vm.symbol_roots.get(crate::symbol::Root::ArrayValues as usize).copied();
+            vm.store_field(o, 1, values_fn.map_or(Value::UNDEFINED, object_value));
+            vm.store_field(o, 2, Value::TRUE);
+            let callee = *Object::slot(t, (*s).location(3));
+            vm.store_field(o, 3, callee);
             if !values.is_empty() {
                 let e = vm.heap.alloc_values_from(values.len(), values.len());
                 std::ptr::copy_nonoverlapping(values.as_ptr(), e, values.len());

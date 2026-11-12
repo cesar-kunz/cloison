@@ -1276,9 +1276,10 @@ pub(crate) fn mapped_arguments_object(vm: &mut Vm, values: &[Value], callee: *mu
 
 /// An `arguments` object of function `callee` (null: unknown, as strict
 /// code's): an ordinary object with the values as elements, `length`,
-/// `callee` (throws for strict or non-simple-parameter functions),
-/// @@iterator`, and the hidden
-/// mark `Object.prototype.toString` knows it by.
+/// `callee` (the function, or for one strict or with non-simple
+/// parameters the %ThrowTypeError% accessor: FunctionDeclarationInstantiation
+/// makes it with CreateUnmappedArgumentsObject), `@@iterator`, and the
+/// hidden mark `Object.prototype.toString` knows it by.
 pub(crate) fn arguments_object_of(vm: &mut Vm, values: &[Value], callee: *mut Object) -> Value {
     let unmapped = callee.is_null() || unsafe {
         let code = &*(*callee).code;

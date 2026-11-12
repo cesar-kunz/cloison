@@ -6558,6 +6558,13 @@ impl Vm {
         if !self.running() {
             return self.host(|vm| vm.call_other(f, this, args));
         }
+        self.call_own(f, this, args)
+    }
+
+    /// [`call_other`](Self::call_other) from a frame of this VM, which is
+    /// running.
+    #[inline(always)]
+    pub(crate) fn call_own(&mut self, f: Value, this: Value, args: &[Value]) -> Result<Value> {
         self.check_own(f, "Vm::call_other");
         self.check_own(this, "Vm::call_other");
         args.iter().for_each(|&a| self.check_own(a, "Vm::call_other"));

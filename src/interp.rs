@@ -2197,16 +2197,56 @@ handlers! {
         next_or_throw!(Op::SetKeyed.size(), r.map(|()| acc))
     }
 
+    /// `Call` of what isn't a bytecode function: a leaf native (`is_leaf`)
+    /// to `call_leaf`, the rest to `slow_call_other`. (Handlers of their
+    /// own: the test alone is what other natives' calls pay.)
     #[cold]
     #[inline(never)]
     fn slow_call(pc, acc, regs, tag) {
+        if is_leaf(tag, *reg(pc, 1, regs)) {
+            tail!(call_leaf, acc)
+        }
+        tail!(slow_call_other, acc)
+    }
+
+    /// `CallUndefined`'s `slow_call`.
+    #[cold]
+    #[inline(never)]
+    fn slow_call_undefined(pc, acc, regs, tag) {
+        if is_leaf(tag, *reg(pc, 1, regs)) {
+            tail!(call_undefined_leaf, acc)
+        }
+        tail!(slow_call_undefined_other, acc)
+    }
+
+    /// `Call` of a leaf native: called directly if its arguments let it
+    /// (`leaf_call`), else as any native.
+    #[inline(never)]
+    fn call_leaf(pc, acc, regs, tag) {
         let w = reg(pc, 2, regs);
         if let Some(r) = leaf_call(regs, *reg(pc, 1, regs), *w, w.add(1), *pc.add(3) as usize) {
-            // (As the general path below records it: not a `VIA_CALL`.)
+            // (As `slow_call` records it: not a `VIA_CALL`.)
             record_callee(pc, regs, tag);
             (*ic_at(regs, pc, 4)).loc = 0;
             next!(any, Op::Call.size(), r)
         }
+        tail!(slow_call_other, acc)
+    }
+
+    /// `CallUndefined` of a leaf native: see `call_leaf`.
+    #[inline(never)]
+    fn call_undefined_leaf(pc, acc, regs, tag) {
+        if let Some(r) = leaf_call(regs, *reg(pc, 1, regs), Value::UNDEFINED, reg(pc, 2, regs), *pc.add(3) as usize) {
+            record_callee(pc, regs, tag);
+            next!(any, Op::CallUndefined.size(), r)
+        }
+        tail!(slow_call_undefined_other, acc)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn slow_call_other(pc, acc, regs, tag) {
+        let w = reg(pc, 2, regs);
         // `f.call(that, …args)` with `f` a bytecode function: call `f`,
         // with the window one register on. The cache records `f`, for the
         // JIT to call (`VIA_CALL`).
@@ -2232,19 +2272,16 @@ handlers! {
         record_callee(pc, regs, tag);
         (*ic).loc = 0;
         let args = std::slice::from_raw_parts(w.add(1), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| { let r = vm.call_other(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
+        let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), *w, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::Call.size(), r)
     }
 
     #[cold]
     #[inline(never)]
-    fn slow_call_undefined(pc, acc, regs, tag) {
+    fn slow_call_undefined_other(pc, acc, regs, tag) {
         record_callee(pc, regs, tag);
-        if let Some(r) = leaf_call(regs, *reg(pc, 1, regs), Value::UNDEFINED, reg(pc, 2, regs), *pc.add(3) as usize) {
-            next!(any, Op::CallUndefined.size(), r)
-        }
         let args = std::slice::from_raw_parts(reg(pc, 2, regs), *pc.add(3) as usize);
-        let r = with_top(regs, None, |vm| { let r = vm.call_other(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
+        let r = with_top(regs, None, |vm| { let r = vm.call_own(*reg(pc, 1, regs), Value::UNDEFINED, args); if vm.conv_thrown { Err(vm.take_conv_error()) } else { r } });
         next_or_throw!(Op::CallUndefined.size(), r)
     }
 
@@ -4951,24 +4988,21 @@ unsafe fn record_callee(pc: *const u8, regs: *mut Value, tag: NumberTag) {
     }
 }
 
-/// A call of a leaf native (`Code::leaf`) whose arguments let it run as
+/// Whether `f` is a leaf native (`Code::leaf`).
+#[inline(always)]
+unsafe fn is_leaf(tag: NumberTag, f: Value) -> bool {
+    unsafe { is_cell(tag, f) && (*as_object(f)).class == Class::Native && (*(*as_object(f)).code).leaf }
+}
+
+/// A call of leaf native `f` (`is_leaf`) whose arguments let it run as
 /// one: its result, called directly, without `Vm::call_other`'s entry
 /// (no frame top, safepoint or held atoms: it runs no JS, interns nothing
 /// and can't fail). Else `None`, for the general path.
 #[inline(always)]
 unsafe fn leaf_call(regs: *mut Value, f: Value, this: Value, args: *const Value, argc: usize) -> Option<Value> {
     unsafe {
-        if !f.is_cell() {
-            return None;
-        }
         let o = as_object(f);
-        if (*o).class != Class::Native {
-            return None;
-        }
         let code = (*o).code;
-        if !(*code).leaf {
-            return None;
-        }
         let args = std::slice::from_raw_parts(args, argc);
         if args.iter().any(|a| a.is_cell()) {
             return None;

@@ -5259,14 +5259,6 @@ macro_rules! array_length {
             s.acc = unboxed((*cell(o)).elems_len as i32);
             next!(s)
         });
-        stencil!("get_length_nt_", loc!($loc); |s| {
-            let o = get!($loc, s);
-            if !is_cell_g(s.tag, o) || !matches!(length_class(o), LENGTH_ARRAY | LENGTH_STRING) {
-                exit!(s)
-            }
-            s.acc = unboxed((*cell(o)).elems_len as i32);
-            next!(s)
-        });
         // target x86_64 get_length_nc_g{}: 1 `mov r12d, [rsi+12]` (docs/opcode-targets.md, group 2)
         // target aarch64 get_length_nc_g{}: 1 (docs/arm64-targets.md)
         stencil!("get_length_nc_", loc!($loc); |s| {
@@ -5284,6 +5276,33 @@ macro_rules! array_length {
                 exit!(s)
             }
             s.acc = unboxed((*cell(o)).elems_len as i32);
+            next!(s)
+        });
+        // Once a fixed-length buffer has been detached (`Vm::views_detached`),
+        // a typed array's length is 0 where its buffer is: of a known typed
+        // array (`_td`, which checks `RUNTIME_LENGTH` as `_na` does), or of
+        // an array, string or typed array (`_d`, as the plain stencil).
+        // target x86_64 get_length_td_g{}: 6 `_na`'s check and the buffer's (`mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je zero`), then the load (judged 2026-11-13)
+        // target x86_64 get_length_td_m: 7 as `_g{}` after `mov rax, [r13+k]` (judged 2026-11-13)
+        stencil!("get_length_td_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            if (*cell(o)).flags & FAR != 0 {
+                exit!(s)
+            }
+            let n = if buffer_detached(o) { 0 } else { (*cell(o)).elems_len };
+            s.acc = unboxed(n as i32);
+            next!(s)
+        });
+        // target x86_64 get_length_d_g{}: 15 the plain stencil's cell and class checks as compares (`cmp eax, 1; je; cmp eax, 4; je; cmp eax, 7; jne exit`), a typed array's falling through to the buffer check (3) (judged 2026-11-13)
+        // target x86_64 get_length_d_m: 16 as `_g{}` after `mov rax, [r13+k]` (judged 2026-11-13)
+        stencil!("get_length_d_", loc!($loc); |s| {
+            let o = get!($loc, s);
+            let c = if is_cell_g(s.tag, o) { length_class(o) } else { 0xffff };
+            if !matches!(c, LENGTH_ARRAY | LENGTH_STRING | LENGTH_TYPED_ARRAY) {
+                exit!(s)
+            }
+            let n = if c == LENGTH_TYPED_ARRAY && buffer_detached(o) { 0 } else { (*cell(o)).elems_len };
+            s.acc = unboxed(n as i32);
             next!(s)
         });
     };
@@ -6241,12 +6260,32 @@ macro_rules! typed_load {
         });
         // A double key in `facc` (an index plus a `Uint32Array`'s element):
         // one naming an index, else the exit.
+        // target x86_64 tget_u8_fk_g{},tget_u16_fk_g{},tget_i32_fk_g{}: 12 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_i8_fk_g{},tget_i16_fk_g{}: 13 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_u32f_fk_g{}: 14 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_u32_fk_g{},tget_f32_fk_g{}: 15 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_f64_fk_g{}: 16 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_u8_fk_m,tget_u16_fk_m,tget_i32_fk_m: 13 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_i8_fk_m,tget_i16_fk_m: 14 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_u32f_fk_m: 15 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_u32_fk_m,tget_f32_fk_m: 16 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
+        // target x86_64 tget_f64_fk_m: 17 as `tget_*` with the key from `facc`: `cvttsd2si; mov r10d, 0xfffffffe; cmp; ja; cvtsi2sd; ucomisd; jne; jp` (8) before the bounds check (judged 2026-11-13)
         stencil!("tget_", $w, "_fk_", loc!($loc); |$s| {
             let Some(i) = f64_index($s.facc) else { exit!($s) };
             let Some($e) = typed_elem(get!($loc, $s), i, $size) else { exit!($s) };
             $set;
             next!($s)
         });
+        // target x86_64 tget_u8_fkchk_g{},tget_u16_fkchk_g{},tget_i32_fkchk_g{}: 21 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_i8_fkchk_g{},tget_i16_fkchk_g{}: 22 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_u32f_fkchk_g{}: 23 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_u32_fkchk_g{},tget_f32_fkchk_g{}: 24 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_f64_fkchk_g{}: 25 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_u8_fkchk_m,tget_u16_fkchk_m,tget_i32_fkchk_m: 22 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_i8_fkchk_m,tget_i16_fkchk_m: 23 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_u32f_fkchk_m: 24 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_u32_fkchk_m,tget_f32_fkchk_m: 25 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
+        // target x86_64 tget_f64_fkchk_m: 26 `_fk`'s key, then as `tget_*_chk` (judged 2026-11-13)
         stencil!("tget_", $w, "_fkchk_", loc!($loc); |$s| {
             let o = get!($loc, $s);
             if !is_typed($s.tag, o, imm() as u32) {
@@ -6257,21 +6296,138 @@ macro_rules! typed_load {
             $set;
             next!($s)
         });
+        // Once a fixed-length buffer has been detached (`Vm::views_detached`),
+        // whose views' lengths stay what they were: as above, exiting where
+        // the view's buffer is detached (`_d`, `_dchk`, `_fkd`, `_fkdchk`).
+        // target x86_64 tget_u8_d_g{},tget_u16_d_g{},tget_i32_d_g{}: 8 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_d_g{},tget_i16_d_g{}: 9 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_d_g{}: 10 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_d_g{},tget_f32_d_g{}: 11 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_d_g{}: 12 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_u8_d_m,tget_u16_d_m,tget_i32_d_m: 9 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_d_m,tget_i16_d_m: 10 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_d_m: 11 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_d_m,tget_f32_d_m: 12 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_d_m: 13 `tget_*` and the view's buffer checked: `mov rax, [rdi+0x20]; cmp dword [rax+0xc], 0; je exit` (3) (judged 2026-11-13)
+        stencil!("tget_", $w, "_d_", loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            let Some($e) = typed_elem(o, int($s.acc) as u32, $size) else { exit!($s) };
+            if buffer_detached(o) {
+                exit!($s)
+            }
+            $set;
+            next!($s)
+        });
+        // target x86_64 tget_u8_dchk_g{},tget_u16_dchk_g{},tget_i32_dchk_g{}: 17 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_dchk_g{},tget_i16_dchk_g{}: 18 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_dchk_g{}: 19 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_dchk_g{},tget_f32_dchk_g{}: 20 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_dchk_g{}: 21 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u8_dchk_m,tget_u16_dchk_m,tget_i32_dchk_m: 18 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_dchk_m,tget_i16_dchk_m: 19 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_dchk_m: 20 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_dchk_m,tget_f32_dchk_m: 21 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_dchk_m: 22 `tget_*_chk` and the buffer check (3) (judged 2026-11-13)
+        stencil!("tget_", $w, "_dchk_", loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            if !is_typed($s.tag, o, imm() as u32) {
+                exit!($s)
+            }
+            let Some($e) = typed_elem(o, int($s.acc) as u32, $size) else { exit!($s) };
+            if buffer_detached(o) {
+                exit!($s)
+            }
+            $set;
+            next!($s)
+        });
+        // target x86_64 tget_u8_fkd_g{},tget_u16_fkd_g{},tget_i32_fkd_g{}: 15 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_fkd_g{},tget_i16_fkd_g{}: 16 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_fkd_g{}: 17 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_fkd_g{},tget_f32_fkd_g{}: 18 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_fkd_g{}: 19 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u8_fkd_m,tget_u16_fkd_m,tget_i32_fkd_m: 16 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_fkd_m,tget_i16_fkd_m: 17 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_fkd_m: 18 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_fkd_m,tget_f32_fkd_m: 19 `_fk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_fkd_m: 20 `_fk` and the buffer check (3) (judged 2026-11-13)
+        stencil!("tget_", $w, "_fkd_", loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            let Some(i) = f64_index($s.facc) else { exit!($s) };
+            let Some($e) = typed_elem(o, i, $size) else { exit!($s) };
+            if buffer_detached(o) {
+                exit!($s)
+            }
+            $set;
+            next!($s)
+        });
+        // target x86_64 tget_u8_fkdchk_g{},tget_u16_fkdchk_g{},tget_i32_fkdchk_g{}: 24 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_fkdchk_g{},tget_i16_fkdchk_g{}: 25 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_fkdchk_g{}: 26 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_fkdchk_g{},tget_f32_fkdchk_g{}: 27 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_fkdchk_g{}: 28 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u8_fkdchk_m,tget_u16_fkdchk_m,tget_i32_fkdchk_m: 25 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_i8_fkdchk_m,tget_i16_fkdchk_m: 26 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32f_fkdchk_m: 27 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_u32_fkdchk_m,tget_f32_fkdchk_m: 28 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tget_f64_fkdchk_m: 29 `_fkchk` and the buffer check (3) (judged 2026-11-13)
+        stencil!("tget_", $w, "_fkdchk_", loc!($loc); |$s| {
+            let o = get!($loc, $s);
+            if !is_typed($s.tag, o, imm() as u32) {
+                exit!($s)
+            }
+            let Some(i) = f64_index($s.facc) else { exit!($s) };
+            let Some($e) = typed_elem(o, i, $size) else { exit!($s) };
+            if buffer_detached(o) {
+                exit!($s)
+            }
+            $set;
+            next!($s)
+        });
     };
+}
+
+/// Whether typed array `o`'s buffer is detached (no bytes: a view of an
+/// empty buffer has no element either, so it exits on its bounds first).
+#[inline(always)]
+unsafe fn buffer_detached(o: Value) -> bool {
+    let p = o.to_bits() as *const u8;
+    unsafe {
+        let b = (*header(p)).code as *const u8;
+        (*header(b)).elems_len == 0
+    }
+}
+
+/// Whether typed array `o` can't be stored through: its buffer detached,
+/// or immutable (`IMMUTABLE_VIEW`, `LENGTH_READ_ONLY`'s bit).
+#[inline(always)]
+unsafe fn view_unwritable(o: Value) -> bool {
+    let p = o.to_bits() as *const u8;
+    unsafe { (*header(p)).flags & LENGTH_READ_ONLY != 0 || buffer_detached(o) }
 }
 
 /// Double `d` as an array index (`-0` as 0), if it names one.
 #[inline(always)]
 fn f64_index(d: f64) -> Option<u32> {
-    // Below 2^32 and not negative (but `-0`), on the bits, as
-    // `f64_to_int32`: a compare with a double would load a constant from
-    // `.rodata`. Then the truncation is exact, and must give `d` back.
-    let b = d.to_bits() & !(1 << 63);
-    if d.to_bits() >> 63 != 0 && b != 0 || (b >> 52) >= 1023 + 32 {
+    // Truncated as the hardware does it, defined for any double: x86-64's
+    // `cvttsd2si` gives `i64::MIN` for NaN or out of range, arm64's
+    // `fcvtzs` saturates (NaN 0), as Rust's `as` does there. An index
+    // converts back to `d` exactly (`-0` to 0, which compares equal; NaN
+    // compares unequal to anything).
+    #[cfg(target_arch = "x86_64")]
+    let i = unsafe {
+        use core::arch::x86_64::{_mm_cvttsd_si64, _mm_set_sd};
+        _mm_cvttsd_si64(_mm_set_sd(d))
+    };
+    #[cfg(target_arch = "aarch64")]
+    let i = d as i64;
+    if i as u64 >= u32::MAX as u64 {
         return None;
     }
-    let i = unsafe { d.to_int_unchecked::<i64>() };
-    (i as f64 == d && i != u32::MAX as i64).then_some(i as u32)
+    #[allow(clippy::float_cmp)]
+    if i as f64 != d {
+        return None;
+    }
+    Some(i as u32)
 }
 
 macro_rules! typed_store {
@@ -6301,6 +6457,48 @@ macro_rules! typed_store {
                 exit!($s)
             }
             let Some($e) = typed_elem_x(o, key, $size) else { exit!($s) };
+            $store;
+            next!($s)
+        });
+        // Once a buffer has been detached or made immutable
+        // (`Vm::views_detached`): exiting where the view's is (`_d`,
+        // `_dchk`).
+        // target x86_64 tset_b8_i_d_g{},tset_b16_i_d_g{},tset_b32_i_d_g{},tset_f64_f_d_g{}: 10 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tset_f32_i_d_g{},tset_f32_f_d_g{}: 11 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tset_f64_i_d_g{}: 12 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tset_c8_i_d_g{},tset_b8_f_d_g{},tset_b16_f_d_g{},tset_b32_f_d_g{}: 16 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tset_b8_i_d_m,tset_b16_i_d_m,tset_b32_i_d_m,tset_f64_f_d_m: 11 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tset_f32_i_d_m,tset_f32_f_d_m: 12 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tset_f64_i_d_m: 13 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        // target x86_64 tset_c8_i_d_m,tset_b8_f_d_m,tset_b16_f_d_m,tset_b32_f_d_m: 17 `tset_*` and the view checked: `test byte [rdi+9], 0x40; jne exit` (immutable) and the buffer check (3) (judged 2026-11-13)
+        stencil!("tset_", $w, "_d_", loc!($loc); |$s| {
+            let key = key_x();
+            let o = get!($loc, $s);
+            let Some($e) = typed_elem_x(o, key, $size) else { exit!($s) };
+            if view_unwritable(o) {
+                exit!($s)
+            }
+            $store;
+            next!($s)
+        });
+        // target x86_64 tset_b8_i_dchk_g{},tset_b16_i_dchk_g{},tset_b32_i_dchk_g{},tset_f64_f_dchk_g{}: 20 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        // target x86_64 tset_f32_i_dchk_g{},tset_f32_f_dchk_g{}: 21 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        // target x86_64 tset_f64_i_dchk_g{}: 22 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        // target x86_64 tset_c8_i_dchk_g{},tset_b8_f_dchk_g{},tset_b16_f_dchk_g{},tset_b32_f_dchk_g{}: 26 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        // target x86_64 tset_b8_i_dchk_m,tset_b16_i_dchk_m,tset_b32_i_dchk_m,tset_f64_f_dchk_m: 23 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        // target x86_64 tset_f32_i_dchk_m,tset_f32_f_dchk_m: 24 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        // target x86_64 tset_f64_i_dchk_m: 25 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        // target x86_64 tset_c8_i_dchk_m,tset_b8_f_dchk_m,tset_b16_f_dchk_m,tset_b32_f_dchk_m: 29 `tset_*_chk` and `_d`'s checks (5) (judged 2026-11-13)
+        stencil!("tset_", $w, "_dchk_", loc!($loc); |$s| {
+            let key = key_x();
+            let o = get!($loc, $s);
+            if !is_typed($s.tag, o, imm() as u32) {
+                exit!($s)
+            }
+            let Some($e) = typed_elem_x(o, key, $size) else { exit!($s) };
+            if view_unwritable(o) {
+                exit!($s)
+            }
             $store;
             next!($s)
         });

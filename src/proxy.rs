@@ -17,6 +17,7 @@
 //! the target has it, nor a non-extensible target otherwise than it is).
 
 use crate::interp::{call_function, to_boolean};
+use crate::jit::HashSet;
 use crate::object::{Class, Object, as_object, object_value};
 use crate::props::{Desc, is_callable, is_object, same_value};
 use crate::value::Value;
@@ -694,15 +695,16 @@ pub(crate) fn final_target(vm: &Vm, mut o: *mut Object) -> Result<*mut Object> {
 /// `for … in`'s keys of `o`: its own enumerable string keys, then its
 /// prototypes' not seen before, through proxies' traps.
 pub(crate) fn for_in_names(vm: &mut Vm, o: *mut Object) -> Result<Vec<Vec<u16>>> {
-    let mut seen: Vec<Key> = Vec::new();
+    // This follows the same shadowing rule as the ordinary path in
+    // `Vm::for_in_key_array`; proxy traps must not turn it quadratic.
+    let mut seen: HashSet<Key> = HashSet::default();
     let mut out = Vec::new();
     let mut cur = o;
     loop {
         for key in own_keys(vm, cur)? {
-            if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) || seen.contains(&key) {
+            if matches!(key, Key::Name(a) if crate::symbol::is_symbol_atom(vm, a)) || !seen.insert(key) {
                 continue;
             }
-            seen.push(key);
             if get_own_property(vm, cur, key)?.is_some_and(|d| d.enumerable == Some(true)) {
                 let mut u = Vec::new();
                 match key {

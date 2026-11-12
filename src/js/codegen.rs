@@ -1684,10 +1684,10 @@ fn may_map_arguments(f: &Function) -> bool {
     !f.strict && !f.arrow && !f.params.is_empty() && simple_parameters(f)
 }
 
-/// Defaults, rest parameters and destructuring make the list non-simple.
-/// An empty parameter list is simple.
+/// Whether function `f`'s parameter list is simple (IsSimpleParameterList):
+/// no default, rest parameter or pattern. An empty one is.
 fn simple_parameters(f: &Function) -> bool {
-   !f.rest && f.param_stmts == 0 && f.params.iter().all(|p| !p.starts_with('%'))
+    !f.rest && f.param_stmts == 0 && f.params.iter().all(|p| !p.starts_with('%'))
 }
 
 /// Whether function `f` reads `arguments` only to pass them on, as

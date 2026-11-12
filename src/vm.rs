@@ -464,10 +464,10 @@ pub struct Code {
     /// A native that only reads, which a conversion may run twice (see
     /// `interp::reads_only`).
     pub(crate) reads_only: bool,
-    /// A native that, given arguments none of which is a cell (and, if 2,
-    /// a string `this`), runs no JS, throws nothing and doesn't recurse:
-    /// the interpreter calls it directly (see `interp::slow_call`). 0: no.
-    pub(crate) leaf: u8,
+    /// A native that, given arguments none of which is a cell, runs no JS,
+    /// allocates no cell, throws nothing and doesn't recurse: the
+    /// interpreter calls it directly (see `interp::leaf_call`).
+    pub(crate) leaf: bool,
     /// Its `arguments` object may be reachable once it has returned (see
     /// `asm::FunctionDef::arguments_escape`, `Vm::release_mapped`).
     pub(crate) arguments_escape: bool,
@@ -6269,7 +6269,7 @@ impl Vm {
             // (The built-ins' accessors' getters, named so, only read: an
             // Intl collator's `compare` makes its function once.)
             reads_only: crate::interp::reads_only(f) || name.starts_with("get "),
-            leaf: leaf_kind(f),
+            leaf: is_leaf(f),
             arguments_escape: false,
             strict: false,
             simple_parameters: true,
@@ -7026,7 +7026,7 @@ impl Vm {
                     native: None,
                     constructs: false,
                     reads_only: false,
-                    leaf: 0,
+                    leaf: false,
                     arguments_escape: f.arguments_escape,
                     ctor_capacity: Cell::new(MAX_INLINE_CAPACITY),
                     ctor_shape: Cell::new(std::ptr::null()),
@@ -7794,13 +7794,11 @@ fn array_constructor(vm: &mut Vm, _: Value, args: &[Value]) -> Result<Value> {
     Ok(a)
 }
 
-/// `Object(…)` and `new Object(…)`: an object argument itself, else a new
-/// plain object (there are no wrapper objects yet).
-/// Argument `i` as a number (ToNumber), `NaN` if missing.
-/// [`Code::leaf`] of native `f`: 1 for `Math`'s functions of numbers.
-/// String methods may flatten a cons string or allocate their result, so
-/// they retain the normal native-call safepoint and roots.
-fn leaf_kind(f: NativeFn) -> u8 {
+/// Whether native `f` is a [`Code::leaf`]: `Math`'s functions of numbers
+/// (not `sumPrecise`, which iterates). The string methods reading a unit
+/// aren't: they may flatten a cons string or allocate their result, so
+/// they keep the general entry's safepoint and roots.
+fn is_leaf(f: NativeFn) -> bool {
     use crate::builtins as b;
     let math: [NativeFn; 35] = [
         math_log, math_exp, math_sqrt, math_abs, math_floor, math_ceil, math_round, math_sin, math_cos, math_pow,
@@ -7809,12 +7807,12 @@ fn leaf_kind(f: NativeFn) -> u8 {
         b::math_asinh, b::math_atanh, b::math_expm1, b::math_log1p, b::math_log2, b::math_log10, b::math_sign,
         b::math_trunc, b::math_fround, b::math_hypot,
     ];
-    if math.iter().any(|&g| g as usize == f as usize) {
-        return 1;
-    }
-    0
+    math.iter().any(|&g| g as usize == f as usize)
 }
 
+/// `Object(…)` and `new Object(…)`: an object argument itself, else a new
+/// plain object (there are no wrapper objects yet).
+/// Argument `i` as a number (ToNumber), `NaN` if missing.
 fn num_arg(args: &[Value], i: usize) -> f64 {
     args.get(i)
         .map_or(f64::NAN, |&v| crate::interp::to_number(v))

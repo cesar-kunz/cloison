@@ -8269,6 +8269,11 @@ pub(crate) fn array_push(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Val
 #[cold]
 fn array_push_flagged(vm: &mut Vm, this: Value, args: &[Value]) -> Result<Value> {
     let o = as_object(this);
+    // (Past the largest array index: a named property, then a RangeError
+    // for the length.)
+    if crate::far::array_length(o) as u64 + args.len() as u64 > u32::MAX as u64 {
+        return array_push_generic(vm, this, args);
+    }
     for &v in args {
         let n = crate::far::array_length(o);
         vm.put_key(this, Key::Index(n), v)?;

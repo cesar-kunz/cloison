@@ -6862,6 +6862,24 @@ s + q;";
     assert!(st.compiles >= 1, "{st:?}");
 }
 
+/// An opcode the JIT leaves to the interpreter on execution must not keep an
+/// ordinary function interpreted when it is on a cold path (#241).
+#[test]
+fn cold_interpreter_opcode_does_not_prevent_function_entry() {
+    let body = "s += n; ".repeat(80);
+    let src = format!(
+        "function f(n) {{ if (n < 0) `${{n}}`; var s = 0; {body} return s; }}\
+         var out = 0; for (var i = 0; i < 20; i++) out += f(i); out;"
+    );
+    let m = cloison::js::compile(&src).unwrap();
+    assert!(cloison::asm::disassemble(&m).contains("Intrinsic"), "{src}");
+    let mut vm = Vm::new();
+    vm.set_tier_back_edges(2);
+    assert_eq!(display(vm.run(&m).unwrap()), (80 * 190).to_string());
+    let st = vm.jit_stats("f").expect("f entered compiled code");
+    assert!(st.compiles >= 1 && st.exits == 0, "{st:?}");
+}
+
 #[test]
 fn intrinsics_in_compiled_loops_throw_and_return_as_interpreted() {
     // Each loop compiled, with intrinsics (spread, templates, `**`,

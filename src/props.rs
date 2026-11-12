@@ -633,12 +633,12 @@ impl Vm {
     }
 
     /// `o` has become a prototype. If it already has an indexed accessor or
-    /// read-only element, stores through objects inheriting from it must use
-    /// [`Vm::set_new_element`].
+    /// read-only element, or is a typed array or a string object, stores
+    /// through objects inheriting from it must use [`Vm::set_new_element`].
     pub(crate) fn protect_prototype_indices(&mut self, o: *mut Object) {
         debug_assert!(unsafe { (*o).flags & crate::object::PROTOTYPE != 0 });
         // Do not use `own_keys` here: a typed array's keys include each of
-        // its elements, and promoting a large ordinary typed array must not
+        // its elements, and promoting a large typed array must not
         // allocate or sort all of them. Dense and far elements share the
         // object's frozen flag; indexed properties with their own attributes
         // are the sparse shape keys.
@@ -646,9 +646,11 @@ impl Vm {
             let flags = (*o).flags;
             let dense_or_far = flags & FROZEN != 0
                 && ((*o).elems_len != 0 || crate::far::is_far(o));
-            let immutable_typed = (*o).class == Class::TypedArray
-                && crate::typed::is_immutable_view(o)
-                && crate::typed::ta_length(o).is_some_and(|n| n != 0);
+            // A typed array takes an inherited store of an index outside
+            // its length (doing nothing: its [[Set]]); a string object's
+            // characters are read-only.
+            let typed = (*o).class == Class::TypedArray;
+            let chars = Self::string_of(o).is_some_and(|u| !u.is_empty());
             let s = &*(*o).shape;
             let sparse = flags & SPARSE != 0
                 && s
@@ -658,7 +660,7 @@ impl Vm {
                     .any(|(&name, &attrs)| {
                         index_of_name(self.atom_name(name)).is_some() && attrs & (ACCESSOR | READ_ONLY) != 0
                     });
-            dense_or_far || immutable_typed || sparse
+            dense_or_far || typed || chars || sparse
         };
         if protected {
             self.protect_indices();

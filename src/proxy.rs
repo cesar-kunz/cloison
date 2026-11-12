@@ -553,12 +553,15 @@ pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
         if !crate::vm::is_string(k) && !crate::symbol::is_symbol(k) {
             return Err(Error::type_error("The proxy's 'ownKeys' trap gave a key neither a string nor a symbol"));
         }
-        let key = crate::intrinsics::to_property_key(vm, k)?;
-        if keys.contains(&key) {
-            return Err(Error::type_error("The proxy's 'ownKeys' trap gave a key twice"));
-        }
-        keys.push(key);
+        keys.push(crate::intrinsics::to_property_key(vm, k)?);
         i += 1.0;
+    }
+    // (Once every element is read: CreateListFromArrayLike, then 10.5.11
+    // step 9. Hashed, as is what the target's keys are checked against
+    // below: searching the list made a proxy of n keys O(n²).)
+    let mut unchecked: HashSet<Key> = HashSet::default();
+    if keys.iter().any(|&k| !unchecked.insert(k)) {
+        return Err(Error::type_error("The proxy's 'ownKeys' trap gave a key twice"));
     }
     // Every non-configurable key of the target's (and of a non-extensible
     // one's, every key and no other).
@@ -574,21 +577,18 @@ pub(crate) fn own_keys(vm: &mut Vm, o: *mut Object) -> Result<Vec<Key>> {
     if extensible && fixed.is_empty() {
         return Ok(keys);
     }
-    let mut unchecked = keys.clone();
     for k in fixed {
-        let Some(at) = unchecked.iter().position(|&u| u == k) else {
+        if !unchecked.remove(&k) {
             return Err(broken("ownKeys", "omitted a non-configurable key"));
-        };
-        unchecked.swap_remove(at);
+        }
     }
     if extensible {
         return Ok(keys);
     }
     for k in other {
-        let Some(at) = unchecked.iter().position(|&u| u == k) else {
+        if !unchecked.remove(&k) {
             return Err(broken("ownKeys", "omitted a key of a non-extensible target"));
-        };
-        unchecked.swap_remove(at);
+        }
     }
     if !unchecked.is_empty() {
         return Err(broken("ownKeys", "added a key to a non-extensible target"));

@@ -2764,6 +2764,9 @@ pub(crate) enum Prop {
     Keyed { shape: u64, elems: FieldType },
     /// A `GetNamed` that read an array's or a string's `length`.
     Length,
+    /// A `GetNamed` of a typed array's `length` by %TypedArray%.prototype's
+    /// getter, after a check of its shape (see `Lowering::typed_length`).
+    TypedLength,
     /// A `SetKeyed` that appended to an array (`vm::APPEND_LOC`): in its
     /// elements, at its length too, else through the runtime (see
     /// `set_keyed_ap` in the stencils).
@@ -5719,9 +5722,25 @@ fn select_cached(insn: &Insn, i: usize, st: &TypeState, spec: &Spec) -> Sel {
         if matches!(reg, I32 | F64) {
             return bail(out);
         }
+        // A typed array's `length` by the getter, its shape checked (a
+        // typed array's): its length's field, as `get_length` reads a
+        // known typed array's; once a fixed-length buffer was detached
+        // (`views_detached`), 0 where its buffer is detached (`td`).
+        if prop == Prop::TypedLength {
+            out.acc = I32;
+            let case = if spec.views_detached {
+                "td"
+            } else if spec.checked_length_views {
+                "na"
+            } else {
+                "nc"
+            };
+            return Sel::new("get_length", case, out);
+        }
         // Only arrays' and strings' `length` is in the header whatever
-        // their prototypes; a typed array's (a known one's, or one at a
-        // site that met arrays too) through the runtime.
+        // their prototypes; a typed array's is %TypedArray%.prototype's
+        // getter's, unless shadowed (`Prop::TypedLength`), so through the
+        // runtime here.
         if prop == Prop::Length {
             use crate::object::Class;
             let class = reg.shape().map(|s| unsafe { (*(s as *const Shape)).class });
@@ -14969,6 +14988,30 @@ impl Lowering<'_> {
                     self.push(i, prop);
                 }
                 // In a constructor passing its arguments on, inlined for
+                // A typed array's `length` by %TypedArray%.prototype's
+                // getter: the receiver's shape checked, as for an
+                // accessor's call below, then the length read
+                // (`Prop::TypedLength`).
+                Op::GetNamed if let Some((shapes, addr)) = self.typed_length(frame, &i) => {
+                    let mut check = i;
+                    check.check_only = true;
+                    let ft = FieldType::Any;
+                    let prop = if let [shape] = shapes[..] {
+                        Prop::Proto { shape, addr, ft }
+                    } else {
+                        let mut cases = [Case::NONE; crate::vm::IC_WAYS];
+                        for (c, &shape) in cases.iter_mut().zip(&shapes) {
+                            *c = Case { shape, loc: CaseLoc::Proto(addr), ft };
+                        }
+                        self.out.polys.push(cases);
+                        Prop::Poly {
+                            n: shapes.len() as u8,
+                            at: self.out.polys.len() as u32 - 1,
+                        }
+                    };
+                    self.push(check, prop);
+                    self.push(i, Prop::TypedLength);
+                }
                 // A getter or setter found in a prototype: the receiver's
                 // shape checked (a load of the accessor, `check_only`), then
                 // a call of the function with the receiver as `this` and,
@@ -16506,6 +16549,52 @@ impl Lowering<'_> {
             }
             rely_on_slot(at as u64);
             Some((fo, shapes, at as u64, inline))
+        }
+    }
+
+    /// For `GetNamed` `i` of frame `frame`, a `length` whose cache says
+    /// typed arrays of up to `IC_WAYS` shapes found %TypedArray%.prototype's
+    /// getter in a prototype (`vm::ACCESSOR_LOC`) under this epoch, and
+    /// exits there haven't given up on it: the receivers' shapes and the
+    /// accessor's slot (its value relied on). Their shapes have no `length`
+    /// and their prototypes one in a slot (`Vm::virtual_before`), while
+    /// the epoch holds; the getter reads the length.
+    fn typed_length(&mut self, frame: usize, i: &Insn) -> Option<(Vec<u64>, u64)> {
+        use crate::object::{ACCESSOR, Class};
+        let f = self.out.frames[frame];
+        let fb = self.out.fbs[frame];
+        let ic = unsafe { *fb.ic(i.imm as usize) };
+        if i.bail
+            || ic.loc != crate::vm::ACCESSOR_LOC
+            || ic.new_shape.is_null()
+            || ic.epoch != self.epoch
+            || fb.name(i) != unsafe { (*self.state.vm).a_length }
+            || (self.state.property_exits.get(&(f.code as usize, i.pc)))
+                .is_some_and(|&n| n >= MAX_PROPERTY_EXITS)
+        {
+            return None;
+        }
+        unsafe {
+            let h = ic.holder;
+            let s = &*(*h).shape;
+            let slot = s.lookup(fb.name(i))?;
+            if s.attrs()[slot as usize] & ACCESSOR == 0 {
+                return None;
+            }
+            let at = Object::slot(h, s.location(slot));
+            if !crate::typed::is_length_getter(*(*crate::object::as_object(*at)).elems) {
+                return None;
+            }
+            let shapes: Vec<u64> = (0..crate::vm::IC_WAYS)
+                .map(|k| *fb.ic(i.imm as usize).add(k))
+                .take_while(|w| w.loc == ic.loc && w.epoch == ic.epoch && w.holder == h)
+                .map(|w| w.new_shape as u64)
+                .collect();
+            if !shapes.iter().all(|&s| (*(s as *const Shape)).class == Class::TypedArray) {
+                return None;
+            }
+            rely_on_slot(at as u64);
+            Some((shapes, at as u64))
         }
     }
 
@@ -19390,6 +19479,7 @@ pub(crate) fn shape_words(vm: &crate::vm::Vm, out: &mut dyn FnMut(u64)) -> bool 
             | Prop::Closure { .. }
             | Prop::Typed { .. }
             | Prop::Length
+            | Prop::TypedLength
             | Prop::Append
             | Prop::InstanceOf { .. }
             | Prop::Poly { .. }
